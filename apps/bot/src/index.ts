@@ -5,16 +5,21 @@ import { handleSettings } from "./commands/settings.js";
 import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
 import { handleBankButton, handlePanelCommand, maybeRepostPanel } from "./commands/bank-panel.js";
 import { handleAdjust } from "./commands/adjust.js";
+import { handleSalaryTable } from "./commands/salary-table.js";
+import { handlePaydayCommand } from "./commands/payday-command.js";
+import { handlePaydayButton } from "./payday.js";
+import { startScheduler } from "./scheduler.js";
 import { startOutboxWorker } from "./outbox.js";
 
 const services = buildServices();
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers],
 });
 
 client.once(Events.ClientReady, (ready) => {
   console.log(`⚔️ 冥獄城ボット 起動: ${ready.user.tag}`);
   startOutboxWorker(client, services);
+  startScheduler(client, services);
 
   // 起動時に必ず帳簿を検算する（経済設計.md §8）
   const integrity = services.ledger.verifyIntegrity();
@@ -41,6 +46,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "調整":
           await handleAdjust(interaction, services);
           return;
+        case "給与表":
+          await handleSalaryTable(interaction, services);
+          return;
+        case "給与支給":
+          await handlePaydayCommand(interaction, services);
+          return;
       }
       return;
     }
@@ -51,6 +62,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleApprovalButton(interaction, services);
       } else if (interaction.customId.startsWith("bank:")) {
         await handleBankButton(interaction, services);
+      } else if (interaction.customId.startsWith("pay:")) {
+        await handlePaydayButton(interaction, services);
       }
     }
   } catch (err) {
