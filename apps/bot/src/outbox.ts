@@ -1,4 +1,5 @@
 import type { Client, TextChannel } from "discord.js";
+import { mention } from "./format.js";
 import type { Services } from "./services.js";
 
 interface TxPayload {
@@ -11,13 +12,6 @@ interface TxPayload {
   actor: string;
   refType: string | null;
   refId: string | null;
-}
-
-function mention(accountId: string): string {
-  // 'user:<discordId>' → メンション、システム勘定はそのままラベル表示
-  if (accountId.startsWith("user:")) return `<@${accountId.slice(5)}>`;
-  if (accountId === "sys:treasury") return "🏛 国庫";
-  return `⚙️ ${accountId}`;
 }
 
 function formatPublic(p: TxPayload): string {
