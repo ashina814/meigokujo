@@ -19,6 +19,8 @@ import {
   handleEvaluationModal,
   handleEvaluationSelect,
 } from "./commands/evaluation.js";
+import { handlePromote } from "./commands/promote.js";
+import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
 import { handleSalaryTable } from "./commands/salary-table.js";
 import { handlePaydayCommand } from "./commands/payday-command.js";
@@ -33,6 +35,7 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.MessageContent, // bump検知（掲示板ボットのembed読取に必要）
   ],
 });
 
@@ -80,6 +83,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "評価":
           await handleEvaluationCommand(interaction, services);
+          return;
+        case "昇格":
+          await handlePromote(interaction, services);
           return;
       }
       return;
@@ -134,11 +140,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// パネル自動再掲（UX原則8）
+// パネル自動再掲（UX原則8）+ bump/up 検知
 client.on(Events.MessageCreate, (message) => {
   void maybeRepostPanel(message, services).catch((err) =>
     console.error("[panel] 再掲失敗:", err),
   );
+  void handleBumpMessage(message, services).catch((err) => console.error("[bump] 処理失敗:", err));
 });
 
 // 入城導線: 参加時のロール付与・案内

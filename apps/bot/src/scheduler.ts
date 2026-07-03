@@ -1,6 +1,9 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, type Client, type TextChannel } from "discord.js";
+import { TREASURY } from "@meigokujo/core";
 import { createAndPostDraft } from "./payday.js";
 import { threadTitleFor } from "./commands/evaluation.js";
+import { checkBumpCooldowns } from "./bump.js";
+import { fmtLd } from "./format.js";
 import type { Services } from "./services.js";
 
 /** JSTの現在時刻の分解値。VPSのTZに依存しないよう明示的に変換する */
@@ -83,6 +86,19 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
+    // ── bump/up クールタイム終了通知 ──
+    await checkBumpCooldowns(client, services);
+
+    // ── VC浮上報酬: 毎日 05:00 台に前日分を支給 ──
+    if (now.hour === 5) {
+      const yesterday = jstNow(new Date(Date.now() - 86_400_000)).dateStr;
+      const marker = `vc_reward:paid:${yesterday}`;
+      if (!services.settings.getString(marker)) {
+        services.settings.set(marker, "1", "system:scheduler");
+        await payVcRewards(client, services, yesterday);
+      }
+    }
+
     // ── カロン: 毎日 09:00 台に期限リスト・演出通知・迷霊落ち承認パネル ──
     if (now.hour === 9 && !services.settings.getString(`charon:daily:${now.dateStr}`)) {
       services.settings.set(`charon:daily:${now.dateStr}`, "1", "system:scheduler");
@@ -108,6 +124,45 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
   }
 
   return setInterval(() => void tick().catch((e) => console.error("[刻時盤] tick失敗:", e)), intervalMs);
+}
+
+/** VC浮上報酬の日次支給: 前日分を計算して1人1取引で発行し、本人にDMで通知 */
+export async function payVcRewards(client: Client, services: Services, dateStr: string): Promise<void> {
+  const rewards = services.vcRewards.computeDay(dateStr);
+  if (rewards.length === 0) return;
+
+  let total = 0;
+  for (const r of rewards) {
+    const accountId = `user:${r.userId}`;
+    services.ledger.ensureAccount(accountId, "user");
+    const seconds = r.normalSeconds + r.sleepSeconds;
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const result = services.ledger.transfer({
+      from: TREASURY,
+      to: accountId,
+      amount: r.amount,
+      type: "vc_reward",
+      actor: "system:scheduler",
+      reason: `${dateStr} の浮上 ${h}時間${m}分`,
+      idempotencyKey: `vc_reward:${dateStr}:user:${r.userId}`,
+    });
+    if (result.duplicate) continue;
+    total += r.amount;
+    const user = await client.users.fetch(r.userId).catch(() => null);
+    await user
+      ?.send(`🌙 昨夜の浮上 **${h}時間${m}分** → **+${fmtLd(r.amount)}**。今宵も評価対象の場で会おう。`)
+      .catch(() => undefined);
+  }
+
+  const keikibanId = services.settings.getString("channel:keikiban");
+  if (keikibanId && total > 0) {
+    const channel = await client.channels.fetch(keikibanId).catch(() => null);
+    if (channel?.isTextBased() && "send" in channel) {
+      await channel.send(`🌙 浮上報酬（${dateStr}分）: **${rewards.length}名 / 計 ${fmtLd(total)}** を支給しました。`);
+    }
+  }
+  console.log(`[刻時盤] 浮上報酬 ${dateStr}: ${rewards.length}名 / ${total} Ld`);
 }
 
 /** カロンの日次業務: 期限リスト（計器盤）・本人への演出通知・期限切れの承認パネル（#決裁）・スレ題名の同期 */

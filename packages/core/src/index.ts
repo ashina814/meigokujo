@@ -37,3 +37,4 @@ export { Entry, type BookingRow, type SoulRow, type GhostifyResult, type Booking
 export { VcTracker, type VcSegment, type PresenceSummary } from "./vc/service.js";
 export { Tickets, type TicketRow, type TicketKind, type TicketStatus } from "./tickets/service.js";
 export { Evaluation, type Conclusion, type EvalScores, type EvalTexts, type PromotionScore, type SubmitResult, type SoulDeadlineRow } from "./evaluation/service.js";
+export { VcRewards, type DailyReward } from "./vc/rewards.js";

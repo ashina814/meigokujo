@@ -9,6 +9,7 @@ import { paydayCommand } from "./commands/payday-command.js";
 import { migrationCommand } from "./commands/migration.js";
 import { sessionCommand } from "./commands/entry.js";
 import { evaluationCommand } from "./commands/evaluation.js";
+import { promoteCommand } from "./commands/promote.js";
 
 const commands = [
   settingsCommand.toJSON(),
@@ -20,6 +21,7 @@ const commands = [
   migrationCommand.toJSON(),
   sessionCommand.toJSON(),
   evaluationCommand.toJSON(),
+  promoteCommand.toJSON(),
 ];
 
 const rest = new REST().setToken(config.token);
