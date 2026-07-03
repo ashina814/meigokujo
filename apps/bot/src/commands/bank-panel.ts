@@ -12,6 +12,7 @@ import {
 } from "discord.js";
 import { fmtLd, formatHistLine } from "../format.js";
 import { isAdmin } from "../permissions.js";
+import { entryPanelMessage } from "./entry.js";
 import type { Services } from "../services.js";
 
 export const panelCommand = new SlashCommandBuilder()
@@ -23,8 +24,10 @@ export const panelCommand = new SlashCommandBuilder()
       .setName("種別")
       .setDescription("設置するパネル")
       .setRequired(true)
-      .addChoices({ name: "冥獄銀行", value: "bank" }),
+      .addChoices({ name: "冥獄銀行", value: "bank" }, { name: "入城申請", value: "entry" }),
   );
+
+const PANEL_KINDS = ["bank", "entry"] as const;
 
 function bankPanelMessage() {
   const embed = new EmbedBuilder()
@@ -51,11 +54,12 @@ export async function handlePanelCommand(
   const channel = interaction.channel as TextChannel | null;
   if (!channel?.isTextBased()) return;
 
-  const sent = await channel.send(bankPanelMessage());
+  const kind = interaction.options.getString("種別", true);
+  const sent = await channel.send(kind === "entry" ? entryPanelMessage() : bankPanelMessage());
   await sent.pin().catch(() => undefined); // ピン留め権限がなくても設置自体は成立させる
-  services.settings.set(`panel:bank:${channel.id}`, sent.id, `user:${interaction.user.id}`);
+  services.settings.set(`panel:${kind}:${channel.id}`, sent.id, `user:${interaction.user.id}`);
   await interaction.reply({
-    content: "✅ 冥獄銀行パネルを設置しました（会話で流れたら自動で貼り直します）。",
+    content: `✅ ${kind === "entry" ? "入城申請" : "冥獄銀行"}パネルを設置しました（会話で流れたら自動で貼り直します）。`,
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -121,16 +125,19 @@ const REPOST_DEBOUNCE_MS = 30_000;
 
 export async function maybeRepostPanel(message: Message, services: Services): Promise<void> {
   if (message.author.bot) return;
-  const panelMsgId = services.settings.getString(`panel:bank:${message.channelId}`);
-  if (!panelMsgId) return;
+  for (const kind of PANEL_KINDS) {
+    const panelMsgId = services.settings.getString(`panel:${kind}:${message.channelId}`);
+    if (!panelMsgId) continue;
 
-  const now = Date.now();
-  if ((lastRepost.get(message.channelId) ?? 0) > now - REPOST_DEBOUNCE_MS) return;
-  lastRepost.set(message.channelId, now);
+    const now = Date.now();
+    const key = `${kind}:${message.channelId}`;
+    if ((lastRepost.get(key) ?? 0) > now - REPOST_DEBOUNCE_MS) continue;
+    lastRepost.set(key, now);
 
-  const channel = message.channel as TextChannel;
-  const old = await channel.messages.fetch(panelMsgId).catch(() => null);
-  if (old) await old.delete().catch(() => undefined);
-  const sent = await channel.send(bankPanelMessage());
-  services.settings.set(`panel:bank:${channel.id}`, sent.id, "system:panel-repost");
+    const channel = message.channel as TextChannel;
+    const old = await channel.messages.fetch(panelMsgId).catch(() => null);
+    if (old) await old.delete().catch(() => undefined);
+    const sent = await channel.send(kind === "entry" ? entryPanelMessage() : bankPanelMessage());
+    services.settings.set(`panel:${kind}:${channel.id}`, sent.id, "system:panel-repost");
+  }
 }

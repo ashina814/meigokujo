@@ -15,6 +15,17 @@ export const CHANNEL_KINDS = [
   ["kessai", "#決裁"],
   ["keikiban", "#城の計器盤"],
   ["audit_log", "監査ログ"],
+  ["entry_guide", "入城案内"],
+  ["session_vc", "説明会場VC"],
+] as const;
+
+/** ロール割当の種別（role:<kind> に保存） */
+export const ROLE_KINDS = [
+  ["queue_wait", "入城案内待ち"],
+  ["ghost", "亡霊"],
+  ["judge", "面接担当"],
+  ["male", "男性属性"],
+  ["female", "女性属性"],
 ] as const;
 
 const NUMERIC_KEYS = Object.keys(SETTING_DEFAULTS) as SettingKey[];
@@ -55,6 +66,19 @@ export const settingsCommand = new SlashCommandBuilder()
       .setName("管理ロール")
       .setDescription("/設定 を使える運営ロールを指定")
       .addRoleOption((o) => o.setName("ロール").setDescription("高度な管理者ロール").setRequired(true)),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("ロール")
+      .setDescription("機能が参照するロールを割り当てる")
+      .addStringOption((o) =>
+        o
+          .setName("種別")
+          .setDescription("どの用途のロールか")
+          .setRequired(true)
+          .addChoices(...ROLE_KINDS.map(([value, name]) => ({ name, value }))),
+      )
+      .addRoleOption((o) => o.setName("ロール").setDescription("割り当てるロール").setRequired(true)),
   );
 
 function isAdmin(interaction: ChatInputCommandInteraction, services: Services): boolean {
@@ -129,6 +153,18 @@ export async function handleSettings(
     services.settings.set("role:admin", role.id, actor);
     await interaction.reply({
       content: `✅ 管理ロールを <@&${role.id}> に設定しました。`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (sub === "ロール") {
+    const kind = interaction.options.getString("種別", true);
+    const role = interaction.options.getRole("ロール", true);
+    services.settings.set(`role:${kind}`, role.id, actor);
+    const label = ROLE_KINDS.find(([v]) => v === kind)?.[1] ?? kind;
+    await interaction.reply({
+      content: `✅ ${label} ロールを <@&${role.id}> に設定しました。`,
       flags: MessageFlags.Ephemeral,
     });
     return;

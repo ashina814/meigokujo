@@ -32,3 +32,5 @@ export {
 } from "./payroll/service.js";
 export { parseBalanceDump, splitForMigration, type DumpEntry, type ParsedDump, type MigrationSplit } from "./migration/parse.js";
 export { Migration, MigrationError, type MigrationErrorCode, type StagingRow, type StagingStatus, type MemberNameInfo, type ImportSummary, type MigrationReport } from "./migration/service.js";
+export { EventLog, type EventRow } from "./events/service.js";
+export { Entry, type BookingRow, type SoulRow, type GhostifyResult, type BookingStatus, type InviterSource } from "./entry/service.js";

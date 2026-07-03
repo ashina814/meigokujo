@@ -61,6 +61,50 @@ CREATE TABLE IF NOT EXISTS salary_table (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS events (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  type         TEXT NOT NULL,
+  actor_id     TEXT,
+  target_id    TEXT,
+  payload_json TEXT,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_target ON events(target_id, created_at);
+
+CREATE TABLE IF NOT EXISTS souls (
+  user_id             TEXT PRIMARY KEY,
+  status              TEXT NOT NULL DEFAULT 'waiting'
+                      CHECK (status IN ('waiting','ghost','majin','mazoku','meirei','departed')),
+  joined_at           INTEGER,
+  ghost_at            INTEGER,
+  eval_deadline_at    INTEGER,
+  eval_extension_days INTEGER NOT NULL DEFAULT 0,
+  inviter_user_id     TEXT,
+  inviter_source      TEXT,
+  updated_at          INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS entry_bookings (
+  user_id         TEXT PRIMARY KEY,
+  slot            TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'booked'
+                  CHECK (status IN ('booked','attended','ghosted','dropped')),
+  inviter_user_id TEXT,
+  inviter_source  TEXT NOT NULL DEFAULT 'none',
+  no_show_count   INTEGER NOT NULL DEFAULT 0,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bookings_slot ON entry_bookings(slot, status);
+
+CREATE TABLE IF NOT EXISTS invites (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  inviter_id TEXT NOT NULL,
+  invitee_id TEXT NOT NULL UNIQUE,
+  credited_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS migration_staging (
   rank         INTEGER PRIMARY KEY,
   display_name TEXT NOT NULL,

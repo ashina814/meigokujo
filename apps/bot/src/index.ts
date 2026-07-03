@@ -6,6 +6,12 @@ import { handleApprovalButton, handleTransfer, handleTransferButton } from "./co
 import { handleBankButton, handlePanelCommand, maybeRepostPanel } from "./commands/bank-panel.js";
 import { handleAdjust } from "./commands/adjust.js";
 import { handleMigration, handleMigrationButton } from "./commands/migration.js";
+import {
+  handleEntryButton,
+  handleMemberJoin,
+  handleSessionCommand,
+  handleVoiceAttendance,
+} from "./commands/entry.js";
 import { handleSalaryTable } from "./commands/salary-table.js";
 import { handlePaydayCommand } from "./commands/payday-command.js";
 import { handlePaydayButton } from "./payday.js";
@@ -14,7 +20,12 @@ import { startOutboxWorker } from "./outbox.js";
 
 const services = buildServices();
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMembers],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildVoiceStates,
+  ],
 });
 
 client.once(Events.ClientReady, (ready) => {
@@ -56,10 +67,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "移行":
           await handleMigration(interaction, services);
           return;
+        case "説明会":
+          await handleSessionCommand(interaction, services);
+          return;
       }
       return;
     }
+    if (
+      (interaction.isStringSelectMenu() || interaction.isUserSelectMenu()) &&
+      interaction.customId.startsWith("entry:")
+    ) {
+      await handleEntryButton(interaction, services);
+      return;
+    }
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith("entry:")) {
+        await handleEntryButton(interaction, services);
+        return;
+      }
       if (interaction.customId.startsWith("tf:")) {
         await handleTransferButton(interaction, services);
       } else if (interaction.customId.startsWith("apv:")) {
@@ -87,6 +112,20 @@ client.on(Events.MessageCreate, (message) => {
   void maybeRepostPanel(message, services).catch((err) =>
     console.error("[panel] 再掲失敗:", err),
   );
+});
+
+// 入城導線: 参加時のロール付与・案内
+client.on(Events.GuildMemberAdd, (member) => {
+  void handleMemberJoin(member, services).catch((err) => console.error("[entry] 参加処理失敗:", err));
+});
+
+// 入城導線: 説明会の出席自動記録
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  try {
+    handleVoiceAttendance(oldState, newState, services);
+  } catch (err) {
+    console.error("[entry] 出席記録失敗:", err);
+  }
 });
 
 function shutdown(): void {

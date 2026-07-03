@@ -8,7 +8,9 @@ export function jstNow(date = new Date()): {
   month: number;
   day: number;
   hour: number;
+  minute: number;
   period: string;
+  dateStr: string; // 'YYYY-MM-DD'
 } {
   const parts = new Intl.DateTimeFormat("ja-JP", {
     timeZone: "Asia/Tokyo",
@@ -16,17 +18,21 @@ export function jstNow(date = new Date()): {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
+    minute: "2-digit",
     hour12: false,
   }).formatToParts(date);
   const get = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? 0);
   const year = get("year");
   const month = get("month");
+  const day = get("day");
   return {
     year,
     month,
-    day: get("day"),
+    day,
     hour: get("hour") % 24,
+    minute: get("minute"),
     period: `${year}-${String(month).padStart(2, "0")}`,
+    dateStr: `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`,
   };
 }
 
@@ -37,6 +43,25 @@ export function jstNow(date = new Date()): {
 export function startScheduler(client: Client, services: Services, intervalMs = 60_000): NodeJS.Timeout {
   async function tick(): Promise<void> {
     const now = jstNow();
+
+    // ── 説明会の1時間前リマインド（毎日 20/21/22 時 = 21/22/23 時の各会の1時間前）──
+    if ([20, 21, 22].includes(now.hour) && now.minute < 2) {
+      const slot = `${now.dateStr} ${now.hour + 1}`;
+      const marker = `entry:reminded:${slot}`;
+      if (!services.settings.getString(marker)) {
+        services.settings.set(marker, "1", "system:scheduler");
+        const bookings = services.entry.listBySlot(slot).filter((b) => b.status === "booked");
+        const guideId = services.settings.getString("channel:entry_guide");
+        if (bookings.length > 0 && guideId) {
+          const channel = await client.channels.fetch(guideId).catch(() => null);
+          if (channel?.isTextBased() && "send" in channel) {
+            await channel.send(
+              `⏰ ${bookings.map((b) => `<@${b.user_id}>`).join(" ")} 説明会は **1時間後（${now.hour + 1}時）** です。時間になったら説明会場VCへどうぞ。`,
+            );
+          }
+        }
+      }
+    }
 
     // ── 給与の自動ドラフト: 毎月1日 09:00 JST 以降、その月にまだ投稿していなければ ──
     const marker = `payroll:draft_posted:${now.period}`;

@@ -7,6 +7,7 @@ import { adjustCommand } from "./commands/adjust.js";
 import { salaryTableCommand } from "./commands/salary-table.js";
 import { paydayCommand } from "./commands/payday-command.js";
 import { migrationCommand } from "./commands/migration.js";
+import { sessionCommand } from "./commands/entry.js";
 
 const commands = [
   settingsCommand.toJSON(),
@@ -16,6 +17,7 @@ const commands = [
   salaryTableCommand.toJSON(),
   paydayCommand.toJSON(),
   migrationCommand.toJSON(),
+  sessionCommand.toJSON(),
 ];
 
 const rest = new REST().setToken(config.token);

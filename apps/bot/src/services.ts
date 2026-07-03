@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { Ledger, Migration, Payroll, Settings, openDb, registerDefaultTxTypes } from "@meigokujo/core";
+import { Entry, EventLog, Ledger, Migration, Payroll, Settings, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import { config } from "./config.js";
 
 /**
@@ -19,7 +19,9 @@ export function buildServices() {
   });
   const payroll = new Payroll(db, ledger);
   const migration = new Migration(db, ledger);
-  return { db, settings, ledger, payroll, migration };
+  const events = new EventLog(db);
+  const entry = new Entry(db, ledger, settings, events);
+  return { db, settings, ledger, payroll, migration, events, entry };
 }
 
 export type Services = ReturnType<typeof buildServices>;
