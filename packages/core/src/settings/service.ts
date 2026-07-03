@@ -32,6 +32,8 @@ export const SETTING_DEFAULTS = {
   room_empty_grace_min: 5, // 全員退出からの削除猶予
   // bump/up 報酬
   bump_reward: 0, // 金額は運営が設定パネルで決める（0 = 支給しない）
+  // 移行（経済設計.md §9）
+  migration_cap: 5_000_000, // これを超える旧残高は /移行 承認 が必要（キャップ額は運営合意待ちの暫定値）
 } as const;
 
 export type SettingKey = keyof typeof SETTING_DEFAULTS;

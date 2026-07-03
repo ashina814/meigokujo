@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { Ledger, Payroll, Settings, openDb, registerDefaultTxTypes } from "@meigokujo/core";
+import { Ledger, Migration, Payroll, Settings, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import { config } from "./config.js";
 
 /**
@@ -18,7 +18,8 @@ export function buildServices() {
     approvalThreshold: () => settings.getNumber("approval_threshold"),
   });
   const payroll = new Payroll(db, ledger);
-  return { db, settings, ledger, payroll };
+  const migration = new Migration(db, ledger);
+  return { db, settings, ledger, payroll, migration };
 }
 
 export type Services = ReturnType<typeof buildServices>;

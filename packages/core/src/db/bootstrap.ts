@@ -61,6 +61,18 @@ CREATE TABLE IF NOT EXISTS salary_table (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS migration_staging (
+  rank         INTEGER PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  amount       INTEGER NOT NULL CHECK (amount > 0),
+  status       TEXT NOT NULL
+               CHECK (status IN ('auto','ambiguous','over_cap','unmatched','ready','done','excluded')),
+  user_id      TEXT,
+  note         TEXT,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS payout_runs (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   period      TEXT NOT NULL UNIQUE,
