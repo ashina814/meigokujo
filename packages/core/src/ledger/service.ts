@@ -48,8 +48,8 @@ export interface TransferResult {
 }
 
 export interface LedgerOptions {
-  /** これを超える取引は approvedBy 必須（既定 1,000,000 Ld。設定で可変） */
-  approvalThreshold?: number;
+  /** これを超える取引は approvedBy 必須（既定 1,000,000 Ld）。関数を渡すと毎回評価＝設定変更が即反映 */
+  approvalThreshold?: number | (() => number);
   /** 1取引の絶対上限（誤入力・暴走ガード） */
   maxAmount?: number;
   /** 未成年判定。魂台帳と接続する（未接続なら全員成人扱い） */
@@ -64,7 +64,7 @@ const now = () => Math.floor(Date.now() / 1000);
  * 全取引に actor / 冪等 / 通知は outbox 分離。
  */
 export class Ledger {
-  private readonly approvalThreshold: number;
+  private readonly approvalThresholdOpt: number | (() => number);
   private readonly maxAmount: number;
   private readonly isMinor: (accountId: string) => boolean;
 
@@ -72,10 +72,16 @@ export class Ledger {
     private readonly db: Database.Database,
     options: LedgerOptions = {},
   ) {
-    this.approvalThreshold = options.approvalThreshold ?? 1_000_000;
+    this.approvalThresholdOpt = options.approvalThreshold ?? 1_000_000;
     this.maxAmount = options.maxAmount ?? 100_000_000;
     this.isMinor = options.isMinor ?? (() => false);
     this.ensureAccount(TREASURY, "system");
+  }
+
+  private get approvalThreshold(): number {
+    return typeof this.approvalThresholdOpt === "function"
+      ? this.approvalThresholdOpt()
+      : this.approvalThresholdOpt;
   }
 
   ensureAccount(id: string, kind: AccountKind): void {
@@ -290,14 +296,21 @@ export class Ledger {
     return -this.balanceOf(TREASURY);
   }
 
-  pendingOutbox(limit = 50): Array<{ id: number; kind: string; payload: string }> {
+  pendingOutbox(limit = 50): Array<{ id: number; kind: string; payload: string; attempts: number }> {
+    // 10回失敗したエントリは配送を諦める（詰まり防止。データは残るので手動で追える）
     return this.db
-      .prepare("SELECT id, kind, payload FROM outbox WHERE delivered_at IS NULL ORDER BY id LIMIT ?")
-      .all(limit) as Array<{ id: number; kind: string; payload: string }>;
+      .prepare(
+        "SELECT id, kind, payload, attempts FROM outbox WHERE delivered_at IS NULL AND attempts < 10 ORDER BY id LIMIT ?",
+      )
+      .all(limit) as Array<{ id: number; kind: string; payload: string; attempts: number }>;
   }
 
   markOutboxDelivered(id: number): void {
     this.db.prepare("UPDATE outbox SET delivered_at = ? WHERE id = ?").run(now(), id);
+  }
+
+  incrementOutboxAttempts(id: number): void {
+    this.db.prepare("UPDATE outbox SET attempts = attempts + 1 WHERE id = ?").run(id);
   }
 
   private applyBalance(accountId: string, delta: number, ts: number): void {
@@ -310,8 +323,20 @@ export class Ledger {
   }
 
   private enqueueOutbox(kind: string, tx: TxRow, ts: number): void {
-    this.db
-      .prepare("INSERT INTO outbox (kind, payload, created_at) VALUES (?, ?, ?)")
-      .run(kind, JSON.stringify({ txId: tx.id, type: tx.type, from: tx.from_account, to: tx.to_account, amount: tx.amount }), ts);
+    this.db.prepare("INSERT INTO outbox (kind, payload, created_at) VALUES (?, ?, ?)").run(
+      kind,
+      JSON.stringify({
+        txId: tx.id,
+        type: tx.type,
+        from: tx.from_account,
+        to: tx.to_account,
+        amount: tx.amount,
+        reason: tx.reason,
+        actor: tx.actor_id,
+        refType: tx.ref_type,
+        refId: tx.ref_id,
+      }),
+      ts,
+    );
   }
 }

@@ -1,0 +1,17 @@
+# systemd unit（VPS の既存流儀に合わせる: event-planning-bot 等と同形式）
+# 配置例: /etc/systemd/system/meigokujo-bot.service
+[Unit]
+Description=Meigokujo Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/meigokujo/apps/bot
+ExecStart=/usr/bin/env pnpm start
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
