@@ -81,6 +81,29 @@ describe("印台帳と閾値", () => {
     expect(ctx.events.listByTarget("bob").map((e) => e.type)).toContain("demotion");
   });
 
+  it("同一評価員の再評価は上書き（印が重複しない）", () => {
+    // 同じ評価員が3回昇格印を付けても1個
+    for (let i = 0; i < 3; i++) submit(ctx, "dave", "promotion");
+    expect(ctx.evaluation.promotionScore("dave").evalMarks).toBe(1);
+    expect(ctx.evaluation.evaluationCount("dave")).toBe(1);
+
+    // 結論を変えたら古い印は消えて新しい印だけが残る
+    submit(ctx, "dave", "demotion");
+    expect(ctx.evaluation.promotionScore("dave").evalMarks).toBe(0);
+    expect(ctx.evaluation.demotionCount("dave")).toBe(1);
+
+    // 印なしに変えたら両方消える
+    submit(ctx, "dave", "none");
+    expect(ctx.evaluation.promotionScore("dave").evalMarks).toBe(0);
+    expect(ctx.evaluation.demotionCount("dave")).toBe(0);
+
+    // 別の評価員の印は影響を受けない
+    submit(ctx, "dave", "promotion", "user:other");
+    submit(ctx, "dave", "promotion");
+    expect(ctx.evaluation.promotionScore("dave").evalMarks).toBe(2);
+    expect(ctx.evaluation.evaluationCount("dave")).toBe(2);
+  });
+
   it("取り消した印は集計に入らない", () => {
     const r1 = submit(ctx, "carol", "demotion");
     expect(ctx.evaluation.demotionCount("carol")).toBe(1);

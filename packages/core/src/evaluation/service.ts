@@ -104,6 +104,21 @@ export class Evaluation {
     conclusion: Conclusion;
     threadId?: string;
   }): SubmitResult {
+    // 同一評価員の再評価は上書き: 同じ評価員が同じ対象に付けた既存の印を取り消してから記帳する
+    // （1評価員=最新の結論1つだけが有効。評価の履歴自体は evaluations に追記で残る）
+    const superseded = this.db
+      .prepare(
+        "UPDATE marks SET revoked_at = ? WHERE target_id = ? AND granted_by = ? AND ref = 'evaluation' AND revoked_at IS NULL",
+      )
+      .run(now(), input.targetId, input.evaluatorId);
+    if (superseded.changes > 0) {
+      this.events.log("mark_superseded", {
+        actor: input.evaluatorId,
+        target: input.targetId,
+        payload: { count: superseded.changes },
+      });
+    }
+
     let markId: number | null = null;
     if (input.conclusion !== "none") {
       markId = this.addMark(input.targetId, input.conclusion, input.evaluatorId, "evaluation");
@@ -135,9 +150,12 @@ export class Evaluation {
     };
   }
 
+  /** 評価件数 = 評価員の人数（同一評価員の再評価は1件と数える） */
   evaluationCount(targetId: string): number {
     return (
-      this.db.prepare("SELECT COUNT(*) AS c FROM evaluations WHERE target_id = ?").get(targetId) as { c: number }
+      this.db
+        .prepare("SELECT COUNT(DISTINCT evaluator_id) AS c FROM evaluations WHERE target_id = ?")
+        .get(targetId) as { c: number }
     ).c;
   }
 
