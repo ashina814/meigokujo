@@ -53,6 +53,27 @@ CREATE TABLE IF NOT EXISTS settings (
   value      TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS salary_table (
+  role_id    TEXT PRIMARY KEY,
+  label      TEXT NOT NULL,
+  amount     INTEGER NOT NULL CHECK (amount >= 0),
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS payout_runs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  period      TEXT NOT NULL UNIQUE,
+  status      TEXT NOT NULL DEFAULT 'draft'
+              CHECK (status IN ('draft','approved','executed','cancelled')),
+  plan_json   TEXT NOT NULL,
+  report_json TEXT,
+  created_by  TEXT NOT NULL,
+  approved_by TEXT,
+  executed_at INTEGER,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
 `;
 
 export function openDb(path: string): Database.Database {
