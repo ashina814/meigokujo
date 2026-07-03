@@ -30,3 +30,4 @@ export {
   type ExecutionReport,
   type RunStatus,
 } from "./payroll/service.js";
+export { parseBalanceDump, splitForMigration, type DumpEntry, type ParsedDump, type MigrationSplit } from "./migration/parse.js";
