@@ -24,6 +24,7 @@ export const ROLE_KINDS = [
   ["queue_wait", "入城案内待ち"],
   ["ghost", "亡霊"],
   ["judge", "面接担当"],
+  ["ticket_staff", "チケット対応"],
   ["male", "男性属性"],
   ["female", "女性属性"],
 ] as const;

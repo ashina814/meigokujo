@@ -12,6 +12,8 @@ import {
   handleSessionCommand,
   handleVoiceAttendance,
 } from "./commands/entry.js";
+import { handleTicketButton } from "./commands/tickets.js";
+import { trackVoiceState } from "./vc-tracking.js";
 import { handleSalaryTable } from "./commands/salary-table.js";
 import { handlePaydayCommand } from "./commands/payday-command.js";
 import { handlePaydayButton } from "./payday.js";
@@ -85,6 +87,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleEntryButton(interaction, services);
         return;
       }
+      if (interaction.customId.startsWith("ticket:")) {
+        await handleTicketButton(interaction, services);
+        return;
+      }
       if (interaction.customId.startsWith("tf:")) {
         await handleTransferButton(interaction, services);
       } else if (interaction.customId.startsWith("apv:")) {
@@ -119,12 +125,13 @@ client.on(Events.GuildMemberAdd, (member) => {
   void handleMemberJoin(member, services).catch((err) => console.error("[entry] 参加処理失敗:", err));
 });
 
-// 入城導線: 説明会の出席自動記録
+// VC計測（全VC）+ 入城導線の説明会出席記録
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   try {
+    trackVoiceState(oldState, newState, services);
     handleVoiceAttendance(oldState, newState, services);
   } catch (err) {
-    console.error("[entry] 出席記録失敗:", err);
+    console.error("[vc] 記録失敗:", err);
   }
 });
 

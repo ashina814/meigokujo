@@ -13,6 +13,7 @@ import {
 import { fmtLd, formatHistLine } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import { entryPanelMessage } from "./entry.js";
+import { ticketPanelMessage } from "./tickets.js";
 import type { Services } from "../services.js";
 
 export const panelCommand = new SlashCommandBuilder()
@@ -24,10 +25,20 @@ export const panelCommand = new SlashCommandBuilder()
       .setName("種別")
       .setDescription("設置するパネル")
       .setRequired(true)
-      .addChoices({ name: "冥獄銀行", value: "bank" }, { name: "入城申請", value: "entry" }),
+      .addChoices(
+        { name: "冥獄銀行", value: "bank" },
+        { name: "入城申請", value: "entry" },
+        { name: "チケット受付", value: "ticket" },
+      ),
   );
 
-const PANEL_KINDS = ["bank", "entry"] as const;
+const PANEL_KINDS = ["bank", "entry", "ticket"] as const;
+
+const PANEL_LABELS: Record<(typeof PANEL_KINDS)[number], string> = {
+  bank: "冥獄銀行",
+  entry: "入城申請",
+  ticket: "チケット受付",
+};
 
 function bankPanelMessage() {
   const embed = new EmbedBuilder()
@@ -54,14 +65,20 @@ export async function handlePanelCommand(
   const channel = interaction.channel as TextChannel | null;
   if (!channel?.isTextBased()) return;
 
-  const kind = interaction.options.getString("種別", true);
-  const sent = await channel.send(kind === "entry" ? entryPanelMessage() : bankPanelMessage());
+  const kind = interaction.options.getString("種別", true) as (typeof PANEL_KINDS)[number];
+  const sent = await channel.send(panelMessageFor(kind));
   await sent.pin().catch(() => undefined); // ピン留め権限がなくても設置自体は成立させる
   services.settings.set(`panel:${kind}:${channel.id}`, sent.id, `user:${interaction.user.id}`);
   await interaction.reply({
-    content: `✅ ${kind === "entry" ? "入城申請" : "冥獄銀行"}パネルを設置しました（会話で流れたら自動で貼り直します）。`,
+    content: `✅ ${PANEL_LABELS[kind]}パネルを設置しました（会話で流れたら自動で貼り直します）。`,
     flags: MessageFlags.Ephemeral,
   });
+}
+
+function panelMessageFor(kind: (typeof PANEL_KINDS)[number]) {
+  if (kind === "entry") return entryPanelMessage();
+  if (kind === "ticket") return ticketPanelMessage();
+  return bankPanelMessage();
 }
 
 export async function handleBankButton(
@@ -137,7 +154,7 @@ export async function maybeRepostPanel(message: Message, services: Services): Pr
     const channel = message.channel as TextChannel;
     const old = await channel.messages.fetch(panelMsgId).catch(() => null);
     if (old) await old.delete().catch(() => undefined);
-    const sent = await channel.send(kind === "entry" ? entryPanelMessage() : bankPanelMessage());
+    const sent = await channel.send(panelMessageFor(kind));
     services.settings.set(`panel:${kind}:${channel.id}`, sent.id, "system:panel-repost");
   }
 }

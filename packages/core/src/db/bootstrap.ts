@@ -105,6 +105,31 @@ CREATE TABLE IF NOT EXISTS invites (
   credited_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS vc_segments (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id       TEXT NOT NULL,
+  channel_id    TEXT NOT NULL,
+  started_at    INTEGER NOT NULL,
+  ended_at      INTEGER,
+  self_muted    INTEGER NOT NULL DEFAULT 0,
+  self_deafened INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_vc_user ON vc_segments(user_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_vc_open ON vc_segments(ended_at) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_vc_channel ON vc_segments(channel_id, started_at);
+
+CREATE TABLE IF NOT EXISTS tickets (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id   TEXT NOT NULL UNIQUE,
+  user_id     TEXT NOT NULL,
+  kind        TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','claimed','closed')),
+  claimed_by  TEXT,
+  reminded_at INTEGER,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS migration_staging (
   rank         INTEGER PRIMARY KEY,
   display_name TEXT NOT NULL,

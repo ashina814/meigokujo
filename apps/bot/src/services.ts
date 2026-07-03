@@ -1,6 +1,17 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { Entry, EventLog, Ledger, Migration, Payroll, Settings, openDb, registerDefaultTxTypes } from "@meigokujo/core";
+import {
+  Entry,
+  EventLog,
+  Ledger,
+  Migration,
+  Payroll,
+  Settings,
+  Tickets,
+  VcTracker,
+  openDb,
+  registerDefaultTxTypes,
+} from "@meigokujo/core";
 import { config } from "./config.js";
 
 /**
@@ -21,7 +32,12 @@ export function buildServices() {
   const migration = new Migration(db, ledger);
   const events = new EventLog(db);
   const entry = new Entry(db, ledger, settings, events);
-  return { db, settings, ledger, payroll, migration, events, entry };
+  const vc = new VcTracker(db);
+  const tickets = new Tickets(db, events);
+  // クラッシュで閉じ損ねたVCセグメントの後始末
+  const dangling = vc.closeAllDangling();
+  if (dangling > 0) console.warn(`[vc] 閉じ損ねセグメントを ${dangling} 件補正しました`);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets };
 }
 
 export type Services = ReturnType<typeof buildServices>;

@@ -63,6 +63,25 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
+    // ── 24時間無応答チケットのリマインド（毎時0分にチェック）──
+    if (now.minute < 2) {
+      const stale = services.tickets.staleOpen(24);
+      if (stale.length > 0) {
+        const kessaiId = services.settings.getString("channel:kessai");
+        const staffRoleId = services.settings.getString("role:ticket_staff");
+        const channel = kessaiId ? await client.channels.fetch(kessaiId).catch(() => null) : null;
+        if (channel?.isTextBased() && "send" in channel) {
+          await channel.send(
+            [
+              `📮 ${staffRoleId ? `<@&${staffRoleId}> ` : ""}**24時間以上応答のないチケットが ${stale.length} 件あります**:`,
+              ...stale.map((t) => `・<#${t.thread_id}>（${t.kind === "return" ? "出戻り" : "相談"}）`),
+            ].join("\n"),
+          );
+          for (const t of stale) services.tickets.markReminded(t.thread_id);
+        }
+      }
+    }
+
     // ── 給与の自動ドラフト: 毎月1日 09:00 JST 以降、その月にまだ投稿していなければ ──
     const marker = `payroll:draft_posted:${now.period}`;
     if (now.day === 1 && now.hour >= 9 && !services.settings.getString(marker)) {
