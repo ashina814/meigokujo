@@ -293,7 +293,7 @@ export class Ledger {
 
   /** 通貨発行残高 = 国庫残高の符号反転（経済設計.md §2） */
   moneySupply(): number {
-    return -this.balanceOf(TREASURY);
+    return -this.balanceOf(TREASURY) || 0; // 「-0」表示を防ぐ
   }
 
   pendingOutbox(limit = 50): Array<{ id: number; kind: string; payload: string; attempts: number }> {

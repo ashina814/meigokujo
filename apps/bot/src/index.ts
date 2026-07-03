@@ -4,6 +4,7 @@ import { buildServices } from "./services.js";
 import { handleSettings } from "./commands/settings.js";
 import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
 import { handleBankButton, handlePanelCommand, maybeRepostPanel } from "./commands/bank-panel.js";
+import { handleAdjust } from "./commands/adjust.js";
 import { startOutboxWorker } from "./outbox.js";
 
 const services = buildServices();
@@ -36,6 +37,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "パネル設置":
           await handlePanelCommand(interaction, services);
+          return;
+        case "調整":
+          await handleAdjust(interaction, services);
           return;
       }
       return;
