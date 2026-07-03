@@ -17,13 +17,19 @@ export const CHANNEL_KINDS = [
   ["audit_log", "監査ログ"],
   ["entry_guide", "入城案内"],
   ["session_vc", "説明会場VC"],
+  ["eval_forum", "評価フォーラム"],
+  ["shurei", "集令"],
 ] as const;
 
 /** ロール割当の種別（role:<kind> に保存） */
 export const ROLE_KINDS = [
   ["queue_wait", "入城案内待ち"],
   ["ghost", "亡霊"],
+  ["meirei", "迷霊"],
   ["judge", "面接担当"],
+  ["swordsman", "魔剣士"],
+  ["mendan", "面談待ち"],
+  ["shin", "審（昇格面談の審査）"],
   ["ticket_staff", "チケット対応"],
   ["male", "男性属性"],
   ["female", "女性属性"],

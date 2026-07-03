@@ -1,5 +1,6 @@
-import type { Client } from "discord.js";
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, type Client, type TextChannel } from "discord.js";
 import { createAndPostDraft } from "./payday.js";
+import { threadTitleFor } from "./commands/evaluation.js";
 import type { Services } from "./services.js";
 
 /** JSTの現在時刻の分解値。VPSのTZに依存しないよう明示的に変換する */
@@ -82,6 +83,12 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
+    // ── カロン: 毎日 09:00 台に期限リスト・演出通知・迷霊落ち承認パネル ──
+    if (now.hour === 9 && !services.settings.getString(`charon:daily:${now.dateStr}`)) {
+      services.settings.set(`charon:daily:${now.dateStr}`, "1", "system:scheduler");
+      await runCharonDaily(client, services);
+    }
+
     // ── 給与の自動ドラフト: 毎月1日 09:00 JST 以降、その月にまだ投稿していなければ ──
     const marker = `payroll:draft_posted:${now.period}`;
     if (now.day === 1 && now.hour >= 9 && !services.settings.getString(marker)) {
@@ -101,4 +108,84 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
   }
 
   return setInterval(() => void tick().catch((e) => console.error("[刻時盤] tick失敗:", e)), intervalMs);
+}
+
+/** カロンの日次業務: 期限リスト（計器盤）・本人への演出通知・期限切れの承認パネル（#決裁）・スレ題名の同期 */
+export async function runCharonDaily(client: Client, services: Services): Promise<void> {
+  const nowTs = Math.floor(Date.now() / 1000);
+  const DAY = 86_400;
+
+  const fetchText = async (settingKey: string): Promise<TextChannel | null> => {
+    const id = services.settings.getString(settingKey);
+    if (!id) return null;
+    const ch = await client.channels.fetch(id).catch(() => null);
+    return ch?.isTextBased() && "send" in ch ? (ch as TextChannel) : null;
+  };
+
+  // ① 期限が近い者のリスト → #城の計器盤
+  const dueSoon = services.evaluation.dueBetween(nowTs, nowTs + 2 * DAY);
+  const keikiban = await fetchText("channel:keikiban");
+  if (keikiban && dueSoon.length > 0) {
+    const lines = dueSoon.map((r) => {
+      const p = services.evaluation.promotionScore(r.user_id);
+      const d = services.evaluation.demotionCount(r.user_id);
+      return `・<@${r.user_id}> 期限 <t:${r.eval_deadline_at}:R> — 昇格印 ${p.total}/5・低評価印 ${d}/4・評価 ${services.evaluation.evaluationCount(r.user_id)}件`;
+    });
+    await keikiban.send({
+      content: `🛶 **カロンの帳簿** — 審判が近い魂:\n${lines.join("\n")}`,
+      allowedMentions: { parse: [] },
+    });
+  }
+
+  // ② 本人への演出通知（3日前・前日・当日、各1回）
+  const upcoming = services.evaluation.dueBetween(nowTs, nowTs + 4 * DAY);
+  for (const r of upcoming) {
+    const daysLeft = Math.floor((r.eval_deadline_at - nowTs) / DAY);
+    if (![3, 1, 0].includes(daysLeft)) continue;
+    const marker = `charon:notified:${r.user_id}:${daysLeft}`;
+    if (services.settings.getString(marker)) continue;
+    services.settings.set(marker, "1", "system:charon");
+    const user = await client.users.fetch(r.user_id).catch(() => null);
+    await user
+      ?.send(
+        daysLeft === 0
+          ? "🛶 **汝の審判は今日である。** 冥獄の魂たちは汝の姿を見ているか。"
+          : `🛶 **汝の審判まで、あと${daysLeft}日。** 評価対象の場に姿を見せよ。`,
+      )
+      .catch(() => undefined);
+  }
+
+  // ③ 期限切れ（昇格印不足）→ #決裁 に承認パネル
+  const overdue = services.evaluation.overdue(nowTs);
+  const kessai = await fetchText("channel:kessai");
+  if (kessai && overdue.length > 0) {
+    const lines = overdue.slice(0, 20).map((r) => {
+      const p = services.evaluation.promotionScore(r.user_id);
+      return `・<@${r.user_id}>（昇格印 ${p.total}/5・期限 <t:${r.eval_deadline_at}:D>）`;
+    });
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("charon:drop").setLabel(`${overdue.length}名を迷霊に落とす`).setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("charon:cancel").setLabel("今日は見送る").setStyle(ButtonStyle.Secondary),
+    );
+    await kessai.send({
+      content: `⚖️ **カロンの上申** — 評価期限が到達し昇格印が不足している魂 **${overdue.length}名**:\n${lines.join("\n")}`,
+      components: [row],
+      allowedMentions: { parse: [] },
+    });
+  }
+
+  // ④ 評価スレッドの題名を実際の期限に同期（招待延長でズレた分の自己修復）
+  const guildId = services.settings.getString("guild:main");
+  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
+  if (guild) {
+    for (const r of [...dueSoon, ...upcoming]) {
+      const threadId = services.evaluation.threadFor(r.user_id);
+      if (!threadId) continue;
+      const thread = await client.channels.fetch(threadId).catch(() => null);
+      if (!thread?.isThread()) continue;
+      const member = await guild.members.fetch(r.user_id).catch(() => null);
+      const expected = threadTitleFor(member?.displayName ?? r.user_id, r.eval_deadline_at);
+      if (thread.name !== expected) await thread.setName(expected).catch(() => undefined);
+    }
+  }
 }

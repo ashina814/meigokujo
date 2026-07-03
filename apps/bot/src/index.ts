@@ -13,6 +13,12 @@ import {
   handleVoiceAttendance,
 } from "./commands/entry.js";
 import { handleTicketButton } from "./commands/tickets.js";
+import {
+  handleCharonButton,
+  handleEvaluationCommand,
+  handleEvaluationModal,
+  handleEvaluationSelect,
+} from "./commands/evaluation.js";
 import { trackVoiceState } from "./vc-tracking.js";
 import { handleSalaryTable } from "./commands/salary-table.js";
 import { handlePaydayCommand } from "./commands/payday-command.js";
@@ -72,7 +78,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "説明会":
           await handleSessionCommand(interaction, services);
           return;
+        case "評価":
+          await handleEvaluationCommand(interaction, services);
+          return;
       }
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId === "eval:modal") {
+      await handleEvaluationModal(interaction, services);
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {
+      await handleEvaluationSelect(interaction, services);
       return;
     }
     if (
@@ -89,6 +106,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("ticket:")) {
         await handleTicketButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("charon:")) {
+        await handleCharonButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("tf:")) {

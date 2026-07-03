@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
   Entry,
+  Evaluation,
   EventLog,
   Ledger,
   Migration,
@@ -34,10 +35,11 @@ export function buildServices() {
   const entry = new Entry(db, ledger, settings, events);
   const vc = new VcTracker(db);
   const tickets = new Tickets(db, events);
+  const evaluation = new Evaluation(db, settings, events);
   // クラッシュで閉じ損ねたVCセグメントの後始末
   const dangling = vc.closeAllDangling();
   if (dangling > 0) console.warn(`[vc] 閉じ損ねセグメントを ${dangling} 件補正しました`);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets };
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation };
 }
 
 export type Services = ReturnType<typeof buildServices>;

@@ -105,6 +105,35 @@ CREATE TABLE IF NOT EXISTS invites (
   credited_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS marks (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  target_id  TEXT NOT NULL,
+  kind       TEXT NOT NULL CHECK (kind IN ('promotion','demotion')),
+  granted_by TEXT NOT NULL,
+  ref        TEXT,
+  created_at INTEGER NOT NULL,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_marks_target ON marks(target_id, kind);
+
+CREATE TABLE IF NOT EXISTS evaluations (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  target_id    TEXT NOT NULL,
+  evaluator_id TEXT NOT NULL,
+  scores_json  TEXT NOT NULL,
+  texts_json   TEXT NOT NULL,
+  conclusion   TEXT NOT NULL CHECK (conclusion IN ('promotion','demotion','none')),
+  mark_id      INTEGER REFERENCES marks(id),
+  thread_id    TEXT,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eval_target ON evaluations(target_id, created_at);
+
+CREATE TABLE IF NOT EXISTS eval_threads (
+  user_id   TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS vc_segments (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id       TEXT NOT NULL,
