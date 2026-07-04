@@ -10,7 +10,13 @@ import { EventLog } from "../events/service.js";
  */
 export const HOUSE = "sys:house";
 
-export type CasinoErrorCode = "ERR_BAD_BET" | "ERR_INSUFFICIENT_CHIPS" | "ERR_HOUSE_SHORT" | "ERR_BAD_PICK";
+export type CasinoErrorCode =
+  | "ERR_BAD_BET"
+  | "ERR_INSUFFICIENT_CHIPS"
+  | "ERR_HOUSE_SHORT"
+  | "ERR_BAD_PICK"
+  | "ERR_ACTIVE_GAME"
+  | "ERR_NO_GAME";
 
 export class CasinoError extends Error {
   constructor(
@@ -60,6 +66,75 @@ const SLOT_MAX_MULT = 50;
 // ルーレットの赤（欧州式）。それ以外(0除く)は黒、0は緑
 const ROULETTE_RED = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
 
+// ---- トランプ（ブラックジャック・ハイロー）----
+export interface Card {
+  rank: number; // 1..13 (A..K)
+  suit: string; // ♠♥♦♣
+}
+const SUITS = ["♠", "♥", "♦", "♣"];
+const RANK_LABEL = ["", "A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
+export const cardLabel = (c: Card): string => `${RANK_LABEL[c.rank]}${c.suit}`;
+function freshDeck(): Card[] {
+  const d: Card[] = [];
+  for (const s of SUITS) for (let r = 1; r <= 13; r++) d.push({ rank: r, suit: s });
+  return d;
+}
+/** ブラックジャックの手札価値（Aは11、超えたら1に落とす） */
+function bjValue(cards: Card[]): number {
+  let sum = 0;
+  let aces = 0;
+  for (const c of cards) {
+    if (c.rank === 1) {
+      aces++;
+      sum += 11;
+    } else sum += Math.min(10, c.rank);
+  }
+  while (sum > 21 && aces > 0) {
+    sum -= 10;
+    aces--;
+  }
+  return sum;
+}
+const isNatural = (cards: Card[]): boolean => cards.length === 2 && bjValue(cards) === 21;
+
+export type BJState = "playing" | "player_bust" | "win" | "lose" | "push" | "blackjack";
+export interface BJView {
+  bet: number;
+  player: { cards: string[]; value: number };
+  dealer: { cards: string[]; value: number; hidden: boolean };
+  state: BJState;
+  payout: number;
+  net: number;
+}
+
+export type HiLoState = "playing" | "bust" | "cashed";
+export interface HiLoView {
+  bet: number;
+  current: string;
+  pot: number;
+  streak: number;
+  state: HiLoState;
+  last?: string; // 直前にめくったカード
+  higher: { count: number; mult: number };
+  lower: { count: number; mult: number };
+  tableLimit: boolean;
+  payout?: number;
+}
+
+interface BJSession {
+  bet: number;
+  deck: Card[];
+  player: Card[];
+  dealer: Card[];
+}
+interface HiLoSession {
+  bet: number;
+  pot: number; // 現在の配当見込み（float）
+  currentRank: number;
+  currentLabel: string;
+  streak: number;
+}
+
 export class Casino {
   constructor(
     private readonly db: Database.Database,
@@ -98,8 +173,167 @@ export class Casino {
     if (payout > 0) this.chips.transfer(HOUSE, playerId, payout); // 当たりは胴元から
   }
 
+  private readonly bjSessions = new Map<string, BJSession>();
+  private readonly hiloSessions = new Map<string, HiLoSession>();
+
   private randInt(n: number): number {
     return Math.min(n - 1, Math.floor(this.rng() * n));
+  }
+  private drawFrom(deck: Card[]): Card {
+    return deck.splice(this.randInt(deck.length), 1)[0]!;
+  }
+  /** 掛け金を胴元へ */
+  private takeBet(playerId: string, bet: number): void {
+    this.chips.transfer(playerId, HOUSE, bet);
+  }
+  /** 胴元から配当（胴元残でキャップ＝テーブルリミット。新規発行は絶対にしない） */
+  private pay(playerId: string, amount: number): number {
+    const a = Math.min(Math.floor(amount), this.houseBalance());
+    if (a > 0) this.chips.transfer(HOUSE, playerId, a);
+    return a;
+  }
+
+  // ---- ブラックジャック ----
+  hasBlackjack(playerId: string): boolean {
+    return this.bjSessions.has(playerId);
+  }
+  private bjView(bet: number, player: Card[], dealer: Card[], state: BJState, payout: number, hidden: boolean): BJView {
+    return {
+      bet,
+      player: { cards: player.map(cardLabel), value: bjValue(player) },
+      dealer: { cards: hidden ? [cardLabel(dealer[0]!), "🂠"] : dealer.map(cardLabel), value: hidden ? bjValue([dealer[0]!]) : bjValue(dealer), hidden },
+      state,
+      payout,
+      net: payout - bet,
+    };
+  }
+
+  blackjackStart(playerId: string, bet: number): BJView {
+    if (this.bjSessions.has(playerId)) throw new CasinoError("ERR_ACTIVE_GAME", { game: "blackjack" });
+    this.ensureBet(playerId, bet, 3); // 最大2.5倍(BJ)＋余裕
+    this.takeBet(playerId, bet);
+    const deck = freshDeck();
+    const player = [this.drawFrom(deck), this.drawFrom(deck)];
+    const dealer = [this.drawFrom(deck), this.drawFrom(deck)];
+    const playerBJ = isNatural(player);
+    const dealerBJ = isNatural(dealer);
+    if (playerBJ || dealerBJ) {
+      let payout = 0;
+      let state: BJState = "lose";
+      if (playerBJ && dealerBJ) {
+        payout = bet;
+        state = "push";
+      } else if (playerBJ) {
+        payout = Math.floor((bet * 5) / 2); // 3:2
+        state = "blackjack";
+      }
+      const paid = this.pay(playerId, payout);
+      this.events.log("casino_blackjack", { actor: playerId, payload: { bet, state, payout: paid } });
+      return this.bjView(bet, player, dealer, state, paid, false);
+    }
+    this.bjSessions.set(playerId, { bet, deck, player, dealer });
+    return this.bjView(bet, player, dealer, "playing", 0, true);
+  }
+
+  blackjackHit(playerId: string): BJView {
+    const s = this.bjSessions.get(playerId);
+    if (!s) throw new CasinoError("ERR_NO_GAME", { game: "blackjack" });
+    s.player.push(this.drawFrom(s.deck));
+    if (bjValue(s.player) > 21) {
+      this.bjSessions.delete(playerId);
+      this.events.log("casino_blackjack", { actor: playerId, payload: { bet: s.bet, state: "player_bust", payout: 0 } });
+      return this.bjView(s.bet, s.player, s.dealer, "player_bust", 0, false);
+    }
+    return this.bjView(s.bet, s.player, s.dealer, "playing", 0, true);
+  }
+
+  blackjackStand(playerId: string): BJView {
+    const s = this.bjSessions.get(playerId);
+    if (!s) throw new CasinoError("ERR_NO_GAME", { game: "blackjack" });
+    while (bjValue(s.dealer) < 17) s.dealer.push(this.drawFrom(s.deck));
+    const pv = bjValue(s.player);
+    const dv = bjValue(s.dealer);
+    let state: BJState;
+    let payout = 0;
+    if (dv > 21 || pv > dv) {
+      state = "win";
+      payout = s.bet * 2;
+    } else if (pv === dv) {
+      state = "push";
+      payout = s.bet;
+    } else {
+      state = "lose";
+    }
+    const paid = this.pay(playerId, payout);
+    this.bjSessions.delete(playerId);
+    this.events.log("casino_blackjack", { actor: playerId, payload: { bet: s.bet, state, payout: paid } });
+    return this.bjView(s.bet, s.player, s.dealer, state, paid, false);
+  }
+
+  // ---- ハイロー（連勝＋キャッシュアウト）----
+  hasHiLo(playerId: string): boolean {
+    return this.hiloSessions.has(playerId);
+  }
+  private hiloMult(favorable: number): number {
+    return favorable <= 0 ? 0 : (0.95 * 13) / favorable; // 5%エッジ。必ず1倍超
+  }
+  private hiloView(s: HiLoSession, state: HiLoState, last?: string, payout?: number): HiLoView {
+    const higherCount = 13 - s.currentRank;
+    const lowerCount = s.currentRank - 1;
+    return {
+      bet: s.bet,
+      current: s.currentLabel,
+      pot: Math.floor(s.pot),
+      streak: s.streak,
+      state,
+      last,
+      higher: { count: higherCount, mult: Math.round(this.hiloMult(higherCount) * 100) / 100 },
+      lower: { count: lowerCount, mult: Math.round(this.hiloMult(lowerCount) * 100) / 100 },
+      tableLimit: Math.floor(s.pot) >= this.houseBalance(),
+      payout,
+    };
+  }
+  private drawCard(): Card {
+    return { rank: this.randInt(13) + 1, suit: SUITS[this.randInt(4)]! };
+  }
+
+  hiloStart(playerId: string, bet: number): HiLoView {
+    if (this.hiloSessions.has(playerId)) throw new CasinoError("ERR_ACTIVE_GAME", { game: "hilo" });
+    this.ensureBet(playerId, bet, 2);
+    this.takeBet(playerId, bet);
+    const c = this.drawCard();
+    const s: HiLoSession = { bet, pot: bet, currentRank: c.rank, currentLabel: cardLabel(c), streak: 0 };
+    this.hiloSessions.set(playerId, s);
+    return this.hiloView(s, "playing");
+  }
+
+  hiloGuess(playerId: string, dir: "higher" | "lower"): HiLoView {
+    const s = this.hiloSessions.get(playerId);
+    if (!s) throw new CasinoError("ERR_NO_GAME", { game: "hilo" });
+    const favorable = dir === "higher" ? 13 - s.currentRank : s.currentRank - 1;
+    const next = this.drawCard();
+    const win = dir === "higher" ? next.rank > s.currentRank : next.rank < s.currentRank;
+    if (!win || favorable <= 0) {
+      this.hiloSessions.delete(playerId);
+      this.events.log("casino_hilo", { actor: playerId, payload: { bet: s.bet, streak: s.streak, state: "bust" } });
+      return this.hiloView(s, "bust", cardLabel(next));
+    }
+    s.pot *= this.hiloMult(favorable);
+    s.currentRank = next.rank;
+    s.currentLabel = cardLabel(next);
+    s.streak++;
+    // テーブルリミット: 胴元残を超えたらそこで頭打ち（キャップ）
+    if (Math.floor(s.pot) > this.houseBalance()) s.pot = this.houseBalance();
+    return this.hiloView(s, "playing", cardLabel(next));
+  }
+
+  hiloCashout(playerId: string): HiLoView {
+    const s = this.hiloSessions.get(playerId);
+    if (!s) throw new CasinoError("ERR_NO_GAME", { game: "hilo" });
+    const paid = this.pay(playerId, Math.floor(s.pot));
+    this.hiloSessions.delete(playerId);
+    this.events.log("casino_hilo", { actor: playerId, payload: { bet: s.bet, streak: s.streak, state: "cashed", payout: paid } });
+    return this.hiloView(s, "cashed", undefined, paid);
   }
 
   // ---- コイン ----

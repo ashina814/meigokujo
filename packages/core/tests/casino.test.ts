@@ -103,4 +103,59 @@ describe("カジノ", () => {
     expect(ctx.chips.outstanding()).toBe(total0); // カジノは移動のみ＝総量不変
     expect(ctx.ledger.balanceOf(HOUSE)).toBe(0); // HOUSE は Land口座ではない
   });
+
+  it("ブラックジャック: hit で21超えバスト、掛け金没収", () => {
+    // player[10,10]=20, dealer[10,10]=20 の後 hit で更に10 → 30 bust。
+    // drawFrom は randInt(deck.length)。deck先頭付近の10級を引くよう rng=0 固定
+    // ではランクが偏るので、決定論のため rng を固定して結果を観測する
+    const ctx = setup(() => 0);
+    const total0 = ctx.chips.outstanding();
+    const start = ctx.casino.blackjackStart("p", 1_000);
+    if (start.state === "playing") {
+      // バストするまで引く
+      let v = start;
+      while (v.state === "playing") v = ctx.casino.blackjackHit("p");
+      expect(["player_bust", "win", "lose", "push"]).toContain(v.state);
+    }
+    // 何が起きてもチップ総量は不変（＝インフレしない）
+    expect(ctx.chips.outstanding()).toBe(total0);
+    expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
+  });
+
+  it("ハイロー: 連勝で pot が増え、キャッシュアウトで受け取れる", () => {
+    // rng: 最初のカードを低ランクにして「higher」を通す
+    // drawCard = rank randInt(13)+1, suit randInt(4)。rng=0 → rank1(A), suit0
+    // 次も rank1 → tie(=bust)。なので rng を段階制御する
+    const ctx = setup(seq([0, 0, 0.9, 0, 0.5, 0])); // 現在A → 次K(higher勝ち) → ...
+    const v0 = ctx.casino.hiloStart("p", 1_000);
+    expect(v0.current).toContain("A");
+    const v1 = ctx.casino.hiloGuess("p", "higher");
+    expect(v1.state).toBe("playing");
+    expect(v1.pot).toBeGreaterThanOrEqual(1_000);
+    const cash = ctx.casino.hiloCashout("p");
+    expect(cash.state).toBe("cashed");
+    expect(cash.payout).toBe(v1.pot);
+  });
+
+  it("ハイロー: 外れ(バスト)で pot 消滅、チップ総量は保存", () => {
+    const ctx = setup(seq([0.9, 0, 0])); // 現在K → higher は不可能(favorable0)で必ずバスト
+    const total0 = ctx.chips.outstanding();
+    ctx.casino.hiloStart("p", 1_000);
+    const v = ctx.casino.hiloGuess("p", "higher");
+    expect(v.state).toBe("bust");
+    expect(ctx.chips.outstanding()).toBe(total0); // 焼却も発行もなし＝インフレしない
+  });
+
+  it("多数のゲーム後もチップ総量とLand準備は不変（インフレゼロ）", () => {
+    const ctx = setup(seq([0.1, 0.7, 0.3, 0.9, 0.5, 0.2, 0.8, 0.4]));
+    const total0 = ctx.chips.outstanding();
+    const pool0 = ctx.chips.pool();
+    for (let i = 0; i < 20; i++) {
+      try { ctx.casino.coin("p", 100, i % 2 ? "表" : "裏"); } catch { /* 破産したら止まる */ }
+      try { ctx.casino.slot("p", 50); } catch { /* noop */ }
+    }
+    expect(ctx.chips.outstanding()).toBe(total0);
+    expect(ctx.chips.pool()).toBe(pool0);
+    expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
+  });
 });

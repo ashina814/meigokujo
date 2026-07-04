@@ -43,7 +43,7 @@ import {
 } from "./commands/race.js";
 import { handleTaxCommand, handlePensionCommand, handleFiscalButton } from "./commands/fiscal.js";
 import { handleExchangeCommand } from "./commands/chips.js";
-import { handleCasinoCommand } from "./commands/casino.js";
+import { handleCasinoCommand, handleCasinoButton } from "./commands/casino.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
@@ -223,6 +223,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("lot:buy:")) {
         await handleLotteryButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("cas:")) {
+        await handleCasinoButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("tf:")) {
