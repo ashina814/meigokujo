@@ -44,9 +44,12 @@ export async function handleProfile(
   const vcHours = Math.floor(presence.totalSeconds / 3600);
   const titles = services.titles.list(target.id);
 
-  const member = interaction.guild?.members.cache.get(target.id) as GuildMember | undefined;
+  // 鯖のニックネーム（表示名）を確実に読むため cache ではなく fetch する
+  const member = (await interaction.guild?.members.fetch(target.id).catch(() => null)) as
+    | GuildMember
+    | null;
   const rank = soul ? (RANK_LABEL[soul.status] ?? soul.status) : "記録なし";
-  const displayName = member?.displayName ?? target.username;
+  const displayName = member?.displayName ?? target.globalName ?? target.username;
 
   const png = await renderProfileCard({
     displayName,

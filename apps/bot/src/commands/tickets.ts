@@ -53,8 +53,13 @@ export async function handleTicketButton(interaction: ButtonInteraction, service
     if (!channel || channel.type !== ChannelType.GuildText) return;
 
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    // 鯖のニックネーム（表示名）を使う。無ければグローバル名→ユーザー名
+    const nick =
+      interaction.member && "displayName" in interaction.member
+        ? (interaction.member as GuildMember).displayName
+        : (interaction.user.globalName ?? interaction.user.username);
     const thread = await channel.threads.create({
-      name: `${KIND_LABELS[kind]}-${interaction.user.username}`.slice(0, 90),
+      name: `${KIND_LABELS[kind]}-${nick}`.slice(0, 90),
       type: ChannelType.PrivateThread,
       invitable: false,
       autoArchiveDuration: ThreadAutoArchiveDuration.ThreeDays,
