@@ -223,6 +223,14 @@ CREATE TABLE IF NOT EXISTS payout_runs (
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS departments (
+  key        TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  role_id    TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 `;
 
 export function openDb(path: string): Database.Database {

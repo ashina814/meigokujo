@@ -58,6 +58,13 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
     `稼働中の部屋: ${openRooms}室`,
   ].join("\n");
 
+  // 部署口座（残高のある／登録済みの部署を上位から）
+  const depts = services.departments
+    .listWithBalance()
+    .sort((a, b) => b.balance - a.balance)
+    .slice(0, 12);
+  const deptField = depts.length > 0 ? depts.map((d) => `${d.name}: ${fmtLd(d.balance)}`).join("\n") : null;
+
   const alerts: string[] = [];
   if (overdue > 0) alerts.push(`迷霊落ち承認 ${overdue}名`);
   if (staleTickets > 0) alerts.push(`無応答チケット ${staleTickets}件`);
@@ -71,6 +78,7 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
       { name: "🚪 入城", value: entry },
       { name: "⚖️ 審判", value: evaluation },
       { name: "🛡 治安・運用", value: ops },
+      ...(deptField ? [{ name: "🏦 部署口座", value: deptField }] : []),
     )
     .setFooter({ text: `最終更新: ${jstNow().dateStr} ${String(jstNow().hour).padStart(2, "0")}:${String(jstNow().minute).padStart(2, "0")} JST` });
   if (alerts.length > 0) embed.setDescription(`🔔 **要対応:** ${alerts.join(" / ")}`);

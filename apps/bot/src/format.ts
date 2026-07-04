@@ -36,6 +36,7 @@ function trimZero(s: string): string {
 export function mention(accountId: string): string {
   if (accountId.startsWith("user:")) return `<@${accountId.slice(5)}>`;
   if (accountId === "sys:treasury") return "🏛 国庫";
+  if (accountId.startsWith("sys:dept:")) return `🏦 ${accountId.slice("sys:dept:".length)}`;
   return `⚙️ ${accountId}`;
 }
 
@@ -55,6 +56,10 @@ export const TX_LABELS: Record<string, string> = {
   event_fee: "イベント参加費",
   pension: "年金",
   tax: "冥府税",
+  tip: "投げ銭",
+  dept_in: "部署入金",
+  dept_out: "部署払戻",
+  commission: "歩合",
 };
 
 export function txLabel(type: string): string {

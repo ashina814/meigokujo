@@ -53,6 +53,12 @@ export function registerDefaultTxTypes(): void {
   registerTxType("shop_personal", { ...userToUser });
   registerTxType("fanclub", { ...userToUser });
   registerTxType("inheritance", { ...userToUser });
+  registerTxType("tip", { ...userToUser, publicLog: true }); // 投げ銭
+
+  // 部署口座（sys:dept:*）— 業務資金の分離（経済設計.md §5）
+  registerTxType("dept_in", { ...userToSys }); // 住人→部署（原資積み立て・売上入金）
+  registerTxType("dept_out", { ...sysToUser }); // 部署→住人（払い戻し・釣り銭・賞金）
+  registerTxType("commission", { ...sysToUser }); // 部署→従業員（歩合分配）
 
   // 回収（住人→国庫）
   registerTxType("fine", { ...userToSys });

@@ -40,3 +40,11 @@ export { Evaluation, type Conclusion, type EvalScores, type EvalTexts, type Prom
 export { VcRewards, type DailyReward } from "./vc/rewards.js";
 export { Rooms, type RoomRow, type RecruitRow, type RoomKind } from "./rooms/service.js";
 export { TitleEngine, TitleHelper, TITLE_RULES, type TitleRule, type GrantedTitle } from "./titles/service.js";
+export {
+  Departments,
+  DepartmentError,
+  deptAccount,
+  type DepartmentRow,
+  type DepartmentBalance,
+  type DepartmentErrorCode,
+} from "./departments/service.js";

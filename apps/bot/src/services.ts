@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
+  Departments,
   Entry,
   Evaluation,
   EventLog,
@@ -45,7 +46,8 @@ export function buildServices() {
   const dangling = vc.closeAllDangling();
   if (dangling > 0) console.warn(`[vc] 閉じ損ねセグメントを ${dangling} 件補正しました`);
   const titles = new TitleEngine(db, vc);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles };
+  const departments = new Departments(db, ledger);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments };
 }
 
 export type Services = ReturnType<typeof buildServices>;

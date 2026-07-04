@@ -12,6 +12,8 @@ import { evaluationCommand } from "./commands/evaluation.js";
 import { promoteCommand } from "./commands/promote.js";
 import { dashboardCommand } from "./commands/dashboard-command.js";
 import { profileCommand } from "./commands/profile.js";
+import { departmentCommand } from "./commands/department.js";
+import { tipCommand } from "./commands/tip.js";
 
 const commands = [
   settingsCommand.toJSON(),
@@ -26,6 +28,8 @@ const commands = [
   promoteCommand.toJSON(),
   dashboardCommand.toJSON(),
   profileCommand.toJSON(),
+  departmentCommand.toJSON(),
+  tipCommand.toJSON(),
 ];
 
 const rest = new REST().setToken(config.token);

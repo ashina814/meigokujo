@@ -22,6 +22,8 @@ import {
 import { handlePromote } from "./commands/promote.js";
 import { handleDashboardCommand } from "./commands/dashboard-command.js";
 import { handleProfile } from "./commands/profile.js";
+import { handleDepartment, handleDepartmentAutocomplete } from "./commands/department.js";
+import { handleTip } from "./commands/tip.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
@@ -96,6 +98,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "プロフィール":
           await handleProfile(interaction, services);
           return;
+        case "部署":
+          await handleDepartment(interaction, services);
+          return;
+        case "投げ銭":
+          await handleTip(interaction, services);
+          return;
+      }
+      return;
+    }
+    if (interaction.isAutocomplete()) {
+      if (interaction.commandName === "部署") {
+        await handleDepartmentAutocomplete(interaction, services);
       }
       return;
     }
