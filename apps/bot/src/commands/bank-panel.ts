@@ -14,6 +14,7 @@ import { fmtLd, formatHistLine } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import { entryPanelMessage } from "./entry.js";
 import { ticketPanelMessage } from "./tickets.js";
+import { roomPanelMessage } from "./rooms.js";
 import type { Services } from "../services.js";
 
 export const panelCommand = new SlashCommandBuilder()
@@ -29,15 +30,17 @@ export const panelCommand = new SlashCommandBuilder()
         { name: "冥獄銀行", value: "bank" },
         { name: "入城申請", value: "entry" },
         { name: "チケット受付", value: "ticket" },
+        { name: "貸間（部屋）", value: "room" },
       ),
   );
 
-const PANEL_KINDS = ["bank", "entry", "ticket"] as const;
+const PANEL_KINDS = ["bank", "entry", "ticket", "room"] as const;
 
 const PANEL_LABELS: Record<(typeof PANEL_KINDS)[number], string> = {
   bank: "冥獄銀行",
   entry: "入城申請",
   ticket: "チケット受付",
+  room: "貸間",
 };
 
 function bankPanelMessage() {
@@ -78,6 +81,7 @@ export async function handlePanelCommand(
 function panelMessageFor(kind: (typeof PANEL_KINDS)[number]) {
   if (kind === "entry") return entryPanelMessage();
   if (kind === "ticket") return ticketPanelMessage();
+  if (kind === "room") return roomPanelMessage();
   return bankPanelMessage();
 }
 

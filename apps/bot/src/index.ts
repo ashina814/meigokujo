@@ -20,6 +20,7 @@ import {
   handleEvaluationSelect,
 } from "./commands/evaluation.js";
 import { handlePromote } from "./commands/promote.js";
+import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
 import { handleSalaryTable } from "./commands/salary-table.js";
@@ -94,8 +95,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleEvaluationModal(interaction, services);
       return;
     }
+    if (interaction.isModalSubmit() && interaction.customId === "room:recruit") {
+      await handleRecruitModal(interaction, services);
+      return;
+    }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {
       await handleEvaluationSelect(interaction, services);
+      return;
+    }
+    if (
+      (interaction.isStringSelectMenu() || interaction.isUserSelectMenu()) &&
+      interaction.customId.startsWith("room:")
+    ) {
+      await handleRoomButton(interaction, services);
       return;
     }
     if (
@@ -116,6 +128,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("charon:")) {
         await handleCharonButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("room:")) {
+        await handleRoomButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("tf:")) {

@@ -8,6 +8,7 @@ import {
   Migration,
   Payroll,
   Settings,
+  Rooms,
   Tickets,
   VcRewards,
   VcTracker,
@@ -38,10 +39,11 @@ export function buildServices() {
   const tickets = new Tickets(db, events);
   const evaluation = new Evaluation(db, settings, events);
   const vcRewards = new VcRewards(db, settings);
+  const rooms = new Rooms(db, ledger, settings, events);
   // クラッシュで閉じ損ねたVCセグメントの後始末
   const dangling = vc.closeAllDangling();
   if (dangling > 0) console.warn(`[vc] 閉じ損ねセグメントを ${dangling} 件補正しました`);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards };
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms };
 }
 
 export type Services = ReturnType<typeof buildServices>;

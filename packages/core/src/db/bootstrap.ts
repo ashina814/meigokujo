@@ -105,6 +105,37 @@ CREATE TABLE IF NOT EXISTS invites (
   credited_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS rooms (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind         TEXT NOT NULL CHECK (kind IN ('normal','mitsugetsu','oborozuki','game')),
+  channel_id   TEXT NOT NULL UNIQUE,
+  owner_id     TEXT NOT NULL,
+  capacity     INTEGER NOT NULL DEFAULT 2,
+  expires_at   INTEGER,
+  warned_at    INTEGER,
+  activated_at INTEGER,
+  empty_since  INTEGER,
+  status       TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rooms_open ON rooms(status) WHERE status = 'open';
+
+CREATE TABLE IF NOT EXISTS recruits (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  room_id          INTEGER NOT NULL REFERENCES rooms(id),
+  owner_id         TEXT NOT NULL,
+  target_gender    TEXT NOT NULL CHECK (target_gender IN ('male','female')),
+  purpose          TEXT NOT NULL,
+  message          TEXT,
+  panel_channel_id TEXT,
+  panel_message_id TEXT,
+  status           TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','matched','expired','cancelled')),
+  created_at       INTEGER NOT NULL,
+  expires_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recruits_open ON recruits(status, expires_at);
+
 CREATE TABLE IF NOT EXISTS marks (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   target_id  TEXT NOT NULL,

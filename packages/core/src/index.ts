@@ -38,3 +38,4 @@ export { VcTracker, type VcSegment, type PresenceSummary } from "./vc/service.js
 export { Tickets, type TicketRow, type TicketKind, type TicketStatus } from "./tickets/service.js";
 export { Evaluation, type Conclusion, type EvalScores, type EvalTexts, type PromotionScore, type SubmitResult, type SoulDeadlineRow } from "./evaluation/service.js";
 export { VcRewards, type DailyReward } from "./vc/rewards.js";
+export { Rooms, type RoomRow, type RecruitRow, type RoomKind } from "./rooms/service.js";
