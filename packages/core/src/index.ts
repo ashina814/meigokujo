@@ -83,3 +83,13 @@ export {
   type FiscalKind,
   type FiscalErrorCode,
 } from "./fiscal/service.js";
+export {
+  Stocks,
+  StockError,
+  MARKET_ESCROW,
+  type StockRow,
+  type TradeResult,
+  type Holding,
+  type StatusChange,
+  type StockErrorCode,
+} from "./stocks/service.js";

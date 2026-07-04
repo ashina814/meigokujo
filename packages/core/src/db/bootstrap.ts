@@ -313,6 +313,29 @@ CREATE TABLE IF NOT EXISTS race_bets (
 );
 CREATE INDEX IF NOT EXISTS idx_race_bets ON race_bets(race_id, horse_index);
 
+CREATE TABLE IF NOT EXISTS stocks (
+  subject_id        TEXT PRIMARY KEY,
+  base_price        INTEGER NOT NULL,
+  step              INTEGER NOT NULL,
+  promotion_bonus   INTEGER NOT NULL,
+  shares            INTEGER NOT NULL DEFAULT 0,
+  escrow            INTEGER NOT NULL DEFAULT 0,
+  status            TEXT NOT NULL DEFAULT 'listed' CHECK (status IN ('listed','delisted')),
+  promotion_credited INTEGER NOT NULL DEFAULT 0,
+  created_by        TEXT NOT NULL,
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS stock_holdings (
+  subject_id TEXT NOT NULL REFERENCES stocks(subject_id),
+  holder_id  TEXT NOT NULL,
+  shares     INTEGER NOT NULL DEFAULT 0 CHECK (shares >= 0),
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (subject_id, holder_id)
+);
+CREATE INDEX IF NOT EXISTS idx_holdings_holder ON stock_holdings(holder_id);
+
 CREATE TABLE IF NOT EXISTS fiscal_runs (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   kind        TEXT NOT NULL CHECK (kind IN ('tax','pension')),

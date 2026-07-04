@@ -149,6 +149,27 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
+    // ── 魂株の状態同期（昇格→配当・値上がり / 迷霊落ち→廃止）──
+    try {
+      const changes = services.stocks.syncStatuses();
+      if (changes.length > 0) {
+        const chId = services.settings.getString("channel:shurei");
+        const ch = chId ? await client.channels.fetch(chId).catch(() => null) : null;
+        if (ch?.isTextBased() && "send" in ch) {
+          for (const c of changes) {
+            await ch
+              .send({
+                content: c.kind === "promoted" ? `📈 魂株: <@${c.subjectId}> が昇格！ 株価が上昇し、株主へ配当が入りました。` : `📉 魂株: <@${c.subjectId}> が迷霊に落ち、上場廃止。保有株は紙くずになりました（原資 ${fmtLd(c.reclaimed ?? 0)} は国庫へ）。`,
+                allowedMentions: { parse: [] },
+              })
+              .catch(() => undefined);
+          }
+        }
+      }
+    } catch (e) {
+      console.error("[stock] 状態同期失敗:", e);
+    }
+
     // ── 計器盤の更新（10分ごと）──
     if (now.minute % 10 === 0) {
       await updateDashboard(client, services).catch((e) => console.error("[計器盤] 更新失敗:", e));
