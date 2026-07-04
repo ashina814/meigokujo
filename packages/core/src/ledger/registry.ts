@@ -79,4 +79,7 @@ export function registerDefaultTxTypes(): void {
   registerTxType("auction_settle", { fromKinds: ["system"], toKinds: ["system"] });
   registerTxType("lottery_ticket", { fromKinds: ["user"], toKinds: ["system"], minorBlocked: true });
   registerTxType("lottery_prize", { fromKinds: ["system"], toKinds: ["user"], minorBlocked: true });
+  registerTxType("lottery_rake", { fromKinds: ["system"], toKinds: ["system"] }); // 控除（エスクロー→国庫）
+  registerTxType("lottery_seed", { fromKinds: ["system"], toKinds: ["system"] }); // 積立（国庫→エスクロー）
+  registerTxType("lottery_refund", { fromKinds: ["system"], toKinds: ["user"] }); // 取消返金
 }

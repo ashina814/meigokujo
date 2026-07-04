@@ -6,6 +6,7 @@ import { checkBumpCooldowns } from "./bump.js";
 import { scanRooms } from "./rooms-lifecycle.js";
 import { updateDashboard } from "./dashboard.js";
 import { announceResult, refreshAuctionPanel } from "./commands/auction.js";
+import { announceDraw, refreshLotteryPanel } from "./commands/lottery.js";
 import { notifyUser } from "./notify.js";
 import { fmtLd } from "./format.js";
 import type { Services } from "./services.js";
@@ -122,6 +123,17 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         await announceResult(client, services, res.auction, res.winnerId, res.amount);
       } catch (e) {
         console.error(`[auction] 自動締切失敗 #${expired.id}:`, e);
+      }
+    }
+
+    // ── 輪廻籤の自動抽選（抽選時刻を過ぎた open を抽選）──
+    for (const expired of services.lottery.listExpired()) {
+      try {
+        const res = services.lottery.draw(expired.id, "system:lottery");
+        await refreshLotteryPanel(client, services, res.lottery);
+        await announceDraw(client, services, res);
+      } catch (e) {
+        console.error(`[lottery] 自動抽選失敗 #${expired.id}:`, e);
       }
     }
 

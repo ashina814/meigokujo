@@ -57,3 +57,11 @@ export {
   type CloseResult,
   type AuctionErrorCode,
 } from "./auctions/service.js";
+export {
+  Lottery,
+  LotteryError,
+  LOTTERY_ESCROW,
+  type LotteryRow,
+  type DrawResult,
+  type LotteryErrorCode,
+} from "./lottery/service.js";

@@ -258,6 +258,33 @@ CREATE TABLE IF NOT EXISTS auction_bids (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_auction_bids ON auction_bids(auction_id, created_at);
+
+CREATE TABLE IF NOT EXISTS lotteries (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  status         TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','drawn','cancelled')),
+  ticket_price   INTEGER NOT NULL CHECK (ticket_price > 0),
+  house_edge_bps INTEGER NOT NULL DEFAULT 2000 CHECK (house_edge_bps >= 0 AND house_edge_bps <= 10000),
+  pot            INTEGER NOT NULL DEFAULT 0,
+  carryover_in   INTEGER NOT NULL DEFAULT 0,
+  winner_id      TEXT,
+  prize          INTEGER,
+  rake           INTEGER,
+  draws_at       INTEGER NOT NULL,
+  channel_id     TEXT,
+  message_id     TEXT,
+  created_by     TEXT NOT NULL,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lotteries_open ON lotteries(status, draws_at);
+
+CREATE TABLE IF NOT EXISTS lottery_entries (
+  lottery_id INTEGER NOT NULL REFERENCES lotteries(id),
+  user_id    TEXT NOT NULL,
+  qty        INTEGER NOT NULL DEFAULT 0 CHECK (qty >= 0),
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (lottery_id, user_id)
+);
 `;
 
 export function openDb(path: string): Database.Database {

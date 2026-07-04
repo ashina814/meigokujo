@@ -15,6 +15,7 @@ import { profileCommand } from "./commands/profile.js";
 import { departmentCommand } from "./commands/department.js";
 import { tipCommand } from "./commands/tip.js";
 import { auctionCommand } from "./commands/auction.js";
+import { lotteryCommand } from "./commands/lottery.js";
 
 const commands = [
   settingsCommand.toJSON(),
@@ -32,6 +33,7 @@ const commands = [
   departmentCommand.toJSON(),
   tipCommand.toJSON(),
   auctionCommand.toJSON(),
+  lotteryCommand.toJSON(),
 ];
 
 const rest = new REST().setToken(config.token);

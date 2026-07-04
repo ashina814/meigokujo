@@ -4,6 +4,7 @@ import {
   Auctions,
   Departments,
   Entry,
+  Lottery,
   Evaluation,
   EventLog,
   Ledger,
@@ -49,7 +50,8 @@ export function buildServices() {
   const titles = new TitleEngine(db, vc);
   const departments = new Departments(db, ledger);
   const auctions = new Auctions(db, ledger, events);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, auctions };
+  const lottery = new Lottery(db, ledger, settings, events);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, auctions, lottery };
 }
 
 export type Services = ReturnType<typeof buildServices>;

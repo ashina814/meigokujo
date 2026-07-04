@@ -30,6 +30,11 @@ import {
   handleAuctionButton,
   handleAuctionBidModal,
 } from "./commands/auction.js";
+import {
+  handleLotteryCommand,
+  handleLotteryButton,
+  handleLotteryBuyModal,
+} from "./commands/lottery.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
@@ -113,6 +118,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "競売":
           await handleAuctionCommand(interaction, services);
           return;
+        case "籤":
+          await handleLotteryCommand(interaction, services);
+          return;
       }
       return;
     }
@@ -134,6 +142,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("auc:bidmodal:")) {
       await handleAuctionBidModal(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("lot:buymodal:")) {
+      await handleLotteryBuyModal(interaction, services);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {
@@ -173,6 +185,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("auc:bid:")) {
         await handleAuctionButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("lot:buy:")) {
+        await handleLotteryButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("tf:")) {
