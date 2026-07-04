@@ -71,7 +71,8 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     }
 
     // ── 説明会の担当スタッフへ30分前アラート（20:30/21:30/22:30 = 各会の30分前）──
-    if ([20, 21, 22].includes(now.hour) && now.minute === 30) {
+    // 窓を持たせて tick のドリフトでの取りこぼしを防ぐ（重複はマーカーで抑止）
+    if ([20, 21, 22].includes(now.hour) && now.minute >= 30 && now.minute < 33) {
       const slot = `${now.dateStr} ${now.hour + 1}`;
       const marker = `entry:staffalert:${slot}`;
       if (!services.settings.getString(marker)) {
