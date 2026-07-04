@@ -60,7 +60,7 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
     `稼働中の部屋: ${openRooms}室`,
     `開催中の競売: ${openAuctions}件 ／ レース: ${services.races.listOpen().length}件`,
     lot ? `輪廻籤 #${lot.id}: 想定当選 ${fmtLd(services.lottery.jackpot(lot))}（抽選 <t:${lot.draws_at}:R>）` : "輪廻籤: なし",
-    `チップ: 発行 ${services.chips.outstanding().toLocaleString()} / 準備 ${fmtLd(services.chips.pool())}`,
+    `チップ: 発行 ${services.chips.outstanding().toLocaleString()} / 準備 ${fmtLd(services.chips.pool())} / 胴元 ${services.casino.houseBalance().toLocaleString()}`,
   ].join("\n");
 
   // 部署口座（残高のある／登録済みの部署を上位から）

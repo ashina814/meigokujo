@@ -43,6 +43,7 @@ import {
 } from "./commands/race.js";
 import { handleTaxCommand, handlePensionCommand, handleFiscalButton } from "./commands/fiscal.js";
 import { handleExchangeCommand } from "./commands/chips.js";
+import { handleCasinoCommand } from "./commands/casino.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
@@ -140,6 +141,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "為替":
           await handleExchangeCommand(interaction, services);
+          return;
+        case "カジノ":
+          await handleCasinoCommand(interaction, services);
           return;
       }
       return;

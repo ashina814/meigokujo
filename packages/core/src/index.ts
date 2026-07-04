@@ -90,3 +90,13 @@ export {
   type ChipQuote,
   type ChipErrorCode,
 } from "./chips/service.js";
+export {
+  Casino,
+  CasinoError,
+  HOUSE,
+  type CoinResult,
+  type SlotResult,
+  type RouletteResult,
+  type RouletteBet,
+  type CasinoErrorCode,
+} from "./casino/service.js";

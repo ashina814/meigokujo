@@ -19,6 +19,7 @@ import { lotteryCommand } from "./commands/lottery.js";
 import { raceCommand } from "./commands/race.js";
 import { taxCommand, pensionCommand } from "./commands/fiscal.js";
 import { exchangeCommand } from "./commands/chips.js";
+import { casinoCommand } from "./commands/casino.js";
 
 const commands = [
   settingsCommand.toJSON(),
@@ -41,6 +42,7 @@ const commands = [
   taxCommand.toJSON(),
   pensionCommand.toJSON(),
   exchangeCommand.toJSON(),
+  casinoCommand.toJSON(),
 ];
 
 const rest = new REST().setToken(config.token);
