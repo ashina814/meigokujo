@@ -58,7 +58,7 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
   const ops = [
     `対応中チケット: ${openTickets}件${staleTickets > 0 ? ` / ⚠️ 24h無応答 **${staleTickets}件**` : ""}`,
     `稼働中の部屋: ${openRooms}室`,
-    `開催中の競売: ${openAuctions}件`,
+    `開催中の競売: ${openAuctions}件 ／ レース: ${services.races.listOpen().length}件`,
     lot ? `輪廻籤 #${lot.id}: 想定当選 ${fmtLd(services.lottery.jackpot(lot))}（抽選 <t:${lot.draws_at}:R>）` : "輪廻籤: なし",
   ].join("\n");
 

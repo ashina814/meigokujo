@@ -65,3 +65,11 @@ export {
   type DrawResult,
   type LotteryErrorCode,
 } from "./lottery/service.js";
+export {
+  Races,
+  RaceError,
+  RACE_ESCROW,
+  type RaceRow,
+  type SettleResult,
+  type RaceErrorCode,
+} from "./races/service.js";

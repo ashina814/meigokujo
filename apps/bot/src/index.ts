@@ -35,6 +35,12 @@ import {
   handleLotteryButton,
   handleLotteryBuyModal,
 } from "./commands/lottery.js";
+import {
+  handleRaceCommand,
+  handleRaceAutocomplete,
+  handleRaceSelect,
+  handleRaceBetModal,
+} from "./commands/race.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
@@ -121,6 +127,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "籤":
           await handleLotteryCommand(interaction, services);
           return;
+        case "レース":
+          await handleRaceCommand(interaction, services);
+          return;
       }
       return;
     }
@@ -129,6 +138,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleDepartmentAutocomplete(interaction, services);
       } else if (interaction.commandName === "競売") {
         await handleAuctionAutocomplete(interaction, services);
+      } else if (interaction.commandName === "レース") {
+        await handleRaceAutocomplete(interaction, services);
       }
       return;
     }
@@ -146,6 +157,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("lot:buymodal:")) {
       await handleLotteryBuyModal(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("race:betmodal:")) {
+      await handleRaceBetModal(interaction, services);
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("race:pick:")) {
+      await handleRaceSelect(interaction, services);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {

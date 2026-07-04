@@ -285,6 +285,33 @@ CREATE TABLE IF NOT EXISTS lottery_entries (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (lottery_id, user_id)
 );
+
+CREATE TABLE IF NOT EXISTS races (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  title          TEXT,
+  horses_json    TEXT NOT NULL,
+  status         TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','settled','cancelled')),
+  house_edge_bps INTEGER NOT NULL DEFAULT 1000 CHECK (house_edge_bps >= 0 AND house_edge_bps <= 10000),
+  pool           INTEGER NOT NULL DEFAULT 0,
+  winner_index   INTEGER,
+  starts_at      INTEGER NOT NULL,
+  channel_id     TEXT,
+  message_id     TEXT,
+  created_by     TEXT NOT NULL,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_races_open ON races(status, starts_at);
+
+CREATE TABLE IF NOT EXISTS race_bets (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  race_id     INTEGER NOT NULL REFERENCES races(id),
+  bettor_id   TEXT NOT NULL,
+  horse_index INTEGER NOT NULL,
+  amount      INTEGER NOT NULL CHECK (amount > 0),
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_race_bets ON race_bets(race_id, horse_index);
 `;
 
 export function openDb(path: string): Database.Database {

@@ -7,6 +7,7 @@ import { scanRooms } from "./rooms-lifecycle.js";
 import { updateDashboard } from "./dashboard.js";
 import { announceResult, refreshAuctionPanel } from "./commands/auction.js";
 import { announceDraw, refreshLotteryPanel } from "./commands/lottery.js";
+import { announceRace, refreshRacePanel } from "./commands/race.js";
 import { notifyUser } from "./notify.js";
 import { fmtLd } from "./format.js";
 import type { Services } from "./services.js";
@@ -134,6 +135,17 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         await announceDraw(client, services, res);
       } catch (e) {
         console.error(`[lottery] 自動抽選失敗 #${expired.id}:`, e);
+      }
+    }
+
+    // ── 冥馬レースの自動発走（発走時刻を過ぎた open を清算）──
+    for (const expired of services.races.listExpired()) {
+      try {
+        const res = services.races.settle(expired.id, "system:race");
+        await refreshRacePanel(client, services, res.race);
+        await announceRace(client, services, res);
+      } catch (e) {
+        console.error(`[race] 自動発走失敗 #${expired.id}:`, e);
       }
     }
 
