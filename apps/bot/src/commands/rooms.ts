@@ -33,47 +33,75 @@ const KIND_LABELS: Record<RoomKind, string> = {
   game: "ゲーム部屋",
 };
 
-export function roomPanelMessage(): MessageCreateOptions {
+const KIND_TITLE: Record<RoomKind, string> = {
+  normal: "🛏 宿",
+  mitsugetsu: "🌸 蜜月",
+  oborozuki: "🌙 朧月",
+  game: "🎲 ゲーム部屋",
+};
+
+const KIND_EMOJI: Record<RoomKind, string> = {
+  normal: "🛏",
+  mitsugetsu: "🌸",
+  oborozuki: "🌙",
+  game: "🎲",
+};
+
+const KIND_DESC: Record<RoomKind, string> = {
+  normal: "2人まで無料。3人目から枠+1ごとに 5,000 Ld（部屋の誰でも払えます）。",
+  mitsugetsu: "5,000 Ld。異性へ匿名で募集を出し、参加者だけが入れる部屋。",
+  oborozuki: "30,000 Ld。相手を指名する、運営以外に見えない秘密の部屋。",
+  game: "2h 6,000 / 3h 8,000 / 5h 13,000 / 10h 27,000 Ld。",
+};
+
+/** 種別ごとの単独パネル。設置したチャンネルの親カテゴリの権限を部屋が引き継ぐ */
+export function roomPanelMessage(kind: RoomKind): MessageCreateOptions {
   const embed = new EmbedBuilder()
-    .setTitle("🏨 冥獄城 貸間")
-    .setDescription(
-      [
-        "🛏 **宿** — 2人まで無料。3人目から枠+1ごとに 5,000 Ld（部屋の誰でも払えます）",
-        "🌸 **蜜月** — 5,000 Ld。異性へ匿名で募集を出し、参加者だけが入れる部屋",
-        "🌙 **朧月** — 30,000 Ld。相手を指名する、運営以外に見えない秘密の部屋",
-        "🎲 **ゲーム部屋** — 2h 6,000 / 3h 8,000 / 5h 13,000 / 10h 27,000 Ld",
-        "",
-        "全ての部屋は**全員が退出すると自動で消えます**。",
-      ].join("\n"),
-    )
+    .setTitle(KIND_TITLE[kind])
+    .setDescription([KIND_DESC[kind], "", "全員が退出すると自動で消えます。"].join("\n"))
     .setColor(0x6b21a8);
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("room:new:normal").setLabel("宿").setEmoji("🛏").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("room:new:mitsugetsu").setLabel("蜜月").setEmoji("🌸").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("room:new:oborozuki").setLabel("朧月").setEmoji("🌙").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("room:new:game").setLabel("ゲーム部屋").setEmoji("🎲").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`room:new:${kind}`)
+      .setLabel(`${KIND_LABELS[kind]}を立てる`)
+      .setEmoji(KIND_EMOJI[kind])
+      .setStyle(ButtonStyle.Primary),
   );
   return { embeds: [embed], components: [row] };
 }
 
-async function roomCategory(guild: Guild, services: Services, secret: boolean): Promise<CategoryChannel | null> {
-  const key = secret ? "category:oborozuki" : "category:rooms";
-  const id = services.settings.getString(key);
-  if (!id) return null;
-  const cat = await guild.channels.fetch(id).catch(() => null);
-  return cat?.type === ChannelType.GuildCategory ? (cat as CategoryChannel) : null;
+/** ボタンが押されたパネルチャンネルの親カテゴリID（部屋の設置先＝権限の継承元） */
+function panelCategoryId(
+  interaction:
+    | ButtonInteraction
+    | StringSelectMenuInteraction
+    | UserSelectMenuInteraction
+    | ModalSubmitInteraction,
+): string | null {
+  const ch = interaction.channel;
+  if (ch && !ch.isDMBased() && "parentId" in ch) return ch.parentId ?? null;
+  return null;
 }
 
-/** 部屋VCを作る（可視性に応じた権限オーバーライト付き） */
+/**
+ * 部屋VCを作る。設置元カテゴリ(parentCategoryId)配下に作成する。
+ * 宿・ゲームは overwrites を付けずカテゴリ権限を継承（＝パネルが見える人だけ見える）。
+ * 蜜月・朧月は継承せず、専用の可視性オーバーライトを掛ける。
+ */
 async function createRoomChannel(
   guild: Guild,
   services: Services,
   kind: RoomKind,
   owner: GuildMember,
   members: string[],
+  parentCategoryId: string | null,
 ): Promise<VoiceChannel | null> {
   const secret = kind === "oborozuki";
-  const category = await roomCategory(guild, services, secret);
+  const parentFetched = parentCategoryId
+    ? await guild.channels.fetch(parentCategoryId).catch(() => null)
+    : null;
+  const category =
+    parentFetched?.type === ChannelType.GuildCategory ? (parentFetched as CategoryChannel) : null;
   const everyone = guild.roles.everyone.id;
   const adminRoleId = services.settings.getString("role:admin");
 
@@ -102,6 +130,11 @@ async function createRoomChannel(
       console.error("[room] チャンネル作成失敗:", e);
       return null;
     });
+
+  // 宿・ゲームはカテゴリの権限を明示的に継承（同期）させる
+  if (channel && category && overwrites.length === 0) {
+    await channel.lockPermissions().catch(() => undefined);
+  }
   return channel;
 }
 
@@ -208,9 +241,9 @@ async function createAndReply(
     return;
   }
 
-  const channel = await createRoomChannel(guild, services, kind, owner, members);
+  const channel = await createRoomChannel(guild, services, kind, owner, members, panelCategoryId(interaction));
   if (!channel) {
-    const msg = "部屋の作成に失敗しました。運営にカテゴリ設定（/設定 チャンネル）を確認してもらってください。";
+    const msg = "部屋の作成に失敗しました。運営にパネルの設置場所（カテゴリ）を確認してもらってください。";
     if (interaction.isButton()) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
     else await interaction.update({ content: msg, components: [] });
     return;
@@ -292,7 +325,7 @@ export async function handleRecruitModal(interaction: ModalSubmitInteraction, se
     return;
   }
 
-  const channel = await createRoomChannel(guild, services, "mitsugetsu", owner, [owner.id]);
+  const channel = await createRoomChannel(guild, services, "mitsugetsu", owner, [owner.id], panelCategoryId(interaction));
   if (!channel) {
     await interaction.editReply({ content: "部屋の作成に失敗しました。" });
     return;

@@ -15,6 +15,7 @@ import { isAdmin } from "../permissions.js";
 import { entryPanelMessage } from "./entry.js";
 import { ticketPanelMessage } from "./tickets.js";
 import { roomPanelMessage } from "./rooms.js";
+import type { RoomKind } from "@meigokujo/core";
 import type { Services } from "../services.js";
 
 export const panelCommand = new SlashCommandBuilder()
@@ -30,17 +31,39 @@ export const panelCommand = new SlashCommandBuilder()
         { name: "冥獄銀行", value: "bank" },
         { name: "入城申請", value: "entry" },
         { name: "チケット受付", value: "ticket" },
-        { name: "貸間（部屋）", value: "room" },
+        { name: "宿", value: "room_normal" },
+        { name: "蜜月", value: "room_mitsugetsu" },
+        { name: "朧月", value: "room_oborozuki" },
+        { name: "ゲーム部屋", value: "room_game" },
       ),
   );
 
-const PANEL_KINDS = ["bank", "entry", "ticket", "room"] as const;
+const PANEL_KINDS = [
+  "bank",
+  "entry",
+  "ticket",
+  "room_normal",
+  "room_mitsugetsu",
+  "room_oborozuki",
+  "room_game",
+] as const;
 
 const PANEL_LABELS: Record<(typeof PANEL_KINDS)[number], string> = {
   bank: "冥獄銀行",
   entry: "入城申請",
   ticket: "チケット受付",
-  room: "貸間",
+  room_normal: "宿",
+  room_mitsugetsu: "蜜月",
+  room_oborozuki: "朧月",
+  room_game: "ゲーム部屋",
+};
+
+/** パネル種別 → 部屋種別 */
+const ROOM_PANEL_KIND: Record<string, RoomKind> = {
+  room_normal: "normal",
+  room_mitsugetsu: "mitsugetsu",
+  room_oborozuki: "oborozuki",
+  room_game: "game",
 };
 
 function bankPanelMessage() {
@@ -81,7 +104,8 @@ export async function handlePanelCommand(
 function panelMessageFor(kind: (typeof PANEL_KINDS)[number]) {
   if (kind === "entry") return entryPanelMessage();
   if (kind === "ticket") return ticketPanelMessage();
-  if (kind === "room") return roomPanelMessage();
+  const roomKind = ROOM_PANEL_KIND[kind];
+  if (roomKind) return roomPanelMessage(roomKind);
   return bankPanelMessage();
 }
 

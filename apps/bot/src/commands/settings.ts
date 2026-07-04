@@ -23,12 +23,6 @@ export const CHANNEL_KINDS = [
   ["recruit", "蜜月の募集掲示"],
 ] as const;
 
-/** カテゴリ割当の種別（category:<kind> に保存） */
-export const CATEGORY_KINDS = [
-  ["rooms", "宿・貸間カテゴリ"],
-  ["oborozuki", "朧月（秘匿）カテゴリ"],
-] as const;
-
 /** ロール割当の種別（role:<kind> に保存） */
 export const ROLE_KINDS = [
   ["queue_wait", "入城案内待ち"],
@@ -96,19 +90,6 @@ export const settingsCommand = new SlashCommandBuilder()
           .addChoices(...ROLE_KINDS.map(([value, name]) => ({ name, value }))),
       )
       .addRoleOption((o) => o.setName("ロール").setDescription("割り当てるロール").setRequired(true)),
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("カテゴリ")
-      .setDescription("部屋を作成するカテゴリを設定")
-      .addStringOption((o) =>
-        o
-          .setName("種別")
-          .setDescription("どのカテゴリか")
-          .setRequired(true)
-          .addChoices(...CATEGORY_KINDS.map(([value, name]) => ({ name, value }))),
-      )
-      .addChannelOption((o) => o.setName("カテゴリ").setDescription("対象カテゴリ").setRequired(true)),
   )
   .addSubcommand((sub) =>
     sub
@@ -217,15 +198,6 @@ export async function handleSettings(
       content: `✅ ${label} ロールを <@&${role.id}> に設定しました。`,
       flags: MessageFlags.Ephemeral,
     });
-    return;
-  }
-
-  if (sub === "カテゴリ") {
-    const kind = interaction.options.getString("種別", true);
-    const category = interaction.options.getChannel("カテゴリ", true);
-    services.settings.set(`category:${kind}`, category.id, actor);
-    const label = CATEGORY_KINDS.find(([v]) => v === kind)?.[1] ?? kind;
-    await interaction.reply({ content: `✅ ${label} を「${category.name}」に設定しました。`, flags: MessageFlags.Ephemeral });
     return;
   }
 
