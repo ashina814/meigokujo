@@ -1,17 +1,19 @@
 # systemd unit（VPS の既存流儀に合わせる: event-planning-bot 等と同形式）
-# 配置例: /etc/systemd/system/meigokujo-bot.service
+# 配置: sudo cp → /etc/systemd/system/meigokujo-bot.service
+# 実行方式: tsx 直実行（ビルド不要・開発と本番が一致）
 [Unit]
 Description=Meigokujo Discord Bot
-After=network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/meigokujo/apps/bot
-ExecStart=/usr/bin/env pnpm start
+User=kabu
+WorkingDirectory=/home/kabu/meigokujo/apps/bot
+ExecStart=/home/kabu/.nvm/versions/node/v22.23.1/bin/node --import tsx src/index.ts
 Restart=on-failure
-RestartSec=5
+RestartSec=10
 Environment=NODE_ENV=production
+Environment=TZ=Asia/Tokyo
 
 [Install]
 WantedBy=multi-user.target
