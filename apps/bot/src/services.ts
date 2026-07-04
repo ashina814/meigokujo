@@ -5,9 +5,9 @@ import {
   Departments,
   Entry,
   Fiscal,
+  Chips,
   Lottery,
   Races,
-  Stocks,
   Evaluation,
   EventLog,
   Ledger,
@@ -56,8 +56,8 @@ export function buildServices() {
   const lottery = new Lottery(db, ledger, settings, events);
   const races = new Races(db, ledger, events);
   const fiscal = new Fiscal(db, ledger);
-  const stocks = new Stocks(db, ledger, events);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, auctions, lottery, races, fiscal, stocks };
+  const chips = new Chips(db, ledger, events);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, auctions, lottery, races, fiscal, chips };
 }
 
 export type Services = ReturnType<typeof buildServices>;

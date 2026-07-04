@@ -81,11 +81,10 @@ export function registerDefaultTxTypes(): void {
   registerTxType("auction_settle", { fromKinds: ["system"], toKinds: ["system"] });
   registerTxType("lottery_ticket", { fromKinds: ["user"], toKinds: ["system"], minorBlocked: true });
   registerTxType("lottery_prize", { fromKinds: ["system"], toKinds: ["user"], minorBlocked: true });
-  // 魂株市場（bonding-curve AMM・エスクロー sys:escrow:market）
-  registerTxType("stock_buy", { fromKinds: ["user"], toKinds: ["system"] }); // 買い（住人→エスクロー）
-  registerTxType("stock_sell", { fromKinds: ["system"], toKinds: ["user"] }); // 売り（エスクロー→住人）
-  registerTxType("stock_dividend", { fromKinds: ["system"], toKinds: ["system"] }); // 昇格配当（国庫→エスクロー）
-  registerTxType("stock_delist", { fromKinds: ["system"], toKinds: ["system"] }); // 廃止（エスクロー→国庫回収）
+  // チップ為替（カジノ通貨・Land100%準備 sys:escrow:chips）
+  registerTxType("chip_buy", { fromKinds: ["user"], toKinds: ["system"] }); // Land→チップ（住人→準備プール）
+  registerTxType("chip_sell", { fromKinds: ["system"], toKinds: ["user"] }); // チップ→Land（準備プール→住人）
+  registerTxType("chip_burn", { fromKinds: ["system"], toKinds: ["system"] }); // 両替スプレッドの焼却（プール→国庫回収）
 
   registerTxType("lottery_rake", { fromKinds: ["system"], toKinds: ["system"] }); // 控除（エスクロー→国庫）
   registerTxType("lottery_seed", { fromKinds: ["system"], toKinds: ["system"] }); // 積立（国庫→エスクロー）

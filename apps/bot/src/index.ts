@@ -42,7 +42,7 @@ import {
   handleRaceBetModal,
 } from "./commands/race.js";
 import { handleTaxCommand, handlePensionCommand, handleFiscalButton } from "./commands/fiscal.js";
-import { handleStockCommand } from "./commands/stock.js";
+import { handleExchangeCommand } from "./commands/chips.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
@@ -138,8 +138,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "年金":
           await handlePensionCommand(interaction, services);
           return;
-        case "魂株":
-          await handleStockCommand(interaction, services);
+        case "為替":
+          await handleExchangeCommand(interaction, services);
           return;
       }
       return;
