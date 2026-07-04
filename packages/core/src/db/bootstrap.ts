@@ -231,6 +231,33 @@ CREATE TABLE IF NOT EXISTS departments (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS auctions (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  title          TEXT NOT NULL,
+  description    TEXT,
+  start_price    INTEGER NOT NULL CHECK (start_price >= 0),
+  min_increment  INTEGER NOT NULL DEFAULT 1 CHECK (min_increment >= 1),
+  current_bid    INTEGER,
+  current_bidder TEXT,
+  status         TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed','cancelled')),
+  channel_id     TEXT,
+  message_id     TEXT,
+  ends_at        INTEGER NOT NULL,
+  created_by     TEXT NOT NULL,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auctions_open ON auctions(status, ends_at);
+
+CREATE TABLE IF NOT EXISTS auction_bids (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  auction_id INTEGER NOT NULL REFERENCES auctions(id),
+  bidder_id  TEXT NOT NULL,
+  amount     INTEGER NOT NULL CHECK (amount > 0),
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auction_bids ON auction_bids(auction_id, created_at);
 `;
 
 export function openDb(path: string): Database.Database {

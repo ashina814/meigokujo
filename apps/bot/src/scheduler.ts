@@ -5,6 +5,7 @@ import { threadTitleFor } from "./commands/evaluation.js";
 import { checkBumpCooldowns } from "./bump.js";
 import { scanRooms } from "./rooms-lifecycle.js";
 import { updateDashboard } from "./dashboard.js";
+import { announceResult, refreshAuctionPanel } from "./commands/auction.js";
 import { notifyUser } from "./notify.js";
 import { fmtLd } from "./format.js";
 import type { Services } from "./services.js";
@@ -112,6 +113,17 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
 
     // ── 部屋のライフサイクル（在室スキャン・削除・期限・募集失効）──
     await scanRooms(client, services);
+
+    // ── 競売の自動締切（締切時刻を過ぎた open を落札確定）──
+    for (const expired of services.auctions.listExpired()) {
+      try {
+        const res = services.auctions.close(expired.id, "system:auction");
+        await refreshAuctionPanel(client, services, res.auction);
+        await announceResult(client, services, res.auction, res.winnerId, res.amount);
+      } catch (e) {
+        console.error(`[auction] 自動締切失敗 #${expired.id}:`, e);
+      }
+    }
 
     // ── 計器盤の更新（10分ごと）──
     if (now.minute % 10 === 0) {

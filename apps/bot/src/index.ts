@@ -24,6 +24,12 @@ import { handleDashboardCommand } from "./commands/dashboard-command.js";
 import { handleProfile } from "./commands/profile.js";
 import { handleDepartment, handleDepartmentAutocomplete } from "./commands/department.js";
 import { handleTip } from "./commands/tip.js";
+import {
+  handleAuctionCommand,
+  handleAuctionAutocomplete,
+  handleAuctionButton,
+  handleAuctionBidModal,
+} from "./commands/auction.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
@@ -104,12 +110,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "投げ銭":
           await handleTip(interaction, services);
           return;
+        case "競売":
+          await handleAuctionCommand(interaction, services);
+          return;
       }
       return;
     }
     if (interaction.isAutocomplete()) {
       if (interaction.commandName === "部署") {
         await handleDepartmentAutocomplete(interaction, services);
+      } else if (interaction.commandName === "競売") {
+        await handleAuctionAutocomplete(interaction, services);
       }
       return;
     }
@@ -119,6 +130,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isModalSubmit() && interaction.customId === "room:recruit") {
       await handleRecruitModal(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("auc:bidmodal:")) {
+      await handleAuctionBidModal(interaction, services);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {
@@ -154,6 +169,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("room:")) {
         await handleRoomButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("auc:bid:")) {
+        await handleAuctionButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("tf:")) {

@@ -48,3 +48,12 @@ export {
   type DepartmentBalance,
   type DepartmentErrorCode,
 } from "./departments/service.js";
+export {
+  Auctions,
+  AuctionError,
+  AUCTION_ESCROW,
+  type AuctionRow,
+  type BidResult,
+  type CloseResult,
+  type AuctionErrorCode,
+} from "./auctions/service.js";

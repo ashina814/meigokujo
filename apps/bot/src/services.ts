@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
+  Auctions,
   Departments,
   Entry,
   Evaluation,
@@ -47,7 +48,8 @@ export function buildServices() {
   if (dangling > 0) console.warn(`[vc] 閉じ損ねセグメントを ${dangling} 件補正しました`);
   const titles = new TitleEngine(db, vc);
   const departments = new Departments(db, ledger);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments };
+  const auctions = new Auctions(db, ledger, events);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, auctions };
 }
 
 export type Services = ReturnType<typeof buildServices>;

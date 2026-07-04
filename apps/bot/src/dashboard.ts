@@ -53,9 +53,11 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
     overdue > 0 ? `⚠️ 期限切れ・印不足: **${overdue}名**（#決裁で承認待ち）` : "期限切れ: なし",
   ].join("\n");
 
+  const openAuctions = services.auctions.listOpen().length;
   const ops = [
     `対応中チケット: ${openTickets}件${staleTickets > 0 ? ` / ⚠️ 24h無応答 **${staleTickets}件**` : ""}`,
     `稼働中の部屋: ${openRooms}室`,
+    `開催中の競売: ${openAuctions}件`,
   ].join("\n");
 
   // 部署口座（残高のある／登録済みの部署を上位から）
