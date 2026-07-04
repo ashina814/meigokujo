@@ -150,6 +150,41 @@ export class Chips {
     })();
   }
 
+  /**
+   * 保有チップを換金し、Land を「システム口座（部署など）」へ着地させる。
+   * カジノ収益(sys:house のチップ)を賭博場の部署口座へ精算するのに使う。
+   * 為替と同じスプレッド（80%着地/10%焼却/10%残留）＝非インフレ（むしろ焼却でデフレ寄り）。
+   */
+  redeemToAccount(holderId: string, chipsIn: number, destAccount: string, actor: string, idempotencyKey: string): ChipQuote {
+    if (!Number.isInteger(chipsIn) || chipsIn <= 0) throw new ChipError("ERR_BAD_AMOUNT", { chipsIn });
+    const held = this.balanceOf(holderId);
+    if (held < chipsIn) throw new ChipError("ERR_INSUFFICIENT_CHIPS", { held, chipsIn });
+    return this.db.transaction((): ChipQuote => {
+      const q = this.quoteSell(chipsIn);
+      if (q.output > 0) {
+        this.ledger.transfer({
+          from: CHIP_ESCROW, to: destAccount, amount: q.output, type: "chip_settle", actor,
+          approvedBy: CHIP_APPROVER, reason: "カジノ収益の精算", refType: "chips", refId: holderId, idempotencyKey,
+        });
+      }
+      if (q.burned > 0) {
+        this.ledger.transfer({
+          from: CHIP_ESCROW, to: TREASURY, amount: q.burned, type: "chip_burn", actor,
+          approvedBy: CHIP_APPROVER, reason: "精算スプレッド焼却", refType: "chips", refId: holderId, idempotencyKey: `${idempotencyKey}:burn`,
+        });
+      }
+      this.setBalance(holderId, -chipsIn);
+      if (this.outstanding() === 0 && this.pool() > 0) {
+        this.ledger.transfer({
+          from: CHIP_ESCROW, to: TREASURY, amount: this.pool(), type: "chip_burn", actor,
+          approvedBy: CHIP_APPROVER, reason: "準備プール残の回収", refType: "chips", refId: holderId, idempotencyKey: `${idempotencyKey}:sweep`,
+        });
+      }
+      this.events.log("chip_settle", { actor, payload: { holderId, chipsIn, land: q.output, dest: destAccount } });
+      return q;
+    })();
+  }
+
   /** カジノ内のチップ移動（賭け・配当）。台帳(Land)は動かさず総量保存 */
   transfer(fromUserId: string, toUserId: string, amount: number): void {
     if (!Number.isInteger(amount) || amount <= 0) throw new ChipError("ERR_BAD_AMOUNT", { amount });

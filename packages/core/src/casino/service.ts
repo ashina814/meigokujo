@@ -161,10 +161,23 @@ export class Casino {
     this.chips.transfer(fromUserId, HOUSE, chips);
     this.events.log("casino_fund", { actor: fromUserId, payload: { chips } });
   }
-  /** 胴元の売上を引き出す */
+  /** 胴元の売上を引き出す（個人チップへ） */
   withdrawHouse(toUserId: string, chips: number): void {
     this.chips.transfer(HOUSE, toUserId, chips);
     this.events.log("casino_withdraw", { actor: toUserId, payload: { chips } });
+  }
+
+  /**
+   * 胴元の売上を賭博場の部署口座へ Land として精算する。
+   * チップ→Land変換は為替と同じスプレッド（焼却シンクあり）。部署の売上として溜まる。
+   * @returns 変換したチップ数と部署に入った Land、焼却額
+   */
+  settleToDept(deptAccount: string, chips: number, actor: string): { chips: number; land: number; burned: number } {
+    const n = Math.min(chips, this.houseBalance());
+    if (n <= 0) return { chips: 0, land: 0, burned: 0 };
+    const q = this.chips.redeemToAccount(HOUSE, n, deptAccount, actor, `casino-settle:${Date.now()}:${n}`);
+    this.events.log("casino_settle", { actor, payload: { chips: n, land: q.output, dest: deptAccount, burned: q.burned } });
+    return { chips: n, land: q.output, burned: q.burned };
   }
 
   private ensureBet(playerId: string, bet: number, maxMult: number): void {

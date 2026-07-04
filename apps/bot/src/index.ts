@@ -153,7 +153,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     if (interaction.isAutocomplete()) {
-      if (interaction.commandName === "部署") {
+      if (interaction.commandName === "部署" || interaction.commandName === "カジノ") {
         await handleDepartmentAutocomplete(interaction, services);
       } else if (interaction.commandName === "競売") {
         await handleAuctionAutocomplete(interaction, services);

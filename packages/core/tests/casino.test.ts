@@ -146,6 +146,25 @@ describe("カジノ", () => {
     expect(ctx.chips.outstanding()).toBe(total0); // 焼却も発行もなし＝インフレしない
   });
 
+  it("精算: 胴元チップを部署口座へLandで納める（スプレッド＝焼却シンクあり・非インフレ）", () => {
+    const ctx = setup(() => 0);
+    // 賭博場の部署口座を用意（sys:dept:賭博場 を system 口座として作る）
+    const deptAcc = "sys:dept:賭博場";
+    ctx.ledger.ensureAccount(deptAcc, "system");
+    const houseChips = ctx.chips.balanceOf("sys:house");
+    expect(houseChips).toBeGreaterThan(0);
+    const supply0 = ctx.ledger.moneySupply();
+
+    const r = ctx.casino.settleToDept(deptAcc, houseChips, "op");
+    expect(r.chips).toBe(houseChips);
+    expect(r.land).toBeGreaterThan(0);
+    expect(ctx.ledger.balanceOf(deptAcc)).toBe(r.land); // 部署にLandが入る
+    expect(ctx.chips.balanceOf("sys:house")).toBe(0); // 胴元チップは0に
+    // 焼却ぶんだけ通貨供給は減る（増えない＝インフレしない）
+    expect(ctx.ledger.moneySupply()).toBeLessThanOrEqual(supply0);
+    expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
+  });
+
   it("多数のゲーム後もチップ総量とLand準備は不変（インフレゼロ）", () => {
     const ctx = setup(seq([0.1, 0.7, 0.3, 0.9, 0.5, 0.2, 0.8, 0.4]));
     const total0 = ctx.chips.outstanding();

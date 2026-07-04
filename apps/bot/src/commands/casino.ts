@@ -8,7 +8,8 @@ import {
   MessageFlags,
   SlashCommandBuilder,
 } from "discord.js";
-import { CasinoError, type BJView, type HiLoView, type RouletteBet } from "@meigokujo/core";
+import { CasinoError, deptAccount, type BJView, type HiLoView, type RouletteBet } from "@meigokujo/core";
+import { fmtLd } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import type { Services } from "../services.js";
 
@@ -46,7 +47,14 @@ export const casinoCommand = new SlashCommandBuilder()
     sub.setName("資金").setDescription("胴元にチップを入れる（運営）").addIntegerOption((o) => o.setName("チップ").setDescription("入れるチップ").setRequired(true).setMinValue(1)),
   )
   .addSubcommand((sub) =>
-    sub.setName("回収").setDescription("胴元の売上を引き出す（運営）").addIntegerOption((o) => o.setName("チップ").setDescription("引き出すチップ").setRequired(true).setMinValue(1)),
+    sub.setName("回収").setDescription("胴元の売上を個人チップへ引き出す（運営）").addIntegerOption((o) => o.setName("チップ").setDescription("引き出すチップ").setRequired(true).setMinValue(1)),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("精算")
+      .setDescription("胴元の売上を賭博場の部署口座へLandで納める（運営）")
+      .addStringOption((o) => o.setName("部署").setDescription("納入先の部署（既定: 賭博場）").setAutocomplete(true))
+      .addIntegerOption((o) => o.setName("チップ").setDescription("精算するチップ（省略で全額）").setMinValue(1)),
   );
 
 function parseRoulette(raw: string): RouletteBet | null {
@@ -92,6 +100,30 @@ export async function handleCasinoCommand(interaction: ChatInputCommandInteracti
     } catch (e) {
       await interaction.reply({ content: `❌ ${betErr(e)}`, flags: MessageFlags.Ephemeral });
     }
+    return;
+  }
+
+  if (sub === "精算") {
+    if (!isAdmin(interaction, services)) {
+      await interaction.reply({ content: "精算は運営のみ可能です。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const key = interaction.options.getString("部署") ?? "賭博場";
+    const dept = services.departments.get(key);
+    if (!dept) {
+      await interaction.reply({ content: `部署「${key}」がありません。\`/部署 作成\` で用意してください。`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const chipsToSettle = interaction.options.getInteger("チップ") ?? services.casino.houseBalance();
+    if (chipsToSettle <= 0) {
+      await interaction.reply({ content: "胴元の売上がありません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const r = services.casino.settleToDept(deptAccount(key), chipsToSettle, `user:${interaction.user.id}`);
+    await interaction.reply({
+      content: `✅ カジノ収益を「${dept.name}」へ精算: ${chip(r.chips)} → **${fmtLd(r.land)}**（焼却 ${fmtLd(r.burned)}）。部署残 ${fmtLd(services.departments.balanceOf(key))} ／ 胴元残 ${chip(services.casino.houseBalance())}`,
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
 
