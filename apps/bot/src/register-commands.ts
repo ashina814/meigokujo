@@ -30,16 +30,25 @@ const commands = [
 
 const rest = new REST().setToken(config.token);
 const guildId = process.env.GUILD_ID;
-if (guildId) {
+// REGISTER_GLOBAL=1 で本番用グローバル登録を強制。GUILD_ID 未設定でもグローバル。
+const useGlobal = process.env.REGISTER_GLOBAL === "1" || !guildId;
+
+if (useGlobal) {
+  const result = (await rest.put(Routes.applicationCommands(config.clientId), {
+    body: commands,
+  })) as unknown[];
+  // 開発ギルドが分かっているなら、そのギルド登録を必ず掃除する（グローバルと二重表示になるため）
+  if (guildId) {
+    await rest.put(Routes.applicationGuildCommands(config.clientId, guildId), { body: [] });
+    console.log(`✅ ${result.length} 個をグローバル登録し、ギルド ${guildId} の重複登録を掃除しました（反映に数分〜1時間）`);
+  } else {
+    console.log(`✅ ${result.length} 個のコマンドを登録しました（グローバル。反映に数分〜1時間かかることがあります）`);
+  }
+} else {
   // ギルド登録は即時反映（開発用）。グローバル側は空にして重複表示を防ぐ
   await rest.put(Routes.applicationCommands(config.clientId), { body: [] });
   const result = (await rest.put(Routes.applicationGuildCommands(config.clientId, guildId), {
     body: commands,
   })) as unknown[];
   console.log(`✅ ${result.length} 個のコマンドをギルド ${guildId} に登録しました（即時反映・グローバルは掃除済み）`);
-} else {
-  const result = (await rest.put(Routes.applicationCommands(config.clientId), {
-    body: commands,
-  })) as unknown[];
-  console.log(`✅ ${result.length} 個のコマンドを登録しました（グローバル。反映に数分かかることがあります）`);
 }
