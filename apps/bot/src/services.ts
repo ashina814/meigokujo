@@ -10,6 +10,7 @@ import {
   Settings,
   Rooms,
   Tickets,
+  TitleEngine,
   VcRewards,
   VcTracker,
   openDb,
@@ -43,7 +44,8 @@ export function buildServices() {
   // クラッシュで閉じ損ねたVCセグメントの後始末
   const dangling = vc.closeAllDangling();
   if (dangling > 0) console.warn(`[vc] 閉じ損ねセグメントを ${dangling} 件補正しました`);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms };
+  const titles = new TitleEngine(db, vc);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles };
 }
 
 export type Services = ReturnType<typeof buildServices>;

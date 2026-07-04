@@ -21,6 +21,7 @@ import {
 } from "./commands/evaluation.js";
 import { handlePromote } from "./commands/promote.js";
 import { handleDashboardCommand } from "./commands/dashboard-command.js";
+import { handleProfile } from "./commands/profile.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
@@ -91,6 +92,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "計器盤":
           await handleDashboardCommand(interaction, services);
+          return;
+        case "プロフィール":
+          await handleProfile(interaction, services);
           return;
       }
       return;

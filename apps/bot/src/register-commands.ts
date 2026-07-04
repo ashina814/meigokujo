@@ -11,6 +11,7 @@ import { sessionCommand } from "./commands/entry.js";
 import { evaluationCommand } from "./commands/evaluation.js";
 import { promoteCommand } from "./commands/promote.js";
 import { dashboardCommand } from "./commands/dashboard-command.js";
+import { profileCommand } from "./commands/profile.js";
 
 const commands = [
   settingsCommand.toJSON(),
@@ -24,6 +25,7 @@ const commands = [
   evaluationCommand.toJSON(),
   promoteCommand.toJSON(),
   dashboardCommand.toJSON(),
+  profileCommand.toJSON(),
 ];
 
 const rest = new REST().setToken(config.token);

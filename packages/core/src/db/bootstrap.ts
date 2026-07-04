@@ -165,6 +165,14 @@ CREATE TABLE IF NOT EXISTS eval_threads (
   thread_id TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS titles (
+  user_id    TEXT NOT NULL,
+  title_key  TEXT NOT NULL,
+  granted_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, title_key)
+);
+CREATE INDEX IF NOT EXISTS idx_titles_user ON titles(user_id);
+
 CREATE TABLE IF NOT EXISTS vc_segments (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id       TEXT NOT NULL,
