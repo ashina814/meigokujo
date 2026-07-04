@@ -95,6 +95,9 @@ export async function handleCasinoCommand(interaction: ChatInputCommandInteracti
     return;
   }
 
+  const w = services.weather.today();
+  const weatherFoot = w.mult === 1 ? undefined : `${w.emoji} ${w.label}: 配当 ×${w.mult}`;
+
   const bet = interaction.options.getInteger("賭け", true);
 
   if (sub === "ブラックジャック") {
@@ -121,7 +124,7 @@ export async function handleCasinoCommand(interaction: ChatInputCommandInteracti
       const pick = interaction.options.getString("面", true) as "表" | "裏";
       const r = services.casino.coin(uid, bet, pick);
       await interaction.reply({
-        embeds: [resultEmbed("🪙 コイン投げ", `結果は **${r.outcome}**！ あなたは ${r.pick} に ${chip(bet)}`, r.win, r.net, services.chips.balanceOf(uid))],
+        embeds: [resultEmbed("🪙 コイン投げ", `結果は **${r.outcome}**！ あなたは ${r.pick} に ${chip(bet)}`, r.win, r.net, services.chips.balanceOf(uid), weatherFoot)],
       });
       return;
     }
@@ -130,7 +133,7 @@ export async function handleCasinoCommand(interaction: ChatInputCommandInteracti
       const line = `[ ${r.reels.join(" | ")} ]`;
       const tag = r.multiplier >= 50 ? "🎉 **JACKPOT!!**" : r.multiplier >= 10 ? "✨ 大当たり！" : r.multiplier > 0 ? "当たり" : "ハズレ";
       await interaction.reply({
-        embeds: [resultEmbed("🎰 スロット", `${line}\n${tag}${r.multiplier > 0 ? `（×${r.multiplier}）` : ""}`, r.multiplier >= 1 && r.net >= 0, r.net, services.chips.balanceOf(uid))],
+        embeds: [resultEmbed("🎰 スロット", `${line}\n${tag}${r.multiplier > 0 ? `（×${r.multiplier}）` : ""}`, r.multiplier >= 1 && r.net >= 0, r.net, services.chips.balanceOf(uid), weatherFoot)],
       });
       return;
     }
@@ -143,18 +146,20 @@ export async function handleCasinoCommand(interaction: ChatInputCommandInteracti
     const r = services.casino.roulette(uid, bet, target);
     const colorMark = r.color === "赤" ? "🔴" : r.color === "黒" ? "⚫" : "🟢";
     await interaction.reply({
-      embeds: [resultEmbed("🎡 ルーレット", `出目は ${colorMark} **${r.number}**（${r.color}）！ あなたは「${r.target}」に ${chip(bet)}`, r.win, r.net, services.chips.balanceOf(uid))],
+      embeds: [resultEmbed("🎡 ルーレット", `出目は ${colorMark} **${r.number}**（${r.color}）！ あなたは「${r.target}」に ${chip(bet)}`, r.win, r.net, services.chips.balanceOf(uid), weatherFoot)],
     });
   } catch (e) {
     await interaction.reply({ content: `❌ ${betErr(e)}`, flags: MessageFlags.Ephemeral });
   }
 }
 
-function resultEmbed(title: string, body: string, win: boolean, net: number, balance: number): EmbedBuilder {
-  return new EmbedBuilder()
+function resultEmbed(title: string, body: string, win: boolean, net: number, balance: number, footer?: string): EmbedBuilder {
+  const e = new EmbedBuilder()
     .setTitle(title)
     .setColor(win ? 0xf0b429 : 0x52525b)
     .setDescription([body, "", win ? `➕ **${chip(net)}** の勝ち！` : `➖ ${chip(-net)} の負け…`, `残り ${chip(balance)}`].join("\n"));
+  if (footer) e.setFooter({ text: footer });
+  return e;
 }
 
 // ---- ブラックジャック ----

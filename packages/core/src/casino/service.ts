@@ -141,8 +141,15 @@ export class Casino {
     private readonly chips: Chips,
     private readonly events: EventLog,
     private readonly rng: () => number = Math.random,
+    /** その日の配当倍率（冥界の天気）。既定は等倍 */
+    private readonly weather: () => number = () => 1,
   ) {
     void this.db;
+  }
+
+  /** 当たり配当に天気倍率を適用（掛け金返却＝pushには適用しない） */
+  private win(base: number): number {
+    return Math.floor(base * this.weather());
   }
 
   houseBalance(): number {
@@ -163,8 +170,9 @@ export class Casino {
   private ensureBet(playerId: string, bet: number, maxMult: number): void {
     if (!Number.isInteger(bet) || bet <= 0) throw new CasinoError("ERR_BAD_BET", { bet });
     if (this.chips.balanceOf(playerId) < bet) throw new CasinoError("ERR_INSUFFICIENT_CHIPS", { held: this.chips.balanceOf(playerId), bet });
-    // 最大配当を胴元が払えるか（掛け金を受けた後の残高で判定）
-    if (this.houseBalance() + bet < bet * maxMult) throw new CasinoError("ERR_HOUSE_SHORT", { house: this.houseBalance(), need: bet * maxMult });
+    // 最大配当を胴元が払えるか（天気倍率込み・掛け金を受けた後の残高で判定）
+    const need = Math.ceil(bet * maxMult * this.weather());
+    if (this.houseBalance() + bet < need) throw new CasinoError("ERR_HOUSE_SHORT", { house: this.houseBalance(), need });
   }
 
   /** 賭けを受け、結果に応じて配当を払う共通処理 */
@@ -224,7 +232,7 @@ export class Casino {
         payout = bet;
         state = "push";
       } else if (playerBJ) {
-        payout = Math.floor((bet * 5) / 2); // 3:2
+        payout = this.win(Math.floor((bet * 5) / 2)); // 3:2 ×天気
         state = "blackjack";
       }
       const paid = this.pay(playerId, payout);
@@ -257,7 +265,7 @@ export class Casino {
     let payout = 0;
     if (dv > 21 || pv > dv) {
       state = "win";
-      payout = s.bet * 2;
+      payout = this.win(s.bet * 2);
     } else if (pv === dv) {
       state = "push";
       payout = s.bet;
@@ -330,7 +338,7 @@ export class Casino {
   hiloCashout(playerId: string): HiLoView {
     const s = this.hiloSessions.get(playerId);
     if (!s) throw new CasinoError("ERR_NO_GAME", { game: "hilo" });
-    const paid = this.pay(playerId, Math.floor(s.pot));
+    const paid = this.pay(playerId, this.win(Math.floor(s.pot)));
     this.hiloSessions.delete(playerId);
     this.events.log("casino_hilo", { actor: playerId, payload: { bet: s.bet, streak: s.streak, state: "cashed", payout: paid } });
     return this.hiloView(s, "cashed", undefined, paid);
@@ -342,7 +350,7 @@ export class Casino {
     this.ensureBet(playerId, bet, 2);
     const outcome: "表" | "裏" = this.randInt(2) === 0 ? "表" : "裏";
     const win = outcome === pick;
-    const payout = win ? Math.floor((bet * 195) / 100) : 0; // 1.95倍（エッジ2.5%）
+    const payout = win ? this.win(Math.floor((bet * 195) / 100)) : 0; // 1.95倍（エッジ2.5%）×天気
     this.resolve(playerId, bet, payout);
     this.events.log("casino_coin", { actor: playerId, payload: { bet, pick, outcome, payout } });
     return { bet, pick, outcome, win, payout, net: payout - bet };
@@ -377,7 +385,7 @@ export class Casino {
     this.ensureBet(playerId, bet, SLOT_MAX_MULT);
     const reels = [this.spinReel(), this.spinReel(), this.spinReel()];
     const multiplier = this.slotMultiplier(reels);
-    const payout = bet * multiplier;
+    const payout = this.win(bet * multiplier);
     this.resolve(playerId, bet, payout);
     this.events.log("casino_slot", { actor: playerId, payload: { bet, reels, multiplier, payout } });
     return { bet, reels, multiplier, payout, net: payout - bet };
@@ -399,7 +407,7 @@ export class Casino {
     else if (target.kind === "parity") win = number !== 0 && (number % 2 === 0 ? "偶" : "奇") === target.value;
     else win = number === target.value;
     const multiplier = win ? maxMult : 0;
-    const payout = bet * multiplier;
+    const payout = this.win(bet * multiplier);
     this.resolve(playerId, bet, payout);
     const targetStr = target.kind === "straight" ? String(target.value) : target.value;
     this.events.log("casino_roulette", { actor: playerId, payload: { bet, target: targetStr, number, color, payout } });

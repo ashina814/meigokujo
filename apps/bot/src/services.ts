@@ -20,6 +20,7 @@ import {
   TitleEngine,
   VcRewards,
   VcTracker,
+  Weather,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -58,8 +59,9 @@ export function buildServices() {
   const races = new Races(db, ledger, events);
   const fiscal = new Fiscal(db, ledger);
   const chips = new Chips(db, ledger, events);
-  const casino = new Casino(db, chips, events);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, auctions, lottery, races, fiscal, chips, casino };
+  const weather = new Weather(settings);
+  const casino = new Casino(db, chips, events, Math.random, () => weather.payoutMult());
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, auctions, lottery, races, fiscal, chips, casino, weather };
 }
 
 export type Services = ReturnType<typeof buildServices>;

@@ -94,6 +94,19 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
+    // ── 冥界の天気（毎朝7時に今日の天気を確定・発表）──
+    if (now.hour === 7 && now.minute < 2) {
+      const { def, isNew } = services.weather.roll(now.dateStr, "system:weather");
+      if (isNew) {
+        const chId = services.settings.getString("channel:shurei");
+        const ch = chId ? await client.channels.fetch(chId).catch(() => null) : null;
+        if (ch?.isTextBased() && "send" in ch) {
+          const eff = def.mult === 1 ? "カジノは平常運転。" : `本日のカジノ配当は **×${def.mult}**。`;
+          await ch.send(`🌦 **今日の冥界の天気** — ${def.emoji} **${def.label}**\n${def.note} ${eff}`).catch(() => undefined);
+        }
+      }
+    }
+
     // ── 24時間無応答チケットのリマインド（毎時0分にチェック）──
     if (now.minute < 2) {
       const stale = services.tickets.staleOpen(24);

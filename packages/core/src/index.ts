@@ -90,6 +90,7 @@ export {
   type ChipQuote,
   type ChipErrorCode,
 } from "./chips/service.js";
+export { Weather, WEATHER_TYPES, jstDateStr, type WeatherDef } from "./weather/service.js";
 export {
   Casino,
   CasinoError,
