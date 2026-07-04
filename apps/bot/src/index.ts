@@ -41,6 +41,7 @@ import {
   handleRaceSelect,
   handleRaceBetModal,
 } from "./commands/race.js";
+import { handleTaxCommand, handlePensionCommand, handleFiscalButton } from "./commands/fiscal.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
@@ -129,6 +130,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "レース":
           await handleRaceCommand(interaction, services);
+          return;
+        case "冥府税":
+          await handleTaxCommand(interaction, services);
+          return;
+        case "年金":
+          await handlePensionCommand(interaction, services);
           return;
       }
       return;
@@ -220,6 +227,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handlePaydayButton(interaction, services);
       } else if (interaction.customId.startsWith("mig:")) {
         await handleMigrationButton(interaction, services);
+      } else if (interaction.customId.startsWith("fis:")) {
+        await handleFiscalButton(interaction, services);
       }
     }
   } catch (err) {

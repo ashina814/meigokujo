@@ -73,3 +73,13 @@ export {
   type SettleResult,
   type RaceErrorCode,
 } from "./races/service.js";
+export {
+  Fiscal,
+  FiscalError,
+  type FiscalRunRow,
+  type FiscalPlan,
+  type FiscalPlanItem,
+  type FiscalReport,
+  type FiscalKind,
+  type FiscalErrorCode,
+} from "./fiscal/service.js";

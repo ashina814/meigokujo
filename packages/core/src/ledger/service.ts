@@ -108,6 +108,15 @@ export class Ledger {
     return row?.amount ?? 0;
   }
 
+  /** 残高が threshold を超える住人口座の一覧（冥府税の課税対象抽出用）。多い順 */
+  userBalancesAbove(threshold: number): Array<{ userId: string; balance: number }> {
+    return (
+      this.db
+        .prepare("SELECT account_id, amount FROM balances WHERE account_id LIKE 'user:%' AND amount > ? ORDER BY amount DESC")
+        .all(threshold) as Array<{ account_id: string; amount: number }>
+    ).map((r) => ({ userId: r.account_id.slice("user:".length), balance: r.amount }));
+  }
+
   getTx(id: number): TxRow | undefined {
     return this.db.prepare("SELECT * FROM transactions WHERE id = ?").get(id) as TxRow | undefined;
   }

@@ -312,6 +312,21 @@ CREATE TABLE IF NOT EXISTS race_bets (
   created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_race_bets ON race_bets(race_id, horse_index);
+
+CREATE TABLE IF NOT EXISTS fiscal_runs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind        TEXT NOT NULL CHECK (kind IN ('tax','pension')),
+  period      TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','approved','executed','cancelled')),
+  plan_json   TEXT NOT NULL,
+  report_json TEXT,
+  created_by  TEXT NOT NULL,
+  approved_by TEXT,
+  executed_at INTEGER,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  UNIQUE (kind, period)
+);
 `;
 
 export function openDb(path: string): Database.Database {
