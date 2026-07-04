@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@meigokujo/core": "workspace:*",
+    "@napi-rs/canvas": "^1.0.2",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.7",
     "tsx": "^4.19.2"

@@ -4,6 +4,35 @@ export function fmtLd(n: number): string {
   return `${n.toLocaleString("ja-JP")} Ld`;
 }
 
+/**
+ * 記録カードなど幅の限られた場所向けの簡約表記。
+ * 冥獄城は京クラス残高が実在するので万進法の単位で畳む。
+ * 例: 1,284,300 → "128.4万 Ld" / 2.8e16 → "2.8京 Ld" / 500 → "500 Ld"
+ */
+export function fmtLdCompact(n: number): string {
+  const sign = n < 0 ? "−" : "";
+  const v = Math.abs(n);
+  const units: Array<[number, string]> = [
+    [1e16, "京"],
+    [1e12, "兆"],
+    [1e8, "億"],
+    [1e4, "万"],
+  ];
+  for (const [base, unit] of units) {
+    if (v >= base) {
+      const scaled = v / base;
+      // 100以上は小数を落とす（例: 128万）。それ未満は小数1桁（例: 2.8京）
+      const text = scaled >= 100 ? Math.round(scaled).toLocaleString("ja-JP") : trimZero(scaled.toFixed(1));
+      return `${sign}${text}${unit} Ld`;
+    }
+  }
+  return `${sign}${v.toLocaleString("ja-JP")} Ld`;
+}
+
+function trimZero(s: string): string {
+  return s.replace(/\.0$/, "");
+}
+
 export function mention(accountId: string): string {
   if (accountId.startsWith("user:")) return `<@${accountId.slice(5)}>`;
   if (accountId === "sys:treasury") return "🏛 国庫";

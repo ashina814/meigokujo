@@ -1,11 +1,12 @@
 import {
+  AttachmentBuilder,
   ChatInputCommandInteraction,
-  EmbedBuilder,
   MessageFlags,
   SlashCommandBuilder,
   type GuildMember,
 } from "discord.js";
-import { fmtLd } from "../format.js";
+import { fmtLdCompact } from "../format.js";
+import { renderProfileCard } from "../render/profile-card.js";
 import type { Services } from "../services.js";
 
 const RANK_LABEL: Record<string, string> = {
@@ -30,6 +31,9 @@ export async function handleProfile(
   const target = interaction.options.getUser("対象") ?? interaction.user;
   const isSelf = target.id === interaction.user.id;
 
+  // 画像生成＋アバター取得で時間がかかるので先に defer（ephemeral）
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
   // 開いたときに称号を評価（新規獲得があれば付与）。他人のプロフィールでも遅れて拾える
   const newlyGranted = services.titles.evaluate(target.id);
 
@@ -42,38 +46,30 @@ export async function handleProfile(
 
   const member = interaction.guild?.members.cache.get(target.id) as GuildMember | undefined;
   const rank = soul ? (RANK_LABEL[soul.status] ?? soul.status) : "記録なし";
+  const displayName = member?.displayName ?? target.username;
 
-  const embed = new EmbedBuilder()
-    .setTitle(`📜 ${member?.displayName ?? target.username} の魂の記録`)
-    .setThumbnail(target.displayAvatarURL())
-    .setColor(0x6b21a8)
-    .addFields(
-      { name: "階級", value: rank, inline: true },
-      { name: "所持", value: fmtLd(balance), inline: true },
-      { name: "在城", value: daysInCastle > 0 ? `${daysInCastle}日` : "—", inline: true },
-      { name: "累計浮上", value: vcHours > 0 ? `${vcHours}時間` : "—", inline: true },
-      { name: "出現日数", value: presence.daysSeen > 0 ? `${presence.daysSeen}日` : "—", inline: true },
-      { name: "称号数", value: `${titles.length}`, inline: true },
-      {
-        name: "獲得称号",
-        value:
-          titles.length > 0
-            ? titles.map((t) => `${t.emoji} **${t.name}** — ${t.desc}`).join("\n")
-            : "まだ称号を持っていない。城で生きた証がここに刻まれる。",
-      },
-    );
-  if (soul?.status === "ghost" && soul.eval_deadline_at) {
-    embed.setFooter({ text: `審判期限まで…` }).addFields({ name: "審判", value: `<t:${soul.eval_deadline_at}:R>`, inline: true });
-  }
+  const png = await renderProfileCard({
+    displayName,
+    avatarUrl: target.displayAvatarURL({ extension: "png", size: 256 }),
+    rank,
+    balanceText: fmtLdCompact(balance),
+    daysInCastle,
+    vcHours,
+    daysSeen: presence.daysSeen,
+    titles: titles.map((t) => ({ name: t.name, desc: t.desc })),
+  });
+  const card = new AttachmentBuilder(png, { name: "record-card.png" });
 
   const lines: string[] = [];
   if (newlyGranted.length > 0 && isSelf) {
     lines.push(`🎉 新たな称号を獲得: ${newlyGranted.map((t) => `${t.emoji}${t.name}`).join(" / ")}`);
   }
+  if (soul?.status === "ghost" && soul.eval_deadline_at) {
+    lines.push(`⏳ 審判の刻限: <t:${soul.eval_deadline_at}:R>`);
+  }
 
-  await interaction.reply({
+  await interaction.editReply({
     content: lines.length > 0 ? lines.join("\n") : undefined,
-    embeds: [embed],
-    flags: MessageFlags.Ephemeral,
+    files: [card],
   });
 }
