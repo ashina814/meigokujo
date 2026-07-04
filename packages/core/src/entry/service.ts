@@ -117,6 +117,22 @@ export class Entry {
       .all(slot) as BookingRow[];
   }
 
+  /** 計器盤用のサマリー: 予約待ち人数・最古の予約日時・入城案内待ち（未申請含む）人数 */
+  queueSummary(): { booked: number; oldestBookedAt: number | null; waiting: number } {
+    const booked = (
+      this.db.prepare("SELECT COUNT(*) AS c FROM entry_bookings WHERE status = 'booked'").get() as { c: number }
+    ).c;
+    const oldest = (
+      this.db.prepare("SELECT MIN(created_at) AS t FROM entry_bookings WHERE status = 'booked'").get() as {
+        t: number | null;
+      }
+    ).t;
+    const waiting = (
+      this.db.prepare("SELECT COUNT(*) AS c FROM souls WHERE status = 'waiting'").get() as { c: number }
+    ).c;
+    return { booked, oldestBookedAt: oldest, waiting };
+  }
+
   /**
    * 亡霊化の一括処理（判定ボタンの本体）:
    * 魂台帳更新・評価期限起算・初期発行・招待実績の記帳と招待者の期限延長・事件録。

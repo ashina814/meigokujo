@@ -296,6 +296,36 @@ export class Ledger {
     return -this.balanceOf(TREASURY) || 0; // 「-0」表示を防ぐ
   }
 
+  /** 期間内の発行量（国庫→住人）・回収量（住人→国庫）。計器盤の経済指標用 */
+  flowBetween(fromTs: number, toTs: number): { issued: number; collected: number; net: number } {
+    const issued = (
+      this.db
+        .prepare(
+          "SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE from_account = ? AND created_at >= ? AND created_at < ?",
+        )
+        .get(TREASURY, fromTs, toTs) as { s: number }
+    ).s;
+    const collected = (
+      this.db
+        .prepare(
+          "SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE to_account = ? AND created_at >= ? AND created_at < ?",
+        )
+        .get(TREASURY, fromTs, toTs) as { s: number }
+    ).s;
+    return { issued, collected, net: issued - collected };
+  }
+
+  /** エスクロー・部署などシステム勘定に眠っている総額（国庫を除く） */
+  escrowTotal(): number {
+    return (
+      this.db
+        .prepare(
+          "SELECT COALESCE(SUM(amount),0) AS s FROM balances WHERE account_id LIKE 'sys:%' AND account_id != ?",
+        )
+        .get(TREASURY) as { s: number }
+    ).s;
+  }
+
   pendingOutbox(limit = 50): Array<{ id: number; kind: string; payload: string; attempts: number }> {
     // 10回失敗したエントリは配送を諦める（詰まり防止。データは残るので手動で追える）
     return this.db

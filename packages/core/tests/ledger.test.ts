@@ -214,3 +214,24 @@ describe("検算と outbox", () => {
     expect(ledger.pendingOutbox().length).toBe(0);
   });
 });
+
+describe("計器盤の経済指標", () => {
+  it("flowBetween が発行量・回収量・純増を返す", () => {
+    const ledger = setup();
+    fund(ledger, A, 30_000); // 発行
+    ledger.transfer({ from: A, to: TREASURY, amount: 5_000, type: "fine", actor: "staff", idempotencyKey: "f1" }); // 回収
+    ledger.transfer({ from: A, to: B, amount: 1_000, type: "transfer", actor: A, idempotencyKey: "t1" }); // 循環（国庫を通らない）
+
+    const flow = ledger.flowBetween(0, Math.floor(Date.now() / 1000) + 60);
+    expect(flow.issued).toBe(30_000);
+    expect(flow.collected).toBe(5_000);
+    expect(flow.net).toBe(25_000);
+  });
+
+  it("escrowTotal は国庫以外のシステム勘定の残高合計", () => {
+    const ledger = setup();
+    fund(ledger, A, 10_000);
+    ledger.transfer({ from: A, to: ESCROW, amount: 3_000, type: "auction_bid", actor: A, idempotencyKey: "e1" });
+    expect(ledger.escrowTotal()).toBe(3_000); // 国庫の負残高は含まれない
+  });
+});

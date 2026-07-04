@@ -4,6 +4,7 @@ import { createAndPostDraft } from "./payday.js";
 import { threadTitleFor } from "./commands/evaluation.js";
 import { checkBumpCooldowns } from "./bump.js";
 import { scanRooms } from "./rooms-lifecycle.js";
+import { updateDashboard } from "./dashboard.js";
 import { fmtLd } from "./format.js";
 import type { Services } from "./services.js";
 
@@ -89,6 +90,11 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
 
     // ── 部屋のライフサイクル（在室スキャン・削除・期限・募集失効）──
     await scanRooms(client, services);
+
+    // ── 計器盤の更新（10分ごと）──
+    if (now.minute % 10 === 0) {
+      await updateDashboard(client, services).catch((e) => console.error("[計器盤] 更新失敗:", e));
+    }
 
     // ── bump/up クールタイム終了通知 ──
     await checkBumpCooldowns(client, services);

@@ -20,6 +20,7 @@ import {
   handleEvaluationSelect,
 } from "./commands/evaluation.js";
 import { handlePromote } from "./commands/promote.js";
+import { handleDashboardCommand } from "./commands/dashboard-command.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
@@ -87,6 +88,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "昇格":
           await handlePromote(interaction, services);
+          return;
+        case "計器盤":
+          await handleDashboardCommand(interaction, services);
           return;
       }
       return;

@@ -10,6 +10,7 @@ import { migrationCommand } from "./commands/migration.js";
 import { sessionCommand } from "./commands/entry.js";
 import { evaluationCommand } from "./commands/evaluation.js";
 import { promoteCommand } from "./commands/promote.js";
+import { dashboardCommand } from "./commands/dashboard-command.js";
 
 const commands = [
   settingsCommand.toJSON(),
@@ -22,6 +23,7 @@ const commands = [
   sessionCommand.toJSON(),
   evaluationCommand.toJSON(),
   promoteCommand.toJSON(),
+  dashboardCommand.toJSON(),
 ];
 
 const rest = new REST().setToken(config.token);
