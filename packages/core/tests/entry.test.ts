@@ -109,4 +109,16 @@ describe("入城導線", () => {
     ctx.entry.book("c", "2026-07-06 22", { source: "none" });
     expect(ctx.entry.getBooking("c")!.no_show_count).toBe(1);
   });
+
+  it("見送り(skipBooking): 出席者を dropped にし、亡霊化しない", () => {
+    ctx.entry.book("skip1", "2026-07-05 21", { source: "none" });
+    ctx.entry.markAttended("skip1");
+    expect(ctx.entry.skipBooking("skip1", STAFF)).toBe(true);
+    expect(ctx.entry.getBooking("skip1")!.status).toBe("dropped");
+    // dropped は判定対象に出ない
+    expect(ctx.entry.judgeSlot("2026-07-05 21").attended).toHaveLength(0);
+    expect(ctx.events.listByTarget("skip1").map((e) => e.type)).toContain("entry_skipped");
+    // 既に dropped 済みは false
+    expect(ctx.entry.skipBooking("skip1", STAFF)).toBe(false);
+  });
 });

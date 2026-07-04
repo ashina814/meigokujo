@@ -237,6 +237,18 @@ export class Entry {
     return add;
   }
 
+  /**
+   * 見送り: 出席していたが今回は通さない判断。予約を dropped にしてキューから外す。
+   * 亡霊化はしない（初期発行も無し）。再挑戦は本人が再予約すれば可能。
+   */
+  skipBooking(userId: string, actor: string): boolean {
+    const changed = this.db
+      .prepare("UPDATE entry_bookings SET status = 'dropped', updated_at = ? WHERE user_id = ? AND status IN ('booked','attended')")
+      .run(now(), userId);
+    if (changed.changes > 0) this.events.log("entry_skipped", { actor, target: userId });
+    return changed.changes > 0;
+  }
+
   /** 欠席処理: 3回連続でキューから外す（自動キックはしない） */
   recordNoShow(userId: string): { count: number; dropped: boolean } {
     const ts = now();

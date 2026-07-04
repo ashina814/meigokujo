@@ -158,6 +158,11 @@ export async function handleEntryButton(
     return;
   }
 
+  if ((id.startsWith("entry:judgehold:") || id.startsWith("entry:judgeskip:")) && interaction.isUserSelectMenu()) {
+    await handleJudgeSelect(interaction, services);
+    return;
+  }
+
   if (id.startsWith("entry:pass:") && interaction.isButton()) {
     await handlePassButton(interaction, services);
   }
@@ -248,9 +253,32 @@ export const sessionCommand = new SlashCommandBuilder()
           .addChoices(...SESSION_HOURS.map((h) => ({ name: `${h}時`, value: h }))),
       ),
   )
+  .addSubcommand((sub) =>
+    sub
+      .setName("担当")
+      .setDescription("説明会の担当スタッフを割り当てる（30分前に本人へ通知）")
+      .addStringOption((o) =>
+        o
+          .setName("日付")
+          .setDescription("開催日")
+          .setRequired(true)
+          .addChoices({ name: "今日", value: "0" }, { name: "明日", value: "1" }),
+      )
+      .addIntegerOption((o) =>
+        o
+          .setName("時刻")
+          .setDescription("開催時刻")
+          .setRequired(true)
+          .addChoices(...SESSION_HOURS.map((h) => ({ name: `${h}時`, value: h }))),
+      )
+      .addUserOption((o) => o.setName("担当").setDescription("担当スタッフ").setRequired(true)),
+  )
   .addSubcommand((sub) => sub.setName("時間外一覧").setDescription("時間外・個別希望の待機者を表示"));
 
-function isJudge(interaction: ChatInputCommandInteraction | ButtonInteraction, services: Services): boolean {
+function isJudge(
+  interaction: ChatInputCommandInteraction | ButtonInteraction | UserSelectMenuInteraction,
+  services: Services,
+): boolean {
   if (isAdmin(interaction, services)) return true;
   const judgeRoleId = services.settings.getString("role:judge");
   if (!judgeRoleId) return false;
@@ -267,6 +295,21 @@ export async function handleSessionCommand(
     return;
   }
   const sub = interaction.options.getSubcommand();
+
+  if (sub === "担当") {
+    const dayOffset = Number(interaction.options.getString("日付", true));
+    const hour = interaction.options.getInteger("時刻", true);
+    const staff = interaction.options.getUser("担当", true);
+    const date = jstNow(new Date(Date.now() + dayOffset * 86_400_000)).dateStr;
+    const slot = `${date} ${hour}`;
+    services.settings.set(`entry:staff:${slot}`, staff.id, `user:${interaction.user.id}`);
+    await interaction.reply({
+      content: `✅ ${slotLabel(slot)} の説明会の担当を <@${staff.id}> にしました（開始30分前に本人へ通知します）。`,
+      flags: MessageFlags.Ephemeral,
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
 
   if (sub === "時間外一覧") {
     const rows = services.entry.listBySlot("flex").slice(0, 25);
@@ -293,31 +336,92 @@ export async function handleSessionCommand(
     return;
   }
 
+  // この判定用の保留/見送り状態をリセットして描画
+  judgeState.set(judgeKey(interaction.user.id, slot), { hold: new Set(), skip: new Set() });
+  await interaction.reply({ ...renderJudgment(services, slot, interaction.user.id), flags: MessageFlags.Ephemeral });
+}
+
+// ---- 判定UI: 保留/見送りの個別例外 ----
+
+interface JudgeSel {
+  hold: Set<string>; // 保留＝今回は通さず attended のまま（次回の判定で再度出る）
+  skip: Set<string>; // 見送り＝dropped にしてキューから外す（亡霊化しない）
+}
+const judgeState = new Map<string, JudgeSel>();
+const judgeKey = (judgeId: string, slot: string) => `${judgeId}:${slot}`;
+
+/** 判定メッセージ（出席・欠席・保留・見送りの分類 + 選択UI）を組み立てる */
+function renderJudgment(services: Services, slot: string, judgeId: string) {
+  const [date, hour] = slot.split(" ");
+  const { attended, absent } = services.entry.judgeSlot(slot);
+  const sel = judgeState.get(judgeKey(judgeId, slot)) ?? { hold: new Set(), skip: new Set() };
+  const toGhost = attended.filter((r) => !sel.hold.has(r.user_id) && !sel.skip.has(r.user_id));
+
+  const line = (rows: { user_id: string }[]) => (rows.length > 0 ? rows.map((r) => `・<@${r.user_id}>`).join("\n") : "（なし）");
   const embed = new EmbedBuilder()
     .setTitle(`⚖️ ${slotLabel(slot)} 説明会の判定`)
+    .setColor(0x6b21a8)
     .setDescription(
       [
-        `**出席 ${attended.length}名**（[全員を亡霊にする] の対象）:`,
-        attended.length > 0 ? attended.map((r) => `・<@${r.user_id}>`).join("\n") : "（なし）",
+        `**亡霊にする ${toGhost.length}名**:`,
+        line(toGhost),
         "",
-        `**欠席 ${absent.length}名**（欠席カウント+1 → 再予約案内）:`,
+        sel.hold.size > 0 ? `⏸ **保留 ${sel.hold.size}名**（次回に持ち越し）:\n${line([...sel.hold].map((id) => ({ user_id: id })))}\n` : "",
+        sel.skip.size > 0 ? `🚫 **見送り ${sel.skip.size}名**（キューから外す）:\n${line([...sel.skip].map((id) => ({ user_id: id })))}\n` : "",
+        `**欠席 ${absent.length}名**（欠席+1 → 再予約案内）:`,
         absent.length > 0 ? absent.map((r) => `・<@${r.user_id}>（累計${r.no_show_count}回）`).join("\n") : "（なし）",
-      ].join("\n"),
-    )
-    .setColor(0x6b21a8);
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`entry:pass:${date}:${hour}`)
-      .setLabel(`出席${attended.length}名を亡霊にする`)
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(attended.length === 0),
+      ]
+        .filter((s) => s !== "")
+        .join("\n"),
+    );
+
+  const rows: ActionRowBuilder<UserSelectMenuBuilder | ButtonBuilder>[] = [];
+  if (attended.length > 0) {
+    const max = Math.min(25, attended.length);
+    rows.push(
+      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+        new UserSelectMenuBuilder().setCustomId(`entry:judgehold:${date}:${hour}`).setPlaceholder("⏸ 保留にする人（次回持ち越し）").setMinValues(0).setMaxValues(max),
+      ),
+    );
+    rows.push(
+      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+        new UserSelectMenuBuilder().setCustomId(`entry:judgeskip:${date}:${hour}`).setPlaceholder("🚫 見送りにする人（今回通さない）").setMinValues(0).setMaxValues(max),
+      ),
+    );
+  }
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`entry:pass:${date}:${hour}`)
+        .setLabel(`${toGhost.length}名を亡霊にする`)
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(toGhost.length === 0),
+    ),
   );
-  await interaction.reply({
-    embeds: [embed],
-    components: [row],
-    flags: MessageFlags.Ephemeral,
-    allowedMentions: { parse: [] },
-  });
+  return { embeds: [embed], components: rows, allowedMentions: { parse: [] } };
+}
+
+/** 保留/見送りの選択を反映してメッセージを更新 */
+async function handleJudgeSelect(interaction: UserSelectMenuInteraction, services: Services): Promise<void> {
+  if (!isJudge(interaction, services)) {
+    await interaction.reply({ content: "この操作には面接担当の権限が必要です。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const parts = interaction.customId.split(":"); // entry:judgehold:date:hour
+  const kind = parts[1]; // judgehold | judgeskip
+  const slot = `${parts[2]} ${parts[3]}`;
+  const key = judgeKey(interaction.user.id, slot);
+  const sel = judgeState.get(key) ?? { hold: new Set<string>(), skip: new Set<string>() };
+  const picked = new Set(interaction.values);
+  if (kind === "judgehold") {
+    sel.hold = picked;
+    for (const id of picked) sel.skip.delete(id); // 保留に入れたら見送りからは外す
+  } else {
+    sel.skip = picked;
+    for (const id of picked) sel.hold.delete(id);
+  }
+  judgeState.set(key, sel);
+  await interaction.update(renderJudgment(services, slot, interaction.user.id));
 }
 
 async function handlePassButton(interaction: ButtonInteraction, services: Services): Promise<void> {
@@ -328,10 +432,21 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
   const parts = interaction.customId.split(":");
   const slot = `${parts[2]} ${parts[3]}`;
   const actor = `user:${interaction.user.id}`;
+  const sel = judgeState.get(judgeKey(interaction.user.id, slot)) ?? { hold: new Set<string>(), skip: new Set<string>() };
 
-  await interaction.update({ content: "⏳ 亡霊化を実行中…", embeds: [], components: [] });
+  await interaction.update({ content: "⏳ 判定を実行中…", embeds: [], components: [] });
 
   const { attended, absent } = services.entry.judgeSlot(slot);
+  // 見送りはキューから外す（亡霊化しない）。保留は attended のまま残す（次回に持ち越し）
+  const skipped: string[] = [];
+  for (const row of attended) {
+    if (sel.skip.has(row.user_id)) {
+      services.entry.skipBooking(row.user_id, actor);
+      skipped.push(row.user_id);
+    }
+  }
+  const toGhost = attended.filter((r) => !sel.hold.has(r.user_id) && !sel.skip.has(r.user_id));
+
   const guild = interaction.guild!;
   const waitRoleId = services.settings.getString("role:queue_wait");
   const ghostRoleId = services.settings.getString("role:ghost");
@@ -342,7 +457,7 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
   const failed: string[] = [];
   let totalGranted = 0;
 
-  for (const row of attended) {
+  for (const row of toGhost) {
     try {
       const member = await guild.members.fetch(row.user_id);
       const gender = maleRoleId && member.roles.cache.has(maleRoleId)
@@ -379,11 +494,15 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
       .catch(() => undefined);
   }
 
+  judgeState.delete(judgeKey(interaction.user.id, slot));
+
   const lines = [
     `✅ **${passed.length}名** を亡霊にしました（初期発行 計 ${fmtLd(totalGranted)}）。`,
     failed.length > 0 ? `❌ 失敗: ${failed.map((id) => `<@${id}>`).join(", ")}` : "",
+    sel.hold.size > 0 ? `⏸ 保留（次回持ち越し）: ${sel.hold.size}名` : "",
+    skipped.length > 0 ? `🚫 見送り（キューから除外）: ${skipped.map((id) => `<@${id}>`).join(", ")}` : "",
     rebook.length > 0 ? `📅 欠席 → 再予約案内: ${rebook.length}名` : "",
     droppedList.length > 0 ? `🚫 3回連続欠席でキューから除外: ${droppedList.map((id) => `<@${id}>`).join(", ")}（対応は運営判断）` : "",
   ].filter(Boolean);
-  await interaction.editReply({ content: lines.join("\n") });
+  await interaction.editReply({ content: lines.join("\n"), allowedMentions: { parse: [] } });
 }

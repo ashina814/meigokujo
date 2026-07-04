@@ -5,6 +5,7 @@ import { threadTitleFor } from "./commands/evaluation.js";
 import { checkBumpCooldowns } from "./bump.js";
 import { scanRooms } from "./rooms-lifecycle.js";
 import { updateDashboard } from "./dashboard.js";
+import { notifyUser } from "./notify.js";
 import { fmtLd } from "./format.js";
 import type { Services } from "./services.js";
 
@@ -65,6 +66,26 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
               `⏰ ${bookings.map((b) => `<@${b.user_id}>`).join(" ")} 説明会は **1時間後（${now.hour + 1}時）** です。時間になったら説明会場VCへどうぞ。`,
             );
           }
+        }
+      }
+    }
+
+    // ── 説明会の担当スタッフへ30分前アラート（20:30/21:30/22:30 = 各会の30分前）──
+    if ([20, 21, 22].includes(now.hour) && now.minute === 30) {
+      const slot = `${now.dateStr} ${now.hour + 1}`;
+      const marker = `entry:staffalert:${slot}`;
+      if (!services.settings.getString(marker)) {
+        services.settings.set(marker, "1", "system:scheduler");
+        const staffId = services.settings.getString(`entry:staff:${slot}`);
+        if (staffId) {
+          const booked = services.entry.listBySlot(slot).filter((b) => b.status === "booked").length;
+          await notifyUser(
+            client,
+            services,
+            staffId,
+            `🔔 **30分後（${now.hour + 1}時）の説明会の担当です。** 予約 **${booked}名**。時間になったら説明会場VCへ。`,
+            { fallbackChannelKey: "channel:shurei" },
+          ).catch((e) => console.error("[entry] 担当アラート失敗:", e));
         }
       }
     }
