@@ -228,11 +228,11 @@ export function handleVoiceAttendance(
   }
 }
 
-// ---- 判定（/説明会）----
+// ---- 判定（/審判）----
 
 export const sessionCommand = new SlashCommandBuilder()
-  .setName("説明会")
-  .setDescription("説明会の出席確認と判定（面接担当・運営専用）")
+  .setName("審判")
+  .setDescription("説明会の判定・担当と昇格（面接担当・審・運営）")
   .setDMPermission(false)
   .addSubcommand((sub) =>
     sub
@@ -273,7 +273,13 @@ export const sessionCommand = new SlashCommandBuilder()
       )
       .addUserOption((o) => o.setName("担当").setDescription("担当スタッフ").setRequired(true)),
   )
-  .addSubcommand((sub) => sub.setName("時間外一覧").setDescription("時間外・個別希望の待機者を表示"));
+  .addSubcommand((sub) => sub.setName("時間外一覧").setDescription("時間外・個別希望の待機者を表示"))
+  .addSubcommand((sub) =>
+    sub
+      .setName("昇格")
+      .setDescription("面談合格者を魔人に昇格させる（審・運営）")
+      .addUserOption((o) => o.setName("対象").setDescription("昇格させる亡霊").setRequired(true)),
+  );
 
 function isJudge(
   interaction: ChatInputCommandInteraction | ButtonInteraction | UserSelectMenuInteraction,

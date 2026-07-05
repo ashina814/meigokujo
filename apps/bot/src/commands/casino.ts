@@ -43,20 +43,7 @@ export const casinoCommand = new SlashCommandBuilder()
   .addSubcommand((sub) =>
     sub.setName("ハイロー").setDescription("次が上か下か。連勝で倍々、引き際が勝負").addIntegerOption((o) => o.setName("賭け").setDescription("賭けるチップ").setRequired(true).setMinValue(1)),
   )
-  .addSubcommand((sub) => sub.setName("残高").setDescription("自分のチップと胴元の状況"))
-  .addSubcommand((sub) =>
-    sub.setName("資金").setDescription("胴元にチップを入れる（運営）").addIntegerOption((o) => o.setName("チップ").setDescription("入れるチップ").setRequired(true).setMinValue(1)),
-  )
-  .addSubcommand((sub) =>
-    sub.setName("回収").setDescription("胴元の売上を個人チップへ引き出す（運営）").addIntegerOption((o) => o.setName("チップ").setDescription("引き出すチップ").setRequired(true).setMinValue(1)),
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("精算")
-      .setDescription("胴元の売上を賭博場の部署口座へLandで納める（運営）")
-      .addStringOption((o) => o.setName("部署").setDescription("納入先の部署（既定: 賭博場）").setAutocomplete(true))
-      .addIntegerOption((o) => o.setName("チップ").setDescription("精算するチップ（省略で全額）").setMinValue(1)),
-  );
+  .addSubcommand((sub) => sub.setName("残高").setDescription("自分のチップと胴元の状況"));
 
 function parseRoulette(raw: string): RouletteBet | null {
   const t = raw.trim();
@@ -112,7 +99,7 @@ export async function handleCasinoCommand(interaction: ChatInputCommandInteracti
     const key = interaction.options.getString("部署") ?? "賭博場";
     const dept = services.departments.get(key);
     if (!dept) {
-      await interaction.reply({ content: `部署「${key}」がありません。\`/部署 作成\` で用意してください。`, flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: `部署「${key}」がありません。\`/運営 部署 作成\` で用意してください。`, flags: MessageFlags.Ephemeral });
       return;
     }
     const chipsToSettle = interaction.options.getInteger("チップ") ?? services.casino.houseBalance();

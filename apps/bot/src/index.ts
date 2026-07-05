@@ -24,26 +24,13 @@ import { handleDashboardCommand } from "./commands/dashboard-command.js";
 import { handleProfile } from "./commands/profile.js";
 import { handleDepartment, handleDepartmentAutocomplete } from "./commands/department.js";
 import { handleTip } from "./commands/tip.js";
-import {
-  handleAuctionCommand,
-  handleAuctionAutocomplete,
-  handleAuctionButton,
-  handleAuctionBidModal,
-} from "./commands/auction.js";
-import {
-  handleLotteryCommand,
-  handleLotteryButton,
-  handleLotteryBuyModal,
-} from "./commands/lottery.js";
-import {
-  handleRaceCommand,
-  handleRaceAutocomplete,
-  handleRaceSelect,
-  handleRaceBetModal,
-} from "./commands/race.js";
+import { handleAuctionButton, handleAuctionBidModal } from "./commands/auction.js";
+import { handleLotteryButton, handleLotteryBuyModal } from "./commands/lottery.js";
+import { handleRaceSelect, handleRaceBetModal } from "./commands/race.js";
 import { handleTaxCommand, handlePensionCommand, handleFiscalButton } from "./commands/fiscal.js";
 import { handleExchangeCommand } from "./commands/chips.js";
 import { handleCasinoCommand, handleCasinoButton, handleCasinoAutocomplete } from "./commands/casino.js";
+import { handleOperations, handleOperationsAutocomplete } from "./commands/operations.js";
 import { handleWeatherCommand } from "./commands/weather.js";
 import { handleHelpCommand } from "./commands/help.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
@@ -106,14 +93,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "移行":
           await handleMigration(interaction, services);
           return;
-        case "説明会":
-          await handleSessionCommand(interaction, services);
+        case "審判":
+          if (interaction.options.getSubcommand() === "昇格") await handlePromote(interaction, services);
+          else await handleSessionCommand(interaction, services);
+          return;
+        case "運営":
+          await handleOperations(interaction, services);
           return;
         case "評価":
           await handleEvaluationCommand(interaction, services);
-          return;
-        case "昇格":
-          await handlePromote(interaction, services);
           return;
         case "計器盤":
           await handleDashboardCommand(interaction, services);
@@ -126,15 +114,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "投げ銭":
           await handleTip(interaction, services);
-          return;
-        case "競売":
-          await handleAuctionCommand(interaction, services);
-          return;
-        case "籤":
-          await handleLotteryCommand(interaction, services);
-          return;
-        case "レース":
-          await handleRaceCommand(interaction, services);
           return;
         case "冥府税":
           await handleTaxCommand(interaction, services);
@@ -158,14 +137,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     if (interaction.isAutocomplete()) {
-      if (interaction.commandName === "部署") {
+      if (interaction.commandName === "運営") {
+        await handleOperationsAutocomplete(interaction, services);
+      } else if (interaction.commandName === "部署") {
         await handleDepartmentAutocomplete(interaction, services);
       } else if (interaction.commandName === "カジノ") {
         await handleCasinoAutocomplete(interaction, services);
-      } else if (interaction.commandName === "競売") {
-        await handleAuctionAutocomplete(interaction, services);
-      } else if (interaction.commandName === "レース") {
-        await handleRaceAutocomplete(interaction, services);
       }
       return;
     }

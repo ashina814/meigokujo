@@ -19,19 +19,6 @@ export const departmentCommand = new SlashCommandBuilder()
   .setName("部署")
   .setDescription("部署口座の管理（業務資金）")
   .setDMPermission(false)
-  .addSubcommand((sub) =>
-    sub
-      .setName("作成")
-      .setDescription("部署を作成／担当ロールを更新（運営）")
-      .addStringOption((o) => o.setName("名前").setDescription("部署名（例: 賭博場）").setRequired(true).setMaxLength(40))
-      .addRoleOption((o) => o.setName("担当ロール").setDescription("入出金できる部署員ロール").setRequired(true)),
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("削除")
-      .setDescription("部署を削除（残高0のときのみ・運営）")
-      .addStringOption((o) => o.setName("部署").setDescription("削除する部署").setRequired(true).setAutocomplete(true)),
-  )
   .addSubcommand((sub) => sub.setName("一覧").setDescription("部署と残高の一覧"))
   .addSubcommand((sub) =>
     sub
@@ -88,7 +75,7 @@ export async function handleDepartment(
           ? rows
               .map((d) => `**${d.name}** — ${fmtLd(d.balance)}${d.role_id ? `　担当 <@&${d.role_id}>` : "　担当未設定"}`)
               .join("\n")
-          : "まだ部署がありません。`/部署 作成` で登録してください。",
+          : "まだ部署がありません。運営が `/運営 部署 作成` で登録してください。",
       );
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     return;

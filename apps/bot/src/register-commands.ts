@@ -9,40 +9,37 @@ import { paydayCommand } from "./commands/payday-command.js";
 import { migrationCommand } from "./commands/migration.js";
 import { sessionCommand } from "./commands/entry.js";
 import { evaluationCommand } from "./commands/evaluation.js";
-import { promoteCommand } from "./commands/promote.js";
 import { dashboardCommand } from "./commands/dashboard-command.js";
 import { profileCommand } from "./commands/profile.js";
 import { departmentCommand } from "./commands/department.js";
 import { tipCommand } from "./commands/tip.js";
-import { auctionCommand } from "./commands/auction.js";
-import { lotteryCommand } from "./commands/lottery.js";
-import { raceCommand } from "./commands/race.js";
 import { taxCommand, pensionCommand } from "./commands/fiscal.js";
 import { exchangeCommand } from "./commands/chips.js";
 import { casinoCommand } from "./commands/casino.js";
 import { weatherCommand } from "./commands/weather.js";
 import { helpCommand } from "./commands/help.js";
+import { operationsCommand } from "./commands/operations.js";
 
 const commands = [
+  // 運営専用（ManageGuild で非表示）
   settingsCommand.toJSON(),
-  transferCommand.toJSON(),
+  operationsCommand.toJSON(),
   panelCommand.toJSON(),
   adjustCommand.toJSON(),
   salaryTableCommand.toJSON(),
   paydayCommand.toJSON(),
   migrationCommand.toJSON(),
-  sessionCommand.toJSON(),
-  evaluationCommand.toJSON(),
-  promoteCommand.toJSON(),
   dashboardCommand.toJSON(),
+  taxCommand.toJSON(),
+  pensionCommand.toJSON(),
+  // スタッフ（役職ゲート）
+  sessionCommand.toJSON(), // /審判（判定・担当・時間外一覧・昇格）
+  evaluationCommand.toJSON(),
+  // 全員
+  transferCommand.toJSON(),
   profileCommand.toJSON(),
   departmentCommand.toJSON(),
   tipCommand.toJSON(),
-  auctionCommand.toJSON(),
-  lotteryCommand.toJSON(),
-  raceCommand.toJSON(),
-  taxCommand.toJSON(),
-  pensionCommand.toJSON(),
   exchangeCommand.toJSON(),
   casinoCommand.toJSON(),
   weatherCommand.toJSON(),
