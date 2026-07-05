@@ -118,7 +118,8 @@ export const settingsCommand = new SlashCommandBuilder()
       .addChannelOption((o) => o.setName("カテゴリ").setDescription("複製先の巣穴カテゴリ"))
       .addChannelOption((o) => o.setName("巣穴大").setDescription("入ると増えるトリガーVC（全員可）"))
       .addChannelOption((o) => o.setName("巣穴中").setDescription("トリガーVC（魔剣士・審のみ）"))
-      .addChannelOption((o) => o.setName("巣穴小").setDescription("トリガーVC（魔剣士・審のみ）")),
+      .addChannelOption((o) => o.setName("巣穴小").setDescription("トリガーVC（魔剣士・審のみ）"))
+      .addChannelOption((o) => o.setName("応接室").setDescription("トリガーVC（魔剣士・審のみ・2人・報酬対象外）")),
   )
   .addSubcommand((sub) =>
     sub
@@ -285,6 +286,7 @@ export async function handleSettings(
       ["巣穴大", "vc:den_large"],
       ["巣穴中", "vc:den_medium"],
       ["巣穴小", "vc:den_small"],
+      ["応接室", "vc:den_reception"],
     ];
     const done: string[] = [];
     for (const [opt, keyName] of map) {

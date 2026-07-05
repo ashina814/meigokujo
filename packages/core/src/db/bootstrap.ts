@@ -315,7 +315,7 @@ CREATE INDEX IF NOT EXISTS idx_race_bets ON race_bets(race_id, horse_index);
 
 CREATE TABLE IF NOT EXISTS den_vcs (
   channel_id TEXT PRIMARY KEY,
-  kind       TEXT NOT NULL CHECK (kind IN ('large','medium','small')),
+  kind       TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
 
@@ -347,6 +347,10 @@ export function openDb(path: string): Database.Database {
     db.pragma("journal_mode = WAL");
   }
   db.pragma("foreign_keys = ON");
+  // マイグレーション: den_vcs.kind の古い CHECK 制約（応接室を弾く）を外すため作り直す。
+  // 一時的な追跡データなので破棄して問題ない。
+  const denSql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='den_vcs'").get() as { sql?: string } | undefined)?.sql;
+  if (denSql && denSql.includes("CHECK")) db.exec("DROP TABLE den_vcs");
   db.exec(DDL);
   return db;
 }
