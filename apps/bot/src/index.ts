@@ -43,7 +43,7 @@ import {
 } from "./commands/race.js";
 import { handleTaxCommand, handlePensionCommand, handleFiscalButton } from "./commands/fiscal.js";
 import { handleExchangeCommand } from "./commands/chips.js";
-import { handleCasinoCommand, handleCasinoButton } from "./commands/casino.js";
+import { handleCasinoCommand, handleCasinoButton, handleCasinoAutocomplete } from "./commands/casino.js";
 import { handleWeatherCommand } from "./commands/weather.js";
 import { handleHelpCommand } from "./commands/help.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
@@ -158,8 +158,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     if (interaction.isAutocomplete()) {
-      if (interaction.commandName === "部署" || interaction.commandName === "カジノ") {
+      if (interaction.commandName === "部署") {
         await handleDepartmentAutocomplete(interaction, services);
+      } else if (interaction.commandName === "カジノ") {
+        await handleCasinoAutocomplete(interaction, services);
       } else if (interaction.commandName === "競売") {
         await handleAuctionAutocomplete(interaction, services);
       } else if (interaction.commandName === "レース") {
@@ -171,7 +173,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleEvaluationModal(interaction, services);
       return;
     }
-    if (interaction.isModalSubmit() && interaction.customId === "room:recruit") {
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("room:recruit:")) {
       await handleRecruitModal(interaction, services);
       return;
     }
@@ -230,7 +232,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleAuctionButton(interaction, services);
         return;
       }
-      if (interaction.customId.startsWith("lot:buy:")) {
+      if (interaction.customId.startsWith("lot:buy:") || interaction.customId.startsWith("lot:qbuy:")) {
         await handleLotteryButton(interaction, services);
         return;
       }

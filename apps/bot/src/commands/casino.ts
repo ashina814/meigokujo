@@ -1,5 +1,6 @@
 import {
   ActionRowBuilder,
+  AutocompleteInteraction,
   ButtonBuilder,
   ButtonInteraction,
   ButtonStyle,
@@ -34,7 +35,7 @@ export const casinoCommand = new SlashCommandBuilder()
       .setName("ルーレット")
       .setDescription("ルーレット。色/偶奇は2倍、数字的中は36倍")
       .addIntegerOption((o) => o.setName("賭け").setDescription("賭けるチップ").setRequired(true).setMinValue(1))
-      .addStringOption((o) => o.setName("対象").setDescription("赤 / 黒 / 偶 / 奇 / 0〜36 の数字").setRequired(true).setMaxLength(3)),
+      .addStringOption((o) => o.setName("対象").setDescription("赤 / 黒 / 偶 / 奇 / 0〜36 の数字").setRequired(true).setMaxLength(3).setAutocomplete(true)),
   )
   .addSubcommand((sub) =>
     sub.setName("ブラックジャック").setDescription("ディーラーと勝負。BJは1.5倍").addIntegerOption((o) => o.setName("賭け").setDescription("賭けるチップ").setRequired(true).setMinValue(1)),
@@ -124,6 +125,13 @@ export async function handleCasinoCommand(interaction: ChatInputCommandInteracti
       content: `✅ カジノ収益を「${dept.name}」へ精算: ${chip(r.chips)} → **${fmtLd(r.land)}**（焼却 ${fmtLd(r.burned)}）。部署残 ${fmtLd(services.departments.balanceOf(key))} ／ 胴元残 ${chip(services.casino.houseBalance())}`,
       flags: MessageFlags.Ephemeral,
     });
+    return;
+  }
+
+  // カジノ専用チャンネルが設定されていれば、ゲームはそこでだけ（雑談を流さない）
+  const casinoCh = services.settings.getString("channel:casino");
+  if (casinoCh && interaction.channelId !== casinoCh) {
+    await interaction.reply({ content: `🎰 カジノは <#${casinoCh}> で開帳しています。そちらでどうぞ。`, flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -255,6 +263,31 @@ function hiloMessage(v: HiLoView) {
     return { embeds: [embed], components: [row] };
   }
   return { embeds: [embed], components: [] };
+}
+
+/** カジノのオートコンプリート: 精算の部署／ルーレットの対象、で分岐 */
+export async function handleCasinoAutocomplete(interaction: AutocompleteInteraction, services: Services): Promise<void> {
+  const focused = interaction.options.getFocused(true);
+  if (focused.name === "部署") {
+    const q = focused.value.toString().toLowerCase();
+    const choices = services.departments
+      .list()
+      .filter((d) => !q || d.name.toLowerCase().includes(q) || d.key.toLowerCase().includes(q))
+      .slice(0, 25)
+      .map((d) => ({ name: d.name, value: d.key }));
+    await interaction.respond(choices).catch(() => undefined);
+    return;
+  }
+  // ルーレットの対象
+  const raw = focused.value.toString().trim();
+  const base = [
+    { name: "🔴 赤（2倍）", value: "赤" },
+    { name: "⚫ 黒（2倍）", value: "黒" },
+    { name: "偶数（2倍）", value: "偶" },
+    { name: "奇数（2倍）", value: "奇" },
+  ];
+  const choices = /^\d{1,2}$/.test(raw) && Number(raw) <= 36 ? [{ name: `🎯 ${raw} に一点賭け（36倍）`, value: raw }, ...base] : base;
+  await interaction.respond(choices).catch(() => undefined);
 }
 
 export async function handleCasinoButton(interaction: ButtonInteraction, services: Services): Promise<void> {

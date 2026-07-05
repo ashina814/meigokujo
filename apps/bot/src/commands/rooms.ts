@@ -163,7 +163,11 @@ export async function handleRoomButton(
       return;
     }
     if (kind === "mitsugetsu") {
-      await interaction.showModal(recruitModal());
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("room:recruitg:male").setLabel("男性を募集").setEmoji("🚹").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("room:recruitg:female").setLabel("女性を募集").setEmoji("🚺").setStyle(ButtonStyle.Danger),
+      );
+      await interaction.reply({ content: "🌸 どちらを募集しますか？（5,000 Ld）", components: [row], flags: MessageFlags.Ephemeral });
       return;
     }
     if (kind === "oborozuki") {
@@ -191,6 +195,12 @@ export async function handleRoomButton(
       return;
     }
     await createAndReply(interaction, services, "oborozuki", [interaction.user.id, targetId]);
+    return;
+  }
+
+  if (id.startsWith("room:recruitg:") && interaction.isButton()) {
+    const gender = id.endsWith("male") && !id.endsWith("female") ? "male" : "female";
+    await interaction.showModal(recruitModal(gender));
     return;
   }
 
@@ -289,14 +299,11 @@ async function handleAddSlot(interaction: ButtonInteraction, services: Services)
 
 // ---- 蜜月の匿名募集 ----
 
-function recruitModal(): ModalBuilder {
+function recruitModal(gender: "male" | "female"): ModalBuilder {
   return new ModalBuilder()
-    .setCustomId("room:recruit")
-    .setTitle("蜜月の募集（5,000 Ld）")
+    .setCustomId(`room:recruit:${gender}`)
+    .setTitle(`蜜月の募集 — ${gender === "male" ? "男性" : "女性"}向け（5,000 Ld）`)
     .addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("gender").setLabel("募集する性別（男 / 女）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(2),
-      ),
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder().setCustomId("purpose").setLabel("目的（例: 寝落ち・作業・雑談）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(50),
       ),
@@ -307,12 +314,7 @@ function recruitModal(): ModalBuilder {
 }
 
 export async function handleRecruitModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
-  const genderRaw = interaction.fields.getTextInputValue("gender").trim();
-  const gender = genderRaw.startsWith("男") ? "male" : genderRaw.startsWith("女") ? "female" : null;
-  if (!gender) {
-    await interaction.reply({ content: "性別は「男」または「女」で入力してください。", flags: MessageFlags.Ephemeral });
-    return;
-  }
+  const gender = interaction.customId.endsWith(":male") ? ("male" as const) : ("female" as const);
   const purpose = interaction.fields.getTextInputValue("purpose").trim();
   const message = interaction.fields.getTextInputValue("message").trim() || undefined;
 

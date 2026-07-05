@@ -4,6 +4,7 @@ import {
   GuildMember,
   MessageFlags,
   SlashCommandBuilder,
+  PermissionFlagsBits,
 } from "discord.js";
 import { SETTING_DEFAULTS, type SettingKey } from "@meigokujo/core";
 import { config } from "../config.js";
@@ -21,6 +22,7 @@ export const CHANNEL_KINDS = [
   ["shurei", "集令"],
   ["announce", "昇格のお知らせ"],
   ["recruit", "蜜月の募集掲示"],
+  ["casino", "カジノ（設定するとゲームはそこ限定）"],
 ] as const;
 
 /** ロール割当の種別（role:<kind> に保存） */
@@ -46,6 +48,7 @@ export const settingsCommand = new SlashCommandBuilder()
   .setName("設定")
   .setDescription("冥獄城ボットの設定（運営専用）")
   .setDMPermission(false)
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addSubcommand((sub) => sub.setName("表示").setDescription("現在の設定を一覧表示"))
   .addSubcommand((sub) =>
     sub
@@ -165,11 +168,30 @@ export async function handleSettings(
     const numericLines = NUMERIC_KEYS.map(
       (k) => `${k}: **${services.settings.getNumber(k).toLocaleString()}**`,
     );
+    const denLines = (
+      [
+        ["category:eval_den", "カテゴリ"],
+        ["vc:den_large", "巣穴大"],
+        ["vc:den_medium", "巣穴中"],
+        ["vc:den_small", "巣穴小"],
+        ["vc:den_reception", "応接室"],
+      ] as const
+    ).map(([key, label]) => {
+      const id = services.settings.getString(key);
+      return `${label}: ${id ? `<#${id}>` : "未設定"}`;
+    });
+    const ladder = services.settings.getJson<Array<{ hours: number; roleId: string }>>("vc_rank_ladder", []);
+    const ladderLine =
+      ladder.length > 0
+        ? [...ladder].sort((a, b) => a.hours - b.hours).map((t) => `${t.hours}h→<@&${t.roleId}>`).join(" / ")
+        : "未設定";
     const embed = new EmbedBuilder()
       .setTitle("⚙️ 冥獄城ボット 設定")
       .addFields(
         { name: "チャンネル割当", value: channelLines.join("\n") },
         { name: "管理ロール", value: adminRoleId ? `<@&${adminRoleId}>` : "未設定（OWNERのみ）" },
+        { name: "巣穴（評価VC）", value: denLines.join("\n") },
+        { name: "位階ラダー", value: ladderLine },
         { name: "数値パラメータ", value: numericLines.join("\n") },
       )
       .setColor(0x6b21a8);

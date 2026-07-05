@@ -60,7 +60,9 @@ export function lotteryPanelMessage(services: Services, l: LotteryRow) {
     )
     .setFooter({ text: "当選確率は購入枚数に比例します" });
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`lot:buy:${l.id}`).setLabel(open ? "籤を買う" : "終了").setEmoji("🎟").setStyle(ButtonStyle.Primary).setDisabled(!open),
+    new ButtonBuilder().setCustomId(`lot:qbuy:${l.id}:1`).setLabel("1枚").setEmoji("🎟").setStyle(ButtonStyle.Primary).setDisabled(!open),
+    new ButtonBuilder().setCustomId(`lot:qbuy:${l.id}:10`).setLabel("10枚").setEmoji("🎟").setStyle(ButtonStyle.Primary).setDisabled(!open),
+    new ButtonBuilder().setCustomId(`lot:buy:${l.id}`).setLabel(open ? "まとめ買い…" : "終了").setStyle(ButtonStyle.Secondary).setDisabled(!open),
   );
   return { embeds: [embed], components: [row], allowedMentions: { parse: [] } };
 }
@@ -165,12 +167,31 @@ export async function handleLotteryCommand(interaction: ChatInputCommandInteract
 // ---- 購入（ボタン → モーダル）----
 
 export async function handleLotteryButton(interaction: ButtonInteraction, services: Services): Promise<void> {
-  const id = Number(interaction.customId.split(":")[2]);
+  const parts = interaction.customId.split(":"); // lot:buy:id / lot:qbuy:id:qty
+  const id = Number(parts[2]);
   const l = services.lottery.get(id);
   if (!l || l.status !== "open") {
     await interaction.reply({ content: "この籤は終了しています。", flags: MessageFlags.Ephemeral });
     return;
   }
+
+  // クイック購入（1枚/10枚）はモーダルなしで即時
+  if (parts[1] === "qbuy") {
+    const qty = Number(parts[3]);
+    try {
+      const res = services.lottery.buy({ lotteryId: id, userId: interaction.user.id, qty, idempotencyKey: `lot-qbuy:${interaction.id}` });
+      const fresh = services.lottery.get(id)!;
+      await refreshLotteryPanel(interaction.client, services, fresh);
+      await interaction.reply({ content: `✅ ${qty}枚 購入しました（−${fmtLd(res.cost)}）。持ち枚数 **${res.qty}枚** ／ 想定当選額 ${fmtLd(services.lottery.jackpot(fresh))}`, flags: MessageFlags.Ephemeral });
+    } catch (e) {
+      let msg = "購入に失敗しました。";
+      if (e instanceof LotteryError && (e.code === "ERR_LOTTERY_ENDED" || e.code === "ERR_LOTTERY_CLOSED")) msg = "この籤は終了しています。";
+      else if (e instanceof LedgerError && e.code === "ERR_INSUFFICIENT") msg = `残高が足りません（所持: ${fmtLd(Number(e.details.balance))}）。`;
+      await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+
   const modal = new ModalBuilder()
     .setCustomId(`lot:buymodal:${id}`)
     .setTitle(`輪廻籤#${id} 購入`)

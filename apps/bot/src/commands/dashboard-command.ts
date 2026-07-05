@@ -1,4 +1,4 @@
-import { ChatInputCommandInteraction, MessageFlags, SlashCommandBuilder } from "discord.js";
+import { ChatInputCommandInteraction, MessageFlags, SlashCommandBuilder , PermissionFlagsBits} from "discord.js";
 import { isAdmin } from "../permissions.js";
 import { updateDashboard } from "../dashboard.js";
 import type { Services } from "../services.js";
@@ -8,6 +8,7 @@ export const dashboardCommand = new SlashCommandBuilder()
   .setName("計器盤")
   .setDescription("城の計器盤を設置・更新する（運営専用）")
   .setDMPermission(false)
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addSubcommand((sub) =>
     sub.setName("設置").setDescription("このチャンネルを計器盤にする（10分ごと自動更新）"),
   )

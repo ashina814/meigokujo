@@ -7,6 +7,7 @@ import {
   EmbedBuilder,
   MessageFlags,
   SlashCommandBuilder,
+  PermissionFlagsBits,
 } from "discord.js";
 import {
   MigrationError,
@@ -22,6 +23,7 @@ export const migrationCommand = new SlashCommandBuilder()
   .setName("移行")
   .setDescription("旧ボット残高の一括移行（運営専用）")
   .setDMPermission(false)
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addSubcommand((sub) =>
     sub
       .setName("取込")

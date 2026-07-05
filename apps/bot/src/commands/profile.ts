@@ -22,7 +22,8 @@ export const profileCommand = new SlashCommandBuilder()
   .setName("プロフィール")
   .setDescription("魂の記録カードを表示する")
   .setDMPermission(false)
-  .addUserOption((o) => o.setName("対象").setDescription("他の人の記録を見る（省略で自分）"));
+  .addUserOption((o) => o.setName("対象").setDescription("他の人の記録を見る（省略で自分）"))
+  .addBooleanOption((o) => o.setName("公開").setDescription("true でみんなに見える形で表示（称号自慢用）"));
 
 export async function handleProfile(
   interaction: ChatInputCommandInteraction,
@@ -31,8 +32,9 @@ export async function handleProfile(
   const target = interaction.options.getUser("対象") ?? interaction.user;
   const isSelf = target.id === interaction.user.id;
 
-  // 画像生成＋アバター取得で時間がかかるので先に defer（ephemeral）
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  // 画像生成＋アバター取得で時間がかかるので先に defer（既定は本人だけ・公開:true で全員に見える）
+  const isPublic = interaction.options.getBoolean("公開") ?? false;
+  await interaction.deferReply(isPublic ? {} : { flags: MessageFlags.Ephemeral });
 
   // 開いたときに称号を評価（新規獲得があれば付与）。他人のプロフィールでも遅れて拾える
   const newlyGranted = services.titles.evaluate(target.id);

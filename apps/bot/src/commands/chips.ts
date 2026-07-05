@@ -21,7 +21,7 @@ export const exchangeCommand = new SlashCommandBuilder()
     sub
       .setName("両替")
       .setDescription("Land を払ってチップを買う")
-      .addIntegerOption((o) => o.setName("land").setDescription("支払う Land").setRequired(true).setMinValue(10)),
+      .addIntegerOption((o) => o.setName("金額").setDescription("支払う Land").setRequired(true).setMinValue(10)),
   )
   .addSubcommand((sub) =>
     sub
@@ -53,7 +53,7 @@ export async function handleExchangeCommand(interaction: ChatInputCommandInterac
   }
 
   if (sub === "両替") {
-    const landIn = interaction.options.getInteger("land", true);
+    const landIn = interaction.options.getInteger("金額", true);
     const preview = services.chips.quoteBuy(landIn);
     try {
       const q = services.chips.buy(interaction.user.id, landIn, `chip-buy:${interaction.id}`);

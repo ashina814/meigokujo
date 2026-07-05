@@ -2,6 +2,7 @@ import {
   ChatInputCommandInteraction,
   MessageFlags,
   SlashCommandBuilder,
+  PermissionFlagsBits,
 } from "discord.js";
 import { isAdmin } from "../permissions.js";
 import { createAndPostDraft } from "../payday.js";
@@ -13,6 +14,7 @@ export const paydayCommand = new SlashCommandBuilder()
   .setName("給与支給")
   .setDescription("支給案を作成して #決裁 に承認パネルを出す（運営専用・臨時用）")
   .setDMPermission(false)
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addStringOption((o) =>
     o.setName("対象月").setDescription("YYYY-MM 形式（省略時は今月）").setMaxLength(7),
   );

@@ -8,6 +8,7 @@ import {
   MessageFlags,
   SlashCommandBuilder,
   type TextChannel,
+  PermissionFlagsBits,
 } from "discord.js";
 import { FiscalError, type FiscalPlan, type FiscalRunRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
@@ -19,6 +20,7 @@ export const taxCommand = new SlashCommandBuilder()
   .setName("冥府税")
   .setDescription("高額残高への課税案を作り #決裁 に出す（運営）")
   .setDMPermission(false)
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addIntegerOption((o) => o.setName("控除下限").setDescription("この残高までは非課税（既定100万）").setMinValue(0))
   .addIntegerOption((o) => o.setName("税率").setDescription("超過分への税率％（既定5）").setMinValue(1).setMaxValue(90));
 
@@ -26,6 +28,7 @@ export const pensionCommand = new SlashCommandBuilder()
   .setName("年金")
   .setDescription("在城の長い魂へ年金を給付する案を #決裁 に出す（運営）")
   .setDMPermission(false)
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addIntegerOption((o) => o.setName("在城日数").setDescription("この日数を超えた魂が対象（既定365）").setMinValue(1))
   .addIntegerOption((o) => o.setName("金額").setDescription("1人あたりの給付額（既定50,000）").setMinValue(1));
 

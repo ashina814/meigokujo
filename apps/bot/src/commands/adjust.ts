@@ -2,6 +2,7 @@ import {
   ChatInputCommandInteraction,
   MessageFlags,
   SlashCommandBuilder,
+  PermissionFlagsBits,
 } from "discord.js";
 import { LedgerError, TREASURY } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
@@ -15,6 +16,7 @@ export const adjustCommand = new SlashCommandBuilder()
   .setName("調整")
   .setDescription("Land の発行・回収・罰金（運営専用）")
   .setDMPermission(false)
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addStringOption((o) =>
     o
       .setName("種別")

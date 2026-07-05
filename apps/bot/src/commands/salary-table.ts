@@ -3,6 +3,7 @@ import {
   EmbedBuilder,
   MessageFlags,
   SlashCommandBuilder,
+  PermissionFlagsBits,
 } from "discord.js";
 import { fmtLd } from "../format.js";
 import { isAdmin } from "../permissions.js";
@@ -12,6 +13,7 @@ export const salaryTableCommand = new SlashCommandBuilder()
   .setName("給与表")
   .setDescription("ロールごとの給与を管理する（運営専用）")
   .setDMPermission(false)
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addSubcommand((sub) =>
     sub
       .setName("設定")

@@ -43,7 +43,7 @@ export async function handleHelpCommand(interaction: ChatInputCommandInteraction
       {
         name: "🎰 カジノ（チップで遊ぶ）",
         value: [
-          "① `/為替 両替 land:1000` で Land をチップに（手数料あり）",
+          "① `/為替 両替 金額:1000` で Land をチップに（手数料あり）",
           "② `/カジノ コイン / スロット / ルーレット / ブラックジャック / ハイロー`",
           "③ `/為替 換金` で Land に戻す（手数料あり）",
           "チップは Land 100% 準備。遊んでも日常の Land は直接は減らない",

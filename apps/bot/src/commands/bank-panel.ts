@@ -9,6 +9,7 @@ import {
   SlashCommandBuilder,
   type Message,
   type TextChannel,
+  PermissionFlagsBits,
 } from "discord.js";
 import { fmtLd, formatHistLine } from "../format.js";
 import { isAdmin } from "../permissions.js";
@@ -22,6 +23,7 @@ export const panelCommand = new SlashCommandBuilder()
   .setName("パネル設置")
   .setDescription("常設パネルをこのチャンネルに設置する（運営専用）")
   .setDMPermission(false)
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addStringOption((o) =>
     o
       .setName("種別")
