@@ -9,7 +9,7 @@ import {
   MessageFlags,
   SlashCommandBuilder,
 } from "discord.js";
-import { CasinoError, deptAccount, type BJView, type HiLoView, type RouletteBet } from "@meigokujo/core";
+import { CasinoError, LedgerError, deptAccount, type BJView, type HiLoView, type RouletteBet } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import type { Services } from "../services.js";
@@ -75,16 +75,43 @@ export async function handleCasinoCommand(interaction: ChatInputCommandInteracti
     return;
   }
 
-  if (sub === "資金" || sub === "回収") {
+  if (sub === "資金") {
+    if (!isAdmin(interaction, services)) {
+      await interaction.reply({ content: "胴元の資金操作は運営のみ可能です。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const key = interaction.options.getString("部署") ?? "賭博場";
+    const dept = services.departments.get(key);
+    if (!dept) {
+      await interaction.reply({ content: `部署「${key}」がありません。\`/運営 部署 作成\` で用意してください。`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const land = interaction.options.getInteger("金額", true);
+    try {
+      const r = services.casino.fundHouseFromDept(deptAccount(key), land, `user:${interaction.user.id}`);
+      await interaction.reply({
+        content: `✅ 「${dept.name}」から胴元へ **${fmtLd(r.land)}** を投入 → ${chip(r.chips)}（手数料なし）。胴元残 ${chip(services.casino.houseBalance())} ／ 部署残 ${fmtLd(services.departments.balanceOf(key))}`,
+        flags: MessageFlags.Ephemeral,
+      });
+    } catch (e) {
+      const msg =
+        e instanceof LedgerError && e.code === "ERR_INSUFFICIENT"
+          ? `「${dept.name}」のLandが足りません（残高 ${fmtLd(services.departments.balanceOf(key))}）。\`/部署 入金\` で入れてください。`
+          : "投入に失敗しました。";
+      await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+
+  if (sub === "回収") {
     if (!isAdmin(interaction, services)) {
       await interaction.reply({ content: "胴元の資金操作は運営のみ可能です。", flags: MessageFlags.Ephemeral });
       return;
     }
     const amount = interaction.options.getInteger("チップ", true);
     try {
-      if (sub === "資金") services.casino.fundHouse(uid, amount);
-      else services.casino.withdrawHouse(uid, amount);
-      await interaction.reply({ content: `✅ 胴元${sub === "資金" ? "へ入金" : "から回収"}: ${chip(amount)}（胴元残 ${chip(services.casino.houseBalance())}）。`, flags: MessageFlags.Ephemeral });
+      services.casino.withdrawHouse(uid, amount);
+      await interaction.reply({ content: `✅ 胴元から回収: ${chip(amount)}（胴元残 ${chip(services.casino.houseBalance())}）。`, flags: MessageFlags.Ephemeral });
     } catch (e) {
       await interaction.reply({ content: `❌ ${betErr(e)}`, flags: MessageFlags.Ephemeral });
     }
@@ -109,7 +136,7 @@ export async function handleCasinoCommand(interaction: ChatInputCommandInteracti
     }
     const r = services.casino.settleToDept(deptAccount(key), chipsToSettle, `user:${interaction.user.id}`);
     await interaction.reply({
-      content: `✅ カジノ収益を「${dept.name}」へ精算: ${chip(r.chips)} → **${fmtLd(r.land)}**（焼却 ${fmtLd(r.burned)}）。部署残 ${fmtLd(services.departments.balanceOf(key))} ／ 胴元残 ${chip(services.casino.houseBalance())}`,
+      content: `✅ カジノ収益を「${dept.name}」へ精算: ${chip(r.chips)} → **${fmtLd(r.land)}**（手数料なし）。部署残 ${fmtLd(services.departments.balanceOf(key))} ／ 胴元残 ${chip(services.casino.houseBalance())}`,
       flags: MessageFlags.Ephemeral,
     });
     return;

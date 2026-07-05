@@ -75,7 +75,13 @@ export const operationsCommand = new SlashCommandBuilder()
     g
       .setName("カジノ")
       .setDescription("胴元の資金管理")
-      .addSubcommand((s) => s.setName("資金").setDescription("胴元にチップを入れる").addIntegerOption((o) => o.setName("チップ").setDescription("入れるチップ").setRequired(true).setMinValue(1)))
+      .addSubcommand((s) =>
+        s
+          .setName("資金")
+          .setDescription("賭博場口座のLandを胴元の元手に入れる（手数料なし）")
+          .addIntegerOption((o) => o.setName("金額").setDescription("投入する Land").setRequired(true).setMinValue(1))
+          .addStringOption((o) => o.setName("部署").setDescription("元手の出所（既定: 賭博場）").setAutocomplete(true)),
+      )
       .addSubcommand((s) => s.setName("回収").setDescription("胴元の売上を個人チップへ引き出す").addIntegerOption((o) => o.setName("チップ").setDescription("引き出すチップ").setRequired(true).setMinValue(1)))
       .addSubcommand((s) =>
         s

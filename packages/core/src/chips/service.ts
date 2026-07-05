@@ -185,6 +185,56 @@ export class Chips {
     })();
   }
 
+  /**
+   * システム口座(部署など)の Land を元手に、フェアレート（スプレッド/焼却なし）でチップを holder へ発行。
+   * 胴元(カジノ)の開帳資金を賭博場口座から入れる用。プレイヤーの両替と違い損得ゼロで往復できる。
+   */
+  fundFromAccount(srcAccount: string, landIn: number, holderId: string, idempotencyKey: string): { land: number; chips: number } {
+    if (!Number.isInteger(landIn) || landIn <= 0) throw new ChipError("ERR_BAD_AMOUNT", { landIn });
+    return this.db.transaction((): { land: number; chips: number } => {
+      const P = this.pool();
+      const C = this.outstanding();
+      const minted = C === 0 || P === 0 ? landIn : muldiv(landIn, C, P); // フェア（レート据え置き）
+      this.ledger.transfer({
+        from: srcAccount, to: CHIP_ESCROW, amount: landIn, type: "chip_house_fund", actor: CHIP_APPROVER,
+        approvedBy: CHIP_APPROVER, reason: "胴元の元手", refType: "chips", refId: holderId, idempotencyKey,
+      });
+      this.setBalance(holderId, minted);
+      this.events.log("chip_house_fund", { actor: holderId, payload: { land: landIn, chips: minted, src: srcAccount } });
+      return { land: landIn, chips: minted };
+    })();
+  }
+
+  /**
+   * holder のチップをフェアレート（スプレッド/焼却なし）で system 口座(部署)へ Land 精算。
+   * 胴元の売上を賭博場口座へ戻す用。全部戻すと準備プールもちょうど空になる。
+   */
+  redeemFairToAccount(holderId: string, chipsIn: number, destAccount: string, idempotencyKey: string): { chips: number; land: number } {
+    if (!Number.isInteger(chipsIn) || chipsIn <= 0) throw new ChipError("ERR_BAD_AMOUNT", { chipsIn });
+    const held = this.balanceOf(holderId);
+    if (held < chipsIn) throw new ChipError("ERR_INSUFFICIENT_CHIPS", { held, chipsIn });
+    return this.db.transaction((): { chips: number; land: number } => {
+      const P = this.pool();
+      const C = this.outstanding();
+      const land = C === 0 ? 0 : muldiv(chipsIn, P, C); // フェア gross（80%引きなし）
+      if (land > 0) {
+        this.ledger.transfer({
+          from: CHIP_ESCROW, to: destAccount, amount: land, type: "chip_settle", actor: CHIP_APPROVER,
+          approvedBy: CHIP_APPROVER, reason: "胴元の売上精算", refType: "chips", refId: holderId, idempotencyKey,
+        });
+      }
+      this.setBalance(holderId, -chipsIn);
+      if (this.outstanding() === 0 && this.pool() > 0) {
+        this.ledger.transfer({
+          from: CHIP_ESCROW, to: TREASURY, amount: this.pool(), type: "chip_burn", actor: CHIP_APPROVER,
+          approvedBy: CHIP_APPROVER, reason: "準備プール残の回収", refType: "chips", refId: holderId, idempotencyKey: `${idempotencyKey}:sweep`,
+        });
+      }
+      this.events.log("chip_settle", { actor: holderId, payload: { chips: chipsIn, land, dest: destAccount, fair: true } });
+      return { chips: chipsIn, land };
+    })();
+  }
+
   /** カジノ内のチップ移動（賭け・配当）。台帳(Land)は動かさず総量保存 */
   transfer(fromUserId: string, toUserId: string, amount: number): void {
     if (!Number.isInteger(amount) || amount <= 0) throw new ChipError("ERR_BAD_AMOUNT", { amount });

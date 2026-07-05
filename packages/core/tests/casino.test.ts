@@ -146,23 +146,32 @@ describe("カジノ", () => {
     expect(ctx.chips.outstanding()).toBe(total0); // 焼却も発行もなし＝インフレしない
   });
 
-  it("精算: 胴元チップを部署口座へLandで納める（スプレッド＝焼却シンクあり・非インフレ）", () => {
-    const ctx = setup(() => 0);
-    // 賭博場の部署口座を用意（sys:dept:賭博場 を system 口座として作る）
+  it("胴元の元手を賭博場口座のLandから入れ、精算で戻す往復は手数料ゼロ（フェア）", () => {
+    // チップ未発行のクリーンな状態で検証（初期レート1）
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    const events = new EventLog(db);
+    const chips = new Chips(db, ledger, events);
+    const casino = new Casino(db, chips, events);
     const deptAcc = "sys:dept:賭博場";
-    ctx.ledger.ensureAccount(deptAcc, "system");
-    const houseChips = ctx.chips.balanceOf("sys:house");
-    expect(houseChips).toBeGreaterThan(0);
-    const supply0 = ctx.ledger.moneySupply();
+    ledger.ensureAccount(deptAcc, "system");
+    ledger.transfer({ from: TREASURY, to: deptAcc, amount: 200_000, type: "adjust", actor: "op", idempotencyKey: "seed", approvedBy: "op" });
 
-    const r = ctx.casino.settleToDept(deptAcc, houseChips, "op");
-    expect(r.chips).toBe(houseChips);
-    expect(r.land).toBeGreaterThan(0);
-    expect(ctx.ledger.balanceOf(deptAcc)).toBe(r.land); // 部署にLandが入る
-    expect(ctx.chips.balanceOf("sys:house")).toBe(0); // 胴元チップは0に
-    // 焼却ぶんだけ通貨供給は減る（増えない＝インフレしない）
-    expect(ctx.ledger.moneySupply()).toBeLessThanOrEqual(supply0);
-    expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
+    // 資金: 部署Land 100,000 → 胴元チップ（フェア＝1:1）
+    const f = casino.fundHouseFromDept(deptAcc, 100_000, "op");
+    expect(f.land).toBe(100_000);
+    expect(f.chips).toBe(100_000); // レート1
+    expect(casino.houseBalance()).toBe(100_000);
+    expect(ledger.balanceOf(deptAcc)).toBe(100_000);
+
+    // 精算: 全部戻すと Land はぴったり 100,000（手数料なし）＝往復ゼロ損
+    const s = casino.settleToDept(deptAcc, f.chips, "op");
+    expect(s.land).toBe(100_000);
+    expect(ledger.balanceOf(deptAcc)).toBe(200_000);
+    expect(casino.houseBalance()).toBe(0);
+    expect(chips.outstanding()).toBe(0);
+    expect(chips.pool()).toBe(0);
+    expect(ledger.verifyIntegrity().ok).toBe(true);
   });
 
   it("多数のゲーム後もチップ総量とLand準備は不変（インフレゼロ）", () => {

@@ -156,10 +156,17 @@ export class Casino {
     return this.chips.balanceOf(HOUSE);
   }
 
-  /** 胴元にチップを入れる（開帳の元手）。運営操作はbot側で判定 */
+  /** 胴元にチップを入れる（開帳の元手・個人チップから）。運営操作はbot側で判定 */
   fundHouse(fromUserId: string, chips: number): void {
     this.chips.transfer(fromUserId, HOUSE, chips);
     this.events.log("casino_fund", { actor: fromUserId, payload: { chips } });
+  }
+
+  /** 開帳の元手を賭博場の部署口座のLandから入れる（フェアレート・手数料なし） */
+  fundHouseFromDept(deptAccount: string, landIn: number, actor: string): { land: number; chips: number } {
+    const r = this.chips.fundFromAccount(deptAccount, landIn, HOUSE, `casino-fund:${Date.now()}:${landIn}`);
+    this.events.log("casino_fund", { actor, payload: { land: r.land, chips: r.chips, src: deptAccount } });
+    return r;
   }
   /** 胴元の売上を引き出す（個人チップへ） */
   withdrawHouse(toUserId: string, chips: number): void {
@@ -168,16 +175,16 @@ export class Casino {
   }
 
   /**
-   * 胴元の売上を賭博場の部署口座へ Land として精算する。
-   * チップ→Land変換は為替と同じスプレッド（焼却シンクあり）。部署の売上として溜まる。
-   * @returns 変換したチップ数と部署に入った Land、焼却額
+   * 胴元の売上を賭博場の部署口座へ Land として精算する（フェアレート・手数料なし）。
+   * スプレッド（20%）はプレイヤーの両替だけに掛かる。胴元の資金は損得ゼロで往復。
+   * @returns 変換したチップ数と部署に入った Land
    */
-  settleToDept(deptAccount: string, chips: number, actor: string): { chips: number; land: number; burned: number } {
+  settleToDept(deptAccount: string, chips: number, actor: string): { chips: number; land: number } {
     const n = Math.min(chips, this.houseBalance());
-    if (n <= 0) return { chips: 0, land: 0, burned: 0 };
-    const q = this.chips.redeemToAccount(HOUSE, n, deptAccount, actor, `casino-settle:${Date.now()}:${n}`);
-    this.events.log("casino_settle", { actor, payload: { chips: n, land: q.output, dest: deptAccount, burned: q.burned } });
-    return { chips: n, land: q.output, burned: q.burned };
+    if (n <= 0) return { chips: 0, land: 0 };
+    const q = this.chips.redeemFairToAccount(HOUSE, n, deptAccount, `casino-settle:${Date.now()}:${n}`);
+    this.events.log("casino_settle", { actor, payload: { chips: n, land: q.land, dest: deptAccount } });
+    return { chips: n, land: q.land };
   }
 
   private ensureBet(playerId: string, bet: number, maxMult: number): void {

@@ -86,6 +86,7 @@ export function registerDefaultTxTypes(): void {
   registerTxType("chip_sell", { fromKinds: ["system"], toKinds: ["user"] }); // チップ→Land（準備プール→住人）
   registerTxType("chip_burn", { fromKinds: ["system"], toKinds: ["system"] }); // 両替スプレッドの焼却（プール→国庫回収）
   registerTxType("chip_settle", { fromKinds: ["system"], toKinds: ["system"] }); // カジノ収益の精算（チップ準備→部署口座へLand）
+  registerTxType("chip_house_fund", { fromKinds: ["system"], toKinds: ["system"] }); // 胴元の元手（部署口座Land→チップ準備、フェアレート）
 
   registerTxType("lottery_rake", { fromKinds: ["system"], toKinds: ["system"] }); // 控除（エスクロー→国庫）
   registerTxType("lottery_seed", { fromKinds: ["system"], toKinds: ["system"] }); // 積立（国庫→エスクロー）
