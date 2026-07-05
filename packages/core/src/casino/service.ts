@@ -47,6 +47,18 @@ export interface SlotResult {
 
 export type RouletteBet = { kind: "color"; value: "赤" | "黒" } | { kind: "parity"; value: "偶" | "奇" } | { kind: "straight"; value: number };
 
+export type ChinchiroKind = "win" | "push" | "lose";
+export interface ChinchiroResult {
+  bet: number;
+  rolls: number[][]; // 各投目（振り直しを含む）
+  dice: number[]; // 最終の3つ
+  yaku: string; // 役名
+  kind: ChinchiroKind;
+  multiplier: number;
+  payout: number;
+  net: number;
+}
+
 export interface RouletteResult {
   bet: number;
   target: string;
@@ -65,6 +77,24 @@ const SLOT_MAX_MULT = 50;
 
 // ルーレットの赤（欧州式）。それ以外(0除く)は黒、0は緑
 const ROULETTE_RED = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
+
+// ---- チンチロ ----
+/** 3つの目から役を判定する（none は振り直し対象） */
+function chinchiroYaku(dice: number[]): { name: string; kind: ChinchiroKind | "none"; mult: number } {
+  const [a, b, c] = [...dice].sort((x, y) => x - y);
+  if (a === b && b === c) {
+    return a === 1 ? { name: "ピンゾロ", kind: "win", mult: 5 } : { name: `アラシ（${a}のゾロ目）`, kind: "win", mult: 3 };
+  }
+  if (a === 4 && b === 5 && c === 6) return { name: "シゴロ", kind: "win", mult: 2 };
+  if (a === 1 && b === 2 && c === 3) return { name: "ヒフミ", kind: "lose", mult: 0 };
+  const odd = a === b ? c! : b === c ? a! : null; // ペアの余り＝目
+  if (odd !== null) {
+    if (odd >= 5) return { name: `目${odd}`, kind: "win", mult: 2 };
+    if (odd === 4) return { name: "目4", kind: "push", mult: 1 };
+    return { name: `目${odd}`, kind: "lose", mult: 0 };
+  }
+  return { name: "役なし", kind: "none", mult: 0 }; // 振り直し対象
+}
 
 // ---- トランプ（ブラックジャック・ハイロー）----
 export interface Card {
@@ -199,6 +229,28 @@ export class Casino {
   private resolve(playerId: string, bet: number, payout: number): void {
     this.chips.transfer(playerId, HOUSE, bet); // 掛け金を胴元へ
     if (payout > 0) this.chips.transfer(HOUSE, playerId, payout); // 当たりは胴元から
+  }
+
+  // ---- チンチロ（3個振り・役なしは最大3回まで振り直し） ----
+  chinchiro(playerId: string, bet: number): ChinchiroResult {
+    this.ensureBet(playerId, bet, 5); // 最大ピンゾロ×5
+    const rolls: number[][] = [];
+    let yaku = { name: "ションベン", kind: "lose" as ChinchiroKind | "none", mult: 0 };
+    for (let i = 0; i < 3; i++) {
+      const dice = [this.randInt(6) + 1, this.randInt(6) + 1, this.randInt(6) + 1];
+      rolls.push(dice);
+      const y = chinchiroYaku(dice);
+      if (y.kind !== "none") {
+        yaku = y;
+        break;
+      }
+      if (i === 2) yaku = { name: "ションベン", kind: "lose", mult: 0 }; // 3回とも役なし
+    }
+    const kind = (yaku.kind === "none" ? "lose" : yaku.kind) as ChinchiroKind;
+    const payout = kind === "push" ? bet : kind === "win" ? this.win(bet * yaku.mult) : 0;
+    this.resolve(playerId, bet, payout);
+    this.events.log("casino_chinchiro", { actor: playerId, payload: { bet, yaku: yaku.name, payout } });
+    return { bet, rolls, dice: rolls[rolls.length - 1]!, yaku: yaku.name, kind, multiplier: yaku.mult, payout, net: payout - bet };
   }
 
   private readonly bjSessions = new Map<string, BJSession>();

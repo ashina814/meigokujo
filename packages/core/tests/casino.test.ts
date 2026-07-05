@@ -146,6 +146,35 @@ describe("カジノ", () => {
     expect(ctx.chips.outstanding()).toBe(total0); // 焼却も発行もなし＝インフレしない
   });
 
+  it("チンチロ: ピンゾロ(1-1-1)は5倍", () => {
+    const ctx = setup(seq([0])); // randInt(6)=0 → 目1。3つとも1 → ピンゾロ
+    const before = ctx.chips.balanceOf("p");
+    const r = ctx.casino.chinchiro("p", 1_000);
+    expect(r.yaku).toBe("ピンゾロ");
+    expect(r.kind).toBe("win");
+    expect(r.payout).toBe(5_000);
+    expect(ctx.chips.balanceOf("p")).toBe(before + 4_000);
+  });
+
+  it("チンチロ: ヒフミ(1-2-3)は負け", () => {
+    // 目1,2,3 を出す: randInt(6)=floor(x*6) → 0,1,2 は x=0,0.2,0.4
+    const ctx = setup(seq([0, 0.2, 0.4]));
+    const before = ctx.chips.balanceOf("p");
+    const r = ctx.casino.chinchiro("p", 1_000);
+    expect(r.yaku).toBe("ヒフミ");
+    expect(r.kind).toBe("lose");
+    expect(ctx.chips.balanceOf("p")).toBe(before - 1_000);
+  });
+
+  it("チンチロ: 役なしが3回続くとションベン（負け）", () => {
+    // 役なし(3つバラバラで並びでない)を3回。例: 2,4,6 → x=0.2,0.55,0.9
+    const ctx = setup(seq([0.2, 0.55, 0.9]));
+    const r = ctx.casino.chinchiro("p", 1_000);
+    expect(r.rolls.length).toBe(3);
+    expect(r.yaku).toBe("ションベン");
+    expect(r.kind).toBe("lose");
+  });
+
   it("胴元の元手を賭博場口座のLandから入れ、精算で戻す往復は手数料ゼロ（フェア）", () => {
     // チップ未発行のクリーンな状態で検証（初期レート1）
     const db = openDb(":memory:");

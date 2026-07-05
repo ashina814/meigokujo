@@ -100,6 +100,7 @@ export {
   type SlotResult,
   type RouletteResult,
   type RouletteBet,
+  type ChinchiroResult,
   type BJView,
   type BJState,
   type HiLoView,

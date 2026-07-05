@@ -31,6 +31,9 @@ export const casinoCommand = new SlashCommandBuilder()
     sub.setName("スロット").setDescription("スロット。7揃いで50倍").addIntegerOption((o) => o.setName("賭け").setDescription("賭けるチップ").setRequired(true).setMinValue(1)),
   )
   .addSubcommand((sub) =>
+    sub.setName("チンチロ").setDescription("サイコロ3個。ゾロ目・シゴロを狙え（ピンゾロ5倍）").addIntegerOption((o) => o.setName("賭け").setDescription("賭けるチップ").setRequired(true).setMinValue(1)),
+  )
+  .addSubcommand((sub) =>
     sub
       .setName("ルーレット")
       .setDescription("ルーレット。色/偶奇は2倍、数字的中は36倍")
@@ -191,6 +194,16 @@ export async function handleCasinoCommand(interaction: ChatInputCommandInteracti
       });
       return;
     }
+    if (sub === "チンチロ") {
+      const r = services.casino.chinchiro(uid, bet);
+      const DICE = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"];
+      const rollsLine = r.rolls.map((d, i) => `${r.rolls.length > 1 ? `${i + 1}投目 ` : ""}${d.map((n) => DICE[n]).join(" ")}`).join("\n");
+      const tag = r.kind === "win" ? `**${r.yaku}**（×${r.multiplier}）！` : r.kind === "push" ? `**${r.yaku}**（引き分け・返却）` : `**${r.yaku}**…`;
+      await interaction.reply({
+        embeds: [resultEmbed("🎲 チンチロ", `${rollsLine}\n${tag}`, r.kind === "win", r.net, services.chips.balanceOf(uid), weatherFoot)],
+      });
+      return;
+    }
     // ルーレット
     const target = parseRoulette(interaction.options.getString("対象", true));
     if (!target) {
@@ -208,10 +221,11 @@ export async function handleCasinoCommand(interaction: ChatInputCommandInteracti
 }
 
 function resultEmbed(title: string, body: string, win: boolean, net: number, balance: number, footer?: string): EmbedBuilder {
+  const outcome = net > 0 ? `➕ **${chip(net)}** の勝ち！` : net < 0 ? `➖ ${chip(-net)} の負け…` : "±0（引き分け）";
   const e = new EmbedBuilder()
     .setTitle(title)
-    .setColor(win ? 0xf0b429 : 0x52525b)
-    .setDescription([body, "", win ? `➕ **${chip(net)}** の勝ち！` : `➖ ${chip(-net)} の負け…`, `残り ${chip(balance)}`].join("\n"));
+    .setColor(win ? 0xf0b429 : net === 0 ? 0x6b7280 : 0x52525b)
+    .setDescription([body, "", outcome, `残り ${chip(balance)}`].join("\n"));
   if (footer) e.setFooter({ text: footer });
   return e;
 }
