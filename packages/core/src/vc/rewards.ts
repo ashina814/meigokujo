@@ -35,7 +35,11 @@ export class VcRewards {
     const windowStart = Date.UTC(y, m - 1, d) / 1000 - 9 * 3600; // JST 00:00
     const windowEnd = windowStart + 86_400;
 
-    const whitelist = this.settings.getJson<string[]>("vc_whitelist", []);
+    // 手動の報酬対象 ＋ 巣穴の複製VC（自動登録）。動的に生まれた巣穴でも報酬が付く
+    const whitelist = [
+      ...this.settings.getJson<string[]>("vc_whitelist", []),
+      ...this.settings.getJson<string[]>("vc_whitelist_den", []),
+    ];
     const sleepList = this.settings.getJson<string[]>("vc_sleep_list", []);
     const rate = this.settings.getNumber("vc_reward_rate_per_10min");
     const sleepRate = this.settings.getNumber("vc_reward_sleep_rate_per_10min");

@@ -49,6 +49,7 @@ import { handleHelpCommand } from "./commands/help.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
+import { handleDenVoice } from "./dens.js";
 import { handleSalaryTable } from "./commands/salary-table.js";
 import { handlePaydayCommand } from "./commands/payday-command.js";
 import { handlePaydayButton } from "./payday.js";
@@ -279,6 +280,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   try {
     trackVoiceState(oldState, newState, services);
     handleVoiceAttendance(oldState, newState, services);
+    void handleDenVoice(oldState, newState, services).catch((err) => console.error("[den] 処理失敗:", err));
   } catch (err) {
     console.error("[vc] 記録失敗:", err);
   }

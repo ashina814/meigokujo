@@ -110,6 +110,15 @@ export const settingsCommand = new SlashCommandBuilder()
           .addChoices({ name: "報酬対象（評価対象VC）", value: "vc_whitelist" }, { name: "寝落ちVC（減額）", value: "vc_sleep_list" }),
       )
       .addChannelOption((o) => o.setName("チャンネル").setDescription("対象VC（追加・削除時に必須）")),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("巣穴")
+      .setDescription("冥獣の巣（評価VC）のカテゴリとトリガーVCを設定")
+      .addChannelOption((o) => o.setName("カテゴリ").setDescription("複製先の巣穴カテゴリ"))
+      .addChannelOption((o) => o.setName("巣穴大").setDescription("入ると増えるトリガーVC（全員可）"))
+      .addChannelOption((o) => o.setName("巣穴中").setDescription("トリガーVC（魔剣士・審のみ）"))
+      .addChannelOption((o) => o.setName("巣穴小").setDescription("トリガーVC（魔剣士・審のみ）")),
   );
 
 function isAdmin(interaction: ChatInputCommandInteraction, services: Services): boolean {
@@ -221,6 +230,28 @@ export async function handleSettings(
     services.settings.set(key, next, actor);
     await interaction.reply({
       content: `✅ ${op === "add" ? "追加" : "削除"}しました。現在: ${next.length > 0 ? next.map((id) => `<#${id}>`).join(" ") : "なし"}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (sub === "巣穴") {
+    const map: Array<[string, string]> = [
+      ["カテゴリ", "category:eval_den"],
+      ["巣穴大", "vc:den_large"],
+      ["巣穴中", "vc:den_medium"],
+      ["巣穴小", "vc:den_small"],
+    ];
+    const done: string[] = [];
+    for (const [opt, keyName] of map) {
+      const ch = interaction.options.getChannel(opt);
+      if (ch) {
+        services.settings.set(keyName, ch.id, actor);
+        done.push(`${opt}→<#${ch.id}>`);
+      }
+    }
+    await interaction.reply({
+      content: done.length > 0 ? `✅ 巣穴設定を更新: ${done.join(" / ")}` : "更新する項目を1つ以上指定してください。",
       flags: MessageFlags.Ephemeral,
     });
     return;

@@ -34,6 +34,15 @@ describe("VC浮上報酬の日次計算", () => {
     ctx = setup();
   });
 
+  it("巣穴の複製VC（vc_whitelist_den）も報酬対象になる", () => {
+    ctx.settings.set("vc_whitelist_den", ["vc:den-clone-1"], "test");
+    ctx.insert("a", "vc:den-clone-1", 0, 120);
+    ctx.insert("b", "vc:den-clone-1", 60, 120); // 重なり60分
+    const r = ctx.rewards.computeDay(DATE);
+    expect(r.find((x) => x.userId === "a")?.normalSeconds).toBe(3600);
+    expect(r.find((x) => x.userId === "b")?.normalSeconds).toBe(3600);
+  });
+
   it("2人が重なっている時間だけカウントされる（1人浮上は無収入）", () => {
     ctx.insert("a", "vc:eval", 0, 120); // 0〜120分
     ctx.insert("b", "vc:eval", 60, 120); // 60〜120分 → 重なり60分

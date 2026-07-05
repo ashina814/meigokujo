@@ -313,6 +313,12 @@ CREATE TABLE IF NOT EXISTS race_bets (
 );
 CREATE INDEX IF NOT EXISTS idx_race_bets ON race_bets(race_id, horse_index);
 
+CREATE TABLE IF NOT EXISTS den_vcs (
+  channel_id TEXT PRIMARY KEY,
+  kind       TEXT NOT NULL CHECK (kind IN ('large','medium','small')),
+  created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS chip_balances (
   user_id    TEXT PRIMARY KEY,
   amount     INTEGER NOT NULL DEFAULT 0 CHECK (amount >= 0),

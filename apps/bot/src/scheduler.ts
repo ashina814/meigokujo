@@ -4,6 +4,7 @@ import { createAndPostDraft } from "./payday.js";
 import { threadTitleFor } from "./commands/evaluation.js";
 import { checkBumpCooldowns } from "./bump.js";
 import { scanRooms } from "./rooms-lifecycle.js";
+import { scanDens } from "./dens.js";
 import { updateDashboard } from "./dashboard.js";
 import { announceResult, refreshAuctionPanel } from "./commands/auction.js";
 import { announceDraw, refreshLotteryPanel } from "./commands/lottery.js";
@@ -128,6 +129,9 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
 
     // ── 部屋のライフサイクル（在室スキャン・削除・期限・募集失効）──
     await scanRooms(client, services);
+
+    // ── 冥獣の巣: 無人の複製VC撤収・報酬対象の掃除 ──
+    await scanDens(client, services).catch((e) => console.error("[den] スキャン失敗:", e));
 
     // ── 競売の自動締切（締切時刻を過ぎた open を落札確定）──
     for (const expired of services.auctions.listExpired()) {
