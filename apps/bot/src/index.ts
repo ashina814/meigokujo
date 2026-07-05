@@ -45,6 +45,7 @@ import { handleTaxCommand, handlePensionCommand, handleFiscalButton } from "./co
 import { handleExchangeCommand } from "./commands/chips.js";
 import { handleCasinoCommand, handleCasinoButton } from "./commands/casino.js";
 import { handleWeatherCommand } from "./commands/weather.js";
+import { handleHelpCommand } from "./commands/help.js";
 import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
@@ -148,6 +149,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "天気":
           await handleWeatherCommand(interaction, services);
+          return;
+        case "あそびかた":
+          await handleHelpCommand(interaction, services);
           return;
       }
       return;
