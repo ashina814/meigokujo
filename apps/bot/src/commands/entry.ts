@@ -3,14 +3,17 @@ import {
   ButtonBuilder,
   ButtonInteraction,
   ButtonStyle,
+  ChannelType,
   ChatInputCommandInteraction,
   EmbedBuilder,
   MessageFlags,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
   StringSelectMenuInteraction,
+  ThreadAutoArchiveDuration,
   UserSelectMenuBuilder,
   UserSelectMenuInteraction,
+  type Guild,
   type GuildMember,
   type MessageCreateOptions,
   type TextChannel,
@@ -135,10 +138,8 @@ export async function handleEntryButton(
     }
     finalizeBooking(services, userId, slot, { userId: inviterId, source: "user" });
     pendingSlots.delete(userId);
-    await interaction.update({
-      content: `✅ 予約しました: **${slotLabel(slot)}**（招待者: <@${inviterId}>）\n開始1時間前にお知らせします。`,
-      components: [],
-    });
+    if (slot === "flex") await openFlexTicket(interaction, services, userId);
+    else await interaction.update({ content: `✅ 予約しました: **${slotLabel(slot)}**（招待者: <@${inviterId}>）\n開始1時間前にお知らせします。`, components: [] });
     return;
   }
 
@@ -151,10 +152,13 @@ export async function handleEntryButton(
     const source = id.endsWith("disboard") ? ("disboard" as const) : ("none" as const);
     finalizeBooking(services, userId, slot, { source });
     pendingSlots.delete(userId);
-    await interaction.update({
-      content: `✅ 予約しました: **${slotLabel(slot)}**\n${slot === "flex" ? "スタッフから個別に連絡します。" : "開始1時間前にお知らせします。"}`,
-      components: [],
-    });
+    if (slot === "flex") await openFlexTicket(interaction, services, userId);
+    else await interaction.update({ content: `✅ 予約しました: **${slotLabel(slot)}**\n開始1時間前にお知らせします。`, components: [] });
+    return;
+  }
+
+  if (id.startsWith("entry:flexdone:") && interaction.isButton()) {
+    await handleFlexDone(interaction, services);
     return;
   }
 
@@ -454,32 +458,16 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
   const toGhost = attended.filter((r) => !sel.hold.has(r.user_id) && !sel.skip.has(r.user_id));
 
   const guild = interaction.guild!;
-  const waitRoleId = services.settings.getString("role:queue_wait");
-  const ghostRoleId = services.settings.getString("role:ghost");
-  const maleRoleId = services.settings.getString("role:male");
-  const femaleRoleId = services.settings.getString("role:female");
-
   const passed: string[] = [];
   const failed: string[] = [];
   let totalGranted = 0;
 
   for (const row of toGhost) {
-    try {
-      const member = await guild.members.fetch(row.user_id);
-      const gender = maleRoleId && member.roles.cache.has(maleRoleId)
-        ? ("male" as const)
-        : femaleRoleId && member.roles.cache.has(femaleRoleId)
-          ? ("female" as const)
-          : null;
-      const result = services.entry.ghostify(row.user_id, actor, { inviteeGender: gender });
-      if (waitRoleId) await member.roles.remove(waitRoleId).catch(() => undefined);
-      if (ghostRoleId) await member.roles.add(ghostRoleId).catch(() => undefined);
-      totalGranted += result.granted;
+    const r = await ghostifyOne(guild, services, row.user_id, actor);
+    if (r.ok) {
+      totalGranted += r.granted;
       passed.push(row.user_id);
-    } catch (e) {
-      console.error(`[entry] 亡霊化失敗 ${row.user_id}:`, e);
-      failed.push(row.user_id);
-    }
+    } else failed.push(row.user_id);
   }
 
   const rebook: string[] = [];
@@ -511,4 +499,110 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
     droppedList.length > 0 ? `🚫 3回連続欠席でキューから除外: ${droppedList.map((id) => `<@${id}>`).join(", ")}（対応は運営判断）` : "",
   ].filter(Boolean);
   await interaction.editReply({ content: lines.join("\n"), allowedMentions: { parse: [] } });
+}
+
+// ---- 亡霊化（1人分の共通処理: 判定バッチ・時間外チケット両方から使う）----
+
+async function ghostifyOne(
+  guild: Guild,
+  services: Services,
+  userId: string,
+  actor: string,
+): Promise<{ ok: boolean; granted: number }> {
+  try {
+    const member = await guild.members.fetch(userId);
+    const maleRoleId = services.settings.getString("role:male");
+    const femaleRoleId = services.settings.getString("role:female");
+    const gender =
+      maleRoleId && member.roles.cache.has(maleRoleId)
+        ? ("male" as const)
+        : femaleRoleId && member.roles.cache.has(femaleRoleId)
+          ? ("female" as const)
+          : null;
+    const result = services.entry.ghostify(userId, actor, { inviteeGender: gender });
+    const waitRoleId = services.settings.getString("role:queue_wait");
+    const ghostRoleId = services.settings.getString("role:ghost");
+    if (waitRoleId) await member.roles.remove(waitRoleId).catch(() => undefined);
+    if (ghostRoleId) await member.roles.add(ghostRoleId).catch(() => undefined);
+    return { ok: true, granted: result.granted };
+  } catch (e) {
+    console.error(`[entry] 亡霊化失敗 ${userId}:`, e);
+    return { ok: false, granted: 0 };
+  }
+}
+
+// ---- 時間外・個別希望: チケット（非公開スレッド）で柔軟に面接 ----
+
+async function openFlexTicket(
+  interaction: ButtonInteraction | UserSelectMenuInteraction,
+  services: Services,
+  userId: string,
+): Promise<void> {
+  const guild = interaction.guild!;
+  const guideId = services.settings.getString("channel:entry_guide");
+  const guide = guideId ? await guild.channels.fetch(guideId).catch(() => null) : null;
+  const base = (guide?.isTextBased() ? guide : interaction.channel) as TextChannel | null;
+  if (!base || !("threads" in base)) {
+    await interaction.update({ content: "✅ 時間外希望を受け付けました。スタッフから個別に連絡します。", components: [] });
+    return;
+  }
+
+  const member = await guild.members.fetch(userId).catch(() => null);
+  const thread = await base.threads
+    .create({
+      name: `時間外希望-${member?.displayName ?? "案内待ち"}`.slice(0, 90),
+      type: ChannelType.PrivateThread,
+      invitable: false,
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+    })
+    .catch(() => null);
+  if (!thread) {
+    await interaction.update({ content: "✅ 時間外希望を受け付けました。スタッフから連絡します。", components: [] });
+    return;
+  }
+  await thread.members.add(userId).catch(() => undefined);
+
+  const judgeId = services.settings.getString("role:judge");
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`entry:flexdone:${userId}`).setLabel("亡霊にする（面接完了）").setEmoji("👻").setStyle(ButtonStyle.Success),
+  );
+  await thread
+    .send({
+      content: [
+        `${judgeId ? `<@&${judgeId}> ` : ""}<@${userId}> さんの**時間外・個別希望**です。`,
+        "**都合のいい曜日・時間帯**を書いてください。面接担当が合わせて調整します。",
+        "（面接が済んだら、担当が下のボタンで亡霊化します）",
+      ].join("\n"),
+      components: [row],
+      allowedMentions: { users: [userId], roles: judgeId ? [judgeId] : [] },
+    })
+    .catch(() => undefined);
+
+  await interaction.update({
+    content: `✅ 時間外の受付を作りました → ${thread.toString()}\nそちらで面接担当と時間を決めてください。`,
+    components: [],
+  });
+}
+
+async function handleFlexDone(interaction: ButtonInteraction, services: Services): Promise<void> {
+  if (!isJudge(interaction, services)) {
+    await interaction.reply({ content: "この操作には面接担当の権限が必要です。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const targetId = interaction.customId.split(":")[2]!;
+  await interaction.deferReply();
+  const r = await ghostifyOne(interaction.guild!, services, targetId, `user:${interaction.user.id}`);
+  if (!r.ok) {
+    await interaction.editReply({ content: `❌ <@${targetId}> の亡霊化に失敗しました。ロール権限などを確認してください。` });
+    return;
+  }
+  await interaction.editReply({
+    content: `👻 <@${targetId}> を亡霊にしました（初期発行 ${fmtLd(r.granted)}）。ようこそ冥獄城へ。`,
+    allowedMentions: { users: [targetId] },
+  });
+  const thread = interaction.channel;
+  if (thread && thread.isThread()) {
+    await thread.setLocked(true).catch(() => undefined);
+    await thread.setArchived(true).catch(() => undefined);
+  }
 }
