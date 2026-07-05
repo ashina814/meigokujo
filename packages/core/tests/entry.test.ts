@@ -110,6 +110,31 @@ describe("入城導線", () => {
     expect(ctx.entry.getBooking("c")!.no_show_count).toBe(1);
   });
 
+  it("階級バックフィル: ロール由来の階級を写し、亡霊に14日期限・魔人は期限なし", () => {
+    const r = ctx.entry.backfillStatuses(
+      [
+        { userId: "maj", status: "majin" },
+        { userId: "gho", status: "ghost" },
+        { userId: "mei", status: "meirei" },
+      ],
+      14,
+    );
+    expect(r.applied).toEqual({ majin: 1, ghost: 1, meirei: 1 });
+    expect(r.ghostDeadlinesSet).toBe(1);
+    const gho = ctx.entry.getSoul("gho")!;
+    expect(gho.status).toBe("ghost");
+    expect(gho.eval_deadline_at! - gho.ghost_at!).toBe(14 * DAY);
+    expect(ctx.entry.getSoul("maj")!.eval_deadline_at).toBeNull();
+  });
+
+  it("階級バックフィルは冪等: 再実行しても既存の亡霊期限をリセットしない", () => {
+    ctx.entry.backfillStatuses([{ userId: "g", status: "ghost" }], 14);
+    const first = ctx.entry.getSoul("g")!.eval_deadline_at!;
+    const again = ctx.entry.backfillStatuses([{ userId: "g", status: "ghost" }], 30);
+    expect(again.ghostDeadlinesSet).toBe(0); // 既存期限を維持
+    expect(ctx.entry.getSoul("g")!.eval_deadline_at).toBe(first);
+  });
+
   it("見送り(skipBooking): 出席者を dropped にし、亡霊化しない", () => {
     ctx.entry.book("skip1", "2026-07-05 21", { source: "none" });
     ctx.entry.markAttended("skip1");

@@ -29,6 +29,7 @@ export const ROLE_KINDS = [
   ["ghost", "亡霊"],
   ["meirei", "迷霊"],
   ["majin", "魔人"],
+  ["mazoku", "魔族"],
   ["bump_notify", "紹介協力者"],
   ["judge", "面接担当"],
   ["swordsman", "魔剣士"],

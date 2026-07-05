@@ -67,7 +67,13 @@ export const migrationCommand = new SlashCommandBuilder()
       .addIntegerOption((o) => o.setName("番号").setDescription("ダンプの順位番号").setRequired(true))
       .addStringOption((o) => o.setName("理由").setDescription("記録用").setMaxLength(100)),
   )
-  .addSubcommand((sub) => sub.setName("実行").setDescription("照合済みの行を一括 opening 発行する"));
+  .addSubcommand((sub) => sub.setName("実行").setDescription("照合済みの行を一括 opening 発行する"))
+  .addSubcommand((sub) =>
+    sub
+      .setName("階級")
+      .setDescription("現在のロールから階級を魂台帳へ一括反映（亡霊は移行日から評価期限）")
+      .addBooleanOption((o) => o.setName("実行").setDescription("true で実際に反映（省略でプレビュー）")),
+  );
 
 function statusLabel(s: StagingStatus): string {
   return (
@@ -237,6 +243,67 @@ export async function handleMigration(
       components: [row],
       flags: MessageFlags.Ephemeral,
     });
+    return;
+  }
+
+  if (sub === "階級") {
+    const guild = interaction.guild;
+    if (!guild) return;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    // ロール → 階級（上位優先）
+    const roleFor = (kind: string) => services.settings.getString(`role:${kind}`);
+    const ladder: Array<[string, "mazoku" | "majin" | "ghost" | "meirei" | "waiting"]> = [
+      ["mazoku", "mazoku"],
+      ["majin", "majin"],
+      ["ghost", "ghost"],
+      ["meirei", "meirei"],
+      ["queue_wait", "waiting"],
+    ];
+    let members;
+    try {
+      members = await guild.members.fetch();
+    } catch {
+      await interaction.editReply({ content: "メンバー一覧の取得に失敗しました（Server Members Intent を確認）。" });
+      return;
+    }
+
+    const entries: Array<{ userId: string; status: "mazoku" | "majin" | "ghost" | "meirei" | "waiting" }> = [];
+    for (const [, m] of members) {
+      if (m.user.bot) continue;
+      for (const [roleKind, status] of ladder) {
+        const rid = roleFor(roleKind);
+        if (rid && m.roles.cache.has(rid)) {
+          entries.push({ userId: m.id, status });
+          break; // 上位で確定
+        }
+      }
+    }
+
+    if (entries.length === 0) {
+      await interaction.editReply({ content: "対象がいません。先に `/設定 ロール` で 魔族/魔人/亡霊/迷霊/入城案内待ち を紐付けてください。" });
+      return;
+    }
+
+    const period = services.settings.getNumber("eval_base_period_days");
+    const counts = entries.reduce<Record<string, number>>((a, e) => ((a[e.status] = (a[e.status] ?? 0) + 1), a), {});
+    const line = (s: string, label: string) => `${label}: **${counts[s] ?? 0}名**`;
+    const summary = [
+      line("mazoku", "魔族"),
+      line("majin", "魔人"),
+      `${line("ghost", "亡霊")}（期限なしの人へ移行日から${period}日を付与）`,
+      line("meirei", "迷霊"),
+      line("waiting", "入城案内待ち"),
+    ].join("\n");
+
+    const doRun = interaction.options.getBoolean("実行") ?? false;
+    if (!doRun) {
+      await interaction.editReply({ content: `🔎 **プレビュー**（${entries.length}名）\n${summary}\n\n実行するには \`/移行 階級 実行:true\`。魔人/魔族は期限なし・既存の亡霊期限は維持されます。` });
+      return;
+    }
+    const r = services.entry.backfillStatuses(entries, period);
+    await interaction.editReply({ content: `✅ 階級を反映しました（${entries.length}名）\n${summary}\n新たに評価期限を付与した亡霊: **${r.ghostDeadlinesSet}名**` });
+    return;
   }
 }
 

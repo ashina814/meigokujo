@@ -249,6 +249,49 @@ export class Entry {
     return changed.changes > 0;
   }
 
+  /**
+   * 移行時の階級バックフィル。現在のロールから判定した階級を魂台帳へ写す。
+   * 冪等: 既存の ghost_at / 評価期限は維持する（再実行しても期限リセットしない）。
+   * 亡霊は期限が無ければ移行日から periodDays を付与、魔人/魔族は期限なし(NULL)。
+   */
+  backfillStatuses(
+    entries: Array<{ userId: string; status: SoulRow["status"] }>,
+    periodDays: number,
+  ): { applied: Record<string, number>; ghostDeadlinesSet: number } {
+    const ts = now();
+    const applied: Record<string, number> = {};
+    let ghostDeadlinesSet = 0;
+    const upsert = this.db.prepare(
+      `INSERT INTO souls (user_id, status, joined_at, ghost_at, eval_deadline_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         status = excluded.status, ghost_at = excluded.ghost_at,
+         eval_deadline_at = excluded.eval_deadline_at, updated_at = excluded.updated_at`,
+    );
+    const run = this.db.transaction(() => {
+      for (const e of entries) {
+        applied[e.status] = (applied[e.status] ?? 0) + 1;
+        const existing = this.getSoul(e.userId);
+        let ghostAt = existing?.ghost_at ?? null;
+        let deadline = existing?.eval_deadline_at ?? null;
+        if (e.status === "ghost") {
+          ghostAt = ghostAt ?? ts;
+          if (deadline === null) {
+            deadline = ts + periodDays * DAY;
+            ghostDeadlinesSet++;
+          }
+        } else if (e.status === "majin" || e.status === "mazoku") {
+          ghostAt = ghostAt ?? ts;
+          deadline = null;
+        }
+        upsert.run(e.userId, e.status, existing?.joined_at ?? ts, ghostAt, deadline, ts);
+      }
+    });
+    run();
+    this.events.log("backfill_status", { payload: { count: entries.length, applied } });
+    return { applied, ghostDeadlinesSet };
+  }
+
   /** 欠席処理: 3回連続でキューから外す（自動キックはしない） */
   recordNoShow(userId: string): { count: number; dropped: boolean } {
     const ts = now();
