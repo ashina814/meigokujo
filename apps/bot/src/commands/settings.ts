@@ -1,4 +1,5 @@
 import {
+  ChannelType,
   ChatInputCommandInteraction,
   EmbedBuilder,
   GuildMember,
@@ -119,11 +120,11 @@ export const settingsCommand = new SlashCommandBuilder()
     sub
       .setName("巣穴")
       .setDescription("冥獣の巣（評価VC）のカテゴリとトリガーVCを設定")
-      .addChannelOption((o) => o.setName("カテゴリ").setDescription("複製先の巣穴カテゴリ"))
-      .addChannelOption((o) => o.setName("巣穴大").setDescription("入ると増えるトリガーVC（全員可）"))
-      .addChannelOption((o) => o.setName("巣穴中").setDescription("トリガーVC（魔剣士・審のみ）"))
-      .addChannelOption((o) => o.setName("巣穴小").setDescription("トリガーVC（魔剣士・審のみ）"))
-      .addChannelOption((o) => o.setName("応接室").setDescription("トリガーVC（魔剣士・審のみ・2人・報酬対象外）")),
+      .addChannelOption((o) => o.setName("カテゴリ").setDescription("複製先の巣穴カテゴリ").addChannelTypes(ChannelType.GuildCategory))
+      .addChannelOption((o) => o.setName("巣穴大").setDescription("入ると増えるトリガーVC（全員可）").addChannelTypes(ChannelType.GuildVoice))
+      .addChannelOption((o) => o.setName("巣穴中").setDescription("トリガーVC（魔剣士・審のみ）").addChannelTypes(ChannelType.GuildVoice))
+      .addChannelOption((o) => o.setName("巣穴小").setDescription("トリガーVC（魔剣士・審のみ）").addChannelTypes(ChannelType.GuildVoice))
+      .addChannelOption((o) => o.setName("応接室").setDescription("トリガーVC（魔剣士・審のみ・2人・報酬対象外）").addChannelTypes(ChannelType.GuildVoice)),
   )
   .addSubcommand((sub) =>
     sub
