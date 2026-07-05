@@ -119,6 +119,16 @@ export const settingsCommand = new SlashCommandBuilder()
       .addChannelOption((o) => o.setName("巣穴大").setDescription("入ると増えるトリガーVC（全員可）"))
       .addChannelOption((o) => o.setName("巣穴中").setDescription("トリガーVC（魔剣士・審のみ）"))
       .addChannelOption((o) => o.setName("巣穴小").setDescription("トリガーVC（魔剣士・審のみ）")),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("位階")
+      .setDescription("累計VC時間で上がる位階ロールのラダーを編集")
+      .addStringOption((o) =>
+        o.setName("操作").setDescription("何をするか").setRequired(true).addChoices({ name: "追加/更新", value: "add" }, { name: "削除", value: "remove" }, { name: "表示", value: "show" }),
+      )
+      .addRoleOption((o) => o.setName("ロール").setDescription("位階ロール（追加/削除時）"))
+      .addNumberOption((o) => o.setName("時間").setDescription("この累計VC時間(h)以上で付与（追加時）").setMinValue(0)),
   );
 
 function isAdmin(interaction: ChatInputCommandInteraction, services: Services): boolean {
@@ -230,6 +240,40 @@ export async function handleSettings(
     services.settings.set(key, next, actor);
     await interaction.reply({
       content: `✅ ${op === "add" ? "追加" : "削除"}しました。現在: ${next.length > 0 ? next.map((id) => `<#${id}>`).join(" ") : "なし"}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (sub === "位階") {
+    const op = interaction.options.getString("操作", true);
+    const ladder = services.settings.getJson<Array<{ hours: number; roleId: string }>>("vc_rank_ladder", []);
+    if (op === "show") {
+      const sorted = [...ladder].sort((a, b) => a.hours - b.hours);
+      await interaction.reply({
+        content: sorted.length > 0 ? `📶 位階ラダー（累計VC時間→ロール）:\n${sorted.map((t) => `・${t.hours}h → <@&${t.roleId}>`).join("\n")}` : "位階ラダーは未設定です。",
+        flags: MessageFlags.Ephemeral,
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
+    const role = interaction.options.getRole("ロール");
+    if (!role) {
+      await interaction.reply({ content: "ロールを指定してください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    let next = ladder.filter((t) => t.roleId !== role.id);
+    if (op === "add") {
+      const hours = interaction.options.getNumber("時間");
+      if (hours === null) {
+        await interaction.reply({ content: "追加時は「時間」も指定してください。", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      next = [...next, { hours, roleId: role.id }];
+    }
+    services.settings.set("vc_rank_ladder", next, actor);
+    await interaction.reply({
+      content: `✅ 位階ラダーを更新しました（${next.length}段）。反映は次回の判定（毎朝6時）から。`,
       flags: MessageFlags.Ephemeral,
     });
     return;

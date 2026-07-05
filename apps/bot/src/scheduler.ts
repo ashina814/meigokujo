@@ -5,6 +5,7 @@ import { threadTitleFor } from "./commands/evaluation.js";
 import { checkBumpCooldowns } from "./bump.js";
 import { scanRooms } from "./rooms-lifecycle.js";
 import { scanDens } from "./dens.js";
+import { applyVcRanks } from "./vc-ranks.js";
 import { updateDashboard } from "./dashboard.js";
 import { announceResult, refreshAuctionPanel } from "./commands/auction.js";
 import { announceDraw, refreshLotteryPanel } from "./commands/lottery.js";
@@ -182,6 +183,12 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         services.settings.set(marker, "1", "system:scheduler");
         await payVcRewards(client, services, yesterday);
       }
+    }
+
+    // ── 位階（VCロール）: 毎日 06:00 台に累計VC時間で付け直す ──
+    if (now.hour === 6 && !services.settings.getString(`vc_rank:applied:${now.dateStr}`)) {
+      services.settings.set(`vc_rank:applied:${now.dateStr}`, "1", "system:scheduler");
+      await applyVcRanks(client, services).catch((e) => console.error("[位階] 付与失敗:", e));
     }
 
     // ── カロン: 毎日 09:00 台に期限リスト・演出通知・迷霊落ち承認パネル ──

@@ -55,6 +55,23 @@ describe("VC計測", () => {
     expect(vc.presence("alice", 14).totalSeconds).toBe(6 * 3600);
   });
 
+  it("totalsByUser: 全ユーザーの累計VC時間を全VC対象で集計（位階判定用）", () => {
+    vi.useFakeTimers();
+    const { vc } = setup();
+    vi.setSystemTime(new Date("2026-07-04T12:00:00Z"));
+    vc.open("alice", "vc1", false, false);
+    vc.open("bob", "vc2", false, false);
+    vi.setSystemTime(new Date("2026-07-04T12:30:00Z"));
+    vc.close("bob"); // 30分
+    vi.setSystemTime(new Date("2026-07-04T13:00:00Z"));
+    vc.close("alice"); // 60分
+
+    const totals = vc.totalsByUser(30);
+    expect(totals.find((t) => t.userId === "alice")?.seconds).toBe(60 * 60);
+    expect(totals.find((t) => t.userId === "bob")?.seconds).toBe(30 * 60);
+    expect(totals[0]?.userId).toBe("alice"); // 多い順
+  });
+
   it("lastSeen が最終浮上時刻を返す（死亡判定の材料）", () => {
     vi.useFakeTimers();
     const { vc } = setup();

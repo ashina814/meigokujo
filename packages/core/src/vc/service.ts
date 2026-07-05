@@ -98,6 +98,27 @@ export class VcTracker {
     };
   }
 
+  /** 全ユーザーの累計VC時間（全VC対象・位階の判定用）。多い順 */
+  totalsByUser(sinceDays: number): Array<{ userId: string; seconds: number }> {
+    const since = now() - sinceDays * 86_400;
+    const rows = this.db
+      .prepare(
+        `SELECT user_id, started_at, COALESCE(ended_at, ?) AS ended_at
+         FROM vc_segments
+         WHERE COALESCE(ended_at, ?) > ?`,
+      )
+      .all(now(), now(), since) as Array<{ user_id: string; started_at: number; ended_at: number }>;
+    const totals = new Map<string, number>();
+    for (const r of rows) {
+      const start = Math.max(r.started_at, since);
+      const seconds = Math.max(0, r.ended_at - start);
+      totals.set(r.user_id, (totals.get(r.user_id) ?? 0) + seconds);
+    }
+    return [...totals.entries()]
+      .map(([userId, seconds]) => ({ userId, seconds }))
+      .sort((a, b) => b.seconds - a.seconds);
+  }
+
   /** 最終浮上時刻（死亡判定＝非アクティブ検知の材料） */
   lastSeen(userId: string): number | null {
     const row = this.db
