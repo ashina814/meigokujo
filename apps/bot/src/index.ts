@@ -1,8 +1,10 @@
 import { Client, Events, GatewayIntentBits, MessageFlags } from "discord.js";
+import { InviteTracker } from "./invite-tracker.js";
 import { config } from "./config.js";
 import { buildServices } from "./services.js";
 import { handleSettings } from "./commands/settings.js";
 import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
+import { handleTip } from "./commands/tip.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -15,6 +17,7 @@ import { handleAdjust } from "./commands/adjust.js";
 import {
   handleEntryButton,
   handleMemberJoin,
+  handleMemberRoleUpdate,
   handleSessionCommand,
   handleVoiceAttendance,
 } from "./commands/entry.js";
@@ -57,13 +60,22 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.MessageContent, // bump検知（掲示板ボットのembed読取に必要）
+    GatewayIntentBits.GuildInvites, // 招待リンクトラッキング
   ],
 });
+
+const inviteTracker = new InviteTracker(client);
+inviteTracker.wire();
 
 client.once(Events.ClientReady, (ready) => {
   console.log(`⚔️ 冥獄城ボット 起動: ${ready.user.tag}`);
   startOutboxWorker(client, services);
   startScheduler(client, services);
+
+  // 招待キャッシュを初期化（全ギルド）
+  for (const [, guild] of ready.guilds.cache) {
+    void inviteTracker.initGuild(guild).catch((e) => console.error("[invite] 初期化失敗:", e));
+  }
 
   // 起動時に必ず帳簿を検算する（経済設計.md §8）
   const integrity = services.ledger.verifyIntegrity();
@@ -83,6 +95,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "送金":
           await handleTransfer(interaction, services);
+          return;
+        case "投げ銭":
+          await handleTip(interaction, services);
           return;
         case "パネル設置":
           await handlePanelCommand(interaction, services);
@@ -269,9 +284,20 @@ client.on(Events.MessageCreate, (message) => {
   void handleBumpMessage(message, services).catch((err) => console.error("[bump] 処理失敗:", err));
 });
 
-// 入城導線: 参加時のロール付与・案内
+// 入城導線: 参加時のロール付与・案内・招待リンク自動検出
 client.on(Events.GuildMemberAdd, (member) => {
-  void handleMemberJoin(member, services).catch((err) => console.error("[entry] 参加処理失敗:", err));
+  void (async () => {
+    const inviterId = await inviteTracker.detectInviter(member.guild).catch(() => null);
+    await handleMemberJoin(member, services, inviterId);
+  })().catch((err) => console.error("[entry] 参加処理失敗:", err));
+});
+
+// 亡霊ロール手動付与検知・性別ロール後付けで招待延長
+client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
+  if (oldMember.partial) return;
+  void handleMemberRoleUpdate(oldMember, newMember, services).catch((err) =>
+    console.error("[entry] ロール変更処理失敗:", err),
+  );
 });
 
 // VC計測（全VC）+ 入城導線の説明会出席記録

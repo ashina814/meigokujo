@@ -11,6 +11,7 @@ import { evaluationCommand } from "./commands/evaluation.js";
 import { dashboardCommand } from "./commands/dashboard-command.js";
 import { profileCommand } from "./commands/profile.js";
 import { departmentCommand } from "./commands/department.js";
+import { tipCommand } from "./commands/tip.js";
 import { taxCommand, pensionCommand } from "./commands/fiscal.js";
 import { exchangeCommand } from "./commands/chips.js";
 import { casinoCommand } from "./commands/casino.js";
@@ -37,6 +38,7 @@ const commands = [
   transferCommand.toJSON(),
   profileCommand.toJSON(),
   departmentCommand.toJSON(),
+  tipCommand.toJSON(),
   exchangeCommand.toJSON(),
   casinoCommand.toJSON(),
   pokerCommand.toJSON(),

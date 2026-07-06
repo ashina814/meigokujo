@@ -25,7 +25,7 @@ export async function handleHelpCommand(interaction: ChatInputCommandInteraction
         name: "🏛 暮らし（Land）",
         value: [
           "`/プロフィール` — 自分の記録（階級・所持Land・在城日数・称号）",
-          "`/送金` — 住人へ Land を送る",
+          "`/送金` — 住人へ Land を送る　/　`/投げ銭` — 気持ちを乗せて贈る",
           "銀行パネルで残高照会・取引履歴も見られる",
         ].join("\n"),
       },

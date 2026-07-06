@@ -219,6 +219,27 @@ export class Entry {
     };
   }
 
+  /**
+   * 性別ロールが後付けされた被招待者について、招待者の期限延長を後追い適用する。
+   * 既に適用済みなら 0 を返す（冪等・二重延長なし）。
+   */
+  applyInviteeGenderExtension(inviteeUserId: string, gender: "male" | "female"): number {
+    const soul = this.getSoul(inviteeUserId);
+    if (!soul || !soul.inviter_user_id) return 0;
+    const flagKey = `invite_ext_applied:${inviteeUserId}`;
+    if (this.settings.getString(flagKey)) return 0;
+    const extended = this.extendInviterDeadline(soul.inviter_user_id, gender);
+    if (extended > 0) {
+      this.settings.set(flagKey, "1", "system:invite-ext");
+      this.events.log("invite_ext_deferred", {
+        actor: soul.inviter_user_id,
+        target: inviteeUserId,
+        payload: { gender, extendedDays: extended },
+      });
+    }
+    return extended;
+  }
+
   /** 招待者の評価期限延長（男+1日/女+2日、累計上限あり。評価期間中の招待者のみ） */
   private extendInviterDeadline(inviterId: string, inviteeGender: "male" | "female" | null): number {
     if (!inviteeGender) return 0;

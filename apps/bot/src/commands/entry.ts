@@ -125,7 +125,11 @@ function finalizeBooking(
 
 // ---- 参加時の自動処理 ----
 
-export async function handleMemberJoin(member: GuildMember, services: Services): Promise<void> {
+export async function handleMemberJoin(
+  member: GuildMember,
+  services: Services,
+  inviterId?: string | null,
+): Promise<void> {
   if (member.user.bot) return;
   services.entry.recordJoin(member.id);
 
@@ -135,26 +139,67 @@ export async function handleMemberJoin(member: GuildMember, services: Services):
       .add(waitRoleId)
       .catch((e) => console.warn(`[entry] 入城待ちロール付与に失敗（ボットのロールを階級より上へ）: ${(e as Error).message}`));
 
-  // 本人にDMで招待経路パネルを送る（1タップで完結。判定は必須のためこれで実質全員に届く）
-  const dmSent = await member
-    .send({
-      ...inviterStep(),
-      content: [
-        `👻 <@${member.id}> ようこそ冥獄城へ。`,
-        "説明会に進む前に、**誰の招待で来たか** を教えてください（下のボタン1つでOK）。",
-        "その後、サーバー内の**説明会場VC**に入って担当をお待ちください。",
-      ].join("\n"),
-    })
-    .then(() => true)
-    .catch(() => false);
+  // 招待リンクから招待者を自動記録
+  if (inviterId && inviterId !== member.id) {
+    finalizeBooking(services, member.id, "open", { userId: inviterId, source: "user" });
+    console.log(`[invite] 自動検出: ${member.id} は ${inviterId} の招待リンクで入城`);
+  }
 
+  // 入城案内chで本人メンション + パネル誘導（DMは使わない）
   const guideId = services.settings.getString("channel:entry_guide");
   if (guideId) {
     const channel = (await member.client.channels.fetch(guideId).catch(() => null)) as TextChannel | null;
-    const note = dmSent
-      ? "DMに招待経路の登録パネルを送りました。ご確認ください。"
-      : "DMを受け取れない設定のようです。**上の案内パネル**から招待経路を登録してください（必須）。";
-    await channel?.send(`👻 <@${member.id}> ようこそ冥獄城へ。${note}`).catch(() => undefined);
+    const invLine =
+      inviterId && inviterId !== member.id
+        ? `**招待者を自動検出しました**（<@${inviterId}> の招待リンク）。追加の登録は不要です。`
+        : "**上の案内パネル**から「招待経路を登録する（必須）」を押してから来てください。";
+    await channel
+      ?.send({
+        content: [
+          `👻 <@${member.id}> ようこそ冥獄城へ。`,
+          invLine,
+          "説明会は **月・木を除く 21/22/23 時** です（30分前と5分前にこのチャンネルで案内します）。**説明会場VC**でお待ちください。",
+        ].join("\n"),
+        allowedMentions: { users: [member.id] },
+      })
+      .catch(() => undefined);
+  }
+}
+
+// ---- ロール変更検知: 亡霊ロールが手動付与された時にghostify・性別ロール後付けで招待延長 ----
+
+export async function handleMemberRoleUpdate(
+  oldMember: GuildMember,
+  newMember: GuildMember,
+  services: Services,
+): Promise<void> {
+  if (newMember.user.bot) return;
+  const before = oldMember.roles.cache;
+  const after = newMember.roles.cache;
+  const added = after.filter((r) => !before.has(r.id));
+  if (added.size === 0) return;
+
+  const ghostRoleId = services.settings.getString("role:ghost");
+  const maleRoleId = services.settings.getString("role:male");
+  const femaleRoleId = services.settings.getString("role:female");
+
+  // ① 亡霊ロールが手動付与された → ghostify（冪等）
+  if (ghostRoleId && added.has(ghostRoleId)) {
+    const soul = services.entry.getSoul(newMember.id);
+    if (!soul || soul.status !== "ghost") {
+      const r = await ghostifyOne(newMember.guild, services, newMember.id, "system:role-add");
+      if (r.ok) console.log(`[entry] 亡霊ロール手動付与検知 → ghostify: ${newMember.id}`);
+    }
+  }
+
+  // ② 性別ロールが後付けされた → 招待延長を後追い適用
+  if (maleRoleId && added.has(maleRoleId)) {
+    const ext = services.entry.applyInviteeGenderExtension(newMember.id, "male");
+    if (ext > 0) console.log(`[entry] 後追い招待延長(男): +${ext}日 for ${newMember.id}`);
+  }
+  if (femaleRoleId && added.has(femaleRoleId)) {
+    const ext = services.entry.applyInviteeGenderExtension(newMember.id, "female");
+    if (ext > 0) console.log(`[entry] 後追い招待延長(女): +${ext}日 for ${newMember.id}`);
   }
 }
 
@@ -339,7 +384,7 @@ function renderJudgment(_services: Services, judgeId: string) {
   return { embeds: [embed], components: rows, allowedMentions: { parse: [] } };
 }
 
-/** 招待未登録者へ登録DMを再送する */
+/** 招待未登録者を入城案内chでメンション催促する */
 async function handleInviteRemind(interaction: ButtonInteraction, services: Services): Promise<void> {
   if (!isJudge(interaction, services)) {
     await interaction.reply({ content: "この操作には面接担当の権限が必要です。", flags: MessageFlags.Ephemeral });
@@ -351,31 +396,25 @@ async function handleInviteRemind(interaction: ButtonInteraction, services: Serv
     return;
   }
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const guild = interaction.guild!;
-  const sent: string[] = [];
-  const failed: string[] = [];
-  for (const uid of sel.missing) {
-    const member = await guild.members.fetch(uid).catch(() => null);
-    if (!member) {
-      failed.push(uid);
-      continue;
-    }
-    const ok = await member
-      .send({
-        ...inviterStep(),
-        content: "👻 冥獄城の判定を進めるため、**誰の招待で来たか** を教えてください（下のボタン1つでOK）。",
-      })
-      .then(() => true)
-      .catch(() => false);
-    (ok ? sent : failed).push(uid);
+  const guideId = services.settings.getString("channel:entry_guide");
+  if (!guideId) {
+    await interaction.editReply({ content: "入城案内チャンネルが未設定です。`/設定 チャンネル 種別:入城案内` で設定してください。" });
+    return;
   }
+  const guide = (await interaction.client.channels.fetch(guideId).catch(() => null)) as TextChannel | null;
+  if (!guide?.isTextBased()) {
+    await interaction.editReply({ content: "入城案内チャンネルが見つかりません。" });
+    return;
+  }
+  const mentions = sel.missing.map((id) => `<@${id}>`).join(" ");
+  await guide
+    .send({
+      content: `📮 ${mentions}\n判定を進めるため、**上の案内パネル**から「招待経路を登録する」を押してください（必須）。`,
+      allowedMentions: { users: sel.missing },
+    })
+    .catch(() => undefined);
   await interaction.editReply({
-    content: [
-      `📨 招待経路のDM催促: 送信 **${sent.length}名** / 失敗 ${failed.length}名`,
-      failed.length > 0 ? `失敗（DM閉鎖の可能性）: ${failed.map((id) => `<@${id}>`).join(", ")}` : "",
-    ]
-      .filter(Boolean)
-      .join("\n"),
+    content: `📨 入城案内チャンネルで **${sel.missing.length}名** に催促しました。`,
     allowedMentions: { parse: [] },
   });
 }

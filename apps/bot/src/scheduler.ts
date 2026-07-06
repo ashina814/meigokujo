@@ -56,6 +56,48 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
   async function tick(): Promise<void> {
     const now = jstNow();
 
+    // ── 説明会の案内: 月・木を除く 21/22/23 時の 30分前・5分前に入城案内chへ通知 ──
+    // JST の new Date().getDay(): 0=日, 1=月, 4=木
+    {
+      const jstDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+      const dow = jstDate.getDay();
+      const isMonOrThu = dow === 1 || dow === 4;
+      const sessions = [
+        { start: 21, minute: 30, kind: "30m" as const },
+        { start: 21, minute: 55, kind: "5m" as const },
+        { start: 22, minute: 30, kind: "30m" as const },
+        { start: 22, minute: 55, kind: "5m" as const },
+        { start: 23, minute: 30, kind: "30m" as const },
+        { start: 23, minute: 55, kind: "5m" as const },
+      ];
+      // 20:30/55, 21:30/55, 22:30/55 = 21時会前・22時会前・23時会前の 30min/5min 前
+      // すなわち session.start は 21/22/23、通知時刻は start-1 時 30/55 分
+      if (!isMonOrThu) {
+        for (const s of sessions) {
+          const notifyHour = s.start - 1;
+          if (now.hour === notifyHour && now.minute === s.minute) {
+            const marker = `session:notify:${now.dateStr}:${s.start}:${s.kind}`;
+            if (!services.settings.getString(marker)) {
+              services.settings.set(marker, "1", "system:scheduler");
+              const guideId = services.settings.getString("channel:entry_guide");
+              const waitRoleId = services.settings.getString("role:queue_wait");
+              const ch = guideId ? await client.channels.fetch(guideId).catch(() => null) : null;
+              if (ch?.isTextBased() && "send" in ch) {
+                const rolePart = waitRoleId ? `<@&${waitRoleId}> ` : "";
+                const timing = s.kind === "30m" ? "**30分後**" : "**まもなく**";
+                await ch
+                  .send({
+                    content: `📣 ${rolePart}${timing}（**${s.start}時**）に説明会があります。**説明会場VC**に来てお待ちください。`,
+                    allowedMentions: { roles: waitRoleId ? [waitRoleId] : [] },
+                  })
+                  .catch(() => undefined);
+              }
+            }
+          }
+        }
+      }
+    }
+
     // ── 冥界の天気（毎朝7時に今日の天気を確定・発表）──
     if (now.hour === 7 && now.minute < 2) {
       const { def, isNew } = services.weather.roll(now.dateStr, "system:weather");
@@ -164,6 +206,15 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     if (now.hour === 9 && !services.settings.getString(`charon:daily:${now.dateStr}`)) {
       services.settings.set(`charon:daily:${now.dateStr}`, "1", "system:scheduler");
       await runCharonDaily(client, services);
+    }
+
+    // ── 14日経ってフォーラム未作成の亡霊は自動で迷霊に落とす（毎日 09:15）──
+    if (now.hour === 9 && now.minute >= 15 && now.minute < 18) {
+      const marker = `autodrop:noeval:${now.dateStr}`;
+      if (!services.settings.getString(marker)) {
+        services.settings.set(marker, "1", "system:scheduler");
+        await autoDropNoEvalGhosts(client, services).catch((e) => console.error("[自動迷霊] 失敗:", e));
+      }
     }
 
     // ── 給与の自動ドラフト: 毎月1日 09:00 JST 以降、その月にまだ投稿していなければ ──
@@ -304,4 +355,31 @@ export async function runCharonDaily(client: Client, services: Services): Promis
       if (thread.name !== expected) await thread.setName(expected).catch(() => undefined);
     }
   }
+}
+
+/**
+ * 14日の評価期限を過ぎ、評価フォーラムのスレッドが1本も無い（＝誰にも評価されず）
+ * 亡霊を自動で迷霊に落とす。フォーラムがある人はカロンの承認パスに委ねる（自動落とし対象外）。
+ */
+export async function autoDropNoEvalGhosts(client: Client, services: Services): Promise<void> {
+  const guildId = services.settings.getString("guild:main");
+  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
+  if (!guild) return;
+  const ghostRoleId = services.settings.getString("role:ghost");
+  const meireiRoleId = services.settings.getString("role:meirei");
+  const nowTs = Math.floor(Date.now() / 1000);
+  const ghosts = services.entry.listSouls("ghost");
+  let dropped = 0;
+  for (const soul of ghosts) {
+    if (!soul.eval_deadline_at || soul.eval_deadline_at > nowTs) continue;
+    if (services.evaluation.threadFor(soul.user_id)) continue; // フォーラム有り→カロンへ
+    services.evaluation.demoteToMeirei(soul.user_id, "system:auto-drop", "14日以内に評価が付かなかった（フォーラム未作成）");
+    const member = await guild.members.fetch(soul.user_id).catch(() => null);
+    if (member) {
+      if (ghostRoleId) await member.roles.remove(ghostRoleId).catch(() => undefined);
+      if (meireiRoleId) await member.roles.add(meireiRoleId).catch(() => undefined);
+    }
+    dropped++;
+  }
+  if (dropped > 0) console.log(`[自動迷霊] ${dropped}名を落としました（フォーラム未作成・期限超過）`);
 }
