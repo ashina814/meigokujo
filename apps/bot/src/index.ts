@@ -189,10 +189,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleRoomButton(interaction, services);
       return;
     }
-    if (
-      (interaction.isStringSelectMenu() || interaction.isUserSelectMenu()) &&
-      interaction.customId.startsWith("entry:")
-    ) {
+    if (interaction.isUserSelectMenu() && interaction.customId.startsWith("entry:")) {
       await handleEntryButton(interaction, services);
       return;
     }

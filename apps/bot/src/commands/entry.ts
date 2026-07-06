@@ -3,14 +3,10 @@ import {
   ButtonBuilder,
   ButtonInteraction,
   ButtonStyle,
-  ChannelType,
   ChatInputCommandInteraction,
   EmbedBuilder,
   MessageFlags,
   SlashCommandBuilder,
-  StringSelectMenuBuilder,
-  StringSelectMenuInteraction,
-  ThreadAutoArchiveDuration,
   UserSelectMenuBuilder,
   UserSelectMenuInteraction,
   type Guild,
@@ -24,8 +20,6 @@ import { isAdmin } from "../permissions.js";
 import { jstNow } from "../scheduler.js";
 import type { Services } from "../services.js";
 
-const SESSION_HOURS = [21, 22, 23] as const;
-
 // ---- パネル ----
 
 export function entryPanelMessage(): MessageCreateOptions {
@@ -33,47 +27,20 @@ export function entryPanelMessage(): MessageCreateOptions {
     .setTitle("🚪 冥獄城 入城案内")
     .setDescription(
       [
-        "説明会は毎日 **21時 / 22時 / 23時** に開催されます。",
-        "下のボタンから枠を予約してください（応答はあなたにだけ表示されます）。",
-        "決まった時間に来られない方は「時間外・個別希望」からどうぞ。",
+        "**説明会場VCのどれかに入って**お待ちください。担当が来たら順番に面接します（時間の予約は不要です）。",
+        "先に下のボタンで「誰の招待で来たか」を登録しておくとスムーズです（任意）。",
       ].join("\n"),
     )
     .setColor(0x6b21a8);
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("entry:book").setLabel("説明会を予約する").setEmoji("🚪").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("entry:flex").setLabel("時間外・個別希望").setEmoji("⏰").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("entry:book").setLabel("招待経路を登録する").setEmoji("🚪").setStyle(ButtonStyle.Primary),
   );
   return { embeds: [embed], components: [row] };
 }
 
-// ---- 予約フロー（枠選択 → 招待者 → 確定）----
+// ---- 招待経路の登録（トラッキング用。時間予約はしない）----
 
-/** 予約途中の状態（確定まで金銭・DBは動かないため、消えても再操作でOK） */
-const pendingSlots = new Map<string, string>();
-
-function slotLabel(slot: string): string {
-  if (slot === "flex") return "時間外・個別希望";
-  const [date, hour] = slot.split(" ");
-  const [, m, d] = (date ?? "").split("-");
-  return `${Number(m)}/${Number(d)} ${hour}時`;
-}
-
-function buildSlotOptions(): { label: string; value: string }[] {
-  const nowJst = jstNow();
-  const options: { label: string; value: string }[] = [];
-  for (const dayOffset of [0, 1]) {
-    const target = jstNow(new Date(Date.now() + dayOffset * 86_400_000));
-    for (const hour of SESSION_HOURS) {
-      // 開始10分前を過ぎた今日の枠は出さない
-      if (dayOffset === 0 && (nowJst.hour > hour || (nowJst.hour === hour && nowJst.minute > 50))) continue;
-      const value = `${target.dateStr} ${hour}`;
-      options.push({ label: `${dayOffset === 0 ? "今日" : "明日"} ${hour}時`, value });
-    }
-  }
-  return options;
-}
-
-function inviterStep(slot: string) {
+function inviterStep() {
   const select = new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
     new UserSelectMenuBuilder().setCustomId("entry:invsel").setPlaceholder("招待してくれた人を選ぶ"),
   );
@@ -82,53 +49,27 @@ function inviterStep(slot: string) {
     new ButtonBuilder().setCustomId("entry:inv:none").setLabel("招待者なし・その他").setStyle(ButtonStyle.Secondary),
   );
   return {
-    content: `📅 **${slotLabel(slot)}** ですね。最後に、誰かの招待で来ましたか？`,
+    content: "誰かの招待で来ましたか？（分かる範囲でOK・任意）",
     components: [select, buttons],
     embeds: [],
   };
 }
 
 export async function handleEntryButton(
-  interaction: ButtonInteraction | StringSelectMenuInteraction | UserSelectMenuInteraction,
+  interaction: ButtonInteraction | UserSelectMenuInteraction,
   services: Services,
 ): Promise<void> {
   const id = interaction.customId;
   const userId = interaction.user.id;
 
   if (id === "entry:book" && interaction.isButton()) {
-    const options = buildSlotOptions();
-    const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId("entry:slot")
-        .setPlaceholder("説明会の枠を選ぶ")
-        .addOptions(options.map((o) => ({ label: o.label, value: o.value }))),
-    );
-    await interaction.reply({
-      content: "📅 参加できる説明会の枠を選んでください。",
-      components: [row],
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-
-  if (id === "entry:flex" && interaction.isButton()) {
-    pendingSlots.set(userId, "flex");
-    await interaction.reply({ ...inviterStep("flex"), flags: MessageFlags.Ephemeral });
-    return;
-  }
-
-  if (id === "entry:slot" && interaction.isStringSelectMenu()) {
-    const slot = interaction.values[0];
-    if (!slot) return;
-    pendingSlots.set(userId, slot);
-    await interaction.update(inviterStep(slot));
+    await interaction.reply({ ...inviterStep(), flags: MessageFlags.Ephemeral });
     return;
   }
 
   if (id === "entry:invsel" && interaction.isUserSelectMenu()) {
     const inviterId = interaction.values[0];
-    const slot = pendingSlots.get(userId);
-    if (!slot || !inviterId) {
+    if (!inviterId) {
       await interaction.update({ content: "⌛ 途中で切れました。もう一度パネルからどうぞ。", components: [] });
       return;
     }
@@ -136,38 +77,24 @@ export async function handleEntryButton(
       await interaction.reply({ content: "自分自身は招待者にできません。", flags: MessageFlags.Ephemeral });
       return;
     }
-    finalizeBooking(services, userId, slot, { userId: inviterId, source: "user" });
-    pendingSlots.delete(userId);
-    if (slot === "flex") await openFlexTicket(interaction, services, userId);
-    else await interaction.update({ content: `✅ 予約しました: **${slotLabel(slot)}**（招待者: <@${inviterId}>）\n開始1時間前にお知らせします。`, components: [] });
+    finalizeBooking(services, userId, "open", { userId: inviterId, source: "user" });
+    await interaction.update({ content: `✅ 登録しました（招待者: <@${inviterId}>）。**説明会場VCに入って**お待ちください。`, components: [] });
     return;
   }
 
   if ((id === "entry:inv:disboard" || id === "entry:inv:none") && interaction.isButton()) {
-    const slot = pendingSlots.get(userId);
-    if (!slot) {
-      await interaction.update({ content: "⌛ 途中で切れました。もう一度パネルからどうぞ。", components: [] });
-      return;
-    }
     const source = id.endsWith("disboard") ? ("disboard" as const) : ("none" as const);
-    finalizeBooking(services, userId, slot, { source });
-    pendingSlots.delete(userId);
-    if (slot === "flex") await openFlexTicket(interaction, services, userId);
-    else await interaction.update({ content: `✅ 予約しました: **${slotLabel(slot)}**\n開始1時間前にお知らせします。`, components: [] });
+    finalizeBooking(services, userId, "open", { source });
+    await interaction.update({ content: "✅ 登録しました。**説明会場VCに入って**お待ちください。", components: [] });
     return;
   }
 
-  if (id.startsWith("entry:flexdone:") && interaction.isButton()) {
-    await handleFlexDone(interaction, services);
-    return;
-  }
-
-  if ((id.startsWith("entry:judgehold:") || id.startsWith("entry:judgeskip:")) && interaction.isUserSelectMenu()) {
+  if ((id.startsWith("entry:judgehold") || id.startsWith("entry:judgeskip")) && interaction.isUserSelectMenu()) {
     await handleJudgeSelect(interaction, services);
     return;
   }
 
-  if (id.startsWith("entry:pass:") && interaction.isButton()) {
+  if (id.startsWith("entry:pass") && interaction.isButton()) {
     await handlePassButton(interaction, services);
   }
 }
@@ -242,48 +169,11 @@ export function handleVoiceAttendance(
 
 export const sessionCommand = new SlashCommandBuilder()
   .setName("審判")
-  .setDescription("説明会の判定・担当と昇格（面接担当・審・運営）")
+  .setDescription("説明会の判定と昇格（面接担当・魔剣士・審・運営）")
   .setDMPermission(false)
   .addSubcommand((sub) =>
-    sub
-      .setName("判定")
-      .setDescription("指定枠の出席者を確認して一括で亡霊にする")
-      .addStringOption((o) =>
-        o
-          .setName("日付")
-          .setDescription("開催日")
-          .setRequired(true)
-          .addChoices({ name: "今日", value: "0" }, { name: "昨日", value: "-1" }),
-      )
-      .addIntegerOption((o) =>
-        o
-          .setName("時刻")
-          .setDescription("開催時刻")
-          .setRequired(true)
-          .addChoices(...SESSION_HOURS.map((h) => ({ name: `${h}時`, value: h }))),
-      ),
+    sub.setName("判定").setDescription("いま説明会VCにいる案内待ちの人を確認して一括で亡霊にする"),
   )
-  .addSubcommand((sub) =>
-    sub
-      .setName("担当")
-      .setDescription("説明会の担当スタッフを割り当てる（30分前に本人へ通知）")
-      .addStringOption((o) =>
-        o
-          .setName("日付")
-          .setDescription("開催日")
-          .setRequired(true)
-          .addChoices({ name: "今日", value: "0" }, { name: "明日", value: "1" }),
-      )
-      .addIntegerOption((o) =>
-        o
-          .setName("時刻")
-          .setDescription("開催時刻")
-          .setRequired(true)
-          .addChoices(...SESSION_HOURS.map((h) => ({ name: `${h}時`, value: h }))),
-      )
-      .addUserOption((o) => o.setName("担当").setDescription("担当スタッフ").setRequired(true)),
-  )
-  .addSubcommand((sub) => sub.setName("時間外一覧").setDescription("時間外・個別希望の待機者を表示"))
   .addSubcommand((sub) =>
     sub
       .setName("昇格")
@@ -306,118 +196,93 @@ function isJudge(
   });
 }
 
+/** いま説明会VC(1・2)にいる「案内待ち」のメンバーIDを集める */
+async function presentWaiters(guild: Guild, services: Services): Promise<string[]> {
+  const vcIds = [
+    services.settings.getString("channel:session_vc"),
+    services.settings.getString("channel:session_vc2"),
+  ].filter((v): v is string => !!v);
+  const waitRoleId = services.settings.getString("role:queue_wait");
+  const ids = new Set<string>();
+  for (const vcId of vcIds) {
+    const ch = await guild.channels.fetch(vcId).catch(() => null);
+    if (!ch || !ch.isVoiceBased()) continue;
+    for (const [, m] of ch.members) {
+      if (m.user.bot) continue;
+      const soul = services.entry.getSoul(m.id);
+      // すでに階級が付いた人（亡霊/魔人等）は対象外。案内待ちロール or waiting の魂だけ
+      if (soul && soul.status !== "waiting") continue;
+      const hasWait = waitRoleId ? m.roles.cache.has(waitRoleId) : false;
+      if (hasWait || soul?.status === "waiting") ids.add(m.id);
+    }
+  }
+  return [...ids];
+}
+
 export async function handleSessionCommand(
   interaction: ChatInputCommandInteraction,
   services: Services,
 ): Promise<void> {
   if (!isJudge(interaction, services)) {
-    await interaction.reply({ content: "この操作には面接担当の権限が必要です。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "この操作には面接担当（運営・面接担当・魔剣士・審）の権限が必要です。", flags: MessageFlags.Ephemeral });
     return;
   }
-  const sub = interaction.options.getSubcommand();
-
-  if (sub === "担当") {
-    const dayOffset = Number(interaction.options.getString("日付", true));
-    const hour = interaction.options.getInteger("時刻", true);
-    const staff = interaction.options.getUser("担当", true);
-    const date = jstNow(new Date(Date.now() + dayOffset * 86_400_000)).dateStr;
-    const slot = `${date} ${hour}`;
-    services.settings.set(`entry:staff:${slot}`, staff.id, `user:${interaction.user.id}`);
+  // 判定のみ（昇格は index 側で handlePromote に振り分け）
+  const guild = interaction.guild!;
+  const present = await presentWaiters(guild, services);
+  if (present.length === 0) {
     await interaction.reply({
-      content: `✅ ${slotLabel(slot)} の説明会の担当を <@${staff.id}> にしました（開始30分前に本人へ通知します）。`,
+      content: "いま説明会場VCに案内待ちの人がいません。（`/設定 チャンネル 種別:説明会場VC` で対応VCを設定してください）",
       flags: MessageFlags.Ephemeral,
-      allowedMentions: { parse: [] },
     });
     return;
   }
-
-  if (sub === "時間外一覧") {
-    const rows = services.entry.listBySlot("flex").slice(0, 25);
-    const lines =
-      rows.length > 0
-        ? rows.map((r) => `・<@${r.user_id}>（欠席 ${r.no_show_count}回）`)
-        : ["いません。"];
-    await interaction.reply({
-      content: `⏰ 時間外・個別希望の待機者:\n${lines.join("\n")}`,
-      flags: MessageFlags.Ephemeral,
-      allowedMentions: { parse: [] },
-    });
-    return;
-  }
-
-  const dayOffset = Number(interaction.options.getString("日付", true));
-  const hour = interaction.options.getInteger("時刻", true);
-  const date = jstNow(new Date(Date.now() + dayOffset * 86_400_000)).dateStr;
-  const slot = `${date} ${hour}`;
-
-  const { attended, absent } = services.entry.judgeSlot(slot);
-  if (attended.length === 0 && absent.length === 0) {
-    await interaction.reply({ content: `${slotLabel(slot)} の予約者はいません。`, flags: MessageFlags.Ephemeral });
-    return;
-  }
-
-  // この判定用の保留/見送り状態をリセットして描画
-  judgeState.set(judgeKey(interaction.user.id, slot), { hold: new Set(), skip: new Set() });
-  await interaction.reply({ ...renderJudgment(services, slot, interaction.user.id), flags: MessageFlags.Ephemeral });
+  judgeState.set(interaction.user.id, { present, hold: new Set(), skip: new Set() });
+  await interaction.reply({ ...renderJudgment(services, interaction.user.id), flags: MessageFlags.Ephemeral });
 }
 
 // ---- 判定UI: 保留/見送りの個別例外 ----
 
 interface JudgeSel {
-  hold: Set<string>; // 保留＝今回は通さず attended のまま（次回の判定で再度出る）
-  skip: Set<string>; // 見送り＝dropped にしてキューから外す（亡霊化しない）
+  present: string[]; // /審判 判定 実行時にVCにいた案内待ちのスナップショット
+  hold: Set<string>; // 保留＝今回は通さない（案内待ちのまま。次回の判定で再度出る）
+  skip: Set<string>; // 見送り＝案内待ちから外す（亡霊化しない）
 }
-const judgeState = new Map<string, JudgeSel>();
-const judgeKey = (judgeId: string, slot: string) => `${judgeId}:${slot}`;
+const judgeState = new Map<string, JudgeSel>(); // key = 判定者のユーザーID
 
-/** 判定メッセージ（出席・欠席・保留・見送りの分類 + 選択UI）を組み立てる */
-function renderJudgment(services: Services, slot: string, judgeId: string) {
-  const [date, hour] = slot.split(" ");
-  const { attended, absent } = services.entry.judgeSlot(slot);
-  const sel = judgeState.get(judgeKey(judgeId, slot)) ?? { hold: new Set(), skip: new Set() };
-  const toGhost = attended.filter((r) => !sel.hold.has(r.user_id) && !sel.skip.has(r.user_id));
+/** 判定メッセージ（今VCにいる案内待ち + 保留/見送りの選択UI）を組み立てる */
+function renderJudgment(_services: Services, judgeId: string) {
+  const st = judgeState.get(judgeId) ?? { present: [], hold: new Set<string>(), skip: new Set<string>() };
+  const toGhost = st.present.filter((id) => !st.hold.has(id) && !st.skip.has(id));
 
-  const line = (rows: { user_id: string }[]) => (rows.length > 0 ? rows.map((r) => `・<@${r.user_id}>`).join("\n") : "（なし）");
+  const line = (ids: string[]) => (ids.length > 0 ? ids.map((id) => `・<@${id}>`).join("\n") : "（なし）");
   const embed = new EmbedBuilder()
-    .setTitle(`⚖️ ${slotLabel(slot)} 説明会の判定`)
+    .setTitle("⚖️ 説明会の判定（今VCにいる案内待ち）")
     .setColor(0x6b21a8)
     .setDescription(
       [
         `**亡霊にする ${toGhost.length}名**:`,
         line(toGhost),
         "",
-        sel.hold.size > 0 ? `⏸ **保留 ${sel.hold.size}名**（次回に持ち越し）:\n${line([...sel.hold].map((id) => ({ user_id: id })))}\n` : "",
-        sel.skip.size > 0 ? `🚫 **見送り ${sel.skip.size}名**（キューから外す）:\n${line([...sel.skip].map((id) => ({ user_id: id })))}\n` : "",
-        `**欠席 ${absent.length}名**（欠席+1 → 再予約案内）:`,
-        absent.length > 0 ? absent.map((r) => `・<@${r.user_id}>（累計${r.no_show_count}回）`).join("\n") : "（なし）",
+        st.hold.size > 0 ? `⏸ **保留 ${st.hold.size}名**（今回は通さない・案内待ちのまま）:\n${line([...st.hold])}\n` : "",
+        st.skip.size > 0 ? `🚫 **見送り ${st.skip.size}名**（案内待ちから外す）:\n${line([...st.skip])}\n` : "",
       ]
         .filter((s) => s !== "")
         .join("\n"),
     );
 
-  const rows: ActionRowBuilder<UserSelectMenuBuilder | ButtonBuilder>[] = [];
-  if (attended.length > 0) {
-    const max = Math.min(25, attended.length);
-    rows.push(
-      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
-        new UserSelectMenuBuilder().setCustomId(`entry:judgehold:${date}:${hour}`).setPlaceholder("⏸ 保留にする人（次回持ち越し）").setMinValues(0).setMaxValues(max),
-      ),
-    );
-    rows.push(
-      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
-        new UserSelectMenuBuilder().setCustomId(`entry:judgeskip:${date}:${hour}`).setPlaceholder("🚫 見送りにする人（今回通さない）").setMinValues(0).setMaxValues(max),
-      ),
-    );
-  }
-  rows.push(
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`entry:pass:${date}:${hour}`)
-        .setLabel(`${toGhost.length}名を亡霊にする`)
-        .setStyle(ButtonStyle.Success)
-        .setDisabled(toGhost.length === 0),
+  const max = Math.min(25, Math.max(1, st.present.length));
+  const rows: ActionRowBuilder<UserSelectMenuBuilder | ButtonBuilder>[] = [
+    new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+      new UserSelectMenuBuilder().setCustomId("entry:judgehold").setPlaceholder("⏸ 保留にする人（今回通さない）").setMinValues(0).setMaxValues(max),
     ),
-  );
+    new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+      new UserSelectMenuBuilder().setCustomId("entry:judgeskip").setPlaceholder("🚫 見送りにする人（案内待ちから外す）").setMinValues(0).setMaxValues(max),
+    ),
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("entry:pass").setLabel(`${toGhost.length}名を亡霊にする`).setStyle(ButtonStyle.Success).setDisabled(toGhost.length === 0),
+    ),
+  ];
   return { embeds: [embed], components: rows, allowedMentions: { parse: [] } };
 }
 
@@ -427,11 +292,12 @@ async function handleJudgeSelect(interaction: UserSelectMenuInteraction, service
     await interaction.reply({ content: "この操作には面接担当の権限が必要です。", flags: MessageFlags.Ephemeral });
     return;
   }
-  const parts = interaction.customId.split(":"); // entry:judgehold:date:hour
-  const kind = parts[1]; // judgehold | judgeskip
-  const slot = `${parts[2]} ${parts[3]}`;
-  const key = judgeKey(interaction.user.id, slot);
-  const sel = judgeState.get(key) ?? { hold: new Set<string>(), skip: new Set<string>() };
+  const kind = interaction.customId.split(":")[1]; // judgehold | judgeskip
+  const sel = judgeState.get(interaction.user.id);
+  if (!sel) {
+    await interaction.update({ content: "⌛ この判定は期限切れです。`/審判 判定` からやり直してください。", components: [], embeds: [] });
+    return;
+  }
   const picked = new Set(interaction.values);
   if (kind === "judgehold") {
     sel.hold = picked;
@@ -440,8 +306,8 @@ async function handleJudgeSelect(interaction: UserSelectMenuInteraction, service
     sel.skip = picked;
     for (const id of picked) sel.hold.delete(id);
   }
-  judgeState.set(key, sel);
-  await interaction.update(renderJudgment(services, slot, interaction.user.id));
+  judgeState.set(interaction.user.id, sel);
+  await interaction.update(renderJudgment(services, interaction.user.id));
 }
 
 async function handlePassButton(interaction: ButtonInteraction, services: Services): Promise<void> {
@@ -449,64 +315,46 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
     await interaction.reply({ content: "この操作には面接担当の権限が必要です。", flags: MessageFlags.Ephemeral });
     return;
   }
-  const parts = interaction.customId.split(":");
-  const slot = `${parts[2]} ${parts[3]}`;
   const actor = `user:${interaction.user.id}`;
-  const sel = judgeState.get(judgeKey(interaction.user.id, slot)) ?? { hold: new Set<string>(), skip: new Set<string>() };
-
+  const sel = judgeState.get(interaction.user.id);
+  if (!sel) {
+    await interaction.update({ content: "⌛ この判定は期限切れです。`/審判 判定` からやり直してください。", components: [], embeds: [] });
+    return;
+  }
   await interaction.update({ content: "⏳ 判定を実行中…", embeds: [], components: [] });
 
-  const { attended, absent } = services.entry.judgeSlot(slot);
-  // 見送りはキューから外す（亡霊化しない）。保留は attended のまま残す（次回に持ち越し）
-  const skipped: string[] = [];
-  for (const row of attended) {
-    if (sel.skip.has(row.user_id)) {
-      services.entry.skipBooking(row.user_id, actor);
-      skipped.push(row.user_id);
+  const guild = interaction.guild!;
+  const toGhost = sel.present.filter((id) => !sel.hold.has(id) && !sel.skip.has(id));
+  const skipped = sel.present.filter((id) => sel.skip.has(id));
+
+  // 見送り: 案内待ちロールを外してキューから除外（亡霊化しない）
+  const waitRoleId = services.settings.getString("role:queue_wait");
+  for (const id of skipped) {
+    services.entry.skipBooking(id, actor);
+    if (waitRoleId) {
+      const m = await guild.members.fetch(id).catch(() => null);
+      await m?.roles.remove(waitRoleId).catch(() => undefined);
     }
   }
-  const toGhost = attended.filter((r) => !sel.hold.has(r.user_id) && !sel.skip.has(r.user_id));
 
-  const guild = interaction.guild!;
   const passed: string[] = [];
   const failed: string[] = [];
   let totalGranted = 0;
-
-  for (const row of toGhost) {
-    const r = await ghostifyOne(guild, services, row.user_id, actor);
+  for (const id of toGhost) {
+    const r = await ghostifyOne(guild, services, id, actor);
     if (r.ok) {
       totalGranted += r.granted;
-      passed.push(row.user_id);
-    } else failed.push(row.user_id);
+      passed.push(id);
+    } else failed.push(id);
   }
 
-  const rebook: string[] = [];
-  const droppedList: string[] = [];
-  for (const row of absent) {
-    const r = services.entry.recordNoShow(row.user_id);
-    (r.dropped ? droppedList : rebook).push(row.user_id);
-  }
-
-  // 欠席者への再予約案内（入城案内チャンネルで本人にだけ分かる形＝メンション）
-  const guideId = services.settings.getString("channel:entry_guide");
-  if (guideId && rebook.length > 0) {
-    const channel = (await guild.client.channels.fetch(guideId).catch(() => null)) as TextChannel | null;
-    await channel
-      ?.send(
-        `📅 ${rebook.map((id) => `<@${id}>`).join(" ")} 説明会に来られなかったようです。パネルからもう一度予約してください。`,
-      )
-      .catch(() => undefined);
-  }
-
-  judgeState.delete(judgeKey(interaction.user.id, slot));
+  judgeState.delete(interaction.user.id);
 
   const lines = [
     `✅ **${passed.length}名** を亡霊にしました（初期発行 計 ${fmtLd(totalGranted)}）。`,
     failed.length > 0 ? `❌ 失敗: ${failed.map((id) => `<@${id}>`).join(", ")}` : "",
-    sel.hold.size > 0 ? `⏸ 保留（次回持ち越し）: ${sel.hold.size}名` : "",
-    skipped.length > 0 ? `🚫 見送り（キューから除外）: ${skipped.map((id) => `<@${id}>`).join(", ")}` : "",
-    rebook.length > 0 ? `📅 欠席 → 再予約案内: ${rebook.length}名` : "",
-    droppedList.length > 0 ? `🚫 3回連続欠席でキューから除外: ${droppedList.map((id) => `<@${id}>`).join(", ")}（対応は運営判断）` : "",
+    sel.hold.size > 0 ? `⏸ 保留（案内待ちのまま）: ${sel.hold.size}名` : "",
+    skipped.length > 0 ? `🚫 見送り（案内待ちから除外）: ${skipped.map((id) => `<@${id}>`).join(", ")}` : "",
   ].filter(Boolean);
   await interaction.editReply({ content: lines.join("\n"), allowedMentions: { parse: [] } });
 }
@@ -541,78 +389,4 @@ async function ghostifyOne(
   }
 }
 
-// ---- 時間外・個別希望: チケット（非公開スレッド）で柔軟に面接 ----
-
-async function openFlexTicket(
-  interaction: ButtonInteraction | UserSelectMenuInteraction,
-  services: Services,
-  userId: string,
-): Promise<void> {
-  const guild = interaction.guild!;
-  const guideId = services.settings.getString("channel:entry_guide");
-  const guide = guideId ? await guild.channels.fetch(guideId).catch(() => null) : null;
-  const base = (guide?.isTextBased() ? guide : interaction.channel) as TextChannel | null;
-  if (!base || !("threads" in base)) {
-    await interaction.update({ content: "✅ 時間外希望を受け付けました。スタッフから個別に連絡します。", components: [] });
-    return;
-  }
-
-  const member = await guild.members.fetch(userId).catch(() => null);
-  const thread = await base.threads
-    .create({
-      name: `時間外希望-${member?.displayName ?? "案内待ち"}`.slice(0, 90),
-      type: ChannelType.PrivateThread,
-      invitable: false,
-      autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
-    })
-    .catch(() => null);
-  if (!thread) {
-    await interaction.update({ content: "✅ 時間外希望を受け付けました。スタッフから連絡します。", components: [] });
-    return;
-  }
-  await thread.members.add(userId).catch(() => undefined);
-
-  const judgeId = services.settings.getString("role:judge");
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`entry:flexdone:${userId}`).setLabel("亡霊にする（面接完了）").setEmoji("👻").setStyle(ButtonStyle.Success),
-  );
-  await thread
-    .send({
-      content: [
-        `${judgeId ? `<@&${judgeId}> ` : ""}<@${userId}> さんの**時間外・個別希望**です。`,
-        "**都合のいい曜日・時間帯**を書いてください。面接担当が合わせて調整します。",
-        "（面接が済んだら、担当が下のボタンで亡霊化します）",
-      ].join("\n"),
-      components: [row],
-      allowedMentions: { users: [userId], roles: judgeId ? [judgeId] : [] },
-    })
-    .catch(() => undefined);
-
-  await interaction.update({
-    content: `✅ 時間外の受付を作りました → ${thread.toString()}\nそちらで面接担当と時間を決めてください。`,
-    components: [],
-  });
-}
-
-async function handleFlexDone(interaction: ButtonInteraction, services: Services): Promise<void> {
-  if (!isJudge(interaction, services)) {
-    await interaction.reply({ content: "この操作には面接担当の権限が必要です。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  const targetId = interaction.customId.split(":")[2]!;
-  await interaction.deferReply();
-  const r = await ghostifyOne(interaction.guild!, services, targetId, `user:${interaction.user.id}`);
-  if (!r.ok) {
-    await interaction.editReply({ content: `❌ <@${targetId}> の亡霊化に失敗しました。ロール権限などを確認してください。` });
-    return;
-  }
-  await interaction.editReply({
-    content: `👻 <@${targetId}> を亡霊にしました（初期発行 ${fmtLd(r.granted)}）。ようこそ冥獄城へ。`,
-    allowedMentions: { users: [targetId] },
-  });
-  const thread = interaction.channel;
-  if (thread && thread.isThread()) {
-    await thread.setLocked(true).catch(() => undefined);
-    await thread.setArchived(true).catch(() => undefined);
-  }
-}
+// ---- （時間外チケット機能は 2026-07-06 廃止。判定は「今VCにいる案内待ち」ベースに一本化）----

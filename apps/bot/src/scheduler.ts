@@ -10,7 +10,6 @@ import { updateDashboard } from "./dashboard.js";
 import { announceResult, refreshAuctionPanel } from "./commands/auction.js";
 import { announceDraw, refreshLotteryPanel } from "./commands/lottery.js";
 import { announceRace, refreshRacePanel } from "./commands/race.js";
-import { notifyUser } from "./notify.js";
 import { fmtLd } from "./format.js";
 import type { Services } from "./services.js";
 
@@ -55,46 +54,6 @@ export function jstNow(date = new Date()): {
 export function startScheduler(client: Client, services: Services, intervalMs = 60_000): NodeJS.Timeout {
   async function tick(): Promise<void> {
     const now = jstNow();
-
-    // ── 説明会の1時間前リマインド（毎日 20/21/22 時 = 21/22/23 時の各会の1時間前）──
-    if ([20, 21, 22].includes(now.hour) && now.minute < 2) {
-      const slot = `${now.dateStr} ${now.hour + 1}`;
-      const marker = `entry:reminded:${slot}`;
-      if (!services.settings.getString(marker)) {
-        services.settings.set(marker, "1", "system:scheduler");
-        const bookings = services.entry.listBySlot(slot).filter((b) => b.status === "booked");
-        const guideId = services.settings.getString("channel:entry_guide");
-        if (bookings.length > 0 && guideId) {
-          const channel = await client.channels.fetch(guideId).catch(() => null);
-          if (channel?.isTextBased() && "send" in channel) {
-            await channel.send(
-              `⏰ ${bookings.map((b) => `<@${b.user_id}>`).join(" ")} 説明会は **1時間後（${now.hour + 1}時）** です。時間になったら説明会場VCへどうぞ。`,
-            );
-          }
-        }
-      }
-    }
-
-    // ── 説明会の担当スタッフへ30分前アラート（20:30/21:30/22:30 = 各会の30分前）──
-    // 窓を持たせて tick のドリフトでの取りこぼしを防ぐ（重複はマーカーで抑止）
-    if ([20, 21, 22].includes(now.hour) && now.minute >= 30 && now.minute < 33) {
-      const slot = `${now.dateStr} ${now.hour + 1}`;
-      const marker = `entry:staffalert:${slot}`;
-      if (!services.settings.getString(marker)) {
-        services.settings.set(marker, "1", "system:scheduler");
-        const staffId = services.settings.getString(`entry:staff:${slot}`);
-        if (staffId) {
-          const booked = services.entry.listBySlot(slot).filter((b) => b.status === "booked").length;
-          await notifyUser(
-            client,
-            services,
-            staffId,
-            `🔔 **30分後（${now.hour + 1}時）の説明会の担当です。** 予約 **${booked}名**。時間になったら説明会場VCへ。`,
-            { fallbackChannelKey: "channel:shurei" },
-          ).catch((e) => console.error("[entry] 担当アラート失敗:", e));
-        }
-      }
-    }
 
     // ── 冥界の天気（毎朝7時に今日の天気を確定・発表）──
     if (now.hour === 7 && now.minute < 2) {
