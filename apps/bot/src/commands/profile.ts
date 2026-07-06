@@ -7,6 +7,7 @@ import {
 } from "discord.js";
 import { fmtLdCompact } from "../format.js";
 import { renderProfileCard } from "../render/profile-card.js";
+import { isAdmin } from "../permissions.js";
 import type { Services } from "../services.js";
 
 const RANK_LABEL: Record<string, string> = {
@@ -31,6 +32,15 @@ export async function handleProfile(
 ): Promise<void> {
   const target = interaction.options.getUser("対象") ?? interaction.user;
   const isSelf = target.id === interaction.user.id;
+
+  // 他人のプロフィール（残高・階級など）は運営（管理ロール）のみ閲覧可
+  if (!isSelf && !isAdmin(interaction, services)) {
+    await interaction.reply({
+      content: "他の人のプロフィールは運営（管理ロール）のみ閲覧できます。自分のプロフィールは `/プロフィール` で見られます。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
 
   // 画像生成＋アバター取得で時間がかかるので先に defer（既定は本人だけ・公開:true で全員に見える）
   const isPublic = interaction.options.getBoolean("公開") ?? false;
