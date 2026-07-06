@@ -27,29 +27,31 @@ export function entryPanelMessage(): MessageCreateOptions {
     .setTitle("🚪 冥獄城 入城案内")
     .setDescription(
       [
-        "**説明会場VCのどれかに入って**お待ちください。担当が来たら順番に面接します（時間の予約は不要です）。",
-        "先に下のボタンで「誰の招待で来たか」を登録しておくとスムーズです（任意）。",
+        "**先に招待経路を登録してから、説明会場VCのどれかに入って**お待ちください（登録が無いと判定に進めません）。",
+        "登録は下のボタン1つでOK。時間の予約はありません、担当が来たら順番に面接します。",
       ].join("\n"),
     )
     .setColor(0x6b21a8);
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("entry:book").setLabel("招待経路を登録する").setEmoji("🚪").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("entry:book").setLabel("招待経路を登録する（必須）").setEmoji("🚪").setStyle(ButtonStyle.Primary),
   );
   return { embeds: [embed], components: [row] };
 }
 
 // ---- 招待経路の登録（トラッキング用。時間予約はしない）----
 
+/** 招待経路 入力UI（案内パネル・DM・審判の代打入力で共用） */
 function inviterStep() {
   const select = new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
     new UserSelectMenuBuilder().setCustomId("entry:invsel").setPlaceholder("招待してくれた人を選ぶ"),
   );
   const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("entry:inv:disboard").setLabel("ディスボードから来た").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("entry:inv:none").setLabel("招待者なし・その他").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("entry:inv:disboard").setLabel("ディスボード").setEmoji("🅱").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("entry:inv:lumina").setLabel("ルミナ").setEmoji("✨").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("entry:inv:none").setLabel("その他（誰の招待でもない）").setStyle(ButtonStyle.Secondary),
   );
   return {
-    content: "誰かの招待で来ましたか？（分かる範囲でOK・任意）",
+    content: "**誰かの招待で来ましたか？** どれか1つ選んで押してください（必ずお願いします）。",
     components: [select, buttons],
     embeds: [],
   };
@@ -82,8 +84,15 @@ export async function handleEntryButton(
     return;
   }
 
-  if ((id === "entry:inv:disboard" || id === "entry:inv:none") && interaction.isButton()) {
-    const source = id.endsWith("disboard") ? ("disboard" as const) : ("none" as const);
+  if (
+    (id === "entry:inv:disboard" || id === "entry:inv:lumina" || id === "entry:inv:none") &&
+    interaction.isButton()
+  ) {
+    const source = id.endsWith("disboard")
+      ? ("disboard" as const)
+      : id.endsWith("lumina")
+        ? ("lumina" as const)
+        : ("none" as const);
     finalizeBooking(services, userId, "open", { source });
     await interaction.update({ content: "✅ 登録しました。**説明会場VCに入って**お待ちください。", components: [] });
     return;
@@ -96,6 +105,11 @@ export async function handleEntryButton(
 
   if (id.startsWith("entry:pass") && interaction.isButton()) {
     await handlePassButton(interaction, services);
+    return;
+  }
+
+  if (id === "entry:invremind" && interaction.isButton()) {
+    await handleInviteRemind(interaction, services);
   }
 }
 
@@ -103,7 +117,7 @@ function finalizeBooking(
   services: Services,
   userId: string,
   slot: string,
-  inviter: { userId?: string; source: "user" | "disboard" | "none" },
+  inviter: { userId?: string; source: "user" | "disboard" | "lumina" | "none" },
 ): void {
   services.entry.recordJoin(userId); // 参加記録が無い既存メンバーの申請にも対応
   services.entry.book(userId, slot, inviter);
@@ -121,12 +135,26 @@ export async function handleMemberJoin(member: GuildMember, services: Services):
       .add(waitRoleId)
       .catch((e) => console.warn(`[entry] 入城待ちロール付与に失敗（ボットのロールを階級より上へ）: ${(e as Error).message}`));
 
+  // 本人にDMで招待経路パネルを送る（1タップで完結。判定は必須のためこれで実質全員に届く）
+  const dmSent = await member
+    .send({
+      ...inviterStep(),
+      content: [
+        `👻 <@${member.id}> ようこそ冥獄城へ。`,
+        "説明会に進む前に、**誰の招待で来たか** を教えてください（下のボタン1つでOK）。",
+        "その後、サーバー内の**説明会場VC**に入って担当をお待ちください。",
+      ].join("\n"),
+    })
+    .then(() => true)
+    .catch(() => false);
+
   const guideId = services.settings.getString("channel:entry_guide");
   if (guideId) {
     const channel = (await member.client.channels.fetch(guideId).catch(() => null)) as TextChannel | null;
-    await channel
-      ?.send(`👻 <@${member.id}> ようこそ冥獄城へ。上の案内パネルから説明会を予約してください。`)
-      .catch(() => undefined);
+    const note = dmSent
+      ? "DMに招待経路の登録パネルを送りました。ご確認ください。"
+      : "DMを受け取れない設定のようです。**上の案内パネル**から招待経路を登録してください（必須）。";
+    await channel?.send(`👻 <@${member.id}> ようこそ冥獄城へ。${note}`).catch(() => undefined);
   }
 }
 
@@ -237,22 +265,33 @@ export async function handleSessionCommand(
     });
     return;
   }
-  judgeState.set(interaction.user.id, { present, hold: new Set(), skip: new Set() });
+  // 招待経路の登録有無で切り分け（未登録者は判定対象から外し、DM催促の対象にする）
+  const ready: string[] = [];
+  const missing: string[] = [];
+  for (const uid of present) {
+    const booking = services.entry.getBooking(uid);
+    if (booking && booking.inviter_source) ready.push(uid);
+    else missing.push(uid);
+  }
+  judgeState.set(interaction.user.id, { present: ready, missing, hold: new Set(), skip: new Set() });
   await interaction.reply({ ...renderJudgment(services, interaction.user.id), flags: MessageFlags.Ephemeral });
 }
 
-// ---- 判定UI: 保留/見送りの個別例外 ----
+// ---- 判定UI: 保留/見送り/招待未登録 ----
 
 interface JudgeSel {
-  present: string[]; // /審判 判定 実行時にVCにいた案内待ちのスナップショット
-  hold: Set<string>; // 保留＝今回は通さない（案内待ちのまま。次回の判定で再度出る）
+  present: string[]; // 招待経路登録済み・判定対象
+  missing: string[]; // 招待経路が未登録・判定不可（DM催促の対象）
+  hold: Set<string>; // 保留＝今回は通さない（案内待ちのまま）
   skip: Set<string>; // 見送り＝案内待ちから外す（亡霊化しない）
 }
 const judgeState = new Map<string, JudgeSel>(); // key = 判定者のユーザーID
 
 /** 判定メッセージ（今VCにいる案内待ち + 保留/見送りの選択UI）を組み立てる */
 function renderJudgment(_services: Services, judgeId: string) {
-  const st = judgeState.get(judgeId) ?? { present: [], hold: new Set<string>(), skip: new Set<string>() };
+  const st =
+    judgeState.get(judgeId) ??
+    ({ present: [], missing: [], hold: new Set<string>(), skip: new Set<string>() } as JudgeSel);
   const toGhost = st.present.filter((id) => !st.hold.has(id) && !st.skip.has(id));
 
   const line = (ids: string[]) => (ids.length > 0 ? ids.map((id) => `・<@${id}>`).join("\n") : "（なし）");
@@ -266,24 +305,79 @@ function renderJudgment(_services: Services, judgeId: string) {
         "",
         st.hold.size > 0 ? `⏸ **保留 ${st.hold.size}名**（今回は通さない・案内待ちのまま）:\n${line([...st.hold])}\n` : "",
         st.skip.size > 0 ? `🚫 **見送り ${st.skip.size}名**（案内待ちから外す）:\n${line([...st.skip])}\n` : "",
+        st.missing.length > 0
+          ? `⚠️ **招待経路 未登録 ${st.missing.length}名**（判定不可・下のボタンでDM催促）:\n${line(st.missing)}\n`
+          : "",
       ]
         .filter((s) => s !== "")
         .join("\n"),
     );
 
   const max = Math.min(25, Math.max(1, st.present.length));
-  const rows: ActionRowBuilder<UserSelectMenuBuilder | ButtonBuilder>[] = [
-    new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
-      new UserSelectMenuBuilder().setCustomId("entry:judgehold").setPlaceholder("⏸ 保留にする人（今回通さない）").setMinValues(0).setMaxValues(max),
-    ),
-    new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
-      new UserSelectMenuBuilder().setCustomId("entry:judgeskip").setPlaceholder("🚫 見送りにする人（案内待ちから外す）").setMinValues(0).setMaxValues(max),
-    ),
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("entry:pass").setLabel(`${toGhost.length}名を亡霊にする`).setStyle(ButtonStyle.Success).setDisabled(toGhost.length === 0),
-    ),
-  ];
+  const rows: ActionRowBuilder<UserSelectMenuBuilder | ButtonBuilder>[] = [];
+  if (st.present.length > 0) {
+    rows.push(
+      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+        new UserSelectMenuBuilder().setCustomId("entry:judgehold").setPlaceholder("⏸ 保留にする人（今回通さない）").setMinValues(0).setMaxValues(max),
+      ),
+    );
+    rows.push(
+      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+        new UserSelectMenuBuilder().setCustomId("entry:judgeskip").setPlaceholder("🚫 見送りにする人（案内待ちから外す）").setMinValues(0).setMaxValues(max),
+      ),
+    );
+  }
+  const bottom = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("entry:pass").setLabel(`${toGhost.length}名を亡霊にする`).setStyle(ButtonStyle.Success).setDisabled(toGhost.length === 0),
+  );
+  if (st.missing.length > 0) {
+    bottom.addComponents(
+      new ButtonBuilder().setCustomId("entry:invremind").setLabel(`⚠️ ${st.missing.length}名へ招待経路のDM催促`).setStyle(ButtonStyle.Secondary),
+    );
+  }
+  rows.push(bottom);
   return { embeds: [embed], components: rows, allowedMentions: { parse: [] } };
+}
+
+/** 招待未登録者へ登録DMを再送する */
+async function handleInviteRemind(interaction: ButtonInteraction, services: Services): Promise<void> {
+  if (!isJudge(interaction, services)) {
+    await interaction.reply({ content: "この操作には面接担当の権限が必要です。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const sel = judgeState.get(interaction.user.id);
+  if (!sel || sel.missing.length === 0) {
+    await interaction.reply({ content: "催促する対象がありません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const guild = interaction.guild!;
+  const sent: string[] = [];
+  const failed: string[] = [];
+  for (const uid of sel.missing) {
+    const member = await guild.members.fetch(uid).catch(() => null);
+    if (!member) {
+      failed.push(uid);
+      continue;
+    }
+    const ok = await member
+      .send({
+        ...inviterStep(),
+        content: "👻 冥獄城の判定を進めるため、**誰の招待で来たか** を教えてください（下のボタン1つでOK）。",
+      })
+      .then(() => true)
+      .catch(() => false);
+    (ok ? sent : failed).push(uid);
+  }
+  await interaction.editReply({
+    content: [
+      `📨 招待経路のDM催促: 送信 **${sent.length}名** / 失敗 ${failed.length}名`,
+      failed.length > 0 ? `失敗（DM閉鎖の可能性）: ${failed.map((id) => `<@${id}>`).join(", ")}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    allowedMentions: { parse: [] },
+  });
 }
 
 /** 保留/見送りの選択を反映してメッセージを更新 */

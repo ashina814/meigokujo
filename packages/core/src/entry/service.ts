@@ -4,7 +4,7 @@ import { Settings } from "../settings/service.js";
 import { EventLog } from "../events/service.js";
 
 export type BookingStatus = "booked" | "attended" | "ghosted" | "dropped";
-export type InviterSource = "user" | "disboard" | "none";
+export type InviterSource = "user" | "disboard" | "lumina" | "none";
 
 export interface BookingRow {
   user_id: string;
