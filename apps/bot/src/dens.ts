@@ -60,18 +60,24 @@ export async function handleDenVoice(oldState: VoiceState, newState: VoiceState,
   const guild = newState.guild;
   const catId = services.settings.getString("category:eval_den");
   const parent = catId ? await guild.channels.fetch(catId).catch(() => null) : null;
+  // 定員は親元（トリガー）VCの人数制限を反映（未設定なら spec の既定＝応接室2人など）
+  const trigger = newState.channel;
+  const userLimit = trigger?.userLimit || spec.userLimit;
   const clone = await guild.channels
     .create({
       name: spec.name,
       type: ChannelType.GuildVoice,
       parent: parent?.type === ChannelType.GuildCategory ? parent.id : undefined,
-      userLimit: spec.userLimit,
+      userLimit,
     })
     .catch((e) => {
       console.error("[den] 複製VC作成失敗:", e);
       return null;
     });
   if (!clone) return;
+
+  // 権限をカテゴリに同期（作成直後は上書きが空でカテゴリ設定が効かないため）
+  if (clone.parentId) await clone.lockPermissions().catch((e) => console.error("[den] 権限同期失敗:", e));
 
   await member.voice.setChannel(clone as VoiceChannel).catch(() => undefined);
   registerDen(services, clone.id, kind, spec.reward);
@@ -100,7 +106,7 @@ export async function scanDens(client: Client, services: Services): Promise<void
     const humans = ch ? ch.members.filter((m) => !m.user.bot).size : 0;
 
     if (ch && humans === 0 && now - row.created_at > DEN_GRACE_S) {
-      await ch.delete("冥獣の巣: 無人のため撤収").catch(() => undefined);
+      await ch.delete("冥獣の巣: 無人のため撤収").catch((e) => console.error(`[den] 撤収失敗 ${row.channel_id}:`, e));
     }
     // 報酬対象からの掃除は前日分の計算後（2日）に。VC自体が消えていても登録は残して報酬を保証
     if (now - row.created_at > DEN_WHITELIST_KEEP_S) {

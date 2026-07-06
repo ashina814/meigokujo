@@ -129,7 +129,7 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     }
 
     // ── 部屋のライフサイクル（在室スキャン・削除・期限・募集失効）──
-    await scanRooms(client, services);
+    await scanRooms(client, services).catch((e) => console.error("[room] スキャン失敗:", e));
 
     // ── 冥獣の巣: 無人の複製VC撤収・報酬対象の掃除 ──
     await scanDens(client, services).catch((e) => console.error("[den] スキャン失敗:", e));
