@@ -8,6 +8,7 @@ import {
   Casino,
   Chips,
   Lottery,
+  Poker,
   Races,
   Evaluation,
   EventLog,
@@ -61,7 +62,8 @@ export function buildServices() {
   const chips = new Chips(db, ledger, events);
   const weather = new Weather(settings);
   const casino = new Casino(db, chips, events, Math.random, () => weather.payoutMult());
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, auctions, lottery, races, fiscal, chips, casino, weather };
+  const poker = new Poker(db, chips, events);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, auctions, lottery, races, fiscal, chips, casino, weather, poker };
 }
 
 export type Services = ReturnType<typeof buildServices>;

@@ -16,6 +16,7 @@ import { tipCommand } from "./commands/tip.js";
 import { taxCommand, pensionCommand } from "./commands/fiscal.js";
 import { exchangeCommand } from "./commands/chips.js";
 import { casinoCommand } from "./commands/casino.js";
+import { pokerCommand } from "./commands/poker.js";
 import { weatherCommand } from "./commands/weather.js";
 import { helpCommand } from "./commands/help.js";
 import { operationsCommand } from "./commands/operations.js";
@@ -42,6 +43,7 @@ const commands = [
   tipCommand.toJSON(),
   exchangeCommand.toJSON(),
   casinoCommand.toJSON(),
+  pokerCommand.toJSON(),
   weatherCommand.toJSON(),
   helpCommand.toJSON(),
 ];

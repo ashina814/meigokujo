@@ -92,6 +92,17 @@ export {
 } from "./chips/service.js";
 export { Weather, WEATHER_TYPES, jstDateStr, type WeatherDef } from "./weather/service.js";
 export {
+  Poker,
+  PokerError,
+  evaluateHand,
+  compareHands,
+  POKER_RAKE_BPS,
+  type PokerTable,
+  type ShowdownResult,
+  type HandRank,
+  type PokerErrorCode,
+} from "./poker/service.js";
+export {
   Casino,
   CasinoError,
   HOUSE,
