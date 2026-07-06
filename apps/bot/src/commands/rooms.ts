@@ -294,6 +294,9 @@ async function createAndReply(
     controls.push(new ButtonBuilder().setCustomId(`room:slot:${room.id}`).setLabel("人数枠+1（5,000 Ld）").setStyle(ButtonStyle.Secondary));
   }
   controls.push(new ButtonBuilder().setCustomId(`room:rename:${room.id}`).setLabel("名前を変える").setEmoji("🏷").setStyle(ButtonStyle.Secondary));
+  // 立てた本人がVCにいれば部屋へ移動（すぐ「使用中」になり、退出後は猶予で撤去される）
+  if (owner.voice.channel) await owner.voice.setChannel(channel).catch(() => undefined);
+
   const expiryNote = room.expires_at
     ? kind === "game"
       ? `\n利用期限: <t:${room.expires_at}:t>（10分前に延長案内）`

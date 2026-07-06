@@ -29,7 +29,7 @@ export const SETTING_DEFAULTS = {
   room_oborozuki_price: 30_000,
   room_recruit_expire_hours: 5, // 蜜月の無応募失効
   room_recruit_refund: 2_500, // 失効時の半額返金
-  room_empty_grace_min: 5, // 全員退出からの削除猶予
+  room_empty_grace_min: 1, // 全員退出からの削除猶予
   // bump/up 報酬
   bump_reward: 0, // 金額は運営が設定パネルで決める（0 = 支給しない）
   // 移行（経済設計.md §9）

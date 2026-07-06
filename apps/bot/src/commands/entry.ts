@@ -189,7 +189,10 @@ export async function handleMemberJoin(member: GuildMember, services: Services):
   services.entry.recordJoin(member.id);
 
   const waitRoleId = services.settings.getString("role:queue_wait");
-  if (waitRoleId) await member.roles.add(waitRoleId).catch((e) => console.error("[entry] ロール付与失敗:", e));
+  if (waitRoleId)
+    await member.roles
+      .add(waitRoleId)
+      .catch((e) => console.warn(`[entry] 入城待ちロール付与に失敗（ボットのロールを階級より上へ）: ${(e as Error).message}`));
 
   const guideId = services.settings.getString("channel:entry_guide");
   if (guideId) {

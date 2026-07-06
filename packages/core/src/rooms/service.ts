@@ -229,7 +229,7 @@ export class Rooms {
            OR (activated_at IS NULL AND kind != 'mitsugetsu' AND created_at < ?)
          )`,
       )
-      .all(ts - graceMinutes * 60, ts - 3600) as RoomRow[];
+      .all(ts - graceMinutes * 60, ts - 300) as RoomRow[]; // 未入室のまま5分放置で撤去
   }
 
   /** ゲーム部屋: 期限10分前で未警告のもの */
