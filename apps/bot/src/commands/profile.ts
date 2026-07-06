@@ -87,6 +87,9 @@ export async function handleProfile(
   if (soul?.status === "ghost" && soul.eval_deadline_at) {
     lines.push(`⏳ 審判の刻限: <t:${soul.eval_deadline_at}:R>`);
   }
+  if (soul && soul.eval_extension_days > 0) {
+    lines.push(`🎟 招待による評価期限の延長: **+${soul.eval_extension_days}日**`);
+  }
 
   await interaction.editReply({
     content: lines.length > 0 ? lines.join("\n") : undefined,

@@ -1,12 +1,17 @@
 import {
   ActionRowBuilder,
+  AutocompleteInteraction,
   ButtonBuilder,
   ButtonInteraction,
   ButtonStyle,
   ChatInputCommandInteraction,
   EmbedBuilder,
   MessageFlags,
+  ModalBuilder,
+  ModalSubmitInteraction,
   SlashCommandBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   type Message,
   type TextChannel,
   PermissionFlagsBits,
@@ -16,7 +21,7 @@ import { isAdmin } from "../permissions.js";
 import { entryPanelMessage } from "./entry.js";
 import { ticketPanelMessage } from "./tickets.js";
 import { roomPanelMessage } from "./rooms.js";
-import type { RoomKind } from "@meigokujo/core";
+import { deptAccount, LedgerError, type RoomKind } from "@meigokujo/core";
 import type { Services } from "../services.js";
 
 export const panelCommand = new SlashCommandBuilder()
@@ -32,32 +37,41 @@ export const panelCommand = new SlashCommandBuilder()
       .addChoices(
         { name: "冥獄銀行", value: "bank" },
         { name: "入城申請", value: "entry" },
-        { name: "チケット受付", value: "ticket" },
+        { name: "出戻り申請", value: "ticket_return" },
+        { name: "個別相談", value: "ticket_consult" },
         { name: "宿", value: "room_normal" },
         { name: "蜜月", value: "room_mitsugetsu" },
         { name: "朧月", value: "room_oborozuki" },
         { name: "ゲーム部屋", value: "room_game" },
+        { name: "部署運用（自分の残高と入れ替え）", value: "dept" },
       ),
+  )
+  .addStringOption((o) =>
+    o.setName("部署").setDescription("部署パネルの対象（種別=部署運用のとき必須）").setAutocomplete(true),
   );
 
 const PANEL_KINDS = [
   "bank",
   "entry",
-  "ticket",
+  "ticket_return",
+  "ticket_consult",
   "room_normal",
   "room_mitsugetsu",
   "room_oborozuki",
   "room_game",
+  "dept",
 ] as const;
 
 const PANEL_LABELS: Record<(typeof PANEL_KINDS)[number], string> = {
   bank: "冥獄銀行",
   entry: "入城申請",
-  ticket: "チケット受付",
+  ticket_return: "出戻り申請",
+  ticket_consult: "個別相談",
   room_normal: "宿",
   room_mitsugetsu: "蜜月",
   room_oborozuki: "朧月",
   room_game: "ゲーム部屋",
+  dept: "部署運用",
 };
 
 /** パネル種別 → 部屋種別 */
@@ -94,8 +108,23 @@ export async function handlePanelCommand(
   if (!channel?.isTextBased()) return;
 
   const kind = interaction.options.getString("種別", true) as (typeof PANEL_KINDS)[number];
-  const sent = await channel.send(panelMessageFor(kind));
-  await sent.pin().catch(() => undefined); // ピン留め権限がなくても設置自体は成立させる
+
+  // 部署パネルは対象部署の指定必須。チャンネルと部署の対応表を持たせる
+  if (kind === "dept") {
+    const deptKey = interaction.options.getString("部署");
+    if (!deptKey) {
+      await interaction.reply({ content: "部署運用パネルには「部署」の指定が必要です。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!services.departments.get(deptKey)) {
+      await interaction.reply({ content: `部署「${deptKey}」がありません。\`/運営 部署 作成\` で作成してから設置してください。`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    services.settings.set(`dept_panel_channel:${channel.id}`, deptKey, `user:${interaction.user.id}`);
+  }
+
+  const sent = await channel.send(panelMessageFor(kind, services, channel.id));
+  await sent.pin().catch(() => undefined);
   services.settings.set(`panel:${kind}:${channel.id}`, sent.id, `user:${interaction.user.id}`);
   await interaction.reply({
     content: `✅ ${PANEL_LABELS[kind]}パネルを設置しました（会話で流れたら自動で貼り直します）。`,
@@ -103,12 +132,163 @@ export async function handlePanelCommand(
   });
 }
 
-function panelMessageFor(kind: (typeof PANEL_KINDS)[number]) {
+function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services, channelId: string) {
   if (kind === "entry") return entryPanelMessage();
-  if (kind === "ticket") return ticketPanelMessage();
+  if (kind === "ticket_return") return ticketPanelMessage("return");
+  if (kind === "ticket_consult") return ticketPanelMessage("consult");
+  if (kind === "dept") {
+    const deptKey = services.settings.getString(`dept_panel_channel:${channelId}`) ?? "";
+    return deptPanelMessage(services, deptKey);
+  }
   const roomKind = ROOM_PANEL_KIND[kind];
   if (roomKind) return roomPanelMessage(roomKind);
   return bankPanelMessage();
+}
+
+/** /パネル設置 の「部署」オートコンプリート（種別=dept のとき） */
+export async function handlePanelAutocomplete(
+  interaction: AutocompleteInteraction,
+  services: Services,
+): Promise<void> {
+  const focused = interaction.options.getFocused(true);
+  if (focused.name !== "部署") {
+    await interaction.respond([]).catch(() => undefined);
+    return;
+  }
+  const q = focused.value.toString().toLowerCase();
+  const choices = services.departments
+    .list()
+    .filter((d) => !q || d.name.toLowerCase().includes(q) || d.key.toLowerCase().includes(q))
+    .slice(0, 25)
+    .map((d) => ({ name: d.name, value: d.key }));
+  await interaction.respond(choices).catch(() => undefined);
+}
+
+/** 部署運用パネル: 部署残高を表示し、自分の残高⇄部署でLandを入れ替える */
+function deptPanelMessage(services: Services, deptKey: string) {
+  const dept = deptKey ? services.departments.get(deptKey) : undefined;
+  if (!dept) {
+    const embed = new EmbedBuilder().setTitle("🏛 部署運用パネル").setDescription("この部署は設定されていません。運営に確認してください。").setColor(0x6b7280);
+    return { embeds: [embed], components: [] };
+  }
+  const bal = services.departments.balanceOf(deptKey);
+  const embed = new EmbedBuilder()
+    .setTitle(`🏛 部署「${dept.name}」の運用`)
+    .setDescription(
+      [
+        "このパネルが見える人は、部署の残高を自分の残高と入れ替えできます。",
+        "",
+        `**部署残高**: ${fmtLd(bal)}`,
+        "",
+        "🔵 **入金**: 自分の残高 → 部署（原資積み立て・売上入金）",
+        "🟠 **出金**: 部署 → 自分（部署の支出を自分が受け取る形）",
+        "",
+        "※ 記録はすべて台帳に残ります（監査ログで追跡可）。",
+      ].join("\n"),
+    )
+    .setColor(0x0ea5e9);
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`dept:in:${deptKey}`).setLabel("部署に入金").setEmoji("🔵").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`dept:out:${deptKey}`).setLabel("部署から出金").setEmoji("🟠").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`dept:refresh:${deptKey}`).setLabel("残高更新").setEmoji("🔁").setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+/** 部署パネル: ボタン → 金額入力モーダル → 実行 */
+export async function handleDeptPanelButton(
+  interaction: ButtonInteraction,
+  services: Services,
+): Promise<void> {
+  const [, action, deptKey] = interaction.customId.split(":");
+  if (!deptKey) return;
+  const dept = services.departments.get(deptKey);
+  if (!dept) {
+    await interaction.reply({ content: "部署が見つかりません。運営に確認してください。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (action === "refresh") {
+    await interaction.update(deptPanelMessage(services, deptKey));
+    return;
+  }
+  const modal = new ModalBuilder()
+    .setCustomId(`dept:modal:${action}:${deptKey}`)
+    .setTitle(`「${dept.name}」${action === "in" ? "への入金" : "からの出金"}`)
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("amount").setLabel("金額（Land）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("reason").setLabel("理由（任意メモ）").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200),
+      ),
+    );
+  await interaction.showModal(modal);
+}
+
+export async function handleDeptPanelModal(
+  interaction: ModalSubmitInteraction,
+  services: Services,
+): Promise<void> {
+  const parts = interaction.customId.split(":"); // dept:modal:in|out:deptKey
+  const action = parts[2] as "in" | "out";
+  const deptKey = parts[3]!;
+  const dept = services.departments.get(deptKey);
+  if (!dept) {
+    await interaction.reply({ content: "部署が見つかりません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const amt = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
+  if (!Number.isInteger(amt) || amt <= 0) {
+    await interaction.reply({ content: "金額は正の整数で入力してください。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const reason = interaction.fields.getTextInputValue("reason").trim() || undefined;
+  const uid = interaction.user.id;
+  const account = `user:${uid}`;
+  services.ledger.ensureAccount(account, "user");
+  try {
+    if (action === "in") {
+      services.ledger.transfer({
+        from: account,
+        to: deptAccount(deptKey),
+        amount: amt,
+        type: "dept_in",
+        actor: account,
+        reason: reason ?? `${dept.name} への入金（パネル）`,
+        refType: "dept_panel",
+        refId: deptKey,
+        idempotencyKey: `dept:panel:in:${uid}:${deptKey}:${Date.now()}`,
+      });
+      await interaction.reply({
+        content: `✅ **${dept.name}** に **${fmtLd(amt)}** を入金しました（部署残 ${fmtLd(services.departments.balanceOf(deptKey))}）。`,
+        flags: MessageFlags.Ephemeral,
+      });
+    } else {
+      services.ledger.transfer({
+        from: deptAccount(deptKey),
+        to: account,
+        amount: amt,
+        type: "dept_out",
+        actor: account,
+        reason: reason ?? `${dept.name} からの出金（パネル）`,
+        refType: "dept_panel",
+        refId: deptKey,
+        idempotencyKey: `dept:panel:out:${uid}:${deptKey}:${Date.now()}`,
+      });
+      await interaction.reply({
+        content: `✅ **${dept.name}** から **${fmtLd(amt)}** を受け取りました（部署残 ${fmtLd(services.departments.balanceOf(deptKey))}）。`,
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+  } catch (e) {
+    const msg =
+      e instanceof LedgerError && e.code === "ERR_INSUFFICIENT"
+        ? action === "in"
+          ? "自分の残高が不足しています。"
+          : `部署「${dept.name}」の残高が不足しています。`
+        : "処理に失敗しました。";
+    await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
+  }
 }
 
 export async function handleBankButton(
@@ -184,7 +364,7 @@ export async function maybeRepostPanel(message: Message, services: Services): Pr
     const channel = message.channel as TextChannel;
     const old = await channel.messages.fetch(panelMsgId).catch(() => null);
     if (old) await old.delete().catch(() => undefined);
-    const sent = await channel.send(panelMessageFor(kind));
+    const sent = await channel.send(panelMessageFor(kind, services, channel.id));
     services.settings.set(`panel:${kind}:${channel.id}`, sent.id, "system:panel-repost");
   }
 }

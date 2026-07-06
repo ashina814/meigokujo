@@ -17,21 +17,34 @@ import type { Services } from "../services.js";
 
 const KIND_LABELS: Record<TicketKind, string> = { return: "出戻り申請", consult: "個別相談" };
 
-export function ticketPanelMessage(): MessageCreateOptions {
+/** 単独のチケットパネル。種別ごとに別チャンネルへ設置できる */
+export function ticketPanelMessage(kind: TicketKind): MessageCreateOptions {
+  if (kind === "return") {
+    const embed = new EmbedBuilder()
+      .setTitle("🔄 出戻り申請 受付")
+      .setDescription(
+        [
+          "以前いた方の再入城はこちらから。",
+          "ボタンを押すと、あなたとスタッフだけのプライベートスレッドが開きます。",
+        ].join("\n"),
+      )
+      .setColor(0x0ea5e9);
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("ticket:return").setLabel("出戻り申請").setEmoji("🔄").setStyle(ButtonStyle.Primary),
+    );
+    return { embeds: [embed], components: [row] };
+  }
   const embed = new EmbedBuilder()
-    .setTitle("📮 冥獄城 受付")
+    .setTitle("❓ 個別相談 受付")
     .setDescription(
       [
+        "運営への相談・問い合わせはこちらから。",
         "ボタンを押すと、あなたとスタッフだけのプライベートスレッドが開きます。",
-        "",
-        "🔄 **出戻り申請** — 以前いた方の再入城はこちら",
-        "❓ **個別相談** — その他の相談・問い合わせ",
       ].join("\n"),
     )
     .setColor(0x6b21a8);
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("ticket:return").setLabel("出戻り申請").setEmoji("🔄").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("ticket:consult").setLabel("個別相談").setEmoji("❓").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("ticket:consult").setLabel("個別相談").setEmoji("❓").setStyle(ButtonStyle.Primary),
   );
   return { embeds: [embed], components: [row] };
 }

@@ -67,6 +67,11 @@ export class Entry {
     return this.db.prepare("SELECT * FROM souls WHERE user_id = ?").get(userId) as SoulRow | undefined;
   }
 
+  /** 指定ステータスの魂を列挙（評価スレッド日次更新等の一括処理用） */
+  listSouls(status: SoulRow["status"]): SoulRow[] {
+    return this.db.prepare("SELECT * FROM souls WHERE status = ? ORDER BY ghost_at").all(status) as SoulRow[];
+  }
+
   getBooking(userId: string): BookingRow | undefined {
     return this.db.prepare("SELECT * FROM entry_bookings WHERE user_id = ?").get(userId) as
       | BookingRow

@@ -5,6 +5,7 @@ import { threadTitleFor } from "./commands/evaluation.js";
 import { checkBumpCooldowns } from "./bump.js";
 import { scanRooms } from "./rooms-lifecycle.js";
 import { scanDens } from "./dens.js";
+import { refreshEvalStats } from "./eval-daily.js";
 import { applyVcRanks } from "./vc-ranks.js";
 import { updateDashboard } from "./dashboard.js";
 import { announceResult, refreshAuctionPanel } from "./commands/auction.js";
@@ -141,6 +142,15 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       if (!services.settings.getString(marker)) {
         services.settings.set(marker, "1", "system:scheduler");
         await payVcRewards(client, services, yesterday);
+      }
+    }
+
+    // ── 評価スレッドの実績サマリ更新（毎日 05:30 頃）──
+    if (now.hour === 5 && now.minute >= 30 && now.minute < 33) {
+      const marker = `eval_stats:refreshed:${now.dateStr}`;
+      if (!services.settings.getString(marker)) {
+        services.settings.set(marker, "1", "system:scheduler");
+        await refreshEvalStats(client, services).catch((e) => console.error("[評価] 実績更新失敗:", e));
       }
     }
 

@@ -3,7 +3,14 @@ import { config } from "./config.js";
 import { buildServices } from "./services.js";
 import { handleSettings } from "./commands/settings.js";
 import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
-import { handleBankButton, handlePanelCommand, maybeRepostPanel } from "./commands/bank-panel.js";
+import {
+  handleBankButton,
+  handleDeptPanelButton,
+  handleDeptPanelModal,
+  handlePanelAutocomplete,
+  handlePanelCommand,
+  maybeRepostPanel,
+} from "./commands/bank-panel.js";
 import { handleAdjust } from "./commands/adjust.js";
 import {
   handleEntryButton,
@@ -22,7 +29,6 @@ import { handlePromote } from "./commands/promote.js";
 import { handleDashboardCommand } from "./commands/dashboard-command.js";
 import { handleProfile } from "./commands/profile.js";
 import { handleDepartment, handleDepartmentAutocomplete } from "./commands/department.js";
-import { handleTip } from "./commands/tip.js";
 import { handleAuctionButton, handleAuctionBidModal } from "./commands/auction.js";
 import { handleLotteryButton, handleLotteryBuyModal } from "./commands/lottery.js";
 import { handleRaceSelect, handleRaceBetModal } from "./commands/race.js";
@@ -109,9 +115,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "部署":
           await handleDepartment(interaction, services);
           return;
-        case "投げ銭":
-          await handleTip(interaction, services);
-          return;
         case "冥府税":
           await handleTaxCommand(interaction, services);
           return;
@@ -143,6 +146,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleDepartmentAutocomplete(interaction, services);
       } else if (interaction.commandName === "カジノ") {
         await handleCasinoAutocomplete(interaction, services);
+      } else if (interaction.commandName === "パネル設置") {
+        await handlePanelAutocomplete(interaction, services);
       }
       return;
     }
@@ -152,6 +157,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("room:recruit:")) {
       await handleRecruitModal(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("dept:modal:")) {
+      await handleDeptPanelModal(interaction, services);
       return;
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("room:renamemodal:")) {
@@ -224,6 +233,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("pok:")) {
         await handlePokerButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("dept:")) {
+        await handleDeptPanelButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("tf:")) {
