@@ -5,7 +5,6 @@ import { handleSettings } from "./commands/settings.js";
 import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
 import { handleBankButton, handlePanelCommand, maybeRepostPanel } from "./commands/bank-panel.js";
 import { handleAdjust } from "./commands/adjust.js";
-import { handleMigration, handleMigrationButton } from "./commands/migration.js";
 import {
   handleEntryButton,
   handleMemberJoin,
@@ -90,9 +89,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "給与支給":
           await handlePaydayCommand(interaction, services);
-          return;
-        case "移行":
-          await handleMigration(interaction, services);
           return;
         case "審判":
           if (interaction.options.getSubcommand() === "昇格") await handlePromote(interaction, services);
@@ -237,8 +233,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleBankButton(interaction, services);
       } else if (interaction.customId.startsWith("pay:")) {
         await handlePaydayButton(interaction, services);
-      } else if (interaction.customId.startsWith("mig:")) {
-        await handleMigrationButton(interaction, services);
       } else if (interaction.customId.startsWith("fis:")) {
         await handleFiscalButton(interaction, services);
       }

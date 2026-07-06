@@ -6,7 +6,6 @@ import { panelCommand } from "./commands/bank-panel.js";
 import { adjustCommand } from "./commands/adjust.js";
 import { salaryTableCommand } from "./commands/salary-table.js";
 import { paydayCommand } from "./commands/payday-command.js";
-import { migrationCommand } from "./commands/migration.js";
 import { sessionCommand } from "./commands/entry.js";
 import { evaluationCommand } from "./commands/evaluation.js";
 import { dashboardCommand } from "./commands/dashboard-command.js";
@@ -29,7 +28,6 @@ const commands = [
   adjustCommand.toJSON(),
   salaryTableCommand.toJSON(),
   paydayCommand.toJSON(),
-  migrationCommand.toJSON(),
   dashboardCommand.toJSON(),
   taxCommand.toJSON(),
   pensionCommand.toJSON(),
