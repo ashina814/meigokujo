@@ -5,6 +5,17 @@ import { EventLog } from "../events/service.js";
 
 export type RoomKind = "normal" | "mitsugetsu" | "oborozuki" | "game";
 
+export type RoomErrorCode = "ERR_ALREADY_OWNS";
+export class RoomError extends Error {
+  constructor(readonly code: RoomErrorCode, readonly meta: Record<string, unknown> = {}) {
+    super(code);
+    this.name = "RoomError";
+  }
+}
+
+/** 蜜月・朧月の自動クローズまでの時間（12時間） */
+const LOVE_ROOM_TTL_S = 12 * 3600;
+
 export interface RoomRow {
   id: number;
   kind: RoomKind;
@@ -73,12 +84,22 @@ export class Rooms {
    * チャンネル作成後に呼ぶ: 課金して部屋を登録する。
    * 課金が失敗（残高不足等）で throw した場合、呼び出し側がチャンネルを片付ける。
    */
+  /** そのオーナーが今オープン中の部屋を持っているか（一人一部屋の制限用） */
+  ownerHasOpenRoom(ownerId: string): boolean {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS c FROM rooms WHERE owner_id = ? AND status = 'open'")
+      .get(ownerId) as { c: number };
+    return row.c > 0;
+  }
+
   register(input: {
     kind: RoomKind;
     channelId: string;
     ownerId: string;
     hours?: number; // game のみ
   }): RoomRow {
+    // 一人一部屋の制限は bot 側（作成前）に ownerHasOpenRoom() で弾く。
+    // ここは台帳の記録層なので強制はしない（運営操作や将来の例外に備える）。
     const price = this.priceFor(input.kind, input.hours);
     if (price > 0) {
       const account = `user:${input.ownerId}`;
@@ -96,7 +117,12 @@ export class Rooms {
       });
     }
     const ts = now();
-    const expiresAt = input.kind === "game" && input.hours ? ts + input.hours * 3600 : null;
+    const expiresAt =
+      input.kind === "game" && input.hours
+        ? ts + input.hours * 3600
+        : input.kind === "mitsugetsu" || input.kind === "oborozuki"
+          ? ts + LOVE_ROOM_TTL_S // 蜜月・朧月は12時間で自動クローズ
+          : null;
     const result = this.db
       .prepare(
         `INSERT INTO rooms (kind, channel_id, owner_id, capacity, expires_at, status, created_at, updated_at)
@@ -221,10 +247,10 @@ export class Rooms {
     this.db.prepare("UPDATE rooms SET warned_at = ?, updated_at = ? WHERE id = ?").run(now(), now(), roomId);
   }
 
-  /** ゲーム部屋: 期限切れ */
-  expiredGames(): RoomRow[] {
+  /** 期限切れの部屋（ゲームの利用期限・蜜月/朧月の12時間上限） */
+  expiredRooms(): RoomRow[] {
     return this.db
-      .prepare("SELECT * FROM rooms WHERE status = 'open' AND kind = 'game' AND expires_at IS NOT NULL AND expires_at < ?")
+      .prepare("SELECT * FROM rooms WHERE status = 'open' AND expires_at IS NOT NULL AND expires_at < ?")
       .all(now()) as RoomRow[];
   }
 

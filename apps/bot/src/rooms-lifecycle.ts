@@ -37,8 +37,8 @@ export async function scanRooms(client: Client, services: Services): Promise<voi
     }
   }
 
-  // ③ ゲーム部屋: 期限切れ → 閉じる
-  for (const room of services.rooms.expiredGames()) {
+  // ③ 期限切れ → 閉じる（ゲームの利用期限・蜜月/朧月の12時間上限）
+  for (const room of services.rooms.expiredRooms()) {
     const channel = (await guild.channels.fetch(room.channel_id).catch(() => null)) as VoiceChannel | null;
     services.rooms.close(room.id, "利用期限切れ");
     await channel?.delete("利用期限切れ").catch(() => undefined);

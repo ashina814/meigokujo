@@ -33,7 +33,7 @@ import { handlePokerCommand, handlePokerButton, handlePokerSelect } from "./comm
 import { handleOperations, handleOperationsAutocomplete } from "./commands/operations.js";
 import { handleWeatherCommand } from "./commands/weather.js";
 import { handleHelpCommand } from "./commands/help.js";
-import { handleRoomButton, handleRecruitModal } from "./commands/rooms.js";
+import { handleRoomButton, handleRecruitModal, handleRoomRenameModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
@@ -152,6 +152,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("room:recruit:")) {
       await handleRecruitModal(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("room:renamemodal:")) {
+      await handleRoomRenameModal(interaction, services);
       return;
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("auc:bidmodal:")) {

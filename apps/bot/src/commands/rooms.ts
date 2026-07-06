@@ -119,11 +119,16 @@ async function createRoomChannel(
     overwrites.push({ id: owner.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] });
   }
 
+  // 定員: 宿/蜜月/朧月は「2人＋音楽ボット1」で3。ゲームは無制限。
+  // ※管理者・「メンバーを移動」権限持ちは Discord 仕様で定員を無視して入れる
+  const userLimit = kind === "game" ? undefined : 3;
+
   const channel = await guild.channels
     .create({
       name: `${KIND_LABELS[kind]}-${owner.displayName}`.slice(0, 90),
       type: ChannelType.GuildVoice,
       parent: category ?? undefined,
+      userLimit,
       permissionOverwrites: overwrites.length > 0 ? overwrites : undefined,
     })
     .catch((e) => {
@@ -214,6 +219,11 @@ export async function handleRoomButton(
     return;
   }
 
+  if (id.startsWith("room:rename:") && interaction.isButton()) {
+    await handleRenameButton(interaction, services);
+    return;
+  }
+
   if (id.startsWith("room:extend:") && interaction.isButton()) {
     const [, , roomIdStr, hoursStr] = id.split(":");
     const roomId = Number(roomIdStr);
@@ -241,6 +251,14 @@ async function createAndReply(
 ): Promise<void> {
   const guild = interaction.guild!;
   const owner = (await guild.members.fetch(interaction.user.id)) as GuildMember;
+
+  // 一人一部屋: すでにオープン中の部屋を持っていたら弾く
+  if (services.rooms.ownerHasOpenRoom(owner.id)) {
+    const msg = "すでに部屋を持っています。今の部屋を閉じてから、新しく立ててください（全員退出で自動的に閉じます）。";
+    if (interaction.isButton()) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
+    else await interaction.update({ content: msg, components: [] });
+    return;
+  }
 
   // 先に残高チェック（チャンネルを作ってから課金失敗で消す無駄を避ける）
   const price = services.rooms.priceFor(kind, opts.hours);
@@ -270,12 +288,17 @@ async function createAndReply(
     return;
   }
 
-  // 部屋内に操作パネル（宿は枠追加、ゲームは延長案内）
+  // 部屋内に操作パネル（宿は枠追加、全部屋で名前変更、ゲームは延長案内）
   const controls: ButtonBuilder[] = [];
   if (kind === "normal") {
     controls.push(new ButtonBuilder().setCustomId(`room:slot:${room.id}`).setLabel("人数枠+1（5,000 Ld）").setStyle(ButtonStyle.Secondary));
   }
-  const expiryNote = room.expires_at ? `\n利用期限: <t:${room.expires_at}:t>（10分前に延長案内）` : "";
+  controls.push(new ButtonBuilder().setCustomId(`room:rename:${room.id}`).setLabel("名前を変える").setEmoji("🏷").setStyle(ButtonStyle.Secondary));
+  const expiryNote = room.expires_at
+    ? kind === "game"
+      ? `\n利用期限: <t:${room.expires_at}:t>（10分前に延長案内）`
+      : `\n自動クローズ: <t:${room.expires_at}:R>（12時間の時間制限）`
+    : "";
   await channel.send({
     content: `${KIND_LABELS[kind]}を開きました（オーナー: <@${owner.id}>）。全員が退出すると自動で消えます。${expiryNote}`,
     components: controls.length > 0 ? [new ActionRowBuilder<ButtonBuilder>().addComponents(...controls)] : [],
@@ -290,11 +313,67 @@ async function handleAddSlot(interaction: ButtonInteraction, services: Services)
   const roomId = Number(interaction.customId.split(":")[2]);
   try {
     const room = services.rooms.addSlot(roomId, interaction.user.id);
-    await interaction.reply({ content: `✅ <@${interaction.user.id}> が枠を追加しました（定員 ${room.capacity}人）。`, allowedMentions: { parse: [] } });
+    // VC定員も追随（人数枠 + 音楽ボット1）
+    const ch = interaction.channel;
+    if (ch && ch.type === ChannelType.GuildVoice) {
+      await (ch as VoiceChannel).setUserLimit(room.capacity + 1).catch(() => undefined);
+    }
+    await interaction.reply({ content: `✅ <@${interaction.user.id}> が枠を追加しました（定員 ${room.capacity}人＋ボット）。`, allowedMentions: { parse: [] } });
   } catch (e) {
     const msg = e instanceof LedgerError && e.code === "ERR_INSUFFICIENT" ? "残高が足りません。" : "枠の追加に失敗しました。";
     await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
   }
+}
+
+/** 部屋の名前変更ボタン → モーダルを開く（オーナーのみ） */
+async function handleRenameButton(interaction: ButtonInteraction, services: Services): Promise<void> {
+  const roomId = Number(interaction.customId.split(":")[2]);
+  const room = services.rooms.byChannel(interaction.channelId) ?? (Number.isFinite(roomId) ? services.rooms.get(roomId) : undefined);
+  if (!room || room.status !== "open") {
+    await interaction.reply({ content: "この部屋は見つかりませんでした。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (interaction.user.id !== room.owner_id) {
+    await interaction.reply({ content: "名前を変えられるのは部屋のオーナーだけです。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const modal = new ModalBuilder()
+    .setCustomId(`room:renamemodal:${room.id}`)
+    .setTitle("部屋の名前を変える")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("name").setLabel("新しい名前").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(90),
+      ),
+    );
+  await interaction.showModal(modal);
+}
+
+/** 部屋の名前変更モーダル送信 → VC名を変更 */
+export async function handleRoomRenameModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
+  const roomId = Number(interaction.customId.split(":")[2]);
+  let room;
+  try {
+    room = services.rooms.get(roomId);
+  } catch {
+    await interaction.reply({ content: "この部屋は見つかりませんでした。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (interaction.user.id !== room.owner_id) {
+    await interaction.reply({ content: "名前を変えられるのは部屋のオーナーだけです。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const name = interaction.fields.getTextInputValue("name").trim().slice(0, 90);
+  if (!name) {
+    await interaction.reply({ content: "名前を入力してください。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const channel = (await interaction.guild!.channels.fetch(room.channel_id).catch(() => null)) as VoiceChannel | null;
+  if (!channel) {
+    await interaction.reply({ content: "部屋が見つかりませんでした。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await channel.setName(name).catch(() => undefined);
+  await interaction.reply({ content: `✅ 部屋の名前を「${name}」に変えました。`, flags: MessageFlags.Ephemeral });
 }
 
 // ---- 蜜月の匿名募集 ----
@@ -322,6 +401,10 @@ export async function handleRecruitModal(interaction: ModalSubmitInteraction, se
   const owner = (await guild.members.fetch(interaction.user.id)) as GuildMember;
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
+  if (services.rooms.ownerHasOpenRoom(owner.id)) {
+    await interaction.editReply({ content: "すでに部屋を持っています。今の部屋を閉じてから募集を出してください。" });
+    return;
+  }
   if (services.ledger.balanceOf(`user:${owner.id}`) < services.rooms.priceFor("mitsugetsu")) {
     await interaction.editReply({ content: "残高が足りません（5,000 Ld）。" });
     return;

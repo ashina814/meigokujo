@@ -41,21 +41,26 @@ export async function handleProfile(
 
   const soul = services.entry.getSoul(target.id);
   const balance = services.ledger.balanceOf(`user:${target.id}`);
-  const daysInCastle = soul?.ghost_at ? Math.floor((Date.now() / 1000 - soul.ghost_at) / 86_400) : 0;
+
+  // 鯖のニックネーム・アバター・参加日を確実に読むため cache ではなく fetch する
+  const member = (await interaction.guild?.members.fetch(target.id).catch(() => null)) as
+    | GuildMember
+    | null;
+
+  // 在城日数はサーバー参加日から逆算（無ければ亡霊化時刻）
+  const joinedSec = member?.joinedTimestamp ? Math.floor(member.joinedTimestamp / 1000) : null;
+  const anchorSec = joinedSec ?? soul?.ghost_at ?? null;
+  const daysInCastle = anchorSec ? Math.floor((Date.now() / 1000 - anchorSec) / 86_400) : 0;
   const presence = services.vc.presence(target.id, 36_500);
   const vcHours = Math.floor(presence.totalSeconds / 3600);
   const titles = services.titles.list(target.id);
 
-  // 鯖のニックネーム（表示名）を確実に読むため cache ではなく fetch する
-  const member = (await interaction.guild?.members.fetch(target.id).catch(() => null)) as
-    | GuildMember
-    | null;
   const rank = soul ? (RANK_LABEL[soul.status] ?? soul.status) : "記録なし";
   const displayName = member?.displayName ?? target.globalName ?? target.username;
 
   const png = await renderProfileCard({
     displayName,
-    avatarUrl: target.displayAvatarURL({ extension: "png", size: 256 }),
+    avatarUrl: (member ?? target).displayAvatarURL({ extension: "png", size: 256 }),
     rank,
     balanceText: fmtLdCompact(balance),
     daysInCastle,
