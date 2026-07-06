@@ -211,8 +211,11 @@ export function handleVoiceAttendance(
   services: Services,
 ): void {
   if (!next.channelId || next.member?.user.bot) return;
-  const sessionVcId = services.settings.getString("channel:session_vc");
-  if (next.channelId !== sessionVcId) return;
+  const sessionVcIds = [
+    services.settings.getString("channel:session_vc"),
+    services.settings.getString("channel:session_vc2"),
+  ].filter((v): v is string => !!v);
+  if (!sessionVcIds.includes(next.channelId)) return;
 
   const booking = services.entry.getBooking(next.id);
   if (!booking || booking.status !== "booked") return;
@@ -288,15 +291,19 @@ export const sessionCommand = new SlashCommandBuilder()
       .addUserOption((o) => o.setName("対象").setDescription("昇格させる亡霊").setRequired(true)),
   );
 
+/** 審判を使えるのは 運営 / 面接担当 / 魔剣士 / 審 のいずれか */
+const JUDGE_ROLE_KINDS = ["judge", "swordsman", "shin"] as const;
 function isJudge(
   interaction: ChatInputCommandInteraction | ButtonInteraction | UserSelectMenuInteraction,
   services: Services,
 ): boolean {
   if (isAdmin(interaction, services)) return true;
-  const judgeRoleId = services.settings.getString("role:judge");
-  if (!judgeRoleId) return false;
   const member = interaction.member as GuildMember | null;
-  return member?.roles.cache.has(judgeRoleId) ?? false;
+  if (!member) return false;
+  return JUDGE_ROLE_KINDS.some((kind) => {
+    const rid = services.settings.getString(`role:${kind}`);
+    return rid ? member.roles.cache.has(rid) : false;
+  });
 }
 
 export async function handleSessionCommand(
