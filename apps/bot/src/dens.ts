@@ -23,7 +23,7 @@ const DENS: Record<string, DenSpec> = {
   reception: { settingKey: "vc:den_reception", name: "応接室", evaluatorOnly: true, reward: false, userLimit: 2 },
 };
 
-const DEN_GRACE_S = 120; // 生成直後・一瞬の無人での誤削除を避ける猶予
+const DEN_GRACE_S = 0; // 猶予なし: 無人になったら次のスキャンで即撤収
 const DEN_WHITELIST_KEEP_S = 2 * 86_400; // 前日分の報酬計算まで報酬対象に残す
 
 function triggerKind(services: Services, channelId: string): keyof typeof DENS | null {

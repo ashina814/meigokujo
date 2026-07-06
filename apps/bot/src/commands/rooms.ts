@@ -119,9 +119,9 @@ async function createRoomChannel(
     overwrites.push({ id: owner.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] });
   }
 
-  // 定員: 宿/蜜月/朧月は「2人＋音楽ボット1」で3。ゲームは無制限。
+  // 定員: 宿は2人（枠+1で増える）。蜜月/朧月は「2人＋音楽ボット1」で3。ゲームは無制限。
   // ※管理者・「メンバーを移動」権限持ちは Discord 仕様で定員を無視して入れる
-  const userLimit = kind === "game" ? undefined : 3;
+  const userLimit = kind === "game" ? undefined : kind === "normal" ? 2 : 3;
 
   const channel = await guild.channels
     .create({
@@ -311,14 +311,19 @@ async function createAndReply(
 
 async function handleAddSlot(interaction: ButtonInteraction, services: Services): Promise<void> {
   const roomId = Number(interaction.customId.split(":")[2]);
+  // そのVCにいる人なら（オーナーでなくても）枠を増やせる
+  const ch = interaction.channel;
+  if (ch && ch.type === ChannelType.GuildVoice && !(ch as VoiceChannel).members.has(interaction.user.id)) {
+    await interaction.reply({ content: "このVCに入ってから枠を追加してください。", flags: MessageFlags.Ephemeral });
+    return;
+  }
   try {
     const room = services.rooms.addSlot(roomId, interaction.user.id);
-    // VC定員も追随（人数枠 + 音楽ボット1）
-    const ch = interaction.channel;
+    // VC定員も追随（宿の定員＝人数枠）
     if (ch && ch.type === ChannelType.GuildVoice) {
-      await (ch as VoiceChannel).setUserLimit(room.capacity + 1).catch(() => undefined);
+      await (ch as VoiceChannel).setUserLimit(room.capacity).catch(() => undefined);
     }
-    await interaction.reply({ content: `✅ <@${interaction.user.id}> が枠を追加しました（定員 ${room.capacity}人＋ボット）。`, allowedMentions: { parse: [] } });
+    await interaction.reply({ content: `✅ <@${interaction.user.id}> が枠を追加しました（定員 ${room.capacity}人）。`, allowedMentions: { parse: [] } });
   } catch (e) {
     const msg = e instanceof LedgerError && e.code === "ERR_INSUFFICIENT" ? "残高が足りません。" : "枠の追加に失敗しました。";
     await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
