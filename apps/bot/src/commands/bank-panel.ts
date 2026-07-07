@@ -51,6 +51,31 @@ export const panelCommand = new SlashCommandBuilder()
     o.setName("部署").setDescription("部署パネルの対象（種別=部署運用のとき必須）").setAutocomplete(true),
   );
 
+/** /パネル撤去 — このチャンネルに置いた指定種別のパネルを削除する */
+export const panelRemoveCommand = new SlashCommandBuilder()
+  .setName("パネル撤去")
+  .setDescription("このチャンネルに設置した常設パネルを削除する（運営専用）")
+  .setDMPermission(false)
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+  .addStringOption((o) =>
+    o
+      .setName("種別")
+      .setDescription("撤去するパネル")
+      .setRequired(true)
+      .addChoices(
+        { name: "冥獄銀行", value: "bank" },
+        { name: "入城申請", value: "entry" },
+        { name: "時間外希望受付", value: "entry_flex" },
+        { name: "出戻り申請", value: "ticket_return" },
+        { name: "個別相談", value: "ticket_consult" },
+        { name: "宿", value: "room_normal" },
+        { name: "蜜月", value: "room_mitsugetsu" },
+        { name: "朧月", value: "room_oborozuki" },
+        { name: "ゲーム部屋", value: "room_game" },
+        { name: "部署運用（自分の残高と入れ替え）", value: "dept" },
+      ),
+  );
+
 const PANEL_KINDS = [
   "bank",
   "entry",
@@ -131,6 +156,44 @@ export async function handlePanelCommand(
   services.settings.set(`panel:${kind}:${channel.id}`, sent.id, `user:${interaction.user.id}`);
   await interaction.reply({
     content: `✅ ${PANEL_LABELS[kind]}パネルを設置しました（会話で流れたら自動で貼り直します）。`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+/** /パネル撤去 の本体 */
+export async function handlePanelRemove(
+  interaction: ChatInputCommandInteraction,
+  services: Services,
+): Promise<void> {
+  if (!isAdmin(interaction, services)) {
+    await interaction.reply({ content: "この操作には城の管理権限が必要です。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const channel = interaction.channel as TextChannel | null;
+  if (!channel?.isTextBased()) return;
+
+  const kind = interaction.options.getString("種別", true) as (typeof PANEL_KINDS)[number];
+  const settingKey = `panel:${kind}:${channel.id}`;
+  const panelMsgId = services.settings.getString(settingKey);
+  if (!panelMsgId) {
+    await interaction.reply({
+      content: `このチャンネルに ${PANEL_LABELS[kind]}パネルは設置されていません。`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  // メッセージを削除（既に削除済みでも設定は掃除する）
+  const msg = await channel.messages.fetch(panelMsgId).catch(() => null);
+  if (msg) await msg.delete().catch(() => undefined);
+
+  // 設定を消去。部署パネルはチャンネル→部署の紐付けも掃除
+  const actor = `user:${interaction.user.id}`;
+  services.settings.delete(settingKey, actor);
+  if (kind === "dept") services.settings.delete(`dept_panel_channel:${channel.id}`, actor);
+
+  await interaction.reply({
+    content: `✅ ${PANEL_LABELS[kind]}パネルを撤去しました${msg ? "" : "（メッセージは既に削除されていました）"}。`,
     flags: MessageFlags.Ephemeral,
   });
 }

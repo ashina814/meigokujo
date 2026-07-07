@@ -89,4 +89,18 @@ export class Settings {
     });
     tx();
   }
+
+  /** キーを削除。監査ログに setting_deleted を残す */
+  delete(key: string, actor: string = "system"): void {
+    const ts = now();
+    const tx = this.db.transaction(() => {
+      const r = this.db.prepare("DELETE FROM settings WHERE key = ?").run(key);
+      if (r.changes > 0) {
+        this.db
+          .prepare("INSERT INTO outbox (kind, payload, created_at) VALUES ('audit_log', ?, ?)")
+          .run(JSON.stringify({ event: "setting_deleted", key, actor }), ts);
+      }
+    });
+    tx();
+  }
 }

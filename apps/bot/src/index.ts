@@ -11,6 +11,7 @@ import {
   handleDeptPanelModal,
   handlePanelAutocomplete,
   handlePanelCommand,
+  handlePanelRemove,
   maybeRepostPanel,
 } from "./commands/bank-panel.js";
 import { handleAdjust } from "./commands/adjust.js";
@@ -101,6 +102,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "パネル設置":
           await handlePanelCommand(interaction, services);
+          return;
+        case "パネル撤去":
+          await handlePanelRemove(interaction, services);
           return;
         case "調整":
           await handleAdjust(interaction, services);

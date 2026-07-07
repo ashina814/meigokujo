@@ -2,7 +2,7 @@ import { REST, Routes } from "discord.js";
 import { config } from "./config.js";
 import { settingsCommand } from "./commands/settings.js";
 import { transferCommand } from "./commands/transfer.js";
-import { panelCommand } from "./commands/bank-panel.js";
+import { panelCommand, panelRemoveCommand } from "./commands/bank-panel.js";
 import { adjustCommand } from "./commands/adjust.js";
 import { salaryTableCommand } from "./commands/salary-table.js";
 import { paydayCommand } from "./commands/payday-command.js";
@@ -25,6 +25,7 @@ const commands = [
   settingsCommand.toJSON(),
   operationsCommand.toJSON(),
   panelCommand.toJSON(),
+  panelRemoveCommand.toJSON(),
   adjustCommand.toJSON(),
   salaryTableCommand.toJSON(),
   paydayCommand.toJSON(),
