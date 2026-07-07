@@ -582,10 +582,11 @@ async function ghostifyOne(
     if (waitRoleId) await member.roles.remove(waitRoleId).catch(() => undefined);
     if (ghostRoleId) await member.roles.add(ghostRoleId).catch(() => undefined);
 
-    // 招待者の称号を即評価。新規獲得があれば本人にDMで通知（勧誘者・冥獄の伝道師）
+    // 招待者への波及処理: 称号評価 + 招待による昇格印の閾値到達チェック
     const inviteeSoul = services.entry.getSoul(userId);
     const inviterId = inviteeSoul?.inviter_user_id;
     if (inviterId) {
+      // 称号評価（勧誘者・冥獄の伝道師）
       const newlyGranted = services.titles.evaluate(inviterId);
       if (newlyGranted.length > 0) {
         const inviter = await guild.members.fetch(inviterId).catch(() => null);
@@ -595,12 +596,50 @@ async function ghostifyOne(
           )
           .catch(() => undefined);
       }
+      // 招待による昇格印スコアが閾値に達したか（招待者が亡霊で評価期間中の場合のみ）
+      await checkInvitePromotion(guild, services, inviterId).catch((e) =>
+        console.error(`[entry] 招待昇格チェック失敗 ${inviterId}:`, e),
+      );
     }
     return { ok: true, granted: result.granted };
   } catch (e) {
     console.error(`[entry] 亡霊化失敗 ${userId}:`, e);
     return { ok: false, granted: 0 };
   }
+}
+
+/**
+ * 招待による昇格印スコアが閾値に到達したかチェック（招待者が亡霊のみ対象）。
+ * 到達していたら面談待ちロールを付与し、集令チャンネルで審に通知する。
+ * 冪等: 既に面談待ちロールを持っていれば何もしない。
+ */
+async function checkInvitePromotion(guild: Guild, services: Services, inviterId: string): Promise<void> {
+  const soul = services.entry.getSoul(inviterId);
+  if (!soul || soul.status !== "ghost") return; // 亡霊以外は昇格対象外
+  const score = services.evaluation.promotionScore(inviterId);
+  const required = services.settings.getNumber("promotion_marks_required");
+  if (score.total < required) return;
+
+  const member = await guild.members.fetch(inviterId).catch(() => null);
+  if (!member) return;
+  const mendanRoleId = services.settings.getString("role:mendan");
+  if (mendanRoleId && member.roles.cache.has(mendanRoleId)) return; // 既に面談待ちなら通知しない
+  if (mendanRoleId) await member.roles.add(mendanRoleId).catch(() => undefined);
+
+  const shureiId = services.settings.getString("channel:shurei");
+  const shinRoleId = services.settings.getString("role:shin");
+  if (shureiId) {
+    const channel = await guild.client.channels.fetch(shureiId).catch(() => null);
+    if (channel?.isTextBased() && "send" in channel) {
+      await channel
+        .send(
+          `⚔️ ${shinRoleId ? `<@&${shinRoleId}> ` : ""}<@${inviterId}> の昇格印が **${score.total}/${required}** に到達しました（評価${score.evalMarks} + 招待${score.inviteScore}）。昇格面談をお願いします。`,
+        )
+        .catch(() => undefined);
+    }
+  }
+  await member.send(`🎉 招待実績で昇格印が **${score.total}/${required}** に到達しました。面談待ちロールが付き、審に通知されました。`).catch(() => undefined);
+  console.log(`[entry] 招待経由で面談待ち到達: ${inviterId} (score=${score.total})`);
 }
 
 // ---- 時間外・個別希望: チケット（非公開スレッド）で柔軟に面接 ----
