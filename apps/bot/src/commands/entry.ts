@@ -581,6 +581,21 @@ async function ghostifyOne(
     const ghostRoleId = services.settings.getString("role:ghost");
     if (waitRoleId) await member.roles.remove(waitRoleId).catch(() => undefined);
     if (ghostRoleId) await member.roles.add(ghostRoleId).catch(() => undefined);
+
+    // 招待者の称号を即評価。新規獲得があれば本人にDMで通知（勧誘者・冥獄の伝道師）
+    const inviteeSoul = services.entry.getSoul(userId);
+    const inviterId = inviteeSoul?.inviter_user_id;
+    if (inviterId) {
+      const newlyGranted = services.titles.evaluate(inviterId);
+      if (newlyGranted.length > 0) {
+        const inviter = await guild.members.fetch(inviterId).catch(() => null);
+        await inviter
+          ?.send(
+            `🎉 <@${userId}> さんを招待した実績で新たな称号を獲得しました:\n${newlyGranted.map((t) => `${t.emoji} **${t.name}** — ${t.desc}`).join("\n")}`,
+          )
+          .catch(() => undefined);
+      }
+    }
     return { ok: true, granted: result.granted };
   } catch (e) {
     console.error(`[entry] 亡霊化失敗 ${userId}:`, e);
