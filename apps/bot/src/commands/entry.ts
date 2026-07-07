@@ -177,14 +177,18 @@ export async function handleMemberRoleUpdate(
   const before = oldMember.roles.cache;
   const after = newMember.roles.cache;
   const added = after.filter((r) => !before.has(r.id));
-  if (added.size === 0) return;
+  const removed = before.filter((r) => !after.has(r.id));
 
   const ghostRoleId = services.settings.getString("role:ghost");
   const maleRoleId = services.settings.getString("role:male");
   const femaleRoleId = services.settings.getString("role:female");
+  const majinRoleId = services.settings.getString("role:majin");
+  const mazokuRoleId = services.settings.getString("role:mazoku");
+  const meireiRoleId = services.settings.getString("role:meirei");
+  const waitRoleId = services.settings.getString("role:queue_wait");
 
   // ① 亡霊ロールが手動付与された → ghostify（冪等）
-  if (ghostRoleId && added.has(ghostRoleId)) {
+  if (added.size > 0 && ghostRoleId && added.has(ghostRoleId)) {
     const soul = services.entry.getSoul(newMember.id);
     if (!soul || soul.status !== "ghost") {
       const r = await ghostifyOne(newMember.guild, services, newMember.id, "system:role-add");
@@ -193,13 +197,26 @@ export async function handleMemberRoleUpdate(
   }
 
   // ② 性別ロールが後付けされた → 招待延長を後追い適用
-  if (maleRoleId && added.has(maleRoleId)) {
+  if (added.size > 0 && maleRoleId && added.has(maleRoleId)) {
     const ext = services.entry.applyInviteeGenderExtension(newMember.id, "male");
     if (ext > 0) console.log(`[entry] 後追い招待延長(男): +${ext}日 for ${newMember.id}`);
   }
-  if (femaleRoleId && added.has(femaleRoleId)) {
+  if (added.size > 0 && femaleRoleId && added.has(femaleRoleId)) {
     const ext = services.entry.applyInviteeGenderExtension(newMember.id, "female");
     if (ext > 0) console.log(`[entry] 後追い招待延長(女): +${ext}日 for ${newMember.id}`);
+  }
+
+  // ③ 亡霊ロールが剥奪された（他の階級ロールが同時に付いていない）→ 案内待ちにリセット
+  if (removed.size > 0 && ghostRoleId && removed.has(ghostRoleId)) {
+    const hasOther =
+      (majinRoleId && after.has(majinRoleId)) ||
+      (mazokuRoleId && after.has(mazokuRoleId)) ||
+      (meireiRoleId && after.has(meireiRoleId));
+    if (!hasOther) {
+      services.entry.resetToWaiting(newMember.id, "system:role-remove");
+      if (waitRoleId) await newMember.roles.add(waitRoleId).catch(() => undefined);
+      console.log(`[entry] 亡霊ロール剥奪 → 案内待ちにリセット: ${newMember.id}`);
+    }
   }
 }
 
@@ -302,10 +319,23 @@ export async function handleSessionCommand(
   }
   // 判定のみ（昇格は index 側で handlePromote に振り分け）
   const guild = interaction.guild!;
+  const vc1 = services.settings.getString("channel:session_vc");
+  const vc2 = services.settings.getString("channel:session_vc2");
+  if (!vc1 && !vc2) {
+    await interaction.reply({
+      content: "説明会場VCが未設定です。`/設定 チャンネル 種別:説明会場VC` で登録してください。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
   const present = await presentWaiters(guild, services);
   if (present.length === 0) {
+    const vcMentions = [vc1, vc2].filter(Boolean).map((id) => `<#${id}>`).join(" / ");
     await interaction.reply({
-      content: "いま説明会場VCに案内待ちの人がいません。（`/設定 チャンネル 種別:説明会場VC` で対応VCを設定してください）",
+      content: [
+        `いま ${vcMentions} に「案内待ち」の人がいません。`,
+        "（対象は **入城案内待ちロール保持者** か **魂の状態が waiting** の人だけ。既に亡霊/魔人などになっている人は対象外です）",
+      ].join("\n"),
       flags: MessageFlags.Ephemeral,
     });
     return;

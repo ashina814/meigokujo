@@ -18,6 +18,7 @@ import {
 } from "discord.js";
 import type { Conclusion, EvalScores } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
+import { refreshEvalStatsForUser } from "../eval-daily.js";
 import type { Services } from "../services.js";
 
 const AXES = [
@@ -206,6 +207,8 @@ async function ensureEvalThread(
     },
   });
   services.evaluation.setThread(targetId, thread.id);
+  // 起点メッセージを最新の実績で即上書き（以降は毎日05:30に自動更新）
+  if (interaction.guild) await refreshEvalStatsForUser(interaction.guild, services, targetId);
   return thread;
 }
 

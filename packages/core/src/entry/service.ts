@@ -72,6 +72,23 @@ export class Entry {
     return this.db.prepare("SELECT * FROM souls WHERE status = ? ORDER BY ghost_at").all(status) as SoulRow[];
   }
 
+  /**
+   * 魂を「案内待ち」にリセット（亡霊ロールが剥奪された時など）。
+   * ghost_at・eval_deadline_at・eval_extension_days を消し、招待延長フラグも掃除する。
+   * 台帳の初期発行は残るので、次回 ghostify では二重発行されない。
+   */
+  resetToWaiting(userId: string, actor: string): void {
+    const ts = now();
+    this.db
+      .prepare(
+        "UPDATE souls SET status='waiting', ghost_at=NULL, eval_deadline_at=NULL, eval_extension_days=0, updated_at=? WHERE user_id=?",
+      )
+      .run(ts, userId);
+    // 招待延長の後追い適用フラグを掃除（次に亡霊化した時にまた延長を受け付けられるように）
+    this.db.prepare("DELETE FROM settings WHERE key = ?").run(`invite_ext_applied:${userId}`);
+    this.events.log("ghost_reset", { actor, target: userId });
+  }
+
   getBooking(userId: string): BookingRow | undefined {
     return this.db.prepare("SELECT * FROM entry_bookings WHERE user_id = ?").get(userId) as
       | BookingRow
