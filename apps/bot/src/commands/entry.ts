@@ -3,10 +3,12 @@ import {
   ButtonBuilder,
   ButtonInteraction,
   ButtonStyle,
+  ChannelType,
   ChatInputCommandInteraction,
   EmbedBuilder,
   MessageFlags,
   SlashCommandBuilder,
+  ThreadAutoArchiveDuration,
   UserSelectMenuBuilder,
   UserSelectMenuInteraction,
   type Guild,
@@ -25,15 +27,31 @@ import type { Services } from "../services.js";
 export function entryPanelMessage(): MessageCreateOptions {
   const embed = new EmbedBuilder()
     .setTitle("🚪 冥獄城 入城案内")
-    .setDescription(
-      [
-        "**先に招待経路を登録してから、説明会場VCのどれかに入って**お待ちください（登録が無いと判定に進めません）。",
-        "登録は下のボタン1つでOK。時間の予約はありません、担当が来たら順番に面接します。",
-      ].join("\n"),
-    )
-    .setColor(0x6b21a8);
+    .setColor(0x6b21a8)
+    .addFields(
+      {
+        name: "📅 説明会の時間",
+        value: [
+          "**月・木を除く 21時 / 22時 / 23時** に開催しています。",
+          "開始 **30分前** と **5分前** にこのチャンネルでお知らせします。",
+        ].join("\n"),
+      },
+      {
+        name: "① 招待経路を登録（必須）",
+        value: "下の🚪ボタンから登録。**招待リンク経由なら自動検出**されるので、手動登録は不要な場合もあります。",
+      },
+      {
+        name: "② 説明会場VCに来る",
+        value: "時間になったら **説明会場VC** に入ってお待ちください。担当が順番に面接します。",
+      },
+      {
+        name: "⏰ 上の時間に来られない場合",
+        value: "下の⏰ボタンから **時間外・個別希望** を出せます。スタッフが個別に時間を調整します。",
+      },
+    );
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("entry:book").setLabel("招待経路を登録する（必須）").setEmoji("🚪").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("entry:book").setLabel("招待経路を登録する").setEmoji("🚪").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("entry:flex").setLabel("時間外・個別希望").setEmoji("⏰").setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row] };
 }
@@ -66,6 +84,16 @@ export async function handleEntryButton(
 
   if (id === "entry:book" && interaction.isButton()) {
     await interaction.reply({ ...inviterStep(), flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (id === "entry:flex" && interaction.isButton()) {
+    await openFlexTicket(interaction, services, userId);
+    return;
+  }
+
+  if (id.startsWith("entry:flexdone:") && interaction.isButton()) {
+    await handleFlexDone(interaction, services);
     return;
   }
 
@@ -576,4 +604,89 @@ async function ghostifyOne(
   }
 }
 
-// ---- （時間外チケット機能は 2026-07-06 廃止。判定は「今VCにいる案内待ち」ベースに一本化）----
+// ---- 時間外・個別希望: チケット（非公開スレッド）で柔軟に面接 ----
+
+async function openFlexTicket(
+  interaction: ButtonInteraction | UserSelectMenuInteraction,
+  services: Services,
+  userId: string,
+): Promise<void> {
+  const guild = interaction.guild!;
+  const guideId = services.settings.getString("channel:entry_guide");
+  const guide = guideId ? await guild.channels.fetch(guideId).catch(() => null) : null;
+  const base = (guide?.isTextBased() ? guide : interaction.channel) as TextChannel | null;
+  if (!base || !("threads" in base)) {
+    await interaction.reply({
+      content: "✅ 時間外希望を受け付けました。スタッフから個別に連絡します。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  const member = await guild.members.fetch(userId).catch(() => null);
+  const thread = await base.threads
+    .create({
+      name: `時間外希望-${member?.displayName ?? "案内待ち"}`.slice(0, 90),
+      type: ChannelType.PrivateThread,
+      invitable: false,
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+    })
+    .catch(() => null);
+  if (!thread) {
+    await interaction.reply({
+      content: "✅ 時間外希望を受け付けました。スタッフから連絡します。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  await thread.members.add(userId).catch(() => undefined);
+
+  // 面接担当・審・魔剣士・運営のロールが付いていれば全て呼ぶ
+  const judgeRoleIds = ["judge", "shin", "swordsman"]
+    .map((k) => services.settings.getString(`role:${k}`))
+    .filter((v): v is string => !!v);
+  const adminRoleId = services.settings.getString("role:admin");
+  const rolesToPing = [...new Set([...judgeRoleIds, ...(adminRoleId ? [adminRoleId] : [])])];
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`entry:flexdone:${userId}`).setLabel("亡霊にする（面接完了）").setEmoji("👻").setStyle(ButtonStyle.Success),
+  );
+  await thread
+    .send({
+      content: [
+        `${rolesToPing.map((r) => `<@&${r}>`).join(" ")} <@${userId}> さんの**時間外・個別希望**です。`,
+        "**都合のいい曜日・時間帯**を書いてください。担当が合わせて調整します。",
+        "面接が済んだら、担当が下のボタンで亡霊化してください。",
+      ].join("\n"),
+      components: [row],
+      allowedMentions: { users: [userId], roles: rolesToPing },
+    })
+    .catch(() => undefined);
+
+  await interaction.reply({
+    content: `✅ 時間外の受付を作りました → ${thread.toString()}\nそちらで担当と時間を決めてください。`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleFlexDone(interaction: ButtonInteraction, services: Services): Promise<void> {
+  if (!isJudge(interaction, services)) {
+    await interaction.reply({ content: "この操作には面接担当（運営・面接担当・魔剣士・審）の権限が必要です。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const targetId = interaction.customId.split(":")[2]!;
+  await interaction.deferReply();
+  const r = await ghostifyOne(interaction.guild!, services, targetId, `user:${interaction.user.id}`);
+  if (!r.ok) {
+    await interaction.editReply({ content: `❌ <@${targetId}> の亡霊化に失敗しました。ロール権限などを確認してください。` });
+    return;
+  }
+  await interaction.editReply({
+    content: `👻 <@${targetId}> を亡霊にしました（初期発行 ${fmtLd(r.granted)}）。ようこそ冥獄城へ。`,
+    allowedMentions: { users: [targetId] },
+  });
+  const thread = interaction.channel;
+  if (thread && thread.isThread()) {
+    await thread.setLocked(true).catch(() => undefined);
+    await thread.setArchived(true).catch(() => undefined);
+  }
+}
