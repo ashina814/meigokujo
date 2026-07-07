@@ -64,6 +64,7 @@ export function registerDefaultTxTypes(): void {
   registerTxType("fine", { ...userToSys });
   registerTxType("tax", { ...userToSys });
   registerTxType("shop_official", { ...userToSys });
+  registerTxType("tip_burn", { ...userToSys, publicLog: true }); // 冥獄ボットへの投げ銭＝Land焼却シンク
   registerTxType("event_fee", { ...userToSys });
   registerTxType("insurance_premium", { ...userToSys });
   registerTxType("room_fee", { ...userToSys });

@@ -3,19 +3,20 @@ import {
   MessageFlags,
   SlashCommandBuilder,
 } from "discord.js";
-import { LedgerError } from "@meigokujo/core";
+import { LedgerError, TREASURY } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import type { Services } from "../services.js";
 
 /**
  * 投げ銭（経済設計.md §4 循環: 住人→住人）。type=tip・公開ログに流れる。
+ * 特例: 対象が冥獄ボット自身のときは type=tip_burn で国庫へ流し、Land を焼却する（シンク）。
  * 高額は台帳の承認閾値に当たるので、その場合は /送金 に誘導する。
  */
 export const tipCommand = new SlashCommandBuilder()
   .setName("投げ銭")
-  .setDescription("住人に Land を投げ銭する（公開ログに流れます）")
+  .setDescription("住人に Land を投げ銭する（公開ログに流れます・冥獄ボット宛は焼却シンク）")
   .setDMPermission(false)
-  .addUserOption((o) => o.setName("相手").setDescription("投げ銭する相手").setRequired(true))
+  .addUserOption((o) => o.setName("相手").setDescription("投げ銭する相手（冥獄ボット宛はLand焼却）").setRequired(true))
   .addIntegerOption((o) => o.setName("金額").setDescription("Land").setRequired(true).setMinValue(1))
   .addStringOption((o) => o.setName("一言").setDescription("メッセージ（任意）").setMaxLength(100));
 
@@ -31,17 +32,36 @@ export async function handleTip(
     await interaction.reply({ content: "自分には投げ銭できません。", flags: MessageFlags.Ephemeral });
     return;
   }
-  if (target.bot) {
-    await interaction.reply({ content: "Bot には投げ銭できません。", flags: MessageFlags.Ephemeral });
+  // 冥獄ボット自身への投げ銭は「焼却シンク」として国庫へ。他のBotは不可
+  const selfBotId = interaction.client.user?.id;
+  const isBurn = target.bot && target.id === selfBotId;
+  if (target.bot && !isBurn) {
+    await interaction.reply({ content: "他の Bot には投げ銭できません。", flags: MessageFlags.Ephemeral });
     return;
   }
 
   const from = `user:${interaction.user.id}`;
-  const to = `user:${target.id}`;
   services.ledger.ensureAccount(from, "user");
-  services.ledger.ensureAccount(to, "user");
 
   try {
+    if (isBurn) {
+      const result = services.ledger.transfer({
+        from,
+        to: TREASURY,
+        amount,
+        type: "tip_burn",
+        actor: from,
+        reason: message ?? "冥獄ボットへの投げ銭（焼却）",
+        idempotencyKey: `tip_burn:${interaction.id}`,
+      });
+      await interaction.reply({
+        content: `🔥 **${fmtLd(amount)}** を冥獄に投げ入れました（Landが循環から消えます）${message ? `\n『${message}』` : ""}（tx#${result.tx.id}）`,
+      });
+      return;
+    }
+
+    const to = `user:${target.id}`;
+    services.ledger.ensureAccount(to, "user");
     const result = services.ledger.transfer({
       from,
       to,
