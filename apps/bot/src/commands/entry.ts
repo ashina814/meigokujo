@@ -37,21 +37,39 @@ export function entryPanelMessage(): MessageCreateOptions {
         ].join("\n"),
       },
       {
-        name: "① 招待経路を登録（必須）",
-        value: "下の🚪ボタンから登録。**招待リンク経由なら自動検出**されるので、手動登録は不要な場合もあります。",
+        name: "🎯 参加の流れ",
+        value: [
+          "時間になったら **説明会場VC** に入って担当をお待ちください。",
+          "招待リンク経由で来た方は **自動的に招待者が記録** されるので、追加操作は不要です。",
+        ].join("\n"),
       },
       {
-        name: "② 説明会場VCに来る",
-        value: "時間になったら **説明会場VC** に入ってお待ちください。担当が順番に面接します。",
-      },
-      {
-        name: "⏰ 上の時間に来られない場合",
-        value: "下の⏰ボタンから **時間外・個別希望** を出せます。スタッフが個別に時間を調整します。",
+        name: "🚪 招待経路を登録（自動検出できなかった方向け）",
+        value: [
+          "ディスボード・ルミナ経由で来た方や、招待者を手動で指定したい方は下のボタンから登録できます。",
+          "自動検出済みの方はこのボタンを押す必要はありません。",
+        ].join("\n"),
       },
     );
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("entry:book").setLabel("招待経路を登録する").setEmoji("🚪").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("entry:flex").setLabel("時間外・個別希望").setEmoji("⏰").setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+/** 時間外・個別希望の単独パネル */
+export function entryFlexPanelMessage(): MessageCreateOptions {
+  const embed = new EmbedBuilder()
+    .setTitle("⏰ 時間外・個別希望 受付")
+    .setColor(0xdb2777)
+    .setDescription(
+      [
+        "**月・木を除く 21/22/23時** の説明会に来られない方は、こちらから個別希望を出せます。",
+        "ボタンを押すと、あなたとスタッフだけの非公開スレッドが開きます。都合のいい時間帯を書いてください。",
+      ].join("\n"),
+    );
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("entry:flex").setLabel("時間外・個別希望を出す").setEmoji("⏰").setStyle(ButtonStyle.Primary),
   );
   return { embeds: [embed], components: [row] };
 }
