@@ -286,24 +286,48 @@ function isJudge(
   });
 }
 
-/** いま説明会VC(1・2)にいる「案内待ち」のメンバーIDを集める */
+/**
+ * いま説明会VC(1・2)にいる「案内待ち」のメンバーIDを集める。
+ * ロール優先: 案内待ちロール保持者は対象。魂がghost等でズレていた場合は自動修復する。
+ * ロール無しでも魂が waiting なら対象（ロール付与失敗の救済）。
+ * 案内待ちロール保持でも高階級ロール(魔族/魔人/迷霊)がある場合は対象外（誤操作防止）。
+ */
 async function presentWaiters(guild: Guild, services: Services): Promise<string[]> {
   const vcIds = [
     services.settings.getString("channel:session_vc"),
     services.settings.getString("channel:session_vc2"),
   ].filter((v): v is string => !!v);
   const waitRoleId = services.settings.getString("role:queue_wait");
+  const ghostRoleId = services.settings.getString("role:ghost");
+  const majinRoleId = services.settings.getString("role:majin");
+  const mazokuRoleId = services.settings.getString("role:mazoku");
+  const meireiRoleId = services.settings.getString("role:meirei");
   const ids = new Set<string>();
   for (const vcId of vcIds) {
     const ch = await guild.channels.fetch(vcId).catch(() => null);
     if (!ch || !ch.isVoiceBased()) continue;
     for (const [, m] of ch.members) {
       if (m.user.bot) continue;
+      const roles = m.roles.cache;
+      const hasWait = !!(waitRoleId && roles.has(waitRoleId));
+      const hasGhost = !!(ghostRoleId && roles.has(ghostRoleId));
+      const hasHigher =
+        (majinRoleId && roles.has(majinRoleId)) ||
+        (mazokuRoleId && roles.has(mazokuRoleId)) ||
+        (meireiRoleId && roles.has(meireiRoleId));
+      if (hasHigher || hasGhost) continue; // 亡霊以上は判定対象外
       const soul = services.entry.getSoul(m.id);
-      // すでに階級が付いた人（亡霊/魔人等）は対象外。案内待ちロール or waiting の魂だけ
-      if (soul && soul.status !== "waiting") continue;
-      const hasWait = waitRoleId ? m.roles.cache.has(waitRoleId) : false;
-      if (hasWait || soul?.status === "waiting") ids.add(m.id);
+      if (hasWait) {
+        // 案内待ちロール保持者は対象。魂とのズレを見つけたら修復
+        if (soul && soul.status !== "waiting") {
+          services.entry.resetToWaiting(m.id, "system:role-sync");
+          console.log(`[entry] 魂のズレを修復: ${m.id} (${soul.status} → waiting、案内待ちロール保持のため)`);
+        }
+        ids.add(m.id);
+        continue;
+      }
+      // ロール無しでも魂が waiting なら救済
+      if (soul?.status === "waiting") ids.add(m.id);
     }
   }
   return [...ids];
