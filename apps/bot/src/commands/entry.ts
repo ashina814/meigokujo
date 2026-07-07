@@ -110,11 +110,6 @@ export async function handleEntryButton(
     return;
   }
 
-  if (id.startsWith("entry:flexdone:") && interaction.isButton()) {
-    await handleFlexDone(interaction, services);
-    return;
-  }
-
   if (id === "entry:invsel" && interaction.isUserSelectMenu()) {
     const inviterId = interaction.values[0];
     if (!inviterId) {
@@ -144,7 +139,7 @@ export async function handleEntryButton(
     return;
   }
 
-  if ((id.startsWith("entry:judgehold") || id.startsWith("entry:judgeskip")) && interaction.isUserSelectMenu()) {
+  if (id.startsWith("entry:judgehold") && interaction.isUserSelectMenu()) {
     await handleJudgeSelect(interaction, services);
     return;
   }
@@ -318,7 +313,7 @@ export const sessionCommand = new SlashCommandBuilder()
   );
 
 /** 審判を使えるのは 運営 / 面接担当 / 魔剣士 / 審 のいずれか */
-const JUDGE_ROLE_KINDS = ["judge", "swordsman", "shin"] as const;
+const JUDGE_ROLE_KINDS = ["judge", "judge_lead", "judge_extra"] as const;
 function isJudge(
   interaction: ChatInputCommandInteraction | ButtonInteraction | UserSelectMenuInteraction,
   services: Services,
@@ -384,7 +379,7 @@ export async function handleSessionCommand(
   services: Services,
 ): Promise<void> {
   if (!isJudge(interaction, services)) {
-    await interaction.reply({ content: "この操作には面接担当（運営・面接担当・魔剣士・審）の権限が必要です。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "この操作には門番（運営・門番・門番統括）の権限が必要です。", flags: MessageFlags.Ephemeral });
     return;
   }
   // 判定のみ（昇格は index 側で handlePromote に振り分け）
@@ -418,26 +413,23 @@ export async function handleSessionCommand(
     if (booking && booking.inviter_source) ready.push(uid);
     else missing.push(uid);
   }
-  judgeState.set(interaction.user.id, { present: ready, missing, hold: new Set(), skip: new Set() });
+  judgeState.set(interaction.user.id, { present: ready, missing, hold: new Set() });
   await interaction.reply({ ...renderJudgment(services, interaction.user.id), flags: MessageFlags.Ephemeral });
 }
 
-// ---- 判定UI: 保留/見送り/招待未登録 ----
+// ---- 判定UI: 保留/合格/招待未登録 ----
 
 interface JudgeSel {
   present: string[]; // 招待経路登録済み・判定対象
   missing: string[]; // 招待経路が未登録・判定不可（DM催促の対象）
-  hold: Set<string>; // 保留＝今回は通さない（案内待ちのまま）
-  skip: Set<string>; // 見送り＝案内待ちから外す（亡霊化しない）
+  hold: Set<string>; // 保留＝今回は通さない（案内待ちのまま。次回の判定で再度出る）
 }
 const judgeState = new Map<string, JudgeSel>(); // key = 判定者のユーザーID
 
-/** 判定メッセージ（今VCにいる案内待ち + 保留/見送りの選択UI）を組み立てる */
+/** 判定メッセージ（今VCにいる案内待ち + 保留の選択UI）を組み立てる */
 function renderJudgment(_services: Services, judgeId: string) {
-  const st =
-    judgeState.get(judgeId) ??
-    ({ present: [], missing: [], hold: new Set<string>(), skip: new Set<string>() } as JudgeSel);
-  const toGhost = st.present.filter((id) => !st.hold.has(id) && !st.skip.has(id));
+  const st = judgeState.get(judgeId) ?? ({ present: [], missing: [], hold: new Set<string>() } as JudgeSel);
+  const toGhost = st.present.filter((id) => !st.hold.has(id));
 
   const line = (ids: string[]) => (ids.length > 0 ? ids.map((id) => `・<@${id}>`).join("\n") : "（なし）");
   const embed = new EmbedBuilder()
@@ -445,13 +437,12 @@ function renderJudgment(_services: Services, judgeId: string) {
     .setColor(0x6b21a8)
     .setDescription(
       [
-        `**亡霊にする ${toGhost.length}名**:`,
+        `**合格→亡霊にする ${toGhost.length}名**:`,
         line(toGhost),
         "",
         st.hold.size > 0 ? `⏸ **保留 ${st.hold.size}名**（今回は通さない・案内待ちのまま）:\n${line([...st.hold])}\n` : "",
-        st.skip.size > 0 ? `🚫 **見送り ${st.skip.size}名**（案内待ちから外す）:\n${line([...st.skip])}\n` : "",
         st.missing.length > 0
-          ? `⚠️ **招待経路 未登録 ${st.missing.length}名**（判定不可・下のボタンでDM催促）:\n${line(st.missing)}\n`
+          ? `⚠️ **招待経路 未登録 ${st.missing.length}名**（判定不可・下のボタンで催促）:\n${line(st.missing)}\n`
           : "",
       ]
         .filter((s) => s !== "")
@@ -466,18 +457,13 @@ function renderJudgment(_services: Services, judgeId: string) {
         new UserSelectMenuBuilder().setCustomId("entry:judgehold").setPlaceholder("⏸ 保留にする人（今回通さない）").setMinValues(0).setMaxValues(max),
       ),
     );
-    rows.push(
-      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
-        new UserSelectMenuBuilder().setCustomId("entry:judgeskip").setPlaceholder("🚫 見送りにする人（案内待ちから外す）").setMinValues(0).setMaxValues(max),
-      ),
-    );
   }
   const bottom = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("entry:pass").setLabel(`${toGhost.length}名を亡霊にする`).setStyle(ButtonStyle.Success).setDisabled(toGhost.length === 0),
+    new ButtonBuilder().setCustomId("entry:pass").setLabel(`${toGhost.length}名を合格（亡霊化）`).setStyle(ButtonStyle.Success).setDisabled(toGhost.length === 0),
   );
   if (st.missing.length > 0) {
     bottom.addComponents(
-      new ButtonBuilder().setCustomId("entry:invremind").setLabel(`⚠️ ${st.missing.length}名へ招待経路のDM催促`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("entry:invremind").setLabel(`⚠️ ${st.missing.length}名に招待経路を催促`).setStyle(ButtonStyle.Secondary),
     );
   }
   rows.push(bottom);
@@ -487,7 +473,7 @@ function renderJudgment(_services: Services, judgeId: string) {
 /** 招待未登録者を入城案内chでメンション催促する */
 async function handleInviteRemind(interaction: ButtonInteraction, services: Services): Promise<void> {
   if (!isJudge(interaction, services)) {
-    await interaction.reply({ content: "この操作には面接担当の権限が必要です。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "この操作には門番の権限が必要です。", flags: MessageFlags.Ephemeral });
     return;
   }
   const sel = judgeState.get(interaction.user.id);
@@ -519,33 +505,25 @@ async function handleInviteRemind(interaction: ButtonInteraction, services: Serv
   });
 }
 
-/** 保留/見送りの選択を反映してメッセージを更新 */
+/** 保留の選択を反映してメッセージを更新 */
 async function handleJudgeSelect(interaction: UserSelectMenuInteraction, services: Services): Promise<void> {
   if (!isJudge(interaction, services)) {
-    await interaction.reply({ content: "この操作には面接担当の権限が必要です。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "この操作には門番の権限が必要です。", flags: MessageFlags.Ephemeral });
     return;
   }
-  const kind = interaction.customId.split(":")[1]; // judgehold | judgeskip
   const sel = judgeState.get(interaction.user.id);
   if (!sel) {
     await interaction.update({ content: "⌛ この判定は期限切れです。`/審判 判定` からやり直してください。", components: [], embeds: [] });
     return;
   }
-  const picked = new Set(interaction.values);
-  if (kind === "judgehold") {
-    sel.hold = picked;
-    for (const id of picked) sel.skip.delete(id); // 保留に入れたら見送りからは外す
-  } else {
-    sel.skip = picked;
-    for (const id of picked) sel.hold.delete(id);
-  }
+  sel.hold = new Set(interaction.values);
   judgeState.set(interaction.user.id, sel);
   await interaction.update(renderJudgment(services, interaction.user.id));
 }
 
 async function handlePassButton(interaction: ButtonInteraction, services: Services): Promise<void> {
   if (!isJudge(interaction, services)) {
-    await interaction.reply({ content: "この操作には面接担当の権限が必要です。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "この操作には門番の権限が必要です。", flags: MessageFlags.Ephemeral });
     return;
   }
   const actor = `user:${interaction.user.id}`;
@@ -557,18 +535,7 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
   await interaction.update({ content: "⏳ 判定を実行中…", embeds: [], components: [] });
 
   const guild = interaction.guild!;
-  const toGhost = sel.present.filter((id) => !sel.hold.has(id) && !sel.skip.has(id));
-  const skipped = sel.present.filter((id) => sel.skip.has(id));
-
-  // 見送り: 案内待ちロールを外してキューから除外（亡霊化しない）
-  const waitRoleId = services.settings.getString("role:queue_wait");
-  for (const id of skipped) {
-    services.entry.skipBooking(id, actor);
-    if (waitRoleId) {
-      const m = await guild.members.fetch(id).catch(() => null);
-      await m?.roles.remove(waitRoleId).catch(() => undefined);
-    }
-  }
+  const toGhost = sel.present.filter((id) => !sel.hold.has(id));
 
   const passed: string[] = [];
   const failed: string[] = [];
@@ -584,10 +551,9 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
   judgeState.delete(interaction.user.id);
 
   const lines = [
-    `✅ **${passed.length}名** を亡霊にしました（初期発行 計 ${fmtLd(totalGranted)}）。`,
+    `✅ **${passed.length}名** を合格→亡霊にしました（初期発行 計 ${fmtLd(totalGranted)}）。`,
     failed.length > 0 ? `❌ 失敗: ${failed.map((id) => `<@${id}>`).join(", ")}` : "",
     sel.hold.size > 0 ? `⏸ 保留（案内待ちのまま）: ${sel.hold.size}名` : "",
-    skipped.length > 0 ? `🚫 見送り（案内待ちから除外）: ${skipped.map((id) => `<@${id}>`).join(", ")}` : "",
   ].filter(Boolean);
   await interaction.editReply({ content: lines.join("\n"), allowedMentions: { parse: [] } });
 }
@@ -658,53 +624,26 @@ async function openFlexTicket(
   }
   await thread.members.add(userId).catch(() => undefined);
 
-  // 面接担当・審・魔剣士・運営のロールが付いていれば全て呼ぶ
-  const judgeRoleIds = ["judge", "shin", "swordsman"]
+  // 門番（judge/lead/extra）と運営のロールが付いていれば全て呼ぶ
+  const judgeRoleIds = ["judge", "judge_lead", "judge_extra"]
     .map((k) => services.settings.getString(`role:${k}`))
     .filter((v): v is string => !!v);
   const adminRoleId = services.settings.getString("role:admin");
   const rolesToPing = [...new Set([...judgeRoleIds, ...(adminRoleId ? [adminRoleId] : [])])];
 
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`entry:flexdone:${userId}`).setLabel("亡霊にする（面接完了）").setEmoji("👻").setStyle(ButtonStyle.Success),
-  );
   await thread
     .send({
       content: [
         `${rolesToPing.map((r) => `<@&${r}>`).join(" ")} <@${userId}> さんの**時間外・個別希望**です。`,
-        "**都合のいい曜日・時間帯**を書いてください。担当が合わせて調整します。",
-        "面接が済んだら、担当が下のボタンで亡霊化してください。",
+        "**都合のいい曜日・時間帯**を書いてください。門番が合わせて調整します。",
+        "調整した時間に本人が **説明会場VC** に来たら、通常通り `/審判 判定` で合格にしてください。",
       ].join("\n"),
-      components: [row],
       allowedMentions: { users: [userId], roles: rolesToPing },
     })
     .catch(() => undefined);
 
   await interaction.reply({
-    content: `✅ 時間外の受付を作りました → ${thread.toString()}\nそちらで担当と時間を決めてください。`,
+    content: `✅ 時間外の受付を作りました → ${thread.toString()}\nそちらで門番と時間を決めてください。`,
     flags: MessageFlags.Ephemeral,
   });
-}
-
-async function handleFlexDone(interaction: ButtonInteraction, services: Services): Promise<void> {
-  if (!isJudge(interaction, services)) {
-    await interaction.reply({ content: "この操作には面接担当（運営・面接担当・魔剣士・審）の権限が必要です。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  const targetId = interaction.customId.split(":")[2]!;
-  await interaction.deferReply();
-  const r = await ghostifyOne(interaction.guild!, services, targetId, `user:${interaction.user.id}`);
-  if (!r.ok) {
-    await interaction.editReply({ content: `❌ <@${targetId}> の亡霊化に失敗しました。ロール権限などを確認してください。` });
-    return;
-  }
-  await interaction.editReply({
-    content: `👻 <@${targetId}> を亡霊にしました（初期発行 ${fmtLd(r.granted)}）。ようこそ冥獄城へ。`,
-    allowedMentions: { users: [targetId] },
-  });
-  const thread = interaction.channel;
-  if (thread && thread.isThread()) {
-    await thread.setLocked(true).catch(() => undefined);
-    await thread.setArchived(true).catch(() => undefined);
-  }
 }
