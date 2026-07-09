@@ -3,6 +3,8 @@ import { fmtLd } from "./format.js";
 import { jstNow } from "./scheduler.js";
 import type { Services } from "./services.js";
 
+const TREASURY = "sys:treasury";
+
 /** JSTの当月の開始・終了 unix秒（発行/回収の月次集計用） */
 function monthBounds(): { start: number; end: number } {
   const n = jstNow();
@@ -14,6 +16,29 @@ function monthBounds(): { start: number; end: number } {
   return { start, end };
 }
 
+/** 計器盤用の月次運用フロー。移行投入は月内の経済活動ではないため除外する。 */
+function operationalFlowBetween(
+  services: Services,
+  fromTs: number,
+  toTs: number,
+): { issued: number; collected: number; net: number } {
+  const row = services.db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN from_account = ? THEN amount ELSE 0 END), 0) AS issued,
+         COALESCE(SUM(CASE WHEN to_account = ? THEN amount ELSE 0 END), 0) AS collected
+       FROM transactions
+       WHERE created_at >= ?
+         AND created_at < ?
+         AND (from_account = ? OR to_account = ?)
+         AND actor_id != 'system:migration'
+         AND type != 'opening'`,
+    )
+    .get(TREASURY, TREASURY, fromTs, toTs, TREASURY, TREASURY) as { issued: number; collected: number };
+
+  return { issued: row.issued, collected: row.collected, net: row.issued - row.collected };
+}
+
 export function buildDashboardEmbed(services: Services): EmbedBuilder {
   const nowTs = Math.floor(Date.now() / 1000);
   const DAY = 86_400;
@@ -21,7 +46,7 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
   // 経済
   const supply = services.ledger.moneySupply();
   const { start, end } = monthBounds();
-  const flow = services.ledger.flowBetween(start, end);
+  const flow = operationalFlowBetween(services, start, end);
   const escrow = services.ledger.escrowTotal();
 
   // 入城
@@ -39,7 +64,7 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
 
   const economy = [
     `通貨発行残高: **${fmtLd(supply)}**`,
-    `今月 発行 ${fmtLd(flow.issued)} / 回収 ${fmtLd(flow.collected)} / 純増 **${flow.net >= 0 ? "+" : ""}${fmtLd(flow.net)}**`,
+    `今月 発行 ${fmtLd(flow.issued)} / 回収 ${fmtLd(flow.collected)} / 純増 **${flow.net >= 0 ? "+" : ""}${fmtLd(flow.net)}**（移行除外）`,
     `エスクロー・部署預り: ${fmtLd(escrow)}`,
   ].join("\n");
 
