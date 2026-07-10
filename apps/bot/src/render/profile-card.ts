@@ -23,6 +23,12 @@ export interface ProfileCardData {
   vcHours: number;
   daysSeen: number;
   titles: Array<{ name: string; desc: string }>;
+  // ランク（発言・浮上）— 未指定なら描画スキップ
+  ranks?: {
+    totalLevel: number;
+    text: { level: number; inLevel: number; toNext: number; title: string };
+    voice: { level: number; inLevel: number; toNext: number; title: string };
+  };
 }
 
 /** 階級ごとの帯色（バッジ） */
@@ -37,9 +43,10 @@ const RANK_COLOR: Record<string, string> = {
 };
 
 export async function renderProfileCard(data: ProfileCardData): Promise<Buffer> {
-  // 称号数に応じて高さを伸ばす
+  // 称号数に応じて高さを伸ばす + ランク描画があれば追加
   const titleRows = Math.max(data.titles.length, 1);
-  const titlesBlockTop = 340;
+  const rankBlockH = data.ranks ? 220 : 0;
+  const titlesBlockTop = 340 + rankBlockH;
   const rowH = 52;
   const height = titlesBlockTop + 44 + titleRows * rowH + 40;
 
@@ -96,6 +103,39 @@ export async function renderProfileCard(data: ProfileCardData): Promise<Buffer> 
     fitFont(ctx, value, boxW - 36, 30, 20, (px) => `600 ${px}px ${SANS}`);
     ctx.fillText(value, x + 18, boxY + 68);
   });
+
+  // ── ランクセクション（総合Lv + 発言/浮上のゲージ + 称号）──
+  if (data.ranks) {
+    const rankTop = 340;
+    const secX = PAD;
+    ctx.fillStyle = "#f0b429";
+    ctx.font = `600 30px ${SERIF}`;
+    ctx.fillText("ランク", secX, rankTop + 8);
+    ctx.strokeStyle = "rgba(240,180,41,0.25)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(secX, rankTop + 24);
+    ctx.lineTo(WIDTH - PAD, rankTop + 24);
+    ctx.stroke();
+
+    // 総合レベル（右寄せの大きな数字）
+    ctx.fillStyle = "#8a7fa6";
+    ctx.font = `400 22px ${SANS}`;
+    const totalLabel = "総合Lv";
+    ctx.textAlign = "right";
+    ctx.fillText(totalLabel, WIDTH - PAD, rankTop + 8);
+    ctx.fillStyle = "#f5e9d0";
+    ctx.font = `700 44px ${SERIF}`;
+    ctx.fillText(String(data.ranks.totalLevel), WIDTH - PAD, rankTop + 54);
+    ctx.textAlign = "left";
+
+    // 発言ゲージ
+    const g1Y = rankTop + 60;
+    drawRankRow(ctx, secX, g1Y, "発言", data.ranks.text);
+    // 浮上ゲージ
+    const g2Y = rankTop + 140;
+    drawRankRow(ctx, secX, g2Y, "浮上", data.ranks.voice);
+  }
 
   // ── 称号セクション ──
   const secX = PAD;
@@ -200,6 +240,57 @@ async function drawAvatar(
   ctx.arc(cx, cy, r, 0, Math.PI * 2);
   ctx.strokeStyle = "rgba(240,180,41,0.5)";
   ctx.lineWidth = 3;
+  ctx.stroke();
+}
+
+function drawRankRow(
+  ctx: SKRSContext2D,
+  x: number,
+  y: number,
+  label: string,
+  data: { level: number; inLevel: number; toNext: number; title: string },
+): void {
+  // ラベル + Lv + 称号（1行目）
+  ctx.fillStyle = "#8a7fa6";
+  ctx.font = `400 24px ${SANS}`;
+  ctx.fillText(label, x, y);
+  ctx.fillStyle = "#f5e9d0";
+  ctx.font = `700 30px ${SERIF}`;
+  const lvText = `Lv.${data.level}`;
+  ctx.fillText(lvText, x + 70, y + 2);
+  const lvW = ctx.measureText(lvText).width;
+  ctx.fillStyle = "#f0b429";
+  ctx.font = `600 24px ${SANS}`;
+  ctx.fillText(data.title, x + 70 + lvW + 18, y);
+
+  // XP テキスト（右端）
+  ctx.fillStyle = "#8a7fa6";
+  ctx.font = `400 20px ${SANS}`;
+  const xpText = `${data.inLevel} / ${data.toNext} XP`;
+  ctx.textAlign = "right";
+  ctx.fillText(xpText, WIDTH - PAD, y);
+  ctx.textAlign = "left";
+
+  // ゲージ（2行目）
+  const barX = x;
+  const barY = y + 14;
+  const barW = WIDTH - PAD * 2;
+  const barH = 14;
+  roundRect(ctx, barX, barY, barW, barH, barH / 2);
+  ctx.fillStyle = "rgba(255,255,255,0.06)";
+  ctx.fill();
+  const fillW = Math.max(0, Math.min(barW, Math.round(barW * (data.inLevel / Math.max(1, data.toNext)))));
+  if (fillW > 0) {
+    roundRect(ctx, barX, barY, fillW, barH, barH / 2);
+    const g = ctx.createLinearGradient(barX, barY, barX + fillW, barY);
+    g.addColorStop(0, "#a855f7");
+    g.addColorStop(1, "#f0b429");
+    ctx.fillStyle = g;
+    ctx.fill();
+  }
+  ctx.strokeStyle = "rgba(240,180,41,0.25)";
+  ctx.lineWidth = 1;
+  roundRect(ctx, barX, barY, barW, barH, barH / 2);
   ctx.stroke();
 }
 

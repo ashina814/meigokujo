@@ -5,6 +5,8 @@ import { buildServices } from "./services.js";
 import { handleSettings } from "./commands/settings.js";
 import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
 import { handleTip } from "./commands/tip.js";
+import { handleRankingCommand } from "./commands/ranking.js";
+import { handleRankPanelButton } from "./commands/rank-panel.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -138,6 +140,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await handlePensionCommand(interaction, services);
           return;
         case "為替":
+        case "ランキング":
+          await handleRankingCommand(interaction, services);
+          return;
         case "あそびかた":
           await handleHelpCommand(interaction, services);
           return;
@@ -224,6 +229,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("lot:buy:") || interaction.customId.startsWith("lot:qbuy:")) {
         await handleLotteryButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("rank:")) {
+        await handleRankPanelButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("dept:")) {

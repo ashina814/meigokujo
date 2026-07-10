@@ -8,6 +8,13 @@ import {
 import { fmtLdCompact } from "../format.js";
 import { renderProfileCard } from "../render/profile-card.js";
 import { isAdmin } from "../permissions.js";
+import {
+  TEXT_TIERS,
+  VOICE_TIERS,
+  textProgress,
+  voiceProgress,
+  tierFor,
+} from "@meigokujo/core";
 import type { Services } from "../services.js";
 
 const RANK_LABEL: Record<string, string> = {
@@ -68,6 +75,17 @@ export async function handleProfile(
   const rank = soul ? (RANK_LABEL[soul.status] ?? soul.status) : "記録なし";
   const displayName = member?.displayName ?? target.globalName ?? target.username;
 
+  // ランク（発言・浮上・総合）
+  const textData = services.ranks.getText(target.id);
+  const voiceData = services.ranks.getVoice(target.id);
+  const tp = textProgress(textData.xp);
+  const vp = voiceProgress(voiceData.xp);
+  const ranks = {
+    totalLevel: tp.level + vp.level,
+    text: { level: tp.level, inLevel: tp.inLevel, toNext: tp.toNext, title: tierFor(tp.level, TEXT_TIERS).name },
+    voice: { level: vp.level, inLevel: vp.inLevel, toNext: vp.toNext, title: tierFor(vp.level, VOICE_TIERS).name },
+  };
+
   const png = await renderProfileCard({
     displayName,
     avatarUrl: (member ?? target).displayAvatarURL({ extension: "png", size: 256 }),
@@ -77,6 +95,7 @@ export async function handleProfile(
     vcHours,
     daysSeen: presence.daysSeen,
     titles: titles.map((t) => ({ name: t.name, desc: t.desc })),
+    ranks,
   });
   const card = new AttachmentBuilder(png, { name: "record-card.png" });
 

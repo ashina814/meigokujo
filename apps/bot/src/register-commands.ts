@@ -12,6 +12,7 @@ import { dashboardCommand } from "./commands/dashboard-command.js";
 import { profileCommand } from "./commands/profile.js";
 import { departmentCommand } from "./commands/department.js";
 import { tipCommand } from "./commands/tip.js";
+import { rankingCommand } from "./commands/ranking.js";
 import { taxCommand, pensionCommand } from "./commands/fiscal.js";
 import { helpCommand } from "./commands/help.js";
 import { operationsCommand } from "./commands/operations.js";
@@ -36,6 +37,7 @@ const commands = [
   profileCommand.toJSON(),
   departmentCommand.toJSON(),
   tipCommand.toJSON(),
+  rankingCommand.toJSON(),
   helpCommand.toJSON(),
 ];
 

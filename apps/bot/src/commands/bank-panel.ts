@@ -19,6 +19,7 @@ import {
 import { fmtLd, formatHistLine } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import { entryPanelMessage, entryFlexPanelMessage } from "./entry.js";
+import { rankPanelMessage } from "./rank-panel.js";
 import { ticketPanelMessage } from "./tickets.js";
 import { roomPanelMessage } from "./rooms.js";
 import { deptAccount, LedgerError, type RoomKind } from "@meigokujo/core";
@@ -66,6 +67,7 @@ export const panelRemoveCommand = new SlashCommandBuilder()
         { name: "冥獄銀行", value: "bank" },
         { name: "入城申請", value: "entry" },
         { name: "時間外希望受付", value: "entry_flex" },
+        { name: "ランク確認", value: "rank" },
         { name: "出戻り申請", value: "ticket_return" },
         { name: "個別相談", value: "ticket_consult" },
         { name: "宿", value: "room_normal" },
@@ -80,6 +82,7 @@ const PANEL_KINDS = [
   "bank",
   "entry",
   "entry_flex",
+  "rank",
   "ticket_return",
   "ticket_consult",
   "room_normal",
@@ -93,6 +96,7 @@ const PANEL_LABELS: Record<(typeof PANEL_KINDS)[number], string> = {
   bank: "冥獄銀行",
   entry: "入城申請",
   entry_flex: "時間外希望受付",
+  rank: "ランク確認",
   ticket_return: "出戻り申請",
   ticket_consult: "個別相談",
   room_normal: "宿",
@@ -201,6 +205,7 @@ export async function handlePanelRemove(
 function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services, channelId: string) {
   if (kind === "entry") return entryPanelMessage();
   if (kind === "entry_flex") return entryFlexPanelMessage();
+  if (kind === "rank") return rankPanelMessage();
   if (kind === "ticket_return") return ticketPanelMessage("return");
   if (kind === "ticket_consult") return ticketPanelMessage("consult");
   if (kind === "dept") {
