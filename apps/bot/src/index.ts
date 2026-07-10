@@ -41,6 +41,7 @@ import { handleOperations, handleOperationsAutocomplete } from "./commands/opera
 import { handleHelpCommand } from "./commands/help.js";
 import { handleRoomButton, handleRecruitModal, handleRoomRenameModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
+import { handleMessageXp, tickVoiceXp } from "./rank-tracker.js";
 import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
 import { handleSalaryTable } from "./commands/salary-table.js";
@@ -257,6 +258,7 @@ client.on(Events.MessageCreate, (message) => {
     console.error("[panel] 再掲失敗:", err),
   );
   void handleBumpMessage(message, services).catch((err) => console.error("[bump] 処理失敗:", err));
+  void handleMessageXp(message, services).catch((err) => console.error("[rank] 発言XP付与失敗:", err));
 });
 
 // 入城導線: 参加時のロール付与・案内・招待リンク自動検出

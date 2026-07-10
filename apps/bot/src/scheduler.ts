@@ -8,6 +8,7 @@ import { scanDens } from "./dens.js";
 import { refreshEvalStats } from "./eval-daily.js";
 import { applyVcRanks } from "./vc-ranks.js";
 import { updateDashboard } from "./dashboard.js";
+import { tickVoiceXp } from "./rank-tracker.js";
 import { announceResult, refreshAuctionPanel } from "./commands/auction.js";
 import { announceDraw, refreshLotteryPanel } from "./commands/lottery.js";
 import { announceRace, refreshRacePanel } from "./commands/race.js";
@@ -160,6 +161,11 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     // ── 計器盤の更新（10分ごと）──
     if (now.minute % 10 === 0) {
       await updateDashboard(client, services).catch((e) => console.error("[計器盤] 更新失敗:", e));
+    }
+
+    // ── ボイスXP tick（5分ごと・複数人VC滞在者に加算）──
+    if (now.minute % 5 === 0) {
+      await tickVoiceXp(client, services).catch((e) => console.error("[rank] ボイスXP tick失敗:", e));
     }
 
     // ── bump/up クールタイム終了通知 ──

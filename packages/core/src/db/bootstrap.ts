@@ -325,6 +325,31 @@ CREATE TABLE IF NOT EXISTS chip_balances (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS rank_text (
+  user_id       TEXT PRIMARY KEY,
+  xp            INTEGER NOT NULL DEFAULT 0,
+  messages      INTEGER NOT NULL DEFAULT 0,
+  last_award_at INTEGER NOT NULL DEFAULT 0,
+  last_tier     INTEGER NOT NULL DEFAULT 0,
+  updated_at    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rank_voice (
+  user_id       TEXT PRIMARY KEY,
+  xp            INTEGER NOT NULL DEFAULT 0,
+  minutes       INTEGER NOT NULL DEFAULT 0,
+  last_award_at INTEGER NOT NULL DEFAULT 0,
+  last_tier     INTEGER NOT NULL DEFAULT 0,
+  updated_at    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bump_counts (
+  user_id    TEXT PRIMARY KEY,
+  count      INTEGER NOT NULL DEFAULT 0,
+  last_at    INTEGER,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS fiscal_runs (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   kind        TEXT NOT NULL CHECK (kind IN ('tax','pension')),

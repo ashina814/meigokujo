@@ -18,6 +18,8 @@ import {
   TitleEngine,
   VcRewards,
   VcTracker,
+  RankEngine,
+  BumpCounter,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -55,7 +57,9 @@ export function buildServices() {
   const lottery = new Lottery(db, ledger, settings, events);
   const races = new Races(db, ledger, events);
   const fiscal = new Fiscal(db, ledger);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, auctions, lottery, races, fiscal };
+  const ranks = new RankEngine(db);
+  const bumps = new BumpCounter(db);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, auctions, lottery, races, fiscal, ranks, bumps };
 }
 
 export type Services = ReturnType<typeof buildServices>;

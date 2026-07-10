@@ -44,6 +44,8 @@ export async function handleBumpMessage(message: Message, services: Services): P
         .send(`💰 <@${runner.id}> に${isDisboard ? "bump" : "up"}報酬 **${fmtLd(reward)}** を支給しました。`)
         .catch(() => undefined);
     }
+    // ランキング用のbumpカウント（初回・冪等ではないが tx が冪等なので重複防止は台帳側で担保）
+    if (!result.duplicate) services.bumps.add(runner.id);
   }
 
   // クールタイム終了通知の予約（2時間後・刻時盤が拾う）
