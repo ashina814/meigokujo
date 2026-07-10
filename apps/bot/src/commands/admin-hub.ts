@@ -116,9 +116,16 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "panel" && action === "install") return void (await interaction.update(panelInstallPicker()));
   if (section === "panel" && action === "remove") return void (await interaction.update(panelRemovePicker()));
 
-  // ── 給与 / 徴収 は表示だけ（実行は既存フロー予定） ──
+  // ── 給与 ──
   if (section === "payroll" && !action) return void (await interaction.update(payrollHome(services)));
+  if (section === "payroll" && action === "add-start")
+    return void (await interaction.update(payrollAddRolePicker()));
+  if (section === "payroll" && action === "pay") return void (await payrollPayNow(interaction, services));
+
+  // ── 徴収 ──
   if (section === "fiscal" && !action) return void (await interaction.update(fiscalHome()));
+  if (section === "fiscal" && action === "tax") return void (await interaction.showModal(taxModal()));
+  if (section === "fiscal" && action === "pension") return void (await interaction.showModal(pensionModal()));
 
   // ── 部署 ──
   if (section === "dept" && !action) return void (await interaction.update(deptHome(services)));
@@ -190,6 +197,12 @@ export async function handleAdminSelect(
   if (section === "xpex" && action === "add" && interaction.isChannelSelectMenu()) {
     return void (await xpexAdd(interaction, services, interaction.values[0]!));
   }
+  if (section === "payroll" && action === "add-role" && interaction.isRoleSelectMenu()) {
+    return void (await interaction.showModal(payrollAddModal(interaction.values[0]!)));
+  }
+  if (section === "payroll" && action === "remove-pick" && interaction.isStringSelectMenu()) {
+    return void (await payrollRemove(interaction, services, interaction.values[0]!));
+  }
 }
 
 export async function handleAdminModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
@@ -253,6 +266,53 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       await interaction.reply({ content: `✅ 部署「${name}」を作成しました。担当ロールは /設定 相当の別UIで設定してください（未実装）。`, flags: MessageFlags.Ephemeral });
     } catch {
       await interaction.reply({ content: "❌ 作成に失敗しました（キーが不正または既存の可能性）。", flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+  if (section === "payroll" && action === "add") {
+    const roleId = parts[3]!;
+    const label = interaction.fields.getTextInputValue("label").trim();
+    const amount = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
+    if (!label || !Number.isFinite(amount) || amount < 0) {
+      await interaction.reply({ content: "ラベルと0以上の金額を入れてください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    try {
+      services.payroll.setSalary(roleId, label, amount, `user:${interaction.user.id}`);
+      await interaction.reply({ content: `✅ 給与表: <@&${roleId}> = ${label} / ${fmtLd(amount)}`, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+    } catch (e) {
+      await interaction.reply({ content: `❌ ${e instanceof Error ? e.message : "設定失敗"}`, flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+  if (section === "fiscal" && (action === "tax" || action === "pension")) {
+    const period = interaction.fields.getTextInputValue("period").trim() || new Date().toISOString().slice(0, 7);
+    try {
+      if (action === "tax") {
+        const threshold = Number(interaction.fields.getTextInputValue("threshold").replaceAll(",", "").trim());
+        const rateBps = Number(interaction.fields.getTextInputValue("rate_bps").replaceAll(",", "").trim());
+        if (!Number.isFinite(threshold) || threshold < 0 || !Number.isFinite(rateBps) || rateBps <= 0 || rateBps > 10000) {
+          await interaction.reply({ content: "閾値(0以上) と 税率bps(1〜10000) を入れてください。", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        const run = services.fiscal.generateTaxDraft(period, { threshold, rateBps }, `user:${interaction.user.id}`);
+        services.fiscal.approve(run.id, `user:${interaction.user.id}`);
+        const rep = services.fiscal.execute(run.id, `user:${interaction.user.id}`);
+        await interaction.reply({ content: `✅ 冥府税 ${period}: 徴収 ${fmtLd(rep.total)}（対象 ${rep.succeeded}名）`, flags: MessageFlags.Ephemeral });
+      } else {
+        const minDays = Number(interaction.fields.getTextInputValue("min_days").replaceAll(",", "").trim());
+        const amount = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
+        if (!Number.isFinite(minDays) || minDays < 0 || !Number.isFinite(amount) || amount <= 0) {
+          await interaction.reply({ content: "最低在城日数(0以上) と 支給額(1以上) を入れてください。", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        const run = services.fiscal.generatePensionDraft(period, { minDays, amount }, `user:${interaction.user.id}`);
+        services.fiscal.approve(run.id, `user:${interaction.user.id}`);
+        const rep = services.fiscal.execute(run.id, `user:${interaction.user.id}`);
+        await interaction.reply({ content: `✅ 年金 ${period}: 支給 ${fmtLd(rep.total)}（対象 ${rep.succeeded}名）`, flags: MessageFlags.Ephemeral });
+      }
+    } catch (e) {
+      await interaction.reply({ content: `❌ ${e instanceof Error ? e.message : "実行失敗"}`, flags: MessageFlags.Ephemeral });
     }
     return;
   }
@@ -505,20 +565,96 @@ async function removePanel(
 
 function payrollHome(services: Services) {
   const rows = services.payroll.listSalaries();
-  const list = rows.length > 0 ? rows.map((r) => `・${r.label}: ${fmtLd(r.amount)}`).join("\n") : "（給与表は空）";
+  const list =
+    rows.length > 0
+      ? rows.map((r) => `・<@&${r.role_id}> **${r.label}**: ${fmtLd(r.amount)}`).join("\n")
+      : "（給与表は空）";
   const embed = new EmbedBuilder()
     .setTitle("💰 給与")
     .setColor(0x6b21a8)
     .setDescription(
       [
-        "**給与表**",
+        "**給与表**（ロールごとに月額を設定）",
         list,
         "",
-        "月次のドラフト投稿・承認・実行は毎月1日に自動で `#決裁` に流れます（刻時盤）。",
-        "手動の追加/削除は今のところ未実装（次のアップデートで対応予定）。",
+        "月次自動支給は毎月1日に `#決裁` へドラフトが流れます。ここからの「今月手動支給」は draft→approve→execute を一気通貫。",
       ].join("\n"),
     );
-  return { embeds: [embed], components: [backButton()] };
+  const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("mgmt:payroll:add-start").setLabel("行追加").setEmoji("➕").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("mgmt:payroll:pay").setLabel("今月手動支給").setEmoji("💸").setStyle(ButtonStyle.Success),
+  );
+  const components: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [buttons];
+  if (rows.length > 0) {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId("mgmt:payroll:remove-pick")
+      .setPlaceholder("削除する行を選ぶ")
+      .addOptions(rows.slice(0, 25).map((r) => ({ label: `${r.label}: ${r.amount.toLocaleString()}`, value: r.role_id })));
+    components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu));
+  }
+  components.push(backButton());
+  return { embeds: [embed], components };
+}
+
+function payrollAddRolePicker() {
+  const menu = new RoleSelectMenuBuilder().setCustomId("mgmt:payroll:add-role").setPlaceholder("給与を付けるロールを選ぶ");
+  return {
+    embeds: [new EmbedBuilder().setTitle("➕ 給与表 行追加").setColor(0x6b21a8).setDescription("対象ロールを選ぶとラベル・月額のモーダルが開きます。")],
+    components: [new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(menu), backButton()],
+  };
+}
+
+function payrollAddModal(roleId: string) {
+  return new ModalBuilder()
+    .setCustomId(`mgmt:payroll:add:${roleId}`)
+    .setTitle("給与表 行追加")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("label").setLabel("ラベル（例: 銀行員月給）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("amount").setLabel("月額（Land）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15),
+      ),
+    );
+}
+
+async function payrollRemove(
+  interaction: StringSelectMenuInteraction,
+  services: Services,
+  roleId: string,
+): Promise<void> {
+  services.payroll.removeSalary(roleId, `user:${interaction.user.id}`);
+  await interaction.update({ content: `🗑 給与表からロール <@&${roleId}> を削除しました。`, embeds: [], components: [backButton()], allowedMentions: { parse: [] } });
+}
+
+async function payrollPayNow(interaction: ButtonInteraction, services: Services): Promise<void> {
+  await interaction.deferUpdate();
+  const period = new Date().toISOString().slice(0, 7);
+  try {
+    const guild = interaction.guild;
+    if (!guild) {
+      await interaction.editReply({ content: "❌ ギルド情報が取得できません。", embeds: [], components: [backButton()] });
+      return;
+    }
+    const memberCol = await guild.members.fetch();
+    const members = memberCol
+      .filter((m) => !m.user.bot)
+      .map((m) => ({ userId: m.id, roleIds: m.roles.cache.map((r) => r.id) }));
+    const run = services.payroll.generateDraft(period, members, `user:${interaction.user.id}`);
+    services.payroll.approve(run.id, `user:${interaction.user.id}`);
+    const rep = services.payroll.execute(run.id, `user:${interaction.user.id}`);
+    await interaction.editReply({
+      content: `✅ ${period} を手動支給しました（総額 ${fmtLd(rep.totalPaid)} / 成功 ${rep.succeeded}件 / スキップ ${rep.skippedAsPaid}件${rep.failed.length > 0 ? ` / 失敗 ${rep.failed.length}件` : ""}）`,
+      embeds: [],
+      components: [backButton()],
+    });
+  } catch (e) {
+    await interaction.editReply({
+      content: `❌ ${e instanceof Error ? e.message : "支給失敗"}`,
+      embeds: [],
+      components: [backButton()],
+    });
+  }
 }
 
 // ---- 徴収サブパネル ----
@@ -529,14 +665,53 @@ function fiscalHome() {
     .setColor(0x6b21a8)
     .setDescription(
       [
-        "運営が主導する徴収（税・年金）です。",
+        "運営が主導する徴収（税・年金）を、パラメータ指定 → **draft→承認→実行** を1発で回します。",
         "",
-        "冥府税・年金は閾値/税率/支給額のパラメータを指定して案（ドラフト）を作り、",
-        "`#決裁` チャンネルで承認 → 実行 する流れです。",
-        "モーダル対応の実行UIは次回のアップデートで組みます（現状は既存フローで実行）。",
+        "・**冥府税**: 残高が閾値を超えた住人から、超過分×税率(bps) を徴収",
+        "・**年金**: 在城 N日 以上の魂に定額を支給",
+        "",
+        "対象期間は空欄で今月（YYYY-MM）。同じ期間で2回目は上書きされずエラーになります。",
       ].join("\n"),
     );
-  return { embeds: [embed], components: [backButton()] };
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("mgmt:fiscal:tax").setLabel("冥府税を実行").setEmoji("🏛").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("mgmt:fiscal:pension").setLabel("年金を実行").setEmoji("💴").setStyle(ButtonStyle.Success),
+  );
+  return { embeds: [embed], components: [row, backButton()] };
+}
+
+function taxModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:fiscal:tax")
+    .setTitle("冥府税 実行")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("threshold").setLabel("閾値（Land・これを超える残高が対象）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("rate_bps").setLabel("税率 bps（例: 500=5%）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(6).setPlaceholder("100 = 1%"),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("period").setLabel("対象期間 YYYY-MM（空欄で今月）").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(7),
+      ),
+    );
+}
+
+function pensionModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:fiscal:pension")
+    .setTitle("年金 実行")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("min_days").setLabel("最低在城日数").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(6),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("amount").setLabel("支給額（Land）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("period").setLabel("対象期間 YYYY-MM（空欄で今月）").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(7),
+      ),
+    );
 }
 
 // ---- 部署サブパネル ----
