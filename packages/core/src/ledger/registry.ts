@@ -73,6 +73,8 @@ export function registerDefaultTxTypes(): void {
   registerTxType("adjust", { fromKinds: ["user", "system"], toKinds: ["user", "system"] });
 
   // 賭場系（エスクロー経由・未成年ゲート対象）
+  registerTxType("bet", { fromKinds: ["user"], toKinds: ["system"], minorBlocked: true });
+  registerTxType("prize", { fromKinds: ["system"], toKinds: ["user"], minorBlocked: true });
   registerTxType("race_rake", { fromKinds: ["system"], toKinds: ["system"] }); // 冥馬レース控除（エスクロー→国庫）
   registerTxType("race_refund", { fromKinds: ["system"], toKinds: ["user"] }); // 不成立・取消の返金
   registerTxType("auction_bid", { fromKinds: ["user"], toKinds: ["system"] });
