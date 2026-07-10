@@ -119,7 +119,7 @@ describe("台帳の不変条件", () => {
 
   it("エスクローは負残高になれない（負を許すのは国庫だけ）", () => {
     expect(() =>
-      ledger.transfer({ from: ESCROW, to: A, amount: 100, type: "auction_refund", actor: "system", idempotencyKey: "e1" }),
+      ledger.transfer({ from: ESCROW, to: A, amount: 100, type: "dept_out", actor: "system", idempotencyKey: "e1" }),
     ).toThrowError(/ERR_INSUFFICIENT/);
   });
 });
@@ -186,7 +186,7 @@ describe("巻き戻し", () => {
       from: A, to: B, amount: 5_000, type: "transfer", actor: A, idempotencyKey: "r3",
     });
     // B が受け取った 5,000 を使い切る
-    ledger.transfer({ from: B, to: ESCROW, amount: 5_000, type: "auction_bid", actor: B, idempotencyKey: "spend" });
+    ledger.transfer({ from: B, to: ESCROW, amount: 5_000, type: "dept_in", actor: B, idempotencyKey: "spend" });
     expect(() => ledger.reverse(original.tx.id, "staff:bank", "巻き戻し")).toThrowError(/ERR_INSUFFICIENT/);
   });
 });
@@ -231,7 +231,7 @@ describe("計器盤の経済指標", () => {
   it("escrowTotal は国庫以外のシステム勘定の残高合計", () => {
     const ledger = setup();
     fund(ledger, A, 10_000);
-    ledger.transfer({ from: A, to: ESCROW, amount: 3_000, type: "auction_bid", actor: A, idempotencyKey: "e1" });
+    ledger.transfer({ from: A, to: ESCROW, amount: 3_000, type: "dept_in", actor: A, idempotencyKey: "e1" });
     expect(ledger.escrowTotal()).toBe(3_000); // 国庫の負残高は含まれない
   });
 });

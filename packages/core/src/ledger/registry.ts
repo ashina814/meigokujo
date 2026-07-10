@@ -72,4 +72,7 @@ export function registerDefaultTxTypes(): void {
   // 運営調整（方向自由・最終手段）
   registerTxType("adjust", { fromKinds: ["user", "system"], toKinds: ["user", "system"] });
 
+  // 賭け系（新カジノ実装用に汎用型として保持・未成年ゲート対象）
+  registerTxType("bet", { fromKinds: ["user"], toKinds: ["system"], minorBlocked: true });
+  registerTxType("prize", { fromKinds: ["system"], toKinds: ["user"], minorBlocked: true });
 }
