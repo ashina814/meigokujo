@@ -39,6 +39,7 @@ export const panelCommand = new SlashCommandBuilder()
         { name: "冥獄銀行", value: "bank" },
         { name: "入城申請", value: "entry" },
         { name: "時間外希望受付", value: "entry_flex" },
+        { name: "ランク確認", value: "rank" },
         { name: "出戻り申請", value: "ticket_return" },
         { name: "個別相談", value: "ticket_consult" },
         { name: "宿", value: "room_normal" },
