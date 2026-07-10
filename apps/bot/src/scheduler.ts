@@ -304,7 +304,11 @@ export async function runCharonDaily(client: Client, services: Services): Promis
     });
   }
 
-  // ② 本人への演出通知（3日前・前日・当日、各1回）
+  // ② 本人への演出通知（3日前・前日・当日、各1回）— DM＋通知チャンネルの両方
+  //   通知チャンネルは channel:charon_notify（未設定なら channel:shurei にフォールバック）
+  const notifyChId =
+    services.settings.getString("channel:charon_notify") ?? services.settings.getString("channel:shurei");
+  const notifyCh = notifyChId ? await client.channels.fetch(notifyChId).catch(() => null) : null;
   const upcoming = services.evaluation.dueBetween(nowTs, nowTs + 4 * DAY);
   for (const r of upcoming) {
     const daysLeft = Math.floor((r.eval_deadline_at - nowTs) / DAY);
@@ -312,6 +316,7 @@ export async function runCharonDaily(client: Client, services: Services): Promis
     const marker = `charon:notified:${r.user_id}:${daysLeft}`;
     if (services.settings.getString(marker)) continue;
     services.settings.set(marker, "1", "system:charon");
+    // 本人DM
     const user = await client.users.fetch(r.user_id).catch(() => null);
     await user
       ?.send(
@@ -320,6 +325,17 @@ export async function runCharonDaily(client: Client, services: Services): Promis
           : `🛶 **汝の審判まで、あと${daysLeft}日。** 評価対象の場に姿を見せよ。`,
       )
       .catch(() => undefined);
+    // チャンネル通知（本人メンション付き）
+    if (notifyCh?.isTextBased() && "send" in notifyCh) {
+      const p = services.evaluation.promotionScore(r.user_id);
+      const line =
+        daysLeft === 0
+          ? `🛶 <@${r.user_id}> **審判の刻限は本日** <t:${r.eval_deadline_at}:t>。昇格印 **${p.total}/5**（残り時間で挽回するか、迷霊落ちを覚悟せよ）。`
+          : `🛶 <@${r.user_id}> **審判まであと${daysLeft}日**（<t:${r.eval_deadline_at}:R>）。昇格印 **${p.total}/5**・評価対象VCで姿を示せ。`;
+      await notifyCh
+        .send({ content: line, allowedMentions: { users: [r.user_id] } })
+        .catch(() => undefined);
+    }
   }
 
   // ③ 期限切れ（昇格印不足）→ #決裁 に承認パネル

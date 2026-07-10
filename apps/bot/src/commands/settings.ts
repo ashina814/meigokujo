@@ -22,6 +22,7 @@ export const CHANNEL_KINDS = [
   ["session_vc2", "説明会場VC（2つ目）"],
   ["eval_forum", "評価フォーラム"],
   ["shurei", "集令"],
+  ["charon_notify", "カロン通知（審判の刻限）"],
   ["announce", "昇格のお知らせ"],
   ["recruit", "蜜月の募集掲示"],
   ["casino", "カジノ（設定するとゲームはそこ限定）"],
