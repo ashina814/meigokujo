@@ -1,6 +1,7 @@
 import { REST, Routes } from "discord.js";
 import { config } from "./config.js";
 import { adminCommand } from "./commands/admin-hub.js";
+import { shokanCommand } from "./commands/shokan.js";
 import { transferCommand } from "./commands/transfer.js";
 import { sessionCommand } from "./commands/entry.js";
 import { evaluationCommand } from "./commands/evaluation.js";
@@ -13,6 +14,7 @@ import { helpCommand } from "./commands/help.js";
 const commands = [
   // 運営（ManageGuildで一般には非表示。全部ここに畳んだ）
   adminCommand.toJSON(),
+  shokanCommand.toJSON(),
   // スタッフ（役職ゲート）
   sessionCommand.toJSON(),
   evaluationCommand.toJSON(),

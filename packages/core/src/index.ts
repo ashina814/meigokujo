@@ -50,6 +50,20 @@ export {
   type RankTier,
 } from "./rank/service.js";
 export { BumpCounter } from "./rank/bump.js";
+export {
+  Shop,
+  ShopError,
+  nextFirstOfMonthJst,
+  endOfMonthJst,
+  type ShopItemRow,
+  type ShopItemInput,
+  type PurchaseRow,
+  type ItemKind,
+  type DeliveryMode,
+  type DeliveryKind,
+  type PurchaseStatus,
+  type ShopErrorCode,
+} from "./shop/service.js";
 export { Tickets, type TicketRow, type TicketKind, type TicketStatus } from "./tickets/service.js";
 export { Evaluation, type Conclusion, type EvalScores, type EvalTexts, type PromotionScore, type SubmitResult, type SoulDeadlineRow } from "./evaluation/service.js";
 export { VcRewards, type DailyReward } from "./vc/rewards.js";

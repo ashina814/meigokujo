@@ -175,6 +175,41 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
+    // ── 公式ショップの月額一括請求: 毎月1日 08:00 JST ──
+    if (now.day === 1 && now.hour === 8) {
+      const shopMarker = `shop:monthly:${now.period}`;
+      if (!services.settings.getString(shopMarker)) {
+        services.settings.set(shopMarker, "1", "system:scheduler");
+        try {
+          const { charged, lapsed } = services.shop.chargeMonthlySubscriptions("system:shop-monthly");
+          console.log(`[ショップ] 月額一括: 課金 ${charged.length}件 / 失効 ${lapsed.length}件`);
+          // 失効ユーザーへのDM＆ロール剥奪
+          for (const l of lapsed) {
+            const user = await client.users.fetch(l.purchase.user_id).catch(() => null);
+            await user
+              ?.send(`🛒 **${l.item.name}** の月額更新が失敗しました（${l.reason}）。当月末で権利が失効します。再購入は公式ショップから。`)
+              .catch(() => undefined);
+            // add_role の場合はロールを剥奪
+            if (l.item.delivery_kind === "add_role" && l.item.delivery_data) {
+              try {
+                const data = JSON.parse(l.item.delivery_data) as { role_id?: string };
+                if (data.role_id) {
+                  const guildId = services.settings.getString("guild:main");
+                  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
+                  const member = guild ? await guild.members.fetch(l.purchase.user_id).catch(() => null) : null;
+                  await member?.roles.remove(data.role_id).catch(() => undefined);
+                }
+              } catch {
+                /* noop */
+              }
+            }
+          }
+        } catch (e) {
+          console.error("[ショップ] 月額一括処理失敗:", e);
+        }
+      }
+    }
+
     // ── 給与の自動ドラフト: 毎月1日 09:00 JST 以降、その月にまだ投稿していなければ ──
     const marker = `payroll:draft_posted:${now.period}`;
     if (now.day === 1 && now.hour >= 9 && !services.settings.getString(marker)) {

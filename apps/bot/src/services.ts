@@ -17,6 +17,7 @@ import {
   VcTracker,
   RankEngine,
   BumpCounter,
+  Shop,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -53,7 +54,8 @@ export function buildServices() {
   const fiscal = new Fiscal(db, ledger);
   const ranks = new RankEngine(db);
   const bumps = new BumpCounter(db);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps };
+  const shop = new Shop(db, ledger, events);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop };
 }
 
 export type Services = ReturnType<typeof buildServices>;

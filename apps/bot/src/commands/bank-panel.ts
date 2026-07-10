@@ -20,6 +20,7 @@ import { fmtLd, formatHistLine } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import { entryPanelMessage, entryFlexPanelMessage } from "./entry.js";
 import { rankPanelMessage } from "./rank-panel.js";
+import { shopPanelMessage } from "./shop-panel.js";
 import { ticketPanelMessage } from "./tickets.js";
 import { roomPanelMessage } from "./rooms.js";
 import { deptAccount, LedgerError, type RoomKind } from "@meigokujo/core";
@@ -40,6 +41,7 @@ export const panelCommand = new SlashCommandBuilder()
         { name: "入城申請", value: "entry" },
         { name: "時間外希望受付", value: "entry_flex" },
         { name: "ランク確認", value: "rank" },
+        { name: "公式ショップ", value: "shop" },
         { name: "出戻り申請", value: "ticket_return" },
         { name: "個別相談", value: "ticket_consult" },
         { name: "宿", value: "room_normal" },
@@ -69,6 +71,7 @@ export const panelRemoveCommand = new SlashCommandBuilder()
         { name: "入城申請", value: "entry" },
         { name: "時間外希望受付", value: "entry_flex" },
         { name: "ランク確認", value: "rank" },
+        { name: "公式ショップ", value: "shop" },
         { name: "出戻り申請", value: "ticket_return" },
         { name: "個別相談", value: "ticket_consult" },
         { name: "宿", value: "room_normal" },
@@ -84,6 +87,7 @@ const PANEL_KINDS = [
   "entry",
   "entry_flex",
   "rank",
+  "shop",
   "ticket_return",
   "ticket_consult",
   "room_normal",
@@ -98,6 +102,7 @@ const PANEL_LABELS: Record<(typeof PANEL_KINDS)[number], string> = {
   entry: "入城申請",
   entry_flex: "時間外希望受付",
   rank: "ランク確認",
+  shop: "公式ショップ",
   ticket_return: "出戻り申請",
   ticket_consult: "個別相談",
   room_normal: "宿",
@@ -215,6 +220,7 @@ function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services,
   if (kind === "entry") return entryPanelMessage();
   if (kind === "entry_flex") return entryFlexPanelMessage();
   if (kind === "rank") return rankPanelMessage();
+  if (kind === "shop") return shopPanelMessage(services);
   if (kind === "ticket_return") return ticketPanelMessage("return");
   if (kind === "ticket_consult") return ticketPanelMessage("consult");
   if (kind === "dept") {

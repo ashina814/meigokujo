@@ -325,6 +325,42 @@ CREATE TABLE IF NOT EXISTS chip_balances (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS shop_items (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  name              TEXT NOT NULL,
+  description       TEXT,
+  price_land        INTEGER,
+  price_alt_kind    TEXT,
+  price_alt_amount  INTEGER,
+  kind              TEXT NOT NULL CHECK (kind IN ('one_shot','monthly')),
+  duration_days     INTEGER,
+  require_role_id   TEXT,
+  delivery          TEXT NOT NULL DEFAULT 'manual' CHECK (delivery IN ('auto','manual')),
+  delivery_kind     TEXT,
+  delivery_data     TEXT,
+  stock             INTEGER,
+  enabled           INTEGER NOT NULL DEFAULT 1,
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shop_items_enabled ON shop_items(enabled);
+
+CREATE TABLE IF NOT EXISTS shop_purchases (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id          INTEGER NOT NULL REFERENCES shop_items(id),
+  user_id          TEXT NOT NULL,
+  purchased_at     INTEGER NOT NULL,
+  expires_at       INTEGER,
+  paid_land        INTEGER,
+  paid_alt_kind    TEXT,
+  paid_alt_amount  INTEGER,
+  status           TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','expired','refunded','cancelled')),
+  delivered_at     INTEGER,
+  auto_renew       INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_shop_purchases_user ON shop_purchases(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_shop_purchases_expiry ON shop_purchases(status, expires_at);
+
 CREATE TABLE IF NOT EXISTS rank_text (
   user_id       TEXT PRIMARY KEY,
   xp            INTEGER NOT NULL DEFAULT 0,

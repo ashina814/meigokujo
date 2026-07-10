@@ -3,6 +3,8 @@ import { InviteTracker } from "./invite-tracker.js";
 import { config } from "./config.js";
 import { buildServices } from "./services.js";
 import { handleAdminCommand, handleAdminButton, handleAdminSelect, handleAdminModal } from "./commands/admin-hub.js";
+import { handleShopButton, handleShopSelect } from "./commands/shop-panel.js";
+import { handleShokanCommand, handleShokanButton, handleShokanSelect, handleShokanModal } from "./commands/shokan.js";
 import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
 import { handleTip } from "./commands/tip.js";
 import { handleRankingCommand } from "./commands/ranking.js";
@@ -82,6 +84,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "管理":
           await handleAdminCommand(interaction, services);
           return;
+        case "商館":
+          await handleShokanCommand(interaction, services);
+          return;
         case "送金":
           await handleTransfer(interaction, services);
           return;
@@ -136,6 +141,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleAdminModal(interaction, services);
       return;
     }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("shokan:")) {
+      await handleShokanModal(interaction, services);
+      return;
+    }
     if (
       (interaction.isStringSelectMenu() ||
         interaction.isUserSelectMenu() ||
@@ -144,6 +153,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
       interaction.customId.startsWith("mgmt:")
     ) {
       await handleAdminSelect(interaction, services);
+      return;
+    }
+    if (
+      (interaction.isStringSelectMenu() || interaction.isRoleSelectMenu()) &&
+      interaction.customId.startsWith("shokan:")
+    ) {
+      await handleShokanSelect(interaction, services);
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("shop:")) {
+      await handleShopSelect(interaction, services);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {
@@ -180,6 +200,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("mgmt:")) {
         await handleAdminButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("shokan:")) {
+        await handleShokanButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("shop:")) {
+        await handleShopButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("rank:")) {
