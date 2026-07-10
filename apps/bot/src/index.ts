@@ -2,7 +2,7 @@ import { Client, Events, GatewayIntentBits, MessageFlags } from "discord.js";
 import { InviteTracker } from "./invite-tracker.js";
 import { config } from "./config.js";
 import { buildServices } from "./services.js";
-import { handleSettings } from "./commands/settings.js";
+import { handleAdminCommand, handleAdminButton, handleAdminSelect, handleAdminModal } from "./commands/admin-hub.js";
 import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
 import { handleTip } from "./commands/tip.js";
 import { handleRankingCommand } from "./commands/ranking.js";
@@ -11,12 +11,8 @@ import {
   handleBankButton,
   handleDeptPanelButton,
   handleDeptPanelModal,
-  handlePanelAutocomplete,
-  handlePanelCommand,
-  handlePanelRemove,
   maybeRepostPanel,
 } from "./commands/bank-panel.js";
-import { handleAdjust } from "./commands/adjust.js";
 import {
   handleEntryButton,
   handleMemberJoin,
@@ -32,19 +28,15 @@ import {
   handleEvaluationSelect,
 } from "./commands/evaluation.js";
 import { handlePromote } from "./commands/promote.js";
-import { handleDashboardCommand } from "./commands/dashboard-command.js";
 import { handleProfile } from "./commands/profile.js";
 import { handleDepartment, handleDepartmentAutocomplete } from "./commands/department.js";
-import { handleTaxCommand, handlePensionCommand, handleFiscalButton } from "./commands/fiscal.js";
-import { handleOperations, handleOperationsAutocomplete } from "./commands/operations.js";
+import { handleFiscalButton } from "./commands/fiscal.js";
 import { handleHelpCommand } from "./commands/help.js";
 import { handleRoomButton, handleRecruitModal, handleRoomRenameModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { handleMessageXp, tickVoiceXp } from "./rank-tracker.js";
 import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
-import { handleSalaryTable } from "./commands/salary-table.js";
-import { handlePaydayCommand } from "./commands/payday-command.js";
 import { handlePaydayButton } from "./payday.js";
 import { startScheduler } from "./scheduler.js";
 import { startOutboxWorker } from "./outbox.js";
@@ -87,8 +79,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
       switch (interaction.commandName) {
-        case "設定":
-          await handleSettings(interaction, services);
+        case "管理":
+          await handleAdminCommand(interaction, services);
           return;
         case "送金":
           await handleTransfer(interaction, services);
@@ -96,33 +88,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "投げ銭":
           await handleTip(interaction, services);
           return;
-        case "パネル設置":
-          await handlePanelCommand(interaction, services);
-          return;
-        case "パネル撤去":
-          await handlePanelRemove(interaction, services);
-          return;
-        case "調整":
-          await handleAdjust(interaction, services);
-          return;
-        case "給与表":
-          await handleSalaryTable(interaction, services);
-          return;
-        case "給与支給":
-          await handlePaydayCommand(interaction, services);
-          return;
         case "審判":
           if (interaction.options.getSubcommand() === "昇格") await handlePromote(interaction, services);
           else await handleSessionCommand(interaction, services);
           return;
-        case "運営":
-          await handleOperations(interaction, services);
-          return;
         case "評価":
           await handleEvaluationCommand(interaction, services);
-          return;
-        case "計器盤":
-          await handleDashboardCommand(interaction, services);
           return;
         case "プロフィール":
           await handleProfile(interaction, services);
@@ -130,13 +101,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "部署":
           await handleDepartment(interaction, services);
           return;
-        case "冥府税":
-          await handleTaxCommand(interaction, services);
-          return;
-        case "年金":
-          await handlePensionCommand(interaction, services);
-          return;
-        case "為替":
         case "ランキング":
           await handleRankingCommand(interaction, services);
           return;
@@ -147,12 +111,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     if (interaction.isAutocomplete()) {
-      if (interaction.commandName === "運営") {
-        await handleOperationsAutocomplete(interaction, services);
-      } else if (interaction.commandName === "部署") {
+      if (interaction.commandName === "部署") {
         await handleDepartmentAutocomplete(interaction, services);
-      } else if (interaction.commandName === "パネル設置") {
-        await handlePanelAutocomplete(interaction, services);
       }
       return;
     }
@@ -170,6 +130,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("room:renamemodal:")) {
       await handleRoomRenameModal(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("mgmt:")) {
+      await handleAdminModal(interaction, services);
+      return;
+    }
+    if (
+      (interaction.isStringSelectMenu() ||
+        interaction.isUserSelectMenu() ||
+        interaction.isChannelSelectMenu() ||
+        interaction.isRoleSelectMenu()) &&
+      interaction.customId.startsWith("mgmt:")
+    ) {
+      await handleAdminSelect(interaction, services);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {
@@ -202,6 +176,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("room:")) {
         await handleRoomButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("mgmt:")) {
+        await handleAdminButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("rank:")) {

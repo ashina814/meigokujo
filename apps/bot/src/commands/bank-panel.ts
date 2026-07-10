@@ -203,6 +203,14 @@ export async function handlePanelRemove(
   });
 }
 
+/** /管理 パネル サブパネルから使うヘルパ */
+export function panelMessageForExternal(kind: string, services: Services, channelId: string) {
+  return panelMessageFor(kind as (typeof PANEL_KINDS)[number], services, channelId);
+}
+export function savePanelSettingExternal(services: Services, kind: string, channelId: string, msgId: string, actor: string): void {
+  services.settings.set(`panel:${kind}:${channelId}`, msgId, `user:${actor}`);
+}
+
 function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services, channelId: string) {
   if (kind === "entry") return entryPanelMessage();
   if (kind === "entry_flex") return entryFlexPanelMessage();
