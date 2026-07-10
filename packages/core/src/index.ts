@@ -83,39 +83,3 @@ export {
   type FiscalKind,
   type FiscalErrorCode,
 } from "./fiscal/service.js";
-export {
-  Chips,
-  ChipError,
-  CHIP_ESCROW,
-  type ChipQuote,
-  type ChipErrorCode,
-} from "./chips/service.js";
-export { Weather, WEATHER_TYPES, jstDateStr, type WeatherDef } from "./weather/service.js";
-export {
-  Poker,
-  PokerError,
-  evaluateHand,
-  compareHands,
-  POKER_RAKE_BPS,
-  type PokerTable,
-  type ShowdownResult,
-  type HandRank,
-  type PokerErrorCode,
-} from "./poker/service.js";
-export {
-  Casino,
-  CasinoError,
-  HOUSE,
-  cardLabel,
-  type CoinResult,
-  type SlotResult,
-  type RouletteResult,
-  type RouletteBet,
-  type ChinchiroResult,
-  type BJView,
-  type BJState,
-  type HiLoView,
-  type HiLoState,
-  type Card,
-  type CasinoErrorCode,
-} from "./casino/service.js";

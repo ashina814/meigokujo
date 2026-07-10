@@ -37,11 +37,7 @@ import { handleAuctionButton, handleAuctionBidModal } from "./commands/auction.j
 import { handleLotteryButton, handleLotteryBuyModal } from "./commands/lottery.js";
 import { handleRaceSelect, handleRaceBetModal } from "./commands/race.js";
 import { handleTaxCommand, handlePensionCommand, handleFiscalButton } from "./commands/fiscal.js";
-import { handleExchangeCommand } from "./commands/chips.js";
-import { handleCasinoCommand, handleCasinoButton, handleCasinoAutocomplete } from "./commands/casino.js";
-import { handlePokerCommand, handlePokerButton, handlePokerSelect } from "./commands/poker.js";
 import { handleOperations, handleOperationsAutocomplete } from "./commands/operations.js";
-import { handleWeatherCommand } from "./commands/weather.js";
 import { handleHelpCommand } from "./commands/help.js";
 import { handleRoomButton, handleRecruitModal, handleRoomRenameModal } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
@@ -141,17 +137,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await handlePensionCommand(interaction, services);
           return;
         case "為替":
-          await handleExchangeCommand(interaction, services);
-          return;
-        case "カジノ":
-          await handleCasinoCommand(interaction, services);
-          return;
-        case "ポーカー":
-          await handlePokerCommand(interaction, services);
-          return;
-        case "天気":
-          await handleWeatherCommand(interaction, services);
-          return;
         case "あそびかた":
           await handleHelpCommand(interaction, services);
           return;
@@ -163,8 +148,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleOperationsAutocomplete(interaction, services);
       } else if (interaction.commandName === "部署") {
         await handleDepartmentAutocomplete(interaction, services);
-      } else if (interaction.commandName === "カジノ") {
-        await handleCasinoAutocomplete(interaction, services);
       } else if (interaction.commandName === "パネル設置") {
         await handlePanelAutocomplete(interaction, services);
       }
@@ -206,10 +189,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleEvaluationSelect(interaction, services);
       return;
     }
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("pok:swap:")) {
-      await handlePokerSelect(interaction, services);
-      return;
-    }
     if (
       (interaction.isStringSelectMenu() || interaction.isUserSelectMenu()) &&
       interaction.customId.startsWith("room:")
@@ -244,14 +223,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("lot:buy:") || interaction.customId.startsWith("lot:qbuy:")) {
         await handleLotteryButton(interaction, services);
-        return;
-      }
-      if (interaction.customId.startsWith("cas:")) {
-        await handleCasinoButton(interaction, services);
-        return;
-      }
-      if (interaction.customId.startsWith("pok:")) {
-        await handlePokerButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("dept:")) {

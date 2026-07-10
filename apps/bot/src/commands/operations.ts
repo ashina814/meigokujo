@@ -7,13 +7,12 @@ import {
 import { handleLotteryCommand } from "./lottery.js";
 import { handleAuctionCommand, handleAuctionAutocomplete } from "./auction.js";
 import { handleRaceCommand, handleRaceAutocomplete } from "./race.js";
-import { handleCasinoCommand } from "./casino.js";
 import { handleDepartment, handleDepartmentAutocomplete } from "./department.js";
 import type { Services } from "../services.js";
 
 /**
  * 運営操作の集約コマンド（ManageGuild で一般メンバーには非表示）。
- * 賭場（籤/競売/レース/カジノ）と部署の"開催・管理"系をここに畳み、プレイヤーの
+ * 賭場（籤/競売/レース）と部署の"開催・管理"系をここに畳み、プレイヤーの
  * スラッシュ一覧から運営サブコマンドを消す。中身は既存ハンドラへ委譲するだけ
  * （各ハンドラは getSubcommand() と option 名で動くので、親が変わっても同じに動く）。
  */
@@ -73,26 +72,6 @@ export const operationsCommand = new SlashCommandBuilder()
   )
   .addSubcommandGroup((g) =>
     g
-      .setName("カジノ")
-      .setDescription("胴元の資金管理")
-      .addSubcommand((s) =>
-        s
-          .setName("資金")
-          .setDescription("賭博場口座のLandを胴元の元手に入れる（手数料なし）")
-          .addIntegerOption((o) => o.setName("金額").setDescription("投入する Land").setRequired(true).setMinValue(1))
-          .addStringOption((o) => o.setName("部署").setDescription("元手の出所（既定: 賭博場）").setAutocomplete(true)),
-      )
-      .addSubcommand((s) => s.setName("回収").setDescription("胴元の売上を個人チップへ引き出す").addIntegerOption((o) => o.setName("チップ").setDescription("引き出すチップ").setRequired(true).setMinValue(1)))
-      .addSubcommand((s) =>
-        s
-          .setName("精算")
-          .setDescription("胴元の売上を賭博場の部署口座へLandで納める")
-          .addStringOption((o) => o.setName("部署").setDescription("納入先（既定: 賭博場）").setAutocomplete(true))
-          .addIntegerOption((o) => o.setName("チップ").setDescription("精算するチップ（省略で全額）").setMinValue(1)),
-      ),
-  )
-  .addSubcommandGroup((g) =>
-    g
       .setName("部署")
       .setDescription("部署口座の作成・削除")
       .addSubcommand((s) =>
@@ -113,8 +92,6 @@ export async function handleOperations(interaction: ChatInputCommandInteraction,
       return handleAuctionCommand(interaction, services);
     case "レース":
       return handleRaceCommand(interaction, services);
-    case "カジノ":
-      return handleCasinoCommand(interaction, services);
     case "部署":
       return handleDepartment(interaction, services);
   }
@@ -124,6 +101,5 @@ export async function handleOperationsAutocomplete(interaction: AutocompleteInte
   const group = interaction.options.getSubcommandGroup();
   if (group === "競売") return handleAuctionAutocomplete(interaction, services);
   if (group === "レース") return handleRaceAutocomplete(interaction, services);
-  // カジノ精算の部署 / 部署削除の部署
   return handleDepartmentAutocomplete(interaction, services);
 }

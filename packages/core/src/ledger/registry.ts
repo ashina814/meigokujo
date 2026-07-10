@@ -72,9 +72,7 @@ export function registerDefaultTxTypes(): void {
   // 運営調整（方向自由・最終手段）
   registerTxType("adjust", { fromKinds: ["user", "system"], toKinds: ["user", "system"] });
 
-  // 賭け系（エスクロー経由・未成年ゲート対象）
-  registerTxType("bet", { fromKinds: ["user"], toKinds: ["system"], minorBlocked: true });
-  registerTxType("prize", { fromKinds: ["system"], toKinds: ["user"], minorBlocked: true });
+  // 賭場系（エスクロー経由・未成年ゲート対象）
   registerTxType("race_rake", { fromKinds: ["system"], toKinds: ["system"] }); // 冥馬レース控除（エスクロー→国庫）
   registerTxType("race_refund", { fromKinds: ["system"], toKinds: ["user"] }); // 不成立・取消の返金
   registerTxType("auction_bid", { fromKinds: ["user"], toKinds: ["system"] });
@@ -82,13 +80,6 @@ export function registerDefaultTxTypes(): void {
   registerTxType("auction_settle", { fromKinds: ["system"], toKinds: ["system"] });
   registerTxType("lottery_ticket", { fromKinds: ["user"], toKinds: ["system"], minorBlocked: true });
   registerTxType("lottery_prize", { fromKinds: ["system"], toKinds: ["user"], minorBlocked: true });
-  // チップ為替（カジノ通貨・Land100%準備 sys:escrow:chips）
-  registerTxType("chip_buy", { fromKinds: ["user"], toKinds: ["system"] }); // Land→チップ（住人→準備プール）
-  registerTxType("chip_sell", { fromKinds: ["system"], toKinds: ["user"] }); // チップ→Land（準備プール→住人）
-  registerTxType("chip_burn", { fromKinds: ["system"], toKinds: ["system"] }); // 両替スプレッドの焼却（プール→国庫回収）
-  registerTxType("chip_settle", { fromKinds: ["system"], toKinds: ["system"] }); // カジノ収益の精算（チップ準備→部署口座へLand）
-  registerTxType("chip_house_fund", { fromKinds: ["system"], toKinds: ["system"] }); // 胴元の元手（部署口座Land→チップ準備、フェアレート）
-
   registerTxType("lottery_rake", { fromKinds: ["system"], toKinds: ["system"] }); // 控除（エスクロー→国庫）
   registerTxType("lottery_seed", { fromKinds: ["system"], toKinds: ["system"] }); // 積立（国庫→エスクロー）
   registerTxType("lottery_refund", { fromKinds: ["system"], toKinds: ["user"] }); // 取消返金

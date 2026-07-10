@@ -25,7 +25,6 @@ export const CHANNEL_KINDS = [
   ["charon_notify", "カロン通知（審判の刻限）"],
   ["announce", "昇格のお知らせ"],
   ["recruit", "蜜月の募集掲示"],
-  ["casino", "カジノ（設定するとゲームはそこ限定）"],
 ] as const;
 
 /** ロール割当の種別（role:<kind> に保存） */
