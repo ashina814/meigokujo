@@ -78,13 +78,9 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
     overdue > 0 ? `⚠️ 期限切れ・印不足: **${overdue}名**（#決裁で承認待ち）` : "期限切れ: なし",
   ].join("\n");
 
-  const openAuctions = services.auctions.listOpen().length;
-  const lot = services.lottery.activeOpen();
   const ops = [
     `対応中チケット: ${openTickets}件${staleTickets > 0 ? ` / ⚠️ 24h無応答 **${staleTickets}件**` : ""}`,
     `稼働中の部屋: ${openRooms}室`,
-    `開催中の競売: ${openAuctions}件 ／ レース: ${services.races.listOpen().length}件`,
-    lot ? `輪廻籤 #${lot.id}: 想定当選 ${fmtLd(services.lottery.jackpot(lot))}（抽選 <t:${lot.draws_at}:R>）` : "輪廻籤: なし",
   ].join("\n");
 
   // 部署口座（残高のある／登録済みの部署を上位から）

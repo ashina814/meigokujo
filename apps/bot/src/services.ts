@@ -1,12 +1,9 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
-  Auctions,
   Departments,
   Entry,
   Fiscal,
-  Lottery,
-  Races,
   Evaluation,
   EventLog,
   Ledger,
@@ -53,13 +50,10 @@ export function buildServices() {
   if (dangling > 0) console.warn(`[vc] 閉じ損ねセグメントを ${dangling} 件補正しました`);
   const titles = new TitleEngine(db, vc);
   const departments = new Departments(db, ledger);
-  const auctions = new Auctions(db, ledger, events);
-  const lottery = new Lottery(db, ledger, settings, events);
-  const races = new Races(db, ledger, events);
   const fiscal = new Fiscal(db, ledger);
   const ranks = new RankEngine(db);
   const bumps = new BumpCounter(db);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, auctions, lottery, races, fiscal, ranks, bumps };
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps };
 }
 
 export type Services = ReturnType<typeof buildServices>;

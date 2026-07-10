@@ -35,9 +35,6 @@ import { handlePromote } from "./commands/promote.js";
 import { handleDashboardCommand } from "./commands/dashboard-command.js";
 import { handleProfile } from "./commands/profile.js";
 import { handleDepartment, handleDepartmentAutocomplete } from "./commands/department.js";
-import { handleAuctionButton, handleAuctionBidModal } from "./commands/auction.js";
-import { handleLotteryButton, handleLotteryBuyModal } from "./commands/lottery.js";
-import { handleRaceSelect, handleRaceBetModal } from "./commands/race.js";
 import { handleTaxCommand, handlePensionCommand, handleFiscalButton } from "./commands/fiscal.js";
 import { handleOperations, handleOperationsAutocomplete } from "./commands/operations.js";
 import { handleHelpCommand } from "./commands/help.js";
@@ -175,22 +172,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleRoomRenameModal(interaction, services);
       return;
     }
-    if (interaction.isModalSubmit() && interaction.customId.startsWith("auc:bidmodal:")) {
-      await handleAuctionBidModal(interaction, services);
-      return;
-    }
-    if (interaction.isModalSubmit() && interaction.customId.startsWith("lot:buymodal:")) {
-      await handleLotteryBuyModal(interaction, services);
-      return;
-    }
-    if (interaction.isModalSubmit() && interaction.customId.startsWith("race:betmodal:")) {
-      await handleRaceBetModal(interaction, services);
-      return;
-    }
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("race:pick:")) {
-      await handleRaceSelect(interaction, services);
-      return;
-    }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {
       await handleEvaluationSelect(interaction, services);
       return;
@@ -221,14 +202,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("room:")) {
         await handleRoomButton(interaction, services);
-        return;
-      }
-      if (interaction.customId.startsWith("auc:bid:")) {
-        await handleAuctionButton(interaction, services);
-        return;
-      }
-      if (interaction.customId.startsWith("lot:buy:") || interaction.customId.startsWith("lot:qbuy:")) {
-        await handleLotteryButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("rank:")) {

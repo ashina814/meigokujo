@@ -64,31 +64,6 @@ export {
   type DepartmentErrorCode,
 } from "./departments/service.js";
 export {
-  Auctions,
-  AuctionError,
-  AUCTION_ESCROW,
-  type AuctionRow,
-  type BidResult,
-  type CloseResult,
-  type AuctionErrorCode,
-} from "./auctions/service.js";
-export {
-  Lottery,
-  LotteryError,
-  LOTTERY_ESCROW,
-  type LotteryRow,
-  type DrawResult,
-  type LotteryErrorCode,
-} from "./lottery/service.js";
-export {
-  Races,
-  RaceError,
-  RACE_ESCROW,
-  type RaceRow,
-  type SettleResult,
-  type RaceErrorCode,
-} from "./races/service.js";
-export {
   Fiscal,
   FiscalError,
   type FiscalRunRow,

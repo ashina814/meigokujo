@@ -9,9 +9,6 @@ import { refreshEvalStats } from "./eval-daily.js";
 import { applyVcRanks } from "./vc-ranks.js";
 import { updateDashboard } from "./dashboard.js";
 import { tickVoiceXp } from "./rank-tracker.js";
-import { announceResult, refreshAuctionPanel } from "./commands/auction.js";
-import { announceDraw, refreshLotteryPanel } from "./commands/lottery.js";
-import { announceRace, refreshRacePanel } from "./commands/race.js";
 import { fmtLd } from "./format.js";
 import type { Services } from "./services.js";
 
@@ -124,39 +121,6 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
 
     // ── 冥獣の巣: 無人の複製VC撤収・報酬対象の掃除 ──
     await scanDens(client, services).catch((e) => console.error("[den] スキャン失敗:", e));
-
-    // ── 競売の自動締切（締切時刻を過ぎた open を落札確定）──
-    for (const expired of services.auctions.listExpired()) {
-      try {
-        const res = services.auctions.close(expired.id, "system:auction");
-        await refreshAuctionPanel(client, services, res.auction);
-        await announceResult(client, services, res.auction, res.winnerId, res.amount);
-      } catch (e) {
-        console.error(`[auction] 自動締切失敗 #${expired.id}:`, e);
-      }
-    }
-
-    // ── 輪廻籤の自動抽選（抽選時刻を過ぎた open を抽選）──
-    for (const expired of services.lottery.listExpired()) {
-      try {
-        const res = services.lottery.draw(expired.id, "system:lottery");
-        await refreshLotteryPanel(client, services, res.lottery);
-        await announceDraw(client, services, res);
-      } catch (e) {
-        console.error(`[lottery] 自動抽選失敗 #${expired.id}:`, e);
-      }
-    }
-
-    // ── 冥馬レースの自動発走（発走時刻を過ぎた open を清算）──
-    for (const expired of services.races.listExpired()) {
-      try {
-        const res = services.races.settle(expired.id, "system:race");
-        await refreshRacePanel(client, services, res.race);
-        await announceRace(client, services, res);
-      } catch (e) {
-        console.error(`[race] 自動発走失敗 #${expired.id}:`, e);
-      }
-    }
 
     // ── 計器盤の更新（10分ごと）──
     if (now.minute % 10 === 0) {
