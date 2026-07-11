@@ -1,6 +1,7 @@
 import type { Client, Message, VoiceChannel } from "discord.js";
-import { ChannelType } from "discord.js";
+import { AttachmentBuilder, ChannelType } from "discord.js";
 import type { Services } from "./services.js";
+import { renderRankUpCard } from "./render/rank-up-card.js";
 
 /**
  * 発言XP・ボイスXPの獲得ロジックと称号アップの通知。
@@ -81,22 +82,56 @@ async function notifyRankUp(
   info: { userId: string; kind: "text" | "voice"; oldTier: string; newTier: string; level: number },
 ): Promise<void> {
   const label = info.kind === "text" ? "発言" : "浮上";
-  // 本人にDM
+
   const user = await client.users.fetch(info.userId).catch(() => null);
-  await user
-    ?.send(
-      `🎖 **${label}の称号が変わりました**\nLv ${info.level} 到達 → **${info.newTier}**（旧: ${info.oldTier}）`,
-    )
-    .catch(() => undefined);
+  const guildId = services.settings.getString("guild:main");
+  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
+  const member = guild ? await guild.members.fetch(info.userId).catch(() => null) : null;
+
+  const displayName = member?.displayName ?? user?.globalName ?? user?.username ?? "住人";
+  const avatarUrl =
+    (member ?? user)?.displayAvatarURL({ extension: "png", size: 256 }) ??
+    "https://cdn.discordapp.com/embed/avatars/0.png";
+
+  const png = await renderRankUpCard({
+    displayName,
+    avatarUrl,
+    serverName: guild?.name,
+    serverIconUrl: guild?.iconURL({ extension: "png", size: 128 }) ?? null,
+    kind: info.kind,
+    oldTier: info.oldTier,
+    newTier: info.newTier,
+    level: info.level,
+  }).catch((e) => {
+    console.warn(`[rank-up] カード生成失敗: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  });
+  const attachment = png ? new AttachmentBuilder(png, { name: "rank-up.png" }) : null;
+
+  // 本人にDM
+  if (user) {
+    if (attachment) {
+      await user
+        .send({ content: `🎖 **${label}の称号が変わりました** — Lv.${info.level}`, files: [attachment] })
+        .catch(() => undefined);
+    } else {
+      await user
+        .send(`🎖 **${label}の称号が変わりました**\nLv ${info.level} 到達 → **${info.newTier}**（旧: ${info.oldTier}）`)
+        .catch(() => undefined);
+    }
+  }
+
   // 称号レベルアップ通知: channel:rank_notify（未設定なら channel:shurei にフォールバック）
   const notifyId =
     services.settings.getString("channel:rank_notify") ?? services.settings.getString("channel:shurei");
   if (notifyId) {
     const ch = await client.channels.fetch(notifyId).catch(() => null);
     if (ch?.isTextBased() && "send" in ch) {
+      const secondAttachment = png ? new AttachmentBuilder(png, { name: "rank-up.png" }) : null;
       await ch
         .send({
           content: `🎖 <@${info.userId}> の **${label}称号** が **${info.newTier}**（Lv ${info.level}）に到達。`,
+          files: secondAttachment ? [secondAttachment] : [],
           allowedMentions: { users: [info.userId] },
         })
         .catch(() => undefined);
