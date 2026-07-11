@@ -64,8 +64,61 @@ function renderHub(services: Services) {
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("shokan:list").setLabel("一覧").setEmoji("📃").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("shokan:new").setLabel("新規商品").setEmoji("➕").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("shokan:history:0").setLabel("購入履歴").setEmoji("📜").setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row] };
+}
+
+const HISTORY_PAGE = 20;
+
+function fmtJstDate(unixSec: number): string {
+  const d = new Date((unixSec + 9 * 3600) * 1000);
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mi = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${d.getUTCFullYear()}/${mm}/${dd} ${hh}:${mi}`;
+}
+
+function renderHistory(services: Services, offset: number) {
+  const total = services.shop.countPurchases();
+  const rows = services.shop.listRecentPurchases(HISTORY_PAGE, offset);
+  const embed = new EmbedBuilder().setTitle("📜 購入履歴").setColor(0xdb2777);
+  if (total === 0) {
+    embed.setDescription("購入履歴はまだありません。");
+    return { embeds: [embed], components: [backButton()] };
+  }
+  const lines = rows.map((p) => {
+    const dateStr = fmtJstDate(p.purchased_at);
+    const priceStr = p.paid_land !== null ? fmtLd(p.paid_land) : p.paid_alt_kind ? `${p.paid_alt_kind} ${p.paid_alt_amount}` : "—";
+    const pendingManual = p.item_delivery === "manual" && p.delivered_at === null && p.status === "active";
+    const statusIcon =
+      p.status === "expired"
+        ? "⚫"
+        : pendingManual
+          ? "📦"
+          : p.delivered_at
+            ? "✅"
+            : "🟢";
+    return `${statusIcon} \`#${p.id}\` ${dateStr} — <@${p.user_id}> **${p.item_name}** — ${priceStr}`;
+  });
+  const from = offset + 1;
+  const to = offset + rows.length;
+  embed.setDescription(lines.join("\n"));
+  embed.setFooter({ text: `${from}〜${to} / 全 ${total} 件（📦=手動配送待ち, ✅=配送済, 🟢=自動配送済/購読中, ⚫=期限切れ）` });
+  const nav = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`shokan:history:${Math.max(0, offset - HISTORY_PAGE)}`)
+      .setLabel("新しい方へ")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(offset === 0),
+    new ButtonBuilder()
+      .setCustomId(`shokan:history:${offset + HISTORY_PAGE}`)
+      .setLabel("古い方へ")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(to >= total),
+  );
+  return { embeds: [embed], components: [nav, backButton()], allowedMentions: { parse: [] as never[] } };
 }
 
 function renderList(services: Services) {
@@ -152,6 +205,10 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   if (action === "hub") return void (await interaction.update(renderHub(services)));
   if (action === "list") return void (await interaction.update(renderList(services)));
   if (action === "new") return void (await interaction.showModal(newItemModal()));
+  if (action === "history") {
+    const offset = Math.max(0, Number(arg ?? 0));
+    return void (await interaction.update(renderHistory(services, offset)));
+  }
   if (action === "edit-basic" && arg) return void (await interaction.showModal(editBasicModal(Number(arg), services)));
   if (action === "edit-role" && arg) return void (await interaction.update(roleEditor(Number(arg))));
   if (action === "edit-delivery" && arg) return void (await interaction.showModal(editDeliveryModal(Number(arg), services)));

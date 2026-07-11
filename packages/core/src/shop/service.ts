@@ -270,6 +270,26 @@ export class Shop {
       .all(userId) as PurchaseRow[];
   }
 
+  /** 全ユーザの購入履歴（新しい順・アイテム名/配送設定を JOIN） */
+  listRecentPurchases(
+    limit: number = 20,
+    offset: number = 0,
+  ): Array<PurchaseRow & { item_name: string; item_delivery: DeliveryMode }> {
+    return this.db
+      .prepare(
+        `SELECT p.*, i.name AS item_name, i.delivery AS item_delivery
+         FROM shop_purchases p
+         JOIN shop_items i ON i.id = p.item_id
+         ORDER BY p.purchased_at DESC
+         LIMIT ? OFFSET ?`,
+      )
+      .all(limit, offset) as Array<PurchaseRow & { item_name: string; item_delivery: DeliveryMode }>;
+  }
+
+  countPurchases(): number {
+    return (this.db.prepare("SELECT COUNT(*) AS c FROM shop_purchases").get() as { c: number }).c;
+  }
+
   /** 月額購読の解約（次月から自動更新しない・当月末までは有効） */
   cancelSubscription(purchaseId: number, actor: string): void {
     this.db
