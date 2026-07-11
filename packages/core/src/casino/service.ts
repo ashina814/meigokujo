@@ -103,14 +103,18 @@ export class Casino {
     })();
   }
 
-  /** ジャックポット払い出し（当選）。積立全額を当選者へ */
-  seizeJackpot(userId: string, game: string): number {
+  /**
+   * ジャックポット払い出し（当選）。
+   * @param share 取れる割合（既定 1 = 全額。スロットは 0.5 = 半分獲得・半分シード残留）
+   */
+  seizeJackpot(userId: string, game: string, share = 1): number {
     return this.db.transaction((): number => {
       const pool = this.jackpotPool();
-      if (pool <= 0) return 0;
-      this.ether.transfer(JACKPOT_HOLDER, userId, pool);
-      this.events.log("casino_jackpot", { actor: userId, payload: { game, amount: pool } });
-      return pool;
+      const amount = Math.floor(pool * Math.min(1, Math.max(0, share)));
+      if (amount <= 0) return 0;
+      this.ether.transfer(JACKPOT_HOLDER, userId, amount);
+      this.events.log("casino_jackpot", { actor: userId, payload: { game, amount, poolBefore: pool } });
+      return amount;
     })();
   }
 

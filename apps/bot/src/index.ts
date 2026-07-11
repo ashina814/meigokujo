@@ -10,6 +10,7 @@ import { handleTip } from "./commands/tip.js";
 import { handleRankingCommand } from "./commands/ranking.js";
 import { handleRankPanelButton } from "./commands/rank-panel.js";
 import { handleEtherButton, handleEtherModal } from "./commands/exchange-panel.js";
+import { handleAsobuCommand } from "./commands/asobu.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -112,6 +113,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "あそびかた":
           await handleHelpCommand(interaction, services);
+          return;
+        case "遊ぶ":
+          await handleAsobuCommand(interaction, services);
           return;
       }
       return;
