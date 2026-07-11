@@ -460,6 +460,7 @@ const PANEL_KIND_CHOICES: Array<[string, string]> = [
   ["entry", "入城申請"],
   ["entry_flex", "時間外希望受付"],
   ["rank", "ランク確認"],
+  ["shop", "公式ショップ"],
   ["ticket_return", "出戻り申請"],
   ["ticket_consult", "個別相談"],
   ["room_normal", "宿"],
