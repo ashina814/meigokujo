@@ -58,7 +58,18 @@ export async function validateBet(
     return { ok: false, bet };
   }
   if (!services.casino.canAccept(maxPayout)) {
-    await interaction.reply({ content: Mammon.tableClosed(), flags: MessageFlags.Ephemeral });
+    // 胴元が最悪ケースの配当を払えない。今の胴元残高で受けられる上限を教える
+    const multiplier = maxPayout / bet;
+    const maxAcceptable = Math.floor(services.casino.houseBalance() / multiplier);
+    await interaction.reply({
+      content: [
+        Mammon.tableClosed(),
+        maxAcceptable >= MIN_BET
+          ? `（この卓で今受けられるのは **${maxAcceptable.toLocaleString()} ◈** まで）`
+          : "（胴元の資金が尽きている。運営: /管理 → 賭場 → 資金投入）",
+      ].join("\n"),
+      flags: MessageFlags.Ephemeral,
+    });
     return { ok: false, bet };
   }
   return { ok: true, bet };

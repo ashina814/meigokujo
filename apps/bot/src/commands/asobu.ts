@@ -6,6 +6,7 @@ import { playChohan } from "../casino/chohan.js";
 import { playCrash } from "../casino/crash.js";
 import { playChinchiro } from "../casino/chinchiro.js";
 import { playRoulette } from "../casino/roulette.js";
+import { playBlackjack } from "../casino/blackjack.js";
 
 /**
  * /遊ぶ — マモンの賭場の全ソロゲーム集約コマンド（casino-bot の /遊ぶ 方式）。
@@ -49,6 +50,14 @@ export const asobuCommand = new SlashCommandBuilder()
   )
   .addSubcommand((sub) =>
     sub.setName("ルーレット").setDescription("🎡 ルーレット — 卓を開く（30秒受付・みんなで張れる）"),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("ブラックジャック")
+      .setDescription("🃏 ブラックジャック — マモンと21勝負")
+      .addIntegerOption((o) =>
+        o.setName("賭け").setDescription("賭けるエテル").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
+      ),
   );
 
 export async function handleAsobuCommand(
@@ -62,4 +71,5 @@ export async function handleAsobuCommand(
   if (sub === "丁半") return playChohan(interaction, services, bet);
   if (sub === "クラッシュ") return playCrash(interaction, services, bet);
   if (sub === "チンチロ") return playChinchiro(interaction, services, bet);
+  if (sub === "ブラックジャック") return playBlackjack(interaction, services, bet);
 }
