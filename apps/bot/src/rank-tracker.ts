@@ -88,10 +88,11 @@ async function notifyRankUp(
       `🎖 **${label}の称号が変わりました**\nLv ${info.level} 到達 → **${info.newTier}**（旧: ${info.oldTier}）`,
     )
     .catch(() => undefined);
-  // 集令チャンネルに公開通知
-  const shureiId = services.settings.getString("channel:shurei");
-  if (shureiId) {
-    const ch = await client.channels.fetch(shureiId).catch(() => null);
+  // 称号レベルアップ通知: channel:rank_notify（未設定なら channel:shurei にフォールバック）
+  const notifyId =
+    services.settings.getString("channel:rank_notify") ?? services.settings.getString("channel:shurei");
+  if (notifyId) {
+    const ch = await client.channels.fetch(notifyId).catch(() => null);
     if (ch?.isTextBased() && "send" in ch) {
       await ch
         .send({

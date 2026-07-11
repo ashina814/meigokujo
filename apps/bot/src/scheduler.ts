@@ -298,9 +298,8 @@ export async function runCharonDaily(client: Client, services: Services): Promis
   }
 
   // ② 本人への演出通知（3日前・前日・当日、各1回）— DM＋通知チャンネルの両方
-  //   通知チャンネルは channel:charon_notify（未設定なら channel:shurei にフォールバック）
-  const notifyChId =
-    services.settings.getString("channel:charon_notify") ?? services.settings.getString("channel:shurei");
+  //   通知チャンネルは channel:charon_notify のみ（集令は階級変動専用のためフォールバックしない）
+  const notifyChId = services.settings.getString("channel:charon_notify");
   const notifyCh = notifyChId ? await client.channels.fetch(notifyChId).catch(() => null) : null;
   const upcoming = services.evaluation.dueBetween(nowTs, nowTs + 4 * DAY);
   for (const r of upcoming) {

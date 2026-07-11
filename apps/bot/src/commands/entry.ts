@@ -626,10 +626,12 @@ async function checkInvitePromotion(guild: Guild, services: Services, inviterId:
   if (mendanRoleId && member.roles.cache.has(mendanRoleId)) return; // 既に面談待ちなら通知しない
   if (mendanRoleId) await member.roles.add(mendanRoleId).catch(() => undefined);
 
-  const shureiId = services.settings.getString("channel:shurei");
+  // 昇格面談呼び出し: channel:promotion_call（未設定なら channel:shurei にフォールバック）
+  const callChId =
+    services.settings.getString("channel:promotion_call") ?? services.settings.getString("channel:shurei");
   const shinRoleId = services.settings.getString("role:shin");
-  if (shureiId) {
-    const channel = await guild.client.channels.fetch(shureiId).catch(() => null);
+  if (callChId) {
+    const channel = await guild.client.channels.fetch(callChId).catch(() => null);
     if (channel?.isTextBased() && "send" in channel) {
       await channel
         .send(

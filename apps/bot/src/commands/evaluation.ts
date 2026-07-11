@@ -281,17 +281,19 @@ export async function handleEvaluationModal(
     const mendanRoleId = services.settings.getString("role:mendan");
     const member = await guild.members.fetch(pending.targetId).catch(() => null);
     if (mendanRoleId && member) await member.roles.add(mendanRoleId).catch(() => undefined);
-    const shureiId = services.settings.getString("channel:shurei");
+    // 昇格面談呼び出し: channel:promotion_call（未設定なら channel:shurei にフォールバック）
+    const callChId =
+      services.settings.getString("channel:promotion_call") ?? services.settings.getString("channel:shurei");
     const shinRoleId = services.settings.getString("role:shin");
-    if (shureiId) {
-      const channel = await guild.client.channels.fetch(shureiId).catch(() => null);
+    if (callChId) {
+      const channel = await guild.client.channels.fetch(callChId).catch(() => null);
       if (channel?.isTextBased() && "send" in channel) {
         await channel.send(
           `⚔️ ${shinRoleId ? `<@&${shinRoleId}> ` : ""}<@${pending.targetId}> の昇格印が **5個** に到達しました。昇格面談をお願いします。`,
         );
       }
     }
-    notes.push("🎉 昇格印5個に到達 → 面談待ちロールを付与し、集令に通知しました");
+    notes.push("🎉 昇格印5個に到達 → 面談待ちロールを付与し、昇格面談呼び出しチャンネルに通知しました");
   }
 
   await interaction.editReply({

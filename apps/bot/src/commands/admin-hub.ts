@@ -342,6 +342,8 @@ const CHANNEL_KEYS: Array<[string, string]> = [
   ["session_vc", "説明会場VC"],
   ["session_vc2", "説明会場VC（2つ目）"],
   ["shokan", "冥界商館（ショップ配送通知）"],
+  ["promotion_call", "昇格面談呼び出し"],
+  ["rank_notify", "称号レベルアップ通知"],
   ["eval_forum", "評価フォーラム"],
   ["shurei", "集令"],
   ["announce", "昇格のお知らせ"],
