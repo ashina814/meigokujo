@@ -130,6 +130,7 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   // ── 部署 ──
   if (section === "dept" && !action) return void (await interaction.update(deptHome(services)));
   if (section === "dept" && action === "create") return void (await interaction.showModal(deptCreateModal()));
+  if (section === "dept" && action === "role") return void (await interaction.update(deptRolePicker(services)));
 
   // ── 調整 ──
   if (section === "adjust" && !action) return void (await interaction.update(adjustHome()));
@@ -190,6 +191,29 @@ export async function handleAdminSelect(
   }
   if (section === "dept" && action === "remove-pick" && interaction.isStringSelectMenu()) {
     return void (await deptRemove(interaction, services, interaction.values[0]!));
+  }
+  if (section === "dept" && action === "role-pick" && interaction.isStringSelectMenu()) {
+    const key = interaction.values[0]!;
+    const dept = services.departments.get(key);
+    if (!dept) {
+      return void (await interaction.update({ content: "❌ 部署が見つかりません。", embeds: [], components: [backButton()] }));
+    }
+    return void (await interaction.update(deptRoleSetPicker(key, dept.name)));
+  }
+  if (section === "dept" && action === "role-set" && interaction.isRoleSelectMenu()) {
+    const key = parts[3]!;
+    const dept = services.departments.get(key);
+    if (!dept) {
+      return void (await interaction.update({ content: "❌ 部署が見つかりません。", embeds: [], components: [backButton()] }));
+    }
+    const roleId = interaction.values[0]!;
+    services.departments.upsert(dept.key, dept.name, roleId);
+    return void (await interaction.update({
+      content: `✅ 「${dept.name}」の担当ロールを <@&${roleId}> に設定しました。`,
+      embeds: [],
+      components: [backButton()],
+      allowedMentions: { parse: [] },
+    }));
   }
   if (section === "adjust" && action === "target" && interaction.isUserSelectMenu()) {
     return void (await interaction.showModal(adjustAmountModal(interaction.values[0]!)));
@@ -263,7 +287,10 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
     }
     try {
       services.departments.upsert(name, name, null);
-      await interaction.reply({ content: `✅ 部署「${name}」を作成しました。担当ロールは /設定 相当の別UIで設定してください（未実装）。`, flags: MessageFlags.Ephemeral });
+      await interaction.reply({
+        content: `✅ 部署「${name}」を作成しました。続けて **担当ロール** ボタンから担当ロールを設定してください。`,
+        flags: MessageFlags.Ephemeral,
+      });
     } catch {
       await interaction.reply({ content: "❌ 作成に失敗しました（キーが不正または既存の可能性）。", flags: MessageFlags.Ephemeral });
     }
@@ -722,13 +749,19 @@ function pensionModal() {
 
 function deptHome(services: Services) {
   const list = services.departments.listWithBalance();
-  const lines = list.length > 0 ? list.map((d) => `・${d.name}: ${fmtLd(d.balance)}`).join("\n") : "（部署なし）";
+  const lines =
+    list.length > 0
+      ? list
+          .map((d) => `・${d.name}: ${fmtLd(d.balance)}${d.role_id ? ` — 担当 <@&${d.role_id}>` : " — 担当未設定"}`)
+          .join("\n")
+      : "（部署なし）";
   const embed = new EmbedBuilder()
     .setTitle("🏢 部署")
     .setColor(0x6b21a8)
     .setDescription(`**現在の部署**\n${lines}`);
   const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:dept:create").setLabel("作成").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("mgmt:dept:role").setLabel("担当ロール").setEmoji("🎭").setStyle(ButtonStyle.Secondary).setDisabled(list.length === 0),
   );
   const components: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [buttons];
   if (list.length > 0) {
@@ -740,6 +773,36 @@ function deptHome(services: Services) {
   }
   components.push(backButton());
   return { embeds: [embed], components };
+}
+
+function deptRolePicker(services: Services) {
+  const list = services.departments.listWithBalance();
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("mgmt:dept:role-pick")
+    .setPlaceholder("担当ロールを設定する部署を選ぶ")
+    .addOptions(
+      list.slice(0, 25).map((d) => ({
+        label: d.name,
+        description: d.role_id ? `現在の担当: ロール設定済み` : "担当未設定",
+        value: d.key,
+      })),
+    );
+  return {
+    embeds: [new EmbedBuilder().setTitle("🎭 部署の担当ロール設定").setDescription("担当ロールを変更・設定する部署を選んでください。")],
+    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu), backButton()],
+  };
+}
+
+function deptRoleSetPicker(deptKey: string, deptName: string) {
+  const menu = new RoleSelectMenuBuilder().setCustomId(`mgmt:dept:role-set:${deptKey}`).setPlaceholder("担当にするロールを選ぶ");
+  return {
+    embeds: [
+      new EmbedBuilder()
+        .setTitle(`🎭 「${deptName}」の担当ロール`)
+        .setDescription("この部署の口座を操作できるロールを選んでください（既存の設定は上書きされます）。"),
+    ],
+    components: [new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(menu), backButton()],
+  };
 }
 
 function deptCreateModal() {
