@@ -4,6 +4,11 @@ export function fmtLd(n: number): string {
   return `${n.toLocaleString("ja-JP")} Ld`;
 }
 
+/** エテル（マモンの賭場の第二通貨）。◈ は通貨記号 */
+export function fmtEther(n: number): string {
+  return `${n.toLocaleString("ja-JP")} ◈`;
+}
+
 /**
  * 記録カードなど幅の限られた場所向けの簡約表記。
  * 冥獄城は京クラス残高が実在するので万進法の単位で畳む。

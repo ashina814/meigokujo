@@ -459,6 +459,7 @@ const NUMBER_KEYS: Array<[string, string]> = [
   ["room_recruit_expire_hours", "蜜月募集の失効（時間）"],
   ["room_recruit_refund", "蜜月失効の返金"],
   ["bump_reward", "bump報酬（Land）"],
+  ["ether_rate_base", "エテル初期レート（1Land=?◈）"],
 ];
 
 async function openNumberSetup(interaction: ButtonInteraction, _services: Services) {
@@ -491,6 +492,7 @@ const PANEL_KIND_CHOICES: Array<[string, string]> = [
   ["entry_flex", "時間外希望受付"],
   ["rank", "ランク確認"],
   ["shop", "公式ショップ"],
+  ["exchange", "マモンの両替所"],
   ["ticket_return", "出戻り申請"],
   ["ticket_consult", "個別相談"],
   ["room_normal", "宿"],

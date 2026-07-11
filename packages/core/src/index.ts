@@ -87,3 +87,12 @@ export {
   type FiscalKind,
   type FiscalErrorCode,
 } from "./fiscal/service.js";
+export {
+  EtherExchange,
+  EtherError,
+  ETHER_ESCROW,
+  HOUSE_HOLDER,
+  type EtherQuote,
+  type EtherErrorCode,
+  type EtherExchangeOptions,
+} from "./casino/exchange.js";

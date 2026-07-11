@@ -18,6 +18,7 @@ import {
   RankEngine,
   BumpCounter,
   Shop,
+  EtherExchange,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -55,7 +56,10 @@ export function buildServices() {
   const ranks = new RankEngine(db);
   const bumps = new BumpCounter(db);
   const shop = new Shop(db, ledger, events);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop };
+  const ether = new EtherExchange(db, ledger, events, {
+    baseRate: () => settings.getNumber("ether_rate_base"),
+  });
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether };
 }
 
 export type Services = ReturnType<typeof buildServices>;

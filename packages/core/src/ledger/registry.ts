@@ -75,4 +75,11 @@ export function registerDefaultTxTypes(): void {
   // 賭け系（新カジノ実装用に汎用型として保持・未成年ゲート対象）
   registerTxType("bet", { fromKinds: ["user"], toKinds: ["system"], minorBlocked: true });
   registerTxType("prize", { fromKinds: ["system"], toKinds: ["user"], minorBlocked: true });
+
+  // エテル為替（マモンの賭場・第二通貨）。Land 側の裏付け操作のみ台帳に乗る
+  registerTxType("ether_buy", { ...userToSys, minorBlocked: true }); // 住人→準備プール（入場・フェア）
+  registerTxType("ether_sell", { ...sysToUser, minorBlocked: true }); // 準備プール→住人（退場・80%着地）
+  registerTxType("ether_burn", { fromKinds: ["system"], toKinds: ["system"] }); // プール→国庫（10%焼却＝シンク）
+  registerTxType("ether_settle", { fromKinds: ["system"], toKinds: ["system"] }); // プール→部署口座（胴元精算）
+  registerTxType("ether_house_fund", { fromKinds: ["system"], toKinds: ["system"] }); // 部署口座→プール（胴元の元手）
 }

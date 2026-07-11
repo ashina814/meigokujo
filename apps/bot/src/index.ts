@@ -9,6 +9,7 @@ import { handleApprovalButton, handleTransfer, handleTransferButton } from "./co
 import { handleTip } from "./commands/tip.js";
 import { handleRankingCommand } from "./commands/ranking.js";
 import { handleRankPanelButton } from "./commands/rank-panel.js";
+import { handleEtherButton, handleEtherModal } from "./commands/exchange-panel.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -145,6 +146,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleShokanModal(interaction, services);
       return;
     }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("ether:")) {
+      await handleEtherModal(interaction, services);
+      return;
+    }
     if (
       (interaction.isStringSelectMenu() ||
         interaction.isUserSelectMenu() ||
@@ -212,6 +217,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("rank:")) {
         await handleRankPanelButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("ether:")) {
+        await handleEtherButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("dept:")) {

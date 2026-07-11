@@ -319,7 +319,7 @@ CREATE TABLE IF NOT EXISTS den_vcs (
   created_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS chip_balances (
+CREATE TABLE IF NOT EXISTS ether_balances (
   user_id    TEXT PRIMARY KEY,
   amount     INTEGER NOT NULL DEFAULT 0 CHECK (amount >= 0),
   updated_at INTEGER NOT NULL
@@ -412,6 +412,8 @@ export function openDb(path: string): Database.Database {
   // 一時的な追跡データなので破棄して問題ない。
   const denSql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='den_vcs'").get() as { sql?: string } | undefined)?.sql;
   if (denSql && denSql.includes("CHECK")) db.exec("DROP TABLE den_vcs");
+  // マイグレーション: 旧カジノの chip_balances は ether_balances に置き換え（旧カジノは開帳前に廃止＝データ無し）
+  db.exec("DROP TABLE IF EXISTS chip_balances");
   db.exec(DDL);
   return db;
 }
