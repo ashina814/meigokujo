@@ -22,10 +22,10 @@ import {
   UserSelectMenuBuilder,
   UserSelectMenuInteraction,
 } from "discord.js";
-import { deptAccount, LedgerError } from "@meigokujo/core";
+import { deptAccount, EtherError, HOUSE_HOLDER, LedgerError } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
 import { updateDashboard } from "../dashboard.js";
-import { fmtLd } from "../format.js";
+import { fmtEther, fmtLd } from "../format.js";
 import type { Services } from "../services.js";
 
 /**
@@ -56,6 +56,7 @@ function renderHub(): { embeds: EmbedBuilder[]; components: ActionRowBuilder<But
         "・**調整**: 残高の運営調整",
         "・**計器盤**: 手動更新",
         "・**XP除外**: 発言/浮上XPを付けないチャンネル・カテゴリ",
+        "・**賭場**: マモンの賭場（胴元資金・売上精算）",
       ].join("\n"),
     );
   const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -63,12 +64,13 @@ function renderHub(): { embeds: EmbedBuilder[]; components: ActionRowBuilder<But
     new ButtonBuilder().setCustomId("mgmt:panel").setLabel("パネル").setEmoji("🪧").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:payroll").setLabel("給与").setEmoji("💰").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:fiscal").setLabel("徴収").setEmoji("🏛").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mgmt:dept").setLabel("部署").setEmoji("🏢").setStyle(ButtonStyle.Secondary),
   );
   const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("mgmt:dept").setLabel("部署").setEmoji("🏢").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:adjust").setLabel("調整").setEmoji("🔧").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:dashboard").setLabel("計器盤").setEmoji("📊").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:xpex").setLabel("XP除外").setEmoji("🚫").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mgmt:casino").setLabel("賭場").setEmoji("🎰").setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row1, row2] };
 }
@@ -131,6 +133,11 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "dept" && !action) return void (await interaction.update(deptHome(services)));
   if (section === "dept" && action === "create") return void (await interaction.showModal(deptCreateModal()));
   if (section === "dept" && action === "role") return void (await interaction.update(deptRolePicker(services)));
+
+  // ── 賭場（マモン） ──
+  if (section === "casino" && !action) return void (await interaction.update(casinoHome(services)));
+  if (section === "casino" && action === "fund") return void (await interaction.showModal(casinoFundModal()));
+  if (section === "casino" && action === "settle") return void (await interaction.showModal(casinoSettleModal()));
 
   // ── 調整 ──
   if (section === "adjust" && !action) return void (await interaction.update(adjustHome()));
@@ -278,6 +285,50 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       });
     } catch (e) {
       const msg = e instanceof LedgerError ? e.code : "処理失敗";
+      await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+  if (section === "casino" && action === "fund") {
+    const amt = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
+    if (!Number.isInteger(amt) || amt <= 0) {
+      await interaction.reply({ content: "金額は正の整数で。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    try {
+      const r = services.ether.fundFromAccount(deptAccount(CASINO_DEPT_KEY), amt, HOUSE_HOLDER, `casino:fund:${interaction.id}`);
+      await interaction.reply({
+        content: `✅ 胴元へ **${fmtLd(r.land)}** を投入し、**${fmtEther(r.ether)}** になりました（胴元残 ${fmtEther(services.casino.houseBalance())}）。`,
+        flags: MessageFlags.Ephemeral,
+      });
+    } catch (e) {
+      const msg =
+        e instanceof LedgerError && e.code === "ERR_INSUFFICIENT"
+          ? `部署「${CASINO_DEPT_KEY}」の残高が足りません（${fmtLd(services.departments.balanceOf(CASINO_DEPT_KEY))}）。`
+          : "処理に失敗しました。";
+      await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+  if (section === "casino" && action === "settle") {
+    const raw = interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim();
+    const held = services.casino.houseBalance();
+    const amt = raw === "" ? held : Number(raw);
+    if (!Number.isInteger(amt) || amt <= 0) {
+      await interaction.reply({ content: held === 0 ? "胴元残高が 0 です。" : "金額は正の整数で。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    try {
+      const r = services.ether.redeemFairToAccount(HOUSE_HOLDER, amt, deptAccount(CASINO_DEPT_KEY), `casino:settle:${interaction.id}`);
+      await interaction.reply({
+        content: `✅ 胴元の **${fmtEther(r.ether)}** を精算し、部署「${CASINO_DEPT_KEY}」へ **${fmtLd(r.land)}** を戻しました（胴元残 ${fmtEther(services.casino.houseBalance())}）。`,
+        flags: MessageFlags.Ephemeral,
+      });
+    } catch (e) {
+      const msg =
+        e instanceof EtherError && e.code === "ERR_INSUFFICIENT_ETHER"
+          ? `胴元のエテルが足りません（${fmtEther(held)}）。`
+          : "処理に失敗しました。";
       await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
     }
     return;
@@ -877,6 +928,62 @@ async function deptRemove(
   }
   services.departments.remove(key);
   await interaction.update({ content: `🗑 部署「${key}」を削除しました。`, embeds: [], components: [backButton()] });
+}
+
+// ---- 賭場（マモン）サブパネル ----
+
+const CASINO_DEPT_KEY = "賭博場";
+
+function casinoHome(services: Services) {
+  const ether = services.ether;
+  const casino = services.casino;
+  const dept = services.departments.get(CASINO_DEPT_KEY);
+  const deptBal = dept ? services.departments.balanceOf(CASINO_DEPT_KEY) : null;
+  const embed = new EmbedBuilder()
+    .setTitle("🎰 マモンの賭場 運営卓")
+    .setColor(0xc9a227)
+    .setDescription(
+      [
+        `**胴元残高**: ${fmtEther(casino.houseBalance())} （テーブルリミットの原資）`,
+        `**ジャックポット積立**: ${fmtEther(casino.jackpotPool())}`,
+        `**為替レート**: 1 Ld = ${ether.rate().toFixed(2)} ◈`,
+        `**準備プール**: ${fmtLd(ether.pool())} ／ **発行エテル**: ${fmtEther(ether.outstanding())}`,
+        "",
+        dept
+          ? `**部署「${CASINO_DEPT_KEY}」残高**: ${fmtLd(deptBal!)}`
+          : `⚠️ 部署「${CASINO_DEPT_KEY}」が未作成です。先に 部署→作成 で作ってください。`,
+        "",
+        "・**資金投入**: 賭博場口座の Land を胴元エテルに（フェアレート・手数料なし）",
+        "・**売上精算**: 胴元エテルを賭博場口座の Land に戻す（フェアレート）",
+      ].join("\n"),
+    );
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("mgmt:casino:fund").setLabel("資金投入").setEmoji("🔸").setStyle(ButtonStyle.Primary).setDisabled(!dept),
+    new ButtonBuilder().setCustomId("mgmt:casino:settle").setLabel("売上精算").setEmoji("🔹").setStyle(ButtonStyle.Secondary).setDisabled(!dept),
+  );
+  return { embeds: [embed], components: [row, backButton()] };
+}
+
+function casinoFundModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:fund")
+    .setTitle("胴元へ資金投入（賭博場口座→胴元）")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("amount").setLabel("投入する Land").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(12),
+      ),
+    );
+}
+
+function casinoSettleModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:settle")
+    .setTitle("売上精算（胴元→賭博場口座）")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("amount").setLabel("精算するエテル（空欄=全額）").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(15),
+      ),
+    );
 }
 
 // ---- 調整サブパネル ----

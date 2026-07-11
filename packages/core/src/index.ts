@@ -96,3 +96,4 @@ export {
   type EtherErrorCode,
   type EtherExchangeOptions,
 } from "./casino/exchange.js";
+export { Casino, JACKPOT_HOLDER, type CasinoStatsRow, type SettleResult } from "./casino/service.js";

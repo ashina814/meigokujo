@@ -19,6 +19,7 @@ import {
   BumpCounter,
   Shop,
   EtherExchange,
+  Casino,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -59,7 +60,8 @@ export function buildServices() {
   const ether = new EtherExchange(db, ledger, events, {
     baseRate: () => settings.getNumber("ether_rate_base"),
   });
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether };
+  const casino = new Casino(db, ether, events);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino };
 }
 
 export type Services = ReturnType<typeof buildServices>;
