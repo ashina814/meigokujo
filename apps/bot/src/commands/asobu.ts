@@ -4,6 +4,8 @@ import { MAX_BET, MIN_BET } from "../casino/common.js";
 import { playSlots } from "../casino/slots.js";
 import { playChohan } from "../casino/chohan.js";
 import { playCrash } from "../casino/crash.js";
+import { playChinchiro } from "../casino/chinchiro.js";
+import { playRoulette } from "../casino/roulette.js";
 
 /**
  * /遊ぶ — マモンの賭場の全ソロゲーム集約コマンド（casino-bot の /遊ぶ 方式）。
@@ -36,6 +38,17 @@ export const asobuCommand = new SlashCommandBuilder()
       .addIntegerOption((o) =>
         o.setName("賭け").setDescription("賭けるエテル").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
       ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("チンチロ")
+      .setDescription("🎲 チンチロ — マモンと3つのサイコロで勝負")
+      .addIntegerOption((o) =>
+        o.setName("賭け").setDescription("賭けるエテル").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub.setName("ルーレット").setDescription("🎡 ルーレット — 卓を開く（30秒受付・みんなで張れる）"),
   );
 
 export async function handleAsobuCommand(
@@ -43,8 +56,10 @@ export async function handleAsobuCommand(
   services: Services,
 ): Promise<void> {
   const sub = interaction.options.getSubcommand();
+  if (sub === "ルーレット") return playRoulette(interaction, services);
   const bet = interaction.options.getInteger("賭け", true);
   if (sub === "スロット") return playSlots(interaction, services, bet);
   if (sub === "丁半") return playChohan(interaction, services, bet);
   if (sub === "クラッシュ") return playCrash(interaction, services, bet);
+  if (sub === "チンチロ") return playChinchiro(interaction, services, bet);
 }
