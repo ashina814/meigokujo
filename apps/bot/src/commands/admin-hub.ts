@@ -186,6 +186,9 @@ export async function handleAdminSelect(
   if (section === "panel" && action === "install-pick" && interaction.isStringSelectMenu()) {
     return void (await installPanel(interaction, services, interaction.values[0]!));
   }
+  if (section === "panel" && action === "dept-pick" && interaction.isStringSelectMenu()) {
+    return void (await installDeptPanel(interaction, services, interaction.values[0]!));
+  }
   if (section === "panel" && action === "remove-pick" && interaction.isStringSelectMenu()) {
     return void (await removePanel(interaction, services, interaction.values[0]!));
   }
@@ -542,13 +545,26 @@ async function installPanel(
     savePanelSetting: m.savePanelSettingExternal,
   }));
   if (kind === "dept") {
+    const list = services.departments.listWithBalance();
+    if (list.length === 0) {
+      await interaction.update({
+        content: "❌ 部署がまだありません。先に `/管理 → 部署 → 作成` で部署を作ってください。",
+        embeds: [],
+        components: [backButton()],
+      });
+      return;
+    }
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId("mgmt:panel:dept-pick")
+      .setPlaceholder("パネルにする部署を選ぶ")
+      .addOptions(list.slice(0, 25).map((d) => ({ label: d.name, value: d.key })));
     await interaction.update({
       embeds: [
         new EmbedBuilder()
           .setTitle("🪧 部署運用パネル設置")
-          .setDescription("部署パネルは `/管理` からは設置できません（部署キー指定が必要）。\n将来のアップデートで対応予定です。"),
+          .setDescription("このチャンネルに設置する部署を選んでください。"),
       ],
-      components: [backButton()],
+      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu), backButton()],
     });
     return;
   }
@@ -563,6 +579,37 @@ async function installPanel(
   savePanelSetting(services, kind, channel.id, sent.id, interaction.user.id);
   await interaction.update({
     embeds: [new EmbedBuilder().setTitle("✅ 設置しました").setDescription(`種別: **${kind}** をこのチャンネルに設置`)],
+    components: [backButton()],
+  });
+}
+
+async function installDeptPanel(
+  interaction: StringSelectMenuInteraction,
+  services: Services,
+  deptKey: string,
+): Promise<void> {
+  const dept = services.departments.get(deptKey);
+  if (!dept) {
+    await interaction.update({ content: "❌ 部署が見つかりません。", embeds: [], components: [backButton()] });
+    return;
+  }
+  const channel = interaction.channel;
+  if (!channel || !channel.isTextBased() || !("send" in channel)) {
+    await interaction.update({ content: "テキストチャンネルで実行してください。", embeds: [], components: [backButton()] });
+    return;
+  }
+  const { panelMessageForKind, savePanelSetting } = await import("./bank-panel.js").then((m) => ({
+    panelMessageForKind: m.panelMessageForExternal,
+    savePanelSetting: m.savePanelSettingExternal,
+  }));
+  const actor = `user:${interaction.user.id}`;
+  services.settings.set(`dept_panel_channel:${channel.id}`, deptKey, actor);
+  const msg = panelMessageForKind("dept", services, channel.id);
+  const sent = await channel.send(msg);
+  await sent.pin().catch(() => undefined);
+  savePanelSetting(services, "dept", channel.id, sent.id, interaction.user.id);
+  await interaction.update({
+    embeds: [new EmbedBuilder().setTitle("✅ 設置しました").setDescription(`「${dept.name}」の運用パネルをこのチャンネルに設置しました。`)],
     components: [backButton()],
   });
 }
