@@ -1,5 +1,6 @@
 import {
   AttachmentBuilder,
+  ButtonInteraction,
   ChatInputCommandInteraction,
   EmbedBuilder,
   MessageFlags,
@@ -99,7 +100,10 @@ async function renderTopEmbed(
   return embed;
 }
 
-async function renderMeCard(interaction: ChatInputCommandInteraction, services: Services): Promise<AttachmentBuilder> {
+export async function renderMeCard(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+): Promise<AttachmentBuilder> {
   const userId = interaction.user.id;
   const t = services.ranks.getText(userId);
   const v = services.ranks.getVoice(userId);
