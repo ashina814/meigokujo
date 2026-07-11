@@ -327,7 +327,7 @@ async function notifyStaffForDelivery(
   const ch = await interaction.client.channels.fetch(chId).catch(() => null);
   if (!ch?.isTextBased() || !("send" in ch)) return;
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`shop:deliver:${purchaseId}`).setLabel("配送完了").setEmoji("📦").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`shokan:deliver:${purchaseId}`).setLabel("配送完了").setEmoji("📦").setStyle(ButtonStyle.Success),
   );
   await ch
     .send({
