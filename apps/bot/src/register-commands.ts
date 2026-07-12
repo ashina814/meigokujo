@@ -11,6 +11,9 @@ import { tipCommand } from "./commands/tip.js";
 import { rankingCommand } from "./commands/ranking.js";
 import { helpCommand } from "./commands/help.js";
 import { asobuCommand } from "./commands/asobu.js";
+import { dailyCommand } from "./commands/daily.js";
+import { passportCommand } from "./commands/passport.js";
+import { banzukeCommand } from "./commands/banzuke.js";
 
 const commands = [
   // 運営（ManageGuildで一般には非表示。全部ここに畳んだ）
@@ -27,6 +30,9 @@ const commands = [
   rankingCommand.toJSON(),
   helpCommand.toJSON(),
   asobuCommand.toJSON(),
+  dailyCommand.toJSON(),
+  passportCommand.toJSON(),
+  banzukeCommand.toJSON(),
 ];
 
 const rest = new REST().setToken(config.token);

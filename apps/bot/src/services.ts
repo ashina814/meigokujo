@@ -20,6 +20,7 @@ import {
   Shop,
   EtherExchange,
   Casino,
+  Daily,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -63,7 +64,12 @@ export function buildServices() {
   const casino = new Casino(db, ether, events, {
     fukuScale: () => settings.getNumber("ether_fuku_scale"),
   });
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino };
+  const daily = new Daily(db, ether, events, {
+    base: () => settings.getNumber("daily_base"),
+    reliefThreshold: () => settings.getNumber("daily_relief_threshold"),
+    reliefMax: () => settings.getNumber("daily_relief_max"),
+  });
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily };
 }
 
 export type Services = ReturnType<typeof buildServices>;

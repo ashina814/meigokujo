@@ -11,6 +11,9 @@ import { handleRankingCommand } from "./commands/ranking.js";
 import { handleRankPanelButton } from "./commands/rank-panel.js";
 import { handleEtherButton, handleEtherModal } from "./commands/exchange-panel.js";
 import { handleAsobuCommand } from "./commands/asobu.js";
+import { handleDailyCommand } from "./commands/daily.js";
+import { handlePassportCommand } from "./commands/passport.js";
+import { handleBanzukeCommand } from "./commands/banzuke.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -116,6 +119,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "遊ぶ":
           await handleAsobuCommand(interaction, services);
+          return;
+        case "福分け":
+          await handleDailyCommand(interaction, services);
+          return;
+        case "通行証":
+          await handlePassportCommand(interaction, services);
+          return;
+        case "賭場番付":
+          await handleBanzukeCommand(interaction, services);
           return;
       }
       return;

@@ -97,3 +97,4 @@ export {
   type EtherExchangeOptions,
 } from "./casino/exchange.js";
 export { Casino, JACKPOT_HOLDER, RELIEF_HOLDER, CHAIN_TIERS, chainMultiplier, fukuRate, type CasinoStatsRow, type SettleResult, type CasinoOptions } from "./casino/service.js";
+export { Daily, type DailyClaim, type DailyClaimResult, type DailyOptions } from "./casino/daily.js";
