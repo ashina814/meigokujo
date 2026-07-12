@@ -11,7 +11,7 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
 
 /**
@@ -218,7 +218,8 @@ async function runRound(
   // ── 精算 ──
   if (cashedOut && cashOutMultiplier >= 1.0) {
     const rawPayout = Math.floor(bet * cashOutMultiplier);
-    const settled = services.casino.settle(uid, "クラッシュ", bet, rawPayout);
+    const amulet = applyAmulets(services, uid, bet, rawPayout);
+    const settled = services.casino.settle(uid, "クラッシュ", bet, amulet.payout);
     const embed = new EmbedBuilder()
       .setTitle("📈 クラッシュ — 離脱成功！")
       .setColor(WIN_COLOR)
@@ -232,6 +233,7 @@ async function runRound(
           settled.fukuTax > 0
             ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
             : "",
+          amulet.note ? `✨ ${amulet.note}` : "",
         ]
           .filter(Boolean)
           .join("\n"),
@@ -240,11 +242,13 @@ async function runRound(
     await reply.edit({ embeds: [embed], components: [buildRetryRow()] }).catch(() => undefined);
     broadcastBigWin(interaction.client, services, { userId: uid, game: "クラッシュ", bet, payout: settled.payout });
   } else {
-    services.casino.settle(uid, "クラッシュ", bet, 0);
+    const lossAmulet = applyAmulets(services, uid, bet, 0);
+    services.casino.settle(uid, "クラッシュ", bet, lossAmulet.payout);
+    const lossLine = lossAmulet.payout > 0 ? `🛡 ${lossAmulet.note ?? "返金"} (${fmtEther(lossAmulet.payout)})` : `💸 -${fmtEther(bet)}`;
     const embed = new EmbedBuilder()
       .setTitle("💥 クラッシュ — 燃え尽き！")
       .setColor(LOSE_COLOR)
-      .setDescription([`📉 崩壊: **${crashPoint.toFixed(2)}x**`, `💸 -${fmtEther(bet)}`].join("\n"))
+      .setDescription([`📉 崩壊: **${crashPoint.toFixed(2)}x**`, lossLine].join("\n"))
       .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
     await reply.edit({ embeds: [embed], components: [buildRetryRow()] }).catch(() => undefined);
   }

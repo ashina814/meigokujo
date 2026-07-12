@@ -21,6 +21,7 @@ import {
   EtherExchange,
   Casino,
   Daily,
+  Items,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -69,7 +70,8 @@ export function buildServices() {
     reliefThreshold: () => settings.getNumber("daily_relief_threshold"),
     reliefMax: () => settings.getNumber("daily_relief_max"),
   });
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily };
+  const items = new Items(db);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items };
 }
 
 export type Services = ReturnType<typeof buildServices>;

@@ -15,6 +15,7 @@ import { handleDailyCommand } from "./commands/daily.js";
 import { handlePassportCommand } from "./commands/passport.js";
 import { handleBanzukeCommand } from "./commands/banzuke.js";
 import { handleShobuCommand } from "./commands/shobu.js";
+import { handleBakutenButton, handleBakutenCommand, handleBakutenSelect } from "./commands/bakuten.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -133,6 +134,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "勝負":
           await handleShobuCommand(interaction, services);
           return;
+        case "賭場商店":
+          await handleBakutenCommand(interaction, services);
+          return;
       }
       return;
     }
@@ -191,6 +195,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleShopSelect(interaction, services);
       return;
     }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("bakuten:")) {
+      await handleBakutenSelect(interaction, services);
+      return;
+    }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {
       await handleEvaluationSelect(interaction, services);
       return;
@@ -241,6 +249,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("ether:")) {
         await handleEtherButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("bakuten:")) {
+        await handleBakutenButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("dept:")) {

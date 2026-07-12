@@ -11,7 +11,7 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
 
 /**
@@ -156,7 +156,8 @@ async function runRound(
   };
 
   const finish = async (rawPayout: number, note: string) => {
-    const settled = services.casino.settle(uid, "ブラックジャック", totalBet, rawPayout);
+    const amulet = applyAmulets(services, uid, totalBet, rawPayout);
+    const settled = services.casino.settle(uid, "ブラックジャック", totalBet, amulet.payout);
     const won = settled.net > 0;
     const push = settled.net === 0 && rawPayout > 0;
     const chainLine = settled.chainBonus > 0
@@ -174,6 +175,7 @@ async function runRound(
           `お前:　 ${showHand(player)} （**${handValue(player)}**）`,
           "",
           note,
+          amulet.note ? `✨ ${amulet.note}` : "",
           chainLine,
           fukuLine,
         ]

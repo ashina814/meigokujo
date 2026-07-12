@@ -11,7 +11,7 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
 
 /**
@@ -251,17 +251,20 @@ async function runOne(
   const reelsRaw: [SlotSymbol, SlotSymbol, SlotSymbol] = [spinReel(), spinReel(), spinReel()];
   const spin = evaluate(reelsRaw, bet);
 
+  // お守り: 勝ちなら勝利ボーナス、負けなら返金保護
+  const amulet = applyAmulets(services, uid, bet, spin.payout);
+  const adjustedPayout = amulet.payout;
   // 精算を先に確定（演出中の残高変動で失敗しないよう）。フリースピンなら賭けは無料
   const jpCut = isFreeSpin ? 0 : Math.max(1, Math.floor(bet * JP_CONTRIBUTION));
   let settled: import("@meigokujo/core").SettleResult | null = null;
   let jpWon = 0;
   if (isFreeSpin) {
     // フリースピンは配当のみ（賭けなし）。settle は使わず胴元→プレイヤーの直接転送
-    if (spin.payout > 0 && services.casino.canAccept(spin.payout)) {
-      services.ether.transfer("house", uid, spin.payout);
+    if (adjustedPayout > 0 && services.casino.canAccept(adjustedPayout)) {
+      services.ether.transfer("house", uid, adjustedPayout);
     }
   } else {
-    settled = services.casino.settle(uid, "スロット", bet, spin.payout, jpCut);
+    settled = services.casino.settle(uid, "スロット", bet, adjustedPayout, jpCut);
   }
   // JP はフリースピンでも当選する（原作準拠）
   if (spin.kind === "jackpot") {
@@ -324,8 +327,8 @@ async function runOne(
   })();
   const reelDisplay = face(reelsRaw[0].emoji, reelsRaw[1].emoji, reelsRaw[2].emoji);
 
-  const won = spin.payout > 0;
-  const totalPayout = spin.payout + jpWon + (settled?.chainBonus ?? 0) - (settled?.fukuTax ?? 0);
+  const won = adjustedPayout > 0;
+  const totalPayout = adjustedPayout + jpWon + (settled?.chainBonus ?? 0) - (settled?.fukuTax ?? 0);
   const net = totalPayout - (isFreeSpin ? 0 : bet);
   const stats = services.casino.stats(uid);
   const winStreak = won ? stats.current_win_streak : 0;
@@ -342,11 +345,13 @@ async function runOne(
       ? `\n⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
       : "";
 
+  const amuletLine = amulet.note ? `✨ ${amulet.note}` : "";
   const descLines = [
     streakBadge.trim(),
     reelDisplay,
     "",
     won ? `💰 配当: ${fmtEther(totalPayout)}${payoutLabel ? ` (${payoutLabel})` : ""}${jpLine}` : "💨 ハズレ",
+    amuletLine,
     chainLine.trim(),
     fukuLine.trim(),
     freeSpinNotice,

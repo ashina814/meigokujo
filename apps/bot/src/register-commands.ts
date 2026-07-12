@@ -15,6 +15,7 @@ import { dailyCommand } from "./commands/daily.js";
 import { passportCommand } from "./commands/passport.js";
 import { banzukeCommand } from "./commands/banzuke.js";
 import { shobuCommand } from "./commands/shobu.js";
+import { bakutenCommand } from "./commands/bakuten.js";
 
 const commands = [
   // 運営（ManageGuildで一般には非表示。全部ここに畳んだ）
@@ -35,6 +36,7 @@ const commands = [
   passportCommand.toJSON(),
   banzukeCommand.toJSON(),
   shobuCommand.toJSON(),
+  bakutenCommand.toJSON(),
 ];
 
 const rest = new REST().setToken(config.token);

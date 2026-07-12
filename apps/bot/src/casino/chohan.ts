@@ -11,7 +11,7 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
 
 /**
@@ -136,7 +136,8 @@ async function runRound(
   const isCho = total % 2 === 0;
   const won = (picked === "cho") === isCho;
   const rawPayout = won ? Math.floor(bet * 2 * (1 - HOUSE_EDGE)) : 0;
-  const settled = services.casino.settle(uid, "丁半", bet, rawPayout);
+  const amulet = applyAmulets(services, uid, bet, rawPayout);
+  const settled = services.casino.settle(uid, "丁半", bet, amulet.payout);
 
   const totalPayout = settled.payout;
   const net = settled.net;
@@ -157,7 +158,8 @@ async function runRound(
         `🎲${DICE_EMOJI[d1]} + 🎲${DICE_EMOJI[d2]} = ${total} → **${resultLabel}**`,
         `張り: **${playerLabel}** → ${won ? "✅ 的中！" : "❌ 外れ"}`,
         "",
-        won ? `💰 +${fmtEther(net)}` : `💸 -${fmtEther(-net)}`,
+        settled.net > 0 ? `💰 +${fmtEther(settled.net)}` : settled.net === 0 ? "🛡 返金（お守り）" : `💸 -${fmtEther(-settled.net)}`,
+        amulet.note ? `✨ ${amulet.note}` : "",
         streakLine,
         fukuLine,
       ]

@@ -12,7 +12,7 @@ import {
 import { HOUSE_HOLDER } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
 
 /**
@@ -182,9 +182,13 @@ async function runRound(
   let playerDice: Dice = [1, 1, 1] as const;
   let playerHand: Hand = { type: "menashi" };
   let playerLocked = false;
+  // 二度振りの権: 装備してればプレイヤーの投数を +1
+  const rerollGranted = services.items.consumeReroll(uid);
+  const playerMaxRolls = MAX_ROLLS + (rerollGranted ? 1 : 0);
+  void rerollGranted;
 
-  for (let rollNo = 1; rollNo <= MAX_ROLLS && !playerLocked; rollNo++) {
-    const remaining = MAX_ROLLS - rollNo + 1;
+  for (let rollNo = 1; rollNo <= playerMaxRolls && !playerLocked; rollNo++) {
+    const remaining = playerMaxRolls - rollNo + 1;
     await shakeAnimation(reply, [], bet, rollNo, remaining);
     playerDice = rollDice();
     playerHand = evaluate(playerDice);
@@ -195,7 +199,7 @@ async function runRound(
     }
 
     if (playerHand.type === "menashi") {
-      if (rollNo < MAX_ROLLS) {
+      if (rollNo < playerMaxRolls) {
         // 自動再振り
         await reply
           .edit({
@@ -203,7 +207,7 @@ async function runRound(
               new EmbedBuilder()
                 .setTitle("🎲 チンチロ")
                 .setColor(MAMMON_COLOR)
-                .setDescription([describe(playerHand), "", diceDisplay(playerDice), "", `第${rollNo}投 → 自動で再振り…（残り${MAX_ROLLS - rollNo}）`].join("\n")),
+                .setDescription([describe(playerHand), "", diceDisplay(playerDice), "", `第${rollNo}投 → 自動で再振り…（残り${playerMaxRolls - rollNo}）`].join("\n")),
             ],
             components: [],
           })
@@ -211,12 +215,12 @@ async function runRound(
         await sleep(1500);
         continue;
       }
-      break; // 3投目メナシ → 確定
+      break; // 最終投メナシ → 確定
     }
 
     // 目 → 選択
     if (playerHand.type === "me") {
-      if (rollNo >= MAX_ROLLS) break;
+      if (rollNo >= playerMaxRolls) break;
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId("chinchiro:stop")
@@ -224,7 +228,7 @@ async function runRound(
           .setStyle(ButtonStyle.Success),
         new ButtonBuilder()
           .setCustomId("chinchiro:reroll")
-          .setLabel(`🎲 もう一度振る（残り${MAX_ROLLS - rollNo}）`)
+          .setLabel(`🎲 もう一度振る（残り${playerMaxRolls - rollNo}）`)
           .setStyle(ButtonStyle.Danger),
       );
       const e = new EmbedBuilder()
@@ -236,10 +240,11 @@ async function runRound(
             "",
             diceDisplay(playerDice),
             "",
-            `**止めるか、もう一度振るか…**（残り ${MAX_ROLLS - rollNo}回）`,
+            `**止めるか、もう一度振るか…**（残り ${playerMaxRolls - rollNo}回）`,
+            rerollGranted ? "✨ 二度振りの権が効いている（+1投）" : "",
             "・**止める** → 今の目で決着",
             "・**もう一度振る** → 上書き。ヒフミやメナシ続きのリスクあり",
-          ].join("\n"),
+          ].filter(Boolean).join("\n"),
         );
       await reply.edit({ embeds: [e], components: [row] }).catch(() => undefined);
 
@@ -348,11 +353,14 @@ async function runRound(
   let extraNote = "";
   let netForDisplay = 0;
 
+  let amuletNote = "";
   if (mul > 0) {
     // 勝ち: profit = bet * mul * (1 - edge)、payout = bet + profit
     const profit = Math.floor(bet * mul * (1 - HOUSE_EDGE));
     const rawPayout = bet + profit;
-    const settled = services.casino.settle(uid, "チンチロ", bet, rawPayout);
+    const amulet = applyAmulets(services, uid, bet, rawPayout);
+    if (amulet.note) amuletNote = `✨ ${amulet.note}`;
+    const settled = services.casino.settle(uid, "チンチロ", bet, amulet.payout);
     color = WIN_COLOR;
     netForDisplay = settled.net;
     const chainLine = settled.chainBonus > 0
@@ -369,10 +377,12 @@ async function runRound(
     color = MAMMON_COLOR;
     payoutText = `🌀 プッシュ：${fmtEther(bet)} を返金`;
   } else if (mul === -1) {
-    // 通常負け: bet だけ徴収
-    services.casino.settle(uid, "チンチロ", bet, 0);
-    netForDisplay = -bet;
-    payoutText = `💸 -${fmtEther(bet)}`;
+    // 通常負け: bet だけ徴収。ただし敗北保護お守りがあれば返金
+    const lossAmulet = applyAmulets(services, uid, bet, 0);
+    if (lossAmulet.note) amuletNote = `✨ ${lossAmulet.note}`;
+    services.casino.settle(uid, "チンチロ", bet, lossAmulet.payout);
+    netForDisplay = lossAmulet.payout - bet;
+    payoutText = lossAmulet.payout > 0 ? `🛡 返金 ${fmtEther(lossAmulet.payout)}` : `💸 -${fmtEther(bet)}`;
   } else {
     // 倍付け負け: bet + (|mul|-1)*bet を徴収。残高不足なら通常負けフォールバック
     const extraNeeded = (Math.abs(mul) - 1) * bet;
@@ -408,7 +418,7 @@ async function runRound(
   const resultEmbed = new EmbedBuilder()
     .setTitle(title)
     .setColor(color)
-    .setDescription([comparison, "", payoutText + extraNote].join("\n"))
+    .setDescription([comparison, "", payoutText + extraNote, amuletNote].filter(Boolean).join("\n"))
     .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
 
   const heldAfter = services.ether.balanceOf(uid);

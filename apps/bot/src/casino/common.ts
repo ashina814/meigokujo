@@ -94,3 +94,31 @@ export function resultEmbed(opts: {
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+/**
+ * お守り消費: 勝ちなら armed_win で配当倍増、負けなら armed_loss で返金。
+ * ゲーム側は raw payout を計算した後にこれを呼ぶ。返される payout を最終値として使う。
+ * @param bet 賭け額（負け保護の返金額計算に使う）
+ * @param rawPayout 生の払戻総額（0=負け）
+ * @returns { payout: 調整後の払戻, note?: string 発動メッセージ }
+ */
+export function applyAmulets(
+  services: Services,
+  userId: string,
+  bet: number,
+  rawPayout: number,
+): { payout: number; note?: string } {
+  if (rawPayout > bet) {
+    const bonus = services.items.consumeWinBonus(userId);
+    if (bonus.mult !== 1) return { payout: Math.floor(rawPayout * bonus.mult), note: bonus.note };
+    return { payout: rawPayout };
+  }
+  if (rawPayout < bet) {
+    const prot = services.items.consumeLossProtection(userId);
+    if (prot.refundRate > 0) {
+      const refund = Math.floor(bet * prot.refundRate);
+      return { payout: refund, note: prot.note };
+    }
+  }
+  return { payout: rawPayout };
+}
