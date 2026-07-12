@@ -14,6 +14,7 @@ import { handleAsobuCommand } from "./commands/asobu.js";
 import { handleDailyCommand } from "./commands/daily.js";
 import { handlePassportCommand } from "./commands/passport.js";
 import { handleBanzukeCommand } from "./commands/banzuke.js";
+import { handleShobuCommand } from "./commands/shobu.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -128,6 +129,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "賭場番付":
           await handleBanzukeCommand(interaction, services);
+          return;
+        case "勝負":
+          await handleShobuCommand(interaction, services);
           return;
       }
       return;
