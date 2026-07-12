@@ -38,11 +38,11 @@ export const itaCommand = new SlashCommandBuilder()
       .addStringOption((o) => o.setName("題目").setDescription("賭けの題目").setRequired(true).setMaxLength(120))
       .addStringOption((o) => o.setName("選択肢1").setDescription("選択肢1").setRequired(true).setMaxLength(60))
       .addStringOption((o) => o.setName("選択肢2").setDescription("選択肢2").setRequired(true).setMaxLength(60))
-      .addStringOption((o) => o.setName("選択肢3").setDescription("選択肢3（任意）").setRequired(false).setMaxLength(60))
-      .addStringOption((o) => o.setName("選択肢4").setDescription("選択肢4（任意）").setRequired(false).setMaxLength(60))
       .addIntegerOption((o) =>
         o.setName("締切分").setDescription("何分後に締切るか（1〜1440）").setRequired(true).setMinValue(1).setMaxValue(1440),
-      ),
+      )
+      .addStringOption((o) => o.setName("選択肢3").setDescription("選択肢3（任意）").setRequired(false).setMaxLength(60))
+      .addStringOption((o) => o.setName("選択肢4").setDescription("選択肢4（任意）").setRequired(false).setMaxLength(60)),
   )
   .addSubcommand((sub) => sub.setName("一覧").setDescription("開催中の板一覧"))
   .addSubcommand((sub) =>
