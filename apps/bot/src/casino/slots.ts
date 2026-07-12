@@ -1,23 +1,34 @@
-import type { ChatInputCommandInteraction } from "discord.js";
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonInteraction,
+  ButtonStyle,
+  ComponentType,
+  EmbedBuilder,
+  MessageFlags,
+  type ChatInputCommandInteraction,
+  type Message,
+} from "discord.js";
 import { fmtEther } from "../format.js";
-import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
-import { acquireSeat, releaseSeat, resultEmbed, sleep, validateBet } from "./common.js";
+import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
 
 /**
- * 🎰 スロット。casino-bot の数学を踏襲（絵柄は冥獄城テーマに差し替え）。
- * - ワイルド🌙 は3揃いの代用のみ（2揃いには効かない）
- * - スキャッター✨ が3つでフリースピン1回（連鎖なし）
- * - JP は純マモン😈³ のみ。積立=賭金1%、当選でプール半分獲得（半分はシード残留）
- * - ハウスエッジ 4%
+ * 🎰 スロット。casino-bot 準拠の忠実移植。
+ * - 3リール、シンボルは冥獄城テーマ
+ * - リール1→2→3 と順に止まる演出（サイクル絵柄でぐるぐる感）
+ * - 1+2 リールが同じ絵柄で止まったら「あと一つで…」ニアミス煽り
+ * - JP は純😈³のみ。積立=賭金1%、当選でプール半分獲得
+ * - 魂片✨3つでフリースピン1回（自動再スピン・賭金不要）
+ * - 結果画面に「最低/前回/最大」の3ボタン + 📖配当表ボタン
  */
 
 const HOUSE_EDGE = 0.04;
 const JP_CONTRIBUTION = 0.01;
 const JP_WIN_SHARE = 0.5;
-/** 最大配当倍率（テーブルリミット判定用）: マモン³=100倍 */
-const MAX_MULTIPLIER = 100;
+const SCATTER_TRIGGER_COUNT = 3;
+const MAX_MULTIPLIER = 100; // マモン³=100倍。テーブルリミット判定用
 
 interface SlotSymbol {
   emoji: string;
@@ -35,7 +46,7 @@ const SYMBOLS: readonly SlotSymbol[] = [
   { emoji: "😈", name: "マモン", weight: 3, kind: "normal" },
   { emoji: "🌙", name: "月", weight: 5, kind: "wild" },
   { emoji: "✨", name: "魂片", weight: 3, kind: "scatter" },
-] as const;
+];
 
 const TRIPLE_PAYOUTS: Record<string, number> = {
   蝙蝠: 3,
@@ -43,8 +54,8 @@ const TRIPLE_PAYOUTS: Record<string, number> = {
   獄炎: 10,
   魔剣: 15,
   王冠: 30,
-  マモン: 100, // 純3つ揃いはJP扱い
-  月: 25, // ワイルド自体の3揃い
+  マモン: 100,
+  月: 25,
 };
 
 const DOUBLE_PAYOUTS: Record<string, number> = {
@@ -56,6 +67,9 @@ const DOUBLE_PAYOUTS: Record<string, number> = {
   マモン: 10,
 };
 
+const CYCLE = ["🦇", "👻", "🔥", "⚔️", "👑", "😈", "🌙", "✨"] as const;
+const cycleAt = (n: number) => CYCLE[n % CYCLE.length]!;
+
 function spinReel(): SlotSymbol {
   const total = SYMBOLS.reduce((a, s) => a + s.weight, 0);
   let roll = Math.random() * total;
@@ -66,31 +80,31 @@ function spinReel(): SlotSymbol {
   return SYMBOLS[0]!;
 }
 
+const isScatter = (s: SlotSymbol) => s.kind === "scatter";
+const isWild = (s: SlotSymbol) => s.kind === "wild";
+
 interface SpinOutcome {
-  reels: SlotSymbol[];
+  reels: [SlotSymbol, SlotSymbol, SlotSymbol];
   payout: number;
   kind: "none" | "double" | "triple" | "wild_triple" | "jackpot";
   matched?: string;
   freeSpin: boolean;
 }
 
-function evaluate(reels: SlotSymbol[], bet: number): SpinOutcome {
-  const isWild = (s: SlotSymbol) => s.kind === "wild";
-  const isScatter = (s: SlotSymbol) => s.kind === "scatter";
-  const freeSpin = reels.filter(isScatter).length >= 3;
+function evaluate(reels: [SlotSymbol, SlotSymbol, SlotSymbol], bet: number): SpinOutcome {
+  const scatterCount = reels.filter(isScatter).length;
+  const freeSpin = scatterCount >= SCATTER_TRIGGER_COUNT;
   const noScatter = !reels.some(isScatter);
   const pay = (mult: number) => Math.floor(bet * mult * (1 - HOUSE_EDGE));
 
-  // 純3つ揃い
-  if (noScatter && reels[0]!.name === reels[1]!.name && reels[1]!.name === reels[2]!.name) {
-    const name = reels[0]!.name;
+  if (noScatter && reels[0].name === reels[1].name && reels[1].name === reels[2].name) {
+    const name = reels[0].name;
     const mult = TRIPLE_PAYOUTS[name] ?? 0;
     if (mult > 0) {
       if (name === "マモン") return { reels, payout: pay(mult), kind: "jackpot", matched: name, freeSpin };
       return { reels, payout: pay(mult), kind: name === "月" ? "wild_triple" : "triple", matched: name, freeSpin };
     }
   }
-  // ワイルド代用3つ揃い（マモンはJP扱いせず通常配当）
   if (noScatter) {
     const wilds = reels.filter(isWild).length;
     const normals = reels.filter((s) => s.kind === "normal");
@@ -99,7 +113,6 @@ function evaluate(reels: SlotSymbol[], bet: number): SpinOutcome {
       if (mult > 0) return { reels, payout: pay(mult), kind: "wild_triple", matched: normals[0]!.name, freeSpin };
     }
   }
-  // 純2つ揃い
   if (noScatter) {
     for (const sym of SYMBOLS) {
       if (sym.kind !== "normal") continue;
@@ -112,89 +125,291 @@ function evaluate(reels: SlotSymbol[], bet: number): SpinOutcome {
   return { reels, payout: 0, kind: "none", freeSpin };
 }
 
-const face = (reels: SlotSymbol[], visible: number) =>
-  reels.map((s, i) => (i < visible ? s.emoji : "❓")).join(" │ ");
+function paytableEmbed(): EmbedBuilder {
+  const tripleLines = Object.entries(TRIPLE_PAYOUTS)
+    .map(([name, mul]) => {
+      const sym = SYMBOLS.find((s) => s.name === name)!;
+      const label = name === "マモン" ? `${sym.emoji} ${name} (純3つでJP)` : `${sym.emoji} ${name}`;
+      return `　${label}: **${mul}倍**`;
+    })
+    .join("\n");
+  const doubleLines = Object.entries(DOUBLE_PAYOUTS)
+    .map(([name, mul]) => {
+      const sym = SYMBOLS.find((s) => s.name === name)!;
+      return `　${sym.emoji} ${name}: **${mul}倍**`;
+    })
+    .join("\n");
+  return new EmbedBuilder()
+    .setTitle("📖 スロット — 配当表")
+    .setColor(MAMMON_COLOR)
+    .setDescription(
+      [
+        "**🎯 3つ揃い** (3リール同じ絵柄)",
+        tripleLines,
+        "",
+        "**🎯 2つ揃い** (2リール同じ絵柄・ワイルド代用不可)",
+        doubleLines,
+        "",
+        "**🌙 月（ワイルド）**",
+        "　他の絵柄を補って3つ揃いを成立させる（マモン純3はJP扱いだがワイルド代用は通常配当）",
+        "",
+        "**✨ 魂片（スキャッター）**",
+        `　位置不問で${SCATTER_TRIGGER_COUNT}つ出現 → **賭金不要でもう1回スピン**`,
+        "",
+        "**🏆 ジャックポット**",
+        `　純3つの 😈 マモン で発動`,
+        `　 → 通常配当 + JPプールの **${JP_WIN_SHARE * 100}%** を獲得`,
+        `　 (プールは賭金の ${JP_CONTRIBUTION * 100}% を毎回積立)`,
+        "",
+        "**⚖️ 福の重み**",
+        "　残高が多いほど勝ち利益から累進奉納（0/5/10/20/30%）。半分は JP・半分は救済プールへ",
+        "**🔥 連鎖**",
+        "　2連勝目から倍率が乗る（最大 ×2.0）。連敗でリセット",
+      ].join("\n"),
+    );
+}
+
+const REEL_BAR = "┃";
+const face = (a: string, b: string, c: string) => `${REEL_BAR} ${a} ${REEL_BAR} ${b} ${REEL_BAR} ${c} ${REEL_BAR}`;
+
+function buildSpinEmbed(
+  services: Services,
+  bet: number,
+  isFreeSpin: boolean,
+  label: string,
+  slots: [string, string, string],
+): EmbedBuilder {
+  return new EmbedBuilder()
+    .setTitle(isFreeSpin ? "✨ フリースピン中" : "🎰 スロット")
+    .setColor(MAMMON_COLOR)
+    .setDescription(
+      [
+        `*${label}*`,
+        "",
+        face(slots[0], slots[1], slots[2]),
+        "",
+        isFreeSpin ? "ベット: **無料**（フリースピン）" : `ベット: ${fmtEther(bet)}`,
+        `🏆 JPプール: **${fmtEther(services.casino.jackpotPool())}**`,
+      ].join("\n"),
+    );
+}
+
+function retryButtons(uid: string, bet: number, services: Services): ActionRowBuilder<ButtonBuilder> {
+  const held = services.ether.balanceOf(uid);
+  const min = MIN_BET;
+  const max = Math.min(MAX_BET, held);
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`slots:retry:${min}`)
+      .setLabel(`最低 ${min.toLocaleString()}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(held < min),
+    new ButtonBuilder()
+      .setCustomId(`slots:retry:${bet}`)
+      .setLabel(`🎰 もう一回 ${bet.toLocaleString()}`)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(held < bet),
+    new ButtonBuilder()
+      .setCustomId(`slots:retry:${max}`)
+      .setLabel(`最大 ${max.toLocaleString()}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(max < min),
+    new ButtonBuilder().setCustomId("slots:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
+  );
+}
 
 export async function playSlots(
-  interaction: ChatInputCommandInteraction,
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction, services, betRaw, betRaw * MAX_MULTIPLIER);
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULTIPLIER);
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
-    await interaction.reply({ content: "まだ前の勝負が終わっていない。", flags: 64 });
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
+    } else {
+      await interaction.reply({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
+    }
     return;
   }
-  const bet = check.bet;
   try {
-    const reels = [spinReel(), spinReel(), spinReel()];
-    const spin1 = evaluate(reels, bet);
-
-    // フリースピン（連鎖なし・同額扱いで追加払い出し）
-    let free: SpinOutcome | null = null;
-    if (spin1.freeSpin) {
-      const reels2 = [spinReel(), spinReel(), spinReel()];
-      free = evaluate(reels2, bet);
-    }
-
-    // 精算を先に確定（演出中の残高変動で失敗しないように。結果は既に決まっている）
-    let totalPayout = spin1.payout + (free?.payout ?? 0);
-    const jpCut = Math.max(1, Math.floor(bet * JP_CONTRIBUTION));
-    const settled = services.casino.settle(uid, "slots", bet, totalPayout, jpCut);
-    let jpWon = 0;
-    if (spin1.kind === "jackpot") {
-      jpWon = services.casino.seizeJackpot(uid, "slots", JP_WIN_SHARE);
-      totalPayout += jpWon;
-    }
-
-    // 演出: 左→中→右 と止める
-    await interaction.reply({ content: `🎰 **スロット** — 賭け ${fmtEther(bet)}\n${face(reels, 0)}` });
-    await sleep(700);
-    await interaction.editReply(`🎰 **スロット** — 賭け ${fmtEther(bet)}\n${face(reels, 1)}`);
-    await sleep(700);
-    await interaction.editReply(`🎰 **スロット** — 賭け ${fmtEther(bet)}\n${face(reels, 2)}`);
-    await sleep(spin1.kind === "none" ? 700 : 1100);
-
-    const lines: string[] = [`${face(reels, 3)}`];
-    if (spin1.kind === "jackpot") {
-      lines.push("", `😈😈😈 **ジャックポット！** 😈😈😈`, `配当 ${fmtEther(spin1.payout)} ＋ JP **${fmtEther(jpWon)}**`, `*「${Mammon.jackpot()}」*`);
-    } else if (spin1.payout > 0) {
-      lines.push("", `**${spin1.matched}** が揃った — 配当 ${fmtEther(spin1.payout)}`);
-    } else {
-      lines.push("", "外れだ。");
-    }
-    if (free) {
-      lines.push("", `✨ 魂片が3つ——**フリースピン**発動！`, `${face(free.reels, 3)}`, free.payout > 0 ? `追加配当 ${fmtEther(free.payout)}` : "何も出なかった。");
-    }
-    if (settled.chainBonus > 0) {
-      lines.push(`${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`);
-    }
-    if (settled.fukuTax > 0) {
-      lines.push(`⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`);
-    }
-    broadcastBigWin(interaction.client, services, {
-      userId: uid,
-      game: "スロット",
-      bet,
-      payout: settled.payout + jpWon,
-      isJackpot: spin1.kind === "jackpot",
-    });
-
-    const net = settled.net + jpWon;
-    await interaction.editReply({
-      content: "",
-      embeds: [
-        resultEmbed({
-          title: `🎰 スロット — ${net > 0 ? `+${fmtEther(net)}` : net < 0 ? `-${fmtEther(-net)}` : "±0"}`,
-          lines,
-          net,
-          balance: services.ether.balanceOf(uid),
-        }),
-      ],
-    });
+    await runOne(interaction, services, check.bet, false);
   } finally {
     releaseSeat(uid);
   }
+}
+
+async function runOne(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+  bet: number,
+  isFreeSpin: boolean,
+): Promise<void> {
+  const uid = interaction.user.id;
+  const reelsRaw: [SlotSymbol, SlotSymbol, SlotSymbol] = [spinReel(), spinReel(), spinReel()];
+  const spin = evaluate(reelsRaw, bet);
+
+  // 精算を先に確定（演出中の残高変動で失敗しないよう）。フリースピンなら賭けは無料
+  const jpCut = isFreeSpin ? 0 : Math.max(1, Math.floor(bet * JP_CONTRIBUTION));
+  let settled: import("@meigokujo/core").SettleResult | null = null;
+  let jpWon = 0;
+  if (isFreeSpin) {
+    // フリースピンは配当のみ（賭けなし）。settle は使わず胴元→プレイヤーの直接転送
+    if (spin.payout > 0 && services.casino.canAccept(spin.payout)) {
+      services.ether.transfer("house", uid, spin.payout);
+    }
+  } else {
+    settled = services.casino.settle(uid, "スロット", bet, spin.payout, jpCut);
+  }
+  // JP はフリースピンでも当選する（原作準拠）
+  if (spin.kind === "jackpot") {
+    jpWon = services.casino.seizeJackpot(uid, "slots", JP_WIN_SHARE);
+  }
+
+  // ── Phase 1: スピンアニメ ──
+  const initialEmbed = buildSpinEmbed(services, bet, isFreeSpin, "壺の中で運命が転がる……", ["❓", "❓", "❓"]);
+  let reply: Message;
+  if (interaction.replied || interaction.deferred) {
+    reply = (await interaction.followUp({ embeds: [initialEmbed] })) as Message;
+  } else {
+    await interaction.reply({ embeds: [initialEmbed] });
+    reply = (await interaction.fetchReply()) as Message;
+  }
+
+  const edit = async (embed: EmbedBuilder, components: ActionRowBuilder<ButtonBuilder>[] = []) => {
+    try {
+      await reply.edit({ embeds: [embed], components });
+    } catch {
+      /* ignore */
+    }
+  };
+
+  // リール1: サイクル→確定
+  for (let t = 0; t < 3; t++) {
+    await sleep(160);
+    await edit(buildSpinEmbed(services, bet, isFreeSpin, "ぐるぐる……", [cycleAt(t * 3), cycleAt(t * 3 + 1), cycleAt(t * 3 + 2)]));
+  }
+  await sleep(160);
+  await edit(buildSpinEmbed(services, bet, isFreeSpin, "ふむ……", [reelsRaw[0].emoji, cycleAt(99), cycleAt(98)]));
+
+  // リール2: サイクル→確定
+  for (let t = 0; t < 3; t++) {
+    await sleep(160);
+    await edit(buildSpinEmbed(services, bet, isFreeSpin, "おぉ……", [reelsRaw[0].emoji, cycleAt(t * 5), cycleAt(t * 5 + 1)]));
+  }
+  await sleep(160);
+
+  // リール1+2 のニアミス煽り
+  const isNearMiss =
+    !isScatter(reelsRaw[0]) &&
+    !isScatter(reelsRaw[1]) &&
+    reelsRaw[0].kind === "normal" &&
+    reelsRaw[1].kind === "normal" &&
+    reelsRaw[0].name === reelsRaw[1].name;
+  const teaseLabel = isNearMiss ? `あと一つで **${reelsRaw[0].name}** が揃う……！` : "むむ……";
+  await edit(buildSpinEmbed(services, bet, isFreeSpin, teaseLabel, [reelsRaw[0].emoji, reelsRaw[1].emoji, "❓"]));
+  await sleep(isNearMiss ? 1900 : 1100);
+
+  // ── Phase 2: 結果 ──
+  const payoutLabel = (() => {
+    switch (spin.kind) {
+      case "jackpot": return `🎉 **JACKPOT！** 純3マモン揃い`;
+      case "triple": return `3つ揃い (${spin.matched})`;
+      case "wild_triple": return `🌙 ワイルド3つ揃い (${spin.matched})`;
+      case "double": return `2つ揃い (${spin.matched})`;
+      default: return "";
+    }
+  })();
+  const reelDisplay = face(reelsRaw[0].emoji, reelsRaw[1].emoji, reelsRaw[2].emoji);
+
+  const won = spin.payout > 0;
+  const totalPayout = spin.payout + jpWon + (settled?.chainBonus ?? 0) - (settled?.fukuTax ?? 0);
+  const net = totalPayout - (isFreeSpin ? 0 : bet);
+  const stats = services.casino.stats(uid);
+  const winStreak = won ? stats.current_win_streak : 0;
+  const streakBadge = winStreak >= 2 ? `🔥 ${winStreak}連勝中！\n` : "";
+
+  const jpLine = jpWon > 0 ? `\n💎 JPプール獲得: **${fmtEther(jpWon)}** (残 ${fmtEther(services.casino.jackpotPool())})` : "";
+  const freeSpinNotice = spin.freeSpin && !isFreeSpin ? `\n\n✨✨ **魂片3つ！フリースピン獲得！** ✨✨` : "";
+  const chainLine =
+    settled && settled.chainBonus > 0
+      ? `\n${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
+      : "";
+  const fukuLine =
+    settled && settled.fukuTax > 0
+      ? `\n⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
+      : "";
+
+  const descLines = [
+    streakBadge.trim(),
+    reelDisplay,
+    "",
+    won ? `💰 配当: ${fmtEther(totalPayout)}${payoutLabel ? ` (${payoutLabel})` : ""}${jpLine}` : "💨 ハズレ",
+    chainLine.trim(),
+    fukuLine.trim(),
+    freeSpinNotice,
+    isFreeSpin ? "" : `\n🏆 JPプール: ${fmtEther(services.casino.jackpotPool())}`,
+  ]
+    .filter((s) => s.length > 0)
+    .join("\n");
+
+  const resultEmbed = new EmbedBuilder()
+    .setTitle(spin.kind === "jackpot" ? "🔥🔥🔥 🎰 スロット 🔥🔥🔥" : "🎰 スロット")
+    .setColor(won ? WIN_COLOR : LOSE_COLOR)
+    .setDescription(descLines)
+    .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
+
+  // 大勝ち速報
+  if (won) {
+    broadcastBigWin(interaction.client, services, {
+      userId: uid,
+      game: "スロット",
+      bet: isFreeSpin ? 0 : bet,
+      payout: totalPayout,
+      isJackpot: spin.kind === "jackpot",
+    });
+  }
+
+  // フリースピンなら結果表示後に自動で再スピン（原作準拠）
+  if (spin.freeSpin && !isFreeSpin) {
+    await edit(resultEmbed, []);
+    await sleep(2500);
+    await runOne(interaction, services, bet, true);
+    return;
+  }
+
+  await edit(resultEmbed, [retryButtons(uid, bet, services)]);
+
+  // ── 「もう一回」/配当表 コレクタ ──
+  const collector = reply.createMessageComponentCollector({
+    componentType: ComponentType.Button,
+    time: 60_000,
+    filter: (i) => i.user.id === uid,
+  });
+  collector.on("collect", async (btn) => {
+    if (btn.customId === "slots:paytable") {
+      await btn.reply({ embeds: [paytableEmbed()], flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (btn.customId.startsWith("slots:retry:")) {
+      collector.stop("retry");
+      const retryBet = Number(btn.customId.split(":")[2]);
+      await btn.deferUpdate();
+      // acquireSeat のためこの playSlots は releaseSeat 後に呼ぶ必要があるが、
+      // 現在の座席は runOne の親（playSlots）が持っている。ここで一旦解放して再取得する。
+      releaseSeat(uid);
+      if (acquireSeat(uid)) {
+        try {
+          await runOne(btn, services, retryBet, false);
+        } finally {
+          releaseSeat(uid);
+        }
+      }
+    }
+  });
+  collector.on("end", async (_col, reason) => {
+    if (reason !== "retry") await edit(resultEmbed, []).catch(() => undefined);
+  });
 }

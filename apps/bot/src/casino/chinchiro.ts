@@ -1,29 +1,36 @@
 import {
   ActionRowBuilder,
   ButtonBuilder,
+  ButtonInteraction,
   ButtonStyle,
   ComponentType,
+  EmbedBuilder,
+  MessageFlags,
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
+import { HOUSE_HOLDER } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
-import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
-import { acquireSeat, releaseSeat, resultEmbed, sleep, validateBet } from "./common.js";
+import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { broadcastBigWin } from "./bigwin.js";
 
 /**
- * 🎲 チンチロ（対マモン）。casino-bot の役・倍率・胴元戦略を踏襲。
- * - 最大3投。終了役（ピンゾロ/ゾロ目/シゴロ/ヒフミ）は即確定
- * - 役倍付け: ピンゾロ5倍 / ゾロ目3倍 / シゴロ2倍 / 目1倍。ヒフミは出した側が2倍払う
- * - 同点はマモン勝ち（ハウスエッジの根幹）。勝ち利益にはさらにエッジ4%
- * - 負けの倍付け徴収は残高が足りない分をスキップ（借金にはしない）
+ * 🎲 チンチロ（対マモン・casino-bot 準拠の忠実移植）。
+ * - 最大3投。終了役（ピンゾロ/ゾロ目/シゴロ/ヒフミ）即確定。メナシ自動再振り。目は選択
+ * - 役倍率: ピンゾロ5 / ゾロ目3 / シゴロ2 / 目1 / ヒフミは負ける側が2倍払う
+ * - 同点はマモン勝ち（-1倍）。勝ち利益にエッジ5%
+ * - 倍付け負け（|mul|≥2）は追加徴収。残高不足なら通常負けにフォールバック
+ * - シェイクアニメ 4フレーム、マモンのターンでも同じ演出
+ * - 結果画面に「最低/前回/最大/配当表/退席」ボタン
  */
-const HOUSE_EDGE = 0.04;
+const HOUSE_EDGE = 0.05;
 const MAX_ROLLS = 3;
-/** 最大配当 = ピンゾロ5倍の利益 + 元金 */
-const MAX_MULT = 6;
+const ROLL_BUTTON_TIMEOUT_MS = 30_000;
+const DIE_FACES = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"] as const;
+const MAX_MULT = 6; // 最大ピンゾロ5倍 = 純利益5倍 + 元金 = 6倍 分の胴元余力
 
-type Dice = [number, number, number];
+type Dice = readonly [number, number, number];
 type Hand =
   | { type: "pinzoro" }
   | { type: "zorome"; value: number }
@@ -32,14 +39,11 @@ type Hand =
   | { type: "me"; score: number }
   | { type: "menashi" };
 
-const DIE = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"] as const;
-
-function roll(): Dice {
-  return [1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6)];
-}
+const rollDice = (): Dice =>
+  [1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6)] as const;
 
 function evaluate(dice: Dice): Hand {
-  const [a, b, c] = [...dice].sort((x, y) => x - y) as Dice;
+  const [a, b, c] = [...dice].sort((x, y) => x - y) as [number, number, number];
   if (a === b && b === c) return a === 1 ? { type: "pinzoro" } : { type: "zorome", value: a };
   if (a === 4 && b === 5 && c === 6) return { type: "shigoro" };
   if (a === 1 && b === 2 && c === 3) return { type: "hifumi" };
@@ -69,146 +73,404 @@ function handBaseMul(h: Hand): number {
   }
 }
 
-/** プレイヤー視点の純倍率（+利益 / -損失 / 0=プッシュ）。同点はマモン勝ち */
-function compare(player: Hand, dealer: Hand): number {
-  if (player.type === "hifumi" && dealer.type === "hifumi") return 0;
-  if (player.type === "hifumi") return -2;
-  if (dealer.type === "hifumi") return 2;
+function compare(player: Hand, dealer: Hand): { result: "player_win" | "dealer_win" | "push"; mul: number } {
+  if (player.type === "hifumi" && dealer.type === "hifumi") return { result: "push", mul: 0 };
+  if (player.type === "hifumi") return { result: "dealer_win", mul: -2 };
+  if (dealer.type === "hifumi") return { result: "player_win", mul: 2 };
   const pr = handRank(player);
   const dr = handRank(dealer);
-  if (pr > dr) return handBaseMul(player);
-  if (pr < dr) return -handBaseMul(dealer);
-  return -1;
+  if (pr > dr) return { result: "player_win", mul: handBaseMul(player) };
+  if (pr < dr) return { result: "dealer_win", mul: -handBaseMul(dealer) };
+  return { result: "dealer_win", mul: -1 };
 }
 
 function describe(h: Hand): string {
   switch (h.type) {
-    case "pinzoro": return "🌟 **ピンゾロ**！（5倍）";
+    case "pinzoro": return "🌟 **ピンゾロ**！1-1-1（5倍）";
     case "zorome": return `🎯 **ゾロ目**！${h.value}-${h.value}-${h.value}（3倍）`;
     case "shigoro": return "🔥 **シゴロ**！4-5-6（2倍）";
     case "hifumi": return "💀 **ヒフミ**…1-2-3（倍付けで払う）";
-    case "me": return `目は **${h.score}**`;
-    case "menashi": return "目なし……";
+    case "me": return `🎲 **目** スコア **${h.score}**`;
+    case "menashi": return "🌀 **メナシ**（役なし）";
   }
 }
 
-const show = (d: Dice) => d.map((v) => DIE[v]).join(" ");
-/** 終了役なら振り直し不可 */
-const isTerminal = (h: Hand) => h.type === "pinzoro" || h.type === "zorome" || h.type === "shigoro" || h.type === "hifumi";
+const isTerminal = (h: Hand) => h.type !== "me" && h.type !== "menashi";
+const diceDisplay = (d: Dice) => `┃ ${DIE_FACES[d[0]]} ┃ ${DIE_FACES[d[1]]} ${DIE_FACES[d[2]]} ┃`;
+
+function paytableEmbed(): EmbedBuilder {
+  return new EmbedBuilder()
+    .setTitle("📖 チンチロ — ルール")
+    .setColor(MAMMON_COLOR)
+    .setDescription(
+      [
+        "**役と倍率（対マモン）**",
+        "・🌟 ピンゾロ 1-1-1 → **5倍**",
+        "・🎯 ゾロ目 → **3倍**",
+        "・🔥 シゴロ 4-5-6 → **2倍**",
+        "・🎲 目（一組ペア）→ **1倍**",
+        "・🌀 メナシ → 目より弱い（自動再振り）",
+        "・💀 ヒフミ 1-2-3 → **出した側が2倍払う**（自爆役）",
+        "",
+        "**振りルール**",
+        "・最大3投。終了役（ピンゾロ/ゾロ目/シゴロ/ヒフミ）で即確定",
+        "・目が出たら「止める/もう一度」を選択",
+        "・メナシは自動で振り直し（3投目でメナシなら確定）",
+        "",
+        "**同点はマモン勝ち**（-1倍）。勝ち利益にエッジ5%",
+      ].join("\n"),
+    );
+}
+
+async function shakeAnimation(reply: Message, header: string[], bet: number, rollNo: number, remaining: number): Promise<void> {
+  for (let f = 0; f < 4; f++) {
+    const shake: Dice = [1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6)] as const;
+    const e = new EmbedBuilder()
+      .setTitle("🎲 チンチロ")
+      .setColor(MAMMON_COLOR)
+      .setDescription([...header, `振る……`, "", diceDisplay(shake), "", `第${rollNo}投（残り${remaining}）／ ベット: ${fmtEther(bet)}`].join("\n"));
+    await reply.edit({ embeds: [e], components: [] }).catch(() => undefined);
+    await sleep(220);
+  }
+}
 
 export async function playChinchiro(
-  interaction: ChatInputCommandInteraction,
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction, services, betRaw, betRaw * MAX_MULT);
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT);
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
-    await interaction.reply({ content: "まだ前の勝負が終わっていない。", flags: 64 });
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
+    } else {
+      await interaction.reply({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
+    }
     return;
   }
-  const bet = check.bet;
   try {
-    // ── プレイヤーの振り（最大3投・終了役は即確定・目/目なしは選択で振り直し）──
-    let dice = roll();
-    let hand = evaluate(dice);
-    let rollNo = 1;
-
-    const header = `🎲 **チンチロ** — 賭け ${fmtEther(bet)}（対マモン）`;
-    const msg = await interaction.reply({ content: `${header}\n壺を振る……`, withResponse: true });
-    const reply: Message | undefined = msg.resource?.message ?? undefined;
-    if (!reply) throw new Error("reply unavailable");
-    await sleep(900);
-
-    while (rollNo < MAX_ROLLS && !isTerminal(hand)) {
-      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId("cc:reroll").setLabel(`もう一度振る（残${MAX_ROLLS - rollNo}投）`).setEmoji("🎲").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("cc:stand").setLabel("この手で勝負").setEmoji("✊").setStyle(ButtonStyle.Success),
-      );
-      await interaction.editReply({
-        content: [header, `第${rollNo}投: ${show(dice)}`, describe(hand), "", "振り直すか、この手で勝負するか。"].join("\n"),
-        components: [row],
-      });
-      let choice: "reroll" | "stand";
-      try {
-        const btn = await reply.awaitMessageComponent({
-          componentType: ComponentType.Button,
-          filter: (i) => i.user.id === uid && i.customId.startsWith("cc:"),
-          time: 45_000,
-        });
-        choice = btn.customId === "cc:reroll" ? "reroll" : "stand";
-        await btn.deferUpdate();
-      } catch {
-        choice = "stand"; // 時間切れは手を保持
-      }
-      if (choice === "stand") break;
-      rollNo += 1;
-      dice = roll();
-      hand = evaluate(dice);
-      await interaction.editReply({ content: `${header}\n第${rollNo}投……`, components: [] });
-      await sleep(800);
-    }
-
-    // ── マモンの振り（戦略: 終了役/目5-6は止め、他は振り直し・3投で強制確定）──
-    await interaction.editReply({
-      content: [header, `お前の手: ${show(dice)} — ${describe(hand)}`, "", `*「${Mammon.betPlaced()}」* マモンが壺を振る……`].join("\n"),
-      components: [],
-    });
-    await sleep(1100);
-
-    let dDice: Dice = roll();
-    let dHand = evaluate(dDice);
-    let dRoll = 1;
-    while (dRoll < MAX_ROLLS && !isTerminal(dHand) && !(dHand.type === "me" && dHand.score >= 5)) {
-      dRoll += 1;
-      dDice = roll();
-      dHand = evaluate(dDice);
-      await sleep(500);
-    }
-
-    // ── 精算 ──
-    const mul = compare(hand, dHand);
-    const held = services.ether.balanceOf(uid);
-    let net: number;
-    if (mul > 0) {
-      const profit = Math.floor(bet * mul * (1 - HOUSE_EDGE));
-      services.casino.settle(uid, "chinchiro", bet, bet + profit);
-      net = profit;
-    } else if (mul === 0) {
-      services.casino.settle(uid, "chinchiro", bet, bet); // プッシュ（記録のみ・返金）
-      net = 0;
-    } else {
-      const loss = Math.min(held, bet * -mul); // 倍付けは払える分だけ（借金なし）
-      services.casino.settle(uid, "chinchiro", loss, 0);
-      net = -loss;
-    }
-
-    const lines = [
-      `お前:　 ${show(dice)} — ${describe(hand)}`,
-      `マモン: ${show(dDice)} — ${describe(dHand)}`,
-      "",
-      mul > 0
-        ? `**勝ち！** 配当 ${fmtEther(bet + net)}（利益 ${fmtEther(net)}）`
-        : mul === 0
-          ? `**プッシュ。** ${fmtEther(bet)} は返す。`
-          : mul < -1
-            ? `**倍付け負け……** ${fmtEther(-net)} 没収`
-            : `**負け。** ${fmtEther(-net)} 没収`,
-    ];
-    await interaction.editReply({
-      content: "",
-      components: [],
-      embeds: [
-        resultEmbed({
-          title: `🎲 チンチロ — ${net > 0 ? `+${fmtEther(net)}` : net < 0 ? `-${fmtEther(-net)}` : "±0"}`,
-          lines,
-          net,
-          balance: services.ether.balanceOf(uid),
-        }),
-      ],
-    });
+    await runRound(interaction, services, check.bet);
   } finally {
     releaseSeat(uid);
   }
+}
+
+async function runRound(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+  bet: number,
+): Promise<void> {
+  const uid = interaction.user.id;
+  const startEmbed = new EmbedBuilder()
+    .setTitle("🎲 チンチロ")
+    .setColor(MAMMON_COLOR)
+    .setDescription(
+      ["さあ、振れ。", "", "┃ ❓ ┃ ❓ ❓ ❓ ┃", "", `ベット: ${fmtEther(bet)} ／ 最大3投`].join("\n"),
+    );
+  let reply: Message;
+  if (interaction.replied || interaction.deferred) {
+    reply = (await interaction.followUp({ embeds: [startEmbed] })) as Message;
+  } else {
+    await interaction.reply({ embeds: [startEmbed] });
+    reply = (await interaction.fetchReply()) as Message;
+  }
+  await sleep(700);
+
+  // ── プレイヤーの振り ──
+  let playerDice: Dice = [1, 1, 1] as const;
+  let playerHand: Hand = { type: "menashi" };
+  let playerLocked = false;
+
+  for (let rollNo = 1; rollNo <= MAX_ROLLS && !playerLocked; rollNo++) {
+    const remaining = MAX_ROLLS - rollNo + 1;
+    await shakeAnimation(reply, [], bet, rollNo, remaining);
+    playerDice = rollDice();
+    playerHand = evaluate(playerDice);
+
+    if (isTerminal(playerHand)) {
+      // 終了役 → 即確定
+      break;
+    }
+
+    if (playerHand.type === "menashi") {
+      if (rollNo < MAX_ROLLS) {
+        // 自動再振り
+        await reply
+          .edit({
+            embeds: [
+              new EmbedBuilder()
+                .setTitle("🎲 チンチロ")
+                .setColor(MAMMON_COLOR)
+                .setDescription([describe(playerHand), "", diceDisplay(playerDice), "", `第${rollNo}投 → 自動で再振り…（残り${MAX_ROLLS - rollNo}）`].join("\n")),
+            ],
+            components: [],
+          })
+          .catch(() => undefined);
+        await sleep(1500);
+        continue;
+      }
+      break; // 3投目メナシ → 確定
+    }
+
+    // 目 → 選択
+    if (playerHand.type === "me") {
+      if (rollNo >= MAX_ROLLS) break;
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("chinchiro:stop")
+          .setLabel(`✋ 止める（${playerHand.score}）`)
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId("chinchiro:reroll")
+          .setLabel(`🎲 もう一度振る（残り${MAX_ROLLS - rollNo}）`)
+          .setStyle(ButtonStyle.Danger),
+      );
+      const e = new EmbedBuilder()
+        .setTitle("🎲 チンチロ")
+        .setColor(MAMMON_COLOR)
+        .setDescription(
+          [
+            describe(playerHand),
+            "",
+            diceDisplay(playerDice),
+            "",
+            `**止めるか、もう一度振るか…**（残り ${MAX_ROLLS - rollNo}回）`,
+            "・**止める** → 今の目で決着",
+            "・**もう一度振る** → 上書き。ヒフミやメナシ続きのリスクあり",
+          ].join("\n"),
+        );
+      await reply.edit({ embeds: [e], components: [row] }).catch(() => undefined);
+
+      const choice = await new Promise<"stop" | "reroll">((resolve) => {
+        const collector = reply.createMessageComponentCollector({
+          componentType: ComponentType.Button,
+          time: ROLL_BUTTON_TIMEOUT_MS,
+          filter: (i) => i.user.id === uid && i.customId.startsWith("chinchiro:"),
+        });
+        collector.on("collect", async (btn) => {
+          await btn.deferUpdate();
+          if (btn.customId === "chinchiro:stop") {
+            collector.stop("stop");
+            resolve("stop");
+          } else {
+            collector.stop("reroll");
+            resolve("reroll");
+          }
+        });
+        collector.on("end", (_c, reason) => {
+          if (reason !== "stop" && reason !== "reroll") resolve("stop"); // 時間切れは保守的に止める
+        });
+      });
+      if (choice === "stop") {
+        playerLocked = true;
+        break;
+      }
+    }
+  }
+
+  // ── マモンの振り（同じシェイクアニメ） ──
+  await reply
+    .edit({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("🎲 チンチロ — マモンの番")
+          .setColor(MAMMON_COLOR)
+          .setDescription(
+            [
+              `あなた: ${diceDisplay(playerDice)}`,
+              `　└ ${describe(playerHand)}`,
+              "",
+              "マモン: ┃ ❓ ┃ ❓ ❓ ❓ ┃",
+            ].join("\n"),
+          ),
+      ],
+      components: [],
+    })
+    .catch(() => undefined);
+  await sleep(1200);
+
+  let dealerDice: Dice = [1, 1, 1] as const;
+  let dealerHand: Hand = { type: "menashi" };
+  for (let rollNo = 1; rollNo <= MAX_ROLLS; rollNo++) {
+    for (let f = 0; f < 4; f++) {
+      const shake: Dice = [1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6)] as const;
+      const e = new EmbedBuilder()
+        .setTitle("🎲 チンチロ — マモンの番")
+        .setColor(MAMMON_COLOR)
+        .setDescription(
+          [
+            `あなた: ${diceDisplay(playerDice)}`,
+            `　└ ${describe(playerHand)}`,
+            "",
+            `マモン: ${diceDisplay(shake)}`,
+            `第${rollNo}投（残り${MAX_ROLLS - rollNo + 1}）`,
+          ].join("\n"),
+        );
+      await reply.edit({ embeds: [e], components: [] }).catch(() => undefined);
+      await sleep(220);
+    }
+    dealerDice = rollDice();
+    dealerHand = evaluate(dealerDice);
+    const willStop = isTerminal(dealerHand) || (dealerHand.type === "me" && dealerHand.score >= 5) || rollNo >= MAX_ROLLS;
+    await reply
+      .edit({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("🎲 チンチロ — マモンの番")
+            .setColor(MAMMON_COLOR)
+            .setDescription(
+              [
+                `あなた: ${diceDisplay(playerDice)}`,
+                `　└ ${describe(playerHand)}`,
+                "",
+                `マモン: ${diceDisplay(dealerDice)}`,
+                `　└ ${describe(dealerHand)}`,
+              ].join("\n"),
+            ),
+        ],
+        components: [],
+      })
+      .catch(() => undefined);
+    await sleep(willStop ? 1400 : 1000);
+    if (willStop) break;
+  }
+
+  // ── 精算 ──
+  const cmp = compare(playerHand, dealerHand);
+  const mul = cmp.mul;
+  const held = services.ether.balanceOf(uid);
+
+  let payoutText = "";
+  let title = "🎲 チンチロ — 対 マモン";
+  let color = LOSE_COLOR;
+  let extraNote = "";
+  let netForDisplay = 0;
+
+  if (mul > 0) {
+    // 勝ち: profit = bet * mul * (1 - edge)、payout = bet + profit
+    const profit = Math.floor(bet * mul * (1 - HOUSE_EDGE));
+    const rawPayout = bet + profit;
+    const settled = services.casino.settle(uid, "チンチロ", bet, rawPayout);
+    color = WIN_COLOR;
+    netForDisplay = settled.net;
+    const chainLine = settled.chainBonus > 0
+      ? `\n${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
+      : "";
+    const fukuLine = settled.fukuTax > 0
+      ? `\n⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
+      : "";
+    payoutText = `💰 配当 ${fmtEther(settled.payout)}（利益 +${fmtEther(settled.net)}）${chainLine}${fukuLine}`;
+    broadcastBigWin(interaction.client, services, { userId: uid, game: "チンチロ", bet, payout: settled.payout });
+  } else if (mul === 0) {
+    // プッシュ（両方ヒフミ）: 返金
+    services.casino.settle(uid, "チンチロ", bet, bet);
+    color = MAMMON_COLOR;
+    payoutText = `🌀 プッシュ：${fmtEther(bet)} を返金`;
+  } else if (mul === -1) {
+    // 通常負け: bet だけ徴収
+    services.casino.settle(uid, "チンチロ", bet, 0);
+    netForDisplay = -bet;
+    payoutText = `💸 -${fmtEther(bet)}`;
+  } else {
+    // 倍付け負け: bet + (|mul|-1)*bet を徴収。残高不足なら通常負けフォールバック
+    const extraNeeded = (Math.abs(mul) - 1) * bet;
+    if (held >= bet + extraNeeded) {
+      services.casino.settle(uid, "チンチロ", bet, 0);
+      services.ether.transfer(uid, HOUSE_HOLDER, extraNeeded);
+      const totalLoss = bet + extraNeeded;
+      netForDisplay = -totalLoss;
+      payoutText = `💀 -${fmtEther(totalLoss)}（${Math.abs(mul)}倍負け）`;
+    } else {
+      services.casino.settle(uid, "チンチロ", bet, 0);
+      netForDisplay = -bet;
+      payoutText = `💸 -${fmtEther(bet)}（残高不足で追加徴収なし）`;
+      extraNote = "\n*※本来は倍付け負けだったが、残高不足のため通常負けにフォールバック*";
+    }
+  }
+
+  const resultLabel =
+    cmp.result === "player_win" ? "✨ **お前の勝ち！**" : cmp.result === "push" ? "🌀 **プッシュ**" : "😈 **マモンの勝ち**";
+  const comparison = [
+    "┌─ お前 ────────────┐",
+    `│ ${diceDisplay(playerDice)}`,
+    `│ ${describe(playerHand)}`,
+    "└──────────────────┘",
+    "┌─ マモン ──────────┐",
+    `│ ${diceDisplay(dealerDice)}`,
+    `│ ${describe(dealerHand)}`,
+    "└──────────────────┘",
+    "",
+    resultLabel,
+  ].join("\n");
+
+  const resultEmbed = new EmbedBuilder()
+    .setTitle(title)
+    .setColor(color)
+    .setDescription([comparison, "", payoutText + extraNote].join("\n"))
+    .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
+
+  const heldAfter = services.ether.balanceOf(uid);
+  const min = MIN_BET;
+  const max = Math.min(MAX_BET, heldAfter);
+  const nextRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`chinchiro:retry:${min}`)
+      .setLabel(`最低 ${min.toLocaleString()}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(heldAfter < min),
+    new ButtonBuilder()
+      .setCustomId(`chinchiro:retry:${bet}`)
+      .setLabel(`🎰 もう一回 ${bet.toLocaleString()}`)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(heldAfter < bet),
+    new ButtonBuilder()
+      .setCustomId(`chinchiro:retry:${max}`)
+      .setLabel(`最大 ${max.toLocaleString()}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(max < min),
+    new ButtonBuilder().setCustomId("chinchiro:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("chinchiro:quit").setLabel("🚪 退席").setStyle(ButtonStyle.Secondary),
+  );
+
+  // 演出用の使わない値を silent（TS 気にせず）
+  void netForDisplay;
+
+  await reply.edit({ embeds: [resultEmbed], components: [nextRow] }).catch(() => undefined);
+
+  const collector = reply.createMessageComponentCollector({
+    componentType: ComponentType.Button,
+    time: 60_000,
+    filter: (i) => i.user.id === uid,
+  });
+  collector.on("collect", async (btn) => {
+    if (btn.customId === "chinchiro:paytable") {
+      await btn.reply({ embeds: [paytableEmbed()], flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (btn.customId === "chinchiro:quit") {
+      collector.stop("quit");
+      await btn.deferUpdate();
+      await reply.edit({ components: [] }).catch(() => undefined);
+      return;
+    }
+    if (btn.customId.startsWith("chinchiro:retry:")) {
+      collector.stop("retry");
+      const retryBet = Number(btn.customId.split(":")[2]);
+      if (retryBet < MIN_BET || retryBet > MAX_BET) return;
+      await btn.deferUpdate();
+      releaseSeat(uid);
+      if (acquireSeat(uid)) {
+        try {
+          await runRound(btn, services, retryBet);
+        } finally {
+          releaseSeat(uid);
+        }
+      }
+    }
+  });
+  collector.on("end", async (_c, reason) => {
+    if (reason !== "retry" && reason !== "quit") await reply.edit({ components: [] }).catch(() => undefined);
+  });
 }
