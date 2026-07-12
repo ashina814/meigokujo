@@ -2,11 +2,12 @@ import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "di
 import { fmtEther } from "../format.js";
 import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
+import { C_BIGWIN, C_LOSE, C_MAMMON, C_PUSH, C_WIN, E, fmtBigDelta } from "./ui.js";
 
-/** マモンの賭場の共通定数・ヘルパ */
-export const MAMMON_COLOR = 0xc9a227;
-export const WIN_COLOR = 0x22c55e;
-export const LOSE_COLOR = 0x7f1d1d;
+/** 後方互換: 既存コードが参照している色エイリアス */
+export const MAMMON_COLOR = C_MAMMON;
+export const WIN_COLOR = C_WIN;
+export const LOSE_COLOR = C_LOSE;
 
 export const MIN_BET = 50;
 export const MAX_BET = 1_000_000;
@@ -82,20 +83,49 @@ export async function validateBet(
   return { ok: true, bet };
 }
 
-/** 勝敗リザルトの共通embed */
+/**
+ * 勝敗リザルトの共通embed（洗練版）。
+ * - Author: 「マモンの賭場 · {ゲーム名}」
+ * - Title: 勝ち/負けタグ + 大きな純損益（±付き）
+ * - Description: 状態詳細のライン
+ * - Footer: 所持 + 連勝バッジ
+ */
 export function resultEmbed(opts: {
-  title: string;
+  title: string; // ゲーム名（"スロット" 等・タグと組み合わせる）
   lines: string[];
   net: number;
   balance: number;
+  bet?: number;
+  isJackpot?: boolean;
+  streak?: number; // 現在の連勝数（設定なら Footer に出す）
 }): EmbedBuilder {
-  const color = opts.net > 0 ? WIN_COLOR : opts.net < 0 ? LOSE_COLOR : MAMMON_COLOR;
-  const mammonLine = opts.net > 0 ? Mammon.win() : opts.net < 0 ? Mammon.lose() : Mammon.push();
+  const won = opts.net > 0;
+  const push = opts.net === 0;
+  const bigWin = won && opts.bet && opts.net >= opts.bet * 5;
+  const color = opts.isJackpot ? 0xf0b429 : bigWin ? C_BIGWIN : won ? C_WIN : push ? C_PUSH : C_LOSE;
+
+  const tag = opts.isJackpot
+    ? `${E.jp} JACKPOT!`
+    : bigWin
+      ? `${E.fire} 大勝ち`
+      : won
+        ? `${E.win} 勝ち`
+        : push
+          ? `${E.push} 引き分け`
+          : `${E.lose} 負け`;
+
+  const mammonLine = opts.isJackpot ? Mammon.jackpot() : bigWin ? Mammon.bigWin() : won ? Mammon.win() : push ? Mammon.push() : Mammon.lose();
+
+  const footerBits = [`所持 ${fmtEther(opts.balance).replace(" ◈", "◈")}`];
+  if (opts.bet) footerBits.push(`賭け ${fmtEther(opts.bet).replace(" ◈", "◈")}`);
+  if (opts.streak && opts.streak >= 2) footerBits.push(`${E.fire} ${opts.streak}連勝`);
+
   return new EmbedBuilder()
-    .setTitle(opts.title)
+    .setAuthor({ name: `マモンの賭場 · ${opts.title.replace(/^[🎰🎲🎡🃏📈🌟💥🏆]\s?/, "").split(" ")[0] ?? "賭場"}` })
+    .setTitle(`${tag}  ${fmtBigDelta(opts.net)}`)
     .setColor(color)
     .setDescription([...opts.lines, "", `*「${mammonLine}」*`].join("\n"))
-    .setFooter({ text: `所持: ${fmtEther(opts.balance).replace("◈", "エテル")}` });
+    .setFooter({ text: footerBits.join(" · ") });
 }
 
 export function sleep(ms: number): Promise<void> {

@@ -117,18 +117,25 @@ async function runRound(
   const dealer: Card[] = [deck.pop()!, deck.pop()!];
   let totalBet = bet;
 
-  const table = (hideDealer: boolean) =>
-    new EmbedBuilder()
-      .setTitle("🃏 ブラックジャック")
+  const table = (hideDealer: boolean) => {
+    const dealerVal = hideDealer ? "**?**" : `**${handValue(dealer)}**`;
+    return new EmbedBuilder()
+      .setAuthor({ name: "マモンの賭場 · ブラックジャック" })
       .setColor(MAMMON_COLOR)
+      .setTitle(`🃏 21 を狙え  ·  賭け ${fmtEther(totalBet)}`)
       .setDescription(
         [
-          `賭け: ${fmtEther(totalBet)}`,
-          "",
-          `マモン: ${showHand(dealer, hideDealer)}${hideDealer ? "" : ` （**${handValue(dealer)}**）`}`,
-          `お前:　 ${showHand(player)} （**${handValue(player)}**）`,
+          "```",
+          `😈 マモン    ${showHand(dealer, hideDealer)}`,
+          `           合計 ${hideDealer ? "?" : String(handValue(dealer))}`,
+          "─────────────────────────────",
+          `👤 お前      ${showHand(player)}`,
+          `           合計 ${handValue(player)}`,
+          "```",
         ].join("\n"),
       );
+    void dealerVal;
+  };
 
   let reply: Message;
   const buttons = (canDouble: boolean) =>
@@ -166,23 +173,31 @@ async function runRound(
     const fukuLine = settled.fukuTax > 0
       ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
       : "";
+    const tag = won ? "🟢 勝ち" : push ? "⚪ プッシュ" : "🔴 負け";
+    const netStr = settled.net === 0 ? "±0 ◈" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} ◈`;
+    const bonusBits: string[] = [];
+    if (chainLine) bonusBits.push(chainLine);
+    if (fukuLine) bonusBits.push(fukuLine);
+    if (amulet.note) bonusBits.push(`✨ ${amulet.note}`);
+
     const embed = new EmbedBuilder()
-      .setTitle(`🃏 ブラックジャック — ${won ? `+${fmtEther(settled.net)}` : push ? "±0" : `-${fmtEther(-settled.net)}`}`)
-      .setColor(won ? WIN_COLOR : push ? MAMMON_COLOR : LOSE_COLOR)
+      .setAuthor({ name: "マモンの賭場 · ブラックジャック" })
+      .setColor(won ? WIN_COLOR : push ? 0x78716c : LOSE_COLOR)
+      .setTitle(`${tag}  **${netStr}**`)
       .setDescription(
         [
-          `マモン: ${showHand(dealer)} （**${handValue(dealer)}**）`,
-          `お前:　 ${showHand(player)} （**${handValue(player)}**）`,
-          "",
+          "```",
+          `😈 マモン    ${showHand(dealer)}   合計 ${handValue(dealer)}`,
+          "─────────────────────────────",
+          `👤 お前      ${showHand(player)}   合計 ${handValue(player)}`,
+          "```",
           note,
-          amulet.note ? `✨ ${amulet.note}` : "",
-          chainLine,
-          fukuLine,
-        ]
-          .filter(Boolean)
-          .join("\n"),
+        ].join("\n"),
       )
-      .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
+      .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
+      .setFooter({
+        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(totalBet).replace(" ◈", "◈")}`].join(" · "),
+      });
 
     if (won) broadcastBigWin(interaction.client, services, { userId: uid, game: "ブラックジャック", bet: totalBet, payout: settled.payout });
 

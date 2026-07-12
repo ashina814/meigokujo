@@ -169,8 +169,14 @@ function paytableEmbed(): EmbedBuilder {
     );
 }
 
-const REEL_BAR = "┃";
-const face = (a: string, b: string, c: string) => `${REEL_BAR} ${a} ${REEL_BAR} ${b} ${REEL_BAR} ${c} ${REEL_BAR}`;
+/**
+ * リール表示（枠線で囲む・二重枠で目立たせる）
+ * ╔═══╦═══╦═══╗
+ * ║ 🦇 ║ 👻 ║ 🔥 ║
+ * ╚═══╩═══╩═══╝
+ */
+const face = (a: string, b: string, c: string) =>
+  ["╔═════╦═════╦═════╗", `║  ${a}  ║  ${b}  ║  ${c}  ║`, "╚═════╩═════╩═════╝"].join("\n");
 
 function buildSpinEmbed(
   services: Services,
@@ -179,19 +185,19 @@ function buildSpinEmbed(
   label: string,
   slots: [string, string, string],
 ): EmbedBuilder {
+  const jp = services.casino.jackpotPool();
+  const jpHigh = jp >= 100_000;
   return new EmbedBuilder()
-    .setTitle(isFreeSpin ? "✨ フリースピン中" : "🎰 スロット")
-    .setColor(MAMMON_COLOR)
-    .setDescription(
-      [
-        `*${label}*`,
-        "",
-        face(slots[0], slots[1], slots[2]),
-        "",
-        isFreeSpin ? "ベット: **無料**（フリースピン）" : `ベット: ${fmtEther(bet)}`,
-        `🏆 JPプール: **${fmtEther(services.casino.jackpotPool())}**`,
-      ].join("\n"),
-    );
+    .setAuthor({ name: `マモンの賭場 · スロット${isFreeSpin ? " · フリースピン" : ""}` })
+    .setColor(jpHigh ? 0xf0b429 : MAMMON_COLOR)
+    .setTitle(`🎰  ${label}`)
+    .setDescription(face(slots[0], slots[1], slots[2]))
+    .setFooter({
+      text: [
+        isFreeSpin ? "ベット: 無料" : `ベット ${fmtEther(bet).replace(" ◈", "◈")}`,
+        `JP ${fmtEther(jp).replace(" ◈", "◈")}${jpHigh ? " 🔥" : ""}`,
+      ].join(" · "),
+    });
 }
 
 function retryButtons(uid: string, bet: number, services: Services): ActionRowBuilder<ButtonBuilder> {
@@ -345,26 +351,48 @@ async function runOne(
       ? `\n⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
       : "";
 
-  const amuletLine = amulet.note ? `✨ ${amulet.note}` : "";
-  const descLines = [
-    streakBadge.trim(),
-    reelDisplay,
-    "",
-    won ? `💰 配当: ${fmtEther(totalPayout)}${payoutLabel ? ` (${payoutLabel})` : ""}${jpLine}` : "💨 ハズレ",
-    amuletLine,
-    chainLine.trim(),
-    fukuLine.trim(),
-    freeSpinNotice,
-    isFreeSpin ? "" : `\n🏆 JPプール: ${fmtEther(services.casino.jackpotPool())}`,
-  ]
-    .filter((s) => s.length > 0)
-    .join("\n");
+  // 結果 embed（Fields でセクション化）
+  const isJp = spin.kind === "jackpot";
+  const bigWin = won && totalPayout >= bet * 5;
+  const color = isJp ? 0xf0b429 : bigWin ? 0x16a34a : won ? 0x22c55e : 0x991b1b;
+
+  const tag = isJp ? "💎 JACKPOT!" : bigWin ? "🔥 大勝ち" : won ? "🟢 勝ち" : "🔴 ハズレ";
+  const netStr = net === 0 ? "±0 ◈" : `${net > 0 ? "+" : "−"}${Math.abs(net).toLocaleString("ja-JP")} ◈`;
+
+  const bonusBits: string[] = [];
+  if (settled && settled.chainBonus > 0) {
+    bonusBits.push(`${settled.chainLabel} 連鎖 ×${settled.chainMult.toFixed(2)}（${settled.chainStreak}連勝）  +${fmtEther(settled.chainBonus)}`);
+  }
+  if (settled && settled.fukuTax > 0) {
+    bonusBits.push(`⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}%  −${fmtEther(settled.fukuTax)}`);
+  }
+  if (amulet.note) bonusBits.push(`✨ ${amulet.note}`);
+  if (jpWon > 0) bonusBits.push(`💎 JP獲得  +${fmtEther(jpWon)}（残 ${fmtEther(services.casino.jackpotPool())}）`);
 
   const resultEmbed = new EmbedBuilder()
-    .setTitle(spin.kind === "jackpot" ? "🔥🔥🔥 🎰 スロット 🔥🔥🔥" : "🎰 スロット")
-    .setColor(won ? WIN_COLOR : LOSE_COLOR)
-    .setDescription(descLines)
-    .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
+    .setAuthor({ name: `マモンの賭場 · スロット${isFreeSpin ? " · フリースピン" : ""}` })
+    .setColor(color)
+    .setTitle(`${tag}  **${netStr}**`)
+    .setDescription(reelDisplay + (payoutLabel ? `\n\n${payoutLabel}` : "") + (spin.freeSpin && !isFreeSpin ? `\n\n✨ **魂片3つ！フリースピン獲得！** ✨` : ""))
+    .addFields(
+      ...(bonusBits.length > 0
+        ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }]
+        : []),
+    )
+    .setFooter({
+      text: [
+        `所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`,
+        !isFreeSpin ? `賭け ${fmtEther(bet).replace(" ◈", "◈")}` : "無料",
+        winStreak >= 2 ? `🔥 ${winStreak}連勝` : "",
+        `JP ${fmtEther(services.casino.jackpotPool()).replace(" ◈", "◈")}`,
+      ].filter(Boolean).join(" · "),
+    });
+  void streakBadge;
+  void chainLine;
+  void fukuLine;
+  void amulet;
+  void freeSpinNotice;
+  void jpLine;
 
   // 大勝ち速報
   if (won) {

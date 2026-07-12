@@ -96,7 +96,8 @@ function describe(h: Hand): string {
 }
 
 const isTerminal = (h: Hand) => h.type !== "me" && h.type !== "menashi";
-const diceDisplay = (d: Dice) => `┃ ${DIE_FACES[d[0]]} ┃ ${DIE_FACES[d[1]]} ${DIE_FACES[d[2]]} ┃`;
+/** 壺の中に転がる三賽を等幅で並べる（原作準拠の見せ方より視認性重視） */
+const diceDisplay = (d: Dice) => `╭─────╮  ╭─────╮  ╭─────╮\n│  ${DIE_FACES[d[0]]}  │  │  ${DIE_FACES[d[1]]}  │  │  ${DIE_FACES[d[2]]}  │\n╰─────╯  ╰─────╯  ╰─────╯`;
 
 function paytableEmbed(): EmbedBuilder {
   return new EmbedBuilder()
@@ -126,9 +127,18 @@ async function shakeAnimation(reply: Message, header: string[], bet: number, rol
   for (let f = 0; f < 4; f++) {
     const shake: Dice = [1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6)] as const;
     const e = new EmbedBuilder()
-      .setTitle("🎲 チンチロ")
+      .setAuthor({ name: "マモンの賭場 · チンチロ" })
       .setColor(MAMMON_COLOR)
-      .setDescription([...header, `振る……`, "", diceDisplay(shake), "", `第${rollNo}投（残り${remaining}）／ ベット: ${fmtEther(bet)}`].join("\n"));
+      .setTitle(`🎲  壺を振る……  ${"・".repeat(f + 1)}`)
+      .setDescription(
+        [
+          ...header,
+          "```",
+          diceDisplay(shake),
+          "```",
+        ].join("\n"),
+      )
+      .setFooter({ text: `第${rollNo}投 · 残り${remaining} · 賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
     await reply.edit({ embeds: [e], components: [] }).catch(() => undefined);
     await sleep(220);
   }

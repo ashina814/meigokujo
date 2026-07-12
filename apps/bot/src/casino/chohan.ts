@@ -78,16 +78,16 @@ async function runRound(
   const uid = interaction.user.id;
 
   const bettingEmbed = new EmbedBuilder()
-    .setTitle("🎴 丁半")
+    .setAuthor({ name: "マモンの賭場 · 丁半" })
     .setColor(MAMMON_COLOR)
+    .setTitle("🎴  丁 か 半 か")
     .setDescription(
       [
         "壺の中で二賽が転がる。",
-        "**丁（偶数）** か **半（奇数）** か。",
-        "",
-        `ベット: ${fmtEther(bet)}`,
+        "**丁（偶数）** か **半（奇数）** か——15秒以内に選べ。",
       ].join("\n"),
-    );
+    )
+    .setFooter({ text: `賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
   const choiceRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("chohan:cho").setLabel("丁（偶数）").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("chohan:han").setLabel("半（奇数）").setStyle(ButtonStyle.Danger),
@@ -120,11 +120,19 @@ async function runRound(
     const d1 = 1 + Math.floor(Math.random() * 6);
     const d2 = 1 + Math.floor(Math.random() * 6);
     return new EmbedBuilder()
-      .setTitle("🎴 丁半")
+      .setAuthor({ name: "マモンの賭場 · 丁半" })
       .setColor(MAMMON_COLOR)
+      .setTitle(`🎴  壺を振る……  ${"・".repeat(frame + 1)}`)
       .setDescription(
-        [`壺を振る……(${frame + 1}/3)`, "", `${DIE[d1]}   ${DIE[d2]}`, "", `ベット: ${fmtEther(bet)}`].join("\n"),
-      );
+        [
+          "```",
+          `╭─────╮   ╭─────╮`,
+          `│  ${DIE[d1]}  │   │  ${DIE[d2]}  │`,
+          `╰─────╯   ╰─────╯`,
+          "```",
+        ].join("\n"),
+      )
+      .setFooter({ text: `賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
   };
   for (let f = 0; f < 3; f++) {
     await reply.edit({ embeds: [shakeEmbed(f)], components: [] }).catch(() => undefined);
@@ -150,23 +158,35 @@ async function runRound(
   const fukuLine =
     settled.fukuTax > 0 ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納` : "";
 
+  const tag = won ? "🟢 的中" : settled.net === 0 ? "⚪ 返金（お守り）" : "🔴 外れ";
+  const netStr = settled.net === 0 ? "±0 ◈" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} ◈`;
+  const bonusBits: string[] = [];
+  if (streakLine) bonusBits.push(streakLine);
+  if (fukuLine) bonusBits.push(fukuLine);
+  if (amulet.note) bonusBits.push(`✨ ${amulet.note}`);
+
   const resultEmbed = new EmbedBuilder()
-    .setTitle(`🎴 丁半${won ? " — 的中！" : ""}`)
-    .setColor(won ? WIN_COLOR : LOSE_COLOR)
+    .setAuthor({ name: "マモンの賭場 · 丁半" })
+    .setColor(won ? WIN_COLOR : settled.net === 0 ? 0x78716c : LOSE_COLOR)
+    .setTitle(`${tag}  **${netStr}**`)
     .setDescription(
       [
-        `🎲${DICE_EMOJI[d1]} + 🎲${DICE_EMOJI[d2]} = ${total} → **${resultLabel}**`,
-        `張り: **${playerLabel}** → ${won ? "✅ 的中！" : "❌ 外れ"}`,
-        "",
-        settled.net > 0 ? `💰 +${fmtEther(settled.net)}` : settled.net === 0 ? "🛡 返金（お守り）" : `💸 -${fmtEther(-settled.net)}`,
-        amulet.note ? `✨ ${amulet.note}` : "",
-        streakLine,
-        fukuLine,
-      ]
-        .filter(Boolean)
-        .join("\n"),
+        "```",
+        `╭─────╮   ╭─────╮`,
+        `│  ${DIE[d1]}  │   │  ${DIE[d2]}  │`,
+        `╰─────╯   ╰─────╯`,
+        "```",
+        `**${d1 + d2}** → **${resultLabel}**   ／   お前の張り: **${playerLabel}**`,
+      ].join("\n"),
     )
-    .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
+    .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
+    .setFooter({
+      text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
+    });
+  void DICE_EMOJI;
+  void total;
+  void totalPayout;
+  void net;
 
   if (won) {
     broadcastBigWin(interaction.client, services, {
