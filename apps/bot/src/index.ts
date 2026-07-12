@@ -18,6 +18,7 @@ import { handleShobuCommand } from "./commands/shobu.js";
 import { handleBakutenButton, handleBakutenCommand, handleBakutenSelect } from "./commands/bakuten.js";
 import { handleStocksButton, handleStocksCommand, handleStocksModal, handleStocksSelect } from "./commands/stocks.js";
 import { handleKeibaCommand } from "./commands/keiba.js";
+import { handleAnnaiButton, handleAnnaiCommand } from "./commands/annai.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -144,6 +145,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "競馬":
           await handleKeibaCommand(interaction, services);
+          return;
+        case "案内":
+          await handleAnnaiCommand(interaction, services);
           return;
       }
       return;
@@ -273,6 +277,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("stocks:")) {
         await handleStocksButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("annai:")) {
+        await handleAnnaiButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("dept:")) {
