@@ -60,7 +60,9 @@ export function buildServices() {
   const ether = new EtherExchange(db, ledger, events, {
     baseRate: () => settings.getNumber("ether_rate_base"),
   });
-  const casino = new Casino(db, ether, events);
+  const casino = new Casino(db, ether, events, {
+    fukuScale: () => settings.getNumber("ether_fuku_scale"),
+  });
   return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino };
 }
 

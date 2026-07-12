@@ -3,6 +3,7 @@ import { fmtEther } from "../format.js";
 import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
 import { acquireSeat, releaseSeat, resultEmbed, sleep, validateBet } from "./common.js";
+import { broadcastBigWin } from "./bigwin.js";
 
 /**
  * 🎰 スロット。casino-bot の数学を踏襲（絵柄は冥獄城テーマに差し替え）。
@@ -141,7 +142,7 @@ export async function playSlots(
     // 精算を先に確定（演出中の残高変動で失敗しないように。結果は既に決まっている）
     let totalPayout = spin1.payout + (free?.payout ?? 0);
     const jpCut = Math.max(1, Math.floor(bet * JP_CONTRIBUTION));
-    services.casino.settle(uid, "slots", bet, totalPayout, jpCut);
+    const settled = services.casino.settle(uid, "slots", bet, totalPayout, jpCut);
     let jpWon = 0;
     if (spin1.kind === "jackpot") {
       jpWon = services.casino.seizeJackpot(uid, "slots", JP_WIN_SHARE);
@@ -167,8 +168,21 @@ export async function playSlots(
     if (free) {
       lines.push("", `✨ 魂片が3つ——**フリースピン**発動！`, `${face(free.reels, 3)}`, free.payout > 0 ? `追加配当 ${fmtEther(free.payout)}` : "何も出なかった。");
     }
+    if (settled.chainBonus > 0) {
+      lines.push(`${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`);
+    }
+    if (settled.fukuTax > 0) {
+      lines.push(`⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`);
+    }
+    broadcastBigWin(interaction.client, services, {
+      userId: uid,
+      game: "スロット",
+      bet,
+      payout: settled.payout + jpWon,
+      isJackpot: spin1.kind === "jackpot",
+    });
 
-    const net = totalPayout - bet;
+    const net = settled.net + jpWon;
     await interaction.editReply({
       content: "",
       embeds: [

@@ -430,6 +430,7 @@ const CHANNEL_KEYS: Array<[string, string]> = [
   ["announce", "昇格のお知らせ"],
   ["recruit", "蜜月の募集掲示"],
   ["charon_notify", "カロン通知"],
+  ["bigwin", "大勝ち速報"],
 ];
 
 async function openChannelSetup(interaction: ButtonInteraction, _services: Services) {
@@ -511,6 +512,7 @@ const NUMBER_KEYS: Array<[string, string]> = [
   ["room_recruit_refund", "蜜月失効の返金"],
   ["bump_reward", "bump報酬（Land）"],
   ["ether_rate_base", "エテル初期レート（1Land=?◈）"],
+  ["ether_fuku_scale", "福の重みスケール"],
 ];
 
 async function openNumberSetup(interaction: ButtonInteraction, _services: Services) {

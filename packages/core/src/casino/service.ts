@@ -11,6 +11,43 @@ import { EtherError, EtherExchange, HOUSE_HOLDER } from "./exchange.js";
  * - ジャックポットは専用保有者(jackpot)に積む
  */
 export const JACKPOT_HOLDER = "jackpot";
+/** 救済プール（福の重みの半分が入る。デイリー福分けの原資） */
+export const RELIEF_HOLDER = "relief";
+
+/** 連鎖ボーナス（連勝チェーン）。casino-bot の CHAIN_TIERS 準拠 */
+export const CHAIN_TIERS: ReadonlyArray<{ min: number; mult: number; label: string }> = [
+  { min: 1, mult: 1.0, label: "" },
+  { min: 2, mult: 1.05, label: "🔥" },
+  { min: 3, mult: 1.1, label: "🔥" },
+  { min: 5, mult: 1.2, label: "🔥🔥" },
+  { min: 7, mult: 1.35, label: "🔥🔥" },
+  { min: 10, mult: 1.5, label: "🔥🔥🔥" },
+  { min: 15, mult: 1.75, label: "✦🔥🔥🔥" },
+  { min: 20, mult: 2.0, label: "✦✦🔥🔥🔥" },
+];
+
+export function chainMultiplier(streak: number): { mult: number; label: string } {
+  let mult = 1.0;
+  let label = "";
+  for (const t of CHAIN_TIERS)
+    if (streak >= t.min) {
+      mult = t.mult;
+      label = t.label;
+    }
+  return { mult, label };
+}
+
+/**
+ * 福の重み（勝ち分への累進奉納率）。casino-bot 準拠のしきい値 × scale。
+ * scale はエテル物価に合わせる係数（既定10 = 冥獄城レート 1Ld=10◈ 相当）。
+ */
+export function fukuRate(balance: number, scale: number): number {
+  if (balance <= 10_000 * scale) return 0;
+  if (balance <= 50_000 * scale) return 0.05;
+  if (balance <= 100_000 * scale) return 0.1;
+  if (balance <= 300_000 * scale) return 0.2;
+  return 0.3;
+}
 
 export interface CasinoStatsRow {
   user_id: string;
@@ -29,20 +66,38 @@ export interface CasinoStatsRow {
 export interface SettleResult {
   /** 賭け額 */
   wagered: number;
-  /** 受け取った配当（0 = 負け） */
+  /** 受け取った配当（0 = 負け・チェーン込み・福の重み控除後） */
   payout: number;
   /** 純損益 */
   net: number;
+  /** 連鎖ボーナス（勝ち時のみ・胴元残高が上限） */
+  chainBonus: number;
+  /** この勝ちで何連勝目か */
+  chainStreak: number;
+  chainMult: number;
+  chainLabel: string;
+  /** 福の重みで奉納された額（半分JP・半分救済へ） */
+  fukuTax: number;
+  fukuRate: number;
+}
+
+export interface CasinoOptions {
+  /** 福の重みしきい値のスケール（既定10）。関数なら毎回評価 */
+  fukuScale?: number | (() => number);
 }
 
 const now = () => Math.floor(Date.now() / 1000);
 
 export class Casino {
+  private readonly fukuScaleOpt: number | (() => number);
+
   constructor(
     private readonly db: Database.Database,
     readonly ether: EtherExchange,
     private readonly events: EventLog,
+    options: CasinoOptions = {},
   ) {
+    this.fukuScaleOpt = options.fukuScale ?? 10;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS casino_stats (
         user_id             TEXT PRIMARY KEY,
@@ -78,28 +133,74 @@ export class Casino {
     return this.houseBalance() >= maxPayout;
   }
 
+  private fukuScale(): number {
+    const s = typeof this.fukuScaleOpt === "function" ? this.fukuScaleOpt() : this.fukuScaleOpt;
+    return Number.isFinite(s) && s > 0 ? s : 10;
+  }
+
   /**
-   * 1ゲームの精算（ソロゲーム用）。
-   * 賭け額を徴収→配当を支払い、戦績を更新する。原子的に行う。
+   * 1ゲームの精算（ソロゲーム用）。原子的に:
+   * 賭け徴収 → 配当 → 連鎖ボーナス（勝ち・胴元残高が上限） →
+   * 福の重み（勝ち利益への累進奉納・半分JP/半分救済） → JP積立 → 戦績更新
    * @param payout 配当（賭け額込みの受取総額。0=負け、bet=引き分け返金）
    * @param jackpotCut 賭け額のうちジャックポットへ積む額（スロット等。胴元取り分から回す）
+   * @param opts chain/fuku はソロゲーム既定ON。ルーレット等の共有卓はOFFにする
    */
-  settle(userId: string, game: string, bet: number, payout: number, jackpotCut = 0): SettleResult {
+  settle(
+    userId: string,
+    game: string,
+    bet: number,
+    payout: number,
+    jackpotCut = 0,
+    opts: { chain?: boolean; fuku?: boolean } = {},
+  ): SettleResult {
     if (!Number.isInteger(bet) || bet <= 0) throw new EtherError("ERR_BAD_AMOUNT", { bet });
     if (!Number.isInteger(payout) || payout < 0) throw new EtherError("ERR_BAD_AMOUNT", { payout });
+    const useChain = opts.chain ?? true;
+    const useFuku = opts.fuku ?? true;
     return this.db.transaction((): SettleResult => {
       // 徴収
       this.ether.transfer(userId, HOUSE_HOLDER, bet);
       // 配当
       if (payout > 0) this.ether.transfer(HOUSE_HOLDER, userId, payout);
+
+      const won = payout > bet;
+      // 連鎖ボーナス: 「この勝ちで何連勝目か」= 現在の連勝 + 1（recordResult 前に読む）
+      let chainBonus = 0;
+      let chainStreak = 0;
+      let chainMult = 1.0;
+      let chainLabel = "";
+      if (won && useChain) {
+        chainStreak = this.stats(userId).current_win_streak + 1;
+        const c = chainMultiplier(chainStreak);
+        chainMult = c.mult;
+        chainLabel = c.label;
+        chainBonus = Math.min(Math.floor(payout * (c.mult - 1)), this.ether.balanceOf(HOUSE_HOLDER));
+        if (chainBonus > 0) this.ether.transfer(HOUSE_HOLDER, userId, chainBonus);
+      }
+
+      // 福の重み: 勝ち利益（チェーン込み）への累進奉納。半分JP・半分救済
+      let fukuTax = 0;
+      let rate = 0;
+      if (won && useFuku) {
+        rate = fukuRate(this.ether.balanceOf(userId), this.fukuScale());
+        fukuTax = Math.floor((payout - bet + chainBonus) * rate);
+        if (fukuTax > 0) {
+          const half = Math.floor(fukuTax / 2);
+          if (half > 0) this.ether.transfer(userId, JACKPOT_HOLDER, half);
+          if (fukuTax - half > 0) this.ether.transfer(userId, RELIEF_HOLDER, fukuTax - half);
+        }
+      }
+
       // JP積立（胴元から）
       if (jackpotCut > 0 && this.ether.balanceOf(HOUSE_HOLDER) >= jackpotCut) {
         this.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, jackpotCut);
       }
-      const net = payout - bet;
+      const effectivePayout = payout + chainBonus - fukuTax;
+      const net = effectivePayout - bet;
       this.recordResult(userId, bet, payout);
-      this.events.log("casino_game", { actor: userId, payload: { game, bet, payout, net } });
-      return { wagered: bet, payout, net };
+      this.events.log("casino_game", { actor: userId, payload: { game, bet, payout: effectivePayout, net, chainBonus, fukuTax } });
+      return { wagered: bet, payout: effectivePayout, net, chainBonus, chainStreak, chainMult, chainLabel, fukuTax, fukuRate: rate };
     })();
   }
 
@@ -175,10 +276,10 @@ export class Casino {
       return this.db
         .prepare(
           `SELECT user_id, amount AS value FROM ether_balances
-           WHERE user_id NOT IN (?, ?) AND amount > 0
+           WHERE user_id NOT IN (?, ?, ?) AND amount > 0
            ORDER BY amount DESC LIMIT ?`,
         )
-        .all(HOUSE_HOLDER, JACKPOT_HOLDER, limit) as Array<{ user_id: string; value: number }>;
+        .all(HOUSE_HOLDER, JACKPOT_HOLDER, RELIEF_HOLDER, limit) as Array<{ user_id: string; value: number }>;
     }
     if (metric === "win_rate") {
       return this.db

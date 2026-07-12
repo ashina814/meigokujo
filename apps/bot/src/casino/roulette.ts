@@ -208,7 +208,7 @@ export async function playRoulette(
       const won = hits(b.type, n);
       const payout = won ? Math.floor(b.amount * PAYOUTS[b.type]) : 0;
       try {
-        services.casino.settle(b.userId, "roulette", b.amount, payout);
+        services.casino.settle(b.userId, "roulette", b.amount, payout, 0, { chain: false, fuku: false });
       } catch {
         lines.push(`・<@${b.userId}> — 残高不足で無効`);
         continue;
