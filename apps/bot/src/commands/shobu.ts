@@ -5,6 +5,7 @@ import { playChohanMulti } from "../casino/chohan-multi.js";
 import { playChinchiroDuel } from "../casino/chinchiro-duel.js";
 import { playBjDuel } from "../casino/bj-duel.js";
 import { playSashi } from "../casino/sashi.js";
+import { playIndian } from "../casino/indian.js";
 
 /**
  * /勝負 — マモンの賭場の対人ゲーム集約コマンド。
@@ -43,6 +44,15 @@ export const shobuCommand = new SlashCommandBuilder()
       .addIntegerOption((o) =>
         o.setName("賭け").setDescription("賭けるエテル（同額）").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
       ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("インディアン")
+      .setDescription("🃏 インディアンポーカー（1v1・自分の手だけ見えない心理戦）")
+      .addUserOption((o) => o.setName("相手").setDescription("挑戦相手").setRequired(true))
+      .addIntegerOption((o) =>
+        o.setName("賭け").setDescription("賭けるエテル（同額）").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
+      ),
   );
 
 export async function handleShobuCommand(
@@ -56,4 +66,5 @@ export async function handleShobuCommand(
   if (sub === "チンチロ") return playChinchiroDuel(interaction, services, opponent, bet);
   if (sub === "bj") return playBjDuel(interaction, services, opponent, bet);
   if (sub === "サシ") return playSashi(interaction, services, opponent, bet);
+  if (sub === "インディアン") return playIndian(interaction, services, opponent, bet);
 }
