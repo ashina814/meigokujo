@@ -17,6 +17,7 @@ import { handleBanzukeCommand } from "./commands/banzuke.js";
 import { handleShobuCommand } from "./commands/shobu.js";
 import { handleBakutenButton, handleBakutenCommand, handleBakutenSelect } from "./commands/bakuten.js";
 import { handleStocksButton, handleStocksCommand, handleStocksModal, handleStocksSelect } from "./commands/stocks.js";
+import { handleKeibaCommand } from "./commands/keiba.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -140,6 +141,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "株":
           await handleStocksCommand(interaction, services);
+          return;
+        case "競馬":
+          await handleKeibaCommand(interaction, services);
           return;
       }
       return;
