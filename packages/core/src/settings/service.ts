@@ -39,6 +39,10 @@ export const SETTING_DEFAULTS = {
   daily_base: 1_000,
   daily_relief_threshold: 10_000,
   daily_relief_max: 500,
+  // VIP
+  vip_price: 30_000,
+  vip_days: 30,
+  vip_bet_cap_mult: 2,
   // 移行（経済設計.md §9）
   migration_cap: 5_000_000, // これを超える旧残高は /移行 承認 が必要（キャップ額は運営合意待ちの暫定値）
 } as const;

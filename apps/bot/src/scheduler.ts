@@ -175,6 +175,26 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
+    // ── VIP 期限切れ: ロール剥奪 & DB クリア ──
+    try {
+      const expired = services.vip.expired();
+      if (expired.length > 0) {
+        const roleId = services.settings.getString("role:casino_vip");
+        const guildId = services.settings.getString("guild:main");
+        const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
+        if (guild && roleId) {
+          for (const uid of expired) {
+            const member = await guild.members.fetch(uid).catch(() => null);
+            await member?.roles.remove(roleId).catch(() => undefined);
+          }
+        }
+        services.vip.clearExpired(expired);
+        if (expired.length > 0) console.log(`[vip] 期限切れ ${expired.length}人 のロール剥奪`);
+      }
+    } catch (e) {
+      console.error("[vip] tick失敗:", e);
+    }
+
     // ── マモンの株式市場: 1時間ごとの価格更新 & 期限切れ強制売却 ──
     try {
       services.stocks.updateAll();

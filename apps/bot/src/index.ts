@@ -19,6 +19,8 @@ import { handleBakutenButton, handleBakutenCommand, handleBakutenSelect } from "
 import { handleStocksButton, handleStocksCommand, handleStocksModal, handleStocksSelect } from "./commands/stocks.js";
 import { handleKeibaCommand } from "./commands/keiba.js";
 import { handleAnnaiButton, handleAnnaiCommand } from "./commands/annai.js";
+import { handleVipButton, handleVipCommand } from "./commands/vip.js";
+import { handleNagareboshiCommand } from "./commands/nagareboshi.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -148,6 +150,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "案内":
           await handleAnnaiCommand(interaction, services);
+          return;
+        case "vip":
+          await handleVipCommand(interaction, services);
+          return;
+        case "流れ星":
+          await handleNagareboshiCommand(interaction, services);
           return;
       }
       return;
@@ -281,6 +289,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("annai:")) {
         await handleAnnaiButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("vip:")) {
+        await handleVipButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("dept:")) {

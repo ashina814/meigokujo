@@ -23,6 +23,7 @@ import {
   Daily,
   Items,
   Stocks,
+  Vip,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -73,7 +74,12 @@ export function buildServices() {
   });
   const items = new Items(db);
   const stocks = new Stocks(db, ether, events);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks };
+  const vip = new Vip(db, ether, events, {
+    price: () => settings.getNumber("vip_price"),
+    days: () => settings.getNumber("vip_days"),
+    betCapMult: () => settings.getNumber("vip_bet_cap_mult"),
+  });
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip };
 }
 
 export type Services = ReturnType<typeof buildServices>;

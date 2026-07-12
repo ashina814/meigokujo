@@ -471,6 +471,7 @@ const ROLE_KEYS: Array<[string, string]> = [
   ["male", "男性属性"],
   ["female", "女性属性"],
   ["bump_notify", "紹介協力者"],
+  ["casino_vip", "賭場VIP"],
 ];
 
 async function openRoleSetup(interaction: ButtonInteraction, _services: Services) {
@@ -513,6 +514,9 @@ const NUMBER_KEYS: Array<[string, string]> = [
   ["bump_reward", "bump報酬（Land）"],
   ["ether_rate_base", "エテル初期レート（1Land=?◈）"],
   ["ether_fuku_scale", "福の重みスケール"],
+  ["vip_price", "VIP月会費（エテル）"],
+  ["vip_days", "VIP日数"],
+  ["vip_bet_cap_mult", "VIP賭け上限倍率"],
 ];
 
 async function openNumberSetup(interaction: ButtonInteraction, _services: Services) {

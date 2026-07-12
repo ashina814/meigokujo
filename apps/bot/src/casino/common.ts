@@ -11,6 +11,12 @@ export const LOSE_COLOR = 0x7f1d1d;
 export const MIN_BET = 50;
 export const MAX_BET = 1_000_000;
 
+/** VIP なら賭け上限倍率を掛ける。ゲーム側は effectiveMaxBet(services, userId) で判定 */
+export function effectiveMaxBet(services: Services, userId: string): number {
+  if (services.vip.isVip(userId)) return MAX_BET * services.vip.betCapMult();
+  return MAX_BET;
+}
+
 /** 同時プレイ防止（1人1卓）。プロセス内ロックで足りる（bot は単一プロセス） */
 const playing = new Set<string>();
 
@@ -42,9 +48,10 @@ export async function validateBet(
   maxPayout: number,
 ): Promise<BetCheck> {
   const bet = Math.floor(betRaw);
-  if (!Number.isInteger(bet) || bet < MIN_BET || bet > MAX_BET) {
+  const cap = effectiveMaxBet(services, interaction.user.id);
+  if (!Number.isInteger(bet) || bet < MIN_BET || bet > cap) {
     await interaction.reply({
-      content: `賭け額は ${MIN_BET.toLocaleString()}〜${MAX_BET.toLocaleString()} ◈ で。`,
+      content: `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
       flags: MessageFlags.Ephemeral,
     });
     return { ok: false, bet };
