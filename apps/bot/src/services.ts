@@ -24,6 +24,7 @@ import {
   Items,
   Stocks,
   Vip,
+  Markets,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -79,7 +80,11 @@ export function buildServices() {
     days: () => settings.getNumber("vip_days"),
     betCapMult: () => settings.getNumber("vip_bet_cap_mult"),
   });
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip };
+  const markets = new Markets(db, ether, events);
+  // 起動時に未精算の板を全部返金＆void（エスクロー整合維持）
+  const voided = markets.refundAllPending("system:startup");
+  if (voided > 0) console.log(`[market] 起動時に未精算板 ${voided}件 を返金＆void 化`);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets };
 }
 
 export type Services = ReturnType<typeof buildServices>;

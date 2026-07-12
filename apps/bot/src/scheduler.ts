@@ -195,6 +195,14 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       console.error("[vip] tick失敗:", e);
     }
 
+    // ── 賭場の板: 締切を過ぎた open を closed へ ──
+    try {
+      const pending = services.markets.listPastDeadline();
+      for (const m of pending) services.markets.autoClose(m.id);
+    } catch (e) {
+      console.error("[market] tick失敗:", e);
+    }
+
     // ── マモンの株式市場: 1時間ごとの価格更新 & 期限切れ強制売却 ──
     try {
       services.stocks.updateAll();

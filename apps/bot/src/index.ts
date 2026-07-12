@@ -21,6 +21,7 @@ import { handleKeibaCommand } from "./commands/keiba.js";
 import { handleAnnaiButton, handleAnnaiCommand } from "./commands/annai.js";
 import { handleVipButton, handleVipCommand } from "./commands/vip.js";
 import { handleNagareboshiCommand } from "./commands/nagareboshi.js";
+import { handleItaButton, handleItaCommand, handleItaModal, handleItaSelect } from "./commands/ita.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -157,6 +158,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "流れ星":
           await handleNagareboshiCommand(interaction, services);
           return;
+        case "板":
+          await handleItaCommand(interaction, services);
+          return;
       }
       return;
     }
@@ -221,6 +225,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("stocks:")) {
       await handleStocksSelect(interaction, services);
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("ita:")) {
+      await handleItaSelect(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("ita:")) {
+      await handleItaModal(interaction, services);
       return;
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("stocks:")) {
@@ -293,6 +305,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("vip:")) {
         await handleVipButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("ita:")) {
+        await handleItaButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("dept:")) {

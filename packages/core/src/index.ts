@@ -101,3 +101,4 @@ export { Daily, type DailyClaim, type DailyClaimResult, type DailyOptions } from
 export { Items, CONSUMABLES, getConsumableDef, type ItemKind as CasinoItemKind, type ConsumableDef, type ArmResult } from "./casino/items.js";
 export { Stocks, StockError, STOCK_HOLD_DAYS, type Stock, type Holding, type StockErrorCode } from "./casino/stocks.js";
 export { Vip, type VipOptions, type VipJoinResult } from "./casino/vip.js";
+export { Markets, MarketError, type Market, type MarketBet, type MarketStatus, type MarketErrorCode } from "./casino/market.js";

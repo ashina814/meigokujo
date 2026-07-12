@@ -21,6 +21,7 @@ import { keibaCommand } from "./commands/keiba.js";
 import { annaiCommand } from "./commands/annai.js";
 import { vipCommand } from "./commands/vip.js";
 import { nagareboshiCommand } from "./commands/nagareboshi.js";
+import { itaCommand } from "./commands/ita.js";
 
 const commands = [
   // 運営（ManageGuildで一般には非表示。全部ここに畳んだ）
@@ -47,6 +48,7 @@ const commands = [
   annaiCommand.toJSON(),
   vipCommand.toJSON(),
   nagareboshiCommand.toJSON(),
+  itaCommand.toJSON(),
 ];
 
 const rest = new REST().setToken(config.token);
