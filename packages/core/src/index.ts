@@ -102,3 +102,4 @@ export { Items, CONSUMABLES, getConsumableDef, type ItemKind as CasinoItemKind, 
 export { Stocks, StockError, STOCK_HOLD_DAYS, type Stock, type Holding, type StockErrorCode } from "./casino/stocks.js";
 export { Vip, type VipOptions, type VipJoinResult } from "./casino/vip.js";
 export { Markets, MarketError, type Market, type MarketBet, type MarketStatus, type MarketErrorCode } from "./casino/market.js";
+export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";

@@ -550,6 +550,7 @@ const PANEL_KIND_CHOICES: Array<[string, string]> = [
   ["rank", "ランク確認"],
   ["shop", "公式ショップ"],
   ["exchange", "マモンの両替所"],
+  ["takutate", "卓建て"],
   ["ticket_return", "出戻り申請"],
   ["ticket_consult", "個別相談"],
   ["room_normal", "宿"],

@@ -22,6 +22,7 @@ import { handleAnnaiButton, handleAnnaiCommand } from "./commands/annai.js";
 import { handleVipButton, handleVipCommand } from "./commands/vip.js";
 import { handleNagareboshiCommand } from "./commands/nagareboshi.js";
 import { handleItaButton, handleItaCommand, handleItaModal, handleItaSelect } from "./commands/ita.js";
+import { handleTakuButton, handleTakuVoiceUpdate, sweepStaleTables } from "./commands/takutate-panel.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -88,6 +89,11 @@ client.once(Events.ClientReady, (ready) => {
   } else {
     console.log(`📗 検算OK / 通貨発行残高 ${services.ledger.moneySupply().toLocaleString()} Ld`);
   }
+
+  // 起動時に卓建て空VCを sweep
+  void sweepStaleTables(client, services).then((n) => {
+    if (n > 0) console.log(`[taku] 起動時 sweep: ${n}件 の空VCを削除`);
+  }).catch((e) => console.error("[taku] sweep失敗:", e));
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -311,6 +317,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleItaButton(interaction, services);
         return;
       }
+      if (interaction.customId.startsWith("taku:")) {
+        await handleTakuButton(interaction, services);
+        return;
+      }
       if (interaction.customId.startsWith("dept:")) {
         await handleDeptPanelButton(interaction, services);
         return;
@@ -368,6 +378,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     trackVoiceState(oldState, newState, services);
     handleVoiceAttendance(oldState, newState, services);
     void handleDenVoice(oldState, newState, services).catch((err) => console.error("[den] 処理失敗:", err));
+    void handleTakuVoiceUpdate(oldState, newState, services).catch((err) => console.error("[taku] 処理失敗:", err));
   } catch (err) {
     console.error("[vc] 記録失敗:", err);
   }

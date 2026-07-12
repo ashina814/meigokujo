@@ -25,6 +25,7 @@ import {
   Stocks,
   Vip,
   Markets,
+  Takutate,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -84,7 +85,8 @@ export function buildServices() {
   // 起動時に未精算の板を全部返金＆void（エスクロー整合維持）
   const voided = markets.refundAllPending("system:startup");
   if (voided > 0) console.log(`[market] 起動時に未精算板 ${voided}件 を返金＆void 化`);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets };
+  const takutate = new Takutate(db, events);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, takutate };
 }
 
 export type Services = ReturnType<typeof buildServices>;

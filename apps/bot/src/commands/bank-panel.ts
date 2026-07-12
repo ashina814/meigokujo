@@ -22,6 +22,7 @@ import { entryPanelMessage, entryFlexPanelMessage } from "./entry.js";
 import { exchangePanelMessage } from "./exchange-panel.js";
 import { rankPanelMessage } from "./rank-panel.js";
 import { shopPanelMessage } from "./shop-panel.js";
+import { takutatePanelMessage } from "./takutate-panel.js";
 import { ticketPanelMessage } from "./tickets.js";
 import { roomPanelMessage } from "./rooms.js";
 import { deptAccount, LedgerError, type RoomKind } from "@meigokujo/core";
@@ -44,6 +45,7 @@ export const panelCommand = new SlashCommandBuilder()
         { name: "ランク確認", value: "rank" },
         { name: "公式ショップ", value: "shop" },
         { name: "マモンの両替所", value: "exchange" },
+        { name: "卓建て", value: "takutate" },
         { name: "出戻り申請", value: "ticket_return" },
         { name: "個別相談", value: "ticket_consult" },
         { name: "宿", value: "room_normal" },
@@ -75,6 +77,7 @@ export const panelRemoveCommand = new SlashCommandBuilder()
         { name: "ランク確認", value: "rank" },
         { name: "公式ショップ", value: "shop" },
         { name: "マモンの両替所", value: "exchange" },
+        { name: "卓建て", value: "takutate" },
         { name: "出戻り申請", value: "ticket_return" },
         { name: "個別相談", value: "ticket_consult" },
         { name: "宿", value: "room_normal" },
@@ -92,6 +95,7 @@ const PANEL_KINDS = [
   "rank",
   "shop",
   "exchange",
+  "takutate",
   "ticket_return",
   "ticket_consult",
   "room_normal",
@@ -108,6 +112,7 @@ const PANEL_LABELS: Record<(typeof PANEL_KINDS)[number], string> = {
   rank: "ランク確認",
   shop: "公式ショップ",
   exchange: "マモンの両替所",
+  takutate: "卓建て",
   ticket_return: "出戻り申請",
   ticket_consult: "個別相談",
   room_normal: "宿",
@@ -227,6 +232,7 @@ function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services,
   if (kind === "rank") return rankPanelMessage();
   if (kind === "shop") return shopPanelMessage(services);
   if (kind === "exchange") return exchangePanelMessage(services);
+  if (kind === "takutate") return takutatePanelMessage();
   if (kind === "ticket_return") return ticketPanelMessage("return");
   if (kind === "ticket_consult") return ticketPanelMessage("consult");
   if (kind === "dept") {
