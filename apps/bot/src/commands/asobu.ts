@@ -7,6 +7,8 @@ import { playCrash } from "../casino/crash.js";
 import { playChinchiro } from "../casino/chinchiro.js";
 import { playRoulette } from "../casino/roulette.js";
 import { playBlackjack } from "../casino/blackjack.js";
+import { playPoker } from "../casino/poker.js";
+import { playHoldem } from "../casino/holdem.js";
 
 /**
  * /遊ぶ — マモンの賭場の全ソロゲーム集約コマンド（casino-bot の /遊ぶ 方式）。
@@ -58,6 +60,22 @@ export const asobuCommand = new SlashCommandBuilder()
       .addIntegerOption((o) =>
         o.setName("賭け").setDescription("賭けるエテル").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
       ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("ポーカー")
+      .setDescription("🃏 ドローポーカー（Jacks or Better・ロイヤル250倍）")
+      .addIntegerOption((o) =>
+        o.setName("賭け").setDescription("賭けるエテル").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
+      ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("ホールデム")
+      .setDescription("🃏 テキサスホールデム（対マモン簡易版）")
+      .addIntegerOption((o) =>
+        o.setName("アンティ").setDescription("初期賭け金（各ラウンドでコール可）").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
+      ),
   );
 
 export async function handleAsobuCommand(
@@ -66,10 +84,15 @@ export async function handleAsobuCommand(
 ): Promise<void> {
   const sub = interaction.options.getSubcommand();
   if (sub === "ルーレット") return playRoulette(interaction, services);
+  if (sub === "ホールデム") {
+    const ante = interaction.options.getInteger("アンティ", true);
+    return playHoldem(interaction, services, ante);
+  }
   const bet = interaction.options.getInteger("賭け", true);
   if (sub === "スロット") return playSlots(interaction, services, bet);
   if (sub === "丁半") return playChohan(interaction, services, bet);
   if (sub === "クラッシュ") return playCrash(interaction, services, bet);
   if (sub === "チンチロ") return playChinchiro(interaction, services, bet);
   if (sub === "ブラックジャック") return playBlackjack(interaction, services, bet);
+  if (sub === "ポーカー") return playPoker(interaction, services, bet);
 }
