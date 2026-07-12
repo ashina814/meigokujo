@@ -22,6 +22,7 @@ import {
   Casino,
   Daily,
   Items,
+  Stocks,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -71,7 +72,8 @@ export function buildServices() {
     reliefMax: () => settings.getNumber("daily_relief_max"),
   });
   const items = new Items(db);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items };
+  const stocks = new Stocks(db, ether, events);
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks };
 }
 
 export type Services = ReturnType<typeof buildServices>;

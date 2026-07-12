@@ -16,6 +16,7 @@ import { handlePassportCommand } from "./commands/passport.js";
 import { handleBanzukeCommand } from "./commands/banzuke.js";
 import { handleShobuCommand } from "./commands/shobu.js";
 import { handleBakutenButton, handleBakutenCommand, handleBakutenSelect } from "./commands/bakuten.js";
+import { handleStocksButton, handleStocksCommand, handleStocksModal, handleStocksSelect } from "./commands/stocks.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -137,6 +138,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "賭場商店":
           await handleBakutenCommand(interaction, services);
           return;
+        case "株":
+          await handleStocksCommand(interaction, services);
+          return;
       }
       return;
     }
@@ -199,6 +203,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleBakutenSelect(interaction, services);
       return;
     }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("stocks:")) {
+      await handleStocksSelect(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("stocks:")) {
+      await handleStocksModal(interaction, services);
+      return;
+    }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {
       await handleEvaluationSelect(interaction, services);
       return;
@@ -253,6 +265,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("bakuten:")) {
         await handleBakutenButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("stocks:")) {
+        await handleStocksButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("dept:")) {

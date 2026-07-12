@@ -175,6 +175,15 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
+    // ── マモンの株式市場: 1時間ごとの価格更新 & 期限切れ強制売却 ──
+    try {
+      services.stocks.updateAll();
+      const forced = services.stocks.forceSellExpired();
+      if (forced.length > 0) console.log(`[stocks] 期限切れ強制売却: ${forced.length}件`);
+    } catch (e) {
+      console.error("[stocks] tick失敗:", e);
+    }
+
     // ── 公式ショップの月額一括請求: 毎月1日 08:00 JST ──
     if (now.day === 1 && now.hour === 8) {
       const shopMarker = `shop:monthly:${now.period}`;
