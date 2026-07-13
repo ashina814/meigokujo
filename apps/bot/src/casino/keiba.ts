@@ -26,23 +26,35 @@ import { C_LOSE, C_MAMMON, C_WIN, E, buildLobbyEmbed } from "./ui.js";
  */
 const LOBBY_SEC = 60;
 const TRACK_LENGTH = 20;
-const TURN_MS = 1400;
+const BASE_TURN_MS = 1600;
+const FINAL_STRAIGHT_MS = 2400;
 const HOUSE_RATE = 0.1;
+
+/** 走法。casino-bot 準拠。序盤/中盤/終盤で伸びる馬が変わる */
+type Style = "nige" | "senko" | "sashi" | "oikomi";
+
+const STYLE_LABEL: Record<Style, string> = {
+  nige: "逃げ",
+  senko: "先行",
+  sashi: "差し",
+  oikomi: "追込",
+};
 
 interface Horse {
   id: number;
   name: string;
   emoji: string;
   baseSpeed: number; // 1-10
+  style: Style;
 }
 
 const HORSES: readonly Horse[] = [
-  { id: 1, name: "冥馬・獄炎", emoji: "🔥", baseSpeed: 7 },
-  { id: 2, name: "冥馬・霧影", emoji: "👻", baseSpeed: 6 },
-  { id: 3, name: "冥馬・雷牙", emoji: "⚡", baseSpeed: 8 },
-  { id: 4, name: "冥馬・骨鎧", emoji: "💀", baseSpeed: 5 },
-  { id: 5, name: "冥馬・血月", emoji: "🌙", baseSpeed: 7 },
-  { id: 6, name: "冥馬・魔王", emoji: "😈", baseSpeed: 6 },
+  { id: 1, name: "冥馬・獄炎", emoji: "🔥", baseSpeed: 7, style: "nige" },
+  { id: 2, name: "冥馬・霧影", emoji: "👻", baseSpeed: 6, style: "sashi" },
+  { id: 3, name: "冥馬・雷牙", emoji: "⚡", baseSpeed: 8, style: "senko" },
+  { id: 4, name: "冥馬・骨鎧", emoji: "💀", baseSpeed: 5, style: "oikomi" },
+  { id: 5, name: "冥馬・血月", emoji: "🌙", baseSpeed: 7, style: "sashi" },
+  { id: 6, name: "冥馬・魔王", emoji: "😈", baseSpeed: 6, style: "nige" },
 ] as const;
 
 type BetType = "win" | "place";
@@ -77,29 +89,55 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
   const buildLobby = (secondsLeft: number) => {
     const totalByHorseWin = new Map<number, number>();
     const totalByHorsePlace = new Map<number, number>();
-    let pot = 0;
+    let totalWin = 0;
+    let totalPlace = 0;
     for (const arr of bets.values()) {
       for (const b of arr) {
-        const map = b.type === "win" ? totalByHorseWin : totalByHorsePlace;
-        map.set(b.horseId, (map.get(b.horseId) ?? 0) + b.amount);
-        pot += b.amount;
+        if (b.type === "win") {
+          totalByHorseWin.set(b.horseId, (totalByHorseWin.get(b.horseId) ?? 0) + b.amount);
+          totalWin += b.amount;
+        } else {
+          totalByHorsePlace.set(b.horseId, (totalByHorsePlace.get(b.horseId) ?? 0) + b.amount);
+          totalPlace += b.amount;
+        }
       }
     }
-    const horseLines = HORSES.map((h) => {
+    const winPrize = Math.floor(totalWin * (1 - HOUSE_RATE));
+    const placePrize = Math.floor(totalPlace * (1 - HOUSE_RATE));
+    // 人気ランク（単勝賭け額の多い順）
+    const popularity = [...HORSES]
+      .map((h) => ({ id: h.id, stake: totalByHorseWin.get(h.id) ?? 0 }))
+      .sort((a, b) => b.stake - a.stake);
+    const popRank = new Map<number, number>();
+    popularity.forEach((p, i) => { if (p.stake > 0) popRank.set(p.id, i + 1); });
+
+    const horseLines = HORSES.map((h, i) => {
       const w = totalByHorseWin.get(h.id) ?? 0;
       const p = totalByHorsePlace.get(h.id) ?? 0;
-      const wStr = w > 0 ? `**単 ${fmtEther(w).replace(" ◈", "◈")}**` : `単 ─`;
-      const pStr = p > 0 ? `**複 ${fmtEther(p).replace(" ◈", "◈")}**` : `複 ─`;
-      return `${h.emoji}  ${h.id}. **${h.name}**  ·  ${wStr}  /  ${pStr}`;
+      const winOdds = w > 0 ? `×${(winPrize / w).toFixed(2)}` : "—";
+      const placeOdds = p > 0 ? `×${(placePrize / p).toFixed(2)}` : "—";
+      const rank = popRank.get(h.id);
+      const mark = rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "　";
+      return `${mark} ${h.emoji} ${i + 1}. **${h.name}** ｜ ${STYLE_LABEL[h.style]}\n　└ 単勝 **${winOdds}**  ·  複勝 **${placeOdds}**`;
     });
     const embed = buildLobbyEmbed({
       game: "冥馬レース",
       title: "🏇  冥馬レース  ·  受付中",
-      body: "**単勝**: 1着的中  /  **複勝**: 3着以内で配当（場代10% → JPプール）",
+      body: "賭けが入るたびにオッズは変動する。**単勝**: 1着的中  /  **複勝**: 3着以内で配当（場代10% → JPプール）",
       secondsLeft,
-      totalBet: pot,
+      totalBet: totalWin + totalPlace,
     });
-    embed.addFields({ name: "▸ 出走馬", value: horseLines.join("\n"), inline: false });
+    embed.addFields(
+      {
+        name: "▸ プール",
+        value: [
+          `${E.bet}  **単勝** ${fmtEther(totalWin).replace(" ◈", "◈")}  →  賞金プール ${fmtEther(winPrize).replace(" ◈", "◈")}`,
+          `${E.up}  **複勝** ${fmtEther(totalPlace).replace(" ◈", "◈")}  →  賞金プール ${fmtEther(placePrize).replace(" ◈", "◈")}`,
+        ].join("\n"),
+        inline: false,
+      },
+      { name: "▸ 出走馬  ·  概算オッズ", value: horseLines.join("\n"), inline: false },
+    );
     return embed;
   };
 
@@ -195,53 +233,103 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
   // ── レース進行 ──
   const positions = new Map<number, number>(HORSES.map((h) => [h.id, 0]));
   const finished: number[] = []; // ゴール順
+  // 馬ごとのコンディション（0.8〜1.2）
+  const conditions = new Map<number, number>(HORSES.map((h) => [h.id, 0.8 + Math.random() * 0.4]));
 
-  const renderTrack = () => {
-    const lines = HORSES.map((h) => {
-      const pos = Math.min(TRACK_LENGTH, positions.get(h.id) ?? 0);
-      const filled = "▰".repeat(pos);
-      const empty = "▱".repeat(TRACK_LENGTH - pos);
-      const rank = finished.indexOf(h.id);
-      const rankMark = rank >= 0 ? ` [${rank + 1}着]` : "";
-      return `${h.emoji} ${h.id}. ${filled}${h.emoji}${empty} 🏁${rankMark}`;
-    });
-    return lines.join("\n");
+  const buildLane = (pos: number) => {
+    const p = Math.max(0, Math.min(TRACK_LENGTH, Math.floor(pos)));
+    return "▰".repeat(p) + "▱".repeat(TRACK_LENGTH - p) + " 🏁";
+  };
+
+  const renderBoard = () => {
+    const ranking = [...HORSES].sort((a, b) => (positions.get(b.id) ?? 0) - (positions.get(a.id) ?? 0));
+    return ranking
+      .map((h, idx) => {
+        const finishedRank = finished.indexOf(h.id);
+        const marker = finishedRank >= 0 ? ` **[${finishedRank + 1}着]**` : "";
+        return `${idx + 1}. ${h.emoji} **${h.name}**${marker}\n　${buildLane(positions.get(h.id) ?? 0)}`;
+      })
+      .join("\n");
   };
 
   await interaction.editReply({
+    content: "🚦 **三、二、一…スタート！**",
     embeds: [
       new EmbedBuilder()
         .setAuthor({ name: "マモンの賭場 · 冥馬レース" })
         .setColor(C_MAMMON)
-        .setTitle("🏇  スタート！")
-        .setDescription(renderTrack()),
+        .setTitle("🏇  レース開始")
+        .setDescription(renderBoard()),
     ],
     components: [],
   });
+  await sleep(1600);
 
-  // 最大 30 ターン（安全弁）
-  for (let turn = 0; turn < 30 && finished.length < HORSES.length; turn++) {
-    await sleep(TURN_MS);
+  let prevLeaderId: number | null = null;
+  let finalStraightAnnounced = false;
+
+  // 最大 15 ターン（安全弁）
+  for (let turn = 1; turn <= 15 && finished.length < HORSES.length; turn++) {
+    // ── 移動（casino-bot 準拠: 走法 × 進捗 × コンディション × 乱数）──
     for (const h of HORSES) {
       if (finished.includes(h.id)) continue;
-      const step = 1 + Math.floor(Math.random() * (h.baseSpeed / 2)); // 1..speed/2+
-      const noise = Math.random() < 0.15 ? -1 : 0; // 15%で足踏み
-      const cur = positions.get(h.id) ?? 0;
-      const next = Math.max(0, Math.min(TRACK_LENGTH, cur + step + noise));
+      const current = positions.get(h.id) ?? 0;
+      const progress = current / TRACK_LENGTH; // 0..1
+      const styleBonus =
+        h.style === "nige"
+          ? 0.4 * (1 - progress) // 序盤に伸びる
+          : h.style === "senko"
+            ? 0.25                // 常に安定
+            : h.style === "sashi"
+              ? 0.35 * progress   // 中盤〜終盤
+              : 0.45 * progress;  // 追込は終盤爆発
+      const randomFactor = 0.75 + Math.random() * 0.5;
+      const move = h.baseSpeed * 0.35 * (conditions.get(h.id) ?? 1) * randomFactor + styleBonus;
+      const next = Math.min(TRACK_LENGTH, current + move);
       positions.set(h.id, next);
       if (next >= TRACK_LENGTH && !finished.includes(h.id)) {
         finished.push(h.id);
       }
     }
+
+    // ── 順位 & 実況 ──
+    const ranking = [...HORSES].sort((a, b) => (positions.get(b.id) ?? 0) - (positions.get(a.id) ?? 0));
+    const leaderPos = positions.get(ranking[0]!.id) ?? 0;
+    const remain = TRACK_LENGTH - leaderPos;
+
+    const commentary: string[] = [];
+    if (prevLeaderId !== null && prevLeaderId !== ranking[0]!.id) {
+      const oldLeader = HORSES.find((h) => h.id === prevLeaderId)?.name ?? "前の馬";
+      commentary.push(`📢 **先頭交代！${ranking[0]!.name} が ${oldLeader} を抜いた！**`);
+    }
+    if (!finalStraightAnnounced && remain < 5) {
+      finalStraightAnnounced = true;
+      commentary.push("🔥 **さあ最終直線！勝つのはどっちだ…！？**");
+    }
+    if (finalStraightAnnounced && ranking[1]) {
+      const secondPos = positions.get(ranking[1].id) ?? 0;
+      const lead = leaderPos - secondPos;
+      if (lead < 0.5 && remain < 4) {
+        commentary.push(`⚔️ 並んだ！${ranking[0]!.name} と ${ranking[1].name} の叩き合い！`);
+      } else if (lead < 1.5 && remain < 3) {
+        commentary.push(`🏃 ${ranking[1].name} が猛追！差はわずか…！`);
+      }
+    }
+    prevLeaderId = ranking[0]!.id;
+
+    const header = `**Turn ${turn}** ・ 先頭 ${ranking[0]!.emoji} ${ranking[0]!.name}（残り ${remain.toFixed(1)}）`;
     await interaction.editReply({
+      content: [header, ...commentary].join("\n"),
       embeds: [
         new EmbedBuilder()
           .setAuthor({ name: "マモンの賭場 · 冥馬レース" })
           .setColor(C_MAMMON)
-          .setTitle(`🏇  第 ${turn + 1} 直線`)
-          .setDescription(renderTrack()),
+          .setTitle(`🏇  レース進行  ·  Turn ${turn}`)
+          .setDescription(renderBoard()),
       ],
     }).catch(() => undefined);
+
+    await sleep(finalStraightAnnounced && remain < 5 ? FINAL_STRAIGHT_MS : BASE_TURN_MS);
   }
   // 残った馬は最終位置順で決定
   const remaining = HORSES.filter((h) => !finished.includes(h.id))
@@ -287,18 +375,19 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
   const top3 = finished.slice(0, 3).map((id, i) => {
     const h = HORSES.find((x) => x.id === id)!;
     const medal = ["🥇", "🥈", "🥉"][i]!;
-    return `${medal} ${h.emoji} ${h.name}`;
+    return `${medal} ${h.emoji} **${h.name}** ｜ ${STYLE_LABEL[h.style]}`;
   });
   const winOdds = winHitTotal > 0 ? (winDistributable / winHitTotal).toFixed(2) : "—";
   const placeOdds = placeHitTotal > 0 ? (placeDistributable / placeHitTotal).toFixed(2) : "—";
 
   await interaction.editReply({
+    content: `🏆 **勝者** ${winnerHorse.emoji} **${winnerHorse.name}** — 単勝 ×${winOdds}`,
     embeds: [
       new EmbedBuilder()
         .setAuthor({ name: "マモンの賭場 · 冥馬レース" })
         .setColor(C_WIN)
         .setTitle(`🏇  勝者  ${winnerHorse.emoji}  ${winnerHorse.name}`)
-        .setDescription(renderTrack())
+        .setDescription(renderBoard())
         .addFields(
           { name: "▸ 着順", value: top3.join("\n"), inline: false },
           {
