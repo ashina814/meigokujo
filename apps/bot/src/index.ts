@@ -23,6 +23,7 @@ import { handleVipButton, handleVipCommand } from "./commands/vip.js";
 import { handleNagareboshiCommand } from "./commands/nagareboshi.js";
 import { handleItaButton, handleItaCommand, handleItaModal, handleItaSelect } from "./commands/ita.js";
 import { handleTakuButton, handleTakuVoiceUpdate, sweepStaleTables } from "./commands/takutate-panel.js";
+import { handlePokerDuelButton, handlePokerDuelSelect } from "./casino/poker-duel.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -233,6 +234,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleStocksSelect(interaction, services);
       return;
     }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("pkr:")) {
+      await handlePokerDuelSelect(interaction, services);
+      return;
+    }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("ita:")) {
       await handleItaSelect(interaction, services);
       return;
@@ -315,6 +320,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("ita:")) {
         await handleItaButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("pkr:")) {
+        await handlePokerDuelButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("taku:")) {

@@ -6,6 +6,7 @@ import { playChinchiroDuel } from "../casino/chinchiro-duel.js";
 import { playBjDuel } from "../casino/bj-duel.js";
 import { playSashi } from "../casino/sashi.js";
 import { playIndian } from "../casino/indian.js";
+import { playPokerDuel } from "../casino/poker-duel.js";
 
 /**
  * /勝負 — マモンの賭場の対人ゲーム集約コマンド。
@@ -53,6 +54,15 @@ export const shobuCommand = new SlashCommandBuilder()
       .addIntegerOption((o) =>
         o.setName("賭け").setDescription("賭けるエテル（同額）").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
       ),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("ポーカー")
+      .setDescription("🃏 5枚交換ポーカー（相手指定でサシ・未指定でオープン募集）")
+      .addIntegerOption((o) =>
+        o.setName("賭け").setDescription("賭けるエテル（参加者全員同額）").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
+      )
+      .addUserOption((o) => o.setName("相手").setDescription("相手指定でサシ（未指定なら誰でも参加できるオープン）").setRequired(false)),
   );
 
 export async function handleShobuCommand(
@@ -61,6 +71,11 @@ export async function handleShobuCommand(
 ): Promise<void> {
   const sub = interaction.options.getSubcommand();
   if (sub === "丁半") return playChohanMulti(interaction, services);
+  if (sub === "ポーカー") {
+    const bet = interaction.options.getInteger("賭け", true);
+    const opponent = interaction.options.getUser("相手", false);
+    return playPokerDuel(interaction, services, opponent, bet);
+  }
   const opponent = interaction.options.getUser("相手", true);
   const bet = interaction.options.getInteger("賭け", true);
   if (sub === "チンチロ") return playChinchiroDuel(interaction, services, opponent, bet);
