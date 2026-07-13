@@ -11,7 +11,7 @@ import {
   type MessageCreateOptions,
 } from "discord.js";
 import { TABLE_TYPES } from "@meigokujo/core";
-import { MAMMON_COLOR } from "../casino/common.js";
+import { C_MAMMON } from "../casino/ui.js";
 import type { Services } from "../services.js";
 
 /**
@@ -23,15 +23,16 @@ import type { Services } from "../services.js";
 
 export function takutatePanelMessage(): MessageCreateOptions {
   const embed = new EmbedBuilder()
-    .setTitle("🪑 卓を立てる")
-    .setColor(MAMMON_COLOR)
-    .setDescription(
-      [
-        "用途別の一時VCを立てる。**最後の1人が退出したら自動で消える**。",
-        "",
-        ...TABLE_TYPES.map((t) => `${t.emoji} **${t.name}** — 定員${t.userLimit}`),
-      ].join("\n"),
-    );
+    .setAuthor({ name: "マモンの賭場 · 卓建て" })
+    .setColor(C_MAMMON)
+    .setTitle("🪑  卓を立てる")
+    .setDescription("用途別の一時VCを開く。**最後の1人が退出したら自動で片付けられる**。")
+    .addFields({
+      name: "▸ 卓の種類",
+      value: TABLE_TYPES.map((t) => `${t.emoji}  **${t.name}**  ·  定員 ${t.userLimit}`).join("\n"),
+      inline: false,
+    })
+    .setFooter({ text: "パネルのボタンから即席で開ける" });
   const rows: ActionRowBuilder<ButtonBuilder>[] = [];
   let current = new ActionRowBuilder<ButtonBuilder>();
   for (const t of TABLE_TYPES) {

@@ -18,7 +18,8 @@ import {
 } from "discord.js";
 import { MarketError } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
-import { MAMMON_COLOR, MAX_BET, MIN_BET } from "../casino/common.js";
+import { MAX_BET, MIN_BET } from "../casino/common.js";
+import { C_JACKPOT, C_LOSE, C_MAMMON, E, bar } from "../casino/ui.js";
 import { isAdmin } from "../permissions.js";
 import type { Services } from "../services.js";
 
@@ -97,10 +98,16 @@ async function runList(interaction: ChatInputCommandInteraction, services: Servi
   }
   const lines = rows
     .slice(0, 15)
-    .map((m) => `**#${m.id}** ${m.title} — 締切 <t:${m.deadline_at}:R>（<@${m.creator_id}>）`)
-    .join("\n");
+    .map((m) => `**#${m.id}**  ${m.title}\n　${E.history}  締切 <t:${m.deadline_at}:R>  ·  <@${m.creator_id}>`)
+    .join("\n\n");
   await interaction.reply({
-    embeds: [new EmbedBuilder().setTitle("📋 開催中の板").setColor(MAMMON_COLOR).setDescription(lines)],
+    embeds: [
+      new EmbedBuilder()
+        .setAuthor({ name: "マモンの賭場 · 板" })
+        .setColor(C_MAMMON)
+        .setTitle(`📋  開催中の板  ${rows.length}件`)
+        .setDescription(lines),
+    ],
     flags: MessageFlags.Ephemeral,
     allowedMentions: { parse: [] },
   });
@@ -127,30 +134,34 @@ function buildMarketEmbed(services: Services, marketId: number): EmbedBuilder {
   const totalByOption = new Map<number, number>();
   for (const b of bets) totalByOption.set(b.option_index, (totalByOption.get(b.option_index) ?? 0) + b.amount);
   const pot = bets.reduce((s, b) => s + b.amount, 0);
+  const settled = m.status === "settled" && m.result_option !== null;
+  const voided = m.status === "void";
   const optionLines = options.map((opt, i) => {
     const total = totalByOption.get(i) ?? 0;
-    const pct = pot > 0 ? ((total / pot) * 100).toFixed(1) : "0.0";
-    return `**${i + 1}. ${opt}** — ${fmtEther(total)}（${pct}%）`;
+    const pct = pot > 0 ? Math.round((total / pot) * 100) : 0;
+    const win = settled && i === m.result_option;
+    const mark = win ? "🏆" : `${i + 1}.`;
+    const gauge = bar(pct, 100, 10);
+    return `${mark}  **${opt}**\n　\`${gauge}\`  ${pct}%  ·  ${fmtEther(total).replace(" ◈", "◈")}`;
   });
-  return new EmbedBuilder()
-    .setTitle(`📋 板 #${m.id} — ${m.title}`)
-    .setColor(MAMMON_COLOR)
-    .setDescription(
-      [
-        `作成者: <@${m.creator_id}>／状態: **${m.status}**`,
-        `締切: <t:${m.deadline_at}:F>（<t:${m.deadline_at}:R>）`,
-        `場代: 3% → JPプール`,
-        "",
-        ...optionLines,
-        "",
-        `**総額**: ${fmtEther(pot)}`,
-        m.status === "settled" && m.result_option !== null
-          ? `\n**結果**: ${options[m.result_option]}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-    );
+  const color = voided ? C_LOSE : settled ? C_JACKPOT : C_MAMMON;
+  const status = voided ? "🚫 void" : settled ? "🏁 精算済" : "🟢 受付中";
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: `マモンの賭場 · 板 #${m.id}` })
+    .setColor(color)
+    .setTitle(`📋  ${m.title}`)
+    .addFields(
+      { name: "▸ 情報", value: [
+        `作成者  <@${m.creator_id}>  ·  状態  **${status}**`,
+        `締切  <t:${m.deadline_at}:F>  ·  <t:${m.deadline_at}:R>`,
+      ].join("\n"), inline: false },
+      { name: "▸ 選択肢", value: optionLines.join("\n\n"), inline: false },
+    )
+    .setFooter({ text: `総額 ${fmtEther(pot).replace(" ◈", "◈")}  ·  場代 3% → JPプール` });
+  if (settled) {
+    embed.setDescription(`🏆 **結果**: ${options[m.result_option!]}`);
+  }
+  return embed;
 }
 
 function buildMarketRow(marketId: number, optionCount: number): ActionRowBuilder<ButtonBuilder> {
@@ -224,7 +235,13 @@ export async function handleItaButton(interaction: ButtonInteraction, services: 
       .setPlaceholder("勝ちの選択肢を選ぶ")
       .addOptions(options.map((opt, i) => ({ label: `${i + 1}. ${opt}`.slice(0, 100), value: String(i) })));
     await interaction.reply({
-      embeds: [new EmbedBuilder().setTitle(`📢 板 #${marketId} — 結果報告`).setColor(MAMMON_COLOR).setDescription("勝ちの選択肢を選ぶ")],
+      embeds: [
+        new EmbedBuilder()
+          .setAuthor({ name: `マモンの賭場 · 板 #${marketId}` })
+          .setColor(C_MAMMON)
+          .setTitle("📢  結果報告")
+          .setDescription("勝ちの選択肢を選ぶ"),
+      ],
       components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)],
       flags: MessageFlags.Ephemeral,
     });

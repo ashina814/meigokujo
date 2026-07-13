@@ -15,7 +15,8 @@ import {
 } from "discord.js";
 import { HOUSE_HOLDER, JACKPOT_HOLDER } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, sleep } from "./common.js";
+import { MAX_BET, MIN_BET, sleep } from "./common.js";
+import { C_LOSE, C_MAMMON, C_WIN, E, buildLobbyEmbed } from "./ui.js";
 
 /**
  * 🏇 マモンの賭場 競馬（シンプル版）。
@@ -76,28 +77,30 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
   const buildLobby = (secondsLeft: number) => {
     const totalByHorseWin = new Map<number, number>();
     const totalByHorsePlace = new Map<number, number>();
+    let pot = 0;
     for (const arr of bets.values()) {
       for (const b of arr) {
         const map = b.type === "win" ? totalByHorseWin : totalByHorsePlace;
         map.set(b.horseId, (map.get(b.horseId) ?? 0) + b.amount);
+        pot += b.amount;
       }
     }
     const horseLines = HORSES.map((h) => {
       const w = totalByHorseWin.get(h.id) ?? 0;
       const p = totalByHorsePlace.get(h.id) ?? 0;
-      return `${h.emoji} **${h.id}. ${h.name}** — 単 ${fmtEther(w)} / 複 ${fmtEther(p)}`;
+      const wStr = w > 0 ? `**単 ${fmtEther(w).replace(" ◈", "◈")}**` : `単 ─`;
+      const pStr = p > 0 ? `**複 ${fmtEther(p).replace(" ◈", "◈")}**` : `複 ─`;
+      return `${h.emoji}  ${h.id}. **${h.name}**  ·  ${wStr}  /  ${pStr}`;
     });
-    return new EmbedBuilder()
-      .setTitle("🏇 冥馬レース — 受付中")
-      .setColor(MAMMON_COLOR)
-      .setDescription(
-        [
-          `締切まで **${secondsLeft}秒**。1人何口でも張れる。`,
-          "**単勝**: 1着的中で配当 / **複勝**: 3着以内で配当（場代10%）",
-          "",
-          ...horseLines,
-        ].join("\n"),
-      );
+    const embed = buildLobbyEmbed({
+      game: "冥馬レース",
+      title: "🏇  冥馬レース  ·  受付中",
+      body: "**単勝**: 1着的中  /  **複勝**: 3着以内で配当（場代10% → JPプール）",
+      secondsLeft,
+      totalBet: pot,
+    });
+    embed.addFields({ name: "▸ 出走馬", value: horseLines.join("\n"), inline: false });
+    return embed;
   };
 
   const rows = () => [
@@ -179,8 +182,9 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
     await interaction.editReply({
       embeds: [
         new EmbedBuilder()
-          .setTitle("🏇 冥馬レース — 不成立")
-          .setColor(LOSE_COLOR)
+          .setAuthor({ name: "マモンの賭場 · 冥馬レース" })
+          .setColor(C_LOSE)
+          .setTitle("🏇  不成立")
           .setDescription("誰も張らなかった。レースは流れた。"),
       ],
       components: [],
@@ -207,8 +211,9 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
   await interaction.editReply({
     embeds: [
       new EmbedBuilder()
-        .setTitle("🏇 冥馬レース — スタート！")
-        .setColor(MAMMON_COLOR)
+        .setAuthor({ name: "マモンの賭場 · 冥馬レース" })
+        .setColor(C_MAMMON)
+        .setTitle("🏇  スタート！")
         .setDescription(renderTrack()),
     ],
     components: [],
@@ -230,7 +235,11 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
     }
     await interaction.editReply({
       embeds: [
-        new EmbedBuilder().setTitle("🏇 冥馬レース").setColor(MAMMON_COLOR).setDescription(renderTrack()),
+        new EmbedBuilder()
+          .setAuthor({ name: "マモンの賭場 · 冥馬レース" })
+          .setColor(C_MAMMON)
+          .setTitle(`🏇  第 ${turn + 1} 直線`)
+          .setDescription(renderTrack()),
       ],
     }).catch(() => undefined);
   }
@@ -286,19 +295,22 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
   await interaction.editReply({
     embeds: [
       new EmbedBuilder()
-        .setTitle(`🏇 冥馬レース — 勝者 ${winnerHorse.emoji} ${winnerHorse.name}`)
-        .setColor(WIN_COLOR)
-        .setDescription(
-          [
-            "**順位**",
-            ...top3,
-            "",
-            `**単勝配当倍率**: ${winOdds} 倍（プール ${fmtEther(winPool)}・場代 ${fmtEther(winCut)}）`,
-            `**複勝配当倍率**: ${placeOdds} 倍（プール ${fmtEther(placePool)}・場代 ${fmtEther(placeCut)}）`,
-            "",
-            renderTrack(),
-          ].join("\n"),
-        ),
+        .setAuthor({ name: "マモンの賭場 · 冥馬レース" })
+        .setColor(C_WIN)
+        .setTitle(`🏇  勝者  ${winnerHorse.emoji}  ${winnerHorse.name}`)
+        .setDescription(renderTrack())
+        .addFields(
+          { name: "▸ 着順", value: top3.join("\n"), inline: false },
+          {
+            name: "▸ 配当倍率",
+            value: [
+              `${E.bet}  **単勝 ×${winOdds}**  ·  プール ${fmtEther(winPool).replace(" ◈", "◈")}  ·  場代 ${fmtEther(winCut).replace(" ◈", "◈")}`,
+              `${E.up}  **複勝 ×${placeOdds}**  ·  プール ${fmtEther(placePool).replace(" ◈", "◈")}  ·  場代 ${fmtEther(placeCut).replace(" ◈", "◈")}`,
+            ].join("\n"),
+            inline: false,
+          },
+        )
+        .setFooter({ text: "場代は JPプールへ ─ 的中不在分もキャリーオーバー" }),
     ],
     components: [],
     allowedMentions: { parse: [] },

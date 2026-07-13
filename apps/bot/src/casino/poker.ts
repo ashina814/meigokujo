@@ -11,8 +11,9 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
+import { C_JACKPOT, C_MAMMON, E, HR_THIN, buildResultEmbed, fmtBigDelta } from "./ui.js";
 
 /**
  * 🃏 ドローポーカー（Jacks or Better・ソロ）。対胴元の簡易版。
@@ -108,32 +109,25 @@ function evaluate(hand: Card[]): HandEval {
 
 function paytableEmbed(): EmbedBuilder {
   const lines = [
-    "🏆 ロイヤルフラッシュ — **250倍**",
-    "🌟 ストレートフラッシュ — **50倍**",
-    "🎯 4カード — **25倍**",
-    "🎴 フルハウス — **9倍**",
-    "🔷 フラッシュ — **6倍**",
-    "➡ ストレート — **4倍**",
-    "🃏 3カード — **3倍**",
-    "🎭 ツーペア — **2倍**",
-    "💫 J以上のペア — **1倍**（賭け金返却+1倍）",
-    "😔 それ以下 — 負け",
+    "🏆  ロイヤルフラッシュ  ·  **×250**",
+    "🌟  ストレートフラッシュ  ·  **×50**",
+    "🎯  4カード  ·  **×25**",
+    "🎴  フルハウス  ·  **×9**",
+    "🔷  フラッシュ  ·  **×6**",
+    "➡  ストレート  ·  **×4**",
+    "🃏  3カード  ·  **×3**",
+    "🎭  ツーペア  ·  **×2**",
+    "💫  J以上のペア  ·  **×1**（元本返却+1倍）",
+    "😔  それ以下  ·  負け",
   ];
   return new EmbedBuilder()
-    .setTitle("📖 ポーカー — 配当表（Jacks or Better）")
-    .setColor(MAMMON_COLOR)
-    .setDescription(
-      [
-        "**遊び方**",
-        "・5枚配札 → 保持したいカードを選ぶ → 残りを交換 → 役判定",
-        "・ジャック以上のペアで元本+1倍返し。以降は表通り",
-        "・52枚デッキ 1組。RTP は約 96%",
-        "",
-        ...lines,
-        "",
-        "**⚖️ 福の重み / 🔥 連鎖チェーン**",
-        "　勝ちで発動（残高が多いほど奉納・連勝で倍率）",
-      ].join("\n"),
+    .setAuthor({ name: "マモンの賭場 · ポーカー" })
+    .setColor(C_MAMMON)
+    .setTitle("📖  配当表  ·  Jacks or Better")
+    .setDescription("5枚配札 → 保持を選ぶ → 交換 → 役判定。52枚デッキ1組・RTP 約96%。")
+    .addFields(
+      { name: "▸ 配当", value: lines.join("\n"), inline: false },
+      { name: "▸ ⚖️ 福の重み / 🔥 連鎖チェーン", value: "勝ちで発動（残高が多いほど奉納・連勝で倍率）", inline: false },
     );
 }
 
@@ -171,23 +165,28 @@ async function runRound(
   for (let i = 0; i < 5; i++) hand.push(deck.pop()!);
   const held = new Set<number>();
 
-  const buildEmbed = (phase: "draw" | "reveal", finalEval?: HandEval) =>
-    new EmbedBuilder()
-      .setTitle("🃏 ポーカー — ドロー")
-      .setColor(phase === "draw" ? MAMMON_COLOR : finalEval && finalEval.payMult > 0 ? WIN_COLOR : LOSE_COLOR)
+  const buildEmbed = (phase: "draw" | "reveal", finalEval?: HandEval) => {
+    const cardsLine = hand.map((c, i) => (held.has(i) ? `[**${showCard(c)}**]` : `[${showCard(c)}]`)).join("  ");
+    const heldCount = held.size;
+    return new EmbedBuilder()
+      .setAuthor({ name: "マモンの賭場 · ポーカー" })
+      .setColor(C_MAMMON)
+      .setTitle(`🃏  ドロー  ·  保持 ${heldCount}枚 / 交換 ${5 - heldCount}枚`)
       .setDescription(
         [
-          `賭け: ${fmtEther(bet)}`,
-          "",
-          hand.map((c, i) => (held.has(i) ? `[**${showCard(c)}**]` : `[${showCard(c)}]`)).join("  "),
-          "",
+          cardsLine,
+          HR_THIN,
           phase === "draw"
-            ? "**保持したいカードのボタンを押す**（もう一度押すと解除）→ **交換** で確定"
+            ? "保持したい札のボタンを押す（再押しで解除）→ **交換** で確定"
             : finalEval
-              ? `**${finalEval.label}** — 配当倍率 **${finalEval.payMult}x**`
+              ? `**${finalEval.label}**  ·  配当倍率 **×${finalEval.payMult}**`
               : "",
-        ].join("\n"),
-      );
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      )
+      .setFooter({ text: `賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
+  };
 
   const cardButtons = () =>
     new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -255,31 +254,31 @@ async function runRound(
   const amulet = applyAmulets(services, uid, bet, rawPayout);
   const settled = services.casino.settle(uid, "ポーカー", bet, amulet.payout);
 
-  const won = settled.net > 0;
-  const chainLine =
-    settled.chainBonus > 0
-      ? `${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
-      : "";
-  const fukuLine =
-    settled.fukuTax > 0 ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納` : "";
+  const isJp = ev.category === 11;
+  const bonusBits: string[] = [];
+  if (settled.chainBonus > 0) {
+    bonusBits.push(`${settled.chainLabel} 連鎖 ×${settled.chainMult.toFixed(2)}（${settled.chainStreak}連勝）  ${fmtBigDelta(settled.chainBonus)}`);
+  }
+  if (settled.fukuTax > 0) {
+    bonusBits.push(`⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}%  ${fmtBigDelta(-settled.fukuTax)}`);
+  }
+  if (amulet.note) bonusBits.push(`${E.sparkle} ${amulet.note}`);
 
-  const resultEmbed = new EmbedBuilder()
-    .setTitle(ev.category === 11 ? "🔥🔥🔥 🏆 ロイヤルフラッシュ 🔥🔥🔥" : "🃏 ポーカー — 結果")
-    .setColor(won ? WIN_COLOR : LOSE_COLOR)
-    .setDescription(
-      [
-        hand.map((c) => `[${showCard(c)}]`).join("  "),
-        "",
-        `**${ev.label}** — 配当倍率 ${ev.payMult}x`,
-        won ? `💰 +${fmtEther(settled.net)}` : `💸 -${fmtEther(-settled.net)}`,
-        amulet.note ? `✨ ${amulet.note}` : "",
-        chainLine,
-        fukuLine,
-      ]
-        .filter(Boolean)
-        .join("\n"),
-    )
-    .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
+  const resultEmbed = buildResultEmbed({
+    game: "ポーカー",
+    net: settled.net,
+    bet,
+    balance: services.ether.balanceOf(uid),
+    isJackpot: isJp,
+    sections: [
+      { icon: "🃏", label: "手札", value: hand.map((c) => `[${showCard(c)}]`).join("  "), inline: false },
+      { icon: "🏆", label: `${ev.label}  ·  配当倍率 ×${ev.payMult}`, value: bonusBits.length > 0 ? bonusBits.join("\n") : "─", inline: false },
+    ],
+  });
+  if (isJp) {
+    resultEmbed.setColor(C_JACKPOT).setTitle(`💎  ロイヤルフラッシュ  ${fmtBigDelta(settled.net)}`);
+  }
+  const won = settled.net > 0;
 
   if (won) {
     broadcastBigWin(interaction.client, services, {

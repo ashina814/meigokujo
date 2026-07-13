@@ -11,8 +11,9 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
+import { C_MAMMON, E, HR_THIN, buildResultEmbed, fmtBigDelta } from "./ui.js";
 
 /**
  * 🃏 テキサスホールデム（対マモン簡易版・ソロ）。
@@ -198,21 +199,29 @@ async function runRound(
           : phase === "turn"
             ? `${showHand([...flop, turn])} 🂠`
             : showHand([...flop, turn, river]);
+    const phaseLabel = {
+      preflop: "プリフロップ",
+      flop: "フロップ",
+      turn: "ターン",
+      river: "リバー",
+      showdown: "ショウダウン",
+    }[phase];
+    const pot = playerBet + dealerBet;
     return new EmbedBuilder()
-      .setTitle("🃏 テキサスホールデム — 対マモン")
-      .setColor(MAMMON_COLOR)
+      .setAuthor({ name: "マモンの賭場 · ホールデム" })
+      .setColor(C_MAMMON)
+      .setTitle(`🃏  ${phaseLabel}  ·  Pot ${fmtEther(pot).replace(" ◈", "◈")}`)
       .setDescription(
         [
-          `**ボード**: ${board}`,
-          `**お前の手札**: ${showHand(pHand)}`,
-          `**マモン**: ${phase === "showdown" ? showHand(dHand) : "🂠 🂠"}`,
-          "",
-          `賭け（お前 / マモン）: ${fmtEther(playerBet)} / ${fmtEther(dealerBet)}`,
-          note ?? "",
+          `**ボード**   ${board}`,
+          `${E.demon} マモン   ${phase === "showdown" ? showHand(dHand) : "🂠 🂠"}`,
+          `${E.crown} お前     ${showHand(pHand)}`,
+          note ? `${HR_THIN}\n${note}` : "",
         ]
           .filter(Boolean)
           .join("\n"),
-      );
+      )
+      .setFooter({ text: `賭け ${fmtEther(playerBet).replace(" ◈", "◈")} / マモン ${fmtEther(dealerBet).replace(" ◈", "◈")}` });
   };
 
   const actionRow = (phase: string) =>
@@ -296,31 +305,39 @@ async function runRound(
   const settled = services.casino.settle(uid, "ホールデム", playerBet, amulet.payout);
 
   const won = settled.net > 0;
-  const chainLine =
-    settled.chainBonus > 0
-      ? `${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
-      : "";
-  const fukuLine =
-    settled.fukuTax > 0 ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納` : "";
+  const bonusBits: string[] = [];
+  if (settled.chainBonus > 0) {
+    bonusBits.push(`${settled.chainLabel} 連鎖 ×${settled.chainMult.toFixed(2)}（${settled.chainStreak}連勝）  ${fmtBigDelta(settled.chainBonus)}`);
+  }
+  if (settled.fukuTax > 0) {
+    bonusBits.push(`⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}%  ${fmtBigDelta(-settled.fukuTax)}`);
+  }
+  if (amulet.note) bonusBits.push(`${E.sparkle} ${amulet.note}`);
 
-  const resultEmbed = new EmbedBuilder()
-    .setTitle("🃏 ホールデム — 結果")
-    .setColor(won ? WIN_COLOR : LOSE_COLOR)
-    .setDescription(
-      [
-        `**ボード**: ${showHand([...flop, turn, river])}`,
-        `**お前**: ${showHand(pHand)} / **マモン**: ${folded ? "🂠 🂠" : showHand(dHand)}`,
-        "",
-        note,
-        won ? `💰 +${fmtEther(settled.net)}` : settled.net < 0 ? `💸 -${fmtEther(-settled.net)}` : "±0",
-        amulet.note ? `✨ ${amulet.note}` : "",
-        chainLine,
-        fukuLine,
-      ]
-        .filter(Boolean)
-        .join("\n"),
-    )
-    .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
+  const resultEmbed = buildResultEmbed({
+    game: "ホールデム",
+    net: settled.net,
+    bet: playerBet,
+    balance: services.ether.balanceOf(uid),
+    sections: [
+      { icon: "🃏", label: "ボード", value: showHand([...flop, turn, river]), inline: false },
+      {
+        icon: "👥",
+        label: "手役",
+        value: [
+          `${E.crown} お前     ${showHand(pHand)}`,
+          `${E.demon} マモン   ${folded ? "🂠 🂠" : showHand(dHand)}`,
+          note,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        inline: false,
+      },
+      ...(bonusBits.length > 0
+        ? [{ icon: "🔥", label: "ボーナス", value: bonusBits.join("\n"), inline: false } as const]
+        : []),
+    ],
+  });
 
   if (won) {
     broadcastBigWin(interaction.client, services, { userId: uid, game: "ホールデム", bet: playerBet, payout: settled.payout });

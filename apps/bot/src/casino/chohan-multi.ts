@@ -14,8 +14,9 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, sleep } from "./common.js";
-import { collectStakes, refundAll, settleProportional } from "./pvp-common.js";
+import { MAX_BET, MIN_BET, sleep } from "./common.js";
+import { collectStakes, settleProportional } from "./pvp-common.js";
+import { C_LOSE, C_MAMMON, C_WIN, E, boxDice, buildLobbyEmbed, fmtBigDelta } from "./ui.js";
 
 /**
  * 🎴 多人数丁半（casino-bot /丁半 PvP 準拠）。
@@ -25,7 +26,6 @@ import { collectStakes, refundAll, settleProportional } from "./pvp-common.js";
  * - 場代 3% を JP プールへ（マモンの取り分）
  */
 const LOBBY_SEC = 60;
-const DIE_FACES = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"] as const;
 
 interface Bet {
   userId: string;
@@ -58,21 +58,25 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
     const hans = [...bets.values()].filter((b) => b.side === "han");
     const choTotal = chos.reduce((s, b) => s + b.amount, 0);
     const hanTotal = hans.reduce((s, b) => s + b.amount, 0);
-    return new EmbedBuilder()
-      .setTitle("🎴 多人数丁半 — 受付中")
-      .setColor(MAMMON_COLOR)
-      .setDescription(
-        [
-          "壺の中で二賽が転がる。",
-          `締切まで **${secondsLeft}秒**。両側に張り手が居なければ勝負不成立。`,
-          "",
-          `**⚫ 丁（偶数）** — ${chos.length}人 / 計 ${fmtEther(choTotal)}`,
-          chos.length > 0 ? chos.map((b) => `　・<@${b.userId}> ${fmtEther(b.amount)}`).join("\n") : "　（誰も張っていない）",
-          "",
-          `**⚪ 半（奇数）** — ${hans.length}人 / 計 ${fmtEther(hanTotal)}`,
-          hans.length > 0 ? hans.map((b) => `　・<@${b.userId}> ${fmtEther(b.amount)}`).join("\n") : "　（誰も張っていない）",
-        ].join("\n"),
-      );
+    const pot = choTotal + hanTotal;
+    const embed = buildLobbyEmbed({
+      game: "多人数丁半",
+      title: "🎴  多人数丁半  ·  受付中",
+      body: "壺の中で二賽が転がる。両側に張り手が揃わなければ不成立。",
+      secondsLeft,
+      totalBet: pot,
+    });
+    const choValue = chos.length > 0
+      ? chos.map((b) => `　<@${b.userId}>  ${fmtEther(b.amount).replace(" ◈", "◈")}`).join("\n")
+      : "　（誰も張っていない）";
+    const hanValue = hans.length > 0
+      ? hans.map((b) => `　<@${b.userId}>  ${fmtEther(b.amount).replace(" ◈", "◈")}`).join("\n")
+      : "　（誰も張っていない）";
+    embed.addFields(
+      { name: `⚫ 丁（偶数）  ${chos.length}人  ·  ${fmtEther(choTotal).replace(" ◈", "◈")}`, value: choValue, inline: false },
+      { name: `⚪ 半（奇数）  ${hans.length}人  ·  ${fmtEther(hanTotal).replace(" ◈", "◈")}`, value: hanValue, inline: false },
+    );
+    return embed;
   };
 
   const rows = (disabled = false) => [
@@ -169,8 +173,9 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
     await interaction.editReply({
       embeds: [
         new EmbedBuilder()
-          .setTitle("🎴 多人数丁半 — 勝負不成立")
-          .setColor(LOSE_COLOR)
+          .setAuthor({ name: "マモンの賭場 · 多人数丁半" })
+          .setColor(C_LOSE)
+          .setTitle("🎴  不成立")
           .setDescription("両側に張り手が揃わなかった。全額返金。"),
       ],
       components: [],
@@ -181,7 +186,11 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
   // 抽選演出
   await interaction.editReply({
     embeds: [
-      new EmbedBuilder().setTitle("🎴 多人数丁半 — 締切").setColor(MAMMON_COLOR).setDescription("壺を開く……"),
+      new EmbedBuilder()
+        .setAuthor({ name: "マモンの賭場 · 多人数丁半" })
+        .setColor(C_MAMMON)
+        .setTitle("🎴  締切  ·  壺を開く……")
+        .setDescription("マモンの手が壺にかかる。"),
     ],
     components: [],
   });
@@ -209,26 +218,21 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
     .sort((a, b) => b.amount - a.amount)
     .map((w) => {
       const share = Math.floor((distributable * w.amount) / winTotal);
-      return `　・<@${w.userId}> 賭け ${fmtEther(w.amount)} → 受取 **${fmtEther(share)}**（純益 +${fmtEther(share - w.amount)}）`;
+      return `　${E.win}  <@${w.userId}>  賭け ${fmtEther(w.amount).replace(" ◈", "◈")} → 受取 **${fmtEther(share).replace(" ◈", "◈")}**  ${fmtBigDelta(share - w.amount)}`;
     })
     .join("\n");
   const loserLines = losers
-    .map((l) => `　・<@${l.userId}> -${fmtEther(l.amount)}`)
+    .map((l) => `　${E.lose}  <@${l.userId}>  ${fmtBigDelta(-l.amount)}`)
     .join("\n");
 
   const embed = new EmbedBuilder()
-    .setTitle(`🎴 多人数丁半 — 出目 ${DIE_FACES[d1]} ${DIE_FACES[d2]} = ${total} → ${resultLabel}`)
-    .setColor(WIN_COLOR)
-    .setDescription(
-      [
-        `**勝ち側**（${winners.length}人）`,
-        winnerLines,
-        "",
-        `**負け側**（${losers.length}人）`,
-        loserLines,
-        "",
-        `場代 ${fmtEther(totalHouseCut)} をマモンの取り分（JPプールへ）`,
-      ].join("\n"),
-    );
+    .setAuthor({ name: "マモンの賭場 · 多人数丁半" })
+    .setColor(C_WIN)
+    .setTitle(`🎴  ${resultLabel}  ·  ${boxDice([d1, d2])}  =  ${total}`)
+    .addFields(
+      { name: `${E.win} 勝ち側  ${winners.length}人`, value: winnerLines || "（なし）", inline: false },
+      { name: `${E.lose} 負け側  ${losers.length}人`, value: loserLines || "（なし）", inline: false },
+    )
+    .setFooter({ text: `場代 ${fmtEther(totalHouseCut).replace(" ◈", "◈")} → JPプール` });
   await interaction.editReply({ embeds: [embed], components: [], allowedMentions: { parse: [] } });
 }

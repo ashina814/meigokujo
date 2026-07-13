@@ -1,6 +1,7 @@
 import { EmbedBuilder, type Client } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
+import { C_BIGWIN, C_JACKPOT, E, fmtBigDelta } from "./ui.js";
 
 /**
  * 大勝ち速報 — JP当選・高倍率勝ちを channel:bigwin へ流す（casino-bot 準拠）。
@@ -25,14 +26,17 @@ export function broadcastBigWin(
     void (async () => {
       const ch = await client.channels.fetch(chId).catch(() => null);
       if (!ch?.isTextBased() || !("send" in ch)) return;
+      const isJp = !!o.isJackpot;
       const embed = new EmbedBuilder()
-        .setTitle(o.isJackpot ? "🎉 JACKPOT！" : "🔥 大勝ち速報")
-        .setColor(o.isJackpot ? 0xf0b429 : 0xdc2626)
+        .setAuthor({ name: `マモンの賭場 · ${o.game}` })
+        .setColor(isJp ? C_JACKPOT : C_BIGWIN)
+        .setTitle(`${isJp ? `${E.jp}  JACKPOT!` : `${E.fire}  大勝ち  ×${ratio.toFixed(1)}`}  ${fmtBigDelta(net)}`)
         .setDescription(
-          o.isJackpot
-            ? `<@${o.userId}> が **${o.game}** でジャックポットを射止めた！ **+${fmtEther(net)}**`
-            : `<@${o.userId}> が **${o.game}** で **${ratio.toFixed(1)}倍** の大勝ち！ **+${fmtEther(net)}**`,
-        );
+          isJp
+            ? `<@${o.userId}> がジャックポットを射止めた。マモンが押し黙る。`
+            : `<@${o.userId}> が賭け ${fmtEther(o.bet).replace(" ◈", "◈")} を **${fmtEther(o.payout).replace(" ◈", "◈")}** に化けさせた。`,
+        )
+        .setFooter({ text: isJp ? `${E.demon} マモンより苦渋の献上` : `${E.streak} 賭場の話題を独占` });
       await ch.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => undefined);
     })();
   } catch {
