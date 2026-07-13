@@ -106,19 +106,25 @@ async function runRound(
   const makeEmbed = (multi: number) => {
     const currentValue = Math.floor(bet * multi);
     const canCashOut = multi >= MIN_CASHOUT;
+    // 倍率が上がるほど色が緑→黄→オレンジと熱くなる（心理演出）
+    const color = multi >= 5 ? 0xf59e0b : multi >= 2 ? 0xeab308 : canCashOut ? 0x22c55e : 0x64748b;
     return new EmbedBuilder()
-      .setTitle("📈 クラッシュ")
-      .setColor(MAMMON_COLOR)
+      .setAuthor({ name: "マモンの賭場 · クラッシュ" })
+      .setColor(color)
+      .setTitle(`📈  ${multi.toFixed(2)}x   ${canCashOut ? "🟢" : "🔒"}`)
       .setDescription(
         [
-          `📈 現在: **${multi.toFixed(2)}x**` +
-            (canCashOut ? " 🟢" : ` 🔒 (最低降車 **${MIN_CASHOUT.toFixed(2)}x** まで待て)`),
+          "```",
           progressBar(multi),
+          "```",
+          canCashOut
+            ? `**降りる → ${fmtEther(currentValue)}** で確定`
+            : `⛓ 最低降車 **${MIN_CASHOUT.toFixed(2)}x** まで降りれない`,
           "",
-          `ベット: ${fmtEther(bet)} → 現在価値: ${fmtEther(currentValue)}`,
-          "*押した瞬間の倍率が適用される（内部はリアルタイムで上昇中）*",
+          "*押した瞬間の倍率が適用される。通信の裏で崩壊してたら「遅かった」*",
         ].join("\n"),
-      );
+      )
+      .setFooter({ text: `賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
   };
 
   const cashOutRow = (multi: number) => {
@@ -220,36 +226,53 @@ async function runRound(
     const rawPayout = Math.floor(bet * cashOutMultiplier);
     const amulet = applyAmulets(services, uid, bet, rawPayout);
     const settled = services.casino.settle(uid, "クラッシュ", bet, amulet.payout);
+    const netStr = `+${settled.net.toLocaleString("ja-JP")} ◈`;
+    const bigWin = settled.net >= bet * 5;
+    const bonusBits: string[] = [];
+    if (settled.chainBonus > 0) bonusBits.push(`${settled.chainLabel} 連鎖 ×${settled.chainMult.toFixed(2)}（${settled.chainStreak}連勝）  +${fmtEther(settled.chainBonus)}`);
+    if (settled.fukuTax > 0) bonusBits.push(`⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}%  −${fmtEther(settled.fukuTax)}`);
+    if (amulet.note) bonusBits.push(`✨ ${amulet.note}`);
+
     const embed = new EmbedBuilder()
-      .setTitle("📈 クラッシュ — 離脱成功！")
-      .setColor(WIN_COLOR)
+      .setAuthor({ name: "マモンの賭場 · クラッシュ" })
+      .setColor(bigWin ? 0x16a34a : WIN_COLOR)
+      .setTitle(`${bigWin ? "🔥 大勝ち" : "🪂 離脱成功"}  **${netStr}**`)
       .setDescription(
         [
-          `🪂 離脱: **${cashOutMultiplier.toFixed(2)}x** / 崩壊点は ${crashPoint.toFixed(2)}x だった`,
-          `💰 +${fmtEther(settled.net)}`,
-          settled.chainBonus > 0
-            ? `${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
-            : "",
-          settled.fukuTax > 0
-            ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
-            : "",
-          amulet.note ? `✨ ${amulet.note}` : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
+          "```",
+          `離脱  ${cashOutMultiplier.toFixed(2)}x   （崩壊 ${crashPoint.toFixed(2)}x）`,
+          "```",
+        ].join("\n"),
       )
-      .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
+      .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
+      .setFooter({
+        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
+      });
     await reply.edit({ embeds: [embed], components: [buildRetryRow()] }).catch(() => undefined);
     broadcastBigWin(interaction.client, services, { userId: uid, game: "クラッシュ", bet, payout: settled.payout });
   } else {
     const lossAmulet = applyAmulets(services, uid, bet, 0);
     services.casino.settle(uid, "クラッシュ", bet, lossAmulet.payout);
-    const lossLine = lossAmulet.payout > 0 ? `🛡 ${lossAmulet.note ?? "返金"} (${fmtEther(lossAmulet.payout)})` : `💸 -${fmtEther(bet)}`;
+    const savedByAmulet = lossAmulet.payout > 0;
+    const netStr = savedByAmulet ? `±0 ◈` : `−${bet.toLocaleString("ja-JP")} ◈`;
+
     const embed = new EmbedBuilder()
-      .setTitle("💥 クラッシュ — 燃え尽き！")
-      .setColor(LOSE_COLOR)
-      .setDescription([`📉 崩壊: **${crashPoint.toFixed(2)}x**`, lossLine].join("\n"))
-      .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
+      .setAuthor({ name: "マモンの賭場 · クラッシュ" })
+      .setColor(savedByAmulet ? 0x78716c : 0x450a0a)
+      .setTitle(`${savedByAmulet ? "🛡 敗北無効" : "💥 崩壊"}  **${netStr}**`)
+      .setDescription(
+        [
+          "```",
+          `崩壊  ${crashPoint.toFixed(2)}x`,
+          "```",
+          savedByAmulet ? `✨ ${lossAmulet.note ?? "お守りで返金"}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      )
+      .setFooter({
+        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
+      });
     await reply.edit({ embeds: [embed], components: [buildRetryRow()] }).catch(() => undefined);
   }
 

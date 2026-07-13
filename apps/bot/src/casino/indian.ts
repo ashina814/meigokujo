@@ -13,7 +13,7 @@ import { HOUSE_HOLDER } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, sleep } from "./common.js";
-import { collectStakes, refundAll, settlePvp } from "./pvp-common.js";
+import { buildPvpAbort, buildPvpInvite, collectStakes, refundAll, settlePvp } from "./pvp-common.js";
 
 /**
  * 🃏 インディアンポーカー（1v1心理戦）。casino-bot 準拠。
@@ -62,20 +62,18 @@ export async function playIndian(
   await interaction.reply({
     content: `<@${opponent.id}>`,
     embeds: [
-      new EmbedBuilder()
-        .setTitle("🃏 インディアンポーカー — 挑戦")
-        .setColor(MAMMON_COLOR)
-        .setDescription(
-          [
-            `<@${challenger.id}> が <@${opponent.id}> にインディアン勝負を挑んだ。`,
-            "",
-            `**賭け金**: ${fmtEther(stake)}（両者から徴収）`,
-            "",
-            "**自分の手は見えず、相手の手は DM で通知される**。",
-            "両者ステイなら数値高い方の勝ち。片方フォールドなら残った方の勝ち。",
-            "勝者総取り（場代3% → JPプール）",
-          ].join("\n"),
-        ),
+      buildPvpInvite({
+        game: "インディアン",
+        icon: "🃏",
+        challengerId: challenger.id,
+        opponentId: opponent.id,
+        bet: stake,
+        ruleLines: [
+          "**自分の手は見えず、相手の手だけ DM で分かる**。",
+          "両者ステイなら数値高い方の勝ち・同値ドロー返金。",
+          "片方フォールドなら残った方の勝ち・両者フォールドは返金。",
+        ],
+      }),
     ],
     components: [inviteRow],
     allowedMentions: { users: [opponent.id] },
@@ -98,7 +96,7 @@ export async function playIndian(
     services.ether.transfer(HOUSE_HOLDER, challenger.id, stake);
     await interaction.editReply({
       content: "",
-      embeds: [new EmbedBuilder().setTitle("🃏 インディアン — 不成立").setColor(LOSE_COLOR).setDescription("受諾されなかった。返金。")],
+      embeds: [buildPvpAbort("インディアン", "🃏", "受諾されなかった。挑戦者に全額返金。")],
       components: [],
     });
     return;

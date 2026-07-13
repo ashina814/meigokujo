@@ -44,39 +44,46 @@ function buildBoard(services: Services, userId: string): EmbedBuilder {
   const stocks = services.stocks.list();
   const holdings = services.stocks.holdings(userId);
   const held = services.ether.balanceOf(userId);
-  const lines = stocks.map((s) => {
+
+  // 価格ボード（等幅コードブロックで縦揃え）
+  const rows = stocks.map((s) => {
     const delta = s.price - s.prev_price;
     const pct = s.prev_price > 0 ? (delta / s.prev_price) * 100 : 0;
-    const arrow = delta > 0 ? "🟢▲" : delta < 0 ? "🔴▼" : "➖";
-    const trendMark = s.trend > 0.3 ? "🔥" : s.trend < -0.3 ? "❄️" : "";
-    return `${s.emoji} **${s.name}**（${s.id}） — ${fmtEther(s.price)} ${arrow} ${pct.toFixed(1)}% ${trendMark}`;
+    const arrow = delta > 0 ? "▲" : delta < 0 ? "▼" : "─";
+    const trend = s.trend > 0.3 ? "🔥" : s.trend < -0.3 ? "❄" : "  ";
+    // padding: 銘柄名 8chars, 価格 8chars, 差分 8chars
+    const name = (s.emoji + " " + s.name).padEnd(10, " ");
+    const price = s.price.toLocaleString("ja-JP").padStart(8, " ") + " ◈";
+    const change = `${arrow} ${Math.abs(pct).toFixed(1)}%`.padEnd(10, " ");
+    return `${name}  ${price}  ${change}${trend}`;
   });
-  const holdingLines =
-    holdings.length > 0
-      ? holdings.map((h) => {
-          const value = h.stock.price * h.shares;
-          const cost = h.avg_cost * h.shares;
-          const pnl = value - cost;
-          const daysHeld = Math.floor((Date.now() / 1000 - h.bought_at) / 86_400);
-          return `${h.stock.emoji} ${h.stock.name} × ${h.shares} — 平均取得 ${fmtEther(h.avg_cost)} / 時価 ${fmtEther(value)} (${pnl >= 0 ? "+" : ""}${fmtEther(pnl)}) ／ 保有 ${daysHeld}日`;
-        })
-      : ["（保有なし）"];
-  return new EmbedBuilder()
-    .setTitle("📈 マモンの賭場 — 株式市場")
+
+  const boardStr = "```" + "\n" + rows.join("\n") + "\n" + "```";
+
+  const holdingRows = holdings.map((h) => {
+    const value = h.stock.price * h.shares;
+    const cost = h.avg_cost * h.shares;
+    const pnl = value - cost;
+    const daysHeld = Math.floor((Date.now() / 1000 - h.bought_at) / 86_400);
+    const pnlStr = (pnl >= 0 ? "+" : "−") + Math.abs(pnl).toLocaleString("ja-JP");
+    return `${h.stock.emoji} **${h.stock.name}** ×${h.shares}   平均${fmtEther(h.avg_cost).replace(" ◈", "◈")}  時価${fmtEther(value).replace(" ◈", "◈")}  **${pnlStr}**  ${daysHeld}日`;
+  });
+
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: "マモンの賭場 · 株式市場" })
     .setColor(MAMMON_COLOR)
-    .setDescription(
-      [
-        `所持: ${fmtEther(held)}`,
-        "",
-        "**銘柄一覧**",
-        ...lines,
-        "",
-        "**保有株**",
-        ...holdingLines,
-        "",
-        `※ 価格は1時間ごとに更新。保有 **${STOCK_HOLD_DAYS}日** 超で強制売却（インフレ抑制）`,
-      ].join("\n"),
-    );
+    .setTitle("📈  相場板")
+    .setDescription(boardStr)
+    .setFooter({
+      text: `所持 ${fmtEther(held).replace(" ◈", "◈")} · 価格は1時間毎更新 · 保有 ${STOCK_HOLD_DAYS}日超で強制売却`,
+    });
+
+  if (holdingRows.length > 0) {
+    embed.addFields({ name: "▸ お前の保有", value: holdingRows.join("\n"), inline: false });
+  } else {
+    embed.addFields({ name: "▸ お前の保有", value: "（なし）", inline: false });
+  }
+  return embed;
 }
 
 function buildComponents(services: Services): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {

@@ -1,5 +1,8 @@
+import { EmbedBuilder } from "discord.js";
 import { HOUSE_HOLDER, JACKPOT_HOLDER } from "@meigokujo/core";
 import type { Services } from "../services.js";
+import { fmtEther } from "../format.js";
+import { C_LOSE, C_MAMMON, C_WIN } from "./ui.js";
 
 /**
  * PvP ゲームの共通経済ルール。
@@ -9,6 +12,77 @@ import type { Services } from "../services.js";
  * - 総量保存（一時的に house に置くことでカウンタの矛盾を防ぐ）
  */
 const HOUSE_CUT = 0.03;
+
+/**
+ * PvP 招待の共通embed。
+ * ゲーム名・アイコン・ルール要旨を渡すと author line + description + rule field を統一形で返す。
+ */
+export function buildPvpInvite(opts: {
+  game: string;
+  icon: string;
+  challengerId: string;
+  opponentId: string;
+  bet: number;
+  ruleLines: string[];
+  color?: number;
+}): EmbedBuilder {
+  return new EmbedBuilder()
+    .setAuthor({ name: `マモンの賭場 · ${opts.game}` })
+    .setColor(opts.color ?? C_MAMMON)
+    .setTitle(`${opts.icon}  <${opts.challengerId}> の挑戦`)
+    .setDescription(
+      [
+        `<@${opts.challengerId}> が <@${opts.opponentId}> に **${opts.game}** を挑んだ。`,
+        "",
+        `**賭け金**: ${fmtEther(opts.bet)}（両者から徴収）`,
+        `**受ける** で対戦開始（60秒無応答は不成立）`,
+      ].join("\n"),
+    )
+    .addFields({
+      name: "▸ 遊び方",
+      value: opts.ruleLines.map((l) => `　${l}`).join("\n"),
+      inline: false,
+    })
+    .setFooter({ text: "勝者総取り · 場代3% → JPプール" });
+}
+
+/** PvP 不成立時の共通embed */
+export function buildPvpAbort(game: string, icon: string, reason: string): EmbedBuilder {
+  return new EmbedBuilder()
+    .setAuthor({ name: `マモンの賭場 · ${game}` })
+    .setColor(C_LOSE)
+    .setTitle(`${icon}  不成立`)
+    .setDescription(reason);
+}
+
+/** PvP 勝敗確定時の共通embed */
+export function buildPvpResult(opts: {
+  game: string;
+  icon: string;
+  winnerId: string | null;
+  loserId?: string | null;
+  bet: number;
+  payout: number;
+  houseCut: number;
+  extra?: string;
+}): EmbedBuilder {
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: `マモンの賭場 · ${opts.game}` })
+    .setColor(opts.winnerId ? C_WIN : 0x78716c)
+    .setTitle(opts.winnerId ? `${opts.icon}  勝者 <@${opts.winnerId}>` : `${opts.icon}  引き分け`)
+    .setFooter({ text: `場代 ${fmtEther(opts.houseCut).replace(" ◈", "◈")} → JPプール` });
+
+  const lines: string[] = [];
+  if (opts.winnerId) {
+    lines.push(`${opts.icon} **勝ち**  <@${opts.winnerId}>  +${fmtEther(opts.payout - opts.bet).replace(" ◈", "◈")}`);
+    if (opts.loserId) lines.push(`　**負け**  <@${opts.loserId}>  −${fmtEther(opts.bet).replace(" ◈", "◈")}`);
+  } else {
+    lines.push("両者に返金。");
+  }
+  if (opts.extra) lines.push("", opts.extra);
+  embed.setDescription(lines.join("\n"));
+  return embed;
+}
 
 /** 両者から bet を徴収して house 一時保管。全員から取れなかったら false（呼び出し側で全額返金） */
 export function collectStakes(services: Services, userIds: string[], bet: number): boolean {

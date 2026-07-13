@@ -89,24 +89,38 @@ export async function playRoulette(
     const bets = new Map<string, SessionBet>(); // userId -> bet（上書き）
 
     const lobbyEmbed = (secondsLeft: number) => {
-      const list =
-        bets.size > 0
-          ? [...bets.values()].map((b) => `・<@${b.userId}> — ${LABELS[b.type]} に ${fmtEther(b.amount)}`).join("\n")
-          : "（まだ誰も張っていない）";
-      return new EmbedBuilder()
-        .setTitle("🎡 ルーレット — 受付中")
+      const totalPot = [...bets.values()].reduce((s, b) => s + b.amount, 0);
+      const embed = new EmbedBuilder()
+        .setAuthor({ name: "マモンの賭場 · ルーレット" })
         .setColor(MAMMON_COLOR)
+        .setTitle(`🎡  受付中  ·  締切まで ${secondsLeft}秒`)
         .setDescription(
           [
+            "```",
+            `赤・黒・奇数・偶数・大・小  ×  2倍`,
+            `🟢 零                       ×  36倍`,
+            "```",
             `*「${Mammon.greeting()}」*`,
-            "",
-            `ボタンで張れ。締切まで **${secondsLeft}秒**。`,
-            "赤/黒/奇数/偶数/大/小 = **2倍**、🟢零 = **36倍**",
-            "",
-            "**現在の張り**",
-            list,
           ].join("\n"),
-        );
+        )
+        .setFooter({ text: `参加 ${bets.size}人 · 総額 ${fmtEther(totalPot).replace(" ◈", "◈")}` });
+
+      if (bets.size > 0) {
+        // 賭け目ごとにまとめて表示
+        const byType = new Map<string, { user: string; amt: number }[]>();
+        for (const b of bets.values()) {
+          if (!byType.has(b.type)) byType.set(b.type, []);
+          byType.get(b.type)!.push({ user: b.userId, amt: b.amount });
+        }
+        const sortedTypes = [...byType.keys()].sort();
+        for (const t of sortedTypes) {
+          const arr = byType.get(t)!;
+          const total = arr.reduce((s, x) => s + x.amt, 0);
+          const users = arr.map((x) => `<@${x.user}> ${fmtEther(x.amt).replace(" ◈", "◈")}`).join("・");
+          embed.addFields({ name: `${LABELS[t as keyof typeof LABELS]}  ·  ${fmtEther(total).replace(" ◈", "◈")}`, value: users, inline: false });
+        }
+      }
+      return embed;
     };
 
     const rows = (disabled = false) => [

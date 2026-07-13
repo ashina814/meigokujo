@@ -13,7 +13,7 @@ import {
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, sleep } from "./common.js";
-import { collectStakes, refundAll, settlePvp } from "./pvp-common.js";
+import { buildPvpAbort, buildPvpInvite, collectStakes, refundAll, settlePvp } from "./pvp-common.js";
 
 /**
  * 🎲 対戦チンチロ（casino-bot /チンチロ対戦 準拠・1v1 PvP）。
@@ -126,19 +126,18 @@ export async function playChinchiroDuel(
   await interaction.reply({
     content: `<@${opponent.id}>`,
     embeds: [
-      new EmbedBuilder()
-        .setTitle("🎲 対戦チンチロ — 挑戦")
-        .setColor(MAMMON_COLOR)
-        .setDescription(
-          [
-            `<@${challenger.id}> が <@${opponent.id}> にチンチロ勝負を挑んだ。`,
-            "",
-            `**賭け金**: ${fmtEther(bet)}（両者から徴収済み・不成立なら返金）`,
-            "**受ける** で勝負開始。60秒無応答は不成立",
-            "",
-            "勝者総取り（場代3% = JPプールへ）",
-          ].join("\n"),
-        ),
+      buildPvpInvite({
+        game: "対戦チンチロ",
+        icon: "🎲",
+        challengerId: challenger.id,
+        opponentId: opponent.id,
+        bet,
+        ruleLines: [
+          "BOTが両者の賽を同一戦略で振って自動判定。",
+          "ピンゾロ5倍・ゾロ目3倍・シゴロ2倍・ヒフミ倍付け負け。",
+          "同役は最大5回振り直し、決まらねば全額返金。",
+        ],
+      }),
     ],
     components: [inviteRow],
     allowedMentions: { users: [opponent.id] },
@@ -162,12 +161,7 @@ export async function playChinchiroDuel(
     services.ether.transfer("house", challenger.id, bet);
     await interaction.editReply({
       content: "",
-      embeds: [
-        new EmbedBuilder()
-          .setTitle("🎲 対戦チンチロ — 不成立")
-          .setColor(LOSE_COLOR)
-          .setDescription(`<@${opponent.id}> が受けなかった（時間切れ or 辞退）。<@${challenger.id}> に返金。`),
-      ],
+      embeds: [buildPvpAbort("対戦チンチロ", "🎲", `<@${opponent.id}> が受けなかった（時間切れ or 辞退）。挑戦者に全額返金。`)],
       components: [],
     });
     return;
@@ -177,12 +171,7 @@ export async function playChinchiroDuel(
     services.ether.transfer("house", challenger.id, bet);
     await interaction.editReply({
       content: "",
-      embeds: [
-        new EmbedBuilder()
-          .setTitle("🎲 対戦チンチロ — 不成立")
-          .setColor(LOSE_COLOR)
-          .setDescription("対戦相手のエテル徴収に失敗。挑戦者に返金。"),
-      ],
+      embeds: [buildPvpAbort("対戦チンチロ", "🎲", "対戦相手のエテル徴収に失敗。挑戦者に全額返金。")],
       components: [],
     });
     return;

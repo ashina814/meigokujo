@@ -12,7 +12,7 @@ import {
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, sleep } from "./common.js";
-import { collectStakes, refundAll, settlePvp } from "./pvp-common.js";
+import { buildPvpAbort, buildPvpInvite, buildPvpResult, collectStakes, refundAll, settlePvp } from "./pvp-common.js";
 
 /**
  * 🃏 BJデュエル（casino-bot /BJ対戦 準拠・1v1 PvP）。
@@ -80,19 +80,14 @@ export async function playBjDuel(
   await interaction.reply({
     content: `<@${opponent.id}>`,
     embeds: [
-      new EmbedBuilder()
-        .setTitle("🃏 BJデュエル — 挑戦")
-        .setColor(MAMMON_COLOR)
-        .setDescription(
-          [
-            `<@${challenger.id}> が <@${opponent.id}> にBJ対戦を挑んだ。`,
-            "",
-            `**賭け金**: ${fmtEther(bet)}（両者から徴収）`,
-            "",
-            "21以下でより高い数字を作った方が勝ち。バーストで即負け。",
-            "勝者総取り（場代3% → JPプール）",
-          ].join("\n"),
-        ),
+      buildPvpInvite({
+        game: "BJデュエル",
+        icon: "🃏",
+        challengerId: challenger.id,
+        opponentId: opponent.id,
+        bet,
+        ruleLines: ["21以下でより高い数字を作った方が勝ち。", "バーストで即負け。交互にヒット／スタンド。"],
+      }),
     ],
     components: [inviteRow],
     allowedMentions: { users: [opponent.id] },
@@ -115,7 +110,7 @@ export async function playBjDuel(
     services.ether.transfer("house", challenger.id, bet);
     await interaction.editReply({
       content: "",
-      embeds: [new EmbedBuilder().setTitle("🃏 BJデュエル — 不成立").setColor(LOSE_COLOR).setDescription("対戦相手が受けなかった。返金。")],
+      embeds: [buildPvpAbort("BJデュエル", "🃏", "対戦相手が受けなかった。挑戦者に全額返金。")],
       components: [],
     });
     return;
@@ -159,13 +154,16 @@ export async function playBjDuel(
         content: "",
         embeds: [
           new EmbedBuilder()
-            .setTitle("🃏 BJデュエル — 引き分け")
-            .setColor(MAMMON_COLOR)
+            .setAuthor({ name: "マモンの賭場 · BJデュエル" })
+            .setColor(0x78716c)
+            .setTitle("🃏  引き分け")
             .setDescription(
               [
-                `<@${challenger.id}>: ${showHand(cHand)} （${handValue(cHand)}）`,
-                `<@${opponent.id}>: ${showHand(oHand)} （${handValue(oHand)}）`,
-                "",
+                "```",
+                `<@${challenger.id}>: ${showHand(cHand)}   合計 ${handValue(cHand)}`,
+                "─────────────────────────────",
+                `<@${opponent.id}>: ${showHand(oHand)}   合計 ${handValue(oHand)}`,
+                "```",
                 note,
                 "全額返金。",
               ].join("\n"),
@@ -182,20 +180,23 @@ export async function playBjDuel(
     await interaction.editReply({
       content: "",
       embeds: [
-        new EmbedBuilder()
-          .setTitle(`🃏 BJデュエル — 勝者 <@${winnerId}>`)
-          .setColor(WIN_COLOR)
-          .setDescription(
-            [
-              `<@${challenger.id}>: ${showHand(cHand)} （${handValue(cHand)}）`,
-              `<@${opponent.id}>: ${showHand(oHand)} （${handValue(oHand)}）`,
-              "",
-              note,
-              `**勝ち** <@${winnerId}> +${fmtEther(payout - bet)}（受取 ${fmtEther(payout)}）`,
-              `**負け** <@${loserId}> -${fmtEther(bet)}`,
-              `場代 ${fmtEther(houseCut)} → JPプール`,
-            ].join("\n"),
-          ),
+        buildPvpResult({
+          game: "BJデュエル",
+          icon: "🃏",
+          winnerId,
+          loserId,
+          bet,
+          payout,
+          houseCut,
+          extra:
+            "```" +
+            "\n" +
+            `<@${challenger.id}>: ${showHand(cHand)}   合計 ${handValue(cHand)}` +
+            "\n─────────────────────────────\n" +
+            `<@${opponent.id}>: ${showHand(oHand)}   合計 ${handValue(oHand)}` +
+            "\n```\n" +
+            note,
+        }),
       ],
       components: [],
       allowedMentions: { users: [winnerId] },

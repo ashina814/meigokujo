@@ -184,8 +184,16 @@ export async function handleNagareboshiCommand(
 
   const remaining = MAX_PER_DAY - used - 1;
   const embed = new EmbedBuilder()
-    .setTitle(`✨ 賭場占い — ${outcome.label}`)
+    .setAuthor({ name: "マモンの賭場 · 占い" })
     .setColor(outcome.color)
-    .setDescription([`*「${line}」*`, rewardLine, "", `残り ${remaining}回 ／ 占い料 ${fee > 0 ? fmtEther(fee) : "無料"}`].join("\n"));
+    .setTitle(`${outcome.label}${outcome.reward ? "  ✨" : ""}`)
+    .setDescription([`*「${line}」*`, rewardLine].filter(Boolean).join("\n"))
+    .setFooter({
+      text: [
+        `今日の残り ${remaining}/${MAX_PER_DAY - 1}回`,
+        fee > 0 ? `占い料 ${fmtEther(fee).replace(" ◈", "◈")}` : "無料",
+        `所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`,
+      ].join(" · "),
+    });
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }

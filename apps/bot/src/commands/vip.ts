@@ -9,14 +9,11 @@ import {
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { fmtEther } from "../format.js";
-import { MAMMON_COLOR } from "../casino/common.js";
+import { C_JACKPOT, C_MAMMON, E, bar } from "../casino/ui.js";
 import type { Services } from "../services.js";
 
 /**
- * /VIP — マモンの賭場のVIP会員（月額エテル）。casino-bot 準拠。
- * - 加入: 月会費エテル → VIP_DAYS 日間 VIP
- * - 特権: 賭け上限×2、VIP ロール自動付与（role:casino_vip 設定時）
- * - 期限切れは scheduler で自動失効＆ロール剥奪
+ * /vip — マモンの賭場のVIP会員（月額エテル）。casino-bot 準拠。
  */
 export const vipCommand = new SlashCommandBuilder()
   .setName("vip")
@@ -36,30 +33,47 @@ function renderStatus(userId: string, services: Services) {
   const price = services.vip.price();
   const days = services.vip.days();
   const mult = services.vip.betCapMult();
+  const held = services.ether.balanceOf(userId);
 
   const embed = new EmbedBuilder()
-    .setTitle("💎 マモンの賭場 — VIP会員")
-    .setColor(MAMMON_COLOR)
+    .setAuthor({ name: "マモンの賭場 · VIP" })
+    .setColor(active ? C_JACKPOT : C_MAMMON)
+    .setTitle(active ? `💎  VIP 会員  ·  残り ${left}日` : "💎  一般席")
     .setDescription(
-      [
-        active ? `✅ **VIP会員**（残り **${left}日**）` : "まだVIPじゃない。",
-        "",
-        `**月会費**: ${fmtEther(price)} / ${days}日`,
-        "",
-        "**特権**",
-        `・🎰 賭け上限が **×${mult}**`,
-        "・👑 VIPロール自動付与（設定されていれば）",
-        "・🎫 通行証カードで VIP として表示（実装済み）",
-      ].join("\n"),
+      active
+        ? [
+            "```",
+            `${bar(left, days, 20)}`,
+            "```",
+            `期限まで **${left}日**  ／  会費 ${fmtEther(price).replace(" ◈", "◈")}／${days}日`,
+          ].join("\n")
+        : `月会費 **${fmtEther(price)}** で **${days}日間** のVIP資格が得られる。`,
     )
-    .setFooter({ text: active ? "更新すると今の期限に日数が足される。" : "加入すると即日VIP。期限が切れると自動で解除される。" });
+    .addFields(
+      {
+        name: "▸ VIP の特権",
+        value: [
+          `${E.up} 賭け上限 ×**${mult}**（各ゲーム自動反映）`,
+          `${E.crown} VIP ロール自動付与（設定されていれば）`,
+          `${E.paytable} 通行証カードで VIP 表示`,
+        ].join("\n"),
+        inline: false,
+      },
+      {
+        name: "▸ 財布",
+        value: `所持 **${fmtEther(held)}**  ／  ${held >= price ? `${E.win} 会費を払える` : `${E.lose} 会費に不足（${fmtEther(price - held)}）`}`,
+        inline: false,
+      },
+    )
+    .setFooter({ text: active ? "更新すると今の期限に日数が足される" : "加入すると即日VIP。期限切れは自動で解除される" });
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId("vip:join")
-      .setLabel(active ? "更新する" : "加入する")
+      .setLabel(active ? `更新（+${days}日）` : `加入する`)
       .setStyle(ButtonStyle.Success)
-      .setEmoji("💎"),
+      .setEmoji("💎")
+      .setDisabled(held < price),
   );
   return { embeds: [embed], components: [row] };
 }
@@ -84,11 +98,12 @@ export async function handleVipButton(
     const member = await interaction.guild.members.fetch(uid).catch(() => null);
     await member?.roles.add(roleId).catch(() => undefined);
   }
-  await interaction.reply({
-    content: [
-      r.wasExtension ? "✅ VIP を **更新** した。" : "✅ VIP に **加入** した。",
-      `期限: <t:${r.expiresAt}:F>（残り ${services.vip.daysLeft(uid)}日）`,
-    ].join("\n"),
-    flags: MessageFlags.Ephemeral,
-  });
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: "マモンの賭場 · VIP" })
+    .setColor(C_JACKPOT)
+    .setTitle(r.wasExtension ? "💎  VIP を更新" : "💎  VIP に加入")
+    .setDescription(`期限: <t:${r.expiresAt}:F>  （<t:${r.expiresAt}:R>）`)
+    .setFooter({ text: `残り ${services.vip.daysLeft(uid)}日 · 所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}` });
+
+  await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }

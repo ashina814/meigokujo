@@ -38,23 +38,36 @@ function buildEmbed(userId: string, services: Services): EmbedBuilder {
   const inv = services.items.inventory(userId);
   const armed = new Set(services.items.armedList(userId));
   const held = services.ether.balanceOf(userId);
-  const itemLines = CONSUMABLES.map((c) => {
-    const own = inv.find((i) => i.key === c.key)?.quantity ?? 0;
-    const armedMark = armed.has(c.key) ? " 🟢装備中" : "";
-    return `**${c.name}** — ${fmtEther(c.price)}${armedMark}\n　${c.desc}\n　所持: ${own}`;
-  }).join("\n\n");
-  return new EmbedBuilder()
-    .setTitle("🛍 マモンの賭場商店")
+
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: "マモンの賭場 · 商店" })
     .setColor(MAMMON_COLOR)
+    .setTitle("🛍  お守り棚")
     .setDescription(
       [
-        `所持: ${fmtEther(held)}`,
+        `所持 **${fmtEther(held)}**`,
         "",
-        itemLines,
-        "",
-        "**買う** or **装備する** を下から選べ。装備は発動条件を満たしたら自動で消える。",
+        "*買う → 装備する → 発動条件を満たしたら自動で消える。*",
       ].join("\n"),
     );
+
+  // 各お守りを Field で並べる（inline: true で2列レイアウト）
+  for (const c of CONSUMABLES) {
+    const own = inv.find((i) => i.key === c.key)?.quantity ?? 0;
+    const armedMark = armed.has(c.key) ? " 🟢" : "";
+    embed.addFields({
+      name: `${c.name}${armedMark}  ·  ${fmtEther(c.price).replace(" ◈", "◈")}`,
+      value: [
+        `${c.desc}`,
+        `所持 **${own}**${armed.has(c.key) ? "  ／  装備中" : ""}`,
+      ].join("\n"),
+      inline: true,
+    });
+  }
+  // 2列 x 2行 = 4個で足りない場合の詰めを inline 数で調整（現状4個なので綺麗に並ぶ）
+
+  embed.setFooter({ text: `${armed.size > 0 ? `装備 ${armed.size}種類` : "装備なし"} · 装備は各ゲームの発動条件で消費` });
+  return embed;
 }
 
 function buildComponents(services: Services): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {

@@ -5,11 +5,11 @@ import {
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { fmtEther } from "../format.js";
+import { C_JACKPOT, C_MAMMON, E, HR_THIN } from "../casino/ui.js";
 import type { Services } from "../services.js";
 
 /**
  * /賭場番付 — マモンの賭場の番付（casino-bot /番付 相当）。
- * 冥獄城の /ランキング（住人の活動 4軸）とは別軸で、賭場での成績を並べる。
  * ephemeral（本人にだけ見える）。
  */
 export const banzukeCommand = new SlashCommandBuilder()
@@ -31,13 +31,13 @@ export const banzukeCommand = new SlashCommandBuilder()
       ),
   );
 
-const LABELS: Record<string, string> = {
-  balance: "💰 エテル残高",
-  win_rate: "📊 勝率",
-  biggest_win: "🎯 最大単勝",
-  total_earned: "📈 総獲得",
-  total_wagered: "💸 総ベット",
-  best_win_streak: "🔥 最長連勝",
+const LABELS: Record<string, { title: string; icon: string; color: number }> = {
+  balance: { title: "エテル残高", icon: "💰", color: C_JACKPOT },
+  win_rate: { title: "勝率", icon: "📊", color: 0x22c55e },
+  biggest_win: { title: "最大単勝", icon: "🎯", color: 0xf59e0b },
+  total_earned: { title: "総獲得", icon: "📈", color: 0x0ea5e9 },
+  total_wagered: { title: "総ベット", icon: "💸", color: 0x8b5cf6 },
+  best_win_streak: { title: "最長連勝", icon: "🔥", color: 0xdc2626 },
 };
 
 export async function handleBanzukeCommand(
@@ -51,25 +51,44 @@ export async function handleBanzukeCommand(
     | "total_earned"
     | "total_wagered"
     | "best_win_streak";
+  const meta = LABELS[kind]!;
   const rows = services.casino.top(kind, 10);
+
   const embed = new EmbedBuilder()
-    .setTitle(`🏅 賭場番付 — ${LABELS[kind]} Top10`)
-    .setColor(0xc9a227);
+    .setAuthor({ name: "マモンの賭場 · 番付" })
+    .setTitle(`${meta.icon}  ${meta.title} 番付  Top 10`)
+    .setColor(meta.color);
+
   if (rows.length === 0) {
     embed.setDescription("まだ番付に載る者がいない。");
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
     return;
   }
+
+  // 自分の順位も探しておく
+  const myIdx = rows.findIndex((r) => r.user_id === interaction.user.id);
+
   const lines = rows.map((r, i) => {
-    const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `**${i + 1}.**`;
+    const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `\`${String(i + 1).padStart(2, " ")}.\``;
     const value =
       kind === "win_rate"
-        ? `${(r.value as number).toFixed(1)}%` + (r.sub ? `（${r.sub}戦）` : "")
+        ? `**${(r.value as number).toFixed(1)}%**${r.sub ? ` · ${r.sub}戦` : ""}`
         : kind === "best_win_streak"
-          ? `${r.value}連勝`
-          : fmtEther(r.value);
-    return `${medal} <@${r.user_id}> — **${value}**`;
+          ? `**${r.value.toLocaleString()}連勝**`
+          : `**${fmtEther(r.value)}**`;
+    const self = r.user_id === interaction.user.id ? " ← お前" : "";
+    return `${medal}  <@${r.user_id}>${self}\n　　${value}`;
   });
+
   embed.setDescription(lines.join("\n"));
+
+  const myLine =
+    myIdx === -1
+      ? "\n" + HR_THIN + "\n" + `${E.chart} お前はまだ Top10 に入っていない。`
+      : "";
+  if (myLine) embed.setDescription((embed.data.description ?? "") + myLine);
+
+  embed.setFooter({ text: `${E.paytable} \`/通行証\` で自分の戦績カードを見られる` });
+
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
 }

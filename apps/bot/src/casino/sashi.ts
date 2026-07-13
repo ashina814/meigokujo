@@ -12,7 +12,7 @@ import {
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, sleep } from "./common.js";
-import { collectStakes, refundAll, settlePvp } from "./pvp-common.js";
+import { buildPvpAbort, buildPvpInvite, buildPvpResult, collectStakes, refundAll, settlePvp } from "./pvp-common.js";
 
 /**
  * ⚔ サシ勝負（casino-bot /サシ 準拠・1v1 コイントス的簡易勝負）。
@@ -47,18 +47,14 @@ export async function playSashi(
   await interaction.reply({
     content: `<@${opponent.id}>`,
     embeds: [
-      new EmbedBuilder()
-        .setTitle("⚔ サシ勝負")
-        .setColor(MAMMON_COLOR)
-        .setDescription(
-          [
-            `<@${challenger.id}> が <@${opponent.id}> にサシ勝負を挑んだ。`,
-            "",
-            `**賭け金**: ${fmtEther(bet)}（両者から徴収）`,
-            "",
-            "**50/50 の一発勝負**。勝者総取り（場代3% → JPプール）。",
-          ].join("\n"),
-        ),
+      buildPvpInvite({
+        game: "サシ勝負",
+        icon: "⚔",
+        challengerId: challenger.id,
+        opponentId: opponent.id,
+        bet,
+        ruleLines: ["50/50 の一発勝負。", "運任せ、駆け引きなし。"],
+      }),
     ],
     components: [inviteRow],
     allowedMentions: { users: [opponent.id] },
@@ -81,7 +77,7 @@ export async function playSashi(
     services.ether.transfer("house", challenger.id, bet);
     await interaction.editReply({
       content: "",
-      embeds: [new EmbedBuilder().setTitle("⚔ サシ勝負 — 不成立").setColor(LOSE_COLOR).setDescription("受諾されなかった。返金。")],
+      embeds: [buildPvpAbort("サシ勝負", "⚔", "受諾されなかった。挑戦者に全額返金。")],
       components: [],
     });
     return;
@@ -96,9 +92,10 @@ export async function playSashi(
     content: "",
     embeds: [
       new EmbedBuilder()
-        .setTitle("⚔ サシ勝負 — 決着中")
+        .setAuthor({ name: "マモンの賭場 · サシ勝負" })
         .setColor(MAMMON_COLOR)
-        .setDescription("運命の分岐点……"),
+        .setTitle("⚔  運命の分岐点……")
+        .setDescription("*マモンが銀貨を弾く……*"),
     ],
     components: [],
   });
@@ -111,18 +108,7 @@ export async function playSashi(
 
   await interaction.editReply({
     content: "",
-    embeds: [
-      new EmbedBuilder()
-        .setTitle(`⚔ サシ勝負 — 勝者 <@${winnerId}>`)
-        .setColor(WIN_COLOR)
-        .setDescription(
-          [
-            `**勝ち** <@${winnerId}> +${fmtEther(payout - bet)}（受取 ${fmtEther(payout)}）`,
-            `**負け** <@${loserId}> -${fmtEther(bet)}`,
-            `場代 ${fmtEther(houseCut)} → JPプール`,
-          ].join("\n"),
-        ),
-    ],
+    embeds: [buildPvpResult({ game: "サシ勝負", icon: "⚔", winnerId, loserId, bet, payout, houseCut })],
     components: [],
     allowedMentions: { users: [winnerId] },
   });
