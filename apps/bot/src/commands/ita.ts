@@ -157,7 +157,7 @@ function buildMarketEmbed(services: Services, marketId: number): EmbedBuilder {
       ].join("\n"), inline: false },
       { name: "▸ 選択肢", value: optionLines.join("\n\n"), inline: false },
     )
-    .setFooter({ text: `総額 ${fmtEther(pot).replace(" ◈", "◈")}  ·  場代 3% → JPプール` });
+    .setFooter({ text: `総額 ${fmtEther(pot).replace(" ◈", "◈")}  ·  場代 3% → JPプール  ·  1人1口（張り直しは上書き）` });
   if (settled) {
     embed.setDescription(`🏆 **結果**: ${options[m.result_option!]}`);
   }
@@ -259,8 +259,11 @@ export async function handleItaModal(interaction: ModalSubmitInteraction, servic
     return;
   }
   try {
-    services.markets.bet(marketId, interaction.user.id, optionIndex, amt);
-    await interaction.reply({ content: `✅ 板 #${marketId} 選択肢 ${optionIndex + 1} に ${fmtEther(amt)} を張った。`, flags: MessageFlags.Ephemeral });
+    const result = services.markets.bet(marketId, interaction.user.id, optionIndex, amt);
+    const msg = result.previous !== null
+      ? `✅ 板 #${marketId} 選択肢 ${optionIndex + 1} に ${fmtEther(amt)} で **張り直した**（前額 ${fmtEther(result.previous)} を返金）。`
+      : `✅ 板 #${marketId} 選択肢 ${optionIndex + 1} に ${fmtEther(amt)} を張った。`;
+    await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
     // 板の embed を更新
     const m = services.markets.get(marketId);
     if (m && m.channel_id && m.message_id) {

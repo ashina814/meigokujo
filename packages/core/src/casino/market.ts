@@ -127,7 +127,13 @@ export class Markets {
     return this.db.prepare("SELECT * FROM casino_market_bets WHERE market_id = ?").all(id) as MarketBet[];
   }
 
-  bet(marketId: number, userId: string, optionIndex: number, amount: number): void {
+  /**
+   * 1人1口の原則。既に張っていたら前額を返金してから新額を徴収する（casino-bot 準拠「張り直しは上書き」）。
+   * - 同一選択肢/別選択肢どちらの張り直しにも対応
+   * - 減額の場合は差額が返金される
+   * - 途中で残高不足を検出したら例外を投げ、DB トランザクションでロールバック
+   */
+  bet(marketId: number, userId: string, optionIndex: number, amount: number): { previous: number | null; net: number } {
     if (!Number.isInteger(amount) || amount <= 0) throw new MarketError("ERR_BAD_AMOUNT", { amount });
     const m = this.get(marketId);
     if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { marketId });
@@ -137,15 +143,33 @@ export class Markets {
     if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= options.length) {
       throw new MarketError("ERR_BAD_OPTION", { optionIndex, count: options.length });
     }
-    if (this.ether.balanceOf(userId) < amount) throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(userId), amount });
+    const existingRows = this.db
+      .prepare("SELECT amount FROM casino_market_bets WHERE market_id = ? AND user_id = ?")
+      .all(marketId, userId) as Array<{ amount: number }>;
+    const existingTotal = existingRows.reduce((s, r) => s + r.amount, 0);
+    // 張り直し後の追加徴収額 = amount - existingTotal（負なら差額返金）
+    const additionalRequired = Math.max(0, amount - existingTotal);
+    if (this.ether.balanceOf(userId) < additionalRequired) {
+      throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(userId), additionalRequired, amount, existingTotal });
+    }
 
-    this.db.transaction(() => {
+    return this.db.transaction((): { previous: number | null; net: number } => {
+      // 既存張りを全額返金 → 削除
+      if (existingTotal > 0) {
+        this.ether.transfer(HOUSE_HOLDER, userId, existingTotal);
+        this.db.prepare("DELETE FROM casino_market_bets WHERE market_id = ? AND user_id = ?").run(marketId, userId);
+      }
+      // 新規張り
       this.ether.transfer(userId, HOUSE_HOLDER, amount);
       this.db
         .prepare("INSERT INTO casino_market_bets (market_id, user_id, option_index, amount, created_at) VALUES (?, ?, ?, ?, ?)")
         .run(marketId, userId, optionIndex, amount, now());
+      this.events.log("market_bet", {
+        actor: userId,
+        payload: { marketId, optionIndex, amount, previous: existingTotal > 0 ? existingTotal : null },
+      });
+      return { previous: existingTotal > 0 ? existingTotal : null, net: amount - existingTotal };
     })();
-    this.events.log("market_bet", { actor: userId, payload: { marketId, optionIndex, amount } });
   }
 
   /** 締切を過ぎたら close 状態にする。呼び出し側は scheduler tick から */
