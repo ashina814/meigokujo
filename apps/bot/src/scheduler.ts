@@ -10,6 +10,7 @@ import { applyVcRanks } from "./vc-ranks.js";
 import { updateDashboard } from "./dashboard.js";
 import { tickVoiceXp } from "./rank-tracker.js";
 import { fmtLd } from "./format.js";
+import { announceAutoClose, announceSettle, refreshMarketPanel } from "./commands/ita.js";
 import type { Services } from "./services.js";
 
 /** JSTの現在時刻の分解値。VPSのTZに依存しないよう明示的に変換する */
@@ -195,10 +196,24 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       console.error("[vip] tick失敗:", e);
     }
 
-    // ── 賭場の板: 締切を過ぎた open を closed へ ──
+    // ── 賭場の板: 締切を過ぎた open を closed へ + reported の5分無異議で自動精算 ──
     try {
       const pending = services.markets.listPastDeadline();
-      for (const m of pending) services.markets.autoClose(m.id);
+      for (const m of pending) {
+        services.markets.autoClose(m.id);
+        await announceAutoClose(client, services, m.id).catch(() => undefined);
+      }
+      const disputeExpired = services.markets.listPastDisputeWindow();
+      for (const m of disputeExpired) {
+        const settled = services.markets.finalizeIfNoDispute(m.id);
+        if (settled) {
+          const fresh = services.markets.get(m.id);
+          if (fresh) {
+            await announceSettle(client, fresh, settled).catch(() => undefined);
+            await refreshMarketPanel(client, services, m.id).catch(() => undefined);
+          }
+        }
+      }
     } catch (e) {
       console.error("[market] tick失敗:", e);
     }
