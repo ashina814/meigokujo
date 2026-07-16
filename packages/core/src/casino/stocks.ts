@@ -118,7 +118,6 @@ export class Stocks {
       this.db
         .prepare("UPDATE casino_stocks SET prev_price = price, price = ?, trend = ?, last_update = ? WHERE id = ?")
         .run(newPrice, newTrend, ts, s.id);
-      void bias;
     }
   }
 
@@ -134,12 +133,14 @@ export class Stocks {
       const s = this.get(h.stock_id);
       if (!s) continue;
       const proceeds = s.price * h.shares;
-      if (services_ready_for_pay(this.ether, HOUSE_HOLDER, proceeds)) {
+      // 胴元が払えないなら没収せず保留（次の tick で再試行）。株だけ消すと実質没収になる
+      if (this.ether.balanceOf(HOUSE_HOLDER) < proceeds) continue;
+      this.db.transaction(() => {
         this.ether.transfer(HOUSE_HOLDER, h.user_id, proceeds);
-      }
-      this.db
-        .prepare("UPDATE casino_holdings SET shares = 0, avg_cost = 0, bought_at = 0 WHERE user_id = ? AND stock_id = ?")
-        .run(h.user_id, h.stock_id);
+        this.db
+          .prepare("UPDATE casino_holdings SET shares = 0, avg_cost = 0, bought_at = 0 WHERE user_id = ? AND stock_id = ?")
+          .run(h.user_id, h.stock_id);
+      })();
       this.events.log("stock_force_sell", { actor: h.user_id, payload: { stockId: h.stock_id, shares: h.shares, proceeds } });
       results.push({ userId: h.user_id, stockId: h.stock_id, shares: h.shares, proceeds });
     }
@@ -158,12 +159,14 @@ export class Stocks {
       const cur = this.db.prepare("SELECT * FROM casino_holdings WHERE user_id = ? AND stock_id = ?").get(userId, stockId) as Holding | undefined;
       const newShares = (cur?.shares ?? 0) + shares;
       const newAvgCost = cur && cur.shares > 0 ? Math.floor((cur.avg_cost * cur.shares + cost) / newShares) : s.price;
+      // 保有期限は「最初に買った時点」から。買い増しでタイマーをリセットさせない
+      const boughtAt = cur && cur.shares > 0 && cur.bought_at > 0 ? cur.bought_at : now();
       this.db
         .prepare(
           `INSERT INTO casino_holdings (user_id, stock_id, shares, avg_cost, bought_at) VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(user_id, stock_id) DO UPDATE SET shares = excluded.shares, avg_cost = excluded.avg_cost, bought_at = excluded.bought_at`,
         )
-        .run(userId, stockId, newShares, newAvgCost, now());
+        .run(userId, stockId, newShares, newAvgCost, boughtAt);
       this.events.log("stock_buy", { actor: userId, payload: { stockId, shares, cost, avgCost: newAvgCost } });
       return { cost, avgCost: newAvgCost, newShares };
     })();
@@ -177,10 +180,12 @@ export class Stocks {
     const cur = this.db.prepare("SELECT * FROM casino_holdings WHERE user_id = ? AND stock_id = ?").get(userId, stockId) as Holding | undefined;
     if (!cur || cur.shares < shares) throw new StockError("ERR_INSUFFICIENT_SHARES", { held: cur?.shares ?? 0, shares });
     const proceeds = s.price * shares;
+    // 胴元が払えないなら売却自体を拒否（株だけ消して支払わない、を防ぐ）
+    if (proceeds > 0 && this.ether.balanceOf(HOUSE_HOLDER) < proceeds) {
+      throw new StockError("ERR_INSUFFICIENT_ETHER", { house: this.ether.balanceOf(HOUSE_HOLDER), proceeds });
+    }
     return this.db.transaction((): { proceeds: number; remaining: number } => {
-      if (proceeds > 0 && this.ether.balanceOf(HOUSE_HOLDER) >= proceeds) {
-        this.ether.transfer(HOUSE_HOLDER, userId, proceeds);
-      }
+      if (proceeds > 0) this.ether.transfer(HOUSE_HOLDER, userId, proceeds);
       const remaining = cur.shares - shares;
       if (remaining === 0) {
         this.db
@@ -196,6 +201,7 @@ export class Stocks {
     })();
   }
 
+
   holdings(userId: string): Array<Holding & { stock: Stock }> {
     const rows = this.db
       .prepare("SELECT * FROM casino_holdings WHERE user_id = ? AND shares > 0")
@@ -207,9 +213,4 @@ export class Stocks {
       })
       .filter((x): x is Holding & { stock: Stock } => x !== null);
   }
-}
-
-/** 胴元が支払える額があるか。無ければ transfer せずに 0 として扱う（保護） */
-function services_ready_for_pay(ether: EtherExchange, holder: string, amount: number): boolean {
-  return ether.balanceOf(holder) >= amount;
 }

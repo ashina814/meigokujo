@@ -111,8 +111,6 @@ export class Daily {
     const streakBonus = Math.min(Math.floor(streak / 7) * STREAK_STEP, STREAK_CAP);
     const held = this.ether.balanceOf(userId);
     const reliefEligible = held <= this.reliefThreshold();
-    const reliefPool = this.ether.balanceOf(RELIEF_HOLDER);
-    const relief = reliefEligible ? Math.min(this.reliefMax(), reliefPool) : 0;
 
     return this.db.transaction((): DailyClaimResult => {
       // 基本 + streak 分は胴元から。胴元不足なら救済プールから振替
@@ -124,7 +122,8 @@ export class Daily {
       const fromReliefForBase = Math.min(shortfall, this.ether.balanceOf(RELIEF_HOLDER));
       if (fromReliefForBase > 0) this.ether.transfer(RELIEF_HOLDER, userId, fromReliefForBase);
 
-      // 救済ボーナスは追加で救済プールから
+      // 救済ボーナスは追加で救済プールから（base 振替後の残高で再計算しないと透支で claim 全体が失敗する）
+      const relief = reliefEligible ? Math.min(this.reliefMax(), this.ether.balanceOf(RELIEF_HOLDER)) : 0;
       if (relief > 0) this.ether.transfer(RELIEF_HOLDER, userId, relief);
 
       const total = fromHouse + fromReliefForBase + relief;

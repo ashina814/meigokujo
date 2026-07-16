@@ -177,9 +177,16 @@ export async function handleNagareboshiCommand(
   const outcome = pickOutcome();
   const line = outcome.lines[Math.floor(Math.random() * outcome.lines.length)]!;
   let rewardLine = "";
-  if (outcome.reward && services.ether.balanceOf(JACKPOT_HOLDER) >= outcome.reward) {
-    services.ether.transfer(JACKPOT_HOLDER, uid, outcome.reward);
-    rewardLine = `\n\n💰 **+${fmtEther(outcome.reward)}**（JPプールから）`;
+  if (outcome.reward) {
+    const jpPool = services.ether.balanceOf(JACKPOT_HOLDER);
+    // JPプールが満額に届かなくても、有るだけ払う（流れ星を空砲にしない）
+    const paid = Math.min(outcome.reward, jpPool);
+    if (paid > 0) {
+      services.ether.transfer(JACKPOT_HOLDER, uid, paid);
+      rewardLine = `\n\n💰 **+${fmtEther(paid)}**（JPプールから${paid < outcome.reward ? "・プール残が少なく減額" : ""}）`;
+    } else {
+      rewardLine = "\n\n……が、JPプールが空だった。マモンが気まずそうに目を逸らす。";
+    }
   }
 
   const remaining = MAX_PER_DAY - used - 1;

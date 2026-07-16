@@ -252,6 +252,36 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
       .join("\n");
   };
 
+  // 異常終了時は全額返金（casino-bot の rollbackRaceBets 相当）
+  try {
+    await runRaceAndSettle();
+  } catch (e) {
+    console.error("[keiba] レース異常終了・全額返金:", e);
+    for (const b of allBets) {
+      try {
+        services.ether.transfer(HOUSE_HOLDER, b.userId, b.amount);
+      } catch {
+        /* houseに残っているはずだが念のため */
+      }
+    }
+    await interaction
+      .editReply({
+        content: "",
+        embeds: [
+          new EmbedBuilder()
+            .setAuthor({ name: "マモンの賭場 · 冥馬レース" })
+            .setColor(C_LOSE)
+            .setTitle("🏇  レース中断")
+            .setDescription("システムエラーでレースが流れた。賭け金は全額返金した。"),
+        ],
+        components: [],
+      })
+      .catch(() => undefined);
+    return;
+  }
+  return;
+
+  async function runRaceAndSettle(): Promise<void> {
   await interaction.editReply({
     content: "🚦 **三、二、一…スタート！**",
     embeds: [
@@ -404,4 +434,5 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
     components: [],
     allowedMentions: { parse: [] },
   });
+  }
 }

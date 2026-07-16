@@ -183,6 +183,35 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
     return;
   }
 
+  // 異常終了時は全額返金（エスクロー済みの賭け金を守る）
+  try {
+    await revealAndSettle();
+  } catch (e) {
+    console.error("[chohan-multi] 異常終了・全額返金:", e);
+    for (const b of bets.values()) {
+      try {
+        services.ether.transfer("house", b.userId, b.amount);
+      } catch {
+        /* ignore */
+      }
+    }
+    await interaction
+      .editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setAuthor({ name: "マモンの賭場 · 多人数丁半" })
+            .setColor(C_LOSE)
+            .setTitle("🎴  中断")
+            .setDescription("システムエラーで勝負が流れた。賭け金は全額返金した。"),
+        ],
+        components: [],
+      })
+      .catch(() => undefined);
+    return;
+  }
+  return;
+
+  async function revealAndSettle(): Promise<void> {
   // 抽選演出
   await interaction.editReply({
     embeds: [
@@ -235,4 +264,5 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
     )
     .setFooter({ text: `場代 ${fmtEther(totalHouseCut).replace(" ◈", "◈")} → JPプール` });
   await interaction.editReply({ embeds: [embed], components: [], allowedMentions: { parse: [] } });
+  }
 }

@@ -4,17 +4,21 @@ import { fmtLd } from "./format.js";
 import type { Services } from "./services.js";
 
 const DISBOARD_ID = "302050872383242240";
-const COOLDOWN_SECONDS = 2 * 3600;
+/** ディス速（Dissoku）。設定 bump_dissoku_bot_id で上書き可 */
+const DISSOKU_DEFAULT_ID = "761562078095867916";
+/** クールタイム: DISBOARD /bump = 2時間、ディス速 /up = 1時間 */
+const COOLDOWN_SEC = { disboard: 2 * 3600, dissoku: 1 * 3600 } as const;
 
 /**
  * bump/up 報酬（ボット設計.md）: 掲示板ボットの成功メッセージを検知して実行者に自動記帳。
- * ディス速は成功メッセージの形式確認待ちのため、Bot IDを設定した場合のみ同条件で検知する。
+ * 成功判定: DISBOARD「表示順をアップしたよ」/ ディス速「UPしたよ」/ 英語版「Bump done」。
+ * 失敗メッセージ（「あとN分」「UPに失敗」等）はどれにもマッチしない。
  */
 export async function handleBumpMessage(message: Message, services: Services): Promise<void> {
   if (!message.author.bot) return;
-  const dissokuId = services.settings.getString("bump_dissoku_bot_id");
+  const dissokuId = services.settings.getString("bump_dissoku_bot_id") ?? DISSOKU_DEFAULT_ID;
   const isDisboard = message.author.id === DISBOARD_ID;
-  const isDissoku = dissokuId !== undefined && message.author.id === dissokuId;
+  const isDissoku = message.author.id === dissokuId;
   if (!isDisboard && !isDissoku) return;
 
   const runner = message.interactionMetadata?.user;
@@ -23,8 +27,7 @@ export async function handleBumpMessage(message: Message, services: Services): P
   const embedText = message.embeds
     .map((e) => `${e.description ?? ""} ${e.fields.map((f) => f.value).join(" ")}`)
     .join(" ");
-  // DISBOARD: 「表示順をアップしたよ」/ ディス速: 「アップ」を含む成功表示（要実物確認）
-  if (!embedText.includes("アップ")) return;
+  if (!/(アップ|UP)したよ|Bump done/i.test(embedText)) return;
 
   const reward = services.settings.getNumber("bump_reward");
   if (reward > 0) {
@@ -48,10 +51,11 @@ export async function handleBumpMessage(message: Message, services: Services): P
     if (!result.duplicate) services.bumps.add(runner.id);
   }
 
-  // クールタイム終了通知の予約（2時間後・刻時盤が拾う）
+  // クールタイム終了通知の予約（DISBOARD 2h / ディス速 1h・刻時盤が拾う）
+  const kind = isDisboard ? "disboard" : "dissoku";
   services.settings.set(
-    `bump:cooldown:${isDisboard ? "disboard" : "dissoku"}`,
-    { until: Math.floor(Date.now() / 1000) + COOLDOWN_SECONDS, channelId: message.channelId },
+    `bump:cooldown:${kind}`,
+    { until: Math.floor(Date.now() / 1000) + COOLDOWN_SEC[kind], channelId: message.channelId },
     "system:bump",
   );
 }
