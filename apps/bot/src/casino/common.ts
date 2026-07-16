@@ -4,11 +4,6 @@ import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
 import { C_BIGWIN, C_LOSE, C_MAMMON, C_PUSH, C_WIN, E, fmtBigDelta } from "./ui.js";
 
-/** 後方互換: 既存コードが参照している色エイリアス */
-export const MAMMON_COLOR = C_MAMMON;
-export const WIN_COLOR = C_WIN;
-export const LOSE_COLOR = C_LOSE;
-
 export const MIN_BET = 50;
 export const MAX_BET = 1_000_000;
 

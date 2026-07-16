@@ -11,7 +11,8 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { C_MAMMON } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
 /**
@@ -141,7 +142,7 @@ function paytableEmbed(): EmbedBuilder {
     .join("\n");
   return new EmbedBuilder()
     .setTitle("📖 スロット — 配当表")
-    .setColor(MAMMON_COLOR)
+    .setColor(C_MAMMON)
     .setDescription(
       [
         "**🎯 3つ揃い** (3リール同じ絵柄)",
@@ -189,7 +190,7 @@ function buildSpinEmbed(
   const jpHigh = jp >= 100_000;
   return new EmbedBuilder()
     .setAuthor({ name: `マモンの賭場 · スロット${isFreeSpin ? " · フリースピン" : ""}` })
-    .setColor(jpHigh ? 0xf0b429 : MAMMON_COLOR)
+    .setColor(jpHigh ? 0xf0b429 : C_MAMMON)
     .setTitle(`🎰  ${label}`)
     .setDescription(face(slots[0], slots[1], slots[2]))
     .setFooter({

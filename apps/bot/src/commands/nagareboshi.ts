@@ -6,7 +6,6 @@ import {
 } from "discord.js";
 import { HOUSE_HOLDER, JACKPOT_HOLDER } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
-import { MAMMON_COLOR } from "../casino/common.js";
 import type { Services } from "../services.js";
 
 /**

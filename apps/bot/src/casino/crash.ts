@@ -11,7 +11,8 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { C_MAMMON, C_WIN } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
 /**
@@ -46,7 +47,7 @@ function progressBar(mult: number): string {
 function paytableEmbed(): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle("📖 クラッシュ — ルール")
-    .setColor(MAMMON_COLOR)
+    .setColor(C_MAMMON)
     .setDescription(
       [
         "**遊び方**",
@@ -235,7 +236,7 @@ async function runRound(
 
     const embed = new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · クラッシュ" })
-      .setColor(bigWin ? 0x16a34a : WIN_COLOR)
+      .setColor(bigWin ? 0x16a34a : C_WIN)
       .setTitle(`${bigWin ? "🔥 大勝ち" : "🪂 離脱成功"}  **${netStr}**`)
       .setDescription(
         [

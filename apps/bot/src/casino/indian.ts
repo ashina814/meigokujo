@@ -9,10 +9,10 @@ import {
   type Message,
   type User,
 } from "discord.js";
-import { HOUSE_HOLDER } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, sleep } from "./common.js";
+import { MAX_BET, MIN_BET } from "./common.js";
+import { C_MAMMON, C_WIN } from "./ui.js";
 import { buildPvpAbort, buildPvpInvite, collectStakes, refundAll, settlePvp } from "./pvp-common.js";
 
 /**
@@ -53,7 +53,8 @@ export async function playIndian(
     await interaction.reply({ content: "どちらかのエテル残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }
-  if (!collectStakes(services, [challenger.id], stake)) return;
+  const session = `indian:${interaction.id}`;
+  if (!collectStakes(services, [challenger.id], stake, session, "indian")) return;
 
   const inviteRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("ind:accept").setLabel("受ける").setEmoji("🃏").setStyle(ButtonStyle.Success),
@@ -93,7 +94,7 @@ export async function playIndian(
     /* timeout */
   }
   if (!accepted) {
-    services.ether.transfer(HOUSE_HOLDER, challenger.id, stake);
+    refundAll(services, [challenger.id], stake, session);
     await interaction.editReply({
       content: "",
       embeds: [buildPvpAbort("インディアン", "🃏", "受諾されなかった。挑戦者に全額返金。")],
@@ -101,8 +102,8 @@ export async function playIndian(
     });
     return;
   }
-  if (!collectStakes(services, [opponent.id], stake)) {
-    services.ether.transfer(HOUSE_HOLDER, challenger.id, stake);
+  if (!collectStakes(services, [opponent.id], stake, session, "indian")) {
+    refundAll(services, [challenger.id], stake, session);
     return;
   }
 
@@ -110,27 +111,29 @@ export async function playIndian(
   const cChallenger = draw();
   const cOpponent = draw();
 
-  // 各人に相手のカードを DM で通知
+  // 各人に相手のカードを DM で通知。どちらかの DM が閉じていたら勝負自体を流す
+  //（catch 内の return はコールバックを抜けるだけでゲームが続いてしまうので、フラグで本体を止める）
+  let dmFailed: string | null = null;
   await challenger
     .send(`🃏 **インディアン対戦** — 相手 <@${opponent.id}> のカード: **${cOpponent.suit}${rankName(cOpponent.rank)}**（あなた自身の手は見えない）`)
-    .catch(async () => {
-      await interaction.followUp({
-        content: `<@${challenger.id}> DM が閉じていて相手のカードを送れなかった。この対戦は流す（両者返金）。`,
-        allowedMentions: { users: [challenger.id] },
-      });
-      refundAll(services, [challenger.id, opponent.id], stake);
-      return;
+    .catch(() => {
+      dmFailed = challenger.id;
     });
-  await opponent
-    .send(`🃏 **インディアン対戦** — 相手 <@${challenger.id}> のカード: **${cChallenger.suit}${rankName(cChallenger.rank)}**（あなた自身の手は見えない）`)
-    .catch(async () => {
-      await interaction.followUp({
-        content: `<@${opponent.id}> DM が閉じていて相手のカードを送れなかった。この対戦は流す（両者返金）。`,
-        allowedMentions: { users: [opponent.id] },
+  if (!dmFailed) {
+    await opponent
+      .send(`🃏 **インディアン対戦** — 相手 <@${challenger.id}> のカード: **${cChallenger.suit}${rankName(cChallenger.rank)}**（あなた自身の手は見えない）`)
+      .catch(() => {
+        dmFailed = opponent.id;
       });
-      refundAll(services, [challenger.id, opponent.id], stake);
-      return;
+  }
+  if (dmFailed) {
+    refundAll(services, [challenger.id, opponent.id], stake, session);
+    await interaction.followUp({
+      content: `<@${dmFailed}> DM が閉じていて相手のカードを送れなかった。この対戦は流す（両者返金）。`,
+      allowedMentions: { users: [dmFailed] },
     });
+    return;
+  }
 
   // 各自 ステイ / フォールドの入力
   const decisionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -142,7 +145,7 @@ export async function playIndian(
     embeds: [
       new EmbedBuilder()
         .setTitle("🃏 インディアンポーカー — 決断")
-        .setColor(MAMMON_COLOR)
+        .setColor(C_MAMMON)
         .setDescription(
           [
             "DM に相手のカードが届いた。**自分の手はまだ見えない**。",
@@ -181,7 +184,7 @@ export async function playIndian(
   let note = "";
   if (cDecision === "fold" && oDecision === "fold") {
     // 両者フォールド → 全額返金
-    refundAll(services, [challenger.id, opponent.id], stake);
+    refundAll(services, [challenger.id, opponent.id], stake, session);
     title = "🃏 インディアン — 両者フォールド";
     note = "両者ともフォールド。全額返金。";
     winner = null;
@@ -201,11 +204,11 @@ export async function playIndian(
 
   if (winner === null && cDecision === "stay" && oDecision === "stay") {
     // 同値ドロー
-    refundAll(services, [challenger.id, opponent.id], stake);
+    refundAll(services, [challenger.id, opponent.id], stake, session);
     title = "🃏 インディアン — 引き分け";
     note += "\n同値。全額返金。";
   } else if (winner !== null) {
-    const { payout, houseCut } = settlePvp(services, [winner], pot);
+    const { payout, houseCut } = settlePvp(services, [winner], pot, session);
     const loser = winner === challenger.id ? opponent.id : challenger.id;
     title = `🃏 インディアン — 勝者 <@${winner}>`;
     note += `\n**勝ち** <@${winner}> +${fmtEther(payout - stake)}\n**負け** <@${loser}> -${fmtEther(stake)}\n場代 ${fmtEther(houseCut)} → JP`;
@@ -218,7 +221,7 @@ export async function playIndian(
     embeds: [
       new EmbedBuilder()
         .setTitle(title)
-        .setColor(winner ? WIN_COLOR : MAMMON_COLOR)
+        .setColor(winner ? C_WIN : C_MAMMON)
         .setDescription(
           [
             `<@${challenger.id}>: **${cChallenger.suit}${rankName(cChallenger.rank)}** — ${cDecision === "stay" ? "ステイ" : "フォールド"}`,
@@ -231,5 +234,4 @@ export async function playIndian(
     components: [],
     allowedMentions: winner ? { users: [winner] } : { parse: [] },
   });
-  void sleep;
 }

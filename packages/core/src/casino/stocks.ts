@@ -12,6 +12,8 @@ import { EtherError, EtherExchange, HOUSE_HOLDER } from "./exchange.js";
  * - 総量保存（Land は動かない・エテル残高のみ移動）
  */
 export const STOCK_HOLD_DAYS = 3;
+/** 売却手数料（胴元の取り分）。ランダムウォークは期待値中立のため、これが唯一の胴元エッジ */
+export const STOCK_SELL_FEE_RATE = 0.01;
 const UPDATE_INTERVAL_MS = 60 * 60 * 1000; // 1時間
 
 export interface Stock {
@@ -132,7 +134,7 @@ export class Stocks {
     for (const h of rows) {
       const s = this.get(h.stock_id);
       if (!s) continue;
-      const proceeds = s.price * h.shares;
+      const proceeds = Math.floor(s.price * h.shares * (1 - STOCK_SELL_FEE_RATE));
       // 胴元が払えないなら没収せず保留（次の tick で再試行）。株だけ消すと実質没収になる
       if (this.ether.balanceOf(HOUSE_HOLDER) < proceeds) continue;
       this.db.transaction(() => {
@@ -179,7 +181,7 @@ export class Stocks {
     if (!s) throw new StockError("ERR_UNKNOWN_STOCK", { stockId });
     const cur = this.db.prepare("SELECT * FROM casino_holdings WHERE user_id = ? AND stock_id = ?").get(userId, stockId) as Holding | undefined;
     if (!cur || cur.shares < shares) throw new StockError("ERR_INSUFFICIENT_SHARES", { held: cur?.shares ?? 0, shares });
-    const proceeds = s.price * shares;
+    const proceeds = Math.floor(s.price * shares * (1 - STOCK_SELL_FEE_RATE));
     // 胴元が払えないなら売却自体を拒否（株だけ消して支払わない、を防ぐ）
     if (proceeds > 0 && this.ether.balanceOf(HOUSE_HOLDER) < proceeds) {
       throw new StockError("ERR_INSUFFICIENT_ETHER", { house: this.ether.balanceOf(HOUSE_HOLDER), proceeds });

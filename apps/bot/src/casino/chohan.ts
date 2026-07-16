@@ -11,7 +11,8 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
 /**
@@ -31,7 +32,7 @@ function rollDice(): [number, number] {
 function paytableEmbed(): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle("📖 丁半 — ルール")
-    .setColor(MAMMON_COLOR)
+    .setColor(C_MAMMON)
     .setDescription(
       [
         "**遊び方**",
@@ -79,7 +80,7 @@ async function runRound(
 
   const bettingEmbed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · 丁半" })
-    .setColor(MAMMON_COLOR)
+    .setColor(C_MAMMON)
     .setTitle("🎴  丁 か 半 か")
     .setDescription(
       [
@@ -121,7 +122,7 @@ async function runRound(
     const d2 = 1 + Math.floor(Math.random() * 6);
     return new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · 丁半" })
-      .setColor(MAMMON_COLOR)
+      .setColor(C_MAMMON)
       .setTitle(`🎴  壺を振る……  ${"・".repeat(frame + 1)}`)
       .setDescription(
         [
@@ -167,7 +168,7 @@ async function runRound(
 
   const resultEmbed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · 丁半" })
-    .setColor(won ? WIN_COLOR : settled.net === 0 ? 0x78716c : LOSE_COLOR)
+    .setColor(won ? C_WIN : settled.net === 0 ? 0x78716c : C_LOSE)
     .setTitle(`${tag}  **${netStr}**`)
     .setDescription(
       [

@@ -12,7 +12,8 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, sleep } from "./common.js";
+import { MAX_BET, MIN_BET, sleep } from "./common.js";
+import { C_MAMMON, C_WIN } from "./ui.js";
 import { buildPvpAbort, buildPvpInvite, collectStakes, refundAll, settlePvp } from "./pvp-common.js";
 
 /**
@@ -114,7 +115,8 @@ export async function playChinchiroDuel(
   }
 
   // 挑戦者から先に徴収（受諾されなければ返金）
-  if (!collectStakes(services, [challenger.id], bet)) {
+  const session = `ccduel:${interaction.id}`;
+  if (!collectStakes(services, [challenger.id], bet, session, "chinchiro-duel")) {
     await interaction.reply({ content: "徴収に失敗した。", flags: MessageFlags.Ephemeral });
     return;
   }
@@ -158,7 +160,7 @@ export async function playChinchiroDuel(
   }
 
   if (!accepted) {
-    services.ether.transfer("house", challenger.id, bet);
+    refundAll(services, [challenger.id], bet, session);
     await interaction.editReply({
       content: "",
       embeds: [buildPvpAbort("対戦チンチロ", "🎲", `<@${opponent.id}> が受けなかった（時間切れ or 辞退）。挑戦者に全額返金。`)],
@@ -167,8 +169,8 @@ export async function playChinchiroDuel(
     return;
   }
   // 受諾: 対戦相手からも徴収
-  if (!collectStakes(services, [opponent.id], bet)) {
-    services.ether.transfer("house", challenger.id, bet);
+  if (!collectStakes(services, [opponent.id], bet, session, "chinchiro-duel")) {
+    refundAll(services, [challenger.id], bet, session);
     await interaction.editReply({
       content: "",
       embeds: [buildPvpAbort("対戦チンチロ", "🎲", "対戦相手のエテル徴収に失敗。挑戦者に全額返金。")],
@@ -196,7 +198,7 @@ export async function playChinchiroDuel(
     embeds: [
       new EmbedBuilder()
         .setTitle("🎲 対戦チンチロ — 決着")
-        .setColor(MAMMON_COLOR)
+        .setColor(C_MAMMON)
         .setDescription(
           [
             `<@${challenger.id}>: ${showDice(cResult.dice)} → ${describe(cResult.hand)}`,
@@ -211,12 +213,12 @@ export async function playChinchiroDuel(
 
   if (cRank === oRank) {
     // 同役続き → 全額返金
-    refundAll(services, [challenger.id, opponent.id], bet);
+    refundAll(services, [challenger.id, opponent.id], bet, session);
     await interaction.followUp({
       embeds: [
         new EmbedBuilder()
           .setTitle("🎲 引き分け")
-          .setColor(MAMMON_COLOR)
+          .setColor(C_MAMMON)
           .setDescription("何度振っても同役だった。全額返金。"),
       ],
       allowedMentions: { parse: [] },
@@ -225,13 +227,13 @@ export async function playChinchiroDuel(
   }
   const winnerId = cRank > oRank ? challenger.id : opponent.id;
   const loserId = cRank > oRank ? opponent.id : challenger.id;
-  const { payout, houseCut } = settlePvp(services, [winnerId], pot);
+  const { payout, houseCut } = settlePvp(services, [winnerId], pot, session);
 
   await interaction.followUp({
     embeds: [
       new EmbedBuilder()
         .setTitle(`🎲 対戦チンチロ — 勝者 <@${winnerId}>`)
-        .setColor(WIN_COLOR)
+        .setColor(C_WIN)
         .setDescription(
           [
             `**勝ち** <@${winnerId}> +${fmtEther(payout - bet)}（受取 ${fmtEther(payout)}）`,

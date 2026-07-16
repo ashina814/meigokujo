@@ -52,6 +52,7 @@ export async function playChohanMulti(interaction: ChatInputCommandInteraction, 
 async function runSession(interaction: ChatInputCommandInteraction, services: Services): Promise<void> {
   const bets = new Map<string, Bet>();
   const endAt = Date.now() + LOBBY_SEC * 1000;
+  const session = `chohan:${interaction.id}`;
 
   const buildLobby = (secondsLeft: number) => {
     const chos = [...bets.values()].filter((b) => b.side === "cho");
@@ -135,7 +136,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
           await sub.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
           return;
         }
-        if (!collectStakes(services, [btn.user.id], additional)) {
+        if (!collectStakes(services, [btn.user.id], additional, session, "chohan-multi")) {
           await sub.reply({ content: "徴収に失敗した。", flags: MessageFlags.Ephemeral });
           return;
         }
@@ -145,7 +146,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
           await sub.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
           return;
         }
-        if (!collectStakes(services, [btn.user.id], amt)) {
+        if (!collectStakes(services, [btn.user.id], amt, session, "chohan-multi")) {
           await sub.reply({ content: "徴収に失敗した。", flags: MessageFlags.Ephemeral });
           return;
         }
@@ -169,7 +170,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
   const hans = [...bets.values()].filter((b) => b.side === "han");
   if (chos.length === 0 || hans.length === 0) {
     // 片側だけなら全額返金
-    for (const b of bets.values()) services.ether.transfer("house", b.userId, b.amount);
+    services.escrow.refund(session);
     await interaction.editReply({
       embeds: [
         new EmbedBuilder()
@@ -188,12 +189,10 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
     await revealAndSettle();
   } catch (e) {
     console.error("[chohan-multi] 異常終了・全額返金:", e);
-    for (const b of bets.values()) {
-      try {
-        services.ether.transfer("house", b.userId, b.amount);
-      } catch {
-        /* ignore */
-      }
+    try {
+      services.escrow.refund(session);
+    } catch {
+      /* ignore */
     }
     await interaction
       .editReply({
@@ -236,6 +235,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
     services,
     winners.map((b) => ({ userId: b.userId, bet: b.amount })),
     losers.map((b) => ({ userId: b.userId, bet: b.amount })),
+    session,
   );
 
   const resultLabel = isCho ? "丁（偶数）" : "半（奇数）";

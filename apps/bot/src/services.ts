@@ -26,6 +26,7 @@ import {
   Vip,
   Markets,
   Takutate,
+  Escrow,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -85,8 +86,14 @@ export function buildServices() {
   // 起動時に未精算の板を全部返金＆void（エスクロー整合維持）
   const voided = markets.refundAllPending("system:startup");
   if (voided > 0) console.log(`[market] 起動時に未精算板 ${voided}件 を返金＆void 化`);
+  const escrow = new Escrow(db, ether, events);
+  // 起動時にセッション型ゲーム（対人・競馬・丁半・PvPポーカー等）の預かり残を全額返金
+  const swept = escrow.sweepAll("system:startup");
+  if (swept.users > 0) {
+    console.log(`[escrow] 起動時に未精算エスクロー ${swept.sessions}卓/${swept.users}人分（計 ${swept.total.toLocaleString("ja-JP")}◈）を返金`);
+  }
   const takutate = new Takutate(db, events);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, takutate };
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, escrow, takutate };
 }
 
 export type Services = ReturnType<typeof buildServices>;

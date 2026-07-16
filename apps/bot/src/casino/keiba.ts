@@ -85,6 +85,7 @@ export async function playKeiba(interaction: ChatInputCommandInteraction, servic
 async function runSession(interaction: ChatInputCommandInteraction, services: import("../services.js").Services): Promise<void> {
   const bets = new Map<string, Bet[]>(); // userId -> bets
   const endAt = Date.now() + LOBBY_SEC * 1000;
+  const session = `keiba:${interaction.id}`;
 
   const buildLobby = (secondsLeft: number) => {
     const totalByHorseWin = new Map<number, number>();
@@ -189,11 +190,10 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
         await sub.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
         return;
       }
-      if (services.ether.balanceOf(btn.user.id) < amt) {
+      if (!services.escrow.hold(session, btn.user.id, amt, "keiba")) {
         await sub.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
         return;
       }
-      services.ether.transfer(btn.user.id, HOUSE_HOLDER, amt);
       const arr = bets.get(btn.user.id) ?? [];
       arr.push({ userId: btn.user.id, horseId, type, amount: amt });
       bets.set(btn.user.id, arr);
@@ -257,12 +257,10 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
     await runRaceAndSettle();
   } catch (e) {
     console.error("[keiba] レース異常終了・全額返金:", e);
-    for (const b of allBets) {
-      try {
-        services.ether.transfer(HOUSE_HOLDER, b.userId, b.amount);
-      } catch {
-        /* houseに残っているはずだが念のため */
-      }
+    try {
+      services.escrow.refund(session);
+    } catch {
+      /* houseに残っているはずだが念のため */
     }
     await interaction
       .editReply({
@@ -400,6 +398,8 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
   // 的中者がいなかった分は JP へ（キャリーオーバー相当）
   if (winHit.length === 0 && winDistributable > 0) services.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, winDistributable);
   if (placeHit.length === 0 && placeDistributable > 0) services.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, placeDistributable);
+  // 精算完了: エスクロー記録を消す（金は分配済み。以降のembed失敗で二重返金させない）
+  services.escrow.clear(session);
 
   const winnerHorse = HORSES.find((h) => h.id === winnerId)!;
   const top3 = finished.slice(0, 3).map((id, i) => {

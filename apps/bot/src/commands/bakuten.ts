@@ -14,7 +14,7 @@ import {
 } from "discord.js";
 import { CONSUMABLES, getConsumableDef, HOUSE_HOLDER } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
-import { MAMMON_COLOR } from "../casino/common.js";
+import { C_MAMMON } from "../casino/ui.js";
 import type { Services } from "../services.js";
 
 /**
@@ -41,7 +41,7 @@ function buildEmbed(userId: string, services: Services): EmbedBuilder {
 
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · 商店" })
-    .setColor(MAMMON_COLOR)
+    .setColor(C_MAMMON)
     .setTitle("🛍  お守り棚")
     .setDescription(
       [

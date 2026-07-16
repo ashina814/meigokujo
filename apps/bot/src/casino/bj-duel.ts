@@ -11,7 +11,8 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, sleep } from "./common.js";
+import { MAX_BET, MIN_BET, sleep } from "./common.js";
+import { C_MAMMON } from "./ui.js";
 import { buildPvpAbort, buildPvpInvite, buildPvpResult, collectStakes, refundAll, settlePvp } from "./pvp-common.js";
 
 /**
@@ -71,7 +72,8 @@ export async function playBjDuel(
     await interaction.reply({ content: `<@${opponent.id}> のエテル残高が足りない。`, flags: MessageFlags.Ephemeral });
     return;
   }
-  if (!collectStakes(services, [challenger.id], bet)) return;
+  const session = `bjduel:${interaction.id}`;
+  if (!collectStakes(services, [challenger.id], bet, session, "bj-duel")) return;
 
   const inviteRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("bjd:accept").setLabel("受ける").setEmoji("🃏").setStyle(ButtonStyle.Success),
@@ -107,7 +109,7 @@ export async function playBjDuel(
     /* timeout */
   }
   if (!accepted) {
-    services.ether.transfer("house", challenger.id, bet);
+    refundAll(services, [challenger.id], bet, session);
     await interaction.editReply({
       content: "",
       embeds: [buildPvpAbort("BJデュエル", "🃏", "対戦相手が受けなかった。挑戦者に全額返金。")],
@@ -115,8 +117,8 @@ export async function playBjDuel(
     });
     return;
   }
-  if (!collectStakes(services, [opponent.id], bet)) {
-    services.ether.transfer("house", challenger.id, bet);
+  if (!collectStakes(services, [opponent.id], bet, session, "bj-duel")) {
+    refundAll(services, [challenger.id], bet, session);
     return;
   }
 
@@ -131,7 +133,7 @@ export async function playBjDuel(
     const oVis = handValue(oHand);
     return new EmbedBuilder()
       .setTitle("🃏 BJデュエル")
-      .setColor(MAMMON_COLOR)
+      .setColor(C_MAMMON)
       .setDescription(
         [
           `<@${challenger.id}>: ${showHand(cHand)} （**${cVis}**）${cStand ? " [スタンド]" : ""}`,
@@ -149,7 +151,7 @@ export async function playBjDuel(
 
   const finishGame = async (result: "challenger_win" | "opponent_win" | "push", note: string) => {
     if (result === "push") {
-      refundAll(services, [challenger.id, opponent.id], bet);
+      refundAll(services, [challenger.id, opponent.id], bet, session);
       await interaction.editReply({
         content: "",
         embeds: [
@@ -176,7 +178,7 @@ export async function playBjDuel(
     }
     const winnerId = result === "challenger_win" ? challenger.id : opponent.id;
     const loserId = result === "challenger_win" ? opponent.id : challenger.id;
-    const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2);
+    const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2, session);
     await interaction.editReply({
       content: "",
       embeds: [

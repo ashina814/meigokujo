@@ -99,7 +99,7 @@ export {
 export { Casino, JACKPOT_HOLDER, RELIEF_HOLDER, CHAIN_TIERS, chainMultiplier, fukuRate, type CasinoStatsRow, type SettleResult, type CasinoOptions } from "./casino/service.js";
 export { Daily, type DailyClaim, type DailyClaimResult, type DailyOptions } from "./casino/daily.js";
 export { Items, CONSUMABLES, getConsumableDef, type ItemKind as CasinoItemKind, type ConsumableDef, type ArmResult } from "./casino/items.js";
-export { Stocks, StockError, STOCK_HOLD_DAYS, type Stock, type Holding, type StockErrorCode } from "./casino/stocks.js";
+export { Stocks, StockError, STOCK_HOLD_DAYS, STOCK_SELL_FEE_RATE, type Stock, type Holding, type StockErrorCode } from "./casino/stocks.js";
 export { Vip, type VipOptions, type VipJoinResult } from "./casino/vip.js";
 export {
   Markets,
@@ -114,3 +114,4 @@ export {
   type MarketSettleResult,
 } from "./casino/market.js";
 export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";
+export { Escrow, type EscrowRow } from "./casino/escrow.js";

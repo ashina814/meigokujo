@@ -15,9 +15,9 @@ import {
   TextInputStyle,
   type ChatInputCommandInteraction,
 } from "discord.js";
-import { StockError, STOCK_HOLD_DAYS } from "@meigokujo/core";
+import { StockError, STOCK_HOLD_DAYS, STOCK_SELL_FEE_RATE } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
-import { MAMMON_COLOR } from "../casino/common.js";
+import { C_MAMMON } from "../casino/ui.js";
 import type { Services } from "../services.js";
 
 /**
@@ -71,11 +71,11 @@ function buildBoard(services: Services, userId: string): EmbedBuilder {
 
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · 株式市場" })
-    .setColor(MAMMON_COLOR)
+    .setColor(C_MAMMON)
     .setTitle("📈  相場板")
     .setDescription(boardStr)
     .setFooter({
-      text: `所持 ${fmtEther(held).replace(" ◈", "◈")} · 価格は1時間毎更新 · 保有 ${STOCK_HOLD_DAYS}日超で強制売却`,
+      text: `所持 ${fmtEther(held).replace(" ◈", "◈")} · 価格は1時間毎更新 · 保有 ${STOCK_HOLD_DAYS}日超で強制売却 · 売却手数料 ${Math.round(STOCK_SELL_FEE_RATE * 100)}%`,
     });
 
   if (holdingRows.length > 0) {

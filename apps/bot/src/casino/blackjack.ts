@@ -11,7 +11,8 @@ import {
 } from "discord.js";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
 /**
@@ -61,7 +62,7 @@ const showHand = (hand: Card[], hideSecond = false) =>
 function paytableEmbed(): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle("📖 ブラックジャック — ルール")
-    .setColor(MAMMON_COLOR)
+    .setColor(C_MAMMON)
     .setDescription(
       [
         "**遊び方**",
@@ -121,7 +122,7 @@ async function runRound(
     const dealerVal = hideDealer ? "**?**" : `**${handValue(dealer)}**`;
     return new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · ブラックジャック" })
-      .setColor(MAMMON_COLOR)
+      .setColor(C_MAMMON)
       .setTitle(`🃏 21 を狙え  ·  賭け ${fmtEther(totalBet)}`)
       .setDescription(
         [
@@ -182,7 +183,7 @@ async function runRound(
 
     const embed = new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · ブラックジャック" })
-      .setColor(won ? WIN_COLOR : push ? 0x78716c : LOSE_COLOR)
+      .setColor(won ? C_WIN : push ? 0x78716c : C_LOSE)
       .setTitle(`${tag}  **${netStr}**`)
       .setDescription(
         [

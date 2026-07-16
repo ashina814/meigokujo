@@ -12,7 +12,8 @@ import {
 import { HOUSE_HOLDER } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
 /**
@@ -102,7 +103,7 @@ const diceDisplay = (d: Dice) => `╭─────╮  ╭─────╮  
 function paytableEmbed(): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle("📖 チンチロ — ルール")
-    .setColor(MAMMON_COLOR)
+    .setColor(C_MAMMON)
     .setDescription(
       [
         "**役と倍率（対マモン）**",
@@ -128,7 +129,7 @@ async function shakeAnimation(reply: Message, header: string[], bet: number, rol
     const shake: Dice = [1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6)] as const;
     const e = new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · チンチロ" })
-      .setColor(MAMMON_COLOR)
+      .setColor(C_MAMMON)
       .setTitle(`🎲  壺を振る……  ${"・".repeat(f + 1)}`)
       .setDescription(
         [
@@ -175,7 +176,7 @@ async function runRound(
   const uid = interaction.user.id;
   const startEmbed = new EmbedBuilder()
     .setTitle("🎲 チンチロ")
-    .setColor(MAMMON_COLOR)
+    .setColor(C_MAMMON)
     .setDescription(
       ["さあ、振れ。", "", "┃ ❓ ┃ ❓ ❓ ❓ ┃", "", `ベット: ${fmtEther(bet)} ／ 最大3投`].join("\n"),
     );
@@ -216,7 +217,7 @@ async function runRound(
             embeds: [
               new EmbedBuilder()
                 .setTitle("🎲 チンチロ")
-                .setColor(MAMMON_COLOR)
+                .setColor(C_MAMMON)
                 .setDescription([describe(playerHand), "", diceDisplay(playerDice), "", `第${rollNo}投 → 自動で再振り…（残り${playerMaxRolls - rollNo}）`].join("\n")),
             ],
             components: [],
@@ -243,7 +244,7 @@ async function runRound(
       );
       const e = new EmbedBuilder()
         .setTitle("🎲 チンチロ")
-        .setColor(MAMMON_COLOR)
+        .setColor(C_MAMMON)
         .setDescription(
           [
             describe(playerHand),
@@ -291,7 +292,7 @@ async function runRound(
       embeds: [
         new EmbedBuilder()
           .setTitle("🎲 チンチロ — マモンの番")
-          .setColor(MAMMON_COLOR)
+          .setColor(C_MAMMON)
           .setDescription(
             [
               `あなた: ${diceDisplay(playerDice)}`,
@@ -313,7 +314,7 @@ async function runRound(
       const shake: Dice = [1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6)] as const;
       const e = new EmbedBuilder()
         .setTitle("🎲 チンチロ — マモンの番")
-        .setColor(MAMMON_COLOR)
+        .setColor(C_MAMMON)
         .setDescription(
           [
             `あなた: ${diceDisplay(playerDice)}`,
@@ -334,7 +335,7 @@ async function runRound(
         embeds: [
           new EmbedBuilder()
             .setTitle("🎲 チンチロ — マモンの番")
-            .setColor(MAMMON_COLOR)
+            .setColor(C_MAMMON)
             .setDescription(
               [
                 `あなた: ${diceDisplay(playerDice)}`,
@@ -359,7 +360,7 @@ async function runRound(
 
   let payoutText = "";
   let title = "🎲 チンチロ — 対 マモン";
-  let color = LOSE_COLOR;
+  let color = C_LOSE;
   let extraNote = "";
   let netForDisplay = 0;
 
@@ -371,7 +372,7 @@ async function runRound(
     const amulet = applyAmulets(services, uid, bet, rawPayout);
     if (amulet.note) amuletNote = `✨ ${amulet.note}`;
     const settled = services.casino.settle(uid, "チンチロ", bet, amulet.payout);
-    color = WIN_COLOR;
+    color = C_WIN;
     netForDisplay = settled.net;
     const chainLine = settled.chainBonus > 0
       ? `\n${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
@@ -384,7 +385,7 @@ async function runRound(
   } else if (mul === 0) {
     // プッシュ（両方ヒフミ）: 返金
     services.casino.settle(uid, "チンチロ", bet, bet);
-    color = MAMMON_COLOR;
+    color = C_MAMMON;
     payoutText = `🌀 プッシュ：${fmtEther(bet)} を返金`;
   } else if (mul === -1) {
     // 通常負け: bet だけ徴収。ただし敗北保護お守りがあれば返金

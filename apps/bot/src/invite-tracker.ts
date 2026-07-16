@@ -71,10 +71,4 @@ export class InviteTracker {
     }
     return matched;
   }
-
-  /** 後方互換: inviter ID だけ返す旧API */
-  async detectInviter(guild: Guild): Promise<string | null> {
-    const d = await this.detectInvite(guild);
-    return d?.inviterId ?? null;
-  }
 }

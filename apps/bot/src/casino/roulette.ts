@@ -15,13 +15,14 @@ import {
 import { fmtEther } from "../format.js";
 import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
-import { LOSE_COLOR, MAMMON_COLOR, MAX_BET, MIN_BET, WIN_COLOR, sleep } from "./common.js";
+import { MAX_BET, MIN_BET, sleep } from "./common.js";
+import { C_LOSE, C_MAMMON, C_WIN, E, fmtBigDelta } from "./ui.js";
 
 /**
  * 🎡 ルーレット（チャンネル共有セッション）。casino-bot 準拠。
  * - 誰かが /遊ぶ ルーレット で卓を開く → 30秒の受付 → 0〜36 抽選 → 一括精算
  * - 賭け先: 赤/黒/奇数/偶数/大/小 = 2倍、零(0) = 36倍
- * - 1人1口（張り直しは上書き）。徴収は抽選時（受付中に残高が消えた賭けは無効）
+ * - 1人1口（張り直しは上書き）。徴収は張った時点でエスクロー（再起動時は自動返金）
  */
 const LOBBY_SEC = 30;
 
@@ -85,6 +86,7 @@ export async function playRoulette(
     return;
   }
   activeSessions.add(channelId);
+  const session = `roulette:${interaction.id}`;
   try {
     const bets = new Map<string, SessionBet>(); // userId -> bet（上書き）
 
@@ -92,7 +94,7 @@ export async function playRoulette(
       const totalPot = [...bets.values()].reduce((s, b) => s + b.amount, 0);
       const embed = new EmbedBuilder()
         .setAuthor({ name: "マモンの賭場 · ルーレット" })
-        .setColor(MAMMON_COLOR)
+        .setColor(C_MAMMON)
         .setTitle(`🎡  受付中  ·  締切まで ${secondsLeft}秒`)
         .setDescription(
           [
@@ -167,11 +169,6 @@ export async function playRoulette(
           await sub.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
           return;
         }
-        const held = services.ether.balanceOf(btn.user.id);
-        if (held < amt) {
-          await sub.reply({ content: `${Mammon.broke()}（所持 ${fmtEther(held)}）`, flags: MessageFlags.Ephemeral });
-          return;
-        }
         // テーブルリミット: この卓の最大支払い合計が胴元残高を超えない範囲で受ける
         const potential = [...bets.values()]
           .filter((b) => b.userId !== btn.user.id)
@@ -182,6 +179,14 @@ export async function playRoulette(
         }
         if (collector.ended) {
           await sub.reply({ content: "締切に間に合わなかった。次の卓で。", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        // 張り直しは上書き: 前の張りを返してから新しい額をエスクロー
+        if (bets.has(btn.user.id)) services.escrow.refundOne(session, btn.user.id);
+        if (!services.escrow.hold(session, btn.user.id, amt, "roulette")) {
+          bets.delete(btn.user.id);
+          await sub.reply({ content: `${Mammon.broke()}（所持 ${fmtEther(services.ether.balanceOf(btn.user.id))}）`, flags: MessageFlags.Ephemeral });
+          await interaction.editReply({ embeds: [lobbyEmbed(Math.max(0, Math.ceil((endAt - Date.now()) / 1000)))] }).catch(() => undefined);
           return;
         }
         bets.set(btn.user.id, { userId: btn.user.id, type, amount: amt });
@@ -202,7 +207,13 @@ export async function playRoulette(
 
     if (bets.size === 0) {
       await interaction.editReply({
-        embeds: [new EmbedBuilder().setTitle("🎡 ルーレット — 流れた").setColor(LOSE_COLOR).setDescription("誰も張らなかったので、この卓は流れた。")],
+        embeds: [
+          new EmbedBuilder()
+            .setAuthor({ name: "マモンの賭場 · ルーレット" })
+            .setColor(C_LOSE)
+            .setTitle("🎡  流れた")
+            .setDescription("誰も張らなかったので、この卓は流れた。"),
+        ],
         components: [],
       });
       return;
@@ -210,10 +221,20 @@ export async function playRoulette(
 
     // 抽選演出
     await interaction.editReply({
-      embeds: [new EmbedBuilder().setTitle("🎡 ルーレット — 締切").setColor(MAMMON_COLOR).setDescription("球が回る……")],
+      embeds: [
+        new EmbedBuilder()
+          .setAuthor({ name: "マモンの賭場 · ルーレット" })
+          .setColor(C_MAMMON)
+          .setTitle("🎡  締切  ·  球が回る……")
+          .setDescription("*カラカラカラ……*"),
+      ],
       components: [],
     });
     await sleep(1800);
+
+    // エスクロー分を一旦返してから casino.settle で正規精算
+    //（settle が賭け徴収→配当を原子的にやる。戦績・イベントログも settle 経由で記録される）
+    services.escrow.refund(session);
 
     const n = Math.floor(Math.random() * 37);
     const lines: string[] = [];
@@ -224,21 +245,24 @@ export async function playRoulette(
       try {
         services.casino.settle(b.userId, "roulette", b.amount, payout, 0, { chain: false, fuku: false });
       } catch {
-        lines.push(`・<@${b.userId}> — 残高不足で無効`);
+        lines.push(`${E.push}  <@${b.userId}>  —  残高不足で無効`);
         continue;
       }
       if (won) anyWin = true;
       lines.push(
         won
-          ? `・<@${b.userId}> — ${LABELS[b.type]} 的中！ **+${fmtEther(payout - b.amount)}**`
-          : `・<@${b.userId}> — ${LABELS[b.type]} 外れ（-${fmtEther(b.amount)}）`,
+          ? `${E.win}  <@${b.userId}>  ${LABELS[b.type]} 的中！  ${fmtBigDelta(payout - b.amount)}`
+          : `${E.lose}  <@${b.userId}>  ${LABELS[b.type]} 外れ  ${fmtBigDelta(-b.amount)}`,
       );
     }
 
+    const totalPot = [...bets.values()].reduce((s, b) => s + b.amount, 0);
     const embed = new EmbedBuilder()
-      .setTitle(`🎡 ルーレット — 出目 ${colorOf(n)} **${n}**`)
-      .setColor(anyWin ? WIN_COLOR : LOSE_COLOR)
-      .setDescription([...lines, "", `*「${anyWin ? Mammon.win() : Mammon.lose()}」*`].join("\n"));
+      .setAuthor({ name: "マモンの賭場 · ルーレット" })
+      .setColor(anyWin ? C_WIN : C_LOSE)
+      .setTitle(`🎡  出目  ${colorOf(n)} **${n}**`)
+      .setDescription([...lines, "", `*「${anyWin ? Mammon.win() : Mammon.lose()}」*`].join("\n"))
+      .setFooter({ text: `参加 ${bets.size}人 · 総額 ${fmtEther(totalPot).replace(" ◈", "◈")}` });
     await interaction.editReply({ embeds: [embed], components: [] });
   } finally {
     activeSessions.delete(channelId);

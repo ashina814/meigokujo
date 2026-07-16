@@ -84,16 +84,34 @@ export function buildPvpResult(opts: {
   return embed;
 }
 
-/** 両者から bet を徴収して house 一時保管。全員から取れなかったら false（呼び出し側で全額返金） */
-export function collectStakes(services: Services, userIds: string[], bet: number): boolean {
+/**
+ * 両者から bet を徴収して house 一時保管。全員から取れなかったら false（取った分は戻す）。
+ * session を渡すとエスクロー台帳に記録され、再起動時に自動返金される（推奨）。
+ */
+export function collectStakes(services: Services, userIds: string[], bet: number, session?: string, game = "pvp"): boolean {
   const insufficient = userIds.find((u) => services.ether.balanceOf(u) < bet);
   if (insufficient) return false;
+  if (session) {
+    const collected: string[] = [];
+    for (const u of userIds) {
+      if (!services.escrow.hold(session, u, bet, game)) {
+        for (const c of collected) services.escrow.refundOne(session, c);
+        return false;
+      }
+      collected.push(u);
+    }
+    return true;
+  }
   for (const u of userIds) services.ether.transfer(u, HOUSE_HOLDER, bet);
   return true;
 }
 
-/** 全参加者に均等返金（勝負不成立時など） */
-export function refundAll(services: Services, userIds: string[], bet: number): void {
+/** 参加者に返金（勝負不成立時など）。session があれば台帳の預かり額で返して記録も消す */
+export function refundAll(services: Services, userIds: string[], bet: number, session?: string): void {
+  if (session) {
+    for (const u of userIds) services.escrow.refundOne(session, u);
+    return;
+  }
   for (const u of userIds) services.ether.transfer(HOUSE_HOLDER, u, bet);
 }
 
@@ -107,6 +125,7 @@ export function settlePvp(
   services: Services,
   winners: string[],
   pot: number,
+  session?: string,
 ): { payout: number; houseCut: number } {
   const houseCut = Math.floor(pot * HOUSE_CUT);
   const distributable = pot - houseCut;
@@ -115,12 +134,14 @@ export function settlePvp(
 
   if (winners.length === 0) {
     // 引き分け or 該当者なし → 場代だけ取って残りを分割対象がいないので国庫（実装的にはこのケースは呼ばれない）
+    if (session) services.escrow.clear(session);
     return { payout: 0, houseCut };
   }
   const share = Math.floor(distributable / winners.length);
   const remainder = distributable - share * winners.length;
   for (const w of winners) services.ether.transfer(HOUSE_HOLDER, w, share);
   if (remainder > 0) services.ether.transfer(HOUSE_HOLDER, winners[0]!, remainder);
+  if (session) services.escrow.clear(session);
   return { payout: distributable, houseCut };
 }
 
@@ -133,6 +154,7 @@ export function settleProportional(
   services: Services,
   winners: Array<{ userId: string; bet: number }>,
   losers: Array<{ userId: string; bet: number }>,
+  session?: string,
 ): { totalHouseCut: number } {
   const winnerPot = winners.reduce((s, w) => s + w.bet, 0);
   const loserPot = losers.reduce((s, l) => s + l.bet, 0);
@@ -149,5 +171,6 @@ export function settleProportional(
     if (share > 0) services.ether.transfer(HOUSE_HOLDER, w.userId, share);
     remaining -= share;
   }
+  if (session) services.escrow.clear(session);
   return { totalHouseCut: houseCut };
 }

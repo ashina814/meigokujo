@@ -203,7 +203,7 @@ export async function playPokerDuel(
     });
   } else {
     // オープン: host は自動参加でエスクロー
-    if (!collectStakes(services, [uid], bet)) {
+    if (!collectStakes(services, [uid], bet, id, "poker-duel")) {
       await interaction.reply({ content: "エテル徴収に失敗した。", flags: MessageFlags.Ephemeral });
       return;
     }
@@ -245,7 +245,7 @@ async function tryTimeout(client: import("discord.js").Client, id: string, servi
   } else {
     // 参加不足 → 全員返金
     setPhase(s, "void");
-    for (const uid of s.players.keys()) refundAll(services, [uid], s.bet);
+    services.escrow.refund(s.id);
     await editMessage(client, s, {
       embeds: [
         new EmbedBuilder()
@@ -354,7 +354,7 @@ async function sashiAccept(interaction: ButtonInteraction, services: Services, s
     return;
   }
   // 両者から徴収
-  if (!collectStakes(services, [s.hostId, s.opponentId], s.bet)) {
+  if (!collectStakes(services, [s.hostId, s.opponentId], s.bet, s.id, "poker-duel")) {
     await interaction.reply({ content: "どちらかのエテル残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }
@@ -407,7 +407,7 @@ async function openJoin(interaction: ButtonInteraction, services: Services, s: S
     await interaction.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }
-  if (!collectStakes(services, [uid], s.bet)) {
+  if (!collectStakes(services, [uid], s.bet, s.id, "poker-duel")) {
     await interaction.reply({ content: "徴収に失敗した。", flags: MessageFlags.Ephemeral });
     return;
   }
@@ -429,7 +429,7 @@ async function openLeave(interaction: ButtonInteraction, services: Services, s: 
     await interaction.reply({ content: "立て主は「❌ 中止」で全員返金してから。", flags: MessageFlags.Ephemeral });
     return;
   }
-  refundAll(services, [uid], s.bet);
+  refundAll(services, [uid], s.bet, s.id);
   s.players.delete(uid);
   await interaction.update({ embeds: [buildOpenLobby(s)], components: openLobbyRow(s.id) });
 }
@@ -444,7 +444,7 @@ async function openCancel(interaction: ButtonInteraction, services: Services, s:
     return;
   }
   setPhase(s, "void");
-  for (const uid of s.players.keys()) refundAll(services, [uid], s.bet);
+  services.escrow.refund(s.id);
   await interaction.update({
     embeds: [
       new EmbedBuilder()
@@ -654,7 +654,7 @@ async function settleGame(client: import("discord.js").Client, s: Session, servi
   // 精算: 勝者複数なら比例配分（同額なので均等割）、単独ならサシと同じ settlePvp
   if (winners.length === 1 && losers.length === 1) {
     const w = winners[0]!;
-    const { houseCut } = settlePvp(services, [w.userId], s.bet * entries.length);
+    const { houseCut } = settlePvp(services, [w.userId], s.bet * entries.length, s.id);
     await postResult(client, s, entries, winners, houseCut);
     sessions.delete(s.id);
     return;
@@ -663,6 +663,7 @@ async function settleGame(client: import("discord.js").Client, s: Session, servi
     services,
     winners.map((w) => ({ userId: w.userId, bet: s.bet })),
     losers.map((l) => ({ userId: l.userId, bet: s.bet })),
+    s.id,
   );
   await postResult(client, s, entries, winners, totalHouseCut);
   sessions.delete(s.id);
