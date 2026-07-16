@@ -431,6 +431,7 @@ const CHANNEL_KEYS: Array<[string, string]> = [
   ["recruit", "蜜月の募集掲示"],
   ["charon_notify", "カロン通知"],
   ["bigwin", "大勝ち速報"],
+  ["member_log", "入退室ログ"],
 ];
 
 async function openChannelSetup(interaction: ButtonInteraction, _services: Services) {

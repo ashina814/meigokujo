@@ -57,6 +57,7 @@ import { handleDenVoice } from "./dens.js";
 import { handlePaydayButton } from "./payday.js";
 import { startScheduler } from "./scheduler.js";
 import { startOutboxWorker } from "./outbox.js";
+import { postJoinLog, postLeaveLog } from "./member-log.js";
 
 const services = buildServices();
 const client = new Client({
@@ -365,12 +366,22 @@ client.on(Events.MessageCreate, (message) => {
   void handleMessageXp(message, services).catch((err) => console.error("[rank] 発言XP付与失敗:", err));
 });
 
-// 入城導線: 参加時のロール付与・案内・招待リンク自動検出
+// 入城導線: 参加時のロール付与・案内・招待リンク自動検出 + 入退室ログ
 client.on(Events.GuildMemberAdd, (member) => {
   void (async () => {
-    const inviterId = await inviteTracker.detectInviter(member.guild).catch(() => null);
-    await handleMemberJoin(member, services, inviterId);
+    const detection = await inviteTracker.detectInvite(member.guild).catch(() => null);
+    await handleMemberJoin(member, services, detection?.inviterId ?? null);
+    await postJoinLog(client, services, member, detection).catch((err) =>
+      console.error("[member-log] 入城ログ投稿失敗:", err),
+    );
   })().catch((err) => console.error("[entry] 参加処理失敗:", err));
+});
+
+// 退城ログ
+client.on(Events.GuildMemberRemove, (member) => {
+  void postLeaveLog(client, services, member).catch((err) =>
+    console.error("[member-log] 退城ログ投稿失敗:", err),
+  );
 });
 
 // 亡霊ロール手動付与検知・性別ロール後付けで招待延長
