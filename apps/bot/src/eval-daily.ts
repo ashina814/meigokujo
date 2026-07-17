@@ -14,11 +14,19 @@ function buildStarterContent(
   presenceMins: number,
   presenceDays: number,
   balance: number,
+  basePeriodDays: number,
 ): string {
-  const extLine =
-    soul.eval_extension_days > 0
-      ? `**+${soul.eval_extension_days}日**（累積、招待による延長込み）`
-      : "延長なし";
+  // 延長合計は期限から逆算する（招待 eval_extension_days だけでなく、
+  // ショップ購入・運営手動の延長も漏れなく表示するため）
+  const totalExtDays =
+    soul.ghost_at && soul.eval_deadline_at
+      ? Math.round((soul.eval_deadline_at - soul.ghost_at) / 86_400) - basePeriodDays
+      : 0;
+  const extBits: string[] = [];
+  if (soul.eval_extension_days > 0) extBits.push(`招待 +${soul.eval_extension_days}日`);
+  const otherExt = totalExtDays - soul.eval_extension_days;
+  if (otherExt > 0) extBits.push(`購入・運営 +${otherExt}日`);
+  const extLine = totalExtDays > 0 ? `**+${totalExtDays}日**（${extBits.join("・") || "内訳不明"}）` : "延長なし";
   return [
     `📄 **${displayName}** の評価スレッド`,
     `入城: ${soul.ghost_at ? `<t:${soul.ghost_at}:D>` : "—"} / 審判期限: ${soul.eval_deadline_at ? `<t:${soul.eval_deadline_at}:D>（<t:${soul.eval_deadline_at}:R>）` : "—"}`,
@@ -43,7 +51,8 @@ async function refreshOne(guild: Guild, services: Services, userId: string): Pro
   const hours = Math.floor(presence.totalSeconds / 3600);
   const mins = Math.floor((presence.totalSeconds % 3600) / 60);
   const balance = services.ledger.balanceOf(`user:${userId}`);
-  const content = buildStarterContent(displayName, soul, hours, mins, presence.daysSeen, balance);
+  const basePeriodDays = services.settings.getNumber("eval_base_period_days");
+  const content = buildStarterContent(displayName, soul, hours, mins, presence.daysSeen, balance, basePeriodDays);
 
   // Forum スレッドの起点メッセージ ID はスレッド ID と同じ
   const starter = await thread.messages.fetch(threadId).catch(() => null);

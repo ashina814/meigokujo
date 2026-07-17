@@ -12,6 +12,7 @@ import {
 import type { ShopItemRow } from "@meigokujo/core";
 import { ShopError } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
+import { refreshEvalStatsForUser } from "../eval-daily.js";
 import type { Services } from "../services.js";
 
 /**
@@ -291,7 +292,11 @@ async function tryAutoDeliver(
         "UPDATE souls SET eval_deadline_at = eval_deadline_at + ?, updated_at = ? WHERE user_id = ?",
       )
       .run(days * 86_400, Math.floor(Date.now() / 1000), userId);
-    return `評価期限を **+${days}日** 延長しました。`;
+    // 評価フォーラムの起点投稿を即時更新（05:30の一括更新を待たせない）
+    if (interaction.guild) {
+      await refreshEvalStatsForUser(interaction.guild, services, userId).catch(() => undefined);
+    }
+    return `評価期限を **+${days}日** 延長しました。評価スレッドにも反映済みです。`;
   }
   if (item.delivery_kind === "revoke_meirei") {
     const soul = services.entry.getSoul(userId);
