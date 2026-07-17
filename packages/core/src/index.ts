@@ -1,4 +1,5 @@
 export { openDb } from "./db/bootstrap.js";
+export { openReadonlyDb } from "./db/readonly.js";
 export { LedgerError, type LedgerErrorCode } from "./ledger/errors.js";
 export {
   registerTxType,
