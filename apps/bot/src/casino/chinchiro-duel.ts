@@ -14,7 +14,15 @@ import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
 import { C_MAMMON, C_WIN } from "./ui.js";
-import { buildPvpAbort, buildPvpInvite, collectStakes, refundAll, settlePvp } from "./pvp-common.js";
+import {
+  buildPvpAbort,
+  buildPvpInvite,
+  collectStakes,
+  offerRematch,
+  refundAll,
+  settlePvp,
+  type PvpInteraction,
+} from "./pvp-common.js";
 
 /**
  * 🎲 対戦チンチロ（casino-bot /チンチロ対戦 準拠・1v1 PvP）。
@@ -87,7 +95,7 @@ function describe(h: Hand): string {
 const showDice = (d: Dice) => `${DIE_FACES[d[0]]} ${DIE_FACES[d[1]]} ${DIE_FACES[d[2]]}`;
 
 export async function playChinchiroDuel(
-  interaction: ChatInputCommandInteraction,
+  interaction: PvpInteraction,
   services: Services,
   opponent: User,
   bet: number,
@@ -223,25 +231,33 @@ export async function playChinchiroDuel(
       ],
       allowedMentions: { parse: [] },
     });
-    return;
-  }
-  const winnerId = cRank > oRank ? challenger.id : opponent.id;
-  const loserId = cRank > oRank ? opponent.id : challenger.id;
-  const { payout, houseCut } = settlePvp(services, [winnerId], pot, session);
+  } else {
+    const winnerId = cRank > oRank ? challenger.id : opponent.id;
+    const loserId = cRank > oRank ? opponent.id : challenger.id;
+    const { payout, houseCut } = settlePvp(services, [winnerId], pot, session);
 
-  await interaction.followUp({
-    embeds: [
-      new EmbedBuilder()
-        .setTitle(`🎲 対戦チンチロ — 勝者 <@${winnerId}>`)
-        .setColor(C_WIN)
-        .setDescription(
-          [
-            `**勝ち** <@${winnerId}> +${fmtEther(payout - bet)}（受取 ${fmtEther(payout)}）`,
-            `**負け** <@${loserId}> -${fmtEther(bet)}`,
-            `場代 ${fmtEther(houseCut)} → JPプール`,
-          ].join("\n"),
-        ),
-    ],
-    allowedMentions: { users: [winnerId] },
+    await interaction.followUp({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle(`🎲 対戦チンチロ — 勝者 <@${winnerId}>`)
+          .setColor(C_WIN)
+          .setDescription(
+            [
+              `**勝ち** <@${winnerId}> +${fmtEther(payout - bet)}（受取 ${fmtEther(payout)}）`,
+              `**負け** <@${loserId}> -${fmtEther(bet)}`,
+              `場代 ${fmtEther(houseCut)} → JPプール`,
+            ].join("\n"),
+          ),
+      ],
+      allowedMentions: { users: [winnerId] },
+    });
+  }
+
+  await offerRematch(interaction, {
+    aId: challenger.id,
+    bId: opponent.id,
+    bet,
+    game: "対戦チンチロ",
+    replay: (btn) => playChinchiroDuel(btn, services, btn.user.id === challenger.id ? opponent : challenger, bet),
   });
 }

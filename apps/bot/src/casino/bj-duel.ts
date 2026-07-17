@@ -13,7 +13,16 @@ import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
 import { C_MAMMON } from "./ui.js";
-import { buildPvpAbort, buildPvpInvite, buildPvpResult, collectStakes, refundAll, settlePvp } from "./pvp-common.js";
+import {
+  buildPvpAbort,
+  buildPvpInvite,
+  buildPvpResult,
+  collectStakes,
+  offerRematch,
+  refundAll,
+  settlePvp,
+  type PvpInteraction,
+} from "./pvp-common.js";
 
 /**
  * 🃏 BJデュエル（casino-bot /BJ対戦 準拠・1v1 PvP）。
@@ -50,7 +59,7 @@ function handValue(h: Card[]): number {
 const showHand = (h: Card[]) => h.map((c) => `${c.suit}${c.rank}`).join(" ");
 
 export async function playBjDuel(
-  interaction: ChatInputCommandInteraction,
+  interaction: PvpInteraction,
   services: Services,
   opponent: User,
   bet: number,
@@ -174,34 +183,41 @@ export async function playBjDuel(
         components: [],
         allowedMentions: { parse: [] },
       });
-      return;
+    } else {
+      const winnerId = result === "challenger_win" ? challenger.id : opponent.id;
+      const loserId = result === "challenger_win" ? opponent.id : challenger.id;
+      const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2, session);
+      await interaction.editReply({
+        content: "",
+        embeds: [
+          buildPvpResult({
+            game: "BJデュエル",
+            icon: "🃏",
+            winnerId,
+            loserId,
+            bet,
+            payout,
+            houseCut,
+            extra:
+              "```" +
+              "\n" +
+              `<@${challenger.id}>: ${showHand(cHand)}   合計 ${handValue(cHand)}` +
+              "\n─────────────────────────────\n" +
+              `<@${opponent.id}>: ${showHand(oHand)}   合計 ${handValue(oHand)}` +
+              "\n```\n" +
+              note,
+          }),
+        ],
+        components: [],
+        allowedMentions: { users: [winnerId] },
+      });
     }
-    const winnerId = result === "challenger_win" ? challenger.id : opponent.id;
-    const loserId = result === "challenger_win" ? opponent.id : challenger.id;
-    const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2, session);
-    await interaction.editReply({
-      content: "",
-      embeds: [
-        buildPvpResult({
-          game: "BJデュエル",
-          icon: "🃏",
-          winnerId,
-          loserId,
-          bet,
-          payout,
-          houseCut,
-          extra:
-            "```" +
-            "\n" +
-            `<@${challenger.id}>: ${showHand(cHand)}   合計 ${handValue(cHand)}` +
-            "\n─────────────────────────────\n" +
-            `<@${opponent.id}>: ${showHand(oHand)}   合計 ${handValue(oHand)}` +
-            "\n```\n" +
-            note,
-        }),
-      ],
-      components: [],
-      allowedMentions: { users: [winnerId] },
+    await offerRematch(interaction, {
+      aId: challenger.id,
+      bId: opponent.id,
+      bet,
+      game: "BJデュエル",
+      replay: (btn) => playBjDuel(btn, services, btn.user.id === challenger.id ? opponent : challenger, bet),
     });
   };
 

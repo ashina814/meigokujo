@@ -190,6 +190,13 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
           }
         }
         services.vip.clearExpired(expired);
+        // 失効は本人に見える形で伝える（無言の権利剥奪をしない）
+        for (const uid of expired) {
+          const user = await client.users.fetch(uid).catch(() => null);
+          await user
+            ?.send("💎 マモンの賭場 VIP の期限が切れた。賭け上限は通常に戻る。更新は `/vip` から。")
+            .catch(() => undefined);
+        }
         if (expired.length > 0) console.log(`[vip] 期限切れ ${expired.length}人 のロール剥奪`);
       }
     } catch (e) {
@@ -222,7 +229,19 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     try {
       services.stocks.updateAll();
       const forced = services.stocks.forceSellExpired();
-      if (forced.length > 0) console.log(`[stocks] 期限切れ強制売却: ${forced.length}件`);
+      if (forced.length > 0) {
+        console.log(`[stocks] 期限切れ強制売却: ${forced.length}件`);
+        // 資産が勝手に動いた時は必ず本人に通知（無言の強制売却をしない）
+        for (const f of forced) {
+          const stock = services.stocks.get(f.stockId);
+          const user = await client.users.fetch(f.userId).catch(() => null);
+          await user
+            ?.send(
+              `📈 マモンの株式市場: **${stock?.emoji ?? ""}${stock?.name ?? f.stockId}** ${f.shares}株 が保有期限（3日）を超えたため強制売却された。受取 **${f.proceeds.toLocaleString("ja-JP")}◈**（手数料1%控除後）。`,
+            )
+            .catch(() => undefined);
+        }
+      }
     } catch (e) {
       console.error("[stocks] tick失敗:", e);
     }

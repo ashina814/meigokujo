@@ -1,11 +1,16 @@
 import {
+  ActionRowBuilder,
   AttachmentBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   ChatInputCommandInteraction,
+  EmbedBuilder,
   MessageFlags,
   SlashCommandBuilder,
+  type ButtonInteraction,
   type GuildMember,
 } from "discord.js";
-import { fmtLdCompact } from "../format.js";
+import { fmtLd, fmtLdCompact } from "../format.js";
 import { renderProfileCard } from "../render/profile-card.js";
 import { isAdmin } from "../permissions.js";
 import {
@@ -110,8 +115,88 @@ export async function handleProfile(
     lines.push(`🎟 招待による評価期限の延長: **+${soul.eval_extension_days}日**`);
   }
 
+  // 通帳ボタンは本人のみ（他人の取引履歴は運営でも1クリックでは開かない・誤爆防止）
+  const components = isSelf
+    ? [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId(`prof:tsucho:${target.id}`).setLabel("📜 通帳（直近の取引）").setStyle(ButtonStyle.Secondary),
+        ),
+      ]
+    : [];
+
   await interaction.editReply({
     content: lines.length > 0 ? lines.join("\n") : undefined,
     files: [card],
+    components,
+  });
+}
+
+/** 取引種別の日本語ラベル（主要なもののみ。未知の型はそのまま出す） */
+const TX_LABEL: Record<string, string> = {
+  transfer: "送金",
+  tip: "投げ銭",
+  tip_burn: "投げ銭（焼却）",
+  salary: "給与",
+  tax: "冥府税",
+  pension: "年金",
+  reward_bump: "bump/up報酬",
+  reward_vc: "浮上報酬",
+  ether_buy: "エテル購入",
+  ether_sell: "エテル換金",
+  ether_burn: "退場奉納",
+  shop: "ショップ購入",
+  dept_in: "部署へ預入",
+  dept_out: "部署から引出",
+  bet: "賭け",
+  prize: "配当",
+  adjust: "運営調整",
+  migration: "残高移行",
+};
+
+function accountLabel(account: string, selfId: string): string {
+  if (account === `user:${selfId}`) return "自分";
+  if (account.startsWith("user:")) return `<@${account.slice(5)}>`;
+  if (account === "sys:treasury") return "国庫";
+  if (account === "sys:escrow:ether") return "両替所";
+  if (account.startsWith("dept:")) return `部署「${account.slice(5)}」`;
+  if (account.startsWith("sys:")) return account.slice(4);
+  return account;
+}
+
+/** /プロフィール の「📜 通帳」ボタン: Land 台帳の直近15件を ephemeral で出す */
+export async function handleProfileButton(interaction: ButtonInteraction, services: Services): Promise<void> {
+  const parts = interaction.customId.split(":"); // prof:tsucho:userId
+  if (parts[1] !== "tsucho") return;
+  const targetId = parts[2]!;
+  // ボタンは本人の返信にしか付かないが、公開表示から他人が押すケースを弾く
+  if (interaction.user.id !== targetId) {
+    await interaction.reply({ content: "通帳は本人だけが開ける。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const accountId = `user:${targetId}`;
+  const rows = services.ledger.history(accountId, { limit: 15 });
+  if (rows.length === 0) {
+    await interaction.reply({ content: "まだ取引記録がない。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const lines = rows.map((tx) => {
+    const incoming = tx.to_account === accountId;
+    const sign = incoming ? "＋" : "−";
+    const other = incoming ? tx.from_account : tx.to_account;
+    const label = TX_LABEL[tx.type] ?? tx.type;
+    const reason = tx.reason && tx.reason !== label ? `・${tx.reason}` : "";
+    return `<t:${tx.created_at}:d> <t:${tx.created_at}:t>  **${sign}${fmtLd(tx.amount)}**  ${label}${reason}  ⇄ ${accountLabel(other, targetId)}`;
+  });
+  const balance = services.ledger.balanceOf(accountId);
+  await interaction.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("📜 通帳 — 直近の取引")
+        .setColor(0x1e1b4b)
+        .setDescription(lines.join("\n"))
+        .setFooter({ text: `現在残高 ${fmtLd(balance)} · 直近${rows.length}件 · 賭場内の勝敗は /通行証 で` }),
+    ],
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
   });
 }

@@ -13,7 +13,16 @@ import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
 import { C_MAMMON } from "./ui.js";
-import { buildPvpAbort, buildPvpInvite, buildPvpResult, collectStakes, refundAll, settlePvp } from "./pvp-common.js";
+import {
+  buildPvpAbort,
+  buildPvpInvite,
+  buildPvpResult,
+  collectStakes,
+  offerRematch,
+  refundAll,
+  settlePvp,
+  type PvpInteraction,
+} from "./pvp-common.js";
 
 /**
  * ⚔ サシ勝負（casino-bot /サシ 準拠・1v1 コイントス的簡易勝負）。
@@ -21,7 +30,7 @@ import { buildPvpAbort, buildPvpInvite, buildPvpResult, collectStakes, refundAll
  * - 勝者総取り（場代3%）。座敷童テーマは削除
  */
 export async function playSashi(
-  interaction: ChatInputCommandInteraction,
+  interaction: PvpInteraction,
   services: Services,
   opponent: User,
   bet: number,
@@ -113,5 +122,13 @@ export async function playSashi(
     embeds: [buildPvpResult({ game: "サシ勝負", icon: "⚔", winnerId, loserId, bet, payout, houseCut })],
     components: [],
     allowedMentions: { users: [winnerId] },
+  });
+
+  await offerRematch(interaction, {
+    aId: challenger.id,
+    bId: opponent.id,
+    bet,
+    game: "サシ勝負",
+    replay: (btn) => playSashi(btn, services, btn.user.id === challenger.id ? opponent : challenger, bet),
   });
 }

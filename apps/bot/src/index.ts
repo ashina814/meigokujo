@@ -45,7 +45,7 @@ import {
   handleEvaluationSelect,
 } from "./commands/evaluation.js";
 import { handlePromote } from "./commands/promote.js";
-import { handleProfile } from "./commands/profile.js";
+import { handleProfile, handleProfileButton } from "./commands/profile.js";
 import { handleDepartment, handleDepartmentAutocomplete } from "./commands/department.js";
 import { handleFiscalButton } from "./commands/fiscal.js";
 import { handleHelpCommand } from "./commands/help.js";
@@ -325,6 +325,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("pkr:")) {
         await handlePokerDuelButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("prof:")) {
+        await handleProfileButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("taku:")) {

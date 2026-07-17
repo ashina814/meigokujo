@@ -13,7 +13,15 @@ import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET } from "./common.js";
 import { C_MAMMON, C_WIN } from "./ui.js";
-import { buildPvpAbort, buildPvpInvite, collectStakes, refundAll, settlePvp } from "./pvp-common.js";
+import {
+  buildPvpAbort,
+  buildPvpInvite,
+  collectStakes,
+  offerRematch,
+  refundAll,
+  settlePvp,
+  type PvpInteraction,
+} from "./pvp-common.js";
 
 /**
  * 🃏 インディアンポーカー（1v1心理戦）。casino-bot 準拠。
@@ -35,7 +43,7 @@ function draw(): { rank: number; suit: string } {
 }
 
 export async function playIndian(
-  interaction: ChatInputCommandInteraction,
+  interaction: PvpInteraction,
   services: Services,
   opponent: User,
   stake: number,
@@ -233,5 +241,13 @@ export async function playIndian(
     ],
     components: [],
     allowedMentions: winner ? { users: [winner] } : { parse: [] },
+  });
+
+  await offerRematch(interaction, {
+    aId: challenger.id,
+    bId: opponent.id,
+    bet: stake,
+    game: "インディアン",
+    replay: (btn) => playIndian(btn, services, btn.user.id === challenger.id ? opponent : challenger, stake),
   });
 }

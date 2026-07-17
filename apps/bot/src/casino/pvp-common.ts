@@ -1,8 +1,21 @@
-import { EmbedBuilder } from "discord.js";
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ComponentType,
+  EmbedBuilder,
+  MessageFlags,
+  type ButtonInteraction,
+  type ChatInputCommandInteraction,
+  type Message,
+} from "discord.js";
 import { HOUSE_HOLDER, JACKPOT_HOLDER } from "@meigokujo/core";
 import type { Services } from "../services.js";
 import { fmtEther } from "../format.js";
 import { C_LOSE, C_MAMMON, C_WIN } from "./ui.js";
+
+/** 1v1 PvP ゲームが受け取る interaction（/勝負 直叩き or 再戦ボタン経由） */
+export type PvpInteraction = ChatInputCommandInteraction | ButtonInteraction;
 
 /**
  * PvP ゲームの共通経済ルール。
@@ -173,4 +186,58 @@ export function settleProportional(
   }
   if (session) services.escrow.clear(session);
   return { totalHouseCut: houseCut };
+}
+
+/**
+ * 決着後の再戦オファー。決着メッセージの下に「⚔ 再戦（同額）」ボタンを followUp で出し、
+ * **両者が60秒以内に押したら** replay(btn) を呼ぶ。btn は2人目の押下 interaction で、
+ * これを新しい挑戦コマンドの代わりとして各ゲームの play 関数に渡す（reply から新規に始まる）。
+ * 残高チェック・エスクローは play 関数側が普通にやるので、ここでは何も徴収しない。
+ */
+export async function offerRematch(
+  interaction: PvpInteraction,
+  opts: { aId: string; bId: string; bet: number; game: string; replay: (btn: ButtonInteraction) => Promise<void> },
+): Promise<void> {
+  const nonce = `rem:${interaction.id}`;
+  let msg: Message;
+  try {
+    msg = (await interaction.followUp({
+      content: `⚔ 再戦するか？（同額 ${fmtEther(opts.bet)}・**両者**が押したら開始・60秒）`,
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId(nonce).setLabel("再戦（同額）").setEmoji("⚔").setStyle(ButtonStyle.Primary),
+        ),
+      ],
+      allowedMentions: { parse: [] },
+    })) as Message;
+  } catch {
+    return; // followUp できない状況（期限切れ等）は静かに諦める
+  }
+
+  const pressed = new Set<string>();
+  const collector = msg.createMessageComponentCollector({
+    componentType: ComponentType.Button,
+    filter: (i) => i.customId === nonce && (i.user.id === opts.aId || i.user.id === opts.bId),
+    time: 60_000,
+  });
+  collector.on("collect", (btn) => {
+    void (async () => {
+      if (pressed.has(btn.user.id)) {
+        await btn.reply({ content: "もう押してある。相手待ちだ。", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      pressed.add(btn.user.id);
+      if (pressed.size < 2) {
+        await btn.reply({ content: "✅ 受け付けた。相手が押したら開戦。", flags: MessageFlags.Ephemeral });
+        await msg.edit({ content: `⚔ 再戦するか？（同額 ${fmtEther(opts.bet)}・あと1人・60秒）` }).catch(() => undefined);
+        return;
+      }
+      collector.stop("go");
+      await msg.edit({ content: `⚔ **再戦成立！**（${opts.game}・${fmtEther(opts.bet)}）`, components: [] }).catch(() => undefined);
+      await opts.replay(btn);
+    })().catch((e) => console.error(`[rematch:${opts.game}] 再戦失敗:`, e));
+  });
+  collector.on("end", (_c, reason) => {
+    if (reason !== "go") void msg.edit({ components: [] }).catch(() => undefined);
+  });
 }

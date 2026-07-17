@@ -83,6 +83,21 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
     `稼働中の部屋: ${openRooms}室`,
   ].join("\n");
 
+  // 賭場（エテル経済圏の健全性監視。壊れ・exploit の早期検知用）
+  const fmtE = (n: number) => `${n.toLocaleString("ja-JP")}◈`;
+  const housePool = services.casino.houseBalance();
+  const jpPool = services.casino.jackpotPool();
+  const reliefPool = services.ether.balanceOf("relief");
+  const etherOutstanding = services.ether.outstanding();
+  const reservePool = services.ether.pool();
+  const etherRate = services.ether.rate();
+  const escrowRows = services.db.prepare("SELECT COALESCE(SUM(amount),0) AS s, COUNT(*) AS c FROM casino_escrow").get() as { s: number; c: number };
+  const casinoField = [
+    `胴元: **${fmtE(housePool)}** / JP: ${fmtE(jpPool)} / 救済: ${fmtE(reliefPool)}`,
+    `発行エテル: ${fmtE(etherOutstanding)} ⇄ 準備Land: ${fmtLd(reservePool)}（1Ld=${etherRate.toFixed(2)}◈）`,
+    escrowRows.c > 0 ? `進行中の卓の預かり: ${fmtE(escrowRows.s)}（${escrowRows.c}口）` : "進行中の卓の預かり: なし",
+  ].join("\n");
+
   // 部署口座（残高のある／登録済みの部署を上位から）
   const depts = services.departments
     .listWithBalance()
@@ -103,6 +118,7 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
       { name: "🚪 入城", value: entry },
       { name: "⚖️ 審判", value: evaluation },
       { name: "🛡 治安・運用", value: ops },
+      { name: "🎰 賭場", value: casinoField },
       ...(deptField ? [{ name: "🏦 部署口座", value: deptField }] : []),
     )
     .setFooter({ text: `最終更新: ${jstNow().dateStr} ${String(jstNow().hour).padStart(2, "0")}:${String(jstNow().minute).padStart(2, "0")} JST` });
