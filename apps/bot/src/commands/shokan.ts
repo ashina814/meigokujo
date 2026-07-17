@@ -20,6 +20,7 @@ import {
 import type { ShopItemRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { isAdmin } from "../permissions.js";
+import { requirementLabel } from "../rank-requirement.js";
 import type { Services } from "../services.js";
 
 /**
@@ -152,7 +153,7 @@ function renderList(services: Services) {
   return { embeds: [embed], components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu), backButton()] };
 }
 
-function renderItem(item: ShopItemRow) {
+function renderItem(item: ShopItemRow, services: Services) {
   const embed = new EmbedBuilder()
     .setTitle(`🛒 ${item.name}`)
     .setColor(item.enabled ? 0xdb2777 : 0x6b7280)
@@ -162,7 +163,7 @@ function renderItem(item: ShopItemRow) {
       { name: "代替価格", value: item.price_alt_kind ? `${item.price_alt_kind} ${item.price_alt_amount}` : "—", inline: true },
       { name: "種類", value: item.kind === "monthly" ? "月額" : "単発", inline: true },
       { name: "期限（日）", value: String(item.duration_days ?? "—"), inline: true },
-      { name: "階級要件", value: item.require_role_id ? `<@&${item.require_role_id}>` : "なし", inline: true },
+      { name: "階級要件", value: requirementLabel(services.settings, item.require_role_id), inline: true },
       { name: "配送", value: `${item.delivery === "auto" ? "自動" : "手動"}${item.delivery_kind ? ` (${item.delivery_kind})` : ""}`, inline: true },
       { name: "在庫", value: item.stock === null ? "無限" : String(item.stock), inline: true },
       { name: "状態", value: item.enabled ? "🟢 有効" : "⚫ 無効", inline: true },
@@ -217,7 +218,7 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
     const item = services.shop.getItem(id);
     if (!item) return;
     services.shop.setEnabled(id, !item.enabled, `user:${interaction.user.id}`);
-    return void (await interaction.update(renderItem(services.shop.getItem(id)!)));
+    return void (await interaction.update(renderItem(services.shop.getItem(id)!, services)));
   }
   if (action === "deliver" && arg) {
     const id = Number(arg);
@@ -250,17 +251,17 @@ export async function handleShokanSelect(
   if (action === "pick" && interaction.isStringSelectMenu()) {
     const item = services.shop.getItem(Number(interaction.values[0]));
     if (!item) return;
-    return void (await interaction.update(renderItem(item)));
+    return void (await interaction.update(renderItem(item, services)));
   }
   if (action === "role-set" && interaction.isRoleSelectMenu()) {
     const id = Number(parts[2]);
     services.shop.updateItem(id, { require_role_id: interaction.values[0] }, `user:${interaction.user.id}`);
-    return void (await interaction.update(renderItem(services.shop.getItem(id)!)));
+    return void (await interaction.update(renderItem(services.shop.getItem(id)!, services)));
   }
   if (action === "role-clear" && interaction.isStringSelectMenu()) {
     const id = Number(parts[2]);
     services.shop.updateItem(id, { require_role_id: null }, `user:${interaction.user.id}`);
-    return void (await interaction.update(renderItem(services.shop.getItem(id)!)));
+    return void (await interaction.update(renderItem(services.shop.getItem(id)!, services)));
   }
 }
 

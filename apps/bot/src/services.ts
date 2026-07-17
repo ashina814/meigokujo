@@ -31,6 +31,7 @@ import {
   registerDefaultTxTypes,
 } from "@meigokujo/core";
 import { config } from "./config.js";
+import { meetsRoleRequirement } from "./rank-requirement.js";
 
 /**
  * コアサービスの組み立て。アプリ層は薄く、ロジックは全て core 側（システム設計.md の原則）。
@@ -63,7 +64,10 @@ export function buildServices() {
   const fiscal = new Fiscal(db, ledger);
   const ranks = new RankEngine(db);
   const bumps = new BumpCounter(db);
-  const shop = new Shop(db, ledger, events);
+  // 階級要件は「〇〇以上」判定（亡霊 < 魔人 < 魔族。上位階級は下位要件の商品を買える）
+  const shop = new Shop(db, ledger, events, {
+    roleCheck: (memberRoleIds, requireRoleId) => meetsRoleRequirement(settings, memberRoleIds, requireRoleId),
+  });
   const ether = new EtherExchange(db, ledger, events, {
     baseRate: () => settings.getNumber("ether_rate_base"),
   });

@@ -94,12 +94,26 @@ export function endOfMonthJst(fromUnixSec: number = now()): number {
   return nextFirstOfMonthJst(fromUnixSec) - 1;
 }
 
+export interface ShopOptions {
+  /**
+   * 階級要件の判定。既定は「そのロールを持っているか」の完全一致。
+   * bot 側から階層対応（「〇〇以上」= 上位階級も可）の判定を注入できる。
+   */
+  roleCheck?: (memberRoleIds: readonly string[], requireRoleId: string) => boolean;
+}
+
 export class Shop {
   constructor(
     private readonly db: Database.Database,
     private readonly ledger: Ledger,
     private readonly events: EventLog,
+    private readonly options: ShopOptions = {},
   ) {}
+
+  private roleSatisfied(memberRoleIds: readonly string[], requireRoleId: string): boolean {
+    const check = this.options.roleCheck ?? ((ids, req) => ids.includes(req));
+    return check(memberRoleIds, requireRoleId);
+  }
 
   // ---- 商品CRUD ----
 
@@ -194,7 +208,7 @@ export class Shop {
     const item = this.getItem(input.itemId);
     if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: input.itemId });
     if (!item.enabled) throw new ShopError("ERR_ITEM_DISABLED", { itemId: item.id });
-    if (item.require_role_id && !input.memberRoleIds.includes(item.require_role_id)) {
+    if (item.require_role_id && !this.roleSatisfied(input.memberRoleIds, item.require_role_id)) {
       throw new ShopError("ERR_ROLE_REQUIRED", { roleId: item.require_role_id });
     }
     if (item.stock !== null && item.stock <= 0) throw new ShopError("ERR_NO_STOCK", { itemId: item.id });

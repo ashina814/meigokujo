@@ -13,6 +13,7 @@ import type { ShopItemRow } from "@meigokujo/core";
 import { ShopError } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { refreshEvalStatsForUser } from "../eval-daily.js";
+import { meetsRoleRequirement, requirementLabel } from "../rank-requirement.js";
 import type { Services } from "../services.js";
 
 /**
@@ -87,7 +88,7 @@ export function shopPanelMessage(services: Services): MessageCreateOptions {
   return { embeds: [embed], components };
 }
 
-function itemDetail(item: ShopItemRow, userHasRole: boolean, balance: number): {
+function itemDetail(item: ShopItemRow, userHasRole: boolean, balance: number, requireLabel: string): {
   embeds: EmbedBuilder[];
   components: ActionRowBuilder<ButtonBuilder>[];
 } {
@@ -99,7 +100,7 @@ function itemDetail(item: ShopItemRow, userHasRole: boolean, balance: number): {
       { name: "価格", value: formatPrice(item), inline: true },
       { name: "種類", value: formatKind(item), inline: true },
       { name: "配送", value: item.delivery === "auto" ? "自動" : "手動（スタッフ対応）", inline: true },
-      { name: "階級要件", value: item.require_role_id ? `<@&${item.require_role_id}>` : "なし", inline: true },
+      { name: "階級要件", value: requireLabel, inline: true },
       { name: "在庫", value: item.stock === null ? "無限" : String(item.stock), inline: true },
       { name: "あなたの残高", value: fmtLd(balance), inline: true },
     );
@@ -129,7 +130,7 @@ function itemDetail(item: ShopItemRow, userHasRole: boolean, balance: number): {
   if (buttons.length > 0) row.addComponents(...buttons);
   const components = row.components.length > 0 ? [row] : [];
   if (!userHasRole && item.require_role_id) {
-    embed.setFooter({ text: `階級要件を満たしていません（要 ${item.require_role_id}）` });
+    embed.setFooter({ text: "階級要件を満たしていません（上の「階級要件」を参照）" });
   }
   return { embeds: [embed], components };
 }
@@ -215,7 +216,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
             : e.code === "ERR_NO_STOCK"
               ? "在庫切れです。"
               : e.code === "ERR_ROLE_REQUIRED"
-                ? "階級要件を満たしていません。"
+                ? `階級要件を満たしていません（要 ${requirementLabel(services.settings, (e.details.roleId as string | undefined) ?? null)}）。`
                 : e.code === "ERR_ALREADY_ACTIVE"
                   ? "既にこの月額商品を契約中です。"
                   : e.code === "ERR_NO_PRICE"
@@ -245,9 +246,10 @@ export async function handleShopSelect(
     const member = interaction.member;
     const memberRoleIds =
       member && "roles" in member && "cache" in member.roles ? [...member.roles.cache.keys()] : [];
-    const hasRole = !item.require_role_id || memberRoleIds.includes(item.require_role_id);
+    const hasRole =
+      !item.require_role_id || meetsRoleRequirement(services.settings, memberRoleIds, item.require_role_id);
     const balance = services.ledger.balanceOf(`user:${interaction.user.id}`);
-    const view = itemDetail(item, hasRole, balance);
+    const view = itemDetail(item, hasRole, balance, requirementLabel(services.settings, item.require_role_id));
     await interaction.reply({ ...view, flags: MessageFlags.Ephemeral });
     return;
   }
