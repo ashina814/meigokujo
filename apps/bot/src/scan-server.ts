@@ -132,7 +132,7 @@ function serializeOverwrite(overwrite: any): JsonValue {
   };
 }
 
-function serializeChannel(channel: any): JsonValue {
+function serializeChannel(channel: any): Record<string, unknown> {
   return {
     id: channel.id,
     name: channel.name ?? null,
@@ -652,12 +652,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(async (error) => {
+main().catch((error) => {
   console.error("❌ 全体スキャン失敗:", error);
-  try {
-    await recordError("scan", undefined, error);
-    for (const stream of writers.values()) await stream.close();
-  } finally {
-    process.exitCode = 1;
-  }
+  writeFileSync(
+    join(outputDir, "fatal-error.json"),
+    JSON.stringify({ reason: errorMessage(error), recorded_at: Date.now() }, null, 2),
+    "utf8",
+  );
+  process.exitCode = 1;
 });
