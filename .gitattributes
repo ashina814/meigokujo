@@ -1,0 +1,9 @@
+# シェルスクリプトは必ず LF で checkout させる。
+# Windows で clone → CRLF になると Linux 側で
+# 「bad interpreter: /usr/bin/env bash^M」で起動しない。
+*.sh text eol=lf
+*.service text eol=lf
+deploy/* text eol=lf
+
+# PowerShell は Windows でしか動かさないので CRLF のままでよい
+*.ps1 text eol=crlf
