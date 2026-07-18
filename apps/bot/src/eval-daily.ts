@@ -1,5 +1,6 @@
 import type { AnyThreadChannel, Client, Guild } from "discord.js";
 import { fmtLd } from "./format.js";
+import { threadTitleFor } from "./commands/evaluation.js";
 import type { Services } from "./services.js";
 
 /**
@@ -47,6 +48,14 @@ async function refreshOne(guild: Guild, services: Services, userId: string): Pro
   if (thread.archived) await thread.setArchived(false).catch(() => undefined);
   const member = await guild.members.fetch(userId).catch(() => null);
   const displayName = member?.displayName ?? userId;
+
+  // スレッド名の【期限: MM/DD】を最新の期限に追従させる（延長のたびに名前側も更新）。
+  // 変わっていない時は setName を呼ばない（スレッド名変更はレート制限が厳しいため）。
+  const newName = threadTitleFor(displayName, soul.eval_deadline_at);
+  if (thread.name !== newName) {
+    await thread.setName(newName).catch((e) => console.error(`[評価] スレッド名更新失敗 ${userId}:`, e));
+  }
+
   const presence = services.vc.presence(userId, 14);
   const hours = Math.floor(presence.totalSeconds / 3600);
   const mins = Math.floor((presence.totalSeconds % 3600) / 60);
