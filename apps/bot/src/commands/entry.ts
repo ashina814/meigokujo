@@ -539,12 +539,14 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
 
   const passed: string[] = [];
   const failed: string[] = [];
+  const roleFailed: string[] = []; // DBは亡霊化したがロール変更に失敗＝手動対応が必要
   let totalGranted = 0;
   for (const id of toGhost) {
     const r = await ghostifyOne(guild, services, id, actor);
     if (r.ok) {
       totalGranted += r.granted;
       passed.push(id);
+      if (!r.roleOk) roleFailed.push(id);
     } else failed.push(id);
   }
 
@@ -552,7 +554,10 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
 
   const lines = [
     `✅ **${passed.length}名** を合格→亡霊にしました（初期発行 計 ${fmtLd(totalGranted)}）。`,
-    failed.length > 0 ? `❌ 失敗: ${failed.map((id) => `<@${id}>`).join(", ")}` : "",
+    roleFailed.length > 0
+      ? `⚠️ **ロール変更に失敗 ${roleFailed.length}名**: ${roleFailed.map((id) => `<@${id}>`).join(", ")}\n　→ DB上は亡霊化・初期発行済みですが**入城案内待ち→亡霊のロールが変わっていません**。手動で亡霊ロールを付けてください。原因はボットのロールが亡霊ロールより下にあること（Discordのロール順で上へ）。`
+      : "",
+    failed.length > 0 ? `❌ 亡霊化そのものに失敗: ${failed.map((id) => `<@${id}>`).join(", ")}` : "",
     sel.hold.size > 0 ? `⏸ 保留（案内待ちのまま）: ${sel.hold.size}名` : "",
   ].filter(Boolean);
   await interaction.editReply({ content: lines.join("\n"), allowedMentions: { parse: [] } });
@@ -565,7 +570,7 @@ async function ghostifyOne(
   services: Services,
   userId: string,
   actor: string,
-): Promise<{ ok: boolean; granted: number }> {
+): Promise<{ ok: boolean; granted: number; roleOk: boolean; roleError?: string }> {
   try {
     const member = await guild.members.fetch(userId);
     const maleRoleId = services.settings.getString("role:male");
@@ -579,8 +584,30 @@ async function ghostifyOne(
     const result = services.entry.ghostify(userId, actor, { inviteeGender: gender });
     const waitRoleId = services.settings.getString("role:queue_wait");
     const ghostRoleId = services.settings.getString("role:ghost");
-    if (waitRoleId) await member.roles.remove(waitRoleId).catch(() => undefined);
-    if (ghostRoleId) await member.roles.add(ghostRoleId).catch(() => undefined);
+    // ロール変更の成否を捕捉する。ghostify(DB) は成功しているので握り潰さず、
+    // 失敗を呼び出し側（判定UI）へ伝えて手動対応を促す。
+    let roleOk = true;
+    let roleError: string | undefined;
+    if (waitRoleId) {
+      const removed = await member.roles.remove(waitRoleId).then(() => true).catch((e: Error) => {
+        roleError = e.message;
+        return false;
+      });
+      if (!removed) roleOk = false;
+    }
+    if (ghostRoleId) {
+      const added = await member.roles.add(ghostRoleId).then(() => true).catch((e: Error) => {
+        roleError = e.message;
+        return false;
+      });
+      if (!added) roleOk = false;
+    } else {
+      roleOk = false;
+      roleError = "role:ghost が未設定";
+    }
+    if (!roleOk) {
+      console.error(`[entry] 亡霊化のロール変更失敗 ${userId}: ${roleError}（ボットのロールを階級より上へ）`);
+    }
 
     // 招待者への波及処理: 称号評価 + 招待による昇格印の閾値到達チェック
     const inviteeSoul = services.entry.getSoul(userId);
@@ -601,10 +628,10 @@ async function ghostifyOne(
         console.error(`[entry] 招待昇格チェック失敗 ${inviterId}:`, e),
       );
     }
-    return { ok: true, granted: result.granted };
+    return { ok: true, granted: result.granted, roleOk, roleError };
   } catch (e) {
     console.error(`[entry] 亡霊化失敗 ${userId}:`, e);
-    return { ok: false, granted: 0 };
+    return { ok: false, granted: 0, roleOk: false, roleError: (e as Error).message };
   }
 }
 
