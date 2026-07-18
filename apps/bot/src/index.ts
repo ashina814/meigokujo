@@ -39,6 +39,12 @@ import {
 } from "./commands/entry.js";
 import { handleTicketButton } from "./commands/tickets.js";
 import {
+  handleConfessionButton,
+  handleConfessionModal,
+  handleConfessionSelect,
+  relayStaffMessage,
+} from "./commands/confession.js";
+import {
   handleCharonButton,
   handleEvaluationCommand,
   handleEvaluationModal,
@@ -223,6 +229,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleShokanSelect(interaction, services);
       return;
     }
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith("mimi:")) {
+      await handleConfessionSelect(interaction, services);
+      return;
+    }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("shop:")) {
       await handleShopSelect(interaction, services);
       return;
@@ -241,6 +251,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("ita:")) {
       await handleItaSelect(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("mimi:")) {
+      await handleConfessionModal(interaction, services);
       return;
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("ita:")) {
@@ -273,6 +287,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("ticket:")) {
         await handleTicketButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("mimi:")) {
+        await handleConfessionButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("charon:")) {
@@ -368,6 +386,8 @@ client.on(Events.MessageCreate, (message) => {
   );
   void handleBumpMessage(message, services).catch((err) => console.error("[bump] 処理失敗:", err));
   void handleMessageXp(message, services).catch((err) => console.error("[rank] 発言XP付与失敗:", err));
+  // トートの耳: 対応スレッドの運営メッセージを告発者DMへ匿名中継
+  void relayStaffMessage(client, services, message).catch((err) => console.error("[mimi] 中継失敗:", err));
 });
 
 // 入城導線: 参加時のロール付与・案内・招待リンク自動検出 + 入退室ログ

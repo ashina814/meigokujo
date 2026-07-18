@@ -24,6 +24,7 @@ import { rankPanelMessage } from "./rank-panel.js";
 import { shopPanelMessage } from "./shop-panel.js";
 import { takutatePanelMessage } from "./takutate-panel.js";
 import { ticketPanelMessage } from "./tickets.js";
+import { confessionPanelMessage } from "./confession.js";
 import { roomPanelMessage } from "./rooms.js";
 import { deptAccount, LedgerError, type RoomKind } from "@meigokujo/core";
 import type { Services } from "../services.js";
@@ -98,6 +99,7 @@ const PANEL_KINDS = [
   "takutate",
   "ticket_return",
   "ticket_consult",
+  "confession",
   "room_normal",
   "room_mitsugetsu",
   "room_oborozuki",
@@ -115,6 +117,7 @@ const PANEL_LABELS: Record<(typeof PANEL_KINDS)[number], string> = {
   takutate: "卓建て",
   ticket_return: "出戻り申請",
   ticket_consult: "個別相談",
+  confession: "トートの耳",
   room_normal: "宿",
   room_mitsugetsu: "蜜月",
   room_oborozuki: "朧月",
@@ -235,6 +238,7 @@ function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services,
   if (kind === "takutate") return takutatePanelMessage();
   if (kind === "ticket_return") return ticketPanelMessage("return");
   if (kind === "ticket_consult") return ticketPanelMessage("consult");
+  if (kind === "confession") return confessionPanelMessage();
   if (kind === "dept") {
     const deptKey = services.settings.getString(`dept_panel_channel:${channelId}`) ?? "";
     return deptPanelMessage(services, deptKey);

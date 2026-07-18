@@ -65,6 +65,7 @@ export {
   type ShopErrorCode,
 } from "./shop/service.js";
 export { Tickets, type TicketRow, type TicketKind, type TicketStatus } from "./tickets/service.js";
+export { Confessions, type ConfessionRow, type ConfessionStatus } from "./confession/service.js";
 export { Evaluation, type Conclusion, type EvalScores, type EvalTexts, type PromotionScore, type SubmitResult, type SoulDeadlineRow } from "./evaluation/service.js";
 export { VcRewards, type DailyReward } from "./vc/rewards.js";
 export { Rooms, RoomError, type RoomRow, type RecruitRow, type RoomKind, type RoomErrorCode } from "./rooms/service.js";

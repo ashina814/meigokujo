@@ -12,6 +12,7 @@ import {
   Settings,
   Rooms,
   Tickets,
+  Confessions,
   TitleEngine,
   VcRewards,
   VcTracker,
@@ -53,6 +54,7 @@ export function buildServices() {
   const entry = new Entry(db, ledger, settings, events);
   const vc = new VcTracker(db);
   const tickets = new Tickets(db, events);
+  const confessions = new Confessions(db, events);
   const evaluation = new Evaluation(db, settings, events);
   const vcRewards = new VcRewards(db, settings);
   const rooms = new Rooms(db, ledger, settings, events);
@@ -97,7 +99,7 @@ export function buildServices() {
     console.log(`[escrow] 起動時に未精算エスクロー ${swept.sessions}卓/${swept.users}人分（計 ${swept.total.toLocaleString("ja-JP")}◈）を返金`);
   }
   const takutate = new Takutate(db, events);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, escrow, takutate };
+  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, escrow, takutate };
 }
 
 export type Services = ReturnType<typeof buildServices>;

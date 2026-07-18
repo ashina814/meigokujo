@@ -432,6 +432,7 @@ const CHANNEL_KEYS: Array<[string, string]> = [
   ["charon_notify", "カロン通知"],
   ["bigwin", "大勝ち速報"],
   ["member_log", "入退室ログ"],
+  ["confession", "トートの耳（匿名タレコミ）"],
 ];
 
 async function openChannelSetup(interaction: ButtonInteraction, _services: Services) {
@@ -554,6 +555,7 @@ const PANEL_KIND_CHOICES: Array<[string, string]> = [
   ["takutate", "卓建て"],
   ["ticket_return", "出戻り申請"],
   ["ticket_consult", "個別相談"],
+  ["confession", "トートの耳（匿名タレコミ）"],
   ["room_normal", "宿"],
   ["room_mitsugetsu", "蜜月"],
   ["room_oborozuki", "朧月"],
