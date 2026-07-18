@@ -70,6 +70,8 @@ export async function handleTakuButton(interaction: ButtonInteraction, services:
   }
   // パネル設置チャンネルの親カテゴリ配下に VC を作る（権限は継承）
   const parent = panelChannel.parent;
+  // VC作成は遅く3秒を超えることがあるので先に defer（以降 editReply）
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   try {
     const uid = interaction.user.id;
     const name = `${def.emoji} ${def.name}・${interaction.user.username.slice(0, 12)}`;
@@ -81,12 +83,11 @@ export async function handleTakuButton(interaction: ButtonInteraction, services:
       reason: `卓建て by ${uid}`,
     });
     services.takutate.track(vc.id, guild.id, uid, def.key);
-    await interaction.reply({
+    await interaction.editReply({
       content: `✅ ${def.emoji} **${def.name}** を立てた: <#${vc.id}>（最後の1人が退出で自動削除）`,
-      flags: MessageFlags.Ephemeral,
     });
   } catch (e) {
-    await interaction.reply({ content: `❌ VC 作成に失敗した（Botの権限不足?）`, flags: MessageFlags.Ephemeral });
+    await interaction.editReply({ content: `❌ VC 作成に失敗した（Botの権限不足?）` });
     void e;
   }
 }

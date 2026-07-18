@@ -13,7 +13,7 @@
 #   （OneDrive なので PC が飛んでもクラウドに残る = 三重化）
 
 param(
-  [string]$VpsHost = "root@163.44.110.20",   # ★ 新VPSのIPに書き換える
+  [string]$VpsHost = "root@160.251.205.72",   # 新VPS（2026-07-17 移行）。IPが変わったらここを直す
   [string]$Dest    = "C:\Users\kout2\OneDrive\discord\冥獄城\_backups",
   [int]$Keep       = 30,
   [switch]$Install

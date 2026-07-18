@@ -185,6 +185,9 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     const member = interaction.member;
     const memberRoleIds =
       member && "roles" in member && "cache" in member.roles ? [...member.roles.cache.keys()] : [];
+    // 自動配送（ロール付与・スレッド更新等）が3秒を超えると reply が 10062 で失敗するため、
+    // 先に defer して「考え中」を返しておく（以降は editReply）。
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const res = services.shop.purchase({
         itemId,
@@ -204,9 +207,8 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         await notifyStaffForDelivery(interaction, services, res.purchase.id, item).catch(() => undefined);
       }
       const expires = res.purchase.expires_at ? `\n有効期限: <t:${res.purchase.expires_at}:D>` : "";
-      await interaction.reply({
+      await interaction.editReply({
         content: `✅ **${item.name}** を購入しました${deliveryNote ? `\n${deliveryNote}` : ""}${expires}`,
-        flags: MessageFlags.Ephemeral,
       });
     } catch (e) {
       const msg =
@@ -225,7 +227,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
           : e instanceof Error && "code" in e && (e as { code: unknown }).code === "ERR_INSUFFICIENT"
             ? "残高が足りません。"
             : "処理に失敗しました。";
-      await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
+      await interaction.editReply({ content: `❌ ${msg}` });
     }
     return;
   }

@@ -249,31 +249,31 @@ async function createAndReply(
   members: string[],
   opts: { hours?: number } = {},
 ): Promise<void> {
+  // VC作成・メンバー移動などのDiscord APIで3秒を超えると最終returが 10062 で失敗するため、
+  // 先に defer する。ボタン=新規ephemeral / セレクト=元パネルを編集（セレクトは消す）。
+  if (interaction.isButton()) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  else await interaction.deferUpdate();
+  const finish = (content: string) => interaction.editReply({ content, components: [] });
+
   const guild = interaction.guild!;
   const owner = (await guild.members.fetch(interaction.user.id)) as GuildMember;
 
   // 一人一部屋: すでにオープン中の部屋を持っていたら弾く
   if (services.rooms.ownerHasOpenRoom(owner.id)) {
-    const msg = "すでに部屋を持っています。今の部屋を閉じてから、新しく立ててください（全員退出で自動的に閉じます）。";
-    if (interaction.isButton()) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
-    else await interaction.update({ content: msg, components: [] });
+    await finish("すでに部屋を持っています。今の部屋を閉じてから、新しく立ててください（全員退出で自動的に閉じます）。");
     return;
   }
 
   // 先に残高チェック（チャンネルを作ってから課金失敗で消す無駄を避ける）
   const price = services.rooms.priceFor(kind, opts.hours);
   if (price > 0 && services.ledger.balanceOf(`user:${owner.id}`) < price) {
-    const msg = `残高が足りません（所持: ${fmtLd(services.ledger.balanceOf(`user:${owner.id}`))} / 必要: ${fmtLd(price)}）。`;
-    if (interaction.isButton()) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
-    else await interaction.update({ content: msg, components: [] });
+    await finish(`残高が足りません（所持: ${fmtLd(services.ledger.balanceOf(`user:${owner.id}`))} / 必要: ${fmtLd(price)}）。`);
     return;
   }
 
   const channel = await createRoomChannel(guild, services, kind, owner, members, panelCategoryId(interaction));
   if (!channel) {
-    const msg = "部屋の作成に失敗しました。運営にパネルの設置場所（カテゴリ）を確認してもらってください。";
-    if (interaction.isButton()) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
-    else await interaction.update({ content: msg, components: [] });
+    await finish("部屋の作成に失敗しました。運営にパネルの設置場所（カテゴリ）を確認してもらってください。");
     return;
   }
 
@@ -282,9 +282,7 @@ async function createAndReply(
     room = services.rooms.register({ kind, channelId: channel.id, ownerId: owner.id, hours: opts.hours });
   } catch (e) {
     await channel.delete().catch(() => undefined); // 課金失敗 → 片付け
-    const msg = e instanceof LedgerError ? "課金に失敗しました（残高をご確認ください）。" : "登録に失敗しました。";
-    if (interaction.isButton()) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
-    else await interaction.update({ content: msg, components: [] });
+    await finish(e instanceof LedgerError ? "課金に失敗しました（残高をご確認ください）。" : "登録に失敗しました。");
     return;
   }
 
@@ -307,9 +305,7 @@ async function createAndReply(
     components: controls.length > 0 ? [new ActionRowBuilder<ButtonBuilder>().addComponents(...controls)] : [],
   });
 
-  const done = `✅ ${KIND_LABELS[kind]}を作成しました: ${channel.toString()}${price > 0 ? `（−${fmtLd(price)}）` : ""}`;
-  if (interaction.isButton()) await interaction.reply({ content: done, flags: MessageFlags.Ephemeral });
-  else await interaction.update({ content: done, components: [] });
+  await finish(`✅ ${KIND_LABELS[kind]}を作成しました: ${channel.toString()}${price > 0 ? `（−${fmtLd(price)}）` : ""}`);
 }
 
 async function handleAddSlot(interaction: ButtonInteraction, services: Services): Promise<void> {
