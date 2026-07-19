@@ -72,6 +72,11 @@ export {
   type ConfessionType,
   type ReplyWish,
   type ConfessionMeta,
+  type ConfessionStage,
+  type Disposition,
+  type CloseReason,
+  type AssigneeRow,
+  type EmergencyRow,
 } from "./confession/service.js";
 export { Evaluation, type Conclusion, type EvalScores, type EvalTexts, type PromotionScore, type SubmitResult, type SoulDeadlineRow } from "./evaluation/service.js";
 export { VcRewards, type DailyReward } from "./vc/rewards.js";

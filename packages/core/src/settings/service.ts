@@ -45,6 +45,9 @@ export const SETTING_DEFAULTS = {
   vip_bet_cap_mult: 2,
   // 移行（経済設計.md §9）
   migration_cap: 5_000_000, // これを超える旧残高は /移行 承認 が必要（キャップ額は運営合意待ちの暫定値）
+  // トートの耳（相談本文の保持期間）
+  confession_body_retention_days: 90, // 通常案件はクローズからN日後に本文purge可能
+  confession_court_retention_days: 365, // 裁判所送致案件は審理中に確認できるよう延長保持
 } as const;
 
 export type SettingKey = keyof typeof SETTING_DEFAULTS;
