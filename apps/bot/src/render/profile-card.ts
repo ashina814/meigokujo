@@ -41,6 +41,9 @@ const SPECIAL_STYLE_COLORS: Record<string, { bg1: string; bg2: string; border: s
   plain: { bg1: "#1c1030", bg2: "#0a0518", border: "#a855f7", accent: "#a855f7", sub: "#8a7fa6" },
 };
 
+/** 特別役職の下に「兼任/階級」を出さない、実質的な階級を持たない状態 */
+const HIDDEN_RANK = new Set(["入城案内待ち", "記録なし", "去りし魂"]);
+
 /** 階級ごとの帯色（バッジ） */
 const RANK_COLOR: Record<string, string> = {
   入城案内待ち: "#6b7280",
@@ -55,10 +58,11 @@ const RANK_COLOR: Record<string, string> = {
 export async function renderProfileCard(data: ProfileCardData): Promise<Buffer> {
   // 称号数に応じて高さを伸ばす + ランク描画があれば追加 + 特別役職バナーがあれば追加
   const titleRows = Math.max(data.titles.length, 1);
-  const specialH = data.specialRole ? 156 : 0;
+  const specialH = data.specialRole ? 176 : 0;
   const rankBlockH = data.ranks ? 220 : 0;
   const boxY = 236 + specialH; // ステータス4枠の上端
-  const rankTop = boxY + 104; // ランクセクションの上端
+  const boxH = 84; // ステータス枠の高さ
+  const rankTop = boxY + boxH + 52; // ランクセクションの上端（枠と十分に間隔を空ける）
   const titlesBlockTop = rankTop + rankBlockH;
   const rowH = 52;
   const height = titlesBlockTop + 44 + titleRows * rowH + 40;
@@ -86,7 +90,9 @@ export async function renderProfileCard(data: ProfileCardData): Promise<Buffer> 
     drawBadge(ctx, textX, avY + 92, data.specialRole.name, sc.accent);
     ctx.fillStyle = "#8a7fa6";
     ctx.font = `400 22px ${SANS}`;
-    ctx.fillText(`兼任 / 階級：${data.rank}`, textX, avY + 158);
+    // 入城前・記録なし・退場済みなど「実質的な階級を持たない状態」は兼任表示を出さない
+    const sub = HIDDEN_RANK.has(data.rank) ? "冥獄城 魂の記録カード" : `兼任 / 階級：${data.rank}`;
+    ctx.fillText(sub, textX, avY + 158);
   } else {
     const rankBadgeColor = RANK_COLOR[data.rank] ?? "#a855f7";
     drawBadge(ctx, textX, avY + 92, data.rank, rankBadgeColor);
@@ -109,7 +115,6 @@ export async function renderProfileCard(data: ProfileCardData): Promise<Buffer> 
   ];
   const gap = 18;
   const boxW = (WIDTH - PAD * 2 - gap * (stats.length - 1)) / stats.length;
-  const boxH = 84;
   stats.forEach(([label, value], i) => {
     const x = PAD + i * (boxW + gap);
     roundRect(ctx, x, boxY, boxW, boxH, 14);
@@ -327,49 +332,120 @@ function drawSpecialBanner(
   special: { name: string; desc: string; style: string },
 ): void {
   const sc = SPECIAL_STYLE_COLORS[special.style] ?? SPECIAL_STYLE_COLORS.plain!;
+  const r = 16;
 
-  // 重厚な枠（黒×深紅グラデ＋二重の金枠）
-  roundRect(ctx, x, y, w, h, 16);
+  // 外周のほのかな輝き（威厳の光）
+  ctx.save();
+  ctx.shadowColor = hexToRgba(sc.accent, 0.5);
+  ctx.shadowBlur = 22;
+  roundRect(ctx, x, y, w, h, r);
   const g = ctx.createLinearGradient(x, y, x + w, y + h);
   g.addColorStop(0, sc.bg1);
-  g.addColorStop(1, sc.bg2);
+  g.addColorStop(0.5, sc.bg2);
+  g.addColorStop(1, sc.bg1);
   ctx.fillStyle = g;
   ctx.fill();
-  ctx.strokeStyle = hexToRgba(sc.border, 0.85);
+  ctx.restore();
+
+  // 上部の玉座の光（ハイライト）
+  const hg = ctx.createLinearGradient(x, y, x, y + h);
+  hg.addColorStop(0, hexToRgba(sc.accent, 0.12));
+  hg.addColorStop(0.28, "rgba(0,0,0,0)");
+  ctx.fillStyle = hg;
+  roundRect(ctx, x, y, w, h, r);
+  ctx.fill();
+
+  // 二重の金枠
+  ctx.strokeStyle = hexToRgba(sc.border, 0.9);
   ctx.lineWidth = 2.5;
-  roundRect(ctx, x, y, w, h, 16);
+  roundRect(ctx, x, y, w, h, r);
   ctx.stroke();
-  ctx.strokeStyle = hexToRgba(sc.border, 0.3);
+  ctx.strokeStyle = hexToRgba(sc.border, 0.28);
   ctx.lineWidth = 1;
-  roundRect(ctx, x + 7, y + 7, w - 14, h - 14, 12);
+  roundRect(ctx, x + 7, y + 7, w - 14, h - 14, r - 5);
   ctx.stroke();
 
-  // 王冠（左）
-  const crownCx = x + 62;
+  // 四隅の飾り（コーナーブラケット＋ダイヤ）
+  drawCornerFlourishes(ctx, x + 6, y + 6, w - 12, h - 12, sc.accent);
+
+  // 王冠（左）＋背後の光輪
+  const crownCx = x + 74;
   const crownCy = y + h / 2;
-  drawCrown(ctx, crownCx, crownCy, 40, sc.accent);
+  const glow = ctx.createRadialGradient(crownCx, crownCy, 3, crownCx, crownCy, 58);
+  glow.addColorStop(0, hexToRgba(sc.accent, 0.3));
+  glow.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(crownCx, crownCy, 58, 0, Math.PI * 2);
+  ctx.fill();
+  drawCrown(ctx, crownCx, crownCy, 46, sc.accent);
+
+  // 縦の仕切り（王冠と本文の間）
+  const divX = x + 132;
+  const vg = ctx.createLinearGradient(divX, y + 20, divX, y + h - 20);
+  vg.addColorStop(0, "rgba(0,0,0,0)");
+  vg.addColorStop(0.5, hexToRgba(sc.border, 0.55));
+  vg.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.strokeStyle = vg;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(divX, y + 20);
+  ctx.lineTo(divX, y + h - 20);
+  ctx.stroke();
 
   // 見出し（名前）
-  const textX = x + 120;
+  const textX = x + 156;
+  const maxW = w - (textX - x) - 30;
   ctx.textBaseline = "alphabetic";
   ctx.fillStyle = sc.accent;
   ctx.font = `700 46px ${SERIF}`;
-  const nameY = y + 56;
-  ctx.fillText(fit(ctx, special.name, w - (textX - x) - 28), textX, nameY);
+  const nameY = y + 52;
+  ctx.fillText(fit(ctx, special.name, maxW), textX, nameY);
 
-  // 肩書ライン
+  // 肩書ライン（左右に飾りダイヤ）
   ctx.fillStyle = hexToRgba(sc.sub, 0.95);
-  ctx.font = `600 20px ${SANS}`;
-  ctx.fillText("― 冥獄城の特別役職 ―", textX, nameY + 26);
+  ctx.font = `600 19px ${SANS}`;
+  const subtitle = "冥獄城の特別役職";
+  const subW = ctx.measureText(subtitle).width;
+  ctx.fillText(subtitle, textX + 18, nameY + 26);
+  drawDiamond(ctx, textX + 7, nameY + 20, 4, sc.accent);
+  drawDiamond(ctx, textX + 18 + subW + 11, nameY + 20, 4, sc.accent);
 
-  // 説明文（最大2行に折り返し）
+  // 説明文（改行を尊重し、各文を折り返して最大2行）
   if (special.desc) {
-    ctx.fillStyle = "#d9cfe6";
+    ctx.fillStyle = "#e6ddf0";
     ctx.font = `400 22px ${SANS}`;
-    const maxW = w - (textX - x) - 28;
-    const lines = wrapText(ctx, special.desc.replace(/\n/g, " "), maxW, 2);
-    lines.forEach((ln, i) => ctx.fillText(ln, textX, nameY + 58 + i * 28));
+    const lines: string[] = [];
+    for (const para of special.desc.split("\n").map((s) => s.trim()).filter(Boolean)) {
+      for (const ln of wrapText(ctx, para, maxW, 2)) if (lines.length < 2) lines.push(ln);
+    }
+    lines.slice(0, 2).forEach((ln, i) => ctx.fillText(ln, textX, nameY + 60 + i * 28));
   }
+}
+
+/** バナー四隅のコーナーブラケット（╔╗╚╝ 風）＋ダイヤ */
+function drawCornerFlourishes(ctx: SKRSContext2D, x: number, y: number, w: number, h: number, color: string): void {
+  const arm = 20;
+  const inset = 10;
+  const corners: Array<[number, number, number, number]> = [
+    [x + inset, y + inset, 1, 1],
+    [x + w - inset, y + inset, -1, 1],
+    [x + inset, y + h - inset, 1, -1],
+    [x + w - inset, y + h - inset, -1, -1],
+  ];
+  ctx.save();
+  ctx.strokeStyle = hexToRgba(color, 0.8);
+  ctx.lineWidth = 2;
+  ctx.lineCap = "round";
+  for (const [cx, cy, sx, sy] of corners) {
+    ctx.beginPath();
+    ctx.moveTo(cx + sx * arm, cy);
+    ctx.lineTo(cx, cy);
+    ctx.lineTo(cx, cy + sy * arm);
+    ctx.stroke();
+    drawDiamond(ctx, cx, cy, 3.5, color);
+  }
+  ctx.restore();
 }
 
 /** 王冠のベクター描画（絵文字非依存） */
