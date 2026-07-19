@@ -161,6 +161,21 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       await applyVcRanks(client, services).catch((e) => console.error("[位階] 付与失敗:", e));
     }
 
+    // ── トートの耳: 保存期間を過ぎた相談本文を毎日 04:00 台にpurge（メタ・操作ログは残す）──
+    if (now.hour === 4) {
+      const marker = `confession_purge:${now.dateStr}`;
+      if (!services.settings.getString(marker)) {
+        services.settings.set(marker, "1", "system:scheduler");
+        try {
+          const due = services.confessions.listPurgeable();
+          for (const c of due) services.confessions.purgeBody(c.id, "system:scheduler", { auto: true });
+          if (due.length > 0) console.log(`[トート] 保存期間切れの相談本文 ${due.length}件 をpurgeしました`);
+        } catch (e) {
+          console.error("[トート] 本文purge失敗:", e);
+        }
+      }
+    }
+
     // ── カロン: 毎日 09:00 台に期限リスト・演出通知・迷霊落ち承認パネル ──
     if (now.hour === 9 && !services.settings.getString(`charon:daily:${now.dateStr}`)) {
       services.settings.set(`charon:daily:${now.dateStr}`, "1", "system:scheduler");

@@ -433,6 +433,8 @@ const CHANNEL_KEYS: Array<[string, string]> = [
   ["bigwin", "大勝ち速報"],
   ["member_log", "入退室ログ"],
   ["confession", "トートの耳（匿名タレコミ）"],
+  ["court_forum", "冥府裁判所フォーラム（送致先）"],
+  ["emergency_reports", "緊急対応の通知先"],
 ];
 
 async function openChannelSetup(interaction: ButtonInteraction, _services: Services) {
@@ -474,6 +476,7 @@ const ROLE_KEYS: Array<[string, string]> = [
   ["female", "女性属性"],
   ["bump_notify", "紹介協力者"],
   ["casino_vip", "賭場VIP"],
+  ["emergency_staff", "緊急対応担当"],
 ];
 
 async function openRoleSetup(interaction: ButtonInteraction, _services: Services) {
@@ -519,6 +522,8 @@ const NUMBER_KEYS: Array<[string, string]> = [
   ["vip_price", "VIP月会費（エテル）"],
   ["vip_days", "VIP日数"],
   ["vip_bet_cap_mult", "VIP賭け上限倍率"],
+  ["confession_body_retention_days", "トート本文の保持日数"],
+  ["confession_court_retention_days", "トート送致案件の本文保持日数"],
 ];
 
 async function openNumberSetup(interaction: ButtonInteraction, _services: Services) {
