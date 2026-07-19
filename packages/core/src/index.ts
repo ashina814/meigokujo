@@ -76,7 +76,7 @@ export {
 export { Evaluation, type Conclusion, type EvalScores, type EvalTexts, type PromotionScore, type SubmitResult, type SoulDeadlineRow } from "./evaluation/service.js";
 export { VcRewards, type DailyReward } from "./vc/rewards.js";
 export { Rooms, RoomError, type RoomRow, type RecruitRow, type RoomKind, type RoomErrorCode } from "./rooms/service.js";
-export { TitleEngine, TitleHelper, TITLE_RULES, SECRET_TITLE_COUNT, type TitleRule, type GrantedTitle } from "./titles/service.js";
+export { TitleEngine, TitleHelper, TITLE_RULES, type TitleRule, type GrantedTitle } from "./titles/service.js";
 export {
   Departments,
   DepartmentError,
