@@ -14,6 +14,11 @@ import { EventLog } from "../events/service.js";
  */
 export type ConfessionStatus = "open" | "claimed" | "closed";
 
+/** 投稿種類（§4）。値はコード、表示名はUI層で解決する */
+export type ConfessionType = "soudan" | "zange" | "iken" | "houkoku" | "kinkyu";
+/** 返信希望（§5） */
+export type ReplyWish = "yes" | "no" | "either";
+
 export interface ConfessionRow {
   id: number;
   user_id: string;
@@ -23,6 +28,17 @@ export interface ConfessionRow {
   created_at: number;
   claimed_at: number | null;
   closed_at: number | null;
+  // Phase 1 で加算（既存行は NULL）
+  type: string | null;
+  reply_wish: string | null;
+  body: string | null;
+}
+
+/** create に渡す任意メタ（未指定でも従来通り動く） */
+export interface ConfessionMeta {
+  type?: ConfessionType;
+  replyWish?: ReplyWish;
+  body?: string;
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -51,17 +67,34 @@ export class Confessions {
         blocked_by TEXT NOT NULL
       );
     `);
+    // Phase 1 加算列（既存DBには後付け。SQLite は ADD COLUMN IF NOT EXISTS が無いので存在確認して追加）
+    this.addColumn("type", "TEXT");
+    this.addColumn("reply_wish", "TEXT");
+    this.addColumn("body", "TEXT");
   }
 
-  /** 告発を受け付ける。返り値の id が受付番号（運営にはこれだけ見せる） */
-  create(userId: string): ConfessionRow {
+  /** confession_tickets に列が無ければ追加する（冪等な後付けマイグレーション） */
+  private addColumn(name: string, decl: string): void {
+    const cols = this.db.prepare("PRAGMA table_info(confession_tickets)").all() as { name: string }[];
+    if (cols.some((c) => c.name === name)) return;
+    this.db.exec(`ALTER TABLE confession_tickets ADD COLUMN ${name} ${decl}`);
+  }
+
+  /**
+   * 告発を受け付ける。返り値の id が受付番号（運営にはこれだけ見せる）。
+   * meta（種別・返信希望・本文）は任意。本文は #トートの声 に既に出る内容と同じで、
+   * スレッド表示や §18 の保存要件のために DB にも保持する。
+   */
+  create(userId: string, meta: ConfessionMeta = {}): ConfessionRow {
     const ts = now();
     const info = this.db
-      .prepare("INSERT INTO confession_tickets (user_id, status, created_at) VALUES (?, 'open', ?)")
-      .run(userId, ts);
+      .prepare(
+        "INSERT INTO confession_tickets (user_id, status, created_at, type, reply_wish, body) VALUES (?, 'open', ?, ?, ?, ?)",
+      )
+      .run(userId, ts, meta.type ?? null, meta.replyWish ?? null, meta.body ?? null);
     const id = Number(info.lastInsertRowid);
     // user_id は監査用にイベントログへ残すが、運営が直接見る導線には出さない
-    this.events.log("confession_create", { actor: userId, payload: { id } });
+    this.events.log("confession_create", { actor: userId, payload: { id, type: meta.type ?? null } });
     return this.get(id)!;
   }
 

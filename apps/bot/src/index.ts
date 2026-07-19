@@ -42,6 +42,7 @@ import {
   handleConfessionButton,
   handleConfessionModal,
   handleConfessionSelect,
+  handleConfessionStringSelect,
   relayStaffMessage,
 } from "./commands/confession.js";
 import {
@@ -231,6 +232,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isRoleSelectMenu() && interaction.customId.startsWith("mimi:")) {
       await handleConfessionSelect(interaction, services);
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("mimi:")) {
+      await handleConfessionStringSelect(interaction, services);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("shop:")) {
