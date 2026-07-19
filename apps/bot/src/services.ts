@@ -33,6 +33,7 @@ import {
 } from "@meigokujo/core";
 import { config } from "./config.js";
 import { meetsRoleRequirement } from "./rank-requirement.js";
+import { seedSpecialProfiles } from "./special-profile.js";
 
 /**
  * コアサービスの組み立て。アプリ層は薄く、ロジックは全て core 側（システム設計.md の原則）。
@@ -99,7 +100,10 @@ export function buildServices() {
     console.log(`[escrow] 起動時に未精算エスクロー ${swept.sessions}卓/${swept.users}人分（計 ${swept.total.toLocaleString("ja-JP")}◈）を返金`);
   }
   const takutate = new Takutate(db, events);
-  return { db, settings, ledger, payroll, migration, events, entry, vc, tickets, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, escrow, takutate };
+  const services = { db, settings, ledger, payroll, migration, events, entry, vc, tickets, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, escrow, takutate };
+  // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
+  seedSpecialProfiles(services);
+  return services;
 }
 
 export type Services = ReturnType<typeof buildServices>;

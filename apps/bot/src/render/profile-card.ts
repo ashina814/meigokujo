@@ -29,7 +29,17 @@ export interface ProfileCardData {
     text: { level: number; inLevel: number; toNext: number; title: string };
     voice: { level: number; inLevel: number; toNext: number; title: string };
   };
+  // 特別プロフィール（魔王など）— 指定時は最上部に専用バナーを描く（§11-§13）
+  specialRole?: { name: string; desc: string; style: string };
 }
+
+/** 特別役職の装飾スタイルごとの配色 */
+const SPECIAL_STYLE_COLORS: Record<string, { bg1: string; bg2: string; border: string; accent: string; sub: string }> = {
+  maou: { bg1: "#2c0512", bg2: "#08020a", border: "#f0b429", accent: "#f0b429", sub: "#e05a7d" },
+  crimson: { bg1: "#2a0512", bg2: "#12060a", border: "#e05a7d", accent: "#e05a7d", sub: "#f0b429" },
+  gold: { bg1: "#2a2205", bg2: "#100c02", border: "#f0b429", accent: "#ffe9a8", sub: "#f0b429" },
+  plain: { bg1: "#1c1030", bg2: "#0a0518", border: "#a855f7", accent: "#a855f7", sub: "#8a7fa6" },
+};
 
 /** 階級ごとの帯色（バッジ） */
 const RANK_COLOR: Record<string, string> = {
@@ -43,10 +53,13 @@ const RANK_COLOR: Record<string, string> = {
 };
 
 export async function renderProfileCard(data: ProfileCardData): Promise<Buffer> {
-  // 称号数に応じて高さを伸ばす + ランク描画があれば追加
+  // 称号数に応じて高さを伸ばす + ランク描画があれば追加 + 特別役職バナーがあれば追加
   const titleRows = Math.max(data.titles.length, 1);
+  const specialH = data.specialRole ? 156 : 0;
   const rankBlockH = data.ranks ? 220 : 0;
-  const titlesBlockTop = 340 + rankBlockH;
+  const boxY = 236 + specialH; // ステータス4枠の上端
+  const rankTop = boxY + 104; // ランクセクションの上端
+  const titlesBlockTop = rankTop + rankBlockH;
   const rowH = 52;
   const height = titlesBlockTop + 44 + titleRows * rowH + 40;
 
@@ -67,13 +80,25 @@ export async function renderProfileCard(data: ProfileCardData): Promise<Buffer> 
   ctx.font = `600 52px ${SERIF}`;
   ctx.fillText(fit(ctx, data.displayName, WIDTH - textX - PAD), textX, avY + 66);
 
-  // 階級バッジ
-  const rankBadgeColor = RANK_COLOR[data.rank] ?? "#a855f7";
-  drawBadge(ctx, textX, avY + 92, data.rank, rankBadgeColor);
+  // 階級バッジ。特別役職があるときは「主要役職＝特別役職」を大きく、階級は兼任として添える（§13）
+  if (data.specialRole) {
+    const sc = SPECIAL_STYLE_COLORS[data.specialRole.style] ?? SPECIAL_STYLE_COLORS.plain!;
+    drawBadge(ctx, textX, avY + 92, data.specialRole.name, sc.accent);
+    ctx.fillStyle = "#8a7fa6";
+    ctx.font = `400 22px ${SANS}`;
+    ctx.fillText(`兼任 / 階級：${data.rank}`, textX, avY + 158);
+  } else {
+    const rankBadgeColor = RANK_COLOR[data.rank] ?? "#a855f7";
+    drawBadge(ctx, textX, avY + 92, data.rank, rankBadgeColor);
+    ctx.fillStyle = "#8a7fa6";
+    ctx.font = `400 26px ${SANS}`;
+    ctx.fillText("冥獄城 魂の記録カード", textX, avY + 168);
+  }
 
-  ctx.fillStyle = "#8a7fa6";
-  ctx.font = `400 26px ${SANS}`;
-  ctx.fillText("冥獄城 魂の記録カード", textX, avY + 168);
+  // ── 特別役職バナー（魔王など）──
+  if (data.specialRole) {
+    drawSpecialBanner(ctx, PAD, 232, WIDTH - PAD * 2, specialH - 20, data.specialRole);
+  }
 
   // ── ステータス4枠 ──
   const stats: Array<[string, string]> = [
@@ -84,7 +109,6 @@ export async function renderProfileCard(data: ProfileCardData): Promise<Buffer> 
   ];
   const gap = 18;
   const boxW = (WIDTH - PAD * 2 - gap * (stats.length - 1)) / stats.length;
-  const boxY = 236;
   const boxH = 84;
   stats.forEach(([label, value], i) => {
     const x = PAD + i * (boxW + gap);
@@ -106,7 +130,6 @@ export async function renderProfileCard(data: ProfileCardData): Promise<Buffer> 
 
   // ── ランクセクション（総合Lv + 発言/浮上のゲージ + 称号）──
   if (data.ranks) {
-    const rankTop = 340;
     const secX = PAD;
     ctx.fillStyle = "#f0b429";
     ctx.font = `600 30px ${SERIF}`;
@@ -292,6 +315,111 @@ function drawRankRow(
   ctx.lineWidth = 1;
   roundRect(ctx, barX, barY, barW, barH, barH / 2);
   ctx.stroke();
+}
+
+/** 特別役職バナー（魔王など）。王冠＋見出し＋説明を専用枠で描く（§11-§12） */
+function drawSpecialBanner(
+  ctx: SKRSContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  special: { name: string; desc: string; style: string },
+): void {
+  const sc = SPECIAL_STYLE_COLORS[special.style] ?? SPECIAL_STYLE_COLORS.plain!;
+
+  // 重厚な枠（黒×深紅グラデ＋二重の金枠）
+  roundRect(ctx, x, y, w, h, 16);
+  const g = ctx.createLinearGradient(x, y, x + w, y + h);
+  g.addColorStop(0, sc.bg1);
+  g.addColorStop(1, sc.bg2);
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.strokeStyle = hexToRgba(sc.border, 0.85);
+  ctx.lineWidth = 2.5;
+  roundRect(ctx, x, y, w, h, 16);
+  ctx.stroke();
+  ctx.strokeStyle = hexToRgba(sc.border, 0.3);
+  ctx.lineWidth = 1;
+  roundRect(ctx, x + 7, y + 7, w - 14, h - 14, 12);
+  ctx.stroke();
+
+  // 王冠（左）
+  const crownCx = x + 62;
+  const crownCy = y + h / 2;
+  drawCrown(ctx, crownCx, crownCy, 40, sc.accent);
+
+  // 見出し（名前）
+  const textX = x + 120;
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = sc.accent;
+  ctx.font = `700 46px ${SERIF}`;
+  const nameY = y + 56;
+  ctx.fillText(fit(ctx, special.name, w - (textX - x) - 28), textX, nameY);
+
+  // 肩書ライン
+  ctx.fillStyle = hexToRgba(sc.sub, 0.95);
+  ctx.font = `600 20px ${SANS}`;
+  ctx.fillText("― 冥獄城の特別役職 ―", textX, nameY + 26);
+
+  // 説明文（最大2行に折り返し）
+  if (special.desc) {
+    ctx.fillStyle = "#d9cfe6";
+    ctx.font = `400 22px ${SANS}`;
+    const maxW = w - (textX - x) - 28;
+    const lines = wrapText(ctx, special.desc.replace(/\n/g, " "), maxW, 2);
+    lines.forEach((ln, i) => ctx.fillText(ln, textX, nameY + 58 + i * 28));
+  }
+}
+
+/** 王冠のベクター描画（絵文字非依存） */
+function drawCrown(ctx: SKRSContext2D, cx: number, cy: number, size: number, color: string): void {
+  const w = size;
+  const h = size * 0.72;
+  const left = cx - w / 2;
+  const top = cy - h / 2;
+  const bottom = cy + h / 2;
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(left, bottom); // 左下
+  ctx.lineTo(left, top + h * 0.35); // 左の谷から上へ
+  ctx.lineTo(left + w * 0.25, top + h * 0.62); // 左山の谷
+  ctx.lineTo(cx, top); // 中央の頂点
+  ctx.lineTo(left + w * 0.75, top + h * 0.62); // 右山の谷
+  ctx.lineTo(left + w, top + h * 0.35); // 右の頂点
+  ctx.lineTo(left + w, bottom); // 右下
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  // 台座
+  ctx.fillRect(left - 2, bottom, w + 4, h * 0.2);
+  // 宝珠（3つ）
+  ctx.fillStyle = hexToRgba("#ffffff", 0.85);
+  for (const fx of [0.18, 0.5, 0.82]) {
+    ctx.beginPath();
+    ctx.arc(left + w * fx, top + h * 0.28, size * 0.06, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/** テキストを幅に合わせて最大 maxLines 行へ折り返す（超過は末尾を…に詰める） */
+function wrapText(ctx: SKRSContext2D, text: string, maxWidth: number, maxLines: number): string[] {
+  const chars = [...text];
+  const lines: string[] = [];
+  let cur = "";
+  for (const ch of chars) {
+    if (ctx.measureText(cur + ch).width > maxWidth) {
+      lines.push(cur);
+      cur = ch;
+      if (lines.length === maxLines - 1) break;
+    } else {
+      cur += ch;
+    }
+  }
+  const rest = chars.slice([...lines.join("")].length).join("");
+  if (lines.length < maxLines) lines.push(fit(ctx, rest, maxWidth));
+  return lines.filter((l) => l.length > 0);
 }
 
 function drawBadge(ctx: SKRSContext2D, x: number, y: number, text: string, color: string): void {

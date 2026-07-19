@@ -13,6 +13,7 @@ import {
 import { fmtLd, fmtLdCompact } from "../format.js";
 import { renderProfileCard } from "../render/profile-card.js";
 import { isAdmin } from "../permissions.js";
+import { resolveSpecialProfile } from "../special-profile.js";
 import {
   TEXT_TIERS,
   VOICE_TIERS,
@@ -80,6 +81,9 @@ export async function handleProfile(
   const rank = soul ? (RANK_LABEL[soul.status] ?? soul.status) : "記録なし";
   const displayName = member?.displayName ?? target.globalName ?? target.username;
 
+  // 特別プロフィール（魔王など）。Discordロールを見て、最も優先度の高い有効エントリを主要役職にする（§9-§13）
+  const special = resolveSpecialProfile(member, services);
+
   // ランク（発言・浮上・総合）
   const textData = services.ranks.getText(target.id);
   const voiceData = services.ranks.getVoice(target.id);
@@ -101,6 +105,9 @@ export async function handleProfile(
     daysSeen: presence.daysSeen,
     titles: titles.map((t) => ({ name: t.name, desc: t.desc })),
     ranks,
+    specialRole: special
+      ? { name: special.primary.name, desc: special.primary.desc, style: special.primary.style }
+      : undefined,
   });
   const card = new AttachmentBuilder(png, { name: "record-card.png" });
 

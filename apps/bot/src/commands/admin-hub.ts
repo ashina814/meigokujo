@@ -24,6 +24,14 @@ import {
 } from "discord.js";
 import { deptAccount, EtherError, HOUSE_HOLDER, LedgerError } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
+import { ROLE_SLOT_META, ROLE_SLOT_ORDER, getRoleIds, setRoleIds, type RoleSlot } from "../church-roles.js";
+import {
+  getSpecialProfiles,
+  removeSpecialProfile,
+  toggleSpecialProfile,
+  upsertSpecialProfile,
+  type SpecialStyle,
+} from "../special-profile.js";
 import { updateDashboard } from "../dashboard.js";
 import { fmtEther, fmtLd } from "../format.js";
 import type { Services } from "../services.js";
@@ -113,6 +121,12 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "setting" && action === "role-select") return void (await openRoleSetup(interaction, services));
   if (section === "setting" && action === "number-select") return void (await openNumberSetup(interaction, services));
 
+  // ── 機関ロール（冥教会・他機関） ──
+  if (section === "orgrole" && !action) return void (await interaction.update(orgRoleHome(services)));
+
+  // ── 特別プロフィール（魔王など） ──
+  if (section === "sprof" && !action) return void (await interaction.update(specialProfileHome(services)));
+
   // ── パネル ──
   if (section === "panel" && !action) return void (await interaction.update(panelHome()));
   if (section === "panel" && action === "install") return void (await interaction.update(panelInstallPicker()));
@@ -190,6 +204,33 @@ export async function handleAdminSelect(
   if (section === "setting" && action === "number-key" && interaction.isStringSelectMenu()) {
     return void (await interaction.showModal(numberSetModal(interaction.values[0]!)));
   }
+  // ── 機関ロール ──
+  if (section === "orgrole" && action === "key" && interaction.isStringSelectMenu()) {
+    return void (await interaction.update(orgRolePicker(services, interaction.values[0]! as RoleSlot)));
+  }
+  if (section === "orgrole" && action === "set" && interaction.isRoleSelectMenu()) {
+    const slot = parts[3]! as RoleSlot;
+    setRoleIds(services, slot, [...interaction.values], `user:${interaction.user.id}`);
+    const n = interaction.values.length;
+    return void (await interaction.update({
+      content: n > 0 ? `✅ **${ROLE_SLOT_META[slot].label}** に ${n}件 のロールを設定しました。` : `🗑 **${ROLE_SLOT_META[slot].label}** のロールをクリアしました。`,
+      embeds: [],
+      components: [backButton()],
+      allowedMentions: { parse: [] },
+    }));
+  }
+  // ── 特別プロフィール ──
+  if (section === "sprof" && action === "pick" && interaction.isRoleSelectMenu()) {
+    return void (await interaction.showModal(sprofModal(services, interaction.values[0]!)));
+  }
+  if (section === "sprof" && action === "toggle" && interaction.isStringSelectMenu()) {
+    toggleSpecialProfile(services, interaction.values[0]!, `user:${interaction.user.id}`);
+    return void (await interaction.update(specialProfileHome(services)));
+  }
+  if (section === "sprof" && action === "delete" && interaction.isStringSelectMenu()) {
+    removeSpecialProfile(services, interaction.values[0]!, `user:${interaction.user.id}`);
+    return void (await interaction.update(specialProfileHome(services)));
+  }
   if (section === "panel" && action === "install-pick" && interaction.isStringSelectMenu()) {
     return void (await installPanel(interaction, services, interaction.values[0]!));
   }
@@ -255,6 +296,27 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
     }
     services.settings.set(key, n, `user:${interaction.user.id}`);
     await interaction.reply({ content: `✅ **${key}** = ${n.toLocaleString()} に設定しました。`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (section === "sprof" && action === "save") {
+    const roleId = parts[3]!;
+    const name = interaction.fields.getTextInputValue("name").trim();
+    const priority = Number(interaction.fields.getTextInputValue("priority").replaceAll(",", "").trim());
+    const desc = (interaction.fields.getTextInputValue("desc") || "").trim();
+    const styleRaw = (interaction.fields.getTextInputValue("style") || "").trim().toLowerCase();
+    const enabledRaw = (interaction.fields.getTextInputValue("enabled") || "").trim();
+    if (!name || !Number.isFinite(priority)) {
+      await interaction.reply({ content: "表示名と、数値の優先度を入れてください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const style: SpecialStyle = (["maou", "gold", "crimson", "plain"].includes(styleRaw) ? styleRaw : "maou") as SpecialStyle;
+    const enabled = !/^(no|false|0|off|オフ|無効|いいえ|×)$/i.test(enabledRaw);
+    upsertSpecialProfile(services, { roleId, name, priority, desc, style, enabled }, `user:${interaction.user.id}`);
+    await interaction.reply({
+      content: `✅ 特別プロフィール **${name}**（<@&${roleId}> / 優先度${priority} / ${style} / ${enabled ? "有効" : "無効"}）を保存しました。`,
+      flags: MessageFlags.Ephemeral,
+      allowedMentions: { parse: [] },
+    });
     return;
   }
   if (section === "adjust" && action === "amount") {
@@ -411,7 +473,11 @@ async function settingHome(_services: Services) {
     new ButtonBuilder().setCustomId("mgmt:setting:role-select").setLabel("ロール").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("mgmt:setting:number-select").setLabel("数値").setStyle(ButtonStyle.Primary),
   );
-  return { embeds: [embed], components: [row, backButton()] };
+  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("mgmt:orgrole").setLabel("機関ロール").setEmoji("⛪").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mgmt:sprof").setLabel("特別プロフィール").setEmoji("👑").setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row, row2, backButton()] };
 }
 
 const CHANNEL_KEYS: Array<[string, string]> = [
@@ -435,6 +501,7 @@ const CHANNEL_KEYS: Array<[string, string]> = [
   ["confession", "トートの耳（匿名タレコミ）"],
   ["court_forum", "冥府裁判所フォーラム（送致先）"],
   ["emergency_reports", "緊急対応の通知先"],
+  ["handoff_notify", "対応先変更・大司教呼出の通知先（省略時はトートの耳）"],
 ];
 
 async function openChannelSetup(interaction: ButtonInteraction, _services: Services) {
@@ -545,6 +612,142 @@ function numberSetModal(key: string) {
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder().setCustomId("value").setLabel("数値").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15),
       ),
+    );
+}
+
+// ---- 機関ロール（冥教会・他機関）サブパネル ----
+
+function orgRoleHome(services: Services) {
+  const lines = ROLE_SLOT_ORDER.map((slot) => {
+    const ids = getRoleIds(services, slot);
+    const val = ids.length > 0 ? ids.map((id) => `<@&${id}>`).join("・") : "（未設定）";
+    return `・**${ROLE_SLOT_META[slot].label}**\n　${val}`;
+  }).join("\n");
+  const embed = new EmbedBuilder()
+    .setTitle("⛪ 冥教会・機関ロールの対応付け")
+    .setColor(0x6b21a8)
+    .setDescription(
+      [
+        "こちらで作成済みのDiscordロールを、トートの通知先・対応資格・案件管理へ対応付けます。",
+        "**Botはロールを作成・削除しません。** 既存ロールを選ぶだけです。",
+        "新着通知・対応先変更の通知は、ここで設定したロールへ振り分けられます。",
+        "",
+        lines,
+      ].join("\n"),
+    );
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("mgmt:orgrole:key")
+    .setPlaceholder("設定する区分を選ぶ")
+    .addOptions(
+      ROLE_SLOT_ORDER.map((slot) => ({
+        label: ROLE_SLOT_META[slot].label.slice(0, 100),
+        description: ROLE_SLOT_META[slot].hint.slice(0, 100),
+        value: slot,
+      })),
+    );
+  return { embeds: [embed], components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu), backButton()] };
+}
+
+function orgRolePicker(services: Services, slot: RoleSlot) {
+  const meta = ROLE_SLOT_META[slot];
+  const current = getRoleIds(services, slot);
+  const picker = new RoleSelectMenuBuilder()
+    .setCustomId(`mgmt:orgrole:set:${slot}`)
+    .setPlaceholder(meta.multi ? "ロールを選ぶ（複数可・選び直しで上書き）" : "ロールを選ぶ（選び直しで上書き）")
+    .setMinValues(0)
+    .setMaxValues(meta.multi ? 10 : 1);
+  const embed = new EmbedBuilder()
+    .setTitle(`⛪ ${meta.label}`)
+    .setColor(0x6b21a8)
+    .setDescription(
+      [
+        meta.hint,
+        "",
+        `現在: ${current.length > 0 ? current.map((id) => `<@&${id}>`).join("・") : "（未設定）"}`,
+        "",
+        "選び直すと **上書き** されます（何も選ばず確定すると解除）。",
+      ].join("\n"),
+    );
+  return { embeds: [embed], components: [new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(picker), backButton()] };
+}
+
+// ---- 特別プロフィール（魔王など）サブパネル ----
+
+function specialProfileHome(services: Services) {
+  const entries = getSpecialProfiles(services).slice().sort((a, b) => b.priority - a.priority);
+  const lines =
+    entries.length > 0
+      ? entries.map((e) => `・${e.enabled ? "🟢" : "⚪"} **${e.name}** ｜ 優先度 ${e.priority} ｜ 装飾 \`${e.style}\` ｜ <@&${e.roleId}>`).join("\n")
+      : "（特別プロフィールは未設定）";
+  const embed = new EmbedBuilder()
+    .setTitle("👑 特別プロフィール役職")
+    .setColor(0x6b21a8)
+    .setDescription(
+      [
+        "既存のDiscordロールを、プロフィール上の特別役職へ対応付けます（表示名・優先度・説明・装飾・有効/無効）。",
+        "対象ロールを選ぶと、追加または編集のモーダルが開きます。優先度が大きいほど上位に表示されます。",
+        "",
+        lines,
+      ].join("\n"),
+    );
+  const pick = new RoleSelectMenuBuilder().setCustomId("mgmt:sprof:pick").setPlaceholder("追加・編集する対象ロールを選ぶ");
+  const components: ActionRowBuilder<RoleSelectMenuBuilder | StringSelectMenuBuilder | ButtonBuilder>[] = [
+    new ActionRowBuilder<RoleSelectMenuBuilder | StringSelectMenuBuilder | ButtonBuilder>().addComponents(pick),
+  ];
+  if (entries.length > 0) {
+    const toggle = new StringSelectMenuBuilder()
+      .setCustomId("mgmt:sprof:toggle")
+      .setPlaceholder("有効／無効を切り替える")
+      .addOptions(entries.slice(0, 25).map((e) => ({ label: `${e.name}（${e.enabled ? "有効→無効" : "無効→有効"}）`.slice(0, 100), value: e.roleId })));
+    const del = new StringSelectMenuBuilder()
+      .setCustomId("mgmt:sprof:delete")
+      .setPlaceholder("対応付けを削除する")
+      .addOptions(entries.slice(0, 25).map((e) => ({ label: `${e.name} を削除`.slice(0, 100), value: e.roleId })));
+    components.push(new ActionRowBuilder<RoleSelectMenuBuilder | StringSelectMenuBuilder | ButtonBuilder>().addComponents(toggle));
+    components.push(new ActionRowBuilder<RoleSelectMenuBuilder | StringSelectMenuBuilder | ButtonBuilder>().addComponents(del));
+  }
+  components.push(new ActionRowBuilder<RoleSelectMenuBuilder | StringSelectMenuBuilder | ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("mgmt:hub").setLabel("← ハブへ").setStyle(ButtonStyle.Secondary),
+  ));
+  return { embeds: [embed], components };
+}
+
+function sprofModal(services: Services, roleId: string) {
+  const existing = getSpecialProfiles(services).find((e) => e.roleId === roleId);
+  const nameInput = new TextInputBuilder().setCustomId("name").setLabel("表示名").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40);
+  if (existing) nameInput.setValue(existing.name);
+  const priInput = new TextInputBuilder()
+    .setCustomId("priority")
+    .setLabel("表示優先度（数値・大きいほど上位）")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(6)
+    .setValue(String(existing?.priority ?? 100));
+  const descInput = new TextInputBuilder().setCustomId("desc").setLabel("説明文").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500);
+  if (existing?.desc) descInput.setValue(existing.desc);
+  const styleInput = new TextInputBuilder()
+    .setCustomId("style")
+    .setLabel("装飾スタイル: maou / gold / crimson / plain")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(12)
+    .setValue(existing?.style ?? "maou");
+  const enabledInput = new TextInputBuilder()
+    .setCustomId("enabled")
+    .setLabel("有効？（はい / いいえ）")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(6)
+    .setValue(existing ? (existing.enabled ? "はい" : "いいえ") : "はい");
+  return new ModalBuilder()
+    .setCustomId(`mgmt:sprof:save:${roleId}`)
+    .setTitle("特別プロフィール設定")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(nameInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(priInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(descInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(styleInput),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(enabledInput),
     );
 }
 

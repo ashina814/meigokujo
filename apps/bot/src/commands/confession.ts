@@ -26,6 +26,14 @@ import {
   type TextChannel,
 } from "discord.js";
 import { isAdmin } from "../permissions.js";
+import {
+  isChurchConsult,
+  isChurchManager,
+  notifyRoleIdsForDisposition,
+  notifyRoleIdsForType,
+  getRoleIds,
+  roleMention,
+} from "../church-roles.js";
 import type { Services } from "../services.js";
 import type {
   ConfessionRow,
@@ -110,13 +118,15 @@ const STAGE_META: Record<ConfessionStage, string> = {
 
 const DISPO_META: Record<Disposition, { emoji: string; label: string }> = {
   church: { emoji: "⛪", label: "冥教会で相談継続" },
-  normal: { emoji: "🏰", label: "通常の運営対応" },
-  kaiwa: { emoji: "🤝", label: "諧和廷へ連携" },
+  normal: { emoji: "🏰", label: "通常運営で対応" },
+  // 諧和廷連携は廃止（旧運用）。既存案件の表示互換のため定義は残すが、新規選択肢からは外す
+  kaiwa: { emoji: "🤝", label: "諧和廷連携（旧運用・使用停止）" },
   court: { emoji: "⚖️", label: "冥府裁判所への送致を検討" },
   emergency: { emoji: "🚨", label: "緊急対応" },
   record: { emoji: "📁", label: "記録のみ" },
 };
-const DISPO_ORDER: Disposition[] = ["church", "normal", "kaiwa", "court", "emergency", "record"];
+// 新規案件で選べる対応先（5種）。kaiwa は廃止したため含めない
+const DISPO_ORDER: Disposition[] = ["church", "normal", "court", "emergency", "record"];
 
 const STAGE_ORDER: ConfessionStage[] = [
   "active",
@@ -133,17 +143,17 @@ const CLOSE_META: Record<CloseReason, string> = {
   poster_ended: "投稿者が終了を希望した",
   no_response: "投稿者から返答がない",
   handoff_normal: "通常運営へ引き継いだ",
-  handoff_kaiwa: "諧和廷へ連携した",
+  handoff_kaiwa: "諧和廷へ連携した（旧運用）",
   sent_court: "冥府裁判所へ送致した",
   no_action: "対応不要と判断した",
   other: "その他",
 };
+// 新規クローズで選べる理由。handoff_kaiwa（諧和廷連携）は廃止したため含めない（既存表示用に META は残す）
 const CLOSE_ORDER: CloseReason[] = [
   "resolved",
   "poster_ended",
   "no_response",
   "handoff_normal",
-  "handoff_kaiwa",
   "sent_court",
   "no_action",
   "other",
@@ -306,20 +316,28 @@ function replyModal(id: number): ModalBuilder {
     );
 }
 
+/**
+ * 「対応する」を押せる資格（案件の入口）。§8 の分離後は相談対応ロール（シスター・修道士）・
+ * 冥教会管理ロール（大司教）・管理者。新設定が未投入の間は church_consult が ticket_staff へ
+ * フォールバックする（church-roles 側で解決）。
+ */
 function isConfessionStaff(interaction: ButtonInteraction | RoleSelectMenuInteraction, services: Services): boolean {
   if (isAdmin(interaction, services)) return true;
-  const roleId = services.settings.getString("role:ticket_staff");
-  if (!roleId) return false;
   const member = interaction.member as GuildMember | null;
-  return member?.roles.cache.has(roleId) ?? false;
+  return isChurchManager(member, services) || isChurchConsult(member, services);
 }
 
 /**
- * 案件の操作・閲覧が許されるか（§Phase2-3）。
- * 「役職を持っているだけ」では不可。担当者（追加担当を含む）または管理者のみ。
+ * 案件の操作・閲覧が許されるか（§Phase2-3 / §5-6）。
+ * 「新着通知でメンションされただけ」では不可。以下のみ:
+ * - 管理者
+ * - 冥教会管理ロール（大司教）＝全トート案件を管理・介入できる
+ * - 主担当（claimed_by）
+ * - 案件へ正式に追加された担当者（追加運営・裁判所・緊急対応担当を含む）
  */
 function canOperate(interaction: Interaction, services: Services, id: number): boolean {
   if (isAdmin(interaction, services)) return true;
+  if (isChurchManager(interaction.member as GuildMember | null, services)) return true;
   // 主担当(claimed_by) は常に可（Phase 2 以前に claim され assignees 未登録の旧案件も救済）
   if (services.confessions.get(id)?.claimed_by === interaction.user.id) return true;
   return services.confessions.isAssignee(id, interaction.user.id);
@@ -389,6 +407,7 @@ function managementControls(id: number, row: ConfessionRow): ActionRowBuilder<Bu
     new ButtonBuilder().setCustomId(`mimi:disp:${id}`).setLabel("対応先").setEmoji("📍").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`mimi:stage:${id}`).setLabel("状態").setEmoji("🔄").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`mimi:assign:${id}`).setLabel("担当者").setEmoji("👥").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`mimi:callbishop:${id}`).setLabel("大司教を呼ぶ").setEmoji("⛪").setStyle(ButtonStyle.Secondary),
   );
   // 送致状況で裁判所ボタンの意味を切り替える
   let courtBtn: ButtonBuilder;
@@ -426,6 +445,69 @@ async function threadLog(client: Client, services: Services, id: number, line: s
   if (!row?.thread_id) return;
   const thread = await client.channels.fetch(row.thread_id).catch(() => null);
   if (thread?.isThread()) await thread.send({ content: line, allowedMentions: { parse: [] } }).catch(() => undefined);
+}
+
+/**
+ * 引継ぎ・呼び出しの「見出しだけ」を通知するチャンネルへ、本文を含めずに掲示する（§5/§7）。
+ * 通知されたロールへ自動で案件閲覧権は与えない。閲覧・対応するには正式な担当追加が必要。
+ * 掲示先は channel:handoff_notify、無ければ channel:confession。どちらも無ければ掲示しない。
+ * @returns 通知したロール数（0=未通知）
+ */
+async function postHandoffNotice(
+  client: Client,
+  services: Services,
+  id: number,
+  opts: { title: string; roleIds: string[]; note?: string; color?: number },
+): Promise<number> {
+  if (opts.roleIds.length === 0) return 0;
+  const chId = services.settings.getString("channel:handoff_notify") ?? services.settings.getString("channel:confession");
+  if (!chId) return 0;
+  const ch = await client.channels.fetch(chId).catch(() => null);
+  if (!ch?.isTextBased() || !("send" in ch)) return 0;
+  const row = services.confessions.get(id);
+  const embed = new EmbedBuilder()
+    .setColor(opts.color ?? PANEL_COLOR)
+    .setTitle(opts.title)
+    .setDescription(
+      [
+        `案件：**${recordNo(id)}**`,
+        opts.note ?? "",
+        row?.thread_id ? `対応スレッド：<#${row.thread_id}>（閲覧には正式な担当追加が必要です）` : "",
+        "> ※ 相談本文は含まれていません。通知されただけでは案件を閲覧できません。",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  const mention = roleMention(opts.roleIds);
+  await ch
+    .send({ content: mention.content, embeds: [embed], allowedMentions: { roles: mention.roleIds } })
+    .catch(() => undefined);
+  return opts.roleIds.length;
+}
+
+/** 対応先変更の通知（§7）。record は通知なし。通知内容は EventLog にも記録する */
+async function notifyDispositionChange(
+  client: Client,
+  services: Services,
+  id: number,
+  disp: Disposition,
+  actorId: string,
+): Promise<number> {
+  const roleIds = notifyRoleIdsForDisposition(services, disp);
+  if (roleIds.length === 0) return 0;
+  const label = DISPO_META[disp]?.label ?? disp;
+  const n = await postHandoffNotice(client, services, id, {
+    title: `📍 対応先の変更：${label}`,
+    roleIds,
+    note: `<@${actorId}> が対応先を「${label}」へ変更しました。`,
+    color: disp === "emergency" ? 0xdc2626 : PANEL_COLOR,
+  });
+  services.events.log("confession_disposition_notify", {
+    actor: actorId,
+    payload: { id, disposition: disp, roleIds, notified: n },
+  });
+  await threadLog(client, services, id, `📣 対応先「${label}」の担当ロール（${n}件）へ通知しました。`);
+  return n;
 }
 
 // ─────────────────────────────────────────────────────
@@ -508,10 +590,31 @@ export async function handleConfessionButton(interaction: ButtonInteraction, ser
     case "reopen":
       await opGuarded(() => reopenConfession(interaction, services, id));
       return;
+    case "callbishop":
+      // §4 手動で大司教（冥教会管理ロール）へ介入を要請する。閲覧権は与えず見出しのみ通知
+      await opGuarded(async () => {
+        const roleIds = getRoleIds(services, "church_manage");
+        if (roleIds.length === 0) {
+          await interaction.reply({
+            content: "冥教会管理ロール（大司教）が未設定です。/管理 → 設定 → 機関ロール で設定してください。",
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+        const n = await postHandoffNotice(interaction.client, services, id, {
+          title: "⛪ 大司教への介入要請",
+          roleIds,
+          note: `<@${interaction.user.id}> が大司教の介入を要請しました。`,
+        });
+        services.events.log("confession_call_bishop", { actor: interaction.user.id, payload: { id, notified: n } });
+        await threadLog(interaction.client, services, id, `⛪ <@${interaction.user.id}> が大司教の介入を要請しました（${n}件へ通知）。`);
+        await interaction.reply({ content: `⛪ 大司教へ介入を要請しました（${n}ロールへ通知）。`, flags: MessageFlags.Ephemeral });
+      });
+      return;
     case "purgenow":
-      // 本文の手動削除は管理者のみ（限定された管理者による手動purge・§Phase2-5）
-      if (!isAdmin(interaction, services)) {
-        await interaction.reply({ content: "本文の削除は管理者のみ可能です。", flags: MessageFlags.Ephemeral });
+      // 本文の手動削除は大司教（冥教会管理）または管理者（§6 本文の手動purge / §Phase2-5）
+      if (!isAdmin(interaction, services) && !isChurchManager(interaction.member as GuildMember | null, services)) {
+        await interaction.reply({ content: "本文の削除は大司教または管理者のみ可能です。", flags: MessageFlags.Ephemeral });
         return;
       }
       services.confessions.purgeBody(id, interaction.user.id);
@@ -520,8 +623,9 @@ export async function handleConfessionButton(interaction: ButtonInteraction, ser
       await interaction.reply({ content: "🗑️ 相談本文を削除しました（案件番号・操作ログは残ります）。", flags: MessageFlags.Ephemeral });
       return;
     case "extend":
-      if (!isAdmin(interaction, services)) {
-        await interaction.reply({ content: "保持延長は管理者のみ可能です。", flags: MessageFlags.Ephemeral });
+      // 本文の保持延長は大司教（冥教会管理）または管理者（§6 本文の保持延長）
+      if (!isAdmin(interaction, services) && !isChurchManager(interaction.member as GuildMember | null, services)) {
+        await interaction.reply({ content: "保持延長は大司教または管理者のみ可能です。", flags: MessageFlags.Ephemeral });
         return;
       }
       await interaction.showModal(extendModal(id));
@@ -627,6 +731,7 @@ export async function handleConfessionStringSelect(
       await interaction.update({ content: "担当者または管理者のみ操作できます。", components: [] });
       return;
     }
+    const prevDisp = services.confessions.get(id)?.disposition ?? null;
     const disp = interaction.values[0] as Disposition;
     services.confessions.setDisposition(id, disp, interaction.user.id);
     await threadLog(
@@ -635,8 +740,14 @@ export async function handleConfessionStringSelect(
       id,
       `📍 <@${interaction.user.id}> が対応先を「${DISPO_META[disp].emoji} ${DISPO_META[disp].label}」へ変更しました。`,
     );
+    // §7 対応先が実際に変わったときだけ、変更先ロールへ通知（同一値・パネル更新では再通知しない）
+    let notice = "";
+    if (prevDisp !== disp) {
+      const notified = await notifyDispositionChange(interaction.client, services, id, disp, interaction.user.id);
+      if (notified > 0) notice = `（${notified}ロールへ通知）`;
+    }
     await refreshPanel(interaction.client, services, id);
-    await interaction.update({ content: `📍 対応先を「${DISPO_META[disp].label}」に設定しました。`, components: [] });
+    await interaction.update({ content: `📍 対応先を「${DISPO_META[disp].label}」に設定しました。${notice}`, components: [] });
     return;
   }
 
@@ -780,13 +891,14 @@ export async function handleConfessionModal(interaction: ModalSubmitInteraction,
     const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`mimi:claim:${row.id}`).setLabel("対応する").setEmoji("🤝").setStyle(ButtonStyle.Primary),
     );
-    const staffRoleId = services.settings.getString("role:ticket_staff");
+    // §4 投稿種別ごとに、その種別に設定されたロールだけを通知する（大司教は通常新着では呼ばない）
+    const mention = roleMention(notifyRoleIdsForType(services, row.type as ConfessionType | null));
     await (ch as TextChannel)
       .send({
-        content: staffRoleId ? `<@&${staffRoleId}>` : undefined,
+        content: mention.content,
         embeds: [embed],
         components: [controls],
-        allowedMentions: { roles: staffRoleId ? [staffRoleId] : [] },
+        allowedMentions: { roles: mention.roleIds },
       })
       .catch(() => undefined);
 
