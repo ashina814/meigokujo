@@ -183,10 +183,16 @@ export function startInternalApi(services: Services): void {
     console.warn(`${LOG} ECONOMY_API_TOKEN が未設定のため内部APIを起動しません（無認証公開を避けるため）`);
     return;
   }
-  const host = process.env.ECONOMY_API_HOST ?? "172.17.0.1";
+  // 待受アドレスはカンマ区切りで複数指定できる。
+  // ログBotは独自のcomposeネットワーク上にいるため、docker0(172.17.0.1)だけでは
+  // Dockerのネットワーク間分離により到達できない。各ブリッジのゲートウェイを列挙する。
+  const hosts = (process.env.ECONOMY_API_HOST ?? "172.17.0.1")
+    .split(",")
+    .map((h) => h.trim())
+    .filter(Boolean);
   const port = Number(process.env.ECONOMY_API_PORT ?? 8787);
 
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+  const handler = (req: IncomingMessage, res: ServerResponse) => {
     try {
       // 読み取り専用APIなので GET 以外は受け付けない
       if (req.method !== "GET") return json(res, 405, { error: "method_not_allowed" });
@@ -197,7 +203,7 @@ export function startInternalApi(services: Services): void {
         return json(res, 401, { error: "unauthorized" });
       }
 
-      const url = new URL(req.url ?? "/", `http://${host}:${port}`);
+      const url = new URL(req.url ?? "/", `http://internal:${port}`);
       switch (url.pathname) {
         case "/internal/v1/health":
           return handleHealth(services, url, res);
@@ -212,10 +218,13 @@ export function startInternalApi(services: Services): void {
       console.error(`${LOG} リクエスト処理に失敗:`, e);
       json(res, 500, { error: "internal_error" });
     }
-  });
+  };
 
-  server.on("error", (e) => console.error(`${LOG} サーバエラー:`, e));
-  server.listen(port, host, () => {
-    console.log(`${LOG} 読み取り専用APIを起動: http://${host}:${port}/internal/v1/ （Bearer認証・ホスト内限定）`);
-  });
+  for (const host of hosts) {
+    const server = createServer(handler);
+    server.on("error", (e) => console.error(`${LOG} ${host}:${port} でサーバエラー:`, e));
+    server.listen(port, host, () => {
+      console.log(`${LOG} 読み取り専用APIを起動: http://${host}:${port}/internal/v1/ （Bearer認証・ホスト内限定）`);
+    });
+  }
 }
