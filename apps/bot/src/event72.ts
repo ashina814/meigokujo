@@ -218,7 +218,8 @@ let movePending = false;
 /** 既存パネルを編集。無ければ新規投稿。常に1件だけ残す */
 async function updatePanel(client: Client, services: Services, opts: { repost?: boolean } = {}): Promise<void> {
   if (panelBusy) {
-    movePending = true;
+    // 追従(repost)要求だけは取りこぼさない。単なる再描画は次の定期更新で追いつくので捨てる
+    if (opts.repost) movePending = true;
     return;
   }
   panelBusy = true;
@@ -341,8 +342,20 @@ export function handleEvent72Voice(oldState: VoiceState, newState: VoiceState, s
     const total = state.voiceParticipation[member.id] ?? 0;
     console.log(`${LOG} VC退室: ${member.user.tag} / 今回 ${sec}秒 / 通算 ${total}秒`);
   }
-  // 状態表示を早めに反映（レート制限に配慮して編集のみ）
-  void updatePanel(newState.client, services).catch(() => undefined);
+  // 状態表示を反映。入退室が連続してもGIF再生成と編集が集中しないよう5秒に集約する
+  scheduleVcRefresh(newState.client, services);
+}
+
+let vcRefreshTimer: NodeJS.Timeout | null = null;
+
+/** VC状態変化によるパネル再描画をまとめる（レート制限とCPUの保護） */
+function scheduleVcRefresh(client: Client, services: Services): void {
+  if (vcRefreshTimer) return; // 既に予約済みなら束ねる
+  vcRefreshTimer = setTimeout(() => {
+    vcRefreshTimer = null;
+    if (Date.now() >= END_MS) return;
+    void updatePanel(client, services).catch(() => undefined);
+  }, 5000);
 }
 
 /** 起動時、既に対象VCにいる人のセッションを復旧する */
