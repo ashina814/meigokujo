@@ -230,10 +230,18 @@ async function updatePanel(client: Client, services: Services, opts: { repost?: 
     const nowMs = Date.now();
     const payload = buildPanel(client, nowMs);
 
-    // 添付の差し替えは editでは行わない。
-    // edit + attachments:[] は新規アップロードが本文に紐づかず 403 の壊れ画像になり、
-    // attachments を省くと編集のたびに添付が積み上がって上限(10)で失敗する。
-    // send は必ず正しく添付されるため、毎回「新規投稿 → 旧パネル削除」で1件を維持する。
+    // 定期更新は「その場で編集」。パネルが毎分下へ飛ぶのを避け、追従はユーザー発言時だけにする。
+    // attachments:[] で旧添付を必ず破棄する（省略すると編集のたびに積み上がり上限10で失敗する）。
+    // 新しい添付は embed から attachment:// で参照され、Discord側でembedへ取り込まれる。
+    if (!opts.repost && state.panelMessageId) {
+      const msg = await channel.messages.fetch(state.panelMessageId).catch(() => null);
+      if (msg) {
+        await msg.edit({ ...payload, attachments: [] });
+        return;
+      }
+      console.warn(`${LOG} 既存パネル(${state.panelMessageId})が見つかりません。新規投稿します`);
+    }
+
     const sent = await channel.send(payload);
     const oldId = state.panelMessageId;
     state.panelMessageId = sent.id;
