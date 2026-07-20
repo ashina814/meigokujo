@@ -230,23 +230,16 @@ async function updatePanel(client: Client, services: Services, opts: { repost?: 
     const nowMs = Date.now();
     const payload = buildPanel(client, nowMs);
 
-    if (!opts.repost && state.panelMessageId) {
-      const msg = await channel.messages.fetch(state.panelMessageId).catch(() => null);
-      if (msg) {
-        // attachments:[] で既存の添付を必ず破棄する。付けないと編集のたびに添付が積み上がり、
-        // 同名参照(attachment://countdown.gif)が古い画像に解決されてカウントダウンが止まって見える
-        await msg.edit({ ...payload, attachments: [] });
-        return;
-      }
-      console.warn(`${LOG} 既存パネル(${state.panelMessageId})が見つかりません。新規投稿します`);
-    }
-
+    // 添付の差し替えは editでは行わない。
+    // edit + attachments:[] は新規アップロードが本文に紐づかず 403 の壊れ画像になり、
+    // attachments を省くと編集のたびに添付が積み上がって上限(10)で失敗する。
+    // send は必ず正しく添付されるため、毎回「新規投稿 → 旧パネル削除」で1件を維持する。
     const sent = await channel.send(payload);
     const oldId = state.panelMessageId;
     state.panelMessageId = sent.id;
     state.lastPanelMoveAt = nowMs;
     saveState(services, state);
-    console.log(`${LOG} パネル${opts.repost ? "再投稿(追従)" : "作成"}: ${sent.id}`);
+    console.log(`${LOG} パネル${opts.repost ? "再投稿(追従)" : "更新"}: ${sent.id}`);
 
     if (oldId && oldId !== sent.id) {
       const old = await channel.messages.fetch(oldId).catch(() => null);
@@ -288,6 +281,7 @@ export function handleEvent72Message(message: Message, services: Services): void
   if (message.channelId !== EVENT_CONFIG.panelChannelId) return;
   if (message.author.bot) return; // 自分の投稿で無限ループしない
   const nowMs = Date.now();
+  if (nowMs < FINAL_START_MS) return; // 最終24時間より前は何も出さない
   if (nowMs >= END_MS) return;
   if (phaseAt(nowMs) === "one") return; // 残り1分は再投稿による事故を避けて追従停止
   const state = loadState(services);
@@ -355,7 +349,7 @@ function scheduleVcRefresh(client: Client, services: Services): void {
     vcRefreshTimer = null;
     if (Date.now() >= END_MS) return;
     void updatePanel(client, services).catch(() => undefined);
-  }, 5000);
+  }, 15000);
 }
 
 /** 起動時、既に対象VCにいる人のセッションを復旧する */
