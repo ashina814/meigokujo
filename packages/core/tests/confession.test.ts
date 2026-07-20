@@ -132,11 +132,12 @@ describe("Confessions", () => {
     });
     expect(r1?.court_status).toBe("pending_consent");
     expect(r1?.court_category).toBe("criminal");
-    expect(r1?.stage).toBe("court_review");
+    // 裁判所送致は会話状態(stage)を書き換えない（付帯情報として別欄で扱う）
+    expect(r1?.stage).toBe("active");
     const r2 = ctx.confessions.recordCourtPost(row.id, { threadId: "court:9", url: "https://x/9", staffId: "user:staff" });
     expect(r2?.court_status).toBe("sent");
     expect(r2?.court_thread_id).toBe("court:9");
-    expect(r2?.stage).toBe("court_sent");
+    expect(r2?.stage).toBe("active");
     const r3 = ctx.confessions.setCourtCaseNo(row.id, "冥府刑事第003号", "user:staff");
     expect(r3?.court_case_no).toBe("冥府刑事第003号");
     const r4 = ctx.confessions.cancelCourtReferral(row.id, "user:staff");
@@ -158,7 +159,8 @@ describe("Confessions", () => {
       note: null,
     });
     expect(emg.status).toBe("open");
-    expect(ctx.confessions.get(row.id)?.stage).toBe("emergency");
+    // 緊急共有も会話状態を書き換えない（付帯情報として embed 側で表示する）
+    expect(ctx.confessions.get(row.id)?.stage).toBe("active");
     expect(ctx.confessions.openEmergencyFor(row.id)?.id).toBe(emg.id);
     const confirmed = ctx.confessions.confirmEmergency(emg.id, "user:emgstaff");
     expect(confirmed?.status).toBe("confirmed");

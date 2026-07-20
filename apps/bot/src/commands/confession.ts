@@ -106,14 +106,17 @@ function wishText(code: string | null): string {
   return m ? `${m.emoji} ${m.label}` : "（未選択）";
 }
 // ── 状態(stage)・対応先(disposition)・クローズ理由 の表示定義（Phase 2） ──
+// 表示定義は既存 stage 値の後方互換のため全て残す。ただし新規案件で書き込まれる stage は
+// active / awaiting_poster / awaiting_staff の3種のみ（会話状態は5種類: 未対応/対応中/
+// 投稿者からの返信待ち/担当者からの返信待ち/終結）。裁判所送致と緊急共有は別欄で表示する。
 const STAGE_META: Record<ConfessionStage, string> = {
   active: "🤝 対応中",
   awaiting_poster: "⏳ 投稿者からの返信待ち",
   awaiting_staff: "📥 担当者からの返信待ち",
-  handoff: "🏰 外部への引継ぎ中",
-  court_review: "⚖️ 裁判所への送致確認中",
-  court_sent: "⚖️ 裁判所へ送致済み",
-  emergency: "🚨 緊急対応中",
+  handoff: "🤝 対応中（旧: 外部引継ぎ中）",
+  court_review: "🤝 対応中（旧: 裁判所送致確認中）",
+  court_sent: "🤝 対応中（旧: 裁判所送致済み・現在は付帯情報として表示）",
+  emergency: "🤝 対応中（旧: 緊急対応中・現在は付帯情報として表示）",
 };
 
 const DISPO_META: Record<Disposition, { emoji: string; label: string }> = {
@@ -128,14 +131,11 @@ const DISPO_META: Record<Disposition, { emoji: string; label: string }> = {
 // 新規案件で選べる対応先（5種）。kaiwa は廃止したため含めない
 const DISPO_ORDER: Disposition[] = ["church", "normal", "court", "emergency", "record"];
 
+// 補助操作（管理者用）の手動変更セレクトで選べる状態。会話状態の5種のみ。
 const STAGE_ORDER: ConfessionStage[] = [
   "active",
   "awaiting_poster",
   "awaiting_staff",
-  "handoff",
-  "court_review",
-  "court_sent",
-  "emergency",
 ];
 
 const CLOSE_META: Record<CloseReason, string> = {
@@ -145,16 +145,19 @@ const CLOSE_META: Record<CloseReason, string> = {
   handoff_normal: "通常運営へ引き継いだ",
   handoff_kaiwa: "諧和廷へ連携した（旧運用）",
   sent_court: "冥府裁判所へ送致した",
+  info_only: "情報提供として記録した",
   no_action: "対応不要と判断した",
   other: "その他",
 };
-// 新規クローズで選べる理由。handoff_kaiwa（諧和廷連携）は廃止したため含めない（既存表示用に META は残す）
+// 新規クローズで選べる理由。旧「対応先=記録のみ」は info_only の終了理由で表現する。
+// handoff_kaiwa は廃止済（既存表示用に META は残す）
 const CLOSE_ORDER: CloseReason[] = [
   "resolved",
   "poster_ended",
   "no_response",
   "handoff_normal",
   "sent_court",
+  "info_only",
   "no_action",
   "other",
 ];
@@ -328,19 +331,30 @@ function isConfessionStaff(interaction: ButtonInteraction | RoleSelectMenuIntera
 }
 
 /**
- * 案件の操作・閲覧が許されるか（§Phase2-3 / §5-6）。
+ * 案件の操作・閲覧が許されるか。
  * 「新着通知でメンションされただけ」では不可。以下のみ:
  * - 管理者
- * - 冥教会管理ロール（大司教）＝全トート案件を管理・介入できる
  * - 主担当（claimed_by）
- * - 案件へ正式に追加された担当者（追加運営・裁判所・緊急対応担当を含む）
+ * - 案件へ正式に追加された担当者
+ * - 大司祭（冥教会管理ロール）は、相談・懺悔の案件のみ自動で監督できる。
+ *   意見・報告・緊急・裁判所案件などは「支援を求める」から相談要請が入って共同担当に
+ *   追加された場合のみアクセスできる（役職を持っているだけでは閲覧できない）。
  */
 function canOperate(interaction: Interaction, services: Services, id: number): boolean {
   if (isAdmin(interaction, services)) return true;
-  if (isChurchManager(interaction.member as GuildMember | null, services)) return true;
+  const row = services.confessions.get(id);
+  if (!row) return false;
   // 主担当(claimed_by) は常に可（Phase 2 以前に claim され assignees 未登録の旧案件も救済）
-  if (services.confessions.get(id)?.claimed_by === interaction.user.id) return true;
-  return services.confessions.isAssignee(id, interaction.user.id);
+  if (row.claimed_by === interaction.user.id) return true;
+  if (services.confessions.isAssignee(id, interaction.user.id)) return true;
+  // 大司祭の自動監督範囲は「相談・懺悔」のみに限定
+  if (
+    isChurchManager(interaction.member as GuildMember | null, services) &&
+    (row.type === "soudan" || row.type === "zange")
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /** 本文の表示。purge済みなら削除された旨を出す（§Phase2-5） */
@@ -351,9 +365,22 @@ function bodyOrPurgeNotice(row: ConfessionRow): string {
   return `## 届いた声\n${(row.body ?? "（本文の記録なし）").slice(0, 3800)}`;
 }
 
-/** 対応スレッドの管理パネル embed（案件の現状を一覧表示）。担当者IDのみ表示、投稿者IDは出さない */
-function buildCaseEmbed(row: ConfessionRow, assigneeIds: string[]): EmbedBuilder {
-  const color = row.type === "kinkyu" || row.stage === "emergency" ? 0xdc2626 : row.status === "closed" ? 0x6b7280 : PANEL_COLOR;
+/**
+ * 対応スレッドの管理パネル embed。担当者IDのみ表示し、投稿者IDは出さない。
+ * 「対応先」欄は廃止済のため、既存案件で値がある場合だけ「旧設定」として表示する。
+ * 裁判所送致・緊急共有は会話状態ではなく付帯情報として別欄で示す。
+ */
+function buildCaseEmbed(
+  row: ConfessionRow,
+  assigneeIds: string[],
+  extras: { hasOpenEmergency?: boolean } = {},
+): EmbedBuilder {
+  const color =
+    row.type === "kinkyu" || extras.hasOpenEmergency
+      ? 0xdc2626
+      : row.status === "closed"
+        ? 0x6b7280
+        : PANEL_COLOR;
   const staff = assigneeIds.length > 0 ? assigneeIds.map((u) => `<@${u}>`).join("・") : row.claimed_by ? `<@${row.claimed_by}>` : "—";
   const embed = new EmbedBuilder()
     .setColor(color)
@@ -363,9 +390,15 @@ function buildCaseEmbed(row: ConfessionRow, assigneeIds: string[]): EmbedBuilder
       { name: "返信希望", value: wishText(row.reply_wish), inline: true },
       { name: "状態", value: statusText(row), inline: true },
       { name: "担当者", value: staff, inline: true },
-      { name: "対応先", value: dispoText(row.disposition), inline: true },
       { name: "受付日時", value: jstStamp(row.created_at), inline: true },
     );
+  if (extras.hasOpenEmergency) {
+    embed.addFields({ name: "緊急共有", value: "🚨 登録あり（別ロールへ確認要請中）", inline: true });
+  }
+  // 旧「対応先」は新規UIから廃止。既存案件で値が残っているものだけ「旧設定」として可視化する。
+  if (row.disposition) {
+    embed.addFields({ name: "対応先（旧設定）", value: dispoText(row.disposition), inline: true });
+  }
   // 送致済みなら送致先を出す
   if (row.court_case_no || row.court_url || row.court_thread_id) {
     const link = row.court_url ?? (row.court_thread_id ? `<#${row.court_thread_id}>` : "—");
@@ -388,13 +421,23 @@ function buildCaseEmbed(row: ConfessionRow, assigneeIds: string[]): EmbedBuilder
   return embed;
 }
 
-/** 管理パネルの操作ボタン。閉じている案件は再オープンのみ */
+/**
+ * 管理パネルの操作ボタン。
+ *
+ * 通常担当者向けは 5操作へ絞る（§整理後の管理パネル案）:
+ *   [Row1] 👥 担当管理 / 🆘 支援を求める / ⚖️ 裁判所へ送致
+ *   [Row2] 🚨 緊急共有 / 🔒 クローズ
+ * 管理者用（権限がない者には表示しない）:
+ *   [Row3] 🛠️ 補助操作 / 📅 保持延長 / 🗑️ 本文を削除
+ *
+ * 状態変更セレクトは通常担当者に常設しない（会話状態は自動更新）。管理者は補助操作から手動変更できる。
+ */
 function managementControls(id: number, row: ConfessionRow): ActionRowBuilder<ButtonBuilder>[] {
   if (row.status === "closed") {
+    // クローズ済み案件: 再オープン中心。本文が残っていれば管理者用の保持延長・削除を並置。
     const btns = [
       new ButtonBuilder().setCustomId(`mimi:reopen:${id}`).setLabel("再オープン").setEmoji("🔓").setStyle(ButtonStyle.Secondary),
     ];
-    // 本文がまだ残っているなら、管理者向けに手動purge・保持延長を出す（§Phase2-5）
     if (row.body && !row.body_purged_at) {
       btns.push(
         new ButtonBuilder().setCustomId(`mimi:extend:${id}`).setLabel("保持延長").setEmoji("📅").setStyle(ButtonStyle.Secondary),
@@ -403,12 +446,7 @@ function managementControls(id: number, row: ConfessionRow): ActionRowBuilder<Bu
     }
     return [new ActionRowBuilder<ButtonBuilder>().addComponents(...btns)];
   }
-  const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`mimi:disp:${id}`).setLabel("対応先").setEmoji("📍").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`mimi:stage:${id}`).setLabel("状態").setEmoji("🔄").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`mimi:assign:${id}`).setLabel("担当者").setEmoji("👥").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`mimi:callbishop:${id}`).setLabel("大司教を呼ぶ").setEmoji("⛪").setStyle(ButtonStyle.Secondary),
-  );
+
   // 送致状況で裁判所ボタンの意味を切り替える
   let courtBtn: ButtonBuilder;
   if (row.court_status === "sent") {
@@ -418,12 +456,21 @@ function managementControls(id: number, row: ConfessionRow): ActionRowBuilder<Bu
   } else {
     courtBtn = new ButtonBuilder().setCustomId(`mimi:court:${id}`).setLabel("裁判所へ送致").setEmoji("⚖️").setStyle(ButtonStyle.Secondary);
   }
-  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+
+  const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`mimi:assign:${id}`).setLabel("担当管理").setEmoji("👥").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`mimi:support:${id}`).setLabel("支援を求める").setEmoji("🆘").setStyle(ButtonStyle.Primary),
     courtBtn,
-    new ButtonBuilder().setCustomId(`mimi:emg:${id}`).setLabel("緊急対応").setEmoji("🚨").setStyle(ButtonStyle.Danger),
+  );
+  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`mimi:emg:${id}`).setLabel("緊急共有").setEmoji("🚨").setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId(`mimi:close:${id}`).setLabel("クローズ").setEmoji("🔒").setStyle(ButtonStyle.Danger),
   );
-  return [row1, row2];
+  // 管理者用は「補助操作」に集約し、通常UIから隠す（実際の権限判定は各ハンドラで再確認）
+  const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`mimi:admin:${id}`).setLabel("補助操作").setEmoji("🛠️").setStyle(ButtonStyle.Secondary),
+  );
+  return [row1, row2, row3];
 }
 
 /** スレッドの管理パネル（panel_msg_id）を現状で描き直す */
@@ -435,7 +482,14 @@ async function refreshPanel(client: Client, services: Services, id: number): Pro
   const msg = await thread.messages.fetch(row.panel_msg_id).catch(() => null);
   if (!msg) return;
   await msg
-    .edit({ embeds: [buildCaseEmbed(row, services.confessions.assignees(id))], components: managementControls(id, row) })
+    .edit({
+      embeds: [
+        buildCaseEmbed(row, services.confessions.assignees(id), {
+          hasOpenEmergency: !!services.confessions.openEmergencyFor(id),
+        }),
+      ],
+      components: managementControls(id, row),
+    })
     .catch(() => undefined);
 }
 
@@ -573,11 +627,19 @@ export async function handleConfessionButton(interaction: ButtonInteraction, ser
   };
 
   switch (action) {
+    // 旧「対応先」ボタン。新規UIから廃止したが、旧メッセージの押下で例外にしないため no-op ephemeral で応答
     case "disp":
-      await opGuarded(() => interaction.reply({ ...dispSelectMsg(id), flags: MessageFlags.Ephemeral }));
+      await interaction.reply({
+        content: "「対応先」の設定は廃止されました。担当者の追加は 👥 担当管理、他機関への通知は 🆘 支援を求める、送致は ⚖️ 裁判所へ送致 をご利用ください。",
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     case "stage":
-      await opGuarded(() => interaction.reply({ ...stageSelectMsg(id), flags: MessageFlags.Ephemeral }));
+      // 状態は自動更新される。管理者用の手動変更は 🛠️ 補助操作 経由でのみ提供する
+      await interaction.reply({
+        content: "会話状態は操作から自動更新されます。手動で変更する場合は 🛠️ 補助操作 からお願いします。",
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     case "assign":
       await opGuarded(() =>
@@ -590,31 +652,34 @@ export async function handleConfessionButton(interaction: ButtonInteraction, ser
     case "reopen":
       await opGuarded(() => reopenConfession(interaction, services, id));
       return;
+    // 旧「大司教を呼ぶ」ボタン。押下時は新しい「支援を求める」フローへ案内する
     case "callbishop":
-      // §4 手動で大司教（冥教会管理ロール）へ介入を要請する。閲覧権は与えず見出しのみ通知
-      await opGuarded(async () => {
-        const roleIds = getRoleIds(services, "church_manage");
-        if (roleIds.length === 0) {
-          await interaction.reply({
-            content: "冥教会管理ロール（大司教）が未設定です。/管理 → 設定 → 機関ロール で設定してください。",
-            flags: MessageFlags.Ephemeral,
-          });
-          return;
-        }
-        const n = await postHandoffNotice(interaction.client, services, id, {
-          title: "⛪ 大司教への介入要請",
-          roleIds,
-          note: `<@${interaction.user.id}> が大司教の介入を要請しました。`,
-        });
-        services.events.log("confession_call_bishop", { actor: interaction.user.id, payload: { id, notified: n } });
-        await threadLog(interaction.client, services, id, `⛪ <@${interaction.user.id}> が大司教の介入を要請しました（${n}件へ通知）。`);
-        await interaction.reply({ content: `⛪ 大司教へ介入を要請しました（${n}ロールへ通知）。`, flags: MessageFlags.Ephemeral });
+      await interaction.reply({
+        content: "「大司祭を呼ぶ」は 🆘 支援を求める に統合されました。そちらから「大司祭へ監督相談」を選んでください。",
+        flags: MessageFlags.Ephemeral,
       });
       return;
+    case "support":
+      await opGuarded(() =>
+        interaction.reply({ ...supportSelectMsg(id), flags: MessageFlags.Ephemeral }),
+      );
+      return;
+    case "accept":
+      // 支援の引き受け（対象ロールを持つ人が押す）。担当追加とスレッド参加まで一気通貫
+      await handleAcceptSupport(interaction, services);
+      return;
+    case "admin":
+      // 補助操作パネル。管理者以外はここで弾く（通常UIから直接見えないよう button だけは残す）
+      if (!isAdmin(interaction, services)) {
+        await interaction.reply({ content: "🛠️ 補助操作は管理者のみ利用できます。", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await interaction.reply({ ...adminSubPanelMsg(id), flags: MessageFlags.Ephemeral });
+      return;
     case "purgenow":
-      // 本文の手動削除は大司教（冥教会管理）または管理者（§6 本文の手動purge / §Phase2-5）
-      if (!isAdmin(interaction, services) && !isChurchManager(interaction.member as GuildMember | null, services)) {
-        await interaction.reply({ content: "本文の削除は大司教または管理者のみ可能です。", flags: MessageFlags.Ephemeral });
+      // 本文の即時削除は管理者のみ（大司祭には本操作を認めない）
+      if (!isAdmin(interaction, services)) {
+        await interaction.reply({ content: "本文の削除は管理者のみ可能です。", flags: MessageFlags.Ephemeral });
         return;
       }
       services.confessions.purgeBody(id, interaction.user.id);
@@ -623,9 +688,12 @@ export async function handleConfessionButton(interaction: ButtonInteraction, ser
       await interaction.reply({ content: "🗑️ 相談本文を削除しました（案件番号・操作ログは残ります）。", flags: MessageFlags.Ephemeral });
       return;
     case "extend":
-      // 本文の保持延長は大司教（冥教会管理）または管理者（§6 本文の保持延長）
-      if (!isAdmin(interaction, services) && !isChurchManager(interaction.member as GuildMember | null, services)) {
-        await interaction.reply({ content: "保持延長は大司教または管理者のみ可能です。", flags: MessageFlags.Ephemeral });
+      // 保持延長は管理者、または大司祭（担当している冥教会案件のみ canOperate 経由で通す）
+      if (
+        !isAdmin(interaction, services) &&
+        !(isChurchManager(interaction.member as GuildMember | null, services) && canOperate(interaction, services, id))
+      ) {
+        await interaction.reply({ content: "保持延長は管理者または大司祭のみ可能です。", flags: MessageFlags.Ephemeral });
         return;
       }
       await interaction.showModal(extendModal(id));
@@ -725,43 +793,36 @@ export async function handleConfessionStringSelect(
 
   const id = Number(parts[2]);
 
-  // ── 対応先の確定（§Phase2-1） ──
+  // ── 旧「対応先」セレクト。廃止済のため no-op で応答（旧メッセージでもエラーにしない） ──
   if (action === "dispset") {
-    if (!canOperate(interaction, services, id)) {
-      await interaction.update({ content: "担当者または管理者のみ操作できます。", components: [] });
-      return;
-    }
-    const prevDisp = services.confessions.get(id)?.disposition ?? null;
-    const disp = interaction.values[0] as Disposition;
-    services.confessions.setDisposition(id, disp, interaction.user.id);
-    await threadLog(
-      interaction.client,
-      services,
-      id,
-      `📍 <@${interaction.user.id}> が対応先を「${DISPO_META[disp].emoji} ${DISPO_META[disp].label}」へ変更しました。`,
-    );
-    // §7 対応先が実際に変わったときだけ、変更先ロールへ通知（同一値・パネル更新では再通知しない）
-    let notice = "";
-    if (prevDisp !== disp) {
-      const notified = await notifyDispositionChange(interaction.client, services, id, disp, interaction.user.id);
-      if (notified > 0) notice = `（${notified}ロールへ通知）`;
-    }
-    await refreshPanel(interaction.client, services, id);
-    await interaction.update({ content: `📍 対応先を「${DISPO_META[disp].label}」に設定しました。${notice}`, components: [] });
+    await interaction.update({
+      content: "「対応先」の設定は廃止されました。担当追加は 👥 担当管理、他機関への支援要請は 🆘 支援を求める をご利用ください。",
+      components: [],
+    });
     return;
   }
 
-  // ── 状態の変更（§Phase2-2） ──
+  // ── 状態の手動変更（管理者用・補助操作から到達）──
   if (action === "stageset") {
-    if (!canOperate(interaction, services, id)) {
-      await interaction.update({ content: "担当者または管理者のみ操作できます。", components: [] });
+    if (!isAdmin(interaction, services)) {
+      await interaction.update({ content: "手動での状態変更は管理者のみ利用できます（通常は自動更新されます）。", components: [] });
       return;
     }
     const stage = interaction.values[0] as ConfessionStage;
     services.confessions.setStage(id, stage, interaction.user.id);
-    await threadLog(interaction.client, services, id, `🔄 <@${interaction.user.id}> が状態を「${STAGE_META[stage]}」へ変更しました。`);
+    await threadLog(interaction.client, services, id, `🔄 <@${interaction.user.id}> が状態を「${STAGE_META[stage]}」へ手動変更しました。`);
     await refreshPanel(interaction.client, services, id);
     await interaction.update({ content: `🔄 状態を「${STAGE_META[stage]}」に変更しました。`, components: [] });
+    return;
+  }
+
+  // ── 🆘 支援を求める セレクト。対象を選ぶ → 引受フローの通知を出す ──
+  if (action === "supset") {
+    if (!canOperate(interaction, services, id)) {
+      await interaction.update({ content: "この案件の担当者、または管理者のみ操作できます。", components: [] });
+      return;
+    }
+    await handleSupportTarget(interaction, services, id, interaction.values[0]!);
     return;
   }
 
@@ -875,7 +936,8 @@ export async function handleConfessionModal(interaction: ModalSubmitInteraction,
       replyWish: wish ?? undefined,
       body: text,
     });
-    // 緊急種別はひと目で分かるよう色を変える
+    // 本文は「対応する」を押した人だけが専用スレッドで見られる。
+    // 通知チャンネルには受付情報だけを載せ、閲覧制限を機能させる（同チャンネル閲覧者への漏洩を防ぐ）。
     const embed = new EmbedBuilder()
       .setAuthor({ name: "👂 トートの耳 — 匿名の囁き" })
       .setColor(type === "kinkyu" ? 0xdc2626 : PANEL_COLOR)
@@ -883,11 +945,11 @@ export async function handleConfessionModal(interaction: ModalSubmitInteraction,
       .addFields(
         { name: "種別", value: typeText(row.type), inline: true },
         { name: "返信希望", value: wishText(row.reply_wish), inline: true },
-        { name: "状態", value: statusText(row), inline: true },
+        { name: "状態", value: "🕯️ 未対応", inline: true },
         { name: "受付日時", value: jstStamp(row.created_at), inline: false },
       )
-      .setDescription(`## 届いた声\n${text.slice(0, 4000)}`)
-      .setFooter({ text: "投稿者は匿名。対応を開始するとトートが仲介します。" });
+      .setDescription("匿名の声が届きました。\n**対応する** を押すと専用スレッドが開き、そこで本文を確認できます。")
+      .setFooter({ text: "投稿者は匿名。本文はスレッドに参加した者だけが読めます。" });
     const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`mimi:claim:${row.id}`).setLabel("対応する").setEmoji("🤝").setStyle(ButtonStyle.Primary),
     );
@@ -1063,7 +1125,11 @@ async function claimConfession(interaction: ButtonInteraction, services: Service
       `🤝 <@${interaction.user.id}> が **${recordNo(id)}** の対応を開始。`,
       "**このスレッドに書くと、トートが投稿者の DM へ匿名で届けます。**（投稿者の正体はトートしか知りません）",
     ].join("\n"),
-    embeds: [buildCaseEmbed(claimed, services.confessions.assignees(id))],
+    embeds: [
+      buildCaseEmbed(claimed, services.confessions.assignees(id), {
+        hasOpenEmergency: !!services.confessions.openEmergencyFor(id),
+      }),
+    ],
     components: managementControls(id, claimed),
   });
   services.confessions.setPanelMsg(id, panel.id);
@@ -1188,28 +1254,8 @@ export async function relayStaffMessage(client: Client, services: Services, mess
 }
 
 // ═════════════════════════════════════════════════════
-// Phase 2: 対応先・状態・担当者・クローズ の選択UI
+// 担当者・クローズ の選択UI（旧「対応先／状態」の常設セレクトは廃止）
 // ═════════════════════════════════════════════════════
-function dispSelectMsg(id: number) {
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`mimi:dispset:${id}`)
-    .setPlaceholder("対応先を選ぶ")
-    .addOptions(
-      DISPO_ORDER.map((code) =>
-        new StringSelectMenuOptionBuilder().setValue(code).setLabel(DISPO_META[code].label).setEmoji(DISPO_META[code].emoji),
-      ),
-    );
-  return { content: "この案件の対応先を選んでください。", components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)] };
-}
-
-function stageSelectMsg(id: number) {
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`mimi:stageset:${id}`)
-    .setPlaceholder("状態を選ぶ")
-    .addOptions(STAGE_ORDER.map((code) => new StringSelectMenuOptionBuilder().setValue(code).setLabel(STAGE_META[code])));
-  return { content: "現在の状態を選んでください。", components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)] };
-}
-
 function closeSelectMsg(id: number) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`mimi:closeset:${id}`)
@@ -1217,6 +1263,213 @@ function closeSelectMsg(id: number) {
     .addOptions(CLOSE_ORDER.map((code) => new StringSelectMenuOptionBuilder().setValue(code).setLabel(CLOSE_META[code])));
   return {
     content: "終了理由を選ぶとクローズします。投稿者へは終了をDMでお知らせします。",
+    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
+  };
+}
+
+// ═════════════════════════════════════════════════════
+// 🆘 支援を求める（運営判断・大司祭相談・別のシスターの共同担当）
+// 3種の"通知だけの連携"を一つのボタンに統合し、押した後の選択で対象を分ける。
+// いずれも「見出しのみ通知 → 引き受ける → 担当追加＋スレッド参加」の同じ流れで処理する。
+// ═════════════════════════════════════════════════════
+type SupportTarget = "ops" | "bishop" | "sister";
+const SUPPORT_META: Record<SupportTarget, { label: string; emoji: string; slot: "normal_ops" | "church_manage" | "church_consult"; header: string; noRole: string }> = {
+  ops: {
+    label: "通常運営へ判断を依頼",
+    emoji: "🏰",
+    slot: "normal_ops",
+    header: "🏰 運営判断の依頼",
+    noRole: "通常運営ロールが未設定です。/管理 → 設定 → 機関ロール で設定してください。",
+  },
+  bishop: {
+    label: "大司祭へ監督相談",
+    emoji: "⛪",
+    slot: "church_manage",
+    header: "⛪ 大司祭への監督相談",
+    noRole: "冥教会管理ロール（大司祭）が未設定です。/管理 → 設定 → 機関ロール で設定してください。",
+  },
+  sister: {
+    label: "別のシスター／修道士を共同担当へ",
+    emoji: "👥",
+    slot: "church_consult",
+    header: "👥 冥教会 相談担当への支援要請",
+    noRole: "相談対応ロール（シスター／修道士）が未設定です。/管理 → 設定 → 機関ロール で設定してください。",
+  },
+};
+
+function supportSelectMsg(id: number) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`mimi:supset:${id}`)
+    .setPlaceholder("誰に支援を求めるか選ぶ")
+    .addOptions(
+      (Object.keys(SUPPORT_META) as SupportTarget[]).map((k) =>
+        new StringSelectMenuOptionBuilder().setValue(k).setLabel(SUPPORT_META[k].label).setEmoji(SUPPORT_META[k].emoji),
+      ),
+    );
+  return {
+    content: [
+      "🆘 **支援を求める**",
+      "対象ロールへ「見出しのみ」の通知を出し、相手が **引き受ける** を押した時点で共同担当へ追加されます。",
+      "通知だけでは案件本文は閲覧できません。",
+    ].join("\n"),
+    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
+  };
+}
+
+async function handleSupportTarget(
+  interaction: StringSelectMenuInteraction,
+  services: Services,
+  id: number,
+  targetStr: string,
+): Promise<void> {
+  const target = targetStr as SupportTarget;
+  const meta = SUPPORT_META[target];
+  if (!meta) {
+    await interaction.update({ content: "不明な支援先です。", components: [] });
+    return;
+  }
+  const roleIds = getRoleIds(services, meta.slot);
+  if (roleIds.length === 0) {
+    await interaction.update({ content: meta.noRole, components: [] });
+    return;
+  }
+  const chId = services.settings.getString("channel:handoff_notify") ?? services.settings.getString("channel:confession");
+  if (!chId) {
+    await interaction.update({ content: "通知先チャンネルが未設定です。", components: [] });
+    return;
+  }
+  const ch = await interaction.client.channels.fetch(chId).catch(() => null);
+  if (!ch?.isTextBased() || !("send" in ch)) {
+    await interaction.update({ content: "通知先チャンネルへ送信できません。", components: [] });
+    return;
+  }
+
+  const row = services.confessions.get(id);
+  const mention = roleMention(roleIds);
+  const embed = new EmbedBuilder()
+    .setColor(PANEL_COLOR)
+    .setTitle(meta.header)
+    .setDescription(
+      [
+        `案件：**${recordNo(id)}**`,
+        `依頼者：<@${interaction.user.id}>`,
+        row?.thread_id ? `対応スレッド：<#${row.thread_id}>` : "",
+        "",
+        "**引き受ける** を押すと、共同担当としてこの案件のスレッドへ追加されます。",
+        "本文はそこで初めて確認できます（通知だけでは閲覧できません）。",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  const accept = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`mimi:accept:${target}:${id}`)
+      .setLabel("引き受ける")
+      .setEmoji("🤝")
+      .setStyle(ButtonStyle.Primary),
+  );
+  await ch
+    .send({ content: mention.content, embeds: [embed], components: [accept], allowedMentions: { roles: mention.roleIds } })
+    .catch(() => undefined);
+
+  services.events.log("confession_support_request", {
+    actor: interaction.user.id,
+    payload: { id, target, notified: roleIds.length },
+  });
+  await threadLog(
+    interaction.client,
+    services,
+    id,
+    `🆘 <@${interaction.user.id}> が「${meta.label}」を要請しました（${roleIds.length}ロールへ通知）。引き受けを待機しています。`,
+  );
+  await interaction.update({
+    content: `${meta.emoji} 「${meta.label}」を通知しました。相手が **引き受ける** を押すと共同担当に追加されます。`,
+    components: [],
+  });
+}
+
+/** 引き受けボタン処理。対象ロール保持者のみ受理し、担当追加とスレッド参加まで実行する */
+async function handleAcceptSupport(interaction: ButtonInteraction, services: Services): Promise<void> {
+  const [, , target, idS] = interaction.customId.split(":"); // mimi:accept:<target>:<id>
+  const id = Number(idS);
+  const meta = SUPPORT_META[target as SupportTarget];
+  if (!meta) {
+    await interaction.reply({ content: "不明な支援先です。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const row = services.confessions.get(id);
+  if (!row) {
+    await interaction.reply({ content: "案件が見つかりません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const member = interaction.member as GuildMember | null;
+  const allowed = isAdmin(interaction, services) || memberHasSlot(member, services, meta.slot);
+  if (!allowed) {
+    await interaction.reply({
+      content: `この引き受けは ${meta.label} の担当ロール保持者のみ可能です。`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  // 既に主担当・共同担当ならスキップして通知だけ更新
+  const already =
+    row.claimed_by === interaction.user.id || services.confessions.isAssignee(id, interaction.user.id);
+  if (!already) {
+    services.confessions.addAssignee(id, interaction.user.id, interaction.user.id);
+    if (row.thread_id) {
+      const thread = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
+      if (thread?.isThread()) await thread.members.add(interaction.user.id).catch(() => undefined);
+    }
+    services.events.log("confession_support_accepted", {
+      actor: interaction.user.id,
+      payload: { id, target },
+    });
+    await threadLog(
+      interaction.client,
+      services,
+      id,
+      `🤝 <@${interaction.user.id}>（${meta.label}）が引き受け、共同担当に追加されました。`,
+    );
+    await refreshPanel(interaction.client, services, id);
+  }
+  // 通知メッセージ自体を「引受済み」に更新して、他の候補者に押させない
+  await interaction.update({
+    embeds: interaction.message.embeds,
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`mimi:accepted:${id}`)
+          .setLabel(`<@${interaction.user.id}> が引き受け済み`.replace(/<@\d+>/, "担当者が"))
+          .setStyle(ButtonStyle.Success)
+          .setDisabled(true),
+      ),
+    ],
+    content: `${meta.emoji} <@${interaction.user.id}> が引き受けました。`,
+    allowedMentions: { parse: [] },
+  });
+}
+
+function memberHasSlot(
+  member: GuildMember | null,
+  services: Services,
+  slot: "normal_ops" | "church_manage" | "church_consult",
+): boolean {
+  if (!member) return false;
+  const ids = getRoleIds(services, slot);
+  return ids.some((rid) => member.roles.cache.has(rid));
+}
+
+/** 補助操作の ephemeral パネル（管理者のみ）。会話状態の手動変更などを提供する */
+function adminSubPanelMsg(id: number) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`mimi:stageset:${id}`)
+    .setPlaceholder("会話状態を手動で変更する")
+    .addOptions(STAGE_ORDER.map((code) => new StringSelectMenuOptionBuilder().setValue(code).setLabel(STAGE_META[code])));
+  return {
+    content: [
+      "🛠️ **補助操作（管理者のみ）**",
+      "会話状態は通常、担当者・投稿者のやり取りから自動更新されます。何らかの理由で表示がズレた場合のみここで手動変更してください。",
+    ].join("\n"),
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
   };
 }

@@ -35,7 +35,7 @@ export type ConfessionStage =
 /** 対応先（Phase 2 §1） */
 export type Disposition = "church" | "normal" | "kaiwa" | "court" | "emergency" | "record";
 
-/** クローズ理由（Phase 2 §4） */
+/** クローズ理由（Phase 2 §4）。info_only は旧「対応先=記録のみ」を移行した終了理由 */
 export type CloseReason =
   | "resolved"
   | "poster_ended"
@@ -43,6 +43,7 @@ export type CloseReason =
   | "handoff_normal"
   | "handoff_kaiwa"
   | "sent_court"
+  | "info_only"
   | "no_action"
   | "other";
 
@@ -352,9 +353,10 @@ export class Confessions {
     id: number,
     opts: { category: string; consent: string; staffId: string; form: { reason: string; summary: string; wants: string } },
   ): ConfessionRow | undefined {
+    // 裁判所送致は会話状態(stage)を書き換えない。付帯情報として別欄で表示する。
     this.db
       .prepare(
-        "UPDATE confession_tickets SET court_status='pending_consent', court_category=?, court_consent=?, court_form=?, stage='court_review' WHERE id=?",
+        "UPDATE confession_tickets SET court_status='pending_consent', court_category=?, court_consent=?, court_form=? WHERE id=?",
       )
       .run(opts.category, opts.consent, JSON.stringify(opts.form), id);
     this.events.log("confession_court_referral", {
@@ -373,9 +375,10 @@ export class Confessions {
 
   /** フォーラム投稿を作成できた＝送致確定。送致先を記録し stage を court_sent に */
   recordCourtPost(id: number, opts: { threadId: string; url: string; staffId: string }): ConfessionRow | undefined {
+    // 送致完了も stage は書き換えない。会話状態と裁判所状況は独立して進む。
     this.db
       .prepare(
-        "UPDATE confession_tickets SET court_status='sent', court_thread_id=?, court_url=?, court_sent_at=?, court_sent_by=?, stage='court_sent' WHERE id=?",
+        "UPDATE confession_tickets SET court_status='sent', court_thread_id=?, court_url=?, court_sent_at=?, court_sent_by=? WHERE id=?",
       )
       .run(opts.threadId, opts.url, now(), opts.staffId, id);
     this.events.log("confession_court_sent", { actor: opts.staffId, payload: { id, threadId: opts.threadId } });
@@ -391,9 +394,8 @@ export class Confessions {
 
   /** 送致の取消し（確認中止・誤操作）。stage を対応中に戻す */
   cancelCourtReferral(id: number, actor: string): ConfessionRow | undefined {
-    this.db
-      .prepare("UPDATE confession_tickets SET court_status='canceled', stage=CASE WHEN status='claimed' THEN 'active' ELSE stage END WHERE id=?")
-      .run(id);
+    // stage には触れない（裁判所状況は付帯情報。会話状態は担当のやり取りだけで更新する）
+    this.db.prepare("UPDATE confession_tickets SET court_status='canceled' WHERE id=?").run(id);
     this.events.log("confession_court_cancel", { actor, payload: { id } });
     return this.get(id);
   }
@@ -429,8 +431,7 @@ export class Confessions {
         opts.note,
       );
     const emgId = Number(info.lastInsertRowid);
-    // 案件側の状態も緊急対応中に
-    this.db.prepare("UPDATE confession_tickets SET stage='emergency' WHERE id=?").run(opts.confessionId);
+    // 緊急共有は付帯情報。会話状態(stage)は書き換えず、担当者は通常のやり取りを続ける。
     this.events.log("confession_emergency_create", {
       actor: opts.createdBy,
       payload: { id: opts.confessionId, emgId, dangerOngoing: opts.dangerOngoing },
