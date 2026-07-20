@@ -64,6 +64,7 @@ import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
 import { handlePaydayButton } from "./payday.js";
 import { startScheduler } from "./scheduler.js";
+import { handleEvent72Button, handleEvent72Message, handleEvent72Voice, startEvent72 } from "./event72.js";
 import { startOutboxWorker } from "./outbox.js";
 import { postJoinLog, postLeaveLog } from "./member-log.js";
 
@@ -99,6 +100,9 @@ client.once(Events.ClientReady, (ready) => {
   } else {
     console.log(`📗 検算OK / 通貨発行残高 ${services.ledger.moneySupply().toLocaleString()} Ld`);
   }
+
+  // 72時間耐久・最終24時間イベント（パネル復旧・カウントダウン・VC記録）
+  void startEvent72(client, services).catch((e) => console.error("[72h] 起動失敗:", e));
 
   // 起動時に卓建て空VCを sweep
   void sweepStaleTables(client, services).then((n) => {
@@ -291,6 +295,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     if (interaction.isButton()) {
+      // 72時間耐久イベント（パネル再投稿でMessage IDが変わっても動くよう customId で処理）
+      if (interaction.customId.startsWith("e72:")) {
+        await handleEvent72Button(interaction, services);
+        return;
+      }
       if (interaction.customId.startsWith("entry:")) {
         await handleEntryButton(interaction, services);
         return;
@@ -398,6 +407,12 @@ client.on(Events.MessageCreate, (message) => {
   void handleMessageXp(message, services).catch((err) => console.error("[rank] 発言XP付与失敗:", err));
   // トートの耳: 対応スレッドの運営メッセージを告発者DMへ匿名中継
   void relayStaffMessage(client, services, message).catch((err) => console.error("[mimi] 中継失敗:", err));
+  // 72時間耐久: パネルを会話の最下部へ追従（デバウンス2秒）
+  try {
+    handleEvent72Message(message, services);
+  } catch (err) {
+    console.error("[72h] 追従処理失敗:", err);
+  }
 });
 
 // 入城導線: 参加時のロール付与・案内・招待リンク自動検出 + 入退室ログ
@@ -433,6 +448,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     handleVoiceAttendance(oldState, newState, services);
     void handleDenVoice(oldState, newState, services).catch((err) => console.error("[den] 処理失敗:", err));
     void handleTakuVoiceUpdate(oldState, newState, services).catch((err) => console.error("[taku] 処理失敗:", err));
+    handleEvent72Voice(oldState, newState, services);
   } catch (err) {
     console.error("[vc] 記録失敗:", err);
   }

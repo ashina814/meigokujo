@@ -22,6 +22,9 @@ importers:
       dotenv:
         specifier: ^16.4.7
         version: 16.6.1
+      gifenc:
+        specifier: ^1.0.3
+        version: 1.0.3
       tsx:
         specifier: ^4.19.2
         version: 4.22.5
@@ -618,6 +621,9 @@ packages:
     resolution: {integrity: sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==}
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
     os: [darwin]
+
+  gifenc@1.0.3:
+    resolution: {integrity: sha512-xdr6AdrfGBcfzncONUOlXMBuc5wJDtOueE3c5rdG0oNgtINLD+f2iFZltrBRZYzACRbKr+mSVU/x98zv2u3jmw==}
 
   github-from-package@0.0.0:
     resolution: {integrity: sha512-SyHy3T1v2NUXn29OsWdxmK6RwHD+vkj3v8en8AOBZ1wBQ/hCAQ5bAQTD02kW4W9tUp/3Qh6J8r9EvntiyCmOOw==}
@@ -1364,6 +1370,8 @@ snapshots:
 
   fsevents@2.3.3:
     optional: true
+
+  gifenc@1.0.3: {}
 
   github-from-package@0.0.0: {}
 
