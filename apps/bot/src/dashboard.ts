@@ -132,9 +132,15 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
  */
 export async function updateDashboard(client: Client, services: Services): Promise<void> {
   const channelId = services.settings.getString("channel:keikiban");
-  if (!channelId) return;
+  if (!channelId) {
+    console.warn("[計器盤] channel:keikiban が未設定のため更新をスキップしました");
+    return;
+  }
   const channel = (await client.channels.fetch(channelId).catch(() => null)) as TextChannel | null;
-  if (!channel?.isTextBased()) return;
+  if (!channel?.isTextBased()) {
+    console.error(`[計器盤] チャンネル ${channelId} を取得できません（削除/権限不足の可能性）`);
+    return;
+  }
 
   const embed = buildDashboardEmbed(services);
   const savedId = services.settings.getString("dashboard:message_id");
@@ -142,13 +148,22 @@ export async function updateDashboard(client: Client, services: Services): Promi
   if (savedId) { // 空文字は false 扱い（/計器盤 設置 で新規投稿させるためクリアされる）
     const msg = await channel.messages.fetch(savedId).catch(() => null);
     if (msg) {
-      await msg.edit({ embeds: [embed] }).catch(() => undefined);
+      // 失敗を握り潰すと「静かに止まる」ため必ずログに出す（原因調査が不能になるのを防ぐ）
+      try {
+        await msg.edit({ embeds: [embed] });
+      } catch (e) {
+        console.error("[計器盤] 既存メッセージの更新に失敗:", e);
+      }
       return;
     }
+    console.warn(`[計器盤] 保存済みメッセージ ${savedId} が見つかりません。新規投稿します`);
   }
-  const sent = await channel.send({ embeds: [embed] }).catch(() => null);
-  if (sent) {
+  try {
+    const sent = await channel.send({ embeds: [embed] });
     await sent.pin().catch(() => undefined);
     services.settings.set("dashboard:message_id", sent.id, "system:dashboard");
+    console.log(`[計器盤] 新規投稿しました: ${sent.id}`);
+  } catch (e) {
+    console.error("[計器盤] 新規投稿に失敗（送信権限を確認してください）:", e);
   }
 }

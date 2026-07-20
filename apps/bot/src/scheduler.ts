@@ -106,11 +106,11 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         const staffRoleId = services.settings.getString("role:ticket_staff");
         const channel = kessaiId ? await client.channels.fetch(kessaiId).catch(() => null) : null;
         if (channel?.isTextBased() && "send" in channel) {
-          await channel.send(
-            [
-              `📮 ${staffRoleId ? `<@&${staffRoleId}> ` : ""}**24時間以上応答のないチケットが ${stale.length} 件あります**:`,
-              ...stale.map((t) => `・<#${t.thread_id}>（${t.kind === "return" ? "出戻り" : "相談"}）`),
-            ].join("\n"),
+          // 同じ2000文字上限の踏み方をするため、チケット一覧も分割送信にする
+          await sendChunkedLines(
+            channel as TextChannel,
+            `📮 ${staffRoleId ? `<@&${staffRoleId}> ` : ""}**24時間以上応答のないチケットが ${stale.length} 件あります**:`,
+            stale.map((t) => `・<#${t.thread_id}>（${t.kind === "return" ? "出戻り" : "相談"}）`),
           );
           for (const t of stale) services.tickets.markReminded(t.thread_id);
         }
@@ -356,6 +356,43 @@ export async function payVcRewards(client: Client, services: Services, dateStr: 
   console.log(`[刻時盤] 浮上報酬 ${dateStr}: ${rewards.length}名 / ${total} Ld`);
 }
 
+/** Discordの1メッセージあたりの content 上限 */
+const DISCORD_CONTENT_MAX = 2000;
+
+/**
+ * 見出し＋行リストを 2000 文字以内へ分割して送る。
+ *
+ * 対象者が増えると単一 content が上限を超え、DiscordAPIError[50035] で
+ * 「送信そのものが失敗」する。定期ジョブの中で throw すると後続処理まで巻き添えになるため、
+ * 一覧を投げる箇所は必ずこれを通す。components はボタンの二重表示を避けて最後のチャンクにだけ付ける。
+ */
+async function sendChunkedLines(
+  channel: TextChannel,
+  header: string,
+  lines: string[],
+  opts: { components?: ActionRowBuilder<ButtonBuilder>[] } = {},
+): Promise<void> {
+  const chunks: string[] = [];
+  let cur = header;
+  for (const raw of lines) {
+    const line = raw.length > DISCORD_CONTENT_MAX ? `${raw.slice(0, DISCORD_CONTENT_MAX - 1)}…` : raw;
+    if (`${cur}\n${line}`.length > DISCORD_CONTENT_MAX) {
+      chunks.push(cur);
+      cur = line;
+    } else {
+      cur = cur ? `${cur}\n${line}` : line;
+    }
+  }
+  if (cur) chunks.push(cur);
+  for (let i = 0; i < chunks.length; i++) {
+    await channel.send({
+      content: chunks[i]!,
+      allowedMentions: { parse: [] },
+      ...(i === chunks.length - 1 && opts.components ? { components: opts.components } : {}),
+    });
+  }
+}
+
 /** カロンの日次業務: 期限リスト（計器盤）・本人への演出通知・期限切れの承認パネル（#決裁）・スレ題名の同期 */
 export async function runCharonDaily(client: Client, services: Services): Promise<void> {
   const nowTs = Math.floor(Date.now() / 1000);
@@ -370,17 +407,19 @@ export async function runCharonDaily(client: Client, services: Services): Promis
 
   // ① 期限が近い者のリスト → #城の計器盤
   const dueSoon = services.evaluation.dueBetween(nowTs, nowTs + 2 * DAY);
-  const keikiban = await fetchText("channel:keikiban");
-  if (keikiban && dueSoon.length > 0) {
-    const lines = dueSoon.map((r) => {
-      const p = services.evaluation.promotionScore(r.user_id);
-      const d = services.evaluation.demotionCount(r.user_id);
-      return `・<@${r.user_id}> 期限 <t:${r.eval_deadline_at}:R> — 昇格印 ${p.total}/5・低評価印 ${d}/4・評価 ${services.evaluation.evaluationCount(r.user_id)}件`;
-    });
-    await keikiban.send({
-      content: `🛶 **カロンの帳簿** — 審判が近い魂:\n${lines.join("\n")}`,
-      allowedMentions: { parse: [] },
-    });
+  // 各ステップは独立して失敗させる。①が落ちても②③④まで巻き添えにしない
+  try {
+    const keikiban = await fetchText("channel:keikiban");
+    if (keikiban && dueSoon.length > 0) {
+      const lines = dueSoon.map((r) => {
+        const p = services.evaluation.promotionScore(r.user_id);
+        const d = services.evaluation.demotionCount(r.user_id);
+        return `・<@${r.user_id}> 期限 <t:${r.eval_deadline_at}:R> — 昇格印 ${p.total}/5・低評価印 ${d}/4・評価 ${services.evaluation.evaluationCount(r.user_id)}件`;
+      });
+      await sendChunkedLines(keikiban, `🛶 **カロンの帳簿** — 審判が近い魂 ${dueSoon.length}名:`, lines);
+    }
+  } catch (e) {
+    console.error("[カロン] ①期限リストの投稿に失敗:", e);
   }
 
   // ② 本人への演出通知（3日前・前日・当日、各1回）— DM＋通知チャンネルの両方
@@ -428,11 +467,12 @@ export async function runCharonDaily(client: Client, services: Services): Promis
       new ButtonBuilder().setCustomId("charon:drop").setLabel(`${overdue.length}名を迷霊に落とす`).setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId("charon:cancel").setLabel("今日は見送る").setStyle(ButtonStyle.Secondary),
     );
-    await kessai.send({
-      content: `⚖️ **カロンの上申** — 評価期限が到達し昇格印が不足している魂 **${overdue.length}名**:\n${lines.join("\n")}`,
-      components: [row],
-      allowedMentions: { parse: [] },
-    });
+    await sendChunkedLines(
+      kessai,
+      `⚖️ **カロンの上申** — 評価期限が到達し昇格印が不足している魂 **${overdue.length}名**:`,
+      lines,
+      { components: [row] },
+    );
   }
 
   // ④ 評価スレッドの題名を実際の期限に同期（招待延長でズレた分の自己修復）
