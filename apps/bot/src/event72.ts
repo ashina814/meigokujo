@@ -232,7 +232,9 @@ async function updatePanel(client: Client, services: Services, opts: { repost?: 
     if (!opts.repost && state.panelMessageId) {
       const msg = await channel.messages.fetch(state.panelMessageId).catch(() => null);
       if (msg) {
-        await msg.edit(payload);
+        // attachments:[] で既存の添付を必ず破棄する。付けないと編集のたびに添付が積み上がり、
+        // 同名参照(attachment://countdown.gif)が古い画像に解決されてカウントダウンが止まって見える
+        await msg.edit({ ...payload, attachments: [] });
         return;
       }
       console.warn(`${LOG} 既存パネル(${state.panelMessageId})が見つかりません。新規投稿します`);
