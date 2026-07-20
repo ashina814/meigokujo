@@ -64,6 +64,7 @@ import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
 import { handlePaydayButton } from "./payday.js";
 import { startScheduler } from "./scheduler.js";
+import { startInternalApi } from "./internal-api.js";
 import { handleEvent72Button, handleEvent72Message, handleEvent72Voice, startEvent72 } from "./event72.js";
 import { startOutboxWorker } from "./outbox.js";
 import { postJoinLog, postLeaveLog } from "./member-log.js";
@@ -86,6 +87,8 @@ inviteTracker.wire();
 client.once(Events.ClientReady, (ready) => {
   console.log(`⚔️ 冥獄城ボット 起動: ${ready.user.tag}`);
   startOutboxWorker(client, services);
+  // 経済観測用の読み取り専用内部API（ログBot向け・ホスト内限定）
+  startInternalApi(services);
   startScheduler(client, services);
 
   // 招待キャッシュを初期化（全ギルド）
