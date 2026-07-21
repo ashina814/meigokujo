@@ -510,8 +510,9 @@ export async function autoDropNoEvalGhosts(client: Client, services: Services): 
     services.evaluation.demoteToMeirei(soul.user_id, "system:auto-drop", "14日以内に評価が付かなかった（フォーラム未作成）");
     const member = await guild.members.fetch(soul.user_id).catch(() => null);
     if (member) {
-      if (ghostRoleId) await member.roles.remove(ghostRoleId).catch(() => undefined);
+      // 迷霊を先に付けてから亡霊を剥がす（executeDemotion と同じ race 対策）
       if (meireiRoleId) await member.roles.add(meireiRoleId).catch(() => undefined);
+      if (ghostRoleId) await member.roles.remove(ghostRoleId).catch(() => undefined);
     }
     dropped++;
   }

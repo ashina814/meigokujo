@@ -40,12 +40,15 @@ export async function handlePromote(
 
   const member = await interaction.guild!.members.fetch(target.id).catch(() => null);
   if (member) {
+    // 魔人を先に付けてから亡霊・面談ロールを剥がす。逆順にすると Discord の2イベント間で
+    // handleMemberRoleUpdate ③（亡霊剥奪検知）が「他の階級ロールなし」と誤判定して
+    // 案内待ちにリセットしてしまう副作用を起こす。
+    const majinRoleId = services.settings.getString("role:majin");
+    if (majinRoleId) await member.roles.add(majinRoleId).catch(() => undefined);
     const remove = ["role:ghost", "role:mendan"]
       .map((k) => services.settings.getString(k))
       .filter((id): id is string => !!id);
     for (const roleId of remove) await member.roles.remove(roleId).catch(() => undefined);
-    const majinRoleId = services.settings.getString("role:majin");
-    if (majinRoleId) await member.roles.add(majinRoleId).catch(() => undefined);
   }
 
   // 昇格のお知らせ自動投稿（給与テーブルはロール参照なので切替は自動）

@@ -254,6 +254,14 @@ export async function handleMemberRoleUpdate(
       (mazokuRoleId && after.has(mazokuRoleId)) ||
       (meireiRoleId && after.has(meireiRoleId));
     if (!hasOther) {
+      // 台帳側で既に階級が変わっているなら、ロール反映の途中で新ロールがまだ付いていない
+      // 状態のイベントを見ているだけ。案内待ちへ戻すとDB status を上書きし queue_wait を
+      // 付けてしまうので、ここでは何もしない（迷霊落ち・魔人昇格レースへの防護線）。
+      const soul = services.entry.getSoul(newMember.id);
+      if (soul && soul.status !== "ghost" && soul.status !== "waiting") {
+        console.log(`[entry] 亡霊ロール剥奪検知したが台帳は既に ${soul.status}。リセットせず（レース対策）: ${newMember.id}`);
+        return;
+      }
       services.entry.resetToWaiting(newMember.id, "system:role-remove");
       if (waitRoleId) await newMember.roles.add(waitRoleId).catch(() => undefined);
       console.log(`[entry] 亡霊ロール剥奪 → 案内待ちにリセット: ${newMember.id}`);

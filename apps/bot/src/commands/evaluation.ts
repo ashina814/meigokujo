@@ -317,8 +317,11 @@ export async function executeDemotion(
   const meireiRoleId = services.settings.getString("role:meirei");
   const member = await guild.members.fetch(targetId).catch(() => null);
   if (member) {
-    if (ghostRoleId) await member.roles.remove(ghostRoleId).catch(() => undefined);
+    // 迷霊を「先に」付けてから亡霊を剥がす。逆順にすると Discord の2イベント間で
+    // handleMemberRoleUpdate ③（亡霊剥奪検知）が「他の階級ロールなし」と誤判定して
+    // 案内待ちにリセット＋queue_wait 付与＋DB status='waiting' 上書きの副作用を起こす。
     if (meireiRoleId) await member.roles.add(meireiRoleId).catch(() => undefined);
+    if (ghostRoleId) await member.roles.remove(ghostRoleId).catch(() => undefined);
     await member
       .send(`⚖️ 冥獄城の審判が下りました。汝は**迷霊**となった（理由: ${reason}）。贖罪の道は運営に相談を。`)
       .catch(() => undefined);
