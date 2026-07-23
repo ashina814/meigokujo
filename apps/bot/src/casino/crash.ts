@@ -9,6 +9,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
+import type { CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
@@ -29,9 +30,9 @@ const MIN_CASHOUT = 1.5;
 const MAX_MULT_CAP = 100; // テーブルリミット判定に使う（実際の崩壊はもっと低い）
 const UPDATE_INTERVAL_MS = 1500;
 
-function generateCrashPoint(): number {
+function generateCrashPoint(rng: CasinoRng): number {
   const e = 1 - HOUSE_EDGE;
-  const r = Math.random();
+  const r = rng.float();
   if (r < 0.01) return 1.0; // 1% は即崩壊
   const crash = e / (1 - r);
   return Math.max(1.0, Math.round(crash * 100) / 100);
@@ -93,7 +94,7 @@ async function runRound(
   bet: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const crashPoint = generateCrashPoint();
+  const crashPoint = generateCrashPoint(services.rng);
 
   const START_TIME = Date.now();
   const t_crash_ms = Math.log(crashPoint) / GROWTH_RATE;

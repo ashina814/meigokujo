@@ -9,10 +9,20 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import { HOUSE_HOLDER, JACKPOT_HOLDER } from "@meigokujo/core";
+import { HOUSE_HOLDER, JACKPOT_HOLDER, escrowHolderFor } from "@meigokujo/core";
 import type { Services } from "../services.js";
 import { fmtEther } from "../format.js";
 import { C_LOSE, C_MAMMON, C_WIN } from "./ui.js";
+
+/**
+ * 「今この対戦の資金がどこにあるか」を返す。
+ * - session あり: escrow:session:<id>（新方式・胴元と分離）
+ * - session なし: house（旧方式・呼び出し側が旧経路でも動くように残す）
+ * ここを唯一の分岐点にすることで、勝負系のあらゆる精算/返金が同じ場所から動く。
+ */
+function stakeHolder(session?: string): string {
+  return session ? escrowHolderFor(session) : HOUSE_HOLDER;
+}
 
 /** 1v1 PvP ゲームが受け取る interaction（/勝負 直叩き or 再戦ボタン経由） */
 export type PvpInteraction = ChatInputCommandInteraction | ButtonInteraction;
@@ -140,10 +150,11 @@ export function settlePvp(
   pot: number,
   session?: string,
 ): { payout: number; houseCut: number } {
+  const src = stakeHolder(session);
   const houseCut = Math.floor(pot * HOUSE_CUT);
   const distributable = pot - houseCut;
   // 場代は JP へ（胴元の取り分＝プレイヤーに間接的に還元される）
-  if (houseCut > 0) services.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, houseCut);
+  if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut);
 
   if (winners.length === 0) {
     // 引き分け or 該当者なし → 場代だけ取って残りを分割対象がいないので国庫（実装的にはこのケースは呼ばれない）
@@ -152,8 +163,8 @@ export function settlePvp(
   }
   const share = Math.floor(distributable / winners.length);
   const remainder = distributable - share * winners.length;
-  for (const w of winners) services.ether.transfer(HOUSE_HOLDER, w, share);
-  if (remainder > 0) services.ether.transfer(HOUSE_HOLDER, winners[0]!, remainder);
+  for (const w of winners) services.ether.transfer(src, w, share);
+  if (remainder > 0) services.ether.transfer(src, winners[0]!, remainder);
   if (session) services.escrow.clear(session);
   return { payout: distributable, houseCut };
 }
@@ -169,10 +180,11 @@ export function settleProportional(
   losers: Array<{ userId: string; bet: number }>,
   session?: string,
 ): { totalHouseCut: number } {
+  const src = stakeHolder(session);
   const winnerPot = winners.reduce((s, w) => s + w.bet, 0);
   const loserPot = losers.reduce((s, l) => s + l.bet, 0);
   const houseCut = Math.floor((winnerPot + loserPot) * HOUSE_CUT);
-  if (houseCut > 0) services.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, houseCut);
+  if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut);
   const distributable = winnerPot + loserPot - houseCut;
 
   // 勝ち側に賭け額比で分配（元本 + 負け側からの取り分）
@@ -181,7 +193,7 @@ export function settleProportional(
     const w = winners[i]!;
     const isLast = i === winners.length - 1;
     const share = isLast ? remaining : Math.floor((distributable * w.bet) / winnerPot);
-    if (share > 0) services.ether.transfer(HOUSE_HOLDER, w.userId, share);
+    if (share > 0) services.ether.transfer(src, w.userId, share);
     remaining -= share;
   }
   if (session) services.escrow.clear(session);

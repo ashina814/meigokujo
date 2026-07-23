@@ -98,13 +98,8 @@ const OUTCOMES: readonly Outcome[] = [
 
 const TOTAL_WEIGHT = OUTCOMES.reduce((s, o) => s + o.weight, 0);
 
-function pickOutcome(): Outcome {
-  let roll = Math.random() * TOTAL_WEIGHT;
-  for (const o of OUTCOMES) {
-    roll -= o.weight;
-    if (roll <= 0) return o;
-  }
-  return OUTCOMES[0]!;
+function pickOutcome(services: Services): Outcome {
+  return services.rng.weighted(OUTCOMES.map((o) => [o, o.weight]));
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -173,8 +168,8 @@ export async function handleNagareboshiCommand(
   if (fee > 0) services.ether.transfer(uid, HOUSE_HOLDER, fee);
   incCount(services, uid, day);
 
-  const outcome = pickOutcome();
-  const line = outcome.lines[Math.floor(Math.random() * outcome.lines.length)]!;
+  const outcome = pickOutcome(services);
+  const line = services.rng.pick(outcome.lines);
   let rewardLine = "";
   if (outcome.reward) {
     const jpPool = services.ether.balanceOf(JACKPOT_HOLDER);

@@ -9,7 +9,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import { HOUSE_HOLDER } from "@meigokujo/core";
+import { HOUSE_HOLDER, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
@@ -40,8 +40,7 @@ type Hand =
   | { type: "me"; score: number }
   | { type: "menashi" };
 
-const rollDice = (): Dice =>
-  [1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6)] as const;
+const rollDice = (rng: CasinoRng): Dice => [rng.int(1, 6), rng.int(1, 6), rng.int(1, 6)] as const;
 
 function evaluate(dice: Dice): Hand {
   const [a, b, c] = [...dice].sort((x, y) => x - y) as [number, number, number];
@@ -124,9 +123,9 @@ function paytableEmbed(): EmbedBuilder {
     );
 }
 
-async function shakeAnimation(reply: Message, header: string[], bet: number, rollNo: number, remaining: number): Promise<void> {
+async function shakeAnimation(reply: Message, header: string[], bet: number, rollNo: number, remaining: number, rng: CasinoRng): Promise<void> {
   for (let f = 0; f < 4; f++) {
-    const shake: Dice = [1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6)] as const;
+    const shake: Dice = [rng.int(1, 6), rng.int(1, 6), rng.int(1, 6)] as const;
     const e = new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · チンチロ" })
       .setColor(C_MAMMON)
@@ -200,8 +199,8 @@ async function runRound(
 
   for (let rollNo = 1; rollNo <= playerMaxRolls && !playerLocked; rollNo++) {
     const remaining = playerMaxRolls - rollNo + 1;
-    await shakeAnimation(reply, [], bet, rollNo, remaining);
-    playerDice = rollDice();
+    await shakeAnimation(reply, [], bet, rollNo, remaining, services.rng);
+    playerDice = rollDice(services.rng);
     playerHand = evaluate(playerDice);
 
     if (isTerminal(playerHand)) {
@@ -311,7 +310,7 @@ async function runRound(
   let dealerHand: Hand = { type: "menashi" };
   for (let rollNo = 1; rollNo <= MAX_ROLLS; rollNo++) {
     for (let f = 0; f < 4; f++) {
-      const shake: Dice = [1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6)] as const;
+      const shake: Dice = [services.rng.int(1, 6), services.rng.int(1, 6), services.rng.int(1, 6)] as const;
       const e = new EmbedBuilder()
         .setTitle("🎲 チンチロ — マモンの番")
         .setColor(C_MAMMON)
@@ -327,7 +326,7 @@ async function runRound(
       await reply.edit({ embeds: [e], components: [] }).catch(() => undefined);
       await sleep(220);
     }
-    dealerDice = rollDice();
+    dealerDice = rollDice(services.rng);
     dealerHand = evaluate(dealerDice);
     const willStop = isTerminal(dealerHand) || (dealerHand.type === "me" && dealerHand.score >= 5) || rollNo >= MAX_ROLLS;
     await reply

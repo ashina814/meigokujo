@@ -118,6 +118,7 @@ export {
   Markets,
   MarketError,
   DISPUTE_WINDOW_SEC,
+  marketEscrowHolder,
   type Market,
   type MarketBet,
   type MarketApproval,
@@ -127,4 +128,45 @@ export {
   type MarketSettleResult,
 } from "./casino/market.js";
 export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";
-export { Escrow, type EscrowRow } from "./casino/escrow.js";
+export { Escrow, escrowHolderFor, isEscrowHolder, ESCROW_QUARANTINE, type EscrowRow } from "./casino/escrow.js";
+export { defaultRng, deterministicRng, scriptedRng, type CasinoRng } from "./casino/rng.js";
+export {
+  SLOT_SYMBOLS,
+  TRIPLE_PAYOUTS,
+  DOUBLE_PAYOUTS,
+  JP_CONTRIBUTION as SLOTS_JP_CONTRIBUTION,
+  JP_WIN_SHARE as SLOTS_JP_WIN_SHARE,
+  SCATTER_TRIGGER_COUNT as SLOTS_SCATTER_TRIGGER_COUNT,
+  spinReel as slotsSpinReel,
+  evaluate as slotsEvaluate,
+  computeRtp as slotsComputeRtp,
+  simulateRtp as slotsSimulateRtp,
+  type SlotSymbol,
+  type SpinOutcome as SlotSpinOutcome,
+  type SpinKind as SlotSpinKind,
+} from "./casino/slots-model.js";
+export {
+  CHOHAN_PAYOUT,
+  chohanRollAndPay,
+  chohanRtp,
+  ROULETTE_SLOTS,
+  ROULETTE_PAYOUTS,
+  rouletteSpin,
+  rouletteRtp,
+  CRASH_HOUSE_EDGE,
+  CRASH_INSTANT_BUST_RATE,
+  crashPoint,
+  crashRtp,
+  MARKET_HOUSE_CUT,
+  marketPlayerRtp,
+  KEIBA_HOUSE_RATE,
+  keibaPlayerRtp,
+  bjSimulateHand,
+  bjSimulateRtp,
+  pokerSimulateRtp,
+  holdemSimulateRtp,
+  STOCK_SELL_FEE,
+  stockBuyThenSellRtp,
+  type BjStrategy,
+  type PokerStrategy,
+} from "./casino/game-models.js";

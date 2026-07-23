@@ -11,6 +11,7 @@ import {
   type Message,
   type User,
 } from "discord.js";
+import type { CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET } from "./common.js";
@@ -42,14 +43,10 @@ interface Card {
 const showCard = (c: Card) => `${c.suit}${RANK_LABEL[c.rank]}`;
 const handStr = (h: Card[]) => h.map(showCard).join("  ");
 
-function newDeck(): Card[] {
+function newDeck(rng: CasinoRng): Card[] {
   const d: Card[] = [];
   for (const s of SUITS) for (let r = 2; r <= 14; r++) d.push({ suit: s, rank: r });
-  for (let i = d.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [d[i], d[j]] = [d[j]!, d[i]!];
-  }
-  return d;
+  return rng.shuffle(d);
 }
 
 interface HandEval {
@@ -482,7 +479,7 @@ async function autoDeal(client: import("discord.js").Client, s: Session, service
 
 // ─── 配布 ────────────────────────────────────────
 async function dealHands(interaction: ButtonInteraction, s: Session, services: Services): Promise<void> {
-  const deck = newDeck();
+  const deck = newDeck(services.rng);
   for (const p of s.players.values()) {
     p.hand = [deck.pop()!, deck.pop()!, deck.pop()!, deck.pop()!, deck.pop()!];
     p.discardDone = false;
@@ -494,7 +491,7 @@ async function dealHands(interaction: ButtonInteraction, s: Session, services: S
 }
 
 async function dealHandsFromClient(client: import("discord.js").Client, s: Session, services: Services): Promise<void> {
-  const deck = newDeck();
+  const deck = newDeck(services.rng);
   for (const p of s.players.values()) {
     p.hand = [deck.pop()!, deck.pop()!, deck.pop()!, deck.pop()!, deck.pop()!];
     p.discardDone = false;
@@ -602,7 +599,7 @@ export async function handlePokerDuelSelect(interaction: StringSelectMenuInterac
   // 全プレイヤーの手札を使用済みとし、残りから補充
   const used = new Set<string>();
   for (const pp of s.players.values()) for (const c of pp.hand) used.add(`${c.suit}${c.rank}`);
-  const remaining = newDeck().filter((c) => !used.has(`${c.suit}${c.rank}`));
+  const remaining = newDeck(services.rng).filter((c) => !used.has(`${c.suit}${c.rank}`));
   const newHand = p.hand.map((c, i) => (indices.includes(i) ? remaining.pop()! : c));
 
   p.finalHand = newHand;

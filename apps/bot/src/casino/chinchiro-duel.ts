@@ -10,6 +10,7 @@ import {
   type Message,
   type User,
 } from "discord.js";
+import type { CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
@@ -43,8 +44,7 @@ type Hand =
   | { type: "me"; score: number }
   | { type: "menashi" };
 
-const roll = (): Dice =>
-  [1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6)] as const;
+const roll = (rng: CasinoRng): Dice => [rng.int(1, 6), rng.int(1, 6), rng.int(1, 6)] as const;
 
 function evaluate(dice: Dice): Hand {
   const [a, b, c] = [...dice].sort((x, y) => x - y) as [number, number, number];
@@ -68,11 +68,11 @@ function handRank(h: Hand): number {
 }
 
 /** BOTの決定論的な振り戦略（原作 autoRollHand 準拠） */
-function autoRollHand(): { hand: Hand; dice: Dice } {
+function autoRollHand(rng: CasinoRng): { hand: Hand; dice: Dice } {
   let dice: Dice = [1, 1, 1] as const;
   let hand: Hand = { type: "menashi" };
   for (let rollNo = 1; rollNo <= MAX_ROLLS; rollNo++) {
-    dice = roll();
+    dice = roll(rng);
     hand = evaluate(dice);
     const meStop = hand.type === "me" && hand.score >= 5;
     const terminal = hand.type !== "me" && hand.type !== "menashi";
@@ -188,13 +188,13 @@ export async function playChinchiroDuel(
   }
 
   // ── 両者振る（同一戦略・同役なら最大5回振り直し） ──
-  let cResult = autoRollHand();
-  let oResult = autoRollHand();
+  let cResult = autoRollHand(services.rng);
+  let oResult = autoRollHand(services.rng);
   let ties = 0;
   while (handRank(cResult.hand) === handRank(oResult.hand) && ties < REROLL_ON_TIE) {
     ties++;
-    cResult = autoRollHand();
-    oResult = autoRollHand();
+    cResult = autoRollHand(services.rng);
+    oResult = autoRollHand(services.rng);
   }
 
   const pot = bet * 2;

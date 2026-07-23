@@ -19,6 +19,9 @@ const DEFAULT_FEE = 500;
 export const DISPUTE_WINDOW_SEC = 5 * 60;
 const now = () => Math.floor(Date.now() / 1000);
 
+/** 板ごとの預り所（保有者ID）。胴元(house)とは完全に分離して置く。 */
+export const marketEscrowHolder = (id: number): string => `escrow:market:${id}`;
+
 export type MarketStatus = "open" | "closed" | "reported" | "disputed" | "settled" | "void";
 export type PayoutMode = "parimutuel" | "winner_take_all";
 
@@ -121,6 +124,19 @@ export class Markets {
     const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
     if (cols.some((c) => c.name === column)) return;
     this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${spec}`);
+  }
+
+  /**
+   * この板の預り金がどこにあるか。
+   * - 新方式: escrow:market:<id>（分離された預り所）
+   * - 旧方式: house（分離前に張られた既存板・起動時 refundAllPending 通過で全て消えているはず）
+   * 判定は「板の pot と保有者残高が一致するか」で自動選択して自己修復する。
+   * pot === 0 なら宛先の分岐は不要（返金しても0）。
+   */
+  private fundHolder(id: number, pot: number): string {
+    const esc = marketEscrowHolder(id);
+    if (pot > 0 && this.ether.balanceOf(esc) >= pot) return esc;
+    return HOUSE_HOLDER;
   }
 
   create(input: {
@@ -228,12 +244,17 @@ export class Markets {
       throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(userId), additionalRequired, amount, existingTotal });
     }
 
+    const escHolder = marketEscrowHolder(marketId);
     return this.db.transaction((): { previous: number | null; net: number } => {
       if (existingTotal > 0) {
-        this.ether.transfer(HOUSE_HOLDER, userId, existingTotal);
+        // 既存の張り直しは同じ場所から返す（新方式なら escrow、旧方式なら house）。
+        // fundHolder は「保有者残高 >= pot」で判定するので、張り直し前の pot（= existingTotal を含む）で見る。
+        const src = this.fundHolder(marketId, existingTotal);
+        this.ether.transfer(src, userId, existingTotal);
         this.db.prepare("DELETE FROM casino_market_bets WHERE market_id = ? AND user_id = ?").run(marketId, userId);
       }
-      this.ether.transfer(userId, HOUSE_HOLDER, amount);
+      // 新規徴収は必ず板ごとの分離保有者へ（胴元の配当余力から切り離す）
+      this.ether.transfer(userId, escHolder, amount);
       this.db
         .prepare("INSERT INTO casino_market_bets (market_id, user_id, option_index, amount, created_at) VALUES (?, ?, ?, ?, ?)")
         .run(marketId, userId, optionIndex, amount, now());
@@ -368,7 +389,9 @@ export class Markets {
     if (m.status !== "disputed") throw new MarketError("ERR_NOT_DISPUTED", { status: m.status });
     this.db.transaction(() => {
       const bets = this.bets(id);
-      for (const b of bets) this.ether.transfer(HOUSE_HOLDER, b.user_id, b.amount);
+      const pot = bets.reduce((s, b) => s + b.amount, 0);
+      const src = this.fundHolder(id, pot);
+      for (const b of bets) this.ether.transfer(src, b.user_id, b.amount);
       this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), id);
     })();
     this.events.log("market_admin_void", { actor, payload: { id } });
@@ -389,17 +412,20 @@ export class Markets {
       const winners = bets.filter((b) => b.option_index === m.result_option);
       const winnersPot = winners.reduce((s, b) => s + b.amount, 0);
 
+      // 精算の資金源: 新方式なら escrow:market:<id>、旧方式なら house。自己修復で両対応
+      const src = this.fundHolder(id, pot);
+
       // 的中者なし → 全額返金 & void
       if (winners.length === 0) {
-        for (const b of bets) this.ether.transfer(HOUSE_HOLDER, b.user_id, b.amount);
+        for (const b of bets) this.ether.transfer(src, b.user_id, b.amount);
         this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), id);
         this.events.log("market_settle_void", { actor: "system", payload: { id, pot } });
         return { id, pot, houseCut: 0, distributable: 0, winnerCount: 0, payouts: [], mode: m.payout_mode, resultOption: m.result_option, void: true };
       }
 
-      // 場代
+      // 場代（勝者精算の前に JP へ抜く）
       const houseCut = Math.floor(pot * HOUSE_CUT);
-      if (houseCut > 0) this.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, houseCut);
+      if (houseCut > 0) this.ether.transfer(src, JACKPOT_HOLDER, houseCut);
       const distributable = pot - houseCut;
 
       const payouts: Array<{ userId: string; amount: number }> = [];
@@ -410,7 +436,7 @@ export class Markets {
           const w = winners[i]!;
           const isLast = i === winners.length - 1;
           const share = isLast ? remaining : Math.floor((distributable * w.amount) / winnersPot);
-          if (share > 0) this.ether.transfer(HOUSE_HOLDER, w.user_id, share);
+          if (share > 0) this.ether.transfer(src, w.user_id, share);
           remaining -= share;
           payouts.push({ userId: w.user_id, amount: share });
         }
@@ -422,7 +448,7 @@ export class Markets {
         for (let i = 0; i < uniqueWinners.length; i++) {
           const uid = uniqueWinners[i]!;
           const share = i === 0 ? per + leftover : per;
-          if (share > 0) this.ether.transfer(HOUSE_HOLDER, uid, share);
+          if (share > 0) this.ether.transfer(src, uid, share);
           payouts.push({ userId: uid, amount: share });
         }
       }
@@ -455,7 +481,9 @@ export class Markets {
     if (m.status === "settled" || m.status === "void") return;
     this.db.transaction(() => {
       const bets = this.bets(id);
-      for (const b of bets) this.ether.transfer(HOUSE_HOLDER, b.user_id, b.amount);
+      const pot = bets.reduce((s, b) => s + b.amount, 0);
+      const src = this.fundHolder(id, pot);
+      for (const b of bets) this.ether.transfer(src, b.user_id, b.amount);
       this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), id);
     })();
     this.events.log("market_void", { actor, payload: { id } });

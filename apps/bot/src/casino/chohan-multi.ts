@@ -224,8 +224,8 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
   });
   await sleep(1600);
 
-  const d1 = 1 + Math.floor(Math.random() * 6);
-  const d2 = 1 + Math.floor(Math.random() * 6);
+  const d1 = services.rng.int(1, 6);
+  const d2 = services.rng.int(1, 6);
   const total = d1 + d2;
   const isCho = total % 2 === 0;
   const winners = isCho ? chos : hans;

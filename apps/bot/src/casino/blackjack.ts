@@ -9,6 +9,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
+import type { CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
@@ -30,7 +31,7 @@ interface Card {
   suit: string;
 }
 
-function newDeck(): Card[] {
+function newDeck(rng: CasinoRng): Card[] {
   const suits = ["♠", "♥", "♦", "♣"];
   const ranks: Array<[string, number]> = [
     ["A", 11], ["2", 2], ["3", 3], ["4", 4], ["5", 5], ["6", 6], ["7", 7],
@@ -38,11 +39,7 @@ function newDeck(): Card[] {
   ];
   const deck: Card[] = [];
   for (const suit of suits) for (const [rank, value] of ranks) deck.push({ rank, value, suit });
-  for (let i = deck.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [deck[i], deck[j]] = [deck[j]!, deck[i]!];
-  }
-  return deck;
+  return rng.shuffle(deck);
 }
 
 function handValue(hand: Card[]): number {
@@ -113,7 +110,7 @@ async function runRound(
   bet: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const deck = newDeck();
+  const deck = newDeck(services.rng);
   const player: Card[] = [deck.pop()!, deck.pop()!];
   const dealer: Card[] = [deck.pop()!, deck.pop()!];
   let totalBet = bet;

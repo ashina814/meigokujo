@@ -9,6 +9,7 @@ import {
   type Message,
   type User,
 } from "discord.js";
+import type { CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
@@ -33,7 +34,7 @@ import {
  */
 type Card = { rank: string; value: number; suit: string };
 
-function newDeck(): Card[] {
+function newDeck(rng: CasinoRng): Card[] {
   const suits = ["♠", "♥", "♦", "♣"];
   const ranks: Array<[string, number]> = [
     ["A", 11], ["2", 2], ["3", 3], ["4", 4], ["5", 5], ["6", 6], ["7", 7],
@@ -41,11 +42,7 @@ function newDeck(): Card[] {
   ];
   const d: Card[] = [];
   for (const s of suits) for (const [r, v] of ranks) d.push({ rank: r, value: v, suit: s });
-  for (let i = d.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [d[i], d[j]] = [d[j]!, d[i]!];
-  }
-  return d;
+  return rng.shuffle(d);
 }
 function handValue(h: Card[]): number {
   let t = h.reduce((s, c) => s + c.value, 0);
@@ -131,7 +128,7 @@ export async function playBjDuel(
     return;
   }
 
-  const deck = newDeck();
+  const deck = newDeck(services.rng);
   const cHand: Card[] = [deck.pop()!, deck.pop()!];
   const oHand: Card[] = [deck.pop()!, deck.pop()!];
   let cStand = false;

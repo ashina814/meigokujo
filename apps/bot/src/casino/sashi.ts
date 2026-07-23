@@ -112,7 +112,7 @@ export async function playSashi(
   });
   await sleep(1500);
 
-  const challengerWins = Math.random() < 0.5;
+  const challengerWins = services.rng.int(0, 1) === 0;
   const winnerId = challengerWins ? challenger.id : opponent.id;
   const loserId = challengerWins ? opponent.id : challenger.id;
   const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2, session);

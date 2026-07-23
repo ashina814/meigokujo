@@ -236,7 +236,7 @@ export async function playRoulette(
     //（settle が賭け徴収→配当を原子的にやる。戦績・イベントログも settle 経由で記録される）
     services.escrow.refund(session);
 
-    const n = Math.floor(Math.random() * 37);
+    const n = services.rng.int(0, 36);
     const lines: string[] = [];
     let anyWin = false;
     for (const b of bets.values()) {

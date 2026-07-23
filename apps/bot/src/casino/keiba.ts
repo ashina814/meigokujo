@@ -13,7 +13,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import { HOUSE_HOLDER, JACKPOT_HOLDER } from "@meigokujo/core";
+import { JACKPOT_HOLDER, escrowHolderFor } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
 import { C_LOSE, C_MAMMON, C_WIN, E, buildLobbyEmbed } from "./ui.js";
@@ -234,7 +234,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
   const positions = new Map<number, number>(HORSES.map((h) => [h.id, 0]));
   const finished: number[] = []; // ゴール順
   // 馬ごとのコンディション（0.8〜1.2）
-  const conditions = new Map<number, number>(HORSES.map((h) => [h.id, 0.8 + Math.random() * 0.4]));
+  const conditions = new Map<number, number>(HORSES.map((h) => [h.id, 0.8 + services.rng.float() * 0.4]));
 
   const buildLane = (pos: number) => {
     const p = Math.max(0, Math.min(TRACK_LENGTH, Math.floor(pos)));
@@ -311,7 +311,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
             : h.style === "sashi"
               ? 0.35 * progress   // 中盤〜終盤
               : 0.45 * progress;  // 追込は終盤爆発
-      const randomFactor = 0.75 + Math.random() * 0.5;
+      const randomFactor = 0.75 + services.rng.float() * 0.5;
       const move = h.baseSpeed * 0.35 * (conditions.get(h.id) ?? 1) * randomFactor + styleBonus;
       const next = Math.min(TRACK_LENGTH, current + move);
       positions.set(h.id, next);
@@ -376,28 +376,43 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
   const winHitTotal = winHit.reduce((s, b) => s + b.amount, 0);
   const placeHitTotal = placeHit.reduce((s, b) => s + b.amount, 0);
 
+  // 全ての賭け金はエスクロー保有者 escrow:session:<session> に集めてある。
+  // 場代・分配・キャリーオーバーは全てそこから動かす。house は関わらない。
+  const src = escrowHolderFor(session);
   const winCut = Math.floor(winPool * HOUSE_RATE);
   const placeCut = Math.floor(placePool * HOUSE_RATE);
-  if (winCut > 0) services.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, winCut);
-  if (placeCut > 0) services.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, placeCut);
+  if (winCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, winCut);
+  if (placeCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, placeCut);
   const winDistributable = winPool - winCut;
   const placeDistributable = placePool - placeCut;
 
-  // 単勝分配: 的中者に賭け額比で
-  for (const b of winHit) {
-    if (winHitTotal === 0) break;
-    const payout = Math.floor((winDistributable * b.amount) / winHitTotal);
-    if (payout > 0) services.ether.transfer(HOUSE_HOLDER, b.userId, payout);
+  // 単勝分配: 的中者に賭け額比で（端数は最後の的中者に寄せる）
+  {
+    let remaining = winDistributable;
+    for (let i = 0; i < winHit.length; i++) {
+      const b = winHit[i]!;
+      if (winHitTotal === 0) break;
+      const isLast = i === winHit.length - 1;
+      const payout = isLast ? remaining : Math.floor((winDistributable * b.amount) / winHitTotal);
+      if (payout > 0) services.ether.transfer(src, b.userId, payout);
+      remaining -= payout;
+    }
   }
   // 複勝分配
-  for (const b of placeHit) {
-    if (placeHitTotal === 0) break;
-    const payout = Math.floor((placeDistributable * b.amount) / placeHitTotal);
-    if (payout > 0) services.ether.transfer(HOUSE_HOLDER, b.userId, payout);
+  {
+    let remaining = placeDistributable;
+    for (let i = 0; i < placeHit.length; i++) {
+      const b = placeHit[i]!;
+      if (placeHitTotal === 0) break;
+      const isLast = i === placeHit.length - 1;
+      const payout = isLast ? remaining : Math.floor((placeDistributable * b.amount) / placeHitTotal);
+      if (payout > 0) services.ether.transfer(src, b.userId, payout);
+      remaining -= payout;
+    }
   }
   // 的中者がいなかった分は JP へ（キャリーオーバー相当）
-  if (winHit.length === 0 && winDistributable > 0) services.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, winDistributable);
-  if (placeHit.length === 0 && placeDistributable > 0) services.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, placeDistributable);
+  if (winHit.length === 0 && winDistributable > 0) services.ether.transfer(src, JACKPOT_HOLDER, winDistributable);
+  if (placeHit.length === 0 && placeDistributable > 0) services.ether.transfer(src, JACKPOT_HOLDER, placeDistributable);
   // 精算完了: エスクロー記録を消す（金は分配済み。以降のembed失敗で二重返金させない）
   services.escrow.clear(session);
 

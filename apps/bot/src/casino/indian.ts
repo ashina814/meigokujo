@@ -9,6 +9,7 @@ import {
   type Message,
   type User,
 } from "discord.js";
+import type { CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET } from "./common.js";
@@ -38,8 +39,8 @@ const RANK_NAMES = ["", "A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", 
 const SUITS = ["♠", "♥", "♦", "♣"] as const;
 const rankName = (n: number) => RANK_NAMES[n] ?? "?";
 
-function draw(): { rank: number; suit: string } {
-  return { rank: 1 + Math.floor(Math.random() * 13), suit: SUITS[Math.floor(Math.random() * SUITS.length)]! };
+function draw(rng: CasinoRng): { rank: number; suit: string } {
+  return { rank: rng.int(1, 13), suit: rng.pick(SUITS) };
 }
 
 export async function playIndian(
@@ -116,8 +117,8 @@ export async function playIndian(
   }
 
   // 配札
-  const cChallenger = draw();
-  const cOpponent = draw();
+  const cChallenger = draw(services.rng);
+  const cOpponent = draw(services.rng);
 
   // 各人に相手のカードを DM で通知。どちらかの DM が閉じていたら勝負自体を流す
   //（catch 内の return はコールバックを抜けるだけでゲームが続いてしまうので、フラグで本体を止める）
