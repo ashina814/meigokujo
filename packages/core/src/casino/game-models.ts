@@ -62,17 +62,29 @@ export function rouletteRtp(): {
 /**
  * クラッシュ（マルチプライヤーが崩壊するまで引き延ばして cashout）。
  *
- * 崩壊分布（apps/bot 実装準拠）:
- * - 1% は即崩壊（1.0 倍 = 元金没収）
- * - 残り 99% は `e/(1-r)` で分布。r ∈ [0.01, 1)、e = 1 - HOUSE_EDGE(=0.04) = 0.96
- *   → P(crash >= M) = 0.96/M（r 一様なので）
+ * ## 崩壊分布（本モデルが「単一の実装」・bot からも import する）
+ * - r ∈ [0, 1) を一様サンプリング
+ * - r < 0.01（1%）: crash = 1.0（即崩壊）
+ * - r >= 0.01     : crash = (1 - HOUSE_EDGE) / (1 - r) = 0.96 / (1 - r)
  *
- * 固定戦略「常に M で cashout」の RTP:
- *   RTP(M) = P(crash >= M) × M = 0.99 × (0.96 / M) × M = 0.9504
- * すなわち M によらず 95.04%。プレイヤーは M の選び方で「当たる回数 × 大きさ」だけを変えられる。
+ * ## 理論 RTP（重要: 1%即崩壊を "追加" 控除してはいけない）
+ * 最低降車 MIN_CASHOUT >= 1.0（実際は 1.5）で降りる固定戦略 M の場合:
+ *   crash >= M ⟺ 0.96 / (1 - r) >= M ⟺ r >= 1 - 0.96/M
+ *   ここで 1 - 0.96/M > 0.01（M > 0.97）なら、下側の 1% は既に「crash=1.0 < M で負け」に
+ *   含まれている（分岐 r < 0.01 は crash=1.0 なので M>1 では絶対に勝てない）。
+ *   したがって P(crash >= M) = 1 - (1 - 0.96/M) = 0.96 / M
+ *   RTP(M) = P(crash >= M) × M = **0.96**（M に依らず 96%）
+ *
+ * これに（1 - 即崩壊率）を追加で掛けると 1% を二重控除になる。
+ * 実装丸め（`Math.round(x*100)/100` と `Math.max(1.0, ...)`）で若干下振れするので、
+ * 実測 RTP はわずかに 96% を下回る（テストは 95〜96% 帯で検証）。
  */
 export const CRASH_HOUSE_EDGE = 0.04;
 export const CRASH_INSTANT_BUST_RATE = 0.01;
+/** 最低降車倍率。M < MIN_CASHOUT の戦略は不能（実装が受け付けない） */
+export const CRASH_MIN_CASHOUT = 1.5;
+/** 表示・テストで使うテーブルリミット倍率（マモン純3=100倍と同じスケール） */
+export const CRASH_MAX_MULT_CAP = 100;
 
 export function crashPoint(rng: CasinoRng): number {
   const r = rng.float();
@@ -81,20 +93,25 @@ export function crashPoint(rng: CasinoRng): number {
   return Math.max(1.0, Math.round(crash * 100) / 100);
 }
 
-/** 固定 cashout 戦略の理論 RTP */
-export function crashRtp(_cashoutTarget: number): number {
-  return (1 - CRASH_INSTANT_BUST_RATE) * (1 - CRASH_HOUSE_EDGE);
+/**
+ * 固定 cashout 戦略の理論 RTP。
+ * 分布上 M >= 1 なら (1 - HOUSE_EDGE)、それ以外は 0（M < 1 では受け付け不能）。
+ * cashoutTarget は情報として受け取るが、値そのものによらず RTP は一定（この歪みの少ない分布の性質）。
+ */
+export function crashRtp(cashoutTarget: number): number {
+  if (cashoutTarget < 1) return 0;
+  return 1 - CRASH_HOUSE_EDGE;
 }
 
 // ─── 板（Markets）: 場代 3% ─────────────────────────────
-/** 板の固定パラメータ。実装は packages/core/src/casino/market.ts の HOUSE_CUT と一致させること */
+/** 板の場代率。core/casino/market.ts が同名 export を import する（単一の真実源） */
 export const MARKET_HOUSE_CUT = 0.03;
 export function marketPlayerRtp(): number {
   return 1 - MARKET_HOUSE_CUT;
 }
 
 // ─── 競馬（Keiba）: 場代 10% ────────────────────────────
-/** 競馬の固定パラメータ。実装 apps/bot/src/casino/keiba.ts の HOUSE_RATE と一致させること */
+/** 競馬の場代率。apps/bot/src/casino/keiba.ts が同名 export を import する */
 export const KEIBA_HOUSE_RATE = 0.1;
 export function keibaPlayerRtp(): number {
   return 1 - KEIBA_HOUSE_RATE;
@@ -266,21 +283,44 @@ function evalPoker(h: PkCard[]): HandRank {
 }
 
 /**
- * Jacks or Better 準拠の代表的な配当表（多くの実装で使われる 9/6 表）。
- * 実装 poker.ts の payoutTable と別物になっている可能性があるので、
- * ここでは「基準となる配当表」に対する RTP を測る（実装依存で微差はあり得る）。
+ * Jacks or Better 配当表（単一の真実源）。
+ * apps/bot/src/casino/poker.ts の payMult もここから import する。
+ *
+ * インデックスは実装（apps/bot/src/casino/poker.ts の category）と一致:
+ *   0=未使用, 1=ハイカード, 2=J未満のペア, 3=J以上のペア, 4=ツーペア, 5=スリー,
+ *   6=ストレート, 7=フラッシュ, 8=フルハウス, 9=フォー, 10=ストレートフラッシュ, 11=ロイヤル
+ * 配当は「payout multiplier（元金含む）」= bet × mult が戻ってくる額。
  */
-const POKER_PAYOUTS: Record<HandRank, number> = {
-  0: 0,   // ハイ
-  1: 0,   // ジャック未満のペア
-  2: 2,   // ツーペア
-  3: 3,   // スリー
-  4: 4,   // ストレート
-  5: 6,   // フラッシュ
-  6: 9,   // フルハウス
-  7: 25,  // フォー
-  8: 50,  // ストレートフラッシュ
-  9: 250, // ロイヤル
+export const POKER_CATEGORY_PAYOUTS: readonly number[] = [
+  0, // (未使用: category は 1 始まり)
+  0, // 1: ハイカード
+  0, // 2: J 未満のペア
+  2, // 3: J 以上のペア（Jacks or Better）
+  3, // 4: ツーペア
+  4, // 5: スリーカード
+  5, // 6: ストレート
+  7, // 7: フラッシュ
+  10, // 8: フルハウス
+  26, // 9: フォーカード
+  51, // 10: ストレートフラッシュ
+  251, // 11: ロイヤルフラッシュ
+];
+
+/**
+ * 旧形式 API（RTPシミュレータの HandRank 0-9 用）。
+ * 新規コードは POKER_CATEGORY_PAYOUTS を使うこと。
+ */
+export const POKER_PAYOUTS: Readonly<Record<HandRank, number>> = {
+  0: POKER_CATEGORY_PAYOUTS[1]!, // high
+  1: POKER_CATEGORY_PAYOUTS[2]!, // low pair
+  2: POKER_CATEGORY_PAYOUTS[4]!, // two pair
+  3: POKER_CATEGORY_PAYOUTS[5]!, // three
+  4: POKER_CATEGORY_PAYOUTS[6]!, // straight
+  5: POKER_CATEGORY_PAYOUTS[7]!, // flush
+  6: POKER_CATEGORY_PAYOUTS[8]!, // full
+  7: POKER_CATEGORY_PAYOUTS[9]!, // four
+  8: POKER_CATEGORY_PAYOUTS[10]!, // straight flush
+  9: POKER_CATEGORY_PAYOUTS[11]!, // royal
 };
 
 function pokerHold(rng: CasinoRng, strategy: PokerStrategy): { payout: number; hand: HandRank } {

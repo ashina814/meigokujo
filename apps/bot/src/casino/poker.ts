@@ -9,7 +9,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import type { CasinoRng } from "@meigokujo/core";
+import { POKER_CATEGORY_PAYOUTS, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
@@ -61,7 +61,9 @@ const CAT_LABELS: readonly string[] = [
   "ストレートフラッシュ",
   "ロイヤルフラッシュ",
 ];
-const CAT_PAYS: readonly number[] = [0, 0, 0, 2, 3, 4, 5, 7, 10, 26, 51, 251]; // payout(=bet+profit) 倍率
+// 配当表は core の POKER_CATEGORY_PAYOUTS を単一の真実源として import する。
+// テスト（core/tests/casino-game-rtp.test.ts）も同じ定数を参照して RTP を検証する。
+const CAT_PAYS: readonly number[] = POKER_CATEGORY_PAYOUTS;
 // ※ ジャックス・オア・ベター（1x）= 賭け金返却+1x = 2x payout。以降 profit=(bet*X)-bet の関係。
 
 function evaluate(hand: Card[]): HandEval {

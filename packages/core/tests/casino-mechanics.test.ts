@@ -112,50 +112,151 @@ describe("福の重み（fuku）", () => {
 });
 
 describe("お守り（amulet）", () => {
-  it("福のお守り: 消費で 1回だけ +5% 補正、以後は無効", () => {
+  it("福のお守り: 消費で 1回だけ発動、cap で頭打ち", () => {
     const ctx = setup();
     ctx.items.grant("a", "omamori", 2);
     ctx.items.arm("a", "omamori");
-    // 装備中 → 発動 → mult=1.05, 消費で剥がれる
-    const r1 = ctx.items.consumeWinBonus("a");
-    expect(r1.mult).toBeCloseTo(1.05);
+    // 装備中 → 発動 → 利益 1000 × 5% = 50◈ ボーナス (cap 5000 未満)
+    const r1 = ctx.items.consumeWinBonus("a", 2_000, 1_000);
+    expect(r1.bonus).toBe(50);
     expect(ctx.items.isArmed("a", "omamori")).toBe(false);
     // 再装備しないと発動しない
-    const r2 = ctx.items.consumeWinBonus("a");
-    expect(r2.mult).toBe(1);
+    const r2 = ctx.items.consumeWinBonus("a", 2_000, 1_000);
+    expect(r2.bonus).toBe(0);
     // 在庫はまだ 1 残っている（arm で消費した分だけ）
     expect(ctx.items.qty("a", "omamori")).toBe(1);
   });
 
-  it("庇護 > 保険 の優先順位で発動する", () => {
+  it("福のお守り: 高額ベットの利益に対して cap 5,000◈ で頭打ち", () => {
+    const ctx = setup();
+    ctx.items.grant("a", "omamori", 1);
+    ctx.items.arm("a", "omamori");
+    // 100万利益 × 5% = 50,000 だが cap 5,000 で頭打ち
+    const r = ctx.items.consumeWinBonus("a", 2_000_000, 1_000_000);
+    expect(r.bonus).toBe(5_000);
+  });
+
+  it("庇護 > 保険 の優先順位で発動する（cap も反映）", () => {
     const ctx = setup();
     ctx.items.grant("a", "hoken", 1);
     ctx.items.grant("a", "higo", 1);
     ctx.items.arm("a", "hoken");
     ctx.items.arm("a", "higo");
-    const r = ctx.items.consumeLossProtection("a");
-    // 庇護（power 1.0）が優先
-    expect(r.refundRate).toBe(1.0);
+    // 庇護（power 1.0, cap 15,000）が優先。bet 8,000 × 100% = 8,000 (cap 未満)
+    const r = ctx.items.consumeLossProtection("a", 8_000);
+    expect(r.refund).toBe(8_000);
     // 保険（power 0.5）は残っている
     expect(ctx.items.isArmed("a", "hoken")).toBe(true);
     expect(ctx.items.isArmed("a", "higo")).toBe(false);
   });
 
+  it("庇護: 100万ベットの敗北でも cap 15,000◈ で頭打ち", () => {
+    const ctx = setup();
+    ctx.items.grant("a", "higo", 1);
+    ctx.items.arm("a", "higo");
+    const r = ctx.items.consumeLossProtection("a", 1_000_000);
+    expect(r.refund).toBe(15_000);
+  });
+
+  it("保険符: 100万ベットの敗北でも cap 5,000◈ で頭打ち", () => {
+    const ctx = setup();
+    ctx.items.grant("a", "hoken", 1);
+    ctx.items.arm("a", "hoken");
+    const r = ctx.items.consumeLossProtection("a", 1_000_000);
+    expect(r.refund).toBe(5_000);
+  });
+
   it("お守り込みでもエテル総量が保存される（総量保存 + 二重発動なし）", () => {
     const ctx = setup();
     const total0 = ctx.ether.outstanding();
-    // 勝ち補正（+5%）
     ctx.items.grant("a", "omamori", 1);
     ctx.items.arm("a", "omamori");
     // ゲーム側で consumeWinBonus を呼び、その結果 payout を上乗せして settle する想定
-    const bonus = ctx.items.consumeWinBonus("a");
+    const bonus = ctx.items.consumeWinBonus("a", 2_000, 1_000);
     const rawPayout = 2_000;
-    const adjustedPayout = Math.floor(rawPayout * bonus.mult); // 2100
+    const adjustedPayout = rawPayout + bonus.bonus; // 2050
     ctx.casino.settle("a", "test", 1_000, adjustedPayout, 0, { chain: false, fuku: false });
     expect(ctx.ether.outstanding()).toBe(total0);
     // 二重発動しない
-    const again = ctx.items.consumeWinBonus("a");
-    expect(again.mult).toBe(1);
+    const again = ctx.items.consumeWinBonus("a", 2_000, 1_000);
+    expect(again.bonus).toBe(0);
+  });
+});
+
+describe("お守り裁定取引の封じ込め（毎回購入戦略の期待値）", () => {
+  const HOKEN_PRICE = 3_000;
+  const HOKEN_CAP = 5_000;
+  const HIGO_PRICE = 12_000;
+  const HIGO_CAP = 15_000;
+  const OMAMORI_PRICE = 4_000;
+  const OMAMORI_CAP = 5_000;
+
+  it("保険符: 高額ベット時の期待利益（勝率50%仮定）が価格を超えない", () => {
+    // 「毎回 3,000◈ で保険符を買い、大額ベットする」戦略の期待値。
+    // 勝率 p, 賭け bet の場合、期待利益 = -HOKEN_PRICE + (1-p) × min(bet×0.5, cap)
+    // 勝率 50% (BJ 相当) で bet 100万 なら (1-0.5) × 5000 = 2500。価格 3000 を回収できない。
+    for (const bet of [10_000, 100_000, 1_000_000]) {
+      const expectedRefund = Math.min(bet * 0.5, HOKEN_CAP);
+      const expectedGain = 0.5 * expectedRefund - HOKEN_PRICE;
+      // 勝敗にかかわらず、アイテム単体の期待利益は負
+      expect(expectedGain).toBeLessThan(0);
+    }
+  });
+
+  it("庇護の札: 高額ベット時の期待利益（勝率50%仮定）が価格を超えない", () => {
+    for (const bet of [10_000, 100_000, 1_000_000]) {
+      const expectedRefund = Math.min(bet * 1.0, HIGO_CAP);
+      const expectedGain = 0.5 * expectedRefund - HIGO_PRICE;
+      expect(expectedGain).toBeLessThan(0);
+    }
+  });
+
+  it("福のお守り: 高額配当時の期待利益（勝率50%仮定）が価格を超えない", () => {
+    // 勝率 50%、配当倍率 2倍（純利益 = bet）想定
+    for (const bet of [10_000, 100_000, 1_000_000]) {
+      const profit = bet; // 2倍配当なら利益 = bet
+      const expectedBonus = Math.min(profit * 0.05, OMAMORI_CAP);
+      const expectedGain = 0.5 * expectedBonus - OMAMORI_PRICE;
+      expect(expectedGain).toBeLessThan(0);
+    }
+  });
+
+  it("シミュレーション: bet=1M で毎回買って装備する戦略でも胴元は黒字を維持", () => {
+    // 高額シミュレーション用の専用 setup（house と player に大きな元手を持たせる）
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    const ether = new EtherExchange(db, ledger, new EventLog(db));
+    const casino = new Casino(db, ether, new EventLog(db));
+    const items = new Items(db);
+    const departments = new Departments(db, ledger);
+    departments.upsert("賭博場", "賭博場", null);
+    ledger.transfer({ from: TREASURY, to: deptAccount("賭博場"), amount: 100_000_000, type: "adjust", actor: "t", approvedBy: "t", idempotencyKey: "seed:dept" });
+    ether.fundFromAccount(deptAccount("賭博場"), 100_000_000, HOUSE_HOLDER, "seed:house");
+    // house は 10億エテル持つ。プレイヤーには 5億支給（承認閾値超なので approvedBy 付き）
+    ledger.ensureAccount("user:a", "user");
+    ledger.transfer({ from: TREASURY, to: "user:a", amount: 50_000_000, type: "initial", actor: "t", approvedBy: "t", idempotencyKey: "seed:a" });
+    ether.buy("a", 50_000_000, "seed:buy:a");
+
+    const N = 200;
+    const bet = 1_000_000;
+    const houseBefore = ether.balanceOf(HOUSE_HOLDER);
+    // 保険符戦略: 買う → 装備 → bet → 勝率 50%
+    for (let i = 0; i < N; i++) {
+      ether.transfer("a", HOUSE_HOLDER, HOKEN_PRICE);
+      items.grant("a", "hoken", 1);
+      items.arm("a", "hoken");
+      const won = i % 2 === 0;
+      if (won) {
+        casino.settle("a", "arbitrage", bet, 2 * bet, 0, { chain: false, fuku: false });
+      } else {
+        const p = items.consumeLossProtection("a", bet);
+        casino.settle("a", "arbitrage", bet, p.refund, 0, { chain: false, fuku: false });
+      }
+    }
+    const houseAfter = ether.balanceOf(HOUSE_HOLDER);
+    const houseNet = houseAfter - houseBefore;
+    // 胴元は黒字（=プレイヤー裁定不可）。理論的には +100,000 前後
+    expect(houseNet).toBeGreaterThan(0);
   });
 });
 

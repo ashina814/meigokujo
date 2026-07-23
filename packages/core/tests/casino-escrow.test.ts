@@ -113,6 +113,79 @@ describe("エスクロー資金分離", () => {
     expect(ctx.casino.canAccept(house0 + 1)).toBe(false);
   });
 
+  it("settle: 原子的に全分配が成功する（合計 == プールで正常終了）", () => {
+    ctx.escrow.hold("sess1", "a", 6_000, "duel");
+    ctx.escrow.hold("sess1", "b", 4_000, "duel");
+    const beforeA = ctx.ether.balanceOf("a");
+    const beforeB = ctx.ether.balanceOf("b");
+    const jp0 = ctx.ether.balanceOf("jackpot");
+    ctx.escrow.settle(
+      "sess1",
+      [
+        { to: "jackpot", amount: 300, reason: "場代" },
+        { to: "a", amount: 5_700, reason: "勝者" },
+        { to: "b", amount: 4_000, reason: "引き分け返金" },
+      ],
+      "test",
+      "atomic settle ok",
+    );
+    expect(ctx.ether.balanceOf("a")).toBe(beforeA + 5_700);
+    expect(ctx.ether.balanceOf("b")).toBe(beforeB + 4_000);
+    expect(ctx.ether.balanceOf("jackpot")).toBe(jp0 + 300);
+    expect(ctx.escrow.list("sess1")).toEqual([]);
+    // 保有者残高は 0
+    expect(ctx.ether.balanceOf(escrowHolderFor("sess1"))).toBe(0);
+  });
+
+  it("settle: 合計 != プールなら例外・状態変わらず（プリチェック）", () => {
+    ctx.escrow.hold("sess1", "a", 5_000, "duel");
+    const beforeA = ctx.ether.balanceOf("a");
+    const pool0 = ctx.ether.balanceOf(escrowHolderFor("sess1"));
+    expect(() =>
+      ctx.escrow.settle("sess1", [{ to: "a", amount: 4_999, reason: "誤配分" }], "test", "wrong total"),
+    ).toThrowError(/distribution total/);
+    // 例外前後で状態は変わらない
+    expect(ctx.ether.balanceOf("a")).toBe(beforeA);
+    expect(ctx.ether.balanceOf(escrowHolderFor("sess1"))).toBe(pool0);
+    expect(ctx.escrow.list("sess1")).toHaveLength(1);
+  });
+
+  it("settle: 中間送金で例外を注入するとトランザクション全体がロールバックする", () => {
+    ctx.escrow.hold("sess1", "a", 6_000, "duel");
+    ctx.escrow.hold("sess1", "b", 4_000, "duel");
+    const beforeA = ctx.ether.balanceOf("a");
+    const beforeB = ctx.ether.balanceOf("b");
+    const jp0 = ctx.ether.balanceOf("jackpot");
+    const pool0 = ctx.ether.balanceOf(escrowHolderFor("sess1"));
+
+    // 2 番目の送金 (index=1) で例外を注入
+    expect(() =>
+      ctx.escrow.settle(
+        "sess1",
+        [
+          { to: "jackpot", amount: 300 },
+          { to: "a", amount: 5_700 },
+          { to: "b", amount: 4_000 },
+        ],
+        "test",
+        "inject failure",
+        (index) => {
+          if (index === 1) throw new Error("simulated network failure mid-settle");
+        },
+      ),
+    ).toThrow(/simulated network failure/);
+
+    // ロールバック: 何も動いていないはず
+    expect(ctx.ether.balanceOf("a")).toBe(beforeA);
+    expect(ctx.ether.balanceOf("b")).toBe(beforeB);
+    expect(ctx.ether.balanceOf("jackpot")).toBe(jp0);
+    expect(ctx.ether.balanceOf(escrowHolderFor("sess1"))).toBe(pool0);
+    // 帳簿もそのまま
+    expect(ctx.escrow.list("sess1")).toHaveLength(2);
+    // 整合性: Ledger identity は壊れていない
+    expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
+  });
+
   it("releaseFromQuarantine: 隔離残高を手動で返金または帳消しできる", () => {
     ctx.escrow.hold("sess1", "a", 4_000, "duel");
     ctx.escrow.clear("sess1");
@@ -190,8 +263,10 @@ describe("Markets: 資金分離と精算", () => {
     ctx.markets.bet(m2.id, "b", 1, 4_000);
     const beforeA = ctx.ether.balanceOf("a");
     const beforeB = ctx.ether.balanceOf("b");
-    const n = ctx.markets.refundAllPending("system:startup");
-    expect(n).toBe(2);
+    const r = ctx.markets.refundAllPending("system:startup");
+    expect(r.total).toBe(2);
+    expect(r.refunded).toBe(2);
+    expect(r.failed).toEqual([]);
     expect(ctx.ether.balanceOf("a")).toBe(beforeA + 2_000);
     expect(ctx.ether.balanceOf("b")).toBe(beforeB + 4_000);
     expect(ctx.ether.balanceOf(marketEscrowHolder(m1.id))).toBe(0);
@@ -210,6 +285,80 @@ describe("Markets: 資金分離と精算", () => {
     ctx.markets.approve(m.id, "b");
     // 精算後、エスクロー残高が 0（勝者と JP に配布し尽くした）
     expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(0);
+  });
+
+  it("孤児検出: escrow:market:* も対象になる（settled 済みなのに残高が残っているケース）", () => {
+    const m = ctx.markets.create({
+      guildId: "g", creatorId: "a", title: "T", options: ["○", "×"], durationMin: 10, fee: 0,
+    });
+    // 板を精算完了状態にする
+    ctx.markets.bet(m.id, "a", 0, 1_000);
+    ctx.markets.close(m.id, "admin");
+    ctx.markets.report(m.id, "a", 0);
+    ctx.markets.approve(m.id, "a");
+    // 精算後の状態: エスクロー残高 0、status='settled'
+    expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(0);
+    // 人為的に残高を戻す（精算バグ or 手動介入で発生し得る孤児）
+    // fund で人為的に注入
+    ctx.ether.transfer(HOUSE_HOLDER, marketEscrowHolder(m.id), 500);
+    expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(500);
+    // sweep で隔離に移る（house 直行ではない）
+    const r = ctx.escrow.sweepAll("test:startup");
+    expect(r.orphans).toBe(1);
+    expect(r.orphanTotal).toBe(500);
+    expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(0);
+    expect(ctx.escrow.quarantineBalance()).toBe(500);
+  });
+
+  it("孤児検出: 未精算の open 板は孤児扱いしない（有効な帳簿がある）", () => {
+    const m = ctx.markets.create({
+      guildId: "g", creatorId: "a", title: "T", options: ["○", "×"], durationMin: 10, fee: 0,
+    });
+    ctx.markets.bet(m.id, "a", 0, 2_000);
+    // 未精算 (status='open') → 保有者残高は正当
+    expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(2_000);
+    const r = ctx.escrow.sweepAll("test:startup");
+    // orphans = 0（有効な帳簿がある market は残す）
+    expect(r.orphans).toBe(0);
+    expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(2_000);
+  });
+
+  it("underfunded escrow: refund/settle が黙って house にフォールバックせず例外を投げる", async () => {
+    const m = ctx.markets.create({
+      guildId: "g", creatorId: "a", title: "T", options: ["○", "×"], durationMin: 10, fee: 0,
+    });
+    ctx.markets.bet(m.id, "a", 0, 3_000);
+    // 人為的にエスクロー残高を減らす（バグでずれた状態を再現）
+    ctx.ether.transfer(marketEscrowHolder(m.id), HOUSE_HOLDER, 1_000);
+    expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(2_000);
+    // refund 呼び出し → underfunded escrow で throw
+    expect(() => ctx.markets.refund(m.id, "test")).toThrowError(/ERR_UNDERFUNDED_ESCROW/);
+    // 状態は変わらない (open のまま)
+    const after = ctx.markets.get(m.id)!;
+    expect(after.status).toBe("open");
+  });
+
+  it("refundAllPending: 個別 market の失敗が他の板の返金を止めない", () => {
+    const m1 = ctx.markets.create({
+      guildId: "g", creatorId: "a", title: "T1", options: ["A", "B"], durationMin: 10, fee: 0,
+    });
+    const m2 = ctx.markets.create({
+      guildId: "g", creatorId: "a", title: "T2", options: ["A", "B"], durationMin: 10, fee: 0,
+    });
+    ctx.markets.bet(m1.id, "a", 0, 1_000);
+    ctx.markets.bet(m2.id, "b", 0, 2_000);
+    // m1 を意図的に underfunded にする
+    ctx.ether.transfer(marketEscrowHolder(m1.id), HOUSE_HOLDER, 500);
+    const beforeB = ctx.ether.balanceOf("b");
+    const r = ctx.markets.refundAllPending("test:startup");
+    // m2 は返金成功、m1 は失敗
+    expect(r.total).toBe(2);
+    expect(r.refunded).toBe(1);
+    expect(r.failed).toHaveLength(1);
+    expect(r.failed[0]!.id).toBe(m1.id);
+    expect(r.failed[0]!.error).toMatch(/ERR_UNDERFUNDED_ESCROW/);
+    // m2 のプレイヤー b は返金されている
+    expect(ctx.ether.balanceOf("b")).toBe(beforeB + 2_000);
   });
 
   it("的中者なし → void で全額返金し、エスクロー残高 0", () => {

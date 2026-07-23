@@ -17,13 +17,38 @@ export interface ConsumableDef {
   desc: string;
   price: number; // エテル価格
   kind: ItemKind;
+  /** 効果率（0.05 = +5%、0.5 = 50%返金、1.0 = 全額返金） */
   power: number;
+  /**
+   * 追加払戻・返金の絶対上限（エテル）。0 or 未設定なら上限なし。
+   *
+   * これが無いと、高額ベット時に「アイテム価格 << 期待効果額」となり
+   * プレイヤーの裁定取引が可能になる（例: 3,000◈ の保険符で 100万◈ ベットの敗北から 50万◈ 返金）。
+   * 上限額はおおむね「アイテム価格の 2〜3倍以内」に収める設計。
+   */
+  cap?: number;
 }
 
+/**
+ * 各お守りの効果上限は「価格の 1.25〜1.5倍」を目安に設定している。
+ * これで毎回買って装備しても、期待利益が価格を超えない（＝胴元赤字にならない）よう構造化。
+ */
 export const CONSUMABLES: readonly ConsumableDef[] = [
-  { key: "omamori", name: "福のお守り", desc: "次に勝った時、勝利金が +5% になる。", price: 4_000, kind: "armed_win", power: 0.05 },
-  { key: "hoken", name: "保険符", desc: "次に負けた時、賭け金の半分が戻る。", price: 3_000, kind: "armed_loss", power: 0.5 },
-  { key: "higo", name: "庇護の札", desc: "次の敗北を無効化（賭け金が全額戻る）。", price: 12_000, kind: "armed_loss", power: 1.0 },
+  {
+    key: "omamori", name: "福のお守り",
+    desc: "次に勝った時、勝利金が +5%（最大 +5,000◈）になる。",
+    price: 4_000, kind: "armed_win", power: 0.05, cap: 5_000,
+  },
+  {
+    key: "hoken", name: "保険符",
+    desc: "次に負けた時、賭け金の半分（最大 5,000◈）が戻る。",
+    price: 3_000, kind: "armed_loss", power: 0.5, cap: 5_000,
+  },
+  {
+    key: "higo", name: "庇護の札",
+    desc: "次の敗北を無効化（賭け金の全額、最大 15,000◈ が戻る）。",
+    price: 12_000, kind: "armed_loss", power: 1.0, cap: 15_000,
+  },
   { key: "reroll", name: "二度振りの権", desc: "チンチロでもう一度振り直せる（1回）。", price: 5_000, kind: "game_reroll", power: 0 },
 ];
 
@@ -100,27 +125,51 @@ export class Items {
     this.db.prepare("DELETE FROM casino_active_effects WHERE user_id = ? AND effect_key = ?").run(userId, key);
   }
 
-  /** 勝利時: armed_win を消費して倍率を返す */
-  consumeWinBonus(userId: string): { mult: number; note?: string } {
+  /**
+   * 勝利時: armed_win を消費して "実際に加算するボーナス額（エテル・整数）" を返す。
+   *
+   * @param rawPayout   ゲーム側の raw payout（bet + 利益、エッジ適用後）
+   * @returns bonus     加算するべき額（cap で頭打ち）。呼び出し側は adjustedPayout = rawPayout + bonus を使う
+   *
+   * 旧 API は倍率 (1 + power) を返していたが、高額ベット時に無制限にスケールするため
+   * ユーザーの裁定を許してしまった。新 API は cap で頭打ちにする。
+   * ペイアウトから bet を差し引いた「利益部分」に対して power を掛けるので、
+   * 引き分けや負けでの発動はしない（呼び出し側で rawPayout > bet の場合のみ呼ぶ想定）。
+   */
+  consumeWinBonus(userId: string, rawPayout: number, bet: number): { bonus: number; note?: string } {
     for (const def of CONSUMABLES.filter((c) => c.kind === "armed_win")) {
       if (this.isArmed(userId, def.key)) {
         this.disarm(userId, def.key);
-        return { mult: 1 + def.power, note: `${def.name} 発動（+${Math.round(def.power * 100)}%）` };
+        const profit = Math.max(0, rawPayout - bet);
+        const raw = Math.floor(profit * def.power);
+        const capped = def.cap && def.cap > 0 ? Math.min(raw, def.cap) : raw;
+        return { bonus: capped, note: `${def.name} 発動（+${capped.toLocaleString()}◈）` };
       }
     }
-    return { mult: 1 };
+    return { bonus: 0 };
   }
 
-  /** 敗北時: armed_loss を消費して返金率を返す（庇護優先） */
-  consumeLossProtection(userId: string): { refundRate: number; note?: string } {
+  /**
+   * 敗北時: armed_loss を消費して "返金額（エテル・整数）" を返す。
+   *
+   * @param bet   賭け額
+   * @returns refund  返金額（cap で頭打ち）。呼び出し側は payout = refund を使う
+   *
+   * 旧 API は refundRate（率）を返していたが、高額ベット時に無制限にスケールするため
+   * ユーザーの裁定を許してしまった。新 API は cap で頭打ちにする。
+   * 庇護（power 1.0）と保険（power 0.5）が両方装備されている場合、庇護を優先して消費。
+   */
+  consumeLossProtection(userId: string, bet: number): { refund: number; note?: string } {
     const losses = CONSUMABLES.filter((c) => c.kind === "armed_loss").sort((a, b) => b.power - a.power);
     for (const def of losses) {
       if (this.isArmed(userId, def.key)) {
         this.disarm(userId, def.key);
-        return { refundRate: def.power, note: `${def.name} 発動（${def.power >= 1 ? "敗北無効・全額返金" : `${Math.round(def.power * 100)}%返金`}）` };
+        const raw = Math.floor(bet * def.power);
+        const capped = def.cap && def.cap > 0 ? Math.min(raw, def.cap) : raw;
+        return { refund: capped, note: `${def.name} 発動（${capped.toLocaleString()}◈ 返金）` };
       }
     }
-    return { refundRate: 0 };
+    return { refund: 0 };
   }
 
   /** チンチロ振り直し */

@@ -14,7 +14,9 @@ import { JACKPOT_HOLDER } from "./service.js";
  * 議題立て手数料は JPプールへ。
  * 再起動時の未精算板は refundAllPending() で全額返金 & void 化（呼び出しは起動側）。
  */
-const HOUSE_CUT = 0.03;
+import { MARKET_HOUSE_CUT } from "./game-models.js";
+/** 板の場代率。単一の真実源は game-models.MARKET_HOUSE_CUT */
+const HOUSE_CUT = MARKET_HOUSE_CUT;
 const DEFAULT_FEE = 500;
 export const DISPUTE_WINDOW_SEC = 5 * 60;
 const now = () => Math.floor(Date.now() / 1000);
@@ -67,7 +69,8 @@ export type MarketErrorCode =
   | "ERR_BAD_OPTION"
   | "ERR_INSUFFICIENT_ETHER"
   | "ERR_BAD_AMOUNT"
-  | "ERR_BAD_MODE";
+  | "ERR_BAD_MODE"
+  | "ERR_UNDERFUNDED_ESCROW";
 export class MarketError extends Error {
   constructor(readonly code: MarketErrorCode, readonly meta: Record<string, unknown> = {}) {
     super(code);
@@ -129,14 +132,24 @@ export class Markets {
   /**
    * この板の預り金がどこにあるか。
    * - 新方式: escrow:market:<id>（分離された預り所）
-   * - 旧方式: house（分離前に張られた既存板・起動時 refundAllPending 通過で全て消えているはず）
-   * 判定は「板の pot と保有者残高が一致するか」で自動選択して自己修復する。
-   * pot === 0 なら宛先の分岐は不要（返金しても0）。
+   * - 旧方式: 分離前 (bet が house 直接) の既存板。エスクロー残高 0 かつ pot は
+   *          host が支払える（起動時 refundAllPending 通過済み想定）→ house からの動きを許可
+   *
+   * 整合性チェック:
+   *   - エスクロー残高が pot と一致  → 新方式（安全）
+   *   - エスクロー残高 = 0 かつ pot > 0 → 旧方式 or 手動介入。house にフォールバック
+   *   - エスクロー残高が 0 < balance < pot → underfunded escrow（整合性エラー）
+   *     黙って house から補填すると孤児残高を作る危険がある。例外を投げて呼び出し側で
+   *     market を停止 → refund → 隔離するようにする。
    */
   private fundHolder(id: number, pot: number): string {
     const esc = marketEscrowHolder(id);
-    if (pot > 0 && this.ether.balanceOf(esc) >= pot) return esc;
-    return HOUSE_HOLDER;
+    if (pot === 0) return esc; // 何も動かないので分岐は無害
+    const bal = this.ether.balanceOf(esc);
+    if (bal >= pot) return esc; // 新方式・正常
+    if (bal === 0) return HOUSE_HOLDER; // 旧方式・分離前データ想定
+    // underfunded escrow: エスクロー残高が pot に足りない。整合性エラーで停止する。
+    throw new MarketError("ERR_UNDERFUNDED_ESCROW", { marketId: id, pot, escrowBalance: bal });
   }
 
   create(input: {
@@ -489,13 +502,29 @@ export class Markets {
     this.events.log("market_void", { actor, payload: { id } });
   }
 
-  /** 起動時: open/closed/reported/disputed の未精算板を全部返金 & void。エスクロー整合維持 */
-  refundAllPending(actor: string): number {
+  /**
+   * 起動時: open/closed/reported/disputed の未精算板を全部返金 & void。
+   * 個別の板でエラー（underfunded escrow など）が出ても他の板を止めない。
+   * エラーは events に記録して呼び出し側でログ出力できるようにする。
+   */
+  refundAllPending(actor: string): { total: number; refunded: number; failed: Array<{ id: number; error: string }> } {
     const rows = this.db
       .prepare("SELECT id FROM casino_markets WHERE status IN ('open','closed','reported','disputed')")
       .all() as Array<{ id: number }>;
-    for (const r of rows) this.refund(r.id, actor);
-    return rows.length;
+    let refunded = 0;
+    const failed: Array<{ id: number; error: string }> = [];
+    for (const r of rows) {
+      try {
+        this.refund(r.id, actor);
+        refunded++;
+      } catch (e) {
+        const err = e instanceof MarketError ? `${e.code}:${JSON.stringify(e.meta)}` : (e as Error).message;
+        failed.push({ id: r.id, error: err });
+        // 個別イベントログ（起動時掃除の失敗は必ず監査に残す）
+        this.events.log("market_refund_failed", { actor, payload: { id: r.id, error: err } });
+      }
+    }
+    return { total: rows.length, refunded, failed };
   }
 }
 

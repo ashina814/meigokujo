@@ -141,6 +141,62 @@ export class Escrow {
     this.db.prepare("DELETE FROM casino_escrow WHERE session_id = ?").run(sessionId);
   }
 
+  /**
+   * 原子的精算（推奨エントリポイント）。
+   *
+   * 対象: PvP / 競馬 / その他 escrow.hold() で預けた資金の分配全般。
+   * 動作: エスクロー残高 == 分配合計 を検証し、単一 SQLite トランザクション内で
+   *   1) 全 distribution.to へ ether を送金
+   *   2) casino_escrow の当該セッションを削除
+   *   3) events に settle 記録を残す
+   * 途中の任意の送金で例外が発生すれば全ロールバック（保有者残高・帳簿ともに元の状態に戻る）。
+   *
+   * オプション `_beforeStep` はテスト専用のフック: 各送金の直前に呼ばれ、例外を投げると
+   * その送金は失敗し、トランザクション全体が巻き戻る。プロダクション呼び出しは省略する。
+   */
+  settle(
+    sessionId: string,
+    distributions: ReadonlyArray<{ to: string; amount: number; reason?: string }>,
+    actor: string,
+    reason: string,
+    _beforeStep?: (index: number, dist: { to: string; amount: number }) => void,
+  ): { paid: number; sessionId: string } {
+    const positive = distributions.filter((d) => d.amount > 0);
+    const total = positive.reduce((s, d) => s + d.amount, 0);
+    const holder = this.holderId(sessionId);
+
+    // 事前チェック（トランザクション外・早期リターン）
+    if (positive.some((d) => !Number.isInteger(d.amount) || d.amount < 0)) {
+      throw new Error(`Escrow.settle: bad amount in distributions`);
+    }
+    const pool = this.ether.balanceOf(holder);
+    if (total !== pool) {
+      throw new Error(
+        `Escrow.settle: distribution total ${total} != escrow pool ${pool} for session ${sessionId}`,
+      );
+    }
+
+    return this.db.transaction(() => {
+      for (let i = 0; i < positive.length; i++) {
+        const d = positive[i]!;
+        _beforeStep?.(i, d);
+        this.ether.transfer(holder, d.to, d.amount);
+      }
+      // 帳簿削除は最後（送金が全部通ってから）
+      this.db.prepare("DELETE FROM casino_escrow WHERE session_id = ?").run(sessionId);
+      this.events.log("casino_escrow_settle", {
+        actor,
+        payload: {
+          sessionId,
+          reason,
+          total,
+          distributions: positive.map((d) => ({ to: d.to, amount: d.amount, reason: d.reason })),
+        },
+      });
+      return { paid: total, sessionId };
+    })();
+  }
+
   /** セッションの全員に預かり額を返金して記録を消す。返金した人数を返す */
   refund(sessionId: string): number {
     return this.db.transaction((): number => {
@@ -197,13 +253,49 @@ export class Escrow {
       }
       this.db.prepare("DELETE FROM casino_escrow").run();
 
-      // 孤児残高（記録が無いのに session 保有者に残っているエテル）→ 隔離口座に集約
+      // 孤児残高（記録が無いのに escrow 保有者に残っているエテル）→ 隔離口座に集約。
+      // 隔離口座自身と対応する有効な帳簿がある保有者は除外する。
+      // 対象:
+      //   escrow:session:%   … PvP/競馬/丁半など (casino_escrow で追跡)
+      //   escrow:market:%    … 板 (casino_markets で追跡)
+      // 有効な帳簿があるかは以下で判定:
+      //   session: casino_escrow の対応 session_id が存在
+      //   market:  casino_markets の対応 id が未精算 (open/closed/reported/disputed)
       this.ether.ensureHolder(ESCROW_QUARANTINE);
-      const orphanHolders = this.db
+      const activeSessions = new Set(
+        (this.db.prepare("SELECT DISTINCT session_id FROM casino_escrow").all() as Array<{ session_id: string }>).map(
+          (r) => r.session_id,
+        ),
+      );
+      // markets テーブルは存在しない可能性があるので try/catch でガード（core は Escrow 単体でも使える設計）
+      let activeMarkets = new Set<string>();
+      try {
+        activeMarkets = new Set(
+          (
+            this.db
+              .prepare("SELECT id FROM casino_markets WHERE status IN ('open','closed','reported','disputed')")
+              .all() as Array<{ id: number }>
+          ).map((r) => String(r.id)),
+        );
+      } catch {
+        /* markets テーブル未作成の環境（テスト最小構成）は空扱い */
+      }
+      const allEscrowHolders = this.db
         .prepare(
-          "SELECT user_id, amount FROM ether_balances WHERE user_id LIKE 'escrow:session:%' AND amount > 0",
+          "SELECT user_id, amount FROM ether_balances WHERE user_id LIKE 'escrow:%' AND user_id != ? AND amount > 0",
         )
-        .all() as Array<{ user_id: string; amount: number }>;
+        .all(ESCROW_QUARANTINE) as Array<{ user_id: string; amount: number }>;
+      const orphanHolders = allEscrowHolders.filter((h) => {
+        if (h.user_id.startsWith("escrow:session:")) {
+          const sid = h.user_id.slice("escrow:session:".length);
+          return !activeSessions.has(sid); // 帳簿が消えている = 孤児
+        }
+        if (h.user_id.startsWith("escrow:market:")) {
+          const mid = h.user_id.slice("escrow:market:".length);
+          return !activeMarkets.has(mid); // 板が精算済み/void 済みなのに残高が残っている = 孤児
+        }
+        return true; // 未知の escrow:* も孤児として隔離
+      });
       let orphanTotal = 0;
       const detectedAt = Math.floor(Date.now() / 1000);
       for (const h of orphanHolders) {

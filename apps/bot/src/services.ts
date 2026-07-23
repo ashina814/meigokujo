@@ -96,8 +96,17 @@ export function buildServices() {
   });
   const markets = new Markets(db, ether, events);
   // 起動時に未精算の板を全部返金＆void（エスクロー整合維持）
-  const voided = markets.refundAllPending("system:startup");
-  if (voided > 0) console.log(`[market] 起動時に未精算板 ${voided}件 を返金＆void 化`);
+  const marketSweep = markets.refundAllPending("system:startup");
+  if (marketSweep.refunded > 0) {
+    console.log(`[market] 起動時に未精算板 ${marketSweep.refunded}/${marketSweep.total}件 を返金＆void 化`);
+  }
+  if (marketSweep.failed.length > 0) {
+    // underfunded escrow などで返金に失敗した板。監査ログを見て手動対応する。
+    // この後 escrow.sweepAll() が escrow:market:<id> の残高を隔離するので二重補填にはならない。
+    console.warn(
+      `[market] 起動時 refund 失敗 ${marketSweep.failed.length}件: ${marketSweep.failed.map((f) => `#${f.id}(${f.error})`).join(", ")}`,
+    );
+  }
   const escrow = new Escrow(db, ether, events);
   // 起動時にセッション型ゲーム（対人・競馬・丁半・PvPポーカー等）の預かり残を全額返金
   const swept = escrow.sweepAll("system:startup");

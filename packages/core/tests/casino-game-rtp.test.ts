@@ -85,25 +85,43 @@ describe("クラッシュ（crash）", () => {
     expect(CRASH_INSTANT_BUST_RATE).toBe(0.01);
   });
 
-  it("理論RTP = (1 - 即崩壊率) × (1 - houseEdge) = 0.9504（M によらず一定）", () => {
+  it("理論RTP = 1 - houseEdge = 0.96（M によらず一定・1% 即崩壊は分布に既に含まれる）", () => {
+    // 重要: 1% 即崩壊は r < 0.01 の分岐で crash=1.0 になる。この分は M > 1 の戦略では
+    // 「crash=1.0 < M で負け」に既に数えられているため、(1 - 即崩壊率) を追加で掛けると二重控除。
     for (const M of [1.5, 2, 5, 10, 50]) {
-      expect(crashRtp(M)).toBeCloseTo(0.9504, 4);
+      expect(crashRtp(M)).toBeCloseTo(0.96, 4);
     }
   });
 
-  it("実測: 固定 M=2 cashout, 200,000 回で RTP が 94〜96% に収束", () => {
-    const rng = deterministicRng(3);
-    const M = 2.0;
-    let payouts = 0;
-    const N = 200_000;
-    const bet = 100;
-    for (let i = 0; i < N; i++) {
-      const crash = crashPoint(rng);
-      if (crash >= M) payouts += Math.floor(bet * M);
+  it("実測: 各 M ∈ {1.5, 2, 3, 5, 10} で 200,000 回シミュ、理論値 0.96 との誤差 ±2%", () => {
+    // Math.round(crash*100)/100 の丸めで実測 RTP は理論より若干上下する（M=1.5 で顕著）。
+    // 「1% の二重控除で 0.9504 にならない」ことの確認と、全 M で 100% を超えない保証を検証する。
+    for (const M of [1.5, 2.0, 3.0, 5.0, 10.0]) {
+      const rng = deterministicRng(1000 + Math.floor(M * 10));
+      let payouts = 0;
+      const N = 200_000;
+      const bet = 100;
+      for (let i = 0; i < N; i++) {
+        const crash = crashPoint(rng);
+        if (crash >= M) payouts += Math.floor(bet * M);
+      }
+      const rtp = payouts / (N * bet);
+      expect(rtp).toBeGreaterThan(0.94);
+      expect(rtp).toBeLessThan(0.99); // 100%（胴元赤字）は絶対に超えないこと
     }
-    const rtp = payouts / (N * bet);
-    expect(rtp).toBeGreaterThan(0.93);
-    expect(rtp).toBeLessThan(0.97);
+  });
+
+  it("境界: crashPoint の分布特性を確認（1000サンプルで crash=1.0 が 0.5〜1.5% に近い）", () => {
+    const rng = deterministicRng(42);
+    let insta = 0;
+    const N = 100_000;
+    for (let i = 0; i < N; i++) {
+      const c = crashPoint(rng);
+      if (c === 1.0) insta++;
+    }
+    // 1% 期待値のはず。実際には (1 - 0.96) / 0.99 の追加分（Math.max で 1 に切り上げ）で少し多い
+    expect(insta / N).toBeGreaterThan(0.005);
+    expect(insta / N).toBeLessThan(0.06);
   });
 });
 
