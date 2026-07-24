@@ -41,6 +41,30 @@ jobs:
           LOG=/tmp/ticket-panel-lifecycle.log
           {
             set -euo pipefail
+
+            python - <<'PY'
+          from pathlib import Path
+
+          helpers = [
+              Path('.github/scripts/ticket_panel_lifecycle_core.py'),
+              Path('.github/scripts/ticket_panel_lifecycle_admin_routes.py'),
+              Path('.github/scripts/ticket_panel_lifecycle_admin_ui.py'),
+              Path('.github/scripts/ticket_panel_lifecycle_admin_actions.py'),
+          ]
+          old = 'new_text, count = re.subn(pattern, replacement, text, count=1, flags=flags)'
+          new = 'new_text, count = re.subn(pattern, lambda _match: replacement, text, count=1, flags=flags)'
+          for helper in helpers:
+              text = helper.read_text()
+              if old in text:
+                  text = text.replace(old, new)
+              helper.write_text(text)
+
+          routes = Path('.github/scripts/ticket_panel_lifecycle_admin_routes.py')
+          text = routes.read_text()
+          text = text.replace(r'? `\n⚠️ ${warning}` : ""', r'? `\\n⚠️ ${warning}` : ""')
+          routes.write_text(text)
+          PY
+
             python .github/scripts/ticket_panel_lifecycle_core.py
             python .github/scripts/ticket_panel_lifecycle_admin_routes.py
             python .github/scripts/ticket_panel_lifecycle_admin_ui.py
