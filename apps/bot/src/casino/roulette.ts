@@ -12,6 +12,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
+import { ROULETTE_PAYOUTS as CORE_ROULETTE_PAYOUTS, ROULETTE_SLOTS, rouletteSpin } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
@@ -40,14 +41,15 @@ const LABELS: Record<BetType, string> = {
   low: "小(1-18)",
 };
 
+// 配当は core の ROULETTE_PAYOUTS（単一の真実源）から派生させる。数値変更はモデル側で行う。
 const PAYOUTS: Record<BetType, number> = {
-  red: 2,
-  black: 2,
-  green: 36,
-  odd: 2,
-  even: 2,
-  high: 2,
-  low: 2,
+  red: CORE_ROULETTE_PAYOUTS.even,
+  black: CORE_ROULETTE_PAYOUTS.even,
+  green: CORE_ROULETTE_PAYOUTS.single,
+  odd: CORE_ROULETTE_PAYOUTS.even,
+  even: CORE_ROULETTE_PAYOUTS.even,
+  high: CORE_ROULETTE_PAYOUTS.even,
+  low: CORE_ROULETTE_PAYOUTS.even,
 };
 
 function hits(type: BetType, n: number): boolean {
@@ -236,7 +238,9 @@ export async function playRoulette(
     //（settle が賭け徴収→配当を原子的にやる。戦績・イベントログも settle 経由で記録される）
     services.escrow.refund(session);
 
-    const n = Math.floor(Math.random() * 37);
+    // 抽選も core モデルの rouletteSpin() を使う（37 マス構成が単一の真実源）
+    void ROULETTE_SLOTS;
+    const n = rouletteSpin(services.rng);
     const lines: string[] = [];
     let anyWin = false;
     for (const b of bets.values()) {

@@ -128,10 +128,16 @@ export function sleep(ms: number): Promise<void> {
 }
 
 /**
- * お守り消費: 勝ちなら armed_win で配当倍増、負けなら armed_loss で返金。
+ * お守り消費: 勝ちなら armed_win で加算、負けなら armed_loss で返金。
  * ゲーム側は raw payout を計算した後にこれを呼ぶ。返される payout を最終値として使う。
- * @param bet 賭け額（負け保護の返金額計算に使う）
- * @param rawPayout 生の払戻総額（0=負け）
+ *
+ * v3 で cap 付き絶対値 API に変更（高額ベット時の裁定を封じるため）:
+ * - 福のお守り: bonus = min(profit × 5%, 5,000)
+ * - 保険符  : refund = min(bet × 50%, 5,000)
+ * - 庇護の札: refund = min(bet × 100%, 15,000)
+ *
+ * @param bet 賭け額
+ * @param rawPayout 生の払戻総額（0=負け、bet=引き分け、>bet=勝ち）
  * @returns { payout: 調整後の払戻, note?: string 発動メッセージ }
  */
 export function applyAmulets(
@@ -141,16 +147,13 @@ export function applyAmulets(
   rawPayout: number,
 ): { payout: number; note?: string } {
   if (rawPayout > bet) {
-    const bonus = services.items.consumeWinBonus(userId);
-    if (bonus.mult !== 1) return { payout: Math.floor(rawPayout * bonus.mult), note: bonus.note };
+    const b = services.items.consumeWinBonus(userId, rawPayout, bet);
+    if (b.bonus > 0) return { payout: rawPayout + b.bonus, note: b.note };
     return { payout: rawPayout };
   }
   if (rawPayout < bet) {
-    const prot = services.items.consumeLossProtection(userId);
-    if (prot.refundRate > 0) {
-      const refund = Math.floor(bet * prot.refundRate);
-      return { payout: refund, note: prot.note };
-    }
+    const p = services.items.consumeLossProtection(userId, bet);
+    if (p.refund > 0) return { payout: p.refund, note: p.note };
   }
   return { payout: rawPayout };
 }

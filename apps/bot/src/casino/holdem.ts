@@ -9,6 +9,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
+import type { CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
@@ -37,14 +38,10 @@ interface Card {
 
 const showCard = (c: Card) => `${c.suit}${RANK_LABEL[c.rank]}`;
 
-function newDeck(): Card[] {
+function newDeck(rng: CasinoRng): Card[] {
   const d: Card[] = [];
   for (const s of SUITS) for (let r = 2; r <= 14; r++) d.push({ suit: s, rank: r });
-  for (let i = d.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [d[i], d[j]] = [d[j]!, d[i]!];
-  }
-  return d;
+  return rng.shuffle(d);
 }
 
 interface HandEval {
@@ -180,7 +177,7 @@ async function runRound(
   ante: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const deck = newDeck();
+  const deck = newDeck(services.rng);
   const pHand: [Card, Card] = [deck.pop()!, deck.pop()!];
   const dHand: [Card, Card] = [deck.pop()!, deck.pop()!];
   const flop: Card[] = [deck.pop()!, deck.pop()!, deck.pop()!];

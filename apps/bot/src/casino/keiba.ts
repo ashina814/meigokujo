@@ -13,7 +13,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import { HOUSE_HOLDER, JACKPOT_HOLDER } from "@meigokujo/core";
+import { JACKPOT_HOLDER, KEIBA_HOUSE_RATE, escrowHolderFor } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
 import { C_LOSE, C_MAMMON, C_WIN, E, buildLobbyEmbed } from "./ui.js";
@@ -28,7 +28,8 @@ const LOBBY_SEC = 60;
 const TRACK_LENGTH = 20;
 const BASE_TURN_MS = 1600;
 const FINAL_STRAIGHT_MS = 2400;
-const HOUSE_RATE = 0.1;
+// 場代率は core の KEIBA_HOUSE_RATE を単一の真実源として import する
+const HOUSE_RATE = KEIBA_HOUSE_RATE;
 
 /** 走法。casino-bot 準拠。序盤/中盤/終盤で伸びる馬が変わる */
 type Style = "nige" | "senko" | "sashi" | "oikomi";
@@ -234,7 +235,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
   const positions = new Map<number, number>(HORSES.map((h) => [h.id, 0]));
   const finished: number[] = []; // ゴール順
   // 馬ごとのコンディション（0.8〜1.2）
-  const conditions = new Map<number, number>(HORSES.map((h) => [h.id, 0.8 + Math.random() * 0.4]));
+  const conditions = new Map<number, number>(HORSES.map((h) => [h.id, 0.8 + services.rng.float() * 0.4]));
 
   const buildLane = (pos: number) => {
     const p = Math.max(0, Math.min(TRACK_LENGTH, Math.floor(pos)));
@@ -311,7 +312,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
             : h.style === "sashi"
               ? 0.35 * progress   // 中盤〜終盤
               : 0.45 * progress;  // 追込は終盤爆発
-      const randomFactor = 0.75 + Math.random() * 0.5;
+      const randomFactor = 0.75 + services.rng.float() * 0.5;
       const move = h.baseSpeed * 0.35 * (conditions.get(h.id) ?? 1) * randomFactor + styleBonus;
       const next = Math.min(TRACK_LENGTH, current + move);
       positions.set(h.id, next);
@@ -376,30 +377,48 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
   const winHitTotal = winHit.reduce((s, b) => s + b.amount, 0);
   const placeHitTotal = placeHit.reduce((s, b) => s + b.amount, 0);
 
+  // 単一 SQLite トランザクションで場代・単勝・複勝・キャリーオーバーを分配する。
+  // 途中の任意の送金で例外が出れば全ロールバック（エスクロー残高・帳簿ともに元通り）。
+  void escrowHolderFor(session); // 参照維持
   const winCut = Math.floor(winPool * HOUSE_RATE);
   const placeCut = Math.floor(placePool * HOUSE_RATE);
-  if (winCut > 0) services.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, winCut);
-  if (placeCut > 0) services.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, placeCut);
   const winDistributable = winPool - winCut;
   const placeDistributable = placePool - placeCut;
 
-  // 単勝分配: 的中者に賭け額比で
-  for (const b of winHit) {
-    if (winHitTotal === 0) break;
-    const payout = Math.floor((winDistributable * b.amount) / winHitTotal);
-    if (payout > 0) services.ether.transfer(HOUSE_HOLDER, b.userId, payout);
+  const distributions: Array<{ to: string; amount: number; reason: string }> = [];
+  if (winCut > 0) distributions.push({ to: JACKPOT_HOLDER, amount: winCut, reason: "単勝場代" });
+  if (placeCut > 0) distributions.push({ to: JACKPOT_HOLDER, amount: placeCut, reason: "複勝場代" });
+
+  // 単勝分配: 的中者に賭け額比で（端数は最後の的中者へ寄せる）
+  if (winHit.length > 0 && winHitTotal > 0) {
+    let remaining = winDistributable;
+    for (let i = 0; i < winHit.length; i++) {
+      const b = winHit[i]!;
+      const isLast = i === winHit.length - 1;
+      const payout = isLast ? remaining : Math.floor((winDistributable * b.amount) / winHitTotal);
+      if (payout > 0) distributions.push({ to: b.userId, amount: payout, reason: "単勝配当" });
+      remaining -= payout;
+    }
+  } else if (winDistributable > 0) {
+    distributions.push({ to: JACKPOT_HOLDER, amount: winDistributable, reason: "単勝キャリーオーバー" });
   }
+
   // 複勝分配
-  for (const b of placeHit) {
-    if (placeHitTotal === 0) break;
-    const payout = Math.floor((placeDistributable * b.amount) / placeHitTotal);
-    if (payout > 0) services.ether.transfer(HOUSE_HOLDER, b.userId, payout);
+  if (placeHit.length > 0 && placeHitTotal > 0) {
+    let remaining = placeDistributable;
+    for (let i = 0; i < placeHit.length; i++) {
+      const b = placeHit[i]!;
+      const isLast = i === placeHit.length - 1;
+      const payout = isLast ? remaining : Math.floor((placeDistributable * b.amount) / placeHitTotal);
+      if (payout > 0) distributions.push({ to: b.userId, amount: payout, reason: "複勝配当" });
+      remaining -= payout;
+    }
+  } else if (placeDistributable > 0) {
+    distributions.push({ to: JACKPOT_HOLDER, amount: placeDistributable, reason: "複勝キャリーオーバー" });
   }
-  // 的中者がいなかった分は JP へ（キャリーオーバー相当）
-  if (winHit.length === 0 && winDistributable > 0) services.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, winDistributable);
-  if (placeHit.length === 0 && placeDistributable > 0) services.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, placeDistributable);
-  // 精算完了: エスクロー記録を消す（金は分配済み。以降のembed失敗で二重返金させない）
-  services.escrow.clear(session);
+
+  // 原子的精算（合計 !== プールなら例外・途中失敗も全ロールバック）
+  services.escrow.settle(session, distributions, "system:keiba", `race ${session}`);
 
   const winnerHorse = HORSES.find((h) => h.id === winnerId)!;
   const top3 = finished.slice(0, 3).map((id, i) => {

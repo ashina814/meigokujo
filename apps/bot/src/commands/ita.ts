@@ -42,6 +42,7 @@ const STATUS_LABEL: Record<Market["status"], string> = {
   disputed: "⚖️ 異議あり — 裁定待ち",
   settled: "✅ 精算済み",
   void: "♻️ 無効・返金済み",
+  frozen: "🧊 資金不整合・凍結中（運営調査待ち）",
 };
 
 export const itaCommand = new SlashCommandBuilder()

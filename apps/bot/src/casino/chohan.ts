@@ -9,6 +9,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
+import { CHOHAN_PAYOUT, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
@@ -17,16 +18,16 @@ import { broadcastBigWin } from "./bigwin.js";
 
 /**
  * 🎴 丁半（ソロ・casino-bot 準拠）。
- * - 丁/半 を選ぶ → サイコロ2つ振って偶奇判定 → 2倍配当（エッジ3%）
+ * - 丁/半 を選ぶ → サイコロ2つ振って偶奇判定 → 1.94倍配当（RTP 97%）
  * - 結果画面に「もう一回」「倍プッシュ」「配当表」「退席」の4ボタン
  * - 15秒無操作は賭け金返却
  */
-const HOUSE_EDGE = 0.03;
+// 配当倍率は core の CHOHAN_PAYOUT を唯一の真実源として使う（表示配当表・実払戻・RTPテストが一致）
 const DICE_EMOJI: Record<number, string> = { 1: "①", 2: "②", 3: "③", 4: "④", 5: "⑤", 6: "⑥" };
 const DIE = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"] as const;
 
-function rollDice(): [number, number] {
-  return [1 + Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 6)];
+function rollDice(rng: CasinoRng): [number, number] {
+  return [rng.int(1, 6), rng.int(1, 6)];
 }
 
 function paytableEmbed(): EmbedBuilder {
@@ -37,7 +38,7 @@ function paytableEmbed(): EmbedBuilder {
       [
         "**遊び方**",
         "・サイコロ2つの合計が **丁（偶数）** か **半（奇数）** かを当てる",
-        "・的中したら賭金 **× 2倍** 払戻し（ハウスエッジで実質1.94倍前後）",
+        "・的中したら賭金 **× 1.94倍** 払戻し（RTP 97%）",
         "",
         "**⚡ 倍プッシュ**",
         "　結果画面から前回の倍額で即再挑戦できる。連勝チャレンジ用",
@@ -118,8 +119,9 @@ async function runRound(
 
   // ── サイコロを振る演出（シェイク3フレーム→確定） ──
   const shakeEmbed = (frame: number) => {
-    const d1 = 1 + Math.floor(Math.random() * 6);
-    const d2 = 1 + Math.floor(Math.random() * 6);
+    // 見た目のシェイクアニメだけは軽い擬似乱数で十分（結果には影響しない）
+    const d1 = services.rng.int(1, 6);
+    const d2 = services.rng.int(1, 6);
     return new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · 丁半" })
       .setColor(C_MAMMON)
@@ -140,13 +142,15 @@ async function runRound(
     await sleep(280);
   }
 
-  const [d1, d2] = rollDice();
+  const [d1, d2] = rollDice(services.rng);
   const total = d1 + d2;
   const isCho = total % 2 === 0;
   const won = (picked === "cho") === isCho;
-  const rawPayout = won ? Math.floor(bet * 2 * (1 - HOUSE_EDGE)) : 0;
+  const rawPayout = won ? Math.floor(bet * CHOHAN_PAYOUT) : 0;
   const amulet = applyAmulets(services, uid, bet, rawPayout);
-  const settled = services.casino.settle(uid, "丁半", bet, amulet.payout);
+  // 連鎖ボーナスは無効化。丁半は 50% 勝率と CHOHAN_PAYOUT=1.94 で RTP 97% だが、
+  // 連鎖有効時は実効 RTP が 106% を超える回帰が実測レポートで確認された（クラッシュと同構造）。
+  const settled = services.casino.settle(uid, "丁半", bet, amulet.payout, 0, { chain: false });
 
   const totalPayout = settled.payout;
   const net = settled.net;

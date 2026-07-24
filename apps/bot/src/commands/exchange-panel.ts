@@ -73,6 +73,7 @@ export async function handleEtherButton(interaction: ButtonInteraction, services
     return;
   }
 
+
   if (action === "balance") {
     const uid = interaction.user.id;
     const ether = services.ether.balanceOf(uid);
@@ -190,9 +191,7 @@ export async function handleEtherModal(interaction: ModalSubmitInteraction, serv
       msg =
         e.code === "ERR_INSUFFICIENT"
           ? `Land が足りない（所持 ${fmtLd(services.ledger.balanceOf(`user:${uid}`))}）。`
-          : e.code === "ERR_MINOR_BLOCKED"
-            ? "未成年は賭場に入れない。掟だ。"
-            : `台帳エラー: ${e.code}`;
+          : `台帳エラー: ${e.code}`;
     }
     await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
   }

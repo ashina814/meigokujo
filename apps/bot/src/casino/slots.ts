@@ -9,6 +9,17 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
+import {
+  SLOT_SYMBOLS as SYMBOLS,
+  TRIPLE_PAYOUTS,
+  DOUBLE_PAYOUTS,
+  SLOTS_JP_CONTRIBUTION as JP_CONTRIBUTION,
+  SLOTS_JP_WIN_SHARE as JP_WIN_SHARE,
+  SLOTS_SCATTER_TRIGGER_COUNT as SCATTER_TRIGGER_COUNT,
+  slotsSpinReel as spinReel,
+  slotsEvaluate as evaluate,
+  type SlotSymbol,
+} from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
@@ -16,115 +27,23 @@ import { C_MAMMON } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
 /**
- * 🎰 スロット。casino-bot 準拠の忠実移植。
+ * 🎰 スロット。casino-bot 準拠。数値モデルは core/casino/slots-model へ委譲。
  * - 3リール、シンボルは冥獄城テーマ
  * - リール1→2→3 と順に止まる演出（サイクル絵柄でぐるぐる感）
  * - 1+2 リールが同じ絵柄で止まったら「あと一つで…」ニアミス煽り
  * - JP は純😈³のみ。積立=賭金1%、当選でプール半分獲得
  * - 魂片✨3つでフリースピン1回（自動再スピン・賭金不要）
  * - 結果画面に「最低/前回/最大」の3ボタン + 📖配当表ボタン
+ *
+ * RTP 計算・回帰テストは packages/core/tests/casino-slots-rtp.test.ts を見る。
  */
 
-const HOUSE_EDGE = 0.04;
-const JP_CONTRIBUTION = 0.01;
-const JP_WIN_SHARE = 0.5;
-const SCATTER_TRIGGER_COUNT = 3;
 const MAX_MULTIPLIER = 100; // マモン³=100倍。テーブルリミット判定用
-
-interface SlotSymbol {
-  emoji: string;
-  name: string;
-  weight: number;
-  kind: "normal" | "wild" | "scatter";
-}
-
-const SYMBOLS: readonly SlotSymbol[] = [
-  { emoji: "🦇", name: "蝙蝠", weight: 28, kind: "normal" },
-  { emoji: "👻", name: "亡霊", weight: 23, kind: "normal" },
-  { emoji: "🔥", name: "獄炎", weight: 17, kind: "normal" },
-  { emoji: "⚔️", name: "魔剣", weight: 13, kind: "normal" },
-  { emoji: "👑", name: "王冠", weight: 8, kind: "normal" },
-  { emoji: "😈", name: "マモン", weight: 3, kind: "normal" },
-  { emoji: "🌙", name: "月", weight: 5, kind: "wild" },
-  { emoji: "✨", name: "魂片", weight: 3, kind: "scatter" },
-];
-
-const TRIPLE_PAYOUTS: Record<string, number> = {
-  蝙蝠: 3,
-  亡霊: 5,
-  獄炎: 10,
-  魔剣: 15,
-  王冠: 30,
-  マモン: 100,
-  月: 25,
-};
-
-const DOUBLE_PAYOUTS: Record<string, number> = {
-  蝙蝠: 1,
-  亡霊: 1.5,
-  獄炎: 2,
-  魔剣: 3,
-  王冠: 5,
-  マモン: 10,
-};
 
 const CYCLE = ["🦇", "👻", "🔥", "⚔️", "👑", "😈", "🌙", "✨"] as const;
 const cycleAt = (n: number) => CYCLE[n % CYCLE.length]!;
 
-function spinReel(): SlotSymbol {
-  const total = SYMBOLS.reduce((a, s) => a + s.weight, 0);
-  let roll = Math.random() * total;
-  for (const s of SYMBOLS) {
-    roll -= s.weight;
-    if (roll <= 0) return s;
-  }
-  return SYMBOLS[0]!;
-}
-
 const isScatter = (s: SlotSymbol) => s.kind === "scatter";
-const isWild = (s: SlotSymbol) => s.kind === "wild";
-
-interface SpinOutcome {
-  reels: [SlotSymbol, SlotSymbol, SlotSymbol];
-  payout: number;
-  kind: "none" | "double" | "triple" | "wild_triple" | "jackpot";
-  matched?: string;
-  freeSpin: boolean;
-}
-
-function evaluate(reels: [SlotSymbol, SlotSymbol, SlotSymbol], bet: number): SpinOutcome {
-  const scatterCount = reels.filter(isScatter).length;
-  const freeSpin = scatterCount >= SCATTER_TRIGGER_COUNT;
-  const noScatter = !reels.some(isScatter);
-  const pay = (mult: number) => Math.floor(bet * mult * (1 - HOUSE_EDGE));
-
-  if (noScatter && reels[0].name === reels[1].name && reels[1].name === reels[2].name) {
-    const name = reels[0].name;
-    const mult = TRIPLE_PAYOUTS[name] ?? 0;
-    if (mult > 0) {
-      if (name === "マモン") return { reels, payout: pay(mult), kind: "jackpot", matched: name, freeSpin };
-      return { reels, payout: pay(mult), kind: name === "月" ? "wild_triple" : "triple", matched: name, freeSpin };
-    }
-  }
-  if (noScatter) {
-    const wilds = reels.filter(isWild).length;
-    const normals = reels.filter((s) => s.kind === "normal");
-    if (wilds > 0 && wilds < 3 && normals.length > 0 && normals.every((s) => s.name === normals[0]!.name)) {
-      const mult = TRIPLE_PAYOUTS[normals[0]!.name] ?? 0;
-      if (mult > 0) return { reels, payout: pay(mult), kind: "wild_triple", matched: normals[0]!.name, freeSpin };
-    }
-  }
-  if (noScatter) {
-    for (const sym of SYMBOLS) {
-      if (sym.kind !== "normal") continue;
-      if (reels.filter((r) => r.name === sym.name).length === 2) {
-        const mult = DOUBLE_PAYOUTS[sym.name] ?? 0;
-        if (mult > 0) return { reels, payout: pay(mult), kind: "double", matched: sym.name, freeSpin };
-      }
-    }
-  }
-  return { reels, payout: 0, kind: "none", freeSpin };
-}
 
 function paytableEmbed(): EmbedBuilder {
   const tripleLines = Object.entries(TRIPLE_PAYOUTS)
@@ -255,7 +174,8 @@ async function runOne(
   isFreeSpin: boolean,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const reelsRaw: [SlotSymbol, SlotSymbol, SlotSymbol] = [spinReel(), spinReel(), spinReel()];
+  const rng = services.rng;
+  const reelsRaw: [SlotSymbol, SlotSymbol, SlotSymbol] = [spinReel(rng), spinReel(rng), spinReel(rng)];
   const spin = evaluate(reelsRaw, bet);
 
   // お守り: 勝ちなら勝利ボーナス、負けなら返金保護

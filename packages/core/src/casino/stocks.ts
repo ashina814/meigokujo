@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherError, EtherExchange, HOUSE_HOLDER } from "./exchange.js";
+import { defaultRng, type CasinoRng } from "./rng.js";
 
 /**
  * マモンの賭場の株式市場。casino-bot /株 のシンプル版移植。
@@ -55,11 +56,14 @@ export class StockError extends Error {
 }
 
 export class Stocks {
+  private readonly rng: CasinoRng;
   constructor(
     private readonly db: Database.Database,
     private readonly ether: EtherExchange,
     private readonly events: EventLog,
+    options: { rng?: CasinoRng } = {},
   ) {
+    this.rng = options.rng ?? defaultRng();
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS casino_stocks (
         id          TEXT PRIMARY KEY,
@@ -111,12 +115,12 @@ export class Stocks {
     for (const s of stocks) {
       if (ts - s.last_update < UPDATE_INTERVAL_MS / 1000) continue;
       // ランダムウォーク: ±10% + trend×5%
-      const noise = (Math.random() * 2 - 1) * 0.1;
+      const noise = (this.rng.float() * 2 - 1) * 0.1;
       const bias = s.trend * 0.05;
       const changePct = noise + bias;
-      let newPrice = Math.max(100, Math.floor(s.price * (1 + changePct)));
+      const newPrice = Math.max(100, Math.floor(s.price * (1 + changePct)));
       // trend は 0.6*前回 + 少しノイズ で寄せる（暴走防止）
-      const newTrend = Math.max(-1, Math.min(1, s.trend * 0.6 + (Math.random() * 2 - 1) * 0.15));
+      const newTrend = Math.max(-1, Math.min(1, s.trend * 0.6 + (this.rng.float() * 2 - 1) * 0.15));
       this.db
         .prepare("UPDATE casino_stocks SET prev_price = price, price = ?, trend = ?, last_update = ? WHERE id = ?")
         .run(newPrice, newTrend, ts, s.id);

@@ -9,6 +9,12 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
+import {
+  CRASH_HOUSE_EDGE,
+  CRASH_MAX_MULT_CAP,
+  CRASH_MIN_CASHOUT,
+  crashPoint as generateCrashPoint,
+} from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
@@ -17,25 +23,17 @@ import { broadcastBigWin } from "./bigwin.js";
 
 /**
  * 📈 クラッシュ。casino-bot 準拠の忠実移植。
- * - 崩壊点は事前決定: E[payout] = 1 - houseEdge を満たす逆CDF
+ * - 崩壊点は core の crashPoint() を使用（RTP モデルと同じ実装・単一の真実源）
  * - 実時間で滑らかに指数成長: M = exp(0.00015 * ms)
- * - 最低降車ライン 1.5x（それ以下は降りられない = 各ラウンドで真の敗北リスク）
- * - 押した瞬間の**実時間**で倍率を再計算。CRASH_TIME 超なら「遅かった」
+ * - 最低降車ライン CRASH_MIN_CASHOUT
  * - 結果画面に「最低/前回/最大/配当表/退席」ボタン
+ * - 連鎖ボーナスは無効。1.5倍固定戦略のような高勝率戦略と連鎖倍率の組み合わせで
+ *   実効RTPが 100% を超える裁定が可能になるため（PR#6 レビュー指摘）。
  */
-const HOUSE_EDGE = 0.04;
 const GROWTH_RATE = 0.00015; // per ms
-const MIN_CASHOUT = 1.5;
-const MAX_MULT_CAP = 100; // テーブルリミット判定に使う（実際の崩壊はもっと低い）
+const MIN_CASHOUT = CRASH_MIN_CASHOUT;
+const MAX_MULT_CAP = CRASH_MAX_MULT_CAP;
 const UPDATE_INTERVAL_MS = 1500;
-
-function generateCrashPoint(): number {
-  const e = 1 - HOUSE_EDGE;
-  const r = Math.random();
-  if (r < 0.01) return 1.0; // 1% は即崩壊
-  const crash = e / (1 - r);
-  return Math.max(1.0, Math.round(crash * 100) / 100);
-}
 
 function progressBar(mult: number): string {
   const steps = 15;
@@ -53,13 +51,15 @@ function paytableEmbed(): EmbedBuilder {
         "**遊び方**",
         "・倍率がじわじわ上昇。**崩壊する前に「降りる」** を押した瞬間の倍率で払戻し",
         `・最低降車ラインは **${MIN_CASHOUT.toFixed(2)}x**。それ未満では降りられない`,
-        `・崩壊点は分布的にランダム（1%は即崩壊）。数学的 RTP は **${((1 - HOUSE_EDGE) * 100).toFixed(0)}%**`,
+        `・崩壊点は分布的にランダム（1%は即崩壊）。数学的 RTP は **${((1 - CRASH_HOUSE_EDGE) * 100).toFixed(0)}%**（M に依らず一定）`,
         "",
         "**⚡ 遅かった**",
         "　押した瞬間の実時間が崩壊時刻を超えていたら、通信の裏で墜ちている",
         "",
-        "**⚖️ 福の重み / 🔥 連鎖チェーン**",
-        "　勝ちで発動（残高が多いほど奉納・連勝で倍率）",
+        "**⚖️ 福の重み**",
+        "　勝ちで発動（残高が多いほど奉納）",
+        "**🔥 連鎖チェーン**",
+        "　クラッシュでは無効（他ゲームより勝率が高いため）",
       ].join("\n"),
     );
 }
@@ -93,7 +93,7 @@ async function runRound(
   bet: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const crashPoint = generateCrashPoint();
+  const crashPoint = generateCrashPoint(services.rng);
 
   const START_TIME = Date.now();
   const t_crash_ms = Math.log(crashPoint) / GROWTH_RATE;
@@ -226,7 +226,9 @@ async function runRound(
   if (cashedOut && cashOutMultiplier >= 1.0) {
     const rawPayout = Math.floor(bet * cashOutMultiplier);
     const amulet = applyAmulets(services, uid, bet, rawPayout);
-    const settled = services.casino.settle(uid, "クラッシュ", bet, amulet.payout);
+    // 連鎖ボーナスは無効化（1.5倍固定戦略 × 高勝率で 100% 超になる裁定を防ぐ・PR#6 レビュー指摘）。
+    // 福の重みは維持（低残高帯では 0% なので影響なし・高残高帯ではプレイヤーから JP/救済へ流す）。
+    const settled = services.casino.settle(uid, "クラッシュ", bet, amulet.payout, 0, { chain: false });
     const netStr = `+${settled.net.toLocaleString("ja-JP")} ◈`;
     const bigWin = settled.net >= bet * 5;
     const bonusBits: string[] = [];
@@ -253,7 +255,7 @@ async function runRound(
     broadcastBigWin(interaction.client, services, { userId: uid, game: "クラッシュ", bet, payout: settled.payout });
   } else {
     const lossAmulet = applyAmulets(services, uid, bet, 0);
-    services.casino.settle(uid, "クラッシュ", bet, lossAmulet.payout);
+    services.casino.settle(uid, "クラッシュ", bet, lossAmulet.payout, 0, { chain: false });
     const savedByAmulet = lossAmulet.payout > 0;
     const netStr = savedByAmulet ? `±0 ◈` : `−${bet.toLocaleString("ja-JP")} ◈`;
 

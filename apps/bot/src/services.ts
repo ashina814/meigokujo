@@ -28,6 +28,7 @@ import {
   Markets,
   Takutate,
   Escrow,
+  defaultRng,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -48,6 +49,9 @@ export function buildServices() {
   const ledger = new Ledger(db, {
     // 関数で渡す＝ /設定 での変更が再起動なしで反映される
     approvalThreshold: () => settings.getNumber("approval_threshold"),
+    // 未成年判定は使わない方針。Ledger 側の minorBlocked 種別は宣言されているが
+    // isMinor() 未接続なので常に成人扱い（＝実質 no-op）。
+    // 冥獄城の Land/エテルはサーバー内独自通貨で外部換金しないため、賭場に年齢制限を敷かない。
   });
   const payroll = new Payroll(db, ledger);
   const migration = new Migration(db, ledger);
@@ -83,7 +87,8 @@ export function buildServices() {
     reliefMax: () => settings.getNumber("daily_relief_max"),
   });
   const items = new Items(db);
-  const stocks = new Stocks(db, ether, events);
+  // Stocks の価格ランダムウォークは共通RNGを使う（テスト時は決定的にできる）
+  const stocks = new Stocks(db, ether, events, { rng: defaultRng() });
   const vip = new Vip(db, ether, events, {
     price: () => settings.getNumber("vip_price"),
     days: () => settings.getNumber("vip_days"),
@@ -91,16 +96,46 @@ export function buildServices() {
   });
   const markets = new Markets(db, ether, events);
   // 起動時に未精算の板を全部返金＆void（エスクロー整合維持）
-  const voided = markets.refundAllPending("system:startup");
-  if (voided > 0) console.log(`[market] 起動時に未精算板 ${voided}件 を返金＆void 化`);
+  const marketSweep = markets.refundAllPending("system:startup");
+  if (marketSweep.refunded > 0) {
+    console.log(`[market] 起動時に未精算板 ${marketSweep.refunded}/${marketSweep.total}件 を返金＆void 化`);
+  }
+  if (marketSweep.failed.length > 0) {
+    // underfunded/overfunded/mismatch などで返金に失敗した板は frozen に変更済み。
+    // frozen 板は新規ベットを受け付けず、帳簿とエスクロー残高を保持したまま手動調査を待つ。
+    // escrow.sweepAll() は frozen 板を孤児として隔離しない（所有者情報が casino_market_bets に残るため）。
+    console.warn(
+      `[market] 起動時 refund 失敗 ${marketSweep.failed.length}件 → frozen へ変更（帳簿・残高を保持し手動調査）: ${marketSweep.failed
+        .map((f) => `#${f.id}(${f.error})`)
+        .join(", ")}`,
+    );
+  }
   const escrow = new Escrow(db, ether, events);
-  // 起動時にセッション型ゲーム（対人・競馬・丁半・PvPポーカー等）の預かり残を全額返金
+  // 起動時にセッション型ゲーム（対人・競馬・丁半・PvPポーカー等）の預かり残をセッション単位で返金
   const swept = escrow.sweepAll("system:startup");
-  if (swept.users > 0) {
-    console.log(`[escrow] 起動時に未精算エスクロー ${swept.sessions}卓/${swept.users}人分（計 ${swept.total.toLocaleString("ja-JP")}◈）を返金`);
+  if (swept.refundedUsers > 0) {
+    console.log(
+      `[escrow] 起動時に未精算エスクロー ${swept.refundedSessions}/${swept.totalSessions}卓・${swept.refundedUsers}人分（計 ${swept.refundedTotal.toLocaleString("ja-JP")}◈）を返金`,
+    );
+  }
+  if (swept.failed.length > 0) {
+    // 帳簿と保有者残高が乖離して返金できなかったセッション。house 補填せず帳簿を保持した。要調査
+    console.warn(
+      `[escrow] 返金失敗セッション ${swept.failed.length}件（他セッションは正常返金・Bot 起動は継続）: ${swept.failed
+        .map((f) => `${f.sessionId}(帳簿${f.expected}/保有${f.actual})`)
+        .join(", ")}`,
+    );
+  }
+  if (swept.orphans > 0) {
+    // 帳簿と保有者残高が乖離した孤児残高。house へ吸い上げず隔離した。要調査
+    console.warn(
+      `[escrow] 孤児残高 ${swept.orphans}件 (計 ${swept.orphanTotal.toLocaleString("ja-JP")}◈) を sys:escrow:quarantine へ隔離。監査ログを確認して手動対応してください。`,
+    );
   }
   const takutate = new Takutate(db, events);
-  const services = { db, settings, ledger, payroll, migration, events, entry, vc, tickets, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, escrow, takutate };
+  // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
+  const rng = defaultRng();
+  const services = { db, settings, ledger, payroll, migration, events, entry, vc, tickets, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, escrow, takutate, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;

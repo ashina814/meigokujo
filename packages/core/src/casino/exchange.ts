@@ -104,6 +104,14 @@ export class EtherExchange {
     this.db.prepare("UPDATE ether_balances SET amount = amount + ?, updated_at = ? WHERE user_id = ?").run(delta, ts, holderId);
   }
 
+  /** 残高行が無い保有者を 0 で作る（宛先が未初期化の system 口座でも `transfer` が通るように） */
+  ensureHolder(holderId: string): void {
+    const ts = now();
+    this.db
+      .prepare("INSERT INTO ether_balances (user_id, amount, updated_at) VALUES (?, 0, ?) ON CONFLICT(user_id) DO NOTHING")
+      .run(holderId, ts);
+  }
+
   /** Land→エテルの見積り（実行せず）。フェアレート・手数料なし */
   quoteBuy(landIn: number): EtherQuote {
     const P = this.pool();
