@@ -39,6 +39,7 @@ TARGET_SHA=""
 AFTER_SHA=""
 DEPLOYED_SHA=""
 VERIFY_DIR=""
+APP_PATH=""
 
 log() { printf '\n==> %s\n' "$*"; }
 fail() { echo "❌ $*" >&2; return 1; }
@@ -51,7 +52,7 @@ as_app() {
 cleanup() {
   local rc=$?
   trap - EXIT
-  if [[ -n "$VERIFY_DIR" ]]; then
+  if [[ -n "$VERIFY_DIR" && -n "$APP_PATH" ]]; then
     cd "$REPO" 2>/dev/null || true
     as_app git worktree remove --force "$VERIFY_DIR" >/dev/null 2>&1 || true
     as_app git worktree prune >/dev/null 2>&1 || true
@@ -78,7 +79,9 @@ trap cleanup EXIT
 trap on_error ERR
 
 [[ "$EUID" -eq 0 ]] || fail "rootで実行してください: sudo /home/kabu/deploy.sh"
-for cmd in sudo git systemctl journalctl flock grep find sort; do require "$cmd"; done
+for cmd in sudo git systemctl journalctl flock grep find sort head tail dirname tr date sleep chown chmod; do
+  require "$cmd"
+done
 [[ -d "$REPO/.git" ]] || fail "Gitリポジトリがありません: $REPO"
 [[ -f "$BACKUP_SCRIPT" ]] || fail "バックアップスクリプトがありません: $BACKUP_SCRIPT"
 
@@ -154,17 +157,16 @@ as_app git worktree prune
 VERIFY_DIR="$APP_HOME/.meigokujo-deploy-check-${TARGET_SHA:0:12}-$$"
 [[ ! -e "$VERIFY_DIR" ]] || fail "一時検証ディレクトリが既に存在します: $VERIFY_DIR"
 as_app git worktree add --detach "$VERIFY_DIR" "$TARGET_SHA"
-(
-  cd "$VERIFY_DIR"
-  as_app pnpm install --frozen-lockfile
-  as_app pnpm -r typecheck
-  as_app pnpm -r test
-  VERIFY_DIRTY="$(as_app git status --porcelain=v1 --untracked-files=all)"
-  if [[ -n "$VERIFY_DIRTY" ]]; then
-    echo "$VERIFY_DIRTY" >&2
-    fail "事前検証後に追跡対象の差分が発生しました"
-  fi
-)
+cd "$VERIFY_DIR"
+as_app pnpm install --frozen-lockfile
+as_app pnpm -r typecheck
+as_app pnpm -r test
+VERIFY_DIRTY="$(as_app git status --porcelain=v1 --untracked-files=all)"
+if [[ -n "$VERIFY_DIRTY" ]]; then
+  echo "$VERIFY_DIRTY" >&2
+  fail "事前検証後に追跡対象の差分が発生しました"
+fi
+cd "$REPO"
 as_app git worktree remove --force "$VERIFY_DIR"
 VERIFY_DIR=""
 as_app git worktree prune
