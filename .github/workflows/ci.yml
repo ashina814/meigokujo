@@ -12,8 +12,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check deploy shell syntax
-        run: bash -n deploy/deploy.sh
+      - name: Check deployment shell syntax
+        run: bash -n deploy/deploy.sh deploy/backup.sh
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
