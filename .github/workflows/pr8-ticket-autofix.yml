@@ -22,83 +22,92 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
+          def block(lines):
+              return "\n".join(lines) + "\n"
+
           admin = Path("apps/bot/src/commands/admin-hub.ts")
           text = admin.read_text()
 
-          old = '''  await sent.pin().catch(() => undefined);
-          services.tickets.setPanelMessage(panel.id, channel.id, sent.id, `user:${interaction.user.id}`);
-
-          let warning = "";
-          '''
-          new = '''  await sent.pin().catch(() => undefined);
-          try {
-            services.tickets.setPanelMessage(panel.id, channel.id, sent.id, `user:${interaction.user.id}`);
-          } catch (e) {
-            if (!editedExisting) {
-              await sent.delete().catch((deleteError) =>
-                console.error("[ticket-panel] DB保存失敗後の新規パネル削除にも失敗しました", {
-                  panelId: panel.id,
-                  channelId: channel.id,
-                  messageId: sent.id,
-                  error: deleteError,
-                }),
-              );
-            }
-            console.error("[ticket-panel] パネル設置情報のDB保存に失敗しました", {
-              panelId: panel.id,
-              channelId: channel.id,
-              messageId: sent.id,
-              editedExisting,
-              error: e,
-            });
-            await interaction.update({
-              content: editedExisting
-                ? "❌ 既存パネルの表示更新後、設置情報の保存に失敗しました。DBは更新されていません。"
-                : "❌ パネル送信後に設置情報の保存に失敗したため、新しいメッセージを削除しました。既存パネルは残しています。",
-              embeds: [],
-              components: [backButton()],
-            });
-            return;
-          }
-
-          let warning = "";
-          '''
+          old = block([
+              '  await sent.pin().catch(() => undefined);',
+              '  services.tickets.setPanelMessage(panel.id, channel.id, sent.id, `user:${interaction.user.id}`);',
+              '',
+              '  let warning = "";',
+          ])
+          new = block([
+              '  await sent.pin().catch(() => undefined);',
+              '  try {',
+              '    services.tickets.setPanelMessage(panel.id, channel.id, sent.id, `user:${interaction.user.id}`);',
+              '  } catch (e) {',
+              '    if (!editedExisting) {',
+              '      await sent.delete().catch((deleteError) =>',
+              '        console.error("[ticket-panel] DB保存失敗後の新規パネル削除にも失敗しました", {',
+              '          panelId: panel.id,',
+              '          channelId: channel.id,',
+              '          messageId: sent.id,',
+              '          error: deleteError,',
+              '        }),',
+              '      );',
+              '    }',
+              '    console.error("[ticket-panel] パネル設置情報のDB保存に失敗しました", {',
+              '      panelId: panel.id,',
+              '      channelId: channel.id,',
+              '      messageId: sent.id,',
+              '      editedExisting,',
+              '      error: e,',
+              '    });',
+              '    await interaction.update({',
+              '      content: editedExisting',
+              '        ? "❌ 既存パネルの表示更新後、設置情報の保存に失敗しました。DBは更新されていません。"',
+              '        : "❌ パネル送信後に設置情報の保存に失敗したため、新しいメッセージを削除しました。既存パネルは残しています。",',
+              '      embeds: [],',
+              '      components: [backButton()],',
+              '    });',
+              '    return;',
+              '  }',
+              '',
+              '  let warning = "";',
+          ])
           if text.count(old) != 1:
               raise SystemExit(f"admin save block match count={text.count(old)}")
           text = text.replace(old, new)
 
-          old = '''    const oldChannel = await interaction.client.channels.fetch(oldPlacement.channelId).catch((e) => {
-              console.warn("[ticket-panel] 移設後の旧チャンネル取得に失敗しました", { panelId: panel.id, oldPlacement, error: e });
-              return null;
-            });
-            if (oldChannel?.isTextBased() && "messages" in oldChannel) {
-          '''
-          new = '''    let oldChannelFetchFailed = false;
-            const oldChannel = await interaction.client.channels.fetch(oldPlacement.channelId).catch((e) => {
-              oldChannelFetchFailed = true;
-              console.warn("[ticket-panel] 移設後の旧チャンネル取得に失敗しました", { panelId: panel.id, oldPlacement, error: e });
-              return null;
-            });
-            if (oldChannelFetchFailed) {
-              warning = "旧パネルのチャンネル取得に失敗しました。旧パネルが残っている可能性があるため手動確認してください。";
-            } else if (oldChannel?.isTextBased() && "messages" in oldChannel) {
-          '''
+          old = block([
+              '    const oldChannel = await interaction.client.channels.fetch(oldPlacement.channelId).catch((e) => {',
+              '      console.warn("[ticket-panel] 移設後の旧チャンネル取得に失敗しました", { panelId: panel.id, oldPlacement, error: e });',
+              '      return null;',
+              '    });',
+              '    if (oldChannel?.isTextBased() && "messages" in oldChannel) {',
+          ])
+          new = block([
+              '    let oldChannelFetchFailed = false;',
+              '    const oldChannel = await interaction.client.channels.fetch(oldPlacement.channelId).catch((e) => {',
+              '      oldChannelFetchFailed = true;',
+              '      console.warn("[ticket-panel] 移設後の旧チャンネル取得に失敗しました", { panelId: panel.id, oldPlacement, error: e });',
+              '      return null;',
+              '    });',
+              '    if (oldChannelFetchFailed) {',
+              '      warning = "旧パネルのチャンネル取得に失敗しました。旧パネルが残っている可能性があるため手動確認してください。";',
+              '    } else if (oldChannel?.isTextBased() && "messages" in oldChannel) {',
+          ])
           if text.count(old) != 1:
               raise SystemExit(f"old channel fetch block match count={text.count(old)}")
           text = text.replace(old, new)
 
-          old = '''    } else if (oldChannel) {
-              warning = "旧パネルのチャンネルがテキストチャンネルではありません。手動確認してください。";
-              console.warn("[ticket-panel] 移設後の旧パネルチャンネルがテキストではありません", { panelId: panel.id, oldPlacement });
-            }
-          '''
-          new = '''    } else {
-              warning = oldChannel
-                ? "旧パネルのチャンネルがテキストチャンネルではありません。手動確認してください。"
-                : "旧パネルのチャンネルが見つかりません。手動確認してください。";
-              console.warn("[ticket-panel] 移設後の旧パネルチャンネルを処理できません", { panelId: panel.id, oldPlacement });
-            }
-          '''
+          old = block([
+              '    } else if (oldChannel) {',
+              '      warning = "旧パネルのチャンネルがテキストチャンネルではありません。手動確認してください。";',
+              '      console.warn("[ticket-panel] 移設後の旧パネルチャンネルがテキストではありません", { panelId: panel.id, oldPlacement });',
+              '    }',
+          ])
+          new = block([
+              '    } else {',
+              '      warning = oldChannel',
+              '        ? "旧パネルのチャンネルがテキストチャンネルではありません。手動確認してください。"',
+              '        : "旧パネルのチャンネルが見つかりません。手動確認してください。";',
+              '      console.warn("[ticket-panel] 移設後の旧パネルチャンネルを処理できません", { panelId: panel.id, oldPlacement });',
+              '    }',
+          ])
           if text.count(old) != 1:
               raise SystemExit(f"old channel fallback block match count={text.count(old)}")
           text = text.replace(old, new)
@@ -106,25 +115,27 @@ jobs:
 
           service = Path("packages/core/src/tickets/service.ts")
           text = service.read_text()
-          old = '''  setPanelMessage(id: string, channelId: string, messageId: string, actor = "system"): TicketPanel | undefined {
-            this.db
-              .prepare("UPDATE ticket_panels SET channel_id = ?, message_id = ?, updated_by = ?, updated_at = ? WHERE id = ?")
-              .run(channelId, messageId, actor, now(), id);
-            this.events.log("ticket_panel_installed", { actor, payload: { id, channelId, messageId } });
-            return this.getPanel(id);
-          }
-          '''
-          new = '''  setPanelMessage(id: string, channelId: string, messageId: string, actor = "system"): TicketPanel | undefined {
-            const savePanelMessage = this.db.transaction(() => {
-              this.db
-                .prepare("UPDATE ticket_panels SET channel_id = ?, message_id = ?, updated_by = ?, updated_at = ? WHERE id = ?")
-                .run(channelId, messageId, actor, now(), id);
-              this.events.log("ticket_panel_installed", { actor, payload: { id, channelId, messageId } });
-              return this.getPanel(id);
-            });
-            return savePanelMessage();
-          }
-          '''
+          old = block([
+              '  setPanelMessage(id: string, channelId: string, messageId: string, actor = "system"): TicketPanel | undefined {',
+              '    this.db',
+              '      .prepare("UPDATE ticket_panels SET channel_id = ?, message_id = ?, updated_by = ?, updated_at = ? WHERE id = ?")',
+              '      .run(channelId, messageId, actor, now(), id);',
+              '    this.events.log("ticket_panel_installed", { actor, payload: { id, channelId, messageId } });',
+              '    return this.getPanel(id);',
+              '  }',
+          ])
+          new = block([
+              '  setPanelMessage(id: string, channelId: string, messageId: string, actor = "system"): TicketPanel | undefined {',
+              '    const savePanelMessage = this.db.transaction(() => {',
+              '      this.db',
+              '        .prepare("UPDATE ticket_panels SET channel_id = ?, message_id = ?, updated_by = ?, updated_at = ? WHERE id = ?")',
+              '        .run(channelId, messageId, actor, now(), id);',
+              '      this.events.log("ticket_panel_installed", { actor, payload: { id, channelId, messageId } });',
+              '      return this.getPanel(id);',
+              '    });',
+              '    return savePanelMessage();',
+              '  }',
+          ])
           if text.count(old) != 1:
               raise SystemExit(f"setPanelMessage block match count={text.count(old)}")
           service.write_text(text.replace(old, new))
