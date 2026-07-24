@@ -1,3 +1,4 @@
+// Lifecycle controls intentionally keep disable, uninstall, and registration removal as separate operations.
 import { describe, expect, it, vi } from "vitest";
 import type { TicketPanel } from "@meigokujo/core";
 
