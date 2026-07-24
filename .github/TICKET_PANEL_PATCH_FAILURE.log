@@ -14,25 +14,11 @@ Scope: 2 of 3 workspace projects
 packages/core typecheck$ tsc --noEmit
 packages/core typecheck: Done
 apps/bot typecheck$ tsc --noEmit
-apps/bot typecheck: src/commands/admin-hub.ts(1040,86): error TS1002: Unterminated string literal.
-apps/bot typecheck: src/commands/admin-hub.ts(1041,1): error TS1005: ',' expected.
-apps/bot typecheck: src/commands/admin-hub.ts(1041,7): error TS1127: Invalid character.
-apps/bot typecheck: src/commands/admin-hub.ts(1041,12): error TS1127: Invalid character.
-apps/bot typecheck: src/commands/admin-hub.ts(1041,15): error TS1002: Unterminated string literal.
-apps/bot typecheck: src/commands/admin-hub.ts(1042,3): error TS1005: ',' expected.
-apps/bot typecheck: src/commands/admin-hub.ts(1048,11): error TS1002: Unterminated string literal.
-apps/bot typecheck: src/commands/admin-hub.ts(1049,1): error TS1005: ',' expected.
-apps/bot typecheck: src/commands/admin-hub.ts(1049,5): error TS1002: Unterminated string literal.
-apps/bot typecheck: src/commands/admin-hub.ts(1050,3): error TS1005: ',' expected.
-apps/bot typecheck: src/commands/admin-hub.ts(1083,317): error TS1002: Unterminated string literal.
-apps/bot typecheck: src/commands/admin-hub.ts(1084,1): error TS1005: ',' expected.
-apps/bot typecheck: src/commands/admin-hub.ts(1084,105): error TS1002: Unterminated string literal.
-apps/bot typecheck: src/commands/admin-hub.ts(1085,1): error TS1005: ',' expected.
-apps/bot typecheck: src/commands/admin-hub.ts(1282,148): error TS1002: Unterminated string literal.
-apps/bot typecheck: src/commands/admin-hub.ts(1283,1): error TS1005: ',' expected.
-apps/bot typecheck: src/commands/admin-hub.ts(1283,92): error TS1002: Unterminated string literal.
-apps/bot typecheck: src/commands/admin-hub.ts(1284,1): error TS1005: ',' expected.
-apps/bot typecheck: src/commands/admin-hub.ts(1737,1): error TS1005: '}' expected.
+apps/bot typecheck: src/commands/admin-hub.ts(384,40): error TS2345: Argument of type 'MessageCreateOptions' is not assignable to parameter of type 'string | MessagePayload | MessageEditOptions'.
+apps/bot typecheck:   Type 'MessageCreateOptions' is not assignable to type 'MessageEditOptions'.
+apps/bot typecheck:     Types of property 'flags' are incompatible.
+apps/bot typecheck:       Type 'BitFieldResolvable<"SuppressEmbeds" | "SuppressNotifications" | "IsComponentsV2", MessageFlags.SuppressEmbeds | MessageFlags.SuppressNotifications | MessageFlags.IsComponentsV2> | undefined' is not assignable to type 'BitFieldResolvable<"SuppressEmbeds" | "IsComponentsV2", MessageFlags.SuppressEmbeds | MessageFlags.IsComponentsV2> | undefined'.
+apps/bot typecheck:         Type 'MessageFlags.SuppressNotifications' is not assignable to type 'BitFieldResolvable<"SuppressEmbeds" | "IsComponentsV2", MessageFlags.SuppressEmbeds | MessageFlags.IsComponentsV2> | undefined'.
 apps/bot typecheck: Failed
 /home/runner/work/meigokujo/meigokujo/apps/bot:
  ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @meigokujo/bot@0.1.0 typecheck: `tsc --noEmit`
