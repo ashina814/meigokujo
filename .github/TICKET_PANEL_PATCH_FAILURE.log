@@ -5,7 +5,7 @@ Packages: +122
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 Progress: resolved 122, reused 122, downloaded 0, added 122, done
 
-Done in 1.1s using pnpm v9.15.9
+Done in 1s using pnpm v9.15.9
 
 > meigokujo@ typecheck /home/runner/work/meigokujo/meigokujo
 > pnpm -r typecheck
@@ -14,13 +14,175 @@ Scope: 2 of 3 workspace projects
 packages/core typecheck$ tsc --noEmit
 packages/core typecheck: Done
 apps/bot typecheck$ tsc --noEmit
-apps/bot typecheck: src/commands/admin-hub.ts(384,40): error TS2345: Argument of type 'MessageCreateOptions' is not assignable to parameter of type 'string | MessagePayload | MessageEditOptions'.
-apps/bot typecheck:   Type 'MessageCreateOptions' is not assignable to type 'MessageEditOptions'.
-apps/bot typecheck:     Types of property 'flags' are incompatible.
-apps/bot typecheck:       Type 'BitFieldResolvable<"SuppressEmbeds" | "SuppressNotifications" | "IsComponentsV2", MessageFlags.SuppressEmbeds | MessageFlags.SuppressNotifications | MessageFlags.IsComponentsV2> | undefined' is not assignable to type 'BitFieldResolvable<"SuppressEmbeds" | "IsComponentsV2", MessageFlags.SuppressEmbeds | MessageFlags.IsComponentsV2> | undefined'.
-apps/bot typecheck:         Type 'MessageFlags.SuppressNotifications' is not assignable to type 'BitFieldResolvable<"SuppressEmbeds" | "IsComponentsV2", MessageFlags.SuppressEmbeds | MessageFlags.IsComponentsV2> | undefined'.
-apps/bot typecheck: Failed
+apps/bot typecheck: Done
+
+> @meigokujo/core@0.1.0 test /home/runner/work/meigokujo/meigokujo/packages/core
+> vitest run tests/vc-tickets.test.ts
+
+
+[1m[46m RUN [49m[22m [36mv3.2.6 [39m[90m/home/runner/work/meigokujo/meigokujo/packages/core[39m
+
+ [32m✓[39m tests/vc-tickets.test.ts [2m([22m[2m18 tests[22m[2m)[22m[32m 73[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m1 passed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[32m18 passed[39m[22m[90m (18)[39m
+[2m   Start at [22m 15:13:31
+[2m   Duration [22m 533ms[2m (transform 153ms, setup 0ms, collect 179ms, tests 73ms, environment 0ms, prepare 74ms)[22m
+
+
+> @meigokujo/bot@0.1.0 test /home/runner/work/meigokujo/meigokujo/apps/bot
+> vitest run
+
+
+[1m[46m RUN [49m[22m [36mv3.2.6 [39m[90m/home/runner/work/meigokujo/meigokujo/apps/bot[39m
+
+[90mstderr[2m | tests/tickets.test.ts[2m > [22m[2m汎用チケット受付パネル[2m > [22m[2m担当者追加が全件失敗した場合はDB登録せず、作成済みスレッドを削除する
+[22m[39m[ticket] 担当者を1人もスレッドへ追加できないため受付を中止します {
+  panelId: [32m'appeal'[39m,
+  userId: [32m'user1'[39m,
+  threadId: [32m'thread1'[39m,
+  staffRoleIds: [ [32m'staff_role'[39m ],
+  accessRoleIds: [ [32m'staff_role'[39m ],
+  attemptedMembers: [33m1[39m
+}
+
+[90mstderr[2m | tests/tickets.test.ts[2m > [22m[2m汎用チケット受付パネル[2m > [22m[2m初期メッセージ送信失敗時はDB登録を巻き戻し、作成済みスレッドを削除する
+[22m[39m[ticket] チケット受付処理に失敗しました {
+  panelId: [32m'appeal'[39m,
+  userId: [32m'user1'[39m,
+  threadId: [32m'thread1'[39m,
+  ticketCreated: [33mtrue[39m,
+  initialized: [33mfalse[39m,
+  error: Error: send failed
+      at Object.sendMessage [90m(/home/runner/work/meigokujo/meigokujo/apps/bot/[39mtests/tickets.test.ts:245:15[90m)[39m
+      at Object.mockCall (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+spy@3.2.6/node_modules/[4m@vitest/spy[24m/dist/index.js:96:15)
+      at Object.sendMessage [as send] (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/tinyspy@4.0.4/node_modules/[4mtinyspy[24m/dist/index.js:47:80)
+      at Module.openTicket [90m(/home/runner/work/meigokujo/meigokujo/apps/bot/[39msrc/commands/tickets.ts:286:18[90m)[39m
+  [90m    at processTicksAndRejections (node:internal/process/task_queues:103:5)[39m
+      at [90m/home/runner/work/meigokujo/meigokujo/apps/bot/[39mtests/tickets.test.ts:249:5
+      at file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:752:20
+}
+
+ [32m✓[39m tests/tickets.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 29[2mms[22m[39m
+[90mstderr[2m | tests/ticket-panels-admin.test.ts[2m > [22m[2mチケット受付パネル管理[2m > [22m[2m新規設置失敗時に旧パネルを削除しない
+[22m[39m[ticket-panel] 新規パネル送信に失敗しました。旧パネルは残します {
+  panelId: [32m'appeal'[39m,
+  channelId: [32m'new_channel'[39m,
+  oldPlacement: { channelId: [32m'old_channel'[39m, messageId: [32m'old_message'[39m },
+  error: Error: send failed
+      at Object.<anonymous> [90m(/home/runner/work/meigokujo/meigokujo/apps/bot/[39mtests/ticket-panels-admin.test.ts:55:15[90m)[39m
+      at Object.mockCall (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+spy@3.2.6/node_modules/[4m@vitest/spy[24m/dist/index.js:96:15)
+      at Object.spy [as send] (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/tinyspy@4.0.4/node_modules/[4mtinyspy[24m/dist/index.js:47:80)
+      at Module.installTicketPanel [90m(/home/runner/work/meigokujo/meigokujo/apps/bot/[39msrc/commands/admin-hub.ts:1176:28[90m)[39m
+      at [90m/home/runner/work/meigokujo/meigokujo/apps/bot/[39mtests/ticket-panels-admin.test.ts:71:11
+      at file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:155:11
+      at file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:752:26
+      at file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1897:20
+      at new Promise (<anonymous>)
+      at runWithTimeout (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1863:10)
+}
+
+[90mstderr[2m | tests/ticket-panels-admin.test.ts[2m > [22m[2mチケット受付パネル管理[2m > [22m[2m既存メッセージ取得の一時エラー時に重複投稿しない
+[22m[39m[ticket-panel] 既存パネル取得に失敗したため再設置を中止します {
+  panelId: [32m'appeal'[39m,
+  channelId: [32m'same_channel'[39m,
+  messageId: [32m'old_message'[39m,
+  error: { code: [33m50013[39m }
+}
+
+ [31m❯[39m tests/ticket-panels-admin.test.ts [2m([22m[2m5 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[32m 45[2mms[22m[39m
+   [32m✓[39m チケット受付パネル管理[2m > [22mUnknown Message / 404 だけを既存メッセージなしとして扱う[32m 2[2mms[22m[39m
+   [32m✓[39m チケット受付パネル管理[2m > [22m新規設置失敗時に旧パネルを削除しない[32m 33[2mms[22m[39m
+   [32m✓[39m チケット受付パネル管理[2m > [22m既存メッセージ取得の一時エラー時に重複投稿しない[32m 3[2mms[22m[39m
+   [32m✓[39m チケット受付パネル管理[2m > [22m通知ロール・対応ロールを空へ戻せるUIになっている[32m 1[2mms[22m[39m
+[31m   [31m×[31m チケット受付パネル管理[2m > [22m無効化時に既存パネルを無効表示へ更新する[39m[32m 4[2mms[22m[39m
+[31m     → disableTicketPanel is not a function[39m
+[90mstdout[2m | tests/dashboard.test.ts[2m > [22m[2m城の計器盤[2m > [22m[2m更新処理が同時実行された場合は同じ投稿処理に合流する
+[22m[39m[計器盤] 新規投稿しました: msg1
+
+[90mstderr[2m | tests/ticket-panel-lifecycle.test.ts[2m > [22m[2mチケット受付パネルの管理ライフサイクル[2m > [22m[2m撤去時にメッセージ削除が失敗したら登録を無効化して設置情報を解除する
+[22m[39m[ticket-panel] 設置メッセージ削除に失敗しました {
+  panelId: [32m'appeal'[39m,
+  error: Error: delete failed
+      at Object.<anonymous> [90m(/home/runner/work/meigokujo/meigokujo/apps/bot/[39mtests/ticket-panel-lifecycle.test.ts:32:100[90m)[39m
+      at Object.mockCall (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+spy@3.2.6/node_modules/[4m@vitest/spy[24m/dist/index.js:96:15)
+      at Object.spy [as delete] (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/tinyspy@4.0.4/node_modules/[4mtinyspy[24m/dist/index.js:47:80)
+      at detachTicketPanelMessage [90m(/home/runner/work/meigokujo/meigokujo/apps/bot/[39msrc/commands/admin-hub.ts:1335:31[90m)[39m
+  [90m    at processTicksAndRejections (node:internal/process/task_queues:103:5)[39m
+      at Module.uninstallTicketPanel [90m(/home/runner/work/meigokujo/meigokujo/apps/bot/[39msrc/commands/admin-hub.ts:1342:18[90m)[39m
+      at [90m/home/runner/work/meigokujo/meigokujo/apps/bot/[39mtests/ticket-panel-lifecycle.test.ts:36:5
+      at file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:752:20
+}
+
+[90mstderr[2m | tests/dashboard.test.ts[2m > [22m[2m城の計器盤[2m > [22m[2mメッセージ編集失敗時は失敗を返し、新規投稿しない
+[22m[39m[計器盤] 既存メッセージの更新に失敗: Error: edit failed
+    at [90m/home/runner/work/meigokujo/meigokujo/apps/bot/[39mtests/dashboard.test.ts:269:44
+    at file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:155:11
+    at file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:752:26
+    at file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1897:20
+    at new Promise (<anonymous>)
+    at runWithTimeout (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1863:10)
+    at runTest (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1574:12)
+    at runSuite (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1729:8)
+    at runSuite (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1729:8)
+    at runFiles (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:1787:3)
+
+ [32m✓[39m tests/dashboard.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 167[2mms[22m[39m
+ [32m✓[39m tests/ticket-panel-lifecycle.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 28[2mms[22m[39m
+[90mstderr[2m | tests/ticket-panels-admin-final.test.ts[2m > [22m[2mチケット受付パネル管理の最終安全策[2m > [22m[2m新パネル送信後にDB保存が失敗した場合は新メッセージを削除し、旧パネルを残す
+[22m[39m[ticket-panel] パネル設置情報のDB保存に失敗しました {
+  panelId: [32m'appeal'[39m,
+  channelId: [32m'new_channel'[39m,
+  messageId: [32m'new_message'[39m,
+  editedExisting: [33mfalse[39m,
+  error: Error: db failed
+      at Object.<anonymous> [90m(/home/runner/work/meigokujo/meigokujo/apps/bot/[39mtests/ticket-panels-admin-final.test.ts:53:17[90m)[39m
+      at Object.mockCall (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+spy@3.2.6/node_modules/[4m@vitest/spy[24m/dist/index.js:96:15)
+      at Object.spy [as setPanelMessage] (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/tinyspy@4.0.4/node_modules/[4mtinyspy[24m/dist/index.js:47:80)
+      at Module.installTicketPanel [90m(/home/runner/work/meigokujo/meigokujo/apps/bot/[39msrc/commands/admin-hub.ts:1195:22[90m)[39m
+  [90m    at processTicksAndRejections (node:internal/process/task_queues:103:5)[39m
+      at [90m/home/runner/work/meigokujo/meigokujo/apps/bot/[39mtests/ticket-panels-admin-final.test.ts:61:5
+      at file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:752:20
+}
+
+[90mstderr[2m | tests/ticket-panels-admin-final.test.ts[2m > [22m[2mチケット受付パネル管理の最終安全策[2m > [22m[2m移設後に旧チャンネルを取得できない場合は管理者へ警告を表示する
+[22m[39m[ticket-panel] 移設後の旧チャンネル取得に失敗しました {
+  panelId: [32m'appeal'[39m,
+  oldPlacement: { channelId: [32m'old_channel'[39m, messageId: [32m'old_message'[39m },
+  error: Error: temporary fetch failure
+      at Object.<anonymous> [90m(/home/runner/work/meigokujo/meigokujo/apps/bot/[39mtests/ticket-panels-admin-final.test.ts:90:13[90m)[39m
+      at Object.mockCall (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+spy@3.2.6/node_modules/[4m@vitest/spy[24m/dist/index.js:96:15)
+      at Object.spy [as fetch] (file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/tinyspy@4.0.4/node_modules/[4mtinyspy[24m/dist/index.js:47:80)
+      at Module.installTicketPanel [90m(/home/runner/work/meigokujo/meigokujo/apps/bot/[39msrc/commands/admin-hub.ts:1227:58[90m)[39m
+  [90m    at processTicksAndRejections (node:internal/process/task_queues:103:5)[39m
+      at [90m/home/runner/work/meigokujo/meigokujo/apps/bot/[39mtests/ticket-panels-admin-final.test.ts:93:5
+      at file:///home/runner/work/meigokujo/meigokujo/node_modules/[4m.pnpm[24m/@vitest+runner@3.2.6/node_modules/[4m@vitest/runner[24m/dist/chunk-hooks.js:752:20
+}
+
+ [32m✓[39m tests/ticket-panels-admin-final.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 23[2mms[22m[39m
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 1 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m tests/ticket-panels-admin.test.ts[2m > [22mチケット受付パネル管理[2m > [22m無効化時に既存パネルを無効表示へ更新する
+[31m[1mTypeError[22m: disableTicketPanel is not a function[39m
+[36m [2m❯[22m tests/ticket-panels-admin.test.ts:[2m125:11[22m[39m
+    [90m123| [39m    const interaction = makeInteraction({ id: "admin_channel" }, vi.fn…
+    [90m124| [39m
+    [90m125| [39m    await disableTicketPanel(interaction as any, services as any, "app…
+    [90m   | [39m          [31m^[39m
+    [90m126| [39m
+    [90m127| [39m    expect(services.tickets.disablePanel).toHaveBeenCalledWith("appeal…
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯[22m[39m
+
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m4 passed[39m[22m[90m (5)[39m
+[2m      Tests [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m29 passed[39m[22m[90m (30)[39m
+[2m   Start at [22m 15:13:32
+[2m   Duration [22m 2.09s[2m (transform 967ms, setup 0ms, collect 3.85s, tests 292ms, environment 1ms, prepare 594ms)[22m
+
+
+::error file=/home/runner/work/meigokujo/meigokujo/apps/bot/tests/ticket-panels-admin.test.ts,title=tests/ticket-panels-admin.test.ts > チケット受付パネル管理 > 無効化時に既存パネルを無効表示へ更新する,line=125,column=11::TypeError: disableTicketPanel is not a function%0A ❯ tests/ticket-panels-admin.test.ts:125:11%0A%0A
 /home/runner/work/meigokujo/meigokujo/apps/bot:
- ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @meigokujo/bot@0.1.0 typecheck: `tsc --noEmit`
-Exit status 2
- ELIFECYCLE  Command failed with exit code 2.
+ ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @meigokujo/bot@0.1.0 test: `vitest run`
+Exit status 1
