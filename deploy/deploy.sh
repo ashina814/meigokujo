@@ -94,10 +94,14 @@ LOAD_STATE="$(systemctl show "$SERVICE" -p LoadState --value)"
 SERVICE_USER="$(systemctl show "$SERVICE" -p User --value)"
 [[ "$SERVICE_USER" == "$APP_USER" ]] || fail "service Userが想定外です: ${SERVICE_USER:-root}（想定: $APP_USER）"
 SERVICE_WORKDIR="$(systemctl show "$SERVICE" -p WorkingDirectory --value)"
-case "$SERVICE_WORKDIR" in
-  "$REPO"|"$REPO"/*) ;;
-  *) fail "service WorkingDirectoryがリポジトリ配下ではありません: ${SERVICE_WORKDIR:-未設定}" ;;
-esac
+if [[ -n "$SERVICE_WORKDIR" ]]; then
+  case "$SERVICE_WORKDIR" in
+    "$REPO"|"$REPO"/*) ;;
+    *) fail "service WorkingDirectoryがリポジトリ配下ではありません: $SERVICE_WORKDIR" ;;
+  esac
+else
+  echo "⚠️ service WorkingDirectoryは未設定です。ExecStartとNode環境だけを検証します。"
+fi
 
 SERVICE_EXEC="$(systemctl show "$SERVICE" -p ExecStart --value)"
 NODE_PATH="$(printf '%s\n' "$SERVICE_EXEC" | grep -oE '/[^ ;]+/bin/node' | head -n 1 || true)"
@@ -170,6 +174,18 @@ cd "$REPO"
 as_app git worktree remove --force "$VERIFY_DIR"
 VERIFY_DIR=""
 as_app git worktree prune
+
+STEP="反映直前の本番状態再確認"
+log "反映直前の本番状態を再確認"
+CURRENT_BRANCH="$(as_app git branch --show-current)"
+[[ "$CURRENT_BRANCH" == "$BRANCH" ]] || fail "検証中に本番ブランチが変更されました: $CURRENT_BRANCH"
+CURRENT_SHA="$(as_app git rev-parse HEAD)"
+[[ "$CURRENT_SHA" == "$BEFORE_SHA" ]] || fail "検証中に本番HEADが変更されました: $CURRENT_SHA"
+DIRTY="$(as_app git status --porcelain=v1 --untracked-files=all)"
+if [[ -n "$DIRTY" ]]; then
+  echo "$DIRTY" >&2
+  fail "検証中に本番作業ツリーへ差分が発生しました"
+fi
 
 STEP="反映前バックアップ"
 log "反映前バックアップ"
