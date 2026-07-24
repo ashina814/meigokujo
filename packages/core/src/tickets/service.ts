@@ -272,11 +272,14 @@ export class Tickets {
   }
 
   setPanelMessage(id: string, channelId: string, messageId: string, actor = "system"): TicketPanel | undefined {
-    this.db
-      .prepare("UPDATE ticket_panels SET channel_id = ?, message_id = ?, updated_by = ?, updated_at = ? WHERE id = ?")
-      .run(channelId, messageId, actor, now(), id);
-    this.events.log("ticket_panel_installed", { actor, payload: { id, channelId, messageId } });
-    return this.getPanel(id);
+    const savePanelMessage = this.db.transaction(() => {
+      this.db
+        .prepare("UPDATE ticket_panels SET channel_id = ?, message_id = ?, updated_by = ?, updated_at = ? WHERE id = ?")
+        .run(channelId, messageId, actor, now(), id);
+      this.events.log("ticket_panel_installed", { actor, payload: { id, channelId, messageId } });
+      return this.getPanel(id);
+    });
+    return savePanelMessage();
   }
 
   disablePanel(id: string, actor = "system"): TicketPanel | undefined {

@@ -1170,15 +1170,47 @@ export async function installTicketPanel(
   }
 
   await sent.pin().catch(() => undefined);
-  services.tickets.setPanelMessage(panel.id, channel.id, sent.id, `user:${interaction.user.id}`);
+  try {
+    services.tickets.setPanelMessage(panel.id, channel.id, sent.id, `user:${interaction.user.id}`);
+  } catch (e) {
+    if (!editedExisting) {
+      await sent.delete().catch((deleteError) =>
+        console.error("[ticket-panel] DB保存失敗後の新規パネル削除にも失敗しました", {
+          panelId: panel.id,
+          channelId: channel.id,
+          messageId: sent.id,
+          error: deleteError,
+        }),
+      );
+    }
+    console.error("[ticket-panel] パネル設置情報のDB保存に失敗しました", {
+      panelId: panel.id,
+      channelId: channel.id,
+      messageId: sent.id,
+      editedExisting,
+      error: e,
+    });
+    await interaction.update({
+      content: editedExisting
+        ? "❌ 既存パネルの表示更新後、設置情報の保存に失敗しました。DBは更新されていません。"
+        : "❌ パネル送信後に設置情報の保存に失敗したため、新しいメッセージを削除しました。既存パネルは残しています。",
+      embeds: [],
+      components: [backButton()],
+    });
+    return;
+  }
 
   let warning = "";
   if (oldPlacement && oldPlacement.channelId !== channel.id) {
+    let oldChannelFetchFailed = false;
     const oldChannel = await interaction.client.channels.fetch(oldPlacement.channelId).catch((e) => {
+      oldChannelFetchFailed = true;
       console.warn("[ticket-panel] 移設後の旧チャンネル取得に失敗しました", { panelId: panel.id, oldPlacement, error: e });
       return null;
     });
-    if (oldChannel?.isTextBased() && "messages" in oldChannel) {
+    if (oldChannelFetchFailed) {
+      warning = "旧パネルのチャンネル取得に失敗しました。旧パネルが残っている可能性があるため手動確認してください。";
+    } else if (oldChannel?.isTextBased() && "messages" in oldChannel) {
       const old = await fetchPanelMessage(oldChannel, oldPlacement.messageId);
       if (old.ok) {
         if (old.message) {
@@ -1191,9 +1223,11 @@ export async function installTicketPanel(
         warning = "旧パネルの取得に失敗しました。手動確認してください。";
         console.warn("[ticket-panel] 移設後の旧パネル取得に失敗しました", { panelId: panel.id, oldPlacement, error: old.error });
       }
-    } else if (oldChannel) {
-      warning = "旧パネルのチャンネルがテキストチャンネルではありません。手動確認してください。";
-      console.warn("[ticket-panel] 移設後の旧パネルチャンネルがテキストではありません", { panelId: panel.id, oldPlacement });
+    } else {
+      warning = oldChannel
+        ? "旧パネルのチャンネルがテキストチャンネルではありません。手動確認してください。"
+        : "旧パネルのチャンネルが見つかりません。手動確認してください。";
+      console.warn("[ticket-panel] 移設後の旧パネルチャンネルを処理できません", { panelId: panel.id, oldPlacement });
     }
   }
 
