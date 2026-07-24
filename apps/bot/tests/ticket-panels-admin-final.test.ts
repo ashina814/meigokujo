@@ -1,3 +1,4 @@
+// PR #8 final regression coverage for panel placement failure paths.
 import { describe, expect, it, vi } from "vitest";
 import type { TicketPanel } from "@meigokujo/core";
 
