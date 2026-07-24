@@ -8,7 +8,7 @@
     "start": "tsx src/index.ts",
     "register": "tsx src/register-commands.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run && node --import tsx tests/apply-toto-patch.ts"
   },
   "dependencies": {
     "@meigokujo/core": "workspace:*",
