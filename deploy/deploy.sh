@@ -11,6 +11,7 @@ REMOTE="${REMOTE:-origin}"
 SERVICE="${SERVICE:-meigokujo-bot.service}"
 BACKUP_SCRIPT="${BACKUP_SCRIPT:-/home/kabu/backup.sh}"
 LOCK_FILE="${LOCK_FILE:-/run/lock/meigokujo-deploy.lock}"
+STATE_FILE="${STATE_FILE:-/home/kabu/.meigokujo-deployed-sha}"
 
 FORCE=0
 DRY_RUN=0
@@ -23,7 +24,7 @@ for arg in "$@"; do
 Usage: /home/kabu/deploy.sh [--dry-run] [--force]
 
   --dry-run  本番を変更せず、dirty状態・取得先・ff可能性・実行環境だけ確認する
-  --force    mainが更新されていなくても依存同期・検証・再起動まで実行する
+  --force    同じSHAでもバックアップ・検証・再起動まで実行する
 HELP
       exit 0
       ;;
@@ -36,6 +37,7 @@ RESTARTED=0
 BEFORE_SHA=""
 TARGET_SHA=""
 AFTER_SHA=""
+DEPLOYED_SHA=""
 
 on_error() {
   local rc=$?
@@ -44,6 +46,7 @@ on_error() {
   [[ -n "$BEFORE_SHA" ]] && echo "反映前SHA: ${BEFORE_SHA}" >&2
   [[ -n "$TARGET_SHA" ]] && echo "取得先SHA: ${TARGET_SHA}" >&2
   [[ -n "$AFTER_SHA" ]] && echo "現在SHA:   ${AFTER_SHA}" >&2
+  [[ -n "$DEPLOYED_SHA" ]] && echo "最終成功SHA: ${DEPLOYED_SHA}" >&2
   if [[ "$RESTARTED" -eq 0 ]]; then
     echo "Botサービスはこの処理では再起動していません。" >&2
   else
@@ -58,9 +61,10 @@ fail() { echo "❌ $*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null 2>&1 || fail "必要なコマンドがありません: $1"; }
 
 [[ "$EUID" -eq 0 ]] || fail "rootで実行してください: sudo /home/kabu/deploy.sh"
-for cmd in sudo git systemctl journalctl flock grep find sort; do require "$cmd"; done
+for cmd in sudo git systemctl journalctl flock grep find sort id; do require "$cmd"; done
 [[ -d "$REPO/.git" ]] || fail "Gitリポジトリがありません: $REPO"
 [[ -f "$BACKUP_SCRIPT" ]] || fail "バックアップスクリプトがありません: $BACKUP_SCRIPT"
+APP_GROUP="$(id -gn "$APP_USER")"
 
 exec 9>"$LOCK_FILE"
 flock -n 9 || fail "別のデプロイが実行中です: $LOCK_FILE"
@@ -95,6 +99,7 @@ if [[ -n "$DIRTY" ]]; then
   fail "未コミット差分があります。勝手に破棄せず、先に整理してください"
 fi
 BEFORE_SHA="$(as_app git rev-parse HEAD)"
+[[ -f "$STATE_FILE" ]] && DEPLOYED_SHA="$(tr -d '[:space:]' < "$STATE_FILE")"
 
 STEP="リモートmainの取得"
 log "${REMOTE}/${BRANCH}を取得"
@@ -104,6 +109,7 @@ as_app git merge-base --is-ancestor "$BEFORE_SHA" "$TARGET_SHA" \
   || fail "本番HEADから${REMOTE}/${BRANCH}へfast-forwardできません"
 
 printf '反映前SHA: %s\n取得先SHA: %s\n' "$BEFORE_SHA" "$TARGET_SHA"
+printf '最終成功SHA: %s\n' "${DEPLOYED_SHA:-未記録}"
 printf 'Node: %s\npnpm: %s\n' "$(as_app node --version)" "$(as_app pnpm --version)"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -111,9 +117,12 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-if [[ "$BEFORE_SHA" == "$TARGET_SHA" && "$FORCE" -eq 0 ]]; then
-  echo "✅ すでに最新です。何も変更していません。再検証する場合は --force を使用してください。"
-  exit 0
+if [[ "$BEFORE_SHA" == "$TARGET_SHA" && "$DEPLOYED_SHA" == "$TARGET_SHA" && "$FORCE" -eq 0 ]]; then
+  if systemctl is-active --quiet "$SERVICE"; then
+    echo "✅ このSHAは反映・起動確認済みです。何も変更していません。再検証する場合は --force を使用してください。"
+    exit 0
+  fi
+  echo "⚠️ SHAは反映済みですがサービスがactiveではないため、検証と再起動を続行します。"
 fi
 
 STEP="反映前バックアップ"
@@ -121,8 +130,8 @@ log "反映前バックアップ"
 as_app bash "$BACKUP_SCRIPT"
 
 STEP="mainのfast-forward反映"
-log "mainをff-onlyで反映"
-as_app git pull --ff-only "$REMOTE" "$BRANCH"
+log "取得済みmainをff-onlyで反映"
+as_app git merge --ff-only "$TARGET_SHA"
 AFTER_SHA="$(as_app git rev-parse HEAD)"
 [[ "$AFTER_SHA" == "$TARGET_SHA" ]] || fail "反映後SHAが取得先SHAと一致しません"
 
@@ -163,8 +172,14 @@ systemctl status "$SERVICE" --no-pager --full
 log "再起動後journal"
 journalctl -u "$SERVICE" --since "$RESTART_AT" -n 120 --no-pager
 
-STEP="完了"
+STEP="成功SHAの記録"
 AFTER_SHA="$(as_app git rev-parse HEAD)"
+printf '%s\n' "$AFTER_SHA" > "$STATE_FILE"
+chown "$APP_USER:$APP_GROUP" "$STATE_FILE"
+chmod 0644 "$STATE_FILE"
+DEPLOYED_SHA="$AFTER_SHA"
+
+STEP="完了"
 echo
 echo "✅ 本番反映完了"
 echo "反映前SHA: $BEFORE_SHA"
