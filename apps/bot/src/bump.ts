@@ -10,12 +10,17 @@ const DISSOKU_DEFAULT_ID = "761562078095867916";
 const BUMP_CHANNEL_DEFAULT_ID = "1466310307994665000";
 /** 実運用では DISBOARD /bump・ディス速 /up ともに2時間 */
 const COOLDOWN_SEC = { disboard: 2 * 3600, dissoku: 2 * 3600 } as const;
+/** ディス速は応答投稿後にembedを完成させることがあるため、有限回だけ再取得する。 */
+const DISSOKU_RETRY_DELAYS_MS = [1_000, 3_000] as const;
 
 type BumpKind = keyof typeof COOLDOWN_SEC;
 type LegacyInteraction = {
   user?: { id: string; bot?: boolean };
   name?: string;
   commandName?: string;
+};
+type BumpHandleOptions = {
+  retryAttempt?: number;
 };
 
 function compact(value: string): string {
@@ -60,11 +65,41 @@ function reject(message: Message, reason: string): void {
   );
 }
 
+function scheduleDissokuRetry(
+  message: Message,
+  services: Services,
+  retryAttempt: number,
+): void {
+  const delayMs = DISSOKU_RETRY_DELAYS_MS[retryAttempt];
+  if (delayMs === undefined) return;
+
+  console.info(
+    `[bump] ディス速応答の完成待ち message=${message.id} attempt=${retryAttempt + 1} delayMs=${delayMs}`,
+  );
+
+  const timer = setTimeout(() => {
+    void message
+      .fetch(true)
+      .then((fresh) => handleBumpMessage(fresh, services, { retryAttempt: retryAttempt + 1 }))
+      .catch((error) =>
+        console.warn(
+          `[bump] ディス速応答の再取得失敗 message=${message.id} attempt=${retryAttempt + 1}:`,
+          error,
+        ),
+      );
+  }, delayMs);
+  timer.unref?.();
+}
+
 /**
  * bump/up 報酬: 掲示板ボットの成功メッセージを検知して実行者に自動記帳。
  * Bot ID・Guild・Channel・取得可能な実行コマンド・成功文面を検証する。
  */
-export async function handleBumpMessage(message: Message, services: Services): Promise<void> {
+export async function handleBumpMessage(
+  message: Message,
+  services: Services,
+  options: BumpHandleOptions = {},
+): Promise<void> {
   if (!message.author.bot) return;
 
   const dissokuId = services.settings.getString("bump_dissoku_bot_id") ?? DISSOKU_DEFAULT_ID;
@@ -104,7 +139,14 @@ export async function handleBumpMessage(message: Message, services: Services): P
     ? /表示順をアップしたよ|Bump done/i.test(text)
     : /をアップしたよ|UPしたよ/i.test(text);
   if (!success) {
-    reject(message, "success_text_missing");
+    // クールタイム等の明示的な失敗は完成済み応答なので再取得しない。
+    const explicitFailure = /失敗|間隔をあけて|あと\s*\d+\s*分|しばらく待/i.test(text);
+    reject(message, explicitFailure ? "failure_response" : "success_text_missing");
+
+    const retryAttempt = options.retryAttempt ?? 0;
+    if (isDissoku && !explicitFailure) {
+      scheduleDissokuRetry(message, services, retryAttempt);
+    }
     return;
   }
 
