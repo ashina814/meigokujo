@@ -67,6 +67,42 @@ jobs:
               'const rendered = ticketPanelMessageForPanel(panel);\n            await fetched.message.edit({ embeds: rendered.embeds, components: rendered.components }).catch(() => { warning = "設置済みメッセージの表示更新に失敗しました。再設置してください。"; });',
           )
           routes.write_text(text)
+
+          actions = Path('.github/scripts/ticket_panel_lifecycle_admin_actions.py')
+          text = actions.read_text()
+          marker = 'async function detachTicketPanelMessage(interaction: ButtonInteraction, services: Services, panel: TicketPanel, actor: string): Promise<{ warning: string; forcedDisabled: boolean }> {'
+          compatibility = r'''export async function disableTicketPanel(
+            interaction: StringSelectMenuInteraction,
+            services: Services,
+            panelId: string,
+          ): Promise<void> {
+            const panel = services.tickets.disablePanel(panelId, `user:${interaction.user.id}`);
+            if (!panel) {
+              await interaction.update({ content: "❌ 受付が見つかりません。", embeds: [], components: [backButton()] });
+              return;
+            }
+            let warning = "";
+            if (panel.channelId && panel.messageId) {
+              const channel = await interaction.client.channels.fetch(panel.channelId).catch(() => null);
+              if (channel?.isTextBased() && "messages" in channel) {
+                const fetched = await fetchPanelMessage(channel, panel.messageId);
+                if (fetched.ok && fetched.message) {
+                  const rendered = ticketPanelMessageForPanel(panel);
+                  await fetched.message.edit({ embeds: rendered.embeds, components: rendered.components }).catch(() => {
+                    warning = "設置済みパネルの無効表示への更新に失敗しました。";
+                  });
+                } else if (fetched.ok) warning = "設置済みパネルのメッセージが見つかりませんでした。";
+                else warning = "設置済みパネルの取得に失敗しました。";
+              } else warning = "設置済みパネルのチャンネルが見つかりません。";
+            }
+            await interaction.update({ content: `🛑 「${panel.name}」を無効化しました。既存チケットは残ります。${warning ? `\n⚠️ ${warning}` : ""}`, embeds: [], components: [backButton()] });
+          }
+
+          '''
+          if marker not in text:
+              raise RuntimeError('compatibility insertion marker not found')
+          text = text.replace(marker, compatibility + marker, 1)
+          actions.write_text(text)
           PY
 
             python .github/scripts/ticket_panel_lifecycle_core.py
