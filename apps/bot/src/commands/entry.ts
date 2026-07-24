@@ -652,7 +652,7 @@ async function checkInvitePromotion(guild: Guild, services: Services, inviterId:
   const soul = services.entry.getSoul(inviterId);
   if (!soul || soul.status !== "ghost") return; // 亡霊以外は昇格対象外
   const score = services.evaluation.promotionScore(inviterId);
-  const required = services.settings.getNumber("promotion_marks_required");
+  const required = services.evaluation.thresholdsFor(inviterId).promotionRequired;
   if (score.total < required) return;
 
   const member = await guild.members.fetch(inviterId).catch(() => null);

@@ -26,10 +26,41 @@ export interface PromotionScore {
   total: number;
 }
 
+export interface EvalThresholds {
+  promotionRequired: number;
+  demotionThreshold: number;
+  policyVersion: string;
+  startedAt: number | null;
+  snapshotted: boolean;
+}
+
+export interface EvaluationHistoryRow {
+  id: number;
+  target_id: string;
+  evaluator_id: string;
+  scores_json: string;
+  texts_json: string;
+  conclusion: Conclusion;
+  mark_id: number | null;
+  mark_weight: number;
+  thread_id: string | null;
+  created_at: number;
+}
+
+export interface PreviousEvaluation {
+  id: number;
+  scores: EvalScores;
+  texts: EvalTexts;
+  conclusion: Conclusion;
+  markWeight: number;
+  createdAt: number;
+}
+
 export interface SubmitResult {
   evaluationId: number;
   promotion: PromotionScore;
   demotionCount: number;
+  thresholds: EvalThresholds;
   promotionReached: boolean;
   demotionReached: boolean;
 }
@@ -40,6 +71,11 @@ export interface SoulDeadlineRow {
 }
 
 const now = () => Math.floor(Date.now() / 1000);
+
+function positiveInt(value: unknown): number | null {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
 
 /**
  * 印台帳 + 評価（ボット設計.md 評価・印・招待トラッキング）。
@@ -54,14 +90,43 @@ export class Evaluation {
 
   // ---- 印台帳 ----
 
-  addMark(targetId: string, kind: "promotion" | "demotion", grantedBy: string, ref?: string): number {
+  thresholdsFor(targetId: string): EvalThresholds {
+    const row = this.db
+      .prepare(
+        `SELECT eval_started_at, eval_policy_version, eval_promotion_required, eval_demotion_threshold
+         FROM souls WHERE user_id = ?`,
+      )
+      .get(targetId) as
+      | {
+          eval_started_at: number | null;
+          eval_policy_version: string | null;
+          eval_promotion_required: number | null;
+          eval_demotion_threshold: number | null;
+        }
+      | undefined;
+    const currentPromotion = this.settings.getNumber("promotion_marks_required");
+    const currentDemotion = this.settings.getNumber("demotion_marks_threshold");
+    const promotionRequired = positiveInt(row?.eval_promotion_required) ?? currentPromotion;
+    const demotionThreshold = positiveInt(row?.eval_demotion_threshold) ?? currentDemotion;
+    return {
+      promotionRequired,
+      demotionThreshold,
+      policyVersion: row?.eval_policy_version ?? `current:${currentPromotion}:${currentDemotion}`,
+      startedAt: row?.eval_started_at ?? null,
+      snapshotted: row?.eval_promotion_required !== null && row?.eval_demotion_threshold !== null,
+    };
+  }
+
+  addMark(targetId: string, kind: "promotion" | "demotion", grantedBy: string, ref?: string, weight = 1): number {
+    const safeWeight = positiveInt(weight);
+    if (!safeWeight) throw new Error("mark weight must be a positive integer");
     const result = this.db
-      .prepare("INSERT INTO marks (target_id, kind, granted_by, ref, created_at) VALUES (?, ?, ?, ?, ?)")
-      .run(targetId, kind, grantedBy, ref ?? null, now());
+      .prepare("INSERT INTO marks (target_id, kind, granted_by, ref, weight, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(targetId, kind, grantedBy, ref ?? null, safeWeight, now());
     this.events.log(kind === "promotion" ? "mark_promotion" : "mark_demotion", {
       actor: grantedBy,
       target: targetId,
-      payload: { ref },
+      payload: { ref, weight: safeWeight },
     });
     return Number(result.lastInsertRowid);
   }
@@ -74,7 +139,7 @@ export class Evaluation {
   promotionScore(targetId: string): PromotionScore {
     const evalMarks = (
       this.db
-        .prepare("SELECT COUNT(*) AS c FROM marks WHERE target_id = ? AND kind = 'promotion' AND revoked_at IS NULL")
+        .prepare("SELECT COALESCE(SUM(weight), 0) AS c FROM marks WHERE target_id = ? AND kind = 'promotion' AND revoked_at IS NULL")
         .get(targetId) as { c: number }
     ).c;
     const inviteCount = (
@@ -89,7 +154,7 @@ export class Evaluation {
   demotionCount(targetId: string): number {
     return (
       this.db
-        .prepare("SELECT COUNT(*) AS c FROM marks WHERE target_id = ? AND kind = 'demotion' AND revoked_at IS NULL")
+        .prepare("SELECT COALESCE(SUM(weight), 0) AS c FROM marks WHERE target_id = ? AND kind = 'demotion' AND revoked_at IS NULL")
         .get(targetId) as { c: number }
     ).c;
   }
@@ -102,8 +167,10 @@ export class Evaluation {
     scores: EvalScores;
     texts: EvalTexts;
     conclusion: Conclusion;
+    markWeight?: number;
     threadId?: string;
   }): SubmitResult {
+    const markWeight = input.conclusion === "none" ? 0 : (positiveInt(input.markWeight) ?? 1);
     // 同一評価員の再評価は上書き: 同じ評価員が同じ対象に付けた既存の印を取り消してから記帳する
     // （1評価員=最新の結論1つだけが有効。評価の履歴自体は evaluations に追記で残る）
     const superseded = this.db
@@ -121,12 +188,12 @@ export class Evaluation {
 
     let markId: number | null = null;
     if (input.conclusion !== "none") {
-      markId = this.addMark(input.targetId, input.conclusion, input.evaluatorId, "evaluation");
+      markId = this.addMark(input.targetId, input.conclusion, input.evaluatorId, "evaluation", markWeight);
     }
     const result = this.db
       .prepare(
-        `INSERT INTO evaluations (target_id, evaluator_id, scores_json, texts_json, conclusion, mark_id, thread_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO evaluations (target_id, evaluator_id, scores_json, texts_json, conclusion, mark_id, mark_weight, thread_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.targetId,
@@ -135,18 +202,41 @@ export class Evaluation {
         JSON.stringify(input.texts),
         input.conclusion,
         markId,
+        markWeight,
         input.threadId ?? null,
         now(),
       );
 
     const promotion = this.promotionScore(input.targetId);
     const demotionCount = this.demotionCount(input.targetId);
+    const thresholds = this.thresholdsFor(input.targetId);
     return {
       evaluationId: Number(result.lastInsertRowid),
       promotion,
       demotionCount,
-      promotionReached: promotion.total >= this.settings.getNumber("promotion_marks_required"),
-      demotionReached: demotionCount >= this.settings.getNumber("demotion_marks_threshold"),
+      thresholds,
+      promotionReached: promotion.total >= thresholds.promotionRequired,
+      demotionReached: demotionCount >= thresholds.demotionThreshold,
+    };
+  }
+
+  latestByEvaluator(targetId: string, evaluatorId: string): PreviousEvaluation | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM evaluations
+         WHERE target_id = ? AND evaluator_id = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1`,
+      )
+      .get(targetId, evaluatorId) as EvaluationHistoryRow | undefined;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      scores: JSON.parse(row.scores_json) as EvalScores,
+      texts: JSON.parse(row.texts_json) as EvalTexts,
+      conclusion: row.conclusion,
+      markWeight: row.mark_weight,
+      createdAt: row.created_at,
     };
   }
 
@@ -190,7 +280,6 @@ export class Evaluation {
 
   /** 期限切れ（迷霊落ち承認パネルの対象）。昇格到達者は面談待ちのため除外 */
   overdue(atTs = now()): SoulDeadlineRow[] {
-    const required = this.settings.getNumber("promotion_marks_required");
     return (
       this.db
         .prepare(
@@ -199,7 +288,10 @@ export class Evaluation {
            ORDER BY eval_deadline_at`,
         )
         .all(atTs) as SoulDeadlineRow[]
-    ).filter((r) => this.promotionScore(r.user_id).total < required);
+    ).filter((r) => {
+      const thresholds = this.thresholdsFor(r.user_id);
+      return this.promotionScore(r.user_id).total < thresholds.promotionRequired;
+    });
   }
 
   // ---- 評価フォーラムのスレッド対応表 ----

@@ -122,6 +122,7 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "setting" && action === "channel-select") return void (await openChannelSetup(interaction, services));
   if (section === "setting" && action === "role-select") return void (await openRoleSetup(interaction, services));
   if (section === "setting" && action === "number-select") return void (await openNumberSetup(interaction, services));
+  if (section === "setting" && action === "eval-cap") return void (await interaction.update(evaluationCapHome(services)));
 
   // ── 機関ロール（冥教会・他機関） ──
   if (section === "orgrole" && !action) return void (await interaction.update(orgRoleHome(services)));
@@ -224,6 +225,9 @@ export async function handleAdminSelect(
   }
   if (section === "setting" && action === "number-key" && interaction.isStringSelectMenu()) {
     return void (await interaction.showModal(numberSetModal(interaction.values[0]!)));
+  }
+  if (section === "setting" && action === "eval-cap-pick" && interaction.isRoleSelectMenu()) {
+    return void (await interaction.showModal(evaluationCapModal(services, interaction.values[0]!)));
   }
   // ── 機関ロール ──
   if (section === "orgrole" && action === "key" && interaction.isStringSelectMenu()) {
@@ -418,6 +422,25 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
     await interaction.reply({ content: `✅ **${key}** = ${n.toLocaleString()} に設定しました。`, flags: MessageFlags.Ephemeral });
     return;
   }
+  if (section === "setting" && action === "eval-cap-save") {
+    const roleId = parts[3]!;
+    const raw = interaction.fields.getTextInputValue("value").replaceAll(",", "").trim();
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 0 || n > 25) {
+      await interaction.reply({ content: "最大印数は 0〜25 の整数で入力してください（0で設定削除）。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const caps = evalMarkCapsByRole(services);
+    if (n === 0) delete caps[roleId];
+    else caps[roleId] = n;
+    services.settings.set("eval_mark_caps_by_role", caps, `user:${interaction.user.id}`);
+    await interaction.reply({
+      content: n === 0 ? `🗑 <@&${roleId}> の評価印上限設定を削除しました。` : `✅ <@&${roleId}> の評価印上限を **${n}印** に設定しました。`,
+      flags: MessageFlags.Ephemeral,
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
   if (section === "sprof" && action === "save") {
     const roleId = parts[3]!;
     const name = interaction.fields.getTextInputValue("name").trim();
@@ -596,8 +619,59 @@ async function settingHome(_services: Services) {
   const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:orgrole").setLabel("機関ロール").setEmoji("⛪").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:sprof").setLabel("特別プロフィール").setEmoji("👑").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mgmt:setting:eval-cap").setLabel("評価印上限").setEmoji("🪬").setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row, row2, backButton()] };
+}
+
+function evalMarkCapsByRole(services: Services): Record<string, number> {
+  const raw = services.settings.getJson<Record<string, unknown>>("eval_mark_caps_by_role", {});
+  return Object.fromEntries(
+    Object.entries(raw)
+      .map(([roleId, value]) => [roleId, Math.trunc(Number(value))] as const)
+      .filter(([, value]) => Number.isInteger(value) && value > 0),
+  );
+}
+
+function evaluationCapHome(services: Services) {
+  const caps = evalMarkCapsByRole(services);
+  const lines = Object.entries(caps)
+    .sort((a, b) => b[1] - a[1])
+    .map(([roleId, cap]) => `・<@&${roleId}>: 最大 **${cap}印**`);
+  const embed = new EmbedBuilder()
+    .setTitle("🪬 評価印上限")
+    .setColor(0x6b21a8)
+    .setDescription(
+      [
+        "魔剣士の階級ロールごとに、1回の評価で付けられる最大印数を設定します。",
+        "複数ロールを持つ評価員は、設定された上限のうち最大値を使用します。",
+        "未設定ロールは従来通り最大1印です。",
+        "",
+        lines.length > 0 ? lines.join("\n") : "現在の個別設定はありません（全員 最大1印）。",
+      ].join("\n"),
+    );
+  const picker = new RoleSelectMenuBuilder()
+    .setCustomId("mgmt:setting:eval-cap-pick")
+    .setPlaceholder("上限を設定・変更するロールを選ぶ");
+  return { embeds: [embed], components: [new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(picker), backButton()], allowedMentions: { parse: [] } };
+}
+
+function evaluationCapModal(services: Services, roleId: string) {
+  const current = evalMarkCapsByRole(services)[roleId] ?? 1;
+  return new ModalBuilder()
+    .setCustomId(`mgmt:setting:eval-cap-save:${roleId}`)
+    .setTitle("評価印上限")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("value")
+          .setLabel("最大印数（0で設定削除）")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setValue(String(current))
+          .setMaxLength(2),
+      ),
+    );
 }
 
 const CHANNEL_KEYS: Array<[string, string]> = [

@@ -418,7 +418,8 @@ export async function runCharonDaily(client: Client, services: Services): Promis
       const lines = dueSoon.map((r) => {
         const p = services.evaluation.promotionScore(r.user_id);
         const d = services.evaluation.demotionCount(r.user_id);
-        return `・<@${r.user_id}> 期限 <t:${r.eval_deadline_at}:R> — 昇格印 ${p.total}/5・低評価印 ${d}/4・評価 ${services.evaluation.evaluationCount(r.user_id)}件`;
+        const t = services.evaluation.thresholdsFor(r.user_id);
+        return `・<@${r.user_id}> 期限 <t:${r.eval_deadline_at}:R> — 昇格印 ${p.total}/${t.promotionRequired}・低評価印 ${d}/${t.demotionThreshold}・評価 ${services.evaluation.evaluationCount(r.user_id)}件`;
       });
       await sendChunkedLines(keikiban, `🛶 **カロンの帳簿** — 審判が近い魂 ${dueSoon.length}名:`, lines);
     }
@@ -449,10 +450,11 @@ export async function runCharonDaily(client: Client, services: Services): Promis
     // チャンネル通知（本人メンション付き）
     if (notifyCh?.isTextBased() && "send" in notifyCh) {
       const p = services.evaluation.promotionScore(r.user_id);
+      const t = services.evaluation.thresholdsFor(r.user_id);
       const line =
         daysLeft === 0
-          ? `🛶 <@${r.user_id}> **審判の刻限は本日** <t:${r.eval_deadline_at}:t>。昇格印 **${p.total}/5**（残り時間で挽回するか、迷霊落ちを覚悟せよ）。`
-          : `🛶 <@${r.user_id}> **審判まであと${daysLeft}日**（<t:${r.eval_deadline_at}:R>）。昇格印 **${p.total}/5**・評価対象VCで姿を示せ。`;
+          ? `🛶 <@${r.user_id}> **審判の刻限は本日** <t:${r.eval_deadline_at}:t>。昇格印 **${p.total}/${t.promotionRequired}**（残り時間で挽回するか、迷霊落ちを覚悟せよ）。`
+          : `🛶 <@${r.user_id}> **審判まであと${daysLeft}日**（<t:${r.eval_deadline_at}:R>）。昇格印 **${p.total}/${t.promotionRequired}**・評価対象VCで姿を示せ。`;
       await notifyCh
         .send({ content: line, allowedMentions: { users: [r.user_id] } })
         .catch(() => undefined);
@@ -465,7 +467,8 @@ export async function runCharonDaily(client: Client, services: Services): Promis
   if (kessai && overdue.length > 0) {
     const lines = overdue.slice(0, 20).map((r) => {
       const p = services.evaluation.promotionScore(r.user_id);
-      return `・<@${r.user_id}>（昇格印 ${p.total}/5・期限 <t:${r.eval_deadline_at}:D>）`;
+      const t = services.evaluation.thresholdsFor(r.user_id);
+      return `・<@${r.user_id}>（昇格印 ${p.total}/${t.promotionRequired}・期限 <t:${r.eval_deadline_at}:D>）`;
     });
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("charon:drop").setLabel(`${overdue.length}名を迷霊に落とす`).setStyle(ButtonStyle.Danger),

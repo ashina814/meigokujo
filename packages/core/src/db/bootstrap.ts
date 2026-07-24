@@ -80,6 +80,10 @@ CREATE TABLE IF NOT EXISTS souls (
   ghost_at            INTEGER,
   eval_deadline_at    INTEGER,
   eval_extension_days INTEGER NOT NULL DEFAULT 0,
+  eval_started_at     INTEGER,
+  eval_policy_version TEXT,
+  eval_promotion_required INTEGER,
+  eval_demotion_threshold INTEGER,
   inviter_user_id     TEXT,
   inviter_source      TEXT,
   updated_at          INTEGER NOT NULL
@@ -142,6 +146,7 @@ CREATE TABLE IF NOT EXISTS marks (
   kind       TEXT NOT NULL CHECK (kind IN ('promotion','demotion')),
   granted_by TEXT NOT NULL,
   ref        TEXT,
+  weight     INTEGER NOT NULL DEFAULT 1 CHECK (weight > 0),
   created_at INTEGER NOT NULL,
   revoked_at INTEGER
 );
@@ -155,6 +160,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
   texts_json   TEXT NOT NULL,
   conclusion   TEXT NOT NULL CHECK (conclusion IN ('promotion','demotion','none')),
   mark_id      INTEGER REFERENCES marks(id),
+  mark_weight  INTEGER NOT NULL DEFAULT 0 CHECK (mark_weight >= 0),
   thread_id    TEXT,
   created_at   INTEGER NOT NULL
 );
@@ -440,17 +446,41 @@ export function openDb(path: string): Database.Database {
   // マイグレーション: 旧カジノの chip_balances は ether_balances に置き換え（旧カジノは開帳前に廃止＝データ無し）
   db.exec("DROP TABLE IF EXISTS chip_balances");
   db.exec(DDL);
-  // マイグレーション: vc_segments に parent_id（親カテゴリ）を追加。
-  // ブラックリスト方式の浮上報酬でカテゴリ単位の除外を正確に判定するため。
-  // 既存行は NULL（＝カテゴリ不明）で、チャンネル単位の除外のみ効く。以後の記録は親カテゴリを保持。
-  if (!columnExists(db, "vc_segments", "parent_id")) {
-    db.exec("ALTER TABLE vc_segments ADD COLUMN parent_id TEXT");
-  }
+  ensureColumn(db, "vc_segments", "parent_id", "TEXT");
+  ensureColumn(db, "marks", "weight", "INTEGER NOT NULL DEFAULT 1 CHECK (weight > 0)");
+  ensureColumn(db, "evaluations", "mark_weight", "INTEGER NOT NULL DEFAULT 0 CHECK (mark_weight >= 0)");
+  ensureColumn(db, "souls", "eval_started_at", "INTEGER");
+  ensureColumn(db, "souls", "eval_policy_version", "TEXT");
+  ensureColumn(db, "souls", "eval_promotion_required", "INTEGER");
+  ensureColumn(db, "souls", "eval_demotion_threshold", "INTEGER");
+  backfillEvaluationPolicySnapshots(db);
   return db;
 }
 
-/** テーブルに指定カラムが存在するか（冪等マイグレーション用） */
-function columnExists(db: Database.Database, table: string, column: string): boolean {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-  return cols.some((c) => c.name === column);
+function ensureColumn(db: Database.Database, table: string, column: string, definition: string): void {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (rows.some((r) => r.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+function settingNumber(db: Database.Database, key: string, fallback: number): number {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;
+  if (!row) return fallback;
+  const value = Number(row.value);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function backfillEvaluationPolicySnapshots(db: Database.Database): void {
+  const promotionRequired = settingNumber(db, "promotion_marks_required", 5);
+  const demotionThreshold = settingNumber(db, "demotion_marks_threshold", 4);
+  const ts = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `UPDATE souls
+     SET eval_started_at = COALESCE(eval_started_at, ghost_at, updated_at, ?),
+         eval_policy_version = COALESCE(eval_policy_version, ?),
+         eval_promotion_required = COALESCE(eval_promotion_required, ?),
+         eval_demotion_threshold = COALESCE(eval_demotion_threshold, ?)
+     WHERE status = 'ghost'
+       AND (eval_promotion_required IS NULL OR eval_demotion_threshold IS NULL)`,
+  ).run(ts, `migration:${ts}`, promotionRequired, demotionThreshold);
 }

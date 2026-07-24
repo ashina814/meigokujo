@@ -22,13 +22,20 @@ function setup() {
   return { db, ledger, settings, events, entry, evaluation };
 }
 
-function submit(ctx: ReturnType<typeof setup>, target: string, conclusion: "promotion" | "demotion" | "none", evaluator = SWORDSMAN) {
+function submit(
+  ctx: ReturnType<typeof setup>,
+  target: string,
+  conclusion: "promotion" | "demotion" | "none",
+  evaluator = SWORDSMAN,
+  markWeight?: number,
+) {
   return ctx.evaluation.submitEvaluation({
     targetId: target,
     evaluatorId: evaluator,
     scores: SCORES,
-    texts: { detail: "テスト" },
+    texts: { detail: "テスト", merit: "メリット", concern: "不安", feedback: "FB", others: "高い人/低い人" },
     conclusion,
+    markWeight,
   });
 }
 
@@ -48,6 +55,15 @@ describe("印台帳と閾値", () => {
     expect(fifth.promotionReached).toBe(true);
   });
 
+  it("既存印は1印として扱い、weight付き印は加重集計される", () => {
+    ctx.evaluation.addMark("weighted", "promotion", "old", "legacy");
+    ctx.evaluation.addMark("weighted", "promotion", "senior", "evaluation", 3);
+    ctx.evaluation.addMark("weighted", "demotion", "strict", "evaluation", 2);
+
+    expect(ctx.evaluation.promotionScore("weighted").evalMarks).toBe(4);
+    expect(ctx.evaluation.demotionCount("weighted")).toBe(2);
+  });
+
   it("招待は0.5個/人・上限1.0個として昇格スコアに加算される", () => {
     // alice が3人招待（実績は invites テーブル）→ 0.5×3 = 1.5 だが上限1.0
     ctx.entry.book("alice", "flex", { source: "none" });
@@ -65,6 +81,36 @@ describe("印台帳と閾値", () => {
     const r = submit(ctx, "alice", "promotion");
     expect(r.promotion.total).toBe(5);
     expect(r.promotionReached).toBe(true);
+  });
+
+  it("対象者ごとの必要印数は評価開始時点で固定される", () => {
+    ctx.settings.set("promotion_marks_required", 6, "staff");
+    ctx.settings.set("demotion_marks_threshold", 3, "staff");
+    ctx.entry.book("frozen", "flex", { source: "none" });
+    ctx.entry.ghostify("frozen", "staff");
+
+    ctx.settings.set("promotion_marks_required", 2, "staff");
+    ctx.settings.set("demotion_marks_threshold", 2, "staff");
+
+    const thresholds = ctx.evaluation.thresholdsFor("frozen");
+    expect(thresholds.promotionRequired).toBe(6);
+    expect(thresholds.demotionThreshold).toBe(3);
+
+    const r1 = submit(ctx, "frozen", "promotion", "user:a", 2);
+    expect(r1.promotionReached).toBe(false);
+    const r2 = submit(ctx, "frozen", "promotion", "user:b", 4);
+    expect(r2.promotionReached).toBe(true);
+    expect(r2.thresholds.promotionRequired).toBe(6);
+  });
+
+  it("制度変更後の新規対象者には新基準が適用される", () => {
+    ctx.settings.set("promotion_marks_required", 7, "staff");
+    ctx.settings.set("demotion_marks_threshold", 5, "staff");
+    ctx.entry.book("new_ghost", "flex", { source: "none" });
+    ctx.entry.ghostify("new_ghost", "staff");
+
+    expect(ctx.evaluation.thresholdsFor("new_ghost").promotionRequired).toBe(7);
+    expect(ctx.evaluation.thresholdsFor("new_ghost").demotionThreshold).toBe(5);
   });
 
   it("低評価印4個で迷霊落ちフラグが立ち、demoteToMeirei で魂台帳が変わる", () => {
@@ -102,6 +148,37 @@ describe("印台帳と閾値", () => {
     submit(ctx, "dave", "promotion");
     expect(ctx.evaluation.promotionScore("dave").evalMarks).toBe(2);
     expect(ctx.evaluation.evaluationCount("dave")).toBe(2);
+  });
+
+  it("再評価時に旧印が無効化され、新しい印数へ置換される", () => {
+    submit(ctx, "redo", "promotion", "user:evaluator", 3);
+    expect(ctx.evaluation.promotionScore("redo").evalMarks).toBe(3);
+
+    const second = submit(ctx, "redo", "demotion", "user:evaluator", 2);
+    expect(second.promotion.evalMarks).toBe(0);
+    expect(second.demotionCount).toBe(2);
+    expect(ctx.evaluation.evaluationCount("redo")).toBe(1);
+
+    const rows = ctx.db
+      .prepare("SELECT conclusion, mark_weight FROM evaluations WHERE target_id='redo' ORDER BY id")
+      .all() as Array<{ conclusion: string; mark_weight: number }>;
+    expect(rows).toEqual([
+      { conclusion: "promotion", mark_weight: 3 },
+      { conclusion: "demotion", mark_weight: 2 },
+    ]);
+  });
+
+  it("前回評価内容を取得でき、履歴は追記で残る", () => {
+    submit(ctx, "history", "promotion", "user:evaluator", 2);
+    submit(ctx, "history", "none", "user:evaluator");
+
+    const latest = ctx.evaluation.latestByEvaluator("history", "user:evaluator")!;
+    expect(latest.conclusion).toBe("none");
+    expect(latest.scores).toEqual(SCORES);
+    expect(latest.texts.detail).toBe("テスト");
+    expect(latest.texts.merit).toBe("メリット");
+    expect(latest.markWeight).toBe(0);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS c FROM evaluations WHERE target_id='history'").get() as { c: number }).c).toBe(2);
   });
 
   it("取り消した印は集計に入らない", () => {
