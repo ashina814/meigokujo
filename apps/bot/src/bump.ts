@@ -48,8 +48,7 @@ function invocation(message: Message): {
     | (NonNullable<Message["interactionMetadata"]> & { name?: string })
     | null;
   return {
-    // discord.js 14.26ではcommand名は旧interaction.commandNameに残る。
-    // APIのinteraction_metadata.nameを保持する実装向けにmetadata.nameもフォールバックする。
+    // discord.jsの版によってcommand名の公開位置が異なるため、取得できる場所を順に見る。
     name: legacy?.commandName ?? legacy?.name ?? metadata?.name,
     user: metadata?.user ?? legacy?.user,
   };
@@ -63,7 +62,7 @@ function reject(message: Message, reason: string): void {
 
 /**
  * bump/up 報酬: 掲示板ボットの成功メッセージを検知して実行者に自動記帳。
- * Bot ID・Guild・Channel・実行コマンド・成功文面をすべて検証する。
+ * Bot ID・Guild・Channel・取得可能な実行コマンド・成功文面を検証する。
  */
 export async function handleBumpMessage(message: Message, services: Services): Promise<void> {
   if (!message.author.bot) return;
@@ -88,8 +87,9 @@ export async function handleBumpMessage(message: Message, services: Services): P
 
   const interaction = invocation(message);
   const expectedCommand = isDisboard ? "bump" : "up";
-  if (interaction.name !== expectedCommand) {
-    reject(message, `command_mismatch:${interaction.name ?? "none"}`);
+  // discord.jsがcommand名を公開しない版では、Bot ID・Guild・Channel・成功文面で判定する。
+  if (interaction.name !== undefined && interaction.name !== expectedCommand) {
+    reject(message, `command_mismatch:${interaction.name}`);
     return;
   }
 
