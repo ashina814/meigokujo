@@ -11,6 +11,7 @@ import { updateDashboard } from "./dashboard.js";
 import { tickVoiceXp } from "./rank-tracker.js";
 import { fmtLd } from "./format.js";
 import { announceAutoClose, announceSettle, refreshMarketPanel } from "./commands/ita.js";
+import { ticketStaffRoleIds } from "./commands/tickets.js";
 import type { Services } from "./services.js";
 
 /** JSTの現在時刻の分解値。VPSのTZに依存しないよう明示的に変換する */
@@ -103,14 +104,14 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       const stale = services.tickets.staleOpen(24);
       if (stale.length > 0) {
         const kessaiId = services.settings.getString("channel:kessai");
-        const staffRoleId = services.settings.getString("role:ticket_staff");
+        const staffRoleIds = [...new Set(stale.flatMap((t) => ticketStaffRoleIds(t, services)))];
         const channel = kessaiId ? await client.channels.fetch(kessaiId).catch(() => null) : null;
         if (channel?.isTextBased() && "send" in channel) {
           // 同じ2000文字上限の踏み方をするため、チケット一覧も分割送信にする
           await sendChunkedLines(
             channel as TextChannel,
-            `📮 ${staffRoleId ? `<@&${staffRoleId}> ` : ""}**24時間以上応答のないチケットが ${stale.length} 件あります**:`,
-            stale.map((t) => `・<#${t.thread_id}>（${t.kind === "return" ? "出戻り" : "相談"}）`),
+            `📮 ${staffRoleIds.length > 0 ? `${staffRoleIds.map((id) => `<@&${id}>`).join(" ")} ` : ""}**24時間以上応答のないチケットが ${stale.length} 件あります**:`,
+            stale.map((t) => `・<#${t.thread_id}>（${t.panel_name ?? (t.kind === "return" ? "出戻り" : t.kind === "consult" ? "相談" : t.kind)}）`),
           );
           for (const t of stale) services.tickets.markReminded(t.thread_id);
         }
