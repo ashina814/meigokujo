@@ -44,9 +44,14 @@ function invocation(message: Message): {
   user: { id: string; bot?: boolean } | undefined;
 } {
   const legacy = (message as Message & { interaction?: LegacyInteraction | null }).interaction;
+  const metadata = message.interactionMetadata as
+    | (NonNullable<Message["interactionMetadata"]> & { name?: string })
+    | null;
   return {
-    name: message.interactionMetadata?.name ?? legacy?.name ?? legacy?.commandName,
-    user: message.interactionMetadata?.user ?? legacy?.user,
+    // discord.js 14.26ではcommand名は旧interaction.commandNameに残る。
+    // APIのinteraction_metadata.nameを保持する実装向けにmetadata.nameもフォールバックする。
+    name: legacy?.commandName ?? legacy?.name ?? metadata?.name,
+    user: metadata?.user ?? legacy?.user,
   };
 }
 
