@@ -1,0 +1,73 @@
+name: Apply ticket panel lifecycle patch
+
+on:
+  push:
+    branches:
+      - agent/ticket-panel-lifecycle
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/ticket-panel-lifecycle
+          fetch-depth: 0
+
+      - name: Apply lifecycle patches
+        run: |
+          python .github/scripts/ticket_panel_lifecycle_core.py
+          python .github/scripts/ticket_panel_lifecycle_admin_routes.py
+          python .github/scripts/ticket_panel_lifecycle_admin_ui.py
+          python .github/scripts/ticket_panel_lifecycle_admin_actions.py
+          python .github/scripts/ticket_panel_lifecycle_tests.py
+
+      - name: Remove temporary patch machinery
+        run: |
+          rm -f .github/scripts/ticket_panel_lifecycle_core.py
+          rm -f .github/scripts/ticket_panel_lifecycle_admin_routes.py
+          rm -f .github/scripts/ticket_panel_lifecycle_admin_ui.py
+          rm -f .github/scripts/ticket_panel_lifecycle_admin_actions.py
+          rm -f .github/scripts/ticket_panel_lifecycle_tests.py
+          rm -f .github/workflows/ticket-panel-lifecycle-autofix.yml
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Run ticket core tests
+        run: pnpm --filter @meigokujo/core test -- tests/vc-tickets.test.ts
+
+      - name: Run bot tests
+        run: pnpm --filter @meigokujo/bot test
+
+      - name: Run full test suite
+        run: pnpm -r test
+
+      - name: Check diff
+        run: git diff --check
+
+      - name: Commit implementation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "Complete ticket panel lifecycle controls"
+          git push origin HEAD:agent/ticket-panel-lifecycle
