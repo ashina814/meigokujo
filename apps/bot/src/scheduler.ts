@@ -320,7 +320,10 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
 
 /** VC浮上報酬の日次支給: 前日分を計算して1人1取引で発行し、本人にDMで通知 */
 export async function payVcRewards(client: Client, services: Services, dateStr: string): Promise<void> {
-  const rewards = services.vcRewards.computeDay(dateStr);
+  // ブラックリスト方式: 除外リスト(XPと共用)と寝落ちリストを設定から組み立てて渡す。
+  const excludedIds = new Set(services.settings.getJson<string[]>("xp_excluded_channels", []));
+  const sleepChannelIds = new Set(services.settings.getJson<string[]>("vc_sleep_list", []));
+  const rewards = services.vcRewards.computeDay(dateStr, { excludedIds, sleepChannelIds });
   if (rewards.length === 0) return;
 
   let total = 0;
