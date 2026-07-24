@@ -1,0 +1,161 @@
+name: PR8 ticket safety autofix
+
+on:
+  push:
+    branches: [agent/generic-ticket-panels]
+    paths:
+      - .github/workflows/pr8-ticket-autofix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/generic-ticket-panels
+          fetch-depth: 0
+
+      - name: Apply exact safety fixes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          admin = Path("apps/bot/src/commands/admin-hub.ts")
+          text = admin.read_text()
+
+          old = '''  await sent.pin().catch(() => undefined);
+          services.tickets.setPanelMessage(panel.id, channel.id, sent.id, `user:${interaction.user.id}`);
+
+          let warning = "";
+          '''
+          new = '''  await sent.pin().catch(() => undefined);
+          try {
+            services.tickets.setPanelMessage(panel.id, channel.id, sent.id, `user:${interaction.user.id}`);
+          } catch (e) {
+            if (!editedExisting) {
+              await sent.delete().catch((deleteError) =>
+                console.error("[ticket-panel] DB保存失敗後の新規パネル削除にも失敗しました", {
+                  panelId: panel.id,
+                  channelId: channel.id,
+                  messageId: sent.id,
+                  error: deleteError,
+                }),
+              );
+            }
+            console.error("[ticket-panel] パネル設置情報のDB保存に失敗しました", {
+              panelId: panel.id,
+              channelId: channel.id,
+              messageId: sent.id,
+              editedExisting,
+              error: e,
+            });
+            await interaction.update({
+              content: editedExisting
+                ? "❌ 既存パネルの表示更新後、設置情報の保存に失敗しました。DBは更新されていません。"
+                : "❌ パネル送信後に設置情報の保存に失敗したため、新しいメッセージを削除しました。既存パネルは残しています。",
+              embeds: [],
+              components: [backButton()],
+            });
+            return;
+          }
+
+          let warning = "";
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f"admin save block match count={text.count(old)}")
+          text = text.replace(old, new)
+
+          old = '''    const oldChannel = await interaction.client.channels.fetch(oldPlacement.channelId).catch((e) => {
+              console.warn("[ticket-panel] 移設後の旧チャンネル取得に失敗しました", { panelId: panel.id, oldPlacement, error: e });
+              return null;
+            });
+            if (oldChannel?.isTextBased() && "messages" in oldChannel) {
+          '''
+          new = '''    let oldChannelFetchFailed = false;
+            const oldChannel = await interaction.client.channels.fetch(oldPlacement.channelId).catch((e) => {
+              oldChannelFetchFailed = true;
+              console.warn("[ticket-panel] 移設後の旧チャンネル取得に失敗しました", { panelId: panel.id, oldPlacement, error: e });
+              return null;
+            });
+            if (oldChannelFetchFailed) {
+              warning = "旧パネルのチャンネル取得に失敗しました。旧パネルが残っている可能性があるため手動確認してください。";
+            } else if (oldChannel?.isTextBased() && "messages" in oldChannel) {
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f"old channel fetch block match count={text.count(old)}")
+          text = text.replace(old, new)
+
+          old = '''    } else if (oldChannel) {
+              warning = "旧パネルのチャンネルがテキストチャンネルではありません。手動確認してください。";
+              console.warn("[ticket-panel] 移設後の旧パネルチャンネルがテキストではありません", { panelId: panel.id, oldPlacement });
+            }
+          '''
+          new = '''    } else {
+              warning = oldChannel
+                ? "旧パネルのチャンネルがテキストチャンネルではありません。手動確認してください。"
+                : "旧パネルのチャンネルが見つかりません。手動確認してください。";
+              console.warn("[ticket-panel] 移設後の旧パネルチャンネルを処理できません", { panelId: panel.id, oldPlacement });
+            }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f"old channel fallback block match count={text.count(old)}")
+          text = text.replace(old, new)
+          admin.write_text(text)
+
+          service = Path("packages/core/src/tickets/service.ts")
+          text = service.read_text()
+          old = '''  setPanelMessage(id: string, channelId: string, messageId: string, actor = "system"): TicketPanel | undefined {
+            this.db
+              .prepare("UPDATE ticket_panels SET channel_id = ?, message_id = ?, updated_by = ?, updated_at = ? WHERE id = ?")
+              .run(channelId, messageId, actor, now(), id);
+            this.events.log("ticket_panel_installed", { actor, payload: { id, channelId, messageId } });
+            return this.getPanel(id);
+          }
+          '''
+          new = '''  setPanelMessage(id: string, channelId: string, messageId: string, actor = "system"): TicketPanel | undefined {
+            const savePanelMessage = this.db.transaction(() => {
+              this.db
+                .prepare("UPDATE ticket_panels SET channel_id = ?, message_id = ?, updated_by = ?, updated_at = ? WHERE id = ?")
+                .run(channelId, messageId, actor, now(), id);
+              this.events.log("ticket_panel_installed", { actor, payload: { id, channelId, messageId } });
+              return this.getPanel(id);
+            });
+            return savePanelMessage();
+          }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f"setPanelMessage block match count={text.count(old)}")
+          service.write_text(text.replace(old, new))
+          PY
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Run tests
+        run: pnpm -r test
+
+      - name: Commit verified fixes and remove temporary workflow
+        run: |
+          rm .github/workflows/pr8-ticket-autofix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apps/bot/src/commands/admin-hub.ts packages/core/src/tickets/service.ts apps/bot/tests/ticket-panels-admin-final.test.ts .github/workflows/pr8-ticket-autofix.yml
+          git commit -m "Finish generic ticket panel safety fixes"
+          git push origin HEAD:agent/generic-ticket-panels
