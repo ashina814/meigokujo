@@ -1,0 +1,81 @@
+name: Temporary ticket panel lifecycle patch
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: read
+  issues: read
+
+jobs:
+  apply:
+    if: >-
+      github.event.issue.number == 11 &&
+      github.event.issue.pull_request &&
+      github.event.comment.body == '/apply-ticket-panel-lifecycle-7f3c2a'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out lifecycle branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/ticket-panel-lifecycle
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Apply, validate, and publish
+        shell: bash
+        run: |
+          set +e
+          LOG=/tmp/ticket-panel-lifecycle.log
+          {
+            set -euo pipefail
+            python .github/scripts/ticket_panel_lifecycle_core.py
+            python .github/scripts/ticket_panel_lifecycle_admin_routes.py
+            python .github/scripts/ticket_panel_lifecycle_admin_ui.py
+            python .github/scripts/ticket_panel_lifecycle_admin_actions.py
+            python .github/scripts/ticket_panel_lifecycle_tests.py
+
+            rm -f .github/scripts/ticket_panel_lifecycle_core.py
+            rm -f .github/scripts/ticket_panel_lifecycle_admin_routes.py
+            rm -f .github/scripts/ticket_panel_lifecycle_admin_ui.py
+            rm -f .github/scripts/ticket_panel_lifecycle_admin_actions.py
+            rm -f .github/scripts/ticket_panel_lifecycle_tests.py
+            rm -f .github/workflows/ticket-panel-lifecycle-autofix.yml
+            rm -f .github/TICKET_PANEL_PATCH_FAILURE.log
+
+            pnpm install --frozen-lockfile
+            pnpm typecheck
+            pnpm --filter @meigokujo/core test -- tests/vc-tickets.test.ts
+            pnpm --filter @meigokujo/bot test
+            pnpm -r test
+            git diff --check
+          } 2>&1 | tee "$LOG"
+          rc=${PIPESTATUS[0]}
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+
+          if [ "$rc" -ne 0 ]; then
+            git reset --hard HEAD
+            cp "$LOG" .github/TICKET_PANEL_PATCH_FAILURE.log
+            git add .github/TICKET_PANEL_PATCH_FAILURE.log
+            git commit -m "Record ticket panel lifecycle patch failure"
+            git push origin HEAD:agent/ticket-panel-lifecycle
+            exit "$rc"
+          fi
+
+          git add -A
+          git commit -m "Complete ticket panel lifecycle controls"
+          git push origin HEAD:agent/ticket-panel-lifecycle
