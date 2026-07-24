@@ -377,8 +377,15 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       const panel = services.tickets.upsertPanel({ id, name, title, description, buttonLabel, buttonEmoji: current.buttonEmoji, notifyRoleIds: current.notifyRoleIds, staffRoleIds: current.staffRoleIds, enabled: current.enabled }, `user:${interaction.user.id}`);
       let warning = "";
       if (panel.channelId && panel.messageId) {
-        const channel = await interaction.client.channels.fetch(panel.channelId).catch(() => null);
-        if (channel?.isTextBased() && "messages" in channel) {
+        let channelFetchFailed = false;
+        const channel = await interaction.client.channels.fetch(panel.channelId).catch((error) => {
+          channelFetchFailed = true;
+          console.warn("[ticket-panel] 内容編集後の設置チャンネル取得に失敗しました", { panelId: panel.id, channelId: panel.channelId, error });
+          return null;
+        });
+        if (channelFetchFailed) {
+          warning = "設置チャンネルの取得に失敗しました。設置情報は維持しています。時間を置いて再試行してください。";
+        } else if (channel?.isTextBased() && "messages" in channel) {
           const fetched = await fetchPanelMessage(channel, panel.messageId);
           if (fetched.ok && fetched.message) {
             const rendered = ticketPanelMessageForPanel(panel);
@@ -386,7 +393,7 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
           } else if (fetched.ok) {
             services.tickets.clearPanelMessage(panel.id, `user:${interaction.user.id}`, "edit found missing message");
             warning = "設置済みメッセージが見つからなかったため未設置へ戻しました。";
-          } else warning = "設置済みメッセージの取得に失敗しました。設定内容は保存されています。";
+          } else warning = "設置済みメッセージの取得に失敗しました。設定内容と設置情報は維持しています。";
         } else {
           services.tickets.clearPanelMessage(panel.id, `user:${interaction.user.id}`, "edit found missing channel");
           warning = "設置チャンネルが見つからなかったため未設置へ戻しました。";
@@ -1192,7 +1199,8 @@ export async function installTicketPanel(
 
   await sent.pin().catch(() => undefined);
   try {
-    services.tickets.setPanelMessage(panel.id, channel.id, sent.id, `user:${interaction.user.id}`);
+    const saved = services.tickets.setPanelMessage(panel.id, channel.id, sent.id, `user:${interaction.user.id}`);
+    if (!saved) throw new Error("ticket panel placement was not saved");
   } catch (e) {
     if (!editedExisting) {
       await sent.delete().catch((deleteError) =>
@@ -1222,6 +1230,7 @@ export async function installTicketPanel(
   }
 
   let warning = "";
+  let staleOldPanelPossible = false;
   if (oldPlacement && oldPlacement.channelId !== channel.id) {
     let oldChannelFetchFailed = false;
     const oldChannel = await interaction.client.channels.fetch(oldPlacement.channelId).catch((e) => {
@@ -1230,25 +1239,53 @@ export async function installTicketPanel(
       return null;
     });
     if (oldChannelFetchFailed) {
-      warning = "旧パネルのチャンネル取得に失敗しました。旧パネルが残っている可能性があるため手動確認してください。";
+      staleOldPanelPossible = true;
+      warning = "旧パネルのチャンネル取得に失敗し、旧パネルが残っている可能性があります。手動確認が必要です。";
     } else if (oldChannel?.isTextBased() && "messages" in oldChannel) {
       const old = await fetchPanelMessage(oldChannel, oldPlacement.messageId);
       if (old.ok) {
         if (old.message) {
+          const disabledOld = ticketPanelMessageForPanel({ ...panel, enabled: false });
+          let oldDisabled = false;
+          try {
+            await old.message.edit({ embeds: disabledOld.embeds, components: disabledOld.components });
+            oldDisabled = true;
+          } catch (e) {
+            console.warn("[ticket-panel] 移設後の旧パネル無効化に失敗しました", { panelId: panel.id, oldPlacement, error: e });
+          }
           await old.message.delete().catch((e) => {
-            warning = "旧パネルの削除に失敗しました。手動確認してください。";
-            console.warn("[ticket-panel] 移設後の旧パネル削除に失敗しました", { panelId: panel.id, oldPlacement, error: e });
+            warning = oldDisabled
+              ? "旧パネルの削除に失敗しましたが、受付ボタンは無効化しました。手動削除してください。"
+              : "旧パネルの無効化と削除に失敗しました。";
+            if (!oldDisabled) staleOldPanelPossible = true;
+            console.warn("[ticket-panel] 移設後の旧パネル削除に失敗しました", { panelId: panel.id, oldPlacement, oldDisabled, error: e });
           });
         }
       } else {
-        warning = "旧パネルの取得に失敗しました。手動確認してください。";
+        staleOldPanelPossible = true;
+        warning = "旧パネルの取得に失敗し、旧パネルが残っている可能性があります。";
         console.warn("[ticket-panel] 移設後の旧パネル取得に失敗しました", { panelId: panel.id, oldPlacement, error: old.error });
       }
     } else {
       warning = oldChannel
         ? "旧パネルのチャンネルがテキストチャンネルではありません。手動確認してください。"
-        : "旧パネルのチャンネルが見つかりません。手動確認してください。";
+        : "旧パネルのチャンネルが見つかりませんでした。";
       console.warn("[ticket-panel] 移設後の旧パネルチャンネルを処理できません", { panelId: panel.id, oldPlacement });
+    }
+  }
+
+  if (staleOldPanelPossible) {
+    try {
+      const disabled = services.tickets.setPanelEnabled(panel.id, false, `user:${interaction.user.id}`);
+      if (!disabled) throw new Error("ticket panel could not be disabled after stale placement risk");
+      const disabledNew = ticketPanelMessageForPanel(disabled);
+      await sent.edit({ embeds: disabledNew.embeds, components: disabledNew.components }).catch((e) =>
+        console.warn("[ticket-panel] 安全停止後の新パネル表示更新に失敗しました", { panelId: panel.id, error: e }),
+      );
+      warning = `${warning} 安全のため受付登録を無効化しました。旧パネルを確認後、再有効化してください。`.trim();
+    } catch (e) {
+      console.error("[ticket-panel] 旧パネル残存リスク検出後の自動無効化に失敗しました", { panelId: panel.id, error: e });
+      warning = `${warning} 受付登録の自動無効化にも失敗しました。直ちに手動で無効化してください。`.trim();
     }
   }
 
