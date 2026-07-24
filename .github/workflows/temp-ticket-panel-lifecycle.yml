@@ -62,6 +62,10 @@ jobs:
           routes = Path('.github/scripts/ticket_panel_lifecycle_admin_routes.py')
           text = routes.read_text()
           text = text.replace(r'? `\n⚠️ ${warning}` : ""', r'? `\\n⚠️ ${warning}` : ""')
+          text = text.replace(
+              'await fetched.message.edit(ticketPanelMessageForPanel(panel)).catch(() => { warning = "設置済みメッセージの表示更新に失敗しました。再設置してください。"; });',
+              'const rendered = ticketPanelMessageForPanel(panel);\n            await fetched.message.edit({ embeds: rendered.embeds, components: rendered.components }).catch(() => { warning = "設置済みメッセージの表示更新に失敗しました。再設置してください。"; });',
+          )
           routes.write_text(text)
           PY
 
