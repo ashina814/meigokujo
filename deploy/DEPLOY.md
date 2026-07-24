@@ -14,7 +14,7 @@ sudo -u kabu git status --short
 sudo -u kabu git fetch origin
 sudo -u kabu git checkout main
 sudo -u kabu git pull --ff-only origin main
-bash -n deploy/deploy.sh
+bash -n deploy/deploy.sh deploy/backup.sh
 ```
 
 その後、実行用wrapperを一度だけ設置します。
@@ -96,7 +96,37 @@ Discord上の計器盤や変更箇所の実表示確認は、自動化せず最�
 /home/kabu/deploy.sh --force
 ```
 
-## 初回利用前の注意
+## DBバックアップ
 
-2026年7月24日時点の本番には、`deploy/backup.sh`の未コミット差分が残っています。
-安全デプロイはこの状態を検出して停止するため、内容を確認し、リポジトリへ正式反映するか意図的に戻してから利用してください。勝手に`git reset --hard`や`git checkout -- deploy/backup.sh`を実行してはいけません。
+正本は`deploy/backup.sh`です。本番実行用ファイルは次のコマンドで設置します。
+
+```bash
+install -o root -g kabu -m 0750 \
+  /home/kabu/meigokujo/deploy/backup.sh \
+  /home/kabu/backup.sh
+```
+
+手動実行は`kabu`ユーザーで行います。
+
+```bash
+sudo -u kabu /home/kabu/backup.sh
+```
+
+バックアップは`/home/kabu/backups/bot-YYYYmmdd-HHMMSS.db.gz`へ保存され、最新14世代を保持します。ログは`/home/kabu/backups/backup.log`です。
+
+スクリプトは次を保証します。
+
+- SQLiteのオンラインバックアップAPIを使用し、WALを含む整合スナップショットを作成
+- ライブDBを`-readonly`で開き、バックアップ処理から書き込まない
+- `flock`により同時実行を拒否
+- 一時ファイルへ作成し、整合性検査とgzip検査に成功後だけ正式名へ移動
+- バックアップとログを所有者のみ読み書きできる権限で作成
+- 失敗時に未完成ファイルを削除
+
+毎日04:00 JSTの自動実行は`/etc/cron.d/meigokujo-backup`で管理します。
+
+```cron
+0 4 * * * kabu /home/kabu/backup.sh
+```
+
+cronの標準出力・標準エラーを別途同じログへリダイレクトする必要はありません。スクリプト自身が`backup.log`へ記録します。
