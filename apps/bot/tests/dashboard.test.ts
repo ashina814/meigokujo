@@ -173,6 +173,19 @@ describe("城の計器盤", () => {
     expect(fieldValue(buildDashboardEmbed(services), "経済健全性")).toContain("session不一致 1件（差額 300◈）");
   });
 
+  it("台帳記録なしのsession holderに残高がある場合は孤児holderとして警告する", () => {
+    const services = createServices();
+    setEtherBalance(services.db, "escrow:session:orphan", 1_234);
+
+    const summary = getEconomyHealthSummary(services);
+    expect(summary.orphanEscrowHolderCount).toBe(1);
+    expect(summary.orphanSessionHolderCount).toBe(1);
+    expect(summary.orphanEscrowTotal).toBe(1_234);
+    expect(fieldValue(buildDashboardEmbed(services), "経済健全性")).toContain(
+      "孤児holder 1件（合計 1,234◈ / session 1）",
+    );
+  });
+
   it("market Escrow不一致時はpotとholderの差額を表示する", () => {
     const services = createServices();
     insertMarket(services.db, { status: "open", fundMode: "escrow", pot: 1_000, escrow: 400 });
@@ -181,6 +194,20 @@ describe("城の計器盤", () => {
     expect(summary.marketEscrowMismatchCount).toBe(1);
     expect(summary.marketEscrowMismatchDiff).toBe(600);
     expect(fieldValue(buildDashboardEmbed(services), "経済健全性")).toContain("pot不一致 1件（差額 600◈）");
+  });
+
+  it("settled／void市場のholderに残高が残っている場合は孤児holderとして警告する", () => {
+    const services = createServices();
+    insertMarket(services.db, { status: "settled", fundMode: "escrow", pot: 1_000, escrow: 700 });
+    insertMarket(services.db, { status: "void", fundMode: "escrow", pot: 500, escrow: 300 });
+
+    const summary = getEconomyHealthSummary(services);
+    expect(summary.orphanEscrowHolderCount).toBe(2);
+    expect(summary.orphanMarketHolderCount).toBe(2);
+    expect(summary.orphanEscrowTotal).toBe(1_000);
+    expect(fieldValue(buildDashboardEmbed(services), "経済健全性")).toContain(
+      "孤児holder 2件（合計 1,000◈ / market 2）",
+    );
   });
 
   it("frozen・未知fund mode・quarantineを警告表示する", () => {

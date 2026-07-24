@@ -20,6 +20,11 @@ export interface EconomyHealthSummary {
   landMismatchCount: number;
   sessionEscrowMismatchCount: number;
   sessionEscrowMismatchDiff: number;
+  orphanEscrowHolderCount: number;
+  orphanEscrowTotal: number;
+  orphanSessionHolderCount: number;
+  orphanMarketHolderCount: number;
+  orphanUnknownEscrowHolderCount: number;
   marketEscrowMismatchCount: number;
   marketEscrowMismatchDiff: number;
   frozenMarketCount: number;
@@ -101,6 +106,64 @@ export function getLandSystemBreakdown(services: Services): LandSystemBreakdown 
   return { departmentTotal, etherReserve, otherSystem, legacyChips };
 }
 
+function getOrphanEscrowHolders(services: Services): {
+  count: number;
+  total: number;
+  sessionCount: number;
+  marketCount: number;
+  unknownCount: number;
+} {
+  const holders = services.db
+    .prepare("SELECT user_id, amount FROM ether_balances WHERE user_id LIKE 'escrow:%' AND amount > 0")
+    .all() as Array<{ user_id: string; amount: number }>;
+  if (holders.length === 0) return { count: 0, total: 0, sessionCount: 0, marketCount: 0, unknownCount: 0 };
+
+  const activeSessions = tableExists(services, "casino_escrow")
+    ? new Set(
+        (services.db.prepare("SELECT DISTINCT session_id FROM casino_escrow").all() as Array<{ session_id: string }>).map(
+          (r) => r.session_id,
+        ),
+      )
+    : new Set<string>();
+  const unresolvedMarkets = tableExists(services, "casino_markets")
+    ? new Set(
+        (
+          services.db
+            .prepare(
+              `SELECT id FROM casino_markets WHERE status IN (${UNRESOLVED_MARKET_STATUSES.map(() => "?").join(",")})`,
+            )
+            .all(...UNRESOLVED_MARKET_STATUSES) as Array<{ id: number }>
+        ).map((r) => String(r.id)),
+      )
+    : new Set<string>();
+
+  let count = 0;
+  let total = 0;
+  let sessionCount = 0;
+  let marketCount = 0;
+  let unknownCount = 0;
+  for (const h of holders) {
+    let orphanKind: "session" | "market" | "unknown" | null = null;
+    if (h.user_id.startsWith("escrow:session:")) {
+      const sessionId = h.user_id.slice("escrow:session:".length);
+      if (!activeSessions.has(sessionId)) orphanKind = "session";
+    } else if (h.user_id.startsWith("escrow:market:")) {
+      const marketId = h.user_id.slice("escrow:market:".length);
+      if (!unresolvedMarkets.has(marketId)) orphanKind = "market";
+    } else {
+      orphanKind = "unknown";
+    }
+
+    if (!orphanKind) continue;
+    count++;
+    total += h.amount;
+    if (orphanKind === "session") sessionCount++;
+    if (orphanKind === "market") marketCount++;
+    if (orphanKind === "unknown") unknownCount++;
+  }
+  return { count, total, sessionCount, marketCount, unknownCount };
+}
+
 export function getEconomyHealthSummary(services: Services): EconomyHealthSummary {
   const land = services.ledger.verifyIntegrity();
   const session = services.escrow.verify();
@@ -108,6 +171,7 @@ export function getEconomyHealthSummary(services: Services): EconomyHealthSummar
     (sum, m) => sum + Math.abs(m.expected - m.actual),
     0,
   );
+  const orphans = getOrphanEscrowHolders(services);
 
   let marketEscrowMismatchCount = 0;
   let marketEscrowMismatchDiff = 0;
@@ -154,6 +218,11 @@ export function getEconomyHealthSummary(services: Services): EconomyHealthSummar
     landMismatchCount: land.mismatches.length,
     sessionEscrowMismatchCount: session.mismatches.length,
     sessionEscrowMismatchDiff,
+    orphanEscrowHolderCount: orphans.count,
+    orphanEscrowTotal: orphans.total,
+    orphanSessionHolderCount: orphans.sessionCount,
+    orphanMarketHolderCount: orphans.marketCount,
+    orphanUnknownEscrowHolderCount: orphans.unknownCount,
     marketEscrowMismatchCount,
     marketEscrowMismatchDiff,
     frozenMarketCount,
@@ -168,6 +237,7 @@ function hasEconomyHealthAlert(summary: EconomyHealthSummary): boolean {
   return (
     summary.landMismatchCount > 0 ||
     summary.sessionEscrowMismatchCount > 0 ||
+    summary.orphanEscrowHolderCount > 0 ||
     summary.marketEscrowMismatchCount > 0 ||
     summary.frozenMarketCount > 0 ||
     summary.unknownFundModeCount > 0 ||
@@ -179,6 +249,20 @@ function hasEconomyHealthAlert(summary: EconomyHealthSummary): boolean {
 function formatEconomyHealth(summary: EconomyHealthSummary, updatedAt: ReturnType<typeof dashboardJstNow>): string {
   const fmtE = (n: number) => `${n.toLocaleString("ja-JP")}◈`;
   const marketIssues: string[] = [];
+  const escrowIssues: string[] = [];
+  if (summary.sessionEscrowMismatchCount > 0) {
+    escrowIssues.push(`session不一致 ${summary.sessionEscrowMismatchCount}件（差額 ${fmtE(summary.sessionEscrowMismatchDiff)}）`);
+  }
+  if (summary.orphanEscrowHolderCount > 0) {
+    const detail = [
+      summary.orphanSessionHolderCount > 0 ? `session ${summary.orphanSessionHolderCount}` : null,
+      summary.orphanMarketHolderCount > 0 ? `market ${summary.orphanMarketHolderCount}` : null,
+      summary.orphanUnknownEscrowHolderCount > 0 ? `unknown ${summary.orphanUnknownEscrowHolderCount}` : null,
+    ].filter(Boolean);
+    escrowIssues.push(
+      `孤児holder ${summary.orphanEscrowHolderCount}件（合計 ${fmtE(summary.orphanEscrowTotal)}${detail.length > 0 ? ` / ${detail.join(" / ")}` : ""}）`,
+    );
+  }
   if (summary.marketEscrowMismatchCount > 0) {
     marketIssues.push(`pot不一致 ${summary.marketEscrowMismatchCount}件（差額 ${fmtE(summary.marketEscrowMismatchDiff)}）`);
   }
@@ -190,9 +274,7 @@ function formatEconomyHealth(summary: EconomyHealthSummary, updatedAt: ReturnTyp
     summary.landMismatchCount === 0
       ? "会計検算: 正常"
       : `⚠️ 会計検算: 残高キャッシュ不一致 ${summary.landMismatchCount}件`,
-    summary.sessionEscrowMismatchCount === 0
-      ? "Escrow: 正常"
-      : `⚠️ Escrow: session不一致 ${summary.sessionEscrowMismatchCount}件（差額 ${fmtE(summary.sessionEscrowMismatchDiff)}）`,
+    escrowIssues.length === 0 ? "Escrow: 正常" : `⚠️ Escrow: ${escrowIssues.join(" / ")}`,
     marketIssues.length === 0 ? "市場異常: なし" : `⚠️ 市場異常: ${marketIssues.join(" / ")}`,
     `未精算市場: ${summary.unsettledMarketCount}件`,
     summary.quarantineBalance === 0 ? "隔離資金: なし" : `⚠️ 隔離資金: ${fmtE(summary.quarantineBalance)}`,
