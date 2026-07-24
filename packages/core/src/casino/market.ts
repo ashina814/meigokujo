@@ -141,6 +141,88 @@ export class Markets {
     // 資金源を DB に明示。既存の板は 'legacy_house'（分離前データ）として扱う。
     // 起動時 refundAllPending() で返金・void 化されるので、以降 legacy は残らないのが正常。
     this.addColumnIfMissing("casino_markets", "fund_mode", "TEXT NOT NULL DEFAULT 'legacy_house'");
+    // 旧 DB は status に古い CHECK 制約（'disputed'/'frozen' を含まない）が付いている場合がある。
+    // SQLite は CHECK を ALTER で変更できないため、必要ならテーブルを作り直して制約を外す。
+    this.migrateStatusCheckConstraint();
+  }
+
+  /**
+   * 旧 casino_markets.status の CHECK 制約を撤去する冪等マイグレーション。
+   *
+   * 背景: 初期スキーマは `CHECK(status IN ('open','closed','reported','settled','void'))` で、
+   * 後から追加された 'disputed'（既存コードで使用中）と 'frozen'（PR#6）を **書き込めない**。
+   * その結果、資金不整合市場の frozen 化が黙って失敗し 'open' のまま残る（本番のみ再現・ステージングで検出）。
+   *
+   * SQLite は CHECK 制約を ALTER で変更できないので、テーブルを作り直して制約を外す。
+   * status の妥当性はアプリ層（MarketStatus 型 + メソッドの status ガード）で保証する。
+   *
+   * 冪等性: CHECK が無い（新スキーマ）or 既に 'frozen' を含むなら何もしない。
+   * 非破壊: 全列を明示コピー。id を保持するので子テーブル(bets/approvals)の参照は有効なまま。
+   */
+  private migrateStatusCheckConstraint(): void {
+    const sql =
+      (this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='casino_markets'").get() as
+        | { sql?: string }
+        | undefined)?.sql ?? "";
+    // status 列に CHECK が無い（＝新スキーマ）なら何もしない
+    if (!/CHECK\s*\(\s*status/i.test(sql)) return;
+    // 既に 'frozen' を含む CHECK なら移行済み
+    if (sql.includes("'frozen'")) return;
+
+    // FK（bets/approvals → markets）を一時 OFF にして作り直す。id を保持するので参照は保たれる。
+    this.db.pragma("foreign_keys = OFF");
+    try {
+      this.db.exec("BEGIN");
+      this.db.exec(`
+        CREATE TABLE casino_markets_new (
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          guild_id       TEXT NOT NULL,
+          creator_id     TEXT NOT NULL,
+          title          TEXT NOT NULL,
+          options_json   TEXT NOT NULL,
+          deadline_at    INTEGER NOT NULL,
+          status         TEXT NOT NULL DEFAULT 'open',
+          result_option  INTEGER,
+          channel_id     TEXT,
+          message_id     TEXT,
+          thread_id      TEXT,
+          payout_mode    TEXT NOT NULL DEFAULT 'parimutuel',
+          fee            INTEGER NOT NULL DEFAULT 0,
+          reported_at    INTEGER,
+          settled_at     INTEGER,
+          fund_mode      TEXT NOT NULL DEFAULT 'legacy_house',
+          created_at     INTEGER NOT NULL
+        );
+      `);
+      this.db.exec(`
+        INSERT INTO casino_markets_new
+          (id, guild_id, creator_id, title, options_json, deadline_at, status, result_option,
+           channel_id, message_id, thread_id, payout_mode, fee, reported_at, settled_at, fund_mode, created_at)
+        SELECT
+           id, guild_id, creator_id, title, options_json, deadline_at, status, result_option,
+           channel_id, message_id, thread_id, payout_mode, fee, reported_at, settled_at, fund_mode, created_at
+        FROM casino_markets;
+      `);
+      this.db.exec("DROP TABLE casino_markets");
+      this.db.exec("ALTER TABLE casino_markets_new RENAME TO casino_markets");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_casino_markets_open ON casino_markets(status, deadline_at)");
+      // 子テーブルの参照整合性を確認（壊れていたら移行を巻き戻す）
+      const violations = this.db.pragma("foreign_key_check(casino_markets)") as unknown[];
+      if (violations.length > 0) {
+        throw new Error(`foreign_key_check failed after casino_markets rebuild: ${JSON.stringify(violations)}`);
+      }
+      this.db.exec("COMMIT");
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* already rolled back */
+      }
+      this.db.pragma("foreign_keys = ON");
+      throw e;
+    }
+    this.db.pragma("foreign_keys = ON");
+    this.events.log("market_status_check_migrated", { actor: "system:migration", payload: { removedCheckConstraint: true } });
   }
 
   private addColumnIfMissing(table: string, column: string, spec: string): void {
