@@ -1,4 +1,4 @@
-// Lifecycle controls intentionally keep disable, uninstall, and registration removal as separate operations.
+// Disable, uninstall, and registration removal are separate state transitions and must remain independently testable.
 import { describe, expect, it, vi } from "vitest";
 import type { TicketPanel } from "@meigokujo/core";
 
