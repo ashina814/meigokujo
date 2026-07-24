@@ -321,10 +321,12 @@ export class Escrow {
     );
     let activeMarkets = new Set<string>();
     try {
+      // frozen も「有効な帳簿がある」扱いにする（孤児として自動隔離せず、調査完了まで
+      // 市場専用 holder にエスクローを保持する。所有者情報は casino_market_bets に残っている）。
       activeMarkets = new Set(
         (
           this.db
-            .prepare("SELECT id FROM casino_markets WHERE status IN ('open','closed','reported','disputed')")
+            .prepare("SELECT id FROM casino_markets WHERE status IN ('open','closed','reported','disputed','frozen')")
             .all() as Array<{ id: number }>
         ).map((r) => String(r.id)),
       );

@@ -470,14 +470,115 @@ describe("Markets: 資金分離と精算", () => {
     ctx.ether.transfer(marketEscrowHolder(m1.id), HOUSE_HOLDER, 500);
     const beforeB = ctx.ether.balanceOf("b");
     const r = ctx.markets.refundAllPending("test:startup");
-    // m2 は返金成功、m1 は失敗
+    // m2 は返金成功、m1 は失敗 → frozen
     expect(r.total).toBe(2);
     expect(r.refunded).toBe(1);
+    expect(r.frozen).toBe(1);
     expect(r.failed).toHaveLength(1);
     expect(r.failed[0]!.id).toBe(m1.id);
     expect(r.failed[0]!.error).toMatch(/ERR_UNDERFUNDED_ESCROW/);
     // m2 のプレイヤー b は返金されている
     expect(ctx.ether.balanceOf("b")).toBe(beforeB + 2_000);
+    // m1 は frozen になっている
+    expect(ctx.markets.get(m1.id)!.status).toBe("frozen");
+    // m1 の帳簿とエスクロー残高は保持される（house 補填していない）
+    expect(ctx.markets.bets(m1.id)).toHaveLength(1);
+    expect(ctx.ether.balanceOf(marketEscrowHolder(m1.id))).toBe(500);
+  });
+
+  describe("破損市場の凍結（frozen）", () => {
+    it("起動時: underfunded な open 市場は frozen になり、正常市場は返金される", () => {
+      const ok = ctx.markets.create({ guildId: "g", creatorId: "a", title: "OK", options: ["A", "B"], durationMin: 10, fee: 0 });
+      const bad = ctx.markets.create({ guildId: "g", creatorId: "a", title: "BAD", options: ["A", "B"], durationMin: 10, fee: 0 });
+      ctx.markets.bet(ok.id, "a", 0, 1_000);
+      ctx.markets.bet(bad.id, "b", 0, 2_000);
+      // bad を underfunded に
+      ctx.ether.transfer(marketEscrowHolder(bad.id), HOUSE_HOLDER, 500);
+      const houseBefore = ctx.ether.balanceOf(HOUSE_HOLDER);
+      const beforeA = ctx.ether.balanceOf("a");
+
+      const r = ctx.markets.refundAllPending("system:startup");
+      expect(r.frozen).toBe(1);
+      // 正常市場 ok は返金・void
+      expect(ctx.markets.get(ok.id)!.status).toBe("void");
+      expect(ctx.ether.balanceOf("a")).toBe(beforeA + 1_000);
+      // 破損市場 bad は frozen
+      expect(ctx.markets.get(bad.id)!.status).toBe("frozen");
+      // house 残高は増えていない（自動補填していない）。ok 返金は escrow から。
+      expect(ctx.ether.balanceOf(HOUSE_HOLDER)).toBe(houseBefore);
+    });
+
+    it("frozen 市場へ新規ベットできない（ERR_NOT_OPEN）", () => {
+      const m = ctx.markets.create({ guildId: "g", creatorId: "a", title: "F", options: ["A", "B"], durationMin: 60, fee: 0 });
+      ctx.db.prepare("UPDATE casino_markets SET status='frozen' WHERE id=?").run(m.id);
+      expect(() => ctx.markets.bet(m.id, "a", 0, 1_000)).toThrowError(/ERR_NOT_OPEN/);
+    });
+
+    it("frozen 市場で張り直しできない（ERR_NOT_OPEN）", () => {
+      const m = ctx.markets.create({ guildId: "g", creatorId: "a", title: "F", options: ["A", "B"], durationMin: 60, fee: 0 });
+      ctx.markets.bet(m.id, "a", 0, 1_000);
+      ctx.db.prepare("UPDATE casino_markets SET status='frozen' WHERE id=?").run(m.id);
+      // 同一ユーザーの張り直しも open でないので拒否
+      expect(() => ctx.markets.bet(m.id, "a", 1, 2_000)).toThrowError(/ERR_NOT_OPEN/);
+    });
+
+    it("bet() を直接呼んでも既存 pot とエスクロー不一致なら資金が動かず frozen になる", () => {
+      const m = ctx.markets.create({ guildId: "g", creatorId: "a", title: "F", options: ["A", "B"], durationMin: 60, fee: 0 });
+      ctx.markets.bet(m.id, "a", 0, 3_000);
+      // 起動時以外で escrow を破損させる
+      ctx.ether.transfer(marketEscrowHolder(m.id), HOUSE_HOLDER, 1_000); // 残 2000 != pot 3000
+      const beforeB = ctx.ether.balanceOf("b");
+      const houseBefore = ctx.ether.balanceOf(HOUSE_HOLDER);
+      // 別ユーザー b が新規ベットしようとすると、資金整合ガードで frozen + 例外
+      expect(() => ctx.markets.bet(m.id, "b", 1, 5_000)).toThrowError(/ERR_UNDERFUNDED_ESCROW|ERR_ESCROW_MISMATCH/);
+      // 市場は frozen
+      expect(ctx.markets.get(m.id)!.status).toBe("frozen");
+      // b の資金は動いていない・house も動いていない
+      expect(ctx.ether.balanceOf("b")).toBe(beforeB);
+      expect(ctx.ether.balanceOf(HOUSE_HOLDER)).toBe(houseBefore);
+      // 既存の帳簿は保持
+      expect(ctx.markets.bets(m.id)).toHaveLength(1);
+    });
+
+    it("frozen 市場のエスクローは孤児として自動隔離されない", () => {
+      const m = ctx.markets.create({ guildId: "g", creatorId: "a", title: "F", options: ["A", "B"], durationMin: 60, fee: 0 });
+      ctx.markets.bet(m.id, "a", 0, 2_000);
+      ctx.db.prepare("UPDATE casino_markets SET status='frozen' WHERE id=?").run(m.id);
+      const r = ctx.escrow.sweepAll("test:startup");
+      // frozen 市場は活きた帳簿がある扱い → 孤児 0・エスクロー残高保持
+      expect(r.orphans).toBe(0);
+      expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(2_000);
+      expect(ctx.escrow.quarantineBalance()).toBe(0);
+    });
+
+    it("運営が escrow を補正すれば frozen 市場を返金できる", () => {
+      const m = ctx.markets.create({ guildId: "g", creatorId: "a", title: "F", options: ["A", "B"], durationMin: 60, fee: 0 });
+      ctx.markets.bet(m.id, "a", 0, 3_000);
+      // 破損 → frozen
+      ctx.ether.transfer(marketEscrowHolder(m.id), HOUSE_HOLDER, 1_000);
+      ctx.db.prepare("UPDATE casino_markets SET status='frozen' WHERE id=?").run(m.id);
+      // 運営が原因調査の上、escrow を pot(3000) に補正
+      ctx.ether.transfer(HOUSE_HOLDER, marketEscrowHolder(m.id), 1_000);
+      expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(3_000);
+      const beforeA = ctx.ether.balanceOf("a");
+      // 補正後は返金できる（fundHolder が balance===pot を満たす）
+      ctx.markets.refund(m.id, "admin");
+      expect(ctx.ether.balanceOf("a")).toBe(beforeA + 3_000);
+      expect(ctx.markets.get(m.id)!.status).toBe("void");
+    });
+
+    it("未知の fund_mode は legacy 扱いせず ERR_BAD_MODE で例外（house 補填しない）", () => {
+      const m = ctx.markets.create({ guildId: "g", creatorId: "a", title: "F", options: ["A", "B"], durationMin: 60, fee: 0 });
+      ctx.markets.bet(m.id, "a", 0, 2_000);
+      // DB 破損を再現: fund_mode を不明な文字列に
+      ctx.db.prepare("UPDATE casino_markets SET fund_mode='corrupt_value' WHERE id=?").run(m.id);
+      ctx.markets.close(m.id, "admin");
+      ctx.markets.report(m.id, "a", 0);
+      const houseBefore = ctx.ether.balanceOf(HOUSE_HOLDER);
+      // 精算（approve 全員）が fundHolder で ERR_BAD_MODE → house 補填されない
+      expect(() => ctx.markets.approve(m.id, "a")).toThrowError(/ERR_BAD_MODE/);
+      expect(ctx.ether.balanceOf(HOUSE_HOLDER)).toBe(houseBefore);
+    });
   });
 
   it("的中者なし → void で全額返金し、エスクロー残高 0", () => {

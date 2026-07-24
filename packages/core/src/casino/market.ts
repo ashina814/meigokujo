@@ -24,7 +24,15 @@ const now = () => Math.floor(Date.now() / 1000);
 /** 板ごとの預り所（保有者ID）。胴元(house)とは完全に分離して置く。 */
 export const marketEscrowHolder = (id: number): string => `escrow:market:${id}`;
 
-export type MarketStatus = "open" | "closed" | "reported" | "disputed" | "settled" | "void";
+/**
+ * 板の状態。
+ * - open/closed/reported/disputed: 進行中
+ * - settled/void: 終端（精算済み・無効化済み）
+ * - frozen: **資金不整合による凍結**。返金失敗（underfunded/overfunded/mismatch）や
+ *   bet 時の整合性エラーで到達する終端状態。新規ベット・張り直し・報告・承認・自動精算すべて不可。
+ *   帳簿とエスクロー残高は保持され、運営の手動調査・補正後にのみ返金/無効化できる。
+ */
+export type MarketStatus = "open" | "closed" | "reported" | "disputed" | "settled" | "void" | "frozen";
 export type PayoutMode = "parimutuel" | "winner_take_all";
 /**
  * 板の資金源。DB に明示保存する（残高から推測しない）。
@@ -169,12 +177,17 @@ export class Markets {
       // 不一致（0/pot未満/pot超）はすべて整合性エラーで停止
       if (bal < pot) throw new MarketError("ERR_UNDERFUNDED_ESCROW", { marketId: m.id, pot, escrowBalance: bal });
       throw new MarketError("ERR_ESCROW_MISMATCH", { marketId: m.id, pot, escrowBalance: bal, mode: m.fund_mode });
+    } else if (m.fund_mode === "legacy_house") {
+      // legacy_house: エスクロー残高 0 の場合のみ house から動かせる
+      if (bal !== 0) {
+        throw new MarketError("ERR_ESCROW_MISMATCH", { marketId: m.id, pot, escrowBalance: bal, mode: m.fund_mode });
+      }
+      return HOUSE_HOLDER;
+    } else {
+      // fail-closed: DB 破損・予期しない fund_mode 値は legacy 扱いせず必ず例外。
+      // house から誤って支払う経路を塞ぐ。
+      throw new MarketError("ERR_BAD_MODE", { marketId: m.id, fundMode: m.fund_mode });
     }
-    // legacy_house: エスクロー残高 0 の場合のみ house から動かせる
-    if (bal !== 0) {
-      throw new MarketError("ERR_ESCROW_MISMATCH", { marketId: m.id, pot, escrowBalance: bal, mode: m.fund_mode });
-    }
-    return HOUSE_HOLDER;
   }
 
   create(input: {
@@ -262,7 +275,27 @@ export class Markets {
   }
 
   /**
+   * 資金不整合により市場を凍結する（独立トランザクション・資金は動かさない）。
+   * frozen 市場は新規ベット/張り直し/報告/承認/自動精算がすべて不可になり、
+   * 帳簿とエスクロー残高を保持して運営の手動調査を待つ。
+   */
+  private freeze(id: number, actor: string, reason: string, meta: Record<string, unknown>): void {
+    try {
+      this.db.transaction(() => {
+        this.db.prepare("UPDATE casino_markets SET status = 'frozen' WHERE id = ?").run(id);
+      })();
+    } catch {
+      /* frozen 化に失敗しても後続の throw は行う（次回起動時 refundAllPending でも再検出される） */
+    }
+    this.events.log("market_frozen", { actor, payload: { id, reason, ...meta } });
+  }
+
+  /**
    * 1人1口の原則。既に張っていたら前額を返金してから新額を徴収する（casino-bot 準拠「張り直しは上書き」）。
+   *
+   * 資金整合ガード（PR#6 レビュー指摘）: fund_mode='escrow' かつ既存 pot がある場合、
+   * escrow 残高 === 既存 pot でなければベットを受け付けず、市場を frozen にする。
+   * これで起動時以外に資金不整合が生じても、追加利用者の資金を巻き込まない。
    */
   bet(marketId: number, userId: string, optionIndex: number, amount: number): { previous: number | null; net: number } {
     if (!Number.isInteger(amount) || amount <= 0) throw new MarketError("ERR_BAD_AMOUNT", { amount });
@@ -270,12 +303,30 @@ export class Markets {
     if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { marketId });
     if (m.status !== "open") throw new MarketError("ERR_NOT_OPEN", { marketId, status: m.status });
     if (m.deadline_at <= now()) throw new MarketError("ERR_NOT_OPEN", { marketId, deadline: m.deadline_at });
-    // 旧方式（legacy_house）の板には新規ベットを受け付けない（分離前データは返金のみ）
+    // 旧方式（legacy_house）や未知の fund_mode には新規ベットを受け付けない（escrow のみ）
     if (m.fund_mode !== "escrow") throw new MarketError("ERR_LEGACY_BET_FORBIDDEN", { marketId, mode: m.fund_mode });
     const options = JSON.parse(m.options_json) as string[];
     if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= options.length) {
       throw new MarketError("ERR_BAD_OPTION", { optionIndex, count: options.length });
     }
+
+    // ── 資金整合ガード: escrow 残高 === 既存 pot（全ベット合計）を検証 ──
+    const escHolder = marketEscrowHolder(marketId);
+    const existingPot = (
+      this.db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM casino_market_bets WHERE market_id = ?").get(marketId) as { s: number }
+    ).s;
+    if (existingPot > 0) {
+      const escBal = this.ether.balanceOf(escHolder);
+      if (escBal !== existingPot) {
+        // 不整合 → 市場を凍結し、資金を一切動かさず例外。監査ログに記録。
+        this.freeze(marketId, "system:bet-guard", "escrow_mismatch_on_bet", { existingPot, escrowBalance: escBal });
+        if (escBal < existingPot) {
+          throw new MarketError("ERR_UNDERFUNDED_ESCROW", { marketId, pot: existingPot, escrowBalance: escBal });
+        }
+        throw new MarketError("ERR_ESCROW_MISMATCH", { marketId, pot: existingPot, escrowBalance: escBal, mode: m.fund_mode });
+      }
+    }
+
     const existingRows = this.db
       .prepare("SELECT amount FROM casino_market_bets WHERE market_id = ? AND user_id = ?")
       .all(marketId, userId) as Array<{ amount: number }>;
@@ -285,7 +336,6 @@ export class Markets {
       throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(userId), additionalRequired, amount, existingTotal });
     }
 
-    const escHolder = marketEscrowHolder(marketId);
     return this.db.transaction((): { previous: number | null; net: number } => {
       if (existingTotal > 0) {
         // 張り直し: 既存分は escrow に入っているのでそこから返す（fund_mode='escrow' 確定済み）
@@ -530,14 +580,21 @@ export class Markets {
 
   /**
    * 起動時: open/closed/reported/disputed の未精算板を全部返金 & void。
-   * 個別の板でエラー（underfunded escrow など）が出ても他の板を止めない。
+   * 個別の板でエラー（underfunded/overfunded/mismatch）が出ても他の板を止めない。
+   * **返金に失敗した板は frozen に変更**して新規ベットを止め、帳簿とエスクロー残高を保持する。
    * エラーは events に記録して呼び出し側でログ出力できるようにする。
    */
-  refundAllPending(actor: string): { total: number; refunded: number; failed: Array<{ id: number; error: string }> } {
+  refundAllPending(actor: string): {
+    total: number;
+    refunded: number;
+    frozen: number;
+    failed: Array<{ id: number; error: string }>;
+  } {
     const rows = this.db
       .prepare("SELECT id FROM casino_markets WHERE status IN ('open','closed','reported','disputed')")
       .all() as Array<{ id: number }>;
     let refunded = 0;
+    let frozen = 0;
     const failed: Array<{ id: number; error: string }> = [];
     for (const r of rows) {
       try {
@@ -546,11 +603,24 @@ export class Markets {
       } catch (e) {
         const err = e instanceof MarketError ? `${e.code}:${JSON.stringify(e.meta)}` : (e as Error).message;
         failed.push({ id: r.id, error: err });
+        // 返金失敗市場は frozen へ（独立トランザクション）。
+        // - open のまま放置すると起動後に新規ベットを受け付けてしまう
+        // - house からの自動補填はしない・帳簿とエスクロー残高は保持する
+        // - frozen のエスクローは所有者情報が残るので孤児として自動隔離しない（調査完了まで市場専用holderに保持）
+        try {
+          this.db.transaction(() => {
+            this.db.prepare("UPDATE casino_markets SET status = 'frozen' WHERE id = ?").run(r.id);
+          })();
+          frozen++;
+        } catch (fe) {
+          // frozen 化にも失敗（DB異常）→ ログのみ。他市場の処理は続行
+          this.events.log("market_freeze_failed", { actor, payload: { id: r.id, error: (fe as Error).message } });
+        }
         // 個別イベントログ（起動時掃除の失敗は必ず監査に残す）
-        this.events.log("market_refund_failed", { actor, payload: { id: r.id, error: err } });
+        this.events.log("market_refund_failed", { actor, payload: { id: r.id, error: err, frozen: true } });
       }
     }
-    return { total: rows.length, refunded, failed };
+    return { total: rows.length, refunded, frozen, failed };
   }
 }
 

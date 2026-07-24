@@ -101,10 +101,13 @@ export function buildServices() {
     console.log(`[market] 起動時に未精算板 ${marketSweep.refunded}/${marketSweep.total}件 を返金＆void 化`);
   }
   if (marketSweep.failed.length > 0) {
-    // underfunded escrow などで返金に失敗した板。監査ログを見て手動対応する。
-    // この後 escrow.sweepAll() が escrow:market:<id> の残高を隔離するので二重補填にはならない。
+    // underfunded/overfunded/mismatch などで返金に失敗した板は frozen に変更済み。
+    // frozen 板は新規ベットを受け付けず、帳簿とエスクロー残高を保持したまま手動調査を待つ。
+    // escrow.sweepAll() は frozen 板を孤児として隔離しない（所有者情報が casino_market_bets に残るため）。
     console.warn(
-      `[market] 起動時 refund 失敗 ${marketSweep.failed.length}件: ${marketSweep.failed.map((f) => `#${f.id}(${f.error})`).join(", ")}`,
+      `[market] 起動時 refund 失敗 ${marketSweep.failed.length}件 → frozen へ変更（帳簿・残高を保持し手動調査）: ${marketSweep.failed
+        .map((f) => `#${f.id}(${f.error})`)
+        .join(", ")}`,
     );
   }
   const escrow = new Escrow(db, ether, events);
