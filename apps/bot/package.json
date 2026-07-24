@@ -8,7 +8,7 @@
     "start": "tsx src/index.ts",
     "register": "tsx src/register-commands.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run tests/confession-voice-received.test.ts --reporter=verbose"
+    "test": "vitest run"
   },
   "dependencies": {
     "@meigokujo/core": "workspace:*",
