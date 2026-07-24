@@ -51,16 +51,18 @@ function fallbackStaffRoleId(services: Services): string | undefined {
 }
 
 export function ticketPanelMessageForPanel(panel: TicketPanel): MessageCreateOptions {
+  const available = panel.enabled && !panel.archivedAt;
+  const stateLabel = panel.archivedAt ? " / アーカイブ済み" : available ? "" : " / 無効";
   const embed = new EmbedBuilder()
     .setTitle(panel.title)
     .setDescription(panel.description)
-    .setColor(panel.enabled ? 0x0ea5e9 : 0x64748b)
-    .setFooter({ text: `受付ID: ${panel.id}${panel.enabled ? "" : " / 無効"}` });
+    .setColor(available ? 0x0ea5e9 : 0x64748b)
+    .setFooter({ text: `受付ID: ${panel.id}${stateLabel}` });
   const button = new ButtonBuilder()
     .setCustomId(ticketOpenCustomId(panel.id))
     .setLabel(panel.buttonLabel)
-    .setStyle(panel.enabled ? ButtonStyle.Primary : ButtonStyle.Secondary)
-    .setDisabled(!panel.enabled);
+    .setStyle(available ? ButtonStyle.Primary : ButtonStyle.Secondary)
+    .setDisabled(!available);
   if (panel.buttonEmoji) button.setEmoji(panel.buttonEmoji);
   return { embeds: [embed], components: [new ActionRowBuilder<ButtonBuilder>().addComponents(button)] };
 }
@@ -179,6 +181,10 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
   const panel = services.tickets.getPanel(panelId);
   if (!panel) {
     await interaction.reply({ content: "この受付パネルの設定が見つかりません。運営に確認してください。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (panel.archivedAt) {
+    await interaction.reply({ content: `「${panel.name}」は終了した受付です。`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (!panel.enabled) {
