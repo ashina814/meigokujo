@@ -2,7 +2,17 @@ import type Database from "better-sqlite3";
 
 /** Bump（DISBOARD・ディス速）成功回数の集計。ランキング用 */
 export class BumpCounter {
-  constructor(private readonly db: Database.Database) {}
+  constructor(private readonly db: Database.Database) {
+    // 既存本番DBにも安全に追加できる、メッセージ単位の冪等記録。
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS bump_events (
+        message_id TEXT PRIMARY KEY,
+        user_id    TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_bump_events_user ON bump_events(user_id, created_at);
+    `);
+  }
 
   /**
    * 同じDiscordメッセージIDを二重加算しない形で成功実績を記録する。
