@@ -165,6 +165,16 @@ async function cleanupCreatedThread(thread: PrivateThreadChannel, reason: string
   await thread.setArchived(true, reason).catch((e) => console.warn(`[ticket] 作成済みスレッドのアーカイブに失敗: ${thread.id}`, e));
 }
 
+async function replyTicketFailure(interaction: ButtonInteraction, content: string): Promise<void> {
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply({ content }).catch((e) => console.warn("[ticket] 受付失敗メッセージの更新に失敗", e));
+    return;
+  }
+  await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch((e) =>
+    console.warn("[ticket] 受付失敗メッセージの送信に失敗", e),
+  );
+}
+
 export async function openTicket(interaction: ButtonInteraction, services: Services, panelId: string): Promise<void> {
   const panel = services.tickets.getPanel(panelId);
   if (!panel) {
@@ -194,6 +204,10 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
   }
   inFlightTickets.add(flightKey);
 
+  let thread: PrivateThreadChannel | undefined;
+  let ticketCreated = false;
+  let initialized = false;
+
   try {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -206,9 +220,11 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
     }
     const validNotifyRoleIds = await existingRoleIds(interaction.guild, notifyRoleIds);
     const accessRoleIds = uniq([...validStaffRoleIds, ...validNotifyRoleIds]);
-    const staffMemberIds = await memberIdsForRoles(interaction.guild, accessRoleIds);
+    const staffMemberIds = (await memberIdsForRoles(interaction.guild, accessRoleIds)).filter(
+      (memberId) => memberId !== interaction.user.id,
+    );
     if (staffMemberIds.length === 0) {
-      await interaction.editReply({ content: `「${panel.name}」の担当者をスレッドへ招待できません。ロールのメンバーまたはBot権限を確認してください。` });
+      await interaction.editReply({ content: `「${panel.name}」の担当者をスレッドへ招待できません。申請者以外のロールメンバーまたはBot権限を確認してください。` });
       return;
     }
 
@@ -216,7 +232,7 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
       interaction.member && "displayName" in interaction.member
         ? (interaction.member as GuildMember).displayName
         : (interaction.user.globalName ?? interaction.user.username);
-    const thread = (await channel.threads.create({
+    thread = (await channel.threads.create({
       name: `${panel.name}-${nick}`.slice(0, 90),
       type: ChannelType.PrivateThread,
       invitable: false,
@@ -234,6 +250,7 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
         attemptedMembers: staffMemberIds.length,
       });
       await cleanupCreatedThread(thread, "ticket staff invite failed");
+      thread = undefined;
       await interaction.editReply({
         content: `「${panel.name}」の担当者をスレッドへ追加できなかったため、受付を中止しました。運営に確認してください。`,
       });
@@ -243,6 +260,7 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
     const duplicate = services.tickets.openByUserPanel(interaction.user.id, panel.id);
     if (duplicate) {
       await cleanupCreatedThread(thread, "duplicate ticket detected");
+      thread = undefined;
       await interaction.editReply({ content: `既に未完了の「${duplicate.panel_name ?? panel.name}」チケットがあります: <#${duplicate.thread_id}>` });
       return;
     }
@@ -253,6 +271,7 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
       notifyRoleIds: validNotifyRoleIds,
       staffRoleIds: validStaffRoleIds,
     });
+    ticketCreated = true;
 
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("ticket:claim").setLabel("対応する").setStyle(ButtonStyle.Primary),
@@ -270,7 +289,31 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
       components: [row],
       allowedMentions: { users: [interaction.user.id], roles: validNotifyRoleIds },
     });
+    initialized = true;
     await interaction.editReply({ content: `✅ スレッドを開きました: ${thread.toString()}` });
+  } catch (e) {
+    console.error("[ticket] チケット受付処理に失敗しました", {
+      panelId: panel.id,
+      userId: interaction.user.id,
+      threadId: thread?.id,
+      ticketCreated,
+      initialized,
+      error: e,
+    });
+
+    if (!initialized) {
+      if (ticketCreated && thread) {
+        try {
+          services.tickets.rollbackCreate(thread.id, `user:${interaction.user.id}`, "ticket initialization failed");
+        } catch (rollbackError) {
+          console.error("[ticket] チケットDB行の巻き戻し処理でエラー", { threadId: thread.id, error: rollbackError });
+        }
+      }
+      if (thread) await cleanupCreatedThread(thread, "ticket initialization failed");
+      await replyTicketFailure(interaction, `「${panel.name}」の受付処理に失敗しました。チケットは作成されていません。運営に確認してください。`);
+    } else {
+      console.warn("[ticket] チケットは作成済みですが、利用者への完了応答に失敗しました", { threadId: thread?.id });
+    }
   } finally {
     inFlightTickets.delete(flightKey);
   }
