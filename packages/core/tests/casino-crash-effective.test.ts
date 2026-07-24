@@ -6,7 +6,8 @@ import { EventLog } from "../src/events/service.js";
 import { EtherExchange, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { Casino } from "../src/casino/service.js";
 import { deptAccount, Departments } from "../src/departments/service.js";
-import { crashPoint } from "../src/casino/game-models.js";
+import { crashPoint, chohanRollAndPay } from "../src/casino/game-models.js";
+import { slotsSpinReel, slotsEvaluate, SLOTS_JP_CONTRIBUTION, SLOTS_JP_WIN_SHARE, type SlotSymbol } from "../src/index.js";
 import { deterministicRng } from "../src/casino/rng.js";
 
 registerDefaultTxTypes();
@@ -103,6 +104,67 @@ describe("クラッシュ実効RTP（Casino.settle 経由・連鎖無効）", ()
       const rtp = received / wagered;
       // これが「chain:true が危険」の証拠。100% を超える
       expect(rtp).toBeGreaterThan(1.0);
+    },
+  );
+});
+
+describe("スロット実効RTP（Casino.settle 経由・連鎖込み長期シミュレーション）", () => {
+  let ctx: ReturnType<typeof setup>;
+  beforeEach(() => (ctx = setup()));
+
+  it(
+    "連鎖ON・JP積立込みで 100,000スピンの実効RTPが 100% 未満（胴元黒字を維持）",
+    { timeout: 60_000 },
+    () => {
+      const rng = deterministicRng(70_707);
+      const bet = 200; // fuku しきい値未満を維持しやすい低ベット
+      const jpCut = Math.max(1, Math.floor(bet * SLOTS_JP_CONTRIBUTION));
+      const N = 100_000;
+      let wagered = 0;
+      let received = 0;
+      for (let i = 0; i < N; i++) {
+        if (ctx.ether.balanceOf("p") < bet * 2) ctx.ether.transfer(HOUSE_HOLDER, "p", bet * 500);
+        const reels: [SlotSymbol, SlotSymbol, SlotSymbol] = [slotsSpinReel(rng), slotsSpinReel(rng), slotsSpinReel(rng)];
+        const out = slotsEvaluate(reels, bet);
+        // 実装同様: chain ON, fuku ON（低残高で 0%）, JP 積立あり
+        const r = ctx.casino.settle("p", "slots", bet, out.payout, jpCut, { chain: true, fuku: true });
+        wagered += bet;
+        received += r.payout;
+        if (out.kind === "jackpot") received += ctx.casino.seizeJackpot("p", "slots", SLOTS_JP_WIN_SHARE);
+      }
+      const rtp = received / wagered;
+      // 連鎖を乗せても勝率 46% のスロットでは 100% を超えない
+      expect(rtp).toBeLessThan(1.0);
+      expect(rtp).toBeGreaterThan(0.9);
+    },
+  );
+});
+
+describe("丁半実効RTP（Casino.settle 経由・連鎖無効の確認）", () => {
+  let ctx: ReturnType<typeof setup>;
+  beforeEach(() => (ctx = setup()));
+
+  it(
+    "chain OFF で 50,000ゲームの実効RTPが 97% 前後（100% 未満）",
+    { timeout: 60_000 },
+    () => {
+      const rng = deterministicRng(3131);
+      const bet = 200;
+      const N = 50_000;
+      let wagered = 0;
+      let received = 0;
+      for (let i = 0; i < N; i++) {
+        if (ctx.ether.balanceOf("p") < bet * 2) ctx.ether.transfer(HOUSE_HOLDER, "p", bet * 500);
+        const payout = chohanRollAndPay(rng, bet, "cho");
+        // 実装 (chohan.ts) と同じく chain: false
+        const r = ctx.casino.settle("p", "chohan", bet, payout, 0, { chain: false, fuku: true });
+        wagered += bet;
+        received += r.payout;
+      }
+      const rtp = received / wagered;
+      // 理論 97%（配当 1.94 × 勝率 0.5）。chain OFF なので 100% を超えない
+      expect(rtp).toBeGreaterThan(0.94);
+      expect(rtp).toBeLessThan(1.0);
     },
   );
 });

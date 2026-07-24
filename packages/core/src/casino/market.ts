@@ -26,6 +26,12 @@ export const marketEscrowHolder = (id: number): string => `escrow:market:${id}`;
 
 export type MarketStatus = "open" | "closed" | "reported" | "disputed" | "settled" | "void";
 export type PayoutMode = "parimutuel" | "winner_take_all";
+/**
+ * 板の資金源。DB に明示保存する（残高から推測しない）。
+ * - "escrow":       新方式。賭け金は escrow:market:<id> に分離。精算は必ずそこから。
+ * - "legacy_house": 分離前の既存板。賭け金は house 直接。新規ベット禁止・起動時返金のみ。
+ */
+export type MarketFundMode = "escrow" | "legacy_house";
 
 export interface Market {
   id: number;
@@ -43,6 +49,7 @@ export interface Market {
   fee: number;
   reported_at: number | null;
   settled_at: number | null;
+  fund_mode: MarketFundMode;
   created_at: number;
 }
 export interface MarketBet {
@@ -70,7 +77,9 @@ export type MarketErrorCode =
   | "ERR_INSUFFICIENT_ETHER"
   | "ERR_BAD_AMOUNT"
   | "ERR_BAD_MODE"
-  | "ERR_UNDERFUNDED_ESCROW";
+  | "ERR_UNDERFUNDED_ESCROW"
+  | "ERR_ESCROW_MISMATCH"
+  | "ERR_LEGACY_BET_FORBIDDEN";
 export class MarketError extends Error {
   constructor(readonly code: MarketErrorCode, readonly meta: Record<string, unknown> = {}) {
     super(code);
@@ -121,6 +130,9 @@ export class Markets {
     this.addColumnIfMissing("casino_markets", "fee", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("casino_markets", "reported_at", "INTEGER");
     this.addColumnIfMissing("casino_markets", "settled_at", "INTEGER");
+    // 資金源を DB に明示。既存の板は 'legacy_house'（分離前データ）として扱う。
+    // 起動時 refundAllPending() で返金・void 化されるので、以降 legacy は残らないのが正常。
+    this.addColumnIfMissing("casino_markets", "fund_mode", "TEXT NOT NULL DEFAULT 'legacy_house'");
   }
 
   private addColumnIfMissing(table: string, column: string, spec: string): void {
@@ -130,26 +142,39 @@ export class Markets {
   }
 
   /**
-   * この板の預り金がどこにあるか。
-   * - 新方式: escrow:market:<id>（分離された預り所）
-   * - 旧方式: 分離前 (bet が house 直接) の既存板。エスクロー残高 0 かつ pot は
-   *          host が支払える（起動時 refundAllPending 通過済み想定）→ house からの動きを許可
+   * この板の精算資金源を DB の fund_mode に従って決める（残高から推測しない）。
    *
-   * 整合性チェック:
-   *   - エスクロー残高が pot と一致  → 新方式（安全）
-   *   - エスクロー残高 = 0 かつ pot > 0 → 旧方式 or 手動介入。house にフォールバック
-   *   - エスクロー残高が 0 < balance < pot → underfunded escrow（整合性エラー）
-   *     黙って house から補填すると孤児残高を作る危険がある。例外を投げて呼び出し側で
-   *     market を停止 → refund → 隔離するようにする。
+   * fund_mode='escrow'（新方式）:
+   *   - エスクロー残高が pot と **完全一致** の場合のみ escrow:market:<id> を返す
+   *   - balance != pot（多い/少ない/0 いずれも）は ERR_ESCROW_MISMATCH で停止
+   *     → house に黙ってフォールバックしない。呼び出し側で void → 隔離させる
+   *
+   * fund_mode='legacy_house'（分離前データ）:
+   *   - エスクロー残高 0 の場合のみ house から返金を許可
+   *   - エスクローに残高があるのは異常（新方式のはず）→ ERR_ESCROW_MISMATCH
+   *
+   * @param m  板（fund_mode を含む）
+   * @param pot 現在の pot（賭け合計）
    */
-  private fundHolder(id: number, pot: number): string {
-    const esc = marketEscrowHolder(id);
-    if (pot === 0) return esc; // 何も動かないので分岐は無害
+  private fundHolder(m: Market, pot: number): string {
+    const esc = marketEscrowHolder(m.id);
     const bal = this.ether.balanceOf(esc);
-    if (bal >= pot) return esc; // 新方式・正常
-    if (bal === 0) return HOUSE_HOLDER; // 旧方式・分離前データ想定
-    // underfunded escrow: エスクロー残高が pot に足りない。整合性エラーで停止する。
-    throw new MarketError("ERR_UNDERFUNDED_ESCROW", { marketId: id, pot, escrowBalance: bal });
+    if (m.fund_mode === "escrow") {
+      if (pot === 0) {
+        // pot=0 は精算しても何も動かない。ただしエスクローに残があるのは異常
+        if (bal !== 0) throw new MarketError("ERR_ESCROW_MISMATCH", { marketId: m.id, pot, escrowBalance: bal, mode: m.fund_mode });
+        return esc;
+      }
+      if (bal === pot) return esc; // 正常: 完全一致のみ許可
+      // 不一致（0/pot未満/pot超）はすべて整合性エラーで停止
+      if (bal < pot) throw new MarketError("ERR_UNDERFUNDED_ESCROW", { marketId: m.id, pot, escrowBalance: bal });
+      throw new MarketError("ERR_ESCROW_MISMATCH", { marketId: m.id, pot, escrowBalance: bal, mode: m.fund_mode });
+    }
+    // legacy_house: エスクロー残高 0 の場合のみ house から動かせる
+    if (bal !== 0) {
+      throw new MarketError("ERR_ESCROW_MISMATCH", { marketId: m.id, pot, escrowBalance: bal, mode: m.fund_mode });
+    }
+    return HOUSE_HOLDER;
   }
 
   create(input: {
@@ -181,10 +206,11 @@ export class Markets {
     const deadline = t + input.durationMin * 60;
     return this.db.transaction((): Market => {
       if (fee > 0) this.ether.transfer(input.creatorId, JACKPOT_HOLDER, fee);
+      // 新規板は必ず fund_mode='escrow'（賭け金を escrow:market:<id> に分離する）
       const info = this.db
         .prepare(
-          `INSERT INTO casino_markets (guild_id, creator_id, title, options_json, deadline_at, status, payout_mode, fee, created_at)
-           VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)`,
+          `INSERT INTO casino_markets (guild_id, creator_id, title, options_json, deadline_at, status, payout_mode, fee, fund_mode, created_at)
+           VALUES (?, ?, ?, ?, ?, 'open', ?, ?, 'escrow', ?)`,
         )
         .run(input.guildId, input.creatorId, input.title.slice(0, 200), JSON.stringify(input.options), deadline, payoutMode, fee, t);
       const id = Number(info.lastInsertRowid);
@@ -244,6 +270,8 @@ export class Markets {
     if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { marketId });
     if (m.status !== "open") throw new MarketError("ERR_NOT_OPEN", { marketId, status: m.status });
     if (m.deadline_at <= now()) throw new MarketError("ERR_NOT_OPEN", { marketId, deadline: m.deadline_at });
+    // 旧方式（legacy_house）の板には新規ベットを受け付けない（分離前データは返金のみ）
+    if (m.fund_mode !== "escrow") throw new MarketError("ERR_LEGACY_BET_FORBIDDEN", { marketId, mode: m.fund_mode });
     const options = JSON.parse(m.options_json) as string[];
     if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= options.length) {
       throw new MarketError("ERR_BAD_OPTION", { optionIndex, count: options.length });
@@ -260,10 +288,8 @@ export class Markets {
     const escHolder = marketEscrowHolder(marketId);
     return this.db.transaction((): { previous: number | null; net: number } => {
       if (existingTotal > 0) {
-        // 既存の張り直しは同じ場所から返す（新方式なら escrow、旧方式なら house）。
-        // fundHolder は「保有者残高 >= pot」で判定するので、張り直し前の pot（= existingTotal を含む）で見る。
-        const src = this.fundHolder(marketId, existingTotal);
-        this.ether.transfer(src, userId, existingTotal);
+        // 張り直し: 既存分は escrow に入っているのでそこから返す（fund_mode='escrow' 確定済み）
+        this.ether.transfer(escHolder, userId, existingTotal);
         this.db.prepare("DELETE FROM casino_market_bets WHERE market_id = ? AND user_id = ?").run(marketId, userId);
       }
       // 新規徴収は必ず板ごとの分離保有者へ（胴元の配当余力から切り離す）
@@ -403,7 +429,7 @@ export class Markets {
     this.db.transaction(() => {
       const bets = this.bets(id);
       const pot = bets.reduce((s, b) => s + b.amount, 0);
-      const src = this.fundHolder(id, pot);
+      const src = this.fundHolder(m, pot);
       for (const b of bets) this.ether.transfer(src, b.user_id, b.amount);
       this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), id);
     })();
@@ -425,8 +451,8 @@ export class Markets {
       const winners = bets.filter((b) => b.option_index === m.result_option);
       const winnersPot = winners.reduce((s, b) => s + b.amount, 0);
 
-      // 精算の資金源: 新方式なら escrow:market:<id>、旧方式なら house。自己修復で両対応
-      const src = this.fundHolder(id, pot);
+      // 精算の資金源: fund_mode に従い決定（escrow は balance===pot 厳格一致のみ許可）
+      const src = this.fundHolder(m, pot);
 
       // 的中者なし → 全額返金 & void
       if (winners.length === 0) {
@@ -495,7 +521,7 @@ export class Markets {
     this.db.transaction(() => {
       const bets = this.bets(id);
       const pot = bets.reduce((s, b) => s + b.amount, 0);
-      const src = this.fundHolder(id, pot);
+      const src = this.fundHolder(m, pot);
       for (const b of bets) this.ether.transfer(src, b.user_id, b.amount);
       this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), id);
     })();

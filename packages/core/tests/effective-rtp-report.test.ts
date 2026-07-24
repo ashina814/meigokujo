@@ -15,6 +15,7 @@ import {
 import {
   slotsSpinReel as spinReel,
   slotsEvaluate as evaluate,
+  slotsComputeRtp,
   SLOTS_JP_CONTRIBUTION,
   SLOTS_JP_WIN_SHARE,
   type SlotSymbol,
@@ -150,30 +151,21 @@ describe("実効 RTP レポート（Casino.settle 経由）", () => {
     console.log("\n=== スロット効果別 RTP ===\n" + lines.join("\n"));
   });
 
-  it("スロット: 賭け額 50/100/1,000/最大 で JP 積立整数丸めの影響", { timeout: 30_000 }, () => {
+  it("スロット: 賭け額別 JP 積立整数丸めの影響（RTP は理論値・積立率は決定的算術）", () => {
+    // 注意: RTP は payout 構造で決まり bet に依存しない（理論値 computeRtp を使う）。
+    //       500回シミュのような小標本 RTP は分散が大きく誤解を招くので報告しない。
+    //       bet ごとに変わるのは「JP 積立率 = jpCut/bet」で、これは決定的な整数丸めの帰結。
+    const theoryRtp = slotsComputeRtp().withJackpot;
     const buckets = [50, 100, 1_000, 100_000];
     const lines: string[] = [];
     for (const bet of buckets) {
-      ctx = setup(90_000_000, 90_000_000); // 高額 bet 用に潤沢シード（Ledger maxAmount 内）
-      const rng = deterministicRng(bet);
       const jpCut = Math.max(1, Math.floor(bet * SLOTS_JP_CONTRIBUTION));
       const jpRate = jpCut / bet;
-      // 低残高維持ロジックだと大額 bet で fail するので、シード後は放置（fuku 帯に入る可能性あり）
-      let wagered = 0;
-      let received = 0;
-      for (let i = 0; i < 500; i++) {
-        const reels: [SlotSymbol, SlotSymbol, SlotSymbol] = [spinReel(rng), spinReel(rng), spinReel(rng)];
-        const out = evaluate(reels, bet);
-        const r = ctx.casino.settle("a", "slots", bet, out.payout, jpCut, { chain: false, fuku: false });
-        wagered += bet;
-        received += r.payout;
-        if (out.kind === "jackpot") received += ctx.casino.seizeJackpot("a", "slots", SLOTS_JP_WIN_SHARE);
-        if (ctx.ether.balanceOf("a") < bet) break; // 破産で終了
-      }
-      const rtp = wagered > 0 ? received / wagered : 0;
-      lines.push(report("スロット", `bet=${bet.toLocaleString()}`, rtp, `jpCut=${jpCut}◈ (実効積立率 ${(jpRate * 100).toFixed(2)}%)`));
+      lines.push(
+        report("スロット", `bet=${bet.toLocaleString()}`, theoryRtp, `jpCut=${jpCut}◈ (実効積立率 ${(jpRate * 100).toFixed(2)}%)`),
+      );
     }
-    console.log("\n=== スロット bet 額別 RTP（JP 積立整数丸め影響） ===\n" + lines.join("\n"));
+    console.log("\n=== スロット bet 額別（RTP=理論値・JP 積立率のみ bet 依存） ===\n" + lines.join("\n"));
   });
 
   it("丁半: base / +chain / +fuku", { timeout: 30_000 }, () => {

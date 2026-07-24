@@ -80,11 +80,43 @@ describe("エスクロー資金分離", () => {
     const beforeA = ctx.ether.balanceOf("a");
     const beforeB = ctx.ether.balanceOf("b");
     const r = ctx.escrow.sweepAll("test:startup");
-    expect(r.users).toBe(2);
-    expect(r.total).toBe(5_000);
+    expect(r.refundedUsers).toBe(2);
+    expect(r.refundedSessions).toBe(1);
+    expect(r.totalSessions).toBe(1);
+    expect(r.refundedTotal).toBe(5_000);
     expect(r.orphans).toBe(0);
+    expect(r.failed).toEqual([]);
     expect(ctx.ether.balanceOf("a")).toBe(beforeA + 3_000);
     expect(ctx.ether.balanceOf("b")).toBe(beforeB + 2_000);
+  });
+
+  it("sweepAll: 破損セッションがあっても正常セッションは返金され、Bot 起動は継続できる", () => {
+    // 正常セッション
+    ctx.escrow.hold("ok1", "a", 3_000, "duel");
+    ctx.escrow.hold("ok2", "b", 2_000, "duel");
+    // 破損セッション: 帳簿は 5,000 だが保有者残高を人為的にずらす
+    ctx.escrow.hold("broken", "a", 5_000, "duel");
+    ctx.ether.transfer(escrowHolderFor("broken"), HOUSE_HOLDER, 1_000); // 保有者 4,000 != 帳簿 5,000
+    const beforeA = ctx.ether.balanceOf("a");
+    const beforeB = ctx.ether.balanceOf("b");
+
+    const r = ctx.escrow.sweepAll("test:startup");
+    // 正常2セッションは返金、破損1は失敗
+    expect(r.totalSessions).toBe(3);
+    expect(r.refundedSessions).toBe(2);
+    expect(r.failed).toHaveLength(1);
+    expect(r.failed[0]!.sessionId).toBe("broken");
+    expect(r.failed[0]!.expected).toBe(5_000);
+    expect(r.failed[0]!.actual).toBe(4_000);
+    // 正常セッションのプレイヤーは返金されている
+    expect(ctx.ether.balanceOf("a")).toBe(beforeA + 3_000);
+    expect(ctx.ether.balanceOf("b")).toBe(beforeB + 2_000);
+    // 破損セッションの帳簿は残っている（削除しない）
+    expect(ctx.escrow.list("broken")).toHaveLength(1);
+    // 破損セッションの残高は house 補填されず保有者に残る
+    expect(ctx.ether.balanceOf(escrowHolderFor("broken"))).toBe(4_000);
+    // 整合性は保たれている
+    expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
   });
 
   it("sweepAll: 孤児残高は house ではなく sys:escrow:quarantine へ隔離する", () => {
@@ -184,6 +216,41 @@ describe("エスクロー資金分離", () => {
     expect(ctx.escrow.list("sess1")).toHaveLength(2);
     // 整合性: Ledger identity は壊れていない
     expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
+  });
+
+  it.each([
+    ["負数", [{ to: "a", amount: -100 }]],
+    ["NaN", [{ to: "a", amount: Number.NaN }]],
+    ["Infinity", [{ to: "a", amount: Number.POSITIVE_INFINITY }]],
+    ["小数", [{ to: "a", amount: 100.5 }]],
+    ["空の宛先", [{ to: "", amount: 100 }]],
+  ] as const)("settle: 不正な分配（%s）を拒否し、残高・帳簿を一切変えない", (_label, dist) => {
+    ctx.escrow.hold("sess1", "a", 5_000, "duel");
+    const beforeA = ctx.ether.balanceOf("a");
+    const pool0 = ctx.ether.balanceOf(escrowHolderFor("sess1"));
+    // 正しい分配（合計 5000）に不正エントリを1つ混ぜても、全件検査で弾かれる
+    const distributions = [{ to: "a", amount: 5_000 }, ...dist] as Array<{ to: string; amount: number }>;
+    expect(() => ctx.escrow.settle("sess1", distributions, "test", "bad dist")).toThrowError(/bad distribution/);
+    // 何も動いていない・帳簿もそのまま
+    expect(ctx.ether.balanceOf("a")).toBe(beforeA);
+    expect(ctx.ether.balanceOf(escrowHolderFor("sess1"))).toBe(pool0);
+    expect(ctx.escrow.list("sess1")).toHaveLength(1);
+    expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
+  });
+
+  it("settle: 負数を「正数フィルタで黙って捨てる」ことがない（合計が pool と一致しても拒否）", () => {
+    ctx.escrow.hold("sess1", "a", 5_000, "duel");
+    // もし負数が filter で捨てられると、正数合計 5000 == pool 5000 で通ってしまう。
+    // 全件検査を先にやることで、この抜け穴を塞ぐ。
+    expect(() =>
+      ctx.escrow.settle(
+        "sess1",
+        [{ to: "a", amount: 5_000 }, { to: "b", amount: -1_000 }],
+        "test",
+        "sneaky negative",
+      ),
+    ).toThrowError(/bad distribution/);
+    expect(ctx.escrow.list("sess1")).toHaveLength(1);
   });
 
   it("releaseFromQuarantine: 隔離残高を手動で返金または帳消しできる", () => {
@@ -323,19 +390,71 @@ describe("Markets: 資金分離と精算", () => {
     expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(2_000);
   });
 
-  it("underfunded escrow: refund/settle が黙って house にフォールバックせず例外を投げる", async () => {
+  it("新規市場は必ず fund_mode='escrow'", () => {
+    const m = ctx.markets.create({
+      guildId: "g", creatorId: "a", title: "T", options: ["○", "×"], durationMin: 10, fee: 0,
+    });
+    expect(ctx.markets.get(m.id)!.fund_mode).toBe("escrow");
+  });
+
+  it("escrow市場・pot>0・escrow=0: house にフォールバックせず例外（残高から旧方式と誤認しない）", () => {
     const m = ctx.markets.create({
       guildId: "g", creatorId: "a", title: "T", options: ["○", "×"], durationMin: 10, fee: 0,
     });
     ctx.markets.bet(m.id, "a", 0, 3_000);
-    // 人為的にエスクロー残高を減らす（バグでずれた状態を再現）
-    ctx.ether.transfer(marketEscrowHolder(m.id), HOUSE_HOLDER, 1_000);
-    expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(2_000);
-    // refund 呼び出し → underfunded escrow で throw
+    // エスクローを完全に空にする（残高から旧方式と誤認させようとする攻撃/バグ）
+    ctx.ether.transfer(marketEscrowHolder(m.id), HOUSE_HOLDER, 3_000);
+    expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(0);
+    const houseBefore = ctx.ether.balanceOf(HOUSE_HOLDER);
+    // fund_mode='escrow' なので escrow=0 でも house にフォールバックしない → 例外（underfunded）
+    expect(() => ctx.markets.refund(m.id, "test")).toThrowError(/ERR_UNDERFUNDED_ESCROW|ERR_ESCROW_MISMATCH/);
+    // house 残高は 1 も減っていない（フォールバックしていない証拠）
+    expect(ctx.ether.balanceOf(HOUSE_HOLDER)).toBe(houseBefore);
+    expect(ctx.markets.get(m.id)!.status).toBe("open");
+  });
+
+  it("escrow市場・escrow < pot: ERR_UNDERFUNDED_ESCROW", () => {
+    const m = ctx.markets.create({
+      guildId: "g", creatorId: "a", title: "T", options: ["○", "×"], durationMin: 10, fee: 0,
+    });
+    ctx.markets.bet(m.id, "a", 0, 3_000);
+    ctx.ether.transfer(marketEscrowHolder(m.id), HOUSE_HOLDER, 1_000); // 残 2000 < pot 3000
     expect(() => ctx.markets.refund(m.id, "test")).toThrowError(/ERR_UNDERFUNDED_ESCROW/);
-    // 状態は変わらない (open のまま)
-    const after = ctx.markets.get(m.id)!;
-    expect(after.status).toBe("open");
+    expect(ctx.markets.get(m.id)!.status).toBe("open");
+  });
+
+  it("escrow市場・escrow > pot: ERR_ESCROW_MISMATCH（過剰残高も拒否）", () => {
+    const m = ctx.markets.create({
+      guildId: "g", creatorId: "a", title: "T", options: ["○", "×"], durationMin: 10, fee: 0,
+    });
+    ctx.markets.bet(m.id, "a", 0, 3_000);
+    ctx.ether.transfer(HOUSE_HOLDER, marketEscrowHolder(m.id), 500); // 残 3500 > pot 3000
+    expect(() => ctx.markets.refund(m.id, "test")).toThrowError(/ERR_ESCROW_MISMATCH/);
+    expect(ctx.markets.get(m.id)!.status).toBe("open");
+  });
+
+  it("legacy_house と明示された市場のみ house 返金可能（escrow balance=0）", () => {
+    // 旧方式データを人為的に作る: fund_mode='legacy_house', bet は house に入れる
+    const m = ctx.markets.create({
+      guildId: "g", creatorId: "a", title: "T", options: ["○", "×"], durationMin: 10, fee: 0,
+    });
+    // DB を直接いじって legacy_house 化 + escrow 分を house に移す（分離前データを再現）
+    ctx.markets.bet(m.id, "a", 0, 3_000);
+    ctx.db.prepare("UPDATE casino_markets SET fund_mode='legacy_house' WHERE id=?").run(m.id);
+    ctx.ether.transfer(marketEscrowHolder(m.id), HOUSE_HOLDER, 3_000); // escrow 0, house に元本
+    const beforeA = ctx.ether.balanceOf("a");
+    // legacy_house かつ escrow=0 なので house から返金できる
+    ctx.markets.refund(m.id, "test");
+    expect(ctx.ether.balanceOf("a")).toBe(beforeA + 3_000);
+    expect(ctx.markets.get(m.id)!.status).toBe("void");
+  });
+
+  it("legacy_house 市場は新規ベットを拒否（ERR_LEGACY_BET_FORBIDDEN）", () => {
+    const m = ctx.markets.create({
+      guildId: "g", creatorId: "a", title: "T", options: ["○", "×"], durationMin: 60, fee: 0,
+    });
+    ctx.db.prepare("UPDATE casino_markets SET fund_mode='legacy_house' WHERE id=?").run(m.id);
+    expect(() => ctx.markets.bet(m.id, "a", 0, 1_000)).toThrowError(/ERR_LEGACY_BET_FORBIDDEN/);
   });
 
   it("refundAllPending: 個別 market の失敗が他の板の返金を止めない", () => {

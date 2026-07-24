@@ -161,14 +161,26 @@ export class Escrow {
     reason: string,
     _beforeStep?: (index: number, dist: { to: string; amount: number }) => void,
   ): { paid: number; sessionId: string } {
-    const positive = distributions.filter((d) => d.amount > 0);
-    const total = positive.reduce((s, d) => s + d.amount, 0);
     const holder = this.holderId(sessionId);
 
-    // 事前チェック（トランザクション外・早期リターン）
-    if (positive.some((d) => !Number.isInteger(d.amount) || d.amount < 0)) {
-      throw new Error(`Escrow.settle: bad amount in distributions`);
+    // 検証は「正数フィルタの前」に全件を検査する。
+    // 先に filter(d.amount > 0) してしまうと、負数・NaN・Infinity・小数・空宛先が
+    // 黙って捨てられて素通りしてしまう（filter が false になり配列から消える）。
+    for (const d of distributions) {
+      if (
+        !d.to ||
+        typeof d.to !== "string" ||
+        !Number.isFinite(d.amount) ||
+        !Number.isInteger(d.amount) ||
+        d.amount < 0
+      ) {
+        throw new Error(`Escrow.settle: bad distribution ${JSON.stringify(d)}`);
+      }
     }
+
+    const positive = distributions.filter((d) => d.amount > 0);
+    const total = positive.reduce((s, d) => s + d.amount, 0);
+
     const pool = this.ether.balanceOf(holder);
     if (total !== pool) {
       throw new Error(
@@ -224,123 +236,166 @@ export class Escrow {
   }
 
   /**
-   * 起動時掃除:
-   * 1. 台帳(casino_escrow) に記録がある行 → 記録された `source` から本人に返金
-   * 2. 台帳に記録がないのに session 保有者に残っているエテル(孤児残高)
-   *    → 隔離口座 `sys:escrow:quarantine` に移す（house には送らない）
+   * 起動時掃除（セッション単位で分離処理）。
    *
-   * 孤児残高は「誰の預り金か特定できない」状態。原因は Bot が精算途中で死んだ・帳簿と保有者が
-   * 分離運用された・手動介入で片方だけ動いた、など。自動で house 売上化すると
-   * 「バグで消えた預り金が売上に化ける」ので、必ず人手確認を通す。
+   * 1. 台帳(casino_escrow) をセッションごとに独立トランザクションで返金する。
+   *    各セッションで「帳簿合計 == source 残高」を検証し、一致するものだけ返金する。
+   *    不一致セッションは:
+   *      - 帳簿を削除しない
+   *      - 残高を勝手に house から補填しない
+   *      - イベントログ / 運営ログに残す
+   *      - 他の正常セッションの返金は続行する
+   *    → 1セッションの破損で Bot 全体が起動不能にならない（market の refundAllPending と同思想）。
    *
-   * 各孤児は event log `casino_escrow_orphan` に holder / amount / 時刻を記録するので、
-   * 運営はイベントログを見て個別に返金指示または帳消しを判断できる。
+   * 2. 台帳に記録がないのに escrow 保有者に残っているエテル(孤児残高)
+   *    → 隔離口座 `sys:escrow:quarantine` に移す（house には送らない）。
+   *    失敗セッションは帳簿が残るので孤児扱いされない（下の除外ロジック参照）。
+   *
+   * @returns 返金・孤児・失敗の内訳
    */
   sweepAll(actor: string): {
-    sessions: number;
-    users: number;
-    total: number;
+    totalSessions: number;
+    refundedSessions: number;
+    refundedUsers: number;
+    refundedTotal: number;
+    failed: Array<{ sessionId: string; expected: number; actual: number; error: string }>;
     orphans: number;
     orphanTotal: number;
   } {
-    return this.db.transaction(() => {
-      const rows = this.db.prepare("SELECT * FROM casino_escrow").all() as EscrowRow[];
-      const sessions = new Set(rows.map((r) => r.session_id)).size;
-      let total = 0;
-      for (const r of rows) {
-        this.ether.transfer(r.source, r.user_id, r.amount);
-        total += r.amount;
-      }
-      this.db.prepare("DELETE FROM casino_escrow").run();
+    const allRows = this.db.prepare("SELECT * FROM casino_escrow").all() as EscrowRow[];
+    const bySession = new Map<string, EscrowRow[]>();
+    for (const r of allRows) {
+      const arr = bySession.get(r.session_id) ?? [];
+      arr.push(r);
+      bySession.set(r.session_id, arr);
+    }
 
-      // 孤児残高（記録が無いのに escrow 保有者に残っているエテル）→ 隔離口座に集約。
-      // 隔離口座自身と対応する有効な帳簿がある保有者は除外する。
-      // 対象:
-      //   escrow:session:%   … PvP/競馬/丁半など (casino_escrow で追跡)
-      //   escrow:market:%    … 板 (casino_markets で追跡)
-      // 有効な帳簿があるかは以下で判定:
-      //   session: casino_escrow の対応 session_id が存在
-      //   market:  casino_markets の対応 id が未精算 (open/closed/reported/disputed)
-      this.ether.ensureHolder(ESCROW_QUARANTINE);
-      const activeSessions = new Set(
-        (this.db.prepare("SELECT DISTINCT session_id FROM casino_escrow").all() as Array<{ session_id: string }>).map(
-          (r) => r.session_id,
-        ),
-      );
-      // markets テーブルは存在しない可能性があるので try/catch でガード（core は Escrow 単体でも使える設計）
-      let activeMarkets = new Set<string>();
+    let refundedSessions = 0;
+    let refundedUsers = 0;
+    let refundedTotal = 0;
+    const failed: Array<{ sessionId: string; expected: number; actual: number; error: string }> = [];
+
+    for (const [sid, rows] of bySession) {
+      const expected = rows.reduce((s, r) => s + r.amount, 0);
+      const holder = escrowHolderFor(sid);
       try {
-        activeMarkets = new Set(
-          (
-            this.db
-              .prepare("SELECT id FROM casino_markets WHERE status IN ('open','closed','reported','disputed')")
-              .all() as Array<{ id: number }>
-          ).map((r) => String(r.id)),
+        this.db.transaction(() => {
+          // 新方式（source が session 専用保有者）は「保有者残高 == 帳簿合計」を厳格検証。
+          // legacy（source='house'）は house が混在勘定なので個別検証できず、そのまま house から返金。
+          const sources = new Set(rows.map((r) => r.source));
+          const isNewStyle = sources.size === 1 && [...sources][0] === holder;
+          if (isNewStyle) {
+            const actual = this.ether.balanceOf(holder);
+            if (actual !== expected) {
+              throw new Error(`escrow mismatch: ledger=${expected} holder=${actual}`);
+            }
+          }
+          for (const r of rows) this.ether.transfer(r.source, r.user_id, r.amount);
+          this.db.prepare("DELETE FROM casino_escrow WHERE session_id = ?").run(sid);
+        })();
+        refundedSessions++;
+        refundedUsers += rows.length;
+        refundedTotal += expected;
+      } catch (e) {
+        const actual = this.ether.balanceOf(holder);
+        const error = (e as Error).message;
+        failed.push({ sessionId: sid, expected, actual, error });
+        this.events.log("casino_escrow_sweep_failed", {
+          actor,
+          payload: { sessionId: sid, expected, actual, error },
+        });
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[escrow] セッション ${sid} の返金失敗（帳簿=${expected} 保有者=${actual}）: ${error}。帳簿は残し house 補填もしない。要調査`,
         );
-      } catch {
-        /* markets テーブル未作成の環境（テスト最小構成）は空扱い */
       }
-      const allEscrowHolders = this.db
-        .prepare(
-          "SELECT user_id, amount FROM ether_balances WHERE user_id LIKE 'escrow:%' AND user_id != ? AND amount > 0",
-        )
-        .all(ESCROW_QUARANTINE) as Array<{ user_id: string; amount: number }>;
-      const orphanHolders = allEscrowHolders.filter((h) => {
-        if (h.user_id.startsWith("escrow:session:")) {
-          const sid = h.user_id.slice("escrow:session:".length);
-          return !activeSessions.has(sid); // 帳簿が消えている = 孤児
-        }
-        if (h.user_id.startsWith("escrow:market:")) {
-          const mid = h.user_id.slice("escrow:market:".length);
-          return !activeMarkets.has(mid); // 板が精算済み/void 済みなのに残高が残っている = 孤児
-        }
-        return true; // 未知の escrow:* も孤児として隔離
-      });
-      let orphanTotal = 0;
-      const detectedAt = Math.floor(Date.now() / 1000);
-      for (const h of orphanHolders) {
-        const bal = this.ether.balanceOf(h.user_id);
-        if (bal > 0) {
-          this.ether.transfer(h.user_id, ESCROW_QUARANTINE, bal);
+    }
+
+    // ── 孤児残高（記録が無いのに escrow 保有者に残っているエテル）→ 隔離口座に集約 ──
+    this.ether.ensureHolder(ESCROW_QUARANTINE);
+    // 失敗セッションは帳簿が残っているので activeSessions に含まれ、孤児扱いされない
+    const activeSessions = new Set(
+      (this.db.prepare("SELECT DISTINCT session_id FROM casino_escrow").all() as Array<{ session_id: string }>).map(
+        (r) => r.session_id,
+      ),
+    );
+    let activeMarkets = new Set<string>();
+    try {
+      activeMarkets = new Set(
+        (
+          this.db
+            .prepare("SELECT id FROM casino_markets WHERE status IN ('open','closed','reported','disputed')")
+            .all() as Array<{ id: number }>
+        ).map((r) => String(r.id)),
+      );
+    } catch {
+      /* markets テーブル未作成の環境（テスト最小構成）は空扱い */
+    }
+    const allEscrowHolders = this.db
+      .prepare(
+        "SELECT user_id, amount FROM ether_balances WHERE user_id LIKE 'escrow:%' AND user_id != ? AND amount > 0",
+      )
+      .all(ESCROW_QUARANTINE) as Array<{ user_id: string; amount: number }>;
+    const orphanHolders = allEscrowHolders.filter((h) => {
+      if (h.user_id.startsWith("escrow:session:")) {
+        const sid = h.user_id.slice("escrow:session:".length);
+        return !activeSessions.has(sid); // 帳簿が消えている = 孤児（失敗セッションは残るので除外）
+      }
+      if (h.user_id.startsWith("escrow:market:")) {
+        const mid = h.user_id.slice("escrow:market:".length);
+        return !activeMarkets.has(mid); // 板が精算済み/void 済みなのに残高が残っている = 孤児
+      }
+      return true; // 未知の escrow:* も孤児として隔離
+    });
+    let orphanTotal = 0;
+    const detectedAt = Math.floor(Date.now() / 1000);
+    for (const h of orphanHolders) {
+      const bal = this.ether.balanceOf(h.user_id);
+      if (bal > 0) {
+        // 孤児1件ずつ独立トランザクションで隔離（1件失敗が他を止めない）
+        try {
+          this.db.transaction(() => {
+            this.ether.transfer(h.user_id, ESCROW_QUARANTINE, bal);
+          })();
           orphanTotal += bal;
-          // 個別のイベントログ（監査用）: holder ID / 金額 / 検出時刻
           this.events.log("casino_escrow_orphan", {
             actor,
-            payload: {
-              holder: h.user_id,
-              amount: bal,
-              detectedAt,
-              quarantinedTo: ESCROW_QUARANTINE,
-            },
+            payload: { holder: h.user_id, amount: bal, detectedAt, quarantinedTo: ESCROW_QUARANTINE },
           });
-          // 運営ログにも警告（stdout に流し、収集基盤で拾えるように）
           // eslint-disable-next-line no-console
           console.warn(
             `[escrow] 孤児残高を隔離: holder=${h.user_id} amount=${bal} → ${ESCROW_QUARANTINE}（要調査）`,
           );
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn(`[escrow] 孤児残高の隔離に失敗: holder=${h.user_id} ${(e as Error).message}`);
         }
       }
+    }
 
-      if (rows.length > 0 || orphanHolders.length > 0) {
-        this.events.log("casino_escrow_sweep", {
-          actor,
-          payload: {
-            sessions,
-            users: rows.length,
-            total,
-            orphans: orphanHolders.length,
-            orphanTotal,
-          },
-        });
-      }
-      return {
-        sessions,
-        users: rows.length,
-        total,
-        orphans: orphanHolders.length,
-        orphanTotal,
-      };
-    })();
+    if (allRows.length > 0 || orphanHolders.length > 0 || failed.length > 0) {
+      this.events.log("casino_escrow_sweep", {
+        actor,
+        payload: {
+          totalSessions: bySession.size,
+          refundedSessions,
+          refundedUsers,
+          refundedTotal,
+          failed: failed.length,
+          orphans: orphanHolders.length,
+          orphanTotal,
+        },
+      });
+    }
+    return {
+      totalSessions: bySession.size,
+      refundedSessions,
+      refundedUsers,
+      refundedTotal,
+      failed,
+      orphans: orphanHolders.length,
+      orphanTotal,
+    };
   }
 
   /** 隔離口座の現在残高（運営 UI・監査用） */

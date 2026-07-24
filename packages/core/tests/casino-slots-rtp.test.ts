@@ -4,6 +4,7 @@ import {
   simulateRtp,
   DOUBLE_PAYOUTS,
   TRIPLE_PAYOUTS,
+  JP_CONTRIBUTION,
   evaluate,
   SLOT_SYMBOLS,
 } from "../src/casino/slots-model.js";
@@ -103,5 +104,33 @@ describe("スロット: 実測RTP（決定的シミュレーション）", () =>
       if (sim.rtp < 1.0) houseWins++;
     }
     expect(houseWins).toBeGreaterThanOrEqual(8);
+  });
+});
+
+describe("スロット: JP 積立の整数丸め（bet 額別・決定的算術）", () => {
+  // 実装 (apps/bot/src/casino/slots.ts) の jpCut = max(1, floor(bet * JP_CONTRIBUTION))
+  const jpCutOf = (bet: number) => Math.max(1, Math.floor(bet * JP_CONTRIBUTION));
+
+  it("bet=50 では jpCut=1 となり実効 JP 積立率が 2%（意図は 1%）", () => {
+    // floor(50 * 0.01) = floor(0.5) = 0 → max(1, 0) = 1 → 1/50 = 2%
+    const bet = 50;
+    const jpCut = jpCutOf(bet);
+    expect(jpCut).toBe(1);
+    expect(jpCut / bet).toBeCloseTo(0.02, 6);
+  });
+
+  it("bet=100 以上では実効 JP 積立率が 1%（意図通り）", () => {
+    for (const bet of [100, 1_000, 10_000, 100_000]) {
+      const jpCut = jpCutOf(bet);
+      expect(jpCut / bet).toBeCloseTo(0.01, 6);
+    }
+  });
+
+  it("bet < 100 の全域で jpCut=1 のため積立率 > 1%（MIN_BET 引き上げ検討の根拠）", () => {
+    for (let bet = 50; bet < 100; bet++) {
+      const jpCut = jpCutOf(bet);
+      expect(jpCut).toBe(1);
+      expect(jpCut / bet).toBeGreaterThan(0.01);
+    }
   });
 });

@@ -22,35 +22,52 @@ export interface ConsumableDef {
   /**
    * 追加払戻・返金の絶対上限（エテル）。0 or 未設定なら上限なし。
    *
-   * これが無いと、高額ベット時に「アイテム価格 << 期待効果額」となり
-   * プレイヤーの裁定取引が可能になる（例: 3,000◈ の保険符で 100万◈ ベットの敗北から 50万◈ 返金）。
-   * 上限額はおおむね「アイテム価格の 2〜3倍以内」に収める設計。
+   * ## cap < price を厳守する理由（PR#6 レビュー指摘）
+   * お守りは「発動するまで装備が残る」仕様（次に勝つ／負けるまで消えない）。
+   * したがってプレイヤーが「未装備なら買う・装備中は買わない・発動したら買い直す」戦略を取ると、
+   * 1装備サイクルの期待損益は本質的に `発動時効果額 − 購入価格` になる。
+   * cap >= price だと、発動が保証される（＝いつか必ず勝つ／負ける）以上、
+   * 1サイクルあたり必ず (cap − price) >= 0 の利益が出る裁定になる。
+   * これを防ぐため cap は price より必ず小さくする（下の CONSUMABLES で検証）。
    */
   cap?: number;
 }
 
 /**
- * 各お守りの効果上限は「価格の 1.25〜1.5倍」を目安に設定している。
- * これで毎回買って装備しても、期待利益が価格を超えない（＝胴元赤字にならない）よう構造化。
+ * お守りの効果上限は「価格未満」に固定する（cap < price）。
+ * これで「発動まで装備が残る」仕様のまま、毎サイクル買い直しても
+ * 期待損益が (cap − price) < 0 となり、胴元が構造的赤字にならない。
+ *
+ * 価格・上限（PR#6 レビュー指摘の推奨値 A）:
+ *   福のお守り price=4,000  cap=3,000
+ *   保険符     price=3,000  cap=2,000
+ *   庇護の札   price=12,000 cap=10,000
  */
 export const CONSUMABLES: readonly ConsumableDef[] = [
   {
     key: "omamori", name: "福のお守り",
-    desc: "次に勝った時、勝利金が +5%（最大 +5,000◈）になる。",
-    price: 4_000, kind: "armed_win", power: 0.05, cap: 5_000,
+    desc: "次に勝った時、勝利金が +5%（最大 +3,000◈）になる。",
+    price: 4_000, kind: "armed_win", power: 0.05, cap: 3_000,
   },
   {
     key: "hoken", name: "保険符",
-    desc: "次に負けた時、賭け金の半分（最大 5,000◈）が戻る。",
-    price: 3_000, kind: "armed_loss", power: 0.5, cap: 5_000,
+    desc: "次に負けた時、賭け金の半分（最大 2,000◈）が戻る。",
+    price: 3_000, kind: "armed_loss", power: 0.5, cap: 2_000,
   },
   {
     key: "higo", name: "庇護の札",
-    desc: "次の敗北を無効化（賭け金の全額、最大 15,000◈ が戻る）。",
-    price: 12_000, kind: "armed_loss", power: 1.0, cap: 15_000,
+    desc: "次の敗北を無効化（賭け金の全額、最大 10,000◈ が戻る）。",
+    price: 12_000, kind: "armed_loss", power: 1.0, cap: 10_000,
   },
   { key: "reroll", name: "二度振りの権", desc: "チンチロでもう一度振り直せる（1回）。", price: 5_000, kind: "game_reroll", power: 0 },
 ];
+
+// 不変条件を起動時に検査: 効果を持つお守りは cap < price（cap > 0 のとき）
+for (const c of CONSUMABLES) {
+  if (c.cap !== undefined && c.cap > 0 && c.cap >= c.price) {
+    throw new Error(`ConsumableDef invariant violated: ${c.key} cap(${c.cap}) must be < price(${c.price})`);
+  }
+}
 
 const BY_KEY = new Map(CONSUMABLES.map((c) => [c.key, c]));
 export function getConsumableDef(key: string): ConsumableDef | undefined {

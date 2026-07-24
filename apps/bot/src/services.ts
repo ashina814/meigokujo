@@ -108,10 +108,20 @@ export function buildServices() {
     );
   }
   const escrow = new Escrow(db, ether, events);
-  // 起動時にセッション型ゲーム（対人・競馬・丁半・PvPポーカー等）の預かり残を全額返金
+  // 起動時にセッション型ゲーム（対人・競馬・丁半・PvPポーカー等）の預かり残をセッション単位で返金
   const swept = escrow.sweepAll("system:startup");
-  if (swept.users > 0) {
-    console.log(`[escrow] 起動時に未精算エスクロー ${swept.sessions}卓/${swept.users}人分（計 ${swept.total.toLocaleString("ja-JP")}◈）を返金`);
+  if (swept.refundedUsers > 0) {
+    console.log(
+      `[escrow] 起動時に未精算エスクロー ${swept.refundedSessions}/${swept.totalSessions}卓・${swept.refundedUsers}人分（計 ${swept.refundedTotal.toLocaleString("ja-JP")}◈）を返金`,
+    );
+  }
+  if (swept.failed.length > 0) {
+    // 帳簿と保有者残高が乖離して返金できなかったセッション。house 補填せず帳簿を保持した。要調査
+    console.warn(
+      `[escrow] 返金失敗セッション ${swept.failed.length}件（他セッションは正常返金・Bot 起動は継続）: ${swept.failed
+        .map((f) => `${f.sessionId}(帳簿${f.expected}/保有${f.actual})`)
+        .join(", ")}`,
+    );
   }
   if (swept.orphans > 0) {
     // 帳簿と保有者残高が乖離した孤児残高。house へ吸い上げず隔離した。要調査

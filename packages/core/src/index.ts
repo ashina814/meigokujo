@@ -124,6 +124,7 @@ export {
   type MarketApproval,
   type MarketStatus,
   type MarketErrorCode,
+  type MarketFundMode,
   type PayoutMode,
   type MarketSettleResult,
 } from "./casino/market.js";
