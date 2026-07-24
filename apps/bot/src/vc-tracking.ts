@@ -22,6 +22,8 @@ export function trackVoiceState(oldState: VoiceState, newState: VoiceState, serv
   }
   if (before !== after || muteChanged) {
     // 入室・移動・状態変化 → セグメント切替（open が既存を閉じる）
-    services.vc.open(userId, after, newState.selfMute ?? false, newState.selfDeaf ?? false);
+    // 親カテゴリを保持しておく（浮上報酬のカテゴリ除外判定に使う）
+    const parentId = newState.channel?.parentId ?? null;
+    services.vc.open(userId, after, parentId, newState.selfMute ?? false, newState.selfDeaf ?? false);
   }
 }

@@ -10,6 +10,7 @@ export interface VcSegment {
   id: number;
   user_id: string;
   channel_id: string;
+  parent_id: string | null;
   started_at: number;
   ended_at: number | null;
   self_muted: number;
@@ -27,15 +28,18 @@ const now = () => Math.floor(Date.now() / 1000);
 export class VcTracker {
   constructor(private readonly db: Database.Database) {}
 
-  /** 入室 or 状態変化: 開いているセグメントを閉じて新しく開く */
-  open(userId: string, channelId: string, muted: boolean, deafened: boolean): void {
+  /**
+   * 入室 or 状態変化: 開いているセグメントを閉じて新しく開く。
+   * @param parentId 親カテゴリID（浮上報酬のカテゴリ除外判定に使う）。不明なら null。
+   */
+  open(userId: string, channelId: string, parentId: string | null, muted: boolean, deafened: boolean): void {
     const ts = now();
     this.closeAt(userId, ts);
     this.db
       .prepare(
-        "INSERT INTO vc_segments (user_id, channel_id, started_at, self_muted, self_deafened) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO vc_segments (user_id, channel_id, parent_id, started_at, self_muted, self_deafened) VALUES (?, ?, ?, ?, ?, ?)",
       )
-      .run(userId, channelId, ts, muted ? 1 : 0, deafened ? 1 : 0);
+      .run(userId, channelId, parentId, ts, muted ? 1 : 0, deafened ? 1 : 0);
   }
 
   /** 退出 */

@@ -177,6 +177,7 @@ CREATE TABLE IF NOT EXISTS vc_segments (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id       TEXT NOT NULL,
   channel_id    TEXT NOT NULL,
+  parent_id     TEXT,
   started_at    INTEGER NOT NULL,
   ended_at      INTEGER,
   self_muted    INTEGER NOT NULL DEFAULT 0,
@@ -439,5 +440,17 @@ export function openDb(path: string): Database.Database {
   // マイグレーション: 旧カジノの chip_balances は ether_balances に置き換え（旧カジノは開帳前に廃止＝データ無し）
   db.exec("DROP TABLE IF EXISTS chip_balances");
   db.exec(DDL);
+  // マイグレーション: vc_segments に parent_id（親カテゴリ）を追加。
+  // ブラックリスト方式の浮上報酬でカテゴリ単位の除外を正確に判定するため。
+  // 既存行は NULL（＝カテゴリ不明）で、チャンネル単位の除外のみ効く。以後の記録は親カテゴリを保持。
+  if (!columnExists(db, "vc_segments", "parent_id")) {
+    db.exec("ALTER TABLE vc_segments ADD COLUMN parent_id TEXT");
+  }
   return db;
+}
+
+/** テーブルに指定カラムが存在するか（冪等マイグレーション用） */
+function columnExists(db: Database.Database, table: string, column: string): boolean {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return cols.some((c) => c.name === column);
 }

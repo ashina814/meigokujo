@@ -87,19 +87,27 @@ function registerDen(services: Services, channelId: string, kind: string, reward
   services.db
     .prepare("INSERT INTO den_vcs (channel_id, kind, created_at) VALUES (?, ?, ?) ON CONFLICT(channel_id) DO NOTHING")
     .run(channelId, kind, Math.floor(Date.now() / 1000));
-  if (reward) {
-    const list = services.settings.getJson<string[]>("vc_whitelist_den", []);
-    if (!list.includes(channelId)) services.settings.set("vc_whitelist_den", [...list, channelId], "system:den");
+  // 浮上報酬はブラックリスト方式（全VC対象・除外だけ外す）に移行済み。
+  // 報酬対象の巣穴は何もしなくてよい（既定で対象）。
+  // 報酬対象外の応接室(reward=false)だけ、共用除外リスト xp_excluded_channels に載せて
+  // XP・浮上報酬の両方から外す（ツーショ評価は報酬・XPともに付けない）。
+  if (!reward) {
+    const excl = services.settings.getJson<string[]>("xp_excluded_channels", []);
+    if (!excl.includes(channelId)) services.settings.set("xp_excluded_channels", [...excl, channelId], "system:den");
   }
 }
 
-/** 空の複製VCを削除し、古い報酬対象登録を掃除する（刻時盤から毎分呼ぶ） */
+/** 空の複製VCを削除し、古い追跡登録を掃除する（刻時盤から毎分呼ぶ） */
 export async function scanDens(client: Client, services: Services): Promise<void> {
-  const rows = services.db.prepare("SELECT channel_id, created_at FROM den_vcs").all() as Array<{ channel_id: string; created_at: number }>;
+  const rows = services.db.prepare("SELECT channel_id, kind, created_at FROM den_vcs").all() as Array<{
+    channel_id: string;
+    kind: string;
+    created_at: number;
+  }>;
   if (rows.length === 0) return;
   const now = Math.floor(Date.now() / 1000);
-  const denWl = new Set(services.settings.getJson<string[]>("vc_whitelist_den", []));
-  let wlChanged = false;
+  const excl = new Set(services.settings.getJson<string[]>("xp_excluded_channels", []));
+  let exclChanged = false;
 
   for (const row of rows) {
     const ch = (await client.channels.fetch(row.channel_id).catch(() => null)) as VoiceChannel | null;
@@ -108,11 +116,12 @@ export async function scanDens(client: Client, services: Services): Promise<void
     if (ch && humans === 0 && now - row.created_at > DEN_GRACE_S) {
       await ch.delete("冥獣の巣: 無人のため撤収").catch((e) => console.error(`[den] 撤収失敗 ${row.channel_id}:`, e));
     }
-    // 報酬対象からの掃除は前日分の計算後（2日）に。VC自体が消えていても登録は残して報酬を保証
+    // 追跡登録の掃除は前日分の報酬計算後（2日）に。
+    // 応接室(reception)は除外リストに載せているので、掃除時に外す（除外リストに死にIDを残さない）。
     if (now - row.created_at > DEN_WHITELIST_KEEP_S) {
       services.db.prepare("DELETE FROM den_vcs WHERE channel_id = ?").run(row.channel_id);
-      if (denWl.delete(row.channel_id)) wlChanged = true;
+      if (row.kind === "reception" && excl.delete(row.channel_id)) exclChanged = true;
     }
   }
-  if (wlChanged) services.settings.set("vc_whitelist_den", [...denWl], "system:den");
+  if (exclChanged) services.settings.set("xp_excluded_channels", [...excl], "system:den");
 }
