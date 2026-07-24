@@ -61,10 +61,9 @@ fail() { echo "❌ $*" >&2; exit 1; }
 require() { command -v "$1" >/dev/null 2>&1 || fail "必要なコマンドがありません: $1"; }
 
 [[ "$EUID" -eq 0 ]] || fail "rootで実行してください: sudo /home/kabu/deploy.sh"
-for cmd in sudo git systemctl journalctl flock grep find sort id; do require "$cmd"; done
+for cmd in sudo git systemctl journalctl flock grep find sort; do require "$cmd"; done
 [[ -d "$REPO/.git" ]] || fail "Gitリポジトリがありません: $REPO"
 [[ -f "$BACKUP_SCRIPT" ]] || fail "バックアップスクリプトがありません: $BACKUP_SCRIPT"
-APP_GROUP="$(id -gn "$APP_USER")"
 
 exec 9>"$LOCK_FILE"
 flock -n 9 || fail "別のデプロイが実行中です: $LOCK_FILE"
@@ -99,7 +98,9 @@ if [[ -n "$DIRTY" ]]; then
   fail "未コミット差分があります。勝手に破棄せず、先に整理してください"
 fi
 BEFORE_SHA="$(as_app git rev-parse HEAD)"
-[[ -f "$STATE_FILE" ]] && DEPLOYED_SHA="$(tr -d '[:space:]' < "$STATE_FILE")"
+if [[ -f "$STATE_FILE" ]]; then
+  DEPLOYED_SHA="$(tr -d '[:space:]' < "$STATE_FILE")"
+fi
 
 STEP="リモートmainの取得"
 log "${REMOTE}/${BRANCH}を取得"
@@ -175,7 +176,7 @@ journalctl -u "$SERVICE" --since "$RESTART_AT" -n 120 --no-pager
 STEP="成功SHAの記録"
 AFTER_SHA="$(as_app git rev-parse HEAD)"
 printf '%s\n' "$AFTER_SHA" > "$STATE_FILE"
-chown "$APP_USER:$APP_GROUP" "$STATE_FILE"
+chown root:root "$STATE_FILE"
 chmod 0644 "$STATE_FILE"
 DEPLOYED_SHA="$AFTER_SHA"
 
