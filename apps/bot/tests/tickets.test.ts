@@ -84,6 +84,7 @@ function makeOpenTicketHarness(options: {
   openByUserPanel?: () => TicketRow | undefined;
   deferReply?: () => Promise<void>;
   addMember?: (memberId: string) => Promise<void>;
+  sendMessage?: () => Promise<void>;
 } = {}) {
   const p = options.panel ?? panel({ staffRoleIds: ["staff_role"] });
   const thread = {
@@ -91,7 +92,7 @@ function makeOpenTicketHarness(options: {
     members: {
       add: vi.fn(options.addMember ?? (async () => undefined)),
     },
-    send: vi.fn(async () => undefined),
+    send: vi.fn(options.sendMessage ?? (async () => undefined)),
     delete: vi.fn(async () => undefined),
     setLocked: vi.fn(async () => undefined),
     setArchived: vi.fn(async () => undefined),
@@ -108,15 +109,23 @@ function makeOpenTicketHarness(options: {
       getPanel: vi.fn(() => p),
       openByUserPanel: vi.fn(options.openByUserPanel ?? (() => undefined)),
       create: vi.fn(() => ticket({ thread_id: thread.id, panel_id: p.id, panel_name: p.name })),
+      rollbackCreate: vi.fn(() => ticket({ thread_id: thread.id, panel_id: p.id, panel_name: p.name })),
     },
   };
-  const interaction = {
+  const interaction: any = {
     user: { id: "user1", username: "user1", globalName: null },
     member: { displayName: "user1" },
     channel,
     guild: makeGuild(),
-    reply: vi.fn(async () => undefined),
-    deferReply: vi.fn(options.deferReply ?? (async () => undefined)),
+    deferred: false,
+    replied: false,
+    reply: vi.fn(async () => {
+      interaction.replied = true;
+    }),
+    deferReply: vi.fn(async () => {
+      await (options.deferReply ?? (async () => undefined))();
+      interaction.deferred = true;
+    }),
     editReply: vi.fn(async () => undefined),
   };
   return { interaction, services, channel, thread };
@@ -167,6 +176,8 @@ describe("汎用チケット受付パネル", () => {
     const first = makeOpenTicketHarness({ deferReply: () => gate.promise });
     const second = {
       ...first.interaction,
+      deferred: false,
+      replied: false,
       reply: vi.fn(async () => undefined),
       deferReply: vi.fn(async () => undefined),
       editReply: vi.fn(async () => undefined),
@@ -182,6 +193,17 @@ describe("汎用チケット受付パネル", () => {
     await p1;
     expect(first.channel.threads.create).toHaveBeenCalledTimes(1);
     expect(first.services.tickets.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("申請者本人しか担当ロールにいない場合はチケットを作成しない", async () => {
+    const h = makeOpenTicketHarness();
+    h.interaction.guild = makeGuild(["staff_role"], [{ id: "user1", roles: ["staff_role"] }]) as any;
+
+    await openTicket(h.interaction as any, h.services as any, "appeal");
+
+    expect(h.channel.threads.create).not.toHaveBeenCalled();
+    expect(h.services.tickets.create).not.toHaveBeenCalled();
+    expect(h.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("申請者以外") }));
   });
 
   it("担当者追加が全件失敗した場合はDB登録せず、作成済みスレッドを削除する", async () => {
@@ -215,5 +237,20 @@ describe("汎用チケット受付パネル", () => {
     expect(h.services.tickets.create).toHaveBeenCalledTimes(1);
     expect(h.thread.delete).not.toHaveBeenCalled();
     expect(h.thread.send).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("一部担当者") }));
+  });
+
+  it("初期メッセージ送信失敗時はDB登録を巻き戻し、作成済みスレッドを削除する", async () => {
+    const h = makeOpenTicketHarness({
+      sendMessage: async () => {
+        throw new Error("send failed");
+      },
+    });
+
+    await openTicket(h.interaction as any, h.services as any, "appeal");
+
+    expect(h.services.tickets.create).toHaveBeenCalledTimes(1);
+    expect(h.services.tickets.rollbackCreate).toHaveBeenCalledWith("thread1", "user:user1", "ticket initialization failed");
+    expect(h.thread.delete).toHaveBeenCalled();
+    expect(h.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("作成されていません") }));
   });
 });
