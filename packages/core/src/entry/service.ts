@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { Ledger, TREASURY } from "../ledger/service.js";
-import { Settings } from "../settings/service.js";
+import { SETTING_DEFAULTS, Settings } from "../settings/service.js";
 import { EventLog } from "../events/service.js";
 
 export type BookingStatus = "booked" | "attended" | "ghosted" | "dropped";
@@ -28,6 +28,8 @@ export interface SoulRow {
   eval_policy_version: string | null;
   eval_promotion_required: number | null;
   eval_demotion_threshold: number | null;
+  eval_invite_mark_per_person: number | null;
+  eval_invite_mark_cap: number | null;
   inviter_user_id: string | null;
   inviter_source: string | null;
   updated_at: number;
@@ -42,6 +44,16 @@ export interface GhostifyResult {
 
 const now = () => Math.floor(Date.now() / 1000);
 const DAY = 86_400;
+
+function positiveInt(value: unknown, fallback: number): number {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+function nonNegativeNumber(value: unknown, fallback: number): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
 
 /**
  * 入城導線（ボット設計.md 説明会予約制）。
@@ -94,6 +106,8 @@ export class Entry {
              eval_policy_version=NULL,
              eval_promotion_required=NULL,
              eval_demotion_threshold=NULL,
+             eval_invite_mark_per_person=NULL,
+             eval_invite_mark_cap=NULL,
              updated_at=?
          WHERE user_id=?`,
       )
@@ -193,18 +207,21 @@ export class Entry {
     }
 
     const deadline = ts + baseDays * DAY;
-    const promotionRequired = this.settings.getNumber("promotion_marks_required");
-    const demotionThreshold = this.settings.getNumber("demotion_marks_threshold");
+    const promotionRequired = positiveInt(this.settings.getNumber("promotion_marks_required"), SETTING_DEFAULTS.promotion_marks_required);
+    const demotionThreshold = positiveInt(this.settings.getNumber("demotion_marks_threshold"), SETTING_DEFAULTS.demotion_marks_threshold);
+    const inviteMarkPerPerson = nonNegativeNumber(this.settings.getNumber("invite_mark_per_person"), SETTING_DEFAULTS.invite_mark_per_person);
+    const inviteMarkCap = nonNegativeNumber(this.settings.getNumber("invite_mark_cap"), SETTING_DEFAULTS.invite_mark_cap);
     const policyVersion =
       this.settings.getString("eval_policy_version") ??
-      `manual:${promotionRequired}:${demotionThreshold}:${ts}`;
+      `manual:${promotionRequired}:${demotionThreshold}:${inviteMarkPerPerson}:${inviteMarkCap}:${ts}`;
     this.db
       .prepare(
         `INSERT INTO souls (
            user_id, status, joined_at, ghost_at, eval_deadline_at, eval_started_at,
-           eval_policy_version, eval_promotion_required, eval_demotion_threshold, updated_at
+           eval_policy_version, eval_promotion_required, eval_demotion_threshold,
+           eval_invite_mark_per_person, eval_invite_mark_cap, updated_at
          )
-         VALUES (?, 'ghost', ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, 'ghost', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET
            status = 'ghost', ghost_at = excluded.ghost_at,
            eval_deadline_at = excluded.eval_deadline_at,
@@ -212,9 +229,11 @@ export class Entry {
            eval_policy_version = excluded.eval_policy_version,
            eval_promotion_required = excluded.eval_promotion_required,
            eval_demotion_threshold = excluded.eval_demotion_threshold,
+           eval_invite_mark_per_person = excluded.eval_invite_mark_per_person,
+           eval_invite_mark_cap = excluded.eval_invite_mark_cap,
            updated_at = excluded.updated_at`,
       )
-      .run(userId, ts, ts, deadline, ts, policyVersion, promotionRequired, demotionThreshold, ts);
+      .run(userId, ts, ts, deadline, ts, policyVersion, promotionRequired, demotionThreshold, inviteMarkPerPerson, inviteMarkCap, ts);
 
     // 初期発行（冪等キーで二重発行不可）
     const grant = this.settings.getNumber("initial_grant");
@@ -260,7 +279,7 @@ export class Entry {
       payload: {
         deadline,
         granted: grantResult.duplicate ? 0 : grant,
-        evalPolicy: { version: policyVersion, promotionRequired, demotionThreshold, startedAt: ts },
+        evalPolicy: { version: policyVersion, promotionRequired, demotionThreshold, inviteMarkPerPerson, inviteMarkCap, startedAt: ts },
       },
     });
     return {
@@ -339,17 +358,20 @@ export class Entry {
     const ts = now();
     const applied: Record<string, number> = {};
     let ghostDeadlinesSet = 0;
-    const promotionRequired = this.settings.getNumber("promotion_marks_required");
-    const demotionThreshold = this.settings.getNumber("demotion_marks_threshold");
+    const promotionRequired = positiveInt(this.settings.getNumber("promotion_marks_required"), SETTING_DEFAULTS.promotion_marks_required);
+    const demotionThreshold = positiveInt(this.settings.getNumber("demotion_marks_threshold"), SETTING_DEFAULTS.demotion_marks_threshold);
+    const inviteMarkPerPerson = nonNegativeNumber(this.settings.getNumber("invite_mark_per_person"), SETTING_DEFAULTS.invite_mark_per_person);
+    const inviteMarkCap = nonNegativeNumber(this.settings.getNumber("invite_mark_cap"), SETTING_DEFAULTS.invite_mark_cap);
     const policyVersion =
       this.settings.getString("eval_policy_version") ??
-      `backfill:${promotionRequired}:${demotionThreshold}:${ts}`;
+      `backfill:${promotionRequired}:${demotionThreshold}:${inviteMarkPerPerson}:${inviteMarkCap}:${ts}`;
     const upsert = this.db.prepare(
       `INSERT INTO souls (
          user_id, status, joined_at, ghost_at, eval_deadline_at,
-         eval_started_at, eval_policy_version, eval_promotion_required, eval_demotion_threshold, updated_at
+         eval_started_at, eval_policy_version, eval_promotion_required, eval_demotion_threshold,
+         eval_invite_mark_per_person, eval_invite_mark_cap, updated_at
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET
          status = excluded.status, ghost_at = excluded.ghost_at,
          eval_deadline_at = excluded.eval_deadline_at,
@@ -357,6 +379,8 @@ export class Entry {
          eval_policy_version = COALESCE(souls.eval_policy_version, excluded.eval_policy_version),
          eval_promotion_required = COALESCE(souls.eval_promotion_required, excluded.eval_promotion_required),
          eval_demotion_threshold = COALESCE(souls.eval_demotion_threshold, excluded.eval_demotion_threshold),
+         eval_invite_mark_per_person = COALESCE(souls.eval_invite_mark_per_person, excluded.eval_invite_mark_per_person),
+         eval_invite_mark_cap = COALESCE(souls.eval_invite_mark_cap, excluded.eval_invite_mark_cap),
          updated_at = excluded.updated_at`,
     );
     const run = this.db.transaction(() => {
@@ -385,6 +409,8 @@ export class Entry {
           e.status === "ghost" ? policyVersion : null,
           e.status === "ghost" ? promotionRequired : null,
           e.status === "ghost" ? demotionThreshold : null,
+          e.status === "ghost" ? inviteMarkPerPerson : null,
+          e.status === "ghost" ? inviteMarkCap : null,
           ts,
         );
       }

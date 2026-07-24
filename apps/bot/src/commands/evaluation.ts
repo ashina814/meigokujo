@@ -245,6 +245,11 @@ export async function handleEvaluationSelect(
     await interaction.update({ content: "⌛ 期限切れです。もう一度 `/評価` からどうぞ。", components: [] });
     return;
   }
+  if (!isSwordsman(interaction, services)) {
+    pendingEvals.delete(interaction.user.id);
+    await interaction.reply({ content: "評価資格が確認できません。もう一度、現在のロールを確認してから `/評価` を実行してください。", flags: MessageFlags.Ephemeral });
+    return;
+  }
   const key = interaction.customId.split(":")[2];
   const value = interaction.values[0];
   if (!key || !value) return;
@@ -356,6 +361,11 @@ export async function handleEvaluationModal(
   const pending = pendingEvals.get(interaction.user.id);
   if (!pending?.conclusion) {
     await interaction.reply({ content: "⌛ 期限切れです。もう一度 `/評価` からどうぞ。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!isSwordsman(interaction, services)) {
+    pendingEvals.delete(interaction.user.id);
+    await interaction.reply({ content: "評価資格が確認できません。評価は記録されませんでした。", flags: MessageFlags.Ephemeral });
     return;
   }
   pendingEvals.delete(interaction.user.id);

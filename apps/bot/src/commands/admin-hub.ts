@@ -418,6 +418,14 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       await interaction.reply({ content: "数値を入れてください。", flags: MessageFlags.Ephemeral });
       return;
     }
+    if (POSITIVE_INTEGER_NUMBER_KEYS.has(key) && (!Number.isInteger(n) || n <= 0)) {
+      await interaction.reply({ content: "昇格印・低評価印の必要数は、1以上の整数で入力してください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (NON_NEGATIVE_NUMBER_KEYS.has(key) && n < 0) {
+      await interaction.reply({ content: "招待印の換算値・上限は、0以上の数値で入力してください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
     services.settings.set(key, n, `user:${interaction.user.id}`);
     await interaction.reply({ content: `✅ **${key}** = ${n.toLocaleString()} に設定しました。`, flags: MessageFlags.Ephemeral });
     return;
@@ -786,6 +794,9 @@ const NUMBER_KEYS: Array<[string, string]> = [
   ["confession_body_retention_days", "トート本文の保持日数"],
   ["confession_court_retention_days", "トート送致案件の本文保持日数"],
 ];
+
+const POSITIVE_INTEGER_NUMBER_KEYS = new Set(["promotion_marks_required", "demotion_marks_threshold"]);
+const NON_NEGATIVE_NUMBER_KEYS = new Set(["invite_mark_per_person", "invite_mark_cap"]);
 
 async function openNumberSetup(interaction: ButtonInteraction, _services: Services) {
   const menu = new StringSelectMenuBuilder()

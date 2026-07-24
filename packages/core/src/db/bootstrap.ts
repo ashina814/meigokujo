@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS souls (
   eval_policy_version TEXT,
   eval_promotion_required INTEGER,
   eval_demotion_threshold INTEGER,
+  eval_invite_mark_per_person REAL,
+  eval_invite_mark_cap REAL,
   inviter_user_id     TEXT,
   inviter_source      TEXT,
   updated_at          INTEGER NOT NULL
@@ -453,6 +455,9 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "souls", "eval_policy_version", "TEXT");
   ensureColumn(db, "souls", "eval_promotion_required", "INTEGER");
   ensureColumn(db, "souls", "eval_demotion_threshold", "INTEGER");
+  ensureColumn(db, "souls", "eval_invite_mark_per_person", "REAL");
+  ensureColumn(db, "souls", "eval_invite_mark_cap", "REAL");
+  backfillEvaluationMarkWeights(db);
   backfillEvaluationPolicySnapshots(db);
   return db;
 }
@@ -467,20 +472,45 @@ function settingNumber(db: Database.Database, key: string, fallback: number): nu
   const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;
   if (!row) return fallback;
   const value = Number(row.value);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function settingNonNegativeNumber(db: Database.Database, key: string, fallback: number): number {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;
+  if (!row) return fallback;
+  const value = Number(row.value);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function backfillEvaluationMarkWeights(db: Database.Database): void {
+  db.prepare(
+    `UPDATE evaluations
+     SET mark_weight = CASE
+       WHEN conclusion = 'none' THEN 0
+       ELSE COALESCE((SELECT weight FROM marks WHERE marks.id = evaluations.mark_id), 1)
+     END
+     WHERE mark_weight = 0`,
+  ).run();
 }
 
 function backfillEvaluationPolicySnapshots(db: Database.Database): void {
   const promotionRequired = settingNumber(db, "promotion_marks_required", 5);
   const demotionThreshold = settingNumber(db, "demotion_marks_threshold", 4);
+  const inviteMarkPerPerson = settingNonNegativeNumber(db, "invite_mark_per_person", 0.5);
+  const inviteMarkCap = settingNonNegativeNumber(db, "invite_mark_cap", 1.0);
   const ts = Math.floor(Date.now() / 1000);
   db.prepare(
     `UPDATE souls
      SET eval_started_at = COALESCE(eval_started_at, ghost_at, updated_at, ?),
          eval_policy_version = COALESCE(eval_policy_version, ?),
          eval_promotion_required = COALESCE(eval_promotion_required, ?),
-         eval_demotion_threshold = COALESCE(eval_demotion_threshold, ?)
+         eval_demotion_threshold = COALESCE(eval_demotion_threshold, ?),
+         eval_invite_mark_per_person = COALESCE(eval_invite_mark_per_person, ?),
+         eval_invite_mark_cap = COALESCE(eval_invite_mark_cap, ?)
      WHERE status = 'ghost'
-       AND (eval_promotion_required IS NULL OR eval_demotion_threshold IS NULL)`,
-  ).run(ts, `migration:${ts}`, promotionRequired, demotionThreshold);
+       AND (
+         eval_promotion_required IS NULL OR eval_demotion_threshold IS NULL
+         OR eval_invite_mark_per_person IS NULL OR eval_invite_mark_cap IS NULL
+       )`,
+  ).run(ts, `migration:${ts}`, promotionRequired, demotionThreshold, inviteMarkPerPerson, inviteMarkCap);
 }

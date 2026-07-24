@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { Settings } from "../settings/service.js";
+import { SETTING_DEFAULTS, Settings } from "../settings/service.js";
 import { EventLog } from "../events/service.js";
 
 export type Conclusion = "promotion" | "demotion" | "none";
@@ -29,6 +29,8 @@ export interface PromotionScore {
 export interface EvalThresholds {
   promotionRequired: number;
   demotionThreshold: number;
+  inviteMarkPerPerson: number;
+  inviteMarkCap: number;
   policyVersion: string;
   startedAt: number | null;
   snapshotted: boolean;
@@ -77,6 +79,11 @@ function positiveInt(value: unknown): number | null {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
+function nonNegativeNumber(value: unknown): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
 /**
  * 印台帳 + 評価（ボット設計.md 評価・印・招待トラッキング）。
  * 昇格印5個（うち招待で最大1個）で面談待ち、低評価印4個で迷霊即落ち。閾値・換算値はすべて設定値。
@@ -94,6 +101,7 @@ export class Evaluation {
     const row = this.db
       .prepare(
         `SELECT eval_started_at, eval_policy_version, eval_promotion_required, eval_demotion_threshold
+              , eval_invite_mark_per_person, eval_invite_mark_cap
          FROM souls WHERE user_id = ?`,
       )
       .get(targetId) as
@@ -102,18 +110,30 @@ export class Evaluation {
           eval_policy_version: string | null;
           eval_promotion_required: number | null;
           eval_demotion_threshold: number | null;
+          eval_invite_mark_per_person: number | null;
+          eval_invite_mark_cap: number | null;
         }
       | undefined;
-    const currentPromotion = this.settings.getNumber("promotion_marks_required");
-    const currentDemotion = this.settings.getNumber("demotion_marks_threshold");
+    const currentPromotion = positiveInt(this.settings.getNumber("promotion_marks_required")) ?? SETTING_DEFAULTS.promotion_marks_required;
+    const currentDemotion = positiveInt(this.settings.getNumber("demotion_marks_threshold")) ?? SETTING_DEFAULTS.demotion_marks_threshold;
+    const currentInvitePer = nonNegativeNumber(this.settings.getNumber("invite_mark_per_person")) ?? SETTING_DEFAULTS.invite_mark_per_person;
+    const currentInviteCap = nonNegativeNumber(this.settings.getNumber("invite_mark_cap")) ?? SETTING_DEFAULTS.invite_mark_cap;
     const promotionRequired = positiveInt(row?.eval_promotion_required) ?? currentPromotion;
     const demotionThreshold = positiveInt(row?.eval_demotion_threshold) ?? currentDemotion;
+    const inviteMarkPerPerson = nonNegativeNumber(row?.eval_invite_mark_per_person) ?? currentInvitePer;
+    const inviteMarkCap = nonNegativeNumber(row?.eval_invite_mark_cap) ?? currentInviteCap;
     return {
       promotionRequired,
       demotionThreshold,
-      policyVersion: row?.eval_policy_version ?? `current:${currentPromotion}:${currentDemotion}`,
+      inviteMarkPerPerson,
+      inviteMarkCap,
+      policyVersion: row?.eval_policy_version ?? `current:${currentPromotion}:${currentDemotion}:${currentInvitePer}:${currentInviteCap}`,
       startedAt: row?.eval_started_at ?? null,
-      snapshotted: row?.eval_promotion_required !== null && row?.eval_demotion_threshold !== null,
+      snapshotted:
+        row?.eval_promotion_required != null &&
+        row?.eval_demotion_threshold != null &&
+        row?.eval_invite_mark_per_person != null &&
+        row?.eval_invite_mark_cap != null,
     };
   }
 
@@ -145,8 +165,9 @@ export class Evaluation {
     const inviteCount = (
       this.db.prepare("SELECT COUNT(*) AS c FROM invites WHERE inviter_id = ?").get(targetId) as { c: number }
     ).c;
-    const per = this.settings.getNumber("invite_mark_per_person");
-    const cap = this.settings.getNumber("invite_mark_cap");
+    const thresholds = this.thresholdsFor(targetId);
+    const per = thresholds.inviteMarkPerPerson;
+    const cap = thresholds.inviteMarkCap;
     const inviteScore = Math.min(inviteCount * per, cap);
     return { evalMarks, inviteCount, inviteScore, total: evalMarks + inviteScore };
   }
@@ -171,41 +192,45 @@ export class Evaluation {
     threadId?: string;
   }): SubmitResult {
     const markWeight = input.conclusion === "none" ? 0 : (positiveInt(input.markWeight) ?? 1);
-    // 同一評価員の再評価は上書き: 同じ評価員が同じ対象に付けた既存の印を取り消してから記帳する
-    // （1評価員=最新の結論1つだけが有効。評価の履歴自体は evaluations に追記で残る）
-    const superseded = this.db
-      .prepare(
-        "UPDATE marks SET revoked_at = ? WHERE target_id = ? AND granted_by = ? AND ref = 'evaluation' AND revoked_at IS NULL",
-      )
-      .run(now(), input.targetId, input.evaluatorId);
-    if (superseded.changes > 0) {
-      this.events.log("mark_superseded", {
-        actor: input.evaluatorId,
-        target: input.targetId,
-        payload: { count: superseded.changes },
-      });
-    }
+    const insertEvaluation = this.db.transaction(() => {
+      const ts = now();
+      // 同一評価員の再評価は上書き: 同じ評価員が同じ対象に付けた既存の印を取り消してから記帳する
+      // （1評価員=最新の結論1つだけが有効。評価の履歴自体は evaluations に追記で残る）
+      const superseded = this.db
+        .prepare(
+          "UPDATE marks SET revoked_at = ? WHERE target_id = ? AND granted_by = ? AND ref = 'evaluation' AND revoked_at IS NULL",
+        )
+        .run(ts, input.targetId, input.evaluatorId);
+      if (superseded.changes > 0) {
+        this.events.log("mark_superseded", {
+          actor: input.evaluatorId,
+          target: input.targetId,
+          payload: { count: superseded.changes },
+        });
+      }
 
-    let markId: number | null = null;
-    if (input.conclusion !== "none") {
-      markId = this.addMark(input.targetId, input.conclusion, input.evaluatorId, "evaluation", markWeight);
-    }
-    const result = this.db
-      .prepare(
-        `INSERT INTO evaluations (target_id, evaluator_id, scores_json, texts_json, conclusion, mark_id, mark_weight, thread_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        input.targetId,
-        input.evaluatorId,
-        JSON.stringify(input.scores),
-        JSON.stringify(input.texts),
-        input.conclusion,
-        markId,
-        markWeight,
-        input.threadId ?? null,
-        now(),
-      );
+      let markId: number | null = null;
+      if (input.conclusion !== "none") {
+        markId = this.addMark(input.targetId, input.conclusion, input.evaluatorId, "evaluation", markWeight);
+      }
+      return this.db
+        .prepare(
+          `INSERT INTO evaluations (target_id, evaluator_id, scores_json, texts_json, conclusion, mark_id, mark_weight, thread_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.targetId,
+          input.evaluatorId,
+          JSON.stringify(input.scores),
+          JSON.stringify(input.texts),
+          input.conclusion,
+          markId,
+          markWeight,
+          input.threadId ?? null,
+          ts,
+        );
+    });
+    const result = insertEvaluation();
 
     const promotion = this.promotionScore(input.targetId);
     const demotionCount = this.demotionCount(input.targetId);
