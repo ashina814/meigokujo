@@ -16,9 +16,10 @@ import {
   type ForumChannel,
   type GuildMember,
 } from "discord.js";
-import type { Conclusion, EvalScores } from "@meigokujo/core";
+import type { Conclusion, EvalScores, PreviousEvaluation } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
 import { refreshEvalStatsForUser } from "../eval-daily.js";
+import { markWeightLimitForRoleIds } from "../evaluation-rules.js";
 import type { Services } from "../services.js";
 
 const AXES = [
@@ -59,10 +60,133 @@ interface PendingEval {
   targetId: string;
   scores: Partial<Record<(typeof AXES)[number][0], number>>;
   conclusion?: Conclusion;
+  markWeight?: number;
+  maxMarkWeight?: number;
+  previous?: PreviousEvaluation;
 }
 
 /** 評価員ごとの入力途中状態（送信までスレッドには何も出ない） */
 const pendingEvals = new Map<string, PendingEval>();
+
+function markCapsByRole(services: Services): Record<string, number> {
+  const raw = services.settings.getJson<Record<string, unknown>>("eval_mark_caps_by_role", {});
+  return Object.fromEntries(
+    Object.entries(raw)
+      .map(([roleId, value]) => [roleId, Math.trunc(Number(value))] as const)
+      .filter(([, value]) => Number.isInteger(value) && value > 0),
+  );
+}
+
+function maxMarkWeightForMember(member: GuildMember | null, services: Services): number {
+  if (!member) return 1;
+  return markWeightLimitForRoleIds(member.roles.cache.keys(), markCapsByRole(services));
+}
+
+function renderEvaluationRows(pending: PendingEval): ActionRowBuilder<StringSelectMenuBuilder>[] {
+  const rows = AXES.map(([key, label]) =>
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`eval:s:${key}`)
+        .setPlaceholder(`${label}（1〜5点）${pending.scores[key] ? `: 現在 ${pending.scores[key]}点` : ""}`)
+        .addOptions([1, 2, 3, 4, 5].map((n) => ({ label: `${label}: ${n}点`, value: String(n), default: pending.scores[key] === n }))),
+    ),
+  );
+  rows.push(
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId("eval:s:conclusion")
+        .setPlaceholder(
+          pending.conclusion
+            ? `結論: ${CONCLUSIONS.find(([v]) => v === pending.conclusion)?.[1] ?? pending.conclusion}`
+            : "結論（最後に選ぶとコメント入力へ進みます）",
+        )
+        .addOptions(CONCLUSIONS.map(([value, label]) => ({ label, value, default: pending.conclusion === value }))),
+    ),
+  );
+  return rows;
+}
+
+function prefillFromPrevious(pending: PendingEval, previous: PreviousEvaluation): void {
+  pending.scores = { ...previous.scores };
+  pending.conclusion = previous.conclusion;
+  pending.markWeight = previous.markWeight;
+}
+
+function modalFromPending(pending: PendingEval, inheritTexts = false): ModalBuilder {
+  const texts = inheritTexts ? pending.previous?.texts : undefined;
+  const input = (id: keyof NonNullable<typeof texts>, label: string, style: TextInputStyle, required: boolean, maxLength: number) => {
+    const builder = new TextInputBuilder()
+      .setCustomId(id)
+      .setLabel(label)
+      .setStyle(style)
+      .setRequired(required)
+      .setMaxLength(maxLength);
+    const value = texts?.[id];
+    if (value) builder.setValue(value.slice(0, maxLength));
+    return builder;
+  };
+  return new ModalBuilder()
+    .setCustomId("eval:modal")
+    .setTitle("評価コメント")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        input("detail", "詳細（声・コミュ力・浮上率・鯖理解度）", TextInputStyle.Paragraph, true, 1000),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(input("merit", "鯖メリット", TextInputStyle.Paragraph, false, 500)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(input("concern", "不安点", TextInputStyle.Paragraph, false, 500)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(input("feedback", "フィードバック", TextInputStyle.Paragraph, false, 500)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(input("others", "評価高い人・低い人", TextInputStyle.Short, false, 200)),
+    );
+}
+
+async function continueAfterConclusion(interaction: StringSelectMenuInteraction, services: Services, pending: PendingEval): Promise<void> {
+  const member = interaction.member as GuildMember | null;
+  const maxWeight = maxMarkWeightForMember(member, services);
+  pending.maxMarkWeight = maxWeight;
+  if (pending.conclusion === "none") {
+    pending.markWeight = 0;
+    await showDraftChoiceOrModal(interaction, pending);
+    return;
+  }
+  const inherited = Math.min(Math.max(pending.markWeight ?? 1, 1), maxWeight);
+  if (maxWeight <= 1) {
+    pending.markWeight = 1;
+    await showDraftChoiceOrModal(interaction, pending);
+    return;
+  }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("eval:s:markWeight")
+    .setPlaceholder(`印数を選んでください（上限 ${maxWeight}印）`)
+    .addOptions(
+      Array.from({ length: maxWeight }, (_, i) => i + 1).map((n) => ({
+        label: `${n}印`,
+        value: String(n),
+        default: inherited === n,
+      })),
+    );
+  await interaction.update({
+    content: `結論を受け付けました。今回付ける印数を選んでください（あなたの現在の上限: ${maxWeight}印）。`,
+    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
+  });
+}
+
+async function showDraftChoiceOrModal(interaction: StringSelectMenuInteraction, pending: PendingEval): Promise<void> {
+  if (!pending.previous) {
+    await interaction.showModal(modalFromPending(pending));
+    return;
+  }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("eval:s:draft")
+    .setPlaceholder("コメント入力の開始方法を選んでください")
+    .addOptions([
+      { label: "前回内容を引き継いで編集", value: "inherit" },
+      { label: "新しく書く", value: "fresh" },
+    ]);
+  await interaction.update({
+    content: "前回の評価履歴があります。コメント欄へ前回内容を入れて編集するか、新規入力するか選んでください。",
+    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
+  });
+}
 
 export async function handleEvaluationCommand(
   interaction: ChatInputCommandInteraction,
@@ -78,28 +202,35 @@ export async function handleEvaluationCommand(
     return;
   }
 
-  pendingEvals.set(interaction.user.id, { targetId: target.id, scores: {} });
+  const previous = services.evaluation.latestByEvaluator(target.id, interaction.user.id);
+  const pending: PendingEval = {
+    targetId: target.id,
+    scores: {},
+    previous,
+    maxMarkWeight: maxMarkWeightForMember(interaction.member as GuildMember | null, services),
+  };
+  pendingEvals.set(interaction.user.id, pending);
 
-  const rows = AXES.map(([key, label]) =>
-    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId(`eval:s:${key}`)
-        .setPlaceholder(`${label}（1〜5点）`)
-        .addOptions([1, 2, 3, 4, 5].map((n) => ({ label: `${label}: ${n}点`, value: String(n) }))),
-    ),
-  );
-  rows.push(
-    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId("eval:s:conclusion")
-        .setPlaceholder("結論（最後に選ぶとコメント入力へ進みます）")
-        .addOptions(CONCLUSIONS.map(([value, label]) => ({ label, value }))),
-    ),
-  );
+  if (previous) {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId("eval:s:prefill")
+      .setPlaceholder("前回内容を引き継ぎますか？")
+      .addOptions([
+        { label: "前回内容を引き継ぐ", value: "inherit", description: "4項目・結論・印数を初期値にします" },
+        { label: "新規入力する", value: "fresh", description: "空の状態から評価します" },
+      ]);
+    await interaction.reply({
+      content: `📝 <@${target.id}> の前回評価があります。引き継ぎ方法を選んでください。`,
+      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
+      flags: MessageFlags.Ephemeral,
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
 
   await interaction.reply({
-    content: `📝 <@${target.id}> の評価。4項目の点数を選び、最後に結論を選んでください。`,
-    components: rows,
+    content: `📝 <@${target.id}> の評価。4項目の点数を選び、最後に結論を選んでください。印の上限: ${pending.maxMarkWeight}印。`,
+    components: renderEvaluationRows(pending),
     flags: MessageFlags.Ephemeral,
     allowedMentions: { parse: [] },
   });
@@ -114,11 +245,41 @@ export async function handleEvaluationSelect(
     await interaction.update({ content: "⌛ 期限切れです。もう一度 `/評価` からどうぞ。", components: [] });
     return;
   }
+  if (!isSwordsman(interaction, services)) {
+    pendingEvals.delete(interaction.user.id);
+    await interaction.reply({ content: "評価資格が確認できません。もう一度、現在のロールを確認してから `/評価` を実行してください。", flags: MessageFlags.Ephemeral });
+    return;
+  }
   const key = interaction.customId.split(":")[2];
   const value = interaction.values[0];
   if (!key || !value) return;
 
+  if (key === "prefill") {
+    if (value === "inherit" && pending.previous) prefillFromPrevious(pending, pending.previous);
+    await interaction.update({
+      content: `📝 <@${pending.targetId}> の評価。4項目の点数を確認・必要なら変更し、最後に結論を選んでください。印の上限: ${pending.maxMarkWeight ?? 1}印。`,
+      components: renderEvaluationRows(pending),
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
+
   if (key !== "conclusion") {
+    if (key === "markWeight") {
+      const max = pending.maxMarkWeight ?? maxMarkWeightForMember(interaction.member as GuildMember | null, services);
+      const n = Number(value);
+      if (!Number.isInteger(n) || n < 1 || n > max) {
+        await interaction.reply({ content: `印数が上限を超えています（現在の上限: ${max}印）。`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      pending.markWeight = n;
+      await showDraftChoiceOrModal(interaction, pending);
+      return;
+    }
+    if (key === "draft") {
+      await interaction.showModal(modalFromPending(pending, value === "inherit"));
+      return;
+    }
     pending.scores[key as (typeof AXES)[number][0]] = Number(value);
     await interaction.deferUpdate();
     return;
@@ -134,28 +295,7 @@ export async function handleEvaluationSelect(
     return;
   }
   pending.conclusion = value as Conclusion;
-
-  const modal = new ModalBuilder()
-    .setCustomId("eval:modal")
-    .setTitle("評価コメント")
-    .addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("detail").setLabel("詳細（声・コミュ力・浮上率・鯖理解度）").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1000),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("merit").setLabel("鯖メリット").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("concern").setLabel("不安点").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("feedback").setLabel("フィードバック").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("others").setLabel("評価高い人・低い人").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200),
-      ),
-    );
-  await interaction.showModal(modal);
+  await continueAfterConclusion(interaction, services, pending);
 }
 
 // ---- 送信（モーダル）→ フォーラム投稿・印台帳・閾値アクション ----
@@ -195,6 +335,7 @@ async function ensureEvalThread(
   const presence = services.vc.presence(targetId, 14, whitelist.length > 0 ? whitelist : undefined);
   const hours = Math.floor(presence.totalSeconds / 3600);
   const mins = Math.floor((presence.totalSeconds % 3600) / 60);
+  const thresholds = services.evaluation.thresholdsFor(targetId);
 
   const thread = await forum.threads.create({
     name: threadTitleFor(member?.displayName ?? targetId, soul?.eval_deadline_at),
@@ -202,6 +343,7 @@ async function ensureEvalThread(
       content: [
         `📄 対象者: <@${targetId}>`,
         `入城: ${soul?.ghost_at ? `<t:${soul.ghost_at}:D>` : "—"} / 審判期限: ${soul?.eval_deadline_at ? `<t:${soul.eval_deadline_at}:D>` : "—"}`,
+        `適用基準: 昇格印 **${thresholds.promotionRequired}** / 低評価印 **${thresholds.demotionThreshold}**`,
         `浮上実績（直近14日・評価対象VC）: **${hours}時間${mins}分 / 出現${presence.daysSeen}日**`,
       ].join("\n"),
     },
@@ -221,6 +363,11 @@ export async function handleEvaluationModal(
     await interaction.reply({ content: "⌛ 期限切れです。もう一度 `/評価` からどうぞ。", flags: MessageFlags.Ephemeral });
     return;
   }
+  if (!isSwordsman(interaction, services)) {
+    pendingEvals.delete(interaction.user.id);
+    await interaction.reply({ content: "評価資格が確認できません。評価は記録されませんでした。", flags: MessageFlags.Ephemeral });
+    return;
+  }
   pendingEvals.delete(interaction.user.id);
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -233,6 +380,14 @@ export async function handleEvaluationModal(
   };
   const scores = pending.scores as EvalScores;
   const total = scores.voice + scores.communication + scores.presence + scores.understanding;
+  const maxMarkWeight = maxMarkWeightForMember(interaction.member as GuildMember | null, services);
+  const markWeight = pending.conclusion === "none" ? 0 : (pending.markWeight ?? 1);
+  if (markWeight > maxMarkWeight) {
+    await interaction.editReply(
+      `❌ 現在のロール設定では ${markWeight}印 は付けられません（上限: ${maxMarkWeight}印）。もう一度 \`/評価\` からやり直してください。`,
+    );
+    return;
+  }
 
   const thread = await ensureEvalThread(interaction, services, pending.targetId);
   const result = services.evaluation.submitEvaluation({
@@ -241,6 +396,7 @@ export async function handleEvaluationModal(
     scores,
     texts,
     conclusion: pending.conclusion,
+    markWeight,
     threadId: thread?.id,
   });
 
@@ -260,8 +416,8 @@ export async function handleEvaluationModal(
           texts.feedback ? `**フィードバック** ${texts.feedback}` : "",
           texts.others ? `**評価高い人・低い人** ${texts.others}` : "",
           "",
-          `**結論**: ${CONCLUSIONS.find(([v]) => v === pending.conclusion)?.[1]}`,
-          `現在 — 昇格印 **${result.promotion.total}/5**（うち招待 ${result.promotion.inviteScore}）・低評価印 **${result.demotionCount}/4**・評価 ${services.evaluation.evaluationCount(pending.targetId)}件`,
+          `**結論**: ${CONCLUSIONS.find(([v]) => v === pending.conclusion)?.[1]}${markWeight > 0 ? `（${markWeight}印）` : ""}`,
+          `現在 — 昇格印 **${result.promotion.total}/${result.thresholds.promotionRequired}**（うち招待 ${result.promotion.inviteScore}）・低評価印 **${result.demotionCount}/${result.thresholds.demotionThreshold}**・評価 ${services.evaluation.evaluationCount(pending.targetId)}件`,
           `浮上実績（直近14日）: ${Math.floor(presence.totalSeconds / 3600)}時間${Math.floor((presence.totalSeconds % 3600) / 60)}分 / 出現${presence.daysSeen}日`,
         ]
           .filter(Boolean)
@@ -275,8 +431,8 @@ export async function handleEvaluationModal(
   const guild = interaction.guild!;
   const notes: string[] = [];
   if (result.demotionReached) {
-    await executeDemotion(services, guild, pending.targetId, "低評価印4個到達（即落ちルール）");
-    notes.push("⚠️ 低評価印4個に到達 → **迷霊落ちを執行しました**");
+    await executeDemotion(services, guild, pending.targetId, `低評価印${result.thresholds.demotionThreshold}個到達（即落ちルール）`);
+    notes.push(`⚠️ 低評価印${result.thresholds.demotionThreshold}個に到達 → **迷霊落ちを執行しました**`);
   } else if (result.promotionReached) {
     const mendanRoleId = services.settings.getString("role:mendan");
     const member = await guild.members.fetch(pending.targetId).catch(() => null);
@@ -289,17 +445,17 @@ export async function handleEvaluationModal(
       const channel = await guild.client.channels.fetch(callChId).catch(() => null);
       if (channel?.isTextBased() && "send" in channel) {
         await channel.send(
-          `⚔️ ${shinRoleId ? `<@&${shinRoleId}> ` : ""}<@${pending.targetId}> の昇格印が **5個** に到達しました。昇格面談をお願いします。`,
+          `⚔️ ${shinRoleId ? `<@&${shinRoleId}> ` : ""}<@${pending.targetId}> の昇格印が **${result.promotion.total}/${result.thresholds.promotionRequired}** に到達しました。昇格面談をお願いします。`,
         );
       }
     }
-    notes.push("🎉 昇格印5個に到達 → 面談待ちロールを付与し、昇格面談呼び出しチャンネルに通知しました");
+    notes.push(`🎉 昇格印${result.thresholds.promotionRequired}個に到達 → 面談待ちロールを付与し、昇格面談呼び出しチャンネルに通知しました`);
   }
 
   await interaction.editReply({
     content: [
       `✅ 評価を投稿しました${thread ? `: ${thread.toString()}` : "（評価フォーラム未設定のため記録のみ）"}`,
-      `昇格印 **${result.promotion.total}/5** ・ 低評価印 **${result.demotionCount}/4**`,
+      `昇格印 **${result.promotion.total}/${result.thresholds.promotionRequired}** ・ 低評価印 **${result.demotionCount}/${result.thresholds.demotionThreshold}**`,
       ...notes,
     ].join("\n"),
   });

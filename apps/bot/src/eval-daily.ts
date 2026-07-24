@@ -16,6 +16,7 @@ function buildStarterContent(
   presenceDays: number,
   balance: number,
   basePeriodDays: number,
+  thresholds: { promotionRequired: number; demotionThreshold: number; policyVersion: string; startedAt: number | null },
 ): string {
   // 延長合計は期限から逆算する（招待 eval_extension_days だけでなく、
   // ショップ購入・運営手動の延長も漏れなく表示するため）
@@ -32,6 +33,7 @@ function buildStarterContent(
     `📄 **${displayName}** の評価スレッド`,
     `入城: ${soul.ghost_at ? `<t:${soul.ghost_at}:D>` : "—"} / 審判期限: ${soul.eval_deadline_at ? `<t:${soul.eval_deadline_at}:D>（<t:${soul.eval_deadline_at}:R>）` : "—"}`,
     `期限の延長: ${extLine}`,
+    `適用基準: 昇格印 **${thresholds.promotionRequired}** / 低評価印 **${thresholds.demotionThreshold}**${thresholds.startedAt ? `（開始 <t:${thresholds.startedAt}:D>）` : ""}`,
     `**浮上実績（直近14日・評価対象VC）**: ${presenceHours}時間${presenceMins}分 / 出現${presenceDays}日`,
     `通算残高: ${fmtLd(balance)}`,
     `-# 実績部は毎日05:30に自動更新されます`,
@@ -61,7 +63,8 @@ async function refreshOne(guild: Guild, services: Services, userId: string): Pro
   const mins = Math.floor((presence.totalSeconds % 3600) / 60);
   const balance = services.ledger.balanceOf(`user:${userId}`);
   const basePeriodDays = services.settings.getNumber("eval_base_period_days");
-  const content = buildStarterContent(displayName, soul, hours, mins, presence.daysSeen, balance, basePeriodDays);
+  const thresholds = services.evaluation.thresholdsFor(userId);
+  const content = buildStarterContent(displayName, soul, hours, mins, presence.daysSeen, balance, basePeriodDays, thresholds);
 
   // Forum スレッドの起点メッセージ ID はスレッド ID と同じ
   const starter = await thread.messages.fetch(threadId).catch(() => null);

@@ -86,7 +86,17 @@ export {
   type AssigneeRow,
   type EmergencyRow,
 } from "./confession/service.js";
-export { Evaluation, type Conclusion, type EvalScores, type EvalTexts, type PromotionScore, type SubmitResult, type SoulDeadlineRow } from "./evaluation/service.js";
+export {
+  Evaluation,
+  type Conclusion,
+  type EvalScores,
+  type EvalTexts,
+  type EvalThresholds,
+  type PreviousEvaluation,
+  type PromotionScore,
+  type SubmitResult,
+  type SoulDeadlineRow,
+} from "./evaluation/service.js";
 export { VcRewards, type DailyReward, type RewardScope } from "./vc/rewards.js";
 export { Rooms, RoomError, type RoomRow, type RecruitRow, type RoomKind, type RoomErrorCode } from "./rooms/service.js";
 export { TitleEngine, TitleHelper, TITLE_RULES, type TitleRule, type GrantedTitle } from "./titles/service.js";
