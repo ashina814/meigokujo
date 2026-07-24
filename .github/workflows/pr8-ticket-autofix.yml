@@ -1,10 +1,9 @@
 name: PR8 ticket safety autofix
 
 on:
-  push:
-    branches: [agent/generic-ticket-panels]
-    paths:
-      - .github/workflows/pr8-ticket-autofix.yml
+  pull_request:
+    branches: [main]
+    types: [synchronize]
 
 permissions:
   contents: write
