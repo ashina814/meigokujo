@@ -43,6 +43,10 @@ function message(kind: "disboard" | "dissoku", overrides: Record<string, unknown
       name: isDisboard ? "bump" : "up",
       user: { id: "user-1", bot: false },
     },
+    interaction: {
+      commandName: isDisboard ? "bump" : "up",
+      user: { id: "user-1", bot: false },
+    },
     embeds: isDisboard
       ? [
           {
@@ -127,10 +131,23 @@ describe("bump/up メッセージ検知", () => {
   });
 
   it.each([
+    ["Bot ID不一致", { author: { bot: true, id: "other-bot" } }],
     ["Guild不一致", { guildId: "other-guild" }],
     ["Channel不一致", { channelId: "other-channel" }],
-    ["コマンド不一致", { interactionMetadata: { name: "other", user: { id: "user-1", bot: false } } }],
-    ["実行者なし", { interactionMetadata: { name: "up", user: undefined } }],
+    [
+      "コマンド不一致",
+      {
+        interactionMetadata: { name: "other", user: { id: "user-1", bot: false } },
+        interaction: { commandName: "other", user: { id: "user-1", bot: false } },
+      },
+    ],
+    [
+      "実行者なし",
+      {
+        interactionMetadata: { user: undefined },
+        interaction: { commandName: "up", user: undefined },
+      },
+    ],
   ])("%sを拒否する", async (_label, override) => {
     const s = services();
     const m = message("dissoku", override);
