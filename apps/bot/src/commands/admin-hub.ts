@@ -159,9 +159,14 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   // ── 計器盤 ──
   if (section === "dashboard" && !action) {
     await interaction.deferUpdate();
-    await updateDashboard(interaction.client, services).catch(() => undefined);
+    const result = await updateDashboard(interaction.client, services).catch((e): { ok: false; reason: string } => {
+      console.error("[計器盤] 手動更新に失敗:", e);
+      return { ok: false, reason: e instanceof Error ? e.message : "不明なエラー" };
+    });
     await interaction.editReply({
-      content: "📊 計器盤を更新しました。",
+      content: result.ok
+        ? "📊 計器盤を更新しました。"
+        : `⚠️ 計器盤の更新に失敗しました: ${result.reason ?? "ログを確認してください"}`,
       embeds: [],
       components: [backButton()],
     });
