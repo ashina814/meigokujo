@@ -292,25 +292,40 @@ export class Tickets {
     panel?: Pick<TicketPanel, "id" | "name" | "notifyRoleIds" | "staffRoleIds">,
   ): TicketRow {
     const ts = now();
-    this.db
-      .prepare(
-        `INSERT INTO tickets
-          (thread_id, user_id, kind, status, panel_id, panel_name, panel_notify_role_ids_json, panel_staff_role_ids_json, created_at, updated_at)
-         VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        threadId,
-        userId,
-        kind,
-        panel?.id ?? null,
-        panel?.name ?? null,
-        panel ? JSON.stringify(uniq(panel.notifyRoleIds)) : null,
-        panel ? JSON.stringify(uniq(panel.staffRoleIds)) : null,
-        ts,
-        ts,
-      );
-    this.events.log("ticket_opened", { target: userId, payload: { kind, threadId, panelId: panel?.id ?? null } });
-    return this.get(threadId)!;
+    const createTicket = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO tickets
+            (thread_id, user_id, kind, status, panel_id, panel_name, panel_notify_role_ids_json, panel_staff_role_ids_json, created_at, updated_at)
+           VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          threadId,
+          userId,
+          kind,
+          panel?.id ?? null,
+          panel?.name ?? null,
+          panel ? JSON.stringify(uniq(panel.notifyRoleIds)) : null,
+          panel ? JSON.stringify(uniq(panel.staffRoleIds)) : null,
+          ts,
+          ts,
+        );
+      this.events.log("ticket_opened", { target: userId, payload: { kind, threadId, panelId: panel?.id ?? null } });
+      return this.get(threadId)!;
+    });
+    return createTicket();
+  }
+
+  rollbackCreate(threadId: string, actor = "system", reason = "ticket initialization failed"): TicketRow | undefined {
+    const ticket = this.get(threadId);
+    if (!ticket) return undefined;
+    this.db.prepare("DELETE FROM tickets WHERE thread_id = ?").run(threadId);
+    this.events.log("ticket_open_rolled_back", {
+      actor,
+      target: ticket.user_id,
+      payload: { threadId, kind: ticket.kind, panelId: ticket.panel_id, reason },
+    });
+    return ticket;
   }
 
   get(threadId: string): TicketRow | undefined {
