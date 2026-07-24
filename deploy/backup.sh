@@ -31,20 +31,28 @@ fail() {
 
 cleanup() {
   local rc=$?
+  local removed_incomplete=0
+  local suffix=""
   trap - EXIT
 
   if [[ -n "${TMP}" ]]; then
-    rm -f -- "${TMP}"
+    removed_incomplete=1
+    rm -f -- "${TMP}" || true
   fi
   if [[ -n "${GZ_TMP}" ]]; then
-    rm -f -- "${GZ_TMP}"
+    removed_incomplete=1
+    rm -f -- "${GZ_TMP}" || true
+  fi
+
+  if (( removed_incomplete == 1 )); then
+    suffix="; incomplete backup removed"
   fi
 
   if (( rc != 0 )); then
     if [[ -n "${FAIL_REASON}" ]]; then
-      log "FAIL ${FAIL_REASON}; incomplete backup removed"
+      log "FAIL ${FAIL_REASON}${suffix}"
     else
-      log "FAIL rc=${rc}; incomplete backup removed"
+      log "FAIL rc=${rc}${suffix}"
     fi
   fi
 
