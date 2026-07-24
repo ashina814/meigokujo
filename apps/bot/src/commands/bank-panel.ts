@@ -177,6 +177,8 @@ export async function handlePanelCommand(
   const sent = await channel.send(panelMessageFor(kind, services, channel.id));
   await sent.pin().catch(() => undefined);
   services.settings.set(`panel:${kind}:${channel.id}`, sent.id, `user:${interaction.user.id}`);
+  if (kind === "ticket_return") services.tickets.setPanelMessage("return", channel.id, sent.id, `user:${interaction.user.id}`);
+  if (kind === "ticket_consult") services.tickets.setPanelMessage("consult", channel.id, sent.id, `user:${interaction.user.id}`);
   await interaction.reply({
     content: `✅ ${PANEL_LABELS[kind]}パネルを設置しました（会話で流れたら自動で貼り直します）。`,
     flags: MessageFlags.Ephemeral,
@@ -227,6 +229,8 @@ export function panelMessageForExternal(kind: string, services: Services, channe
 }
 export function savePanelSettingExternal(services: Services, kind: string, channelId: string, msgId: string, actor: string): void {
   services.settings.set(`panel:${kind}:${channelId}`, msgId, `user:${actor}`);
+  if (kind === "ticket_return") services.tickets.setPanelMessage("return", channelId, msgId, `user:${actor}`);
+  if (kind === "ticket_consult") services.tickets.setPanelMessage("consult", channelId, msgId, `user:${actor}`);
 }
 
 function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services, channelId: string) {
@@ -236,8 +240,8 @@ function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services,
   if (kind === "shop") return shopPanelMessage(services);
   if (kind === "exchange") return exchangePanelMessage(services);
   if (kind === "takutate") return takutatePanelMessage();
-  if (kind === "ticket_return") return ticketPanelMessage("return");
-  if (kind === "ticket_consult") return ticketPanelMessage("consult");
+  if (kind === "ticket_return") return ticketPanelMessage("return", services);
+  if (kind === "ticket_consult") return ticketPanelMessage("consult", services);
   if (kind === "confession") return confessionPanelMessage();
   if (kind === "dept") {
     const deptKey = services.settings.getString(`dept_panel_channel:${channelId}`) ?? "";
@@ -469,5 +473,7 @@ export async function maybeRepostPanel(message: Message, services: Services): Pr
     if (old) await old.delete().catch(() => undefined);
     const sent = await channel.send(panelMessageFor(kind, services, channel.id));
     services.settings.set(`panel:${kind}:${channel.id}`, sent.id, "system:panel-repost");
+    if (kind === "ticket_return") services.tickets.setPanelMessage("return", channel.id, sent.id, "system:panel-repost");
+    if (kind === "ticket_consult") services.tickets.setPanelMessage("consult", channel.id, sent.id, "system:panel-repost");
   }
 }

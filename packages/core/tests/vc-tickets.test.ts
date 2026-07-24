@@ -111,4 +111,136 @@ describe("チケット", () => {
     tickets.markReminded("old_open");
     expect(tickets.staleOpen(24)).toEqual([]);
   });
+
+  it("既存の出戻り・個別相談パネルを互換シードする", () => {
+    const { tickets } = setup();
+    const panels = tickets.listPanels();
+    expect(panels.map((p) => p.id)).toContain("return");
+    expect(panels.map((p) => p.id)).toContain("consult");
+    expect(tickets.getPanel("return")!.buttonLabel).toBe("出戻り申請");
+  });
+
+  it("複数ロールを持つ汎用チケットパネルを作成・設置できる", () => {
+    const { tickets } = setup();
+    const panel = tickets.upsertPanel(
+      {
+        id: "finance_help",
+        name: "会計相談",
+        title: "会計相談 受付",
+        description: "会計の相談はこちら。",
+        buttonLabel: "相談する",
+        notifyRoleIds: ["role_notify_a", "role_notify_b", "role_notify_a"],
+        staffRoleIds: ["role_staff_a", "role_staff_b"],
+      },
+      "user:admin",
+    );
+    expect(panel.notifyRoleIds).toEqual(["role_notify_a", "role_notify_b"]);
+    expect(panel.staffRoleIds).toEqual(["role_staff_a", "role_staff_b"]);
+
+    const installed = tickets.setPanelMessage(panel.id, "channel1", "message1", "user:admin")!;
+    expect(installed.channelId).toBe("channel1");
+    expect(installed.messageId).toBe("message1");
+
+    const clearedNotify = tickets.setPanelRoles(panel.id, "notify", [], "user:admin")!;
+    const clearedStaff = tickets.setPanelRoles(panel.id, "staff", [], "user:admin")!;
+    expect(clearedNotify.notifyRoleIds).toEqual([]);
+    expect(clearedStaff.staffRoleIds).toEqual([]);
+  });
+
+  it("表示文の更新だけでは既存の通知・対応ロールを消さない", () => {
+    const { tickets } = setup();
+    tickets.upsertPanel(
+      {
+        id: "finance_help",
+        name: "会計相談",
+        title: "会計相談 受付",
+        description: "会計の相談はこちら。",
+        buttonLabel: "相談する",
+        notifyRoleIds: ["role_notify"],
+        staffRoleIds: ["role_staff"],
+      },
+      "user:admin",
+    );
+    const updated = tickets.upsertPanel(
+      {
+        id: "finance_help",
+        name: "会計相談 改",
+        title: "会計相談 改",
+        description: "表示文だけ変更。",
+        buttonLabel: "相談する",
+      },
+      "user:admin2",
+    );
+    expect(updated.notifyRoleIds).toEqual(["role_notify"]);
+    expect(updated.staffRoleIds).toEqual(["role_staff"]);
+  });
+
+  it("パネル設定変更後も既存チケットの出所とロールスナップショットが残る", () => {
+    const { tickets } = setup();
+    const panel = tickets.upsertPanel(
+      {
+        id: "appeal",
+        name: "異議申立",
+        title: "異議申立 受付",
+        description: "異議申立はこちら。",
+        buttonLabel: "申立する",
+        notifyRoleIds: ["role_notify_old"],
+        staffRoleIds: ["role_staff_old"],
+      },
+      "user:admin",
+    );
+    tickets.create("thread_appeal", "alice", panel.id, panel);
+
+    tickets.upsertPanel(
+      {
+        id: "appeal",
+        name: "異議申立 改名後",
+        title: "異議申立 改名後",
+        description: "変更後。",
+        buttonLabel: "送る",
+        notifyRoleIds: ["role_notify_new"],
+        staffRoleIds: ["role_staff_new"],
+      },
+      "user:admin2",
+    );
+
+    const ticket = tickets.get("thread_appeal")!;
+    expect(ticket.panel_id).toBe("appeal");
+    expect(ticket.panel_name).toBe("異議申立");
+    expect(JSON.parse(ticket.panel_notify_role_ids_json!)).toEqual(["role_notify_old"]);
+    expect(JSON.parse(ticket.panel_staff_role_ids_json!)).toEqual(["role_staff_old"]);
+  });
+
+  it("無効パネルと旧ticket_staffフォールバック用の空ロール設定を扱える", () => {
+    const { tickets } = setup();
+    tickets.upsertPanel(
+      {
+        id: "closed_panel",
+        name: "閉鎖受付",
+        title: "閉鎖受付",
+        description: "いまは閉鎖。",
+        buttonLabel: "送る",
+        notifyRoleIds: [],
+        staffRoleIds: [],
+      },
+      "user:admin",
+    );
+    const disabled = tickets.disablePanel("closed_panel", "user:admin")!;
+    expect(disabled.enabled).toBe(false);
+    expect(disabled.staffRoleIds).toEqual([]);
+
+    tickets.create("legacy_thread", "bob", "consult");
+    const legacy = tickets.get("legacy_thread")!;
+    expect(legacy.panel_id).toBeNull();
+    expect(legacy.panel_staff_role_ids_json).toBeNull();
+  });
+
+  it("同じ利用者・同じパネルの未完了チケットを検出できる", () => {
+    const { tickets } = setup();
+    const panel = tickets.getPanel("consult")!;
+    tickets.create("thread1", "alice", "consult", panel);
+    expect(tickets.openByUserPanel("alice", "consult")!.thread_id).toBe("thread1");
+    tickets.close("thread1", "staff");
+    expect(tickets.openByUserPanel("alice", "consult")).toBeUndefined();
+  });
 });

@@ -64,7 +64,15 @@ export {
   type PurchaseStatus,
   type ShopErrorCode,
 } from "./shop/service.js";
-export { Tickets, type TicketRow, type TicketKind, type TicketStatus } from "./tickets/service.js";
+export {
+  Tickets,
+  type TicketRow,
+  type TicketKind,
+  type TicketStatus,
+  type TicketPanel,
+  type TicketPanelInput,
+  type TicketPanelRow,
+} from "./tickets/service.js";
 export {
   Confessions,
   type ConfessionRow,

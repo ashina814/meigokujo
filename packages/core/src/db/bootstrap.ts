@@ -194,8 +194,30 @@ CREATE TABLE IF NOT EXISTS tickets (
   status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','claimed','closed')),
   claimed_by  TEXT,
   reminded_at INTEGER,
+  panel_id    TEXT,
+  panel_name  TEXT,
+  panel_notify_role_ids_json TEXT,
+  panel_staff_role_ids_json  TEXT,
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ticket_panels (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  channel_id TEXT,
+  message_id TEXT,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  button_label TEXT NOT NULL,
+  button_emoji TEXT,
+  notify_role_ids_json TEXT NOT NULL DEFAULT '[]',
+  staff_role_ids_json TEXT NOT NULL DEFAULT '[]',
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  created_by TEXT,
+  updated_by TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS migration_staging (
