@@ -214,6 +214,8 @@ CREATE TABLE IF NOT EXISTS ticket_panels (
   notify_role_ids_json TEXT NOT NULL DEFAULT '[]',
   staff_role_ids_json TEXT NOT NULL DEFAULT '[]',
   enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  archived_at INTEGER,
+  archived_by TEXT,
   created_by TEXT,
   updated_by TEXT,
   created_at INTEGER NOT NULL,

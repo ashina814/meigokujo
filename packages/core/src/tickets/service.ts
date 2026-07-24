@@ -32,6 +32,8 @@ export interface TicketPanelRow {
   notify_role_ids_json: string;
   staff_role_ids_json: string;
   enabled: 0 | 1;
+  archived_at: number | null;
+  archived_by: string | null;
   created_by: string | null;
   updated_by: string | null;
   created_at: number;
@@ -50,6 +52,8 @@ export interface TicketPanel {
   notifyRoleIds: string[];
   staffRoleIds: string[];
   enabled: boolean;
+  archivedAt?: number | null;
+  archivedBy?: string | null;
   createdBy: string | null;
   updatedBy: string | null;
   createdAt: number;
@@ -66,6 +70,13 @@ export interface TicketPanelInput {
   notifyRoleIds?: string[];
   staffRoleIds?: string[];
   enabled?: boolean;
+}
+
+export interface TicketPanelRemovalResult {
+  mode: "deleted" | "archived";
+  panel: TicketPanel;
+  totalTickets: number;
+  activeTickets: number;
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -124,6 +135,8 @@ function panelFromRow(row: TicketPanelRow): TicketPanel {
     notifyRoleIds: parseRoleIds(row.notify_role_ids_json),
     staffRoleIds: parseRoleIds(row.staff_role_ids_json),
     enabled: row.enabled === 1,
+    archivedAt: row.archived_at,
+    archivedBy: row.archived_by,
     createdBy: row.created_by,
     updatedBy: row.updated_by,
     createdAt: row.created_at,
@@ -154,6 +167,8 @@ export class Tickets {
         notify_role_ids_json TEXT NOT NULL DEFAULT '[]',
         staff_role_ids_json TEXT NOT NULL DEFAULT '[]',
         enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+        archived_at INTEGER,
+        archived_by TEXT,
         created_by TEXT,
         updated_by TEXT,
         created_at INTEGER NOT NULL,
@@ -164,6 +179,8 @@ export class Tickets {
     this.addTicketColumn("panel_name", "TEXT");
     this.addTicketColumn("panel_notify_role_ids_json", "TEXT");
     this.addTicketColumn("panel_staff_role_ids_json", "TEXT");
+    this.addPanelColumn("archived_at", "INTEGER");
+    this.addPanelColumn("archived_by", "TEXT");
     const ts = now();
     const insert = this.db.prepare(`
       INSERT OR IGNORE INTO ticket_panels
@@ -177,6 +194,11 @@ export class Tickets {
   private addTicketColumn(name: string, decl: string): void {
     const cols = this.db.prepare("PRAGMA table_info(tickets)").all() as { name: string }[];
     if (!cols.some((c) => c.name === name)) this.db.exec(`ALTER TABLE tickets ADD COLUMN ${name} ${decl}`);
+  }
+
+  private addPanelColumn(name: string, decl: string): void {
+    const cols = this.db.prepare("PRAGMA table_info(ticket_panels)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === name)) this.db.exec(`ALTER TABLE ticket_panels ADD COLUMN ${name} ${decl}`);
   }
 
   defaultPanel(id: string): TicketPanel | undefined {
@@ -195,6 +217,8 @@ export class Tickets {
       notifyRoleIds: [],
       staffRoleIds: [],
       enabled: true,
+      archivedAt: null,
+      archivedBy: null,
       createdBy: "system:legacy-default",
       updatedBy: "system:legacy-default",
       createdAt: ts,
@@ -207,9 +231,13 @@ export class Tickets {
     return row ? panelFromRow(row) : this.defaultPanel(id);
   }
 
-  listPanels(includeDisabled = true): TicketPanel[] {
+  listPanels(includeDisabled = true, includeArchived = false): TicketPanel[] {
+    const where: string[] = [];
+    if (!includeDisabled) where.push("enabled = 1");
+    if (!includeArchived) where.push("archived_at IS NULL");
+    const clause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const rows = this.db
-      .prepare(`SELECT * FROM ticket_panels ${includeDisabled ? "" : "WHERE enabled = 1"} ORDER BY enabled DESC, id ASC`)
+      .prepare(`SELECT * FROM ticket_panels ${clause} ORDER BY archived_at IS NOT NULL ASC, enabled DESC, id ASC`)
       .all() as TicketPanelRow[];
     return rows.map(panelFromRow);
   }
@@ -221,6 +249,7 @@ export class Tickets {
       throw new Error("ERR_INVALID_PANEL");
     }
     const existing = this.getPanel(id);
+    if (existing?.archivedAt) throw new Error("ERR_PANEL_ARCHIVED");
     const ts = now();
     const notify = JSON.stringify(input.notifyRoleIds === undefined ? (existing?.notifyRoleIds ?? []) : uniq(input.notifyRoleIds));
     const staff = JSON.stringify(input.staffRoleIds === undefined ? (existing?.staffRoleIds ?? []) : uniq(input.staffRoleIds));
@@ -262,30 +291,80 @@ export class Tickets {
 
   setPanelRoles(id: string, type: "notify" | "staff", roleIds: string[], actor = "system"): TicketPanel | undefined {
     const panel = this.getPanel(id);
-    if (!panel) return undefined;
+    if (!panel || panel.archivedAt) return undefined;
     const column = type === "notify" ? "notify_role_ids_json" : "staff_role_ids_json";
-    this.db
-      .prepare(`UPDATE ticket_panels SET ${column} = ?, updated_by = ?, updated_at = ? WHERE id = ?`)
-      .run(JSON.stringify(uniq(roleIds)), actor, now(), id);
-    this.events.log("ticket_panel_roles_set", { actor, payload: { id, type, roleIds: uniq(roleIds) } });
+    const normalized = uniq(roleIds);
+    const changed = this.db
+      .prepare(`UPDATE ticket_panels SET ${column} = ?, updated_by = ?, updated_at = ? WHERE id = ? AND archived_at IS NULL`)
+      .run(JSON.stringify(normalized), actor, now(), id);
+    if (changed.changes === 0) return undefined;
+    this.events.log("ticket_panel_roles_set", {
+      actor,
+      payload: { id, type, before: type === "notify" ? panel.notifyRoleIds : panel.staffRoleIds, after: normalized },
+    });
     return this.getPanel(id);
   }
 
   setPanelMessage(id: string, channelId: string, messageId: string, actor = "system"): TicketPanel | undefined {
+    const before = this.getPanel(id);
+    if (!before || before.archivedAt) return undefined;
     const savePanelMessage = this.db.transaction(() => {
-      this.db
-        .prepare("UPDATE ticket_panels SET channel_id = ?, message_id = ?, updated_by = ?, updated_at = ? WHERE id = ?")
-        .run(channelId, messageId, actor, now(), id);
-      this.events.log("ticket_panel_installed", { actor, payload: { id, channelId, messageId } });
+      const changed = this.db.prepare("UPDATE ticket_panels SET channel_id = ?, message_id = ?, updated_by = ?, updated_at = ? WHERE id = ? AND archived_at IS NULL").run(channelId, messageId, actor, now(), id);
+      if (changed.changes === 0) return undefined;
+      this.events.log("ticket_panel_installed", { actor, payload: { id, before: { channelId: before.channelId, messageId: before.messageId }, after: { channelId, messageId } } });
       return this.getPanel(id);
     });
     return savePanelMessage();
   }
 
-  disablePanel(id: string, actor = "system"): TicketPanel | undefined {
-    this.db.prepare("UPDATE ticket_panels SET enabled = 0, updated_by = ?, updated_at = ? WHERE id = ?").run(actor, now(), id);
-    this.events.log("ticket_panel_disabled", { actor, payload: { id } });
+  setPanelEnabled(id: string, enabled: boolean, actor = "system"): TicketPanel | undefined {
+    const before = this.getPanel(id);
+    if (!before || before.archivedAt) return undefined;
+    const changed = this.db.prepare("UPDATE ticket_panels SET enabled = ?, updated_by = ?, updated_at = ? WHERE id = ? AND archived_at IS NULL").run(enabled ? 1 : 0, actor, now(), id);
+    if (changed.changes === 0) return undefined;
+    this.events.log(enabled ? "ticket_panel_enabled" : "ticket_panel_disabled", { actor, payload: { id, before: { enabled: before.enabled }, after: { enabled } } });
     return this.getPanel(id);
+  }
+
+  disablePanel(id: string, actor = "system"): TicketPanel | undefined { return this.setPanelEnabled(id, false, actor); }
+  enablePanel(id: string, actor = "system"): TicketPanel | undefined { return this.setPanelEnabled(id, true, actor); }
+
+  clearPanelMessage(id: string, actor = "system", reason = "manual", forceDisable = false): TicketPanel | undefined {
+    const before = this.getPanel(id);
+    if (!before) return undefined;
+    const clear = this.db.transaction(() => {
+      const changed = this.db.prepare(`UPDATE ticket_panels SET channel_id = NULL, message_id = NULL, enabled = CASE WHEN ? = 1 THEN 0 ELSE enabled END, updated_by = ?, updated_at = ? WHERE id = ?`).run(forceDisable ? 1 : 0, actor, now(), id);
+      if (changed.changes === 0) return undefined;
+      const after = this.getPanel(id);
+      this.events.log("ticket_panel_uninstalled", { actor, payload: { id, reason, forceDisabled: forceDisable, before: { channelId: before.channelId, messageId: before.messageId, enabled: before.enabled }, after: { channelId: null, messageId: null, enabled: after?.enabled ?? false } } });
+      return after;
+    });
+    return clear();
+  }
+
+  panelTicketCounts(id: string): { total: number; active: number } {
+    const row = this.db.prepare(`SELECT COUNT(*) AS total, SUM(CASE WHEN status IN ('open','claimed') THEN 1 ELSE 0 END) AS active FROM tickets WHERE panel_id = ?`).get(id) as { total: number; active: number | null };
+    return { total: Number(row.total ?? 0), active: Number(row.active ?? 0) };
+  }
+
+  removePanelRegistration(id: string, actor = "system"): TicketPanelRemovalResult | undefined {
+    const panel = this.getPanel(id);
+    if (!panel) return undefined;
+    const counts = this.panelTicketCounts(id);
+    const isLegacy = LEGACY_PANELS.some((legacy) => legacy.id === id);
+    const mode: TicketPanelRemovalResult["mode"] = counts.total === 0 && !isLegacy ? "deleted" : "archived";
+    const remove = this.db.transaction(() => {
+      if (mode === "deleted") {
+        this.db.prepare("DELETE FROM ticket_panels WHERE id = ?").run(id);
+        this.events.log("ticket_panel_deleted", { actor, payload: { id, before: panel, after: null, totalTickets: counts.total, activeTickets: counts.active } });
+      } else {
+        const ts = now();
+        this.db.prepare(`UPDATE ticket_panels SET enabled = 0, channel_id = NULL, message_id = NULL, archived_at = ?, archived_by = ?, updated_by = ?, updated_at = ? WHERE id = ?`).run(ts, actor, actor, ts, id);
+        this.events.log("ticket_panel_archived", { actor, payload: { id, before: panel, after: { enabled: false, channelId: null, messageId: null, archivedAt: ts, archivedBy: actor }, totalTickets: counts.total, activeTickets: counts.active } });
+      }
+    });
+    remove();
+    return { mode, panel, totalTickets: counts.total, activeTickets: counts.active };
   }
 
   create(
