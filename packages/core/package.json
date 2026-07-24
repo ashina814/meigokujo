@@ -7,7 +7,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "node -e \"process.exit(0)\"",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
