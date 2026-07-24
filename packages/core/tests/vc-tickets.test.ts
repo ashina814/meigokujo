@@ -140,6 +140,11 @@ describe("チケット", () => {
     const installed = tickets.setPanelMessage(panel.id, "channel1", "message1", "user:admin")!;
     expect(installed.channelId).toBe("channel1");
     expect(installed.messageId).toBe("message1");
+
+    const clearedNotify = tickets.setPanelRoles(panel.id, "notify", [], "user:admin")!;
+    const clearedStaff = tickets.setPanelRoles(panel.id, "staff", [], "user:admin")!;
+    expect(clearedNotify.notifyRoleIds).toEqual([]);
+    expect(clearedStaff.staffRoleIds).toEqual([]);
   });
 
   it("表示文の更新だけでは既存の通知・対応ロールを消さない", () => {

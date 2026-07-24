@@ -19,6 +19,7 @@ import type { Services } from "../services.js";
 
 const LEGACY_KIND_LABELS: Record<string, string> = { return: "出戻り申請", consult: "個別相談" };
 const OPEN_PREFIX = "ticket:open:";
+const inFlightTickets = new Set<string>();
 
 function uniq(values: string[]): string[] {
   return [...new Set(values.map((v) => v.trim()).filter(Boolean))];
@@ -153,7 +154,18 @@ async function addMembersToThread(thread: PrivateThreadChannel, memberIds: strin
   return { added, failed };
 }
 
-async function openTicket(interaction: ButtonInteraction, services: Services, panelId: string): Promise<void> {
+async function cleanupCreatedThread(thread: PrivateThreadChannel, reason: string): Promise<void> {
+  try {
+    await thread.delete(reason);
+    return;
+  } catch (e) {
+    console.warn(`[ticket] 作成済みスレッドの削除に失敗したためロック/アーカイブします: ${thread.id}`, e);
+  }
+  await thread.setLocked(true, reason).catch((e) => console.warn(`[ticket] 作成済みスレッドのロックに失敗: ${thread.id}`, e));
+  await thread.setArchived(true, reason).catch((e) => console.warn(`[ticket] 作成済みスレッドのアーカイブに失敗: ${thread.id}`, e));
+}
+
+export async function openTicket(interaction: ButtonInteraction, services: Services, panelId: string): Promise<void> {
   const panel = services.tickets.getPanel(panelId);
   if (!panel) {
     await interaction.reply({ content: "この受付パネルの設定が見つかりません。運営に確認してください。", flags: MessageFlags.Ephemeral });
@@ -175,64 +187,93 @@ async function openTicket(interaction: ButtonInteraction, services: Services, pa
     return;
   }
 
-  const staffRoleIds = panelStaffRoleIds(panel, services);
-  const notifyRoleIds = panelNotifyRoleIds(panel, staffRoleIds);
-  const validStaffRoleIds = await existingRoleIds(interaction.guild, staffRoleIds);
-  if (validStaffRoleIds.length === 0) {
-    await interaction.reply({
-      content: `「${panel.name}」の対応ロールが未設定、または削除されています。運営に確認してください。`,
-      flags: MessageFlags.Ephemeral,
-    });
+  const flightKey = `${interaction.user.id}:${panel.id}`;
+  if (inFlightTickets.has(flightKey)) {
+    await interaction.reply({ content: `「${panel.name}」の受付処理中です。少し待ってから確認してください。`, flags: MessageFlags.Ephemeral });
     return;
   }
-  const validNotifyRoleIds = await existingRoleIds(interaction.guild, notifyRoleIds);
-  const accessRoleIds = uniq([...validStaffRoleIds, ...validNotifyRoleIds]);
-  const staffMemberIds = await memberIdsForRoles(interaction.guild, accessRoleIds);
-  if (staffMemberIds.length === 0) {
-    await interaction.reply({
-      content: `「${panel.name}」の担当者をスレッドへ招待できません。ロールのメンバーまたはBot権限を確認してください。`,
-      flags: MessageFlags.Ephemeral,
+  inFlightTickets.add(flightKey);
+
+  try {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const staffRoleIds = panelStaffRoleIds(panel, services);
+    const notifyRoleIds = panelNotifyRoleIds(panel, staffRoleIds);
+    const validStaffRoleIds = await existingRoleIds(interaction.guild, staffRoleIds);
+    if (validStaffRoleIds.length === 0) {
+      await interaction.editReply({ content: `「${panel.name}」の対応ロールが未設定、または削除されています。運営に確認してください。` });
+      return;
+    }
+    const validNotifyRoleIds = await existingRoleIds(interaction.guild, notifyRoleIds);
+    const accessRoleIds = uniq([...validStaffRoleIds, ...validNotifyRoleIds]);
+    const staffMemberIds = await memberIdsForRoles(interaction.guild, accessRoleIds);
+    if (staffMemberIds.length === 0) {
+      await interaction.editReply({ content: `「${panel.name}」の担当者をスレッドへ招待できません。ロールのメンバーまたはBot権限を確認してください。` });
+      return;
+    }
+
+    const nick =
+      interaction.member && "displayName" in interaction.member
+        ? (interaction.member as GuildMember).displayName
+        : (interaction.user.globalName ?? interaction.user.username);
+    const thread = (await channel.threads.create({
+      name: `${panel.name}-${nick}`.slice(0, 90),
+      type: ChannelType.PrivateThread,
+      invitable: false,
+      autoArchiveDuration: ThreadAutoArchiveDuration.ThreeDays,
+    })) as PrivateThreadChannel;
+    await thread.members.add(interaction.user.id);
+    const invited = await addMembersToThread(thread, staffMemberIds);
+    if (invited.added === 0) {
+      console.error("[ticket] 担当者を1人もスレッドへ追加できないため受付を中止します", {
+        panelId: panel.id,
+        userId: interaction.user.id,
+        threadId: thread.id,
+        staffRoleIds: validStaffRoleIds,
+        accessRoleIds,
+        attemptedMembers: staffMemberIds.length,
+      });
+      await cleanupCreatedThread(thread, "ticket staff invite failed");
+      await interaction.editReply({
+        content: `「${panel.name}」の担当者をスレッドへ追加できなかったため、受付を中止しました。運営に確認してください。`,
+      });
+      return;
+    }
+
+    const duplicate = services.tickets.openByUserPanel(interaction.user.id, panel.id);
+    if (duplicate) {
+      await cleanupCreatedThread(thread, "duplicate ticket detected");
+      await interaction.editReply({ content: `既に未完了の「${duplicate.panel_name ?? panel.name}」チケットがあります: <#${duplicate.thread_id}>` });
+      return;
+    }
+
+    const ticket = services.tickets.create(thread.id, interaction.user.id, panel.id, {
+      id: panel.id,
+      name: panel.name,
+      notifyRoleIds: validNotifyRoleIds,
+      staffRoleIds: validStaffRoleIds,
     });
-    return;
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("ticket:claim").setLabel("対応する").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("ticket:close").setLabel("クローズ").setStyle(ButtonStyle.Danger),
+    );
+    await thread.send({
+      content: [
+        `📮 **${ticket.panel_name ?? panel.name}** — <@${interaction.user.id}>`,
+        validNotifyRoleIds.length > 0 ? validNotifyRoleIds.map((roleId) => `<@&${roleId}>`).join(" ") : "",
+        panel.description,
+        invited.failed > 0 ? `⚠️ 一部担当者をスレッドへ追加できませんでした（失敗 ${invited.failed}件）。` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      components: [row],
+      allowedMentions: { users: [interaction.user.id], roles: validNotifyRoleIds },
+    });
+    await interaction.editReply({ content: `✅ スレッドを開きました: ${thread.toString()}` });
+  } finally {
+    inFlightTickets.delete(flightKey);
   }
-
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const nick =
-    interaction.member && "displayName" in interaction.member
-      ? (interaction.member as GuildMember).displayName
-      : (interaction.user.globalName ?? interaction.user.username);
-  const thread = (await channel.threads.create({
-    name: `${panel.name}-${nick}`.slice(0, 90),
-    type: ChannelType.PrivateThread,
-    invitable: false,
-    autoArchiveDuration: ThreadAutoArchiveDuration.ThreeDays,
-  })) as PrivateThreadChannel;
-  await thread.members.add(interaction.user.id);
-  const invited = await addMembersToThread(thread, staffMemberIds);
-  const ticket = services.tickets.create(thread.id, interaction.user.id, panel.id, {
-    id: panel.id,
-    name: panel.name,
-    notifyRoleIds: validNotifyRoleIds,
-    staffRoleIds: validStaffRoleIds,
-  });
-
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("ticket:claim").setLabel("対応する").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("ticket:close").setLabel("クローズ").setStyle(ButtonStyle.Danger),
-  );
-  await thread.send({
-    content: [
-      `📮 **${ticket.panel_name ?? panel.name}** — <@${interaction.user.id}>`,
-      validNotifyRoleIds.length > 0 ? validNotifyRoleIds.map((roleId) => `<@&${roleId}>`).join(" ") : "",
-      panel.description,
-      invited.failed > 0 ? `⚠️ 一部担当者をスレッドへ追加できませんでした（失敗 ${invited.failed}件）。` : "",
-    ]
-      .filter(Boolean)
-      .join("\n"),
-    components: [row],
-    allowedMentions: { users: [interaction.user.id], roles: validNotifyRoleIds },
-  });
-  await interaction.editReply({ content: `✅ スレッドを開きました: ${thread.toString()}` });
 }
 
 export async function handleTicketButton(interaction: ButtonInteraction, services: Services): Promise<void> {

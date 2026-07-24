@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { ChannelType } from "discord.js";
 import type { TicketPanel, TicketRow } from "@meigokujo/core";
 
 vi.mock("../src/permissions.js", () => ({ isAdmin: () => false }));
@@ -8,6 +9,7 @@ import {
   panelIdFromTicketButton,
   panelNotifyRoleIds,
   panelStaffRoleIds,
+  openTicket,
   ticketOpenCustomId,
   ticketPanelMessageForPanel,
   ticketStaffRoleIds,
@@ -49,6 +51,77 @@ const ticket = (overrides: Partial<TicketRow> = {}): TicketRow => ({
   ...overrides,
 });
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+function makeGuild(roleIds = ["staff_role"], memberSpecs: Array<{ id: string; roles: string[] }> = [{ id: "staff1", roles: ["staff_role"] }]) {
+  const members = new Map(
+    memberSpecs.map((m) => [
+      m.id,
+      {
+        id: m.id,
+        user: { bot: false },
+        roles: { cache: { has: (roleId: string) => m.roles.includes(roleId) } },
+      },
+    ]),
+  );
+  return {
+    roles: {
+      cache: { get: (roleId: string) => (roleIds.includes(roleId) ? { id: roleId } : undefined) },
+      fetch: vi.fn(async (roleId: string) => (roleIds.includes(roleId) ? { id: roleId } : null)),
+    },
+    members: { fetch: vi.fn(async () => members) },
+  };
+}
+
+function makeOpenTicketHarness(options: {
+  panel?: TicketPanel;
+  openByUserPanel?: () => TicketRow | undefined;
+  deferReply?: () => Promise<void>;
+  addMember?: (memberId: string) => Promise<void>;
+} = {}) {
+  const p = options.panel ?? panel({ staffRoleIds: ["staff_role"] });
+  const thread = {
+    id: "thread1",
+    members: {
+      add: vi.fn(options.addMember ?? (async () => undefined)),
+    },
+    send: vi.fn(async () => undefined),
+    delete: vi.fn(async () => undefined),
+    setLocked: vi.fn(async () => undefined),
+    setArchived: vi.fn(async () => undefined),
+    toString: () => "<#thread1>",
+  };
+  const channel = {
+    id: "panel_channel",
+    type: ChannelType.GuildText,
+    threads: { create: vi.fn(async () => thread) },
+  };
+  const services = {
+    settings: { getString: vi.fn(() => undefined) },
+    tickets: {
+      getPanel: vi.fn(() => p),
+      openByUserPanel: vi.fn(options.openByUserPanel ?? (() => undefined)),
+      create: vi.fn(() => ticket({ thread_id: thread.id, panel_id: p.id, panel_name: p.name })),
+    },
+  };
+  const interaction = {
+    user: { id: "user1", username: "user1", globalName: null },
+    member: { displayName: "user1" },
+    channel,
+    guild: makeGuild(),
+    reply: vi.fn(async () => undefined),
+    deferReply: vi.fn(options.deferReply ?? (async () => undefined)),
+    editReply: vi.fn(async () => undefined),
+  };
+  return { interaction, services, channel, thread };
+}
+
 describe("汎用チケット受付パネル", () => {
   it("パネルIDを持つ共通ボタンを生成し、旧ボタンも解決できる", () => {
     expect(ticketOpenCustomId("appeal")).toBe("ticket:open:appeal");
@@ -87,5 +160,60 @@ describe("汎用チケット受付パネル", () => {
     expect(memberHasAnyRole(member, ["staff_a", "staff_b"])).toBe(true);
     expect(memberHasAnyRole(member, ["other"])).toBe(false);
     expect(memberHasAnyRole(null, ["staff_a"])).toBe(false);
+  });
+
+  it("同時に2回作成処理が走ってもチケット・スレッドは1件だけになる", async () => {
+    const gate = deferred();
+    const first = makeOpenTicketHarness({ deferReply: () => gate.promise });
+    const second = {
+      ...first.interaction,
+      reply: vi.fn(async () => undefined),
+      deferReply: vi.fn(async () => undefined),
+      editReply: vi.fn(async () => undefined),
+    };
+
+    const p1 = openTicket(first.interaction as any, first.services as any, "appeal");
+    await Promise.resolve();
+    await openTicket(second as any, first.services as any, "appeal");
+    expect(second.reply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("受付処理中") }));
+    expect(first.channel.threads.create).not.toHaveBeenCalled();
+
+    gate.resolve();
+    await p1;
+    expect(first.channel.threads.create).toHaveBeenCalledTimes(1);
+    expect(first.services.tickets.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("担当者追加が全件失敗した場合はDB登録せず、作成済みスレッドを削除する", async () => {
+    const h = makeOpenTicketHarness({
+      addMember: async (memberId) => {
+        if (memberId !== "user1") throw new Error("cannot add staff");
+      },
+    });
+    await openTicket(h.interaction as any, h.services as any, "appeal");
+
+    expect(h.services.tickets.create).not.toHaveBeenCalled();
+    expect(h.thread.send).not.toHaveBeenCalled();
+    expect(h.thread.delete).toHaveBeenCalled();
+    expect(h.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("受付を中止") }));
+  });
+
+  it("一部担当者のみ追加失敗した場合は警告付きで作成継続する", async () => {
+    const h = makeOpenTicketHarness({
+      panel: panel({ staffRoleIds: ["staff_role"] }),
+      addMember: async (memberId) => {
+        if (memberId === "staff2") throw new Error("cannot add staff2");
+      },
+    });
+    h.interaction.guild = makeGuild(["staff_role"], [
+      { id: "staff1", roles: ["staff_role"] },
+      { id: "staff2", roles: ["staff_role"] },
+    ]) as any;
+
+    await openTicket(h.interaction as any, h.services as any, "appeal");
+
+    expect(h.services.tickets.create).toHaveBeenCalledTimes(1);
+    expect(h.thread.delete).not.toHaveBeenCalled();
+    expect(h.thread.send).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("一部担当者") }));
   });
 });

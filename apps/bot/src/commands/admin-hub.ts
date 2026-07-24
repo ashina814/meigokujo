@@ -19,6 +19,7 @@ import {
   StringSelectMenuInteraction,
   TextInputBuilder,
   TextInputStyle,
+  type Message,
   UserSelectMenuBuilder,
   UserSelectMenuInteraction,
 } from "discord.js";
@@ -262,12 +263,7 @@ export async function handleAdminSelect(
     return void (await interaction.update(ticketPanelRolePicker(services, interaction.values[0]!, "staff")));
   }
   if (section === "tpanel" && action === "disable-pick" && interaction.isStringSelectMenu()) {
-    const panel = services.tickets.disablePanel(interaction.values[0]!, `user:${interaction.user.id}`);
-    return void (await interaction.update({
-      content: panel ? `🛑 「${panel.name}」を無効化しました。既存チケットは残ります。` : "❌ 受付が見つかりません。",
-      embeds: [],
-      components: [backButton()],
-    }));
+    return void (await disableTicketPanel(interaction, services, interaction.values[0]!));
   }
   if (section === "tpanel" && (action === "notify-roles" || action === "staff-roles") && interaction.isRoleSelectMenu()) {
     const panelId = parts[3]!;
@@ -999,6 +995,7 @@ function ticketPanelHome(services: Services) {
     .setDescription([
       "受付ごとに表示文・設置先・通知ロール・対応ロールを持たせます。",
       "対応ロールは「対応する」「クローズ」の権限判定にも使います。",
+      "通知ロールは新着時にメンションされ、プライベートスレッドへ追加されます。対応・クローズ操作はできませんが、本文は閲覧できます。",
       "",
       list,
       "",
@@ -1032,7 +1029,7 @@ function ticketPanelPicker(services: Services, customId: string, placeholder: st
   };
 }
 
-function ticketPanelRolePicker(services: Services, panelId: string, type: "notify" | "staff") {
+export function ticketPanelRolePicker(services: Services, panelId: string, type: "notify" | "staff") {
   const panel = services.tickets.getPanel(panelId);
   const label = type === "notify" ? "通知ロール" : "対応ロール";
   if (!panel) {
@@ -1040,8 +1037,8 @@ function ticketPanelRolePicker(services: Services, panelId: string, type: "notif
   }
   const picker = new RoleSelectMenuBuilder()
     .setCustomId(`mgmt:tpanel:${type}-roles:${panel.id}`)
-    .setPlaceholder(`${panel.name} の${label}を選ぶ（複数可）`)
-    .setMinValues(1)
+    .setPlaceholder(`${panel.name} の${label}を選ぶ（複数可 / 空でフォールバック）`)
+    .setMinValues(0)
     .setMaxValues(10);
   return {
     embeds: [
@@ -1051,8 +1048,8 @@ function ticketPanelRolePicker(services: Services, panelId: string, type: "notif
           `対象: **${panel.name}** (\`${panel.id}\`)`,
           "",
           type === "notify"
-            ? "新着時にメンションするロールです。未設定なら対応ロール、対応ロールも未設定なら旧 ticket_staff にフォールバックします。"
-            : "「対応する」「クローズ」を許可し、プライベートスレッドへ招待するロールです。",
+            ? "新着時にメンションされ、プライベートスレッドへ追加されるロールです。対応・クローズ操作はできませんが、本文は閲覧できます。空にすると対応ロールへフォールバックします。"
+            : "「対応する」「クローズ」を許可し、プライベートスレッドへ招待するロールです。空にすると旧 ticket_staff へフォールバックします。",
         ].join("\n")),
     ],
     components: [new ActionRowBuilder<RoleSelectMenuBuilder>().addComponents(picker), backButton()],
@@ -1088,7 +1085,28 @@ function ticketPanelCreateModal() {
     );
 }
 
-async function installTicketPanel(
+export function isUnknownMessageError(error: unknown): boolean {
+  const maybe = error as { code?: unknown; status?: unknown; rawError?: { code?: unknown } };
+  return maybe.code === 10008 || maybe.rawError?.code === 10008 || maybe.status === 404;
+}
+
+type FetchPanelMessageResult =
+  | { ok: true; message: Message | null }
+  | { ok: false; error: unknown };
+
+async function fetchPanelMessage(
+  channel: { messages: { fetch: (messageId: string) => Promise<Message> } },
+  messageId: string,
+): Promise<FetchPanelMessageResult> {
+  try {
+    return { ok: true, message: await channel.messages.fetch(messageId) };
+  } catch (e) {
+    if (isUnknownMessageError(e)) return { ok: true, message: null };
+    return { ok: false, error: e };
+  }
+}
+
+export async function installTicketPanel(
   interaction: StringSelectMenuInteraction,
   services: Services,
   panelId: string,
@@ -1105,22 +1123,133 @@ async function installTicketPanel(
   }
 
   const msg = ticketPanelMessageForPanel(panel);
-  let messageId = panel.messageId;
-  if (panel.channelId && panel.messageId && panel.channelId !== channel.id) {
-    const oldChannel = await interaction.client.channels.fetch(panel.channelId).catch(() => null);
-    if (oldChannel?.isTextBased() && "messages" in oldChannel) {
-      const old = await oldChannel.messages.fetch(panel.messageId).catch(() => null);
-      await old?.delete().catch(() => undefined);
+  const oldPlacement = panel.channelId && panel.messageId ? { channelId: panel.channelId, messageId: panel.messageId } : null;
+  const samePlacement = oldPlacement?.channelId === channel.id;
+  let sent: Message;
+  let editedExisting = false;
+
+  if (samePlacement && oldPlacement.messageId && "messages" in channel) {
+    const fetched = await fetchPanelMessage(channel, oldPlacement.messageId);
+    if (!fetched.ok) {
+      console.warn("[ticket-panel] 既存パネル取得に失敗したため再設置を中止します", {
+        panelId: panel.id,
+        channelId: channel.id,
+        messageId: oldPlacement.messageId,
+        error: fetched.error,
+      });
+      await interaction.update({
+        content: "⚠️ 既存パネルの取得に失敗したため、重複防止のため再設置を中止しました。時間を置いて再試行してください。",
+        embeds: [],
+        components: [backButton()],
+      });
+      return;
     }
-    messageId = null;
+    if (fetched.message) {
+      sent = await fetched.message.edit({ embeds: msg.embeds, components: msg.components });
+      editedExisting = true;
+    } else {
+      sent = await channel.send(msg);
+    }
+  } else {
+    try {
+      sent = await channel.send(msg);
+    } catch (e) {
+      console.warn("[ticket-panel] 新規パネル送信に失敗しました。旧パネルは残します", {
+        panelId: panel.id,
+        channelId: channel.id,
+        oldPlacement,
+        error: e,
+      });
+      await interaction.update({
+        content: "❌ 新しいパネルの送信に失敗しました。既存パネルは削除していません。",
+        embeds: [],
+        components: [backButton()],
+      });
+      return;
+    }
   }
-  const existing =
-    messageId && "messages" in channel ? await channel.messages.fetch(messageId).catch(() => null) : null;
-  const sent = existing ? await existing.edit({ embeds: msg.embeds, components: msg.components }) : await channel.send(msg);
+
   await sent.pin().catch(() => undefined);
   services.tickets.setPanelMessage(panel.id, channel.id, sent.id, `user:${interaction.user.id}`);
+
+  let warning = "";
+  if (oldPlacement && oldPlacement.channelId !== channel.id) {
+    const oldChannel = await interaction.client.channels.fetch(oldPlacement.channelId).catch((e) => {
+      console.warn("[ticket-panel] 移設後の旧チャンネル取得に失敗しました", { panelId: panel.id, oldPlacement, error: e });
+      return null;
+    });
+    if (oldChannel?.isTextBased() && "messages" in oldChannel) {
+      const old = await fetchPanelMessage(oldChannel, oldPlacement.messageId);
+      if (old.ok) {
+        if (old.message) {
+          await old.message.delete().catch((e) => {
+            warning = "旧パネルの削除に失敗しました。手動確認してください。";
+            console.warn("[ticket-panel] 移設後の旧パネル削除に失敗しました", { panelId: panel.id, oldPlacement, error: e });
+          });
+        }
+      } else {
+        warning = "旧パネルの取得に失敗しました。手動確認してください。";
+        console.warn("[ticket-panel] 移設後の旧パネル取得に失敗しました", { panelId: panel.id, oldPlacement, error: old.error });
+      }
+    } else if (oldChannel) {
+      warning = "旧パネルのチャンネルがテキストチャンネルではありません。手動確認してください。";
+      console.warn("[ticket-panel] 移設後の旧パネルチャンネルがテキストではありません", { panelId: panel.id, oldPlacement });
+    }
+  }
+
   await interaction.update({
-    embeds: [new EmbedBuilder().setTitle("✅ 設置しました").setDescription(`「${panel.name}」をこのチャンネルに${existing ? "再描画" : "設置"}しました。`)],
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("✅ 設置しました")
+        .setDescription(`「${panel.name}」をこのチャンネルに${editedExisting ? "再描画" : "設置"}しました。${warning ? `\n⚠️ ${warning}` : ""}`),
+    ],
+    components: [backButton()],
+  });
+}
+
+export async function disableTicketPanel(
+  interaction: StringSelectMenuInteraction,
+  services: Services,
+  panelId: string,
+): Promise<void> {
+  const panel = services.tickets.disablePanel(panelId, `user:${interaction.user.id}`);
+  if (!panel) {
+    await interaction.update({ content: "❌ 受付が見つかりません。", embeds: [], components: [backButton()] });
+    return;
+  }
+
+  let warning = "";
+  if (panel.channelId && panel.messageId) {
+    const channel = await interaction.client.channels.fetch(panel.channelId).catch((e) => {
+      console.warn("[ticket-panel] 無効化後の設置チャンネル取得に失敗しました", {
+        panelId: panel.id,
+        channelId: panel.channelId,
+        messageId: panel.messageId,
+        error: e,
+      });
+      return null;
+    });
+    if (channel?.isTextBased() && "messages" in channel) {
+      const fetched = await fetchPanelMessage(channel, panel.messageId);
+      if (fetched.ok && fetched.message) {
+        await fetched.message.edit({ embeds: ticketPanelMessageForPanel(panel).embeds, components: ticketPanelMessageForPanel(panel).components }).catch((e) => {
+          warning = "設置済みパネルの無効表示への更新に失敗しました。";
+          console.warn("[ticket-panel] 無効化済みパネルのメッセージ編集に失敗しました", { panelId: panel.id, error: e });
+        });
+      } else if (fetched.ok) {
+        warning = "設置済みパネルのメッセージが見つかりませんでした。";
+      } else {
+        warning = "設置済みパネルの取得に失敗しました。";
+        console.warn("[ticket-panel] 無効化済みパネルのメッセージ取得に失敗しました", { panelId: panel.id, error: fetched.error });
+      }
+    } else {
+      warning = "設置済みパネルのチャンネルが見つからない、またはテキストチャンネルではありません。";
+    }
+  }
+
+  await interaction.update({
+    content: `🛑 「${panel.name}」を無効化しました。既存チケットは残ります。${warning ? `\n⚠️ ${warning}` : ""}`,
+    embeds: [],
     components: [backButton()],
   });
 }
