@@ -3,6 +3,8 @@ name: Apply Toto voice-received close
 on:
   push:
     branches: [agent/toto-voice-received-close]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
