@@ -39,7 +39,9 @@ jobs:
           {
             set -euo pipefail
             python .github/scripts/ticket_panel_lifecycle_review_fix.py
+            python .github/scripts/ticket_panel_lifecycle_review_fix_followup.py
             rm -f .github/scripts/ticket_panel_lifecycle_review_fix.py
+            rm -f .github/scripts/ticket_panel_lifecycle_review_fix_followup.py
             rm -f .github/TICKET_PANEL_REVIEW_FIX_FAILURE.log
             pnpm install --frozen-lockfile
             pnpm typecheck
