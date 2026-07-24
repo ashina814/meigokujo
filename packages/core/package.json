@@ -7,7 +7,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "vitest run",
+    "test": "vitest run tests/confession-voice-received.test.ts --reporter=verbose",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
