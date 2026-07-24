@@ -24,7 +24,7 @@ for arg in "$@"; do
 Usage: /home/kabu/deploy.sh [--dry-run] [--force]
 
   --dry-run  本番を変更せず、dirty状態・取得先・ff可能性・実行環境だけ確認する
-  --force    同じSHAでもバックアップ・検証・再起動まで実行する
+  --force    同じSHAでも事前検証・バックアップ・依存同期・再起動まで実行する
 HELP
       exit 0
       ;;
@@ -38,14 +38,34 @@ BEFORE_SHA=""
 TARGET_SHA=""
 AFTER_SHA=""
 DEPLOYED_SHA=""
+VERIFY_DIR=""
+
+log() { printf '\n==> %s\n' "$*"; }
+fail() { echo "❌ $*" >&2; return 1; }
+require() { command -v "$1" >/dev/null 2>&1 || fail "必要なコマンドがありません: $1"; }
+
+as_app() {
+  sudo -u "$APP_USER" env HOME="$APP_HOME" PATH="$APP_PATH" "$@"
+}
+
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  if [[ -n "$VERIFY_DIR" ]]; then
+    cd "$REPO" 2>/dev/null || true
+    as_app git worktree remove --force "$VERIFY_DIR" >/dev/null 2>&1 || true
+    as_app git worktree prune >/dev/null 2>&1 || true
+  fi
+  exit "$rc"
+}
 
 on_error() {
   local rc=$?
   echo
   echo "❌ デプロイ失敗: ${STEP} (exit=${rc})" >&2
-  [[ -n "$BEFORE_SHA" ]] && echo "反映前SHA: ${BEFORE_SHA}" >&2
-  [[ -n "$TARGET_SHA" ]] && echo "取得先SHA: ${TARGET_SHA}" >&2
-  [[ -n "$AFTER_SHA" ]] && echo "現在SHA:   ${AFTER_SHA}" >&2
+  [[ -n "$BEFORE_SHA" ]] && echo "反映前SHA:   ${BEFORE_SHA}" >&2
+  [[ -n "$TARGET_SHA" ]] && echo "取得先SHA:   ${TARGET_SHA}" >&2
+  [[ -n "$AFTER_SHA" ]] && echo "現在SHA:     ${AFTER_SHA}" >&2
   [[ -n "$DEPLOYED_SHA" ]] && echo "最終成功SHA: ${DEPLOYED_SHA}" >&2
   if [[ "$RESTARTED" -eq 0 ]]; then
     echo "Botサービスはこの処理では再起動していません。" >&2
@@ -54,11 +74,8 @@ on_error() {
   fi
   exit "$rc"
 }
+trap cleanup EXIT
 trap on_error ERR
-
-log() { printf '\n==> %s\n' "$*"; }
-fail() { echo "❌ $*" >&2; exit 1; }
-require() { command -v "$1" >/dev/null 2>&1 || fail "必要なコマンドがありません: $1"; }
 
 [[ "$EUID" -eq 0 ]] || fail "rootで実行してください: sudo /home/kabu/deploy.sh"
 for cmd in sudo git systemctl journalctl flock grep find sort; do require "$cmd"; done
@@ -68,8 +85,17 @@ for cmd in sudo git systemctl journalctl flock grep find sort; do require "$cmd"
 exec 9>"$LOCK_FILE"
 flock -n 9 || fail "別のデプロイが実行中です: $LOCK_FILE"
 
-# systemdの実行Nodeを優先して、pnpmと同じbinディレクトリを使う。
-STEP="Node/pnpm環境の検出"
+STEP="systemd・Node/pnpm環境の検出"
+LOAD_STATE="$(systemctl show "$SERVICE" -p LoadState --value)"
+[[ "$LOAD_STATE" == "loaded" ]] || fail "systemdサービスを読み込めません: ${SERVICE} (${LOAD_STATE:-unknown})"
+SERVICE_USER="$(systemctl show "$SERVICE" -p User --value)"
+[[ "$SERVICE_USER" == "$APP_USER" ]] || fail "service Userが想定外です: ${SERVICE_USER:-root}（想定: $APP_USER）"
+SERVICE_WORKDIR="$(systemctl show "$SERVICE" -p WorkingDirectory --value)"
+case "$SERVICE_WORKDIR" in
+  "$REPO"|"$REPO"/*) ;;
+  *) fail "service WorkingDirectoryがリポジトリ配下ではありません: ${SERVICE_WORKDIR:-未設定}" ;;
+esac
+
 SERVICE_EXEC="$(systemctl show "$SERVICE" -p ExecStart --value)"
 NODE_PATH="$(printf '%s\n' "$SERVICE_EXEC" | grep -oE '/[^ ;]+/bin/node' | head -n 1 || true)"
 if [[ -z "$NODE_PATH" ]]; then
@@ -78,10 +104,6 @@ fi
 [[ -n "$NODE_PATH" && -x "$NODE_PATH" ]] || fail "systemdまたはNVMからNodeを検出できません"
 NODE_BIN="$(dirname "$NODE_PATH")"
 APP_PATH="$NODE_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-as_app() {
-  sudo -u "$APP_USER" env HOME="$APP_HOME" PATH="$APP_PATH" "$@"
-}
 
 as_app node --version >/dev/null
 as_app pnpm --version >/dev/null
@@ -109,12 +131,12 @@ TARGET_SHA="$(as_app git rev-parse "${REMOTE}/${BRANCH}")"
 as_app git merge-base --is-ancestor "$BEFORE_SHA" "$TARGET_SHA" \
   || fail "本番HEADから${REMOTE}/${BRANCH}へfast-forwardできません"
 
-printf '反映前SHA: %s\n取得先SHA: %s\n' "$BEFORE_SHA" "$TARGET_SHA"
+printf '反映前SHA:   %s\n取得先SHA:   %s\n' "$BEFORE_SHA" "$TARGET_SHA"
 printf '最終成功SHA: %s\n' "${DEPLOYED_SHA:-未記録}"
 printf 'Node: %s\npnpm: %s\n' "$(as_app node --version)" "$(as_app pnpm --version)"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  echo "✅ dry-run完了。本番への変更、バックアップ、再起動は行っていません。"
+  echo "✅ dry-run完了。作業ツリー、DB、依存関係、serviceは変更していません。"
   exit 0
 fi
 
@@ -123,8 +145,29 @@ if [[ "$BEFORE_SHA" == "$TARGET_SHA" && "$DEPLOYED_SHA" == "$TARGET_SHA" && "$FO
     echo "✅ このSHAは反映・起動確認済みです。何も変更していません。再検証する場合は --force を使用してください。"
     exit 0
   fi
-  echo "⚠️ SHAは反映済みですがサービスがactiveではないため、検証と再起動を続行します。"
+  echo "⚠️ SHAは反映済みですがサービスがactiveではないため、事前検証と再起動を続行します。"
 fi
+
+STEP="取得先SHAの隔離検証"
+log "取得先SHAを一時worktreeで検証"
+as_app git worktree prune
+VERIFY_DIR="$APP_HOME/.meigokujo-deploy-check-${TARGET_SHA:0:12}-$$"
+[[ ! -e "$VERIFY_DIR" ]] || fail "一時検証ディレクトリが既に存在します: $VERIFY_DIR"
+as_app git worktree add --detach "$VERIFY_DIR" "$TARGET_SHA"
+(
+  cd "$VERIFY_DIR"
+  as_app pnpm install --frozen-lockfile
+  as_app pnpm -r typecheck
+  as_app pnpm -r test
+  VERIFY_DIRTY="$(as_app git status --porcelain=v1 --untracked-files=all)"
+  if [[ -n "$VERIFY_DIRTY" ]]; then
+    echo "$VERIFY_DIRTY" >&2
+    fail "事前検証後に追跡対象の差分が発生しました"
+  fi
+)
+as_app git worktree remove --force "$VERIFY_DIR"
+VERIFY_DIR=""
+as_app git worktree prune
 
 STEP="反映前バックアップ"
 log "反映前バックアップ"
@@ -136,23 +179,15 @@ as_app git merge --ff-only "$TARGET_SHA"
 AFTER_SHA="$(as_app git rev-parse HEAD)"
 [[ "$AFTER_SHA" == "$TARGET_SHA" ]] || fail "反映後SHAが取得先SHAと一致しません"
 
-STEP="依存関係の同期"
-log "依存関係を同期"
+STEP="本番依存関係の同期"
+log "本番依存関係を同期"
 as_app pnpm install --frozen-lockfile
 
-STEP="型検査"
-log "typecheck"
-as_app pnpm -r typecheck
-
-STEP="テスト"
-log "test"
-as_app pnpm -r test
-
-STEP="検証後の作業ツリー確認"
+STEP="反映後の作業ツリー確認"
 DIRTY_AFTER="$(as_app git status --porcelain=v1 --untracked-files=all)"
 if [[ -n "$DIRTY_AFTER" ]]; then
   echo "$DIRTY_AFTER" >&2
-  fail "依存同期または検証後に追跡対象の差分が発生しました"
+  fail "依存同期後に追跡対象の差分が発生しました"
 fi
 
 STEP="Botサービスの再起動"
@@ -172,6 +207,7 @@ log "service状態"
 systemctl status "$SERVICE" --no-pager --full
 log "再起動後journal"
 journalctl -u "$SERVICE" --since "$RESTART_AT" -n 120 --no-pager
+systemctl is-active --quiet "$SERVICE" || fail "journal確認後にサービスがactiveではありません"
 
 STEP="成功SHAの記録"
 AFTER_SHA="$(as_app git rev-parse HEAD)"
@@ -183,8 +219,8 @@ DEPLOYED_SHA="$AFTER_SHA"
 STEP="完了"
 echo
 echo "✅ 本番反映完了"
-echo "反映前SHA: $BEFORE_SHA"
-echo "取得先SHA: $TARGET_SHA"
-echo "反映後SHA: $AFTER_SHA"
-echo "service:    $(systemctl is-active "$SERVICE")"
+echo "反映前SHA:   $BEFORE_SHA"
+echo "取得先SHA:   $TARGET_SHA"
+echo "反映後SHA:   $AFTER_SHA"
+echo "service:      $(systemctl is-active "$SERVICE")"
 echo "次にDiscordで計器盤など、変更箇所の実表示を人手確認してください。"
