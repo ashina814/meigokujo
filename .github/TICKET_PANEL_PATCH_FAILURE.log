@@ -1,0 +1,40 @@
+Scope: all 3 workspace projects
+Lockfile is up to date, resolution step is skipped
+Progress: resolved 1, reused 0, downloaded 0, added 0
+Packages: +122
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Progress: resolved 122, reused 122, downloaded 0, added 122, done
+
+Done in 1.1s using pnpm v9.15.9
+
+> meigokujo@ typecheck /home/runner/work/meigokujo/meigokujo
+> pnpm -r typecheck
+
+Scope: 2 of 3 workspace projects
+packages/core typecheck$ tsc --noEmit
+packages/core typecheck: Done
+apps/bot typecheck$ tsc --noEmit
+apps/bot typecheck: src/commands/admin-hub.ts(1040,86): error TS1002: Unterminated string literal.
+apps/bot typecheck: src/commands/admin-hub.ts(1041,1): error TS1005: ',' expected.
+apps/bot typecheck: src/commands/admin-hub.ts(1041,7): error TS1127: Invalid character.
+apps/bot typecheck: src/commands/admin-hub.ts(1041,12): error TS1127: Invalid character.
+apps/bot typecheck: src/commands/admin-hub.ts(1041,15): error TS1002: Unterminated string literal.
+apps/bot typecheck: src/commands/admin-hub.ts(1042,3): error TS1005: ',' expected.
+apps/bot typecheck: src/commands/admin-hub.ts(1048,11): error TS1002: Unterminated string literal.
+apps/bot typecheck: src/commands/admin-hub.ts(1049,1): error TS1005: ',' expected.
+apps/bot typecheck: src/commands/admin-hub.ts(1049,5): error TS1002: Unterminated string literal.
+apps/bot typecheck: src/commands/admin-hub.ts(1050,3): error TS1005: ',' expected.
+apps/bot typecheck: src/commands/admin-hub.ts(1083,317): error TS1002: Unterminated string literal.
+apps/bot typecheck: src/commands/admin-hub.ts(1084,1): error TS1005: ',' expected.
+apps/bot typecheck: src/commands/admin-hub.ts(1084,105): error TS1002: Unterminated string literal.
+apps/bot typecheck: src/commands/admin-hub.ts(1085,1): error TS1005: ',' expected.
+apps/bot typecheck: src/commands/admin-hub.ts(1282,148): error TS1002: Unterminated string literal.
+apps/bot typecheck: src/commands/admin-hub.ts(1283,1): error TS1005: ',' expected.
+apps/bot typecheck: src/commands/admin-hub.ts(1283,92): error TS1002: Unterminated string literal.
+apps/bot typecheck: src/commands/admin-hub.ts(1284,1): error TS1005: ',' expected.
+apps/bot typecheck: src/commands/admin-hub.ts(1737,1): error TS1005: '}' expected.
+apps/bot typecheck: Failed
+/home/runner/work/meigokujo/meigokujo/apps/bot:
+ ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @meigokujo/bot@0.1.0 typecheck: `tsc --noEmit`
+Exit status 2
+ ELIFECYCLE  Command failed with exit code 2.
