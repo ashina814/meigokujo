@@ -21,10 +21,10 @@ function isUnknownMember(error: unknown): boolean {
 }
 
 function readPending(services: Pick<Services, "settings">): AutoDropPending[] {
-  const raw = services.settings.getString(AUTODROP_PENDING_KEY);
+  const raw = services.settings.getString(AUTODROP_PENDING_KEY) as unknown;
   if (!raw) return [];
   try {
-    const parsed = JSON.parse(raw) as unknown;
+    const parsed = Array.isArray(raw) ? raw : typeof raw === "string" ? JSON.parse(raw) as unknown : [];
     if (!Array.isArray(parsed)) return [];
     return parsed.flatMap((value) => {
       if (typeof value !== "object" || value === null) return [];
