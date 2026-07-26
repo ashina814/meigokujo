@@ -20,6 +20,14 @@ interface ExpiredRolePurchaseRow {
   item_delivery_data: string | null;
 }
 
+interface RoleMutableMember {
+  roles: {
+    cache: { has(roleId: string): boolean };
+    add(roleId: string): Promise<unknown>;
+    remove(roleId: string): Promise<unknown>;
+  };
+}
+
 function errorCode(error: unknown): number | undefined {
   if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
   const code = Number((error as { code?: unknown }).code);
@@ -57,7 +65,7 @@ function savePending(services: Pick<Services, "settings">, pending: AutoDropPend
 }
 
 async function reconcileCancelledAutoDrop(
-  member: Awaited<ReturnType<Awaited<ReturnType<Client["guilds"]["fetch"]>>["members"]["fetch"]>>,
+  member: RoleMutableMember,
   currentStatus: string | undefined,
   ghostRoleId: string,
   meireiRoleId: string,
@@ -141,7 +149,7 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
   for (const row of [...pending]) {
     if (!row.demoted || (row.meireiAdded && row.ghostRemoved)) continue;
 
-    let member;
+    let member: RoleMutableMember;
     try {
       member = await guild.members.fetch(row.userId);
     } catch (error) {
@@ -318,7 +326,7 @@ export function backfillShopRoleRevocations(services: Pick<Services, "db">): voi
 export function chargeMonthlySubscriptionsAtomically(
   services: Pick<Services, "db" | "shop">,
   actor: string,
-): ReturnType<Services["shop"]["chargeMonthlySubscriptions"]> {
+) {
   return services.db.transaction(() => services.shop.chargeMonthlySubscriptions(actor))();
 }
 
