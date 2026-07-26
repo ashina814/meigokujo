@@ -2,12 +2,22 @@ import type { Client } from "discord.js";
 import type { Services } from "./services.js";
 
 const AUTODROP_PENDING_KEY = "autodrop:pending_role_sync";
+let shopRoleRevocationInFlight = false;
 
 interface AutoDropPending {
   userId: string;
   demoted: boolean;
   meireiAdded: boolean;
   ghostRemoved: boolean;
+}
+
+interface ExpiredRolePurchaseRow {
+  purchase_id: number;
+  user_id: string;
+  delivery_snapshot_json: string | null;
+  item_delivery: string;
+  item_delivery_kind: string | null;
+  item_delivery_data: string | null;
 }
 
 function errorCode(error: unknown): number | undefined {
@@ -44,6 +54,16 @@ function readPending(services: Pick<Services, "settings">): AutoDropPending[] {
 
 function savePending(services: Pick<Services, "settings">, pending: AutoDropPending[]): void {
   services.settings.set(AUTODROP_PENDING_KEY, pending, "system:auto-drop");
+}
+
+async function reconcileCancelledAutoDrop(
+  member: Awaited<ReturnType<Awaited<ReturnType<Client["guilds"]["fetch"]>>["members"]["fetch"]>>,
+  currentStatus: string | undefined,
+  ghostRoleId: string,
+  meireiRoleId: string,
+): Promise<void> {
+  if (member.roles.cache.has(meireiRoleId)) await member.roles.remove(meireiRoleId);
+  if (currentStatus === "ghost" && !member.roles.cache.has(ghostRoleId)) await member.roles.add(ghostRoleId);
 }
 
 /**
@@ -93,7 +113,6 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
       continue;
     }
     if (!ghostIds.has(row.userId)) {
-      // 魂台帳から消えた、または別状態へ移った対象は同期不要として除去する。
       row.demoted = true;
       row.meireiAdded = true;
       row.ghostRemoved = true;
@@ -121,20 +140,12 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
   const failures: string[] = [];
   for (const row of [...pending]) {
     if (!row.demoted || (row.meireiAdded && row.ghostRemoved)) continue;
-    const currentBeforeFetch = services.entry.getSoul(row.userId);
-    if (currentBeforeFetch?.status !== "meirei") {
-      row.meireiAdded = true;
-      row.ghostRemoved = true;
-      savePending(services, pending);
-      continue;
-    }
 
     let member;
     try {
       member = await guild.members.fetch(row.userId);
     } catch (error) {
       if (isUnknownMember(error)) {
-        // 退城済みならDiscord側で剥がすロールがないため完了。
         row.meireiAdded = true;
         row.ghostRemoved = true;
         savePending(services, pending);
@@ -144,7 +155,33 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
       continue;
     }
 
+    const statusAfterFetch = services.entry.getSoul(row.userId)?.status;
+    if (statusAfterFetch !== "meirei") {
+      try {
+        await reconcileCancelledAutoDrop(member, statusAfterFetch, ghostRoleId, meireiRoleId);
+        row.meireiAdded = true;
+        row.ghostRemoved = true;
+        savePending(services, pending);
+      } catch (error) {
+        failures.push(`rollback_cancelled:${row.userId}:${error instanceof Error ? error.message : String(error)}`);
+      }
+      continue;
+    }
+
     if (!row.meireiAdded) {
+      const statusBeforeAdd = services.entry.getSoul(row.userId)?.status;
+      if (statusBeforeAdd !== "meirei") {
+        try {
+          await reconcileCancelledAutoDrop(member, statusBeforeAdd, ghostRoleId, meireiRoleId);
+          row.meireiAdded = true;
+          row.ghostRemoved = true;
+          savePending(services, pending);
+        } catch (error) {
+          failures.push(`rollback_before_add:${row.userId}:${error instanceof Error ? error.message : String(error)}`);
+        }
+        continue;
+      }
+
       if (member.roles.cache.has(meireiRoleId)) {
         row.meireiAdded = true;
         savePending(services, pending);
@@ -158,13 +195,35 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
           continue;
         }
       }
+
+      const statusAfterAdd = services.entry.getSoul(row.userId)?.status;
+      if (statusAfterAdd !== "meirei") {
+        try {
+          await reconcileCancelledAutoDrop(member, statusAfterAdd, ghostRoleId, meireiRoleId);
+          row.meireiAdded = true;
+          row.ghostRemoved = true;
+          savePending(services, pending);
+        } catch (error) {
+          row.ghostRemoved = false;
+          savePending(services, pending);
+          failures.push(`rollback_after_add:${row.userId}:${error instanceof Error ? error.message : String(error)}`);
+        }
+        continue;
+      }
     }
 
-    const currentBeforeGhostRemoval = services.entry.getSoul(row.userId);
-    if (currentBeforeGhostRemoval?.status !== "meirei") {
-      row.meireiAdded = true;
-      row.ghostRemoved = true;
-      savePending(services, pending);
+    const statusBeforeGhostRemoval = services.entry.getSoul(row.userId)?.status;
+    if (statusBeforeGhostRemoval !== "meirei") {
+      try {
+        await reconcileCancelledAutoDrop(member, statusBeforeGhostRemoval, ghostRoleId, meireiRoleId);
+        row.meireiAdded = true;
+        row.ghostRemoved = true;
+        savePending(services, pending);
+      } catch (error) {
+        row.ghostRemoved = false;
+        savePending(services, pending);
+        failures.push(`rollback_before_ghost_remove:${row.userId}:${error instanceof Error ? error.message : String(error)}`);
+      }
       continue;
     }
 
@@ -190,60 +249,140 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
   if (failures.length > 0) throw new Error(`autodrop:role_sync_failed:${failures.join(",")}`);
 }
 
+function roleIdFromSnapshotOrItem(row: ExpiredRolePurchaseRow): { roleId?: string; error?: string; applicable: boolean } {
+  const raw = row.delivery_snapshot_json;
+  try {
+    if (raw) {
+      const snapshot = JSON.parse(raw) as { delivery_kind?: unknown; delivery_data?: unknown };
+      if (snapshot.delivery_kind !== "add_role") return { applicable: false };
+      if (typeof snapshot.delivery_data !== "string" || !snapshot.delivery_data) {
+        return { applicable: true, error: "delivery_data_missing" };
+      }
+      const data = JSON.parse(snapshot.delivery_data) as { role_id?: unknown };
+      return typeof data.role_id === "string" && data.role_id.trim()
+        ? { applicable: true, roleId: data.role_id.trim() }
+        : { applicable: true, error: "role_id_missing" };
+    }
+
+    if (row.item_delivery !== "auto" || row.item_delivery_kind !== "add_role") return { applicable: false };
+    if (!row.item_delivery_data) return { applicable: true, error: "legacy_delivery_data_missing" };
+    const data = JSON.parse(row.item_delivery_data) as { role_id?: unknown };
+    return typeof data.role_id === "string" && data.role_id.trim()
+      ? { applicable: true, roleId: data.role_id.trim() }
+      : { applicable: true, error: "legacy_role_id_missing" };
+  } catch (error) {
+    return { applicable: true, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export function backfillShopRoleRevocations(services: Pick<Services, "db">): void {
+  const rows = services.db
+    .prepare(
+      `SELECT p.id AS purchase_id, p.user_id, p.delivery_snapshot_json,
+              i.delivery AS item_delivery, i.delivery_kind AS item_delivery_kind, i.delivery_data AS item_delivery_data
+       FROM shop_purchases p
+       JOIN shop_items i ON i.id = p.item_id
+       LEFT JOIN shop_role_revocations r ON r.purchase_id = p.id
+       WHERE p.status = 'expired' AND r.purchase_id IS NULL`,
+    )
+    .all() as ExpiredRolePurchaseRow[];
+  if (rows.length === 0) return;
+
+  const insert = services.db.prepare(
+    `INSERT OR IGNORE INTO shop_role_revocations
+     (purchase_id, user_id, role_id, status, attempts, last_error, created_at, updated_at, completed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const ts = Math.floor(Date.now() / 1000);
+  services.db.transaction(() => {
+    for (const row of rows) {
+      const parsed = roleIdFromSnapshotOrItem(row);
+      if (!parsed.applicable) continue;
+      const status = parsed.roleId ? "pending" : "failed";
+      const lastError = parsed.roleId ? null : `backfill_invalid_delivery:${parsed.error ?? "unknown"}`;
+      insert.run(
+        row.purchase_id,
+        row.user_id,
+        parsed.roleId ?? null,
+        status,
+        status === "failed" ? 1 : 0,
+        lastError,
+        ts,
+        ts,
+        status === "failed" ? ts : null,
+      );
+    }
+  })();
+}
+
+export function chargeMonthlySubscriptionsAtomically(
+  services: Pick<Services, "db" | "shop">,
+  actor: string,
+): ReturnType<Services["shop"]["chargeMonthlySubscriptions"]> {
+  return services.db.transaction(() => services.shop.chargeMonthlySubscriptions(actor))();
+}
+
 /**
  * 失効済みadd_role商品のロール剥奪を、購入ID単位のDB pendingキューから再試行する。
  * 現在の商品設定ではなく購入時スナップショット由来のrole_idを使い、
  * 同じロールを正当に付与するactive購入があれば剥奪せず完了扱いにする。
  */
 export async function processShopRoleRevocations(client: Client, services: Services): Promise<void> {
-  const pending = services.shop.pendingRoleRevocations();
-  if (pending.length === 0) return;
-  const guildId = services.settings.getString("guild:main");
-  if (!guildId) throw new Error("shop_role_revoke:guild_id_missing");
-  const guild = await client.guilds.fetch(guildId).catch((error) => {
-    throw new Error(`shop_role_revoke:guild_fetch_failed:${error instanceof Error ? error.message : String(error)}`);
-  });
+  if (shopRoleRevocationInFlight) return;
+  shopRoleRevocationInFlight = true;
+  try {
+    backfillShopRoleRevocations(services);
+    const pending = services.shop.pendingRoleRevocations();
+    if (pending.length === 0) return;
+    const guildId = services.settings.getString("guild:main");
+    if (!guildId) throw new Error("shop_role_revoke:guild_id_missing");
+    const guild = await client.guilds.fetch(guildId).catch((error) => {
+      throw new Error(`shop_role_revoke:guild_fetch_failed:${error instanceof Error ? error.message : String(error)}`);
+    });
 
-  const failures: string[] = [];
-  for (const candidate of pending) {
-    if (!candidate.role_id) {
-      services.shop.markRoleRevocationRetry(candidate.purchase_id, "system:shop-role-revoke", "role_id_missing");
-      failures.push(`role_id_missing:${candidate.purchase_id}`);
-      continue;
-    }
-    if (services.shop.activePurchaseGrantsRole(candidate.user_id, candidate.role_id, candidate.purchase_id)) {
-      services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "active_purchase_still_grants_role");
-      continue;
-    }
-
-    let member;
-    try {
-      member = await guild.members.fetch(candidate.user_id);
-    } catch (error) {
-      if (isUnknownMember(error)) {
-        services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "member_absent");
+    const failures: string[] = [];
+    for (const candidate of pending) {
+      if (!candidate.role_id) {
+        services.shop.markRoleRevocationRetry(candidate.purchase_id, "system:shop-role-revoke", "role_id_missing");
+        failures.push(`role_id_missing:${candidate.purchase_id}`);
         continue;
       }
-      const message = error instanceof Error ? error.message : String(error);
-      services.shop.markRoleRevocationRetry(candidate.purchase_id, "system:shop-role-revoke", message);
-      failures.push(`member_fetch:${candidate.purchase_id}:${message}`);
-      continue;
+      if (services.shop.activePurchaseGrantsRole(candidate.user_id, candidate.role_id, candidate.purchase_id)) {
+        services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "active_purchase_still_grants_role");
+        continue;
+      }
+
+      let member;
+      try {
+        member = await guild.members.fetch(candidate.user_id);
+      } catch (error) {
+        if (isUnknownMember(error)) {
+          services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "member_absent");
+          continue;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        services.shop.markRoleRevocationRetry(candidate.purchase_id, "system:shop-role-revoke", message);
+        failures.push(`member_fetch:${candidate.purchase_id}:${message}`);
+        continue;
+      }
+
+      if (!member.roles.cache.has(candidate.role_id)) {
+        services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "already_absent");
+        continue;
+      }
+
+      try {
+        await member.roles.remove(candidate.role_id);
+        services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "removed");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        services.shop.markRoleRevocationRetry(candidate.purchase_id, "system:shop-role-revoke", message);
+        failures.push(`role_remove:${candidate.purchase_id}:${message}`);
+      }
     }
 
-    if (!member.roles.cache.has(candidate.role_id)) {
-      services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "already_absent");
-      continue;
-    }
-
-    try {
-      await member.roles.remove(candidate.role_id);
-      services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "removed");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      services.shop.markRoleRevocationRetry(candidate.purchase_id, "system:shop-role-revoke", message);
-      failures.push(`role_remove:${candidate.purchase_id}:${message}`);
-    }
+    if (failures.length > 0) throw new Error(`shop_role_revocation_failed:${failures.join(",")}`);
+  } finally {
+    shopRoleRevocationInFlight = false;
   }
-
-  if (failures.length > 0) throw new Error(`shop_role_revocation_failed:${failures.join(",")}`);
 }
