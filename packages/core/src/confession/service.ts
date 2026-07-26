@@ -45,6 +45,7 @@ export type CloseReason =
   | "sent_court"
   | "info_only"
   | "no_action"
+  | "voice_received"
   | "other";
 
 export interface ConfessionRow {

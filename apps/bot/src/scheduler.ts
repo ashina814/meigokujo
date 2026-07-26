@@ -13,6 +13,7 @@ import { fmtLd } from "./format.js";
 import { announceAutoClose, announceSettle, refreshMarketPanel } from "./commands/ita.js";
 import { ticketStaffRoleIds } from "./commands/tickets.js";
 import type { Services } from "./services.js";
+import { runSchedulerTaskOnce, sendChunkedLines } from "./scheduler-utils.js";
 
 /** JSTの現在時刻の分解値。VPSのTZに依存しないよう明示的に変換する */
 export function jstNow(date = new Date()): {
@@ -78,20 +79,19 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
           if (now.hour === notifyHour && now.minute === s.minute) {
             const marker = `session:notify:${now.dateStr}:${s.start}:${s.kind}`;
             if (!services.settings.getString(marker)) {
-              services.settings.set(marker, "1", "system:scheduler");
-              const guideId = services.settings.getString("channel:entry_guide");
-              const waitRoleId = services.settings.getString("role:queue_wait");
-              const ch = guideId ? await client.channels.fetch(guideId).catch(() => null) : null;
-              if (ch?.isTextBased() && "send" in ch) {
-                const rolePart = waitRoleId ? `<@&${waitRoleId}> ` : "";
-                const timing = s.kind === "30m" ? "**30分後**" : "**まもなく**";
-                await ch
-                  .send({
+              await runSchedulerTaskOnce(services, marker, "system:scheduler", async () => {
+                const guideId = services.settings.getString("channel:entry_guide");
+                const waitRoleId = services.settings.getString("role:queue_wait");
+                const ch = guideId ? await client.channels.fetch(guideId).catch(() => null) : null;
+                if (ch?.isTextBased() && "send" in ch) {
+                  const rolePart = waitRoleId ? `<@&${waitRoleId}> ` : "";
+                  const timing = s.kind === "30m" ? "**30分後**" : "**まもなく**";
+                  await ch.send({
                     content: `📣 ${rolePart}${timing}（**${s.start}時**）に説明会があります。**説明会場VC**に来てお待ちください。`,
                     allowedMentions: { roles: waitRoleId ? [waitRoleId] : [] },
-                  })
-                  .catch(() => undefined);
-              }
+                  });
+                }
+              }).catch((e) => console.error("[説明会] 通知失敗:", e));
             }
           }
         }
@@ -112,6 +112,7 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
             channel as TextChannel,
             `📮 ${staffRoleIds.length > 0 ? `${staffRoleIds.map((id) => `<@&${id}>`).join(" ")} ` : ""}**24時間以上応答のないチケットが ${stale.length} 件あります**:`,
             stale.map((t) => `・<#${t.thread_id}>（${t.panel_name ?? (t.kind === "return" ? "出戻り" : t.kind === "consult" ? "相談" : t.kind)}）`),
+            { allowedRoleIds: staffRoleIds },
           );
           for (const t of stale) services.tickets.markReminded(t.thread_id);
         }
@@ -142,8 +143,9 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       const yesterday = jstNow(new Date(Date.now() - 86_400_000)).dateStr;
       const marker = `vc_reward:paid:${yesterday}`;
       if (!services.settings.getString(marker)) {
-        services.settings.set(marker, "1", "system:scheduler");
-        await payVcRewards(client, services, yesterday);
+        await runSchedulerTaskOnce(services, marker, "system:scheduler", () =>
+          payVcRewards(client, services, yesterday),
+        );
       }
     }
 
@@ -151,44 +153,45 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     if (now.hour === 5 && now.minute >= 30 && now.minute < 33) {
       const marker = `eval_stats:refreshed:${now.dateStr}`;
       if (!services.settings.getString(marker)) {
-        services.settings.set(marker, "1", "system:scheduler");
-        await refreshEvalStats(client, services).catch((e) => console.error("[評価] 実績更新失敗:", e));
+        await runSchedulerTaskOnce(services, marker, "system:scheduler", () =>
+          refreshEvalStats(client, services),
+        ).catch((e) => console.error("[評価] 実績更新失敗:", e));
       }
     }
 
     // ── 位階（VCロール）: 毎日 06:00 台に累計VC時間で付け直す ──
     if (now.hour === 6 && !services.settings.getString(`vc_rank:applied:${now.dateStr}`)) {
-      services.settings.set(`vc_rank:applied:${now.dateStr}`, "1", "system:scheduler");
-      await applyVcRanks(client, services).catch((e) => console.error("[位階] 付与失敗:", e));
+      await runSchedulerTaskOnce(services, `vc_rank:applied:${now.dateStr}`, "system:scheduler", () =>
+        applyVcRanks(client, services),
+      ).catch((e) => console.error("[位階] 付与失敗:", e));
     }
 
     // ── トートの耳: 保存期間を過ぎた相談本文を毎日 04:00 台にpurge（メタ・操作ログは残す）──
     if (now.hour === 4) {
       const marker = `confession_purge:${now.dateStr}`;
       if (!services.settings.getString(marker)) {
-        services.settings.set(marker, "1", "system:scheduler");
-        try {
+        await runSchedulerTaskOnce(services, marker, "system:scheduler", async () => {
           const due = services.confessions.listPurgeable();
           for (const c of due) services.confessions.purgeBody(c.id, "system:scheduler", { auto: true });
           if (due.length > 0) console.log(`[トート] 保存期間切れの相談本文 ${due.length}件 をpurgeしました`);
-        } catch (e) {
-          console.error("[トート] 本文purge失敗:", e);
-        }
+        }).catch((e) => console.error("[トート] 本文purge失敗:", e));
       }
     }
 
     // ── カロン: 毎日 09:00 台に期限リスト・演出通知・迷霊落ち承認パネル ──
     if (now.hour === 9 && !services.settings.getString(`charon:daily:${now.dateStr}`)) {
-      services.settings.set(`charon:daily:${now.dateStr}`, "1", "system:scheduler");
-      await runCharonDaily(client, services);
+      await runSchedulerTaskOnce(services, `charon:daily:${now.dateStr}`, "system:scheduler", () =>
+        runCharonDaily(client, services),
+      );
     }
 
     // ── 14日経ってフォーラム未作成の亡霊は自動で迷霊に落とす（毎日 09:15）──
     if (now.hour === 9 && now.minute >= 15 && now.minute < 18) {
       const marker = `autodrop:noeval:${now.dateStr}`;
       if (!services.settings.getString(marker)) {
-        services.settings.set(marker, "1", "system:scheduler");
-        await autoDropNoEvalGhosts(client, services).catch((e) => console.error("[自動迷霊] 失敗:", e));
+        await runSchedulerTaskOnce(services, marker, "system:scheduler", () =>
+          autoDropNoEvalGhosts(client, services),
+        ).catch((e) => console.error("[自動迷霊] 失敗:", e));
       }
     }
 
@@ -266,8 +269,7 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     if (now.day === 1 && now.hour === 8) {
       const shopMarker = `shop:monthly:${now.period}`;
       if (!services.settings.getString(shopMarker)) {
-        services.settings.set(shopMarker, "1", "system:scheduler");
-        try {
+        await runSchedulerTaskOnce(services, shopMarker, "system:scheduler", async () => {
           const { charged, lapsed } = services.shop.chargeMonthlySubscriptions("system:shop-monthly");
           console.log(`[ショップ] 月額一括: 課金 ${charged.length}件 / 失効 ${lapsed.length}件`);
           // 失効ユーザーへのDM＆ロール剥奪
@@ -291,9 +293,7 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
               }
             }
           }
-        } catch (e) {
-          console.error("[ショップ] 月額一括処理失敗:", e);
-        }
+        }).catch((e) => console.error("[ショップ] 月額一括処理失敗:", e));
       }
     }
 
@@ -358,43 +358,6 @@ export async function payVcRewards(client: Client, services: Services, dateStr: 
     }
   }
   console.log(`[刻時盤] 浮上報酬 ${dateStr}: ${rewards.length}名 / ${total} Ld`);
-}
-
-/** Discordの1メッセージあたりの content 上限 */
-const DISCORD_CONTENT_MAX = 2000;
-
-/**
- * 見出し＋行リストを 2000 文字以内へ分割して送る。
- *
- * 対象者が増えると単一 content が上限を超え、DiscordAPIError[50035] で
- * 「送信そのものが失敗」する。定期ジョブの中で throw すると後続処理まで巻き添えになるため、
- * 一覧を投げる箇所は必ずこれを通す。components はボタンの二重表示を避けて最後のチャンクにだけ付ける。
- */
-async function sendChunkedLines(
-  channel: TextChannel,
-  header: string,
-  lines: string[],
-  opts: { components?: ActionRowBuilder<ButtonBuilder>[] } = {},
-): Promise<void> {
-  const chunks: string[] = [];
-  let cur = header;
-  for (const raw of lines) {
-    const line = raw.length > DISCORD_CONTENT_MAX ? `${raw.slice(0, DISCORD_CONTENT_MAX - 1)}…` : raw;
-    if (`${cur}\n${line}`.length > DISCORD_CONTENT_MAX) {
-      chunks.push(cur);
-      cur = line;
-    } else {
-      cur = cur ? `${cur}\n${line}` : line;
-    }
-  }
-  if (cur) chunks.push(cur);
-  for (let i = 0; i < chunks.length; i++) {
-    await channel.send({
-      content: chunks[i]!,
-      allowedMentions: { parse: [] },
-      ...(i === chunks.length - 1 && opts.components ? { components: opts.components } : {}),
-    });
-  }
 }
 
 /** カロンの日次業務: 期限リスト（計器盤）・本人への演出通知・期限切れの承認パネル（#決裁）・スレ題名の同期 */

@@ -13,7 +13,7 @@ describe("トートの耳・受領確認クローズ", () => {
       body: "返信は不要ですが、伝えておきたいことです。",
     });
 
-    const closed = confessions.close(row.id, "staff", "voice_received" as never, 7);
+    const closed = confessions.close(row.id, "staff", "voice_received", 7);
 
     expect(closed?.status).toBe("closed");
     expect(closed?.close_reason).toBe("voice_received");
