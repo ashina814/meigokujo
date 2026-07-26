@@ -36,6 +36,7 @@ export interface SchedulerChunkBatchRow {
   metadata_json: string | null;
   created_at: number;
   updated_at: number;
+  sent_at: number | null;
   completed_at: number | null;
 }
 
@@ -51,6 +52,11 @@ export interface ResumableChunkSnapshot {
 
 const now = () => Math.floor(Date.now() / 1000);
 
+function ensureColumn(db: Services["db"], table: string, column: string, definition: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
 function ensureChunkBatchTable(db: Services["db"]): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS scheduler_chunk_batches (
@@ -64,10 +70,12 @@ function ensureChunkBatchTable(db: Services["db"]): void {
       metadata_json   TEXT,
       created_at      INTEGER NOT NULL,
       updated_at      INTEGER NOT NULL,
+      sent_at         INTEGER,
       completed_at    INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_scheduler_chunk_batches_kind ON scheduler_chunk_batches(kind, status, created_at);
   `);
+  ensureColumn(db, "scheduler_chunk_batches", "sent_at", "INTEGER");
 }
 
 function buildChunks(header: string, lines: string[]): string[] {
@@ -113,12 +121,38 @@ export function cleanupCompletedChunkBatches(services: Pick<Services, "db">, old
     .run(now() - olderThanSec);
 }
 
+export function finalizeChunkBatch(
+  services: Pick<Services, "db">,
+  batchKey: string,
+  finalize?: () => void,
+): boolean {
+  ensureChunkBatchTable(services.db);
+  const complete = services.db.transaction(() => {
+    const row = services.db
+      .prepare("SELECT status, sent_at FROM scheduler_chunk_batches WHERE batch_key=?")
+      .get(batchKey) as { status: "pending" | "completed"; sent_at: number | null } | undefined;
+    if (!row || row.status === "completed") return false;
+    if (!row.sent_at) throw new Error(`scheduler_chunk_batch:not_fully_sent:${batchKey}`);
+    finalize?.();
+    const ts = now();
+    const updated = services.db
+      .prepare(
+        `UPDATE scheduler_chunk_batches
+         SET status='completed', chunks_json=NULL, metadata_json=NULL, updated_at=?, completed_at=?
+         WHERE batch_key=? AND status='pending' AND sent_at IS NOT NULL`,
+      )
+      .run(ts, ts, batchKey);
+    return updated.changes === 1;
+  });
+  return complete();
+}
+
 export async function sendChunkedLinesResumable(
   services: Pick<Services, "db">,
   channel: TextChannel,
   snapshot: ResumableChunkSnapshot,
   opts: { components?: ActionRowBuilder<ButtonBuilder>[] } = {},
-): Promise<{ targetIds: string[]; roleIds: string[]; sent: number }> {
+): Promise<{ targetIds: string[]; roleIds: string[]; sent: number; allSent: boolean }> {
   ensureChunkBatchTable(services.db);
   const ts = now();
   const existing = services.db
@@ -147,8 +181,11 @@ export async function sendChunkedLinesResumable(
     .get(snapshot.batchKey) as SchedulerChunkBatchRow;
   const targetIds = parseJsonArray(row.target_ids_json);
   const roleIds = parseJsonArray(row.role_ids_json);
-  if (row.status === "completed") return { targetIds, roleIds, sent: 0 };
+  if (row.status === "completed") return { targetIds, roleIds, sent: 0, allSent: true };
+  if (row.sent_at) return { targetIds, roleIds, sent: 0, allSent: true };
+
   const chunks = parseJsonArray(row.chunks_json);
+  if (chunks.length === 0) throw new Error(`scheduler_chunk_batch:chunks_missing:${snapshot.batchKey}`);
   const sentChunks = new Set(parseJsonArray(row.sent_chunks_json).map((v) => Number(v)).filter(Number.isInteger));
   let sentNow = 0;
   for (let i = 0; i < chunks.length; i += 1) {
@@ -161,15 +198,17 @@ export async function sendChunkedLinesResumable(
     sentChunks.add(i);
     sentNow += 1;
     services.db
-      .prepare("UPDATE scheduler_chunk_batches SET sent_chunks_json=?, updated_at=? WHERE batch_key=?")
+      .prepare("UPDATE scheduler_chunk_batches SET sent_chunks_json=?, updated_at=? WHERE batch_key=? AND status='pending'")
       .run(JSON.stringify([...sentChunks].sort((a, b) => a - b).map(String)), now(), snapshot.batchKey);
   }
+
+  if (sentChunks.size !== chunks.length) {
+    throw new Error(`scheduler_chunk_batch:send_incomplete:${snapshot.batchKey}`);
+  }
   services.db
-    .prepare(
-      "UPDATE scheduler_chunk_batches SET status='completed', chunks_json=NULL, metadata_json=NULL, updated_at=?, completed_at=? WHERE batch_key=?",
-    )
+    .prepare("UPDATE scheduler_chunk_batches SET sent_at=COALESCE(sent_at, ?), updated_at=? WHERE batch_key=? AND status='pending'")
     .run(now(), now(), snapshot.batchKey);
-  return { targetIds, roleIds, sent: sentNow };
+  return { targetIds, roleIds, sent: sentNow, allSent: true };
 }
 
 /**
