@@ -122,10 +122,26 @@ CREATE TABLE IF NOT EXISTS rooms (
   activated_at INTEGER,
   empty_since  INTEGER,
   status       TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+  pending_delete INTEGER NOT NULL DEFAULT 0 CHECK (pending_delete IN (0,1)),
+  delete_attempts INTEGER NOT NULL DEFAULT 0,
+  next_delete_retry_at INTEGER,
+  close_reason TEXT,
+  close_actor_id TEXT,
+  closed_at INTEGER,
+  unused_refund_tx_id INTEGER REFERENCES transactions(id),
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rooms_open ON rooms(status) WHERE status = 'open';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_owner_normal_open
+  ON rooms(owner_id)
+  WHERE status = 'open' AND kind = 'normal';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_owner_special_open
+  ON rooms(owner_id)
+  WHERE status = 'open' AND kind IN ('mitsugetsu','oborozuki','game');
+CREATE INDEX IF NOT EXISTS idx_rooms_pending_delete
+  ON rooms(status, pending_delete, next_delete_retry_at)
+  WHERE status = 'open' AND pending_delete = 1;
 
 CREATE TABLE IF NOT EXISTS recruits (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,10 +153,31 @@ CREATE TABLE IF NOT EXISTS recruits (
   panel_channel_id TEXT,
   panel_message_id TEXT,
   status           TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','matched','expired','cancelled')),
+  matched_user_id  TEXT,
+  refund_tx_id     INTEGER REFERENCES transactions(id),
+  updated_at       INTEGER,
   created_at       INTEGER NOT NULL,
   expires_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_recruits_open ON recruits(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS oborozuki_invites (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  requester_id   TEXT NOT NULL,
+  target_id      TEXT NOT NULL,
+  status         TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending','accepted','declined','expired','cancelled')),
+  token          TEXT NOT NULL UNIQUE,
+  price          INTEGER NOT NULL CHECK (price >= 0),
+  expires_at     INTEGER NOT NULL,
+  room_id        INTEGER REFERENCES rooms(id),
+  channel_id     TEXT,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  decided_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_oborozuki_invites_pending ON oborozuki_invites(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_oborozuki_invites_requester ON oborozuki_invites(requester_id, status);
 
 CREATE TABLE IF NOT EXISTS marks (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -487,8 +524,29 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "souls", "eval_demotion_threshold", "INTEGER");
   ensureColumn(db, "souls", "eval_invite_mark_per_person", "REAL");
   ensureColumn(db, "souls", "eval_invite_mark_cap", "REAL");
+  ensureColumn(db, "rooms", "pending_delete", "INTEGER NOT NULL DEFAULT 0 CHECK (pending_delete IN (0,1))");
+  ensureColumn(db, "rooms", "delete_attempts", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "rooms", "next_delete_retry_at", "INTEGER");
+  ensureColumn(db, "rooms", "close_reason", "TEXT");
+  ensureColumn(db, "rooms", "close_actor_id", "TEXT");
+  ensureColumn(db, "rooms", "closed_at", "INTEGER");
+  ensureColumn(db, "rooms", "unused_refund_tx_id", "INTEGER REFERENCES transactions(id)");
+  ensureColumn(db, "recruits", "matched_user_id", "TEXT");
+  ensureColumn(db, "recruits", "refund_tx_id", "INTEGER REFERENCES transactions(id)");
+  ensureColumn(db, "recruits", "updated_at", "INTEGER");
   ensureColumn(db, "shop_purchases", "delivery_snapshot_json", "TEXT");
   ensureColumn(db, "scheduler_chunk_batches", "sent_at", "INTEGER");
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_owner_normal_open
+      ON rooms(owner_id)
+      WHERE status = 'open' AND kind = 'normal';
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_owner_special_open
+      ON rooms(owner_id)
+      WHERE status = 'open' AND kind IN ('mitsugetsu','oborozuki','game');
+    CREATE INDEX IF NOT EXISTS idx_rooms_pending_delete
+      ON rooms(status, pending_delete, next_delete_retry_at)
+      WHERE status = 'open' AND pending_delete = 1;
+  `);
   backfillEvaluationMarkWeights(db);
   backfillEvaluationPolicySnapshots(db);
   return db;

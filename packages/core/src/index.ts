@@ -100,7 +100,18 @@ export {
   type SoulDeadlineRow,
 } from "./evaluation/service.js";
 export { VcRewards, type DailyReward, type RewardScope } from "./vc/rewards.js";
-export { Rooms, RoomError, type RoomRow, type RecruitRow, type RoomKind, type RoomErrorCode } from "./rooms/service.js";
+export {
+  Rooms,
+  RoomError,
+  roomOwnershipSlot,
+  type RoomRow,
+  type RecruitRow,
+  type OborozukiInviteRow,
+  type RoomKind,
+  type RoomErrorCode,
+  type RoomOwnershipSlot,
+  type RoomPanelValues,
+} from "./rooms/service.js";
 export { TitleEngine, TitleHelper, TITLE_RULES, type TitleRule, type GrantedTitle } from "./titles/service.js";
 export {
   Departments,
