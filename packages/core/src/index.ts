@@ -63,6 +63,7 @@ export {
   type DeliveryKind,
   type PurchaseStatus,
   type ShopErrorCode,
+  type ShopRoleRevocationRow,
 } from "./shop/service.js";
 export {
   Tickets,
@@ -85,6 +86,7 @@ export {
   type CloseReason,
   type AssigneeRow,
   type EmergencyRow,
+  type VoiceReceivedCloseResult,
 } from "./confession/service.js";
 export {
   Evaluation,

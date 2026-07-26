@@ -3,6 +3,15 @@ import { fmtLd } from "./format.js";
 import { threadTitleFor } from "./commands/evaluation.js";
 import type { Services } from "./services.js";
 
+interface RefreshOneResult {
+  updated: boolean;
+  failures: string[];
+}
+
+function isUnknownMessageError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === 10008;
+}
+
 /**
  * 亡霊の評価スレッドの「1件目メッセージ（起点メッセージ）」を最新の実績で書き換える。
  * 別Embedを追加投稿するのではなく、既にスレッドを開いた時に見えるメッセージを更新する。
@@ -40,14 +49,25 @@ function buildStarterContent(
   ].join("\n");
 }
 
-async function refreshOne(guild: Guild, services: Services, userId: string): Promise<boolean> {
+async function refreshOne(guild: Guild, services: Services, userId: string, dateStr: string): Promise<RefreshOneResult> {
+  const failures: string[] = [];
   const soul = services.entry.getSoul(userId);
-  if (!soul) return false;
+  if (!soul) return { updated: false, failures };
   const threadId = services.evaluation.threadFor(userId);
-  if (!threadId) return false;
-  const thread = (await guild.client.channels.fetch(threadId).catch(() => null)) as AnyThreadChannel | null;
-  if (!thread?.isThread()) return false;
-  if (thread.archived) await thread.setArchived(false).catch(() => undefined);
+  if (!threadId) return { updated: false, failures };
+  const thread = (await guild.client.channels.fetch(threadId).catch((e) => {
+    failures.push(`thread_fetch:${userId}:${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  })) as AnyThreadChannel | null;
+  if (!thread?.isThread()) {
+    if (failures.length === 0) failures.push(`thread_unavailable:${userId}`);
+    return { updated: false, failures };
+  }
+  if (thread.archived) {
+    await thread.setArchived(false).catch((e) => {
+      failures.push(`thread_unarchive:${userId}:${e instanceof Error ? e.message : String(e)}`);
+    });
+  }
   const member = await guild.members.fetch(userId).catch(() => null);
   const displayName = member?.displayName ?? userId;
 
@@ -55,7 +75,10 @@ async function refreshOne(guild: Guild, services: Services, userId: string): Pro
   // 変わっていない時は setName を呼ばない（スレッド名変更はレート制限が厳しいため）。
   const newName = threadTitleFor(displayName, soul.eval_deadline_at);
   if (thread.name !== newName) {
-    await thread.setName(newName).catch((e) => console.error(`[評価] スレッド名更新失敗 ${userId}:`, e));
+    await thread.setName(newName).catch((e) => {
+      failures.push(`thread_rename:${userId}:${e instanceof Error ? e.message : String(e)}`);
+      console.error(`[評価] スレッド名更新失敗 ${userId}:`, e);
+    });
   }
 
   const presence = services.vc.presence(userId, 14);
@@ -67,28 +90,57 @@ async function refreshOne(guild: Guild, services: Services, userId: string): Pro
   const content = buildStarterContent(displayName, soul, hours, mins, presence.daysSeen, balance, basePeriodDays, thresholds);
 
   // Forum スレッドの起点メッセージ ID はスレッド ID と同じ
-  const starter = await thread.messages.fetch(threadId).catch(() => null);
+  let starterFetchFailed = false;
+  let starterMissing = false;
+  const starter = await thread.messages.fetch(threadId).catch((e) => {
+    if (isUnknownMessageError(e)) {
+      starterMissing = true;
+      return null;
+    }
+    starterFetchFailed = true;
+    failures.push(`starter_fetch:${userId}:${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  });
   if (starter) {
-    await starter.edit({ content, embeds: [] }).catch((e) => console.error(`[評価] 起点メッセージ更新失敗 ${userId}:`, e));
-    return true;
+    await starter.edit({ content, embeds: [] }).catch((e) => {
+      failures.push(`starter_edit:${userId}:${e instanceof Error ? e.message : String(e)}`);
+      console.error(`[評価] 起点メッセージ更新失敗 ${userId}:`, e);
+    });
+    return { updated: failures.length === 0, failures };
   }
+  if (starterFetchFailed) return { updated: false, failures };
+
   // 起点が取れない場合は末尾に投稿（保険）
-  await thread.send({ content }).catch(() => undefined);
-  return true;
+  if (!starterMissing) return { updated: failures.length === 0, failures };
+  const fallbackMarker = `eval_stats:fallback_posted:${dateStr}:${threadId}`;
+  if (services.settings.getString(fallbackMarker)) return { updated: failures.length === 0, failures };
+  await thread
+    .send({ content })
+    .then(() => services.settings.set(fallbackMarker, "1", "system:eval-stats"))
+    .catch((e) => {
+      failures.push(`fallback_post:${userId}:${e instanceof Error ? e.message : String(e)}`);
+    });
+  return { updated: failures.length === 0, failures };
 }
 
 /** 対象1人のスレッド起点メッセージを即座に更新（スレッド作成直後・亡霊化直後などに呼ぶ） */
 export async function refreshEvalStatsForUser(guild: Guild, services: Services, userId: string): Promise<void> {
-  await refreshOne(guild, services, userId);
+  const dateStr = new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Tokyo" }).format(new Date());
+  const result = await refreshOne(guild, services, userId, dateStr);
+  if (result.failures.length > 0) throw new Error(`refreshEvalStatsForUser failed: ${result.failures.join(", ")}`);
 }
 
 /** 全亡霊のスレッド起点メッセージを更新（毎日05:30のバッチ用） */
 export async function refreshEvalStats(client: Client, services: Services): Promise<void> {
   const guildId = services.settings.getString("guild:main");
   const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
-  if (!guild) return;
+  if (!guild) throw new Error("guild_fetch_failed");
   const ghosts = services.entry.listSouls("ghost");
+  const dateStr = new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Tokyo" }).format(new Date());
+  const failures: string[] = [];
   for (const soul of ghosts) {
-    await refreshOne(guild, services, soul.user_id);
+    const result = await refreshOne(guild, services, soul.user_id, dateStr);
+    failures.push(...result.failures);
   }
+  if (failures.length > 0) throw new Error(`refreshEvalStats failed: ${failures.join(", ")}`);
 }

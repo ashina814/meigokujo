@@ -147,6 +147,7 @@ const CLOSE_META: Record<CloseReason, string> = {
   sent_court: "冥府裁判所へ送致した",
   info_only: "情報提供として記録した",
   no_action: "対応不要と判断した",
+  voice_received: "あなたの声は届きました",
   other: "その他",
 };
 // 新規クローズで選べる理由。旧「対応先=記録のみ」は info_only の終了理由で表現する。

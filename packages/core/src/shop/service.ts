@@ -60,6 +60,19 @@ export interface PurchaseRow {
   status: PurchaseStatus;
   delivered_at: number | null;
   auto_renew: number;
+  delivery_snapshot_json: string | null;
+}
+
+export interface ShopRoleRevocationRow {
+  purchase_id: number;
+  user_id: string;
+  role_id: string | null;
+  status: "pending" | "done" | "failed";
+  attempts: number;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
 }
 
 export type ShopErrorCode =
@@ -108,11 +121,64 @@ export class Shop {
     private readonly ledger: Ledger,
     private readonly events: EventLog,
     private readonly options: ShopOptions = {},
-  ) {}
+  ) {
+    this.ensureSchema();
+  }
+
+  private ensureSchema(): void {
+    this.ensureColumn("shop_purchases", "delivery_snapshot_json", "TEXT");
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS shop_role_revocations (
+        purchase_id INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
+        user_id     TEXT NOT NULL,
+        role_id     TEXT,
+        status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','done','failed')),
+        attempts    INTEGER NOT NULL DEFAULT 0,
+        last_error  TEXT,
+        created_at  INTEGER NOT NULL,
+        updated_at  INTEGER NOT NULL,
+        completed_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_shop_role_revocations_status ON shop_role_revocations(status, updated_at);
+    `);
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    if (cols.some((c) => c.name === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 
   private roleSatisfied(memberRoleIds: readonly string[], requireRoleId: string): boolean {
     const check = this.options.roleCheck ?? ((ids, req) => ids.includes(req));
     return check(memberRoleIds, requireRoleId);
+  }
+
+  private deliverySnapshot(item: ShopItemRow): string | null {
+    if (item.delivery !== "auto" || !item.delivery_kind) return null;
+    return JSON.stringify({
+      delivery: item.delivery,
+      delivery_kind: item.delivery_kind,
+      delivery_data: item.delivery_data,
+      captured_at: now(),
+    });
+  }
+
+  private roleIdFromDelivery(snapshotJson: string | null | undefined, item?: ShopItemRow): { roleId?: string; error?: string } {
+    const raw = snapshotJson ?? (item ? this.deliverySnapshot(item) : null);
+    if (!raw) return {};
+    try {
+      const snapshot = JSON.parse(raw) as { delivery_kind?: string; delivery_data?: string | null };
+      if (snapshot.delivery_kind !== "add_role") return {};
+      const dataRaw = snapshot.delivery_data;
+      if (!dataRaw) return { error: "delivery_data_missing" };
+      const data = JSON.parse(dataRaw) as { role_id?: unknown };
+      return typeof data.role_id === "string" && data.role_id.trim()
+        ? { roleId: data.role_id.trim() }
+        : { error: "role_id_missing" };
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
   }
 
   // ---- 商品CRUD ----
@@ -258,10 +324,10 @@ export class Shop {
     const info = this.db
       .prepare(
         `INSERT INTO shop_purchases
-         (item_id, user_id, purchased_at, expires_at, paid_land, paid_alt_kind, paid_alt_amount, status, auto_renew)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1)`,
+         (item_id, user_id, purchased_at, expires_at, paid_land, paid_alt_kind, paid_alt_amount, status, auto_renew, delivery_snapshot_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?)`,
       )
-      .run(item.id, input.userId, ts, expiresAt, paidLand, paidAltKind, paidAltAmount);
+      .run(item.id, input.userId, ts, expiresAt, paidLand, paidAltKind, paidAltAmount, this.deliverySnapshot(item));
     if (item.stock !== null) {
       this.db.prepare("UPDATE shop_items SET stock = stock - 1, updated_at = ? WHERE id = ?").run(ts, item.id);
     }
@@ -378,7 +444,96 @@ export class Shop {
   }
 
   private expire(purchaseId: number, actor: string): void {
+    const purchase = this.getPurchase(purchaseId);
+    const item = purchase ? this.getItem(purchase.item_id) : undefined;
     this.db.prepare("UPDATE shop_purchases SET status = 'expired' WHERE id = ?").run(purchaseId);
+    if (purchase) this.enqueueRoleRevocation(purchase, item, actor);
     this.events.log("shop_expired", { actor, payload: { purchaseId } });
+  }
+
+  private enqueueRoleRevocation(purchase: PurchaseRow, item: ShopItemRow | undefined, actor: string): void {
+    const ts = now();
+    const parsed = this.roleIdFromDelivery(purchase.delivery_snapshot_json, item);
+    if (!parsed.roleId && !parsed.error) return;
+    const status = parsed.roleId ? "pending" : "failed";
+    const error = parsed.roleId ? null : `invalid_delivery:${parsed.error ?? "unknown"}`;
+    this.db
+      .prepare(
+        `INSERT INTO shop_role_revocations
+         (purchase_id, user_id, role_id, status, attempts, last_error, created_at, updated_at, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(purchase_id) DO UPDATE SET
+           role_id=COALESCE(shop_role_revocations.role_id, excluded.role_id),
+           status=CASE WHEN shop_role_revocations.status='done' THEN 'done' ELSE excluded.status END,
+           last_error=excluded.last_error,
+           updated_at=excluded.updated_at`,
+      )
+      .run(purchase.id, purchase.user_id, parsed.roleId ?? null, status, status === "failed" ? 1 : 0, error, ts, ts, status === "failed" ? ts : null);
+    if (status === "failed") {
+      this.events.log("shop_role_revocation_invalid", {
+        actor,
+        target: purchase.user_id,
+        payload: { purchaseId: purchase.id, error },
+      });
+    }
+  }
+
+  pendingRoleRevocations(limit = 100): ShopRoleRevocationRow[] {
+    return this.db
+      .prepare("SELECT * FROM shop_role_revocations WHERE status = 'pending' ORDER BY updated_at, purchase_id LIMIT ?")
+      .all(limit) as ShopRoleRevocationRow[];
+  }
+
+  activePurchaseGrantsRole(userId: string, roleId: string, excludePurchaseId?: number): boolean {
+    const rows = this.db
+      .prepare(
+        `SELECT p.*, i.delivery AS item_delivery, i.delivery_kind AS item_delivery_kind, i.delivery_data AS item_delivery_data
+         FROM shop_purchases p
+         JOIN shop_items i ON i.id = p.item_id
+         WHERE p.user_id = ? AND p.status = 'active'`,
+      )
+      .all(userId) as Array<PurchaseRow & { item_delivery: DeliveryMode; item_delivery_kind: DeliveryKind; item_delivery_data: string | null }>;
+    for (const p of rows) {
+      if (excludePurchaseId !== undefined && p.id === excludePurchaseId) continue;
+      const parsed = this.roleIdFromDelivery(
+        p.delivery_snapshot_json,
+        {
+          id: p.item_id,
+          name: "",
+          description: null,
+          price_land: null,
+          price_alt_kind: null,
+          price_alt_amount: null,
+          kind: "monthly",
+          duration_days: null,
+          require_role_id: null,
+          delivery: p.item_delivery,
+          delivery_kind: p.item_delivery_kind,
+          delivery_data: p.item_delivery_data,
+          stock: null,
+          enabled: 1,
+          created_at: 0,
+          updated_at: 0,
+        },
+      );
+      if (parsed.roleId === roleId) return true;
+    }
+    return false;
+  }
+
+  markRoleRevocationDone(purchaseId: number, actor: string, reason: string): void {
+    const ts = now();
+    this.db
+      .prepare("UPDATE shop_role_revocations SET status='done', last_error=NULL, updated_at=?, completed_at=COALESCE(completed_at, ?) WHERE purchase_id=? AND status!='done'")
+      .run(ts, ts, purchaseId);
+    this.events.log("shop_role_revocation_done", { actor, payload: { purchaseId, reason } });
+  }
+
+  markRoleRevocationRetry(purchaseId: number, actor: string, error: string): void {
+    const ts = now();
+    this.db
+      .prepare("UPDATE shop_role_revocations SET attempts=attempts+1, last_error=?, updated_at=? WHERE purchase_id=? AND status='pending'")
+      .run(error.slice(0, 500), ts, purchaseId);
+    this.events.log("shop_role_revocation_retry", { actor, payload: { purchaseId, error: error.slice(0, 500) } });
   }
 }

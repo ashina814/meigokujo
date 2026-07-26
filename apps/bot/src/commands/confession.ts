@@ -22,7 +22,7 @@ import * as base from "./confession-base.js";
 
 export * from "./confession-base.js";
 
-const VOICE_RECEIVED_REASON = "voice_received";
+const VOICE_RECEIVED_REASON: CloseReason = "voice_received";
 const VOICE_RECEIVED_LABEL = "あなたの声は届きました";
 
 function asJson(value: unknown): any {
@@ -190,7 +190,7 @@ async function rewriteAcknowledgement(interaction: ModalSubmitInteraction): Prom
   if (content !== message.content) await interaction.editReply({ content }).catch(() => undefined);
 }
 
-async function closeAsVoiceReceived(
+export async function closeAsVoiceReceived(
   interaction: ButtonInteraction,
   services: Services,
   id: number,
@@ -222,37 +222,46 @@ async function closeAsVoiceReceived(
     row.court_status === "sent"
       ? services.settings.getNumber("confession_court_retention_days")
       : services.settings.getNumber("confession_body_retention_days");
-  services.confessions.close(
-    id,
-    interaction.user.id,
-    VOICE_RECEIVED_REASON as CloseReason,
-    retentionDays,
-  );
+  const closed = services.confessions.closeVoiceReceivedAtomic(id, interaction.user.id, retentionDays);
+  if (!closed.ok) {
+    await interaction.editReply({
+      content:
+        closed.code === "already_closed"
+          ? "この件は既に閉じられています。"
+          : "「あなたの声は届きました」は、返信不要を選んだ案件でのみ利用できます。",
+    });
+    return;
+  }
 
   const openEmergency = services.confessions.openEmergencyFor(id);
   if (openEmergency) services.confessions.closeEmergency(openEmergency.id, interaction.user.id);
 
-  const user = await interaction.client.users.fetch(row.user_id).catch(() => null);
-  await user
-    ?.send(
-      [
-        "# 🕯️ トートの耳",
-        "",
-        "あなたの声は、たしかに届きました。",
-        "",
-        "返信は不要とのことでしたので、この件はここでそっと閉じます。",
-        "",
-        "伝えてくれて、ありがとう。",
-      ].join("\n"),
-    )
-    .catch(() => undefined);
+  const user = await interaction.client.users.fetch(closed.row.user_id).catch(() => null);
+  const dmSent = user
+    ? await user
+        .send(
+          [
+            "# 🕯️ トートの耳",
+            "",
+            "あなたの声は、たしかに届きました。",
+            "",
+            "返信は不要とのことでしたので、この件はここでそっと閉じます。",
+            "",
+            "伝えてくれて、ありがとう。",
+          ].join("\n"),
+        )
+        .then(() => true)
+        .catch(() => false)
+    : false;
 
-  if (row.thread_id) {
-    const thread = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
+  if (closed.row.thread_id) {
+    const thread = await interaction.client.channels.fetch(closed.row.thread_id).catch(() => null);
     if (thread?.isThread()) {
       await thread
         .send({
-          content: `🕯️ <@${interaction.user.id}> が「${VOICE_RECEIVED_LABEL}」でクローズしました。`,
+          content: dmSent
+            ? `🕯️ 「${VOICE_RECEIVED_LABEL}」でクローズしました。投稿者へのDM送信にも成功しました。`
+            : `⚠️ 「${VOICE_RECEIVED_LABEL}」でクローズしましたが、投稿者へDMを送れませんでした。`,
           allowedMentions: { parse: [] },
         })
         .catch(() => undefined);
@@ -260,10 +269,14 @@ async function closeAsVoiceReceived(
   }
 
   await syncCasePanel(interaction.client, services, id);
-  await interaction.editReply({ content: `🕯️ 投稿者へ「${VOICE_RECEIVED_LABEL}」と伝えてクローズしました。` });
+  await interaction.editReply({
+    content: dmSent
+      ? `投稿者へ『${VOICE_RECEIVED_LABEL}』と伝えてクローズしました`
+      : "案件はクローズしましたが、投稿者へDMを送れませんでした",
+  });
 
-  if (row.thread_id) {
-    const thread = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
+  if (closed.row.thread_id) {
+    const thread = await interaction.client.channels.fetch(closed.row.thread_id).catch(() => null);
     if (thread?.isThread()) await thread.setArchived(true).catch(() => undefined);
   }
 }
