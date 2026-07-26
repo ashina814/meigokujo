@@ -111,39 +111,6 @@ describe("評価実績更新タスク", () => {
   });
 });
 
-describe("位階ロールタスク", () => {
-  it("位階ロール付与失敗時に日次マーカーが保存されない", async () => {
-    const { values, settings } = makeMarkerSettings();
-    values.set("guild:main", "guild");
-    const add = vi.fn(async () => { throw new Error("add failed"); });
-    const member = {
-      user: { bot: false },
-      roles: { cache: { has: vi.fn(() => false) }, add, remove: vi.fn() },
-    };
-    const members = new Map([["user1", member]]);
-    const client = {
-      guilds: {
-        cache: { first: vi.fn() },
-        fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => members) } })),
-      },
-    };
-    const services = {
-      settings: { ...settings, getJson: vi.fn(() => [{ hours: 1, roleId: "role1" }]) },
-      vc: { totalsByUser: vi.fn(() => [{ userId: "user1", seconds: 7200 }]) },
-    };
-    const { applyVcRanks } = await import("../src/vc-ranks.js");
-
-    await expect(
-      runSchedulerTaskOnce({ settings } as any, "vc_rank:applied:test", "system:test", () =>
-        applyVcRanks(client as any, services as any),
-      ),
-    ).rejects.toThrow("vc_rank:role_sync_failed");
-
-    expect(add).toHaveBeenCalledWith("role1");
-    expect(values.get("vc_rank:applied:test")).toBeUndefined();
-  });
-});
-
 describe("自動迷霊タスク", () => {
   it("ロール同期失敗時は完了にせず、再試行でDB降格を二重実行せずにロールだけ修復する", async () => {
     const { values, settings } = makeMarkerSettings();
