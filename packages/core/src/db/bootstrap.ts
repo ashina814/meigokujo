@@ -419,6 +419,7 @@ CREATE TABLE IF NOT EXISTS scheduler_chunk_batches (
   metadata_json   TEXT,
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL,
+  sent_at         INTEGER,
   completed_at    INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_scheduler_chunk_batches_kind ON scheduler_chunk_batches(kind, status, created_at);
@@ -487,6 +488,7 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "souls", "eval_invite_mark_per_person", "REAL");
   ensureColumn(db, "souls", "eval_invite_mark_cap", "REAL");
   ensureColumn(db, "shop_purchases", "delivery_snapshot_json", "TEXT");
+  ensureColumn(db, "scheduler_chunk_batches", "sent_at", "INTEGER");
   backfillEvaluationMarkWeights(db);
   backfillEvaluationPolicySnapshots(db);
   return db;
