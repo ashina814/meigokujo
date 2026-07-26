@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { openDb } from "@meigokujo/core";
-import { processShopRoleRevocations, recoverAutoDropNoEvalGhosts } from "../src/scheduler-recovery.js";
+import { recoverAutoDropNoEvalGhosts } from "../src/scheduler-recovery.js";
 import { finalizeChunkBatch, sendChunkedLinesResumable } from "../src/scheduler-utils.js";
 
 function makeSettings(values = new Map<string, string>()) {
@@ -12,12 +12,6 @@ function makeSettings(values = new Map<string, string>()) {
         values.set(key, typeof value === "object" ? JSON.stringify(value) : String(value));
       }),
     },
-  };
-}
-
-function emptyBackfillDb() {
-  return {
-    prepare: vi.fn(() => ({ all: vi.fn(() => []) })),
   };
 }
 
@@ -71,7 +65,6 @@ describe("自動迷霊の永続ロール同期", () => {
           }),
         },
         evaluation: { threadFor: vi.fn(() => undefined), demoteToMeirei: demote },
-        shop: {},
       };
     };
     const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
@@ -154,94 +147,50 @@ describe("自動迷霊の永続ロール同期", () => {
     expect(remove).not.toHaveBeenCalledWith("ghost_role");
     expect(values.get("autodrop:pending_role_sync")).toBe("[]");
   });
-});
 
-describe("ショップ失効ロール剥奪", () => {
-  function pendingRevocation() {
-    return {
-      purchase_id: 10,
-      user_id: "user1",
-      role_id: "role1",
-      status: "pending",
-      attempts: 0,
-      last_error: null,
-      created_at: 1,
-      updated_at: 1,
-      completed_at: null,
-    };
-  }
-
-  it("剥奪失敗後はpendingから再試行し、成功後だけ購入ID単位で完了する", async () => {
-    const values = new Map<string, string>([["guild:main", "guild"]]);
-    let hasRole = true;
-    const remove = vi.fn(async () => { throw new Error("temporary"); });
-    const done = vi.fn();
-    const retry = vi.fn();
+  it("亡霊ロール解除中に亡霊へ戻された場合は迷霊ロールを外して亡霊ロールを復元する", async () => {
+    const values = new Map<string, string>([
+      ["guild:main", "guild"],
+      ["role:ghost", "ghost_role"],
+      ["role:meirei", "meirei_role"],
+      ["autodrop:pending_role_sync", JSON.stringify([{ userId: "user1", demoted: true, meireiAdded: true, ghostRemoved: false }])],
+    ]);
+    const { settings } = makeSettings(values);
+    let status: "meirei" | "ghost" = "meirei";
+    let hasMeirei = true;
+    let hasGhost = true;
+    const add = vi.fn(async (roleId: string) => {
+      if (roleId === "ghost_role") hasGhost = true;
+    });
+    const remove = vi.fn(async (roleId: string) => {
+      if (roleId === "ghost_role") {
+        hasGhost = false;
+        status = "ghost";
+      }
+      if (roleId === "meirei_role") hasMeirei = false;
+    });
     const member = {
       roles: {
-        cache: { has: vi.fn(() => hasRole) },
+        cache: { has: vi.fn((roleId: string) => roleId === "meirei_role" ? hasMeirei : hasGhost) },
+        add,
         remove,
       },
     };
-    const makeServices = () => {
-      const { settings } = makeSettings(values);
-      return {
-        db: emptyBackfillDb(),
-        settings,
-        shop: {
-          pendingRoleRevocations: vi.fn(() => done.mock.calls.length > 0 ? [] : [pendingRevocation()]),
-          activePurchaseGrantsRole: vi.fn(() => false),
-          markRoleRevocationDone: done,
-          markRoleRevocationRetry: retry,
-        },
-      };
+    const services = {
+      settings,
+      entry: {
+        listSouls: vi.fn((requested: string) => requested === "meirei" ? [{ user_id: "user1" }] : []),
+        getSoul: vi.fn(() => ({ user_id: "user1", status })),
+      },
+      evaluation: { threadFor: vi.fn(), demoteToMeirei: vi.fn() },
     };
     const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
 
-    await expect(processShopRoleRevocations(client as any, makeServices() as any)).rejects.toThrow("shop_role_revocation_failed");
-    expect(done).not.toHaveBeenCalled();
-    expect(retry).toHaveBeenCalledWith(10, "system:shop-role-revoke", "temporary");
-
-    remove.mockImplementation(async () => { hasRole = false; });
-    await expect(processShopRoleRevocations(client as any, makeServices() as any)).resolves.toBeUndefined();
-    expect(done).toHaveBeenCalledWith(10, "system:shop-role-revoke", "removed");
-
-    await expect(processShopRoleRevocations(client as any, makeServices() as any)).resolves.toBeUndefined();
-    expect(remove).toHaveBeenCalledTimes(2);
-  });
-
-  it("退城済み・既にロール無しは正常完了する", async () => {
-    const missingValues = new Map<string, string>([["guild:main", "guild"]]);
-    const missingSettings = makeSettings(missingValues).settings;
-    const services = {
-      db: emptyBackfillDb(),
-      settings: missingSettings,
-      shop: {
-        pendingRoleRevocations: vi.fn(() => [pendingRevocation()]),
-        activePurchaseGrantsRole: vi.fn(() => false),
-        markRoleRevocationDone: vi.fn(),
-        markRoleRevocationRetry: vi.fn(),
-      },
-    };
-    const missing = Object.assign(new Error("Unknown Member"), { code: 10007 });
-    const missingClient = {
-      guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => { throw missing; }) } })) },
-    };
-    await expect(processShopRoleRevocations(missingClient as any, services as any)).resolves.toBeUndefined();
-    expect(services.shop.markRoleRevocationDone).toHaveBeenCalledWith(10, "system:shop-role-revoke", "member_absent");
-
-    const absentValues = new Map<string, string>([["guild:main", "guild"]]);
-    const absentServices = {
-      ...services,
-      db: emptyBackfillDb(),
-      settings: makeSettings(absentValues).settings,
-      shop: { ...services.shop, markRoleRevocationDone: vi.fn() },
-    };
-    const absentClient = {
-      guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => ({ roles: { cache: { has: () => false }, remove: vi.fn() } })) } })) },
-    };
-    await expect(processShopRoleRevocations(absentClient as any, absentServices as any)).resolves.toBeUndefined();
-    expect(absentServices.shop.markRoleRevocationDone).toHaveBeenCalledWith(10, "system:shop-role-revoke", "already_absent");
+    await expect(recoverAutoDropNoEvalGhosts(client as any, services as any)).resolves.toBeUndefined();
+    expect(remove).toHaveBeenCalledWith("ghost_role");
+    expect(remove).toHaveBeenCalledWith("meirei_role");
+    expect(add).toHaveBeenCalledWith("ghost_role");
+    expect(values.get("autodrop:pending_role_sync")).toBe("[]");
   });
 });
 
