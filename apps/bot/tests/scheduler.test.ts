@@ -177,6 +177,7 @@ describe("チケット24時間通知のスナップショット", () => {
 
     await processStaleTicketNotifications(client as any, services as any);
     expect(tickets.get("threadC")?.reminded_at).not.toBeNull();
+    db.close();
   });
 });
 
@@ -220,11 +221,12 @@ describe("ショップ月額ロール剥奪", () => {
     const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
     const { processShopRoleRevocations } = await import("../src/scheduler.js");
 
-    await processShopRoleRevocations(client as any, { shop, settings } as any);
+    await processShopRoleRevocations(client as any, { db, shop, settings } as any);
 
     expect(remove).not.toHaveBeenCalled();
     const row = db.prepare("SELECT status FROM shop_role_revocations WHERE purchase_id=?").get(purchase.id) as { status: string };
     expect(row.status).toBe("done");
+    db.close();
   });
 
   it("active購入がなければロールを剥奪し、Discord API一時失敗後は剥奪だけ再試行する", async () => {
@@ -237,18 +239,19 @@ describe("ショップ月額ロール剥奪", () => {
     const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
     const { processShopRoleRevocations } = await import("../src/scheduler.js");
 
-    await expect(processShopRoleRevocations(client as any, { shop, settings } as any)).rejects.toThrow("shop_role_revocation_failed");
+    await expect(processShopRoleRevocations(client as any, { db, shop, settings } as any)).rejects.toThrow("shop_role_revocation_failed");
     let row = db.prepare("SELECT status, attempts FROM shop_role_revocations WHERE purchase_id=?").get(purchase.id) as { status: string; attempts: number };
     expect(row.status).toBe("pending");
     expect(row.attempts).toBe(1);
 
-    await processShopRoleRevocations(client as any, { shop, settings } as any);
+    await processShopRoleRevocations(client as any, { db, shop, settings } as any);
     row = db.prepare("SELECT status, attempts FROM shop_role_revocations WHERE purchase_id=?").get(purchase.id) as { status: string; attempts: number };
     expect(row.status).toBe("done");
     expect(remove).toHaveBeenCalledTimes(2);
 
-    await processShopRoleRevocations(client as any, { shop, settings } as any);
+    await processShopRoleRevocations(client as any, { db, shop, settings } as any);
     expect(remove).toHaveBeenCalledTimes(2);
+    db.close();
   });
 });
 
@@ -325,6 +328,7 @@ describe("カロン分割タスク", () => {
 
     expect(values.get("charon:due_list:test")).toBe("1");
     expect(panelSend).toHaveBeenCalledTimes(1);
+    services.db.close();
   });
 
   it("個人通知失敗時に通知済み扱いにならず、再試行で二重通知しない", async () => {
