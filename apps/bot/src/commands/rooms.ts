@@ -495,7 +495,21 @@ async function executeAddSlot(interaction: ButtonInteraction, services: Services
   }
   try {
     const updated = services.rooms.addSlot(roomId, interaction.user.id);
-    await (ch as VoiceChannel).setUserLimit(updated.capacity);
+    try {
+      await (ch as VoiceChannel).setUserLimit(updated.capacity);
+    } catch (error) {
+      console.error("[rooms] failed to update voice channel user limit after paid slot add", {
+        roomId,
+        channelId: room.channel_id,
+        capacity: updated.capacity,
+        error,
+      });
+      await interaction.update({
+        content: `⚠️ 枠追加の支払いと記録は完了しましたが、Discord側の定員反映に失敗しました（DB上の定員: ${updated.capacity}人）。運営へ連絡してください。`,
+        components: [],
+      });
+      return;
+    }
     await interaction.update({ content: `✅ <@${interaction.user.id}> が枠を追加しました（定員 ${updated.capacity}人）。`, components: [], allowedMentions: { parse: [] } });
   } catch (error) {
     const msg =

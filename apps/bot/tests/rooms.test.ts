@@ -1,5 +1,6 @@
+import { ChannelType } from "discord.js";
 import { describe, expect, it, vi } from "vitest";
-import { handleRoomRenameModal, roomPanelMessage } from "../src/commands/rooms.js";
+import { handleRoomButton, handleRoomRenameModal, roomPanelMessage } from "../src/commands/rooms.js";
 
 function servicesForPanel(overrides: Record<string, number> = {}) {
   const numbers: Record<string, number> = {
@@ -87,5 +88,57 @@ describe("部屋Bot UI", () => {
     expect(setName).toHaveBeenCalledWith("新しい部屋");
     expect(reply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("失敗") }));
     expect(JSON.stringify(reply.mock.calls[0]?.[0])).not.toContain("✅");
+  });
+
+  it("枠追加でDiscord定員反映だけ失敗した場合は未課金とは表示しない", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const update = vi.fn(async () => undefined);
+    const setUserLimit = vi.fn(async () => {
+      throw new Error("discord failed");
+    });
+    const addSlot = vi.fn(() => ({
+      id: 1,
+      kind: "normal",
+      channel_id: "vc1",
+      owner_id: "owner",
+      status: "open",
+      capacity: 3,
+    }));
+    const services = {
+      rooms: {
+        get: vi.fn(() => ({
+          id: 1,
+          kind: "normal",
+          channel_id: "vc1",
+          owner_id: "owner",
+          status: "open",
+          capacity: 2,
+        })),
+        addSlot,
+      },
+      settings: { getNumber: vi.fn(() => 7000) },
+    };
+    const interaction = {
+      customId: "room:slotpay:1:7000:2",
+      isButton: () => true,
+      isStringSelectMenu: () => false,
+      isUserSelectMenu: () => false,
+      user: { id: "payer" },
+      channel: {
+        type: ChannelType.GuildVoice,
+        members: { has: vi.fn(() => true) },
+        setUserLimit,
+      },
+      update,
+    };
+
+    await handleRoomButton(interaction as any, services as any);
+
+    expect(addSlot).toHaveBeenCalledWith(1, "payer");
+    expect(setUserLimit).toHaveBeenCalledWith(3);
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("支払いと記録は完了") }));
+    expect(JSON.stringify(update.mock.calls[0]?.[0])).not.toContain("課金していません");
+    expect(JSON.stringify(update.mock.calls[0]?.[0])).not.toContain("✅");
+    errorSpy.mockRestore();
   });
 });
