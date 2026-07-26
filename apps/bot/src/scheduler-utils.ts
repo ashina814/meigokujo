@@ -30,10 +30,10 @@ interface ChunkProgressState {
   sent: number[];
 }
 
-function parseChunkProgress(raw: string | undefined): ChunkProgressState | undefined {
+function parseChunkProgress(raw: unknown): ChunkProgressState | undefined {
   if (!raw) return undefined;
   try {
-    const parsed = JSON.parse(raw) as Partial<ChunkProgressState>;
+    const parsed = typeof raw === "string" ? JSON.parse(raw) as Partial<ChunkProgressState> : raw as Partial<ChunkProgressState>;
     if (!Array.isArray(parsed.chunks) || !parsed.chunks.every((value) => typeof value === "string")) return undefined;
     if (!Array.isArray(parsed.sent) || !parsed.sent.every((value) => Number.isInteger(value) && value >= 0)) return undefined;
     return { chunks: parsed.chunks, sent: parsed.sent };
@@ -85,7 +85,7 @@ export async function sendChunkedLines(
 
   const generatedChunks = buildChunks(header, lines);
   const stored = opts.progress
-    ? parseChunkProgress(opts.progress.services.settings.getString(opts.progress.key))
+    ? parseChunkProgress(opts.progress.services.settings.getString(opts.progress.key) as unknown)
     : undefined;
   const chunks = stored?.chunks.length ? stored.chunks : generatedChunks;
   const sent = new Set(stored?.sent ?? []);
