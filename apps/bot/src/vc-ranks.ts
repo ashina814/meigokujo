@@ -19,13 +19,14 @@ export async function applyVcRanks(client: Client, services: Services): Promise<
   const ladderRoleIds = new Set(sorted.map((t) => t.roleId));
 
   const guildId = services.settings.getString("guild:main") ?? client.guilds.cache.first()?.id;
-  if (!guildId) return;
+  if (!guildId) throw new Error("vc_rank:guild_id_missing");
   const guild = await client.guilds.fetch(guildId).catch(() => null);
-  if (!guild) return;
+  if (!guild) throw new Error(`vc_rank:guild_fetch_failed:${guildId}`);
   const members = await guild.members.fetch().catch(() => null);
-  if (!members) return;
+  if (!members) throw new Error(`vc_rank:members_fetch_failed:${guildId}`);
 
   const totals = new Map(services.vc.totalsByUser(36_500).map((t) => [t.userId, t.seconds]));
+  const failures: string[] = [];
 
   for (const [userId, member] of members) {
     if (member.user.bot) continue;
@@ -35,8 +36,17 @@ export async function applyVcRanks(client: Client, services: Services): Promise<
 
     for (const roleId of ladderRoleIds) {
       const has = member.roles.cache.has(roleId);
-      if (roleId === target && !has) await member.roles.add(roleId).catch(() => undefined);
-      else if (roleId !== target && has) await member.roles.remove(roleId).catch(() => undefined);
+      if (roleId === target && !has) {
+        await member.roles.add(roleId).catch((e) => {
+          failures.push(`add:${userId}:${roleId}:${e instanceof Error ? e.message : String(e)}`);
+        });
+      } else if (roleId !== target && has) {
+        await member.roles.remove(roleId).catch((e) => {
+          failures.push(`remove:${userId}:${roleId}:${e instanceof Error ? e.message : String(e)}`);
+        });
+      }
     }
   }
+
+  if (failures.length > 0) throw new Error(`vc_rank:role_sync_failed:${failures.join(",")}`);
 }

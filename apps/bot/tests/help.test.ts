@@ -30,5 +30,11 @@ describe("/あそびかた", () => {
     }
     expect(text).toContain("12,345Ld");
     expect(text).not.toContain("30,000");
+    expect(text).toMatch(/通行証.*賭場.*エテル残高.*戦績.*勝率/s);
+    expect(text).not.toMatch(/通行証.*入城状態/s);
+    expect(text).not.toMatch(/ランキング.*Land/s);
+    expect(text).not.toContain("チップ");
+    expect(text).toContain("エテル");
+    expect(text).toContain("両替所");
   });
 });

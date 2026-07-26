@@ -27,7 +27,7 @@ export async function handleHelpCommand(interaction: ChatInputCommandInteraction
         name: "🚪 初めての人",
         value: [
           "入城案内・申請パネルから説明会を予約し、説明会VCへ参加してください。",
-          "参加後は `/通行証` や `/プロフィール` で自分の状態を確認できます。",
+          "入城状態・階級・Landなどは `/プロフィール` で確認できます。",
           initialGrantText,
         ].filter(Boolean).join("\n"),
       },
@@ -35,8 +35,8 @@ export async function handleHelpCommand(interaction: ChatInputCommandInteraction
         name: "👤 プロフィール・通帳",
         value: [
           "`/プロフィール` — 階級、称号、在城日数、所持Landなどの確認。",
-          "`/通行証` — 入城状態や案内の確認。",
-          "銀行・通帳パネルでは残高照会と取引履歴を確認できます。",
+          "取引履歴はプロフィール内の通帳ボタン、または銀行パネルから確認できます。",
+          "`/通行証` — マモンの賭場におけるエテル残高・戦績・勝率などのカード。",
         ].join("\n"),
       },
       {
@@ -66,8 +66,8 @@ export async function handleHelpCommand(interaction: ChatInputCommandInteraction
       {
         name: "🏆 ランキング・賭場",
         value: [
-          "`/ランキング` — Land、活動、bump/upなどの順位を見る入口。",
-          "マモンの賭場は `/案内` から。チップ購入、スロット、勝負、競馬、板、市場、VIPなどへ進めます。",
+          "`/ランキング` — 自分のランク・発言・浮上・招待・Bumpなどの活動ランキングを見る入口。",
+          "マモンの賭場全体は `/案内` から。エテル、両替所、スロット、勝負、競馬、板、市場、VIPなどへ進めます。",
           "賭場の詳しい使い方・注意は、賭場内の案内表示を優先してください。",
         ].join("\n"),
       },

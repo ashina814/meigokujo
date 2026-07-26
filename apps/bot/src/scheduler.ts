@@ -79,19 +79,9 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
           if (now.hour === notifyHour && now.minute === s.minute) {
             const marker = `session:notify:${now.dateStr}:${s.start}:${s.kind}`;
             if (!services.settings.getString(marker)) {
-              await runSchedulerTaskOnce(services, marker, "system:scheduler", async () => {
-                const guideId = services.settings.getString("channel:entry_guide");
-                const waitRoleId = services.settings.getString("role:queue_wait");
-                const ch = guideId ? await client.channels.fetch(guideId).catch(() => null) : null;
-                if (ch?.isTextBased() && "send" in ch) {
-                  const rolePart = waitRoleId ? `<@&${waitRoleId}> ` : "";
-                  const timing = s.kind === "30m" ? "**30分後**" : "**まもなく**";
-                  await ch.send({
-                    content: `📣 ${rolePart}${timing}（**${s.start}時**）に説明会があります。**説明会場VC**に来てお待ちください。`,
-                    allowedMentions: { roles: waitRoleId ? [waitRoleId] : [] },
-                  });
-                }
-              }).catch((e) => console.error("[説明会] 通知失敗:", e));
+              await runSchedulerTaskOnce(services, marker, "system:scheduler", () =>
+                sendSessionNotification(client, services, s.start, s.kind),
+              ).catch((e) => console.error("[説明会] 通知失敗:", e));
             }
           }
         }
@@ -178,11 +168,18 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
-    // ── カロン: 毎日 09:00 台に期限リスト・演出通知・迷霊落ち承認パネル ──
-    if (now.hour === 9 && !services.settings.getString(`charon:daily:${now.dateStr}`)) {
-      await runSchedulerTaskOnce(services, `charon:daily:${now.dateStr}`, "system:scheduler", () =>
-        runCharonDaily(client, services),
-      );
+    // ── カロン: 毎日 09:00 台に期限リスト・演出通知・迷霊落ち承認パネル・題名同期 ──
+    if (now.hour === 9) {
+      await runSchedulerTaskOnce(services, `charon:due_list:${now.dateStr}`, "system:scheduler", () =>
+        postCharonDueList(client, services),
+      ).catch((e) => console.error("[カロン] 期限リスト失敗:", e));
+      await sendCharonNotifications(client, services).catch((e) => console.error("[カロン] 本人通知失敗:", e));
+      await runSchedulerTaskOnce(services, `charon:overdue_panel:${now.dateStr}`, "system:scheduler", () =>
+        postCharonOverduePanel(client, services),
+      ).catch((e) => console.error("[カロン] 承認パネル失敗:", e));
+      await runSchedulerTaskOnce(services, `charon:title_sync:${now.dateStr}`, "system:scheduler", () =>
+        syncCharonThreadTitles(client, services),
+      ).catch((e) => console.error("[カロン] 題名同期失敗:", e));
     }
 
     // ── 14日経ってフォーラム未作成の亡霊は自動で迷霊に落とす（毎日 09:15）──
@@ -360,58 +357,96 @@ export async function payVcRewards(client: Client, services: Services, dateStr: 
   console.log(`[刻時盤] 浮上報酬 ${dateStr}: ${rewards.length}名 / ${total} Ld`);
 }
 
-/** カロンの日次業務: 期限リスト（計器盤）・本人への演出通知・期限切れの承認パネル（#決裁）・スレ題名の同期 */
-export async function runCharonDaily(client: Client, services: Services): Promise<void> {
+export async function sendSessionNotification(
+  client: Client,
+  services: Services,
+  startHour: number,
+  kind: "30m" | "5m",
+): Promise<void> {
+  const guideId = services.settings.getString("channel:entry_guide");
+  if (!guideId) throw new Error("session_notify:channel_entry_guide_missing");
+  const waitRoleId = services.settings.getString("role:queue_wait");
+  const ch = await client.channels.fetch(guideId).catch((e) => {
+    throw new Error(`session_notify:channel_fetch_failed:${e instanceof Error ? e.message : String(e)}`);
+  });
+  if (!ch?.isTextBased() || !("send" in ch)) throw new Error("session_notify:channel_not_sendable");
+
+  const rolePart = waitRoleId ? `<@&${waitRoleId}> ` : "";
+  const timing = kind === "30m" ? "**30分後**" : "**まもなく**";
+  await ch.send({
+    content: `📣 ${rolePart}${timing}（**${startHour}時**）に説明会があります。**説明会場VC**に来てお待ちください。`,
+    allowedMentions: { roles: waitRoleId ? [waitRoleId] : [] },
+  });
+}
+
+async function fetchTextChannel(client: Client, services: Services, settingKey: string): Promise<TextChannel | null> {
+  const id = services.settings.getString(settingKey);
+  if (!id) return null;
+  const ch = await client.channels.fetch(id).catch((e) => {
+    throw new Error(`${settingKey}:fetch_failed:${e instanceof Error ? e.message : String(e)}`);
+  });
+  return ch?.isTextBased() && "send" in ch ? (ch as TextChannel) : null;
+}
+
+/** カロン①: 期限が近い者のリストを #城の計器盤 へ投稿 */
+export async function postCharonDueList(client: Client, services: Services): Promise<void> {
   const nowTs = Math.floor(Date.now() / 1000);
   const DAY = 86_400;
-
-  const fetchText = async (settingKey: string): Promise<TextChannel | null> => {
-    const id = services.settings.getString(settingKey);
-    if (!id) return null;
-    const ch = await client.channels.fetch(id).catch(() => null);
-    return ch?.isTextBased() && "send" in ch ? (ch as TextChannel) : null;
-  };
-
-  // ① 期限が近い者のリスト → #城の計器盤
   const dueSoon = services.evaluation.dueBetween(nowTs, nowTs + 2 * DAY);
-  // 各ステップは独立して失敗させる。①が落ちても②③④まで巻き添えにしない
-  try {
-    const keikiban = await fetchText("channel:keikiban");
-    if (keikiban && dueSoon.length > 0) {
-      const lines = dueSoon.map((r) => {
-        const p = services.evaluation.promotionScore(r.user_id);
-        const d = services.evaluation.demotionCount(r.user_id);
-        const t = services.evaluation.thresholdsFor(r.user_id);
-        return `・<@${r.user_id}> 期限 <t:${r.eval_deadline_at}:R> — 昇格印 ${p.total}/${t.promotionRequired}・低評価印 ${d}/${t.demotionThreshold}・評価 ${services.evaluation.evaluationCount(r.user_id)}件`;
-      });
-      await sendChunkedLines(keikiban, `🛶 **カロンの帳簿** — 審判が近い魂 ${dueSoon.length}名:`, lines);
-    }
-  } catch (e) {
-    console.error("[カロン] ①期限リストの投稿に失敗:", e);
-  }
+  if (dueSoon.length === 0) return;
+  const keikiban = await fetchTextChannel(client, services, "channel:keikiban");
+  if (!keikiban) throw new Error("charon_due_list:channel_missing_or_not_sendable");
 
-  // ② 本人への演出通知（3日前・前日・当日、各1回）— DM＋通知チャンネルの両方
-  //   通知チャンネルは channel:charon_notify のみ（集令は階級変動専用のためフォールバックしない）
+  const lines = dueSoon.map((r) => {
+    const p = services.evaluation.promotionScore(r.user_id);
+    const d = services.evaluation.demotionCount(r.user_id);
+    const t = services.evaluation.thresholdsFor(r.user_id);
+    return `・<@${r.user_id}> 期限 <t:${r.eval_deadline_at}:R> — 昇格印 ${p.total}/${t.promotionRequired}・低評価印 ${d}/${t.demotionThreshold}・評価 ${services.evaluation.evaluationCount(r.user_id)}件`;
+  });
+  await sendChunkedLines(keikiban, `🛶 **カロンの帳簿** — 審判が近い魂 ${dueSoon.length}名:`, lines);
+}
+
+/** カロン②: 本人への演出通知（DM と通知チャンネルを個別マーカーで追跡） */
+export async function sendCharonNotifications(client: Client, services: Services): Promise<void> {
+  const nowTs = Math.floor(Date.now() / 1000);
+  const DAY = 86_400;
   const notifyChId = services.settings.getString("channel:charon_notify");
   const notifyCh = notifyChId ? await client.channels.fetch(notifyChId).catch(() => null) : null;
   const upcoming = services.evaluation.dueBetween(nowTs, nowTs + 4 * DAY);
+  const failures: string[] = [];
+
   for (const r of upcoming) {
     const daysLeft = Math.floor((r.eval_deadline_at - nowTs) / DAY);
     if (![3, 1, 0].includes(daysLeft)) continue;
-    const marker = `charon:notified:${r.user_id}:${daysLeft}`;
-    if (services.settings.getString(marker)) continue;
-    services.settings.set(marker, "1", "system:charon");
-    // 本人DM
-    const user = await client.users.fetch(r.user_id).catch(() => null);
-    await user
-      ?.send(
-        daysLeft === 0
-          ? "🛶 **汝の審判は今日である。** 冥獄の魂たちは汝の姿を見ているか。"
-          : `🛶 **汝の審判まで、あと${daysLeft}日。** 評価対象の場に姿を見せよ。`,
-      )
-      .catch(() => undefined);
-    // チャンネル通知（本人メンション付き）
-    if (notifyCh?.isTextBased() && "send" in notifyCh) {
+
+    const legacyMarker = `charon:notified:${r.user_id}:${daysLeft}`;
+    const dmMarker = `charon:notified:dm:${r.user_id}:${daysLeft}`;
+    const channelMarker = `charon:notified:channel:${r.user_id}:${daysLeft}`;
+
+    if (!services.settings.getString(legacyMarker) && !services.settings.getString(dmMarker)) {
+      const user = await client.users.fetch(r.user_id).catch((e) => {
+        failures.push(`dm_fetch:${r.user_id}:${e instanceof Error ? e.message : String(e)}`);
+        return null;
+      });
+      if (!user) {
+        failures.push(`dm_user_missing:${r.user_id}`);
+      } else {
+        await user
+          .send(
+            daysLeft === 0
+              ? "🛶 **汝の審判は今日である。** 冥獄の魂たちは汝の姿を見ているか。"
+              : `🛶 **汝の審判まで、あと${daysLeft}日。** 評価対象の場に姿を見せよ。`,
+          )
+          .then(() => services.settings.set(dmMarker, "1", "system:charon"))
+          .catch((e) => failures.push(`dm_send:${r.user_id}:${e instanceof Error ? e.message : String(e)}`));
+      }
+    }
+
+    if (notifyChId && !services.settings.getString(legacyMarker) && !services.settings.getString(channelMarker)) {
+      if (!notifyCh?.isTextBased() || !("send" in notifyCh)) {
+        failures.push(`channel_unavailable:${r.user_id}`);
+        continue;
+      }
       const p = services.evaluation.promotionScore(r.user_id);
       const t = services.evaluation.thresholdsFor(r.user_id);
       const line =
@@ -420,45 +455,82 @@ export async function runCharonDaily(client: Client, services: Services): Promis
           : `🛶 <@${r.user_id}> **審判まであと${daysLeft}日**（<t:${r.eval_deadline_at}:R>）。昇格印 **${p.total}/${t.promotionRequired}**・評価対象VCで姿を示せ。`;
       await notifyCh
         .send({ content: line, allowedMentions: { users: [r.user_id] } })
-        .catch(() => undefined);
+        .then(() => services.settings.set(channelMarker, "1", "system:charon"))
+        .catch((e) => failures.push(`channel_send:${r.user_id}:${e instanceof Error ? e.message : String(e)}`));
     }
   }
+  if (failures.length > 0) throw new Error(`charon_notifications_failed:${failures.join(",")}`);
+}
 
-  // ③ 期限切れ（昇格印不足）→ #決裁 に承認パネル
+/** カロン③: 期限切れ（昇格印不足）を #決裁 に承認パネルとして投稿 */
+export async function postCharonOverduePanel(client: Client, services: Services): Promise<void> {
+  const nowTs = Math.floor(Date.now() / 1000);
   const overdue = services.evaluation.overdue(nowTs);
-  const kessai = await fetchText("channel:kessai");
-  if (kessai && overdue.length > 0) {
-    const lines = overdue.slice(0, 20).map((r) => {
-      const p = services.evaluation.promotionScore(r.user_id);
-      const t = services.evaluation.thresholdsFor(r.user_id);
-      return `・<@${r.user_id}>（昇格印 ${p.total}/${t.promotionRequired}・期限 <t:${r.eval_deadline_at}:D>）`;
-    });
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("charon:drop").setLabel(`${overdue.length}名を迷霊に落とす`).setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId("charon:cancel").setLabel("今日は見送る").setStyle(ButtonStyle.Secondary),
-    );
-    await sendChunkedLines(
-      kessai,
+  if (overdue.length === 0) return;
+  const kessai = await fetchTextChannel(client, services, "channel:kessai");
+  if (!kessai) throw new Error("charon_overdue_panel:channel_missing_or_not_sendable");
+  const lines = overdue.slice(0, 20).map((r) => {
+    const p = services.evaluation.promotionScore(r.user_id);
+    const t = services.evaluation.thresholdsFor(r.user_id);
+    return `・<@${r.user_id}>（昇格印 ${p.total}/${t.promotionRequired}・期限 <t:${r.eval_deadline_at}:D>）`;
+  });
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("charon:drop").setLabel(`${overdue.length}名を迷霊に落とす`).setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("charon:cancel").setLabel("今日は見送る").setStyle(ButtonStyle.Secondary),
+  );
+  await kessai.send({
+    content: [
       `⚖️ **カロンの上申** — 評価期限が到達し昇格印が不足している魂 **${overdue.length}名**:`,
-      lines,
-      { components: [row] },
-    );
-  }
+      ...lines,
+    ].join("\n"),
+    components: [row],
+    allowedMentions: { parse: [] },
+  });
+}
 
-  // ④ 評価スレッドの題名を実際の期限に同期（招待延長でズレた分の自己修復）
+/** カロン④: 評価スレッドの題名を実際の期限に同期 */
+export async function syncCharonThreadTitles(client: Client, services: Services): Promise<void> {
+  const nowTs = Math.floor(Date.now() / 1000);
+  const DAY = 86_400;
+  const targets = [
+    ...services.evaluation.dueBetween(nowTs, nowTs + 2 * DAY),
+    ...services.evaluation.dueBetween(nowTs, nowTs + 4 * DAY),
+  ];
   const guildId = services.settings.getString("guild:main");
   const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
-  if (guild) {
-    for (const r of [...dueSoon, ...upcoming]) {
-      const threadId = services.evaluation.threadFor(r.user_id);
-      if (!threadId) continue;
-      const thread = await client.channels.fetch(threadId).catch(() => null);
-      if (!thread?.isThread()) continue;
-      const member = await guild.members.fetch(r.user_id).catch(() => null);
-      const expected = threadTitleFor(member?.displayName ?? r.user_id, r.eval_deadline_at);
-      if (thread.name !== expected) await thread.setName(expected).catch(() => undefined);
+  if (!guild) throw new Error("charon_title_sync:guild_fetch_failed");
+  const failures: string[] = [];
+  const seen = new Set<string>();
+  for (const r of targets) {
+    if (seen.has(r.user_id)) continue;
+    seen.add(r.user_id);
+    const threadId = services.evaluation.threadFor(r.user_id);
+    if (!threadId) continue;
+    const thread = await client.channels.fetch(threadId).catch((e) => {
+      failures.push(`thread_fetch:${r.user_id}:${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    });
+    if (!thread?.isThread()) {
+      failures.push(`thread_unavailable:${r.user_id}`);
+      continue;
+    }
+    const member = await guild.members.fetch(r.user_id).catch(() => null);
+    const expected = threadTitleFor(member?.displayName ?? r.user_id, r.eval_deadline_at);
+    if (thread.name !== expected) {
+      await thread.setName(expected).catch((e) => {
+        failures.push(`thread_rename:${r.user_id}:${e instanceof Error ? e.message : String(e)}`);
+      });
     }
   }
+  if (failures.length > 0) throw new Error(`charon_title_sync_failed:${failures.join(",")}`);
+}
+
+/** カロンの日次業務: 互換用。Schedulerでは個別マーカー付きサブタスクを直接呼ぶ。 */
+export async function runCharonDaily(client: Client, services: Services): Promise<void> {
+  await postCharonDueList(client, services);
+  await sendCharonNotifications(client, services);
+  await postCharonOverduePanel(client, services);
+  await syncCharonThreadTitles(client, services);
 }
 
 /**
@@ -466,25 +538,43 @@ export async function runCharonDaily(client: Client, services: Services): Promis
  * 亡霊を自動で迷霊に落とす。フォーラムがある人はカロンの承認パスに委ねる（自動落とし対象外）。
  */
 export async function autoDropNoEvalGhosts(client: Client, services: Services): Promise<void> {
-  const guildId = services.settings.getString("guild:main");
-  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
-  if (!guild) return;
   const ghostRoleId = services.settings.getString("role:ghost");
   const meireiRoleId = services.settings.getString("role:meirei");
   const nowTs = Math.floor(Date.now() / 1000);
   const ghosts = services.entry.listSouls("ghost");
+  const syncTargets = new Set<string>(services.entry.listSouls("meirei").map((s) => s.user_id));
   let dropped = 0;
   for (const soul of ghosts) {
     if (!soul.eval_deadline_at || soul.eval_deadline_at > nowTs) continue;
     if (services.evaluation.threadFor(soul.user_id)) continue; // フォーラム有り→カロンへ
     services.evaluation.demoteToMeirei(soul.user_id, "system:auto-drop", "14日以内に評価が付かなかった（フォーラム未作成）");
-    const member = await guild.members.fetch(soul.user_id).catch(() => null);
-    if (member) {
-      // 迷霊を先に付けてから亡霊を剥がす（executeDemotion と同じ race 対策）
-      if (meireiRoleId) await member.roles.add(meireiRoleId).catch(() => undefined);
-      if (ghostRoleId) await member.roles.remove(ghostRoleId).catch(() => undefined);
-    }
+    syncTargets.add(soul.user_id);
     dropped++;
   }
+
+  if (syncTargets.size === 0) return;
+  const guildId = services.settings.getString("guild:main");
+  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
+  if (!guild) throw new Error("autodrop:guild_fetch_failed");
+  const failures: string[] = [];
+  for (const userId of syncTargets) {
+    const member = await guild.members.fetch(userId).catch((e) => {
+      failures.push(`member_fetch:${userId}:${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    });
+    if (!member) continue;
+    // 迷霊を先に付けてから亡霊を剥がす（executeDemotion と同じ race 対策）
+    if (meireiRoleId && !member.roles.cache.has(meireiRoleId)) {
+      await member.roles.add(meireiRoleId).catch((e) => {
+        failures.push(`add_meirei:${userId}:${e instanceof Error ? e.message : String(e)}`);
+      });
+    }
+    if (ghostRoleId && member.roles.cache.has(ghostRoleId)) {
+      await member.roles.remove(ghostRoleId).catch((e) => {
+        failures.push(`remove_ghost:${userId}:${e instanceof Error ? e.message : String(e)}`);
+      });
+    }
+  }
   if (dropped > 0) console.log(`[自動迷霊] ${dropped}名を落としました（フォーラム未作成・期限超過）`);
+  if (failures.length > 0) throw new Error(`autodrop:role_sync_failed:${failures.join(",")}`);
 }
