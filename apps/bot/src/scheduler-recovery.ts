@@ -246,6 +246,21 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
           savePending(services, pending);
         } catch (error) {
           failures.push(`remove_ghost:${row.userId}:${error instanceof Error ? error.message : String(error)}`);
+          continue;
+        }
+      }
+
+      const statusAfterGhostRemoval = services.entry.getSoul(row.userId)?.status;
+      if (statusAfterGhostRemoval !== "meirei") {
+        try {
+          await reconcileCancelledAutoDrop(member, statusAfterGhostRemoval, ghostRoleId, meireiRoleId);
+          row.meireiAdded = true;
+          row.ghostRemoved = true;
+          savePending(services, pending);
+        } catch (error) {
+          row.ghostRemoved = false;
+          savePending(services, pending);
+          failures.push(`rollback_after_ghost_remove:${row.userId}:${error instanceof Error ? error.message : String(error)}`);
         }
       }
     }
@@ -305,9 +320,12 @@ export function backfillShopRoleRevocations(services: Pick<Services, "db">): voi
   services.db.transaction(() => {
     for (const row of rows) {
       const parsed = roleIdFromSnapshotOrItem(row);
-      if (!parsed.applicable) continue;
-      const status = parsed.roleId ? "pending" : "failed";
-      const lastError = parsed.roleId ? null : `backfill_invalid_delivery:${parsed.error ?? "unknown"}`;
+      const status = !parsed.applicable ? "done" : parsed.roleId ? "pending" : "failed";
+      const lastError = !parsed.applicable
+        ? "backfill_not_applicable"
+        : parsed.roleId
+          ? null
+          : `backfill_invalid_delivery:${parsed.error ?? "unknown"}`;
       insert.run(
         row.purchase_id,
         row.user_id,
@@ -317,7 +335,7 @@ export function backfillShopRoleRevocations(services: Pick<Services, "db">): voi
         lastError,
         ts,
         ts,
-        status === "failed" ? ts : null,
+        status === "pending" ? null : ts,
       );
     }
   })();
@@ -328,6 +346,41 @@ export function chargeMonthlySubscriptionsAtomically(
   actor: string,
 ) {
   return services.db.transaction(() => services.shop.chargeMonthlySubscriptions(actor))();
+}
+
+function markRoleRevocationDoneOnce(services: Services, purchaseId: number, reason: string): void {
+  const ts = Math.floor(Date.now() / 1000);
+  const updated = services.db
+    .prepare(
+      `UPDATE shop_role_revocations
+       SET status='done', last_error=NULL, updated_at=?, completed_at=COALESCE(completed_at, ?)
+       WHERE purchase_id=? AND status='pending'`,
+    )
+    .run(ts, ts, purchaseId);
+  if (updated.changes === 1) {
+    services.events.log("shop_role_revocation_done", {
+      actor: "system:shop-role-revoke",
+      payload: { purchaseId, reason },
+    });
+  }
+}
+
+function markRoleRevocationRetryOnce(services: Services, purchaseId: number, error: string): void {
+  const ts = Math.floor(Date.now() / 1000);
+  const normalized = error.slice(0, 500);
+  const updated = services.db
+    .prepare(
+      `UPDATE shop_role_revocations
+       SET attempts=attempts+1, last_error=?, updated_at=?
+       WHERE purchase_id=? AND status='pending'`,
+    )
+    .run(normalized, ts, purchaseId);
+  if (updated.changes === 1) {
+    services.events.log("shop_role_revocation_retry", {
+      actor: "system:shop-role-revoke",
+      payload: { purchaseId, error: normalized },
+    });
+  }
 }
 
 /**
@@ -351,12 +404,12 @@ export async function processShopRoleRevocations(client: Client, services: Servi
     const failures: string[] = [];
     for (const candidate of pending) {
       if (!candidate.role_id) {
-        services.shop.markRoleRevocationRetry(candidate.purchase_id, "system:shop-role-revoke", "role_id_missing");
+        markRoleRevocationRetryOnce(services, candidate.purchase_id, "role_id_missing");
         failures.push(`role_id_missing:${candidate.purchase_id}`);
         continue;
       }
       if (services.shop.activePurchaseGrantsRole(candidate.user_id, candidate.role_id, candidate.purchase_id)) {
-        services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "active_purchase_still_grants_role");
+        markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
         continue;
       }
 
@@ -365,26 +418,26 @@ export async function processShopRoleRevocations(client: Client, services: Servi
         member = await guild.members.fetch(candidate.user_id);
       } catch (error) {
         if (isUnknownMember(error)) {
-          services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "member_absent");
+          markRoleRevocationDoneOnce(services, candidate.purchase_id, "member_absent");
           continue;
         }
         const message = error instanceof Error ? error.message : String(error);
-        services.shop.markRoleRevocationRetry(candidate.purchase_id, "system:shop-role-revoke", message);
+        markRoleRevocationRetryOnce(services, candidate.purchase_id, message);
         failures.push(`member_fetch:${candidate.purchase_id}:${message}`);
         continue;
       }
 
       if (!member.roles.cache.has(candidate.role_id)) {
-        services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "already_absent");
+        markRoleRevocationDoneOnce(services, candidate.purchase_id, "already_absent");
         continue;
       }
 
       try {
         await member.roles.remove(candidate.role_id);
-        services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "removed");
+        markRoleRevocationDoneOnce(services, candidate.purchase_id, "removed");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        services.shop.markRoleRevocationRetry(candidate.purchase_id, "system:shop-role-revoke", message);
+        markRoleRevocationRetryOnce(services, candidate.purchase_id, message);
         failures.push(`role_remove:${candidate.purchase_id}:${message}`);
       }
     }
