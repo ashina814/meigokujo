@@ -248,7 +248,7 @@ function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services,
     return deptPanelMessage(services, deptKey);
   }
   const roomKind = ROOM_PANEL_KIND[kind];
-  if (roomKind) return roomPanelMessage(roomKind);
+  if (roomKind) return roomPanelMessage(roomKind, services);
   return bankPanelMessage();
 }
 
