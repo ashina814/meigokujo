@@ -14,6 +14,7 @@ import { announceAutoClose, announceSettle, refreshMarketPanel } from "./command
 import { ticketStaffRoleIds } from "./commands/tickets.js";
 import type { Services } from "./services.js";
 import { runSchedulerTaskOnce, sendChunkedLines } from "./scheduler-utils.js";
+import { processShopRoleRevocations, recoverAutoDropNoEvalGhosts } from "./scheduler-recovery.js";
 
 /** JSTの現在時刻の分解値。VPSのTZに依存しないよう明示的に変換する */
 export function jstNow(date = new Date()): {
@@ -88,7 +89,6 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
-
     // ── 24時間無応答チケットのリマインド（毎時0分にチェック）──
     if (now.minute < 2) {
       const stale = services.tickets.staleOpen(24);
@@ -97,12 +97,19 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         const staffRoleIds = [...new Set(stale.flatMap((t) => ticketStaffRoleIds(t, services)))];
         const channel = kessaiId ? await client.channels.fetch(kessaiId).catch(() => null) : null;
         if (channel?.isTextBased() && "send" in channel) {
-          // 同じ2000文字上限の踏み方をするため、チケット一覧も分割送信にする
+          // 途中失敗時は同じ時間帯の未送信チャンクだけを再開し、スタッフを重複メンションしない。
           await sendChunkedLines(
             channel as TextChannel,
             `📮 ${staffRoleIds.length > 0 ? `${staffRoleIds.map((id) => `<@&${id}>`).join(" ")} ` : ""}**24時間以上応答のないチケットが ${stale.length} 件あります**:`,
             stale.map((t) => `・<#${t.thread_id}>（${t.panel_name ?? (t.kind === "return" ? "出戻り" : t.kind === "consult" ? "相談" : t.kind)}）`),
-            { allowedRoleIds: staffRoleIds },
+            {
+              allowedRoleIds: staffRoleIds,
+              progress: {
+                services,
+                key: `scheduler:chunks:tickets:${now.dateStr}:${now.hour}`,
+                actor: "system:tickets",
+              },
+            },
           );
           for (const t of stale) services.tickets.markReminded(t.thread_id);
         }
@@ -269,30 +276,21 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         await runSchedulerTaskOnce(services, shopMarker, "system:scheduler", async () => {
           const { charged, lapsed } = services.shop.chargeMonthlySubscriptions("system:shop-monthly");
           console.log(`[ショップ] 月額一括: 課金 ${charged.length}件 / 失効 ${lapsed.length}件`);
-          // 失効ユーザーへのDM＆ロール剥奪
+          // 本人通知はbest effort。Discord上の権利剥奪は購入履歴から別タスクで再試行する。
           for (const l of lapsed) {
             const user = await client.users.fetch(l.purchase.user_id).catch(() => null);
             await user
               ?.send(`🛒 **${l.item.name}** の月額更新が失敗しました（${l.reason}）。当月末で権利が失効します。再購入は公式ショップから。`)
               .catch(() => undefined);
-            // add_role の場合はロールを剥奪
-            if (l.item.delivery_kind === "add_role" && l.item.delivery_data) {
-              try {
-                const data = JSON.parse(l.item.delivery_data) as { role_id?: string };
-                if (data.role_id) {
-                  const guildId = services.settings.getString("guild:main");
-                  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
-                  const member = guild ? await guild.members.fetch(l.purchase.user_id).catch(() => null) : null;
-                  await member?.roles.remove(data.role_id).catch(() => undefined);
-                }
-              } catch {
-                /* noop */
-              }
-            }
           }
         }).catch((e) => console.error("[ショップ] 月額一括処理失敗:", e));
       }
     }
+
+    // 失効購入のロール剥奪は月次請求と分離し、購入ID単位で毎分自己修復する。
+    await processShopRoleRevocations(client, services).catch((e) =>
+      console.error("[ショップ] 失効ロール剥奪失敗:", e),
+    );
 
     // ── 給与の自動ドラフト: 毎月1日 09:00 JST 以降、その月にまだ投稿していなければ ──
     const marker = `payroll:draft_posted:${now.period}`;
@@ -403,7 +401,19 @@ export async function postCharonDueList(client: Client, services: Services): Pro
     const t = services.evaluation.thresholdsFor(r.user_id);
     return `・<@${r.user_id}> 期限 <t:${r.eval_deadline_at}:R> — 昇格印 ${p.total}/${t.promotionRequired}・低評価印 ${d}/${t.demotionThreshold}・評価 ${services.evaluation.evaluationCount(r.user_id)}件`;
   });
-  await sendChunkedLines(keikiban, `🛶 **カロンの帳簿** — 審判が近い魂 ${dueSoon.length}名:`, lines);
+  const dateStr = jstNow().dateStr;
+  await sendChunkedLines(
+    keikiban,
+    `🛶 **カロンの帳簿** — 審判が近い魂 ${dueSoon.length}名:`,
+    lines,
+    {
+      progress: {
+        services,
+        key: `scheduler:chunks:charon_due:${dateStr}`,
+        actor: "system:charon",
+      },
+    },
+  );
 }
 
 /** カロン②: 本人への演出通知（DM と通知チャンネルを個別マーカーで追跡） */
@@ -535,46 +545,8 @@ export async function runCharonDaily(client: Client, services: Services): Promis
 
 /**
  * 14日の評価期限を過ぎ、評価フォーラムのスレッドが1本も無い（＝誰にも評価されず）
- * 亡霊を自動で迷霊に落とす。フォーラムがある人はカロンの承認パスに委ねる（自動落とし対象外）。
+ * 亡霊を自動で迷霊に落とす。ロール同期失敗分は永続キューから自己修復する。
  */
 export async function autoDropNoEvalGhosts(client: Client, services: Services): Promise<void> {
-  const ghostRoleId = services.settings.getString("role:ghost");
-  const meireiRoleId = services.settings.getString("role:meirei");
-  const nowTs = Math.floor(Date.now() / 1000);
-  const ghosts = services.entry.listSouls("ghost");
-  const syncTargets = new Set<string>(services.entry.listSouls("meirei").map((s) => s.user_id));
-  let dropped = 0;
-  for (const soul of ghosts) {
-    if (!soul.eval_deadline_at || soul.eval_deadline_at > nowTs) continue;
-    if (services.evaluation.threadFor(soul.user_id)) continue; // フォーラム有り→カロンへ
-    services.evaluation.demoteToMeirei(soul.user_id, "system:auto-drop", "14日以内に評価が付かなかった（フォーラム未作成）");
-    syncTargets.add(soul.user_id);
-    dropped++;
-  }
-
-  if (syncTargets.size === 0) return;
-  const guildId = services.settings.getString("guild:main");
-  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
-  if (!guild) throw new Error("autodrop:guild_fetch_failed");
-  const failures: string[] = [];
-  for (const userId of syncTargets) {
-    const member = await guild.members.fetch(userId).catch((e) => {
-      failures.push(`member_fetch:${userId}:${e instanceof Error ? e.message : String(e)}`);
-      return null;
-    });
-    if (!member) continue;
-    // 迷霊を先に付けてから亡霊を剥がす（executeDemotion と同じ race 対策）
-    if (meireiRoleId && !member.roles.cache.has(meireiRoleId)) {
-      await member.roles.add(meireiRoleId).catch((e) => {
-        failures.push(`add_meirei:${userId}:${e instanceof Error ? e.message : String(e)}`);
-      });
-    }
-    if (ghostRoleId && member.roles.cache.has(ghostRoleId)) {
-      await member.roles.remove(ghostRoleId).catch((e) => {
-        failures.push(`remove_ghost:${userId}:${e instanceof Error ? e.message : String(e)}`);
-      });
-    }
-  }
-  if (dropped > 0) console.log(`[自動迷霊] ${dropped}名を落としました（フォーラム未作成・期限超過）`);
-  if (failures.length > 0) throw new Error(`autodrop:role_sync_failed:${failures.join(",")}`);
+  await recoverAutoDropNoEvalGhosts(client, services);
 }
