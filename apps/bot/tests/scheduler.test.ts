@@ -194,7 +194,8 @@ describe("ショップ月額ロール剥奪", () => {
       actor: "test",
       idempotencyKey: `fund:${Math.random()}`,
     });
-    const shop = new Shop(db, ledger, new EventLog(db));
+    const events = new EventLog(db);
+    const shop = new Shop(db, ledger, events);
     const item = shop.createItem(
       {
         name: "月額ロール",
@@ -209,28 +210,32 @@ describe("ショップ月額ロール剥奪", () => {
     const purchase = shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     db.prepare("UPDATE shop_purchases SET expires_at=1, auto_renew=0 WHERE id=?").run(purchase.id);
     shop.chargeMonthlySubscriptions("system:test");
-    return { db, shop, item, purchase };
+    return { db, events, shop, item, purchase };
   }
 
-  it("失効購入の剥奪再試行時、同じロールを付与するactive購入があれば剥がさず完了扱いにする", async () => {
-    const { db, shop, item, purchase } = setupShop();
+  it("失効購入の剥奪再試行時、同じロールを付与するactive購入があれば剥がさず一度だけ完了記録する", async () => {
+    const { db, events, shop, item, purchase } = setupShop();
     shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] });
     const remove = vi.fn(async () => undefined);
     const member = { roles: { cache: { has: vi.fn(() => true) }, remove } };
     const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
     const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
     const { processShopRoleRevocations } = await import("../src/scheduler.js");
+    const services = { db, events, shop, settings };
 
-    await processShopRoleRevocations(client as any, { db, shop, settings } as any);
+    await processShopRoleRevocations(client as any, services as any);
+    await processShopRoleRevocations(client as any, services as any);
 
     expect(remove).not.toHaveBeenCalled();
     const row = db.prepare("SELECT status FROM shop_role_revocations WHERE purchase_id=?").get(purchase.id) as { status: string };
     expect(row.status).toBe("done");
+    const doneEvents = db.prepare("SELECT * FROM events WHERE type='shop_role_revocation_done'").all();
+    expect(doneEvents).toHaveLength(1);
     db.close();
   });
 
   it("active購入がなければロールを剥奪し、Discord API一時失敗後は剥奪だけ再試行する", async () => {
-    const { db, shop, purchase } = setupShop();
+    const { db, events, shop, purchase } = setupShop();
     const remove = vi.fn()
       .mockRejectedValueOnce(new Error("temporary"))
       .mockResolvedValueOnce(undefined);
@@ -238,19 +243,55 @@ describe("ショップ月額ロール剥奪", () => {
     const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
     const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
     const { processShopRoleRevocations } = await import("../src/scheduler.js");
+    const services = { db, events, shop, settings };
 
-    await expect(processShopRoleRevocations(client as any, { db, shop, settings } as any)).rejects.toThrow("shop_role_revocation_failed");
+    await expect(processShopRoleRevocations(client as any, services as any)).rejects.toThrow("shop_role_revocation_failed");
     let row = db.prepare("SELECT status, attempts FROM shop_role_revocations WHERE purchase_id=?").get(purchase.id) as { status: string; attempts: number };
     expect(row.status).toBe("pending");
     expect(row.attempts).toBe(1);
 
-    await processShopRoleRevocations(client as any, { db, shop, settings } as any);
+    await processShopRoleRevocations(client as any, services as any);
     row = db.prepare("SELECT status, attempts FROM shop_role_revocations WHERE purchase_id=?").get(purchase.id) as { status: string; attempts: number };
     expect(row.status).toBe("done");
     expect(remove).toHaveBeenCalledTimes(2);
 
-    await processShopRoleRevocations(client as any, { db, shop, settings } as any);
+    await processShopRoleRevocations(client as any, services as any);
     expect(remove).toHaveBeenCalledTimes(2);
+    expect(db.prepare("SELECT * FROM events WHERE type='shop_role_revocation_done'").all()).toHaveLength(1);
+    db.close();
+  });
+
+  it("既存の失効購入に剥奪キューが無くても起動時バックフィルで回収する", async () => {
+    const { db, events, shop, purchase } = setupShop();
+    db.prepare("DELETE FROM shop_role_revocations WHERE purchase_id=?").run(purchase.id);
+    const remove = vi.fn(async () => undefined);
+    const member = { roles: { cache: { has: vi.fn(() => true) }, remove } };
+    const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
+    const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
+    const { processShopRoleRevocations } = await import("../src/scheduler.js");
+
+    await processShopRoleRevocations(client as any, { db, events, shop, settings } as any);
+
+    expect(remove).toHaveBeenCalledWith("role_old");
+    const row = db.prepare("SELECT status, role_id FROM shop_role_revocations WHERE purchase_id=?").get(purchase.id) as { status: string; role_id: string };
+    expect(row).toEqual({ status: "done", role_id: "role_old" });
+    db.close();
+  });
+
+  it("月額処理途中で例外が起きた場合は外側トランザクションでDB変更を戻す", async () => {
+    const db = openDb(":memory:");
+    db.exec("CREATE TABLE scheduler_atomic_probe (id INTEGER PRIMARY KEY)");
+    const fakeShop = {
+      chargeMonthlySubscriptions: vi.fn(() => {
+        db.prepare("INSERT INTO scheduler_atomic_probe(id) VALUES (1)").run();
+        throw new Error("after expire queue failure");
+      }),
+    };
+    const { chargeMonthlySubscriptionsAtomically } = await import("../src/scheduler-recovery.js");
+
+    expect(() => chargeMonthlySubscriptionsAtomically({ db, shop: fakeShop } as any, "system:test")).toThrow("after expire queue failure");
+    const count = db.prepare("SELECT COUNT(*) AS c FROM scheduler_atomic_probe").get() as { c: number };
+    expect(count.c).toBe(0);
     db.close();
   });
 });
