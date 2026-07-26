@@ -14,11 +14,16 @@ import { ticketStaffRoleIds } from "./commands/tickets.js";
 import type { Services } from "./services.js";
 import {
   cleanupCompletedChunkBatches,
+  finalizeChunkBatch,
   pendingChunkBatch,
   runSchedulerTaskOnce,
   sendChunkedLinesResumable,
 } from "./scheduler-utils.js";
-import { processShopRoleRevocations, recoverAutoDropNoEvalGhosts } from "./scheduler-recovery.js";
+import {
+  chargeMonthlySubscriptionsAtomically,
+  processShopRoleRevocations,
+  recoverAutoDropNoEvalGhosts,
+} from "./scheduler-recovery.js";
 
 export { processShopRoleRevocations } from "./scheduler-recovery.js";
 
@@ -261,7 +266,7 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       const shopMarker = `shop:monthly:${now.period}`;
       if (!services.settings.getString(shopMarker)) {
         await runSchedulerTaskOnce(services, shopMarker, "system:scheduler", async () => {
-          const { charged, lapsed } = services.shop.chargeMonthlySubscriptions("system:shop-monthly");
+          const { charged, lapsed } = chargeMonthlySubscriptionsAtomically(services, "system:shop-monthly");
           console.log(`[ショップ] 月額一括: 課金 ${charged.length}件 / 失効 ${lapsed.length}件`);
           // 本人通知はbest effort。Discord上の権利剥奪は購入履歴から別タスクで再試行する。
           for (const l of lapsed) {
@@ -273,7 +278,6 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         }).catch((e) => console.error("[ショップ] 月額一括処理失敗:", e));
       }
     }
-    await processShopRoleRevocations(client, services).catch((e) => console.error("[ショップ] ロール剥奪再試行失敗:", e));
 
     // 失効購入のロール剥奪は月次請求と分離し、購入ID単位で毎分自己修復する。
     await processShopRoleRevocations(client, services).catch((e) =>
@@ -298,7 +302,18 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     }
   }
 
-  return setInterval(() => void tick().catch((e) => console.error("[刻時盤] tick失敗:", e)), intervalMs);
+  let tickInFlight = false;
+  async function runTick(): Promise<void> {
+    if (tickInFlight) return;
+    tickInFlight = true;
+    try {
+      await tick();
+    } finally {
+      tickInFlight = false;
+    }
+  }
+
+  return setInterval(() => void runTick().catch((e) => console.error("[刻時盤] tick失敗:", e)), intervalMs);
 }
 
 /** VC浮上報酬の日次支給: 前日分を計算して1人1取引で発行し、本人にDMで通知 */
@@ -396,7 +411,9 @@ export async function processStaleTicketNotifications(client: Client, services: 
     roleIds: staffRoleIds,
     metadata: { createdBy: "system:scheduler" },
   });
-  for (const threadId of result.targetIds) services.tickets.markReminded(threadId);
+  finalizeChunkBatch(services, batchKey, () => {
+    for (const threadId of result.targetIds) services.tickets.markReminded(threadId);
+  });
 }
 
 async function fetchTextChannel(client: Client, services: Services, settingKey: string): Promise<TextChannel | null> {
@@ -410,29 +427,35 @@ async function fetchTextChannel(client: Client, services: Services, settingKey: 
 
 /** カロン①: 期限が近い者のリストを #城の計器盤 へ投稿 */
 export async function postCharonDueList(client: Client, services: Services): Promise<void> {
+  const existing = pendingChunkBatch(services, "charon_due_list");
   const nowTs = Math.floor(Date.now() / 1000);
   const dateStr = jstNow().dateStr;
   const DAY = 86_400;
-  const dueSoon = services.evaluation.dueBetween(nowTs, nowTs + 2 * DAY);
-  if (dueSoon.length === 0) return;
+  const dueSoon = existing ? [] : services.evaluation.dueBetween(nowTs, nowTs + 2 * DAY);
+  if (!existing && dueSoon.length === 0) return;
   const keikiban = await fetchTextChannel(client, services, "channel:keikiban");
   if (!keikiban) throw new Error("charon_due_list:channel_missing_or_not_sendable");
 
-  const lines = dueSoon.map((r) => {
-    const p = services.evaluation.promotionScore(r.user_id);
-    const d = services.evaluation.demotionCount(r.user_id);
-    const t = services.evaluation.thresholdsFor(r.user_id);
-    return `・<@${r.user_id}> 期限 <t:${r.eval_deadline_at}:R> — 昇格印 ${p.total}/${t.promotionRequired}・低評価印 ${d}/${t.demotionThreshold}・評価 ${services.evaluation.evaluationCount(r.user_id)}件`;
-  });
+  const targetIds = existing ? JSON.parse(existing.target_ids_json) as string[] : dueSoon.map((r) => r.user_id);
+  const lines = existing
+    ? []
+    : dueSoon.map((r) => {
+      const p = services.evaluation.promotionScore(r.user_id);
+      const d = services.evaluation.demotionCount(r.user_id);
+      const t = services.evaluation.thresholdsFor(r.user_id);
+      return `・<@${r.user_id}> 期限 <t:${r.eval_deadline_at}:R> — 昇格印 ${p.total}/${t.promotionRequired}・低評価印 ${d}/${t.demotionThreshold}・評価 ${services.evaluation.evaluationCount(r.user_id)}件`;
+    });
+  const batchKey = existing?.batch_key ?? `charon_due_list:${dateStr}`;
   await sendChunkedLinesResumable(services, keikiban, {
-    batchKey: `charon_due_list:${dateStr}`,
+    batchKey,
     kind: "charon_due_list",
-    header: `🛶 **カロンの帳簿** — 審判が近い魂 ${dueSoon.length}名:`,
+    header: `🛶 **カロンの帳簿** — 審判が近い魂 ${targetIds.length}名:`,
     lines,
-    targetIds: dueSoon.map((r) => r.user_id),
+    targetIds,
     roleIds: [],
     metadata: { dateStr },
   });
+  finalizeChunkBatch(services, batchKey);
 }
 
 /** カロン②: 本人への演出通知（DM と通知チャンネルを個別マーカーで追跡） */
