@@ -134,6 +134,7 @@ describe("自動迷霊タスク", () => {
     const services = {
       settings,
       entry: {
+        getSoul: vi.fn(() => (phase === "meirei" ? { user_id: "user1", status: "meirei" } : { user_id: "user1", status: "ghost" })),
         listSouls: vi.fn((status: string) => {
           if (status === "ghost") {
             return phase === "ghost" ? [{ user_id: "user1", eval_deadline_at: 1 }] : [];
@@ -168,4 +169,41 @@ describe("自動迷霊タスク", () => {
     expect(remove).toHaveBeenCalledWith("ghost_role");
     expect(values.get("autodrop:noeval:test")).toBe("1");
   });
+
+  it.each(["ghost", "majin", "mazoku", "waiting", "departed"] as const)(
+    "未完了同期の再試行時、現在statusが%sなら迷霊ロールを付けない",
+    async (status) => {
+      const { values, settings } = makeMarkerSettings();
+      values.set("guild:main", "guild");
+      values.set("role:ghost", "ghost_role");
+      values.set("role:meirei", "meirei_role");
+      const add = vi.fn(async () => undefined);
+      const remove = vi.fn(async () => undefined);
+      const member = {
+        roles: {
+          cache: { has: vi.fn((roleId: string) => roleId === "ghost_role") },
+          add,
+          remove,
+        },
+      };
+      const client = {
+        guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) },
+      };
+      const services = {
+        settings,
+        entry: {
+          listSouls: vi.fn((requested: string) => requested === "meirei" ? [{ user_id: "user1", eval_deadline_at: 1 }] : []),
+          getSoul: vi.fn(() => ({ user_id: "user1", status })),
+        },
+        evaluation: { threadFor: vi.fn(() => undefined), demoteToMeirei: vi.fn() },
+      };
+      const { autoDropNoEvalGhosts } = await import("../src/scheduler.js");
+
+      await expect(autoDropNoEvalGhosts(client as any, services as any)).resolves.toBeUndefined();
+
+      expect(add).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+      expect(services.evaluation.demoteToMeirei).not.toHaveBeenCalled();
+    },
+  );
 });

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { openDb } from "@meigokujo/core";
 import { processShopRoleRevocations, recoverAutoDropNoEvalGhosts } from "../src/scheduler-recovery.js";
-import { sendChunkedLines } from "../src/scheduler-utils.js";
+import { sendChunkedLinesResumable } from "../src/scheduler-utils.js";
 
 function makeSettings(values = new Map<string, string>()) {
   return {
@@ -22,6 +23,7 @@ describe("自動迷霊の永続ロール同期", () => {
       settings,
       entry: {
         listSouls: vi.fn((status: string) => status === "meirei" ? [{ user_id: "departed" }] : []),
+        getSoul: vi.fn(() => ({ user_id: "departed", status: "meirei" })),
       },
       evaluation: { threadFor: vi.fn(), demoteToMeirei: vi.fn() },
     };
@@ -55,6 +57,7 @@ describe("自動迷霊の永続ロール同期", () => {
       return {
         settings,
         entry: {
+          getSoul: vi.fn((userId: string) => ({ user_id: userId, status })),
           listSouls: vi.fn((requested: string) => {
             if (requested === "ghost") return status === "ghost" ? [{ user_id: "user1", eval_deadline_at: 1 }] : [];
             if (requested === "meirei") return status === "meirei" ? [{ user_id: "user1" }] : [];
@@ -89,7 +92,7 @@ describe("自動迷霊の永続ロール同期", () => {
     const { settings } = makeSettings(values);
     const services = {
       settings,
-      entry: { listSouls: vi.fn(() => []) },
+      entry: { listSouls: vi.fn(() => []), getSoul: vi.fn(() => ({ user_id: "gone", status: "meirei" })) },
       evaluation: { threadFor: vi.fn(), demoteToMeirei: vi.fn() },
     };
     const missing = Object.assign(new Error("Unknown Member"), { code: 10007 });
@@ -103,21 +106,26 @@ describe("自動迷霊の永続ロール同期", () => {
 });
 
 describe("ショップ失効ロール剥奪", () => {
-  function expiredPurchase() {
+  function pendingRevocation() {
     return {
-      id: 10,
-      item_id: 2,
+      purchase_id: 10,
       user_id: "user1",
-      status: "expired",
-      item_name: "monthly role",
-      item_delivery: "auto",
+      role_id: "role1",
+      status: "pending",
+      attempts: 0,
+      last_error: null,
+      created_at: 1,
+      updated_at: 1,
+      completed_at: null,
     };
   }
 
-  it("剥奪失敗後は購入履歴から再発見し、成功後だけ購入IDマーカーを保存する", async () => {
+  it("剥奪失敗後はpendingから再試行し、成功後だけ購入ID単位で完了する", async () => {
     const values = new Map<string, string>([["guild:main", "guild"]]);
     let hasRole = true;
     const remove = vi.fn(async () => { throw new Error("temporary"); });
+    const done = vi.fn();
+    const retry = vi.fn();
     const member = {
       roles: {
         cache: { has: vi.fn(() => hasRole) },
@@ -129,19 +137,22 @@ describe("ショップ失効ロール剥奪", () => {
       return {
         settings,
         shop: {
-          listRecentPurchases: vi.fn(() => [expiredPurchase()]),
-          getItem: vi.fn(() => ({ delivery_kind: "add_role", delivery_data: JSON.stringify({ role_id: "role1" }) })),
+          pendingRoleRevocations: vi.fn(() => done.mock.calls.length > 0 ? [] : [pendingRevocation()]),
+          activePurchaseGrantsRole: vi.fn(() => false),
+          markRoleRevocationDone: done,
+          markRoleRevocationRetry: retry,
         },
       };
     };
     const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
 
-    await expect(processShopRoleRevocations(client as any, makeServices() as any)).rejects.toThrow("shop_role_revoke:failed");
-    expect(values.get("shop:role_revoked:10")).toBeUndefined();
+    await expect(processShopRoleRevocations(client as any, makeServices() as any)).rejects.toThrow("shop_role_revocation_failed");
+    expect(done).not.toHaveBeenCalled();
+    expect(retry).toHaveBeenCalledWith(10, "system:shop-role-revoke", "temporary");
 
     remove.mockImplementation(async () => { hasRole = false; });
     await expect(processShopRoleRevocations(client as any, makeServices() as any)).resolves.toBeUndefined();
-    expect(values.get("shop:role_revoked:10")).toBe("removed");
+    expect(done).toHaveBeenCalledWith(10, "system:shop-role-revoke", "removed");
 
     await expect(processShopRoleRevocations(client as any, makeServices() as any)).resolves.toBeUndefined();
     expect(remove).toHaveBeenCalledTimes(2);
@@ -153,8 +164,10 @@ describe("ショップ失効ロール剥奪", () => {
     const services = {
       settings: missingSettings,
       shop: {
-        listRecentPurchases: vi.fn(() => [expiredPurchase()]),
-        getItem: vi.fn(() => ({ delivery_kind: "add_role", delivery_data: JSON.stringify({ role_id: "role1" }) })),
+        pendingRoleRevocations: vi.fn(() => [pendingRevocation()]),
+        activePurchaseGrantsRole: vi.fn(() => false),
+        markRoleRevocationDone: vi.fn(),
+        markRoleRevocationRetry: vi.fn(),
       },
     };
     const missing = Object.assign(new Error("Unknown Member"), { code: 10007 });
@@ -162,41 +175,51 @@ describe("ショップ失効ロール剥奪", () => {
       guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => { throw missing; }) } })) },
     };
     await expect(processShopRoleRevocations(missingClient as any, services as any)).resolves.toBeUndefined();
-    expect(missingValues.get("shop:role_revoked:10")).toBe("member_absent");
+    expect(services.shop.markRoleRevocationDone).toHaveBeenCalledWith(10, "system:shop-role-revoke", "member_absent");
 
     const absentValues = new Map<string, string>([["guild:main", "guild"]]);
-    const absentServices = { ...services, settings: makeSettings(absentValues).settings };
+    const absentServices = {
+      ...services,
+      settings: makeSettings(absentValues).settings,
+      shop: { ...services.shop, markRoleRevocationDone: vi.fn() },
+    };
     const absentClient = {
       guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => ({ roles: { cache: { has: () => false }, remove: vi.fn() } })) } })) },
     };
     await expect(processShopRoleRevocations(absentClient as any, absentServices as any)).resolves.toBeUndefined();
-    expect(absentValues.get("shop:role_revoked:10")).toBe("already_absent");
+    expect(absentServices.shop.markRoleRevocationDone).toHaveBeenCalledWith(10, "system:shop-role-revoke", "already_absent");
   });
 });
 
 describe("分割通知の再開", () => {
   it("2チャンク目失敗後は1チャンク目を再投稿せず、ロールも再メンションしない", async () => {
-    const values = new Map<string, string>();
-    const { settings } = makeSettings(values);
+    const db = openDb(":memory:");
     const firstSend = vi.fn()
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error("second failed"));
     const firstChannel = { send: firstSend };
     const lines = ["a".repeat(1500), "b".repeat(1500)];
-    const opts = {
-      allowedRoleIds: ["staff"],
-      progress: { services: { settings }, key: "chunks:test", actor: "system:test" },
+    const snapshot = {
+      batchKey: "chunks:test",
+      kind: "test",
+      header: "<@&staff> header",
+      lines,
+      targetIds: ["target"],
+      roleIds: ["staff"],
     };
 
-    await expect(sendChunkedLines(firstChannel as any, "<@&staff> header", lines, opts as any)).rejects.toThrow("second failed");
+    await expect(sendChunkedLinesResumable({ db } as any, firstChannel as any, snapshot)).rejects.toThrow("second failed");
     expect(firstSend).toHaveBeenCalledTimes(2);
 
     const retrySend = vi.fn(async () => undefined);
-    await expect(sendChunkedLines({ send: retrySend } as any, "changed header", ["changed"], opts as any)).resolves.toBeUndefined();
+    await expect(sendChunkedLinesResumable({ db } as any, { send: retrySend } as any, { ...snapshot, header: "changed", lines: ["changed"] })).resolves.toBeDefined();
     expect(retrySend).toHaveBeenCalledTimes(1);
     expect(retrySend.mock.calls[0]?.[0]?.allowedMentions.roles).toEqual([]);
 
-    await expect(sendChunkedLines({ send: retrySend } as any, "ignored", [], opts as any)).resolves.toBeUndefined();
+    await expect(sendChunkedLinesResumable({ db } as any, { send: retrySend } as any, snapshot)).resolves.toBeDefined();
     expect(retrySend).toHaveBeenCalledTimes(1);
+    const row = db.prepare("SELECT chunks_json FROM scheduler_chunk_batches WHERE batch_key='chunks:test'").get() as { chunks_json: string | null };
+    expect(row.chunks_json).toBeNull();
+    db.close();
   });
 });

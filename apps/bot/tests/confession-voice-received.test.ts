@@ -57,7 +57,10 @@ function makeHarness(sendDm: () => Promise<void>) {
     settings: { getNumber: vi.fn(() => 90) },
     confessions: {
       get: vi.fn(() => row),
-      close: vi.fn(() => makeRow({ status: "closed", close_reason: "voice_received", closed_by: "staff" })),
+      closeVoiceReceivedAtomic: vi.fn(() => ({
+        ok: true,
+        row: makeRow({ status: "closed", close_reason: "voice_received", closed_by: "staff" }),
+      })),
       openEmergencyFor: vi.fn(() => null),
       closeEmergency: vi.fn(),
       isAssignee: vi.fn(() => false),
@@ -74,7 +77,7 @@ describe("トートの耳・返信不要案件の専用クローズ", () => {
 
     await closeAsVoiceReceived(interaction as any, services as any, 1);
 
-    expect(services.confessions.close).toHaveBeenCalledWith(1, "staff", "voice_received", 90);
+    expect(services.confessions.closeVoiceReceivedAtomic).toHaveBeenCalledWith(1, "staff", 90);
     expect(editReply).toHaveBeenCalledWith({
       content: "投稿者へ『あなたの声は届きました』と伝えてクローズしました",
     });
@@ -92,7 +95,7 @@ describe("トートの耳・返信不要案件の専用クローズ", () => {
 
     await closeAsVoiceReceived(interaction as any, services as any, 1);
 
-    expect(services.confessions.close).toHaveBeenCalledWith(1, "staff", "voice_received", 90);
+    expect(services.confessions.closeVoiceReceivedAtomic).toHaveBeenCalledWith(1, "staff", 90);
     expect(editReply).toHaveBeenCalledWith({
       content: "案件はクローズしましたが、投稿者へDMを送れませんでした",
     });

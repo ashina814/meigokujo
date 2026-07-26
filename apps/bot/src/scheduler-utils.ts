@@ -25,21 +25,49 @@ export async function runSchedulerTaskOnce(
 /** Discordの1メッセージあたりの content 上限 */
 const DISCORD_CONTENT_MAX = 2000;
 
-interface ChunkProgressState {
-  chunks: string[];
-  sent: number[];
+export interface SchedulerChunkBatchRow {
+  batch_key: string;
+  kind: string;
+  status: "pending" | "completed";
+  target_ids_json: string;
+  role_ids_json: string;
+  chunks_json: string | null;
+  sent_chunks_json: string;
+  metadata_json: string | null;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
 }
 
-function parseChunkProgress(raw: unknown): ChunkProgressState | undefined {
-  if (!raw) return undefined;
-  try {
-    const parsed = typeof raw === "string" ? JSON.parse(raw) as Partial<ChunkProgressState> : raw as Partial<ChunkProgressState>;
-    if (!Array.isArray(parsed.chunks) || !parsed.chunks.every((value) => typeof value === "string")) return undefined;
-    if (!Array.isArray(parsed.sent) || !parsed.sent.every((value) => Number.isInteger(value) && value >= 0)) return undefined;
-    return { chunks: parsed.chunks, sent: parsed.sent };
-  } catch {
-    return undefined;
-  }
+export interface ResumableChunkSnapshot {
+  batchKey: string;
+  kind: string;
+  header: string;
+  lines: string[];
+  targetIds: string[];
+  roleIds: string[];
+  metadata?: Record<string, unknown>;
+}
+
+const now = () => Math.floor(Date.now() / 1000);
+
+function ensureChunkBatchTable(db: Services["db"]): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS scheduler_chunk_batches (
+      batch_key       TEXT PRIMARY KEY,
+      kind            TEXT NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
+      target_ids_json TEXT NOT NULL,
+      role_ids_json   TEXT NOT NULL,
+      chunks_json     TEXT,
+      sent_chunks_json TEXT NOT NULL DEFAULT '[]',
+      metadata_json   TEXT,
+      created_at      INTEGER NOT NULL,
+      updated_at      INTEGER NOT NULL,
+      completed_at    INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_scheduler_chunk_batches_kind ON scheduler_chunk_batches(kind, status, created_at);
+  `);
 }
 
 function buildChunks(header: string, lines: string[]): string[] {
@@ -58,60 +86,110 @@ function buildChunks(header: string, lines: string[]): string[] {
   return chunks;
 }
 
+function parseJsonArray(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+export function pendingChunkBatch(
+  services: Pick<Services, "db">,
+  kind: string,
+): SchedulerChunkBatchRow | undefined {
+  ensureChunkBatchTable(services.db);
+  return services.db
+    .prepare("SELECT * FROM scheduler_chunk_batches WHERE kind=? AND status='pending' ORDER BY created_at LIMIT 1")
+    .get(kind) as SchedulerChunkBatchRow | undefined;
+}
+
+export function cleanupCompletedChunkBatches(services: Pick<Services, "db">, olderThanSec = 86_400): void {
+  ensureChunkBatchTable(services.db);
+  services.db
+    .prepare("DELETE FROM scheduler_chunk_batches WHERE status='completed' AND completed_at IS NOT NULL AND completed_at < ?")
+    .run(now() - olderThanSec);
+}
+
+export async function sendChunkedLinesResumable(
+  services: Pick<Services, "db">,
+  channel: TextChannel,
+  snapshot: ResumableChunkSnapshot,
+  opts: { components?: ActionRowBuilder<ButtonBuilder>[] } = {},
+): Promise<{ targetIds: string[]; roleIds: string[]; sent: number }> {
+  ensureChunkBatchTable(services.db);
+  const ts = now();
+  const existing = services.db
+    .prepare("SELECT * FROM scheduler_chunk_batches WHERE batch_key=?")
+    .get(snapshot.batchKey) as SchedulerChunkBatchRow | undefined;
+  if (!existing) {
+    services.db
+      .prepare(
+        `INSERT INTO scheduler_chunk_batches
+         (batch_key, kind, status, target_ids_json, role_ids_json, chunks_json, sent_chunks_json, metadata_json, created_at, updated_at)
+         VALUES (?, ?, 'pending', ?, ?, ?, '[]', ?, ?, ?)`,
+      )
+      .run(
+        snapshot.batchKey,
+        snapshot.kind,
+        JSON.stringify(snapshot.targetIds),
+        JSON.stringify(snapshot.roleIds),
+        JSON.stringify(buildChunks(snapshot.header, snapshot.lines)),
+        snapshot.metadata ? JSON.stringify(snapshot.metadata) : null,
+        ts,
+        ts,
+      );
+  }
+  const row = services.db
+    .prepare("SELECT * FROM scheduler_chunk_batches WHERE batch_key=?")
+    .get(snapshot.batchKey) as SchedulerChunkBatchRow;
+  const targetIds = parseJsonArray(row.target_ids_json);
+  const roleIds = parseJsonArray(row.role_ids_json);
+  if (row.status === "completed") return { targetIds, roleIds, sent: 0 };
+  const chunks = parseJsonArray(row.chunks_json);
+  const sentChunks = new Set(parseJsonArray(row.sent_chunks_json).map((v) => Number(v)).filter(Number.isInteger));
+  let sentNow = 0;
+  for (let i = 0; i < chunks.length; i += 1) {
+    if (sentChunks.has(i)) continue;
+    await channel.send({
+      content: chunks[i]!,
+      allowedMentions: { parse: [], roles: i === 0 ? roleIds : [] },
+      ...(i === chunks.length - 1 && opts.components ? { components: opts.components } : {}),
+    });
+    sentChunks.add(i);
+    sentNow += 1;
+    services.db
+      .prepare("UPDATE scheduler_chunk_batches SET sent_chunks_json=?, updated_at=? WHERE batch_key=?")
+      .run(JSON.stringify([...sentChunks].sort((a, b) => a - b).map(String)), now(), snapshot.batchKey);
+  }
+  services.db
+    .prepare(
+      "UPDATE scheduler_chunk_batches SET status='completed', chunks_json=NULL, metadata_json=NULL, updated_at=?, completed_at=? WHERE batch_key=?",
+    )
+    .run(now(), now(), snapshot.batchKey);
+  return { targetIds, roleIds, sent: sentNow };
+}
+
 /**
  * 見出し＋行リストを 2000 文字以内へ分割して送る。
  *
- * progressを指定した場合、最初に確定したチャンク列と送信済み番号をsettingsへ保存する。
- * 途中のDiscord送信失敗やBot再起動後は未送信チャンクだけを再開するため、
- * 先頭チャンクの再投稿やスタッフロールの重複メンションを防げる。
+ * 通常の一括送信用。再起動後の再開が必要なScheduler通知では
+ * sendChunkedLinesResumable を使い、本文をsettings監査ログへ保存しない。
  */
 export async function sendChunkedLines(
   channel: TextChannel,
   header: string,
   lines: string[],
-  opts: {
-    components?: ActionRowBuilder<ButtonBuilder>[];
-    allowedRoleIds?: string[];
-    progress?: {
-      services: Pick<Services, "settings">;
-      key: string;
-      actor: string;
-    };
-  } = {},
+  opts: { components?: ActionRowBuilder<ButtonBuilder>[]; allowedRoleIds?: string[] } = {},
 ): Promise<void> {
-  if (opts.progress && opts.components) {
-    throw new Error("sendChunkedLines:progress_with_components_not_supported");
-  }
-
-  const generatedChunks = buildChunks(header, lines);
-  const stored = opts.progress
-    ? parseChunkProgress(opts.progress.services.settings.getString(opts.progress.key) as unknown)
-    : undefined;
-  const chunks = stored?.chunks.length ? stored.chunks : generatedChunks;
-  const sent = new Set(stored?.sent ?? []);
-
-  if (opts.progress && !stored) {
-    opts.progress.services.settings.set(
-      opts.progress.key,
-      { chunks, sent: [] },
-      opts.progress.actor,
-    );
-  }
-
+  const chunks = buildChunks(header, lines);
   for (let i = 0; i < chunks.length; i++) {
-    if (sent.has(i)) continue;
     await channel.send({
       content: chunks[i]!,
       allowedMentions: { parse: [], roles: i === 0 ? (opts.allowedRoleIds ?? []) : [] },
       ...(i === chunks.length - 1 && opts.components ? { components: opts.components } : {}),
     });
-    sent.add(i);
-    if (opts.progress) {
-      opts.progress.services.settings.set(
-        opts.progress.key,
-        { chunks, sent: [...sent].sort((a, b) => a - b) },
-        opts.progress.actor,
-      );
-    }
   }
 }

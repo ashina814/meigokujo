@@ -12,8 +12,15 @@ import { fmtLd } from "./format.js";
 import { announceAutoClose, announceSettle, refreshMarketPanel } from "./commands/ita.js";
 import { ticketStaffRoleIds } from "./commands/tickets.js";
 import type { Services } from "./services.js";
-import { runSchedulerTaskOnce, sendChunkedLines } from "./scheduler-utils.js";
+import {
+  cleanupCompletedChunkBatches,
+  pendingChunkBatch,
+  runSchedulerTaskOnce,
+  sendChunkedLinesResumable,
+} from "./scheduler-utils.js";
 import { processShopRoleRevocations, recoverAutoDropNoEvalGhosts } from "./scheduler-recovery.js";
+
+export { processShopRoleRevocations } from "./scheduler-recovery.js";
 
 /** JSTの現在時刻の分解値。VPSのTZに依存しないよう明示的に変換する */
 export function jstNow(date = new Date()): {
@@ -49,6 +56,16 @@ export function jstNow(date = new Date()): {
   };
 }
 
+export function isSessionNotificationDue(
+  now: Pick<ReturnType<typeof jstNow>, "hour" | "minute">,
+  sessionStartHour: number,
+  notifyMinute: number,
+  retryWindowMinutes = 2,
+): boolean {
+  const notifyHour = sessionStartHour - 1;
+  return now.hour === notifyHour && now.minute >= notifyMinute && now.minute <= notifyMinute + retryWindowMinutes && now.hour < sessionStartHour;
+}
+
 /**
  * 刻時盤（Scheduler）: 時間駆動タスクの土台。毎分tickし、各タスクは
  * settings のマーカーで「実行済みか」を自分で判定する（再起動しても二重実行しない）。
@@ -75,8 +92,7 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       // すなわち session.start は 21/22/23、通知時刻は start-1 時 30/55 分
       if (!isMonOrThu) {
         for (const s of sessions) {
-          const notifyHour = s.start - 1;
-          if (now.hour === notifyHour && now.minute === s.minute) {
+          if (isSessionNotificationDue(now, s.start, s.minute)) {
             const marker = `session:notify:${now.dateStr}:${s.start}:${s.kind}`;
             if (!services.settings.getString(marker)) {
               await runSchedulerTaskOnce(services, marker, "system:scheduler", () =>
@@ -90,30 +106,9 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
 
     // ── 24時間無応答チケットのリマインド（毎時0分にチェック）──
     if (now.minute < 2) {
-      const stale = services.tickets.staleOpen(24);
-      if (stale.length > 0) {
-        const kessaiId = services.settings.getString("channel:kessai");
-        const staffRoleIds = [...new Set(stale.flatMap((t) => ticketStaffRoleIds(t, services)))];
-        const channel = kessaiId ? await client.channels.fetch(kessaiId).catch(() => null) : null;
-        if (channel?.isTextBased() && "send" in channel) {
-          // 途中失敗時は同じ時間帯の未送信チャンクだけを再開し、スタッフを重複メンションしない。
-          await sendChunkedLines(
-            channel as TextChannel,
-            `📮 ${staffRoleIds.length > 0 ? `${staffRoleIds.map((id) => `<@&${id}>`).join(" ")} ` : ""}**24時間以上応答のないチケットが ${stale.length} 件あります**:`,
-            stale.map((t) => `・<#${t.thread_id}>（${t.panel_name ?? (t.kind === "return" ? "出戻り" : t.kind === "consult" ? "相談" : t.kind)}）`),
-            {
-              allowedRoleIds: staffRoleIds,
-              progress: {
-                services,
-                key: `scheduler:chunks:tickets:${now.dateStr}:${now.hour}`,
-                actor: "system:tickets",
-              },
-            },
-          );
-          for (const t of stale) services.tickets.markReminded(t.thread_id);
-        }
-      }
+      await processStaleTicketNotifications(client, services).catch((e) => console.error("[ticket] 24時間通知失敗:", e));
     }
+    cleanupCompletedChunkBatches(services);
 
     // ── 部屋のライフサイクル（在室スキャン・削除・期限・募集失効）──
     await scanRooms(client, services).catch((e) => console.error("[room] スキャン失敗:", e));
@@ -278,6 +273,7 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         }).catch((e) => console.error("[ショップ] 月額一括処理失敗:", e));
       }
     }
+    await processShopRoleRevocations(client, services).catch((e) => console.error("[ショップ] ロール剥奪再試行失敗:", e));
 
     // 失効購入のロール剥奪は月次請求と分離し、購入ID単位で毎分自己修復する。
     await processShopRoleRevocations(client, services).catch((e) =>
@@ -369,6 +365,40 @@ export async function sendSessionNotification(
   });
 }
 
+function legacyTicketKindLabel(kind: string): string {
+  return kind === "return" ? "出戻り" : kind === "consult" ? "相談" : kind;
+}
+
+export async function processStaleTicketNotifications(client: Client, services: Services): Promise<void> {
+  const existing = pendingChunkBatch(services, "ticket_stale_24h");
+  const stale = existing ? [] : services.tickets.staleOpen(24);
+  if (!existing && stale.length === 0) return;
+
+  const targetIds = existing ? JSON.parse(existing.target_ids_json) as string[] : stale.map((t) => t.thread_id);
+  const staffRoleIds = existing
+    ? (JSON.parse(existing.role_ids_json) as string[])
+    : [...new Set(stale.flatMap((t) => ticketStaffRoleIds(t, services)))];
+  const batchKey = existing?.batch_key ?? `ticket_stale_24h:${Date.now()}`;
+  const lines = existing
+    ? []
+    : stale.map((t) => `・<#${t.thread_id}>（${t.panel_name ?? legacyTicketKindLabel(t.kind)}）`);
+
+  const kessaiId = services.settings.getString("channel:kessai");
+  const channel = kessaiId ? await client.channels.fetch(kessaiId).catch(() => null) : null;
+  if (!channel?.isTextBased() || !("send" in channel)) throw new Error("ticket_stale:channel_missing_or_not_sendable");
+
+  const result = await sendChunkedLinesResumable(services, channel as TextChannel, {
+    batchKey,
+    kind: "ticket_stale_24h",
+    header: `📮 ${staffRoleIds.length > 0 ? `${staffRoleIds.map((id) => `<@&${id}>`).join(" ")} ` : ""}**24時間以上応答のないチケットが ${targetIds.length} 件あります**:`,
+    lines,
+    targetIds,
+    roleIds: staffRoleIds,
+    metadata: { createdBy: "system:scheduler" },
+  });
+  for (const threadId of result.targetIds) services.tickets.markReminded(threadId);
+}
+
 async function fetchTextChannel(client: Client, services: Services, settingKey: string): Promise<TextChannel | null> {
   const id = services.settings.getString(settingKey);
   if (!id) return null;
@@ -381,6 +411,7 @@ async function fetchTextChannel(client: Client, services: Services, settingKey: 
 /** カロン①: 期限が近い者のリストを #城の計器盤 へ投稿 */
 export async function postCharonDueList(client: Client, services: Services): Promise<void> {
   const nowTs = Math.floor(Date.now() / 1000);
+  const dateStr = jstNow().dateStr;
   const DAY = 86_400;
   const dueSoon = services.evaluation.dueBetween(nowTs, nowTs + 2 * DAY);
   if (dueSoon.length === 0) return;
@@ -393,19 +424,15 @@ export async function postCharonDueList(client: Client, services: Services): Pro
     const t = services.evaluation.thresholdsFor(r.user_id);
     return `・<@${r.user_id}> 期限 <t:${r.eval_deadline_at}:R> — 昇格印 ${p.total}/${t.promotionRequired}・低評価印 ${d}/${t.demotionThreshold}・評価 ${services.evaluation.evaluationCount(r.user_id)}件`;
   });
-  const dateStr = jstNow().dateStr;
-  await sendChunkedLines(
-    keikiban,
-    `🛶 **カロンの帳簿** — 審判が近い魂 ${dueSoon.length}名:`,
+  await sendChunkedLinesResumable(services, keikiban, {
+    batchKey: `charon_due_list:${dateStr}`,
+    kind: "charon_due_list",
+    header: `🛶 **カロンの帳簿** — 審判が近い魂 ${dueSoon.length}名:`,
     lines,
-    {
-      progress: {
-        services,
-        key: `scheduler:chunks:charon_due:${dateStr}`,
-        actor: "system:charon",
-      },
-    },
-  );
+    targetIds: dueSoon.map((r) => r.user_id),
+    roleIds: [],
+    metadata: { dateStr },
+  });
 }
 
 /** カロン②: 本人への演出通知（DM と通知チャンネルを個別マーカーで追跡） */

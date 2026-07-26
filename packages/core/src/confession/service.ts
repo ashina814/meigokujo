@@ -116,6 +116,10 @@ export interface ConfessionMeta {
   body?: string;
 }
 
+export type VoiceReceivedCloseResult =
+  | { ok: true; row: ConfessionRow }
+  | { ok: false; code: "not_found" | "already_closed" | "reply_wish_not_no"; row?: ConfessionRow };
+
 const now = () => Math.floor(Date.now() / 1000);
 
 export class Confessions {
@@ -259,6 +263,27 @@ export class Confessions {
       .run(ts, reason ?? null, staffId, purgeAt, id);
     this.events.log("confession_close", { actor: staffId, payload: { id, reason: reason ?? null } });
     return this.get(id);
+  }
+
+  /** 返信不要案件専用の原子的クローズ。勝者（changes=1）だけがDM等の副作用へ進む。 */
+  closeVoiceReceivedAtomic(id: number, staffId: string, retentionDays?: number): VoiceReceivedCloseResult {
+    const ts = now();
+    const purgeAt = retentionDays && retentionDays > 0 ? ts + retentionDays * 86_400 : null;
+    const info = this.db
+      .prepare(
+        `UPDATE confession_tickets
+         SET status='closed', closed_at=?, close_reason='voice_received', closed_by=?, body_purge_at=COALESCE(body_purge_at, ?)
+         WHERE id=? AND status<>'closed' AND reply_wish='no'`,
+      )
+      .run(ts, staffId, purgeAt, id);
+    const row = this.get(id);
+    if (info.changes === 1) {
+      this.events.log("confession_close", { actor: staffId, payload: { id, reason: "voice_received" } });
+      return { ok: true, row: row! };
+    }
+    if (!row) return { ok: false, code: "not_found" };
+    if (row.status === "closed") return { ok: false, code: "already_closed", row };
+    return { ok: false, code: "reply_wish_not_no", row };
   }
 
   /** 再オープン（誤クローズ・相談再開）。status=claimed に戻し、purge予定は据え置く */

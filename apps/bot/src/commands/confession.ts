@@ -222,17 +222,21 @@ export async function closeAsVoiceReceived(
     row.court_status === "sent"
       ? services.settings.getNumber("confession_court_retention_days")
       : services.settings.getNumber("confession_body_retention_days");
-  services.confessions.close(
-    id,
-    interaction.user.id,
-    VOICE_RECEIVED_REASON,
-    retentionDays,
-  );
+  const closed = services.confessions.closeVoiceReceivedAtomic(id, interaction.user.id, retentionDays);
+  if (!closed.ok) {
+    await interaction.editReply({
+      content:
+        closed.code === "already_closed"
+          ? "この件は既に閉じられています。"
+          : "「あなたの声は届きました」は、返信不要を選んだ案件でのみ利用できます。",
+    });
+    return;
+  }
 
   const openEmergency = services.confessions.openEmergencyFor(id);
   if (openEmergency) services.confessions.closeEmergency(openEmergency.id, interaction.user.id);
 
-  const user = await interaction.client.users.fetch(row.user_id).catch(() => null);
+  const user = await interaction.client.users.fetch(closed.row.user_id).catch(() => null);
   const dmSent = user
     ? await user
         .send(
@@ -250,8 +254,8 @@ export async function closeAsVoiceReceived(
         .catch(() => false)
     : false;
 
-  if (row.thread_id) {
-    const thread = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
+  if (closed.row.thread_id) {
+    const thread = await interaction.client.channels.fetch(closed.row.thread_id).catch(() => null);
     if (thread?.isThread()) {
       await thread
         .send({
@@ -271,8 +275,8 @@ export async function closeAsVoiceReceived(
       : "案件はクローズしましたが、投稿者へDMを送れませんでした",
   });
 
-  if (row.thread_id) {
-    const thread = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
+  if (closed.row.thread_id) {
+    const thread = await interaction.client.channels.fetch(closed.row.thread_id).catch(() => null);
     if (thread?.isThread()) await thread.setArchived(true).catch(() => undefined);
   }
 }

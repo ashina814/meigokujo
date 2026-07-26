@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
+import { EventLog, Ledger, openDb, registerDefaultTxTypes, Settings, Shop, Tickets, TREASURY } from "@meigokujo/core";
 import { runSchedulerTaskOnce, sendChunkedLines } from "../src/scheduler-utils.js";
 
 process.env.DISCORD_TOKEN = process.env.DISCORD_TOKEN ?? "test-token";
 process.env.CLIENT_ID = process.env.CLIENT_ID ?? "test-client";
 process.env.OWNER_ID = process.env.OWNER_ID ?? "test-owner";
+registerDefaultTxTypes();
 
 function makeSettings() {
   const values = new Map<string, string>();
@@ -76,6 +78,16 @@ describe("sendChunkedLines", () => {
 });
 
 describe("説明会通知タスク", () => {
+  it("通知予定時刻から2分間は再試行窓になり、窓外と開始後は送らない", async () => {
+    const { isSessionNotificationDue } = await import("../src/scheduler.js");
+
+    expect(isSessionNotificationDue({ hour: 20, minute: 30 }, 21, 30)).toBe(true);
+    expect(isSessionNotificationDue({ hour: 20, minute: 31 }, 21, 30)).toBe(true);
+    expect(isSessionNotificationDue({ hour: 20, minute: 32 }, 21, 30)).toBe(true);
+    expect(isSessionNotificationDue({ hour: 20, minute: 33 }, 21, 30)).toBe(false);
+    expect(isSessionNotificationDue({ hour: 21, minute: 0 }, 21, 30)).toBe(false);
+  });
+
   it("説明会チャンネル取得失敗時にマーカーが保存されない", async () => {
     const { values, settings } = makeSettings();
     values.set("channel:entry_guide", "guide");
@@ -112,6 +124,134 @@ describe("説明会通知タスク", () => {
   });
 });
 
+describe("チケット24時間通知のスナップショット", () => {
+  function setupTickets() {
+    const db = openDb(":memory:");
+    const events = new EventLog(db);
+    const tickets = new Tickets(db, events);
+    const settings = new Settings(db);
+    settings.set("channel:kessai", "kessai", "test");
+    const services = { db, tickets, settings };
+    const oldTs = Math.floor(Date.now() / 1000) - 25 * 3600;
+    tickets.create("threadA", "userA", "consult", {
+      id: "panelA",
+      name: "相談A",
+      notifyRoleIds: ["notify"],
+      staffRoleIds: ["staff"],
+    });
+    tickets.create("threadB", "userB", "consult", {
+      id: "panelB",
+      name: "相談B",
+      notifyRoleIds: ["notify"],
+      staffRoleIds: ["staff"],
+    });
+    db.prepare("UPDATE tickets SET created_at=? WHERE thread_id IN ('threadA','threadB')").run(oldTs);
+    db.prepare("UPDATE tickets SET panel_name=? WHERE thread_id='threadB'").run("長い相談".repeat(500));
+    return { db, tickets, services };
+  }
+
+  it("途中失敗後に新しくstaleになったチケットを同じバッチでmarkRemindedしない", async () => {
+    const { db, tickets, services } = setupTickets();
+    const send = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("send failed"));
+    const client = { channels: { fetch: vi.fn(async () => ({ isTextBased: () => true, send })) } };
+    const { processStaleTicketNotifications } = await import("../src/scheduler.js");
+
+    await expect(processStaleTicketNotifications(client as any, services as any)).rejects.toThrow("send failed");
+    tickets.create("threadC", "userC", "consult", {
+      id: "panelC",
+      name: "相談C",
+      notifyRoleIds: ["notify"],
+      staffRoleIds: ["staff"],
+    });
+    db.prepare("UPDATE tickets SET created_at=? WHERE thread_id='threadC'").run(Math.floor(Date.now() / 1000) - 25 * 3600);
+
+    send.mockResolvedValue(undefined);
+    await processStaleTicketNotifications(client as any, services as any);
+
+    expect(tickets.get("threadA")?.reminded_at).not.toBeNull();
+    expect(tickets.get("threadB")?.reminded_at).not.toBeNull();
+    expect(tickets.get("threadC")?.reminded_at).toBeNull();
+    expect(send.mock.calls.filter((call) => String(call[0]?.content ?? "").includes("<@&staff>"))).toHaveLength(1);
+
+    await processStaleTicketNotifications(client as any, services as any);
+    expect(tickets.get("threadC")?.reminded_at).not.toBeNull();
+  });
+});
+
+describe("ショップ月額ロール剥奪", () => {
+  function setupShop(roleId = "role_old") {
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    ledger.ensureAccount("user:user1", "user");
+    ledger.transfer({
+      from: TREASURY,
+      to: "user:user1",
+      amount: 100_000,
+      type: "initial",
+      actor: "test",
+      idempotencyKey: `fund:${Math.random()}`,
+    });
+    const shop = new Shop(db, ledger, new EventLog(db));
+    const item = shop.createItem(
+      {
+        name: "月額ロール",
+        price_land: 100,
+        kind: "monthly",
+        delivery: "auto",
+        delivery_kind: "add_role",
+        delivery_data: JSON.stringify({ role_id: roleId }),
+      },
+      "staff",
+    );
+    const purchase = shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
+    db.prepare("UPDATE shop_purchases SET expires_at=1, auto_renew=0 WHERE id=?").run(purchase.id);
+    shop.chargeMonthlySubscriptions("system:test");
+    return { db, shop, item, purchase };
+  }
+
+  it("失効購入の剥奪再試行時、同じロールを付与するactive購入があれば剥がさず完了扱いにする", async () => {
+    const { db, shop, item, purchase } = setupShop();
+    shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] });
+    const remove = vi.fn(async () => undefined);
+    const member = { roles: { cache: { has: vi.fn(() => true) }, remove } };
+    const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
+    const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
+    const { processShopRoleRevocations } = await import("../src/scheduler.js");
+
+    await processShopRoleRevocations(client as any, { shop, settings } as any);
+
+    expect(remove).not.toHaveBeenCalled();
+    const row = db.prepare("SELECT status FROM shop_role_revocations WHERE purchase_id=?").get(purchase.id) as { status: string };
+    expect(row.status).toBe("done");
+  });
+
+  it("active購入がなければロールを剥奪し、Discord API一時失敗後は剥奪だけ再試行する", async () => {
+    const { db, shop, purchase } = setupShop();
+    const remove = vi.fn()
+      .mockRejectedValueOnce(new Error("temporary"))
+      .mockResolvedValueOnce(undefined);
+    const member = { roles: { cache: { has: vi.fn(() => true) }, remove } };
+    const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
+    const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
+    const { processShopRoleRevocations } = await import("../src/scheduler.js");
+
+    await expect(processShopRoleRevocations(client as any, { shop, settings } as any)).rejects.toThrow("shop_role_revocation_failed");
+    let row = db.prepare("SELECT status, attempts FROM shop_role_revocations WHERE purchase_id=?").get(purchase.id) as { status: string; attempts: number };
+    expect(row.status).toBe("pending");
+    expect(row.attempts).toBe(1);
+
+    await processShopRoleRevocations(client as any, { shop, settings } as any);
+    row = db.prepare("SELECT status, attempts FROM shop_role_revocations WHERE purchase_id=?").get(purchase.id) as { status: string; attempts: number };
+    expect(row.status).toBe("done");
+    expect(remove).toHaveBeenCalledTimes(2);
+
+    await processShopRoleRevocations(client as any, { shop, settings } as any);
+    expect(remove).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("カロン分割タスク", () => {
   function deadlineRow(userId: string) {
     return { user_id: userId, eval_deadline_at: Math.floor(Date.now() / 1000) + 3600 };
@@ -129,6 +269,7 @@ describe("カロン分割タスク", () => {
       values,
       settings,
       services: {
+        db: openDb(":memory:"),
         settings,
         evaluation: {
           dueBetween: vi.fn(() => [row]),

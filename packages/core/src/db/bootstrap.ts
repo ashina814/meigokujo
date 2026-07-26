@@ -389,10 +389,39 @@ CREATE TABLE IF NOT EXISTS shop_purchases (
   paid_alt_amount  INTEGER,
   status           TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','expired','refunded','cancelled')),
   delivered_at     INTEGER,
-  auto_renew       INTEGER NOT NULL DEFAULT 1
+  auto_renew       INTEGER NOT NULL DEFAULT 1,
+  delivery_snapshot_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_shop_purchases_user ON shop_purchases(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_shop_purchases_expiry ON shop_purchases(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS shop_role_revocations (
+  purchase_id INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
+  user_id     TEXT NOT NULL,
+  role_id     TEXT,
+  status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','done','failed')),
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  last_error  TEXT,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  completed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_shop_role_revocations_status ON shop_role_revocations(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS scheduler_chunk_batches (
+  batch_key       TEXT PRIMARY KEY,
+  kind            TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
+  target_ids_json TEXT NOT NULL,
+  role_ids_json   TEXT NOT NULL,
+  chunks_json     TEXT,
+  sent_chunks_json TEXT NOT NULL DEFAULT '[]',
+  metadata_json   TEXT,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL,
+  completed_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_scheduler_chunk_batches_kind ON scheduler_chunk_batches(kind, status, created_at);
 
 CREATE TABLE IF NOT EXISTS rank_text (
   user_id       TEXT PRIMARY KEY,
@@ -457,6 +486,7 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "souls", "eval_demotion_threshold", "INTEGER");
   ensureColumn(db, "souls", "eval_invite_mark_per_person", "REAL");
   ensureColumn(db, "souls", "eval_invite_mark_cap", "REAL");
+  ensureColumn(db, "shop_purchases", "delivery_snapshot_json", "TEXT");
   backfillEvaluationMarkWeights(db);
   backfillEvaluationPolicySnapshots(db);
   return db;

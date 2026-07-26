@@ -121,6 +121,13 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
   const failures: string[] = [];
   for (const row of [...pending]) {
     if (!row.demoted || (row.meireiAdded && row.ghostRemoved)) continue;
+    const currentBeforeFetch = services.entry.getSoul(row.userId);
+    if (currentBeforeFetch?.status !== "meirei") {
+      row.meireiAdded = true;
+      row.ghostRemoved = true;
+      savePending(services, pending);
+      continue;
+    }
 
     let member;
     try {
@@ -153,6 +160,14 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
       }
     }
 
+    const currentBeforeGhostRemoval = services.entry.getSoul(row.userId);
+    if (currentBeforeGhostRemoval?.status !== "meirei") {
+      row.meireiAdded = true;
+      row.ghostRemoved = true;
+      savePending(services, pending);
+      continue;
+    }
+
     if (!row.ghostRemoved) {
       if (!member.roles.cache.has(ghostRoleId)) {
         row.ghostRemoved = true;
@@ -176,34 +191,13 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
 }
 
 /**
- * 失効済みのadd_role商品を購入履歴から再発見し、購入ID単位でロール剥奪を完了させる。
- * 月次請求とDiscord操作を分離するため、Bot再起動後でも回収できる。
+ * 失効済みadd_role商品のロール剥奪を、購入ID単位のDB pendingキューから再試行する。
+ * 現在の商品設定ではなく購入時スナップショット由来のrole_idを使い、
+ * 同じロールを正当に付与するactive購入があれば剥奪せず完了扱いにする。
  */
 export async function processShopRoleRevocations(client: Client, services: Services): Promise<void> {
-  const candidates: Array<{ purchaseId: number; userId: string; roleId: string }> = [];
-  const pageSize = 100;
-
-  for (let offset = 0; ; offset += pageSize) {
-    const purchases = services.shop.listRecentPurchases(pageSize, offset);
-    for (const purchase of purchases) {
-      if (purchase.status !== "expired") continue;
-      if (services.settings.getString(`shop:role_revoked:${purchase.id}`)) continue;
-      const item = services.shop.getItem(purchase.item_id);
-      if (!item || item.delivery_kind !== "add_role" || !item.delivery_data) continue;
-      let roleId: string | undefined;
-      try {
-        const data = JSON.parse(item.delivery_data) as { role_id?: unknown };
-        if (typeof data.role_id === "string" && data.role_id.length > 0) roleId = data.role_id;
-      } catch {
-        throw new Error(`shop_role_revoke:invalid_delivery_data:${purchase.id}`);
-      }
-      if (!roleId) throw new Error(`shop_role_revoke:role_id_missing:${purchase.id}`);
-      candidates.push({ purchaseId: purchase.id, userId: purchase.user_id, roleId });
-    }
-    if (purchases.length < pageSize) break;
-  }
-
-  if (candidates.length === 0) return;
+  const pending = services.shop.pendingRoleRevocations();
+  if (pending.length === 0) return;
   const guildId = services.settings.getString("guild:main");
   if (!guildId) throw new Error("shop_role_revoke:guild_id_missing");
   const guild = await client.guilds.fetch(guildId).catch((error) => {
@@ -211,34 +205,45 @@ export async function processShopRoleRevocations(client: Client, services: Servi
   });
 
   const failures: string[] = [];
-  for (const candidate of candidates) {
-    const marker = `shop:role_revoked:${candidate.purchaseId}`;
-    if (services.settings.getString(marker)) continue;
+  for (const candidate of pending) {
+    if (!candidate.role_id) {
+      services.shop.markRoleRevocationRetry(candidate.purchase_id, "system:shop-role-revoke", "role_id_missing");
+      failures.push(`role_id_missing:${candidate.purchase_id}`);
+      continue;
+    }
+    if (services.shop.activePurchaseGrantsRole(candidate.user_id, candidate.role_id, candidate.purchase_id)) {
+      services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "active_purchase_still_grants_role");
+      continue;
+    }
 
     let member;
     try {
-      member = await guild.members.fetch(candidate.userId);
+      member = await guild.members.fetch(candidate.user_id);
     } catch (error) {
       if (isUnknownMember(error)) {
-        services.settings.set(marker, "member_absent", "system:shop-role-revoke");
+        services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "member_absent");
         continue;
       }
-      failures.push(`member_fetch:${candidate.purchaseId}:${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      services.shop.markRoleRevocationRetry(candidate.purchase_id, "system:shop-role-revoke", message);
+      failures.push(`member_fetch:${candidate.purchase_id}:${message}`);
       continue;
     }
 
-    if (!member.roles.cache.has(candidate.roleId)) {
-      services.settings.set(marker, "already_absent", "system:shop-role-revoke");
+    if (!member.roles.cache.has(candidate.role_id)) {
+      services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "already_absent");
       continue;
     }
 
     try {
-      await member.roles.remove(candidate.roleId);
-      services.settings.set(marker, "removed", "system:shop-role-revoke");
+      await member.roles.remove(candidate.role_id);
+      services.shop.markRoleRevocationDone(candidate.purchase_id, "system:shop-role-revoke", "removed");
     } catch (error) {
-      failures.push(`role_remove:${candidate.purchaseId}:${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      services.shop.markRoleRevocationRetry(candidate.purchase_id, "system:shop-role-revoke", message);
+      failures.push(`role_remove:${candidate.purchase_id}:${message}`);
     }
   }
 
-  if (failures.length > 0) throw new Error(`shop_role_revoke:failed:${failures.join(",")}`);
+  if (failures.length > 0) throw new Error(`shop_role_revocation_failed:${failures.join(",")}`);
 }
