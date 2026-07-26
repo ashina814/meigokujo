@@ -52,6 +52,17 @@ export interface ResumableChunkSnapshot {
 
 const now = () => Math.floor(Date.now() / 1000);
 
+function currentJstDateStr(date = new Date()): string {
+  const parts = new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? "00";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
 function ensureColumn(db: Services["db"], table: string, column: string, definition: string): void {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
   if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
@@ -104,11 +115,24 @@ function parseJsonArray(raw: string | null | undefined): string[] {
   }
 }
 
+function discardStaleDailyCharonBatches(services: Pick<Services, "db">): void {
+  const todayKey = `charon_due_list:${currentJstDateStr()}`;
+  const ts = now();
+  services.db
+    .prepare(
+      `UPDATE scheduler_chunk_batches
+       SET status='completed', chunks_json=NULL, metadata_json=NULL, updated_at=?, completed_at=?
+       WHERE kind='charon_due_list' AND status='pending' AND batch_key<>?`,
+    )
+    .run(ts, ts, todayKey);
+}
+
 export function pendingChunkBatch(
   services: Pick<Services, "db">,
   kind: string,
 ): SchedulerChunkBatchRow | undefined {
   ensureChunkBatchTable(services.db);
+  if (kind === "charon_due_list") discardStaleDailyCharonBatches(services);
   return services.db
     .prepare("SELECT * FROM scheduler_chunk_batches WHERE kind=? AND status='pending' ORDER BY created_at LIMIT 1")
     .get(kind) as SchedulerChunkBatchRow | undefined;
