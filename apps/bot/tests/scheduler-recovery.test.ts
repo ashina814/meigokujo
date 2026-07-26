@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { openDb } from "@meigokujo/core";
 import { processShopRoleRevocations, recoverAutoDropNoEvalGhosts } from "../src/scheduler-recovery.js";
-import { sendChunkedLinesResumable } from "../src/scheduler-utils.js";
+import { finalizeChunkBatch, sendChunkedLinesResumable } from "../src/scheduler-utils.js";
 
 function makeSettings(values = new Map<string, string>()) {
   return {
@@ -103,6 +103,51 @@ describe("自動迷霊の永続ロール同期", () => {
     await expect(recoverAutoDropNoEvalGhosts(client as any, services as any)).resolves.toBeUndefined();
     expect(values.get("autodrop:pending_role_sync")).toBe("[]");
   });
+
+  it("メンバー取得中に運営が魔人へ変更した場合は迷霊ロールを追加しない", async () => {
+    const values = new Map<string, string>([
+      ["guild:main", "guild"],
+      ["role:ghost", "ghost_role"],
+      ["role:meirei", "meirei_role"],
+      ["autodrop:pending_role_sync", JSON.stringify([{ userId: "user1", demoted: true, meireiAdded: false, ghostRemoved: false }])],
+    ]);
+    const { settings } = makeSettings(values);
+    let status: "meirei" | "majin" = "meirei";
+    const add = vi.fn(async () => undefined);
+    const remove = vi.fn(async () => undefined);
+    const member = {
+      roles: {
+        cache: { has: vi.fn((roleId: string) => roleId === "ghost_role") },
+        add,
+        remove,
+      },
+    };
+    const services = {
+      settings,
+      entry: {
+        listSouls: vi.fn((requested: string) => requested === "meirei" ? [{ user_id: "user1" }] : []),
+        getSoul: vi.fn(() => ({ user_id: "user1", status })),
+      },
+      evaluation: { threadFor: vi.fn(), demoteToMeirei: vi.fn() },
+    };
+    const client = {
+      guilds: {
+        fetch: vi.fn(async () => ({
+          members: {
+            fetch: vi.fn(async () => {
+              status = "majin";
+              return member;
+            }),
+          },
+        })),
+      },
+    };
+
+    await expect(recoverAutoDropNoEvalGhosts(client as any, services as any)).resolves.toBeUndefined();
+    expect(add).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalledWith("ghost_role");
+    expect(values.get("autodrop:pending_role_sync")).toBe("[]");
+  });
 });
 
 describe("ショップ失効ロール剥奪", () => {
@@ -192,7 +237,7 @@ describe("ショップ失効ロール剥奪", () => {
 });
 
 describe("分割通知の再開", () => {
-  it("2チャンク目失敗後は1チャンク目を再投稿せず、ロールも再メンションしない", async () => {
+  it("2チャンク目失敗後は1チャンク目を再投稿せず、送信済み状態から明示確定する", async () => {
     const db = openDb(":memory:");
     const firstSend = vi.fn()
       .mockResolvedValueOnce(undefined)
@@ -218,8 +263,19 @@ describe("分割通知の再開", () => {
 
     await expect(sendChunkedLinesResumable({ db } as any, { send: retrySend } as any, snapshot)).resolves.toBeDefined();
     expect(retrySend).toHaveBeenCalledTimes(1);
-    const row = db.prepare("SELECT chunks_json FROM scheduler_chunk_batches WHERE batch_key='chunks:test'").get() as { chunks_json: string | null };
-    expect(row.chunks_json).toBeNull();
+    const sentRow = db
+      .prepare("SELECT status, sent_at, chunks_json FROM scheduler_chunk_batches WHERE batch_key='chunks:test'")
+      .get() as { status: string; sent_at: number | null; chunks_json: string | null };
+    expect(sentRow.status).toBe("pending");
+    expect(sentRow.sent_at).not.toBeNull();
+    expect(sentRow.chunks_json).not.toBeNull();
+
+    expect(finalizeChunkBatch({ db } as any, "chunks:test")).toBe(true);
+    const completedRow = db
+      .prepare("SELECT status, chunks_json FROM scheduler_chunk_batches WHERE batch_key='chunks:test'")
+      .get() as { status: string; chunks_json: string | null };
+    expect(completedRow.status).toBe("completed");
+    expect(completedRow.chunks_json).toBeNull();
     db.close();
   });
 });
