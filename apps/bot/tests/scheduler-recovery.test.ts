@@ -15,6 +15,12 @@ function makeSettings(values = new Map<string, string>()) {
   };
 }
 
+function emptyBackfillDb() {
+  return {
+    prepare: vi.fn(() => ({ all: vi.fn(() => []) })),
+  };
+}
+
 describe("自動迷霊の永続ロール同期", () => {
   it("既存の退城済み迷霊を毎日の同期対象へ入れない", async () => {
     const { settings } = makeSettings();
@@ -180,6 +186,7 @@ describe("ショップ失効ロール剥奪", () => {
     const makeServices = () => {
       const { settings } = makeSettings(values);
       return {
+        db: emptyBackfillDb(),
         settings,
         shop: {
           pendingRoleRevocations: vi.fn(() => done.mock.calls.length > 0 ? [] : [pendingRevocation()]),
@@ -207,6 +214,7 @@ describe("ショップ失効ロール剥奪", () => {
     const missingValues = new Map<string, string>([["guild:main", "guild"]]);
     const missingSettings = makeSettings(missingValues).settings;
     const services = {
+      db: emptyBackfillDb(),
       settings: missingSettings,
       shop: {
         pendingRoleRevocations: vi.fn(() => [pendingRevocation()]),
@@ -225,6 +233,7 @@ describe("ショップ失効ロール剥奪", () => {
     const absentValues = new Map<string, string>([["guild:main", "guild"]]);
     const absentServices = {
       ...services,
+      db: emptyBackfillDb(),
       settings: makeSettings(absentValues).settings,
       shop: { ...services.shop, markRoleRevocationDone: vi.fn() },
     };
