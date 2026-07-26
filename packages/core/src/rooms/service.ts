@@ -190,12 +190,13 @@ export class Rooms {
     channelId: string;
     ownerId: string;
     hours?: number;
+    priceOverride?: number;
   }): RoomRow {
     const run = this.db.transaction(() => {
       const conflict = this.ownershipConflict(input.ownerId, input.kind);
       if (conflict) throw new RoomError("ERR_ALREADY_OWNS", conflict);
 
-      const price = this.priceFor(input.kind, input.hours);
+      const price = input.priceOverride ?? this.priceFor(input.kind, input.hours);
       if (price > 0) {
         const account = `user:${input.ownerId}`;
         this.ledger.ensureAccount(account, "user");
@@ -413,7 +414,9 @@ export class Rooms {
     const run = this.db.transaction(() => {
       const room = this.get(roomId);
       if (room.unused_refund_tx_id) return { refunded: 0 };
-      if (room.activated_at !== null || room.expires_at === null || room.expires_at <= now()) return { refunded: 0 };
+      const wasClosedAsUnused = room.close_reason === "unused";
+      if (room.activated_at !== null || room.expires_at === null) return { refunded: 0 };
+      if (room.expires_at <= now() && !wasClosedAsUnused) return { refunded: 0 };
 
       const original = this.ledger.findByIdempotencyKey(`room:create:${room.channel_id}`);
       if (!original || original.amount <= 0) return { refunded: 0 };
@@ -705,7 +708,7 @@ export class Rooms {
           .run(ts, ts, invite.id);
         throw new RoomError("ERR_INVITE_EXPIRED", { inviteId: invite.id });
       }
-      const room = this.register({ kind: "oborozuki", channelId: input.channelId, ownerId: invite.requester_id });
+      const room = this.register({ kind: "oborozuki", channelId: input.channelId, ownerId: invite.requester_id, priceOverride: invite.price });
       this.db
         .prepare(
           `UPDATE oborozuki_invites

@@ -22,6 +22,7 @@ import {
   type MessageCreateOptions,
   type TextChannel,
   type VoiceChannel,
+  type VoiceState,
 } from "discord.js";
 import { LedgerError, RoomError, roomOwnershipSlot, type RoomKind, type RoomRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
@@ -230,6 +231,35 @@ async function sendRoomIntro(channel: VoiceChannel, room: RoomRow, owner: GuildM
   });
 }
 
+async function cleanupRegisteredRoomChannel(
+  channel: VoiceChannel,
+  services: Services,
+  room: RoomRow,
+  closeReason: string,
+  actor: string,
+  deleteReason: string,
+): Promise<boolean> {
+  services.rooms.requestDelete(room.id, closeReason, actor);
+  try {
+    await channel.delete(deleteReason);
+    services.rooms.markDeletedAndClosed(room.id, closeReason, actor);
+    return true;
+  } catch (error) {
+    console.error("[room] 登録済み部屋のVC削除に失敗しました", { roomId: room.id, channelId: channel.id, closeReason, error });
+    services.rooms.markDeleteFailed(room.id, error);
+    return false;
+  }
+}
+
+export function handleRoomVoiceUpdate(oldState: VoiceState, newState: VoiceState, services: Services): void {
+  const member = newState.member ?? oldState.member;
+  if (!member || member.user.bot) return;
+  if (!newState.channelId || newState.channelId === oldState.channelId) return;
+  const room = services.rooms.byChannel(newState.channelId);
+  if (!room || room.status !== "open" || room.pending_delete) return;
+  services.rooms.markOccupancy(room.id, true);
+}
+
 export async function handleRoomButton(
   interaction: ButtonInteraction | StringSelectMenuInteraction | UserSelectMenuInteraction,
   services: Services,
@@ -436,12 +466,24 @@ async function createAndReply(
     } catch (error) {
       console.error("[room] 操作パネル投稿失敗。作成済みVCを片付けます", { roomId: room.id, channelId: channel.id, error });
       if (price > 0) services.rooms.refundUnusedPaidRoom(room.id);
-      await channel.delete("部屋パネル投稿失敗のためロールバック");
-      services.rooms.markDeletedAndClosed(room.id, "panel_post_failed", `user:${owner.id}`);
-      await finish(price > 0 ? "部屋内パネルの投稿に失敗したため作成を中止し、課金済み分は返金しました。" : "部屋内パネルの投稿に失敗したため作成を中止しました。");
+      const deleted = await cleanupRegisteredRoomChannel(channel, services, room, "panel_post_failed", `user:${owner.id}`, "部屋パネル投稿失敗のためロールバック");
+      await finish(
+        deleted
+          ? price > 0
+            ? "部屋内パネルの投稿に失敗したため作成を中止し、課金済み分は返金しました。"
+            : "部屋内パネルの投稿に失敗したため作成を中止しました。"
+          : price > 0
+            ? "部屋内パネルの投稿に失敗したため作成を中止し、課金済み分は返金しました。VC削除は失敗したため次回スキャンで再試行します。"
+            : "部屋内パネルの投稿に失敗したため作成を中止しました。VC削除は失敗したため次回スキャンで再試行します。",
+      );
       return;
     }
-    if (owner.voice.channel) await owner.voice.setChannel(channel).catch(() => undefined);
+    if (owner.voice.channel) {
+      await owner.voice
+        .setChannel(channel)
+        .then(() => services.rooms.markOccupancy(room.id, true))
+        .catch(() => undefined);
+    }
     const expiry = room.expires_at ? ` / 期限: <t:${room.expires_at}:t>` : "";
     await finish(`✅ ${KIND_LABELS[kind]}を作成しました: ${channel.toString()}${price > 0 ? `（−${fmtLd(price)}）` : ""}${expiry}`);
   } catch (error) {
@@ -751,7 +793,12 @@ export async function handleRecruitModal(interaction: ModalSubmitInteraction, se
     });
     services.rooms.setRecruitPanel(created.recruit.id, sent.channelId, sent.id);
     await sendRoomIntro(channel, room, owner, services);
-    if (owner.voice.channel) await owner.voice.setChannel(channel).catch(() => undefined);
+    if (owner.voice.channel) {
+      await owner.voice
+        .setChannel(channel)
+        .then(() => services.rooms.markOccupancy(room!.id, true))
+        .catch(() => undefined);
+    }
     await interaction.editReply({
       content: `✅ 蜜月の募集を出しました（−${fmtLd(price)}）。応募がないまま${formatHours(services.rooms.panelValues().recruitExpireHours)}で失効すると、設定額 ${fmtLd(services.rooms.panelValues().recruitRefund)} を返金します。`,
     });
@@ -768,11 +815,13 @@ export async function handleRecruitModal(interaction: ModalSubmitInteraction, se
         // already closed
       }
     }
-    await channel.delete("蜜月募集作成失敗のためロールバック").catch((deleteError) => {
-      console.error("[room] 蜜月作成失敗後のVC削除にも失敗しました", { channelId: channel.id, deleteError });
-      if (room) services.rooms.markDeleteFailed(room.id, deleteError);
-    });
-    if (room) services.rooms.markDeletedAndClosed(room.id, "recruit_cancelled", `user:${owner.id}`);
+    if (room) {
+      await cleanupRegisteredRoomChannel(channel, services, room, "recruit_cancelled", `user:${owner.id}`, "蜜月募集作成失敗のためロールバック");
+    } else {
+      await channel.delete("蜜月募集作成失敗のためロールバック").catch((deleteError) => {
+        console.error("[room] 蜜月作成失敗後のVC削除にも失敗しました", { channelId: channel.id, deleteError });
+      });
+    }
     await interaction.editReply({ content: "募集作成に失敗したため中止しました。課金済みの場合は一度だけ返金しました。" });
   }
 }
@@ -1004,12 +1053,25 @@ async function handleOboroDecision(interaction: ButtonInteraction, services: Ser
     await interaction.editReply({ content: "秘密部屋の作成に失敗しました。課金していません。", components: [] });
     return;
   }
+  let acceptedRoom: RoomRow | undefined;
   try {
     const accepted = services.rooms.acceptOborozukiInvite({ token, targetId: interaction.user.id, channelId: channel.id });
+    acceptedRoom = accepted.room;
     await sendRoomIntro(channel, accepted.room, requester, services);
     await interaction.editReply({ content: `✅ 朧月の招待を承諾しました: ${channel.toString()}`, components: [] });
     await requester.send(`✅ 朧月の招待が承諾され、部屋を作成しました: ${channel.toString()}（−${fmtLd(invite.price)}）`).catch(() => undefined);
   } catch (error) {
+    if (acceptedRoom) {
+      services.rooms.refundUnusedPaidRoom(acceptedRoom.id);
+      const deleted = await cleanupRegisteredRoomChannel(channel, services, acceptedRoom, "panel_post_failed", `user:${requester.id}`, "朧月パネル投稿失敗のためロールバック");
+      await interaction.editReply({
+        content: deleted
+          ? "部屋内パネルの投稿に失敗したため承諾処理を中止し、課金済み分は返金しました。"
+          : "部屋内パネルの投稿に失敗したため承諾処理を中止し、課金済み分は返金しました。VC削除は失敗したため次回スキャンで再試行します。",
+        components: [],
+      });
+      return;
+    }
     await channel.delete("朧月承諾処理失敗のためロールバック").catch((deleteError) => {
       console.error("[room] 朧月承諾失敗後のVC削除にも失敗しました", { channelId: channel.id, deleteError });
     });

@@ -1,6 +1,7 @@
 import { ChannelType } from "discord.js";
 import { describe, expect, it, vi } from "vitest";
-import { handleRoomButton, handleRoomRenameModal, roomPanelMessage } from "../src/commands/rooms.js";
+import { handleRecruitModal, handleRoomButton, handleRoomRenameModal, handleRoomVoiceUpdate, roomPanelMessage } from "../src/commands/rooms.js";
+import { scanRooms } from "../src/rooms-lifecycle.js";
 
 function servicesForPanel(overrides: Record<string, number> = {}) {
   const numbers: Record<string, number> = {
@@ -139,6 +140,212 @@ describe("部屋Bot UI", () => {
     expect(update).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("支払いと記録は完了") }));
     expect(JSON.stringify(update.mock.calls[0]?.[0])).not.toContain("課金していません");
     expect(JSON.stringify(update.mock.calls[0]?.[0])).not.toContain("✅");
+    errorSpy.mockRestore();
+  });
+
+  it("VoiceStateUpdateで部屋への人間入室を即時利用済みにする", () => {
+    const markOccupancy = vi.fn();
+    const services = {
+      rooms: {
+        byChannel: vi.fn(() => ({ id: 10, status: "open", pending_delete: 0 })),
+        markOccupancy,
+      },
+    };
+
+    handleRoomVoiceUpdate(
+      { channelId: null, member: { user: { bot: false } } } as any,
+      { channelId: "room-vc", member: { user: { bot: false } } } as any,
+      services as any,
+    );
+
+    expect(services.rooms.byChannel).toHaveBeenCalledWith("room-vc");
+    expect(markOccupancy).toHaveBeenCalledWith(10, true);
+  });
+
+  it("pending_delete再試行成功時にunused有料部屋の返金と通知まで実行する", async () => {
+    const send = vi.fn(async () => undefined);
+    const voiceDelete = vi.fn(async () => undefined);
+    const room = {
+      id: 20,
+      kind: "game",
+      channel_id: "room-vc",
+      owner_id: "owner",
+      status: "open",
+      pending_delete: 1,
+      close_reason: "unused",
+    };
+    const services = {
+      settings: { getString: vi.fn(() => "guild-main"), getNumber: vi.fn(() => 5) },
+      rooms: {
+        listPendingDelete: vi.fn(() => [room]),
+        get: vi.fn(() => room),
+        markDeletedAndClosed: vi.fn(),
+        markDeleteFailed: vi.fn(),
+        refundUnusedPaidRoom: vi.fn(() => ({ refunded: 6000 })),
+        listOpen: vi.fn(() => []),
+        gamesNeedingWarning: vi.fn(() => []),
+        expiredRooms: vi.fn(() => []),
+        dueForDeletion: vi.fn(() => []),
+        expireRecruits: vi.fn(() => []),
+      },
+    };
+    const client = {
+      guilds: { fetch: vi.fn(async () => ({ channels: { fetch: vi.fn() } })) },
+      channels: { fetch: vi.fn(async () => ({ delete: voiceDelete })) },
+      users: { fetch: vi.fn(async () => ({ send })) },
+    };
+
+    await scanRooms(client as any, services as any);
+
+    expect(voiceDelete).toHaveBeenCalledWith("unused");
+    expect(services.rooms.markDeletedAndClosed).toHaveBeenCalledWith(20, "unused");
+    expect(services.rooms.refundUnusedPaidRoom).toHaveBeenCalledWith(20);
+    expect(send).toHaveBeenCalledWith(expect.stringContaining("返金額: 6,000 Ld"));
+  });
+
+  it("朧月承諾後のパネル投稿失敗では返金し、削除成功時だけclosedにする", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const editReply = vi.fn(async () => undefined);
+    const channelDelete = vi.fn(async () => undefined);
+    const room = {
+      id: 30,
+      kind: "oborozuki",
+      channel_id: "oboro-vc",
+      owner_id: "owner",
+      status: "open",
+      pending_delete: 0,
+      expires_at: 123,
+      capacity: 2,
+    };
+    const channel = {
+      id: "oboro-vc",
+      toString: () => "<#oboro-vc>",
+      send: vi.fn(async () => {
+        throw new Error("send failed");
+      }),
+      delete: channelDelete,
+    };
+    const guild = {
+      roles: { everyone: { id: "everyone" } },
+      members: {
+        fetch: vi.fn(async (id: string) => ({ id, displayName: id, user: { bot: false }, send: vi.fn(), voice: {} })),
+      },
+      channels: {
+        fetch: vi.fn(),
+        create: vi.fn(async () => channel),
+      },
+    };
+    const services = {
+      settings: { getString: vi.fn(() => undefined), getNumber: vi.fn(() => 5) },
+      rooms: {
+        getOborozukiInviteByToken: vi.fn(() => ({
+          id: 1,
+          requester_id: "owner",
+          target_id: "target",
+          status: "pending",
+          token: "token",
+          price: 30000,
+          expires_at: 999,
+        })),
+        acceptOborozukiInvite: vi.fn(() => ({ room, invite: { id: 1 } })),
+        panelValues: vi.fn(() => ({
+          slotPrice: 7000,
+          mitsugetsuPrice: 5000,
+          oborozukiPrice: 30000,
+          gameTiers: [],
+          recruitExpireHours: 6,
+          recruitRefund: 2500,
+          emptyGraceMinutes: 5,
+          unusedGraceMinutes: 5,
+          loveRoomTtlHours: 12,
+          normalMaxCapacity: 99,
+        })),
+        refundUnusedPaidRoom: vi.fn(() => ({ refunded: 30000 })),
+        requestDelete: vi.fn(),
+        markDeletedAndClosed: vi.fn(),
+        markDeleteFailed: vi.fn(),
+      },
+    };
+    const interaction = {
+      customId: "room:oboroaccept:token",
+      isButton: () => true,
+      isStringSelectMenu: () => false,
+      isUserSelectMenu: () => false,
+      user: { id: "target" },
+      guild,
+      client: { guilds: { fetch: vi.fn() } },
+      deferUpdate: vi.fn(async () => undefined),
+      editReply,
+    };
+
+    await handleRoomButton(interaction as any, services as any);
+
+    expect(services.rooms.refundUnusedPaidRoom).toHaveBeenCalledWith(30);
+    expect(services.rooms.requestDelete).toHaveBeenCalledWith(30, "panel_post_failed", "user:owner");
+    expect(channelDelete).toHaveBeenCalledWith("朧月パネル投稿失敗のためロールバック");
+    expect(services.rooms.markDeletedAndClosed).toHaveBeenCalledWith(30, "panel_post_failed", "user:owner");
+    expect(services.rooms.markDeleteFailed).not.toHaveBeenCalled();
+    expect(editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("課金済み分は返金") }));
+    expect(JSON.stringify(editReply.mock.calls.at(-1)?.[0])).not.toContain("課金していません");
+    errorSpy.mockRestore();
+  });
+
+  it("蜜月作成失敗後のVC削除失敗ではpending_deleteを残しclosedにしない", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const editReply = vi.fn(async () => undefined);
+    const channelDelete = vi.fn(async () => {
+      throw new Error("delete failed");
+    });
+    const room = { id: 40, kind: "mitsugetsu", channel_id: "mitsu-vc", owner_id: "owner", status: "open", pending_delete: 0 };
+    const panelChannel = {
+      isTextBased: () => true,
+      send: vi.fn(async () => {
+        throw new Error("panel failed");
+      }),
+    };
+    const owner = { id: "owner", displayName: "owner", user: { bot: false }, voice: {}, roles: { cache: new Map() } };
+    const guild = {
+      client: { channels: { fetch: vi.fn(async () => panelChannel) } },
+      roles: { everyone: { id: "everyone" } },
+      members: { fetch: vi.fn(async () => owner) },
+      channels: {
+        fetch: vi.fn(),
+        create: vi.fn(async () => ({ id: "mitsu-vc", send: vi.fn(), delete: channelDelete })),
+      },
+    };
+    const services = {
+      ledger: { balanceOf: vi.fn(() => 100000) },
+      settings: {
+        getString: vi.fn((key: string) => (key === "role:male" ? "male-role" : key === "channel:recruit" ? "recruit-channel" : undefined)),
+      },
+      rooms: {
+        priceFor: vi.fn(() => 5000),
+        ownershipConflict: vi.fn(() => undefined),
+        registerWithRecruit: vi.fn(() => ({ room, recruit: { id: 50, expires_at: 999 } })),
+        setRecruitPanel: vi.fn(),
+        refundUnusedPaidRoom: vi.fn(),
+        requestDelete: vi.fn(),
+        cancelRecruit: vi.fn(),
+        markDeleteFailed: vi.fn(),
+        markDeletedAndClosed: vi.fn(),
+      },
+    };
+    const interaction = {
+      customId: "room:recruit:male",
+      user: { id: "owner" },
+      guild,
+      fields: { getTextInputValue: vi.fn((key: string) => (key === "purpose" ? "雑談" : "")) },
+      deferReply: vi.fn(async () => undefined),
+      editReply,
+    };
+
+    await handleRecruitModal(interaction as any, services as any);
+
+    expect(services.rooms.requestDelete).toHaveBeenCalledWith(40, "recruit_cancelled", "user:owner");
+    expect(channelDelete).toHaveBeenCalledWith("蜜月募集作成失敗のためロールバック");
+    expect(services.rooms.markDeleteFailed).toHaveBeenCalledWith(40, expect.any(Error));
+    expect(services.rooms.markDeletedAndClosed).not.toHaveBeenCalled();
+    expect(editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("募集作成に失敗") }));
     errorSpy.mockRestore();
   });
 });

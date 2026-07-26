@@ -47,6 +47,21 @@ async function notifyOwner(client: Client, userId: string, content: string): Pro
   });
 }
 
+async function refundUnusedIfNeeded(client: Client, services: Services, room: RoomRow): Promise<void> {
+  if (room.close_reason !== "unused" || room.kind === "normal") return;
+  const { refunded } = services.rooms.refundUnusedPaidRoom(room.id);
+  if (refunded <= 0) return;
+  await notifyOwner(
+    client,
+    room.owner_id,
+    [
+      "作成後、一度も人間が入室していなかった有料部屋をBotの未利用整理で削除しました。",
+      `返金額: ${fmtLd(refunded)}`,
+      "もう一度使う場合は、部屋パネルから再作成してください。",
+    ].join("\n"),
+  );
+}
+
 async function closeWithDelete(
   client: Client,
   services: Services,
@@ -59,18 +74,7 @@ async function closeWithDelete(
   const deleted = await deleteRoomChannel(client, services, services.rooms.get(room.id), deleteReason);
   if (!deleted) return;
   if (opts.refundUnused) {
-    const { refunded } = services.rooms.refundUnusedPaidRoom(room.id);
-    if (refunded > 0) {
-      await notifyOwner(
-        client,
-        room.owner_id,
-        [
-          "作成後、一度も人間が入室していなかった有料部屋をBotの未利用整理で削除しました。",
-          `返金額: ${fmtLd(refunded)}`,
-          "もう一度使う場合は、部屋パネルから再作成してください。",
-        ].join("\n"),
-      );
-    }
+    await refundUnusedIfNeeded(client, services, services.rooms.get(room.id));
   }
   if (opts.dm) await notifyOwner(client, room.owner_id, opts.dm);
 }
@@ -81,9 +85,12 @@ export async function scanRooms(client: Client, services: Services): Promise<voi
   if (!guild) return;
 
   for (const room of services.rooms.listPendingDelete()) {
-    await deleteRoomChannel(client, services, room, room.close_reason ?? "部屋の削除再試行").catch((error) => {
+    try {
+      const deleted = await deleteRoomChannel(client, services, room, room.close_reason ?? "部屋の削除再試行");
+      if (deleted) await refundUnusedIfNeeded(client, services, services.rooms.get(room.id));
+    } catch (error) {
       console.error("[room] pending_delete再試行失敗", { roomId: room.id, error });
-    });
+    }
   }
 
   for (const room of services.rooms.listOpen()) {

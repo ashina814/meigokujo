@@ -57,7 +57,7 @@ import { handleProfile, handleProfileButton } from "./commands/profile.js";
 import { handleDepartment, handleDepartmentAutocomplete } from "./commands/department.js";
 import { handleFiscalButton } from "./commands/fiscal.js";
 import { handleHelpCommand } from "./commands/help.js";
-import { handleRoomButton, handleRecruitModal, handleRoomRenameModal } from "./commands/rooms.js";
+import { handleRoomButton, handleRecruitModal, handleRoomRenameModal, handleRoomVoiceUpdate } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { handleMessageXp, tickVoiceXp } from "./rank-tracker.js";
 import { trackVoiceState } from "./vc-tracking.js";
@@ -431,6 +431,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   try {
     trackVoiceState(oldState, newState, services);
     handleVoiceAttendance(oldState, newState, services);
+    handleRoomVoiceUpdate(oldState, newState, services);
     void handleDenVoice(oldState, newState, services).catch((err) => console.error("[den] 処理失敗:", err));
     void handleTakuVoiceUpdate(oldState, newState, services).catch((err) => console.error("[taku] 処理失敗:", err));
   } catch (err) {

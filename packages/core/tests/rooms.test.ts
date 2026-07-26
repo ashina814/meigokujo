@@ -192,6 +192,19 @@ describe("部屋システム", () => {
     expect(ctx.ledger.balanceOf("user:owner")).toBe(afterPay + 8_000);
   });
 
+  it("unused削除要求済みなら削除再試行が期限後になっても未利用返金できる", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-05T12:00:00Z"));
+    const game = ctx.rooms.register({ kind: "game", channelId: "refund-after-retry", ownerId: "owner", hours: 2 });
+    const afterPay = ctx.ledger.balanceOf("user:owner");
+    ctx.rooms.requestDelete(game.id, "unused");
+
+    vi.setSystemTime(new Date("2026-07-05T15:00:00Z"));
+    expect(ctx.rooms.refundUnusedPaidRoom(game.id).refunded).toBe(6_000);
+    expect(ctx.rooms.refundUnusedPaidRoom(game.id).refunded).toBe(0);
+    expect(ctx.ledger.balanceOf("user:owner")).toBe(afterPay + 6_000);
+  });
+
   it("チャンネル削除失敗時はpending_deleteのまま再試行情報を残し、closedにしない", () => {
     const room = ctx.rooms.register({ kind: "normal", channelId: "delete-retry", ownerId: "owner" });
     ctx.rooms.requestDelete(room.id, "manual", "user:owner");
@@ -238,6 +251,19 @@ describe("部屋システム", () => {
     expect(accepted.room.kind).toBe("oborozuki");
     expect(ctx.ledger.balanceOf("user:owner")).toBe(before - 30_000);
     expect(() => ctx.rooms.acceptOborozukiInvite({ token: "token-1", targetId: "joiner", channelId: "oboro-vc-2" })).toThrowError(/ERR_INVITE_CLOSED/);
+  });
+
+  it("朧月は招待作成時に保存した価格で承諾時課金する", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-05T12:00:00Z"));
+    ctx.settings.set("room_oborozuki_price", 40_000, "test");
+    const before = ctx.ledger.balanceOf("user:owner");
+    const invite = ctx.rooms.createOborozukiInvite({ requesterId: "owner", targetId: "joiner", token: "token-price" });
+    expect(invite.price).toBe(40_000);
+
+    ctx.settings.set("room_oborozuki_price", 10_000, "test");
+    ctx.rooms.acceptOborozukiInvite({ token: "token-price", targetId: "joiner", channelId: "oboro-price-vc" });
+    expect(ctx.ledger.balanceOf("user:owner")).toBe(before - 40_000);
   });
 
   it("朧月招待の辞退・期限切れでは課金されない", () => {
