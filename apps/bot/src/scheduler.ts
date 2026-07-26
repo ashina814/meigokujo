@@ -6,7 +6,6 @@ import { checkBumpCooldowns } from "./bump.js";
 import { scanRooms } from "./rooms-lifecycle.js";
 import { scanDens } from "./dens.js";
 import { refreshEvalStats } from "./eval-daily.js";
-import { applyVcRanks } from "./vc-ranks.js";
 import { updateDashboard } from "./dashboard.js";
 import { tickVoiceXp } from "./rank-tracker.js";
 import { fmtLd } from "./format.js";
@@ -154,13 +153,6 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
           refreshEvalStats(client, services),
         ).catch((e) => console.error("[評価] 実績更新失敗:", e));
       }
-    }
-
-    // ── 位階（VCロール）: 毎日 06:00 台に累計VC時間で付け直す ──
-    if (now.hour === 6 && !services.settings.getString(`vc_rank:applied:${now.dateStr}`)) {
-      await runSchedulerTaskOnce(services, `vc_rank:applied:${now.dateStr}`, "system:scheduler", () =>
-        applyVcRanks(client, services),
-      ).catch((e) => console.error("[位階] 付与失敗:", e));
     }
 
     // ── トートの耳: 保存期間を過ぎた相談本文を毎日 04:00 台にpurge（メタ・操作ログは残す）──
