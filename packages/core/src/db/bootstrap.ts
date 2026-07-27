@@ -133,15 +133,6 @@ CREATE TABLE IF NOT EXISTS rooms (
   updated_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rooms_open ON rooms(status) WHERE status = 'open';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_owner_normal_open
-  ON rooms(owner_id)
-  WHERE status = 'open' AND kind = 'normal';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_owner_special_open
-  ON rooms(owner_id)
-  WHERE status = 'open' AND kind IN ('mitsugetsu','oborozuki','game');
-CREATE INDEX IF NOT EXISTS idx_rooms_pending_delete
-  ON rooms(status, pending_delete, next_delete_retry_at)
-  WHERE status = 'open' AND pending_delete = 1;
 
 CREATE TABLE IF NOT EXISTS recruits (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -536,6 +527,7 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "recruits", "updated_at", "INTEGER");
   ensureColumn(db, "shop_purchases", "delivery_snapshot_json", "TEXT");
   ensureColumn(db, "scheduler_chunk_batches", "sent_at", "INTEGER");
+  assertNoDuplicateOpenRoomOwnership(db);
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_owner_normal_open
       ON rooms(owner_id)
@@ -556,6 +548,28 @@ function ensureColumn(db: Database.Database, table: string, column: string, defi
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
   if (rows.some((r) => r.name === column)) return;
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+function assertNoDuplicateOpenRoomOwnership(db: Database.Database): void {
+  const duplicates = db
+    .prepare(
+      `SELECT
+         owner_id,
+         CASE WHEN kind = 'normal' THEN 'normal' ELSE 'special' END AS ownership_slot,
+         COUNT(*) AS room_count,
+         GROUP_CONCAT(id || ':' || kind || ':' || channel_id, ', ') AS rooms
+       FROM rooms
+       WHERE status = 'open'
+       GROUP BY owner_id, CASE WHEN kind = 'normal' THEN 'normal' ELSE 'special' END
+       HAVING COUNT(*) > 1
+       ORDER BY owner_id, ownership_slot`,
+    )
+    .all() as Array<{ owner_id: string; ownership_slot: string; room_count: number; rooms: string }>;
+  if (duplicates.length === 0) return;
+  const details = duplicates
+    .map((d) => `owner=${d.owner_id} slot=${d.ownership_slot} count=${d.room_count} rooms=[${d.rooms}]`)
+    .join("; ");
+  throw new Error(`rooms migration blocked: duplicate open room ownership would violate room ownership indexes: ${details}`);
 }
 
 function settingNumber(db: Database.Database, key: string, fallback: number): number {
