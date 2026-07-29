@@ -13,6 +13,8 @@ export interface TitleRule {
   desc: string;
   /** 城の別軸実績。ネタ枠込み。true を返したら付与 */
   check: (h: TitleHelper) => boolean;
+  /** 隠し二つ名。獲得条件を明かさない収集要素。獲得すると映える */
+  secret?: boolean;
 }
 
 export interface GrantedTitle {
@@ -21,6 +23,7 @@ export interface GrantedTitle {
   emoji: string;
   desc: string;
   granted_at: number;
+  secret?: boolean;
 }
 
 const DAY = 86_400;
@@ -72,6 +75,23 @@ export class TitleHelper {
   totalVcSeconds(): number {
     return this.vc.presence(this.userId, 36_500).totalSeconds; // 約100年 = 全期間
   }
+
+  /** 自分が actor として台帳(transactions)に type を記録された回数（tip/reward_bump 等） */
+  txAsActor(type: string): number {
+    return (
+      this.db
+        .prepare("SELECT COUNT(*) AS c FROM transactions WHERE type = ? AND actor_id = ?")
+        .get(type, this.userId) as { c: number }
+    ).c;
+  }
+
+  /** 賭場の戦績(casino_stats)の1フィールドを読む。行が無ければ0 */
+  casinoStat(field: "games" | "wins" | "biggest_win" | "total_wagered" | "best_win_streak"): number {
+    const row = this.db.prepare(`SELECT ${field} AS v FROM casino_stats WHERE user_id = ?`).get(this.userId) as
+      | { v: number }
+      | undefined;
+    return row?.v ?? 0;
+  }
 }
 
 /** 称号ルール定義。ここに1行足すだけで新しい称号が増える。 */
@@ -85,7 +105,27 @@ export const TITLE_RULES: TitleRule[] = [
   { key: "veteran", name: "古参の魂", emoji: "🏰", desc: "在城30日を超えた", check: (h) => h.daysInCastle() >= 30 },
   { key: "elder", name: "百年の亡霊", emoji: "👑", desc: "在城100日を超えた", check: (h) => h.daysInCastle() >= 100 },
   { key: "nightwalker", name: "不眠の魂", emoji: "🌙", desc: "累計100時間 城に浮上した", check: (h) => h.totalVcSeconds() >= 100 * 3600 },
+
+  // ── 隠し二つ名（条件は明かさない収集要素） ──────────────────────
+  // 賭場
+  { key: "s_jackpot", name: "一攫千金", emoji: "💎", desc: "ジャックポットを射止めた", secret: true, check: (h) => h.asActor("casino_jackpot") >= 1 },
+  { key: "s_gambler", name: "賭場の主", emoji: "🎰", desc: "賭場で200戦を刻んだ", secret: true, check: (h) => h.asActor("casino_game") >= 200 },
+  { key: "s_streak", name: "連勝の覇者", emoji: "⚡", desc: "10連勝を成し遂げた", secret: true, check: (h) => h.casinoStat("best_win_streak") >= 10 },
+  { key: "s_bigwin", name: "大博打", emoji: "🔥", desc: "一度の勝負で50万エテルを掴んだ", secret: true, check: (h) => h.casinoStat("biggest_win") >= 500_000 },
+  { key: "s_abyss", name: "深淵を賭した者", emoji: "🕳", desc: "賭場に累計100万エテルを投じた", secret: true, check: (h) => h.casinoStat("total_wagered") >= 1_000_000 },
+  { key: "s_agitator", name: "扇動者", emoji: "📋", desc: "板を5回立てた", secret: true, check: (h) => h.asActor("market_create") >= 5 },
+  // 経済・社交
+  { key: "s_spender", name: "浪費の美学", emoji: "🌹", desc: "投げ銭を20回投じた", secret: true, check: (h) => h.txAsActor("tip") >= 20 },
+  { key: "s_bless", name: "福の申し子", emoji: "🍀", desc: "マモンの福分けを30回受けた", secret: true, check: (h) => h.asActor("casino_daily") >= 30 },
+  { key: "s_bumper", name: "城の目覚まし", emoji: "🔔", desc: "城の宣伝(bump/up)を50回果たした", secret: true, check: (h) => h.txAsActor("reward_bump") >= 50 },
+  // 献身・時
+  { key: "s_courtier", name: "不眠の廷臣", emoji: "🌌", desc: "累計300時間 城に浮上した", secret: true, check: (h) => h.totalVcSeconds() >= 300 * 3600 },
+  { key: "s_chronicle", name: "城の生き字引", emoji: "📜", desc: "在城200日を超えた", secret: true, check: (h) => h.daysInCastle() >= 200 },
+  { key: "s_matchmaker", name: "冥界の縁結び", emoji: "🕊", desc: "蜜月の縁を5組 結んだ", secret: true, check: (h) => h.asActor("recruit_matched") >= 5 },
 ];
+
+/** 隠し二つ名の総数（プロフィールの「X/N 発見」表示用） */
+export const SECRET_TITLE_COUNT = TITLE_RULES.filter((r) => r.secret).length;
 
 export class TitleEngine {
   private readonly ruleMap = new Map(TITLE_RULES.map((r) => [r.key, r]));
@@ -113,7 +153,7 @@ export class TitleEngine {
       this.db
         .prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
         .run(userId, rule.key, ts);
-      newlyGranted.push({ key: rule.key, name: rule.name, emoji: rule.emoji, desc: rule.desc, granted_at: ts });
+      newlyGranted.push({ key: rule.key, name: rule.name, emoji: rule.emoji, desc: rule.desc, granted_at: ts, secret: rule.secret });
     }
     return newlyGranted;
   }
@@ -131,7 +171,7 @@ export class TitleEngine {
       .all(userId) as Array<{ title_key: string; granted_at: number }>;
     return rows.flatMap((r) => {
       const rule = this.ruleMap.get(r.title_key);
-      return rule ? [{ key: rule.key, name: rule.name, emoji: rule.emoji, desc: rule.desc, granted_at: r.granted_at }] : [];
+      return rule ? [{ key: rule.key, name: rule.name, emoji: rule.emoji, desc: rule.desc, granted_at: r.granted_at, secret: rule.secret }] : [];
     });
   }
 }
