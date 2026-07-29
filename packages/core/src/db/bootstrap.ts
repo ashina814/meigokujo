@@ -491,6 +491,35 @@ CREATE TABLE IF NOT EXISTS fiscal_runs (
   updated_at  INTEGER NOT NULL,
   UNIQUE (kind, period)
 );
+
+-- 称号判定は「自分が actor として何をしたか」を大量に数える。type だけの索引では
+-- 該当 type を全走査して actor_id を絞ることになるため、actor 起点の索引を持つ。
+CREATE INDEX IF NOT EXISTS idx_events_actor ON events(actor_id, type);
+CREATE INDEX IF NOT EXISTS idx_tx_actor ON transactions(actor_id, type);
+
+-- 同席台帳: 「誰と何秒 同じVCに居たか」の集計。vc_segments の自己結合は重いので、
+-- セグメントが閉じるたびに加算し、判定時は1クエリで読めるようにする。
+-- ペアは (user_id, other_id) の双方向で記録する（読み出しを片側だけで済ませるため）。
+CREATE TABLE IF NOT EXISTS vc_companions (
+  user_id    TEXT NOT NULL,
+  other_id   TEXT NOT NULL,
+  seconds    INTEGER NOT NULL DEFAULT 0,
+  sessions   INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, other_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vc_companions_user ON vc_companions(user_id, seconds DESC);
+
+-- 装備称号: 獲得数が3桁になるため、カードに出すのは本人が選んだ数枠だけにする。
+-- slot は 0 起点の表示順。title_key は titles(user_id, title_key) を持っている前提。
+CREATE TABLE IF NOT EXISTS title_equips (
+  user_id    TEXT NOT NULL,
+  slot       INTEGER NOT NULL,
+  title_key  TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, slot),
+  UNIQUE (user_id, title_key)
+);
 `;
 
 export function openDb(path: string): Database.Database {

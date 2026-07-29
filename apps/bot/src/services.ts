@@ -66,6 +66,17 @@ export function buildServices() {
   // クラッシュで閉じ損ねたVCセグメントの後始末
   const dangling = vc.closeAllDangling();
   if (dangling > 0) console.warn(`[vc] 閉じ損ねセグメントを ${dangling} 件補正しました`);
+  // 同席台帳は通常セグメントを閉じるたびに増分更新するが、
+  //   - 導入直後（既存セグメントからのバックフィル）
+  //   - closeAllDangling による一括クローズ（増分を取り漏らす）
+  // の2つは増分では埋まらないため、全再計算で辻褄を合わせる。
+  const companionRows = (
+    db.prepare("SELECT COUNT(*) AS n FROM vc_companions").get() as { n: number }
+  ).n;
+  if (companionRows === 0 || dangling > 0) {
+    const pairs = vc.rebuildCompanions();
+    console.log(`[vc] 同席台帳を再計算: ${pairs}組`);
+  }
   const titles = new TitleEngine(db, vc);
   const departments = new Departments(db, ledger);
   const fiscal = new Fiscal(db, ledger);

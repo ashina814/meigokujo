@@ -112,7 +112,18 @@ export {
   type RoomOwnershipSlot,
   type RoomPanelValues,
 } from "./rooms/service.js";
-export { TitleEngine, TitleHelper, TITLE_RULES, type TitleRule, type GrantedTitle } from "./titles/service.js";
+export {
+  TitleEngine,
+  TitleHelper,
+  TITLE_RULES,
+  SECRET_TITLE_COUNT,
+  EQUIP_SLOTS,
+  buildSnapshot,
+  type TitleRule,
+  type TitleCategory,
+  type TitleSnapshot,
+  type GrantedTitle,
+} from "./titles/service.js";
 export {
   Departments,
   DepartmentError,

@@ -76,7 +76,9 @@ export async function handleProfile(
   const daysInCastle = anchorSec ? Math.floor((Date.now() / 1000 - anchorSec) / 86_400) : 0;
   const presence = services.vc.presence(target.id, 36_500);
   const vcHours = Math.floor(presence.totalSeconds / 3600);
-  const titles = services.titles.list(target.id);
+  // カードに出すのは本人が掲げた分だけ。総数は3桁になるので進捗として別に見せる
+  const titles = services.titles.equipped(target.id);
+  const titleProgress = services.titles.progress(target.id);
 
   const rank = soul ? (RANK_LABEL[soul.status] ?? soul.status) : "記録なし";
   const displayName = member?.displayName ?? target.globalName ?? target.username;
@@ -104,6 +106,7 @@ export async function handleProfile(
     vcHours,
     daysSeen: presence.daysSeen,
     titles: titles.map((t) => ({ name: t.name, desc: t.desc })),
+    titleProgress,
     ranks,
     specialRole: special
       ? { name: special.primary.name, desc: special.primary.desc, style: special.primary.style }

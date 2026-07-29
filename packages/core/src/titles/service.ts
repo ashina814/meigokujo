@@ -1,21 +1,23 @@
 import type Database from "better-sqlite3";
 import type { VcTracker } from "../vc/service.js";
+import { TitleHelper, type TitleCategory, type TitleRule } from "./helper.js";
+import { SECRET_TITLE_COUNT, TITLE_RULES } from "./catalog.js";
+import { buildSnapshot } from "./snapshot.js";
+
+export { TitleHelper, TITLE_RULES, SECRET_TITLE_COUNT, buildSnapshot };
+export type { TitleCategory, TitleRule };
+export type { TitleSnapshot } from "./snapshot.js";
 
 /**
- * 称号機関（システム設計.md ④ / 構想マップの実績エンジン）。
- * 「事件録に X が N 回記録されたら称号 Y を付与」をルールとして定義する。
- * 新しい称号 = TITLE_RULES に1行足すだけ。判定材料は事件録・魂台帳・VC計測から導出。
+ * 称号機関（システム設計.md ④）。
+ * 判定は buildSnapshot が作る1人分のスナップショットに対して行う。称号が何個あっても
+ * DBに当たる回数は変わらない（catalog.ts / snapshot.ts の各先頭コメント参照）。
  */
-export interface TitleRule {
-  key: string;
-  name: string;
-  emoji: string;
-  desc: string;
-  /** 城の別軸実績。ネタ枠込み。true を返したら付与 */
-  check: (h: TitleHelper) => boolean;
-  /** 隠し二つ名。獲得条件を明かさない収集要素。獲得すると映える */
-  secret?: boolean;
-}
+
+const now = () => Math.floor(Date.now() / 1000);
+
+/** カードに掲げられる称号の数 */
+export const EQUIP_SLOTS = 3;
 
 export interface GrantedTitle {
   key: string;
@@ -23,124 +25,84 @@ export interface GrantedTitle {
   emoji: string;
   desc: string;
   granted_at: number;
+  category: TitleCategory;
   secret?: boolean;
 }
 
-const DAY = 86_400;
-const now = () => Math.floor(Date.now() / 1000);
+/**
+ * 旧称号キーの引き継ぎ表。カタログ刷新でキーが変わっても、既に付与された実績は失わせない。
+ * 付与済みレコードを新キーへ書き換える（一度きり・冪等）。
+ */
+const LEGACY_KEY_MAP: Record<string, string> = {
+  recruiter: "recruiter_1",
+  recruiter_gold: "recruiter_5",
+  matchmaker: "mitsugetsu",
+  innkeeper: "dan_room_2",
+  veteran: "dan_days_2",
+  elder: "dan_days_3",
+};
 
-/** ルールの判定に使うヘルパ（DBアクセスを隠蔽） */
-export class TitleHelper {
-  constructor(
-    private readonly db: Database.Database,
-    private readonly vc: VcTracker,
-    readonly userId: string,
-  ) {}
-
-  /** 自分が actor（行為者）として type を記録された回数 */
-  asActor(type: string): number {
-    return (
-      this.db
-        .prepare("SELECT COUNT(*) AS c FROM events WHERE type = ? AND actor_id = ?")
-        .get(type, this.userId) as { c: number }
-    ).c;
-  }
-
-  /** 自分が target（対象）として type を記録された回数 */
-  asTarget(type: string): number {
-    return (
-      this.db
-        .prepare("SELECT COUNT(*) AS c FROM events WHERE type = ? AND target_id = ?")
-        .get(type, this.userId) as { c: number }
-    ).c;
-  }
-
-  /** 亡霊化してからの在城日数（未亡霊化なら0） */
-  daysInCastle(): number {
-    const row = this.db.prepare("SELECT ghost_at FROM souls WHERE user_id = ?").get(this.userId) as
-      | { ghost_at: number | null }
-      | undefined;
-    if (!row?.ghost_at) return 0;
-    return Math.floor((now() - row.ghost_at) / DAY);
-  }
-
-  status(): string | null {
-    const row = this.db.prepare("SELECT status FROM souls WHERE user_id = ?").get(this.userId) as
-      | { status: string }
-      | undefined;
-    return row?.status ?? null;
-  }
-
-  /** 累計VC浮上時間（秒）。全期間・全VC */
-  totalVcSeconds(): number {
-    return this.vc.presence(this.userId, 36_500).totalSeconds; // 約100年 = 全期間
-  }
-
-  /** 自分が actor として台帳(transactions)に type を記録された回数（tip/reward_bump 等） */
-  txAsActor(type: string): number {
-    return (
-      this.db
-        .prepare("SELECT COUNT(*) AS c FROM transactions WHERE type = ? AND actor_id = ?")
-        .get(type, this.userId) as { c: number }
-    ).c;
-  }
-
-  /** 賭場の戦績(casino_stats)の1フィールドを読む。行が無ければ0 */
-  casinoStat(field: "games" | "wins" | "biggest_win" | "total_wagered" | "best_win_streak"): number {
-    const row = this.db.prepare(`SELECT ${field} AS v FROM casino_stats WHERE user_id = ?`).get(this.userId) as
-      | { v: number }
-      | undefined;
-    return row?.v ?? 0;
-  }
-}
-
-/** 称号ルール定義。ここに1行足すだけで新しい称号が増える。 */
-export const TITLE_RULES: TitleRule[] = [
-  { key: "newborn", name: "生まれし魂", emoji: "🕯", desc: "冥獄城に亡霊として迎えられた", check: (h) => h.asTarget("ghosted") >= 1 },
-  { key: "risen", name: "魔人への道", emoji: "⚔️", desc: "審判を越えて魔人へ昇格した", check: (h) => h.asTarget("promotion") >= 1 },
-  { key: "recruiter", name: "勧誘者", emoji: "📣", desc: "1人以上を城へ導いた", check: (h) => h.asActor("invite_credited") >= 1 },
-  { key: "recruiter_gold", name: "冥獄の伝道師", emoji: "🔥", desc: "5人以上を城へ導いた", check: (h) => h.asActor("invite_credited") >= 5 },
-  { key: "matchmaker", name: "月下氷人", emoji: "🌸", desc: "蜜月の縁を結んだ", check: (h) => h.asActor("recruit_matched") >= 1 },
-  { key: "innkeeper", name: "宿の常連", emoji: "🛏", desc: "10回以上 部屋を開いた", check: (h) => h.asActor("room_created") >= 10 },
-  { key: "veteran", name: "古参の魂", emoji: "🏰", desc: "在城30日を超えた", check: (h) => h.daysInCastle() >= 30 },
-  { key: "elder", name: "百年の亡霊", emoji: "👑", desc: "在城100日を超えた", check: (h) => h.daysInCastle() >= 100 },
-  { key: "nightwalker", name: "不眠の魂", emoji: "🌙", desc: "累計100時間 城に浮上した", check: (h) => h.totalVcSeconds() >= 100 * 3600 },
-
-  // ── 隠し二つ名（条件は明かさない収集要素） ──────────────────────
-  // 賭場
-  { key: "s_jackpot", name: "一攫千金", emoji: "💎", desc: "ジャックポットを射止めた", secret: true, check: (h) => h.asActor("casino_jackpot") >= 1 },
-  { key: "s_gambler", name: "賭場の主", emoji: "🎰", desc: "賭場で200戦を刻んだ", secret: true, check: (h) => h.asActor("casino_game") >= 200 },
-  { key: "s_streak", name: "連勝の覇者", emoji: "⚡", desc: "10連勝を成し遂げた", secret: true, check: (h) => h.casinoStat("best_win_streak") >= 10 },
-  { key: "s_bigwin", name: "大博打", emoji: "🔥", desc: "一度の勝負で50万エテルを掴んだ", secret: true, check: (h) => h.casinoStat("biggest_win") >= 500_000 },
-  { key: "s_abyss", name: "深淵を賭した者", emoji: "🕳", desc: "賭場に累計100万エテルを投じた", secret: true, check: (h) => h.casinoStat("total_wagered") >= 1_000_000 },
-  { key: "s_agitator", name: "扇動者", emoji: "📋", desc: "板を5回立てた", secret: true, check: (h) => h.asActor("market_create") >= 5 },
-  // 経済・社交
-  { key: "s_spender", name: "浪費の美学", emoji: "🌹", desc: "投げ銭を20回投じた", secret: true, check: (h) => h.txAsActor("tip") >= 20 },
-  { key: "s_bless", name: "福の申し子", emoji: "🍀", desc: "マモンの福分けを30回受けた", secret: true, check: (h) => h.asActor("casino_daily") >= 30 },
-  { key: "s_bumper", name: "城の目覚まし", emoji: "🔔", desc: "城の宣伝(bump/up)を50回果たした", secret: true, check: (h) => h.txAsActor("reward_bump") >= 50 },
-  // 献身・時
-  { key: "s_courtier", name: "不眠の廷臣", emoji: "🌌", desc: "累計300時間 城に浮上した", secret: true, check: (h) => h.totalVcSeconds() >= 300 * 3600 },
-  { key: "s_chronicle", name: "城の生き字引", emoji: "📜", desc: "在城200日を超えた", secret: true, check: (h) => h.daysInCastle() >= 200 },
-  { key: "s_matchmaker", name: "冥界の縁結び", emoji: "🕊", desc: "蜜月の縁を5組 結んだ", secret: true, check: (h) => h.asActor("recruit_matched") >= 5 },
+/**
+ * 廃止したルール。新規付与はしないが、既に持っている人の一覧には出し続ける。
+ * 「累計VC時間」はランク（rank_voice）の領分と整理したため称号からは外したが、
+ * 過去に獲得した人の記録まで消す理由はない。
+ */
+const RETIRED_RULES: TitleRule[] = [
+  {
+    key: "nightwalker",
+    category: "toki",
+    name: "不眠の魂",
+    emoji: "🌙",
+    desc: "累計100時間 城に浮上した（現在は廃止された称号）",
+    check: () => false,
+  },
 ];
 
-/** 隠し二つ名の総数（プロフィールの「X/N 発見」表示用） */
-export const SECRET_TITLE_COUNT = TITLE_RULES.filter((r) => r.secret).length;
-
 export class TitleEngine {
-  private readonly ruleMap = new Map(TITLE_RULES.map((r) => [r.key, r]));
+  private readonly ruleMap = new Map<string, TitleRule>(
+    [...TITLE_RULES, ...RETIRED_RULES].map((r) => [r.key, r]),
+  );
 
   constructor(
     private readonly db: Database.Database,
     private readonly vc: VcTracker,
-  ) {}
+  ) {
+    this.migrateLegacyKeys();
+  }
+
+  /** 旧キーを新キーへ寄せる。衝突（新旧どちらも所持）した場合は旧行を捨てる */
+  private migrateLegacyKeys(): void {
+    const update = this.db.prepare(
+      "UPDATE OR IGNORE titles SET title_key = ? WHERE user_id = ? AND title_key = ?",
+    );
+    const remove = this.db.prepare("DELETE FROM titles WHERE user_id = ? AND title_key = ?");
+    const rows = this.db
+      .prepare(
+        `SELECT user_id, title_key FROM titles WHERE title_key IN (${Object.keys(LEGACY_KEY_MAP)
+          .map(() => "?")
+          .join(",")})`,
+      )
+      .all(...Object.keys(LEGACY_KEY_MAP)) as Array<{ user_id: string; title_key: string }>;
+    if (rows.length === 0) return;
+    this.db.transaction(() => {
+      for (const r of rows) {
+        update.run(LEGACY_KEY_MAP[r.title_key]!, r.user_id, r.title_key);
+        remove.run(r.user_id, r.title_key);
+      }
+    })();
+  }
 
   /** 全ルールを判定し、新規に満たした称号を付与する。付与した新称号を返す */
   evaluate(userId: string): GrantedTitle[] {
-    const helper = new TitleHelper(this.db, this.vc, userId);
+    const snapshot = buildSnapshot(this.db, this.vc, userId);
+    const helper = new TitleHelper(snapshot);
     const owned = new Set(this.ownedKeys(userId));
     const newlyGranted: GrantedTitle[] = [];
     const ts = now();
+    const insert = this.db.prepare(
+      "INSERT INTO titles (user_id, title_key, granted_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+    );
+
     for (const rule of TITLE_RULES) {
       if (owned.has(rule.key)) continue;
       let ok = false;
@@ -150,10 +112,8 @@ export class TitleEngine {
         ok = false; // 判定中の例外は「未達」扱い（付与漏れは次回拾える）
       }
       if (!ok) continue;
-      this.db
-        .prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
-        .run(userId, rule.key, ts);
-      newlyGranted.push({ key: rule.key, name: rule.name, emoji: rule.emoji, desc: rule.desc, granted_at: ts, secret: rule.secret });
+      insert.run(userId, rule.key, ts);
+      newlyGranted.push({ ...toGranted(rule, ts) });
     }
     return newlyGranted;
   }
@@ -167,11 +127,96 @@ export class TitleEngine {
   /** 獲得済み称号（獲得順）。ルール定義にないキーは無視 */
   list(userId: string): GrantedTitle[] {
     const rows = this.db
-      .prepare("SELECT title_key, granted_at FROM titles WHERE user_id = ? ORDER BY granted_at")
+      .prepare("SELECT title_key, granted_at FROM titles WHERE user_id = ? ORDER BY granted_at, title_key")
       .all(userId) as Array<{ title_key: string; granted_at: number }>;
     return rows.flatMap((r) => {
       const rule = this.ruleMap.get(r.title_key);
-      return rule ? [{ key: rule.key, name: rule.name, emoji: rule.emoji, desc: rule.desc, granted_at: r.granted_at, secret: rule.secret }] : [];
+      return rule ? [toGranted(rule, r.granted_at)] : [];
     });
   }
+
+  /** 収集の進捗。分母は現行ルールのみ（廃止称号は含めない） */
+  progress(userId: string): { owned: number; total: number; secretOwned: number; secretTotal: number } {
+    const owned = new Set(this.ownedKeys(userId));
+    let ownedCount = 0;
+    let secretOwned = 0;
+    for (const rule of TITLE_RULES) {
+      if (!owned.has(rule.key)) continue;
+      ownedCount += 1;
+      if (rule.secret) secretOwned += 1;
+    }
+    return { owned: ownedCount, total: TITLE_RULES.length, secretOwned, secretTotal: SECRET_TITLE_COUNT };
+  }
+
+  // ── 装備 ────────────────────────────────────────────────
+
+  /**
+   * カードに掲げる称号。未設定なら「獲得が新しい順」で自動的に埋める
+   * （何も装備していない人のカードが空にならないように）。
+   */
+  equipped(userId: string): GrantedTitle[] {
+    const rows = this.db
+      .prepare("SELECT title_key FROM title_equips WHERE user_id = ? ORDER BY slot")
+      .all(userId) as Array<{ title_key: string }>;
+
+    if (rows.length > 0) {
+      const ownedKeys = new Set(this.ownedKeys(userId));
+      const picked = rows
+        .filter((r) => ownedKeys.has(r.title_key))
+        .flatMap((r) => {
+          const rule = this.ruleMap.get(r.title_key);
+          return rule ? [rule] : [];
+        });
+      if (picked.length > 0) {
+        const grantedAt = new Map(
+          (
+            this.db.prepare("SELECT title_key, granted_at FROM titles WHERE user_id = ?").all(userId) as Array<{
+              title_key: string;
+              granted_at: number;
+            }>
+          ).map((r) => [r.title_key, r.granted_at]),
+        );
+        return picked.map((rule) => toGranted(rule, grantedAt.get(rule.key) ?? 0));
+      }
+    }
+
+    return this.list(userId).slice(-EQUIP_SLOTS).reverse();
+  }
+
+  /**
+   * 装備を差し替える。所持していないキー・重複・上限超過は弾く。
+   * 空配列を渡すと「自動（新しい順）」へ戻る。
+   */
+  equip(userId: string, keys: string[]): { ok: true } | { ok: false; reason: string } {
+    if (keys.length > EQUIP_SLOTS) return { ok: false, reason: `掲げられるのは${EQUIP_SLOTS}つまで` };
+    const unique = [...new Set(keys)];
+    if (unique.length !== keys.length) return { ok: false, reason: "同じ称号は一度しか掲げられない" };
+    const owned = new Set(this.ownedKeys(userId));
+    for (const k of unique) {
+      if (!owned.has(k)) return { ok: false, reason: "持っていない称号は掲げられない" };
+    }
+
+    const ts = now();
+    const del = this.db.prepare("DELETE FROM title_equips WHERE user_id = ?");
+    const ins = this.db.prepare(
+      "INSERT INTO title_equips (user_id, slot, title_key, updated_at) VALUES (?, ?, ?, ?)",
+    );
+    this.db.transaction(() => {
+      del.run(userId);
+      unique.forEach((k, i) => ins.run(userId, i, k, ts));
+    })();
+    return { ok: true };
+  }
+}
+
+function toGranted(rule: TitleRule, grantedAt: number): GrantedTitle {
+  return {
+    key: rule.key,
+    name: rule.name,
+    emoji: rule.emoji,
+    desc: rule.desc,
+    granted_at: grantedAt,
+    category: rule.category,
+    secret: rule.secret,
+  };
 }
