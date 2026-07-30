@@ -1,7 +1,7 @@
 const ACTIVE_TICKET_UNIQUE_INDEX = "idx_tickets_user_panel_active_unique";
 
 interface TicketConstraintDb {
-  prepare(sql: string): { all(...params: unknown[]): unknown[] };
+  prepare(sql: string): { all(...params: any[]): any[] };
   exec(sql: string): unknown;
 }
 
