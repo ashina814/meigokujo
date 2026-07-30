@@ -37,7 +37,7 @@ import {
   handleSessionCommand,
   handleVoiceAttendance,
 } from "./commands/entry.js";
-import { handleTicketButton } from "./commands/tickets.js";
+import { handleTicketButton } from "./commands/ticket-handler-safe.js";
 import {
   handleConfessionButton,
   handleConfessionModal,
