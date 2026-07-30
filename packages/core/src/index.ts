@@ -75,6 +75,7 @@ export {
   type TicketPanelRow,
 } from "./tickets/service.js";
 export { ensureTicketOpenUniqueness } from "./tickets/constraints.js";
+export { closeActiveTicket } from "./tickets/close-active.js";
 export {
   Confessions,
   type ConfessionRow,
