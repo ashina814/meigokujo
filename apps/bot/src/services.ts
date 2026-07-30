@@ -61,8 +61,11 @@ export function buildServices() {
   const vc = new VcTracker(db);
   const tickets = new Tickets(db, events);
   // 同じ利用者・同じ受付パネルでは未完了チケットを1件だけにする。
-  // Tickets構築後に実行し、旧DBへpanel_id列を追加した後で部分ユニーク索引を作る。
-  ensureTicketOpenUniqueness(db);
+  // 旧式チケット行は削除するが、受付パネル設定は保持する。
+  const ticketMigration = ensureTicketOpenUniqueness(db);
+  if (ticketMigration.deletedLegacyTickets > 0) {
+    console.warn(`[ticket] 旧式チケットを ${ticketMigration.deletedLegacyTickets} 件削除しました（受付パネル設定は保持）`);
+  }
   const confessions = new Confessions(db, events);
   const evaluation = new Evaluation(db, settings, events);
   const vcRewards = new VcRewards(db, settings);
