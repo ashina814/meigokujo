@@ -13,6 +13,8 @@ const SERIF = `"Noto Serif CJK JP", "Yu Mincho", "Hiragino Mincho ProN", serif`;
 
 const WIDTH = 1000;
 const PAD = 56;
+/** カードに描く称号の上限（装備枠と同数だが、描画側の安全弁として独立に持つ） */
+const MAX_CARD_TITLES = 3;
 
 export interface ProfileCardData {
   displayName: string;
@@ -22,7 +24,10 @@ export interface ProfileCardData {
   daysInCastle: number;
   vcHours: number;
   daysSeen: number;
+  /** カードに掲げる称号（装備分のみ）。所持全件を渡すとカードが縦に伸び続けるので注意 */
   titles: Array<{ name: string; desc: string }>;
+  /** 収集の進捗。見出しの右に「23/113」の形で出す */
+  titleProgress?: { owned: number; total: number };
   // ランク（発言・浮上）— 未指定なら描画スキップ
   ranks?: {
     totalLevel: number;
@@ -57,7 +62,9 @@ const RANK_COLOR: Record<string, string> = {
 
 export async function renderProfileCard(data: ProfileCardData): Promise<Buffer> {
   // 称号数に応じて高さを伸ばす + ランク描画があれば追加 + 特別役職バナーがあれば追加
-  const titleRows = Math.max(data.titles.length, 1);
+  // 称号は装備制なので通常3件だが、呼び出し側の取り違えでカードが青天井に伸びないよう頭を抑える
+  const shownTitles = data.titles.slice(0, MAX_CARD_TITLES);
+  const titleRows = Math.max(shownTitles.length, 1);
   const specialH = data.specialRole ? 176 : 0;
   const rankBlockH = data.ranks ? 220 : 0;
   const boxY = 236 + specialH; // ステータス4枠の上端
@@ -170,6 +177,12 @@ export async function renderProfileCard(data: ProfileCardData): Promise<Buffer> 
   ctx.fillStyle = "#f0b429";
   ctx.font = `600 30px ${SERIF}`;
   ctx.fillText("刻まれし称号", secX, titlesBlockTop + 8);
+  if (data.titleProgress) {
+    const label = `${data.titleProgress.owned} / ${data.titleProgress.total} 獲得`;
+    ctx.fillStyle = "#8a7fa6";
+    ctx.font = `400 24px ${SANS}`;
+    ctx.fillText(label, WIDTH - PAD - ctx.measureText(label).width, titlesBlockTop + 8);
+  }
   // 見出し下の細線
   ctx.strokeStyle = "rgba(240,180,41,0.25)";
   ctx.lineWidth = 1;
@@ -179,12 +192,12 @@ export async function renderProfileCard(data: ProfileCardData): Promise<Buffer> 
   ctx.stroke();
 
   const listTop = titlesBlockTop + 44;
-  if (data.titles.length === 0) {
+  if (shownTitles.length === 0) {
     ctx.fillStyle = "#6b6480";
     ctx.font = `400 26px ${SANS}`;
     ctx.fillText("まだ称号を持たぬ魂。城で生きた証が、いずれここに刻まれる。", secX + 4, listTop + 40);
   } else {
-    data.titles.forEach((t, i) => {
+    shownTitles.forEach((t, i) => {
       const y = listTop + i * rowH + 34;
       // ダイヤ型のブレット
       drawDiamond(ctx, secX + 10, y - 9, 7, bulletColor(i));
