@@ -1,5 +1,9 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
+import {
+  ensureTicketOpenUniqueness,
+  type TicketOpenUniquenessMigrationResult,
+} from "./constraints.js";
 
 export type TicketKind = string;
 export type TicketStatus = "open" | "claimed" | "closed";
@@ -146,14 +150,16 @@ function panelFromRow(row: TicketPanelRow): TicketPanel {
 
 /** チケット（出戻り申請・個別相談）。スレッドの状態管理と24時間無応答の検知 */
 export class Tickets {
+  readonly migrationResult: TicketOpenUniquenessMigrationResult;
+
   constructor(
     private readonly db: Database.Database,
     private readonly events: EventLog,
   ) {
-    this.ensureSchema();
+    this.migrationResult = this.ensureSchema();
   }
 
-  private ensureSchema(): void {
+  private ensureSchema(): TicketOpenUniquenessMigrationResult {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS ticket_panels (
         id TEXT PRIMARY KEY,
@@ -189,6 +195,9 @@ export class Tickets {
         (@id, @name, @title, @description, @buttonLabel, @buttonEmoji, '[]', '[]', 1, 'system:legacy-seed', 'system:legacy-seed', @ts, @ts)
     `);
     for (const panel of LEGACY_PANELS) insert.run({ ...panel, buttonEmoji: panel.buttonEmoji ?? null, ts });
+
+    // 列追加と既定パネルのシード完了後、旧式チケット整理と未完了重複制約を必ず適用する。
+    return ensureTicketOpenUniqueness(this.db);
   }
 
   private addTicketColumn(name: string, decl: string): void {

@@ -74,6 +74,7 @@ export {
   type TicketPanelInput,
   type TicketPanelRow,
 } from "./tickets/service.js";
+export { ensureTicketOpenUniqueness } from "./tickets/constraints.js";
 export {
   Confessions,
   type ConfessionRow,

@@ -59,6 +59,9 @@ export function buildServices() {
   const entry = new Entry(db, ledger, settings, events);
   const vc = new VcTracker(db);
   const tickets = new Tickets(db, events);
+  if (tickets.migrationResult.deletedLegacyTickets > 0) {
+    console.warn(`[ticket] 旧式チケットを ${tickets.migrationResult.deletedLegacyTickets} 件削除しました（受付パネル設定は保持）`);
+  }
   const confessions = new Confessions(db, events);
   const evaluation = new Evaluation(db, settings, events);
   const vcRewards = new VcRewards(db, settings);
