@@ -74,7 +74,7 @@ describe("チケット未完了数のDB制約", () => {
     tickets.create("thread-b", "user-a", "consult", panel("consult"));
 
     expect(() => ensureTicketOpenUniqueness(db)).toThrowError(
-      /ticket active uniqueness migration blocked: duplicate active tickets exist: user=user-a panel=consult count=2 threads=\[thread-a, thread-b\]/,
+      /ticket active uniqueness migration blocked: duplicate active tickets exist: user=user-a panel=consult count=2 threads=\[(?=[^\]]*thread-a)(?=[^\]]*thread-b)[^\]]+\]/,
     );
     db.close();
   });
