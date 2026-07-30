@@ -69,7 +69,7 @@ describe("チケット未完了数のDB制約", () => {
     db.close();
   });
 
-  it("既存DBに重複した未完了チケットがあれば詳細付きで移行を止める", () => {
+  it("既存DBに重複した現行チケットがあれば詳細付きで移行を止める", () => {
     const { db, tickets } = setup();
 
     tickets.create("thread-a", "user-a", "consult", panel("consult"));
@@ -81,14 +81,51 @@ describe("チケット未完了数のDB制約", () => {
     db.close();
   });
 
-  it("旧式のpanel_idなしチケットは互換のため制約対象外", () => {
+  it("旧式チケットだけを削除し、受付パネル設定は保持する", () => {
     const { db, tickets } = setup();
-    ensureTicketOpenUniqueness(db);
-
+    tickets.upsertPanel({
+      id: "legacy-panel",
+      name: "残す受付",
+      title: "残す受付タイトル",
+      description: "この受付パネル設定は削除しない",
+      buttonLabel: "受付する",
+      buttonEmoji: "📮",
+      notifyRoleIds: ["notify-role"],
+      staffRoleIds: ["staff-role"],
+      enabled: false,
+    });
     tickets.create("legacy-a", "user-a", "consult");
     tickets.create("legacy-b", "user-a", "consult");
 
-    expect(tickets.countOpen()).toBe(2);
+    const result = ensureTicketOpenUniqueness(db);
+
+    expect(result.deletedLegacyTickets).toBe(2);
+    expect(tickets.get("legacy-a")).toBeUndefined();
+    expect(tickets.get("legacy-b")).toBeUndefined();
+    expect(tickets.getPanel("legacy-panel")).toMatchObject({
+      id: "legacy-panel",
+      name: "残す受付",
+      title: "残す受付タイトル",
+      description: "この受付パネル設定は削除しない",
+      buttonLabel: "受付する",
+      buttonEmoji: "📮",
+      notifyRoleIds: ["notify-role"],
+      staffRoleIds: ["staff-role"],
+      enabled: false,
+    });
+    db.close();
+  });
+
+  it("現行チケット重複で移行停止した場合は旧式チケット削除も巻き戻す", () => {
+    const { db, tickets } = setup();
+    tickets.create("legacy-a", "user-legacy", "consult");
+    tickets.create("thread-a", "user-a", "consult", panel("consult"));
+    tickets.create("thread-b", "user-a", "consult", panel("consult"));
+
+    expect(() => ensureTicketOpenUniqueness(db)).toThrow(
+      /ticket active uniqueness migration blocked/,
+    );
+    expect(tickets.get("legacy-a")?.panel_id).toBeNull();
     db.close();
   });
 });
