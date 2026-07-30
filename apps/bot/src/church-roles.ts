@@ -8,7 +8,7 @@ import type { Services } from "./services.js";
  * 設計方針:
  * - ロール名はコードに固定しない。運営ボードで選んだロールIDを Settings の
  *   `roles:<slot>` に **JSON配列** で保存する（複数ロール可・将来の担当交代に強い）。
- * - 旧 `role:ticket_staff` / `role:emergency_staff` は、新設定が未投入の間だけ
+ * - 旧 `role:admin` / `role:ticket_staff` / `role:emergency_staff` は、新設定が未投入の間だけ
  *   フォールバックとして使う（§8 の段階移行）。運営ボードで設定が入れば新設定が優先。
  * - 「通知される資格」と「案件を閲覧・操作できる資格」は別物。ここは前者（＝どのロールを
  *   メンションするか／誰が入口を押せるか）だけを解決する。閲覧権は claim / 担当追加でのみ付く。
@@ -16,6 +16,7 @@ import type { Services } from "./services.js";
 
 /** ロール区分（運営ボードの設定スロット）。値が Settings のキー接尾辞になる */
 export type RoleSlot =
+  | "admin" // /管理 と管理パネルの利用資格（魔王・使令など）
   | "church_consult" // 相談対応（シスター・修道士）※複数
   | "church_manage" // 冥教会管理（大司教）
   | "normal_ops" // 通常運営（使令など）
@@ -26,6 +27,11 @@ export type RoleSlot =
   | "discipline"; // 規律対応担当
 
 export const ROLE_SLOT_META: Record<RoleSlot, { label: string; hint: string; multi: boolean }> = {
+  admin: {
+    label: "管理コマンド利用ロール",
+    hint: "魔王・使令など。いずれかのロール保持者が /管理 と管理パネルを利用可（旧単一設定より優先）",
+    multi: true,
+  },
   church_consult: { label: "相談対応ロール（シスター・修道士）", hint: "🕯️相談・🙏懺悔の一次対応。複数選択可", multi: true },
   church_manage: { label: "冥教会管理ロール（大司教）", hint: "冥教会案件の管理・担当調整・引継ぎ確認", multi: true },
   normal_ops: { label: "通常運営ロール（使令など）", hint: "サーバー規約対応・警告・処分は運営の管轄", multi: true },
@@ -39,6 +45,7 @@ export const ROLE_SLOT_META: Record<RoleSlot, { label: string; hint: string; mul
 
 // 運営ボードに表示する区分（諧和廷=kaiwa は廃止したため一覧から除外）
 export const ROLE_SLOT_ORDER: RoleSlot[] = [
+  "admin",
   "church_consult",
   "church_manage",
   "normal_ops",
@@ -58,6 +65,10 @@ export function getRoleIds(services: Services, slot: RoleSlot): string[] {
   const list = services.settings.getJson<string[]>(key(slot), []);
   if (Array.isArray(list) && list.length > 0) return list.filter(Boolean);
   // ── フォールバック（新設定が未投入の間だけ）──
+  if (slot === "admin") {
+    const legacy = services.settings.getString("role:admin");
+    if (legacy) return [legacy];
+  }
   if (slot === "emergency") {
     const legacy = services.settings.getString("role:emergency_staff");
     if (legacy) return [legacy];
