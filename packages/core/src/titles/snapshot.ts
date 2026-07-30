@@ -1,5 +1,16 @@
 import type Database from "better-sqlite3";
 import type { VcTracker } from "../vc/service.js";
+import {
+  coveredDays,
+  crossMidnightCount,
+  daysOverlappingWindow,
+  longestIntervalSeconds,
+  longestStreak,
+  mergeIntervals,
+  totalSeconds,
+  type Interval,
+} from "../vc/time.js";
+import { PUBLIC_ROOM_KINDS } from "./privacy.js";
 
 /**
  * 称号判定のためのスナップショット。
@@ -7,21 +18,22 @@ import type { VcTracker } from "../vc/service.js";
  * 称号は3桁になるため「1ルール = 1クエリ」では線形に重くなる。ここで1人分の集計を
  * 固定本数のクエリでまとめて取り、ルール側はメモリ上のこの構造だけを読む。
  * 称号が9個でも300個でも、DBに当たる回数は変わらない。
+ *
+ * ■ 台帳の集計は actor_id ではなく from_account / to_account を使う
+ *   transactions.actor_id は自由書式で、ユーザー操作は `user:<id>`、システム処理は
+ *   `system:*` や承認者IDが入る（tip.ts / transfer.ts / exchange.ts / bank-panel.ts）。
+ *   一方 from_account / to_account は accounts への参照で、住人口座は必ず `user:<id>`。
+ *   台帳は追記専用（UPDATE/DELETE 禁止）なので過去行の actor_id を揃える選択は取れない。
+ *   よって「口座の出入り」で数える。形式差の影響を受けず、過去データもそのまま読める。
  */
 
 const DAY = 86_400;
-const JST_OFFSET = 9 * 3600;
 const now = () => Math.floor(Date.now() / 1000);
 
-/** JSTでの日付キー（YYYY-MM-DD）。既存の VcTracker.presence と同じ換算に揃える */
-function jstDate(unixSec: number): string {
-  return new Date((unixSec + JST_OFFSET) * 1000).toISOString().slice(0, 10);
-}
-
-/** JSTでの時刻（0-23） */
-function jstHour(unixSec: number): number {
-  return Math.floor(((unixSec + JST_OFFSET) % DAY) / 3600);
-}
+/** 深夜帯（2時〜4時台） */
+const NIGHT_WINDOW: readonly [number, number] = [2, 5];
+/** 朝帯（5時〜6時台） */
+const DAWN_WINDOW: readonly [number, number] = [5, 7];
 
 export interface TxAgg {
   count: number;
@@ -29,35 +41,35 @@ export interface TxAgg {
 }
 
 export interface VcDerived {
+  /** 結合済み区間の合計。重なりがあっても実時間を超えない */
   totalSeconds: number;
+  /** 浮上した日数（中間日も落とさない） */
   daysSeen: number;
-  /** 一度の滞在の最長秒数 */
+  /** 一度の滞在の最長秒数（状態変化による分割は結合して数える） */
   longestSessionSeconds: number;
-  /** JSTの深夜帯(2:00-4:59)に跨って浮上していた日数 */
+  /** 深夜2時〜4時台に浮上していた日数 */
   deepNightDays: number;
-  /** JSTの朝(5:00-6:59)まで残っていた回数 */
-  dawnSessions: number;
-  /** 日付をまたいで浮上し続けた回数 */
+  /** 朝5時〜6時台に浮上していた日数 */
+  dawnDays: number;
+  /** 日付を跨いだ滞在の回数（結合後の区間で数える） */
   crossMidnightSessions: number;
   /** 連続して浮上した最大日数 */
   maxStreakDays: number;
-  /** 浮上したことのあるVCの種類数 */
+  /** 浮上したことのあるVCの種類数（動的生成の部屋を除く） */
   distinctChannels: number;
-  /** スピーカーミュート(deafen)状態で過ごした秒数 */
+  /** スピーカーを切った状態で過ごした秒数 */
   deafenedSeconds: number;
-  /** 初回浮上時刻（無ければ null） */
-  firstSeenAt: number | null;
 }
 
 export interface TitleSnapshot {
   userId: string;
-  /** events に actor として記録された回数（type別） */
+  /** events に actor として記録された回数（type別）。events の actor は裸のユーザーID */
   evActor: Map<string, number>;
   /** events に target として記録された回数（type別） */
   evTarget: Map<string, number>;
-  /** transactions に actor として記録された回数と総額（type別） */
-  txActor: Map<string, TxAgg>;
-  /** 自分の口座が受け取った回数と総額（type別） */
+  /** 自分の口座から出た取引の回数と総額（type別） */
+  txOut: Map<string, TxAgg>;
+  /** 自分の口座が受け取った取引の回数と総額（type別） */
   txIn: Map<string, TxAgg>;
   casino: Record<string, number>;
   soulStatus: string | null;
@@ -66,31 +78,26 @@ export interface TitleSnapshot {
   companions: { uniqueCount: number; totalSeconds: number; bestSeconds: number };
   /** 賭場で実際に遊んだゲームの種類数 */
   distinctCasinoGames: number;
-  /** 開いた部屋の数（kind別） */
+  /** 開いた部屋の数（公開してよい種別のみ） */
   roomsByKind: Map<string, number>;
   invites: { direct: number; grand: number };
   marks: { promotion: number; demotion: number };
-  /** 自分が評価した回数（conclusion別） */
   evalsGiven: Map<string, number>;
   bumps: number;
   /** 投げ銭を贈った相手のユニーク人数 */
   distinctTipTargets: number;
   shopPurchases: number;
-  /** 競馬に賭けた回数 */
   raceBets: number;
-  /**
-   * 既に獲得している称号の数。「称号を N 個集めた」系の判定に使う。
-   * 同一 evaluate 内での増加は反映されない（次回の評価で追いつく）。
-   */
+  /** 既に獲得している称号の数（同一 evaluate 内の増分は次回に持ち越す） */
   ownedTitles: number;
 }
 
 function tableExists(db: Database.Database, name: string): boolean {
   return (
-    db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name = ?").get(name) as
+    (db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name = ?").get(name) as
       | { ok: number }
-      | undefined
-  ) !== undefined;
+      | undefined) !== undefined
+  );
 }
 
 /** 賭場テーブルは Casino サービスが遅延生成する。未生成でも判定全体を落とさない */
@@ -118,85 +125,55 @@ function countMap(rows: Array<{ k: string | null; c: number }>): Map<string, num
   return m;
 }
 
-function txMap(rows: Array<{ k: string; c: number; s: number }>): Map<string, TxAgg> {
+function txMap(rows: Array<{ k: string; c: number; s: number | null }>): Map<string, TxAgg> {
   const m = new Map<string, TxAgg>();
   for (const r of rows) m.set(r.k, { count: r.c, sum: r.s ?? 0 });
   return m;
 }
 
-/** vc_segments 1人分から、時間帯・連続性・最長滞在といった「量ではない」指標を導く */
-function deriveVc(
+/**
+ * vc_segments 1人分から「量ではない」指標を導く。
+ *
+ * セグメントはミュート/デフン切替・チャンネル移動のたびに分割される
+ * （apps/bot/src/vc-tracking.ts）。そのままでは「一度の滞在」も「日跨ぎ回数」も
+ * 実態とずれるため、まず連続した滞在に結合してから各指標を求める。
+ */
+export function deriveVc(
   segments: Array<{ channel_id: string; started_at: number; ended_at: number; self_deafened: number }>,
+  opts: { ephemeralChannels?: ReadonlySet<string> } = {},
 ): VcDerived {
-  const days = new Set<string>();
-  const deepNight = new Set<string>();
-  const channels = new Set<string>();
-  let totalSeconds = 0;
-  let longest = 0;
-  let dawnSessions = 0;
-  let crossMidnight = 0;
-  let deafenedSeconds = 0;
-  let firstSeenAt: number | null = null;
+  const intervals: Interval[] = segments.map((s) => ({ start: s.started_at, end: s.ended_at }));
+  const merged = mergeIntervals(intervals);
+  const days = coveredDays(merged);
 
+  // デフン秒数は「状態」なので結合前の生セグメントから積む
+  let deafenedSeconds = 0;
+  const channels = new Set<string>();
   for (const s of segments) {
     const seconds = Math.max(0, s.ended_at - s.started_at);
-    totalSeconds += seconds;
-    if (seconds > longest) longest = seconds;
     if (s.self_deafened) deafenedSeconds += seconds;
-    channels.add(s.channel_id);
-    if (firstSeenAt === null || s.started_at < firstSeenAt) firstSeenAt = s.started_at;
-
-    const startDay = jstDate(s.started_at);
-    const endDay = jstDate(s.ended_at);
-    days.add(startDay);
-    if (startDay !== endDay) {
-      days.add(endDay);
-      crossMidnight += 1;
-    }
-
-    const endHour = jstHour(s.ended_at);
-    if (endHour >= 5 && endHour < 7) dawnSessions += 1;
-
-    // 深夜帯(2:00-4:59)に1秒でも掛かっていればその日を深夜浮上とみなす。
-    // 区間が長いと複数日にまたがるため、日ごとの深夜窓と突き合わせる。
-    for (let t = s.started_at; t <= s.ended_at; t += DAY) {
-      const day = jstDate(t);
-      const dayStart = Math.floor((t + JST_OFFSET) / DAY) * DAY - JST_OFFSET;
-      const windowStart = dayStart + 2 * 3600;
-      const windowEnd = dayStart + 5 * 3600;
-      if (Math.min(s.ended_at, windowEnd) > Math.max(s.started_at, windowStart)) deepNight.add(day);
-    }
-  }
-
-  // 連続浮上日数（JST基準の最長ラン）
-  const sorted = [...days].sort();
-  let maxStreak = 0;
-  let run = 0;
-  let prev: number | null = null;
-  for (const d of sorted) {
-    const t = Date.parse(`${d}T00:00:00Z`) / 1000;
-    run = prev !== null && t - prev === DAY ? run + 1 : 1;
-    if (run > maxStreak) maxStreak = run;
-    prev = t;
+    // 宿・卓・巣穴のような動的生成VCは「城を歩いた」に数えない。
+    // 部屋を10個開けば探索称号が取れてしまうのを防ぐ。
+    if (!opts.ephemeralChannels?.has(s.channel_id)) channels.add(s.channel_id);
   }
 
   return {
-    totalSeconds,
+    totalSeconds: totalSeconds(merged),
     daysSeen: days.size,
-    longestSessionSeconds: longest,
-    deepNightDays: deepNight.size,
-    dawnSessions,
-    crossMidnightSessions: crossMidnight,
-    maxStreakDays: maxStreak,
+    longestSessionSeconds: longestIntervalSeconds(merged),
+    deepNightDays: daysOverlappingWindow(merged, ...NIGHT_WINDOW).size,
+    dawnDays: daysOverlappingWindow(merged, ...DAWN_WINDOW).size,
+    crossMidnightSessions: crossMidnightCount(merged),
+    maxStreakDays: longestStreak(days),
     distinctChannels: channels.size,
     deafenedSeconds,
-    firstSeenAt,
   };
 }
 
 /** 1人分のスナップショットを構築する。DBに当たるのはこの関数の中だけ */
 export function buildSnapshot(db: Database.Database, vc: VcTracker, userId: string): TitleSnapshot {
   const ts = now();
+  const account = `user:${userId}`;
 
   const evActor = countMap(
     db
@@ -208,23 +185,26 @@ export function buildSnapshot(db: Database.Database, vc: VcTracker, userId: stri
       .prepare("SELECT type AS k, COUNT(*) AS c FROM events WHERE target_id = ? GROUP BY type")
       .all(userId) as Array<{ k: string; c: number }>,
   );
-  const txActor = txMap(
+
+  // 口座の出入りで数える（actor_id の書式差に依存しない）
+  const txOut = txMap(
     db
-      .prepare("SELECT type AS k, COUNT(*) AS c, SUM(amount) AS s FROM transactions WHERE actor_id = ? GROUP BY type")
-      .all(userId) as Array<{ k: string; c: number; s: number }>,
+      .prepare(
+        "SELECT type AS k, COUNT(*) AS c, SUM(amount) AS s FROM transactions WHERE from_account = ? GROUP BY type",
+      )
+      .all(account) as Array<{ k: string; c: number; s: number | null }>,
   );
   const txIn = txMap(
     db
-      .prepare("SELECT type AS k, COUNT(*) AS c, SUM(amount) AS s FROM transactions WHERE to_account = ? GROUP BY type")
-      .all(`user:${userId}`) as Array<{ k: string; c: number; s: number }>,
+      .prepare(
+        "SELECT type AS k, COUNT(*) AS c, SUM(amount) AS s FROM transactions WHERE to_account = ? GROUP BY type",
+      )
+      .all(account) as Array<{ k: string; c: number; s: number | null }>,
   );
 
-  const casinoRow = safeGet<Record<string, number>>(
-    db,
-    "casino_stats",
-    "SELECT * FROM casino_stats WHERE user_id = ?",
-    [userId],
-  );
+  const casinoRow = safeGet<Record<string, number>>(db, "casino_stats", "SELECT * FROM casino_stats WHERE user_id = ?", [
+    userId,
+  ]);
 
   const soul = db.prepare("SELECT status, ghost_at FROM souls WHERE user_id = ?").get(userId) as
     | { status: string; ghost_at: number | null }
@@ -250,12 +230,15 @@ export function buildSnapshot(db: Database.Database, vc: VcTracker, userId: stri
     [userId],
   );
 
+  // 蜜月・朧月は秘匿対象なので集計自体に含めない（titles/privacy.ts）
   const roomsByKind = countMap(
     safeAll<{ k: string; c: number }>(
       db,
       "rooms",
-      "SELECT kind AS k, COUNT(*) AS c FROM rooms WHERE owner_id = ? GROUP BY kind",
-      [userId],
+      `SELECT kind AS k, COUNT(*) AS c FROM rooms
+       WHERE owner_id = ? AND kind IN (${PUBLIC_ROOM_KINDS.map(() => "?").join(",")})
+       GROUP BY kind`,
+      [userId, ...PUBLIC_ROOM_KINDS],
     ),
   );
 
@@ -293,36 +276,51 @@ export function buildSnapshot(db: Database.Database, vc: VcTracker, userId: stri
   const tipTargetRow = safeGet<{ n: number }>(
     db,
     "transactions",
-    "SELECT COUNT(DISTINCT to_account) AS n FROM transactions WHERE type = 'tip' AND actor_id = ?",
-    [userId],
+    "SELECT COUNT(DISTINCT to_account) AS n FROM transactions WHERE type = 'tip' AND from_account = ?",
+    [account],
   );
 
-  const shopRow = safeGet<{ n: number }>(
-    db,
-    "shop_purchases",
-    "SELECT COUNT(*) AS n FROM shop_purchases WHERE user_id = ?",
-    [userId],
-  );
+  const shopRow = safeGet<{ n: number }>(db, "shop_purchases", "SELECT COUNT(*) AS n FROM shop_purchases WHERE user_id = ?", [
+    userId,
+  ]);
 
-  const raceRow = safeGet<{ n: number }>(
-    db,
-    "race_bets",
-    "SELECT COUNT(*) AS n FROM race_bets WHERE user_id = ?",
-    [userId],
-  );
+  const raceRow = safeGet<{ n: number }>(db, "race_bets", "SELECT COUNT(*) AS n FROM race_bets WHERE user_id = ?", [
+    userId,
+  ]);
 
   const ownedRow = db.prepare("SELECT COUNT(*) AS n FROM titles WHERE user_id = ?").get(userId) as { n: number };
+
+  // 動的生成VC（宿・特殊部屋・賭場の卓・巣穴）の channel_id 集合。
+  // 常設VCの探索と区別するために使う。テーブルが無い環境では空集合。
+  //
+  // rooms と den_vcs は行が残るが、casino_temp_vcs は untrack で消えるため
+  // 過去の卓を取りこぼす。卓は takutate_create の事件録に channelId が残るので
+  // そちらも併せて読む（事件録は追記専用なので取りこぼしがない）。
+  const ephemeralChannels = new Set<string>();
+  for (const table of ["rooms", "casino_temp_vcs", "den_vcs"]) {
+    for (const r of safeAll<{ channel_id: string }>(db, table, `SELECT channel_id FROM ${table}`, [])) {
+      if (r.channel_id) ephemeralChannels.add(r.channel_id);
+    }
+  }
+  for (const r of safeAll<{ channel_id: string | null }>(
+    db,
+    "events",
+    "SELECT json_extract(payload_json, '$.channelId') AS channel_id FROM events WHERE type = 'takutate_create'",
+    [],
+  )) {
+    if (r.channel_id) ephemeralChannels.add(r.channel_id);
+  }
 
   return {
     userId,
     evActor,
     evTarget,
-    txActor,
+    txOut,
     txIn,
     casino: casinoRow ?? {},
     soulStatus: soul?.status ?? null,
     ghostAt: soul?.ghost_at ?? null,
-    vc: deriveVc(segments),
+    vc: deriveVc(segments, { ephemeralChannels }),
     companions: vc.companionSummary(userId),
     distinctCasinoGames: distinctGamesRow?.n ?? 0,
     roomsByKind,
@@ -336,3 +334,5 @@ export function buildSnapshot(db: Database.Database, vc: VcTracker, userId: stri
     ownedTitles: ownedRow.n,
   };
 }
+
+export { DAY };

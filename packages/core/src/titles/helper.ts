@@ -1,4 +1,5 @@
 import type { TitleSnapshot, VcDerived } from "./snapshot.js";
+import type { PublicRoomKind } from "./privacy.js";
 
 const DAY = 86_400;
 const HOUR = 3600;
@@ -19,7 +20,7 @@ export interface TitleRule {
   category: TitleCategory;
   name: string;
   emoji: string;
-  /** 獲得条件の説明。未獲得の一覧にも出る（secret のときは伏せる） */
+  /** 獲得条件の説明。未獲得の一覧にも出る（secret のときは伏せる）。判定式と一致させること */
   desc: string;
   check: (h: TitleHelper) => boolean;
   /** 隠し二つ名。獲得するまで名前も条件も明かさない */
@@ -29,6 +30,9 @@ export interface TitleRule {
 /**
  * ルール判定用のアクセサ。DBには一切触らず、事前に構築した TitleSnapshot だけを読む。
  * ここに生えているメソッドが、称号ルールで使える語彙のすべて。
+ *
+ * 台帳系は actor_id ではなく口座の出入りで数える（理由は snapshot.ts の先頭コメント）。
+ * 部屋は公開してよい種別しか触れない（理由は privacy.ts）。
  */
 export class TitleHelper {
   constructor(private readonly s: TitleSnapshot) {}
@@ -47,17 +51,17 @@ export class TitleHelper {
     return this.s.evTarget.get(type) ?? 0;
   }
 
-  /** 自分が動かした台帳取引の件数 */
-  txCount(type: string): number {
-    return this.s.txActor.get(type)?.count ?? 0;
+  /** 自分の口座から出た取引の件数（投げ銭・送金・入金など） */
+  txOutCount(type: string): number {
+    return this.s.txOut.get(type)?.count ?? 0;
   }
 
-  /** 自分が動かした台帳取引の総額 */
-  txSum(type: string): number {
-    return this.s.txActor.get(type)?.sum ?? 0;
+  /** 自分の口座から出た取引の総額 */
+  txOutSum(type: string): number {
+    return this.s.txOut.get(type)?.sum ?? 0;
   }
 
-  /** 自分の口座が受け取った件数 */
+  /** 自分の口座が受け取った件数（給与・浮上報酬・部署からの出金など） */
   txInCount(type: string): number {
     return this.s.txIn.get(type)?.count ?? 0;
   }
@@ -90,11 +94,11 @@ export class TitleHelper {
     return this.s.vc.totalSeconds;
   }
 
-  totalVcHours(): number {
-    return this.s.vc.totalSeconds / HOUR;
-  }
-
-  /** 同席（誰と何秒いたか）の要約 */
+  /**
+   * 同席の要約。
+   * totalSeconds は「相手ごとの延べ」なので、3人以上のVCでは実時間を超える。
+   * 単独時間の算出には使えない（誤用防止のためコメントを残す）。
+   */
   get companions(): { uniqueCount: number; totalSeconds: number; bestSeconds: number } {
     return this.s.companions;
   }
@@ -108,7 +112,11 @@ export class TitleHelper {
     return this.s.distinctCasinoGames;
   }
 
-  roomsOpened(kind?: string): number {
+  /**
+   * 開いた部屋の数。種別は公開してよいものだけを受け付ける
+   * （蜜月・朧月を条件に書けないよう型で塞いでいる）。
+   */
+  roomsOpened(kind?: PublicRoomKind): number {
     if (kind) return this.s.roomsByKind.get(kind) ?? 0;
     let total = 0;
     for (const v of this.s.roomsByKind.values()) total += v;

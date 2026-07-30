@@ -3,8 +3,9 @@ import type { VcTracker } from "../vc/service.js";
 import { TitleHelper, type TitleCategory, type TitleRule } from "./helper.js";
 import { SECRET_TITLE_COUNT, TITLE_RULES } from "./catalog.js";
 import { buildSnapshot } from "./snapshot.js";
+import { SENSITIVE_SOURCES, findSensitiveReference } from "./privacy.js";
 
-export { TitleHelper, TITLE_RULES, SECRET_TITLE_COUNT, buildSnapshot };
+export { TitleHelper, TITLE_RULES, SECRET_TITLE_COUNT, buildSnapshot, SENSITIVE_SOURCES, findSensitiveReference };
 export type { TitleCategory, TitleRule };
 export type { TitleSnapshot } from "./snapshot.js";
 
@@ -30,13 +31,20 @@ export interface GrantedTitle {
 }
 
 /**
- * 旧称号キーの引き継ぎ表。カタログ刷新でキーが変わっても、既に付与された実績は失わせない。
- * 付与済みレコードを新キーへ書き換える（一度きり・冪等）。
+ * 旧称号キーの対応表（旧キー → 新キー）。
+ *
+ * 移行は「旧行を消して書き換える」のではなく「旧行を残したまま新キー行を足す」方式を取る。
+ * 理由: 前回の本番投入でコードのロールバックが必要になった実績があるため、
+ * DBだけ新形式へ進んだ状態で旧コードに戻っても称号表示が壊れないことを優先する。
+ *   - 旧コードは旧キー行をそのまま読めるので表示が欠落しない
+ *   - 旧コードは知らない新キー行を無視する（list が未知キーを飛ばす実装）
+ *   - 新コードは読み取り時に旧キーを新キーへ解決し、重複を潰す
+ * 旧行の削除は「旧コードへ戻す可能性が無くなってから」別途行う（docs/titles-migration.md）。
  */
 const LEGACY_KEY_MAP: Record<string, string> = {
   recruiter: "recruiter_1",
   recruiter_gold: "recruiter_5",
-  matchmaker: "mitsugetsu",
+  matchmaker: "mitsugetsu_retired",
   innkeeper: "dan_room_2",
   veteran: "dan_days_2",
   elder: "dan_days_3",
@@ -44,8 +52,9 @@ const LEGACY_KEY_MAP: Record<string, string> = {
 
 /**
  * 廃止したルール。新規付与はしないが、既に持っている人の一覧には出し続ける。
- * 「累計VC時間」はランク（rank_voice）の領分と整理したため称号からは外したが、
- * 過去に獲得した人の記録まで消す理由はない。
+ *   nightwalker        : 「累計VC時間」はランク（rank_voice）の領分と整理したため称号から外した。
+ *   mitsugetsu_retired : 蜜月は秘匿対象（titles/privacy.ts）。旧「月下氷人」の獲得記録だけ残す。
+ * いずれも過去に獲得した人の記録を消す理由はないので、表示だけ生かす。
  */
 const RETIRED_RULES: TitleRule[] = [
   {
@@ -53,7 +62,15 @@ const RETIRED_RULES: TitleRule[] = [
     category: "toki",
     name: "不眠の魂",
     emoji: "🌙",
-    desc: "累計100時間 城に浮上した（現在は廃止された称号）",
+    desc: "累計100時間 城に浮上した（廃止された称号）",
+    check: () => false,
+  },
+  {
+    key: "mitsugetsu_retired",
+    category: "kizuna",
+    name: "月下氷人",
+    emoji: "🌸",
+    desc: "縁を結んだ証（廃止された称号）",
     check: () => false,
   },
 ];
@@ -70,33 +87,63 @@ export class TitleEngine {
     this.migrateLegacyKeys();
   }
 
-  /** 旧キーを新キーへ寄せる。衝突（新旧どちらも所持）した場合は旧行を捨てる */
+  /**
+   * 旧キーに対応する新キー行を追加する（旧行は消さない）。
+   * granted_at は旧行の値を引き継ぐので「いつ獲得したか」を失わない。
+   * INSERT OR IGNORE と移行台帳のPKで、何度走っても同じ結果になる。
+   */
   private migrateLegacyKeys(): void {
-    const update = this.db.prepare(
-      "UPDATE OR IGNORE titles SET title_key = ? WHERE user_id = ? AND title_key = ?",
-    );
-    const remove = this.db.prepare("DELETE FROM titles WHERE user_id = ? AND title_key = ?");
+    const legacyKeys = Object.keys(LEGACY_KEY_MAP);
+    const placeholders = legacyKeys.map(() => "?").join(",");
     const rows = this.db
-      .prepare(
-        `SELECT user_id, title_key FROM titles WHERE title_key IN (${Object.keys(LEGACY_KEY_MAP)
-          .map(() => "?")
-          .join(",")})`,
-      )
-      .all(...Object.keys(LEGACY_KEY_MAP)) as Array<{ user_id: string; title_key: string }>;
+      .prepare(`SELECT user_id, title_key, granted_at FROM titles WHERE title_key IN (${placeholders})`)
+      .all(...legacyKeys) as Array<{ user_id: string; title_key: string; granted_at: number }>;
     if (rows.length === 0) return;
+
+    const insertTitle = this.db.prepare(
+      "INSERT INTO titles (user_id, title_key, granted_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+    );
+    const recordMigration = this.db.prepare(
+      `INSERT INTO title_key_migrations (user_id, legacy_key, new_key, migrated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT DO NOTHING`,
+    );
+    const ts = now();
     this.db.transaction(() => {
       for (const r of rows) {
-        update.run(LEGACY_KEY_MAP[r.title_key]!, r.user_id, r.title_key);
-        remove.run(r.user_id, r.title_key);
+        const newKey = LEGACY_KEY_MAP[r.title_key]!;
+        insertTitle.run(r.user_id, newKey, r.granted_at);
+        recordMigration.run(r.user_id, r.title_key, newKey, ts);
       }
     })();
+  }
+
+  /** 旧キーを新キーに読み替える */
+  private resolveKey(key: string): string {
+    return LEGACY_KEY_MAP[key] ?? key;
+  }
+
+  /**
+   * 所持している称号を「解決後のキー → 最古の獲得時刻」で返す。
+   * 旧キーと新キーの両方を持っていても1件に潰れる。
+   */
+  private ownedMap(userId: string): Map<string, number> {
+    const rows = this.db
+      .prepare("SELECT title_key, granted_at FROM titles WHERE user_id = ?")
+      .all(userId) as Array<{ title_key: string; granted_at: number }>;
+    const owned = new Map<string, number>();
+    for (const r of rows) {
+      const key = this.resolveKey(r.title_key);
+      const existing = owned.get(key);
+      if (existing === undefined || r.granted_at < existing) owned.set(key, r.granted_at);
+    }
+    return owned;
   }
 
   /** 全ルールを判定し、新規に満たした称号を付与する。付与した新称号を返す */
   evaluate(userId: string): GrantedTitle[] {
     const snapshot = buildSnapshot(this.db, this.vc, userId);
     const helper = new TitleHelper(snapshot);
-    const owned = new Set(this.ownedKeys(userId));
+    const owned = this.ownedMap(userId);
     const newlyGranted: GrantedTitle[] = [];
     const ts = now();
     const insert = this.db.prepare(
@@ -113,31 +160,29 @@ export class TitleEngine {
       }
       if (!ok) continue;
       insert.run(userId, rule.key, ts);
-      newlyGranted.push({ ...toGranted(rule, ts) });
+      newlyGranted.push(toGranted(rule, ts));
     }
     return newlyGranted;
   }
 
+  /** 所持キー（解決後）。旧キーは新キーとして返る */
   ownedKeys(userId: string): string[] {
-    return (
-      this.db.prepare("SELECT title_key FROM titles WHERE user_id = ?").all(userId) as Array<{ title_key: string }>
-    ).map((r) => r.title_key);
+    return [...this.ownedMap(userId).keys()];
   }
 
   /** 獲得済み称号（獲得順）。ルール定義にないキーは無視 */
   list(userId: string): GrantedTitle[] {
-    const rows = this.db
-      .prepare("SELECT title_key, granted_at FROM titles WHERE user_id = ? ORDER BY granted_at, title_key")
-      .all(userId) as Array<{ title_key: string; granted_at: number }>;
-    return rows.flatMap((r) => {
-      const rule = this.ruleMap.get(r.title_key);
-      return rule ? [toGranted(rule, r.granted_at)] : [];
-    });
+    return [...this.ownedMap(userId).entries()]
+      .flatMap(([key, grantedAt]) => {
+        const rule = this.ruleMap.get(key);
+        return rule ? [toGranted(rule, grantedAt)] : [];
+      })
+      .sort((a, b) => a.granted_at - b.granted_at || a.key.localeCompare(b.key));
   }
 
   /** 収集の進捗。分母は現行ルールのみ（廃止称号は含めない） */
   progress(userId: string): { owned: number; total: number; secretOwned: number; secretTotal: number } {
-    const owned = new Set(this.ownedKeys(userId));
+    const owned = this.ownedMap(userId);
     let ownedCount = 0;
     let secretOwned = 0;
     for (const rule of TITLE_RULES) {
@@ -153,32 +198,25 @@ export class TitleEngine {
   /**
    * カードに掲げる称号。未設定なら「獲得が新しい順」で自動的に埋める
    * （何も装備していない人のカードが空にならないように）。
+   *
+   * 秘匿対象の機能は称号自体を作らない方針なので、自動装備で意図せず
+   * 露出する称号は存在しない（titles/privacy.ts）。
    */
   equipped(userId: string): GrantedTitle[] {
+    const owned = this.ownedMap(userId);
     const rows = this.db
       .prepare("SELECT title_key FROM title_equips WHERE user_id = ? ORDER BY slot")
       .all(userId) as Array<{ title_key: string }>;
 
-    if (rows.length > 0) {
-      const ownedKeys = new Set(this.ownedKeys(userId));
-      const picked = rows
-        .filter((r) => ownedKeys.has(r.title_key))
-        .flatMap((r) => {
-          const rule = this.ruleMap.get(r.title_key);
-          return rule ? [rule] : [];
-        });
-      if (picked.length > 0) {
-        const grantedAt = new Map(
-          (
-            this.db.prepare("SELECT title_key, granted_at FROM titles WHERE user_id = ?").all(userId) as Array<{
-              title_key: string;
-              granted_at: number;
-            }>
-          ).map((r) => [r.title_key, r.granted_at]),
-        );
-        return picked.map((rule) => toGranted(rule, grantedAt.get(rule.key) ?? 0));
-      }
+    const picked: GrantedTitle[] = [];
+    for (const r of rows) {
+      const key = this.resolveKey(r.title_key);
+      const grantedAt = owned.get(key);
+      const rule = this.ruleMap.get(key);
+      if (grantedAt === undefined || !rule) continue; // 失効・未知キーは黙って落とす
+      picked.push(toGranted(rule, grantedAt));
     }
+    if (picked.length > 0) return picked.slice(0, EQUIP_SLOTS);
 
     return this.list(userId).slice(-EQUIP_SLOTS).reverse();
   }
@@ -189,9 +227,10 @@ export class TitleEngine {
    */
   equip(userId: string, keys: string[]): { ok: true } | { ok: false; reason: string } {
     if (keys.length > EQUIP_SLOTS) return { ok: false, reason: `掲げられるのは${EQUIP_SLOTS}つまで` };
-    const unique = [...new Set(keys)];
-    if (unique.length !== keys.length) return { ok: false, reason: "同じ称号は一度しか掲げられない" };
-    const owned = new Set(this.ownedKeys(userId));
+    const resolved = keys.map((k) => this.resolveKey(k));
+    const unique = [...new Set(resolved)];
+    if (unique.length !== resolved.length) return { ok: false, reason: "同じ称号は一度しか掲げられない" };
+    const owned = this.ownedMap(userId);
     for (const k of unique) {
       if (!owned.has(k)) return { ok: false, reason: "持っていない称号は掲げられない" };
     }

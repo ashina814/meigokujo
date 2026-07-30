@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3";
 import { openDb } from "../src/db/bootstrap.js";
 import { VcTracker } from "../src/vc/service.js";
@@ -177,6 +177,91 @@ describe("同席台帳", () => {
     vc.rebuildCompanions();
     vc.rebuildCompanions();
     expect(snapshotPairs(db)).toEqual(first);
+  });
+
+  it("退出処理は原子的（台帳更新が失敗すればセグメントも閉じない）", () => {
+    const { db, vc } = setup();
+    const t0 = Math.floor(Date.now() / 1000) - 10_000;
+    db.prepare("INSERT INTO vc_segments (user_id, channel_id, started_at) VALUES ('A','vc:1',?)").run(t0);
+    db.prepare("INSERT INTO vc_segments (user_id, channel_id, started_at) VALUES ('B','vc:1',?)").run(t0);
+
+    // 台帳への書き込みを壊して異常終了を模す
+    const original = db.prepare.bind(db);
+    const spy = vi.spyOn(db, "prepare").mockImplementation(((sql: string) => {
+      if (sql.includes("INSERT INTO vc_companions")) throw new Error("disk full");
+      return original(sql);
+    }) as typeof db.prepare);
+
+    expect(() => vc.close("A")).toThrow("disk full");
+    spy.mockRestore();
+
+    // セグメントは閉じられていない → 起動時に dangling として復旧できる
+    const open = db.prepare("SELECT COUNT(*) AS n FROM vc_segments WHERE ended_at IS NULL").get() as { n: number };
+    expect(open.n).toBe(2);
+    expect(pairSeconds(db, "A", "B")).toBe(0);
+  });
+
+  it("一括クローズは dirty を立て、再計算が必要と判定される", () => {
+    const { db, vc } = setup();
+    const t0 = Math.floor(Date.now() / 1000) - 10_000;
+    db.prepare("INSERT INTO vc_segments (user_id, channel_id, started_at) VALUES ('A','vc:1',?)").run(t0);
+    db.prepare("INSERT INTO vc_segments (user_id, channel_id, started_at) VALUES ('B','vc:1',?)").run(t0);
+
+    // 先に正常な世代を記録しておく（empty 判定ではなく dirty で拾えることを示す）
+    vc.rebuildCompanions();
+    expect(vc.companionsRebuildReason()).toBeNull();
+
+    expect(vc.closeAllDangling()).toBe(2);
+    expect(vc.companionsRebuildReason()).toBe("dirty");
+
+    vc.rebuildCompanions();
+    expect(vc.companionsRebuildReason()).toBeNull();
+  });
+
+  it("導入直後（世代マーカー未記録）は再計算が必要と判定される", () => {
+    const { db, vc } = setup();
+    const t0 = Math.floor(Date.now() / 1000) - 10_000;
+    db.prepare("INSERT INTO vc_segments (user_id, channel_id, started_at, ended_at) VALUES ('A','vc:1',?,?)").run(
+      t0,
+      t0 + 600,
+    );
+    expect(vc.companionsRebuildReason()).toBe("generation");
+    vc.rebuildCompanions();
+    expect(vc.companionsRebuildReason()).toBeNull();
+  });
+
+  it("同席相手が一人もいなくても、再計算後は再実行を要求しない", () => {
+    // 台帳が空であることを理由にすると、独りで浮上している人しか居ない城では
+    // 毎回の起動で全再計算が走ってしまう（回帰の要点）
+    const { db, vc } = setup();
+    const t0 = Math.floor(Date.now() / 1000) - 10_000;
+    db.prepare("INSERT INTO vc_segments (user_id, channel_id, started_at, ended_at) VALUES ('solo','vc:1',?,?)").run(
+      t0,
+      t0 + 3600,
+    );
+    vc.rebuildCompanions();
+    expect(vc.companionRowCount()).toBe(0);
+    expect(vc.companionsRebuildReason()).toBeNull();
+    expect(vc.companionsRebuildReason()).toBeNull();
+  });
+
+  it("セグメントが1件も無ければ再計算後は不要", () => {
+    const { vc } = setup();
+    vc.rebuildCompanions();
+    expect(vc.companionsRebuildReason()).toBeNull();
+  });
+
+  it("集計世代が上がったら再計算が必要と判定される", () => {
+    const { db, vc } = setup();
+    const t0 = Math.floor(Date.now() / 1000) - 10_000;
+    db.prepare("INSERT INTO vc_segments (user_id, channel_id, started_at, ended_at) VALUES ('A','vc:1',?,?)").run(
+      t0,
+      t0 + 600,
+    );
+    vc.rebuildCompanions();
+    // 旧世代で記録された状態を模す
+    db.prepare("UPDATE settings SET value = '0' WHERE key = 'vc_companions:generation'").run();
+    expect(vc.companionsRebuildReason()).toBe("generation");
   });
 
   it("companionSummary が人数・総時間・最長ペアを返す", () => {

@@ -36,6 +36,18 @@ export { EventLog, type EventRow } from "./events/service.js";
 export { Entry, type BookingRow, type SoulRow, type GhostifyResult, type BookingStatus, type InviterSource } from "./entry/service.js";
 export { VcTracker, type VcSegment, type PresenceSummary } from "./vc/service.js";
 export {
+  coveredDays,
+  crossMidnightCount,
+  daysOverlappingWindow,
+  jstDayIndex,
+  jstDayStart,
+  jstDateString,
+  longestIntervalSeconds,
+  longestStreak,
+  mergeIntervals,
+  type Interval,
+} from "./vc/time.js";
+export {
   RankEngine,
   TEXT_TIERS,
   VOICE_TIERS,
@@ -119,11 +131,14 @@ export {
   SECRET_TITLE_COUNT,
   EQUIP_SLOTS,
   buildSnapshot,
+  SENSITIVE_SOURCES,
+  findSensitiveReference,
   type TitleRule,
   type TitleCategory,
   type TitleSnapshot,
   type GrantedTitle,
 } from "./titles/service.js";
+export { PUBLIC_ROOM_KINDS, type PublicRoomKind } from "./titles/privacy.js";
 export {
   Departments,
   DepartmentError,
