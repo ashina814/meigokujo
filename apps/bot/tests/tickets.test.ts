@@ -5,6 +5,7 @@ import type { TicketPanel, TicketRow } from "@meigokujo/core";
 vi.mock("../src/permissions.js", () => ({ isAdmin: () => false }));
 
 import {
+  handleTicketButton,
   memberHasAnyRole,
   panelIdFromTicketButton,
   panelNotifyRoleIds,
@@ -59,7 +60,10 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
-function makeGuild(roleIds = ["staff_role"], memberSpecs: Array<{ id: string; roles: string[] }> = [{ id: "staff1", roles: ["staff_role"] }]) {
+function makeGuild(
+  roleIds = ["staff_role"],
+  memberSpecs: Array<{ id: string; roles: string[] }> = [{ id: "staff1", roles: ["staff_role"] }],
+) {
   const members = new Map(
     memberSpecs.map((m) => [
       m.id,
@@ -85,10 +89,12 @@ function makeOpenTicketHarness(options: {
   deferReply?: () => Promise<void>;
   addMember?: (memberId: string) => Promise<void>;
   sendMessage?: () => Promise<void>;
+  createTicket?: () => TicketRow;
 } = {}) {
   const p = options.panel ?? panel({ staffRoleIds: ["staff_role"] });
   const thread = {
     id: "thread1",
+    name: "🔴未対応｜異議申立-user1",
     members: {
       add: vi.fn(options.addMember ?? (async () => undefined)),
     },
@@ -96,6 +102,8 @@ function makeOpenTicketHarness(options: {
     delete: vi.fn(async () => undefined),
     setLocked: vi.fn(async () => undefined),
     setArchived: vi.fn(async () => undefined),
+    setName: vi.fn(async () => undefined),
+    isThread: () => true,
     toString: () => "<#thread1>",
   };
   const channel = {
@@ -108,7 +116,7 @@ function makeOpenTicketHarness(options: {
     tickets: {
       getPanel: vi.fn(() => p),
       openByUserPanel: vi.fn(options.openByUserPanel ?? (() => undefined)),
-      create: vi.fn(() => ticket({ thread_id: thread.id, panel_id: p.id, panel_name: p.name })),
+      create: vi.fn(options.createTicket ?? (() => ticket({ thread_id: thread.id, panel_id: p.id, panel_name: p.name }))),
       rollbackCreate: vi.fn(() => ticket({ thread_id: thread.id, panel_id: p.id, panel_name: p.name })),
     },
   };
@@ -129,6 +137,68 @@ function makeOpenTicketHarness(options: {
     editReply: vi.fn(async () => undefined),
   };
   return { interaction, services, channel, thread };
+}
+
+function makeTicketButtonHarness(options: {
+  customId?: string;
+  currentTicket?: TicketRow;
+  claimedTicket?: TicketRow;
+  closedTicket?: TicketRow;
+} = {}) {
+  const currentTicket =
+    options.currentTicket ??
+    ticket({ panel_staff_role_ids_json: JSON.stringify(["staff_role"]) });
+  const claimedTicket =
+    options.claimedTicket ??
+    ticket({
+      status: "claimed",
+      claimed_by: "user:staff1",
+      panel_staff_role_ids_json: JSON.stringify(["staff_role"]),
+    });
+  const closedTicket =
+    options.closedTicket ??
+    ticket({
+      status: "closed",
+      claimed_by: "user:staff1",
+      panel_staff_role_ids_json: JSON.stringify(["staff_role"]),
+    });
+  const controlMessage = {
+    id: "control1",
+    content: "📮 **異議申立** — <@user1>\n異議申立はこちら。\n\n🔴 **対応状況:** 未対応",
+    edit: vi.fn(async () => undefined),
+  };
+  const thread = {
+    id: "thread1",
+    name: "🔴未対応｜異議申立-user1",
+    isThread: () => true,
+    setName: vi.fn(async () => undefined),
+    setLocked: vi.fn(async () => undefined),
+    setArchived: vi.fn(async () => undefined),
+    messages: { fetch: vi.fn(async () => controlMessage) },
+  };
+  const services = {
+    settings: { getString: vi.fn(() => undefined) },
+    tickets: {
+      getPanel: vi.fn(() => panel({ staffRoleIds: ["staff_role"] })),
+      get: vi.fn(() => currentTicket),
+      claim: vi.fn(() => claimedTicket),
+      close: vi.fn(() => closedTicket),
+    },
+  };
+  const interaction: any = {
+    customId: options.customId ?? "ticket:claim",
+    channelId: "thread1",
+    channel: thread,
+    user: { id: "staff1", username: "staff1", globalName: null },
+    member: {
+      displayName: "橋本",
+      roles: { cache: { has: (roleId: string) => roleId === "staff_role" } },
+    },
+    message: { id: "control1", content: controlMessage.content },
+    reply: vi.fn(async () => undefined),
+    update: vi.fn(async () => undefined),
+  };
+  return { interaction, services, thread, controlMessage };
 }
 
 describe("汎用チケット受付パネル", () => {
@@ -195,6 +265,18 @@ describe("汎用チケット受付パネル", () => {
     expect(first.services.tickets.create).toHaveBeenCalledTimes(1);
   });
 
+  it("新規チケットを未対応表示で作成する", async () => {
+    const h = makeOpenTicketHarness();
+    await openTicket(h.interaction as any, h.services as any, "appeal");
+
+    expect(h.channel.threads.create).toHaveBeenCalledWith(
+      expect.objectContaining({ name: expect.stringContaining("未対応") }),
+    );
+    expect(h.thread.send).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("🔴 **対応状況:** 未対応") }),
+    );
+  });
+
   it("申請者本人しか担当ロールにいない場合はチケットを作成しない", async () => {
     const h = makeOpenTicketHarness();
     h.interaction.guild = makeGuild(["staff_role"], [{ id: "user1", roles: ["staff_role"] }]) as any;
@@ -252,5 +334,110 @@ describe("汎用チケット受付パネル", () => {
     expect(h.services.tickets.rollbackCreate).toHaveBeenCalledWith("thread1", "user:user1", "ticket initialization failed");
     expect(h.thread.delete).toHaveBeenCalled();
     expect(h.interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("作成されていません") }));
+  });
+
+  it("DB競合で作成に負けた場合は失敗扱いせず、既存チケットへ案内する", async () => {
+    const raced = ticket({ thread_id: "thread-other", panel_name: "異議申立" });
+    let lookupCount = 0;
+    const h = makeOpenTicketHarness({
+      openByUserPanel: () => {
+        lookupCount += 1;
+        return lookupCount >= 3 ? raced : undefined;
+      },
+      createTicket: () => {
+        throw new Error("UNIQUE constraint failed: tickets.user_id, tickets.panel_id");
+      },
+    });
+
+    await openTicket(h.interaction as any, h.services as any, "appeal");
+
+    expect(h.thread.delete).toHaveBeenCalled();
+    expect(h.interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringMatching(/受付は既に完了.*<#thread-other>/) }),
+    );
+  });
+});
+
+describe("チケット対応UI", () => {
+  it("最初の担当者だけを登録し、ボタン・表示・スレッド名を対応中へ更新する", async () => {
+    const h = makeTicketButtonHarness();
+
+    await handleTicketButton(h.interaction as any, h.services as any);
+
+    expect(h.services.tickets.claim).toHaveBeenCalledWith("thread1", "user:staff1");
+    const payload = h.interaction.update.mock.calls[0]![0];
+    expect(payload.content).toContain("<@staff1> が対応中");
+    const row = payload.components[0].toJSON() as {
+      components: Array<{ label: string; disabled: boolean }>;
+    };
+    expect(row.components[0]).toMatchObject({ label: "対応済み", disabled: true });
+    expect(h.thread.setName).toHaveBeenCalledWith(expect.stringContaining("橋本対応中"), "チケット対応開始");
+  });
+
+  it("既に担当者がいる場合は上書きせず、現在の担当者を案内する", async () => {
+    const h = makeTicketButtonHarness({
+      currentTicket: ticket({
+        status: "claimed",
+        claimed_by: "user:staff2",
+        panel_staff_role_ids_json: JSON.stringify(["staff_role"]),
+      }),
+    });
+
+    await handleTicketButton(h.interaction as any, h.services as any);
+
+    expect(h.services.tickets.claim).not.toHaveBeenCalled();
+    expect(h.interaction.reply).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("<@staff2> が対応中") }),
+    );
+    expect(h.interaction.update).not.toHaveBeenCalled();
+  });
+
+  it("クローズは即実行せず、本人だけに確認ボタンを表示する", async () => {
+    const h = makeTicketButtonHarness({ customId: "ticket:close" });
+
+    await handleTicketButton(h.interaction as any, h.services as any);
+
+    expect(h.services.tickets.close).not.toHaveBeenCalled();
+    const payload = h.interaction.reply.mock.calls[0]![0];
+    expect(payload.content).toContain("クローズしますか");
+    const row = payload.components[0].toJSON() as { components: Array<{ custom_id: string }> };
+    expect(row.components.map((component) => component.custom_id)).toEqual([
+      "ticket:close-confirm:control1",
+      "ticket:close-cancel",
+    ]);
+  });
+
+  it("確認後に受付メッセージとスレッド名を完了へ更新してからロックする", async () => {
+    const h = makeTicketButtonHarness({
+      customId: "ticket:close-confirm:control1",
+      currentTicket: ticket({
+        status: "claimed",
+        claimed_by: "user:staff1",
+        panel_staff_role_ids_json: JSON.stringify(["staff_role"]),
+      }),
+    });
+
+    await handleTicketButton(h.interaction as any, h.services as any);
+
+    expect(h.services.tickets.close).toHaveBeenCalledWith("thread1", "user:staff1");
+    expect(h.thread.messages.fetch).toHaveBeenCalledWith("control1");
+    expect(h.controlMessage.edit).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("がクローズ") }),
+    );
+    expect(h.thread.setName).toHaveBeenCalledWith(expect.stringContaining("完了"), "チケット完了");
+    expect(h.interaction.update).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("クローズしました"), components: [] }),
+    );
+    expect(h.thread.setLocked).toHaveBeenCalledWith(true);
+    expect(h.thread.setArchived).toHaveBeenCalledWith(true);
+  });
+
+  it("クローズ確認をキャンセルできる", async () => {
+    const h = makeTicketButtonHarness({ customId: "ticket:close-cancel" });
+
+    await handleTicketButton(h.interaction as any, h.services as any);
+
+    expect(h.services.tickets.close).not.toHaveBeenCalled();
+    expect(h.interaction.update).toHaveBeenCalledWith({ content: "クローズをキャンセルしました。", components: [] });
   });
 });
