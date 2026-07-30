@@ -12,7 +12,6 @@ import {
   Settings,
   Rooms,
   Tickets,
-  ensureTicketOpenUniqueness,
   Confessions,
   TitleEngine,
   VcRewards,
@@ -60,11 +59,8 @@ export function buildServices() {
   const entry = new Entry(db, ledger, settings, events);
   const vc = new VcTracker(db);
   const tickets = new Tickets(db, events);
-  // 同じ利用者・同じ受付パネルでは未完了チケットを1件だけにする。
-  // 旧式チケット行は削除するが、受付パネル設定は保持する。
-  const ticketMigration = ensureTicketOpenUniqueness(db);
-  if (ticketMigration.deletedLegacyTickets > 0) {
-    console.warn(`[ticket] 旧式チケットを ${ticketMigration.deletedLegacyTickets} 件削除しました（受付パネル設定は保持）`);
+  if (tickets.migrationResult.deletedLegacyTickets > 0) {
+    console.warn(`[ticket] 旧式チケットを ${tickets.migrationResult.deletedLegacyTickets} 件削除しました（受付パネル設定は保持）`);
   }
   const confessions = new Confessions(db, events);
   const evaluation = new Evaluation(db, settings, events);
