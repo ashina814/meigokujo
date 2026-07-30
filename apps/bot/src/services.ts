@@ -12,6 +12,7 @@ import {
   Settings,
   Rooms,
   Tickets,
+  ensureTicketOpenUniqueness,
   Confessions,
   TitleEngine,
   VcRewards,
@@ -35,7 +36,6 @@ import {
 import { config } from "./config.js";
 import { meetsRoleRequirement } from "./rank-requirement.js";
 import { seedSpecialProfiles } from "./special-profile.js";
-import { ensureTicketOpenUniqueness } from "./ticket-open-uniqueness.js";
 
 /**
  * コアサービスの組み立て。アプリ層は薄く、ロジックは全て core 側（システム設計.md の原則）。
