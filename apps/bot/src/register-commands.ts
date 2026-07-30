@@ -23,9 +23,13 @@ import { vipCommand } from "./commands/vip.js";
 import { nagareboshiCommand } from "./commands/nagareboshi.js";
 import { itaCommand } from "./commands/ita.js";
 
+// /管理 はBot内部で OWNER_ID / 管理コマンド利用ロールを検証する。
+// Discord側のManageGuild制限を外し、設定したロール保持者にもコマンドを表示する。
+const adminCommandJson = { ...adminCommand.toJSON(), default_member_permissions: null };
+
 const commands = [
-  // 運営（ManageGuildで一般には非表示。全部ここに畳んだ）
-  adminCommand.toJSON(),
+  // 運営（Bot内のロールゲート）
+  adminCommandJson,
   shokanCommand.toJSON(),
   // スタッフ（役職ゲート）
   sessionCommand.toJSON(),
