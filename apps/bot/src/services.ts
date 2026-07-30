@@ -35,6 +35,7 @@ import {
 import { config } from "./config.js";
 import { meetsRoleRequirement } from "./rank-requirement.js";
 import { seedSpecialProfiles } from "./special-profile.js";
+import { ensureTicketOpenUniqueness } from "./ticket-open-uniqueness.js";
 
 /**
  * コアサービスの組み立て。アプリ層は薄く、ロジックは全て core 側（システム設計.md の原則）。
@@ -59,6 +60,9 @@ export function buildServices() {
   const entry = new Entry(db, ledger, settings, events);
   const vc = new VcTracker(db);
   const tickets = new Tickets(db, events);
+  // 同じ利用者・同じ受付パネルでは未完了チケットを1件だけにする。
+  // Tickets構築後に実行し、旧DBへpanel_id列を追加した後で部分ユニーク索引を作る。
+  ensureTicketOpenUniqueness(db);
   const confessions = new Confessions(db, events);
   const evaluation = new Evaluation(db, settings, events);
   const vcRewards = new VcRewards(db, settings);
