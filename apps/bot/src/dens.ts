@@ -5,7 +5,7 @@ import type { Services } from "./services.js";
  * 冥獣の巣（評価VC）。トリガーVCに入ると複製VCを建てて中へ移す。
  * - 巣穴大: 全員・報酬対象
  * - 巣穴中/小: 魔剣士・審のみ・報酬対象
- * - 応接室: 魔剣士・審のみ・2人まで・報酬対象外（ツーショ評価）
+ * - 応接室: 魔剣士・審のみ・3人まで・報酬対象外
  * 複製VC（報酬対象のもの）は生成時に vc_whitelist_den へ自動登録するので、動的に生まれた
  * 巣穴でも VC浮上報酬(Land)が付く。空になったら自動撤収、報酬登録は2日後に掃除。
  */
@@ -20,7 +20,7 @@ const DENS: Record<string, DenSpec> = {
   large: { settingKey: "vc:den_large", name: "巣穴大", evaluatorOnly: false, reward: true },
   medium: { settingKey: "vc:den_medium", name: "巣穴中", evaluatorOnly: true, reward: true },
   small: { settingKey: "vc:den_small", name: "巣穴小", evaluatorOnly: true, reward: true },
-  reception: { settingKey: "vc:den_reception", name: "応接室", evaluatorOnly: true, reward: false, userLimit: 2 },
+  reception: { settingKey: "vc:den_reception", name: "応接室", evaluatorOnly: true, reward: false, userLimit: 3 },
 };
 
 const DEN_GRACE_S = 0; // 猶予なし: 無人になったら次のスキャンで即撤収
@@ -60,9 +60,9 @@ export async function handleDenVoice(oldState: VoiceState, newState: VoiceState,
   const guild = newState.guild;
   const catId = services.settings.getString("category:eval_den");
   const parent = catId ? await guild.channels.fetch(catId).catch(() => null) : null;
-  // 定員は親元（トリガー）VCの人数制限を反映（未設定なら spec の既定＝応接室2人など）
+  // 応接室など spec に定員があるものはその値を優先し、それ以外はトリガーVCの人数制限を反映する。
   const trigger = newState.channel;
-  const userLimit = trigger?.userLimit || spec.userLimit;
+  const userLimit = spec.userLimit ?? trigger?.userLimit;
   const clone = await guild.channels
     .create({
       name: spec.name,
