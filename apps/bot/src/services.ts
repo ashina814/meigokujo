@@ -28,6 +28,7 @@ import {
   Markets,
   Takutate,
   Escrow,
+  closeActiveTicket,
   defaultRng,
   openDb,
   registerDefaultTxTypes,
@@ -59,6 +60,8 @@ export function buildServices() {
   const entry = new Entry(db, ledger, settings, events);
   const vc = new VcTracker(db);
   const tickets = new Tickets(db, events);
+  // 古い確認画面が複数残っていても、未完了→完了の遷移と完了ログは最初の1回だけにする。
+  tickets.close = (threadId, staffId) => closeActiveTicket(db, events, threadId, staffId);
   if (tickets.migrationResult.deletedLegacyTickets > 0) {
     console.warn(`[ticket] 旧式チケットを ${tickets.migrationResult.deletedLegacyTickets} 件削除しました（受付パネル設定は保持）`);
   }
