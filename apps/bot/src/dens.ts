@@ -60,9 +60,9 @@ export async function handleDenVoice(oldState: VoiceState, newState: VoiceState,
   const guild = newState.guild;
   const catId = services.settings.getString("category:eval_den");
   const parent = catId ? await guild.channels.fetch(catId).catch(() => null) : null;
-  // 定員は親元（トリガー）VCの人数制限を反映（未設定なら spec の既定＝応接室3人など）
+  // 応接室など spec に定員があるものはその値を優先し、それ以外はトリガーVCの人数制限を反映する。
   const trigger = newState.channel;
-  const userLimit = trigger?.userLimit || spec.userLimit;
+  const userLimit = spec.userLimit ?? trigger?.userLimit;
   const clone = await guild.channels
     .create({
       name: spec.name,
