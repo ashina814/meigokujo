@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
-import type { TicketRow } from "./service.js";
+import { Tickets as BaseTickets, type TicketRow } from "./service.js";
 
 /**
  * 未完了チケットを最初の1回だけクローズする。
@@ -34,4 +34,21 @@ export function closeActiveTicket(
   });
 
   return close();
+}
+
+/**
+ * 公開API用のチケットサービス。
+ * close() 自体が原子的なので、Bot以外の利用経路でも二重クローズを起こさない。
+ */
+export class Tickets extends BaseTickets {
+  constructor(
+    private readonly closeDb: Database.Database,
+    private readonly closeEvents: EventLog,
+  ) {
+    super(closeDb, closeEvents);
+  }
+
+  override close(threadId: string, staffId: string): TicketRow | undefined {
+    return closeActiveTicket(this.closeDb, this.closeEvents, threadId, staffId);
+  }
 }
