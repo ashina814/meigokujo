@@ -88,7 +88,15 @@ export interface TitleSnapshot {
   distinctTipTargets: number;
   shopPurchases: number;
   raceBets: number;
-  /** 既に獲得している称号の数（同一 evaluate 内の増分は次回に持ち越す） */
+  /**
+   * 既に獲得している称号の数。
+   *
+   * titles テーブルの行数ではない。旧キー移行で旧行と新行が並存するため
+   * 単純な COUNT(*) では同じ称号が二重に数えられる。
+   * 「旧新キーを解決して重複排除し、現行カタログに存在するものだけ」を数えた値を
+   * TitleEngine から渡す（progress().owned と同じ定義）。
+   * 同一 evaluate 内の増分は反映されない（次回の評価で追いつく）。
+   */
   ownedTitles: number;
 }
 
@@ -170,8 +178,19 @@ export function deriveVc(
   };
 }
 
-/** 1人分のスナップショットを構築する。DBに当たるのはこの関数の中だけ */
-export function buildSnapshot(db: Database.Database, vc: VcTracker, userId: string): TitleSnapshot {
+/**
+ * 1人分のスナップショットを構築する。DBに当たるのはこの関数の中だけ。
+ *
+ * @param opts.ownedTitles 既に獲得している称号の数。旧キー解決と重複排除が要るため
+ *   ここでは数えず、TitleEngine から受け取る（TitleSnapshot.ownedTitles のコメント参照）。
+ *   直接呼ぶ場合に省略すると「称号をN個集めた」系の判定だけが未達扱いになる。
+ */
+export function buildSnapshot(
+  db: Database.Database,
+  vc: VcTracker,
+  userId: string,
+  opts: { ownedTitles?: number } = {},
+): TitleSnapshot {
   const ts = now();
   const account = `user:${userId}`;
 
@@ -288,8 +307,6 @@ export function buildSnapshot(db: Database.Database, vc: VcTracker, userId: stri
     userId,
   ]);
 
-  const ownedRow = db.prepare("SELECT COUNT(*) AS n FROM titles WHERE user_id = ?").get(userId) as { n: number };
-
   // 動的生成VC（宿・特殊部屋・賭場の卓・巣穴）の channel_id 集合。
   // 常設VCの探索と区別するために使う。テーブルが無い環境では空集合。
   //
@@ -331,7 +348,7 @@ export function buildSnapshot(db: Database.Database, vc: VcTracker, userId: stri
     distinctTipTargets: tipTargetRow?.n ?? 0,
     shopPurchases: shopRow?.n ?? 0,
     raceBets: raceRow?.n ?? 0,
-    ownedTitles: ownedRow.n,
+    ownedTitles: opts.ownedTitles ?? 0,
   };
 }
 

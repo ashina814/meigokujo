@@ -3,7 +3,12 @@ import type Database from "better-sqlite3";
 import { openDb } from "../src/db/bootstrap.js";
 import { EventLog } from "../src/events/service.js";
 import { VcTracker } from "../src/vc/service.js";
-import { TitleEngine, EQUIP_SLOTS } from "../src/titles/service.js";
+import {
+  TitleEngine,
+  EQUIP_SLOTS,
+  DISPLAYABLE_RULES,
+  NON_PUBLIC_TITLE_KEYS,
+} from "../src/titles/service.js";
 import { TITLE_RULES } from "../src/titles/catalog.js";
 import { SENSITIVE_SOURCES, findSensitiveReference } from "../src/titles/privacy.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
@@ -75,8 +80,27 @@ describe("秘匿機能の構造的な排除", () => {
 
   it("秘匿対象の一覧が縮んでいない（うっかり削除の検知）", () => {
     expect([...SENSITIVE_SOURCES]).toEqual(
-      expect.arrayContaining(["confession", "toto", "ticket", "mitsugetsu", "oborozuki", "recruit"]),
+      expect.arrayContaining([
+        "confession",
+        "toto",
+        "ticket",
+        "mitsugetsu",
+        "oborozuki",
+        "recruits",
+        "recruit_matched",
+      ]),
     );
+  });
+
+  it("招待系の称号を秘匿語の誤一致で巻き込まない", () => {
+    // `recruiter_1`（勧誘者＝城への招待）は秘匿対象ではない。
+    // 秘匿語を `recruit` のような短い語で持つと誤検知する
+    expect(findSensitiveReference("recruiter_1")).toBeNull();
+    expect(findSensitiveReference("recruiter_5")).toBeNull();
+    expect(findSensitiveReference("invitesDirect()")).toBeNull();
+    // 一方で蜜月の実体を指す識別子は捕まる
+    expect(findSensitiveReference('asActor("recruit_matched")')).toBe("recruit_matched");
+    expect(findSensitiveReference("SELECT * FROM recruits")).toBe("recruits");
   });
 
   it("蜜月・朧月の部屋は部屋の実績に数えない", () => {
@@ -98,6 +122,95 @@ describe("秘匿機能の構造的な排除", () => {
     events.log("recruit_matched", { actor: "u1" });
     events.log("oborozuki_invite_accepted", { actor: "u1" });
     expect(titles.evaluate("u1")).toEqual([]);
+  });
+
+  it("表示できるルール（現行＋廃止）にも秘匿対象の痕跡がない", () => {
+    // 廃止称号として復活させる形で公開面に戻ってしまう事故を防ぐ。
+    // 判定式だけでなくキー・名前・説明も見る（旧「月下氷人」は語彙に mitsugetsu を含まない）
+    for (const r of DISPLAYABLE_RULES) {
+      for (const [label, text] of [
+        ["key", r.key],
+        ["name", r.name],
+        ["desc", r.desc],
+        ["check", r.check.toString()],
+      ] as const) {
+        expect(findSensitiveReference(text), `${r.key} の ${label} が秘匿機能に触れている`).toBeNull();
+      }
+    }
+    // 蜜月由来の名前そのものも表示ルールに存在しない
+    expect(DISPLAYABLE_RULES.map((r) => r.name)).not.toContain("月下氷人");
+  });
+});
+
+describe("旧『月下氷人』の非公開化", () => {
+  /** 旧コードで蜜月成立の称号を得ていた人の状態 */
+  function withMatchmaker() {
+    const db = openDb(":memory:");
+    db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1','matchmaker',100)").run();
+    // 他の称号も持たせて「一覧が空だから出ない」だけではないことを示す
+    db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1','newborn',50)").run();
+    const titles = new TitleEngine(db, new VcTracker(db));
+    return { db, titles };
+  }
+
+  it("旧行はDBに残る（旧コードへのロールバック耐性）", () => {
+    const { db } = withMatchmaker();
+    const rows = db
+      .prepare("SELECT title_key FROM titles WHERE user_id = 'u1'")
+      .all() as Array<{ title_key: string }>;
+    expect(rows.map((r) => r.title_key)).toContain("matchmaker");
+  });
+
+  it("移行先を作らない（表示用の廃止称号へ写さない）", () => {
+    const { db } = withMatchmaker();
+    const rows = db
+      .prepare("SELECT title_key FROM titles WHERE user_id = 'u1'")
+      .all() as Array<{ title_key: string }>;
+    expect(rows.map((r) => r.title_key)).not.toContain("mitsugetsu_retired");
+    expect(db.prepare("SELECT COUNT(*) AS n FROM title_key_migrations").get()).toEqual({ n: 0 });
+  });
+
+  it("list に現れない", () => {
+    const { titles } = withMatchmaker();
+    const keys = titles.list("u1").map((t) => t.key);
+    expect(keys).not.toContain("matchmaker");
+    expect(keys).not.toContain("mitsugetsu_retired");
+    expect(titles.list("u1").map((t) => t.name)).not.toContain("月下氷人");
+    expect(keys).toEqual(["newborn"]); // 他の称号は普通に見える
+  });
+
+  it("ownedKeys に現れない", () => {
+    const { titles } = withMatchmaker();
+    expect(titles.ownedKeys("u1")).toEqual(["newborn"]);
+  });
+
+  it("自動装備に選ばれない", () => {
+    const { titles } = withMatchmaker();
+    // matchmaker の granted_at(100) は newborn(50) より新しいので、
+    // 非公開でなければ自動装備の先頭に来てしまう位置関係にしてある
+    const equipped = titles.equipped("u1");
+    expect(equipped.map((t) => t.key)).toEqual(["newborn"]);
+    expect(equipped.map((t) => t.name)).not.toContain("月下氷人");
+  });
+
+  it("明示的にも装備できない", () => {
+    const { titles } = withMatchmaker();
+    expect(titles.equip("u1", ["matchmaker"]).ok).toBe(false);
+    expect(titles.equip("u1", ["mitsugetsu_retired"]).ok).toBe(false);
+    expect(titles.equipped("u1").map((t) => t.name)).not.toContain("月下氷人");
+  });
+
+  it("収集数に数えない", () => {
+    const { titles } = withMatchmaker();
+    expect(titles.progress("u1").owned).toBe(1); // newborn のみ
+  });
+
+  it("非公開キーは表示ルールとして定義されていない", () => {
+    const displayable = new Set(DISPLAYABLE_RULES.map((r) => r.key));
+    for (const key of NON_PUBLIC_TITLE_KEYS) {
+      expect(displayable.has(key), `${key} が表示ルールに存在する`).toBe(false);
+    }
+    expect([...NON_PUBLIC_TITLE_KEYS]).toEqual(expect.arrayContaining(["matchmaker", "mitsugetsu_retired"]));
   });
 });
 
@@ -401,7 +514,8 @@ describe("称号機関", () => {
 });
 
 describe("旧称号キーの引き継ぎ（ロールバック耐性）", () => {
-  const LEGACY = ["recruiter", "recruiter_gold", "matchmaker", "innkeeper", "veteran", "elder"];
+  // matchmaker は移行先を持たない（秘匿対象のため非公開）。別 describe で検証する
+  const LEGACY = ["recruiter", "recruiter_gold", "innkeeper", "veteran", "elder"];
 
   function withLegacy(keys: string[] = LEGACY) {
     const db = openDb(":memory:");
@@ -490,13 +604,118 @@ describe("旧称号キーの引き継ぎ（ロールバック耐性）", () => {
     expect(TITLE_RULES.map((r) => r.key)).not.toContain("nightwalker");
   });
 
-  it("旧『月下氷人』は廃止称号として記録だけ残る（蜜月は秘匿対象）", () => {
-    const db = withLegacy(["matchmaker"]);
+});
+
+describe("収集称号の所持数（旧キー移行による水増しの防止）", () => {
+  /**
+   * titles テーブルの COUNT(*) を使うと、非破壊移行で並存する旧行＋新行が
+   * 二重に数えられ、titles_25 / titles_50 / titles_80 が本来より早く解除される。
+   * 称号は一度付くと残るので、投入前に潰しておく必要がある。
+   */
+
+  /** 現行カタログのキーを n 個ぶん付与する */
+  function grantCurrent(db: Database.Database, n: number, from = 0) {
+    const keys = TITLE_RULES.slice(from, from + n).map((r) => r.key);
+    keys.forEach((key, i) => {
+      db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1', ?, ?)").run(key, 1000 + i);
+    });
+    return keys;
+  }
+
+  it("旧キーを移行しても旧行＋新行の二重計上が起きない", () => {
+    const db = openDb(":memory:");
+    // 旧キー5件だけを持つ状態。移行後は titles の行数が10になる
+    for (const [i, key] of ["recruiter", "recruiter_gold", "innkeeper", "veteran", "elder"].entries()) {
+      db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1', ?, ?)").run(key, 100 + i);
+    }
     const titles = new TitleEngine(db, new VcTracker(db));
-    const keys = titles.list("u1").map((t) => t.key);
-    expect(keys).toEqual(["mitsugetsu_retired"]);
-    expect(titles.progress("u1").owned).toBe(0);
-    expect(TITLE_RULES.map((r) => r.key)).not.toContain("mitsugetsu_retired");
+
+    const rawRows = (db.prepare("SELECT COUNT(*) AS n FROM titles WHERE user_id='u1'").get() as { n: number }).n;
+    expect(rawRows).toBe(10); // 旧5行 + 新5行
+
+    // 所持数は解決・重複排除後の5件
+    expect(titles.progress("u1").owned).toBe(5);
+    expect(titles.ownedKeys("u1")).toHaveLength(5);
+    expect(titles.list("u1")).toHaveLength(5);
+  });
+
+  it("新旧両方を持っていても1称号として数える", () => {
+    const db = openDb(":memory:");
+    db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1','veteran',100)").run();
+    db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1','dan_days_2',200)").run();
+    const titles = new TitleEngine(db, new VcTracker(db));
+    expect(titles.progress("u1").owned).toBe(1);
+    expect(titles.ownedKeys("u1")).toEqual(["dan_days_2"]);
+  });
+
+  it("廃止称号・非公開キーは収集数に含めない（定義の固定）", () => {
+    const db = openDb(":memory:");
+    db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1','nightwalker',100)").run();
+    db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1','matchmaker',101)").run();
+    db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1','gone_forever',102)").run();
+    db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1','newborn',103)").run();
+    const titles = new TitleEngine(db, new VcTracker(db));
+
+    // 収集数は「現行カタログに存在するもの」だけ = newborn のみ
+    expect(titles.progress("u1").owned).toBe(1);
+    // 廃止称号は一覧には残る（記録として）が、数には入らない
+    expect(titles.list("u1").map((t) => t.key)).toEqual(expect.arrayContaining(["nightwalker", "newborn"]));
+    expect(titles.progress("u1").total).toBe(TITLE_RULES.length);
+  });
+
+  it("移行によって収集称号が早期解除されない", () => {
+    const db = openDb(":memory:");
+    // 現行キーで24個 + 旧キー5個（移行で新キー5個が増える）
+    grantCurrent(db, 24);
+    for (const [i, key] of ["recruiter", "recruiter_gold", "innkeeper", "veteran", "elder"].entries()) {
+      db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1', ?, ?)").run(key, 100 + i);
+    }
+    const titles = new TitleEngine(db, new VcTracker(db));
+
+    // 行数だけ見ると 24 + 5 + 5 = 34 で 25 を超えるが、実所持は重複排除して 29 未満か確認
+    const rawRows = (db.prepare("SELECT COUNT(*) AS n FROM titles WHERE user_id='u1'").get() as { n: number }).n;
+    expect(rawRows).toBeGreaterThan(25);
+
+    const owned = titles.progress("u1").owned;
+    expect(owned).toBeLessThan(rawRows); // 水増しされていない
+    // titles_25 は実所持が25以上になったときにだけ付く
+    const granted = titles.evaluate("u1").map((t) => t.key);
+    if (owned >= 25) expect(granted).toContain("titles_25");
+    else expect(granted).not.toContain("titles_25");
+  });
+
+  it("行数が閾値を超えても、実所持が届いていなければ解除されない", () => {
+    const db = openDb(":memory:");
+    // 現行キー20個 + 旧キー5個 → 行数は 20+5+5 = 30（25超）だが実所持は25
+    grantCurrent(db, 20);
+    for (const [i, key] of ["recruiter", "recruiter_gold", "innkeeper", "veteran", "elder"].entries()) {
+      db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1', ?, ?)").run(key, 100 + i);
+    }
+    const titles = new TitleEngine(db, new VcTracker(db));
+    const rawRows = (db.prepare("SELECT COUNT(*) AS n FROM titles WHERE user_id='u1'").get() as { n: number }).n;
+    expect(rawRows).toBe(30);
+    expect(titles.progress("u1").owned).toBe(25);
+    // ちょうど25なので titles_25 は解除される。titles_50 はされない
+    const granted = titles.evaluate("u1").map((t) => t.key);
+    expect(granted).toContain("titles_25");
+    expect(granted).not.toContain("titles_50");
+  });
+
+  it("収集数の定義が progress().owned と一致する", () => {
+    const db = openDb(":memory:");
+    grantCurrent(db, 30);
+    db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1','veteran',100)").run();
+    db.prepare("INSERT INTO titles (user_id, title_key, granted_at) VALUES ('u1','nightwalker',101)").run();
+    const titles = new TitleEngine(db, new VcTracker(db));
+
+    // evaluate に渡る所持数と progress().owned が同じ定義であることを、
+    // 閾値ちょうどでの解除有無を通して確認する
+    const owned = titles.progress("u1").owned;
+    const granted = titles.evaluate("u1").map((t) => t.key);
+    expect(owned).toBeGreaterThanOrEqual(25);
+    expect(granted).toContain("titles_25");
+    expect(owned).toBeLessThan(50);
+    expect(granted).not.toContain("titles_50");
   });
 });
 

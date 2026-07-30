@@ -44,17 +44,30 @@ export interface GrantedTitle {
 const LEGACY_KEY_MAP: Record<string, string> = {
   recruiter: "recruiter_1",
   recruiter_gold: "recruiter_5",
-  matchmaker: "mitsugetsu_retired",
   innkeeper: "dan_room_2",
   veteran: "dan_days_2",
   elder: "dan_days_3",
 };
 
 /**
+ * 移行先を持たせない旧キー。DBの行は残すが、新コードの公開面には一切出さない。
+ *
+ * `matchmaker`（旧「月下氷人」＝蜜月の縁を結んだ）は秘匿対象（titles/privacy.ts）。
+ * 表示用の廃止称号として移行すると、自動装備や将来の装備UI経由で
+ * 「蜜月を使って成立させた」事実がプロフィールに出てしまう。
+ *
+ * 「DBに行が残ること」と「新コードで公開表示すること」は別物として扱う。
+ *   - 行は残す      → 旧コードへロールバックしたときに旧称号がそのまま見える
+ *   - 移行先を作らない → 新コードでは未知キーになり list / 装備 / カードに出ない
+ * `mitsugetsu_retired` は本ブランチの途中のコミットで一度作った表示用キー。
+ * 同じ理由で公開しないため、こちらも非公開として明示的に列挙しておく。
+ */
+const NON_PUBLIC_LEGACY_KEYS = new Set(["matchmaker", "mitsugetsu_retired"]);
+
+/**
  * 廃止したルール。新規付与はしないが、既に持っている人の一覧には出し続ける。
- *   nightwalker        : 「累計VC時間」はランク（rank_voice）の領分と整理したため称号から外した。
- *   mitsugetsu_retired : 蜜月は秘匿対象（titles/privacy.ts）。旧「月下氷人」の獲得記録だけ残す。
- * いずれも過去に獲得した人の記録を消す理由はないので、表示だけ生かす。
+ *   nightwalker : 「累計VC時間」はランク（rank_voice）の領分と整理したため称号から外した。
+ * 秘匿対象に由来する称号はここに置かない（置くと公開面に戻ってしまう）。
  */
 const RETIRED_RULES: TitleRule[] = [
   {
@@ -65,20 +78,16 @@ const RETIRED_RULES: TitleRule[] = [
     desc: "累計100時間 城に浮上した（廃止された称号）",
     check: () => false,
   },
-  {
-    key: "mitsugetsu_retired",
-    category: "kizuna",
-    name: "月下氷人",
-    emoji: "🌸",
-    desc: "縁を結んだ証（廃止された称号）",
-    check: () => false,
-  },
 ];
 
+/** 表示してよいルールの全体（現行 + 廃止）。公開面に出せるキーの唯一の定義 */
+export const DISPLAYABLE_RULES: TitleRule[] = [...TITLE_RULES, ...RETIRED_RULES];
+
+/** 非公開の旧キー一覧（テストと運用手順の参照用） */
+export const NON_PUBLIC_TITLE_KEYS: readonly string[] = [...NON_PUBLIC_LEGACY_KEYS];
+
 export class TitleEngine {
-  private readonly ruleMap = new Map<string, TitleRule>(
-    [...TITLE_RULES, ...RETIRED_RULES].map((r) => [r.key, r]),
-  );
+  private readonly ruleMap = new Map<string, TitleRule>(DISPLAYABLE_RULES.map((r) => [r.key, r]));
 
   constructor(
     private readonly db: Database.Database,
@@ -125,6 +134,7 @@ export class TitleEngine {
   /**
    * 所持している称号を「解決後のキー → 最古の獲得時刻」で返す。
    * 旧キーと新キーの両方を持っていても1件に潰れる。
+   * 非公開の旧キーはここで落とすので、以降のどの経路にも現れない。
    */
   private ownedMap(userId: string): Map<string, number> {
     const rows = this.db
@@ -132,18 +142,34 @@ export class TitleEngine {
       .all(userId) as Array<{ title_key: string; granted_at: number }>;
     const owned = new Map<string, number>();
     for (const r of rows) {
+      if (NON_PUBLIC_LEGACY_KEYS.has(r.title_key)) continue;
       const key = this.resolveKey(r.title_key);
+      if (NON_PUBLIC_LEGACY_KEYS.has(key)) continue;
       const existing = owned.get(key);
       if (existing === undefined || r.granted_at < existing) owned.set(key, r.granted_at);
     }
     return owned;
   }
 
+  /**
+   * 収集数の唯一の定義: 解決・重複排除した上で、現行カタログに存在するものだけを数える。
+   * titles の COUNT(*) を使うと、旧キー移行で並存する行が二重に数えられ
+   * 「称号をN個集めた」系が本来より早く解除されてしまう。
+   * 廃止称号（nightwalker 等）は分母にも分子にも含めない。
+   */
+  private currentOwnedCount(owned: Map<string, number>): number {
+    let count = 0;
+    for (const rule of TITLE_RULES) if (owned.has(rule.key)) count += 1;
+    return count;
+  }
+
   /** 全ルールを判定し、新規に満たした称号を付与する。付与した新称号を返す */
   evaluate(userId: string): GrantedTitle[] {
-    const snapshot = buildSnapshot(this.db, this.vc, userId);
-    const helper = new TitleHelper(snapshot);
     const owned = this.ownedMap(userId);
+    const snapshot = buildSnapshot(this.db, this.vc, userId, {
+      ownedTitles: this.currentOwnedCount(owned),
+    });
+    const helper = new TitleHelper(snapshot);
     const newlyGranted: GrantedTitle[] = [];
     const ts = now();
     const insert = this.db.prepare(
@@ -180,17 +206,19 @@ export class TitleEngine {
       .sort((a, b) => a.granted_at - b.granted_at || a.key.localeCompare(b.key));
   }
 
-  /** 収集の進捗。分母は現行ルールのみ（廃止称号は含めない） */
+  /** 収集の進捗。分母・分子とも現行ルールのみ（廃止称号は含めない） */
   progress(userId: string): { owned: number; total: number; secretOwned: number; secretTotal: number } {
     const owned = this.ownedMap(userId);
-    let ownedCount = 0;
     let secretOwned = 0;
     for (const rule of TITLE_RULES) {
-      if (!owned.has(rule.key)) continue;
-      ownedCount += 1;
-      if (rule.secret) secretOwned += 1;
+      if (owned.has(rule.key) && rule.secret) secretOwned += 1;
     }
-    return { owned: ownedCount, total: TITLE_RULES.length, secretOwned, secretTotal: SECRET_TITLE_COUNT };
+    return {
+      owned: this.currentOwnedCount(owned),
+      total: TITLE_RULES.length,
+      secretOwned,
+      secretTotal: SECRET_TITLE_COUNT,
+    };
   }
 
   // ── 装備 ────────────────────────────────────────────────
@@ -232,6 +260,9 @@ export class TitleEngine {
     if (unique.length !== resolved.length) return { ok: false, reason: "同じ称号は一度しか掲げられない" };
     const owned = this.ownedMap(userId);
     for (const k of unique) {
+      // 非公開の旧キーは ownedMap から落ちているのでここで弾かれる。
+      // 表示定義を持たないキーも掲げさせない（掲げても描画されず、無言で消えるのを防ぐ）
+      if (!this.ruleMap.has(k)) return { ok: false, reason: "この称号は掲げられない" };
       if (!owned.has(k)) return { ok: false, reason: "持っていない称号は掲げられない" };
     }
 

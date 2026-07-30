@@ -33,11 +33,48 @@ PR #28 で称号のキー体系が変わった。本番投入とロールバッ�
 | `risen` | （変更なし） | |
 | `recruiter` | `recruiter_1` | |
 | `recruiter_gold` | `recruiter_5` | |
-| `matchmaker` | `mitsugetsu_retired` | 蜜月は秘匿対象になったため廃止称号として記録のみ残す |
 | `innkeeper` | `dan_room_2` | 旧「10回以上」を段位Ⅱ（5回）に寄せた |
 | `veteran` | `dan_days_2` | 在城30日 |
 | `elder` | `dan_days_3` | 在城100日 |
-| `nightwalker` | （対応先なし） | 累計VC時間はランクの領分と整理。廃止称号として表示のみ残す |
+| `nightwalker` | （対応先なし・表示は残す） | 累計VC時間はランクの領分と整理。廃止称号として表示のみ生かす |
+| `matchmaker` | **（移行しない・非公開）** | 蜜月は秘匿対象。行は残すが新コードの公開面には一切出さない |
+
+### `matchmaker`（旧「月下氷人」）を移行しない理由
+
+蜜月は匿名の募集・マッチングなので、成立した事実そのものが人間関係の開示になる
+（`packages/core/src/titles/privacy.ts`）。表示用の廃止称号として移行すると、
+**装備未設定時の自動選択や将来の装備UI経由でプロフィールカードに出てしまう。**
+
+そこで「DBに行が残ること」と「新コードで公開表示すること」を分けた。
+
+| | 挙動 |
+| --- | --- |
+| DBの `matchmaker` 行 | **残す**（旧コードへ戻したときに旧称号がそのまま見える） |
+| 新コードの `list()` | 出ない |
+| 自動装備 | 選ばれない |
+| 明示装備 | 拒否される |
+| プロフィールカード | 出ない |
+| 収集数 (`progress().owned`) | 数えない |
+
+実装は `NON_PUBLIC_LEGACY_KEYS`（`titles/service.ts`）。移行先を作らず、
+`ownedMap()` の段階で落とすので以降のどの経路にも現れない。
+`NON_PUBLIC_TITLE_KEYS` としてエクスポートし、
+「表示ルールに存在しないこと」をテストで固定している。
+
+## 収集称号（`titles_25` / `titles_50` / `titles_80`）の所持数の定義
+
+`titles` テーブルの `COUNT(*)` は**使わない**。非破壊移行で旧行と新行が並存するため、
+同じ称号が二重に数えられ、収集称号が本来より早く解除されてしまう。
+
+所持数は次の1つの定義に統一している（`TitleEngine.currentOwnedCount`）。
+
+1. 旧キーを新キーへ解決する
+2. 非公開の旧キーを落とす
+3. 重複を排除する
+4. **現行カタログ（`TITLE_RULES`）に存在するものだけ**を数える
+
+`progress().owned` と `buildSnapshot()` に渡る `ownedTitles` は同じ値になる。
+廃止称号（`nightwalker`）とカタログから消えたキーは一覧には残るが**数には入らない**。
 
 ## 投入手順
 
@@ -80,9 +117,16 @@ DELETE FROM titles
 WHERE (user_id, title_key) IN (SELECT user_id, legacy_key FROM title_key_migrations);
 ```
 
+`matchmaker` は移行台帳に載らないので、上のSQLでは消えない。消す場合は明示的に指定する
+（旧コードへ戻す可能性が無くなってからでよい。残していても新コードには出ない）。
+
+```sql
+DELETE FROM titles WHERE title_key IN ('matchmaker', 'mitsugetsu_retired');
+```
+
 削除後は `LEGACY_KEY_MAP`（`packages/core/src/titles/service.ts`）も空にできる。
-ただし `mitsugetsu_retired` / `nightwalker` の廃止ルール定義は、
-既得者の表示のために残し続ける。
+ただし `nightwalker` の廃止ルール定義は既得者の表示のために残し続ける。
+`NON_PUBLIC_LEGACY_KEYS` も、古いバックアップからの復元に備えて残しておくのが安全。
 
 ## 同席台帳の再計算について
 

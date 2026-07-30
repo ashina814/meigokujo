@@ -133,6 +133,8 @@ export {
   buildSnapshot,
   SENSITIVE_SOURCES,
   findSensitiveReference,
+  DISPLAYABLE_RULES,
+  NON_PUBLIC_TITLE_KEYS,
   type TitleRule,
   type TitleCategory,
   type TitleSnapshot,
