@@ -1,6 +1,9 @@
-import type Database from "better-sqlite3";
-
 const ACTIVE_TICKET_UNIQUE_INDEX = "idx_tickets_user_panel_active_unique";
+
+interface TicketConstraintDb {
+  prepare(sql: string): { all(...params: unknown[]): unknown[] };
+  exec(sql: string): unknown;
+}
 
 interface DuplicateActiveTicketGroup {
   user_id: string;
@@ -16,7 +19,7 @@ interface DuplicateActiveTicketGroup {
  * - closed は対象外なので、クローズ後は同じ受付から再作成可能
  * - panel_id がない旧チケットは移行互換のため対象外
  */
-export function ensureTicketOpenUniqueness(db: Database.Database): void {
+export function ensureTicketOpenUniqueness(db: TicketConstraintDb): void {
   const duplicates = db
     .prepare(
       `SELECT
