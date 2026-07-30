@@ -63,22 +63,9 @@ export function buildServices() {
   const evaluation = new Evaluation(db, settings, events);
   const vcRewards = new VcRewards(db, settings);
   const rooms = new Rooms(db, ledger, settings, events);
-  // クラッシュで閉じ損ねたVCセグメントの後始末（内部で同席台帳に dirty を立てる）
+  // クラッシュで閉じ損ねたVCセグメントの後始末
   const dangling = vc.closeAllDangling();
   if (dangling > 0) console.warn(`[vc] 閉じ損ねセグメントを ${dangling} 件補正しました`);
-  // 同席台帳は通常セグメントを閉じるたびに同一トランザクションで増分更新する。
-  // 増分で埋まらないのは「導入直後のバックフィル」「一括クローズ」「集計世代の更新」の3つだけ。
-  // 実測では20万セグメントで約0.5秒・ヒープ増4MB（tests/vc-companions-perf.test.ts）なので
-  // 起動時に同期実行して差し支えない。事前に走らせたい場合は
-  // `pnpm --filter @meigokujo/core companions:rebuild` を使う。
-  const rebuildReason = vc.companionsRebuildReason();
-  if (rebuildReason) {
-    const startedAt = Date.now();
-    const pairs = vc.rebuildCompanions();
-    console.log(
-      `[vc] 同席台帳を再計算 (理由=${rebuildReason} セグメント=${vc.segmentCount()}件): ${pairs}組 / ${Date.now() - startedAt}ms`,
-    );
-  }
   const titles = new TitleEngine(db, vc);
   const departments = new Departments(db, ledger);
   const fiscal = new Fiscal(db, ledger);

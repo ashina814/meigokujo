@@ -8,9 +8,7 @@
   },
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit",
-    "titles:worksheet": "tsx scripts/titles-worksheet.ts",
-    "companions:rebuild": "tsx scripts/rebuild-companions.ts"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "better-sqlite3": "^12.4.1"

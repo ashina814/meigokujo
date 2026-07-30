@@ -1,5 +1,4 @@
 import type Database from "better-sqlite3";
-import { coveredDays, mergeIntervals, totalSeconds as sumIntervals, type Interval } from "./time.js";
 
 /**
  * VC計測（ボット設計.md VC浮上報酬）。
@@ -23,14 +22,6 @@ export interface PresenceSummary {
   daysSeen: number;
   perChannel: Array<{ channelId: string; seconds: number }>;
 }
-
-/**
- * 同席台帳の集計アルゴリズムの世代。
- * 数え方を変えたらここを上げる。起動時に保存値と比較し、違えば再計算する。
- */
-const COMPANIONS_GENERATION = 1;
-const COMPANIONS_GENERATION_KEY = "vc_companions:generation";
-const COMPANIONS_DIRTY_KEY = "vc_companions:dirty";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -56,258 +47,55 @@ export class VcTracker {
     this.closeAt(userId, now());
   }
 
-  /**
-   * セグメントを閉じ、同席台帳へ反映する。
-   *
-   * この2つは必ず同一トランザクションで行う。分けると「セグメントは閉じたが台帳は未更新」
-   * という状態でプロセスが落ちた場合、そのセグメントは dangling ではないため
-   * 起動時の復旧にも掛からず、同席時間が永久に欠損する。
-   */
   private closeAt(userId: string, ts: number): void {
-    this.db.transaction(() => {
-      // 閉じる前に対象セグメントを控える。同席台帳の加算に開始時刻とチャンネルが要る。
-      const closing = this.db
-        .prepare("SELECT channel_id, started_at FROM vc_segments WHERE user_id = ? AND ended_at IS NULL")
-        .all(userId) as Array<{ channel_id: string; started_at: number }>;
-      if (closing.length === 0) return;
-
-      this.db
-        .prepare("UPDATE vc_segments SET ended_at = ? WHERE user_id = ? AND ended_at IS NULL")
-        .run(ts, userId);
-
-      for (const seg of closing) this.rollUpCompanions(userId, seg.channel_id, seg.started_at, ts);
-    })();
-  }
-
-  /**
-   * 同席台帳への加算。「閉じた瞬間に、まだ開いている相手だけ」を数えることで
-   * 各ペアがちょうど一度だけ計上される。
-   *   - 相手がまだ開いている  → このペアは未計上（相手が閉じるとき自分は既に閉じている＝相手側は skip する）
-   *   - 相手が既に閉じている  → 相手が閉じた時点で計上済み（そのとき自分は開いていた）
-   */
-  private rollUpCompanions(userId: string, channelId: string, startedAt: number, endedAt: number): void {
-    const others = this.db
-      .prepare(
-        `SELECT user_id, started_at FROM vc_segments
-         WHERE channel_id = ? AND ended_at IS NULL AND user_id <> ? AND started_at < ?`,
-      )
-      .all(channelId, userId, endedAt) as Array<{ user_id: string; started_at: number }>;
-
-    for (const other of others) {
-      const seconds = endedAt - Math.max(startedAt, other.started_at);
-      if (seconds <= 0) continue;
-      this.addCompanionSeconds(userId, other.user_id, seconds);
-    }
-  }
-
-  /** 双方向に加算する（読み出しを user_id 片側だけで済ませるため） */
-  private addCompanionSeconds(a: string, b: string, seconds: number): void {
-    const ts = now();
-    const stmt = this.db.prepare(
-      `INSERT INTO vc_companions (user_id, other_id, seconds, updated_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT (user_id, other_id) DO UPDATE
-         SET seconds = seconds + excluded.seconds,
-             updated_at = excluded.updated_at`,
-    );
-    stmt.run(a, b, seconds, ts);
-    stmt.run(b, a, seconds, ts);
-  }
-
-  /**
-   * 同席台帳の全再計算。既存データからのバックフィルと、
-   * closeAllDangling（クラッシュ後の一括クローズ）で増分が取れなかった分の復旧に使う。
-   * チャンネルごとに時系列で走査し、重なっている区間のペアだけを足す。
-   *
-   * 計算量は O(N log N + Σ同時接続数)。N は vc_segments の件数。
-   * 何度実行しても同じ結果になる（DELETE してから入れ直す）。
-   *
-   * 行は iterate で1件ずつ引く。all() で全件を配列に載せると件数に比例して
-   * ヒープが伸びるため（20万件で約80MB）、常駐メモリを一定に保つ。
-   * 保持するのは走査中チャンネルの同時接続ぶんとペア集計（住人数の二乗が上限）だけ。
-   */
-  rebuildCompanions(): number {
-    const cutoff = now();
-    const rows = this.db
-      .prepare(
-        `SELECT user_id, channel_id, started_at, COALESCE(ended_at, ?) AS ended_at
-         FROM vc_segments
-         WHERE COALESCE(ended_at, ?) > started_at
-         ORDER BY channel_id, started_at`,
-      )
-      .iterate(cutoff, cutoff) as Iterable<{
-      user_id: string;
-      channel_id: string;
-      started_at: number;
-      ended_at: number;
-    }>;
-
-    const totals = new Map<string, number>();
-    let channel: string | null = null;
-    // 走査中のチャンネルで「まだ終わっていない」区間だけを保持する（スイープライン）
-    const active: Array<{ userId: string; startedAt: number; endedAt: number }> = [];
-
-    for (const r of rows) {
-      if (r.channel_id !== channel) {
-        channel = r.channel_id;
-        active.length = 0;
-      }
-      // 終了済みを落とす。filter だと行数ぶんの配列を作り直すので詰め替える
-      let write = 0;
-      for (let read = 0; read < active.length; read++) {
-        const a = active[read]!;
-        if (a.endedAt > r.started_at) active[write++] = a;
-      }
-      active.length = write;
-
-      for (const a of active) {
-        if (a.userId === r.user_id) continue;
-        const seconds = Math.min(a.endedAt, r.ended_at) - Math.max(a.startedAt, r.started_at);
-        if (seconds <= 0) continue;
-        const key = a.userId < r.user_id ? `${a.userId} ${r.user_id}` : `${r.user_id} ${a.userId}`;
-        totals.set(key, (totals.get(key) ?? 0) + seconds);
-      }
-      active.push({ userId: r.user_id, startedAt: r.started_at, endedAt: r.ended_at });
-    }
-
-    const ts = now();
-    const insert = this.db.prepare(
-      "INSERT INTO vc_companions (user_id, other_id, seconds, updated_at) VALUES (?, ?, ?, ?)",
-    );
-    this.db.transaction(() => {
-      this.db.prepare("DELETE FROM vc_companions").run();
-      for (const [key, seconds] of totals) {
-        const [a, b] = key.split(" ") as [string, string];
-        insert.run(a, b, seconds, ts);
-        insert.run(b, a, seconds, ts);
-      }
-      this.writeCompanionsMeta(COMPANIONS_GENERATION, false);
-    })();
-    return totals.size;
-  }
-
-  /** 同席の要約（称号判定用）。相棒＝最も長く同席した1人の秒数 */
-  companionSummary(userId: string): { uniqueCount: number; totalSeconds: number; bestSeconds: number } {
-    const row = this.db
-      .prepare(
-        `SELECT COUNT(*) AS n, COALESCE(SUM(seconds), 0) AS total, COALESCE(MAX(seconds), 0) AS best
-         FROM vc_companions WHERE user_id = ?`,
-      )
-      .get(userId) as { n: number; total: number; best: number };
-    return { uniqueCount: row.n, totalSeconds: row.total, bestSeconds: row.best };
-  }
-
-  // ── 同席台帳の健全性管理 ──────────────────────────────────
-
-  private writeCompanionsMeta(generation: number, dirty: boolean): void {
-    const ts = now();
-    const stmt = this.db.prepare(
-      `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-    );
-    stmt.run(COMPANIONS_GENERATION_KEY, String(generation), ts);
-    stmt.run(COMPANIONS_DIRTY_KEY, dirty ? "1" : "0", ts);
-  }
-
-  private readSetting(key: string): string | null {
-    const row = this.db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as
-      | { value: string }
-      | undefined;
-    return row?.value ?? null;
-  }
-
-  /** 増分では埋められない事象が起きたことを記録する（一括クローズなど） */
-  markCompanionsDirty(): void {
-    const ts = now();
     this.db
-      .prepare(
-        `INSERT INTO settings (key, value, updated_at) VALUES (?, '1', ?)
-         ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at`,
-      )
-      .run(COMPANIONS_DIRTY_KEY, ts);
-  }
-
-  /**
-   * 同席台帳の再計算が必要か。理由を返す（不要なら null）。
-   *   dirty      : 一括クローズなど、増分で埋められない事象があった
-   *   generation : 世代マーカーが無い（導入直後＝バックフィル未実施）か、
-   *                集計アルゴリズムの世代が上がった（コード更新後の初回）
-   *
-   * 「台帳が空か」では判定しない。同席相手が一人もいない状態は正常にあり得るので、
-   * 空であることを理由にすると毎回の起動で再計算が走り続ける。
-   * 実施済みかどうかは世代マーカーの有無だけで判断する。
-   */
-  companionsRebuildReason(): "dirty" | "generation" | null {
-    if (this.readSetting(COMPANIONS_DIRTY_KEY) === "1") return "dirty";
-    const stored = this.readSetting(COMPANIONS_GENERATION_KEY);
-    if (stored === null) return "generation";
-    const generation = Number(stored);
-    if (!Number.isFinite(generation) || generation !== COMPANIONS_GENERATION) return "generation";
-    return null;
-  }
-
-  /** 起動時ログ・負荷見積り用 */
-  companionRowCount(): number {
-    return (this.db.prepare("SELECT COUNT(*) AS n FROM vc_companions").get() as { n: number }).n;
-  }
-
-  segmentCount(): number {
-    return (this.db.prepare("SELECT COUNT(*) AS n FROM vc_segments").get() as { n: number }).n;
+      .prepare("UPDATE vc_segments SET ended_at = ? WHERE user_id = ? AND ended_at IS NULL")
+      .run(ts, userId);
   }
 
   /**
    * 起動時の後始末: クラッシュ等で閉じ損ねたセグメントを閉じる。
    * 実際の退出時刻は分からないため、開始+上限（既定6時間）と現在時刻の早い方で打ち切る。
-   *
-   * 一括UPDATEなので同席台帳の増分は取れない。dirty を立てて再計算に回す。
    */
   closeAllDangling(capSeconds = 6 * 3600): number {
     const ts = now();
-    const result = this.db.transaction(() => {
-      const r = this.db
-        .prepare(
-          `UPDATE vc_segments
-           SET ended_at = MIN(?, started_at + ?)
-           WHERE ended_at IS NULL`,
-        )
-        .run(ts, capSeconds);
-      if (r.changes > 0) this.markCompanionsDirty();
-      return r.changes;
-    })();
-    return result;
+    const result = this.db
+      .prepare(
+        `UPDATE vc_segments
+         SET ended_at = MIN(?, started_at + ?)
+         WHERE ended_at IS NULL`,
+      )
+      .run(ts, capSeconds);
+    return result.changes;
   }
 
-  /**
-   * 浮上実績: 期間内の合計時間・出現日数・チャンネル別内訳（評価スレへの自動添付用）。
-   *
-   * 出現日数は日境界を跨ぐセグメントの中間日も数える（vc/time.ts に集約）。
-   * 状態変化で分割されたセグメントは結合してから数えるので、合計が実時間を超えない。
-   */
+  /** 浮上実績: 期間内の合計時間・出現日数・チャンネル別内訳（評価スレへの自動添付用） */
   presence(userId: string, sinceDays: number, channelIds?: string[]): PresenceSummary {
-    const ts = now();
-    const since = ts - sinceDays * 86_400;
+    const since = now() - sinceDays * 86_400;
     const rows = this.db
       .prepare(
         `SELECT channel_id, started_at, COALESCE(ended_at, ?) AS ended_at
          FROM vc_segments
          WHERE user_id = ? AND COALESCE(ended_at, ?) > ?`,
       )
-      .all(ts, userId, ts, since) as Array<{ channel_id: string; started_at: number; ended_at: number }>;
+      .all(now(), userId, now(), since) as Array<{ channel_id: string; started_at: number; ended_at: number }>;
 
     const filtered = channelIds ? rows.filter((r) => channelIds.includes(r.channel_id)) : rows;
     const perChannelMap = new Map<string, number>();
-    const intervals: Interval[] = [];
+    const days = new Set<string>();
+    let total = 0;
     for (const r of filtered) {
       const start = Math.max(r.started_at, since);
       const seconds = Math.max(0, r.ended_at - start);
+      total += seconds;
       perChannelMap.set(r.channel_id, (perChannelMap.get(r.channel_id) ?? 0) + seconds);
-      intervals.push({ start, end: r.ended_at });
+      // 出現日（JST）
+      const d = new Date((start + 9 * 3600) * 1000).toISOString().slice(0, 10);
+      days.add(d);
     }
-
-    const merged = mergeIntervals(intervals);
     return {
-      totalSeconds: sumIntervals(merged),
-      daysSeen: coveredDays(merged).size,
+      totalSeconds: total,
+      daysSeen: days.size,
       perChannel: [...perChannelMap.entries()]
         .map(([channelId, seconds]) => ({ channelId, seconds }))
         .sort((a, b) => b.seconds - a.seconds),
@@ -316,15 +104,14 @@ export class VcTracker {
 
   /** 全ユーザーの累計VC時間（全VC対象・位階の判定用）。多い順 */
   totalsByUser(sinceDays: number): Array<{ userId: string; seconds: number }> {
-    const ts = now();
-    const since = ts - sinceDays * 86_400;
+    const since = now() - sinceDays * 86_400;
     const rows = this.db
       .prepare(
         `SELECT user_id, started_at, COALESCE(ended_at, ?) AS ended_at
          FROM vc_segments
          WHERE COALESCE(ended_at, ?) > ?`,
       )
-      .all(ts, ts, since) as Array<{ user_id: string; started_at: number; ended_at: number }>;
+      .all(now(), now(), since) as Array<{ user_id: string; started_at: number; ended_at: number }>;
     const totals = new Map<string, number>();
     for (const r of rows) {
       const start = Math.max(r.started_at, since);
