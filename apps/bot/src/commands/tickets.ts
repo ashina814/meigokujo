@@ -22,6 +22,12 @@ const OPEN_PREFIX = "ticket:open:";
 const CLOSE_CONFIRM_PREFIX = "ticket:close-confirm:";
 const inFlightTickets = new Set<string>();
 
+type LockableThread = {
+  id: string;
+  setLocked(locked: boolean, reason?: string): Promise<unknown>;
+  setArchived(archived: boolean, reason?: string): Promise<unknown>;
+};
+
 function uniq(values: string[]): string[] {
   return [...new Set(values.map((v) => v.trim()).filter(Boolean))];
 }
@@ -231,7 +237,7 @@ async function addMembersToThread(thread: PrivateThreadChannel, memberIds: strin
   return { added, failed };
 }
 
-async function lockAndArchiveThread(thread: PrivateThreadChannel, reason: string): Promise<void> {
+async function lockAndArchiveThread(thread: LockableThread, reason: string): Promise<void> {
   await thread.setLocked(true, reason).catch((e) => console.warn(`[ticket] スレッドのロックに失敗: ${thread.id}`, e));
   await thread.setArchived(true, reason).catch((e) => console.warn(`[ticket] スレッドのアーカイブに失敗: ${thread.id}`, e));
 }
