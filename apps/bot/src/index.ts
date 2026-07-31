@@ -2,7 +2,7 @@ import { Client, Events, GatewayIntentBits } from "discord.js";
 import { InviteTracker } from "./invite-tracker.js";
 import { config } from "./config.js";
 import { buildServices } from "./services.js";
-import { handleAdminCommand, handleAdminButton, handleAdminSelect, handleAdminModal } from "./commands/admin-hub.js";
+import { handleAdminCommand, handleAdminButton, handleAdminSelect, handleAdminModal } from "./commands/admin-payroll-safe.js";
 import { handleShopButton, handleShopSelect } from "./commands/shop-panel.js";
 import { handleShokanCommand, handleShokanButton, handleShokanSelect, handleShokanModal } from "./commands/shokan.js";
 import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
