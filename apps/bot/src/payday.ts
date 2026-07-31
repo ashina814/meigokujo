@@ -51,6 +51,20 @@ function boundedLines(
   return shorten(output.filter(Boolean).join("\n"), limit);
 }
 
+function olderRecoverableRun(
+  services: Services,
+  period: string,
+  excludedRunId?: number,
+): PayoutRunRow | undefined {
+  return services.payroll
+    .listRecoverableRuns()
+    .find((run) => run.id !== excludedRunId && run.period < period);
+}
+
+function blockedByOlderRunMessage(blocker: PayoutRunRow): string {
+  return `⛔ \`${blocker.period}\` の未完了給与Run #${blocker.id} があるため、この給与案は承認・支給していません。先に \`/管理 → 給与\` から古いRunを処理してください。`;
+}
+
 /** ギルドの全メンバーからロール一覧を作る（Bot除外）。GuildMembers インテント必須 */
 async function collectMembers(guild: Guild): Promise<MemberRoles[]> {
   const members = await guild.members.fetch();
@@ -123,6 +137,14 @@ export async function createAndPostDraft(
   period: string,
   actor: string,
 ): Promise<{ ok: true; runId: number } | { ok: false; message: string }> {
+  const blocker = olderRecoverableRun(services, period);
+  if (blocker) {
+    return {
+      ok: false,
+      message: `${blocker.period} の未完了給与Run #${blocker.id} があるため、${period} の支給案は作成しません。先に /管理 → 給与 から古いRunを処理してください。`,
+    };
+  }
+
   const guildId = services.settings.getString("guild:main");
   const kessaiId = services.settings.getString("channel:kessai");
   if (!guildId) return { ok: false, message: "対象サーバーが未記録です。/給与表 か /設定 を一度実行してください。" };
@@ -224,6 +246,16 @@ export async function handlePaydayButton(
         embeds: interaction.message.embeds,
         components: [],
         content: `❌ <@${interaction.user.id}> が今月の支給を見送りました。`,
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
+
+    const blocker = olderRecoverableRun(services, run.period, run.id);
+    if (blocker) {
+      await interaction.editReply({
+        embeds: interaction.message.embeds,
+        content: blockedByOlderRunMessage(blocker),
         allowedMentions: { parse: [] },
       });
       return;
