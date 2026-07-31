@@ -75,6 +75,48 @@ export interface ExecutionReport {
 const now = () => Math.floor(Date.now() / 1000);
 const PERIOD_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function parseStoredExecutionReport(raw: string | null): ExecutionReport | undefined {
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+  if (
+    !isNonNegativeSafeInteger(parsed.succeeded) ||
+    !isNonNegativeSafeInteger(parsed.skippedAsPaid) ||
+    !isNonNegativeSafeInteger(parsed.totalPaid) ||
+    !Array.isArray(parsed.failed)
+  ) {
+    return undefined;
+  }
+
+  const failed: ExecutionReport["failed"] = [];
+  for (const item of parsed.failed) {
+    if (!isRecord(item) || typeof item.userId !== "string" || typeof item.code !== "string" || !isRecord(item.details)) {
+      return undefined;
+    }
+    failed.push({ userId: item.userId, code: item.code, details: item.details });
+  }
+
+  return {
+    succeeded: parsed.succeeded,
+    skippedAsPaid: parsed.skippedAsPaid,
+    failed,
+    totalPaid: parsed.totalPaid,
+  };
+}
+
 /**
  * 給与バッチ（経済設計.md §5）。
  * draft（計画スナップショット）→ approved（#決裁）→ executed の3段階。
@@ -204,13 +246,8 @@ export class Payroll {
 
     return rows.filter((run) => {
       if (run.status === "draft" || run.status === "approved") return true;
-      if (!run.report_json) return true;
-      try {
-        const report = JSON.parse(run.report_json) as Partial<ExecutionReport>;
-        return !Array.isArray(report.failed) || report.failed.length > 0;
-      } catch {
-        return true;
-      }
+      const report = parseStoredExecutionReport(run.report_json);
+      return !report || report.failed.length > 0;
     });
   }
 
