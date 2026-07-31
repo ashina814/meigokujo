@@ -18,47 +18,58 @@ import {
   type VoiceState,
 } from "discord.js";
 import { fmtLd } from "../format.js";
+import { deliverToUser } from "../notify.js";
 import { isAdmin } from "../permissions.js";
 import { jstNow, nextSessionStart } from "../scheduler.js";
 import type { Services } from "../services.js";
 
 // ---- パネル ----
 
-export function entryPanelMessage(): MessageCreateOptions {
+/**
+ * 入城案内の常設パネル（正本）。
+ *
+ * 設置後は再編集されない静的メッセージなので、**具体的な日時を書かない**。
+ * 「次は何時か」は押した時点で計算する `いまの自分の状態を見る` が返す。
+ * 招待経路の登録ボタンは置かない（新規に操作を要求しない・門番が `/審判 招待` で拾う）。
+ */
+export function entryPanelMessage(services: Services): MessageCreateOptions {
+  const vcIds = sessionVcIds(services);
   const embed = new EmbedBuilder()
     .setTitle("🚪 冥獄城 入城案内")
     .setColor(0x6b21a8)
+    .setDescription("城に入るには、説明会に来ていただくだけです。事前の登録や申請はいりません。")
     .addFields(
       {
-        name: "📅 説明会の時間",
-        value: [
-          "**月・木を除く 21時 / 22時 / 23時** に開催しています。",
-          "開始 **5分前** にこのチャンネルでお知らせします。",
-        ].join("\n"),
+        name: "📅 説明会",
+        value: ["**月・木を除く 21時 / 22時 / 23時**", "開始 **5分前** にこのチャンネルでお知らせします。"].join("\n"),
+        inline: true,
       },
       {
-        name: "🎯 参加の流れ",
-        value: [
-          "時間になったら **説明会場VC** に入って担当をお待ちください。",
-          "招待リンク経由で来た方は **自動的に招待者が記録** されるので、追加操作は不要です。",
-        ].join("\n"),
+        name: "📍 集合場所",
+        value: vcIds.length > 0 ? vcIds.map((id) => `<#${id}>`).join("\n") : "説明会場VC",
+        inline: true,
       },
       {
-        name: "🚪 招待経路の登録（任意）",
-        value: [
-          "招待リンク経由の方は自動で記録されるので、操作は不要です。",
-          "ディスボード・ルミナ経由の方や、招待者を自分で伝えたい方だけ下のボタンをどうぞ。",
-          "押さなくても説明会には参加できます。分からなければ当日、門番に伝えてください。",
-        ].join("\n"),
+        name: "🎯 やること",
+        value: ["**1.** 時間になったら説明会場VCに入る", "**2.** 門番の案内を待つ（10分ほどで終わります）"].join("\n"),
       },
-    );
+      {
+        name: "⏰ その時間に来られない",
+        value: "下の「時間外・個別希望」から、都合のいい時間で個別に調整できます。",
+      },
+    )
+    .setFooter({ text: "次の説明会が何時かは「いまの自分の状態を見る」で確認できます" });
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("entry:book").setLabel("招待経路を登録する").setEmoji("🚪").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("entry:status").setLabel("いまの自分の状態を見る").setEmoji("🕯️").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("entry:flex").setLabel("時間外・個別希望").setEmoji("⏰").setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row] };
 }
 
-/** 時間外・個別希望の単独パネル */
+/**
+ * @deprecated 入城案内パネルへ統合済み。新規設置はできない（`/パネル設置` の選択肢から外した）。
+ * 既に設置してあるパネルを撤去するまでの間、押しても動くように残してある。
+ */
 export function entryFlexPanelMessage(): MessageCreateOptions {
   const embed = new EmbedBuilder()
     .setTitle("⏰ 時間外・個別希望 受付")
@@ -75,23 +86,10 @@ export function entryFlexPanelMessage(): MessageCreateOptions {
   return { embeds: [embed], components: [row] };
 }
 
-// ---- 招待経路の登録（トラッキング用。時間予約はしない）----
-
-/** 招待経路 入力UI（案内パネル・DM・審判の代打入力で共用） */
-function inviterStep() {
-  const select = new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
-    new UserSelectMenuBuilder().setCustomId("entry:invsel").setPlaceholder("招待してくれた人を選ぶ"),
+function sessionVcIds(services: Services): string[] {
+  return [services.settings.getString("channel:session_vc"), services.settings.getString("channel:session_vc2")].filter(
+    (v): v is string => !!v,
   );
-  const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("entry:inv:disboard").setLabel("ディスボード").setEmoji("🅱").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("entry:inv:lumina").setLabel("ルミナ").setEmoji("✨").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("entry:inv:none").setLabel("その他（誰の招待でもない）").setStyle(ButtonStyle.Secondary),
-  );
-  return {
-    content: "**誰かの招待で来ましたか？** どれか1つ選んで押してください（必ずお願いします）。",
-    components: [select, buttons],
-    embeds: [],
-  };
 }
 
 export async function handleEntryButton(
@@ -101,8 +99,8 @@ export async function handleEntryButton(
   const id = interaction.customId;
   const userId = interaction.user.id;
 
-  if (id === "entry:book" && interaction.isButton()) {
-    await interaction.reply({ ...inviterStep(), flags: MessageFlags.Ephemeral });
+  if (id === "entry:status" && interaction.isButton()) {
+    await interaction.reply({ ...entryStatusMessage(services, userId), flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -111,32 +109,16 @@ export async function handleEntryButton(
     return;
   }
 
-  if (id === "entry:invsel" && interaction.isUserSelectMenu()) {
-    const inviterId = interaction.values[0];
-    if (!inviterId) {
-      await interaction.update({ content: "⌛ 途中で切れました。もう一度パネルからどうぞ。", components: [] });
-      return;
-    }
-    if (inviterId === userId) {
-      await interaction.reply({ content: "自分自身は招待者にできません。", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    finalizeBooking(services, userId, "open", { userId: inviterId, source: "user" });
-    await interaction.update({ content: `✅ 登録しました（招待者: <@${inviterId}>）。**説明会場VCに入って**お待ちください。`, components: [] });
-    return;
-  }
-
-  if (
-    (id === "entry:inv:disboard" || id === "entry:inv:lumina" || id === "entry:inv:none") &&
-    interaction.isButton()
-  ) {
-    const source = id.endsWith("disboard")
-      ? ("disboard" as const)
-      : id.endsWith("lumina")
-        ? ("lumina" as const)
-        : ("none" as const);
-    finalizeBooking(services, userId, "open", { source });
-    await interaction.update({ content: "✅ 登録しました。**説明会場VCに入って**お待ちください。", components: [] });
+  // 旧パネル（招待経路を本人に登録させる導線）の互換。撤去前のパネルが残っていても
+  // 迷子にしない。本人からの招待経路の登録は受け付けない方針になった。
+  if (id === "entry:book" || id === "entry:invsel" || id.startsWith("entry:inv:")) {
+    await interaction.reply({
+      content: [
+        "この操作は不要になりました。**招待経路の登録は要りません**（分かる場合は門番が記録します）。",
+        "時間になったら **説明会場VC** に入ってお待ちください。",
+      ].join("\n"),
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
 
@@ -150,18 +132,62 @@ export async function handleEntryButton(
   }
 }
 
-function finalizeBooking(
-  services: Services,
-  userId: string,
-  slot: string,
-  inviter: { userId?: string; source: "user" | "disboard" | "lumina" | "none" },
-): void {
-  services.entry.recordJoin(userId); // 参加記録が無い既存メンバーの申請にも対応
-  services.entry.book(userId, slot, inviter);
+/**
+ * `いまの自分の状態を見る`（エフェメラル）。
+ * パネルが静的な代わりに、動的な情報（次の実時刻・自分の状態）はここが返す。
+ * 招待者の名前は出さない（記録の有無だけ）。
+ */
+export function entryStatusMessage(services: Services, userId: string): MessageCreateOptions {
+  const soul = services.entry.getSoul(userId);
+  const next = nextSessionStart();
+  const nextTs = next ? Math.floor(next.getTime() / 1000) : null;
+  const vcIds = sessionVcIds(services);
+
+  const embed = new EmbedBuilder().setTitle("🕯️ いまのあなたの状態").setColor(0x6b21a8);
+
+  if (soul && soul.status !== "waiting") {
+    embed.setDescription(
+      soul.status === "departed"
+        ? "城の記録では退城扱いになっています。門番にお声がけください。"
+        : "**入城済み**です。説明会に来ていただく必要はありません。",
+    );
+    return { embeds: [embed] };
+  }
+
+  const hint = services.entry.getInviterHint(userId);
+  embed
+    .setDescription("**案内待ち**です。次の説明会で説明会場VCに来ていただければ入城できます。")
+    .addFields(
+      {
+        name: "📅 次の説明会",
+        value: nextTs ? `<t:${nextTs}:F>\n<t:${nextTs}:R>` : "月・木を除く 21 / 22 / 23 時",
+        inline: true,
+      },
+      {
+        name: "📍 集合場所",
+        value: vcIds.length > 0 ? vcIds.map((id) => `<#${id}>`).join("\n") : "説明会場VC",
+        inline: true,
+      },
+      {
+        name: "🚪 招待経路",
+        value: hint
+          ? "記録済みです。操作は要りません。"
+          : "未記録ですが、**そのままで入城できます**。心当たりがあれば当日、門番にお伝えください。",
+      },
+    )
+    .setFooter({ text: "その時間に来られない場合はパネルの「時間外・個別希望」からどうぞ" });
+  return { embeds: [embed] };
 }
 
 // ---- 参加時の自動処理 ----
 
+/**
+ * 参加時の処理。**公開チャンネルには何も投稿しない**（設計案 確定事項1）。
+ *
+ * 案内待ちの段階では一般住民から新規が見えないので、公開投稿に「住民が歓迎する」
+ * 効果が無い。参加のたびに長文が並ぶ副作用だけが残るため、本人へのDMに寄せる。
+ * DMが届かなかった時だけ、入城案内chへ1行のフォールバックを出す。
+ */
 export async function handleMemberJoin(
   member: GuildMember,
   services: Services,
@@ -176,33 +202,33 @@ export async function handleMemberJoin(
       .add(waitRoleId)
       .catch((e) => console.warn(`[entry] 入城待ちロール付与に失敗（ボットのロールを階級より上へ）: ${(e as Error).message}`));
 
-  // 招待リンクから招待者を自動記録
+  // 招待リンクから招待者を自動検出 → 検出として保存するだけ。実績の確定は亡霊化の時。
   if (inviterId && inviterId !== member.id) {
-    finalizeBooking(services, member.id, "open", { userId: inviterId, source: "user" });
+    services.entry.recordInviterHint(
+      member.id,
+      { userId: inviterId, source: "user" },
+      "auto",
+      "system:invite-tracker",
+    );
     console.log(`[invite] 自動検出: ${member.id} は ${inviterId} の招待リンクで入城`);
   }
 
-  // 入城案内chで本人メンション + パネル誘導（DMは使わない）
-  //
-  // 招待者の名前はここには出さない。誰が誰を連れてきたかを全員に見える形で出すと、
-  // 招待する側にも された側にもブレーキになる。招待情報は運営だけが見る入退室ログに残す。
-  const guideId = services.settings.getString("channel:entry_guide");
-  if (guideId) {
-    const channel = (await member.client.channels.fetch(guideId).catch(() => null)) as TextChannel | null;
-    await channel
-      ?.send({
-        content: `👻 <@${member.id}>`,
-        embeds: [buildWelcomeEmbed(member, services)],
-        allowedMentions: { users: [member.id] },
-      })
-      .catch(() => undefined);
+  const result = await deliverToUser(member.client, services, member.id, {
+    dm: { embeds: [buildWelcomeEmbed(member, services)] },
+    fallback: {
+      channelKey: "channel:entry_guide",
+      content: "案内をDMへ送れなかったため、上部の常設パネルを確認してください。",
+    },
+  });
+  services.events.log("entry_guide_sent", { target: member.id, payload: { via: result.via } });
+  if (!result.delivered) {
+    console.warn(`[entry] 入城案内が届きませんでした（DM拒否＋フォールバック不可）: ${member.id}`);
   }
 }
 
 /**
- * 参加者向けの歓迎カード。
- * 平文に太字を散らすと優先順位が見えないので、「いつ・どこへ・何をする」の3点だけを
- * embed の枠で分けて出す。招待者の名前は載せない（公開すると招待の抑止になるため）。
+ * 参加者本人へ送るDM。
+ * 「いつ・どこへ・何をする」の3点だけ。招待者の名前は載せない。
  *
  * 招待経路の登録は新規に要求しない。検出できたものは黙って記録し、抜けたぶんは
  * 門番が当日 `/審判 招待` で拾う。ここで手順を1つ増やすほうが損が大きい。
@@ -210,10 +236,16 @@ export async function handleMemberJoin(
 function buildWelcomeEmbed(member: GuildMember, services: Services): EmbedBuilder {
   const next = nextSessionStart();
   const nextTs = next ? Math.floor(next.getTime() / 1000) : null;
-  const vcIds = [
-    services.settings.getString("channel:session_vc"),
-    services.settings.getString("channel:session_vc2"),
-  ].filter((v): v is string => !!v);
+  const guildId = member.guild.id;
+  const vcIds = sessionVcIds(services);
+  // DM にはサーバーの文脈が無く <#id> が「#unknown」になることがあるので、
+  // 名前を添えたチャンネルリンクで出す。
+  const vcLinks = vcIds
+    .map((id) => {
+      const ch = member.guild.channels.cache.get(id);
+      return `[${ch?.name ?? "説明会場VC"}](https://discord.com/channels/${guildId}/${id})`;
+    })
+    .join("\n");
 
   const steps = ["時間になったら説明会場VCに入る", "門番の案内を待つ（10分ほどで終わります）"]
     .map((s, i) => `**${i + 1}.** ${s}`)
@@ -231,14 +263,19 @@ function buildWelcomeEmbed(member: GuildMember, services: Services): EmbedBuilde
         value: nextTs ? `<t:${nextTs}:F>\n<t:${nextTs}:R>` : "月・木を除く 21 / 22 / 23 時",
         inline: true,
       },
-      {
-        name: "📍 集合場所",
-        value: vcIds.length > 0 ? vcIds.map((id) => `<#${id}>`).join("\n") : "説明会場VC",
-        inline: true,
-      },
+      { name: "📍 集合場所", value: vcLinks || "説明会場VC", inline: true },
       { name: "​", value: steps, inline: false },
     )
-    .setFooter({ text: "案内が終われば、城の中がすべて見えるようになります" });
+    .setFooter({ text: "この案内は入城案内チャンネルのパネルからいつでも確認できます" });
+
+  const guideId = services.settings.getString("channel:entry_guide");
+  if (guideId) {
+    embed.addFields({
+      name: "📌 案内パネル",
+      value: `[入城案内チャンネルを開く](https://discord.com/channels/${guildId}/${guideId})\n次の説明会の時刻も、そこの「いまの自分の状態を見る」で確認できます。`,
+      inline: false,
+    });
+  }
 
   // 次の会まで半日以上空く（月木に参加した場合など）なら、待たせきりにせず個別調整へ逃がす
   if (next && next.getTime() - Date.now() > 12 * 3_600_000) {
@@ -315,6 +352,10 @@ export async function handleMemberRoleUpdate(
 
 // ---- 出席の自動記録（voiceState）----
 
+/**
+ * @deprecated 予約制の名残。新しい導線は予約行を作らないので、新規参加者には効かない。
+ * 判定は VC 在室者を直接見る（presentWaiters）。過去の予約行のために残してある。
+ */
 export function handleVoiceAttendance(
   _old: VoiceState,
   next: VoiceState,
@@ -482,10 +523,10 @@ export async function handleSessionCommand(
   // 以前はここで未登録者を判定対象から外していたが、本人にボタンを押させる導線が
   // 詰まりの主因になっていたため、全員を判定対象にして未検出は表示だけ残す。
   // 経路が要る場合は門番が `/審判 招待` で後から入れられる（亡霊化後でも記帳できる）。
-  const missing = present.filter((uid) => {
-    const booking = services.entry.getBooking(uid);
-    return !booking?.inviter_user_id && booking?.inviter_source !== "disboard" && booking?.inviter_source !== "lumina";
-  });
+  //
+  // 検出・補足が1件でもあれば「確認済み」。`none`（誰の招待でもない）も門番が確認した
+  // 結果なので未検出には数えない。
+  const missing = present.filter((uid) => !services.entry.getInviterHint(uid));
   judgeState.set(interaction.user.id, { present, missing, hold: new Set() });
   await interaction.reply({ ...renderJudgment(services, interaction.user.id), flags: MessageFlags.Ephemeral });
 }
@@ -534,11 +575,28 @@ async function handleInviterRecord(
     gender,
   );
 
-  const lines: string[] = [
-    `✅ <@${target.id}> の招待経路を登録しました（${inviter ? `招待者 <@${inviter.id}>` : sourceLabel(source!)}）。`,
-  ];
+  // 既に確定済みなら何も書き換えていない。付け替えは取り消し設計とセットの別操作にする
   if (result.reason === "already") {
-    lines.push("ℹ️ この人の招待実績は既に記帳済みだったので、招待者への加算はしていません（二重加算の防止）。");
+    await interaction.editReply({
+      content: [
+        `ℹ️ <@${target.id}> の招待実績は既に確定済みです（招待者: <@${result.existingInviterId}>）。`,
+        "二重加算を防ぐため、**何も書き換えていません**。",
+        "誤りの訂正が必要な場合は運営へ連絡してください（延長・称号の取り消しを伴うため、この操作では変更できません）。",
+      ].join("\n"),
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
+
+  const lines: string[] = [
+    `✅ <@${target.id}> の招待経路を記録しました（${inviter ? `招待者 <@${inviter.id}>` : sourceLabel(source!)}）。`,
+  ];
+  if (result.pending) {
+    // まだ説明会を受けていない。実績は本人が入城した時に確定する
+    lines.push(
+      "⏳ この人はまだ入城前なので、**招待実績はまだ確定していません**。",
+      "説明会を受けて亡霊になった時点で、実績・期限延長・称号がまとめて反映されます。",
+    );
   } else if (result.credited) {
     lines.push(
       result.extendedDays > 0

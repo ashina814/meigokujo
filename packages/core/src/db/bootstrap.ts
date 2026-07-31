@@ -515,6 +515,12 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "souls", "eval_demotion_threshold", "INTEGER");
   ensureColumn(db, "souls", "eval_invite_mark_per_person", "REAL");
   ensureColumn(db, "souls", "eval_invite_mark_cap", "REAL");
+  // 招待経路の「検出・補足」層（未確定）。確定は invites 行 + souls.inviter_user_id。
+  // waiting の人は予約行を持たないので、置き場所を souls 側に持つ。
+  ensureColumn(db, "souls", "inviter_hint_user_id", "TEXT");
+  ensureColumn(db, "souls", "inviter_hint_source", "TEXT");
+  ensureColumn(db, "souls", "inviter_hint_origin", "TEXT");
+  ensureColumn(db, "souls", "inviter_hint_at", "INTEGER");
   ensureColumn(db, "rooms", "pending_delete", "INTEGER NOT NULL DEFAULT 0 CHECK (pending_delete IN (0,1))");
   ensureColumn(db, "rooms", "delete_attempts", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "rooms", "next_delete_retry_at", "INTEGER");

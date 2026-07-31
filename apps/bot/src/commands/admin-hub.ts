@@ -961,7 +961,6 @@ function sprofModal(services: Services, roleId: string) {
 const PANEL_KIND_CHOICES: Array<[string, string]> = [
   ["bank", "冥獄銀行"],
   ["entry", "入城申請"],
-  ["entry_flex", "時間外希望受付"],
   ["rank", "ランク確認"],
   ["shop", "公式ショップ"],
   ["exchange", "マモンの両替所"],
@@ -975,6 +974,9 @@ const PANEL_KIND_CHOICES: Array<[string, string]> = [
   ["room_game", "ゲーム部屋"],
   ["dept", "部署運用"],
 ];
+
+// 廃止済みで新規設置はできないが、既に設置してあるものを撤去する必要がある種別
+const RETIRED_PANEL_KIND_CHOICES: Array<[string, string]> = [["entry_flex", "時間外希望受付（廃止・撤去用）"]];
 
 function panelHome(services: Services) {
   const ticketPanels = services.tickets.listPanels().length;
@@ -1009,7 +1011,9 @@ function panelRemovePicker() {
   const menu = new StringSelectMenuBuilder()
     .setCustomId("mgmt:panel:remove-pick")
     .setPlaceholder("撤去するパネルを選ぶ")
-    .addOptions(PANEL_KIND_CHOICES.map(([v, name]) => ({ label: name, value: v })));
+    .addOptions(
+      [...PANEL_KIND_CHOICES, ...RETIRED_PANEL_KIND_CHOICES].map(([v, name]) => ({ label: name, value: v })),
+    );
   return {
     embeds: [new EmbedBuilder().setTitle("🪧 パネル撤去").setDescription("今いるチャンネルから撤去します。")],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu), backButton()],
