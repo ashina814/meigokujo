@@ -25,29 +25,51 @@ describe("未完了給与Runの回収", () => {
   it("draft・approved・部分失敗だけを月順で返し、成功済みと見送り済みを除外する", () => {
     const { db, ledger, payroll } = setup();
 
-    payroll.generateDraft("2026-07", members, STAFF);
-
-    const approved = payroll.generateDraft("2026-08", members, STAFF);
-    payroll.approve(approved.id, STAFF);
-
-    const succeeded = payroll.generateDraft("2026-09", members, STAFF);
-    payroll.approve(succeeded.id, STAFF);
-    payroll.execute(succeeded.id, STAFF);
+    // 新しい月から作り、状態を確定してから古い月を作る。通常運用では古い未完了が新規月をブロックする。
+    const cancelled = payroll.generateDraft("2026-11", members, STAFF);
+    payroll.cancel(cancelled.id, STAFF);
 
     ledger.ensureAccount("user:alice", "user");
     ledger.setAccountStatus("user:alice", "frozen");
     const partial = payroll.generateDraft("2026-10", members, STAFF);
     payroll.approve(partial.id, STAFF);
     payroll.execute(partial.id, STAFF);
+    ledger.setAccountStatus("user:alice", "active");
 
-    const cancelled = payroll.generateDraft("2026-11", members, STAFF);
-    payroll.cancel(cancelled.id, STAFF);
+    const succeeded = payroll.generateDraft("2026-09", members, STAFF);
+    payroll.approve(succeeded.id, STAFF);
+    payroll.execute(succeeded.id, STAFF);
+
+    const approved = payroll.generateDraft("2026-08", members, STAFF);
+    payroll.approve(approved.id, STAFF);
+
+    payroll.generateDraft("2026-07", members, STAFF);
 
     expect(payroll.listRecoverableRuns().map((run) => [run.period, run.status])).toEqual([
       ["2026-07", "draft"],
       ["2026-08", "approved"],
       ["2026-10", "executed"],
     ]);
+
+    db.close();
+  });
+
+  it("新しい月の生成・承認・実行を、より古い未完了Runが構造的にブロックする", () => {
+    const { db, payroll } = setup();
+
+    const august = payroll.generateDraft("2026-08", members, STAFF);
+    const july = payroll.generateDraft("2026-07", members, STAFF);
+
+    expect(() => payroll.generateDraft("2026-09", members, STAFF)).toThrowError(/ERR_OLDER_RUN_PENDING/);
+    expect(() => payroll.approve(august.id, STAFF)).toThrowError(/ERR_OLDER_RUN_PENDING/);
+
+    payroll.approve(july.id, STAFF);
+    payroll.execute(july.id, STAFF);
+    payroll.approve(august.id, STAFF);
+
+    const june = payroll.generateDraft("2026-06", members, STAFF);
+    payroll.approve(june.id, STAFF);
+    expect(() => payroll.execute(august.id, STAFF)).toThrowError(/ERR_OLDER_RUN_PENDING/);
 
     db.close();
   });
