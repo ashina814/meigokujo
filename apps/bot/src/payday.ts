@@ -1,7 +1,8 @@
+import { createHash } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
-  ButtonInteraction,
+  type ButtonInteraction,
   ButtonStyle,
   EmbedBuilder,
   MessageFlags,
@@ -9,38 +10,72 @@ import {
   type Guild,
   type TextChannel,
 } from "discord.js";
-import { PayrollError, type MemberRoles, type PayoutPlan } from "@meigokujo/core";
+import { PayrollError, type MemberRoles, type PayoutPlan, type PayoutRunRow } from "@meigokujo/core";
 import { fmtLd } from "./format.js";
 import { isAdmin } from "./permissions.js";
 import type { Services } from "./services.js";
+
+const EMBED_DESCRIPTION_LIMIT = 3_900;
+const RESULT_CONTENT_LIMIT = 1_800;
+
+function planHash(run: PayoutRunRow): string {
+  return createHash("sha256").update(run.plan_json).digest("hex").slice(0, 12);
+}
+
+function shorten(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function boundedLines(
+  fixed: string[],
+  details: string[],
+  omittedLabel: (count: number) => string,
+  limit: number,
+): string {
+  const output = [...fixed];
+  for (let index = 0; index < details.length; index += 1) {
+    const remaining = details.length - index - 1;
+    const suffix = remaining > 0 ? omittedLabel(remaining) : "";
+    const candidate = [...output, details[index]!, suffix].filter(Boolean).join("\n");
+    if (candidate.length > limit) {
+      output.push(omittedLabel(details.length - index));
+      break;
+    }
+    output.push(details[index]!);
+  }
+  return shorten(output.filter(Boolean).join("\n"), limit);
+}
 
 /** ギルドの全メンバーからロール一覧を作る（Bot除外）。GuildMembers インテント必須 */
 async function collectMembers(guild: Guild): Promise<MemberRoles[]> {
   const members = await guild.members.fetch();
   return members
-    .filter((m) => !m.user.bot)
-    .map((m) => ({ userId: m.id, roleIds: [...m.roles.cache.keys()] }));
+    .filter((member) => !member.user.bot)
+    .map((member) => ({ userId: member.id, roleIds: [...member.roles.cache.keys()] }));
 }
 
 function planEmbed(plan: PayoutPlan, runId: number): EmbedBuilder {
-  const top = [...plan.items]
-    .sort((a, b) => b.total - a.total)
-    .slice(0, 15)
-    .map((i) => `<@${i.userId}> — **${fmtLd(i.total)}**（${i.breakdown.map((b) => b.label).join("+")}）`);
-  const rest = plan.items.length - top.length;
+  const detailLines = [...plan.items]
+    .sort((a, b) => b.total - a.total || a.userId.localeCompare(b.userId))
+    .map((item) => {
+      const labels = shorten(item.breakdown.map((part) => part.label).join(" + "), 320);
+      return `<@${item.userId}> — **${fmtLd(item.total)}**（${labels}）`;
+    });
+  const description = boundedLines(
+    [`対象: **${plan.items.length}名** / 総額: **${fmtLd(plan.totalPayout)}**（国庫から発行）`, ""],
+    detailLines.slice(0, 15),
+    (count) => `…他 ${count + Math.max(0, detailLines.length - 15)}名（全件は管理画面の給与明細で確認）`,
+    EMBED_DESCRIPTION_LIMIT,
+  );
   return new EmbedBuilder()
     .setTitle(`💰 ${plan.period} 給与支給案 (#${runId})`)
-    .setDescription(
-      [
-        `対象: **${plan.items.length}名** / 総額: **${fmtLd(plan.totalPayout)}**（国庫から発行）`,
-        "",
-        ...top,
-        rest > 0 ? `…他 ${rest} 名` : "",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-    )
+    .setDescription(description)
     .setColor(0xd97706);
+}
+
+function staleSnapshotMessage(): string {
+  return "⚠️ この給与パネルの支給案は、作成後に再集計または更新されています。ここからは支給せず、`/管理 → 給与` で最新の対象者・金額を確認してください。";
 }
 
 /**
@@ -78,20 +113,21 @@ export async function createAndPostDraft(
   try {
     const run = services.payroll.generateDraft(period, members, actor);
     const plan = services.payroll.planOf(run);
+    const hash = planHash(run);
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`pay:ok:${run.id}`).setLabel("承認して支給").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId(`pay:no:${run.id}`).setLabel("今月は見送り").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId(`pay:ok:${run.id}:${hash}`).setLabel("承認して支給").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`pay:no:${run.id}:${hash}`).setLabel("今月は見送り").setStyle(ButtonStyle.Danger),
     );
     await kessai.send({ embeds: [planEmbed(plan, run.id)], components: [row] });
     return { ok: true, runId: run.id };
-  } catch (e) {
-    if (e instanceof PayrollError && e.code === "ERR_EMPTY_PLAN") {
+  } catch (error) {
+    if (error instanceof PayrollError && error.code === "ERR_EMPTY_PLAN") {
       return { ok: false, message: "支給対象がいません。/給与表 にロールを登録してください。" };
     }
-    if (e instanceof PayrollError && e.code === "ERR_INVALID_STATUS") {
+    if (error instanceof PayrollError && error.code === "ERR_INVALID_STATUS") {
       return { ok: false, message: `${period} の支給案は既に承認/実行済みです。` };
     }
-    throw e;
+    throw error;
   }
 }
 
@@ -106,55 +142,72 @@ export async function handlePaydayButton(
   const parts = interaction.customId.split(":");
   const action = parts[1];
   const runId = Number(parts[2]);
-  if (!action || !Number.isSafeInteger(runId)) return;
-
-  const actor = `user:${interaction.user.id}`;
-
-  if (action === "no") {
-    try {
-      services.payroll.cancel(runId, actor);
-    } catch (e) {
-      if (e instanceof PayrollError) {
-        await interaction.reply({ content: `処理できません: ${e.code}`, flags: MessageFlags.Ephemeral });
-        return;
-      }
-      throw e;
-    }
-    await interaction.update({
-      embeds: interaction.message.embeds,
-      components: [],
-      content: `❌ <@${interaction.user.id}> が今月の支給を見送りました。`,
-    });
+  const expectedHash = parts[3];
+  if ((action !== "ok" && action !== "no") || !Number.isSafeInteger(runId)) return;
+  if (!expectedHash) {
+    await interaction.reply({ content: staleSnapshotMessage(), flags: MessageFlags.Ephemeral });
     return;
   }
 
-  // 承認 → 実行。実行には時間がかかりうるので先に応答を確定させる
-  await interaction.update({
-    embeds: interaction.message.embeds,
-    components: [],
-    content: `⏳ <@${interaction.user.id}> が承認しました。支給を実行中…`,
-  });
+  const actor = `user:${interaction.user.id}`;
+  await interaction.deferUpdate();
 
   try {
-    const run = services.payroll.getRun(runId);
-    if (run.status === "draft") services.payroll.approve(runId, actor);
+    let run = services.payroll.getRun(runId);
+    if (planHash(run) !== expectedHash) {
+      await interaction.editReply({
+        embeds: interaction.message.embeds,
+        components: [],
+        content: staleSnapshotMessage(),
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
+
+    if (action === "no") {
+      services.payroll.cancel(runId, actor);
+      await interaction.editReply({
+        embeds: interaction.message.embeds,
+        components: [],
+        content: `❌ <@${interaction.user.id}> が今月の支給を見送りました。`,
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
+
+    if (run.status === "draft") run = services.payroll.approve(runId, actor);
+    if (run.status !== "approved") {
+      throw new PayrollError("ERR_INVALID_STATUS", { id: runId, status: run.status, expected: "approved" });
+    }
+
     const report = services.payroll.execute(runId, actor);
-    const lines = [
+    const fixed = [
       `✅ 支給完了: 成功 **${report.succeeded}件** / 支給済みスキップ ${report.skippedAsPaid}件 / 失敗 ${report.failed.length}件`,
       `支給総額: **${fmtLd(report.totalPaid)}** / 通貨発行残高: ${fmtLd(services.ledger.moneySupply())}`,
     ];
-    if (report.failed.length > 0) {
-      lines.push(
-        "失敗: " + report.failed.map((f) => `<@${f.userId}>（${f.code}）`).join(", "),
-        "（原因解消後にもう一度実行すれば、失敗分だけ支給されます）",
-      );
-    }
-    await interaction.editReply({ content: lines.join("\n") });
-  } catch (e) {
-    if (e instanceof PayrollError) {
-      await interaction.editReply({ content: `❌ 実行に失敗しました: ${e.code}` });
+    const failures = report.failed.map((failure) => `<@${failure.userId}>（${failure.code}）`);
+    const content = boundedLines(
+      fixed,
+      failures.length > 0 ? ["失敗: " + failures.join(", "), "原因解消後は `/管理 → 給与` から未払い分だけ再実行できます。"] : [],
+      (count) => `…他 ${count}件`,
+      RESULT_CONTENT_LIMIT,
+    );
+    await interaction.editReply({
+      embeds: interaction.message.embeds,
+      components: [],
+      content,
+      allowedMentions: { parse: [] },
+    });
+  } catch (error) {
+    if (error instanceof PayrollError) {
+      await interaction.editReply({
+        embeds: interaction.message.embeds,
+        components: [],
+        content: `❌ 実行に失敗しました: ${error.code}`,
+        allowedMentions: { parse: [] },
+      });
       return;
     }
-    throw e;
+    throw error;
   }
 }
