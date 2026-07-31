@@ -64,8 +64,8 @@ function planEmbed(plan: PayoutPlan, runId: number): EmbedBuilder {
     });
   const description = boundedLines(
     [`対象: **${plan.items.length}名** / 総額: **${fmtLd(plan.totalPayout)}**（国庫から発行）`, ""],
-    detailLines.slice(0, 15),
-    (count) => `…他 ${count + Math.max(0, detailLines.length - 15)}名（全件は管理画面の給与明細で確認）`,
+    detailLines,
+    (count) => `…他 ${count}名（全件は /管理 → 給与 の明細で確認）`,
     EMBED_DESCRIPTION_LIMIT,
   );
   return new EmbedBuilder()
@@ -185,17 +185,20 @@ export async function handlePaydayButton(
       `✅ 支給完了: 成功 **${report.succeeded}件** / 支給済みスキップ ${report.skippedAsPaid}件 / 失敗 ${report.failed.length}件`,
       `支給総額: **${fmtLd(report.totalPaid)}** / 通貨発行残高: ${fmtLd(services.ledger.moneySupply())}`,
     ];
-    const failures = report.failed.map((failure) => `<@${failure.userId}>（${failure.code}）`);
+    const failureLines = report.failed.map((failure) => `<@${failure.userId}>（${failure.code}）`);
     const content = boundedLines(
       fixed,
-      failures.length > 0 ? ["失敗: " + failures.join(", "), "原因解消後は `/管理 → 給与` から未払い分だけ再実行できます。"] : [],
-      (count) => `…他 ${count}件`,
+      failureLines,
+      (count) => `…他 ${count}件（詳細は /管理 → 給与）`,
       RESULT_CONTENT_LIMIT,
     );
     await interaction.editReply({
       embeds: interaction.message.embeds,
       components: [],
-      content,
+      content:
+        report.failed.length > 0
+          ? `${content}\n原因解消後は \`/管理 → 給与\` から未払い分だけ再実行できます。`
+          : content,
       allowedMentions: { parse: [] },
     });
   } catch (error) {
