@@ -194,7 +194,7 @@ function makeTicketButtonHarness(options: {
       displayName: "橋本",
       roles: { cache: { has: (roleId: string) => roleId === "staff_role" } },
     },
-    message: { id: "control1", content: controlMessage.content },
+    message: { id: "control1", content: controlMessage.content, edit: vi.fn(async () => undefined) },
     reply: vi.fn(async () => undefined),
     update: vi.fn(async () => undefined),
   };
@@ -428,8 +428,8 @@ describe("チケット対応UI", () => {
     expect(h.interaction.update).toHaveBeenCalledWith(
       expect.objectContaining({ content: expect.stringContaining("クローズしました"), components: [] }),
     );
-    expect(h.thread.setLocked).toHaveBeenCalledWith(true);
-    expect(h.thread.setArchived).toHaveBeenCalledWith(true);
+    expect(h.thread.setLocked).toHaveBeenCalledWith(true, "チケット完了");
+    expect(h.thread.setArchived).toHaveBeenCalledWith(true, "チケット完了");
   });
 
   it("クローズ確認をキャンセルできる", async () => {
