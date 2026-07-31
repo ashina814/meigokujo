@@ -1,5 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import { EventLog, Ledger, openDb, registerDefaultTxTypes, Settings, Shop, Tickets, TREASURY } from "@meigokujo/core";
+import {
+  EventLog,
+  Ledger,
+  openDb,
+  registerDefaultTxTypes,
+  SessionCalendar,
+  Settings,
+  Shop,
+  Tickets,
+  TREASURY,
+} from "@meigokujo/core";
 import { runSchedulerTaskOnce, sendChunkedLines } from "../src/scheduler-utils.js";
 
 process.env.DISCORD_TOKEN = process.env.DISCORD_TOKEN ?? "test-token";
@@ -77,87 +87,49 @@ describe("sendChunkedLines", () => {
   });
 });
 
-describe("説明会の開催枠", () => {
-  function scheduleFor(values: Record<string, string>) {
-    const settings = { getString: vi.fn((key: string) => values[key]) };
-    return { settings };
+describe("次の説明会", () => {
+  // 案内の「次は何時か」は通常枠だけでなく休止・臨時追加まで織り込んだ実際の予定を返す。
+  // 通常枠の設定そのものの解釈は packages/core の entry-sessions.test.ts が持つ。
+  function calendarServices() {
+    const db = openDb(":memory:");
+    const settings = new Settings(db);
+    const sessions = new SessionCalendar(db, settings, new EventLog(db));
+    return { db, settings, sessions, services: { db, settings, sessions } as any };
   }
 
-  it("未設定なら現行運用（月・木を除く 21/22/23時）のまま", async () => {
-    const { sessionSchedule, describeSessionSchedule, nextSessionStart } = await import("../src/scheduler.js");
-    const schedule = sessionSchedule(scheduleFor({}) as any);
+  it("例外が無ければ通常枠どおり", async () => {
+    const { db, services } = calendarServices();
+    const { nextSessionStart } = await import("../src/scheduler.js");
 
-    expect(schedule).toEqual({ hours: [21, 22, 23], skipDow: [1, 4] });
-    expect(describeSessionSchedule(schedule)).toBe("月・木を除く 21 / 22 / 23 時");
+    // 金 21:30 JST → 同日22時会
+    expect(nextSessionStart(services, new Date("2026-07-31T12:30:00Z"))?.toISOString()).toBe("2026-07-31T13:00:00.000Z");
+    // 日 23:30 JST → 月曜は休みなので火曜21時会
+    expect(nextSessionStart(services, new Date("2026-08-02T14:30:00Z"))?.toISOString()).toBe("2026-08-04T12:00:00.000Z");
+    db.close();
+  });
 
-    // 2026-07-31(金) 21:30 JST → 同日22時会
-    const friday2130 = new Date("2026-07-31T12:30:00Z");
-    expect(nextSessionStart(schedule, friday2130)?.toISOString()).toBe("2026-07-31T13:00:00.000Z");
-    // 日曜23:30 JST → 月曜は休みなので火曜21時会
+  it("休止した枠は案内せず、臨時追加した枠は案内する", async () => {
+    const { db, sessions, services } = calendarServices();
+    const { nextSessionStart } = await import("../src/scheduler.js");
+    const friday2030 = new Date("2026-07-31T11:30:00Z");
+
+    sessions.skip({ date: "2026-07-31", hour: 21, reason: "門番不在", actor: "user:1", now: friday2030 });
+    expect(nextSessionStart(services, friday2030)?.toISOString()).toBe("2026-07-31T13:00:00.000Z");
+
+    // 月曜は通常休みだが、臨時枠を足せばそこが次の案内になる
     const sunday2330 = new Date("2026-08-02T14:30:00Z");
-    expect(nextSessionStart(schedule, sunday2330)?.toISOString()).toBe("2026-08-04T12:00:00.000Z");
+    sessions.add({ date: "2026-08-03", hour: 21, actor: "user:1", now: sunday2330 });
+    expect(nextSessionStart(services, sunday2330)?.toISOString()).toBe("2026-08-03T12:00:00.000Z");
+    db.close();
   });
 
-  it("設定した時刻・休みの曜日で次の開催が決まる", async () => {
-    const { sessionSchedule, describeSessionSchedule, nextSessionStart } = await import("../src/scheduler.js");
-    const schedule = sessionSchedule(
-      scheduleFor({ "entry:session_hours": "[20, 22]", "entry:session_skip_dow": "[0, 6]" }) as any,
-    );
+  it("開催予定が無ければ null", async () => {
+    const { db, settings, services } = calendarServices();
+    const { nextSessionStart } = await import("../src/scheduler.js");
+    settings.set("entry:session_skip_dow", "[0,1,2,3,4,5,6]", "test");
 
-    expect(schedule).toEqual({ hours: [20, 22], skipDow: [0, 6] });
-    expect(describeSessionSchedule(schedule)).toBe("日・土を除く 20 / 22 時");
-    // 金曜22:30 JST → 土日は休みなので月曜20時会
-    expect(nextSessionStart(schedule, new Date("2026-07-31T13:30:00Z"))?.toISOString()).toBe("2026-08-03T11:00:00.000Z");
-  });
-
-  it("カンマ区切りでも受け付け、範囲外・数値でない値は捨てる", async () => {
-    const { sessionSchedule } = await import("../src/scheduler.js");
-    const schedule = sessionSchedule(
-      scheduleFor({ "entry:session_hours": "23, 21, 21, 24, あ", "entry:session_skip_dow": "4,1" }) as any,
-    );
-
-    expect(schedule).toEqual({ hours: [21, 23], skipDow: [1, 4] });
-  });
-
-  it("整数以外は数値に化かさず捨てる（true/null/小数/16進表記など）", async () => {
-    const { sessionSchedule } = await import("../src/scheduler.js");
-
-    // Number(true)===1 / Number(null)===0 で通してしまうと、意図しない時刻に説明会が立つ
-    expect(sessionSchedule(scheduleFor({ "entry:session_hours": "[true, 21]" }) as any).hours).toEqual([21]);
-    expect(sessionSchedule(scheduleFor({ "entry:session_hours": "[null, 22]" }) as any).hours).toEqual([22]);
-    expect(sessionSchedule(scheduleFor({ "entry:session_hours": "[true]" }) as any).hours).toEqual([21, 22, 23]);
-    expect(sessionSchedule(scheduleFor({ "entry:session_hours": "[null]" }) as any).hours).toEqual([21, 22, 23]);
-    expect(sessionSchedule(scheduleFor({ "entry:session_hours": "[21.5, 23]" }) as any).hours).toEqual([23]);
-    expect(sessionSchedule(scheduleFor({ "entry:session_hours": '["0x15", " 21 "]' }) as any).hours).toEqual([21]);
-    expect(sessionSchedule(scheduleFor({ "entry:session_skip_dow": "[true, false]" }) as any).skipDow).toEqual([1, 4]);
-  });
-
-  it("休みなしと認めるのは明示的な [] だけ、時刻が全滅した設定は既定値へ落とす", async () => {
-    const { sessionSchedule, describeSessionSchedule } = await import("../src/scheduler.js");
-    const everyday = sessionSchedule(scheduleFor({ "entry:session_skip_dow": "[]" }) as any);
-    expect(everyday.skipDow).toEqual([]);
-    expect(describeSessionSchedule(everyday)).toBe("毎日 21 / 22 / 23 時");
-
-    // 区切り文字だけ・整数が1つも無い値は「休みなし」ではなく誤設定として扱う
-    expect(sessionSchedule(scheduleFor({ "entry:session_skip_dow": "," }) as any).skipDow).toEqual([1, 4]);
-    expect(sessionSchedule(scheduleFor({ "entry:session_skip_dow": "毎日" }) as any).skipDow).toEqual([1, 4]);
-    expect(sessionSchedule(scheduleFor({ "entry:session_skip_dow": "[9]" }) as any).skipDow).toEqual([1, 4]);
-
-    // 説明会が黙って消えるほうが害が大きいので、壊れた値は既定値で運転を続ける
-    const broken = sessionSchedule(
-      scheduleFor({ "entry:session_hours": "[99]", "entry:session_skip_dow": "毎日" }) as any,
-    );
-    expect(broken).toEqual({ hours: [21, 22, 23], skipDow: [1, 4] });
-    // 開催時刻は空にできない（`[]` でも定例が消えるだけなので既定値へ戻す）
-    expect(sessionSchedule(scheduleFor({ "entry:session_hours": "[]" }) as any).hours).toEqual([21, 22, 23]);
-  });
-
-  it("全曜日が休みなら次の開催は無い", async () => {
-    const { sessionSchedule, describeSessionSchedule, nextSessionStart } = await import("../src/scheduler.js");
-    const schedule = sessionSchedule(scheduleFor({ "entry:session_skip_dow": "[0,1,2,3,4,5,6]" }) as any);
-
-    expect(nextSessionStart(schedule, new Date("2026-07-31T12:30:00Z"))).toBeNull();
-    expect(describeSessionSchedule(schedule)).toBe("現在は定例の説明会がありません");
+    expect(nextSessionStart(services, new Date("2026-07-31T12:30:00Z"))).toBeNull();
+    db.close();
   });
 });
 

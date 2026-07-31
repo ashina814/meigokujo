@@ -34,6 +34,28 @@ export { parseBalanceDump, splitForMigration, type DumpEntry, type ParsedDump, t
 export { Migration, MigrationError, type MigrationErrorCode, type StagingRow, type StagingStatus, type MemberNameInfo, type ImportSummary, type MigrationReport } from "./migration/service.js";
 export { EventLog, type EventRow } from "./events/service.js";
 export { Entry, type BookingRow, type SoulRow, type GhostifyResult, type BookingStatus, type InviterSource } from "./entry/service.js";
+export {
+  SessionCalendar,
+  SessionCalendarError,
+  sessionSchedule,
+  describeSessionSchedule,
+  jstDateStr,
+  jstDayOfWeekFor,
+  sessionStartAt,
+  addJstDays,
+  normalizeDateStr,
+  formatJstDate,
+  DEFAULT_SESSION_HOURS,
+  DEFAULT_SESSION_SKIP_DOW,
+  SESSION_HOURS_KEY,
+  SESSION_SKIP_DOW_KEY,
+  SESSION_SEARCH_DAYS,
+  type SessionSchedule,
+  type SessionOccurrence,
+  type SessionOverrideKind,
+  type SessionOverrideRow,
+  type SessionCalendarErrorCode,
+} from "./entry/sessions.js";
 export { VcTracker, type VcSegment, type PresenceSummary } from "./vc/service.js";
 export {
   RankEngine,
