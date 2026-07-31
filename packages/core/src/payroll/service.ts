@@ -7,7 +7,8 @@ export type PayrollErrorCode =
   | "ERR_RUN_NOT_FOUND"
   | "ERR_INVALID_STATUS"
   | "ERR_INVALID_AMOUNT"
-  | "ERR_EMPTY_PLAN";
+  | "ERR_EMPTY_PLAN"
+  | "ERR_OLDER_RUN_PENDING";
 
 export class PayrollError extends Error {
   constructor(
@@ -128,6 +129,9 @@ export class Payroll {
   generateDraft(period: string, members: MemberRoles[], actor: string): PayoutRunRow {
     if (!PERIOD_RE.test(period)) throw new PayrollError("ERR_INVALID_PERIOD", { period });
 
+    const existing = this.getRunByPeriod(period);
+    this.assertNoOlderRecoverable(period, existing?.id);
+
     const salaries = new Map(this.listSalaries().map((s) => [s.role_id, s]));
     const items: PlanItem[] = [];
     for (const member of members) {
@@ -151,7 +155,6 @@ export class Payroll {
       totalPayout: items.reduce((sum, i) => sum + i.total, 0),
     };
 
-    const existing = this.getRunByPeriod(period);
     const ts = now();
     if (existing) {
       if (existing.status !== "draft") {
@@ -211,6 +214,18 @@ export class Payroll {
     });
   }
 
+  private assertNoOlderRecoverable(period: string, excludedRunId?: number): void {
+    const blocker = this.listRecoverableRuns().find((run) => run.id !== excludedRunId && run.period < period);
+    if (blocker) {
+      throw new PayrollError("ERR_OLDER_RUN_PENDING", {
+        period,
+        blockerId: blocker.id,
+        blockerPeriod: blocker.period,
+        blockerStatus: blocker.status,
+      });
+    }
+  }
+
   planOf(run: PayoutRunRow): PayoutPlan {
     return JSON.parse(run.plan_json) as PayoutPlan;
   }
@@ -220,6 +235,7 @@ export class Payroll {
     if (run.status !== "draft") {
       throw new PayrollError("ERR_INVALID_STATUS", { id, status: run.status, expected: "draft" });
     }
+    this.assertNoOlderRecoverable(run.period, run.id);
     this.db
       .prepare("UPDATE payout_runs SET status = 'approved', approved_by = ?, updated_at = ? WHERE id = ?")
       .run(actor, now(), id);
@@ -251,6 +267,7 @@ export class Payroll {
     if (run.status !== "approved" && run.status !== "executed") {
       throw new PayrollError("ERR_INVALID_STATUS", { id, status: run.status, expected: "approved" });
     }
+    this.assertNoOlderRecoverable(run.period, run.id);
     const plan = this.planOf(run);
 
     const report: ExecutionReport = { succeeded: 0, skippedAsPaid: 0, failed: [], totalPaid: 0 };
