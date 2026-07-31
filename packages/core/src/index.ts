@@ -66,6 +66,7 @@ export {
   type ShopRoleRevocationRow,
 } from "./shop/service.js";
 export {
+  Tickets,
   type TicketRow,
   type TicketKind,
   type TicketStatus,
@@ -74,7 +75,6 @@ export {
   type TicketPanelRow,
 } from "./tickets/service.js";
 export { ensureTicketOpenUniqueness } from "./tickets/constraints.js";
-export { Tickets, closeActiveTicket } from "./tickets/close-active.js";
 export {
   Confessions,
   type ConfessionRow,
