@@ -5,6 +5,26 @@ import { EventLog } from "../events/service.js";
 
 export type BookingStatus = "booked" | "attended" | "ghosted" | "dropped";
 export type InviterSource = "user" | "disboard" | "lumina" | "none";
+/** 招待経路が誰の手で分かったか: auto=招待リンクの自動検出 / staff=門番の補足 */
+export type InviterOrigin = "auto" | "staff";
+
+/**
+ * 招待経路の「検出・補足」（未確定）。確定は invites 行 + souls.inviter_user_id。
+ * legacy=true は PR #34 以前に entry_bookings へ入った検出結果を読んだもの。
+ */
+export interface InviterHint {
+  inviterUserId: string | null;
+  source: InviterSource;
+  origin: InviterOrigin | null;
+  detectedAt: number | null;
+  legacy: boolean;
+}
+
+/** 確定済みの招待実績（invites 行） */
+export interface ConfirmedInvite {
+  inviterId: string;
+  creditedAt: number;
+}
 
 export interface BookingRow {
   user_id: string;
@@ -32,6 +52,10 @@ export interface SoulRow {
   eval_invite_mark_cap: number | null;
   inviter_user_id: string | null;
   inviter_source: string | null;
+  inviter_hint_user_id: string | null;
+  inviter_hint_source: string | null;
+  inviter_hint_origin: string | null;
+  inviter_hint_at: number | null;
   updated_at: number;
 }
 
@@ -44,6 +68,14 @@ export interface GhostifyResult {
 
 const now = () => Math.floor(Date.now() / 1000);
 const DAY = 86_400;
+
+/** 入城を済ませている階級（departed は入城前の離脱と区別が付かないので含めない） */
+const ENTERED_STATUSES: ReadonlySet<SoulRow["status"]> = new Set<SoulRow["status"]>([
+  "ghost",
+  "majin",
+  "mazoku",
+  "meirei",
+]);
 
 function positiveInt(value: unknown, fallback: number): number {
   const n = Number(value);
@@ -67,16 +99,23 @@ export class Entry {
     private readonly events: EventLog,
   ) {}
 
-  /** サーバー参加の記録（魂台帳に waiting で登録） */
-  recordJoin(userId: string): void {
+  /**
+   * サーバー参加の記録（魂台帳に waiting で登録）。
+   * join の事件録は **INSERT が成立した時だけ** 残す。既存メンバーへの招待登録などで
+   * 何度も呼ばれる経路があり、そこで join を重ねると参加日時の記録が壊れるため。
+   * 戻り値は「新しく魂を作ったか」。
+   */
+  recordJoin(userId: string): boolean {
     const ts = now();
-    this.db
+    const info = this.db
       .prepare(
         `INSERT INTO souls (user_id, status, joined_at, updated_at) VALUES (?, 'waiting', ?, ?)
          ON CONFLICT(user_id) DO NOTHING`,
       )
       .run(userId, ts, ts);
+    if (info.changes === 0) return false;
     this.events.log("join", { target: userId });
+    return true;
   }
 
   getSoul(userId: string): SoulRow | undefined {
@@ -123,7 +162,84 @@ export class Entry {
       | undefined;
   }
 
-  /** 説明会枠の予約（再予約は上書き）。ghosted 済みは受け付けない */
+  // ---- 招待経路: 検出・補足（未確定）----
+
+  /**
+   * 招待経路の検出・補足を保存する。**招待実績は確定しない**（invites 行を作らない）。
+   * 確定は亡霊化した時点（ghostify）か、亡霊化済み相手への後追い登録（recordInviterByStaff）。
+   *
+   * 予約行は作らない。waiting の人も魂は必ずあるので、置き場所は souls 側の hint 列。
+   * 既に確定済み（invites 行あり）の相手は上書きしない — 付け替えは取り消し設計とセットの
+   * 別操作にする（設計案 12節）。
+   */
+  recordInviterHint(
+    inviteeId: string,
+    inviter: { userId?: string; source: InviterSource },
+    origin: InviterOrigin,
+    actor: string,
+  ): { saved: boolean; reason?: "self" | "already" } {
+    if (inviter.userId && inviter.userId === inviteeId) return { saved: false, reason: "self" };
+    if (this.getConfirmedInvite(inviteeId)) return { saved: false, reason: "already" };
+
+    const ts = now();
+    this.recordJoin(inviteeId); // 魂が無い相手（移行前からの在籍者など）でも受け付ける
+    this.db
+      .prepare(
+        `UPDATE souls
+         SET inviter_hint_user_id = ?, inviter_hint_source = ?, inviter_hint_origin = ?,
+             inviter_hint_at = ?, updated_at = ?
+         WHERE user_id = ?`,
+      )
+      .run(inviter.userId ?? null, inviter.source, origin, ts, ts, inviteeId);
+    this.events.log("inviter_hint", {
+      actor,
+      target: inviteeId,
+      payload: { inviter: inviter.userId ?? null, source: inviter.source, origin },
+    });
+    return { saved: true };
+  }
+
+  /**
+   * 招待経路の検出・補足を読む。souls の hint 列を優先し、無ければ entry_bookings を見る
+   * （PR #34 以前に予約行へ入った検出結果を捨てないための、読み取り専用フォールバック）。
+   */
+  getInviterHint(userId: string): InviterHint | null {
+    const soul = this.getSoul(userId);
+    if (soul?.inviter_hint_source) {
+      return {
+        inviterUserId: soul.inviter_hint_user_id,
+        source: soul.inviter_hint_source as InviterSource,
+        origin: (soul.inviter_hint_origin as InviterOrigin | null) ?? null,
+        detectedAt: soul.inviter_hint_at,
+        legacy: false,
+      };
+    }
+    const booking = this.getBooking(userId);
+    if (!booking) return null;
+    // 旧データ: inviter_source は NOT NULL DEFAULT 'none' なので、招待者も経路も無い行は
+    // 「未検出」として扱う（'none' を明示登録した行と区別が付かないため、安全側に倒す）
+    if (!booking.inviter_user_id && booking.inviter_source === "none") return null;
+    return {
+      inviterUserId: booking.inviter_user_id,
+      source: (booking.inviter_source as InviterSource) ?? "none",
+      origin: null,
+      detectedAt: booking.created_at,
+      legacy: true,
+    };
+  }
+
+  /** 確定済みの招待実績（invites 行）。無ければ null */
+  getConfirmedInvite(inviteeId: string): ConfirmedInvite | null {
+    const row = this.db
+      .prepare("SELECT inviter_id, credited_at FROM invites WHERE invitee_id = ?")
+      .get(inviteeId) as { inviter_id: string; credited_at: number } | undefined;
+    return row ? { inviterId: row.inviter_id, creditedAt: row.credited_at } : null;
+  }
+
+  /**
+   * @deprecated 予約制の名残。新しい導線は予約行を作らない（設計案 11節(3)）。
+   * 過去データの互換のために残してある。招待経路の保存には recordInviterHint を使う。
+   */
   book(userId: string, slot: string, inviter: { userId?: string; source: InviterSource }): BookingRow {
     const existing = this.getBooking(userId);
     if (existing?.status === "ghosted") return existing;
@@ -150,7 +266,10 @@ export class Entry {
     return changed.changes > 0;
   }
 
-  /** 指定枠の判定材料: 出席済みと欠席（bookedのまま）を分けて返す */
+  /**
+   * @deprecated 予約制の名残。現在の判定は VC 在室者を見る（presentWaiters）ので呼ばれていない。
+   * 削除は統計項目を決めた後の別PRで（設計案 11節(3)）。
+   */
   judgeSlot(slot: string): { attended: BookingRow[]; absent: BookingRow[] } {
     const rows = this.db
       .prepare("SELECT * FROM entry_bookings WHERE slot = ? AND status IN ('booked','attended')")
@@ -161,6 +280,7 @@ export class Entry {
     };
   }
 
+  /** @deprecated 予約制の名残。呼び出し元なし（設計案 11節(3)） */
   listBySlot(slot: string): BookingRow[] {
     return this.db
       .prepare("SELECT * FROM entry_bookings WHERE slot = ? AND status IN ('booked','attended') ORDER BY created_at")
@@ -249,24 +369,20 @@ export class Entry {
       idempotencyKey: `initial:user:${userId}`,
     });
 
-    // 招待実績: 予約に記録された招待者を魂台帳に写し、招待者の評価期限を延長する
-    const booking = this.getBooking(userId);
+    // 招待実績はここで初めて確定する（検出・補足だけでは確定しない）。
+    // 実際に亡霊化した＝説明会に来た人の招待だけを実績にする、という線引き。
+    const hint = this.getInviterHint(userId);
     let extended = 0;
-    if (booking?.inviter_user_id) {
-      this.db
-        .prepare("UPDATE souls SET inviter_user_id = ?, inviter_source = ?, updated_at = ? WHERE user_id = ?")
-        .run(booking.inviter_user_id, booking.inviter_source, ts, userId);
-      this.db
-        .prepare("INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?, ?, ?) ON CONFLICT(invitee_id) DO NOTHING")
-        .run(booking.inviter_user_id, userId, ts);
-      extended = this.extendInviterDeadline(booking.inviter_user_id, opts.inviteeGender ?? null);
-      this.events.log("invite_credited", {
-        actor: booking.inviter_user_id,
-        target: userId,
-        payload: { extendedDays: extended },
-      });
+    if (hint?.inviterUserId) {
+      extended = this.creditInvite(
+        userId,
+        hint.inviterUserId,
+        hint.source === "user" ? "user" : hint.source,
+        opts.inviteeGender ?? null,
+      ).extendedDays;
     }
 
+    const booking = this.getBooking(userId);
     if (booking) {
       this.db
         .prepare("UPDATE entry_bookings SET status = 'ghosted', updated_at = ? WHERE user_id = ?")
@@ -287,6 +403,133 @@ export class Entry {
       granted: grantResult.duplicate ? 0 : grant,
       evalDeadlineAt: deadline,
       inviterExtendedDays: extended,
+    };
+  }
+
+  /**
+   * 入城済みか（＝招待実績をその場で確定してよいか）。
+   *
+   * 本来は ghost_at の有無で判断できるはずだが、2026-07-06 の移行でバックフィルされた
+   * 行は階級だけ入って ghost_at が NULL のまま残っている（本番: 迷霊129 / 魔人2）。
+   * ghost_at だけで見るとこの人たちが「入城前」と誤判定され、後追い登録が保存だけで
+   * 止まって確定の機会を失うため、階級も補助条件にする。
+   *
+   * departed は入城前の離脱と区別が付かないので階級側には含めない。
+   * 亡霊化を経ていれば ghost_at が残っているので、そちら側で拾える。
+   */
+  private hasEnteredCastle(soul: SoulRow | undefined): boolean {
+    if (!soul) return false;
+    if (soul.ghost_at !== null && soul.ghost_at !== undefined) return true;
+    return ENTERED_STATUSES.has(soul.status);
+  }
+
+  /**
+   * 招待実績の記帳（魂台帳・invites・招待者の期限延長・事件録）。
+   *
+   * 亡霊化のタイミングと、門番による後追い登録（/審判 招待）の両方から呼ばれる。
+   * invites.invitee_id が UNIQUE なので「1人につき一度きり」。既に記帳済みなら
+   * 何もせず credited=false を返すので、どちらの順序で来ても二重に延長されない。
+   */
+  creditInvite(
+    inviteeId: string,
+    inviterId: string,
+    source: InviterSource,
+    inviteeGender: "male" | "female" | null,
+  ): { credited: boolean; extendedDays: number; reason?: "self" | "already" } {
+    if (inviteeId === inviterId) return { credited: false, extendedDays: 0, reason: "self" };
+
+    // 一連の書き込みを1トランザクションに包む。途中で例外・DBエラー・プロセス停止が
+    // 起きても、invites 行だけ残って期限延長が飛ぶ（次回は already になり、二度と
+    // 延長されない）という部分反映を防ぐため。
+    //
+    // 「一度きり」の判定は事前 SELECT ではなく UNIQUE 制約 + INSERT の結果に持たせる。
+    // 先に INSERT し、changes が 0 なら既に記帳済みとして何もしない。
+    const credit = this.db.transaction((): { credited: boolean; extendedDays: number } => {
+      const ts = now();
+      const inserted = this.db
+        .prepare(
+          "INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?, ?, ?) ON CONFLICT(invitee_id) DO NOTHING",
+        )
+        .run(inviterId, inviteeId, ts);
+      if (inserted.changes === 0) return { credited: false, extendedDays: 0 };
+
+      this.db
+        .prepare("UPDATE souls SET inviter_user_id = ?, inviter_source = ?, updated_at = ? WHERE user_id = ?")
+        .run(inviterId, source, ts, inviteeId);
+      const extendedDays = this.extendInviterDeadline(inviterId, inviteeGender);
+      this.events.log("invite_credited", {
+        actor: inviterId,
+        target: inviteeId,
+        payload: { extendedDays, source },
+      });
+      return { credited: true, extendedDays };
+    })();
+
+    return credit.credited ? credit : { credited: false, extendedDays: 0, reason: "already" };
+  }
+
+  /**
+   * 門番による招待経路の補足登録（`/審判 招待`）。
+   *
+   * 相手の状態で挙動が変わる:
+   *  - まだ亡霊化していない → **検出・補足を保存するだけ**。実績・期限延長・称号は動かない。
+   *    確定は本人が説明会に来て亡霊化した時（ghostify がこの hint を読んで確定する）
+   *  - 既に亡霊化済み（ghost_at あり）→ 後追い登録として **その場で確定**。予約行は作らない
+   *  - 既に確定済み（invites 行あり）→ **何も書き換えず** 既存の招待者を返す
+   *
+   * 確定の判定に status ではなく ghost_at を使うのは、亡霊化した後に退城・降格した人でも
+   * 「一度は説明会に来た」事実で正しく判断するため。
+   */
+  recordInviterByStaff(
+    inviteeId: string,
+    inviter: { userId?: string; source: InviterSource },
+    actor: string,
+    inviteeGender: "male" | "female" | null = null,
+  ): {
+    saved: boolean;
+    credited: boolean;
+    extendedDays: number;
+    pending: boolean;
+    reason?: "self" | "already";
+    existingInviterId?: string;
+  } {
+    if (inviter.userId && inviter.userId === inviteeId) {
+      return { saved: false, credited: false, extendedDays: 0, pending: false, reason: "self" };
+    }
+    const confirmed = this.getConfirmedInvite(inviteeId);
+    if (confirmed) {
+      // 確定済みは触らない。付け替えは取り消し設計とセットの別操作にする（設計案 12節）
+      return {
+        saved: false,
+        credited: false,
+        extendedDays: 0,
+        pending: false,
+        reason: "already",
+        existingInviterId: confirmed.inviterId,
+      };
+    }
+
+    const hintResult = this.recordInviterHint(inviteeId, inviter, "staff", actor);
+    if (!hintResult.saved) {
+      return { saved: false, credited: false, extendedDays: 0, pending: false, reason: hintResult.reason };
+    }
+
+    const soul = this.getSoul(inviteeId);
+    if (!this.hasEnteredCastle(soul)) {
+      // まだ入城していない。亡霊化の時に確定させる
+      return { saved: true, credited: false, extendedDays: 0, pending: true };
+    }
+    if (!inviter.userId) {
+      // ディスボード等は記帳対象の招待者がいない（経路の記録だけ）
+      return { saved: true, credited: false, extendedDays: 0, pending: false };
+    }
+    const credit = this.creditInvite(inviteeId, inviter.userId, inviter.source, inviteeGender);
+    return {
+      saved: true,
+      credited: credit.credited,
+      extendedDays: credit.extendedDays,
+      pending: false,
+      reason: credit.reason,
     };
   }
 
@@ -420,7 +663,10 @@ export class Entry {
     return { applied, ghostDeadlinesSet };
   }
 
-  /** 欠席処理: 3回連続でキューから外す（自動キックはしない） */
+  /**
+   * @deprecated 予約制の名残。予約枠が無くなったので欠席という状態が発生しない。
+   * 呼び出し元なし（設計案 11節(3)）。
+   */
   recordNoShow(userId: string): { count: number; dropped: boolean } {
     const ts = now();
     const booking = this.getBooking(userId);

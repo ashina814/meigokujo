@@ -42,7 +42,6 @@ export const panelCommand = new SlashCommandBuilder()
       .addChoices(
         { name: "冥獄銀行", value: "bank" },
         { name: "入城申請", value: "entry" },
-        { name: "時間外希望受付", value: "entry_flex" },
         { name: "ランク確認", value: "rank" },
         { name: "公式ショップ", value: "shop" },
         { name: "マモンの両替所", value: "exchange" },
@@ -74,7 +73,7 @@ export const panelRemoveCommand = new SlashCommandBuilder()
       .addChoices(
         { name: "冥獄銀行", value: "bank" },
         { name: "入城申請", value: "entry" },
-        { name: "時間外希望受付", value: "entry_flex" },
+        { name: "時間外希望受付（廃止・撤去用）", value: "entry_flex" },
         { name: "ランク確認", value: "rank" },
         { name: "公式ショップ", value: "shop" },
         { name: "マモンの両替所", value: "exchange" },
@@ -89,6 +88,8 @@ export const panelRemoveCommand = new SlashCommandBuilder()
       ),
   );
 
+// entry_flex は入城案内パネルへ統合済み。設置はできないが、既に設置してあるものを
+// 撤去する必要があるので種別としては残す。
 const PANEL_KINDS = [
   "bank",
   "entry",
@@ -234,8 +235,8 @@ export function savePanelSettingExternal(services: Services, kind: string, chann
 }
 
 function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services, channelId: string) {
-  if (kind === "entry") return entryPanelMessage();
-  if (kind === "entry_flex") return entryFlexPanelMessage();
+  if (kind === "entry") return entryPanelMessage(services);
+  if (kind === "entry_flex") return entryFlexPanelMessage(); // 廃止済み（撤去専用）
   if (kind === "rank") return rankPanelMessage();
   if (kind === "shop") return shopPanelMessage(services);
   if (kind === "exchange") return exchangePanelMessage(services);

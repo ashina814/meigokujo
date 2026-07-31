@@ -72,6 +72,25 @@ export function isSessionNotificationDue(
 }
 
 /**
+ * 次の説明会の開始時刻（JST 21/22/23時・月木は休み）。8日先まで見て無ければ null。
+ * 入城案内で「次は何時か」を具体的に出すために使う（抽象的な「21/22/23時です」だけだと
+ * 参加直後の人が次の機会をいつまで待つのか分からず、そのまま抜けてしまうため）。
+ */
+export function nextSessionStart(from = new Date()): Date | null {
+  const jst = jstNow(from);
+  for (let offset = 0; offset < 8; offset++) {
+    const base = Date.UTC(jst.year, jst.month - 1, jst.day + offset);
+    const dow = new Date(base).getUTCDay(); // 0=日, 1=月, 4=木
+    if (dow === 1 || dow === 4) continue;
+    for (const hour of [21, 22, 23]) {
+      const at = new Date(base + (hour - 9) * 3_600_000); // JSTは常にUTC+9
+      if (at.getTime() > from.getTime()) return at;
+    }
+  }
+  return null;
+}
+
+/**
  * 刻時盤（Scheduler）: 時間駆動タスクの土台。毎分tickし、各タスクは
  * settings のマーカーで「実行済みか」を自分で判定する（再起動しても二重実行しない）。
  */
@@ -79,22 +98,22 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
   async function tick(): Promise<void> {
     const now = jstNow();
 
-    // ── 説明会の案内: 月・木を除く 21/22/23 時の 30分前・5分前に入城案内chへ通知 ──
+    // ── 説明会の案内: 月・木を除く 21/22/23 時の 5分前に入城案内chへ通知 ──
     // JST の new Date().getDay(): 0=日, 1=月, 4=木
+    //
+    // 30分前の予告は廃止した。案内待ちロールへのメンションが 1日6回・週30回になり、
+    // まだ城の中を何も見ていない新規にとって離脱要因になっていたため（直前の1回だけに絞る）。
     {
       const jstDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
       const dow = jstDate.getDay();
       const isMonOrThu = dow === 1 || dow === 4;
       const sessions = [
-        { start: 21, minute: 30, kind: "30m" as const },
         { start: 21, minute: 55, kind: "5m" as const },
-        { start: 22, minute: 30, kind: "30m" as const },
         { start: 22, minute: 55, kind: "5m" as const },
-        { start: 23, minute: 30, kind: "30m" as const },
         { start: 23, minute: 55, kind: "5m" as const },
       ];
-      // 20:30/55, 21:30/55, 22:30/55 = 21時会前・22時会前・23時会前の 30min/5min 前
-      // すなわち session.start は 21/22/23、通知時刻は start-1 時 30/55 分
+      // 20:55, 21:55, 22:55 = 21時会前・22時会前・23時会前の 5min 前
+      // すなわち session.start は 21/22/23、通知時刻は start-1 時 55 分
       if (!isMonOrThu) {
         for (const s of sessions) {
           if (isSessionNotificationDue(now, s.start, s.minute)) {
