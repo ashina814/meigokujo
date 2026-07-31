@@ -196,7 +196,6 @@ export class Tickets {
     `);
     for (const panel of LEGACY_PANELS) insert.run({ ...panel, buttonEmoji: panel.buttonEmoji ?? null, ts });
 
-    // 列追加と既定パネルのシード完了後、旧式チケット整理と未完了重複制約を必ず適用する。
     return ensureTicketOpenUniqueness(this.db);
   }
 
@@ -420,9 +419,7 @@ export class Tickets {
   }
 
   get(threadId: string): TicketRow | undefined {
-    return this.db.prepare("SELECT * FROM tickets WHERE thread_id = ?").get(threadId) as
-      | TicketRow
-      | undefined;
+    return this.db.prepare("SELECT * FROM tickets WHERE thread_id = ?").get(threadId) as TicketRow | undefined;
   }
 
   claim(threadId: string, staffId: string): TicketRow | undefined {
@@ -433,16 +430,23 @@ export class Tickets {
   }
 
   close(threadId: string, staffId: string): TicketRow | undefined {
-    const ticket = this.get(threadId);
-    if (!ticket) return undefined;
-    this.db
-      .prepare("UPDATE tickets SET status = 'closed', updated_at = ? WHERE thread_id = ?")
-      .run(now(), threadId);
-    this.events.log("ticket_closed", { actor: staffId, target: ticket.user_id, payload: { threadId, kind: ticket.kind } });
-    return this.get(threadId);
+    const closeTicket = this.db.transaction(() => {
+      const ticket = this.get(threadId);
+      if (!ticket) return undefined;
+      const changed = this.db
+        .prepare("UPDATE tickets SET status = 'closed', updated_at = ? WHERE thread_id = ? AND status IN ('open','claimed')")
+        .run(now(), threadId);
+      if (changed.changes !== 1) return undefined;
+      this.events.log("ticket_closed", {
+        actor: staffId,
+        target: ticket.user_id,
+        payload: { threadId, kind: ticket.kind },
+      });
+      return this.get(threadId);
+    });
+    return closeTicket();
   }
 
-  /** 24時間（既定）誰も対応していない open チケット。リマインド済みは除く */
   staleOpen(hours = 24): TicketRow[] {
     const cutoff = now() - hours * 3600;
     return this.db
