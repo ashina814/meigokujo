@@ -19,7 +19,7 @@ import {
 } from "discord.js";
 import { fmtLd } from "../format.js";
 import { isAdmin } from "../permissions.js";
-import { jstNow } from "../scheduler.js";
+import { jstNow, nextSessionStart } from "../scheduler.js";
 import type { Services } from "../services.js";
 
 // ---- パネル ----
@@ -33,7 +33,7 @@ export function entryPanelMessage(): MessageCreateOptions {
         name: "📅 説明会の時間",
         value: [
           "**月・木を除く 21時 / 22時 / 23時** に開催しています。",
-          "開始 **30分前** と **5分前** にこのチャンネルでお知らせします。",
+          "開始 **5分前** にこのチャンネルでお知らせします。",
         ].join("\n"),
       },
       {
@@ -44,10 +44,11 @@ export function entryPanelMessage(): MessageCreateOptions {
         ].join("\n"),
       },
       {
-        name: "🚪 招待経路を登録（自動検出できなかった方向け）",
+        name: "🚪 招待経路の登録（任意）",
         value: [
-          "ディスボード・ルミナ経由で来た方や、招待者を手動で指定したい方は下のボタンから登録できます。",
-          "自動検出済みの方はこのボタンを押す必要はありません。",
+          "招待リンク経由の方は自動で記録されるので、操作は不要です。",
+          "ディスボード・ルミナ経由の方や、招待者を自分で伝えたい方だけ下のボタンをどうぞ。",
+          "押さなくても説明会には参加できます。分からなければ当日、門番に伝えてください。",
         ].join("\n"),
       },
     );
@@ -146,11 +147,6 @@ export async function handleEntryButton(
 
   if (id.startsWith("entry:pass") && interaction.isButton()) {
     await handlePassButton(interaction, services);
-    return;
-  }
-
-  if (id === "entry:invremind" && interaction.isButton()) {
-    await handleInviteRemind(interaction, services);
   }
 }
 
@@ -187,24 +183,72 @@ export async function handleMemberJoin(
   }
 
   // 入城案内chで本人メンション + パネル誘導（DMは使わない）
+  //
+  // 招待者の名前はここには出さない。誰が誰を連れてきたかを全員に見える形で出すと、
+  // 招待する側にも された側にもブレーキになる。招待情報は運営だけが見る入退室ログに残す。
   const guideId = services.settings.getString("channel:entry_guide");
   if (guideId) {
     const channel = (await member.client.channels.fetch(guideId).catch(() => null)) as TextChannel | null;
-    const invLine =
-      inviterId && inviterId !== member.id
-        ? `**招待者を自動検出しました**（<@${inviterId}> の招待リンク）。追加の登録は不要です。`
-        : "**上の案内パネル**から「招待経路を登録する（必須）」を押してから来てください。";
     await channel
       ?.send({
-        content: [
-          `👻 <@${member.id}> ようこそ冥獄城へ。`,
-          invLine,
-          "説明会は **月・木を除く 21/22/23 時** です（30分前と5分前にこのチャンネルで案内します）。**説明会場VC**でお待ちください。",
-        ].join("\n"),
+        content: `👻 <@${member.id}>`,
+        embeds: [buildWelcomeEmbed(member, services)],
         allowedMentions: { users: [member.id] },
       })
       .catch(() => undefined);
   }
+}
+
+/**
+ * 参加者向けの歓迎カード。
+ * 平文に太字を散らすと優先順位が見えないので、「いつ・どこへ・何をする」の3点だけを
+ * embed の枠で分けて出す。招待者の名前は載せない（公開すると招待の抑止になるため）。
+ *
+ * 招待経路の登録は新規に要求しない。検出できたものは黙って記録し、抜けたぶんは
+ * 門番が当日 `/審判 招待` で拾う。ここで手順を1つ増やすほうが損が大きい。
+ */
+function buildWelcomeEmbed(member: GuildMember, services: Services): EmbedBuilder {
+  const next = nextSessionStart();
+  const nextTs = next ? Math.floor(next.getTime() / 1000) : null;
+  const vcIds = [
+    services.settings.getString("channel:session_vc"),
+    services.settings.getString("channel:session_vc2"),
+  ].filter((v): v is string => !!v);
+
+  const steps = ["時間になったら説明会場VCに入る", "門番の案内を待つ（10分ほどで終わります）"]
+    .map((s, i) => `**${i + 1}.** ${s}`)
+    .join("\n");
+
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: "冥獄城 入城案内" })
+    .setTitle("ようこそ、冥獄城へ")
+    .setColor(0x6b21a8)
+    .setThumbnail(member.displayAvatarURL({ size: 128 }))
+    .setDescription("城に入るには、説明会に来ていただくだけです。事前の登録や申請はいりません。")
+    .addFields(
+      {
+        name: "🕯️ 次の案内",
+        value: nextTs ? `<t:${nextTs}:F>\n<t:${nextTs}:R>` : "月・木を除く 21 / 22 / 23 時",
+        inline: true,
+      },
+      {
+        name: "📍 集合場所",
+        value: vcIds.length > 0 ? vcIds.map((id) => `<#${id}>`).join("\n") : "説明会場VC",
+        inline: true,
+      },
+      { name: "​", value: steps, inline: false },
+    )
+    .setFooter({ text: "案内が終われば、城の中がすべて見えるようになります" });
+
+  // 次の会まで半日以上空く（月木に参加した場合など）なら、待たせきりにせず個別調整へ逃がす
+  if (next && next.getTime() - Date.now() > 12 * 3_600_000) {
+    embed.addFields({
+      name: "⏰ その時間に来られない",
+      value: "案内パネルの「時間外・個別希望」から、都合のいい時間で個別に調整できます。",
+      inline: false,
+    });
+  }
+  return embed;
 }
 
 // ---- ロール変更検知: 亡霊ロールが手動付与された時にghostify・性別ロール後付けで招待延長 ----
@@ -318,6 +362,23 @@ export const sessionCommand = new SlashCommandBuilder()
       .setName("昇格")
       .setDescription("面談合格者を魔人に昇格させる（審・運営）")
       .addUserOption((o) => o.setName("対象").setDescription("昇格させる亡霊").setRequired(true)),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName("招待")
+      .setDescription("招待経路を門番が代わりに登録する（判定の前でも後でも可）")
+      .addUserOption((o) => o.setName("対象").setDescription("招待されて来た人").setRequired(true))
+      .addUserOption((o) => o.setName("招待者").setDescription("招待した人（城の住人）"))
+      .addStringOption((o) =>
+        o
+          .setName("経路")
+          .setDescription("人以外の経路")
+          .addChoices(
+            { name: "ディスボード", value: "disboard" },
+            { name: "ルミナ", value: "lumina" },
+            { name: "その他（誰の招待でもない）", value: "none" },
+          ),
+      ),
   );
 
 /** 審判を使えるのは 運営 / 面接担当 / 魔剣士 / 審 のいずれか */
@@ -390,6 +451,10 @@ export async function handleSessionCommand(
     await interaction.reply({ content: "この操作には門番（運営・門番・門番統括）の権限が必要です。", flags: MessageFlags.Ephemeral });
     return;
   }
+  if (interaction.options.getSubcommand() === "招待") {
+    await handleInviterRecord(interaction, services);
+    return;
+  }
   // 判定のみ（昇格は index 側で handlePromote に振り分け）
   const guild = interaction.guild!;
   const vc1 = services.settings.getString("channel:session_vc");
@@ -413,23 +478,92 @@ export async function handleSessionCommand(
     });
     return;
   }
-  // 招待経路の登録有無で切り分け（未登録者は判定対象から外し、DM催促の対象にする）
-  const ready: string[] = [];
-  const missing: string[] = [];
-  for (const uid of present) {
+  // 招待経路の未検出は「警告」であって判定の条件ではない。
+  // 以前はここで未登録者を判定対象から外していたが、本人にボタンを押させる導線が
+  // 詰まりの主因になっていたため、全員を判定対象にして未検出は表示だけ残す。
+  // 経路が要る場合は門番が `/審判 招待` で後から入れられる（亡霊化後でも記帳できる）。
+  const missing = present.filter((uid) => {
     const booking = services.entry.getBooking(uid);
-    if (booking && booking.inviter_source) ready.push(uid);
-    else missing.push(uid);
-  }
-  judgeState.set(interaction.user.id, { present: ready, missing, hold: new Set() });
+    return !booking?.inviter_user_id && booking?.inviter_source !== "disboard" && booking?.inviter_source !== "lumina";
+  });
+  judgeState.set(interaction.user.id, { present, missing, hold: new Set() });
   await interaction.reply({ ...renderJudgment(services, interaction.user.id), flags: MessageFlags.Ephemeral });
 }
 
-// ---- 判定UI: 保留/合格/招待未登録 ----
+/**
+ * `/審判 招待` — 門番が招待経路を代わりに登録する。
+ * 本人にボタンを押させる代わりに、抜けたぶんは門番がここで拾う。
+ * 亡霊化の後でも記帳できる（招待者への期限延長・称号評価もここで走る）。
+ */
+async function handleInviterRecord(
+  interaction: ChatInputCommandInteraction,
+  services: Services,
+): Promise<void> {
+  const target = interaction.options.getUser("対象", true);
+  const inviter = interaction.options.getUser("招待者");
+  const source = interaction.options.getString("経路") as "disboard" | "lumina" | "none" | null;
+
+  if (!inviter && !source) {
+    await interaction.reply({
+      content: "「招待者」か「経路」のどちらかを指定してください。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (inviter && inviter.id === target.id) {
+    await interaction.reply({ content: "自分自身は招待者にできません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  // 期限延長の日数は被招待者の性別ロールで決まる（男+1日 / 女+2日）
+  const member = await interaction.guild?.members.fetch(target.id).catch(() => null);
+  const maleRoleId = services.settings.getString("role:male");
+  const femaleRoleId = services.settings.getString("role:female");
+  const gender =
+    member && maleRoleId && member.roles.cache.has(maleRoleId)
+      ? ("male" as const)
+      : member && femaleRoleId && member.roles.cache.has(femaleRoleId)
+        ? ("female" as const)
+        : null;
+
+  const result = services.entry.recordInviterByStaff(
+    target.id,
+    inviter ? { userId: inviter.id, source: "user" } : { source: source! },
+    `user:${interaction.user.id}`,
+    gender,
+  );
+
+  const lines: string[] = [
+    `✅ <@${target.id}> の招待経路を登録しました（${inviter ? `招待者 <@${inviter.id}>` : sourceLabel(source!)}）。`,
+  ];
+  if (result.reason === "already") {
+    lines.push("ℹ️ この人の招待実績は既に記帳済みだったので、招待者への加算はしていません（二重加算の防止）。");
+  } else if (result.credited) {
+    lines.push(
+      result.extendedDays > 0
+        ? `🕯️ 招待者の評価期限を **+${result.extendedDays}日** 延長しました。`
+        : "🕯️ 期限延長はなし（招待者が評価期間中でない、または上限に到達）。",
+    );
+    if (!gender) lines.push("※ 対象に性別ロールが無いため延長は保留です。後で付けば自動で反映されます。");
+    // 招待実績で称号の条件を満たしたかを見る
+    if (inviter) {
+      const granted = services.titles.evaluate(inviter.id);
+      if (granted.length > 0) lines.push(`🎉 招待者が称号を獲得: ${granted.map((t) => `${t.emoji} ${t.name}`).join(" / ")}`);
+    }
+  }
+  await interaction.editReply({ content: lines.join("\n"), allowedMentions: { parse: [] } });
+}
+
+function sourceLabel(source: "disboard" | "lumina" | "none"): string {
+  return source === "disboard" ? "ディスボード" : source === "lumina" ? "ルミナ" : "誰の招待でもない";
+}
+
+// ---- 判定UI: 保留/合格/招待未検出の警告 ----
 
 interface JudgeSel {
-  present: string[]; // 招待経路登録済み・判定対象
-  missing: string[]; // 招待経路が未登録・判定不可（DM催促の対象）
+  present: string[]; // 今VCにいる案内待ち＝判定対象（招待経路の有無は問わない）
+  missing: string[]; // うち招待経路が未検出の人。警告表示のみで、判定は妨げない
   hold: Set<string>; // 保留＝今回は通さない（案内待ちのまま。次回の判定で再度出る）
 }
 const judgeState = new Map<string, JudgeSel>(); // key = 判定者のユーザーID
@@ -450,7 +584,7 @@ function renderJudgment(_services: Services, judgeId: string) {
         "",
         st.hold.size > 0 ? `⏸ **保留 ${st.hold.size}名**（今回は通さない・案内待ちのまま）:\n${line([...st.hold])}\n` : "",
         st.missing.length > 0
-          ? `⚠️ **招待経路 未登録 ${st.missing.length}名**（判定不可・下のボタンで催促）:\n${line(st.missing)}\n`
+          ? `⚠️ **招待経路 未検出 ${st.missing.length}名**（判定は通せます。必要なら \`/審判 招待\` で後から登録）:\n${line(st.missing)}\n`
           : "",
       ]
         .filter((s) => s !== "")
@@ -469,48 +603,8 @@ function renderJudgment(_services: Services, judgeId: string) {
   const bottom = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("entry:pass").setLabel(`${toGhost.length}名を合格（亡霊化）`).setStyle(ButtonStyle.Success).setDisabled(toGhost.length === 0),
   );
-  if (st.missing.length > 0) {
-    bottom.addComponents(
-      new ButtonBuilder().setCustomId("entry:invremind").setLabel(`⚠️ ${st.missing.length}名に招待経路を催促`).setStyle(ButtonStyle.Secondary),
-    );
-  }
   rows.push(bottom);
   return { embeds: [embed], components: rows, allowedMentions: { parse: [] } };
-}
-
-/** 招待未登録者を入城案内chでメンション催促する */
-async function handleInviteRemind(interaction: ButtonInteraction, services: Services): Promise<void> {
-  if (!isJudge(interaction, services)) {
-    await interaction.reply({ content: "この操作には門番の権限が必要です。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  const sel = judgeState.get(interaction.user.id);
-  if (!sel || sel.missing.length === 0) {
-    await interaction.reply({ content: "催促する対象がありません。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const guideId = services.settings.getString("channel:entry_guide");
-  if (!guideId) {
-    await interaction.editReply({ content: "入城案内チャンネルが未設定です。`/設定 チャンネル 種別:入城案内` で設定してください。" });
-    return;
-  }
-  const guide = (await interaction.client.channels.fetch(guideId).catch(() => null)) as TextChannel | null;
-  if (!guide?.isTextBased()) {
-    await interaction.editReply({ content: "入城案内チャンネルが見つかりません。" });
-    return;
-  }
-  const mentions = sel.missing.map((id) => `<@${id}>`).join(" ");
-  await guide
-    .send({
-      content: `📮 ${mentions}\n判定を進めるため、**上の案内パネル**から「招待経路を登録する」を押してください（必須）。`,
-      allowedMentions: { users: sel.missing },
-    })
-    .catch(() => undefined);
-  await interaction.editReply({
-    content: `📨 入城案内チャンネルで **${sel.missing.length}名** に催促しました。`,
-    allowedMentions: { parse: [] },
-  });
 }
 
 /** 保留の選択を反映してメッセージを更新 */

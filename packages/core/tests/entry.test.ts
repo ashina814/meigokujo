@@ -146,4 +146,41 @@ describe("入城導線", () => {
     // 既に dropped 済みは false
     expect(ctx.entry.skipBooking("skip1", STAFF)).toBe(false);
   });
+
+  it("門番の後追い登録: 亡霊化の後でも招待実績が付き、期限が延びる", () => {
+    // 招待者は評価期間中の亡霊
+    ctx.entry.ghostify("inviter", STAFF);
+    // 被招待者は招待経路なしで判定を通る（招待経路は判定の条件ではない）
+    ctx.entry.recordJoin("newbie");
+    ctx.entry.ghostify("newbie", STAFF);
+    expect(ctx.entry.getSoul("newbie")!.inviter_user_id).toBeNull();
+
+    const before = ctx.entry.getSoul("inviter")!.eval_deadline_at!;
+    const r = ctx.entry.recordInviterByStaff("newbie", { userId: "inviter", source: "user" }, STAFF, "female");
+
+    expect(r.credited).toBe(true);
+    expect(r.extendedDays).toBe(2);
+    expect(ctx.entry.getSoul("newbie")!.inviter_user_id).toBe("inviter");
+    expect(ctx.entry.getSoul("inviter")!.eval_deadline_at!).toBe(before + 2 * DAY);
+  });
+
+  it("招待実績は1人につき一度きり: 判定時に付いた相手を門番が再登録しても二重に延びない", () => {
+    ctx.entry.ghostify("inviter", STAFF);
+    ctx.entry.recordJoin("newbie");
+    ctx.entry.book("newbie", "open", { userId: "inviter", source: "user" });
+    ctx.entry.ghostify("newbie", STAFF, { inviteeGender: "male" });
+    const after = ctx.entry.getSoul("inviter")!.eval_deadline_at!;
+
+    const again = ctx.entry.recordInviterByStaff("newbie", { userId: "inviter", source: "user" }, STAFF, "female");
+    expect(again.credited).toBe(false);
+    expect(again.reason).toBe("already");
+    expect(ctx.entry.getSoul("inviter")!.eval_deadline_at!).toBe(after);
+  });
+
+  it("自分自身は招待者にできない", () => {
+    ctx.entry.recordJoin("solo");
+    const r = ctx.entry.recordInviterByStaff("solo", { userId: "solo", source: "user" }, STAFF, "male");
+    expect(r.credited).toBe(false);
+    expect(r.reason).toBe("self");
+  });
 });

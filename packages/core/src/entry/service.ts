@@ -253,18 +253,12 @@ export class Entry {
     const booking = this.getBooking(userId);
     let extended = 0;
     if (booking?.inviter_user_id) {
-      this.db
-        .prepare("UPDATE souls SET inviter_user_id = ?, inviter_source = ?, updated_at = ? WHERE user_id = ?")
-        .run(booking.inviter_user_id, booking.inviter_source, ts, userId);
-      this.db
-        .prepare("INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?, ?, ?) ON CONFLICT(invitee_id) DO NOTHING")
-        .run(booking.inviter_user_id, userId, ts);
-      extended = this.extendInviterDeadline(booking.inviter_user_id, opts.inviteeGender ?? null);
-      this.events.log("invite_credited", {
-        actor: booking.inviter_user_id,
-        target: userId,
-        payload: { extendedDays: extended },
-      });
+      extended = this.creditInvite(
+        userId,
+        booking.inviter_user_id,
+        (booking.inviter_source as InviterSource) ?? "user",
+        opts.inviteeGender ?? null,
+      ).extendedDays;
     }
 
     if (booking) {
@@ -288,6 +282,73 @@ export class Entry {
       evalDeadlineAt: deadline,
       inviterExtendedDays: extended,
     };
+  }
+
+  /**
+   * 招待実績の記帳（魂台帳・invites・招待者の期限延長・事件録）。
+   *
+   * 亡霊化のタイミングと、門番による後追い登録（/審判 招待）の両方から呼ばれる。
+   * invites.invitee_id が UNIQUE なので「1人につき一度きり」。既に記帳済みなら
+   * 何もせず credited=false を返すので、どちらの順序で来ても二重に延長されない。
+   */
+  creditInvite(
+    inviteeId: string,
+    inviterId: string,
+    source: InviterSource,
+    inviteeGender: "male" | "female" | null,
+  ): { credited: boolean; extendedDays: number; reason?: "self" | "already" } {
+    if (inviteeId === inviterId) return { credited: false, extendedDays: 0, reason: "self" };
+    const existing = this.db.prepare("SELECT 1 FROM invites WHERE invitee_id = ?").get(inviteeId);
+    if (existing) return { credited: false, extendedDays: 0, reason: "already" };
+
+    const ts = now();
+    this.db
+      .prepare("UPDATE souls SET inviter_user_id = ?, inviter_source = ?, updated_at = ? WHERE user_id = ?")
+      .run(inviterId, source, ts, inviteeId);
+    this.db
+      .prepare("INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?, ?, ?) ON CONFLICT(invitee_id) DO NOTHING")
+      .run(inviterId, inviteeId, ts);
+    const extendedDays = this.extendInviterDeadline(inviterId, inviteeGender);
+    this.events.log("invite_credited", {
+      actor: inviterId,
+      target: inviteeId,
+      payload: { extendedDays, source },
+    });
+    return { credited: true, extendedDays };
+  }
+
+  /**
+   * 門番による招待経路の後追い登録。判定を通した後でも招待実績を付けられるようにする。
+   * 予約行にも書き戻すので、判定前・判定後どちらのタイミングでも使える。
+   */
+  recordInviterByStaff(
+    inviteeId: string,
+    inviter: { userId?: string; source: InviterSource },
+    actor: string,
+    inviteeGender: "male" | "female" | null = null,
+  ): { credited: boolean; extendedDays: number; reason?: "self" | "already" } {
+    const ts = now();
+    this.recordJoin(inviteeId); // 魂が無い相手（移行前からの在籍者など）でも受け付ける
+    const existing = this.getBooking(inviteeId);
+    if (existing) {
+      this.db
+        .prepare("UPDATE entry_bookings SET inviter_user_id = ?, inviter_source = ?, updated_at = ? WHERE user_id = ?")
+        .run(inviter.userId ?? null, inviter.source, ts, inviteeId);
+    } else {
+      this.db
+        .prepare(
+          `INSERT INTO entry_bookings (user_id, slot, status, inviter_user_id, inviter_source, no_show_count, created_at, updated_at)
+           VALUES (?, 'open', 'booked', ?, ?, 0, ?, ?)`,
+        )
+        .run(inviteeId, inviter.userId ?? null, inviter.source, ts, ts);
+    }
+    this.events.log("inviter_recorded", {
+      actor,
+      target: inviteeId,
+      payload: { inviter: inviter.userId ?? null, source: inviter.source },
+    });
+    if (!inviter.userId) return { credited: false, extendedDays: 0 }; // ディスボード等は記帳対象なし
+    return this.creditInvite(inviteeId, inviter.userId, inviter.source, inviteeGender);
   }
 
   /**
