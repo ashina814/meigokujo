@@ -7,7 +7,8 @@ export type PayrollErrorCode =
   | "ERR_RUN_NOT_FOUND"
   | "ERR_INVALID_STATUS"
   | "ERR_INVALID_AMOUNT"
-  | "ERR_EMPTY_PLAN";
+  | "ERR_EMPTY_PLAN"
+  | "ERR_OLDER_RUN_PENDING";
 
 export class PayrollError extends Error {
   constructor(
@@ -74,6 +75,48 @@ export interface ExecutionReport {
 const now = () => Math.floor(Date.now() / 1000);
 const PERIOD_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function parseStoredExecutionReport(raw: string | null): ExecutionReport | undefined {
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+  if (
+    !isNonNegativeSafeInteger(parsed.succeeded) ||
+    !isNonNegativeSafeInteger(parsed.skippedAsPaid) ||
+    !isNonNegativeSafeInteger(parsed.totalPaid) ||
+    !Array.isArray(parsed.failed)
+  ) {
+    return undefined;
+  }
+
+  const failed: ExecutionReport["failed"] = [];
+  for (const item of parsed.failed) {
+    if (!isRecord(item) || typeof item.userId !== "string" || typeof item.code !== "string" || !isRecord(item.details)) {
+      return undefined;
+    }
+    failed.push({ userId: item.userId, code: item.code, details: item.details });
+  }
+
+  return {
+    succeeded: parsed.succeeded,
+    skippedAsPaid: parsed.skippedAsPaid,
+    failed,
+    totalPaid: parsed.totalPaid,
+  };
+}
+
 /**
  * 給与バッチ（経済設計.md §5）。
  * draft（計画スナップショット）→ approved（#決裁）→ executed の3段階。
@@ -128,6 +171,9 @@ export class Payroll {
   generateDraft(period: string, members: MemberRoles[], actor: string): PayoutRunRow {
     if (!PERIOD_RE.test(period)) throw new PayrollError("ERR_INVALID_PERIOD", { period });
 
+    const existing = this.getRunByPeriod(period);
+    this.assertNoOlderRecoverable(period, existing?.id);
+
     const salaries = new Map(this.listSalaries().map((s) => [s.role_id, s]));
     const items: PlanItem[] = [];
     for (const member of members) {
@@ -151,7 +197,6 @@ export class Payroll {
       totalPayout: items.reduce((sum, i) => sum + i.total, 0),
     };
 
-    const existing = this.getRunByPeriod(period);
     const ts = now();
     if (existing) {
       if (existing.status !== "draft") {
@@ -186,6 +231,38 @@ export class Payroll {
       | undefined;
   }
 
+  /**
+   * 月を跨いでも回収が必要なRunを古い順に返す。
+   * draft / approved は常に対象。executed は部分失敗またはレポート破損時だけ対象に残す。
+   */
+  listRecoverableRuns(): PayoutRunRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM payout_runs
+         WHERE status IN ('draft', 'approved', 'executed')
+         ORDER BY period ASC, id ASC`,
+      )
+      .all() as PayoutRunRow[];
+
+    return rows.filter((run) => {
+      if (run.status === "draft" || run.status === "approved") return true;
+      const report = parseStoredExecutionReport(run.report_json);
+      return !report || report.failed.length > 0;
+    });
+  }
+
+  private assertNoOlderRecoverable(period: string, excludedRunId?: number): void {
+    const blocker = this.listRecoverableRuns().find((run) => run.id !== excludedRunId && run.period < period);
+    if (blocker) {
+      throw new PayrollError("ERR_OLDER_RUN_PENDING", {
+        period,
+        blockerId: blocker.id,
+        blockerPeriod: blocker.period,
+        blockerStatus: blocker.status,
+      });
+    }
+  }
+
   planOf(run: PayoutRunRow): PayoutPlan {
     return JSON.parse(run.plan_json) as PayoutPlan;
   }
@@ -195,6 +272,7 @@ export class Payroll {
     if (run.status !== "draft") {
       throw new PayrollError("ERR_INVALID_STATUS", { id, status: run.status, expected: "draft" });
     }
+    this.assertNoOlderRecoverable(run.period, run.id);
     this.db
       .prepare("UPDATE payout_runs SET status = 'approved', approved_by = ?, updated_at = ? WHERE id = ?")
       .run(actor, now(), id);
@@ -226,6 +304,7 @@ export class Payroll {
     if (run.status !== "approved" && run.status !== "executed") {
       throw new PayrollError("ERR_INVALID_STATUS", { id, status: run.status, expected: "approved" });
     }
+    this.assertNoOlderRecoverable(run.period, run.id);
     const plan = this.planOf(run);
 
     const report: ExecutionReport = { succeeded: 0, skippedAsPaid: 0, failed: [], totalPaid: 0 };
