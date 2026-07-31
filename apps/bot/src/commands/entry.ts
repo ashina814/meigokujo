@@ -23,6 +23,7 @@ import { fmtLd } from "../format.js";
 import { deliverToUser } from "../notify.js";
 import { isAdmin } from "../permissions.js";
 import { jstNow, nextSessionStart } from "../scheduler.js";
+import { refreshWaitersBoard } from "../waiters-board.js";
 import type { Services } from "../services.js";
 
 // ---- パネル ----
@@ -225,6 +226,7 @@ export async function handleMemberJoin(
   if (!result.delivered) {
     console.warn(`[entry] 入城案内が届きませんでした（DM拒否＋フォールバック不可）: ${member.id}`);
   }
+  refreshWaitersBoard(member.client, services);
 }
 
 /**
@@ -713,6 +715,7 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
   }
 
   judgeState.delete(interaction.user.id);
+  refreshWaitersBoard(interaction.client, services);
 
   const lines = [
     `✅ **${passed.length}名** を合格→亡霊にしました（初期発行 計 ${fmtLd(totalGranted)}）。`,
@@ -886,6 +889,10 @@ async function openFlexTicket(
       allowedMentions: { users: [userId], roles: rolesToPing },
     })
     .catch(() => undefined);
+
+  // 受付の記録。門番用ボードはスレッドの生存数を数えるが、取得できない時はこの記録で代替する
+  services.events.log("entry_flex_opened", { target: userId, payload: { threadId: thread.id } });
+  refreshWaitersBoard(interaction.client, services);
 
   await interaction.reply({
     content: `✅ 時間外の受付を作りました → ${thread.toString()}\nそちらで門番と時間を決めてください。`,

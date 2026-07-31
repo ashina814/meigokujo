@@ -15,6 +15,7 @@ import {
   type SessionOverrideRow,
 } from "@meigokujo/core";
 import { isJudge } from "./entry.js";
+import { refreshWaitersBoard } from "../waiters-board.js";
 import type { Services } from "../services.js";
 
 /**
@@ -147,6 +148,7 @@ async function replySkip(interaction: ChatInputCommandInteraction, services: Ser
   const hour = interaction.options.getInteger("時刻");
   const reason = interaction.options.getString("理由");
   const row = services.sessions.skip({ date, hour, reason, actor: `user:${interaction.user.id}` });
+  refreshWaitersBoard(interaction.client, services);
 
   const target = row.hour === null ? "の説明会を**すべて**" : ` **${row.hour}:00** の説明会を`;
   await interaction.reply({
@@ -164,6 +166,7 @@ async function replyAdd(interaction: ChatInputCommandInteraction, services: Serv
   const hour = interaction.options.getInteger("時刻", true);
   const reason = interaction.options.getString("理由");
   const row = services.sessions.add({ date, hour, reason, actor: `user:${interaction.user.id}` });
+  refreshWaitersBoard(interaction.client, services);
   const ts = Math.floor(sessionStartAt(row.date, row.hour!).getTime() / 1000);
   const isRestDay = services.sessions.regularHours(row.date).length === 0;
 
@@ -182,6 +185,7 @@ async function replyAdd(interaction: ChatInputCommandInteraction, services: Serv
 async function replyCancel(interaction: ChatInputCommandInteraction, services: Services): Promise<void> {
   const id = interaction.options.getInteger("対象", true);
   const row = services.sessions.cancel(id, `user:${interaction.user.id}`);
+  refreshWaitersBoard(interaction.client, services);
   // 取り消した結果どうなったかは、固定文ではなく**取消後の実際の開催状態**から作る。
   // 全休と個別休止が重なっている場合、「通常どおり開催します」が事実と食い違うため。
   // 0時開催も拾うため直前から探す。起点が前日になるので2日分見てその日だけ残す

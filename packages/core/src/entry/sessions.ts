@@ -341,6 +341,26 @@ export class SessionCalendar {
     return null;
   }
 
+  /**
+   * 5分前通知の結果。再起動しても分かるよう事件録から読む（settings のマーカーは
+   * 成功時にしか残らないので、失敗と「まだ通知時刻前」を区別できない）。
+   */
+  notificationStatus(date: string, hour: number): { status: "sent" | "failed" | "none"; at: number | null; error?: string } {
+    const row = this.db
+      .prepare(
+        `SELECT type, created_at, payload_json FROM events
+         WHERE type IN ('session_notified','session_notify_failed')
+           AND json_extract(payload_json, '$.date') = ?
+           AND json_extract(payload_json, '$.hour') = ?
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(date, hour) as { type: string; created_at: number; payload_json: string | null } | undefined;
+    if (!row) return { status: "none", at: null };
+    if (row.type === "session_notified") return { status: "sent", at: row.created_at };
+    const error = row.payload_json ? (JSON.parse(row.payload_json) as { error?: string }).error : undefined;
+    return { status: "failed", at: row.created_at, error };
+  }
+
   /** その日その時刻に説明会があるか（5分前通知の可否判定に使う） */
   isOccurring(dateStr: string, hour: number, schedule = this.schedule()): boolean {
     const dayOverrides = this.listOverrides(dateStr, dateStr);

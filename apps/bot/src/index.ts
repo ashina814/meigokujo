@@ -41,6 +41,7 @@ import {
   handleSessionScheduleAutocomplete,
   handleSessionScheduleCommand,
 } from "./commands/session-schedule.js";
+import { refreshWaitersBoard } from "./waiters-board.js";
 import { handleTicketButton } from "./commands/ticket-handler-safe.js";
 import {
   handleConfessionButton,
@@ -107,6 +108,9 @@ client.once(Events.ClientReady, (ready) => {
   } else {
     console.log(`📗 検算OK / 通貨発行残高 ${services.ledger.moneySupply().toLocaleString()} Ld`);
   }
+
+  // 起動時に門番用の待ち人ボードを最新化（未設置なら何もしない）
+  refreshWaitersBoard(client, services);
 
   // 起動時に卓建て空VCを sweep
   void sweepStaleTables(client, services).then((n) => {

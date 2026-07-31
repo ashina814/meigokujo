@@ -228,6 +228,59 @@ export class Entry {
     };
   }
 
+  /**
+   * 門番用の待ち人サマリ。
+   *
+   * 招待経路の未検出は**警告であって合格の条件ではない**（設計案 確定事項）。ここでは
+   * 件数だけを出し、表示側で「止まらない」ことを明示する。旧データ（entry_bookings に
+   * 検出結果が入っている行）も検出済みとして数える。
+   */
+  waitingSummary(options: { staleDays?: number; recentHours?: number; now?: number } = {}): {
+    waiting: number;
+    stale: number;
+    recentJoins: number;
+    missingInviterHint: number;
+  } {
+    const ts = options.now ?? now();
+    const staleBefore = ts - (options.staleDays ?? 7) * DAY;
+    const recentAfter = ts - (options.recentHours ?? 24) * 3_600;
+    const count = (sql: string, ...params: unknown[]): number =>
+      (this.db.prepare(sql).get(...(params as [])) as { c: number }).c;
+
+    return {
+      waiting: count("SELECT COUNT(*) AS c FROM souls WHERE status = 'waiting'"),
+      stale: count(
+        "SELECT COUNT(*) AS c FROM souls WHERE status = 'waiting' AND COALESCE(joined_at, updated_at) <= ?",
+        staleBefore,
+      ),
+      // 参加の判定に updated_at を混ぜない（既存メンバーの情報更新まで新規参加として数えてしまう）
+      recentJoins: count("SELECT COUNT(*) AS c FROM souls WHERE joined_at IS NOT NULL AND joined_at >= ?", recentAfter),
+      missingInviterHint: count(
+        `SELECT COUNT(*) AS c FROM souls s
+         WHERE s.status = 'waiting'
+           AND s.inviter_hint_source IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM entry_bookings b
+             WHERE b.user_id = s.user_id
+               AND (b.inviter_user_id IS NOT NULL OR b.inviter_source <> 'none')
+           )`,
+      ),
+    };
+  }
+
+  /** 案内の配送結果（entry_guide_sent）の内訳。DM不達を門番用ボードに出すために使う */
+  guideDeliverySummary(sinceDays = 7, nowSec = now()): { dm: number; channel: number; none: number } {
+    const rows = this.db
+      .prepare(
+        `SELECT json_extract(payload_json, '$.via') AS via, COUNT(*) AS c
+         FROM events WHERE type = 'entry_guide_sent' AND created_at >= ?
+         GROUP BY via`,
+      )
+      .all(nowSec - sinceDays * DAY) as Array<{ via: string | null; c: number }>;
+    const pick = (via: string) => rows.find((r) => r.via === via)?.c ?? 0;
+    return { dm: pick("dm"), channel: pick("channel"), none: pick("none") };
+  }
+
   /** 確定済みの招待実績（invites 行）。無ければ null */
   getConfirmedInvite(inviteeId: string): ConfirmedInvite | null {
     const row = this.db

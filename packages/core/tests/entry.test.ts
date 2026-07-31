@@ -413,4 +413,28 @@ describe("招待経路の状態（検出・補足 → 確定 → 報酬）", () 
     expect(ctx.entry.getSoul("inviter")!.eval_deadline_at).toBe(deadline);
     expect(ctx.entry.getSoul("newbie")!.inviter_user_id).toBe("inviter"); // 2回目の招待者に変わらない
   });
+
+  it("待ち人サマリの「直近の参加」は参加日だけで数え、既存メンバーの更新を含めない", () => {
+    const now = Math.floor(Date.now() / 1000);
+    ctx.entry.recordJoin("today");
+    ctx.entry.recordJoin("longAgo");
+    // 3か月前に参加した人が、いま情報を更新された（updated_at だけが新しい）状態を作る
+    ctx.db.prepare("UPDATE souls SET joined_at = ?, updated_at = ? WHERE user_id = 'longAgo'").run(now - 90 * DAY, now);
+
+    const summary = ctx.entry.waitingSummary({ now });
+
+    expect(summary.waiting).toBe(2);
+    expect(summary.recentJoins).toBe(1); // longAgo は数えない
+    expect(summary.stale).toBe(1); // 7日以上待っているのは longAgo だけ
+  });
+
+  it("待ち人サマリの未検出は、旧データの検出結果も検出済みとして扱う", () => {
+    ctx.entry.recordJoin("detected");
+    ctx.entry.recordJoin("legacy");
+    ctx.entry.recordJoin("missing");
+    ctx.entry.recordInviterHint("detected", { userId: "inviter", source: "user" }, "auto", "system:test");
+    ctx.entry.book("legacy", "2026-07-05 21", { userId: "inviter", source: "user" }); // 旧導線の予約行
+
+    expect(ctx.entry.waitingSummary().missingInviterHint).toBe(1);
+  });
 });
