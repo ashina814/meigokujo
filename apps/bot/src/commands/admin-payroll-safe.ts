@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
-  ButtonInteraction,
+  type ButtonInteraction,
   ButtonStyle,
   EmbedBuilder,
   MessageFlags,
@@ -34,7 +34,7 @@ function planHash(run: PayoutRunRow): string {
   return createHash("sha256").update(run.plan_json).digest("hex").slice(0, 12);
 }
 
-function parseReport(run: PayoutRunRow): ExecutionReport | undefined {
+function reportOf(run: PayoutRunRow): ExecutionReport | undefined {
   if (!run.report_json) return undefined;
   try {
     return JSON.parse(run.report_json) as ExecutionReport;
@@ -50,7 +50,7 @@ function payrollBackRow(): ActionRowBuilder<ButtonBuilder> {
   );
 }
 
-function runStatusLabel(run: PayoutRunRow | undefined): string {
+function statusLabel(run: PayoutRunRow | undefined): string {
   if (!run) return "未作成";
   const labels: Record<PayoutRunRow["status"], string> = {
     draft: "支給案作成済み・未承認",
@@ -65,33 +65,29 @@ function payrollHome(services: Services) {
   const rows = services.payroll.listSalaries();
   const period = jstPeriod();
   const run = services.payroll.getRunByPeriod(period);
-  const previousReport = run ? parseReport(run) : undefined;
-  const list =
-    rows.length > 0
-      ? rows.map((row) => `・<@&${row.role_id}> **${row.label}**: ${fmtLd(row.amount)}`).join("\n")
-      : "（給与表は空）";
-
+  const previousReport = run ? reportOf(run) : undefined;
+  const salaryLines = rows.length
+    ? rows.map((row) => `・<@&${row.role_id}> **${row.label}**: ${fmtLd(row.amount)}`).join("\n")
+    : "（給与表は空）";
   const description = [
     `**対象月（JST）:** \`${period}\``,
-    `**支給状態:** ${runStatusLabel(run)}`,
+    `**支給状態:** ${statusLabel(run)}`,
     "",
     "**給与表**（ロールごとに月額を設定）",
-    list,
+    salaryLines,
     "",
-    "支給ボタンでは送金せず、現在のロールから支給案を作成して対象者・各人の内訳・総額を確認します。",
+    "支給ボタンでは送金せず、現在のロールから対象者・内訳・総額を計算します。",
     "確認後にだけ支給し、部分失敗時は同じRunから未払い分だけ再実行できます。",
   ];
   if (previousReport?.failed.length) {
     description.push("", `⚠️ 前回実行で **${previousReport.failed.length}件** が未払いです。`);
   }
 
-  const embed = new EmbedBuilder().setTitle("💰 給与").setColor(0x6b21a8).setDescription(description.join("\n"));
-  const actions = new ActionRowBuilder<ButtonBuilder>().addComponents(
+  const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:payroll:add-start").setLabel("行追加").setEmoji("➕").setStyle(ButtonStyle.Primary),
   );
-
   if (!run || run.status === "draft") {
-    actions.addComponents(
+    buttons.addComponents(
       new ButtonBuilder()
         .setCustomId("mgmt:payroll:pay")
         .setLabel(`${period} 支給案を確認`)
@@ -100,7 +96,7 @@ function payrollHome(services: Services) {
         .setDisabled(rows.length === 0),
     );
   } else if (run.status === "approved") {
-    actions.addComponents(
+    buttons.addComponents(
       new ButtonBuilder()
         .setCustomId(`mgmt:payroll:retry:${run.id}`)
         .setLabel("承認済み支給を再開")
@@ -108,7 +104,7 @@ function payrollHome(services: Services) {
         .setStyle(ButtonStyle.Success),
     );
   } else if (run.status === "executed" && previousReport?.failed.length) {
-    actions.addComponents(
+    buttons.addComponents(
       new ButtonBuilder()
         .setCustomId(`mgmt:payroll:retry:${run.id}`)
         .setLabel("未払い分を再実行")
@@ -116,7 +112,7 @@ function payrollHome(services: Services) {
         .setStyle(ButtonStyle.Danger),
     );
   } else {
-    actions.addComponents(
+    buttons.addComponents(
       new ButtonBuilder()
         .setCustomId("mgmt:payroll:done")
         .setLabel(run.status === "cancelled" ? "今月は見送り済み" : "今月は支給済み")
@@ -125,8 +121,8 @@ function payrollHome(services: Services) {
     );
   }
 
-  const components: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [actions];
-  if (rows.length > 0) {
+  const components: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [buttons];
+  if (rows.length) {
     const remove = new StringSelectMenuBuilder()
       .setCustomId("mgmt:payroll:remove-pick")
       .setPlaceholder("削除する行を選ぶ")
@@ -143,18 +139,17 @@ function payrollHome(services: Services) {
       new ButtonBuilder().setCustomId("mgmt:hub").setLabel("← ハブへ").setStyle(ButtonStyle.Secondary),
     ),
   );
-  return { embeds: [embed], components, allowedMentions: { parse: [] as string[] } };
+  return {
+    embeds: [new EmbedBuilder().setTitle("💰 給与").setColor(0x6b21a8).setDescription(description.join("\n"))],
+    components,
+  };
 }
 
 function safeText(value: string): string {
   return value.replace(/[\r\n\t]+/gu, " ").trim();
 }
 
-function previewText(
-  plan: PayoutPlan,
-  runId: number,
-  displayNames: ReadonlyMap<string, string>,
-): string {
+function previewText(plan: PayoutPlan, runId: number, displayNames: ReadonlyMap<string, string>): string {
   const lines = [
     `${plan.period} 給与支給案 (#${runId})`,
     `対象者数: ${plan.items.length}`,
@@ -162,8 +157,7 @@ function previewText(
     "",
     "user_id\tdisplay_name\ttotal\tbreakdown",
   ];
-  const sorted = [...plan.items].sort((a, b) => b.total - a.total || a.userId.localeCompare(b.userId));
-  for (const item of sorted) {
+  for (const item of [...plan.items].sort((a, b) => b.total - a.total || a.userId.localeCompare(b.userId))) {
     const breakdown = item.breakdown
       .map((part) => `${safeText(part.label)}[${part.roleId}]=${part.amount}`)
       .join(" + ");
@@ -178,10 +172,7 @@ function previewEmbed(plan: PayoutPlan, runId: number): EmbedBuilder {
   const top = [...plan.items]
     .sort((a, b) => b.total - a.total || a.userId.localeCompare(b.userId))
     .slice(0, 15)
-    .map(
-      (item) =>
-        `<@${item.userId}> — **${fmtLd(item.total)}**（${item.breakdown.map((part) => part.label).join(" + ")}）`,
-    );
+    .map((item) => `<@${item.userId}> — **${fmtLd(item.total)}**（${item.breakdown.map((part) => part.label).join(" + ")}）`);
   const rest = plan.items.length - top.length;
   return new EmbedBuilder()
     .setTitle(`🔎 ${plan.period} 給与支給案 (#${runId})`)
@@ -199,36 +190,26 @@ function previewEmbed(plan: PayoutPlan, runId: number): EmbedBuilder {
     );
 }
 
-function failureDetails(report: ExecutionReport): string[] {
+function failureLines(report: ExecutionReport): string[] {
   return report.failed.map((failure) => {
-    const detail = Object.entries(failure.details)
+    const details = Object.entries(failure.details)
       .slice(0, 4)
       .map(([key, value]) => `${key}=${String(value)}`)
       .join(", ");
-    return `・<@${failure.userId}> — \`${failure.code}\`${detail ? `（${detail}）` : ""}`;
+    return `・<@${failure.userId}> — \`${failure.code}\`${details ? `（${details}）` : ""}`;
   });
 }
 
-function executionResult(
-  run: PayoutRunRow,
-  report: ExecutionReport,
-  moneySupply: number,
-) {
+function executionResult(run: PayoutRunRow, report: ExecutionReport, moneySupply: number) {
   const lines = [
     `**対象月:** \`${run.period}\` / **Run:** #${run.id}`,
     `成功 **${report.succeeded}件** / 支給済みスキップ **${report.skippedAsPaid}件** / 失敗 **${report.failed.length}件**`,
     `今回の支給額: **${fmtLd(report.totalPaid)}** / 通貨発行残高: ${fmtLd(moneySupply)}`,
   ];
-  if (report.failed.length > 0) {
-    lines.push("", "**未払い・失敗理由**", ...failureDetails(report));
-  }
-  const embed = new EmbedBuilder()
-    .setTitle(report.failed.length > 0 ? "⚠️ 給与支給は一部未完了" : "✅ 給与支給完了")
-    .setColor(report.failed.length > 0 ? 0xdc2626 : 0x16a34a)
-    .setDescription(lines.join("\n"));
-  const rows: ActionRowBuilder<ButtonBuilder>[] = [];
-  if (report.failed.length > 0) {
-    rows.push(
+  if (report.failed.length) lines.push("", "**未払い・失敗理由**", ...failureLines(report));
+  const components: ActionRowBuilder<ButtonBuilder>[] = [];
+  if (report.failed.length) {
+    components.push(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId(`mgmt:payroll:retry:${run.id}`)
@@ -238,28 +219,31 @@ function executionResult(
       ),
     );
   }
-  rows.push(payrollBackRow());
+  components.push(payrollBackRow());
   return {
     content: "",
-    embeds: [embed],
-    components: rows,
+    embeds: [
+      new EmbedBuilder()
+        .setTitle(report.failed.length ? "⚠️ 給与支給は一部未完了" : "✅ 給与支給完了")
+        .setColor(report.failed.length ? 0xdc2626 : 0x16a34a)
+        .setDescription(lines.join("\n")),
+    ],
+    components,
     attachments: [],
-    allowedMentions: { parse: [] as string[] },
+    allowedMentions: { parse: [] },
   };
 }
 
 function existingRunMessage(run: PayoutRunRow, services: Services) {
   const plan = services.payroll.planOf(run);
-  const report = parseReport(run);
+  const report = reportOf(run);
   const lines = [
     `**対象月:** \`${run.period}\` / **Run:** #${run.id}`,
-    `状態: **${runStatusLabel(run)}**`,
+    `状態: **${statusLabel(run)}**`,
     `計画: **${plan.items.length}名** / **${fmtLd(plan.totalPayout)}**`,
   ];
   if (report) {
-    lines.push(
-      `直近実行: 成功 ${report.succeeded}件 / 支給済みスキップ ${report.skippedAsPaid}件 / 失敗 ${report.failed.length}件`,
-    );
+    lines.push(`直近実行: 成功 ${report.succeeded}件 / 支給済みスキップ ${report.skippedAsPaid}件 / 失敗 ${report.failed.length}件`);
   }
   const components: ActionRowBuilder<ButtonBuilder>[] = [];
   if (run.status === "approved" || (run.status === "executed" && report?.failed.length)) {
@@ -278,7 +262,7 @@ function existingRunMessage(run: PayoutRunRow, services: Services) {
     embeds: [new EmbedBuilder().setTitle("💰 既存の給与Run").setColor(0x6b21a8).setDescription(lines.join("\n"))],
     components,
     attachments: [],
-    allowedMentions: { parse: [] as string[] },
+    allowedMentions: { parse: [] },
   };
 }
 
@@ -306,18 +290,13 @@ async function previewPayroll(interaction: ButtonInteraction, services: Services
     if (!guild) throw new Error("ギルド情報を取得できませんでした");
     const fetched = await guild.members.fetch();
     const humans = fetched.filter((member) => !member.user.bot);
-    const members = humans.map((member) => ({
-      userId: member.id,
-      roleIds: [...member.roles.cache.keys()],
-    }));
+    const members = humans.map((member) => ({ userId: member.id, roleIds: [...member.roles.cache.keys()] }));
     const displayNames = new Map(humans.map((member) => [member.id, member.displayName]));
-    const actor = `user:${interaction.user.id}`;
-    const run = services.payroll.generateDraft(period, members, actor);
+    const run = services.payroll.generateDraft(period, members, `user:${interaction.user.id}`);
     const plan = services.payroll.planOf(run);
-    const hash = planHash(run);
     const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
-        .setCustomId(`mgmt:payroll:confirm:${run.id}:${hash}`)
+        .setCustomId(`mgmt:payroll:confirm:${run.id}:${planHash(run)}`)
         .setLabel("この内容で支給")
         .setEmoji("💸")
         .setStyle(ButtonStyle.Danger),
@@ -354,6 +333,10 @@ async function confirmPayroll(
   await interaction.deferUpdate();
   try {
     let run = services.payroll.getRun(runId);
+    if (run.status === "executed" || run.status === "cancelled") {
+      await interaction.editReply(existingRunMessage(run, services));
+      return;
+    }
     if (run.status === "draft") {
       if (planHash(run) !== expectedHash) {
         await interaction.editReply({
@@ -361,14 +344,13 @@ async function confirmPayroll(
           embeds: [],
           components: [payrollBackRow()],
           attachments: [],
+          allowedMentions: { parse: [] },
         });
         return;
       }
       run = services.payroll.approve(runId, `user:${interaction.user.id}`);
     }
-    if (run.status !== "approved" && run.status !== "executed") {
-      throw new Error(`このRunは実行できません（状態: ${run.status}）`);
-    }
+    if (run.status !== "approved") throw new Error(`このRunは実行できません（状態: ${run.status}）`);
     const report = services.payroll.execute(runId, `user:${interaction.user.id}`);
     run = services.payroll.getRun(runId);
     await interaction.editReply(executionResult(run, report, services.ledger.moneySupply()));
@@ -377,11 +359,7 @@ async function confirmPayroll(
   }
 }
 
-async function retryPayroll(
-  interaction: ButtonInteraction,
-  services: Services,
-  runId: number,
-): Promise<void> {
+async function retryPayroll(interaction: ButtonInteraction, services: Services, runId: number): Promise<void> {
   await interaction.deferUpdate();
   try {
     const before = services.payroll.getRun(runId);
@@ -396,13 +374,8 @@ async function retryPayroll(
   }
 }
 
-/**
- * /管理 の給与部分だけを安全な二段階操作へ差し替え、それ以外は既存実装へ委譲する。
- */
-export async function handleAdminButton(
-  interaction: ButtonInteraction,
-  services: Services,
-): Promise<void> {
+/** /管理 の給与部分だけを安全な二段階操作へ差し替え、それ以外は既存実装へ委譲する。 */
+export async function handleAdminButton(interaction: ButtonInteraction, services: Services): Promise<void> {
   if (!interaction.customId.startsWith(PAYROLL_PREFIX) && interaction.customId !== "mgmt:payroll") {
     await handleAdminButtonBase(interaction, services);
     return;
@@ -415,34 +388,25 @@ export async function handleAdminButton(
   const [, section, action, rawRunId, expectedHash] = interaction.customId.split(":");
   if (section !== "payroll") {
     await handleAdminButtonBase(interaction, services);
-    return;
-  }
-  if (!action) {
+  } else if (!action) {
     await interaction.update(payrollHome(services));
-    return;
-  }
-  if (action === "pay") {
+  } else if (action === "pay") {
     await previewPayroll(interaction, services);
-    return;
-  }
-  if (action === "confirm") {
+  } else if (action === "confirm") {
     const runId = Number(rawRunId);
     if (!Number.isSafeInteger(runId) || !expectedHash) {
       await interaction.reply({ content: "支給案の識別子が不正です。", flags: MessageFlags.Ephemeral });
       return;
     }
     await confirmPayroll(interaction, services, runId, expectedHash);
-    return;
-  }
-  if (action === "retry") {
+  } else if (action === "retry") {
     const runId = Number(rawRunId);
     if (!Number.isSafeInteger(runId)) {
       await interaction.reply({ content: "給与Runの識別子が不正です。", flags: MessageFlags.Ephemeral });
       return;
     }
     await retryPayroll(interaction, services, runId);
-    return;
+  } else {
+    await handleAdminButtonBase(interaction, services);
   }
-
-  await handleAdminButtonBase(interaction, services);
 }
