@@ -69,6 +69,14 @@ export interface GhostifyResult {
 const now = () => Math.floor(Date.now() / 1000);
 const DAY = 86_400;
 
+/** 入城を済ませている階級（departed は入城前の離脱と区別が付かないので含めない） */
+const ENTERED_STATUSES: ReadonlySet<SoulRow["status"]> = new Set<SoulRow["status"]>([
+  "ghost",
+  "majin",
+  "mazoku",
+  "meirei",
+]);
+
 function positiveInt(value: unknown, fallback: number): number {
   const n = Number(value);
   return Number.isInteger(n) && n > 0 ? n : fallback;
@@ -399,6 +407,23 @@ export class Entry {
   }
 
   /**
+   * 入城済みか（＝招待実績をその場で確定してよいか）。
+   *
+   * 本来は ghost_at の有無で判断できるはずだが、2026-07-06 の移行でバックフィルされた
+   * 行は階級だけ入って ghost_at が NULL のまま残っている（本番: 迷霊129 / 魔人2）。
+   * ghost_at だけで見るとこの人たちが「入城前」と誤判定され、後追い登録が保存だけで
+   * 止まって確定の機会を失うため、階級も補助条件にする。
+   *
+   * departed は入城前の離脱と区別が付かないので階級側には含めない。
+   * 亡霊化を経ていれば ghost_at が残っているので、そちら側で拾える。
+   */
+  private hasEnteredCastle(soul: SoulRow | undefined): boolean {
+    if (!soul) return false;
+    if (soul.ghost_at !== null && soul.ghost_at !== undefined) return true;
+    return ENTERED_STATUSES.has(soul.status);
+  }
+
+  /**
    * 招待実績の記帳（魂台帳・invites・招待者の期限延長・事件録）。
    *
    * 亡霊化のタイミングと、門番による後追い登録（/審判 招待）の両方から呼ばれる。
@@ -412,23 +437,35 @@ export class Entry {
     inviteeGender: "male" | "female" | null,
   ): { credited: boolean; extendedDays: number; reason?: "self" | "already" } {
     if (inviteeId === inviterId) return { credited: false, extendedDays: 0, reason: "self" };
-    const existing = this.db.prepare("SELECT 1 FROM invites WHERE invitee_id = ?").get(inviteeId);
-    if (existing) return { credited: false, extendedDays: 0, reason: "already" };
 
-    const ts = now();
-    this.db
-      .prepare("UPDATE souls SET inviter_user_id = ?, inviter_source = ?, updated_at = ? WHERE user_id = ?")
-      .run(inviterId, source, ts, inviteeId);
-    this.db
-      .prepare("INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?, ?, ?) ON CONFLICT(invitee_id) DO NOTHING")
-      .run(inviterId, inviteeId, ts);
-    const extendedDays = this.extendInviterDeadline(inviterId, inviteeGender);
-    this.events.log("invite_credited", {
-      actor: inviterId,
-      target: inviteeId,
-      payload: { extendedDays, source },
-    });
-    return { credited: true, extendedDays };
+    // 一連の書き込みを1トランザクションに包む。途中で例外・DBエラー・プロセス停止が
+    // 起きても、invites 行だけ残って期限延長が飛ぶ（次回は already になり、二度と
+    // 延長されない）という部分反映を防ぐため。
+    //
+    // 「一度きり」の判定は事前 SELECT ではなく UNIQUE 制約 + INSERT の結果に持たせる。
+    // 先に INSERT し、changes が 0 なら既に記帳済みとして何もしない。
+    const credit = this.db.transaction((): { credited: boolean; extendedDays: number } => {
+      const ts = now();
+      const inserted = this.db
+        .prepare(
+          "INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?, ?, ?) ON CONFLICT(invitee_id) DO NOTHING",
+        )
+        .run(inviterId, inviteeId, ts);
+      if (inserted.changes === 0) return { credited: false, extendedDays: 0 };
+
+      this.db
+        .prepare("UPDATE souls SET inviter_user_id = ?, inviter_source = ?, updated_at = ? WHERE user_id = ?")
+        .run(inviterId, source, ts, inviteeId);
+      const extendedDays = this.extendInviterDeadline(inviterId, inviteeGender);
+      this.events.log("invite_credited", {
+        actor: inviterId,
+        target: inviteeId,
+        payload: { extendedDays, source },
+      });
+      return { credited: true, extendedDays };
+    })();
+
+    return credit.credited ? credit : { credited: false, extendedDays: 0, reason: "already" };
   }
 
   /**
@@ -478,8 +515,7 @@ export class Entry {
     }
 
     const soul = this.getSoul(inviteeId);
-    const ghostified = soul?.ghost_at !== null && soul?.ghost_at !== undefined;
-    if (!ghostified) {
+    if (!this.hasEnteredCastle(soul)) {
       // まだ入城していない。亡霊化の時に確定させる
       return { saved: true, credited: false, extendedDays: 0, pending: true };
     }

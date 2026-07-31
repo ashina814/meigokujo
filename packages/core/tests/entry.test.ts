@@ -339,4 +339,78 @@ describe("招待経路の状態（検出・補足 → 確定 → 報酬）", () 
     ctx.entry.book("legacy2", "open", { source: "none" });
     expect(ctx.entry.getInviterHint("legacy2")).toBeNull();
   });
+
+  it("確定処理は途中で失敗しても部分反映しない（invites行だけ残らない）", () => {
+    // 期限延長やイベント記録の段階で落ちた時に invites 行だけが残ると、
+    // 次回は already になって延長が永久に取りこぼされる。それを防げているかを見る。
+    const failingEvents = new EventLog(ctx.db);
+    const original = failingEvents.log.bind(failingEvents);
+    failingEvents.log = ((type: string, opts?: Parameters<EventLog["log"]>[1]) => {
+      if (type === "invite_credited") throw new Error("記録に失敗");
+      return original(type, opts);
+    }) as EventLog["log"];
+    const entry = new Entry(ctx.db, ctx.ledger, ctx.settings, failingEvents);
+
+    entry.ghostify("inviter", STAFF);
+    const before = entry.getSoul("inviter")!.eval_deadline_at!;
+    entry.recordJoin("newbie");
+    entry.ghostify("newbie", STAFF);
+
+    expect(() => entry.creditInvite("newbie", "inviter", "user", "female")).toThrow("記録に失敗");
+
+    // ロールバックされている
+    expect(invitesCount(ctx.db, "newbie")).toBe(0);
+    expect(entry.getSoul("newbie")!.inviter_user_id).toBeNull();
+    expect(entry.getSoul("inviter")!.eval_deadline_at).toBe(before);
+
+    // やり直せば正しく確定する（already で詰まらない）
+    const retry = ctx.entry.creditInvite("newbie", "inviter", "user", "female");
+    expect(retry.credited).toBe(true);
+    expect(retry.extendedDays).toBe(2);
+    expect(ctx.entry.getSoul("inviter")!.eval_deadline_at).toBe(before + 2 * DAY);
+  });
+
+  it("移行組（階級はあるが ghost_at が NULL）への後追い登録はその場で確定する", () => {
+    // 2026-07-06 の移行でバックフィルされた迷霊・魔人は ghost_at が NULL のまま。
+    // ghost_at だけで見ると「入城前」と誤判定され、確定の機会を永久に失う。
+    ctx.entry.ghostify("inviter", STAFF);
+    const before = ctx.entry.getSoul("inviter")!.eval_deadline_at!;
+    ctx.entry.backfillStatuses([{ userId: "migrated", status: "meirei" }], 14);
+    expect(ctx.entry.getSoul("migrated")!.ghost_at).toBeNull();
+
+    const r = ctx.entry.recordInviterByStaff("migrated", { userId: "inviter", source: "user" }, STAFF, "female");
+
+    expect(r.pending).toBe(false);
+    expect(r.credited).toBe(true);
+    expect(ctx.entry.getSoul("inviter")!.eval_deadline_at).toBe(before + 2 * DAY);
+  });
+
+  it("departed は階級だけでは入城済みと扱わない（入城前の離脱と区別が付かないため）", () => {
+    ctx.entry.ghostify("inviter", STAFF);
+    ctx.entry.recordJoin("gone");
+    ctx.db.prepare("UPDATE souls SET status = 'departed' WHERE user_id = ?").run("gone");
+
+    const r = ctx.entry.recordInviterByStaff("gone", { userId: "inviter", source: "user" }, STAFF, "female");
+
+    expect(r.saved).toBe(true);
+    expect(r.pending).toBe(true); // 確定しない
+    expect(invitesCount(ctx.db, "gone")).toBe(0);
+  });
+
+  it("同じ相手への確定は2回目が already で、延長は増えない", () => {
+    ctx.entry.ghostify("inviter", STAFF);
+    ctx.entry.recordJoin("newbie");
+    ctx.entry.ghostify("newbie", STAFF);
+
+    const first = ctx.entry.creditInvite("newbie", "inviter", "user", "female");
+    const deadline = ctx.entry.getSoul("inviter")!.eval_deadline_at!;
+    const second = ctx.entry.creditInvite("newbie", "other", "user", "female");
+
+    expect(first.credited).toBe(true);
+    expect(second.credited).toBe(false);
+    expect(second.reason).toBe("already");
+    expect(second.extendedDays).toBe(0);
+    expect(ctx.entry.getSoul("inviter")!.eval_deadline_at).toBe(deadline);
+    expect(ctx.entry.getSoul("newbie")!.inviter_user_id).toBe("inviter"); // 2回目の招待者に変わらない
+  });
 });
