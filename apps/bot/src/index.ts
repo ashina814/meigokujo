@@ -2,7 +2,7 @@ import { Client, Events, GatewayIntentBits } from "discord.js";
 import { InviteTracker } from "./invite-tracker.js";
 import { config } from "./config.js";
 import { buildServices } from "./services.js";
-import { handleAdminCommand, handleAdminButton, handleAdminSelect, handleAdminModal } from "./commands/admin-payroll-safe.js";
+import { handleAdminCommand, handleAdminButton, handleAdminSelect, handleAdminModal } from "./commands/admin-payroll-recovery.js";
 import { handleShopButton, handleShopSelect } from "./commands/shop-panel.js";
 import { handleShokanCommand, handleShokanButton, handleShokanSelect, handleShokanModal } from "./commands/shokan.js";
 import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
@@ -414,7 +414,7 @@ client.on(Events.GuildMemberAdd, (member) => {
 // 退城ログ
 client.on(Events.GuildMemberRemove, (member) => {
   void postLeaveLog(client, services, member).catch((err) =>
-    console.error("[member-log] 退城ログ投稿失敗:", err),
+    console.error("[member-log] 退城ログ失敗:", err),
   );
 });
 
