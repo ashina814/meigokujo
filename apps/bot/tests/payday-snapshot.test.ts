@@ -43,6 +43,10 @@ function componentIds(payload: any): string[] {
   );
 }
 
+function hashOf(current: PayoutRunRow): string {
+  return createHash("sha256").update(current.plan_json).digest("hex").slice(0, 12);
+}
+
 function buttonHarness(customId: string, current = run()) {
   const approved = run("approved");
   const services = {
@@ -94,7 +98,7 @@ describe("#決裁の給与スナップショット", () => {
 
     await createAndPostDraft(client, services, "2026-07", "system:scheduler");
 
-    const hash = createHash("sha256").update(current.plan_json).digest("hex").slice(0, 12);
+    const hash = hashOf(current);
     const payload = sent.mock.calls[0]![0];
     expect(componentIds(payload)).toEqual([`pay:ok:7:${hash}`, `pay:no:7:${hash}`]);
     expect(payload.embeds[0].data.description.length).toBeLessThanOrEqual(3_900);
@@ -128,8 +132,7 @@ describe("#決裁の給与スナップショット", () => {
 
   it("同じスナップショットだけを承認して支給する", async () => {
     const current = run();
-    const hash = createHash("sha256").update(current.plan_json).digest("hex").slice(0, 12);
-    const h = buttonHarness(`pay:ok:7:${hash}`, current);
+    const h = buttonHarness(`pay:ok:7:${hashOf(current)}`, current);
 
     await handlePaydayButton(h.interaction, h.services as any);
 
@@ -137,6 +140,48 @@ describe("#決裁の給与スナップショット", () => {
     expect(h.services.payroll.execute).toHaveBeenCalledWith(7, "user:staff1");
     expect(h.interaction.editReply).toHaveBeenCalledWith(
       expect.objectContaining({ content: expect.stringContaining("支給完了") }),
+    );
+  });
+
+  it("承認済みRunは見送りへ戻さず支給再開を案内する", async () => {
+    const current = run("approved");
+    const h = buttonHarness(`pay:no:7:${hashOf(current)}`, current);
+
+    await handlePaydayButton(h.interaction, h.services as any);
+
+    expect(h.services.payroll.cancel).not.toHaveBeenCalled();
+    expect(h.services.payroll.execute).not.toHaveBeenCalled();
+    expect(h.interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("既に承認済み") }),
+    );
+  });
+
+  it("承認済みRunの承認ボタンは再承認せず支給を再開する", async () => {
+    const current = run("approved");
+    const h = buttonHarness(`pay:ok:7:${hashOf(current)}`, current);
+
+    await handlePaydayButton(h.interaction, h.services as any);
+
+    expect(h.services.payroll.approve).not.toHaveBeenCalled();
+    expect(h.services.payroll.execute).toHaveBeenCalledWith(7, "user:staff1");
+    expect(h.interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("支給完了") }),
+    );
+  });
+
+  it("実行済みRunの二度押しは再送金せず完了案内を残す", async () => {
+    const current = run("executed");
+    const h = buttonHarness(`pay:ok:7:${hashOf(current)}`, current);
+
+    await handlePaydayButton(h.interaction, h.services as any);
+
+    expect(h.services.payroll.approve).not.toHaveBeenCalled();
+    expect(h.services.payroll.execute).not.toHaveBeenCalled();
+    expect(h.interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("既に実行済み") }),
+    );
+    expect(h.interaction.editReply).not.toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("実行に失敗") }),
     );
   });
 });
