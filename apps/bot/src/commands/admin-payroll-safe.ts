@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -12,42 +11,21 @@ import type { ExecutionReport, PayoutPlan, PayoutRunRow } from "@meigokujo/core"
 import { fmtLd } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import type { Services } from "../services.js";
+import {
+  isManualPayrollPeriod,
+  jstPeriod,
+  manualPayrollPeriods,
+  planHash,
+  reportOf,
+  safeText,
+  shorten,
+} from "../payroll-ui-utils.js";
 import { handleAdminButton as handleAdminButtonBase } from "./admin-hub.js";
 
 export { handleAdminCommand, handleAdminModal, handleAdminSelect } from "./admin-hub.js";
 
 const PAYROLL_PREFIX = "mgmt:payroll:";
 const EMBED_DESCRIPTION_LIMIT = 3_900;
-
-function jstPeriod(date = new Date()): string {
-  const parts = new Intl.DateTimeFormat("ja-JP", {
-    timeZone: "Asia/Tokyo",
-    year: "numeric",
-    month: "2-digit",
-  }).formatToParts(date);
-  const year = parts.find((part) => part.type === "year")?.value;
-  const month = parts.find((part) => part.type === "month")?.value;
-  if (!year || !month) throw new Error("JSTの対象月を計算できませんでした");
-  return `${year}-${month}`;
-}
-
-function planHash(run: PayoutRunRow): string {
-  return createHash("sha256").update(run.plan_json).digest("hex").slice(0, 12);
-}
-
-function reportOf(run: PayoutRunRow): ExecutionReport | undefined {
-  if (!run.report_json) return undefined;
-  try {
-    return JSON.parse(run.report_json) as ExecutionReport;
-  } catch {
-    return undefined;
-  }
-}
-
-function shorten(value: string, maxLength: number): string {
-  if (value.length <= maxLength) return value;
-  return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
-}
 
 function boundedDescription(
   prefix: string[],
@@ -100,18 +78,26 @@ function statusLabel(run: PayoutRunRow | undefined): string {
 
 function payrollHome(services: Services) {
   const rows = services.payroll.listSalaries();
-  const period = jstPeriod();
+  const { current: period, previous: previousPeriod } = manualPayrollPeriods();
   const run = services.payroll.getRunByPeriod(period);
-  const previousReport = run ? reportOf(run) : undefined;
+  const previousRun = services.payroll.getRunByPeriod(previousPeriod);
+  const currentReport = run ? reportOf(run) : undefined;
+  const currentReportUnknown = run?.status === "executed" && !currentReport;
   const salaryLines = rows.map((row) => `・<@&${row.role_id}> **${row.label}**: ${fmtLd(row.amount)}`);
   const suffix = [
     "",
     "支給ボタンでは送金せず、現在のロールから対象者・内訳・総額を計算します。",
     "確認後にだけ支給し、部分失敗時は同じRunから未払い分だけ再実行できます。",
   ];
-  if (previousReport?.failed.length) suffix.push("", `⚠️ 前回実行で **${previousReport.failed.length}件** が未払いです。`);
+  if (currentReport?.failed.length) suffix.push("", `⚠️ 前回実行で **${currentReport.failed.length}件** が未払いです。`);
+  if (currentReportUnknown) suffix.push("", "⚠️ 実行結果を安全に読み取れません。冪等再実行で確認してください。");
   const description = boundedDescription(
-    [`**対象月（JST）:** \`${period}\``, `**支給状態:** ${statusLabel(run)}`, "", "**給与表**（ロールごとに月額を設定）"],
+    [
+      `**現在月（JST）:** \`${period}\` / ${statusLabel(run)}`,
+      `**前月:** \`${previousPeriod}\` / ${statusLabel(previousRun)}`,
+      "",
+      "**給与表**（ロールごとに月額を設定）",
+    ],
     salaryLines.length > 0 ? salaryLines : ["（給与表は空）"],
     suffix,
     (count) => `…他 ${count}行`,
@@ -123,7 +109,7 @@ function payrollHome(services: Services) {
   if (!run || run.status === "draft") {
     buttons.addComponents(
       new ButtonBuilder()
-        .setCustomId("mgmt:payroll:pay")
+        .setCustomId(`mgmt:payroll:pay-period:${period}`)
         .setLabel(`${period} 支給案を確認`)
         .setEmoji("🔎")
         .setStyle(ButtonStyle.Success)
@@ -137,11 +123,11 @@ function payrollHome(services: Services) {
         .setEmoji("▶️")
         .setStyle(ButtonStyle.Success),
     );
-  } else if (run.status === "executed" && previousReport?.failed.length) {
+  } else if (run.status === "executed" && (currentReportUnknown || currentReport.failed.length > 0)) {
     buttons.addComponents(
       new ButtonBuilder()
         .setCustomId(`mgmt:payroll:retry:${run.id}`)
-        .setLabel("未払い分を再実行")
+        .setLabel(currentReportUnknown ? "結果不明Runを安全再実行" : "未払い分を再実行")
         .setEmoji("🔁")
         .setStyle(ButtonStyle.Danger),
     );
@@ -152,6 +138,16 @@ function payrollHome(services: Services) {
         .setLabel(run.status === "cancelled" ? "今月は見送り済み" : "今月は支給済み")
         .setStyle(ButtonStyle.Secondary)
         .setDisabled(true),
+    );
+  }
+  if (!previousRun) {
+    buttons.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`mgmt:payroll:pay-period:${previousPeriod}`)
+        .setLabel(`${previousPeriod} 前月分を確認`)
+        .setEmoji("🗓️")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(rows.length === 0),
     );
   }
 
@@ -177,10 +173,6 @@ function payrollHome(services: Services) {
     embeds: [new EmbedBuilder().setTitle("💰 給与").setColor(0x6b21a8).setDescription(description)],
     components,
   };
-}
-
-function safeText(value: string): string {
-  return value.replace(/[\r\n\t]+/gu, " ").trim();
 }
 
 function previewText(plan: PayoutPlan, runId: number, displayNames: ReadonlyMap<string, string>): string {
@@ -301,6 +293,7 @@ function executionResult(run: PayoutRunRow, report: ExecutionReport, moneySupply
 function existingRunMessage(run: PayoutRunRow, services: Services) {
   const plan = services.payroll.planOf(run);
   const report = reportOf(run);
+  const reportUnknown = run.status === "executed" && !report;
   const lines = [
     `**対象月:** \`${run.period}\` / **Run:** #${run.id}`,
     `状態: **${statusLabel(run)}**`,
@@ -308,14 +301,16 @@ function existingRunMessage(run: PayoutRunRow, services: Services) {
   ];
   if (report) {
     lines.push(`直近実行: 成功 ${report.succeeded}件 / 支給済みスキップ ${report.skippedAsPaid}件 / 失敗 ${report.failed.length}件`);
+  } else if (reportUnknown) {
+    lines.push("直近実行: 結果を安全に読み取れないため、冪等再実行が必要です。");
   }
   const components: ActionRowBuilder<ButtonBuilder>[] = [];
-  if (run.status === "approved" || (run.status === "executed" && report?.failed.length)) {
+  if (run.status === "approved" || (run.status === "executed" && (reportUnknown || report.failed.length > 0))) {
     components.push(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId(`mgmt:payroll:retry:${run.id}`)
-          .setLabel(run.status === "approved" ? "支給を再開" : "未払い分だけ再実行")
+          .setLabel(run.status === "approved" ? "支給を再開" : reportUnknown ? "結果不明Runを安全再実行" : "未払い分だけ再実行")
           .setStyle(run.status === "approved" ? ButtonStyle.Success : ButtonStyle.Danger),
       ),
     );
@@ -341,9 +336,8 @@ async function showPayrollError(interaction: ButtonInteraction, error: unknown):
   });
 }
 
-async function previewPayroll(interaction: ButtonInteraction, services: Services): Promise<void> {
+async function previewPayroll(interaction: ButtonInteraction, services: Services, period: string): Promise<void> {
   await interaction.deferUpdate();
-  const period = jstPeriod();
   try {
     const existing = services.payroll.getRunByPeriod(period);
     if (existing && existing.status !== "draft") {
@@ -365,7 +359,7 @@ async function previewPayroll(interaction: ButtonInteraction, services: Services
         .setEmoji("💸")
         .setStyle(ButtonStyle.Danger),
       new ButtonBuilder()
-        .setCustomId("mgmt:payroll:pay")
+        .setCustomId(`mgmt:payroll:pay-period:${period}`)
         .setLabel("現在のロールで再集計")
         .setEmoji("🔄")
         .setStyle(ButtonStyle.Secondary),
@@ -453,7 +447,14 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   } else if (!action) {
     await interaction.update(payrollHome(services));
   } else if (action === "pay") {
-    await previewPayroll(interaction, services);
+    await previewPayroll(interaction, services, jstPeriod());
+  } else if (action === "pay-period") {
+    const period = rawRunId;
+    if (!period || !isManualPayrollPeriod(period)) {
+      await interaction.reply({ content: "対象月が不正です。現在月または前月だけを指定できます。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await previewPayroll(interaction, services, period);
   } else if (action === "confirm") {
     const runId = Number(rawRunId);
     if (!Number.isSafeInteger(runId) || !expectedHash) {
