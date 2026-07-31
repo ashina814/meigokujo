@@ -123,7 +123,7 @@ function payrollHome(services: Services) {
         .setEmoji("▶️")
         .setStyle(ButtonStyle.Success),
     );
-  } else if (run.status === "executed" && (currentReportUnknown || currentReport.failed.length > 0)) {
+  } else if (run.status === "executed" && (currentReportUnknown || (currentReport?.failed.length ?? 0) > 0)) {
     buttons.addComponents(
       new ButtonBuilder()
         .setCustomId(`mgmt:payroll:retry:${run.id}`)
@@ -305,7 +305,7 @@ function existingRunMessage(run: PayoutRunRow, services: Services) {
     lines.push("直近実行: 結果を安全に読み取れないため、冪等再実行が必要です。");
   }
   const components: ActionRowBuilder<ButtonBuilder>[] = [];
-  if (run.status === "approved" || (run.status === "executed" && (reportUnknown || report.failed.length > 0))) {
+  if (run.status === "approved" || (run.status === "executed" && (reportUnknown || (report?.failed.length ?? 0) > 0))) {
     components.push(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
