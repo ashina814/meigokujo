@@ -74,16 +74,24 @@ describe("未完了給与Runの回収", () => {
     db.close();
   });
 
-  it("実行レポートが欠損・破損したRunは安全側で回収対象に残す", () => {
+  it("実行レポートが欠損・破損・構造不正なら安全側で回収対象に残す", () => {
     const { db, payroll } = setup();
     const run = payroll.generateDraft("2026-07", members, STAFF);
     payroll.approve(run.id, STAFF);
 
-    db.prepare("UPDATE payout_runs SET status = 'executed', report_json = NULL WHERE id = ?").run(run.id);
-    expect(payroll.listRecoverableRuns().map((item) => item.id)).toContain(run.id);
+    const malformedReports: Array<string | null> = [
+      null,
+      "not-json",
+      "{}",
+      '{"failed":null}',
+      '{"succeeded":"2","skippedAsPaid":0,"failed":[],"totalPaid":200000}',
+      '{"succeeded":2,"skippedAsPaid":0,"failed":[{"userId":"alice","code":"ERR","details":null}],"totalPaid":200000}',
+    ];
 
-    db.prepare("UPDATE payout_runs SET report_json = 'not-json' WHERE id = ?").run(run.id);
-    expect(payroll.listRecoverableRuns().map((item) => item.id)).toContain(run.id);
+    for (const reportJson of malformedReports) {
+      db.prepare("UPDATE payout_runs SET status = 'executed', report_json = ? WHERE id = ?").run(reportJson, run.id);
+      expect(payroll.listRecoverableRuns().map((item) => item.id)).toContain(run.id);
+    }
 
     db.close();
   });
