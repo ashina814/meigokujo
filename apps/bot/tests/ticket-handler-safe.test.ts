@@ -31,6 +31,7 @@ function harness(options: {
   updateError?: Error;
   editReplyError?: Error;
   messageEditError?: Error;
+  roleCheck?: (roleId: string) => boolean;
 }) {
   const current = options.current ?? ticket();
   const controlMessage = {
@@ -50,6 +51,7 @@ function harness(options: {
     setArchived: vi.fn(async () => undefined),
     messages: { fetch: vi.fn(async () => controlMessage) },
   };
+  const roleHas = vi.fn(options.roleCheck ?? ((roleId: string) => roleId === "staff_role"));
   const services = {
     settings: { getString: vi.fn(() => undefined) },
     tickets: {
@@ -66,12 +68,15 @@ function harness(options: {
     user: { id: "staff1", username: "staff1", globalName: null },
     member: {
       displayName: "橋本",
-      roles: { cache: { has: (roleId: string) => roleId === "staff_role" } },
+      roles: { cache: { has: roleHas } },
     },
     message: controlMessage,
     deferred: false,
     replied: false,
     deferUpdate: vi.fn(async () => {
+      interaction.deferred = true;
+    }),
+    deferReply: vi.fn(async () => {
       interaction.deferred = true;
     }),
     update: vi.fn(async () => {
@@ -88,7 +93,7 @@ function harness(options: {
       return controlMessage;
     }),
   };
-  return { interaction, services, thread, controlMessage };
+  return { interaction, services, thread, controlMessage, roleHas };
 }
 
 describe("チケット操作のDiscord応答保証", () => {
@@ -110,6 +115,27 @@ describe("チケット操作のDiscord応答保証", () => {
     );
     expect(h.thread.setLocked).toHaveBeenCalledWith(true, "チケット完了");
     expect(h.thread.setArchived).toHaveBeenCalledWith(true, "チケット完了");
+  });
+
+  it("defer後に権限を失ってもreplyをeditReplyへ変換して拒否を返す", async () => {
+    let roleChecks = 0;
+    const h = harness({
+      customId: "ticket:close-confirm:control1",
+      current: ticket({ status: "claimed", claimed_by: "user:staff1" }),
+      roleCheck: () => {
+        roleChecks += 1;
+        return roleChecks === 1;
+      },
+    });
+
+    await handleTicketButton(h.interaction, h.services as any);
+
+    expect(h.interaction.deferUpdate).toHaveBeenCalledTimes(1);
+    expect(h.interaction.reply).not.toHaveBeenCalled();
+    expect(h.interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("対応ロールだけ") }),
+    );
+    expect(h.services.tickets.close).not.toHaveBeenCalled();
   });
 
   it("クローズ競合側の確認画面更新が失敗してもロックとアーカイブを続ける", async () => {
@@ -148,7 +174,7 @@ describe("チケット操作のDiscord応答保証", () => {
     expect(h.thread.setName).toHaveBeenCalledWith(expect.stringContaining("橋本対応中"), "チケット対応開始");
   });
 
-  it("旧UIの対応中チケットは次の操作時に表示とスレッド名を修復する", async () => {
+  it("旧UIの対応中チケットは修復前にdeferし、表示とスレッド名を直す", async () => {
     const h = harness({
       customId: "ticket:claim",
       current: ticket({ status: "claimed", claimed_by: "user:staff1" }),
@@ -156,6 +182,10 @@ describe("チケット操作のDiscord応答保証", () => {
 
     await handleTicketButton(h.interaction, h.services as any);
 
+    expect(h.interaction.deferReply).toHaveBeenCalledTimes(1);
+    expect(h.interaction.deferReply.mock.invocationCallOrder[0]).toBeLessThan(
+      h.controlMessage.edit.mock.invocationCallOrder[0]!,
+    );
     expect(h.controlMessage.edit).toHaveBeenCalledWith(
       expect.objectContaining({ content: expect.stringContaining("<@staff1> が対応中") }),
     );
@@ -166,7 +196,8 @@ describe("チケット操作のDiscord応答保証", () => {
       expect.stringContaining("橋本対応中"),
       "既存チケットの対応表示を修復",
     );
-    expect(h.interaction.reply).toHaveBeenCalledWith(
+    expect(h.interaction.reply).not.toHaveBeenCalled();
+    expect(h.interaction.editReply).toHaveBeenCalledWith(
       expect.objectContaining({ content: expect.stringContaining("既に <@staff1> が対応中") }),
     );
   });
