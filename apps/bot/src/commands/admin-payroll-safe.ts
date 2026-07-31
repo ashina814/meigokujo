@@ -218,8 +218,8 @@ function previewEmbed(plan: PayoutPlan, runId: number): EmbedBuilder {
       "",
     ],
     visible,
-    [],
-    (count) => `…他 ${count + extra}名（添付を確認）`,
+    extra > 0 ? [`…他 ${extra}名（添付を確認）`] : [],
+    (count) => `…上位表示の他 ${count}名（添付を確認）`,
   );
   return new EmbedBuilder()
     .setTitle(`🔎 ${plan.period} 給与支給案 (#${runId})`)
