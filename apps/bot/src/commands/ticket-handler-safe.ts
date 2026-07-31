@@ -6,6 +6,7 @@ import {
   type ButtonInteraction,
   type GuildMember,
 } from "discord.js";
+import type { TicketRow } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
 import type { Services } from "../services.js";
 import {
@@ -17,6 +18,8 @@ import {
 const CLOSE_CONFIRM_PREFIX = "ticket:close-confirm:";
 
 type UpdatePayload = Parameters<ButtonInteraction["update"]>[0];
+type ReplyPayload = Parameters<ButtonInteraction["reply"]>[0];
+type EditReplyPayload = Parameters<ButtonInteraction["editReply"]>[0];
 
 function actorUserId(actor: string | null | undefined): string | undefined {
   if (!actor) return undefined;
@@ -64,18 +67,17 @@ function safeThreadPart(value: string): string {
   return (value.replace(/[\r\n｜]/gu, " ").replace(/\s+/gu, " ").trim() || "担当者").slice(0, 24);
 }
 
-function canOperateTicket(interaction: ButtonInteraction, services: Services): boolean {
+function canOperateTicket(
+  interaction: ButtonInteraction,
+  services: Services,
+  ticket: TicketRow | undefined = services.tickets.get(interaction.channelId),
+): boolean {
   if (isAdmin(interaction, services)) return true;
   const member = interaction.member as GuildMember | null;
-  const ticket = services.tickets.get(interaction.channelId);
   return memberHasAnyRole(member, ticketStaffRoleIds(ticket, services));
 }
 
-async function repairExistingClaimedUi(interaction: ButtonInteraction, services: Services): Promise<void> {
-  if (interaction.customId !== "ticket:claim" || !canOperateTicket(interaction, services)) return;
-  const ticket = services.tickets.get(interaction.channelId);
-  if (!ticket || ticket.status !== "claimed") return;
-
+async function repairExistingClaimedUi(interaction: ButtonInteraction, ticket: TicketRow): Promise<void> {
   const claimantId = actorUserId(ticket.claimed_by);
   const status = claimantId ? `<@${claimantId}> が対応中` : "担当者が対応中";
   await interaction.message
@@ -95,18 +97,47 @@ async function repairExistingClaimedUi(interaction: ButtonInteraction, services:
   );
 }
 
+function toEditReplyPayload(payload: ReplyPayload): EditReplyPayload {
+  if (typeof payload === "string") return { content: payload };
+  const editable = { ...payload } as Record<string, unknown>;
+  delete editable.flags;
+  delete editable.ephemeral;
+  delete editable.fetchReply;
+  return editable as EditReplyPayload;
+}
+
+async function respondAfterAcknowledgement(
+  interaction: ButtonInteraction,
+  payload: ReplyPayload,
+): Promise<unknown> {
+  if (interaction.deferred || interaction.replied) return interaction.editReply(toEditReplyPayload(payload));
+  return interaction.reply(payload);
+}
+
 function resilientInteraction(interaction: ButtonInteraction): ButtonInteraction {
   const closeConfirm = interaction.customId.startsWith(CLOSE_CONFIRM_PREFIX);
 
   return new Proxy(interaction, {
     get(target, property) {
+      if (property === "reply") {
+        return async (payload: ReplyPayload) => {
+          try {
+            return await respondAfterAcknowledgement(target, payload);
+          } catch (error) {
+            console.warn("[ticket] チケット操作結果の応答に失敗", error);
+            return target.message as never;
+          }
+        };
+      }
+
       if (property === "update") {
         return async (payload: UpdatePayload) => {
-          if (closeConfirm && (target.deferred || target.replied)) {
+          if (target.deferred || target.replied) {
             try {
               return await target.editReply(payload);
             } catch (error) {
-              console.warn("[ticket] クローズ確認画面の更新に失敗しましたが後処理を継続します", error);
+              const label = closeConfirm ? "クローズ確認画面" : "チケット操作画面";
+              console.warn(`[ticket] ${label}の更新に失敗しましたが後処理を継続します`, error);
               return target.message as never;
             }
           }
@@ -120,14 +151,12 @@ function resilientInteraction(interaction: ButtonInteraction): ButtonInteraction
                 console.warn("[ticket] 対応状態の直接メッセージ更新にも失敗", editError);
                 return null;
               });
-              await target
-                .reply({
-                  content: edited
-                    ? "対応者として登録し、表示を更新しました。"
-                    : "対応者として登録しましたが、表示更新に失敗しました。再度押しても担当は重複しません。",
-                  flags: MessageFlags.Ephemeral,
-                })
-                .catch(() => undefined);
+              await respondAfterAcknowledgement(target, {
+                content: edited
+                  ? "対応者として登録し、表示を更新しました。"
+                  : "対応者として登録しましたが、表示更新に失敗しました。再度押しても担当は重複しません。",
+                flags: MessageFlags.Ephemeral,
+              }).catch(() => undefined);
               return (edited ?? target.message) as never;
             }
           }
@@ -146,11 +175,23 @@ function resilientInteraction(interaction: ButtonInteraction): ButtonInteraction
  * チケット操作のDB状態遷移は tickets.ts / core が担い、この層はDiscord Interactionの応答期限と表示復旧を保証する。
  */
 export async function handleTicketButton(interaction: ButtonInteraction, services: Services): Promise<void> {
-  await repairExistingClaimedUi(interaction, services);
+  const ticket = services.tickets.get(interaction.channelId);
+  const canOperate = canOperateTicket(interaction, services, ticket);
+  const repairsClaimedUi =
+    interaction.customId === "ticket:claim" && canOperate && ticket?.status === "claimed";
 
-  if (interaction.customId.startsWith(CLOSE_CONFIRM_PREFIX) && !interaction.deferred && !interaction.replied) {
+  if (repairsClaimedUi && !interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  } else if (
+    interaction.customId.startsWith(CLOSE_CONFIRM_PREFIX) &&
+    canOperate &&
+    !interaction.deferred &&
+    !interaction.replied
+  ) {
     await interaction.deferUpdate();
   }
+
+  if (repairsClaimedUi && ticket) await repairExistingClaimedUi(interaction, ticket);
 
   await handleTicketButtonBase(resilientInteraction(interaction), services);
 }
