@@ -186,6 +186,31 @@ export class Payroll {
       | undefined;
   }
 
+  /**
+   * 月を跨いでも回収が必要なRunを古い順に返す。
+   * draft / approved は常に対象。executed は部分失敗またはレポート破損時だけ対象に残す。
+   */
+  listRecoverableRuns(): PayoutRunRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM payout_runs
+         WHERE status IN ('draft', 'approved', 'executed')
+         ORDER BY period ASC, id ASC`,
+      )
+      .all() as PayoutRunRow[];
+
+    return rows.filter((run) => {
+      if (run.status === "draft" || run.status === "approved") return true;
+      if (!run.report_json) return true;
+      try {
+        const report = JSON.parse(run.report_json) as Partial<ExecutionReport>;
+        return !Array.isArray(report.failed) || report.failed.length > 0;
+      } catch {
+        return true;
+      }
+    });
+  }
+
   planOf(run: PayoutRunRow): PayoutPlan {
     return JSON.parse(run.plan_json) as PayoutPlan;
   }
