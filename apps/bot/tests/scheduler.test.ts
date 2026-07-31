@@ -77,6 +77,70 @@ describe("sendChunkedLines", () => {
   });
 });
 
+describe("説明会の開催枠", () => {
+  function scheduleFor(values: Record<string, string>) {
+    const settings = { getString: vi.fn((key: string) => values[key]) };
+    return { settings };
+  }
+
+  it("未設定なら現行運用（月・木を除く 21/22/23時）のまま", async () => {
+    const { sessionSchedule, describeSessionSchedule, nextSessionStart } = await import("../src/scheduler.js");
+    const schedule = sessionSchedule(scheduleFor({}) as any);
+
+    expect(schedule).toEqual({ hours: [21, 22, 23], skipDow: [1, 4] });
+    expect(describeSessionSchedule(schedule)).toBe("月・木を除く 21 / 22 / 23 時");
+
+    // 2026-07-31(金) 21:30 JST → 同日22時会
+    const friday2130 = new Date("2026-07-31T12:30:00Z");
+    expect(nextSessionStart(schedule, friday2130)?.toISOString()).toBe("2026-07-31T13:00:00.000Z");
+    // 日曜23:30 JST → 月曜は休みなので火曜21時会
+    const sunday2330 = new Date("2026-08-02T14:30:00Z");
+    expect(nextSessionStart(schedule, sunday2330)?.toISOString()).toBe("2026-08-04T12:00:00.000Z");
+  });
+
+  it("設定した時刻・休みの曜日で次の開催が決まる", async () => {
+    const { sessionSchedule, describeSessionSchedule, nextSessionStart } = await import("../src/scheduler.js");
+    const schedule = sessionSchedule(
+      scheduleFor({ "entry:session_hours": "[20, 22]", "entry:session_skip_dow": "[0, 6]" }) as any,
+    );
+
+    expect(schedule).toEqual({ hours: [20, 22], skipDow: [0, 6] });
+    expect(describeSessionSchedule(schedule)).toBe("日・土を除く 20 / 22 時");
+    // 金曜22:30 JST → 土日は休みなので月曜20時会
+    expect(nextSessionStart(schedule, new Date("2026-07-31T13:30:00Z"))?.toISOString()).toBe("2026-08-03T11:00:00.000Z");
+  });
+
+  it("カンマ区切りでも受け付け、範囲外・数値でない値は捨てる", async () => {
+    const { sessionSchedule } = await import("../src/scheduler.js");
+    const schedule = sessionSchedule(
+      scheduleFor({ "entry:session_hours": "23, 21, 21, 24, あ", "entry:session_skip_dow": "4,1" }) as any,
+    );
+
+    expect(schedule).toEqual({ hours: [21, 23], skipDow: [1, 4] });
+  });
+
+  it("休みの曜日は空配列なら毎日開催、時刻が全滅した設定は既定値へ落とす", async () => {
+    const { sessionSchedule, describeSessionSchedule } = await import("../src/scheduler.js");
+    const everyday = sessionSchedule(scheduleFor({ "entry:session_skip_dow": "[]" }) as any);
+    expect(everyday.skipDow).toEqual([]);
+    expect(describeSessionSchedule(everyday)).toBe("毎日 21 / 22 / 23 時");
+
+    // 説明会が黙って消えるほうが害が大きいので、壊れた値は既定値で運転を続ける
+    const broken = sessionSchedule(
+      scheduleFor({ "entry:session_hours": "[99]", "entry:session_skip_dow": "毎日" }) as any,
+    );
+    expect(broken).toEqual({ hours: [21, 22, 23], skipDow: [1, 4] });
+  });
+
+  it("全曜日が休みなら次の開催は無い", async () => {
+    const { sessionSchedule, describeSessionSchedule, nextSessionStart } = await import("../src/scheduler.js");
+    const schedule = sessionSchedule(scheduleFor({ "entry:session_skip_dow": "[0,1,2,3,4,5,6]" }) as any);
+
+    expect(nextSessionStart(schedule, new Date("2026-07-31T12:30:00Z"))).toBeNull();
+    expect(describeSessionSchedule(schedule)).toBe("現在は定例の説明会がありません");
+  });
+});
+
 describe("説明会通知タスク", () => {
   it("通知予定時刻から2分間は再試行窓になり、窓外と開始後は送らない", async () => {
     const { isSessionNotificationDue } = await import("../src/scheduler.js");
@@ -86,6 +150,13 @@ describe("説明会通知タスク", () => {
     expect(isSessionNotificationDue({ hour: 20, minute: 32 }, 21, 30)).toBe(true);
     expect(isSessionNotificationDue({ hour: 20, minute: 33 }, 21, 30)).toBe(false);
     expect(isSessionNotificationDue({ hour: 21, minute: 0 }, 21, 30)).toBe(false);
+  });
+
+  it("0時開催の通知は前日23時台に出る", async () => {
+    const { isSessionNotificationDue } = await import("../src/scheduler.js");
+
+    expect(isSessionNotificationDue({ hour: 23, minute: 55 }, 0, 55)).toBe(true);
+    expect(isSessionNotificationDue({ hour: 0, minute: 55 }, 0, 55)).toBe(false);
   });
 
   it("説明会チャンネル取得失敗時にマーカーが保存されない", async () => {

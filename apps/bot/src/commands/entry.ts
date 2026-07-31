@@ -20,7 +20,7 @@ import {
 import { fmtLd } from "../format.js";
 import { deliverToUser } from "../notify.js";
 import { isAdmin } from "../permissions.js";
-import { jstNow, nextSessionStart } from "../scheduler.js";
+import { describeSessionSchedule, jstNow, nextSessionStart, sessionSchedule } from "../scheduler.js";
 import type { Services } from "../services.js";
 
 // ---- パネル ----
@@ -34,6 +34,7 @@ import type { Services } from "../services.js";
  */
 export function entryPanelMessage(services: Services): MessageCreateOptions {
   const vcIds = sessionVcIds(services);
+  const schedule = describeSessionSchedule(sessionSchedule(services));
   const embed = new EmbedBuilder()
     .setTitle("🚪 冥獄城 入城案内")
     .setColor(0x6b21a8)
@@ -41,7 +42,7 @@ export function entryPanelMessage(services: Services): MessageCreateOptions {
     .addFields(
       {
         name: "📅 説明会",
-        value: ["**月・木を除く 21時 / 22時 / 23時**", "開始 **5分前** にこのチャンネルでお知らせします。"].join("\n"),
+        value: [`**${schedule}**`, "開始 **5分前** にこのチャンネルでお知らせします。"].join("\n"),
         inline: true,
       },
       {
@@ -70,13 +71,13 @@ export function entryPanelMessage(services: Services): MessageCreateOptions {
  * @deprecated 入城案内パネルへ統合済み。新規設置はできない（`/パネル設置` の選択肢から外した）。
  * 既に設置してあるパネルを撤去するまでの間、押しても動くように残してある。
  */
-export function entryFlexPanelMessage(): MessageCreateOptions {
+export function entryFlexPanelMessage(services: Services): MessageCreateOptions {
   const embed = new EmbedBuilder()
     .setTitle("⏰ 時間外・個別希望 受付")
     .setColor(0xdb2777)
     .setDescription(
       [
-        "**月・木を除く 21/22/23時** の説明会に来られない方は、こちらから個別希望を出せます。",
+        `**${describeSessionSchedule(sessionSchedule(services))}** の説明会に来られない方は、こちらから個別希望を出せます。`,
         "ボタンを押すと、あなたとスタッフだけの非公開スレッドが開きます。都合のいい時間帯を書いてください。",
       ].join("\n"),
     );
@@ -139,7 +140,8 @@ export async function handleEntryButton(
  */
 export function entryStatusMessage(services: Services, userId: string): MessageCreateOptions {
   const soul = services.entry.getSoul(userId);
-  const next = nextSessionStart();
+  const schedule = sessionSchedule(services);
+  const next = nextSessionStart(schedule);
   const nextTs = next ? Math.floor(next.getTime() / 1000) : null;
   const vcIds = sessionVcIds(services);
 
@@ -163,7 +165,7 @@ export function entryStatusMessage(services: Services, userId: string): MessageC
     .addFields(
       {
         name: "📅 次の説明会",
-        value: nextTs ? `<t:${nextTs}:F>\n<t:${nextTs}:R>` : "月・木を除く 21 / 22 / 23 時",
+        value: nextTs ? `<t:${nextTs}:F>\n<t:${nextTs}:R>` : describeSessionSchedule(schedule),
         inline: true,
       },
       {
@@ -231,7 +233,8 @@ export async function handleMemberJoin(
  * 門番が当日 `/審判 招待` で拾う。ここで手順を1つ増やすほうが損が大きい。
  */
 function buildWelcomeEmbed(member: GuildMember, services: Services): EmbedBuilder {
-  const next = nextSessionStart();
+  const schedule = sessionSchedule(services);
+  const next = nextSessionStart(schedule);
   const nextTs = next ? Math.floor(next.getTime() / 1000) : null;
   const guildId = member.guild.id;
   const vcIds = sessionVcIds(services);
@@ -257,7 +260,7 @@ function buildWelcomeEmbed(member: GuildMember, services: Services): EmbedBuilde
     .addFields(
       {
         name: "🕯️ 次の案内",
-        value: nextTs ? `<t:${nextTs}:F>\n<t:${nextTs}:R>` : "月・木を除く 21 / 22 / 23 時",
+        value: nextTs ? `<t:${nextTs}:F>\n<t:${nextTs}:R>` : describeSessionSchedule(schedule),
         inline: true,
       },
       { name: "📍 集合場所", value: vcLinks || "説明会場VC", inline: true },
