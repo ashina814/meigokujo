@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -7,10 +6,11 @@ import {
   EmbedBuilder,
   MessageFlags,
 } from "discord.js";
-import type { ExecutionReport, PayoutPlan, PayoutRunRow } from "@meigokujo/core";
+import type { PayoutPlan, PayoutRunRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import type { Services } from "../services.js";
+import { jstPeriod, planHash, reportOf, safeText, shorten } from "../payroll-ui-utils.js";
 import { handleAdminButton as handleSafePayrollButton } from "./admin-payroll-safe.js";
 
 export { handleAdminCommand, handleAdminModal, handleAdminSelect } from "./admin-payroll-safe.js";
@@ -19,45 +19,11 @@ const RECOVER_PREFIX = "mgmt:payroll:recover:";
 const CANCEL_PREFIX = "mgmt:payroll:cancel:";
 const EMBED_DESCRIPTION_LIMIT = 3_900;
 
-function jstPeriod(date = new Date()): string {
-  const parts = new Intl.DateTimeFormat("ja-JP", {
-    timeZone: "Asia/Tokyo",
-    year: "numeric",
-    month: "2-digit",
-  }).formatToParts(date);
-  const year = parts.find((part) => part.type === "year")?.value;
-  const month = parts.find((part) => part.type === "month")?.value;
-  if (!year || !month) throw new Error("JSTの対象月を計算できませんでした");
-  return `${year}-${month}`;
-}
-
-function planHash(run: PayoutRunRow): string {
-  return createHash("sha256").update(run.plan_json).digest("hex").slice(0, 12);
-}
-
-function reportOf(run: PayoutRunRow): ExecutionReport | undefined {
-  if (!run.report_json) return undefined;
-  try {
-    return JSON.parse(run.report_json) as ExecutionReport;
-  } catch {
-    return undefined;
-  }
-}
-
 function statusLabel(run: PayoutRunRow): string {
   if (run.status === "draft") return "支給案作成済み・未承認";
   if (run.status === "approved") return "承認済み・実行待ち";
   if (run.status === "executed") return "一部未完了・再実行待ち";
   return "見送り済み";
-}
-
-function shorten(value: string, maxLength: number): string {
-  if (value.length <= maxLength) return value;
-  return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
-}
-
-function safeText(value: string): string {
-  return value.replace(/[\r\n\t]+/gu, " ").trim();
 }
 
 function pastRecoverableRuns(services: Services): PayoutRunRow[] {
@@ -69,6 +35,10 @@ function olderRecoverableRun(services: Services, target: PayoutRunRow): PayoutRu
   return services.payroll
     .listRecoverableRuns()
     .find((run) => run.id !== target.id && (run.period < target.period || (run.period === target.period && run.id < target.id)));
+}
+
+function olderRecoverableForPeriod(services: Services, targetPeriod: string): PayoutRunRow | undefined {
+  return services.payroll.listRecoverableRuns().find((run) => run.period < targetPeriod);
 }
 
 function recoveryHome(run: PayoutRunRow, services: Services, pendingCount: number) {
@@ -103,7 +73,7 @@ function recoveryHome(run: PayoutRunRow, services: Services, pendingCount: numbe
     primary.addComponents(
       new ButtonBuilder()
         .setCustomId(`mgmt:payroll:retry:${run.id}`)
-        .setLabel(run.status === "approved" ? "支給を再開" : "未払い分を再実行")
+        .setLabel(run.status === "approved" ? "支給を再開" : report ? "未払い分を再実行" : "結果不明Runを安全再実行")
         .setEmoji(run.status === "approved" ? "▶️" : "🔁")
         .setStyle(run.status === "approved" ? ButtonStyle.Success : ButtonStyle.Danger),
     );
@@ -194,6 +164,7 @@ function planText(run: PayoutRunRow, plan: PayoutPlan): string {
 
 function recoveryPreview(run: PayoutRunRow, services: Services) {
   const plan = services.payroll.planOf(run);
+  const report = reportOf(run);
   const action = new ActionRowBuilder<ButtonBuilder>();
   if (run.status === "draft") {
     const hash = planHash(run);
@@ -213,7 +184,7 @@ function recoveryPreview(run: PayoutRunRow, services: Services) {
     action.addComponents(
       new ButtonBuilder()
         .setCustomId(`mgmt:payroll:retry:${run.id}`)
-        .setLabel(run.status === "approved" ? "支給を再開" : "未払い分を再実行")
+        .setLabel(run.status === "approved" ? "支給を再開" : report ? "未払い分を再実行" : "結果不明Runを安全再実行")
         .setEmoji(run.status === "approved" ? "▶️" : "🔁")
         .setStyle(run.status === "approved" ? ButtonStyle.Success : ButtonStyle.Danger),
     );
@@ -363,11 +334,12 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   }
 
   const [, section, action, runIdRaw] = interaction.customId.split(":");
-  if (section === "payroll" && (action === "pay" || action === "confirm" || action === "retry")) {
+  if (section === "payroll" && (action === "pay" || action === "pay-period" || action === "confirm" || action === "retry")) {
     if (await denyNonAdmin(interaction, services)) return;
     let blocker: PayoutRunRow | undefined;
-    if (action === "pay") {
-      blocker = pastRecoverableRuns(services)[0];
+    if (action === "pay" || action === "pay-period") {
+      const targetPeriod = action === "pay" ? jstPeriod() : runIdRaw;
+      if (targetPeriod) blocker = olderRecoverableForPeriod(services, targetPeriod);
     } else {
       const runId = Number(runIdRaw);
       if (Number.isSafeInteger(runId)) {
