@@ -17,6 +17,7 @@ import { handleAdminButton as handleAdminButtonBase } from "./admin-hub.js";
 export { handleAdminCommand, handleAdminModal, handleAdminSelect } from "./admin-hub.js";
 
 const PAYROLL_PREFIX = "mgmt:payroll:";
+const EMBED_DESCRIPTION_LIMIT = 3_900;
 
 function jstPeriod(date = new Date()): string {
   const parts = new Intl.DateTimeFormat("ja-JP", {
@@ -43,6 +44,42 @@ function reportOf(run: PayoutRunRow): ExecutionReport | undefined {
   }
 }
 
+function shorten(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function boundedDescription(
+  prefix: string[],
+  details: string[],
+  suffix: string[],
+  omittedLabel: (count: number) => string,
+  limit = EMBED_DESCRIPTION_LIMIT,
+): string {
+  const selected: string[] = [];
+  for (let index = 0; index < details.length; index += 1) {
+    const remaining = details.length - index - 1;
+    const candidate = [
+      ...prefix,
+      ...selected,
+      details[index]!,
+      ...(remaining > 0 ? [omittedLabel(remaining)] : []),
+      ...suffix,
+    ]
+      .filter(Boolean)
+      .join("\n");
+    if (candidate.length > limit) break;
+    selected.push(details[index]!);
+  }
+  const omitted = details.length - selected.length;
+  return shorten(
+    [...prefix, ...selected, ...(omitted > 0 ? [omittedLabel(omitted)] : []), ...suffix]
+      .filter(Boolean)
+      .join("\n"),
+    limit,
+  );
+}
+
 function payrollBackRow(): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:payroll").setLabel("← 給与へ").setStyle(ButtonStyle.Secondary),
@@ -66,22 +103,19 @@ function payrollHome(services: Services) {
   const period = jstPeriod();
   const run = services.payroll.getRunByPeriod(period);
   const previousReport = run ? reportOf(run) : undefined;
-  const salaryLines = rows.length
-    ? rows.map((row) => `・<@&${row.role_id}> **${row.label}**: ${fmtLd(row.amount)}`).join("\n")
-    : "（給与表は空）";
-  const description = [
-    `**対象月（JST）:** \`${period}\``,
-    `**支給状態:** ${statusLabel(run)}`,
-    "",
-    "**給与表**（ロールごとに月額を設定）",
-    salaryLines,
+  const salaryLines = rows.map((row) => `・<@&${row.role_id}> **${row.label}**: ${fmtLd(row.amount)}`);
+  const suffix = [
     "",
     "支給ボタンでは送金せず、現在のロールから対象者・内訳・総額を計算します。",
     "確認後にだけ支給し、部分失敗時は同じRunから未払い分だけ再実行できます。",
   ];
-  if (previousReport?.failed.length) {
-    description.push("", `⚠️ 前回実行で **${previousReport.failed.length}件** が未払いです。`);
-  }
+  if (previousReport?.failed.length) suffix.push("", `⚠️ 前回実行で **${previousReport.failed.length}件** が未払いです。`);
+  const description = boundedDescription(
+    [`**対象月（JST）:** \`${period}\``, `**支給状態:** ${statusLabel(run)}`, "", "**給与表**（ロールごとに月額を設定）"],
+    salaryLines.length > 0 ? salaryLines : ["（給与表は空）"],
+    suffix,
+    (count) => `…他 ${count}行`,
+  );
 
   const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:payroll:add-start").setLabel("行追加").setEmoji("➕").setStyle(ButtonStyle.Primary),
@@ -140,7 +174,7 @@ function payrollHome(services: Services) {
     ),
   );
   return {
-    embeds: [new EmbedBuilder().setTitle("💰 給与").setColor(0x6b21a8).setDescription(description.join("\n"))],
+    embeds: [new EmbedBuilder().setTitle("💰 給与").setColor(0x6b21a8).setDescription(description)],
     components,
   };
 }
@@ -169,44 +203,66 @@ function previewText(plan: PayoutPlan, runId: number, displayNames: ReadonlyMap<
 }
 
 function previewEmbed(plan: PayoutPlan, runId: number): EmbedBuilder {
-  const top = [...plan.items]
+  const allLines = [...plan.items]
     .sort((a, b) => b.total - a.total || a.userId.localeCompare(b.userId))
-    .slice(0, 15)
-    .map((item) => `<@${item.userId}> — **${fmtLd(item.total)}**（${item.breakdown.map((part) => part.label).join(" + ")}）`);
-  const rest = plan.items.length - top.length;
+    .map((item) => {
+      const labels = shorten(item.breakdown.map((part) => part.label).join(" + "), 320);
+      return `<@${item.userId}> — **${fmtLd(item.total)}**（${labels}）`;
+    });
+  const visible = allLines.slice(0, 15);
+  const extra = Math.max(0, allLines.length - visible.length);
+  const description = boundedDescription(
+    [
+      `対象: **${plan.items.length}名** / 総額: **${fmtLd(plan.totalPayout)}**`,
+      "この画面ではまだ送金していません。添付テキストに全対象者・金額・ロール内訳があります。",
+      "",
+    ],
+    visible,
+    [],
+    (count) => `…他 ${count + extra}名（添付を確認）`,
+  );
   return new EmbedBuilder()
     .setTitle(`🔎 ${plan.period} 給与支給案 (#${runId})`)
     .setColor(0xd97706)
-    .setDescription(
-      [
-        `対象: **${plan.items.length}名** / 総額: **${fmtLd(plan.totalPayout)}**`,
-        "この画面ではまだ送金していません。添付テキストに全対象者・金額・ロール内訳があります。",
-        "",
-        ...top,
-        rest > 0 ? `…他 ${rest}名（添付を確認）` : "",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-    );
+    .setDescription(description);
 }
 
-function failureLines(report: ExecutionReport): string[] {
-  return report.failed.map((failure) => {
+function failureLine(failure: ExecutionReport["failed"][number]): string {
+  const details = Object.entries(failure.details)
+    .map(([key, value]) => `${safeText(key)}=${safeText(String(value))}`)
+    .join(", ");
+  return `・<@${failure.userId}> — \`${failure.code}\`${details ? `（${shorten(details, 500)}）` : ""}`;
+}
+
+function failureText(run: PayoutRunRow, report: ExecutionReport): string {
+  const lines = [
+    `${run.period} 給与支給エラー (#${run.id})`,
+    `失敗件数: ${report.failed.length}`,
+    "",
+    "user_id\tcode\tdetails",
+  ];
+  for (const failure of report.failed) {
     const details = Object.entries(failure.details)
-      .slice(0, 4)
-      .map(([key, value]) => `${key}=${String(value)}`)
+      .map(([key, value]) => `${safeText(key)}=${safeText(String(value))}`)
       .join(", ");
-    return `・<@${failure.userId}> — \`${failure.code}\`${details ? `（${details}）` : ""}`;
-  });
+    lines.push([failure.userId, safeText(failure.code), details].join("\t"));
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 function executionResult(run: PayoutRunRow, report: ExecutionReport, moneySupply: number) {
-  const lines = [
-    `**対象月:** \`${run.period}\` / **Run:** #${run.id}`,
-    `成功 **${report.succeeded}件** / 支給済みスキップ **${report.skippedAsPaid}件** / 失敗 **${report.failed.length}件**`,
-    `今回の支給額: **${fmtLd(report.totalPaid)}** / 通貨発行残高: ${fmtLd(moneySupply)}`,
-  ];
-  if (report.failed.length) lines.push("", "**未払い・失敗理由**", ...failureLines(report));
+  const failureLines = report.failed.map(failureLine);
+  const description = boundedDescription(
+    [
+      `**対象月:** \`${run.period}\` / **Run:** #${run.id}`,
+      `成功 **${report.succeeded}件** / 支給済みスキップ **${report.skippedAsPaid}件** / 失敗 **${report.failed.length}件**`,
+      `今回の支給額: **${fmtLd(report.totalPaid)}** / 通貨発行残高: ${fmtLd(moneySupply)}`,
+      ...(failureLines.length > 0 ? ["", "**未払い・失敗理由**"] : []),
+    ],
+    failureLines,
+    failureLines.length > 0 ? ["全件のエラー詳細は添付ファイルにも保存しています。"] : [],
+    (count) => `…他 ${count}件（添付を確認）`,
+  );
   const components: ActionRowBuilder<ButtonBuilder>[] = [];
   if (report.failed.length) {
     components.push(
@@ -226,9 +282,17 @@ function executionResult(run: PayoutRunRow, report: ExecutionReport, moneySupply
       new EmbedBuilder()
         .setTitle(report.failed.length ? "⚠️ 給与支給は一部未完了" : "✅ 給与支給完了")
         .setColor(report.failed.length ? 0xdc2626 : 0x16a34a)
-        .setDescription(lines.join("\n")),
+        .setDescription(description),
     ],
     components,
+    files: report.failed.length
+      ? [
+          {
+            attachment: Buffer.from(failureText(run, report), "utf8"),
+            name: `salary-failures-${run.period}-run-${run.id}.txt`,
+          },
+        ]
+      : [],
     attachments: [],
     allowedMentions: { parse: [] },
   };
@@ -333,23 +397,21 @@ async function confirmPayroll(
   await interaction.deferUpdate();
   try {
     let run = services.payroll.getRun(runId);
+    if ((run.status === "draft" || run.status === "approved") && planHash(run) !== expectedHash) {
+      await interaction.editReply({
+        content: "⚠️ 支給案が別操作で更新されています。給与画面へ戻り、最新内容をもう一度確認してください。",
+        embeds: [],
+        components: [payrollBackRow()],
+        attachments: [],
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
     if (run.status === "executed" || run.status === "cancelled") {
       await interaction.editReply(existingRunMessage(run, services));
       return;
     }
-    if (run.status === "draft") {
-      if (planHash(run) !== expectedHash) {
-        await interaction.editReply({
-          content: "⚠️ 支給案が別操作で更新されています。給与画面へ戻り、最新内容をもう一度確認してください。",
-          embeds: [],
-          components: [payrollBackRow()],
-          attachments: [],
-          allowedMentions: { parse: [] },
-        });
-        return;
-      }
-      run = services.payroll.approve(runId, `user:${interaction.user.id}`);
-    }
+    if (run.status === "draft") run = services.payroll.approve(runId, `user:${interaction.user.id}`);
     if (run.status !== "approved") throw new Error(`このRunは実行できません（状態: ${run.status}）`);
     const report = services.payroll.execute(runId, `user:${interaction.user.id}`);
     run = services.payroll.getRun(runId);
