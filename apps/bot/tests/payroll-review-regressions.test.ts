@@ -115,6 +115,7 @@ describe("給与レビュー指摘の回帰", () => {
         ),
       },
       payroll: {
+        listRecoverableRuns: vi.fn(() => []),
         generateDraft: vi.fn(() => draft),
         planOf: vi.fn(() => plan),
       },
