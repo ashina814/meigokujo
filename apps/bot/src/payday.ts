@@ -27,6 +27,10 @@ function shorten(value: string, maxLength: number): string {
   return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
+function safeText(value: string): string {
+  return value.replace(/[\r\n\t]+/gu, " ").trim();
+}
+
 function boundedLines(
   fixed: string[],
   details: string[],
@@ -63,15 +67,36 @@ function planEmbed(plan: PayoutPlan, runId: number): EmbedBuilder {
       return `<@${item.userId}> — **${fmtLd(item.total)}**（${labels}）`;
     });
   const description = boundedLines(
-    [`対象: **${plan.items.length}名** / 総額: **${fmtLd(plan.totalPayout)}**（国庫から発行）`, ""],
+    [
+      `対象: **${plan.items.length}名** / 総額: **${fmtLd(plan.totalPayout)}**（国庫から発行）`,
+      "全対象者・金額・給与ロール内訳は添付明細を確認してください。",
+      "",
+    ],
     detailLines,
-    (count) => `…他 ${count}名（全件は /管理 → 給与 の明細で確認）`,
+    (count) => `…他 ${count}名（全件は添付明細）`,
     EMBED_DESCRIPTION_LIMIT,
   );
   return new EmbedBuilder()
     .setTitle(`💰 ${plan.period} 給与支給案 (#${runId})`)
     .setDescription(description)
     .setColor(0xd97706);
+}
+
+function planText(plan: PayoutPlan, runId: number): string {
+  const lines = [
+    `${plan.period} 給与支給案 (#${runId})`,
+    `対象者数: ${plan.items.length}`,
+    `支給総額: ${plan.totalPayout}`,
+    "",
+    "user_id\ttotal\tbreakdown",
+  ];
+  for (const item of [...plan.items].sort((a, b) => b.total - a.total || a.userId.localeCompare(b.userId))) {
+    const breakdown = item.breakdown
+      .map((part) => `${safeText(part.label)}[${part.roleId}]=${part.amount}`)
+      .join(" + ");
+    lines.push([item.userId, String(item.total), breakdown].join("\t"));
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 function staleSnapshotMessage(): string {
@@ -118,7 +143,17 @@ export async function createAndPostDraft(
       new ButtonBuilder().setCustomId(`pay:ok:${run.id}:${hash}`).setLabel("承認して支給").setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId(`pay:no:${run.id}:${hash}`).setLabel("今月は見送り").setStyle(ButtonStyle.Danger),
     );
-    await kessai.send({ embeds: [planEmbed(plan, run.id)], components: [row] });
+    await kessai.send({
+      embeds: [planEmbed(plan, run.id)],
+      components: [row],
+      files: [
+        {
+          attachment: Buffer.from(planText(plan, run.id), "utf8"),
+          name: `salary-draft-${plan.period}-run-${run.id}.txt`,
+        },
+      ],
+      allowedMentions: { parse: [] },
+    });
     return { ok: true, runId: run.id };
   } catch (error) {
     if (error instanceof PayrollError && error.code === "ERR_EMPTY_PLAN") {
