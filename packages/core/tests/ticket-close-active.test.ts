@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { EventLog } from "../src/events/service.js";
-import { closeActiveTicket } from "../src/tickets/close-active.js";
 import { Tickets } from "../src/tickets/service.js";
 
 describe("チケットクローズの原子性", () => {
@@ -12,8 +11,8 @@ describe("チケットクローズの原子性", () => {
     const panel = tickets.getPanel("consult")!;
     tickets.create("thread1", "user1", panel.id, panel);
 
-    const first = closeActiveTicket(db, events, "thread1", "user:staff1");
-    const second = closeActiveTicket(db, events, "thread1", "user:staff2");
+    const first = tickets.close("thread1", "user:staff1");
+    const second = tickets.close("thread1", "user:staff2");
 
     expect(first?.status).toBe("closed");
     expect(second).toBeUndefined();
@@ -31,10 +30,10 @@ describe("チケットクローズの原子性", () => {
     const tickets = new Tickets(db, events);
     const panel = tickets.getPanel("consult")!;
     tickets.create("thread1", "user1", panel.id, panel);
-    closeActiveTicket(db, events, "thread1", "user:staff1");
+    tickets.close("thread1", "user:staff1");
 
-    expect(closeActiveTicket(db, events, "missing", "user:staff2")).toBeUndefined();
-    expect(closeActiveTicket(db, events, "thread1", "user:staff2")).toBeUndefined();
+    expect(tickets.close("missing", "user:staff2")).toBeUndefined();
+    expect(tickets.close("thread1", "user:staff2")).toBeUndefined();
     expect(events.listByType("ticket_closed")).toHaveLength(1);
     db.close();
   });
