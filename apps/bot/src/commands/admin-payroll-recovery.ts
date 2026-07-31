@@ -16,6 +16,7 @@ import { handleAdminButton as handleSafePayrollButton } from "./admin-payroll-sa
 export { handleAdminCommand, handleAdminModal, handleAdminSelect } from "./admin-payroll-safe.js";
 
 const RECOVER_PREFIX = "mgmt:payroll:recover:";
+const CANCEL_PREFIX = "mgmt:payroll:cancel:";
 const EMBED_DESCRIPTION_LIMIT = 3_900;
 
 function jstPeriod(date = new Date()): string {
@@ -57,6 +58,17 @@ function shorten(value: string, maxLength: number): string {
 
 function safeText(value: string): string {
   return value.replace(/[\r\n\t]+/gu, " ").trim();
+}
+
+function pastRecoverableRuns(services: Services): PayoutRunRow[] {
+  const currentPeriod = jstPeriod();
+  return services.payroll.listRecoverableRuns().filter((run) => run.period < currentPeriod);
+}
+
+function olderRecoverableRun(services: Services, target: PayoutRunRow): PayoutRunRow | undefined {
+  return services.payroll
+    .listRecoverableRuns()
+    .find((run) => run.id !== target.id && (run.period < target.period || (run.period === target.period && run.id < target.id)));
 }
 
 function recoveryHome(run: PayoutRunRow, services: Services, pendingCount: number) {
@@ -112,6 +124,12 @@ function recoveryHome(run: PayoutRunRow, services: Services, pendingCount: numbe
     attachments: [],
     allowedMentions: { parse: [] },
   };
+}
+
+function blockedByOlderRun(run: PayoutRunRow, services: Services, pendingCount: number) {
+  const payload = recoveryHome(run, services, pendingCount);
+  payload.content = `⛔ \`${run.period}\` の未完了Run #${run.id} を先に処理してください。新しい月の支給案作成・承認・再実行は行っていません。`;
+  return payload;
 }
 
 function planDescription(run: PayoutRunRow, plan: PayoutPlan): string {
@@ -178,12 +196,18 @@ function recoveryPreview(run: PayoutRunRow, services: Services) {
   const plan = services.payroll.planOf(run);
   const action = new ActionRowBuilder<ButtonBuilder>();
   if (run.status === "draft") {
+    const hash = planHash(run);
     action.addComponents(
       new ButtonBuilder()
-        .setCustomId(`mgmt:payroll:confirm:${run.id}:${planHash(run)}`)
+        .setCustomId(`mgmt:payroll:confirm:${run.id}:${hash}`)
         .setLabel("保存済み内容で支給")
         .setEmoji("💸")
         .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId(`${CANCEL_PREFIX}${run.id}:${hash}`)
+        .setLabel("この月は見送り")
+        .setEmoji("⏭️")
+        .setStyle(ButtonStyle.Secondary),
     );
   } else {
     action.addComponents(
@@ -224,11 +248,63 @@ async function denyNonAdmin(interaction: ButtonInteraction, services: Services):
   return true;
 }
 
+async function cancelRecoveredDraft(
+  interaction: ButtonInteraction,
+  services: Services,
+  runId: number,
+  expectedHash: string,
+): Promise<void> {
+  await interaction.deferUpdate();
+  try {
+    const run = services.payroll.getRun(runId);
+    if (run.status !== "draft" || planHash(run) !== expectedHash) {
+      await interaction.editReply({
+        content: "⚠️ この見送りボタンは古くなっています。給与画面を開き直してください。",
+        embeds: [],
+        components: [
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder().setCustomId("mgmt:payroll").setLabel("給与画面へ").setStyle(ButtonStyle.Primary),
+          ),
+        ],
+        attachments: [],
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
+
+    services.payroll.cancel(run.id, `user:${interaction.user.id}`);
+    const remaining = pastRecoverableRuns(services);
+    if (remaining.length > 0) {
+      await interaction.editReply(recoveryHome(remaining[0]!, services, remaining.length));
+      return;
+    }
+    await interaction.editReply({
+      content: `✅ \`${run.period}\` の給与Run #${run.id} を見送りました。`,
+      embeds: [],
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId("mgmt:payroll").setLabel("現在月の給与画面へ").setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId("mgmt:hub").setLabel("管理ハブ").setStyle(ButtonStyle.Secondary),
+        ),
+      ],
+      attachments: [],
+      allowedMentions: { parse: [] },
+    });
+  } catch (error) {
+    await interaction.editReply({
+      content: `❌ 給与Runの見送りに失敗しました: ${error instanceof Error ? error.message : "不明なエラー"}`,
+      embeds: [],
+      components: [],
+      attachments: [],
+      allowedMentions: { parse: [] },
+    });
+  }
+}
+
 export async function handleAdminButton(interaction: ButtonInteraction, services: Services): Promise<void> {
   if (interaction.customId === "mgmt:payroll") {
     if (await denyNonAdmin(interaction, services)) return;
-    const currentPeriod = jstPeriod();
-    const pastRuns = services.payroll.listRecoverableRuns().filter((run) => run.period < currentPeriod);
+    const pastRuns = pastRecoverableRuns(services);
     if (pastRuns.length === 0) {
       await handleSafePayrollButton(interaction, services);
       return;
@@ -272,6 +348,41 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
       });
     }
     return;
+  }
+
+  if (interaction.customId.startsWith(CANCEL_PREFIX)) {
+    if (await denyNonAdmin(interaction, services)) return;
+    const [, , , runIdRaw, expectedHash] = interaction.customId.split(":");
+    const runId = Number(runIdRaw);
+    if (!Number.isSafeInteger(runId) || !expectedHash) {
+      await interaction.reply({ content: "給与Runの識別子が不正です。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await cancelRecoveredDraft(interaction, services, runId, expectedHash);
+    return;
+  }
+
+  const [, section, action, runIdRaw] = interaction.customId.split(":");
+  if (section === "payroll" && (action === "pay" || action === "confirm" || action === "retry")) {
+    if (await denyNonAdmin(interaction, services)) return;
+    let blocker: PayoutRunRow | undefined;
+    if (action === "pay") {
+      blocker = pastRecoverableRuns(services)[0];
+    } else {
+      const runId = Number(runIdRaw);
+      if (Number.isSafeInteger(runId)) {
+        try {
+          blocker = olderRecoverableRun(services, services.payroll.getRun(runId));
+        } catch {
+          blocker = undefined;
+        }
+      }
+    }
+    if (blocker) {
+      const pendingCount = services.payroll.listRecoverableRuns().filter((run) => run.period <= blocker.period).length;
+      await interaction.update(blockedByOlderRun(blocker, services, Math.max(1, pendingCount)));
+      return;
+    }
   }
 
   await handleSafePayrollButton(interaction, services);
