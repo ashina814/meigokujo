@@ -154,7 +154,10 @@ export function entryStatusMessage(services: Services, userId: string): MessageC
     return { embeds: [embed] };
   }
 
-  const hint = services.entry.getInviterHint(userId);
+  // 招待経路はここに出さない。本人に操作を要求しない方針なら、記録の有無を見せる
+  // 必要もない。「未記録」の表示があるだけで「未完了の項目がある」「当日説明しな
+  // ければならない」という圧になる。招待経路は完全に裏側の情報として、判定画面・
+  // 入退室ログ・待ち人ボードだけで扱う。
   embed
     .setDescription("**案内待ち**です。次の説明会で説明会場VCに来ていただければ入城できます。")
     .addFields(
@@ -167,12 +170,6 @@ export function entryStatusMessage(services: Services, userId: string): MessageC
         name: "📍 集合場所",
         value: vcIds.length > 0 ? vcIds.map((id) => `<#${id}>`).join("\n") : "説明会場VC",
         inline: true,
-      },
-      {
-        name: "🚪 招待経路",
-        value: hint
-          ? "記録済みです。操作は要りません。"
-          : "未記録ですが、**そのままで入城できます**。心当たりがあれば当日、門番にお伝えください。",
       },
     )
     .setFooter({ text: "その時間に来られない場合はパネルの「時間外・個別希望」からどうぞ" });
@@ -264,7 +261,7 @@ function buildWelcomeEmbed(member: GuildMember, services: Services): EmbedBuilde
         inline: true,
       },
       { name: "📍 集合場所", value: vcLinks || "説明会場VC", inline: true },
-      { name: "​", value: steps, inline: false },
+      { name: "🎯 やること", value: steps, inline: false },
     )
     .setFooter({ text: "この案内は入城案内チャンネルのパネルからいつでも確認できます" });
 
