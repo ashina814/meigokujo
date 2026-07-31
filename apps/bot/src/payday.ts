@@ -103,6 +103,16 @@ function staleSnapshotMessage(): string {
   return "⚠️ この給与パネルの支給案は、作成後に再集計または更新されています。ここからは支給せず、`/管理 → 給与` で最新の対象者・金額を確認してください。";
 }
 
+function terminalRunMessage(run: PayoutRunRow): string {
+  if (run.status === "approved") {
+    return "⚠️ この給与案は既に承認済みです。見送りには戻せません。`/管理 → 給与` から支給を再開してください。";
+  }
+  if (run.status === "executed") {
+    return "✅ この給与Runは既に実行済みです。追加の送金は行いません。結果は `/管理 → 給与` で確認してください。";
+  }
+  return "❌ この給与Runは既に見送り済みです。ここから承認・支給はできません。";
+}
+
 /**
  * 支給案を作って #決裁 に承認パネルを投稿する。
  * 刻時盤（毎月1日 09:00）と /給与支給 コマンドの両方から呼ばれる。
@@ -200,11 +210,30 @@ export async function handlePaydayButton(
     }
 
     if (action === "no") {
+      if (run.status !== "draft") {
+        await interaction.editReply({
+          embeds: interaction.message.embeds,
+          components: [],
+          content: terminalRunMessage(run),
+          allowedMentions: { parse: [] },
+        });
+        return;
+      }
       services.payroll.cancel(runId, actor);
       await interaction.editReply({
         embeds: interaction.message.embeds,
         components: [],
         content: `❌ <@${interaction.user.id}> が今月の支給を見送りました。`,
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
+
+    if (run.status === "executed" || run.status === "cancelled") {
+      await interaction.editReply({
+        embeds: interaction.message.embeds,
+        components: [],
+        content: terminalRunMessage(run),
         allowedMentions: { parse: [] },
       });
       return;
