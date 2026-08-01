@@ -270,7 +270,7 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     // 賭場が停止していれば、資金を動かす tick は丸ごと飛ばす。
     // （資金層でも弾かれるが、毎分例外を出し続けないようにここでも見る）
     const casinoClosed = services.casinoStatus.denyMessage() !== null;
-    if (casinoClosed) console.log("[賭場] 停止中のため板・株の tick を飛ばします");
+    if (casinoClosed) console.log("[賭場] 停止中のため板の tick を飛ばします");
 
     // ── 賭場の板: 締切を過ぎた open を closed へ + reported の5分無異議で自動精算 ──
     if (!casinoClosed) try {
@@ -294,26 +294,10 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       console.error("[market] tick失敗:", e);
     }
 
-    // ── マモンの株式市場: 1時間ごとの価格更新 & 期限切れ強制売却 ──
-    if (!casinoClosed) try {
-      services.stocks.updateAll();
-      const forced = services.stocks.forceSellExpired();
-      if (forced.length > 0) {
-        console.log(`[stocks] 期限切れ強制売却: ${forced.length}件`);
-        // 資産が勝手に動いた時は必ず本人に通知（無言の強制売却をしない）
-        for (const f of forced) {
-          const stock = services.stocks.get(f.stockId);
-          const user = await client.users.fetch(f.userId).catch(() => null);
-          await user
-            ?.send(
-              `📈 マモンの株式市場: **${stock?.emoji ?? ""}${stock?.name ?? f.stockId}** ${f.shares}株 が保有期限（3日）を超えたため強制売却された。受取 **${f.proceeds.toLocaleString("ja-JP")}◈**（手数料1%控除後）。`,
-            )
-            .catch(() => undefined);
-        }
-      }
-    } catch (e) {
-      console.error("[stocks] tick失敗:", e);
-    }
+    // ── マモンの株式市場: 停止中（PR6・正本 §1.3）──
+    // 価格更新も期限切れ強制売却も行わない。**建玉には一切触れない**。
+    // 「試験データと確認できた建玉の初期化」は PR12 の正式開業初期化の仕事で、
+    // ここで清算すると、正式資産だった場合の補償基準（時価）を自分で壊すことになる。
 
     // ── 公式ショップの月額一括請求: 毎月1日 08:00 JST ──
     if (now.day === 1 && now.hour === 8) {
