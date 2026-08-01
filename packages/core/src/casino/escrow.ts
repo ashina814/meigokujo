@@ -84,10 +84,12 @@ export class Escrow {
    */
   hold(sessionId: string, userId: string, amount: number, game: string, operationId: string): boolean {
     if (!Number.isInteger(amount) || amount <= 0) return false;
-    if (this.ether.balanceOf(userId) < amount) return false;
     const holder = escrowHolderFor(sessionId);
     try {
-      this.ether.runGroup({ groupKey: `escrow:hold:${sessionId}:${userId}:${operationId}`, kind: "table_hold", actorId: userId }, () => {
+      return this.ether.runGroup({ groupKey: `escrow:hold:${sessionId}:${userId}:${operationId}`, kind: "table_hold", actorId: userId }, () => {
+        // 残高判定はグループの中。外でやると、預託成功後の再試行が
+        // 「保存済みの結果（true）を返す」前に残高不足で false になる
+        if (this.ether.balanceOf(userId) < amount) return false;
         this.ether.transfer(userId, holder, amount, { reason: "卓への預託", game, sessionId });
         this.db
           .prepare(
@@ -95,8 +97,8 @@ export class Escrow {
              ON CONFLICT(session_id, user_id) DO UPDATE SET amount = amount + excluded.amount, source = excluded.source`,
           )
           .run(sessionId, userId, amount, game, holder, now());
+        return true;
       });
-      return true;
     } catch (e) {
       if (e instanceof EtherError) return false;
       throw e;
@@ -232,9 +234,11 @@ export class Escrow {
   }
 
   /** 1人だけ返金して記録を消す（ロビー離脱）。記録が無ければ false */
-  refundOne(sessionId: string, userId: string): boolean {
+  refundOne(sessionId: string, userId: string, operationId: string): boolean {
+    // 張り直し・辞退・巻き戻しで何度も呼ばれるので、局面ごとに別の鍵を受け取る。
+    // セッション＋利用者だけで固定すると、2回目の返金が過去結果の再生になってしまう。
     return this.ether.runGroup(
-      { groupKey: `escrow:refund_one:${sessionId}:${userId}`, kind: "table_refund", actorId: userId },
+      { groupKey: `escrow:refund_one:${sessionId}:${userId}:${operationId}`, kind: "table_refund", actorId: userId },
       (): boolean => {
       const row = this.db
         .prepare("SELECT * FROM casino_escrow WHERE session_id = ? AND user_id = ?")

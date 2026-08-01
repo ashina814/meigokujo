@@ -176,9 +176,11 @@ export class EtherExchange {
   /** エテルを売って Land を受け取る（退場・20%奉納） */
   sell(userId: string, etherIn: number, idempotencyKey: string): EtherQuote {
     if (!Number.isInteger(etherIn) || etherIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { etherIn });
-    const held = this.balanceOf(userId);
-    if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
     return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: `user:${userId}` }, (): EtherQuote => {
+      // 残高の検査はグループの中で行う。外でやると、成功後の再試行が
+      // 「保存済みの結果を返す」前に残高不足で落ちてしまう
+      const held = this.balanceOf(userId);
+      if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
       const q = this.quoteSell(etherIn);
       let landTxId: number | null = null;
       if (q.output > 0) {
@@ -217,9 +219,9 @@ export class EtherExchange {
    */
   redeemToAccount(holderId: string, etherIn: number, destAccount: string, actor: string, idempotencyKey: string): EtherQuote {
     if (!Number.isInteger(etherIn) || etherIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { etherIn });
-    const held = this.balanceOf(holderId);
-    if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
     return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: actor }, (): EtherQuote => {
+      const held = this.balanceOf(holderId);
+      if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
       const q = this.quoteSell(etherIn);
       let landTxId: number | null = null;
       if (q.output > 0) {
@@ -278,9 +280,9 @@ export class EtherExchange {
    */
   redeemFairToAccount(holderId: string, etherIn: number, destAccount: string, idempotencyKey: string): { ether: number; land: number } {
     if (!Number.isInteger(etherIn) || etherIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { etherIn });
-    const held = this.balanceOf(holderId);
-    if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
     return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: ETHER_APPROVER }, () => {
+      const held = this.balanceOf(holderId);
+      if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
       const P = this.pool();
       const C = this.outstanding();
       const land = C === 0 ? 0 : muldiv(etherIn, P, C); // フェア gross（80%引きなし）

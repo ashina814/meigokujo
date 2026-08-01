@@ -96,25 +96,25 @@ export class Daily {
    * 資金は胴元から支給、救済プールが自動追加される。胴元が空でも救済プールから
    * 出せる分は出す（賭場が閉じてても福分けは止まらない = 最低保証）。
    */
-  claim(userId: string): DailyClaimResult {
+  claim(userId: string, operationId: string): DailyClaimResult {
     const t = now();
-    const row = this.db.prepare("SELECT last_at, streak FROM casino_daily WHERE user_id = ?").get(userId) as
-      | { last_at: number; streak: number }
-      | undefined;
-    if (row && t - row.last_at < DAY_SEC) {
-      return { ok: false, reason: "ALREADY_CLAIMED", nextClaimAt: row.last_at + DAY_SEC };
-    }
-    const isConsecutive = !!row && t - row.last_at < 2 * DAY_SEC;
-    const streak = isConsecutive ? row!.streak + 1 : 1;
-
     const base = this.base();
-    const streakBonus = Math.min(Math.floor(streak / 7) * STREAK_STEP, STREAK_CAP);
-    const held = this.ether.balanceOf(userId);
-    const reliefEligible = held <= this.reliefThreshold();
 
-    // 1日1回の受け取りなので、その日そのものが冪等キーになる（再試行で同じ値）
-    const groupKey = `daily:${userId}:${Math.floor(t / DAY_SEC)}`;
+    // 受け取りは24時間制なので「その日」を鍵にはできない（境界をまたぐと別扱いになる）。
+    // 申請1回ぶんの操作IDを鍵にし、クールダウンの判定はグループの中で行う。
+    const groupKey = `daily:${userId}:${operationId}`;
     return this.ether.runGroup({ groupKey, kind: "daily", actorId: userId }, (): DailyClaimResult => {
+      const row = this.db.prepare("SELECT last_at, streak FROM casino_daily WHERE user_id = ?").get(userId) as
+        | { last_at: number; streak: number }
+        | undefined;
+      if (row && t - row.last_at < DAY_SEC) {
+        return { ok: false, reason: "ALREADY_CLAIMED", nextClaimAt: row.last_at + DAY_SEC };
+      }
+      const isConsecutive = !!row && t - row.last_at < 2 * DAY_SEC;
+      const streak = isConsecutive ? row.streak + 1 : 1;
+      const streakBonus = Math.min(Math.floor(streak / 7) * STREAK_STEP, STREAK_CAP);
+      const reliefEligible = this.ether.balanceOf(userId) <= this.reliefThreshold();
+
       // 基本 + streak 分は胴元から。胴元不足なら救済プールから振替
       const wanted = base + streakBonus;
       const houseHas = this.ether.balanceOf(HOUSE_HOLDER);

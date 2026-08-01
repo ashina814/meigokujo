@@ -76,8 +76,9 @@ export class Vip {
   /** 加入 or 更新。エテル徴収 → 期限延長 */
   join(userId: string, operationId: string): VipJoinResult {
     const price = this.price();
-    if (this.ether.balanceOf(userId) < price) return { ok: false, reason: "INSUFFICIENT_ETHER" };
     return this.ether.runGroup({ groupKey: `vip:${userId}:${operationId}`, kind: "vip", actorId: userId }, (): VipJoinResult => {
+      // 残高判定はグループの中。外に置くと、加入成功後の再試行が残高不足で落ちる
+      if (this.ether.balanceOf(userId) < price) return { ok: false, reason: "INSUFFICIENT_ETHER" };
       this.ether.transfer(userId, HOUSE_HOLDER, price, { reason: "VIP加入" });
       const t = now();
       const current = this.expiresAt(userId);

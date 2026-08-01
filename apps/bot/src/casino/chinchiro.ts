@@ -398,10 +398,14 @@ async function runRound(
     // 倍付け負け: bet + (|mul|-1)*bet を徴収。残高不足なら通常負けフォールバック
     const extraNeeded = (Math.abs(mul) - 1) * bet;
     if (held >= bet + extraNeeded) {
-      services.casino.settle(uid, "チンチロ", bet, 0, 0, { operationId: interaction.id });
+      // 通常徴収と追加徴収を1つのグループにまとめる。別々のグループにすると、
+      // 間で落ちたときに「賭け金だけ取られて倍付けぶんが未徴収」の中途半端な状態が残る
       services.ether.runGroup(
-        { groupKey: `chinchiro:extra:${uid}:${interaction.id}`, kind: "solo_game", actorId: uid },
-        () => services.ether.transfer(uid, HOUSE_HOLDER, extraNeeded, { reason: "倍付け負けの追加徴収", game: "チンチロ" }),
+        { groupKey: `chinchiro:double_loss:${uid}:${interaction.id}`, kind: "solo_game", actorId: uid },
+        () => {
+          services.casino.settle(uid, "チンチロ", bet, 0, 0, { operationId: interaction.id });
+          services.ether.transfer(uid, HOUSE_HOLDER, extraNeeded, { reason: "倍付け負けの追加徴収", game: "チンチロ" });
+        },
       );
       const totalLoss = bet + extraNeeded;
       netForDisplay = -totalLoss;

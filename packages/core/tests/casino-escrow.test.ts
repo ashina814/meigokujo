@@ -282,7 +282,7 @@ describe("エスクロー資金分離", () => {
     ctx.escrow.hold("sess1", "b", 7_000, "duel", opId());
     ctx.escrow.refund("sess1");
     ctx.escrow.hold("sess2", "a", 1_000, "duel", opId());
-    ctx.escrow.refundOne("sess2", "a");
+    ctx.escrow.refundOne("sess2", "a", opId());
     expect(ctx.ether.outstanding()).toBe(total0);
     expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
   });

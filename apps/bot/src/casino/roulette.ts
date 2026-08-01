@@ -184,7 +184,7 @@ export async function playRoulette(
           return;
         }
         // 張り直しは上書き: 前の張りを返してから新しい額をエスクロー
-        if (bets.has(btn.user.id)) services.escrow.refundOne(session, btn.user.id);
+        if (bets.has(btn.user.id)) services.escrow.refundOne(session, btn.user.id, `rebet:${btn.id}`);
         if (!services.escrow.hold(session, btn.user.id, amt, "roulette", btn.id)) {
           bets.delete(btn.user.id);
           await sub.reply({ content: `${Mammon.broke()}（所持 ${fmtEther(services.ether.balanceOf(btn.user.id))}）`, flags: MessageFlags.Ephemeral });

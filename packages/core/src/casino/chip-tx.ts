@@ -119,6 +119,8 @@ export class ChipTx {
    * 別の業務操作が割り込むことはない（await を挟む処理は runGroup の外で行う）。
    */
   private active: ActiveGroup | null = null;
+  /** 現在の版。captureOpening で切り替わるまで変わらない */
+  private cachedVersion: string | null = null;
 
   /**
    * プリペアドステートメントは使い回す。1ゲームごとに数件の追記が入るので、
@@ -142,8 +144,8 @@ export class ChipTx {
       insertTx: db.prepare(
         `INSERT INTO casino_tx
            (group_key, seq, tx_kind, from_holder, to_holder, amount, reason, game, session_id, actor_id,
-            land_amount, ledger_tx_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            opening_version, land_amount, ledger_tx_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       getTx: db.prepare("SELECT * FROM casino_tx WHERE id = ?"),
     };
@@ -272,6 +274,7 @@ export class ChipTx {
         move.game ?? null,
         move.sessionId ?? null,
         group.actorId,
+        this.currentVersion(),
         move.txKind === "internal_transfer" ? null : (move.landAmount ?? 0),
         move.ledgerTxId ?? null,
         now(),
@@ -293,12 +296,15 @@ export class ChipTx {
 
   // ---- 開始残高 ----
 
-  /** 現在の開始残高の版。未設定なら PR1 の版 */
+  /** 現在の開始残高の版。未設定なら PR1 の版。版の切替は稀なのでキャッシュする */
   currentVersion(): string {
-    const row = this.db.prepare("SELECT value FROM settings WHERE key = ?").get(CHIP_OPENING_VERSION_KEY) as
-      | { value: string }
-      | undefined;
-    return row?.value ?? LEGACY_OPENING_VERSION;
+    if (this.cachedVersion === null) {
+      const row = this.db.prepare("SELECT value FROM settings WHERE key = ?").get(CHIP_OPENING_VERSION_KEY) as
+        | { value: string }
+        | undefined;
+      this.cachedVersion = row?.value ?? LEGACY_OPENING_VERSION;
+    }
+    return this.cachedVersion;
   }
 
   /**
@@ -321,18 +327,25 @@ export class ChipTx {
     );
     this.db.transaction(() => {
       for (const [holder, amount] of balances) insert.run(version, holder, amount, ts);
-      // 「この残高はどの取引の後の姿か」を版ごとに固定する。
-      // 版を切り替えた後も、旧版は旧版の窓（次の版の境界まで）で個別に検算できる。
+      // 版の前後は version_seq（単調増加）で決める。取引IDに依存させない
+      const seq =
+        (this.db.prepare("SELECT COALESCE(MAX(version_seq), 0) AS s FROM casino_chip_opening_versions").get() as {
+          s: number;
+        }).s + 1;
       const lastTx = (this.db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM casino_tx").get() as { id: number }).id;
       this.db
-        .prepare("INSERT INTO casino_chip_opening_versions (opening_version, from_tx_id, created_at) VALUES (?, ?, ?)")
-        .run(version, lastTx, ts);
+        .prepare(
+          `INSERT INTO casino_chip_opening_versions (opening_version, version_seq, from_tx_id, created_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(version, seq, lastTx, ts);
       setSetting.run(CHIP_OPENING_VERSION_KEY, version, ts);
+      this.cachedVersion = version;
     })();
     return true;
   }
 
-  /** その版の開始残高が「どの取引の後の姿か」。これ以前の取引はその版の再現に含めない */
+  /** その版の開始残高を取った時点の最終取引ID（参考値） */
   openingFromTxId(version = this.currentVersion()): number {
     const row = this.db
       .prepare("SELECT from_tx_id FROM casino_chip_opening_versions WHERE opening_version = ?")
@@ -340,25 +353,24 @@ export class ChipTx {
     return row?.from_tx_id ?? 0;
   }
 
-  /** その版の窓の終わり（次の版が始まる境界）。最新版なら null＝現在まで */
-  private openingUntilTxId(version: string): number | null {
-    const from = this.openingFromTxId(version);
+  /** その版の次の版（version_seq の並びで決める）。最新版なら null */
+  private nextOpeningVersion(version: string): string | null {
     const row = this.db
       .prepare(
-        `SELECT from_tx_id FROM casino_chip_opening_versions
-         WHERE from_tx_id >= ? AND opening_version <> ?
-         ORDER BY from_tx_id, created_at LIMIT 1`,
+        `SELECT opening_version FROM casino_chip_opening_versions
+         WHERE version_seq > (SELECT version_seq FROM casino_chip_opening_versions WHERE opening_version = ?)
+         ORDER BY version_seq LIMIT 1`,
       )
-      .get(from, version) as { from_tx_id: number } | undefined;
-    return row?.from_tx_id ?? null;
+      .get(version) as { opening_version: string } | undefined;
+    return row?.opening_version ?? null;
   }
 
   /** 記録されている開始残高の版を古い順に */
-  listOpeningVersions(): Array<{ version: string; fromTxId: number }> {
+  listOpeningVersions(): Array<{ version: string; seq: number; fromTxId: number }> {
     const rows = this.db
-      .prepare("SELECT opening_version, from_tx_id FROM casino_chip_opening_versions ORDER BY from_tx_id, created_at")
-      .all() as Array<{ opening_version: string; from_tx_id: number }>;
-    return rows.map((r) => ({ version: r.opening_version, fromTxId: r.from_tx_id }));
+      .prepare("SELECT opening_version, version_seq, from_tx_id FROM casino_chip_opening_versions ORDER BY version_seq")
+      .all() as Array<{ opening_version: string; version_seq: number; from_tx_id: number }>;
+    return rows.map((r) => ({ version: r.opening_version, seq: r.version_seq, fromTxId: r.from_tx_id }));
   }
 
   /** PR1導入時の一度きりの記録。いまのチップ残高をそのまま開始残高にする */
@@ -389,13 +401,15 @@ export class ChipTx {
       if (!holder) return;
       balances.set(holder, (balances.get(holder) ?? 0) + delta);
     };
-    const until = this.openingUntilTxId(version);
+    // その版の窓に属する取引だけを足す。
+    // - 版そのものを取引に刻んであるので、初期化で採番が巻き戻っても混ざらない
+    // - 版を記録した時点より前の取引は除く（記録前の分まで足し戻して二重に数えない）
     const rows = this.db
       .prepare(
         `SELECT tx_kind, from_holder, to_holder, amount FROM casino_tx
-         WHERE id > ? AND (? IS NULL OR id <= ?) ORDER BY id`,
+         WHERE opening_version = ? AND id > ? ORDER BY id`,
       )
-      .all(this.openingFromTxId(version), until, until) as Array<
+      .all(version, this.openingFromTxId(version)) as Array<
       Pick<ChipTxRow, "tx_kind" | "from_holder" | "to_holder" | "amount">
     >;
     for (const row of rows) {
@@ -412,18 +426,7 @@ export class ChipTx {
    */
   verifyBalances(version = this.currentVersion()): { ok: boolean; mismatches: ChipBalanceMismatch[] } {
     const expected = this.replayBalances(version);
-    const until = this.openingUntilTxId(version);
-    const nextVersion =
-      until === null
-        ? null
-        : (
-            this.db
-              .prepare(
-                `SELECT opening_version FROM casino_chip_opening_versions
-                 WHERE from_tx_id = ? AND opening_version <> ? ORDER BY created_at LIMIT 1`,
-              )
-              .get(until, version) as { opening_version: string } | undefined
-          )?.opening_version ?? null;
+    const nextVersion = this.nextOpeningVersion(version);
     const actualRows =
       nextVersion === null
         ? (this.db.prepare("SELECT user_id, amount FROM ether_balances").all() as Array<{

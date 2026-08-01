@@ -295,15 +295,15 @@ export class Markets {
     }
     const fee = input.fee ?? DEFAULT_FEE;
     if (!Number.isInteger(fee) || fee < 0) throw new MarketError("ERR_BAD_AMOUNT", { fee });
-    // 手数料徴収は呼び出し側が担保する前提（残高不足なら例外なしで通ってしまう）→ 呼び出し側で先に balance check
-    if (fee > 0 && this.ether.balanceOf(input.creatorId) < fee) {
-      throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(input.creatorId), fee });
-    }
     const t = now();
     const deadline = t + input.durationMin * 60;
     return this.ether.runGroup(
       { groupKey: `market:create:${input.creatorId}:${input.operationId}`, kind: "market_bet", actorId: input.creatorId },
       (): Market => {
+      // 残高判定はグループの中（作成成功後の再試行を残高不足で落とさない）
+      if (fee > 0 && this.ether.balanceOf(input.creatorId) < fee) {
+        throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(input.creatorId), fee });
+      }
       if (fee > 0) {
         this.ether.transfer(input.creatorId, JACKPOT_HOLDER, fee, { reason: "板の開設手数料", game: "market" });
       }
@@ -420,13 +420,14 @@ export class Markets {
       .all(marketId, userId) as Array<{ amount: number }>;
     const existingTotal = existingRows.reduce((s, r) => s + r.amount, 0);
     const additionalRequired = Math.max(0, amount - existingTotal);
-    if (this.ether.balanceOf(userId) < additionalRequired) {
-      throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(userId), additionalRequired, amount, existingTotal });
-    }
 
     return this.ether.runGroup(
       { groupKey: `market:bet:${marketId}:${userId}:${operationId}`, kind: "market_bet", actorId: userId },
       (): { previous: number | null; net: number } => {
+      // 残高判定はグループの中（張った後の再試行を残高不足で落とさない）
+      if (this.ether.balanceOf(userId) < additionalRequired) {
+        throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(userId), additionalRequired, amount, existingTotal });
+      }
       if (existingTotal > 0) {
         // 張り直し: 既存分は escrow に入っているのでそこから返す（fund_mode='escrow' 確定済み）
         this.ether.transfer(escHolder, userId, existingTotal, { reason: "板の賭け直しによる返金", game: "market", sessionId: `market:${marketId}` });

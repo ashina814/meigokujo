@@ -184,23 +184,29 @@ async function runOne(
   const adjustedPayout = amulet.payout;
   // 精算を先に確定（演出中の残高変動で失敗しないよう）。フリースピンなら賭けは無料
   const jpCut = isFreeSpin ? 0 : Math.max(1, Math.floor(bet * JP_CONTRIBUTION));
-  let settled: import("@meigokujo/core").SettleResult | null = null;
-  let jpWon = 0;
-  if (isFreeSpin) {
-    // フリースピンは配当のみ（賭けなし）。settle は使わず胴元→プレイヤーの直接転送
-    if (adjustedPayout > 0 && services.casino.canAccept(adjustedPayout)) {
-      services.ether.runGroup(
-        { groupKey: `slots:free_spin:${uid}:${interaction.id}`, kind: "solo_game", actorId: uid },
-        () => services.ether.transfer("house", uid, adjustedPayout, { reason: "フリースピンの配当", game: "スロット" }),
-      );
-    }
-  } else {
-    settled = services.casino.settle(uid, "スロット", bet, adjustedPayout, jpCut, { operationId: interaction.id });
-  }
-  // JP はフリースピンでも当選する（原作準拠）
-  if (spin.kind === "jackpot") {
-    jpWon = services.casino.seizeJackpot(uid, "slots", interaction.id, JP_WIN_SHARE);
-  }
+  // 1スピンの資金移動（賭け・配当・JP積立・JP当選）を1つのグループにまとめる。
+  // 分かれていると、精算だけ通ってJP当選が落ちる中途半端な状態が残りうる
+  const money = services.ether.runGroup(
+    { groupKey: `slots:spin:${uid}:${interaction.id}`, kind: "solo_game", actorId: uid },
+    (): { settled: import("@meigokujo/core").SettleResult | null; jpWon: number } => {
+      let settledInGroup: import("@meigokujo/core").SettleResult | null = null;
+      if (isFreeSpin) {
+        // フリースピンは配当のみ（賭けなし）。settle は使わず胴元→プレイヤーの直接転送
+        if (adjustedPayout > 0 && services.casino.canAccept(adjustedPayout)) {
+          services.ether.transfer("house", uid, adjustedPayout, { reason: "フリースピンの配当", game: "スロット" });
+        }
+      } else {
+        settledInGroup = services.casino.settle(uid, "スロット", bet, adjustedPayout, jpCut, {
+          operationId: interaction.id,
+        });
+      }
+      // JP はフリースピンでも当選する（原作準拠）
+      const won = spin.kind === "jackpot" ? services.casino.seizeJackpot(uid, "slots", interaction.id, JP_WIN_SHARE) : 0;
+      return { settled: settledInGroup, jpWon: won };
+    },
+  );
+  const settled = money.settled;
+  const jpWon = money.jpWon;
 
   // ── Phase 1: スピンアニメ ──
   const initialEmbed = buildSpinEmbed(services, bet, isFreeSpin, "壺の中で運命が転がる……", ["❓", "❓", "❓"]);

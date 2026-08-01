@@ -9,6 +9,8 @@ import { Escrow } from "../src/casino/escrow.js";
 import { Daily } from "../src/casino/daily.js";
 import { Vip } from "../src/casino/vip.js";
 import { Markets } from "../src/casino/market.js";
+import { Stocks } from "../src/casino/stocks.js";
+import { deterministicRng } from "../src/casino/rng.js";
 import { ChipTx, ChipTxError, LEGACY_OPENING_VERSION } from "../src/casino/chip-tx.js";
 import { deptAccount } from "../src/departments/service.js";
 import { testTransfer, opId } from "./helpers/chip-ctx.js";
@@ -165,8 +167,9 @@ describe("取引明細", () => {
     expect(() =>
       ctx.db
         .prepare(
-          `INSERT INTO casino_tx (group_key, seq, tx_kind, from_holder, to_holder, amount, reason, actor_id, created_at)
-           VALUES ('missing', 1, 'internal_transfer', 'a', 'b', 1, '理由', 'x', 1)`,
+          `INSERT INTO casino_tx
+             (group_key, seq, tx_kind, from_holder, to_holder, amount, reason, actor_id, opening_version, created_at)
+           VALUES ('missing', 1, 'internal_transfer', 'a', 'b', 1, '理由', 'x', 'legacy_pre_reset', 1)`,
         )
         .run(),
     ).toThrow(/FOREIGN KEY/i);
@@ -396,7 +399,7 @@ describe("既存経路のグループ化", () => {
     const vip = new Vip(ctx.db, ctx.ether, events, { price: () => 3_000, days: () => 30, betCapMult: () => 2 });
     const markets = new Markets(ctx.db, ctx.ether, events);
 
-    daily.claim("alice");
+    daily.claim("alice", opId());
     vip.join("alice", opId());
     const market = markets.create({ operationId: opId(),
       guildId: "g", creatorId: "alice", title: "どっち", options: ["A", "B"], durationMin: 60, fee: 100,
@@ -534,6 +537,63 @@ describe("開始残高の版切替", () => {
     ctx.db.close();
   });
 
+  it("取引を挟まず版を切り替えても、新しい版が古い版を飲み込まない", () => {
+    const ctx = setup();
+    fundHouse(ctx, 10_000);
+    ctx.chipTx.captureLegacyOpening();
+    // 取引を1件も挟まずに切り替える（境界の取引IDが両版で同じになる）
+    expect(ctx.chipTx.captureOpening("opening_v1", [[HOUSE_HOLDER, 10_000]])).toBe(true);
+
+    testTransfer(ctx.ether, HOUSE_HOLDER, JACKPOT_HOLDER, 1_000, "切替後の移動");
+
+    const versions = ctx.chipTx.listOpeningVersions();
+    expect(versions.map((v) => v.version)).toEqual([LEGACY_OPENING_VERSION, "opening_v1"]);
+    expect(versions[0]!.fromTxId).toBe(versions[1]!.fromTxId); // 取引IDでは前後が付かない
+    expect(versions[0]!.seq).toBeLessThan(versions[1]!.seq); // 版の順序は別に持っている
+
+    // 切替後の取引は新版の窓にだけ入る
+    expect(ctx.chipTx.replayBalances(LEGACY_OPENING_VERSION).get(HOUSE_HOLDER)).toBe(10_000);
+    expect(ctx.chipTx.replayBalances("opening_v1").get(JACKPOT_HOLDER)).toBe(1_000);
+    expect(ctx.chipTx.verifyBalances().ok).toBe(true);
+    expect(ctx.chipTx.verifyBalances(LEGACY_OPENING_VERSION).ok).toBe(true);
+    ctx.db.close();
+  });
+
+  it("取引を初期化してから版を切り替えても、両方の版を個別に検算できる", () => {
+    const ctx = setup();
+    fundHouse(ctx, 100_000);
+    fundUser(ctx, "alice", 10_000);
+    ctx.chipTx.captureLegacyOpening();
+    ctx.casino.settle("alice", "スロット", 1_000, 2_000, 0, { chain: false, fuku: false, operationId: "v0-1" });
+
+    const legacyReplay = ctx.chipTx.replayBalances(LEGACY_OPENING_VERSION);
+    const legacyRows = ctx.db.prepare("SELECT COUNT(*) AS c FROM casino_tx").get() as { c: number };
+    expect(legacyRows.c).toBeGreaterThan(0);
+
+    // 正式開業初期化（R9）相当: 取引を初期化してから新版を置く。
+    // 採番が巻き戻るので、新版の境界IDは旧版より小さくなる
+    ctx.db.exec("DELETE FROM casino_tx; DELETE FROM casino_tx_groups; DELETE FROM sqlite_sequence WHERE name='casino_tx'");
+    const openingBalances = new Map<string, number>([[HOUSE_HOLDER, 50_000], ["alice", 5_000]]);
+    ctx.db.exec("DELETE FROM ether_balances");
+    for (const [holder, amount] of openingBalances) {
+      ctx.db.prepare("INSERT INTO ether_balances (user_id, amount, updated_at) VALUES (?, ?, 0)").run(holder, amount);
+    }
+    expect(ctx.chipTx.captureOpening("opening_v1", openingBalances)).toBe(true);
+    const versions = ctx.chipTx.listOpeningVersions();
+    expect(versions[1]!.fromTxId).toBeLessThan(versions[0]!.fromTxId); // 境界IDは巻き戻っている
+
+    ctx.casino.settle("alice", "スロット", 1_000, 0, 0, { chain: false, fuku: false, operationId: "v1-1" });
+
+    // 新版は実残高と一致する
+    expect(ctx.chipTx.verifyBalances().ok).toBe(true);
+    expect(ctx.ether.balanceOf("alice")).toBe(4_000);
+    // 旧版の再現結果は、初期化で取引が消えた分だけ開始残高そのものへ戻る（新版の取引は混ざらない）
+    const legacyAfterReset = ctx.chipTx.replayBalances(LEGACY_OPENING_VERSION);
+    expect(legacyAfterReset.get("alice")).toBe(ctx.chipTx.openingBalances(LEGACY_OPENING_VERSION).get("alice"));
+    expect(legacyAfterReset.get("alice")).not.toBe(legacyReplay.get("alice"));
+    ctx.db.close();
+  });
+
   it("同じ版を二度記録しない", () => {
     const ctx = setup();
     fundHouse(ctx, 10_000);
@@ -581,6 +641,127 @@ describe("端数で Land が動かない返還", () => {
     const row = ctx.chipTx.listByGroup("sell:normal")[0]!;
     expect(row.land_amount).toBeGreaterThan(0);
     expect(row.ledger_tx_id).not.toBeNull();
+    ctx.db.close();
+  });
+});
+
+describe("再試行時の資金安全性（可変状態はグループの中で見る）", () => {
+  it("全額を返還した後でも、同じキーの再試行は同じ結果を返す", () => {
+    const ctx = setup();
+    fundUser(ctx, "alice", 10_000);
+    const held = ctx.ether.balanceOf("alice");
+
+    const first = ctx.ether.sell("alice", held, "sell:all");
+    expect(ctx.ether.balanceOf("alice")).toBe(0);
+
+    // 残高が 0 になっていても、同じ操作の再試行は残高不足で落ちない
+    expect(ctx.ether.sell("alice", held, "sell:all")).toEqual(first);
+    expect(ctx.ether.balanceOf("alice")).toBe(0);
+    expect(ctx.chipTx.listByGroup("sell:all")).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("所持額ちょうどのVIP加入でも、再試行は同じ成功結果を返す", () => {
+    const ctx = setup();
+    fundHouse(ctx, 100_000);
+    fundUser(ctx, "alice", 3_000);
+    const vip = new Vip(ctx.db, ctx.ether, ctx.events, { price: () => 3_000, days: () => 30, betCapMult: () => 2 });
+
+    const first = vip.join("alice", "op-vip");
+    expect(first.ok).toBe(true);
+    expect(ctx.ether.balanceOf("alice")).toBe(0);
+
+    const again = vip.join("alice", "op-vip");
+    expect(again).toEqual(first);
+    expect(ctx.ether.balanceOf("alice")).toBe(0); // 二重徴収しない
+    expect(ctx.chipTx.listByGroup("vip:alice:op-vip")).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("所持額ちょうどの預託でも、再試行は true を返し預託は1回分のまま", () => {
+    const ctx = setup();
+    fundUser(ctx, "alice", 2_000);
+
+    expect(ctx.escrow.hold("sess1", "alice", 2_000, "丁半", "op-hold")).toBe(true);
+    expect(ctx.ether.balanceOf("alice")).toBe(0);
+
+    expect(ctx.escrow.hold("sess1", "alice", 2_000, "丁半", "op-hold")).toBe(true);
+    expect(ctx.escrow.poolOf("sess1")).toBe(2_000); // 二重預託しない
+    expect(ctx.ether.balanceOf(ctx.escrow.holderId("sess1"))).toBe(2_000);
+    ctx.db.close();
+  });
+
+  it("預託の巻き戻しは局面ごとに効く（返金→再預託→再返金ができる）", () => {
+    const ctx = setup();
+    fundUser(ctx, "alice", 5_000);
+
+    ctx.escrow.hold("sess1", "alice", 1_000, "ルーレット", "bet-1");
+    expect(ctx.escrow.refundOne("sess1", "alice", "rebet-1")).toBe(true);
+    ctx.escrow.hold("sess1", "alice", 2_000, "ルーレット", "bet-2");
+    // 局面ごとに別の鍵なので、2回目の返金も過去結果の再生にならない
+    expect(ctx.escrow.refundOne("sess1", "alice", "rebet-2")).toBe(true);
+
+    expect(ctx.ether.balanceOf("alice")).toBe(5_000);
+    expect(ctx.escrow.poolOf("sess1")).toBe(0);
+    expect(ctx.chipTx.verifyBalances().ok).toBe(true);
+    ctx.db.close();
+  });
+
+  it("株の売却も、保有が減った後の再試行で同じ結果を返す", () => {
+    const ctx = setup();
+    fundHouse(ctx, 100_000);
+    fundUser(ctx, "alice", 10_000);
+    const stocks = new Stocks(ctx.db, ctx.ether, ctx.events, { rng: deterministicRng(1) });
+    const stock = stocks.list()[0]!;
+    stocks.buy("alice", stock.id, 1, "op-buy");
+
+    const first = stocks.sell("alice", stock.id, 1, "op-sell");
+    const balanceAfter = ctx.ether.balanceOf("alice");
+
+    expect(stocks.sell("alice", stock.id, 1, "op-sell")).toEqual(first);
+    expect(ctx.ether.balanceOf("alice")).toBe(balanceAfter);
+    ctx.db.close();
+  });
+});
+
+describe("1ゲーム＝1グループ", () => {
+  it("チンチロの倍付け負けは、賭け金と追加徴収が同じグループに入る", () => {
+    const ctx = setup();
+    fundHouse(ctx, 100_000);
+    fundUser(ctx, "alice", 10_000);
+    const bet = 1_000;
+    const extra = 1_000;
+
+    ctx.ether.runGroup({ groupKey: "chinchiro:double_loss:alice:op-1", kind: "solo_game", actorId: "alice" }, () => {
+      ctx.casino.settle("alice", "チンチロ", bet, 0, 0, { operationId: "op-1" });
+      ctx.ether.transfer("alice", HOUSE_HOLDER, extra, { reason: "倍付け負けの追加徴収", game: "チンチロ" });
+    });
+
+    const rows = ctx.chipTx.listByGroup("chinchiro:double_loss:alice:op-1");
+    expect(rows.map((r) => r.reason)).toEqual(["賭け金", "倍付け負けの追加徴収"]);
+    // 内側の精算が独自のグループを作らない（合流している）
+    expect(ctx.chipTx.getGroup("solo:チンチロ:alice:op-1")).toBeUndefined();
+    expect(ctx.ether.balanceOf("alice")).toBe(10_000 - bet - extra);
+    ctx.db.close();
+  });
+
+  it("1スピンの精算とJP当選が同じグループに入る", () => {
+    const ctx = setup();
+    fundHouse(ctx, 100_000);
+    fundUser(ctx, "alice", 10_000);
+    // JPプールを作る
+    testTransfer(ctx.ether, HOUSE_HOLDER, JACKPOT_HOLDER, 5_000, "JPプールの用意");
+
+    ctx.ether.runGroup({ groupKey: "slots:spin:alice:op-1", kind: "solo_game", actorId: "alice" }, () => {
+      ctx.casino.settle("alice", "スロット", 1_000, 0, 50, { operationId: "op-1" });
+      ctx.casino.seizeJackpot("alice", "slots", "op-1", 1);
+    });
+
+    const rows = ctx.chipTx.listByGroup("slots:spin:alice:op-1");
+    expect(rows.some((r) => r.reason === "賭け金")).toBe(true);
+    expect(rows.some((r) => r.reason === "ジャックポット当選")).toBe(true);
+    expect(ctx.chipTx.getGroup("jackpot:slots:alice:op-1")).toBeUndefined();
+    expect(ctx.chipTx.verifyBalances().ok).toBe(true);
     ctx.db.close();
   });
 });

@@ -22,7 +22,7 @@ export async function handleDailyCommand(
   services: Services,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const r = services.daily.claim(uid);
+  const r = services.daily.claim(uid, interaction.id);
   if (!r.ok) {
     const embed = new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · 福分け" })

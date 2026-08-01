@@ -126,7 +126,8 @@ export function collectStakes(
     const collected: string[] = [];
     for (const u of userIds) {
       if (!services.escrow.hold(session, u, bet, game, operationId)) {
-        for (const c of collected) services.escrow.refundOne(session, c);
+        // 徴収の巻き戻し。局面ごとに別の鍵を渡す（同じ卓で何度でも返金しうる）
+        for (const c of collected) services.escrow.refundOne(session, c, `${operationId}:rollback`);
         return false;
       }
       collected.push(u);
@@ -142,7 +143,7 @@ export function collectStakes(
 /** 参加者に返金（勝負不成立時など）。session があれば台帳の預かり額で返して記録も消す */
 export function refundAll(services: Services, userIds: string[], bet: number, operationId: string, session?: string): void {
   if (session) {
-    for (const u of userIds) services.escrow.refundOne(session, u);
+    for (const u of userIds) services.escrow.refundOne(session, u, operationId);
     return;
   }
   services.ether.runGroup({ groupKey: `pvp:refund:${operationId}`, kind: "table_refund", actorId: "system:pvp" }, () => {

@@ -436,6 +436,7 @@ CREATE TABLE IF NOT EXISTS casino_tx (
   game         TEXT,
   session_id   TEXT,
   actor_id     TEXT NOT NULL,
+  opening_version TEXT NOT NULL,                     -- この取引が属する開始残高の版（検算の窓）
   land_amount  INTEGER,                              -- 預入・返還で動いたLand（内部移動はNULL）
   ledger_tx_id INTEGER REFERENCES transactions(id),
   created_at   INTEGER NOT NULL,
@@ -454,14 +455,17 @@ CREATE TABLE IF NOT EXISTS casino_tx (
   UNIQUE (group_key, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_casino_tx_group ON casino_tx(group_key, seq);
+CREATE INDEX IF NOT EXISTS idx_casino_tx_version ON casino_tx(opening_version, id);
 CREATE INDEX IF NOT EXISTS idx_casino_tx_from ON casino_tx(from_holder, id);
 CREATE INDEX IF NOT EXISTS idx_casino_tx_to ON casino_tx(to_holder, id);
 
--- 開始残高の版。「その版の残高はどの取引の後の姿か」を版ごとに固定する。
--- 版を切り替えた後も、旧版は旧版の窓（次の版の境界まで）で個別に検算できる。
+-- 開始残高の版。版の前後関係は version_seq（単調増加）で決める。
+-- 取引IDで順序を決めると、取引を挟まず2つの版を作った場合や、開業初期化で
+-- casino_tx を初期化した場合（新版のIDが旧版より小さくなる）に順序が壊れる。
 CREATE TABLE IF NOT EXISTS casino_chip_opening_versions (
   opening_version TEXT PRIMARY KEY,
-  from_tx_id      INTEGER NOT NULL,
+  version_seq     INTEGER NOT NULL UNIQUE,
+  from_tx_id      INTEGER NOT NULL,          -- 参考値（その時点の最終取引ID）
   created_at      INTEGER NOT NULL
 );
 
