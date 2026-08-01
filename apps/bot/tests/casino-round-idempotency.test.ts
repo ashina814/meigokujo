@@ -17,6 +17,7 @@ import {
 import type { Services } from "../src/services.js";
 import { spinOnce } from "../src/casino/slots.js";
 import { settleChinchiroRound } from "../src/casino/chinchiro.js";
+import { settleRoulette } from "../src/casino/roulette.js";
 import { drawNagareboshi, ensureNagareboshiTable } from "../src/commands/nagareboshi.js";
 
 registerDefaultTxTypes();
@@ -148,6 +149,95 @@ describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
 
     expect(settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1")).toEqual(first);
     expect(ctx.ether.balanceOf("u1")).toBe(500);
+    ctx.db.close();
+  });
+});
+
+describe("ルーレット: 1回転が1グループ", () => {
+  const SESSION = "roulette:int-1";
+  /** rouletteSpin = int(0,36) = floor(f*37)。0.03 → 出目 1（🔴赤・奇数・小） */
+  const SPIN_ONE = 0.03;
+
+  function seatTwo(ctx: ReturnType<typeof setup>, houseBalance = 1_000_000) {
+    seedBalance(ctx.db, HOUSE_HOLDER, houseBalance);
+    seedBalance(ctx.db, "alice", 10_000);
+    seedBalance(ctx.db, "bob", 10_000);
+    // 受付時のエスクロー（張った時点で預ける）
+    expect(ctx.escrow.holdAll(SESSION, ["alice", "bob"], 1_000, "roulette", "hold-1")).toBe(true);
+    return [
+      { userId: "alice", type: "red" as const, amount: 1_000 },
+      { userId: "bob", type: "black" as const, amount: 1_000 },
+    ];
+  }
+
+  it("出目と全員の結果が保存値から再生され、資金は二度動かない", () => {
+    const ctx = setup(scriptedRng([SPIN_ONE]));
+    const bets = seatTwo(ctx);
+
+    const first = settleRoulette(ctx.services, SESSION, bets);
+    expect(first.n).toBe(1);
+    expect(first.results).toEqual([
+      { userId: "alice", type: "red", amount: 1_000, won: true, payout: 2_000, net: 1_000 },
+      { userId: "bob", type: "black", amount: 1_000, won: false, payout: 0, net: -1_000 },
+    ]);
+    const alice = ctx.ether.balanceOf("alice");
+    const bob = ctx.ether.balanceOf("bob");
+    expect(alice).toBe(11_000); // 預けた1,000が戻り、賭け1,000を払って配当2,000（+1,000）
+    expect(bob).toBe(9_000); // 預けた1,000が戻り、賭け1,000を払って外れ（−1,000）
+
+    // 再試行: 抽選し直さず、出目も分配も保存済みの値をそのまま返す
+    const again = settleRoulette(ctx.services, SESSION, bets);
+    expect(again).toEqual(first);
+    expect(ctx.ether.balanceOf("alice")).toBe(alice);
+    expect(ctx.ether.balanceOf("bob")).toBe(bob);
+    expect(ctx.casino.stats("alice").games).toBe(1);
+    expect(ctx.escrow.poolOf(SESSION)).toBe(0);
+    ctx.db.close();
+  });
+
+  it("途中で落ちたら全員分がロールバックし、預り金は卓に残る", () => {
+    const ctx = setup(scriptedRng([SPIN_ONE]));
+    const bets = seatTwo(ctx);
+    const holder = ctx.escrow.holderId(SESSION);
+
+    expect(() =>
+      settleRoulette(ctx.services, SESSION, bets, (i) => {
+        if (i === 1) throw new Error("2人目で落ちる");
+      }),
+    ).toThrow("2人目で落ちる");
+
+    // 1人目の精算もエスクロー返還も戻っている（「全員返金済み・一部だけ精算済み」を作らない）
+    expect(ctx.ether.balanceOf("alice")).toBe(9_000);
+    expect(ctx.ether.balanceOf("bob")).toBe(9_000);
+    expect(ctx.ether.balanceOf(holder)).toBe(2_000);
+    expect(ctx.escrow.poolOf(SESSION)).toBe(2_000);
+    expect(ctx.casino.stats("alice").games).toBe(0);
+    expect(ctx.chipTx.getGroup(`${SESSION}:settle`)).toBeUndefined();
+
+    // 巻き戻っているので同じセッションで再試行でき、今度は最後まで通る
+    expect(settleRoulette(ctx.services, SESSION, bets).n).toBe(1);
+    expect(ctx.ether.balanceOf("alice")).toBe(11_000);
+    expect(ctx.escrow.poolOf(SESSION)).toBe(0);
+    ctx.db.close();
+  });
+
+  it("胴元が払えないときは握り潰さず、回転ごと巻き戻す", () => {
+    // 胴元 500 ◈: alice の賭け 1,000 を取り込んでも配当 2,000 に届かない
+    const ctx = setup(scriptedRng([SPIN_ONE]));
+    const bets = seatTwo(ctx, 500);
+
+    expect(() => settleRoulette(ctx.services, SESSION, bets)).toThrow();
+
+    // 「残高不足で無効」と表示して先へ進む（＝その人だけ賭け金が返ったまま）にはしない
+    expect(ctx.ether.balanceOf("alice")).toBe(9_000);
+    expect(ctx.ether.balanceOf("bob")).toBe(9_000);
+    expect(ctx.escrow.poolOf(SESSION)).toBe(2_000);
+    expect(ctx.chipTx.getGroup(`${SESSION}:settle`)).toBeUndefined();
+
+    // 呼び出し側は卓ごと返金して閉じられる
+    expect(ctx.escrow.refund(SESSION)).toBe(2);
+    expect(ctx.ether.balanceOf("alice")).toBe(10_000);
+    expect(ctx.ether.balanceOf("bob")).toBe(10_000);
     ctx.db.close();
   });
 });

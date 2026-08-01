@@ -232,6 +232,82 @@ describe("板の可変状態はグループの中で見る", () => {
   });
 });
 
+describe("板の最終処理（返金・無効化）も1グループ", () => {
+  function openMarketWithBets(ctx: ReturnType<typeof setup>) {
+    fundHouse(ctx, 100_000);
+    fundUser(ctx, "alice", 50_000);
+    fundUser(ctx, "bob", 50_000);
+    const markets = new Markets(ctx.db, ctx.ether, ctx.events);
+    const market = markets.create({
+      operationId: opId(), guildId: "g", creatorId: "alice", title: "どっち", options: ["A", "B"], durationMin: 60, fee: 0,
+    });
+    markets.bet(market.id, "alice", 0, 1_000, "op-a");
+    markets.bet(market.id, "bob", 1, 2_000, "op-b");
+    return { markets, market };
+  }
+
+  it("返金の成功後に再試行しても、保存済みの結果が返り資金は二度動かない", () => {
+    const ctx = setup();
+    const { markets, market } = openMarketWithBets(ctx);
+
+    const first = markets.refund(market.id, "admin-1");
+    expect(first).toEqual({ id: market.id, refunded: 3_000, users: 2, alreadyClosed: false });
+    expect(ctx.ether.balanceOf("alice")).toBe(50_000);
+    expect(markets.get(market.id)!.status).toBe("void");
+
+    // 別の管理者・起動時掃除から再試行しても、鍵の取り違えにならず同じ結果を返す
+    expect(markets.refund(market.id, "admin-2")).toEqual(first);
+    expect(markets.refund(market.id, "system:startup")).toEqual(first);
+    expect(ctx.ether.balanceOf("alice")).toBe(50_000);
+    expect(ctx.ether.balanceOf("bob")).toBe(50_000);
+    expect(ctx.ether.balanceOf(`escrow:market:${market.id}`)).toBe(0);
+    ctx.db.close();
+  });
+
+  it("無効化の成功後に再試行しても、ERR_NOT_DISPUTED にならず同じ結果を返す", () => {
+    const ctx = setup();
+    const { markets, market } = openMarketWithBets(ctx);
+    markets.close(market.id, "admin");
+    markets.report(market.id, "alice", 0);
+    markets.dispute(market.id, "bob");
+
+    const first = markets.adminVoid(market.id, "admin-1");
+    expect(first).toEqual({ id: market.id, refunded: 3_000, users: 2, alreadyClosed: false });
+    expect(markets.get(market.id)!.status).toBe("void");
+
+    expect(markets.adminVoid(market.id, "admin-2")).toEqual(first);
+    expect(ctx.ether.balanceOf("alice")).toBe(50_000);
+    expect(ctx.ether.balanceOf("bob")).toBe(50_000);
+    ctx.db.close();
+  });
+
+  it("途中で落ちたら、返金も status もイベントもすべて戻る", () => {
+    const ctx = setup();
+    const { markets, market } = openMarketWithBets(ctx);
+    const escrowHolder = `escrow:market:${market.id}`;
+    const eventsBefore = (ctx.db.prepare("SELECT COUNT(*) AS c FROM events").get() as { c: number }).c;
+
+    expect(() =>
+      markets.refund(market.id, "admin-1", (i) => {
+        if (i === 1) throw new Error("2人目で落ちる");
+      }),
+    ).toThrow("2人目で落ちる");
+
+    expect(ctx.ether.balanceOf("alice")).toBe(49_000);
+    expect(ctx.ether.balanceOf("bob")).toBe(48_000);
+    expect(ctx.ether.balanceOf(escrowHolder)).toBe(3_000);
+    expect(markets.get(market.id)!.status).toBe("open");
+    expect((ctx.db.prepare("SELECT COUNT(*) AS c FROM events").get() as { c: number }).c).toBe(eventsBefore);
+    expect(ctx.chipTx.getGroup(`market:refund:${market.id}`)).toBeUndefined();
+
+    // 巻き戻っているので同じ鍵で再試行でき、今度は最後まで通る
+    expect(markets.refund(market.id, "admin-1").refunded).toBe(3_000);
+    expect(ctx.ether.balanceOf("alice")).toBe(50_000);
+    expect(ctx.ether.balanceOf("bob")).toBe(50_000);
+    ctx.db.close();
+  });
+});
+
 describe("胴元不足の強制売却は保留する（false を保存しない）", () => {
   it("資金を補充すれば次の tick で売却できる", () => {
     const ctx = setup();

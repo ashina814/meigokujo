@@ -69,10 +69,64 @@ function colorOf(n: number): string {
   return RED.has(n) ? "🔴" : "⚫";
 }
 
-interface SessionBet {
+export interface SessionBet {
   userId: string;
   type: BetType;
   amount: number;
+}
+
+/**
+ * 1回転の確定結果。**すべて `result_json` に保存できる形**にしてある。
+ * 同じセッションの再試行は、出目も参加者別の結果もここから再生される。
+ */
+export interface RouletteSpinRecord {
+  /** 出目（0〜36） */
+  n: number;
+  results: Array<{ userId: string; type: BetType; amount: number; won: boolean; payout: number; net: number }>;
+}
+
+/**
+ * 1回転ぶんの資金処理を**ひとつの最外部グループ**で行う。
+ *
+ * 抽選・エスクロー返還・全員分の精算（賭け徴収→配当）・戦績・エスクロー台帳の削除まで、
+ * 全部この中。以前は「先に全員へ返金 → 参加者ごとに別グループで精算」だったため、
+ * 途中で止まると「全員返金済み・一部だけ再精算済み」が残った。
+ *
+ * 個別の精算例外は握り潰さない。1人でも払えなければ回転ごと巻き戻し、
+ * 呼び出し側が卓ごと返金する（中途半端な卓を残さない）。
+ *
+ * `_beforeStep` はテスト専用のフック（各精算の直前に呼ばれる）。本番呼び出しは省略する。
+ */
+export function settleRoulette(
+  services: Services,
+  session: string,
+  bets: readonly SessionBet[],
+  _beforeStep?: (index: number, bet: SessionBet) => void,
+): RouletteSpinRecord {
+  return services.ether.runGroup(
+    { groupKey: `${session}:settle`, kind: "table_settle", actorId: "system:roulette" },
+    (): RouletteSpinRecord => {
+      // 抽選もグループの中。出目を保存結果に含めるので、再試行でも同じ目・同じ分配になる
+      const n = rouletteSpin(services.rng);
+      // エスクロー分を一旦全員へ返してから casino.settle で正規精算する
+      //（settle が賭け徴収→配当を原子的にやる。戦績・イベントログも settle 経由）
+      services.escrow.refund(session);
+      const results: RouletteSpinRecord["results"] = [];
+      for (let i = 0; i < bets.length; i++) {
+        const b = bets[i]!;
+        _beforeStep?.(i, b);
+        const won = hits(b.type, n);
+        const payout = won ? Math.floor(b.amount * PAYOUTS[b.type]) : 0;
+        const settled = services.casino.settle(b.userId, "roulette", b.amount, payout, 0, {
+          chain: false,
+          fuku: false,
+          operationId: `${session}:${b.userId}`,
+        });
+        results.push({ userId: b.userId, type: b.type, amount: b.amount, won, payout, net: settled.net });
+      }
+      return { n, results };
+    },
+  );
 }
 
 /** チャンネルごとに1卓 */
@@ -234,37 +288,41 @@ export async function playRoulette(
     });
     await sleep(1800);
 
-    // エスクロー分を一旦返してから casino.settle で正規精算
-    //（settle が賭け徴収→配当を原子的にやる。戦績・イベントログも settle 経由で記録される）
-    services.escrow.refund(session);
-
     // 抽選も core モデルの rouletteSpin() を使う（37 マス構成が単一の真実源）
     void ROULETTE_SLOTS;
-    const n = rouletteSpin(services.rng);
-    const lines: string[] = [];
-    let anyWin = false;
-    for (const b of bets.values()) {
-      const won = hits(b.type, n);
-      const payout = won ? Math.floor(b.amount * PAYOUTS[b.type]) : 0;
+    // 1回転ぶんを1グループで精算。1人でも払えなければ回転ごと巻き戻る
+    let spin: RouletteSpinRecord;
+    try {
+      spin = settleRoulette(services, session, [...bets.values()]);
+    } catch (e) {
+      console.error(`[roulette] 卓 ${session} の精算に失敗。全額返金します`, e);
+      // 精算はまるごと巻き戻っているので、預り金はそのまま残っている＝返金して卓を閉じる
       try {
-        services.casino.settle(b.userId, "roulette", b.amount, payout, 0, {
-          chain: false,
-          fuku: false,
-          operationId: `${session}:${b.userId}`,
-        });
-      } catch {
-        lines.push(`${E.push}  <@${b.userId}>  —  残高不足で無効`);
-        continue;
+        services.escrow.refund(session);
+      } catch (re) {
+        console.error(`[roulette] 卓 ${session} の返金にも失敗。起動時の掃除に任せます`, re);
       }
-      if (won) anyWin = true;
-      lines.push(
-        won
-          ? `${E.win}  <@${b.userId}>  ${LABELS[b.type]} 的中！  ${fmtBigDelta(payout - b.amount)}`
-          : `${E.lose}  <@${b.userId}>  ${LABELS[b.type]} 外れ  ${fmtBigDelta(-b.amount)}`,
-      );
+      await interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setAuthor({ name: "マモンの賭場 · ルーレット" })
+            .setColor(C_LOSE)
+            .setTitle("🎡  この卓は無効")
+            .setDescription("胴元の資金が足りず精算できなかった。**全員に賭け金を返した**。"),
+        ],
+        components: [],
+      });
+      return;
     }
+    const n = spin.n;
+    const anyWin = spin.results.some((r) => r.won);
+    const lines = spin.results.map((r) =>
+      r.won
+        ? `${E.win}  <@${r.userId}>  ${LABELS[r.type]} 的中！  ${fmtBigDelta(r.payout - r.amount)}`
+        : `${E.lose}  <@${r.userId}>  ${LABELS[r.type]} 外れ  ${fmtBigDelta(-r.amount)}`,
+    );
 
-    const totalPot = [...bets.values()].reduce((s, b) => s + b.amount, 0);
+    const totalPot = spin.results.reduce((s, r) => s + r.amount, 0);
     const embed = new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · ルーレット" })
       .setColor(anyWin ? C_WIN : C_LOSE)

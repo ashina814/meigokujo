@@ -198,6 +198,7 @@ export {
   Markets,
   MarketError,
   DISPUTE_WINDOW_SEC,
+  MARKET_FINALIZER,
   marketEscrowHolder,
   type Market,
   type MarketBet,
@@ -207,6 +208,7 @@ export {
   type MarketFundMode,
   type PayoutMode,
   type MarketSettleResult,
+  type MarketRefundResult,
 } from "./casino/market.js";
 export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";
 export { Escrow, escrowHolderFor, isEscrowHolder, ESCROW_QUARANTINE, type EscrowRow } from "./casino/escrow.js";
