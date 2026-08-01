@@ -119,17 +119,37 @@ describe("説明会の開催枠", () => {
     expect(schedule).toEqual({ hours: [21, 23], skipDow: [1, 4] });
   });
 
-  it("休みの曜日は空配列なら毎日開催、時刻が全滅した設定は既定値へ落とす", async () => {
+  it("整数以外は数値に化かさず捨てる（true/null/小数/16進表記など）", async () => {
+    const { sessionSchedule } = await import("../src/scheduler.js");
+
+    // Number(true)===1 / Number(null)===0 で通してしまうと、意図しない時刻に説明会が立つ
+    expect(sessionSchedule(scheduleFor({ "entry:session_hours": "[true, 21]" }) as any).hours).toEqual([21]);
+    expect(sessionSchedule(scheduleFor({ "entry:session_hours": "[null, 22]" }) as any).hours).toEqual([22]);
+    expect(sessionSchedule(scheduleFor({ "entry:session_hours": "[true]" }) as any).hours).toEqual([21, 22, 23]);
+    expect(sessionSchedule(scheduleFor({ "entry:session_hours": "[null]" }) as any).hours).toEqual([21, 22, 23]);
+    expect(sessionSchedule(scheduleFor({ "entry:session_hours": "[21.5, 23]" }) as any).hours).toEqual([23]);
+    expect(sessionSchedule(scheduleFor({ "entry:session_hours": '["0x15", " 21 "]' }) as any).hours).toEqual([21]);
+    expect(sessionSchedule(scheduleFor({ "entry:session_skip_dow": "[true, false]" }) as any).skipDow).toEqual([1, 4]);
+  });
+
+  it("休みなしと認めるのは明示的な [] だけ、時刻が全滅した設定は既定値へ落とす", async () => {
     const { sessionSchedule, describeSessionSchedule } = await import("../src/scheduler.js");
     const everyday = sessionSchedule(scheduleFor({ "entry:session_skip_dow": "[]" }) as any);
     expect(everyday.skipDow).toEqual([]);
     expect(describeSessionSchedule(everyday)).toBe("毎日 21 / 22 / 23 時");
+
+    // 区切り文字だけ・整数が1つも無い値は「休みなし」ではなく誤設定として扱う
+    expect(sessionSchedule(scheduleFor({ "entry:session_skip_dow": "," }) as any).skipDow).toEqual([1, 4]);
+    expect(sessionSchedule(scheduleFor({ "entry:session_skip_dow": "毎日" }) as any).skipDow).toEqual([1, 4]);
+    expect(sessionSchedule(scheduleFor({ "entry:session_skip_dow": "[9]" }) as any).skipDow).toEqual([1, 4]);
 
     // 説明会が黙って消えるほうが害が大きいので、壊れた値は既定値で運転を続ける
     const broken = sessionSchedule(
       scheduleFor({ "entry:session_hours": "[99]", "entry:session_skip_dow": "毎日" }) as any,
     );
     expect(broken).toEqual({ hours: [21, 22, 23], skipDow: [1, 4] });
+    // 開催時刻は空にできない（`[]` でも定例が消えるだけなので既定値へ戻す）
+    expect(sessionSchedule(scheduleFor({ "entry:session_hours": "[]" }) as any).hours).toEqual([21, 22, 23]);
   });
 
   it("全曜日が休みなら次の開催は無い", async () => {

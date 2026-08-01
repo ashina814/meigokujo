@@ -98,29 +98,50 @@ function warnOnce(key: string, raw: string, message: string): void {
   console.warn(`[説明会] ${key} の設定値を解釈できませんでした（${raw}）: ${message}`);
 }
 
+/** 10進の整数「文字列」だけを通す。`Number()` に任せると "" や "0x10" まで拾ってしまう */
+const INTEGER_TEXT = /^[+-]?\d+$/;
+
+/**
+ * 設定値のトークンを整数に変換する。**number型の整数**と**空でない10進整数文字列**だけを認め、
+ * `true` / `null` / `[]` / `{}` / 小数 / 空文字などは弾く（`Number(true)===1` を通さない）。
+ */
+function toInteger(token: unknown): number | null {
+  if (typeof token === "number") return Number.isInteger(token) ? token : null;
+  if (typeof token === "string" && INTEGER_TEXT.test(token.trim())) {
+    const n = Number(token.trim());
+    return Number.isInteger(n) ? n : null;
+  }
+  return null;
+}
+
 /**
  * 数値リスト設定の読み取り。`[21,22,23]`（JSON）でも `21,22,23`（区切り文字）でも受ける。
- * 未設定・空文字は null（＝既定値を使う）、値はあるが数値が取れないぶんは dropped に数える。
+ * 未設定・空文字は null（＝既定値を使う）、整数として読めなかったぶんは dropped に数える。
+ * `emptyArray` は **JSONの空配列 `[]` を明示的に書いた**ときだけ true（意思表示と誤設定を分けるため）。
  */
-function parseNumberList(raw: string | undefined): { values: number[]; dropped: number } | null {
+function parseNumberList(
+  raw: string | undefined,
+): { values: number[]; dropped: number; emptyArray: boolean } | null {
   if (raw === undefined) return null;
   const text = raw.trim();
   if (!text) return null;
   let tokens: unknown[];
+  let emptyArray = false;
   try {
     const parsed: unknown = JSON.parse(text);
     tokens = Array.isArray(parsed) ? parsed : [parsed];
+    emptyArray = Array.isArray(parsed) && parsed.length === 0;
   } catch {
     tokens = text.split(/[,\s、]+/).filter((t) => t !== "");
   }
   const values: number[] = [];
   let dropped = 0;
   for (const token of tokens) {
-    const n = Number(token);
-    if (Number.isInteger(n)) values.push(n);
-    else dropped++;
+    const n = toInteger(token);
+    if (n === null) dropped++;
+    else values.push(n);
   }
-  return { values, dropped };
+  return { values, dropped, emptyArray };
 }
 
 function inRangeUnique(values: number[], min: number, max: number): { kept: number[]; dropped: number } {
@@ -135,7 +156,8 @@ function inRangeUnique(values: number[], min: number, max: number): { kept: numb
 
 /**
  * 開催枠を settings から読む。壊れた値は既定値へ落とす（説明会が黙って消えるほうが害が大きい）。
- * `entry:session_skip_dow` だけは空配列を「休みなし」として認める。
+ * 「休みなし」として空を認めるのは `entry:session_skip_dow` に **JSONの `[]` を書いたときだけ**。
+ * 区切り文字だけの値（`","` など）は誤設定として扱い、既定値へ落とす。
  */
 export function sessionSchedule(services: { settings: Pick<Settings, "getString"> }): SessionSchedule {
   const rawHours = services.settings.getString(SESSION_HOURS_KEY);
@@ -145,6 +167,7 @@ export function sessionSchedule(services: { settings: Pick<Settings, "getString"
   const parsedHours = parseNumberList(rawHours);
   if (parsedHours) {
     const { kept, dropped } = inRangeUnique(parsedHours.values, 0, 23);
+    // 開催時刻は空にできない（`[]` を書かれても定例が消えるだけなので既定値へ戻す）
     if (kept.length === 0) warnOnce(SESSION_HOURS_KEY, rawHours!, "0〜23の整数がひとつも無いため既定値を使います");
     else if (dropped + parsedHours.dropped > 0) warnOnce(SESSION_HOURS_KEY, rawHours!, "0〜23の整数以外を無視しました");
     if (kept.length > 0) hours = kept;
@@ -155,12 +178,14 @@ export function sessionSchedule(services: { settings: Pick<Settings, "getString"
   if (parsedSkip) {
     const { kept, dropped } = inRangeUnique(parsedSkip.values, 0, 6);
     const badTokens = dropped + parsedSkip.dropped;
-    if (kept.length === 0 && badTokens > 0) {
-      warnOnce(SESSION_SKIP_DOW_KEY, rawSkip!, "0〜6の整数がひとつも無いため既定値を使います");
-    } else {
-      // 空配列（`[]`）は「休みなし」の意思表示として尊重する
+    if (kept.length > 0) {
       if (badTokens > 0) warnOnce(SESSION_SKIP_DOW_KEY, rawSkip!, "0〜6の整数以外を無視しました");
       skipDow = kept;
+    } else if (parsedSkip.emptyArray) {
+      // `[]` と明示されたときだけ「休みなし」の意思表示として受ける
+      skipDow = [];
+    } else {
+      warnOnce(SESSION_SKIP_DOW_KEY, rawSkip!, "0〜6の整数がひとつも無いため既定値を使います");
     }
   }
 
