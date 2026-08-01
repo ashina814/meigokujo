@@ -104,6 +104,31 @@ CREATE TABLE IF NOT EXISTS entry_bookings (
 );
 CREATE INDEX IF NOT EXISTS idx_bookings_slot ON entry_bookings(slot, status);
 
+-- 説明会の予定変更（通常枠に対する日付ごとの例外）。
+-- 物理削除しない: 誰がいつ休止・追加し、誰が取り消したかを残す。
+-- 取り消した行は canceled_at が入り、開催予定の合成から外れる（＝通常予定へ復元される）。
+CREATE TABLE IF NOT EXISTS entry_session_overrides (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  date        TEXT NOT NULL,                        -- JSTの日付 'YYYY-MM-DD'
+  hour        INTEGER,                              -- JSTの時。skip で NULL ならその日を全休
+  kind        TEXT NOT NULL CHECK (kind IN ('skip','add')),
+  reason      TEXT,
+  actor_id    TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  canceled_at INTEGER,
+  canceled_by TEXT,
+  CHECK (hour IS NULL OR (hour >= 0 AND hour <= 23)),
+  CHECK (kind = 'skip' OR hour IS NOT NULL)         -- 臨時追加に「その日全部」は無い
+);
+-- 二重登録はDB側で弾く（アプリのチェックだけだと同時実行で抜ける）。
+-- 対象は有効な行だけなので、取り消せば同じ枠をもう一度登録できる。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entry_session_overrides_active
+  ON entry_session_overrides(date, kind, IFNULL(hour, -1))
+  WHERE canceled_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_entry_session_overrides_date
+  ON entry_session_overrides(date)
+  WHERE canceled_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS invites (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   inviter_id TEXT NOT NULL,

@@ -17,10 +17,11 @@ import {
   type TextChannel,
   type VoiceState,
 } from "discord.js";
+import { describeSessionSchedule } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { deliverToUser } from "../notify.js";
 import { isAdmin } from "../permissions.js";
-import { describeSessionSchedule, jstNow, nextSessionStart, sessionSchedule } from "../scheduler.js";
+import { jstNow, nextSessionStart } from "../scheduler.js";
 import type { Services } from "../services.js";
 
 // ---- パネル ----
@@ -34,7 +35,7 @@ import type { Services } from "../services.js";
  */
 export function entryPanelMessage(services: Services): MessageCreateOptions {
   const vcIds = sessionVcIds(services);
-  const schedule = describeSessionSchedule(sessionSchedule(services));
+  const schedule = describeSessionSchedule(services.sessions.schedule());
   const embed = new EmbedBuilder()
     .setTitle("🚪 冥獄城 入城案内")
     .setColor(0x6b21a8)
@@ -77,7 +78,7 @@ export function entryFlexPanelMessage(services: Services): MessageCreateOptions 
     .setColor(0xdb2777)
     .setDescription(
       [
-        `**${describeSessionSchedule(sessionSchedule(services))}** の説明会に来られない方は、こちらから個別希望を出せます。`,
+        `**${describeSessionSchedule(services.sessions.schedule())}** の説明会に来られない方は、こちらから個別希望を出せます。`,
         "ボタンを押すと、あなたとスタッフだけの非公開スレッドが開きます。都合のいい時間帯を書いてください。",
       ].join("\n"),
     );
@@ -140,8 +141,8 @@ export async function handleEntryButton(
  */
 export function entryStatusMessage(services: Services, userId: string): MessageCreateOptions {
   const soul = services.entry.getSoul(userId);
-  const schedule = sessionSchedule(services);
-  const next = nextSessionStart(schedule);
+  const schedule = services.sessions.schedule();
+  const next = nextSessionStart(services);
   const nextTs = next ? Math.floor(next.getTime() / 1000) : null;
   const vcIds = sessionVcIds(services);
 
@@ -233,8 +234,8 @@ export async function handleMemberJoin(
  * 門番が当日 `/審判 招待` で拾う。ここで手順を1つ増やすほうが損が大きい。
  */
 function buildWelcomeEmbed(member: GuildMember, services: Services): EmbedBuilder {
-  const schedule = sessionSchedule(services);
-  const next = nextSessionStart(schedule);
+  const schedule = services.sessions.schedule();
+  const next = nextSessionStart(services);
   const nextTs = next ? Math.floor(next.getTime() / 1000) : null;
   const guildId = member.guild.id;
   const vcIds = sessionVcIds(services);

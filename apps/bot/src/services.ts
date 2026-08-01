@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import {
   Departments,
   Entry,
+  SessionCalendar,
   Fiscal,
   Evaluation,
   EventLog,
@@ -57,6 +58,8 @@ export function buildServices() {
   const migration = new Migration(db, ledger);
   const events = new EventLog(db);
   const entry = new Entry(db, ledger, settings, events);
+  // 説明会の開催予定（通常枠 × 日付ごとの例外）。案内・通知・ボードは全部ここを見る
+  const sessions = new SessionCalendar(db, settings, events);
   const vc = new VcTracker(db);
   const tickets = new Tickets(db, events);
   if (tickets.migrationResult.deletedLegacyTickets > 0) {
@@ -138,7 +141,7 @@ export function buildServices() {
   const takutate = new Takutate(db, events);
   // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
-  const services = { db, settings, ledger, payroll, migration, events, entry, vc, tickets, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, escrow, takutate, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, escrow, takutate, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;

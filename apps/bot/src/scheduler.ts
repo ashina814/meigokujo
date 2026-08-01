@@ -1,5 +1,5 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, type Client, type TextChannel } from "discord.js";
-import { TREASURY, type Settings } from "@meigokujo/core";
+import { addJstDays, TREASURY } from "@meigokujo/core";
 import { createAndPostDraft } from "./payday.js";
 import { threadTitleFor } from "./commands/evaluation.js";
 import { checkBumpCooldowns } from "./bump.js";
@@ -61,144 +61,12 @@ export function jstNow(date = new Date()): {
   };
 }
 
-/** JSTでの曜日（0=日 … 6=土）。VPSのTZに依存しないよう jstNow 経由で出す */
-export function jstDayOfWeek(date = new Date()): number {
-  const jst = jstNow(date);
-  return new Date(Date.UTC(jst.year, jst.month - 1, jst.day)).getUTCDay();
-}
+// ── 説明会の開催予定 ──
+// 通常枠（settings）と日付ごとの例外（entry_session_overrides）の合成は core の
+// SessionCalendar が持つ。刻時盤・DM・パネル・`/説明会`・門番用ボードは全部そこを見る。
 
-// ── 説明会の開催枠 ──
-// 「月・木を除く 21/22/23時」は運用の取り決めであってコードの都合ではないので settings に置く。
-// 既定値は現行運用そのままなので、設定していないサーバーの挙動は変わらない。
-// 日単位の休止・臨時追加（`/説明会 休止・追加`）は、この枠の上に後から重ねる。
-
-export const DEFAULT_SESSION_HOURS = [21, 22, 23];
-export const DEFAULT_SESSION_SKIP_DOW = [1, 4]; // 0=日, 1=月, 4=木
-export const SESSION_HOURS_KEY = "entry:session_hours";
-export const SESSION_SKIP_DOW_KEY = "entry:session_skip_dow";
 /** 開始の何分前に通知するか（notifyMinute = 60 - これ） */
 const SESSION_NOTIFY_LEAD_MIN = 5;
-
-export type SessionSchedule = {
-  /** 開催時刻（JST・時のみ）。昇順・重複なし */
-  hours: number[];
-  /** 休みの曜日（0=日 … 6=土）。昇順・重複なし。空なら毎日開催 */
-  skipDow: number[];
-};
-
-const DOW_LABELS = ["日", "月", "火", "水", "木", "金", "土"];
-
-/** 同じ誤設定で毎分警告を出さないための既出記録 */
-const warnedSettingValues = new Set<string>();
-
-function warnOnce(key: string, raw: string, message: string): void {
-  const seen = `${key}=${raw}`;
-  if (warnedSettingValues.has(seen)) return;
-  warnedSettingValues.add(seen);
-  console.warn(`[説明会] ${key} の設定値を解釈できませんでした（${raw}）: ${message}`);
-}
-
-/** 10進の整数「文字列」だけを通す。`Number()` に任せると "" や "0x10" まで拾ってしまう */
-const INTEGER_TEXT = /^[+-]?\d+$/;
-
-/**
- * 設定値のトークンを整数に変換する。**number型の整数**と**空でない10進整数文字列**だけを認め、
- * `true` / `null` / `[]` / `{}` / 小数 / 空文字などは弾く（`Number(true)===1` を通さない）。
- */
-function toInteger(token: unknown): number | null {
-  if (typeof token === "number") return Number.isInteger(token) ? token : null;
-  if (typeof token === "string" && INTEGER_TEXT.test(token.trim())) {
-    const n = Number(token.trim());
-    return Number.isInteger(n) ? n : null;
-  }
-  return null;
-}
-
-/**
- * 数値リスト設定の読み取り。`[21,22,23]`（JSON）でも `21,22,23`（区切り文字）でも受ける。
- * 未設定・空文字は null（＝既定値を使う）、整数として読めなかったぶんは dropped に数える。
- * `emptyArray` は **JSONの空配列 `[]` を明示的に書いた**ときだけ true（意思表示と誤設定を分けるため）。
- */
-function parseNumberList(
-  raw: string | undefined,
-): { values: number[]; dropped: number; emptyArray: boolean } | null {
-  if (raw === undefined) return null;
-  const text = raw.trim();
-  if (!text) return null;
-  let tokens: unknown[];
-  let emptyArray = false;
-  try {
-    const parsed: unknown = JSON.parse(text);
-    tokens = Array.isArray(parsed) ? parsed : [parsed];
-    emptyArray = Array.isArray(parsed) && parsed.length === 0;
-  } catch {
-    tokens = text.split(/[,\s、]+/).filter((t) => t !== "");
-  }
-  const values: number[] = [];
-  let dropped = 0;
-  for (const token of tokens) {
-    const n = toInteger(token);
-    if (n === null) dropped++;
-    else values.push(n);
-  }
-  return { values, dropped, emptyArray };
-}
-
-function inRangeUnique(values: number[], min: number, max: number): { kept: number[]; dropped: number } {
-  const kept: number[] = [];
-  let dropped = 0;
-  for (const n of values) {
-    if (n < min || n > max) dropped++;
-    else if (!kept.includes(n)) kept.push(n);
-  }
-  return { kept: kept.sort((a, b) => a - b), dropped };
-}
-
-/**
- * 開催枠を settings から読む。壊れた値は既定値へ落とす（説明会が黙って消えるほうが害が大きい）。
- * 「休みなし」として空を認めるのは `entry:session_skip_dow` に **JSONの `[]` を書いたときだけ**。
- * 区切り文字だけの値（`","` など）は誤設定として扱い、既定値へ落とす。
- */
-export function sessionSchedule(services: { settings: Pick<Settings, "getString"> }): SessionSchedule {
-  const rawHours = services.settings.getString(SESSION_HOURS_KEY);
-  const rawSkip = services.settings.getString(SESSION_SKIP_DOW_KEY);
-
-  let hours = [...DEFAULT_SESSION_HOURS];
-  const parsedHours = parseNumberList(rawHours);
-  if (parsedHours) {
-    const { kept, dropped } = inRangeUnique(parsedHours.values, 0, 23);
-    // 開催時刻は空にできない（`[]` を書かれても定例が消えるだけなので既定値へ戻す）
-    if (kept.length === 0) warnOnce(SESSION_HOURS_KEY, rawHours!, "0〜23の整数がひとつも無いため既定値を使います");
-    else if (dropped + parsedHours.dropped > 0) warnOnce(SESSION_HOURS_KEY, rawHours!, "0〜23の整数以外を無視しました");
-    if (kept.length > 0) hours = kept;
-  }
-
-  let skipDow = [...DEFAULT_SESSION_SKIP_DOW];
-  const parsedSkip = parseNumberList(rawSkip);
-  if (parsedSkip) {
-    const { kept, dropped } = inRangeUnique(parsedSkip.values, 0, 6);
-    const badTokens = dropped + parsedSkip.dropped;
-    if (kept.length > 0) {
-      if (badTokens > 0) warnOnce(SESSION_SKIP_DOW_KEY, rawSkip!, "0〜6の整数以外を無視しました");
-      skipDow = kept;
-    } else if (parsedSkip.emptyArray) {
-      // `[]` と明示されたときだけ「休みなし」の意思表示として受ける
-      skipDow = [];
-    } else {
-      warnOnce(SESSION_SKIP_DOW_KEY, rawSkip!, "0〜6の整数がひとつも無いため既定値を使います");
-    }
-  }
-
-  return { hours, skipDow };
-}
-
-/** パネル・DMに載せる開催枠の文字列（例: 「月・木を除く 21 / 22 / 23 時」） */
-export function describeSessionSchedule(schedule: SessionSchedule): string {
-  if (schedule.skipDow.length >= 7 || schedule.hours.length === 0) return "現在は定例の説明会がありません";
-  const hours = schedule.hours.join(" / ");
-  if (schedule.skipDow.length === 0) return `毎日 ${hours} 時`;
-  return `${schedule.skipDow.map((d) => DOW_LABELS[d]).join("・")}を除く ${hours} 時`;
-}
 
 export function isSessionNotificationDue(
   now: Pick<ReturnType<typeof jstNow>, "hour" | "minute">,
@@ -212,22 +80,12 @@ export function isSessionNotificationDue(
 }
 
 /**
- * 次の説明会の開始時刻。8日先まで見て無ければ null。
+ * 次の説明会の開始時刻（休止・臨時追加を織り込んだ実際の予定）。8日先まで見て無ければ null。
  * 入城案内で「次は何時か」を具体的に出すために使う（抽象的な「21/22/23時です」だけだと
  * 参加直後の人が次の機会をいつまで待つのか分からず、そのまま抜けてしまうため）。
  */
-export function nextSessionStart(schedule: SessionSchedule, from = new Date()): Date | null {
-  const jst = jstNow(from);
-  for (let offset = 0; offset < 8; offset++) {
-    const base = Date.UTC(jst.year, jst.month - 1, jst.day + offset);
-    const dow = new Date(base).getUTCDay(); // 0=日 … 6=土
-    if (schedule.skipDow.includes(dow)) continue;
-    for (const hour of schedule.hours) {
-      const at = new Date(base + (hour - 9) * 3_600_000); // JSTは常にUTC+9
-      if (at.getTime() > from.getTime()) return at;
-    }
-  }
-  return null;
+export function nextSessionStart(services: Pick<Services, "sessions">, from = new Date()): Date | null {
+  return services.sessions.nextOccurrence(from)?.at ?? null;
 }
 
 /**
@@ -238,21 +96,29 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
   async function tick(): Promise<void> {
     const now = jstNow();
 
-    // ── 説明会の案内: 開催枠（既定は月・木を除く 21/22/23時）の 5分前に入城案内chへ通知 ──
-    // 開催枠は settings（entry:session_hours / entry:session_skip_dow）で変えられる。
+    // ── 説明会の案内: 実際の開催予定の 5分前に入城案内chへ通知 ──
+    // 通常枠は settings、休止・臨時追加は entry_session_overrides。合成は SessionCalendar が持ち、
+    // ここは「その枠が本当に開催されるか」だけを訊く（休止した枠を案内しない・臨時枠は案内する）。
     //
     // 30分前の予告は廃止した。案内待ちロールへのメンションが 1日6回・週30回になり、
     // まだ城の中を何も見ていない新規にとって離脱要因になっていたため（直前の1回だけに絞る）。
     {
-      const schedule = sessionSchedule(services);
+      const schedule = services.sessions.schedule();
       const notifyMinute = 60 - SESSION_NOTIFY_LEAD_MIN; // 例: 21時会は 20:55
-      const todayDow = jstDayOfWeek();
-      for (const start of schedule.hours) {
-        // 0時開催だけは前日の23:55に通知するので、休みの判定は「開催日」の曜日で行う
-        const sessionDow = start === 0 ? (todayDow + 1) % 7 : todayDow;
-        if (schedule.skipDow.includes(sessionDow)) continue;
+      // 通常枠に加えて、今日・明日に臨時追加された枠も通知の候補にする
+      const candidates = new Set([
+        ...schedule.hours,
+        ...services.sessions
+          .listOverrides(now.dateStr, addJstDays(now.dateStr, 1))
+          .filter((o) => o.kind === "add" && o.hour !== null)
+          .map((o) => o.hour as number),
+      ]);
+      for (const start of candidates) {
         if (!isSessionNotificationDue(now, start, notifyMinute)) continue;
-        const marker = `session:notify:${now.dateStr}:${start}:5m`;
+        // 0時開催だけは前日の23:55に通知するので、開催の有無は「開催日」で見る
+        const sessionDate = start === 0 ? addJstDays(now.dateStr, 1) : now.dateStr;
+        if (!services.sessions.isOccurring(sessionDate, start, schedule)) continue;
+        const marker = `session:notify:${sessionDate}:${start}:5m`;
         if (!services.settings.getString(marker)) {
           await runSchedulerTaskOnce(services, marker, "system:scheduler", () =>
             sendSessionNotification(client, services, start, "5m"),
