@@ -10,7 +10,22 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import { HOUSE_HOLDER, type CasinoRng } from "@meigokujo/core";
+import {
+  CHINCHIRO_HOUSE_EDGE,
+  CHINCHIRO_MAX_LOSS_MULT,
+  CHINCHIRO_MAX_ROLLS,
+  CHINCHIRO_WIN_MULT,
+  HOUSE_HOLDER,
+  chinchiroCompare,
+  chinchiroEvaluate,
+  chinchiroIsTerminal,
+  chinchiroMaxPayout,
+  chinchiroPayout,
+  chinchiroRoll,
+  type ChinchiroDice as Dice,
+  type ChinchiroHand as Hand,
+  type CasinoRng,
+} from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
@@ -19,78 +34,35 @@ import { broadcastBigWin } from "./bigwin.js";
 
 /**
  * 🎲 チンチロ（対マモン・casino-bot 準拠の忠実移植）。
+ *
+ * **数値モデルは `packages/core/src/casino/chinchiro-model.ts` が単一の真実源**（PR4）。
+ * 役判定・順位・勝ち倍率・負け倍率・払戻計算はすべてそこから読む。ここには演出と進行だけ置く。
+ *
  * - 最大3投。終了役（ピンゾロ/ゾロ目/シゴロ/ヒフミ）即確定。メナシ自動再振り。目は選択
- * - 役倍率: ピンゾロ5 / ゾロ目3 / シゴロ2 / 目1 / ヒフミは負ける側が2倍払う
- * - 同点はマモン勝ち（-1倍）。勝ち利益にエッジ5%
- * - 倍付け負け（|mul|≥2）は追加徴収。残高不足なら通常負けにフォールバック
+ * - 勝ち倍率: ピンゾロ5 / ゾロ目3 / シゴロ2 / 目1（変更なし）
+ * - **負けは最大2倍**（PR4・正本 §1.5）。旧実装はマモンのピンゾロで 5倍払いだった
+ * - 同点はマモン勝ち（-1倍）。勝ち利益のエッジは 5% → 15%（負け上限2化で上振れした RTP を戻す）
+ * - 倍付け負けは追加徴収。残高不足なら通常負けにフォールバック
+ *   （**この事前預託化とフォールバック削除は PR11**。PR4 では倍率だけを直す）
  * - シェイクアニメ 4フレーム、マモンのターンでも同じ演出
  * - 結果画面に「最低/前回/最大/配当表/退席」ボタン
  */
-const HOUSE_EDGE = 0.05;
-const MAX_ROLLS = 3;
+const MAX_ROLLS = CHINCHIRO_MAX_ROLLS;
 const ROLL_BUTTON_TIMEOUT_MS = 30_000;
 const DIE_FACES = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"] as const;
-const MAX_MULT = 6; // 最大ピンゾロ5倍 = 純利益5倍 + 元金 = 6倍 分の胴元余力
+/** テーブルリミット判定用の最大払戻倍率。core のモデルから逆算する（写さない） */
+const MAX_MULT = chinchiroMaxPayout(1_000_000) / 1_000_000;
 
-type Dice = readonly [number, number, number];
-type Hand =
-  | { type: "pinzoro" }
-  | { type: "zorome"; value: number }
-  | { type: "shigoro" }
-  | { type: "hifumi" }
-  | { type: "me"; score: number }
-  | { type: "menashi" };
-
-const rollDice = (rng: CasinoRng): Dice => [rng.int(1, 6), rng.int(1, 6), rng.int(1, 6)] as const;
-
-function evaluate(dice: Dice): Hand {
-  const [a, b, c] = [...dice].sort((x, y) => x - y) as [number, number, number];
-  if (a === b && b === c) return a === 1 ? { type: "pinzoro" } : { type: "zorome", value: a };
-  if (a === 4 && b === 5 && c === 6) return { type: "shigoro" };
-  if (a === 1 && b === 2 && c === 3) return { type: "hifumi" };
-  if (a === b) return { type: "me", score: c };
-  if (b === c) return { type: "me", score: a };
-  return { type: "menashi" };
-}
-
-function handRank(h: Hand): number {
-  switch (h.type) {
-    case "pinzoro": return 1000;
-    case "zorome": return 800 + h.value;
-    case "shigoro": return 700;
-    case "me": return 100 + h.score;
-    case "menashi": return 0;
-    case "hifumi": return -100;
-  }
-}
-
-function handBaseMul(h: Hand): number {
-  switch (h.type) {
-    case "pinzoro": return 5;
-    case "zorome": return 3;
-    case "shigoro": return 2;
-    case "hifumi": return 2;
-    default: return 1;
-  }
-}
-
-function compare(player: Hand, dealer: Hand): { result: "player_win" | "dealer_win" | "push"; mul: number } {
-  if (player.type === "hifumi" && dealer.type === "hifumi") return { result: "push", mul: 0 };
-  if (player.type === "hifumi") return { result: "dealer_win", mul: -2 };
-  if (dealer.type === "hifumi") return { result: "player_win", mul: 2 };
-  const pr = handRank(player);
-  const dr = handRank(dealer);
-  if (pr > dr) return { result: "player_win", mul: handBaseMul(player) };
-  if (pr < dr) return { result: "dealer_win", mul: -handBaseMul(dealer) };
-  return { result: "dealer_win", mul: -1 };
-}
+const rollDice = chinchiroRoll;
+const evaluate = chinchiroEvaluate;
+const compare = chinchiroCompare;
 
 function describe(h: Hand): string {
   switch (h.type) {
-    case "pinzoro": return "🌟 **ピンゾロ**！1-1-1（5倍）";
-    case "zorome": return `🎯 **ゾロ目**！${h.value}-${h.value}-${h.value}（3倍）`;
-    case "shigoro": return "🔥 **シゴロ**！4-5-6（2倍）";
-    case "hifumi": return "💀 **ヒフミ**…1-2-3（倍付けで払う）";
+    case "pinzoro": return `🌟 **ピンゾロ**！1-1-1（${CHINCHIRO_WIN_MULT.pinzoro}倍）`;
+    case "zorome": return `🎯 **ゾロ目**！${h.value}-${h.value}-${h.value}（${CHINCHIRO_WIN_MULT.zorome}倍）`;
+    case "shigoro": return `🔥 **シゴロ**！4-5-6（${CHINCHIRO_WIN_MULT.shigoro}倍）`;
+    case "hifumi": return `💀 **ヒフミ**…1-2-3（${CHINCHIRO_MAX_LOSS_MULT}倍払い）`;
     case "me": return `🎲 **目** スコア **${h.score}**`;
     case "menashi": return "🌀 **メナシ**（役なし）";
   }
@@ -131,7 +103,7 @@ export function settleChinchiroRound(
       const held = services.ether.balanceOf(uid);
       if (mul > 0) {
         // 勝ち: profit = bet * mul * (1 - edge)、payout = bet + profit
-        const rawPayout = bet + Math.floor(bet * mul * (1 - HOUSE_EDGE));
+        const rawPayout = chinchiroPayout(bet, mul);
         const settled = services.casino.settleSolo(uid, "チンチロ", bet, rawPayout, { operationId });
         return { branch: "win", settled, amuletNote: settled.amuletNote ?? null, extra: 0 };
       }
@@ -158,7 +130,7 @@ export function settleChinchiroRound(
   );
 }
 
-const isTerminal = (h: Hand) => h.type !== "me" && h.type !== "menashi";
+const isTerminal = chinchiroIsTerminal;
 /** 壺の中に転がる三賽を等幅で並べる（原作準拠の見せ方より視認性重視） */
 const diceDisplay = (d: Dice) => `╭─────╮  ╭─────╮  ╭─────╮\n│  ${DIE_FACES[d[0]]}  │  │  ${DIE_FACES[d[1]]}  │  │  ${DIE_FACES[d[2]]}  │\n╰─────╯  ╰─────╯  ╰─────╯`;
 
@@ -168,20 +140,24 @@ function paytableEmbed(): EmbedBuilder {
     .setColor(C_MAMMON)
     .setDescription(
       [
-        "**役と倍率（対マモン）**",
-        "・🌟 ピンゾロ 1-1-1 → **5倍**",
-        "・🎯 ゾロ目 → **3倍**",
-        "・🔥 シゴロ 4-5-6 → **2倍**",
-        "・🎲 目（一組ペア）→ **1倍**",
+        "**勝ったときの倍率（対マモン）**",
+        `・🌟 ピンゾロ 1-1-1 → **${CHINCHIRO_WIN_MULT.pinzoro}倍**`,
+        `・🎯 ゾロ目 → **${CHINCHIRO_WIN_MULT.zorome}倍**`,
+        `・🔥 シゴロ 4-5-6 → **${CHINCHIRO_WIN_MULT.shigoro}倍**`,
+        `・🎲 目（一組ペア）→ **${CHINCHIRO_WIN_MULT.plain}倍**`,
         "・🌀 メナシ → 目より弱い（自動再振り）",
-        "・💀 ヒフミ 1-2-3 → **出した側が2倍払う**（自爆役）",
+        `・💀 ヒフミ 1-2-3 → **出した側が${CHINCHIRO_MAX_LOSS_MULT}倍払う**（自爆役）`,
+        "",
+        "**負けたときの支払い**",
+        `・どんな役に負けても **最大 ${CHINCHIRO_MAX_LOSS_MULT}倍**（賭け ${(1000).toLocaleString()} なら最大 ${(1000 * CHINCHIRO_MAX_LOSS_MULT).toLocaleString()} まで）`,
+        "・目・メナシに負け／同点は **1倍**（賭け額だけ）",
         "",
         "**振りルール**",
-        "・最大3投。終了役（ピンゾロ/ゾロ目/シゴロ/ヒフミ）で即確定",
+        `・最大${MAX_ROLLS}投。終了役（ピンゾロ/ゾロ目/シゴロ/ヒフミ）で即確定`,
         "・目が出たら「止める/もう一度」を選択",
-        "・メナシは自動で振り直し（3投目でメナシなら確定）",
+        `・メナシは自動で振り直し（${MAX_ROLLS}投目でメナシなら確定）`,
         "",
-        "**同点はマモン勝ち**（-1倍）。勝ち利益にエッジ5%",
+        `**同点はマモン勝ち**（-1倍）。勝ち利益にエッジ${(CHINCHIRO_HOUSE_EDGE * 100).toFixed(0)}%`,
       ].join("\n"),
     );
 }

@@ -25,7 +25,8 @@ import { C_JACKPOT, C_MAMMON, E, HR_THIN, buildResultEmbed, fmtBigDelta } from "
  *   3カード 3倍 / ツーペア 2倍 / J以上のペア 1倍 / それ以下 負け
  * - 最大配当250倍 → テーブルリミット判定に使う
  */
-const MAX_MULT = 250;
+/** ロイヤルフラッシュの払戻倍率。配当表（core）から読む（写さない・PR4） */
+const MAX_MULT = POKER_CATEGORY_PAYOUTS[11]!;
 const SUITS = ["♠", "♥", "♦", "♣"] as const;
 const RANK_LABEL = ["", "", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"] as const;
 

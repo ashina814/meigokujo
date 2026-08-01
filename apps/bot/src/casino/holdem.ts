@@ -9,7 +9,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import type { CasinoRng } from "@meigokujo/core";
+import { HOLDEM_MAX_PAYOUT_MULT, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
@@ -26,7 +26,15 @@ import { C_MAMMON, E, HR_THIN, buildResultEmbed, fmtBigDelta } from "./ui.js";
  * - リバー1枚 → 各人7枚から最強5枚役判定、勝者が pot 総取り
  * - マモンは常にコール（弱いブラフ判断は入れない・単純化）
  */
-const MAX_MULT = 8; // アンティ×8 が最大 pot（アンティ+3ラウンドのコール = 4x per player = 8x pot）
+/**
+ * アンティに対する最大 pot 倍率（PR4 で訂正）。
+ *
+ * 旧値 8 は「アンティ + 3ラウンドのコール」を想定していたが、実際には
+ * preflop / flop / turn / river の**4局面すべてでコールできる**ので、
+ * 片側の総賭けは 5×ante、pot は 10×ante。受付時のテーブルリミットが
+ * 1ラウンドぶん最悪ケースを覆っていなかった。
+ */
+const MAX_MULT = HOLDEM_MAX_PAYOUT_MULT;
 
 const SUITS = ["♠", "♥", "♦", "♣"] as const;
 const RANK_LABEL = ["", "", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"] as const;
