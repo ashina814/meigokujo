@@ -7,8 +7,9 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "test": "vitest run && vitest run --config vitest.serial.config.ts",
+    "typecheck": "tsc --noEmit",
+    "test:serial": "vitest run --config vitest.serial.config.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.4.1"

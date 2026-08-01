@@ -15,9 +15,16 @@ import { ChipTx } from "./chip-tx.js";
  * これにより churn ぶんだけ Land 総量はゆっくり縮む（能動的なシンク）。
  */
 export const ETHER_ESCROW = "sys:escrow:ether";
-const ETHER_APPROVER = "system:ether";
+/** 準備口座を動かす取引の承認者・実行者。検算Bの経路監査もこの値で照合する */
+export const ETHER_APPROVER = "system:ether";
 /** 胴元（マモンの賭場）のエテル保有者ID */
 export const HOUSE_HOLDER = "house";
+/**
+ * 準備プールの端数回収（孤児Land防止）の理由文。
+ * 検算Bは「プールは預入・返還とこの回収でしか動かない」を確かめるので、
+ * 回収を識別できるようにここを唯一の真実源にしておく。
+ */
+export const POOL_SWEEP_REASON = "準備プール残の回収";
 
 export type EtherErrorCode = "ERR_BAD_AMOUNT" | "ERR_INSUFFICIENT_ETHER" | "ERR_DUPLICATE";
 
@@ -325,7 +332,7 @@ export class EtherExchange {
     if (this.outstanding() === 0 && this.pool() > 0) {
       this.ledger.transfer({
         from: ETHER_ESCROW, to: TREASURY, amount: this.pool(), type: "ether_burn", actor: ETHER_APPROVER,
-        approvedBy: ETHER_APPROVER, reason: "準備プール残の回収", refType: "ether", refId, idempotencyKey: `${idempotencyKey}:sweep`,
+        approvedBy: ETHER_APPROVER, reason: POOL_SWEEP_REASON, refType: "ether", refId, idempotencyKey: `${idempotencyKey}:sweep`,
       });
     }
   }

@@ -33,6 +33,8 @@ function setEtherBalance(db: Database.Database, holder: string, amount: number):
 function createServices(opts: {
   landMismatches?: Array<{ accountId: string; cached: number; computed: number }>;
   sessionMismatches?: Array<{ sessionId: string; expected: number; actual: number }>;
+  casinoStatus?: { status: string; reason: string; changedBy: string; changedAt: number };
+  casinoChecks?: Array<{ id: string; name: string; ok: boolean; detail: string; mismatches: unknown[] }>;
 } = {}): FakeServices {
   const db = openDb(":memory:");
   db.exec(`
@@ -98,6 +100,24 @@ function createServices(opts: {
     tickets: { countOpen: () => 0, staleOpen: () => [] },
     rooms: { listOpen: () => [] },
     casino: { houseBalance: () => 50_000, jackpotPool: () => 1_000 },
+    // 賭場の稼働状態と検算（PR2）。計器盤は表示するだけなので、既定は「営業中・検算正常」
+    casinoStatus: {
+      current: () => opts.casinoStatus ?? { status: "open", reason: "初期状態", changedBy: "system", changedAt: 0 },
+    },
+    casinoIntegrity: {
+      runFull: () => ({
+        ok: (opts.casinoChecks ?? []).every((c) => c.ok),
+        ledger: { ok: true, detail: "Land台帳は正常" },
+        checks: opts.casinoChecks ?? [
+          { id: "A", name: "記録と残高", ok: true, detail: "", mismatches: [] },
+          { id: "B", name: "チップの裏付け", ok: true, detail: "", mismatches: [] },
+          { id: "C", name: "預託", ok: true, detail: "", mismatches: [] },
+          { id: "D", name: "帰属", ok: true, detail: "", mismatches: [] },
+        ],
+        failed: (opts.casinoChecks ?? []).filter((c) => !c.ok).map((c) => c.id),
+        checkedAt: 0,
+      }),
+    },
     ether: {
       balanceOf: (holder: string) =>
         (db.prepare("SELECT amount FROM ether_balances WHERE user_id = ?").get(holder) as { amount: number } | undefined)

@@ -23,7 +23,7 @@ import {
   UserSelectMenuBuilder,
   UserSelectMenuInteraction,
 } from "discord.js";
-import { deptAccount, EtherError, HOUSE_HOLDER, LedgerError, type TicketPanel } from "@meigokujo/core";
+import { CasinoIntegrity, deptAccount, EtherError, HOUSE_HOLDER, LedgerError, type TicketPanel } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
 import { ROLE_SLOT_META, ROLE_SLOT_ORDER, getRoleIds, setRoleIds, type RoleSlot } from "../church-roles.js";
 import {
@@ -172,6 +172,26 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "casino" && !action) return void (await interaction.update(casinoHome(services)));
   if (section === "casino" && action === "fund") return void (await interaction.showModal(casinoFundModal()));
   if (section === "casino" && action === "settle") return void (await interaction.showModal(casinoSettleModal()));
+  if (section === "casino" && action === "halt") return void (await interaction.showModal(casinoHaltModal()));
+  if (section === "casino" && action === "reopen") {
+    return void (await interaction.showModal(casinoReopenModal(services.casinoStatus.current().reason)));
+  }
+  if (section === "casino" && action === "baseline") {
+    return void (await interaction.showModal(
+      casinoBaselineModal(services.ether.pool(), services.ledger.lastTransactionId()),
+    ));
+  }
+  if (section === "casino" && action === "recheck") {
+    // 全点検（Land台帳 + 検算A〜D）。通れば検算停止だけを解ける（人が直したあとに押す想定）
+    const report = services.casinoIntegrity.runFull();
+    const cur = services.casinoStatus.current();
+    if (cur.status === "integrity_halt") {
+      services.casinoStatus.reopenAfterIntegrity("再点検で全点検が通った", interaction.user.id, report.ok);
+    } else if (!report.ok && cur.status === "open") {
+      services.casinoStatus.haltForIntegrity(CasinoIntegrity.describeFailure(report), interaction.user.id);
+    }
+    return void (await interaction.update(casinoHome(services)));
+  }
 
   // ── 調整 ──
   if (section === "adjust" && !action) return void (await interaction.update(adjustHome()));
@@ -532,6 +552,14 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
     }
     return;
   }
+  if (section === "casino" && (action === "fund" || action === "settle")) {
+    // 停止中は運営卓からも資金を動かさない（資金層でも弾かれるが、理由を先に見せる）
+    const deny = services.casinoStatus.denyMessage();
+    if (deny) {
+      await interaction.reply({ content: `⛔ ${deny}`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+  }
   if (section === "casino" && action === "fund") {
     const amt = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
     if (!Number.isInteger(amt) || amt <= 0) {
@@ -574,6 +602,65 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
           : "処理に失敗しました。";
       await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
     }
+    return;
+  }
+  if (section === "casino" && action === "halt") {
+    const reason = interaction.fields.getTextInputValue("reason").trim();
+    services.casinoStatus.haltManually(reason, interaction.user.id);
+    await interaction.reply({
+      content: `⛔ 賭場を止めました（${reason}）。以降、チップが動く操作はすべて理由付きで断ります。`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (section === "casino" && action === "reopen") {
+    const reason = interaction.fields.getTextInputValue("reason").trim();
+    const cur = services.casinoStatus.current();
+    // 開ける前に必ず全点検する。NG のまま開けると壊れた帳簿の上に取引を積むことになる
+    const report = services.casinoIntegrity.runFull();
+    if (!report.ok) {
+      await interaction.reply({
+        content: `❌ 全点検が通らないので開けられません。\n${CasinoIntegrity.describeFailure(report)}`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    // 状態ごとの経路で開ける（メンテ終了の導線で検算停止を開けたりできない）
+    const result =
+      cur.status === "manual_halt"
+        ? services.casinoStatus.reopenFromManualHalt(reason, interaction.user.id)
+        : cur.status === "integrity_halt"
+          ? services.casinoStatus.reopenAfterIntegrity(reason, interaction.user.id, report.ok)
+          : cur.status === "maintenance"
+            ? services.casinoStatus.endMaintenance(reason, interaction.user.id)
+            : cur.status === "opening_reset"
+              ? services.casinoStatus.finishOpeningReset(reason, interaction.user.id)
+              : { ok: false, reason: `いまは ${cur.status} なので、この導線では開けられない` };
+    await interaction.reply({
+      content: result.ok ? `🟢 賭場を開けました（${reason}）。` : `❌ ${result.reason}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (section === "casino" && action === "baseline") {
+    if (interaction.fields.getTextInputValue("confirm").trim() !== "確定") {
+      await interaction.reply({ content: "❌ 「確定」と入力されなかったので何もしていません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const poolLand = services.ether.pool();
+    const ledgerTxId = services.ledger.lastTransactionId();
+    const version = services.chipTx.currentVersion();
+    const placed = services.chipTx.establishOpeningLandBaseline(version, poolLand, ledgerTxId);
+    services.events.log("casino_opening_land_baseline", {
+      actor: interaction.user.id,
+      payload: { version, poolLand, fromLedgerTxId: ledgerTxId, placed },
+    });
+    await interaction.reply({
+      content: placed
+        ? `📌 版 ${version} の検算B基準を確定しました（準備プール ${fmtLd(poolLand)} / 境界取引 #${ledgerTxId}）。これ以降の準備口座の出入りを監査します。`
+        : "既に基準が入っているため、何も変更していません。",
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
   if (section === "dept" && action === "create") {
@@ -1779,16 +1866,47 @@ async function deptRemove(
 
 const CASINO_DEPT_KEY = "賭博場";
 
+/**
+ * 状態ごとの「開ける」ボタンの文言。ここに無い状態（open / startup_check）は開けるボタンを出さない。
+ * 経路を1本ずつに分けるのは、検算NGで止めた賭場を「メンテ終了」の導線から開けさせないため。
+ */
+const REOPEN_LABEL: Partial<Record<string, string>> = {
+  manual_halt: "営業再開",
+  integrity_halt: "検算通過で再開",
+  maintenance: "改装終了",
+  opening_reset: "開業初期化を完了",
+};
+
+/** 稼働状態の見出し（運営が一目で「いま開いているか・なぜ閉じたか」を掴めるように） */
+const CASINO_STATUS_LABEL: Record<string, string> = {
+  open: "🟢 営業中",
+  startup_check: "🟡 点検中",
+  integrity_halt: "🔴 停止（検算NG）",
+  manual_halt: "🔴 停止（手動）",
+  maintenance: "🔧 改装中",
+  opening_reset: "🚧 開業準備中",
+};
+
 function casinoHome(services: Services) {
   const ether = services.ether;
   const casino = services.casino;
   const dept = services.departments.get(CASINO_DEPT_KEY);
   const deptBal = dept ? services.departments.balanceOf(CASINO_DEPT_KEY) : null;
+  const status = services.casinoStatus.current();
+  // 起動時・営業再開・再点検・計器盤はすべて同じ全点検（Land台帳 + 検算A〜D）を使う
+  const report = services.casinoIntegrity.runFull();
+  const checkLines = [
+    `　${report.ledger.ok ? "✅" : "⚠️"} Land台帳: ${report.ledger.detail}`,
+    ...report.checks.map((c) => `　${c.ok ? "✅" : "⚠️"} 検算${c.id}（${c.name}）: ${c.detail}`),
+  ];
   const embed = new EmbedBuilder()
     .setTitle("🎰 マモンの賭場 運営卓")
-    .setColor(0xc9a227)
+    .setColor(status.status === "open" ? 0xc9a227 : 0x991b1b)
     .setDescription(
       [
+        `**稼働状態**: ${CASINO_STATUS_LABEL[status.status] ?? status.status}`,
+        `　理由: ${status.reason}（${status.changedBy}）`,
+        "",
         `**胴元残高**: ${fmtEther(casino.houseBalance())} （テーブルリミットの原資）`,
         `**ジャックポット積立**: ${fmtEther(casino.jackpotPool())}`,
         `**為替レート**: 1 Ld = ${ether.rate().toFixed(2)} ◈`,
@@ -1797,16 +1915,95 @@ function casinoHome(services: Services) {
         dept
           ? `**部署「${CASINO_DEPT_KEY}」残高**: ${fmtLd(deptBal!)}`
           : `⚠️ 部署「${CASINO_DEPT_KEY}」が未作成です。先に 部署→作成 で作ってください。`,
-        "",
-        "・**資金投入**: 賭博場口座の Land を胴元エテルに（フェアレート・手数料なし）",
-        "・**売上精算**: 胴元エテルを賭博場口座の Land に戻す（フェアレート）",
       ].join("\n"),
-    );
+    )
+    .addFields({ name: report.ok ? "▸ 全点検（正常）" : "▸ 全点検（**要対応**）", value: checkLines.join("\n"), inline: false });
+  // 停止中は資金投入・売上精算も押せない（押しても資金層で弾かれるが、UIでも見せる）
+  const closed = status.status !== "open";
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("mgmt:casino:fund").setLabel("資金投入").setEmoji("🔸").setStyle(ButtonStyle.Primary).setDisabled(!dept),
-    new ButtonBuilder().setCustomId("mgmt:casino:settle").setLabel("売上精算").setEmoji("🔹").setStyle(ButtonStyle.Secondary).setDisabled(!dept),
+    new ButtonBuilder().setCustomId("mgmt:casino:fund").setLabel("資金投入").setEmoji("🔸").setStyle(ButtonStyle.Primary).setDisabled(!dept || closed),
+    new ButtonBuilder().setCustomId("mgmt:casino:settle").setLabel("売上精算").setEmoji("🔹").setStyle(ButtonStyle.Secondary).setDisabled(!dept || closed),
+    new ButtonBuilder().setCustomId("mgmt:casino:recheck").setLabel("再点検").setEmoji("🔎").setStyle(ButtonStyle.Secondary),
+    ...(closed
+      ? []
+      : [new ButtonBuilder().setCustomId("mgmt:casino:halt").setLabel("営業停止").setEmoji("⛔").setStyle(ButtonStyle.Danger)]),
+    // 開ける経路は状態ごとに1本ずつ。generic な「営業再開」で全部開けられないようにする
+    ...(REOPEN_LABEL[status.status]
+      ? [
+          new ButtonBuilder()
+            .setCustomId("mgmt:casino:reopen")
+            .setLabel(REOPEN_LABEL[status.status]!)
+            .setEmoji("🟢")
+            .setStyle(ButtonStyle.Success),
+        ]
+      : []),
   );
-  return { embeds: [embed], components: [row, backButton()] };
+  const rows: ActionRowBuilder<ButtonBuilder>[] = [row];
+  // 検算Bの基準が無い版（PR2 以前から動いていたDB）だけ、明示的な基準確定を出す
+  if (services.chipTx.openingLandBaseline() === null) {
+    rows.push(
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("mgmt:casino:baseline")
+          .setLabel("検算Bの基準を確定（移行）")
+          .setEmoji("📌")
+          .setStyle(ButtonStyle.Danger),
+      ),
+    );
+  }
+  return { embeds: [embed], components: [...rows, backButton()] };
+}
+
+function casinoHaltModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:halt")
+    .setTitle("賭場を止める")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("reason")
+          .setLabel("理由（利用者と監査ログに残る）")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(200),
+      ),
+    );
+}
+
+function casinoReopenModal(currentReason: string) {
+  // Discord の TextInput label は45文字まで。いまの停止理由は placeholder へ逃がす
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:reopen")
+    .setTitle("賭場を開ける")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("reason")
+          .setLabel("再開の理由（監査ログに残る）")
+          .setPlaceholder(`いまの停止理由: ${currentReason}`.slice(0, 100))
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(200),
+      ),
+    );
+}
+
+/** 検算Bの基準確定（移行操作）。押した人と時点が監査に残る */
+function casinoBaselineModal(poolLand: number, ledgerTxId: number) {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:baseline")
+    .setTitle("検算Bの基準を確定する")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("confirm")
+          .setLabel("確認のため「確定」と入力")
+          .setPlaceholder(`準備プール ${poolLand} Ld / 境界取引 #${ledgerTxId} を出発点にします`.slice(0, 100))
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(10),
+      ),
+    );
 }
 
 function casinoFundModal() {

@@ -105,6 +105,7 @@ export interface ChipBalanceMismatch {
 }
 
 export type ChipTxErrorCode =
+  | "ERR_CASINO_CLOSED"
   | "ERR_NO_GROUP"
   | "ERR_BAD_AMOUNT"
   | "ERR_EMPTY_REASON"
@@ -144,6 +145,18 @@ export class ChipTx {
   private active: ActiveGroup | null = null;
   /** 現在の版。captureOpening で切り替わるまで変わらない */
   private cachedVersion: string | null = null;
+  /**
+   * 賭場が閉まっていれば理由を返す関数（PR2 で `CasinoStatus` を繋ぐ）。
+   * **Discord の入口ではなくここで止める**ので、停止前から進行中のゲーム・scheduler・
+   * 運営卓の資金操作も等しく止まる。
+   */
+  private closedReason: (() => string | null) | null = null;
+  /**
+   * 復旧・初期化のように「停止中でも動かしてよい」処理の入れ子深さ。
+   * actor 文字列を見て判定すると呼び出し側で偽装できるので、
+   * **`runMaintenance()` を通った区間だけ**が許可される明示的な経路にしてある。
+   */
+  private maintenanceDepth = 0;
 
   /**
    * プリペアドステートメントは使い回す。1ゲームごとに数件の追記が入るので、
@@ -185,6 +198,35 @@ export class ChipTx {
    * 作らない）。上位で1つの業務操作として括られている場合に、内側の部品が独自の
    * トランザクションや冪等キーを作って二重管理になるのを避ける。
    */
+  /**
+   * 賭場の稼働状態を繋ぐ。`open` 以外では**新しい金銭グループを作れなくなる**。
+   * @param closedReason 閉まっていれば理由文、開いていれば null を返す関数
+   */
+  setClosedReason(closedReason: (() => string | null) | null): void {
+    this.closedReason = closedReason;
+  }
+
+  /**
+   * 停止中でも資金を動かしてよい区間（起動時の復旧・掃除、正式開業初期化）。
+   *
+   * この関数を通ることが唯一の許可経路。actor 文字列での判定にしないのは、
+   * 呼び出し側が `actorId: "system:startup"` と名乗るだけで素通りできてしまうため。
+   */
+  runMaintenance<T>(reason: string, body: () => T): T {
+    if (!reason.trim()) throw new ChipTxError("ERR_CASINO_CLOSED", { reason: "runMaintenance には理由が要る" });
+    this.maintenanceDepth++;
+    try {
+      return body();
+    } finally {
+      this.maintenanceDepth--;
+    }
+  }
+
+  /** いま復旧・初期化の区間の中か（テスト・診断用） */
+  isMaintenance(): boolean {
+    return this.maintenanceDepth > 0;
+  }
+
   runGroup<T>(input: ChipGroupInput, body: () => T): T {
     assertGroupKey(input);
     if (this.active) {
@@ -196,8 +238,15 @@ export class ChipTx {
       }
     }
 
+    // 処理済みの再試行は資金を動かさないので、閉まっていても保存済みの結果を返す
     const existing = this.getGroup(input.groupKey);
     if (existing) return this.replay<T>(existing, input);
+
+    // ここから先は**新しい金銭グループを作る**。閉まっていれば作らせない
+    if (this.maintenanceDepth === 0) {
+      const closed = this.closedReason?.();
+      if (closed) throw new ChipTxError("ERR_CASINO_CLOSED", { groupKey: input.groupKey, kind: input.kind, reason: closed });
+    }
 
     // IMMEDIATE で始める。遅延トランザクションだと、後から書き込みへ昇格する時点で
     // SQLITE_BUSY が busy handler を通らずに即失敗しうる（複数接続で競合したとき）。
@@ -334,7 +383,11 @@ export class ChipTx {
    * 開始残高を保存する。同じ版で二度目は何もしない（戻り値 false）。
    * 「いまの残高を出発点にする」宣言なので、後から書き換えない。
    */
-  captureOpening(version: string, balances: Iterable<readonly [string, number]>): boolean {
+  captureOpening(
+    version: string,
+    balances: Iterable<readonly [string, number]>,
+    land?: { poolLand: number; fromLedgerTxId: number },
+  ): boolean {
     const existing = this.db
       .prepare("SELECT COUNT(*) AS c FROM casino_chip_opening_versions WHERE opening_version = ?")
       .get(version) as { c: number };
@@ -358,10 +411,11 @@ export class ChipTx {
       const lastTx = (this.db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM casino_tx").get() as { id: number }).id;
       this.db
         .prepare(
-          `INSERT INTO casino_chip_opening_versions (opening_version, version_seq, from_tx_id, created_at)
-           VALUES (?, ?, ?, ?)`,
+          `INSERT INTO casino_chip_opening_versions
+             (opening_version, version_seq, from_tx_id, pool_land, from_ledger_tx_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
         )
-        .run(version, seq, lastTx, ts);
+        .run(version, seq, lastTx, land?.poolLand ?? null, land?.fromLedgerTxId ?? null, ts);
       setSetting.run(CHIP_OPENING_VERSION_KEY, version, ts);
       this.cachedVersion = version;
     })();
@@ -396,8 +450,12 @@ export class ChipTx {
     return rows.map((r) => ({ version: r.opening_version, seq: r.version_seq, fromTxId: r.from_tx_id }));
   }
 
-  /** PR1導入時の一度きりの記録。いまのチップ残高をそのまま開始残高にする */
-  captureLegacyOpening(): boolean {
+  /**
+   * PR1導入時の一度きりの記録。いまのチップ残高をそのまま開始残高にする。
+   * @param land その時点の準備プール残高と Land 台帳の最終取引ID（検算Bの出発点）。
+   *   省略すると基準未設定になり、検算Bは NG のままになる（明示的な移行操作で置く）
+   */
+  captureLegacyOpening(land?: { poolLand: number; fromLedgerTxId: number }): boolean {
     const rows = this.db.prepare("SELECT user_id, amount FROM ether_balances ORDER BY user_id").all() as Array<{
       user_id: string;
       amount: number;
@@ -405,7 +463,57 @@ export class ChipTx {
     return this.captureOpening(
       LEGACY_OPENING_VERSION,
       rows.map((r) => [r.user_id, r.amount] as const),
+      land,
     );
+  }
+
+  /**
+   * その版の Land 側の基準（検算Bの出発点）。
+   * - `poolLand`: その版を開いた時点の準備プール残高
+   * - `fromLedgerTxId`: その時点の Land 台帳の最終取引ID。**これ以降の取引だけ**を監査する
+   *
+   * どちらか欠けていれば null を返す（＝検算Bは「基準未設定」で **NG**。自動で埋めない）。
+   */
+  openingLandBaseline(version = this.currentVersion()): { poolLand: number; fromLedgerTxId: number } | null {
+    const row = this.db
+      .prepare("SELECT pool_land, from_ledger_tx_id FROM casino_chip_opening_versions WHERE opening_version = ?")
+      .get(version) as { pool_land: number | null; from_ledger_tx_id: number | null } | undefined;
+    if (!row || row.pool_land === null || row.from_ledger_tx_id === null) return null;
+    return { poolLand: row.pool_land, fromLedgerTxId: row.from_ledger_tx_id };
+  }
+
+  /**
+   * 基準の無い版（PR2 より前に開始残高だけ取ったDB）に、後から基準を1度だけ置く。
+   *
+   * **これは検算ではなく明示的な移行操作**である。検算の中から自動で呼ばない
+   * （自動で逆算すると、初回の検算が必ず通り、それまでの不正移動を出発点へ取り込んでしまう）。
+   * 運営が「この時点を出発点にする」と決めて実行し、監査に残す。
+   *
+   * @returns 実際に置いたか（すでに基準があれば false・後から書き換えない）
+   */
+  establishOpeningLandBaseline(version: string, poolLand: number, fromLedgerTxId: number): boolean {
+    const r = this.db
+      .prepare(
+        `UPDATE casino_chip_opening_versions SET pool_land = ?, from_ledger_tx_id = ?
+         WHERE opening_version = ? AND (pool_land IS NULL OR from_ledger_tx_id IS NULL)`,
+      )
+      .run(poolLand, fromLedgerTxId, version);
+    return r.changes > 0;
+  }
+
+  /** その版より後に開かれた版の Land 境界（旧版の窓の終わり）。最新版なら null */
+  nextOpeningLandBoundary(version = this.currentVersion()): number | null {
+    const next = this.nextOpeningVersion(version);
+    if (next === null) return null;
+    const row = this.db
+      .prepare("SELECT from_ledger_tx_id FROM casino_chip_opening_versions WHERE opening_version = ?")
+      .get(next) as { from_ledger_tx_id: number | null } | undefined;
+    return row?.from_ledger_tx_id ?? null;
+  }
+
+  /** group_key が存在するか（Land 取引と chip グループの対応確認に使う） */
+  hasGroup(groupKey: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 AS ok FROM casino_tx_groups WHERE group_key = ?").get(groupKey));
   }
 
   openingBalances(version = this.currentVersion()): Map<string, number> {

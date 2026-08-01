@@ -466,8 +466,32 @@ CREATE TABLE IF NOT EXISTS casino_chip_opening_versions (
   opening_version TEXT PRIMARY KEY,
   version_seq     INTEGER NOT NULL UNIQUE,
   from_tx_id      INTEGER NOT NULL,          -- 参考値（その時点の最終取引ID）
+  -- その版を開いた時点の準備プール(sys:escrow:ether)の Land。検算Bの出発点。
+  pool_land       INTEGER,
+  -- その時点の Land 台帳の最終取引ID。検算Bはこれ以降の準備口座の出入りを1件ずつ監査する。
+  -- pool_land と揃って初めて基準が成立する。NULL なら検算Bは NG（自動では埋めない）
+  from_ledger_tx_id INTEGER,
   created_at      INTEGER NOT NULL
 );
+
+-- 賭場の稼働状態（1行だけ）。停止は理由・実行者・時刻とセットでしか作れない。
+-- startup_check だけが自動で解除され、それ以外は人の明示操作でしか開かない。
+CREATE TABLE IF NOT EXISTS casino_status (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  status     TEXT NOT NULL,
+  reason     TEXT NOT NULL,
+  changed_by TEXT NOT NULL,
+  changed_at INTEGER NOT NULL
+);
+-- 状態の変遷は全部残す（いつ誰がなぜ止めた/開けたか）
+CREATE TABLE IF NOT EXISTS casino_status_history (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  status     TEXT NOT NULL,
+  reason     TEXT NOT NULL,
+  changed_by TEXT NOT NULL,
+  changed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_casino_status_history ON casino_status_history(changed_at);
 
 -- 検算の出発点。ここに載せた版の残高 + その版の窓の casino_tx = その時点の残高 になる
 CREATE TABLE IF NOT EXISTS casino_chip_opening_balances (
@@ -601,6 +625,8 @@ export function openDb(path: string): Database.Database {
   // マイグレーション: 旧カジノの chip_balances は ether_balances に置き換え（旧カジノは開帳前に廃止＝データ無し）
   db.exec("DROP TABLE IF EXISTS chip_balances");
   db.exec(DDL);
+  ensureColumn(db, "casino_chip_opening_versions", "pool_land", "INTEGER");
+  ensureColumn(db, "casino_chip_opening_versions", "from_ledger_tx_id", "INTEGER");
   ensureColumn(db, "vc_segments", "parent_id", "TEXT");
   ensureColumn(db, "marks", "weight", "INTEGER NOT NULL DEFAULT 1 CHECK (weight > 0)");
   ensureColumn(db, "evaluations", "mark_weight", "INTEGER NOT NULL DEFAULT 0 CHECK (mark_weight >= 0)");
