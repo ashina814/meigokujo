@@ -12,7 +12,7 @@ import {
 import type { CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { MIN_BET, SEAT_BUSY_REASON, acquireSeat, checkRetry, effectiveMaxBet, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -116,7 +116,6 @@ async function runRound(
   let totalBet = bet;
 
   const table = (hideDealer: boolean) => {
-    const dealerVal = hideDealer ? "**?**" : `**${handValue(dealer)}**`;
     return new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · ブラックジャック" })
       .setColor(C_MAMMON)
@@ -132,7 +131,6 @@ async function runRound(
           "```",
         ].join("\n"),
       );
-    void dealerVal;
   };
 
   let reply: Message;
@@ -204,7 +202,7 @@ async function runRound(
 
     const held = services.ether.balanceOf(uid);
     const min = MIN_BET;
-    const max = Math.min(MAX_BET, held);
+    const max = Math.min(effectiveMaxBet(services, uid), held);
     const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId(`bj:retry:${min}`)
@@ -244,16 +242,22 @@ async function runRound(
       }
       if (btn.customId.startsWith("bj:retry:")) {
         collector.stop("retry");
-        const retryBet = Number(btn.customId.split(":")[2]);
-        if (retryBet < MIN_BET || retryBet > MAX_BET) return;
+        // 断るなら理由を出す。黙って return するとボタンが死んだようにしか見えない（PR3）
+        const retry = checkRetry(services, uid, Number(btn.customId.split(":")[2]));
+        if (!retry.ok) {
+          await btn.reply({ content: `❌ ${retry.reason}`, flags: MessageFlags.Ephemeral });
+          return;
+        }
         await btn.deferUpdate();
         releaseSeat(uid);
-        if (acquireSeat(uid)) {
-          try {
-            await runRound(btn, services, retryBet);
-          } finally {
-            releaseSeat(uid);
-          }
+        if (!acquireSeat(uid)) {
+          await btn.followUp({ content: SEAT_BUSY_REASON, flags: MessageFlags.Ephemeral });
+          return;
+        }
+        try {
+          await runRound(btn, services, retry.bet);
+        } finally {
+          releaseSeat(uid);
         }
       }
     });

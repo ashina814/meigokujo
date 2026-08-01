@@ -13,7 +13,7 @@ import {
 import { HOUSE_HOLDER, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { MIN_BET, SEAT_BUSY_REASON, acquireSeat, checkRetry, effectiveMaxBet, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -258,7 +258,6 @@ async function runRound(
   // 二度振りの権: 装備してればプレイヤーの投数を +1
   const rerollGranted = services.items.consumeReroll(uid);
   const playerMaxRolls = MAX_ROLLS + (rerollGranted ? 1 : 0);
-  void rerollGranted;
 
   for (let rollNo = 1; rollNo <= playerMaxRolls && !playerLocked; rollNo++) {
     const remaining = playerMaxRolls - rollNo + 1;
@@ -478,7 +477,7 @@ async function runRound(
 
   const heldAfter = services.ether.balanceOf(uid);
   const min = MIN_BET;
-  const max = Math.min(MAX_BET, heldAfter);
+  const max = Math.min(effectiveMaxBet(services, uid), heldAfter);
   const nextRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`chinchiro:retry:${min}`)
@@ -498,9 +497,6 @@ async function runRound(
     new ButtonBuilder().setCustomId("chinchiro:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("chinchiro:quit").setLabel("🚪 退席").setStyle(ButtonStyle.Secondary),
   );
-
-  // 演出用の使わない値を silent（TS 気にせず）
-  void netForDisplay;
 
   await reply.edit({ embeds: [resultEmbed], components: [nextRow] }).catch(() => undefined);
 
@@ -522,16 +518,22 @@ async function runRound(
     }
     if (btn.customId.startsWith("chinchiro:retry:")) {
       collector.stop("retry");
-      const retryBet = Number(btn.customId.split(":")[2]);
-      if (retryBet < MIN_BET || retryBet > MAX_BET) return;
+      // 断るなら理由を出す。黙って return するとボタンが死んだようにしか見えない（PR3）
+      const retry = checkRetry(services, uid, Number(btn.customId.split(":")[2]));
+      if (!retry.ok) {
+        await btn.reply({ content: `❌ ${retry.reason}`, flags: MessageFlags.Ephemeral });
+        return;
+      }
       await btn.deferUpdate();
       releaseSeat(uid);
-      if (acquireSeat(uid)) {
-        try {
-          await runRound(btn, services, retryBet);
-        } finally {
-          releaseSeat(uid);
-        }
+      if (!acquireSeat(uid)) {
+        await btn.followUp({ content: SEAT_BUSY_REASON, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      try {
+        await runRound(btn, services, retry.bet);
+      } finally {
+        releaseSeat(uid);
       }
     }
   });

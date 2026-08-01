@@ -32,7 +32,7 @@ export async function handleBakutenCommand(
   interaction: ChatInputCommandInteraction,
   services: Services,
 ): Promise<void> {
-  await interaction.reply({ embeds: [buildEmbed(interaction.user.id, services)], components: buildComponents(services), flags: MessageFlags.Ephemeral });
+  await interaction.reply({ embeds: [buildEmbed(interaction.user.id, services)], components: buildComponents(), flags: MessageFlags.Ephemeral });
 }
 
 function buildEmbed(userId: string, services: Services): EmbedBuilder {
@@ -71,7 +71,7 @@ function buildEmbed(userId: string, services: Services): EmbedBuilder {
   return embed;
 }
 
-function buildComponents(services: Services): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
+function buildComponents(): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
   const buySelect = new StringSelectMenuBuilder()
     .setCustomId("bakuten:buy")
     .setPlaceholder("買う商品を選ぶ")
@@ -134,7 +134,7 @@ export async function handleBakutenSelect(
       });
       return;
     }
-    await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents(services) });
+    await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents() });
     return;
   }
 
@@ -150,7 +150,7 @@ export async function handleBakutenSelect(
       await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
       return;
     }
-    await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents(services) });
+    await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents() });
     return;
   }
 }
@@ -158,6 +158,6 @@ export async function handleBakutenSelect(
 export async function handleBakutenButton(interaction: ButtonInteraction, services: Services): Promise<void> {
   const uid = interaction.user.id;
   if (interaction.customId === "bakuten:refresh") {
-    await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents(services) });
+    await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents() });
   }
 }

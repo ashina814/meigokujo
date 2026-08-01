@@ -23,7 +23,7 @@ import {
 } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { MIN_BET, SEAT_BUSY_REASON, acquireSeat, checkRetry, effectiveMaxBet, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -124,7 +124,7 @@ function buildSpinEmbed(
 function retryButtons(uid: string, bet: number, services: Services): ActionRowBuilder<ButtonBuilder> {
   const held = services.ether.balanceOf(uid);
   const min = MIN_BET;
-  const max = Math.min(MAX_BET, held);
+  const max = Math.min(effectiveMaxBet(services, uid), held);
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`slots:retry:${min}`)
@@ -186,6 +186,14 @@ export interface SpinRecord {
   amuletNote: string | null;
   settled: import("@meigokujo/core").SoloRoundResult | null;
   jpWon: number;
+  /**
+   * フリースピンの配当のうち、胴元の資金が尽きていて**払えなかった**額（PR3）。
+   *
+   * 以前は `canAccept` が false のとき transfer を黙って飛ばしていたので、
+   * 結果画面には配当が出ているのに残高が増えない状態になっていた。
+   * いまは払えないなら `payout` を 0 にし、この額と理由を利用者と監査へ出す。
+   */
+  unpaid: number;
 }
 
 const symbolByName = (name: string): SlotSymbol => SYMBOLS.find((s) => s.name === name) ?? SYMBOLS[0]!;
@@ -212,14 +220,27 @@ export function spinOnce(services: Services, uid: string, bet: number, interacti
       let settledInGroup: import("@meigokujo/core").SoloRoundResult | null = null;
       let payout = spin.payout;
       let amuletNote: string | null = null;
+      let unpaid = 0;
       if (isFreeSpin) {
         // フリースピンは配当のみ（賭けなし）。settle は使わず胴元→プレイヤーの直接転送。
         // お守りの消費もこのグループの中で行う（外で消すと落ちたときお守りだけ消える）
         const amulet = services.casino.consumeAmulets(uid, bet, spin.payout);
-        payout = amulet.payout;
         amuletNote = amulet.note ?? null;
-        if (payout > 0 && services.casino.canAccept(payout)) {
-          services.ether.transfer("house", uid, payout, { reason: "フリースピンの配当", game: "スロット" });
+        const wanted = amulet.payout;
+        if (wanted > 0 && !services.casino.canAccept(wanted)) {
+          // 胴元が払えない。部分払いはしない（見えない規則を作らない）。
+          // 払えなかったことを結果画面と監査の両方に出す（正本 §16.4「自動補填しない」）
+          payout = 0;
+          unpaid = wanted;
+          services.events.log("casino_house_insufficient", {
+            actor: uid,
+            payload: { game: "スロット", kind: "free_spin", wanted, houseBalance: services.casino.houseBalance() },
+          });
+        } else {
+          payout = wanted;
+          if (payout > 0) {
+            services.ether.transfer("house", uid, payout, { reason: "フリースピンの配当", game: "スロット" });
+          }
         }
       } else {
         settledInGroup = services.casino.settleSolo(uid, "スロット", bet, spin.payout, {
@@ -244,6 +265,7 @@ export function spinOnce(services: Services, uid: string, bet: number, interacti
         amuletNote,
         settled: settledInGroup,
         jpWon,
+        unpaid,
       };
     },
   );
@@ -331,18 +353,6 @@ async function runOne(
   const net = totalPayout - (isFreeSpin ? 0 : bet);
   const stats = services.casino.stats(uid);
   const winStreak = won ? stats.current_win_streak : 0;
-  const streakBadge = winStreak >= 2 ? `🔥 ${winStreak}連勝中！\n` : "";
-
-  const jpLine = jpWon > 0 ? `\n💎 JPプール獲得: **${fmtEther(jpWon)}** (残 ${fmtEther(services.casino.jackpotPool())})` : "";
-  const freeSpinNotice = spin.freeSpin && !isFreeSpin ? `\n\n✨✨ **魂片3つ！フリースピン獲得！** ✨✨` : "";
-  const chainLine =
-    settled && settled.chainBonus > 0
-      ? `\n${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
-      : "";
-  const fukuLine =
-    settled && settled.fukuTax > 0
-      ? `\n⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
-      : "";
 
   // 結果 embed（Fields でセクション化）
   const isJp = spin.kind === "jackpot";
@@ -361,6 +371,10 @@ async function runOne(
   }
   if (amulet.note) bonusBits.push(`✨ ${amulet.note}`);
   if (jpWon > 0) bonusBits.push(`💎 JP獲得  +${fmtEther(jpWon)}（残 ${fmtEther(services.casino.jackpotPool())}）`);
+  // 胴元が払えなかったフリースピン配当は黙って消さない（PR3）
+  if (record.unpaid > 0) {
+    bonusBits.push(`⚠️ 胴元の資金が尽きており、フリースピンの配当 ${fmtEther(record.unpaid)} を支払えなかった（運営へ記録済み）`);
+  }
 
   const resultEmbed = new EmbedBuilder()
     .setAuthor({ name: `マモンの賭場 · スロット${isFreeSpin ? " · フリースピン" : ""}` })
@@ -380,13 +394,6 @@ async function runOne(
         `JP ${fmtEther(services.casino.jackpotPool()).replace(" ◈", "◈")}`,
       ].filter(Boolean).join(" · "),
     });
-  void streakBadge;
-  void chainLine;
-  void fukuLine;
-  void amulet;
-  void freeSpinNotice;
-  void jpLine;
-
   // 大勝ち速報
   if (won) {
     broadcastBigWin(interaction.client, services, {
@@ -421,17 +428,24 @@ async function runOne(
     }
     if (btn.customId.startsWith("slots:retry:")) {
       collector.stop("retry");
-      const retryBet = Number(btn.customId.split(":")[2]);
+      // 断るなら理由を出す。黙って return するとボタンが死んだようにしか見えない（PR3）
+      const retry = checkRetry(services, uid, Number(btn.customId.split(":")[2]));
+      if (!retry.ok) {
+        await btn.reply({ content: `❌ ${retry.reason}`, flags: MessageFlags.Ephemeral });
+        return;
+      }
       await btn.deferUpdate();
       // acquireSeat のためこの playSlots は releaseSeat 後に呼ぶ必要があるが、
       // 現在の座席は runOne の親（playSlots）が持っている。ここで一旦解放して再取得する。
       releaseSeat(uid);
-      if (acquireSeat(uid)) {
-        try {
-          await runOne(btn, services, retryBet, 0);
-        } finally {
-          releaseSeat(uid);
-        }
+      if (!acquireSeat(uid)) {
+        await btn.followUp({ content: SEAT_BUSY_REASON, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      try {
+        await runOne(btn, services, retry.bet, 0);
+      } finally {
+        releaseSeat(uid);
       }
     }
   });

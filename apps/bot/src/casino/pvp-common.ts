@@ -10,20 +10,20 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import { HOUSE_HOLDER, JACKPOT_HOLDER, escrowHolderFor } from "@meigokujo/core";
+import { HOUSE_HOLDER, JACKPOT_HOLDER } from "@meigokujo/core";
 import type { Services } from "../services.js";
 import { fmtEther } from "../format.js";
 import { C_LOSE, C_MAMMON, C_WIN } from "./ui.js";
 
 /**
- * 「今この対戦の資金がどこにあるか」を返す。
- * - session あり: escrow:session:<id>（新方式・胴元と分離）
- * - session なし: house（旧方式・呼び出し側が旧経路でも動くように残す）
- * ここを唯一の分岐点にすることで、勝負系のあらゆる精算/返金が同じ場所から動く。
+ * session を渡さない旧方式で資金が置かれる場所。
+ *
+ * 以前は `stakeHolder(session?)` という分岐関数だったが、呼び出しは2箇所とも
+ * `stakeHolder(undefined)` で、session がある経路は先に `escrow.settle()` へ抜けていた。
+ * 通らない分岐を持つと「session を渡せばここも切り替わる」と読めてしまうので、
+ * 旧経路の置き場だけを名前で示す（PR3 の死んだコード整理）。
  */
-function stakeHolder(session?: string): string {
-  return session ? escrowHolderFor(session) : HOUSE_HOLDER;
-}
+const LEGACY_STAKE_HOLDER = HOUSE_HOLDER;
 
 /** 1v1 PvP ゲームが受け取る interaction（/勝負 直叩き or 再戦ボタン経由） */
 export type PvpInteraction = ChatInputCommandInteraction | ButtonInteraction;
@@ -200,7 +200,7 @@ export function settlePvp(
   }
 
   // 旧方式（session なし・レガシー呼び出し互換）: house から直接動かす
-  const src = stakeHolder(undefined);
+  const src = LEGACY_STAKE_HOLDER;
   return services.ether.runGroup(
     { groupKey: `pvp:settle:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
     () => {
@@ -250,7 +250,7 @@ export function settleProportional(
   }
 
   // 旧方式（session なし）
-  const src = stakeHolder(undefined);
+  const src = LEGACY_STAKE_HOLDER;
   services.ether.runGroup(
     { groupKey: `pvp:settle_proportional:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
     () => {

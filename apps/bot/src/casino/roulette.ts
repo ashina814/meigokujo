@@ -12,7 +12,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import { ROULETTE_PAYOUTS as CORE_ROULETTE_PAYOUTS, ROULETTE_SLOTS, rouletteSpin } from "@meigokujo/core";
+import { ROULETTE_PAYOUTS as CORE_ROULETTE_PAYOUTS, rouletteSpin } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
@@ -289,7 +289,6 @@ export async function playRoulette(
     await sleep(1800);
 
     // 抽選も core モデルの rouletteSpin() を使う（37 マス構成が単一の真実源）
-    void ROULETTE_SLOTS;
     // 1回転ぶんを1グループで精算。1人でも払えなければ回転ごと巻き戻る
     let spin: RouletteSpinRecord;
     try {
