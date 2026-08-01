@@ -16,7 +16,7 @@ import { handlePassportCommand } from "./commands/passport.js";
 import { handleBanzukeCommand } from "./commands/banzuke.js";
 import { handleShobuCommand } from "./commands/shobu.js";
 import { handleBakutenButton, handleBakutenCommand, handleBakutenSelect } from "./commands/bakuten.js";
-import { handleStocksButton, handleStocksCommand, handleStocksModal, handleStocksSelect } from "./commands/stocks.js";
+import { replyStocksPaused } from "./casino/stocks-pause.js";
 import { handleKeibaCommand } from "./commands/keiba.js";
 import { handleAnnaiButton, handleAnnaiCommand } from "./commands/annai.js";
 import { handleVipButton, handleVipCommand } from "./commands/vip.js";
@@ -194,7 +194,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await handleBakutenCommand(interaction, services);
           return;
         case "株":
-          await handleStocksCommand(interaction, services);
+          await replyStocksPaused(interaction);
           return;
         case "競馬":
           await handleKeibaCommand(interaction, services);
@@ -288,7 +288,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("stocks:")) {
-      await handleStocksSelect(interaction, services);
+      await replyStocksPaused(interaction);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("pkr:")) {
@@ -308,7 +308,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("stocks:")) {
-      await handleStocksModal(interaction, services);
+      await replyStocksPaused(interaction);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {
@@ -372,7 +372,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
       if (interaction.customId.startsWith("stocks:")) {
-        await handleStocksButton(interaction, services);
+        await replyStocksPaused(interaction);
         return;
       }
       if (interaction.customId.startsWith("annai:")) {

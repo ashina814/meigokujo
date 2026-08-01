@@ -99,11 +99,13 @@ function renderHome(userId: string, services: Services, serverName?: string) {
   ].join("\n");
 
   const economyValue = [
-    `📈 \`/株\` — 6銘柄・1時間毎更新・3日保有上限`,
     `🏇 \`/競馬\` — 冥馬6頭・単勝/複勝パリミュチュエル`,
     `📋 \`/板\` — 何でも賭けられる公開市場`,
     `✨ \`/流れ星\` — 1日5回の占い（初回無料）`,
     `${E.jp} \`/vip\` — 月額${fmtEther(services.vip.price())} で賭け上限×${services.vip.betCapMult()}`,
+    // 株は停止中（PR6・正本 §1.3）。導線からは外すが、持っている建玉には触れていないので
+    // 「消えた」と誤解されないよう1行だけ残す
+    `🚫 \`/株\` — **停止中**（持っている株はそのまま。扱いが決まったら知らせる）`,
   ].join("\n");
 
   const detailValue = [
