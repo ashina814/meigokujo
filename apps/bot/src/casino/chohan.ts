@@ -54,7 +54,7 @@ export async function playChohan(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * 2);
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, Math.ceil(betRaw * CHOHAN_PAYOUT));
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {

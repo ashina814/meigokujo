@@ -19,6 +19,8 @@ import {
   SLOTS_SCATTER_TRIGGER_COUNT as SCATTER_TRIGGER_COUNT,
   slotsSpinReel as spinReel,
   slotsEvaluate as evaluate,
+  SLOT_MAX_PAYOUT_MULT,
+  slotsJackpotCutFor as jackpotCutFor,
   type PendingFreeSpinRow,
   type SlotSymbol,
 } from "@meigokujo/core";
@@ -40,7 +42,8 @@ import { broadcastBigWin } from "./bigwin.js";
  * RTP 計算・回帰テストは packages/core/tests/casino-slots-rtp.test.ts を見る。
  */
 
-const MAX_MULTIPLIER = 100; // マモン³=100倍。テーブルリミット判定用
+/** テーブルリミット判定用の最大払戻倍率。配当表（core）から導く（写さない・PR4） */
+const MAX_MULTIPLIER = SLOT_MAX_PAYOUT_MULT;
 
 const CYCLE = ["🦇", "👻", "🔥", "⚔️", "👑", "😈", "🌙", "✨"] as const;
 const cycleAt = (n: number) => CYCLE[n % CYCLE.length]!;
@@ -284,7 +287,8 @@ export function spinPaid(services: Services, uid: string, bet: number, interacti
     (): SpinRecord => {
       const reelsRaw: [SlotSymbol, SlotSymbol, SlotSymbol] = [spinReel(rng), spinReel(rng), spinReel(rng)];
       const spin = evaluate(reelsRaw, bet);
-      const jpCut = Math.max(1, Math.floor(bet * JP_CONTRIBUTION));
+      // 積立額は core の単一定義から取る（債務モデルが予約するのと同じ関数・PR4）
+      const jpCut = jackpotCutFor(bet);
 
       const settledInGroup = services.casino.settleSolo(uid, "スロット", bet, spin.payout, {
         operationId: `${interactionId}:paid`,

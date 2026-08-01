@@ -9,7 +9,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import type { CasinoRng } from "@meigokujo/core";
+import { BLACKJACK_MAX_PAYOUT_MULT, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
@@ -23,7 +23,8 @@ import { broadcastBigWin } from "./bigwin.js";
  * - ヒット / スタンド / ダブル（最初の2枚のみ・賭け倍増）
  * - 結果画面に「最低/前回/最大/配当表/退席」ボタン
  */
-const MAX_MULT = 4; // ダブル後の勝ち = 4×初期賭け
+/** ダブル後の勝ち = 4×初期賭け。core の債務モデルと同じ定数を読む（PR4） */
+const MAX_MULT = BLACKJACK_MAX_PAYOUT_MULT;
 
 interface Card {
   rank: string;

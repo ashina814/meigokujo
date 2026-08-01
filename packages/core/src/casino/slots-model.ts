@@ -68,6 +68,12 @@ export const DOUBLE_PAYOUTS: Readonly<Record<string, number>> = {
   マモン: 10,
 };
 
+/**
+ * 1スピンの最大払戻倍率（元金込み）。配当表から導く（写さない）。
+ * 胴元債務モデル（`liability.ts`）と bot 側のテーブルリミット判定が読む。
+ */
+export const SLOT_MAX_PAYOUT_MULT = Math.max(...Object.values(TRIPLE_PAYOUTS), ...Object.values(DOUBLE_PAYOUTS));
+
 /** JP 積立率（毎ベットの何%を JP プールへ回すか）。積立源は胴元の取り分から */
 export const JP_CONTRIBUTION = 0.01;
 /** JP 当選時に払い出す割合（残りは次回シードとして残す） */
