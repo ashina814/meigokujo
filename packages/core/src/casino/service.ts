@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherError, EtherExchange, HOUSE_HOLDER } from "./exchange.js";
@@ -152,17 +153,21 @@ export class Casino {
     bet: number,
     payout: number,
     jackpotCut = 0,
-    opts: { chain?: boolean; fuku?: boolean } = {},
+    opts: { chain?: boolean; fuku?: boolean; groupKey?: string } = {},
   ): SettleResult {
     if (!Number.isInteger(bet) || bet <= 0) throw new EtherError("ERR_BAD_AMOUNT", { bet });
     if (!Number.isInteger(payout) || payout < 0) throw new EtherError("ERR_BAD_AMOUNT", { payout });
     const useChain = opts.chain ?? true;
     const useFuku = opts.fuku ?? true;
-    return this.db.transaction((): SettleResult => {
+    const move = { game, sessionId: null };
+    // 1ゲームの精算をひとまとまりの業務操作として記録する。呼び出し側が冪等キーを
+    // 持っていればそれを使う（同じゲームの二重精算をDB側で防げる）
+    const groupKey = opts.groupKey ?? `solo:${game}:${userId}:${randomUUID()}`;
+    return this.ether.runGroup({ groupKey, kind: "solo_game", actorId: userId }, (): SettleResult => {
       // 徴収
-      this.ether.transfer(userId, HOUSE_HOLDER, bet);
+      this.ether.transfer(userId, HOUSE_HOLDER, bet, { ...move, reason: "賭け金" });
       // 配当
-      if (payout > 0) this.ether.transfer(HOUSE_HOLDER, userId, payout);
+      if (payout > 0) this.ether.transfer(HOUSE_HOLDER, userId, payout, { ...move, reason: "配当" });
 
       const won = payout > bet;
       // 連鎖ボーナス: 「この勝ちで何連勝目か」= 現在の連勝 + 1（recordResult 前に読む）
@@ -176,7 +181,7 @@ export class Casino {
         chainMult = c.mult;
         chainLabel = c.label;
         chainBonus = Math.min(Math.floor(payout * (c.mult - 1)), this.ether.balanceOf(HOUSE_HOLDER));
-        if (chainBonus > 0) this.ether.transfer(HOUSE_HOLDER, userId, chainBonus);
+        if (chainBonus > 0) this.ether.transfer(HOUSE_HOLDER, userId, chainBonus, { ...move, reason: "連鎖ボーナス" });
       }
 
       // 福の重み: 勝ち利益（チェーン込み）への累進奉納。半分JP・半分救済
@@ -187,36 +192,39 @@ export class Casino {
         fukuTax = Math.floor((payout - bet + chainBonus) * rate);
         if (fukuTax > 0) {
           const half = Math.floor(fukuTax / 2);
-          if (half > 0) this.ether.transfer(userId, JACKPOT_HOLDER, half);
-          if (fukuTax - half > 0) this.ether.transfer(userId, RELIEF_HOLDER, fukuTax - half);
+          if (half > 0) this.ether.transfer(userId, JACKPOT_HOLDER, half, { ...move, reason: "福の重み（JP積立）" });
+          if (fukuTax - half > 0) {
+            this.ether.transfer(userId, RELIEF_HOLDER, fukuTax - half, { ...move, reason: "福の重み（救済積立）" });
+          }
         }
       }
 
       // JP積立（胴元から）
       if (jackpotCut > 0 && this.ether.balanceOf(HOUSE_HOLDER) >= jackpotCut) {
-        this.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, jackpotCut);
+        this.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, jackpotCut, { ...move, reason: "JP積立" });
       }
       const effectivePayout = payout + chainBonus - fukuTax;
       const net = effectivePayout - bet;
       this.recordResult(userId, bet, payout);
       this.events.log("casino_game", { actor: userId, payload: { game, bet, payout: effectivePayout, net, chainBonus, fukuTax } });
       return { wagered: bet, payout: effectivePayout, net, chainBonus, chainStreak, chainMult, chainLabel, fukuTax, fukuRate: rate };
-    })();
+    });
   }
 
   /**
    * ジャックポット払い出し（当選）。
    * @param share 取れる割合（既定 1 = 全額。スロットは 0.5 = 半分獲得・半分シード残留）
    */
-  seizeJackpot(userId: string, game: string, share = 1): number {
-    return this.db.transaction((): number => {
+  seizeJackpot(userId: string, game: string, share = 1, groupKey?: string): number {
+    const key = groupKey ?? `jackpot:${game}:${userId}:${randomUUID()}`;
+    return this.ether.runGroup({ groupKey: key, kind: "solo_game", actorId: userId }, (): number => {
       const pool = this.jackpotPool();
       const amount = Math.floor(pool * Math.min(1, Math.max(0, share)));
       if (amount <= 0) return 0;
-      this.ether.transfer(JACKPOT_HOLDER, userId, amount);
+      this.ether.transfer(JACKPOT_HOLDER, userId, amount, { game, reason: "ジャックポット当選" });
       this.events.log("casino_jackpot", { actor: userId, payload: { game, amount, poolBefore: pool } });
       return amount;
-    })();
+    });
   }
 
   /** 戦績更新。payout > bet で勝ち、payout < bet で負け、同額はノーカウント（引き分け） */

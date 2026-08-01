@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherExchange, HOUSE_HOLDER } from "./exchange.js";
@@ -112,19 +113,23 @@ export class Daily {
     const held = this.ether.balanceOf(userId);
     const reliefEligible = held <= this.reliefThreshold();
 
-    return this.db.transaction((): DailyClaimResult => {
+    // 1日1回なので「その日の受け取り」を冪等キーにできる
+    const groupKey = `daily:${userId}:${Math.floor(t / DAY_SEC)}:${randomUUID()}`;
+    return this.ether.runGroup({ groupKey, kind: "daily", actorId: userId }, (): DailyClaimResult => {
       // 基本 + streak 分は胴元から。胴元不足なら救済プールから振替
       const wanted = base + streakBonus;
       const houseHas = this.ether.balanceOf(HOUSE_HOLDER);
       const fromHouse = Math.min(wanted, houseHas);
-      if (fromHouse > 0) this.ether.transfer(HOUSE_HOLDER, userId, fromHouse);
+      if (fromHouse > 0) this.ether.transfer(HOUSE_HOLDER, userId, fromHouse, { reason: "福分け（胴元）" });
       const shortfall = wanted - fromHouse;
       const fromReliefForBase = Math.min(shortfall, this.ether.balanceOf(RELIEF_HOLDER));
-      if (fromReliefForBase > 0) this.ether.transfer(RELIEF_HOLDER, userId, fromReliefForBase);
+      if (fromReliefForBase > 0) {
+        this.ether.transfer(RELIEF_HOLDER, userId, fromReliefForBase, { reason: "福分け（救済プール）" });
+      }
 
       // 救済ボーナスは追加で救済プールから（base 振替後の残高で再計算しないと透支で claim 全体が失敗する）
       const relief = reliefEligible ? Math.min(this.reliefMax(), this.ether.balanceOf(RELIEF_HOLDER)) : 0;
-      if (relief > 0) this.ether.transfer(RELIEF_HOLDER, userId, relief);
+      if (relief > 0) this.ether.transfer(RELIEF_HOLDER, userId, relief, { reason: "福分けの救済ボーナス" });
 
       const total = fromHouse + fromReliefForBase + relief;
       this.db
@@ -146,6 +151,6 @@ export class Daily {
           isConsecutive,
         },
       };
-    })();
+    });
   }
 }

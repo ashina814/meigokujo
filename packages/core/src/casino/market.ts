@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherExchange, HOUSE_HOLDER } from "./exchange.js";
@@ -299,8 +300,12 @@ export class Markets {
     }
     const t = now();
     const deadline = t + input.durationMin * 60;
-    return this.db.transaction((): Market => {
-      if (fee > 0) this.ether.transfer(input.creatorId, JACKPOT_HOLDER, fee);
+    return this.ether.runGroup(
+      { groupKey: `market:create:${input.creatorId}:${randomUUID()}`, kind: "market_bet", actorId: input.creatorId },
+      (): Market => {
+      if (fee > 0) {
+        this.ether.transfer(input.creatorId, JACKPOT_HOLDER, fee, { reason: "板の開設手数料", game: "market" });
+      }
       // 新規板は必ず fund_mode='escrow'（賭け金を escrow:market:<id> に分離する）
       const info = this.db
         .prepare(
@@ -314,7 +319,7 @@ export class Markets {
         payload: { id, title: input.title, options: input.options, deadline, payoutMode, fee },
       });
       return this.get(id)!;
-    })();
+    });
   }
 
   get(id: number): Market | undefined {
@@ -418,14 +423,16 @@ export class Markets {
       throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(userId), additionalRequired, amount, existingTotal });
     }
 
-    return this.db.transaction((): { previous: number | null; net: number } => {
+    return this.ether.runGroup(
+      { groupKey: `market:bet:${marketId}:${userId}:${randomUUID()}`, kind: "market_bet", actorId: userId },
+      (): { previous: number | null; net: number } => {
       if (existingTotal > 0) {
         // 張り直し: 既存分は escrow に入っているのでそこから返す（fund_mode='escrow' 確定済み）
-        this.ether.transfer(escHolder, userId, existingTotal);
+        this.ether.transfer(escHolder, userId, existingTotal, { reason: "板の賭け直しによる返金", game: "market", sessionId: `market:${marketId}` });
         this.db.prepare("DELETE FROM casino_market_bets WHERE market_id = ? AND user_id = ?").run(marketId, userId);
       }
       // 新規徴収は必ず板ごとの分離保有者へ（胴元の配当余力から切り離す）
-      this.ether.transfer(userId, escHolder, amount);
+      this.ether.transfer(userId, escHolder, amount, { reason: "板への賭け", game: "market", sessionId: `market:${marketId}` });
       this.db
         .prepare("INSERT INTO casino_market_bets (market_id, user_id, option_index, amount, created_at) VALUES (?, ?, ?, ?, ?)")
         .run(marketId, userId, optionIndex, amount, now());
@@ -434,7 +441,7 @@ export class Markets {
         payload: { marketId, optionIndex, amount, previous: existingTotal > 0 ? existingTotal : null },
       });
       return { previous: existingTotal > 0 ? existingTotal : null, net: amount - existingTotal };
-    })();
+    });
   }
 
   /**
@@ -558,13 +565,15 @@ export class Markets {
     const m = this.get(id);
     if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { id });
     if (m.status !== "disputed") throw new MarketError("ERR_NOT_DISPUTED", { status: m.status });
-    this.db.transaction(() => {
+    this.ether.runGroup({ groupKey: `market:void:${id}:${randomUUID()}`, kind: "market_settle", actorId: actor }, () => {
       const bets = this.bets(id);
       const pot = bets.reduce((s, b) => s + b.amount, 0);
       const src = this.fundHolder(m, pot);
-      for (const b of bets) this.ether.transfer(src, b.user_id, b.amount);
+      for (const b of bets) {
+          this.ether.transfer(src, b.user_id, b.amount, { reason: "板の返金", game: "market", sessionId: `market:${id}` });
+        }
       this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), id);
-    })();
+    });
     this.events.log("market_admin_void", { actor, payload: { id } });
   }
 
@@ -573,7 +582,9 @@ export class Markets {
    * approve 全員 / DISPUTE_WINDOW 経過 / adminResolve のいずれかから呼ばれる。
    */
   private settle(id: number): MarketSettleResult {
-    return this.db.transaction((): MarketSettleResult => {
+    return this.ether.runGroup(
+      { groupKey: `market:settle:${id}:${randomUUID()}`, kind: "market_settle", actorId: "system:market" },
+      (): MarketSettleResult => {
       const m = this.get(id)!;
       if (m.status !== "reported" || m.result_option == null) {
         return { id, pot: 0, houseCut: 0, distributable: 0, winnerCount: 0, payouts: [], mode: m.payout_mode, resultOption: m.result_option, void: true };
@@ -588,7 +599,9 @@ export class Markets {
 
       // 的中者なし → 全額返金 & void
       if (winners.length === 0) {
-        for (const b of bets) this.ether.transfer(src, b.user_id, b.amount);
+        for (const b of bets) {
+          this.ether.transfer(src, b.user_id, b.amount, { reason: "板の返金", game: "market", sessionId: `market:${id}` });
+        }
         this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), id);
         this.events.log("market_settle_void", { actor: "system", payload: { id, pot } });
         return { id, pot, houseCut: 0, distributable: 0, winnerCount: 0, payouts: [], mode: m.payout_mode, resultOption: m.result_option, void: true };
@@ -596,7 +609,9 @@ export class Markets {
 
       // 場代（勝者精算の前に JP へ抜く）
       const houseCut = Math.floor(pot * HOUSE_CUT);
-      if (houseCut > 0) this.ether.transfer(src, JACKPOT_HOLDER, houseCut);
+      if (houseCut > 0) {
+        this.ether.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "板の胴元取り分", game: "market", sessionId: `market:${id}` });
+      }
       const distributable = pot - houseCut;
 
       const payouts: Array<{ userId: string; amount: number }> = [];
@@ -607,7 +622,9 @@ export class Markets {
           const w = winners[i]!;
           const isLast = i === winners.length - 1;
           const share = isLast ? remaining : Math.floor((distributable * w.amount) / winnersPot);
-          if (share > 0) this.ether.transfer(src, w.user_id, share);
+          if (share > 0) {
+            this.ether.transfer(src, w.user_id, share, { reason: "板の配当", game: "market", sessionId: `market:${id}` });
+          }
           remaining -= share;
           payouts.push({ userId: w.user_id, amount: share });
         }
@@ -619,7 +636,9 @@ export class Markets {
         for (let i = 0; i < uniqueWinners.length; i++) {
           const uid = uniqueWinners[i]!;
           const share = i === 0 ? per + leftover : per;
-          if (share > 0) this.ether.transfer(src, uid, share);
+          if (share > 0) {
+            this.ether.transfer(src, uid, share, { reason: "板の配当", game: "market", sessionId: `market:${id}` });
+          }
           payouts.push({ userId: uid, amount: share });
         }
       }
@@ -640,7 +659,7 @@ export class Markets {
         resultOption: m.result_option,
         void: false,
       };
-    })();
+    });
   }
 
   /**
@@ -650,13 +669,15 @@ export class Markets {
     const m = this.get(id);
     if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { id });
     if (m.status === "settled" || m.status === "void") return;
-    this.db.transaction(() => {
+    this.ether.runGroup({ groupKey: `market:refund:${id}:${randomUUID()}`, kind: "market_settle", actorId: actor }, () => {
       const bets = this.bets(id);
       const pot = bets.reduce((s, b) => s + b.amount, 0);
       const src = this.fundHolder(m, pot);
-      for (const b of bets) this.ether.transfer(src, b.user_id, b.amount);
+      for (const b of bets) {
+          this.ether.transfer(src, b.user_id, b.amount, { reason: "板の返金", game: "market", sessionId: `market:${id}` });
+        }
       this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), id);
-    })();
+    });
     this.events.log("market_void", { actor, payload: { id } });
   }
 

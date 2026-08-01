@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -125,7 +126,9 @@ export function collectStakes(services: Services, userIds: string[], bet: number
     }
     return true;
   }
-  for (const u of userIds) services.ether.transfer(u, HOUSE_HOLDER, bet);
+  services.ether.runGroup({ groupKey: `pvp:collect:${game}:${randomUUID()}`, kind: "table_hold", actorId: "system:pvp" }, () => {
+    for (const u of userIds) services.ether.transfer(u, HOUSE_HOLDER, bet, { reason: "対人戦の賭け金", game });
+  });
   return true;
 }
 
@@ -135,7 +138,9 @@ export function refundAll(services: Services, userIds: string[], bet: number, se
     for (const u of userIds) services.escrow.refundOne(session, u);
     return;
   }
-  for (const u of userIds) services.ether.transfer(HOUSE_HOLDER, u, bet);
+  services.ether.runGroup({ groupKey: `pvp:refund:${randomUUID()}`, kind: "table_refund", actorId: "system:pvp" }, () => {
+    for (const u of userIds) services.ether.transfer(HOUSE_HOLDER, u, bet, { reason: "対人戦の不成立返金" });
+  });
 }
 
 /**
@@ -173,13 +178,18 @@ export function settlePvp(
 
   // 旧方式（session なし・レガシー呼び出し互換）: house から直接動かす
   const src = stakeHolder(undefined);
-  if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut);
-  if (winners.length === 0) return { payout: 0, houseCut };
-  const share = Math.floor(distributable / winners.length);
-  const remainder = distributable - share * winners.length;
-  for (const w of winners) services.ether.transfer(src, w, share);
-  if (remainder > 0) services.ether.transfer(src, winners[0]!, remainder);
-  return { payout: distributable, houseCut };
+  return services.ether.runGroup(
+    { groupKey: `pvp:settle:${randomUUID()}`, kind: "table_settle", actorId: "system:pvp" },
+    () => {
+      if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
+      if (winners.length === 0) return { payout: 0, houseCut };
+      const share = Math.floor(distributable / winners.length);
+      const remainder = distributable - share * winners.length;
+      for (const w of winners) services.ether.transfer(src, w, share, { reason: "対人戦の配当" });
+      if (remainder > 0) services.ether.transfer(src, winners[0]!, remainder, { reason: "対人戦の配当（端数）" });
+      return { payout: distributable, houseCut };
+    },
+  );
 }
 
 /**
@@ -217,15 +227,20 @@ export function settleProportional(
 
   // 旧方式（session なし）
   const src = stakeHolder(undefined);
-  if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut);
-  let remaining = distributable;
-  for (let i = 0; i < winners.length; i++) {
-    const w = winners[i]!;
-    const isLast = i === winners.length - 1;
-    const share = isLast ? remaining : Math.floor((distributable * w.bet) / winnerPot);
-    if (share > 0) services.ether.transfer(src, w.userId, share);
-    remaining -= share;
-  }
+  services.ether.runGroup(
+    { groupKey: `pvp:settle_proportional:${randomUUID()}`, kind: "table_settle", actorId: "system:pvp" },
+    () => {
+      if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
+      let remaining = distributable;
+      for (let i = 0; i < winners.length; i++) {
+        const w = winners[i]!;
+        const isLast = i === winners.length - 1;
+        const share = isLast ? remaining : Math.floor((distributable * w.bet) / winnerPot);
+        if (share > 0) services.ether.transfer(src, w.userId, share, { reason: "対人戦の比例配当" });
+        remaining -= share;
+      }
+    },
+  );
   return { totalHouseCut: houseCut };
 }
 

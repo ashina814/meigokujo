@@ -22,6 +22,7 @@ import {
   Shop,
   EtherExchange,
   Casino,
+  ChipTx,
   Daily,
   Items,
   Stocks,
@@ -81,9 +82,16 @@ export function buildServices() {
   const shop = new Shop(db, ledger, events, {
     roleCheck: (memberRoleIds, requireRoleId) => meetsRoleRequirement(settings, memberRoleIds, requireRoleId),
   });
+  // 賭場の取引監査。全サービスで同じインスタンスを共有する（実行中グループを共有するため）
+  const chipTx = new ChipTx(db);
   const ether = new EtherExchange(db, ledger, events, {
     baseRate: () => settings.getNumber("ether_rate_base"),
+    chipTx,
   });
+  // 監査の出発点。導入時のチップ残高を一度だけ開始残高として記録する
+  if (chipTx.captureLegacyOpening()) {
+    console.log("[賭場] 取引監査の開始残高を記録しました（legacy_pre_reset）");
+  }
   const casino = new Casino(db, ether, events, {
     fukuScale: () => settings.getNumber("ether_fuku_scale"),
   });
@@ -141,7 +149,7 @@ export function buildServices() {
   const takutate = new Takutate(db, events);
   // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, escrow, takutate, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, escrow, takutate, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;

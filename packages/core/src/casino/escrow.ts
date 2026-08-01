@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherError, EtherExchange } from "./exchange.js";
@@ -87,15 +88,15 @@ export class Escrow {
     if (this.ether.balanceOf(userId) < amount) return false;
     const holder = escrowHolderFor(sessionId);
     try {
-      this.db.transaction(() => {
-        this.ether.transfer(userId, holder, amount);
+      this.ether.runGroup({ groupKey: `escrow:hold:${sessionId}:${userId}:${randomUUID()}`, kind: "table_hold", actorId: userId }, () => {
+        this.ether.transfer(userId, holder, amount, { reason: "卓への預託", game, sessionId });
         this.db
           .prepare(
             `INSERT INTO casino_escrow (session_id, user_id, amount, game, source, created_at) VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(session_id, user_id) DO UPDATE SET amount = amount + excluded.amount, source = excluded.source`,
           )
           .run(sessionId, userId, amount, game, holder, now());
-      })();
+      });
       return true;
     } catch (e) {
       if (e instanceof EtherError) return false;
@@ -128,9 +129,12 @@ export class Escrow {
    * 精算配分: 保有者から任意の宛先に額を移す（呼び出し側は帳簿上の精算計算に責任を持つ）。
    * 残高不足なら例外。呼び出し側で poolOf() を守れば起きない。
    */
-  payout(sessionId: string, toHolderId: string, amount: number): void {
+  payout(sessionId: string, toHolderId: string, amount: number, reason = "卓の配分"): void {
     if (amount <= 0) return;
-    this.ether.transfer(this.holderId(sessionId), toHolderId, amount);
+    this.ether.runGroup(
+      { groupKey: `escrow:payout:${sessionId}:${randomUUID()}`, kind: "table_settle", actorId: "system:escrow" },
+      () => this.ether.transfer(this.holderId(sessionId), toHolderId, amount, { reason, sessionId }),
+    );
   }
 
   /**
@@ -188,11 +192,13 @@ export class Escrow {
       );
     }
 
-    return this.db.transaction(() => {
+    return this.ether.runGroup(
+      { groupKey: `escrow:settle:${sessionId}:${randomUUID()}`, kind: "table_settle", actorId: actor },
+      () => {
       for (let i = 0; i < positive.length; i++) {
         const d = positive[i]!;
         _beforeStep?.(i, d);
-        this.ether.transfer(holder, d.to, d.amount);
+        this.ether.transfer(holder, d.to, d.amount, { reason: d.reason ?? reason, sessionId });
       }
       // 帳簿削除は最後（送金が全部通ってから）
       this.db.prepare("DELETE FROM casino_escrow WHERE session_id = ?").run(sessionId);
@@ -206,33 +212,38 @@ export class Escrow {
         },
       });
       return { paid: total, sessionId };
-    })();
+    });
   }
 
   /** セッションの全員に預かり額を返金して記録を消す。返金した人数を返す */
   refund(sessionId: string): number {
-    return this.db.transaction((): number => {
-      const rows = this.list(sessionId);
-      for (const r of rows) {
-        // 保有者から返す（旧行は source='house' → house から返金 = 旧挙動互換）
-        this.ether.transfer(r.source, r.user_id, r.amount);
-      }
-      this.clear(sessionId);
-      return rows.length;
-    })();
+    return this.ether.runGroup(
+      { groupKey: `escrow:refund:${sessionId}:${randomUUID()}`, kind: "table_refund", actorId: "system:escrow" },
+      (): number => {
+        const rows = this.list(sessionId);
+        for (const r of rows) {
+          // 保有者から返す（旧行は source='house' → house から返金 = 旧挙動互換）
+          this.ether.transfer(r.source, r.user_id, r.amount, { reason: "卓の返金", sessionId, game: r.game });
+        }
+        this.clear(sessionId);
+        return rows.length;
+      },
+    );
   }
 
   /** 1人だけ返金して記録を消す（ロビー離脱）。記録が無ければ false */
   refundOne(sessionId: string, userId: string): boolean {
-    return this.db.transaction((): boolean => {
+    return this.ether.runGroup(
+      { groupKey: `escrow:refund_one:${sessionId}:${userId}:${randomUUID()}`, kind: "table_refund", actorId: userId },
+      (): boolean => {
       const row = this.db
         .prepare("SELECT * FROM casino_escrow WHERE session_id = ? AND user_id = ?")
         .get(sessionId, userId) as EscrowRow | undefined;
       if (!row) return false;
-      this.ether.transfer(row.source, userId, row.amount);
+      this.ether.transfer(row.source, userId, row.amount, { reason: "離脱による返金", sessionId, game: row.game });
       this.db.prepare("DELETE FROM casino_escrow WHERE session_id = ? AND user_id = ?").run(sessionId, userId);
       return true;
-    })();
+    });
   }
 
   /**
@@ -279,7 +290,7 @@ export class Escrow {
       const expected = rows.reduce((s, r) => s + r.amount, 0);
       const holder = escrowHolderFor(sid);
       try {
-        this.db.transaction(() => {
+        this.ether.runGroup({ groupKey: `escrow:sweep:${sid}:${randomUUID()}`, kind: "table_refund", actorId: actor }, () => {
           // 新方式（source が session 専用保有者）は「保有者残高 == 帳簿合計」を厳格検証。
           // legacy（source='house'）は house が混在勘定なので個別検証できず、そのまま house から返金。
           const sources = new Set(rows.map((r) => r.source));
@@ -290,9 +301,11 @@ export class Escrow {
               throw new Error(`escrow mismatch: ledger=${expected} holder=${actual}`);
             }
           }
-          for (const r of rows) this.ether.transfer(r.source, r.user_id, r.amount);
+          for (const r of rows) {
+            this.ether.transfer(r.source, r.user_id, r.amount, { reason: "起動時の未精算返金", sessionId: sid, game: r.game });
+          }
           this.db.prepare("DELETE FROM casino_escrow WHERE session_id = ?").run(sid);
-        })();
+        });
         refundedSessions++;
         refundedUsers += rows.length;
         refundedTotal += expected;
@@ -356,9 +369,10 @@ export class Escrow {
       if (bal > 0) {
         // 孤児1件ずつ独立トランザクションで隔離（1件失敗が他を止めない）
         try {
-          this.db.transaction(() => {
-            this.ether.transfer(h.user_id, ESCROW_QUARANTINE, bal);
-          })();
+          this.ether.runGroup(
+            { groupKey: `escrow:quarantine:${h.user_id}:${detectedAt}`, kind: "table_refund", actorId: actor },
+            () => this.ether.transfer(h.user_id, ESCROW_QUARANTINE, bal, { reason: "孤児残高の隔離" }),
+          );
           orphanTotal += bal;
           this.events.log("casino_escrow_orphan", {
             actor,
@@ -411,7 +425,10 @@ export class Escrow {
    */
   releaseFromQuarantine(destHolderId: string, amount: number, actor: string, reason: string): void {
     if (amount <= 0) return;
-    this.ether.transfer(ESCROW_QUARANTINE, destHolderId, amount);
+    this.ether.runGroup(
+      { groupKey: `escrow:quarantine_release:${destHolderId}:${randomUUID()}`, kind: "table_refund", actorId: actor },
+      () => this.ether.transfer(ESCROW_QUARANTINE, destHolderId, amount, { reason: `隔離解除: ${reason}` }),
+    );
     this.events.log("casino_escrow_quarantine_release", {
       actor,
       payload: { dest: destHolderId, amount, reason },

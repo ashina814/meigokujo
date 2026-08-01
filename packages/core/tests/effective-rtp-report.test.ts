@@ -1,3 +1,4 @@
+import { testTransfer } from "./helpers/chip-ctx.js";
 import { beforeEach, describe, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
@@ -66,8 +67,8 @@ function setup(seedHouseEther = 50_000_000, seedPlayerEther = 5_000_000): Ctx {
 /** プレイヤー残高を fuku しきい値未満（<100,000 ether）に維持しつつ N 回プレイ */
 function keepLowBalance(ctx: Ctx) {
   const bal = ctx.ether.balanceOf("a");
-  if (bal < 5_000) ctx.ether.transfer(HOUSE_HOLDER, "a", 50_000);
-  if (bal > 90_000) ctx.ether.transfer("a", HOUSE_HOLDER, bal - 50_000);
+  if (bal < 5_000) testTransfer(ctx.ether, HOUSE_HOLDER, "a", 50_000);
+  if (bal > 90_000) testTransfer(ctx.ether, "a", HOUSE_HOLDER, bal - 50_000);
 }
 
 /** 実測 RTP を計算するヘルパ。settle の payout を集計 */
@@ -219,12 +220,12 @@ describe("実効 RTP レポート（Casino.settle 経由）", () => {
       if (i % 2 === 0) {
         ctx.items.grant("a", "omamori", 1);
         ctx.items.arm("a", "omamori");
-        ctx.ether.transfer("a", HOUSE_HOLDER, 4_000);
+        testTransfer(ctx.ether, "a", HOUSE_HOLDER, 4_000);
         houseFromItems += 4_000;
       } else {
         ctx.items.grant("a", "hoken", 1);
         ctx.items.arm("a", "hoken");
-        ctx.ether.transfer("a", HOUSE_HOLDER, 3_000);
+        testTransfer(ctx.ether, "a", HOUSE_HOLDER, 3_000);
         houseFromItems += 3_000;
       }
       // 勝率 50% 想定（rng でシミュ）

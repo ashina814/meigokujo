@@ -1,3 +1,4 @@
+import { testTransfer } from "./helpers/chip-ctx.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
@@ -94,7 +95,7 @@ describe("エテル為替", () => {
     ctx.ether.buy("a", 10_000, key());
     const outstanding0 = ctx.ether.outstanding();
     const pool0 = ctx.ether.pool();
-    ctx.ether.transfer("a", "house", 30_000);
+    testTransfer(ctx.ether, "a", "house", 30_000);
     expect(ctx.ether.balanceOf("a")).toBe(70_000);
     expect(ctx.ether.balanceOf("house")).toBe(30_000);
     expect(ctx.ether.outstanding()).toBe(outstanding0);
@@ -104,7 +105,7 @@ describe("エテル為替", () => {
   it("保有超の換金・移動は弾く", () => {
     ctx.ether.buy("a", 10_000, key());
     expect(() => ctx.ether.sell("a", 999_999_999, key())).toThrow(EtherError);
-    expect(() => ctx.ether.transfer("a", "b", 999_999_999)).toThrow(EtherError);
+    expect(() => testTransfer(ctx.ether, "a", "b", 999_999_999)).toThrow(EtherError);
   });
 
   it("胴元の元手と売上精算はフェアレートで損得ゼロ往復", () => {
@@ -128,7 +129,7 @@ describe("エテル為替", () => {
 
   it("胴元収益のスプレッド付き精算（redeemToAccount）は8割着地・1割焼却", () => {
     ctx.ether.buy("a", 10_000, key()); // プレイヤーが入場
-    ctx.ether.transfer("a", "house", 50_000); // 胴元が勝った体
+    testTransfer(ctx.ether, "a", "house", 50_000); // 胴元が勝った体
     ctx.departments.upsert("賭博場", "賭博場", null);
     const dept = deptAccount("賭博場");
     const q = ctx.ether.redeemToAccount("house", 50_000, dept, "system:test", key());

@@ -162,7 +162,21 @@ export {
   type EtherQuote,
   type EtherErrorCode,
   type EtherExchangeOptions,
+  type ChipMoveInfo,
 } from "./casino/exchange.js";
+export {
+  ChipTx,
+  ChipTxError,
+  CHIP_OPENING_VERSION_KEY,
+  LEGACY_OPENING_VERSION,
+  type ChipTxKind,
+  type ChipMove,
+  type ChipGroupInput,
+  type ChipGroupRow,
+  type ChipTxRow,
+  type ChipBalanceMismatch,
+  type ChipTxErrorCode,
+} from "./casino/chip-tx.js";
 export { Casino, JACKPOT_HOLDER, RELIEF_HOLDER, CHAIN_TIERS, chainMultiplier, fukuRate, type CasinoStatsRow, type SettleResult, type CasinoOptions } from "./casino/service.js";
 export { Daily, type DailyClaim, type DailyClaimResult, type DailyOptions } from "./casino/daily.js";
 export { Items, CONSUMABLES, getConsumableDef, type ItemKind as CasinoItemKind, type ConsumableDef, type ArmResult } from "./casino/items.js";

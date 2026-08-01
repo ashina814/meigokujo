@@ -1,3 +1,4 @@
+import { testTransfer } from "./helpers/chip-ctx.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
@@ -100,7 +101,7 @@ describe("福の重み（fuku）", () => {
     const ctx = setup();
     // b の残高を 100,000 未満まで減らす（fuku scale=10, しきい値100,000）
     // 初期 500,000 → 401,000 を house に送って残 99,000
-    ctx.ether.transfer("b", HOUSE_HOLDER, 401_000);
+    testTransfer(ctx.ether, "b", HOUSE_HOLDER, 401_000);
     const jp0 = ctx.ether.balanceOf(JACKPOT_HOLDER);
     // bet 1000, payout 3000 → 純益 +2000。b の勝ち後残高 = 99,000 - 1000 + 3000 = 101,000
     // しきい値 100,000 を超えるので 5% 帯。奉納が発生してしまう。
@@ -316,11 +317,11 @@ describe("お守り裁定シミュレーション（buy-if-not-armed 戦略を�
     for (let i = 0; i < N; i++) {
       if (ctx.ether.balanceOf("a") < bet + price + 1_000) {
         // テスト継続のための補充（RTP 計算には含めない）
-        ctx.ether.transfer(HOUSE_HOLDER, "a", 50_000_000 - ctx.ether.balanceOf("a"));
+        testTransfer(ctx.ether, HOUSE_HOLDER, "a", 50_000_000 - ctx.ether.balanceOf("a"));
       }
       // 未装備のときだけ購入＋装備（ALREADY_ARMED の場合は買わない）
       if (!ctx.items.isArmed("a", amuletKey)) {
-        ctx.ether.transfer("a", HOUSE_HOLDER, price);
+        testTransfer(ctx.ether, "a", HOUSE_HOLDER, price);
         ctx.items.grant("a", amuletKey, 1);
         const armRes = ctx.items.arm("a", amuletKey);
         if (!armRes.ok) throw new Error(`arm failed unexpectedly: ${JSON.stringify(armRes)}`);
@@ -388,10 +389,10 @@ describe("お守り裁定シミュレーション（buy-if-not-armed 戦略を�
     const N = 5_000;
     for (let i = 0; i < N; i++) {
       if (ctx.ether.balanceOf("a") < bet + price + 1_000) {
-        ctx.ether.transfer(HOUSE_HOLDER, "a", 50_000_000 - ctx.ether.balanceOf("a"));
+        testTransfer(ctx.ether, HOUSE_HOLDER, "a", 50_000_000 - ctx.ether.balanceOf("a"));
       }
       if (!ctx.items.isArmed("a", "hoken")) {
-        ctx.ether.transfer("a", HOUSE_HOLDER, price);
+        testTransfer(ctx.ether, "a", HOUSE_HOLDER, price);
         ctx.items.grant("a", "hoken", 1);
         const armRes = ctx.items.arm("a", "hoken");
         expect(armRes.ok).toBe(true); // 未装備なので必ず成功

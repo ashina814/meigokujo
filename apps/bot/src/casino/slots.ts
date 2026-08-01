@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -188,7 +189,10 @@ async function runOne(
   if (isFreeSpin) {
     // フリースピンは配当のみ（賭けなし）。settle は使わず胴元→プレイヤーの直接転送
     if (adjustedPayout > 0 && services.casino.canAccept(adjustedPayout)) {
-      services.ether.transfer("house", uid, adjustedPayout);
+      services.ether.runGroup(
+        { groupKey: `slots:free_spin:${uid}:${randomUUID()}`, kind: "solo_game", actorId: uid },
+        () => services.ether.transfer("house", uid, adjustedPayout, { reason: "フリースピンの配当", game: "スロット" }),
+      );
     }
   } else {
     settled = services.casino.settle(uid, "スロット", bet, adjustedPayout, jpCut);

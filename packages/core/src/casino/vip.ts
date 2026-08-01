@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherExchange, HOUSE_HOLDER } from "./exchange.js";
@@ -77,8 +78,8 @@ export class Vip {
   join(userId: string): VipJoinResult {
     const price = this.price();
     if (this.ether.balanceOf(userId) < price) return { ok: false, reason: "INSUFFICIENT_ETHER" };
-    return this.db.transaction((): VipJoinResult => {
-      this.ether.transfer(userId, HOUSE_HOLDER, price);
+    return this.ether.runGroup({ groupKey: `vip:${userId}:${randomUUID()}`, kind: "vip", actorId: userId }, (): VipJoinResult => {
+      this.ether.transfer(userId, HOUSE_HOLDER, price, { reason: "VIP加入" });
       const t = now();
       const current = this.expiresAt(userId);
       const base = current > t ? current : t;
@@ -91,7 +92,7 @@ export class Vip {
         .run(userId, newExpires);
       this.events.log("casino_vip_join", { actor: userId, payload: { price, days: this.days(), expiresAt: newExpires, extension: current > t } });
       return { ok: true, expiresAt: newExpires, wasExtension: current > t };
-    })();
+    });
   }
 
   /** 期限切れの一覧（bot 側でロール剥奪用） */

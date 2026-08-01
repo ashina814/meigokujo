@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -398,7 +399,10 @@ async function runRound(
     const extraNeeded = (Math.abs(mul) - 1) * bet;
     if (held >= bet + extraNeeded) {
       services.casino.settle(uid, "チンチロ", bet, 0);
-      services.ether.transfer(uid, HOUSE_HOLDER, extraNeeded);
+      services.ether.runGroup(
+        { groupKey: `chinchiro:extra:${uid}:${randomUUID()}`, kind: "solo_game", actorId: uid },
+        () => services.ether.transfer(uid, HOUSE_HOLDER, extraNeeded, { reason: "倍付け負けの追加徴収", game: "チンチロ" }),
+      );
       const totalLoss = bet + extraNeeded;
       netForDisplay = -totalLoss;
       payoutText = `💀 -${fmtEther(totalLoss)}（${Math.abs(mul)}倍負け）`;

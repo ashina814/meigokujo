@@ -411,6 +411,54 @@ CREATE TABLE IF NOT EXISTS ether_balances (
   updated_at INTEGER NOT NULL
 );
 
+-- 賭場チップの取引監査（大型UPD PR1）。チップ残高は現在値しか持たないので、
+-- 「業務操作の単位(group)」と「その中の1移動(tx)」を追記し、開始残高から再現できるようにする。
+CREATE TABLE IF NOT EXISTS casino_tx_groups (
+  group_key    TEXT PRIMARY KEY,                 -- 業務操作の冪等キー
+  kind         TEXT NOT NULL,                    -- solo_game / table_settle / deposit など
+  status       TEXT NOT NULL CHECK (status IN ('settled','failed')),
+  actor_id     TEXT NOT NULL,
+  result_json  TEXT,                             -- 二度目の呼び出しへ返す結果
+  created_at   INTEGER NOT NULL,
+  settled_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_casino_tx_groups_kind ON casino_tx_groups(kind, created_at);
+
+CREATE TABLE IF NOT EXISTS casino_tx (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_key    TEXT NOT NULL REFERENCES casino_tx_groups(group_key),
+  seq          INTEGER NOT NULL,
+  tx_kind      TEXT NOT NULL CHECK (tx_kind IN ('internal_transfer','deposit','redeem')),
+  from_holder  TEXT,
+  to_holder    TEXT,
+  amount       INTEGER NOT NULL CHECK (amount > 0),
+  reason       TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+  game         TEXT,
+  session_id   TEXT,
+  actor_id     TEXT NOT NULL,
+  ledger_tx_id INTEGER REFERENCES transactions(id),
+  created_at   INTEGER NOT NULL,
+  -- 内部移動は両側必須でLand取引を伴わない。預入は発行、返還は消却
+  CHECK (
+    (tx_kind = 'internal_transfer' AND from_holder IS NOT NULL AND to_holder IS NOT NULL AND ledger_tx_id IS NULL)
+    OR (tx_kind = 'deposit' AND from_holder IS NULL AND to_holder IS NOT NULL AND ledger_tx_id IS NOT NULL)
+    OR (tx_kind = 'redeem' AND from_holder IS NOT NULL AND to_holder IS NULL AND ledger_tx_id IS NOT NULL)
+  ),
+  UNIQUE (group_key, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_casino_tx_group ON casino_tx(group_key, seq);
+CREATE INDEX IF NOT EXISTS idx_casino_tx_from ON casino_tx(from_holder, id);
+CREATE INDEX IF NOT EXISTS idx_casino_tx_to ON casino_tx(to_holder, id);
+
+-- 検算の出発点。ここに載せた版の残高 + casino_tx = 現在残高 になる
+CREATE TABLE IF NOT EXISTS casino_chip_opening_balances (
+  opening_version TEXT NOT NULL,
+  holder          TEXT NOT NULL,
+  amount          INTEGER NOT NULL CHECK (amount >= 0),
+  created_at      INTEGER NOT NULL,
+  PRIMARY KEY (opening_version, holder)
+);
+
 CREATE TABLE IF NOT EXISTS shop_items (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   name              TEXT NOT NULL,

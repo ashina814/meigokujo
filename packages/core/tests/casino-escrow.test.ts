@@ -1,3 +1,4 @@
+import { testTransfer } from "./helpers/chip-ctx.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
@@ -96,7 +97,7 @@ describe("エスクロー資金分離", () => {
     ctx.escrow.hold("ok2", "b", 2_000, "duel");
     // 破損セッション: 帳簿は 5,000 だが保有者残高を人為的にずらす
     ctx.escrow.hold("broken", "a", 5_000, "duel");
-    ctx.ether.transfer(escrowHolderFor("broken"), HOUSE_HOLDER, 1_000); // 保有者 4,000 != 帳簿 5,000
+    testTransfer(ctx.ether, escrowHolderFor("broken"), HOUSE_HOLDER, 1_000); // 保有者 4,000 != 帳簿 5,000
     const beforeA = ctx.ether.balanceOf("a");
     const beforeB = ctx.ether.balanceOf("b");
 
@@ -367,7 +368,7 @@ describe("Markets: 資金分離と精算", () => {
     expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(0);
     // 人為的に残高を戻す（精算バグ or 手動介入で発生し得る孤児）
     // fund で人為的に注入
-    ctx.ether.transfer(HOUSE_HOLDER, marketEscrowHolder(m.id), 500);
+    testTransfer(ctx.ether, HOUSE_HOLDER, marketEscrowHolder(m.id), 500);
     expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(500);
     // sweep で隔離に移る（house 直行ではない）
     const r = ctx.escrow.sweepAll("test:startup");
@@ -403,7 +404,7 @@ describe("Markets: 資金分離と精算", () => {
     });
     ctx.markets.bet(m.id, "a", 0, 3_000);
     // エスクローを完全に空にする（残高から旧方式と誤認させようとする攻撃/バグ）
-    ctx.ether.transfer(marketEscrowHolder(m.id), HOUSE_HOLDER, 3_000);
+    testTransfer(ctx.ether, marketEscrowHolder(m.id), HOUSE_HOLDER, 3_000);
     expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(0);
     const houseBefore = ctx.ether.balanceOf(HOUSE_HOLDER);
     // fund_mode='escrow' なので escrow=0 でも house にフォールバックしない → 例外（underfunded）
@@ -418,7 +419,7 @@ describe("Markets: 資金分離と精算", () => {
       guildId: "g", creatorId: "a", title: "T", options: ["○", "×"], durationMin: 10, fee: 0,
     });
     ctx.markets.bet(m.id, "a", 0, 3_000);
-    ctx.ether.transfer(marketEscrowHolder(m.id), HOUSE_HOLDER, 1_000); // 残 2000 < pot 3000
+    testTransfer(ctx.ether, marketEscrowHolder(m.id), HOUSE_HOLDER, 1_000); // 残 2000 < pot 3000
     expect(() => ctx.markets.refund(m.id, "test")).toThrowError(/ERR_UNDERFUNDED_ESCROW/);
     expect(ctx.markets.get(m.id)!.status).toBe("open");
   });
@@ -428,7 +429,7 @@ describe("Markets: 資金分離と精算", () => {
       guildId: "g", creatorId: "a", title: "T", options: ["○", "×"], durationMin: 10, fee: 0,
     });
     ctx.markets.bet(m.id, "a", 0, 3_000);
-    ctx.ether.transfer(HOUSE_HOLDER, marketEscrowHolder(m.id), 500); // 残 3500 > pot 3000
+    testTransfer(ctx.ether, HOUSE_HOLDER, marketEscrowHolder(m.id), 500); // 残 3500 > pot 3000
     expect(() => ctx.markets.refund(m.id, "test")).toThrowError(/ERR_ESCROW_MISMATCH/);
     expect(ctx.markets.get(m.id)!.status).toBe("open");
   });
@@ -441,7 +442,7 @@ describe("Markets: 資金分離と精算", () => {
     // DB を直接いじって legacy_house 化 + escrow 分を house に移す（分離前データを再現）
     ctx.markets.bet(m.id, "a", 0, 3_000);
     ctx.db.prepare("UPDATE casino_markets SET fund_mode='legacy_house' WHERE id=?").run(m.id);
-    ctx.ether.transfer(marketEscrowHolder(m.id), HOUSE_HOLDER, 3_000); // escrow 0, house に元本
+    testTransfer(ctx.ether, marketEscrowHolder(m.id), HOUSE_HOLDER, 3_000); // escrow 0, house に元本
     const beforeA = ctx.ether.balanceOf("a");
     // legacy_house かつ escrow=0 なので house から返金できる
     ctx.markets.refund(m.id, "test");
@@ -467,7 +468,7 @@ describe("Markets: 資金分離と精算", () => {
     ctx.markets.bet(m1.id, "a", 0, 1_000);
     ctx.markets.bet(m2.id, "b", 0, 2_000);
     // m1 を意図的に underfunded にする
-    ctx.ether.transfer(marketEscrowHolder(m1.id), HOUSE_HOLDER, 500);
+    testTransfer(ctx.ether, marketEscrowHolder(m1.id), HOUSE_HOLDER, 500);
     const beforeB = ctx.ether.balanceOf("b");
     const r = ctx.markets.refundAllPending("test:startup");
     // m2 は返金成功、m1 は失敗 → frozen
@@ -493,7 +494,7 @@ describe("Markets: 資金分離と精算", () => {
       ctx.markets.bet(ok.id, "a", 0, 1_000);
       ctx.markets.bet(bad.id, "b", 0, 2_000);
       // bad を underfunded に
-      ctx.ether.transfer(marketEscrowHolder(bad.id), HOUSE_HOLDER, 500);
+      testTransfer(ctx.ether, marketEscrowHolder(bad.id), HOUSE_HOLDER, 500);
       const houseBefore = ctx.ether.balanceOf(HOUSE_HOLDER);
       const beforeA = ctx.ether.balanceOf("a");
 
@@ -526,7 +527,7 @@ describe("Markets: 資金分離と精算", () => {
       const m = ctx.markets.create({ guildId: "g", creatorId: "a", title: "F", options: ["A", "B"], durationMin: 60, fee: 0 });
       ctx.markets.bet(m.id, "a", 0, 3_000);
       // 起動時以外で escrow を破損させる
-      ctx.ether.transfer(marketEscrowHolder(m.id), HOUSE_HOLDER, 1_000); // 残 2000 != pot 3000
+      testTransfer(ctx.ether, marketEscrowHolder(m.id), HOUSE_HOLDER, 1_000); // 残 2000 != pot 3000
       const beforeB = ctx.ether.balanceOf("b");
       const houseBefore = ctx.ether.balanceOf(HOUSE_HOLDER);
       // 別ユーザー b が新規ベットしようとすると、資金整合ガードで frozen + 例外
@@ -555,10 +556,10 @@ describe("Markets: 資金分離と精算", () => {
       const m = ctx.markets.create({ guildId: "g", creatorId: "a", title: "F", options: ["A", "B"], durationMin: 60, fee: 0 });
       ctx.markets.bet(m.id, "a", 0, 3_000);
       // 破損 → frozen
-      ctx.ether.transfer(marketEscrowHolder(m.id), HOUSE_HOLDER, 1_000);
+      testTransfer(ctx.ether, marketEscrowHolder(m.id), HOUSE_HOLDER, 1_000);
       ctx.db.prepare("UPDATE casino_markets SET status='frozen' WHERE id=?").run(m.id);
       // 運営が原因調査の上、escrow を pot(3000) に補正
-      ctx.ether.transfer(HOUSE_HOLDER, marketEscrowHolder(m.id), 1_000);
+      testTransfer(ctx.ether, HOUSE_HOLDER, marketEscrowHolder(m.id), 1_000);
       expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(3_000);
       const beforeA = ctx.ether.balanceOf("a");
       // 補正後は返金できる（fundHolder が balance===pot を満たす）

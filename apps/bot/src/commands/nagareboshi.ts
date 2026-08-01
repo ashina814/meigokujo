@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   EmbedBuilder,
   MessageFlags,
@@ -165,7 +166,12 @@ export async function handleNagareboshiCommand(
     });
     return;
   }
-  if (fee > 0) services.ether.transfer(uid, HOUSE_HOLDER, fee);
+  if (fee > 0) {
+    services.ether.runGroup(
+      { groupKey: `nagareboshi:fee:${uid}:${randomUUID()}`, kind: "solo_game", actorId: uid },
+      () => services.ether.transfer(uid, HOUSE_HOLDER, fee, { reason: "流れ星の祈り代", game: "流れ星" }),
+    );
+  }
   incCount(services, uid, day);
 
   const outcome = pickOutcome(services);
@@ -176,7 +182,10 @@ export async function handleNagareboshiCommand(
     // JPプールが満額に届かなくても、有るだけ払う（流れ星を空砲にしない）
     const paid = Math.min(outcome.reward, jpPool);
     if (paid > 0) {
-      services.ether.transfer(JACKPOT_HOLDER, uid, paid);
+      services.ether.runGroup(
+        { groupKey: `nagareboshi:reward:${uid}:${randomUUID()}`, kind: "solo_game", actorId: uid },
+        () => services.ether.transfer(JACKPOT_HOLDER, uid, paid, { reason: "流れ星の褒賞", game: "流れ星" }),
+      );
       rewardLine = `\n\n💰 **+${fmtEther(paid)}**（JPプールから${paid < outcome.reward ? "・プール残が少なく減額" : ""}）`;
     } else {
       rewardLine = "\n\n……が、JPプールが空だった。マモンが気まずそうに目を逸らす。";
