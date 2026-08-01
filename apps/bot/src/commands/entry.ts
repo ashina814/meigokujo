@@ -1,5 +1,6 @@
 import {
   ActionRowBuilder,
+  type AutocompleteInteraction,
   ButtonBuilder,
   ButtonInteraction,
   ButtonStyle,
@@ -425,8 +426,8 @@ export const sessionCommand = new SlashCommandBuilder()
 
 /** 審判を使えるのは 運営 / 面接担当 / 魔剣士 / 審 のいずれか */
 const JUDGE_ROLE_KINDS = ["judge", "judge_lead", "judge_extra"] as const;
-function isJudge(
-  interaction: ChatInputCommandInteraction | ButtonInteraction | UserSelectMenuInteraction,
+export function isJudge(
+  interaction: ChatInputCommandInteraction | ButtonInteraction | UserSelectMenuInteraction | AutocompleteInteraction,
   services: Services,
 ): boolean {
   if (isAdmin(interaction, services)) return true;

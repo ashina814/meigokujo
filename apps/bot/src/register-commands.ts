@@ -4,6 +4,7 @@ import { adminCommand } from "./commands/admin-hub.js";
 import { shokanCommand } from "./commands/shokan.js";
 import { transferCommand } from "./commands/transfer.js";
 import { sessionCommand } from "./commands/entry.js";
+import { sessionScheduleCommand } from "./commands/session-schedule.js";
 import { evaluationCommand } from "./commands/evaluation.js";
 import { profileCommand } from "./commands/profile.js";
 import { departmentCommand } from "./commands/department.js";
@@ -33,6 +34,7 @@ const commands = [
   shokanCommand.toJSON(),
   // スタッフ（役職ゲート）
   sessionCommand.toJSON(),
+  sessionScheduleCommand.toJSON(),
   evaluationCommand.toJSON(),
   // 全員
   transferCommand.toJSON(),

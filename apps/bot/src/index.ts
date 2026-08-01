@@ -37,6 +37,10 @@ import {
   handleSessionCommand,
   handleVoiceAttendance,
 } from "./commands/entry.js";
+import {
+  handleSessionScheduleAutocomplete,
+  handleSessionScheduleCommand,
+} from "./commands/session-schedule.js";
 import { handleTicketButton } from "./commands/ticket-handler-safe.js";
 import {
   handleConfessionButton,
@@ -130,6 +134,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (interaction.options.getSubcommand() === "昇格") await handlePromote(interaction, services);
           else await handleSessionCommand(interaction, services);
           return;
+        case "説明会":
+          await handleSessionScheduleCommand(interaction, services);
+          return;
         case "評価":
           await handleEvaluationCommand(interaction, services);
           return;
@@ -187,6 +194,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isAutocomplete()) {
       if (interaction.commandName === "部署") {
         await handleDepartmentAutocomplete(interaction, services);
+      } else if (interaction.commandName === "説明会") {
+        await handleSessionScheduleAutocomplete(interaction, services);
       }
       return;
     }
