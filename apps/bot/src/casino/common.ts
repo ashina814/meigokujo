@@ -78,6 +78,40 @@ export async function validateBet(
   return { ok: true, bet };
 }
 
+/** リトライ操作を受け付けなかった理由（`checkRetry` の返り値） */
+export type RetryDenial =
+  | { ok: true; bet: number }
+  | { ok: false; reason: string };
+
+/**
+ * 「もう一回」ボタンの受付判定（PR3）。
+ *
+ * 以前は各ゲームが `if (retryBet < MIN_BET || retryBet > MAX_BET) return;` と
+ * **何も言わずに return** していた。コレクタは既に停止しているので、押した側からは
+ * ボタンが死んだようにしか見えない。断るなら理由を出す。
+ *
+ * 上限は `MAX_BET` ではなく `effectiveMaxBet`（VIPなら×2）で見る。
+ * ここを固定値にしていると、VIP が上限いっぱいで遊んだ直後の「もう一回」だけが弾かれる。
+ */
+export function checkRetry(services: Services, userId: string, betRaw: number): RetryDenial {
+  const bet = Number(betRaw);
+  const cap = effectiveMaxBet(services, userId);
+  if (!Number.isInteger(bet) || bet < MIN_BET || bet > cap) {
+    return {
+      ok: false,
+      reason: `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
+    };
+  }
+  const held = services.ether.balanceOf(userId);
+  if (held < bet) {
+    return { ok: false, reason: `${Mammon.broke()}（所持 ${fmtEther(held)} / 必要 ${fmtEther(bet)}）` };
+  }
+  return { ok: true, bet };
+}
+
+/** 席が取れなかったときの理由文（同時プレイ防止に弾かれたことを黙らせない） */
+export const SEAT_BUSY_REASON = "まだ前の勝負が終わっていない。少し待ってからもう一度。";
+
 /**
  * 勝敗リザルトの共通embed（洗練版）。
  * - Author: 「マモンの賭場 · {ゲーム名}」

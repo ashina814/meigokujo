@@ -1,6 +1,6 @@
 import { SlashCommandBuilder, type ChatInputCommandInteraction } from "discord.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET } from "../casino/common.js";
+import { MIN_BET } from "../casino/common.js";
 import { playChohanMulti } from "../casino/chohan-multi.js";
 import { playChinchiroDuel } from "../casino/chinchiro-duel.js";
 import { playBjDuel } from "../casino/bj-duel.js";
@@ -11,6 +11,9 @@ import { playPokerDuel } from "../casino/poker-duel.js";
 /**
  * /勝負 — マモンの賭場の対人ゲーム集約コマンド。
  * ソロは /遊ぶ、対人は /勝負 の2本立て（casino-bot の方針を踏襲）。
+ *
+ * `setMaxValue` を付けない理由は /遊ぶ と同じ（PR3）。上限は `validateBet()` が
+ * 利用者ごとに判定する（VIP は ×2）。
  */
 export const shobuCommand = new SlashCommandBuilder()
   .setName("勝負")
@@ -25,7 +28,7 @@ export const shobuCommand = new SlashCommandBuilder()
       .setDescription("🎲 対戦チンチロ（1v1・両者振って自動判定）")
       .addUserOption((o) => o.setName("相手").setDescription("挑戦相手").setRequired(true))
       .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるエテル（同額）").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
+        o.setName("賭け").setDescription("賭けるエテル（同額）").setRequired(true).setMinValue(MIN_BET),
       ),
   )
   .addSubcommand((sub) =>
@@ -34,7 +37,7 @@ export const shobuCommand = new SlashCommandBuilder()
       .setDescription("🃏 BJデュエル（1v1・交互ヒットで21勝負）")
       .addUserOption((o) => o.setName("相手").setDescription("挑戦相手").setRequired(true))
       .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるエテル（同額）").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
+        o.setName("賭け").setDescription("賭けるエテル（同額）").setRequired(true).setMinValue(MIN_BET),
       ),
   )
   .addSubcommand((sub) =>
@@ -43,7 +46,7 @@ export const shobuCommand = new SlashCommandBuilder()
       .setDescription("⚔ サシ勝負（1v1・50/50 の一発勝負）")
       .addUserOption((o) => o.setName("相手").setDescription("挑戦相手").setRequired(true))
       .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるエテル（同額）").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
+        o.setName("賭け").setDescription("賭けるエテル（同額）").setRequired(true).setMinValue(MIN_BET),
       ),
   )
   .addSubcommand((sub) =>
@@ -52,7 +55,7 @@ export const shobuCommand = new SlashCommandBuilder()
       .setDescription("🃏 インディアンポーカー（1v1・自分の手だけ見えない心理戦）")
       .addUserOption((o) => o.setName("相手").setDescription("挑戦相手").setRequired(true))
       .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるエテル（同額）").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
+        o.setName("賭け").setDescription("賭けるエテル（同額）").setRequired(true).setMinValue(MIN_BET),
       ),
   )
   .addSubcommand((sub) =>
@@ -60,7 +63,7 @@ export const shobuCommand = new SlashCommandBuilder()
       .setName("ポーカー")
       .setDescription("🃏 5枚交換ポーカー（相手指定でサシ・未指定でオープン募集）")
       .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるエテル（参加者全員同額）").setRequired(true).setMinValue(MIN_BET).setMaxValue(MAX_BET),
+        o.setName("賭け").setDescription("賭けるエテル（参加者全員同額）").setRequired(true).setMinValue(MIN_BET),
       )
       .addUserOption((o) => o.setName("相手").setDescription("相手指定でサシ（未指定なら誰でも参加できるオープン）").setRequired(false)),
   );

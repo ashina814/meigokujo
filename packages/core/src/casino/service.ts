@@ -57,7 +57,10 @@ export interface CasinoStatsRow {
   wins: number;
   losses: number;
   total_wagered: number;
+  /** 勝った回の純益の総和（Σ max(0, payout − bet)） */
   total_earned: number;
+  /** 負けた回の純損の総和（Σ max(0, bet − payout)）。通算損益は total_earned − total_lost */
+  total_lost: number;
   biggest_win: number;
   current_win_streak: number;
   best_win_streak: number;
@@ -140,6 +143,7 @@ export class Casino {
         losses              INTEGER NOT NULL DEFAULT 0,
         total_wagered       INTEGER NOT NULL DEFAULT 0,
         total_earned        INTEGER NOT NULL DEFAULT 0,
+        total_lost          INTEGER NOT NULL DEFAULT 0,
         biggest_win         INTEGER NOT NULL DEFAULT 0,
         current_win_streak  INTEGER NOT NULL DEFAULT 0,
         best_win_streak     INTEGER NOT NULL DEFAULT 0,
@@ -147,6 +151,14 @@ export class Casino {
         updated_at          INTEGER NOT NULL
       );
     `);
+    // 既存DBへの追加（PR3）。通算損益は total_earned − total_lost で出す。
+    // 以前は total_earned − total_wagered で出していたが、total_earned が
+    // 「勝ちの純益」なのに total_wagered が「勝ち負け問わぬ賭け総額」なので、
+    // 勝った回の賭け額を二重に引いていた（負けが実際より大きく見える）。
+    const cols = this.db.prepare("PRAGMA table_info(casino_stats)").all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "total_lost")) {
+      this.db.exec("ALTER TABLE casino_stats ADD COLUMN total_lost INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   /** 胴元のエテル残高（＝配当余力） */
@@ -313,6 +325,7 @@ export class Casino {
     const win = payout > bet ? 1 : 0;
     const loss = payout < bet ? 1 : 0;
     const netWin = Math.max(0, payout - bet);
+    const netLoss = Math.max(0, bet - payout);
     this.db
       .prepare(
         `UPDATE casino_stats SET
@@ -321,13 +334,14 @@ export class Casino {
            losses = losses + ?,
            total_wagered = total_wagered + ?,
            total_earned = total_earned + ?,
+           total_lost = total_lost + ?,
            biggest_win = MAX(biggest_win, ?),
            current_win_streak = CASE WHEN ? = 1 THEN current_win_streak + 1 WHEN ? = 1 THEN 0 ELSE current_win_streak END,
            current_lose_streak = CASE WHEN ? = 1 THEN current_lose_streak + 1 WHEN ? = 1 THEN 0 ELSE current_lose_streak END,
            updated_at = ?
          WHERE user_id = ?`,
       )
-      .run(win, loss, bet, netWin, netWin, win, loss, loss, win, ts, userId);
+      .run(win, loss, bet, netWin, netLoss, netWin, win, loss, loss, win, ts, userId);
     this.db
       .prepare("UPDATE casino_stats SET best_win_streak = MAX(best_win_streak, current_win_streak) WHERE user_id = ?")
       .run(userId);
@@ -343,6 +357,7 @@ export class Casino {
         losses: 0,
         total_wagered: 0,
         total_earned: 0,
+        total_lost: 0,
         biggest_win: 0,
         current_win_streak: 0,
         best_win_streak: 0,
