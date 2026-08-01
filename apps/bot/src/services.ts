@@ -21,7 +21,10 @@ import {
   BumpCounter,
   Shop,
   EtherExchange,
+  ETHER_ESCROW,
   Casino,
+  CasinoStatus,
+  CasinoIntegrity,
   ChipTx,
   Daily,
   Items,
@@ -88,10 +91,14 @@ export function buildServices() {
     baseRate: () => settings.getNumber("ether_rate_base"),
     chipTx,
   });
-  // 監査の出発点。導入時のチップ残高を一度だけ開始残高として記録する
-  if (chipTx.captureLegacyOpening()) {
+  // 監査の出発点。導入時のチップ残高と準備プールを一度だけ開始値として記録する
+  if (chipTx.captureLegacyOpening(ledger.balanceOf(ETHER_ESCROW))) {
     console.log("[賭場] 取引監査の開始残高を記録しました（legacy_pre_reset）");
   }
+  // 賭場の稼働状態。ここから点検が終わるまで「点検中」にしておく
+  // （人が止めている状態（改装中・手動停止・検算停止・開業初期化）は上書きしない）
+  const casinoStatus = new CasinoStatus(db);
+  casinoStatus.beginStartupCheck();
   // お守りは精算と同じグループで消費する（Casino.settleSolo）。そのため casino より先に作る
   const items = new Items(db);
   const casino = new Casino(db, ether, events, {
@@ -149,12 +156,38 @@ export function buildServices() {
     );
   }
   const takutate = new Takutate(db, events);
+  // 賭場の検算A〜D。掃除が終わった後の状態で点検する（掃除自体が資金を動かすため）
+  const casinoIntegrity = new CasinoIntegrity(db, ledger, ether, escrow);
+  runCasinoStartupCheck(casinoStatus, casinoIntegrity);
   // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, daily, items, stocks, vip, markets, escrow, takutate, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;
 }
 
 export type Services = ReturnType<typeof buildServices>;
+
+/**
+ * 起動時の点検（仕様書 S1〜S2 / 実装計画 PR2）。
+ *
+ * Land 台帳 → チップの検算A〜D の順に見る。1つでも NG なら賭場を `integrity_halt` にして、
+ * **人が解除するまで開かない**。点検を通ったときだけ `startup_check` を自動で解除する。
+ * 人が止めている状態（改装中・手動停止・開業初期化）はどちらの場合も触らない。
+ */
+function runCasinoStartupCheck(status: CasinoStatus, integrity: CasinoIntegrity): void {
+  const ledgerCheck = integrity.checkLedger();
+  const report = integrity.run();
+  if (!ledgerCheck.ok || !report.ok) {
+    const reason = [ledgerCheck.ok ? null : ledgerCheck.detail, report.ok ? null : CasinoIntegrity.describeFailure(report)]
+      .filter(Boolean)
+      .join(" / ");
+    status.haltForIntegrity(reason);
+    console.error(`[賭場] 起動時の検算に失敗したため賭場を停止しました: ${reason}`);
+    return;
+  }
+  if (status.finishStartupCheck()) {
+    console.log("[賭場] 起動時の検算A〜D は正常。営業を開けました");
+  }
+}

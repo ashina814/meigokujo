@@ -334,7 +334,7 @@ export class ChipTx {
    * 開始残高を保存する。同じ版で二度目は何もしない（戻り値 false）。
    * 「いまの残高を出発点にする」宣言なので、後から書き換えない。
    */
-  captureOpening(version: string, balances: Iterable<readonly [string, number]>): boolean {
+  captureOpening(version: string, balances: Iterable<readonly [string, number]>, poolLand?: number): boolean {
     const existing = this.db
       .prepare("SELECT COUNT(*) AS c FROM casino_chip_opening_versions WHERE opening_version = ?")
       .get(version) as { c: number };
@@ -358,10 +358,10 @@ export class ChipTx {
       const lastTx = (this.db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM casino_tx").get() as { id: number }).id;
       this.db
         .prepare(
-          `INSERT INTO casino_chip_opening_versions (opening_version, version_seq, from_tx_id, created_at)
-           VALUES (?, ?, ?, ?)`,
+          `INSERT INTO casino_chip_opening_versions (opening_version, version_seq, from_tx_id, pool_land, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
         )
-        .run(version, seq, lastTx, ts);
+        .run(version, seq, lastTx, poolLand ?? null, ts);
       setSetting.run(CHIP_OPENING_VERSION_KEY, version, ts);
       this.cachedVersion = version;
     })();
@@ -396,8 +396,11 @@ export class ChipTx {
     return rows.map((r) => ({ version: r.opening_version, seq: r.version_seq, fromTxId: r.from_tx_id }));
   }
 
-  /** PR1導入時の一度きりの記録。いまのチップ残高をそのまま開始残高にする */
-  captureLegacyOpening(): boolean {
+  /**
+   * PR1導入時の一度きりの記録。いまのチップ残高をそのまま開始残高にする。
+   * @param poolLand その時点の準備プールの Land（検算Bの出発点）。省略すると後から逆算される
+   */
+  captureLegacyOpening(poolLand?: number): boolean {
     const rows = this.db.prepare("SELECT user_id, amount FROM ether_balances ORDER BY user_id").all() as Array<{
       user_id: string;
       amount: number;
@@ -405,7 +408,43 @@ export class ChipTx {
     return this.captureOpening(
       LEGACY_OPENING_VERSION,
       rows.map((r) => [r.user_id, r.amount] as const),
+      poolLand,
     );
+  }
+
+  /** その版の開始プール（Land）。まだ確定していなければ null */
+  openingPoolLand(version = this.currentVersion()): number | null {
+    const row = this.db
+      .prepare("SELECT pool_land FROM casino_chip_opening_versions WHERE opening_version = ?")
+      .get(version) as { pool_land: number | null } | undefined;
+    return row?.pool_land ?? null;
+  }
+
+  /**
+   * 開始プールが未確定の版に、後から基準を1度だけ置く（検算Bの出発点の確定）。
+   * すでに入っていれば何もしない（後から書き換えない＝開始残高と同じ扱い）。
+   */
+  setOpeningPoolLand(version: string, poolLand: number): boolean {
+    const r = this.db
+      .prepare("UPDATE casino_chip_opening_versions SET pool_land = ? WHERE opening_version = ? AND pool_land IS NULL")
+      .run(poolLand, version);
+    return r.changes > 0;
+  }
+
+  /**
+   * その版の窓に属する預入・返還で動いた Land の差引（deposit − redeem）。
+   * 検算B（準備プールが記録どおりに動いたか）で使う。
+   */
+  landFlow(version = this.currentVersion()): { deposited: number; redeemed: number; net: number } {
+    const row = this.db
+      .prepare(
+        `SELECT
+           COALESCE(SUM(CASE WHEN tx_kind = 'deposit' THEN land_amount ELSE 0 END), 0) AS deposited,
+           COALESCE(SUM(CASE WHEN tx_kind = 'redeem'  THEN land_amount ELSE 0 END), 0) AS redeemed
+         FROM casino_tx WHERE opening_version = ? AND id > ?`,
+      )
+      .get(version, this.openingFromTxId(version)) as { deposited: number; redeemed: number };
+    return { deposited: row.deposited, redeemed: row.redeemed, net: row.deposited - row.redeemed };
   }
 
   openingBalances(version = this.currentVersion()): Map<string, number> {

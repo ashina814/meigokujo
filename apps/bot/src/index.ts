@@ -24,6 +24,7 @@ import { handleNagareboshiCommand } from "./commands/nagareboshi.js";
 import { handleItaButton, handleItaCommand, handleItaModal, handleItaSelect } from "./commands/ita.js";
 import { handleTakuButton, handleTakuVoiceUpdate, sweepStaleTables } from "./commands/takutate-panel.js";
 import { handlePokerDuelButton, handlePokerDuelSelect } from "./casino/poker-duel.js";
+import { denyIfCasinoClosed } from "./casino/gate.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -120,6 +121,8 @@ client.once(Events.ClientReady, (ready) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    // 賭場が停止していれば、チップを動かしうる操作はここで全部止める（理由付きで返す）
+    if (await denyIfCasinoClosed(interaction, services)) return;
     if (interaction.isChatInputCommand()) {
       switch (interaction.commandName) {
         case "管理":
