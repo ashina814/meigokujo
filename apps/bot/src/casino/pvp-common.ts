@@ -120,30 +120,44 @@ export function collectStakes(
   session?: string,
   game = "pvp",
 ): boolean {
-  const insufficient = userIds.find((u) => services.ether.balanceOf(u) < bet);
-  if (insufficient) return false;
-  if (session) {
-    const collected: string[] = [];
-    for (const u of userIds) {
-      if (!services.escrow.hold(session, u, bet, game, operationId)) {
-        // 徴収の巻き戻し。局面ごとに別の鍵を渡す（同じ卓で何度でも返金しうる）
-        for (const c of collected) services.escrow.refundOne(session, c, `${operationId}:rollback`);
-        return false;
-      }
-      collected.push(u);
-    }
-    return true;
+  // 新方式（session あり）: 事前の残高確認も含めて **全員ぶんで1グループ**。
+  // 途中で足りない人がいれば、先に取った人の分もグループごと巻き戻る
+  if (session) return services.escrow.holdAll(session, userIds, bet, game, operationId);
+
+  // 旧方式（session なし・レガシー呼び出し互換）: house へ直接。こちらも1グループ
+  try {
+    return services.ether.runGroup(
+      { groupKey: `pvp:collect:${game}:${operationId}`, kind: "table_hold", actorId: "system:pvp" },
+      (): boolean => {
+        // 残高確認もグループの中（徴収成功後の再試行を残高不足で false にしない）
+        for (const u of userIds) {
+          if (services.ether.balanceOf(u) < bet) throw new StakeShortfall();
+        }
+        for (const u of userIds) services.ether.transfer(u, HOUSE_HOLDER, bet, { reason: "対人戦の賭け金", game });
+        return true;
+      },
+    );
+  } catch (e) {
+    if (e instanceof StakeShortfall) return false;
+    throw e;
   }
-  services.ether.runGroup({ groupKey: `pvp:collect:${game}:${operationId}`, kind: "table_hold", actorId: "system:pvp" }, () => {
-    for (const u of userIds) services.ether.transfer(u, HOUSE_HOLDER, bet, { reason: "対人戦の賭け金", game });
-  });
-  return true;
 }
 
-/** 参加者に返金（勝負不成立時など）。session があれば台帳の預かり額で返して記録も消す */
+/** 誰かの残高が足りずに徴収を打ち切ったことを伝える内部例外（グループを巻き戻すため） */
+class StakeShortfall extends Error {
+  constructor() {
+    super("STAKE_SHORTFALL");
+    this.name = "StakeShortfall";
+  }
+}
+
+/**
+ * 参加者に返金（勝負不成立時など）。session があれば台帳の預かり額で返して記録も消す。
+ * **全員ぶんで1グループ**なので、途中で落ちれば誰にも返らない（＝同じ鍵で再試行できる）。
+ */
 export function refundAll(services: Services, userIds: string[], bet: number, operationId: string, session?: string): void {
   if (session) {
-    for (const u of userIds) services.escrow.refundOne(session, u, operationId);
+    services.escrow.refundMany(session, userIds, operationId);
     return;
   }
   services.ether.runGroup({ groupKey: `pvp:refund:${operationId}`, kind: "table_refund", actorId: "system:pvp" }, () => {

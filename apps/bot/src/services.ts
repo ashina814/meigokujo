@@ -92,15 +92,17 @@ export function buildServices() {
   if (chipTx.captureLegacyOpening()) {
     console.log("[賭場] 取引監査の開始残高を記録しました（legacy_pre_reset）");
   }
+  // お守りは精算と同じグループで消費する（Casino.settleSolo）。そのため casino より先に作る
+  const items = new Items(db);
   const casino = new Casino(db, ether, events, {
     fukuScale: () => settings.getNumber("ether_fuku_scale"),
+    items,
   });
   const daily = new Daily(db, ether, events, {
     base: () => settings.getNumber("daily_base"),
     reliefThreshold: () => settings.getNumber("daily_relief_threshold"),
     reliefMax: () => settings.getNumber("daily_relief_max"),
   });
-  const items = new Items(db);
   // Stocks の価格ランダムウォークは共通RNGを使う（テスト時は決定的にできる）
   const stocks = new Stocks(db, ether, events, { rng: defaultRng() });
   const vip = new Vip(db, ether, events, {

@@ -1,6 +1,8 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherError, EtherExchange, HOUSE_HOLDER } from "./exchange.js";
+import { ChipTxError } from "./chip-tx.js";
+import type { Items } from "./items.js";
 
 /**
  * マモンの賭場の共通土台。
@@ -96,12 +98,31 @@ export interface SettleResult {
 export interface CasinoOptions {
   /** 福の重みしきい値のスケール（既定10）。関数なら毎回評価 */
   fukuScale?: number | (() => number);
+  /**
+   * お守り（消耗品）。渡すと `settleSolo()` が精算と同じグループの中でお守りを消費する。
+   * 渡さない場合は「お守り無し」として扱う（テスト・移植前の経路）。
+   */
+  items?: Items;
+}
+
+/** ソロゲーム1回の結果。精算結果に「お守りが何をしたか」を添えたもの */
+export interface SoloRoundResult extends SettleResult {
+  /** お守り適用前の払戻総額（0=負け、bet=引き分け） */
+  rawPayout: number;
+  /** お守りが発動したときの表示文（未発動なら undefined） */
+  amuletNote?: string;
+}
+
+export interface SoloRoundOptions extends SettleOptions {
+  /** 賭け額のうちジャックポットへ積む額（スロット等） */
+  jackpotCut?: number;
 }
 
 const now = () => Math.floor(Date.now() / 1000);
 
 export class Casino {
   private readonly fukuScaleOpt: number | (() => number);
+  private readonly items?: Items;
 
   constructor(
     private readonly db: Database.Database,
@@ -110,6 +131,7 @@ export class Casino {
     options: CasinoOptions = {},
   ) {
     this.fukuScaleOpt = options.fukuScale ?? 10;
+    this.items = options.items;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS casino_stats (
         user_id             TEXT PRIMARY KEY,
@@ -220,6 +242,50 @@ export class Casino {
       this.events.log("casino_game", { actor: userId, payload: { game, bet, payout: effectivePayout, net, chainBonus, fukuTax } });
       return { wagered: bet, payout: effectivePayout, net, chainBonus, chainStreak, chainMult, chainLabel, fukuTax, fukuRate: rate };
     });
+  }
+
+  /**
+   * ソロゲーム1回の資金処理（**全ソロゲームの入口**）。
+   *
+   * お守りの消費・賭けの徴収・配当・戦績を**ひとつの業務グループ**で行う。
+   * お守りは DB 上の装備を消す副作用なので、精算より前に外で消費すると
+   * 「精算だけ落ちてお守りだけ消えた」状態が残る。同じグループに入れておけば
+   * 例外時にお守りも一緒に戻る。
+   *
+   * @param rawPayout お守り適用前の払戻総額（0=負け、bet=引き分け、>bet=勝ち）
+   */
+  settleSolo(userId: string, game: string, bet: number, rawPayout: number, opts: SoloRoundOptions): SoloRoundResult {
+    const groupKey = `solo:${game}:${userId}:${opts.operationId}`;
+    return this.ether.runGroup({ groupKey, kind: "solo_game", actorId: userId }, (): SoloRoundResult => {
+      const amulet = this.consumeAmulets(userId, bet, rawPayout);
+      // settle は同じキーで runGroup を呼ぶが、すでにこのグループの中なので合流する
+      const settled = this.settle(userId, game, bet, amulet.payout, opts.jackpotCut ?? 0, opts);
+      return { ...settled, rawPayout, ...(amulet.note ? { amuletNote: amulet.note } : {}) };
+    });
+  }
+
+  /**
+   * お守りの適用: 勝ちなら勝利ボーナス、負けなら返金保護。
+   *
+   * 装備の消費は DB を書き換える副作用なので、**必ず資金グループの中から呼ぶ**
+   * （外で消費すると、精算が落ちたときお守りだけ消える）。通常は `settleSolo()` 経由で、
+   * 賭けを伴わない払い出し（スロットのフリースピン等）だけ直接呼ぶ。
+   */
+  consumeAmulets(userId: string, bet: number, rawPayout: number): { payout: number; note?: string } {
+    if (!this.ether.chipTx.isActive()) {
+      throw new ChipTxError("ERR_NO_GROUP", { reason: "お守りの消費はグループの中で行う", userId });
+    }
+    const items = this.items;
+    if (!items) return { payout: rawPayout };
+    if (rawPayout > bet) {
+      const b = items.consumeWinBonus(userId, rawPayout, bet);
+      return b.bonus > 0 ? { payout: rawPayout + b.bonus, note: b.note } : { payout: rawPayout };
+    }
+    if (rawPayout < bet) {
+      const p = items.consumeLossProtection(userId, bet);
+      if (p.refund > 0) return { payout: p.refund, note: p.note };
+    }
+    return { payout: rawPayout };
   }
 
   /**

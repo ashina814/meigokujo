@@ -115,15 +115,25 @@ export async function handleBakutenSelect(
   }
 
   if (action === "buy") {
-    const held = services.ether.balanceOf(uid);
-    if (held < def.price) {
-      await interaction.reply({ content: `エテルが足りない（所持 ${fmtEther(held)} / 必要 ${fmtEther(def.price)}）。`, flags: MessageFlags.Ephemeral });
+    // 残高判定もグループの中。外でやると、購入成功後の再試行が
+    // 「保存済みの結果を返す」前に残高不足で弾かれる
+    const bought = services.ether.runGroup(
+      { groupKey: `shop:buy:${uid}:${def.key}:${interaction.id}`, kind: "shop", actorId: uid },
+      (): { ok: boolean; held: number } => {
+        const held = services.ether.balanceOf(uid);
+        if (held < def.price) return { ok: false, held };
+        services.ether.transfer(uid, HOUSE_HOLDER, def.price, { reason: `賭場商店での購入: ${def.key}` });
+        services.items.grant(uid, def.key, 1);
+        return { ok: true, held };
+      },
+    );
+    if (!bought.ok) {
+      await interaction.reply({
+        content: `エテルが足りない（所持 ${fmtEther(bought.held)} / 必要 ${fmtEther(def.price)}）。`,
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     }
-    services.ether.runGroup({ groupKey: `shop:buy:${uid}:${def.key}:${interaction.id}`, kind: "shop", actorId: uid }, () => {
-      services.ether.transfer(uid, HOUSE_HOLDER, def.price, { reason: `賭場商店での購入: ${def.key}` });
-      services.items.grant(uid, def.key, 1);
-    });
     await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents(services) });
     return;
   }

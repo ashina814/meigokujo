@@ -140,18 +140,27 @@ export class Stocks {
       if (!s) continue;
       const proceeds = Math.floor(s.price * h.shares * (1 - STOCK_SELL_FEE_RATE));
       // 保有行は売却で消えるので「いつ買った建玉か」で一意になる（再試行でも同じ値）
-      const sold = this.ether.runGroup(
-        { groupKey: `stock:force_sell:${h.user_id}:${h.stock_id}:${h.bought_at}`, kind: "shop", actorId: h.user_id },
-        () => {
-        // 胴元が払えないなら没収せず保留（次の tick で再試行）。株だけ消すと実質没収になる
-        if (this.ether.balanceOf(HOUSE_HOLDER) < proceeds) return false;
-        this.ether.transfer(HOUSE_HOLDER, h.user_id, proceeds, { reason: "株の期限到来による強制売却", game: "stocks" });
-        this.db
-          .prepare("UPDATE casino_holdings SET shares = 0, avg_cost = 0, bought_at = 0 WHERE user_id = ? AND stock_id = ?")
-          .run(h.user_id, h.stock_id);
-        return true;
-      });
-      if (!sold) continue;
+      try {
+        this.ether.runGroup(
+          { groupKey: `stock:force_sell:${h.user_id}:${h.stock_id}:${h.bought_at}`, kind: "shop", actorId: h.user_id },
+          () => {
+          // 胴元が払えないなら没収せず保留（次の tick で再試行）。株だけ消すと実質没収になる。
+          // ここは「false を保存して終わる」ではなく**例外でグループごと巻き戻す**。
+          // 保存してしまうと、以後この建玉は同じキーで永久に false が再生され、
+          // 胴元へ資金を入れても二度と売れなくなる
+          if (this.ether.balanceOf(HOUSE_HOLDER) < proceeds) {
+            throw new StockError("ERR_INSUFFICIENT_ETHER", { house: this.ether.balanceOf(HOUSE_HOLDER), proceeds });
+          }
+          this.ether.transfer(HOUSE_HOLDER, h.user_id, proceeds, { reason: "株の期限到来による強制売却", game: "stocks" });
+          this.db
+            .prepare("UPDATE casino_holdings SET shares = 0, avg_cost = 0, bought_at = 0 WHERE user_id = ? AND stock_id = ?")
+            .run(h.user_id, h.stock_id);
+        });
+      } catch (e) {
+        // 胴元不足は保留（グループも残っていないので次の tick で再試行できる）
+        if (e instanceof StockError && e.code === "ERR_INSUFFICIENT_ETHER") continue;
+        throw e;
+      }
       this.events.log("stock_force_sell", { actor: h.user_id, payload: { stockId: h.stock_id, shares: h.shares, proceeds } });
       results.push({ userId: h.user_id, stockId: h.stock_id, shares: h.shares, proceeds });
     }

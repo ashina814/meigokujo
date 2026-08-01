@@ -386,45 +386,49 @@ export class Markets {
    * これで起動時以外に資金不整合が生じても、追加利用者の資金を巻き込まない。
    */
   bet(marketId: number, userId: string, optionIndex: number, amount: number, operationId: string): { previous: number | null; net: number } {
+    // 引数の形だけ先に見る。板の状態・締切・既存 pot・エスクロー整合はすべてグループの中で見る
+    // （成功済みの操作を再試行したとき、保存済みの結果を返す前に「もう締切だ」で落とさないため）
     if (!Number.isInteger(amount) || amount <= 0) throw new MarketError("ERR_BAD_AMOUNT", { amount });
-    const m = this.get(marketId);
-    if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { marketId });
-    if (m.status !== "open") throw new MarketError("ERR_NOT_OPEN", { marketId, status: m.status });
-    if (m.deadline_at <= now()) throw new MarketError("ERR_NOT_OPEN", { marketId, deadline: m.deadline_at });
-    // 旧方式（legacy_house）や未知の fund_mode には新規ベットを受け付けない（escrow のみ）
-    if (m.fund_mode !== "escrow") throw new MarketError("ERR_LEGACY_BET_FORBIDDEN", { marketId, mode: m.fund_mode });
-    const options = JSON.parse(m.options_json) as string[];
-    if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= options.length) {
-      throw new MarketError("ERR_BAD_OPTION", { optionIndex, count: options.length });
-    }
-
-    // ── 資金整合ガード: escrow 残高 === 既存 pot（全ベット合計）を検証 ──
     const escHolder = marketEscrowHolder(marketId);
-    const existingPot = (
-      this.db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM casino_market_bets WHERE market_id = ?").get(marketId) as { s: number }
-    ).s;
-    if (existingPot > 0) {
-      const escBal = this.ether.balanceOf(escHolder);
-      if (escBal !== existingPot) {
-        // 不整合 → 市場を凍結し、資金を一切動かさず例外。監査ログに記録。
-        this.freeze(marketId, "system:bet-guard", "escrow_mismatch_on_bet", { existingPot, escrowBalance: escBal });
-        if (escBal < existingPot) {
-          throw new MarketError("ERR_UNDERFUNDED_ESCROW", { marketId, pot: existingPot, escrowBalance: escBal });
-        }
-        throw new MarketError("ERR_ESCROW_MISMATCH", { marketId, pot: existingPot, escrowBalance: escBal, mode: m.fund_mode });
+    let freezeRequest: { reason: string; meta: Record<string, unknown> } | null = null;
+    try {
+      return this.ether.runGroup(
+        { groupKey: `market:bet:${marketId}:${userId}:${operationId}`, kind: "market_bet", actorId: userId },
+        (): { previous: number | null; net: number } => {
+      const m = this.get(marketId);
+      if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { marketId });
+      if (m.status !== "open") throw new MarketError("ERR_NOT_OPEN", { marketId, status: m.status });
+      if (m.deadline_at <= now()) throw new MarketError("ERR_NOT_OPEN", { marketId, deadline: m.deadline_at });
+      // 旧方式（legacy_house）や未知の fund_mode には新規ベットを受け付けない（escrow のみ）
+      if (m.fund_mode !== "escrow") throw new MarketError("ERR_LEGACY_BET_FORBIDDEN", { marketId, mode: m.fund_mode });
+      const options = JSON.parse(m.options_json) as string[];
+      if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= options.length) {
+        throw new MarketError("ERR_BAD_OPTION", { optionIndex, count: options.length });
       }
-    }
 
-    const existingRows = this.db
-      .prepare("SELECT amount FROM casino_market_bets WHERE market_id = ? AND user_id = ?")
-      .all(marketId, userId) as Array<{ amount: number }>;
-    const existingTotal = existingRows.reduce((s, r) => s + r.amount, 0);
-    const additionalRequired = Math.max(0, amount - existingTotal);
+      // ── 資金整合ガード: escrow 残高 === 既存 pot（全ベット合計）を検証 ──
+      const existingPot = (
+        this.db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM casino_market_bets WHERE market_id = ?").get(marketId) as { s: number }
+      ).s;
+      if (existingPot > 0) {
+        const escBal = this.ether.balanceOf(escHolder);
+        if (escBal !== existingPot) {
+          // 不整合 → 資金を一切動かさず例外。凍結はグループの外で行う
+          //（グループの中で status を書いても、この例外で一緒に巻き戻ってしまう）
+          freezeRequest = { reason: "escrow_mismatch_on_bet", meta: { existingPot, escrowBalance: escBal } };
+          if (escBal < existingPot) {
+            throw new MarketError("ERR_UNDERFUNDED_ESCROW", { marketId, pot: existingPot, escrowBalance: escBal });
+          }
+          throw new MarketError("ERR_ESCROW_MISMATCH", { marketId, pot: existingPot, escrowBalance: escBal, mode: m.fund_mode });
+        }
+      }
 
-    return this.ether.runGroup(
-      { groupKey: `market:bet:${marketId}:${userId}:${operationId}`, kind: "market_bet", actorId: userId },
-      (): { previous: number | null; net: number } => {
-      // 残高判定はグループの中（張った後の再試行を残高不足で落とさない）
+      const existingRows = this.db
+        .prepare("SELECT amount FROM casino_market_bets WHERE market_id = ? AND user_id = ?")
+        .all(marketId, userId) as Array<{ amount: number }>;
+      const existingTotal = existingRows.reduce((s, r) => s + r.amount, 0);
+      const additionalRequired = Math.max(0, amount - existingTotal);
+      // 残高判定もグループの中（張った後の再試行を残高不足で落とさない）
       if (this.ether.balanceOf(userId) < additionalRequired) {
         throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(userId), additionalRequired, amount, existingTotal });
       }
@@ -443,7 +447,14 @@ export class Markets {
         payload: { marketId, optionIndex, amount, previous: existingTotal > 0 ? existingTotal : null },
       });
       return { previous: existingTotal > 0 ? existingTotal : null, net: amount - existingTotal };
-    });
+        },
+      );
+    } catch (e) {
+      // 資金不整合を見つけたときだけ、巻き戻した後に凍結する（凍結は残さないと次のベットを止められない）
+      const req = freezeRequest as { reason: string; meta: Record<string, unknown> } | null;
+      if (req) this.freeze(marketId, "system:bet-guard", req.reason, req.meta);
+      throw e;
+    }
   }
 
   /**

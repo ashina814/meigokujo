@@ -12,7 +12,7 @@ import {
 import { POKER_CATEGORY_PAYOUTS, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { C_JACKPOT, C_MAMMON, E, HR_THIN, buildResultEmbed, fmtBigDelta } from "./ui.js";
 
@@ -250,8 +250,9 @@ async function runRound(
   // ── 判定 & 精算 ──
   const ev = evaluate(hand);
   const rawPayout = ev.payMult > 0 ? bet * ev.payMult : 0;
-  const amulet = applyAmulets(services, uid, bet, rawPayout);
-  const settled = services.casino.settle(uid, "ポーカー", bet, amulet.payout, 0, { operationId: interaction.id });
+  // お守りの消費も賭け・配当と同じグループの中（settleSolo）
+  const settled = services.casino.settleSolo(uid, "ポーカー", bet, rawPayout, { operationId: interaction.id });
+  const amulet = { note: settled.amuletNote };
 
   const isJp = ev.category === 11;
   const bonusBits: string[] = [];

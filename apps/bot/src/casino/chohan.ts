@@ -12,7 +12,7 @@ import {
 import { CHOHAN_PAYOUT, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -147,10 +147,11 @@ async function runRound(
   const isCho = total % 2 === 0;
   const won = (picked === "cho") === isCho;
   const rawPayout = won ? Math.floor(bet * CHOHAN_PAYOUT) : 0;
-  const amulet = applyAmulets(services, uid, bet, rawPayout);
   // 連鎖ボーナスは無効化。丁半は 50% 勝率と CHOHAN_PAYOUT=1.94 で RTP 97% だが、
   // 連鎖有効時は実効 RTP が 106% を超える回帰が実測レポートで確認された（クラッシュと同構造）。
-  const settled = services.casino.settle(uid, "丁半", bet, amulet.payout, 0, { chain: false, operationId: interaction.id });
+  // お守りの消費も賭け・配当と同じグループの中（settleSolo）
+  const settled = services.casino.settleSolo(uid, "丁半", bet, rawPayout, { chain: false, operationId: interaction.id });
+  const amulet = { note: settled.amuletNote };
 
   const totalPayout = settled.payout;
   const net = settled.net;

@@ -36,6 +36,14 @@ export interface EscrowRow {
 
 const now = () => Math.floor(Date.now() / 1000);
 
+/** 複数人徴収の途中で「残高が足りない人がいた」ことを伝える内部例外（グループを巻き戻すため） */
+class EscrowShortfall extends Error {
+  constructor(readonly userId: string) {
+    super("ESCROW_SHORTFALL");
+    this.name = "EscrowShortfall";
+  }
+}
+
 /** セッションIDから専用保有者のIDを作る。他モジュールも同じ命名規則で作ること */
 export const escrowHolderFor = (sessionId: string): string => `escrow:session:${sessionId}`;
 
@@ -103,6 +111,77 @@ export class Escrow {
       if (e instanceof EtherError) return false;
       throw e;
     }
+  }
+
+  /**
+   * 複数人からまとめて預託する（対人卓の参加徴収）。**全員ぶんで1グループ**。
+   *
+   * 途中の1人が足りなければ例外でグループごと巻き戻すので、先に取った人の分も残らない
+   * （「1人目だけ徴収されて卓が立たない」状態を作らない）。
+   * 事前の残高確認もグループの中で行う。外でやると、成功後の再試行が
+   * 「保存済みの結果（true）を返す」前に残高不足で false になる。
+   *
+   * @returns 全員から預かれたら true。1人でも足りなければ false（誰からも取らない）
+   */
+  holdAll(sessionId: string, userIds: readonly string[], amount: number, game: string, operationId: string): boolean {
+    if (!Number.isInteger(amount) || amount <= 0) return false;
+    const holder = escrowHolderFor(sessionId);
+    try {
+      return this.ether.runGroup(
+        { groupKey: `escrow:hold_all:${sessionId}:${operationId}`, kind: "table_hold", actorId: "system:escrow" },
+        (): boolean => {
+          for (const userId of userIds) {
+            if (this.ether.balanceOf(userId) < amount) throw new EscrowShortfall(userId);
+            this.ether.transfer(userId, holder, amount, { reason: "卓への預託", game, sessionId });
+            this.db
+              .prepare(
+                `INSERT INTO casino_escrow (session_id, user_id, amount, game, source, created_at) VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(session_id, user_id) DO UPDATE SET amount = amount + excluded.amount, source = excluded.source`,
+              )
+              .run(sessionId, userId, amount, game, holder, now());
+          }
+          return true;
+        },
+      );
+    } catch (e) {
+      // 足りない人がいた／送金が通らなかった → グループごと巻き戻り済み。誰からも取っていない
+      if (e instanceof EscrowShortfall || e instanceof EtherError) return false;
+      throw e;
+    }
+  }
+
+  /**
+   * 複数人にまとめて返金する（卓の不成立・中止）。**全員ぶんで1グループ**。
+   * 途中で落ちたら誰にも返らない（＝帳簿も残る）ので、同じキーで再試行できる。
+   *
+   * `_beforeStep` はテスト専用のフック（各返金の直前に呼ばれる）。本番呼び出しは省略する。
+   *
+   * @returns 実際に返金した人数
+   */
+  refundMany(
+    sessionId: string,
+    userIds: readonly string[],
+    operationId: string,
+    _beforeStep?: (index: number, userId: string) => void,
+  ): number {
+    return this.ether.runGroup(
+      { groupKey: `escrow:refund_many:${sessionId}:${operationId}`, kind: "table_refund", actorId: "system:escrow" },
+      (): number => {
+        let refunded = 0;
+        for (let i = 0; i < userIds.length; i++) {
+          const userId = userIds[i]!;
+          _beforeStep?.(i, userId);
+          const row = this.db
+            .prepare("SELECT * FROM casino_escrow WHERE session_id = ? AND user_id = ?")
+            .get(sessionId, userId) as EscrowRow | undefined;
+          if (!row) continue;
+          this.ether.transfer(row.source, userId, row.amount, { reason: "離脱による返金", sessionId, game: row.game });
+          this.db.prepare("DELETE FROM casino_escrow WHERE session_id = ? AND user_id = ?").run(sessionId, userId);
+          refunded++;
+        }
+        return refunded;
+      },
+    );
   }
 
   /** セッションの預かり記録（返金額の確認用） */
@@ -186,17 +265,18 @@ export class Escrow {
     const positive = distributions.filter((d) => d.amount > 0);
     const total = positive.reduce((s, d) => s + d.amount, 0);
 
-    const pool = this.ether.balanceOf(holder);
-    if (total !== pool) {
-      throw new Error(
-        `Escrow.settle: distribution total ${total} != escrow pool ${pool} for session ${sessionId}`,
-      );
-    }
-
     // 1セッションの精算は一度きり。セッションIDがそのまま冪等キーになる
     return this.ether.runGroup(
       { groupKey: `escrow:settle:${sessionId}`, kind: "table_settle", actorId: actor },
       () => {
+      // pool の確認はグループの中。外でやると、精算成功後（＝預り所が空）の再試行が
+      // 「保存済みの結果を返す」前に pool 不一致で落ちる
+      const pool = this.ether.balanceOf(holder);
+      if (total !== pool) {
+        throw new Error(
+          `Escrow.settle: distribution total ${total} != escrow pool ${pool} for session ${sessionId}`,
+        );
+      }
       for (let i = 0; i < positive.length; i++) {
         const d = positive[i]!;
         _beforeStep?.(i, d);

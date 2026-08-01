@@ -12,6 +12,29 @@ import type Database from "better-sqlite3";
  * - チップ移動には必ず理由を付ける（理由の無い取引を作らない）
  */
 
+/**
+ * ## 版の切替と「旧版の検算」でできること・できないこと（確定）
+ *
+ * 開始残高には版（`opening_version`）がある。いまは PR1 導入時の `legacy_pre_reset` で、
+ * 正式開業初期化（実装計画 R8〜R9）で `opening_v1` へ切り替わる。
+ * 版の前後は `version_seq`（単調増加）で決める。取引IDでは決めない
+ * （初期化で採番が巻き戻ると順序が逆転するため）。
+ *
+ * **旧版の取引再現は「初期化前（R7 の前）」でしかできない。**
+ * 正式開業初期化の R7 で `casino_tx` / `casino_tx_groups` を空にするので、
+ * それ以降 `replayBalances(旧版)` は開始残高そのものへ戻る（足す取引が無くなる）。
+ * `verifyBalances(旧版)` も「旧版の開始残高 == 新版の開始残高」を見るだけになり、
+ * 旧制度の取引が正しかったかを言うものではなくなる。
+ *
+ * これは仕様として次のように割り切る:
+ * - **旧版の検算は R9 前の読み取り専用 preflight（実装計画 R2）限定**とする。
+ *   初期化に進む前に `verifyBalances(legacy_pre_reset).ok` を確認し、その結果を記録に残す。
+ * - **旧取引を新スキーマ側へアーカイブはしない。** 退避先は実装計画 R1-b の CSV
+ *   （`casino_tx` / `casino_tx_groups` を含む旧賭場データ一式）とスナップショットで、
+ *   初期化後に旧制度を追う必要が出たらそちらを読む。
+ *   DB 内に旧取引を残すと、検算Aの窓・holder 名・単位（エテル→チップ）が新旧で混ざり、
+ *   「いまの残高が正しいか」という本来の問いに答えられなくなるため。
+ */
 export const CHIP_OPENING_VERSION_KEY = "casino:opening_version";
 /** PR1導入時に現在のチップ残高を保存する版。正式開業初期化で opening_v1 へ切り替える */
 export const LEGACY_OPENING_VERSION = "legacy_pre_reset";
@@ -423,6 +446,9 @@ export class ChipTx {
    * 記録から再現した残高と、実際の残高を突き合わせる。1 Ld の差も見逃さない。
    * 最新版は `ether_balances`、それ以前の版は**次の版の開始残高**と比べる
    * （旧版の窓の終わりの姿＝次の版の出発点、が一致していれば記録は繋がっている）。
+   *
+   * 旧版を指定した検算は、**その版の取引が `casino_tx` に残っている間だけ**意味がある。
+   * 正式開業初期化で取引を初期化した後は開始残高同士の突き合わせに退化する（冒頭の解説を見る）。
    */
   verifyBalances(version = this.currentVersion()): { ok: boolean; mismatches: ChipBalanceMismatch[] } {
     const expected = this.replayBalances(version);
