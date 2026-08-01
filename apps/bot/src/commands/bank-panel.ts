@@ -236,7 +236,7 @@ export function savePanelSettingExternal(services: Services, kind: string, chann
 
 function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services, channelId: string) {
   if (kind === "entry") return entryPanelMessage(services);
-  if (kind === "entry_flex") return entryFlexPanelMessage(); // 廃止済み（撤去専用）
+  if (kind === "entry_flex") return entryFlexPanelMessage(services); // 廃止済み（撤去専用）
   if (kind === "rank") return rankPanelMessage();
   if (kind === "shop") return shopPanelMessage(services);
   if (kind === "exchange") return exchangePanelMessage(services);
