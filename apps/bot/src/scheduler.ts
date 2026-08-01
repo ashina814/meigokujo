@@ -7,6 +7,7 @@ import { scanRooms } from "./rooms-lifecycle.js";
 import { scanDens } from "./dens.js";
 import { refreshEvalStats } from "./eval-daily.js";
 import { updateDashboard } from "./dashboard.js";
+import { updateWaitersBoard } from "./waiters-board.js";
 import { tickVoiceXp } from "./rank-tracker.js";
 import { fmtLd } from "./format.js";
 import { announceAutoClose, announceSettle, refreshMarketPanel } from "./commands/ita.js";
@@ -120,9 +121,21 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         if (!services.sessions.isOccurring(sessionDate, start, schedule)) continue;
         const marker = `session:notify:${sessionDate}:${start}:5m`;
         if (!services.settings.getString(marker)) {
-          await runSchedulerTaskOnce(services, marker, "system:scheduler", () =>
-            sendSessionNotification(client, services, start, "5m"),
-          ).catch((e) => console.error("[説明会] 通知失敗:", e));
+          // 成否を事件録に残す。実行済みマーカーは成功時にしか付かないので、それだけでは
+          // 「失敗した」のか「まだ通知時刻前」なのかを門番用ボードから区別できない
+          await runSchedulerTaskOnce(services, marker, "system:scheduler", async () => {
+            await sendSessionNotification(client, services, start, "5m");
+            services.events.log("session_notified", {
+              actor: "system:scheduler",
+              payload: { date: sessionDate, hour: start, kind: "5m" },
+            });
+          }).catch((e) => {
+            console.error("[説明会] 通知失敗:", e);
+            services.events.log("session_notify_failed", {
+              actor: "system:scheduler",
+              payload: { date: sessionDate, hour: start, kind: "5m", error: e instanceof Error ? e.message : String(e) },
+            });
+          });
         }
       }
     }
@@ -142,6 +155,8 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     // ── 計器盤の更新（10分ごと）──
     if (now.minute % 10 === 0) {
       await updateDashboard(client, services).catch((e) => console.error("[計器盤] 更新失敗:", e));
+      // 門番用の待ち人ボードも同じ間隔で追従させる（未設置なら何もしない）
+      await updateWaitersBoard(client, services).catch((e) => console.error("[待ち人ボード] 更新失敗:", e));
     }
 
     // ── ボイスXP tick（5分ごと・複数人VC滞在者に加算）──

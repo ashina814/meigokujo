@@ -17,6 +17,11 @@ process.env.CLIENT_ID = process.env.CLIENT_ID ?? "test-client";
 process.env.OWNER_ID = process.env.OWNER_ID ?? "test-owner";
 registerDefaultTxTypes();
 
+// scheduler.js は config が環境変数を要求するので静的 import できない。
+// 代わりにここで読み込みを始め、各テストは同じ Promise を待つ（初回の変換待ちで
+// テスト単体の制限時間を使い切らないようにする）。
+const schedulerModule = import("../src/scheduler.js");
+
 function makeSettings() {
   const values = new Map<string, string>();
   return {
@@ -99,7 +104,7 @@ describe("次の説明会", () => {
 
   it("例外が無ければ通常枠どおり", async () => {
     const { db, services } = calendarServices();
-    const { nextSessionStart } = await import("../src/scheduler.js");
+    const { nextSessionStart } = await schedulerModule;
 
     // 金 21:30 JST → 同日22時会
     expect(nextSessionStart(services, new Date("2026-07-31T12:30:00Z"))?.toISOString()).toBe("2026-07-31T13:00:00.000Z");
@@ -110,7 +115,7 @@ describe("次の説明会", () => {
 
   it("休止した枠は案内せず、臨時追加した枠は案内する", async () => {
     const { db, sessions, services } = calendarServices();
-    const { nextSessionStart } = await import("../src/scheduler.js");
+    const { nextSessionStart } = await schedulerModule;
     const friday2030 = new Date("2026-07-31T11:30:00Z");
 
     sessions.skip({ date: "2026-07-31", hour: 21, reason: "門番不在", actor: "user:1", now: friday2030 });
@@ -125,7 +130,7 @@ describe("次の説明会", () => {
 
   it("開催予定が無ければ null", async () => {
     const { db, settings, services } = calendarServices();
-    const { nextSessionStart } = await import("../src/scheduler.js");
+    const { nextSessionStart } = await schedulerModule;
     settings.set("entry:session_skip_dow", "[0,1,2,3,4,5,6]", "test");
 
     expect(nextSessionStart(services, new Date("2026-07-31T12:30:00Z"))).toBeNull();
@@ -135,7 +140,7 @@ describe("次の説明会", () => {
 
 describe("説明会通知タスク", () => {
   it("通知予定時刻から2分間は再試行窓になり、窓外と開始後は送らない", async () => {
-    const { isSessionNotificationDue } = await import("../src/scheduler.js");
+    const { isSessionNotificationDue } = await schedulerModule;
 
     expect(isSessionNotificationDue({ hour: 20, minute: 30 }, 21, 30)).toBe(true);
     expect(isSessionNotificationDue({ hour: 20, minute: 31 }, 21, 30)).toBe(true);
@@ -145,7 +150,7 @@ describe("説明会通知タスク", () => {
   });
 
   it("0時開催の通知は前日23時台に出る", async () => {
-    const { isSessionNotificationDue } = await import("../src/scheduler.js");
+    const { isSessionNotificationDue } = await schedulerModule;
 
     expect(isSessionNotificationDue({ hour: 23, minute: 55 }, 0, 55)).toBe(true);
     expect(isSessionNotificationDue({ hour: 0, minute: 55 }, 0, 55)).toBe(false);
@@ -154,7 +159,7 @@ describe("説明会通知タスク", () => {
   it("説明会チャンネル取得失敗時にマーカーが保存されない", async () => {
     const { values, settings } = makeSettings();
     values.set("channel:entry_guide", "guide");
-    const { sendSessionNotification } = await import("../src/scheduler.js");
+    const { sendSessionNotification } = await schedulerModule;
     const client = { channels: { fetch: vi.fn(async () => { throw new Error("temporary"); }) } };
 
     await expect(
@@ -171,7 +176,7 @@ describe("説明会通知タスク", () => {
     values.set("channel:entry_guide", "guide");
     values.set("role:queue_wait", "wait_role");
     const send = vi.fn(async () => undefined);
-    const { sendSessionNotification } = await import("../src/scheduler.js");
+    const { sendSessionNotification } = await schedulerModule;
     const client = {
       channels: { fetch: vi.fn(async () => ({ isTextBased: () => true, send })) },
     };
@@ -219,7 +224,7 @@ describe("チケット24時間通知のスナップショット", () => {
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error("send failed"));
     const client = { channels: { fetch: vi.fn(async () => ({ isTextBased: () => true, send })) } };
-    const { processStaleTicketNotifications } = await import("../src/scheduler.js");
+    const { processStaleTicketNotifications } = await schedulerModule;
 
     await expect(processStaleTicketNotifications(client as any, services as any)).rejects.toThrow("send failed");
     tickets.create("threadC", "userC", "consult", {
@@ -283,7 +288,7 @@ describe("ショップ月額ロール剥奪", () => {
     const member = { roles: { cache: { has: vi.fn(() => true) }, remove } };
     const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
     const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
-    const { processShopRoleRevocations } = await import("../src/scheduler.js");
+    const { processShopRoleRevocations } = await schedulerModule;
     const services = { db, events, shop, settings };
 
     await processShopRoleRevocations(client as any, services as any);
@@ -305,7 +310,7 @@ describe("ショップ月額ロール剥奪", () => {
     const member = { roles: { cache: { has: vi.fn(() => true) }, remove } };
     const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
     const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
-    const { processShopRoleRevocations } = await import("../src/scheduler.js");
+    const { processShopRoleRevocations } = await schedulerModule;
     const services = { db, events, shop, settings };
 
     await expect(processShopRoleRevocations(client as any, services as any)).rejects.toThrow("shop_role_revocation_failed");
@@ -331,7 +336,7 @@ describe("ショップ月額ロール剥奪", () => {
     const member = { roles: { cache: { has: vi.fn(() => true) }, remove } };
     const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
     const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
-    const { processShopRoleRevocations } = await import("../src/scheduler.js");
+    const { processShopRoleRevocations } = await schedulerModule;
 
     await processShopRoleRevocations(client as any, { db, events, shop, settings } as any);
 
@@ -401,7 +406,7 @@ describe("カロン分割タスク", () => {
       return null;
     });
     const client = { channels: { fetch } };
-    const { postCharonDueList, postCharonOverduePanel } = await import("../src/scheduler.js");
+    const { postCharonDueList, postCharonOverduePanel } = await schedulerModule;
 
     await expect(
       runSchedulerTaskOnce({ settings } as any, "charon:due_list:test", "system:test", () =>
@@ -448,7 +453,7 @@ describe("カロン分割タスク", () => {
     };
     const dmSend = vi.fn(async () => { throw new Error("dm closed"); });
     const client = { users: { fetch: vi.fn(async () => ({ send: dmSend })) }, channels: { fetch: vi.fn() } };
-    const { sendCharonNotifications } = await import("../src/scheduler.js");
+    const { sendCharonNotifications } = await schedulerModule;
 
     await expect(sendCharonNotifications(client as any, services as any)).rejects.toThrow("charon_notifications_failed");
     expect([...values.keys()].some((key) => key.startsWith("charon:notified:dm:user1"))).toBe(false);

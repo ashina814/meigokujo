@@ -34,6 +34,7 @@ import {
   type SpecialStyle,
 } from "../special-profile.js";
 import { updateDashboard } from "../dashboard.js";
+import { updateWaitersBoard, WAITERS_BOARD_CHANNEL_KEY } from "../waiters-board.js";
 import { fmtEther, fmtLd } from "../format.js";
 import { ticketPanelMessageForPanel } from "./tickets.js";
 import type { Services } from "../services.js";
@@ -65,6 +66,7 @@ function renderHub(): { embeds: EmbedBuilder[]; components: ActionRowBuilder<But
         "・**部署**: 部署口座の作成・削除",
         "・**調整**: 残高の運営調整",
         "・**計器盤**: 手動更新",
+        "・**待ち人**: 門番用の待ち人ボードを設置・更新",
         "・**XP除外**: 発言/浮上XPを付けないチャンネル・カテゴリ",
         "・**賭場**: マモンの賭場（胴元資金・売上精算）",
       ].join("\n"),
@@ -79,6 +81,7 @@ function renderHub(): { embeds: EmbedBuilder[]; components: ActionRowBuilder<But
   const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:adjust").setLabel("調整").setEmoji("🔧").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:dashboard").setLabel("計器盤").setEmoji("📊").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mgmt:waiters").setLabel("待ち人").setEmoji("🚪").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:xpex").setLabel("XP除外").setEmoji("🚫").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:casino").setLabel("賭場").setEmoji("🎰").setStyle(ButtonStyle.Secondary),
   );
@@ -184,6 +187,33 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
       content: result.ok
         ? "📊 計器盤を更新しました。"
         : `⚠️ 計器盤の更新に失敗しました: ${result.reason ?? "ログを確認してください"}`,
+      embeds: [],
+      components: [backButton()],
+    });
+    return;
+  }
+
+  // ── 待ち人ボード ──
+  // 設置も更新も同じ操作。channel:waiters_board のチャンネルに1枚置き、以後は編集し続ける
+  if (section === "waiters" && !action) {
+    await interaction.deferUpdate();
+    const channelId = services.settings.getString(WAITERS_BOARD_CHANNEL_KEY);
+    if (!channelId) {
+      await interaction.editReply({
+        content: "⚠️ 先に `設定 → チャンネル → 門番用の待ち人ボード` で設置先を決めてください。",
+        embeds: [],
+        components: [backButton()],
+      });
+      return;
+    }
+    const result = await updateWaitersBoard(interaction.client, services).catch((e): { ok: false; reason: string } => {
+      console.error("[待ち人ボード] 手動更新に失敗:", e);
+      return { ok: false, reason: e instanceof Error ? e.message : "不明なエラー" };
+    });
+    await interaction.editReply({
+      content: result.ok
+        ? `🚪 待ち人ボードを${"action" in result && result.action === "created" ? "設置" : "更新"}しました → <#${channelId}>`
+        : `⚠️ 待ち人ボードの更新に失敗しました: ${result.reason ?? "ログを確認してください"}`,
       embeds: [],
       components: [backButton()],
     });
@@ -688,6 +718,7 @@ const CHANNEL_KEYS: Array<[string, string]> = [
   ["keikiban", "#城の計器盤"],
   ["audit_log", "監査ログ"],
   ["entry_guide", "入城案内"],
+  ["waiters_board", "門番用の待ち人ボード"],
   ["session_vc", "説明会場VC"],
   ["session_vc2", "説明会場VC（2つ目）"],
   ["shokan", "冥界商館（ショップ配送通知）"],
