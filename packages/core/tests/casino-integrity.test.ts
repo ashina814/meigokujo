@@ -11,7 +11,7 @@ import { Markets } from "../src/casino/market.js";
 import { Stocks } from "../src/casino/stocks.js";
 import { ChipTx, ChipTxError } from "../src/casino/chip-tx.js";
 import { CasinoIntegrity } from "../src/casino/integrity.js";
-import { CasinoStatus } from "../src/casino/status.js";
+import { CasinoStatus, OPENING_RESET_SEAL } from "../src/casino/status.js";
 import { deterministicRng } from "../src/casino/rng.js";
 import { deptAccount } from "../src/departments/service.js";
 import { opId } from "./helpers/chip-ctx.js";
@@ -345,7 +345,7 @@ describe("稼働状態", () => {
 
     // メンテ終了・開業初期化完了・手動再開のどれでも開かない
     expect(ctx.status.endMaintenance("改装おわり", "boss").ok).toBe(false);
-    expect(ctx.status.finishOpeningReset("初期化おわり", "boss").ok).toBe(false);
+    expect(ctx.status.finishOpeningReset("初期化おわり", "boss", OPENING_RESET_SEAL).ok).toBe(false);
     expect(ctx.status.reopenFromManualHalt("開ける", "boss").ok).toBe(false);
     expect(ctx.status.isOpen()).toBe(false);
 
@@ -366,6 +366,49 @@ describe("稼働状態", () => {
     expect(ctx.status.reopenAfterIntegrity("開ける", "boss", true).ok).toBe(false);
     expect(ctx.status.endMaintenance("改装おわり", "boss").ok).toBe(true);
     expect(ctx.status.isOpen()).toBe(true);
+    ctx.db.close();
+  });
+
+  it("開業準備中は通常の再開導線のどれでも開かない", () => {
+    const ctx = setup();
+    ctx.status.beginOpeningReset("正式開業初期化", "boss");
+
+    // 運営卓が持っている「開ける」経路は全部断られる
+    expect(ctx.status.reopenFromManualHalt("開ける", "boss").ok).toBe(false);
+    expect(ctx.status.reopenAfterIntegrity("開ける", "boss", true).ok).toBe(false);
+    expect(ctx.status.endMaintenance("改装おわり", "boss").ok).toBe(false);
+    expect(ctx.status.finishStartupCheck("boss")).toBe(false);
+    expect(ctx.status.current().status).toBe("opening_reset");
+    expect(ctx.status.isOpen()).toBe(false);
+    ctx.db.close();
+  });
+
+  it("全点検A〜Dが正常でも、開業準備中は通常再開では解除できない", () => {
+    const ctx = busyCasino();
+    // 帳簿はどこも壊れていない（＝運営卓の再開ボタンなら通ってしまう条件）
+    expect(ctx.integrity.runFull().ok).toBe(true);
+
+    ctx.status.beginOpeningReset("正式開業初期化", "boss");
+    expect(ctx.status.reopenAfterIntegrity("全点検が通ったので開ける", "boss", true).ok).toBe(false);
+    expect(ctx.status.reopenFromManualHalt("開ける", "boss").ok).toBe(false);
+    expect(ctx.status.endMaintenance("開ける", "boss").ok).toBe(false);
+    expect(ctx.status.isOpen()).toBe(false);
+    ctx.db.close();
+  });
+
+  it("開業準備中を open にできるのは正式開業初期化の完了経路だけ", () => {
+    const ctx = setup();
+    ctx.status.beginOpeningReset("正式開業初期化", "boss");
+
+    // 印を持たない呼び出し（＝正式開業初期化の外）は断る
+    const forged = ctx.status.finishOpeningReset("初期化おわり", "boss", Symbol("にせの印") as never);
+    expect(forged.ok).toBe(false);
+    expect(ctx.status.isOpen()).toBe(false);
+
+    // PR12 の完了処理（core 内部の印を持つ経路）だけが open にできる
+    expect(ctx.status.finishOpeningReset("正式開業初期化 完了", "boss", OPENING_RESET_SEAL).ok).toBe(true);
+    expect(ctx.status.current().status).toBe("open");
+    expect(ctx.status.current().reason).toBe("正式開業初期化 完了");
     ctx.db.close();
   });
 

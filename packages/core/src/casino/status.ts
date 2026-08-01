@@ -64,6 +64,15 @@ const DENY_MESSAGE: Record<Exclude<CasinoStatusValue, "open">, string> = {
 
 const now = () => Math.floor(Date.now() / 1000);
 
+/**
+ * 正式開業初期化（PR12）の完了処理だけが持つ印。
+ *
+ * `index.ts` から**再エクスポートしない**ことで、apps/bot 側（＝運営卓の通常の再開導線）からは
+ * 手に入らないようにしてある。`opening_reset` を解ける経路を R0〜R14 の一続きの処理に限るための鍵。
+ */
+export const OPENING_RESET_SEAL: unique symbol = Symbol("casino.openingReset");
+export type OpeningResetSeal = typeof OPENING_RESET_SEAL;
+
 export class CasinoStatus {
   constructor(private readonly db: Database.Database) {
     // 初期値は open。行が無い＝まだ一度も止めていない
@@ -214,8 +223,20 @@ export class CasinoStatus {
     return this.reopen("maintenance", reason, changedBy);
   }
 
-  /** 正式開業初期化の完了（実装計画 R11）。**開業準備中のときだけ**通る */
-  finishOpeningReset(reason: string, changedBy: string): TransitionResult {
+  /**
+   * 正式開業初期化の完了（実装計画 R14）。**開業準備中のときだけ**通る。
+   *
+   * 正本では正式開業初期化は R0 停止 → R1〜R11 初期化 → R12 同一トランザクション内の検算 →
+   * R13 成功時のみ COMMIT → R14 open、という**一続きの処理**である。全点検A〜Dが通っただけで
+   * 運営卓の通常の再開導線から解除できてはいけないので、第3引数に
+   * {@link OPENING_RESET_SEAL} を要求する。この印は core の内部（PR12 の正式開業初期化）だけが
+   * 持ち、パッケージの公開エクスポート（index.ts）には出していない。
+   * したがって apps/bot から通常の再開操作でこの経路を通ることはできない。
+   */
+  finishOpeningReset(reason: string, changedBy: string, seal: OpeningResetSeal): TransitionResult {
+    if (seal !== OPENING_RESET_SEAL) {
+      return { ok: false, reason: "開業準備中は、正式開業初期化の完了処理からしか開けられない" };
+    }
     return this.reopen("opening_reset", reason, changedBy);
   }
 

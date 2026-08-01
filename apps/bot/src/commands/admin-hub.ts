@@ -174,7 +174,18 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "casino" && action === "settle") return void (await interaction.showModal(casinoSettleModal()));
   if (section === "casino" && action === "halt") return void (await interaction.showModal(casinoHaltModal()));
   if (section === "casino" && action === "reopen") {
-    return void (await interaction.showModal(casinoReopenModal(services.casinoStatus.current().reason)));
+    // 古いパネルのボタンが残っていることがあるので、押された時点の状態でも確かめる
+    const cur = services.casinoStatus.current();
+    if (!REOPEN_LABEL[cur.status]) {
+      return void (await interaction.reply({
+        content:
+          cur.status === "opening_reset"
+            ? "❌ 開業準備中です。正式開業初期化の完了処理からしか開けられません。"
+            : `❌ いまは ${CASINO_STATUS_LABEL[cur.status] ?? cur.status} なので、この導線では開けられません。`,
+        flags: MessageFlags.Ephemeral,
+      }));
+    }
+    return void (await interaction.showModal(casinoReopenModal(cur.reason)));
   }
   if (section === "casino" && action === "baseline") {
     return void (await interaction.showModal(
@@ -633,9 +644,9 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
           ? services.casinoStatus.reopenAfterIntegrity(reason, interaction.user.id, report.ok)
           : cur.status === "maintenance"
             ? services.casinoStatus.endMaintenance(reason, interaction.user.id)
-            : cur.status === "opening_reset"
-              ? services.casinoStatus.finishOpeningReset(reason, interaction.user.id)
-              : { ok: false, reason: `いまは ${cur.status} なので、この導線では開けられない` };
+            : // opening_reset を含む残りはここへ落ちる。開業準備中は正式開業初期化（PR12）の
+              // 完了処理からしか open にできない
+              { ok: false, reason: `いまは ${cur.status} なので、この導線では開けられない` };
     await interaction.reply({
       content: result.ok ? `🟢 賭場を開けました（${reason}）。` : `❌ ${result.reason}`,
       flags: MessageFlags.Ephemeral,
@@ -1867,14 +1878,18 @@ async function deptRemove(
 const CASINO_DEPT_KEY = "賭博場";
 
 /**
- * 状態ごとの「開ける」ボタンの文言。ここに無い状態（open / startup_check）は開けるボタンを出さない。
+ * 状態ごとの「開ける」ボタンの文言。ここに無い状態は開けるボタンを出さない。
  * 経路を1本ずつに分けるのは、検算NGで止めた賭場を「メンテ終了」の導線から開けさせないため。
+ *
+ * `opening_reset` は**意図的に無い**。正式開業初期化は R0 停止 → R1〜R11 初期化 →
+ * R12 同一トランザクション内の検算 → R13 成功時のみ COMMIT → R14 open という一続きの処理で、
+ * 全点検A〜Dが通っただけで通常の再開導線から解除してよいものではない（PR12 で実装する）。
+ * `open` / `startup_check` も同様にボタンを出さない。
  */
 const REOPEN_LABEL: Partial<Record<string, string>> = {
   manual_halt: "営業再開",
   integrity_halt: "検算通過で再開",
   maintenance: "改装終了",
-  opening_reset: "開業初期化を完了",
 };
 
 /** 稼働状態の見出し（運営が一目で「いま開いているか・なぜ閉じたか」を掴めるように） */
