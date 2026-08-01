@@ -33,6 +33,14 @@ const now = () => Math.floor(Date.now() / 1000);
 export const marketEscrowHolder = (id: number): string => `escrow:market:${id}`;
 
 /**
+ * 起動時の復旧で「返してはいけない」板のエスクロー保有者（PR7・正本 §8.1）。
+ *
+ * frozen も含める。返金に失敗して調査待ちの板は、所有者情報が `casino_market_bets` に
+ * 残っているので孤児ではない。
+ */
+export const MARKET_LIVE_STATUSES = ["open", "closed", "reported", "disputed", "frozen"] as const;
+
+/**
  * 板の状態。
  * - open/closed/reported/disputed: 進行中
  * - settled/void: 終端（精算済み・無効化済み）
@@ -762,6 +770,20 @@ export class Markets {
    * **返金に失敗した板は frozen に変更**して新規ベットを止め、帳簿とエスクロー残高を保持する。
    * エラーは events に記録して呼び出し側でログ出力できるようにする。
    */
+  /**
+   * 復旧レジストリへの申告（PR7・正本 §8.1）。
+   *
+   * 「いま生きていて、預託を返してはいけない板」の保有者IDを返す。
+   * 掃除の側が `casino_markets` を直接読むのをやめ、**所有元が自分で申告する**形にする。
+   */
+  liveEscrowHolders(): string[] {
+    const placeholders = MARKET_LIVE_STATUSES.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(`SELECT id FROM casino_markets WHERE status IN (${placeholders})`)
+      .all(...MARKET_LIVE_STATUSES) as Array<{ id: number }>;
+    return rows.map((r) => marketEscrowHolder(r.id));
+  }
+
   refundAllPending(actor: string): {
     total: number;
     refunded: number;

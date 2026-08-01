@@ -214,6 +214,7 @@ export {
   type MarketSettleResult,
   type MarketRefundResult,
   type MarketsOptions,
+  MARKET_LIVE_STATUSES,
 } from "./casino/market.js";
 export {
   CasinoStatus,
@@ -352,3 +353,11 @@ export {
   type ReservationRow,
   type ReservationResult,
 } from "./casino/reservations.js";
+
+export {
+  RecoveryRegistry,
+  recoverCasino,
+  type RecoverySource,
+  type RecoverCasinoDeps,
+  type RecoverCasinoResult,
+} from "./casino/recovery.js";

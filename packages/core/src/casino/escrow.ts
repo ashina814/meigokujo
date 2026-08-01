@@ -537,6 +537,172 @@ export class Escrow {
     };
   }
 
+  /**
+   * 起動時の復旧（正本 §8.2 S5〜S8・PR7）。`sweepAll` と違い、
+   * **生きている預託を所有元から教えてもらってから**掃除する。
+   *
+   * ```text
+   * S5 帳簿（casino_escrow）と holder 残高を照合
+   * S6 keep に含まれ、かつ一致しているセッションは一切触らない
+   * S7 所有元が確実に存在しない（keep に無い）セッションだけ返金
+   * S8 帳簿が無いのに残高がある escrow:* を quarantine へ隔離
+   * ```
+   *
+   * **不一致は返金も隔離もしない。** 帳簿を残したまま記録だけ作って人間の判断を待つ
+   * （正本 §8.3「帳簿不一致: 対象だけ凍結。返金しない」）。
+   * 1セッションの失敗が他セッションの復旧を止めないのは `sweepAll` と同じ。
+   *
+   * @param keep 生存中のエスクロー保有者ID（`escrow:market:12` など）
+   */
+  recoverSessions(
+    actor: string,
+    keep: ReadonlySet<string>,
+  ): {
+    totalSessions: number;
+    kept: number;
+    refundedSessions: number;
+    refundedUsers: number;
+    refundedTotal: number;
+    mismatched: Array<{ sessionId: string; expected: number; actual: number }>;
+    failed: Array<{ sessionId: string; expected: number; actual: number; error: string }>;
+    quarantined: number;
+    quarantinedTotal: number;
+  } {
+    const allRows = this.db.prepare("SELECT * FROM casino_escrow").all() as EscrowRow[];
+    const bySession = new Map<string, EscrowRow[]>();
+    for (const r of allRows) {
+      const arr = bySession.get(r.session_id) ?? [];
+      arr.push(r);
+      bySession.set(r.session_id, arr);
+    }
+
+    let kept = 0;
+    let refundedSessions = 0;
+    let refundedUsers = 0;
+    let refundedTotal = 0;
+    const mismatched: Array<{ sessionId: string; expected: number; actual: number }> = [];
+    const failed: Array<{ sessionId: string; expected: number; actual: number; error: string }> = [];
+    /** 触ってはいけない保有者（生存中 + 不一致で凍結したもの） */
+    const untouchable = new Set<string>(keep);
+
+    for (const [sid, rows] of bySession) {
+      const expected = rows.reduce((s, r) => s + r.amount, 0);
+      const holder = escrowHolderFor(sid);
+      const sources = new Set(rows.map((r) => r.source));
+      const isNewStyle = sources.size === 1 && [...sources][0] === holder;
+
+      // S5: 照合。新方式（セッション専用保有者）だけ厳格に見られる
+      if (isNewStyle) {
+        const actual = this.ether.balanceOf(holder);
+        if (actual !== expected) {
+          // 返金も隔離もしない。帳簿を残して記録だけ作る
+          mismatched.push({ sessionId: sid, expected, actual });
+          untouchable.add(holder);
+          this.events.log("casino_escrow_mismatch", {
+            actor,
+            payload: { sessionId: sid, expected, actual, action: "freeze" },
+          });
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[escrow] セッション ${sid} は帳簿=${expected} 保有者=${actual} で不一致。返金も隔離もせず凍結（要調査）`,
+          );
+          continue;
+        }
+      }
+
+      // S6: 生きている預託は一切触らない
+      if (keep.has(holder)) {
+        kept++;
+        continue;
+      }
+
+      // S7: 所有元が存在しないので返金する。セッション単位の独立トランザクション
+      try {
+        this.ether.runGroup({ groupKey: `escrow:refund:${sid}`, kind: "table_refund", actorId: actor }, () => {
+          for (const r of rows) {
+            this.ether.transfer(r.source, r.user_id, r.amount, { reason: "起動時の孤児返金", sessionId: sid, game: r.game });
+          }
+          this.db.prepare("DELETE FROM casino_escrow WHERE session_id = ?").run(sid);
+        });
+        refundedSessions++;
+        refundedUsers += rows.length;
+        refundedTotal += expected;
+      } catch (e) {
+        const actual = this.ether.balanceOf(holder);
+        const error = (e as Error).message;
+        failed.push({ sessionId: sid, expected, actual, error });
+        untouchable.add(holder);
+        this.events.log("casino_escrow_sweep_failed", { actor, payload: { sessionId: sid, expected, actual, error } });
+        // eslint-disable-next-line no-console
+        console.warn(`[escrow] セッション ${sid} の孤児返金に失敗（帳簿=${expected} 保有者=${actual}）: ${error}。帳簿は残す`);
+      }
+    }
+
+    // S8: 帳簿が1行も無いのに残高がある escrow:* を隔離する。
+    // 生存中・不一致・返金失敗の保有者は触らない（帳簿か所有元が残っている＝孤児ではない）
+    this.ether.ensureHolder(ESCROW_QUARANTINE);
+    const remainingLedger = new Set(
+      (this.db.prepare("SELECT DISTINCT session_id FROM casino_escrow").all() as Array<{ session_id: string }>).map((r) =>
+        escrowHolderFor(r.session_id),
+      ),
+    );
+    const holders = this.db
+      .prepare("SELECT user_id, amount FROM ether_balances WHERE user_id LIKE 'escrow:%' AND user_id != ? AND amount > 0")
+      .all(ESCROW_QUARANTINE) as Array<{ user_id: string; amount: number }>;
+
+    let quarantined = 0;
+    let quarantinedTotal = 0;
+    const detectedAt = Math.floor(Date.now() / 1000);
+    for (const h of holders) {
+      if (untouchable.has(h.user_id) || remainingLedger.has(h.user_id)) continue;
+      const bal = this.ether.balanceOf(h.user_id);
+      if (bal <= 0) continue;
+      try {
+        this.ether.runGroup(
+          { groupKey: `escrow:quarantine:${h.user_id}:${bal}`, kind: "table_refund", actorId: actor },
+          () => this.ether.transfer(h.user_id, ESCROW_QUARANTINE, bal, { reason: "孤児残高の隔離" }),
+        );
+        quarantined++;
+        quarantinedTotal += bal;
+        this.events.log("casino_escrow_orphan", {
+          actor,
+          payload: { holder: h.user_id, amount: bal, detectedAt, quarantinedTo: ESCROW_QUARANTINE },
+        });
+        // eslint-disable-next-line no-console
+        console.warn(`[escrow] 孤児残高を隔離: holder=${h.user_id} amount=${bal} → ${ESCROW_QUARANTINE}（要調査）`);
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn(`[escrow] 孤児残高の隔離に失敗: holder=${h.user_id} ${(e as Error).message}`);
+      }
+    }
+
+    this.events.log("casino_escrow_recovered", {
+      actor,
+      payload: {
+        totalSessions: bySession.size,
+        kept,
+        refundedSessions,
+        refundedTotal,
+        mismatched: mismatched.length,
+        failed: failed.length,
+        quarantined,
+        quarantinedTotal,
+      },
+    });
+
+    return {
+      totalSessions: bySession.size,
+      kept,
+      refundedSessions,
+      refundedUsers,
+      refundedTotal,
+      mismatched,
+      failed,
+      quarantined,
+      quarantinedTotal,
+    };
+  }
+
   /** 隔離口座の現在残高（運営 UI・監査用） */
   quarantineBalance(): number {
     return this.ether.balanceOf(ESCROW_QUARANTINE);
