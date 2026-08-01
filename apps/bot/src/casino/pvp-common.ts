@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -111,31 +112,57 @@ export function buildPvpResult(opts: {
  * 両者から bet を徴収して house 一時保管。全員から取れなかったら false（取った分は戻す）。
  * session を渡すとエスクロー台帳に記録され、再起動時に自動返金される（推奨）。
  */
-export function collectStakes(services: Services, userIds: string[], bet: number, session?: string, game = "pvp"): boolean {
-  const insufficient = userIds.find((u) => services.ether.balanceOf(u) < bet);
-  if (insufficient) return false;
-  if (session) {
-    const collected: string[] = [];
-    for (const u of userIds) {
-      if (!services.escrow.hold(session, u, bet, game)) {
-        for (const c of collected) services.escrow.refundOne(session, c);
-        return false;
-      }
-      collected.push(u);
-    }
-    return true;
+export function collectStakes(
+  services: Services,
+  userIds: string[],
+  bet: number,
+  operationId: string,
+  session?: string,
+  game = "pvp",
+): boolean {
+  // 新方式（session あり）: 事前の残高確認も含めて **全員ぶんで1グループ**。
+  // 途中で足りない人がいれば、先に取った人の分もグループごと巻き戻る
+  if (session) return services.escrow.holdAll(session, userIds, bet, game, operationId);
+
+  // 旧方式（session なし・レガシー呼び出し互換）: house へ直接。こちらも1グループ
+  try {
+    return services.ether.runGroup(
+      { groupKey: `pvp:collect:${game}:${operationId}`, kind: "table_hold", actorId: "system:pvp" },
+      (): boolean => {
+        // 残高確認もグループの中（徴収成功後の再試行を残高不足で false にしない）
+        for (const u of userIds) {
+          if (services.ether.balanceOf(u) < bet) throw new StakeShortfall();
+        }
+        for (const u of userIds) services.ether.transfer(u, HOUSE_HOLDER, bet, { reason: "対人戦の賭け金", game });
+        return true;
+      },
+    );
+  } catch (e) {
+    if (e instanceof StakeShortfall) return false;
+    throw e;
   }
-  for (const u of userIds) services.ether.transfer(u, HOUSE_HOLDER, bet);
-  return true;
 }
 
-/** 参加者に返金（勝負不成立時など）。session があれば台帳の預かり額で返して記録も消す */
-export function refundAll(services: Services, userIds: string[], bet: number, session?: string): void {
+/** 誰かの残高が足りずに徴収を打ち切ったことを伝える内部例外（グループを巻き戻すため） */
+class StakeShortfall extends Error {
+  constructor() {
+    super("STAKE_SHORTFALL");
+    this.name = "StakeShortfall";
+  }
+}
+
+/**
+ * 参加者に返金（勝負不成立時など）。session があれば台帳の預かり額で返して記録も消す。
+ * **全員ぶんで1グループ**なので、途中で落ちれば誰にも返らない（＝同じ鍵で再試行できる）。
+ */
+export function refundAll(services: Services, userIds: string[], bet: number, operationId: string, session?: string): void {
   if (session) {
-    for (const u of userIds) services.escrow.refundOne(session, u);
+    services.escrow.refundMany(session, userIds, operationId);
     return;
   }
-  for (const u of userIds) services.ether.transfer(HOUSE_HOLDER, u, bet);
+  services.ether.runGroup({ groupKey: `pvp:refund:${operationId}`, kind: "table_refund", actorId: "system:pvp" }, () => {
+    for (const u of userIds) services.ether.transfer(HOUSE_HOLDER, u, bet, { reason: "対人戦の不成立返金" });
+  });
 }
 
 /**
@@ -148,6 +175,7 @@ export function settlePvp(
   services: Services,
   winners: string[],
   pot: number,
+  operationId: string,
   session?: string,
 ): { payout: number; houseCut: number } {
   const houseCut = Math.floor(pot * HOUSE_CUT);
@@ -173,13 +201,18 @@ export function settlePvp(
 
   // 旧方式（session なし・レガシー呼び出し互換）: house から直接動かす
   const src = stakeHolder(undefined);
-  if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut);
-  if (winners.length === 0) return { payout: 0, houseCut };
-  const share = Math.floor(distributable / winners.length);
-  const remainder = distributable - share * winners.length;
-  for (const w of winners) services.ether.transfer(src, w, share);
-  if (remainder > 0) services.ether.transfer(src, winners[0]!, remainder);
-  return { payout: distributable, houseCut };
+  return services.ether.runGroup(
+    { groupKey: `pvp:settle:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
+    () => {
+      if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
+      if (winners.length === 0) return { payout: 0, houseCut };
+      const share = Math.floor(distributable / winners.length);
+      const remainder = distributable - share * winners.length;
+      for (const w of winners) services.ether.transfer(src, w, share, { reason: "対人戦の配当" });
+      if (remainder > 0) services.ether.transfer(src, winners[0]!, remainder, { reason: "対人戦の配当（端数）" });
+      return { payout: distributable, houseCut };
+    },
+  );
 }
 
 /**
@@ -191,6 +224,7 @@ export function settleProportional(
   services: Services,
   winners: Array<{ userId: string; bet: number }>,
   losers: Array<{ userId: string; bet: number }>,
+  operationId: string,
   session?: string,
 ): { totalHouseCut: number } {
   const winnerPot = winners.reduce((s, w) => s + w.bet, 0);
@@ -217,15 +251,20 @@ export function settleProportional(
 
   // 旧方式（session なし）
   const src = stakeHolder(undefined);
-  if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut);
-  let remaining = distributable;
-  for (let i = 0; i < winners.length; i++) {
-    const w = winners[i]!;
-    const isLast = i === winners.length - 1;
-    const share = isLast ? remaining : Math.floor((distributable * w.bet) / winnerPot);
-    if (share > 0) services.ether.transfer(src, w.userId, share);
-    remaining -= share;
-  }
+  services.ether.runGroup(
+    { groupKey: `pvp:settle_proportional:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
+    () => {
+      if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
+      let remaining = distributable;
+      for (let i = 0; i < winners.length; i++) {
+        const w = winners[i]!;
+        const isLast = i === winners.length - 1;
+        const share = isLast ? remaining : Math.floor((distributable * w.bet) / winnerPot);
+        if (share > 0) services.ether.transfer(src, w.userId, share, { reason: "対人戦の比例配当" });
+        remaining -= share;
+      }
+    },
+  );
   return { totalHouseCut: houseCut };
 }
 

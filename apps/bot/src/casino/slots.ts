@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -22,7 +23,7 @@ import {
 } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -161,42 +162,113 @@ export async function playSlots(
     return;
   }
   try {
-    await runOne(interaction, services, check.bet, false);
+    await runOne(interaction, services, check.bet, 0);
   } finally {
     releaseSeat(uid);
   }
+}
+
+/**
+ * 1スピンぶんの確定結果。**すべて `result_json` に保存できる形**にしてある。
+ * 同じスピンをもう一度実行しても、表示（リール・役・フリースピン獲得）と
+ * 資金結果（配当・JP・お守り）が保存済みの値からそのまま再生される。
+ */
+export interface SpinRecord {
+  /** リールの絵柄名（SLOT_SYMBOLS から引き直す） */
+  reels: [string, string, string];
+  kind: import("@meigokujo/core").SlotSpinKind;
+  matched: string | null;
+  freeSpin: boolean;
+  /** お守り適用前の払戻 */
+  rawPayout: number;
+  /** お守り適用後の払戻（実際に動いた額） */
+  payout: number;
+  amuletNote: string | null;
+  settled: import("@meigokujo/core").SoloRoundResult | null;
+  jpWon: number;
+}
+
+const symbolByName = (name: string): SlotSymbol => SYMBOLS.find((s) => s.name === name) ?? SYMBOLS[0]!;
+
+/**
+ * 1スピンぶんの資金処理（抽選・お守り・賭け・配当・JP積立・JP当選）を**ひとつの業務グループ**で行う。
+ * 分かれていると、精算だけ通ってJP当選が落ちる／お守りだけ消える中途半端な状態が残る。
+ *
+ * @param spinNo 0 = 賭け金を払う通常スピン / 1以上 = その interaction 内の n 回目のフリースピン。
+ *   フリースピンは同じ interaction で再帰するので、**1スピンごとに別の安定した鍵**が要る。
+ *   同じ鍵を使い回すと、フリースピンが通常スピンの保存結果を再生してしまい、
+ *   無料スピンの配当が加算されない。
+ */
+export function spinOnce(services: Services, uid: string, bet: number, interactionId: string, spinNo: number): SpinRecord {
+  const rng = services.rng;
+  const isFreeSpin = spinNo > 0;
+  const spinTag = isFreeSpin ? `free:${spinNo}` : "paid";
+  return services.ether.runGroup(
+    { groupKey: `slots:spin:${uid}:${interactionId}:${spinTag}`, kind: "solo_game", actorId: uid },
+    (): SpinRecord => {
+      const reelsRaw: [SlotSymbol, SlotSymbol, SlotSymbol] = [spinReel(rng), spinReel(rng), spinReel(rng)];
+      const spin = evaluate(reelsRaw, bet);
+      const jpCut = isFreeSpin ? 0 : Math.max(1, Math.floor(bet * JP_CONTRIBUTION));
+      let settledInGroup: import("@meigokujo/core").SoloRoundResult | null = null;
+      let payout = spin.payout;
+      let amuletNote: string | null = null;
+      if (isFreeSpin) {
+        // フリースピンは配当のみ（賭けなし）。settle は使わず胴元→プレイヤーの直接転送。
+        // お守りの消費もこのグループの中で行う（外で消すと落ちたときお守りだけ消える）
+        const amulet = services.casino.consumeAmulets(uid, bet, spin.payout);
+        payout = amulet.payout;
+        amuletNote = amulet.note ?? null;
+        if (payout > 0 && services.casino.canAccept(payout)) {
+          services.ether.transfer("house", uid, payout, { reason: "フリースピンの配当", game: "スロット" });
+        }
+      } else {
+        settledInGroup = services.casino.settleSolo(uid, "スロット", bet, spin.payout, {
+          operationId: `${interactionId}:${spinTag}`,
+          jackpotCut: jpCut,
+        });
+        payout = settledInGroup.payout - settledInGroup.chainBonus + settledInGroup.fukuTax;
+        amuletNote = settledInGroup.amuletNote ?? null;
+      }
+      // JP はフリースピンでも当選する（原作準拠）
+      const jpWon =
+        spin.kind === "jackpot"
+          ? services.casino.seizeJackpot(uid, "slots", `${interactionId}:${spinTag}`, JP_WIN_SHARE)
+          : 0;
+      return {
+        reels: [reelsRaw[0].name, reelsRaw[1].name, reelsRaw[2].name],
+        kind: spin.kind,
+        matched: spin.matched ?? null,
+        freeSpin: spin.freeSpin,
+        rawPayout: spin.payout,
+        payout,
+        amuletNote,
+        settled: settledInGroup,
+        jpWon,
+      };
+    },
+  );
 }
 
 async function runOne(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
-  isFreeSpin: boolean,
+  spinNo: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const rng = services.rng;
-  const reelsRaw: [SlotSymbol, SlotSymbol, SlotSymbol] = [spinReel(rng), spinReel(rng), spinReel(rng)];
-  const spin = evaluate(reelsRaw, bet);
+  const isFreeSpin = spinNo > 0;
+  const record = spinOnce(services, uid, bet, interaction.id, spinNo);
 
-  // お守り: 勝ちなら勝利ボーナス、負けなら返金保護
-  const amulet = applyAmulets(services, uid, bet, spin.payout);
-  const adjustedPayout = amulet.payout;
-  // 精算を先に確定（演出中の残高変動で失敗しないよう）。フリースピンなら賭けは無料
-  const jpCut = isFreeSpin ? 0 : Math.max(1, Math.floor(bet * JP_CONTRIBUTION));
-  let settled: import("@meigokujo/core").SettleResult | null = null;
-  let jpWon = 0;
-  if (isFreeSpin) {
-    // フリースピンは配当のみ（賭けなし）。settle は使わず胴元→プレイヤーの直接転送
-    if (adjustedPayout > 0 && services.casino.canAccept(adjustedPayout)) {
-      services.ether.transfer("house", uid, adjustedPayout);
-    }
-  } else {
-    settled = services.casino.settle(uid, "スロット", bet, adjustedPayout, jpCut);
-  }
-  // JP はフリースピンでも当選する（原作準拠）
-  if (spin.kind === "jackpot") {
-    jpWon = services.casino.seizeJackpot(uid, "slots", JP_WIN_SHARE);
-  }
+  const reelsRaw: [SlotSymbol, SlotSymbol, SlotSymbol] = [
+    symbolByName(record.reels[0]),
+    symbolByName(record.reels[1]),
+    symbolByName(record.reels[2]),
+  ];
+  const spin = { kind: record.kind, matched: record.matched ?? undefined, freeSpin: record.freeSpin };
+  const adjustedPayout = record.payout;
+  const amulet = { note: record.amuletNote ?? undefined };
+  const settled = record.settled;
+  const jpWon = record.jpWon;
 
   // ── Phase 1: スピンアニメ ──
   const initialEmbed = buildSpinEmbed(services, bet, isFreeSpin, "壺の中で運命が転がる……", ["❓", "❓", "❓"]);
@@ -330,7 +402,7 @@ async function runOne(
   if (spin.freeSpin && !isFreeSpin) {
     await edit(resultEmbed, []);
     await sleep(2500);
-    await runOne(interaction, services, bet, true);
+    await runOne(interaction, services, bet, spinNo + 1);
     return;
   }
 
@@ -356,7 +428,7 @@ async function runOne(
       releaseSeat(uid);
       if (acquireSeat(uid)) {
         try {
-          await runOne(btn, services, retryBet, false);
+          await runOne(btn, services, retryBet, 0);
         } finally {
           releaseSeat(uid);
         }

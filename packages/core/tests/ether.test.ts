@@ -1,3 +1,4 @@
+import { testTransfer } from "./helpers/chip-ctx.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
@@ -94,7 +95,7 @@ describe("エテル為替", () => {
     ctx.ether.buy("a", 10_000, key());
     const outstanding0 = ctx.ether.outstanding();
     const pool0 = ctx.ether.pool();
-    ctx.ether.transfer("a", "house", 30_000);
+    testTransfer(ctx.ether, "a", "house", 30_000);
     expect(ctx.ether.balanceOf("a")).toBe(70_000);
     expect(ctx.ether.balanceOf("house")).toBe(30_000);
     expect(ctx.ether.outstanding()).toBe(outstanding0);
@@ -104,7 +105,7 @@ describe("エテル為替", () => {
   it("保有超の換金・移動は弾く", () => {
     ctx.ether.buy("a", 10_000, key());
     expect(() => ctx.ether.sell("a", 999_999_999, key())).toThrow(EtherError);
-    expect(() => ctx.ether.transfer("a", "b", 999_999_999)).toThrow(EtherError);
+    expect(() => testTransfer(ctx.ether, "a", "b", 999_999_999)).toThrow(EtherError);
   });
 
   it("胴元の元手と売上精算はフェアレートで損得ゼロ往復", () => {
@@ -128,7 +129,7 @@ describe("エテル為替", () => {
 
   it("胴元収益のスプレッド付き精算（redeemToAccount）は8割着地・1割焼却", () => {
     ctx.ether.buy("a", 10_000, key()); // プレイヤーが入場
-    ctx.ether.transfer("a", "house", 50_000); // 胴元が勝った体
+    testTransfer(ctx.ether, "a", "house", 50_000); // 胴元が勝った体
     ctx.departments.upsert("賭博場", "賭博場", null);
     const dept = deptAccount("賭博場");
     const q = ctx.ether.redeemToAccount("house", 50_000, dept, "system:test", key());
@@ -139,13 +140,33 @@ describe("エテル為替", () => {
     expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
   });
 
-  it("冪等キー重複は ERR_DUPLICATE で弾かれ二重両替できない", () => {
+  it("同じ冪等キーの再実行は資金を動かさず、最初と同じ結果を返す", () => {
     const fixed = "e:idem:1";
-    ctx.ether.buy("a", 10_000, fixed);
-    expect(() => ctx.ether.buy("a", 10_000, fixed)).toThrow(EtherError);
+    const first = ctx.ether.buy("a", 10_000, fixed);
+    const landAfterFirst = ctx.ledger.balanceOf("user:a");
+
+    const again = ctx.ether.buy("a", 10_000, fixed);
+
+    expect(again).toEqual(first); // 保存済みの結果をそのまま返す
     expect(ctx.ether.balanceOf("a")).toBe(100_000); // 1回分のみ
+    expect(ctx.ledger.balanceOf("user:a")).toBe(landAfterFirst);
+
     // 売り側も同様
-    ctx.ether.sell("a", 10_000, "e:idem:2");
-    expect(() => ctx.ether.sell("a", 10_000, "e:idem:2")).toThrow(EtherError);
+    const sold = ctx.ether.sell("a", 10_000, "e:idem:2");
+    const chipsAfterSell = ctx.ether.balanceOf("a");
+    expect(ctx.ether.sell("a", 10_000, "e:idem:2")).toEqual(sold);
+    expect(ctx.ether.balanceOf("a")).toBe(chipsAfterSell);
+  });
+
+  it("別の操作が同じLand冪等キーを使ったら ERR_DUPLICATE で止まる", () => {
+    // Land 側だけ先に同じキーで動かしておく（＝別操作がキーを使ってしまった状態）
+    ctx.ledger.transfer({
+      from: "user:a", to: TREASURY, amount: 1, type: "adjust", actor: "t", approvedBy: "t",
+      idempotencyKey: "e:collide",
+    });
+    const chips = ctx.ether.balanceOf("a");
+
+    expect(() => ctx.ether.buy("a", 10_000, "e:collide")).toThrow(EtherError);
+    expect(ctx.ether.balanceOf("a")).toBe(chips); // チップは発行されない
   });
 });

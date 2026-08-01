@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { Ledger, TREASURY } from "../ledger/service.js";
 import { EventLog } from "../events/service.js";
+import { ChipTx } from "./chip-tx.js";
 
 /**
  * エテル為替（カジノ第二通貨）。Land を 100% 準備する二通貨制。
@@ -42,6 +43,15 @@ export interface EtherQuote {
 export interface EtherExchangeOptions {
   /** 準備が空のときの初期レート（1 Land = 何エテルか）。関数なら毎回評価＝設定変更が即反映 */
   baseRate?: number | (() => number);
+  /** 取引監査。賭場の全サービスで同じインスタンスを共有する（実行中グループを共有するため） */
+  chipTx?: ChipTx;
+}
+
+/** チップ移動に必ず添える情報。理由の無い取引を作らないための必須引数 */
+export interface ChipMoveInfo {
+  reason: string;
+  game?: string | null;
+  sessionId?: string | null;
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -50,6 +60,8 @@ const muldiv = (a: number, b: number, c: number) => Number((BigInt(a) * BigInt(b
 
 export class EtherExchange {
   private readonly baseRateOpt: number | (() => number);
+  /** チップ移動の追記先。賭場の他サービスもここ経由で同じグループに乗る */
+  readonly chipTx: ChipTx;
 
   constructor(
     private readonly db: Database.Database,
@@ -58,7 +70,16 @@ export class EtherExchange {
     options: EtherExchangeOptions = {},
   ) {
     this.baseRateOpt = options.baseRate ?? 10;
+    this.chipTx = options.chipTx ?? new ChipTx(db);
     this.ledger.ensureAccount(ETHER_ESCROW, "system");
+  }
+
+  /**
+   * 業務操作を1グループとして実行する（仕様書 I5）。
+   * チップを動かす処理は必ずこの中で行う。すでに外側のグループがあれば合流する。
+   */
+  runGroup<T>(input: { groupKey: string; kind: string; actorId: string }, body: () => T): T {
+    return this.chipTx.runGroup(input, body);
   }
 
   /** 準備が空のときの初期レート（1 Land = 何エテル） */
@@ -87,13 +108,14 @@ export class EtherExchange {
   }
 
   /**
-   * 冪等キーの重複を先に弾く。Ledger は重複キーで例外を出さず no-op を返すため、
-   * そのまま進めると「Land を動かさずエテル残高だけ更新」の不整合が起きる。
+   * Land 取引が実際に成立したかを確かめる。Ledger は重複キーで例外を出さず no-op を返すので、
+   * それを見逃すと「Land を動かさずチップだけ発行/消却」の不整合になる。
+   *
+   * 同じ操作の再実行は `runGroup` が保存済みの結果で返す（ここへ来ない）。ここへ来るのは
+   * **別の操作が同じ Land 冪等キーを使った**場合なので、資金を動かさず失敗させる。
    */
-  private assertFresh(idempotencyKey: string): void {
-    if (this.ledger.findByIdempotencyKey(idempotencyKey)) {
-      throw new EtherError("ERR_DUPLICATE", { idempotencyKey });
-    }
+  private assertLandMoved(result: { duplicate: boolean }, idempotencyKey: string): void {
+    if (result.duplicate) throw new EtherError("ERR_DUPLICATE", { idempotencyKey });
   }
 
   private setBalance(holderId: string, delta: number): void {
@@ -133,45 +155,61 @@ export class EtherExchange {
   /** Land を払ってエテルを買う（入場・フェア） */
   buy(userId: string, landIn: number, idempotencyKey: string): EtherQuote {
     if (!Number.isInteger(landIn) || landIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { landIn });
-    this.assertFresh(idempotencyKey);
-    return this.db.transaction((): EtherQuote => {
+    return this.runGroup({ groupKey: idempotencyKey, kind: "deposit", actorId: `user:${userId}` }, (): EtherQuote => {
       const q = this.quoteBuy(landIn);
       this.ledger.ensureAccount(`user:${userId}`, "user");
-      this.ledger.transfer({
+      const land = this.ledger.transfer({
         from: `user:${userId}`, to: ETHER_ESCROW, amount: landIn, type: "ether_buy", actor: `user:${userId}`,
         approvedBy: ETHER_APPROVER, reason: "エテル購入", refType: "ether", refId: userId, idempotencyKey,
       });
+      this.assertLandMoved(land, idempotencyKey);
       this.setBalance(userId, q.output);
+      this.chipTx.record({
+        txKind: "deposit", to: userId, amount: q.output, reason: "チップ預入",
+        landAmount: landIn, ledgerTxId: land.tx.id,
+      });
       this.events.log("ether_buy", { actor: userId, payload: { landIn, ether: q.output } });
       return q;
-    })();
+    });
   }
 
   /** エテルを売って Land を受け取る（退場・20%奉納） */
   sell(userId: string, etherIn: number, idempotencyKey: string): EtherQuote {
     if (!Number.isInteger(etherIn) || etherIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { etherIn });
-    const held = this.balanceOf(userId);
-    if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
-    this.assertFresh(idempotencyKey);
-    return this.db.transaction((): EtherQuote => {
+    return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: `user:${userId}` }, (): EtherQuote => {
+      // 残高の検査はグループの中で行う。外でやると、成功後の再試行が
+      // 「保存済みの結果を返す」前に残高不足で落ちてしまう
+      const held = this.balanceOf(userId);
+      if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
       const q = this.quoteSell(etherIn);
+      let landTxId: number | null = null;
       if (q.output > 0) {
-        this.ledger.transfer({
+        const payout = this.ledger.transfer({
           from: ETHER_ESCROW, to: `user:${userId}`, amount: q.output, type: "ether_sell", actor: `user:${userId}`,
           approvedBy: ETHER_APPROVER, reason: "エテル換金", refType: "ether", refId: userId, idempotencyKey,
         });
+        this.assertLandMoved(payout, idempotencyKey);
+        landTxId = payout.tx.id;
       }
       if (q.burned > 0) {
-        this.ledger.transfer({
+        const burn = this.ledger.transfer({
           from: ETHER_ESCROW, to: TREASURY, amount: q.burned, type: "ether_burn", actor: ETHER_APPROVER,
           approvedBy: ETHER_APPROVER, reason: "退場奉納の焼却", refType: "ether", refId: userId, idempotencyKey: `${idempotencyKey}:burn`,
         });
+        this.assertLandMoved(burn, `${idempotencyKey}:burn`);
+        landTxId = landTxId ?? burn.tx.id;
       }
       this.setBalance(userId, -etherIn);
+      // 端数で Land が 1 Ld も出ない返還（現行の変動レート由来）はそのまま通す。
+      // 資金の動きを変えずに「Land が動かなかった返還」として記録に残す。
+      this.chipTx.record({
+        txKind: "redeem", from: userId, amount: etherIn, reason: "チップ返還",
+        landAmount: q.output + q.burned, ledgerTxId: landTxId,
+      });
       this.sweepOrphanPool(userId, idempotencyKey);
       this.events.log("ether_sell", { actor: userId, payload: { etherIn, land: q.output, burned: q.burned } });
       return q;
-    })();
+    });
   }
 
   /**
@@ -181,28 +219,36 @@ export class EtherExchange {
    */
   redeemToAccount(holderId: string, etherIn: number, destAccount: string, actor: string, idempotencyKey: string): EtherQuote {
     if (!Number.isInteger(etherIn) || etherIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { etherIn });
-    const held = this.balanceOf(holderId);
-    if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
-    this.assertFresh(idempotencyKey);
-    return this.db.transaction((): EtherQuote => {
+    return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: actor }, (): EtherQuote => {
+      const held = this.balanceOf(holderId);
+      if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
       const q = this.quoteSell(etherIn);
+      let landTxId: number | null = null;
       if (q.output > 0) {
-        this.ledger.transfer({
+        const settle = this.ledger.transfer({
           from: ETHER_ESCROW, to: destAccount, amount: q.output, type: "ether_settle", actor,
           approvedBy: ETHER_APPROVER, reason: "カジノ収益の精算", refType: "ether", refId: holderId, idempotencyKey,
         });
+        this.assertLandMoved(settle, idempotencyKey);
+        landTxId = settle.tx.id;
       }
       if (q.burned > 0) {
-        this.ledger.transfer({
+        const burn = this.ledger.transfer({
           from: ETHER_ESCROW, to: TREASURY, amount: q.burned, type: "ether_burn", actor,
           approvedBy: ETHER_APPROVER, reason: "精算奉納の焼却", refType: "ether", refId: holderId, idempotencyKey: `${idempotencyKey}:burn`,
         });
+        this.assertLandMoved(burn, `${idempotencyKey}:burn`);
+        landTxId = landTxId ?? burn.tx.id;
       }
       this.setBalance(holderId, -etherIn);
+      this.chipTx.record({
+        txKind: "redeem", from: holderId, amount: etherIn, reason: "賭場収益の精算",
+        landAmount: q.output + q.burned, ledgerTxId: landTxId,
+      });
       this.sweepOrphanPool(holderId, idempotencyKey);
       this.events.log("ether_settle", { actor, payload: { holderId, etherIn, land: q.output, dest: destAccount } });
       return q;
-    })();
+    });
   }
 
   /**
@@ -211,17 +257,21 @@ export class EtherExchange {
    */
   fundFromAccount(srcAccount: string, landIn: number, holderId: string, idempotencyKey: string): { land: number; ether: number } {
     if (!Number.isInteger(landIn) || landIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { landIn });
-    this.assertFresh(idempotencyKey);
-    return this.db.transaction((): { land: number; ether: number } => {
+    return this.runGroup({ groupKey: idempotencyKey, kind: "deposit", actorId: ETHER_APPROVER }, () => {
       const q = this.quoteBuy(landIn); // 入場は元々フェアなので同じ計算
-      this.ledger.transfer({
+      const land = this.ledger.transfer({
         from: srcAccount, to: ETHER_ESCROW, amount: landIn, type: "ether_house_fund", actor: ETHER_APPROVER,
         approvedBy: ETHER_APPROVER, reason: "胴元の元手", refType: "ether", refId: holderId, idempotencyKey,
       });
+      this.assertLandMoved(land, idempotencyKey);
       this.setBalance(holderId, q.output);
+      this.chipTx.record({
+        txKind: "deposit", to: holderId, amount: q.output, reason: "胴元の元手",
+        landAmount: landIn, ledgerTxId: land.tx.id,
+      });
       this.events.log("ether_house_fund", { actor: holderId, payload: { land: landIn, ether: q.output, src: srcAccount } });
       return { land: landIn, ether: q.output };
-    })();
+    });
   }
 
   /**
@@ -230,33 +280,43 @@ export class EtherExchange {
    */
   redeemFairToAccount(holderId: string, etherIn: number, destAccount: string, idempotencyKey: string): { ether: number; land: number } {
     if (!Number.isInteger(etherIn) || etherIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { etherIn });
-    const held = this.balanceOf(holderId);
-    if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
-    this.assertFresh(idempotencyKey);
-    return this.db.transaction((): { ether: number; land: number } => {
+    return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: ETHER_APPROVER }, () => {
+      const held = this.balanceOf(holderId);
+      if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
       const P = this.pool();
       const C = this.outstanding();
       const land = C === 0 ? 0 : muldiv(etherIn, P, C); // フェア gross（80%引きなし）
+      let landTxId: number | null = null;
       if (land > 0) {
-        this.ledger.transfer({
+        const settle = this.ledger.transfer({
           from: ETHER_ESCROW, to: destAccount, amount: land, type: "ether_settle", actor: ETHER_APPROVER,
           approvedBy: ETHER_APPROVER, reason: "胴元の売上精算", refType: "ether", refId: holderId, idempotencyKey,
         });
+        this.assertLandMoved(settle, idempotencyKey);
+        landTxId = settle.tx.id;
       }
       this.setBalance(holderId, -etherIn);
+      this.chipTx.record({
+        txKind: "redeem", from: holderId, amount: etherIn, reason: "胴元の売上精算",
+        landAmount: land, ledgerTxId: landTxId,
+      });
       this.sweepOrphanPool(holderId, idempotencyKey);
       this.events.log("ether_settle", { actor: holderId, payload: { ether: etherIn, land, dest: destAccount, fair: true } });
       return { ether: etherIn, land };
-    })();
+    });
   }
 
-  /** カジノ内のエテル移動（賭け・配当）。台帳(Land)は動かさず総量保存 */
-  transfer(fromHolderId: string, toHolderId: string, amount: number): void {
+  /**
+   * カジノ内のエテル移動（賭け・配当）。台帳(Land)は動かさず総量保存。
+   * 理由の指定は必須で、グループの外では動かせない（記録できない移動を作らないため）。
+   */
+  transfer(fromHolderId: string, toHolderId: string, amount: number, move: ChipMoveInfo): void {
     if (!Number.isInteger(amount) || amount <= 0) throw new EtherError("ERR_BAD_AMOUNT", { amount });
     if (this.balanceOf(fromHolderId) < amount) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held: this.balanceOf(fromHolderId), amount });
     this.db.transaction(() => {
       this.setBalance(fromHolderId, -amount);
       this.setBalance(toHolderId, amount);
+      this.chipTx.record({ txKind: "internal_transfer", from: fromHolderId, to: toHolderId, amount, ...move });
     })();
   }
 

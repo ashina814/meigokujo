@@ -191,7 +191,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
         await sub.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
         return;
       }
-      if (!services.escrow.hold(session, btn.user.id, amt, "keiba")) {
+      if (!services.escrow.hold(session, btn.user.id, amt, "keiba", btn.id)) {
         await sub.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
         return;
       }

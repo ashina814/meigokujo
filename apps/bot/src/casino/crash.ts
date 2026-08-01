@@ -17,7 +17,7 @@ import {
 } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON, C_WIN } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -225,10 +225,11 @@ async function runRound(
   // ── 精算 ──
   if (cashedOut && cashOutMultiplier >= 1.0) {
     const rawPayout = Math.floor(bet * cashOutMultiplier);
-    const amulet = applyAmulets(services, uid, bet, rawPayout);
     // 連鎖ボーナスは無効化（1.5倍固定戦略 × 高勝率で 100% 超になる裁定を防ぐ・PR#6 レビュー指摘）。
     // 福の重みは維持（低残高帯では 0% なので影響なし・高残高帯ではプレイヤーから JP/救済へ流す）。
-    const settled = services.casino.settle(uid, "クラッシュ", bet, amulet.payout, 0, { chain: false });
+    // お守りの消費も賭け・配当と同じグループの中（settleSolo）
+    const settled = services.casino.settleSolo(uid, "クラッシュ", bet, rawPayout, { chain: false, operationId: interaction.id });
+    const amulet = { note: settled.amuletNote };
     const netStr = `+${settled.net.toLocaleString("ja-JP")} ◈`;
     const bigWin = settled.net >= bet * 5;
     const bonusBits: string[] = [];
@@ -254,8 +255,11 @@ async function runRound(
     await reply.edit({ embeds: [embed], components: [buildRetryRow()] }).catch(() => undefined);
     broadcastBigWin(interaction.client, services, { userId: uid, game: "クラッシュ", bet, payout: settled.payout });
   } else {
-    const lossAmulet = applyAmulets(services, uid, bet, 0);
-    services.casino.settle(uid, "クラッシュ", bet, lossAmulet.payout, 0, { chain: false });
+    const lossSettled = services.casino.settleSolo(uid, "クラッシュ", bet, 0, {
+      chain: false,
+      operationId: interaction.id,
+    });
+    const lossAmulet = { payout: lossSettled.payout, note: lossSettled.amuletNote };
     const savedByAmulet = lossAmulet.payout > 0;
     const netStr = savedByAmulet ? `±0 ◈` : `−${bet.toLocaleString("ja-JP")} ◈`;
 

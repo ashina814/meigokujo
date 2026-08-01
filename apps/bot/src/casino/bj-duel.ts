@@ -79,7 +79,7 @@ export async function playBjDuel(
     return;
   }
   const session = `bjduel:${interaction.id}`;
-  if (!collectStakes(services, [challenger.id], bet, session, "bj-duel")) return;
+  if (!collectStakes(services, [challenger.id], bet, `${session}:collect:challenger`, session, "bj-duel")) return;
 
   const inviteRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("bjd:accept").setLabel("受ける").setEmoji("🃏").setStyle(ButtonStyle.Success),
@@ -115,7 +115,7 @@ export async function playBjDuel(
     /* timeout */
   }
   if (!accepted) {
-    refundAll(services, [challenger.id], bet, session);
+    refundAll(services, [challenger.id], bet, `${session}:refund:declined`, session);
     await interaction.editReply({
       content: "",
       embeds: [buildPvpAbort("BJデュエル", "🃏", "対戦相手が受けなかった。挑戦者に全額返金。")],
@@ -123,8 +123,8 @@ export async function playBjDuel(
     });
     return;
   }
-  if (!collectStakes(services, [opponent.id], bet, session, "bj-duel")) {
-    refundAll(services, [challenger.id], bet, session);
+  if (!collectStakes(services, [opponent.id], bet, `${session}:collect:opponent`, session, "bj-duel")) {
+    refundAll(services, [challenger.id], bet, `${session}:refund:opponent_broke`, session);
     return;
   }
 
@@ -157,7 +157,7 @@ export async function playBjDuel(
 
   const finishGame = async (result: "challenger_win" | "opponent_win" | "push", note: string) => {
     if (result === "push") {
-      refundAll(services, [challenger.id, opponent.id], bet, session);
+      refundAll(services, [challenger.id, opponent.id], bet, `${session}:refund:push`, session);
       await interaction.editReply({
         content: "",
         embeds: [
@@ -183,7 +183,7 @@ export async function playBjDuel(
     } else {
       const winnerId = result === "challenger_win" ? challenger.id : opponent.id;
       const loserId = result === "challenger_win" ? opponent.id : challenger.id;
-      const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2, session);
+      const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2, `${session}:settle`, session);
       await interaction.editReply({
         content: "",
         embeds: [

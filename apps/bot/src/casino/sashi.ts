@@ -49,7 +49,7 @@ export async function playSashi(
     return;
   }
   const session = `sashi:${interaction.id}`;
-  if (!collectStakes(services, [challenger.id], bet, session, "sashi")) return;
+  if (!collectStakes(services, [challenger.id], bet, `${session}:collect:challenger`, session, "sashi")) return;
 
   const inviteRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("sashi:accept").setLabel("受ける").setEmoji("⚔").setStyle(ButtonStyle.Success),
@@ -85,7 +85,7 @@ export async function playSashi(
     /* timeout */
   }
   if (!accepted) {
-    refundAll(services, [challenger.id], bet, session);
+    refundAll(services, [challenger.id], bet, `${session}:refund:declined`, session);
     await interaction.editReply({
       content: "",
       embeds: [buildPvpAbort("サシ勝負", "⚔", "受諾されなかった。挑戦者に全額返金。")],
@@ -93,8 +93,8 @@ export async function playSashi(
     });
     return;
   }
-  if (!collectStakes(services, [opponent.id], bet, session, "sashi")) {
-    refundAll(services, [challenger.id], bet, session);
+  if (!collectStakes(services, [opponent.id], bet, `${session}:collect:opponent`, session, "sashi")) {
+    refundAll(services, [challenger.id], bet, `${session}:refund:opponent_broke`, session);
     return;
   }
 
@@ -115,7 +115,7 @@ export async function playSashi(
   const challengerWins = services.rng.int(0, 1) === 0;
   const winnerId = challengerWins ? challenger.id : opponent.id;
   const loserId = challengerWins ? opponent.id : challenger.id;
-  const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2, session);
+  const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2, `${session}:settle`, session);
 
   await interaction.editReply({
     content: "",

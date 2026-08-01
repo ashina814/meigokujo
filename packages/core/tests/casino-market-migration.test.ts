@@ -1,3 +1,4 @@
+import { testTransfer, opId } from "./helpers/chip-ctx.js";
 import { describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
@@ -109,11 +110,11 @@ describe("casino_markets status CHECK 制約撤去マイグレーション", () 
     ether.buy("z", 10_000, "buy:z");
     const markets = new Markets(db, ether, new EventLog(db));
 
-    const m = markets.create({ guildId: "g", creatorId: "z", title: "F", options: ["A", "B"], durationMin: 60, fee: 0 });
-    markets.bet(m.id, "z", 0, 3_000);
+    const m = markets.create({ operationId: opId(), guildId: "g", creatorId: "z", title: "F", options: ["A", "B"], durationMin: 60, fee: 0 });
+    markets.bet(m.id, "z", 0, 3_000, opId());
     // escrow を破損させて refundAllPending → frozen 化が **永続** することを確認
     const escHolder = `escrow:market:${m.id}`;
-    ether.transfer(escHolder, "house", 1_000);
+    testTransfer(ether, escHolder, "house", 1_000);
     const r = markets.refundAllPending("system:startup");
     expect(r.frozen).toBe(1);
     expect(markets.get(m.id)!.status).toBe("frozen"); // CHECK 撤去済みなので永続する

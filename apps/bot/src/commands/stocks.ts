@@ -142,13 +142,13 @@ export async function handleStocksModal(interaction: ModalSubmitInteraction, ser
   }
   try {
     if (action === "buy") {
-      const r = services.stocks.buy(interaction.user.id, stockId, shares);
+      const r = services.stocks.buy(interaction.user.id, stockId, shares, interaction.id);
       await interaction.reply({
         content: `✅ ${stockId} × ${shares} 株を購入（総額 ${fmtEther(r.cost)} / 平均取得 ${fmtEther(r.avgCost)}）`,
         flags: MessageFlags.Ephemeral,
       });
     } else {
-      const r = services.stocks.sell(interaction.user.id, stockId, shares);
+      const r = services.stocks.sell(interaction.user.id, stockId, shares, interaction.id);
       await interaction.reply({
         content: `✅ ${stockId} × ${shares} 株を売却（受取 ${fmtEther(r.proceeds)} / 残 ${r.remaining} 株）`,
         flags: MessageFlags.Ephemeral,

@@ -124,7 +124,7 @@ export async function playChinchiroDuel(
 
   // 挑戦者から先に徴収（受諾されなければ返金）
   const session = `ccduel:${interaction.id}`;
-  if (!collectStakes(services, [challenger.id], bet, session, "chinchiro-duel")) {
+  if (!collectStakes(services, [challenger.id], bet, `${session}:collect:challenger`, session, "chinchiro-duel")) {
     await interaction.reply({ content: "徴収に失敗した。", flags: MessageFlags.Ephemeral });
     return;
   }
@@ -168,7 +168,7 @@ export async function playChinchiroDuel(
   }
 
   if (!accepted) {
-    refundAll(services, [challenger.id], bet, session);
+    refundAll(services, [challenger.id], bet, `${session}:refund:declined`, session);
     await interaction.editReply({
       content: "",
       embeds: [buildPvpAbort("対戦チンチロ", "🎲", `<@${opponent.id}> が受けなかった（時間切れ or 辞退）。挑戦者に全額返金。`)],
@@ -177,8 +177,8 @@ export async function playChinchiroDuel(
     return;
   }
   // 受諾: 対戦相手からも徴収
-  if (!collectStakes(services, [opponent.id], bet, session, "chinchiro-duel")) {
-    refundAll(services, [challenger.id], bet, session);
+  if (!collectStakes(services, [opponent.id], bet, `${session}:collect:opponent`, session, "chinchiro-duel")) {
+    refundAll(services, [challenger.id], bet, `${session}:refund:opponent_broke`, session);
     await interaction.editReply({
       content: "",
       embeds: [buildPvpAbort("対戦チンチロ", "🎲", "対戦相手のエテル徴収に失敗。挑戦者に全額返金。")],
@@ -221,7 +221,7 @@ export async function playChinchiroDuel(
 
   if (cRank === oRank) {
     // 同役続き → 全額返金
-    refundAll(services, [challenger.id, opponent.id], bet, session);
+    refundAll(services, [challenger.id, opponent.id], bet, `${session}:refund:draw`, session);
     await interaction.followUp({
       embeds: [
         new EmbedBuilder()
@@ -234,7 +234,7 @@ export async function playChinchiroDuel(
   } else {
     const winnerId = cRank > oRank ? challenger.id : opponent.id;
     const loserId = cRank > oRank ? opponent.id : challenger.id;
-    const { payout, houseCut } = settlePvp(services, [winnerId], pot, session);
+    const { payout, houseCut } = settlePvp(services, [winnerId], pot, `${session}:settle`, session);
 
     await interaction.followUp({
       embeds: [

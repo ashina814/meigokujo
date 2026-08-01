@@ -1,6 +1,8 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherError, EtherExchange, HOUSE_HOLDER } from "./exchange.js";
+import { ChipTxError } from "./chip-tx.js";
+import type { Items } from "./items.js";
 
 /**
  * マモンの賭場の共通土台。
@@ -63,6 +65,18 @@ export interface CasinoStatsRow {
   updated_at: number;
 }
 
+export interface SettleOptions {
+  /**
+   * この精算を一意に指す値。**同じ操作の再試行では同じ値**を渡すこと
+   * （Discordの操作ID・卓のセッションIDなど）。ランダム値を渡すと二重精算を防げない。
+   */
+  operationId: string;
+  /** 連鎖ボーナス（既定ON。共有卓はOFF） */
+  chain?: boolean;
+  /** 福の重み（既定ON。共有卓はOFF） */
+  fuku?: boolean;
+}
+
 export interface SettleResult {
   /** 賭け額 */
   wagered: number;
@@ -84,12 +98,31 @@ export interface SettleResult {
 export interface CasinoOptions {
   /** 福の重みしきい値のスケール（既定10）。関数なら毎回評価 */
   fukuScale?: number | (() => number);
+  /**
+   * お守り（消耗品）。渡すと `settleSolo()` が精算と同じグループの中でお守りを消費する。
+   * 渡さない場合は「お守り無し」として扱う（テスト・移植前の経路）。
+   */
+  items?: Items;
+}
+
+/** ソロゲーム1回の結果。精算結果に「お守りが何をしたか」を添えたもの */
+export interface SoloRoundResult extends SettleResult {
+  /** お守り適用前の払戻総額（0=負け、bet=引き分け） */
+  rawPayout: number;
+  /** お守りが発動したときの表示文（未発動なら undefined） */
+  amuletNote?: string;
+}
+
+export interface SoloRoundOptions extends SettleOptions {
+  /** 賭け額のうちジャックポットへ積む額（スロット等） */
+  jackpotCut?: number;
 }
 
 const now = () => Math.floor(Date.now() / 1000);
 
 export class Casino {
   private readonly fukuScaleOpt: number | (() => number);
+  private readonly items?: Items;
 
   constructor(
     private readonly db: Database.Database,
@@ -98,6 +131,7 @@ export class Casino {
     options: CasinoOptions = {},
   ) {
     this.fukuScaleOpt = options.fukuScale ?? 10;
+    this.items = options.items;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS casino_stats (
         user_id             TEXT PRIMARY KEY,
@@ -152,17 +186,21 @@ export class Casino {
     bet: number,
     payout: number,
     jackpotCut = 0,
-    opts: { chain?: boolean; fuku?: boolean } = {},
+    opts: SettleOptions,
   ): SettleResult {
     if (!Number.isInteger(bet) || bet <= 0) throw new EtherError("ERR_BAD_AMOUNT", { bet });
     if (!Number.isInteger(payout) || payout < 0) throw new EtherError("ERR_BAD_AMOUNT", { payout });
     const useChain = opts.chain ?? true;
     const useFuku = opts.fuku ?? true;
-    return this.db.transaction((): SettleResult => {
+    const move = { game, sessionId: null };
+    // 1ゲームの精算をひとまとまりの業務操作として記録する。`operationId` は
+    // 「同じ操作の再試行なら同じ値になる」ものを呼び出し側が渡す（Discordの操作IDなど）
+    const groupKey = `solo:${game}:${userId}:${opts.operationId}`;
+    return this.ether.runGroup({ groupKey, kind: "solo_game", actorId: userId }, (): SettleResult => {
       // 徴収
-      this.ether.transfer(userId, HOUSE_HOLDER, bet);
+      this.ether.transfer(userId, HOUSE_HOLDER, bet, { ...move, reason: "賭け金" });
       // 配当
-      if (payout > 0) this.ether.transfer(HOUSE_HOLDER, userId, payout);
+      if (payout > 0) this.ether.transfer(HOUSE_HOLDER, userId, payout, { ...move, reason: "配当" });
 
       const won = payout > bet;
       // 連鎖ボーナス: 「この勝ちで何連勝目か」= 現在の連勝 + 1（recordResult 前に読む）
@@ -176,7 +214,7 @@ export class Casino {
         chainMult = c.mult;
         chainLabel = c.label;
         chainBonus = Math.min(Math.floor(payout * (c.mult - 1)), this.ether.balanceOf(HOUSE_HOLDER));
-        if (chainBonus > 0) this.ether.transfer(HOUSE_HOLDER, userId, chainBonus);
+        if (chainBonus > 0) this.ether.transfer(HOUSE_HOLDER, userId, chainBonus, { ...move, reason: "連鎖ボーナス" });
       }
 
       // 福の重み: 勝ち利益（チェーン込み）への累進奉納。半分JP・半分救済
@@ -187,36 +225,83 @@ export class Casino {
         fukuTax = Math.floor((payout - bet + chainBonus) * rate);
         if (fukuTax > 0) {
           const half = Math.floor(fukuTax / 2);
-          if (half > 0) this.ether.transfer(userId, JACKPOT_HOLDER, half);
-          if (fukuTax - half > 0) this.ether.transfer(userId, RELIEF_HOLDER, fukuTax - half);
+          if (half > 0) this.ether.transfer(userId, JACKPOT_HOLDER, half, { ...move, reason: "福の重み（JP積立）" });
+          if (fukuTax - half > 0) {
+            this.ether.transfer(userId, RELIEF_HOLDER, fukuTax - half, { ...move, reason: "福の重み（救済積立）" });
+          }
         }
       }
 
       // JP積立（胴元から）
       if (jackpotCut > 0 && this.ether.balanceOf(HOUSE_HOLDER) >= jackpotCut) {
-        this.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, jackpotCut);
+        this.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, jackpotCut, { ...move, reason: "JP積立" });
       }
       const effectivePayout = payout + chainBonus - fukuTax;
       const net = effectivePayout - bet;
       this.recordResult(userId, bet, payout);
       this.events.log("casino_game", { actor: userId, payload: { game, bet, payout: effectivePayout, net, chainBonus, fukuTax } });
       return { wagered: bet, payout: effectivePayout, net, chainBonus, chainStreak, chainMult, chainLabel, fukuTax, fukuRate: rate };
-    })();
+    });
+  }
+
+  /**
+   * ソロゲーム1回の資金処理（**全ソロゲームの入口**）。
+   *
+   * お守りの消費・賭けの徴収・配当・戦績を**ひとつの業務グループ**で行う。
+   * お守りは DB 上の装備を消す副作用なので、精算より前に外で消費すると
+   * 「精算だけ落ちてお守りだけ消えた」状態が残る。同じグループに入れておけば
+   * 例外時にお守りも一緒に戻る。
+   *
+   * @param rawPayout お守り適用前の払戻総額（0=負け、bet=引き分け、>bet=勝ち）
+   */
+  settleSolo(userId: string, game: string, bet: number, rawPayout: number, opts: SoloRoundOptions): SoloRoundResult {
+    const groupKey = `solo:${game}:${userId}:${opts.operationId}`;
+    return this.ether.runGroup({ groupKey, kind: "solo_game", actorId: userId }, (): SoloRoundResult => {
+      const amulet = this.consumeAmulets(userId, bet, rawPayout);
+      // settle は同じキーで runGroup を呼ぶが、すでにこのグループの中なので合流する
+      const settled = this.settle(userId, game, bet, amulet.payout, opts.jackpotCut ?? 0, opts);
+      return { ...settled, rawPayout, ...(amulet.note ? { amuletNote: amulet.note } : {}) };
+    });
+  }
+
+  /**
+   * お守りの適用: 勝ちなら勝利ボーナス、負けなら返金保護。
+   *
+   * 装備の消費は DB を書き換える副作用なので、**必ず資金グループの中から呼ぶ**
+   * （外で消費すると、精算が落ちたときお守りだけ消える）。通常は `settleSolo()` 経由で、
+   * 賭けを伴わない払い出し（スロットのフリースピン等）だけ直接呼ぶ。
+   */
+  consumeAmulets(userId: string, bet: number, rawPayout: number): { payout: number; note?: string } {
+    if (!this.ether.chipTx.isActive()) {
+      throw new ChipTxError("ERR_NO_GROUP", { reason: "お守りの消費はグループの中で行う", userId });
+    }
+    const items = this.items;
+    if (!items) return { payout: rawPayout };
+    if (rawPayout > bet) {
+      const b = items.consumeWinBonus(userId, rawPayout, bet);
+      return b.bonus > 0 ? { payout: rawPayout + b.bonus, note: b.note } : { payout: rawPayout };
+    }
+    if (rawPayout < bet) {
+      const p = items.consumeLossProtection(userId, bet);
+      if (p.refund > 0) return { payout: p.refund, note: p.note };
+    }
+    return { payout: rawPayout };
   }
 
   /**
    * ジャックポット払い出し（当選）。
    * @param share 取れる割合（既定 1 = 全額。スロットは 0.5 = 半分獲得・半分シード残留）
    */
-  seizeJackpot(userId: string, game: string, share = 1): number {
-    return this.db.transaction((): number => {
+  seizeJackpot(userId: string, game: string, operationId: string, share = 1): number {
+    const key = `jackpot:${game}:${userId}:${operationId}`;
+    return this.ether.runGroup({ groupKey: key, kind: "solo_game", actorId: userId }, (): number => {
       const pool = this.jackpotPool();
       const amount = Math.floor(pool * Math.min(1, Math.max(0, share)));
       if (amount <= 0) return 0;
-      this.ether.transfer(JACKPOT_HOLDER, userId, amount);
+      this.ether.transfer(JACKPOT_HOLDER, userId, amount, { game, reason: "ジャックポット当選" });
       this.events.log("casino_jackpot", { actor: userId, payload: { game, amount, poolBefore: pool } });
       return amount;
-    })();
+    });
   }
 
   /** 戦績更新。payout > bet で勝ち、payout < bet で負け、同額はノーカウント（引き分け） */

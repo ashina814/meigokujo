@@ -162,8 +162,34 @@ export {
   type EtherQuote,
   type EtherErrorCode,
   type EtherExchangeOptions,
+  type ChipMoveInfo,
 } from "./casino/exchange.js";
-export { Casino, JACKPOT_HOLDER, RELIEF_HOLDER, CHAIN_TIERS, chainMultiplier, fukuRate, type CasinoStatsRow, type SettleResult, type CasinoOptions } from "./casino/service.js";
+export {
+  ChipTx,
+  ChipTxError,
+  CHIP_OPENING_VERSION_KEY,
+  LEGACY_OPENING_VERSION,
+  type ChipTxKind,
+  type ChipMove,
+  type ChipGroupInput,
+  type ChipGroupRow,
+  type ChipTxRow,
+  type ChipBalanceMismatch,
+  type ChipTxErrorCode,
+} from "./casino/chip-tx.js";
+export {
+  Casino,
+  JACKPOT_HOLDER,
+  RELIEF_HOLDER,
+  CHAIN_TIERS,
+  chainMultiplier,
+  fukuRate,
+  type CasinoStatsRow,
+  type SettleResult,
+  type SoloRoundResult,
+  type SoloRoundOptions,
+  type CasinoOptions,
+} from "./casino/service.js";
 export { Daily, type DailyClaim, type DailyClaimResult, type DailyOptions } from "./casino/daily.js";
 export { Items, CONSUMABLES, getConsumableDef, type ItemKind as CasinoItemKind, type ConsumableDef, type ArmResult } from "./casino/items.js";
 export { Stocks, StockError, STOCK_HOLD_DAYS, STOCK_SELL_FEE_RATE, type Stock, type Holding, type StockErrorCode } from "./casino/stocks.js";
@@ -172,6 +198,7 @@ export {
   Markets,
   MarketError,
   DISPUTE_WINDOW_SEC,
+  MARKET_FINALIZER,
   marketEscrowHolder,
   type Market,
   type MarketBet,
@@ -181,6 +208,7 @@ export {
   type MarketFundMode,
   type PayoutMode,
   type MarketSettleResult,
+  type MarketRefundResult,
 } from "./casino/market.js";
 export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";
 export { Escrow, escrowHolderFor, isEscrowHolder, ESCROW_QUARANTINE, type EscrowRow } from "./casino/escrow.js";

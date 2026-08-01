@@ -411,6 +411,73 @@ CREATE TABLE IF NOT EXISTS ether_balances (
   updated_at INTEGER NOT NULL
 );
 
+-- 賭場チップの取引監査（大型UPD PR1）。チップ残高は現在値しか持たないので、
+-- 「業務操作の単位(group)」と「その中の1移動(tx)」を追記し、開始残高から再現できるようにする。
+CREATE TABLE IF NOT EXISTS casino_tx_groups (
+  group_key    TEXT PRIMARY KEY,                 -- 業務操作の冪等キー
+  kind         TEXT NOT NULL,                    -- solo_game / table_settle / deposit など
+  status       TEXT NOT NULL CHECK (status IN ('settled','failed')),
+  actor_id     TEXT NOT NULL,
+  result_json  TEXT,                             -- 二度目の呼び出しへ返す結果
+  created_at   INTEGER NOT NULL,
+  settled_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_casino_tx_groups_kind ON casino_tx_groups(kind, created_at);
+
+CREATE TABLE IF NOT EXISTS casino_tx (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_key    TEXT NOT NULL REFERENCES casino_tx_groups(group_key),
+  seq          INTEGER NOT NULL,
+  tx_kind      TEXT NOT NULL CHECK (tx_kind IN ('internal_transfer','deposit','redeem')),
+  from_holder  TEXT,
+  to_holder    TEXT,
+  amount       INTEGER NOT NULL CHECK (amount > 0),
+  reason       TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+  game         TEXT,
+  session_id   TEXT,
+  actor_id     TEXT NOT NULL,
+  opening_version TEXT NOT NULL,                     -- この取引が属する開始残高の版（検算の窓）
+  land_amount  INTEGER,                              -- 預入・返還で動いたLand（内部移動はNULL）
+  ledger_tx_id INTEGER REFERENCES transactions(id),
+  created_at   INTEGER NOT NULL,
+  -- 内部移動は両側必須でLandを動かさない。預入は発行、返還は消却。
+  -- 預入・返還は動いたLand額を必ず持ち、1 Ldでも動いたなら対応するLand取引IDも必須。
+  -- （端数で0 Ldになる返還は現行仕様として存在するため、land_amount = 0 のときだけID無しを許す）
+  CHECK (
+    (tx_kind = 'internal_transfer' AND from_holder IS NOT NULL AND to_holder IS NOT NULL
+      AND ledger_tx_id IS NULL AND land_amount IS NULL)
+    OR (tx_kind = 'deposit' AND from_holder IS NULL AND to_holder IS NOT NULL
+      AND land_amount IS NOT NULL AND land_amount > 0 AND ledger_tx_id IS NOT NULL)
+    OR (tx_kind = 'redeem' AND from_holder IS NOT NULL AND to_holder IS NULL
+      AND land_amount IS NOT NULL AND land_amount >= 0
+      AND (land_amount = 0 OR ledger_tx_id IS NOT NULL))
+  ),
+  UNIQUE (group_key, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_casino_tx_group ON casino_tx(group_key, seq);
+CREATE INDEX IF NOT EXISTS idx_casino_tx_version ON casino_tx(opening_version, id);
+CREATE INDEX IF NOT EXISTS idx_casino_tx_from ON casino_tx(from_holder, id);
+CREATE INDEX IF NOT EXISTS idx_casino_tx_to ON casino_tx(to_holder, id);
+
+-- 開始残高の版。版の前後関係は version_seq（単調増加）で決める。
+-- 取引IDで順序を決めると、取引を挟まず2つの版を作った場合や、開業初期化で
+-- casino_tx を初期化した場合（新版のIDが旧版より小さくなる）に順序が壊れる。
+CREATE TABLE IF NOT EXISTS casino_chip_opening_versions (
+  opening_version TEXT PRIMARY KEY,
+  version_seq     INTEGER NOT NULL UNIQUE,
+  from_tx_id      INTEGER NOT NULL,          -- 参考値（その時点の最終取引ID）
+  created_at      INTEGER NOT NULL
+);
+
+-- 検算の出発点。ここに載せた版の残高 + その版の窓の casino_tx = その時点の残高 になる
+CREATE TABLE IF NOT EXISTS casino_chip_opening_balances (
+  opening_version TEXT NOT NULL,
+  holder          TEXT NOT NULL,
+  amount          INTEGER NOT NULL CHECK (amount >= 0),
+  created_at      INTEGER NOT NULL,
+  PRIMARY KEY (opening_version, holder)
+);
+
 CREATE TABLE IF NOT EXISTS shop_items (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   name              TEXT NOT NULL,
@@ -519,9 +586,12 @@ CREATE TABLE IF NOT EXISTS fiscal_runs (
 `;
 
 export function openDb(path: string): Database.Database {
-  const db = new Database(path);
+  // 複数接続（別プロセス・別スレッド）から同じDBを触ったとき、ロック待ちで即失敗せず
+  // 待ってから再試行できるようにする。賭場の業務グループは書き込みが衝突しうる。
+  const db = new Database(path, { timeout: 5_000 });
   if (path !== ":memory:") {
     db.pragma("journal_mode = WAL");
+    db.pragma("busy_timeout = 5000");
   }
   db.pragma("foreign_keys = ON");
   // マイグレーション: den_vcs.kind の古い CHECK 制約（応接室を弾く）を外すため作り直す。

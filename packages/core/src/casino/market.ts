@@ -18,6 +18,14 @@ import { MARKET_HOUSE_CUT } from "./game-models.js";
 /** 板の場代率。単一の真実源は game-models.MARKET_HOUSE_CUT */
 const HOUSE_CUT = MARKET_HOUSE_CUT;
 const DEFAULT_FEE = 500;
+/**
+ * 板の最終処理（返金・無効化）の実行者ID。
+ *
+ * `runGroup` は同じ鍵で kind / actorId が違うと鍵の取り違えとして拒否する。
+ * 返金・無効化は「管理者A → 別の管理者B → 起動時掃除」と別々の主体から再試行されうるので、
+ * actor を鍵の同一性に混ぜない。誰が実行したかは events 側に残す。
+ */
+export const MARKET_FINALIZER = "system:market";
 export const DISPUTE_WINDOW_SEC = 5 * 60;
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -280,6 +288,8 @@ export class Markets {
     durationMin: number;
     payoutMode?: PayoutMode;
     fee?: number;
+    /** この作成操作を一意に指す値。同じ操作の再試行では同じ値を渡す */
+    operationId: string;
   }): Market {
     if (input.options.length < 2 || input.options.length > 4) {
       throw new MarketError("ERR_BAD_OPTION", { count: input.options.length });
@@ -293,14 +303,18 @@ export class Markets {
     }
     const fee = input.fee ?? DEFAULT_FEE;
     if (!Number.isInteger(fee) || fee < 0) throw new MarketError("ERR_BAD_AMOUNT", { fee });
-    // 手数料徴収は呼び出し側が担保する前提（残高不足なら例外なしで通ってしまう）→ 呼び出し側で先に balance check
-    if (fee > 0 && this.ether.balanceOf(input.creatorId) < fee) {
-      throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(input.creatorId), fee });
-    }
     const t = now();
     const deadline = t + input.durationMin * 60;
-    return this.db.transaction((): Market => {
-      if (fee > 0) this.ether.transfer(input.creatorId, JACKPOT_HOLDER, fee);
+    return this.ether.runGroup(
+      { groupKey: `market:create:${input.creatorId}:${input.operationId}`, kind: "market_bet", actorId: input.creatorId },
+      (): Market => {
+      // 残高判定はグループの中（作成成功後の再試行を残高不足で落とさない）
+      if (fee > 0 && this.ether.balanceOf(input.creatorId) < fee) {
+        throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(input.creatorId), fee });
+      }
+      if (fee > 0) {
+        this.ether.transfer(input.creatorId, JACKPOT_HOLDER, fee, { reason: "板の開設手数料", game: "market" });
+      }
       // 新規板は必ず fund_mode='escrow'（賭け金を escrow:market:<id> に分離する）
       const info = this.db
         .prepare(
@@ -314,7 +328,7 @@ export class Markets {
         payload: { id, title: input.title, options: input.options, deadline, payoutMode, fee },
       });
       return this.get(id)!;
-    })();
+    });
   }
 
   get(id: number): Market | undefined {
@@ -379,53 +393,60 @@ export class Markets {
    * escrow 残高 === 既存 pot でなければベットを受け付けず、市場を frozen にする。
    * これで起動時以外に資金不整合が生じても、追加利用者の資金を巻き込まない。
    */
-  bet(marketId: number, userId: string, optionIndex: number, amount: number): { previous: number | null; net: number } {
+  bet(marketId: number, userId: string, optionIndex: number, amount: number, operationId: string): { previous: number | null; net: number } {
+    // 引数の形だけ先に見る。板の状態・締切・既存 pot・エスクロー整合はすべてグループの中で見る
+    // （成功済みの操作を再試行したとき、保存済みの結果を返す前に「もう締切だ」で落とさないため）
     if (!Number.isInteger(amount) || amount <= 0) throw new MarketError("ERR_BAD_AMOUNT", { amount });
-    const m = this.get(marketId);
-    if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { marketId });
-    if (m.status !== "open") throw new MarketError("ERR_NOT_OPEN", { marketId, status: m.status });
-    if (m.deadline_at <= now()) throw new MarketError("ERR_NOT_OPEN", { marketId, deadline: m.deadline_at });
-    // 旧方式（legacy_house）や未知の fund_mode には新規ベットを受け付けない（escrow のみ）
-    if (m.fund_mode !== "escrow") throw new MarketError("ERR_LEGACY_BET_FORBIDDEN", { marketId, mode: m.fund_mode });
-    const options = JSON.parse(m.options_json) as string[];
-    if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= options.length) {
-      throw new MarketError("ERR_BAD_OPTION", { optionIndex, count: options.length });
-    }
-
-    // ── 資金整合ガード: escrow 残高 === 既存 pot（全ベット合計）を検証 ──
     const escHolder = marketEscrowHolder(marketId);
-    const existingPot = (
-      this.db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM casino_market_bets WHERE market_id = ?").get(marketId) as { s: number }
-    ).s;
-    if (existingPot > 0) {
-      const escBal = this.ether.balanceOf(escHolder);
-      if (escBal !== existingPot) {
-        // 不整合 → 市場を凍結し、資金を一切動かさず例外。監査ログに記録。
-        this.freeze(marketId, "system:bet-guard", "escrow_mismatch_on_bet", { existingPot, escrowBalance: escBal });
-        if (escBal < existingPot) {
-          throw new MarketError("ERR_UNDERFUNDED_ESCROW", { marketId, pot: existingPot, escrowBalance: escBal });
-        }
-        throw new MarketError("ERR_ESCROW_MISMATCH", { marketId, pot: existingPot, escrowBalance: escBal, mode: m.fund_mode });
+    let freezeRequest: { reason: string; meta: Record<string, unknown> } | null = null;
+    try {
+      return this.ether.runGroup(
+        { groupKey: `market:bet:${marketId}:${userId}:${operationId}`, kind: "market_bet", actorId: userId },
+        (): { previous: number | null; net: number } => {
+      const m = this.get(marketId);
+      if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { marketId });
+      if (m.status !== "open") throw new MarketError("ERR_NOT_OPEN", { marketId, status: m.status });
+      if (m.deadline_at <= now()) throw new MarketError("ERR_NOT_OPEN", { marketId, deadline: m.deadline_at });
+      // 旧方式（legacy_house）や未知の fund_mode には新規ベットを受け付けない（escrow のみ）
+      if (m.fund_mode !== "escrow") throw new MarketError("ERR_LEGACY_BET_FORBIDDEN", { marketId, mode: m.fund_mode });
+      const options = JSON.parse(m.options_json) as string[];
+      if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= options.length) {
+        throw new MarketError("ERR_BAD_OPTION", { optionIndex, count: options.length });
       }
-    }
 
-    const existingRows = this.db
-      .prepare("SELECT amount FROM casino_market_bets WHERE market_id = ? AND user_id = ?")
-      .all(marketId, userId) as Array<{ amount: number }>;
-    const existingTotal = existingRows.reduce((s, r) => s + r.amount, 0);
-    const additionalRequired = Math.max(0, amount - existingTotal);
-    if (this.ether.balanceOf(userId) < additionalRequired) {
-      throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(userId), additionalRequired, amount, existingTotal });
-    }
+      // ── 資金整合ガード: escrow 残高 === 既存 pot（全ベット合計）を検証 ──
+      const existingPot = (
+        this.db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM casino_market_bets WHERE market_id = ?").get(marketId) as { s: number }
+      ).s;
+      if (existingPot > 0) {
+        const escBal = this.ether.balanceOf(escHolder);
+        if (escBal !== existingPot) {
+          // 不整合 → 資金を一切動かさず例外。凍結はグループの外で行う
+          //（グループの中で status を書いても、この例外で一緒に巻き戻ってしまう）
+          freezeRequest = { reason: "escrow_mismatch_on_bet", meta: { existingPot, escrowBalance: escBal } };
+          if (escBal < existingPot) {
+            throw new MarketError("ERR_UNDERFUNDED_ESCROW", { marketId, pot: existingPot, escrowBalance: escBal });
+          }
+          throw new MarketError("ERR_ESCROW_MISMATCH", { marketId, pot: existingPot, escrowBalance: escBal, mode: m.fund_mode });
+        }
+      }
 
-    return this.db.transaction((): { previous: number | null; net: number } => {
+      const existingRows = this.db
+        .prepare("SELECT amount FROM casino_market_bets WHERE market_id = ? AND user_id = ?")
+        .all(marketId, userId) as Array<{ amount: number }>;
+      const existingTotal = existingRows.reduce((s, r) => s + r.amount, 0);
+      const additionalRequired = Math.max(0, amount - existingTotal);
+      // 残高判定もグループの中（張った後の再試行を残高不足で落とさない）
+      if (this.ether.balanceOf(userId) < additionalRequired) {
+        throw new MarketError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(userId), additionalRequired, amount, existingTotal });
+      }
       if (existingTotal > 0) {
         // 張り直し: 既存分は escrow に入っているのでそこから返す（fund_mode='escrow' 確定済み）
-        this.ether.transfer(escHolder, userId, existingTotal);
+        this.ether.transfer(escHolder, userId, existingTotal, { reason: "板の賭け直しによる返金", game: "market", sessionId: `market:${marketId}` });
         this.db.prepare("DELETE FROM casino_market_bets WHERE market_id = ? AND user_id = ?").run(marketId, userId);
       }
       // 新規徴収は必ず板ごとの分離保有者へ（胴元の配当余力から切り離す）
-      this.ether.transfer(userId, escHolder, amount);
+      this.ether.transfer(userId, escHolder, amount, { reason: "板への賭け", game: "market", sessionId: `market:${marketId}` });
       this.db
         .prepare("INSERT INTO casino_market_bets (market_id, user_id, option_index, amount, created_at) VALUES (?, ?, ?, ?, ?)")
         .run(marketId, userId, optionIndex, amount, now());
@@ -434,7 +455,14 @@ export class Markets {
         payload: { marketId, optionIndex, amount, previous: existingTotal > 0 ? existingTotal : null },
       });
       return { previous: existingTotal > 0 ? existingTotal : null, net: amount - existingTotal };
-    })();
+        },
+      );
+    } catch (e) {
+      // 資金不整合を見つけたときだけ、巻き戻した後に凍結する（凍結は残さないと次のベットを止められない）
+      const req = freezeRequest as { reason: string; meta: Record<string, unknown> } | null;
+      if (req) this.freeze(marketId, "system:bet-guard", req.reason, req.meta);
+      throw e;
+    }
   }
 
   /**
@@ -553,19 +581,40 @@ export class Markets {
 
   /**
    * 管理者裁定: 無効化 → 全額返金 & void。
+   *
+   * 状態判定・返金・status 更新・イベント記録をすべて同じグループに入れる。
+   * 状態判定を外に置くと、成功後（status='void'）の再試行が保存済みの結果を返す前に
+   * ERR_NOT_DISPUTED で落ちる。
    */
-  adminVoid(id: number, actor: string): void {
-    const m = this.get(id);
-    if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { id });
-    if (m.status !== "disputed") throw new MarketError("ERR_NOT_DISPUTED", { status: m.status });
-    this.db.transaction(() => {
-      const bets = this.bets(id);
-      const pot = bets.reduce((s, b) => s + b.amount, 0);
-      const src = this.fundHolder(m, pot);
-      for (const b of bets) this.ether.transfer(src, b.user_id, b.amount);
-      this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), id);
-    })();
-    this.events.log("market_admin_void", { actor, payload: { id } });
+  adminVoid(id: number, actor: string): MarketRefundResult {
+    return this.ether.runGroup(
+      { groupKey: `market:void:${id}`, kind: "market_settle", actorId: MARKET_FINALIZER },
+      (): MarketRefundResult => {
+        const m = this.get(id);
+        if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { id });
+        if (m.status !== "disputed") throw new MarketError("ERR_NOT_DISPUTED", { status: m.status });
+        const refunded = this.refundAllBets(m, "板の返金");
+        this.events.log("market_admin_void", { actor, payload: { id, refunded: refunded.refunded, users: refunded.users } });
+        return refunded;
+      },
+    );
+  }
+
+  /**
+   * 全ベットを資金源へ突き合わせて返し、板を void にする（呼び出し元のグループの中で使う）。
+   * `_beforeStep` はテスト専用のフック（各返金の直前に呼ばれる）。本番呼び出しは省略する。
+   */
+  private refundAllBets(m: Market, reason: string, _beforeStep?: (index: number, bet: MarketBet) => void): MarketRefundResult {
+    const bets = this.bets(m.id);
+    const pot = bets.reduce((s, b) => s + b.amount, 0);
+    const src = this.fundHolder(m, pot);
+    for (let i = 0; i < bets.length; i++) {
+      const b = bets[i]!;
+      _beforeStep?.(i, b);
+      this.ether.transfer(src, b.user_id, b.amount, { reason, game: "market", sessionId: `market:${m.id}` });
+    }
+    this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), m.id);
+    return { id: m.id, refunded: pot, users: bets.length, alreadyClosed: false };
   }
 
   /**
@@ -573,7 +622,9 @@ export class Markets {
    * approve 全員 / DISPUTE_WINDOW 経過 / adminResolve のいずれかから呼ばれる。
    */
   private settle(id: number): MarketSettleResult {
-    return this.db.transaction((): MarketSettleResult => {
+    return this.ether.runGroup(
+      { groupKey: `market:settle:${id}`, kind: "market_settle", actorId: "system:market" },
+      (): MarketSettleResult => {
       const m = this.get(id)!;
       if (m.status !== "reported" || m.result_option == null) {
         return { id, pot: 0, houseCut: 0, distributable: 0, winnerCount: 0, payouts: [], mode: m.payout_mode, resultOption: m.result_option, void: true };
@@ -588,7 +639,9 @@ export class Markets {
 
       // 的中者なし → 全額返金 & void
       if (winners.length === 0) {
-        for (const b of bets) this.ether.transfer(src, b.user_id, b.amount);
+        for (const b of bets) {
+          this.ether.transfer(src, b.user_id, b.amount, { reason: "板の返金", game: "market", sessionId: `market:${id}` });
+        }
         this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), id);
         this.events.log("market_settle_void", { actor: "system", payload: { id, pot } });
         return { id, pot, houseCut: 0, distributable: 0, winnerCount: 0, payouts: [], mode: m.payout_mode, resultOption: m.result_option, void: true };
@@ -596,7 +649,9 @@ export class Markets {
 
       // 場代（勝者精算の前に JP へ抜く）
       const houseCut = Math.floor(pot * HOUSE_CUT);
-      if (houseCut > 0) this.ether.transfer(src, JACKPOT_HOLDER, houseCut);
+      if (houseCut > 0) {
+        this.ether.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "板の胴元取り分", game: "market", sessionId: `market:${id}` });
+      }
       const distributable = pot - houseCut;
 
       const payouts: Array<{ userId: string; amount: number }> = [];
@@ -607,7 +662,9 @@ export class Markets {
           const w = winners[i]!;
           const isLast = i === winners.length - 1;
           const share = isLast ? remaining : Math.floor((distributable * w.amount) / winnersPot);
-          if (share > 0) this.ether.transfer(src, w.user_id, share);
+          if (share > 0) {
+            this.ether.transfer(src, w.user_id, share, { reason: "板の配当", game: "market", sessionId: `market:${id}` });
+          }
           remaining -= share;
           payouts.push({ userId: w.user_id, amount: share });
         }
@@ -619,7 +676,9 @@ export class Markets {
         for (let i = 0; i < uniqueWinners.length; i++) {
           const uid = uniqueWinners[i]!;
           const share = i === 0 ? per + leftover : per;
-          if (share > 0) this.ether.transfer(src, uid, share);
+          if (share > 0) {
+            this.ether.transfer(src, uid, share, { reason: "板の配当", game: "market", sessionId: `market:${id}` });
+          }
           payouts.push({ userId: uid, amount: share });
         }
       }
@@ -640,24 +699,30 @@ export class Markets {
         resultOption: m.result_option,
         void: false,
       };
-    })();
+    });
   }
 
   /**
    * 板を強制返金 & void 化。管理者裁定 or 起動時未精算掃除に使う。
+   *
+   * 状態判定・返金・status 更新・イベント記録をすべて同じグループに入れる。
+   * 外で「もう settled/void なら何もしない」と早期に返していたときは、
+   * 成功後の再試行が保存済みの結果ではなく黙った no-op になっていた。
    */
-  refund(id: number, actor: string): void {
-    const m = this.get(id);
-    if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { id });
-    if (m.status === "settled" || m.status === "void") return;
-    this.db.transaction(() => {
-      const bets = this.bets(id);
-      const pot = bets.reduce((s, b) => s + b.amount, 0);
-      const src = this.fundHolder(m, pot);
-      for (const b of bets) this.ether.transfer(src, b.user_id, b.amount);
-      this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), id);
-    })();
-    this.events.log("market_void", { actor, payload: { id } });
+  refund(id: number, actor: string, _beforeStep?: (index: number, bet: MarketBet) => void): MarketRefundResult {
+    return this.ether.runGroup(
+      { groupKey: `market:refund:${id}`, kind: "market_settle", actorId: MARKET_FINALIZER },
+      (): MarketRefundResult => {
+        const m = this.get(id);
+        if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { id });
+        if (m.status === "settled" || m.status === "void") {
+          return { id, refunded: 0, users: 0, alreadyClosed: true };
+        }
+        const refunded = this.refundAllBets(m, "板の返金", _beforeStep);
+        this.events.log("market_void", { actor, payload: { id, refunded: refunded.refunded, users: refunded.users } });
+        return refunded;
+      },
+    );
   }
 
   /**
@@ -704,6 +769,17 @@ export class Markets {
     }
     return { total: rows.length, refunded, frozen, failed };
   }
+}
+
+/** 返金・無効化の結果。同じ操作の再試行はこの値がそのまま再生される */
+export interface MarketRefundResult {
+  id: number;
+  /** 返した総額 */
+  refunded: number;
+  /** 返金した人数 */
+  users: number;
+  /** すでに settled / void だったので何もしなかった */
+  alreadyClosed: boolean;
 }
 
 export interface MarketSettleResult {

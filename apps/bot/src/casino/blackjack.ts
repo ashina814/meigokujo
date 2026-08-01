@@ -12,7 +12,7 @@ import {
 import type { CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -161,8 +161,11 @@ async function runRound(
   };
 
   const finish = async (rawPayout: number, note: string) => {
-    const amulet = applyAmulets(services, uid, totalBet, rawPayout);
-    const settled = services.casino.settle(uid, "ブラックジャック", totalBet, amulet.payout);
+    // お守りの消費も賭け・配当と同じグループの中（settleSolo）。外で消すと精算が落ちたときお守りだけ消える
+    const settled = services.casino.settleSolo(uid, "ブラックジャック", totalBet, rawPayout, {
+      operationId: interaction.id,
+    });
+    const amulet = { note: settled.amuletNote };
     const won = settled.net > 0;
     const push = settled.net === 0 && rawPayout > 0;
     const chainLine = settled.chainBonus > 0

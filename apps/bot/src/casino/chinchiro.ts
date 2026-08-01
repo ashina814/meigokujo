@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -12,7 +13,7 @@ import {
 import { HOUSE_HOLDER, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, applyAmulets, releaseSeat, sleep, validateBet } from "./common.js";
+import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -93,6 +94,68 @@ function describe(h: Hand): string {
     case "me": return `🎲 **目** スコア **${h.score}**`;
     case "menashi": return "🌀 **メナシ**（役なし）";
   }
+}
+
+/**
+ * 1ラウンドの確定結果。`result_json` に保存され、同じ操作の再試行はここから再生される。
+ * 分岐（勝ち／引分／通常負け／倍付け負け／残高不足フォールバック）も保存対象。
+ */
+export interface ChinchiroRound {
+  branch: "win" | "push" | "loss" | "double_loss" | "fallback_loss";
+  settled: import("@meigokujo/core").SoloRoundResult;
+  amuletNote: string | null;
+  /** 倍付け負けの追加徴収額（それ以外は 0） */
+  extra: number;
+}
+
+/**
+ * 1ラウンドの精算。勝ち・引分・通常負け・倍付け負け・残高不足フォールバックを
+ * **すべて同じグループ**で処理する。
+ *
+ * 分岐ごとに別の鍵を使うと、倍付け負けの後の再試行が通常負け側へ回り、
+ * 別グループでもう一度徴収できてしまう。残高判定もグループの中に置いて、
+ * 最初に確定した分岐と結果を `result_json` から再生する。
+ *
+ * @param mul 勝敗倍率（>0 勝ち / 0 引分 / -1 通常負け / ≤-2 倍付け負け）
+ */
+export function settleChinchiroRound(
+  services: Services,
+  uid: string,
+  bet: number,
+  mul: number,
+  operationId: string,
+): ChinchiroRound {
+  return services.ether.runGroup(
+    { groupKey: `chinchiro:round:${uid}:${operationId}`, kind: "solo_game", actorId: uid },
+    (): ChinchiroRound => {
+      const held = services.ether.balanceOf(uid);
+      if (mul > 0) {
+        // 勝ち: profit = bet * mul * (1 - edge)、payout = bet + profit
+        const rawPayout = bet + Math.floor(bet * mul * (1 - HOUSE_EDGE));
+        const settled = services.casino.settleSolo(uid, "チンチロ", bet, rawPayout, { operationId });
+        return { branch: "win", settled, amuletNote: settled.amuletNote ?? null, extra: 0 };
+      }
+      if (mul === 0) {
+        // プッシュ（両方ヒフミ）: 返金
+        const settled = services.casino.settleSolo(uid, "チンチロ", bet, bet, { operationId });
+        return { branch: "push", settled, amuletNote: settled.amuletNote ?? null, extra: 0 };
+      }
+      const extraNeeded = mul <= -2 ? (Math.abs(mul) - 1) * bet : 0;
+      // 倍付け負けは追加徴収まで払えるときだけ。払えなければ通常負けへフォールバック
+      const doubleLoss = extraNeeded > 0 && held >= bet + extraNeeded;
+      const settled = services.casino.settleSolo(uid, "チンチロ", bet, 0, { operationId });
+      if (doubleLoss) {
+        services.ether.transfer(uid, HOUSE_HOLDER, extraNeeded, { reason: "倍付け負けの追加徴収", game: "チンチロ" });
+        return { branch: "double_loss", settled, amuletNote: settled.amuletNote ?? null, extra: extraNeeded };
+      }
+      return {
+        branch: extraNeeded > 0 ? "fallback_loss" : "loss",
+        settled,
+        amuletNote: settled.amuletNote ?? null,
+        extra: 0,
+      };
+    },
+  );
 }
 
 const isTerminal = (h: Hand) => h.type !== "me" && h.type !== "menashi";
@@ -355,22 +418,17 @@ async function runRound(
   // ── 精算 ──
   const cmp = compare(playerHand, dealerHand);
   const mul = cmp.mul;
-  const held = services.ether.balanceOf(uid);
+  const round = settleChinchiroRound(services, uid, bet, mul, interaction.id);
 
   let payoutText = "";
-  let title = "🎲 チンチロ — 対 マモン";
+  const title = "🎲 チンチロ — 対 マモン";
   let color = C_LOSE;
   let extraNote = "";
   let netForDisplay = 0;
+  const amuletNote = round.amuletNote ? `✨ ${round.amuletNote}` : "";
+  const settled = round.settled;
 
-  let amuletNote = "";
-  if (mul > 0) {
-    // 勝ち: profit = bet * mul * (1 - edge)、payout = bet + profit
-    const profit = Math.floor(bet * mul * (1 - HOUSE_EDGE));
-    const rawPayout = bet + profit;
-    const amulet = applyAmulets(services, uid, bet, rawPayout);
-    if (amulet.note) amuletNote = `✨ ${amulet.note}`;
-    const settled = services.casino.settle(uid, "チンチロ", bet, amulet.payout);
+  if (round.branch === "win") {
     color = C_WIN;
     netForDisplay = settled.net;
     const chainLine = settled.chainBonus > 0
@@ -381,33 +439,20 @@ async function runRound(
       : "";
     payoutText = `💰 配当 ${fmtEther(settled.payout)}（利益 +${fmtEther(settled.net)}）${chainLine}${fukuLine}`;
     broadcastBigWin(interaction.client, services, { userId: uid, game: "チンチロ", bet, payout: settled.payout });
-  } else if (mul === 0) {
-    // プッシュ（両方ヒフミ）: 返金
-    services.casino.settle(uid, "チンチロ", bet, bet);
+  } else if (round.branch === "push") {
     color = C_MAMMON;
     payoutText = `🌀 プッシュ：${fmtEther(bet)} を返金`;
-  } else if (mul === -1) {
-    // 通常負け: bet だけ徴収。ただし敗北保護お守りがあれば返金
-    const lossAmulet = applyAmulets(services, uid, bet, 0);
-    if (lossAmulet.note) amuletNote = `✨ ${lossAmulet.note}`;
-    services.casino.settle(uid, "チンチロ", bet, lossAmulet.payout);
-    netForDisplay = lossAmulet.payout - bet;
-    payoutText = lossAmulet.payout > 0 ? `🛡 返金 ${fmtEther(lossAmulet.payout)}` : `💸 -${fmtEther(bet)}`;
+  } else if (round.branch === "double_loss") {
+    const totalLoss = bet + round.extra;
+    netForDisplay = -totalLoss;
+    payoutText = `💀 -${fmtEther(totalLoss)}（${Math.abs(mul)}倍負け）`;
+  } else if (round.branch === "fallback_loss") {
+    netForDisplay = -bet;
+    payoutText = `💸 -${fmtEther(bet)}（残高不足で追加徴収なし）`;
+    extraNote = "\n*※本来は倍付け負けだったが、残高不足のため通常負けにフォールバック*";
   } else {
-    // 倍付け負け: bet + (|mul|-1)*bet を徴収。残高不足なら通常負けフォールバック
-    const extraNeeded = (Math.abs(mul) - 1) * bet;
-    if (held >= bet + extraNeeded) {
-      services.casino.settle(uid, "チンチロ", bet, 0);
-      services.ether.transfer(uid, HOUSE_HOLDER, extraNeeded);
-      const totalLoss = bet + extraNeeded;
-      netForDisplay = -totalLoss;
-      payoutText = `💀 -${fmtEther(totalLoss)}（${Math.abs(mul)}倍負け）`;
-    } else {
-      services.casino.settle(uid, "チンチロ", bet, 0);
-      netForDisplay = -bet;
-      payoutText = `💸 -${fmtEther(bet)}（残高不足で追加徴収なし）`;
-      extraNote = "\n*※本来は倍付け負けだったが、残高不足のため通常負けにフォールバック*";
-    }
+    netForDisplay = settled.payout - bet;
+    payoutText = settled.payout > 0 ? `🛡 返金 ${fmtEther(settled.payout)}` : `💸 -${fmtEther(bet)}`;
   }
 
   const resultLabel =

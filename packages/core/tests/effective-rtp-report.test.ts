@@ -1,3 +1,4 @@
+import { testTransfer, opId } from "./helpers/chip-ctx.js";
 import { beforeEach, describe, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
@@ -66,8 +67,8 @@ function setup(seedHouseEther = 50_000_000, seedPlayerEther = 5_000_000): Ctx {
 /** プレイヤー残高を fuku しきい値未満（<100,000 ether）に維持しつつ N 回プレイ */
 function keepLowBalance(ctx: Ctx) {
   const bal = ctx.ether.balanceOf("a");
-  if (bal < 5_000) ctx.ether.transfer(HOUSE_HOLDER, "a", 50_000);
-  if (bal > 90_000) ctx.ether.transfer("a", HOUSE_HOLDER, bal - 50_000);
+  if (bal < 5_000) testTransfer(ctx.ether, HOUSE_HOLDER, "a", 50_000);
+  if (bal > 90_000) testTransfer(ctx.ether, "a", HOUSE_HOLDER, bal - 50_000);
 }
 
 /** 実測 RTP を計算するヘルパ。settle の payout を集計 */
@@ -86,9 +87,9 @@ function slotsRoundBase(ctx: Ctx, rng: ReturnType<typeof deterministicRng>, bet:
   keepLowBalance(ctx);
   const reels: [SlotSymbol, SlotSymbol, SlotSymbol] = [spinReel(rng), spinReel(rng), spinReel(rng)];
   const out = evaluate(reels, bet);
-  const r = ctx.casino.settle("a", "slots", bet, out.payout, opts.jpCut, { chain: opts.chain, fuku: opts.fuku });
+  const r = ctx.casino.settle("a", "slots", bet, out.payout, opts.jpCut, { chain: opts.chain, fuku: opts.fuku, operationId: opId() });
   let extra = 0;
-  if (out.kind === "jackpot") extra = ctx.casino.seizeJackpot("a", "slots", SLOTS_JP_WIN_SHARE);
+  if (out.kind === "jackpot") extra = ctx.casino.seizeJackpot("a", "slots", opId(), SLOTS_JP_WIN_SHARE);
   return { payout: r.payout + extra };
 }
 
@@ -96,7 +97,7 @@ function slotsRoundBase(ctx: Ctx, rng: ReturnType<typeof deterministicRng>, bet:
 function chohanRoundBase(ctx: Ctx, rng: ReturnType<typeof deterministicRng>, bet: number, opts: { chain: boolean; fuku: boolean }): { payout: number } {
   keepLowBalance(ctx);
   const payout = chohanRollAndPay(rng, bet, "cho");
-  const r = ctx.casino.settle("a", "chohan", bet, payout, 0, { chain: opts.chain, fuku: opts.fuku });
+  const r = ctx.casino.settle("a", "chohan", bet, payout, 0, { chain: opts.chain, fuku: opts.fuku, operationId: opId() });
   return { payout: r.payout };
 }
 
@@ -108,7 +109,7 @@ function rouletteRoundBase(ctx: Ctx, rng: ReturnType<typeof deterministicRng>, b
   const RED = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
   const won = RED.has(n);
   const payout = won ? bet * 2 : 0;
-  const r = ctx.casino.settle("a", "roulette", bet, payout, 0, { chain: opts.chain, fuku: opts.fuku });
+  const r = ctx.casino.settle("a", "roulette", bet, payout, 0, { chain: opts.chain, fuku: opts.fuku, operationId: opId() });
   return { payout: r.payout };
 }
 
@@ -118,7 +119,7 @@ function crashRoundBase(ctx: Ctx, rng: ReturnType<typeof deterministicRng>, bet:
   const crash = crashPoint(rng);
   const won = crash >= M;
   const payout = won ? Math.floor(bet * M) : 0;
-  const r = ctx.casino.settle("a", "crash", bet, payout, 0, { chain: opts.chain, fuku: opts.fuku });
+  const r = ctx.casino.settle("a", "crash", bet, payout, 0, { chain: opts.chain, fuku: opts.fuku, operationId: opId() });
   return { payout: r.payout };
 }
 
@@ -219,12 +220,12 @@ describe("実効 RTP レポート（Casino.settle 経由）", () => {
       if (i % 2 === 0) {
         ctx.items.grant("a", "omamori", 1);
         ctx.items.arm("a", "omamori");
-        ctx.ether.transfer("a", HOUSE_HOLDER, 4_000);
+        testTransfer(ctx.ether, "a", HOUSE_HOLDER, 4_000);
         houseFromItems += 4_000;
       } else {
         ctx.items.grant("a", "hoken", 1);
         ctx.items.arm("a", "hoken");
-        ctx.ether.transfer("a", HOUSE_HOLDER, 3_000);
+        testTransfer(ctx.ether, "a", HOUSE_HOLDER, 3_000);
         houseFromItems += 3_000;
       }
       // 勝率 50% 想定（rng でシミュ）
@@ -233,11 +234,11 @@ describe("実効 RTP レポート（Casino.settle 経由）", () => {
       if (won) {
         const bonus = ctx.items.consumeWinBonus("a", bet * 2, bet);
         const adjustedPayout = bet * 2 + bonus.bonus;
-        const r = ctx.casino.settle("a", "amuletsim", bet, adjustedPayout, 0, { chain: false, fuku: false });
+        const r = ctx.casino.settle("a", "amuletsim", bet, adjustedPayout, 0, { chain: false, fuku: false, operationId: opId() });
         received += r.payout;
       } else {
         const prot = ctx.items.consumeLossProtection("a", bet);
-        const r = ctx.casino.settle("a", "amuletsim", bet, prot.refund, 0, { chain: false, fuku: false });
+        const r = ctx.casino.settle("a", "amuletsim", bet, prot.refund, 0, { chain: false, fuku: false, operationId: opId() });
         received += r.payout;
       }
     }
