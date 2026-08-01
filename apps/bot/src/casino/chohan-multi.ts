@@ -136,7 +136,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
           await sub.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
           return;
         }
-        if (!collectStakes(services, [btn.user.id], additional, session, "chohan-multi")) {
+        if (!collectStakes(services, [btn.user.id], additional, `${session}:collect:${btn.id}`, session, "chohan-multi")) {
           await sub.reply({ content: "徴収に失敗した。", flags: MessageFlags.Ephemeral });
           return;
         }
@@ -146,7 +146,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
           await sub.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
           return;
         }
-        if (!collectStakes(services, [btn.user.id], amt, session, "chohan-multi")) {
+        if (!collectStakes(services, [btn.user.id], amt, `${session}:collect:${btn.id}`, session, "chohan-multi")) {
           await sub.reply({ content: "徴収に失敗した。", flags: MessageFlags.Ephemeral });
           return;
         }
@@ -235,6 +235,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
     services,
     winners.map((b) => ({ userId: b.userId, bet: b.amount })),
     losers.map((b) => ({ userId: b.userId, bet: b.amount })),
+    `${session}:settle`,
     session,
   );
 

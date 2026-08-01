@@ -251,7 +251,7 @@ async function runRound(
   const ev = evaluate(hand);
   const rawPayout = ev.payMult > 0 ? bet * ev.payMult : 0;
   const amulet = applyAmulets(services, uid, bet, rawPayout);
-  const settled = services.casino.settle(uid, "ポーカー", bet, amulet.payout);
+  const settled = services.casino.settle(uid, "ポーカー", bet, amulet.payout, 0, { operationId: interaction.id });
 
   const isJp = ev.category === 11;
   const bonusBits: string[] = [];

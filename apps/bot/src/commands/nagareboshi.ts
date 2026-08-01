@@ -168,7 +168,7 @@ export async function handleNagareboshiCommand(
   }
   if (fee > 0) {
     services.ether.runGroup(
-      { groupKey: `nagareboshi:fee:${uid}:${randomUUID()}`, kind: "solo_game", actorId: uid },
+      { groupKey: `nagareboshi:fee:${uid}:${interaction.id}`, kind: "solo_game", actorId: uid },
       () => services.ether.transfer(uid, HOUSE_HOLDER, fee, { reason: "流れ星の祈り代", game: "流れ星" }),
     );
   }
@@ -183,7 +183,7 @@ export async function handleNagareboshiCommand(
     const paid = Math.min(outcome.reward, jpPool);
     if (paid > 0) {
       services.ether.runGroup(
-        { groupKey: `nagareboshi:reward:${uid}:${randomUUID()}`, kind: "solo_game", actorId: uid },
+        { groupKey: `nagareboshi:reward:${uid}:${interaction.id}`, kind: "solo_game", actorId: uid },
         () => services.ether.transfer(JACKPOT_HOLDER, uid, paid, { reason: "流れ星の褒賞", game: "流れ星" }),
       );
       rewardLine = `\n\n💰 **+${fmtEther(paid)}**（JPプールから${paid < outcome.reward ? "・プール残が少なく減額" : ""}）`;

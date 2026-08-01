@@ -228,7 +228,7 @@ async function runRound(
     const amulet = applyAmulets(services, uid, bet, rawPayout);
     // 連鎖ボーナスは無効化（1.5倍固定戦略 × 高勝率で 100% 超になる裁定を防ぐ・PR#6 レビュー指摘）。
     // 福の重みは維持（低残高帯では 0% なので影響なし・高残高帯ではプレイヤーから JP/救済へ流す）。
-    const settled = services.casino.settle(uid, "クラッシュ", bet, amulet.payout, 0, { chain: false });
+    const settled = services.casino.settle(uid, "クラッシュ", bet, amulet.payout, 0, { chain: false, operationId: interaction.id });
     const netStr = `+${settled.net.toLocaleString("ja-JP")} ◈`;
     const bigWin = settled.net >= bet * 5;
     const bonusBits: string[] = [];
@@ -255,7 +255,10 @@ async function runRound(
     broadcastBigWin(interaction.client, services, { userId: uid, game: "クラッシュ", bet, payout: settled.payout });
   } else {
     const lossAmulet = applyAmulets(services, uid, bet, 0);
-    services.casino.settle(uid, "クラッシュ", bet, lossAmulet.payout, 0, { chain: false });
+    services.casino.settle(uid, "クラッシュ", bet, lossAmulet.payout, 0, {
+      chain: false,
+      operationId: interaction.id,
+    });
     const savedByAmulet = lossAmulet.payout > 0;
     const netStr = savedByAmulet ? `±0 ◈` : `−${bet.toLocaleString("ja-JP")} ◈`;
 

@@ -185,7 +185,7 @@ export async function playRoulette(
         }
         // 張り直しは上書き: 前の張りを返してから新しい額をエスクロー
         if (bets.has(btn.user.id)) services.escrow.refundOne(session, btn.user.id);
-        if (!services.escrow.hold(session, btn.user.id, amt, "roulette")) {
+        if (!services.escrow.hold(session, btn.user.id, amt, "roulette", btn.id)) {
           bets.delete(btn.user.id);
           await sub.reply({ content: `${Mammon.broke()}（所持 ${fmtEther(services.ether.balanceOf(btn.user.id))}）`, flags: MessageFlags.Ephemeral });
           await interaction.editReply({ embeds: [lobbyEmbed(Math.max(0, Math.ceil((endAt - Date.now()) / 1000)))] }).catch(() => undefined);
@@ -247,7 +247,11 @@ export async function playRoulette(
       const won = hits(b.type, n);
       const payout = won ? Math.floor(b.amount * PAYOUTS[b.type]) : 0;
       try {
-        services.casino.settle(b.userId, "roulette", b.amount, payout, 0, { chain: false, fuku: false });
+        services.casino.settle(b.userId, "roulette", b.amount, payout, 0, {
+          chain: false,
+          fuku: false,
+          operationId: `${session}:${b.userId}`,
+        });
       } catch {
         lines.push(`${E.push}  <@${b.userId}>  —  残高不足で無効`);
         continue;

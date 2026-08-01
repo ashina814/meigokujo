@@ -112,13 +112,20 @@ export function buildPvpResult(opts: {
  * 両者から bet を徴収して house 一時保管。全員から取れなかったら false（取った分は戻す）。
  * session を渡すとエスクロー台帳に記録され、再起動時に自動返金される（推奨）。
  */
-export function collectStakes(services: Services, userIds: string[], bet: number, session?: string, game = "pvp"): boolean {
+export function collectStakes(
+  services: Services,
+  userIds: string[],
+  bet: number,
+  operationId: string,
+  session?: string,
+  game = "pvp",
+): boolean {
   const insufficient = userIds.find((u) => services.ether.balanceOf(u) < bet);
   if (insufficient) return false;
   if (session) {
     const collected: string[] = [];
     for (const u of userIds) {
-      if (!services.escrow.hold(session, u, bet, game)) {
+      if (!services.escrow.hold(session, u, bet, game, operationId)) {
         for (const c of collected) services.escrow.refundOne(session, c);
         return false;
       }
@@ -126,19 +133,19 @@ export function collectStakes(services: Services, userIds: string[], bet: number
     }
     return true;
   }
-  services.ether.runGroup({ groupKey: `pvp:collect:${game}:${randomUUID()}`, kind: "table_hold", actorId: "system:pvp" }, () => {
+  services.ether.runGroup({ groupKey: `pvp:collect:${game}:${operationId}`, kind: "table_hold", actorId: "system:pvp" }, () => {
     for (const u of userIds) services.ether.transfer(u, HOUSE_HOLDER, bet, { reason: "対人戦の賭け金", game });
   });
   return true;
 }
 
 /** 参加者に返金（勝負不成立時など）。session があれば台帳の預かり額で返して記録も消す */
-export function refundAll(services: Services, userIds: string[], bet: number, session?: string): void {
+export function refundAll(services: Services, userIds: string[], bet: number, operationId: string, session?: string): void {
   if (session) {
     for (const u of userIds) services.escrow.refundOne(session, u);
     return;
   }
-  services.ether.runGroup({ groupKey: `pvp:refund:${randomUUID()}`, kind: "table_refund", actorId: "system:pvp" }, () => {
+  services.ether.runGroup({ groupKey: `pvp:refund:${operationId}`, kind: "table_refund", actorId: "system:pvp" }, () => {
     for (const u of userIds) services.ether.transfer(HOUSE_HOLDER, u, bet, { reason: "対人戦の不成立返金" });
   });
 }
@@ -153,6 +160,7 @@ export function settlePvp(
   services: Services,
   winners: string[],
   pot: number,
+  operationId: string,
   session?: string,
 ): { payout: number; houseCut: number } {
   const houseCut = Math.floor(pot * HOUSE_CUT);
@@ -179,7 +187,7 @@ export function settlePvp(
   // 旧方式（session なし・レガシー呼び出し互換）: house から直接動かす
   const src = stakeHolder(undefined);
   return services.ether.runGroup(
-    { groupKey: `pvp:settle:${randomUUID()}`, kind: "table_settle", actorId: "system:pvp" },
+    { groupKey: `pvp:settle:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
     () => {
       if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
       if (winners.length === 0) return { payout: 0, houseCut };
@@ -201,6 +209,7 @@ export function settleProportional(
   services: Services,
   winners: Array<{ userId: string; bet: number }>,
   losers: Array<{ userId: string; bet: number }>,
+  operationId: string,
   session?: string,
 ): { totalHouseCut: number } {
   const winnerPot = winners.reduce((s, w) => s + w.bet, 0);
@@ -228,7 +237,7 @@ export function settleProportional(
   // 旧方式（session なし）
   const src = stakeHolder(undefined);
   services.ether.runGroup(
-    { groupKey: `pvp:settle_proportional:${randomUUID()}`, kind: "table_settle", actorId: "system:pvp" },
+    { groupKey: `pvp:settle_proportional:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
     () => {
       if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
       let remaining = distributable;

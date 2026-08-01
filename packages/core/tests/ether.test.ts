@@ -140,13 +140,33 @@ describe("エテル為替", () => {
     expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
   });
 
-  it("冪等キー重複は ERR_DUPLICATE で弾かれ二重両替できない", () => {
+  it("同じ冪等キーの再実行は資金を動かさず、最初と同じ結果を返す", () => {
     const fixed = "e:idem:1";
-    ctx.ether.buy("a", 10_000, fixed);
-    expect(() => ctx.ether.buy("a", 10_000, fixed)).toThrow(EtherError);
+    const first = ctx.ether.buy("a", 10_000, fixed);
+    const landAfterFirst = ctx.ledger.balanceOf("user:a");
+
+    const again = ctx.ether.buy("a", 10_000, fixed);
+
+    expect(again).toEqual(first); // 保存済みの結果をそのまま返す
     expect(ctx.ether.balanceOf("a")).toBe(100_000); // 1回分のみ
+    expect(ctx.ledger.balanceOf("user:a")).toBe(landAfterFirst);
+
     // 売り側も同様
-    ctx.ether.sell("a", 10_000, "e:idem:2");
-    expect(() => ctx.ether.sell("a", 10_000, "e:idem:2")).toThrow(EtherError);
+    const sold = ctx.ether.sell("a", 10_000, "e:idem:2");
+    const chipsAfterSell = ctx.ether.balanceOf("a");
+    expect(ctx.ether.sell("a", 10_000, "e:idem:2")).toEqual(sold);
+    expect(ctx.ether.balanceOf("a")).toBe(chipsAfterSell);
+  });
+
+  it("別の操作が同じLand冪等キーを使ったら ERR_DUPLICATE で止まる", () => {
+    // Land 側だけ先に同じキーで動かしておく（＝別操作がキーを使ってしまった状態）
+    ctx.ledger.transfer({
+      from: "user:a", to: TREASURY, amount: 1, type: "adjust", actor: "t", approvedBy: "t",
+      idempotencyKey: "e:collide",
+    });
+    const chips = ctx.ether.balanceOf("a");
+
+    expect(() => ctx.ether.buy("a", 10_000, "e:collide")).toThrow(EtherError);
+    expect(ctx.ether.balanceOf("a")).toBe(chips); // チップは発行されない
   });
 });

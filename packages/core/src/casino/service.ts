@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherError, EtherExchange, HOUSE_HOLDER } from "./exchange.js";
@@ -62,6 +61,18 @@ export interface CasinoStatsRow {
   best_win_streak: number;
   current_lose_streak: number;
   updated_at: number;
+}
+
+export interface SettleOptions {
+  /**
+   * この精算を一意に指す値。**同じ操作の再試行では同じ値**を渡すこと
+   * （Discordの操作ID・卓のセッションIDなど）。ランダム値を渡すと二重精算を防げない。
+   */
+  operationId: string;
+  /** 連鎖ボーナス（既定ON。共有卓はOFF） */
+  chain?: boolean;
+  /** 福の重み（既定ON。共有卓はOFF） */
+  fuku?: boolean;
 }
 
 export interface SettleResult {
@@ -153,16 +164,16 @@ export class Casino {
     bet: number,
     payout: number,
     jackpotCut = 0,
-    opts: { chain?: boolean; fuku?: boolean; groupKey?: string } = {},
+    opts: SettleOptions,
   ): SettleResult {
     if (!Number.isInteger(bet) || bet <= 0) throw new EtherError("ERR_BAD_AMOUNT", { bet });
     if (!Number.isInteger(payout) || payout < 0) throw new EtherError("ERR_BAD_AMOUNT", { payout });
     const useChain = opts.chain ?? true;
     const useFuku = opts.fuku ?? true;
     const move = { game, sessionId: null };
-    // 1ゲームの精算をひとまとまりの業務操作として記録する。呼び出し側が冪等キーを
-    // 持っていればそれを使う（同じゲームの二重精算をDB側で防げる）
-    const groupKey = opts.groupKey ?? `solo:${game}:${userId}:${randomUUID()}`;
+    // 1ゲームの精算をひとまとまりの業務操作として記録する。`operationId` は
+    // 「同じ操作の再試行なら同じ値になる」ものを呼び出し側が渡す（Discordの操作IDなど）
+    const groupKey = `solo:${game}:${userId}:${opts.operationId}`;
     return this.ether.runGroup({ groupKey, kind: "solo_game", actorId: userId }, (): SettleResult => {
       // 徴収
       this.ether.transfer(userId, HOUSE_HOLDER, bet, { ...move, reason: "賭け金" });
@@ -215,8 +226,8 @@ export class Casino {
    * ジャックポット払い出し（当選）。
    * @param share 取れる割合（既定 1 = 全額。スロットは 0.5 = 半分獲得・半分シード残留）
    */
-  seizeJackpot(userId: string, game: string, share = 1, groupKey?: string): number {
-    const key = groupKey ?? `jackpot:${game}:${userId}:${randomUUID()}`;
+  seizeJackpot(userId: string, game: string, operationId: string, share = 1): number {
+    const key = `jackpot:${game}:${userId}:${operationId}`;
     return this.ether.runGroup({ groupKey: key, kind: "solo_game", actorId: userId }, (): number => {
       const pool = this.jackpotPool();
       const amount = Math.floor(pool * Math.min(1, Math.max(0, share)));

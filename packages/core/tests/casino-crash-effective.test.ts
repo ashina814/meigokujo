@@ -1,4 +1,4 @@
-import { testTransfer } from "./helpers/chip-ctx.js";
+import { testTransfer, opId } from "./helpers/chip-ctx.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
@@ -72,7 +72,7 @@ describe("クラッシュ実効RTP（Casino.settle 経由・連鎖無効）", ()
       const won = crash >= M;
       const payout = won ? Math.floor(BET * M) : 0;
       // クラッシュ実装と同じく `chain: false` で精算。fuku は低残高で 0% 発火
-      const result = ctx.casino.settle("p", "crash", BET, payout, 0, { chain: false, fuku: true });
+      const result = ctx.casino.settle("p", "crash", BET, payout, 0, { chain: false, fuku: true, operationId: opId() });
       wagered += BET;
       received += result.payout;
     }
@@ -98,7 +98,7 @@ describe("クラッシュ実効RTP（Casino.settle 経由・連鎖無効）", ()
         const won = crash >= M;
         const payout = won ? Math.floor(BET * M) : 0;
         // chain: true にすると連勝ボーナスが乗る
-        const result = ctx.casino.settle("p", "crash-legacy", BET, payout, 0, { chain: true, fuku: false });
+        const result = ctx.casino.settle("p", "crash-legacy", BET, payout, 0, { chain: true, fuku: false, operationId: opId() });
         wagered += BET;
         received += result.payout;
       }
@@ -128,10 +128,10 @@ describe("スロット実効RTP（Casino.settle 経由・連鎖込み長期シ�
         const reels: [SlotSymbol, SlotSymbol, SlotSymbol] = [slotsSpinReel(rng), slotsSpinReel(rng), slotsSpinReel(rng)];
         const out = slotsEvaluate(reels, bet);
         // 実装同様: chain ON, fuku ON（低残高で 0%）, JP 積立あり
-        const r = ctx.casino.settle("p", "slots", bet, out.payout, jpCut, { chain: true, fuku: true });
+        const r = ctx.casino.settle("p", "slots", bet, out.payout, jpCut, { chain: true, fuku: true, operationId: opId() });
         wagered += bet;
         received += r.payout;
-        if (out.kind === "jackpot") received += ctx.casino.seizeJackpot("p", "slots", SLOTS_JP_WIN_SHARE);
+        if (out.kind === "jackpot") received += ctx.casino.seizeJackpot("p", "slots", opId(), SLOTS_JP_WIN_SHARE);
       }
       const rtp = received / wagered;
       // 連鎖を乗せても勝率 46% のスロットでは 100% を超えない
@@ -158,7 +158,7 @@ describe("丁半実効RTP（Casino.settle 経由・連鎖無効の確認）", ()
         if (ctx.ether.balanceOf("p") < bet * 2) testTransfer(ctx.ether, HOUSE_HOLDER, "p", bet * 500);
         const payout = chohanRollAndPay(rng, bet, "cho");
         // 実装 (chohan.ts) と同じく chain: false
-        const r = ctx.casino.settle("p", "chohan", bet, payout, 0, { chain: false, fuku: true });
+        const r = ctx.casino.settle("p", "chohan", bet, payout, 0, { chain: false, fuku: true, operationId: opId() });
         wagered += bet;
         received += r.payout;
       }

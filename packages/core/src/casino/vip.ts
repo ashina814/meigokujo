@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherExchange, HOUSE_HOLDER } from "./exchange.js";
@@ -75,10 +74,10 @@ export class Vip {
   }
 
   /** 加入 or 更新。エテル徴収 → 期限延長 */
-  join(userId: string): VipJoinResult {
+  join(userId: string, operationId: string): VipJoinResult {
     const price = this.price();
     if (this.ether.balanceOf(userId) < price) return { ok: false, reason: "INSUFFICIENT_ETHER" };
-    return this.ether.runGroup({ groupKey: `vip:${userId}:${randomUUID()}`, kind: "vip", actorId: userId }, (): VipJoinResult => {
+    return this.ether.runGroup({ groupKey: `vip:${userId}:${operationId}`, kind: "vip", actorId: userId }, (): VipJoinResult => {
       this.ether.transfer(userId, HOUSE_HOLDER, price, { reason: "VIP加入" });
       const t = now();
       const current = this.expiresAt(userId);

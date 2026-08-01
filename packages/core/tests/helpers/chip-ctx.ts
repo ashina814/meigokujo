@@ -25,3 +25,12 @@ export function testTransfer(
 export function inTestGroup<T>(ether: EtherExchange, body: () => T, kind = "opening_reset"): T {
   return ether.runGroup({ groupKey: `test:${randomUUID()}`, kind, actorId: "system:test" }, body);
 }
+
+/**
+ * テスト用の操作ID。本番では「同じ操作の再試行で同じ値になるもの」（Discordの操作IDなど）を
+ * 渡すが、テストでは1回ごとに別のゲームなので連番で十分。
+ */
+let opCounter = 0;
+export function opId(prefix = "test-op"): string {
+  return `${prefix}-${++opCounter}`;
+}

@@ -436,13 +436,20 @@ CREATE TABLE IF NOT EXISTS casino_tx (
   game         TEXT,
   session_id   TEXT,
   actor_id     TEXT NOT NULL,
+  land_amount  INTEGER,                              -- 預入・返還で動いたLand（内部移動はNULL）
   ledger_tx_id INTEGER REFERENCES transactions(id),
   created_at   INTEGER NOT NULL,
-  -- 内部移動は両側必須でLand取引を伴わない。預入は発行、返還は消却
+  -- 内部移動は両側必須でLandを動かさない。預入は発行、返還は消却。
+  -- 預入・返還は動いたLand額を必ず持ち、1 Ldでも動いたなら対応するLand取引IDも必須。
+  -- （端数で0 Ldになる返還は現行仕様として存在するため、land_amount = 0 のときだけID無しを許す）
   CHECK (
-    (tx_kind = 'internal_transfer' AND from_holder IS NOT NULL AND to_holder IS NOT NULL AND ledger_tx_id IS NULL)
-    OR (tx_kind = 'deposit' AND from_holder IS NULL AND to_holder IS NOT NULL AND ledger_tx_id IS NOT NULL)
-    OR (tx_kind = 'redeem' AND from_holder IS NOT NULL AND to_holder IS NULL AND ledger_tx_id IS NOT NULL)
+    (tx_kind = 'internal_transfer' AND from_holder IS NOT NULL AND to_holder IS NOT NULL
+      AND ledger_tx_id IS NULL AND land_amount IS NULL)
+    OR (tx_kind = 'deposit' AND from_holder IS NULL AND to_holder IS NOT NULL
+      AND land_amount IS NOT NULL AND land_amount > 0 AND ledger_tx_id IS NOT NULL)
+    OR (tx_kind = 'redeem' AND from_holder IS NOT NULL AND to_holder IS NULL
+      AND land_amount IS NOT NULL AND land_amount >= 0
+      AND (land_amount = 0 OR ledger_tx_id IS NOT NULL))
   ),
   UNIQUE (group_key, seq)
 );
@@ -450,7 +457,15 @@ CREATE INDEX IF NOT EXISTS idx_casino_tx_group ON casino_tx(group_key, seq);
 CREATE INDEX IF NOT EXISTS idx_casino_tx_from ON casino_tx(from_holder, id);
 CREATE INDEX IF NOT EXISTS idx_casino_tx_to ON casino_tx(to_holder, id);
 
--- 検算の出発点。ここに載せた版の残高 + casino_tx = 現在残高 になる
+-- 開始残高の版。「その版の残高はどの取引の後の姿か」を版ごとに固定する。
+-- 版を切り替えた後も、旧版は旧版の窓（次の版の境界まで）で個別に検算できる。
+CREATE TABLE IF NOT EXISTS casino_chip_opening_versions (
+  opening_version TEXT PRIMARY KEY,
+  from_tx_id      INTEGER NOT NULL,
+  created_at      INTEGER NOT NULL
+);
+
+-- 検算の出発点。ここに載せた版の残高 + その版の窓の casino_tx = その時点の残高 になる
 CREATE TABLE IF NOT EXISTS casino_chip_opening_balances (
   opening_version TEXT NOT NULL,
   holder          TEXT NOT NULL,
@@ -567,9 +582,12 @@ CREATE TABLE IF NOT EXISTS fiscal_runs (
 `;
 
 export function openDb(path: string): Database.Database {
-  const db = new Database(path);
+  // 複数接続（別プロセス・別スレッド）から同じDBを触ったとき、ロック待ちで即失敗せず
+  // 待ってから再試行できるようにする。賭場の業務グループは書き込みが衝突しうる。
+  const db = new Database(path, { timeout: 5_000 });
   if (path !== ":memory:") {
     db.pragma("journal_mode = WAL");
+    db.pragma("busy_timeout = 5000");
   }
   db.pragma("foreign_keys = ON");
   // マイグレーション: den_vcs.kind の古い CHECK 制約（応接室を弾く）を外すため作り直す。

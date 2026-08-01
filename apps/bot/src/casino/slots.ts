@@ -190,16 +190,16 @@ async function runOne(
     // フリースピンは配当のみ（賭けなし）。settle は使わず胴元→プレイヤーの直接転送
     if (adjustedPayout > 0 && services.casino.canAccept(adjustedPayout)) {
       services.ether.runGroup(
-        { groupKey: `slots:free_spin:${uid}:${randomUUID()}`, kind: "solo_game", actorId: uid },
+        { groupKey: `slots:free_spin:${uid}:${interaction.id}`, kind: "solo_game", actorId: uid },
         () => services.ether.transfer("house", uid, adjustedPayout, { reason: "フリースピンの配当", game: "スロット" }),
       );
     }
   } else {
-    settled = services.casino.settle(uid, "スロット", bet, adjustedPayout, jpCut);
+    settled = services.casino.settle(uid, "スロット", bet, adjustedPayout, jpCut, { operationId: interaction.id });
   }
   // JP はフリースピンでも当選する（原作準拠）
   if (spin.kind === "jackpot") {
-    jpWon = services.casino.seizeJackpot(uid, "slots", JP_WIN_SHARE);
+    jpWon = services.casino.seizeJackpot(uid, "slots", interaction.id, JP_WIN_SHARE);
   }
 
   // ── Phase 1: スピンアニメ ──

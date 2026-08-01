@@ -1,4 +1,4 @@
-import { testTransfer } from "./helpers/chip-ctx.js";
+import { testTransfer, opId } from "./helpers/chip-ctx.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
@@ -52,7 +52,7 @@ describe("連鎖ボーナス（chain）", () => {
     // 5連勝させる: 1000 賭けて 2000 払戻。fuku 適用があると分析が複雑になるので off にする。
     // chainStreak は「この勝ちで何連勝目か」＝現在の勝ち連 +1。1連目から chainMultiplier(1)=1.0。
     for (let i = 0; i < 5; i++) {
-      ctx.casino.settle("a", "test", 1_000, 2_000, 0, { chain: true, fuku: false });
+      ctx.casino.settle("a", "test", 1_000, 2_000, 0, { chain: true, fuku: false, operationId: opId() });
     }
     const house1 = ctx.casino.houseBalance();
     // 5 spin 各 -1000 = -5000 の元手ぶん + 連鎖ボーナス
@@ -67,7 +67,7 @@ describe("連鎖ボーナス（chain）", () => {
   it("連鎖はエテル総量を保存する（house と player 間の移動だけ）", () => {
     const ctx = setup();
     const total0 = ctx.ether.outstanding();
-    for (let i = 0; i < 5; i++) ctx.casino.settle("a", "test", 1_000, 2_000, 0, { chain: true, fuku: false });
+    for (let i = 0; i < 5; i++) ctx.casino.settle("a", "test", 1_000, 2_000, 0, { chain: true, fuku: false, operationId: opId() });
     expect(ctx.ether.outstanding()).toBe(total0);
     expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
   });
@@ -91,7 +91,7 @@ describe("福の重み（fuku）", () => {
     // 純益 10,000 × 10% = 1,000 奉納。JP と 救済 が floor(1000/2)=500 ずつ。
     const jp0 = ctx.ether.balanceOf(JACKPOT_HOLDER);
     const relief0 = ctx.ether.balanceOf(RELIEF_HOLDER);
-    ctx.casino.settle("a", "test", 10_000, 20_000, 0, { chain: false, fuku: true });
+    ctx.casino.settle("a", "test", 10_000, 20_000, 0, { chain: false, fuku: true, operationId: opId() });
     expect(ctx.ether.balanceOf(JACKPOT_HOLDER)).toBe(jp0 + 500);
     expect(ctx.ether.balanceOf(RELIEF_HOLDER)).toBe(relief0 + 500);
     expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
@@ -107,7 +107,7 @@ describe("福の重み（fuku）", () => {
     // しきい値 100,000 を超えるので 5% 帯。奉納が発生してしまう。
     // ここは「勝つ前の残高が低い」ではなく「勝った後の残高が低い」で判定される仕様なので、
     // 勝った後も 100,000 以下に収まるように payout を絞る。
-    ctx.casino.settle("b", "test", 1_000, 1_500, 0, { chain: false, fuku: true });
+    ctx.casino.settle("b", "test", 1_000, 1_500, 0, { chain: false, fuku: true, operationId: opId() });
     // 勝ち後残高 = 99,000 - 1000 + 1500 = 99,500 ≤ 100,000 → 奉納 0
     expect(ctx.ether.balanceOf(JACKPOT_HOLDER)).toBe(jp0);
   });
@@ -177,7 +177,7 @@ describe("お守り（amulet）", () => {
     const bonus = ctx.items.consumeWinBonus("a", 2_000, 1_000);
     const rawPayout = 2_000;
     const adjustedPayout = rawPayout + bonus.bonus; // 2050
-    ctx.casino.settle("a", "test", 1_000, adjustedPayout, 0, { chain: false, fuku: false });
+    ctx.casino.settle("a", "test", 1_000, adjustedPayout, 0, { chain: false, fuku: false, operationId: opId() });
     expect(ctx.ether.outstanding()).toBe(total0);
     // 二重発動しない
     const again = ctx.items.consumeWinBonus("a", 2_000, 1_000);
@@ -332,14 +332,14 @@ describe("お守り裁定シミュレーション（buy-if-not-armed 戦略を�
       wagered += bet;
       if (kind === "win" && won) {
         const bonus = ctx.items.consumeWinBonus("a", rawPayout, bet);
-        const r = ctx.casino.settle("a", "sim", bet, rawPayout + bonus.bonus, 0, { chain: false, fuku: false });
+        const r = ctx.casino.settle("a", "sim", bet, rawPayout + bonus.bonus, 0, { chain: false, fuku: false, operationId: opId() });
         payouts += r.payout;
       } else if (kind === "loss" && !won) {
         const prot = ctx.items.consumeLossProtection("a", bet);
-        const r = ctx.casino.settle("a", "sim", bet, prot.refund, 0, { chain: false, fuku: false });
+        const r = ctx.casino.settle("a", "sim", bet, prot.refund, 0, { chain: false, fuku: false, operationId: opId() });
         payouts += r.payout;
       } else {
-        const r = ctx.casino.settle("a", "sim", bet, rawPayout, 0, { chain: false, fuku: false });
+        const r = ctx.casino.settle("a", "sim", bet, rawPayout, 0, { chain: false, fuku: false, operationId: opId() });
         payouts += r.payout;
       }
     }
@@ -407,9 +407,9 @@ describe("お守り裁定シミュレーション（buy-if-not-armed 戦略を�
       if (!won) {
         const prot = ctx.items.consumeLossProtection("a", bet);
         if (prot.refund > 0) triggers++;
-        ctx.casino.settle("a", "sim", bet, prot.refund, 0, { chain: false, fuku: false });
+        ctx.casino.settle("a", "sim", bet, prot.refund, 0, { chain: false, fuku: false, operationId: opId() });
       } else {
-        ctx.casino.settle("a", "sim", bet, Math.floor(bet * 1.94), 0, { chain: false, fuku: false });
+        ctx.casino.settle("a", "sim", bet, Math.floor(bet * 1.94), 0, { chain: false, fuku: false, operationId: opId() });
       }
     }
     // 購入回数 ≈ 発動回数（各サイクルが1発動で終わり次で買い直す）
@@ -423,7 +423,7 @@ describe("胴元収支の総量保存（統合）", () => {
     for (let i = 0; i < 100; i++) {
       const bet = 100 + (i % 5) * 100;
       const payout = i % 3 === 0 ? bet * 2 : i % 3 === 1 ? 0 : bet;
-      ctx.casino.settle("a", "mix", bet, payout, i % 7 === 0 ? 10 : 0, { chain: i % 2 === 0, fuku: i % 2 === 1 });
+      ctx.casino.settle("a", "mix", bet, payout, i % 7 === 0 ? 10 : 0, { chain: i % 2 === 0, fuku: i % 2 === 1, operationId: opId() });
     }
     expect(ctx.ledger.verifyIntegrity().ok).toBe(true);
   });

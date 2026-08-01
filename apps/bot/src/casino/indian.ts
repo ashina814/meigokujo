@@ -63,7 +63,7 @@ export async function playIndian(
     return;
   }
   const session = `indian:${interaction.id}`;
-  if (!collectStakes(services, [challenger.id], stake, session, "indian")) return;
+  if (!collectStakes(services, [challenger.id], stake, `${session}:collect:challenger`, session, "indian")) return;
 
   const inviteRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("ind:accept").setLabel("受ける").setEmoji("🃏").setStyle(ButtonStyle.Success),
@@ -103,7 +103,7 @@ export async function playIndian(
     /* timeout */
   }
   if (!accepted) {
-    refundAll(services, [challenger.id], stake, session);
+    refundAll(services, [challenger.id], stake, `${session}:refund:declined`, session);
     await interaction.editReply({
       content: "",
       embeds: [buildPvpAbort("インディアン", "🃏", "受諾されなかった。挑戦者に全額返金。")],
@@ -111,8 +111,8 @@ export async function playIndian(
     });
     return;
   }
-  if (!collectStakes(services, [opponent.id], stake, session, "indian")) {
-    refundAll(services, [challenger.id], stake, session);
+  if (!collectStakes(services, [opponent.id], stake, `${session}:collect:opponent`, session, "indian")) {
+    refundAll(services, [challenger.id], stake, `${session}:refund:opponent_broke`, session);
     return;
   }
 
@@ -136,7 +136,7 @@ export async function playIndian(
       });
   }
   if (dmFailed) {
-    refundAll(services, [challenger.id, opponent.id], stake, session);
+    refundAll(services, [challenger.id, opponent.id], stake, `${session}:refund:dm_failed`, session);
     await interaction.followUp({
       content: `<@${dmFailed}> DM が閉じていて相手のカードを送れなかった。この対戦は流す（両者返金）。`,
       allowedMentions: { users: [dmFailed] },
@@ -193,7 +193,7 @@ export async function playIndian(
   let note = "";
   if (cDecision === "fold" && oDecision === "fold") {
     // 両者フォールド → 全額返金
-    refundAll(services, [challenger.id, opponent.id], stake, session);
+    refundAll(services, [challenger.id, opponent.id], stake, `${session}:refund:both_fold`, session);
     title = "🃏 インディアン — 両者フォールド";
     note = "両者ともフォールド。全額返金。";
     winner = null;
@@ -213,11 +213,11 @@ export async function playIndian(
 
   if (winner === null && cDecision === "stay" && oDecision === "stay") {
     // 同値ドロー
-    refundAll(services, [challenger.id, opponent.id], stake, session);
+    refundAll(services, [challenger.id, opponent.id], stake, `${session}:refund:draw`, session);
     title = "🃏 インディアン — 引き分け";
     note += "\n同値。全額返金。";
   } else if (winner !== null) {
-    const { payout, houseCut } = settlePvp(services, [winner], pot, session);
+    const { payout, houseCut } = settlePvp(services, [winner], pot, `${session}:settle`, session);
     const loser = winner === challenger.id ? opponent.id : challenger.id;
     title = `🃏 インディアン — 勝者 <@${winner}>`;
     note += `\n**勝ち** <@${winner}> +${fmtEther(payout - stake)}\n**負け** <@${loser}> -${fmtEther(stake)}\n場代 ${fmtEther(houseCut)} → JP`;

@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherError, EtherExchange, HOUSE_HOLDER } from "./exchange.js";
@@ -142,7 +141,10 @@ export class Stocks {
       const proceeds = Math.floor(s.price * h.shares * (1 - STOCK_SELL_FEE_RATE));
       // 胴元が払えないなら没収せず保留（次の tick で再試行）。株だけ消すと実質没収になる
       if (this.ether.balanceOf(HOUSE_HOLDER) < proceeds) continue;
-      this.ether.runGroup({ groupKey: `stock:force_sell:${h.user_id}:${h.stock_id}:${ts}`, kind: "shop", actorId: h.user_id }, () => {
+      // 保有行は売却で消えるので「いつ買った建玉か」で一意になる（再試行でも同じ値）
+      this.ether.runGroup(
+        { groupKey: `stock:force_sell:${h.user_id}:${h.stock_id}:${h.bought_at}`, kind: "shop", actorId: h.user_id },
+        () => {
         this.ether.transfer(HOUSE_HOLDER, h.user_id, proceeds, { reason: "株の期限到来による強制売却", game: "stocks" });
         this.db
           .prepare("UPDATE casino_holdings SET shares = 0, avg_cost = 0, bought_at = 0 WHERE user_id = ? AND stock_id = ?")
@@ -155,14 +157,14 @@ export class Stocks {
   }
 
   /** 株を買う */
-  buy(userId: string, stockId: string, shares: number): { cost: number; avgCost: number; newShares: number } {
+  buy(userId: string, stockId: string, shares: number, operationId: string): { cost: number; avgCost: number; newShares: number } {
     if (!Number.isInteger(shares) || shares <= 0) throw new StockError("ERR_BAD_AMOUNT", { shares });
     const s = this.get(stockId);
     if (!s) throw new StockError("ERR_UNKNOWN_STOCK", { stockId });
     const cost = s.price * shares;
     if (this.ether.balanceOf(userId) < cost) throw new StockError("ERR_INSUFFICIENT_ETHER", { held: this.ether.balanceOf(userId), cost });
     return this.ether.runGroup(
-      { groupKey: `stock:buy:${userId}:${stockId}:${randomUUID()}`, kind: "shop", actorId: userId },
+      { groupKey: `stock:buy:${userId}:${stockId}:${operationId}`, kind: "shop", actorId: userId },
       (): { cost: number; avgCost: number; newShares: number } => {
       this.ether.transfer(userId, HOUSE_HOLDER, cost, { reason: "株の購入", game: "stocks" });
       const cur = this.db.prepare("SELECT * FROM casino_holdings WHERE user_id = ? AND stock_id = ?").get(userId, stockId) as Holding | undefined;
@@ -182,7 +184,7 @@ export class Stocks {
   }
 
   /** 株を売る */
-  sell(userId: string, stockId: string, shares: number): { proceeds: number; remaining: number } {
+  sell(userId: string, stockId: string, shares: number, operationId: string): { proceeds: number; remaining: number } {
     if (!Number.isInteger(shares) || shares <= 0) throw new StockError("ERR_BAD_AMOUNT", { shares });
     const s = this.get(stockId);
     if (!s) throw new StockError("ERR_UNKNOWN_STOCK", { stockId });
@@ -194,7 +196,7 @@ export class Stocks {
       throw new StockError("ERR_INSUFFICIENT_ETHER", { house: this.ether.balanceOf(HOUSE_HOLDER), proceeds });
     }
     return this.ether.runGroup(
-      { groupKey: `stock:sell:${userId}:${stockId}:${randomUUID()}`, kind: "shop", actorId: userId },
+      { groupKey: `stock:sell:${userId}:${stockId}:${operationId}`, kind: "shop", actorId: userId },
       (): { proceeds: number; remaining: number } => {
       if (proceeds > 0) this.ether.transfer(HOUSE_HOLDER, userId, proceeds, { reason: "株の売却", game: "stocks" });
       const remaining = cur.shares - shares;

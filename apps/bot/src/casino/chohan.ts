@@ -150,7 +150,7 @@ async function runRound(
   const amulet = applyAmulets(services, uid, bet, rawPayout);
   // 連鎖ボーナスは無効化。丁半は 50% 勝率と CHOHAN_PAYOUT=1.94 で RTP 97% だが、
   // 連鎖有効時は実効 RTP が 106% を超える回帰が実測レポートで確認された（クラッシュと同構造）。
-  const settled = services.casino.settle(uid, "丁半", bet, amulet.payout, 0, { chain: false });
+  const settled = services.casino.settle(uid, "丁半", bet, amulet.payout, 0, { chain: false, operationId: interaction.id });
 
   const totalPayout = settled.payout;
   const net = settled.net;

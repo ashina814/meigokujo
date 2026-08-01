@@ -84,7 +84,7 @@ export async function handleVipButton(
 ): Promise<void> {
   if (interaction.customId !== "vip:join") return;
   const uid = interaction.user.id;
-  const r = services.vip.join(uid);
+  const r = services.vip.join(uid, interaction.id);
   if (!r.ok) {
     await interaction.reply({
       content: `❌ 月会費 ${fmtEther(services.vip.price())} に足りない（所持 ${fmtEther(services.ether.balanceOf(uid))}）。`,

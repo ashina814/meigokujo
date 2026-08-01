@@ -299,7 +299,9 @@ async function runRound(
   }
 
   const amulet = applyAmulets(services, uid, playerBet, rawPayout);
-  const settled = services.casino.settle(uid, "ホールデム", playerBet, amulet.payout);
+  const settled = services.casino.settle(uid, "ホールデム", playerBet, amulet.payout, 0, {
+    operationId: interaction.id,
+  });
 
   const won = settled.net > 0;
   const bonusBits: string[] = [];

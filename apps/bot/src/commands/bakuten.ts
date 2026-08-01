@@ -120,7 +120,7 @@ export async function handleBakutenSelect(
       await interaction.reply({ content: `エテルが足りない（所持 ${fmtEther(held)} / 必要 ${fmtEther(def.price)}）。`, flags: MessageFlags.Ephemeral });
       return;
     }
-    services.ether.runGroup({ groupKey: `shop:buy:${uid}:${def.key}:${randomUUID()}`, kind: "shop", actorId: uid }, () => {
+    services.ether.runGroup({ groupKey: `shop:buy:${uid}:${def.key}:${interaction.id}`, kind: "shop", actorId: uid }, () => {
       services.ether.transfer(uid, HOUSE_HOLDER, def.price, { reason: `賭場商店での購入: ${def.key}` });
       services.items.grant(uid, def.key, 1);
     });

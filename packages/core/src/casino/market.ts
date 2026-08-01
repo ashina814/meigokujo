@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherExchange, HOUSE_HOLDER } from "./exchange.js";
@@ -281,6 +280,8 @@ export class Markets {
     durationMin: number;
     payoutMode?: PayoutMode;
     fee?: number;
+    /** この作成操作を一意に指す値。同じ操作の再試行では同じ値を渡す */
+    operationId: string;
   }): Market {
     if (input.options.length < 2 || input.options.length > 4) {
       throw new MarketError("ERR_BAD_OPTION", { count: input.options.length });
@@ -301,7 +302,7 @@ export class Markets {
     const t = now();
     const deadline = t + input.durationMin * 60;
     return this.ether.runGroup(
-      { groupKey: `market:create:${input.creatorId}:${randomUUID()}`, kind: "market_bet", actorId: input.creatorId },
+      { groupKey: `market:create:${input.creatorId}:${input.operationId}`, kind: "market_bet", actorId: input.creatorId },
       (): Market => {
       if (fee > 0) {
         this.ether.transfer(input.creatorId, JACKPOT_HOLDER, fee, { reason: "板の開設手数料", game: "market" });
@@ -384,7 +385,7 @@ export class Markets {
    * escrow 残高 === 既存 pot でなければベットを受け付けず、市場を frozen にする。
    * これで起動時以外に資金不整合が生じても、追加利用者の資金を巻き込まない。
    */
-  bet(marketId: number, userId: string, optionIndex: number, amount: number): { previous: number | null; net: number } {
+  bet(marketId: number, userId: string, optionIndex: number, amount: number, operationId: string): { previous: number | null; net: number } {
     if (!Number.isInteger(amount) || amount <= 0) throw new MarketError("ERR_BAD_AMOUNT", { amount });
     const m = this.get(marketId);
     if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { marketId });
@@ -424,7 +425,7 @@ export class Markets {
     }
 
     return this.ether.runGroup(
-      { groupKey: `market:bet:${marketId}:${userId}:${randomUUID()}`, kind: "market_bet", actorId: userId },
+      { groupKey: `market:bet:${marketId}:${userId}:${operationId}`, kind: "market_bet", actorId: userId },
       (): { previous: number | null; net: number } => {
       if (existingTotal > 0) {
         // 張り直し: 既存分は escrow に入っているのでそこから返す（fund_mode='escrow' 確定済み）
@@ -565,7 +566,7 @@ export class Markets {
     const m = this.get(id);
     if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { id });
     if (m.status !== "disputed") throw new MarketError("ERR_NOT_DISPUTED", { status: m.status });
-    this.ether.runGroup({ groupKey: `market:void:${id}:${randomUUID()}`, kind: "market_settle", actorId: actor }, () => {
+    this.ether.runGroup({ groupKey: `market:void:${id}`, kind: "market_settle", actorId: actor }, () => {
       const bets = this.bets(id);
       const pot = bets.reduce((s, b) => s + b.amount, 0);
       const src = this.fundHolder(m, pot);
@@ -583,7 +584,7 @@ export class Markets {
    */
   private settle(id: number): MarketSettleResult {
     return this.ether.runGroup(
-      { groupKey: `market:settle:${id}:${randomUUID()}`, kind: "market_settle", actorId: "system:market" },
+      { groupKey: `market:settle:${id}`, kind: "market_settle", actorId: "system:market" },
       (): MarketSettleResult => {
       const m = this.get(id)!;
       if (m.status !== "reported" || m.result_option == null) {
@@ -669,7 +670,7 @@ export class Markets {
     const m = this.get(id);
     if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { id });
     if (m.status === "settled" || m.status === "void") return;
-    this.ether.runGroup({ groupKey: `market:refund:${id}:${randomUUID()}`, kind: "market_settle", actorId: actor }, () => {
+    this.ether.runGroup({ groupKey: `market:refund:${id}`, kind: "market_settle", actorId: actor }, () => {
       const bets = this.bets(id);
       const pot = bets.reduce((s, b) => s + b.amount, 0);
       const src = this.fundHolder(m, pot);

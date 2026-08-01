@@ -107,6 +107,7 @@ async function runCreate(interaction: ChatInputCommandInteraction, services: Ser
 
   try {
     const m = services.markets.create({
+      operationId: interaction.id,
       guildId: interaction.guildId ?? "",
       creatorId: interaction.user.id,
       title,
@@ -508,7 +509,7 @@ export async function handleItaModal(interaction: ModalSubmitInteraction, servic
     return;
   }
   try {
-    const result = services.markets.bet(marketId, interaction.user.id, optionIndex, amt);
+    const result = services.markets.bet(marketId, interaction.user.id, optionIndex, amt, interaction.id);
     const options = JSON.parse(services.markets.get(marketId)!.options_json) as string[];
     const optLabel = options[optionIndex];
     const msg =

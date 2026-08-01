@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { EtherExchange, HOUSE_HOLDER } from "./exchange.js";
@@ -113,8 +112,8 @@ export class Daily {
     const held = this.ether.balanceOf(userId);
     const reliefEligible = held <= this.reliefThreshold();
 
-    // 1日1回なので「その日の受け取り」を冪等キーにできる
-    const groupKey = `daily:${userId}:${Math.floor(t / DAY_SEC)}:${randomUUID()}`;
+    // 1日1回の受け取りなので、その日そのものが冪等キーになる（再試行で同じ値）
+    const groupKey = `daily:${userId}:${Math.floor(t / DAY_SEC)}`;
     return this.ether.runGroup({ groupKey, kind: "daily", actorId: userId }, (): DailyClaimResult => {
       // 基本 + streak 分は胴元から。胴元不足なら救済プールから振替
       const wanted = base + streakBonus;

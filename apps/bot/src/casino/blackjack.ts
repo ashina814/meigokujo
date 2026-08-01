@@ -162,7 +162,9 @@ async function runRound(
 
   const finish = async (rawPayout: number, note: string) => {
     const amulet = applyAmulets(services, uid, totalBet, rawPayout);
-    const settled = services.casino.settle(uid, "ブラックジャック", totalBet, amulet.payout);
+    const settled = services.casino.settle(uid, "ブラックジャック", totalBet, amulet.payout, 0, {
+      operationId: interaction.id,
+    });
     const won = settled.net > 0;
     const push = settled.net === 0 && rawPayout > 0;
     const chainLine = settled.chainBonus > 0

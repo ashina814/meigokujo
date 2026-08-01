@@ -371,7 +371,7 @@ async function runRound(
     const rawPayout = bet + profit;
     const amulet = applyAmulets(services, uid, bet, rawPayout);
     if (amulet.note) amuletNote = `✨ ${amulet.note}`;
-    const settled = services.casino.settle(uid, "チンチロ", bet, amulet.payout);
+    const settled = services.casino.settle(uid, "チンチロ", bet, amulet.payout, 0, { operationId: interaction.id });
     color = C_WIN;
     netForDisplay = settled.net;
     const chainLine = settled.chainBonus > 0
@@ -384,30 +384,30 @@ async function runRound(
     broadcastBigWin(interaction.client, services, { userId: uid, game: "チンチロ", bet, payout: settled.payout });
   } else if (mul === 0) {
     // プッシュ（両方ヒフミ）: 返金
-    services.casino.settle(uid, "チンチロ", bet, bet);
+    services.casino.settle(uid, "チンチロ", bet, bet, 0, { operationId: interaction.id });
     color = C_MAMMON;
     payoutText = `🌀 プッシュ：${fmtEther(bet)} を返金`;
   } else if (mul === -1) {
     // 通常負け: bet だけ徴収。ただし敗北保護お守りがあれば返金
     const lossAmulet = applyAmulets(services, uid, bet, 0);
     if (lossAmulet.note) amuletNote = `✨ ${lossAmulet.note}`;
-    services.casino.settle(uid, "チンチロ", bet, lossAmulet.payout);
+    services.casino.settle(uid, "チンチロ", bet, lossAmulet.payout, 0, { operationId: interaction.id });
     netForDisplay = lossAmulet.payout - bet;
     payoutText = lossAmulet.payout > 0 ? `🛡 返金 ${fmtEther(lossAmulet.payout)}` : `💸 -${fmtEther(bet)}`;
   } else {
     // 倍付け負け: bet + (|mul|-1)*bet を徴収。残高不足なら通常負けフォールバック
     const extraNeeded = (Math.abs(mul) - 1) * bet;
     if (held >= bet + extraNeeded) {
-      services.casino.settle(uid, "チンチロ", bet, 0);
+      services.casino.settle(uid, "チンチロ", bet, 0, 0, { operationId: interaction.id });
       services.ether.runGroup(
-        { groupKey: `chinchiro:extra:${uid}:${randomUUID()}`, kind: "solo_game", actorId: uid },
+        { groupKey: `chinchiro:extra:${uid}:${interaction.id}`, kind: "solo_game", actorId: uid },
         () => services.ether.transfer(uid, HOUSE_HOLDER, extraNeeded, { reason: "倍付け負けの追加徴収", game: "チンチロ" }),
       );
       const totalLoss = bet + extraNeeded;
       netForDisplay = -totalLoss;
       payoutText = `💀 -${fmtEther(totalLoss)}（${Math.abs(mul)}倍負け）`;
     } else {
-      services.casino.settle(uid, "チンチロ", bet, 0);
+      services.casino.settle(uid, "チンチロ", bet, 0, 0, { operationId: interaction.id });
       netForDisplay = -bet;
       payoutText = `💸 -${fmtEther(bet)}（残高不足で追加徴収なし）`;
       extraNote = "\n*※本来は倍付け負けだったが、残高不足のため通常負けにフォールバック*";
