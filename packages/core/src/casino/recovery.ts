@@ -76,7 +76,8 @@ export interface RecoverCasinoResult {
    *
    * - `opened`: S12 まで通って営業を開けた
    * - `halted`: 検算 NG で `integrity_halt`（以降を実行していない）
-   * - `source_failed`: 所有元の申告が取れなかったので掃除も再開もしていない（PR7 レビュー指摘）
+   * - `source_failed`: 所有元の申告が取れなかったので掃除も再開もしていない。
+   *   **`recovery_halt`** にする（通常の「再点検」では開けられない・PR7 レビュー指摘）
    * - `held`: 人が止めている状態なので触っていない
    * - `manual`: `integrity_halt` のまま。運営の再点検待ち
    */
@@ -170,6 +171,9 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     return { outcome: "manual", steps, ...empty, reason: "integrity_halt のまま（運営の再点検待ち）" };
   }
 
+  // `recovery_halt`（前回の復旧が完了しなかった）からは**やり直す**。
+  // これがこの状態の唯一の出口なので、ここで止めると二度と開けられない（PR7）
+
   // S1: ここから資金を動かす区間へ入る
   status.beginStartupCheck();
   steps.push("S1:startup_check");
@@ -227,7 +231,9 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
   // 復旧が完了したとは判断できない。運営の確認が必要な状態で止める。
   if (result.skipped) {
     const reason = result.reason ?? "生存中エスクローの収集に失敗";
-    status.haltForIntegrity(`復旧中断: ${reason}（掃除・予約解放とも未実行。運営の確認が必要）`);
+    // **専用の停止状態**にする。通常の「再点検」（reopenAfterIntegrity）では開かない。
+    // 出口は「復旧を再実行」して S4〜S12 を通すことだけ
+    status.haltForRecovery(`復旧中断: ${reason}（掃除・予約解放とも未実行。運営の確認が必要）`);
     events.log("casino_recovery_halted", {
       actor: "system:recovery",
       payload: { steps, reason, reservationsReleased: false },

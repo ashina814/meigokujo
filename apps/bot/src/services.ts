@@ -188,9 +188,12 @@ function logRecovery(r: ReturnType<typeof recoverCasino>): void {
       console.error(`[賭場] 起動時の復旧で停止しました: ${r.reason}（${summary}）`);
       break;
     case "source_failed":
-      // 所有元の申告が取れなかった＝掃除も再開もしていない。営業は開けない（PR7）
+      // 所有元の申告が取れなかった＝掃除も再開もしていない。営業は開けない（PR7）。
+      // 通常の「再点検」では開かない専用状態（recovery_halt）にしてある
       console.error(
-        `[賭場] 生存中エスクローの所有元を確認できなかったため、掃除・予約解放とも実行せず停止しました: ${r.reason}`,
+        `[賭場] 生存中エスクローの所有元を確認できなかったため、掃除・予約解放とも実行せず停止しました: ${r.reason}
+` +
+          "　→ 原因を直したうえで /管理 → 賭場 → 「復旧を再実行」を押してください（再点検では開きません）",
       );
       break;
     case "held":
