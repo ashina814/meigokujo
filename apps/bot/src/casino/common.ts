@@ -264,11 +264,12 @@ export function slotsReservationKey(userId: string, interactionId: string): stri
  */
 export function reserveFreeSpinLiability(
   services: Services,
-  row: { id: number; userId: string; bet: number },
+  row: { id: number; userId: string; payout: number },
 ): { key: string; amount: number } {
   const key = `slots:freespin:${row.id}`;
-  const ctx = liabilityCtx(services, row.userId);
-  const amount = Math.floor(row.bet * SLOT_MAX_PAYOUT_MULT) + ctx.activeEffects.winBonusCap;
+  // 保留権利は獲得時点で配当・お守り効果を固定済み。現在の装備状態から
+  // 最大額を組み立て直すと、権利と無関係の装備変更で予約可否が揺れてしまう。
+  const amount = row.payout;
   const r = services.reservations.reserve(key, amount, "スロット", row.userId);
   if (!r.ok) throw new HouseCapacityError("スロット", amount, r.available);
   return { key, amount };

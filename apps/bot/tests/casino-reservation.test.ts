@@ -505,8 +505,8 @@ describe("保留中の無料スピンは予約を取り直してから払う", (
     const paid = spinPaid(c.services, "u1", 1_000, "int-1");
     c.reservations.releaseAll("テストの再起動");
 
-    // 胴元を細らせる（無料スピンぶん 100,000 を予約できない）
-    seed(c.db, HOUSE_HOLDER, 50_000);
+    // 胴元を細らせる（確定済み無料スピン配当 25,000 を予約できない）
+    seed(c.db, HOUSE_HOLDER, 24_999);
     expect(() => resumeFreeSpin(c.services, paid.pendingFreeSpin!)).toThrow(HouseCapacityError);
     expect(c.freeSpins.get(paid.pendingFreeSpin!.id)!.status).toBe("pending");
     // 取れなかった予約行は残らない
