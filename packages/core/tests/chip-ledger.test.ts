@@ -55,7 +55,7 @@ describe("ChipLedger", () => {
   });
 
   it("production構築ではopening_v1前の全資金操作を拒否し、旧残高と台帳を変えない", () => {
-    const locked = setup({ sharedChipTx: true });
+    const locked = setup({ sharedChipTx: true, requireOpeningV1: true });
     const department = "sys:dept:賭博場";
     locked.ledger.ensureAccount(department, "system");
     locked.ledger.transfer({ from: TREASURY, to: ETHER_ESCROW, amount: 10_000, type: "adjust", actor: "test", approvedBy: "test", idempotencyKey: "legacy:reserve" });
@@ -90,7 +90,7 @@ describe("ChipLedger", () => {
   });
 
   it("opening_v1確定後だけproduction構築の1:1操作を解放する", () => {
-    const opened = setup({ sharedChipTx: true });
+    const opened = setup({ sharedChipTx: true, requireOpeningV1: true });
     expect(() => opened.chips.deposit("a", 100, "before:opening")).toThrow(/ERR_CASINO_OPENING_NOT_COMPLETE/);
     opened.chipTx.captureOpening("opening_v1", [], { poolLand: opened.ledger.balanceOf(CHIP_ESCROW), fromLedgerTxId: opened.ledger.lastTransactionId() });
     expect(opened.chips.deposit("a", 1_000, "after:deposit")).toEqual({ input: 1_000, output: 1_000, burned: 0 });
