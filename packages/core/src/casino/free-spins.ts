@@ -37,6 +37,14 @@ import type Database from "better-sqlite3";
 
 export type FreeSpinStatus = "pending" | "processing" | "settled";
 
+/**
+ * 確定済みフリースピンJP請求の専用保有者。
+ *
+ * 卓の預託（`escrow:*`）ではなく、既に確定したシステム債務の引当金である。
+ * 起動時の孤児掃除・隔離対象にせず、検算Cで pending 行の合計と照合する。
+ */
+export const FREE_SPIN_JACKPOT_CLAIMS_HOLDER = "sys:casino:free-spin-jp-claims";
+
 export interface PendingFreeSpinAmuletEffect {
   kind: "none" | "win_bonus" | "loss_protection";
   amount: number;
@@ -253,8 +261,8 @@ export class FreeSpins {
     return `slots:spin:${row.userId}:${row.operationId}:free:${row.spinNo}`;
   }
 
-  jackpotClaimHolder(row: PendingFreeSpinRow): string {
-    return `escrow:free-spin-jackpot:${row.id}`;
+  jackpotClaimHolder(_row?: PendingFreeSpinRow): string {
+    return FREE_SPIN_JACKPOT_CLAIMS_HOLDER;
   }
 
   /** 保留件数（運営ダッシュボード・起動ログ用） */

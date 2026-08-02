@@ -12,6 +12,7 @@ import { Stocks } from "../src/casino/stocks.js";
 import { ChipTx, ChipTxError } from "../src/casino/chip-tx.js";
 import { CasinoIntegrity } from "../src/casino/integrity.js";
 import { CasinoStatus, OPENING_RESET_SEAL } from "../src/casino/status.js";
+import { FREE_SPIN_JACKPOT_CLAIMS_HOLDER, FreeSpins } from "../src/casino/free-spins.js";
 import { deterministicRng } from "../src/casino/rng.js";
 import { deptAccount } from "../src/departments/service.js";
 import { opId } from "./helpers/chip-ctx.js";
@@ -80,6 +81,31 @@ function busyCasino(): Ctx {
   return ctx;
 }
 
+function pendingFreeSpinJp(ctx: Ctx, claims: number[]): { freeSpins: FreeSpins; ids: number[] } {
+  const freeSpins = new FreeSpins(ctx.db);
+  const rows = claims.map((claim, index) =>
+    freeSpins.grant({
+      userId: index === 0 ? "alice" : "bob",
+      operationId: `free-jp-${index}`,
+      spinNo: 1,
+      bet: 1_000,
+      sourceGroup: `slots:spin:free-jp-${index}:paid`,
+      reels: ["マモン", "マモン", "マモン"],
+      rawPayout: 0,
+      amuletEffect: { kind: "none", amount: 0 },
+      payout: 0,
+      jackpotWon: true,
+      jackpotClaim: claim,
+      totalClaim: claim,
+    }),
+  );
+  const total = claims.reduce((sum, claim) => sum + claim, 0);
+  ctx.ether.runGroup({ groupKey: "test:free-spin-jp-claims", kind: "solo_game", actorId: "system:test" }, () =>
+    ctx.ether.transfer(HOUSE_HOLDER, FREE_SPIN_JACKPOT_CLAIMS_HOLDER, total, { reason: "free spin JP claim test" }),
+  );
+  return { freeSpins, ids: rows.map((row) => row.id) };
+}
+
 describe("全点検（正常系）", () => {
   it("一通り遊んだ後でも Land 台帳と検算A〜D が通る", () => {
     const ctx = busyCasino();
@@ -120,6 +146,47 @@ describe("全点検（正常系）", () => {
     // 基準を勝手に埋めない・取引も増やさない
     expect(ctx.chipTx.openingLandBaseline()).toBeNull();
     expect((ctx.db.prepare("SELECT COUNT(*) AS c FROM casino_tx").get() as { c: number }).c).toBe(before.c);
+    ctx.db.close();
+  });
+});
+
+describe("検算C: 確定済みフリースピンJP請求", () => {
+  it("未精算2件の合計とsystem holderが一致すればA〜Dすべて通る", () => {
+    const ctx = busyCasino();
+    pendingFreeSpinJp(ctx, [30, 70]);
+
+    expect(ctx.ether.balanceOf(FREE_SPIN_JACKPOT_CLAIMS_HOLDER)).toBe(100);
+    expect(ctx.integrity.runFull().ok).toBe(true);
+    ctx.db.close();
+  });
+
+  it("1◈不足・1◈過多を検知し、対象pending行を監査理由に残す", () => {
+    const ctx = busyCasino();
+    const { ids } = pendingFreeSpinJp(ctx, [30, 70]);
+
+    for (const actual of [99, 101]) {
+      ctx.db.prepare("UPDATE ether_balances SET amount = ? WHERE user_id = ?").run(actual, FREE_SPIN_JACKPOT_CLAIMS_HOLDER);
+      const check = ctx.integrity.checkC();
+      expect(check.ok).toBe(false);
+      expect(check.mismatches).toContainEqual(
+        expect.objectContaining({ subject: FREE_SPIN_JACKPOT_CLAIMS_HOLDER, expected: 100, actual }),
+      );
+      expect(CasinoIntegrity.describeFailure(ctx.integrity.runFull())).toContain(`#${ids[0]}`);
+    }
+    ctx.db.close();
+  });
+
+  it("settled行は除外し、精算とholder残高の減額が同時に見える", () => {
+    const ctx = busyCasino();
+    const { freeSpins, ids } = pendingFreeSpinJp(ctx, [30, 70]);
+    ctx.ether.runGroup({ groupKey: "test:free-spin-jp-settle", kind: "solo_game", actorId: "alice" }, () => {
+      ctx.ether.transfer(FREE_SPIN_JACKPOT_CLAIMS_HOLDER, "alice", 30, { reason: "free spin JP claim payout" });
+      expect(freeSpins.markSettled(ids[0]!)).toBe(true);
+    });
+
+    expect(ctx.ether.balanceOf(FREE_SPIN_JACKPOT_CLAIMS_HOLDER)).toBe(70);
+    expect(ctx.integrity.checkC().ok).toBe(true);
+    expect(ctx.integrity.runFull().ok).toBe(true);
     ctx.db.close();
   });
 });

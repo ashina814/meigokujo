@@ -240,6 +240,7 @@ export {
 } from "./casino/escrow.js";
 export {
   FreeSpins,
+  FREE_SPIN_JACKPOT_CLAIMS_HOLDER,
   type PendingFreeSpinRow,
   type FreeSpinStatus,
 } from "./casino/free-spins.js";

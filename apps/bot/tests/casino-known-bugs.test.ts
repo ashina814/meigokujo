@@ -490,6 +490,51 @@ describe("③b フリースピン権はプロセスをまたいで残る", () =>
     expect(ctx.ether.balanceOf("u1")).toBe(after);
     ctx.db.close();
   });
+
+  it("再起動前の旧sweepAllは固定JP請求holderを動かさず、再開後に一度だけ払う", () => {
+    const ctx = setup(scriptedRng([SCATTER, SCATTER, SCATTER, 0.9, 0.9, 0.9]));
+    seedBalance(ctx.db, "u1", 10_000);
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    seedBalance(ctx.db, JACKPOT_HOLDER, 100_000);
+    const pending = spinPaid(ctx.services, "u1", 1_000, "jp-restart").pendingFreeSpin!;
+    const holder = ctx.freeSpins.jackpotClaimHolder(pending);
+    const before = ctx.ether.balanceOf("u1");
+
+    // Bot再起動前の旧掃除は escrow:* だけを見る。system holderの請求資金は触らない。
+    const restarted = rebuild(ctx.db, scriptedRng([0.01]));
+    expect(restarted.escrow.sweepAll("system:test").orphanTotal).toBe(0);
+    expect(restarted.ether.balanceOf(holder)).toBe(pending.jackpotClaim);
+
+    const first = resumePendingFreeSpins(restarted.services);
+    expect(first).toMatchObject({ total: 1, settled: 1, paid: pending.totalClaim });
+    expect(restarted.ether.balanceOf("u1")).toBe(before + pending.totalClaim);
+    expect(restarted.ether.balanceOf(holder)).toBe(0);
+    expect(resumePendingFreeSpins(restarted.services).settled).toBe(0);
+    expect(restarted.ether.balanceOf("u1")).toBe(before + pending.totalClaim);
+    ctx.db.close();
+  });
+
+  it("無料スピン精算の途中例外ではJP請求残高とpending状態を同時に巻き戻す", () => {
+    const ctx = setup(scriptedRng([SCATTER, SCATTER, SCATTER, 0.9, 0.9, 0.9]));
+    seedBalance(ctx.db, "u1", 10_000);
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    seedBalance(ctx.db, JACKPOT_HOLDER, 100_000);
+    const pending = spinPaid(ctx.services, "u1", 1_000, "jp-rollback").pendingFreeSpin!;
+    const holder = ctx.freeSpins.jackpotClaimHolder(pending);
+    const beforeUser = ctx.ether.balanceOf("u1");
+    const beforeClaim = ctx.ether.balanceOf(holder);
+    const original = ctx.casino.recordGameNet.bind(ctx.casino);
+    (ctx.services.casino as any).recordGameNet = () => {
+      throw new Error("精算の後段で失敗");
+    };
+
+    expect(() => resolveFreeSpin(ctx.services, pending)).toThrow("精算の後段で失敗");
+    (ctx.services.casino as any).recordGameNet = original;
+    expect(ctx.ether.balanceOf("u1")).toBe(beforeUser);
+    expect(ctx.ether.balanceOf(holder)).toBe(beforeClaim);
+    expect(ctx.freeSpins.get(pending.id)!.status).toBe("pending");
+    ctx.db.close();
+  });
 });
 
 /**
