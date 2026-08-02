@@ -1,4 +1,9 @@
-import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
+import {
+  EmbedBuilder,
+  MessageFlags,
+  type ButtonInteraction,
+  type ChatInputCommandInteraction,
+} from "discord.js";
 import { fmtEther } from "../format.js";
 import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
@@ -111,6 +116,62 @@ export function checkRetry(services: Services, userId: string, betRaw: number): 
 
 /** 席が取れなかったときの理由文（同時プレイ防止に弾かれたことを黙らせない） */
 export const SEAT_BUSY_REASON = "まだ前の勝負が終わっていない。少し待ってからもう一度。";
+
+/**
+ * 「もう一回」ボタンを押されたときの本体（PR3）。
+ *
+ * **collector を止めるのは受付が確定してから**。以前は各ゲームが
+ *
+ * ```ts
+ * collector.stop("retry");        // ← 先に止めていた
+ * const retry = checkRetry(...);
+ * if (!retry.ok) return;          // ← 断ると、ボタンは残っているのに二度と反応しない
+ * ```
+ *
+ * という順で書いていた。理由を出すようにしても、collector が死んでいるので
+ * 「もう一度押す」ができない。断ったなら**押し直せる状態のまま**返す。
+ *
+ * 受付が通ったときだけ collector を止め、座席を取り直して本体を回す。
+ * 全ゲームがこの1本を通るので、順序を各ゲームで書き間違えようがない。
+ */
+export interface RetryCollector {
+  stop(reason?: string): void;
+}
+
+export async function handleRetryPress(opts: {
+  services: Services;
+  btn: ButtonInteraction;
+  collector: RetryCollector;
+  betRaw: number;
+  /** 受付が通ったあとに回す本体（座席は取得済み） */
+  run: (bet: number) => Promise<void>;
+}): Promise<void> {
+  const { services, btn, collector, run } = opts;
+  const uid = btn.user.id;
+
+  const retry = checkRetry(services, uid, opts.betRaw);
+  if (!retry.ok) {
+    // ここで collector を止めない。断ったのにボタンを殺すと、次に押したとき無応答になる
+    await btn.reply({ content: `❌ ${retry.reason}`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  // ここから先は受け付ける。この時点で初めてコレクタを閉じる
+  collector.stop("retry");
+  await btn.deferUpdate();
+
+  // 座席は「前の1回」を回している親が握っている。いったん返して取り直す
+  releaseSeat(uid);
+  if (!acquireSeat(uid)) {
+    await btn.followUp({ content: SEAT_BUSY_REASON, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  try {
+    await run(retry.bet);
+  } finally {
+    releaseSeat(uid);
+  }
+}
 
 /**
  * 勝敗リザルトの共通embed（洗練版）。

@@ -133,7 +133,11 @@ export function collectStakes(
         for (const u of userIds) {
           if (services.ether.balanceOf(u) < bet) throw new StakeShortfall();
         }
-        for (const u of userIds) services.ether.transfer(u, HOUSE_HOLDER, bet, { reason: "対人戦の賭け金", game });
+        for (const u of userIds) {
+          services.ether.transfer(u, HOUSE_HOLDER, bet, { reason: "対人戦の賭け金", game });
+          // 通算損益（PR3）。session ありの経路は Escrow 側の onHolderNet が同じことをする
+          services.casino.recordGameNet(u, -bet);
+        }
         return true;
       },
     );
@@ -161,7 +165,11 @@ export function refundAll(services: Services, userIds: string[], bet: number, op
     return;
   }
   services.ether.runGroup({ groupKey: `pvp:refund:${operationId}`, kind: "table_refund", actorId: "system:pvp" }, () => {
-    for (const u of userIds) services.ether.transfer(HOUSE_HOLDER, u, bet, { reason: "対人戦の不成立返金" });
+    for (const u of userIds) {
+      services.ether.transfer(HOUSE_HOLDER, u, bet, { reason: "対人戦の不成立返金" });
+      // 徴収時の −bet を打ち消す。返金では通算損益が動かない（PR3）
+      services.casino.recordGameNet(u, bet);
+    }
   });
 }
 
@@ -208,8 +216,14 @@ export function settlePvp(
       if (winners.length === 0) return { payout: 0, houseCut };
       const share = Math.floor(distributable / winners.length);
       const remainder = distributable - share * winners.length;
-      for (const w of winners) services.ether.transfer(src, w, share, { reason: "対人戦の配当" });
-      if (remainder > 0) services.ether.transfer(src, winners[0]!, remainder, { reason: "対人戦の配当（端数）" });
+      for (const w of winners) {
+        services.ether.transfer(src, w, share, { reason: "対人戦の配当" });
+        services.casino.recordGameNet(w, share);
+      }
+      if (remainder > 0) {
+        services.ether.transfer(src, winners[0]!, remainder, { reason: "対人戦の配当（端数）" });
+        services.casino.recordGameNet(winners[0]!, remainder);
+      }
       return { payout: distributable, houseCut };
     },
   );
@@ -260,7 +274,10 @@ export function settleProportional(
         const w = winners[i]!;
         const isLast = i === winners.length - 1;
         const share = isLast ? remaining : Math.floor((distributable * w.bet) / winnerPot);
-        if (share > 0) services.ether.transfer(src, w.userId, share, { reason: "対人戦の比例配当" });
+        if (share > 0) {
+          services.ether.transfer(src, w.userId, share, { reason: "対人戦の比例配当" });
+          services.casino.recordGameNet(w.userId, share);
+        }
         remaining -= share;
       }
     },
