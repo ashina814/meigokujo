@@ -5,6 +5,7 @@ import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
 import { EtherExchange, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipTx } from "../src/casino/chip-tx.js";
 import { Casino } from "../src/casino/service.js";
 import { Escrow, escrowHolderFor, ESCROW_QUARANTINE } from "../src/casino/escrow.js";
 import { Markets, marketEscrowHolder } from "../src/casino/market.js";
@@ -597,5 +598,105 @@ describe("Markets: 資金分離と精算", () => {
     expect(ctx.ether.balanceOf("a")).toBe(beforeA + 3_000);
     expect(ctx.ether.balanceOf("b")).toBe(beforeB + 2_000);
     expect(ctx.ether.balanceOf(marketEscrowHolder(m.id))).toBe(0);
+  });
+});
+
+/**
+ * PR3（レビュー指摘）: 通算損益は**確定精算のときだけ**記録する。
+ *
+ * 預託時に −stake / 返金時に +stake を記録すると、
+ * 「対局中なのに通算負けが増える」「全額返金なのに earned と lost が両方膨らむ」。
+ */
+describe("onPlayerNet は確定精算のときだけ呼ばれる", () => {
+  function withHook() {
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    const events = new EventLog(db);
+    const chipTx = new ChipTx(db);
+    const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+    const calls: Array<{ userId: string; net: number }> = [];
+    const escrow = new Escrow(db, ether, events, {
+      onPlayerNet: (userId, net) => calls.push({ userId, net }),
+    });
+    const seed = (holder: string, amount: number) =>
+      db
+        .prepare(
+          "INSERT INTO ether_balances (user_id, amount, updated_at) VALUES (?, ?, 1) ON CONFLICT(user_id) DO UPDATE SET amount = excluded.amount",
+        )
+        .run(holder, amount);
+    return { db, ether, escrow, calls, seed };
+  }
+
+  it("hold / holdAll では呼ばれない", () => {
+    const c = withHook();
+    c.seed("a", 50_000);
+    c.seed("b", 50_000);
+    c.escrow.hold("s1", "a", 10_000, "テスト", "op1");
+    c.escrow.holdAll("s2", ["a", "b"], 5_000, "テスト", "op2");
+    expect(c.calls).toEqual([]);
+    c.db.close();
+  });
+
+  it("refund / refundOne / refundMany でも呼ばれない", () => {
+    const c = withHook();
+    c.seed("a", 50_000);
+    c.seed("b", 50_000);
+    c.escrow.holdAll("s1", ["a", "b"], 10_000, "テスト", "op1");
+    c.escrow.refundOne("s1", "a", "r1");
+    c.escrow.refundMany("s1", ["b"], "r2");
+    c.escrow.hold("s2", "a", 3_000, "テスト", "op2");
+    c.escrow.refund("s2");
+    expect(c.calls).toEqual([]);
+    // 資金は全部戻っている
+    expect(c.ether.balanceOf("a")).toBe(50_000);
+    expect(c.ether.balanceOf("b")).toBe(50_000);
+    c.db.close();
+  });
+
+  it("settle では「受取 − 預託」が利用者ごとに一度だけ", () => {
+    const c = withHook();
+    c.seed("winner", 50_000);
+    c.seed("loser", 50_000);
+    c.escrow.holdAll("s1", ["winner", "loser"], 10_000, "テスト", "op1");
+
+    // 場代 600 を JP へ抜いて、残りを勝者へ
+    c.escrow.settle(
+      "s1",
+      [
+        { to: "jackpot", amount: 600, reason: "場代" },
+        { to: "winner", amount: 19_400, reason: "配当" },
+      ],
+      "t",
+      "test",
+    );
+
+    const byUser = Object.fromEntries(c.calls.map((x) => [x.userId, x.net]));
+    expect(c.calls).toHaveLength(2);
+    // 場代は「受取 < 預託合計」の形で勝者の利益から引かれている（10,000 の勝ちではなく 9,400）
+    expect(byUser).toEqual({ winner: 19_400 - 10_000, loser: -10_000 });
+    expect(byUser["winner"]).toBe(9_400);
+    // JP への場代は利用者の損益ではないので呼ばれない
+    expect(c.calls.some((x) => x.userId === "jackpot")).toBe(false);
+    c.db.close();
+  });
+
+  it("同じ精算を再試行しても二度呼ばれない", () => {
+    const c = withHook();
+    c.seed("a", 50_000);
+    c.escrow.hold("s1", "a", 10_000, "テスト", "op1");
+    c.escrow.settle("s1", [{ to: "a", amount: 10_000 }], "t", "test");
+    c.escrow.settle("s1", [{ to: "a", amount: 10_000 }], "t", "test");
+    expect(c.calls).toEqual([{ userId: "a", net: 0 }]);
+    c.db.close();
+  });
+
+  it("起動時の孤児返金でも呼ばれない", () => {
+    const c = withHook();
+    c.seed("a", 50_000);
+    c.escrow.hold("s1", "a", 10_000, "テスト", "op1");
+    c.escrow.sweepAll("system:startup");
+    expect(c.calls).toEqual([]);
+    expect(c.ether.balanceOf("a")).toBe(50_000);
+    c.db.close();
   });
 });

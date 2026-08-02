@@ -212,6 +212,7 @@ export {
   type PayoutMode,
   type MarketSettleResult,
   type MarketRefundResult,
+  type MarketsOptions,
 } from "./casino/market.js";
 export {
   CasinoStatus,
@@ -237,6 +238,11 @@ export {
   type EscrowRow,
   type EscrowOptions,
 } from "./casino/escrow.js";
+export {
+  FreeSpins,
+  type PendingFreeSpinRow,
+  type FreeSpinStatus,
+} from "./casino/free-spins.js";
 export { defaultRng, deterministicRng, scriptedRng, type CasinoRng } from "./casino/rng.js";
 export {
   SLOT_SYMBOLS,
