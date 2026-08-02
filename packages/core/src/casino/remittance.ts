@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { Ledger, TREASURY } from "../ledger/service.js";
 import { deptAccount } from "../departments/service.js";
@@ -5,62 +6,26 @@ import { ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 import { HouseReservations } from "./reservations.js";
 
 const now = () => Math.floor(Date.now() / 1000);
+const planHash = (x: unknown) => createHash("sha256").update(JSON.stringify(x)).digest("hex");
 export type RemittanceStatus = "draft" | "approved" | "executed" | "rejected";
-export interface RemittanceRow { id: number; key: string; amount: number; status: RemittanceStatus; createdBy: string; approvedBy: string | null; executedAt: number | null; }
+export interface RemittanceRow { id: number; key: string; amount: number; status: RemittanceStatus; createdBy: string; approvedBy: string | null; executedAt: number | null; planHash: string; kind: "remittance" | "bailout"; reason: string | null; landTxId: number | null; chipGroupKey: string | null; }
 
-/** PR14: 月次納付と補填は自動実行せず、永続draft→別人承認→一度だけ実行する。 */
+/** Durable draft → second-person approval → exactly-once execute for both remittance and bailout. */
 export class CasinoRemittance {
-  constructor(private readonly db: Database.Database, private readonly ledger: Ledger, private readonly chips: ChipLedger, private readonly reservations: HouseReservations, private readonly departmentKey = "賭博場") {
+  constructor(private readonly db: Database.Database, private readonly ledger: Ledger, private readonly chips: ChipLedger, private readonly reservations: HouseReservations, private readonly departmentKey = "casino") {
     ledger.ensureAccount(deptAccount(departmentKey), "system");
-    db.exec(`CREATE TABLE IF NOT EXISTS casino_remittances (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, amount INTEGER NOT NULL CHECK(amount > 0),
-      status TEXT NOT NULL CHECK(status IN ('draft','approved','executed','rejected')), created_by TEXT NOT NULL,
-      approved_by TEXT, executed_at INTEGER, created_at INTEGER NOT NULL
-    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS casino_house_pnl (id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL, amount INTEGER NOT NULL, source_key TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS casino_remittances (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(kind IN ('remittance','bailout')), amount INTEGER NOT NULL CHECK(amount >= 0), status TEXT NOT NULL CHECK(status IN ('draft','approved','executed','rejected')), plan_hash TEXT NOT NULL, snapshot_json TEXT NOT NULL, reason TEXT, shortage_json TEXT, created_by TEXT NOT NULL, approved_by TEXT, approved_at INTEGER, executed_by TEXT, executed_at INTEGER, land_tx_id INTEGER, chip_group_key TEXT, created_at INTEGER NOT NULL);`);
   }
-
-  surplus(minimumWorkingCapital: number): number {
-    if (!Number.isSafeInteger(minimumWorkingCapital) || minimumWorkingCapital < 0) throw new Error("minimumWorkingCapital must be non-negative integer");
-    return Math.max(0, this.chips.balanceOf(HOUSE_HOLDER) - this.reservations.totalReserved() - minimumWorkingCapital);
-  }
-  draft(key: string, bps: number, minimumWorkingCapital: number, actor: string): RemittanceRow {
-    if (!Number.isSafeInteger(bps) || bps < 0 || bps > 10_000) throw new Error("bps must be 0..10000");
-    const amount = Math.floor(this.surplus(minimumWorkingCapital) * bps / 10_000);
-    if (amount <= 0) throw new Error("納付可能余剰がありません");
-    this.db.prepare("INSERT INTO casino_remittances (key,amount,status,created_by,created_at) VALUES (?,?,'draft',?,?)").run(key, amount, actor, now());
-    return this.get(key)!;
-  }
-  approve(key: string, actor: string): RemittanceRow {
-    const row = this.get(key); if (!row || row.status !== "draft") throw new Error("承認可能な納付案ではありません");
-    if (row.createdBy === actor) throw new Error("起案者自身は承認できません");
-    this.db.prepare("UPDATE casino_remittances SET status='approved', approved_by=? WHERE key=? AND status='draft'").run(actor, key);
-    return this.get(key)!;
-  }
-  execute(key: string, actor: string): RemittanceRow {
-    const row = this.get(key); if (!row || row.status !== "approved") throw new Error("実行可能な納付案ではありません");
-    const dept = deptAccount(this.departmentKey);
-    this.chips.runGroup({ groupKey: `casino:remittance:${key}`, kind: "remittance", actorId: actor }, () => {
-      // house chips → casino department Land → treasury。JP/relief/claims はこの経路に一切入らない。
-      this.chips.redeemToAccount(HOUSE_HOLDER, row.amount, dept, actor, `casino:remittance:${key}:redeem`);
-      const land = this.ledger.transfer({ from: dept, to: TREASURY, amount: row.amount, type: "casino_remittance", actor, reason: "賭場月次納付", idempotencyKey: `casino:remittance:${key}:treasury` });
-      if (land.duplicate) throw new Error("納付Land取引の冪等キー衝突");
-      const changed = this.db.prepare("UPDATE casino_remittances SET status='executed', executed_at=? WHERE key=? AND status='approved'").run(now(), key);
-      if (changed.changes !== 1) throw new Error("納付状態が古く実行できません");
-    });
-    return this.get(key)!;
-  }
-  /** 補填は国庫→賭博場部署→準備口座→house の唯一の経路。自動呼出し用途は持たない。 */
-  bailout(key: string, amount: number, actor: string, approvedBy: string): void {
-    if (!Number.isSafeInteger(amount) || amount <= 0 || !approvedBy || approvedBy === actor) throw new Error("補填には正の額と別承認者が必要");
-    const dept = deptAccount(this.departmentKey);
-    this.chips.runGroup({ groupKey: `casino:bailout:${key}`, kind: "bailout", actorId: actor }, () => {
-      const land = this.ledger.transfer({ from: TREASURY, to: dept, amount, type: "casino_bailout", actor, approvedBy, reason: "承認済み賭場補填", idempotencyKey: `casino:bailout:${key}:dept` });
-      if (land.duplicate) throw new Error("補填Land取引の冪等キー衝突");
-      this.chips.fundFromAccount(dept, amount, HOUSE_HOLDER, `casino:bailout:${key}:fund`);
-    });
-  }
-  get(key: string): RemittanceRow | undefined {
-    const r = this.db.prepare("SELECT * FROM casino_remittances WHERE key=?").get(key) as any;
-    return r && { id: r.id, key: r.key, amount: r.amount, status: r.status, createdBy: r.created_by, approvedBy: r.approved_by, executedAt: r.executed_at };
-  }
+  recordRealized(category: string, amount: number, sourceKey: string): void { if (!Number.isSafeInteger(amount)) throw new Error("invalid P&L amount"); this.db.prepare("INSERT INTO casino_house_pnl (category,amount,source_key,created_at) VALUES (?,?,?,?)").run(category, amount, sourceKey, now()); }
+  cumulativeProfit(): number { return (this.db.prepare("SELECT COALESCE(SUM(amount),0) AS n FROM casino_house_pnl").get() as { n: number }).n; }
+  surplus(minimumWorkingCapital: number): number { if (!Number.isSafeInteger(minimumWorkingCapital) || minimumWorkingCapital < 0) throw new Error("invalid minimum working capital"); return Math.max(0, this.chips.balanceOf(HOUSE_HOLDER) - this.reservations.totalReserved() - minimumWorkingCapital); }
+  private snapshot(bps: number, minimum: number) { const profit = Math.max(0, this.cumulativeProfit()); const surplus = this.surplus(minimum); const base = Math.min(profit, surplus); return { bps, minimum, profit, surplus, base, amount: Math.floor(base * bps / 10_000) }; }
+  draft(key: string, bps: number, minimumWorkingCapital: number, actor: string): RemittanceRow { if (!Number.isSafeInteger(bps) || bps < 0 || bps > 10_000) throw new Error("invalid bps"); const snapshot = this.snapshot(bps, minimumWorkingCapital); return this.insert(key, "remittance", snapshot.amount, snapshot, actor, null, null); }
+  bailoutDraft(key: string, amount: number, reason: string, shortage: Record<string, unknown>, actor: string): RemittanceRow { if (!Number.isSafeInteger(amount) || amount <= 0 || !reason) throw new Error("bailout needs amount and reason"); return this.insert(key, "bailout", amount, { amount, reason, shortage, house: this.chips.balanceOf(HOUSE_HOLDER), reserved: this.reservations.totalReserved() }, actor, reason, shortage); }
+  private insert(key: string, kind: "remittance" | "bailout", amount: number, snapshot: unknown, actor: string, reason: string | null, shortage: unknown): RemittanceRow { const h = planHash(snapshot); this.db.prepare("INSERT INTO casino_remittances (key,kind,amount,status,plan_hash,snapshot_json,reason,shortage_json,created_by,created_at) VALUES (?,?,?,'draft',?,?,?,?,?,?)").run(key, kind, amount, h, JSON.stringify(snapshot), reason, shortage ? JSON.stringify(shortage) : null, actor, now()); return this.get(key)!; }
+  approve(key: string, actor: string): RemittanceRow { const r=this.get(key); if(!r || r.status!=="draft") throw new Error("not draft"); if(r.createdBy===actor) throw new Error("second approver required"); if(this.db.prepare("UPDATE casino_remittances SET status='approved',approved_by=?,approved_at=? WHERE key=? AND status='draft'").run(actor,now(),key).changes!==1) throw new Error("approval race"); return this.get(key)!; }
+  execute(key: string, actor: string): RemittanceRow { const r=this.get(key); if(!r || r.status!=="approved" || !r.approvedBy) throw new Error("not approved"); const snap=JSON.parse((this.db.prepare("SELECT snapshot_json FROM casino_remittances WHERE key=?").get(key) as {snapshot_json:string}).snapshot_json); if(r.kind==="remittance" && planHash(this.snapshot(snap.bps,snap.minimum))!==r.planHash) throw new Error("remittance plan stale"); const dept=deptAccount(this.departmentKey); let landId=0; const group=`casino:${r.kind}:${key}`; this.chips.runGroup({groupKey:group,kind:r.kind,actorId:actor},()=>{ if(r.kind==="remittance"){ this.chips.redeemToAccount(HOUSE_HOLDER,r.amount,dept,actor,`${group}:redeem`); landId=this.ledger.transfer({from:dept,to:TREASURY,amount:r.amount,type:"casino_remittance",actor,approvedBy:r.approvedBy!,reason:"casino remittance",idempotencyKey:`${group}:land`}).tx.id; } else { landId=this.ledger.transfer({from:TREASURY,to:dept,amount:r.amount,type:"casino_bailout",actor,approvedBy:r.approvedBy!,reason:r.reason??"casino bailout",idempotencyKey:`${group}:land`}).tx.id; this.chips.fundFromAccount(dept,r.amount,HOUSE_HOLDER,`${group}:fund`); } if(this.db.prepare("UPDATE casino_remittances SET status='executed',executed_by=?,executed_at=?,land_tx_id=?,chip_group_key=? WHERE key=? AND status='approved'").run(actor,now(),landId,group,key).changes!==1) throw new Error("execute race"); }); return this.get(key)!; }
+  /** Compatibility guard: passing approvedBy is never an approval. */ bailout(_key:string,_amount:number,_actor:string,_approvedBy:string): never { throw new Error("use bailoutDraft → approve → execute"); }
+  get(key:string):RemittanceRow|undefined { const r=this.db.prepare("SELECT * FROM casino_remittances WHERE key=?").get(key) as any; return r&&{id:r.id,key:r.key,amount:r.amount,status:r.status,createdBy:r.created_by,approvedBy:r.approved_by,executedAt:r.executed_at,planHash:r.plan_hash,kind:r.kind,reason:r.reason,landTxId:r.land_tx_id,chipGroupKey:r.chip_group_key}; }
 }
