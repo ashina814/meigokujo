@@ -75,8 +75,8 @@ describe("連鎖ボーナス（chain）", () => {
 
 describe("福の重み（fuku）", () => {
   it("fukuRate: しきい値 (scale=10) 通りに切り替わる", () => {
-    // scale 10 → 10000ld = 100000◈, 50000ld = 500000◈, ...
-    expect(fukuRate(50_000, 10)).toBe(0); // 10,000×10 = 100,000 以下
+    // scale=10 はチップ基準を維持する。100,000以下=0%、500,000以下=5%、1,000,000以下=10%。
+    expect(fukuRate(50_000, 10)).toBe(0);
     expect(fukuRate(100_000, 10)).toBe(0); // 境界: <= 100,000 は 0
     expect(fukuRate(150_000, 10)).toBeCloseTo(0.05); // 10,000×10 < x <= 50,000×10
     expect(fukuRate(500_000, 10)).toBeCloseTo(0.05); // <= 500,000
@@ -87,7 +87,10 @@ describe("福の重み（fuku）", () => {
 
   it("勝ち利益への奉納が JP と 救済プールに半々で流れる", () => {
     const ctx = setup();
-    // 初期残高: a=500,000◈。payout=20,000 → 勝ち後残高 510,000（10% 帯: 500,000 < x <= 1,000,000）
+    // 1:1 預入で a を 500,000 チップへ明示的に配置する。
+    ctx.ledger.transfer({ from: TREASURY, to: "user:a", amount: 450_000, type: "initial", actor: "t", idempotencyKey: "seed:a:fuku" });
+    ctx.ether.buy("a", 450_000, "seed:buy:a:fuku");
+    // 初期残高: a=500,000チップ。payout=20,000 → 勝ち後510,000（10%帯）。
     // 純益 10,000 × 10% = 1,000 奉納。JP と 救済 が floor(1000/2)=500 ずつ。
     const jp0 = ctx.ether.balanceOf(JACKPOT_HOLDER);
     const relief0 = ctx.ether.balanceOf(RELIEF_HOLDER);
@@ -99,9 +102,9 @@ describe("福の重み（fuku）", () => {
 
   it("低残高（しきい値未満）では奉納 0（新規プレイヤー保護）", () => {
     const ctx = setup();
-    // b の残高を 100,000 未満まで減らす（fuku scale=10, しきい値100,000）
-    // 初期 500,000 → 401,000 を house に送って残 99,000
-    testTransfer(ctx.ether, "b", HOUSE_HOLDER, 401_000);
+    // 1:1 預入で b を 99,000チップにする。勝利後も100,000以下に収める。
+    ctx.ledger.transfer({ from: TREASURY, to: "user:b", amount: 49_000, type: "initial", actor: "t", idempotencyKey: "seed:b:low-fuku" });
+    ctx.ether.buy("b", 49_000, "seed:buy:b:low-fuku");
     const jp0 = ctx.ether.balanceOf(JACKPOT_HOLDER);
     // bet 1000, payout 3000 → 純益 +2000。b の勝ち後残高 = 99,000 - 1000 + 3000 = 101,000
     // しきい値 100,000 を超えるので 5% 帯。奉納が発生してしまう。
