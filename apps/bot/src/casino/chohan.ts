@@ -12,7 +12,7 @@ import {
 import { CHOHAN_PAYOUT, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MIN_BET, SEAT_BUSY_REASON, acquireSeat, checkRetry, effectiveMaxBet, releaseSeat, sleep, validateBet } from "./common.js";
+import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -233,24 +233,15 @@ async function runRound(
       return;
     }
     if (btn.customId.startsWith("chohan:retry:")) {
-      collector.stop("retry");
-      // 断るなら理由を出す。黙って return するとボタンが死んだようにしか見えない（PR3）
-      const retry = checkRetry(services, uid, Number(btn.customId.split(":")[2]));
-      if (!retry.ok) {
-        await btn.reply({ content: `❌ ${retry.reason}`, flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await btn.deferUpdate();
-      releaseSeat(uid);
-      if (!acquireSeat(uid)) {
-        await btn.followUp({ content: SEAT_BUSY_REASON, flags: MessageFlags.Ephemeral });
-        return;
-      }
-      try {
-        await runRound(btn, services, retry.bet);
-      } finally {
-        releaseSeat(uid);
-      }
+      // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
+      // 断るなら collector を止めない ＝ 押し直せる
+      await handleRetryPress({
+        services,
+        btn,
+        collector,
+        betRaw: Number(btn.customId.split(":")[2]),
+        run: (bet) => runRound(btn, services, bet),
+      });
     }
   });
   collector.on("end", async (_c, reason) => {

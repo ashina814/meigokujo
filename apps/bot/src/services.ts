@@ -27,6 +27,7 @@ import {
   CasinoIntegrity,
   ChipTx,
   isHumanHeld,
+  isPlayerHolder,
   Daily,
   Items,
   Stocks,
@@ -126,7 +127,14 @@ export function buildServices() {
     betCapMult: () => settings.getNumber("vip_bet_cap_mult"),
   });
   const markets = new Markets(db, ether, events);
-  const escrow = new Escrow(db, ether, events);
+  // 対人卓の預託・返金・精算も「通算損益」に載せる（PR3）。
+  // 預託で −amount、返金・配当で +amount なので、返金しかされなかった卓は差引0になる。
+  // 胴元・JP・救済・隔離への配分は利用者の損益ではないので `isPlayerHolder` で落とす
+  const escrow = new Escrow(db, ether, events, {
+    onHolderNet: (holderId, net) => {
+      if (isPlayerHolder(holderId)) casino.recordGameNet(holderId, net);
+    },
+  });
   const takutate = new Takutate(db, events);
   const casinoIntegrity = new CasinoIntegrity(db, ledger, ether, escrow);
   // 起動時: 全点検 → 通ったときだけ掃除 → 掃除後にもう一度全点検 → 開ける

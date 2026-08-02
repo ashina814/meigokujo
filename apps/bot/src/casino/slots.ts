@@ -23,7 +23,7 @@ import {
 } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MIN_BET, SEAT_BUSY_REASON, acquireSeat, checkRetry, effectiveMaxBet, releaseSeat, sleep, validateBet } from "./common.js";
+import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -240,6 +240,8 @@ export function spinOnce(services: Services, uid: string, bet: number, interacti
           payout = wanted;
           if (payout > 0) {
             services.ether.transfer("house", uid, payout, { reason: "フリースピンの配当", game: "スロット" });
+            // 賭けなしの払い出しなので settle を通らない。通算損益にはここで足す（PR3）
+            services.casino.recordGameNet(uid, payout);
           }
         }
       } else {
@@ -427,26 +429,15 @@ async function runOne(
       return;
     }
     if (btn.customId.startsWith("slots:retry:")) {
-      collector.stop("retry");
-      // 断るなら理由を出す。黙って return するとボタンが死んだようにしか見えない（PR3）
-      const retry = checkRetry(services, uid, Number(btn.customId.split(":")[2]));
-      if (!retry.ok) {
-        await btn.reply({ content: `❌ ${retry.reason}`, flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await btn.deferUpdate();
-      // acquireSeat のためこの playSlots は releaseSeat 後に呼ぶ必要があるが、
-      // 現在の座席は runOne の親（playSlots）が持っている。ここで一旦解放して再取得する。
-      releaseSeat(uid);
-      if (!acquireSeat(uid)) {
-        await btn.followUp({ content: SEAT_BUSY_REASON, flags: MessageFlags.Ephemeral });
-        return;
-      }
-      try {
-        await runOne(btn, services, retry.bet, 0);
-      } finally {
-        releaseSeat(uid);
-      }
+      // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
+      // 断るなら collector を止めない ＝ 押し直せる
+      await handleRetryPress({
+        services,
+        btn,
+        collector,
+        betRaw: Number(btn.customId.split(":")[2]),
+        run: (bet) => runOne(btn, services, bet, 0),
+      });
     }
   });
   collector.on("end", async (_col, reason) => {

@@ -59,12 +59,28 @@ export const ESCROW_QUARANTINE = "sys:escrow:quarantine";
 export const isEscrowHolder = (holderId: string): boolean =>
   holderId.startsWith("escrow:") || holderId === ESCROW_QUARANTINE || holderId === "house_escrow_legacy";
 
+export interface EscrowOptions {
+  /**
+   * 預託・返金・精算で保有者の残高が動いたときに呼ばれる（PR3・通算損益）。
+   *
+   * **必ず資金グループの中から呼ばれる**ので、同じ操作を再試行しても
+   * 「保存済みの結果を返す」経路に入り、二度は呼ばれない。
+   * 賭場以外の保有者（house / jackpot / relief など）も渡すので、
+   * 「誰を戦績に載せるか」は受け取る側で決める。
+   */
+  onHolderNet?: (holderId: string, net: number) => void;
+}
+
 export class Escrow {
+  private readonly onHolderNet: (holderId: string, net: number) => void;
+
   constructor(
     private readonly db: Database.Database,
     private readonly ether: EtherExchange,
     private readonly events: EventLog,
+    options: EscrowOptions = {},
   ) {
+    this.onHolderNet = options.onHolderNet ?? (() => undefined);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS casino_escrow (
         session_id TEXT NOT NULL,
@@ -99,6 +115,7 @@ export class Escrow {
         // 「保存済みの結果（true）を返す」前に残高不足で false になる
         if (this.ether.balanceOf(userId) < amount) return false;
         this.ether.transfer(userId, holder, amount, { reason: "卓への預託", game, sessionId });
+        this.onHolderNet(userId, -amount);
         this.db
           .prepare(
             `INSERT INTO casino_escrow (session_id, user_id, amount, game, source, created_at) VALUES (?, ?, ?, ?, ?, ?)
@@ -133,6 +150,7 @@ export class Escrow {
           for (const userId of userIds) {
             if (this.ether.balanceOf(userId) < amount) throw new EscrowShortfall(userId);
             this.ether.transfer(userId, holder, amount, { reason: "卓への預託", game, sessionId });
+            this.onHolderNet(userId, -amount);
             this.db
               .prepare(
                 `INSERT INTO casino_escrow (session_id, user_id, amount, game, source, created_at) VALUES (?, ?, ?, ?, ?, ?)
@@ -176,6 +194,8 @@ export class Escrow {
             .get(sessionId, userId) as EscrowRow | undefined;
           if (!row) continue;
           this.ether.transfer(row.source, userId, row.amount, { reason: "離脱による返金", sessionId, game: row.game });
+          // 返金は預託の打ち消し。預託時の −amount と相殺して通算損益 0 になる（PR3）
+          this.onHolderNet(userId, row.amount);
           this.db.prepare("DELETE FROM casino_escrow WHERE session_id = ? AND user_id = ?").run(sessionId, userId);
           refunded++;
         }
@@ -281,6 +301,7 @@ export class Escrow {
         const d = positive[i]!;
         _beforeStep?.(i, d);
         this.ether.transfer(holder, d.to, d.amount, { reason: d.reason ?? reason, sessionId });
+        this.onHolderNet(d.to, d.amount);
       }
       // 帳簿削除は最後（送金が全部通ってから）
       this.db.prepare("DELETE FROM casino_escrow WHERE session_id = ?").run(sessionId);
@@ -306,6 +327,7 @@ export class Escrow {
         for (const r of rows) {
           // 保有者から返す（旧行は source='house' → house から返金 = 旧挙動互換）
           this.ether.transfer(r.source, r.user_id, r.amount, { reason: "卓の返金", sessionId, game: r.game });
+          this.onHolderNet(r.user_id, r.amount);
         }
         this.clear(sessionId);
         return rows.length;
@@ -325,6 +347,7 @@ export class Escrow {
         .get(sessionId, userId) as EscrowRow | undefined;
       if (!row) return false;
       this.ether.transfer(row.source, userId, row.amount, { reason: "離脱による返金", sessionId, game: row.game });
+      this.onHolderNet(userId, row.amount);
       this.db.prepare("DELETE FROM casino_escrow WHERE session_id = ? AND user_id = ?").run(sessionId, userId);
       return true;
     });
@@ -389,6 +412,7 @@ export class Escrow {
           }
           for (const r of rows) {
             this.ether.transfer(r.source, r.user_id, r.amount, { reason: "起動時の未精算返金", sessionId: sid, game: r.game });
+            this.onHolderNet(r.user_id, r.amount);
           }
           this.db.prepare("DELETE FROM casino_escrow WHERE session_id = ?").run(sid);
         });
