@@ -7,6 +7,8 @@ import {
   CHIP_ESCROW,
   ETHER_ESCROW,
   ETHER_APPROVER,
+  CASINO_DEPARTMENT_KEY,
+  CASINO_DEPARTMENT,
   HOUSE_HOLDER,
   isPlayerHolder,
   type ChipLedgerOptions as BaseChipLedgerOptions,
@@ -19,12 +21,8 @@ const OPENING_REQUIRED = "ERR_CASINO_OPENING_NOT_COMPLETE";
 
 /**
  * 新しい賭場チップ API の公開入口。
- *
- * production は全サービスで共有する `ChipTx` を渡す。その場合、正式開業初期化が
- * `opening_v1` を確定するまで、新しい資金グループを core 層で拒否する。
- * 復旧・正式開業初期化の `runMaintenance()` 区間だけは、このロック中でも実行できる。
- * テストでは既存シナリオを壊さないよう、`requireOpeningV1: true`を指定したケースだけ
- * 本番ロックを再現する。
+ * productionでは共有ChipTxを使うため、opening_v1確定まで新規資金操作を拒否する。
+ * テストではrequireOpeningV1を明示したケースだけ本番ロックを再現する。
  */
 export interface ChipLedgerOptions extends BaseChipLedgerOptions {
   requireOpeningV1?: boolean;
@@ -63,4 +61,15 @@ export class EtherExchange extends ChipLedger {
   rate(): number { return 1; }
 }
 
-export { EtherError as ChipLedgerError, CHIP_ESCROW, ETHER_ESCROW, ETHER_APPROVER, HOUSE_HOLDER, isPlayerHolder, type ChipQuote, type ChipMoveInfo };
+export {
+  EtherError as ChipLedgerError,
+  CHIP_ESCROW,
+  ETHER_ESCROW,
+  ETHER_APPROVER,
+  CASINO_DEPARTMENT_KEY,
+  CASINO_DEPARTMENT,
+  HOUSE_HOLDER,
+  isPlayerHolder,
+  type ChipQuote,
+  type ChipMoveInfo,
+};
