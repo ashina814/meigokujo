@@ -10,6 +10,7 @@ import {
   Ledger,
   Vip,
   EtherError,
+  FreeSpins,
   TREASURY,
   SLOT_MAX_PAYOUT_MULT,
   deptAccount,
@@ -33,7 +34,7 @@ import {
   reserveSlotsLiability,
   HouseCapacityError,
 } from "../src/casino/common.js";
-import { spinOnce } from "../src/casino/slots.js";
+import { resolveFreeSpin, resumeFreeSpin, spinPaid } from "../src/casino/slots.js";
 import { isCasinoPlayButton } from "../src/casino/play-route.js";
 import { isCasinoInteraction } from "../src/casino/gate.js";
 
@@ -55,8 +56,9 @@ function setup(rng = scriptedRng([0.5])) {
   ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
   const casino = new Casino(db, ether, events, { items, reservations });
   const vip = new Vip(db, ether, events);
-  const services = { db, ether, casino, items, vip, reservations, events, rng } as unknown as Services;
-  return { db, ledger, ether, casino, items, vip, reservations, services };
+  const freeSpins = new FreeSpins(db);
+  const services = { db, ether, casino, items, vip, reservations, freeSpins, events, rng } as unknown as Services;
+  return { db, ledger, ether, casino, items, vip, reservations, freeSpins, services };
 }
 
 function seed(db: ReturnType<typeof openDb>, holder: string, amount: number): void {
@@ -307,12 +309,11 @@ describe("自分の予約は支払保証として使える", () => {
     // この時点で available() は 0。予約鍵を渡さなければフリースピンは払えない判定になる
     expect(c.reservations.available()).toBe(0);
 
-    spinOnce(c.services, "u1", bet, "int-1", 0, res.key);
+    const paid = spinPaid(c.services, "u1", bet, "int-1");
     const before = c.ether.balanceOf("u1");
-    const free = spinOnce(c.services, "u1", bet, "int-1", 1, res.key);
+    const free = resolveFreeSpin(c.services, paid.pendingFreeSpin!, res.key);
 
     expect(free.payout).toBe(bet * 25);
-    expect(free.unpaid).toBe(0);
     expect(c.ether.balanceOf("u1")).toBe(before + bet * 25);
   });
 });
@@ -431,5 +432,84 @@ describe("JP積立と予約が競合しない", () => {
     expect(settled.payout).toBe(bet * SLOT_MAX_PAYOUT_MULT);
     expect(settled.jackpotUnfunded).toBe(0);
     expect(c.ether.balanceOf(HOUSE_HOLDER)).toBeGreaterThanOrEqual(0);
+  });
+});
+
+/**
+ * レビュー指摘の本体。ダブル無しで予約になった操作を再実行したとき、
+ * 要求額（ダブル込み）ではなく**保存済みの額**から doubleAllowed を決める。
+ */
+describe("ブラックジャックの再実行で doubleAllowed が復元される", () => {
+  it("ダブル無し予約になった操作を再実行しても doubleAllowed=false のまま", () => {
+    const c = setup();
+    const bet = 10_000;
+    // ダブル込み（2×bet=20,000）は無理だが、ダブル無し（1.5×bet=15,000）なら足りる
+    seed(c.db, HOUSE_HOLDER, 16_000);
+
+    const first = reserveBlackjackLiability(c.services, "u1", bet, "op1");
+    expect(first.doubleAllowed).toBe(false);
+    expect(first.amount).toBe(15_000);
+
+    // 同じ操作の再実行。要求はダブル込みだが、保存済みは 15,000
+    const again = reserveBlackjackLiability(c.services, "u1", bet, "op1");
+    expect(again.doubleAllowed).toBe(false);
+    expect(again.amount).toBe(15_000);
+    expect(c.reservations.get(first.key)!.amount).toBe(15_000);
+    expect(c.reservations.count()).toBe(1);
+  });
+
+  it("ダブル込みで取れた操作は再実行でも doubleAllowed=true", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    const first = reserveBlackjackLiability(c.services, "u1", 10_000, "op1");
+    const again = reserveBlackjackLiability(c.services, "u1", 10_000, "op1");
+    expect(first.doubleAllowed).toBe(true);
+    expect(again).toEqual(first);
+  });
+});
+
+/**
+ * レビュー指摘: 保留中の無料スピンを再開するときは、予約を安全に取り直す。
+ * 元の予約は起動時に全解放されている。
+ */
+describe("保留中の無料スピンは予約を取り直してから払う", () => {
+  const REELS = [0.98, 0.98, 0.98, 0.85, 0.85, 0.85]; // 魂片3つ → 王冠3つ（25倍）
+
+  it("再起動で予約が消えていても、取り直して同じ出目で払える", () => {
+    const c = setup(scriptedRng(REELS));
+    seed(c.db, "u1", 100_000);
+    seed(c.db, HOUSE_HOLDER, 10_000_000);
+    const bet = 1_000;
+
+    const res = reserveSlotsLiability(c.services, "u1", bet, "int-1");
+    const paid = spinPaid(c.services, "u1", bet, "int-1");
+    expect(paid.pendingFreeSpin).not.toBeNull();
+
+    // 起動時の全解放（正本 §8.2 S9）
+    c.reservations.releaseAll("テストの再起動");
+    expect(c.reservations.get(res.key)).toBeUndefined();
+
+    const before = c.ether.balanceOf("u1");
+    const free = resumeFreeSpin(c.services, paid.pendingFreeSpin!);
+    expect(free.reels).toEqual(paid.pendingFreeSpin!.reels);
+    expect(free.payout).toBe(bet * 25);
+    expect(c.ether.balanceOf("u1")).toBe(before + bet * 25);
+    // 取り直した予約は払い終わったら解放されている
+    expect(c.reservations.count()).toBe(0);
+  });
+
+  it("取り直す予約が取れないときは権利を残す", () => {
+    const c = setup(scriptedRng(REELS));
+    seed(c.db, "u1", 100_000);
+    seed(c.db, HOUSE_HOLDER, 10_000_000);
+    const paid = spinPaid(c.services, "u1", 1_000, "int-1");
+    c.reservations.releaseAll("テストの再起動");
+
+    // 胴元を細らせる（無料スピンぶん 100,000 を予約できない）
+    seed(c.db, HOUSE_HOLDER, 50_000);
+    expect(() => resumeFreeSpin(c.services, paid.pendingFreeSpin!)).toThrow(HouseCapacityError);
+    expect(c.freeSpins.get(paid.pendingFreeSpin!.id)!.status).toBe("pending");
+    // 取れなかった予約行は残らない
+    expect(c.reservations.count()).toBe(0);
   });
 });

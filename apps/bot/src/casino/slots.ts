@@ -31,7 +31,9 @@ import {
   acquireSeat,
   effectiveMaxBet,
   handleRetryPress,
+  releaseHouseLiability,
   releaseSeat,
+  reserveFreeSpinLiability,
   reserveSlotsLiability,
   sleep,
   validateBet,
@@ -221,7 +223,7 @@ export async function settleLeftoverFreeSpins(
     // いま始めようとしている操作で獲得したものは対象外（まだ存在しない）
     if (row.operationId === interaction.id) continue;
     try {
-      const free = resolveFreeSpin(services, row);
+      const free = resumeFreeSpin(services, row);
       const message = {
           content: `✨ 前回持ち越していた**無料スピン**を回した（配当 ${fmtEther(free.payout + free.jpWon)}）。`,
           flags: MessageFlags.Ephemeral,
@@ -451,6 +453,22 @@ export function resolveFreeSpin(
 }
 
 /**
+ * 保留中の無料スピンを**予約を取り直してから**精算する（PR5）。
+ *
+ * 元の予約は起動時に全解放されている（正本 §8.2 S9）ので、
+ * 再開時は「払う直前に必要額を予約 → 払う → 解放」で安全に取り直す。
+ * 予約が取れなければ `HouseCapacityError` になり、権利は pending のまま残る。
+ */
+export function resumeFreeSpin(services: Services, row: PendingFreeSpinRow): SpinRecord {
+  const reserved = reserveFreeSpinLiability(services, row);
+  try {
+    return resolveFreeSpin(services, row, reserved.key);
+  } finally {
+    releaseHouseLiability(services, reserved.key);
+  }
+}
+
+/**
  * 起動時に、前回のプロセスで払い切れなかった無料スピンを精算する（PR3）。
  *
  * 出目は保存済みなので、再起動をまたいでも表示・配当は同じ。
@@ -468,7 +486,7 @@ export function resumePendingFreeSpins(services: Services): {
   const failed: Array<{ id: number; userId: string; error: string }> = [];
   for (const row of rows) {
     try {
-      const r = resolveFreeSpin(services, row);
+      const r = resumeFreeSpin(services, row);
       settled++;
       paid += r.payout + r.jpWon;
     } catch (e) {
