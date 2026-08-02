@@ -185,6 +185,10 @@ export class ChipLedger {
   quoteDeposit(landIn: number): ChipQuote {
     return { input: landIn, output: landIn, burned: 0 };
   }
+  /** PR9: いまゲームに使える自由チップ。拘束中資金は含まない。 */
+  freeChips(userId: string): number {
+    return this.balanceOf(userId);
+  }
 
   /** 自由チップを返還し、同額の Land を受け取る。 */
   quoteRedeem(chipsIn: number): ChipQuote {
