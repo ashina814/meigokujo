@@ -184,8 +184,15 @@ const POLICIES: Array<[string, ChinchiroPolicy]> = [
   ["投数まで振り続ける", { kind: "always_reroll" }],
 ];
 
+/**
+ * 測定規模は **1方針あたり 250,000 × 3シード = 750,000 対局**。
+ * PR 本文・`chinchiro-model.ts` のコメントに載っている表は、
+ * すべてこの1回の測定（下の `console.log`）の出力を写したもの。
+ */
 const ROUNDS = 250_000;
 const SEEDS = [11, 22, 33];
+/** 表と本文で使う「1方針あたりの対局数」。文言のずれを防ぐためここから出す */
+export const RTP_SAMPLE_ROUNDS = ROUNDS * SEEDS.length;
 
 /**
  * 頻度表は**最初に必要になったときに1度だけ**作る。
@@ -218,15 +225,19 @@ describe("敗北倍率2倍化にともなうRTP調整（正本 §1.5）", () => 
       const t = tallies().get(label)!;
       const oldRtp = rtpOf(t, OLD_RULES);
       const newRtp = rtpOf(t, NEW_RULES);
+      const noAdjust = rtpOf(t, { win: WIN_TABLE, edge: 0.05, lossCap: CHINCHIRO_MAX_LOSS_MULT });
       const diff = (newRtp - oldRtp) * 100;
       worst = Math.max(worst, Math.abs(diff));
       rows.push(
-        `  ${label.padEnd(20)} 旧 ${(oldRtp * 100).toFixed(2)}%  →  新 ${(newRtp * 100).toFixed(2)}%  (${diff >= 0 ? "+" : ""}${diff.toFixed(2)}pt)`,
+        `  ${label.padEnd(20)} 旧 ${(oldRtp * 100).toFixed(2)}%  →  新 ${(newRtp * 100).toFixed(2)}%  ` +
+          `(${diff >= 0 ? "+" : ""}${diff.toFixed(2)}pt)  ／ 調整なしなら ${(noAdjust * 100).toFixed(2)}% ` +
+          `(${((noAdjust - oldRtp) * 100).toFixed(2)}pt)`,
       );
     }
+    // **この出力が測定値の唯一の出所**。PR本文と chinchiro-model.ts の表はここから写す
     console.log(
       `=== チンチロ RTP: 敗北倍率 最大5倍→2倍 / エッジ ${(0.05 * 100).toFixed(0)}%→${(CHINCHIRO_HOUSE_EDGE * 100).toFixed(0)}%` +
-        `（各方針 ${(ROUNDS * SEEDS.length).toLocaleString()} 対局・同一サンプル）===`,
+        `（各方針 ${RTP_SAMPLE_ROUNDS.toLocaleString()} 対局 = ${ROUNDS.toLocaleString()} × ${SEEDS.length}シード・同一サンプル）===`,
     );
     for (const row of rows) console.log(row);
     for (const [label] of POLICIES) {
@@ -238,12 +249,39 @@ describe("敗北倍率2倍化にともなうRTP調整（正本 §1.5）", () => 
     expect(worst).toBeGreaterThan(0.2);
   });
 
-  it("エッジを戻さないと RTP が +5pt 以上 上振れする（調整が要る理由の回帰）", () => {
+  it("エッジを戻さないと RTP が +4.9pt 以上 上振れする（調整が要る理由の回帰）", () => {
     for (const [label] of POLICIES) {
       const t = tallies().get(label)!;
       const noAdjust = rtpOf(t, { win: WIN_TABLE, edge: 0.05, lossCap: CHINCHIRO_MAX_LOSS_MULT });
       const diff = (noAdjust - rtpOf(t, OLD_RULES)) * 100;
-      expect(diff, label).toBeGreaterThan(4.5);
+      expect(diff, label).toBeGreaterThan(4.9);
+    }
+  });
+
+  /**
+   * 文書に載っている表と実測がずれないように固定する。
+   *
+   * レビュー指摘（PR本文・ソースコメント・テストで測定件数と実測値がばらついていた）への対応。
+   * ここが唯一の真実源で、`chinchiro-model.ts` のコメントと PR 本文はこの表を写す。
+   * 倍率・エッジ・進行モデルを触れば当然ここが落ちるので、そのとき文書も一緒に直す。
+   */
+  const DOCUMENTED: Array<[string, number, number, number]> = [
+    // [方針, 旧RTP%, 新RTP%, 調整なし%]
+    ["目が出たら必ず止める", 87.14, 87.58, 93.23],
+    ["スコア4以上で止める", 86.6, 86.75, 92.52],
+    ["スコア5以上で止める（マモン同）", 84.14, 84.18, 89.87],
+    ["スコア6以上で止める", 81.09, 80.96, 86.54],
+    ["投数まで振り続ける", 74.08, 73.76, 79.01],
+  ];
+
+  it("文書に載せている表と実測が一致する（測定規模は 750,000 対局／方針）", () => {
+    expect(RTP_SAMPLE_ROUNDS).toBe(750_000);
+    for (const [label, oldPct, newPct, noAdjustPct] of DOCUMENTED) {
+      const t = tallies().get(label)!;
+      const noAdjust = rtpOf(t, { win: WIN_TABLE, edge: 0.05, lossCap: CHINCHIRO_MAX_LOSS_MULT });
+      expect(rtpOf(t, OLD_RULES) * 100, `${label} 旧`).toBeCloseTo(oldPct, 1);
+      expect(rtpOf(t, NEW_RULES) * 100, `${label} 新`).toBeCloseTo(newPct, 1);
+      expect(noAdjust * 100, `${label} 調整なし`).toBeCloseTo(noAdjustPct, 1);
     }
   });
 
