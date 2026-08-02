@@ -71,16 +71,33 @@ export interface RecoverCasinoDeps {
 }
 
 export interface RecoverCasinoResult {
-  /** どこまで進んだか。`halted` は S2/S3 で止めた（以降を実行していない） */
-  outcome: "opened" | "halted" | "held" | "manual";
+  /**
+   * どこまで進んだか。
+   *
+   * - `opened`: S12 まで通って営業を開けた
+   * - `halted`: 検算 NG で `integrity_halt`（以降を実行していない）
+   * - `source_failed`: 所有元の申告が取れなかったので掃除も再開もしていない（PR7 レビュー指摘）
+   * - `held`: 人が止めている状態なので触っていない
+   * - `manual`: `integrity_halt` のまま。運営の再点検待ち
+   */
+  outcome: "opened" | "halted" | "source_failed" | "held" | "manual";
   /** 実行したステップ（診断用） */
   steps: string[];
   keptHolders: number;
   refundedSessions: number;
   refundedTotal: number;
   quarantined: number;
+  /** 帳簿と保有者残高が合わないセッション。凍結してあり、賭場全体も停止する（運営判断） */
   mismatched: Array<{ sessionId: string; expected: number; actual: number }>;
-  releasedReservations: { count: number; total: number };
+  /**
+   * 孤児返金が**技術的に失敗**したセッション（PR7 レビュー指摘）。
+   *
+   * 1件の失敗で他の復旧は止めないが、失敗そのものが起動ログから消えてはいけない。
+   * 帳簿と残高はそのまま維持してある。
+   */
+  failedSessions: Array<{ sessionId: string; expected: number; actual: number; error: string }>;
+  /** ソロ予約の解放結果。`released: false` なら**解放を実行していない** */
+  releasedReservations: { released: boolean; count: number; total: number };
   reason?: string;
 }
 
@@ -115,7 +132,9 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     refundedTotal: 0,
     quarantined: 0,
     mismatched: [],
-    releasedReservations: { count: 0, total: 0 },
+    failedSessions: [],
+    // 予約解放は S9。ここへ到達していない時点では **実行していない**
+    releasedReservations: { released: false, count: 0, total: 0 },
   };
 
   const held = status.current();
@@ -184,7 +203,8 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
       refundedTotal: swept.refundedTotal,
       quarantined: swept.quarantined,
       mismatched: swept.mismatched,
-      releasedReservations,
+      failedSessions: swept.failed,
+      releasedReservations: { released: true, ...releasedReservations },
       skipped: false as const,
       reason: undefined as string | undefined,
     };
@@ -196,8 +216,24 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     refundedTotal: result.refundedTotal,
     quarantined: result.quarantined,
     mismatched: result.mismatched,
+    failedSessions: result.failedSessions,
     releasedReservations: result.releasedReservations,
   };
+
+  // **所有元の申告が取れなかったら営業を再開しない**（PR7 レビュー指摘）。
+  //
+  // 以前はここを素通りして runFull → finishStartupCheck まで進んでいたので、
+  // 「所有元が分からないまま open へ戻る」状態になっていた。掃除を見送った以上、
+  // 復旧が完了したとは判断できない。運営の確認が必要な状態で止める。
+  if (result.skipped) {
+    const reason = result.reason ?? "生存中エスクローの収集に失敗";
+    status.haltForIntegrity(`復旧中断: ${reason}（掃除・予約解放とも未実行。運営の確認が必要）`);
+    events.log("casino_recovery_halted", {
+      actor: "system:recovery",
+      payload: { steps, reason, reservationsReleased: false },
+    });
+    return { outcome: "source_failed", steps, ...summary, reason };
+  }
 
   // 掃除のあとに**全点検（A〜D）**。ここで初めて C・D まで見る
   // （掃除が終わっていれば孤児も不一致も解消しているはず）
@@ -212,10 +248,25 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     return { outcome: "halted", steps, ...summary, reason };
   }
 
+  // 帳簿不一致があれば、対象を凍結したうえで**賭場全体も止める**（運営判断）。
+  // 正本 §6 は「検算A〜D のいずれかが NG なら integrity_halt」なので、
+  // 正式開業前の段階で「1卓だけ止めて営業継続」へは緩和しない。
+  if (result.mismatched.length > 0) {
+    const reason =
+      `エスクロー帳簿不一致 ${result.mismatched.length}件（対象は凍結済み・返金も隔離もしていない）: ` +
+      result.mismatched.map((m) => `${m.sessionId}(帳簿${m.expected}/保有${m.actual})`).join(", ");
+    events.log("casino_recovery_halted", {
+      actor: "system:recovery",
+      payload: { steps, reason, mismatched: result.mismatched },
+    });
+    status.haltForIntegrity(reason);
+    return { outcome: "halted", steps, ...summary, reason };
+  }
+
   // S12: 元の状態が startup_check のときだけ open へ戻す
   status.finishStartupCheck("system:recovery");
   steps.push("S12:再開");
-  events.log("casino_recovered", { actor: "system:recovery", payload: { steps, ...summary, skipped: result.skipped } });
+  events.log("casino_recovered", { actor: "system:recovery", payload: { steps, ...summary } });
   return { outcome: "opened", steps, ...summary, reason: result.reason };
 }
 

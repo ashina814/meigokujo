@@ -159,11 +159,7 @@ export function buildServices() {
   );
   // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
-<<<<<<< HEAD
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, rng };
-=======
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, reservations, recoveryRegistry, rng };
->>>>>>> 791ac87 (起動時の復旧を登録型にする（マモンの賭場 大型UPD PR7）)
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;
@@ -178,15 +174,24 @@ export type Services = ReturnType<typeof buildServices>;
  * ログで追えるようにするだけで、判断は一切しない。
  */
 function logRecovery(r: ReturnType<typeof recoverCasino>): void {
+  const reservations = r.releasedReservations.released
+    ? `予約解放${r.releasedReservations.count}件`
+    : "予約解放は未実行";
   const summary =
     `維持${r.keptHolders}件 / 孤児返金${r.refundedSessions}件(${r.refundedTotal.toLocaleString("ja-JP")}◈) / ` +
-    `隔離${r.quarantined}件 / 不一致${r.mismatched.length}件 / 予約解放${r.releasedReservations.count}件`;
+    `隔離${r.quarantined}件 / 不一致${r.mismatched.length}件 / 返金失敗${r.failedSessions.length}件 / ${reservations}`;
   switch (r.outcome) {
     case "opened":
       console.log(`[賭場] 起動時の復旧を完了し、営業を開けました（${summary}）`);
       break;
     case "halted":
-      console.error(`[賭場] 起動時の検算に失敗したため停止しました: ${r.reason}`);
+      console.error(`[賭場] 起動時の復旧で停止しました: ${r.reason}（${summary}）`);
+      break;
+    case "source_failed":
+      // 所有元の申告が取れなかった＝掃除も再開もしていない。営業は開けない（PR7）
+      console.error(
+        `[賭場] 生存中エスクローの所有元を確認できなかったため、掃除・予約解放とも実行せず停止しました: ${r.reason}`,
+      );
       break;
     case "held":
       console.warn(`[賭場] 人が止めている状態のため復旧を行いません（${r.reason}）`);
@@ -198,8 +203,17 @@ function logRecovery(r: ReturnType<typeof recoverCasino>): void {
   if (r.mismatched.length > 0) {
     // 帳簿と保有者残高が合わないセッション。返金も隔離もせず凍結してある。要調査
     console.warn(
-      `[escrow] 帳簿不一致 ${r.mismatched.length}件（返金も隔離もせず凍結）: ` +
+      `[escrow] 帳簿不一致 ${r.mismatched.length}件（返金も隔離もせず凍結・賭場全体も停止）: ` +
         r.mismatched.map((m) => `${m.sessionId}(帳簿${m.expected}/保有${m.actual})`).join(", "),
+    );
+  }
+  if (r.failedSessions.length > 0) {
+    // 孤児返金の技術失敗。他の復旧は続けたが、失敗が起動ログから消えてはいけない（PR7）
+    console.error(
+      `[escrow] 孤児返金に失敗 ${r.failedSessions.length}件（帳簿・残高は維持）: ` +
+        r.failedSessions
+          .map((f) => `${f.sessionId}(帳簿${f.expected}/保有${f.actual}): ${f.error}`)
+          .join(" / "),
     );
   }
 }
