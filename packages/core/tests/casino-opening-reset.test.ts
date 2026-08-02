@@ -70,17 +70,21 @@ describe("PR12 開業初期化 preflight", () => {
     const txById = (id: number) =>
       db.prepare("SELECT from_account, to_account, amount FROM transactions WHERE id=?").get(id) as
         { from_account: string; to_account: string; amount: number };
+    // R7 旧制度清算 と R8 新制度出資 は、賭博場部署を挟んだ独立2本
     expect(txById(applied.oldSettlementLandTxId)).toEqual({ from_account: ETHER_ESCROW, to_account: CASINO_DEPARTMENT, amount: 1_000 });
     expect(txById(applied.newInvestmentLandTxId)).toEqual({ from_account: CASINO_DEPARTMENT, to_account: CHIP_ESCROW, amount: 1_000 });
+
+    // 旧キーの口座も取引も生まれない
     expect(db.prepare("SELECT 1 FROM accounts WHERE id='sys:dept:casino'").get()).toBeUndefined();
     expect(db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE from_account='sys:dept:casino' OR to_account='sys:dept:casino'").get()).toEqual({ n: 0 });
     expect(ledger.balanceOf("sys:dept:casino")).toBe(0);
+    // 通過口座なので、出資後の賭博場部署は残さない
     expect(ledger.balanceOf(CASINO_DEPARTMENT)).toBe(0);
     db.close();
   });
 
   it("利用者の通常Landを変えず、変わってしまう場合は適用ごとROLLBACKする", async () => {
-    const { db, ledger, reset } = fundedReset();
+    const { db, ledger, chips, reset } = fundedReset();
     ledger.ensureAccount("user:alice", "user");
     ledger.ensureAccount("user:bob", "user");
     ledger.transfer({ from: "sys:treasury", to: "user:alice", amount: 5_000, type: "initial", actor: "test", idempotencyKey: "seed-alice" });
@@ -93,6 +97,7 @@ describe("PR12 開業初期化 preflight", () => {
     expect(ledger.balanceOf("user:bob")).toBe(2_500);
     db.close();
 
+    // 途中で利用者Landが動く実装になったら、検算で気づいて全部巻き戻す
     const second = fundedReset();
     second.ledger.ensureAccount("user:alice", "user");
     second.ledger.transfer({ from: "sys:treasury", to: "user:alice", amount: 5_000, type: "initial", actor: "test", idempotencyKey: "seed-alice" });
