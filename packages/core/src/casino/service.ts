@@ -108,6 +108,13 @@ export interface SettleResult {
   /** 福の重みで奉納された額（半分JP・半分救済へ） */
   fukuTax: number;
   fukuRate: number;
+  /** 実際に house → jackpot へ積めた額（PR4） */
+  jackpotContributed: number;
+  /**
+   * 積むべきだったのに house の資金が足りず**積めなかった**額（PR4）。
+   * 予約が正しければ 0 のまま。0 でないなら会計上の異常で、events にも残している。
+   */
+  jackpotUnfunded: number;
 }
 
 export interface CasinoOptions {
@@ -256,9 +263,27 @@ export class Casino {
         }
       }
 
-      // JP積立（胴元から）
-      if (jackpotCut > 0 && this.ether.balanceOf(HOUSE_HOLDER) >= jackpotCut) {
-        this.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, jackpotCut, { ...move, reason: "JP積立" });
+      // JP積立（胴元から）。**黙って飛ばさない**（PR4 レビュー指摘）。
+      // 積立は house からの支出なので PR5 の予約債務に含めてある。したがって
+      // 予約が取れた賭けでは必ず払えるはずで、払えないなら会計上の異常として記録する。
+      let jackpotContributed = 0;
+      let jackpotUnfunded = 0;
+      if (jackpotCut > 0) {
+        if (this.ether.balanceOf(HOUSE_HOLDER) >= jackpotCut) {
+          this.ether.transfer(HOUSE_HOLDER, JACKPOT_HOLDER, jackpotCut, { ...move, reason: "JP積立" });
+          jackpotContributed = jackpotCut;
+        } else {
+          jackpotUnfunded = jackpotCut;
+          this.events.log("casino_house_insufficient", {
+            actor: userId,
+            payload: {
+              game,
+              kind: "jackpot_contribution",
+              wanted: jackpotCut,
+              houseBalance: this.ether.balanceOf(HOUSE_HOLDER),
+            },
+          });
+        }
       }
       const effectivePayout = payout + chainBonus - fukuTax;
       const net = effectivePayout - bet;
@@ -267,7 +292,19 @@ export class Casino {
       // JP積立は胴元 → JP の移動なので利用者の損益には関係しない
       this.recordResult(userId, bet, effectivePayout);
       this.events.log("casino_game", { actor: userId, payload: { game, bet, payout: effectivePayout, net, chainBonus, fukuTax } });
-      return { wagered: bet, payout: effectivePayout, net, chainBonus, chainStreak, chainMult, chainLabel, fukuTax, fukuRate: rate };
+      return {
+        wagered: bet,
+        payout: effectivePayout,
+        net,
+        chainBonus,
+        chainStreak,
+        chainMult,
+        chainLabel,
+        fukuTax,
+        fukuRate: rate,
+        jackpotContributed,
+        jackpotUnfunded,
+      };
     });
   }
 

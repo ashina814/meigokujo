@@ -1,6 +1,6 @@
 import { chainMultiplier } from "./service.js";
 import { CHOHAN_PAYOUT, CRASH_MAX_MULT_CAP, POKER_CATEGORY_PAYOUTS, ROULETTE_PAYOUTS } from "./game-models.js";
-import { SLOT_MAX_PAYOUT_MULT } from "./slots-model.js";
+import { SLOT_MAX_PAYOUT_MULT, jackpotCutFor } from "./slots-model.js";
 import { chinchiroMaxPayout, chinchiroMaxPlayerLoss } from "./chinchiro-model.js";
 
 /**
@@ -30,10 +30,17 @@ export interface GameLiabilityModel {
    * この1回で胴元が最悪いくら「純増で」払うか（＝予約すべき額）。
    * 賭け金の回収を織り込む。
    *
-   * **JP は含めない**（当選金は jackpot holder から出るので house の債務ではない）。
-   * **福の重みも含めない**（プレイヤー → JP/救済 の一方向なので債務を減らす側）。
+   * **JP の当選金は含めない**（jackpot holder から出るので house の債務ではない）。
+   * 一方、**通常スピン時の JP 積立は含める**。積立は house → jackpot の支出で、
+   * 「他人の予約済み資金を食える house からの流出」になるため（レビュー指摘）。
+   * **福の重みは含めない**（プレイヤー → JP/救済 の一方向なので債務を減らす側）。
    */
   maxHouseLiability(ctx: LiabilityContext): number;
+  /**
+   * この1回で **必ず** house から出ていく額（配当とは別の確定支出）。
+   * 現状はスロットの JP 積立だけ。`maxHouseLiability` はこれを内包する。
+   */
+  mandatoryHouseOutflow(ctx: LiabilityContext): number;
   /** この1回でプレイヤーが最悪いくら失うか（チンチロ以外は賭け額そのもの） */
   maxPlayerLoss(ctx: LiabilityContext): number;
   /** `available` から逆算できる最大ベット（切り捨て。1未満なら 0） */
@@ -61,11 +68,14 @@ function chainMult(mode: ChainMode, winStreak: number): number {
  * 正本 §5.2 の表は `M·bet·C − bet + W` と書いており、お守りぶんに連鎖を掛けていない。
  * ここでは実装の順序に合わせて **W にも連鎖を掛ける**（表より `W × (C − 1)` だけ厳しい）。
  * 予約は多めに取っておくほうが安全側に倒れる。
+ *
+ * `mandatory` は勝敗に関わらず house から出る額（スロットの JP 積立）。
+ * 配当が最大のときも同時に出ていくので、そのまま足す。
  */
-function liabilityFrom(maxPayout: number, ctx: LiabilityContext, chain: ChainMode): number {
+function liabilityFrom(maxPayout: number, ctx: LiabilityContext, chain: ChainMode, mandatory = 0): number {
   const c = chainMult(chain, ctx.playerState.winStreak);
   const gross = Math.ceil((maxPayout + ctx.activeEffects.winBonusCap) * c);
-  return Math.max(0, gross - ctx.bet);
+  return Math.max(0, gross + mandatory - ctx.bet);
 }
 
 /** `liabilityFrom` の逆算。1 Ld 単位で二分探索する（倍率が実数・切り上げ混じりなので式で解かない） */
@@ -88,22 +98,37 @@ function betForLiability(
   return lo;
 }
 
-/** 最大払戻が「賭け額 × 定数倍率」で表せるゲームの共通実装 */
-function fixedMultModel(game: string, maxPayoutMult: number, chain: ChainMode): GameLiabilityModel {
+/**
+ * 最大払戻が「賭け額 × 定数倍率」で表せるゲームの共通実装。
+ * @param mandatory 勝敗に関わらず house から出る額（スロットの JP 積立）
+ */
+function fixedMultModel(
+  game: string,
+  maxPayoutMult: number,
+  chain: ChainMode,
+  mandatory: (bet: number) => number = () => 0,
+): GameLiabilityModel {
   const maxPayout = (bet: number) => Math.floor(bet * maxPayoutMult);
+  const liability = (ctx: LiabilityContext) => liabilityFrom(maxPayout(ctx.bet), ctx, chain, mandatory(ctx.bet));
   return {
     game,
-    maxHouseLiability: (ctx) => liabilityFrom(maxPayout(ctx.bet), ctx, chain),
+    maxHouseLiability: liability,
+    mandatoryHouseOutflow: (ctx) => mandatory(ctx.bet),
     maxPlayerLoss: (ctx) => ctx.bet,
-    maxBetFor: (available, ctx) =>
-      betForLiability(available, ctx, (bet) => liabilityFrom(maxPayout(bet), { ...ctx, bet }, chain)),
+    maxBetFor: (available, ctx) => betForLiability(available, ctx, (bet) => liability({ ...ctx, bet })),
   };
 }
 
 // ─── ゲーム別 ───────────────────────────────────────────
 
-/** スロット: マモン³ = 100倍。JP 当選金は jackpot holder から出るので含めない */
-export const slotsLiability = fixedMultModel("スロット", SLOT_MAX_PAYOUT_MULT, "on");
+/**
+ * スロット（有料スピン1回ぶん）。マモン³ = 100倍。
+ *
+ * JP **当選金**は jackpot holder から出るので含めない。
+ * JP **積立**は house → jackpot の支出なので含める。含めないと、積立が
+ * 他の利用者の予約済み資金を食う（house.available を計算に入れずに house を減らす）。
+ */
+export const slotsLiability = fixedMultModel("スロット", SLOT_MAX_PAYOUT_MULT, "on", jackpotCutFor);
 
 /** 丁半: CHOHAN_PAYOUT 倍。連鎖は実装で無効（実効RTP が 100% を超える回帰があったため） */
 export const chohanLiability = fixedMultModel("丁半", CHOHAN_PAYOUT, "off");
@@ -135,6 +160,7 @@ export const holdemLiability: GameLiabilityModel = {
     const gross = Math.ceil((ctx.bet * HOLDEM_MAX_PAYOUT_MULT + ctx.activeEffects.winBonusCap) * c);
     return Math.max(0, gross - total);
   },
+  mandatoryHouseOutflow: () => 0,
   // フォールドしても失うのは積んだぶんまで。最悪は T
   maxPlayerLoss: (ctx) => ctx.bet * HOLDEM_MAX_TOTAL_BET_MULT,
   maxBetFor: (available, ctx) =>
@@ -156,6 +182,7 @@ export const blackjackLiability: GameLiabilityModel = {
     const gross = Math.ceil((ctx.bet * BLACKJACK_MAX_PAYOUT_MULT + ctx.activeEffects.winBonusCap) * c);
     return Math.max(0, gross - ctx.bet * 2); // ダブルで 2·bet を回収する
   },
+  mandatoryHouseOutflow: () => 0,
   maxPlayerLoss: (ctx) => ctx.bet * 2,
   maxBetFor: (available, ctx) =>
     betForLiability(available, ctx, (bet) => blackjackLiability.maxHouseLiability({ ...ctx, bet })),
@@ -170,6 +197,7 @@ export const blackjackNoDoubleLiability = fixedMultModel("ブラックジャッ�
 export const chinchiroLiability: GameLiabilityModel = {
   game: "チンチロ",
   maxHouseLiability: (ctx) => liabilityFrom(chinchiroMaxPayout(ctx.bet), ctx, "on"),
+  mandatoryHouseOutflow: () => 0,
   maxPlayerLoss: (ctx) => chinchiroMaxPlayerLoss(ctx.bet),
   maxBetFor: (available, ctx) =>
     betForLiability(available, ctx, (bet) => liabilityFrom(chinchiroMaxPayout(bet), { ...ctx, bet }, "on")),
