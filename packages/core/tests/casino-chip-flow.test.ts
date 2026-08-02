@@ -62,4 +62,16 @@ describe("PR10 自動預入・自由チップ返還", () => {
     expect(ctx.chips.balanceOf("bob")).toBe(100);
     ctx.db.close();
   });
+
+  it("域外操作確認票は本人だけが期限内に一度だけ実行権を取得でき、承認前は資金を動かさない", () => {
+    const ctx = setup();
+    const row = ctx.flow.createExternalConfirmation({ id: "c1", userId: "alice", operationKind: "shop", operationId: "op1", requiredLand: 100, expiresAt: Math.floor(Date.now() / 1000) + 60 });
+    expect(row.status).toBe("pending");
+    expect(ctx.chips.balanceOf("alice")).toBe(0);
+    expect(() => ctx.flow.beginExternalConfirmation("c1", "bob")).toThrow();
+    expect(ctx.flow.beginExternalConfirmation("c1", "alice").status).toBe("executing");
+    expect(() => ctx.flow.beginExternalConfirmation("c1", "alice")).toThrow();
+    expect(ctx.flow.completeExternalConfirmation("c1", "alice")).toBe(true);
+    ctx.db.close();
+  });
 });

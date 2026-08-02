@@ -137,6 +137,10 @@ client.once(Events.ClientReady, (ready) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    // PR10: 賭場内の操作時刻はDBを真実源にする。再起動後の無操作返還もこの時刻から再計算する。
+    const casinoCommand = interaction.isChatInputCommand() && ["遊ぶ", "勝負", "賭場商店", "vip", "板", "競馬", "福分け", "案内"].includes(interaction.commandName);
+    const casinoComponent = "customId" in interaction && /^(casino:|annai:|ita:|bakuten:|vip:|chinchiro:)/.test(interaction.customId);
+    if (casinoCommand || casinoComponent) services.chipFlow.touch(interaction.user.id);
     // 賭場が停止していれば、チップを動かしうる操作はここで全部止める（理由付きで返す）
     if (await denyIfCasinoClosed(interaction, services)) return;
     if (interaction.isChatInputCommand()) {
@@ -376,6 +380,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
       if (interaction.customId.startsWith("annai:")) {
+        await handleAnnaiButton(interaction, services);
+        return;
+      }
+      if (interaction.customId === "casino:leave") {
         await handleAnnaiButton(interaction, services);
         return;
       }

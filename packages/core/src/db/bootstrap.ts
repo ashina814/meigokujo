@@ -419,6 +419,19 @@ CREATE TABLE IF NOT EXISTS casino_chip_activity (
 );
 CREATE INDEX IF NOT EXISTS idx_casino_chip_activity_idle ON casino_chip_activity(last_active_at);
 
+CREATE TABLE IF NOT EXISTS casino_chip_external_confirmations (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  operation_kind TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  required_land INTEGER NOT NULL CHECK(required_land > 0),
+  status TEXT NOT NULL CHECK(status IN ('pending','executing','completed','cancelled','expired')),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  completed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_casino_chip_external_confirmations_user ON casino_chip_external_confirmations(user_id, status, expires_at);
+
 -- 賭場チップの取引監査（大型UPD PR1）。チップ残高は現在値しか持たないので、
 -- 「業務操作の単位(group)」と「その中の1移動(tx)」を追記し、開始残高から再現できるようにする。
 CREATE TABLE IF NOT EXISTS casino_tx_groups (

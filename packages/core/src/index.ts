@@ -191,6 +191,7 @@ export {
   type AutoDepositResult,
   type RedeemResult,
   type InactiveRedeemResult,
+  type ExternalChipConfirmation,
 } from "./casino/chip-flow.js";
 export {
   Casino,

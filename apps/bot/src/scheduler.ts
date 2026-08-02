@@ -96,6 +96,12 @@ export function nextSessionStart(services: Pick<Services, "sessions">, from = ne
 export function startScheduler(client: Client, services: Services, intervalMs = 60_000): NodeJS.Timeout {
   async function tick(): Promise<void> {
     const now = jstNow();
+    // PR10: 1分走査。候補・最終時刻はDBから読み、各利用者の返還は冪等groupで処理する。
+    const idleCutoff = Math.floor(Date.now() / 1000) - 10 * 60;
+    const idle = services.chipFlow.redeemInactive(idleCutoff, `scheduler:${Math.floor(Date.now() / 60_000)}`);
+    if (idle.failed.length > 0 || idle.skipped.length > 0) {
+      services.events.log("casino_idle_redeem_scan", { actor: "system:scheduler", payload: { cutoff: idleCutoff, failed: idle.failed, skipped: idle.skipped } });
+    }
 
     // ── 説明会の案内: 実際の開催予定の 5分前に入城案内chへ通知 ──
     // 通常枠は settings、休止・臨時追加は entry_session_overrides。合成は SessionCalendar が持ち、

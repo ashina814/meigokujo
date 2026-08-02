@@ -69,6 +69,10 @@ export function acquireSeat(userId: string): boolean {
 export function releaseSeat(userId: string): void {
   playing.delete(userId);
 }
+/** PR10: 返還・域外確認は進行中ソロゲームの利用者には出さない。 */
+export function isSeatOccupied(userId: string): boolean {
+  return playing.has(userId);
+}
 
 export interface BetCheck {
   ok: boolean;
