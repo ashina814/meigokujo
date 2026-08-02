@@ -529,11 +529,10 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
     try {
       if (action === "remit-draft") {
         const key = interaction.fields.getTextInputValue("key").trim();
-        const bps = Number(interaction.fields.getTextInputValue("bps").replaceAll(",", "").trim());
-        const minimum = Number(interaction.fields.getTextInputValue("minimum").replaceAll(",", "").trim());
         const fuku = Number(interaction.fields.getTextInputValue("fuku").replaceAll(",", "").trim());
         const period = interaction.fields.getTextInputValue("period").trim() || undefined;
-        const draft = services.remittance.draft(key, bps, minimum, actor, { fukuReserve: fuku, period });
+        // 納付率・最低運転資金は運営が確定した開業設定だけを使う（操作者は入力できない）
+        const draft = services.remittance.draftFromConfiguration(key, actor, { fukuReserve: fuku, period });
         await interaction.reply({ content: `Remittance draft ${draft.key}: ${fmtLd(draft.amount)} / plan ${draft.planHash}`, flags: MessageFlags.Ephemeral });
         return;
       }
@@ -2156,6 +2155,7 @@ function casinoFinanceHome(services: Services) {
   const undisposed = services.remittance.cumulativeUndisposedProfit();
   const reserved = services.reservations.totalReserved();
   const house = services.casino.houseBalance();
+  const config = services.remittance.configuration();
   const embed = new EmbedBuilder()
     .setTitle("Casino finance: durable approval workflow")
     .setColor(0xc9a227)
@@ -2163,6 +2163,9 @@ function casinoFinanceHome(services: Services) {
       `Realised P&L: ${fmtLd(realized)}`,
       `Undisposed profit: ${fmtLd(undisposed)}`,
       `House: ${fmtEther(house)} / reserved obligations: ${fmtEther(reserved)}`,
+      config
+        ? `Configured rate: ${config.remittanceBps} bps / minimum working capital: ${fmtLd(config.minimumWorkingCapital)}`
+        : "⚠️ Opening configuration is not set; no remittance draft can be created yet.",
       "All actions below are durable draft → a different approver → exactly-once execute.",
       "A stale plan is rejected; no insufficient-house path creates an automatic bailout.",
     ].join("\n"));
@@ -2199,8 +2202,6 @@ function casinoRemittanceDraftModal() {
     .setTitle("Create remittance draft")
     .addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("key").setLabel("Draft key").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(120)),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("bps").setLabel("Rate bps (0..10000)").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(5)),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("minimum").setLabel("Minimum working capital").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15)),
       new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("fuku").setLabel("Fuku reserve").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15)),
       new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("period").setLabel("Period YYYY-MM (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(7)),
     );

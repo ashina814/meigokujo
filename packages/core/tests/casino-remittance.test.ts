@@ -26,6 +26,23 @@ function fundHouse(c: ReturnType<typeof setup>, amount = 1_000): void {
   c.chips.fundFromAccount(TREASURY, amount, "house", "seed:house");
 }
 
+/** PR12 の開業設定を運営が確定した状態にする。 */
+function configureOpening(
+  c: ReturnType<typeof setup>,
+  input: { bps: number; minimumWorkingCapital: number },
+): void {
+  c.db.prepare(
+    `INSERT INTO casino_opening_configuration
+      (id, casino_opening_capital, casino_opening_house, casino_opening_jackpot, casino_opening_relief,
+       casino_min_working_capital, casino_remit_rate_bps, casino_opening_configured, configured_by, configured_at)
+     VALUES (1, 1000, 1000, 0, 0, ?, ?, 1, 'operator', 0)
+     ON CONFLICT(id) DO UPDATE SET
+       casino_min_working_capital=excluded.casino_min_working_capital,
+       casino_remit_rate_bps=excluded.casino_remit_rate_bps,
+       casino_opening_configured=1`,
+  ).run(input.minimumWorkingCapital, input.bps);
+}
+
 describe("PR14 casino accounting and remittance", () => {
   it("derives classified realised P&L from settled groups exactly once and excludes refunds and JP claims", () => {
     const c = setup();
@@ -51,6 +68,22 @@ describe("PR14 casino accounting and remittance", () => {
       ["wager", 100], ["payout", -30], ["chain_bonus", -10], ["jackpot_contribution", -5],
     ]);
     expect(c.remit.cumulativeProfit()).toBe(55);
+    c.db.close();
+  });
+
+  it("books the house-funded fuku payout as its own expense instead of a plain payout", () => {
+    const c = setup();
+    fundHouse(c);
+    c.chips.fundFromAccount(TREASURY, 100, "u1", "seed:u1");
+    c.chips.runGroup({ groupKey: "daily:1", kind: "daily", actorId: "u1" }, () => {
+      c.chips.transfer("house", "u1", 40, { reason: "福分け（胴元）" });
+      c.chips.transfer("house", "u1", 30, { reason: "配当", game: "slots" });
+    });
+
+    expect(c.remit.pnl().map((row) => [row.category, row.amount])).toEqual([
+      ["fuku_distribution", -40], ["payout", -30],
+    ]);
+    expect(c.remit.cumulativeProfit()).toBe(-70);
     c.db.close();
   });
 
@@ -116,6 +149,28 @@ describe("PR14 casino accounting and remittance", () => {
     expect(executed.chipGroupKey).toBe("casino:remittance:m1");
     expect(c.remit.cumulativeUndisposedProfit()).toBe(400);
     expect(() => c.remit.execute("m1", "operator")).toThrow("not approved");
+    c.db.close();
+  });
+
+  it("takes the remittance rate and minimum working capital from the operator-approved opening configuration", () => {
+    const c = setup();
+    fundHouse(c);
+    c.remit.recordRealized("wager", 800, "manual:profit");
+
+    // 設定前は納付できない（仕様16.3: 運営が設定するまで納付しない）
+    expect(c.remit.configuration()).toBeNull();
+    expect(() => c.remit.draftFromConfiguration("m0", "maker")).toThrow("opening configuration");
+
+    configureOpening(c, { bps: 5_000, minimumWorkingCapital: 200 });
+    expect(c.remit.configuration()).toEqual({ remittanceBps: 5_000, minimumWorkingCapital: 200 });
+
+    const draft = c.remit.draftFromConfiguration("m1", "maker");
+    expect(draft.snapshot).toMatchObject({ bps: 5_000, minimumWorkingCapital: 200, base: 800, amount: 400 });
+
+    // 納付率0の設定でも、金額0のdraftを監査用に残せる
+    configureOpening(c, { bps: 0, minimumWorkingCapital: 200 });
+    const zero = c.remit.draftFromConfiguration("m2", "maker");
+    expect(zero.amount).toBe(0);
     c.db.close();
   });
 

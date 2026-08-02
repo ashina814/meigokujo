@@ -71,6 +71,12 @@ export interface RemittanceDraftOptions {
   fukuReserve?: number;
 }
 
+/** 運営が確定した納付率・最低運転資金（PR12 の開業設定）。 */
+export interface RemittanceConfiguration {
+  remittanceBps: number;
+  minimumWorkingCapital: number;
+}
+
 interface ChipTxForPnl {
   id: number;
   group_key: string;
@@ -106,6 +112,9 @@ function categoryFor(row: ChipTxForPnl): { category: HousePnlCategory; amount: n
     return { category: "fuku_distribution", amount: -row.amount };
   }
   if (from === HOUSE_HOLDER && to && isPlayerHolder(to)) {
+    // 福分けは胴元から利用者へ直接出る（daily.ts）。仕様16.1では配当と別建ての支出なので、
+    // 通算だけ合わせて payout に混ぜず、専用の分類へ落とす。
+    if (/福分け|fuku/i.test(row.reason)) return { category: "fuku_distribution", amount: -row.amount };
     return { category: /連鎖|chain/i.test(row.reason) ? "chain_bonus" : "payout", amount: -row.amount };
   }
   if (to === HOUSE_HOLDER && from && isPlayerHolder(from)) {
@@ -266,6 +275,32 @@ export class CasinoRemittance {
     const period = options.period ?? monthOf();
     const snapshot = this.remittanceSnapshot(bps, minimumWorkingCapital, options.fukuReserve ?? 0, period);
     return this.insert(key, "remittance", period, snapshot.amount, snapshot, actor, null, null);
+  }
+
+  /** 運営が確定した開業設定。未設定なら null（＝まだ納付できる状態ではない）。 */
+  configuration(): RemittanceConfiguration | null {
+    const exists = this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='casino_opening_configuration'")
+      .get();
+    if (!exists) return null;
+    const row = this.db.prepare("SELECT * FROM casino_opening_configuration WHERE id=1").get() as
+      | Record<string, unknown>
+      | undefined;
+    if (!row || Number(row.casino_opening_configured) !== 1) return null;
+    return {
+      remittanceBps: Number(row.casino_remit_rate_bps),
+      minimumWorkingCapital: Number(row.casino_min_working_capital),
+    };
+  }
+
+  /**
+   * 納付draftの唯一の運用入口。納付率と最低運転資金は運営が確定した設定だけを使い、
+   * 操作者が都度入力した値では納付できない（仕様16.3「運営が設定するまで納付しない」）。
+   */
+  draftFromConfiguration(key: string, actor: string, options: RemittanceDraftOptions = {}): RemittanceRow {
+    const config = this.configuration();
+    if (!config) throw new Error("casino opening configuration required");
+    return this.draft(key, config.remittanceBps, config.minimumWorkingCapital, actor, options);
   }
 
   bailoutDraft(
