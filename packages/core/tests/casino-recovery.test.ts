@@ -297,6 +297,7 @@ describe("債務予約の解放（S9）と再開（S12）", () => {
       "S7:孤児返金",
       "S8:隔離",
       "S9:予約解放",
+      "S10:自由チップ返還",
       "S12:再開",
     ]);
     expect(ctx.status.current().status).toBe("open");

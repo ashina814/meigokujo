@@ -411,6 +411,14 @@ CREATE TABLE IF NOT EXISTS ether_balances (
   updated_at INTEGER NOT NULL
 );
 
+-- PR10: 自由チップの自動返還はプロセス内タイマーだけに依存させない。
+CREATE TABLE IF NOT EXISTS casino_chip_activity (
+  user_id        TEXT PRIMARY KEY,
+  last_active_at INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_casino_chip_activity_idle ON casino_chip_activity(last_active_at);
+
 -- 賭場チップの取引監査（大型UPD PR1）。チップ残高は現在値しか持たないので、
 -- 「業務操作の単位(group)」と「その中の1移動(tx)」を追記し、開始残高から再現できるようにする。
 CREATE TABLE IF NOT EXISTS casino_tx_groups (

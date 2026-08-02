@@ -116,6 +116,13 @@ export async function validateBet(
     });
     return { ok: false, bet };
   }
+  // PR10: 両替パネルへ追い返さず、ゲーム開始の同一業務操作で不足分**だけ**を
+  // 1:1預入する。余剰購入はしない。Land不足などで預入が失敗すれば group 全体が戻る。
+  try {
+    services.chipFlow.ensureFreeChips(uid, bet, interaction.id);
+  } catch {
+    // 下の残高判定で、既存と同じ利用者向け不足通知へ落とす。
+  }
   const held = services.ether.balanceOf(uid);
   if (held < bet) {
     await respond({

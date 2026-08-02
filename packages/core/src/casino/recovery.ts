@@ -5,6 +5,7 @@ import type { CasinoStatus } from "./status.js";
 import type { ChipTx } from "./chip-tx.js";
 import type { Escrow } from "./escrow.js";
 import type { HouseReservations } from "./reservations.js";
+import type { CasinoChipFlow, InactiveRedeemResult } from "./chip-flow.js";
 
 /**
  * 登録型の復旧レジストリ（大型UPD PR7・正本 §8.1）。
@@ -68,6 +69,8 @@ export interface RecoverCasinoDeps {
   reservations: HouseReservations;
   registry: RecoveryRegistry;
   events: EventLog;
+  /** PR10: S8の後、確認済みの利用者自由チップだけをLandへ返還する。 */
+  chipFlow?: CasinoChipFlow;
 }
 
 export interface RecoverCasinoResult {
@@ -99,6 +102,8 @@ export interface RecoverCasinoResult {
   failedSessions: Array<{ sessionId: string; expected: number; actual: number; error: string }>;
   /** ソロ予約の解放結果。`released: false` なら**解放を実行していない** */
   releasedReservations: { released: boolean; count: number; total: number };
+  /** S10の返還結果。system holder・エスクローは件数に含めない。 */
+  redeemedFreeChips: InactiveRedeemResult;
   reason?: string;
 }
 
@@ -125,7 +130,7 @@ export interface RecoverCasinoResult {
  * 「所有元が確実に存在しない」と証明できた場合だけ。
  */
 export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
-  const { status, integrity, chipTx, escrow, reservations, registry, events } = deps;
+  const { status, integrity, chipTx, escrow, reservations, registry, events, chipFlow } = deps;
   const steps: string[] = [];
   const empty: Omit<RecoverCasinoResult, "outcome" | "steps" | "reason"> = {
     keptHolders: 0,
@@ -136,6 +141,7 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     failedSessions: [],
     // 予約解放は S9。ここへ到達していない時点では **実行していない**
     releasedReservations: { released: false, count: 0, total: 0 },
+    redeemedFreeChips: { redeemed: [], skipped: [], failed: [] },
   };
 
   const held = status.current();
@@ -201,6 +207,11 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     const releasedReservations = reservations.releaseAll("起動時の復旧");
     steps.push("S9:予約解放");
 
+    // S10: 利用者の自由チップだけを返還する。escrow / market / system holder は
+    // CasinoChipFlow の account kind 結合で対象外なので、未精算フリースピンJP請求も不変。
+    const redeemedFreeChips = chipFlow?.redeemAllFreeChips("startup") ?? { redeemed: [], skipped: [], failed: [] };
+    steps.push("S10:自由チップ返還");
+
     return {
       keptHolders: swept.kept,
       refundedSessions: swept.refundedSessions,
@@ -209,6 +220,7 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
       mismatched: swept.mismatched,
       failedSessions: swept.failed,
       releasedReservations: { released: true, ...releasedReservations },
+      redeemedFreeChips,
       skipped: false as const,
       reason: undefined as string | undefined,
     };
@@ -222,6 +234,7 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     mismatched: result.mismatched,
     failedSessions: result.failedSessions,
     releasedReservations: result.releasedReservations,
+    redeemedFreeChips: result.redeemedFreeChips,
   };
 
   // **所有元の申告が取れなかったら営業を再開しない**（PR7 レビュー指摘）。
