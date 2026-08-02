@@ -378,3 +378,4 @@ export {
   type RecoverCasinoDeps,
   type RecoverCasinoResult,
 } from "./casino/recovery.js";
+export { CasinoOpeningReset, type CasinoOpeningConfig, type OpeningResetPlan } from "./casino/opening-reset.js";
