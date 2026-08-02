@@ -41,11 +41,11 @@ export async function playSashi(
     return;
   }
   if (!Number.isInteger(bet) || bet < MIN_BET || bet > MAX_BET) {
-    await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} Ld で。`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (services.ether.balanceOf(challenger.id) < bet || services.ether.balanceOf(opponent.id) < bet) {
-    await interaction.reply({ content: "どちらかのエテル残高が足りない。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "どちらかのLand残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }
   const session = `sashi:${interaction.id}`;

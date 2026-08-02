@@ -63,6 +63,10 @@ export function exchangePanelMessage(services: Services) {
 }
 
 export async function handleEtherButton(interaction: ButtonInteraction, services: Services): Promise<void> {
+  void services;
+  await interaction.reply({ content: "この旧両替ボタンは無効です。ゲーム開始時の自動預入をご利用ください。", flags: MessageFlags.Ephemeral });
+  return;
+  /* legacy exchange implementation intentionally disabled
   const action = interaction.customId.split(":")[1];
 
   if (action === "refresh") {
@@ -135,7 +139,13 @@ export async function handleEtherButton(interaction: ButtonInteraction, services
   }
 }
 
+*/ }
+
 export async function handleEtherModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
+  void services;
+  await interaction.reply({ content: "この旧両替フォームは無効です。ゲーム開始時の自動預入をご利用ください。", flags: MessageFlags.Ephemeral });
+  return;
+  /* legacy exchange implementation intentionally disabled
   const mode = interaction.customId.split(":")[2] as "buy" | "sell";
   const amt = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
   if (!Number.isInteger(amt) || amt <= 0) {
@@ -191,4 +201,4 @@ export async function handleEtherModal(interaction: ModalSubmitInteraction, serv
     }
     await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
   }
-}
+*/ }

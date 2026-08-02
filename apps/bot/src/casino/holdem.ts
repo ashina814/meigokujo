@@ -239,7 +239,7 @@ async function runRoundInner(
     return new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · ホールデム" })
       .setColor(C_MAMMON)
-      .setTitle(`🃏  ${phaseLabel}  ·  Pot ${fmtEther(pot).replace(" ◈", "◈")}`)
+      .setTitle(`🃏  ${phaseLabel}  ·  Pot ${fmtEther(pot).replace(" Ld", "Ld")}`)
       .setDescription(
         [
           `**ボード**   ${board}`,
@@ -250,7 +250,7 @@ async function runRoundInner(
           .filter(Boolean)
           .join("\n"),
       )
-      .setFooter({ text: `賭け ${fmtEther(playerBet).replace(" ◈", "◈")} / マモン ${fmtEther(dealerBet).replace(" ◈", "◈")}` });
+      .setFooter({ text: `賭け ${fmtEther(playerBet).replace(" Ld", "Ld")} / マモン ${fmtEther(dealerBet).replace(" Ld", "Ld")}` });
   };
 
   const actionRow = (phase: string) =>

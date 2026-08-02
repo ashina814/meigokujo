@@ -76,7 +76,7 @@ export const E = {
 // フォーマッタ
 // ─────────────────────────────────────────────────────────
 
-/** 符号付きエテル表示（+123◈ / -456◈ / ±0◈） */
+/** 符号付きLand表示（+123Ld / -456Ld / ±0Ld） */
 export function fmtSignedEther(n: number): string {
   if (n === 0) return "±0 Ld";
   const sign = n > 0 ? "+" : "−";
@@ -208,7 +208,7 @@ export function buildResultEmbed(opts: {
     .setFooter({
       text:
         opts.footer ??
-        `${E.ether} 所持 ${fmtEther(opts.balance).replace(" ◈", "◈")}${opts.bet ? ` · 賭け ${fmtEther(opts.bet).replace(" ◈", "◈")}` : ""}`,
+        `${E.ether} 所持 ${fmtEther(opts.balance).replace(" Ld", "Ld")}${opts.bet ? ` · 賭け ${fmtEther(opts.bet).replace(" Ld", "Ld")}` : ""}`,
     });
 
   for (const s of opts.sections) {

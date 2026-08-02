@@ -169,7 +169,7 @@ async function runRoundInner(
           "*押した瞬間の倍率が適用される。通信の裏で崩壊してたら「遅かった」*",
         ].join("\n"),
       )
-      .setFooter({ text: `賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
+      .setFooter({ text: `賭け ${fmtEther(bet).replace(" Ld", "Ld")}` });
   };
 
   const cashOutRow = (multi: number) => {
@@ -272,7 +272,7 @@ async function runRoundInner(
     // お守りの消費も賭け・配当と同じグループの中（settleSolo）
     const settled = services.casino.settleSolo(uid, "クラッシュ", bet, rawPayout, { chain: false, operationId: interaction.id, reservationKey });
     const amulet = { note: settled.amuletNote };
-    const netStr = `+${settled.net.toLocaleString("ja-JP")} ◈`;
+    const netStr = `+${settled.net.toLocaleString("ja-JP")} Ld`;
     const bigWin = settled.net >= bet * 5;
     const bonusBits: string[] = [];
     if (settled.chainBonus > 0) bonusBits.push(`${settled.chainLabel} 連鎖 ×${settled.chainMult.toFixed(2)}（${settled.chainStreak}連勝）  +${fmtEther(settled.chainBonus)}`);
@@ -292,7 +292,7 @@ async function runRoundInner(
       )
       .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
       .setFooter({
-        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
+        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" Ld", "Ld")}`, `賭け ${fmtEther(bet).replace(" Ld", "Ld")}`].join(" · "),
       });
     await reply.edit({ embeds: [embed], components: [buildRetryRow()] }).catch(() => undefined);
     broadcastBigWin(interaction.client, services, { userId: uid, game: "クラッシュ", bet, payout: settled.payout });
@@ -303,7 +303,7 @@ async function runRoundInner(
     });
     const lossAmulet = { payout: lossSettled.payout, note: lossSettled.amuletNote };
     const savedByAmulet = lossAmulet.payout > 0;
-    const netStr = savedByAmulet ? `±0 ◈` : `−${bet.toLocaleString("ja-JP")} ◈`;
+    const netStr = savedByAmulet ? `±0 Ld` : `−${bet.toLocaleString("ja-JP")} Ld`;
 
     const embed = new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · クラッシュ" })
@@ -320,7 +320,7 @@ async function runRoundInner(
           .join("\n"),
       )
       .setFooter({
-        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
+        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" Ld", "Ld")}`, `賭け ${fmtEther(bet).replace(" Ld", "Ld")}`].join(" · "),
       });
     await reply.edit({ embeds: [embed], components: [buildRetryRow()] }).catch(() => undefined);
   }

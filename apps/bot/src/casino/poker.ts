@@ -209,7 +209,7 @@ async function runRoundInner(
           .filter(Boolean)
           .join("\n"),
       )
-      .setFooter({ text: `賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
+      .setFooter({ text: `賭け ${fmtEther(bet).replace(" Ld", "Ld")}` });
   };
 
   const cardButtons = () =>

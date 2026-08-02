@@ -210,7 +210,7 @@ async function runRoundInner(
       ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
       : "";
     const tag = won ? "🟢 勝ち" : push ? "⚪ プッシュ" : "🔴 負け";
-    const netStr = settled.net === 0 ? "±0 ◈" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} ◈`;
+    const netStr = settled.net === 0 ? "±0 Ld" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} Ld`;
     const bonusBits: string[] = [];
     if (chainLine) bonusBits.push(chainLine);
     if (fukuLine) bonusBits.push(fukuLine);
@@ -232,7 +232,7 @@ async function runRoundInner(
       )
       .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
       .setFooter({
-        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(totalBet).replace(" ◈", "◈")}`].join(" · "),
+        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" Ld", "Ld")}`, `賭け ${fmtEther(totalBet).replace(" Ld", "Ld")}`].join(" · "),
       });
 
     if (won) broadcastBigWin(interaction.client, services, { userId: uid, game: "ブラックジャック", bet: totalBet, payout: settled.payout });

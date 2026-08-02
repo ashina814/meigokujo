@@ -239,7 +239,7 @@ async function shakeAnimation(reply: Message, header: string[], bet: number, rol
           "```",
         ].join("\n"),
       )
-      .setFooter({ text: `第${rollNo}投 · 残り${remaining} · 賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
+      .setFooter({ text: `第${rollNo}投 · 残り${remaining} · 賭け ${fmtEther(bet).replace(" Ld", "Ld")}` });
     // 結果確定前の表示失敗はゲームを続行しない。呼出元が事前預託を全額返す。
     await reply.edit({ embeds: [e], components: [] });
     await sleep(220);

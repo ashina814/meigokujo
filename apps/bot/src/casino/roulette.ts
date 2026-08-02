@@ -161,7 +161,7 @@ export async function playRoulette(
             `*「${Mammon.greeting()}」*`,
           ].join("\n"),
         )
-        .setFooter({ text: `参加 ${bets.size}人 · 総額 ${fmtEther(totalPot).replace(" ◈", "◈")}` });
+        .setFooter({ text: `参加 ${bets.size}人 · 総額 ${fmtEther(totalPot).replace(" Ld", "Ld")}` });
 
       if (bets.size > 0) {
         // 賭け目ごとにまとめて表示
@@ -174,8 +174,8 @@ export async function playRoulette(
         for (const t of sortedTypes) {
           const arr = byType.get(t)!;
           const total = arr.reduce((s, x) => s + x.amt, 0);
-          const users = arr.map((x) => `<@${x.user}> ${fmtEther(x.amt).replace(" ◈", "◈")}`).join("・");
-          embed.addFields({ name: `${LABELS[t as keyof typeof LABELS]}  ·  ${fmtEther(total).replace(" ◈", "◈")}`, value: users, inline: false });
+          const users = arr.map((x) => `<@${x.user}> ${fmtEther(x.amt).replace(" Ld", "Ld")}`).join("・");
+          embed.addFields({ name: `${LABELS[t as keyof typeof LABELS]}  ·  ${fmtEther(total).replace(" Ld", "Ld")}`, value: users, inline: false });
         }
       }
       return embed;
@@ -214,7 +214,7 @@ export async function playRoulette(
           .setTitle(`${LABELS[type]} に張る`)
           .addComponents(
             new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder().setCustomId("amount").setLabel(`賭けるエテル（${MIN_BET}〜${MAX_BET.toLocaleString()}）`).setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(9),
+              new TextInputBuilder().setCustomId("amount").setLabel(`賭けるLand（${MIN_BET}〜${MAX_BET.toLocaleString()}）`).setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(9),
             ),
           );
         await btn.showModal(modal);
@@ -222,7 +222,7 @@ export async function playRoulette(
         if (!sub) return;
         const amt = Number(sub.fields.getTextInputValue("amount").replaceAll(",", "").trim());
         if (!Number.isInteger(amt) || amt < MIN_BET || amt > MAX_BET) {
-          await sub.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
+          await sub.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} Ld で。`, flags: MessageFlags.Ephemeral });
           return;
         }
         // テーブルリミット: この卓の最大支払い合計が胴元残高を超えない範囲で受ける
@@ -327,7 +327,7 @@ export async function playRoulette(
       .setColor(anyWin ? C_WIN : C_LOSE)
       .setTitle(`🎡  出目  ${colorOf(n)} **${n}**`)
       .setDescription([...lines, "", `*「${anyWin ? Mammon.win() : Mammon.lose()}」*`].join("\n"))
-      .setFooter({ text: `参加 ${bets.size}人 · 総額 ${fmtEther(totalPot).replace(" ◈", "◈")}` });
+      .setFooter({ text: `参加 ${bets.size}人 · 総額 ${fmtEther(totalPot).replace(" Ld", "Ld")}` });
     await interaction.editReply({ embeds: [embed], components: [] });
   } finally {
     activeSessions.delete(channelId);
