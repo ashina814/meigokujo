@@ -36,7 +36,8 @@ export const C_NIGHT = 0x1e1b4b;
 // ─────────────────────────────────────────────────────────
 export const E = {
   // 通貨
-  ether: "◈",
+  // PR13: 利用者向け通貨はLandだけ。内部チップを示す記号は画面へ出さない。
+  ether: "Ld",
   land: "Ld",
   // 状態
   win: "🟢",
@@ -77,9 +78,9 @@ export const E = {
 
 /** 符号付きエテル表示（+123◈ / -456◈ / ±0◈） */
 export function fmtSignedEther(n: number): string {
-  if (n === 0) return "±0 ◈";
+  if (n === 0) return "±0 Ld";
   const sign = n > 0 ? "+" : "−";
-  return `${sign}${Math.abs(n).toLocaleString("ja-JP")} ◈`;
+  return `${sign}${Math.abs(n).toLocaleString("ja-JP")} Ld`;
 }
 
 /** 差分（デルタ）を色付き ansi 風テキストで大きく見せる */
@@ -95,9 +96,9 @@ export function fmtMult(m: number): string {
   return m >= 2 ? `**${s}**` : s;
 }
 
-/** 残高（所持）表示。エテルと Land を1行で */
+/** 残高（所持）表示。自由チップはLand価値として合算表示する。 */
 export function fmtWallet(ether: number, land: number): string {
-  return `${E.ether} ${fmtEther(ether)} ／ ${fmtLd(land)}`;
+  return `所持 ${fmtLd(ether + land)}`;
 }
 
 /** 進捗バー（ASCII）。value/max を width 文字幅で描画。使用例: 連続日数・XP */

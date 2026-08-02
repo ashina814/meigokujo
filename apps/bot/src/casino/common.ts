@@ -20,8 +20,9 @@ import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
 import { C_BIGWIN, C_LOSE, C_MAMMON, C_PUSH, C_WIN, E, fmtBigDelta } from "./ui.js";
 
-export const MIN_BET = 50;
-export const MAX_BET = 1_000_000;
+/** PR13: 旧チップ時代の賭け額を1/10へ。利用者画面の単位はLandのみ。 */
+export const MIN_BET = 5;
+export const MAX_BET = 100_000;
 
 /** 設定上の賭け上限（VIP なら倍率を掛ける）。胴元の余力は見ない */
 export function configuredMaxBet(services: Services, userId: string): number {
