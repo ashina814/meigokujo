@@ -38,35 +38,18 @@ export interface ChipLedgerOptions extends BaseChipLedgerOptions {
 export class ChipLedger extends BaseChipLedger {
   private readonly requireOpeningV1: boolean;
 
-  constructor(
-    db: Database.Database,
-    ledger: Ledger,
-    events: EventLog,
-    options: ChipLedgerOptions = {},
-  ) {
+  constructor(db: Database.Database, ledger: Ledger, events: EventLog, options: ChipLedgerOptions = {}) {
     super(db, ledger, events, options);
     this.requireOpeningV1 = options.requireOpeningV1 ?? options.chipTx !== undefined;
   }
 
   private assertOpeningReady(input: { groupKey: string; kind: string; actorId: string }): void {
-    if (!this.requireOpeningV1) return;
-    if (this.chipTx.isMaintenance()) return;
+    if (!this.requireOpeningV1 || this.chipTx.isMaintenance()) return;
     const version = this.chipTx.currentVersion();
     if (version === FORMAL_OPENING_VERSION) return;
-    // EtherErrorの互換型へ新しいコードを載せる。runtimeではcodeがそのまま保持される。
-    throw new EtherError(OPENING_REQUIRED as never, {
-      version,
-      requiredVersion: FORMAL_OPENING_VERSION,
-      groupKey: input.groupKey,
-      kind: input.kind,
-      actorId: input.actorId,
-    });
+    throw new EtherError(OPENING_REQUIRED as never, { version, requiredVersion: FORMAL_OPENING_VERSION, ...input });
   }
 
-  /**
-   * 新しい資金操作だけを止める。処理済みgroupの冪等再実行はBase側がbodyを呼ばずに
-   * 保存結果を返すため、停止中でも二重処理せず元の結果を再取得できる。
-   */
   override runGroup<T>(input: { groupKey: string; kind: string; actorId: string }, body: () => T): T {
     return super.runGroup(input, () => {
       this.assertOpeningReady(input);
@@ -75,49 +58,14 @@ export class ChipLedger extends BaseChipLedger {
   }
 }
 
-/** @deprecated `ChipLedger` を使うこと。変動レートの振る舞いは復活させない。 */
-export interface EtherExchangeOptions extends ChipLedgerOptions {
-  /** @deprecated 無視される。交換比率は常に1:1。 */
-  baseRate?: number | (() => number);
-}
-
-/**
- * @deprecated 旧プラグイン向けの互換名。公開入口を通るため、productionの正式開業ロックを
- * 回避できない。新規コードでは使用しない。
- */
+export interface EtherExchangeOptions extends ChipLedgerOptions { baseRate?: number | (() => number) }
+/** @deprecated `ChipLedger` を使うこと。 */
 export class EtherExchange extends ChipLedger {
-  constructor(db: Database.Database, ledger: Ledger, events: EventLog, options: EtherExchangeOptions = {}) {
-    super(db, ledger, events, options);
-  }
-
-  buy(userId: string, landIn: number, idempotencyKey: string): ChipQuote {
-    return this.deposit(userId, landIn, idempotencyKey);
-  }
-
-  sell(userId: string, chipsIn: number, idempotencyKey: string): ChipQuote {
-    return this.redeem(userId, chipsIn, idempotencyKey);
-  }
-
-  quoteBuy(landIn: number): ChipQuote {
-    return this.quoteDeposit(landIn);
-  }
-
-  quoteSell(chipsIn: number): ChipQuote {
-    return this.quoteRedeem(chipsIn);
-  }
-
-  rate(): number {
-    return 1;
-  }
+  buy(userId: string, landIn: number, idempotencyKey: string): ChipQuote { return this.deposit(userId, landIn, idempotencyKey); }
+  sell(userId: string, chipsIn: number, idempotencyKey: string): ChipQuote { return this.redeem(userId, chipsIn, idempotencyKey); }
+  quoteBuy(landIn: number): ChipQuote { return this.quoteDeposit(landIn); }
+  quoteSell(chipsIn: number): ChipQuote { return this.quoteRedeem(chipsIn); }
+  rate(): number { return 1; }
 }
 
-export {
-  EtherError as ChipLedgerError,
-  CHIP_ESCROW,
-  ETHER_ESCROW,
-  ETHER_APPROVER,
-  HOUSE_HOLDER,
-  isPlayerHolder,
-  type ChipQuote,
-  type ChipMoveInfo,
-};
+export { EtherError as ChipLedgerError, CHIP_ESCROW, ETHER_ESCROW, ETHER_APPROVER, HOUSE_HOLDER, isPlayerHolder, type ChipQuote, type ChipMoveInfo };
