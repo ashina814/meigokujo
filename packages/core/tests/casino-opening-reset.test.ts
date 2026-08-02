@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { CasinoOpeningReset, FREE_SPIN_JACKPOT_CLAIMS_HOLDER, Ledger, ChipLedger, EventLog, ETHER_ESCROW, CHIP_ESCROW, openDb, registerDefaultTxTypes, type OpeningBackupAdapter, type OpeningDiscordAdapter } from "../src/index.js";
+import { CASINO_DEPARTMENT, CasinoOpeningReset, FREE_SPIN_JACKPOT_CLAIMS_HOLDER, Ledger, ChipLedger, EventLog, ETHER_ESCROW, CHIP_ESCROW, openDb, registerDefaultTxTypes, type OpeningBackupAdapter, type OpeningDiscordAdapter } from "../src/index.js";
 
 registerDefaultTxTypes();
 const config = { configured: true as const, casinoOpeningCapital: 1000, houseCapital: 800, jackpotCapital: 100, reliefCapital: 100, minimumWorkingCapital: 100, remittanceBps: 0 };
@@ -57,6 +57,29 @@ describe("PR12 開業初期化 preflight", () => {
     expect(chips.balanceOf("jackpot")).toBe(100);
     expect(reset.configuration()).toEqual(config);
     await expect(reset.apply({ configuration: config, planHash: plan.planHash, actorId: "admin:b", backup, discord })).rejects.toThrow("already applied");
+    db.close();
+  });
+
+  it("旧制度清算・新制度出資が正本の賭博場部署だけを通り、sys:dept:casino を作らない", async () => {
+    const { db, ledger, reset } = fundedReset();
+    const plan = reset.dryRun(config);
+    const { backup, discord } = cleanAdapters();
+    const applied = await reset.apply({ configuration: config, planHash: plan.planHash, actorId: "admin:a", backup, discord });
+
+    expect(CASINO_DEPARTMENT).toBe("sys:dept:賭博場");
+    const txById = (id: number) =>
+      db.prepare("SELECT from_account, to_account, amount FROM transactions WHERE id=?").get(id) as
+        { from_account: string; to_account: string; amount: number };
+    // R7 旧制度清算 と R8 新制度出資 は、賭博場部署を挟んだ独立2本
+    expect(txById(applied.oldSettlementLandTxId)).toEqual({ from_account: ETHER_ESCROW, to_account: CASINO_DEPARTMENT, amount: 1_000 });
+    expect(txById(applied.newInvestmentLandTxId)).toEqual({ from_account: CASINO_DEPARTMENT, to_account: CHIP_ESCROW, amount: 1_000 });
+
+    // 旧キーの口座も取引も生まれない
+    expect(db.prepare("SELECT 1 FROM accounts WHERE id='sys:dept:casino'").get()).toBeUndefined();
+    expect(db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE from_account='sys:dept:casino' OR to_account='sys:dept:casino'").get()).toEqual({ n: 0 });
+    expect(ledger.balanceOf("sys:dept:casino")).toBe(0);
+    // 通過口座なので、出資後の賭博場部署は残さない
+    expect(ledger.balanceOf(CASINO_DEPARTMENT)).toBe(0);
     db.close();
   });
 

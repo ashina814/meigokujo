@@ -24,6 +24,7 @@ import {
   UserSelectMenuInteraction,
 } from "discord.js";
 import {
+  CASINO_DEPARTMENT_KEY,
   CasinoIntegrity,
   deptAccount,
   ChipLedgerError as EtherError,
@@ -1991,7 +1992,8 @@ async function deptRemove(
 
 // ---- 賭場（マモン）サブパネル ----
 
-const CASINO_DEPT_KEY = "賭博場";
+/** 賭博場の部署キーは core の唯一の定数を使う（開業出資・納付・補填と同じ口座へ揃える） */
+const CASINO_DEPT_KEY = CASINO_DEPARTMENT_KEY;
 
 /**
  * 状態ごとの「開ける」ボタンの文言。ここに無い状態は開けるボタンを出さない。

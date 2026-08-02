@@ -13,6 +13,16 @@ import { ChipTx } from "./chip-tx.js";
 export const ETHER_ESCROW = "sys:escrow:ether";
 /** 正式開業後の、発行済みチップを100%裏付ける Land 準備口座。 */
 export const CHIP_ESCROW = "sys:escrow:casino";
+/**
+ * 賭博場の部署キー（正本4.1 `sys:dept:賭博場`）。
+ *
+ * 開業出資・月次納付・国庫補填・支配人の元手投入／売上精算は、すべてこの
+ * 一つの部署口座を通る。ここを分けると賭場の資金が複数口座へ散り、部署板から
+ * 見えない残高ができるので、キーの literal をここ以外へ書かない。
+ */
+export const CASINO_DEPARTMENT_KEY = "賭博場";
+/** `CASINO_DEPARTMENT_KEY` の Land 台帳口座ID。 */
+export const CASINO_DEPARTMENT = `sys:dept:${CASINO_DEPARTMENT_KEY}`;
 /** 準備口座を動かす取引の承認者・実行者。検算Bの経路監査もこの値で照合する */
 export const ETHER_APPROVER = "system:ether";
 /** 胴元（マモンの賭場）のエテル保有者ID */

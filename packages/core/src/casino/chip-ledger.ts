@@ -11,6 +11,8 @@ export {
   CHIP_ESCROW,
   ETHER_ESCROW,
   ETHER_APPROVER,
+  CASINO_DEPARTMENT_KEY,
+  CASINO_DEPARTMENT,
   HOUSE_HOLDER,
   isPlayerHolder,
   type ChipLedgerOptions,

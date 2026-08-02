@@ -3,12 +3,11 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
 import { Ledger } from "../ledger/service.js";
-import { CHIP_ESCROW, ETHER_ESCROW, HOUSE_HOLDER, isPlayerHolder } from "./exchange.js";
+import { CASINO_DEPARTMENT, CHIP_ESCROW, ETHER_ESCROW, HOUSE_HOLDER, isPlayerHolder } from "./exchange.js";
 import { ChipTx } from "./chip-tx.js";
 import { FREE_SPIN_JACKPOT_CLAIMS_HOLDER } from "./free-spins.js";
 import { CasinoStatus, OPENING_RESET_SEAL } from "./status.js";
 
-const CASINO_DEPARTMENT = "sys:dept:casino";
 const OPENING_VERSION = "opening_v1";
 const now = () => Math.floor(Date.now() / 1000);
 
