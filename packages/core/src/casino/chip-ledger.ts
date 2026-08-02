@@ -7,6 +7,8 @@ import {
   CHIP_ESCROW,
   ETHER_ESCROW,
   ETHER_APPROVER,
+  CASINO_DEPARTMENT_KEY,
+  CASINO_DEPARTMENT,
   HOUSE_HOLDER,
   isPlayerHolder,
   type ChipLedgerOptions as BaseChipLedgerOptions,
@@ -16,19 +18,9 @@ import {
 
 const FORMAL_OPENING_VERSION = "opening_v1";
 const OPENING_REQUIRED = "ERR_CASINO_OPENING_NOT_COMPLETE";
-/**
- * クラスへprivate/protectedメンバーを増やすと、旧`exchange.ts`のEtherExchangeと
- * 構造互換でなくなる。段階移行中の既存コードを壊さずロック状態を持つため、外部WeakMapを使う。
- */
+/** 旧EtherExchangeとの構造互換を壊さず、インスタンスごとの開業ロックを保持する。 */
 const OPENING_REQUIRED_BY_LEDGER = new WeakMap<BaseChipLedger, boolean>();
 
-/**
- * 新しい賭場チップ API の公開入口。
- *
- * production は `requireOpeningV1: true` を明示する。正式開業初期化が`opening_v1`を
- * 確定するまで、新しい資金グループをcore層で拒否する。復旧・正式開業初期化の
- * `runMaintenance()`区間だけは、このロック中でも実行できる。
- */
 export interface ChipLedgerOptions extends BaseChipLedgerOptions {
   requireOpeningV1?: boolean;
 }
@@ -94,6 +86,8 @@ export {
   CHIP_ESCROW,
   ETHER_ESCROW,
   ETHER_APPROVER,
+  CASINO_DEPARTMENT_KEY,
+  CASINO_DEPARTMENT,
   HOUSE_HOLDER,
   isPlayerHolder,
   type ChipQuote,
