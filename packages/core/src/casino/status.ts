@@ -190,6 +190,14 @@ export class CasinoStatus {
   haltForIntegrity(reason: string, changedBy = "system:integrity"): boolean {
     const cur = this.current();
     if (HUMAN_HELD.has(cur.status)) return false;
+    // `recovery_halt` は「S4〜S12 が未完了」という復旧義務そのものを表す。
+    // 復旧をやり直したときの S2/S3 で検算NGを見つけても、通常の integrity_halt に
+    // すり替えると、帳簿を直しただけで通常の再点検から開けられてしまう。
+    // 停止理由へ検算結果を追記しつつ、復旧を S12 まで通す義務は保持する。
+    if (cur.status === "recovery_halt") {
+      this.set("recovery_halt", `${cur.reason}\n検算NG: ${reason}`, changedBy);
+      return true;
+    }
     this.set("integrity_halt", reason, changedBy);
     return true;
   }

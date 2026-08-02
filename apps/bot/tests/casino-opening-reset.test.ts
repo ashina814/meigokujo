@@ -12,7 +12,7 @@ import { handleAdminButton, handleAdminModal } from "../src/commands/admin-hub.j
  * 運営卓の通常の再開導線から、全点検A〜Dが通っただけで解除できてはいけない。
  */
 
-type StatusValue = "open" | "manual_halt" | "integrity_halt" | "maintenance" | "opening_reset";
+type StatusValue = "open" | "manual_halt" | "integrity_halt" | "recovery_halt" | "maintenance" | "opening_reset";
 
 /** 全点検が全部通っている報告（＝通常の再開ボタンなら通ってしまう条件） */
 const cleanReport = {
@@ -110,4 +110,21 @@ describe("運営卓から開業準備中は解除できない", () => {
     expect(i.reply.mock.calls[0][0].content).toContain("❌");
     expect(i.reply.mock.calls[0][0].content).toContain("opening_reset");
   });
+});
+
+describe("古い復旧再実行ボタンは recovery_halt 以外で何もしない", () => {
+  it.each(["open", "manual_halt", "maintenance", "opening_reset", "integrity_halt"] as const)(
+    "%s のときは recoverCasino を起動せず拒否する",
+    async (status) => {
+      const { services } = fakeServices(status);
+      const i = buttonInteraction("mgmt:casino:rerecover");
+
+      await handleAdminButton(i, services);
+
+      // この fake Services には復旧に必要な db / escrow / reservations を入れていない。
+      // それでも例外にならず応答だけ返ることが、recoverCasino に入っていない証拠になる。
+      expect(i.reply).toHaveBeenCalledTimes(1);
+      expect(i.reply.mock.calls[0][0].content).toContain("復旧の再実行");
+    },
+  );
 });
