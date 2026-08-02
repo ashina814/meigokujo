@@ -463,6 +463,43 @@ describe("recovery_halt は通常の再開導線から開けられない", () =>
     ctx.db.close();
   });
 
+  it("復旧再実行の前検NGでも復旧義務を保持し、S12成功時だけ解除する", () => {
+    const ctx = setup();
+    fundUser(ctx, "alice", 20_000);
+    const broken = brokenSource(ctx);
+
+    // 1. source 取得失敗で recovery_halt になる
+    expect(run(ctx).outcome).toBe("source_failed");
+    expect(ctx.status.current().status).toBe("recovery_halt");
+
+    // 2. S2/S3 の前検も壊した状態で再実行する
+    ctx.db.prepare("UPDATE ether_balances SET amount = amount - 1 WHERE user_id = ?").run("alice");
+    const precheckFailed = run(ctx);
+    expect(precheckFailed.outcome).toBe("halted");
+    expect(precheckFailed.steps).toEqual(["S2:Land台帳", "S3:チップ検算AB"]);
+    expect(ctx.status.current().status).toBe("recovery_halt");
+    expect(ctx.status.current().reason).toContain("検算NG");
+
+    // DBを読み直しても、未完了の復旧義務は残る
+    expect(new CasinoStatus(ctx.db).current().status).toBe("recovery_halt");
+
+    // 3. 検算だけ直しても、通常の再点検経路では開かない
+    ctx.db.prepare("UPDATE ether_balances SET amount = amount + 1 WHERE user_id = ?").run("alice");
+    const report = ctx.integrity.runFull();
+    expect(report.ok).toBe(true);
+    expect(ctx.status.reopenAfterIntegrity("検算を直した", "admin", report.ok).ok).toBe(false);
+    expect(ctx.status.current().status).toBe("recovery_halt");
+
+    // 4. 復旧を再実行して S4〜S12 を完走したときだけ解除される
+    broken.value = false;
+    const completed = run(ctx);
+    expect(completed.outcome).toBe("opened");
+    expect(completed.steps).toContain("S4:生存収集");
+    expect(completed.steps).toContain("S12:再開");
+    expect(ctx.status.current().status).toBe("open");
+    ctx.db.close();
+  });
+
   it("source が直ったあとに復旧を再実行すると S4〜S12 が動いて open になる", () => {
     const ctx = setup();
     fundUser(ctx, "alice", 20_000);

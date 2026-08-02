@@ -205,6 +205,17 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
     // `recovery_halt` の唯一の出口。所有元の申告が読めるようになっていれば、
     // 収集 → 掃除 → 予約解放 → 全点検 → S12 まで進んで open に戻る。
     // 読めないままなら再び recovery_halt のままで、資金は1 Ld も動かない
+    // 古い管理パネル／保存済み custom ID でも、押された時点の状態で必ず拒否する。
+    // `recoverCasino()` は通常起動にも使うため、営業中などから呼ぶと復旧処理が
+    // 資金・予約・状態へ触れてしまう。ここは recovery_halt 専用の入口にする。
+    const cur = services.casinoStatus.current();
+    if (cur.status !== "recovery_halt") {
+      await interaction.reply({
+        content: `❌ いまは ${CASINO_STATUS_LABEL[cur.status] ?? cur.status} です。復旧の再実行は「起動時の復旧が未完了」のときだけ実行できます。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     const r = recoverCasino({
       db: services.db,
       status: services.casinoStatus,
