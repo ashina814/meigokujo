@@ -50,8 +50,12 @@ export async function validateBet(
 ): Promise<BetCheck> {
   const bet = Math.floor(betRaw);
   const cap = effectiveMaxBet(services, interaction.user.id);
+  // 保留中の無料スピンを先に通知した場合、ここは2通目になる。
+  // 未応答 interaction には reply、応答済み／defer 済みなら followUp を使う。
+  const respond = (payload: Parameters<typeof interaction.reply>[0]) =>
+    interaction.replied || interaction.deferred ? interaction.followUp(payload) : interaction.reply(payload);
   if (!Number.isInteger(bet) || bet < MIN_BET || bet > cap) {
-    await interaction.reply({
+    await respond({
       content: `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
       flags: MessageFlags.Ephemeral,
     });
@@ -59,7 +63,7 @@ export async function validateBet(
   }
   const held = services.ether.balanceOf(interaction.user.id);
   if (held < bet) {
-    await interaction.reply({
+    await respond({
       content: `${Mammon.broke()}（所持 ${fmtEther(held)}）\n→ 両替所パネルで Land をエテルに替えてこい。`,
       flags: MessageFlags.Ephemeral,
     });
@@ -69,7 +73,7 @@ export async function validateBet(
     // 胴元が最悪ケースの配当を払えない。今の胴元残高で受けられる上限を教える
     const multiplier = maxPayout / bet;
     const maxAcceptable = Math.floor(services.casino.houseBalance() / multiplier);
-    await interaction.reply({
+    await respond({
       content: [
         Mammon.tableClosed(),
         maxAcceptable >= MIN_BET
