@@ -277,7 +277,7 @@ describe("債務予約の解放（S9）と再開（S12）", () => {
     ctx.registry.register({ type: "market", listLiveEscrowHolders: () => [] });
 
     const r = run(ctx);
-    expect(r.releasedReservations).toEqual({ count: 2, total: 15_000 });
+    expect(r.releasedReservations).toEqual({ released: true, count: 2, total: 15_000 });
     expect(ctx.reservations.count()).toBe(0);
     ctx.db.close();
   });
@@ -303,10 +303,19 @@ describe("債務予約の解放（S9）と再開（S12）", () => {
     ctx.db.close();
   });
 
-  it("生存中エスクローの収集に失敗したら掃除を見送る（孤児と誤認しない）", () => {
+  /**
+   * レビュー指摘: 所有元の申告が取れなかったのに、その後の全点検が通れば
+   * open へ戻していた。掃除を見送った以上、復旧が完了したとは判断できない。
+   */
+  it("生存中エスクローの収集に失敗したら掃除も再開もしない", () => {
     const ctx = setup();
     fundUser(ctx, "alice", 20_000);
     ctx.escrow.hold("market:7", "alice", 5_000, "板", "op-1");
+    // 予約が取れるように胴元へ元手を入れておく（予約は house.available の範囲でしか取れない）
+    ctx.ether.runGroup({ groupKey: "test:house", kind: "table_hold", actorId: "t" }, () =>
+      ctx.ether.transfer("alice", HOUSE_HOLDER, 10_000, { reason: "胴元の元手" }),
+    );
+    expect(ctx.reservations.reserve("残骸", 3_000, "スロット", "u1").ok).toBe(true);
     ctx.registry.register({
       type: "market",
       listLiveEscrowHolders: () => {
@@ -315,11 +324,89 @@ describe("債務予約の解放（S9）と再開（S12）", () => {
     });
 
     const r = run(ctx);
-    // 返金は一切していない（申告が読めない = 生きているかも分からない）
+
+    // 営業を再開しない
+    expect(r.outcome).toBe("source_failed");
+    expect(ctx.status.current().status).not.toBe("open");
+    expect(ctx.status.current().status).toBe("integrity_halt");
+    // S12 は実行していない
+    expect(r.steps).not.toContain("S12:再開");
+    expect(r.steps).not.toContain("S9:予約解放");
+    // 資金が動いていない（返金も隔離もしていない）
     expect(r.refundedSessions).toBe(0);
     expect(r.quarantined).toBe(0);
     expect(ctx.escrow.poolOf("market:7")).toBe(5_000);
+    expect(ctx.ether.balanceOf(escrowHolderFor("market:7"))).toBe(5_000);
+    expect(ctx.ether.balanceOf(ESCROW_QUARANTINE)).toBe(0);
+    // 既存の予約が勝手に復旧済み扱いにならない（解放していないことも結果に出る）
+    expect(r.releasedReservations).toEqual({ released: false, count: 0, total: 0 });
+    expect(ctx.reservations.count()).toBe(1);
+    // 運営向けイベントとログに失敗元が残る
     expect(r.reason).toContain("収集に失敗");
+    expect(r.reason).toContain("market");
+    const src = ctx.db
+      .prepare("SELECT payload_json FROM events WHERE type = 'casino_recovery_source_failed'")
+      .all() as Array<{ payload_json: string }>;
+    expect(src).toHaveLength(1);
+    expect(src[0]!.payload_json).toContain("板テーブルが読めない");
+    const halted = ctx.db
+      .prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'casino_recovery_halted'")
+      .get() as { n: number };
+    expect(halted.n).toBe(1);
+    // 停止理由にも「掃除・予約解放とも未実行」が残る
+    expect(ctx.status.current().reason).toContain("未実行");
+    ctx.db.close();
+  });
+});
+
+/**
+ * レビュー指摘: `Escrow.recoverSessions` は failed を返しているのに、
+ * `recoverCasino` の返却値にもログにも含まれていなかった。
+ * 1件の失敗で他の復旧は止めないが、失敗が起動ログから消えてはいけない。
+ */
+describe("孤児返金の技術失敗が結果に残る", () => {
+  it("失敗したセッションは failedSessions に出て、帳簿と残高は維持される", () => {
+    const ctx = setup();
+    fundUser(ctx, "alice", 30_000);
+    fundUser(ctx, "bob", 30_000);
+    ctx.escrow.hold("卓:壊れる", "alice", 5_000, "丁半", "op-1");
+    ctx.escrow.hold("卓:正常", "bob", 4_000, "丁半", "op-2");
+    ctx.registry.register({ type: "market", listLiveEscrowHolders: () => [] });
+
+    // 「卓:壊れる」の返金だけ技術的に失敗させる（送金の直前で投げる）
+    const realTransfer = ctx.ether.transfer.bind(ctx.ether);
+    ctx.ether.transfer = ((from: string, to: string, amount: number, info: never) => {
+      if (from === escrowHolderFor("卓:壊れる")) throw new Error("送金に失敗した");
+      return realTransfer(from, to, amount, info);
+    }) as typeof ctx.ether.transfer;
+
+    const r = run(ctx);
+    ctx.ether.transfer = realTransfer;
+
+    // 失敗が結果に残る（件数・sessionId・expected・actual・error）
+    expect(r.failedSessions).toHaveLength(1);
+    const f = r.failedSessions[0]!;
+    expect(f.sessionId).toBe("卓:壊れる");
+    expect(f.expected).toBe(5_000);
+    expect(f.actual).toBe(5_000);
+    expect(f.error).toContain("送金に失敗した");
+
+    // 失敗した帳簿と残高は維持
+    expect(ctx.escrow.poolOf("卓:壊れる")).toBe(5_000);
+    expect(ctx.ether.balanceOf(escrowHolderFor("卓:壊れる"))).toBe(5_000);
+    expect(ctx.ether.balanceOf(ESCROW_QUARANTINE)).toBe(0);
+
+    // 他の正常セッションは続行している
+    expect(r.refundedSessions).toBe(1);
+    expect(ctx.escrow.list("卓:正常")).toEqual([]);
+
+    // 監査イベントに詳細が残る
+    const logged = ctx.db
+      .prepare("SELECT payload_json FROM events WHERE type = 'casino_escrow_sweep_failed'")
+      .all() as Array<{ payload_json: string }>;
+    expect(logged).toHaveLength(1);
+    expect(logged[0]!.payload_json).toContain("卓:壊れる");
+    expect(logged[0]!.payload_json).toContain("送金に失敗した");
     ctx.db.close();
   });
 });
