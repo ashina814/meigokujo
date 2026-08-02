@@ -37,6 +37,11 @@ import type Database from "better-sqlite3";
 
 export type FreeSpinStatus = "pending" | "processing" | "settled";
 
+export interface PendingFreeSpinAmuletEffect {
+  kind: "none" | "win_bonus" | "loss_protection";
+  amount: number;
+}
+
 export interface PendingFreeSpinRow {
   id: number;
   userId: string;
@@ -50,6 +55,13 @@ export interface PendingFreeSpinRow {
   status: FreeSpinStatus;
   /** 獲得時に確定させたリール（絵柄名）。再開しても出目が変わらない */
   reels: [string, string, string];
+  rawPayout: number;
+  amuletEffect: PendingFreeSpinAmuletEffect;
+  amuletNote: string | null;
+  payout: number;
+  jackpotWon: boolean;
+  jackpotClaim: number;
+  totalClaim: number;
   createdAt: number;
   settledAt: number | null;
 }
@@ -63,6 +75,13 @@ interface RawRow {
   source_group: string;
   status: string;
   reels_json: string;
+  raw_payout: number;
+  amulet_effect_json: string;
+  amulet_note: string | null;
+  payout: number;
+  jackpot_won: number;
+  jackpot_claim: number;
+  total_claim: number;
   created_at: number;
   settled_at: number | null;
 }
@@ -80,6 +99,13 @@ function toRow(r: RawRow): PendingFreeSpinRow {
     sourceGroup: r.source_group,
     status: r.status as FreeSpinStatus,
     reels,
+    rawPayout: r.raw_payout,
+    amuletEffect: JSON.parse(r.amulet_effect_json) as PendingFreeSpinAmuletEffect,
+    amuletNote: r.amulet_note,
+    payout: r.payout,
+    jackpotWon: r.jackpot_won === 1,
+    jackpotClaim: r.jackpot_claim,
+    totalClaim: r.total_claim,
     createdAt: r.created_at,
     settledAt: r.settled_at,
   };
@@ -97,6 +123,13 @@ export class FreeSpins {
         source_group TEXT    NOT NULL,
         status       TEXT    NOT NULL CHECK(status IN ('pending','processing','settled')),
         reels_json   TEXT    NOT NULL,
+        raw_payout   INTEGER NOT NULL DEFAULT 0,
+        amulet_effect_json TEXT NOT NULL DEFAULT '{"kind":"none","amount":0}',
+        amulet_note  TEXT,
+        payout       INTEGER NOT NULL DEFAULT 0,
+        jackpot_won  INTEGER NOT NULL DEFAULT 0 CHECK(jackpot_won IN (0,1)),
+        jackpot_claim INTEGER NOT NULL DEFAULT 0,
+        total_claim  INTEGER NOT NULL DEFAULT 0,
         created_at   INTEGER NOT NULL,
         settled_at   INTEGER,
         UNIQUE (user_id, operation_id, spin_no)
@@ -104,6 +137,17 @@ export class FreeSpins {
       CREATE INDEX IF NOT EXISTS idx_casino_free_spins_pending
         ON casino_pending_free_spins(status, created_at);
     `);
+    const columns = new Set((this.db.prepare("PRAGMA table_info(casino_pending_free_spins)").all() as Array<{ name: string }>).map((r) => r.name));
+    const add = (name: string, ddl: string) => {
+      if (!columns.has(name)) this.db.exec(`ALTER TABLE casino_pending_free_spins ADD COLUMN ${ddl}`);
+    };
+    add("raw_payout", "raw_payout INTEGER NOT NULL DEFAULT 0");
+    add("amulet_effect_json", "amulet_effect_json TEXT NOT NULL DEFAULT '{\"kind\":\"none\",\"amount\":0}'");
+    add("amulet_note", "amulet_note TEXT");
+    add("payout", "payout INTEGER NOT NULL DEFAULT 0");
+    add("jackpot_won", "jackpot_won INTEGER NOT NULL DEFAULT 0");
+    add("jackpot_claim", "jackpot_claim INTEGER NOT NULL DEFAULT 0");
+    add("total_claim", "total_claim INTEGER NOT NULL DEFAULT 0");
   }
 
   /**
@@ -120,6 +164,13 @@ export class FreeSpins {
     bet: number;
     sourceGroup: string;
     reels: readonly [string, string, string];
+    rawPayout: number;
+    amuletEffect: PendingFreeSpinAmuletEffect;
+    amuletNote?: string;
+    payout: number;
+    jackpotWon: boolean;
+    jackpotClaim: number;
+    totalClaim: number;
   }): PendingFreeSpinRow {
     const existing = this.find(input.userId, input.operationId, input.spinNo);
     if (existing) return existing;
@@ -127,10 +178,15 @@ export class FreeSpins {
     this.db
       .prepare(
         `INSERT INTO casino_pending_free_spins
-           (user_id, operation_id, spin_no, bet, source_group, status, reels_json, created_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`,
+           (user_id, operation_id, spin_no, bet, source_group, status, reels_json,
+            raw_payout, amulet_effect_json, amulet_note, payout, jackpot_won, jackpot_claim, total_claim, created_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(input.userId, input.operationId, input.spinNo, input.bet, input.sourceGroup, JSON.stringify(input.reels), ts);
+      .run(
+        input.userId, input.operationId, input.spinNo, input.bet, input.sourceGroup, JSON.stringify(input.reels),
+        input.rawPayout, JSON.stringify(input.amuletEffect), input.amuletNote ?? null, input.payout,
+        input.jackpotWon ? 1 : 0, input.jackpotClaim, input.totalClaim, ts,
+      );
     return this.find(input.userId, input.operationId, input.spinNo)!;
   }
 
@@ -195,6 +251,10 @@ export class FreeSpins {
    */
   payoutGroupKey(row: PendingFreeSpinRow): string {
     return `slots:spin:${row.userId}:${row.operationId}:free:${row.spinNo}`;
+  }
+
+  jackpotClaimHolder(row: PendingFreeSpinRow): string {
+    return `escrow:free-spin-jackpot:${row.id}`;
   }
 
   /** 保留件数（運営ダッシュボード・起動ログ用） */

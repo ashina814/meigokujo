@@ -9,6 +9,7 @@ import {
   EventLog,
   FreeSpins,
   HOUSE_HOLDER,
+  JACKPOT_HOLDER,
   Items,
   Ledger,
   Markets,
@@ -356,6 +357,50 @@ describe("③b フリースピン権はプロセスをまたいで残る", () =>
     expect(r.settled).toBe(1);
     expect(r.paid).toBe(25_000);
     expect(boot.freeSpins.pendingCount()).toBe(0);
+    ctx.db.close();
+  });
+
+  it("fixes the amulet result when the free-spin right is granted", () => {
+    const ctx = setup(scriptedRng(REELS));
+    seedBalance(ctx.db, "u1", 10_000);
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    ctx.items.grant("u1", "omamori", 1);
+    expect(ctx.items.arm("u1", "omamori").ok).toBe(true);
+
+    const paid = spinPaid(ctx.services, "u1", 1_000, "amulet-fixed");
+    const pending = paid.pendingFreeSpin!;
+    expect(pending.amuletEffect.kind).toBe("win_bonus");
+    expect(pending.payout).toBe(26_200);
+    expect(ctx.items.isArmed("u1", "omamori")).toBe(false);
+
+    ctx.items.grant("u1", "omamori", 1);
+    expect(ctx.items.arm("u1", "omamori").ok).toBe(true);
+    const free = resolveFreeSpin(ctx.services, pending);
+    expect(free.payout).toBe(26_200);
+    expect(ctx.items.isArmed("u1", "omamori")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("fixes and isolates the JP claim when the free-spin right is granted", () => {
+    const ctx = setup(scriptedRng([SCATTER, SCATTER, SCATTER, 0.9, 0.9, 0.9]));
+    seedBalance(ctx.db, "u1", 10_000);
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    seedBalance(ctx.db, JACKPOT_HOLDER, 100_000);
+
+    const paid = spinPaid(ctx.services, "u1", 1_000, "jp-fixed");
+    const pending = paid.pendingFreeSpin!;
+    expect(pending.jackpotWon).toBe(true);
+    expect(pending.jackpotClaim).toBeGreaterThan(0);
+    expect(ctx.ether.balanceOf(ctx.freeSpins.jackpotClaimHolder(pending))).toBe(pending.jackpotClaim);
+
+    seedBalance(ctx.db, JACKPOT_HOLDER, 7);
+    const before = ctx.ether.balanceOf("u1");
+    const first = resolveFreeSpin(ctx.services, pending);
+    expect(first.jpWon).toBe(pending.jackpotClaim);
+    expect(ctx.ether.balanceOf("u1")).toBe(before + pending.totalClaim);
+    const after = ctx.ether.balanceOf("u1");
+    expect(resolveFreeSpin(ctx.services, pending)).toEqual(first);
+    expect(ctx.ether.balanceOf("u1")).toBe(after);
     ctx.db.close();
   });
 });
