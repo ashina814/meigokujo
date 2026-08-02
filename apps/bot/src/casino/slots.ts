@@ -152,8 +152,6 @@ export async function playSlots(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULTIPLIER);
-  if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
       await interaction.followUp({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
@@ -163,9 +161,10 @@ export async function playSlots(
     return;
   }
   try {
-    // 前回のプロセスで払い切れていない無料スピンがあれば、先に片付ける（PR3）。
-    // 賭場停止中に獲得した権利がここで回収される
+    // 取得済み権利は新規ベットの下限・残高・予約可否に従属させない。
     await settleLeftoverFreeSpins(interaction, services, uid);
+    const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULTIPLIER);
+    if (!check.ok) return;
     await runPaidSpin(interaction, services, check.bet);
   } finally {
     releaseSeat(uid);
@@ -199,12 +198,16 @@ async function settleLeftoverFreeSpins(
     if (row.operationId === interaction.id) continue;
     try {
       const free = resolveFreeSpin(services, row);
-      await interaction
-        .followUp({
+      const message = {
           content: `✨ 前回持ち越していた**無料スピン**を回した（配当 ${fmtEther(free.payout + free.jpWon)}）。`,
           flags: MessageFlags.Ephemeral,
-        })
-        .catch(() => undefined);
+        } as const;
+      try {
+        if (interaction.replied || interaction.deferred) await interaction.followUp(message);
+        else await interaction.reply(message);
+      } catch {
+        // 通知失敗は精算済みの権利をpendingへ戻さず、二重払いの契機にもならない。
+      }
     } catch {
       return; // まだ払えない。権利は残る
     }
@@ -297,6 +300,9 @@ export function spinPaid(services: Services, uid: string, bet: number, interacti
       let pendingFreeSpin: PendingFreeSpinRow | null = null;
       if (spin.freeSpin) {
         const freeReels: [SlotSymbol, SlotSymbol, SlotSymbol] = [spinReel(rng), spinReel(rng), spinReel(rng)];
+        const freeSpin = evaluate(freeReels, bet);
+        const freeAmulet = services.casino.consumeAmulets(uid, bet, freeSpin.payout);
+        const jackpotClaim = freeSpin.kind === "jackpot" ? Math.floor(services.casino.jackpotPool() * JP_WIN_SHARE) : 0;
         pendingFreeSpin = services.freeSpins.grant({
           userId: uid,
           operationId: interactionId,
@@ -304,7 +310,23 @@ export function spinPaid(services: Services, uid: string, bet: number, interacti
           bet,
           sourceGroup: groupKey,
           reels: [freeReels[0].name, freeReels[1].name, freeReels[2].name],
+          rawPayout: freeSpin.payout,
+          amuletEffect: {
+            kind: freeAmulet.payout > freeSpin.payout ? "win_bonus" : freeAmulet.payout !== freeSpin.payout ? "loss_protection" : "none",
+            amount: Math.abs(freeAmulet.payout - freeSpin.payout),
+          },
+          amuletNote: freeAmulet.note,
+          payout: freeAmulet.payout,
+          jackpotWon: freeSpin.kind === "jackpot",
+          jackpotClaim,
+          totalClaim: freeAmulet.payout + jackpotClaim,
         });
+        if (jackpotClaim > 0) {
+          services.ether.transfer("jackpot", services.freeSpins.jackpotClaimHolder(pendingFreeSpin), jackpotClaim, {
+            reason: "フリースピンJP請求の予約",
+            game: "スロット",
+          });
+        }
       }
 
       return {
@@ -345,9 +367,8 @@ export function resolveFreeSpin(
       // 払う前に「これから払う」印を付ける。例外が出れば一緒に巻き戻って pending に戻る
       services.freeSpins.beginProcessing(row.id);
 
-      // お守りの消費もこのグループの中で行う（外で消すと落ちたときお守りだけ消える）
-      const amulet = services.casino.consumeAmulets(row.userId, row.bet, spin.payout);
-      const wanted = amulet.payout;
+      // 権利内容は獲得時に確定済み。現在のお守りやJPプールは参照しない。
+      const wanted = row.payout;
       const capacity = capacityOf(services);
       if (wanted > capacity) {
         // **配当0で完了扱いにはしない。** 権利を残して巻き戻す
@@ -356,12 +377,14 @@ export function resolveFreeSpin(
       if (wanted > 0) {
         services.ether.transfer("house", row.userId, wanted, { reason: "フリースピンの配当", game: "スロット" });
         // 賭けなしの払い出しなので settle を通らない。通算損益にはここで足す
-        services.casino.recordGameNet(row.userId, wanted);
       }
-      const jpWon =
-        spin.kind === "jackpot"
-          ? services.casino.seizeJackpot(row.userId, "slots", `${row.operationId}:free:${row.spinNo}`, JP_WIN_SHARE)
-          : 0;
+      if (row.jackpotClaim > 0) {
+        services.ether.transfer(services.freeSpins.jackpotClaimHolder(row), row.userId, row.jackpotClaim, {
+          reason: "フリースピンのジャックポット請求",
+          game: "スロット",
+        });
+      }
+      if (row.totalClaim > 0) services.casino.recordGameNet(row.userId, row.totalClaim, { countAsBiggestWin: row.jackpotWon });
 
       // 払い切ってからだけ settled にする
       services.freeSpins.markSettled(row.id);
@@ -371,11 +394,11 @@ export function resolveFreeSpin(
         kind: spin.kind,
         matched: spin.matched ?? null,
         freeSpin: spin.freeSpin,
-        rawPayout: spin.payout,
+        rawPayout: row.rawPayout,
         payout: wanted,
-        amuletNote: amulet.note ?? null,
+        amuletNote: row.amuletNote,
         settled: null,
-        jpWon,
+        jpWon: row.jackpotClaim,
         pendingFreeSpin: null,
       };
     });

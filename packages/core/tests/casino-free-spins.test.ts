@@ -20,6 +20,12 @@ const grantInput = (over: Partial<Parameters<FreeSpins["grant"]>[0]> = {}) => ({
   bet: 1_000,
   sourceGroup: "slots:spin:u1:int-1:paid",
   reels: ["王冠", "王冠", "王冠"] as [string, string, string],
+  rawPayout: 25_000,
+  amuletEffect: { kind: "none" as const, amount: 0 },
+  payout: 25_000,
+  jackpotWon: false,
+  jackpotClaim: 0,
+  totalClaim: 25_000,
   ...over,
 });
 
@@ -33,6 +39,10 @@ describe("保留記録は必要な項目を全部持つ", () => {
     expect(row.bet).toBe(1_000);
     expect(row.sourceGroup).toBe("slots:spin:u1:int-1:paid");
     expect(row.reels).toEqual(["王冠", "王冠", "王冠"]);
+    expect(row.rawPayout).toBe(25_000);
+    expect(row.amuletEffect).toEqual({ kind: "none", amount: 0 });
+    expect(row.payout).toBe(25_000);
+    expect(row.totalClaim).toBe(25_000);
     expect(row.status).toBe("pending");
     expect(row.createdAt).toBeGreaterThan(0);
     expect(row.settledAt).toBeNull();
