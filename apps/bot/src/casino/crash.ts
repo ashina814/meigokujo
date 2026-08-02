@@ -99,7 +99,7 @@ export async function playCrash(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT_CAP, "クラッシュ");
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "クラッシュ");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -242,7 +242,7 @@ async function runRoundInner(
   const buildRetryRow = () => {
     const held = services.ether.balanceOf(uid);
     const min = MIN_BET;
-    const max = Math.min(effectiveMaxBet(services, uid), held);
+    const max = Math.min(effectiveMaxBet(services, uid, "クラッシュ"), held);
     return new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId(`crash:retry:${min}`)
@@ -349,6 +349,7 @@ async function runRoundInner(
         services,
         btn,
         collector: retryCollector,
+        game: "クラッシュ",
         betRaw: Number(btn.customId.split(":")[2]),
         run: (bet) => runRound(btn, services, bet),
       });

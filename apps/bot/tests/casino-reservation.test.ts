@@ -9,7 +9,13 @@ import {
   Items,
   Ledger,
   Vip,
+  EtherError,
+  TREASURY,
+  SLOT_MAX_PAYOUT_MULT,
+  deptAccount,
   liabilityModelFor,
+  slotsJackpotCutFor,
+  slotsPaidSpinLiability,
   openDb,
   registerDefaultTxTypes,
   scriptedRng,
@@ -27,6 +33,7 @@ import {
   reserveSlotsLiability,
   HouseCapacityError,
 } from "../src/casino/common.js";
+import { spinOnce } from "../src/casino/slots.js";
 import { isCasinoPlayButton } from "../src/casino/play-route.js";
 import { isCasinoInteraction } from "../src/casino/gate.js";
 
@@ -36,7 +43,7 @@ registerDefaultTxTypes();
  * PR5 の bot 側。表示上限・押せる金額の提示・ブラックジャックのダブル制御を見る。
  */
 
-function setup() {
+function setup(rng = scriptedRng([0.5])) {
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
   const events = new EventLog(db);
@@ -44,10 +51,12 @@ function setup() {
   const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
   const items = new Items(db);
   const reservations = new HouseReservations(db, ether, events);
+  // 本番（services.ts）と同じ配線。売上精算も予約分は出せない
+  ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
   const casino = new Casino(db, ether, events, { items, reservations });
   const vip = new Vip(db, ether, events);
-  const services = { db, ether, casino, items, vip, reservations, events, rng: scriptedRng([0.5]) } as unknown as Services;
-  return { db, ether, casino, items, vip, reservations, services };
+  const services = { db, ether, casino, items, vip, reservations, events, rng } as unknown as Services;
+  return { db, ledger, ether, casino, items, vip, reservations, services };
 }
 
 function seed(db: ReturnType<typeof openDb>, holder: string, amount: number): void {
@@ -203,15 +212,52 @@ describe("ブラックジャックのダブルは予約が取れたときだけ"
 });
 
 describe("スロットはフリースピンぶんまで予約する", () => {
-  it("有料スピン + フリースピン1回の最悪ケースを1つの予約で押さえる", () => {
+  it("予約額はモデル（有料 + フリースピン1回）そのもの", () => {
     const c = setup();
     seed(c.db, HOUSE_HOLDER, 100_000_000);
     const bet = 1_000;
-    const paid = liabilityModelFor("スロット")!.maxHouseLiability({ ...liabilityCtx(c.services, "u1"), bet });
+    const ctx = { ...liabilityCtx(c.services, "u1"), bet };
+    const model = liabilityModelFor("スロット")!;
     const r = reserveSlotsLiability(c.services, "u1", bet, "int-1");
-    // フリースピンは賭け金を取らないので、回収ぶん（bet）を戻した額が上乗せされる
-    expect(r.amount).toBe(paid + paid + bet);
+
+    // 上限表示・事前検証・予約 INSERT が同じ1つの式を通る（PR5 レビュー指摘）
+    expect(r.amount).toBe(model.maxHouseLiability(ctx));
+    // 内訳: 有料スピンの純債務（JP積立込み） + フリースピンの丸ごと支払い
+    expect(r.amount).toBe(slotsPaidSpinLiability.maxHouseLiability(ctx) + bet * SLOT_MAX_PAYOUT_MULT);
     expect(r.key).toBe("slots:reserve:u1:int-1");
+  });
+
+  /**
+   * レビュー指摘の本体。「表示された上限では予約が取れない」が起きないことを、
+   * 提示額ちょうど / +1 の両方で押さえる。
+   */
+  it("提示された最大額はちょうど予約でき、+1 は予約できない", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 3_000_000);
+    seed(c.db, "u1", 100_000_000);
+
+    const max = effectiveMaxBet(c.services, "u1", "スロット");
+    expect(max).toBeGreaterThan(MIN_BET);
+
+    // ちょうどなら通る
+    const ok = reserveSlotsLiability(c.services, "u1", max, "int-max");
+    expect(ok.amount).toBeGreaterThan(0);
+    c.reservations.release(ok.key);
+
+    // +1 は通らない
+    expect(() => reserveSlotsLiability(c.services, "u1", max + 1, "int-over")).toThrow(HouseCapacityError);
+    expect(c.reservations.get("slots:reserve:u1:int-over")).toBeUndefined();
+  });
+
+  it("house 100万・賭け5,000 では同時1人しか受けられない", () => {
+    // PR本文にあった「5,000なら495,000予約、同時2人」の訂正（レビュー指摘）。
+    // 実際はフリースピンぶんを足して 995,050 なので、100万では1人で埋まる
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    const bet = 5_000;
+    const first = reserveSlotsLiability(c.services, "u1", bet, "int-1");
+    expect(first.amount).toBe(995_050);
+    expect(() => reserveSlotsLiability(c.services, "u2", bet, "int-2")).toThrow(HouseCapacityError);
   });
 
   it("精算グループ鍵とは別の鍵にする（有料スピンの精算で解放されないように）", () => {
@@ -226,5 +272,164 @@ describe("スロットはフリースピンぶんまで予約する", () => {
       reservationKey: "solo:スロット:u1:int-1:paid",
     });
     expect(c.reservations.get(r.key)).toBeDefined();
+  });
+});
+
+/**
+ * レビュー指摘: 予約を取った処理は、その予約の範囲内で払えなければならない。
+ * `canAccept` は全予約を house 残高から引くので、自分で確保した枠まで
+ * 「利用不可」と数えてしまい、十分な予約があるのに未払いになっていた。
+ */
+describe("自分の予約は支払保証として使える", () => {
+  it("availableIncludingOwn は自己予約ぶんを戻す", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    c.reservations.reserve("own", 900_000, "スロット", "u1");
+    c.reservations.reserve("other", 50_000, "ポーカー", "u2");
+
+    expect(c.reservations.available()).toBe(50_000);
+    // 自分の 900,000 は使ってよい（他人の 50,000 は使えない）
+    expect(c.reservations.availableIncludingOwn("own")).toBe(950_000);
+    // 知らない鍵なら available と同じ
+    expect(c.reservations.availableIncludingOwn("nope")).toBe(50_000);
+  });
+
+  it("予約済みのフリースピンは自分の枠から満額払われる", () => {
+    // 魂片3つ → フリースピンで王冠3つ（25倍）
+    const c = setup(scriptedRng([0.98, 0.98, 0.98, 0.85, 0.85, 0.85]));
+    const bet = 1_000;
+    seed(c.db, "u1", 100_000);
+    // 有料スピン + フリースピンぶんちょうどしか無い胴元（余裕は1 Ldも無い）
+    const need = liabilityModelFor("スロット")!.maxHouseLiability({ ...liabilityCtx(c.services, "u1"), bet });
+    seed(c.db, HOUSE_HOLDER, need);
+    const res = reserveSlotsLiability(c.services, "u1", bet, "int-1");
+    expect(res.amount).toBe(need);
+    // この時点で available() は 0。予約鍵を渡さなければフリースピンは払えない判定になる
+    expect(c.reservations.available()).toBe(0);
+
+    spinOnce(c.services, "u1", bet, "int-1", 0, res.key);
+    const before = c.ether.balanceOf("u1");
+    const free = spinOnce(c.services, "u1", bet, "int-1", 1, res.key);
+
+    expect(free.payout).toBe(bet * 25);
+    expect(free.unpaid).toBe(0);
+    expect(c.ether.balanceOf("u1")).toBe(before + bet * 25);
+  });
+});
+
+/**
+ * レビュー指摘: 進行中ゲームの予約があっても house 全残高を売上精算できてしまい、
+ * 予約が支払保証になっていなかった。UI ではなく資金処理層で止める。
+ */
+describe("売上精算は予約済み資金を抜けない", () => {
+  const DEPT = deptAccount("賭博場");
+
+  function fundedHouse(houseAmount: number) {
+    const c = setup();
+    c.ledger.ensureAccount(DEPT, "system");
+    c.ledger.transfer({
+      from: TREASURY, to: DEPT, amount: houseAmount, type: "adjust", actor: "t", approvedBy: "t",
+      idempotencyKey: `seed:dept:${houseAmount}`,
+    });
+    c.ether.fundFromAccount(DEPT, houseAmount, HOUSE_HOLDER, "fund:test");
+    return c;
+  }
+
+  it("予約中は全額精算を要求しても予約分が残る", () => {
+    const c = fundedHouse(1_000_000);
+    const house = c.ether.balanceOf(HOUSE_HOLDER);
+    c.reservations.reserve("live", 400_000, "スロット", "u1");
+
+    expect(c.ether.settleableBalance(HOUSE_HOLDER)).toBe(house - 400_000);
+    expect(() => c.ether.redeemFairToAccount(HOUSE_HOLDER, house, DEPT, "settle:all")).toThrow(EtherError);
+    // 1 Ld も動いていない
+    expect(c.ether.balanceOf(HOUSE_HOLDER)).toBe(house);
+  });
+
+  it("精算可能額ちょうどは通り、+1 は拒否される", () => {
+    const c = fundedHouse(1_000_000);
+    const house = c.ether.balanceOf(HOUSE_HOLDER);
+    c.reservations.reserve("live", 400_000, "スロット", "u1");
+    const settleable = c.ether.settleableBalance(HOUSE_HOLDER);
+
+    expect(() => c.ether.redeemFairToAccount(HOUSE_HOLDER, settleable + 1, DEPT, "settle:over")).toThrow(EtherError);
+    expect(c.ether.balanceOf(HOUSE_HOLDER)).toBe(house);
+
+    c.ether.redeemFairToAccount(HOUSE_HOLDER, settleable, DEPT, "settle:exact");
+    expect(c.ether.balanceOf(HOUSE_HOLDER)).toBe(400_000);
+  });
+
+  it("精算後も予約済みゲームの最大配当を払える", () => {
+    const c = fundedHouse(1_000_000);
+    seed(c.db, "u1", 100_000);
+    const bet = 2_000;
+    const res = reserveHouseLiability(c.services, "丁半", "u1", bet, "op-1");
+
+    // 精算できるだけ精算する
+    const settleable = c.ether.settleableBalance(HOUSE_HOLDER);
+    if (settleable > 0) c.ether.redeemFairToAccount(HOUSE_HOLDER, settleable, DEPT, "settle:max");
+
+    // それでも予約した最大配当は払える
+    expect(c.ether.balanceOf(HOUSE_HOLDER)).toBeGreaterThanOrEqual(res.amount);
+    const r = c.services.casino.settleSolo("u1", "丁半", bet, Math.floor(bet * 1.94), {
+      chain: false,
+      fuku: false,
+      operationId: "op-1",
+      reservationKey: res.key,
+    });
+    expect(r.payout).toBeGreaterThan(bet);
+    expect(c.ether.balanceOf(HOUSE_HOLDER)).toBeGreaterThanOrEqual(0);
+  });
+
+  it("予約が無ければ従来どおり全額戻せる", () => {
+    const c = fundedHouse(1_000_000);
+    const house = c.ether.balanceOf(HOUSE_HOLDER);
+    c.ether.redeemFairToAccount(HOUSE_HOLDER, house, DEPT, "settle:all");
+    expect(c.ether.balanceOf(HOUSE_HOLDER)).toBe(0);
+  });
+});
+
+/**
+ * レビュー指摘: JP積立を含む house からのすべての流出が、
+ * 他人の予約済み資金を侵食しないこと。
+ */
+describe("JP積立と予約が競合しない", () => {
+  it("2件の予約が並ぶ状況で、片方が最大配当+JP積立を出しても、もう片方も満額払える", () => {
+    const c = setup();
+    seed(c.db, "a", 1_000_000);
+    seed(c.db, "b", 1_000_000);
+    const bet = 1_000;
+
+    // 2人ぶんの予約がちょうど収まる house
+    const ctxA = { ...liabilityCtx(c.services, "a"), bet };
+    const need = liabilityModelFor("スロット")!.maxHouseLiability(ctxA);
+    seed(c.db, HOUSE_HOLDER, need * 2);
+
+    const ra = reserveSlotsLiability(c.services, "a", bet, "int-a");
+    const rb = reserveSlotsLiability(c.services, "b", bet, "int-b");
+    expect(c.reservations.available()).toBe(0);
+
+    // a が最大配当（マモン³ 100倍）+ JP積立を実行
+    c.services.casino.settleSolo("a", "スロット", bet, bet * SLOT_MAX_PAYOUT_MULT, {
+      chain: false,
+      fuku: false,
+      operationId: "int-a:paid",
+      jackpotCut: slotsJackpotCutFor(bet),
+    });
+    // JP積立が黙って飛ばされていない
+    expect(c.ether.balanceOf("jackpot")).toBe(slotsJackpotCutFor(bet));
+
+    // b も最大配当を全額払える
+    c.reservations.release(ra.key);
+    const settled = c.services.casino.settleSolo("b", "スロット", bet, bet * SLOT_MAX_PAYOUT_MULT, {
+      chain: false,
+      fuku: false,
+      operationId: "int-b:paid",
+      jackpotCut: slotsJackpotCutFor(bet),
+      reservationKey: rb.key,
+    });
+    expect(settled.payout).toBe(bet * SLOT_MAX_PAYOUT_MULT);
+    expect(settled.jackpotUnfunded).toBe(0);
+    expect(c.ether.balanceOf(HOUSE_HOLDER)).toBeGreaterThanOrEqual(0);
   });
 });

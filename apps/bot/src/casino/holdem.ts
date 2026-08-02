@@ -171,7 +171,7 @@ export async function playHoldem(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT, "ホールデム");
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "ホールデム");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -377,7 +377,7 @@ async function runRoundInner(
 
   const heldEther = services.ether.balanceOf(uid);
   const min = MIN_BET;
-  const max = Math.min(effectiveMaxBet(services, uid), heldEther);
+  const max = Math.min(effectiveMaxBet(services, uid, "ホールデム"), heldEther);
   const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`holdem:retry:${min}`)
@@ -417,6 +417,7 @@ async function runRoundInner(
         services,
         btn,
         collector,
+        game: "ホールデム",
         betRaw: Number(btn.customId.split(":")[2]),
         run: (bet) => runRound(btn, services, bet),
       });

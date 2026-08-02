@@ -146,7 +146,7 @@ export async function playPoker(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT, "ポーカー");
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "ポーカー");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -318,7 +318,7 @@ async function runRoundInner(
   // ── リトライボタン ──
   const heldEther = services.ether.balanceOf(uid);
   const min = MIN_BET;
-  const max = Math.min(effectiveMaxBet(services, uid), heldEther);
+  const max = Math.min(effectiveMaxBet(services, uid, "ポーカー"), heldEther);
   const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`poker:retry:${min}`)
@@ -363,6 +363,7 @@ async function runRoundInner(
         services,
         btn,
         collector,
+        game: "ポーカー",
         betRaw: Number(btn.customId.split(":")[2]),
         run: (bet) => runRound(btn, services, bet),
       });

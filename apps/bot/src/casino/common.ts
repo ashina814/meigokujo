@@ -35,8 +35,12 @@ export function configuredMaxBet(services: Services, userId: string): number {
  * min( 設定上限（VIPなら×2）, gameModel.maxBetFor(house.available, ctx) )
  * ```
  *
- * `house.available` は「胴元残高 − 予約済み債務」。ゲームを指定しない呼び出しでは
- * 設定上限だけを返す（リトライ判定など、ゲーム固有の倍率を持たない場所）。
+ * `house.available` は「胴元残高 − 予約済み債務」。**上限表示・事前検証・予約 INSERT が
+ * 同じ `GameLiabilityModel.maxHouseLiability` を通る**ので、「表示された上限では予約が取れない」
+ * が起きない（PR5 レビュー指摘）。
+ *
+ * ゲーム名を渡さない呼び出しは設定上限しか返さないので、**結果画面や賭け受付では使わない**。
+ * 残っているのは「ゲームが決まっていない場面」（賭場ホームの所持額表示など）だけ。
  */
 export function effectiveMaxBet(services: Services, userId: string, game?: string): number {
   const cap = configuredMaxBet(services, userId);
@@ -72,21 +76,34 @@ export interface BetCheck {
 
 /**
  * 賭けの共通前処理。座席確保はしない（呼び出し側で）。
+ *
  * - bet の整数/範囲チェック
  * - 残高チェック（不足ならマモンが両替所へ誘導）
- * - テーブルリミット（胴元が最悪配当を払えるか）
+ * - テーブルリミット（胴元がこの賭けの**純債務**を予約できるか）
+ *
  * NG のときは reply 済みで ok:false を返す。
+ *
+ * ## gross payout ではなく net liability で見る（PR5 レビュー指摘）
+ *
+ * 以前はここへ「払戻総額」を渡して `canAccept(maxPayout)` を呼んでいた。
+ * ところが実際に予約するのは「最大払戻 − 回収する賭け金」の**純債務**なので、
+ * 事前判定のほうが常に厳しく、予約できる安全な賭けまで断っていた。
+ * 表示上限（`effectiveMaxBet`）とも一致しないので「下のボタンなら必ず通る」が保証できない。
+ *
+ * いまはここも `GameLiabilityModel.maxHouseLiability` を見る。
+ * **最終的な可否は同一トランザクション内の `reserve` が真実源**で、ここはあくまで
+ * 「明らかに無理な賭けを早く断って、押せる金額を提示する」ための前段。
  */
 export async function validateBet(
   interaction: ChatInputCommandInteraction,
   services: Services,
   betRaw: number,
-  maxPayout: number,
-  /** 債務モデルを持つゲーム名。渡すと上限提示が予約込みの余力から出る */
-  game?: string,
+  /** 債務モデルを持つゲーム名。上限表示・事前検証・予約がこの1つのモデルを共有する */
+  game: string,
 ): Promise<BetCheck> {
   const bet = Math.floor(betRaw);
-  const cap = configuredMaxBet(services, interaction.user.id);
+  const uid = interaction.user.id;
+  const cap = configuredMaxBet(services, uid);
   // 保留中の無料スピンを先に通知した場合、ここは2通目になる。
   // 未応答 interaction には reply、応答済み／defer 済みなら followUp を使う。
   const respond = (payload: Parameters<typeof interaction.reply>[0]) =>
@@ -98,7 +115,7 @@ export async function validateBet(
     });
     return { ok: false, bet };
   }
-  const held = services.ether.balanceOf(interaction.user.id);
+  const held = services.ether.balanceOf(uid);
   if (held < bet) {
     await respond({
       content: `${Mammon.broke()}（所持 ${fmtEther(held)}）\n→ 両替所パネルで Land をエテルに替えてこい。`,
@@ -106,14 +123,19 @@ export async function validateBet(
     });
     return { ok: false, bet };
   }
-  if (!services.casino.canAccept(maxPayout)) {
-    // 胴元が最悪ケースの配当を払えない。**押し直せば必ず通る金額**を提示して戻す（正本 §5.4 ③）
-    const multiplier = maxPayout / bet;
-    const maxAcceptable = game
-      ? effectiveMaxBet(services, interaction.user.id, game)
-      : Math.floor(services.casino.availableForLiability() / multiplier);
-    await respond({ ...capacityRecoveryPayload(services, maxAcceptable, game), flags: MessageFlags.Ephemeral });
-    return { ok: false, bet };
+  const model = liabilityModelFor(game);
+  if (model) {
+    const needed = model.maxHouseLiability({ ...liabilityCtx(services, uid), bet });
+    if (needed > services.casino.availableForLiability()) {
+      // 胴元がこの賭けの最悪ケースを引き受けられない。
+      // **押し直せば必ず通る金額**を提示して戻す（正本 §5.4 ③）。
+      // 提示額は同じモデルの逆算なので、その額なら予約が取れる
+      await respond({
+        ...capacityRecoveryPayload(services, effectiveMaxBet(services, uid, game), game),
+        flags: MessageFlags.Ephemeral,
+      });
+      return { ok: false, bet };
+    }
   }
   return { ok: true, bet };
 }
@@ -200,11 +222,15 @@ export function reserveHouseLiability(
 }
 
 /**
- * スロット1回ぶんの予約（有料スピン + 最大1回のフリースピン）。
+ * スロット1セットぶんの予約（有料スピン + 最大1回のフリースピン）。
  *
- * フリースピンは賭け金を取らないので、胴元は配当を丸ごと持ち出す（賭け額の回収が無い）。
- * 有料ぶんの債務に `bet` を足すとちょうどフリースピン1回ぶんの最悪ケースになる。
- * 原作準拠でフリースピン中はさらなるフリースピンが出ないので、多くても1回。
+ * 額は core の `slotsLiability`（＝`liabilityModelFor("スロット")`）そのもの。
+ * 以前はここで `paid + (paid + bet)` と**予約側だけが**セット全体を計算しており、
+ * 上限表示・事前検証は有料1回ぶんしか見ていなかった（PR5 レビュー指摘）。
+ * いまは表示・検証・予約・復帰ボタンがすべて同じモデルを読む。
+ *
+ * 鍵は精算グループ鍵と別にしてある。精算グループ鍵にすると、有料スピンの精算時に
+ * 解放されてフリースピンが裸になる。
  */
 export function reserveSlotsLiability(
   services: Services,
@@ -213,13 +239,17 @@ export function reserveSlotsLiability(
   interactionId: string,
 ): { key: string; amount: number } {
   const model = liabilityModelFor("スロット");
-  const key = `slots:reserve:${userId}:${interactionId}`;
+  const key = slotsReservationKey(userId, interactionId);
   if (!model) return { key, amount: 0 };
-  const paid = model.maxHouseLiability({ ...liabilityCtx(services, userId), bet });
-  const amount = paid + (paid + bet);
+  const amount = model.maxHouseLiability({ ...liabilityCtx(services, userId), bet });
   const r = services.reservations.reserve(key, amount, "スロット", userId);
   if (!r.ok) throw new HouseCapacityError("スロット", amount, r.available);
   return { key, amount };
+}
+
+/** スロット1セットの予約鍵。`spinOnce` が自己予約を参照するのに同じ関数を使う */
+export function slotsReservationKey(userId: string, interactionId: string): string {
+  return `slots:reserve:${userId}:${interactionId}`;
 }
 
 /**
@@ -325,14 +355,22 @@ export type RetryDenial =
  *
  * 上限は `MAX_BET` ではなく `effectiveMaxBet`（VIPなら×2）で見る。
  * ここを固定値にしていると、VIP が上限いっぱいで遊んだ直後の「もう一回」だけが弾かれる。
+ *
+ * `game` を渡すと**胴元の余力も反映**する（PR5 レビュー指摘）。ゲーム名なしだと
+ * VIP 設定上限しか見ないので、他の客が大きく張っている最中の「もう一回」が
+ * 予約段階まで進んでから落ちていた。全ゲームの結果画面はゲーム名を渡す。
  */
-export function checkRetry(services: Services, userId: string, betRaw: number): RetryDenial {
+export function checkRetry(services: Services, userId: string, betRaw: number, game?: string): RetryDenial {
   const bet = Number(betRaw);
-  const cap = effectiveMaxBet(services, userId);
+  const cap = effectiveMaxBet(services, userId, game);
   if (!Number.isInteger(bet) || bet < MIN_BET || bet > cap) {
+    const configured = configuredMaxBet(services, userId);
+    const capped = cap < configured; // 胴元の余力で絞られている
     return {
       ok: false,
-      reason: `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
+      reason: capped
+        ? `いまこの卓で受けられるのは ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ まで。（他の客が大きく張っている）`
+        : `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
     };
   }
   const held = services.ether.balanceOf(userId);
@@ -370,6 +408,11 @@ export async function handleRetryPress(opts: {
   services: Services;
   btn: ButtonInteraction;
   collector: RetryCollector;
+  /**
+   * ゲーム名（PR5）。**必須**。渡さないと VIP 設定上限しか見ず、胴元の余力を反映しない。
+   * 全7ゲームの結果画面がここを通るので、渡し忘れは型で防がれる。
+   */
+  game: string;
   betRaw: number;
   /** 受付が通ったあとに回す本体（座席は取得済み） */
   run: (bet: number) => Promise<void>;
@@ -377,7 +420,7 @@ export async function handleRetryPress(opts: {
   const { services, btn, collector, run } = opts;
   const uid = btn.user.id;
 
-  const retry = checkRetry(services, uid, opts.betRaw);
+  const retry = checkRetry(services, uid, opts.betRaw, opts.game);
   if (!retry.ok) {
     // ここで collector を止めない。断ったのにボタンを殺すと、次に押したとき無応答になる
     await btn.reply({ content: `❌ ${retry.reason}`, flags: MessageFlags.Ephemeral });

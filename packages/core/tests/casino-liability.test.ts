@@ -23,6 +23,7 @@ import {
   rouletteTableLiability,
   slotsJackpotCutFor,
   slotsLiability,
+  slotsPaidSpinLiability,
   type LiabilityContext,
 } from "../src/index.js";
 
@@ -44,8 +45,8 @@ const ctx = (bet: number, winStreak = 0, winBonusCap = 0): LiabilityContext => (
 describe("倍率は core のモデルから来ている", () => {
   it("スロットの最大払戻はマモン³の配当表の値", () => {
     expect(SLOT_MAX_PAYOUT_MULT).toBe(TRIPLE_PAYOUTS["マモン"]);
-    // 連鎖なし・お守りなしなら 100·bet − bet + JP積立
-    expect(slotsLiability.maxHouseLiability(ctx(1_000))).toBe(
+    // 有料スピン1回なら 100·bet − bet + JP積立
+    expect(slotsPaidSpinLiability.maxHouseLiability(ctx(1_000))).toBe(
       1_000 * SLOT_MAX_PAYOUT_MULT - 1_000 + slotsJackpotCutFor(1_000),
     );
   });
@@ -75,8 +76,8 @@ describe("連鎖ボーナスとお守りの扱い", () => {
     const streak = 4;
     const c = chainMultiplier(streak + 1).mult;
     expect(c).toBeGreaterThan(1);
-    const base = slotsLiability.maxHouseLiability(ctx(1_000));
-    const chained = slotsLiability.maxHouseLiability(ctx(1_000, streak));
+    const base = slotsPaidSpinLiability.maxHouseLiability(ctx(1_000));
+    const chained = slotsPaidSpinLiability.maxHouseLiability(ctx(1_000, streak));
     expect(chained).toBe(Math.ceil(1_000 * SLOT_MAX_PAYOUT_MULT * c) - 1_000 + slotsJackpotCutFor(1_000));
     expect(chained).toBeGreaterThan(base);
   });
@@ -90,7 +91,7 @@ describe("連鎖ボーナスとお守りの扱い", () => {
   it("お守りの勝利ボーナス上限は債務に含まれ、連鎖も掛かる（安全側）", () => {
     const cap = 3_000;
     const c = chainMultiplier(3).mult;
-    expect(slotsLiability.maxHouseLiability(ctx(1_000, 2, cap))).toBe(
+    expect(slotsPaidSpinLiability.maxHouseLiability(ctx(1_000, 2, cap))).toBe(
       Math.ceil((1_000 * SLOT_MAX_PAYOUT_MULT + cap) * c) - 1_000 + slotsJackpotCutFor(1_000),
     );
   });
@@ -99,12 +100,12 @@ describe("連鎖ボーナスとお守りの扱い", () => {
     // JP **当選金**は jackpot holder から出るので house の債務ではない。
     // 一方 JP **積立**は house からの支出なので入る（レビュー指摘）。
     const bet = 1_000;
-    expect(slotsLiability.maxHouseLiability(ctx(bet))).toBe(
+    expect(slotsPaidSpinLiability.maxHouseLiability(ctx(bet))).toBe(
       bet * SLOT_MAX_PAYOUT_MULT - bet + slotsJackpotCutFor(bet),
     );
     // 福の重みはプレイヤー → JP/救済 の一方向なので、債務を増やす向きには効かない
     // （モデルに福の項が無いことを、式が賭けと倍率と積立だけで決まることで確認する）
-    expect(slotsLiability.maxHouseLiability(ctx(bet * 2))).toBe(
+    expect(slotsPaidSpinLiability.maxHouseLiability(ctx(bet * 2))).toBe(
       2 * (bet * SLOT_MAX_PAYOUT_MULT) - bet * 2 + slotsJackpotCutFor(bet * 2),
     );
   });
@@ -229,15 +230,45 @@ describe("JP積立が胴元債務に含まれる", () => {
   it("スロットの必須流出は実装と同じ jackpotCutFor", () => {
     for (const bet of [50, 999, 1_000, 5_000, 1_234_567]) {
       expect(slotsLiability.mandatoryHouseOutflow(ctx(bet)), `bet=${bet}`).toBe(slotsJackpotCutFor(bet));
+      expect(slotsPaidSpinLiability.mandatoryHouseOutflow(ctx(bet)), `bet=${bet}`).toBe(slotsJackpotCutFor(bet));
     }
     // 端数でも必ず 1 以上積む（率だけで計算すると 0 になる領域）
     expect(slotsJackpotCutFor(50)).toBe(1);
   });
 
-  it("スロットの債務は「最大払戻 − 賭け金 + JP積立」", () => {
+  it("有料スピンの債務は「最大払戻 − 賭け金 + JP積立」", () => {
     const bet = 5_000;
     const maxPayout = bet * SLOT_MAX_PAYOUT_MULT;
-    expect(slotsLiability.maxHouseLiability(ctx(bet))).toBe(maxPayout - bet + slotsJackpotCutFor(bet));
+    expect(slotsPaidSpinLiability.maxHouseLiability(ctx(bet))).toBe(maxPayout - bet + slotsJackpotCutFor(bet));
+  });
+
+  /**
+   * レビュー指摘: 予約はセット（有料 + フリースピン1回）で取るのに、
+   * 上限表示・事前検証が有料1回ぶんしか見ていなかった。
+   * `liabilityModelFor("スロット")` はセット全体を返す。
+   */
+  it("スロットのモデルは1セット（有料 + フリースピン1回）", () => {
+    const bet = 5_000;
+    const set = liabilityModelFor("スロット")!;
+    expect(set).toBe(slotsLiability);
+    // 有料スピンの純債務 495,050 + フリースピンの丸ごと支払い 500,000
+    expect(slotsPaidSpinLiability.maxHouseLiability(ctx(bet))).toBe(495_050);
+    expect(set.maxHouseLiability(ctx(bet))).toBe(995_050);
+    // house 100万では同時1人ぶんしか受けられない（PR本文の「同時2人」は誤り）
+    expect(set.maxHouseLiability(ctx(bet)) * 2).toBeGreaterThan(1_000_000);
+  });
+
+  it("フリースピンぶんにはお守り上限も乗る（安全側）", () => {
+    const bet = 1_000;
+    const cap = 3_000;
+    const withAmulet = slotsLiability.maxHouseLiability({
+      bet,
+      playerState: { winStreak: 0 },
+      activeEffects: { winBonusCap: cap },
+    });
+    const without = slotsLiability.maxHouseLiability(ctx(bet));
+    // 有料側とフリースピン側の両方に上限を足しているので 2×cap ぶん増える
+    expect(withAmulet - without).toBe(cap * 2);
   });
 
   it("JP積立を持たないゲームの必須流出は 0", () => {
