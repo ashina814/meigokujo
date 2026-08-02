@@ -23,7 +23,14 @@ import {
   type CasinoRng,
 } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
-import { FreeSpinUnpayableError, resolveFreeSpin, resumePendingFreeSpins, spinPaid } from "../src/casino/slots.js";
+import {
+  FreeSpinUnpayableError,
+  playSlots,
+  resolveFreeSpin,
+  resumePendingFreeSpins,
+  settleLeftoverFreeSpins,
+  spinPaid,
+} from "../src/casino/slots.js";
 import { cashOutMultiplier } from "../src/casino/crash.js";
 import {
   MAX_BET,
@@ -254,6 +261,86 @@ describe("③ フリースピンの取りこぼしが起きない", () => {
     expect(free.matched).toBe("王冠");
     expect(free.payout).toBe(bet * 25);
     expect(ctx.ether.balanceOf("u1")).toBe(before + bet * 25);
+    ctx.db.close();
+  });
+});
+
+describe("③a 保留フリースピンは新規有料ベットから独立して受け取れる", () => {
+  function pendingFreeSpinCtx() {
+    const ctx = setup(scriptedRng([SCATTER, SCATTER, SCATTER, CROWN, CROWN, CROWN]));
+    seedBalance(ctx.db, "u1", 10_000);
+    seedBalance(ctx.db, HOUSE_HOLDER, 25_000);
+    const paid = spinPaid(ctx.services, "u1", 1_000, "paid-that-granted-free");
+    expect(paid.pendingFreeSpin).not.toBeNull();
+    return { ctx, row: paid.pendingFreeSpin! };
+  }
+
+  function interaction(id: string, notify?: () => Promise<void>) {
+    let replied = false;
+    const replies: unknown[] = [];
+    const followUps: unknown[] = [];
+    return {
+      id,
+      user: { id: "u1" },
+      get replied() {
+        return replied;
+      },
+      deferred: false,
+      replies,
+      followUps,
+      reply: async (payload: unknown) => {
+        replies.push(payload);
+        if (notify) await notify();
+        replied = true;
+      },
+      followUp: async (payload: unknown) => {
+        followUps.push(payload);
+      },
+    };
+  }
+
+  it.each([0, MIN_BET - 1])("所持0でも賭け額%sから保留分だけを受け取れる", async (bet) => {
+    const { ctx, row } = pendingFreeSpinCtx();
+    seedBalance(ctx.db, "u1", 0);
+    const i = interaction(`claim-with-${bet}`);
+
+    await playSlots(i as any, ctx.services, bet);
+
+    expect(ctx.ether.balanceOf("u1")).toBe(row.totalClaim);
+    expect(ctx.freeSpins.get(row.id)!.status).toBe("settled");
+    // 未応答からの最初の通知は reply、続く無効ベットの案内は followUp。
+    expect(i.replies).toHaveLength(1);
+    expect(i.followUps).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("新規有料スピン用の余力が無くても、確定済み無料スピンだけは予約して払える", async () => {
+    const { ctx, row } = pendingFreeSpinCtx();
+    const i = interaction("paid-reservation-will-fail");
+
+    // 25,000 は確定済み無料スピンには足りるが、精算後の有料スピンには足りない。
+    await playSlots(i as any, ctx.services, MIN_BET);
+
+    expect(ctx.ether.balanceOf("u1")).toBe(9_000 + row.totalClaim);
+    expect(ctx.freeSpins.get(row.id)!.status).toBe("settled");
+    expect(i.replies).toHaveLength(1);
+    expect(i.followUps).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("無料スピンの通知に失敗しても、精算済み権利を再払いしない", async () => {
+    const { ctx, row } = pendingFreeSpinCtx();
+    const before = ctx.ether.balanceOf("u1");
+    const i = interaction("notification-fails", async () => {
+      throw new Error("Discord送信失敗");
+    });
+
+    await settleLeftoverFreeSpins(i as any, ctx.services, "u1");
+    expect(ctx.ether.balanceOf("u1")).toBe(before + row.totalClaim);
+    expect(ctx.freeSpins.get(row.id)!.status).toBe("settled");
+
+    await settleLeftoverFreeSpins(i as any, ctx.services, "u1");
+    expect(ctx.ether.balanceOf("u1")).toBe(before + row.totalClaim);
     ctx.db.close();
   });
 });

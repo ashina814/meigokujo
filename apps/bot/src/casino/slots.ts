@@ -188,7 +188,7 @@ async function runPaidSpin(
  * （賭場が停止していた・胴元が細っていた）を、遊びに来たタイミングで回収する。
  * 払えなければ黙って諦める（権利は pending のまま残る）。
  */
-async function settleLeftoverFreeSpins(
+export async function settleLeftoverFreeSpins(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   uid: string,
