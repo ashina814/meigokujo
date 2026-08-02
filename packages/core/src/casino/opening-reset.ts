@@ -5,11 +5,12 @@ import type Database from "better-sqlite3";
 import { Ledger } from "../ledger/service.js";
 import { CASINO_DEPARTMENT, CHIP_ESCROW, ETHER_ESCROW, HOUSE_HOLDER, isPlayerHolder } from "./exchange.js";
 import { ChipTx } from "./chip-tx.js";
+import { ESCROW_QUARANTINE } from "./escrow.js";
 import { FREE_SPIN_JACKPOT_CLAIMS_HOLDER } from "./free-spins.js";
 import { CasinoStatus, OPENING_RESET_SEAL } from "./status.js";
 
 const OPENING_VERSION = "opening_v1";
-const PROTECTED_TABLES = ["vip_members", "stocks", "casino_stats", "quarantine_assets"] as const;
+const PROTECTED_TABLES = ["casino_vip", "casino_stocks", "casino_holdings", "casino_stats"] as const;
 const now = () => Math.floor(Date.now() / 1000);
 
 export interface CasinoOpeningConfig {
@@ -34,6 +35,22 @@ export interface OpeningBackupAdapter {
 export interface OpeningDiscordAdapter { disableLegacyCasino(): Promise<void> }
 export interface OpeningDataFingerprint { exists: boolean; rows: number; sha256: string }
 export interface OpeningPlayerLandFingerprint { accounts: number; total: number; sha256: string }
+export interface OpeningProtectedFindings {
+  activeVip: Array<{ userId: string; expiresAt: number }>;
+  stockHoldings: Array<{ userId: string; stockId: string; shares: number; avgCost: number; boughtAt: number }>;
+  casinoStats: Array<{
+    userId: string;
+    games: number;
+    wins: number;
+    losses: number;
+    totalWagered: number;
+    totalEarned: number;
+    totalLost: number;
+    biggestWin: number;
+    bestWinStreak: number;
+  }>;
+  quarantineChips: number;
+}
 
 export interface OpeningResetPlan {
   mode: "dry-run";
@@ -46,6 +63,7 @@ export interface OpeningResetPlan {
   playerLand: OpeningPlayerLandFingerprint;
   protectedRows: Record<string, number>;
   protectedData: Record<string, OpeningDataFingerprint>;
+  protectedFindings: OpeningProtectedFindings;
   compensation: { candidates: OpeningCompensationCandidate[]; requiredLand: number };
   legacyTables: Record<string, number>;
   configuration: CasinoOpeningConfig;
@@ -116,21 +134,20 @@ export class CasinoOpeningReset {
 
   dryRun(configuration: CasinoOpeningConfig): OpeningResetPlan {
     this.assertConfig(configuration);
-    const table = (name: string) => this.hasTable(name);
-    const count = (name: string, where = "") => table(name)
+    const count = (name: string, where = "") => this.hasTable(name)
       ? ((this.db.prepare(`SELECT COUNT(*) AS n FROM ${quoteIdent(name)} ${where}`).get() as { n: number }).n) : 0;
-    const pending = table("casino_pending_free_spins")
+    const pending = this.hasTable("casino_pending_free_spins")
       ? (this.db.prepare("SELECT id, jackpot_claim FROM casino_pending_free_spins WHERE status != 'settled' ORDER BY id").all() as Array<{ id: number; jackpot_claim: number }>) : [];
     const expected = pending.reduce((sum, row) => sum + row.jackpot_claim, 0);
-    const actual = table("ether_balances")
-      ? ((this.db.prepare("SELECT amount FROM ether_balances WHERE user_id=?").get(FREE_SPIN_JACKPOT_CLAIMS_HOLDER) as { amount: number } | undefined)?.amount ?? 0) : 0;
-    const balances = table("ether_balances")
+    const actual = this.holderBalance(FREE_SPIN_JACKPOT_CLAIMS_HOLDER);
+    const balances = this.hasTable("ether_balances")
       ? (this.db.prepare("SELECT user_id, amount FROM ether_balances WHERE amount > 0 ORDER BY user_id").all() as Array<{ user_id: string; amount: number }>) : [];
     const candidates = balances.filter((r) => isPlayerHolder(r.user_id)).map((r) => ({ userId: r.user_id, chips: r.amount, requiredLand: r.amount }));
     const legacyNames = ["casino_tables", "casino_markets", "casino_market_bets", "casino_escrow", "casino_tx", "casino_tx_groups", "casino_house_reservations"];
     const legacyTables = Object.fromEntries(legacyNames.map((name) => [name, count(name)]));
     const protectedData = this.protectedDataFingerprint();
     const protectedRows = Object.fromEntries(Object.entries(protectedData).map(([name, value]) => [name, value.rows]));
+    const protectedFindings = this.protectedFindings();
     const activeEscrowRows = count("casino_escrow");
     const oldReserveLand = this.ledger.balanceOf(ETHER_ESCROW);
     const departmentLandBefore = this.ledger.balanceOf(CASINO_DEPARTMENT);
@@ -140,6 +157,10 @@ export class CasinoOpeningReset {
     if (expected !== actual) blockers.push(`無料スピンJP請求不一致: expected ${expected}, actual ${actual}`);
     if (activeEscrowRows) blockers.push(`active escrow rows: ${activeEscrowRows}`);
     if (candidates.length) blockers.push(`chip compensation candidates: ${candidates.length}, required Land ${candidates.reduce((s, x) => s + x.requiredLand, 0)}`);
+    if (protectedFindings.activeVip.length) blockers.push(`active VIP compensation candidates: ${protectedFindings.activeVip.length}`);
+    if (protectedFindings.stockHoldings.length) blockers.push(`stock holding compensation candidates: ${protectedFindings.stockHoldings.length}`);
+    if (protectedFindings.casinoStats.length) blockers.push(`casino stats preservation candidates: ${protectedFindings.casinoStats.length}`);
+    if (protectedFindings.quarantineChips > 0) blockers.push(`quarantine assets require manual attribution: ${protectedFindings.quarantineChips}`);
     for (const [name, rows] of Object.entries(legacyTables)) if (rows && name !== "casino_tx" && name !== "casino_tx_groups") blockers.push(`legacy ${name}: ${rows}`);
     if (oldReserveLand < configuration.casinoOpeningCapital) blockers.push(`casino department source insufficient: ${oldReserveLand}/${configuration.casinoOpeningCapital}`);
     const unsigned = {
@@ -152,6 +173,7 @@ export class CasinoOpeningReset {
       playerLand,
       protectedRows,
       protectedData,
+      protectedFindings,
       compensation: { candidates, requiredLand: candidates.reduce((s, x) => s + x.requiredLand, 0) },
       legacyTables,
       configuration,
@@ -173,16 +195,18 @@ export class CasinoOpeningReset {
       throw new Error("opening reset status must be bound to the same database");
     }
 
-    // R1/R3 are outside the mutable reset transaction. They must be read-only with respect to protected data.
+    // R1/R3 are outside the mutable reset transaction. They must not alter preflight inputs.
     const manifest = await input.backup.backup({ db: this.db, planHash: plan.planHash, legacyTables: Object.keys(plan.legacyTables) });
     if (!/^[a-f0-9]{64}$/.test(manifest.sqliteSha256) || manifest.csv.some((x) => !/^[a-f0-9]{64}$/.test(x.sha256))) throw new Error("invalid opening backup manifest");
     await input.discord.disableLegacyCasino();
-    this.assertPreserved(plan.playerLand, plan.protectedData);
+    if (this.dryRun(input.configuration).planHash !== plan.planHash) throw new Error("opening reset plan hash is stale after adapters");
 
     let oldSettlementLandTxId = 0;
     let newInvestmentLandTxId = 0;
-    this.db.transaction(() => {
-      // R4/R5/R6: no active record survived preflight; delete only legacy casino state, never VIP/stocks/quarantine/free-spin claims.
+    const tx = this.db.transaction(() => {
+      // 資金移動と同じIMMEDIATEトランザクション内で最後のstale確認を行う。
+      if (this.dryRun(input.configuration).planHash !== plan.planHash) throw new Error("opening reset plan hash is stale before apply");
+      // R4/R5/R6: no active record survived preflight; delete only legacy casino state.
       for (const name of ["casino_escrow", "casino_tables", "casino_markets", "casino_market_bets", "casino_house_reservations", "casino_tx", "casino_tx_groups"]) {
         if (this.hasTable(name)) this.db.prepare(`DELETE FROM ${quoteIdent(name)}`).run();
       }
@@ -192,7 +216,7 @@ export class CasinoOpeningReset {
       const fresh = this.ledger.transfer({ from: CASINO_DEPARTMENT, to: CHIP_ESCROW, amount: input.configuration.casinoOpeningCapital, type: "ether_house_fund", actor: input.actorId, approvedBy: input.actorId, reason: "casino opening new investment", refType: "casino_opening", refId: plan.planHash, idempotencyKey: `casino-opening:${plan.planHash}:new-investment` });
       oldSettlementLandTxId = old.tx.id;
       newInvestmentLandTxId = fresh.tx.id;
-      // R9/R10: opening_v1 starts with classified operating capital only.
+      // R9/R10: preflight済みの補償対象が0であることを前提に旧残高を初期化する。
       this.db.prepare("DELETE FROM ether_balances").run();
       const put = this.db.prepare("INSERT INTO ether_balances (user_id,amount,updated_at) VALUES (?,?,?)");
       put.run(HOUSE_HOLDER, input.configuration.houseCapital, now());
@@ -202,7 +226,8 @@ export class CasinoOpeningReset {
       this.saveConfiguration(input.configuration, input.actorId);
       this.verifyApplied(input.configuration, plan);
       this.db.prepare("INSERT INTO casino_opening_reset_plans (plan_hash,status,manifest_json,applied_by,applied_at) VALUES (?, 'applied', ?, ?, ?)").run(plan.planHash, JSON.stringify(manifest), input.actorId, now());
-    })();
+    });
+    tx.immediate();
     // R14 is deliberately last. A status transition failure leaves the fully audited reset safely halted.
     if (!input.status.finishOpeningReset(`opening reset completed: ${plan.planHash}`, input.actorId, OPENING_RESET_SEAL).ok) {
       throw new Error("opening reset completed but could not reopen casino");
@@ -214,6 +239,11 @@ export class CasinoOpeningReset {
     return Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name));
   }
 
+  private holderBalance(holderId: string): number {
+    if (!this.hasTable("ether_balances")) return 0;
+    return (this.db.prepare("SELECT amount FROM ether_balances WHERE user_id=?").get(holderId) as { amount: number } | undefined)?.amount ?? 0;
+  }
+
   private tableFingerprint(name: string): OpeningDataFingerprint {
     if (!this.hasTable(name)) return { exists: false, rows: 0, sha256: hash([]) };
     const rows = this.db.prepare(`SELECT * FROM ${quoteIdent(name)}`).all() as Array<Record<string, unknown>>;
@@ -223,6 +253,32 @@ export class CasinoOpeningReset {
 
   private protectedDataFingerprint(): Record<string, OpeningDataFingerprint> {
     return Object.fromEntries(PROTECTED_TABLES.map((name) => [name, this.tableFingerprint(name)]));
+  }
+
+  private protectedFindings(): OpeningProtectedFindings {
+    const activeVip = this.hasTable("casino_vip")
+      ? (this.db.prepare("SELECT user_id, expires_at FROM casino_vip WHERE expires_at > ? ORDER BY user_id").all(now()) as Array<{ user_id: string; expires_at: number }>).map((row) => ({ userId: row.user_id, expiresAt: row.expires_at }))
+      : [];
+    const stockHoldings = this.hasTable("casino_holdings")
+      ? (this.db.prepare("SELECT user_id, stock_id, shares, avg_cost, bought_at FROM casino_holdings WHERE shares > 0 ORDER BY user_id, stock_id").all() as Array<{ user_id: string; stock_id: string; shares: number; avg_cost: number; bought_at: number }>).map((row) => ({ userId: row.user_id, stockId: row.stock_id, shares: row.shares, avgCost: row.avg_cost, boughtAt: row.bought_at }))
+      : [];
+    const casinoStats = this.hasTable("casino_stats")
+      ? (this.db.prepare(`SELECT user_id, games, wins, losses, total_wagered, total_earned, total_lost, biggest_win, best_win_streak
+                         FROM casino_stats
+                         WHERE games > 0 OR total_wagered > 0 OR total_earned > 0 OR total_lost > 0 OR biggest_win > 0 OR best_win_streak > 0
+                         ORDER BY user_id`).all() as Array<{ user_id: string; games: number; wins: number; losses: number; total_wagered: number; total_earned: number; total_lost: number; biggest_win: number; best_win_streak: number }>).map((row) => ({
+          userId: row.user_id,
+          games: row.games,
+          wins: row.wins,
+          losses: row.losses,
+          totalWagered: row.total_wagered,
+          totalEarned: row.total_earned,
+          totalLost: row.total_lost,
+          biggestWin: row.biggest_win,
+          bestWinStreak: row.best_win_streak,
+        }))
+      : [];
+    return { activeVip, stockHoldings, casinoStats, quarantineChips: this.holderBalance(ESCROW_QUARANTINE) };
   }
 
   private playerLandFingerprint(): OpeningPlayerLandFingerprint {
@@ -241,12 +297,8 @@ export class CasinoOpeningReset {
   }
 
   private assertPreserved(playerLandBefore: OpeningPlayerLandFingerprint, protectedBefore: Record<string, OpeningDataFingerprint>): void {
-    if (stable(this.playerLandFingerprint()) !== stable(playerLandBefore)) {
-      throw new Error("opening reset must not change player Land");
-    }
-    if (stable(this.protectedDataFingerprint()) !== stable(protectedBefore)) {
-      throw new Error("opening reset must not change protected casino data");
-    }
+    if (stable(this.playerLandFingerprint()) !== stable(playerLandBefore)) throw new Error("opening reset must not change player Land");
+    if (stable(this.protectedDataFingerprint()) !== stable(protectedBefore)) throw new Error("opening reset must not change protected casino data");
   }
 
   private saveConfiguration(c: CasinoOpeningConfig, actor: string): void {
