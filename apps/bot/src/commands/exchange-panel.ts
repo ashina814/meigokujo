@@ -10,48 +10,45 @@ import {
   TextInputBuilder,
   TextInputStyle,
 } from "discord.js";
-import { EtherError, LedgerError } from "@meigokujo/core";
+import { ChipLedgerError, LedgerError } from "@meigokujo/core";
 import { fmtLd, fmtEther } from "../format.js";
 import { C_MAMMON, E, HR_THIN } from "../casino/ui.js";
 import type { Services } from "../services.js";
 
 /**
- * マモンの両替所（Land⇄エテル 変動為替パネル）。
- * - 入場（Land→エテル）はフェアレート・手数料なし
- * - 退場（エテル→Land）は 20% 奉納（80%着地 / 10%焼却=Landシンク / 10%プール残留）
+ * マモンの両替所（Land⇄賭場チップ）。預入・返還とも常に1:1。
  */
 
 function ratePanel(services: Services): EmbedBuilder {
-  const rate = services.ether.rate();
-  const pool = services.ether.pool();
-  const outstanding = services.ether.outstanding();
+  const pool = services.chips.pool();
+  const outstanding = services.chips.outstanding();
 
   // 直感的にわかる例示 (10,000 Ld で何エテル？ / 10,000 ◈ で何 Ld？)
-  const sampleBuy = services.ether.quoteBuy(10_000);
-  const sampleSell = services.ether.quoteSell(100_000);
+  const sampleBuy = services.chips.quoteDeposit(10_000);
+  const sampleSell = services.chips.quoteRedeem(100_000);
 
   return new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · 両替所" })
-    .setTitle(`${E.jp} 現在レート  1 Ld ＝ ${rate.toFixed(2)} ${E.ether}`)
+    .setTitle(`${E.jp} 賭場チップ  1 Ld ＝ 1 ${E.ether}`)
     .setColor(C_MAMMON)
     .setDescription(
       [
-        "**入場フェア／退場二割奉納**",
-        `　入る側 ${E.win} 手数料ゼロで満額エテル化`,
-        `　出る側 ${E.lose} 20%奉納（80%着地／10%焼却／10%プール残留）`,
+        "**預入・返還は常に1:1**",
+        `　預入 ${E.win} Landと同額のチップを受け取る`,
+        `　返還 ${E.lose} チップと同額のLandを受け取る`,
         "",
         HR_THIN,
         `**目安**`,
         `　${E.up} 入場: 10,000 Ld → **${sampleBuy.output.toLocaleString()} ${E.ether}**`,
-        `　${E.down} 退場: 100,000 ${E.ether} → **${sampleSell.output.toLocaleString()} Ld**（焼却 ${sampleSell.burned.toLocaleString()} Ld）`,
+        `　${E.down} 返還: 100,000 ${E.ether} → **${sampleSell.output.toLocaleString()} Ld**`,
       ].join("\n"),
     )
     .addFields(
       { name: `${E.chart} 準備プール`, value: `${fmtLd(pool)}`, inline: true },
       { name: `${E.chart} 発行エテル`, value: `${outstanding.toLocaleString()} ${E.ether}`, inline: true },
-      { name: `${E.chart} 実効レート`, value: `1 ${E.ether} ≈ ${(1 / Math.max(rate, 0.0001)).toFixed(4)} Ld`, inline: true },
+      { name: `${E.chart} 交換比率`, value: `1 ${E.ether} = 1 Ld`, inline: true },
     )
-    .setFooter({ text: "レートは変動制。他人が退場すると残った人のエテルが少し肥える" });
+    .setFooter({ text: "変動レート・奉納・焼却はありません" });
 }
 
 export function exchangePanelMessage(services: Services) {
@@ -76,9 +73,9 @@ export async function handleEtherButton(interaction: ButtonInteraction, services
 
   if (action === "balance") {
     const uid = interaction.user.id;
-    const ether = services.ether.balanceOf(uid);
+    const ether = services.chips.balanceOf(uid);
     const land = services.ledger.balanceOf(`user:${uid}`);
-    const q = ether > 0 ? services.ether.quoteSell(ether) : null;
+    const q = ether > 0 ? services.chips.quoteRedeem(ether) : null;
     const embed = new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · 財布" })
       .setColor(C_MAMMON)
@@ -89,7 +86,7 @@ export async function handleEtherButton(interaction: ButtonInteraction, services
           ? [
               {
                 name: "💱 今すぐ換金すると",
-                value: `**${fmtLd(q.output)}** 着地（焼却 ${fmtLd(q.burned)}）`,
+                value: `**${fmtLd(q.output)}** を1:1で受け取る`,
                 inline: false,
               },
             ]
@@ -121,7 +118,7 @@ export async function handleEtherButton(interaction: ButtonInteraction, services
   if (action === "sell") {
     const modal = new ModalBuilder()
       .setCustomId("ether:modal:sell")
-      .setTitle("退場: エテル → Land（二割奉納）")
+      .setTitle("返還: 賭場チップ → Land（1:1）")
       .addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(
           new TextInputBuilder()
@@ -149,7 +146,7 @@ export async function handleEtherModal(interaction: ModalSubmitInteraction, serv
 
   try {
     if (mode === "buy") {
-      const q = services.ether.buy(uid, amt, `ether:buy:${interaction.id}`);
+      const q = services.chips.deposit(uid, amt, `chip:deposit:${interaction.id}`);
       const embed = new EmbedBuilder()
         .setAuthor({ name: "マモンの賭場 · 両替所" })
         .setColor(0x22c55e)
@@ -159,28 +156,27 @@ export async function handleEtherModal(interaction: ModalSubmitInteraction, serv
           { name: "受取", value: `**${fmtEther(q.output)}**`, inline: true },
         )
         .setFooter({
-          text: `所持 ${fmtEther(services.ether.balanceOf(uid))} · ${fmtLd(services.ledger.balanceOf(`user:${uid}`))}`,
+          text: `所持 ${fmtEther(services.chips.balanceOf(uid))} · ${fmtLd(services.ledger.balanceOf(`user:${uid}`))}`,
         });
       await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
       return;
     }
-    const q = services.ether.sell(uid, amt, `ether:sell:${interaction.id}`);
+    const q = services.chips.redeem(uid, amt, `chip:redeem:${interaction.id}`);
     const embed = new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · 両替所" })
       .setColor(0x991b1b)
-      .setTitle(`${E.lose} 退場完了（二割奉納済）`)
+      .setTitle(`${E.lose} 返還完了`)
       .addFields(
         { name: "換金", value: `**${fmtEther(amt)}**`, inline: true },
         { name: "着地", value: `**${fmtLd(q.output)}**`, inline: true },
-        { name: "焼却", value: `${fmtLd(q.burned)}`, inline: true },
       )
       .setFooter({
-        text: `所持 ${fmtEther(services.ether.balanceOf(uid))} · ${fmtLd(services.ledger.balanceOf(`user:${uid}`))}`,
+        text: `所持 ${fmtEther(services.chips.balanceOf(uid))} · ${fmtLd(services.ledger.balanceOf(`user:${uid}`))}`,
       });
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   } catch (e) {
     let msg = "処理に失敗した。";
-    if (e instanceof EtherError) {
+    if (e instanceof ChipLedgerError) {
       msg =
         e.code === "ERR_INSUFFICIENT_ETHER"
           ? `エテルが足りない（所持 ${fmtEther(Number(e.meta.held ?? 0))}）。`

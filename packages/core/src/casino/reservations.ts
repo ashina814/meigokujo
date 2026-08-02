@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { EtherExchange } from "./exchange.js";
+import type { ChipLedger } from "./chip-ledger.js";
 import { HOUSE_HOLDER } from "./exchange.js";
 import type { EventLog } from "../events/service.js";
 
@@ -72,7 +72,7 @@ export const RESERVATION_STALE_SEC = 24 * 60 * 60;
 export class HouseReservations {
   constructor(
     private readonly db: Database.Database,
-    private readonly ether: EtherExchange,
+    private readonly ether: ChipLedger,
     private readonly events: EventLog,
   ) {
     this.db.exec(`

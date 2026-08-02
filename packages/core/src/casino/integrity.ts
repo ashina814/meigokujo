@@ -1,9 +1,8 @@
 import type Database from "better-sqlite3";
 import { Ledger, TREASURY } from "../ledger/service.js";
 import { ChipTx } from "./chip-tx.js";
-import { ETHER_ESCROW, ETHER_APPROVER, EtherExchange, POOL_SWEEP_REASON } from "./exchange.js";
+import { ETHER_APPROVER, ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 import { Escrow, ESCROW_QUARANTINE } from "./escrow.js";
-import { HOUSE_HOLDER } from "./exchange.js";
 import { JACKPOT_HOLDER, RELIEF_HOLDER } from "./service.js";
 import { FREE_SPIN_JACKPOT_CLAIMS_HOLDER } from "./free-spins.js";
 
@@ -74,8 +73,8 @@ const SYSTEM_HOLDERS: ReadonlySet<string> = new Set([
 const MAX_MISMATCHES = 20;
 
 /**
- * 準備口座(sys:escrow:ether)を動かしてよい Land 取引の型と形。
- * `EtherExchange` が作る取引はこの表に必ず載る。載らない出入りは1件でも検算Bを NG にする。
+ * 準備口座を動かしてよい Land 取引の型と形。
+ * 旧 EtherExchange と ChipLedger が作る取引はこの表に必ず載る。載らない出入りは1件でも検算Bを NG にする。
  */
 interface PoolTxRule {
   /** 準備口座から見た向き */
@@ -86,8 +85,9 @@ interface PoolTxRule {
   actor?: string;
   /** 冪等キーの末尾（chip グループ名に付く接尾辞） */
   keySuffix?: ":burn" | ":sweep";
-  /** 焼却・回収は理由文まで固定する */
+  /** 旧焼却・回収の理由文制約 */
   reason?: string;
+  /** 冪等キーの末尾（chip グループ名に付く接尾辞） */
 }
 const POOL_TX_RULES: Record<string, PoolTxRule[]> = {
   // 入場（利用者が Land を払ってチップを買う）
@@ -98,11 +98,15 @@ const POOL_TX_RULES: Record<string, PoolTxRule[]> = {
   ether_sell: [{ direction: "out", counterparty: "user" }],
   // 収益精算（準備口座 → 部署などのシステム口座）
   ether_settle: [{ direction: "out", counterparty: "system" }],
-  // 奉納の焼却と、全額返還後の端数回収。どちらも国庫行きで理由文が固定
+  // 旧制度の奉納・端数回収。履歴監査のため正当な旧取引として残す。
   ether_burn: [
     { direction: "out", counterparty: "treasury", keySuffix: ":burn" },
-    { direction: "out", counterparty: "treasury", keySuffix: ":sweep", reason: POOL_SWEEP_REASON },
+    { direction: "out", counterparty: "treasury", keySuffix: ":sweep" },
   ],
+  chip_deposit: [{ direction: "in", counterparty: "user" }],
+  chip_fund: [{ direction: "in", counterparty: "system", actor: ETHER_APPROVER }],
+  chip_redeem: [{ direction: "out", counterparty: "user" }],
+  chip_settle: [{ direction: "out", counterparty: "system" }],
 };
 
 interface PoolTxRow {
@@ -124,7 +128,7 @@ export class CasinoIntegrity {
   constructor(
     private readonly db: Database.Database,
     private readonly ledger: Ledger,
-    private readonly ether: EtherExchange,
+    private readonly ether: ChipLedger,
     private readonly escrow: Escrow,
   ) {
     this.chipTx = ether.chipTx;
@@ -245,14 +249,14 @@ export class CasinoIntegrity {
         mismatches.push({ subject: `tx#${row.id}`, expected: 0, actual: row.amount, note: problem });
         continue;
       }
-      if (row.to_account === ETHER_ESCROW) inflow += row.amount;
+      if (row.to_account === this.ether.reserveHolder()) inflow += row.amount;
       else outflow += row.amount;
     }
 
     const actual = this.ether.pool();
     const expected = baseline.poolLand + inflow - outflow;
     if (expected !== actual) {
-      mismatches.push({ subject: ETHER_ESCROW, expected, actual, note: "balance_mismatch" });
+      mismatches.push({ subject: this.ether.reserveHolder(), expected, actual, note: "balance_mismatch" });
     }
     const ok = mismatches.length === 0;
     return {
@@ -283,7 +287,8 @@ export class CasinoIntegrity {
         WHERE (from_account = ? OR to_account = ?) AND id > ?` +
       (upperBound === null ? "" : " AND id <= ?") +
       " ORDER BY id";
-    const params: unknown[] = [ETHER_ESCROW, ETHER_ESCROW, fromLedgerTxId];
+    const reserve = this.ether.reserveHolder();
+    const params: unknown[] = [reserve, reserve, fromLedgerTxId];
     if (upperBound !== null) params.push(upperBound);
     return this.db.prepare(sql).all(...params) as PoolTxRow[];
   }
@@ -292,7 +297,7 @@ export class CasinoIntegrity {
   private classifyPoolTx(row: PoolTxRow, version: string): string | null {
     const rules = POOL_TX_RULES[row.type];
     if (!rules) return `unknown_type:${row.type}`;
-    const direction: "in" | "out" = row.to_account === ETHER_ESCROW ? "in" : "out";
+    const direction: "in" | "out" = row.to_account === this.ether.reserveHolder() ? "in" : "out";
     // 準備口座から準備口座への自己送金は Ledger 側が弾くが、念のため
     if (row.from_account === row.to_account) return "self_transfer";
 

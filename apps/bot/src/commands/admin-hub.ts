@@ -26,7 +26,7 @@ import {
 import {
   CasinoIntegrity,
   deptAccount,
-  EtherError,
+  ChipLedgerError as EtherError,
   HOUSE_HOLDER,
   LedgerError,
   recoverCasino,
@@ -1985,7 +1985,7 @@ function casinoHome(services: Services) {
         "",
         `**胴元残高**: ${fmtEther(casino.houseBalance())} （テーブルリミットの原資）`,
         `**ジャックポット積立**: ${fmtEther(casino.jackpotPool())}`,
-        `**為替レート**: 1 Ld = ${ether.rate().toFixed(2)} ◈`,
+        `**チップ交換比率**: 1 Ld = 1 ◈`,
         `**準備プール**: ${fmtLd(ether.pool())} ／ **発行エテル**: ${fmtEther(ether.outstanding())}`,
         "",
         dept

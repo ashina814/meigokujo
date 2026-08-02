@@ -41,7 +41,6 @@ function renderHome(userId: string, services: Services, serverName?: string) {
   const daily = services.daily;
   const heldEther = ether.balanceOf(userId);
   const heldLand = services.ledger.balanceOf(`user:${userId}`);
-  const rate = ether.rate();
   const jp = services.casino.jackpotPool();
   const houseBal = services.casino.houseBalance();
   const pool = ether.pool();
@@ -76,7 +75,7 @@ function renderHome(userId: string, services: Services, serverName?: string) {
     .join("\n");
 
   const marketValue = [
-    `**1 Ld = ${rate.toFixed(2)} ${E.ether}**   （準備 ${pool.toLocaleString()} Ld ／ 発行 ${outstanding.toLocaleString()} ${E.ether}）`,
+    `**1 Ld = 1 ${E.ether}**   （準備 ${pool.toLocaleString()} Ld ／ 発行 ${outstanding.toLocaleString()} ${E.ether}）`,
     `${E.jp} JPプール **${fmtEther(jp)}**`,
     `胴元残 ${fmtEther(houseBal)}`,
   ].join("\n");
@@ -113,7 +112,7 @@ function renderHome(userId: string, services: Services, serverName?: string) {
     `🏅 \`/賭場番付\` — Top10（残高/勝率/最大単勝/連勝など）`,
     `${HR_THIN}`,
     `${E.ether} エテル ⇄ Land はマモンの両替所パネルで`,
-    `　入場フェア／退場は **二割奉納**（80%着地・10%焼却・10%プール残留）`,
+    `　預入・返還は **1:1**（変動レート・奉納・焼却なし）`,
   ].join("\n");
 
   const embed = new EmbedBuilder()

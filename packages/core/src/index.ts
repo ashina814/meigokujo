@@ -155,18 +155,19 @@ export {
   type FiscalErrorCode,
 } from "./fiscal/service.js";
 export {
+  ChipLedger,
+  ChipLedgerError,
+  /** @deprecated compatibility export; use ChipLedger. */
   EtherExchange,
-  EtherError,
+  CHIP_ESCROW,
   ETHER_ESCROW,
   HOUSE_HOLDER,
-  POOL_SWEEP_REASON,
   ETHER_APPROVER,
   isPlayerHolder,
-  type EtherQuote,
-  type EtherErrorCode,
-  type EtherExchangeOptions,
+  type ChipQuote,
+  type ChipLedgerOptions,
   type ChipMoveInfo,
-} from "./casino/exchange.js";
+} from "./casino/chip-ledger.js";
 export {
   ChipTx,
   ChipTxError,

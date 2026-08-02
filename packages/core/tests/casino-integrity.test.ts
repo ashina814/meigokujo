@@ -266,20 +266,20 @@ describe("検算B（経路監査）", () => {
     ctx.db.close();
   });
 
-  it("版を切り替えたら、旧版の端数回収を新版で二重計上しない", () => {
+  it("版を切り替えても、1:1全額返還は旧制度の端数回収を作らない", () => {
     const ctx = setup();
     ctx.chipTx.captureLegacyOpening({
       poolLand: ctx.ledger.balanceOf(ETHER_ESCROW),
       fromLedgerTxId: ctx.ledger.lastTransactionId(),
     });
     fundUser(ctx, "alice", 5_000);
-    // 全額返還 → 端数回収がここで起きる（旧版の窓の中）
+    // 全額返還しても端数回収は発生しない
     ctx.ether.sell("alice", ctx.ether.balanceOf("alice"), "sell:all");
     expect(ctx.ether.pool()).toBe(0);
     const sweeps = ctx.db
       .prepare("SELECT COUNT(*) AS c FROM transactions WHERE reason = ?")
       .get(POOL_SWEEP_REASON) as { c: number };
-    expect(sweeps.c).toBeGreaterThan(0);
+    expect(sweeps.c).toBe(0);
 
     // 新版へ切替（新しい Land 境界を置く）
     ctx.chipTx.captureOpening("opening_v1", [], {
@@ -288,7 +288,7 @@ describe("検算B（経路監査）", () => {
     });
     expect(ctx.chipTx.currentVersion()).toBe("opening_v1");
 
-    // 新版では旧版の回収を数えないので、そのままでも通る
+    // 新版では旧制度の取引を数えないので、そのままでも通る
     expect(ctx.integrity.checkB().ok).toBe(true);
     // 旧版側も自分の窓だけで完結している
     ctx.db.close();

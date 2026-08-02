@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
-import { EtherExchange, HOUSE_HOLDER } from "./exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 
 /**
  * マモンの賭場 VIP会員（月額エテル制）。casino-bot /vip のシンプル版。
@@ -29,7 +29,7 @@ export class Vip {
 
   constructor(
     private readonly db: Database.Database,
-    private readonly ether: EtherExchange,
+    private readonly ether: ChipLedger,
     private readonly events: EventLog,
     options: VipOptions = {},
   ) {

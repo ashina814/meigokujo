@@ -379,7 +379,6 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
   const reliefPool = services.ether.balanceOf("relief");
   const etherOutstanding = services.ether.outstanding();
   const reservePool = services.ether.pool();
-  const etherRate = services.ether.rate();
   const escrowRows = services.db.prepare("SELECT COALESCE(SUM(amount),0) AS s, COUNT(*) AS c FROM casino_escrow").get() as { s: number; c: number };
   // 稼働状態と検算A〜D（PR2）。停止していれば理由をそのまま出す
   const casinoStatus = services.casinoStatus.current();
@@ -392,7 +391,7 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
       ? "全点検（Land台帳 + 検算A〜D）: 正常"
       : `⚠️ 点検NG: ${[...(integrity.ledger.ok ? [] : ["Land台帳"]), ...failedChecks.map((c) => `${c.id}(${c.name})`)].join(" / ")}`,
     `胴元: **${fmtE(housePool)}** / JP: ${fmtE(jpPool)} / 救済: ${fmtE(reliefPool)}`,
-    `発行エテル: ${fmtE(etherOutstanding)} ⇄ 準備Land: ${fmtLd(reservePool)}（1Ld=${etherRate.toFixed(2)}◈）`,
+    `発行エテル: ${fmtE(etherOutstanding)} ⇄ 準備Land: ${fmtLd(reservePool)}（1Ld=1◈）`,
     escrowRows.c > 0 ? `進行中の卓の預かり: ${fmtE(escrowRows.s)}（${escrowRows.c}口）` : "進行中の卓の預かり: なし",
   ].join("\n");
 
