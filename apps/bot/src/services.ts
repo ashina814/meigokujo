@@ -97,7 +97,8 @@ export function buildServices() {
   });
   // 賭場の取引監査。全サービスで同じインスタンスを共有する（実行中グループを共有するため）
   const chipTx = new ChipTx(db);
-  const chips = new ChipLedger(db, ledger, events, { chipTx });
+  // 正式開業前の1:1資金操作は、実行環境名に依存させず本番配線で必ず拒否する。
+  const chips = new ChipLedger(db, ledger, events, { chipTx, requireOpeningV1: true });
   // 監査の出発点。導入時のチップ残高と、Land 側の基準（準備プール残高＋境界取引ID）を
   // 一度だけ記録する。ここで基準を持てるのは「まだ何も動いていない」新規DBだけで、
   // すでに版がある既存DBは運営卓の「検算Bの基準を確定」から明示的に置く
@@ -225,4 +226,3 @@ function logRecovery(r: ReturnType<typeof recoverCasino>): void {
     );
   }
 }
-
