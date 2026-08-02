@@ -17,7 +17,16 @@ import {
 } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
+import {
+  MIN_BET,
+  acquireSeat,
+  effectiveMaxBet,
+  handleRetryPress,
+  releaseSeat,
+  sleep,
+  validateBet,
+  withHouseReservation,
+} from "./common.js";
 import { C_MAMMON, C_WIN } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -90,7 +99,7 @@ export async function playCrash(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT_CAP);
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT_CAP, "クラッシュ");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -107,10 +116,25 @@ export async function playCrash(
   }
 }
 
+/**
+ * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
+ * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
+ */
 async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+): Promise<void> {
+  await withHouseReservation(interaction, services, "クラッシュ", bet, interaction.id, (reservationKey) =>
+    runRoundInner(interaction, services, bet, reservationKey),
+  );
+}
+
+async function runRoundInner(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+  bet: number,
+  reservationKey: string,
 ): Promise<void> {
   const uid = interaction.user.id;
   const crashPoint = generateCrashPoint(services.rng);
@@ -246,7 +270,7 @@ async function runRound(
     // 連鎖ボーナスは無効化（1.5倍固定戦略 × 高勝率で 100% 超になる裁定を防ぐ・PR#6 レビュー指摘）。
     // 福の重みは維持（低残高帯では 0% なので影響なし・高残高帯ではプレイヤーから JP/救済へ流す）。
     // お守りの消費も賭け・配当と同じグループの中（settleSolo）
-    const settled = services.casino.settleSolo(uid, "クラッシュ", bet, rawPayout, { chain: false, operationId: interaction.id });
+    const settled = services.casino.settleSolo(uid, "クラッシュ", bet, rawPayout, { chain: false, operationId: interaction.id, reservationKey });
     const amulet = { note: settled.amuletNote };
     const netStr = `+${settled.net.toLocaleString("ja-JP")} ◈`;
     const bigWin = settled.net >= bet * 5;
@@ -275,7 +299,7 @@ async function runRound(
   } else {
     const lossSettled = services.casino.settleSolo(uid, "クラッシュ", bet, 0, {
       chain: false,
-      operationId: interaction.id,
+      operationId: interaction.id, reservationKey,
     });
     const lossAmulet = { payout: lossSettled.payout, note: lossSettled.amuletNote };
     const savedByAmulet = lossAmulet.payout > 0;

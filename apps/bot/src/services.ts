@@ -29,6 +29,7 @@ import {
   isHumanHeld,
   isPlayerHolder,
   FreeSpins,
+  HouseReservations,
   Daily,
   Items,
   Stocks,
@@ -113,9 +114,12 @@ export function buildServices() {
   const items = new Items(db);
   // 獲得済みフリースピンの保留台帳（PR3）。有料スピンの確定と同じトランザクションで積む
   const freeSpins = new FreeSpins(db);
+  // 胴元債務予約（PR5）。canAccept が見るのは house 残高ではなく「残高 − 予約合計」になる
+  const reservations = new HouseReservations(db, ether, events);
   const casino = new Casino(db, ether, events, {
     fukuScale: () => settings.getNumber("ether_fuku_scale"),
     items,
+    reservations,
   });
   const daily = new Daily(db, ether, events, {
     base: () => settings.getNumber("daily_base"),
@@ -140,10 +144,10 @@ export function buildServices() {
   const takutate = new Takutate(db, events);
   const casinoIntegrity = new CasinoIntegrity(db, ledger, ether, escrow);
   // 起動時: 全点検 → 通ったときだけ掃除 → 掃除後にもう一度全点検 → 開ける
-  runCasinoStartup(casinoStatus, casinoIntegrity, chipTx, events, () => sweepCasinoOnBoot(markets, escrow));
+  runCasinoStartup(casinoStatus, casinoIntegrity, chipTx, events, () => sweepCasinoOnBoot(markets, escrow, reservations));
   // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;
@@ -152,7 +156,13 @@ export function buildServices() {
 export type Services = ReturnType<typeof buildServices>;
 
 /** 起動時の掃除（未精算の板とエスクローの返金）。`runMaintenance` の中からだけ呼ばれる */
-function sweepCasinoOnBoot(markets: Markets, escrow: Escrow): void {
+function sweepCasinoOnBoot(markets: Markets, escrow: Escrow, reservations: HouseReservations): void {
+  // ソロゲームの債務予約を全解放（正本 §8.2 S9）。ソロの進行はプロセス内状態なので、
+  // 再起動後に進行中のものは存在しない。件数と総額は releaseAll が events へ残す
+  const released = reservations.releaseAll("bot 起動");
+  if (released.count > 0) {
+    console.log(`[casino] 起動時に胴元債務予約 ${released.count}件（計 ${released.total.toLocaleString("ja-JP")}◈）を解放`);
+  }
   const marketSweep = markets.refundAllPending("system:startup");
   if (marketSweep.refunded > 0) {
     console.log(`[market] 起動時に未精算板 ${marketSweep.refunded}/${marketSweep.total}件 を返金＆void 化`);

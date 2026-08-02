@@ -1,9 +1,19 @@
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   EmbedBuilder,
   MessageFlags,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
 } from "discord.js";
+import {
+  blackjackNoDoubleLiability,
+  liabilityModelFor,
+  soloGroupKey,
+  type GameLiabilityModel,
+  type LiabilityContext,
+} from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
@@ -12,10 +22,35 @@ import { C_BIGWIN, C_LOSE, C_MAMMON, C_PUSH, C_WIN, E, fmtBigDelta } from "./ui.
 export const MIN_BET = 50;
 export const MAX_BET = 1_000_000;
 
-/** VIP なら賭け上限倍率を掛ける。ゲーム側は effectiveMaxBet(services, userId) で判定 */
-export function effectiveMaxBet(services: Services, userId: string): number {
-  if (services.vip.isVip(userId)) return MAX_BET * services.vip.betCapMult();
+/** 設定上の賭け上限（VIP なら倍率を掛ける）。胴元の余力は見ない */
+export function configuredMaxBet(services: Services, userId: string): number {
+  if (services.vip.isVip(userId)) return Math.floor(MAX_BET * services.vip.betCapMult());
   return MAX_BET;
+}
+
+/**
+ * その利用者・そのゲームで**いま表示してよい**賭け上限（正本 §11.3）。
+ *
+ * ```text
+ * min( 設定上限（VIPなら×2）, gameModel.maxBetFor(house.available, ctx) )
+ * ```
+ *
+ * `house.available` は「胴元残高 − 予約済み債務」。ゲームを指定しない呼び出しでは
+ * 設定上限だけを返す（リトライ判定など、ゲーム固有の倍率を持たない場所）。
+ */
+export function effectiveMaxBet(services: Services, userId: string, game?: string): number {
+  const cap = configuredMaxBet(services, userId);
+  const model = game ? liabilityModelFor(game) : undefined;
+  if (!model) return cap;
+  return Math.min(cap, model.maxBetFor(services.casino.availableForLiability(), liabilityCtx(services, userId)));
+}
+
+/** 債務モデルへ渡す文脈（連勝数と装備中お守りの上限） */
+export function liabilityCtx(services: Services, userId: string): Omit<LiabilityContext, "bet"> {
+  return {
+    playerState: { winStreak: services.casino.stats(userId).current_win_streak },
+    activeEffects: { winBonusCap: services.items.armedWinBonusCap(userId) },
+  };
 }
 
 /** 同時プレイ防止（1人1卓）。プロセス内ロックで足りる（bot は単一プロセス） */
@@ -47,9 +82,11 @@ export async function validateBet(
   services: Services,
   betRaw: number,
   maxPayout: number,
+  /** 債務モデルを持つゲーム名。渡すと上限提示が予約込みの余力から出る */
+  game?: string,
 ): Promise<BetCheck> {
   const bet = Math.floor(betRaw);
-  const cap = effectiveMaxBet(services, interaction.user.id);
+  const cap = configuredMaxBet(services, interaction.user.id);
   // 保留中の無料スピンを先に通知した場合、ここは2通目になる。
   // 未応答 interaction には reply、応答済み／defer 済みなら followUp を使う。
   const respond = (payload: Parameters<typeof interaction.reply>[0]) =>
@@ -70,21 +107,208 @@ export async function validateBet(
     return { ok: false, bet };
   }
   if (!services.casino.canAccept(maxPayout)) {
-    // 胴元が最悪ケースの配当を払えない。今の胴元残高で受けられる上限を教える
+    // 胴元が最悪ケースの配当を払えない。**押し直せば必ず通る金額**を提示して戻す（正本 §5.4 ③）
     const multiplier = maxPayout / bet;
-    const maxAcceptable = Math.floor(services.casino.houseBalance() / multiplier);
-    await respond({
-      content: [
-        Mammon.tableClosed(),
-        maxAcceptable >= MIN_BET
-          ? `（この卓で今受けられるのは **${maxAcceptable.toLocaleString()} ◈** まで）`
-          : "（胴元の資金が尽きている。運営: /管理 → 賭場 → 資金投入）",
-      ].join("\n"),
-      flags: MessageFlags.Ephemeral,
-    });
+    const maxAcceptable = game
+      ? effectiveMaxBet(services, interaction.user.id, game)
+      : Math.floor(services.casino.availableForLiability() / multiplier);
+    await respond({ ...capacityRecoveryPayload(services, maxAcceptable, game), flags: MessageFlags.Ephemeral });
     return { ok: false, bet };
   }
   return { ok: true, bet };
+}
+
+/**
+ * 「いま受けられる額」を提示する画面（正本 §5.4 ③）。
+ *
+ * 「卓が閉じている」で終わらせない。押せば必ず通る額のボタンを出して、次の一手を必ず提示する。
+ * ボタンは `casino:play:<ゲーム>:<額>` で、コレクタではなく**全体のボタン経路**が拾う
+ * （コレクタだと、この返信が別メッセージなので誰も拾えない）。
+ */
+export function capacityRecoveryPayload(
+  services: Services,
+  maxAcceptable: number,
+  game?: string,
+): { content: string; components: ActionRowBuilder<ButtonBuilder>[] } {
+  if (maxAcceptable < MIN_BET) {
+    return {
+      content: [Mammon.tableClosed(), "（胴元の資金が尽きている。運営: /管理 → 賭場 → 資金投入）"].join("\n"),
+      components: [],
+    };
+  }
+  const content = [
+    `⚠️ いまこの卓で受けられるのは **${maxAcceptable.toLocaleString()} ◈** まで。`,
+    "（他の客が大きく張っている。下のどれかなら必ず通る）",
+  ].join("\n");
+  if (!game) return { content, components: [] };
+
+  // 上限・半分・最低。重複と MIN_BET 未満は落とす
+  const candidates = [maxAcceptable, Math.floor(maxAcceptable / 2), MIN_BET]
+    .map((v) => Math.floor(v))
+    .filter((v) => v >= MIN_BET);
+  const amounts = [...new Set(candidates)].slice(0, 3);
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    ...amounts.map((amount, i) =>
+      new ButtonBuilder()
+        .setCustomId(`casino:play:${game}:${amount}`)
+        .setLabel(`${amount.toLocaleString()} で遊ぶ`)
+        .setStyle(i === 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    ),
+  );
+  return { content, components: [row] };
+}
+
+/** 予約が取れなかったときに投げる（グループごと巻き戻して金を1 Ld も動かさない） */
+export class HouseCapacityError extends Error {
+  constructor(
+    readonly game: string,
+    readonly needed: number,
+    readonly available: number,
+  ) {
+    super(`ERR_HOUSE_CAPACITY: ${game} に必要な ${needed} に対して余力 ${available}`);
+    this.name = "HouseCapacityError";
+  }
+}
+
+/** ソロゲーム1回ぶんの予約鍵。精算の業務グループ鍵と同じ文字列を使う */
+export function reservationKeyFor(game: string, userId: string, operationId: string): string {
+  return soloGroupKey(game, userId, operationId);
+}
+
+/**
+ * ゲーム開始時に最悪ケースの債務を予約する（正本 §11.2）。
+ *
+ * 予約と `available()` の再確認は同一トランザクション。取れなければ
+ * {@link HouseCapacityError} を投げ、呼び出し側が「押せる金額」を出す。
+ * 精算が通れば `Casino.settle` が**同じトランザクションの中で**解放し、
+ * 中止・例外の場合は呼び出し側の `finally` が解放する。
+ */
+export function reserveHouseLiability(
+  services: Services,
+  game: string,
+  userId: string,
+  bet: number,
+  operationId: string,
+): { key: string; amount: number } {
+  const model: GameLiabilityModel | undefined = liabilityModelFor(game);
+  const key = reservationKeyFor(game, userId, operationId);
+  if (!model) return { key, amount: 0 };
+  const amount = model.maxHouseLiability({ ...liabilityCtx(services, userId), bet });
+  const r = services.reservations.reserve(key, amount, game, userId);
+  if (!r.ok) throw new HouseCapacityError(game, amount, r.available);
+  return { key, amount };
+}
+
+/**
+ * スロット1回ぶんの予約（有料スピン + 最大1回のフリースピン）。
+ *
+ * フリースピンは賭け金を取らないので、胴元は配当を丸ごと持ち出す（賭け額の回収が無い）。
+ * 有料ぶんの債務に `bet` を足すとちょうどフリースピン1回ぶんの最悪ケースになる。
+ * 原作準拠でフリースピン中はさらなるフリースピンが出ないので、多くても1回。
+ */
+export function reserveSlotsLiability(
+  services: Services,
+  userId: string,
+  bet: number,
+  interactionId: string,
+): { key: string; amount: number } {
+  const model = liabilityModelFor("スロット");
+  const key = `slots:reserve:${userId}:${interactionId}`;
+  if (!model) return { key, amount: 0 };
+  const paid = model.maxHouseLiability({ ...liabilityCtx(services, userId), bet });
+  const amount = paid + (paid + bet);
+  const r = services.reservations.reserve(key, amount, "スロット", userId);
+  if (!r.ok) throw new HouseCapacityError("スロット", amount, r.available);
+  return { key, amount };
+}
+
+/**
+ * ブラックジャックの段階予約（PR5 受入条件）。
+ *
+ * まずダブル込みの最悪ケースで取りにいき、余力が足りなければ**ダブル無しの額**で取り直す。
+ * こうすると「胴元が細っているときはダブルボタンだけ無効になり、手そのものは続けられる」。
+ * 手ごと断ると、ダブルするつもりのなかった客まで遊べなくなる。
+ */
+export function reserveBlackjackLiability(
+  services: Services,
+  userId: string,
+  bet: number,
+  operationId: string,
+): { key: string; amount: number; doubleAllowed: boolean } {
+  const key = reservationKeyFor("ブラックジャック", userId, operationId);
+  const ctx = liabilityCtx(services, userId);
+  const withDouble = liabilityModelFor("ブラックジャック")?.maxHouseLiability({ ...ctx, bet }) ?? 0;
+  const full = services.reservations.reserve(key, withDouble, "ブラックジャック", userId);
+  if (full.ok) return { key, amount: withDouble, doubleAllowed: true };
+
+  const noDouble = blackjackNoDoubleLiability.maxHouseLiability({ ...ctx, bet });
+  const fallback = services.reservations.reserve(key, noDouble, "ブラックジャック", userId);
+  if (fallback.ok) return { key, amount: noDouble, doubleAllowed: false };
+  throw new HouseCapacityError("ブラックジャック", noDouble, fallback.available);
+}
+
+/** 予約を解放する（中止・例外の後始末。精算が通っていれば既に消えている） */
+export function releaseHouseLiability(services: Services, key: string): void {
+  services.reservations.release(key);
+}
+
+/**
+ * 「開始時に予約 → 本体 → 必ず解放」を1箇所にまとめる（正本 §11.2 のライフサイクル）。
+ *
+ * 予約が取れなければ本体を**一度も呼ばず**、押せる金額を提示して `undefined` を返す。
+ * 金は1 Ld も動かない（本体に入っていないので当然）。
+ * 精算が通れば `Casino.settle` が同じトランザクションで解放し、
+ * 中止・例外でもここの `finally` が解放する。
+ */
+export async function withHouseReservation<T>(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+  game: string,
+  bet: number,
+  operationId: string,
+  body: (reservationKey: string) => Promise<T>,
+): Promise<T | undefined> {
+  return withExplicitHouseReservation(
+    interaction,
+    services,
+    game,
+    (uid) => reserveHouseLiability(services, game, uid, bet, operationId),
+    body,
+  );
+}
+
+/**
+ * 予約額と鍵を呼び出し側が決める版。
+ *
+ * スロットのように「1回の操作で複数スピンぶんの債務を負う」ゲームで使う。
+ * 鍵を精算グループ鍵と別にしておくと `Casino.settle` が途中で解放しないので、
+ * フリースピンまで含めた区間を1つの予約で押さえられる。
+ */
+export async function withExplicitHouseReservation<T>(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+  game: string,
+  take: (userId: string) => { key: string; amount: number },
+  body: (reservationKey: string) => Promise<T>,
+): Promise<T | undefined> {
+  let reserved: { key: string; amount: number };
+  try {
+    reserved = take(interaction.user.id);
+  } catch (e) {
+    if (!(e instanceof HouseCapacityError)) throw e;
+    const payload = {
+      ...capacityRecoveryPayload(services, effectiveMaxBet(services, interaction.user.id, game), game),
+      flags: MessageFlags.Ephemeral as const,
+    };
+    if (interaction.replied || interaction.deferred) await interaction.followUp(payload);
+    else await interaction.reply(payload);
+    return undefined;
+  }
+  try {
+    return await body(reserved.key);
+  } finally {
+    releaseHouseLiability(services, reserved.key);
+  }
 }
 
 /** リトライ操作を受け付けなかった理由（`checkRetry` の返り値） */

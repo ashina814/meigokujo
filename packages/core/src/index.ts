@@ -185,6 +185,7 @@ export {
   JACKPOT_HOLDER,
   RELIEF_HOLDER,
   CHAIN_TIERS,
+  soloGroupKey,
   chainMultiplier,
   fukuRate,
   type CasinoStatsRow,
@@ -345,3 +346,10 @@ export {
   type ChainMode,
   type RouletteBet,
 } from "./casino/liability.js";
+
+export {
+  HouseReservations,
+  RESERVATION_STALE_SEC,
+  type ReservationRow,
+  type ReservationResult,
+} from "./casino/reservations.js";

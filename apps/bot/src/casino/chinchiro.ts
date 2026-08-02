@@ -28,7 +28,16 @@ import {
 } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
+import {
+  MIN_BET,
+  acquireSeat,
+  effectiveMaxBet,
+  handleRetryPress,
+  releaseSeat,
+  sleep,
+  validateBet,
+  withHouseReservation,
+} from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -96,6 +105,8 @@ export function settleChinchiroRound(
   bet: number,
   mul: number,
   operationId: string,
+  /** 胴元債務予約の鍵（PR5）。精算が通った時点で同じトランザクション内で解放される */
+  reservationKey?: string,
 ): ChinchiroRound {
   return services.ether.runGroup(
     { groupKey: `chinchiro:round:${uid}:${operationId}`, kind: "solo_game", actorId: uid },
@@ -104,18 +115,18 @@ export function settleChinchiroRound(
       if (mul > 0) {
         // 勝ち: profit = bet * mul * (1 - edge)、payout = bet + profit
         const rawPayout = chinchiroPayout(bet, mul);
-        const settled = services.casino.settleSolo(uid, "チンチロ", bet, rawPayout, { operationId });
+        const settled = services.casino.settleSolo(uid, "チンチロ", bet, rawPayout, { operationId, reservationKey });
         return { branch: "win", settled, amuletNote: settled.amuletNote ?? null, extra: 0 };
       }
       if (mul === 0) {
         // プッシュ（両方ヒフミ）: 返金
-        const settled = services.casino.settleSolo(uid, "チンチロ", bet, bet, { operationId });
+        const settled = services.casino.settleSolo(uid, "チンチロ", bet, bet, { operationId, reservationKey });
         return { branch: "push", settled, amuletNote: settled.amuletNote ?? null, extra: 0 };
       }
       const extraNeeded = mul <= -2 ? (Math.abs(mul) - 1) * bet : 0;
       // 倍付け負けは追加徴収まで払えるときだけ。払えなければ通常負けへフォールバック
       const doubleLoss = extraNeeded > 0 && held >= bet + extraNeeded;
-      const settled = services.casino.settleSolo(uid, "チンチロ", bet, 0, { operationId });
+      const settled = services.casino.settleSolo(uid, "チンチロ", bet, 0, { operationId, reservationKey });
       if (doubleLoss) {
         services.ether.transfer(uid, HOUSE_HOLDER, extraNeeded, { reason: "倍付け負けの追加徴収", game: "チンチロ" });
         return { branch: "double_loss", settled, amuletNote: settled.amuletNote ?? null, extra: extraNeeded };
@@ -189,7 +200,7 @@ export async function playChinchiro(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT);
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT, "チンチロ");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -206,10 +217,25 @@ export async function playChinchiro(
   }
 }
 
+/**
+ * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
+ * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
+ */
 async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+): Promise<void> {
+  await withHouseReservation(interaction, services, "チンチロ", bet, interaction.id, (reservationKey) =>
+    runRoundInner(interaction, services, bet, reservationKey),
+  );
+}
+
+async function runRoundInner(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+  bet: number,
+  reservationKey: string,
 ): Promise<void> {
   const uid = interaction.user.id;
   const startEmbed = new EmbedBuilder()
@@ -393,7 +419,7 @@ async function runRound(
   // ── 精算 ──
   const cmp = compare(playerHand, dealerHand);
   const mul = cmp.mul;
-  const round = settleChinchiroRound(services, uid, bet, mul, interaction.id);
+  const round = settleChinchiroRound(services, uid, bet, mul, interaction.id, reservationKey);
 
   let payoutText = "";
   const title = "🎲 チンチロ — 対 マモン";
