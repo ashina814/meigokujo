@@ -325,10 +325,10 @@ describe("債務予約の解放（S9）と再開（S12）", () => {
 
     const r = run(ctx);
 
-    // 営業を再開しない
+    // 営業を再開しない。**通常の検算停止とは別の状態**にする
     expect(r.outcome).toBe("source_failed");
     expect(ctx.status.current().status).not.toBe("open");
-    expect(ctx.status.current().status).toBe("integrity_halt");
+    expect(ctx.status.current().status).toBe("recovery_halt");
     // S12 は実行していない
     expect(r.steps).not.toContain("S12:再開");
     expect(r.steps).not.toContain("S9:予約解放");
@@ -407,6 +407,111 @@ describe("孤児返金の技術失敗が結果に残る", () => {
     expect(logged).toHaveLength(1);
     expect(logged[0]!.payload_json).toContain("卓:壊れる");
     expect(logged[0]!.payload_json).toContain("送金に失敗した");
+    ctx.db.close();
+  });
+});
+
+/**
+ * レビュー指摘: source 取得失敗は通常の integrity_halt と分ける。
+ *
+ * A〜D がたまたま通っても、
+ * 「生存中の預託を確認していない・孤児掃除をしていない・予約解放をしていない」
+ * 状態なので、運営卓の「再点検」からは開けてはいけない。
+ * 出口は復旧をやり直して S12 まで通すことだけ。
+ */
+describe("recovery_halt は通常の再開導線から開けられない", () => {
+  /** source が読めない状態を作る（毎回投げる登録元を1つ入れる） */
+  function brokenSource(ctx: Ctx, broken = { value: true }) {
+    ctx.registry.register({
+      type: "market",
+      listLiveEscrowHolders: () => {
+        if (broken.value) throw new Error("板テーブルが読めない");
+        return [];
+      },
+    });
+    return broken;
+  }
+
+  it("A〜Dが通っても通常の再開（reopenAfterIntegrity）では開かない", () => {
+    const ctx = setup();
+    brokenSource(ctx);
+    expect(run(ctx).outcome).toBe("source_failed");
+    expect(ctx.status.current().status).toBe("recovery_halt");
+
+    // 全点検は通る（掃除対象が無いので当然通ってしまう）
+    const report = ctx.integrity.runFull();
+    expect(report.ok).toBe(true);
+
+    // それでも通常の再開導線は断る
+    const reopened = ctx.status.reopenAfterIntegrity("再点検で通った", "admin", report.ok);
+    expect(reopened.ok).toBe(false);
+    expect(ctx.status.current().status).toBe("recovery_halt");
+    ctx.db.close();
+  });
+
+  it("Bot 再起動後も専用停止状態が残る", () => {
+    const ctx = setup();
+    brokenSource(ctx);
+    run(ctx);
+    expect(ctx.status.current().status).toBe("recovery_halt");
+
+    // 同じ DB から状態を読み直す（＝再起動）
+    const restarted = new CasinoStatus(ctx.db);
+    expect(restarted.current().status).toBe("recovery_halt");
+    expect(restarted.isOpen()).toBe(false);
+    expect(restarted.denyMessage()).toContain("点検");
+    ctx.db.close();
+  });
+
+  it("source が直ったあとに復旧を再実行すると S4〜S12 が動いて open になる", () => {
+    const ctx = setup();
+    fundUser(ctx, "alice", 20_000);
+    ctx.escrow.hold("keiba:1", "alice", 5_000, "競馬", "op-1"); // 所有元の無い孤児
+    ctx.ether.runGroup({ groupKey: "test:house", kind: "table_hold", actorId: "t" }, () =>
+      ctx.ether.transfer("alice", HOUSE_HOLDER, 5_000, { reason: "胴元の元手" }),
+    );
+    ctx.reservations.reserve("残骸", 3_000, "スロット", "u1");
+    const broken = brokenSource(ctx);
+
+    // 1回目: source が読めない → 何もせず recovery_halt
+    const first = run(ctx);
+    expect(first.outcome).toBe("source_failed");
+    expect(first.refundedSessions).toBe(0);
+    expect(ctx.reservations.count()).toBe(1);
+
+    // source が直った → 復旧を再実行
+    broken.value = false;
+    const second = run(ctx);
+
+    expect(second.outcome).toBe("opened");
+    expect(ctx.status.current().status).toBe("open");
+    expect(second.steps).toContain("S4:生存収集");
+    expect(second.steps).toContain("S7:孤児返金");
+    expect(second.steps).toContain("S9:予約解放");
+    expect(second.steps).toContain("S12:再開");
+    // 孤児返金も予約解放もこのときに一度だけ行われる
+    expect(second.refundedSessions).toBe(1);
+    expect(second.releasedReservations).toEqual({ released: true, count: 1, total: 3_000 });
+    expect(ctx.reservations.count()).toBe(0);
+    expect(ctx.escrow.list("keiba:1")).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("復旧が成功したときだけ open になる（もう一度回しても二重返金しない）", () => {
+    const ctx = setup();
+    fundUser(ctx, "alice", 20_000);
+    ctx.escrow.hold("keiba:1", "alice", 5_000, "競馬", "op-1");
+    const broken = brokenSource(ctx);
+    run(ctx);
+    broken.value = false;
+    run(ctx);
+    const balanceAfter = ctx.ether.balanceOf("alice");
+
+    // 3回目（もう返すものが無い）
+    const third = run(ctx);
+    expect(third.outcome).toBe("opened");
+    expect(third.refundedSessions).toBe(0);
+    expect(ctx.ether.balanceOf("alice")).toBe(balanceAfter);
     ctx.db.close();
   });
 });
