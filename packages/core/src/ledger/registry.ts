@@ -85,5 +85,7 @@ export function registerDefaultTxTypes(): void {
   registerTxType("chip_redeem", { ...sysToUser, minorBlocked: true });
   registerTxType("chip_fund", { fromKinds: ["system"], toKinds: ["system"] });
   registerTxType("chip_settle", { fromKinds: ["system"], toKinds: ["system"] });
+  registerTxType("casino_remittance", { fromKinds: ["system"], toKinds: ["system"] });
+  registerTxType("casino_bailout", { fromKinds: ["system"], toKinds: ["system"] });
   registerTxType("ether_house_fund", { fromKinds: ["system"], toKinds: ["system"] }); // 部署口座→プール（胴元の元手）
 }
