@@ -236,7 +236,15 @@ async function runRound(
     }
     const held = services.escrow.hold(`chinchiro:prehold:${uid}:${interaction.id}`, uid, preheld, "チンチロ", interaction.id);
     if (!held) throw new Error("チンチロ事前預託に失敗しました");
-    await runRoundInner(interaction, services, bet, reservationKey);
+    const sessionId = `chinchiro:prehold:${uid}:${interaction.id}`;
+    try {
+      await runRoundInner(interaction, services, bet, reservationKey);
+    } catch (error) {
+      // 結果確定前のDiscord/乱数/演出例外は、預託と帳簿を同じ返金groupで即時に戻す。
+      // 返金に失敗した場合は Escrow.refund が例外を返し帳簿を消さないため、復旧で凍結される。
+      if (services.escrow.poolOf(sessionId) > 0) services.escrow.refund(sessionId);
+      throw error;
+    }
   });
 }
 
