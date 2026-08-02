@@ -1,8 +1,24 @@
-import { describe, expect, it } from "vitest";
-import { CasinoOpeningReset, FREE_SPIN_JACKPOT_CLAIMS_HOLDER, Ledger, ChipLedger, EventLog, openDb, registerDefaultTxTypes } from "../src/index.js";
+import { describe, expect, it, vi } from "vitest";
+import { CasinoOpeningReset, FREE_SPIN_JACKPOT_CLAIMS_HOLDER, Ledger, ChipLedger, EventLog, ETHER_ESCROW, CHIP_ESCROW, openDb, registerDefaultTxTypes, type OpeningBackupAdapter, type OpeningDiscordAdapter } from "../src/index.js";
 
 registerDefaultTxTypes();
-const config = { configured: true as const, casinoOpeningCapital: 1000, houseCapital: 500, jackpotCapital: 100, reliefCapital: 100, minimumWorkingCapital: 100, remittanceBps: 0 };
+const config = { configured: true as const, casinoOpeningCapital: 1000, houseCapital: 800, jackpotCapital: 100, reliefCapital: 100, minimumWorkingCapital: 100, remittanceBps: 0 };
+
+function cleanAdapters(): { backup: OpeningBackupAdapter; discord: OpeningDiscordAdapter; disabled: ReturnType<typeof vi.fn> } {
+  const disabled = vi.fn(async () => undefined);
+  return {
+    backup: { backup: vi.fn(async () => ({ sqliteSha256: "a".repeat(64), csv: [{ table: "casino_escrow", sha256: "b".repeat(64), rows: 0 }], createdAt: 1 })) },
+    discord: { disableLegacyCasino: disabled }, disabled,
+  };
+}
+
+function fundedReset() {
+  const db = openDb(":memory:");
+  const ledger = new Ledger(db);
+  const chips = new ChipLedger(db, ledger, new EventLog(db));
+  ledger.transfer({ from: "sys:treasury", to: ETHER_ESCROW, amount: 1_000, type: "ether_house_fund", actor: "test", idempotencyKey: "seed-opening" });
+  return { db, ledger, chips, reset: new CasinoOpeningReset(db, ledger, chips.chipTx) };
+}
 
 describe("PR12 開業初期化 preflight", () => {
   it("未精算フリースピンと固定JP請求holderを読み取り検査し、不一致やpendingをblockerにする", () => {
@@ -15,6 +31,42 @@ describe("PR12 開業初期化 preflight", () => {
     expect(p.freeSpinClaims).toMatchObject({ pendingIds: [1], expected: 30, actual: 0, matches: false });
     expect(p.blockers.join(" ")).toContain("未精算無料スピン");
     expect(p.blockers.join(" ")).toContain("無料スピンJP請求不一致");
+    db.close();
+  });
+
+  it("設定の資本内訳不一致を拒否し、dry-run は書込みを行わない", () => {
+    const { db, reset } = fundedReset();
+    const before = db.prepare("SELECT COUNT(*) AS n FROM casino_opening_configuration").get() as { n: number };
+    expect(() => reset.dryRun({ ...config, reliefCapital: 99 })).toThrow("house + jackpot + relief");
+    const plan = reset.dryRun(config);
+    expect(plan.blockers).toEqual([]);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM casino_opening_configuration").get()).toEqual(before);
+    db.close();
+  });
+
+  it("hash、バックアップ、fake Discord adapter を要求し、Land取引を分離して一度だけ適用する", async () => {
+    const { db, ledger, chips, reset } = fundedReset();
+    const plan = reset.dryRun(config);
+    const { backup, discord, disabled } = cleanAdapters();
+    const applied = await reset.apply({ configuration: config, planHash: plan.planHash, actorId: "admin:a", backup, discord });
+    expect(disabled).toHaveBeenCalledOnce();
+    expect(applied.oldSettlementLandTxId).not.toBe(applied.newInvestmentLandTxId);
+    expect(ledger.balanceOf(ETHER_ESCROW)).toBe(0);
+    expect(ledger.balanceOf(CHIP_ESCROW)).toBe(1_000);
+    expect(chips.balanceOf("house")).toBe(800);
+    expect(chips.balanceOf("jackpot")).toBe(100);
+    expect(reset.configuration()).toEqual(config);
+    await expect(reset.apply({ configuration: config, planHash: plan.planHash, actorId: "admin:b", backup, discord })).rejects.toThrow("already applied");
+    db.close();
+  });
+
+  it("バックアップ失敗では R4 以降を一切変更しない", async () => {
+    const { db, ledger, reset } = fundedReset();
+    const plan = reset.dryRun(config);
+    const backup: OpeningBackupAdapter = { backup: async () => { throw new Error("archive unavailable"); } };
+    await expect(reset.apply({ configuration: config, planHash: plan.planHash, actorId: "admin", backup, discord: { disableLegacyCasino: async () => undefined } })).rejects.toThrow("archive unavailable");
+    expect(ledger.balanceOf(ETHER_ESCROW)).toBe(1_000);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM casino_opening_reset_plans").get()).toEqual({ n: 0 });
     db.close();
   });
 });

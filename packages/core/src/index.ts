@@ -378,4 +378,13 @@ export {
   type RecoverCasinoDeps,
   type RecoverCasinoResult,
 } from "./casino/recovery.js";
-export { CasinoOpeningReset, type CasinoOpeningConfig, type OpeningResetPlan } from "./casino/opening-reset.js";
+export {
+  CasinoOpeningReset,
+  FilesystemOpeningBackupAdapter,
+  type CasinoOpeningConfig,
+  type OpeningResetPlan,
+  type OpeningBackupAdapter,
+  type OpeningBackupManifest,
+  type OpeningDiscordAdapter,
+  type OpeningApplyResult,
+} from "./casino/opening-reset.js";

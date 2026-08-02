@@ -475,6 +475,27 @@ CREATE TABLE IF NOT EXISTS casino_chinchiro_preholds (
 );
 CREATE INDEX IF NOT EXISTS idx_casino_chinchiro_preholds_status ON casino_chinchiro_preholds(status, created_at);
 
+-- 正式開業初期化: 設定と、hash で固定された一度きりの適用記録。
+CREATE TABLE IF NOT EXISTS casino_opening_configuration (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  casino_opening_capital INTEGER NOT NULL CHECK(casino_opening_capital > 0),
+  casino_opening_house INTEGER NOT NULL CHECK(casino_opening_house > 0),
+  casino_opening_jackpot INTEGER NOT NULL CHECK(casino_opening_jackpot >= 0),
+  casino_opening_relief INTEGER NOT NULL CHECK(casino_opening_relief >= 0),
+  casino_min_working_capital INTEGER NOT NULL CHECK(casino_min_working_capital >= 0),
+  casino_remit_rate_bps INTEGER NOT NULL CHECK(casino_remit_rate_bps BETWEEN 0 AND 10000),
+  casino_opening_configured INTEGER NOT NULL CHECK(casino_opening_configured IN (0,1)),
+  configured_by TEXT NOT NULL,
+  configured_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS casino_opening_reset_plans (
+  plan_hash TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK(status IN ('applied','rolled_back')),
+  manifest_json TEXT NOT NULL,
+  applied_by TEXT NOT NULL,
+  applied_at INTEGER NOT NULL
+);
+
 -- 賭場チップの取引監査（大型UPD PR1）。チップ残高は現在値しか持たないので、
 -- 「業務操作の単位(group)」と「その中の1移動(tx)」を追記し、開始残高から再現できるようにする。
 CREATE TABLE IF NOT EXISTS casino_tx_groups (
