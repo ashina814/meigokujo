@@ -49,6 +49,7 @@ import {
 import { config } from "./config.js";
 import { meetsRoleRequirement } from "./rank-requirement.js";
 import { seedSpecialProfiles } from "./special-profile.js";
+import { frozenChinchiroPreholdHolders } from "./casino/chinchiro.js";
 
 /**
  * コアサービスの組み立て。アプリ層は薄く、ロジックは全て core 側（システム設計.md の原則）。
@@ -155,6 +156,7 @@ export function buildServices() {
   // その預託は孤児として返金するのが正しい）。PR20 で対人卓を同じ形で足す。
   const recoveryRegistry = new RecoveryRegistry();
   recoveryRegistry.register({ type: "market", listLiveEscrowHolders: () => markets.liveEscrowHolders() });
+  recoveryRegistry.register({ type: "chinchiro_frozen", listLiveEscrowHolders: () => frozenChinchiroPreholdHolders({ db }) });
   logRecovery(
     recoverCasino({ db, status: casinoStatus, integrity: casinoIntegrity, chipTx, escrow, reservations, registry: recoveryRegistry, events, chipFlow }),
   );

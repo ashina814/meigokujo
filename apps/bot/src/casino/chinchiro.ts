@@ -23,6 +23,7 @@ import {
   chinchiroPlayerLoss,
   chinchiroPayout,
   chinchiroRoll,
+  escrowHolderFor,
   type ChinchiroDice as Dice,
   type ChinchiroHand as Hand,
   type CasinoRng,
@@ -90,6 +91,57 @@ export interface ChinchiroRound {
   extra: number;
 }
 
+const now = () => Math.floor(Date.now() / 1000);
+
+function trackPrehold(services: Services, sessionId: string, userId: string, bet: number, amount: number): void {
+  services.db.prepare(
+    `INSERT INTO casino_chinchiro_preholds (session_id,user_id,bet,amount,status,created_at)
+     VALUES (?,?,?,?, 'preheld', ?)
+     ON CONFLICT(session_id) DO NOTHING`,
+  ).run(sessionId, userId, bet, amount, now());
+}
+
+function markPrehold(services: Services, sessionId: string, status: "settled" | "refunded" | "frozen", failure?: string): void {
+  const ts = now();
+  services.db.prepare(
+    `UPDATE casino_chinchiro_preholds
+       SET status=?, settled_at=CASE WHEN ? IN ('settled','refunded') THEN ? ELSE settled_at END,
+           frozen_at=CASE WHEN ?='frozen' THEN ? ELSE frozen_at END, failure=?
+     WHERE session_id=?`,
+  ).run(status, status, ts, status, ts, failure ?? null, sessionId);
+}
+
+/** 返還失敗時は帳簿を残して凍結する。再起動掃除に任せて黙って資金を動かさない。 */
+export function refundChinchiroPrehold(services: Services, sessionId: string, reason: string): boolean {
+  if (services.escrow.poolOf(sessionId) === 0) return true;
+  try {
+    services.escrow.refund(sessionId);
+    markPrehold(services, sessionId, "refunded");
+    services.events.log("casino_chinchiro_prehold_refunded", { actor: "system:chinchiro", payload: { sessionId, reason } });
+    return true;
+  } catch (error) {
+    const failure = error instanceof Error ? error.message : String(error);
+    markPrehold(services, sessionId, "frozen", failure);
+    services.events.log("casino_chinchiro_prehold_frozen", { actor: "system:chinchiro", payload: { sessionId, reason, failure } });
+    return false;
+  }
+}
+
+/** 返金失敗で凍結したものだけは、起動時の孤児返金から除外して帳簿を保持する。 */
+export function frozenChinchiroPreholdHolders(services: Pick<Services, "db">): string[] {
+  return (services.db.prepare("SELECT session_id FROM casino_chinchiro_preholds WHERE status='frozen'").all() as Array<{ session_id: string }>)
+    .map((row) => escrowHolderFor(row.session_id));
+}
+
+/** 運営が帳簿を確認してから行う凍結preholdの手動返金。 */
+export function recoverFrozenChinchiroPrehold(services: Services, sessionId: string, actorId: string): boolean {
+  const row = services.db.prepare("SELECT status FROM casino_chinchiro_preholds WHERE session_id=?").get(sessionId) as { status: string } | undefined;
+  if (!row || row.status !== "frozen") throw new Error("凍結中のチンチロ事前預託ではありません");
+  const ok = refundChinchiroPrehold(services, sessionId, `手動復旧:${actorId}`);
+  if (ok) services.events.log("casino_chinchiro_prehold_manual_recovery", { actor: actorId, payload: { sessionId } });
+  return ok;
+}
+
 /**
  * 1ラウンドの精算。勝ち・引分・通常負け・倍付け負け・残高不足フォールバックを
  * **すべて同じグループ**で処理する。
@@ -116,16 +168,19 @@ export function settleChinchiroRound(
     { groupKey: `chinchiro:round:${uid}:${operationId}`, kind: "solo_game", actorId: uid },
     (): ChinchiroRound => {
       const preheld = bet * CHINCHIRO_MAX_LOSS_MULT;
-      if (services.escrow.poolOf(sessionId) !== preheld) throw new Error("チンチロ事前預託の帳簿不一致");
+      const holder = services.escrow.holderId(sessionId);
+      if (services.escrow.poolOf(sessionId) !== preheld || services.ether.balanceOf(holder) !== preheld) {
+        throw new Error("チンチロ事前預託の帳簿不一致");
+      }
       const loss = mul < 0 ? chinchiroPlayerLoss(bet, mul) : 0;
       const returned = preheld - loss;
-      const holder = services.escrow.holderId(sessionId);
       if (returned) services.ether.transfer(holder, uid, returned, { reason: "チンチロ事前預託の返還", game: "チンチロ", sessionId });
       if (loss) services.ether.transfer(holder, HOUSE_HOLDER, loss, { reason: "チンチロ確定損失", game: "チンチロ", sessionId });
       const rawPayout = mul > 0 ? chinchiroPayout(bet, mul) : mul === 0 ? bet : 0;
       const profit = Math.max(0, rawPayout - bet);
       if (profit) services.ether.transfer(HOUSE_HOLDER, uid, profit, { reason: "チンチロ胴元配当", game: "チンチロ", sessionId });
       services.db.prepare("DELETE FROM casino_escrow WHERE session_id = ?").run(sessionId);
+      markPrehold(services, sessionId, "settled");
       if (reservationKey) services.reservations.release(reservationKey);
       services.casino.recordGameNet(uid, profit - loss, { countAsBiggestWin: profit > 0 });
       const settled = {
@@ -185,7 +240,8 @@ async function shakeAnimation(reply: Message, header: string[], bet: number, rol
         ].join("\n"),
       )
       .setFooter({ text: `第${rollNo}投 · 残り${remaining} · 賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
-    await reply.edit({ embeds: [e], components: [] }).catch(() => undefined);
+    // 結果確定前の表示失敗はゲームを続行しない。呼出元が事前預託を全額返す。
+    await reply.edit({ embeds: [e], components: [] });
     await sleep(220);
   }
 }
@@ -234,15 +290,20 @@ async function runRound(
       else await interaction.reply(payload);
       return;
     }
-    const held = services.escrow.hold(`chinchiro:prehold:${uid}:${interaction.id}`, uid, preheld, "チンチロ", interaction.id);
-    if (!held) throw new Error("チンチロ事前預託に失敗しました");
     const sessionId = `chinchiro:prehold:${uid}:${interaction.id}`;
     try {
+      const held = services.escrow.hold(sessionId, uid, preheld, "チンチロ", interaction.id);
+      if (!held) throw new Error("チンチロ事前預託に失敗しました");
+      trackPrehold(services, sessionId, uid, bet, preheld);
       await runRoundInner(interaction, services, bet, reservationKey);
     } catch (error) {
       // 結果確定前のDiscord/乱数/演出例外は、預託と帳簿を同じ返金groupで即時に戻す。
       // 返金に失敗した場合は Escrow.refund が例外を返し帳簿を消さないため、復旧で凍結される。
-      if (services.escrow.poolOf(sessionId) > 0) services.escrow.refund(sessionId);
+      const refunded = refundChinchiroPrehold(services, sessionId, "結果確定前の失敗");
+      if (!refunded) {
+        // 返金失敗を上書きせず、凍結したsession IDを利用者と運営ログに残す。
+        throw new Error(`チンチロの事前預託返還に失敗し凍結しました: ${sessionId}`);
+      }
       throw error;
     }
   });
@@ -301,8 +362,7 @@ async function runRoundInner(
                 .setDescription([describe(playerHand), "", diceDisplay(playerDice), "", `第${rollNo}投 → 自動で再振り…（残り${playerMaxRolls - rollNo}）`].join("\n")),
             ],
             components: [],
-          })
-          .catch(() => undefined);
+          });
         await sleep(1500);
         continue;
       }
@@ -321,6 +381,10 @@ async function runRoundInner(
           .setCustomId("chinchiro:reroll")
           .setLabel(`🎲 もう一度振る（残り${playerMaxRolls - rollNo}）`)
           .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId("chinchiro:cancel")
+          .setLabel("中止して全額返還")
+          .setStyle(ButtonStyle.Secondary),
       );
       const e = new EmbedBuilder()
         .setTitle("🎲 チンチロ")
@@ -337,9 +401,9 @@ async function runRoundInner(
             "・**もう一度振る** → 上書き。ヒフミやメナシ続きのリスクあり",
           ].filter(Boolean).join("\n"),
         );
-      await reply.edit({ embeds: [e], components: [row] }).catch(() => undefined);
+      await reply.edit({ embeds: [e], components: [row] });
 
-      const choice = await new Promise<"stop" | "reroll">((resolve) => {
+      const choice = await new Promise<"stop" | "reroll" | "cancel" | "timeout">((resolve) => {
         const collector = reply.createMessageComponentCollector({
           componentType: ComponentType.Button,
           time: ROLL_BUTTON_TIMEOUT_MS,
@@ -350,15 +414,19 @@ async function runRoundInner(
           if (btn.customId === "chinchiro:stop") {
             collector.stop("stop");
             resolve("stop");
+          } else if (btn.customId === "chinchiro:cancel") {
+            collector.stop("cancel");
+            resolve("cancel");
           } else {
             collector.stop("reroll");
             resolve("reroll");
           }
         });
         collector.on("end", (_c, reason) => {
-          if (reason !== "stop" && reason !== "reroll") resolve("stop"); // 時間切れは保守的に止める
+          if (reason !== "stop" && reason !== "reroll" && reason !== "cancel") resolve("timeout");
         });
       });
+      if (choice === "cancel" || choice === "timeout") throw new Error(choice === "timeout" ? "チンチロ操作が時間切れになりました" : "利用者がチンチロを中止しました");
       if (choice === "stop") {
         playerLocked = true;
         break;
@@ -383,8 +451,7 @@ async function runRoundInner(
           ),
       ],
       components: [],
-    })
-    .catch(() => undefined);
+    });
   await sleep(1200);
 
   let dealerDice: Dice = [1, 1, 1] as const;
@@ -404,7 +471,7 @@ async function runRoundInner(
             `第${rollNo}投（残り${MAX_ROLLS - rollNo + 1}）`,
           ].join("\n"),
         );
-      await reply.edit({ embeds: [e], components: [] }).catch(() => undefined);
+      await reply.edit({ embeds: [e], components: [] });
       await sleep(220);
     }
     dealerDice = rollDice(services.rng);
@@ -427,8 +494,7 @@ async function runRoundInner(
             ),
         ],
         components: [],
-      })
-      .catch(() => undefined);
+      });
     await sleep(willStop ? 1400 : 1000);
     if (willStop) break;
   }

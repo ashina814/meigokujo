@@ -17,7 +17,7 @@ import {
 } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 import { resolveFreeSpin, spinPaid } from "../src/casino/slots.js";
-import { settleChinchiroRound } from "../src/casino/chinchiro.js";
+import { frozenChinchiroPreholdHolders, recoverFrozenChinchiroPrehold, refundChinchiroPrehold, settleChinchiroRound } from "../src/casino/chinchiro.js";
 import { settleRoulette } from "../src/casino/roulette.js";
 import { drawNagareboshi, ensureNagareboshiTable } from "../src/commands/nagareboshi.js";
 
@@ -149,6 +149,41 @@ describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
     expect(ctx.escrow.hold("chinchiro:prehold:u1:op-1", "u1", 2_000, "チンチロ", "prehold")).toBe(false);
     expect(ctx.ether.balanceOf("u1")).toBe(1_500);
     expect(ctx.chipTx.getGroup("chinchiro:round:u1:op-1")).toBeUndefined();
+    ctx.db.close();
+  });
+
+  it("帳簿とholderが±1でも精算せず、預託と帳簿を残す", () => {
+    const ctx = setup(scriptedRng([0.5]));
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    seedBalance(ctx.db, "u1", 2_001);
+    const session = "chinchiro:prehold:u1:off-by-one";
+    expect(ctx.escrow.hold(session, "u1", 2_000, "チンチロ", "prehold")).toBe(true);
+    ctx.ether.runGroup({ groupKey: "test:off-by-one", kind: "test", actorId: "test" }, () =>
+      ctx.ether.transfer("u1", ctx.escrow.holderId(session), 1, { reason: "破損を模す" }),
+    );
+    expect(() => settleChinchiroRound(ctx.services, "u1", 1_000, -2, "off-by-one")).toThrow("帳簿不一致");
+    expect(ctx.escrow.poolOf(session)).toBe(2_000);
+    expect(ctx.ether.balanceOf(ctx.escrow.holderId(session))).toBe(2_001);
+    expect(ctx.chipTx.getGroup("chinchiro:round:u1:off-by-one")).toBeUndefined();
+    ctx.db.close();
+  });
+
+  it("返還失敗はsessionを凍結して帳簿を残し、運営の手動復旧だけが返還できる", () => {
+    const ctx = setup(scriptedRng([0.5]));
+    seedBalance(ctx.db, "u1", 2_000);
+    const session = "chinchiro:prehold:u1:frozen";
+    expect(ctx.escrow.hold(session, "u1", 2_000, "チンチロ", "prehold")).toBe(true);
+    ctx.db.prepare("INSERT INTO casino_chinchiro_preholds (session_id,user_id,bet,amount,status,created_at) VALUES (?,?,?,?, 'preheld', 1)")
+      .run(session, "u1", 1_000, 2_000);
+    const realRefund = ctx.escrow.refund.bind(ctx.escrow);
+    ctx.escrow.refund = (() => { throw new Error("返還DB障害"); }) as typeof ctx.escrow.refund;
+    expect(refundChinchiroPrehold(ctx.services, session, "通知失敗")).toBe(false);
+    expect(frozenChinchiroPreholdHolders(ctx.services)).toEqual([ctx.escrow.holderId(session)]);
+    expect(ctx.escrow.poolOf(session)).toBe(2_000);
+    ctx.escrow.refund = realRefund;
+    expect(recoverFrozenChinchiroPrehold(ctx.services, session, "user:admin")).toBe(true);
+    expect(ctx.escrow.poolOf(session)).toBe(0);
+    expect(ctx.ether.balanceOf("u1")).toBe(2_000);
     ctx.db.close();
   });
 });

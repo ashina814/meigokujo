@@ -46,6 +46,7 @@ import { updateDashboard } from "../dashboard.js";
 import { updateWaitersBoard, WAITERS_BOARD_CHANNEL_KEY } from "../waiters-board.js";
 import { fmtEther, fmtLd } from "../format.js";
 import { isSeatOccupied } from "../casino/common.js";
+import { recoverFrozenChinchiroPrehold } from "../casino/chinchiro.js";
 import { ticketPanelMessageForPanel } from "./tickets.js";
 import type { Services } from "../services.js";
 
@@ -183,6 +184,7 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "casino" && action === "fund") return void (await interaction.showModal(casinoFundModal()));
   if (section === "casino" && action === "settle") return void (await interaction.showModal(casinoSettleModal()));
   if (section === "casino" && action === "refund-user") return void (await interaction.showModal(casinoRefundUserModal()));
+  if (section === "casino" && action === "prehold-recover") return void (await interaction.showModal(casinoPreholdRecoveryModal()));
   if (section === "casino" && action === "refund-all") {
     return void (await interaction.update(casinoRefundConfirm(
       services.chipFlow.createRefundSaga({ id: interaction.id, requestedBy: `user:${interaction.user.id}`, scope: "all" }),
@@ -500,6 +502,16 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       await interaction.reply({ ...casinoRefundConfirm(saga), flags: MessageFlags.Ephemeral });
     } catch (error) {
       await interaction.reply({ content: `❌ ${error instanceof Error ? error.message : "緊急返還案を作成できません"}`, flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+  if (section === "casino" && action === "prehold-recover") {
+    const sessionId = interaction.fields.getTextInputValue("session_id").trim();
+    try {
+      const ok = recoverFrozenChinchiroPrehold(services, sessionId, `user:${interaction.user.id}`);
+      await interaction.reply({ content: ok ? `✅ 凍結チンチロ預託を帳簿どおり返還しました: ${sessionId}` : `⛔ 返還に失敗したため凍結を維持しました: ${sessionId}`, flags: MessageFlags.Ephemeral });
+    } catch (error) {
+      await interaction.reply({ content: `❌ ${error instanceof Error ? error.message : "手動復旧できません"}`, flags: MessageFlags.Ephemeral });
     }
     return;
   }
@@ -2075,6 +2087,7 @@ function casinoHome(services: Services) {
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId("mgmt:casino:refund-user").setLabel("緊急返還（個人）").setEmoji("🚨").setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId("mgmt:casino:refund-all").setLabel("緊急返還（全利用者）").setEmoji("🚨").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("mgmt:casino:prehold-recover").setLabel("凍結チンチロを手動返還").setEmoji("🧾").setStyle(ButtonStyle.Secondary),
     ),
   );
   // 検算Bの基準が無い版（PR2 以前から動いていたDB）だけ、明示的な基準確定を出す
@@ -2104,6 +2117,17 @@ function casinoRefundUserModal() {
           .setStyle(TextInputStyle.Short)
           .setRequired(true)
           .setMaxLength(22),
+      ),
+    );
+}
+
+function casinoPreholdRecoveryModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:prehold-recover")
+    .setTitle("凍結チンチロ預託の手動復旧")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("session_id").setLabel("凍結したsession ID（帳簿確認後）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(180),
       ),
     );
 }

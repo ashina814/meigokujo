@@ -460,6 +460,21 @@ CREATE TABLE IF NOT EXISTS casino_chip_refund_saga_targets (
 );
 CREATE INDEX IF NOT EXISTS idx_casino_chip_refund_saga_targets_status ON casino_chip_refund_saga_targets(saga_id, status);
 
+-- PR11: チンチロの2倍事前預託。通常の再起動時は孤児返金するが、返金そのものに
+-- 失敗したものだけは帳簿と理由を残して凍結し、運営の手動復旧を待つ。
+CREATE TABLE IF NOT EXISTS casino_chinchiro_preholds (
+  session_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  bet INTEGER NOT NULL CHECK(bet > 0),
+  amount INTEGER NOT NULL CHECK(amount > 0),
+  status TEXT NOT NULL CHECK(status IN ('preheld','settled','refunded','frozen')),
+  created_at INTEGER NOT NULL,
+  settled_at INTEGER,
+  frozen_at INTEGER,
+  failure TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_casino_chinchiro_preholds_status ON casino_chinchiro_preholds(status, created_at);
+
 -- 賭場チップの取引監査（大型UPD PR1）。チップ残高は現在値しか持たないので、
 -- 「業務操作の単位(group)」と「その中の1移動(tx)」を追記し、開始残高から再現できるようにする。
 CREATE TABLE IF NOT EXISTS casino_tx_groups (
