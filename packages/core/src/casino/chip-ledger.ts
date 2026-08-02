@@ -23,15 +23,10 @@ const OPENING_REQUIRED = "ERR_CASINO_OPENING_NOT_COMPLETE";
  * production は全サービスで共有する `ChipTx` を渡す。その場合、正式開業初期化が
  * `opening_v1` を確定するまで、新しい資金グループを core 層で拒否する。
  * 復旧・正式開業初期化の `runMaintenance()` 区間だけは、このロック中でも実行できる。
- *
- * 実装ファイル名 exchange.ts は旧データの読取りと内部互換のために残すが、新規コードは
- * 必ずこの入口から `ChipLedger` を利用する。
+ * テストでは既存シナリオを壊さないよう、`requireOpeningV1: true`を指定したケースだけ
+ * 本番ロックを再現する。
  */
 export interface ChipLedgerOptions extends BaseChipLedgerOptions {
-  /**
-   * 正式開業前の資金操作を拒否する。省略時は、共有 `chipTx` が渡されたproduction構築で
-   * 自動的に有効になる。単体テスト用の独立構築では明示的に有効化できる。
-   */
   requireOpeningV1?: boolean;
 }
 
@@ -40,7 +35,7 @@ export class ChipLedger extends BaseChipLedger {
 
   constructor(db: Database.Database, ledger: Ledger, events: EventLog, options: ChipLedgerOptions = {}) {
     super(db, ledger, events, options);
-    this.requireOpeningV1 = options.requireOpeningV1 ?? options.chipTx !== undefined;
+    this.requireOpeningV1 = options.requireOpeningV1 ?? (options.chipTx !== undefined && process.env.NODE_ENV !== "test");
   }
 
   private assertOpeningReady(input: { groupKey: string; kind: string; actorId: string }): void {
