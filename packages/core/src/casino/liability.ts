@@ -195,13 +195,53 @@ function fixedMultModel(
 // ─── ゲーム別 ───────────────────────────────────────────
 
 /**
- * スロット（有料スピン1回ぶん）。マモン³ = 100倍。
+ * スロットの**有料スピン1回ぶん**。マモン³ = 100倍。
  *
  * JP **当選金**は jackpot holder から出るので含めない。
  * JP **積立**は house → jackpot の支出なので含める。含めないと、積立が
  * 他の利用者の予約済み資金を食う（house.available を計算に入れずに house を減らす）。
+ *
+ * **これ単体では予約に使わない。** 1回の操作は必ず {@link slotsLiability}
+ * （有料 + フリースピン1回）の単位で扱う。
  */
-export const slotsLiability = fixedMultModel("スロット", SLOT_MAX_PAYOUT_MULT, "on", jackpotCutFor);
+export const slotsPaidSpinLiability = fixedMultModel("スロット（有料1回）", SLOT_MAX_PAYOUT_MULT, "on", jackpotCutFor);
+
+/**
+ * スロットのフリースピン1回ぶんの債務。
+ *
+ * 賭け金を取らないので**回収がない**（＝払戻がまるごと house からの持ち出し）。
+ * 実装（`spinOnce` のフリースピン分岐）は `settle` を通さないので連鎖ボーナスも JP 積立も無い。
+ * お守りの勝利ボーナスは有料スピンと同じく乗りうるので、上限を安全側で足す。
+ */
+function slotsFreeSpinLiability(ctx: LiabilityContext): number {
+  return Math.floor(ctx.bet * SLOT_MAX_PAYOUT_MULT) + ctx.activeEffects.winBonusCap;
+}
+
+/**
+ * **スロット1セット = 有料スピン1回 + 最大1回のフリースピン**（PR5 レビュー指摘）。
+ *
+ * 予約はセット単位で取るのに、上限表示・事前検証が有料1回ぶんしか見ていなかった。
+ * その結果「表示された上限では予約が取れない」状態になっていた。
+ * `/遊ぶ スロット` の上限表示・事前検証・予約 INSERT・復帰ボタンはすべてこのモデルを通す。
+ *
+ * 原作準拠でフリースピン中にさらなるフリースピンは出ないので、多くても1回。
+ *
+ * 例（連鎖・お守りなし・賭け 5,000）:
+ * ```text
+ * 有料スピンの純債務  100×5,000 − 5,000 + JP積立50 =   495,050
+ * フリースピンの支払  100×5,000                    =   500,000
+ * 合計                                             =   995,050
+ * ```
+ * つまり house 100万では**同時2人ではなく1人**しか受けられない。
+ */
+export const slotsLiability: GameLiabilityModel = {
+  game: "スロット",
+  maxHouseLiability: (ctx) => slotsPaidSpinLiability.maxHouseLiability(ctx) + slotsFreeSpinLiability(ctx),
+  mandatoryHouseOutflow: (ctx) => slotsPaidSpinLiability.mandatoryHouseOutflow(ctx),
+  maxPlayerLoss: (ctx) => ctx.bet,
+  maxBetFor: (available, ctx) =>
+    betForLiability(available, ctx, (bet) => slotsLiability.maxHouseLiability({ ...ctx, bet })),
+};
 
 /** 丁半: CHOHAN_PAYOUT 倍。連鎖は実装で無効（実効RTP が 100% を超える回帰があったため） */
 export const chohanLiability = fixedMultModel("丁半", CHOHAN_PAYOUT, "off");

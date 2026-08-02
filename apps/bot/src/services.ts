@@ -22,6 +22,7 @@ import {
   Shop,
   EtherExchange,
   ETHER_ESCROW,
+  HOUSE_HOLDER,
   Casino,
   CasinoStatus,
   CasinoIntegrity,
@@ -116,6 +117,8 @@ export function buildServices() {
   const freeSpins = new FreeSpins(db);
   // 胴元債務予約（PR5）。canAccept が見るのは house 残高ではなく「残高 − 予約合計」になる
   const reservations = new HouseReservations(db, ether, events);
+  // 売上精算（redeemFairToAccount）も予約分は出せないようにする。UI ではなく資金処理層で止める
+  ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
   const casino = new Casino(db, ether, events, {
     fukuScale: () => settings.getNumber("ether_fuku_scale"),
     items,

@@ -42,7 +42,12 @@ export function isPlayerHolder(holderId: string): boolean {
   return !/^(sys:|system:|escrow:)/.test(holderId);
 }
 
-export type EtherErrorCode = "ERR_BAD_AMOUNT" | "ERR_INSUFFICIENT_ETHER" | "ERR_DUPLICATE";
+export type EtherErrorCode =
+  | "ERR_BAD_AMOUNT"
+  | "ERR_INSUFFICIENT_ETHER"
+  | "ERR_DUPLICATE"
+  /** 予約済み債務の裏付けまで精算しようとした（PR5） */
+  | "ERR_RESERVED_FUNDS";
 
 export class EtherError extends Error {
   constructor(
@@ -68,6 +73,14 @@ export interface EtherExchangeOptions {
   baseRate?: number | (() => number);
   /** 取引監査。賭場の全サービスで同じインスタンスを共有する（実行中グループを共有するため） */
   chipTx?: ChipTx;
+  /**
+   * その保有者について**いま予約されている債務**を返す（PR5）。
+   *
+   * `redeemFairToAccount`（売上精算）が「house 残高 − 予約総額」しか出せないようにするために使う。
+   * 予約は `HouseReservations` が持っており、そちらは `EtherExchange` を必要とするので、
+   * 循環を避けるために関数で受け取る（未設定なら予約なし＝従来どおり）。
+   */
+  reservedOf?: (holderId: string) => number;
 }
 
 /** チップ移動に必ず添える情報。理由の無い取引を作らないための必須引数 */
@@ -94,7 +107,33 @@ export class EtherExchange {
   ) {
     this.baseRateOpt = options.baseRate ?? 10;
     this.chipTx = options.chipTx ?? new ChipTx(db);
+    if (options.reservedOf) this.reservedOfFn = options.reservedOf;
     this.ledger.ensureAccount(ETHER_ESCROW, "system");
+  }
+
+  /** @see EtherExchangeOptions.reservedOf */
+  private reservedOfFn: (holderId: string) => number = () => 0;
+
+  /**
+   * 予約の出所を後から繋ぐ（PR5）。
+   * `HouseReservations` は `EtherExchange` を要求するので、構築順の都合でこちらから繋ぐ。
+   */
+  setReservedProvider(fn: (holderId: string) => number): void {
+    this.reservedOfFn = fn;
+  }
+
+  /**
+   * その保有者から**いま外へ出してよい額**（PR5・正本 I7）。
+   *
+   * ```text
+   * 精算可能額 = 残高 − 予約済み債務
+   * ```
+   *
+   * 進行中のゲームの最大配当は予約として押さえてある。その裏付けまで部署口座へ
+   * 戻せてしまうと、予約が支払保証にならない。UI 側の制限では不十分なので**ここで止める**。
+   */
+  settleableBalance(holderId: string): number {
+    return Math.max(0, this.balanceOf(holderId) - Math.max(0, this.reservedOfFn(holderId)));
   }
 
   /**
@@ -299,13 +338,23 @@ export class EtherExchange {
 
   /**
    * holder のエテルをフェアレート（奉納なし）で system 口座(部署)へ Land 精算。
-   * 胴元の売上を賭博場口座へ戻す用。全部戻すと準備プールもちょうど空になる。
+   * 胴元の売上を賭博場口座へ戻す用。
+   *
+   * **予約済み債務は出せない**（PR5）。進行中ゲームの最大配当の裏付けを部署口座へ
+   * 移せてしまうと、予約が支払保証にならない。`settleableBalance()` を超える要求は
+   * `ERR_RESERVED_FUNDS` で断る。予約が無ければ従来どおり全額戻せる
+   * （＝全部戻すと準備プールもちょうど空になる）。
    */
   redeemFairToAccount(holderId: string, etherIn: number, destAccount: string, idempotencyKey: string): { ether: number; land: number } {
     if (!Number.isInteger(etherIn) || etherIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { etherIn });
     return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: ETHER_APPROVER }, () => {
       const held = this.balanceOf(holderId);
       if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
+      // 予約の再確認もグループ（＝同一トランザクション）の中で行う
+      const settleable = this.settleableBalance(holderId);
+      if (settleable < etherIn) {
+        throw new EtherError("ERR_RESERVED_FUNDS", { held, settleable, reserved: held - settleable, etherIn });
+      }
       const P = this.pool();
       const C = this.outstanding();
       const land = C === 0 ? 0 : muldiv(etherIn, P, C); // フェア gross（80%引きなし）

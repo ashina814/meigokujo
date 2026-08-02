@@ -63,7 +63,7 @@ export async function playChohan(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, Math.ceil(betRaw * CHOHAN_PAYOUT), "丁半");
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "丁半");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -234,7 +234,7 @@ async function runRoundInner(
       .setCustomId(`chohan:retry:${doubleBet}`)
       .setLabel(`⚡ 倍プッシュ ${doubleBet.toLocaleString()}`)
       .setStyle(ButtonStyle.Danger)
-      .setDisabled(held < doubleBet || doubleBet > effectiveMaxBet(services, uid)),
+      .setDisabled(held < doubleBet || doubleBet > effectiveMaxBet(services, uid, "丁半")),
     new ButtonBuilder().setCustomId("chohan:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("chohan:quit").setLabel("🚪 退席").setStyle(ButtonStyle.Secondary),
   );
@@ -263,6 +263,7 @@ async function runRoundInner(
         services,
         btn,
         collector,
+        game: "丁半",
         betRaw: Number(btn.customId.split(":")[2]),
         run: (bet) => runRound(btn, services, bet),
       });

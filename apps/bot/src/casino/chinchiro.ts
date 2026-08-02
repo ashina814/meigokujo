@@ -200,7 +200,7 @@ export async function playChinchiro(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT, "チンチロ");
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "チンチロ");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -479,7 +479,7 @@ async function runRoundInner(
 
   const heldAfter = services.ether.balanceOf(uid);
   const min = MIN_BET;
-  const max = Math.min(effectiveMaxBet(services, uid), heldAfter);
+  const max = Math.min(effectiveMaxBet(services, uid, "チンチロ"), heldAfter);
   const nextRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`chinchiro:retry:${min}`)
@@ -525,6 +525,7 @@ async function runRoundInner(
         services,
         btn,
         collector,
+        game: "チンチロ",
         betRaw: Number(btn.customId.split(":")[2]),
         run: (bet) => runRound(btn, services, bet),
       });

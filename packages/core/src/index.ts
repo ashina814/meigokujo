@@ -322,6 +322,7 @@ export {
 
 export {
   slotsLiability,
+  slotsPaidSpinLiability,
   chohanLiability,
   crashLiability,
   pokerLiability,

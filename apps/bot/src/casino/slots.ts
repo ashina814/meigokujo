@@ -138,7 +138,7 @@ function buildSpinEmbed(
 function retryButtons(uid: string, bet: number, services: Services): ActionRowBuilder<ButtonBuilder> {
   const held = services.ether.balanceOf(uid);
   const min = MIN_BET;
-  const max = Math.min(effectiveMaxBet(services, uid), held);
+  const max = Math.min(effectiveMaxBet(services, uid, "スロット"), held);
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`slots:retry:${min}`)
@@ -176,7 +176,7 @@ export async function playSlots(
   try {
     // 取得済み権利は新規ベットの下限・残高・予約可否に従属させない。
     await settleLeftoverFreeSpins(interaction, services, uid);
-    const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULTIPLIER, "スロット");
+    const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "スロット");
     if (!check.ok) return;
     await runPaidSpin(interaction, services, check.bet);
   } finally {
@@ -387,9 +387,7 @@ export function resolveFreeSpin(
   reservationKey?: string,
 ): SpinRecord {
   const capacityOf = (s: Services): number =>
-    reservationKey
-      ? s.casino.availableForLiability() + (s.reservations.get(reservationKey)?.amount ?? 0)
-      : s.casino.availableForLiability();
+    reservationKey ? s.reservations.availableIncludingOwn(reservationKey) : s.casino.availableForLiability();
   const key = services.freeSpins.payoutGroupKey(row);
   try {
     return services.ether.runGroup({ groupKey: key, kind: "solo_game", actorId: row.userId }, (): SpinRecord => {
@@ -668,6 +666,7 @@ async function renderSpin(
         services,
         btn,
         collector,
+        game: "スロット",
         betRaw: Number(btn.customId.split(":")[2]),
         run: (bet) => runPaidSpin(btn, services, bet),
       });

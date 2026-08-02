@@ -69,6 +69,24 @@ export class HouseReservations {
   }
 
   /**
+   * **自分が取った予約を支払保証として使える額**（PR5 レビュー指摘）。
+   *
+   * `available()` は全予約を house 残高から引くので、予約を取った本人が
+   * 「自分で確保した枠」まで利用不可として扱われる。スロットのフリースピンのように
+   * 「予約を保持したまま、その予約の範囲で払う」処理はこちらを見る。
+   *
+   * ```text
+   * availableIncludingOwn(key) = house残高 − (予約総額 − その鍵の予約額)
+   * ```
+   *
+   * 存在しない鍵を渡した場合は `available()` と同じ（＝自己予約なし）。
+   */
+  availableIncludingOwn(key: string): number {
+    const own = this.get(key)?.amount ?? 0;
+    return Math.max(0, this.ether.balanceOf(HOUSE_HOLDER) - (this.totalReserved() - own));
+  }
+
+  /**
    * 予約を取る。**`available()` の再確認と INSERT を同一トランザクション**で行う。
    *
    * すでに同じ鍵で予約済みなら成功として扱う（同じ操作の再試行で二重に取らない）。
