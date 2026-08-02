@@ -88,20 +88,66 @@ function expectOpeningLocked(ctx: ReturnType<typeof fundedReset>, key: string): 
   expect((error as { code: string }).code).toBe("ERR_CASINO_OPENING_NOT_COMPLETE");
 }
 
-function seedProtectedData(ctx: ReturnType<typeof fundedReset>): void {
+function createProtectedTables(ctx: ReturnType<typeof fundedReset>): void {
   ctx.db.exec(`
-    DROP TABLE IF EXISTS vip_members;
-    DROP TABLE IF EXISTS stocks;
-    DROP TABLE IF EXISTS casino_stats;
-    DROP TABLE IF EXISTS quarantine_assets;
-    CREATE TABLE vip_members (user_id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
-    CREATE TABLE stocks (user_id TEXT NOT NULL, symbol TEXT NOT NULL, qty INTEGER NOT NULL, PRIMARY KEY(user_id, symbol));
-    CREATE TABLE casino_stats (user_id TEXT PRIMARY KEY, wins INTEGER NOT NULL, losses INTEGER NOT NULL);
-    CREATE TABLE quarantine_assets (holder_id TEXT PRIMARY KEY, amount INTEGER NOT NULL, reason TEXT NOT NULL);
-    INSERT INTO vip_members VALUES ('alice', 123456);
-    INSERT INTO stocks VALUES ('alice', 'MAMMON', 7);
-    INSERT INTO casino_stats VALUES ('alice', 3, 2);
-    INSERT INTO quarantine_assets VALUES ('sys:quarantine:test', 50, 'review');
+    CREATE TABLE IF NOT EXISTS casino_vip (
+      user_id TEXT PRIMARY KEY,
+      expires_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS casino_stocks (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      emoji TEXT NOT NULL,
+      price INTEGER NOT NULL,
+      prev_price INTEGER NOT NULL,
+      trend REAL NOT NULL,
+      last_update INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS casino_holdings (
+      user_id TEXT NOT NULL,
+      stock_id TEXT NOT NULL,
+      shares INTEGER NOT NULL,
+      avg_cost INTEGER NOT NULL,
+      bought_at INTEGER NOT NULL,
+      PRIMARY KEY(user_id, stock_id)
+    );
+    CREATE TABLE IF NOT EXISTS casino_stats (
+      user_id TEXT PRIMARY KEY,
+      games INTEGER NOT NULL,
+      wins INTEGER NOT NULL,
+      losses INTEGER NOT NULL,
+      total_wagered INTEGER NOT NULL,
+      total_earned INTEGER NOT NULL,
+      total_lost INTEGER NOT NULL,
+      biggest_win INTEGER NOT NULL,
+      current_win_streak INTEGER NOT NULL,
+      best_win_streak INTEGER NOT NULL,
+      current_lose_streak INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+}
+
+function seedBlockingProtectedData(ctx: ReturnType<typeof fundedReset>): void {
+  createProtectedTables(ctx);
+  ctx.db.exec(`
+    INSERT INTO casino_vip VALUES ('alice', 2000000000);
+    INSERT INTO casino_stocks VALUES ('hone', '骸骨精鉱', '💀', 1200, 1000, 0.1, 1);
+    INSERT INTO casino_holdings VALUES ('alice', 'hone', 7, 1100, 12345);
+    INSERT INTO casino_stats VALUES ('alice', 5, 3, 2, 500, 700, 400, 300, 1, 2, 0, 1);
+    INSERT INTO ether_balances (user_id, amount, updated_at)
+      VALUES ('sys:escrow:quarantine', 50, 1)
+      ON CONFLICT(user_id) DO UPDATE SET amount=50, updated_at=1;
+  `);
+}
+
+function seedNonBlockingProtectedData(ctx: ReturnType<typeof fundedReset>): void {
+  createProtectedTables(ctx);
+  ctx.db.exec(`
+    INSERT INTO casino_vip VALUES ('expired', 1);
+    INSERT INTO casino_stocks VALUES ('hone', '骸骨精鉱', '💀', 1200, 1000, 0.1, 1);
+    INSERT INTO casino_holdings VALUES ('alice', 'hone', 0, 0, 0);
+    INSERT INTO casino_stats VALUES ('alice', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1);
   `);
 }
 
@@ -168,6 +214,37 @@ describe("PR12 開業初期化 preflight", () => {
     ctx.db.close();
   });
 
+  it("正本の補償候補を実テーブルから対象者別に出し、一件でもあれば初期化を止める", () => {
+    const ctx = fundedReset();
+    seedBlockingProtectedData(ctx);
+    const plan = ctx.reset.dryRun(config);
+
+    expect(plan.protectedFindings.activeVip).toEqual([{ userId: "alice", expiresAt: 2_000_000_000 }]);
+    expect(plan.protectedFindings.stockHoldings).toEqual([{ userId: "alice", stockId: "hone", shares: 7, avgCost: 1_100, boughtAt: 12_345 }]);
+    expect(plan.protectedFindings.casinoStats).toEqual([expect.objectContaining({ userId: "alice", games: 5, totalWagered: 500 })]);
+    expect(plan.protectedFindings.quarantineChips).toBe(50);
+    expect(plan.blockers.join(" ")).toContain("active VIP compensation candidates: 1");
+    expect(plan.blockers.join(" ")).toContain("stock holding compensation candidates: 1");
+    expect(plan.blockers.join(" ")).toContain("casino stats preservation candidates: 1");
+    expect(plan.blockers.join(" ")).toContain("quarantine assets require manual attribution: 50");
+    ctx.db.close();
+  });
+
+  it("期限切れVIP・ゼロ株・ゼロ戦績・銘柄マスタはblockerにせず、内容を完全に保全する", async () => {
+    const ctx = fundedReset();
+    seedNonBlockingProtectedData(ctx);
+    const plan = ctx.reset.dryRun(config);
+    expect(plan.blockers).toEqual([]);
+    expect(plan.protectedRows).toEqual({ casino_vip: 1, casino_stocks: 1, casino_holdings: 1, casino_stats: 1 });
+
+    await ctx.reset.apply(applyInput(ctx, plan.planHash));
+    expect(ctx.db.prepare("SELECT * FROM casino_vip").all()).toEqual([{ user_id: "expired", expires_at: 1 }]);
+    expect(ctx.db.prepare("SELECT * FROM casino_stocks").all()).toEqual([{ id: "hone", name: "骸骨精鉱", emoji: "💀", price: 1200, prev_price: 1000, trend: 0.1, last_update: 1 }]);
+    expect(ctx.db.prepare("SELECT * FROM casino_holdings").all()).toEqual([{ user_id: "alice", stock_id: "hone", shares: 0, avg_cost: 0, bought_at: 0 }]);
+    expect(ctx.db.prepare("SELECT * FROM casino_stats").all()).toEqual([{ user_id: "alice", games: 0, wins: 0, losses: 0, total_wagered: 0, total_earned: 0, total_lost: 0, biggest_win: 0, current_win_streak: 0, best_win_streak: 0, current_lose_streak: 0, updated_at: 1 }]);
+    ctx.db.close();
+  });
+
   it("hash、バックアップ、fake Discord adapterを要求し、apply成功後だけ1:1操作を解放する", async () => {
     const ctx = fundedReset();
     fundPlayerLand(ctx);
@@ -201,16 +278,8 @@ describe("PR12 開業初期化 preflight", () => {
         { from_account: string; to_account: string; amount: number };
 
     expect(CASINO_DEPARTMENT).toBe("sys:dept:賭博場");
-    expect(txById(applied.oldSettlementLandTxId)).toEqual({
-      from_account: ETHER_ESCROW,
-      to_account: CASINO_DEPARTMENT,
-      amount: 1_500,
-    });
-    expect(txById(applied.newInvestmentLandTxId)).toEqual({
-      from_account: CASINO_DEPARTMENT,
-      to_account: CHIP_ESCROW,
-      amount: 1_000,
-    });
+    expect(txById(applied.oldSettlementLandTxId)).toEqual({ from_account: ETHER_ESCROW, to_account: CASINO_DEPARTMENT, amount: 1_500 });
+    expect(txById(applied.newInvestmentLandTxId)).toEqual({ from_account: CASINO_DEPARTMENT, to_account: CHIP_ESCROW, amount: 1_000 });
     expect(ctx.ledger.balanceOf(ETHER_ESCROW)).toBe(0);
     expect(ctx.ledger.balanceOf(CHIP_ESCROW)).toBe(1_000);
     expect(ctx.ledger.balanceOf(CASINO_DEPARTMENT)).toBe(500);
@@ -218,31 +287,16 @@ describe("PR12 開業初期化 preflight", () => {
     ctx.db.close();
   });
 
-  it("VIP・株・戦績・隔離データは存在してもblockerにせず、内容を完全に保全する", async () => {
+  it("adapter実行中に準備・保全データが変われば、資金初期化前にstale拒否する", async () => {
     const ctx = fundedReset();
-    seedProtectedData(ctx);
-    const plan = ctx.reset.dryRun(config);
-    expect(plan.blockers).toEqual([]);
-    expect(plan.protectedRows).toEqual({ vip_members: 1, stocks: 1, casino_stats: 1, quarantine_assets: 1 });
-
-    await ctx.reset.apply(applyInput(ctx, plan.planHash));
-    expect(ctx.db.prepare("SELECT * FROM vip_members").all()).toEqual([{ user_id: "alice", expires_at: 123456 }]);
-    expect(ctx.db.prepare("SELECT * FROM stocks").all()).toEqual([{ user_id: "alice", symbol: "MAMMON", qty: 7 }]);
-    expect(ctx.db.prepare("SELECT * FROM casino_stats").all()).toEqual([{ user_id: "alice", wins: 3, losses: 2 }]);
-    expect(ctx.db.prepare("SELECT * FROM quarantine_assets").all()).toEqual([{ holder_id: "sys:quarantine:test", amount: 50, reason: "review" }]);
-    ctx.db.close();
-  });
-
-  it("保全対象がadapter実行中に変わった場合は資金初期化前に停止する", async () => {
-    const ctx = fundedReset();
-    seedProtectedData(ctx);
+    seedNonBlockingProtectedData(ctx);
     const plan = ctx.reset.dryRun(config);
     const adapters = cleanAdapters();
     adapters.discord.disableLegacyCasino = async () => {
-      ctx.db.prepare("UPDATE vip_members SET expires_at=999999 WHERE user_id='alice'").run();
+      ctx.db.prepare("UPDATE casino_stocks SET price=9999 WHERE id='hone'").run();
     };
 
-    await expect(ctx.reset.apply(applyInput(ctx, plan.planHash, adapters))).rejects.toThrow("protected casino data");
+    await expect(ctx.reset.apply(applyInput(ctx, plan.planHash, adapters))).rejects.toThrow("stale after adapters");
     expect(ctx.status.current().status).toBe("opening_reset");
     expect(ctx.ledger.balanceOf(ETHER_ESCROW)).toBe(1_000);
     expect(ctx.ledger.balanceOf(CHIP_ESCROW)).toBe(0);
@@ -271,13 +325,8 @@ describe("PR12 開業初期化 preflight", () => {
     const ctx = fundedReset();
     fundPlayerLand(ctx);
     const plan = ctx.reset.dryRun(config);
-    const backup: OpeningBackupAdapter = {
-      backup: async () => { throw new Error("archive unavailable"); },
-    };
-    await expect(ctx.reset.apply({
-      ...applyInput(ctx, plan.planHash),
-      backup,
-    })).rejects.toThrow("archive unavailable");
+    const backup: OpeningBackupAdapter = { backup: async () => { throw new Error("archive unavailable"); } };
+    await expect(ctx.reset.apply({ ...applyInput(ctx, plan.planHash), backup })).rejects.toThrow("archive unavailable");
     expect(ctx.status.current().status).toBe("opening_reset");
     expect(ctx.ledger.balanceOf(ETHER_ESCROW)).toBe(1_000);
     expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_opening_reset_plans").get()).toEqual({ n: 0 });
