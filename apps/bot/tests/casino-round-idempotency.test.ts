@@ -6,6 +6,7 @@ import {
   EtherExchange,
   EventLog,
   HOUSE_HOLDER,
+  FreeSpins,
   Items,
   JACKPOT_HOLDER,
   Ledger,
@@ -15,7 +16,7 @@ import {
   type CasinoRng,
 } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
-import { spinOnce } from "../src/casino/slots.js";
+import { resolveFreeSpin, spinPaid } from "../src/casino/slots.js";
 import { settleChinchiroRound } from "../src/casino/chinchiro.js";
 import { settleRoulette } from "../src/casino/roulette.js";
 import { drawNagareboshi, ensureNagareboshiTable } from "../src/commands/nagareboshi.js";
@@ -37,8 +38,9 @@ function setup(rng: CasinoRng) {
   const items = new Items(db);
   const casino = new Casino(db, ether, events, { items });
   const escrow = new Escrow(db, ether, events);
-  const services = { db, ether, casino, items, escrow, rng, events } as unknown as Services;
-  return { db, chipTx, ether, casino, items, escrow, services };
+  const freeSpins = new FreeSpins(db);
+  const services = { db, ether, casino, items, escrow, freeSpins, rng, events } as unknown as Services;
+  return { db, chipTx, ether, casino, items, escrow, freeSpins, services };
 }
 
 /** 監査経路を通さずに残高を作る（テストの下ごしらえ専用） */
@@ -57,18 +59,21 @@ const CROWN = 0.85;
 
 describe("スロット: 通常スピンとフリースピンは別のグループ", () => {
   it("フリースピンの配当が実際に加算され、グループが2つできる", () => {
-    // 1回目: ✨✨✨（フリースピン獲得・配当0） / 2回目: 👑👑👑（25倍）
+    // 1回目: ✨✨✨（フリースピン獲得・配当0） / 無料スピンの出目: 👑👑👑（25倍）
     const ctx = setup(scriptedRng([SCATTER, SCATTER, SCATTER, CROWN, CROWN, CROWN]));
     seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
     seedBalance(ctx.db, "u1", 10_000);
     const bet = 1_000;
 
-    const paid = spinOnce(ctx.services, "u1", bet, "int-1", 0);
+    const paid = spinPaid(ctx.services, "u1", bet, "int-1");
     expect(paid.freeSpin).toBe(true);
     expect(paid.payout).toBe(0);
     expect(ctx.ether.balanceOf("u1")).toBe(9_000);
+    // 無料スピン権は有料スピンと同じトランザクションで DB に残っている
+    expect(paid.pendingFreeSpin).not.toBeNull();
+    expect(paid.pendingFreeSpin!.status).toBe("pending");
 
-    const free = spinOnce(ctx.services, "u1", bet, "int-1", 1);
+    const free = resolveFreeSpin(ctx.services, paid.pendingFreeSpin!);
     expect(free.matched).toBe("王冠");
     expect(free.payout).toBe(bet * 25);
     // 無料スピンなので賭けは引かれず、配当だけ増える
@@ -87,13 +92,13 @@ describe("スロット: 通常スピンとフリースピンは別のグルー�
     seedBalance(ctx.db, "u1", 10_000);
     const bet = 1_000;
 
-    const paid = spinOnce(ctx.services, "u1", bet, "int-1", 0);
-    const free = spinOnce(ctx.services, "u1", bet, "int-1", 1);
+    const paid = spinPaid(ctx.services, "u1", bet, "int-1");
+    const free = resolveFreeSpin(ctx.services, paid.pendingFreeSpin!);
     const balanceAfter = ctx.ether.balanceOf("u1");
 
     // 再実行: リール・役・フリースピン獲得・配当のすべてが保存済みの値で返る
-    expect(spinOnce(ctx.services, "u1", bet, "int-1", 0)).toEqual(paid);
-    expect(spinOnce(ctx.services, "u1", bet, "int-1", 1)).toEqual(free);
+    expect(spinPaid(ctx.services, "u1", bet, "int-1")).toEqual(paid);
+    expect(resolveFreeSpin(ctx.services, paid.pendingFreeSpin!)).toEqual(free);
     expect(ctx.ether.balanceOf("u1")).toBe(balanceAfter);
     expect(ctx.casino.stats("u1").games).toBe(1); // 有料スピン1回ぶんだけ
     ctx.db.close();

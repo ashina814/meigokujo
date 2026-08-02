@@ -7,9 +7,11 @@ import {
   EtherExchange,
   Escrow,
   EventLog,
+  FreeSpins,
   HOUSE_HOLDER,
   Items,
   Ledger,
+  Markets,
   Vip,
   CRASH_MAX_MULT_CAP,
   getConsumableDef,
@@ -20,7 +22,7 @@ import {
   type CasinoRng,
 } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
-import { spinOnce } from "../src/casino/slots.js";
+import { FreeSpinUnpayableError, resolveFreeSpin, resumePendingFreeSpins, spinPaid } from "../src/casino/slots.js";
 import { cashOutMultiplier } from "../src/casino/crash.js";
 import {
   MAX_BET,
@@ -46,7 +48,16 @@ registerDefaultTxTypes();
  */
 
 function setup(rng: CasinoRng = scriptedRng([0.5])) {
-  const db = openDb(":memory:");
+  return rebuild(openDb(":memory:"), rng);
+}
+
+/**
+ * 同じ DB の上にサービス一式を**もう一度**組み立てる。
+ *
+ * 本番の `buildServices()` と同じ形なので、これを呼ぶこと自体が
+ * 「プロセスが落ちて再起動した」の模擬になる（DB に残っていない状態は当然消える）。
+ */
+function rebuild(db: ReturnType<typeof openDb>, rng: CasinoRng = scriptedRng([0.5])) {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
@@ -54,14 +65,15 @@ function setup(rng: CasinoRng = scriptedRng([0.5])) {
   const items = new Items(db);
   const casino = new Casino(db, ether, events, { items });
   const vip = new Vip(db, ether, events);
-  // 本番（services.ts）と同じ配線。対人卓の預託・返金・配当を通算損益へ流す
-  const escrow = new Escrow(db, ether, events, {
-    onHolderNet: (holderId, net) => {
-      if (isPlayerHolder(holderId)) casino.recordGameNet(holderId, net);
-    },
-  });
-  const services = { db, ether, casino, items, vip, escrow, rng, events } as unknown as Services;
-  return { db, chipTx, ether, casino, items, vip, escrow, events, services };
+  // 本番（services.ts）と同じ配線。**確定精算のときだけ**通算損益へ足す
+  const recordPlayerNet = (userId: string, net: number) => {
+    if (isPlayerHolder(userId)) casino.recordGameNet(userId, net);
+  };
+  const escrow = new Escrow(db, ether, events, { onPlayerNet: recordPlayerNet });
+  const markets = new Markets(db, ether, events, { onPlayerNet: recordPlayerNet });
+  const freeSpins = new FreeSpins(db);
+  const services = { db, ether, casino, items, vip, escrow, markets, freeSpins, rng, events } as unknown as Services;
+  return { db, chipTx, ether, casino, items, vip, escrow, markets, freeSpins, events, services };
 }
 
 function seedBalance(db: ReturnType<typeof openDb>, holder: string, amount: number): void {
@@ -194,45 +206,156 @@ describe("② VIP の賭け上限が到達可能", () => {
   });
 });
 
-describe("③ フリースピンの配当が黙って消えない", () => {
-  it("胴元が払えないときは配当0で理由が残る（画面に出た額だけ増えないをやめる）", () => {
+describe("③ フリースピンの取りこぼしが起きない", () => {
+  it("胴元が払えるときは全額支払われ、保留記録が settled になる", () => {
+    const ctx = setup(scriptedRng([SCATTER, SCATTER, SCATTER, CROWN, CROWN, CROWN]));
+    seedBalance(ctx.db, "u1", 10_000);
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+
+    const paid = spinPaid(ctx.services, "u1", 1_000, "int-1");
+    const before = ctx.ether.balanceOf("u1");
+    const free = resolveFreeSpin(ctx.services, paid.pendingFreeSpin!);
+    expect(free.payout).toBe(25_000);
+    expect(ctx.ether.balanceOf("u1")).toBe(before + 25_000);
+    expect(ctx.freeSpins.get(paid.pendingFreeSpin!.id)!.status).toBe("settled");
+    expect(ctx.freeSpins.pendingCount()).toBe(0);
+    ctx.db.close();
+  });
+
+  it("胴元が払えないときは権利を残したまま巻き戻す（配当0で完了扱いにしない）", () => {
     const ctx = setup(scriptedRng([SCATTER, SCATTER, SCATTER, CROWN, CROWN, CROWN]));
     const bet = 1_000;
     seedBalance(ctx.db, "u1", 10_000);
     // 有料スピンぶんは払えるが、25倍のフリースピン配当には全く足りない胴元
     seedBalance(ctx.db, HOUSE_HOLDER, 5_000);
 
-    const paid = spinOnce(ctx.services, "u1", bet, "int-1", 0);
+    const paid = spinPaid(ctx.services, "u1", bet, "int-1");
     expect(paid.freeSpin).toBe(true);
     const before = ctx.ether.balanceOf("u1");
 
-    const free = spinOnce(ctx.services, "u1", bet, "int-1", 1);
-    expect(free.matched).toBe("王冠");
-    // 払えない額は「払った」ことにしない
-    expect(free.payout).toBe(0);
-    expect(free.unpaid).toBe(bet * 25);
+    expect(() => resolveFreeSpin(ctx.services, paid.pendingFreeSpin!)).toThrow(FreeSpinUnpayableError);
+
     expect(ctx.ether.balanceOf("u1")).toBe(before);
-    // 記録の無い取引を作らない（明細は0行）
+    // 記録の無い取引を作らない（明細も group も残らない）
     expect(ctx.chipTx.listByGroup("slots:spin:u1:int-1:free:1")).toEqual([]);
+    expect(ctx.chipTx.getGroup("slots:spin:u1:int-1:free:1")).toBeUndefined();
+    // **権利は消えていない**
+    expect(ctx.freeSpins.get(paid.pendingFreeSpin!.id)!.status).toBe("pending");
     // 運営が後から気づける
     const logged = ctx.db
       .prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'casino_house_insufficient'")
       .get() as { n: number };
     expect(logged.n).toBe(1);
+
+    // 胴元に資金が戻れば、同じ出目で払える
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    const free = resolveFreeSpin(ctx.services, paid.pendingFreeSpin!);
+    expect(free.matched).toBe("王冠");
+    expect(free.payout).toBe(bet * 25);
+    expect(ctx.ether.balanceOf("u1")).toBe(before + bet * 25);
     ctx.db.close();
   });
+});
 
-  it("胴元が払えるときは従来どおり全額支払われる", () => {
-    const ctx = setup(scriptedRng([SCATTER, SCATTER, SCATTER, CROWN, CROWN, CROWN]));
+/**
+ * レビュー指摘の本体。有料スピンとフリースピンは別 group なので、
+ * 「有料が settled → 演出中に落ちる」で無料スピン権が消えていた。
+ * 権利を DB に持たせて、プロセスの寿命と切り離す。
+ */
+describe("③b フリースピン権はプロセスをまたいで残る", () => {
+  const REELS = [SCATTER, SCATTER, SCATTER, CROWN, CROWN, CROWN];
+
+  it("有料スピン確定直後にプロセスが落ちても、再構築したサービスから同じ無料スピンを再開できる", () => {
+    const ctx = setup(scriptedRng(REELS));
     seedBalance(ctx.db, "u1", 10_000);
     seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
 
-    spinOnce(ctx.services, "u1", 1_000, "int-1", 0);
-    const before = ctx.ether.balanceOf("u1");
-    const free = spinOnce(ctx.services, "u1", 1_000, "int-1", 1);
+    const paid = spinPaid(ctx.services, "u1", 1_000, "int-1");
+    expect(paid.pendingFreeSpin).not.toBeNull();
+    const balanceAfterPaid = ctx.ether.balanceOf("u1");
+
+    // ── ここでプロセスが落ちたとみなす。同じ DB から**別のサービス一式**を組み直す ──
+    const restarted = rebuild(ctx.db, scriptedRng([0.01, 0.01, 0.01])); // 乱数は別物にしておく
+
+    const pending = restarted.freeSpins.listPending("u1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.operationId).toBe("int-1");
+    expect(pending[0]!.bet).toBe(1_000);
+    expect(pending[0]!.sourceGroup).toBe("slots:spin:u1:int-1:paid");
+
+    const free = resolveFreeSpin(restarted.services, pending[0]!);
+    // 出目は獲得時に確定・保存してあるので、乱数を差し替えても同じ
+    expect(free.reels).toEqual(paid.pendingFreeSpin!.reels);
+    expect(free.matched).toBe("王冠");
     expect(free.payout).toBe(25_000);
-    expect(free.unpaid).toBe(0);
+    expect(restarted.ether.balanceOf("u1")).toBe(balanceAfterPaid + 25_000);
+    ctx.db.close();
+  });
+
+  it("同じ無料スピンを二度処理しても一度しか払わない", () => {
+    const ctx = setup(scriptedRng(REELS));
+    seedBalance(ctx.db, "u1", 10_000);
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+
+    const paid = spinPaid(ctx.services, "u1", 1_000, "int-1");
+    const first = resolveFreeSpin(ctx.services, paid.pendingFreeSpin!);
+    const after = ctx.ether.balanceOf("u1");
+
+    // 再開経路からもう一度・別サービスからもう一度
+    const restarted = rebuild(ctx.db, scriptedRng([0.5]));
+    const second = resolveFreeSpin(restarted.services, paid.pendingFreeSpin!);
+    resumePendingFreeSpins(restarted.services);
+
+    expect(second).toEqual(first);
+    expect(restarted.ether.balanceOf("u1")).toBe(after);
+    expect(restarted.chipTx.listByGroup("slots:spin:u1:int-1:free:1")).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("賭場が停止中は動かず、権利だけ残る", () => {
+    const ctx = setup(scriptedRng(REELS));
+    seedBalance(ctx.db, "u1", 10_000);
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    const paid = spinPaid(ctx.services, "u1", 1_000, "int-1");
+    const before = ctx.ether.balanceOf("u1");
+
+    // 賭場を閉じる（資金グループそのものが作れなくなる＝本番と同じ止め方）
+    ctx.chipTx.setClosedReason(() => "テストで閉場中");
+
+    expect(() => resolveFreeSpin(ctx.services, paid.pendingFreeSpin!)).toThrow();
+    expect(ctx.ether.balanceOf("u1")).toBe(before);
+    expect(ctx.freeSpins.get(paid.pendingFreeSpin!.id)!.status).toBe("pending");
+
+    // 再開後に払える
+    ctx.chipTx.setClosedReason(() => null);
+    const free = resolveFreeSpin(ctx.services, paid.pendingFreeSpin!);
+    expect(free.payout).toBe(25_000);
     expect(ctx.ether.balanceOf("u1")).toBe(before + 25_000);
+    ctx.db.close();
+  });
+
+  it("起動時の一括再開で払われ、払えなかったぶんは権利が残る", () => {
+    const ctx = setup(scriptedRng(REELS));
+    seedBalance(ctx.db, "u1", 10_000);
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    spinPaid(ctx.services, "u1", 1_000, "int-1");
+
+    // 胴元を空にして起動 → 払えないので権利が残る
+    seedBalance(ctx.db, HOUSE_HOLDER, 0);
+    let boot = rebuild(ctx.db, scriptedRng([0.5]));
+    let r = resumePendingFreeSpins(boot.services);
+    expect(r.total).toBe(1);
+    expect(r.settled).toBe(0);
+    expect(r.failed).toHaveLength(1);
+    expect(boot.freeSpins.pendingCount()).toBe(1);
+
+    // 資金を入れてもう一度起動 → 払われる
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    boot = rebuild(ctx.db, scriptedRng([0.5]));
+    r = resumePendingFreeSpins(boot.services);
+    expect(r.settled).toBe(1);
+    expect(r.paid).toBe(25_000);
+    expect(boot.freeSpins.pendingCount()).toBe(0);
     ctx.db.close();
   });
 });
@@ -381,9 +504,9 @@ describe("⑤ 通算損益がゲーム由来の実現損益と一致する", () 
     seedBalance(ctx.db, HOUSE_HOLDER, 10_000_000);
     const before = ctx.ether.balanceOf("u1");
 
-    const paid = spinOnce(ctx.services, "u1", 1_000, "int-1", 0);
+    const paid = spinPaid(ctx.services, "u1", 1_000, "int-1");
     expect(paid.freeSpin).toBe(true);
-    const free = spinOnce(ctx.services, "u1", 1_000, "int-1", 1);
+    const free = resolveFreeSpin(ctx.services, paid.pendingFreeSpin!);
     expect(free.payout).toBe(25_000);
 
     // JP 当選（賭けを伴わない払い出し）
@@ -439,6 +562,91 @@ describe("⑤ 通算損益がゲーム由来の実現損益と一致する", () 
     expect(collectStakes(ctx.services, ["winner"], bet, "op-2", "sess-2", "テスト対人")).toBe(true);
     refundAll(ctx.services, ["winner"], bet, "op-2", "sess-2");
     expect(netOf(ctx, "winner")).toBe(bet - houseCut);
+    ctx.db.close();
+  });
+
+  /**
+   * レビュー指摘: 預託時に −stake、返金時に +stake を記録していたので、
+   * 「対局中なのに通算負けが増える」「全額返金なのに earned と lost が両方膨らむ」。
+   * 記録は**確定精算のときだけ**にする。
+   */
+  it("預託しただけでは通算損益が動かない（対局中に負けが増えない）", () => {
+    const ctx = setup();
+    seedBalance(ctx.db, "a", 100_000);
+    seedBalance(ctx.db, "b", 100_000);
+
+    expect(collectStakes(ctx.services, ["a", "b"], 10_000, "op-1", "sess-1", "テスト対人")).toBe(true);
+    // 卓は立っているが、まだ何も確定していない
+    for (const u of ["a", "b"]) {
+      const s = ctx.casino.stats(u);
+      expect(s.total_earned, u).toBe(0);
+      expect(s.total_lost, u).toBe(0);
+    }
+    ctx.db.close();
+  });
+
+  it("全額返金では total_earned も total_lost も膨らまない", () => {
+    const ctx = setup();
+    seedBalance(ctx.db, "a", 100_000);
+    seedBalance(ctx.db, "b", 100_000);
+
+    collectStakes(ctx.services, ["a", "b"], 10_000, "op-1", "sess-1", "テスト対人");
+    refundAll(ctx.services, ["a", "b"], 10_000, "op-1", "sess-1");
+
+    for (const u of ["a", "b"]) {
+      const s = ctx.casino.stats(u);
+      expect(s.total_earned, u).toBe(0);
+      expect(s.total_lost, u).toBe(0);
+      expect(ctx.ether.balanceOf(u), u).toBe(100_000);
+    }
+    ctx.db.close();
+  });
+
+  it("起動時の孤児返金でも通算損益が動かない", () => {
+    const ctx = setup();
+    seedBalance(ctx.db, "a", 100_000);
+    collectStakes(ctx.services, ["a"], 10_000, "op-1", "sess-1", "テスト対人");
+
+    // 再起動して孤児として返金される経路
+    const boot = rebuild(ctx.db);
+    boot.escrow.sweepAll("system:startup");
+
+    expect(boot.ether.balanceOf("a")).toBe(100_000);
+    const s = boot.casino.stats("a");
+    expect(s.total_earned).toBe(0);
+    expect(s.total_lost).toBe(0);
+    ctx.db.close();
+  });
+
+  it("板（予想市場）の確定精算も通算損益に載る", () => {
+    const ctx = setup();
+    seedBalance(ctx.db, "hit", 100_000);
+    seedBalance(ctx.db, "miss", 100_000);
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    const hitBefore = ctx.ether.balanceOf("hit");
+    const missBefore = ctx.ether.balanceOf("miss");
+
+    const m = ctx.markets.create({
+      guildId: "g", creatorId: "admin", title: "テスト板",
+      options: ["A", "B"], durationMin: 60, payoutMode: "parimutuel", fee: 0, operationId: "m1",
+    });
+    ctx.markets.bet(m.id, "hit", 0, 10_000, "b1");
+    ctx.markets.bet(m.id, "miss", 1, 10_000, "b2");
+    // 張っただけでは動かない
+    expect(ctx.casino.stats("hit").total_earned).toBe(0);
+    expect(ctx.casino.stats("miss").total_lost).toBe(0);
+
+    // 締切 → 結果報告 → 参加者全員が承認 → 精算
+    ctx.markets.close(m.id, "admin");
+    ctx.markets.report(m.id, "admin", 0, true);
+    ctx.markets.approve(m.id, "hit");
+    const done = ctx.markets.approve(m.id, "miss");
+    expect(done.settled).not.toBeNull();
+
+    expect(netOf(ctx, "hit")).toBe(ctx.ether.balanceOf("hit") - hitBefore);
+    expect(netOf(ctx, "miss")).toBe(ctx.ether.balanceOf("miss") - missBefore);
+    expect(netOf(ctx, "miss")).toBe(-10_000);
+    expect(netOf(ctx, "hit")).toBeGreaterThan(0);
     ctx.db.close();
   });
 

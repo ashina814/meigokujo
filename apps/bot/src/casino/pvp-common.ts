@@ -133,11 +133,9 @@ export function collectStakes(
         for (const u of userIds) {
           if (services.ether.balanceOf(u) < bet) throw new StakeShortfall();
         }
-        for (const u of userIds) {
-          services.ether.transfer(u, HOUSE_HOLDER, bet, { reason: "対人戦の賭け金", game });
-          // 通算損益（PR3）。session ありの経路は Escrow 側の onHolderNet が同じことをする
-          services.casino.recordGameNet(u, -bet);
-        }
+        // 通算損益はここでは動かさない（PR3）。徴収は「まだ何も確定していない」状態で、
+        // 対局中なのに通算負けが増えるのは定義に合わない。記録は精算のとき一度だけ
+        for (const u of userIds) services.ether.transfer(u, HOUSE_HOLDER, bet, { reason: "対人戦の賭け金", game });
         return true;
       },
     );
@@ -165,12 +163,33 @@ export function refundAll(services: Services, userIds: string[], bet: number, op
     return;
   }
   services.ether.runGroup({ groupKey: `pvp:refund:${operationId}`, kind: "table_refund", actorId: "system:pvp" }, () => {
-    for (const u of userIds) {
-      services.ether.transfer(HOUSE_HOLDER, u, bet, { reason: "対人戦の不成立返金" });
-      // 徴収時の −bet を打ち消す。返金では通算損益が動かない（PR3）
-      services.casino.recordGameNet(u, bet);
-    }
+    // 返金でも通算損益は動かさない（徴収時にも記録していないので差引0のまま・PR3）
+    for (const u of userIds) services.ether.transfer(HOUSE_HOLDER, u, bet, { reason: "対人戦の不成立返金" });
   });
+}
+
+/**
+ * 旧経路（session なし）の通算損益（PR3）。
+ *
+ * 「徴収時に −bet、配当時に +share」と分けて記録すると、対局中なのに通算負けが増え、
+ * 不成立返金でも total_earned / total_lost が両方膨らむ。
+ * **確定精算のときに、利用者ごとの純損益を一度だけ**記録する。
+ * 場代は「受取が出した額を下回る」形で自然に損失側へ入る。
+ *
+ * 呼び出し元は必ず精算の資金グループの中なので、再試行では二度呼ばれない。
+ * session ありの経路は `Escrow.settle` が帳簿から同じ計算をする。
+ */
+function recordPvpNet(
+  services: Services,
+  stakes: ReadonlyArray<{ userId: string; amount: number }> | undefined,
+  received: ReadonlyMap<string, number>,
+): void {
+  if (!stakes || stakes.length === 0) return;
+  const staked = new Map<string, number>();
+  for (const s of stakes) staked.set(s.userId, (staked.get(s.userId) ?? 0) + s.amount);
+  for (const [userId, stake] of staked) {
+    services.casino.recordGameNet(userId, (received.get(userId) ?? 0) - stake);
+  }
 }
 
 /**
@@ -185,6 +204,11 @@ export function settlePvp(
   pot: number,
   operationId: string,
   session?: string,
+  /**
+   * 旧経路（session なし）で通算損益を出すための「誰がいくら出したか」（PR3）。
+   * session ありなら `Escrow.settle` が帳簿から同じことをするので不要。
+   */
+  stakes?: ReadonlyArray<{ userId: string; amount: number }>,
 ): { payout: number; houseCut: number } {
   const houseCut = Math.floor(pot * HOUSE_CUT);
   const distributable = pot - houseCut;
@@ -213,17 +237,23 @@ export function settlePvp(
     { groupKey: `pvp:settle:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
     () => {
       if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
-      if (winners.length === 0) return { payout: 0, houseCut };
+      if (winners.length === 0) {
+        recordPvpNet(services, stakes, new Map());
+        return { payout: 0, houseCut };
+      }
       const share = Math.floor(distributable / winners.length);
       const remainder = distributable - share * winners.length;
+      const received = new Map<string, number>();
       for (const w of winners) {
         services.ether.transfer(src, w, share, { reason: "対人戦の配当" });
-        services.casino.recordGameNet(w, share);
+        received.set(w, (received.get(w) ?? 0) + share);
       }
       if (remainder > 0) {
         services.ether.transfer(src, winners[0]!, remainder, { reason: "対人戦の配当（端数）" });
-        services.casino.recordGameNet(winners[0]!, remainder);
+        received.set(winners[0]!, (received.get(winners[0]!) ?? 0) + remainder);
       }
+      // 通算損益は「受取 − 出した額」を精算時に一度だけ（PR3）
+      recordPvpNet(services, stakes, received);
       return { payout: distributable, houseCut };
     },
   );
@@ -269,6 +299,7 @@ export function settleProportional(
     { groupKey: `pvp:settle_proportional:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
     () => {
       if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
+      const received = new Map<string, number>();
       let remaining = distributable;
       for (let i = 0; i < winners.length; i++) {
         const w = winners[i]!;
@@ -276,10 +307,12 @@ export function settleProportional(
         const share = isLast ? remaining : Math.floor((distributable * w.bet) / winnerPot);
         if (share > 0) {
           services.ether.transfer(src, w.userId, share, { reason: "対人戦の比例配当" });
-          services.casino.recordGameNet(w.userId, share);
+          received.set(w.userId, (received.get(w.userId) ?? 0) + share);
         }
         remaining -= share;
       }
+      // 通算損益は「受取 − 出した額」を精算時に一度だけ（PR3）
+      recordPvpNet(services, [...winners, ...losers].map((p) => ({ userId: p.userId, amount: p.bet })), received);
     },
   );
   return { totalHouseCut: houseCut };
