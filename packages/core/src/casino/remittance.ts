@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { deptAccount } from "../departments/service.js";
 import { Ledger, TREASURY } from "../ledger/service.js";
-import { ChipLedger, HOUSE_HOLDER, isPlayerHolder } from "./chip-ledger.js";
+import { CASINO_DEPARTMENT_KEY, ChipLedger, HOUSE_HOLDER, isPlayerHolder } from "./chip-ledger.js";
 import { HouseReservations } from "./reservations.js";
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -36,8 +36,12 @@ export interface RemittanceSnapshot {
   bps: number;
   minimumWorkingCapital: number;
   fukuReserve: number;
-  realizedProfit: number;
-  undisposedProfit: number;
+  /** `period` 単月の実現損益。報告用で、納付上限には使わない。 */
+  periodRealizedProfit: number;
+  /** 全期間の実現損益。 */
+  cumulativeRealizedProfit: number;
+  /** 全期間の実現損益 − 全期間のexecuted納付額。納付上限はこれ。 */
+  cumulativeUndisposedProfit: number;
   houseBalance: number;
   reservedObligations: number;
   surplus: number;
@@ -136,7 +140,7 @@ export class CasinoRemittance {
     private readonly ledger: Ledger,
     private readonly chips: ChipLedger,
     private readonly reservations: HouseReservations,
-    private readonly departmentKey = "casino",
+    private readonly departmentKey = CASINO_DEPARTMENT_KEY,
   ) {
     ledger.ensureAccount(deptAccount(departmentKey), "system");
     db.exec(`
@@ -262,13 +266,20 @@ export class CasinoRemittance {
     validNonNegative(minimumWorkingCapital, "minimum working capital");
     validNonNegative(fukuReserve, "fuku reserve");
     if (!Number.isSafeInteger(bps) || bps < 0 || bps > 10_000) throw new Error("invalid bps");
-    const realizedProfit = this.cumulativeProfit(period);
-    const undisposedProfit = Math.max(0, this.cumulativeUndisposedProfit(period));
+    // 納付上限は「全期間の未処分利益」。月で切ると前月からの繰り越しが落ちるので、
+    // period は報告のためだけに使い、上限計算へは持ち込まない（正本16.3）。
+    const periodRealizedProfit = this.cumulativeProfit(period);
+    const cumulativeRealizedProfit = this.cumulativeProfit();
+    const cumulativeUndisposedProfit = Math.max(0, this.cumulativeUndisposedProfit());
     const reservedObligations = this.reservations.totalReserved();
     const houseBalance = this.chips.balanceOf(HOUSE_HOLDER);
     const surplus = Math.max(0, houseBalance - reservedObligations - minimumWorkingCapital - fukuReserve);
-    const base = Math.min(undisposedProfit, surplus);
-    return { period, bps, minimumWorkingCapital, fukuReserve, realizedProfit, undisposedProfit, houseBalance, reservedObligations, surplus, base, amount: Math.floor(base * bps / 10_000) };
+    const base = Math.min(cumulativeUndisposedProfit, surplus);
+    return {
+      period, bps, minimumWorkingCapital, fukuReserve,
+      periodRealizedProfit, cumulativeRealizedProfit, cumulativeUndisposedProfit,
+      houseBalance, reservedObligations, surplus, base, amount: Math.floor(base * bps / 10_000),
+    };
   }
 
   draft(key: string, bps: number, minimumWorkingCapital: number, actor: string, options: RemittanceDraftOptions = {}): RemittanceRow {
@@ -367,19 +378,25 @@ export class CasinoRemittance {
   execute(key: string, actor: string): RemittanceRow {
     const row = this.get(key);
     if (!row || row.status !== "approved" || !row.approvedBy) throw new Error("not approved");
-    this.assertFresh(row);
     const group = `casino:${row.kind}:${key}`;
     const dept = deptAccount(this.departmentKey);
 
     if (row.amount === 0) {
-      if (this.db.prepare("UPDATE casino_remittances SET status='executed', executed_by=?, executed_at=?, chip_group_key=? WHERE key=? AND status='approved'").run(actor, now(), group, key).changes !== 1) {
-        throw new Error("execute race");
-      }
+      // 金額0でも、fresh判定とCASを同じSQLiteトランザクションで閉じる。
+      this.db.transaction(() => {
+        this.assertFresh(row);
+        if (this.db.prepare("UPDATE casino_remittances SET status='executed', executed_by=?, executed_at=?, chip_group_key=? WHERE key=? AND status='approved'").run(actor, now(), group, key).changes !== 1) {
+          throw new Error("execute race");
+        }
+      }).immediate();
       return this.get(key)!;
     }
 
     let landTxId: number | null = null;
     this.chips.runGroup({ groupKey: group, kind: row.kind, actorId: actor }, () => {
+      // 予約額・house残高は他の操作で動く。判定を資金移動と同じトランザクションへ入れ、
+      // 「判定してから動かすまで」の隙間を無くす。
+      this.assertFresh(row);
       if (row.kind === "remittance") {
         this.chips.redeemToAccount(HOUSE_HOLDER, row.amount, dept, actor, `${group}:redeem`);
         landTxId = this.ledger.transfer({
