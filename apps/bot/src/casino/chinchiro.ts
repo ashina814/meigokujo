@@ -519,7 +519,7 @@ async function runRoundInner(
       ? `\n${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
       : "";
     const fukuLine = settled.fukuTax > 0
-      ? `\n⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
+      ? `\n⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 福分け積立`
       : "";
     payoutText = `💰 配当 ${fmtEther(settled.payout)}（利益 +${fmtEther(settled.net)}）${chainLine}${fukuLine}`;
     broadcastBigWin(interaction.client, services, { userId: uid, game: "チンチロ", bet, payout: settled.payout });

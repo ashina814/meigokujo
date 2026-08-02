@@ -97,7 +97,7 @@ function renderHome(userId: string, services: Services, serverName?: string) {
 
   const dailyValue = dailyReady
     ? `${E.sparkle} **今すぐ受け取れる** → \`/福分け\``
-    : `次は <t:${nextClaim}:R>  ／  連続 ${streak}日  ${streak >= 7 ? `**+${Math.min(200, Math.floor(streak / 7) * 50)}◈ボーナス**` : ""}`;
+    : `次は <t:${nextClaim}:R>  ／  連続 ${streak}日  ${streak >= 7 ? `**+${Math.min(200, Math.floor(streak / 7) * 50)} Ldボーナス**` : ""}`;
 
   const statsValue = [
     `${E.chart} 総 **${stats.games}** ／ 勝 ${stats.wins} 負 ${stats.losses}  勝率 **${winRate.toFixed(1)}%**`,
@@ -126,8 +126,8 @@ function renderHome(userId: string, services: Services, serverName?: string) {
     `${E.paytable} \`/通行証\` — 戦績カード`,
     `🏅 \`/賭場番付\` — Top10（残高/勝率/最大単勝/連勝など）`,
     `${HR_THIN}`,
-    `${E.ether} エテル ⇄ Land はマモンの両替所パネルで`,
-    `　預入・返還は **1:1**（変動レート・奉納・焼却なし）`,
+    `賭場では自由チップを内部で使いますが、表示と利用者資産はLandです。`,
+    `　預入・返還は **1:1**（変動比率・焼却なし）`,
   ].join("\n");
 
   const embed = new EmbedBuilder()

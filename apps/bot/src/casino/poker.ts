@@ -136,7 +136,7 @@ function paytableEmbed(): EmbedBuilder {
     .setDescription("5枚配札 → 保持を選ぶ → 交換 → 役判定。52枚デッキ1組・RTP 約96%。")
     .addFields(
       { name: "▸ 配当", value: lines.join("\n"), inline: false },
-      { name: "▸ ⚖️ 福の重み / 🔥 連鎖チェーン", value: "勝ちで発動（残高が多いほど奉納・連勝で倍率）", inline: false },
+      { name: "▸ ⚖️ 福の重み / 🔥 連鎖チェーン", value: "勝ちで発動（残高が多いほど福分け積立・連勝で倍率）", inline: false },
     );
 }
 

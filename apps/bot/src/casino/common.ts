@@ -131,7 +131,7 @@ export async function validateBet(
   const held = services.ether.balanceOf(uid);
   if (held < bet) {
     await respond({
-      content: `${Mammon.broke()}（所持 ${fmtEther(held)}）\n→ 両替所パネルで Land をLandに替えてこい。`,
+      content: `${Mammon.broke()}（利用可能額 ${fmtEther(held)}）\n→ 通常Landが不足している場合は、Landを増やしてからもう一度お試しください。`,
       flags: MessageFlags.Ephemeral,
     });
     return { ok: false, bet };

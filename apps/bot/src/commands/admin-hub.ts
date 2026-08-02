@@ -726,7 +726,7 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
         e instanceof EtherError && e.code === "ERR_RESERVED_FUNDS"
           ? `進行中ゲームの予約 ${fmtEther(reserved)} は精算できません（いま精算できるのは ${fmtEther(settleable)} まで）。`
           : e instanceof EtherError && e.code === "ERR_INSUFFICIENT_ETHER"
-            ? `胴元のエテルが足りません（${fmtEther(held)}）。`
+            ? `胴元の利用可能額が足りません（${fmtEther(held)}）。`
             : "処理に失敗しました。";
       await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
     }
@@ -1032,9 +1032,9 @@ const NUMBER_KEYS: Array<[string, string]> = [
   ["room_recruit_expire_hours", "蜜月募集の失効（時間）"],
   ["room_recruit_refund", "蜜月失効の返金"],
   ["bump_reward", "bump報酬（Land）"],
-  ["ether_rate_base", "エテル初期レート（1Land=?◈）"],
+  ["ether_rate_base", "旧制度の固定比率（互換設定）"],
   ["ether_fuku_scale", "福の重みスケール"],
-  ["vip_price", "VIP月会費（エテル）"],
+  ["vip_price", "VIP月会費（Land）"],
   ["vip_days", "VIP日数"],
   ["vip_bet_cap_mult", "VIP賭け上限倍率"],
   ["confession_body_retention_days", "トート本文の保持日数"],
@@ -1209,7 +1209,6 @@ const PANEL_KIND_CHOICES: Array<[string, string]> = [
   ["entry", "入城申請"],
   ["rank", "ランク確認"],
   ["shop", "公式ショップ"],
-  ["exchange", "マモンの両替所"],
   ["takutate", "卓建て"],
   ["ticket_return", "出戻り申請"],
   ["ticket_consult", "個別相談"],
@@ -2043,8 +2042,8 @@ function casinoHome(services: Services) {
         "",
         `**胴元残高**: ${fmtEther(casino.houseBalance())} （テーブルリミットの原資）`,
         `**ジャックポット積立**: ${fmtEther(casino.jackpotPool())}`,
-        `**チップ交換比率**: 1 Ld = 1 ◈`,
-        `**準備プール**: ${fmtLd(ether.pool())} ／ **発行エテル**: ${fmtEther(ether.outstanding())}`,
+        `**チップ比率**: 1 チップ = 1 Ld`,
+        `**準備プール**: ${fmtLd(ether.pool())} ／ **発行済みチップ**: ${fmtEther(ether.outstanding())}`,
         "",
         dept
           ? `**部署「${CASINO_DEPT_KEY}」残高**: ${fmtLd(deptBal!)}`
@@ -2242,7 +2241,7 @@ function casinoSettleModal() {
     .setTitle("売上精算（胴元→賭博場口座）")
     .addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("amount").setLabel("精算するエテル（空欄=全額）").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(15),
+        new TextInputBuilder().setCustomId("amount").setLabel("精算する自由チップ（空欄=全額）").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(15),
       ),
     );
 }

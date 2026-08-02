@@ -207,7 +207,7 @@ async function runRoundInner(
       ? `${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
       : "";
     const fukuLine = settled.fukuTax > 0
-      ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
+      ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 福分け積立`
       : "";
     const tag = won ? "🟢 勝ち" : push ? "⚪ プッシュ" : "🔴 負け";
     const netStr = settled.net === 0 ? "±0 Ld" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} Ld`;
