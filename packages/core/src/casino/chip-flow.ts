@@ -12,6 +12,28 @@ export interface InactiveRedeemResult {
   failed: Array<{ userId: string; amount: number; error: string }>;
 }
 export interface ExternalChipConfirmation { id: string; userId: string; operationKind: string; operationId: string; requiredLand: number; status: "pending" | "executing" | "completed" | "cancelled" | "expired"; createdAt: number; expiresAt: number; }
+export type RefundSagaStatus = "draft" | "executing" | "completed" | "blocked" | "cancelled";
+export interface RefundSagaTarget { userId: string; amount: number; status: "pending" | "completed" | "failed" | "blocked"; groupKey: string; result?: RedeemResult; failure?: string; }
+export interface RefundSaga {
+  id: string;
+  scope: "user" | "all";
+  requestedBy: string;
+  targetUserId: string | null;
+  status: RefundSagaStatus;
+  targetCount: number;
+  targetTotal: number;
+  createdAt: number;
+  startedAt: number | null;
+  completedAt: number | null;
+  failure?: string;
+  targets: RefundSagaTarget[];
+}
+/** 資金を返す前に確認しなければならない、プロセス外の進行状態。 */
+export interface RefundSafetyGate {
+  activeGameUsers?: (userIds: readonly string[]) => string[];
+  processingGroup?: () => boolean;
+  integrityBlocked?: () => boolean;
+}
 
 /**
  * PR10 の自由チップ出入金の唯一の入口。
@@ -78,6 +100,93 @@ export class CasinoChipFlow {
     return { users: rows.length, total: rows.reduce((s, r) => s + r.amount, 0), rows };
   }
 
+  /**
+   * 支配人/管理者用の緊急返還案を作る。ここでは金銭を動かさず、対象・額を固定して提示する。
+   * `all` は作成時点の自由チップ保有者だけを対象にするので、確認後に新規入金した利用者を
+   * 誤って巻き込まない。実行時に残高が増減していても、返還APIはその時点の自由チップだけを
+   * 冪等に返す（エスクロー・system holderは常に対象外）。
+   */
+  createRefundSaga(input: { id: string; requestedBy: string; scope: "user" | "all"; userId?: string }): RefundSaga {
+    if (!input.id || !input.requestedBy || (input.scope === "user" && !input.userId)) throw new Error("不正な緊急返還案");
+    const rows = this.previewFreeChipRedemption(input.scope === "user" ? input.userId : undefined).rows;
+    const ts = now();
+    const tx = this.db.transaction(() => {
+      this.db.prepare(
+        `INSERT INTO casino_chip_refund_sagas
+         (id,scope,requested_by,target_user_id,status,target_count,target_total,created_at)
+         VALUES (?,?,?,?, 'draft',?,?,?)`,
+      ).run(input.id, input.scope, input.requestedBy, input.userId ?? null, rows.length, rows.reduce((n, r) => n + r.amount, 0), ts);
+      const insert = this.db.prepare(
+        `INSERT INTO casino_chip_refund_saga_targets (saga_id,user_id,amount,status,group_key)
+         VALUES (?,?,?,'pending',?)`,
+      );
+      for (const row of rows) insert.run(input.id, row.userId, row.amount, `chip:free-redeem:${row.userId}:emergency:${input.id}:${row.userId}`);
+    });
+    tx.immediate();
+    return this.refundSaga(input.id)!;
+  }
+
+  refundSaga(id: string): RefundSaga | undefined {
+    const row = this.db.prepare("SELECT * FROM casino_chip_refund_sagas WHERE id=?").get(id) as any;
+    if (!row) return undefined;
+    const targets = this.db.prepare("SELECT * FROM casino_chip_refund_saga_targets WHERE saga_id=? ORDER BY user_id").all(id) as any[];
+    return {
+      id: row.id, scope: row.scope, requestedBy: row.requested_by, targetUserId: row.target_user_id,
+      status: row.status, targetCount: row.target_count, targetTotal: row.target_total, createdAt: row.created_at,
+      startedAt: row.started_at ?? null, completedAt: row.completed_at ?? null,
+      failure: row.failure_json ? String(row.failure_json) : undefined,
+      targets: targets.map((t) => ({
+        userId: t.user_id, amount: t.amount, status: t.status, groupKey: t.group_key,
+        result: t.result_json ? JSON.parse(t.result_json) as RedeemResult : undefined, failure: t.failure ?? undefined,
+      })),
+    };
+  }
+
+  cancelRefundSaga(id: string, requestedBy: string): boolean {
+    return this.db.prepare(
+      "UPDATE casino_chip_refund_sagas SET status='cancelled' WHERE id=? AND requested_by=? AND status='draft'",
+    ).run(id, requestedBy).changes === 1;
+  }
+
+  /**
+   * 固定済みの案を実行/再開する。安全ゲートに掛かったら一切返還せず `blocked` にする。
+   * 各対象は安定したgroup keyを使うため、DB commit後・saga完了記録前のクラッシュでも
+   * 次回は保存済みgroupの結果を読み、二重返還なしで `completed` まで進める。
+   */
+  executeRefundSaga(id: string, actorId: string, gate: RefundSafetyGate = {}): RefundSaga {
+    const saga = this.refundSaga(id);
+    if (!saga || saga.requestedBy !== actorId) throw new Error("この緊急返還案は実行できません");
+    if (saga.status === "cancelled") throw new Error("この緊急返還案は取り消されています");
+    if (saga.status === "completed") return saga;
+    const blocked = this.refundBlockReason(saga, gate);
+    if (blocked) {
+      this.db.prepare("UPDATE casino_chip_refund_sagas SET status='blocked',failure_json=? WHERE id=?").run(blocked, id);
+      return this.refundSaga(id)!;
+    }
+    this.db.prepare(
+      "UPDATE casino_chip_refund_sagas SET status='executing',started_at=COALESCE(started_at,?) WHERE id=? AND status IN ('draft','blocked','executing')",
+    ).run(now(), id);
+    for (const target of this.refundSaga(id)!.targets) {
+      if (target.status === "completed") continue;
+      try {
+        const result = this.redeemFreeChips(target.userId, `emergency:${id}:${target.userId}`, "緊急返還");
+        this.db.prepare(
+          "UPDATE casino_chip_refund_saga_targets SET status='completed',result_json=?,completed_at=?,failure=NULL WHERE saga_id=? AND user_id=?",
+        ).run(JSON.stringify(result), now(), id, target.userId);
+      } catch (error) {
+        const failure = error instanceof Error ? error.message : String(error);
+        this.db.prepare("UPDATE casino_chip_refund_saga_targets SET status='failed',failure=? WHERE saga_id=? AND user_id=?").run(failure, id, target.userId);
+        this.events.log("casino_emergency_redeem_failed", { actor: actorId, payload: { sagaId: id, userId: target.userId, error: failure } });
+      }
+    }
+    const incomplete = this.db.prepare("SELECT COUNT(*) AS n FROM casino_chip_refund_saga_targets WHERE saga_id=? AND status <> 'completed'").get(id) as { n: number };
+    if (incomplete.n === 0) {
+      this.db.prepare("UPDATE casino_chip_refund_sagas SET status='completed',completed_at=?,failure_json=NULL WHERE id=?").run(now(), id);
+      this.events.log("casino_emergency_redeem_completed", { actor: actorId, payload: { sagaId: id, targetCount: saga.targetCount, targetTotal: saga.targetTotal } });
+    }
+    return this.refundSaga(id)!;
+  }
+
   /** 域外Land不足の確認票。承認前には一切の資金を動かさない。 */
   createExternalConfirmation(input: { id: string; userId: string; operationKind: string; operationId: string; requiredLand: number; expiresAt: number }): ExternalChipConfirmation {
     if (!input.id || !input.userId || !input.operationKind || !input.operationId || !Number.isSafeInteger(input.requiredLand) || input.requiredLand <= 0 || input.expiresAt <= now()) throw new Error("不正な域外操作確認票");
@@ -100,6 +209,23 @@ export class CasinoChipFlow {
   }
   completeExternalConfirmation(id: string, userId: string): boolean {
     return this.db.prepare("UPDATE casino_chip_external_confirmations SET status='completed',completed_at=? WHERE id=? AND user_id=? AND status='executing'").run(now(), id, userId).changes === 1;
+  }
+
+  /**
+   * 域外確認後に、保存済みの operationId で元の操作を一度だけ再実行するための入口。
+   * callback は operationId を冪等キーとして扱う必要がある。途中クラッシュ時は executing
+   * の同一本人だけが再開でき、他人・古いボタン・完了後の再押下はすべて拒否する。
+   */
+  executeExternalConfirmation<T>(id: string, userId: string, body: (operationId: string) => T, at = now()): T {
+    let row = this.externalConfirmation(id);
+    if (!row || row.userId !== userId || row.status === "cancelled" || row.status === "completed" || row.status === "expired") {
+      throw new Error("この確認票は実行できません");
+    }
+    if (row.status === "pending") row = this.beginExternalConfirmation(id, userId, at);
+    if (row.status !== "executing") throw new Error("この確認票は実行できません");
+    const result = body(row.operationId);
+    this.completeExternalConfirmation(id, userId);
+    return result;
   }
 
   private redeemRows(rows: Array<{ userId: string }>, prefix: string, reason: string, cutoffAt?: number): InactiveRedeemResult {
@@ -125,5 +251,13 @@ export class CasinoChipFlow {
        LEFT JOIN casino_chip_activity a ON a.user_id = e.user_id
        WHERE e.amount > 0 AND ${where} ORDER BY e.user_id`,
     ).all(...params) as Array<{ userId: string }>;
+  }
+
+  private refundBlockReason(saga: RefundSaga, gate: RefundSafetyGate): string | null {
+    if (this.chips.chipTx.isActive() || gate.processingGroup?.()) return "金銭処理中のため緊急返還を停止しました";
+    if (gate.integrityBlocked?.()) return "検算停止中のため緊急返還を停止しました";
+    const active = gate.activeGameUsers?.(saga.targets.map((t) => t.userId)) ?? [];
+    if (active.length > 0) return `進行中ゲームの利用者がいるため緊急返還を停止しました: ${active.join(",")}`;
+    return null;
   }
 }

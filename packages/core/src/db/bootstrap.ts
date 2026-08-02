@@ -432,6 +432,34 @@ CREATE TABLE IF NOT EXISTS casino_chip_external_confirmations (
 );
 CREATE INDEX IF NOT EXISTS idx_casino_chip_external_confirmations_user ON casino_chip_external_confirmations(user_id, status, expires_at);
 
+-- PR10: 緊急返還は「画面で確認した件数」と実行対象を同じ永続sagaで固定する。
+-- 実行途中でプロセスが落ちても、同じsagaを再開すれば各利用者の冪等groupから完了へ収束する。
+CREATE TABLE IF NOT EXISTS casino_chip_refund_sagas (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL CHECK(scope IN ('user','all')),
+  requested_by TEXT NOT NULL,
+  target_user_id TEXT,
+  status TEXT NOT NULL CHECK(status IN ('draft','executing','completed','blocked','cancelled')),
+  target_count INTEGER NOT NULL CHECK(target_count >= 0),
+  target_total INTEGER NOT NULL CHECK(target_total >= 0),
+  created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  completed_at INTEGER,
+  failure_json TEXT
+);
+CREATE TABLE IF NOT EXISTS casino_chip_refund_saga_targets (
+  saga_id TEXT NOT NULL REFERENCES casino_chip_refund_sagas(id),
+  user_id TEXT NOT NULL,
+  amount INTEGER NOT NULL CHECK(amount >= 0),
+  status TEXT NOT NULL CHECK(status IN ('pending','completed','failed','blocked')),
+  group_key TEXT NOT NULL UNIQUE,
+  result_json TEXT,
+  completed_at INTEGER,
+  failure TEXT,
+  PRIMARY KEY(saga_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_casino_chip_refund_saga_targets_status ON casino_chip_refund_saga_targets(saga_id, status);
+
 -- 賭場チップの取引監査（大型UPD PR1）。チップ残高は現在値しか持たないので、
 -- 「業務操作の単位(group)」と「その中の1移動(tx)」を追記し、開始残高から再現できるようにする。
 CREATE TABLE IF NOT EXISTS casino_tx_groups (

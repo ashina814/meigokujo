@@ -192,6 +192,10 @@ export {
   type RedeemResult,
   type InactiveRedeemResult,
   type ExternalChipConfirmation,
+  type RefundSaga,
+  type RefundSagaTarget,
+  type RefundSagaStatus,
+  type RefundSafetyGate,
 } from "./casino/chip-flow.js";
 export {
   Casino,
