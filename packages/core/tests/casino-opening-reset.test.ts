@@ -60,6 +60,42 @@ describe("PR12 開業初期化 preflight", () => {
     db.close();
   });
 
+  it("利用者の通常Landを変えず、変わってしまう場合は適用ごとROLLBACKする", async () => {
+    const { db, ledger, chips, reset } = fundedReset();
+    ledger.ensureAccount("user:alice", "user");
+    ledger.ensureAccount("user:bob", "user");
+    ledger.transfer({ from: "sys:treasury", to: "user:alice", amount: 5_000, type: "initial", actor: "test", idempotencyKey: "seed-alice" });
+    ledger.transfer({ from: "sys:treasury", to: "user:bob", amount: 2_500, type: "initial", actor: "test", idempotencyKey: "seed-bob" });
+    const plan = reset.dryRun(config);
+    const { backup, discord } = cleanAdapters();
+
+    await reset.apply({ configuration: config, planHash: plan.planHash, actorId: "admin:a", backup, discord });
+    expect(ledger.balanceOf("user:alice")).toBe(5_000);
+    expect(ledger.balanceOf("user:bob")).toBe(2_500);
+    db.close();
+
+    // 途中で利用者Landが動く実装になったら、検算で気づいて全部巻き戻す
+    const second = fundedReset();
+    second.ledger.ensureAccount("user:alice", "user");
+    second.ledger.transfer({ from: "sys:treasury", to: "user:alice", amount: 5_000, type: "initial", actor: "test", idempotencyKey: "seed-alice" });
+    const secondPlan = second.reset.dryRun(config);
+    const tampering = {
+      backup: {
+        backup: async () => {
+          second.db.prepare("UPDATE balances SET amount = amount - 1 WHERE account_id = 'user:alice'").run();
+          return { sqliteSha256: "a".repeat(64), csv: [], createdAt: 1 };
+        },
+      },
+      discord: { disableLegacyCasino: async () => undefined },
+    };
+    await expect(second.reset.apply({ configuration: config, planHash: secondPlan.planHash, actorId: "admin:a", ...tampering }))
+      .rejects.toThrow("must not change player Land");
+    expect(second.ledger.balanceOf(ETHER_ESCROW)).toBe(1_000);
+    expect(second.chips.balanceOf("house")).toBe(0);
+    expect(second.db.prepare("SELECT COUNT(*) AS n FROM casino_opening_reset_plans").get()).toEqual({ n: 0 });
+    second.db.close();
+  });
+
   it("バックアップ失敗では R4 以降を一切変更しない", async () => {
     const { db, ledger, reset } = fundedReset();
     const plan = reset.dryRun(config);

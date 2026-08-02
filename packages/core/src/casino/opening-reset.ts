@@ -143,6 +143,9 @@ export class CasinoOpeningReset {
     const plan = this.dryRun(input.configuration);
     if (plan.planHash !== input.planHash) throw new Error("opening reset plan hash is stale");
     if (plan.blockers.length) throw new Error(`opening reset blocked: ${plan.blockers.join("; ")}`);
+    // 仕様10.4/21: 開業初期化は利用者の通常Landを1件も変えてはいけない。構造上触っていないが、
+    // adapter も含めた適用全体で実際に変わっていないことを、COMMIT前に確かめる。
+    const playerLandBefore = this.playerLandFingerprint();
     // R0 happens before the backup. If R1/R3 fail, the casino intentionally remains halted.
     input.status?.beginOpeningReset(`opening reset: ${plan.planHash}`, input.actorId);
     // R1 and R3 intentionally happen before any mutable reset work; a failure leaves the DB untouched.
@@ -168,7 +171,7 @@ export class CasinoOpeningReset {
       put.run(HOUSE_HOLDER, input.configuration.houseCapital, now()); put.run("jackpot", input.configuration.jackpotCapital, now()); put.run("relief", input.configuration.reliefCapital, now());
       if (!this.chipTx.captureOpening(OPENING_VERSION, [[HOUSE_HOLDER, input.configuration.houseCapital], ["jackpot", input.configuration.jackpotCapital], ["relief", input.configuration.reliefCapital]], { poolLand: input.configuration.casinoOpeningCapital, fromLedgerTxId: newInvestmentLandTxId })) throw new Error("opening_v1 already exists");
       this.saveConfiguration(input.configuration, input.actorId);
-      this.verifyApplied(input.configuration, plan.planHash);
+      this.verifyApplied(input.configuration, plan.planHash, playerLandBefore);
       this.db.prepare("INSERT INTO casino_opening_reset_plans (plan_hash,status,manifest_json,applied_by,applied_at) VALUES (?, 'applied', ?, ?, ?)").run(plan.planHash, JSON.stringify(manifest), input.actorId, now());
     })();
     // R14 is deliberately last. A status transition failure leaves the fully audited reset safely halted.
@@ -182,11 +185,25 @@ export class CasinoOpeningReset {
   private saveConfiguration(c: CasinoOpeningConfig, actor: string): void {
     this.db.prepare(`INSERT INTO casino_opening_configuration (id,casino_opening_capital,casino_opening_house,casino_opening_jackpot,casino_opening_relief,casino_min_working_capital,casino_remit_rate_bps,casino_opening_configured,configured_by,configured_at) VALUES (1,?,?,?,?,?,?,1,?,?) ON CONFLICT(id) DO UPDATE SET casino_opening_capital=excluded.casino_opening_capital, casino_opening_house=excluded.casino_opening_house, casino_opening_jackpot=excluded.casino_opening_jackpot, casino_opening_relief=excluded.casino_opening_relief, casino_min_working_capital=excluded.casino_min_working_capital, casino_remit_rate_bps=excluded.casino_remit_rate_bps, casino_opening_configured=1, configured_by=excluded.configured_by, configured_at=excluded.configured_at`).run(c.casinoOpeningCapital, c.houseCapital, c.jackpotCapital, c.reliefCapital, c.minimumWorkingCapital, c.remittanceBps, actor, now());
   }
-  private verifyApplied(c: CasinoOpeningConfig, planHash: string): void {
+  /** 利用者の通常Land口座数と総額。開業初期化の前後で一致しなければならない。 */
+  private playerLandFingerprint(): { accounts: number; total: number } {
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS accounts, COALESCE(SUM(b.amount),0) AS total
+       FROM balances b JOIN accounts a ON a.id = b.account_id AND a.kind = 'user'`,
+    ).get() as { accounts: number; total: number };
+    return { accounts: Number(row.accounts), total: Number(row.total) };
+  }
+
+  private verifyApplied(c: CasinoOpeningConfig, planHash: string, playerLandBefore: { accounts: number; total: number }): void {
     const sum = (this.db.prepare("SELECT COALESCE(SUM(amount),0) AS n FROM ether_balances WHERE user_id IN ('house','jackpot','relief')").get() as { n: number }).n;
     const reserve = this.ledger.balanceOf(CHIP_ESCROW);
     const version = this.chipTx.currentVersion();
     if (sum !== c.casinoOpeningCapital || reserve !== c.casinoOpeningCapital || version !== OPENING_VERSION || (this.hasTable("casino_escrow") && this.db.prepare("SELECT 1 FROM casino_escrow LIMIT 1").get()) || planHash.length !== 64) throw new Error("opening reset V1-V7 verification failed");
+    // V: 利用者の通常Landと賭場外データの変更件数は0（仕様10.4）。崩れていればROLLBACKさせる。
+    const playerLand = this.playerLandFingerprint();
+    if (playerLand.accounts !== playerLandBefore.accounts || playerLand.total !== playerLandBefore.total) {
+      throw new Error("opening reset must not change player Land");
+    }
   }
   private assertConfig(c: CasinoOpeningConfig): void {
     for (const [key, value] of Object.entries(c)) if (key !== "configured" && (!Number.isSafeInteger(value) || value < 0)) throw new Error(`invalid opening configuration: ${key}`);
