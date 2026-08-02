@@ -29,6 +29,7 @@ import {
   ChipTx,
   CasinoChipAssets,
   CasinoChipFlow,
+  CasinoRemittance,
   isHumanHeld,
   isPlayerHolder,
   FreeSpins,
@@ -121,6 +122,9 @@ export function buildServices() {
   const reservations = new HouseReservations(db, chips, events);
   // 売上精算（redeemFairToAccount）も予約分は出せないようにする。UI ではなく資金処理層で止める
   chips.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
+  // PR14: all finance actions use the durable draft → approve → execute ledger.
+  // Nothing calls execute automatically; the admin boundary must explicitly invoke it.
+  const remittance = new CasinoRemittance(db, ledger, chips, reservations);
   const casino = new Casino(db, chips, events, {
     fukuScale: () => settings.getNumber("ether_fuku_scale"),
     items,
@@ -164,7 +168,7 @@ export function buildServices() {
   const rng = defaultRng();
   // `ether` はPR8より前のゲーム画面を段階移行するための読み取り兼用エイリアス。
   // 新規コードは必ず `chips` を使う。
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips, chipAssets, chipFlow, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips, chipAssets, chipFlow, remittance, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;
