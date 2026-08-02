@@ -52,6 +52,16 @@ function ratePanel(services: Services): EmbedBuilder {
 }
 
 export function exchangePanelMessage(services: Services) {
+  void services;
+  return {
+    embeds: [new EmbedBuilder()
+      .setTitle("マモンの賭場 · Land入退場")
+      .setColor(C_MAMMON)
+      .setDescription("旧両替パネルは無効です。賭場ではLandと自由チップを別表示し、入退場は賭場ホームの導線だけを使用してください。")],
+    components: [],
+  };
+  /* Legacy controls are deliberately unreachable.  Their custom IDs are rejected
+     by the handlers below as well, so stale Discord messages cannot move funds. */
   const embed = ratePanel(services);
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("ether:buy").setLabel("入場（Land → エテル）").setEmoji("🔸").setStyle(ButtonStyle.Success),
