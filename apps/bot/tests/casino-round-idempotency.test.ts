@@ -109,7 +109,8 @@ describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
   it("所持額が倍付け損失ちょうどでも、二度実行して減るのは1回分だけ", () => {
     const ctx = setup(scriptedRng([0.5]));
     seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
-    seedBalance(ctx.db, "u1", 2_000); // bet 1,000 + 追加徴収 1,000 ちょうど
+    seedBalance(ctx.db, "u1", 2_000);
+    expect(ctx.escrow.hold("chinchiro:prehold:u1:op-1", "u1", 2_000, "チンチロ", "prehold")).toBe(true);
 
     const first = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
     expect(first.branch).toBe("double_loss");
@@ -120,11 +121,7 @@ describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
     const second = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
     expect(second).toEqual(first);
     expect(ctx.ether.balanceOf("u1")).toBe(0);
-    expect(ctx.chipTx.listByGroup("chinchiro:round:u1:op-1").map((r) => r.reason)).toEqual([
-      "賭け金",
-      "倍付け負けの追加徴収",
-    ]);
-    expect(ctx.chipTx.getGroup("solo:チンチロ:u1:op-1")).toBeUndefined();
+    expect(ctx.chipTx.listByGroup("chinchiro:round:u1:op-1").map((r) => r.reason)).toEqual(["チンチロ確定損失"]);
     ctx.db.close();
   });
 
@@ -132,6 +129,7 @@ describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
     const ctx = setup(scriptedRng([0.5]));
     seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
     seedBalance(ctx.db, "u1", 2_500);
+    expect(ctx.escrow.hold("chinchiro:prehold:u1:op-1", "u1", 2_000, "チンチロ", "prehold")).toBe(true);
 
     const first = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
     expect(first.branch).toBe("double_loss");
@@ -139,21 +137,18 @@ describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
 
     expect(settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1")).toEqual(first);
     expect(ctx.ether.balanceOf("u1")).toBe(500);
-    expect(ctx.casino.stats("u1").games).toBe(1);
+    expect(ctx.casino.stats("u1").total_lost).toBe(2_000);
     ctx.db.close();
   });
 
-  it("残高不足のフォールバックも同じグループで確定する", () => {
+  it("2倍分を事前に預けられなければ開始せず、通常負けへフォールバックしない", () => {
     const ctx = setup(scriptedRng([0.5]));
     seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
     seedBalance(ctx.db, "u1", 1_500); // 追加徴収 1,000 に足りない
 
-    const first = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
-    expect(first.branch).toBe("fallback_loss");
-    expect(ctx.ether.balanceOf("u1")).toBe(500);
-
-    expect(settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1")).toEqual(first);
-    expect(ctx.ether.balanceOf("u1")).toBe(500);
+    expect(ctx.escrow.hold("chinchiro:prehold:u1:op-1", "u1", 2_000, "チンチロ", "prehold")).toBe(false);
+    expect(ctx.ether.balanceOf("u1")).toBe(1_500);
+    expect(ctx.chipTx.getGroup("chinchiro:round:u1:op-1")).toBeUndefined();
     ctx.db.close();
   });
 });
