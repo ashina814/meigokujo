@@ -164,6 +164,22 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       await tickVoiceXp(client, services).catch((e) => console.error("[rank] ボイスXP tick失敗:", e));
     }
 
+    // ── 胴元債務予約の漏れ検出（毎時5分・PR5 / 正本 §11.2）──
+    // 24時間残っている予約は解放し忘れ。放っておくと胴元の受注可能額を永久に食う
+    if (now.minute === 5) {
+      try {
+        const swept = services.reservations.sweepStale();
+        if (swept.count > 0) {
+          console.warn(
+            `[casino] 24時間以上残った胴元債務予約 ${swept.count}件（計 ${swept.total.toLocaleString("ja-JP")}◈）を警告つきで解放: ` +
+              swept.rows.map((r) => `${r.game}/${r.userId}`).slice(0, 10).join(", "),
+          );
+        }
+      } catch (e) {
+        console.error("[casino] 胴元債務予約の掃除に失敗:", e);
+      }
+    }
+
     // ── bump/up クールタイム終了通知 ──
     await checkBumpCooldowns(client, services);
 

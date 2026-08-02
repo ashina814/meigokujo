@@ -12,7 +12,17 @@ import {
 import { BLACKJACK_MAX_PAYOUT_MULT, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
+import {
+  MIN_BET,
+  acquireSeat,
+  effectiveMaxBet,
+  handleRetryPress,
+  releaseSeat,
+  reserveBlackjackLiability,
+  sleep,
+  validateBet,
+  withExplicitHouseReservation,
+} from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -88,7 +98,7 @@ export async function playBlackjack(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT);
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT, "ブラックジャック");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -105,10 +115,36 @@ export async function playBlackjack(
   }
 }
 
+/**
+ * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
+ * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
+ */
 async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+): Promise<void> {
+  let doubleAllowed = true;
+  await withExplicitHouseReservation(
+    interaction,
+    services,
+    "ブラックジャック",
+    (uid) => {
+      const r = reserveBlackjackLiability(services, uid, bet, interaction.id);
+      doubleAllowed = r.doubleAllowed;
+      return r;
+    },
+    (reservationKey) => runRoundInner(interaction, services, bet, reservationKey, doubleAllowed),
+  );
+}
+
+async function runRoundInner(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+  bet: number,
+  reservationKey: string,
+  /** ダブルぶんの債務まで予約できたか。false ならダブルボタンだけ無効化する */
+  doubleAllowed: boolean,
 ): Promise<void> {
   const uid = interaction.user.id;
   const deck = newDeck(services.rng);
@@ -162,7 +198,7 @@ async function runRound(
   const finish = async (rawPayout: number, note: string) => {
     // お守りの消費も賭け・配当と同じグループの中（settleSolo）。外で消すと精算が落ちたときお守りだけ消える
     const settled = services.casino.settleSolo(uid, "ブラックジャック", totalBet, rawPayout, {
-      operationId: interaction.id,
+      operationId: interaction.id, reservationKey,
     });
     const amulet = { note: settled.amuletNote };
     const won = settled.net > 0;
@@ -268,10 +304,9 @@ async function runRound(
   }
 
   // ── プレイヤーのターン ──
-  const canDoubleNow = () =>
-    player.length === 2 &&
-    services.ether.balanceOf(uid) >= bet * 2 &&
-    services.casino.canAccept(bet * MAX_MULT);
+  // ダブルの可否は**開始時の予約結果**で決まる（PR5）。
+  // ここで改めて胴元残高を見ると、予約済みの自分の枠を二重に数えて弾いてしまう
+  const canDoubleNow = () => player.length === 2 && doubleAllowed && services.ether.balanceOf(uid) >= bet * 2;
   reply = await openInitial(true, [buttons(canDoubleNow())]);
 
   let standing = false;

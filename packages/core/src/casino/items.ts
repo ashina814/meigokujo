@@ -125,6 +125,21 @@ export class Items {
     );
   }
 
+  /**
+   * 装備中の「勝利ボーナス」お守りの上限合計（PR5 の胴元債務モデルが読む）。
+   *
+   * 勝利ボーナスは配当に上乗せされるので、胴元が最悪いくら払うかにこの額が乗る。
+   * 現行は armed_win が1種類しか無いが、合計で返しておけば増えても式を変えずに済む。
+   */
+  armedWinBonusCap(userId: string): number {
+    let cap = 0;
+    for (const key of this.armedList(userId)) {
+      const def = getConsumableDef(key);
+      if (def?.kind === "armed_win" && def.cap && def.cap > 0) cap += def.cap;
+    }
+    return cap;
+  }
+
   arm(userId: string, key: string): ArmResult {
     const def = getConsumableDef(key);
     if (!def) return { ok: false, reason: "UNKNOWN_ITEM" };

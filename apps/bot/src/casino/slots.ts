@@ -26,7 +26,17 @@ import {
 } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
+import {
+  MIN_BET,
+  acquireSeat,
+  effectiveMaxBet,
+  handleRetryPress,
+  releaseSeat,
+  reserveSlotsLiability,
+  sleep,
+  validateBet,
+  withExplicitHouseReservation,
+} from "./common.js";
 import { C_MAMMON } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -166,7 +176,7 @@ export async function playSlots(
   try {
     // 取得済み権利は新規ベットの下限・残高・予約可否に従属させない。
     await settleLeftoverFreeSpins(interaction, services, uid);
-    const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULTIPLIER);
+    const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULTIPLIER, "スロット");
     if (!check.ok) return;
     await runPaidSpin(interaction, services, check.bet);
   } finally {
@@ -180,8 +190,19 @@ async function runPaidSpin(
   services: Services,
   bet: number,
 ): Promise<void> {
-  const record = spinPaid(services, interaction.user.id, bet, interaction.id);
-  await renderSpin(interaction, services, bet, record, false);
+  // **先に1セットぶん（有料 + フリースピン1回）の債務を予約**してから回す（PR5・正本 §11.2）。
+  // 予約鍵は精算グループ鍵と別。精算グループ鍵にすると有料スピンの精算で解放され、
+  // 続くフリースピンが裸になる
+  await withExplicitHouseReservation(
+    interaction,
+    services,
+    "スロット",
+    (uid) => reserveSlotsLiability(services, uid, bet, interaction.id),
+    async (reservationKey) => {
+      const record = spinPaid(services, interaction.user.id, bet, interaction.id);
+      await renderSpin(interaction, services, bet, record, false, reservationKey);
+    },
+  );
 }
 
 /**
@@ -356,13 +377,19 @@ export function spinPaid(services: Services, uid: string, bet: number, interacti
  * 決まるので**払い出しは一度きり**になる。賭場が停止中なら資金グループが作れず例外になり、
  * 保留記録はそのまま残る（権利を失わない）。
  *
- * @param capacityOf 胴元が払える上限を返す関数。PR5 で「自分の予約を含む余力」を差し込む
+ * @param reservationKey この無料スピンを含む**生きている予約**の鍵（PR5）。
+ *   渡すとその予約額を支払保証として使える（自分で確保した枠に弾かれない）。
+ *   渡さない場合は「予約を引いた残り」だけで判定する。
  */
 export function resolveFreeSpin(
   services: Services,
   row: PendingFreeSpinRow,
-  capacityOf: (services: Services) => number = (s) => s.casino.houseBalance(),
+  reservationKey?: string,
 ): SpinRecord {
+  const capacityOf = (s: Services): number =>
+    reservationKey
+      ? s.casino.availableForLiability() + (s.reservations.get(reservationKey)?.amount ?? 0)
+      : s.casino.availableForLiability();
   const key = services.freeSpins.payoutGroupKey(row);
   try {
     return services.ether.runGroup({ groupKey: key, kind: "solo_game", actorId: row.userId }, (): SpinRecord => {
@@ -472,6 +499,8 @@ async function renderSpin(
   bet: number,
   record: SpinRecord,
   isFreeSpin: boolean,
+  /** この操作の予約鍵（PR5）。続けて回す無料スピンはこの予約の範囲で払う */
+  reservationKey?: string,
 ): Promise<void> {
   const uid = interaction.user.id;
 
@@ -601,8 +630,8 @@ async function renderSpin(
     await edit(resultEmbed, []);
     await sleep(2500);
     try {
-      const free = resolveFreeSpin(services, record.pendingFreeSpin);
-      await renderSpin(interaction, services, bet, free, true);
+      const free = resolveFreeSpin(services, record.pendingFreeSpin, reservationKey);
+      await renderSpin(interaction, services, bet, free, true, reservationKey);
     } catch {
       // 胴元不足・賭場停止など。**権利は pending のまま残っている**
       await interaction
@@ -633,7 +662,8 @@ async function renderSpin(
     }
     if (btn.customId.startsWith("slots:retry:")) {
       // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
-      // 断るなら collector を止めない ＝ 押し直せる
+      // 断るなら collector を止めない ＝ 押し直せる。
+      // 再スピンは先に債務を予約する経路（runPaidSpin）を通る（PR5）
       await handleRetryPress({
         services,
         btn,

@@ -25,6 +25,7 @@ import { handleItaButton, handleItaCommand, handleItaModal, handleItaSelect } fr
 import { handleTakuButton, handleTakuVoiceUpdate, sweepStaleTables } from "./commands/takutate-panel.js";
 import { handlePokerDuelButton, handlePokerDuelSelect } from "./casino/poker-duel.js";
 import { denyIfCasinoClosed } from "./casino/gate.js";
+import { handleCasinoPlayButton, isCasinoPlayButton } from "./casino/play-route.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -392,6 +393,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("prof:")) {
         await handleProfileButton(interaction, services);
+        return;
+      }
+      if (isCasinoPlayButton(interaction.customId)) {
+        await handleCasinoPlayButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("taku:")) {
