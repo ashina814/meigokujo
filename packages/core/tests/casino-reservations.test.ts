@@ -9,6 +9,7 @@ import {
   Items,
   Ledger,
   RESERVATION_STALE_SEC,
+  ReservationConflictError,
   SLOT_MAX_PAYOUT_MULT,
   chinchiroLiability,
   crashLiability,
@@ -387,6 +388,80 @@ describe("JP積立を含めても予約済み資金を侵食しない", () => {
       .prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'casino_house_insufficient'")
       .get() as { n: number };
     expect(logged.n).toBe(1);
+    c.db.close();
+  });
+});
+
+/**
+ * レビュー指摘: 同じ鍵の予約が既にあるとき、要求額・ゲーム・利用者を比較せず
+ * 成功扱いにしていた。呼び出し側が「要求どおり取れた」と誤解して状態を復元できてしまう。
+ */
+describe("同じ予約鍵は内容まで一致したときだけ冪等成功", () => {
+  it("同じ鍵・同じ内容は冪等成功で、保存済みの行が返る", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    const first = c.reservations.reserve("k1", 30_000, "スロット", "u1");
+    const again = c.reservations.reserve("k1", 30_000, "スロット", "u1");
+
+    expect(first.ok).toBe(true);
+    expect(again.ok).toBe(true);
+    expect(again.row?.amount).toBe(30_000);
+    expect(again.row?.game).toBe("スロット");
+    expect(again.row?.userId).toBe("u1");
+    expect(c.reservations.totalReserved()).toBe(30_000);
+    c.db.close();
+  });
+
+  it("同じ鍵・異なる amount は拒否する（資金も予約も動かない）", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    c.reservations.reserve("k1", 15_000, "ブラックジャック", "u1");
+
+    expect(() => c.reservations.reserve("k1", 20_000, "ブラックジャック", "u1")).toThrow(ReservationConflictError);
+    expect(c.reservations.get("k1")!.amount).toBe(15_000);
+    expect(c.reservations.totalReserved()).toBe(15_000);
+    c.db.close();
+  });
+
+  it("同じ鍵・異なる game は拒否する", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    c.reservations.reserve("k1", 15_000, "スロット", "u1");
+    expect(() => c.reservations.reserve("k1", 15_000, "ポーカー", "u1")).toThrow(ReservationConflictError);
+    expect(c.reservations.get("k1")!.game).toBe("スロット");
+    c.db.close();
+  });
+
+  it("同じ鍵・異なる userId は拒否する", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    c.reservations.reserve("k1", 15_000, "スロット", "u1");
+    expect(() => c.reservations.reserve("k1", 15_000, "スロット", "u2")).toThrow(ReservationConflictError);
+    expect(c.reservations.get("k1")!.userId).toBe("u1");
+    c.db.close();
+  });
+
+  it("同じ鍵を何度実行しても、全呼出が同じ保存結果を受け取る", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    const results = Array.from({ length: 20 }, () => c.reservations.reserve("k1", 40_000, "スロット", "u1"));
+    for (const r of results) {
+      expect(r.ok).toBe(true);
+      expect(r.row?.amount).toBe(40_000);
+      expect(r.row?.key).toBe("k1");
+    }
+    expect(c.reservations.count()).toBe(1);
+    expect(c.reservations.totalReserved()).toBe(40_000);
+    c.db.close();
+  });
+
+  it("余力不足は conflict ではなく capacity として返る", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 10_000);
+    const r = c.reservations.reserve("k1", 20_000, "スロット", "u1");
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("capacity");
+    expect(r.available).toBe(10_000);
     c.db.close();
   });
 });

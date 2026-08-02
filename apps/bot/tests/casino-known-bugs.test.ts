@@ -10,6 +10,7 @@ import {
   FreeSpins,
   HOUSE_HOLDER,
   JACKPOT_HOLDER,
+  HouseReservations,
   Items,
   Ledger,
   Markets,
@@ -71,7 +72,10 @@ function rebuild(db: ReturnType<typeof openDb>, rng: CasinoRng = scriptedRng([0.
   const chipTx = new ChipTx(db);
   const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
   const items = new Items(db);
-  const casino = new Casino(db, ether, events, { items });
+  // 胴元債務予約（PR5）。無料スピンの再開はここから予約を取り直す
+  const reservations = new HouseReservations(db, ether, events);
+  ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
+  const casino = new Casino(db, ether, events, { items, reservations });
   const vip = new Vip(db, ether, events);
   // 本番（services.ts）と同じ配線。**確定精算のときだけ**通算損益へ足す
   const recordPlayerNet = (userId: string, net: number) => {
@@ -80,8 +84,8 @@ function rebuild(db: ReturnType<typeof openDb>, rng: CasinoRng = scriptedRng([0.
   const escrow = new Escrow(db, ether, events, { onPlayerNet: recordPlayerNet });
   const markets = new Markets(db, ether, events, { onPlayerNet: recordPlayerNet });
   const freeSpins = new FreeSpins(db);
-  const services = { db, ether, casino, items, vip, escrow, markets, freeSpins, rng, events } as unknown as Services;
-  return { db, chipTx, ether, casino, items, vip, escrow, markets, freeSpins, events, services };
+  const services = { db, ether, casino, items, vip, escrow, markets, freeSpins, reservations, rng, events } as unknown as Services;
+  return { db, chipTx, ether, casino, items, vip, escrow, markets, freeSpins, reservations, events, services };
 }
 
 function seedBalance(db: ReturnType<typeof openDb>, holder: string, amount: number): void {

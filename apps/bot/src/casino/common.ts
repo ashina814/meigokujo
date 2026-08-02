@@ -8,6 +8,7 @@ import {
   type ChatInputCommandInteraction,
 } from "discord.js";
 import {
+  SLOT_MAX_PAYOUT_MULT,
   blackjackNoDoubleLiability,
   liabilityModelFor,
   soloGroupKey,
@@ -247,9 +248,30 @@ export function reserveSlotsLiability(
   return { key, amount };
 }
 
-/** スロット1セットの予約鍵。`spinOnce` が自己予約を参照するのに同じ関数を使う */
+/** スロット1セットの予約鍵。`spinPaid` が自己予約を参照するのに同じ関数を使う */
 export function slotsReservationKey(userId: string, interactionId: string): string {
   return `slots:reserve:${userId}:${interactionId}`;
+}
+
+/**
+ * 保留中のフリースピンを**再開するとき**の予約（PR5 レビュー指摘）。
+ *
+ * 元の予約はプロセスの再起動で解放されている（正本 §8.2 S9）。
+ * 権利のほうは DB に残っているので、払う直前に**取り直す**。
+ * 賭け金の回収が無いぶん、必要額は「最大払戻 + お守り上限」まるごと。
+ *
+ * 取れなければ {@link HouseCapacityError} を投げる。呼び出し側は権利を pending のまま残す。
+ */
+export function reserveFreeSpinLiability(
+  services: Services,
+  row: { id: number; userId: string; bet: number },
+): { key: string; amount: number } {
+  const key = `slots:freespin:${row.id}`;
+  const ctx = liabilityCtx(services, row.userId);
+  const amount = Math.floor(row.bet * SLOT_MAX_PAYOUT_MULT) + ctx.activeEffects.winBonusCap;
+  const r = services.reservations.reserve(key, amount, "スロット", row.userId);
+  if (!r.ok) throw new HouseCapacityError("スロット", amount, r.available);
+  return { key, amount };
 }
 
 /**
@@ -258,6 +280,13 @@ export function slotsReservationKey(userId: string, interactionId: string): stri
  * まずダブル込みの最悪ケースで取りにいき、余力が足りなければ**ダブル無しの額**で取り直す。
  * こうすると「胴元が細っているときはダブルボタンだけ無効になり、手そのものは続けられる」。
  * 手ごと断ると、ダブルするつもりのなかった客まで遊べなくなる。
+ *
+ * ## 再実行では「実際に保存されている額」から復元する（レビュー指摘）
+ *
+ * 同じ操作をもう一度実行したとき、要求額ではなく**保存済みの予約額**を見て
+ * `doubleAllowed` を決める。要求だけを見ていると
+ * 「1回目はダブル無し 15,000 で予約 → 再実行でダブル込み 20,000 を要求 →
+ * 鍵が同じなので成功扱い → doubleAllowed=true」となり、裏付けの無いダブルを許してしまう。
  */
 export function reserveBlackjackLiability(
   services: Services,
@@ -268,10 +297,17 @@ export function reserveBlackjackLiability(
   const key = reservationKeyFor("ブラックジャック", userId, operationId);
   const ctx = liabilityCtx(services, userId);
   const withDouble = liabilityModelFor("ブラックジャック")?.maxHouseLiability({ ...ctx, bet }) ?? 0;
+  const noDouble = blackjackNoDoubleLiability.maxHouseLiability({ ...ctx, bet });
+
+  // 同じ操作の再実行なら、保存済みの額がそのまま答え
+  const existing = services.reservations.get(key);
+  if (existing) {
+    return { key, amount: existing.amount, doubleAllowed: existing.amount >= withDouble };
+  }
+
   const full = services.reservations.reserve(key, withDouble, "ブラックジャック", userId);
   if (full.ok) return { key, amount: withDouble, doubleAllowed: true };
 
-  const noDouble = blackjackNoDoubleLiability.maxHouseLiability({ ...ctx, bet });
   const fallback = services.reservations.reserve(key, noDouble, "ブラックジャック", userId);
   if (fallback.ok) return { key, amount: noDouble, doubleAllowed: false };
   throw new HouseCapacityError("ブラックジャック", noDouble, fallback.available);

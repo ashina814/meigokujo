@@ -350,6 +350,7 @@ export {
 
 export {
   HouseReservations,
+  ReservationConflictError,
   RESERVATION_STALE_SEC,
   type ReservationRow,
   type ReservationResult,

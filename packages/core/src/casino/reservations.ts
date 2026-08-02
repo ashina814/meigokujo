@@ -27,6 +27,41 @@ export interface ReservationResult {
   ok: boolean;
   /** 予約できなかったときの、いま受けられる上限（＝ available） */
   available: number;
+  /**
+   * 実際に保存されている予約（PR5 レビュー指摘）。
+   *
+   * 同じ鍵の再実行では**要求額ではなく保存済みの額**が返る。呼び出し側は
+   * ここから状態を復元する（例: ブラックジャックの `doubleAllowed`）。
+   * `ok:false` のときは `undefined`。
+   */
+  row?: ReservationRow;
+  /** `ok:false` の理由。`capacity` = 余力不足、`conflict` = 同じ鍵で内容が違う */
+  reason?: "capacity" | "conflict";
+  /** `conflict` のときに既に保存されている予約 */
+  conflictWith?: ReservationRow;
+}
+
+/**
+ * 同じ鍵で内容の違う予約を取ろうとした（PR5 レビュー指摘）。
+ *
+ * 「鍵が同じなら中身を見ずに成功」にすると、たとえばブラックジャックで
+ * 「初回はダブル無しで 15,000 しか取れなかったのに、再実行では 20,000 を要求して
+ * `ok:true` が返り、呼び出し側が `doubleAllowed=true` を復元する」ことが起きる。
+ * 実際の予約は 15,000 のままなので、ダブルされると裏付けが無い。
+ */
+export class ReservationConflictError extends Error {
+  constructor(
+    readonly key: string,
+    readonly existing: ReservationRow,
+    readonly requested: { amount: number; game: string; userId: string },
+  ) {
+    super(
+      `ERR_RESERVATION_CONFLICT: ${key} は既に ` +
+        `{amount:${existing.amount}, game:${existing.game}, user:${existing.userId}} で予約済み` +
+        `（要求 {amount:${requested.amount}, game:${requested.game}, user:${requested.userId}}）`,
+    );
+    this.name = "ReservationConflictError";
+  }
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -89,26 +124,47 @@ export class HouseReservations {
   /**
    * 予約を取る。**`available()` の再確認と INSERT を同一トランザクション**で行う。
    *
-   * すでに同じ鍵で予約済みなら成功として扱う（同じ操作の再試行で二重に取らない）。
-   * @returns 取れたかどうかと、取れなかった場合の現在の上限
+   * ## 同じ鍵が既にある場合（PR5 レビュー指摘）
+   *
+   * 以前は「鍵が同じなら中身を見ずに成功」だった。これだと、たとえば
+   *
+   * ```text
+   * 初回:   ダブル込み 20,000 が取れず → ダブル無し 15,000 を予約（doubleAllowed=false）
+   * 再実行: 20,000 を要求 → 同じ鍵の行があるので ok:true
+   *         → 呼び出し側が doubleAllowed=true を復元 → 実際の予約は 15,000 のまま
+   * ```
+   *
+   * となり、裏付けの無いダブルを許してしまう。
+   *
+   * いまは **user_id / game / amount がすべて一致するときだけ**冪等成功にする。
+   * 一致しなければ資金を1 Ld も動かさず {@link ReservationConflictError} を投げる。
+   * 「取り直したい」場合は呼び出し側が保存済みの額（`row`）から状態を復元すること。
+   *
+   * @returns 取れたかどうか、実際に保存されている予約、取れなかった場合の現在の上限
    */
   reserve(key: string, amount: number, game: string, userId: string): ReservationResult {
     if (!key.trim()) throw new Error("HouseReservations.reserve: key は必須");
     if (!Number.isSafeInteger(amount) || amount < 0) throw new Error(`HouseReservations.reserve: 不正な額 ${amount}`);
-    // 債務ゼロ（引き分けしかないゲーム等）は予約行を作らない
-    if (amount === 0) return { ok: true, available: this.available() };
 
     const run = this.db.transaction((): ReservationResult => {
       const existing = this.get(key);
-      if (existing) return { ok: true, available: this.available() };
+      if (existing) {
+        // 内容が違うなら冪等成功にしない（同じ鍵で別の債務を名乗らせない）
+        if (existing.amount !== amount || existing.game !== game || existing.userId !== userId) {
+          throw new ReservationConflictError(key, existing, { amount, game, userId });
+        }
+        return { ok: true, available: this.available(), row: existing };
+      }
+      // 債務ゼロ（引き分けしかないゲーム等）は予約行を作らない
+      if (amount === 0) return { ok: true, available: this.available() };
       const available = this.available();
-      if (amount > available) return { ok: false, available };
+      if (amount > available) return { ok: false, available, reason: "capacity" };
       this.db
         .prepare(
           "INSERT INTO casino_house_reservations (key, amount, game, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
         )
         .run(key, amount, game, userId, now());
-      return { ok: true, available: available - amount };
+      return { ok: true, available: available - amount, row: this.get(key)! };
     });
     // すでに書き込みトランザクションの中（runGroup の内側）ならそのまま合流する
     return this.db.inTransaction ? run() : run.immediate();
