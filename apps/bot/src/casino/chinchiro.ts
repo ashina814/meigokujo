@@ -20,6 +20,7 @@ import {
   chinchiroEvaluate,
   chinchiroIsTerminal,
   chinchiroMaxPayout,
+  chinchiroPlayerLoss,
   chinchiroPayout,
   chinchiroRoll,
   type ChinchiroDice as Dice,
@@ -82,7 +83,7 @@ function describe(h: Hand): string {
  * 分岐（勝ち／引分／通常負け／倍付け負け／残高不足フォールバック）も保存対象。
  */
 export interface ChinchiroRound {
-  branch: "win" | "push" | "loss" | "double_loss" | "fallback_loss";
+  branch: "win" | "push" | "loss" | "double_loss";
   settled: import("@meigokujo/core").SoloRoundResult;
   amuletNote: string | null;
   /** 倍付け負けの追加徴収額（それ以外は 0） */
@@ -108,35 +109,30 @@ export function settleChinchiroRound(
   /** 胴元債務予約の鍵（PR5）。精算が通った時点で同じトランザクション内で解放される */
   reservationKey?: string,
 ): ChinchiroRound {
+  // PR11: start-of-round で 2×bet を預けた経路。結果後に残高を読み直して
+  // 追加徴収したり、通常負けへフォールバックしたりしない。
+  const sessionId = `chinchiro:prehold:${uid}:${operationId}`;
   return services.ether.runGroup(
     { groupKey: `chinchiro:round:${uid}:${operationId}`, kind: "solo_game", actorId: uid },
     (): ChinchiroRound => {
-      const held = services.ether.balanceOf(uid);
-      if (mul > 0) {
-        // 勝ち: profit = bet * mul * (1 - edge)、payout = bet + profit
-        const rawPayout = chinchiroPayout(bet, mul);
-        const settled = services.casino.settleSolo(uid, "チンチロ", bet, rawPayout, { operationId, reservationKey });
-        return { branch: "win", settled, amuletNote: settled.amuletNote ?? null, extra: 0 };
-      }
-      if (mul === 0) {
-        // プッシュ（両方ヒフミ）: 返金
-        const settled = services.casino.settleSolo(uid, "チンチロ", bet, bet, { operationId, reservationKey });
-        return { branch: "push", settled, amuletNote: settled.amuletNote ?? null, extra: 0 };
-      }
-      const extraNeeded = mul <= -2 ? (Math.abs(mul) - 1) * bet : 0;
-      // 倍付け負けは追加徴収まで払えるときだけ。払えなければ通常負けへフォールバック
-      const doubleLoss = extraNeeded > 0 && held >= bet + extraNeeded;
-      const settled = services.casino.settleSolo(uid, "チンチロ", bet, 0, { operationId, reservationKey });
-      if (doubleLoss) {
-        services.ether.transfer(uid, HOUSE_HOLDER, extraNeeded, { reason: "倍付け負けの追加徴収", game: "チンチロ" });
-        return { branch: "double_loss", settled, amuletNote: settled.amuletNote ?? null, extra: extraNeeded };
-      }
-      return {
-        branch: extraNeeded > 0 ? "fallback_loss" : "loss",
-        settled,
-        amuletNote: settled.amuletNote ?? null,
-        extra: 0,
+      const preheld = bet * CHINCHIRO_MAX_LOSS_MULT;
+      if (services.escrow.poolOf(sessionId) !== preheld) throw new Error("チンチロ事前預託の帳簿不一致");
+      const loss = mul < 0 ? chinchiroPlayerLoss(bet, mul) : 0;
+      const returned = preheld - loss;
+      const holder = services.escrow.holderId(sessionId);
+      if (returned) services.ether.transfer(holder, uid, returned, { reason: "チンチロ事前預託の返還", game: "チンチロ", sessionId });
+      if (loss) services.ether.transfer(holder, HOUSE_HOLDER, loss, { reason: "チンチロ確定損失", game: "チンチロ", sessionId });
+      const rawPayout = mul > 0 ? chinchiroPayout(bet, mul) : mul === 0 ? bet : 0;
+      const profit = Math.max(0, rawPayout - bet);
+      if (profit) services.ether.transfer(HOUSE_HOLDER, uid, profit, { reason: "チンチロ胴元配当", game: "チンチロ", sessionId });
+      services.db.prepare("DELETE FROM casino_escrow WHERE session_id = ?").run(sessionId);
+      if (reservationKey) services.reservations.release(reservationKey);
+      services.casino.recordGameNet(uid, profit - loss, { countAsBiggestWin: profit > 0 });
+      const settled = {
+        wagered: bet, payout: rawPayout, net: profit - loss, chainBonus: 0, chainStreak: 0, chainMult: 1, chainLabel: "",
+        fukuTax: 0, fukuRate: 0, jackpotContributed: 0, jackpotUnfunded: 0, rawPayout,
       };
+      return { branch: mul > 0 ? "win" : mul === 0 ? "push" : loss === preheld ? "double_loss" : "loss", settled, amuletNote: null, extra: Math.max(0, loss - bet) };
     },
   );
 }
@@ -226,9 +222,22 @@ async function runRound(
   services: Services,
   bet: number,
 ): Promise<void> {
-  await withHouseReservation(interaction, services, "チンチロ", bet, interaction.id, (reservationKey) =>
-    runRoundInner(interaction, services, bet, reservationKey),
-  );
+  await withHouseReservation(interaction, services, "チンチロ", bet, interaction.id, async (reservationKey) => {
+    // 乱数・演出より前に最大損失を確保する。自動預入もここで必要額だけ行う。
+    const uid = interaction.user.id;
+    const preheld = bet * CHINCHIRO_MAX_LOSS_MULT;
+    try {
+      services.chipFlow.ensureFreeChips(uid, preheld, `${interaction.id}:chinchiro-prehold`);
+    } catch {
+      const payload = { content: `チンチロは最大 ${fmtEther(preheld)} を事前に預ける必要がある。Land が足りない。`, flags: MessageFlags.Ephemeral as const };
+      if (interaction.replied || interaction.deferred) await interaction.followUp(payload);
+      else await interaction.reply(payload);
+      return;
+    }
+    const held = services.escrow.hold(`chinchiro:prehold:${uid}:${interaction.id}`, uid, preheld, "チンチロ", interaction.id);
+    if (!held) throw new Error("チンチロ事前預託に失敗しました");
+    await runRoundInner(interaction, services, bet, reservationKey);
+  });
 }
 
 async function runRoundInner(
@@ -447,10 +456,6 @@ async function runRoundInner(
     const totalLoss = bet + round.extra;
     netForDisplay = -totalLoss;
     payoutText = `💀 -${fmtEther(totalLoss)}（${Math.abs(mul)}倍負け）`;
-  } else if (round.branch === "fallback_loss") {
-    netForDisplay = -bet;
-    payoutText = `💸 -${fmtEther(bet)}（残高不足で追加徴収なし）`;
-    extraNote = "\n*※本来は倍付け負けだったが、残高不足のため通常負けにフォールバック*";
   } else {
     netForDisplay = settled.payout - bet;
     payoutText = settled.payout > 0 ? `🛡 返金 ${fmtEther(settled.payout)}` : `💸 -${fmtEther(bet)}`;
