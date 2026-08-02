@@ -190,7 +190,7 @@ describe("城の計器盤", () => {
     });
 
     expect(getEconomyHealthSummary(services).sessionEscrowMismatchDiff).toBe(300);
-    expect(fieldValue(buildDashboardEmbed(services), "経済健全性")).toContain("session不一致 1件（差額 300◈）");
+    expect(fieldValue(buildDashboardEmbed(services), "経済健全性")).toContain("session不一致 1件（差額 300 Ld）");
   });
 
   it("台帳記録なしのsession holderに残高がある場合は孤児holderとして警告する", () => {
@@ -202,7 +202,7 @@ describe("城の計器盤", () => {
     expect(summary.orphanSessionHolderCount).toBe(1);
     expect(summary.orphanEscrowTotal).toBe(1_234);
     expect(fieldValue(buildDashboardEmbed(services), "経済健全性")).toContain(
-      "孤児holder 1件（合計 1,234◈ / session 1）",
+      "孤児holder 1件（合計 1,234 Ld / session 1）",
     );
   });
 
@@ -213,7 +213,7 @@ describe("城の計器盤", () => {
     const summary = getEconomyHealthSummary(services);
     expect(summary.marketEscrowMismatchCount).toBe(1);
     expect(summary.marketEscrowMismatchDiff).toBe(600);
-    expect(fieldValue(buildDashboardEmbed(services), "経済健全性")).toContain("pot不一致 1件（差額 600◈）");
+    expect(fieldValue(buildDashboardEmbed(services), "経済健全性")).toContain("pot不一致 1件（差額 600 Ld）");
   });
 
   it("settled／void市場のholderに残高が残っている場合は孤児holderとして警告する", () => {
@@ -226,7 +226,7 @@ describe("城の計器盤", () => {
     expect(summary.orphanMarketHolderCount).toBe(2);
     expect(summary.orphanEscrowTotal).toBe(1_000);
     expect(fieldValue(buildDashboardEmbed(services), "経済健全性")).toContain(
-      "孤児holder 2件（合計 1,000◈ / market 2）",
+      "孤児holder 2件（合計 1,000 Ld / market 2）",
     );
   });
 
@@ -239,7 +239,7 @@ describe("城の計器盤", () => {
     const health = fieldValue(buildDashboardEmbed(services), "経済健全性");
     expect(health).toContain("frozen 1件");
     expect(health).toContain("未知fund_mode 1件");
-    expect(health).toContain("隔離資金: 99◈");
+    expect(health).toContain("隔離資金: 99 Ld");
   });
 
   it("legacy_house市場が処理済みなら警告しない", () => {
