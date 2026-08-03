@@ -29,10 +29,10 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx, requireOpeningV1: false });
   const reservations = new HouseReservations(db, ether, events);
   // services.ts と同じ配線: house だけ予約合計を反映する
-  ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
+  ether.setReservedProvider((holderId: string) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
   const daily = new Daily(db, ether, events, { base: 100, reliefThreshold: 0, reliefMax: 500 });
   const stocks = new Stocks(db, ether, events);
   return { db, ledger, events, chipTx, ether, reservations, daily, stocks };

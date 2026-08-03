@@ -35,7 +35,7 @@ function setup(rng: CasinoRng) {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx, requireOpeningV1: false });
   const items = new Items(db);
   const reservations = new HouseReservations(db, ether, events);
   ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));

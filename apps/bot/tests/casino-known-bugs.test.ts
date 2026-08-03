@@ -74,7 +74,7 @@ function rebuild(db: ReturnType<typeof openDb>, rng: CasinoRng = scriptedRng([0.
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx, requireOpeningV1: false });
   const items = new Items(db);
   // 胴元債務予約（PR5）。無料スピンの再開はここから予約を取り直す
   const reservations = new HouseReservations(db, ether, events);

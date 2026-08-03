@@ -164,6 +164,7 @@ export {
   isPlayerHolder,
   type ChipQuote,
   type ChipLedgerOptions,
+  type ChipLedgerErrorCode,
   type ChipMoveInfo,
 } from "./casino/chip-ledger.js";
 export {
@@ -171,6 +172,7 @@ export {
   ChipTxError,
   CHIP_OPENING_VERSION_KEY,
   LEGACY_OPENING_VERSION,
+  FORMAL_OPENING_VERSION,
   type ChipTxKind,
   type ChipMove,
   type ChipGroupInput,

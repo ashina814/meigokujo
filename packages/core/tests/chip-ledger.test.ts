@@ -1,10 +1,22 @@
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { ChipLedger, ChipLedgerError, CHIP_ESCROW, ETHER_ESCROW, HOUSE_HOLDER } from "../src/casino/chip-ledger.js";
+import {
+  ChipLedger,
+  ChipLedgerError,
+  CHIP_ESCROW,
+  ETHER_ESCROW,
+  HOUSE_HOLDER,
+  EtherExchange as LockedEtherExchange,
+} from "../src/casino/chip-ledger.js";
+import { ChipLedger as RootChipLedger } from "../src/index.js";
 import { ChipTx } from "../src/casino/chip-tx.js";
+import * as CoreIndex from "../src/index.js";
 
 registerDefaultTxTypes();
 function setup(options: { sharedChipTx?: boolean; requireOpeningV1?: boolean } = {}) {
@@ -15,7 +27,9 @@ function setup(options: { sharedChipTx?: boolean; requireOpeningV1?: boolean } =
 }
 const count = (ctx: ReturnType<typeof setup>, table: string) => (ctx.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
 describe("ChipLedger", () => {
-  let ctx: ReturnType<typeof setup>; beforeEach(() => { ctx = setup(); });
+  // secure default（requireOpeningV1既定true）とは独立に1:1の基本動作を検証するための
+  // 明示的なテスト専用解除。ここで何を無効化しているかがコード上に必ず残る（PR8監査）。
+  let ctx: ReturnType<typeof setup>; beforeEach(() => { ctx = setup({ requireOpeningV1: false }); });
   it("預入・返還は常に1:1で、準備口座は発行済みチップを100%裏付ける", () => {
     expect(ctx.chips.deposit("a", 12_345, "deposit:a")).toEqual({ input: 12_345, output: 12_345, burned: 0 }); expect(ctx.chips.balanceOf("a")).toBe(12_345); expect(ctx.chips.pool()).toBe(12_345); expect(ctx.ledger.balanceOf(ETHER_ESCROW)).toBe(12_345);
     expect(ctx.chips.redeem("a", 2_345, "redeem:a")).toEqual({ input: 2_345, output: 2_345, burned: 0 }); expect(ctx.chips.balanceOf("a")).toBe(10_000); expect(ctx.chips.pool()).toBe(10_000); expect(ctx.ledger.balanceOf("user:a")).toBe(990_000); expect(ctx.ledger.balanceOf(CHIP_ESCROW)).toBe(0);
@@ -32,4 +46,174 @@ describe("ChipLedger", () => {
     expect({ userLand: locked.ledger.balanceOf("user:a"), oldReserve: locked.ledger.balanceOf(ETHER_ESCROW), newReserve: locked.ledger.balanceOf(CHIP_ESCROW), department: locked.ledger.balanceOf(department), legacyChips: locked.chips.balanceOf("legacy-user"), houseChips: locked.chips.balanceOf(HOUSE_HOLDER), landTx: count(locked, "transactions"), groups: count(locked, "casino_tx_groups"), chipTx: count(locked, "casino_tx") }).toEqual(before); locked.db.close();
   });
   it("opening_v1確定後だけproduction構築の1:1操作を解放する", () => { const opened = setup({ sharedChipTx: true, requireOpeningV1: true }); expect(() => opened.chips.deposit("a", 100, "before:opening")).toThrow(/ERR_CASINO_OPENING_NOT_COMPLETE/); opened.chipTx.captureOpening("opening_v1", [], { poolLand: opened.ledger.balanceOf(CHIP_ESCROW), fromLedgerTxId: opened.ledger.lastTransactionId() }); expect(opened.chips.deposit("a", 1_000, "after:deposit")).toEqual({ input: 1_000, output: 1_000, burned: 0 }); expect(opened.chips.redeem("a", 400, "after:redeem")).toEqual({ input: 400, output: 400, burned: 0 }); expect(opened.chips.balanceOf("a")).toBe(600); expect(opened.ledger.balanceOf(CHIP_ESCROW)).toBe(600); opened.db.close(); });
+});
+
+/**
+ * PR8監査・ブロッカーA: secure default とロック迂回不可能性を固定する。
+ *
+ * `requireOpeningV1` は既定で true。オプションを一切渡さない・空オブジェクトで渡す・
+ * package root からの import・deprecated `EtherExchange` のいずれでも、
+ * 正式開業前の資金操作は必ず core 層で拒否されること。
+ */
+describe("secure default とロック迂回不可能性", () => {
+  it("オプション未指定（optionsそのものを渡さない）でもopening_v1前は拒否する", () => {
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    ledger.ensureAccount("user:a", "user");
+    ledger.transfer({ from: TREASURY, to: "user:a", amount: 10_000, type: "initial", actor: "test", idempotencyKey: "fund:a" });
+    // 第4引数（options）そのものを省略する＝実装のデフォルト値だけに頼る
+    const chips = new ChipLedger(db, ledger, new EventLog(db));
+    expect(() => chips.deposit("a", 100, "unspecified:deposit")).toThrow(/ERR_CASINO_OPENING_NOT_COMPLETE/);
+    db.close();
+  });
+
+  it("空オブジェクト {} を渡してもopening_v1前は拒否する", () => {
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    ledger.ensureAccount("user:a", "user");
+    ledger.transfer({ from: TREASURY, to: "user:a", amount: 10_000, type: "initial", actor: "test", idempotencyKey: "fund:a" });
+    const chips = new ChipLedger(db, ledger, new EventLog(db), {});
+    expect(() => chips.deposit("a", 100, "empty-options:deposit")).toThrow(/ERR_CASINO_OPENING_NOT_COMPLETE/);
+    db.close();
+  });
+
+  it("package root（@meigokujo/core相当）からのimportもsecure defaultでロックされる", () => {
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    ledger.ensureAccount("user:a", "user");
+    ledger.transfer({ from: TREASURY, to: "user:a", amount: 10_000, type: "initial", actor: "test", idempotencyKey: "fund:a" });
+    const chips = new RootChipLedger(db, ledger, new EventLog(db));
+    expect(() => chips.deposit("a", 100, "root:deposit")).toThrow(/ERR_CASINO_OPENING_NOT_COMPLETE/);
+    db.close();
+  });
+
+  it("deprecated EtherExchange（chip-ledger.js）でも同じロックを通り、迂回できない", () => {
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    ledger.ensureAccount("user:a", "user");
+    ledger.transfer({ from: TREASURY, to: "user:a", amount: 10_000, type: "initial", actor: "test", idempotencyKey: "fund:a" });
+    const ether = new LockedEtherExchange(db, ledger, new EventLog(db));
+    expect(() => ether.buy("a", 100, "legacy-api:buy")).toThrow(/ERR_CASINO_OPENING_NOT_COMPLETE/);
+    expect(() => ether.deposit("a", 100, "legacy-api:deposit")).toThrow(/ERR_CASINO_OPENING_NOT_COMPLETE/);
+    db.close();
+  });
+
+  it("package rootは旧EtherExchangeを一切公開しない", () => {
+    expect((CoreIndex as Record<string, unknown>).EtherExchange).toBeUndefined();
+  });
+
+  it("../casino/exchange.js の直接importでは「ChipLedger」という名を取得できない（ロックなし実装は別名）", () => {
+    const src = readFileSync(new URL("../src/casino/exchange.ts", import.meta.url), "utf8");
+    expect(src).not.toMatch(/export class ChipLedger\b/);
+    expect(src).not.toMatch(/export class EtherExchange\b/);
+    expect(src).toContain("export class ChipLedgerCore");
+    expect(src).toContain("export class EtherExchangeCore");
+  });
+
+  it("テスト専用の requireOpeningV1:false / ChipLedgerCore / EtherExchangeCore は production call site 0件", () => {
+    const root = fileURLToPath(new URL("../../../", import.meta.url));
+    const targets = [join(root, "apps", "bot", "src"), join(root, "packages", "core", "src")];
+    // exchange.ts（定義元）と chip-ledger.ts（そこから正規に継承する唯一の場所）だけは
+    // 「ChipLedgerCore」という名前が登場して当然なので除外する。それ以外の production
+    // コードから見えたら、ロックなし実装への迂回経路が新設されたことになる。
+    const allowedDefinitionFiles = [
+      join(root, "packages", "core", "src", "casino", "exchange.ts"),
+      join(root, "packages", "core", "src", "casino", "chip-ledger.ts"),
+    ];
+    const offenders: string[] = [];
+    const walk = (dir: string): void => {
+      for (const name of readdirSync(dir)) {
+        const full = join(dir, name);
+        const st = statSync(full);
+        if (st.isDirectory()) {
+          walk(full);
+          continue;
+        }
+        if (!name.endsWith(".ts") || allowedDefinitionFiles.includes(full)) continue;
+        const text = readFileSync(full, "utf8");
+        if (/requireOpeningV1\s*:\s*false/.test(text) || /\bChipLedgerCore\b/.test(text) || /\bEtherExchangeCore\b/.test(text)) {
+          offenders.push(full);
+        }
+      }
+    };
+    for (const t of targets) walk(t);
+    expect(offenders).toEqual([]);
+  });
+});
+
+/**
+ * PR8監査・ブロッカーC: opening_version の fail-closed 化。
+ *
+ * `reserveHolder()`（延いては pool/deposit/redeem/fund/settle 全て）は、
+ * legacy_pre_reset / opening_v1 の**厳密一致**でしか準備口座を決めない。
+ * 空文字・typo・DB破損・opening_v2・将来未対応版・__proto__ を
+ * 「旧制度」として fail-open せず、必ず ERR_UNKNOWN_OPENING_VERSION にする。
+ */
+describe("opening versionのfail-closed化", () => {
+  function setVersion(db: ReturnType<typeof openDb>, version: string): void {
+    const ts = Math.floor(Date.now() / 1000);
+    db.prepare(
+      `INSERT INTO settings (key, value, updated_at) VALUES ('casino:opening_version', ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    ).run(version, ts);
+  }
+
+  function ctxWithVersion(version: string) {
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    setVersion(db, version);
+    // ChipTx はバージョンをキャッシュするので、設定後に新しいインスタンスで読み直す
+    const chipTx = new ChipTx(db);
+    // reserveHolder() 自体のfail-closed性を見たいので、開業ロック（ブロッカーA）は
+    // 明示的に外す（何を無効化しているかがコード上に残る）
+    const chips = new ChipLedger(db, ledger, new EventLog(db), { chipTx, requireOpeningV1: false });
+    return { db, ledger, chipTx, chips };
+  }
+
+  it.each([
+    ["legacy_pre_reset", ETHER_ESCROW],
+    ["opening_v1", CHIP_ESCROW],
+  ] as const)("既知の版 %s は正しい準備口座 %s を返す", (version, expectedHolder) => {
+    const ctx = ctxWithVersion(version);
+    expect(ctx.chips.reserveHolder()).toBe(expectedHolder);
+    ctx.db.close();
+  });
+
+  it.each([
+    ["空文字", ""],
+    ["空白のみ", "   "],
+    ["typo", "opening_v1 "],
+    ["opening_v2", "opening_v2"],
+    ["__proto__", "__proto__"],
+    ["未対応の将来版", "opening_v99"],
+  ])("未知版（%s）はERR_UNKNOWN_OPENING_VERSIONでfail-closedになる", (_label, version) => {
+    const ctx = ctxWithVersion(version);
+    let error: unknown;
+    try {
+      ctx.chips.reserveHolder();
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toBeInstanceOf(ChipLedgerError);
+    expect((error as { code: string }).code).toBe("ERR_UNKNOWN_OPENING_VERSION");
+    // pool読み取りもdeposit/redeemも同じ経路で拒否される
+    expect(() => ctx.chips.pool()).toThrow(/ERR_UNKNOWN_OPENING_VERSION/);
+    ctx.ledger.ensureAccount("user:a", "user");
+    expect(() => ctx.chips.deposit("a", 100, "unknown-version:deposit")).toThrow(/ERR_UNKNOWN_OPENING_VERSION/);
+    ctx.db.close();
+  });
+
+  it("DBを閉じて再読込した後も未知版はfail-closedのまま残る", () => {
+    const first = ctxWithVersion("opening_v1");
+    first.db.close();
+
+    // 同じ内容を新しいDB接続で再現する（DB再読込を模す）
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    setVersion(db, "corrupted-by-something");
+    const chipTx = new ChipTx(db);
+    const chips = new ChipLedger(db, ledger, new EventLog(db), { chipTx, requireOpeningV1: false });
+    expect(() => chips.reserveHolder()).toThrow(/ERR_UNKNOWN_OPENING_VERSION/);
+    db.close();
+  });
 });

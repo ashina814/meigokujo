@@ -3,10 +3,10 @@ import { Ledger } from "../../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../../src/ledger/registry.js";
 import { EventLog } from "../../src/events/service.js";
 import { ChipTx } from "../../src/casino/chip-tx.js";
-import { ChipLedger } from "../../src/casino/exchange.js";
+import { ChipLedgerCore } from "../../src/casino/exchange.js";
 
 /**
- * 別プロセスから**本番コードそのもの**（openDb / ChipTx / ChipLedger.runGroup）で
+ * 別プロセスから**本番コードそのもの**（openDb / ChipTx / ChipLedgerCore.runGroup）で
  * 同じ業務グループを実行する。複数接続での競合を、テスト用の写しではなく実物で確かめるため。
  *
  * 引数は JSON1つ。結果は JSON1行を標準出力へ返す。
@@ -34,7 +34,7 @@ function main(): void {
   registerDefaultTxTypes();
   const db = openDb(input.dbPath);
   const chipTx = new ChipTx(db);
-  const ether = new ChipLedger(db, new Ledger(db), new EventLog(db), { chipTx });
+  const ether = new ChipLedgerCore(db, new Ledger(db), new EventLog(db), { chipTx });
 
   sleepUntil(input.startAt);
 

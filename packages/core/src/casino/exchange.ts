@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import { Ledger } from "../ledger/service.js";
 import { EventLog } from "../events/service.js";
-import { ChipTx } from "./chip-tx.js";
+import { ChipTx, LEGACY_OPENING_VERSION, FORMAL_OPENING_VERSION } from "./chip-tx.js";
 
 /**
  * 賭場チップ台帳。Land を 100% 準備し、預入・返還とも常に 1:1 で処理する。
@@ -40,20 +40,34 @@ export function isPlayerHolder(holderId: string): boolean {
   return !/^(sys:|system:|escrow:)/.test(holderId);
 }
 
-export type EtherErrorCode =
+/**
+ * `ChipLedgerError` の公開エラーコード（PR8監査・項目11）。
+ *
+ * `ERR_CASINO_OPENING_NOT_COMPLETE` は `chip-ledger.ts` の正式開業ロックが投げる値だが、
+ * 型はここで一元管理する（`as never` でコード側の型検査を迂回させない）。
+ * `ERR_INSUFFICIENT_ETHER` は歴史的な名残りで残す（旧コードとの互換）。
+ */
+export type ChipLedgerErrorCode =
   | "ERR_BAD_AMOUNT"
   | "ERR_INSUFFICIENT_ETHER"
   | "ERR_DUPLICATE"
   /** 予約済み債務の裏付けまで精算しようとした（PR5） */
-  | "ERR_RESERVED_FUNDS";
+  | "ERR_RESERVED_FUNDS"
+  /** opening_version が legacy_pre_reset / opening_v1 のどちらでもない（PR8監査・ブロッカーC） */
+  | "ERR_UNKNOWN_OPENING_VERSION"
+  /** 正式開業（opening_v1）確定前に資金グループを開こうとした（PR8監査・ブロッカーA） */
+  | "ERR_CASINO_OPENING_NOT_COMPLETE";
 
-export class EtherError extends Error {
+/** @deprecated `ChipLedgerErrorCode` を使うこと。名前だけの後方互換。 */
+export type EtherErrorCode = ChipLedgerErrorCode;
+
+export class ChipLedgerError extends Error {
   constructor(
-    readonly code: EtherErrorCode,
+    readonly code: ChipLedgerErrorCode,
     readonly meta: Record<string, unknown> = {},
   ) {
     super(code);
-    this.name = "EtherError";
+    this.name = "ChipLedgerError";
   }
 }
 
@@ -87,8 +101,19 @@ export interface ChipMoveInfo {
 }
 
 const now = () => Math.floor(Date.now() / 1000);
-/** floor(a * b / c) を安全に（オーバーフロー回避） */
-export class ChipLedger {
+
+/**
+ * 正式開業ロックを持たない基底実装（PR8監査・ブロッカーA）。
+ *
+ * **直接構築してはいけない。** 正式開業前の資金操作を core 層で確実に止めるのは
+ * `./chip-ledger.js` が export する `ChipLedger`（ロック付き）の役目で、そちらが
+ * 唯一の公開APIになる。ここに `ChipLedger` という名前を残すと、
+ * `../casino/exchange.js` を直接 import するだけでロックを迂回できてしまうため、
+ * 名前ごと切り離してある（production からの参照は 0 件であることを grep とテストで固定する）。
+ *
+ * テストで正式開業前の1:1資金操作そのものを検証したい場合だけ、このクラスを直接使ってよい。
+ */
+export class ChipLedgerCore {
   /** チップ移動の追記先。賭場の他サービスもここ経由で同じグループに乗る */
   readonly chipTx: ChipTx;
 
@@ -141,9 +166,19 @@ export class ChipLedger {
   pool(): number {
     return this.ledger.balanceOf(this.reserveHolder());
   }
-  /** 現在のチップ制度が使う準備口座。opening_v1 は PR12 が確定する。 */
+  /**
+   * 現在のチップ制度が使う準備口座。opening_v1 は PR12 が確定する。
+   *
+   * **fail-closed**（PR8監査・ブロッカーC）。対応する版を明示的に列挙し、
+   * 空文字・typo・DB破損・`opening_v2`・将来未対応版など未知の版を
+   * 「旧制度（legacy_pre_reset）」として扱わない。未知版では準備口座そのものが
+   * 決まらない以上、預入・返還・精算・pool読み取りのいずれも進めてはいけない。
+   */
   reserveHolder(): string {
-    return this.chipTx.currentVersion() === "opening_v1" ? CHIP_ESCROW : ETHER_ESCROW;
+    const version = this.chipTx.currentVersion();
+    if (version === LEGACY_OPENING_VERSION) return ETHER_ESCROW;
+    if (version === FORMAL_OPENING_VERSION) return CHIP_ESCROW;
+    throw new ChipLedgerError("ERR_UNKNOWN_OPENING_VERSION", { version });
   }
   /** 発行済みエテル総数 */
   outstanding(): number {
@@ -162,7 +197,7 @@ export class ChipLedger {
    * **別の操作が同じ Land 冪等キーを使った**場合なので、資金を動かさず失敗させる。
    */
   private assertLandMoved(result: { duplicate: boolean }, idempotencyKey: string): void {
-    if (result.duplicate) throw new EtherError("ERR_DUPLICATE", { idempotencyKey });
+    if (result.duplicate) throw new ChipLedgerError("ERR_DUPLICATE", { idempotencyKey });
   }
 
   private setBalance(holderId: string, delta: number): void {
@@ -193,7 +228,7 @@ export class ChipLedger {
 
   /** Land を預けて自由チップを発行する（常に 1:1）。 */
   deposit(userId: string, landIn: number, idempotencyKey: string): ChipQuote {
-    if (!Number.isInteger(landIn) || landIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { landIn });
+    if (!Number.isInteger(landIn) || landIn <= 0) throw new ChipLedgerError("ERR_BAD_AMOUNT", { landIn });
     return this.runGroup({ groupKey: idempotencyKey, kind: "deposit", actorId: `user:${userId}` }, (): ChipQuote => {
       const q = this.quoteDeposit(landIn);
       this.ledger.ensureAccount(`user:${userId}`, "user");
@@ -214,12 +249,12 @@ export class ChipLedger {
 
   /** 自由チップを Land へ返還する（常に 1:1）。 */
   redeem(userId: string, chipsIn: number, idempotencyKey: string): ChipQuote {
-    if (!Number.isInteger(chipsIn) || chipsIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { chipsIn });
+    if (!Number.isInteger(chipsIn) || chipsIn <= 0) throw new ChipLedgerError("ERR_BAD_AMOUNT", { chipsIn });
     return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: `user:${userId}` }, (): ChipQuote => {
       // 残高の検査はグループの中で行う。外でやると、成功後の再試行が
       // 「保存済みの結果を返す」前に残高不足で落ちてしまう
       const held = this.balanceOf(userId);
-      if (held < chipsIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, chipsIn });
+      if (held < chipsIn) throw new ChipLedgerError("ERR_INSUFFICIENT_ETHER", { held, chipsIn });
       const q = this.quoteRedeem(chipsIn);
       const payout = this.ledger.transfer({
         from: this.reserveHolder(), to: `user:${userId}`, amount: q.output, type: "chip_redeem", actor: `user:${userId}`,
@@ -236,12 +271,24 @@ export class ChipLedger {
     });
   }
 
-  /** 胴元などのチップを、システム口座の Land へ 1:1 で精算する。 */
+  /**
+   * 胴元などのチップを、システム口座の Land へ 1:1 で精算する。
+   *
+   * **予約済み債務は出せない**（PR5 / PR8監査・ブロッカーB）。進行中ゲームの最大配当の
+   * 裏付けをシステム口座へ移せてしまうと、予約が支払保証にならない。`settleableBalance()`
+   * を超える要求は `ERR_RESERVED_FUNDS` で断る（1 Ldも1 chipも動かさない）。
+   * 予約の再確認は `runGroup` と同じ IMMEDIATE トランザクションの中で行う
+   * （成功後の再試行を、その後に増減した予約状態で誤って落とさないため）。
+   */
   redeemToAccount(holderId: string, chipsIn: number, destAccount: string, actor: string, idempotencyKey: string): ChipQuote {
-    if (!Number.isInteger(chipsIn) || chipsIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { chipsIn });
+    if (!Number.isInteger(chipsIn) || chipsIn <= 0) throw new ChipLedgerError("ERR_BAD_AMOUNT", { chipsIn });
     return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: actor }, (): ChipQuote => {
       const held = this.balanceOf(holderId);
-      if (held < chipsIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, chipsIn });
+      if (held < chipsIn) throw new ChipLedgerError("ERR_INSUFFICIENT_ETHER", { held, chipsIn });
+      const settleable = this.settleableBalance(holderId);
+      if (settleable < chipsIn) {
+        throw new ChipLedgerError("ERR_RESERVED_FUNDS", { held, settleable, reserved: held - settleable, chipsIn });
+      }
       const q = this.quoteRedeem(chipsIn);
       const settle = this.ledger.transfer({
         from: this.reserveHolder(), to: destAccount, amount: q.output, type: "chip_settle", actor,
@@ -262,7 +309,7 @@ export class ChipLedger {
    * システム口座(部署など)の Land を元手に、1:1でチップを holder へ発行する。
    */
   fundFromAccount(srcAccount: string, landIn: number, holderId: string, idempotencyKey: string): { land: number; ether: number } {
-    if (!Number.isInteger(landIn) || landIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { landIn });
+    if (!Number.isInteger(landIn) || landIn <= 0) throw new ChipLedgerError("ERR_BAD_AMOUNT", { landIn });
     return this.runGroup({ groupKey: idempotencyKey, kind: "deposit", actorId: ETHER_APPROVER }, () => {
       const q = this.quoteDeposit(landIn);
       const land = this.ledger.transfer({
@@ -281,37 +328,15 @@ export class ChipLedger {
   }
 
   /**
-   * @deprecated `redeemToAccount` を使う。1:1化により、旧「fair」区別は不要。
+   * @deprecated `redeemToAccount` を使うこと。1:1化により、旧「fair」区別は不要。
    *
-   * **予約済み債務は出せない**（PR5）。進行中ゲームの最大配当の裏付けを部署口座へ
-   * 移せてしまうと、予約が支払保証にならない。`settleableBalance()` を超える要求は
-   * `ERR_RESERVED_FUNDS` で断る。予約が無ければ従来どおり全額戻せる
-   * （＝全部戻すと準備プールもちょうど空になる）。
+   * **独自のロジックは持たない**（PR8監査・ブロッカーB）。予約保護は `redeemToAccount`
+   * 自身が常に行うため、ここは actor を `ETHER_APPROVER` に固定した単純な委譲にする。
+   * 資金処理ロジックを2本持つと、どちらか一方だけ直した場合に保護が食い違う。
    */
   redeemFairToAccount(holderId: string, etherIn: number, destAccount: string, idempotencyKey: string): { ether: number; land: number } {
-    if (!Number.isInteger(etherIn) || etherIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { etherIn });
-    return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: ETHER_APPROVER }, () => {
-      const held = this.balanceOf(holderId);
-      if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
-      // 予約の再確認もグループ（＝同一トランザクション）の中で行う
-      const settleable = this.settleableBalance(holderId);
-      if (settleable < etherIn) {
-        throw new EtherError("ERR_RESERVED_FUNDS", { held, settleable, reserved: held - settleable, etherIn });
-      }
-      const land = etherIn;
-      const settle = this.ledger.transfer({
-        from: this.reserveHolder(), to: destAccount, amount: land, type: "chip_settle", actor: ETHER_APPROVER,
-        approvedBy: ETHER_APPROVER, reason: "胴元の売上精算", refType: "casino_chip", refId: holderId, idempotencyKey,
-      });
-      this.assertLandMoved(settle, idempotencyKey);
-      this.setBalance(holderId, -etherIn);
-      this.chipTx.record({
-        txKind: "redeem", from: holderId, amount: etherIn, reason: "胴元の売上精算",
-        landAmount: land, ledgerTxId: settle.tx.id,
-      });
-      this.events.log("chip_settle", { actor: holderId, payload: { chips: etherIn, land, dest: destAccount } });
-      return { ether: etherIn, land };
-    });
+    const q = this.redeemToAccount(holderId, etherIn, destAccount, ETHER_APPROVER, idempotencyKey);
+    return { ether: q.input, land: q.output };
   }
 
   /**
@@ -319,8 +344,8 @@ export class ChipLedger {
    * 理由の指定は必須で、グループの外では動かせない（記録できない移動を作らないため）。
    */
   transfer(fromHolderId: string, toHolderId: string, amount: number, move: ChipMoveInfo): void {
-    if (!Number.isInteger(amount) || amount <= 0) throw new EtherError("ERR_BAD_AMOUNT", { amount });
-    if (this.balanceOf(fromHolderId) < amount) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held: this.balanceOf(fromHolderId), amount });
+    if (!Number.isInteger(amount) || amount <= 0) throw new ChipLedgerError("ERR_BAD_AMOUNT", { amount });
+    if (this.balanceOf(fromHolderId) < amount) throw new ChipLedgerError("ERR_INSUFFICIENT_ETHER", { held: this.balanceOf(fromHolderId), amount });
     this.db.transaction(() => {
       this.setBalance(fromHolderId, -amount);
       this.setBalance(toHolderId, amount);
@@ -333,14 +358,17 @@ export class ChipLedger {
 /**
  * @deprecated PR8後の新規コードでは使わない。内部テストと既存プラグインを段階移行させる
  * 互換コンストラクタであり、変動レートの振る舞いは復活させない。
+ *
+ * `ChipLedgerCore` 同様、正式開業ロックを持たない。production からの直接構築は禁止
+ * （`./chip-ledger.js` が export するロック付き `EtherExchange` を使うこと）。
  */
 export interface EtherExchangeOptions extends ChipLedgerOptions {
   /** @deprecated 無視される。チップの交換比率は常に1:1。 */
   baseRate?: number | (() => number);
 }
 
-/** @deprecated `ChipLedger` を使うこと。 */
-export class EtherExchange extends ChipLedger {
+/** @deprecated ロックなし。テスト専用。production は `./chip-ledger.js` の `ChipLedger`/`EtherExchange` を使うこと。 */
+export class EtherExchangeCore extends ChipLedgerCore {
   constructor(db: Database.Database, ledger: Ledger, events: EventLog, options: EtherExchangeOptions = {}) {
     super(db, ledger, events, options);
   }

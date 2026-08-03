@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { HouseReservations } from "../src/casino/reservations.js";
-import { EtherExchange } from "../src/casino/exchange.js";
+import { EtherExchangeCore } from "../src/casino/exchange.js";
 import { Ledger } from "../src/ledger/service.js";
 import { EventLog } from "../src/events/service.js";
 import { ChipTx } from "../src/casino/chip-tx.js";
@@ -89,7 +89,7 @@ describe("複数接続からの同時予約（本番コード）", () => {
     const reopened = openDb(dbPath);
     const reservations = new HouseReservations(
       reopened,
-      new EtherExchange(reopened, new Ledger(reopened), new EventLog(reopened), { baseRate: 1, chipTx: new ChipTx(reopened) }),
+      new EtherExchangeCore(reopened, new Ledger(reopened), new EventLog(reopened), { baseRate: 1, chipTx: new ChipTx(reopened) }),
       new EventLog(reopened),
     );
     const total = reservations.totalReserved();
@@ -115,7 +115,7 @@ describe("複数接続からの同時予約（本番コード）", () => {
     const reopened = openDb(dbPath);
     const reservations = new HouseReservations(
       reopened,
-      new EtherExchange(reopened, new Ledger(reopened), new EventLog(reopened), { baseRate: 1, chipTx: new ChipTx(reopened) }),
+      new EtherExchangeCore(reopened, new Ledger(reopened), new EventLog(reopened), { baseRate: 1, chipTx: new ChipTx(reopened) }),
       new EventLog(reopened),
     );
     const total = reservations.totalReserved();
@@ -144,7 +144,7 @@ describe("複数接続からの同時予約（本番コード）", () => {
     const reopened = openDb(dbPath);
     const reservations = new HouseReservations(
       reopened,
-      new EtherExchange(reopened, new Ledger(reopened), new EventLog(reopened), { baseRate: 1, chipTx: new ChipTx(reopened) }),
+      new EtherExchangeCore(reopened, new Ledger(reopened), new EventLog(reopened), { baseRate: 1, chipTx: new ChipTx(reopened) }),
       new EventLog(reopened),
     );
     const total = reservations.totalReserved();
@@ -170,7 +170,7 @@ describe("複数接続からの同時予約（本番コード）", () => {
     const reopened = openDb(dbPath);
     const reservations = new HouseReservations(
       reopened,
-      new EtherExchange(reopened, new Ledger(reopened), new EventLog(reopened), { baseRate: 1, chipTx: new ChipTx(reopened) }),
+      new EtherExchangeCore(reopened, new Ledger(reopened), new EventLog(reopened), { baseRate: 1, chipTx: new ChipTx(reopened) }),
       new EventLog(reopened),
     );
     const total = reservations.totalReserved();

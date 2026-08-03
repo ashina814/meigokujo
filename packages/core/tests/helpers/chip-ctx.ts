@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ChipLedger } from "../../src/casino/exchange.js";
+import type { ChipLedgerCore } from "../../src/casino/exchange.js";
 
 /**
  * テストからチップを直接動かすための補助。
@@ -10,7 +10,7 @@ import type { ChipLedger } from "../../src/casino/exchange.js";
 
 /** 使い捨てのグループでチップ移動を1回だけ行う（残高の作り込みや、不整合を作る細工に使う） */
 export function testTransfer(
-  ether: ChipLedger,
+  ether: ChipLedgerCore,
   from: string,
   to: string,
   amount: number,
@@ -22,7 +22,7 @@ export function testTransfer(
 }
 
 /** 複数の移動をまとめて1グループで行う（グループ単位の記録を確認したいとき） */
-export function inTestGroup<T>(ether: ChipLedger, body: () => T, kind = "opening_reset"): T {
+export function inTestGroup<T>(ether: ChipLedgerCore, body: () => T, kind = "opening_reset"): T {
   return ether.runGroup({ groupKey: `test:${randomUUID()}`, kind, actorId: "system:test" }, body);
 }
 

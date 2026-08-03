@@ -4,7 +4,7 @@ import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { ChipLedger } from "../src/casino/exchange.js";
+import { ChipLedgerCore } from "../src/casino/exchange.js";
 import { Markets } from "../src/casino/market.js";
 
 registerDefaultTxTypes();
@@ -67,7 +67,7 @@ describe("casino_markets status CHECK 制約撤去マイグレーション", () 
 
     // Markets 構築 → マイグレーション実行
     const ledger = new Ledger(db);
-    const ether = new ChipLedger(db, ledger, new EventLog(db));
+    const ether = new ChipLedgerCore(db, ledger, new EventLog(db));
     const markets = new Markets(db, ether, new EventLog(db));
 
     // CHECK が外れ、frozen/disputed を書ける
@@ -90,7 +90,7 @@ describe("casino_markets status CHECK 制約撤去マイグレーション", () 
     const db = openDb(":memory:");
     makeLegacyMarketsTable(db);
     const ledger = new Ledger(db);
-    const ether = new ChipLedger(db, ledger, new EventLog(db));
+    const ether = new ChipLedgerCore(db, ledger, new EventLog(db));
     new Markets(db, ether, new EventLog(db)); // 1回目: 作り直し
     const sql1 = (db.prepare("SELECT sql FROM sqlite_master WHERE name='casino_markets'").get() as { sql: string }).sql;
     new Markets(db, ether, new EventLog(db)); // 2回目: no-op のはず
@@ -106,7 +106,7 @@ describe("casino_markets status CHECK 制約撤去マイグレーション", () 
     // house に元手を用意
     ledger.ensureAccount("user:z", "user");
     ledger.transfer({ from: TREASURY, to: "user:z", amount: 10_000, type: "initial", actor: "t", idempotencyKey: "s:z" });
-    const ether = new ChipLedger(db, ledger, new EventLog(db));
+    const ether = new ChipLedgerCore(db, ledger, new EventLog(db));
     ether.deposit("z", 10_000, "buy:z");
     const markets = new Markets(db, ether, new EventLog(db));
 

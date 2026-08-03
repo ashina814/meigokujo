@@ -38,6 +38,14 @@ import type Database from "better-sqlite3";
 export const CHIP_OPENING_VERSION_KEY = "casino:opening_version";
 /** PR1導入時に現在のチップ残高を保存する版。正式開業初期化で opening_v1 へ切り替える */
 export const LEGACY_OPENING_VERSION = "legacy_pre_reset";
+/**
+ * 正式開業初期化（PR12）が確定する新版（PR8監査・ブロッカーC）。
+ *
+ * `reserveHolder()` や検算Bはこの値との**厳密一致**でしか新準備口座を認めない。
+ * 空文字・typo・DB破損・`opening_v2`・将来未対応版は、既定でどちらか一方へ
+ * fail-open せず、明示的に `ERR_UNKNOWN_OPENING_VERSION` として扱う。
+ */
+export const FORMAL_OPENING_VERSION = "opening_v1";
 
 /** Land台帳と連動するか（deposit/redeem は必ず Land 取引IDを持つ） */
 export type ChipTxKind = "internal_transfer" | "deposit" | "redeem";

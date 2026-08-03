@@ -121,7 +121,7 @@ describe("建玉に触れていない", () => {
     const ledger = new Ledger(db);
     const events = new EventLog(db);
     const chipTx = new ChipTx(db);
-    const ether = new ChipLedger(db, ledger, events, { chipTx });
+    const ether = new ChipLedger(db, ledger, events, { chipTx, requireOpeningV1: false });
     const stocks = new Stocks(db, ether, events, { rng: deterministicRng(1) });
 
     // 建玉を1件作っておく（停止前からの保有を模す）

@@ -1,10 +1,13 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
 import { Casino, JACKPOT_HOLDER } from "../src/casino/service.js";
-import { ETHER_ESCROW, ChipLedger, HOUSE_HOLDER, POOL_SWEEP_REASON } from "../src/casino/exchange.js";
+import { ETHER_ESCROW, ChipLedgerCore, HOUSE_HOLDER, POOL_SWEEP_REASON } from "../src/casino/exchange.js";
 import { Escrow, ESCROW_QUARANTINE } from "../src/casino/escrow.js";
 import { Items } from "../src/casino/items.js";
 import { Markets } from "../src/casino/market.js";
@@ -32,7 +35,7 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  const ether = new ChipLedgerCore(db, ledger, events, { chipTx });
   const items = new Items(db);
   const casino = new Casino(db, ether, events, { items });
   const escrow = new Escrow(db, ether, events);
@@ -232,7 +235,7 @@ describe("検算B（経路監査）", () => {
 
     expect(ctx.integrity.checkB().ok).toBe(false);
     const notes = ctx.integrity.checkB().mismatches.map((m) => m.note);
-    expect(notes).toEqual(["unknown_type:adjust", "unknown_type:adjust"]);
+    expect(notes).toEqual(["tx_type_not_allowed_for_version:adjust", "tx_type_not_allowed_for_version:adjust"]);
     // プール残高そのものは合っている（差引一致だけでは見抜けない不正）
     expect(notes).not.toContain("balance_mismatch");
     ctx.db.close();
@@ -292,6 +295,284 @@ describe("検算B（経路監査）", () => {
     expect(ctx.integrity.checkB().ok).toBe(true);
     // 旧版側も自分の窓だけで完結している
     ctx.db.close();
+  });
+});
+
+/** opening_v1 へ切り替えた ctx を作る（Land境界も置く） */
+function formalCtx(): Ctx {
+  const ctx = setup();
+  ctx.chipTx.captureLegacyOpening({
+    poolLand: ctx.ledger.balanceOf(ETHER_ESCROW),
+    fromLedgerTxId: ctx.ledger.lastTransactionId(),
+  });
+  ctx.chipTx.captureOpening("opening_v1", [], {
+    poolLand: 0,
+    fromLedgerTxId: ctx.ledger.lastTransactionId(),
+  });
+  return ctx;
+}
+
+/** casino_tx の該当行を1つだけ書き換える（Land側はそのまま・chip明細だけ壊す） */
+function corruptChipTx(ctx: Ctx, ledgerTxId: number, patch: Record<string, unknown>): void {
+  const sets = Object.keys(patch).map((k) => `${k} = ?`).join(", ");
+  ctx.db.prepare(`UPDATE casino_tx SET ${sets} WHERE ledger_tx_id = ?`).run(...Object.values(patch), ledgerTxId);
+}
+
+function lastLedgerTxId(ctx: Ctx): number {
+  return ctx.ledger.lastTransactionId();
+}
+
+describe("検算B: opening_v1のLand-chip厳密対応（PR8監査・ブロッカーE）", () => {
+  it("opening_v1の正規chip_deposit/fund/redeem/settleはすべて通る", () => {
+    const ctx = formalCtx();
+    ctx.ledger.ensureAccount(deptAccount("賭博場"), "system");
+    ctx.ledger.transfer({
+      from: TREASURY, to: deptAccount("賭博場"), amount: 10_000, type: "adjust", actor: "t", approvedBy: "t",
+      idempotencyKey: "formal:seed:dept",
+    });
+    fundUser(ctx, "alice", 5_000);
+    ctx.ether.fundFromAccount(deptAccount("賭博場"), 2_000, HOUSE_HOLDER, "formal:fund");
+    ctx.ether.redeem("alice", 1_000, "formal:redeem");
+    ctx.ether.redeemToAccount(HOUSE_HOLDER, 500, deptAccount("賭博場"), "system:test", "formal:settle");
+    expect(ctx.integrity.checkB().ok).toBe(true);
+    ctx.db.close();
+  });
+
+  it("opening_v1の窓でether_*型を見つけたら、有効なchipグループを参照していても弾く", () => {
+    const ctx = formalCtx();
+    // fundUser は入金額ぴったりを預けて Land を使い切るので、偽装取引ぶんの Land を上乗せしておく
+    ctx.ledger.ensureAccount("user:alice", "user");
+    ctx.ledger.transfer({
+      from: TREASURY, to: "user:alice", amount: 5_001, type: "initial", actor: "t", idempotencyKey: "formal:seed:alice-extra",
+    });
+    ctx.ether.deposit("alice", 5_000, "formal:deposit:alice"); // 有効な opening_v1 の chip_deposit グループを作っておく
+    const depositTxId = lastLedgerTxId(ctx);
+    const depositRow = ctx.db.prepare("SELECT idempotency_key FROM transactions WHERE id = ?").get(depositTxId) as { idempotency_key: string };
+
+    // 同じグループキーを騙って、Land側だけ ether_buy 型で偽装する（現在の準備口座=CHIP_ESCROWを狙う）
+    ctx.ledger.transfer({
+      from: "user:alice", to: ctx.ether.reserveHolder(), amount: 1, type: "ether_buy", actor: "user:alice", approvedBy: "system:ether",
+      reason: "偽装", refType: "casino_chip", refId: "alice", idempotencyKey: `${depositRow.idempotency_key}:forged`,
+    });
+
+    const b = ctx.integrity.checkB();
+    expect(b.ok).toBe(false);
+    expect(b.mismatches.some((m) => m.note === "tx_type_not_allowed_for_version:ether_buy")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("対応するchip明細が0件（ledger_tx_id違い）ならno_matching_chip_tx", () => {
+    const ctx = formalCtx();
+    fundUser(ctx, "alice", 5_000);
+    const aliceTxId = lastLedgerTxId(ctx);
+    fundUser(ctx, "bob", 3_000);
+    const bobTxId = lastLedgerTxId(ctx);
+    // alice の明細を bob の ledger_tx_id へ付け替える（alice側は0件対応、bob側は2件対応になる）
+    corruptChipTx(ctx, aliceTxId, { ledger_tx_id: bobTxId });
+
+    const b = ctx.integrity.checkB();
+    expect(b.ok).toBe(false);
+    expect(b.mismatches.some((m) => m.note === "no_matching_chip_tx")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("holder違い（to_holderが別ユーザー）はholder_mismatch", () => {
+    const ctx = formalCtx();
+    fundUser(ctx, "alice", 5_000);
+    const depositTxId = lastLedgerTxId(ctx);
+    corruptChipTx(ctx, depositTxId, { to_holder: "bob" });
+
+    const b = ctx.integrity.checkB();
+    expect(b.ok).toBe(false);
+    expect(b.mismatches.some((m) => m.note === "holder_mismatch")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("land_amount違いはland_amount_mismatch", () => {
+    const ctx = formalCtx();
+    fundUser(ctx, "alice", 5_000);
+    const depositTxId = lastLedgerTxId(ctx);
+    corruptChipTx(ctx, depositTxId, { land_amount: 4_999 });
+
+    const b = ctx.integrity.checkB();
+    expect(b.ok).toBe(false);
+    expect(b.mismatches.some((m) => m.note === "land_amount_mismatch")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("chip amount違いはchip_amount_mismatch", () => {
+    const ctx = formalCtx();
+    fundUser(ctx, "alice", 5_000);
+    const depositTxId = lastLedgerTxId(ctx);
+    corruptChipTx(ctx, depositTxId, { amount: 4_999 });
+
+    const b = ctx.integrity.checkB();
+    expect(b.ok).toBe(false);
+    expect(b.mismatches.some((m) => m.note === "chip_amount_mismatch")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("tx_kind違い（redeemなのにdeposit明細）はtx_kind_mismatch", () => {
+    const ctx = formalCtx();
+    fundUser(ctx, "alice", 5_000);
+    ctx.ether.redeem("alice", 1_000, "formal:redeem2");
+    const redeemTxId = lastLedgerTxId(ctx);
+    corruptChipTx(ctx, redeemTxId, { tx_kind: "deposit", from_holder: null, to_holder: "alice" });
+
+    const b = ctx.integrity.checkB();
+    expect(b.ok).toBe(false);
+    expect(b.mismatches.some((m) => m.note === "tx_kind_mismatch")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("group_key違い（同groupの無関係internal_transferには対応しない・ledger_tx_id自体は残す）", () => {
+    const ctx = formalCtx();
+    fundUser(ctx, "alice", 5_000);
+    const aliceTxId = lastLedgerTxId(ctx);
+    fundUser(ctx, "bob", 3_000); // 別groupの実在するgroup_keyを用意する（FK制約を満たすため）
+    const bobRow = ctx.db.prepare("SELECT group_key FROM casino_tx WHERE ledger_tx_id = ?").get(lastLedgerTxId(ctx)) as { group_key: string };
+    // (group_key, seq) の複合UNIQUE制約に触れないよう、seqも空いている値へ変える
+    corruptChipTx(ctx, aliceTxId, { group_key: bobRow.group_key, seq: 99 });
+
+    const b = ctx.integrity.checkB();
+    expect(b.ok).toBe(false);
+    expect(b.mismatches.some((m) => m.note === "group_key_mismatch")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("chip_tx_version違い（opening_versionが別版）はchip_tx_version_mismatch", () => {
+    const ctx = formalCtx();
+    fundUser(ctx, "alice", 5_000);
+    const depositTxId = lastLedgerTxId(ctx);
+    corruptChipTx(ctx, depositTxId, { opening_version: "legacy_pre_reset" });
+
+    const b = ctx.integrity.checkB();
+    expect(b.ok).toBe(false);
+    expect(b.mismatches.some((m) => m.note === "chip_tx_version_mismatch")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("ref_id欠如（refIdが空）はmissing_ref_id、承認者違いはwrong_approver", () => {
+    const ctx = formalCtx();
+    ctx.ledger.ensureAccount(deptAccount("賭博場"), "system");
+    ctx.ledger.transfer({
+      from: TREASURY, to: deptAccount("賭博場"), amount: 10_000, type: "adjust", actor: "t", approvedBy: "t",
+      idempotencyKey: "formal:seed:dept2",
+    });
+    ctx.ether.fundFromAccount(deptAccount("賭博場"), 2_000, HOUSE_HOLDER, "formal:fund2");
+    const fundTxId = lastLedgerTxId(ctx);
+
+    ctx.db.prepare("UPDATE transactions SET approved_by = 'someone-else' WHERE id = ?").run(fundTxId);
+    expect(ctx.integrity.checkB().mismatches.some((m) => m.note === "wrong_approver")).toBe(true);
+
+    ctx.db.prepare("UPDATE transactions SET approved_by = 'system:ether', ref_id = '' WHERE id = ?").run(fundTxId);
+    expect(ctx.integrity.checkB().mismatches.some((m) => m.note === "missing_ref_id")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("同じledger_tx_idに複数のchip明細が対応する場合はmultiple_matching_chip_tx", () => {
+    const ctx = formalCtx();
+    fundUser(ctx, "alice", 5_000);
+    const depositTxId = lastLedgerTxId(ctx);
+    const row = ctx.db.prepare("SELECT * FROM casino_tx WHERE ledger_tx_id = ?").get(depositTxId) as Record<string, unknown>;
+    // 同じ ledger_tx_id を指す2件目の明細を、別groupの体で複製する
+    ctx.db.prepare(
+      `INSERT INTO casino_tx_groups (group_key, kind, status, actor_id, created_at) VALUES (?, 'deposit', 'settled', 'user:alice', ?)`,
+    ).run("duplicate:group", Math.floor(Date.now() / 1000));
+    ctx.db.prepare(
+      `INSERT INTO casino_tx (group_key, seq, tx_kind, from_holder, to_holder, amount, reason, actor_id, opening_version, land_amount, ledger_tx_id, created_at)
+       VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run("duplicate:group", row.tx_kind, row.from_holder, row.to_holder, row.amount, row.reason, row.actor_id, row.opening_version, row.land_amount, depositTxId, Math.floor(Date.now() / 1000));
+
+    const b = ctx.integrity.checkB();
+    expect(b.ok).toBe(false);
+    expect(b.mismatches.some((m) => m.note === "multiple_matching_chip_tx")).toBe(true);
+    ctx.db.close();
+  });
+});
+
+describe("検算B: 100%準備の直接検算（PR8監査・ブロッカーF）", () => {
+  it("opening_v1で準備Landと発行済み全chipが一致すればOK", () => {
+    const ctx = formalCtx();
+    fundUser(ctx, "alice", 5_000);
+    expect(ctx.integrity.checkB().ok).toBe(true);
+    ctx.db.close();
+  });
+
+  it("準備Landが1少ない・1多いのどちらもreserve_not_fully_backedでNG", () => {
+    const ctx = formalCtx();
+    fundUser(ctx, "alice", 5_000);
+    expect(ctx.integrity.checkB().ok).toBe(true);
+
+    ctx.db.prepare("UPDATE ether_balances SET amount = amount - 1 WHERE user_id = 'alice'").run();
+    expect(ctx.integrity.checkB().mismatches.some((m) => m.note === "reserve_not_fully_backed")).toBe(true);
+
+    ctx.db.prepare("UPDATE ether_balances SET amount = amount + 2 WHERE user_id = 'alice'").run();
+    expect(ctx.integrity.checkB().mismatches.some((m) => m.note === "reserve_not_fully_backed")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("holder残高を直接1増やす・準備Landを直接1増やすのどちらも不一致として検出する", () => {
+    const ctx = formalCtx();
+    fundUser(ctx, "alice", 5_000);
+
+    // holder残高（outstanding側）だけ動かす
+    ctx.db.prepare("INSERT INTO ether_balances (user_id, amount, updated_at) VALUES ('mystery', 1, 0)").run();
+    expect(ctx.integrity.checkB().mismatches.some((m) => m.note === "reserve_not_fully_backed")).toBe(true);
+    ctx.db.prepare("DELETE FROM ether_balances WHERE user_id = 'mystery'").run();
+    expect(ctx.integrity.checkB().ok).toBe(true);
+
+    // 準備Land（reserve側）だけ動かす
+    ctx.ledger.transfer({
+      from: TREASURY, to: ctx.ether.reserveHolder(), amount: 1, type: "adjust", actor: "t", approvedBy: "t",
+      idempotencyKey: "reserve:leak",
+    });
+    expect(ctx.integrity.checkB().mismatches.some((m) => m.note === "reserve_not_fully_backed" || m.note === "tx_type_not_allowed_for_version:adjust")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("internal_transferのみでは一致が維持される", () => {
+    const ctx = formalCtx();
+    fundUser(ctx, "alice", 5_000);
+    fundUser(ctx, "bob", 1_000);
+    ctx.ether.runGroup({ groupKey: "formal:game", kind: "solo_game", actorId: "alice" }, () =>
+      ctx.ether.transfer("alice", "bob", 500, { reason: "賭け" }),
+    );
+    expect(ctx.integrity.checkB().ok).toBe(true);
+    ctx.db.close();
+  });
+
+  it("DBを閉じて再読込しても不一致は検出され続ける", () => {
+    const dir = mkdtempSync(join(tmpdir(), "meigokujo-integrity-reopen-"));
+    const dbPath = join(dir, "casino.db");
+    try {
+      const db = openDb(dbPath);
+      const ledger = new Ledger(db);
+      const events = new EventLog(db);
+      const chipTx = new ChipTx(db);
+      const ether = new ChipLedgerCore(db, ledger, events, { chipTx });
+      const escrow = new Escrow(db, ether, events);
+      const integrity = new CasinoIntegrity(db, ledger, ether, escrow);
+      const ctx: Ctx = { db, ledger, events, chipTx, ether, casino: new Casino(db, ether, events, { items: new Items(db) }), escrow, integrity, status: new CasinoStatus(db), items: new Items(db) };
+      ctx.chipTx.captureLegacyOpening({ poolLand: ledger.balanceOf(ETHER_ESCROW), fromLedgerTxId: ledger.lastTransactionId() });
+      ctx.chipTx.captureOpening("opening_v1", [], { poolLand: 0, fromLedgerTxId: ledger.lastTransactionId() });
+      fundUser(ctx, "alice", 5_000);
+      db.prepare("UPDATE ether_balances SET amount = amount - 1 WHERE user_id = 'alice'").run();
+      expect(integrity.checkB().ok).toBe(false);
+      db.close();
+
+      const reopened = openDb(dbPath);
+      const ledger2 = new Ledger(reopened);
+      const events2 = new EventLog(reopened);
+      const chipTx2 = new ChipTx(reopened);
+      const ether2 = new ChipLedgerCore(reopened, ledger2, events2, { chipTx: chipTx2 });
+      const escrow2 = new Escrow(reopened, ether2, events2);
+      const integrity2 = new CasinoIntegrity(reopened, ledger2, ether2, escrow2);
+      expect(integrity2.checkB().mismatches.some((m) => m.note === "reserve_not_fully_backed")).toBe(true);
+      reopened.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
