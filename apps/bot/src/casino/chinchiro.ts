@@ -15,7 +15,6 @@ import {
   CHINCHIRO_MAX_LOSS_MULT,
   CHINCHIRO_MAX_ROLLS,
   CHINCHIRO_WIN_MULT,
-  HOUSE_HOLDER,
   chinchiroCompare,
   chinchiroEvaluate,
   chinchiroIsTerminal,
@@ -53,8 +52,8 @@ import { broadcastBigWin } from "./bigwin.js";
  * - 勝ち倍率: ピンゾロ5 / ゾロ目3 / シゴロ2 / 目1（変更なし）
  * - **負けは最大2倍**（PR4・正本 §1.5）。旧実装はマモンのピンゾロで 5倍払いだった
  * - 同点はマモン勝ち（-1倍）。勝ち利益のエッジは 5% → 15%（負け上限2化で上振れした RTP を戻す）
- * - 倍付け負けは追加徴収。残高不足なら通常負けにフォールバック
- *   （**この事前預託化とフォールバック削除は PR11**。PR4 では倍率だけを直す）
+ * - ラウンド開始前に最大損失2倍を預託し、結果後の追加徴収・残高不足フォールバックは行わない
+ * - 精算は他のソロゲームと同じ共通経路を通し、連鎖・福の重み・お守り・戦績を維持する
  * - シェイクアニメ 4フレーム、マモンのターンでも同じ演出
  * - 結果画面に「最低/前回/最大/配当表/退席」ボタン
  */
@@ -81,13 +80,13 @@ function describe(h: Hand): string {
 
 /**
  * 1ラウンドの確定結果。`result_json` に保存され、同じ操作の再試行はここから再生される。
- * 分岐（勝ち／引分／通常負け／倍付け負け／残高不足フォールバック）も保存対象。
+ * 分岐（勝ち／引分／通常負け／倍付け負け）も保存対象。
  */
 export interface ChinchiroRound {
   branch: "win" | "push" | "loss" | "double_loss";
   settled: import("@meigokujo/core").SoloRoundResult;
   amuletNote: string | null;
-  /** 倍付け負けの追加徴収額（それ以外は 0） */
+  /** 倍付け負けの追加損失額（それ以外は 0）。資金は開始前に預託済み。 */
   extra: number;
 }
 
@@ -143,14 +142,9 @@ export function recoverFrozenChinchiroPrehold(services: Services, sessionId: str
 }
 
 /**
- * 1ラウンドの精算。勝ち・引分・通常負け・倍付け負け・残高不足フォールバックを
- * **すべて同じグループ**で処理する。
- *
- * 分岐ごとに別の鍵を使うと、倍付け負けの後の再試行が通常負け側へ回り、
- * 別グループでもう一度徴収できてしまう。残高判定もグループの中に置いて、
- * 最初に確定した分岐と結果を `result_json` から再生する。
- *
- * @param mul 勝敗倍率（>0 勝ち / 0 引分 / -1 通常負け / ≤-2 倍付け負け）
+ * 最大損失2倍を預託したラウンドを、他のソロゲームと同じ共通精算基盤で確定する。
+ * 徴収元だけを利用者の自由残高からprehold holderへ差し替え、連鎖・福の重み・お守り・
+ * 予約解放・戦績更新は `Casino.settleSolo()` に一任する。
  */
 export function settleChinchiroRound(
   services: Services,
@@ -158,11 +152,8 @@ export function settleChinchiroRound(
   bet: number,
   mul: number,
   operationId: string,
-  /** 胴元債務予約の鍵（PR5）。精算が通った時点で同じトランザクション内で解放される */
   reservationKey?: string,
 ): ChinchiroRound {
-  // PR11: start-of-round で 2×bet を預けた経路。結果後に残高を読み直して
-  // 追加徴収したり、通常負けへフォールバックしたりしない。
   const sessionId = `chinchiro:prehold:${uid}:${operationId}`;
   return services.ether.runGroup(
     { groupKey: `chinchiro:round:${uid}:${operationId}`, kind: "solo_game", actorId: uid },
@@ -173,21 +164,26 @@ export function settleChinchiroRound(
         throw new Error("チンチロ事前預託の帳簿不一致");
       }
       const loss = mul < 0 ? chinchiroPlayerLoss(bet, mul) : 0;
-      const returned = preheld - loss;
-      if (returned) services.ether.transfer(holder, uid, returned, { reason: "チンチロ事前預託の返還", game: "チンチロ", sessionId });
-      if (loss) services.ether.transfer(holder, HOUSE_HOLDER, loss, { reason: "チンチロ確定損失", game: "チンチロ", sessionId });
+      const charged = loss > 0 ? loss : bet;
       const rawPayout = mul > 0 ? chinchiroPayout(bet, mul) : mul === 0 ? bet : 0;
-      const profit = Math.max(0, rawPayout - bet);
-      if (profit) services.ether.transfer(HOUSE_HOLDER, uid, profit, { reason: "チンチロ胴元配当", game: "チンチロ", sessionId });
+      const settled = services.casino.settleSolo(uid, "チンチロ", bet, rawPayout, {
+        operationId,
+        reservationKey,
+        preheld: {
+          holderId: holder,
+          heldAmount: preheld,
+          chargedAmount: charged,
+          sessionId,
+        },
+      });
       services.db.prepare("DELETE FROM casino_escrow WHERE session_id = ?").run(sessionId);
       markPrehold(services, sessionId, "settled");
-      if (reservationKey) services.reservations.release(reservationKey);
-      services.casino.recordGameNet(uid, profit - loss, { countAsBiggestWin: profit > 0 });
-      const settled = {
-        wagered: bet, payout: rawPayout, net: profit - loss, chainBonus: 0, chainStreak: 0, chainMult: 1, chainLabel: "",
-        fukuTax: 0, fukuRate: 0, jackpotContributed: 0, jackpotUnfunded: 0, rawPayout,
+      return {
+        branch: mul > 0 ? "win" : mul === 0 ? "push" : loss === preheld ? "double_loss" : "loss",
+        settled,
+        amuletNote: settled.amuletNote ?? null,
+        extra: Math.max(0, loss - bet),
       };
-      return { branch: mul > 0 ? "win" : mul === 0 ? "push" : loss === preheld ? "double_loss" : "loss", settled, amuletNote: null, extra: Math.max(0, loss - bet) };
     },
   );
 }
@@ -240,7 +236,6 @@ async function shakeAnimation(reply: Message, header: string[], bet: number, rol
         ].join("\n"),
       )
       .setFooter({ text: `第${rollNo}投 · 残り${remaining} · 賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
-    // 結果確定前の表示失敗はゲームを続行しない。呼出元が事前預託を全額返す。
     await reply.edit({ embeds: [e], components: [] });
     await sleep(220);
   }
@@ -269,17 +264,12 @@ export async function playChinchiro(
   }
 }
 
-/**
- * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
- * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
- */
 async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
 ): Promise<void> {
   await withHouseReservation(interaction, services, "チンチロ", bet, interaction.id, async (reservationKey) => {
-    // 乱数・演出より前に最大損失を確保する。自動預入もここで必要額だけ行う。
     const uid = interaction.user.id;
     const preheld = bet * CHINCHIRO_MAX_LOSS_MULT;
     try {
@@ -297,11 +287,8 @@ async function runRound(
       trackPrehold(services, sessionId, uid, bet, preheld);
       await runRoundInner(interaction, services, bet, reservationKey);
     } catch (error) {
-      // 結果確定前のDiscord/乱数/演出例外は、預託と帳簿を同じ返金groupで即時に戻す。
-      // 返金に失敗した場合は Escrow.refund が例外を返し帳簿を消さないため、復旧で凍結される。
       const refunded = refundChinchiroPrehold(services, sessionId, "結果確定前の失敗");
       if (!refunded) {
-        // 返金失敗を上書きせず、凍結したsession IDを利用者と運営ログに残す。
         throw new Error(`チンチロの事前預託返還に失敗し凍結しました: ${sessionId}`);
       }
       throw error;
@@ -331,11 +318,9 @@ async function runRoundInner(
   }
   await sleep(700);
 
-  // ── プレイヤーの振り ──
   let playerDice: Dice = [1, 1, 1] as const;
   let playerHand: Hand = { type: "menashi" };
   let playerLocked = false;
-  // 二度振りの権: 装備してればプレイヤーの投数を +1
   const rerollGranted = services.items.consumeReroll(uid);
   const playerMaxRolls = MAX_ROLLS + (rerollGranted ? 1 : 0);
 
@@ -345,31 +330,25 @@ async function runRoundInner(
     playerDice = rollDice(services.rng);
     playerHand = evaluate(playerDice);
 
-    if (isTerminal(playerHand)) {
-      // 終了役 → 即確定
-      break;
-    }
+    if (isTerminal(playerHand)) break;
 
     if (playerHand.type === "menashi") {
       if (rollNo < playerMaxRolls) {
-        // 自動再振り
-        await reply
-          .edit({
-            embeds: [
-              new EmbedBuilder()
-                .setTitle("🎲 チンチロ")
-                .setColor(C_MAMMON)
-                .setDescription([describe(playerHand), "", diceDisplay(playerDice), "", `第${rollNo}投 → 自動で再振り…（残り${playerMaxRolls - rollNo}）`].join("\n")),
-            ],
-            components: [],
-          });
+        await reply.edit({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle("🎲 チンチロ")
+              .setColor(C_MAMMON)
+              .setDescription([describe(playerHand), "", diceDisplay(playerDice), "", `第${rollNo}投 → 自動で再振り…（残り${playerMaxRolls - rollNo}）`].join("\n")),
+          ],
+          components: [],
+        });
         await sleep(1500);
         continue;
       }
-      break; // 最終投メナシ → 確定
+      break;
     }
 
-    // 目 → 選択
     if (playerHand.type === "me") {
       if (rollNo >= playerMaxRolls) break;
       const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -422,11 +401,13 @@ async function runRoundInner(
             resolve("reroll");
           }
         });
-        collector.on("end", (_c, reason) => {
+        collector.on("end", (_collection, reason) => {
           if (reason !== "stop" && reason !== "reroll" && reason !== "cancel") resolve("timeout");
         });
       });
-      if (choice === "cancel" || choice === "timeout") throw new Error(choice === "timeout" ? "チンチロ操作が時間切れになりました" : "利用者がチンチロを中止しました");
+      if (choice === "cancel" || choice === "timeout") {
+        throw new Error(choice === "timeout" ? "チンチロ操作が時間切れになりました" : "利用者がチンチロを中止しました");
+      }
       if (choice === "stop") {
         playerLocked = true;
         break;
@@ -434,24 +415,22 @@ async function runRoundInner(
     }
   }
 
-  // ── マモンの振り（同じシェイクアニメ） ──
-  await reply
-    .edit({
-      embeds: [
-        new EmbedBuilder()
-          .setTitle("🎲 チンチロ — マモンの番")
-          .setColor(C_MAMMON)
-          .setDescription(
-            [
-              `あなた: ${diceDisplay(playerDice)}`,
-              `　└ ${describe(playerHand)}`,
-              "",
-              "マモン: ┃ ❓ ┃ ❓ ❓ ❓ ┃",
-            ].join("\n"),
-          ),
-      ],
-      components: [],
-    });
+  await reply.edit({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("🎲 チンチロ — マモンの番")
+        .setColor(C_MAMMON)
+        .setDescription(
+          [
+            `あなた: ${diceDisplay(playerDice)}`,
+            `　└ ${describe(playerHand)}`,
+            "",
+            "マモン: ┃ ❓ ┃ ❓ ❓ ❓ ┃",
+          ].join("\n"),
+        ),
+    ],
+    components: [],
+  });
   await sleep(1200);
 
   let dealerDice: Dice = [1, 1, 1] as const;
@@ -477,29 +456,27 @@ async function runRoundInner(
     dealerDice = rollDice(services.rng);
     dealerHand = evaluate(dealerDice);
     const willStop = isTerminal(dealerHand) || (dealerHand.type === "me" && dealerHand.score >= 5) || rollNo >= MAX_ROLLS;
-    await reply
-      .edit({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle("🎲 チンチロ — マモンの番")
-            .setColor(C_MAMMON)
-            .setDescription(
-              [
-                `あなた: ${diceDisplay(playerDice)}`,
-                `　└ ${describe(playerHand)}`,
-                "",
-                `マモン: ${diceDisplay(dealerDice)}`,
-                `　└ ${describe(dealerHand)}`,
-              ].join("\n"),
-            ),
-        ],
-        components: [],
-      });
+    await reply.edit({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("🎲 チンチロ — マモンの番")
+          .setColor(C_MAMMON)
+          .setDescription(
+            [
+              `あなた: ${diceDisplay(playerDice)}`,
+              `　└ ${describe(playerHand)}`,
+              "",
+              `マモン: ${diceDisplay(dealerDice)}`,
+              `　└ ${describe(dealerHand)}`,
+            ].join("\n"),
+          ),
+      ],
+      components: [],
+    });
     await sleep(willStop ? 1400 : 1000);
     if (willStop) break;
   }
 
-  // ── 精算 ──
   const cmp = compare(playerHand, dealerHand);
   const mul = cmp.mul;
   const round = settleChinchiroRound(services, uid, bet, mul, interaction.id, reservationKey);
@@ -507,32 +484,36 @@ async function runRoundInner(
   let payoutText = "";
   const title = "🎲 チンチロ — 対 マモン";
   let color = C_LOSE;
-  let extraNote = "";
-  let netForDisplay = 0;
   const amuletNote = round.amuletNote ? `✨ ${round.amuletNote}` : "";
   const settled = round.settled;
 
   if (round.branch === "win") {
     color = C_WIN;
-    netForDisplay = settled.net;
     const chainLine = settled.chainBonus > 0
       ? `\n${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
       : "";
     const fukuLine = settled.fukuTax > 0
       ? `\n⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
       : "";
-    payoutText = `💰 配当 ${fmtEther(settled.payout)}（利益 +${fmtEther(settled.net)}）${chainLine}${fukuLine}`;
+    payoutText = `💰 配当 ${fmtEther(settled.payout)}（利益 ${settled.net >= 0 ? "+" : ""}${fmtEther(settled.net)}）${chainLine}${fukuLine}`;
     broadcastBigWin(interaction.client, services, { userId: uid, game: "チンチロ", bet, payout: settled.payout });
   } else if (round.branch === "push") {
     color = C_MAMMON;
-    payoutText = `🌀 プッシュ：${fmtEther(bet)} を返金`;
+    payoutText = settled.net === 0
+      ? `🌀 プッシュ：${fmtEther(settled.payout)} を返金`
+      : `🛡 お守り適用後 ${fmtEther(settled.payout)}（損益 ${fmtEther(settled.net)}）`;
   } else if (round.branch === "double_loss") {
-    const totalLoss = bet + round.extra;
-    netForDisplay = -totalLoss;
-    payoutText = `💀 -${fmtEther(totalLoss)}（${Math.abs(mul)}倍負け）`;
+    const actualLoss = Math.max(0, -settled.net);
+    payoutText = settled.net < 0
+      ? `💀 -${fmtEther(actualLoss)}（${Math.abs(mul)}倍負け・お守り反映後）`
+      : `🛡 お守りで損失を相殺：${fmtEther(settled.payout)}`;
   } else {
-    netForDisplay = settled.payout - bet;
-    payoutText = settled.payout > 0 ? `🛡 返金 ${fmtEther(settled.payout)}` : `💸 -${fmtEther(bet)}`;
+    const actualLoss = Math.max(0, -settled.net);
+    payoutText = settled.net < 0
+      ? `💸 -${fmtEther(actualLoss)}`
+      : settled.net > 0
+        ? `🛡 お守り適用後 +${fmtEther(settled.net)}`
+        : `🛡 ${fmtEther(settled.payout)} を返金`;
   }
 
   const resultLabel =
@@ -553,7 +534,7 @@ async function runRoundInner(
   const resultEmbed = new EmbedBuilder()
     .setTitle(title)
     .setColor(color)
-    .setDescription([comparison, "", payoutText + extraNote, amuletNote].filter(Boolean).join("\n"))
+    .setDescription([comparison, "", payoutText, amuletNote].filter(Boolean).join("\n"))
     .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
 
   const heldAfter = services.ether.balanceOf(uid);
@@ -598,8 +579,6 @@ async function runRoundInner(
       return;
     }
     if (btn.customId.startsWith("chinchiro:retry:")) {
-      // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
-      // 断るなら collector を止めない ＝ 押し直せる
       await handleRetryPress({
         services,
         btn,
@@ -610,7 +589,7 @@ async function runRoundInner(
       });
     }
   });
-  collector.on("end", async (_c, reason) => {
+  collector.on("end", async (_collection, reason) => {
     if (reason !== "retry" && reason !== "quit") await reply.edit({ components: [] }).catch(() => undefined);
   });
 }
