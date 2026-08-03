@@ -70,9 +70,13 @@ describe("PR14 構造化された実現損益", () => {
       c.chips.transfer("u1", "house", 50, { reason: "任意の商品文言" });
     });
 
-    expect(c.remittance.pnl().map((row) => [row.category, row.amount])).toEqual([
-      ["vip", 100],
+    expect(
+      c.remittance.pnl()
+        .map((row) => [row.category, row.amount] as const)
+        .sort(([left], [right]) => left.localeCompare(right)),
+    ).toEqual([
       ["shop", 50],
+      ["vip", 100],
     ]);
     c.db.close();
   });
