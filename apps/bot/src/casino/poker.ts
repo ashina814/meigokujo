@@ -12,7 +12,16 @@ import {
 import { POKER_CATEGORY_PAYOUTS, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
+import {
+  MIN_BET,
+  acquireSeat,
+  effectiveMaxBet,
+  handleRetryPress,
+  releaseSeat,
+  sleep,
+  validateBet,
+  withHouseReservation,
+} from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { C_JACKPOT, C_MAMMON, E, HR_THIN, buildResultEmbed, fmtBigDelta } from "./ui.js";
 
@@ -137,7 +146,7 @@ export async function playPoker(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT);
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "ポーカー");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -154,10 +163,25 @@ export async function playPoker(
   }
 }
 
+/**
+ * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
+ * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
+ */
 async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+): Promise<void> {
+  await withHouseReservation(interaction, services, "ポーカー", bet, interaction.id, (reservationKey) =>
+    runRoundInner(interaction, services, bet, reservationKey),
+  );
+}
+
+async function runRoundInner(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+  bet: number,
+  reservationKey: string,
 ): Promise<void> {
   const uid = interaction.user.id;
   const deck = newDeck(services.rng);
@@ -252,7 +276,7 @@ async function runRound(
   const ev = evaluate(hand);
   const rawPayout = ev.payMult > 0 ? bet * ev.payMult : 0;
   // お守りの消費も賭け・配当と同じグループの中（settleSolo）
-  const settled = services.casino.settleSolo(uid, "ポーカー", bet, rawPayout, { operationId: interaction.id });
+  const settled = services.casino.settleSolo(uid, "ポーカー", bet, rawPayout, { operationId: interaction.id, reservationKey });
   const amulet = { note: settled.amuletNote };
 
   const isJp = ev.category === 11;
@@ -294,7 +318,7 @@ async function runRound(
   // ── リトライボタン ──
   const heldEther = services.ether.balanceOf(uid);
   const min = MIN_BET;
-  const max = Math.min(effectiveMaxBet(services, uid), heldEther);
+  const max = Math.min(effectiveMaxBet(services, uid, "ポーカー"), heldEther);
   const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`poker:retry:${min}`)
@@ -339,6 +363,7 @@ async function runRound(
         services,
         btn,
         collector,
+        game: "ポーカー",
         betRaw: Number(btn.customId.split(":")[2]),
         run: (bet) => runRound(btn, services, bet),
       });

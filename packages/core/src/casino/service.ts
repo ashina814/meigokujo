@@ -3,6 +3,7 @@ import { EventLog } from "../events/service.js";
 import { EtherError, EtherExchange, HOUSE_HOLDER } from "./exchange.js";
 import { ChipTxError } from "./chip-tx.js";
 import type { Items } from "./items.js";
+import type { HouseReservations } from "./reservations.js";
 
 /**
  * マモンの賭場の共通土台。
@@ -80,6 +81,14 @@ export interface CasinoStatsRow {
   updated_at: number;
 }
 
+/**
+ * ソロゲーム1回の業務グループ鍵。`Casino.settle` / `settleSolo` と
+ * 胴元債務予約（PR5）が**同じ文字列**を使う（予約鍵 = 精算グループ鍵）。
+ */
+export function soloGroupKey(game: string, userId: string, operationId: string): string {
+  return `solo:${game}:${userId}:${operationId}`;
+}
+
 export interface SettleOptions {
   /**
    * この精算を一意に指す値。**同じ操作の再試行では同じ値**を渡すこと
@@ -90,6 +99,11 @@ export interface SettleOptions {
   chain?: boolean;
   /** 福の重み（既定ON。共有卓はOFF） */
   fuku?: boolean;
+  /**
+   * 胴元債務予約の鍵（PR5）。渡すと**精算と同じトランザクションの中で解放**する。
+   * 予約はゲーム開始時に取ってあり、この精算が通った時点で債務が確定するので不要になる。
+   */
+  reservationKey?: string;
 }
 
 export interface SettleResult {
@@ -125,6 +139,11 @@ export interface CasinoOptions {
    * 渡さない場合は「お守り無し」として扱う（テスト・移植前の経路）。
    */
   items?: Items;
+  /**
+   * 胴元債務予約（PR5）。渡すと `settle()` が `reservationKey` を精算と同じ
+   * トランザクション内で解放する。渡さない場合は予約なしとして動く（移植前の経路・テスト）。
+   */
+  reservations?: HouseReservations;
 }
 
 /** ソロゲーム1回の結果。精算結果に「お守りが何をしたか」を添えたもの */
@@ -145,6 +164,7 @@ const now = () => Math.floor(Date.now() / 1000);
 export class Casino {
   private readonly fukuScaleOpt: number | (() => number);
   private readonly items?: Items;
+  private readonly reservations?: HouseReservations;
 
   constructor(
     private readonly db: Database.Database,
@@ -154,6 +174,7 @@ export class Casino {
   ) {
     this.fukuScaleOpt = options.fukuScale ?? 10;
     this.items = options.items;
+    this.reservations = options.reservations;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS casino_stats (
         user_id             TEXT PRIMARY KEY,
@@ -195,7 +216,15 @@ export class Casino {
    * @param maxPayout このベットが当たったときの最大支払額（賭け額込み）
    */
   canAccept(maxPayout: number): boolean {
-    return this.houseBalance() >= maxPayout;
+    return this.availableForLiability() >= maxPayout;
+  }
+
+  /**
+   * いま新しい債務を引き受けられる額（PR5）。
+   * 予約が繋がっていれば `house 残高 − 予約合計`、繋がっていなければ house 残高そのもの。
+   */
+  availableForLiability(): number {
+    return this.reservations ? this.reservations.available() : this.houseBalance();
   }
 
   private fukuScale(): number {
@@ -226,7 +255,7 @@ export class Casino {
     const move = { game, sessionId: null };
     // 1ゲームの精算をひとまとまりの業務操作として記録する。`operationId` は
     // 「同じ操作の再試行なら同じ値になる」ものを呼び出し側が渡す（Discordの操作IDなど）
-    const groupKey = `solo:${game}:${userId}:${opts.operationId}`;
+    const groupKey = soloGroupKey(game, userId, opts.operationId);
     return this.ether.runGroup({ groupKey, kind: "solo_game", actorId: userId }, (): SettleResult => {
       // 徴収
       this.ether.transfer(userId, HOUSE_HOLDER, bet, { ...move, reason: "賭け金" });
@@ -285,6 +314,9 @@ export class Casino {
           });
         }
       }
+      // 債務が確定したので予約を解放する。**精算と同じトランザクションの中**で行うので、
+      // 精算が巻き戻れば予約も残る（払う前に枠だけ空くことがない）
+      if (opts.reservationKey) this.reservations?.release(opts.reservationKey);
       const effectivePayout = payout + chainBonus - fukuTax;
       const net = effectivePayout - bet;
       // 戦績には**実際に残高が動いた額**を渡す（PR3）。素の payout を渡していたので、
@@ -319,7 +351,7 @@ export class Casino {
    * @param rawPayout お守り適用前の払戻総額（0=負け、bet=引き分け、>bet=勝ち）
    */
   settleSolo(userId: string, game: string, bet: number, rawPayout: number, opts: SoloRoundOptions): SoloRoundResult {
-    const groupKey = `solo:${game}:${userId}:${opts.operationId}`;
+    const groupKey = soloGroupKey(game, userId, opts.operationId);
     return this.ether.runGroup({ groupKey, kind: "solo_game", actorId: userId }, (): SoloRoundResult => {
       const amulet = this.consumeAmulets(userId, bet, rawPayout);
       // settle は同じキーで runGroup を呼ぶが、すでにこのグループの中なので合流する

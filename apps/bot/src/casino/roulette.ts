@@ -12,7 +12,7 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import { ROULETTE_PAYOUTS as CORE_ROULETTE_PAYOUTS, rouletteSpin } from "@meigokujo/core";
+import { ROULETTE_PAYOUTS as CORE_ROULETTE_PAYOUTS, rouletteSpin, rouletteTableLiability, type RouletteBet } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
@@ -24,8 +24,114 @@ import { C_LOSE, C_MAMMON, C_WIN, E, fmtBigDelta } from "./ui.js";
  * - 誰かが /遊ぶ ルーレット で卓を開く → 30秒の受付 → 0〜36 抽選 → 一括精算
  * - 賭け先: 赤/黒/奇数/偶数/大/小 = 2倍、零(0) = 36倍
  * - 1人1口（張り直しは上書き）。徴収は張った時点でエスクロー（再起動時は自動返金）
+ * - **卓全体の債務は `HouseReservations` へ予約する**（PR5 マージ直前レビュー対応）。
+ *   複数チャンネルの卓が同じ `available()` を見て過剰受注しないよう、張る・張り直す
+ *   都度 `rouletteTableLiability()` で卓全体の増分債務を計算し直し、`resize()` で
+ *   原子的に増減させる。精算（`settleRoulette`）が全員成功した後で一度だけ解放する。
  */
 const LOBBY_SEC = 30;
+
+/** 卓全体の予約に使う固定の名義。個々の参加者ではなく卓そのものの予約なので共通値にする */
+const RESERVATION_OWNER = "system:roulette";
+
+function reservationKeyFor(session: string): string {
+  return `roulette:reserve:${session}`;
+}
+
+/** ルーレットの掛け方 → 債務モデルの賭け種別（"零" だけ single、それ以外は even） */
+function toLiabilityBetType(type: BetType): RouletteBet["type"] {
+  return type === "green" ? "single" : "even";
+}
+
+function tableLiabilityOf(bets: Iterable<SessionBet>): number {
+  const rouletteBets: RouletteBet[] = [...bets].map((b) => ({ type: toLiabilityBetType(b.type), amount: b.amount }));
+  return rouletteTableLiability(rouletteBets);
+}
+
+/** 卓の予約取得に失敗した（余力不足）。資金は1 Ld も動いていない */
+class RouletteCapacityError extends Error {
+  constructor(
+    readonly needed: number,
+    readonly available: number,
+  ) {
+    super(`ERR_ROULETTE_CAPACITY: 必要 ${needed} に対して余力 ${available}`);
+    this.name = "RouletteCapacityError";
+  }
+}
+
+/** エスクローへの預託に失敗した（残高不足）。予約はこの直前の状態へ巻き戻す */
+class RouletteEscrowShortfall extends Error {
+  constructor() {
+    super("ERR_ROULETTE_ESCROW_SHORTFALL");
+    this.name = "RouletteEscrowShortfall";
+  }
+}
+
+export type AcceptRouletteBetResult =
+  | { ok: true }
+  | { ok: false; reason: "capacity"; available: number }
+  | { ok: false; reason: "broke" };
+
+/**
+ * 卓へのベット受付（新規・張り増し・張り直し）を1つの原子操作として行う（PR5）。
+ *
+ * 1. 卓全体の新しい債務を計算（張り直しなら旧ベットを除いて見積もる）
+ * 2. `HouseReservations.resize()` で原子的に増減
+ * 3. （張り直しなら）旧ベットのエスクローを返す
+ * 4. 新しいベットぶんをエスクローへ預ける
+ *
+ * 2〜4 を**同じ業務グループ**にまとめてあるので、途中のどこで失敗しても
+ * 予約・エスクロー・呼び出し側の `bets` マップが食い違わない
+ * （成功したときだけ `bets` を書き換える。失敗時は3点とも直前の状態のまま）。
+ */
+export function acceptRouletteBet(
+  services: Services,
+  session: string,
+  bets: Map<string, SessionBet>,
+  userId: string,
+  type: BetType,
+  amount: number,
+  operationId: string,
+): AcceptRouletteBetResult {
+  const otherBets = [...bets.values()].filter((b) => b.userId !== userId);
+  const wantedTotal = tableLiabilityOf([...otherBets, { userId, type, amount }]);
+  const reservationKey = reservationKeyFor(session);
+  const wasRebet = bets.has(userId);
+  try {
+    services.ether.runGroup(
+      { groupKey: `roulette:bet:${session}:${userId}:${operationId}`, kind: "table_hold", actorId: userId },
+      () => {
+        const r = services.reservations.resize(reservationKey, wantedTotal, "ルーレット", RESERVATION_OWNER);
+        if (!r.ok) throw new RouletteCapacityError(wantedTotal, r.available);
+        // 張り直しは上書き: 前の張りを返してから新しい額をエスクロー
+        if (wasRebet) services.escrow.refundOne(session, userId, `rebet:${operationId}`);
+        if (!services.escrow.hold(session, userId, amount, "roulette", operationId)) {
+          throw new RouletteEscrowShortfall();
+        }
+      },
+    );
+  } catch (e) {
+    if (e instanceof RouletteCapacityError) return { ok: false, reason: "capacity", available: e.available };
+    if (e instanceof RouletteEscrowShortfall) return { ok: false, reason: "broke" };
+    throw e;
+  }
+  bets.set(userId, { userId, type, amount });
+  return { ok: true };
+}
+
+/**
+ * 卓を無効化する: 全員へ返金し、卓予約を**同じグループ**で解放する（PR5）。
+ * 別々に行うと、返金だけ成功して予約解放が落ちた場合に予約が残り続ける。
+ */
+export function voidRouletteTable(services: Services, session: string): void {
+  services.ether.runGroup(
+    { groupKey: `roulette:void:${session}`, kind: "table_refund", actorId: "system:roulette" },
+    () => {
+      services.escrow.refund(session);
+      services.reservations.release(reservationKeyFor(session));
+    },
+  );
+}
 
 const RED = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
 
@@ -88,12 +194,16 @@ export interface RouletteSpinRecord {
 /**
  * 1回転ぶんの資金処理を**ひとつの最外部グループ**で行う。
  *
- * 抽選・エスクロー返還・全員分の精算（賭け徴収→配当）・戦績・エスクロー台帳の削除まで、
- * 全部この中。以前は「先に全員へ返金 → 参加者ごとに別グループで精算」だったため、
- * 途中で止まると「全員返金済み・一部だけ再精算済み」が残った。
+ * 抽選・エスクロー返還・全員分の精算（賭け徴収→配当）・戦績・エスクロー台帳の削除・
+ * **卓予約の解放**まで、全部この中。以前は「先に全員へ返金 → 参加者ごとに別グループで精算」
+ * だったため、途中で止まると「全員返金済み・一部だけ再精算済み」が残った。
  *
- * 個別の精算例外は握り潰さない。1人でも払えなければ回転ごと巻き戻し、
+ * 個別の精算例外は握り潰さない。1人でも払えなければ回転ごと巻き戻し（**卓予約も残る**）、
  * 呼び出し側が卓ごと返金する（中途半端な卓を残さない）。
+ *
+ * **卓予約は参加者ごとの `settle()` では解放しない。** 1人目の精算で解放すると、
+ * 残りの参加者が予約の裏付けを失う（＝他の卓に枠を奪われうる）。全員成功した後で
+ * この関数の最後に一度だけ解放する（PR5 マージ直前レビュー対応）。
  *
  * `_beforeStep` はテスト専用のフック（各精算の直前に呼ばれる）。本番呼び出しは省略する。
  */
@@ -124,6 +234,9 @@ export function settleRoulette(
         });
         results.push({ userId: b.userId, type: b.type, amount: b.amount, won, payout, net: settled.net });
       }
+      // 全員成功した後で一度だけ解放。ここまでに例外が出ればトランザクションごと
+      // 巻き戻るので、予約は残ったまま（途中で払った額と解放が食い違うことはない）
+      services.reservations.release(reservationKeyFor(session));
       return { n, results };
     },
   );
@@ -225,27 +338,22 @@ export async function playRoulette(
           await sub.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
           return;
         }
-        // テーブルリミット: この卓の最大支払い合計が胴元残高を超えない範囲で受ける
-        const potential = [...bets.values()]
-          .filter((b) => b.userId !== btn.user.id)
-          .reduce((s, b) => s + b.amount * PAYOUTS[b.type], 0);
-        if (!services.casino.canAccept(potential + amt * PAYOUTS[type])) {
-          await sub.reply({ content: Mammon.tableClosed(), flags: MessageFlags.Ephemeral });
-          return;
-        }
         if (collector.ended) {
           await sub.reply({ content: "締切に間に合わなかった。次の卓で。", flags: MessageFlags.Ephemeral });
           return;
         }
-        // 張り直しは上書き: 前の張りを返してから新しい額をエスクロー
-        if (bets.has(btn.user.id)) services.escrow.refundOne(session, btn.user.id, `rebet:${btn.id}`);
-        if (!services.escrow.hold(session, btn.user.id, amt, "roulette", btn.id)) {
-          bets.delete(btn.user.id);
+        // 卓全体の債務を原子的に予約してから資金を動かす（PR5）。失敗時は
+        // 予約・エスクロー・bets のどれも変わらない（acceptRouletteBet が保証する）
+        const accepted = acceptRouletteBet(services, session, bets, btn.user.id, type, amt, btn.id);
+        if (!accepted.ok) {
+          if (accepted.reason === "capacity") {
+            await sub.reply({ content: Mammon.tableClosed(), flags: MessageFlags.Ephemeral });
+            return;
+          }
           await sub.reply({ content: `${Mammon.broke()}（所持 ${fmtEther(services.ether.balanceOf(btn.user.id))}）`, flags: MessageFlags.Ephemeral });
           await interaction.editReply({ embeds: [lobbyEmbed(Math.max(0, Math.ceil((endAt - Date.now()) / 1000)))] }).catch(() => undefined);
           return;
         }
-        bets.set(btn.user.id, { userId: btn.user.id, type, amount: amt });
         await sub.reply({ content: `✅ ${LABELS[type]} に ${fmtEther(amt)} を張った。`, flags: MessageFlags.Ephemeral });
         await interaction.editReply({ embeds: [lobbyEmbed(Math.max(0, Math.ceil((endAt - Date.now()) / 1000)))] }).catch(() => undefined);
       })();
@@ -295,9 +403,10 @@ export async function playRoulette(
       spin = settleRoulette(services, session, [...bets.values()]);
     } catch (e) {
       console.error(`[roulette] 卓 ${session} の精算に失敗。全額返金します`, e);
-      // 精算はまるごと巻き戻っているので、預り金はそのまま残っている＝返金して卓を閉じる
+      // 精算はまるごと巻き戻っているので、預り金・卓予約はそのまま残っている。
+      // 返金と卓予約の解放を同じグループで行う（voidRouletteTable）
       try {
-        services.escrow.refund(session);
+        voidRouletteTable(services, session);
       } catch (re) {
         console.error(`[roulette] 卓 ${session} の返金にも失敗。起動時の掃除に任せます`, re);
       }

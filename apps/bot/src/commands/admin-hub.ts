@@ -595,9 +595,19 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
   if (section === "casino" && action === "settle") {
     const raw = interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim();
     const held = services.casino.houseBalance();
-    const amt = raw === "" ? held : Number(raw);
+    // 進行中ゲームの最大配当は予約で押さえてある。その裏付けは精算できない（PR5）。
+    // **金額未入力でも全残高ではなく精算可能額だけ**を対象にする
+    const settleable = services.ether.settleableBalance(HOUSE_HOLDER);
+    const reserved = held - settleable;
+    const amt = raw === "" ? settleable : Number(raw);
     if (!Number.isInteger(amt) || amt <= 0) {
-      await interaction.reply({ content: held === 0 ? "胴元残高が 0 です。" : "金額は正の整数で。", flags: MessageFlags.Ephemeral });
+      const why =
+        held === 0
+          ? "胴元残高が 0 です。"
+          : settleable === 0
+            ? `いま精算できる額は 0 です（残高 ${fmtEther(held)} は全額が進行中ゲームの予約 ${fmtEther(reserved)} の裏付けです）。`
+            : "金額は正の整数で。";
+      await interaction.reply({ content: why, flags: MessageFlags.Ephemeral });
       return;
     }
     try {
@@ -608,9 +618,11 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       });
     } catch (e) {
       const msg =
-        e instanceof EtherError && e.code === "ERR_INSUFFICIENT_ETHER"
-          ? `胴元のエテルが足りません（${fmtEther(held)}）。`
-          : "処理に失敗しました。";
+        e instanceof EtherError && e.code === "ERR_RESERVED_FUNDS"
+          ? `進行中ゲームの予約 ${fmtEther(reserved)} は精算できません（いま精算できるのは ${fmtEther(settleable)} まで）。`
+          : e instanceof EtherError && e.code === "ERR_INSUFFICIENT_ETHER"
+            ? `胴元のエテルが足りません（${fmtEther(held)}）。`
+            : "処理に失敗しました。";
       await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
     }
     return;

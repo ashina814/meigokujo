@@ -115,9 +115,12 @@ export class Daily {
       const streakBonus = Math.min(Math.floor(streak / 7) * STREAK_STEP, STREAK_CAP);
       const reliefEligible = this.ether.balanceOf(userId) <= this.reliefThreshold();
 
-      // 基本 + streak 分は胴元から。胴元不足なら救済プールから振替
+      // 基本 + streak 分は胴元から。胴元不足なら救済プールから振替。
+      // **予約済み債務は出さない**（PR5レビュー指摘）。進行中ゲームの最大配当は
+      // HouseReservations が押さえてあるので、その裏付けまで福分けに回すと
+      // 後で該当ゲームの精算がここで抜かれた分だけ失敗しうる
       const wanted = base + streakBonus;
-      const houseHas = this.ether.balanceOf(HOUSE_HOLDER);
+      const houseHas = this.ether.settleableBalance(HOUSE_HOLDER);
       const fromHouse = Math.min(wanted, houseHas);
       if (fromHouse > 0) this.ether.transfer(HOUSE_HOLDER, userId, fromHouse, { reason: "福分け（胴元）" });
       const shortfall = wanted - fromHouse;

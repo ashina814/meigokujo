@@ -147,9 +147,12 @@ export class Stocks {
           // 胴元が払えないなら没収せず保留（次の tick で再試行）。株だけ消すと実質没収になる。
           // ここは「false を保存して終わる」ではなく**例外でグループごと巻き戻す**。
           // 保存してしまうと、以後この建玉は同じキーで永久に false が再生され、
-          // 胴元へ資金を入れても二度と売れなくなる
-          if (this.ether.balanceOf(HOUSE_HOLDER) < proceeds) {
-            throw new StockError("ERR_INSUFFICIENT_ETHER", { house: this.ether.balanceOf(HOUSE_HOLDER), proceeds });
+          // 胴元へ資金を入れても二度と売れなくなる。
+          // **予約済み債務も出さない**（PR5レビュー指摘）: 進行中ゲームの最大配当の
+          // 裏付けまで強制売却で抜けてしまうと、そのゲームの精算が後で失敗しうる
+          const settleable = this.ether.settleableBalance(HOUSE_HOLDER);
+          if (settleable < proceeds) {
+            throw new StockError("ERR_INSUFFICIENT_ETHER", { house: this.ether.balanceOf(HOUSE_HOLDER), settleable, proceeds });
           }
           this.ether.transfer(HOUSE_HOLDER, h.user_id, proceeds, { reason: "株の期限到来による強制売却", game: "stocks" });
           this.db
@@ -209,9 +212,11 @@ export class Stocks {
       // 保有数・胴元残高はグループの中で見る（売却成功後の再試行を落とさない）
       const cur = this.db.prepare("SELECT * FROM casino_holdings WHERE user_id = ? AND stock_id = ?").get(userId, stockId) as Holding | undefined;
       if (!cur || cur.shares < shares) throw new StockError("ERR_INSUFFICIENT_SHARES", { held: cur?.shares ?? 0, shares });
-      // 胴元が払えないなら売却自体を拒否（株だけ消して支払わない、を防ぐ）
-      if (proceeds > 0 && this.ether.balanceOf(HOUSE_HOLDER) < proceeds) {
-        throw new StockError("ERR_INSUFFICIENT_ETHER", { house: this.ether.balanceOf(HOUSE_HOLDER), proceeds });
+      // 胴元が払えないなら売却自体を拒否（株だけ消して支払わない、を防ぐ）。
+      // **予約済み債務は出さない**（PR5レビュー指摘）
+      const settleable = this.ether.settleableBalance(HOUSE_HOLDER);
+      if (proceeds > 0 && settleable < proceeds) {
+        throw new StockError("ERR_INSUFFICIENT_ETHER", { house: this.ether.balanceOf(HOUSE_HOLDER), settleable, proceeds });
       }
       if (proceeds > 0) this.ether.transfer(HOUSE_HOLDER, userId, proceeds, { reason: "株の売却", game: "stocks" });
       const remaining = cur.shares - shares;
