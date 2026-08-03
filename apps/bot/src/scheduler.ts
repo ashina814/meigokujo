@@ -96,6 +96,12 @@ export function nextSessionStart(services: Pick<Services, "sessions">, from = ne
 export function startScheduler(client: Client, services: Services, intervalMs = 60_000): NodeJS.Timeout {
   async function tick(): Promise<void> {
     const now = jstNow();
+    // PR10: 1分走査。候補・最終時刻はDBから読み、各利用者の返還は冪等groupで処理する。
+    const idleCutoff = Math.floor(Date.now() / 1000) - 10 * 60;
+    const idle = services.chipFlow.redeemInactive(idleCutoff, `scheduler:${Math.floor(Date.now() / 60_000)}`);
+    if (idle.failed.length > 0 || idle.skipped.length > 0) {
+      services.events.log("casino_idle_redeem_scan", { actor: "system:scheduler", payload: { cutoff: idleCutoff, failed: idle.failed, skipped: idle.skipped } });
+    }
 
     // ── 説明会の案内: 実際の開催予定の 5分前に入城案内chへ通知 ──
     // 通常枠は settings、休止・臨時追加は entry_session_overrides。合成は SessionCalendar が持ち、
@@ -162,6 +168,22 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     // ── ボイスXP tick（5分ごと・複数人VC滞在者に加算）──
     if (now.minute % 5 === 0) {
       await tickVoiceXp(client, services).catch((e) => console.error("[rank] ボイスXP tick失敗:", e));
+    }
+
+    // ── 胴元債務予約の漏れ検出（毎時5分・PR5 / 正本 §11.2）──
+    // 24時間残っている予約は解放し忘れ。放っておくと胴元の受注可能額を永久に食う
+    if (now.minute === 5) {
+      try {
+        const swept = services.reservations.sweepStale();
+        if (swept.count > 0) {
+          console.warn(
+            `[casino] 24時間以上残った胴元債務予約 ${swept.count}件（計 ${swept.total.toLocaleString("ja-JP")}◈）を警告つきで解放: ` +
+              swept.rows.map((r) => `${r.game}/${r.userId}`).slice(0, 10).join(", "),
+          );
+        }
+      } catch (e) {
+        console.error("[casino] 胴元債務予約の掃除に失敗:", e);
+      }
     }
 
     // ── bump/up クールタイム終了通知 ──
@@ -251,8 +273,13 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       console.error("[vip] tick失敗:", e);
     }
 
+    // 賭場が停止していれば、資金を動かす tick は丸ごと飛ばす。
+    // （資金層でも弾かれるが、毎分例外を出し続けないようにここでも見る）
+    const casinoClosed = services.casinoStatus.denyMessage() !== null;
+    if (casinoClosed) console.log("[賭場] 停止中のため板の tick を飛ばします");
+
     // ── 賭場の板: 締切を過ぎた open を closed へ + reported の5分無異議で自動精算 ──
-    try {
+    if (!casinoClosed) try {
       const pending = services.markets.listPastDeadline();
       for (const m of pending) {
         services.markets.autoClose(m.id);
@@ -273,26 +300,10 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       console.error("[market] tick失敗:", e);
     }
 
-    // ── マモンの株式市場: 1時間ごとの価格更新 & 期限切れ強制売却 ──
-    try {
-      services.stocks.updateAll();
-      const forced = services.stocks.forceSellExpired();
-      if (forced.length > 0) {
-        console.log(`[stocks] 期限切れ強制売却: ${forced.length}件`);
-        // 資産が勝手に動いた時は必ず本人に通知（無言の強制売却をしない）
-        for (const f of forced) {
-          const stock = services.stocks.get(f.stockId);
-          const user = await client.users.fetch(f.userId).catch(() => null);
-          await user
-            ?.send(
-              `📈 マモンの株式市場: **${stock?.emoji ?? ""}${stock?.name ?? f.stockId}** ${f.shares}株 が保有期限（3日）を超えたため強制売却された。受取 **${f.proceeds.toLocaleString("ja-JP")}◈**（手数料1%控除後）。`,
-            )
-            .catch(() => undefined);
-        }
-      }
-    } catch (e) {
-      console.error("[stocks] tick失敗:", e);
-    }
+    // ── マモンの株式市場: 停止中（PR6・正本 §1.3）──
+    // 価格更新も期限切れ強制売却も行わない。**建玉には一切触れない**。
+    // 「試験データと確認できた建玉の初期化」は PR12 の正式開業初期化の仕事で、
+    // ここで清算すると、正式資産だった場合の補償基準（時価）を自分で壊すことになる。
 
     // ── 公式ショップの月額一括請求: 毎月1日 08:00 JST ──
     if (now.day === 1 && now.hour === 8) {

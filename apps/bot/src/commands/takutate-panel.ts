@@ -87,15 +87,15 @@ export async function handleTakuButton(interaction: ButtonInteraction, services:
       content: `✅ ${def.emoji} **${def.name}** を立てた: <#${vc.id}>（最後の1人が退出で自動削除）`,
     });
   } catch (e) {
+    console.error("[卓建て] VC 作成に失敗:", e);
     await interaction.editReply({ content: `❌ VC 作成に失敗した（Botの権限不足?）` });
-    void e;
   }
 }
 
 /** VoiceStateUpdate ハンドラ: 追跡中の卓VCが空になったら削除 */
 export async function handleTakuVoiceUpdate(
   oldState: import("discord.js").VoiceState,
-  newState: import("discord.js").VoiceState,
+  _newState: import("discord.js").VoiceState,
   services: Services,
 ): Promise<void> {
   // 退出のみ関心（新チャンネルには何もしない）
@@ -112,7 +112,6 @@ export async function handleTakuVoiceUpdate(
   } catch {
     /* ignore */
   }
-  void newState;
 }
 
 /** 起動時に空になっている追跡中卓VCを sweep */

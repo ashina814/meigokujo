@@ -7,6 +7,15 @@ const ETHER_RESERVE = "sys:escrow:ether";
 const LEGACY_CHIPS = "sys:escrow:chips";
 const ESCROW_QUARANTINE = "sys:escrow:quarantine";
 const ACTIVE_MARKET_STATUSES = ["open", "closed", "reported", "disputed"] as const;
+/** 賭場の稼働状態の見出し（運営卓と同じ言い回しに揃える） */
+const CASINO_STATUS_LABEL: Record<string, string> = {
+  open: "🟢 営業中",
+  startup_check: "🟡 点検中",
+  integrity_halt: "🔴 停止（検算NG）",
+  manual_halt: "🔴 停止（手動）",
+  maintenance: "🔧 改装中",
+  opening_reset: "🚧 開業準備中",
+};
 const UNRESOLVED_MARKET_STATUSES = [...ACTIVE_MARKET_STATUSES, "frozen"] as const;
 
 export interface LandSystemBreakdown {
@@ -247,7 +256,7 @@ function hasEconomyHealthAlert(summary: EconomyHealthSummary): boolean {
 }
 
 function formatEconomyHealth(summary: EconomyHealthSummary, updatedAt: ReturnType<typeof dashboardJstNow>): string {
-  const fmtE = (n: number) => `${n.toLocaleString("ja-JP")}◈`;
+  const fmtE = (n: number) => fmtLd(n);
   const marketIssues: string[] = [];
   const escrowIssues: string[] = [];
   if (summary.sessionEscrowMismatchCount > 0) {
@@ -363,18 +372,26 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
     `稼働中の部屋: ${openRooms}室`,
   ].join("\n");
 
-  // 賭場（エテル経済圏の健全性監視。壊れ・exploit の早期検知用）
-  const fmtE = (n: number) => `${n.toLocaleString("ja-JP")}◈`;
+  // 賭場チップ経済圏の健全性監視。壊れ・exploit の早期検知用。
+  const fmtE = (n: number) => fmtLd(n);
   const housePool = services.casino.houseBalance();
   const jpPool = services.casino.jackpotPool();
   const reliefPool = services.ether.balanceOf("relief");
   const etherOutstanding = services.ether.outstanding();
   const reservePool = services.ether.pool();
-  const etherRate = services.ether.rate();
   const escrowRows = services.db.prepare("SELECT COALESCE(SUM(amount),0) AS s, COUNT(*) AS c FROM casino_escrow").get() as { s: number; c: number };
+  // 稼働状態と検算A〜D（PR2）。停止していれば理由をそのまま出す
+  const casinoStatus = services.casinoStatus.current();
+  // 起動時・営業再開・再点検と同じ全点検（Land台帳 + 検算A〜D）
+  const integrity = services.casinoIntegrity.runFull();
+  const failedChecks = integrity.checks.filter((c) => !c.ok);
   const casinoField = [
+    `稼働: ${CASINO_STATUS_LABEL[casinoStatus.status] ?? casinoStatus.status}${casinoStatus.status === "open" ? "" : `（${casinoStatus.reason}）`}`,
+    integrity.ok
+      ? "全点検（Land台帳 + 検算A〜D）: 正常"
+      : `⚠️ 点検NG: ${[...(integrity.ledger.ok ? [] : ["Land台帳"]), ...failedChecks.map((c) => `${c.id}(${c.name})`)].join(" / ")}`,
     `胴元: **${fmtE(housePool)}** / JP: ${fmtE(jpPool)} / 救済: ${fmtE(reliefPool)}`,
-    `発行エテル: ${fmtE(etherOutstanding)} ⇄ 準備Land: ${fmtLd(reservePool)}（1Ld=${etherRate.toFixed(2)}◈）`,
+    `発行済みチップ: ${fmtE(etherOutstanding)} ⇄ 準備Land: ${fmtLd(reservePool)}（1チップ=1 Ld）`,
     escrowRows.c > 0 ? `進行中の卓の預かり: ${fmtE(escrowRows.s)}（${escrowRows.c}口）` : "進行中の卓の預かり: なし",
   ].join("\n");
 
@@ -391,6 +408,10 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
   if (oldestDays >= 3) alerts.push(`面接待ちが${oldestDays}日滞留`);
   if (landBreakdown.legacyChips > 0) alerts.push(`旧chips口座 ${fmtLd(landBreakdown.legacyChips)}`);
   if (hasEconomyHealthAlert(health)) alerts.push("経済健全性に要確認項目あり");
+  if (!integrity.ok) {
+    alerts.push(`賭場の点検NG ${[...(integrity.ledger.ok ? [] : ["台帳"]), ...failedChecks.map((c) => c.id)].join("")}`);
+  }
+  if (casinoStatus.status !== "open") alerts.push(`賭場が停止中（${casinoStatus.status}）`);
 
   const embed = new EmbedBuilder()
     .setTitle("🏰 城の計器盤")

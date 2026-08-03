@@ -22,7 +22,7 @@ import type { Services } from "../services.js";
 
 /**
  * /株 — マモンの賭場の株式市場。
- * 6 銘柄・1時間ごとの価格更新・保有上限3日・売買はエテル建て。
+ * 6 銘柄・1時間ごとの価格更新・保有上限3日・売買はLand建て。
  */
 export const stocksCommand = new SlashCommandBuilder()
   .setName("株")
@@ -53,7 +53,7 @@ function buildBoard(services: Services, userId: string): EmbedBuilder {
     const trend = s.trend > 0.3 ? "🔥" : s.trend < -0.3 ? "❄" : "  ";
     // padding: 銘柄名 8chars, 価格 8chars, 差分 8chars
     const name = (s.emoji + " " + s.name).padEnd(10, " ");
-    const price = s.price.toLocaleString("ja-JP").padStart(8, " ") + " ◈";
+    const price = s.price.toLocaleString("ja-JP").padStart(8, " ") + " Ld";
     const change = `${arrow} ${Math.abs(pct).toFixed(1)}%`.padEnd(10, " ");
     return `${name}  ${price}  ${change}${trend}`;
   });
@@ -66,7 +66,7 @@ function buildBoard(services: Services, userId: string): EmbedBuilder {
     const pnl = value - cost;
     const daysHeld = Math.floor((Date.now() / 1000 - h.bought_at) / 86_400);
     const pnlStr = (pnl >= 0 ? "+" : "−") + Math.abs(pnl).toLocaleString("ja-JP");
-    return `${h.stock.emoji} **${h.stock.name}** ×${h.shares}   平均${fmtEther(h.avg_cost).replace(" ◈", "◈")}  時価${fmtEther(value).replace(" ◈", "◈")}  **${pnlStr}**  ${daysHeld}日`;
+    return `${h.stock.emoji} **${h.stock.name}** ×${h.shares}   平均${fmtEther(h.avg_cost).replace(" Ld", "Ld")}  時価${fmtEther(value).replace(" Ld", "Ld")}  **${pnlStr}**  ${daysHeld}日`;
   });
 
   const embed = new EmbedBuilder()
@@ -75,7 +75,7 @@ function buildBoard(services: Services, userId: string): EmbedBuilder {
     .setTitle("📈  相場板")
     .setDescription(boardStr)
     .setFooter({
-      text: `所持 ${fmtEther(held).replace(" ◈", "◈")} · 価格は1時間毎更新 · 保有 ${STOCK_HOLD_DAYS}日超で強制売却 · 売却手数料 ${Math.round(STOCK_SELL_FEE_RATE * 100)}%`,
+      text: `所持 ${fmtEther(held).replace(" Ld", "Ld")} · 価格は1時間毎更新 · 保有 ${STOCK_HOLD_DAYS}日超で強制売却 · 売却手数料 ${Math.round(STOCK_SELL_FEE_RATE * 100)}%`,
     });
 
   if (holdingRows.length > 0) {
@@ -93,7 +93,7 @@ function buildComponents(services: Services): ActionRowBuilder<StringSelectMenuB
     .setPlaceholder("買う銘柄を選ぶ")
     .addOptions(
       stocks.map((s) => ({
-        label: `${s.name} — ${s.price.toLocaleString()} ◈`,
+        label: `${s.name} — ${s.price.toLocaleString()} Ld`,
         value: s.id,
         emoji: s.emoji,
       })),
@@ -103,7 +103,7 @@ function buildComponents(services: Services): ActionRowBuilder<StringSelectMenuB
     .setPlaceholder("売る銘柄を選ぶ")
     .addOptions(
       stocks.map((s) => ({
-        label: `${s.name} — ${s.price.toLocaleString()} ◈`,
+        label: `${s.name} — ${s.price.toLocaleString()} Ld`,
         value: s.id,
         emoji: s.emoji,
       })),
@@ -157,7 +157,7 @@ export async function handleStocksModal(interaction: ModalSubmitInteraction, ser
   } catch (e) {
     const msg =
       e instanceof StockError && e.code === "ERR_INSUFFICIENT_ETHER"
-        ? "エテルが足りない。"
+        ? "Landが足りない。"
         : e instanceof StockError && e.code === "ERR_INSUFFICIENT_SHARES"
           ? "その株はそんなに持っていない。"
           : "処理に失敗した。";

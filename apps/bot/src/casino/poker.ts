@@ -12,7 +12,16 @@ import {
 import { POKER_CATEGORY_PAYOUTS, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import {
+  MIN_BET,
+  acquireSeat,
+  effectiveMaxBet,
+  handleRetryPress,
+  releaseSeat,
+  sleep,
+  validateBet,
+  withHouseReservation,
+} from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { C_JACKPOT, C_MAMMON, E, HR_THIN, buildResultEmbed, fmtBigDelta } from "./ui.js";
 
@@ -25,7 +34,8 @@ import { C_JACKPOT, C_MAMMON, E, HR_THIN, buildResultEmbed, fmtBigDelta } from "
  *   3カード 3倍 / ツーペア 2倍 / J以上のペア 1倍 / それ以下 負け
  * - 最大配当250倍 → テーブルリミット判定に使う
  */
-const MAX_MULT = 250;
+/** ロイヤルフラッシュの払戻倍率。配当表（core）から読む（写さない・PR4） */
+const MAX_MULT = POKER_CATEGORY_PAYOUTS[11]!;
 const SUITS = ["♠", "♥", "♦", "♣"] as const;
 const RANK_LABEL = ["", "", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"] as const;
 
@@ -126,7 +136,7 @@ function paytableEmbed(): EmbedBuilder {
     .setDescription("5枚配札 → 保持を選ぶ → 交換 → 役判定。52枚デッキ1組・RTP 約96%。")
     .addFields(
       { name: "▸ 配当", value: lines.join("\n"), inline: false },
-      { name: "▸ ⚖️ 福の重み / 🔥 連鎖チェーン", value: "勝ちで発動（残高が多いほど奉納・連勝で倍率）", inline: false },
+      { name: "▸ ⚖️ 福の重み / 🔥 連鎖チェーン", value: "勝ちで発動（残高が多いほど福分け積立・連勝で倍率）", inline: false },
     );
 }
 
@@ -136,7 +146,7 @@ export async function playPoker(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT);
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "ポーカー");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -153,10 +163,25 @@ export async function playPoker(
   }
 }
 
+/**
+ * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
+ * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
+ */
 async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+): Promise<void> {
+  await withHouseReservation(interaction, services, "ポーカー", bet, interaction.id, (reservationKey) =>
+    runRoundInner(interaction, services, bet, reservationKey),
+  );
+}
+
+async function runRoundInner(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+  bet: number,
+  reservationKey: string,
 ): Promise<void> {
   const uid = interaction.user.id;
   const deck = newDeck(services.rng);
@@ -184,7 +209,7 @@ async function runRound(
           .filter(Boolean)
           .join("\n"),
       )
-      .setFooter({ text: `賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
+      .setFooter({ text: `賭け ${fmtEther(bet).replace(" Ld", "Ld")}` });
   };
 
   const cardButtons = () =>
@@ -251,7 +276,7 @@ async function runRound(
   const ev = evaluate(hand);
   const rawPayout = ev.payMult > 0 ? bet * ev.payMult : 0;
   // お守りの消費も賭け・配当と同じグループの中（settleSolo）
-  const settled = services.casino.settleSolo(uid, "ポーカー", bet, rawPayout, { operationId: interaction.id });
+  const settled = services.casino.settleSolo(uid, "ポーカー", bet, rawPayout, { operationId: interaction.id, reservationKey });
   const amulet = { note: settled.amuletNote };
 
   const isJp = ev.category === 11;
@@ -293,7 +318,7 @@ async function runRound(
   // ── リトライボタン ──
   const heldEther = services.ether.balanceOf(uid);
   const min = MIN_BET;
-  const max = Math.min(MAX_BET, heldEther);
+  const max = Math.min(effectiveMaxBet(services, uid, "ポーカー"), heldEther);
   const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`poker:retry:${min}`)
@@ -332,18 +357,16 @@ async function runRound(
       return;
     }
     if (btn.customId.startsWith("poker:retry:")) {
-      collector.stop("retry");
-      const retryBet = Number(btn.customId.split(":")[2]);
-      if (retryBet < MIN_BET || retryBet > MAX_BET) return;
-      await btn.deferUpdate();
-      releaseSeat(uid);
-      if (acquireSeat(uid)) {
-        try {
-          await runRound(btn, services, retryBet);
-        } finally {
-          releaseSeat(uid);
-        }
-      }
+      // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
+      // 断るなら collector を止めない ＝ 押し直せる
+      await handleRetryPress({
+        services,
+        btn,
+        collector,
+        game: "ポーカー",
+        betRaw: Number(btn.customId.split(":")[2]),
+        run: (bet) => runRound(btn, services, bet),
+      });
     }
   });
   collector.on("end", async (_c, reason) => {

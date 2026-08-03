@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
-import { EtherExchange, HOUSE_HOLDER } from "./exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 import { JACKPOT_HOLDER } from "./service.js";
 
 /**
@@ -31,6 +31,14 @@ const now = () => Math.floor(Date.now() / 1000);
 
 /** 板ごとの預り所（保有者ID）。胴元(house)とは完全に分離して置く。 */
 export const marketEscrowHolder = (id: number): string => `escrow:market:${id}`;
+
+/**
+ * 起動時の復旧で「返してはいけない」板のエスクロー保有者（PR7・正本 §8.1）。
+ *
+ * frozen も含める。返金に失敗して調査待ちの板は、所有者情報が `casino_market_bets` に
+ * 残っているので孤児ではない。
+ */
+export const MARKET_LIVE_STATUSES = ["open", "closed", "reported", "disputed", "frozen"] as const;
 
 /**
  * 板の状態。
@@ -103,12 +111,31 @@ export class MarketError extends Error {
   }
 }
 
+export interface MarketsOptions {
+  /**
+   * **確定精算のときだけ**呼ばれる、利用者ごとの実現損益（PR3・通算損益）。
+   *
+   * ```text
+   * net = その板で受け取った配当 − その板へ張った総額
+   * ```
+   *
+   * 参加（bet）時には呼ばない。的中者なしの全額返金・強制 void も呼ばない
+   * （どちらも差引 0 で、まだ／もう何も確定していない）。
+   * `settle()` の資金グループの中から呼ばれるので、再試行で二度は呼ばれない。
+   */
+  onPlayerNet?: (userId: string, net: number) => void;
+}
+
 export class Markets {
+  private readonly onPlayerNet: (userId: string, net: number) => void;
+
   constructor(
     private readonly db: Database.Database,
-    private readonly ether: EtherExchange,
+    private readonly ether: ChipLedger,
     private readonly events: EventLog,
+    options: MarketsOptions = {},
   ) {
+    this.onPlayerNet = options.onPlayerNet ?? (() => undefined);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS casino_markets (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -654,6 +681,11 @@ export class Markets {
       }
       const distributable = pot - houseCut;
 
+      // 通算損益は「配当 − 張った総額」（PR3）。参加時ではなくここで一度だけ記録する
+      const staked = new Map<string, number>();
+      for (const b of bets) staked.set(b.user_id, (staked.get(b.user_id) ?? 0) + b.amount);
+      const received = new Map<string, number>();
+
       const payouts: Array<{ userId: string; amount: number }> = [];
       if (m.payout_mode === "parimutuel") {
         // 賭け額比例
@@ -666,6 +698,7 @@ export class Markets {
             this.ether.transfer(src, w.user_id, share, { reason: "板の配当", game: "market", sessionId: `market:${id}` });
           }
           remaining -= share;
+          received.set(w.user_id, (received.get(w.user_id) ?? 0) + share);
           payouts.push({ userId: w.user_id, amount: share });
         }
       } else {
@@ -679,8 +712,14 @@ export class Markets {
           if (share > 0) {
             this.ether.transfer(src, uid, share, { reason: "板の配当", game: "market", sessionId: `market:${id}` });
           }
+          received.set(uid, (received.get(uid) ?? 0) + share);
           payouts.push({ userId: uid, amount: share });
         }
+      }
+
+      // 張った本人だけを対象にする（JP へ抜けた場代は「受取 < 張った額」の形で損失に入る）
+      for (const [userId, stake] of staked) {
+        this.onPlayerNet(userId, (received.get(userId) ?? 0) - stake);
       }
 
       this.db.prepare("UPDATE casino_markets SET status = 'settled', settled_at = ? WHERE id = ?").run(now(), id);
@@ -731,6 +770,20 @@ export class Markets {
    * **返金に失敗した板は frozen に変更**して新規ベットを止め、帳簿とエスクロー残高を保持する。
    * エラーは events に記録して呼び出し側でログ出力できるようにする。
    */
+  /**
+   * 復旧レジストリへの申告（PR7・正本 §8.1）。
+   *
+   * 「いま生きていて、預託を返してはいけない板」の保有者IDを返す。
+   * 掃除の側が `casino_markets` を直接読むのをやめ、**所有元が自分で申告する**形にする。
+   */
+  liveEscrowHolders(): string[] {
+    const placeholders = MARKET_LIVE_STATUSES.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(`SELECT id FROM casino_markets WHERE status IN (${placeholders})`)
+      .all(...MARKET_LIVE_STATUSES) as Array<{ id: number }>;
+    return rows.map((r) => marketEscrowHolder(r.id));
+  }
+
   refundAllPending(actor: string): {
     total: number;
     refunded: number;

@@ -23,7 +23,17 @@ import {
   UserSelectMenuBuilder,
   UserSelectMenuInteraction,
 } from "discord.js";
-import { deptAccount, EtherError, HOUSE_HOLDER, LedgerError, type TicketPanel } from "@meigokujo/core";
+import {
+  CASINO_DEPARTMENT_KEY,
+  CasinoIntegrity,
+  deptAccount,
+  ChipLedgerError as EtherError,
+  HOUSE_HOLDER,
+  LedgerError,
+  recoverCasino,
+  type RefundSaga,
+  type TicketPanel,
+} from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
 import { ROLE_SLOT_META, ROLE_SLOT_ORDER, getRoleIds, setRoleIds, type RoleSlot } from "../church-roles.js";
 import {
@@ -36,6 +46,8 @@ import {
 import { updateDashboard } from "../dashboard.js";
 import { updateWaitersBoard, WAITERS_BOARD_CHANNEL_KEY } from "../waiters-board.js";
 import { fmtEther, fmtLd } from "../format.js";
+import { isSeatOccupied } from "../casino/common.js";
+import { recoverFrozenChinchiroPrehold } from "../casino/chinchiro.js";
 import { ticketPanelMessageForPanel } from "./tickets.js";
 import type { Services } from "../services.js";
 
@@ -172,6 +184,107 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "casino" && !action) return void (await interaction.update(casinoHome(services)));
   if (section === "casino" && action === "fund") return void (await interaction.showModal(casinoFundModal()));
   if (section === "casino" && action === "settle") return void (await interaction.showModal(casinoSettleModal()));
+  if (section === "casino" && action === "finance") return void (await interaction.update(casinoFinanceHome(services)));
+  if (section === "casino" && action === "remit-draft") return void (await interaction.showModal(casinoRemittanceDraftModal()));
+  if (section === "casino" && action === "remit-approve") return void (await interaction.showModal(casinoFinanceKeyModal("remit-approve", "納付draftを承認")));
+  if (section === "casino" && action === "remit-execute") return void (await interaction.showModal(casinoFinanceKeyModal("remit-execute", "納付を実行")));
+  if (section === "casino" && action === "bailout-draft") return void (await interaction.showModal(casinoBailoutDraftModal()));
+  if (section === "casino" && action === "bailout-approve") return void (await interaction.showModal(casinoFinanceKeyModal("bailout-approve", "補填draftを承認")));
+  if (section === "casino" && action === "bailout-execute") return void (await interaction.showModal(casinoFinanceKeyModal("bailout-execute", "補填を実行")));
+  if (section === "casino" && action === "refund-user") return void (await interaction.showModal(casinoRefundUserModal()));
+  if (section === "casino" && action === "prehold-recover") return void (await interaction.showModal(casinoPreholdRecoveryModal()));
+  if (section === "casino" && action === "refund-all") {
+    return void (await interaction.update(casinoRefundConfirm(
+      services.chipFlow.createRefundSaga({ id: interaction.id, requestedBy: `user:${interaction.user.id}`, scope: "all" }),
+    )));
+  }
+  if (section === "casino" && action === "refund-cancel" && arg) {
+    const cancelled = services.chipFlow.cancelRefundSaga(arg, `user:${interaction.user.id}`);
+    return void (await interaction.update({ content: cancelled ? "緊急返還案を取り消しました。" : "この緊急返還案は取り消せません。", embeds: [], components: [backButton()] }));
+  }
+  if (section === "casino" && action === "refund-execute" && arg) {
+    try {
+      const saga = services.chipFlow.executeRefundSaga(arg, `user:${interaction.user.id}`, {
+        activeGameUsers: (userIds) => userIds.filter(isSeatOccupied),
+        processingGroup: () => services.chipTx.isActive(),
+        integrityBlocked: () => services.casinoStatus.current().status === "integrity_halt",
+      });
+      return void (await interaction.update(casinoRefundResult(saga)));
+    } catch (error) {
+      return void (await interaction.reply({ content: `❌ ${error instanceof Error ? error.message : "緊急返還を実行できません"}`, flags: MessageFlags.Ephemeral }));
+    }
+  }
+  if (section === "casino" && action === "halt") return void (await interaction.showModal(casinoHaltModal()));
+  if (section === "casino" && action === "reopen") {
+    // 古いパネルのボタンが残っていることがあるので、押された時点の状態でも確かめる
+    const cur = services.casinoStatus.current();
+    if (!REOPEN_LABEL[cur.status]) {
+      return void (await interaction.reply({
+        content:
+          cur.status === "opening_reset"
+            ? "❌ 開業準備中です。正式開業初期化の完了処理からしか開けられません。"
+            : `❌ いまは ${CASINO_STATUS_LABEL[cur.status] ?? cur.status} なので、この導線では開けられません。`,
+        flags: MessageFlags.Ephemeral,
+      }));
+    }
+    return void (await interaction.showModal(casinoReopenModal(cur.reason)));
+  }
+  if (section === "casino" && action === "baseline") {
+    return void (await interaction.showModal(
+      casinoBaselineModal(services.ether.pool(), services.ledger.lastTransactionId()),
+    ));
+  }
+  if (section === "casino" && action === "rerecover") {
+    // 起動時の復旧（S1〜S12）をもう一度通す（PR7・レビュー指摘）。
+    // `recovery_halt` の唯一の出口。所有元の申告が読めるようになっていれば、
+    // 収集 → 掃除 → 予約解放 → 全点検 → S12 まで進んで open に戻る。
+    // 読めないままなら再び recovery_halt のままで、資金は1 Ld も動かない
+    // 古い管理パネル／保存済み custom ID でも、押された時点の状態で必ず拒否する。
+    // `recoverCasino()` は通常起動にも使うため、営業中などから呼ぶと復旧処理が
+    // 資金・予約・状態へ触れてしまう。ここは recovery_halt 専用の入口にする。
+    const cur = services.casinoStatus.current();
+    if (cur.status !== "recovery_halt") {
+      await interaction.reply({
+        content: `❌ いまは ${CASINO_STATUS_LABEL[cur.status] ?? cur.status} です。復旧の再実行は「起動時の復旧が未完了」のときだけ実行できます。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const r = recoverCasino({
+      db: services.db,
+      status: services.casinoStatus,
+      integrity: services.casinoIntegrity,
+      chipTx: services.chipTx,
+      escrow: services.escrow,
+      reservations: services.reservations,
+      registry: services.recoveryRegistry,
+      events: services.events,
+    });
+    const detail = [
+      `維持 ${r.keptHolders}件 / 孤児返金 ${r.refundedSessions}件 / 隔離 ${r.quarantined}件`,
+      `不一致 ${r.mismatched.length}件 / 返金失敗 ${r.failedSessions.length}件`,
+      r.releasedReservations.released ? `予約解放 ${r.releasedReservations.count}件` : "予約解放は未実行",
+    ].join("\n");
+    await interaction.reply({
+      content:
+        r.outcome === "opened"
+          ? `🟢 復旧が完了し、賭場を開けました。\n${detail}`
+          : `❌ 復旧は完了しませんでした（${r.outcome}）。\n${r.reason ?? ""}\n${detail}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (section === "casino" && action === "recheck") {
+    // 全点検（Land台帳 + 検算A〜D）。通れば検算停止だけを解ける（人が直したあとに押す想定）
+    const report = services.casinoIntegrity.runFull();
+    const cur = services.casinoStatus.current();
+    if (cur.status === "integrity_halt") {
+      services.casinoStatus.reopenAfterIntegrity("再点検で全点検が通った", interaction.user.id, report.ok);
+    } else if (!report.ok && cur.status === "open") {
+      services.casinoStatus.haltForIntegrity(CasinoIntegrity.describeFailure(report), interaction.user.id);
+    }
+    return void (await interaction.update(casinoHome(services)));
+  }
 
   // ── 調整 ──
   if (section === "adjust" && !action) return void (await interaction.update(adjustHome()));
@@ -381,6 +494,68 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
   const section = parts[1];
   const action = parts[2];
 
+  if (section === "casino" && action === "refund-user") {
+    const targetId = interaction.fields.getTextInputValue("user_id").trim();
+    if (!/^\d{15,22}$/.test(targetId)) {
+      await interaction.reply({ content: "Discord利用者IDを入力してください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    try {
+      const saga = services.chipFlow.createRefundSaga({
+        id: interaction.id,
+        requestedBy: `user:${interaction.user.id}`,
+        scope: "user",
+        userId: targetId,
+      });
+      await interaction.reply({ ...casinoRefundConfirm(saga), flags: MessageFlags.Ephemeral });
+    } catch (error) {
+      await interaction.reply({ content: `❌ ${error instanceof Error ? error.message : "緊急返還案を作成できません"}`, flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+  if (section === "casino" && action === "prehold-recover") {
+    const sessionId = interaction.fields.getTextInputValue("session_id").trim();
+    try {
+      const ok = recoverFrozenChinchiroPrehold(services, sessionId, `user:${interaction.user.id}`);
+      await interaction.reply({ content: ok ? `✅ 凍結チンチロ預託を帳簿どおり返還しました: ${sessionId}` : `⛔ 返還に失敗したため凍結を維持しました: ${sessionId}`, flags: MessageFlags.Ephemeral });
+    } catch (error) {
+      await interaction.reply({ content: `❌ ${error instanceof Error ? error.message : "手動復旧できません"}`, flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+
+  if (section === "casino" && ["remit-draft", "remit-approve", "remit-execute", "bailout-draft", "bailout-approve", "bailout-execute"].includes(action ?? "")) {
+    const actor = `user:${interaction.user.id}`;
+    try {
+      if (action === "remit-draft") {
+        const key = interaction.fields.getTextInputValue("key").trim();
+        const fuku = Number(interaction.fields.getTextInputValue("fuku").replaceAll(",", "").trim());
+        const period = interaction.fields.getTextInputValue("period").trim() || undefined;
+        // 納付率・最低運転資金は運営が確定した開業設定だけを使う（操作者は入力できない）
+        const draft = services.remittance.draftFromConfiguration(key, actor, { fukuReserve: fuku, period });
+        await interaction.reply({ content: `Remittance draft ${draft.key}: ${fmtLd(draft.amount)} / plan ${draft.planHash}`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (action === "bailout-draft") {
+        const key = interaction.fields.getTextInputValue("key").trim();
+        const amount = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
+        const reason = interaction.fields.getTextInputValue("reason").trim();
+        const shortage = JSON.parse(interaction.fields.getTextInputValue("shortage")) as Record<string, unknown>;
+        const draft = services.remittance.bailoutDraft(key, amount, reason, shortage, actor);
+        await interaction.reply({ content: `Bailout draft ${draft.key}: ${fmtLd(draft.amount)} / plan ${draft.planHash}`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const key = interaction.fields.getTextInputValue("key").trim();
+      const row = action === "remit-approve" || action === "bailout-approve"
+        ? services.remittance.approve(key, actor)
+        : services.remittance.execute(key, actor);
+      await interaction.reply({ content: `${row.kind} ${row.key}: ${row.status}`, flags: MessageFlags.Ephemeral });
+    } catch (error) {
+      await interaction.reply({ content: `Finance operation rejected: ${error instanceof Error ? error.message : "unknown error"}`, flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+
   if (section === "tpanel" && action === "create") {
     const id = interaction.fields.getTextInputValue("id").trim().toLowerCase();
     const name = interaction.fields.getTextInputValue("name").trim();
@@ -532,6 +707,14 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
     }
     return;
   }
+  if (section === "casino" && (action === "fund" || action === "settle")) {
+    // 停止中は運営卓からも資金を動かさない（資金層でも弾かれるが、理由を先に見せる）
+    const deny = services.casinoStatus.denyMessage();
+    if (deny) {
+      await interaction.reply({ content: `⛔ ${deny}`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+  }
   if (section === "casino" && action === "fund") {
     const amt = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
     if (!Number.isInteger(amt) || amt <= 0) {
@@ -556,9 +739,19 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
   if (section === "casino" && action === "settle") {
     const raw = interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim();
     const held = services.casino.houseBalance();
-    const amt = raw === "" ? held : Number(raw);
+    // 進行中ゲームの最大配当は予約で押さえてある。その裏付けは精算できない（PR5）。
+    // **金額未入力でも全残高ではなく精算可能額だけ**を対象にする
+    const settleable = services.ether.settleableBalance(HOUSE_HOLDER);
+    const reserved = held - settleable;
+    const amt = raw === "" ? settleable : Number(raw);
     if (!Number.isInteger(amt) || amt <= 0) {
-      await interaction.reply({ content: held === 0 ? "胴元残高が 0 です。" : "金額は正の整数で。", flags: MessageFlags.Ephemeral });
+      const why =
+        held === 0
+          ? "胴元残高が 0 です。"
+          : settleable === 0
+            ? `いま精算できる額は 0 です（残高 ${fmtEther(held)} は全額が進行中ゲームの予約 ${fmtEther(reserved)} の裏付けです）。`
+            : "金額は正の整数で。";
+      await interaction.reply({ content: why, flags: MessageFlags.Ephemeral });
       return;
     }
     try {
@@ -569,11 +762,72 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       });
     } catch (e) {
       const msg =
-        e instanceof EtherError && e.code === "ERR_INSUFFICIENT_ETHER"
-          ? `胴元のエテルが足りません（${fmtEther(held)}）。`
-          : "処理に失敗しました。";
+        e instanceof EtherError && e.code === "ERR_RESERVED_FUNDS"
+          ? `進行中ゲームの予約 ${fmtEther(reserved)} は精算できません（いま精算できるのは ${fmtEther(settleable)} まで）。`
+          : e instanceof EtherError && e.code === "ERR_INSUFFICIENT_ETHER"
+            ? `胴元の利用可能額が足りません（${fmtEther(held)}）。`
+            : "処理に失敗しました。";
       await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
     }
+    return;
+  }
+  if (section === "casino" && action === "halt") {
+    const reason = interaction.fields.getTextInputValue("reason").trim();
+    services.casinoStatus.haltManually(reason, interaction.user.id);
+    await interaction.reply({
+      content: `⛔ 賭場を止めました（${reason}）。以降、チップが動く操作はすべて理由付きで断ります。`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (section === "casino" && action === "reopen") {
+    const reason = interaction.fields.getTextInputValue("reason").trim();
+    const cur = services.casinoStatus.current();
+    // 開ける前に必ず全点検する。NG のまま開けると壊れた帳簿の上に取引を積むことになる
+    const report = services.casinoIntegrity.runFull();
+    if (!report.ok) {
+      await interaction.reply({
+        content: `❌ 全点検が通らないので開けられません。\n${CasinoIntegrity.describeFailure(report)}`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    // 状態ごとの経路で開ける（メンテ終了の導線で検算停止を開けたりできない）
+    const result =
+      cur.status === "manual_halt"
+        ? services.casinoStatus.reopenFromManualHalt(reason, interaction.user.id)
+        : cur.status === "integrity_halt"
+          ? services.casinoStatus.reopenAfterIntegrity(reason, interaction.user.id, report.ok)
+          : cur.status === "maintenance"
+            ? services.casinoStatus.endMaintenance(reason, interaction.user.id)
+            : // opening_reset を含む残りはここへ落ちる。開業準備中は正式開業初期化（PR12）の
+              // 完了処理からしか open にできない
+              { ok: false, reason: `いまは ${cur.status} なので、この導線では開けられない` };
+    await interaction.reply({
+      content: result.ok ? `🟢 賭場を開けました（${reason}）。` : `❌ ${result.reason}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (section === "casino" && action === "baseline") {
+    if (interaction.fields.getTextInputValue("confirm").trim() !== "確定") {
+      await interaction.reply({ content: "❌ 「確定」と入力されなかったので何もしていません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const poolLand = services.ether.pool();
+    const ledgerTxId = services.ledger.lastTransactionId();
+    const version = services.chipTx.currentVersion();
+    const placed = services.chipTx.establishOpeningLandBaseline(version, poolLand, ledgerTxId);
+    services.events.log("casino_opening_land_baseline", {
+      actor: interaction.user.id,
+      payload: { version, poolLand, fromLedgerTxId: ledgerTxId, placed },
+    });
+    await interaction.reply({
+      content: placed
+        ? `📌 版 ${version} の検算B基準を確定しました（準備プール ${fmtLd(poolLand)} / 境界取引 #${ledgerTxId}）。これ以降の準備口座の出入りを監査します。`
+        : "既に基準が入っているため、何も変更していません。",
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
   if (section === "dept" && action === "create") {
@@ -817,9 +1071,9 @@ const NUMBER_KEYS: Array<[string, string]> = [
   ["room_recruit_expire_hours", "蜜月募集の失効（時間）"],
   ["room_recruit_refund", "蜜月失効の返金"],
   ["bump_reward", "bump報酬（Land）"],
-  ["ether_rate_base", "エテル初期レート（1Land=?◈）"],
+  ["ether_rate_base", "旧制度の固定比率（互換設定）"],
   ["ether_fuku_scale", "福の重みスケール"],
-  ["vip_price", "VIP月会費（エテル）"],
+  ["vip_price", "VIP月会費（Land）"],
   ["vip_days", "VIP日数"],
   ["vip_bet_cap_mult", "VIP賭け上限倍率"],
   ["confession_body_retention_days", "トート本文の保持日数"],
@@ -994,7 +1248,6 @@ const PANEL_KIND_CHOICES: Array<[string, string]> = [
   ["entry", "入城申請"],
   ["rank", "ランク確認"],
   ["shop", "公式ショップ"],
-  ["exchange", "マモンの両替所"],
   ["takutate", "卓建て"],
   ["ticket_return", "出戻り申請"],
   ["ticket_consult", "個別相談"],
@@ -1777,36 +2030,311 @@ async function deptRemove(
 
 // ---- 賭場（マモン）サブパネル ----
 
-const CASINO_DEPT_KEY = "賭博場";
+/** 賭博場の部署キーは core の唯一の定数を使う（開業出資・納付・補填と同じ口座へ揃える） */
+const CASINO_DEPT_KEY = CASINO_DEPARTMENT_KEY;
+
+/**
+ * 状態ごとの「開ける」ボタンの文言。ここに無い状態は開けるボタンを出さない。
+ * 経路を1本ずつに分けるのは、検算NGで止めた賭場を「メンテ終了」の導線から開けさせないため。
+ *
+ * `opening_reset` は**意図的に無い**。正式開業初期化は R0 停止 → R1〜R11 初期化 →
+ * R12 同一トランザクション内の検算 → R13 成功時のみ COMMIT → R14 open という一続きの処理で、
+ * 全点検A〜Dが通っただけで通常の再開導線から解除してよいものではない（PR12 で実装する）。
+ * `open` / `startup_check` も同様にボタンを出さない。
+ */
+const REOPEN_LABEL: Partial<Record<string, string>> = {
+  manual_halt: "営業再開",
+  integrity_halt: "検算通過で再開",
+  maintenance: "改装終了",
+};
+
+/** 稼働状態の見出し（運営が一目で「いま開いているか・なぜ閉じたか」を掴めるように） */
+const CASINO_STATUS_LABEL: Record<string, string> = {
+  open: "🟢 営業中",
+  startup_check: "🟡 点検中",
+  integrity_halt: "🔴 停止（検算NG）",
+  recovery_halt: "🔴 停止（起動時の復旧が未完了）",
+  manual_halt: "🔴 停止（手動）",
+  maintenance: "🔧 改装中",
+  opening_reset: "🚧 開業準備中",
+};
 
 function casinoHome(services: Services) {
   const ether = services.ether;
   const casino = services.casino;
   const dept = services.departments.get(CASINO_DEPT_KEY);
   const deptBal = dept ? services.departments.balanceOf(CASINO_DEPT_KEY) : null;
+  const status = services.casinoStatus.current();
+  // 起動時・営業再開・再点検・計器盤はすべて同じ全点検（Land台帳 + 検算A〜D）を使う
+  const report = services.casinoIntegrity.runFull();
+  const checkLines = [
+    `　${report.ledger.ok ? "✅" : "⚠️"} Land台帳: ${report.ledger.detail}`,
+    ...report.checks.map((c) => `　${c.ok ? "✅" : "⚠️"} 検算${c.id}（${c.name}）: ${c.detail}`),
+  ];
   const embed = new EmbedBuilder()
     .setTitle("🎰 マモンの賭場 運営卓")
-    .setColor(0xc9a227)
+    .setColor(status.status === "open" ? 0xc9a227 : 0x991b1b)
     .setDescription(
       [
+        `**稼働状態**: ${CASINO_STATUS_LABEL[status.status] ?? status.status}`,
+        `　理由: ${status.reason}（${status.changedBy}）`,
+        "",
         `**胴元残高**: ${fmtEther(casino.houseBalance())} （テーブルリミットの原資）`,
         `**ジャックポット積立**: ${fmtEther(casino.jackpotPool())}`,
-        `**為替レート**: 1 Ld = ${ether.rate().toFixed(2)} ◈`,
-        `**準備プール**: ${fmtLd(ether.pool())} ／ **発行エテル**: ${fmtEther(ether.outstanding())}`,
+        `**チップ比率**: 1 チップ = 1 Ld`,
+        `**準備プール**: ${fmtLd(ether.pool())} ／ **発行済みチップ**: ${fmtEther(ether.outstanding())}`,
         "",
         dept
           ? `**部署「${CASINO_DEPT_KEY}」残高**: ${fmtLd(deptBal!)}`
           : `⚠️ 部署「${CASINO_DEPT_KEY}」が未作成です。先に 部署→作成 で作ってください。`,
-        "",
-        "・**資金投入**: 賭博場口座の Land を胴元エテルに（フェアレート・手数料なし）",
-        "・**売上精算**: 胴元エテルを賭博場口座の Land に戻す（フェアレート）",
       ].join("\n"),
-    );
+    )
+    .addFields({ name: report.ok ? "▸ 全点検（正常）" : "▸ 全点検（**要対応**）", value: checkLines.join("\n"), inline: false });
+  // 停止中は資金投入・売上精算も押せない（押しても資金層で弾かれるが、UIでも見せる）
+  const closed = status.status !== "open";
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("mgmt:casino:fund").setLabel("資金投入").setEmoji("🔸").setStyle(ButtonStyle.Primary).setDisabled(!dept),
-    new ButtonBuilder().setCustomId("mgmt:casino:settle").setLabel("売上精算").setEmoji("🔹").setStyle(ButtonStyle.Secondary).setDisabled(!dept),
+    new ButtonBuilder().setCustomId("mgmt:casino:fund").setLabel("資金投入").setEmoji("🔸").setStyle(ButtonStyle.Primary).setDisabled(!dept || closed),
+    new ButtonBuilder().setCustomId("mgmt:casino:settle").setLabel("売上精算").setEmoji("🔹").setStyle(ButtonStyle.Secondary).setDisabled(!dept || closed),
+    new ButtonBuilder().setCustomId("mgmt:casino:recheck").setLabel("再点検").setEmoji("🔎").setStyle(ButtonStyle.Secondary),
+    // 復旧未完了は「再点検して開ける」種類の停止ではない。S4〜S12 をやり直す専用導線（PR7）
+    ...(status.status === "recovery_halt"
+      ? [
+          new ButtonBuilder()
+            .setCustomId("mgmt:casino:rerecover")
+            .setLabel("復旧を再実行")
+            .setEmoji("♻️")
+            .setStyle(ButtonStyle.Primary),
+        ]
+      : []),
+    ...(closed
+      ? []
+      : [new ButtonBuilder().setCustomId("mgmt:casino:halt").setLabel("営業停止").setEmoji("⛔").setStyle(ButtonStyle.Danger)]),
+    // 開ける経路は状態ごとに1本ずつ。generic な「営業再開」で全部開けられないようにする
+    ...(REOPEN_LABEL[status.status]
+      ? [
+          new ButtonBuilder()
+            .setCustomId("mgmt:casino:reopen")
+            .setLabel(REOPEN_LABEL[status.status]!)
+            .setEmoji("🟢")
+            .setStyle(ButtonStyle.Success),
+        ]
+      : []),
   );
-  return { embeds: [embed], components: [row, backButton()] };
+  const rows: ActionRowBuilder<ButtonBuilder>[] = [row];
+  // 緊急返還は通常の従業員操作に混ぜない。handleAdminButton の isAdmin 再検証と
+  // saga.requested_by の照合の両方を通る、管理者専用の確認付き入口にする。
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("mgmt:casino:refund-user").setLabel("緊急返還（個人）").setEmoji("🚨").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("mgmt:casino:refund-all").setLabel("緊急返還（全利用者）").setEmoji("🚨").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("mgmt:casino:prehold-recover").setLabel("凍結チンチロを手動返還").setEmoji("🧾").setStyle(ButtonStyle.Secondary),
+    ),
+  );
+  // 検算Bの基準が無い版（PR2 以前から動いていたDB）だけ、明示的な基準確定を出す
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("mgmt:casino:finance").setLabel("Finance").setStyle(ButtonStyle.Secondary),
+    ),
+  );
+  if (services.chipTx.openingLandBaseline() === null) {
+    rows.push(
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("mgmt:casino:baseline")
+          .setLabel("検算Bの基準を確定（移行）")
+          .setEmoji("📌")
+          .setStyle(ButtonStyle.Danger),
+      ),
+    );
+  }
+  return { embeds: [embed], components: [...rows, backButton()] };
+}
+
+function casinoFinanceHome(services: Services) {
+  const realized = services.remittance.cumulativeProfit();
+  const undisposed = services.remittance.cumulativeUndisposedProfit();
+  const reserved = services.reservations.totalReserved();
+  const house = services.casino.houseBalance();
+  const config = services.remittance.configuration();
+  const embed = new EmbedBuilder()
+    .setTitle("Casino finance: durable approval workflow")
+    .setColor(0xc9a227)
+    .setDescription([
+      `Realised P&L: ${fmtLd(realized)}`,
+      `Undisposed profit: ${fmtLd(undisposed)}`,
+      `House: ${fmtEther(house)} / reserved obligations: ${fmtEther(reserved)}`,
+      config
+        ? `Configured rate: ${config.remittanceBps} bps / minimum working capital: ${fmtLd(config.minimumWorkingCapital)}`
+        : "⚠️ Opening configuration is not set; no remittance draft can be created yet.",
+      "All actions below are durable draft → a different approver → exactly-once execute.",
+      "A stale plan is rejected; no insufficient-house path creates an automatic bailout.",
+    ].join("\n"));
+  return {
+    embeds: [embed],
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("mgmt:casino:remit-draft").setLabel("Create remittance draft").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("mgmt:casino:remit-approve").setLabel("Approve remittance").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("mgmt:casino:remit-execute").setLabel("Execute remittance").setStyle(ButtonStyle.Danger),
+      ),
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("mgmt:casino:bailout-draft").setLabel("Create bailout draft").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("mgmt:casino:bailout-approve").setLabel("Approve bailout").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("mgmt:casino:bailout-execute").setLabel("Execute bailout").setStyle(ButtonStyle.Danger),
+      ),
+      backButton(),
+    ],
+  };
+}
+
+function casinoFinanceKeyModal(action: string, title: string) {
+  return new ModalBuilder()
+    .setCustomId(`mgmt:casino:${action}`)
+    .setTitle(title)
+    .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
+      new TextInputBuilder().setCustomId("key").setLabel("Durable draft key").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(120),
+    ));
+}
+
+function casinoRemittanceDraftModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:remit-draft")
+    .setTitle("Create remittance draft")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("key").setLabel("Draft key").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(120)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("fuku").setLabel("Fuku reserve").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("period").setLabel("Period YYYY-MM (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(7)),
+    );
+}
+
+function casinoBailoutDraftModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:bailout-draft")
+    .setTitle("Create bailout draft")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("key").setLabel("Draft key").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(120)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("amount").setLabel("Requested amount").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("reason").setLabel("Reason").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("shortage").setLabel("Shortage JSON").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1_000)),
+    );
+}
+
+function casinoRefundUserModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:refund-user")
+    .setTitle("緊急返還（個人）")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("user_id")
+          .setLabel("返還対象のDiscord利用者ID")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(22),
+      ),
+    );
+}
+
+function casinoPreholdRecoveryModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:prehold-recover")
+    .setTitle("凍結チンチロ預託の手動復旧")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("session_id").setLabel("凍結したsession ID（帳簿確認後）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(180),
+      ),
+    );
+}
+
+function casinoRefundConfirm(saga: RefundSaga) {
+  const target = saga.scope === "all" ? "全利用者" : `<@${saga.targetUserId}>`;
+  return {
+    content: [
+      `🚨 **緊急返還の実行前確認**`,
+      `対象: ${target} / **${saga.targetCount}人・${fmtLd(saga.targetTotal)}**`,
+      "自由チップだけをLandへ返還します。卓・板の預け中資金、JP、救済、free-spin claimは対象外です。",
+      "進行中ゲーム・金銭処理・検算停止中は実行しません。",
+    ].join("\n"),
+    embeds: [],
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId(`mgmt:casino:refund-execute:${saga.id}`).setLabel("この内容で実行").setEmoji("✅").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`mgmt:casino:refund-cancel:${saga.id}`).setLabel("やめる").setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  };
+}
+
+function casinoRefundResult(saga: RefundSaga) {
+  const completed = saga.targets.filter((target) => target.status === "completed");
+  const failed = saga.targets.filter((target) => target.status !== "completed");
+  return {
+    content:
+      saga.status === "completed"
+        ? `✅ 緊急返還が完了しました。対象 ${completed.length}人 / 確認額 ${fmtLd(saga.targetTotal)}。`
+        : `⛔ 緊急返還は完了していません（${saga.failure ?? saga.status}）。返還済み ${completed.length}人 / 未完了 ${failed.length}人。`,
+    embeds: [],
+    components: saga.status === "completed"
+      ? [backButton()]
+      : [
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder().setCustomId(`mgmt:casino:refund-execute:${saga.id}`).setLabel("安全確認後に再開").setStyle(ButtonStyle.Danger),
+          ),
+          backButton(),
+        ],
+  };
+}
+
+function casinoHaltModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:halt")
+    .setTitle("賭場を止める")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("reason")
+          .setLabel("理由（利用者と監査ログに残る）")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(200),
+      ),
+    );
+}
+
+function casinoReopenModal(currentReason: string) {
+  // Discord の TextInput label は45文字まで。いまの停止理由は placeholder へ逃がす
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:reopen")
+    .setTitle("賭場を開ける")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("reason")
+          .setLabel("再開の理由（監査ログに残る）")
+          .setPlaceholder(`いまの停止理由: ${currentReason}`.slice(0, 100))
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(200),
+      ),
+    );
+}
+
+/** 検算Bの基準確定（移行操作）。押した人と時点が監査に残る */
+function casinoBaselineModal(poolLand: number, ledgerTxId: number) {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:baseline")
+    .setTitle("検算Bの基準を確定する")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("confirm")
+          .setLabel("確認のため「確定」と入力")
+          .setPlaceholder(`準備プール ${poolLand} Ld / 境界取引 #${ledgerTxId} を出発点にします`.slice(0, 100))
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(10),
+      ),
+    );
 }
 
 function casinoFundModal() {
@@ -1826,7 +2354,7 @@ function casinoSettleModal() {
     .setTitle("売上精算（胴元→賭博場口座）")
     .addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("amount").setLabel("精算するエテル（空欄=全額）").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(15),
+        new TextInputBuilder().setCustomId("amount").setLabel("精算する自由チップ（空欄=全額）").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(15),
       ),
     );
 }

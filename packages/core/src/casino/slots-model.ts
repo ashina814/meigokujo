@@ -68,8 +68,25 @@ export const DOUBLE_PAYOUTS: Readonly<Record<string, number>> = {
   マモン: 10,
 };
 
+/**
+ * 1スピンの最大払戻倍率（元金込み）。配当表から導く（写さない）。
+ * 胴元債務モデル（`liability.ts`）と bot 側のテーブルリミット判定が読む。
+ */
+export const SLOT_MAX_PAYOUT_MULT = Math.max(...Object.values(TRIPLE_PAYOUTS), ...Object.values(DOUBLE_PAYOUTS));
+
 /** JP 積立率（毎ベットの何%を JP プールへ回すか）。積立源は胴元の取り分から */
 export const JP_CONTRIBUTION = 0.01;
+
+/**
+ * 有料スピン1回で house → jackpot へ積む額。
+ *
+ * 「毎回必ず 1 以上積む」という切り上げ規則があるので、率だけを見て計算すると
+ * 実装と債務モデルがずれる。実装（`slots.ts`）と債務モデル（`liability.ts`）が
+ * **この関数だけ**を読むようにしておく。
+ */
+export function jackpotCutFor(bet: number): number {
+  return Math.max(1, Math.floor(bet * JP_CONTRIBUTION));
+}
 /** JP 当選時に払い出す割合（残りは次回シードとして残す） */
 export const JP_WIN_SHARE = 0.5;
 /** スキャッター何個でフリースピン獲得か */

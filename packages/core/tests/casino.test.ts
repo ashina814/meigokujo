@@ -23,10 +23,10 @@ function setup() {
   departments.upsert("賭博場", "賭博場", null);
   ledger.transfer({ from: TREASURY, to: deptAccount("賭博場"), amount: 100_000, type: "adjust", actor: "t", approvedBy: "t", idempotencyKey: "seed:dept" });
   ether.fundFromAccount(deptAccount("賭博場"), 100_000, HOUSE_HOLDER, "seed:house");
-  // プレイヤー a: 10,000 Land → 100,000 ◈
+  // プレイヤー a: 100,000 Land → 100,000 ◈（PR8: 1:1）
   ledger.ensureAccount("user:a", "user");
-  ledger.transfer({ from: TREASURY, to: "user:a", amount: 10_000, type: "initial", actor: "t", idempotencyKey: "seed:a" });
-  ether.buy("a", 10_000, "seed:buy:a");
+  ledger.transfer({ from: TREASURY, to: "user:a", amount: 100_000, type: "initial", actor: "t", idempotencyKey: "seed:a" });
+  ether.buy("a", 100_000, "seed:buy:a");
   return { db, ledger, ether, casino };
 }
 

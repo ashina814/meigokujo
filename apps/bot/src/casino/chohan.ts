@@ -12,7 +12,16 @@ import {
 import { CHOHAN_PAYOUT, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import {
+  MIN_BET,
+  acquireSeat,
+  effectiveMaxBet,
+  handleRetryPress,
+  releaseSeat,
+  sleep,
+  validateBet,
+  withHouseReservation,
+} from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -23,7 +32,6 @@ import { broadcastBigWin } from "./bigwin.js";
  * - 15秒無操作は賭け金返却
  */
 // 配当倍率は core の CHOHAN_PAYOUT を唯一の真実源として使う（表示配当表・実払戻・RTPテストが一致）
-const DICE_EMOJI: Record<number, string> = { 1: "①", 2: "②", 3: "③", 4: "④", 5: "⑤", 6: "⑥" };
 const DIE = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"] as const;
 
 function rollDice(rng: CasinoRng): [number, number] {
@@ -44,7 +52,7 @@ function paytableEmbed(): EmbedBuilder {
         "　結果画面から前回の倍額で即再挑戦できる。連勝チャレンジ用",
         "",
         "**⚖️ 福の重み / 🔥 連鎖チェーン**",
-        "　勝ちで発動（残高が多いほど奉納・連勝で倍率）",
+        "　勝ちで発動（残高が多いほど福分け積立・連勝で倍率）",
       ].join("\n"),
     );
 }
@@ -55,7 +63,7 @@ export async function playChohan(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * 2);
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "丁半");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -72,10 +80,25 @@ export async function playChohan(
   }
 }
 
+/**
+ * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
+ * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
+ */
 async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+): Promise<void> {
+  await withHouseReservation(interaction, services, "丁半", bet, interaction.id, (reservationKey) =>
+    runRoundInner(interaction, services, bet, reservationKey),
+  );
+}
+
+async function runRoundInner(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+  bet: number,
+  reservationKey: string,
 ): Promise<void> {
   const uid = interaction.user.id;
 
@@ -89,7 +112,7 @@ async function runRound(
         "**丁（偶数）** か **半（奇数）** か——15秒以内に選べ。",
       ].join("\n"),
     )
-    .setFooter({ text: `賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
+    .setFooter({ text: `賭け ${fmtEther(bet).replace(" Ld", "Ld")}` });
   const choiceRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("chohan:cho").setLabel("丁（偶数）").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("chohan:han").setLabel("半（奇数）").setStyle(ButtonStyle.Danger),
@@ -135,7 +158,7 @@ async function runRound(
           "```",
         ].join("\n"),
       )
-      .setFooter({ text: `賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
+      .setFooter({ text: `賭け ${fmtEther(bet).replace(" Ld", "Ld")}` });
   };
   for (let f = 0; f < 3; f++) {
     await reply.edit({ embeds: [shakeEmbed(f)], components: [] }).catch(() => undefined);
@@ -150,11 +173,10 @@ async function runRound(
   // 連鎖ボーナスは無効化。丁半は 50% 勝率と CHOHAN_PAYOUT=1.94 で RTP 97% だが、
   // 連鎖有効時は実効 RTP が 106% を超える回帰が実測レポートで確認された（クラッシュと同構造）。
   // お守りの消費も賭け・配当と同じグループの中（settleSolo）
-  const settled = services.casino.settleSolo(uid, "丁半", bet, rawPayout, { chain: false, operationId: interaction.id });
+  const settled = services.casino.settleSolo(uid, "丁半", bet, rawPayout, { chain: false, operationId: interaction.id, reservationKey });
   const amulet = { note: settled.amuletNote };
 
   const totalPayout = settled.payout;
-  const net = settled.net;
   const resultLabel = isCho ? "丁（偶数）" : "半（奇数）";
   const playerLabel = picked === "cho" ? "丁" : "半";
   const streakLine =
@@ -162,10 +184,10 @@ async function runRound(
       ? `${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
       : "";
   const fukuLine =
-    settled.fukuTax > 0 ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納` : "";
+    settled.fukuTax > 0 ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 福分け積立` : "";
 
   const tag = won ? "🟢 的中" : settled.net === 0 ? "⚪ 返金（お守り）" : "🔴 外れ";
-  const netStr = settled.net === 0 ? "±0 ◈" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} ◈`;
+  const netStr = settled.net === 0 ? "±0 Ld" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} Ld`;
   const bonusBits: string[] = [];
   if (streakLine) bonusBits.push(streakLine);
   if (fukuLine) bonusBits.push(fukuLine);
@@ -187,12 +209,8 @@ async function runRound(
     )
     .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
     .setFooter({
-      text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
+      text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" Ld", "Ld")}`, `賭け ${fmtEther(bet).replace(" Ld", "Ld")}`].join(" · "),
     });
-  void DICE_EMOJI;
-  void total;
-  void totalPayout;
-  void net;
 
   if (won) {
     broadcastBigWin(interaction.client, services, {
@@ -216,7 +234,7 @@ async function runRound(
       .setCustomId(`chohan:retry:${doubleBet}`)
       .setLabel(`⚡ 倍プッシュ ${doubleBet.toLocaleString()}`)
       .setStyle(ButtonStyle.Danger)
-      .setDisabled(held < doubleBet || doubleBet > MAX_BET),
+      .setDisabled(held < doubleBet || doubleBet > effectiveMaxBet(services, uid, "丁半")),
     new ButtonBuilder().setCustomId("chohan:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("chohan:quit").setLabel("🚪 退席").setStyle(ButtonStyle.Secondary),
   );
@@ -239,18 +257,16 @@ async function runRound(
       return;
     }
     if (btn.customId.startsWith("chohan:retry:")) {
-      collector.stop("retry");
-      const retryBet = Number(btn.customId.split(":")[2]);
-      if (retryBet < MIN_BET || retryBet > MAX_BET) return;
-      await btn.deferUpdate();
-      releaseSeat(uid);
-      if (acquireSeat(uid)) {
-        try {
-          await runRound(btn, services, retryBet);
-        } finally {
-          releaseSeat(uid);
-        }
-      }
+      // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
+      // 断るなら collector を止めない ＝ 押し直せる
+      await handleRetryPress({
+        services,
+        btn,
+        collector,
+        game: "丁半",
+        betRaw: Number(btn.customId.split(":")[2]),
+        run: (bet) => runRound(btn, services, bet),
+      });
     }
   });
   collector.on("end", async (_c, reason) => {
