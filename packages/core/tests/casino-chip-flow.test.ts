@@ -15,11 +15,19 @@ registerDefaultTxTypes();
 function setup() {
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
-  const chips = new ChipLedger(db, ledger, new EventLog(db));
-  const flow = new CasinoChipFlow(db, chips, new EventLog(db));
+  const events = new EventLog(db);
+  const chips = new ChipLedger(db, ledger, events);
+  const flow = new CasinoChipFlow(db, chips, events);
   for (const id of ["alice", "bob"]) {
     ledger.ensureAccount(`user:${id}`, "user");
-    ledger.transfer({ from: TREASURY, to: `user:${id}`, amount: 1_000, type: "initial", actor: "test", idempotencyKey: `seed:${id}` });
+    ledger.transfer({
+      from: TREASURY,
+      to: `user:${id}`,
+      amount: 1_000,
+      type: "initial",
+      actor: "test",
+      idempotencyKey: `seed:${id}`,
+    });
   }
   return { db, ledger, chips, flow };
 }
@@ -28,7 +36,12 @@ describe("PR10 自動預入・自由チップ返還", () => {
   it("不足額だけを1:1で預け、同じ操作の再試行で二重預入しない", () => {
     const ctx = setup();
     ctx.chips.deposit("alice", 40, "seed:chips");
-    expect(ctx.flow.ensureFreeChips("alice", 100, "spin-1")).toMatchObject({ required: 100, freeBefore: 40, deposited: 60, freeAfter: 100 });
+    expect(ctx.flow.ensureFreeChips("alice", 100, "spin-1")).toMatchObject({
+      required: 100,
+      freeBefore: 40,
+      deposited: 60,
+      freeAfter: 100,
+    });
     expect(ctx.flow.ensureFreeChips("alice", 100, "spin-1")).toMatchObject({ deposited: 60, freeAfter: 100 });
     expect(ctx.ledger.balanceOf("user:alice")).toBe(900);
     ctx.db.close();
@@ -50,41 +63,127 @@ describe("PR10 自動預入・自由チップ返還", () => {
     ctx.db.close();
   });
 
-  it("永続アクティビティで無操作者だけを返し、失敗者がいても後続を止めない", () => {
+  it("永続アクティビティで無操作者だけを返し、進行中予約の利用者は呼出側の指定なしでも除外する", () => {
     const ctx = setup();
     ctx.chips.deposit("alice", 100, "seed:a");
     ctx.chips.deposit("bob", 100, "seed:b");
     ctx.flow.touch("alice", 10);
-    ctx.flow.touch("bob", 999);
-    const r = ctx.flow.redeemInactive(100, "idle");
-    expect(r.redeemed.map((x) => x.userId)).toEqual(["alice"]);
+    ctx.flow.touch("bob", 10);
+    ctx.db.prepare(
+      "INSERT INTO casino_house_reservations (key,amount,game,user_id,created_at) VALUES ('active:bob',100,'slots','bob',0)",
+    ).run();
+
+    const result = ctx.flow.redeemInactive(100, "idle");
+    expect(result.redeemed.map((entry) => entry.userId)).toEqual(["alice"]);
+    expect(result.skipped).toContain("bob");
     expect(ctx.chips.balanceOf("alice")).toBe(0);
     expect(ctx.chips.balanceOf("bob")).toBe(100);
     ctx.db.close();
   });
 
-  it("域外操作確認票は本人だけが期限内に一度だけ実行権を取得でき、承認前は資金を動かさない", () => {
+  it("域外確認は承認前に動かさず、固定した自由チップを返した後に同じoperation IDを一度だけ再開する", () => {
     const ctx = setup();
-    const row = ctx.flow.createExternalConfirmation({ id: "c1", userId: "alice", operationKind: "shop", operationId: "op1", requiredLand: 100, expiresAt: Math.floor(Date.now() / 1000) + 60 });
-    expect(row.status).toBe("pending");
+    ctx.chips.deposit("alice", 250, "seed:external");
+    const confirmation = ctx.flow.createExternalConfirmation({
+      id: "c1",
+      userId: "alice",
+      operationKind: "shop",
+      operationId: "same-op",
+      requiredLand: 100,
+      expiresAt: Math.floor(Date.now() / 1000) + 60,
+    });
+    expect(confirmation).toMatchObject({ status: "pending", chipAmount: 250 });
+    expect(ctx.chips.balanceOf("alice")).toBe(250);
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(750);
+
+    let calls = 0;
+    const first = ctx.flow.executeExternalConfirmation("c1", "alice", (operationId) => {
+      calls += 1;
+      expect(operationId).toBe("same-op");
+      return "done";
+    });
+    expect(first).toBe("done");
+    expect(calls).toBe(1);
     expect(ctx.chips.balanceOf("alice")).toBe(0);
-    expect(() => ctx.flow.beginExternalConfirmation("c1", "bob")).toThrow();
-    expect(ctx.flow.beginExternalConfirmation("c1", "alice").status).toBe("executing");
-    expect(() => ctx.flow.beginExternalConfirmation("c1", "alice")).toThrow();
-    expect(ctx.flow.completeExternalConfirmation("c1", "alice")).toBe(true);
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(1_000);
+    expect(() => ctx.flow.executeExternalConfirmation("c1", "alice", () => "again")).toThrow();
+    expect(() => ctx.flow.executeExternalConfirmation("c1", "bob", () => "other")).toThrow();
     ctx.db.close();
   });
 
-  it("域外確認は本人だけが保存済みoperation IDで再開でき、完了後・他人・古い操作を拒否する", () => {
+  it("域外操作本体が失敗しても返還を二重実行せず、同じoperation IDで再開できる", () => {
     const ctx = setup();
-    ctx.flow.createExternalConfirmation({ id: "c2", userId: "alice", operationKind: "shop", operationId: "same-op", requiredLand: 100, expiresAt: Math.floor(Date.now() / 1000) + 60 });
-    expect(ctx.flow.executeExternalConfirmation("c2", "alice", (operationId) => operationId)).toBe("same-op");
-    expect(() => ctx.flow.executeExternalConfirmation("c2", "alice", () => "again")).toThrow();
-    expect(() => ctx.flow.executeExternalConfirmation("c2", "bob", () => "other")).toThrow();
+    ctx.chips.deposit("alice", 200, "seed:external-retry");
+    ctx.flow.createExternalConfirmation({
+      id: "c2",
+      userId: "alice",
+      operationKind: "shop",
+      operationId: "stable-op",
+      requiredLand: 100,
+      expiresAt: Math.floor(Date.now() / 1000) + 60,
+    });
+
+    expect(() => ctx.flow.executeExternalConfirmation("c2", "alice", () => {
+      throw new Error("outside operation failed");
+    })).toThrow("outside operation failed");
+    expect(ctx.chips.balanceOf("alice")).toBe(0);
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(1_000);
+
+    expect(ctx.flow.executeExternalConfirmation("c2", "alice", (operationId) => operationId)).toBe("stable-op");
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(1_000);
+    expect(ctx.flow.externalConfirmation("c2")?.status).toBe("completed");
     ctx.db.close();
   });
 
-  it("緊急返還は対象人数・額を先に固定し、エスクローを含めず、saga再開でも一度だけ完了する", () => {
+  it("域外確認は進行中予約がある利用者に作成せず、確認後の残高変化も拒否する", () => {
+    const ctx = setup();
+    ctx.chips.deposit("alice", 100, "seed:external-block");
+    ctx.db.prepare(
+      "INSERT INTO casino_house_reservations (key,amount,game,user_id,created_at) VALUES ('active:alice',100,'slots','alice',0)",
+    ).run();
+    expect(() => ctx.flow.createExternalConfirmation({
+      id: "active",
+      userId: "alice",
+      operationKind: "shop",
+      operationId: "op-active",
+      requiredLand: 50,
+      expiresAt: Math.floor(Date.now() / 1000) + 60,
+    })).toThrow("進行中");
+    ctx.db.prepare("DELETE FROM casino_house_reservations").run();
+
+    ctx.flow.createExternalConfirmation({
+      id: "stale",
+      userId: "alice",
+      operationKind: "shop",
+      operationId: "op-stale",
+      requiredLand: 50,
+      expiresAt: Math.floor(Date.now() / 1000) + 60,
+    });
+    ctx.chips.deposit("alice", 1, "after-confirmation");
+    expect(() => ctx.flow.executeExternalConfirmation("stale", "alice", () => undefined)).toThrow("変わっています");
+    expect(ctx.chips.balanceOf("alice")).toBe(101);
+    ctx.db.close();
+  });
+
+  it("緊急返還はdraftの対象人数・額を固定し、確認後に一人でも残高が変われば全件を動かさない", () => {
+    const ctx = setup();
+    ctx.chips.deposit("alice", 100, "seed:a");
+    ctx.chips.deposit("bob", 200, "seed:b");
+    const draft = ctx.flow.createRefundSaga({ id: "refund-stale", requestedBy: "admin", scope: "all" });
+    expect(draft).toMatchObject({ status: "draft", targetCount: 2, targetTotal: 300 });
+
+    ctx.chips.deposit("alice", 1, "after-draft");
+    const blocked = ctx.flow.executeRefundSaga("refund-stale", "admin");
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.failure).toContain("残高が変化");
+    expect(ctx.chips.freeChips("alice")).toBe(101);
+    expect(ctx.chips.freeChips("bob")).toBe(200);
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(899);
+    expect(ctx.ledger.balanceOf("user:bob")).toBe(800);
+    ctx.db.close();
+  });
+
+  it("緊急返還は固定額を返し、クラッシュ後のsaga再開でも同じgroupを再生して一度だけ完了する", () => {
     const ctx = setup();
     ctx.chips.deposit("alice", 100, "seed:a");
     ctx.chips.deposit("bob", 200, "seed:b");
@@ -93,13 +192,12 @@ describe("PR10 自動預入・自由チップ返還", () => {
     );
     const draft = ctx.flow.createRefundSaga({ id: "refund-1", requestedBy: "admin", scope: "all" });
     expect(draft).toMatchObject({ status: "draft", targetCount: 2, targetTotal: 270 });
-    expect(ctx.chips.freeChips("alice")).toBe(70);
+
     expect(ctx.flow.executeRefundSaga("refund-1", "admin", { activeGameUsers: () => ["alice"] }).status).toBe("blocked");
     expect(ctx.chips.freeChips("alice")).toBe(70);
 
-    // DB commit後にsagaの完了記録だけ失われたクラッシュを模す。
-    // 同じgroup keyのreplayにより、再開しても二重にLandを返さない。
-    ctx.flow.redeemFreeChips("alice", "emergency:refund-1:alice", "緊急返還");
+    // 資金groupだけcommitし、saga target更新前に落ちた状態を再現する。
+    ctx.flow.redeemExactFreeChips("alice", 70, "emergency:refund-1:alice", "緊急返還");
     const resumed = ctx.flow.executeRefundSaga("refund-1", "admin");
     expect(resumed.status).toBe("completed");
     expect(ctx.chips.freeChips("alice")).toBe(0);
@@ -114,7 +212,12 @@ describe("PR10 自動預入・自由チップ返還", () => {
   it("緊急返還は金銭group中・検算停止中・指定外の実行者を拒否する", () => {
     const ctx = setup();
     ctx.chips.deposit("alice", 100, "seed:a");
-    const draft = ctx.flow.createRefundSaga({ id: "refund-2", requestedBy: "admin", scope: "user", userId: "alice" });
+    const draft = ctx.flow.createRefundSaga({
+      id: "refund-2",
+      requestedBy: "admin",
+      scope: "user",
+      userId: "alice",
+    });
     expect(() => ctx.flow.executeRefundSaga(draft.id, "staff")).toThrow();
     expect(ctx.flow.executeRefundSaga(draft.id, "admin", { integrityBlocked: () => true }).status).toBe("blocked");
     expect(ctx.chips.freeChips("alice")).toBe(100);
