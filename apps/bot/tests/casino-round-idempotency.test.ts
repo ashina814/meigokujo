@@ -3,7 +3,7 @@ import {
   Casino,
   ChipTx,
   Escrow,
-  EtherExchange,
+  ChipLedger,
   EventLog,
   HOUSE_HOLDER,
   FreeSpins,
@@ -34,7 +34,7 @@ function setup(rng: CasinoRng) {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
   const items = new Items(db);
   const casino = new Casino(db, ether, events, { items });
   const escrow = new Escrow(db, ether, events);

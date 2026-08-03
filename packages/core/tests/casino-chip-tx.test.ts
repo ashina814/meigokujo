@@ -4,7 +4,7 @@ import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
 import { Casino, JACKPOT_HOLDER, RELIEF_HOLDER } from "../src/casino/service.js";
-import { EtherExchange, ETHER_ESCROW, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, ETHER_ESCROW, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { Escrow } from "../src/casino/escrow.js";
 import { Daily } from "../src/casino/daily.js";
 import { Vip } from "../src/casino/vip.js";
@@ -27,7 +27,7 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
   const casino = new Casino(db, ether, events);
   const escrow = new Escrow(db, ether, events);
   return { db, ledger, events, chipTx, ether, casino, escrow };
