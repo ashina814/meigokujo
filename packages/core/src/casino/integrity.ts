@@ -146,6 +146,26 @@ export class CasinoIntegrity {
     return snapshot.deferred();
   }
 
+  /**
+   * **起動時の前検（Land台帳 + 検算A・B のみ）**。正本 §8.2 の S2・S3 に対応する。
+   *
+   * ここで C（エスクロー）と D（系全体）を見ないのは、**それらが落ちている状態こそ
+   * 復旧が直しにいく対象**だから。孤児残高や帳簿不一致は検算C を落とすので、
+   * 全点検を前検に使うと「掃除するべき状態を理由に掃除を中止する」ことになる。
+   *
+   * A（記録と残高）と B（準備金）は掃除では直らない種類の壊れ方なので、
+   * ここで NG なら以降のステップを実行してはいけない。
+   */
+  runStartupPrecheck(): CasinoIntegrityReport {
+    const snapshot = this.db.transaction((): CasinoIntegrityReport => {
+      const ledger = this.checkLedger();
+      const checks = [this.checkA(), this.checkB()];
+      const failed = checks.filter((c) => !c.ok).map((c) => c.id);
+      return { ok: ledger.ok && failed.length === 0, ledger, checks, failed, checkedAt: now() };
+    });
+    return snapshot.deferred();
+  }
+
   /** 停止理由の1行（監査通知・状態の reason に入れる） */
   static describeFailure(report: CasinoIntegrityReport): string {
     const parts: string[] = [];

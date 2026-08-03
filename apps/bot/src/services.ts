@@ -31,6 +31,8 @@ import {
   isPlayerHolder,
   FreeSpins,
   HouseReservations,
+  RecoveryRegistry,
+  recoverCasino,
   Daily,
   Items,
   Stocks,
@@ -147,10 +149,17 @@ export function buildServices() {
   const takutate = new Takutate(db, events);
   const casinoIntegrity = new CasinoIntegrity(db, ledger, ether, escrow);
   // 起動時: 全点検 → 通ったときだけ掃除 → 掃除後にもう一度全点検 → 開ける
-  runCasinoStartup(casinoStatus, casinoIntegrity, chipTx, events, () => sweepCasinoOnBoot(markets, escrow, reservations));
+  // 起動・復旧（正本 §8.2 S1〜S9, S12）。**所有元が「生きている預託」を自分で申告する**。
+  // 板だけを登録し、競馬は登録しない（永続テーブルが無く、再起動でレースごと消えるので
+  // その預託は孤児として返金するのが正しい）。PR20 で対人卓を同じ形で足す。
+  const recoveryRegistry = new RecoveryRegistry();
+  recoveryRegistry.register({ type: "market", listLiveEscrowHolders: () => markets.liveEscrowHolders() });
+  logRecovery(
+    recoverCasino({ db, status: casinoStatus, integrity: casinoIntegrity, chipTx, escrow, reservations, registry: recoveryRegistry, events }),
+  );
   // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;
@@ -158,123 +167,75 @@ export function buildServices() {
 
 export type Services = ReturnType<typeof buildServices>;
 
-/** 起動時の掃除（未精算の板とエスクローの返金）。`runMaintenance` の中からだけ呼ばれる */
-function sweepCasinoOnBoot(markets: Markets, escrow: Escrow, reservations: HouseReservations): void {
-  // ソロゲームの債務予約を全解放（正本 §8.2 S9）。ソロの進行はプロセス内状態なので、
-  // 再起動後に進行中のものは存在しない。件数と総額は releaseAll が events へ残す
-  const released = reservations.releaseAll("bot 起動");
-  if (released.count > 0) {
-    console.log(`[casino] 起動時に胴元債務予約 ${released.count}件（計 ${released.total.toLocaleString("ja-JP")}◈）を解放`);
-  }
-  const marketSweep = markets.refundAllPending("system:startup");
-  if (marketSweep.refunded > 0) {
-    console.log(`[market] 起動時に未精算板 ${marketSweep.refunded}/${marketSweep.total}件 を返金＆void 化`);
-  }
-  if (marketSweep.failed.length > 0) {
-    // underfunded/overfunded/mismatch などで返金に失敗した板は frozen に変更済み。
-    // frozen 板は新規ベットを受け付けず、帳簿とエスクロー残高を保持したまま手動調査を待つ。
-    // escrow.sweepAll() は frozen 板を孤児として隔離しない（所有者情報が casino_market_bets に残るため）。
-    console.warn(
-      `[market] 起動時 refund 失敗 ${marketSweep.failed.length}件 → frozen へ変更（帳簿・残高を保持し手動調査）: ${marketSweep.failed
-        .map((f) => `#${f.id}(${f.error})`)
-        .join(", ")}`,
-    );
-  }
-  // 起動時にセッション型ゲーム（対人・競馬・丁半・PvPポーカー等）の預かり残をセッション単位で返金
-  const swept = escrow.sweepAll("system:startup");
-  if (swept.refundedUsers > 0) {
-    console.log(
-      `[escrow] 起動時に未精算エスクロー ${swept.refundedSessions}/${swept.totalSessions}卓・${swept.refundedUsers}人分（計 ${swept.refundedTotal.toLocaleString("ja-JP")}◈）を返金`,
-    );
-  }
-  if (swept.failed.length > 0) {
-    // 帳簿と保有者残高が乖離して返金できなかったセッション。house 補填せず帳簿を保持した。要調査
-    console.warn(
-      `[escrow] 返金失敗セッション ${swept.failed.length}件（他セッションは正常返金・Bot 起動は継続）: ${swept.failed
-        .map((f) => `${f.sessionId}(帳簿${f.expected}/保有${f.actual})`)
-        .join(", ")}`,
-    );
-  }
-  if (swept.orphans > 0) {
-    // 帳簿と保有者残高が乖離した孤児残高。house へ吸い上げず隔離した。要調査
-    console.warn(
-      `[escrow] 孤児残高 ${swept.orphans}件 (計 ${swept.orphanTotal.toLocaleString("ja-JP")}◈) を sys:escrow:quarantine へ隔離。監査ログを確認して手動対応してください。`,
-    );
-  }
-}
-
 /**
- * 起動時の手順（仕様書 S1〜S2 / 実装計画 PR2）。
+ * 起動・復旧の結果をログへ出す（PR7）。
  *
- * ```
- * 全点検（Land台帳 + 検算A〜D）
- *   → 通ったときだけ、許可された掃除（未精算の板・エスクローの返金）
- *   → 掃除のあとにもう一度 全点検
- *   → 通れば startup_check だけを解除して開ける
- * ```
- *
- * 掃除より**先に**点検するのは、壊れた帳簿の上で自動返金を走らせないため。
- * 人が止めている状態（手動停止・改装中・開業準備中）では**資金を1 Ld も動かさず**、
- * 検算NGを見つけても状態を `integrity_halt` で上書きしない（止めた理由がすり替わる）。
- * 見つけた不整合は別途 events と監査ログに残す。
+ * 掃除の中身は core の `recoverCasino()` が持つ。ここは「何が起きたか」を運営が
+ * ログで追えるようにするだけで、判断は一切しない。
  */
-function runCasinoStartup(
-  status: CasinoStatus,
-  integrity: CasinoIntegrity,
-  chipTx: ChipTx,
-  events: EventLog,
-  sweep: () => void,
-): void {
-  const held = status.current();
-  const preflight = integrity.runFull();
-  if (!preflight.ok) recordIntegrityFailure(events, preflight, "preflight");
-
-  if (isHumanHeld(held.status)) {
-    // 人が止めている＝掃除も再開もしない。点検結果だけ記録して起動を続ける
+function logRecovery(r: ReturnType<typeof recoverCasino>): void {
+  const reservations = r.releasedReservations.released
+    ? `予約解放${r.releasedReservations.count}件`
+    : "予約解放は未実行";
+  const summary =
+    `維持${r.keptHolders}件 / 孤児返金${r.refundedSessions}件(${r.refundedTotal.toLocaleString("ja-JP")}◈) / ` +
+    `隔離${r.quarantined}件 / 不一致${r.mismatched.length}件 / 返金失敗${r.failedSessions.length}件 / ${reservations}`;
+  switch (r.outcome) {
+    case "opened":
+      console.log(`[賭場] 起動時の復旧を完了し、営業を開けました（${summary}）`);
+      break;
+    case "halted":
+      console.error(`[賭場] 起動時の復旧で停止しました: ${r.reason}（${summary}）`);
+      break;
+    case "source_failed":
+      // 所有元の申告が取れなかった＝掃除も再開もしていない。営業は開けない（PR7）。
+      // 通常の「再点検」では開かない専用状態（recovery_halt）にしてある
+      console.error(
+        `[賭場] 生存中エスクローの所有元を確認できなかったため、掃除・予約解放とも実行せず停止しました: ${r.reason}
+` +
+          "　→ 原因を直したうえで /管理 → 賭場 → 「復旧を再実行」を押してください（再点検では開きません）",
+      );
+      break;
+    case "refund_failed":
+      // 孤児返金が技術的に失敗したセッションが残っている＝復旧未完了。営業は開けない（PR7監査）。
+      // 帳簿・残高は維持済みなので postflight は通り得るが、それでも recovery_halt にしてある
+      console.error(
+        `[賭場] 孤児返金の技術失敗が残っているため営業を再開しませんでした: ${r.reason}（${summary}）
+` +
+          "　→ 原因を直したうえで /管理 → 賭場 → 「復旧を再実行」を押してください（再点検では開きません）",
+      );
+      break;
+    case "exception_failed":
+      // S1〜S12の途中で予期しない例外＝どこまで安全に完了したか保証できない（PR7監査・二次レビュー）。
+      // 必ずrecovery_haltにしてあるので、原因を直したうえで復旧を再実行するしかない
+      console.error(
+        `[賭場] 起動時の復旧中に予期しない例外が発生したため停止しました: ${r.reason}（${summary}）
+` +
+          "　→ 原因を直したうえで /管理 → 賭場 → 「復旧を再実行」を押してください（再点検では開きません）",
+      );
+      break;
+    case "held":
+      console.warn(`[賭場] 人が止めている状態のため復旧を行いません（${r.reason}）`);
+      break;
+    case "manual":
+      console.warn(`[賭場] ${r.reason}。運営卓の「再点検」で開けてください`);
+      break;
+  }
+  if (r.mismatched.length > 0) {
+    // 帳簿と保有者残高が合わないセッション。返金も隔離もせず凍結してある。要調査
     console.warn(
-      `[賭場] ${held.status} のため起動時の掃除を行いません（理由: ${held.reason}）。` +
-        (preflight.ok ? "" : ` 検算NGも見つかっています: ${CasinoIntegrity.describeFailure(preflight)}`),
+      `[escrow] 帳簿不一致 ${r.mismatched.length}件（返金も隔離もせず凍結・賭場全体も停止）: ` +
+        r.mismatched.map((m) => `${m.sessionId}(帳簿${m.expected}/保有${m.actual})`).join(", "),
     );
-    return;
   }
-  if (!preflight.ok) {
-    const reason = CasinoIntegrity.describeFailure(preflight);
-    status.haltForIntegrity(reason);
-    console.error(`[賭場] 起動時の点検に失敗したため、掃除も行わず賭場を停止しました: ${reason}`);
-    return;
-  }
-  if (held.status === "integrity_halt") {
-    // 検算は通っているが、人がまだ確認していない。掃除も再開も自動ではしない
-    console.warn("[賭場] integrity_halt のままです。検算は通っているので、運営卓の「再点検」で開けてください");
-    return;
-  }
-
-  status.beginStartupCheck();
-  // 掃除は停止中でも資金を動かす唯一の経路。actor 名ではなくこの区間だけが許可される
-  chipTx.runMaintenance("起動時の未精算返金", sweep);
-
-  const postflight = integrity.runFull();
-  if (!postflight.ok) {
-    const reason = CasinoIntegrity.describeFailure(postflight);
-    recordIntegrityFailure(events, postflight, "postflight");
-    status.haltForIntegrity(reason);
-    console.error(`[賭場] 起動時の掃除後の点検に失敗したため賭場を停止しました: ${reason}`);
-    return;
-  }
-  if (status.finishStartupCheck()) {
-    console.log("[賭場] 起動時の点検（Land台帳 + 検算A〜D）は正常。営業を開けました");
+  if (r.failedSessions.length > 0) {
+    // 孤児返金の技術失敗。他の復旧は続けたが、失敗が起動ログから消えてはいけない（PR7）
+    console.error(
+      `[escrow] 孤児返金に失敗 ${r.failedSessions.length}件（帳簿・残高は維持）: ` +
+        r.failedSessions
+          .map((f) => `${f.sessionId}(帳簿${f.expected}/保有${f.actual}): ${f.error}`)
+          .join(" / "),
+    );
   }
 }
 
-/** 検算NGを状態とは別に記録する（人が止めている状態でも取りこぼさないため） */
-function recordIntegrityFailure(events: EventLog, report: ReturnType<CasinoIntegrity["runFull"]>, phase: string): void {
-  events.log("casino_integrity_failed", {
-    actor: "system:integrity",
-    payload: {
-      phase,
-      ledgerOk: report.ledger.ok,
-      failed: report.failed,
-      detail: CasinoIntegrity.describeFailure(report),
-    },
-  });
-}

@@ -16,6 +16,15 @@ export const CASINO_STATUSES = [
   "startup_check",
   /** 検算NGによる自動停止。解除は支配人の明示操作のみ */
   "integrity_halt",
+  /**
+   * **起動時の復旧が完了しなかった**ことによる自動停止（PR7・レビュー指摘）。
+   *
+   * `integrity_halt` と分けてあるのは、直し方が違うから。
+   * 検算NGは「全点検が通れば開けてよい」が、復旧未完了は
+   * 「所有元を確認していない・孤児掃除をしていない・予約解放をしていない」状態なので、
+   * A〜D がたまたま通っても開けてはいけない。**復旧をやり直して S12 まで通す**しかない。
+   */
+  "recovery_halt",
   /** 支配人が手で止めた */
   "manual_halt",
   /** 改修・メンテナンス */
@@ -57,6 +66,7 @@ export interface CasinoStatusRow {
 const DENY_MESSAGE: Record<Exclude<CasinoStatusValue, "open">, string> = {
   startup_check: "賭場は帳簿を点検中だ。少し待て。",
   integrity_halt: "賭場は帳簿の食い違いで閉めている。マモンが数え直すまで待て。",
+  recovery_halt: "賭場は開店前の点検が終わっていない。マモンが片付けるまで待て。",
   manual_halt: "賭場は今日は閉めている。",
   maintenance: "賭場は改装中だ。",
   opening_reset: "賭場は開業準備中だ。",
@@ -159,7 +169,9 @@ export class CasinoStatus {
    */
   beginStartupCheck(changedBy = "system:startup"): boolean {
     const cur = this.current();
-    if (cur.status !== "open" && cur.status !== "startup_check") return false;
+    // `recovery_halt` からは入れる。**復旧のやり直しだけが唯一の出口**なので、
+    // ここを塞ぐと二度と開けられなくなる（PR7）
+    if (cur.status !== "open" && cur.status !== "startup_check" && cur.status !== "recovery_halt") return false;
     this.set("startup_check", "起動時の点検", changedBy);
     return true;
   }
@@ -178,7 +190,30 @@ export class CasinoStatus {
   haltForIntegrity(reason: string, changedBy = "system:integrity"): boolean {
     const cur = this.current();
     if (HUMAN_HELD.has(cur.status)) return false;
+    // `recovery_halt` は「S4〜S12 が未完了」という復旧義務そのものを表す。
+    // 復旧をやり直したときの S2/S3 で検算NGを見つけても、通常の integrity_halt に
+    // すり替えると、帳簿を直しただけで通常の再点検から開けられてしまう。
+    // 停止理由へ検算結果を追記しつつ、復旧を S12 まで通す義務は保持する。
+    if (cur.status === "recovery_halt") {
+      this.set("recovery_halt", `${cur.reason}\n検算NG: ${reason}`, changedBy);
+      return true;
+    }
     this.set("integrity_halt", reason, changedBy);
+    return true;
+  }
+
+  /**
+   * **起動時の復旧が完了しなかった**ことによる自動停止（PR7・レビュー指摘）。
+   *
+   * `integrity_halt` と分けるのは、通常の「再点検して開ける」導線から開けさせないため。
+   * 所有元を確認できていない状態では、A〜D がたまたま通っても
+   * 「生存中の預託が分からない・孤児掃除も予約解放もしていない」ままなので開けてはいけない。
+   * 出口は `recoverCasino()` をもう一度通して S12 まで到達することだけ。
+   */
+  haltForRecovery(reason: string, changedBy = "system:recovery"): boolean {
+    const cur = this.current();
+    if (HUMAN_HELD.has(cur.status)) return false;
+    this.set("recovery_halt", reason, changedBy);
     return true;
   }
 
@@ -215,6 +250,9 @@ export class CasinoStatus {
    */
   reopenAfterIntegrity(reason: string, changedBy: string, integrityOk: boolean): TransitionResult {
     if (!integrityOk) return { ok: false, reason: "検算が通っていないので開けられない" };
+    // `recovery_halt` はここを通らない（`reopen` が from 不一致で断る）。
+    // 復旧未完了は「A〜D が通ったから開けてよい」種類の停止ではないので、
+    // 運営卓の「再点検」ではなく「復旧を再実行」から S4〜S12 をやり直す（PR7）
     return this.reopen("integrity_halt", reason, changedBy);
   }
 

@@ -23,7 +23,15 @@ import {
   UserSelectMenuBuilder,
   UserSelectMenuInteraction,
 } from "discord.js";
-import { CasinoIntegrity, deptAccount, EtherError, HOUSE_HOLDER, LedgerError, type TicketPanel } from "@meigokujo/core";
+import {
+  CasinoIntegrity,
+  deptAccount,
+  EtherError,
+  HOUSE_HOLDER,
+  LedgerError,
+  recoverCasino,
+  type TicketPanel,
+} from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
 import { ROLE_SLOT_META, ROLE_SLOT_ORDER, getRoleIds, setRoleIds, type RoleSlot } from "../church-roles.js";
 import {
@@ -191,6 +199,57 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
     return void (await interaction.showModal(
       casinoBaselineModal(services.ether.pool(), services.ledger.lastTransactionId()),
     ));
+  }
+  if (section === "casino" && action === "rerecover") {
+    // 起動時の復旧（S1〜S12）をもう一度通す（PR7・レビュー指摘）。
+    // `recovery_halt` の唯一の出口。所有元の申告が読めるようになっていれば、
+    // 収集 → 掃除 → 予約解放 → 全点検 → S12 まで進んで open に戻る。
+    // 読めないままなら再び recovery_halt のままで、資金は1 Ld も動かない
+    // 古い管理パネル／保存済み custom ID でも、押された時点の状態で必ず拒否する。
+    // `recoverCasino()` は通常起動にも使うため、営業中などから呼ぶと復旧処理が
+    // 資金・予約・状態へ触れてしまう。ここは recovery_halt 専用の入口にする。
+    const cur = services.casinoStatus.current();
+    if (cur.status !== "recovery_halt") {
+      await interaction.reply({
+        content: `❌ いまは ${CASINO_STATUS_LABEL[cur.status] ?? cur.status} です。復旧の再実行は「起動時の復旧が未完了」のときだけ実行できます。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    // recoverCasino() 自体は S1〜S12 の予期しない例外を内部で recovery_halt へ変換するが、
+    // 呼び出しそのもの（deps の組み立て等）で万一例外が出ても interaction を無応答で
+    // 終わらせない・成功したかのような表示を出さないための防御（PR7監査・二次レビュー）。
+    try {
+      const r = recoverCasino({
+        db: services.db,
+        status: services.casinoStatus,
+        integrity: services.casinoIntegrity,
+        chipTx: services.chipTx,
+        escrow: services.escrow,
+        reservations: services.reservations,
+        registry: services.recoveryRegistry,
+        events: services.events,
+      });
+      const detail = [
+        `維持 ${r.keptHolders}件 / 孤児返金 ${r.refundedSessions}件 / 隔離 ${r.quarantined}件`,
+        `不一致 ${r.mismatched.length}件 / 返金失敗 ${r.failedSessions.length}件`,
+        r.releasedReservations.released ? `予約解放 ${r.releasedReservations.count}件` : "予約解放は未実行",
+      ].join("\n");
+      await interaction.reply({
+        content:
+          r.outcome === "opened"
+            ? `🟢 復旧が完了し、賭場を開けました。\n${detail}`
+            : `❌ 復旧は完了しませんでした（${r.outcome}）。\n${r.reason ?? ""}\n${detail}`,
+        flags: MessageFlags.Ephemeral,
+      });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      await interaction.reply({
+        content: `❌ 復旧の再実行中に予期しないエラーが発生しました: ${message}\n資金・状態は変更されていない可能性がありますが、必ず現在の状態を確認してください。`,
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+    return;
   }
   if (section === "casino" && action === "recheck") {
     // 全点検（Land台帳 + 検算A〜D）。通れば検算停止だけを解ける（人が直したあとに押す想定）
@@ -1909,6 +1968,7 @@ const CASINO_STATUS_LABEL: Record<string, string> = {
   open: "🟢 営業中",
   startup_check: "🟡 点検中",
   integrity_halt: "🔴 停止（検算NG）",
+  recovery_halt: "🔴 停止（起動時の復旧が未完了）",
   manual_halt: "🔴 停止（手動）",
   maintenance: "🔧 改装中",
   opening_reset: "🚧 開業準備中",
@@ -1951,6 +2011,16 @@ function casinoHome(services: Services) {
     new ButtonBuilder().setCustomId("mgmt:casino:fund").setLabel("資金投入").setEmoji("🔸").setStyle(ButtonStyle.Primary).setDisabled(!dept || closed),
     new ButtonBuilder().setCustomId("mgmt:casino:settle").setLabel("売上精算").setEmoji("🔹").setStyle(ButtonStyle.Secondary).setDisabled(!dept || closed),
     new ButtonBuilder().setCustomId("mgmt:casino:recheck").setLabel("再点検").setEmoji("🔎").setStyle(ButtonStyle.Secondary),
+    // 復旧未完了は「再点検して開ける」種類の停止ではない。S4〜S12 をやり直す専用導線（PR7）
+    ...(status.status === "recovery_halt"
+      ? [
+          new ButtonBuilder()
+            .setCustomId("mgmt:casino:rerecover")
+            .setLabel("復旧を再実行")
+            .setEmoji("♻️")
+            .setStyle(ButtonStyle.Primary),
+        ]
+      : []),
     ...(closed
       ? []
       : [new ButtonBuilder().setCustomId("mgmt:casino:halt").setLabel("営業停止").setEmoji("⛔").setStyle(ButtonStyle.Danger)]),
