@@ -40,7 +40,7 @@ function cleanAdapters(): {
     backup: {
       backup: vi.fn(async ({ db, legacyTables }) => ({
         sqliteSha256: "a".repeat(64),
-        csv: legacyTables.map((table) => ({
+        csv: legacyTables.map((table: string) => ({
           table,
           sha256: "b".repeat(64),
           rows: (db.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).get() as { n: number }).n,
