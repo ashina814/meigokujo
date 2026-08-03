@@ -1,0 +1,54 @@
+name: Casino Diagnostic
+
+on:
+  pull_request:
+    branches: ["diagnostic/casino-ci-base"]
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests and capture logs
+        shell: bash
+        run: |
+          set +e
+          pnpm --filter @meigokujo/core test > core-test.log 2>&1
+          core_status=$?
+          pnpm --filter @meigokujo/bot test > bot-test.log 2>&1
+          bot_status=$?
+          printf 'core=%s\nbot=%s\n' "$core_status" "$bot_status" > status.txt
+          exit 0
+
+      - name: Upload diagnostic logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: casino-test-logs
+          path: |
+            core-test.log
+            bot-test.log
+            status.txt
+          if-no-files-found: error
+
+      - name: Preserve failure result
+        shell: bash
+        run: |
+          source <(sed 's/^/export /' status.txt)
+          if [ "$core" -ne 0 ] || [ "$bot" -ne 0 ]; then
+            exit 1
+          fi
