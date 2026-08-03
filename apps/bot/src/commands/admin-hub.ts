@@ -184,6 +184,13 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "casino" && !action) return void (await interaction.update(casinoHome(services)));
   if (section === "casino" && action === "fund") return void (await interaction.showModal(casinoFundModal()));
   if (section === "casino" && action === "settle") return void (await interaction.showModal(casinoSettleModal()));
+  if (section === "casino" && action === "finance") return void (await interaction.update(casinoFinanceHome(services)));
+  if (section === "casino" && action === "remit-draft") return void (await interaction.showModal(casinoRemittanceDraftModal()));
+  if (section === "casino" && action === "remit-approve") return void (await interaction.showModal(casinoFinanceKeyModal("remit-approve", "納付draftを承認")));
+  if (section === "casino" && action === "remit-execute") return void (await interaction.showModal(casinoFinanceKeyModal("remit-execute", "納付を実行")));
+  if (section === "casino" && action === "bailout-draft") return void (await interaction.showModal(casinoBailoutDraftModal()));
+  if (section === "casino" && action === "bailout-approve") return void (await interaction.showModal(casinoFinanceKeyModal("bailout-approve", "補填draftを承認")));
+  if (section === "casino" && action === "bailout-execute") return void (await interaction.showModal(casinoFinanceKeyModal("bailout-execute", "補填を実行")));
   if (section === "casino" && action === "refund-user") return void (await interaction.showModal(casinoRefundUserModal()));
   if (section === "casino" && action === "prehold-recover") return void (await interaction.showModal(casinoPreholdRecoveryModal()));
   if (section === "casino" && action === "refund-all") {
@@ -513,6 +520,38 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       await interaction.reply({ content: ok ? `✅ 凍結チンチロ預託を帳簿どおり返還しました: ${sessionId}` : `⛔ 返還に失敗したため凍結を維持しました: ${sessionId}`, flags: MessageFlags.Ephemeral });
     } catch (error) {
       await interaction.reply({ content: `❌ ${error instanceof Error ? error.message : "手動復旧できません"}`, flags: MessageFlags.Ephemeral });
+    }
+    return;
+  }
+
+  if (section === "casino" && ["remit-draft", "remit-approve", "remit-execute", "bailout-draft", "bailout-approve", "bailout-execute"].includes(action ?? "")) {
+    const actor = `user:${interaction.user.id}`;
+    try {
+      if (action === "remit-draft") {
+        const key = interaction.fields.getTextInputValue("key").trim();
+        const fuku = Number(interaction.fields.getTextInputValue("fuku").replaceAll(",", "").trim());
+        const period = interaction.fields.getTextInputValue("period").trim() || undefined;
+        // 納付率・最低運転資金は運営が確定した開業設定だけを使う（操作者は入力できない）
+        const draft = services.remittance.draftFromConfiguration(key, actor, { fukuReserve: fuku, period });
+        await interaction.reply({ content: `Remittance draft ${draft.key}: ${fmtLd(draft.amount)} / plan ${draft.planHash}`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (action === "bailout-draft") {
+        const key = interaction.fields.getTextInputValue("key").trim();
+        const amount = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
+        const reason = interaction.fields.getTextInputValue("reason").trim();
+        const shortage = JSON.parse(interaction.fields.getTextInputValue("shortage")) as Record<string, unknown>;
+        const draft = services.remittance.bailoutDraft(key, amount, reason, shortage, actor);
+        await interaction.reply({ content: `Bailout draft ${draft.key}: ${fmtLd(draft.amount)} / plan ${draft.planHash}`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const key = interaction.fields.getTextInputValue("key").trim();
+      const row = action === "remit-approve" || action === "bailout-approve"
+        ? services.remittance.approve(key, actor)
+        : services.remittance.execute(key, actor);
+      await interaction.reply({ content: `${row.kind} ${row.key}: ${row.status}`, flags: MessageFlags.Ephemeral });
+    } catch (error) {
+      await interaction.reply({ content: `Finance operation rejected: ${error instanceof Error ? error.message : "unknown error"}`, flags: MessageFlags.Ephemeral });
     }
     return;
   }
@@ -2092,6 +2131,11 @@ function casinoHome(services: Services) {
     ),
   );
   // 検算Bの基準が無い版（PR2 以前から動いていたDB）だけ、明示的な基準確定を出す
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("mgmt:casino:finance").setLabel("Finance").setStyle(ButtonStyle.Secondary),
+    ),
+  );
   if (services.chipTx.openingLandBaseline() === null) {
     rows.push(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -2104,6 +2148,75 @@ function casinoHome(services: Services) {
     );
   }
   return { embeds: [embed], components: [...rows, backButton()] };
+}
+
+function casinoFinanceHome(services: Services) {
+  const realized = services.remittance.cumulativeProfit();
+  const undisposed = services.remittance.cumulativeUndisposedProfit();
+  const reserved = services.reservations.totalReserved();
+  const house = services.casino.houseBalance();
+  const config = services.remittance.configuration();
+  const embed = new EmbedBuilder()
+    .setTitle("Casino finance: durable approval workflow")
+    .setColor(0xc9a227)
+    .setDescription([
+      `Realised P&L: ${fmtLd(realized)}`,
+      `Undisposed profit: ${fmtLd(undisposed)}`,
+      `House: ${fmtEther(house)} / reserved obligations: ${fmtEther(reserved)}`,
+      config
+        ? `Configured rate: ${config.remittanceBps} bps / minimum working capital: ${fmtLd(config.minimumWorkingCapital)}`
+        : "⚠️ Opening configuration is not set; no remittance draft can be created yet.",
+      "All actions below are durable draft → a different approver → exactly-once execute.",
+      "A stale plan is rejected; no insufficient-house path creates an automatic bailout.",
+    ].join("\n"));
+  return {
+    embeds: [embed],
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("mgmt:casino:remit-draft").setLabel("Create remittance draft").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("mgmt:casino:remit-approve").setLabel("Approve remittance").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("mgmt:casino:remit-execute").setLabel("Execute remittance").setStyle(ButtonStyle.Danger),
+      ),
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("mgmt:casino:bailout-draft").setLabel("Create bailout draft").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("mgmt:casino:bailout-approve").setLabel("Approve bailout").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("mgmt:casino:bailout-execute").setLabel("Execute bailout").setStyle(ButtonStyle.Danger),
+      ),
+      backButton(),
+    ],
+  };
+}
+
+function casinoFinanceKeyModal(action: string, title: string) {
+  return new ModalBuilder()
+    .setCustomId(`mgmt:casino:${action}`)
+    .setTitle(title)
+    .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
+      new TextInputBuilder().setCustomId("key").setLabel("Durable draft key").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(120),
+    ));
+}
+
+function casinoRemittanceDraftModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:remit-draft")
+    .setTitle("Create remittance draft")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("key").setLabel("Draft key").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(120)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("fuku").setLabel("Fuku reserve").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("period").setLabel("Period YYYY-MM (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(7)),
+    );
+}
+
+function casinoBailoutDraftModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:bailout-draft")
+    .setTitle("Create bailout draft")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("key").setLabel("Draft key").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(120)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("amount").setLabel("Requested amount").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("reason").setLabel("Reason").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500)),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId("shortage").setLabel("Shortage JSON").setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1_000)),
+    );
 }
 
 function casinoRefundUserModal() {

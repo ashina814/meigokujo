@@ -388,3 +388,4 @@ export {
   type OpeningDiscordAdapter,
   type OpeningApplyResult,
 } from "./casino/opening-reset.js";
+export { CasinoRemittance, type RemittanceStatus, type RemittanceRow } from "./casino/remittance.js";
