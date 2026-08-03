@@ -310,6 +310,50 @@ describe("入力検証（PR4監査対応）: 0・負数・小数・NaN・Infinit
     }
   });
 
+  it("winBonusCap は safe integer でなければ例外にする（マージ直前レビュー対応）", () => {
+    const badWinBonusCaps = [0.5, Number.MAX_SAFE_INTEGER + 1, 1e308, NaN, Infinity, -1];
+    for (const [name, model] of models) {
+      for (const winBonusCap of badWinBonusCaps) {
+        expect(() => model.maxHouseLiability(ctx(1_000, 0, winBonusCap)), `${name}/winBonusCap=${winBonusCap}`).toThrow(
+          LiabilityError,
+        );
+      }
+      // 境界ちょうど（MAX_SAFE_INTEGER）は「入力としては」許すが、掛け算後の結果が
+      // safe integer を超えれば ERR_BET_OVERFLOW で拒否される（下の別テストで検証）。
+      // ここでは winStreak=0・小さい bet の組み合わせで、入力自体は拒否されないことだけ見る。
+      expect(() => model.maxHouseLiability(ctx(1_000, 0, Number.MAX_SAFE_INTEGER))).toThrow(LiabilityError);
+    }
+  });
+
+  it("winStreak は safe integer でなければ例外にする", () => {
+    const badWinStreaks = [0.5, Number.MAX_SAFE_INTEGER + 1, 1e308, NaN, Infinity, -1, -Infinity];
+    for (const [name, model] of models) {
+      for (const winStreak of badWinStreaks) {
+        expect(() => model.maxHouseLiability(ctx(1_000, winStreak)), `${name}/winStreak=${winStreak}`).toThrow(
+          LiabilityError,
+        );
+      }
+    }
+  });
+
+  it("通常の winBonusCap=3,000 は例外にせず有限の safe integer を返す", () => {
+    for (const [name, model] of models) {
+      const value = model.maxHouseLiability(ctx(1_000, 0, 3_000));
+      expect(Number.isSafeInteger(value), name).toBe(true);
+    }
+  });
+
+  it("計算結果が safe integer を超える組み合わせ（巨大 bet × 巨大 winBonusCap）は ERR_BET_OVERFLOW で拒否する", () => {
+    // bet 自体は MAX_SAFE_LIABILITY_BET 以下で許容範囲でも、
+    // winBonusCap に極端な safe integer 上限を足すと gross が safe integer を超えうる
+    for (const [name, model] of models) {
+      expect(
+        () => model.maxHouseLiability(ctx(MAX_SAFE_LIABILITY_BET, 20, Number.MAX_SAFE_INTEGER)),
+        name,
+      ).toThrow(LiabilityError);
+    }
+  });
+
   it("不明なゲームは債務0として扱わず undefined を返す（fail-closed）", () => {
     expect(liabilityModelFor("知らないゲーム")).toBeUndefined();
     expect(liabilityModelFor("")).toBeUndefined();
@@ -322,6 +366,18 @@ describe("入力検証（PR4監査対応）: 0・負数・小数・NaN・Infinit
       expect(() => rouletteTableLiability([{ type: "even", amount: 1_000 }, { type: "single", amount }]), `amount=${amount}`).toThrow(
         LiabilityError,
       );
+    }
+  });
+
+  it("ルーレットの未知 type は even 扱いにせず例外にする（fail-closed・マージ直前レビュー対応）", () => {
+    const unknownTypes = ["unknown", "", "__proto__"];
+    for (const type of unknownTypes) {
+      const bet = { type, amount: 1_000 } as unknown as { type: "even" | "single"; amount: number };
+      expect(() => rouletteIncrementalLiability(bet), `type=${JSON.stringify(type)}`).toThrow(LiabilityError);
+      expect(
+        () => rouletteTableLiability([{ type: "even", amount: 500 }, bet]),
+        `type=${JSON.stringify(type)}`,
+      ).toThrow(LiabilityError);
     }
   });
 
