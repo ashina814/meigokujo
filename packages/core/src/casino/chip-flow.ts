@@ -92,6 +92,10 @@ export class CasinoChipFlow {
     }
   }
 
+  private hasTable(table: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table));
+  }
+
   touch(userId: string, at = now()): void {
     if (!userId) throw new Error("userId is required");
     this.db.prepare(
@@ -127,8 +131,21 @@ export class CasinoChipFlow {
 
   /** 利用者の自由チップだけをLandへ全額返す。 */
   redeemFreeChips(userId: string, operationId: string, reason: string): RedeemResult {
-    const amount = this.chips.freeChips(userId);
-    return this.redeemExactFreeChips(userId, amount, operationId, reason, false);
+    return this.chips.runGroup(
+      { groupKey: `chip:free-redeem:${userId}:${operationId}`, kind: "free_redeem", actorId: userId },
+      () => {
+        const redeemed = this.chips.freeChips(userId);
+        if (redeemed) {
+          this.chips.redeem(userId, redeemed, `chip:free-redeem:${userId}:${operationId}:land`);
+        }
+        this.touch(userId);
+        this.events.log("casino_free_chips_redeemed", {
+          actor: userId,
+          payload: { redeemed, reason, operationId },
+        });
+        return { userId, redeemed, land: redeemed, reason };
+      },
+    );
   }
 
   /**
@@ -366,6 +383,9 @@ export class CasinoChipFlow {
     expiresAt: number;
     chipAmount?: number;
   }): ExternalChipConfirmation {
+    if (this.hasActiveOwnership(input.userId)) {
+      throw new Error("進行中の勝負または預託があるため、Landへ戻して続ける操作はできません");
+    }
     const chipAmount = input.chipAmount ?? this.chips.freeChips(input.userId);
     if (
       !input.id
@@ -432,6 +452,9 @@ export class CasinoChipFlow {
       ).run(id);
       throw new Error("この確認票は期限切れです");
     }
+    if (this.hasActiveOwnership(userId)) {
+      throw new Error("進行中の勝負または預託があるため、この確認票は実行できません");
+    }
     if (this.chips.freeChips(userId) !== row.chipAmount) {
       throw new Error("賭場の自由チップ残高が確認時から変わっています");
     }
@@ -497,7 +520,7 @@ export class CasinoChipFlow {
     for (const row of rows) {
       try {
         const active = gate.activeGameUsers?.([row.userId]) ?? [];
-        if (active.includes(row.userId)) {
+        if (active.includes(row.userId) || this.hasActiveOwnership(row.userId)) {
           result.skipped.push(row.userId);
           continue;
         }
@@ -538,6 +561,37 @@ export class CasinoChipFlow {
     ).all(...params) as Array<{ userId: string }>;
   }
 
+  /**
+   * プロセス内の席だけでなく、再起動をまたぐ予約・エスクロー・板の所有記録も確認する。
+   * 呼出側がactiveGameUsersを渡し忘れても、資金の所有元が残る利用者を自動返還しない。
+   */
+  private hasActiveOwnership(userId: string): boolean {
+    if (this.hasTable("casino_house_reservations")) {
+      const reservation = this.db.prepare(
+        "SELECT 1 FROM casino_house_reservations WHERE user_id=? LIMIT 1",
+      ).get(userId);
+      if (reservation) return true;
+    }
+    if (this.hasTable("casino_escrow")) {
+      const escrow = this.db.prepare(
+        "SELECT 1 FROM casino_escrow WHERE user_id=? LIMIT 1",
+      ).get(userId);
+      if (escrow) return true;
+    }
+    if (this.hasTable("casino_market_bets") && this.hasTable("casino_markets")) {
+      const market = this.db.prepare(
+        `SELECT 1
+           FROM casino_market_bets b
+           JOIN casino_markets m ON m.id=b.market_id
+          WHERE b.user_id=?
+            AND m.status IN ('open','closed','reported','disputed','frozen')
+          LIMIT 1`,
+      ).get(userId);
+      if (market) return true;
+    }
+    return false;
+  }
+
   private globalBlockReason(gate: RefundSafetyGate): string | null {
     if (this.chips.chipTx.isActive() || gate.processingGroup?.()) return "chip_group_active";
     if (gate.integrityBlocked?.()) return "integrity_blocked";
@@ -547,6 +601,10 @@ export class CasinoChipFlow {
   private sagaStaleReason(saga: RefundSaga): string | null {
     for (const target of saga.targets) {
       if (target.status === "completed") continue;
+      const settledGroup = this.hasTable("casino_tx_groups")
+        ? this.db.prepare("SELECT 1 FROM casino_tx_groups WHERE group_key=? AND status='settled'").get(target.groupKey)
+        : undefined;
+      if (settledGroup) continue;
       const actual = this.chips.freeChips(target.userId);
       if (actual !== target.amount) {
         return `返還案作成後に残高が変化しました: ${target.userId} expected=${target.amount} actual=${actual}`;
@@ -559,9 +617,12 @@ export class CasinoChipFlow {
     const global = this.globalBlockReason(gate);
     if (global === "chip_group_active") return "金銭処理中のため緊急返還を停止しました";
     if (global === "integrity_blocked") return "検算停止中のため緊急返還を停止しました";
-    const active = gate.activeGameUsers?.(saga.targets.map((target) => target.userId)) ?? [];
-    if (active.length > 0) {
-      return `進行中ゲームの利用者がいるため緊急返還を停止しました: ${active.join(",")}`;
+    const active = new Set(gate.activeGameUsers?.(saga.targets.map((target) => target.userId)) ?? []);
+    for (const target of saga.targets) {
+      if (this.hasActiveOwnership(target.userId)) active.add(target.userId);
+    }
+    if (active.size > 0) {
+      return `進行中ゲームの利用者がいるため緊急返還を停止しました: ${[...active].join(",")}`;
     }
     return null;
   }
