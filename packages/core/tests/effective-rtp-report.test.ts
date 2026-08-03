@@ -4,7 +4,7 @@ import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { EtherExchange, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { Casino, JACKPOT_HOLDER, RELIEF_HOLDER } from "../src/casino/service.js";
 import { Items } from "../src/casino/items.js";
 import { deptAccount, Departments } from "../src/departments/service.js";
@@ -42,7 +42,7 @@ registerDefaultTxTypes();
 interface Ctx {
   db: ReturnType<typeof openDb>;
   ledger: Ledger;
-  ether: EtherExchange;
+  ether: ChipLedger;
   casino: Casino;
   items: Items;
 }
@@ -50,7 +50,7 @@ interface Ctx {
 function setup(seedHouseEther = 50_000_000, seedPlayerEther = 5_000_000): Ctx {
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
-  const ether = new EtherExchange(db, ledger, new EventLog(db));
+  const ether = new ChipLedger(db, ledger, new EventLog(db));
   const casino = new Casino(db, ether, new EventLog(db));
   const items = new Items(db);
   const departments = new Departments(db, ledger);

@@ -4,7 +4,7 @@ import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { EtherExchange, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { Casino, JACKPOT_HOLDER, RELIEF_HOLDER, chainMultiplier, fukuRate } from "../src/casino/service.js";
 import { Items, CONSUMABLES } from "../src/casino/items.js";
 import { deterministicRng } from "../src/casino/rng.js";
@@ -19,7 +19,7 @@ registerDefaultTxTypes();
 function setup() {
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
-  const ether = new EtherExchange(db, ledger, new EventLog(db));
+  const ether = new ChipLedger(db, ledger, new EventLog(db));
   const casino = new Casino(db, ether, new EventLog(db));
   const items = new Items(db);
   const departments = new Departments(db, ledger);
@@ -283,7 +283,7 @@ describe("お守り裁定シミュレーション（buy-if-not-armed 戦略を�
   function bigSetup() {
     const db = openDb(":memory:");
     const ledger = new Ledger(db);
-    const ether = new EtherExchange(db, ledger, new EventLog(db));
+    const ether = new ChipLedger(db, ledger, new EventLog(db));
     const casino = new Casino(db, ether, new EventLog(db));
     const items = new Items(db);
     const departments = new Departments(db, ledger);
