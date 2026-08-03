@@ -196,6 +196,15 @@ function logRecovery(r: ReturnType<typeof recoverCasino>): void {
           "　→ 原因を直したうえで /管理 → 賭場 → 「復旧を再実行」を押してください（再点検では開きません）",
       );
       break;
+    case "refund_failed":
+      // 孤児返金が技術的に失敗したセッションが残っている＝復旧未完了。営業は開けない（PR7監査）。
+      // 帳簿・残高は維持済みなので postflight は通り得るが、それでも recovery_halt にしてある
+      console.error(
+        `[賭場] 孤児返金の技術失敗が残っているため営業を再開しませんでした: ${r.reason}（${summary}）
+` +
+          "　→ 原因を直したうえで /管理 → 賭場 → 「復旧を再実行」を押してください（再点検では開きません）",
+      );
+      break;
     case "held":
       console.warn(`[賭場] 人が止めている状態のため復旧を行いません（${r.reason}）`);
       break;

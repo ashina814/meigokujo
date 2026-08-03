@@ -12,7 +12,15 @@ import { handleAdminButton, handleAdminModal } from "../src/commands/admin-hub.j
  * 運営卓の通常の再開導線から、全点検A〜Dが通っただけで解除できてはいけない。
  */
 
-type StatusValue = "open" | "manual_halt" | "integrity_halt" | "recovery_halt" | "maintenance" | "opening_reset";
+type StatusValue =
+  | "open"
+  | "manual_halt"
+  | "integrity_halt"
+  | "recovery_halt"
+  | "maintenance"
+  | "opening_reset"
+  | "startup_check"
+  | "__unknown__";
 
 /** 全点検が全部通っている報告（＝通常の再開ボタンなら通ってしまう条件） */
 const cleanReport = {
@@ -113,18 +121,59 @@ describe("運営卓から開業準備中は解除できない", () => {
 });
 
 describe("古い復旧再実行ボタンは recovery_halt 以外で何もしない", () => {
-  it.each(["open", "manual_halt", "maintenance", "opening_reset", "integrity_halt"] as const)(
-    "%s のときは recoverCasino を起動せず拒否する",
-    async (status) => {
-      const { services } = fakeServices(status);
-      const i = buttonInteraction("mgmt:casino:rerecover");
+  it.each([
+    "open",
+    "manual_halt",
+    "maintenance",
+    "opening_reset",
+    "integrity_halt",
+    "startup_check",
+    "__unknown__",
+  ] as const)("%s のときは recoverCasino を起動せず拒否する", async (status) => {
+    const { services } = fakeServices(status);
+    const i = buttonInteraction("mgmt:casino:rerecover");
 
-      await handleAdminButton(i, services);
+    await handleAdminButton(i, services);
 
-      // この fake Services には復旧に必要な db / escrow / reservations を入れていない。
-      // それでも例外にならず応答だけ返ることが、recoverCasino に入っていない証拠になる。
-      expect(i.reply).toHaveBeenCalledTimes(1);
-      expect(i.reply.mock.calls[0][0].content).toContain("復旧の再実行");
-    },
-  );
+    // この fake Services には復旧に必要な db / escrow / reservations を入れていない。
+    // それでも例外にならず応答だけ返ることが、recoverCasino に入っていない証拠になる。
+    expect(i.reply).toHaveBeenCalledTimes(1);
+    expect(i.reply.mock.calls[0][0].content).toContain("復旧の再実行");
+  });
+
+  it("2回連続で押しても、1回目でopenになった後の2回目は再度recoverCasinoへ入らず拒否する", async () => {
+    // current() を呼ぶたびに最新のDB状態を返す想定を模す（1回目は recovery_halt、
+    // recoverCasino相当が成功してopenになった後の2回目は open）。
+    let status: StatusValue = "recovery_halt";
+    const finishOpeningReset = () => ({ ok: true });
+    const services = {
+      casinoStatus: {
+        current: () => ({ status, reason: "テスト", changedBy: "boss", changedAt: 1 }),
+        reopenFromManualHalt: () => ({ ok: true }),
+        reopenAfterIntegrity: () => ({ ok: true }),
+        endMaintenance: () => ({ ok: true }),
+        finishOpeningReset,
+        haltForIntegrity: () => false,
+      },
+      casinoIntegrity: { runFull: () => cleanReport },
+      ether: { pool: () => 0, rate: () => 1, outstanding: () => 0 },
+      casino: { houseBalance: () => 0, jackpotPool: () => 0 },
+      departments: { get: () => ({ name: "賭博場" }), balanceOf: () => 0 },
+      chipTx: { openingLandBaseline: () => ({ poolLand: 0 }) },
+    } as unknown as Services;
+
+    // 1回目: recovery_halt として受理されようとする（この fake には db/escrow が無いため
+    // 実際の recoverCasino 呼び出しは例外になる＝ここでは受理経路に入ったことだけ確認する）
+    const i1 = buttonInteraction("mgmt:casino:rerecover");
+    await expect(handleAdminButton(i1, services)).rejects.toThrow();
+
+    // recoverCasino が（成功して）状態を open に変えたことを模す
+    status = "open";
+
+    // 2回目: 押下時点で既に open なので、再度 recoverCasino を試みず拒否する
+    const i2 = buttonInteraction("mgmt:casino:rerecover");
+    await handleAdminButton(i2, services);
+    expect(i2.reply).toHaveBeenCalledTimes(1);
+    expect(i2.reply.mock.calls[0][0].content).toContain("復旧の再実行");
+  });
 });

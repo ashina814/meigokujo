@@ -407,6 +407,47 @@ describe("孤児返金の技術失敗が結果に残る", () => {
     expect(logged).toHaveLength(1);
     expect(logged[0]!.payload_json).toContain("卓:壊れる");
     expect(logged[0]!.payload_json).toContain("送金に失敗した");
+
+    // レビュー指摘（PR7監査）: 帳簿と残高が一致したまま残るので postflight A〜D は
+    // 通り得るが、それでも「復旧未完了」として営業を再開してはいけない
+    expect(r.outcome).toBe("refund_failed");
+    expect(ctx.status.current().status).toBe("recovery_halt");
+    ctx.db.close();
+  });
+
+  it("failedSessionsが残る限り営業を再開しない。再実行では失敗分だけ再試行し、成功済みは二重返金しない", () => {
+    const ctx = setup();
+    fundUser(ctx, "alice", 30_000);
+    fundUser(ctx, "bob", 30_000);
+    ctx.escrow.hold("卓:壊れる", "alice", 5_000, "丁半", "op-1");
+    ctx.escrow.hold("卓:正常", "bob", 4_000, "丁半", "op-2");
+    ctx.registry.register({ type: "market", listLiveEscrowHolders: () => [] });
+
+    const realTransfer = ctx.ether.transfer.bind(ctx.ether);
+    ctx.ether.transfer = ((from: string, to: string, amount: number, info: never) => {
+      if (from === escrowHolderFor("卓:壊れる")) throw new Error("送金に失敗した");
+      return realTransfer(from, to, amount, info);
+    }) as typeof ctx.ether.transfer;
+
+    const first = run(ctx);
+    ctx.ether.transfer = realTransfer;
+
+    // 技術失敗が残っている限り open にしない
+    expect(first.outcome).toBe("refund_failed");
+    expect(ctx.status.current().status).toBe("recovery_halt");
+    // 正常なほうは既に返金済み
+    expect(ctx.ether.balanceOf("bob")).toBe(30_000);
+    const bobBalanceAfterFirst = ctx.ether.balanceOf("bob");
+
+    // 再実行: 今度は送金が通る。失敗していたセッションだけが再試行対象になる
+    const second = run(ctx);
+    expect(second.outcome).toBe("opened");
+    expect(second.failedSessions).toHaveLength(0);
+    expect(second.refundedSessions).toBe(1); // 「卓:壊れる」だけ（正常分の帳簿はもう無い）
+    expect(ctx.ether.balanceOf("alice")).toBe(30_000);
+    // bob は二重返金されていない
+    expect(ctx.ether.balanceOf("bob")).toBe(bobBalanceAfterFirst);
+    expect(ctx.status.current().status).toBe("open");
     ctx.db.close();
   });
 });
@@ -550,5 +591,166 @@ describe("recovery_halt は通常の再開導線から開けられない", () =>
     expect(third.refundedSessions).toBe(0);
     expect(ctx.ether.balanceOf("alice")).toBe(balanceAfter);
     ctx.db.close();
+  });
+
+  /**
+   * レビュー指摘（PR7監査）: S1（beginStartupCheck）が status を startup_check へ
+   * 書き換えたあとに postflight や不一致を見つけて `haltForIntegrity` を単純に呼ぶと、
+   * 「recovery_halt から再実行していた」事実が消えて通常の integrity_halt に化ける。
+   * そうなると通常の「再点検」（reopenAfterIntegrity）から開けてしまい、
+   * 復旧義務（S4〜S12 の再実行）が二度と要求されなくなる。
+   */
+  it("recovery_halt再実行中にpostflight不一致が見つかっても、通常のintegrity_haltへすり替えない", () => {
+    const ctx = setup();
+    fundUser(ctx, "alice", 30_000);
+    const broken = brokenSource(ctx);
+
+    // 1. source 失敗で recovery_halt になる
+    expect(run(ctx).outcome).toBe("source_failed");
+    expect(ctx.status.current().status).toBe("recovery_halt");
+
+    // 2. source は直すが、帳簿不一致を仕込む（S5照合とpostflight検算Cの両方で検出される）
+    broken.value = false;
+    ctx.escrow.hold("卓:壊れた", "alice", 5_000, "丁半", "op-1");
+    ctx.ether.runGroup({ groupKey: "test:leak2", kind: "table_refund", actorId: "t" }, () =>
+      ctx.ether.transfer(escrowHolderFor("卓:壊れた"), HOUSE_HOLDER, 1_000, { reason: "テストの細工" }),
+    );
+
+    const r = run(ctx);
+    expect(r.outcome).toBe("halted");
+    // **recovery_halt のまま**。integrity_halt へすり替わっていない
+    expect(ctx.status.current().status).toBe("recovery_halt");
+
+    // 通常の再点検経路（reopenAfterIntegrity）ではやはり開けない
+    ctx.ether.runGroup({ groupKey: "test:fix", kind: "table_hold", actorId: "t" }, () =>
+      ctx.ether.transfer(HOUSE_HOLDER, escrowHolderFor("卓:壊れた"), 1_000, { reason: "テストの後始末" }),
+    );
+    const report = ctx.integrity.runFull();
+    const reopened = ctx.status.reopenAfterIntegrity("再点検で通った", "admin", report.ok);
+    expect(reopened.ok).toBe(false);
+    expect(ctx.status.current().status).toBe("recovery_halt");
+    ctx.db.close();
+  });
+
+  it("予約テーブルが破損してtotalReserved()が失敗した場合、復旧を中途半端に開かない", () => {
+    const ctx = setup();
+    ctx.registry.register({ type: "market", listLiveEscrowHolders: () => [] });
+    // Number.MAX_SAFE_INTEGER を超える行を直接仕込む（reserve() のsafe-integer検証を経由しない破損を模す）
+    ctx.db
+      .prepare(
+        "INSERT INTO casino_house_reservations (key, amount, game, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run("corrupt", Number.MAX_SAFE_INTEGER + 2, "test", "u1", Math.floor(Date.now() / 1000));
+
+    // S9 (releaseAll → totalReserved) が例外を投げ、S12 まで到達できない
+    expect(() => run(ctx)).toThrow();
+    // 例外で止まった以上、営業は絶対に開いていない
+    expect(ctx.status.current().status).not.toBe("open");
+    ctx.db.close();
+  });
+});
+
+describe("RecoveryRegistryの入力検証（fail-closed）", () => {
+  it("空のtypeは登録を拒否する", () => {
+    const r = new RecoveryRegistry();
+    expect(() => r.register({ type: "", listLiveEscrowHolders: () => [] })).toThrow("type は空にできない");
+  });
+
+  it("空白のみのtypeは登録を拒否する", () => {
+    const r = new RecoveryRegistry();
+    expect(() => r.register({ type: "   ", listLiveEscrowHolders: () => [] })).toThrow("type は空にできない");
+  });
+
+  it("配列以外を返すsourceはfailedへ（生存holderなしと誤解しない）", () => {
+    const r = new RecoveryRegistry();
+    r.register({ type: "broken", listLiveEscrowHolders: () => "not-an-array" as unknown as string[] });
+    const live = r.liveHolders();
+    expect([...live.holders]).toEqual([]);
+    expect(live.failed).toHaveLength(1);
+    expect(live.failed[0]!.type).toBe("broken");
+  });
+
+  it("holderがstring以外の要素を含むsourceは丸ごとfailedへ（部分採用しない）", () => {
+    const r = new RecoveryRegistry();
+    r.register({
+      type: "mixed",
+      listLiveEscrowHolders: () => ["escrow:market:1", 123 as unknown as string],
+    });
+    const live = r.liveHolders();
+    // 有効に見える "escrow:market:1" も含めて一切採用しない（fail-closed）
+    expect([...live.holders]).toEqual([]);
+    expect(live.failed).toHaveLength(1);
+    expect(live.failed[0]!.type).toBe("mixed");
+  });
+
+  it("空文字のholderは丸ごとfailedへ", () => {
+    const r = new RecoveryRegistry();
+    r.register({ type: "empty-holder", listLiveEscrowHolders: () => ["escrow:market:1", ""] });
+    const live = r.liveHolders();
+    expect([...live.holders]).toEqual([]);
+    expect(live.failed.map((f) => f.type)).toEqual(["empty-holder"]);
+  });
+
+  it("空白のみのholderは丸ごとfailedへ", () => {
+    const r = new RecoveryRegistry();
+    r.register({ type: "blank-holder", listLiveEscrowHolders: () => ["escrow:market:1", "   "] });
+    const live = r.liveHolders();
+    expect([...live.holders]).toEqual([]);
+    expect(live.failed.map((f) => f.type)).toEqual(["blank-holder"]);
+  });
+
+  it("__proto__ という文字列のholderも通常の文字列として扱われる（特別扱いしない）", () => {
+    const r = new RecoveryRegistry();
+    r.register({ type: "market", listLiveEscrowHolders: () => ["__proto__", "escrow:market:1"] });
+    const live = r.liveHolders();
+    expect(live.failed).toEqual([]);
+    expect([...live.holders].sort()).toEqual(["__proto__", "escrow:market:1"].sort());
+    expect(live.holders.has("__proto__")).toBe(true);
+    // Set のプロトタイプが汚染されていない
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it("複数の登録元が重複したholderを申告してもSetで一意化される", () => {
+    const r = new RecoveryRegistry();
+    r.register({ type: "a", listLiveEscrowHolders: () => ["escrow:market:1"] });
+    r.register({ type: "b", listLiveEscrowHolders: () => ["escrow:market:1", "escrow:market:2"] });
+    const live = r.liveHolders();
+    expect([...live.holders].sort()).toEqual(["escrow:market:1", "escrow:market:2"]);
+  });
+
+  it("sourceが返した配列を後から変更しても、既に収集した結果は変わらない", () => {
+    const mutable = ["escrow:market:1"];
+    const r = new RecoveryRegistry();
+    r.register({ type: "market", listLiveEscrowHolders: () => mutable });
+    const live = r.liveHolders();
+    mutable.push("escrow:market:99");
+    mutable[0] = "tampered";
+    expect([...live.holders]).toEqual(["escrow:market:1"]);
+  });
+
+  it("登録順を変えても収集結果（holders・failed）は変わらない", () => {
+    const build = (order: "ab" | "ba") => {
+      const r = new RecoveryRegistry();
+      const regA = () => r.register({ type: "a", listLiveEscrowHolders: () => ["escrow:market:1"] });
+      const regB = () =>
+        r.register({
+          type: "b",
+          listLiveEscrowHolders: () => {
+            throw new Error("bが壊れている");
+          },
+        });
+      if (order === "ab") {
+        regA();
+        regB();
+      } else {
+        regB();
+        regA();
+      }
+      return r.liveHolders();
+    };
+    const ab = build("ab");
+    const ba = build("ba");
+    expect([...ab.holders]).toEqual([...ba.holders]);
+    expect(ab.failed).toEqual(ba.failed);
   });
 });

@@ -31,6 +31,11 @@ export class RecoveryRegistry {
   private readonly sources: RecoverySource[] = [];
 
   register(source: RecoverySource): void {
+    // type は登録の一意キーであり、失敗ログ・診断の識別子でもある。
+    // 空・空白のみは「どの登録元か分からない」ことになるので、登録自体を拒否する（fail-closed・PR7監査）
+    if (typeof source.type !== "string" || !source.type.trim()) {
+      throw new Error("RecoveryRegistry: type は空にできない");
+    }
     if (this.sources.some((s) => s.type === source.type)) {
       throw new Error(`RecoveryRegistry: 種別 ${source.type} は既に登録済み`);
     }
@@ -44,13 +49,30 @@ export class RecoveryRegistry {
   /**
    * 全登録元から生存中の保有者を集める。
    * 1つの申告が落ちても他を止めない（片方の壊れたテーブルで全部を返金させない）。
+   *
+   * **申告の中身も検証する**（PR7監査）。配列でない・要素が空/空白/string以外の
+   * holder IDを1件でも含む申告は、その登録元ぶんを丸ごと failed 扱いにする。
+   * 「一部だけ取り込んで残りを黙って捨てる」と、壊れた申告を
+   * 「生存holderなし」と誤解して孤児返金へ進めてしまいかねないため、
+   * 部分採用はせず登録元単位で all-or-nothing にする。
    */
   liveHolders(): { holders: Set<string>; failed: Array<{ type: string; error: string }> } {
     const holders = new Set<string>();
     const failed: Array<{ type: string; error: string }> = [];
     for (const s of this.sources) {
       try {
-        for (const h of s.listLiveEscrowHolders()) holders.add(h);
+        const raw = s.listLiveEscrowHolders();
+        if (!Array.isArray(raw)) {
+          throw new Error(`listLiveEscrowHolders() が配列を返さなかった: ${typeof raw}`);
+        }
+        const collected: string[] = [];
+        for (const h of raw) {
+          if (typeof h !== "string" || !h.trim()) {
+            throw new Error(`不正な holder ID: ${JSON.stringify(h)}`);
+          }
+          collected.push(h);
+        }
+        for (const h of collected) holders.add(h);
       } catch (e) {
         failed.push({ type: s.type, error: e instanceof Error ? e.message : String(e) });
       }
@@ -78,10 +100,13 @@ export interface RecoverCasinoResult {
    * - `halted`: 検算 NG で `integrity_halt`（以降を実行していない）
    * - `source_failed`: 所有元の申告が取れなかったので掃除も再開もしていない。
    *   **`recovery_halt`** にする（通常の「再点検」では開けられない・PR7 レビュー指摘）
+   * - `refund_failed`: 孤児返金が技術的に失敗したセッションが残っている（`failedSessions`）。
+   *   帳簿と保有者残高は一致したまま維持されるため postflight A〜D はたまたま通り得るが、
+   *   復旧そのものは完了していない。**`recovery_halt`** にして再実行を求める（PR7監査）
    * - `held`: 人が止めている状態なので触っていない
    * - `manual`: `integrity_halt` のまま。運営の再点検待ち
    */
-  outcome: "opened" | "halted" | "source_failed" | "held" | "manual";
+  outcome: "opened" | "halted" | "source_failed" | "refund_failed" | "held" | "manual";
   /** 実行したステップ（診断用） */
   steps: string[];
   keptHolders: number;
@@ -139,6 +164,10 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
   };
 
   const held = status.current();
+  // S1 で startup_check へ移ると `held.status` は上書きされて見えなくなる。
+  // postflight・不一致・孤児返金の技術失敗を「recovery_halt からの再実行中」に見つけたとき、
+  // 通常の integrity_halt へすり替えず recovery_halt を維持するために先に控えておく（PR7監査）。
+  const recoveringFromHalt = held.status === "recovery_halt";
 
   // S2/S3 は状態に関わらず先に走らせる。人が止めていても「壊れているか」は知りたい。
   // **前検は Land台帳 + 検算A・B だけ**（正本 §8.2）。C（エスクロー）と D（系全体）は
@@ -250,13 +279,23 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
       actor: "system:recovery",
       payload: { phase: "recover_post", ledgerOk: post.ledger.ok, failed: post.failed },
     });
-    status.haltForIntegrity(reason);
+    // S1 で startup_check へ入った時点で `held.status` は上書き済みなので、ここで単純に
+    // haltForIntegrity を呼ぶと「recovery_halt から再実行した」事実が失われ、通常の
+    // 「再点検（reopenAfterIntegrity）」で開けてしまう integrity_halt に化ける（PR7監査）。
+    // recovery_halt から再実行していたときは、その義務ごと recovery_halt を維持する。
+    if (recoveringFromHalt) {
+      status.haltForRecovery(`${held.reason}\n検算NG(復旧再実行後の全点検): ${reason}`);
+    } else {
+      status.haltForIntegrity(reason);
+    }
     return { outcome: "halted", steps, ...summary, reason };
   }
 
   // 帳簿不一致があれば、対象を凍結したうえで**賭場全体も止める**（運営判断）。
   // 正本 §6 は「検算A〜D のいずれかが NG なら integrity_halt」なので、
   // 正式開業前の段階で「1卓だけ止めて営業継続」へは緩和しない。
+  // （現状は checkC が同じ不一致を先に検出して post.ok=false になるため通常は上のブロックへ
+  // 入るが、将来 postflight の実装が変わってもここで recovery_halt を守れるよう同じ判断を残す）
   if (result.mismatched.length > 0) {
     const reason =
       `エスクロー帳簿不一致 ${result.mismatched.length}件（対象は凍結済み・返金も隔離もしていない）: ` +
@@ -265,8 +304,28 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
       actor: "system:recovery",
       payload: { steps, reason, mismatched: result.mismatched },
     });
-    status.haltForIntegrity(reason);
+    if (recoveringFromHalt) {
+      status.haltForRecovery(`${held.reason}\n${reason}`);
+    } else {
+      status.haltForIntegrity(reason);
+    }
     return { outcome: "halted", steps, ...summary, reason };
+  }
+
+  // **孤児返金が技術的に失敗したセッションが1件でも残っていれば、営業を再開しない**（PR7監査）。
+  // 帳簿・残高は一致したまま維持されるため postflight A〜D はたまたま通り得るが、
+  // 復旧そのものは完了していない。recoveringFromHalt に関わらず必ず recovery_halt にして、
+  // 「復旧を再実行」からの再試行を求める（このセッションだけが次回また対象になる）。
+  if (result.failedSessions.length > 0) {
+    const reason =
+      `孤児返金の技術失敗 ${result.failedSessions.length}件（帳簿・残高は維持・要調査）: ` +
+      result.failedSessions.map((f) => `${f.sessionId}(帳簿${f.expected}/保有${f.actual}): ${f.error}`).join(", ");
+    events.log("casino_recovery_halted", {
+      actor: "system:recovery",
+      payload: { steps, reason, failedSessions: result.failedSessions },
+    });
+    status.haltForRecovery(recoveringFromHalt ? `${held.reason}\n${reason}` : reason);
+    return { outcome: "refund_failed", steps, ...summary, reason };
   }
 
   // S12: 元の状態が startup_check のときだけ open へ戻す

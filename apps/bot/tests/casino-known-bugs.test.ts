@@ -585,6 +585,51 @@ describe("③b フリースピン権はプロセスをまたいで残る", () =>
     expect(ctx.ether.balanceOf("u1")).toBe(before + pending.totalClaim);
     ctx.db.close();
   });
+
+  /**
+   * PR7監査: 復旧が完了しなかった（＝賭場がopenでない）ときに、ClientReady 相当の
+   * resumePendingFreeSpins が pending 権利を勝手に精算してはいけない。
+   * bot層に明示チェックが無くても、chipTx の closedReason 配線（本番と同じ形）が
+   * 資金層で確実に拒否することを確認する。
+   */
+  describe("賭場が開いていない間はpending権利を勝手に精算しない", () => {
+    const cases: Array<{ name: string; apply: (status: CasinoStatus) => void }> = [
+      { name: "integrity_halt", apply: (s) => { s.haltForIntegrity("テスト停止"); } },
+      { name: "recovery_halt", apply: (s) => { s.haltForRecovery("テスト停止"); } },
+      { name: "manual_halt", apply: (s) => { s.haltManually("テスト停止", "boss"); } },
+      { name: "maintenance", apply: (s) => { s.beginMaintenance("テスト停止", "boss"); } },
+      { name: "opening_reset", apply: (s) => { s.beginOpeningReset("テスト停止", "boss"); } },
+      { name: "startup_check", apply: (s) => { s.beginStartupCheck(); } },
+    ];
+
+    for (const { name, apply } of cases) {
+      it(`${name} のときは支払わず、権利はpendingのまま・残高も不変`, () => {
+        const ctx = setup(scriptedRng([SCATTER, SCATTER, SCATTER, 0.9, 0.9, 0.9]));
+        ctx.ledger.ensureAccount("user:u1", "user");
+        seedBalance(ctx.db, "u1", 10_000);
+        seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+        seedBalance(ctx.db, JACKPOT_HOLDER, 100_000);
+        const pending = spinPaid(ctx.services, "u1", 1_000, `jp-closed-${name}`).pendingFreeSpin!;
+        const holder = ctx.freeSpins.jackpotClaimHolder(pending);
+        const beforeUser = ctx.ether.balanceOf("u1");
+        const beforeHolder = ctx.ether.balanceOf(holder);
+
+        // 本番の services.ts と同じ配線: chipTx の closedReason に casinoStatus.denyMessage を繋ぐ
+        const status = new CasinoStatus(ctx.db);
+        apply(status);
+        ctx.chipTx.setClosedReason(() => status.denyMessage());
+
+        const result = resumePendingFreeSpins(ctx.services);
+
+        expect(result.settled).toBe(0);
+        expect(result.failed).toHaveLength(1);
+        expect(ctx.freeSpins.get(pending.id)!.status).toBe("pending");
+        expect(ctx.ether.balanceOf("u1")).toBe(beforeUser);
+        expect(ctx.ether.balanceOf(holder)).toBe(beforeHolder);
+        ctx.db.close();
+      });
+    }
+  });
 });
 
 /**
