@@ -217,3 +217,110 @@ describe("opening versionのfail-closed化", () => {
     db.close();
   });
 });
+
+/**
+ * PR8監査・項目9: `runMaintenance()` によるロック迂回の棚卸し。
+ *
+ * production で `runMaintenance()` を呼ぶのは PR7 の起動復旧（`recoverCasino`）だけであること、
+ * その区間だけロックが外れ、区間を抜けたら必ず再ロックされること、
+ * body が例外を投げても深さが正しく戻ることを固定する。
+ */
+describe("runMaintenanceによるロック迂回の棚卸し", () => {
+  it("productionでrunMaintenance()を呼ぶのはrecovery.tsだけ", () => {
+    const root = fileURLToPath(new URL("../../../", import.meta.url));
+    const targets = [join(root, "apps", "bot", "src"), join(root, "packages", "core", "src")];
+    const callers: string[] = [];
+    const walk = (dir: string): void => {
+      for (const name of readdirSync(dir)) {
+        const full = join(dir, name);
+        const st = statSync(full);
+        if (st.isDirectory()) {
+          walk(full);
+          continue;
+        }
+        if (!name.endsWith(".ts")) continue;
+        const text = readFileSync(full, "utf8");
+        if (/\.runMaintenance\(/.test(text)) callers.push(full);
+      }
+    };
+    for (const t of targets) walk(t);
+    expect(callers.map((f) => f.replace(/\\/g, "/")).filter((f) => f.endsWith("casino/recovery.ts"))).toHaveLength(1);
+    expect(callers).toHaveLength(1);
+  });
+
+  it("recovery.tsは deposit/redeem/fundFromAccount/redeemToAccount を直接呼ばない", () => {
+    const src = readFileSync(new URL("../src/casino/recovery.ts", import.meta.url), "utf8");
+    expect(src).not.toMatch(/\.deposit\(/);
+    expect(src).not.toMatch(/\.redeem\(/);
+    expect(src).not.toMatch(/\.fundFromAccount\(/);
+    expect(src).not.toMatch(/\.redeemToAccount\(/);
+    expect(src).not.toMatch(/\.redeemFairToAccount\(/);
+  });
+
+  it("runMaintenance区間だけ開業ロック中でも資金移動でき、区間の外では再びロックされる", () => {
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    const chipTx = new ChipTx(db);
+    const chips = new ChipLedger(db, ledger, new EventLog(db), { chipTx, requireOpeningV1: true });
+    ledger.ensureAccount("user:a", "user");
+    ledger.transfer({ from: TREASURY, to: "user:a", amount: 1_000, type: "initial", actor: "t", idempotencyKey: "fund:a" });
+
+    // 区間の外: ロックされている
+    expect(() =>
+      chips.runGroup({ groupKey: "outside", kind: "table_refund", actorId: "system:recovery" }, () =>
+        chips.transfer(HOUSE_HOLDER, "a", 1, { reason: "区間の外" }),
+      ),
+    ).toThrow(/ERR_CASINO_OPENING_NOT_COMPLETE/);
+
+    // recovery相当: runMaintenance区間の中では同じtransferが通る（孤児返金の実体と同じ形）
+    ledger.ensureAccount(HOUSE_HOLDER, "system");
+    chips.ensureHolder(HOUSE_HOLDER);
+    db.prepare("INSERT INTO ether_balances (user_id, amount, updated_at) VALUES (?, 100, 0) ON CONFLICT(user_id) DO UPDATE SET amount = excluded.amount").run(HOUSE_HOLDER);
+    expect(chipTx.isMaintenance()).toBe(false);
+    chipTx.runMaintenance("起動時の復旧（テスト）", () => {
+      expect(chipTx.isMaintenance()).toBe(true);
+      chips.runGroup({ groupKey: "inside", kind: "table_refund", actorId: "system:recovery" }, () =>
+        chips.transfer(HOUSE_HOLDER, "a", 10, { reason: "孤児返金" }),
+      );
+    });
+    expect(chipTx.isMaintenance()).toBe(false);
+    expect(chips.balanceOf("a")).toBe(10);
+
+    // 区間を抜けたら、また同じ操作がロックされる
+    expect(() =>
+      chips.runGroup({ groupKey: "after", kind: "table_refund", actorId: "system:recovery" }, () =>
+        chips.transfer(HOUSE_HOLDER, "a", 1, { reason: "区間の後" }),
+      ),
+    ).toThrow(/ERR_CASINO_OPENING_NOT_COMPLETE/);
+    db.close();
+  });
+
+  it("runMaintenanceのbodyが例外を投げても深さは正しく戻る", () => {
+    const db = openDb(":memory:");
+    const chipTx = new ChipTx(db);
+    expect(chipTx.isMaintenance()).toBe(false);
+    expect(() =>
+      chipTx.runMaintenance("失敗するテスト", () => {
+        expect(chipTx.isMaintenance()).toBe(true);
+        throw new Error("わざと失敗させる");
+      }),
+    ).toThrow("わざと失敗させる");
+    expect(chipTx.isMaintenance()).toBe(false);
+    db.close();
+  });
+
+  it("入れ子のrunMaintenanceでも深さが正しく管理される", () => {
+    const db = openDb(":memory:");
+    const chipTx = new ChipTx(db);
+    chipTx.runMaintenance("外側", () => {
+      expect(chipTx.isMaintenance()).toBe(true);
+      chipTx.runMaintenance("内側", () => {
+        expect(chipTx.isMaintenance()).toBe(true);
+      });
+      // 内側を抜けても外側の区間はまだ続いている
+      expect(chipTx.isMaintenance()).toBe(true);
+    });
+    expect(chipTx.isMaintenance()).toBe(false);
+    db.close();
+  });
+});

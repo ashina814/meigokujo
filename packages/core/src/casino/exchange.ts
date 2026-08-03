@@ -56,7 +56,11 @@ export type ChipLedgerErrorCode =
   /** opening_version が legacy_pre_reset / opening_v1 のどちらでもない（PR8監査・ブロッカーC） */
   | "ERR_UNKNOWN_OPENING_VERSION"
   /** 正式開業（opening_v1）確定前に資金グループを開こうとした（PR8監査・ブロッカーA） */
-  | "ERR_CASINO_OPENING_NOT_COMPLETE";
+  | "ERR_CASINO_OPENING_NOT_COMPLETE"
+  /** userId/holderId/account/actor/idempotencyKey が空・空白のみ・非string（PR8監査・項目10） */
+  | "ERR_BAD_INPUT"
+  /** DB上の残高・発行総量・予約額が safe integer でない（DB破損・PR8監査・項目10） */
+  | "ERR_CORRUPTED_BALANCE";
 
 /** @deprecated `ChipLedgerErrorCode` を使うこと。名前だけの後方互換。 */
 export type EtherErrorCode = ChipLedgerErrorCode;
@@ -101,6 +105,33 @@ export interface ChipMoveInfo {
 }
 
 const now = () => Math.floor(Date.now() / 1000);
+
+/**
+ * 金額の入力検証（PR8監査・項目10）。`Number.isInteger` だけでは
+ * `Number.MAX_SAFE_INTEGER` 超の値を弾けない（浮動小数点の精度限界で整数に見えてしまう）ため、
+ * 常に正の safe integer を要求する。0・負数・NaN・Infinity・小数もここで拒否する。
+ */
+function assertSafeAmount(amount: number, field: string): void {
+  if (!Number.isSafeInteger(amount) || amount <= 0) throw new ChipLedgerError("ERR_BAD_AMOUNT", { [field]: amount });
+}
+
+/**
+ * 文字列引数の入力検証（PR8監査・項目10）。空・空白のみ・非stringを fail-closed で拒否する。
+ * `__proto__` のような特殊な文字列はここでは弾かない（SQLはbindパラメータとして扱い、
+ * オブジェクトキーとしては使わないため、通常の文字列として安全に扱ってよい）。
+ */
+function assertNonEmptyString(value: unknown, field: string): asserts value is string {
+  if (typeof value !== "string" || !value.trim()) throw new ChipLedgerError("ERR_BAD_INPUT", { [field]: value });
+}
+
+/**
+ * DBから読んだ残高・発行総量が safe integer であることを確認する（PR8監査・項目10）。
+ * DB破損で範囲外の値が入っていた場合、それを信じて計算を続けない。
+ */
+function assertSafeBalance(amount: number, field: string): number {
+  if (!Number.isSafeInteger(amount)) throw new ChipLedgerError("ERR_CORRUPTED_BALANCE", { [field]: amount });
+  return amount;
+}
 
 /**
  * 正式開業ロックを持たない基底実装（PR8監査・ブロッカーA）。
@@ -164,7 +195,7 @@ export class ChipLedgerCore {
 
   /** 準備プールの Land 残高 */
   pool(): number {
-    return this.ledger.balanceOf(this.reserveHolder());
+    return assertSafeBalance(this.ledger.balanceOf(this.reserveHolder()), "reserveAmount");
   }
   /**
    * 現在のチップ制度が使う準備口座。opening_v1 は PR12 が確定する。
