@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   Casino,
   ChipTx,
+  ChipLedger,
   Escrow,
-  EtherExchange,
   EventLog,
   HOUSE_HOLDER,
   HouseReservations,
@@ -36,7 +36,7 @@ function setup(rng: CasinoRng = scriptedRng([0.5])) {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
   const items = new Items(db);
   const reservations = new HouseReservations(db, ether, events);
   ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));

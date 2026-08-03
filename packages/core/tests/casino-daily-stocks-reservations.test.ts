@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   ChipTx,
+  ChipLedger,
   Daily,
-  EtherExchange,
   EventLog,
   HOUSE_HOLDER,
   HouseReservations,
@@ -20,7 +20,7 @@ registerDefaultTxTypes();
  * マージ直前レビュー対応: 福分け（Daily）と株式市場（Stocks）は house の生残高を見て
  * 直接支払っていた。進行中ゲームの予約（HouseReservations）を考慮しないと、
  * 「予約は取れたのに、後で settle しようとしたら house が薄くなっていて払えない」
- * という事故が起こりうる。ここでは両方とも `EtherExchange.settleableBalance()`
+ * という事故が起こりうる。ここでは両方とも `ChipLedger.settleableBalance()`
  * （house 残高 − 予約合計）だけを対象にすることを確かめる。
  */
 
@@ -29,7 +29,7 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
   const reservations = new HouseReservations(db, ether, events);
   // services.ts と同じ配線: house だけ予約合計を反映する
   ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));

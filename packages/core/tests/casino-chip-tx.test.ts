@@ -4,7 +4,7 @@ import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
 import { Casino, JACKPOT_HOLDER, RELIEF_HOLDER } from "../src/casino/service.js";
-import { EtherExchange, ETHER_ESCROW, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, ETHER_ESCROW, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { Escrow } from "../src/casino/escrow.js";
 import { Daily } from "../src/casino/daily.js";
 import { Vip } from "../src/casino/vip.js";
@@ -27,7 +27,7 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
   const casino = new Casino(db, ether, events);
   const escrow = new Escrow(db, ether, events);
   return { db, ledger, events, chipTx, ether, casino, escrow };
@@ -49,7 +49,7 @@ function fundUser(ctx: ReturnType<typeof setup>, userId: string, land: number): 
     from: TREASURY, to: `user:${userId}`, amount: land, type: "initial", actor: "t",
     idempotencyKey: `seed:user:${userId}`,
   });
-  ctx.ether.buy(userId, land, `buy:${userId}`);
+  ctx.ether.deposit(userId, land, `buy:${userId}`);
 }
 
 describe("取引明細", () => {
@@ -97,7 +97,7 @@ describe("取引明細", () => {
     const ctx = setup();
     fundUser(ctx, "alice", 5_000);
 
-    ctx.ether.sell("alice", 1_000, "sell:alice");
+    ctx.ether.redeem("alice", 1_000, "sell:alice");
 
     const row = ctx.chipTx.listByGroup("sell:alice")[0]!;
     expect(row.tx_kind).toBe("redeem");
@@ -274,7 +274,7 @@ describe("開始残高", () => {
     ctx.chipTx.captureLegacyOpening();
 
     ctx.casino.settle("alice", "スロット", 1_000, 2_500, 50, { operationId: opId() });
-    ctx.ether.sell("alice", 500, "sell:alice");
+    ctx.ether.redeem("alice", 500, "sell:alice");
     testTransfer(ctx.ether, HOUSE_HOLDER, RELIEF_HOLDER, 200, "救済プールへ補充");
 
     const replay = ctx.chipTx.replayBalances();
@@ -310,7 +310,7 @@ describe("預入・返還と総量保存", () => {
     const poolBefore = ctx.ether.pool();
     const outstandingBefore = ctx.ether.outstanding();
 
-    ctx.ether.buy("alice", 4_000, "buy:alice");
+    ctx.ether.deposit("alice", 4_000, "buy:alice");
 
     expect(ctx.ether.pool() - poolBefore).toBe(4_000);
     expect(ctx.ether.outstanding() - outstandingBefore).toBe(4_000);
@@ -323,7 +323,7 @@ describe("預入・返還と総量保存", () => {
     const poolBefore = ctx.ether.pool();
     const outstandingBefore = ctx.ether.outstanding();
 
-    ctx.ether.sell("alice", 2_000, "sell:alice");
+    ctx.ether.redeem("alice", 2_000, "sell:alice");
 
     expect(outstandingBefore - ctx.ether.outstanding()).toBe(2_000);
     // 準備Landは払い戻し + 焼却ぶん減る（1:1化はPR8。ここでは"Landも同時に減る"ことを見る）
@@ -335,7 +335,7 @@ describe("預入・返還と総量保存", () => {
   it("Land側が通らなければチップは発行されない", () => {
     const ctx = setup();
     // 残高0のまま買おうとする → Land送金で失敗
-    expect(() => ctx.ether.buy("alice", 1_000, "buy:alice")).toThrow();
+    expect(() => ctx.ether.deposit("alice", 1_000, "buy:alice")).toThrow();
 
     expect(ctx.ether.balanceOf("alice")).toBe(0);
     expect(ctx.chipTx.getGroup("buy:alice")).toBeUndefined();
@@ -349,7 +349,7 @@ describe("預入・返還と総量保存", () => {
     const poolBefore = ctx.ether.pool();
 
     // 持っていない額の返還は弾かれ、Land も動かない
-    expect(() => ctx.ether.sell("alice", 99_999, "sell:too-much")).toThrow();
+    expect(() => ctx.ether.redeem("alice", 99_999, "sell:too-much")).toThrow();
 
     expect(ctx.ledger.balanceOf("user:alice")).toBe(landBefore);
     expect(ctx.ether.pool()).toBe(poolBefore);
@@ -607,29 +607,23 @@ describe("開始残高の版切替", () => {
   });
 });
 
-describe("端数で Land が動かない返還", () => {
-  it("最小額の返還はそのまま通り、Landが動かなかったことが記録に残る", () => {
+describe("1:1返還", () => {
+  it("最小額でも同額の Land を返還し、対応するLand取引を記録する", () => {
     const ctx = setup();
     fundUser(ctx, "alice", 10_000);
-    // 準備プールを痩せさせ、1チップあたりの Land が 1 Ld 未満の状態を作る
-    // （PR8 の 1:1 化までは、この端数落ちが現行仕様として存在する）
-    ctx.ledger.transfer({
-      from: ETHER_ESCROW, to: TREASURY, amount: 9_999, type: "adjust", actor: "t", approvedBy: "t",
-      idempotencyKey: "shrink-pool",
-    });
     const landBefore = ctx.ledger.balanceOf("user:alice");
 
-    const quote = ctx.ether.sell("alice", 5, "sell:tiny");
+    const quote = ctx.ether.redeem("alice", 5, "sell:tiny");
 
-    expect(quote.output).toBe(0);
+    expect(quote.output).toBe(5);
     expect(quote.burned).toBe(0);
-    expect(ctx.ledger.balanceOf("user:alice")).toBe(landBefore); // Land は動かない（現行どおり）
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(landBefore + 5);
     expect(ctx.ether.balanceOf("alice")).toBe(9_995); // チップだけ減る
 
     const row = ctx.chipTx.listByGroup("sell:tiny")[0]!;
     expect(row.tx_kind).toBe("redeem");
-    expect(row.land_amount).toBe(0);
-    expect(row.ledger_tx_id).toBeNull();
+    expect(row.land_amount).toBe(5);
+    expect(row.ledger_tx_id).not.toBeNull();
     expect(ctx.chipTx.verifyBalances().ok).toBe(true);
     ctx.db.close();
   });
@@ -638,7 +632,7 @@ describe("端数で Land が動かない返還", () => {
     const ctx = setup();
     fundUser(ctx, "alice", 10_000);
 
-    ctx.ether.sell("alice", 1_000, "sell:normal");
+    ctx.ether.redeem("alice", 1_000, "sell:normal");
 
     const row = ctx.chipTx.listByGroup("sell:normal")[0]!;
     expect(row.land_amount).toBeGreaterThan(0);
@@ -653,11 +647,11 @@ describe("再試行時の資金安全性（可変状態はグループの中で�
     fundUser(ctx, "alice", 10_000);
     const held = ctx.ether.balanceOf("alice");
 
-    const first = ctx.ether.sell("alice", held, "sell:all");
+    const first = ctx.ether.redeem("alice", held, "sell:all");
     expect(ctx.ether.balanceOf("alice")).toBe(0);
 
     // 残高が 0 になっていても、同じ操作の再試行は残高不足で落ちない
-    expect(ctx.ether.sell("alice", held, "sell:all")).toEqual(first);
+    expect(ctx.ether.redeem("alice", held, "sell:all")).toEqual(first);
     expect(ctx.ether.balanceOf("alice")).toBe(0);
     expect(ctx.chipTx.listByGroup("sell:all")).toHaveLength(1);
     ctx.db.close();

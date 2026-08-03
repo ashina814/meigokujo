@@ -7,7 +7,7 @@ import {
   ChipTx,
   ESCROW_QUARANTINE,
   Escrow,
-  EtherExchange,
+  ChipLedger,
   EventLog,
   HOUSE_HOLDER,
   HouseReservations,
@@ -35,7 +35,7 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
   const escrow = new Escrow(db, ether, events);
   const casino = new Casino(db, ether, events);
   const integrity = new CasinoIntegrity(db, ledger, ether, escrow);
@@ -54,7 +54,7 @@ function fundUser(ctx: Ctx, userId: string, amount: number): void {
   ctx.ledger.transfer({
     from: TREASURY, to: `user:${userId}`, amount, type: "initial", actor: "t", idempotencyKey: `seed:${userId}:${amount}`,
   });
-  ctx.ether.buy(userId, amount, `buy:${userId}:${amount}`);
+  ctx.ether.deposit(userId, amount, `buy:${userId}:${amount}`);
 }
 
 const run = (ctx: Ctx) =>

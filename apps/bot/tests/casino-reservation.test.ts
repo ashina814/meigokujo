@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   Casino,
   ChipTx,
-  EtherExchange,
+  ChipLedger,
   EventLog,
   HOUSE_HOLDER,
   HouseReservations,
@@ -51,7 +51,7 @@ function setup(rng = scriptedRng([0.5])) {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
   const items = new Items(db);
   const reservations = new HouseReservations(db, ether, events);
   // 本番（services.ts）と同じ配線。売上精算も予約分は出せない

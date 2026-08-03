@@ -4,7 +4,7 @@ import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { EtherExchange, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { Casino, JACKPOT_HOLDER, RELIEF_HOLDER } from "../src/casino/service.js";
 import { deptAccount, Departments } from "../src/departments/service.js";
 
@@ -16,17 +16,17 @@ const RAW = { chain: false, fuku: false } as const;
 function setup() {
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
-  const ether = new EtherExchange(db, ledger, new EventLog(db));
+  const ether = new ChipLedger(db, ledger, new EventLog(db));
   const casino = new Casino(db, ether, new EventLog(db));
   const departments = new Departments(db, ledger);
   // 賭博場部署 → 胴元に元手 100,000 Land = 1,000,000 ◈
   departments.upsert("賭博場", "賭博場", null);
   ledger.transfer({ from: TREASURY, to: deptAccount("賭博場"), amount: 100_000, type: "adjust", actor: "t", approvedBy: "t", idempotencyKey: "seed:dept" });
   ether.fundFromAccount(deptAccount("賭博場"), 100_000, HOUSE_HOLDER, "seed:house");
-  // プレイヤー a: 10,000 Land → 100,000 ◈
+  // プレイヤー a: 100,000 Land → 100,000 ◈（PR8: 1:1）
   ledger.ensureAccount("user:a", "user");
-  ledger.transfer({ from: TREASURY, to: "user:a", amount: 10_000, type: "initial", actor: "t", idempotencyKey: "seed:a" });
-  ether.buy("a", 10_000, "seed:buy:a");
+  ledger.transfer({ from: TREASURY, to: "user:a", amount: 100_000, type: "initial", actor: "t", idempotencyKey: "seed:a" });
+  ether.deposit("a", 100_000, "seed:buy:a");
   return { db, ledger, ether, casino };
 }
 

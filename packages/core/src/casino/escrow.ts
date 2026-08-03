@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
-import { EtherError, EtherExchange } from "./exchange.js";
+import { ChipLedgerError as EtherError, ChipLedger } from "./chip-ledger.js";
 
 /**
  * 賭場のエスクロー台帳。
@@ -83,7 +83,7 @@ export class Escrow {
 
   constructor(
     private readonly db: Database.Database,
-    private readonly ether: EtherExchange,
+    private readonly ether: ChipLedger,
     private readonly events: EventLog,
     options: EscrowOptions = {},
   ) {
