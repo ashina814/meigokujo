@@ -1,16 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   CASINO_DEPARTMENT,
+  CHIP_ESCROW,
   CasinoOpeningReset,
   CasinoStatus,
-  FREE_SPIN_JACKPOT_CLAIMS_HOLDER,
-  Ledger,
   ChipLedger,
   ChipLedgerError,
   ChipTx,
-  EventLog,
+  ETHER_APPROVER,
   ETHER_ESCROW,
-  CHIP_ESCROW,
+  EventLog,
+  FREE_SPIN_JACKPOT_CLAIMS_HOLDER,
+  Ledger,
   openDb,
   registerDefaultTxTypes,
   type OpeningBackupAdapter,
@@ -37,9 +38,13 @@ function cleanAdapters(): {
   const disabled = vi.fn(async () => undefined);
   return {
     backup: {
-      backup: vi.fn(async () => ({
+      backup: vi.fn(async ({ db, legacyTables }) => ({
         sqliteSha256: "a".repeat(64),
-        csv: [{ table: "casino_escrow", sha256: "b".repeat(64), rows: 0 }],
+        csv: legacyTables.map((table) => ({
+          table,
+          sha256: "b".repeat(64),
+          rows: (db.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).get() as { n: number }).n,
+        })),
         createdAt: 1,
       })),
     },
@@ -54,15 +59,37 @@ function fundedReset(oldReserveLand = 1_000) {
   const chipTx = new ChipTx(db);
   const chips = new ChipLedger(db, ledger, new EventLog(db), { chipTx, requireOpeningV1: true });
   const status = new CasinoStatus(db);
-  ledger.transfer({
-    from: "sys:treasury",
-    to: ETHER_ESCROW,
-    amount: oldReserveLand,
-    type: "ether_house_fund",
-    actor: "test",
-    idempotencyKey: "seed-opening",
-  });
+  const lastLedgerTx = (db.prepare("SELECT COALESCE(MAX(id),0) AS id FROM transactions").get() as { id: number }).id;
+  if (!chipTx.captureLegacyOpening({ poolLand: 0, fromLedgerTxId: lastLedgerTx })) {
+    throw new Error("legacy opening baseline already exists");
+  }
+  if (oldReserveLand > 0) {
+    chipTx.runGroup({ groupKey: "seed-opening", kind: "deposit", actorId: ETHER_APPROVER }, () => {
+      ledger.transfer({
+        from: "sys:treasury",
+        to: ETHER_ESCROW,
+        amount: oldReserveLand,
+        type: "ether_house_fund",
+        actor: ETHER_APPROVER,
+        approvedBy: ETHER_APPROVER,
+        idempotencyKey: "seed-opening",
+      });
+    });
+  }
   return { db, ledger, chips, chipTx, status, reset: new CasinoOpeningReset(db, ledger, chipTx) };
+}
+
+function fundDepartment(ctx: ReturnType<typeof fundedReset>, amount: number): void {
+  ctx.ledger.ensureAccount(CASINO_DEPARTMENT, "system");
+  ctx.ledger.transfer({
+    from: "sys:treasury",
+    to: CASINO_DEPARTMENT,
+    amount,
+    type: "ether_house_fund",
+    actor: "admin:fund",
+    approvedBy: "admin:fund",
+    idempotencyKey: `seed-department:${amount}`,
+  });
 }
 
 function fundPlayerLand(ctx: ReturnType<typeof fundedReset>, userId = "alice", amount = 5_000): void {
@@ -164,16 +191,15 @@ function applyInput(ctx: ReturnType<typeof fundedReset>, planHash: string, adapt
 
 describe("PR12 開業初期化 preflight", () => {
   it("未精算フリースピンと固定JP請求holderを読み取り検査し、不一致やpendingをblockerにする", () => {
-    const db = openDb(":memory:");
-    const chips = new ChipLedger(db, new Ledger(db), new EventLog(db));
-    db.exec(`CREATE TABLE casino_pending_free_spins (id INTEGER PRIMARY KEY, status TEXT, jackpot_claim INTEGER)`);
-    db.prepare("INSERT INTO casino_pending_free_spins VALUES (1,'pending',30),(2,'settled',20)").run();
-    chips.ensureHolder(FREE_SPIN_JACKPOT_CLAIMS_HOLDER);
-    const p = new CasinoOpeningReset(db).dryRun(config);
-    expect(p.freeSpinClaims).toMatchObject({ pendingIds: [1], expected: 30, actual: 0, matches: false });
-    expect(p.blockers.join(" ")).toContain("未精算無料スピン");
-    expect(p.blockers.join(" ")).toContain("無料スピンJP請求不一致");
-    db.close();
+    const ctx = fundedReset(0);
+    ctx.db.exec("CREATE TABLE casino_pending_free_spins (id INTEGER PRIMARY KEY, status TEXT, jackpot_claim INTEGER)");
+    ctx.db.prepare("INSERT INTO casino_pending_free_spins VALUES (1,'pending',30),(2,'settled',20)").run();
+    ctx.chips.ensureHolder(FREE_SPIN_JACKPOT_CLAIMS_HOLDER);
+    const plan = ctx.reset.dryRun(config);
+    expect(plan.freeSpinClaims).toMatchObject({ pendingIds: [1], expected: 30, actual: 0, matches: false });
+    expect(plan.blockers.join(" ")).toContain("未精算無料スピン");
+    expect(plan.blockers.join(" ")).toContain("無料スピンJP請求不一致");
+    ctx.db.close();
   });
 
   it("設定の資本内訳不一致を拒否し、dry-run は書込みもロック解除も行わない", () => {
@@ -185,9 +211,33 @@ describe("PR12 開業初期化 preflight", () => {
     const plan = ctx.reset.dryRun(config);
     expect(plan.blockers).toEqual([]);
     expect(plan.oldReserveLand).toBe(1_000);
+    expect(plan.openingSourceLand).toBe(1_000);
+    expect(plan.legacyIntegrity).toMatchObject({ chipBalancesOk: true, reserveLandMatches: true, ok: true });
     expect(plan.playerLand.sha256).toHaveLength(64);
     expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_opening_configuration").get()).toEqual(before);
     expectOpeningLocked(ctx, "after:dry-run");
+    ctx.db.close();
+  });
+
+  it("旧準備口座の説明不能なLand取引をplanへ記録し、初期化を停止する", () => {
+    const ctx = fundedReset();
+    ctx.ledger.transfer({
+      from: "sys:treasury",
+      to: ETHER_ESCROW,
+      amount: 10,
+      type: "adjust",
+      actor: "manual",
+      approvedBy: "manual",
+      idempotencyKey: "untracked-reserve-change",
+    });
+    const plan = ctx.reset.dryRun(config);
+    expect(plan.legacyIntegrity.reserveTransactions.at(-1)).toMatchObject({
+      type: "adjust",
+      valid: false,
+      problem: "unknown_type:adjust",
+    });
+    expect(plan.legacyIntegrity.ok).toBe(false);
+    expect(plan.blockers.join(" ")).toContain("旧制度のチップ検算または準備口座経路監査が不一致");
     ctx.db.close();
   });
 
@@ -245,7 +295,27 @@ describe("PR12 開業初期化 preflight", () => {
     ctx.db.close();
   });
 
-  it("hash、バックアップ、fake Discord adapterを要求し、apply成功後だけ1:1操作を解放する", async () => {
+  it("全casinoテーブル・旧残高・設定のCSVを要求し、欠落や件数違いを拒否する", async () => {
+    const ctx = fundedReset();
+    const plan = ctx.reset.dryRun(config);
+    expect(plan.archiveTables).toContain("ether_balances");
+    expect(plan.archiveTables).toContain("settings");
+    expect(plan.archiveTables).toContain("casino_tx");
+    expect(plan.archiveTables).toContain("casino_chip_opening_balances");
+
+    const backup: OpeningBackupAdapter = {
+      backup: async () => ({
+        sqliteSha256: "a".repeat(64),
+        csv: [{ table: "ether_balances", sha256: "b".repeat(64), rows: 0 }],
+        createdAt: 1,
+      }),
+    };
+    await expect(ctx.reset.apply({ ...applyInput(ctx, plan.planHash), backup })).rejects.toThrow("manifest table set mismatch");
+    expect(ctx.status.current().status).toBe("opening_reset");
+    ctx.db.close();
+  });
+
+  it("hash、完全バックアップ、fake Discord adapterを要求し、apply成功後だけ1:1操作を解放する", async () => {
     const ctx = fundedReset();
     fundPlayerLand(ctx);
     expectOpeningLocked(ctx, "before:apply");
@@ -278,12 +348,27 @@ describe("PR12 開業初期化 preflight", () => {
         { from_account: string; to_account: string; amount: number };
 
     expect(CASINO_DEPARTMENT).toBe("sys:dept:賭博場");
-    expect(txById(applied.oldSettlementLandTxId)).toEqual({ from_account: ETHER_ESCROW, to_account: CASINO_DEPARTMENT, amount: 1_500 });
+    expect(applied.oldSettlementLandTxId).not.toBeNull();
+    expect(txById(applied.oldSettlementLandTxId!)).toEqual({ from_account: ETHER_ESCROW, to_account: CASINO_DEPARTMENT, amount: 1_500 });
     expect(txById(applied.newInvestmentLandTxId)).toEqual({ from_account: CASINO_DEPARTMENT, to_account: CHIP_ESCROW, amount: 1_000 });
     expect(ctx.ledger.balanceOf(ETHER_ESCROW)).toBe(0);
     expect(ctx.ledger.balanceOf(CHIP_ESCROW)).toBe(1_000);
     expect(ctx.ledger.balanceOf(CASINO_DEPARTMENT)).toBe(500);
     expect(ctx.db.prepare("SELECT 1 FROM accounts WHERE id='sys:dept:casino'").get()).toBeUndefined();
+    ctx.db.close();
+  });
+
+  it("旧準備が0でも部署資金が足りれば開業でき、0額の旧清算取引を作らない", async () => {
+    const ctx = fundedReset(0);
+    fundDepartment(ctx, 1_000);
+    const plan = ctx.reset.dryRun(config);
+    expect(plan).toMatchObject({ oldReserveLand: 0, departmentLandBefore: 1_000, openingSourceLand: 1_000, blockers: [] });
+
+    const applied = await ctx.reset.apply(applyInput(ctx, plan.planHash));
+    expect(applied.oldSettlementLandTxId).toBeNull();
+    expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE idempotency_key LIKE '%old-settlement'").get()).toEqual({ n: 0 });
+    expect(ctx.ledger.balanceOf(CHIP_ESCROW)).toBe(1_000);
+    expect(ctx.ledger.balanceOf(CASINO_DEPARTMENT)).toBe(0);
     ctx.db.close();
   });
 
