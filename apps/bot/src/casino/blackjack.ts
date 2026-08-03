@@ -12,7 +12,7 @@ import {
 import type { CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -116,7 +116,6 @@ async function runRound(
   let totalBet = bet;
 
   const table = (hideDealer: boolean) => {
-    const dealerVal = hideDealer ? "**?**" : `**${handValue(dealer)}**`;
     return new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · ブラックジャック" })
       .setColor(C_MAMMON)
@@ -132,7 +131,6 @@ async function runRound(
           "```",
         ].join("\n"),
       );
-    void dealerVal;
   };
 
   let reply: Message;
@@ -204,7 +202,7 @@ async function runRound(
 
     const held = services.ether.balanceOf(uid);
     const min = MIN_BET;
-    const max = Math.min(MAX_BET, held);
+    const max = Math.min(effectiveMaxBet(services, uid), held);
     const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId(`bj:retry:${min}`)
@@ -243,18 +241,15 @@ async function runRound(
         return;
       }
       if (btn.customId.startsWith("bj:retry:")) {
-        collector.stop("retry");
-        const retryBet = Number(btn.customId.split(":")[2]);
-        if (retryBet < MIN_BET || retryBet > MAX_BET) return;
-        await btn.deferUpdate();
-        releaseSeat(uid);
-        if (acquireSeat(uid)) {
-          try {
-            await runRound(btn, services, retryBet);
-          } finally {
-            releaseSeat(uid);
-          }
-        }
+        // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
+        // 断るなら collector を止めない ＝ 押し直せる
+        await handleRetryPress({
+          services,
+          btn,
+          collector,
+          betRaw: Number(btn.customId.split(":")[2]),
+          run: (bet) => runRound(btn, services, bet),
+        });
       }
     });
     collector.on("end", async (_c, reason) => {

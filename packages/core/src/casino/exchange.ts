@@ -26,6 +26,22 @@ export const HOUSE_HOLDER = "house";
  */
 export const POOL_SWEEP_REASON = "準備プール残の回収";
 
+/** 賭場が自分で持つ保有者（利用者ではない）。プレフィクスで判定できないものだけ列挙する */
+const NON_PLAYER_HOLDERS: ReadonlySet<string> = new Set([HOUSE_HOLDER, "jackpot", "relief", "house_escrow_legacy"]);
+
+/**
+ * 保有者IDが**利用者本人**かどうか（PR3・通算損益の宛先判定）。
+ *
+ * チップ層の利用者IDは Discord のスノーフレークそのままなので、
+ * `sys:` / `escrow:` / `system:` で始まるものと胴元・JP・救済を除けば利用者になる。
+ * 戦績へ載せてよいのはここが true の保有者だけ。
+ */
+export function isPlayerHolder(holderId: string): boolean {
+  if (!holderId) return false;
+  if (NON_PLAYER_HOLDERS.has(holderId)) return false;
+  return !/^(sys:|system:|escrow:)/.test(holderId);
+}
+
 export type EtherErrorCode = "ERR_BAD_AMOUNT" | "ERR_INSUFFICIENT_ETHER" | "ERR_DUPLICATE";
 
 export class EtherError extends Error {

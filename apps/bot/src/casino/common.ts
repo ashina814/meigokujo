@@ -1,4 +1,9 @@
-import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
+import {
+  EmbedBuilder,
+  MessageFlags,
+  type ButtonInteraction,
+  type ChatInputCommandInteraction,
+} from "discord.js";
 import { fmtEther } from "../format.js";
 import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
@@ -45,8 +50,12 @@ export async function validateBet(
 ): Promise<BetCheck> {
   const bet = Math.floor(betRaw);
   const cap = effectiveMaxBet(services, interaction.user.id);
+  // 保留中の無料スピンを先に通知した場合、ここは2通目になる。
+  // 未応答 interaction には reply、応答済み／defer 済みなら followUp を使う。
+  const respond = (payload: Parameters<typeof interaction.reply>[0]) =>
+    interaction.replied || interaction.deferred ? interaction.followUp(payload) : interaction.reply(payload);
   if (!Number.isInteger(bet) || bet < MIN_BET || bet > cap) {
-    await interaction.reply({
+    await respond({
       content: `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
       flags: MessageFlags.Ephemeral,
     });
@@ -54,7 +63,7 @@ export async function validateBet(
   }
   const held = services.ether.balanceOf(interaction.user.id);
   if (held < bet) {
-    await interaction.reply({
+    await respond({
       content: `${Mammon.broke()}（所持 ${fmtEther(held)}）\n→ 両替所パネルで Land をエテルに替えてこい。`,
       flags: MessageFlags.Ephemeral,
     });
@@ -64,7 +73,7 @@ export async function validateBet(
     // 胴元が最悪ケースの配当を払えない。今の胴元残高で受けられる上限を教える
     const multiplier = maxPayout / bet;
     const maxAcceptable = Math.floor(services.casino.houseBalance() / multiplier);
-    await interaction.reply({
+    await respond({
       content: [
         Mammon.tableClosed(),
         maxAcceptable >= MIN_BET
@@ -76,6 +85,96 @@ export async function validateBet(
     return { ok: false, bet };
   }
   return { ok: true, bet };
+}
+
+/** リトライ操作を受け付けなかった理由（`checkRetry` の返り値） */
+export type RetryDenial =
+  | { ok: true; bet: number }
+  | { ok: false; reason: string };
+
+/**
+ * 「もう一回」ボタンの受付判定（PR3）。
+ *
+ * 以前は各ゲームが `if (retryBet < MIN_BET || retryBet > MAX_BET) return;` と
+ * **何も言わずに return** していた。コレクタは既に停止しているので、押した側からは
+ * ボタンが死んだようにしか見えない。断るなら理由を出す。
+ *
+ * 上限は `MAX_BET` ではなく `effectiveMaxBet`（VIPなら×2）で見る。
+ * ここを固定値にしていると、VIP が上限いっぱいで遊んだ直後の「もう一回」だけが弾かれる。
+ */
+export function checkRetry(services: Services, userId: string, betRaw: number): RetryDenial {
+  const bet = Number(betRaw);
+  const cap = effectiveMaxBet(services, userId);
+  if (!Number.isInteger(bet) || bet < MIN_BET || bet > cap) {
+    return {
+      ok: false,
+      reason: `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
+    };
+  }
+  const held = services.ether.balanceOf(userId);
+  if (held < bet) {
+    return { ok: false, reason: `${Mammon.broke()}（所持 ${fmtEther(held)} / 必要 ${fmtEther(bet)}）` };
+  }
+  return { ok: true, bet };
+}
+
+/** 席が取れなかったときの理由文（同時プレイ防止に弾かれたことを黙らせない） */
+export const SEAT_BUSY_REASON = "まだ前の勝負が終わっていない。少し待ってからもう一度。";
+
+/**
+ * 「もう一回」ボタンを押されたときの本体（PR3）。
+ *
+ * **collector を止めるのは受付が確定してから**。以前は各ゲームが
+ *
+ * ```ts
+ * collector.stop("retry");        // ← 先に止めていた
+ * const retry = checkRetry(...);
+ * if (!retry.ok) return;          // ← 断ると、ボタンは残っているのに二度と反応しない
+ * ```
+ *
+ * という順で書いていた。理由を出すようにしても、collector が死んでいるので
+ * 「もう一度押す」ができない。断ったなら**押し直せる状態のまま**返す。
+ *
+ * 受付が通ったときだけ collector を止め、座席を取り直して本体を回す。
+ * 全ゲームがこの1本を通るので、順序を各ゲームで書き間違えようがない。
+ */
+export interface RetryCollector {
+  stop(reason?: string): void;
+}
+
+export async function handleRetryPress(opts: {
+  services: Services;
+  btn: ButtonInteraction;
+  collector: RetryCollector;
+  betRaw: number;
+  /** 受付が通ったあとに回す本体（座席は取得済み） */
+  run: (bet: number) => Promise<void>;
+}): Promise<void> {
+  const { services, btn, collector, run } = opts;
+  const uid = btn.user.id;
+
+  const retry = checkRetry(services, uid, opts.betRaw);
+  if (!retry.ok) {
+    // ここで collector を止めない。断ったのにボタンを殺すと、次に押したとき無応答になる
+    await btn.reply({ content: `❌ ${retry.reason}`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  // ここから先は受け付ける。この時点で初めてコレクタを閉じる
+  collector.stop("retry");
+  await btn.deferUpdate();
+
+  // 座席は「前の1回」を回している親が握っている。いったん返して取り直す
+  releaseSeat(uid);
+  if (!acquireSeat(uid)) {
+    await btn.followUp({ content: SEAT_BUSY_REASON, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  try {
+    await run(retry.bet);
+  } finally {
+    releaseSeat(uid);
+  }
 }
 
 /**

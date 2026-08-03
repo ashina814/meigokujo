@@ -8,7 +8,7 @@ import {
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { fmtEther, fmtLd } from "../format.js";
-import { C_MAMMON, C_JACKPOT, E, HR_THIN, fmtSignedEther, bar } from "../casino/ui.js";
+import { C_MAMMON, C_JACKPOT, E, HR_THIN, fmtSignedEther } from "../casino/ui.js";
 import type { Services } from "../services.js";
 
 /**
@@ -57,7 +57,15 @@ function renderHome(userId: string, services: Services, serverName?: string) {
   const winRate = stats.games > 0 ? (stats.wins / stats.games) * 100 : 0;
   const streakLine = stats.current_win_streak >= 2 ? `${E.fire} ${stats.current_win_streak}連勝中` : "";
   const loseStreakLine = stats.current_lose_streak >= 3 ? `${E.lose} ${stats.current_lose_streak}連敗` : "";
-  const netLifetime = stats.total_earned - stats.total_wagered;
+  // 通算損益 = 賭場で**確定した**ゲーム損益の総和（PR3）。
+  //
+  // 含む: ソロゲーム（連鎖ボーナス・福の重み込み）、フリースピン、JP当選、
+  //       対人戦（場代込み）、競馬、板。いずれも確定精算のときに一度だけ足す。
+  // 含まない: 預託中の資金、返金・無効試合、VIP、商店、通常送金、元手投入・売上精算。
+  //
+  // 以前は total_earned − total_wagered で出しており、total_earned が既に賭け額を
+  // 引いた純益なので、勝った回の賭け額を二重に引いていた。
+  const netLifetime = stats.total_earned - stats.total_lost;
 
   const walletValue = [
     `**${fmtEther(heldEther)}** (エテル)`,
@@ -127,6 +135,3 @@ function renderHome(userId: string, services: Services, serverName?: string) {
 
   return { embeds: [embed], components: [row] };
 }
-
-// unused import prevented by re-export shape
-void bar;

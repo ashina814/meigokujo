@@ -57,7 +57,22 @@ export interface CasinoStatsRow {
   wins: number;
   losses: number;
   total_wagered: number;
+  /**
+   * ゲーム由来の**実現利益**の総和（PR3）。
+   *
+   * 含む: 配当、連鎖ボーナス、福の重み（差し引く側）、フリースピン配当、JP当選、
+   * 対人戦の純勝ち。
+   * 含まない: VIP、賭場商店、通常の送金、胴元への元手投入・売上精算。
+   * 返金・無効試合・冪等再試行では 1 Ld も増減しない。
+   */
   total_earned: number;
+  /**
+   * ゲーム由来の**実現損失**の総和（PR3）。含む/含まないは {@link total_earned} と同じ。
+   * 対人戦の場代もここに入る（負けた側の実支出なので）。
+   *
+   * 通算損益 = total_earned − total_lost で、その利用者の残高の増減と一致する。
+   */
+  total_lost: number;
   biggest_win: number;
   current_win_streak: number;
   best_win_streak: number;
@@ -140,6 +155,7 @@ export class Casino {
         losses              INTEGER NOT NULL DEFAULT 0,
         total_wagered       INTEGER NOT NULL DEFAULT 0,
         total_earned        INTEGER NOT NULL DEFAULT 0,
+        total_lost          INTEGER NOT NULL DEFAULT 0,
         biggest_win         INTEGER NOT NULL DEFAULT 0,
         current_win_streak  INTEGER NOT NULL DEFAULT 0,
         best_win_streak     INTEGER NOT NULL DEFAULT 0,
@@ -147,6 +163,14 @@ export class Casino {
         updated_at          INTEGER NOT NULL
       );
     `);
+    // 既存DBへの追加（PR3）。通算損益は total_earned − total_lost で出す。
+    // 以前は total_earned − total_wagered で出していたが、total_earned が
+    // 「勝ちの純益」なのに total_wagered が「勝ち負け問わぬ賭け総額」なので、
+    // 勝った回の賭け額を二重に引いていた（負けが実際より大きく見える）。
+    const cols = this.db.prepare("PRAGMA table_info(casino_stats)").all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "total_lost")) {
+      this.db.exec("ALTER TABLE casino_stats ADD COLUMN total_lost INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   /** 胴元のエテル残高（＝配当余力） */
@@ -238,7 +262,10 @@ export class Casino {
       }
       const effectivePayout = payout + chainBonus - fukuTax;
       const net = effectivePayout - bet;
-      this.recordResult(userId, bet, payout);
+      // 戦績には**実際に残高が動いた額**を渡す（PR3）。素の payout を渡していたので、
+      // 連鎖ボーナスは通算損益に乗らず、福の重みは引かれていなかった。
+      // JP積立は胴元 → JP の移動なので利用者の損益には関係しない
+      this.recordResult(userId, bet, effectivePayout);
       this.events.log("casino_game", { actor: userId, payload: { game, bet, payout: effectivePayout, net, chainBonus, fukuTax } });
       return { wagered: bet, payout: effectivePayout, net, chainBonus, chainStreak, chainMult, chainLabel, fukuTax, fukuRate: rate };
     });
@@ -299,9 +326,45 @@ export class Casino {
       const amount = Math.floor(pool * Math.min(1, Math.max(0, share)));
       if (amount <= 0) return 0;
       this.ether.transfer(JACKPOT_HOLDER, userId, amount, { game, reason: "ジャックポット当選" });
+      // JP当選は settle を通らないので、ここで通算損益へ足す（PR3）。
+      // 賭けを伴わない払い出しなので試合数は増やさない
+      this.recordGameNet(userId, amount, { countAsBiggestWin: true });
       this.events.log("casino_jackpot", { actor: userId, payload: { game, amount, poolBefore: pool } });
       return amount;
     });
+  }
+
+  /**
+   * `settle()` を通らないゲーム由来の実現損益を戦績へ足す（PR3）。
+   *
+   * 賭けを伴わない払い出し（スロットのフリースピン配当・JP当選）と、
+   * 胴元を相手にしない対人戦の精算がここを通る。**試合数・連勝・賭け総額は動かさない**
+   * （それらは `settle()` が1ゲーム1回だけ数える。ここで足すと1スピンが2ゲームになる）。
+   *
+   * 呼ぶのは「実際に残高が動いた額」だけ。返金・無効試合・冪等再試行では
+   * 残高が動かないので `net = 0` になり、何も記録されない。
+   *
+   * @param net 利用者から見た純増減。プラスなら total_earned、マイナスなら total_lost へ
+   * @param countAsBiggestWin JP当選のように「その回の勝ち」として最大単勝に載せるか
+   */
+  recordGameNet(userId: string, net: number, opts: { countAsBiggestWin?: boolean } = {}): void {
+    if (!Number.isFinite(net) || net === 0) return;
+    const ts = now();
+    this.db
+      .prepare("INSERT INTO casino_stats (user_id, updated_at) VALUES (?, ?) ON CONFLICT(user_id) DO NOTHING")
+      .run(userId, ts);
+    const earned = Math.max(0, Math.trunc(net));
+    const lost = Math.max(0, -Math.trunc(net));
+    this.db
+      .prepare(
+        `UPDATE casino_stats SET
+           total_earned = total_earned + ?,
+           total_lost = total_lost + ?,
+           biggest_win = MAX(biggest_win, ?),
+           updated_at = ?
+         WHERE user_id = ?`,
+      )
+      .run(earned, lost, opts.countAsBiggestWin ? earned : 0, ts, userId);
   }
 
   /** 戦績更新。payout > bet で勝ち、payout < bet で負け、同額はノーカウント（引き分け） */
@@ -313,6 +376,7 @@ export class Casino {
     const win = payout > bet ? 1 : 0;
     const loss = payout < bet ? 1 : 0;
     const netWin = Math.max(0, payout - bet);
+    const netLoss = Math.max(0, bet - payout);
     this.db
       .prepare(
         `UPDATE casino_stats SET
@@ -321,13 +385,14 @@ export class Casino {
            losses = losses + ?,
            total_wagered = total_wagered + ?,
            total_earned = total_earned + ?,
+           total_lost = total_lost + ?,
            biggest_win = MAX(biggest_win, ?),
            current_win_streak = CASE WHEN ? = 1 THEN current_win_streak + 1 WHEN ? = 1 THEN 0 ELSE current_win_streak END,
            current_lose_streak = CASE WHEN ? = 1 THEN current_lose_streak + 1 WHEN ? = 1 THEN 0 ELSE current_lose_streak END,
            updated_at = ?
          WHERE user_id = ?`,
       )
-      .run(win, loss, bet, netWin, netWin, win, loss, loss, win, ts, userId);
+      .run(win, loss, bet, netWin, netLoss, netWin, win, loss, loss, win, ts, userId);
     this.db
       .prepare("UPDATE casino_stats SET best_win_streak = MAX(best_win_streak, current_win_streak) WHERE user_id = ?")
       .run(userId);
@@ -343,6 +408,7 @@ export class Casino {
         losses: 0,
         total_wagered: 0,
         total_earned: 0,
+        total_lost: 0,
         biggest_win: 0,
         current_win_streak: 0,
         best_win_streak: 0,

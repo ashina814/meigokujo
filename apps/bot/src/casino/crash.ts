@@ -17,7 +17,7 @@ import {
 } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON, C_WIN } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -35,6 +35,25 @@ const MIN_CASHOUT = CRASH_MIN_CASHOUT;
 const MAX_MULT_CAP = CRASH_MAX_MULT_CAP;
 const UPDATE_INTERVAL_MS = 1500;
 
+/**
+ * 降車ボタンを押した瞬間に確定する倍率（PR3）。
+ *
+ * 以前は `MAX_MULT_CAP` を**受付時のテーブルリミット判定にしか使っておらず**、
+ * 実際の払戻倍率は崩壊点まで青天井だった（成長率 0.00015/ms なので約31秒粘れば100倍を超える）。
+ * 胴元は `bet × 100` しか引き当てていないので、それを超えた分は引き当ての無い債務になる。
+ * 受付時に見ている上限と払戻の上限を同じ値に揃える。
+ *
+ * @param elapsedMs 開始から押下までの実時間
+ * @param crashPoint この回の崩壊点（押下時刻が崩壊前であることは呼び出し側が確認済み）
+ */
+export function cashOutMultiplier(elapsedMs: number, crashPoint: number): number {
+  const raw = Math.exp(GROWTH_RATE * elapsedMs);
+  const capped = Math.min(raw, crashPoint, MAX_MULT_CAP);
+  const floored = Math.floor(capped * 100) / 100;
+  if (!Number.isFinite(floored)) return 1.0;
+  return Math.max(1.0, floored);
+}
+
 function progressBar(mult: number): string {
   const steps = 15;
   const progress = Math.min(1, Math.log10(mult) / 1.5);
@@ -51,6 +70,7 @@ function paytableEmbed(): EmbedBuilder {
         "**遊び方**",
         "・倍率がじわじわ上昇。**崩壊する前に「降りる」** を押した瞬間の倍率で払戻し",
         `・最低降車ラインは **${MIN_CASHOUT.toFixed(2)}x**。それ未満では降りられない`,
+        `・払戻の上限は **${MAX_MULT_CAP}x**。これ以上粘っても倍率は伸びない（受付時のテーブルリミットと同じ値）`,
         `・崩壊点は分布的にランダム（1%は即崩壊）。数学的 RTP は **${((1 - CRASH_HOUSE_EDGE) * 100).toFixed(0)}%**（M に依らず一定）`,
         "",
         "**⚡ 遅かった**",
@@ -102,7 +122,7 @@ async function runRound(
 
   let currentMultiplier = 1.0;
   let cashedOut = false;
-  let cashOutMultiplier = 0;
+  let cashOutMul = 0;
 
   const makeEmbed = (multi: number) => {
     const currentValue = Math.floor(bet * multi);
@@ -164,10 +184,7 @@ async function runRound(
       return;
     }
     cashedOut = true;
-    const rawMul = Math.exp(GROWTH_RATE * (clickTime - START_TIME));
-    const cappedMul = Math.min(rawMul, crashPoint);
-    cashOutMultiplier = Math.max(1.0, Math.floor(cappedMul * 100) / 100);
-    if (!Number.isFinite(cashOutMultiplier)) cashOutMultiplier = 1.0;
+    cashOutMul = cashOutMultiplier(clickTime - START_TIME, crashPoint);
     collector.stop("cashout");
     await btn.deferUpdate();
   });
@@ -186,7 +203,8 @@ async function runRound(
     const forceUnlockRender = !unlockRendered && now >= MIN_CASHOUT_TIME;
     if (forceUnlockRender || now - lastEditTime >= UPDATE_INTERVAL_MS) {
       lastEditTime = now;
-      currentMultiplier = Math.floor(Math.exp(GROWTH_RATE * (now - START_TIME)) * 100) / 100;
+      // 表示も払戻と同じ上限で止める（画面が 100x を超えるのに払戻が 100x では嘘になる）
+      currentMultiplier = Math.min(MAX_MULT_CAP, Math.floor(Math.exp(GROWTH_RATE * (now - START_TIME)) * 100) / 100);
       if (forceUnlockRender) unlockRendered = true;
       try {
         await reply.edit({ embeds: [makeEmbed(currentMultiplier)], components: [cashOutRow(currentMultiplier)] });
@@ -200,7 +218,7 @@ async function runRound(
   const buildRetryRow = () => {
     const held = services.ether.balanceOf(uid);
     const min = MIN_BET;
-    const max = Math.min(MAX_BET, held);
+    const max = Math.min(effectiveMaxBet(services, uid), held);
     return new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId(`crash:retry:${min}`)
@@ -223,8 +241,8 @@ async function runRound(
   };
 
   // ── 精算 ──
-  if (cashedOut && cashOutMultiplier >= 1.0) {
-    const rawPayout = Math.floor(bet * cashOutMultiplier);
+  if (cashedOut && cashOutMul >= 1.0) {
+    const rawPayout = Math.floor(bet * cashOutMul);
     // 連鎖ボーナスは無効化（1.5倍固定戦略 × 高勝率で 100% 超になる裁定を防ぐ・PR#6 レビュー指摘）。
     // 福の重みは維持（低残高帯では 0% なので影響なし・高残高帯ではプレイヤーから JP/救済へ流す）。
     // お守りの消費も賭け・配当と同じグループの中（settleSolo）
@@ -244,7 +262,7 @@ async function runRound(
       .setDescription(
         [
           "```",
-          `離脱  ${cashOutMultiplier.toFixed(2)}x   （崩壊 ${crashPoint.toFixed(2)}x）`,
+          `離脱  ${cashOutMul.toFixed(2)}x   （崩壊 ${crashPoint.toFixed(2)}x）`,
           "```",
         ].join("\n"),
       )
@@ -301,18 +319,15 @@ async function runRound(
       return;
     }
     if (btn.customId.startsWith("crash:retry:")) {
-      retryCollector.stop("retry");
-      const retryBet = Number(btn.customId.split(":")[2]);
-      if (retryBet < MIN_BET || retryBet > MAX_BET) return;
-      await btn.deferUpdate();
-      releaseSeat(uid);
-      if (acquireSeat(uid)) {
-        try {
-          await runRound(btn, services, retryBet);
-        } finally {
-          releaseSeat(uid);
-        }
-      }
+      // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
+      // 断るなら collector を止めない ＝ 押し直せる
+      await handleRetryPress({
+        services,
+        btn,
+        collector: retryCollector,
+        betRaw: Number(btn.customId.split(":")[2]),
+        run: (bet) => runRound(btn, services, bet),
+      });
     }
   });
   retryCollector.on("end", async (_c, reason) => {

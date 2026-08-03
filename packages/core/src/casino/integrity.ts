@@ -5,6 +5,7 @@ import { ETHER_ESCROW, ETHER_APPROVER, EtherExchange, POOL_SWEEP_REASON } from "
 import { Escrow, ESCROW_QUARANTINE } from "./escrow.js";
 import { HOUSE_HOLDER } from "./exchange.js";
 import { JACKPOT_HOLDER, RELIEF_HOLDER } from "./service.js";
+import { FREE_SPIN_JACKPOT_CLAIMS_HOLDER } from "./free-spins.js";
 
 /**
  * 賭場の検算A〜D（大型UPD PR2）。
@@ -66,6 +67,7 @@ const SYSTEM_HOLDERS: ReadonlySet<string> = new Set([
   JACKPOT_HOLDER,
   RELIEF_HOLDER,
   ESCROW_QUARANTINE,
+  FREE_SPIN_JACKPOT_CLAIMS_HOLDER,
 ]);
 
 /** 差分を最大何件まで持ち回るか（通知が壊れないように） */
@@ -331,13 +333,39 @@ export class CasinoIntegrity {
       actual: m.actual,
     }));
     for (const m of this.marketEscrowMismatches()) mismatches.push(m);
+    const freeSpinClaims = this.freeSpinJackpotClaimMismatch();
+    if (freeSpinClaims) mismatches.push(freeSpinClaims);
     const ok = mismatches.length === 0;
     return {
       id: "C",
       name: "預託",
       ok,
-      detail: ok ? "卓・板の預り金は帳簿どおり" : `${mismatches.length}件の預り所で帳簿と残高が食い違う`,
+      detail: ok
+        ? "卓・板の預り金とフリースピンJP請求は帳簿どおり"
+        : freeSpinClaims
+          ? `フリースピンJP請求が不一致（${freeSpinClaims.note ?? ""} / 期待 ${freeSpinClaims.expected} / 実残高 ${freeSpinClaims.actual}）`
+          : `${mismatches.length}件の預り所で帳簿と残高が食い違う`,
       mismatches: mismatches.slice(0, MAX_MISMATCHES),
+    };
+  }
+
+  /** pending の確定JP請求額と専用system holderを照合する（旧DBで表が無ければ0件扱い）。 */
+  private freeSpinJackpotClaimMismatch(): CasinoCheckMismatch | null {
+    if (!this.tableExists("casino_pending_free_spins")) return null;
+    const rows = this.db
+      .prepare(
+        "SELECT id, jackpot_claim FROM casino_pending_free_spins WHERE status != 'settled' AND jackpot_claim != 0 ORDER BY id",
+      )
+      .all() as Array<{ id: number; jackpot_claim: number }>;
+    const expected = rows.reduce((sum, row) => sum + row.jackpot_claim, 0);
+    const actual = this.ether.balanceOf(FREE_SPIN_JACKPOT_CLAIMS_HOLDER);
+    if (expected === actual) return null;
+    const ids = rows.map((row) => `#${row.id}`).join(", ") || "なし";
+    return {
+      subject: FREE_SPIN_JACKPOT_CLAIMS_HOLDER,
+      expected,
+      actual,
+      note: `pending行 ${ids}`,
     };
   }
 

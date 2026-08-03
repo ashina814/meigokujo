@@ -12,7 +12,7 @@ import {
 import { CHOHAN_PAYOUT, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -23,7 +23,6 @@ import { broadcastBigWin } from "./bigwin.js";
  * - 15秒無操作は賭け金返却
  */
 // 配当倍率は core の CHOHAN_PAYOUT を唯一の真実源として使う（表示配当表・実払戻・RTPテストが一致）
-const DICE_EMOJI: Record<number, string> = { 1: "①", 2: "②", 3: "③", 4: "④", 5: "⑤", 6: "⑥" };
 const DIE = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"] as const;
 
 function rollDice(rng: CasinoRng): [number, number] {
@@ -154,7 +153,6 @@ async function runRound(
   const amulet = { note: settled.amuletNote };
 
   const totalPayout = settled.payout;
-  const net = settled.net;
   const resultLabel = isCho ? "丁（偶数）" : "半（奇数）";
   const playerLabel = picked === "cho" ? "丁" : "半";
   const streakLine =
@@ -189,10 +187,6 @@ async function runRound(
     .setFooter({
       text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
     });
-  void DICE_EMOJI;
-  void total;
-  void totalPayout;
-  void net;
 
   if (won) {
     broadcastBigWin(interaction.client, services, {
@@ -216,7 +210,7 @@ async function runRound(
       .setCustomId(`chohan:retry:${doubleBet}`)
       .setLabel(`⚡ 倍プッシュ ${doubleBet.toLocaleString()}`)
       .setStyle(ButtonStyle.Danger)
-      .setDisabled(held < doubleBet || doubleBet > MAX_BET),
+      .setDisabled(held < doubleBet || doubleBet > effectiveMaxBet(services, uid)),
     new ButtonBuilder().setCustomId("chohan:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("chohan:quit").setLabel("🚪 退席").setStyle(ButtonStyle.Secondary),
   );
@@ -239,18 +233,15 @@ async function runRound(
       return;
     }
     if (btn.customId.startsWith("chohan:retry:")) {
-      collector.stop("retry");
-      const retryBet = Number(btn.customId.split(":")[2]);
-      if (retryBet < MIN_BET || retryBet > MAX_BET) return;
-      await btn.deferUpdate();
-      releaseSeat(uid);
-      if (acquireSeat(uid)) {
-        try {
-          await runRound(btn, services, retryBet);
-        } finally {
-          releaseSeat(uid);
-        }
-      }
+      // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
+      // 断るなら collector を止めない ＝ 押し直せる
+      await handleRetryPress({
+        services,
+        btn,
+        collector,
+        betRaw: Number(btn.customId.split(":")[2]),
+        run: (bet) => runRound(btn, services, bet),
+      });
     }
   });
   collector.on("end", async (_c, reason) => {

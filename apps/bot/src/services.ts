@@ -27,6 +27,8 @@ import {
   CasinoIntegrity,
   ChipTx,
   isHumanHeld,
+  isPlayerHolder,
+  FreeSpins,
   Daily,
   Items,
   Stocks,
@@ -109,6 +111,8 @@ export function buildServices() {
   chipTx.setClosedReason(() => casinoStatus.denyMessage());
   // お守りは精算と同じグループで消費する（Casino.settleSolo）。そのため casino より先に作る
   const items = new Items(db);
+  // 獲得済みフリースピンの保留台帳（PR3）。有料スピンの確定と同じトランザクションで積む
+  const freeSpins = new FreeSpins(db);
   const casino = new Casino(db, ether, events, {
     fukuScale: () => settings.getNumber("ether_fuku_scale"),
     items,
@@ -125,15 +129,21 @@ export function buildServices() {
     days: () => settings.getNumber("vip_days"),
     betCapMult: () => settings.getNumber("vip_bet_cap_mult"),
   });
-  const markets = new Markets(db, ether, events);
-  const escrow = new Escrow(db, ether, events);
+  // 通算損益は**確定精算のときだけ**記録する（PR3）。
+  // 板・競馬・対人卓は「預けた額」と「受け取った額」の差を、精算の資金グループの中で一度だけ足す。
+  // 預託中・返金・無効試合は 0（対局中に通算負けが増えたり、全額返金で両方が膨らんだりしない）
+  const recordPlayerNet = (userId: string, net: number) => {
+    if (isPlayerHolder(userId)) casino.recordGameNet(userId, net);
+  };
+  const markets = new Markets(db, ether, events, { onPlayerNet: recordPlayerNet });
+  const escrow = new Escrow(db, ether, events, { onPlayerNet: recordPlayerNet });
   const takutate = new Takutate(db, events);
   const casinoIntegrity = new CasinoIntegrity(db, ledger, ether, escrow);
   // 起動時: 全点検 → 通ったときだけ掃除 → 掃除後にもう一度全点検 → 開ける
   runCasinoStartup(casinoStatus, casinoIntegrity, chipTx, events, () => sweepCasinoOnBoot(markets, escrow));
   // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;

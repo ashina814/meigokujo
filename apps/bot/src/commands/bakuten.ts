@@ -32,7 +32,7 @@ export async function handleBakutenCommand(
   interaction: ChatInputCommandInteraction,
   services: Services,
 ): Promise<void> {
-  await interaction.reply({ embeds: [buildEmbed(interaction.user.id, services)], components: buildComponents(services), flags: MessageFlags.Ephemeral });
+  await interaction.reply({ embeds: [buildEmbed(interaction.user.id, services)], components: buildComponents(), flags: MessageFlags.Ephemeral });
 }
 
 function buildEmbed(userId: string, services: Services): EmbedBuilder {
@@ -71,7 +71,7 @@ function buildEmbed(userId: string, services: Services): EmbedBuilder {
   return embed;
 }
 
-function buildComponents(services: Services): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
+function buildComponents(): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
   const buySelect = new StringSelectMenuBuilder()
     .setCustomId("bakuten:buy")
     .setPlaceholder("買う商品を選ぶ")
@@ -101,6 +101,47 @@ function buildComponents(services: Services): ActionRowBuilder<StringSelectMenuB
   ];
 }
 
+/** 商店の購入結果。`ok:false` は残高不足だけ（技術例外はグループごと巻き戻って投げ直す） */
+export interface BuyResult {
+  ok: boolean;
+  /** 判定時の所持額（不足メッセージに出す） */
+  held: number;
+  /** この購入の業務グループ鍵。同じ操作の再試行では同じ値になる */
+  groupKey: string;
+}
+
+/**
+ * 賭場商店の購入（PR3 で UI から切り出した購入サービス）。
+ *
+ * 徴収・付与・残高判定を**ひとつの業務グループ**で行う。分けると
+ * 「代金だけ引かれてお守りが増えない」状態が残る。残高判定もグループの中でやるのは、
+ * 購入成功後の再試行が「保存済みの結果を返す」前に残高不足で弾かれないようにするため。
+ *
+ * `operationId` には interaction.id のように**同じ操作の再試行で同じ値になるもの**を渡す。
+ * ランダム値を渡すと二重課金・二重付与を防げない。
+ */
+export function buyConsumable(
+  services: Services,
+  userId: string,
+  key: string,
+  operationId: string,
+): BuyResult {
+  const def = getConsumableDef(key);
+  if (!def) throw new Error(`buyConsumable: 不明な商品 ${key}`);
+  const groupKey = `shop:buy:${userId}:${def.key}:${operationId}`;
+  const r = services.ether.runGroup(
+    { groupKey, kind: "shop", actorId: userId },
+    (): { ok: boolean; held: number } => {
+      const held = services.ether.balanceOf(userId);
+      if (held < def.price) return { ok: false, held };
+      services.ether.transfer(userId, HOUSE_HOLDER, def.price, { reason: `賭場商店での購入: ${def.key}` });
+      services.items.grant(userId, def.key, 1);
+      return { ok: true, held };
+    },
+  );
+  return { ...r, groupKey };
+}
+
 export async function handleBakutenSelect(
   interaction: StringSelectMenuInteraction,
   services: Services,
@@ -115,18 +156,7 @@ export async function handleBakutenSelect(
   }
 
   if (action === "buy") {
-    // 残高判定もグループの中。外でやると、購入成功後の再試行が
-    // 「保存済みの結果を返す」前に残高不足で弾かれる
-    const bought = services.ether.runGroup(
-      { groupKey: `shop:buy:${uid}:${def.key}:${interaction.id}`, kind: "shop", actorId: uid },
-      (): { ok: boolean; held: number } => {
-        const held = services.ether.balanceOf(uid);
-        if (held < def.price) return { ok: false, held };
-        services.ether.transfer(uid, HOUSE_HOLDER, def.price, { reason: `賭場商店での購入: ${def.key}` });
-        services.items.grant(uid, def.key, 1);
-        return { ok: true, held };
-      },
-    );
+    const bought = buyConsumable(services, uid, def.key, interaction.id);
     if (!bought.ok) {
       await interaction.reply({
         content: `エテルが足りない（所持 ${fmtEther(bought.held)} / 必要 ${fmtEther(def.price)}）。`,
@@ -134,7 +164,7 @@ export async function handleBakutenSelect(
       });
       return;
     }
-    await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents(services) });
+    await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents() });
     return;
   }
 
@@ -150,7 +180,7 @@ export async function handleBakutenSelect(
       await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
       return;
     }
-    await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents(services) });
+    await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents() });
     return;
   }
 }
@@ -158,6 +188,6 @@ export async function handleBakutenSelect(
 export async function handleBakutenButton(interaction: ButtonInteraction, services: Services): Promise<void> {
   const uid = interaction.user.id;
   if (interaction.customId === "bakuten:refresh") {
-    await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents(services) });
+    await interaction.update({ embeds: [buildEmbed(uid, services)], components: buildComponents() });
   }
 }

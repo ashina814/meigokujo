@@ -13,7 +13,7 @@ import {
 import { HOUSE_HOLDER, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import { MIN_BET, acquireSeat, effectiveMaxBet, handleRetryPress, releaseSeat, sleep, validateBet } from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -258,7 +258,6 @@ async function runRound(
   // 二度振りの権: 装備してればプレイヤーの投数を +1
   const rerollGranted = services.items.consumeReroll(uid);
   const playerMaxRolls = MAX_ROLLS + (rerollGranted ? 1 : 0);
-  void rerollGranted;
 
   for (let rollNo = 1; rollNo <= playerMaxRolls && !playerLocked; rollNo++) {
     const remaining = playerMaxRolls - rollNo + 1;
@@ -478,7 +477,7 @@ async function runRound(
 
   const heldAfter = services.ether.balanceOf(uid);
   const min = MIN_BET;
-  const max = Math.min(MAX_BET, heldAfter);
+  const max = Math.min(effectiveMaxBet(services, uid), heldAfter);
   const nextRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`chinchiro:retry:${min}`)
@@ -499,9 +498,6 @@ async function runRound(
     new ButtonBuilder().setCustomId("chinchiro:quit").setLabel("🚪 退席").setStyle(ButtonStyle.Secondary),
   );
 
-  // 演出用の使わない値を silent（TS 気にせず）
-  void netForDisplay;
-
   await reply.edit({ embeds: [resultEmbed], components: [nextRow] }).catch(() => undefined);
 
   const collector = reply.createMessageComponentCollector({
@@ -521,18 +517,15 @@ async function runRound(
       return;
     }
     if (btn.customId.startsWith("chinchiro:retry:")) {
-      collector.stop("retry");
-      const retryBet = Number(btn.customId.split(":")[2]);
-      if (retryBet < MIN_BET || retryBet > MAX_BET) return;
-      await btn.deferUpdate();
-      releaseSeat(uid);
-      if (acquireSeat(uid)) {
-        try {
-          await runRound(btn, services, retryBet);
-        } finally {
-          releaseSeat(uid);
-        }
-      }
+      // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
+      // 断るなら collector を止めない ＝ 押し直せる
+      await handleRetryPress({
+        services,
+        btn,
+        collector,
+        betRaw: Number(btn.customId.split(":")[2]),
+        run: (bet) => runRound(btn, services, bet),
+      });
     }
   });
   collector.on("end", async (_c, reason) => {

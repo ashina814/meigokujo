@@ -161,6 +161,7 @@ export {
   HOUSE_HOLDER,
   POOL_SWEEP_REASON,
   ETHER_APPROVER,
+  isPlayerHolder,
   type EtherQuote,
   type EtherErrorCode,
   type EtherExchangeOptions,
@@ -211,6 +212,7 @@ export {
   type PayoutMode,
   type MarketSettleResult,
   type MarketRefundResult,
+  type MarketsOptions,
 } from "./casino/market.js";
 export {
   CasinoStatus,
@@ -228,7 +230,20 @@ export {
   type CasinoIntegrityReport,
 } from "./casino/integrity.js";
 export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";
-export { Escrow, escrowHolderFor, isEscrowHolder, ESCROW_QUARANTINE, type EscrowRow } from "./casino/escrow.js";
+export {
+  Escrow,
+  escrowHolderFor,
+  isEscrowHolder,
+  ESCROW_QUARANTINE,
+  type EscrowRow,
+  type EscrowOptions,
+} from "./casino/escrow.js";
+export {
+  FreeSpins,
+  FREE_SPIN_JACKPOT_CLAIMS_HOLDER,
+  type PendingFreeSpinRow,
+  type FreeSpinStatus,
+} from "./casino/free-spins.js";
 export { defaultRng, deterministicRng, scriptedRng, type CasinoRng } from "./casino/rng.js";
 export {
   SLOT_SYMBOLS,
