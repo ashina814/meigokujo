@@ -4,6 +4,7 @@ import {
   ChipLedger,
   EventLog,
   FREE_SPIN_JACKPOT_CLAIMS_HOLDER,
+  HouseReservations,
   Ledger,
   TREASURY,
   openDb,
@@ -17,6 +18,8 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chips = new ChipLedger(db, ledger, events);
+  // PR10のactive-ownership検査はPR5の永続予約表を読む。テストでも本番と同じservice構築順にする。
+  new HouseReservations(db, chips, events);
   const flow = new CasinoChipFlow(db, chips, events);
   for (const id of ["alice", "bob"]) {
     ledger.ensureAccount(`user:${id}`, "user");
