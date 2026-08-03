@@ -251,8 +251,13 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       console.error("[vip] tick失敗:", e);
     }
 
+    // 賭場が停止していれば、資金を動かす tick は丸ごと飛ばす。
+    // （資金層でも弾かれるが、毎分例外を出し続けないようにここでも見る）
+    const casinoClosed = services.casinoStatus.denyMessage() !== null;
+    if (casinoClosed) console.log("[賭場] 停止中のため板・株の tick を飛ばします");
+
     // ── 賭場の板: 締切を過ぎた open を closed へ + reported の5分無異議で自動精算 ──
-    try {
+    if (!casinoClosed) try {
       const pending = services.markets.listPastDeadline();
       for (const m of pending) {
         services.markets.autoClose(m.id);
@@ -274,7 +279,7 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     }
 
     // ── マモンの株式市場: 1時間ごとの価格更新 & 期限切れ強制売却 ──
-    try {
+    if (!casinoClosed) try {
       services.stocks.updateAll();
       const forced = services.stocks.forceSellExpired();
       if (forced.length > 0) {
