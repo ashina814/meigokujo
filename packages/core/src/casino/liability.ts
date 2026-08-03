@@ -47,6 +47,50 @@ export interface GameLiabilityModel {
   maxBetFor(available: number, ctx: Omit<LiabilityContext, "bet">): number;
 }
 
+export type LiabilityErrorCode = "ERR_BAD_BET" | "ERR_BET_OVERFLOW" | "ERR_BAD_CONTEXT";
+
+/** モデル関数への不正な入力（PR4監査対応）。他の資金層のエラーと同じ形にしてある */
+export class LiabilityError extends Error {
+  constructor(
+    readonly code: LiabilityErrorCode,
+    readonly meta: Record<string, unknown> = {},
+  ) {
+    super(code);
+    this.name = "LiabilityError";
+  }
+}
+
+/**
+ * 全モデル共通の入力検証（PR4監査対応）。
+ *
+ * 賭け金に NaN・Infinity・負数・小数を渡すと、`Math.max(0, NaN)` が NaN を返す・
+ * 負数が「債務0」に化けるなど、**過小評価側**に倒れる経路が生まれる（正本 I7 違反）。
+ * ここで即座に例外にして、呼び出し側（PR5 の予約層）が必ず気付けるようにする。
+ *
+ * 掛け算後も safe integer に収まるよう、賭け金自体にも上限を設ける。
+ * 現行の最大実効倍率はポーカーのロイヤル(251倍)×連鎖の最大(2.0倍)≈502倍。
+ * 将来の倍率追加にも耐えるよう、大きめの安全率(1,000倍)で頭打ちにする。
+ */
+const MAX_SAFE_EFFECTIVE_MULTIPLIER = 1_000;
+export const MAX_SAFE_LIABILITY_BET = Math.floor(Number.MAX_SAFE_INTEGER / MAX_SAFE_EFFECTIVE_MULTIPLIER);
+
+function assertValidBet(bet: number): void {
+  if (!Number.isInteger(bet) || bet <= 0) throw new LiabilityError("ERR_BAD_BET", { bet });
+  if (bet > MAX_SAFE_LIABILITY_BET) throw new LiabilityError("ERR_BET_OVERFLOW", { bet, max: MAX_SAFE_LIABILITY_BET });
+}
+
+function assertValidContext(ctx: LiabilityContext): void {
+  assertValidBet(ctx.bet);
+  const { winStreak } = ctx.playerState;
+  if (!Number.isInteger(winStreak) || winStreak < 0) {
+    throw new LiabilityError("ERR_BAD_CONTEXT", { field: "winStreak", value: winStreak });
+  }
+  const { winBonusCap } = ctx.activeEffects;
+  if (!Number.isFinite(winBonusCap) || winBonusCap < 0) {
+    throw new LiabilityError("ERR_BAD_CONTEXT", { field: "winBonusCap", value: winBonusCap });
+  }
+}
+
 /** そのゲームで連鎖ボーナスが効くか。実装で `chain: false` にしているゲームは 1.0 固定 */
 export type ChainMode = "on" | "off";
 
@@ -73,6 +117,7 @@ function chainMult(mode: ChainMode, winStreak: number): number {
  * 配当が最大のときも同時に出ていくので、そのまま足す。
  */
 function liabilityFrom(maxPayout: number, ctx: LiabilityContext, chain: ChainMode, mandatory = 0): number {
+  assertValidContext(ctx);
   const c = chainMult(chain, ctx.playerState.winStreak);
   const gross = Math.ceil((maxPayout + ctx.activeEffects.winBonusCap) * c);
   return Math.max(0, gross + mandatory - ctx.bet);
@@ -113,8 +158,14 @@ function fixedMultModel(
   return {
     game,
     maxHouseLiability: liability,
-    mandatoryHouseOutflow: (ctx) => mandatory(ctx.bet),
-    maxPlayerLoss: (ctx) => ctx.bet,
+    mandatoryHouseOutflow: (ctx) => {
+      assertValidContext(ctx);
+      return mandatory(ctx.bet);
+    },
+    maxPlayerLoss: (ctx) => {
+      assertValidContext(ctx);
+      return ctx.bet;
+    },
     maxBetFor: (available, ctx) => betForLiability(available, ctx, (bet) => liability({ ...ctx, bet })),
   };
 }
@@ -155,14 +206,21 @@ export const holdemLiability: GameLiabilityModel = {
   game: "ホールデム",
   // 賭け金の回収は「実際に積んだ額 T」なので、最悪ケースでは ante ではなく T を引く
   maxHouseLiability: (ctx) => {
+    assertValidContext(ctx);
     const total = ctx.bet * HOLDEM_MAX_TOTAL_BET_MULT;
     const c = chainMult("on", ctx.playerState.winStreak);
     const gross = Math.ceil((ctx.bet * HOLDEM_MAX_PAYOUT_MULT + ctx.activeEffects.winBonusCap) * c);
     return Math.max(0, gross - total);
   },
-  mandatoryHouseOutflow: () => 0,
+  mandatoryHouseOutflow: (ctx) => {
+    assertValidContext(ctx);
+    return 0;
+  },
   // フォールドしても失うのは積んだぶんまで。最悪は T
-  maxPlayerLoss: (ctx) => ctx.bet * HOLDEM_MAX_TOTAL_BET_MULT,
+  maxPlayerLoss: (ctx) => {
+    assertValidContext(ctx);
+    return ctx.bet * HOLDEM_MAX_TOTAL_BET_MULT;
+  },
   maxBetFor: (available, ctx) =>
     betForLiability(available, ctx, (bet) => holdemLiability.maxHouseLiability({ ...ctx, bet })),
 };
@@ -178,12 +236,19 @@ export const BLACKJACK_NO_DOUBLE_MAX_PAYOUT_MULT = 2.5; // ナチュラル BJ �
 export const blackjackLiability: GameLiabilityModel = {
   game: "ブラックジャック",
   maxHouseLiability: (ctx) => {
+    assertValidContext(ctx);
     const c = chainMult("on", ctx.playerState.winStreak);
     const gross = Math.ceil((ctx.bet * BLACKJACK_MAX_PAYOUT_MULT + ctx.activeEffects.winBonusCap) * c);
     return Math.max(0, gross - ctx.bet * 2); // ダブルで 2·bet を回収する
   },
-  mandatoryHouseOutflow: () => 0,
-  maxPlayerLoss: (ctx) => ctx.bet * 2,
+  mandatoryHouseOutflow: (ctx) => {
+    assertValidContext(ctx);
+    return 0;
+  },
+  maxPlayerLoss: (ctx) => {
+    assertValidContext(ctx);
+    return ctx.bet * 2;
+  },
   maxBetFor: (available, ctx) =>
     betForLiability(available, ctx, (bet) => blackjackLiability.maxHouseLiability({ ...ctx, bet })),
 };
@@ -197,8 +262,14 @@ export const blackjackNoDoubleLiability = fixedMultModel("ブラックジャッ�
 export const chinchiroLiability: GameLiabilityModel = {
   game: "チンチロ",
   maxHouseLiability: (ctx) => liabilityFrom(chinchiroMaxPayout(ctx.bet), ctx, "on"),
-  mandatoryHouseOutflow: () => 0,
-  maxPlayerLoss: (ctx) => chinchiroMaxPlayerLoss(ctx.bet),
+  mandatoryHouseOutflow: (ctx) => {
+    assertValidContext(ctx);
+    return 0;
+  },
+  maxPlayerLoss: (ctx) => {
+    assertValidContext(ctx);
+    return chinchiroMaxPlayerLoss(ctx.bet);
+  },
   maxBetFor: (available, ctx) =>
     betForLiability(available, ctx, (bet) => liabilityFrom(chinchiroMaxPayout(bet), { ...ctx, bet }, "on")),
 };
@@ -215,13 +286,20 @@ export interface RouletteBet {
 
 /** ベット1件を追加で受けるときの増分債務（そのベットが当たったぶんの純増） */
 export function rouletteIncrementalLiability(bet: RouletteBet): number {
+  assertValidBet(bet.amount);
   const odds = bet.type === "single" ? ROULETTE_PAYOUTS.single : ROULETTE_PAYOUTS.even;
   return Math.max(0, Math.ceil(bet.amount * (odds - 1)));
 }
 
-/** 卓に載っている全ベットの合計債務 */
+/**
+ * 卓に載っている全ベットの合計債務。
+ * 各ベットの検証は {@link rouletteIncrementalLiability} が担うが、**合計**は
+ * ベット件数ぶん膨らむので、それでも safe integer を超えたら明示的に拒否する。
+ */
 export function rouletteTableLiability(bets: readonly RouletteBet[]): number {
-  return bets.reduce((sum, b) => sum + rouletteIncrementalLiability(b), 0);
+  const total = bets.reduce((sum, b) => sum + rouletteIncrementalLiability(b), 0);
+  if (!Number.isSafeInteger(total)) throw new LiabilityError("ERR_BET_OVERFLOW", { total, betCount: bets.length });
+  return total;
 }
 
 // ─── 参照表 ─────────────────────────────────────────────
@@ -237,6 +315,13 @@ export const LIABILITY_MODELS: Readonly<Record<string, GameLiabilityModel>> = {
   ホールデム: holdemLiability,
 };
 
+/**
+ * `LIABILITY_MODELS[game]` を直接引くと、`game === "__proto__"` 等の
+ * プロトタイプ汚染系キーでプレーンオブジェクトの継承プロパティを拾ってしまい、
+ * 「未知のゲーム」のはずが undefined 以外の値を返す（PR4監査対応）。
+ * `hasOwnProperty` で自前キーだけに絞る。
+ */
 export function liabilityModelFor(game: string): GameLiabilityModel | undefined {
+  if (!Object.prototype.hasOwnProperty.call(LIABILITY_MODELS, game)) return undefined;
   return LIABILITY_MODELS[game];
 }

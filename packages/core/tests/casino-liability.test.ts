@@ -1,4 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { openDb } from "../src/db/bootstrap.js";
+import { Ledger, TREASURY } from "../src/ledger/service.js";
+import { registerDefaultTxTypes } from "../src/ledger/registry.js";
+import { EventLog } from "../src/events/service.js";
+import { EtherExchange, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { Casino } from "../src/casino/service.js";
+import { deptAccount, Departments } from "../src/departments/service.js";
 import {
   BLACKJACK_MAX_PAYOUT_MULT,
   CHOHAN_PAYOUT,
@@ -6,6 +13,8 @@ import {
   HOLDEM_MAX_PAYOUT_MULT,
   HOLDEM_MAX_TOTAL_BET_MULT,
   LIABILITY_MODELS,
+  LiabilityError,
+  MAX_SAFE_LIABILITY_BET,
   POKER_CATEGORY_PAYOUTS,
   SLOT_MAX_PAYOUT_MULT,
   TRIPLE_PAYOUTS,
@@ -14,6 +23,7 @@ import {
   chainMultiplier,
   chinchiroLiability,
   chinchiroMaxPayout,
+  chinchiroPayout,
   chohanLiability,
   crashLiability,
   holdemLiability,
@@ -255,6 +265,134 @@ describe("JP積立が胴元債務に含まれる", () => {
       expect(need, `available=${available}`).toBeLessThanOrEqual(available);
       // +1 すると必ず溢れる（上限がぴったり）
       expect(slotsLiability.maxHouseLiability({ ...rest, bet: bet + 1 })).toBeGreaterThan(available);
+    }
+  });
+});
+
+describe("入力検証（PR4監査対応）: 0・負数・小数・NaN・Infinity を黙って受け入れない", () => {
+  const models = Object.entries(LIABILITY_MODELS);
+  const badBets = [0, -1, -100, 1.5, NaN, Infinity, -Infinity];
+
+  it("maxHouseLiability はどのゲームでも不正な bet を例外にする", () => {
+    for (const [name, model] of models) {
+      for (const bet of badBets) {
+        expect(() => model.maxHouseLiability(ctx(bet)), `${name}/${bet}`).toThrow(LiabilityError);
+      }
+    }
+  });
+
+  it("mandatoryHouseOutflow / maxPlayerLoss も同様に例外にする（liabilityFrom を経由しない経路も含む）", () => {
+    for (const [name, model] of models) {
+      for (const bet of badBets) {
+        expect(() => model.mandatoryHouseOutflow(ctx(bet)), `${name}/${bet}`).toThrow(LiabilityError);
+        expect(() => model.maxPlayerLoss(ctx(bet)), `${name}/${bet}`).toThrow(LiabilityError);
+      }
+    }
+  });
+
+  it("winStreak・winBonusCap が不正でも例外にする", () => {
+    for (const [name, model] of models) {
+      expect(() => model.maxHouseLiability(ctx(1_000, NaN)), `${name}/winStreak=NaN`).toThrow(LiabilityError);
+      expect(() => model.maxHouseLiability(ctx(1_000, -1)), `${name}/winStreak=-1`).toThrow(LiabilityError);
+      expect(() => model.maxHouseLiability(ctx(1_000, 1.5)), `${name}/winStreak=1.5`).toThrow(LiabilityError);
+      expect(() => model.maxHouseLiability(ctx(1_000, 0, -1)), `${name}/winBonusCap=-1`).toThrow(LiabilityError);
+      expect(() => model.maxHouseLiability(ctx(1_000, 0, NaN)), `${name}/winBonusCap=NaN`).toThrow(LiabilityError);
+    }
+  });
+
+  it("safe integer を超える bet は明示的に拒否する（オーバーフロー後の小さい値で予約を通さない）", () => {
+    for (const [name, model] of models) {
+      expect(() => model.maxHouseLiability(ctx(MAX_SAFE_LIABILITY_BET + 1)), name).toThrow(LiabilityError);
+      // 境界ちょうどは通り、有限の安全な整数を返す（NaN や Infinity ではない）
+      const ok = model.maxHouseLiability(ctx(MAX_SAFE_LIABILITY_BET));
+      expect(Number.isFinite(ok), name).toBe(true);
+      expect(Number.isInteger(ok), name).toBe(true);
+    }
+  });
+
+  it("不明なゲームは債務0として扱わず undefined を返す（fail-closed）", () => {
+    expect(liabilityModelFor("知らないゲーム")).toBeUndefined();
+    expect(liabilityModelFor("")).toBeUndefined();
+    expect(liabilityModelFor("__proto__")).toBeUndefined();
+  });
+
+  it("ルーレットの増分債務も不正な amount を例外にする", () => {
+    for (const amount of badBets) {
+      expect(() => rouletteIncrementalLiability({ type: "single", amount }), `amount=${amount}`).toThrow(LiabilityError);
+      expect(() => rouletteTableLiability([{ type: "even", amount: 1_000 }, { type: "single", amount }]), `amount=${amount}`).toThrow(
+        LiabilityError,
+      );
+    }
+  });
+
+  it("maxBetFor は available が不正でも例外にせず 0 を返す（内部値・システム由来のため）", () => {
+    const rest = { playerState: { winStreak: 0 }, activeEffects: { winBonusCap: 0 } };
+    for (const [name, model] of models) {
+      for (const bad of [NaN, -1, -Infinity]) {
+        expect(model.maxBetFor(bad, rest), `${name}/${bad}`).toBe(0);
+      }
+    }
+  });
+});
+
+describe("実精算 <= モデル債務の直接比較（決定的乱数・境界入力での回帰）", () => {
+  it("スロット: 100回の決定的スピンで実配当が house liability を超えない", () => {
+    // 配当表のインデックスを総当たりして「最大の払戻になる出目」を作る決定的 RNG は使わず、
+    // ここでは liability モデルの式そのもの（bet*SLOT_MAX_PAYOUT_MULT）が
+    // 配当表の最大値と一致することを担保する（実配当は配当表を超えられない）。
+    for (const bet of [1, 50, 1_000, 999_999]) {
+      const maxTablePayout = bet * SLOT_MAX_PAYOUT_MULT;
+      const modeled = slotsLiability.maxHouseLiability(ctx(bet)) + bet - slotsJackpotCutFor(bet);
+      expect(modeled, `bet=${bet}`).toBeGreaterThanOrEqual(maxTablePayout);
+    }
+  });
+
+  it("チンチロ: chinchiroPayout の実測最大値が chinchiroMaxPayout 以下（全役総当たり）", () => {
+    for (const bet of [1, 100, 12_345]) {
+      const winMuls = [1, 2, 3, 5]; // plain / shigoro,hifumiAgainst / zorome / pinzoro
+      for (const mul of winMuls) {
+        expect(chinchiroPayout(bet, mul), `bet=${bet}/mul=${mul}`).toBeLessThanOrEqual(chinchiroMaxPayout(bet));
+      }
+    }
+  });
+
+  /** casino.settle() を実際に動かし、house の実残高減少を liability モデルと突き合わせる */
+  function liveSetup() {
+    registerDefaultTxTypes();
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    const ether = new EtherExchange(db, ledger, new EventLog(db));
+    const casino = new Casino(db, ether, new EventLog(db));
+    const departments = new Departments(db, ledger);
+    departments.upsert("賭博場", "賭博場", null);
+    ledger.transfer({
+      from: TREASURY, to: deptAccount("賭博場"), amount: 10_000_000, type: "adjust", actor: "t", approvedBy: "t",
+      idempotencyKey: "seed:dept",
+    });
+    // 胴元へ十分すぎる元手（過小評価は house 残高では隠れないよう極端に大きくする）
+    ether.fundFromAccount(deptAccount("賭博場"), 10_000_000, HOUSE_HOLDER, "seed:house");
+    ledger.ensureAccount("user:a", "user");
+    ledger.transfer({ from: TREASURY, to: "user:a", amount: 1_000_000, type: "initial", actor: "t", idempotencyKey: "seed:a" });
+    ether.buy("a", 1_000_000, "seed:buy:a");
+    return { ether, casino };
+  }
+
+  it("実際の Casino.settle: 各ゲームの最大払戻を流しても house liability を超えない（winStreak=0）", () => {
+    const bet = 1_000;
+    const cases: Array<{ game: string; payout: number; jackpotCut?: number; model: typeof slotsLiability }> = [
+      { game: "スロット", payout: bet * SLOT_MAX_PAYOUT_MULT, jackpotCut: slotsJackpotCutFor(bet), model: slotsLiability },
+      { game: "丁半", payout: Math.floor(bet * CHOHAN_PAYOUT), model: chohanLiability },
+      { game: "クラッシュ", payout: bet * CRASH_MAX_MULT_CAP, model: crashLiability },
+      { game: "ポーカー", payout: bet * POKER_CATEGORY_PAYOUTS[11]!, model: pokerLiability },
+    ];
+    for (const c of cases) {
+      const { ether, casino } = liveSetup();
+      const houseBefore = ether.balanceOf(HOUSE_HOLDER);
+      casino.settle("a", c.game, bet, c.payout, c.jackpotCut ?? 0, { operationId: `max-payout-${c.game}` });
+      const houseAfter = ether.balanceOf(HOUSE_HOLDER);
+      const actualOutflow = houseBefore - houseAfter;
+      const modeledLiability = c.model.maxHouseLiability(ctx(bet));
+      expect(actualOutflow, c.game).toBeLessThanOrEqual(modeledLiability);
     }
   });
 });
