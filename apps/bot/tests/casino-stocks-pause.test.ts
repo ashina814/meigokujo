@@ -9,7 +9,8 @@ import {
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { STOCKS_PAUSED, STOCKS_PAUSE_REASON, replyStocksPaused } from "../src/casino/stocks-pause.js";
 
 registerDefaultTxTypes();
@@ -43,7 +44,14 @@ describe("コマンド登録から外れている", () => {
     expect(src).not.toContain("handleStocksButton");
     expect(src).not.toContain("handleStocksSelect");
     expect(src).not.toContain("handleStocksModal");
+    expect(src).not.toContain("commands/stocks.js");
+    expect(src).not.toContain("commands/stocks.ts");
     expect(src).toContain("replyStocksPaused");
+  });
+
+  it("直接 services.stocks.buy/sell を呼ぶ旧UIファイルが存在しない（死んだ導入経路を残さない）", () => {
+    const path = fileURLToPath(new URL("../src/commands/stocks.ts", import.meta.url));
+    expect(existsSync(path)).toBe(false);
   });
 
   it("ホーム（/案内）の導線から外れ、停止中とだけ書いてある", () => {
@@ -54,19 +62,43 @@ describe("コマンド登録から外れている", () => {
 });
 
 describe("停止理由が利用者に説明される", () => {
-  it("理由文に「停止」と「建玉を触らない」が入っている", () => {
+  it("理由文に「停止」「建玉を触らない」「購入も売却もできない」が入っている", () => {
     expect(STOCKS_PAUSED).toBe(true);
     expect(STOCKS_PAUSE_REASON).toContain("停止");
     expect(STOCKS_PAUSE_REASON).toContain("持っている株はそのままだ");
+    // 「持っている株はそのまま」だけだと売却はできると誤解されうるため、
+    // 購入・売却がどちらも止まっていることを明示している
+    expect(STOCKS_PAUSE_REASON).toContain("新規の購入も、保有株の売却も、今はできない");
   });
 
-  it("コマンド・ボタン・選択のどれでも同じ文面を ephemeral で返す", async () => {
+  it("コマンド・ボタン・選択のどれでも同じ文面を ephemeral で返す（未応答時は reply）", async () => {
     const reply = vi.fn(async () => undefined);
-    const i = { isRepliable: () => true, reply } as never;
+    const followUp = vi.fn(async () => undefined);
+    const i = { isRepliable: () => true, replied: false, deferred: false, reply, followUp } as never;
     await replyStocksPaused(i);
     expect(reply).toHaveBeenCalledTimes(1);
+    expect(followUp).not.toHaveBeenCalled();
     expect(reply.mock.calls[0]![0].content).toBe(STOCKS_PAUSE_REASON);
     expect(reply.mock.calls[0]![0].flags).toBeDefined();
+  });
+
+  it("既に reply 済みの interaction には followUp で返す（InteractionAlreadyReplied を起こさない）", async () => {
+    const reply = vi.fn(async () => undefined);
+    const followUp = vi.fn(async () => undefined);
+    const i = { isRepliable: () => true, replied: true, deferred: false, reply, followUp } as never;
+    await replyStocksPaused(i);
+    expect(reply).not.toHaveBeenCalled();
+    expect(followUp).toHaveBeenCalledTimes(1);
+    expect(followUp.mock.calls[0]![0].content).toBe(STOCKS_PAUSE_REASON);
+  });
+
+  it("既に defer 済みの interaction にも followUp で返す", async () => {
+    const reply = vi.fn(async () => undefined);
+    const followUp = vi.fn(async () => undefined);
+    const i = { isRepliable: () => true, replied: false, deferred: true, reply, followUp } as never;
+    await replyStocksPaused(i);
+    expect(reply).not.toHaveBeenCalled();
+    expect(followUp).toHaveBeenCalledTimes(1);
   });
 
   it("応答できない interaction には何もしない", async () => {

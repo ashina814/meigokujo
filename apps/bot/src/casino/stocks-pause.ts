@@ -21,12 +21,23 @@ export const STOCKS_PAUSE_REASON = [
   "胴元が引き当てを持てない賭けだったからだ。値動きは前の流れを引きずるので、",
   "乗れば勝ち続けられる。それに対して賭場の取り分は売却手数料の1%しかない。",
   "",
-  "**持っている株はそのままだ。** 勝手に売り払ったりはしない。",
+  "**新規の購入も、保有株の売却も、今はできない。**",
+  "持っている株はそのままだ。勝手に売り払ったりはしない。",
   "扱いが決まるまで凍結し、決まったら本人に知らせる。",
 ].join("\n");
 
-/** 停止理由を利用者へ返す（コマンド・ボタン・選択のどれでも同じ文面） */
+/**
+ * 停止理由を利用者へ返す（コマンド・ボタン・選択のどれでも同じ文面）。
+ * 呼び出し元は denyIfCasinoClosed を先に通っており未応答のはずだが、
+ * 将来の配線変更で reply/defer 済みの interaction から呼ばれても
+ * InteractionAlreadyReplied で落ちないよう followUp にフォールバックする。
+ */
 export async function replyStocksPaused(interaction: Interaction): Promise<void> {
   if (!interaction.isRepliable()) return;
-  await interaction.reply({ content: STOCKS_PAUSE_REASON, flags: MessageFlags.Ephemeral });
+  const payload = { content: STOCKS_PAUSE_REASON, flags: MessageFlags.Ephemeral } as const;
+  if (interaction.replied || interaction.deferred) {
+    await interaction.followUp(payload);
+  } else {
+    await interaction.reply(payload);
+  }
 }
