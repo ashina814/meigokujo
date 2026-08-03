@@ -5,7 +5,7 @@ import { exchangePanelMessage } from "../src/commands/exchange-panel.js";
 describe("PR13 Land表示と運転資金表", () => {
   it("正本の最小・最大賭け額と福分けスケールを固定し、2/5/10人の予約額を出す", () => {
     expect(LAND_SCALE).toEqual({ minBet: 5, maxBet: 100_000, etherFukuScale: 10 });
-    const report = houseCapacityReport(50_000, ["slots", "chinchiro", "holdem"]);
+    const report = houseCapacityReport(50_000, ["スロット", "チンチロ", "ホールデム"]);
     expect(report.complete).toBe(true);
     expect(report.unsupportedGames).toEqual([]);
     expect(report.games).toHaveLength(3);
@@ -19,11 +19,11 @@ describe("PR13 Land表示と運転資金表", () => {
   });
 
   it("債務モデルが無いゲームを1倍で推定せず、推奨開業house額を出さない", () => {
-    const report = houseCapacityReport(50_000, ["slots", "unknown-game"]);
+    const report = houseCapacityReport(50_000, ["スロット", "unknown-game"]);
     expect(report.complete).toBe(false);
     expect(report.unsupportedGames).toEqual(["unknown-game"]);
     expect(report.recommendedOpeningHouse).toBeNull();
-    expect(report.games.map((row) => row.game)).toEqual(["slots"]);
+    expect(report.games.map((row) => row.game)).toEqual(["スロット"]);
   });
 
   it("does not render legacy exchange controls or legacy user-facing terminology", () => {
