@@ -1,0 +1,4 @@
+
+> @meigokujo/bot@0.1.0 typecheck /home/runner/work/meigokujo/meigokujo/apps/bot
+> tsc --noEmit
+

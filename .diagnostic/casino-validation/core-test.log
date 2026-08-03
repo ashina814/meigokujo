@@ -1,0 +1,978 @@
+
+> @meigokujo/core@0.1.0 test /home/runner/work/meigokujo/meigokujo/packages/core
+> vitest run && vitest run --config vitest.serial.config.ts
+
+
+[1m[46m RUN [49m[22m [36mv3.2.6 [39m[90m/home/runner/work/meigokujo/meigokujo/packages/core[39m
+
+[90mstderr[2m | tests/casino-escrow.test.ts[2m > [22m[2mエスクロー資金分離[2m > [22m[2msweepAll: 破損セッションがあっても正常セッションは返金され、Bot 起動は継続できる
+[22m[39m[escrow] セッション broken の返金失敗（帳簿=5000 保有者=4000）: escrow mismatch: ledger=5000 holder=4000。帳簿は残し house 補填もしない。要調査
+
+[90mstderr[2m | tests/casino-escrow.test.ts[2m > [22m[2mエスクロー資金分離[2m > [22m[2msweepAll: 孤児残高は house ではなく sys:escrow:quarantine へ隔離する
+[22m[39m[escrow] 孤児残高を隔離: holder=escrow:session:sess1 amount=4000 → sys:escrow:quarantine（要調査）
+
+[90mstderr[2m | tests/casino-escrow.test.ts[2m > [22m[2mエスクロー資金分離[2m > [22m[2m隔離残高は Casino.canAccept が見る house 残高に含まれない
+[22m[39m[escrow] 孤児残高を隔離: holder=escrow:session:sess1 amount=4000 → sys:escrow:quarantine（要調査）
+
+[90mstderr[2m | tests/casino-escrow.test.ts[2m > [22m[2mエスクロー資金分離[2m > [22m[2mreleaseFromQuarantine: 隔離残高を手動で返金または帳消しできる
+[22m[39m[escrow] 孤児残高を隔離: holder=escrow:session:sess1 amount=4000 → sys:escrow:quarantine（要調査）
+
+[90mstderr[2m | tests/casino-escrow.test.ts[2m > [22m[2mMarkets: 資金分離と精算[2m > [22m[2m孤児検出: escrow:market:* も対象になる（settled 済みなのに残高が残っているケース）
+[22m[39m[escrow] 孤児残高を隔離: holder=escrow:market:1 amount=500 → sys:escrow:quarantine（要調査）
+
+ [32m✓[39m tests/casino-chip-tx.test.ts [2m([22m[2m40 tests[22m[2m)[22m[33m 450[2mms[22m[39m
+ [32m✓[39m tests/casino-integrity.test.ts [2m([22m[2m34 tests[22m[2m)[22m[33m 488[2mms[22m[39m
+ [32m✓[39m tests/casino-escrow.test.ts [2m([22m[2m44 tests[22m[2m)[22m[33m 664[2mms[22m[39m
+ [32m✓[39m tests/entry.test.ts [2m([22m[2m30 tests[22m[2m)[22m[33m 362[2mms[22m[39m
+ [31m❯[39m tests/casino-recovery.test.ts [2m([22m[2m21 tests[22m[2m | [22m[31m18 failed[39m[2m)[22m[32m 202[2mms[22m[39m
+   [32m✓[39m レジストリは所有元が自分で申告する[2m > [22m同じ種別を二重登録できない[32m 3[2mms[22m[39m
+   [32m✓[39m レジストリは所有元が自分で申告する[2m > [22m1つの申告が落ちても他の申告は集まる[32m 1[2mms[22m[39m
+   [32m✓[39m レジストリは所有元が自分で申告する[2m > [22m復旧の実装は casino_tables を直接参照していない（登録型に閉じている）[32m 2[2mms[22m[39m
+[31m   [31m×[31m 生きている預託は維持し、孤児だけ返金する[2m > [22m登録済みの板は触らず、登録の無いセッションだけ返金する[39m[32m 20[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 生きている預託は維持し、孤児だけ返金する[2m > [22m競馬は登録しないので、再起動のたびに返金される（意図した挙動）[39m[32m 10[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 生きている預託は維持し、孤児だけ返金する[2m > [22m帳簿が無いのに残高がある escrow:* は隔離する[39m[32m 14[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 生きている預託は維持し、孤児だけ返金する[2m > [22m生きている板の保有者は、帳簿が無くても隔離しない[39m[32m 8[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 不一致は返金も隔離もせず記録だけ残す[2m > [22m帳簿と保有者残高が合わないセッションは凍結される[39m[32m 8[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 不一致は返金も隔離もせず記録だけ残す[2m > [22m1セッションの不一致が他のセッションの復旧を止めない[39m[32m 8[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 検算NGなら以降のステップを実行しない[2m > [22mチップ残高を1 Ld ずらすと integrity_halt になり、返金も隔離も走らない[39m[32m 13[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 検算NGなら以降のステップを実行しない[2m > [22m人が止めている状態では検算だけ行い、資金も状態も触らない[39m[32m 9[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 検算NGなら以降のステップを実行しない[2m > [22mintegrity_halt のままなら自動では開けない（人の確認を待つ）[39m[32m 11[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 債務予約の解放（S9）と再開（S12）[2m > [22m復旧の中で予約が全解放される[39m[32m 9[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 債務予約の解放（S9）と再開（S12）[2m > [22m正常終了なら open へ戻り、手順が記録される[39m[32m 7[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 債務予約の解放（S9）と再開（S12）[2m > [22m生存中エスクローの収集に失敗したら掃除も再開もしない[39m[32m 9[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 孤児返金の技術失敗が結果に残る[2m > [22m失敗したセッションは failedSessions に出て、帳簿と残高は維持される[39m[32m 12[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m recovery_halt は通常の再開導線から開けられない[2m > [22mA〜Dが通っても通常の再開（reopenAfterIntegrity）では開かない[39m[32m 8[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m recovery_halt は通常の再開導線から開けられない[2m > [22mBot 再起動後も専用停止状態が残る[39m[32m 12[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m recovery_halt は通常の再開導線から開けられない[2m > [22m復旧再実行の前検NGでも復旧義務を保持し、S12成功時だけ解除する[39m[32m 19[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m recovery_halt は通常の再開導線から開けられない[2m > [22msource が直ったあとに復旧を再実行すると S4〜S12 が動いて open になる[39m[32m 8[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m recovery_halt は通常の再開導線から開けられない[2m > [22m復旧が成功したときだけ open になる（もう一度回しても二重返金しない）[39m[32m 7[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+ [31m❯[39m tests/casino-reservations.test.ts [2m([22m[2m27 tests[22m[2m | [22m[31m27 failed[39m[2m)[22m[32m 199[2mms[22m[39m
+[31m   [31m×[31m available = house 残高 − 予約合計[2m > [22m予約したぶんだけ受注可能額が減る[39m[32m 20[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m available = house 残高 − 予約合計[2m > [22mcanAccept が house 残高ではなく available を見る[39m[32m 6[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m available = house 残高 − 予約合計[2m > [22m余力を超える予約は断り、そのときの上限を返す[39m[32m 6[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m available = house 残高 − 予約合計[2m > [22m同じ鍵の再試行は二重に取らない[39m[32m 9[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m available = house 残高 − 予約合計[2m > [22m債務ゼロの予約は行を作らない[39m[32m 5[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 同時実行しても house 残高が負にならない[2m > [22m100件を同時に取りにいっても、予約合計が house 残高を超えない[39m[32m 5[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 同時実行しても house 残高が負にならない[2m > [22m予約を取った全員が最大配当を引いても house が払い切れる[39m[32m 5[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 同時実行しても house 残高が負にならない[2m > [22m小口が先に埋めたら大口は断られる（早い者勝ちで枠が守られる）[39m[32m 5[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 予約失敗時に金が動かない[2m > [22m予約を先に取ってから精算する経路では、取れなければ精算に入らない[39m[32m 6[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 予約失敗時に金が動かない[2m > [22m精算の中で例外が出れば、予約も残高もまとめて巻き戻る[39m[32m 6[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 精算が通ると予約が同じトランザクションで解放される[2m > [22msettleSolo に reservationKey を渡すと解放される[39m[32m 5[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 精算が通ると予約が同じトランザクションで解放される[2m > [22m鍵を渡さなければ解放されない（明示した経路だけが解放する）[39m[32m 5[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m maxBetFor が予約後の余力を反映する[2m > [22m予約が入ると提示できる最大ベットが下がる[39m[32m 8[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m maxBetFor が予約後の余力を反映する[2m > [22mゲームごとに倍率が違うので提示額も違う[39m[32m 9[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 起動時の全解放と漏れ検出[2m > [22m全解放は件数と総額を events へ残してから消す[39m[32m 8[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 起動時の全解放と漏れ検出[2m > [22m予約が無いときは記録も作らない[39m[32m 6[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 起動時の全解放と漏れ検出[2m > [22m24時間残った予約を検出して警告つきで解放する[39m[32m 5[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m availableIncludingOwn（自己予約を支払保証として使う）[2m > [22m自分の予約ぶんだけ戻し、他人の予約は引いたまま[39m[32m 6[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m availableIncludingOwn（自己予約を支払保証として使う）[2m > [22m解放後は自己予約ぶんが戻らない[39m[32m 14[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m JP積立を含めても予約済み資金を侵食しない[2m > [22m2件の予約が並び、片方が最大配当+JP積立を出しても、もう片方も満額払える[39m[32m 7[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m JP積立を含めても予約済み資金を侵食しない[2m > [22mJP積立が払えなかったら黙って飛ばさず記録する[39m[32m 7[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 同じ予約鍵は内容まで一致したときだけ冪等成功[2m > [22m同じ鍵・同じ内容は冪等成功で、保存済みの行が返る[39m[32m 6[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 同じ予約鍵は内容まで一致したときだけ冪等成功[2m > [22m同じ鍵・異なる amount は拒否する（資金も予約も動かない）[39m[32m 7[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 同じ予約鍵は内容まで一致したときだけ冪等成功[2m > [22m同じ鍵・異なる game は拒否する[39m[32m 7[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 同じ予約鍵は内容まで一致したときだけ冪等成功[2m > [22m同じ鍵・異なる userId は拒否する[39m[32m 7[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 同じ予約鍵は内容まで一致したときだけ冪等成功[2m > [22m同じ鍵を何度実行しても、全呼出が同じ保存結果を受け取る[39m[32m 7[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+[31m   [31m×[31m 同じ予約鍵は内容まで一致したときだけ冪等成功[2m > [22m余力不足は conflict ではなく capacity として返る[39m[32m 6[2mms[22m[39m
+[31m     → EtherExchange is not a constructor[39m
+ [32m✓[39m tests/casino-opening-reset.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 219[2mms[22m[39m
+ [32m✓[39m tests/casino-idempotency.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 135[2mms[22m[39m
+ [32m✓[39m tests/casino-remittance.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 148[2mms[22m[39m
+ [32m✓[39m tests/rooms.test.ts [2m([22m[2m21 tests[22m[2m)[22m[32m 257[2mms[22m[39m
+ [32m✓[39m tests/evaluation.test.ts [2m([22m[2m15 tests[22m[2m)[22m[33m 308[2mms[22m[39m
+[90mstderr[2m | tests/entry-sessions.test.ts[2m > [22m[2m通常枠の設定[2m > [22m[2mJSON配列でもカンマ区切りでも受け付け、範囲外・数値でない値は捨てる
+[22m[39m[説明会] entry:session_hours の設定値を解釈できませんでした（23, 21, 21, 24, あ）: 0〜23の整数以外を無視しました
+
+[90mstderr[2m | tests/entry-sessions.test.ts[2m > [22m[2m通常枠の設定[2m > [22m[2m整数以外は数値に化かさず捨てる（true/null/小数/16進表記など）
+[22m[39m[説明会] entry:session_hours の設定値を解釈できませんでした（[true, 21]）: 0〜23の整数以外を無視しました
+[説明会] entry:session_hours の設定値を解釈できませんでした（[null, 22]）: 0〜23の整数以外を無視しました
+[説明会] entry:session_hours の設定値を解釈できませんでした（[true]）: 0〜23の整数がひとつも無いため既定値を使います
+[説明会] entry:session_hours の設定値を解釈できませんでした（[null]）: 0〜23の整数がひとつも無いため既定値を使います
+[説明会] entry:session_hours の設定値を解釈できませんでした（[21.5, 23]）: 0〜23の整数以外を無視しました
+[説明会] entry:session_hours の設定値を解釈できませんでした（["0x15", " 21 "]）: 0〜23の整数以外を無視しました
+[説明会] entry:session_hours の設定値を解釈できませんでした（[{"hour":21}]）: 0〜23の整数がひとつも無いため既定値を使います
+[説明会] entry:session_skip_dow の設定値を解釈できませんでした（[true, false]）: 0〜6の整数がひとつも無いため既定値を使います
+
+[90mstderr[2m | tests/entry-sessions.test.ts[2m > [22m[2m通常枠の設定[2m > [22m[2m休みなしと認めるのは明示的な [] だけ、時刻が全滅した設定は既定値へ落とす
+[22m[39m[説明会] entry:session_skip_dow の設定値を解釈できませんでした（,）: 0〜6の整数がひとつも無いため既定値を使います
+[説明会] entry:session_skip_dow の設定値を解釈できませんでした（毎日）: 0〜6の整数がひとつも無いため既定値を使います
+[説明会] entry:session_skip_dow の設定値を解釈できませんでした（[9]）: 0〜6の整数がひとつも無いため既定値を使います
+[説明会] entry:session_skip_dow の設定値を解釈できませんでした（[""]）: 0〜6の整数がひとつも無いため既定値を使います
+[説明会] entry:session_hours の設定値を解釈できませんでした（[99]）: 0〜23の整数がひとつも無いため既定値を使います
+[説明会] entry:session_hours の設定値を解釈できませんでした（[]）: 0〜23の整数がひとつも無いため既定値を使います
+
+ [32m✓[39m tests/entry-sessions.test.ts [2m([22m[2m21 tests[22m[2m)[22m[32m 277[2mms[22m[39m
+[90mstdout[2m | tests/effective-rtp-report.test.ts[2m > [22m[2m実効 RTP レポート（Casino.settle 経由）[2m > [22m[2mスロット: base / +chain / +fuku / +JP
+[22m[39m
+=== スロット効果別 RTP ===
+  スロット         base                     90.10%  
+  スロット         +chain                   91.11%  
+  スロット         +fuku                    90.10%  
+  スロット         +JP                      90.10%  jpCut=2◈/spin (bet=200)
+  スロット         +chain+fuku+JP           91.11%  実効
+
+[90mstdout[2m | tests/effective-rtp-report.test.ts[2m > [22m[2m実効 RTP レポート（Casino.settle 経由）[2m > [22m[2mスロット: 賭け額別 JP 積立整数丸めの影響（RTP は理論値・積立率は決定的算術）
+[22m[39m
+=== スロット bet 額別（RTP=理論値・JP 積立率のみ bet 依存） ===
+  スロット         bet=50                   96.41%  jpCut=1◈ (実効積立率 2.00%)
+  スロット         bet=100                  96.41%  jpCut=1◈ (実効積立率 1.00%)
+  スロット         bet=1,000                96.41%  jpCut=10◈ (実効積立率 1.00%)
+  スロット         bet=100,000              96.41%  jpCut=1000◈ (実効積立率 1.00%)
+
+[90mstdout[2m | tests/casino-chinchiro-rtp.test.ts[2m > [22m[2m敗北倍率2倍化にともなうRTP調整（正本 §1.5）[2m > [22m[2mどの方針でも基準RTPとの差が ±0.5pt 以内に収まっている
+[22m[39m=== チンチロ RTP: 敗北倍率 最大5倍→2倍 / エッジ 5%→15%（各方針 750,000 対局 = 250,000 × 3シード・同一サンプル）===
+  目が出たら必ず止める           旧 87.14%  →  新 87.58%  (+0.44pt)  ／ 調整なしなら 93.23% (6.09pt)
+  スコア4以上で止める           旧 86.60%  →  新 86.75%  (+0.15pt)  ／ 調整なしなら 92.52% (5.92pt)
+  スコア5以上で止める（マモン同）     旧 84.14%  →  新 84.18%  (+0.04pt)  ／ 調整なしなら 89.87% (5.73pt)
+  スコア6以上で止める           旧 81.09%  →  新 80.96%  (-0.12pt)  ／ 調整なしなら 86.54% (5.45pt)
+  投数まで振り続ける            旧 74.08%  →  新 73.76%  (-0.32pt)  ／ 調整なしなら 79.01% (4.93pt)
+
+ [32m✓[39m tests/casino-chinchiro-rtp.test.ts [2m([22m[2m16 tests[22m[2m)[22m[33m 5696[2mms[22m[39m
+   [33m[2m✓[22m[39m 敗北倍率2倍化にともなうRTP調整（正本 §1.5）[2m > [22mどの方針でも基準RTPとの差が ±0.5pt 以内に収まっている [33m 5394[2mms[22m[39m
+ [32m✓[39m tests/casino-liability.test.ts [2m([22m[2m30 tests[22m[2m)[22m[32m 14[2mms[22m[39m
+ [32m✓[39m tests/vc-tickets.test.ts [2m([22m[2m18 tests[22m[2m)[22m[32m 153[2mms[22m[39m
+ [32m✓[39m tests/confession.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 208[2mms[22m[39m
+ [32m✓[39m tests/casino-chip-flow.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 75[2mms[22m[39m
+ [32m✓[39m tests/ledger.test.ts [2m([22m[2m18 tests[22m[2m)[22m[32m 117[2mms[22m[39m
+[90mstdout[2m | tests/effective-rtp-report.test.ts[2m > [22m[2m実効 RTP レポート（Casino.settle 経由）[2m > [22m[2m丁半: base / +chain / +fuku
+[22m[39m
+=== 丁半効果別 RTP ===
+  丁半           base                    101.72%  
+  丁半           +chain                  106.69%  
+  丁半           +fuku                   101.72%  
+  丁半           +chain+fuku（実効）         106.69%  
+
+[90mstdout[2m | tests/effective-rtp-report.test.ts[2m > [22m[2m実効 RTP レポート（Casino.settle 経由）[2m > [22m[2mルーレット（赤ベット）: base のみ（chain/fuku は無効化されている実装）
+[22m[39m
+=== ルーレット RTP ===
+  ルーレット        base                     98.67%  赤ベット・実装は chain/fuku off
+
+ [32m✓[39m tests/casino-game-rtp.test.ts [2m([22m[2m18 tests[22m[2m)[22m[33m 1179[2mms[22m[39m
+   [33m[2m✓[22m[39m ホールデム（対マモン簡易・check-only）[2m > [22mプレイヤーとマモンの勝敗率が概ね拮抗（0.9〜1.1 RTP） [33m 644[2mms[22m[39m
+[90mstdout[2m | tests/effective-rtp-report.test.ts[2m > [22m[2m実効 RTP レポート（Casino.settle 経由）[2m > [22m[2mクラッシュ（cashout=2.0）: base / +fuku （chain は無効化・回帰済み）
+[22m[39m
+=== クラッシュ RTP ===
+  クラッシュ        base                     95.87%  
+  クラッシュ        +fuku                    95.87%  
+  クラッシュ        +chain（参考・実装off）        100.02%  実装では chain:false
+
+[90mstdout[2m | tests/effective-rtp-report.test.ts[2m > [22m[2m実効 RTP レポート（Casino.settle 経由）[2m > [22m[2mお守り込み: 保険符・庇護・お守り（cap 適用）で効果検証
+[22m[39m
+=== お守り込み実効 RTP (bet=100,000, 200回, 保険符/お守り交互) ===
+  お守り込み        game RTP                 86.87%  
+  お守り込み        アイテム代総額                   3.50%  700,000◈
+  お守り込み        effective house return   16.63%  (-プレイヤー損 / wagered)
+
+ [32m✓[39m tests/effective-rtp-report.test.ts [2m([22m[2m6 tests[22m[2m)[22m[33m 10672[2mms[22m[39m
+   [33m[2m✓[22m[39m 実効 RTP レポート（Casino.settle 経由）[2m > [22mスロット: base / +chain / +fuku / +JP [33m 3601[2mms[22m[39m
+   [33m[2m✓[22m[39m 実効 RTP レポート（Casino.settle 経由）[2m > [22m丁半: base / +chain / +fuku [33m 3368[2mms[22m[39m
+   [33m[2m✓[22m[39m 実効 RTP レポート（Casino.settle 経由）[2m > [22mルーレット（赤ベット）: base のみ（chain/fuku は無効化されている実装） [33m 893[2mms[22m[39m
+   [33m[2m✓[22m[39m 実効 RTP レポート（Casino.settle 経由）[2m > [22mクラッシュ（cashout=2.0）: base / +fuku （chain は無効化・回帰済み） [33m 2676[2mms[22m[39m
+ [32m✓[39m tests/payroll.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 120[2mms[22m[39m
+ [32m✓[39m tests/casino.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 92[2mms[22m[39m
+ [32m✓[39m tests/casino-market-migration.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 57[2mms[22m[39m
+ [32m✓[39m tests/chip-ledger.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 83[2mms[22m[39m
+ [32m✓[39m tests/vc-rewards.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 116[2mms[22m[39m
+ [32m✓[39m tests/ticket-open-uniqueness.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 79[2mms[22m[39m
+ [32m✓[39m tests/departments.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 112[2mms[22m[39m
+ [32m✓[39m tests/casino-slots-rtp.test.ts [2m([22m[2m13 tests[22m[2m)[22m[33m 708[2mms[22m[39m
+   [33m[2m✓[22m[39m スロット: 実測RTP（決定的シミュレーション）[2m > [22m50,000スピン × 10シードで胴元純収支が黒字回数優位（8/10以上） [33m 417[2mms[22m[39m
+ [32m✓[39m tests/casino-free-spins.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 83[2mms[22m[39m
+ [32m✓[39m tests/db-bootstrap-room-migration.test.ts [2m([22m[2m3 tests[22m[2m)[22m[33m 383[2mms[22m[39m
+ [32m✓[39m tests/shop-role-revocations.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 44[2mms[22m[39m
+ [32m✓[39m tests/migration-service.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 52[2mms[22m[39m
+ [32m✓[39m tests/fiscal.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 55[2mms[22m[39m
+ [32m✓[39m tests/payroll-recovery.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 34[2mms[22m[39m
+ [32m✓[39m tests/casino-remittance-structure.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 56[2mms[22m[39m
+ [32m✓[39m tests/titles.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 58[2mms[22m[39m
+ [32m✓[39m tests/migration.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 8[2mms[22m[39m
+[90mstdout[2m | tests/game-rtp-report.test.ts[2m > [22m[2m全ゲームRTPレポート[2m > [22m[2m一覧
+[22m[39m
+=== ゲーム別 RTP 一覧 ===
+  スロット           regular（理論）            95.41%  
+  スロット           +freeSpin（理論）          95.41%  
+  スロット           +JP（理論）                96.41%  winRate=46.0%, jpHit=27.0/1M
+  丁半             理論（配当×勝率）              97.00%  配当=1.94
+  ルーレット          赤/黒/奇偶/大小（理論）          97.30%  
+  ルーレット          零(単発36倍)（理論）           97.30%  
+  クラッシュ          cashout=2.0 理論         96.00%  全 M 共通で 95.04%
+  板              理論                     97.00%  場代 3%
+  競馬             理論                     90.00%  場代 10%
+  株              買って即売る                 99.00%  売却手数料 1%
+  BJ             always_stand（40k）      84.04%  
+  BJ             mimic_dealer（40k）      94.49%  
+  BJ             hard17+double（40k）     96.59%  
+  ポーカー           hold_all（20k）          26.71%  
+  ポーカー           hold_pairs（20k）        93.39%  
+  ホールデム          check-only vs マモン（20k）   99.52%  勝6085/負6181/引7734
+
+ [32m✓[39m tests/game-rtp-report.test.ts [2m([22m[2m1 test[22m[2m)[22m[33m 1655[2mms[22m[39m
+   [33m[2m✓[22m[39m 全ゲームRTPレポート[2m > [22m一覧 [33m 1653[2mms[22m[39m
+ [32m✓[39m tests/casino-rng.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 44[2mms[22m[39m
+ [32m✓[39m tests/chip-assets.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 43[2mms[22m[39m
+ [32m✓[39m tests/confession-voice-received.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 60[2mms[22m[39m
+ [32m✓[39m tests/ticket-close-active.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 23[2mms[22m[39m
+[90mstdout[2m | tests/rtp-report.test.ts[2m > [22m[2mスロット RTP レポート（参考出力）[2m > [22m[2m理論値
+[22m[39m
+=== 理論RTP ===
+regular=95.41%  +freeSpin=95.41%  +JP=96.41%  winRate=46.01%  houseNet=3.59%  jpHit=27.0/1M  freeSpin=27.0/1M
+
+[90mstdout[2m | tests/rtp-report.test.ts[2m > [22m[2mスロット RTP レポート（参考出力）[2m > [22m[2m実測: 300,000スピン × 5シード
+[22m[39m
+=== 実測RTP (300,000 spins) ===
+seed=1  rtp=96.08%  jpHits/1M=30  freeSpins/1M=23
+seed=2  rtp=96.10%  jpHits/1M=30  freeSpins/1M=30
+seed=3  rtp=95.81%  jpHits/1M=27  freeSpins/1M=27
+seed=4  rtp=96.22%  jpHits/1M=27  freeSpins/1M=17
+seed=5  rtp=96.22%  jpHits/1M=20  freeSpins/1M=30
+
+ [32m✓[39m tests/rtp-report.test.ts [2m([22m[2m2 tests[22m[2m)[22m[33m 950[2mms[22m[39m
+   [33m[2m✓[22m[39m スロット RTP レポート（参考出力）[2m > [22m実測: 300,000スピン × 5シード [33m 945[2mms[22m[39m
+ [32m✓[39m tests/bump-counter.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m tests/casino-mechanics.test.ts [2m([22m[2m28 tests[22m[2m)[22m[33m 25384[2mms[22m[39m
+   [33m[2m✓[22m[39m お守り裁定シミュレーション（buy-if-not-armed 戦略を正確に再現）[2m > [22m丁半 × 保険符（bet=10,000, 50,000回）: 実効RTP < 100% [33m 5408[2mms[22m[39m
+   [33m[2m✓[22m[39m お守り裁定シミュレーション（buy-if-not-armed 戦略を正確に再現）[2m > [22m丁半 × 庇護の札（bet=50,000, 50,000回）: 実効RTP < 100% [33m 4662[2mms[22m[39m
+   [33m[2m✓[22m[39m お守り裁定シミュレーション（buy-if-not-armed 戦略を正確に再現）[2m > [22mクラッシュ1.5倍 × 保険符（bet=20,000, 50,000回）: 実効RTP < 100% [33m 3524[2mms[22m[39m
+   [33m[2m✓[22m[39m お守り裁定シミュレーション（buy-if-not-armed 戦略を正確に再現）[2m > [22mルーレット赤 × 保険符（bet=30,000, 50,000回）: 実効RTP < 100% [33m 4457[2mms[22m[39m
+   [33m[2m✓[22m[39m お守り裁定シミュレーション（buy-if-not-armed 戦略を正確に再現）[2m > [22m丁半 × 福のお守り（bet=40,000, 50,000回）: 実効RTP < 100% [33m 4555[2mms[22m[39m
+   [33m[2m✓[22m[39m お守り裁定シミュレーション（buy-if-not-armed 戦略を正確に再現）[2m > [22mALREADY_ARMED を正しく扱う: 装備中は購入せず、購入回数 == 発動回数（±1） [33m 2595[2mms[22m[39m
+ [32m✓[39m tests/casino-crash-effective.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 27121[2mms[22m[39m
+   [33m[2m✓[22m[39m クラッシュ実効RTP（Casino.settle 経由・連鎖無効）[2m > [22m固定 1.5 倍戦略で連勝プレイしても連鎖込み RTP が 100% を超えない { M: 1.5, seed: 15001 } [33m 2830[2mms[22m[39m
+   [33m[2m✓[22m[39m クラッシュ実効RTP（Casino.settle 経由・連鎖無効）[2m > [22m固定 2 倍戦略で連勝プレイしても連鎖込み RTP が 100% を超えない { M: 2, seed: 20002 } [33m 2539[2mms[22m[39m
+   [33m[2m✓[22m[39m クラッシュ実効RTP（Casino.settle 経由・連鎖無効）[2m > [22m固定 3 倍戦略で連勝プレイしても連鎖込み RTP が 100% を超えない { M: 3, seed: 30003 } [33m 2266[2mms[22m[39m
+   [33m[2m✓[22m[39m クラッシュ実効RTP（Casino.settle 経由・連鎖無効）[2m > [22m固定 5 倍戦略で連勝プレイしても連鎖込み RTP が 100% を超えない { M: 5, seed: 50004 } [33m 2236[2mms[22m[39m
+   [33m[2m✓[22m[39m クラッシュ実効RTP（Casino.settle 経由・連鎖無効）[2m > [22m固定 10 倍戦略で連勝プレイしても連鎖込み RTP が 100% を超えない { M: 10, seed: 100005 } [33m 1554[2mms[22m[39m
+   [33m[2m✓[22m[39m クラッシュ実効RTP（Casino.settle 経由・連鎖無効）[2m > [22m連鎖有効時は 1.5倍固定戦略の RTP が 100% を超える（回帰: なぜ chain を切ったかの再現） [33m 1596[2mms[22m[39m
+   [33m[2m✓[22m[39m スロット実効RTP（Casino.settle 経由・連鎖込み長期シミュレーション）[2m > [22m連鎖ON・JP積立込みで 40,000スピンの実効RTPが 100% 未満（胴元黒字を維持） [33m 9277[2mms[22m[39m
+   [33m[2m✓[22m[39m 丁半実効RTP（Casino.settle 経由・連鎖無効の確認）[2m > [22mchain OFF で 30,000ゲームの実効RTPが 97% 前後（100% 未満） [33m 4820[2mms[22m[39m
+
+[31m⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 45 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m生きている預託は維持し、孤児だけ返金する[2m > [22m登録済みの板は触らず、登録の無いセッションだけ返金する
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m106:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m生きている預託は維持し、孤児だけ返金する[2m > [22m競馬は登録しないので、再起動のたびに返金される（意図した挙動）
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m130:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m生きている預託は維持し、孤児だけ返金する[2m > [22m帳簿が無いのに残高がある escrow:* は隔離する
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m140:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m生きている預託は維持し、孤児だけ返金する[2m > [22m生きている板の保有者は、帳簿が無くても隔離しない
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m156:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m不一致は返金も隔離もせず記録だけ残す[2m > [22m帳簿と保有者残高が合わないセッションは凍結される
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m173:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m不一致は返金も隔離もせず記録だけ残す[2m > [22m1セッションの不一致が他のセッションの復旧を止めない
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m200:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m検算NGなら以降のステップを実行しない[2m > [22mチップ残高を1 Ld ずらすと integrity_halt になり、返金も隔離も走らない
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m222:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m検算NGなら以降のステップを実行しない[2m > [22m人が止めている状態では検算だけ行い、資金も状態も触らない
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m241:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[8/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m検算NGなら以降のステップを実行しない[2m > [22mintegrity_halt のままなら自動では開けない（人の確認を待つ）
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m257:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[9/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m債務予約の解放（S9）と再開（S12）[2m > [22m復旧の中で予約が全解放される
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m270:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[10/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m債務予約の解放（S9）と再開（S12）[2m > [22m正常終了なら open へ戻り、手順が記録される
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m286:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[11/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m債務予約の解放（S9）と再開（S12）[2m > [22m生存中エスクローの収集に失敗したら掃除も再開もしない
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m312:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[12/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22m孤児返金の技術失敗が結果に残る[2m > [22m失敗したセッションは failedSessions に出て、帳簿と残高は維持される
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m370:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[13/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22mrecovery_halt は通常の再開導線から開けられない[2m > [22mA〜Dが通っても通常の再開（reopenAfterIntegrity）では開かない
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m437:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[14/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22mrecovery_halt は通常の再開導線から開けられない[2m > [22mBot 再起動後も専用停止状態が残る
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m454:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[15/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22mrecovery_halt は通常の再開導線から開けられない[2m > [22m復旧再実行の前検NGでも復旧義務を保持し、S12成功時だけ解除する
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m468:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[16/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22mrecovery_halt は通常の再開導線から開けられない[2m > [22msource が直ったあとに復旧を再実行すると S4〜S12 が動いて open になる
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m505:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[17/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-recovery.test.ts[2m > [22mrecovery_halt は通常の再開導線から開けられない[2m > [22m復旧が成功したときだけ open になる（もう一度回しても二重返金しない）
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-recovery.test.ts:[2m38:17[22m[39m
+    [90m 36| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 37| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 38| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 39| [39m  [35mconst[39m escrow [33m=[39m [35mnew[39m [33mEscrow[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+    [90m 40| [39m  [35mconst[39m casino [33m=[39m [35mnew[39m [33mCasino[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-recovery.test.ts:[2m539:17[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[18/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22mavailable = house 残高 − 予約合計[2m > [22m予約したぶんだけ受注可能額が減る
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m63:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[19/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22mavailable = house 残高 − 予約合計[2m > [22mcanAccept が house 残高ではなく available を見る
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m77:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[20/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22mavailable = house 残高 − 予約合計[2m > [22m余力を超える予約は断り、そのときの上限を返す
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m90:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[21/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22mavailable = house 残高 − 予約合計[2m > [22m同じ鍵の再試行は二重に取らない
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m100:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[22/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22mavailable = house 残高 − 予約合計[2m > [22m債務ゼロの予約は行を作らない
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m109:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[23/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m同時実行しても house 残高が負にならない[2m > [22m100件を同時に取りにいっても、予約合計が house 残高を超えない
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m119:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[24/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m同時実行しても house 残高が負にならない[2m > [22m予約を取った全員が最大配当を引いても house が払い切れる
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m139:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[25/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m同時実行しても house 残高が負にならない[2m > [22m小口が先に埋めたら大口は断られる（早い者勝ちで枠が守られる）
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m158:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[26/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m予約失敗時に金が動かない[2m > [22m予約を先に取ってから精算する経路では、取れなければ精算に入らない
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m174:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[27/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m予約失敗時に金が動かない[2m > [22m精算の中で例外が出れば、予約も残高もまとめて巻き戻る
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m191:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[28/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m精算が通ると予約が同じトランザクションで解放される[2m > [22msettleSolo に reservationKey を渡すと解放される
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m211:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[29/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m精算が通ると予約が同じトランザクションで解放される[2m > [22m鍵を渡さなければ解放されない（明示した経路だけが解放する）
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m225:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[30/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22mmaxBetFor が予約後の余力を反映する[2m > [22m予約が入ると提示できる最大ベットが下がる
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m237:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[31/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22mmaxBetFor が予約後の余力を反映する[2m > [22mゲームごとに倍率が違うので提示額も違う
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m250:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[32/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m起動時の全解放と漏れ検出[2m > [22m全解放は件数と総額を events へ残してから消す
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m264:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[33/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m起動時の全解放と漏れ検出[2m > [22m予約が無いときは記録も作らない
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m282:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[34/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m起動時の全解放と漏れ検出[2m > [22m24時間残った予約を検出して警告つきで解放する
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m290:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[35/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22mavailableIncludingOwn（自己予約を支払保証として使う）[2m > [22m自分の予約ぶんだけ戻し、他人の予約は引いたまま
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m318:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[36/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22mavailableIncludingOwn（自己予約を支払保証として使う）[2m > [22m解放後は自己予約ぶんが戻らない
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m332:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[37/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22mJP積立を含めても予約済み資金を侵食しない[2m > [22m2件の予約が並び、片方が最大配当+JP積立を出しても、もう片方も満額払える
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m347:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[38/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22mJP積立を含めても予約済み資金を侵食しない[2m > [22mJP積立が払えなかったら黙って飛ばさず記録する
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m378:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[39/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m同じ予約鍵は内容まで一致したときだけ冪等成功[2m > [22m同じ鍵・同じ内容は冪等成功で、保存済みの行が返る
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m401:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[40/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m同じ予約鍵は内容まで一致したときだけ冪等成功[2m > [22m同じ鍵・異なる amount は拒否する（資金も予約も動かない）
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m416:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[41/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m同じ予約鍵は内容まで一致したときだけ冪等成功[2m > [22m同じ鍵・異なる game は拒否する
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m427:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[42/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m同じ予約鍵は内容まで一致したときだけ冪等成功[2m > [22m同じ鍵・異なる userId は拒否する
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m436:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[43/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m同じ予約鍵は内容まで一致したときだけ冪等成功[2m > [22m同じ鍵を何度実行しても、全呼出が同じ保存結果を受け取る
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m445:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[44/45]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m tests/casino-reservations.test.ts[2m > [22m同じ予約鍵は内容まで一致したときだけ冪等成功[2m > [22m余力不足は conflict ではなく capacity として返る
+[31m[1mTypeError[22m: EtherExchange is not a constructor[39m
+[36m [2m❯[22m setup tests/casino-reservations.test.ts:[2m42:17[22m[39m
+    [90m 40| [39m  [35mconst[39m events [33m=[39m [35mnew[39m [33mEventLog[39m(db)[33m;[39m
+    [90m 41| [39m  [35mconst[39m chipTx [33m=[39m [35mnew[39m [33mChipTx[39m(db)[33m;[39m
+    [90m 42| [39m  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, c…
+    [90m   | [39m                [31m^[39m
+    [90m 43| [39m  [35mconst[39m items [33m=[39m [35mnew[39m [33mItems[39m(db)[33m;[39m
+    [90m 44| [39m  [35mconst[39m reservations [33m=[39m [35mnew[39m [33mHouseReservations[39m(db[33m,[39m ether[33m,[39m events)[33m;[39m
+[90m [2m❯[22m tests/casino-reservations.test.ts:[2m459:15[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[45/45]⎯[22m[39m
+
+
+[2m Test Files [22m [1m[31m2 failed[39m[22m[2m | [22m[1m[32m44 passed[39m[22m[90m (46)[39m
+[2m      Tests [22m [1m[31m45 failed[39m[22m[2m | [22m[1m[32m548 passed[39m[22m[90m (593)[39m
+[2m   Start at [22m 05:08:02
+[2m   Duration [22m 40.48s[2m (transform 1.63s, setup 0ms, collect 4.63s, tests 79.25s, environment 12ms, prepare 4.35s)[22m
+
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 生きている預託は維持し、孤児だけ返金する > 登録済みの板は触らず、登録の無いセッションだけ返金する,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:106:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 生きている預託は維持し、孤児だけ返金する > 競馬は登録しないので、再起動のたびに返金される（意図した挙動）,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:130:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 生きている預託は維持し、孤児だけ返金する > 帳簿が無いのに残高がある escrow%3A* は隔離する,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:140:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 生きている預託は維持し、孤児だけ返金する > 生きている板の保有者は、帳簿が無くても隔離しない,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:156:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 不一致は返金も隔離もせず記録だけ残す > 帳簿と保有者残高が合わないセッションは凍結される,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:173:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 不一致は返金も隔離もせず記録だけ残す > 1セッションの不一致が他のセッションの復旧を止めない,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:200:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 検算NGなら以降のステップを実行しない > チップ残高を1 Ld ずらすと integrity_halt になり、返金も隔離も走らない,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:222:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 検算NGなら以降のステップを実行しない > 人が止めている状態では検算だけ行い、資金も状態も触らない,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:241:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 検算NGなら以降のステップを実行しない > integrity_halt のままなら自動では開けない（人の確認を待つ）,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:257:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 債務予約の解放（S9）と再開（S12） > 復旧の中で予約が全解放される,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:270:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 債務予約の解放（S9）と再開（S12） > 正常終了なら open へ戻り、手順が記録される,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:286:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 債務予約の解放（S9）と再開（S12） > 生存中エスクローの収集に失敗したら掃除も再開もしない,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:312:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > 孤児返金の技術失敗が結果に残る > 失敗したセッションは failedSessions に出て、帳簿と残高は維持される,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:370:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > recovery_halt は通常の再開導線から開けられない > A〜Dが通っても通常の再開（reopenAfterIntegrity）では開かない,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:437:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > recovery_halt は通常の再開導線から開けられない > Bot 再起動後も専用停止状態が残る,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:454:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > recovery_halt は通常の再開導線から開けられない > 復旧再実行の前検NGでも復旧義務を保持し、S12成功時だけ解除する,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:468:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > recovery_halt は通常の再開導線から開けられない > source が直ったあとに復旧を再実行すると S4〜S12 が動いて open になる,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:505:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-recovery.test.ts,title=tests/casino-recovery.test.ts > recovery_halt は通常の再開導線から開けられない > 復旧が成功したときだけ open になる（もう一度回しても二重返金しない）,line=38,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-recovery.test.ts:38:17%0A ❯ tests/casino-recovery.test.ts:539:17%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > available = house 残高 − 予約合計 > 予約したぶんだけ受注可能額が減る,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:63:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > available = house 残高 − 予約合計 > canAccept が house 残高ではなく available を見る,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:77:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > available = house 残高 − 予約合計 > 余力を超える予約は断り、そのときの上限を返す,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:90:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > available = house 残高 − 予約合計 > 同じ鍵の再試行は二重に取らない,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:100:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > available = house 残高 − 予約合計 > 債務ゼロの予約は行を作らない,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:109:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 同時実行しても house 残高が負にならない > 100件を同時に取りにいっても、予約合計が house 残高を超えない,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:119:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 同時実行しても house 残高が負にならない > 予約を取った全員が最大配当を引いても house が払い切れる,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:139:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 同時実行しても house 残高が負にならない > 小口が先に埋めたら大口は断られる（早い者勝ちで枠が守られる）,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:158:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 予約失敗時に金が動かない > 予約を先に取ってから精算する経路では、取れなければ精算に入らない,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:174:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 予約失敗時に金が動かない > 精算の中で例外が出れば、予約も残高もまとめて巻き戻る,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:191:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 精算が通ると予約が同じトランザクションで解放される > settleSolo に reservationKey を渡すと解放される,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:211:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 精算が通ると予約が同じトランザクションで解放される > 鍵を渡さなければ解放されない（明示した経路だけが解放する）,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:225:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > maxBetFor が予約後の余力を反映する > 予約が入ると提示できる最大ベットが下がる,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:237:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > maxBetFor が予約後の余力を反映する > ゲームごとに倍率が違うので提示額も違う,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:250:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 起動時の全解放と漏れ検出 > 全解放は件数と総額を events へ残してから消す,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:264:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 起動時の全解放と漏れ検出 > 予約が無いときは記録も作らない,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:282:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 起動時の全解放と漏れ検出 > 24時間残った予約を検出して警告つきで解放する,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:290:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > availableIncludingOwn（自己予約を支払保証として使う） > 自分の予約ぶんだけ戻し、他人の予約は引いたまま,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:318:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > availableIncludingOwn（自己予約を支払保証として使う） > 解放後は自己予約ぶんが戻らない,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:332:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > JP積立を含めても予約済み資金を侵食しない > 2件の予約が並び、片方が最大配当+JP積立を出しても、もう片方も満額払える,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:347:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > JP積立を含めても予約済み資金を侵食しない > JP積立が払えなかったら黙って飛ばさず記録する,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:378:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 同じ予約鍵は内容まで一致したときだけ冪等成功 > 同じ鍵・同じ内容は冪等成功で、保存済みの行が返る,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:401:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 同じ予約鍵は内容まで一致したときだけ冪等成功 > 同じ鍵・異なる amount は拒否する（資金も予約も動かない）,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:416:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 同じ予約鍵は内容まで一致したときだけ冪等成功 > 同じ鍵・異なる game は拒否する,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:427:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 同じ予約鍵は内容まで一致したときだけ冪等成功 > 同じ鍵・異なる userId は拒否する,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:436:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 同じ予約鍵は内容まで一致したときだけ冪等成功 > 同じ鍵を何度実行しても、全呼出が同じ保存結果を受け取る,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:445:15%0A%0A
+
+::error file=/home/runner/work/meigokujo/meigokujo/packages/core/tests/casino-reservations.test.ts,title=tests/casino-reservations.test.ts > 同じ予約鍵は内容まで一致したときだけ冪等成功 > 余力不足は conflict ではなく capacity として返る,line=42,column=17::TypeError: EtherExchange is not a constructor%0A ❯ setup tests/casino-reservations.test.ts:42:17%0A ❯ tests/casino-reservations.test.ts:459:15%0A%0A
+/home/runner/work/meigokujo/meigokujo/packages/core:
+ ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @meigokujo/core@0.1.0 test: `vitest run && vitest run --config vitest.serial.config.ts`
+Exit status 1

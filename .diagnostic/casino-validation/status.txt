@@ -1,0 +1,8 @@
+tested_sha=7998e0a4192c251e44e367180820406461b87786
+install=0
+core_typecheck=2
+bot_typecheck=0
+core_test=1
+bot_test_1=1
+bot_test_2=1
+bot_test_3=1
