@@ -121,7 +121,7 @@ describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
     const second = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
     expect(second).toEqual(first);
     expect(ctx.ether.balanceOf("u1")).toBe(0);
-    expect(ctx.chipTx.listByGroup("chinchiro:round:u1:op-1").map((r) => r.reason)).toEqual(["チンチロ確定損失"]);
+    expect(ctx.chipTx.listByGroup("chinchiro:round:u1:op-1").map((r) => r.reason)).toEqual(["賭け金（倍付け損失を含む）"]);
     ctx.db.close();
   });
 
