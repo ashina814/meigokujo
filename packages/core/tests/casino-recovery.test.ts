@@ -453,6 +453,175 @@ describe("孤児返金の技術失敗が結果に残る", () => {
 });
 
 /**
+ * 最終レビュー指摘（二次レビュー）: failedSessions と、それとは無関係な postflight 検算NG が
+ * 同時に起きたとき、postflight NG が先に integrity_halt を確定させてしまうと、
+ * 「別件の検算だけ直して reopenAfterIntegrity() で開ける」＝孤児返金の再試行義務が
+ * 消えてしまう。failedSessions の判定は postflight の成否より優先し、常に recovery_halt にする。
+ */
+describe("failedSessionsはpostflightの成否より優先される", () => {
+  it("孤児返金の技術失敗と、それとは無関係な帳簿不一致が同時に起きても、recovery_haltを優先する", () => {
+    const ctx = setup();
+    fundUser(ctx, "alice", 30_000);
+    fundUser(ctx, "bob", 30_000);
+    ctx.escrow.hold("卓:壊れる", "alice", 5_000, "丁半", "op-1"); // これを技術失敗させる
+    ctx.escrow.hold("卓:不一致", "bob", 4_000, "丁半", "op-2"); // これとは独立に不一致を作る
+    ctx.registry.register({ type: "market", listLiveEscrowHolders: () => [] });
+
+    // 「卓:不一致」の保有者から外部で1,000だけ抜く（failedSessionsとは無関係な独立した検算NG）
+    ctx.ether.runGroup({ groupKey: "test:independent-leak", kind: "table_refund", actorId: "t" }, () =>
+      ctx.ether.transfer(escrowHolderFor("卓:不一致"), HOUSE_HOLDER, 1_000, { reason: "テストの細工（独立した不一致）" }),
+    );
+
+    // 「卓:壊れる」の返金だけ技術的に失敗させる
+    const realTransfer = ctx.ether.transfer.bind(ctx.ether);
+    ctx.ether.transfer = ((from: string, to: string, amount: number, info: never) => {
+      if (from === escrowHolderFor("卓:壊れる")) throw new Error("送金に失敗した");
+      return realTransfer(from, to, amount, info);
+    }) as typeof ctx.ether.transfer;
+
+    const r = run(ctx);
+    ctx.ether.transfer = realTransfer;
+
+    // 両方とも検出されている
+    expect(r.failedSessions).toHaveLength(1);
+    expect(r.mismatched).toHaveLength(1);
+    // failedSessionsがpostflight（不一致によるNG）より優先され、recovery_haltになる
+    expect(r.outcome).toBe("refund_failed");
+    expect(ctx.status.current().status).toBe("recovery_halt");
+    // reasonに両方の情報が残っている
+    expect(r.reason).toContain("送金に失敗した");
+    expect(r.reason).toContain("検算NG");
+
+    // 通常の再点検（reopenAfterIntegrity）では、たとえ検算が通っても開けない
+    ctx.ether.runGroup({ groupKey: "test:fix-independent", kind: "table_hold", actorId: "t" }, () =>
+      ctx.ether.transfer(HOUSE_HOLDER, escrowHolderFor("卓:不一致"), 1_000, { reason: "テスト後始末" }),
+    );
+    const report = ctx.integrity.runFull();
+    const reopened = ctx.status.reopenAfterIntegrity("直った", "admin", report.ok);
+    expect(reopened.ok).toBe(false);
+    expect(ctx.status.current().status).toBe("recovery_halt");
+
+    // 原因（送金失敗）も直して再実行すると、S4〜S12 が完走する。
+    // 「卓:壊れる」（alice）は再試行で返金され、不一致が解消した「卓:不一致」（bob）は
+    // このタイミングで初めて（一度だけ）孤児として返金される
+    const second = run(ctx);
+    expect(second.outcome).toBe("opened");
+    expect(second.failedSessions).toHaveLength(0);
+    expect(second.mismatched).toHaveLength(0);
+    expect(second.refundedSessions).toBe(2); // 卓:壊れる + 卓:不一致
+    expect(ctx.ether.balanceOf("alice")).toBe(30_000);
+    expect(ctx.ether.balanceOf("bob")).toBe(30_000);
+    expect(ctx.status.current().status).toBe("open");
+
+    // 3回目を回しても、もう返す対象が無いので二重返金は起きない
+    const third = run(ctx);
+    expect(third.outcome).toBe("opened");
+    expect(third.refundedSessions).toBe(0);
+    expect(ctx.ether.balanceOf("alice")).toBe(30_000);
+    expect(ctx.ether.balanceOf("bob")).toBe(30_000);
+    ctx.db.close();
+  });
+});
+
+/**
+ * 最終レビュー指摘（二次レビュー）: S1（beginStartupCheck）以降で予期しない例外が
+ * 外へ抜けると、status が S1 で書き換えた startup_check のまま残ってしまい、
+ * 元が recovery_halt だった文脈が失われる。必ず recovery_halt へ着地させる。
+ */
+describe("S1以降の予期しない例外はrecovery_haltへ着地する", () => {
+  /** casino_house_reservations を直接破損させ、totalReserved() が例外を投げる状態を作る */
+  function corruptReservations(ctx: Ctx): void {
+    ctx.db
+      .prepare(
+        "INSERT INTO casino_house_reservations (key, amount, game, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run("corrupt", Number.MAX_SAFE_INTEGER + 2, "test", "u1", Math.floor(Date.now() / 1000));
+  }
+
+  it("open由来の正常起動でS9へ例外が起きた場合、recovery_haltになりS12を実行しない", () => {
+    const ctx = setup();
+    ctx.registry.register({ type: "market", listLiveEscrowHolders: () => [] });
+    corruptReservations(ctx);
+
+    const r = run(ctx);
+    expect(r.outcome).toBe("exception_failed");
+    expect(r.steps).not.toContain("S12:再開");
+    expect(ctx.status.current().status).toBe("recovery_halt");
+    ctx.db.close();
+  });
+
+  it("recovery_halt再実行中にS9へ例外が起きても、recovery_haltを維持し理由が失われない", () => {
+    const ctx = setup();
+    fundUser(ctx, "alice", 20_000);
+    ctx.escrow.hold("keiba:1", "alice", 5_000, "競馬", "op-1");
+    const broken = { value: true };
+    ctx.registry.register({
+      type: "market",
+      listLiveEscrowHolders: () => {
+        if (broken.value) throw new Error("板テーブルが読めない");
+        return [];
+      },
+    });
+
+    // 1. source失敗でrecovery_haltになる
+    expect(run(ctx).outcome).toBe("source_failed");
+    expect(ctx.status.current().status).toBe("recovery_halt");
+    const reasonAfterFirst = ctx.status.current().reason;
+    expect(reasonAfterFirst).toContain("収集に失敗");
+
+    // 2. sourceは直すが、予約テーブルを破損させてS9で例外を起こす
+    broken.value = false;
+    corruptReservations(ctx);
+
+    const r = run(ctx);
+    expect(r.outcome).toBe("exception_failed");
+    // **recovery_haltのまま**（startup_checkのまま放置されたり、integrity_haltに化けたりしない）
+    expect(ctx.status.current().status).toBe("recovery_halt");
+    // 元の理由（1回目のsource失敗）が失われず、新しい異常が追記されている
+    expect(ctx.status.current().reason).toContain("収集に失敗");
+    expect(ctx.status.current().reason).toContain("予期しない例外");
+
+    // 3. DBを読み直しても復旧義務は残る
+    expect(new CasinoStatus(ctx.db).current().status).toBe("recovery_halt");
+
+    // 4. 通常の再点検では解除できない
+    const report = ctx.integrity.runFull();
+    expect(ctx.status.reopenAfterIntegrity("直した", "admin", report.ok).ok).toBe(false);
+    expect(ctx.status.current().status).toBe("recovery_halt");
+
+    // 5. 原因（予約テーブル破損）を直して再実行すると、S4〜S12が完走してopenになる。
+    //    S4〜S8で既に成功していた孤児返金（keiba:1）が二重に返金・隔離されないことも確認する
+    const aliceBalanceBeforeThird = ctx.ether.balanceOf("alice");
+    ctx.db.prepare("DELETE FROM casino_house_reservations WHERE key = 'corrupt'").run();
+    const third = run(ctx);
+    expect(third.outcome).toBe("opened");
+    expect(ctx.status.current().status).toBe("open");
+    // keiba:1 は最初の成功した実行時点で既に返金済みなので、3回目は返す対象が無い
+    expect(third.refundedSessions).toBe(0);
+    expect(ctx.ether.balanceOf("alice")).toBe(aliceBalanceBeforeThird);
+    ctx.db.close();
+  });
+
+  it("同じ異常で再実行を繰り返しても、reasonへ同じ行を無限に重複追加しない", () => {
+    const ctx = setup();
+    ctx.registry.register({ type: "market", listLiveEscrowHolders: () => [] });
+    corruptReservations(ctx);
+
+    run(ctx);
+    const reasonAfterFirst = ctx.status.current().reason;
+    run(ctx);
+    const reasonAfterSecond = ctx.status.current().reason;
+    run(ctx);
+    const reasonAfterThird = ctx.status.current().reason;
+
+    // 同じ例外が繰り返し起きても、reason文字列は増え続けない（1回目以降は不変）
+    expect(reasonAfterSecond).toBe(reasonAfterFirst);
+    expect(reasonAfterThird).toBe(reasonAfterFirst);
+    ctx.db.close();
+  });
+});
+
+/**
  * レビュー指摘: source 取得失敗は通常の integrity_halt と分ける。
  *
  * A〜D がたまたま通っても、
@@ -632,7 +801,7 @@ describe("recovery_halt は通常の再開導線から開けられない", () =>
     ctx.db.close();
   });
 
-  it("予約テーブルが破損してtotalReserved()が失敗した場合、復旧を中途半端に開かない", () => {
+  it("予約テーブルが破損してtotalReserved()が失敗した場合、例外を構造化結果へ変換しrecovery_haltへ着地する", () => {
     const ctx = setup();
     ctx.registry.register({ type: "market", listLiveEscrowHolders: () => [] });
     // Number.MAX_SAFE_INTEGER を超える行を直接仕込む（reserve() のsafe-integer検証を経由しない破損を模す）
@@ -642,10 +811,19 @@ describe("recovery_halt は通常の再開導線から開けられない", () =>
       )
       .run("corrupt", Number.MAX_SAFE_INTEGER + 2, "test", "u1", Math.floor(Date.now() / 1000));
 
-    // S9 (releaseAll → totalReserved) が例外を投げ、S12 まで到達できない
-    expect(() => run(ctx)).toThrow();
-    // 例外で止まった以上、営業は絶対に開いていない
-    expect(ctx.status.current().status).not.toBe("open");
+    // S9 (releaseAll → totalReserved) の例外は外へ漏らさず、構造化結果へ変換する（PR7監査・二次レビュー）
+    const r = run(ctx);
+    expect(r.outcome).toBe("exception_failed");
+    expect(r.reason).toContain("ERR_BAD_AMOUNT");
+    // 例外で止まった以上、営業は絶対に開いておらず、必ず recovery_halt にする
+    expect(ctx.status.current().status).toBe("recovery_halt");
+
+    // DBを読み直しても復旧義務は残る（S1で書き換わったstartup_checkのまま放置されない）
+    expect(new CasinoStatus(ctx.db).current().status).toBe("recovery_halt");
+    // 通常の再点検経路では開かない
+    const report = ctx.integrity.runFull();
+    expect(ctx.status.reopenAfterIntegrity("直した", "admin", report.ok).ok).toBe(false);
+    expect(ctx.status.current().status).toBe("recovery_halt");
     ctx.db.close();
   });
 });

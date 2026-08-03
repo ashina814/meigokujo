@@ -216,28 +216,39 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
       });
       return;
     }
-    const r = recoverCasino({
-      db: services.db,
-      status: services.casinoStatus,
-      integrity: services.casinoIntegrity,
-      chipTx: services.chipTx,
-      escrow: services.escrow,
-      reservations: services.reservations,
-      registry: services.recoveryRegistry,
-      events: services.events,
-    });
-    const detail = [
-      `維持 ${r.keptHolders}件 / 孤児返金 ${r.refundedSessions}件 / 隔離 ${r.quarantined}件`,
-      `不一致 ${r.mismatched.length}件 / 返金失敗 ${r.failedSessions.length}件`,
-      r.releasedReservations.released ? `予約解放 ${r.releasedReservations.count}件` : "予約解放は未実行",
-    ].join("\n");
-    await interaction.reply({
-      content:
-        r.outcome === "opened"
-          ? `🟢 復旧が完了し、賭場を開けました。\n${detail}`
-          : `❌ 復旧は完了しませんでした（${r.outcome}）。\n${r.reason ?? ""}\n${detail}`,
-      flags: MessageFlags.Ephemeral,
-    });
+    // recoverCasino() 自体は S1〜S12 の予期しない例外を内部で recovery_halt へ変換するが、
+    // 呼び出しそのもの（deps の組み立て等）で万一例外が出ても interaction を無応答で
+    // 終わらせない・成功したかのような表示を出さないための防御（PR7監査・二次レビュー）。
+    try {
+      const r = recoverCasino({
+        db: services.db,
+        status: services.casinoStatus,
+        integrity: services.casinoIntegrity,
+        chipTx: services.chipTx,
+        escrow: services.escrow,
+        reservations: services.reservations,
+        registry: services.recoveryRegistry,
+        events: services.events,
+      });
+      const detail = [
+        `維持 ${r.keptHolders}件 / 孤児返金 ${r.refundedSessions}件 / 隔離 ${r.quarantined}件`,
+        `不一致 ${r.mismatched.length}件 / 返金失敗 ${r.failedSessions.length}件`,
+        r.releasedReservations.released ? `予約解放 ${r.releasedReservations.count}件` : "予約解放は未実行",
+      ].join("\n");
+      await interaction.reply({
+        content:
+          r.outcome === "opened"
+            ? `🟢 復旧が完了し、賭場を開けました。\n${detail}`
+            : `❌ 復旧は完了しませんでした（${r.outcome}）。\n${r.reason ?? ""}\n${detail}`,
+        flags: MessageFlags.Ephemeral,
+      });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      await interaction.reply({
+        content: `❌ 復旧の再実行中に予期しないエラーが発生しました: ${message}\n資金・状態は変更されていない可能性がありますが、必ず現在の状態を確認してください。`,
+        flags: MessageFlags.Ephemeral,
+      });
+    }
     return;
   }
   if (section === "casino" && action === "recheck") {

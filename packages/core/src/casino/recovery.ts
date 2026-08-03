@@ -102,11 +102,18 @@ export interface RecoverCasinoResult {
    *   **`recovery_halt`** にする（通常の「再点検」では開けられない・PR7 レビュー指摘）
    * - `refund_failed`: 孤児返金が技術的に失敗したセッションが残っている（`failedSessions`）。
    *   帳簿と保有者残高は一致したまま維持されるため postflight A〜D はたまたま通り得るが、
-   *   復旧そのものは完了していない。**`recovery_halt`** にして再実行を求める（PR7監査）
+   *   復旧そのものは完了していない。**`recovery_halt`** にして再実行を求める（PR7監査）。
+   *   postflight 自体が別件で NG でも、この判定を postflight の成否より優先する
+   *   （PR7監査・二次レビュー：postflight が先に integrity_halt を確定させ、
+   *   failedSessions の再試行義務が消えるのを防ぐ）
+   * - `exception_failed`: S1〜S12 の途中で予期しない例外が発生した（PR7監査・二次レビュー）。
+   *   どこまで安全に完了したか保証できないので、**必ず `recovery_halt`** にする。
+   *   startup_check のまま例外を外へ漏らすと、次回起動時に「recovery_halt から
+   *   再実行していた」文脈が失われ、通常の再点検から開いてしまいうるため。
    * - `held`: 人が止めている状態なので触っていない
    * - `manual`: `integrity_halt` のまま。運営の再点検待ち
    */
-  outcome: "opened" | "halted" | "source_failed" | "refund_failed" | "held" | "manual";
+  outcome: "opened" | "halted" | "source_failed" | "refund_failed" | "exception_failed" | "held" | "manual";
   /** 実行したステップ（診断用） */
   steps: string[];
   keptHolders: number;
@@ -203,136 +210,197 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
   // `recovery_halt`（前回の復旧が完了しなかった）からは**やり直す**。
   // これがこの状態の唯一の出口なので、ここで止めると二度と開けられない（PR7）
 
-  // S1: ここから資金を動かす区間へ入る
-  status.beginStartupCheck();
-  steps.push("S1:startup_check");
-
-  const result = chipTx.runMaintenance("起動時の復旧（recoverCasino）", () => {
-    // S4: 生存中の預託を所有元から集める
-    const live = registry.liveHolders();
-    steps.push("S4:生存収集");
-    if (live.failed.length > 0) {
-      // 申告に失敗した種別がある = その種別の預託を孤児と誤認しうる。
-      // 分からないときは動かさないので、掃除そのものを見送る
-      events.log("casino_recovery_source_failed", { actor: "system:recovery", payload: { failed: live.failed } });
-      return {
-        ...empty,
-        skipped: true as const,
-        reason: `生存中エスクローの収集に失敗（${live.failed.map((f) => f.type).join(",")}）`,
-      };
-    }
-
-    // S5〜S8: 照合 → 維持 → 孤児返金 → 帳簿なし残高の隔離
-    const swept = escrow.recoverSessions("system:recovery", live.holders);
-    steps.push("S5:照合", "S6:維持", "S7:孤児返金", "S8:隔離");
-
-    // S9: ソロゲームの債務予約を全解放（進行中のソロはプロセス内状態なので存在しない）
-    const releasedReservations = reservations.releaseAll("起動時の復旧");
-    steps.push("S9:予約解放");
-
-    return {
-      keptHolders: swept.kept,
-      refundedSessions: swept.refundedSessions,
-      refundedTotal: swept.refundedTotal,
-      quarantined: swept.quarantined,
-      mismatched: swept.mismatched,
-      failedSessions: swept.failed,
-      releasedReservations: { released: true, ...releasedReservations },
-      skipped: false as const,
-      reason: undefined as string | undefined,
-    };
-  });
-
-  const summary = {
-    keptHolders: result.keptHolders,
-    refundedSessions: result.refundedSessions,
-    refundedTotal: result.refundedTotal,
-    quarantined: result.quarantined,
-    mismatched: result.mismatched,
-    failedSessions: result.failedSessions,
-    releasedReservations: result.releasedReservations,
+  // S1 以降・S12 までを丸ごと保護する（PR7監査・二次レビュー）。
+  // ここから先で予期しない例外（例: reservations.releaseAll() 内の totalReserved() が
+  // DB破損で throw する等）が外へ抜けると、status は S1 で書き換えた startup_check の
+  // ままDBに残ってしまう。すると次回起動時 held.status が recovery_halt に見えなくなり、
+  // 「recovery_halt から再実行していた」文脈が失われて通常の再点検から開いてしまいうる。
+  // どこまで安全に完了したか保証できない以上、例外時も必ず recovery_halt へ着地させる。
+  let sweptSoFar: Pick<
+    RecoverCasinoResult,
+    "keptHolders" | "refundedSessions" | "refundedTotal" | "quarantined" | "mismatched" | "failedSessions"
+  > = {
+    keptHolders: 0,
+    refundedSessions: 0,
+    refundedTotal: 0,
+    quarantined: 0,
+    mismatched: [],
+    failedSessions: [],
   };
+  try {
+    // S1: ここから資金を動かす区間へ入る
+    status.beginStartupCheck();
+    steps.push("S1:startup_check");
 
-  // **所有元の申告が取れなかったら営業を再開しない**（PR7 レビュー指摘）。
-  //
-  // 以前はここを素通りして runFull → finishStartupCheck まで進んでいたので、
-  // 「所有元が分からないまま open へ戻る」状態になっていた。掃除を見送った以上、
-  // 復旧が完了したとは判断できない。運営の確認が必要な状態で止める。
-  if (result.skipped) {
-    const reason = result.reason ?? "生存中エスクローの収集に失敗";
-    // **専用の停止状態**にする。通常の「再点検」（reopenAfterIntegrity）では開かない。
-    // 出口は「復旧を再実行」して S4〜S12 を通すことだけ
-    status.haltForRecovery(`復旧中断: ${reason}（掃除・予約解放とも未実行。運営の確認が必要）`);
-    events.log("casino_recovery_halted", {
-      actor: "system:recovery",
-      payload: { steps, reason, reservationsReleased: false },
-    });
-    return { outcome: "source_failed", steps, ...summary, reason };
-  }
+    const result = chipTx.runMaintenance("起動時の復旧（recoverCasino）", () => {
+      // S4: 生存中の預託を所有元から集める
+      const live = registry.liveHolders();
+      steps.push("S4:生存収集");
+      if (live.failed.length > 0) {
+        // 申告に失敗した種別がある = その種別の預託を孤児と誤認しうる。
+        // 分からないときは動かさないので、掃除そのものを見送る
+        events.log("casino_recovery_source_failed", { actor: "system:recovery", payload: { failed: live.failed } });
+        return {
+          ...empty,
+          skipped: true as const,
+          reason: `生存中エスクローの収集に失敗（${live.failed.map((f) => f.type).join(",")}）`,
+        };
+      }
 
-  // 掃除のあとに**全点検（A〜D）**。ここで初めて C・D まで見る
-  // （掃除が終わっていれば孤児も不一致も解消しているはず）
-  const post = integrity.runFull();
-  if (!post.ok) {
-    const reason = describeFailure(post);
-    events.log("casino_integrity_failed", {
-      actor: "system:recovery",
-      payload: { phase: "recover_post", ledgerOk: post.ledger.ok, failed: post.failed },
+      // S5〜S8: 照合 → 維持 → 孤児返金 → 帳簿なし残高の隔離
+      const swept = escrow.recoverSessions("system:recovery", live.holders);
+      // S9 が例外になっても、ここまでの結果を報告できるよう控えておく
+      sweptSoFar = {
+        keptHolders: swept.kept,
+        refundedSessions: swept.refundedSessions,
+        refundedTotal: swept.refundedTotal,
+        quarantined: swept.quarantined,
+        mismatched: swept.mismatched,
+        failedSessions: swept.failed,
+      };
+      steps.push("S5:照合", "S6:維持", "S7:孤児返金", "S8:隔離");
+
+      // S9: ソロゲームの債務予約を全解放（進行中のソロはプロセス内状態なので存在しない）
+      const releasedReservations = reservations.releaseAll("起動時の復旧");
+      steps.push("S9:予約解放");
+
+      return {
+        keptHolders: swept.kept,
+        refundedSessions: swept.refundedSessions,
+        refundedTotal: swept.refundedTotal,
+        quarantined: swept.quarantined,
+        mismatched: swept.mismatched,
+        failedSessions: swept.failed,
+        releasedReservations: { released: true, ...releasedReservations },
+        skipped: false as const,
+        reason: undefined as string | undefined,
+      };
     });
-    // S1 で startup_check へ入った時点で `held.status` は上書き済みなので、ここで単純に
-    // haltForIntegrity を呼ぶと「recovery_halt から再実行した」事実が失われ、通常の
-    // 「再点検（reopenAfterIntegrity）」で開けてしまう integrity_halt に化ける（PR7監査）。
-    // recovery_halt から再実行していたときは、その義務ごと recovery_halt を維持する。
-    if (recoveringFromHalt) {
-      status.haltForRecovery(`${held.reason}\n検算NG(復旧再実行後の全点検): ${reason}`);
-    } else {
-      status.haltForIntegrity(reason);
+
+    const summary = {
+      keptHolders: result.keptHolders,
+      refundedSessions: result.refundedSessions,
+      refundedTotal: result.refundedTotal,
+      quarantined: result.quarantined,
+      mismatched: result.mismatched,
+      failedSessions: result.failedSessions,
+      releasedReservations: result.releasedReservations,
+    };
+
+    // **所有元の申告が取れなかったら営業を再開しない**（PR7 レビュー指摘）。
+    //
+    // 以前はここを素通りして runFull → finishStartupCheck まで進んでいたので、
+    // 「所有元が分からないまま open へ戻る」状態になっていた。掃除を見送った以上、
+    // 復旧が完了したとは判断できない。運営の確認が必要な状態で止める。
+    if (result.skipped) {
+      const reason = result.reason ?? "生存中エスクローの収集に失敗";
+      // **専用の停止状態**にする。通常の「再点検」（reopenAfterIntegrity）では開かない。
+      // 出口は「復旧を再実行」して S4〜S12 を通すことだけ
+      status.haltForRecovery(`復旧中断: ${reason}（掃除・予約解放とも未実行。運営の確認が必要）`);
+      events.log("casino_recovery_halted", {
+        actor: "system:recovery",
+        payload: { steps, reason, reservationsReleased: false },
+      });
+      return { outcome: "source_failed", steps, ...summary, reason };
     }
-    return { outcome: "halted", steps, ...summary, reason };
-  }
 
-  // 帳簿不一致があれば、対象を凍結したうえで**賭場全体も止める**（運営判断）。
-  // 正本 §6 は「検算A〜D のいずれかが NG なら integrity_halt」なので、
-  // 正式開業前の段階で「1卓だけ止めて営業継続」へは緩和しない。
-  // （現状は checkC が同じ不一致を先に検出して post.ok=false になるため通常は上のブロックへ
-  // 入るが、将来 postflight の実装が変わってもここで recovery_halt を守れるよう同じ判断を残す）
-  if (result.mismatched.length > 0) {
-    const reason =
-      `エスクロー帳簿不一致 ${result.mismatched.length}件（対象は凍結済み・返金も隔離もしていない）: ` +
-      result.mismatched.map((m) => `${m.sessionId}(帳簿${m.expected}/保有${m.actual})`).join(", ");
-    events.log("casino_recovery_halted", {
-      actor: "system:recovery",
-      payload: { steps, reason, mismatched: result.mismatched },
-    });
-    if (recoveringFromHalt) {
-      status.haltForRecovery(`${held.reason}\n${reason}`);
-    } else {
-      status.haltForIntegrity(reason);
+    // 掃除のあとに**全点検（A〜D）**を常に実行する（診断のため）。ここで初めて C・D まで見る。
+    //
+    // ただし「最終的にどの停止状態にするか」の優先順位は postflight の成否だけで決めない
+    // （PR7監査・二次レビュー）。failedSessions は帳簿・残高が一致したまま残るため
+    // postflight がたまたま通ってしまうことがあるが、それでも復旧未完了として扱う必要がある。
+    // 優先順位: failedSessions（孤児返金の技術失敗） > mismatched（帳簿不一致）
+    //           > postflight自体のNG（上記以外） > 正常終了
+    const post = integrity.runFull();
+    const postReason = post.ok ? undefined : describeFailure(post);
+    if (!post.ok) {
+      events.log("casino_integrity_failed", {
+        actor: "system:recovery",
+        payload: { phase: "recover_post", ledgerOk: post.ledger.ok, failed: post.failed },
+      });
     }
-    return { outcome: "halted", steps, ...summary, reason };
-  }
 
-  // **孤児返金が技術的に失敗したセッションが1件でも残っていれば、営業を再開しない**（PR7監査）。
-  // 帳簿・残高は一致したまま維持されるため postflight A〜D はたまたま通り得るが、
-  // 復旧そのものは完了していない。recoveringFromHalt に関わらず必ず recovery_halt にして、
-  // 「復旧を再実行」からの再試行を求める（このセッションだけが次回また対象になる）。
-  if (result.failedSessions.length > 0) {
-    const reason =
-      `孤児返金の技術失敗 ${result.failedSessions.length}件（帳簿・残高は維持・要調査）: ` +
-      result.failedSessions.map((f) => `${f.sessionId}(帳簿${f.expected}/保有${f.actual}): ${f.error}`).join(", ");
-    events.log("casino_recovery_halted", {
+    // **孤児返金が技術的に失敗したセッションが1件でも残っていれば、営業を再開しない**（PR7監査）。
+    // postflight の成否より優先する。帳簿・残高は一致したまま維持されるため postflight A〜D は
+    // たまたま通り得るが、復旧そのものは完了していない。recoveringFromHalt に関わらず必ず
+    // recovery_halt にして、「復旧を再実行」からの再試行を求める（このセッションだけが
+    // 次回また対象になる）。
+    if (result.failedSessions.length > 0) {
+      const refundReason =
+        `孤児返金の技術失敗 ${result.failedSessions.length}件（帳簿・残高は維持・要調査）: ` +
+        result.failedSessions.map((f) => `${f.sessionId}(帳簿${f.expected}/保有${f.actual}): ${f.error}`).join(", ");
+      const reason = postReason ? `${refundReason} / 併発した検算NG: ${postReason}` : refundReason;
+      events.log("casino_recovery_halted", {
+        actor: "system:recovery",
+        payload: { steps, reason, failedSessions: result.failedSessions, postflightOk: post.ok },
+      });
+      status.haltForRecovery(recoveringFromHalt ? appendReason(held.reason, reason) : reason);
+      return { outcome: "refund_failed", steps, ...summary, reason };
+    }
+
+    if (!post.ok) {
+      const reason = postReason!;
+      // recovery_halt から再実行していたときは、その義務ごと recovery_halt を維持する
+      // （通常の「再点検（reopenAfterIntegrity）」で開けてしまう integrity_halt に化けさせない）。
+      if (recoveringFromHalt) {
+        status.haltForRecovery(appendReason(held.reason, `検算NG(復旧再実行後の全点検): ${reason}`));
+      } else {
+        status.haltForIntegrity(reason);
+      }
+      return { outcome: "halted", steps, ...summary, reason };
+    }
+
+    // 帳簿不一致があれば、対象を凍結したうえで**賭場全体も止める**（運営判断）。
+    // 正本 §6 は「検算A〜D のいずれかが NG なら integrity_halt」なので、
+    // 正式開業前の段階で「1卓だけ止めて営業継続」へは緩和しない。
+    // （現状は checkC が同じ不一致を先に検出して post.ok=false になるため通常は上のブロックへ
+    // 入るが、将来 postflight の実装が変わってもここで recovery_halt を守れるよう同じ判断を残す）
+    if (result.mismatched.length > 0) {
+      const reason =
+        `エスクロー帳簿不一致 ${result.mismatched.length}件（対象は凍結済み・返金も隔離もしていない）: ` +
+        result.mismatched.map((m) => `${m.sessionId}(帳簿${m.expected}/保有${m.actual})`).join(", ");
+      events.log("casino_recovery_halted", {
+        actor: "system:recovery",
+        payload: { steps, reason, mismatched: result.mismatched },
+      });
+      if (recoveringFromHalt) {
+        status.haltForRecovery(appendReason(held.reason, reason));
+      } else {
+        status.haltForIntegrity(reason);
+      }
+      return { outcome: "halted", steps, ...summary, reason };
+    }
+
+    // S12: 元の状態が startup_check のときだけ open へ戻す
+    status.finishStartupCheck("system:recovery");
+    steps.push("S12:再開");
+    events.log("casino_recovered", { actor: "system:recovery", payload: { steps, ...summary } });
+    return { outcome: "opened", steps, ...summary, reason: result.reason };
+  } catch (e) {
+    // S1〜S12 のどこかで予期しない例外。安全性を保証できないので必ず recovery_halt にする
+    // （PR7監査・二次レビュー）。S5〜S8 まで確認できていれば、その結果だけは報告する。
+    const message = e instanceof Error ? e.message : String(e);
+    const failedStep = steps[steps.length - 1] ?? "S1:startup_check";
+    const reason = `復旧処理中に予期しない例外（${failedStep}の直後）: ${message}`;
+    events.log("casino_recovery_exception", {
       actor: "system:recovery",
-      payload: { steps, reason, failedSessions: result.failedSessions },
+      payload: { steps, error: message },
     });
-    status.haltForRecovery(recoveringFromHalt ? `${held.reason}\n${reason}` : reason);
-    return { outcome: "refund_failed", steps, ...summary, reason };
+    status.haltForRecovery(recoveringFromHalt ? appendReason(held.reason, reason) : reason);
+    const summary = { ...sweptSoFar, releasedReservations: { released: false, count: 0, total: 0 } };
+    return { outcome: "exception_failed", steps, ...summary, reason };
   }
+}
 
-  // S12: 元の状態が startup_check のときだけ open へ戻す
-  status.finishStartupCheck("system:recovery");
-  steps.push("S12:再開");
-  events.log("casino_recovered", { actor: "system:recovery", payload: { steps, ...summary } });
-  return { outcome: "opened", steps, ...summary, reason: result.reason };
+/**
+ * recovery_halt の理由へ追記するとき、同じ文言を無限に重複させない（PR7監査・二次レビュー）。
+ * 同一の失敗で再実行を繰り返しても、その行が既にあれば足さない。新しい異常だけ追記し、
+ * 元の recovery_halt 理由（1行目以降の履歴）は保持する。
+ */
+function appendReason(base: string, addition: string): string {
+  const lines = base.split("\n");
+  if (lines.includes(addition)) return base;
+  return `${base}\n${addition}`;
 }
 
 function describeFailure(report: ReturnType<CasinoIntegrity["runFull"]>): string {

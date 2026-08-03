@@ -205,6 +205,15 @@ function logRecovery(r: ReturnType<typeof recoverCasino>): void {
           "　→ 原因を直したうえで /管理 → 賭場 → 「復旧を再実行」を押してください（再点検では開きません）",
       );
       break;
+    case "exception_failed":
+      // S1〜S12の途中で予期しない例外＝どこまで安全に完了したか保証できない（PR7監査・二次レビュー）。
+      // 必ずrecovery_haltにしてあるので、原因を直したうえで復旧を再実行するしかない
+      console.error(
+        `[賭場] 起動時の復旧中に予期しない例外が発生したため停止しました: ${r.reason}（${summary}）
+` +
+          "　→ 原因を直したうえで /管理 → 賭場 → 「復旧を再実行」を押してください（再点検では開きません）",
+      );
+      break;
     case "held":
       console.warn(`[賭場] 人が止めている状態のため復旧を行いません（${r.reason}）`);
       break;
