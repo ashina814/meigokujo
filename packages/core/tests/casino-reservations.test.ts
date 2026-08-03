@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   Casino,
   ChipTx,
-  EtherExchange,
+  ChipLedger,
   EventLog,
   HOUSE_HOLDER,
   HouseReservations,
@@ -39,7 +39,7 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
   const items = new Items(db);
   const reservations = new HouseReservations(db, ether, events);
   const casino = new Casino(db, ether, events, { items, reservations });
