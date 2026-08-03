@@ -3,6 +3,8 @@ name: Casino Diagnostic
 on:
   push:
     branches: ["diagnostic/**"]
+  pull_request:
+    branches: [main]
 
 jobs:
   diagnose:
