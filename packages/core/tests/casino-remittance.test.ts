@@ -50,6 +50,18 @@ function configureOpening(
   ).run(input.minimumWorkingCapital, input.bps);
 }
 
+function createRemittanceDraft(
+  c: ReturnType<typeof setup>,
+  key: string,
+  bps: number,
+  minimumWorkingCapital: number,
+  actor: string,
+  options: { period?: string; fukuReserve?: number } = {},
+) {
+  configureOpening(c, { bps, minimumWorkingCapital });
+  return c.remit.draftFromConfiguration(key, actor, options);
+}
+
 function openFormally(c: ReturnType<typeof setup>): void {
   c.db.prepare(
     "INSERT INTO settings (key, value, updated_at) VALUES (?, 'opening_v1', 0) ON CONFLICT(key) DO UPDATE SET value='opening_v1'",
@@ -135,7 +147,7 @@ describe("PR14 casino accounting and remittance", () => {
     });
     c.reservations.reserve("r1", 200, "slots", "u1");
 
-    const draft = c.remit.draft("m1", 5_000, 300, "maker", { fukuReserve: 100 });
+    const draft = createRemittanceDraft(c, "m1", 5_000, 300, "maker", { fukuReserve: 100 });
     expect(c.remit.pnl().map((row) => [row.category, row.amount])).toEqual([
       ["vip", 100],
       ["shop", 50],
@@ -155,7 +167,7 @@ describe("PR14 casino accounting and remittance", () => {
     const c = setup();
     fundHouse(c);
     c.remit.recordRealized("wager", 800, "manual:profit");
-    const first = c.remit.draft("m1", 5_000, 200, "maker");
+    const first = createRemittanceDraft(c, "m1", 5_000, 200, "maker");
     expect(first.amount).toBe(400);
     expect(() => c.remit.approve("m1", "maker")).toThrow("second approver");
     c.remit.approve("m1", "reviewer");
@@ -163,7 +175,7 @@ describe("PR14 casino accounting and remittance", () => {
     expect(() => c.remit.execute("m1", "operator")).toThrow("stale");
     expect(c.remit.get("m1")?.status).toBe("approved");
 
-    c.remit.draft("m2", 5_000, 200, "maker");
+    createRemittanceDraft(c, "m2", 5_000, 200, "maker");
     c.remit.approve("m2", "reviewer");
     const houseBefore = c.chips.balanceOf("house");
     const original = c.ledger.transfer.bind(c.ledger);
@@ -183,12 +195,12 @@ describe("PR14 casino accounting and remittance", () => {
     const c = setup();
     fundHouse(c);
     c.remit.recordRealized("wager", 800, "manual:profit");
-    const zero = c.remit.draft("zero", 0, 200, "maker");
+    const zero = createRemittanceDraft(c, "zero", 0, 200, "maker");
     expect(zero.amount).toBe(0);
     c.remit.approve("zero", "reviewer");
     expect(c.remit.execute("zero", "operator").status).toBe("executed");
 
-    c.remit.draft("m1", 5_000, 200, "maker");
+    createRemittanceDraft(c, "m1", 5_000, 200, "maker");
     c.remit.approve("m1", "reviewer");
     const executed = c.remit.execute("m1", "operator");
     expect(executed).toMatchObject({ status: "executed", chipGroupKey: "casino:remittance:m1" });
@@ -200,6 +212,7 @@ describe("PR14 casino accounting and remittance", () => {
 
   it("納付率と最低運転資金を開業設定だけから読む", () => {
     const c = setup();
+    expect((c.remit as unknown as { draft?: unknown }).draft).toBeUndefined();
     fundHouse(c);
     c.remit.recordRealized("wager", 800, "manual:profit");
     expect(c.remit.configuration()).toBeNull();
@@ -226,7 +239,7 @@ describe("PR14 casino accounting and remittance", () => {
     openFormally(c);
     fundHouse(c);
     c.remit.recordRealized("wager", 800, "manual:profit");
-    c.remit.draft("m1", 5_000, 200, "maker");
+    createRemittanceDraft(c, "m1", 5_000, 200, "maker");
     c.remit.approve("m1", "reviewer");
     c.remit.execute("m1", "operator");
     expect(landTxs(c, "chip_settle")).toEqual([
@@ -258,7 +271,7 @@ describe("PR14 casino accounting and remittance", () => {
     openFormally(c);
     fundHouse(c);
     c.remit.recordRealized("wager", 800, "manual:profit");
-    c.remit.draft("m1", 5_000, 200, "maker");
+    createRemittanceDraft(c, "m1", 5_000, 200, "maker");
     c.remit.approve("m1", "reviewer");
     const original = c.ledger.transfer.bind(c.ledger);
     c.ledger.transfer = ((input: never) => {
@@ -280,7 +293,7 @@ describe("PR14 casino accounting and remittance", () => {
     fundHouse(c, 10_000);
     c.remit.recordRealized("wager", 800, "manual:jan", "2026-01");
     c.remit.recordRealized("wager", 100, "manual:feb", "2026-02");
-    expect(c.remit.draft("feb", 10_000, 0, "maker", { period: "2026-02" }).snapshot).toMatchObject({
+    expect(createRemittanceDraft(c, "feb", 10_000, 0, "maker", { period: "2026-02" }).snapshot).toMatchObject({
       periodRealizedProfit: 100,
       cumulativeRealizedProfit: 900,
       cumulativeUndisposedProfit: 900,
@@ -292,17 +305,17 @@ describe("PR14 casino accounting and remittance", () => {
     const d = setup();
     fundHouse(d, 10_000);
     d.remit.recordRealized("wager", 800, "manual:jan", "2026-01");
-    d.remit.draft("jan", 3_750, 0, "maker", { period: "2026-01" });
+    createRemittanceDraft(d, "jan", 3_750, 0, "maker", { period: "2026-01" });
     d.remit.approve("jan", "reviewer");
     expect(d.remit.execute("jan", "operator").amount).toBe(300);
     d.remit.recordRealized("wager", 100, "manual:feb", "2026-02");
-    expect(d.remit.draft("feb", 10_000, 0, "maker", { period: "2026-02" }).snapshot).toMatchObject({
+    expect(createRemittanceDraft(d, "feb", 10_000, 0, "maker", { period: "2026-02" }).snapshot).toMatchObject({
       cumulativeRealizedProfit: 900,
       cumulativeUndisposedProfit: 600,
       base: 600,
       amount: 600,
     });
-    expect(d.remit.draft("feb-2", 10_000, 0, "maker", { period: "2026-02" }).amount).toBe(600);
+    expect(createRemittanceDraft(d, "feb-2", 10_000, 0, "maker", { period: "2026-02" }).amount).toBe(600);
     d.db.close();
   });
 
@@ -310,7 +323,7 @@ describe("PR14 casino accounting and remittance", () => {
     const c = setup();
     fundHouse(c);
     c.remit.recordRealized("wager", 800, "manual:profit");
-    c.remit.draft("m1", 5_000, 200, "maker");
+    createRemittanceDraft(c, "m1", 5_000, 200, "maker");
     c.remit.approve("m1", "reviewer");
     const originalRunGroup = c.chips.runGroup.bind(c.chips);
     let hooked = false;
@@ -332,7 +345,7 @@ describe("PR14 casino accounting and remittance", () => {
     const c = setup();
     fundHouse(c);
     c.remit.recordRealized("wager", 800, "manual:profit");
-    c.remit.draft("zero", 0, 200, "maker");
+    createRemittanceDraft(c, "zero", 0, 200, "maker");
     c.remit.approve("zero", "reviewer");
     c.remit.recordRealized("wager", 1, "manual:changed");
     expect(() => c.remit.execute("zero", "operator")).toThrow("stale");

@@ -219,7 +219,7 @@ export class CasinoRemittance {
       FROM casino_tx t
       JOIN casino_tx_groups g ON g.group_key=t.group_key
       WHERE g.status='settled' AND t.tx_kind='internal_transfer'
-      ORDER BY t.group_key, t.seq, t.id
+      ORDER BY t.created_at, t.id
     `).all() as ChipTxForPnl[];
     let inserted = 0;
     const payoutOrdinal = new Map<string, number>();
@@ -270,8 +270,8 @@ export class CasinoRemittance {
   pnl(period?: string): HousePnlRow[] {
     this.syncRealized();
     const sql = period
-      ? "SELECT * FROM casino_house_pnl WHERE period=? ORDER BY id"
-      : "SELECT * FROM casino_house_pnl ORDER BY id";
+      ? "SELECT * FROM casino_house_pnl WHERE period=? ORDER BY created_at, id"
+      : "SELECT * FROM casino_house_pnl ORDER BY created_at, id";
     const rows = (period ? this.db.prepare(sql).all(period) : this.db.prepare(sql).all()) as Array<{
       id: number;
       period: string;
@@ -357,13 +357,21 @@ export class CasinoRemittance {
     };
   }
 
-  draft(
+  private draftConfigured(
     key: string,
     bps: number,
     minimumWorkingCapital: number,
     actor: string,
     options: RemittanceDraftOptions = {},
   ): RemittanceRow {
+    const configured = this.configuration();
+    if (
+      !configured
+      || configured.remittanceBps !== bps
+      || configured.minimumWorkingCapital !== minimumWorkingCapital
+    ) {
+      throw new Error("remittance draft must use opening configuration");
+    }
     const period = options.period ?? monthOf();
     const snapshot = this.remittanceSnapshot(
       bps,
@@ -396,7 +404,7 @@ export class CasinoRemittance {
   ): RemittanceRow {
     const config = this.configuration();
     if (!config) throw new Error("casino opening configuration required");
-    return this.draft(key, config.remittanceBps, config.minimumWorkingCapital, actor, options);
+    return this.draftConfigured(key, config.remittanceBps, config.minimumWorkingCapital, actor, options);
   }
 
   bailoutDraft(

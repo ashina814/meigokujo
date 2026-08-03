@@ -157,8 +157,6 @@ export {
 export {
   ChipLedger,
   ChipLedgerError,
-  /** @deprecated compatibility export; use ChipLedger. */
-  EtherExchange,
   CHIP_ESCROW,
   ETHER_ESCROW,
   HOUSE_HOLDER,
