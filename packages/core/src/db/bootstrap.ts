@@ -411,6 +411,91 @@ CREATE TABLE IF NOT EXISTS ether_balances (
   updated_at INTEGER NOT NULL
 );
 
+-- PR10: 自由チップの自動返還はプロセス内タイマーだけに依存させない。
+CREATE TABLE IF NOT EXISTS casino_chip_activity (
+  user_id        TEXT PRIMARY KEY,
+  last_active_at INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_casino_chip_activity_idle ON casino_chip_activity(last_active_at);
+
+CREATE TABLE IF NOT EXISTS casino_chip_external_confirmations (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  operation_kind TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  required_land INTEGER NOT NULL CHECK(required_land > 0),
+  status TEXT NOT NULL CHECK(status IN ('pending','executing','completed','cancelled','expired')),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  completed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_casino_chip_external_confirmations_user ON casino_chip_external_confirmations(user_id, status, expires_at);
+
+-- PR10: 緊急返還は「画面で確認した件数」と実行対象を同じ永続sagaで固定する。
+-- 実行途中でプロセスが落ちても、同じsagaを再開すれば各利用者の冪等groupから完了へ収束する。
+CREATE TABLE IF NOT EXISTS casino_chip_refund_sagas (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL CHECK(scope IN ('user','all')),
+  requested_by TEXT NOT NULL,
+  target_user_id TEXT,
+  status TEXT NOT NULL CHECK(status IN ('draft','executing','completed','blocked','cancelled')),
+  target_count INTEGER NOT NULL CHECK(target_count >= 0),
+  target_total INTEGER NOT NULL CHECK(target_total >= 0),
+  created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  completed_at INTEGER,
+  failure_json TEXT
+);
+CREATE TABLE IF NOT EXISTS casino_chip_refund_saga_targets (
+  saga_id TEXT NOT NULL REFERENCES casino_chip_refund_sagas(id),
+  user_id TEXT NOT NULL,
+  amount INTEGER NOT NULL CHECK(amount >= 0),
+  status TEXT NOT NULL CHECK(status IN ('pending','completed','failed','blocked')),
+  group_key TEXT NOT NULL UNIQUE,
+  result_json TEXT,
+  completed_at INTEGER,
+  failure TEXT,
+  PRIMARY KEY(saga_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_casino_chip_refund_saga_targets_status ON casino_chip_refund_saga_targets(saga_id, status);
+
+-- PR11: チンチロの2倍事前預託。通常の再起動時は孤児返金するが、返金そのものに
+-- 失敗したものだけは帳簿と理由を残して凍結し、運営の手動復旧を待つ。
+CREATE TABLE IF NOT EXISTS casino_chinchiro_preholds (
+  session_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  bet INTEGER NOT NULL CHECK(bet > 0),
+  amount INTEGER NOT NULL CHECK(amount > 0),
+  status TEXT NOT NULL CHECK(status IN ('preheld','settled','refunded','frozen')),
+  created_at INTEGER NOT NULL,
+  settled_at INTEGER,
+  frozen_at INTEGER,
+  failure TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_casino_chinchiro_preholds_status ON casino_chinchiro_preholds(status, created_at);
+
+-- 正式開業初期化: 設定と、hash で固定された一度きりの適用記録。
+CREATE TABLE IF NOT EXISTS casino_opening_configuration (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  casino_opening_capital INTEGER NOT NULL CHECK(casino_opening_capital > 0),
+  casino_opening_house INTEGER NOT NULL CHECK(casino_opening_house > 0),
+  casino_opening_jackpot INTEGER NOT NULL CHECK(casino_opening_jackpot >= 0),
+  casino_opening_relief INTEGER NOT NULL CHECK(casino_opening_relief >= 0),
+  casino_min_working_capital INTEGER NOT NULL CHECK(casino_min_working_capital >= 0),
+  casino_remit_rate_bps INTEGER NOT NULL CHECK(casino_remit_rate_bps BETWEEN 0 AND 10000),
+  casino_opening_configured INTEGER NOT NULL CHECK(casino_opening_configured IN (0,1)),
+  configured_by TEXT NOT NULL,
+  configured_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS casino_opening_reset_plans (
+  plan_hash TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK(status IN ('applied','rolled_back')),
+  manifest_json TEXT NOT NULL,
+  applied_by TEXT NOT NULL,
+  applied_at INTEGER NOT NULL
+);
+
 -- 賭場チップの取引監査（大型UPD PR1）。チップ残高は現在値しか持たないので、
 -- 「業務操作の単位(group)」と「その中の1移動(tx)」を追記し、開始残高から再現できるようにする。
 CREATE TABLE IF NOT EXISTS casino_tx_groups (
@@ -466,8 +551,32 @@ CREATE TABLE IF NOT EXISTS casino_chip_opening_versions (
   opening_version TEXT PRIMARY KEY,
   version_seq     INTEGER NOT NULL UNIQUE,
   from_tx_id      INTEGER NOT NULL,          -- 参考値（その時点の最終取引ID）
+  -- その版を開いた時点の準備プール(sys:escrow:ether)の Land。検算Bの出発点。
+  pool_land       INTEGER,
+  -- その時点の Land 台帳の最終取引ID。検算Bはこれ以降の準備口座の出入りを1件ずつ監査する。
+  -- pool_land と揃って初めて基準が成立する。NULL なら検算Bは NG（自動では埋めない）
+  from_ledger_tx_id INTEGER,
   created_at      INTEGER NOT NULL
 );
+
+-- 賭場の稼働状態（1行だけ）。停止は理由・実行者・時刻とセットでしか作れない。
+-- startup_check だけが自動で解除され、それ以外は人の明示操作でしか開かない。
+CREATE TABLE IF NOT EXISTS casino_status (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  status     TEXT NOT NULL,
+  reason     TEXT NOT NULL,
+  changed_by TEXT NOT NULL,
+  changed_at INTEGER NOT NULL
+);
+-- 状態の変遷は全部残す（いつ誰がなぜ止めた/開けたか）
+CREATE TABLE IF NOT EXISTS casino_status_history (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  status     TEXT NOT NULL,
+  reason     TEXT NOT NULL,
+  changed_by TEXT NOT NULL,
+  changed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_casino_status_history ON casino_status_history(changed_at);
 
 -- 検算の出発点。ここに載せた版の残高 + その版の窓の casino_tx = その時点の残高 になる
 CREATE TABLE IF NOT EXISTS casino_chip_opening_balances (
@@ -601,6 +710,8 @@ export function openDb(path: string): Database.Database {
   // マイグレーション: 旧カジノの chip_balances は ether_balances に置き換え（旧カジノは開帳前に廃止＝データ無し）
   db.exec("DROP TABLE IF EXISTS chip_balances");
   db.exec(DDL);
+  ensureColumn(db, "casino_chip_opening_versions", "pool_land", "INTEGER");
+  ensureColumn(db, "casino_chip_opening_versions", "from_ledger_tx_id", "INTEGER");
   ensureColumn(db, "vc_segments", "parent_id", "TEXT");
   ensureColumn(db, "marks", "weight", "INTEGER NOT NULL DEFAULT 1 CHECK (weight > 0)");
   ensureColumn(db, "evaluations", "mark_weight", "INTEGER NOT NULL DEFAULT 0 CHECK (mark_weight >= 0)");

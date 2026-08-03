@@ -68,14 +68,14 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
       totalBet: pot,
     });
     const choValue = chos.length > 0
-      ? chos.map((b) => `　<@${b.userId}>  ${fmtEther(b.amount).replace(" ◈", "◈")}`).join("\n")
+      ? chos.map((b) => `　<@${b.userId}>  ${fmtEther(b.amount).replace(" Ld", "Ld")}`).join("\n")
       : "　（誰も張っていない）";
     const hanValue = hans.length > 0
-      ? hans.map((b) => `　<@${b.userId}>  ${fmtEther(b.amount).replace(" ◈", "◈")}`).join("\n")
+      ? hans.map((b) => `　<@${b.userId}>  ${fmtEther(b.amount).replace(" Ld", "Ld")}`).join("\n")
       : "　（誰も張っていない）";
     embed.addFields(
-      { name: `⚫ 丁（偶数）  ${chos.length}人  ·  ${fmtEther(choTotal).replace(" ◈", "◈")}`, value: choValue, inline: false },
-      { name: `⚪ 半（奇数）  ${hans.length}人  ·  ${fmtEther(hanTotal).replace(" ◈", "◈")}`, value: hanValue, inline: false },
+      { name: `⚫ 丁（偶数）  ${chos.length}人  ·  ${fmtEther(choTotal).replace(" Ld", "Ld")}`, value: choValue, inline: false },
+      { name: `⚪ 半（奇数）  ${hans.length}人  ·  ${fmtEther(hanTotal).replace(" Ld", "Ld")}`, value: hanValue, inline: false },
     );
     return embed;
   };
@@ -106,7 +106,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
           new ActionRowBuilder<TextInputBuilder>().addComponents(
             new TextInputBuilder()
               .setCustomId("amount")
-              .setLabel(`賭けるエテル（${MIN_BET}〜${MAX_BET.toLocaleString()}）`)
+              .setLabel(`賭けるLand（${MIN_BET}〜${MAX_BET.toLocaleString()}）`)
               .setStyle(TextInputStyle.Short)
               .setRequired(true)
               .setMaxLength(9),
@@ -117,7 +117,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
       if (!sub) return;
       const amt = Number(sub.fields.getTextInputValue("amount").replaceAll(",", "").trim());
       if (!Number.isInteger(amt) || amt < MIN_BET || amt > MAX_BET) {
-        await sub.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
+        await sub.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} Ld で。`, flags: MessageFlags.Ephemeral });
         return;
       }
       // 既に張ってたら追加額を徴収して増額
@@ -133,7 +133,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
           return;
         }
         if (services.ether.balanceOf(btn.user.id) < additional) {
-          await sub.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
+          await sub.reply({ content: "Land残高が足りない。", flags: MessageFlags.Ephemeral });
           return;
         }
         if (!collectStakes(services, [btn.user.id], additional, `${session}:collect:${btn.id}`, session, "chohan-multi")) {
@@ -143,7 +143,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
         existing.amount = amt;
       } else {
         if (services.ether.balanceOf(btn.user.id) < amt) {
-          await sub.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
+          await sub.reply({ content: "Land残高が足りない。", flags: MessageFlags.Ephemeral });
           return;
         }
         if (!collectStakes(services, [btn.user.id], amt, `${session}:collect:${btn.id}`, session, "chohan-multi")) {
@@ -248,7 +248,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
     .sort((a, b) => b.amount - a.amount)
     .map((w) => {
       const share = Math.floor((distributable * w.amount) / winTotal);
-      return `　${E.win}  <@${w.userId}>  賭け ${fmtEther(w.amount).replace(" ◈", "◈")} → 受取 **${fmtEther(share).replace(" ◈", "◈")}**  ${fmtBigDelta(share - w.amount)}`;
+      return `　${E.win}  <@${w.userId}>  賭け ${fmtEther(w.amount).replace(" Ld", "Ld")} → 受取 **${fmtEther(share).replace(" Ld", "Ld")}**  ${fmtBigDelta(share - w.amount)}`;
     })
     .join("\n");
   const loserLines = losers
@@ -263,7 +263,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
       { name: `${E.win} 勝ち側  ${winners.length}人`, value: winnerLines || "（なし）", inline: false },
       { name: `${E.lose} 負け側  ${losers.length}人`, value: loserLines || "（なし）", inline: false },
     )
-    .setFooter({ text: `場代 ${fmtEther(totalHouseCut).replace(" ◈", "◈")} → JPプール` });
+    .setFooter({ text: `場代 ${fmtEther(totalHouseCut).replace(" Ld", "Ld")} → JPプール` });
   await interaction.editReply({ embeds: [embed], components: [], allowedMentions: { parse: [] } });
   }
 }

@@ -133,8 +133,8 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
       {
         name: "▸ プール",
         value: [
-          `${E.bet}  **単勝** ${fmtEther(totalWin).replace(" ◈", "◈")}  →  賞金プール ${fmtEther(winPrize).replace(" ◈", "◈")}`,
-          `${E.up}  **複勝** ${fmtEther(totalPlace).replace(" ◈", "◈")}  →  賞金プール ${fmtEther(placePrize).replace(" ◈", "◈")}`,
+          `${E.bet}  **単勝** ${fmtEther(totalWin).replace(" Ld", "Ld")}  →  賞金プール ${fmtEther(winPrize).replace(" Ld", "Ld")}`,
+          `${E.up}  **複勝** ${fmtEther(totalPlace).replace(" Ld", "Ld")}  →  賞金プール ${fmtEther(placePrize).replace(" Ld", "Ld")}`,
         ].join("\n"),
         inline: false,
       },
@@ -188,11 +188,11 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
         return;
       }
       if (!Number.isInteger(amt) || amt < MIN_BET || amt > MAX_BET) {
-        await sub.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
+        await sub.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} Ld で。`, flags: MessageFlags.Ephemeral });
         return;
       }
       if (!services.escrow.hold(session, btn.user.id, amt, "keiba", btn.id)) {
-        await sub.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
+        await sub.reply({ content: "Land残高が足りない。", flags: MessageFlags.Ephemeral });
         return;
       }
       const arr = bets.get(btn.user.id) ?? [];
@@ -442,8 +442,8 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
           {
             name: "▸ 配当倍率",
             value: [
-              `${E.bet}  **単勝 ×${winOdds}**  ·  プール ${fmtEther(winPool).replace(" ◈", "◈")}  ·  場代 ${fmtEther(winCut).replace(" ◈", "◈")}`,
-              `${E.up}  **複勝 ×${placeOdds}**  ·  プール ${fmtEther(placePool).replace(" ◈", "◈")}  ·  場代 ${fmtEther(placeCut).replace(" ◈", "◈")}`,
+              `${E.bet}  **単勝 ×${winOdds}**  ·  プール ${fmtEther(winPool).replace(" Ld", "Ld")}  ·  場代 ${fmtEther(winCut).replace(" Ld", "Ld")}`,
+              `${E.up}  **複勝 ×${placeOdds}**  ·  プール ${fmtEther(placePool).replace(" Ld", "Ld")}  ·  場代 ${fmtEther(placeCut).replace(" Ld", "Ld")}`,
             ].join("\n"),
             inline: false,
           },

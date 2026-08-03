@@ -10,7 +10,8 @@ describe("/あそびかた", () => {
 
     expect(services.settings.getNumber).toHaveBeenCalledWith("initial_grant");
     const payload = reply.mock.calls[0]?.[0];
-    const text = JSON.stringify(payload.embeds[0].toJSON());
+    const json = payload.embeds[0].toJSON();
+    const text = JSON.stringify(json);
     for (const word of [
       "初めて",
       "プロフィール",
@@ -30,11 +31,18 @@ describe("/あそびかた", () => {
     }
     expect(text).toContain("12,345Ld");
     expect(text).not.toContain("30,000");
-    expect(text).toMatch(/通行証.*賭場.*エテル残高.*戦績.*勝率/s);
+    expect(text).toMatch(/通行証.*賭場.*Land残高.*戦績.*勝率/s);
     expect(text).not.toMatch(/通行証.*入城状態/s);
-    expect(text).not.toMatch(/ランキング.*Land/s);
+    // ランキングは活動量の案内であって、Land の多寡を競う導線ではない
+    const rankingField = json.fields.find((f: { name: string }) => f.name.includes("ランキング"));
+    const rankingCommandLine = rankingField.value
+      .split("\n")
+      .find((line: string) => line.includes("/ランキング"));
+    expect(rankingCommandLine).toBeDefined();
+    expect(rankingCommandLine).not.toContain("Land");
+    // 利用者画面から旧通貨・旧交換導線を出さない（PR13: Land 表示への統一）
     expect(text).not.toContain("チップ");
-    expect(text).toContain("エテル");
-    expect(text).toContain("両替所");
+    expect(text).not.toContain("エテル");
+    expect(text).not.toContain("両替所");
   });
 });

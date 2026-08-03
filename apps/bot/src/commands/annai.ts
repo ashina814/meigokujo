@@ -8,8 +8,9 @@ import {
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { fmtEther, fmtLd } from "../format.js";
-import { C_MAMMON, C_JACKPOT, E, HR_THIN, fmtSignedEther, bar } from "../casino/ui.js";
+import { C_MAMMON, C_JACKPOT, E, HR_THIN, fmtSignedEther } from "../casino/ui.js";
 import type { Services } from "../services.js";
+import { isSeatOccupied } from "../casino/common.js";
 
 /**
  * /案内 — マモンの賭場ホーム画面。
@@ -32,6 +33,18 @@ export async function handleAnnaiCommand(
 export async function handleAnnaiButton(interaction: import("discord.js").ButtonInteraction, services: Services): Promise<void> {
   if (interaction.customId === "annai:refresh") {
     await interaction.update(renderHome(interaction.user.id, services, interaction.guild?.name));
+    return;
+  }
+  if (interaction.customId === "casino:leave") {
+    if (isSeatOccupied(interaction.user.id)) {
+      await interaction.reply({ content: "進行中の勝負が終わってから賭場を出てください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const r = services.chipFlow.leaveCasino(interaction.user.id, `leave:${interaction.id}`);
+    await interaction.update({
+      ...renderHome(interaction.user.id, services, interaction.guild?.name),
+      content: r.redeemed > 0 ? `${fmtLd(r.land)} をLandへ返還しました。` : "返還できる自由チップはありません。",
+    });
   }
 }
 
@@ -39,9 +52,9 @@ function renderHome(userId: string, services: Services, serverName?: string) {
   const stats = services.casino.stats(userId);
   const ether = services.ether;
   const daily = services.daily;
-  const heldEther = ether.balanceOf(userId);
+  const assets = services.chipAssets.forUser(userId);
+  const heldEther = assets.freeChips;
   const heldLand = services.ledger.balanceOf(`user:${userId}`);
-  const rate = ether.rate();
   const jp = services.casino.jackpotPool();
   const houseBal = services.casino.houseBalance();
   const pool = ether.pool();
@@ -57,25 +70,34 @@ function renderHome(userId: string, services: Services, serverName?: string) {
   const winRate = stats.games > 0 ? (stats.wins / stats.games) * 100 : 0;
   const streakLine = stats.current_win_streak >= 2 ? `${E.fire} ${stats.current_win_streak}連勝中` : "";
   const loseStreakLine = stats.current_lose_streak >= 3 ? `${E.lose} ${stats.current_lose_streak}連敗` : "";
-  const netLifetime = stats.total_earned - stats.total_wagered;
+  // 通算損益 = 賭場で**確定した**ゲーム損益の総和（PR3）。
+  //
+  // 含む: ソロゲーム（連鎖ボーナス・福の重み込み）、フリースピン、JP当選、
+  //       対人戦（場代込み）、競馬、板。いずれも確定精算のときに一度だけ足す。
+  // 含まない: 預託中の資金、返金・無効試合、VIP、商店、通常送金、元手投入・売上精算。
+  //
+  // 以前は total_earned − total_wagered で出しており、total_earned が既に賭け額を
+  // 引いた純益なので、勝った回の賭け額を二重に引いていた。
+  const netLifetime = stats.total_earned - stats.total_lost;
 
   const walletValue = [
-    `**${fmtEther(heldEther)}** (エテル)`,
+    `**${fmtEther(heldEther)}** (自由チップ)`,
     `${fmtLd(heldLand)}`,
+    assets.escrowed > 0 ? `卓・板に預け中 **${fmtEther(assets.escrowed)}**` : "",
     isVip ? `${E.jp} **VIP** 残り${vipDaysLeft}日` : "",
   ]
     .filter(Boolean)
     .join("\n");
 
   const marketValue = [
-    `**1 Ld = ${rate.toFixed(2)} ${E.ether}**   （準備 ${pool.toLocaleString()} Ld ／ 発行 ${outstanding.toLocaleString()} ${E.ether}）`,
+    `**1 Ld = 1 ${E.ether}**   （準備 ${pool.toLocaleString()} Ld ／ 発行 ${outstanding.toLocaleString()} ${E.ether}）`,
     `${E.jp} JPプール **${fmtEther(jp)}**`,
     `胴元残 ${fmtEther(houseBal)}`,
   ].join("\n");
 
   const dailyValue = dailyReady
     ? `${E.sparkle} **今すぐ受け取れる** → \`/福分け\``
-    : `次は <t:${nextClaim}:R>  ／  連続 ${streak}日  ${streak >= 7 ? `**+${Math.min(200, Math.floor(streak / 7) * 50)}◈ボーナス**` : ""}`;
+    : `次は <t:${nextClaim}:R>  ／  連続 ${streak}日  ${streak >= 7 ? `**+${Math.min(200, Math.floor(streak / 7) * 50)} Ldボーナス**` : ""}`;
 
   const statsValue = [
     `${E.chart} 総 **${stats.games}** ／ 勝 ${stats.wins} 負 ${stats.losses}  勝率 **${winRate.toFixed(1)}%**`,
@@ -91,19 +113,21 @@ function renderHome(userId: string, services: Services, serverName?: string) {
   ].join("\n");
 
   const economyValue = [
-    `📈 \`/株\` — 6銘柄・1時間毎更新・3日保有上限`,
     `🏇 \`/競馬\` — 冥馬6頭・単勝/複勝パリミュチュエル`,
     `📋 \`/板\` — 何でも賭けられる公開市場`,
     `✨ \`/流れ星\` — 1日5回の占い（初回無料）`,
     `${E.jp} \`/vip\` — 月額${fmtEther(services.vip.price())} で賭け上限×${services.vip.betCapMult()}`,
+    // 株は停止中（PR6・正本 §1.3）。導線からは外すが、持っている建玉には触れていないので
+    // 「消えた」と誤解されないよう1行だけ残す
+    `🚫 \`/株\` — **停止中**（持っている株はそのまま。扱いが決まったら知らせる）`,
   ].join("\n");
 
   const detailValue = [
     `${E.paytable} \`/通行証\` — 戦績カード`,
     `🏅 \`/賭場番付\` — Top10（残高/勝率/最大単勝/連勝など）`,
     `${HR_THIN}`,
-    `${E.ether} エテル ⇄ Land はマモンの両替所パネルで`,
-    `　入場フェア／退場は **二割奉納**（80%着地・10%焼却・10%プール残留）`,
+    `賭場では自由チップを内部で使いますが、表示と利用者資産はLandです。`,
+    `　預入・返還は **1:1**（変動比率・焼却なし）`,
   ].join("\n");
 
   const embed = new EmbedBuilder()
@@ -123,10 +147,8 @@ function renderHome(userId: string, services: Services, serverName?: string) {
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("annai:refresh").setLabel("更新").setEmoji("🔁").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("casino:leave").setLabel("賭場を出る").setEmoji("🚪").setStyle(ButtonStyle.Secondary),
   );
 
   return { embeds: [embed], components: [row] };
 }
-
-// unused import prevented by re-export shape
-void bar;

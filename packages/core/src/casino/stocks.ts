@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
-import { EtherError, EtherExchange, HOUSE_HOLDER } from "./exchange.js";
+import { ChipLedgerError as EtherError, ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 import { defaultRng, type CasinoRng } from "./rng.js";
 
 /**
@@ -59,7 +59,7 @@ export class Stocks {
   private readonly rng: CasinoRng;
   constructor(
     private readonly db: Database.Database,
-    private readonly ether: EtherExchange,
+    private readonly ether: ChipLedger,
     private readonly events: EventLog,
     options: { rng?: CasinoRng } = {},
   ) {

@@ -266,6 +266,14 @@ export class Ledger {
   }
 
   /**
+   * いまの最終取引ID。賭場の検算Bが「この時点より後の準備口座の出入り」を監査する
+   * ための境界として使う。取引が1件も無ければ 0。
+   */
+  lastTransactionId(): number {
+    return (this.db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM transactions").get() as { id: number }).id;
+  }
+
+  /**
    * 検算: transactions から全残高を再計算して balances と突合し、
    * 恒等式「Σ(全口座残高) = 0」も確認する（経済設計.md §8）。
    */

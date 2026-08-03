@@ -81,5 +81,11 @@ export function registerDefaultTxTypes(): void {
   registerTxType("ether_sell", { ...sysToUser, minorBlocked: true }); // 準備プール→住人（退場・80%着地）
   registerTxType("ether_burn", { fromKinds: ["system"], toKinds: ["system"] }); // プール→国庫（10%焼却＝シンク）
   registerTxType("ether_settle", { fromKinds: ["system"], toKinds: ["system"] }); // プール→部署口座（胴元精算）
+  registerTxType("chip_deposit", { ...userToSys, minorBlocked: true });
+  registerTxType("chip_redeem", { ...sysToUser, minorBlocked: true });
+  registerTxType("chip_fund", { fromKinds: ["system"], toKinds: ["system"] });
+  registerTxType("chip_settle", { fromKinds: ["system"], toKinds: ["system"] });
+  registerTxType("casino_remittance", { fromKinds: ["system"], toKinds: ["system"] });
+  registerTxType("casino_bailout", { fromKinds: ["system"], toKinds: ["system"] });
   registerTxType("ether_house_fund", { fromKinds: ["system"], toKinds: ["system"] }); // 部署口座→プール（胴元の元手）
 }
