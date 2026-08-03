@@ -1,0 +1,71 @@
+name: Temporary Casino Stack Validation
+
+on:
+  push:
+    branches: ["feat/casino-remittance"]
+    paths: [".github/workflows/tmp-casino-validation.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/casino-remittance
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Run validation and record result
+        shell: bash
+        run: |
+          set +e
+          tested_sha=$(git rev-parse HEAD)
+          mkdir -p .diagnostic/casino-validation
+          pnpm install --frozen-lockfile > .diagnostic/casino-validation/install.log 2>&1
+          install_status=$?
+          if [ "$install_status" -eq 0 ]; then
+            pnpm --filter @meigokujo/core typecheck > .diagnostic/casino-validation/core-typecheck.log 2>&1
+            core_typecheck=$?
+            pnpm --filter @meigokujo/bot typecheck > .diagnostic/casino-validation/bot-typecheck.log 2>&1
+            bot_typecheck=$?
+            pnpm --filter @meigokujo/core test > .diagnostic/casino-validation/core-test.log 2>&1
+            core_test=$?
+            pnpm --filter @meigokujo/bot test > .diagnostic/casino-validation/bot-test-1.log 2>&1
+            bot_test_1=$?
+            pnpm --filter @meigokujo/bot test > .diagnostic/casino-validation/bot-test-2.log 2>&1
+            bot_test_2=$?
+            pnpm --filter @meigokujo/bot test > .diagnostic/casino-validation/bot-test-3.log 2>&1
+            bot_test_3=$?
+          else
+            core_typecheck=125
+            bot_typecheck=125
+            core_test=125
+            bot_test_1=125
+            bot_test_2=125
+            bot_test_3=125
+          fi
+          cat > .diagnostic/casino-validation/status.txt <<EOF
+          tested_sha=$tested_sha
+          install=$install_status
+          core_typecheck=$core_typecheck
+          bot_typecheck=$bot_typecheck
+          core_test=$core_test
+          bot_test_1=$bot_test_1
+          bot_test_2=$bot_test_2
+          bot_test_3=$bot_test_3
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/tmp-casino-validation.yml
+          git add .diagnostic/casino-validation
+          git commit -m "chore: record casino validation result"
+          git push origin HEAD:feat/casino-remittance
+          exit 0
