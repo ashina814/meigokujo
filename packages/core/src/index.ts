@@ -155,15 +155,19 @@ export {
   type FiscalErrorCode,
 } from "./fiscal/service.js";
 export {
-  EtherExchange,
-  EtherError,
+  ChipLedger,
+  ChipLedgerError,
+  CHIP_ESCROW,
   ETHER_ESCROW,
   HOUSE_HOLDER,
-  type EtherQuote,
-  type EtherErrorCode,
-  type EtherExchangeOptions,
+  ETHER_APPROVER,
+  CASINO_DEPARTMENT_KEY,
+  CASINO_DEPARTMENT,
+  isPlayerHolder,
+  type ChipQuote,
+  type ChipLedgerOptions,
   type ChipMoveInfo,
-} from "./casino/exchange.js";
+} from "./casino/chip-ledger.js";
 export {
   ChipTx,
   ChipTxError,
@@ -178,10 +182,27 @@ export {
   type ChipTxErrorCode,
 } from "./casino/chip-tx.js";
 export {
+  CasinoChipAssets,
+  type UserChipAssets,
+  type EscrowAssetMismatch,
+} from "./casino/chip-assets.js";
+export {
+  CasinoChipFlow,
+  type AutoDepositResult,
+  type RedeemResult,
+  type InactiveRedeemResult,
+  type ExternalChipConfirmation,
+  type RefundSaga,
+  type RefundSagaTarget,
+  type RefundSagaStatus,
+  type RefundSafetyGate,
+} from "./casino/chip-flow.js";
+export {
   Casino,
   JACKPOT_HOLDER,
   RELIEF_HOLDER,
   CHAIN_TIERS,
+  soloGroupKey,
   chainMultiplier,
   fukuRate,
   type CasinoStatsRow,
@@ -209,15 +230,47 @@ export {
   type PayoutMode,
   type MarketSettleResult,
   type MarketRefundResult,
+  type MarketsOptions,
+  MARKET_LIVE_STATUSES,
 } from "./casino/market.js";
+export {
+  CasinoStatus,
+  CASINO_STATUSES,
+  isHumanHeld,
+  type CasinoStatusValue,
+  type CasinoStatusRow,
+  type TransitionResult,
+} from "./casino/status.js";
+export {
+  CasinoIntegrity,
+  type CasinoCheckId,
+  type CasinoCheckResult,
+  type CasinoCheckMismatch,
+  type CasinoIntegrityReport,
+} from "./casino/integrity.js";
 export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";
-export { Escrow, escrowHolderFor, isEscrowHolder, ESCROW_QUARANTINE, type EscrowRow } from "./casino/escrow.js";
+export {
+  Escrow,
+  escrowHolderFor,
+  isEscrowHolder,
+  ESCROW_QUARANTINE,
+  type EscrowRow,
+  type EscrowOptions,
+} from "./casino/escrow.js";
+export {
+  FreeSpins,
+  FREE_SPIN_JACKPOT_CLAIMS_HOLDER,
+  type PendingFreeSpinRow,
+  type FreeSpinStatus,
+} from "./casino/free-spins.js";
 export { defaultRng, deterministicRng, scriptedRng, type CasinoRng } from "./casino/rng.js";
 export {
   SLOT_SYMBOLS,
   TRIPLE_PAYOUTS,
   DOUBLE_PAYOUTS,
+  SLOT_MAX_PAYOUT_MULT,
   JP_CONTRIBUTION as SLOTS_JP_CONTRIBUTION,
+  jackpotCutFor as slotsJackpotCutFor,
   JP_WIN_SHARE as SLOTS_JP_WIN_SHARE,
   SCATTER_TRIGGER_COUNT as SLOTS_SCATTER_TRIGGER_COUNT,
   spinReel as slotsSpinReel,
@@ -257,3 +310,82 @@ export {
   type BjStrategy,
   type PokerStrategy,
 } from "./casino/game-models.js";
+
+export {
+  CHINCHIRO_MAX_ROLLS,
+  CHINCHIRO_HOUSE_EDGE,
+  CHINCHIRO_WIN_MULT,
+  CHINCHIRO_MAX_LOSS_MULT,
+  CHINCHIRO_LOSS_MULT_BASE,
+  CHINCHIRO_DEALER_POLICY,
+  chinchiroRoll,
+  chinchiroEvaluate,
+  chinchiroRank,
+  chinchiroWinMult,
+  chinchiroLossMult,
+  chinchiroIsTerminal,
+  chinchiroCompare,
+  chinchiroPayout,
+  chinchiroPlayerLoss,
+  chinchiroMaxPlayerLoss,
+  chinchiroMaxPayout,
+  chinchiroPlayTurn,
+  chinchiroSimulateRtp,
+  type Dice as ChinchiroDice,
+  type Hand as ChinchiroHand,
+  type ChinchiroCompare,
+  type ChinchiroPolicy,
+  type ChinchiroRtpResult,
+} from "./casino/chinchiro-model.js";
+
+export {
+  slotsLiability,
+  slotsPaidSpinLiability,
+  chohanLiability,
+  crashLiability,
+  pokerLiability,
+  holdemLiability,
+  blackjackLiability,
+  blackjackNoDoubleLiability,
+  chinchiroLiability,
+  rouletteIncrementalLiability,
+  rouletteTableLiability,
+  liabilityModelFor,
+  LIABILITY_MODELS,
+  HOLDEM_CALL_ROUNDS,
+  HOLDEM_MAX_TOTAL_BET_MULT,
+  HOLDEM_MAX_PAYOUT_MULT,
+  BLACKJACK_MAX_PAYOUT_MULT,
+  BLACKJACK_NO_DOUBLE_MAX_PAYOUT_MULT,
+  type LiabilityContext,
+  type GameLiabilityModel,
+  type ChainMode,
+  type RouletteBet,
+} from "./casino/liability.js";
+
+export {
+  HouseReservations,
+  ReservationConflictError,
+  RESERVATION_STALE_SEC,
+  type ReservationRow,
+  type ReservationResult,
+} from "./casino/reservations.js";
+
+export {
+  RecoveryRegistry,
+  recoverCasino,
+  type RecoverySource,
+  type RecoverCasinoDeps,
+  type RecoverCasinoResult,
+} from "./casino/recovery.js";
+export {
+  CasinoOpeningReset,
+  FilesystemOpeningBackupAdapter,
+  type CasinoOpeningConfig,
+  type OpeningResetPlan,
+  type OpeningBackupAdapter,
+  type OpeningBackupManifest,
+  type OpeningDiscordAdapter,
+  type OpeningApplyResult,
+} from "./casino/opening-reset.js";
+export { CasinoRemittance, type RemittanceStatus, type RemittanceRow } from "./casino/remittance.js";

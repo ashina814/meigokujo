@@ -1,25 +1,61 @@
 import type Database from "better-sqlite3";
-import { Ledger, TREASURY } from "../ledger/service.js";
+import { Ledger } from "../ledger/service.js";
 import { EventLog } from "../events/service.js";
 import { ChipTx } from "./chip-tx.js";
 
 /**
- * エテル為替（カジノ第二通貨）。Land を 100% 準備する二通貨制。
- * エテルは魔法のお金ではなく「準備プール(sys:escrow:ether)の Land の引換券」で、
- *   1エテルの価値 = プールLand ÷ 発行エテル数（＝変動レート、板なし）。
- * 新規発行はしないので非インフレ。
+ * 賭場チップ台帳。Land を 100% 準備し、預入・返還とも常に 1:1 で処理する。
  *
- * スプレッド設計（DESIGN_v2「入りやすく出にくい賭場」）:
- * - 入場（Land→エテル）: フェアレート・手数料なし
- * - 退場（エテル→Land）: 20% 奉納 = 80% 着地 / 10% 焼却（→国庫＝Landシンク）/ 10% プール残留（→残った人のエテルが値上がり）
- * これにより churn ぶんだけ Land 総量はゆっくり縮む（能動的なシンク）。
+ * 旧エテル為替の変動レート・奉納・残余プール掃除はここには存在しない。正式開業前は
+ * 旧準備口座を読み、opening_v1 から新しい casino 準備口座へ切り替える。これにより
+ * PR12 が旧制度を明示的に清算するまで、既存残高の裏付けを勝手に動かさない。
  */
 export const ETHER_ESCROW = "sys:escrow:ether";
-const ETHER_APPROVER = "system:ether";
+/** 正式開業後の、発行済みチップを100%裏付ける Land 準備口座。 */
+export const CHIP_ESCROW = "sys:escrow:casino";
+/**
+ * 賭博場の部署キー（正本4.1 `sys:dept:賭博場`）。
+ *
+ * 開業出資・月次納付・国庫補填・支配人の元手投入／売上精算は、すべてこの
+ * 一つの部署口座を通る。ここを分けると賭場の資金が複数口座へ散り、部署板から
+ * 見えない残高ができるので、キーの literal をここ以外へ書かない。
+ */
+export const CASINO_DEPARTMENT_KEY = "賭博場";
+/** `CASINO_DEPARTMENT_KEY` の Land 台帳口座ID。 */
+export const CASINO_DEPARTMENT = `sys:dept:${CASINO_DEPARTMENT_KEY}`;
+/** 準備口座を動かす取引の承認者・実行者。検算Bの経路監査もこの値で照合する */
+export const ETHER_APPROVER = "system:ether";
 /** 胴元（マモンの賭場）のエテル保有者ID */
 export const HOUSE_HOLDER = "house";
+/**
+ * 準備プールの端数回収（孤児Land防止）の理由文。
+ * 検算Bは「プールは預入・返還とこの回収でしか動かない」を確かめるので、
+ * 回収を識別できるようにここを唯一の真実源にしておく。
+ */
+export const POOL_SWEEP_REASON = "準備プール残の回収";
 
-export type EtherErrorCode = "ERR_BAD_AMOUNT" | "ERR_INSUFFICIENT_ETHER" | "ERR_DUPLICATE";
+/** 賭場が自分で持つ保有者（利用者ではない）。プレフィクスで判定できないものだけ列挙する */
+const NON_PLAYER_HOLDERS: ReadonlySet<string> = new Set([HOUSE_HOLDER, "jackpot", "relief", "house_escrow_legacy"]);
+
+/**
+ * 保有者IDが**利用者本人**かどうか（PR3・通算損益の宛先判定）。
+ *
+ * チップ層の利用者IDは Discord のスノーフレークそのままなので、
+ * `sys:` / `escrow:` / `system:` で始まるものと胴元・JP・救済を除けば利用者になる。
+ * 戦績へ載せてよいのはここが true の保有者だけ。
+ */
+export function isPlayerHolder(holderId: string): boolean {
+  if (!holderId) return false;
+  if (NON_PLAYER_HOLDERS.has(holderId)) return false;
+  return !/^(sys:|system:|escrow:)/.test(holderId);
+}
+
+export type EtherErrorCode =
+  | "ERR_BAD_AMOUNT"
+  | "ERR_INSUFFICIENT_ETHER"
+  | "ERR_DUPLICATE"
+  /** 予約済み債務の裏付けまで精算しようとした（PR5） */
+  | "ERR_RESERVED_FUNDS";
 
 export class EtherError extends Error {
   constructor(
@@ -31,20 +67,26 @@ export class EtherError extends Error {
   }
 }
 
-export interface EtherQuote {
-  /** 入力（買い=Land / 売り=エテル） */
+export interface ChipQuote {
+  /** 入力（預入=Land / 返還=chip） */
   input: number;
-  /** 受取り（買い=エテル / 売り=Land） */
+  /** 受取り（預入=chip / 返還=Land） */
   output: number;
-  /** 焼却された Land（シンク） */
-  burned: number;
+  /** 常に0。旧レスポンス形との互換用で、チップ制度では焼却しない。 */
+  burned: 0;
 }
 
-export interface EtherExchangeOptions {
-  /** 準備が空のときの初期レート（1 Land = 何エテルか）。関数なら毎回評価＝設定変更が即反映 */
-  baseRate?: number | (() => number);
+export interface ChipLedgerOptions {
   /** 取引監査。賭場の全サービスで同じインスタンスを共有する（実行中グループを共有するため） */
   chipTx?: ChipTx;
+  /**
+   * その保有者について**いま予約されている債務**を返す（PR5）。
+   *
+   * `redeemToAccount`（売上精算）が「house 残高 − 予約総額」しか出せないようにするために使う。
+   * 予約は `HouseReservations` が持っており、そちらは `EtherExchange` を必要とするので、
+   * 循環を避けるために関数で受け取る（未設定なら予約なし＝従来どおり）。
+   */
+  reservedOf?: (holderId: string) => number;
 }
 
 /** チップ移動に必ず添える情報。理由の無い取引を作らないための必須引数 */
@@ -56,10 +98,7 @@ export interface ChipMoveInfo {
 
 const now = () => Math.floor(Date.now() / 1000);
 /** floor(a * b / c) を安全に（オーバーフロー回避） */
-const muldiv = (a: number, b: number, c: number) => Number((BigInt(a) * BigInt(b)) / BigInt(c));
-
-export class EtherExchange {
-  private readonly baseRateOpt: number | (() => number);
+export class ChipLedger {
   /** チップ移動の追記先。賭場の他サービスもここ経由で同じグループに乗る */
   readonly chipTx: ChipTx;
 
@@ -67,11 +106,37 @@ export class EtherExchange {
     private readonly db: Database.Database,
     private readonly ledger: Ledger,
     private readonly events: EventLog,
-    options: EtherExchangeOptions = {},
+    options: ChipLedgerOptions = {},
   ) {
-    this.baseRateOpt = options.baseRate ?? 10;
     this.chipTx = options.chipTx ?? new ChipTx(db);
+    if (options.reservedOf) this.reservedOfFn = options.reservedOf;
     this.ledger.ensureAccount(ETHER_ESCROW, "system");
+    this.ledger.ensureAccount(CHIP_ESCROW, "system");
+  }
+
+  /** @see ChipLedgerOptions.reservedOf */
+  private reservedOfFn: (holderId: string) => number = () => 0;
+
+  /**
+   * 予約の出所を後から繋ぐ（PR5）。
+   * `HouseReservations` は `ChipLedger` を要求するので、構築順の都合でこちらから繋ぐ。
+   */
+  setReservedProvider(fn: (holderId: string) => number): void {
+    this.reservedOfFn = fn;
+  }
+
+  /**
+   * その保有者から**いま外へ出してよい額**（PR5・正本 I7）。
+   *
+   * ```text
+   * 精算可能額 = 残高 − 予約済み債務
+   * ```
+   *
+   * 進行中のゲームの最大配当は予約として押さえてある。その裏付けまで部署口座へ
+   * 戻せてしまうと、予約が支払保証にならない。UI 側の制限では不十分なので**ここで止める**。
+   */
+  settleableBalance(holderId: string): number {
+    return Math.max(0, this.balanceOf(holderId) - Math.max(0, this.reservedOfFn(holderId)));
   }
 
   /**
@@ -82,15 +147,13 @@ export class EtherExchange {
     return this.chipTx.runGroup(input, body);
   }
 
-  /** 準備が空のときの初期レート（1 Land = 何エテル） */
-  baseRate(): number {
-    const r = typeof this.baseRateOpt === "function" ? this.baseRateOpt() : this.baseRateOpt;
-    return Number.isFinite(r) && r > 0 ? r : 10;
-  }
-
   /** 準備プールの Land 残高 */
   pool(): number {
-    return this.ledger.balanceOf(ETHER_ESCROW);
+    return this.ledger.balanceOf(this.reserveHolder());
+  }
+  /** 現在のチップ制度が使う準備口座。opening_v1 は PR12 が確定する。 */
+  reserveHolder(): string {
+    return this.chipTx.currentVersion() === "opening_v1" ? CHIP_ESCROW : ETHER_ESCROW;
   }
   /** 発行済みエテル総数 */
   outstanding(): number {
@@ -99,12 +162,6 @@ export class EtherExchange {
   balanceOf(holderId: string): number {
     const row = this.db.prepare("SELECT amount FROM ether_balances WHERE user_id = ?").get(holderId) as { amount: number } | undefined;
     return row?.amount ?? 0;
-  }
-  /** 1 Land = 何エテルか（表示用）。準備が空なら初期レート */
-  rate(): number {
-    const P = this.pool();
-    const C = this.outstanding();
-    return C === 0 || P === 0 ? this.baseRate() : C / P;
   }
 
   /**
@@ -134,33 +191,29 @@ export class EtherExchange {
       .run(holderId, ts);
   }
 
-  /** Land→エテルの見積り（実行せず）。フェアレート・手数料なし */
-  quoteBuy(landIn: number): EtherQuote {
-    const P = this.pool();
-    const C = this.outstanding();
-    const minted = C === 0 || P === 0 ? landIn * this.baseRate() : muldiv(landIn, C, P);
-    return { input: landIn, output: Math.floor(minted), burned: 0 };
+  /** Land を預け、同額の自由チップを受け取る。 */
+  quoteDeposit(landIn: number): ChipQuote {
+    return { input: landIn, output: landIn, burned: 0 };
+  }
+  /** PR9: いまゲームに使える自由チップ。拘束中資金は含まない。 */
+  freeChips(userId: string): number {
+    return this.balanceOf(userId);
   }
 
-  /** エテル→Land の見積り（実行せず）。現レートの80%が着地・10%焼却・10%残留 */
-  quoteSell(etherIn: number): EtherQuote {
-    const P = this.pool();
-    const C = this.outstanding();
-    const gross = C === 0 ? 0 : muldiv(etherIn, P, C);
-    const payout = Math.floor((gross * 8) / 10);
-    const burned = Math.floor(gross / 10);
-    return { input: etherIn, output: payout, burned };
+  /** 自由チップを返還し、同額の Land を受け取る。 */
+  quoteRedeem(chipsIn: number): ChipQuote {
+    return { input: chipsIn, output: chipsIn, burned: 0 };
   }
 
-  /** Land を払ってエテルを買う（入場・フェア） */
-  buy(userId: string, landIn: number, idempotencyKey: string): EtherQuote {
+  /** Land を預けて自由チップを発行する（常に 1:1）。 */
+  deposit(userId: string, landIn: number, idempotencyKey: string): ChipQuote {
     if (!Number.isInteger(landIn) || landIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { landIn });
-    return this.runGroup({ groupKey: idempotencyKey, kind: "deposit", actorId: `user:${userId}` }, (): EtherQuote => {
-      const q = this.quoteBuy(landIn);
+    return this.runGroup({ groupKey: idempotencyKey, kind: "deposit", actorId: `user:${userId}` }, (): ChipQuote => {
+      const q = this.quoteDeposit(landIn);
       this.ledger.ensureAccount(`user:${userId}`, "user");
       const land = this.ledger.transfer({
-        from: `user:${userId}`, to: ETHER_ESCROW, amount: landIn, type: "ether_buy", actor: `user:${userId}`,
-        approvedBy: ETHER_APPROVER, reason: "エテル購入", refType: "ether", refId: userId, idempotencyKey,
+        from: `user:${userId}`, to: this.reserveHolder(), amount: landIn, type: "chip_deposit", actor: `user:${userId}`,
+        approvedBy: ETHER_APPROVER, reason: "賭場チップ預入", refType: "casino_chip", refId: userId, idempotencyKey,
       });
       this.assertLandMoved(land, idempotencyKey);
       this.setBalance(userId, q.output);
@@ -168,100 +221,67 @@ export class EtherExchange {
         txKind: "deposit", to: userId, amount: q.output, reason: "チップ預入",
         landAmount: landIn, ledgerTxId: land.tx.id,
       });
-      this.events.log("ether_buy", { actor: userId, payload: { landIn, ether: q.output } });
+      this.events.log("chip_deposit", { actor: userId, payload: { landIn, chips: q.output } });
       return q;
     });
   }
 
-  /** エテルを売って Land を受け取る（退場・20%奉納） */
-  sell(userId: string, etherIn: number, idempotencyKey: string): EtherQuote {
-    if (!Number.isInteger(etherIn) || etherIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { etherIn });
-    return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: `user:${userId}` }, (): EtherQuote => {
+  /** 自由チップを Land へ返還する（常に 1:1）。 */
+  redeem(userId: string, chipsIn: number, idempotencyKey: string): ChipQuote {
+    if (!Number.isInteger(chipsIn) || chipsIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { chipsIn });
+    return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: `user:${userId}` }, (): ChipQuote => {
       // 残高の検査はグループの中で行う。外でやると、成功後の再試行が
       // 「保存済みの結果を返す」前に残高不足で落ちてしまう
       const held = this.balanceOf(userId);
-      if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
-      const q = this.quoteSell(etherIn);
-      let landTxId: number | null = null;
-      if (q.output > 0) {
-        const payout = this.ledger.transfer({
-          from: ETHER_ESCROW, to: `user:${userId}`, amount: q.output, type: "ether_sell", actor: `user:${userId}`,
-          approvedBy: ETHER_APPROVER, reason: "エテル換金", refType: "ether", refId: userId, idempotencyKey,
-        });
-        this.assertLandMoved(payout, idempotencyKey);
-        landTxId = payout.tx.id;
-      }
-      if (q.burned > 0) {
-        const burn = this.ledger.transfer({
-          from: ETHER_ESCROW, to: TREASURY, amount: q.burned, type: "ether_burn", actor: ETHER_APPROVER,
-          approvedBy: ETHER_APPROVER, reason: "退場奉納の焼却", refType: "ether", refId: userId, idempotencyKey: `${idempotencyKey}:burn`,
-        });
-        this.assertLandMoved(burn, `${idempotencyKey}:burn`);
-        landTxId = landTxId ?? burn.tx.id;
-      }
-      this.setBalance(userId, -etherIn);
-      // 端数で Land が 1 Ld も出ない返還（現行の変動レート由来）はそのまま通す。
-      // 資金の動きを変えずに「Land が動かなかった返還」として記録に残す。
-      this.chipTx.record({
-        txKind: "redeem", from: userId, amount: etherIn, reason: "チップ返還",
-        landAmount: q.output + q.burned, ledgerTxId: landTxId,
+      if (held < chipsIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, chipsIn });
+      const q = this.quoteRedeem(chipsIn);
+      const payout = this.ledger.transfer({
+        from: this.reserveHolder(), to: `user:${userId}`, amount: q.output, type: "chip_redeem", actor: `user:${userId}`,
+        approvedBy: ETHER_APPROVER, reason: "賭場チップ返還", refType: "casino_chip", refId: userId, idempotencyKey,
       });
-      this.sweepOrphanPool(userId, idempotencyKey);
-      this.events.log("ether_sell", { actor: userId, payload: { etherIn, land: q.output, burned: q.burned } });
+      this.assertLandMoved(payout, idempotencyKey);
+      this.setBalance(userId, -chipsIn);
+      this.chipTx.record({
+        txKind: "redeem", from: userId, amount: chipsIn, reason: "チップ返還",
+        landAmount: q.output, ledgerTxId: payout.tx.id,
+      });
+      this.events.log("chip_redeem", { actor: userId, payload: { chipsIn, land: q.output } });
       return q;
     });
   }
 
-  /**
-   * 保有エテルを換金し、Land を「システム口座（部署など）」へ着地させる。
-   * カジノ収益(house のエテル)を賭博場の部署口座へ精算するのに使う。
-   * 為替と同じスプレッド（80%着地/10%焼却/10%残留）。
-   */
-  redeemToAccount(holderId: string, etherIn: number, destAccount: string, actor: string, idempotencyKey: string): EtherQuote {
-    if (!Number.isInteger(etherIn) || etherIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { etherIn });
-    return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: actor }, (): EtherQuote => {
+  /** 胴元などのチップを、システム口座の Land へ 1:1 で精算する。 */
+  redeemToAccount(holderId: string, chipsIn: number, destAccount: string, actor: string, idempotencyKey: string): ChipQuote {
+    if (!Number.isInteger(chipsIn) || chipsIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { chipsIn });
+    return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: actor }, (): ChipQuote => {
       const held = this.balanceOf(holderId);
-      if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
-      const q = this.quoteSell(etherIn);
-      let landTxId: number | null = null;
-      if (q.output > 0) {
-        const settle = this.ledger.transfer({
-          from: ETHER_ESCROW, to: destAccount, amount: q.output, type: "ether_settle", actor,
-          approvedBy: ETHER_APPROVER, reason: "カジノ収益の精算", refType: "ether", refId: holderId, idempotencyKey,
-        });
-        this.assertLandMoved(settle, idempotencyKey);
-        landTxId = settle.tx.id;
-      }
-      if (q.burned > 0) {
-        const burn = this.ledger.transfer({
-          from: ETHER_ESCROW, to: TREASURY, amount: q.burned, type: "ether_burn", actor,
-          approvedBy: ETHER_APPROVER, reason: "精算奉納の焼却", refType: "ether", refId: holderId, idempotencyKey: `${idempotencyKey}:burn`,
-        });
-        this.assertLandMoved(burn, `${idempotencyKey}:burn`);
-        landTxId = landTxId ?? burn.tx.id;
-      }
-      this.setBalance(holderId, -etherIn);
-      this.chipTx.record({
-        txKind: "redeem", from: holderId, amount: etherIn, reason: "賭場収益の精算",
-        landAmount: q.output + q.burned, ledgerTxId: landTxId,
+      if (held < chipsIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, chipsIn });
+      const q = this.quoteRedeem(chipsIn);
+      const settle = this.ledger.transfer({
+        from: this.reserveHolder(), to: destAccount, amount: q.output, type: "chip_settle", actor,
+        approvedBy: ETHER_APPROVER, reason: "賭場収益の精算", refType: "casino_chip", refId: holderId, idempotencyKey,
       });
-      this.sweepOrphanPool(holderId, idempotencyKey);
-      this.events.log("ether_settle", { actor, payload: { holderId, etherIn, land: q.output, dest: destAccount } });
+      this.assertLandMoved(settle, idempotencyKey);
+      this.setBalance(holderId, -chipsIn);
+      this.chipTx.record({
+        txKind: "redeem", from: holderId, amount: chipsIn, reason: "賭場収益の精算",
+        landAmount: q.output, ledgerTxId: settle.tx.id,
+      });
+      this.events.log("chip_settle", { actor, payload: { holderId, chipsIn, land: q.output, dest: destAccount } });
       return q;
     });
   }
 
   /**
-   * システム口座(部署など)の Land を元手に、フェアレート（奉納なし）でエテルを holder へ発行。
-   * 胴元(マモン)の開帳資金を賭博場口座から入れる用。プレイヤーの両替と違い損得ゼロで往復できる。
+   * システム口座(部署など)の Land を元手に、1:1でチップを holder へ発行する。
    */
   fundFromAccount(srcAccount: string, landIn: number, holderId: string, idempotencyKey: string): { land: number; ether: number } {
     if (!Number.isInteger(landIn) || landIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { landIn });
     return this.runGroup({ groupKey: idempotencyKey, kind: "deposit", actorId: ETHER_APPROVER }, () => {
-      const q = this.quoteBuy(landIn); // 入場は元々フェアなので同じ計算
+      const q = this.quoteDeposit(landIn);
       const land = this.ledger.transfer({
-        from: srcAccount, to: ETHER_ESCROW, amount: landIn, type: "ether_house_fund", actor: ETHER_APPROVER,
-        approvedBy: ETHER_APPROVER, reason: "胴元の元手", refType: "ether", refId: holderId, idempotencyKey,
+        from: srcAccount, to: this.reserveHolder(), amount: landIn, type: "chip_fund", actor: ETHER_APPROVER,
+        approvedBy: ETHER_APPROVER, reason: "胴元の元手", refType: "casino_chip", refId: holderId, idempotencyKey,
       });
       this.assertLandMoved(land, idempotencyKey);
       this.setBalance(holderId, q.output);
@@ -269,39 +289,41 @@ export class EtherExchange {
         txKind: "deposit", to: holderId, amount: q.output, reason: "胴元の元手",
         landAmount: landIn, ledgerTxId: land.tx.id,
       });
-      this.events.log("ether_house_fund", { actor: holderId, payload: { land: landIn, ether: q.output, src: srcAccount } });
+      this.events.log("chip_fund", { actor: holderId, payload: { land: landIn, chips: q.output, src: srcAccount } });
       return { land: landIn, ether: q.output };
     });
   }
 
   /**
-   * holder のエテルをフェアレート（奉納なし）で system 口座(部署)へ Land 精算。
-   * 胴元の売上を賭博場口座へ戻す用。全部戻すと準備プールもちょうど空になる。
+   * @deprecated `redeemToAccount` を使う。1:1化により、旧「fair」区別は不要。
+   *
+   * **予約済み債務は出せない**（PR5）。進行中ゲームの最大配当の裏付けを部署口座へ
+   * 移せてしまうと、予約が支払保証にならない。`settleableBalance()` を超える要求は
+   * `ERR_RESERVED_FUNDS` で断る。予約が無ければ従来どおり全額戻せる
+   * （＝全部戻すと準備プールもちょうど空になる）。
    */
   redeemFairToAccount(holderId: string, etherIn: number, destAccount: string, idempotencyKey: string): { ether: number; land: number } {
     if (!Number.isInteger(etherIn) || etherIn <= 0) throw new EtherError("ERR_BAD_AMOUNT", { etherIn });
     return this.runGroup({ groupKey: idempotencyKey, kind: "redeem", actorId: ETHER_APPROVER }, () => {
       const held = this.balanceOf(holderId);
       if (held < etherIn) throw new EtherError("ERR_INSUFFICIENT_ETHER", { held, etherIn });
-      const P = this.pool();
-      const C = this.outstanding();
-      const land = C === 0 ? 0 : muldiv(etherIn, P, C); // フェア gross（80%引きなし）
-      let landTxId: number | null = null;
-      if (land > 0) {
-        const settle = this.ledger.transfer({
-          from: ETHER_ESCROW, to: destAccount, amount: land, type: "ether_settle", actor: ETHER_APPROVER,
-          approvedBy: ETHER_APPROVER, reason: "胴元の売上精算", refType: "ether", refId: holderId, idempotencyKey,
-        });
-        this.assertLandMoved(settle, idempotencyKey);
-        landTxId = settle.tx.id;
+      // 予約の再確認もグループ（＝同一トランザクション）の中で行う
+      const settleable = this.settleableBalance(holderId);
+      if (settleable < etherIn) {
+        throw new EtherError("ERR_RESERVED_FUNDS", { held, settleable, reserved: held - settleable, etherIn });
       }
+      const land = etherIn;
+      const settle = this.ledger.transfer({
+        from: this.reserveHolder(), to: destAccount, amount: land, type: "chip_settle", actor: ETHER_APPROVER,
+        approvedBy: ETHER_APPROVER, reason: "胴元の売上精算", refType: "casino_chip", refId: holderId, idempotencyKey,
+      });
+      this.assertLandMoved(settle, idempotencyKey);
       this.setBalance(holderId, -etherIn);
       this.chipTx.record({
         txKind: "redeem", from: holderId, amount: etherIn, reason: "胴元の売上精算",
-        landAmount: land, ledgerTxId: landTxId,
+        landAmount: land, ledgerTxId: settle.tx.id,
       });
-      this.sweepOrphanPool(holderId, idempotencyKey);
-      this.events.log("ether_settle", { actor: holderId, payload: { ether: etherIn, land, dest: destAccount, fair: true } });
+      this.events.log("chip_settle", { actor: holderId, payload: { chips: etherIn, land, dest: destAccount } });
       return { ether: etherIn, land };
     });
   }
@@ -320,13 +342,41 @@ export class EtherExchange {
     })();
   }
 
-  /** 全エテルが引き上げられたら、残留した端数プールを国庫へ掃く（孤児Land防止） */
-  private sweepOrphanPool(refId: string, idempotencyKey: string): void {
-    if (this.outstanding() === 0 && this.pool() > 0) {
-      this.ledger.transfer({
-        from: ETHER_ESCROW, to: TREASURY, amount: this.pool(), type: "ether_burn", actor: ETHER_APPROVER,
-        approvedBy: ETHER_APPROVER, reason: "準備プール残の回収", refType: "ether", refId, idempotencyKey: `${idempotencyKey}:sweep`,
-      });
-    }
+}
+
+/**
+ * @deprecated PR8後の新規コードでは使わない。内部テストと既存プラグインを段階移行させる
+ * 互換コンストラクタであり、変動レートの振る舞いは復活させない。
+ */
+export interface EtherExchangeOptions extends ChipLedgerOptions {
+  /** @deprecated 無視される。チップの交換比率は常に1:1。 */
+  baseRate?: number | (() => number);
+}
+
+/** @deprecated `ChipLedger` を使うこと。 */
+export class EtherExchange extends ChipLedger {
+  constructor(db: Database.Database, ledger: Ledger, events: EventLog, options: EtherExchangeOptions = {}) {
+    super(db, ledger, events, options);
+  }
+
+  /** @deprecated `deposit` を使うこと。常に1:1で処理される。 */
+  buy(userId: string, landIn: number, idempotencyKey: string): ChipQuote {
+    return this.deposit(userId, landIn, idempotencyKey);
+  }
+  /** @deprecated `redeem` を使うこと。常に1:1で処理される。 */
+  sell(userId: string, chipsIn: number, idempotencyKey: string): ChipQuote {
+    return this.redeem(userId, chipsIn, idempotencyKey);
+  }
+  /** @deprecated `quoteDeposit` を使うこと。 */
+  quoteBuy(landIn: number): ChipQuote {
+    return this.quoteDeposit(landIn);
+  }
+  /** @deprecated `quoteRedeem` を使うこと。 */
+  quoteSell(chipsIn: number): ChipQuote {
+    return this.quoteRedeem(chipsIn);
+  }
+  /** @deprecated 交換比率は常に1。 */
+  rate(): number {
+    return 1;
   }
 }

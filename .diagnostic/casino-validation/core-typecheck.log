@@ -1,0 +1,9 @@
+
+> @meigokujo/core@0.1.0 typecheck /home/runner/work/meigokujo/meigokujo/packages/core
+> tsc --noEmit
+
+tests/casino-recovery.test.ts(10,3): error TS2305: Module '"../src/index.js"' has no exported member 'EtherExchange'.
+tests/casino-reservations.test.ts(5,3): error TS2305: Module '"../src/index.js"' has no exported member 'EtherExchange'.
+/home/runner/work/meigokujo/meigokujo/packages/core:
+ ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @meigokujo/core@0.1.0 typecheck: `tsc --noEmit`
+Exit status 2

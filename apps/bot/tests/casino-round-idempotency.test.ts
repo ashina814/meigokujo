@@ -6,6 +6,7 @@ import {
   EtherExchange,
   EventLog,
   HOUSE_HOLDER,
+  FreeSpins,
   Items,
   JACKPOT_HOLDER,
   Ledger,
@@ -15,8 +16,8 @@ import {
   type CasinoRng,
 } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
-import { spinOnce } from "../src/casino/slots.js";
-import { settleChinchiroRound } from "../src/casino/chinchiro.js";
+import { resolveFreeSpin, spinPaid } from "../src/casino/slots.js";
+import { frozenChinchiroPreholdHolders, recoverFrozenChinchiroPrehold, refundChinchiroPrehold, settleChinchiroRound } from "../src/casino/chinchiro.js";
 import { settleRoulette } from "../src/casino/roulette.js";
 import { drawNagareboshi, ensureNagareboshiTable } from "../src/commands/nagareboshi.js";
 
@@ -37,8 +38,9 @@ function setup(rng: CasinoRng) {
   const items = new Items(db);
   const casino = new Casino(db, ether, events, { items });
   const escrow = new Escrow(db, ether, events);
-  const services = { db, ether, casino, items, escrow, rng, events } as unknown as Services;
-  return { db, chipTx, ether, casino, items, escrow, services };
+  const freeSpins = new FreeSpins(db);
+  const services = { db, ether, casino, items, escrow, freeSpins, rng, events } as unknown as Services;
+  return { db, chipTx, ether, casino, items, escrow, freeSpins, services };
 }
 
 /** 監査経路を通さずに残高を作る（テストの下ごしらえ専用） */
@@ -57,18 +59,21 @@ const CROWN = 0.85;
 
 describe("スロット: 通常スピンとフリースピンは別のグループ", () => {
   it("フリースピンの配当が実際に加算され、グループが2つできる", () => {
-    // 1回目: ✨✨✨（フリースピン獲得・配当0） / 2回目: 👑👑👑（25倍）
+    // 1回目: ✨✨✨（フリースピン獲得・配当0） / 無料スピンの出目: 👑👑👑（25倍）
     const ctx = setup(scriptedRng([SCATTER, SCATTER, SCATTER, CROWN, CROWN, CROWN]));
     seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
     seedBalance(ctx.db, "u1", 10_000);
     const bet = 1_000;
 
-    const paid = spinOnce(ctx.services, "u1", bet, "int-1", 0);
+    const paid = spinPaid(ctx.services, "u1", bet, "int-1");
     expect(paid.freeSpin).toBe(true);
     expect(paid.payout).toBe(0);
     expect(ctx.ether.balanceOf("u1")).toBe(9_000);
+    // 無料スピン権は有料スピンと同じトランザクションで DB に残っている
+    expect(paid.pendingFreeSpin).not.toBeNull();
+    expect(paid.pendingFreeSpin!.status).toBe("pending");
 
-    const free = spinOnce(ctx.services, "u1", bet, "int-1", 1);
+    const free = resolveFreeSpin(ctx.services, paid.pendingFreeSpin!);
     expect(free.matched).toBe("王冠");
     expect(free.payout).toBe(bet * 25);
     // 無料スピンなので賭けは引かれず、配当だけ増える
@@ -87,13 +92,13 @@ describe("スロット: 通常スピンとフリースピンは別のグルー�
     seedBalance(ctx.db, "u1", 10_000);
     const bet = 1_000;
 
-    const paid = spinOnce(ctx.services, "u1", bet, "int-1", 0);
-    const free = spinOnce(ctx.services, "u1", bet, "int-1", 1);
+    const paid = spinPaid(ctx.services, "u1", bet, "int-1");
+    const free = resolveFreeSpin(ctx.services, paid.pendingFreeSpin!);
     const balanceAfter = ctx.ether.balanceOf("u1");
 
     // 再実行: リール・役・フリースピン獲得・配当のすべてが保存済みの値で返る
-    expect(spinOnce(ctx.services, "u1", bet, "int-1", 0)).toEqual(paid);
-    expect(spinOnce(ctx.services, "u1", bet, "int-1", 1)).toEqual(free);
+    expect(spinPaid(ctx.services, "u1", bet, "int-1")).toEqual(paid);
+    expect(resolveFreeSpin(ctx.services, paid.pendingFreeSpin!)).toEqual(free);
     expect(ctx.ether.balanceOf("u1")).toBe(balanceAfter);
     expect(ctx.casino.stats("u1").games).toBe(1); // 有料スピン1回ぶんだけ
     ctx.db.close();
@@ -104,7 +109,8 @@ describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
   it("所持額が倍付け損失ちょうどでも、二度実行して減るのは1回分だけ", () => {
     const ctx = setup(scriptedRng([0.5]));
     seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
-    seedBalance(ctx.db, "u1", 2_000); // bet 1,000 + 追加徴収 1,000 ちょうど
+    seedBalance(ctx.db, "u1", 2_000);
+    expect(ctx.escrow.hold("chinchiro:prehold:u1:op-1", "u1", 2_000, "チンチロ", "prehold")).toBe(true);
 
     const first = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
     expect(first.branch).toBe("double_loss");
@@ -115,11 +121,7 @@ describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
     const second = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
     expect(second).toEqual(first);
     expect(ctx.ether.balanceOf("u1")).toBe(0);
-    expect(ctx.chipTx.listByGroup("chinchiro:round:u1:op-1").map((r) => r.reason)).toEqual([
-      "賭け金",
-      "倍付け負けの追加徴収",
-    ]);
-    expect(ctx.chipTx.getGroup("solo:チンチロ:u1:op-1")).toBeUndefined();
+    expect(ctx.chipTx.listByGroup("chinchiro:round:u1:op-1").map((r) => r.reason)).toEqual(["賭け金（倍付け損失を含む）"]);
     ctx.db.close();
   });
 
@@ -127,6 +129,7 @@ describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
     const ctx = setup(scriptedRng([0.5]));
     seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
     seedBalance(ctx.db, "u1", 2_500);
+    expect(ctx.escrow.hold("chinchiro:prehold:u1:op-1", "u1", 2_000, "チンチロ", "prehold")).toBe(true);
 
     const first = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
     expect(first.branch).toBe("double_loss");
@@ -134,21 +137,53 @@ describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
 
     expect(settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1")).toEqual(first);
     expect(ctx.ether.balanceOf("u1")).toBe(500);
-    expect(ctx.casino.stats("u1").games).toBe(1);
+    expect(ctx.casino.stats("u1").total_lost).toBe(2_000);
     ctx.db.close();
   });
 
-  it("残高不足のフォールバックも同じグループで確定する", () => {
+  it("2倍分を事前に預けられなければ開始せず、通常負けへフォールバックしない", () => {
     const ctx = setup(scriptedRng([0.5]));
     seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
     seedBalance(ctx.db, "u1", 1_500); // 追加徴収 1,000 に足りない
 
-    const first = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
-    expect(first.branch).toBe("fallback_loss");
-    expect(ctx.ether.balanceOf("u1")).toBe(500);
+    expect(ctx.escrow.hold("chinchiro:prehold:u1:op-1", "u1", 2_000, "チンチロ", "prehold")).toBe(false);
+    expect(ctx.ether.balanceOf("u1")).toBe(1_500);
+    expect(ctx.chipTx.getGroup("chinchiro:round:u1:op-1")).toBeUndefined();
+    ctx.db.close();
+  });
 
-    expect(settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1")).toEqual(first);
-    expect(ctx.ether.balanceOf("u1")).toBe(500);
+  it("帳簿とholderが±1でも精算せず、預託と帳簿を残す", () => {
+    const ctx = setup(scriptedRng([0.5]));
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    seedBalance(ctx.db, "u1", 2_001);
+    const session = "chinchiro:prehold:u1:off-by-one";
+    expect(ctx.escrow.hold(session, "u1", 2_000, "チンチロ", "prehold")).toBe(true);
+    ctx.ether.runGroup({ groupKey: "test:off-by-one", kind: "test", actorId: "test" }, () =>
+      ctx.ether.transfer("u1", ctx.escrow.holderId(session), 1, { reason: "破損を模す" }),
+    );
+    expect(() => settleChinchiroRound(ctx.services, "u1", 1_000, -2, "off-by-one")).toThrow("帳簿不一致");
+    expect(ctx.escrow.poolOf(session)).toBe(2_000);
+    expect(ctx.ether.balanceOf(ctx.escrow.holderId(session))).toBe(2_001);
+    expect(ctx.chipTx.getGroup("chinchiro:round:u1:off-by-one")).toBeUndefined();
+    ctx.db.close();
+  });
+
+  it("返還失敗はsessionを凍結して帳簿を残し、運営の手動復旧だけが返還できる", () => {
+    const ctx = setup(scriptedRng([0.5]));
+    seedBalance(ctx.db, "u1", 2_000);
+    const session = "chinchiro:prehold:u1:frozen";
+    expect(ctx.escrow.hold(session, "u1", 2_000, "チンチロ", "prehold")).toBe(true);
+    ctx.db.prepare("INSERT INTO casino_chinchiro_preholds (session_id,user_id,bet,amount,status,created_at) VALUES (?,?,?,?, 'preheld', 1)")
+      .run(session, "u1", 1_000, 2_000);
+    const realRefund = ctx.escrow.refund.bind(ctx.escrow);
+    ctx.escrow.refund = (() => { throw new Error("返還DB障害"); }) as typeof ctx.escrow.refund;
+    expect(refundChinchiroPrehold(ctx.services, session, "通知失敗")).toBe(false);
+    expect(frozenChinchiroPreholdHolders(ctx.services)).toEqual([ctx.escrow.holderId(session)]);
+    expect(ctx.escrow.poolOf(session)).toBe(2_000);
+    ctx.escrow.refund = realRefund;
+    expect(recoverFrozenChinchiroPrehold(ctx.services, session, "user:admin")).toBe(true);
+    expect(ctx.escrow.poolOf(session)).toBe(0);
+    expect(ctx.ether.balanceOf("u1")).toBe(2_000);
     ctx.db.close();
   });
 });

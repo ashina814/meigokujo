@@ -16,7 +16,7 @@ import { handlePassportCommand } from "./commands/passport.js";
 import { handleBanzukeCommand } from "./commands/banzuke.js";
 import { handleShobuCommand } from "./commands/shobu.js";
 import { handleBakutenButton, handleBakutenCommand, handleBakutenSelect } from "./commands/bakuten.js";
-import { handleStocksButton, handleStocksCommand, handleStocksModal, handleStocksSelect } from "./commands/stocks.js";
+import { replyStocksPaused } from "./casino/stocks-pause.js";
 import { handleKeibaCommand } from "./commands/keiba.js";
 import { handleAnnaiButton, handleAnnaiCommand } from "./commands/annai.js";
 import { handleVipButton, handleVipCommand } from "./commands/vip.js";
@@ -24,6 +24,8 @@ import { handleNagareboshiCommand } from "./commands/nagareboshi.js";
 import { handleItaButton, handleItaCommand, handleItaModal, handleItaSelect } from "./commands/ita.js";
 import { handleTakuButton, handleTakuVoiceUpdate, sweepStaleTables } from "./commands/takutate-panel.js";
 import { handlePokerDuelButton, handlePokerDuelSelect } from "./casino/poker-duel.js";
+import { denyIfCasinoClosed } from "./casino/gate.js";
+import { handleCasinoPlayButton, isCasinoPlayButton } from "./casino/play-route.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -69,6 +71,7 @@ import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
 import { handlePaydayButton } from "./payday.js";
 import { startScheduler } from "./scheduler.js";
+import { resumePendingFreeSpins } from "./casino/slots.js";
 import { startInternalApi } from "./internal-api.js";
 import { startOutboxWorker } from "./outbox.js";
 import { postJoinLog, postLeaveLog } from "./member-log.js";
@@ -91,6 +94,20 @@ inviteTracker.wire();
 
 client.once(Events.ClientReady, (ready) => {
   console.log(`⚔️ 冥獄城ボット 起動: ${ready.user.tag}`);
+  // 前回のプロセスで払い切れなかった無料スピンを精算する（PR3）。
+  // 出目は獲得時に確定・保存してあるので、再起動しても表示も配当も変わらない。
+  // 賭場が停止中なら資金グループが作れず失敗するが、権利は pending のまま残る
+  try {
+    const resumed = resumePendingFreeSpins(services);
+    if (resumed.total > 0) {
+      console.log(
+        `[casino] 保留中の無料スピン ${resumed.total}件のうち ${resumed.settled}件を精算（計 ${resumed.paid.toLocaleString("ja-JP")}◈）` +
+          (resumed.failed.length > 0 ? ` / 未払い ${resumed.failed.length}件は権利を保持` : ""),
+      );
+    }
+  } catch (e) {
+    console.error("[casino] 保留中の無料スピンの再開に失敗（権利は保持）:", e);
+  }
   startOutboxWorker(client, services);
   // 経済観測用の読み取り専用内部API（ログBot向け・ホスト内限定）
   startInternalApi(services);
@@ -120,6 +137,12 @@ client.once(Events.ClientReady, (ready) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    // PR10: 賭場内の操作時刻はDBを真実源にする。再起動後の無操作返還もこの時刻から再計算する。
+    const casinoCommand = interaction.isChatInputCommand() && ["遊ぶ", "勝負", "賭場商店", "vip", "板", "競馬", "福分け", "案内"].includes(interaction.commandName);
+    const casinoComponent = "customId" in interaction && /^(casino:|annai:|ita:|bakuten:|vip:|chinchiro:)/.test(interaction.customId);
+    if (casinoCommand || casinoComponent) services.chipFlow.touch(interaction.user.id);
+    // 賭場が停止していれば、チップを動かしうる操作はここで全部止める（理由付きで返す）
+    if (await denyIfCasinoClosed(interaction, services)) return;
     if (interaction.isChatInputCommand()) {
       switch (interaction.commandName) {
         case "管理":
@@ -175,7 +198,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await handleBakutenCommand(interaction, services);
           return;
         case "株":
-          await handleStocksCommand(interaction, services);
+          await replyStocksPaused(interaction);
           return;
         case "競馬":
           await handleKeibaCommand(interaction, services);
@@ -269,7 +292,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("stocks:")) {
-      await handleStocksSelect(interaction, services);
+      await replyStocksPaused(interaction);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("pkr:")) {
@@ -289,7 +312,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("stocks:")) {
-      await handleStocksModal(interaction, services);
+      await replyStocksPaused(interaction);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {
@@ -353,10 +376,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
       if (interaction.customId.startsWith("stocks:")) {
-        await handleStocksButton(interaction, services);
+        await replyStocksPaused(interaction);
         return;
       }
       if (interaction.customId.startsWith("annai:")) {
+        await handleAnnaiButton(interaction, services);
+        return;
+      }
+      if (interaction.customId === "casino:leave") {
         await handleAnnaiButton(interaction, services);
         return;
       }
@@ -374,6 +401,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("prof:")) {
         await handleProfileButton(interaction, services);
+        return;
+      }
+      if (isCasinoPlayButton(interaction.customId)) {
+        await handleCasinoPlayButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("taku:")) {

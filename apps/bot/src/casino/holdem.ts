@@ -9,10 +9,19 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import type { CasinoRng } from "@meigokujo/core";
+import { HOLDEM_MAX_PAYOUT_MULT, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import {
+  MIN_BET,
+  acquireSeat,
+  effectiveMaxBet,
+  handleRetryPress,
+  releaseSeat,
+  sleep,
+  validateBet,
+  withHouseReservation,
+} from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { C_MAMMON, E, HR_THIN, buildResultEmbed, fmtBigDelta } from "./ui.js";
 
@@ -26,7 +35,15 @@ import { C_MAMMON, E, HR_THIN, buildResultEmbed, fmtBigDelta } from "./ui.js";
  * - リバー1枚 → 各人7枚から最強5枚役判定、勝者が pot 総取り
  * - マモンは常にコール（弱いブラフ判断は入れない・単純化）
  */
-const MAX_MULT = 8; // アンティ×8 が最大 pot（アンティ+3ラウンドのコール = 4x per player = 8x pot）
+/**
+ * アンティに対する最大 pot 倍率（PR4 で訂正）。
+ *
+ * 旧値 8 は「アンティ + 3ラウンドのコール」を想定していたが、実際には
+ * preflop / flop / turn / river の**4局面すべてでコールできる**ので、
+ * 片側の総賭けは 5×ante、pot は 10×ante。受付時のテーブルリミットが
+ * 1ラウンドぶん最悪ケースを覆っていなかった。
+ */
+const MAX_MULT = HOLDEM_MAX_PAYOUT_MULT;
 
 const SUITS = ["♠", "♥", "♦", "♣"] as const;
 const RANK_LABEL = ["", "", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"] as const;
@@ -154,7 +171,7 @@ export async function playHoldem(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT);
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "ホールデム");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -171,10 +188,25 @@ export async function playHoldem(
   }
 }
 
+/**
+ * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
+ * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
+ */
 async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   ante: number,
+): Promise<void> {
+  await withHouseReservation(interaction, services, "ホールデム", ante, interaction.id, (reservationKey) =>
+    runRoundInner(interaction, services, ante, reservationKey),
+  );
+}
+
+async function runRoundInner(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+  ante: number,
+  reservationKey: string,
 ): Promise<void> {
   const uid = interaction.user.id;
   const deck = newDeck(services.rng);
@@ -207,7 +239,7 @@ async function runRound(
     return new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · ホールデム" })
       .setColor(C_MAMMON)
-      .setTitle(`🃏  ${phaseLabel}  ·  Pot ${fmtEther(pot).replace(" ◈", "◈")}`)
+      .setTitle(`🃏  ${phaseLabel}  ·  Pot ${fmtEther(pot).replace(" Ld", "Ld")}`)
       .setDescription(
         [
           `**ボード**   ${board}`,
@@ -218,7 +250,7 @@ async function runRound(
           .filter(Boolean)
           .join("\n"),
       )
-      .setFooter({ text: `賭け ${fmtEther(playerBet).replace(" ◈", "◈")} / マモン ${fmtEther(dealerBet).replace(" ◈", "◈")}` });
+      .setFooter({ text: `賭け ${fmtEther(playerBet).replace(" Ld", "Ld")} / マモン ${fmtEther(dealerBet).replace(" Ld", "Ld")}` });
   };
 
   const actionRow = (phase: string) =>
@@ -300,7 +332,7 @@ async function runRound(
 
   // お守りの消費も賭け・配当と同じグループの中（settleSolo）
   const settled = services.casino.settleSolo(uid, "ホールデム", playerBet, rawPayout, {
-    operationId: interaction.id,
+    operationId: interaction.id, reservationKey,
   });
   const amulet = { note: settled.amuletNote };
 
@@ -345,7 +377,7 @@ async function runRound(
 
   const heldEther = services.ether.balanceOf(uid);
   const min = MIN_BET;
-  const max = Math.min(MAX_BET, heldEther);
+  const max = Math.min(effectiveMaxBet(services, uid, "ホールデム"), heldEther);
   const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`holdem:retry:${min}`)
@@ -379,18 +411,16 @@ async function runRound(
       return;
     }
     if (btn.customId.startsWith("holdem:retry:")) {
-      collector.stop("retry");
-      const retryBet = Number(btn.customId.split(":")[2]);
-      if (retryBet < MIN_BET || retryBet > MAX_BET) return;
-      await btn.deferUpdate();
-      releaseSeat(uid);
-      if (acquireSeat(uid)) {
-        try {
-          await runRound(btn, services, retryBet);
-        } finally {
-          releaseSeat(uid);
-        }
-      }
+      // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
+      // 断るなら collector を止めない ＝ 押し直せる
+      await handleRetryPress({
+        services,
+        btn,
+        collector,
+        game: "ホールデム",
+        betRaw: Number(btn.customId.split(":")[2]),
+        run: (bet) => runRound(btn, services, bet),
+      });
     }
   });
   collector.on("end", async (_c, reason) => {

@@ -148,9 +148,9 @@ const TX_LABEL: Record<string, string> = {
   pension: "年金",
   reward_bump: "bump/up報酬",
   reward_vc: "浮上報酬",
-  ether_buy: "エテル購入",
-  ether_sell: "エテル換金",
-  ether_burn: "退場奉納",
+  ether_buy: "賭場チップ預入",
+  ether_sell: "自由チップ返還",
+  ether_burn: "旧制度処理",
   shop: "ショップ購入",
   dept_in: "部署へ預入",
   dept_out: "部署から引出",
@@ -164,7 +164,7 @@ function accountLabel(account: string, selfId: string): string {
   if (account === `user:${selfId}`) return "自分";
   if (account.startsWith("user:")) return `<@${account.slice(5)}>`;
   if (account === "sys:treasury") return "国庫";
-  if (account === "sys:escrow:ether") return "両替所";
+  if (account === "sys:escrow:ether") return "旧制度準備口座";
   if (account.startsWith("dept:")) return `部署「${account.slice(5)}」`;
   if (account.startsWith("sys:")) return account.slice(4);
   return account;

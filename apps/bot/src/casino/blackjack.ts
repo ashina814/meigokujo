@@ -9,10 +9,20 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import type { CasinoRng } from "@meigokujo/core";
+import { BLACKJACK_MAX_PAYOUT_MULT, type CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
-import { MAX_BET, MIN_BET, acquireSeat, releaseSeat, sleep, validateBet } from "./common.js";
+import {
+  MIN_BET,
+  acquireSeat,
+  effectiveMaxBet,
+  handleRetryPress,
+  releaseSeat,
+  reserveBlackjackLiability,
+  sleep,
+  validateBet,
+  withExplicitHouseReservation,
+} from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 
@@ -23,7 +33,8 @@ import { broadcastBigWin } from "./bigwin.js";
  * - ヒット / スタンド / ダブル（最初の2枚のみ・賭け倍増）
  * - 結果画面に「最低/前回/最大/配当表/退席」ボタン
  */
-const MAX_MULT = 4; // ダブル後の勝ち = 4×初期賭け
+/** ダブル後の勝ち = 4×初期賭け。core の債務モデルと同じ定数を読む（PR4） */
+const MAX_MULT = BLACKJACK_MAX_PAYOUT_MULT;
 
 interface Card {
   rank: string;
@@ -87,7 +98,7 @@ export async function playBlackjack(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, betRaw * MAX_MULT);
+  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "ブラックジャック");
   if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
@@ -104,10 +115,36 @@ export async function playBlackjack(
   }
 }
 
+/**
+ * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
+ * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
+ */
 async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+): Promise<void> {
+  let doubleAllowed = true;
+  await withExplicitHouseReservation(
+    interaction,
+    services,
+    "ブラックジャック",
+    (uid) => {
+      const r = reserveBlackjackLiability(services, uid, bet, interaction.id);
+      doubleAllowed = r.doubleAllowed;
+      return r;
+    },
+    (reservationKey) => runRoundInner(interaction, services, bet, reservationKey, doubleAllowed),
+  );
+}
+
+async function runRoundInner(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
+  services: Services,
+  bet: number,
+  reservationKey: string,
+  /** ダブルぶんの債務まで予約できたか。false ならダブルボタンだけ無効化する */
+  doubleAllowed: boolean,
 ): Promise<void> {
   const uid = interaction.user.id;
   const deck = newDeck(services.rng);
@@ -116,7 +153,6 @@ async function runRound(
   let totalBet = bet;
 
   const table = (hideDealer: boolean) => {
-    const dealerVal = hideDealer ? "**?**" : `**${handValue(dealer)}**`;
     return new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · ブラックジャック" })
       .setColor(C_MAMMON)
@@ -132,7 +168,6 @@ async function runRound(
           "```",
         ].join("\n"),
       );
-    void dealerVal;
   };
 
   let reply: Message;
@@ -163,7 +198,7 @@ async function runRound(
   const finish = async (rawPayout: number, note: string) => {
     // お守りの消費も賭け・配当と同じグループの中（settleSolo）。外で消すと精算が落ちたときお守りだけ消える
     const settled = services.casino.settleSolo(uid, "ブラックジャック", totalBet, rawPayout, {
-      operationId: interaction.id,
+      operationId: interaction.id, reservationKey,
     });
     const amulet = { note: settled.amuletNote };
     const won = settled.net > 0;
@@ -172,10 +207,10 @@ async function runRound(
       ? `${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
       : "";
     const fukuLine = settled.fukuTax > 0
-      ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納`
+      ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 福分け積立`
       : "";
     const tag = won ? "🟢 勝ち" : push ? "⚪ プッシュ" : "🔴 負け";
-    const netStr = settled.net === 0 ? "±0 ◈" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} ◈`;
+    const netStr = settled.net === 0 ? "±0 Ld" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} Ld`;
     const bonusBits: string[] = [];
     if (chainLine) bonusBits.push(chainLine);
     if (fukuLine) bonusBits.push(fukuLine);
@@ -197,14 +232,14 @@ async function runRound(
       )
       .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
       .setFooter({
-        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(totalBet).replace(" ◈", "◈")}`].join(" · "),
+        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" Ld", "Ld")}`, `賭け ${fmtEther(totalBet).replace(" Ld", "Ld")}`].join(" · "),
       });
 
     if (won) broadcastBigWin(interaction.client, services, { userId: uid, game: "ブラックジャック", bet: totalBet, payout: settled.payout });
 
     const held = services.ether.balanceOf(uid);
     const min = MIN_BET;
-    const max = Math.min(MAX_BET, held);
+    const max = Math.min(effectiveMaxBet(services, uid, "ブラックジャック"), held);
     const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId(`bj:retry:${min}`)
@@ -243,18 +278,16 @@ async function runRound(
         return;
       }
       if (btn.customId.startsWith("bj:retry:")) {
-        collector.stop("retry");
-        const retryBet = Number(btn.customId.split(":")[2]);
-        if (retryBet < MIN_BET || retryBet > MAX_BET) return;
-        await btn.deferUpdate();
-        releaseSeat(uid);
-        if (acquireSeat(uid)) {
-          try {
-            await runRound(btn, services, retryBet);
-          } finally {
-            releaseSeat(uid);
-          }
-        }
+        // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
+        // 断るなら collector を止めない ＝ 押し直せる
+        await handleRetryPress({
+          services,
+          btn,
+          collector,
+          game: "ブラックジャック",
+          betRaw: Number(btn.customId.split(":")[2]),
+          run: (bet) => runRound(btn, services, bet),
+        });
       }
     });
     collector.on("end", async (_c, reason) => {
@@ -272,10 +305,9 @@ async function runRound(
   }
 
   // ── プレイヤーのターン ──
-  const canDoubleNow = () =>
-    player.length === 2 &&
-    services.ether.balanceOf(uid) >= bet * 2 &&
-    services.casino.canAccept(bet * MAX_MULT);
+  // ダブルの可否は**開始時の予約結果**で決まる（PR5）。
+  // ここで改めて胴元残高を見ると、予約済みの自分の枠を二重に数えて弾いてしまう
+  const canDoubleNow = () => player.length === 2 && doubleAllowed && services.ether.balanceOf(uid) >= bet * 2;
   reply = await openInitial(true, [buttons(canDoubleNow())]);
 
   let standing = false;

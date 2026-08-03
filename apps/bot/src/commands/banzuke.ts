@@ -22,7 +22,7 @@ export const banzukeCommand = new SlashCommandBuilder()
       .setDescription("見る番付")
       .setRequired(true)
       .addChoices(
-        { name: "エテル残高", value: "balance" },
+        { name: "賭場利用可能額", value: "balance" },
         { name: "勝率（10戦以上）", value: "win_rate" },
         { name: "最大単勝", value: "biggest_win" },
         { name: "総獲得", value: "total_earned" },
@@ -32,7 +32,7 @@ export const banzukeCommand = new SlashCommandBuilder()
   );
 
 const LABELS: Record<string, { title: string; icon: string; color: number }> = {
-  balance: { title: "エテル残高", icon: "💰", color: C_JACKPOT },
+  balance: { title: "賭場利用可能額", icon: "💰", color: C_JACKPOT },
   win_rate: { title: "勝率", icon: "📊", color: 0x22c55e },
   biggest_win: { title: "最大単勝", icon: "🎯", color: 0xf59e0b },
   total_earned: { title: "総獲得", icon: "📈", color: 0x0ea5e9 },

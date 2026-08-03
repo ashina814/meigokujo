@@ -56,12 +56,12 @@ export async function handleDailyCommand(
         name: "🔥 連続日数",
         value: [
           `**${claim.streak}日** ${claim.isConsecutive ? "（連続中）" : "（新規カウント）"}`,
-          `\`${streakProgress}\`  次の +${Math.min(200, Math.floor(nextBonusAt / 7) * 50)}◈ ボーナスまで ${claim.streak >= nextBonusAt ? 0 : nextBonusAt - claim.streak}日`,
+          `\`${streakProgress}\`  次の +${Math.min(200, Math.floor(nextBonusAt / 7) * 50)}Ld ボーナスまで ${claim.streak >= nextBonusAt ? 0 : nextBonusAt - claim.streak}日`,
         ].join("\n"),
         inline: false,
       },
     )
-    .setFooter({ text: `所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")} · 次は 24 時間後` });
+    .setFooter({ text: `所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" Ld", "Ld")} · 次は 24 時間後` });
 
   await interaction.reply({ embeds: [embed] });
 }

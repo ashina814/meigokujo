@@ -1,4 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+vi.hoisted(() => {
+  process.env.DISCORD_TOKEN ??= "test-token";
+  process.env.CLIENT_ID ??= "test-client";
+  process.env.OWNER_ID ??= "test-owner";
+});
 import {
   EventLog,
   Ledger,
@@ -11,6 +16,7 @@ import {
   TREASURY,
 } from "@meigokujo/core";
 import { runSchedulerTaskOnce, sendChunkedLines } from "../src/scheduler-utils.js";
+import * as schedulerModule from "../src/scheduler.js";
 
 process.env.DISCORD_TOKEN = process.env.DISCORD_TOKEN ?? "test-token";
 process.env.CLIENT_ID = process.env.CLIENT_ID ?? "test-client";
@@ -20,7 +26,6 @@ registerDefaultTxTypes();
 // scheduler.js は config が環境変数を要求するので静的 import できない。
 // 代わりにここで読み込みを始め、各テストは同じ Promise を待つ（初回の変換待ちで
 // テスト単体の制限時間を使い切らないようにする）。
-const schedulerModule = import("../src/scheduler.js");
 
 function makeSettings() {
   const values = new Map<string, string>();

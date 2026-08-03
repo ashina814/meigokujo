@@ -607,29 +607,23 @@ describe("開始残高の版切替", () => {
   });
 });
 
-describe("端数で Land が動かない返還", () => {
-  it("最小額の返還はそのまま通り、Landが動かなかったことが記録に残る", () => {
+describe("1:1返還", () => {
+  it("最小額でも同額の Land を返還し、対応するLand取引を記録する", () => {
     const ctx = setup();
     fundUser(ctx, "alice", 10_000);
-    // 準備プールを痩せさせ、1チップあたりの Land が 1 Ld 未満の状態を作る
-    // （PR8 の 1:1 化までは、この端数落ちが現行仕様として存在する）
-    ctx.ledger.transfer({
-      from: ETHER_ESCROW, to: TREASURY, amount: 9_999, type: "adjust", actor: "t", approvedBy: "t",
-      idempotencyKey: "shrink-pool",
-    });
     const landBefore = ctx.ledger.balanceOf("user:alice");
 
     const quote = ctx.ether.sell("alice", 5, "sell:tiny");
 
-    expect(quote.output).toBe(0);
+    expect(quote.output).toBe(5);
     expect(quote.burned).toBe(0);
-    expect(ctx.ledger.balanceOf("user:alice")).toBe(landBefore); // Land は動かない（現行どおり）
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(landBefore + 5);
     expect(ctx.ether.balanceOf("alice")).toBe(9_995); // チップだけ減る
 
     const row = ctx.chipTx.listByGroup("sell:tiny")[0]!;
     expect(row.tx_kind).toBe("redeem");
-    expect(row.land_amount).toBe(0);
-    expect(row.ledger_tx_id).toBeNull();
+    expect(row.land_amount).toBe(5);
+    expect(row.ledger_tx_id).not.toBeNull();
     expect(ctx.chipTx.verifyBalances().ok).toBe(true);
     ctx.db.close();
   });

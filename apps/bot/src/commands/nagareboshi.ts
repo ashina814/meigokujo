@@ -11,9 +11,9 @@ import type { Services } from "../services.js";
 
 /**
  * /流れ星 — 賭場占い（casino-bot /流れ星 準拠）。
- * 1日5回まで（初回無料、2〜5回目は 1000◈ 消滅=胴元へ）。
- * 報酬は基本ナシ（フレーバー）、稀に「流れ星」結果で JP プールから 10,000◈ 支給。
- * 設計意図: エテル 100%回収でインフレ抑制、賭けじゃない遊びを増やす。
+ * 1日5回まで（初回無料、2〜5回目は 1,000 Ld を胴元へ）。
+ * 報酬は基本ナシ（フレーバー）、稀に「流れ星」結果で JP プールから 10,000 Ld 支給。
+ * 設計意図: 利用可能額を回収してインフレを抑制し、賭けじゃない遊びを増やす。
  */
 const MAX_PER_DAY = 5;
 const FEE = 1_000;
@@ -223,8 +223,8 @@ export async function handleNagareboshiCommand(
     .setFooter({
       text: [
         `今日の残り ${remaining}/${MAX_PER_DAY - 1}回`,
-        fee > 0 ? `占い料 ${fmtEther(fee).replace(" ◈", "◈")}` : "無料",
-        `所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`,
+        fee > 0 ? `占い料 ${fmtEther(fee)}` : "無料",
+        `所持 ${fmtEther(services.ether.balanceOf(uid))}`,
       ].join(" · "),
     });
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
