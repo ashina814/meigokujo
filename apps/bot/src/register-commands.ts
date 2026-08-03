@@ -17,7 +17,6 @@ import { passportCommand } from "./commands/passport.js";
 import { banzukeCommand } from "./commands/banzuke.js";
 import { shobuCommand } from "./commands/shobu.js";
 import { bakutenCommand } from "./commands/bakuten.js";
-import { stocksCommand } from "./commands/stocks.js";
 import { keibaCommand } from "./commands/keiba.js";
 import { annaiCommand } from "./commands/annai.js";
 import { vipCommand } from "./commands/vip.js";
@@ -49,7 +48,6 @@ const commands = [
   banzukeCommand.toJSON(),
   shobuCommand.toJSON(),
   bakutenCommand.toJSON(),
-  stocksCommand.toJSON(),
   keibaCommand.toJSON(),
   annaiCommand.toJSON(),
   vipCommand.toJSON(),
