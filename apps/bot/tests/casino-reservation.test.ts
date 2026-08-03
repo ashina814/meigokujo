@@ -30,9 +30,11 @@ import {
   effectiveMaxBet,
   liabilityCtx,
   reserveBlackjackLiability,
+  reserveFreeSpinLiability,
   reserveHouseLiability,
   reserveSlotsLiability,
   HouseCapacityError,
+  UnknownLiabilityModelError,
 } from "../src/casino/common.js";
 import { resolveFreeSpin, resumeFreeSpin, spinPaid } from "../src/casino/slots.js";
 import { isCasinoPlayButton } from "../src/casino/play-route.js";
@@ -510,6 +512,43 @@ describe("保留中の無料スピンは予約を取り直してから払う", (
     expect(() => resumeFreeSpin(c.services, paid.pendingFreeSpin!)).toThrow(HouseCapacityError);
     expect(c.freeSpins.get(paid.pendingFreeSpin!.id)!.status).toBe("pending");
     // 取れなかった予約行は残らない
+    expect(c.reservations.count()).toBe(0);
+  });
+
+  it("外れ（配当0）の無料スピンは予約API自体を呼ばない（マージ直前レビュー対応: amount=0はfail-closed）", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    const r = reserveFreeSpinLiability(c.services, { id: 999, userId: "u1", payout: 0 });
+    expect(r).toEqual({ key: "slots:freespin:999", amount: 0 });
+    expect(c.reservations.count()).toBe(0);
+  });
+});
+
+/**
+ * マージ直前レビュー対応: モデルの無いゲーム名は「設定上限」「予約額0で成功」へ
+ * 黙ってフォールバックせず、UnknownLiabilityModelError で fail-closed にする。
+ */
+describe("未知のゲーム名はfail-closed（マージ直前レビュー対応）", () => {
+  it("effectiveMaxBet: game を渡したのにモデルが無ければ例外にする", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    expect(() => effectiveMaxBet(c.services, "u1", "存在しないゲーム")).toThrow(UnknownLiabilityModelError);
+    expect(() => effectiveMaxBet(c.services, "u1", "")).toThrow(UnknownLiabilityModelError);
+    expect(() => effectiveMaxBet(c.services, "u1", "__proto__")).toThrow(UnknownLiabilityModelError);
+  });
+
+  it("effectiveMaxBet: game を渡さない呼び出しは例外にせず設定上限を返す（既存の意図的な用途）", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    expect(effectiveMaxBet(c.services, "u1")).toBe(configuredMaxBet(c.services, "u1"));
+  });
+
+  it("reserveHouseLiability: 未知ゲームは予約額0で成功させず例外にする", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    expect(() => reserveHouseLiability(c.services, "存在しないゲーム", "u1", 1_000, "op1")).toThrow(
+      UnknownLiabilityModelError,
+    );
     expect(c.reservations.count()).toBe(0);
   });
 });

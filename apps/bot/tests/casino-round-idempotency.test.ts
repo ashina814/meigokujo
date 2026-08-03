@@ -7,6 +7,7 @@ import {
   EventLog,
   HOUSE_HOLDER,
   FreeSpins,
+  HouseReservations,
   Items,
   JACKPOT_HOLDER,
   Ledger,
@@ -36,11 +37,13 @@ function setup(rng: CasinoRng) {
   const chipTx = new ChipTx(db);
   const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
   const items = new Items(db);
-  const casino = new Casino(db, ether, events, { items });
+  const reservations = new HouseReservations(db, ether, events);
+  ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
+  const casino = new Casino(db, ether, events, { items, reservations });
   const escrow = new Escrow(db, ether, events);
   const freeSpins = new FreeSpins(db);
-  const services = { db, ether, casino, items, escrow, freeSpins, rng, events } as unknown as Services;
-  return { db, chipTx, ether, casino, items, escrow, freeSpins, services };
+  const services = { db, ether, casino, items, escrow, freeSpins, reservations, rng, events } as unknown as Services;
+  return { db, chipTx, ether, casino, items, escrow, freeSpins, reservations, services };
 }
 
 /** 監査経路を通さずに残高を作る（テストの下ごしらえ専用） */

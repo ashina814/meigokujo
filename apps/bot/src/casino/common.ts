@@ -42,11 +42,18 @@ export function configuredMaxBet(services: Services, userId: string): number {
  *
  * ゲーム名を渡さない呼び出しは設定上限しか返さないので、**結果画面や賭け受付では使わない**。
  * 残っているのは「ゲームが決まっていない場面」（賭場ホームの所持額表示など）だけ。
+ *
+ * `game` を**渡したのに**モデルが見つからない場合は、設定上限へ黙ってフォールバックせず
+ * {@link UnknownLiabilityModelError} を投げる（マージ直前レビュー対応）。胴元の余力を
+ * 無視した上限を見せたまま先へ進ませない。
  */
 export function effectiveMaxBet(services: Services, userId: string, game?: string): number {
   const cap = configuredMaxBet(services, userId);
-  const model = game ? liabilityModelFor(game) : undefined;
-  if (!model) return cap;
+  // `undefined`（省略）だけが意図的な「ゲーム未確定」呼び出し。空文字はそれとは違う
+  // 不正な値なので、`!game` ではなく厳密に区別する（マージ直前レビュー対応）
+  if (game === undefined) return cap;
+  const model = liabilityModelFor(game);
+  if (!model) throw new UnknownLiabilityModelError(game);
   return Math.min(cap, model.maxBetFor(services.casino.availableForLiability(), liabilityCtx(services, userId)));
 }
 
@@ -124,19 +131,20 @@ export async function validateBet(
     });
     return { ok: false, bet };
   }
+  // `game` は必須引数。モデルが無ければ設定チェックだけ済ませて先へ通すのではなく、
+  // 呼び出し側のバグとして即座に落とす（マージ直前レビュー対応）
   const model = liabilityModelFor(game);
-  if (model) {
-    const needed = model.maxHouseLiability({ ...liabilityCtx(services, uid), bet });
-    if (needed > services.casino.availableForLiability()) {
-      // 胴元がこの賭けの最悪ケースを引き受けられない。
-      // **押し直せば必ず通る金額**を提示して戻す（正本 §5.4 ③）。
-      // 提示額は同じモデルの逆算なので、その額なら予約が取れる
-      await respond({
-        ...capacityRecoveryPayload(services, effectiveMaxBet(services, uid, game), game),
-        flags: MessageFlags.Ephemeral,
-      });
-      return { ok: false, bet };
-    }
+  if (!model) throw new UnknownLiabilityModelError(game);
+  const needed = model.maxHouseLiability({ ...liabilityCtx(services, uid), bet });
+  if (needed > services.casino.availableForLiability()) {
+    // 胴元がこの賭けの最悪ケースを引き受けられない。
+    // **押し直せば必ず通る金額**を提示して戻す（正本 §5.4 ③）。
+    // 提示額は同じモデルの逆算なので、その額なら予約が取れる
+    await respond({
+      ...capacityRecoveryPayload(services, effectiveMaxBet(services, uid, game), game),
+      flags: MessageFlags.Ephemeral,
+    });
+    return { ok: false, bet };
   }
   return { ok: true, bet };
 }
@@ -193,6 +201,25 @@ export class HouseCapacityError extends Error {
   }
 }
 
+/**
+ * 債務モデルの無いゲーム名で予約・上限計算を呼んだ（マージ直前レビュー対応）。
+ *
+ * 以前は `liabilityModelFor(game)` が undefined のとき、上限表示は設定上限へ、
+ * 予約は「額0で成功」へ黙ってフォールバックしていた。前者は胴元の余力を無視した
+ * 上限を見せ、後者は「予約したつもり」で実際は何も保証していない予約を作る。
+ * どちらも fail-open なので、ここで即座に例外にする。
+ *
+ * 実運用では `game` は呼び出し側が渡すハードコードされた文字列（"スロット" 等）なので、
+ * ここへ来るのは呼び出し側のタイプミス・LIABILITY_MODELS からの削除漏れのようなバグのみ。
+ */
+export class UnknownLiabilityModelError extends Error {
+  readonly code = "ERR_UNKNOWN_LIABILITY_MODEL";
+  constructor(readonly game: string) {
+    super(`ERR_UNKNOWN_LIABILITY_MODEL: ${game}`);
+    this.name = "UnknownLiabilityModelError";
+  }
+}
+
 /** ソロゲーム1回ぶんの予約鍵。精算の業務グループ鍵と同じ文字列を使う */
 export function reservationKeyFor(game: string, userId: string, operationId: string): string {
   return soloGroupKey(game, userId, operationId);
@@ -214,8 +241,10 @@ export function reserveHouseLiability(
   operationId: string,
 ): { key: string; amount: number } {
   const model: GameLiabilityModel | undefined = liabilityModelFor(game);
+  // モデルが無いのに「予約額0で成功」を返すと、呼び出し側は予約が効いたと思い込む。
+  // 未知ゲームは即座に例外にする（マージ直前レビュー対応）
+  if (!model) throw new UnknownLiabilityModelError(game);
   const key = reservationKeyFor(game, userId, operationId);
-  if (!model) return { key, amount: 0 };
   const amount = model.maxHouseLiability({ ...liabilityCtx(services, userId), bet });
   const r = services.reservations.reserve(key, amount, game, userId);
   if (!r.ok) throw new HouseCapacityError(game, amount, r.available);
@@ -240,8 +269,10 @@ export function reserveSlotsLiability(
   interactionId: string,
 ): { key: string; amount: number } {
   const model = liabilityModelFor("スロット");
+  // 定数名なので実運用ではまず外れないが、LIABILITY_MODELS からの削除漏れ等に
+  // 備えて「予約額0で成功」ではなく明示的に落とす（マージ直前レビュー対応）
+  if (!model) throw new UnknownLiabilityModelError("スロット");
   const key = slotsReservationKey(userId, interactionId);
-  if (!model) return { key, amount: 0 };
   const amount = model.maxHouseLiability({ ...liabilityCtx(services, userId), bet });
   const r = services.reservations.reserve(key, amount, "スロット", userId);
   if (!r.ok) throw new HouseCapacityError("スロット", amount, r.available);
@@ -270,6 +301,11 @@ export function reserveFreeSpinLiability(
   // 保留権利は獲得時点で配当・お守り効果を固定済み。現在の装備状態から
   // 最大額を組み立て直すと、権利と無関係の装備変更で予約可否が揺れてしまう。
   const amount = row.payout;
+  // 外れの無料スピン（配当0）は house の債務が無いので予約自体を呼ばない
+  // （予約APIは amount=0 を不正入力として拒否するため。マージ直前レビュー対応）。
+  // `resolveFreeSpin` は鍵が存在しなくても availableIncludingOwn が available() と
+  // 同じ値を返すので、0円の支払いは reservationKey 無しでも問題なく通る
+  if (amount === 0) return { key, amount: 0 };
   const r = services.reservations.reserve(key, amount, "スロット", row.userId);
   if (!r.ok) throw new HouseCapacityError("スロット", amount, r.available);
   return { key, amount };

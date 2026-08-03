@@ -176,7 +176,11 @@ export class HouseReservations {
     if (typeof key !== "string" || !key.trim()) throw new ReservationInputError("ERR_BAD_KEY", { key });
     if (typeof game !== "string" || !game.trim()) throw new ReservationInputError("ERR_BAD_GAME", { game });
     if (typeof userId !== "string" || !userId.trim()) throw new ReservationInputError("ERR_BAD_USER", { userId });
-    if (!Number.isSafeInteger(amount) || amount < 0) throw new ReservationInputError("ERR_BAD_AMOUNT", { amount });
+    // amount=0 も不正入力にする（マージ直前レビュー対応）。
+    // 現行の全ゲームは正のbetから最大債務0にはならないので、0はここへ来ない想定。
+    // 「本当に債務0」を扱いたい場面が将来出たら、この予約APIを呼ばずに別経路へ分けること
+    // （0を「予約なしで成功」と黙って通すと、呼び出し側の取り違えを検出できない）。
+    if (!Number.isSafeInteger(amount) || amount <= 0) throw new ReservationInputError("ERR_BAD_AMOUNT", { amount });
 
     const run = this.db.transaction((): ReservationResult => {
       const existing = this.get(key);
@@ -187,8 +191,6 @@ export class HouseReservations {
         }
         return { ok: true, available: this.available(), row: existing };
       }
-      // 債務ゼロ（引き分けしかないゲーム等）は予約行を作らない
-      if (amount === 0) return { ok: true, available: this.available() };
       const available = this.available();
       if (amount > available) return { ok: false, available, reason: "capacity" };
       this.db
@@ -197,6 +199,71 @@ export class HouseReservations {
         )
         .run(key, amount, game, userId, now());
       return { ok: true, available: available - amount, row: this.get(key)! };
+    });
+    // すでに書き込みトランザクションの中（runGroup の内側）ならそのまま合流する
+    return this.db.inTransaction ? run() : run.immediate();
+  }
+
+  /**
+   * 既存の予約額を原子的に変更する（PR5 レビュー指摘: ルーレットの張り増し・張り直し）。
+   *
+   * `reserve()` と同じく、既存額と `available()` の再確認・書き込みを**同一トランザクション**
+   * （IMMEDIATE）で行う。卓に新しいベットが乗る／取り消される都度、卓全体の債務を
+   * 増減させたい場面で使う（1件ずつ `release` → `reserve` すると、その間に他の予約へ
+   * 枠を取られる隙ができる）。
+   *
+   * - 増額: 差額ぶんの余力があるかを再確認してから通す（無ければ `ok:false`、元の額のまま）
+   * - 減額: 必ず成功する。差額は即座に `available()` へ戻る
+   * - 0 へ変更: 予約行を削除する（`release()` と同じ効果）
+   * - 予約がまだ無い場合は `reserve()` と同じ新規作成として扱う
+   * - key はあるが `game` / `userId` が食い違う場合は {@link ReservationConflictError}
+   *   （`reserve()` と同じ「同じ鍵で別の債務を名乗らせない」規則）
+   *
+   * @returns 変更後の予約状態。`ok:false` のとき額は一切変わっていない
+   */
+  resize(key: string, newAmount: number, game: string, userId: string): ReservationResult {
+    if (typeof key !== "string" || !key.trim()) throw new ReservationInputError("ERR_BAD_KEY", { key });
+    if (typeof game !== "string" || !game.trim()) throw new ReservationInputError("ERR_BAD_GAME", { game });
+    if (typeof userId !== "string" || !userId.trim()) throw new ReservationInputError("ERR_BAD_USER", { userId });
+    if (!Number.isSafeInteger(newAmount) || newAmount < 0) {
+      throw new ReservationInputError("ERR_BAD_AMOUNT", { amount: newAmount });
+    }
+
+    const run = this.db.transaction((): ReservationResult => {
+      const existing = this.get(key);
+      if (!existing) {
+        // まだ何も予約していない鍵への resize は新規予約として扱う
+        if (newAmount === 0) return { ok: true, available: this.available() };
+        const available = this.available();
+        if (newAmount > available) return { ok: false, available, reason: "capacity" };
+        this.db
+          .prepare(
+            "INSERT INTO casino_house_reservations (key, amount, game, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
+          )
+          .run(key, newAmount, game, userId, now());
+        return { ok: true, available: available - newAmount, row: this.get(key)! };
+      }
+      if (existing.game !== game || existing.userId !== userId) {
+        throw new ReservationConflictError(key, existing, { amount: newAmount, game, userId });
+      }
+      if (newAmount === existing.amount) {
+        return { ok: true, available: this.available(), row: existing };
+      }
+      if (newAmount === 0) {
+        this.db.prepare("DELETE FROM casino_house_reservations WHERE key = ?").run(key);
+        return { ok: true, available: this.available() };
+      }
+      if (newAmount < existing.amount) {
+        // 減額は必ず成功する。既存額はすでに totalReserved に乗っているので再確認は不要
+        this.db.prepare("UPDATE casino_house_reservations SET amount = ? WHERE key = ?").run(newAmount, key);
+        return { ok: true, available: this.available(), row: this.get(key)! };
+      }
+      // 増額: 既存ぶんはすでに予約合計に乗っているので、確認するのは差額だけでよい
+      const delta = newAmount - existing.amount;
+      const available = this.available();
+      if (delta > available) return { ok: false, available, reason: "capacity" };
+      this.db.prepare("UPDATE casino_house_reservations SET amount = ? WHERE key = ?").run(newAmount, key);
+      return { ok: true, available: available - delta, row: this.get(key)! };
     });
     // すでに書き込みトランザクションの中（runGroup の内側）ならそのまま合流する
     return this.db.inTransaction ? run() : run.immediate();

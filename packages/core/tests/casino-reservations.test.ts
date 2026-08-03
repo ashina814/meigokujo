@@ -106,10 +106,10 @@ describe("available = house 残高 − 予約合計", () => {
     c.db.close();
   });
 
-  it("債務ゼロの予約は行を作らない", () => {
+  it("amount=0 は不正入力として拒否する（マージ直前レビュー対応: 債務0は予約APIを呼ばない設計）", () => {
     const c = setup();
     seed(c.db, HOUSE_HOLDER, 1_000);
-    expect(c.reservations.reserve("k0", 0, "何か", "u1").ok).toBe(true);
+    expect(() => c.reservations.reserve("k0", 0, "何か", "u1")).toThrow(ReservationInputError);
     expect(c.reservations.count()).toBe(0);
     c.db.close();
   });
@@ -468,6 +468,106 @@ describe("同じ予約鍵は内容まで一致したときだけ冪等成功", (
 });
 
 /**
+ * マージ直前レビュー対応: ルーレットの張り増し・張り直しのように、既存の予約額を
+ * 「一旦解放してから取り直す」と、その隙に他の予約へ枠を取られる。
+ * `resize()` は既存額と available の再確認・書き込みを同一トランザクションで行う。
+ */
+describe("resize（既存予約の原子的な増減）", () => {
+  it("新規keyへのresizeはreserveと同じ新規予約になる", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    const r = c.reservations.resize("k1", 30_000, "ルーレット", "u1");
+    expect(r.ok).toBe(true);
+    expect(r.row?.amount).toBe(30_000);
+    expect(c.reservations.totalReserved()).toBe(30_000);
+    c.db.close();
+  });
+
+  it("増額: 差額ぶんの余力があれば通る", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 100_000);
+    c.reservations.reserve("k1", 30_000, "ルーレット", "u1");
+    const r = c.reservations.resize("k1", 50_000, "ルーレット", "u1");
+    expect(r.ok).toBe(true);
+    expect(r.row?.amount).toBe(50_000);
+    expect(c.reservations.totalReserved()).toBe(50_000);
+    c.db.close();
+  });
+
+  it("増額: 差額ぶんの余力が無ければ断り、元の額のまま", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 40_000);
+    c.reservations.reserve("k1", 30_000, "ルーレット", "u1");
+    // 余力は 10,000 しか無いので +30,000 は通らない
+    const r = c.reservations.resize("k1", 60_000, "ルーレット", "u1");
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("capacity");
+    expect(r.available).toBe(10_000);
+    expect(c.reservations.get("k1")!.amount).toBe(30_000); // 変わっていない
+    expect(c.reservations.totalReserved()).toBe(30_000);
+    c.db.close();
+  });
+
+  it("減額は必ず成功し、差額が即座に available へ戻る", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 100_000);
+    c.reservations.reserve("k1", 80_000, "ルーレット", "u1");
+    expect(c.reservations.available()).toBe(20_000);
+    const r = c.reservations.resize("k1", 30_000, "ルーレット", "u1");
+    expect(r.ok).toBe(true);
+    expect(r.row?.amount).toBe(30_000);
+    expect(c.reservations.available()).toBe(70_000);
+    c.db.close();
+  });
+
+  it("0へのresizeは行を削除する（releaseと同じ効果）", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 100_000);
+    c.reservations.reserve("k1", 50_000, "ルーレット", "u1");
+    const r = c.reservations.resize("k1", 0, "ルーレット", "u1");
+    expect(r.ok).toBe(true);
+    expect(r.row).toBeUndefined();
+    expect(c.reservations.get("k1")).toBeUndefined();
+    expect(c.reservations.available()).toBe(100_000);
+    c.db.close();
+  });
+
+  it("game/userIdが食い違うとConflictで、額は変わらない", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 100_000);
+    c.reservations.reserve("k1", 30_000, "ルーレット", "u1");
+    expect(() => c.reservations.resize("k1", 40_000, "ルーレット", "u2")).toThrow(ReservationConflictError);
+    expect(() => c.reservations.resize("k1", 40_000, "スロット", "u1")).toThrow(ReservationConflictError);
+    expect(c.reservations.get("k1")!.amount).toBe(30_000);
+    c.db.close();
+  });
+
+  it("同額へのresizeは冪等（何も変わらない）", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 100_000);
+    c.reservations.reserve("k1", 30_000, "ルーレット", "u1");
+    const r = c.reservations.resize("k1", 30_000, "ルーレット", "u1");
+    expect(r.ok).toBe(true);
+    expect(c.reservations.totalReserved()).toBe(30_000);
+    c.db.close();
+  });
+
+  it("不正な入力（空key/game/userId・負数・NaN・小数・unsafe integer）は例外にする", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 100_000);
+    c.reservations.reserve("k1", 10_000, "ルーレット", "u1");
+    expect(() => c.reservations.resize("", 10_000, "ルーレット", "u1")).toThrow(ReservationInputError);
+    expect(() => c.reservations.resize("k1", 10_000, "", "u1")).toThrow(ReservationInputError);
+    expect(() => c.reservations.resize("k1", 10_000, "ルーレット", "")).toThrow(ReservationInputError);
+    for (const bad of [-1, NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => c.reservations.resize("k1", bad, "ルーレット", "u1"), `amount=${bad}`).toThrow(ReservationInputError);
+    }
+    expect(c.reservations.get("k1")!.amount).toBe(10_000); // どれも元の額を変えていない
+    c.db.close();
+  });
+});
+
+/**
  * マージ直前レビュー対応: key は元々検証していたが game / userId は素通りしていた。
  * 空文字が通ると、誰の・何の予約か分からない行が作れてしまう（fail-closed 化）。
  */
@@ -502,20 +602,12 @@ describe("予約APIの入力検証（マージ直前レビュー対応）", () =
   it("amount に 0・負数・小数・NaN・Infinity・unsafe integer を渡すと例外にする", () => {
     const c = setup();
     seed(c.db, HOUSE_HOLDER, 1_000_000);
-    const bad = [-1, -100, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1];
+    const bad = [0, -1, -100, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1];
     for (const amount of bad) {
       expect(() => c.reservations.reserve(`k-${amount}`, amount, "スロット", "u1"), `amount=${amount}`).toThrow(
         ReservationInputError,
       );
     }
-    expect(c.reservations.count()).toBe(0);
-    c.db.close();
-  });
-
-  it("amount=0 は例外にせず、行を作らずに ok:true を返す（引き分けしかないゲーム等）", () => {
-    const c = setup();
-    seed(c.db, HOUSE_HOLDER, 1_000_000);
-    expect(c.reservations.reserve("k0", 0, "スロット", "u1")).toEqual({ ok: true, available: 1_000_000 });
     expect(c.reservations.count()).toBe(0);
     c.db.close();
   });

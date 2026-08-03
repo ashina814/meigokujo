@@ -18,6 +18,8 @@ interface RunnerInput {
   amount: number;
   game: string;
   userId: string;
+  /** "reserve"（既定）または "resize"（PR5マージ直前レビュー対応: 既存予約の原子的増減の並行性検証） */
+  action?: "reserve" | "resize";
   /** 全プロセスを同じ瞬間に走らせるための開始時刻（epoch ms） */
   startAt: number;
 }
@@ -41,7 +43,10 @@ function main(): void {
   let amount = 0;
   let error: string | null = null;
   try {
-    const r = reservations.reserve(input.key, input.amount, input.game, input.userId);
+    const r =
+      input.action === "resize"
+        ? reservations.resize(input.key, input.amount, input.game, input.userId)
+        : reservations.reserve(input.key, input.amount, input.game, input.userId);
     if (r.ok) {
       outcome = "ok";
       amount = r.row?.amount ?? 0;

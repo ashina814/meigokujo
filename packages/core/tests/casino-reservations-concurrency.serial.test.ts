@@ -50,7 +50,7 @@ interface RunnerResult {
 /** 本番コードを別プロセスで N 件、同じ瞬間に走らせる */
 function runReservations(
   dbPath: string,
-  requests: Array<{ key: string; amount: number; game: string; userId: string }>,
+  requests: Array<{ key: string; amount: number; game: string; userId: string; action?: "reserve" | "resize" }>,
 ): Promise<RunnerResult[]> {
   const startAt = Date.now() + 2_000; // 起動のばらつきを吸収してから一斉に走らせる
   return Promise.all(
@@ -156,5 +156,31 @@ describe("複数接続からの同時予約（本番コード）", () => {
     expect(okCount).toBeLessThanOrEqual(house / per);
     expect(total).toBeLessThanOrEqual(house);
     expect(total).toBe(okCount * per);
+  }, 60_000);
+
+  it("resize: 別チャンネル2卓（別key）が余力100に対し各80を同時に取りにいくと、片方だけ成功する（PR5マージ直前レビュー対応）", async () => {
+    const { dbPath, db } = setupFileDb(100);
+    db.close();
+
+    const results = await runReservations(dbPath, [
+      { key: "roulette:reserve:roulette:table-a", amount: 80, game: "ルーレット", userId: "system:roulette", action: "resize" },
+      { key: "roulette:reserve:roulette:table-b", amount: 80, game: "ルーレット", userId: "system:roulette", action: "resize" },
+    ]);
+
+    const reopened = openDb(dbPath);
+    const reservations = new HouseReservations(
+      reopened,
+      new EtherExchange(reopened, new Ledger(reopened), new EventLog(reopened), { baseRate: 1, chipTx: new ChipTx(reopened) }),
+      new EventLog(reopened),
+    );
+    const total = reservations.totalReserved();
+    const count = reservations.count();
+    reopened.close();
+
+    expect(results.filter((r) => r.outcome === "error")).toEqual([]);
+    expect(results.filter((r) => r.outcome === "ok")).toHaveLength(1);
+    expect(results.filter((r) => r.outcome === "capacity")).toHaveLength(1);
+    expect(total).toBe(80);
+    expect(count).toBe(1);
   }, 60_000);
 });
