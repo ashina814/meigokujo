@@ -351,7 +351,9 @@ export {
 export {
   HouseReservations,
   ReservationConflictError,
+  ReservationInputError,
   RESERVATION_STALE_SEC,
   type ReservationRow,
   type ReservationResult,
+  type ReservationInputErrorCode,
 } from "./casino/reservations.js";

@@ -10,6 +10,7 @@ import {
   Ledger,
   RESERVATION_STALE_SEC,
   ReservationConflictError,
+  ReservationInputError,
   SLOT_MAX_PAYOUT_MULT,
   chinchiroLiability,
   crashLiability,
@@ -462,6 +463,89 @@ describe("同じ予約鍵は内容まで一致したときだけ冪等成功", (
     expect(r.ok).toBe(false);
     expect(r.reason).toBe("capacity");
     expect(r.available).toBe(10_000);
+    c.db.close();
+  });
+});
+
+/**
+ * マージ直前レビュー対応: key は元々検証していたが game / userId は素通りしていた。
+ * 空文字が通ると、誰の・何の予約か分からない行が作れてしまう（fail-closed 化）。
+ */
+describe("予約APIの入力検証（マージ直前レビュー対応）", () => {
+  it("key が空文字・空白のみは例外にする", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    expect(() => c.reservations.reserve("", 1_000, "スロット", "u1")).toThrow(ReservationInputError);
+    expect(() => c.reservations.reserve("   ", 1_000, "スロット", "u1")).toThrow(ReservationInputError);
+    expect(c.reservations.count()).toBe(0);
+    c.db.close();
+  });
+
+  it("game が空文字・空白のみは例外にする", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    expect(() => c.reservations.reserve("k1", 1_000, "", "u1")).toThrow(ReservationInputError);
+    expect(() => c.reservations.reserve("k1", 1_000, "   ", "u1")).toThrow(ReservationInputError);
+    expect(c.reservations.count()).toBe(0);
+    c.db.close();
+  });
+
+  it("userId が空文字・空白のみは例外にする", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    expect(() => c.reservations.reserve("k1", 1_000, "スロット", "")).toThrow(ReservationInputError);
+    expect(() => c.reservations.reserve("k1", 1_000, "スロット", "   ")).toThrow(ReservationInputError);
+    expect(c.reservations.count()).toBe(0);
+    c.db.close();
+  });
+
+  it("amount に 0・負数・小数・NaN・Infinity・unsafe integer を渡すと例外にする", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    const bad = [-1, -100, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1];
+    for (const amount of bad) {
+      expect(() => c.reservations.reserve(`k-${amount}`, amount, "スロット", "u1"), `amount=${amount}`).toThrow(
+        ReservationInputError,
+      );
+    }
+    expect(c.reservations.count()).toBe(0);
+    c.db.close();
+  });
+
+  it("amount=0 は例外にせず、行を作らずに ok:true を返す（引き分けしかないゲーム等）", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    expect(c.reservations.reserve("k0", 0, "スロット", "u1")).toEqual({ ok: true, available: 1_000_000 });
+    expect(c.reservations.count()).toBe(0);
+    c.db.close();
+  });
+
+  it("amount=Number.MAX_SAFE_INTEGER ちょうどは入力として通り、余力不足なら capacity で断る", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    const r = c.reservations.reserve("k-max", Number.MAX_SAFE_INTEGER, "スロット", "u1");
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("capacity");
+    c.db.close();
+  });
+
+  it("totalReserved は DB 内の破損した合計（safe integer を超える SUM）を例外にする", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    // 正規の reserve() を経由せず、テーブルへ直接 safe integer 超えの行を仕込む
+    // （DB 破損・手動編集・別プロセスのバグ等を模す）
+    c.db
+      .prepare(
+        "INSERT INTO casino_house_reservations (key, amount, game, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run("corrupt", Number.MAX_SAFE_INTEGER, "スロット", "u1", Math.floor(Date.now() / 1000));
+    c.db
+      .prepare(
+        "INSERT INTO casino_house_reservations (key, amount, game, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run("corrupt2", Number.MAX_SAFE_INTEGER, "スロット", "u2", Math.floor(Date.now() / 1000));
+    expect(() => c.reservations.totalReserved()).toThrow(ReservationInputError);
+    expect(() => c.reservations.available()).toThrow(ReservationInputError);
     c.db.close();
   });
 });

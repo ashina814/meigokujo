@@ -214,7 +214,10 @@ export const slotsPaidSpinLiability = fixedMultModel("スロット（有料1回�
  * お守りの勝利ボーナスは有料スピンと同じく乗りうるので、上限を安全側で足す。
  */
 function slotsFreeSpinLiability(ctx: LiabilityContext): number {
-  return Math.floor(ctx.bet * SLOT_MAX_PAYOUT_MULT) + ctx.activeEffects.winBonusCap;
+  assertValidContext(ctx);
+  const liability = Math.floor(ctx.bet * SLOT_MAX_PAYOUT_MULT) + ctx.activeEffects.winBonusCap;
+  assertSafeResult(liability, "slotsFreeSpinLiability");
+  return liability;
 }
 
 /**
@@ -236,9 +239,19 @@ function slotsFreeSpinLiability(ctx: LiabilityContext): number {
  */
 export const slotsLiability: GameLiabilityModel = {
   game: "スロット",
-  maxHouseLiability: (ctx) => slotsPaidSpinLiability.maxHouseLiability(ctx) + slotsFreeSpinLiability(ctx),
+  maxHouseLiability: (ctx) => {
+    // 評価順に依存せず必ず先に検証する（マージ直前レビュー対応）。
+    // どちらの項も内部で検証はしているが、加算前に明示しておくほうが読み手に安全。
+    assertValidContext(ctx);
+    const total = slotsPaidSpinLiability.maxHouseLiability(ctx) + slotsFreeSpinLiability(ctx);
+    assertSafeResult(total, "slotsLiability.maxHouseLiability");
+    return total;
+  },
   mandatoryHouseOutflow: (ctx) => slotsPaidSpinLiability.mandatoryHouseOutflow(ctx),
-  maxPlayerLoss: (ctx) => ctx.bet,
+  maxPlayerLoss: (ctx) => {
+    assertValidContext(ctx);
+    return ctx.bet;
+  },
   maxBetFor: (available, ctx) =>
     betForLiability(available, ctx, (bet) => slotsLiability.maxHouseLiability({ ...ctx, bet })),
 };

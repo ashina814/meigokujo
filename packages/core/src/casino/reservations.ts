@@ -64,6 +64,26 @@ export class ReservationConflictError extends Error {
   }
 }
 
+export type ReservationInputErrorCode = "ERR_BAD_KEY" | "ERR_BAD_GAME" | "ERR_BAD_USER" | "ERR_BAD_AMOUNT";
+
+/**
+ * 予約APIへの不正な入力（マージ直前レビュー対応）。
+ *
+ * `key` は元々検証していたが、`game` / `userId` は素通りしていた。空文字が通ると、
+ * `game=""` や `userId=""` の予約行が作れてしまい、`totalReserved()` には正しく
+ * 乗る一方で、`stale()` の警告や運営の一覧表示で「誰の・何の予約か分からない」行が残る。
+ * 他の資金層（`LiabilityError` 等）と同じ形の型付きエラーで fail-closed にする。
+ */
+export class ReservationInputError extends Error {
+  constructor(
+    readonly code: ReservationInputErrorCode,
+    readonly meta: Record<string, unknown> = {},
+  ) {
+    super(code);
+    this.name = "ReservationInputError";
+  }
+}
+
 const now = () => Math.floor(Date.now() / 1000);
 
 /** 24時間残った予約は「解放し忘れ」とみなして警告する（正本 §11.2） */
@@ -87,11 +107,21 @@ export class HouseReservations {
     `);
   }
 
-  /** 予約済みの合計 */
+  /**
+   * 予約済みの合計。
+   *
+   * 各行の `amount` は `reserve()` で safe integer に制限しているが、
+   * 行数が積み重なった `SUM()` そのものが safe integer を超えていないかは別途見る
+   * （破損した行が混じって INTEGER の範囲だけは満たす、といった経路への保険）。
+   * 超えていれば `available()` 計算が信用できないので、丸めず例外にする。
+   */
   totalReserved(): number {
     const row = this.db.prepare("SELECT COALESCE(SUM(amount), 0) AS total FROM casino_house_reservations").get() as {
       total: number;
     };
+    if (!Number.isSafeInteger(row.total)) {
+      throw new ReservationInputError("ERR_BAD_AMOUNT", { field: "totalReserved", total: row.total });
+    }
     return row.total;
   }
 
@@ -143,8 +173,10 @@ export class HouseReservations {
    * @returns 取れたかどうか、実際に保存されている予約、取れなかった場合の現在の上限
    */
   reserve(key: string, amount: number, game: string, userId: string): ReservationResult {
-    if (!key.trim()) throw new Error("HouseReservations.reserve: key は必須");
-    if (!Number.isSafeInteger(amount) || amount < 0) throw new Error(`HouseReservations.reserve: 不正な額 ${amount}`);
+    if (typeof key !== "string" || !key.trim()) throw new ReservationInputError("ERR_BAD_KEY", { key });
+    if (typeof game !== "string" || !game.trim()) throw new ReservationInputError("ERR_BAD_GAME", { game });
+    if (typeof userId !== "string" || !userId.trim()) throw new ReservationInputError("ERR_BAD_USER", { userId });
+    if (!Number.isSafeInteger(amount) || amount < 0) throw new ReservationInputError("ERR_BAD_AMOUNT", { amount });
 
     const run = this.db.transaction((): ReservationResult => {
       const existing = this.get(key);
