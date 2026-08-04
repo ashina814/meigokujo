@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
-import { EtherError, EtherExchange, HOUSE_HOLDER } from "./exchange.js";
+import { ChipLedgerError, ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 import { ChipTxError } from "./chip-tx.js";
 import type { Items } from "./items.js";
 import type { HouseReservations } from "./reservations.js";
@@ -9,7 +9,7 @@ import type { HouseReservations } from "./reservations.js";
  * マモンの賭場の共通土台。
  * - 賭け/配当はエテル残高の移動のみ（Land 台帳は動かない・総量保存）
  * - 胴元(house)が全ゲームの相手方。配当可能額 = 胴元残高（テーブルリミット）
- * - 胴元の元手・売上は EtherExchange 経由で賭博場の部署口座と往復する
+ * - 胴元の元手・売上は ChipLedger 経由で賭博場の部署口座と往復する
  * - 戦績は casino_stats に集計（通行証・賭場番付の材料）
  * - ジャックポットは専用保有者(jackpot)に積む
  */
@@ -42,7 +42,9 @@ export function chainMultiplier(streak: number): { mult: number; label: string }
 
 /**
  * 福の重み（勝ち分への累進奉納率）。casino-bot 準拠のしきい値 × scale。
- * scale はエテル物価に合わせる係数（既定10 = 冥獄城レート 1Ld=10◈ 相当）。
+ *
+ * scale は「移植元 casino-bot の額面を、冥獄城のチップ物価へ読み替える係数」。
+ * 交換レートとは無関係で、チップは常に 1 Ld = 1 chip（PR8監査・項目9）。
  */
 export function fukuRate(balance: number, scale: number): number {
   if (balance <= 10_000 * scale) return 0;
@@ -168,7 +170,7 @@ export class Casino {
 
   constructor(
     private readonly db: Database.Database,
-    readonly ether: EtherExchange,
+    readonly ether: ChipLedger,
     private readonly events: EventLog,
     options: CasinoOptions = {},
   ) {
@@ -248,8 +250,8 @@ export class Casino {
     jackpotCut = 0,
     opts: SettleOptions,
   ): SettleResult {
-    if (!Number.isInteger(bet) || bet <= 0) throw new EtherError("ERR_BAD_AMOUNT", { bet });
-    if (!Number.isInteger(payout) || payout < 0) throw new EtherError("ERR_BAD_AMOUNT", { payout });
+    if (!Number.isInteger(bet) || bet <= 0) throw new ChipLedgerError("ERR_BAD_AMOUNT", { bet });
+    if (!Number.isInteger(payout) || payout < 0) throw new ChipLedgerError("ERR_BAD_AMOUNT", { payout });
     const useChain = opts.chain ?? true;
     const useFuku = opts.fuku ?? true;
     const move = { game, sessionId: null };

@@ -58,7 +58,7 @@ export async function playIndian(
     await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
     return;
   }
-  if (services.ether.balanceOf(challenger.id) < stake || services.ether.balanceOf(opponent.id) < stake) {
+  if (services.chips.balanceOf(challenger.id) < stake || services.chips.balanceOf(opponent.id) < stake) {
     await interaction.reply({ content: "どちらかのエテル残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }

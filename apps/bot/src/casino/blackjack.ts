@@ -232,12 +232,12 @@ async function runRoundInner(
       )
       .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
       .setFooter({
-        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(totalBet).replace(" ◈", "◈")}`].join(" · "),
+        text: [`所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(totalBet).replace(" ◈", "◈")}`].join(" · "),
       });
 
     if (won) broadcastBigWin(interaction.client, services, { userId: uid, game: "ブラックジャック", bet: totalBet, payout: settled.payout });
 
-    const held = services.ether.balanceOf(uid);
+    const held = services.chips.balanceOf(uid);
     const min = MIN_BET;
     const max = Math.min(effectiveMaxBet(services, uid, "ブラックジャック"), held);
     const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -307,7 +307,7 @@ async function runRoundInner(
   // ── プレイヤーのターン ──
   // ダブルの可否は**開始時の予約結果**で決まる（PR5）。
   // ここで改めて胴元残高を見ると、予約済みの自分の枠を二重に数えて弾いてしまう
-  const canDoubleNow = () => player.length === 2 && doubleAllowed && services.ether.balanceOf(uid) >= bet * 2;
+  const canDoubleNow = () => player.length === 2 && doubleAllowed && services.chips.balanceOf(uid) >= bet * 2;
   reply = await openInitial(true, [buttons(canDoubleNow())]);
 
   let standing = false;

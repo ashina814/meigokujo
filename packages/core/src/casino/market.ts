@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
-import { EtherExchange, HOUSE_HOLDER } from "./exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 import { JACKPOT_HOLDER } from "./service.js";
 
 /**
@@ -131,7 +131,7 @@ export class Markets {
 
   constructor(
     private readonly db: Database.Database,
-    private readonly ether: EtherExchange,
+    private readonly ether: ChipLedger,
     private readonly events: EventLog,
     options: MarketsOptions = {},
   ) {

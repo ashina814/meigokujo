@@ -1,10 +1,10 @@
-import { testTransfer, opId } from "./helpers/chip-ctx.js";
+import { testTransfer, opId , openFormally} from "./helpers/chip-ctx.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { EtherExchange, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { Casino, JACKPOT_HOLDER, RELIEF_HOLDER, chainMultiplier, fukuRate } from "../src/casino/service.js";
 import { Items, CONSUMABLES } from "../src/casino/items.js";
 import { deterministicRng } from "../src/casino/rng.js";
@@ -19,7 +19,9 @@ registerDefaultTxTypes();
 function setup() {
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
-  const ether = new EtherExchange(db, ledger, new EventLog(db));
+  const ether = new ChipLedger(db, ledger, new EventLog(db));
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  openFormally(ether.chipTx, ledger);
   const casino = new Casino(db, ether, new EventLog(db));
   const items = new Items(db);
   const departments = new Departments(db, ledger);
@@ -29,7 +31,7 @@ function setup() {
   for (const uid of ["a", "b"]) {
     ledger.ensureAccount(`user:${uid}`, "user");
     ledger.transfer({ from: TREASURY, to: `user:${uid}`, amount: 50_000, type: "initial", actor: "t", idempotencyKey: `seed:${uid}` });
-    ether.buy(uid, 50_000, `seed:buy:${uid}`);
+    ether.deposit(uid, 50_000, `seed:buy:${uid}`);
   }
   return { db, ledger, ether, casino, items };
 }
@@ -75,8 +77,8 @@ describe("連鎖ボーナス（chain）", () => {
 
 describe("福の重み（fuku）", () => {
   it("fukuRate: しきい値 (scale=10) 通りに切り替わる", () => {
-    // scale 10 → 10000ld = 100000◈, 50000ld = 500000◈, ...
-    expect(fukuRate(50_000, 10)).toBe(0); // 10,000×10 = 100,000 以下
+    // scale=10 はチップ基準を維持する。100,000以下=0%、500,000以下=5%、1,000,000以下=10%。
+    expect(fukuRate(50_000, 10)).toBe(0);
     expect(fukuRate(100_000, 10)).toBe(0); // 境界: <= 100,000 は 0
     expect(fukuRate(150_000, 10)).toBeCloseTo(0.05); // 10,000×10 < x <= 50,000×10
     expect(fukuRate(500_000, 10)).toBeCloseTo(0.05); // <= 500,000
@@ -87,7 +89,10 @@ describe("福の重み（fuku）", () => {
 
   it("勝ち利益への奉納が JP と 救済プールに半々で流れる", () => {
     const ctx = setup();
-    // 初期残高: a=500,000◈。payout=20,000 → 勝ち後残高 510,000（10% 帯: 500,000 < x <= 1,000,000）
+    // 1:1 預入で a を 500,000 チップへ明示的に配置する。
+    ctx.ledger.transfer({ from: TREASURY, to: "user:a", amount: 450_000, type: "initial", actor: "t", idempotencyKey: "seed:a:fuku" });
+    ctx.ether.deposit("a", 450_000, "seed:buy:a:fuku");
+    // 初期残高: a=500,000チップ。payout=20,000 → 勝ち後510,000（10%帯）。
     // 純益 10,000 × 10% = 1,000 奉納。JP と 救済 が floor(1000/2)=500 ずつ。
     const jp0 = ctx.ether.balanceOf(JACKPOT_HOLDER);
     const relief0 = ctx.ether.balanceOf(RELIEF_HOLDER);
@@ -99,9 +104,9 @@ describe("福の重み（fuku）", () => {
 
   it("低残高（しきい値未満）では奉納 0（新規プレイヤー保護）", () => {
     const ctx = setup();
-    // b の残高を 100,000 未満まで減らす（fuku scale=10, しきい値100,000）
-    // 初期 500,000 → 401,000 を house に送って残 99,000
-    testTransfer(ctx.ether, "b", HOUSE_HOLDER, 401_000);
+    // 1:1 預入で b を 99,000チップにする。勝利後も100,000以下に収める。
+    ctx.ledger.transfer({ from: TREASURY, to: "user:b", amount: 49_000, type: "initial", actor: "t", idempotencyKey: "seed:b:low-fuku" });
+    ctx.ether.deposit("b", 49_000, "seed:buy:b:low-fuku");
     const jp0 = ctx.ether.balanceOf(JACKPOT_HOLDER);
     // bet 1000, payout 3000 → 純益 +2000。b の勝ち後残高 = 99,000 - 1000 + 3000 = 101,000
     // しきい値 100,000 を超えるので 5% 帯。奉納が発生してしまう。
@@ -280,7 +285,9 @@ describe("お守り裁定シミュレーション（buy-if-not-armed 戦略を�
   function bigSetup() {
     const db = openDb(":memory:");
     const ledger = new Ledger(db);
-    const ether = new EtherExchange(db, ledger, new EventLog(db));
+    const ether = new ChipLedger(db, ledger, new EventLog(db));
+    // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+    openFormally(ether.chipTx, ledger);
     const casino = new Casino(db, ether, new EventLog(db));
     const items = new Items(db);
     const departments = new Departments(db, ledger);
@@ -289,7 +296,7 @@ describe("お守り裁定シミュレーション（buy-if-not-armed 戦略を�
     ether.fundFromAccount(deptAccount("賭博場"), 90_000_000, HOUSE_HOLDER, "seed:house");
     ledger.ensureAccount("user:a", "user");
     ledger.transfer({ from: TREASURY, to: "user:a", amount: 90_000_000, type: "initial", actor: "t", approvedBy: "t", idempotencyKey: "seed:a" });
-    ether.buy("a", 90_000_000, "seed:buy:a");
+    ether.deposit("a", 90_000_000, "seed:buy:a");
     return { db, ledger, ether, casino, items };
   }
 

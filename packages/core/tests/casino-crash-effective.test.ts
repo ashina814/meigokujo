@@ -1,10 +1,10 @@
-import { testTransfer, opId } from "./helpers/chip-ctx.js";
+import { testTransfer, opId , openFormally} from "./helpers/chip-ctx.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { EtherExchange, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { Casino } from "../src/casino/service.js";
 import { deptAccount, Departments } from "../src/departments/service.js";
 import { crashPoint, chohanRollAndPay } from "../src/casino/game-models.js";
@@ -26,7 +26,9 @@ registerDefaultTxTypes();
 function setup() {
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
-  const ether = new EtherExchange(db, ledger, new EventLog(db));
+  const ether = new ChipLedger(db, ledger, new EventLog(db));
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  openFormally(ether.chipTx, ledger);
   const casino = new Casino(db, ether, new EventLog(db));
   const departments = new Departments(db, ledger);
   departments.upsert("賭博場", "賭博場", null);
@@ -38,7 +40,7 @@ function setup() {
   ledger.ensureAccount("user:p", "user");
   // プレイヤー残高は fuku 未満に抑える（scale=10 → 100,000 以下）
   ledger.transfer({ from: TREASURY, to: "user:p", amount: 5_000, type: "initial", actor: "t", idempotencyKey: "seed:p" });
-  ether.buy("p", 5_000, "seed:buy:p");
+  ether.deposit("p", 5_000, "seed:buy:p");
   return { db, ledger, ether, casino };
 }
 

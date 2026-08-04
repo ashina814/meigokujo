@@ -3,7 +3,8 @@ import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { EtherExchange, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { openFormally } from "./helpers/chip-ctx.js";
 import { Casino } from "../src/casino/service.js";
 import { deptAccount, Departments } from "../src/departments/service.js";
 import {
@@ -448,7 +449,9 @@ describe("実精算 <= モデル債務の直接比較（決定的乱数・境界
     registerDefaultTxTypes();
     const db = openDb(":memory:");
     const ledger = new Ledger(db);
-    const ether = new EtherExchange(db, ledger, new EventLog(db));
+    const ether = new ChipLedger(db, ledger, new EventLog(db));
+    // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+    openFormally(ether.chipTx, ledger);
     const casino = new Casino(db, ether, new EventLog(db));
     const departments = new Departments(db, ledger);
     departments.upsert("賭博場", "賭博場", null);
@@ -460,7 +463,7 @@ describe("実精算 <= モデル債務の直接比較（決定的乱数・境界
     ether.fundFromAccount(deptAccount("賭博場"), 10_000_000, HOUSE_HOLDER, "seed:house");
     ledger.ensureAccount("user:a", "user");
     ledger.transfer({ from: TREASURY, to: "user:a", amount: 1_000_000, type: "initial", actor: "t", idempotencyKey: "seed:a" });
-    ether.buy("a", 1_000_000, "seed:buy:a");
+    ether.deposit("a", 1_000_000, "seed:deposit:a");
     return { ether, casino };
   }
 

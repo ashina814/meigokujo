@@ -6,7 +6,7 @@ import {
   CasinoIntegrity,
   CasinoStatus,
   ChipTx,
-  EtherExchange,
+  ChipLedger,
   Escrow,
   EventLog,
   FreeSpins,
@@ -26,6 +26,8 @@ import {
   registerDefaultTxTypes,
   scriptedRng,
   type CasinoRng,
+  FORMAL_OPENING_VERSION,
+  CHIP_ESCROW,
 } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 import {
@@ -74,7 +76,9 @@ function rebuild(db: ReturnType<typeof openDb>, rng: CasinoRng = scriptedRng([0.
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  chipTx.captureOpening(FORMAL_OPENING_VERSION, [], { poolLand: ledger.balanceOf(CHIP_ESCROW), fromLedgerTxId: ledger.lastTransactionId() });
   const items = new Items(db);
   // 胴元債務予約（PR5）。無料スピンの再開はここから予約を取り直す
   const reservations = new HouseReservations(db, ether, events);
@@ -88,8 +92,24 @@ function rebuild(db: ReturnType<typeof openDb>, rng: CasinoRng = scriptedRng([0.
   const escrow = new Escrow(db, ether, events, { onPlayerNet: recordPlayerNet });
   const markets = new Markets(db, ether, events, { onPlayerNet: recordPlayerNet });
   const freeSpins = new FreeSpins(db);
-  const services = { db, ether, casino, items, vip, escrow, markets, freeSpins, reservations, rng, events } as unknown as Services;
+  const services = { db, ether, chips: ether, chipTx, casino, items, vip, escrow, markets, freeSpins, reservations, rng, events } as unknown as Services;
   return { db, ledger, chipTx, ether, casino, items, vip, escrow, markets, freeSpins, reservations, events, services };
+}
+
+/**
+ * Land の裏付けつきでチップを発行する（正規の `chip_fund` 経路）。
+ *
+ * `seedBalance` は `ether_balances` を直接書くので手早いが、開始残高にも準備口座にも
+ * 現れない。検算A（記録と残高）・検算B（100%準備）を実際に通すテストではこちらを使う。
+ */
+function mintBackedChips(ctx: ReturnType<typeof rebuild>, holder: string, amount: number): void {
+  const dept = "sys:dept:賭博場";
+  ctx.ledger.ensureAccount(dept, "system");
+  ctx.ledger.transfer({
+    from: "sys:treasury", to: dept, amount, type: "adjust", actor: "t", approvedBy: "t",
+    idempotencyKey: `mint:seed:${holder}:${amount}`,
+  });
+  ctx.ether.fundFromAccount(dept, amount, holder, `mint:fund:${holder}:${amount}`);
 }
 
 function seedBalance(db: ReturnType<typeof openDb>, holder: string, amount: number): void {
@@ -547,18 +567,17 @@ describe("③b フリースピン権はプロセスをまたいで残る", () =>
   it("recoverCasino後もJP請求を隔離せず、ClientReady相当の再開で全額を一度だけ払う", () => {
     const ctx = setup(scriptedRng([SCATTER, SCATTER, SCATTER, 0.9, 0.9, 0.9]));
     ctx.ledger.ensureAccount("user:u1", "user");
-    seedBalance(ctx.db, "u1", 10_000);
-    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
-    seedBalance(ctx.db, JACKPOT_HOLDER, 100_000);
+    // このテストだけは検算A〜Dを実際に通すので、チップを**Landで裏付けて**発行する
+    // （`seedBalance` の直挿しだと開始残高にも準備Landにも現れず、検算A/Bが落ちる）
+    mintBackedChips(ctx, "u1", 10_000);
+    mintBackedChips(ctx, HOUSE_HOLDER, 1_000_000);
+    mintBackedChips(ctx, JACKPOT_HOLDER, 100_000);
     const pending = spinPaid(ctx.services, "u1", 1_000, "jp-recovery-integration").pendingFreeSpin!;
     const holder = ctx.freeSpins.jackpotClaimHolder(pending);
     const before = ctx.ether.balanceOf("u1");
 
-    // 有料スピン確定後のDBを起動時スナップショットにする。
-    ctx.chipTx.captureLegacyOpening({
-      poolLand: ctx.ledger.balanceOf("sys:escrow:ether"),
-      fromLedgerTxId: ctx.ledger.lastTransactionId(),
-    });
+    // 有料スピン確定後のDBを起動時スナップショットにする
+    // （開始残高と Land 基準は setup() が opening_v1 として置いてある）。
     const status = new CasinoStatus(ctx.db);
     const integrity = new CasinoIntegrity(ctx.db, ctx.ledger, ctx.ether, ctx.escrow);
     const recovered = recoverCasino({

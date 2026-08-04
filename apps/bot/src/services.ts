@@ -20,7 +20,7 @@ import {
   RankEngine,
   BumpCounter,
   Shop,
-  EtherExchange,
+  ChipLedger,
   ETHER_ESCROW,
   HOUSE_HOLDER,
   Casino,
@@ -47,6 +47,25 @@ import {
 import { config } from "./config.js";
 import { meetsRoleRequirement } from "./rank-requirement.js";
 import { seedSpecialProfiles } from "./special-profile.js";
+
+/**
+ * 旧 `services.ether` に残す**読み取り専用の窓**（PR8監査・項目12）。
+ *
+ * 資金を動かす入口を2つ持つと、片方だけに検証・予約保護・正式開業ロックを足したときに
+ * 保護が食い違う。`deposit` / `redeem` / `fundFromAccount` / `redeemToAccount` /
+ * `transfer` / `runGroup` / 旧 `buy` `sell` `quoteBuy` `quoteSell` を**型から落として**、
+ * `services.ether` 経由では資金が動かせないことをコンパイル時に固定する。
+ * 資金操作も残高の読み取りも、production は必ず `services.chips` を使う
+ * （PR8監査の時点で `services.ether` の production 参照は 0 件）。
+ */
+export interface ChipReadonlyView {
+  balanceOf(holderId: string): number;
+  pool(): number;
+  outstanding(): number;
+  settleableBalance(holderId: string): number;
+  /** 現在の準備口座（opening 状態の読み取り。未知版では例外＝fail-closed） */
+  reserveHolder(): string;
+}
 
 /**
  * コアサービスの組み立て。アプリ層は薄く、ロジックは全て core 側（システム設計.md の原則）。
@@ -94,16 +113,16 @@ export function buildServices() {
   });
   // 賭場の取引監査。全サービスで同じインスタンスを共有する（実行中グループを共有するため）
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, {
-    baseRate: () => settings.getNumber("ether_rate_base"),
-    chipTx,
-  });
+  // 正式開業ロックは `ChipLedger` に組み込まれていて外せない（PR8監査・ブロッカーA）。
+  // 「ロックを解除するオプション」も「ロックなしの派生」も存在しないので、
+  // ここで有効化し忘れる／うっかり無効化する余地が構造的に無い。
+  const chips = new ChipLedger(db, ledger, events, { chipTx });
   // 監査の出発点。導入時のチップ残高と、Land 側の基準（準備プール残高＋境界取引ID）を
   // 一度だけ記録する。ここで基準を持てるのは「まだ何も動いていない」新規DBだけで、
   // すでに版がある既存DBは運営卓の「検算Bの基準を確定」から明示的に置く
   if (
     chipTx.captureLegacyOpening({
-      poolLand: ledger.balanceOf(ETHER_ESCROW),
+      poolLand: ledger.balanceOf(chips.reserveHolder()),
       fromLedgerTxId: ledger.lastTransactionId(),
     })
   ) {
@@ -118,22 +137,22 @@ export function buildServices() {
   // 獲得済みフリースピンの保留台帳（PR3）。有料スピンの確定と同じトランザクションで積む
   const freeSpins = new FreeSpins(db);
   // 胴元債務予約（PR5）。canAccept が見るのは house 残高ではなく「残高 − 予約合計」になる
-  const reservations = new HouseReservations(db, ether, events);
+  const reservations = new HouseReservations(db, chips, events);
   // 売上精算（redeemFairToAccount）も予約分は出せないようにする。UI ではなく資金処理層で止める
-  ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
-  const casino = new Casino(db, ether, events, {
+  chips.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
+  const casino = new Casino(db, chips, events, {
     fukuScale: () => settings.getNumber("ether_fuku_scale"),
     items,
     reservations,
   });
-  const daily = new Daily(db, ether, events, {
+  const daily = new Daily(db, chips, events, {
     base: () => settings.getNumber("daily_base"),
     reliefThreshold: () => settings.getNumber("daily_relief_threshold"),
     reliefMax: () => settings.getNumber("daily_relief_max"),
   });
   // Stocks の価格ランダムウォークは共通RNGを使う（テスト時は決定的にできる）
-  const stocks = new Stocks(db, ether, events, { rng: defaultRng() });
-  const vip = new Vip(db, ether, events, {
+  const stocks = new Stocks(db, chips, events, { rng: defaultRng() });
+  const vip = new Vip(db, chips, events, {
     price: () => settings.getNumber("vip_price"),
     days: () => settings.getNumber("vip_days"),
     betCapMult: () => settings.getNumber("vip_bet_cap_mult"),
@@ -144,10 +163,10 @@ export function buildServices() {
   const recordPlayerNet = (userId: string, net: number) => {
     if (isPlayerHolder(userId)) casino.recordGameNet(userId, net);
   };
-  const markets = new Markets(db, ether, events, { onPlayerNet: recordPlayerNet });
-  const escrow = new Escrow(db, ether, events, { onPlayerNet: recordPlayerNet });
+  const markets = new Markets(db, chips, events, { onPlayerNet: recordPlayerNet });
+  const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
   const takutate = new Takutate(db, events);
-  const casinoIntegrity = new CasinoIntegrity(db, ledger, ether, escrow);
+  const casinoIntegrity = new CasinoIntegrity(db, ledger, chips, escrow);
   // 起動時: 全点検 → 通ったときだけ掃除 → 掃除後にもう一度全点検 → 開ける
   // 起動・復旧（正本 §8.2 S1〜S9, S12）。**所有元が「生きている預託」を自分で申告する**。
   // 板だけを登録し、競馬は登録しない（永続テーブルが無く、再起動でレースごと消えるので
@@ -159,7 +178,10 @@ export function buildServices() {
   );
   // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, ether, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
+  // 資金を動かす経路は `chips` に一本化した（PR8監査・項目12）。`ether` は
+  // 旧名称で書かれた外部プラグイン・古い呼び出しが**読むだけ**なら壊れないように
+  // 残す互換窓で、型を `ChipReadonlyView` に狭めてある（下の注釈参照）。
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;
@@ -238,4 +260,3 @@ function logRecovery(r: ReturnType<typeof recoverCasino>): void {
     );
   }
 }
-

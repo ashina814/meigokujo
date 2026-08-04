@@ -1,5 +1,6 @@
 import { MessageFlags, type Interaction, type RepliableInteraction } from "discord.js";
 import type { Services } from "../services.js";
+import { isFormallyOpen, openingNotice } from "./opening.js";
 
 /**
  * 賭場の入口ガード（大型UPD PR2）。
@@ -67,10 +68,15 @@ export function isCasinoInteraction(interaction: Interaction): boolean {
 /**
  * 賭場が閉まっていれば理由を返して true（＝呼び出し側は処理を中止する）。
  * 開いていれば false。
+ *
+ * 稼働状態が `open` でも、正式開業初期化（PR12）が終わっていなければ資金は動かせない
+ * （PR8監査・項目8）。core 側の `ERR_CASINO_OPENING_NOT_COMPLETE` を握って generic な
+ * 失敗にするのではなく、**押す前に**なぜ今できないかをここで返す。停止中の理由文の方が
+ * 利用者に近いので、稼働状態の判定を先に置く。
  */
 export async function denyIfCasinoClosed(interaction: Interaction, services: Services): Promise<boolean> {
   if (!isCasinoInteraction(interaction)) return false;
-  const deny = services.casinoStatus.denyMessage();
+  const deny = services.casinoStatus.denyMessage() ?? (isFormallyOpen(services) ? null : openingNotice(services));
   if (!deny) return false;
   const repliable = interaction as RepliableInteraction;
   if (typeof repliable.reply !== "function") return true;

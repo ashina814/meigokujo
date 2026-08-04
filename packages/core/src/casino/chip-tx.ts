@@ -38,6 +38,23 @@ import type Database from "better-sqlite3";
 export const CHIP_OPENING_VERSION_KEY = "casino:opening_version";
 /** PR1導入時に現在のチップ残高を保存する版。正式開業初期化で opening_v1 へ切り替える */
 export const LEGACY_OPENING_VERSION = "legacy_pre_reset";
+/**
+ * 正式開業初期化（PR12）が確定する新版（PR8監査・ブロッカーC）。
+ *
+ * `reserveHolder()` や検算Bはこの値との**厳密一致**でしか新準備口座を認めない。
+ * 空文字・typo・DB破損・`opening_v2`・将来未対応版は、既定でどちらか一方へ
+ * fail-open せず、明示的に `ERR_UNKNOWN_OPENING_VERSION` として扱う。
+ */
+export const FORMAL_OPENING_VERSION = "opening_v1";
+
+/**
+ * 正式開業の進み具合（PR8監査・項目8）。UI と core が同じ語彙で判断するための型。
+ *
+ * - `pre_reset` … `legacy_pre_reset`。既存残高は保持するが、資金操作は全停止
+ * - `formal` … `opening_v1` 確定後。1:1 の預入・返還が動く唯一の状態
+ * - `unknown` … 未知の版。準備口座が決まらないので全操作不可（fail-closed）
+ */
+export type OpeningPhase = "pre_reset" | "formal" | "unknown";
 
 /** Land台帳と連動するか（deposit/redeem は必ず Land 取引IDを持つ） */
 export type ChipTxKind = "internal_transfer" | "deposit" | "redeem";
@@ -54,7 +71,8 @@ export interface ChipMove {
   sessionId?: string | null;
   /**
    * deposit / redeem で必須。動いた Land の額。
-   * 端数で 0 Ld になる返還（現行の変動レート由来）もあるので 0 を許す。
+   * チップ制度は常に 1:1 なので 0 にはならないが、端数で 0 Ld になる返還が
+   * 起こりえた**旧変動レート時代**の行も同じ列で読めるように 0 を許す。
    */
   landAmount?: number | null;
   /** deposit / redeem で Land が動いたなら必須。対応する Land 取引の id */
@@ -377,6 +395,21 @@ export class ChipTx {
       this.cachedVersion = row?.value ?? LEGACY_OPENING_VERSION;
     }
     return this.cachedVersion;
+  }
+
+  /**
+   * 正式開業がどこまで進んだか（PR8監査・項目8）。
+   *
+   * UI は `CasinoStatus` だけでは正しい文言を出せない。稼働状態が `open` でも
+   * 正式開業初期化（PR12）が終わっていなければ 1:1 の預入・返還は始まっておらず、
+   * 「営業中」と出すのは**実態と食い違う嘘**になる。表示側がその判定を各所で
+   * 書き直さなくて済むよう、版の解釈をここに一本化する。
+   */
+  openingPhase(): OpeningPhase {
+    const version = this.currentVersion();
+    if (version === LEGACY_OPENING_VERSION) return "pre_reset";
+    if (version === FORMAL_OPENING_VERSION) return "formal";
+    return "unknown";
   }
 
   /**

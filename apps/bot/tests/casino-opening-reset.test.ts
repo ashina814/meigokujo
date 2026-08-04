@@ -47,10 +47,12 @@ function fakeServices(status: StatusValue) {
       haltForIntegrity: vi.fn(() => false),
     },
     casinoIntegrity: { runFull: () => cleanReport },
-    ether: { pool: () => 0, rate: () => 1, outstanding: () => 0 },
+    ether: { pool: () => 0, outstanding: () => 0 },
+    chips: { pool: () => 0, outstanding: () => 0 },
     casino: { houseBalance: () => 0, jackpotPool: () => 0 },
     departments: { get: () => ({ name: "賭博場" }), balanceOf: () => 0 },
-    chipTx: { openingLandBaseline: () => ({ poolLand: 0 }) },
+    // 正式開業初期化の導線そのものを見るテストなので、既定は「開業前」に置く
+    chipTx: { openingLandBaseline: () => ({ poolLand: 0 }), openingPhase: () => "pre_reset" },
   } as unknown as Services;
   return { services, finishOpeningReset };
 }

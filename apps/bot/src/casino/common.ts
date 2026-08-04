@@ -123,7 +123,7 @@ export async function validateBet(
     });
     return { ok: false, bet };
   }
-  const held = services.ether.balanceOf(uid);
+  const held = services.chips.balanceOf(uid);
   if (held < bet) {
     await respond({
       content: `${Mammon.broke()}（所持 ${fmtEther(held)}）\n→ 両替所パネルで Land をエテルに替えてこい。`,
@@ -446,7 +446,7 @@ export function checkRetry(services: Services, userId: string, betRaw: number, g
         : `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
     };
   }
-  const held = services.ether.balanceOf(userId);
+  const held = services.chips.balanceOf(userId);
   if (held < bet) {
     return { ok: false, reason: `${Mammon.broke()}（所持 ${fmtEther(held)} / 必要 ${fmtEther(bet)}）` };
   }

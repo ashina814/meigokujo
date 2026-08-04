@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 import {
   Casino,
   ChipTx,
-  EtherExchange,
+  ChipLedger,
   EventLog,
   HOUSE_HOLDER,
   HouseReservations,
   Items,
   Ledger,
   Vip,
-  EtherError,
+  ChipLedgerError as EtherError,
   FreeSpins,
   TREASURY,
   SLOT_MAX_PAYOUT_MULT,
@@ -20,6 +20,8 @@ import {
   openDb,
   registerDefaultTxTypes,
   scriptedRng,
+  FORMAL_OPENING_VERSION,
+  CHIP_ESCROW,
 } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 import {
@@ -51,7 +53,9 @@ function setup(rng = scriptedRng([0.5])) {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  chipTx.captureOpening(FORMAL_OPENING_VERSION, [], { poolLand: ledger.balanceOf(CHIP_ESCROW), fromLedgerTxId: ledger.lastTransactionId() });
   const items = new Items(db);
   const reservations = new HouseReservations(db, ether, events);
   // 本番（services.ts）と同じ配線。売上精算も予約分は出せない
@@ -59,7 +63,7 @@ function setup(rng = scriptedRng([0.5])) {
   const casino = new Casino(db, ether, events, { items, reservations });
   const vip = new Vip(db, ether, events);
   const freeSpins = new FreeSpins(db);
-  const services = { db, ether, casino, items, vip, reservations, freeSpins, events, rng } as unknown as Services;
+  const services = { db, ether, chips: ether, chipTx, casino, items, vip, reservations, freeSpins, events, rng } as unknown as Services;
   return { db, ledger, ether, casino, items, vip, reservations, freeSpins, services };
 }
 
@@ -389,6 +393,71 @@ describe("売上精算は予約済み資金を抜けない", () => {
     const house = c.ether.balanceOf(HOUSE_HOLDER);
     c.ether.redeemFairToAccount(HOUSE_HOLDER, house, DEPT, "settle:all");
     expect(c.ether.balanceOf(HOUSE_HOLDER)).toBe(0);
+  });
+});
+
+/**
+ * PR8監査・ブロッカーB: `redeemFairToAccount` はdeprecatedであり、新規コードは
+ * `redeemToAccount` を使う案内になっている。予約保護は新APIそのものが持つことを、
+ * 上のdescribeとは別に明示的な `redeemToAccount` 呼び出しで固定する。
+ */
+describe("redeemToAccount自身が予約済み資金を抜けない（新API）", () => {
+  const DEPT = deptAccount("賭博場");
+
+  function fundedHouse(houseAmount: number) {
+    const c = setup();
+    c.ledger.ensureAccount(DEPT, "system");
+    c.ledger.transfer({
+      from: TREASURY, to: DEPT, amount: houseAmount, type: "adjust", actor: "t", approvedBy: "t",
+      idempotencyKey: `seed:dept2:${houseAmount}`,
+    });
+    c.ether.fundFromAccount(DEPT, houseAmount, HOUSE_HOLDER, "fund:test2");
+    return c;
+  }
+
+  it("house残高100・予約80で、21は拒否・20は成功し、予約は維持される", () => {
+    const c = fundedHouse(100);
+    c.reservations.reserve("live-game", 80, "スロット", "u1");
+    const poolBefore = c.ledger.balanceOf(c.ether.reserveHolder());
+
+    expect(() => c.ether.redeemToAccount(HOUSE_HOLDER, 21, DEPT, "test:redeem", "settle:21")).toThrow(EtherError);
+    let error: unknown;
+    try {
+      c.ether.redeemToAccount(HOUSE_HOLDER, 21, DEPT, "test:redeem", "settle:21-check");
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toBeInstanceOf(EtherError);
+    expect((error as { code: string }).code).toBe("ERR_RESERVED_FUNDS");
+    // 予約80は維持、house残高もLand準備口座も動いていない
+    expect(c.reservations.totalReserved()).toBe(80);
+    expect(c.ether.balanceOf(HOUSE_HOLDER)).toBe(100);
+    expect(c.ledger.balanceOf(c.ether.reserveHolder())).toBe(poolBefore);
+
+    // ちょうど精算可能額（20）は成功する
+    c.ether.redeemToAccount(HOUSE_HOLDER, 20, DEPT, "test:redeem", "settle:20");
+    expect(c.ether.balanceOf(HOUSE_HOLDER)).toBe(80);
+    expect(c.reservations.totalReserved()).toBe(80);
+    expect(c.ledger.balanceOf(c.ether.reserveHolder())).toBe(poolBefore - 20);
+
+    // house残高が負にならない・予約済みゲームがその後80を全額支払える
+    expect(c.ether.balanceOf(HOUSE_HOLDER)).toBeGreaterThanOrEqual(0);
+    expect(c.ether.settleableBalance(HOUSE_HOLDER)).toBe(0);
+    c.ether.runGroup({ groupKey: "test:payout", kind: "solo_game", actorId: "u1" }, () =>
+      c.ether.transfer(HOUSE_HOLDER, "u1", 80, { reason: "予約済みゲームの配当", game: "スロット" }),
+    );
+    expect(c.ether.balanceOf(HOUSE_HOLDER)).toBe(0);
+  });
+
+  it("同じ冪等キーで再実行しても二重精算しない", () => {
+    const c = fundedHouse(100);
+    const before = c.ether.balanceOf(HOUSE_HOLDER);
+    const poolBefore = c.ledger.balanceOf(c.ether.reserveHolder());
+    const first = c.ether.redeemToAccount(HOUSE_HOLDER, 30, DEPT, "test:redeem", "settle:idem");
+    const second = c.ether.redeemToAccount(HOUSE_HOLDER, 30, DEPT, "test:redeem", "settle:idem");
+    expect(second).toEqual(first);
+    expect(c.ether.balanceOf(HOUSE_HOLDER)).toBe(before - 30);
+    expect(c.ledger.balanceOf(c.ether.reserveHolder())).toBe(poolBefore - 30);
   });
 });
 

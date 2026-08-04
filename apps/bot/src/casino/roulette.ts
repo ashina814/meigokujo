@@ -98,7 +98,7 @@ export function acceptRouletteBet(
   const reservationKey = reservationKeyFor(session);
   const wasRebet = bets.has(userId);
   try {
-    services.ether.runGroup(
+    services.chips.runGroup(
       { groupKey: `roulette:bet:${session}:${userId}:${operationId}`, kind: "table_hold", actorId: userId },
       () => {
         const r = services.reservations.resize(reservationKey, wantedTotal, "ルーレット", RESERVATION_OWNER);
@@ -124,7 +124,7 @@ export function acceptRouletteBet(
  * 別々に行うと、返金だけ成功して予約解放が落ちた場合に予約が残り続ける。
  */
 export function voidRouletteTable(services: Services, session: string): void {
-  services.ether.runGroup(
+  services.chips.runGroup(
     { groupKey: `roulette:void:${session}`, kind: "table_refund", actorId: "system:roulette" },
     () => {
       services.escrow.refund(session);
@@ -213,7 +213,7 @@ export function settleRoulette(
   bets: readonly SessionBet[],
   _beforeStep?: (index: number, bet: SessionBet) => void,
 ): RouletteSpinRecord {
-  return services.ether.runGroup(
+  return services.chips.runGroup(
     { groupKey: `${session}:settle`, kind: "table_settle", actorId: "system:roulette" },
     (): RouletteSpinRecord => {
       // 抽選もグループの中。出目を保存結果に含めるので、再試行でも同じ目・同じ分配になる
@@ -350,7 +350,7 @@ export async function playRoulette(
             await sub.reply({ content: Mammon.tableClosed(), flags: MessageFlags.Ephemeral });
             return;
           }
-          await sub.reply({ content: `${Mammon.broke()}（所持 ${fmtEther(services.ether.balanceOf(btn.user.id))}）`, flags: MessageFlags.Ephemeral });
+          await sub.reply({ content: `${Mammon.broke()}（所持 ${fmtEther(services.chips.balanceOf(btn.user.id))}）`, flags: MessageFlags.Ephemeral });
           await interaction.editReply({ embeds: [lobbyEmbed(Math.max(0, Math.ceil((endAt - Date.now()) / 1000)))] }).catch(() => undefined);
           return;
         }

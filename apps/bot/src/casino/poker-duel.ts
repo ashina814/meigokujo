@@ -174,7 +174,7 @@ export async function playPokerDuel(
     await interaction.reply({ content: "自分やボットには挑めない。", flags: MessageFlags.Ephemeral });
     return;
   }
-  if (services.ether.balanceOf(uid) < bet) {
+  if (services.chips.balanceOf(uid) < bet) {
     await interaction.reply({ content: "自分のエテル残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }
@@ -400,7 +400,7 @@ async function openJoin(interaction: ButtonInteraction, services: Services, s: S
     await interaction.reply({ content: `定員 ${MAX_OPEN}人。`, flags: MessageFlags.Ephemeral });
     return;
   }
-  if (services.ether.balanceOf(uid) < s.bet) {
+  if (services.chips.balanceOf(uid) < s.bet) {
     await interaction.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }

@@ -35,6 +35,7 @@ function createServices(opts: {
   sessionMismatches?: Array<{ sessionId: string; expected: number; actual: number }>;
   casinoStatus?: { status: string; reason: string; changedBy: string; changedAt: number };
   casinoChecks?: Array<{ id: string; name: string; ok: boolean; detail: string; mismatches: unknown[] }>;
+  openingPhase?: "pre_reset" | "formal" | "unknown";
 } = {}): FakeServices {
   const db = openDb(":memory:");
   db.exec(`
@@ -118,14 +119,16 @@ function createServices(opts: {
         checkedAt: 0,
       }),
     },
-    ether: {
+    // 計器盤は資金を動かさないので、読み取り分だけを持つ（PR8監査・項目12）
+    chips: {
       balanceOf: (holder: string) =>
         (db.prepare("SELECT amount FROM ether_balances WHERE user_id = ?").get(holder) as { amount: number } | undefined)
           ?.amount ?? 0,
       outstanding: () => 51_500,
       pool: () => 7_000,
-      rate: () => 10,
     },
+    // 版は正式開業後を既定にする（開業前の表示は casino-opening-ui.test.ts が見る）
+    chipTx: { openingPhase: () => opts.openingPhase ?? "formal" },
     departments: { listWithBalance: () => [{ key: "bank", name: "銀行", role_id: null, balance: 30_000 }] },
   };
   return services as unknown as FakeServices;

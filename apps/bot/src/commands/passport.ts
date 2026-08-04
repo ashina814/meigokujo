@@ -27,7 +27,7 @@ export async function handlePassportCommand(
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const uid = interaction.user.id;
   const stats = services.casino.stats(uid);
-  const etherBalance = services.ether.balanceOf(uid);
+  const etherBalance = services.chips.balanceOf(uid);
   const landBalance = services.ledger.balanceOf(`user:${uid}`);
   const winRate = stats.games > 0 ? stats.wins / stats.games : 0;
 

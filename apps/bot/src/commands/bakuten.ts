@@ -38,7 +38,7 @@ export async function handleBakutenCommand(
 function buildEmbed(userId: string, services: Services): EmbedBuilder {
   const inv = services.items.inventory(userId);
   const armed = new Set(services.items.armedList(userId));
-  const held = services.ether.balanceOf(userId);
+  const held = services.chips.balanceOf(userId);
 
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · 商店" })
@@ -129,12 +129,12 @@ export function buyConsumable(
   const def = getConsumableDef(key);
   if (!def) throw new Error(`buyConsumable: 不明な商品 ${key}`);
   const groupKey = `shop:buy:${userId}:${def.key}:${operationId}`;
-  const r = services.ether.runGroup(
+  const r = services.chips.runGroup(
     { groupKey, kind: "shop", actorId: userId },
     (): { ok: boolean; held: number } => {
-      const held = services.ether.balanceOf(userId);
+      const held = services.chips.balanceOf(userId);
       if (held < def.price) return { ok: false, held };
-      services.ether.transfer(userId, HOUSE_HOLDER, def.price, { reason: `賭場商店での購入: ${def.key}` });
+      services.chips.transfer(userId, HOUSE_HOLDER, def.price, { reason: `賭場商店での購入: ${def.key}` });
       services.items.grant(userId, def.key, 1);
       return { ok: true, held };
     },

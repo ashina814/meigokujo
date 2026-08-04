@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
-import { EtherError, EtherExchange } from "./exchange.js";
+import { ChipLedgerError, ChipLedger } from "./chip-ledger.js";
 
 /**
  * 賭場のエスクロー台帳。
@@ -83,7 +83,7 @@ export class Escrow {
 
   constructor(
     private readonly db: Database.Database,
-    private readonly ether: EtherExchange,
+    private readonly ether: ChipLedger,
     private readonly events: EventLog,
     options: EscrowOptions = {},
   ) {
@@ -131,7 +131,7 @@ export class Escrow {
         return true;
       });
     } catch (e) {
-      if (e instanceof EtherError) return false;
+      if (e instanceof ChipLedgerError) return false;
       throw e;
     }
   }
@@ -168,7 +168,7 @@ export class Escrow {
       );
     } catch (e) {
       // 足りない人がいた／送金が通らなかった → グループごと巻き戻り済み。誰からも取っていない
-      if (e instanceof EscrowShortfall || e instanceof EtherError) return false;
+      if (e instanceof EscrowShortfall || e instanceof ChipLedgerError) return false;
       throw e;
     }
   }

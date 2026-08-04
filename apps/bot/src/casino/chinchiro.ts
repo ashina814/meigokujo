@@ -108,10 +108,10 @@ export function settleChinchiroRound(
   /** 胴元債務予約の鍵（PR5）。精算が通った時点で同じトランザクション内で解放される */
   reservationKey?: string,
 ): ChinchiroRound {
-  return services.ether.runGroup(
+  return services.chips.runGroup(
     { groupKey: `chinchiro:round:${uid}:${operationId}`, kind: "solo_game", actorId: uid },
     (): ChinchiroRound => {
-      const held = services.ether.balanceOf(uid);
+      const held = services.chips.balanceOf(uid);
       if (mul > 0) {
         // 勝ち: profit = bet * mul * (1 - edge)、payout = bet + profit
         const rawPayout = chinchiroPayout(bet, mul);
@@ -128,7 +128,7 @@ export function settleChinchiroRound(
       const doubleLoss = extraNeeded > 0 && held >= bet + extraNeeded;
       const settled = services.casino.settleSolo(uid, "チンチロ", bet, 0, { operationId, reservationKey });
       if (doubleLoss) {
-        services.ether.transfer(uid, HOUSE_HOLDER, extraNeeded, { reason: "倍付け負けの追加徴収", game: "チンチロ" });
+        services.chips.transfer(uid, HOUSE_HOLDER, extraNeeded, { reason: "倍付け負けの追加徴収", game: "チンチロ" });
         return { branch: "double_loss", settled, amuletNote: settled.amuletNote ?? null, extra: extraNeeded };
       }
       return {
@@ -475,9 +475,9 @@ async function runRoundInner(
     .setTitle(title)
     .setColor(color)
     .setDescription([comparison, "", payoutText + extraNote, amuletNote].filter(Boolean).join("\n"))
-    .setFooter({ text: `所持: ${fmtEther(services.ether.balanceOf(uid))}` });
+    .setFooter({ text: `所持: ${fmtEther(services.chips.balanceOf(uid))}` });
 
-  const heldAfter = services.ether.balanceOf(uid);
+  const heldAfter = services.chips.balanceOf(uid);
   const min = MIN_BET;
   const max = Math.min(effectiveMaxBet(services, uid, "チンチロ"), heldAfter);
   const nextRow = new ActionRowBuilder<ButtonBuilder>().addComponents(

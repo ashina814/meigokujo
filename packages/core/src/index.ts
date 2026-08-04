@@ -155,23 +155,24 @@ export {
   type FiscalErrorCode,
 } from "./fiscal/service.js";
 export {
-  EtherExchange,
-  EtherError,
+  ChipLedger,
+  ChipLedgerError,
+  CHIP_ESCROW,
   ETHER_ESCROW,
   HOUSE_HOLDER,
-  POOL_SWEEP_REASON,
   ETHER_APPROVER,
   isPlayerHolder,
-  type EtherQuote,
-  type EtherErrorCode,
-  type EtherExchangeOptions,
+  type ChipQuote,
+  type ChipLedgerOptions,
+  type ChipLedgerErrorCode,
   type ChipMoveInfo,
-} from "./casino/exchange.js";
+} from "./casino/chip-ledger.js";
 export {
   ChipTx,
   ChipTxError,
   CHIP_OPENING_VERSION_KEY,
   LEGACY_OPENING_VERSION,
+  FORMAL_OPENING_VERSION,
   type ChipTxKind,
   type ChipMove,
   type ChipGroupInput,
@@ -179,6 +180,7 @@ export {
   type ChipTxRow,
   type ChipBalanceMismatch,
   type ChipTxErrorCode,
+  type OpeningPhase,
 } from "./casino/chip-tx.js";
 export {
   Casino,

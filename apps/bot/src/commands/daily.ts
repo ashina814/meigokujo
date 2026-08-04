@@ -61,7 +61,7 @@ export async function handleDailyCommand(
         inline: false,
       },
     )
-    .setFooter({ text: `所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")} · 次は 24 時間後` });
+    .setFooter({ text: `所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" ◈", "◈")} · 次は 24 時間後` });
 
   await interaction.reply({ embeds: [embed] });
 }

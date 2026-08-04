@@ -1,9 +1,8 @@
 import type Database from "better-sqlite3";
 import { Ledger, TREASURY } from "../ledger/service.js";
-import { ChipTx } from "./chip-tx.js";
-import { ETHER_ESCROW, ETHER_APPROVER, EtherExchange, POOL_SWEEP_REASON } from "./exchange.js";
+import { ChipTx, LEGACY_OPENING_VERSION, FORMAL_OPENING_VERSION } from "./chip-tx.js";
+import { ETHER_APPROVER, ChipLedger, HOUSE_HOLDER, POOL_SWEEP_REASON } from "./chip-ledger.js";
 import { Escrow, ESCROW_QUARANTINE } from "./escrow.js";
-import { HOUSE_HOLDER } from "./exchange.js";
 import { JACKPOT_HOLDER, RELIEF_HOLDER } from "./service.js";
 import { FREE_SPIN_JACKPOT_CLAIMS_HOLDER } from "./free-spins.js";
 
@@ -74,8 +73,25 @@ const SYSTEM_HOLDERS: ReadonlySet<string> = new Set([
 const MAX_MISMATCHES = 20;
 
 /**
- * 準備口座(sys:escrow:ether)を動かしてよい Land 取引の型と形。
- * `EtherExchange` が作る取引はこの表に必ず載る。載らない出入りは1件でも検算Bを NG にする。
+ * 準備口座を動かしてよい Land 取引の型と形（PR8監査・ブロッカーD / 再監査ブロッカー2）。
+ *
+ * **取引型は版で完全に分離する**。両方の版で同じ型を許すと、片方の窓に本来
+ * 存在しえない取引が紛れ込んでも監査が通ってしまう。
+ *
+ * ```text
+ * legacy_pre_reset  許可: ether_buy / ether_house_fund / ether_sell / ether_settle / ether_burn
+ *                   拒否: chip_deposit / chip_fund / chip_redeem / chip_settle
+ * opening_v1        許可: chip_deposit / chip_fund / chip_redeem / chip_settle
+ *                   拒否: ether_buy / ether_house_fund / ether_sell / ether_settle / ether_burn
+ * 未知版            すべて拒否（checkB が版の時点で落ちる）
+ * ```
+ *
+ * `ether_*` は PR8 以前（ChipLedger 導入前）の旧 EtherExchange が作った**純粋な歴史データ**で、
+ * 新規に作られる経路は無い。`chip_*` は正式開業後の新しい資金操作だけが作る。
+ * 正式開業前は資金操作そのものを core 層で停止しているので、legacy の窓に `chip_*` が
+ * 存在すること自体があってはならない——明細がどれだけ整合していても許可しない。
+ *
+ * 版が合わない取引は `tx_type_not_allowed_for_version:<type>` として理由を残す。
  */
 interface PoolTxRule {
   /** 準備口座から見た向き */
@@ -86,10 +102,15 @@ interface PoolTxRule {
   actor?: string;
   /** 冪等キーの末尾（chip グループ名に付く接尾辞） */
   keySuffix?: ":burn" | ":sweep";
-  /** 焼却・回収は理由文まで固定する */
+  /** 理由文の制約（旧焼却・端数回収の識別に使う） */
   reason?: string;
 }
-const POOL_TX_RULES: Record<string, PoolTxRule[]> = {
+
+/**
+ * legacy_pre_reset の窓でだけ許可する**歴史専用**の旧 EtherExchange 取引型。
+ * これらは PR8 以降、新規に作られることが無い（作る経路が存在しない）。
+ */
+const LEGACY_ETHER_TX_RULES: Record<string, PoolTxRule[]> = {
   // 入場（利用者が Land を払ってチップを買う）
   ether_buy: [{ direction: "in", counterparty: "user" }],
   // 胴元の元手（部署 → 準備口座）
@@ -98,12 +119,76 @@ const POOL_TX_RULES: Record<string, PoolTxRule[]> = {
   ether_sell: [{ direction: "out", counterparty: "user" }],
   // 収益精算（準備口座 → 部署などのシステム口座）
   ether_settle: [{ direction: "out", counterparty: "system" }],
-  // 奉納の焼却と、全額返還後の端数回収。どちらも国庫行きで理由文が固定
+  // 旧制度の奉納・端数回収。履歴監査のため正当な旧取引として残す。
+  // `:sweep` は端数回収固有の理由文（POOL_SWEEP_REASON）を必須にする（PR8監査・復元）。
   ether_burn: [
     { direction: "out", counterparty: "treasury", keySuffix: ":burn" },
     { direction: "out", counterparty: "treasury", keySuffix: ":sweep", reason: POOL_SWEEP_REASON },
   ],
 };
+
+/**
+ * `chip_*` Land 取引の**正本の形**（PR8監査・再監査ブロッカー3）。
+ *
+ * Land 取引・`casino_tx` 明細・`casino_tx_groups` の三者が、同じ 1 つの業務操作を
+ * 指していることを取引型ごとに固定する。金額と holder だけを見ていると、
+ * 「別人が別の理由で作った同額の取引」を正規の預入として通してしまう。
+ */
+interface ChipPoolTxRule {
+  /** 準備口座から見た向き */
+  direction: "in" | "out";
+  /** 相手口座の形（`user:<ref_id>` か、国庫以外のシステム口座か） */
+  counterparty: "user" | "system";
+  /** Land 取引の理由文（完全一致） */
+  reason: string;
+  /** `casino_tx_groups.kind` の期待値 */
+  groupKind: "deposit" | "redeem";
+  /** `casino_tx.tx_kind` の期待値 */
+  chipTxKind: "deposit" | "redeem";
+  /** `ref_id` が現れる holder 側 */
+  holderSide: "to" | "from";
+  /**
+   * Land 取引の実行者に対する制約。
+   *
+   * - `"user"` … `user:<ref_id>` 自身しか実行できない（本人の預入・返還）
+   * - `"approver"` … `system:ether` 固定（運営の元手投入）
+   * - `"any"` … 誰が実行してもよい（売上精算は運営の誰でも起票しうる）。
+   *   ただしこの場合も、Land・明細・グループの三者が**同じ actor を名乗る**ことは必須。
+   */
+  actor: "user" | "approver" | "any";
+}
+
+const CHIP_POOL_TX_RULES: Record<string, ChipPoolTxRule> = {
+  // 利用者の預入: user:<ref_id> → 準備口座
+  chip_deposit: {
+    direction: "in", counterparty: "user", reason: "賭場チップ預入",
+    groupKind: "deposit", chipTxKind: "deposit", holderSide: "to", actor: "user",
+  },
+  // 利用者の返還: 準備口座 → user:<ref_id>
+  chip_redeem: {
+    direction: "out", counterparty: "user", reason: "賭場チップ返還",
+    groupKind: "redeem", chipTxKind: "redeem", holderSide: "from", actor: "user",
+  },
+  // 胴元の元手: システム口座（部署など） → 準備口座
+  chip_fund: {
+    direction: "in", counterparty: "system", reason: "胴元の元手",
+    groupKind: "deposit", chipTxKind: "deposit", holderSide: "to", actor: "approver",
+  },
+  // 売上精算: 準備口座 → システム口座（部署など）
+  chip_settle: {
+    direction: "out", counterparty: "system", reason: "賭場収益の精算",
+    groupKind: "redeem", chipTxKind: "redeem", holderSide: "from", actor: "any",
+  },
+};
+
+type OpeningVersionKind = "legacy" | "formal" | "unknown";
+
+/** fail-closed（PR8監査・ブロッカーC/D）。既知の2版との厳密一致でしか分類しない。 */
+function classifyOpeningVersion(version: string): OpeningVersionKind {
+  if (version === LEGACY_OPENING_VERSION) return "legacy";
+  if (version === FORMAL_OPENING_VERSION) return "formal";
+  return "unknown";
+}
 
 interface PoolTxRow {
   id: number;
@@ -114,6 +199,28 @@ interface PoolTxRow {
   type: string;
   reason: string | null;
   actor_id: string;
+  ref_type: string | null;
+  ref_id: string | null;
+  approved_by: string | null;
+}
+
+interface ChipTxDetailRow {
+  group_key: string;
+  tx_kind: string;
+  from_holder: string | null;
+  to_holder: string | null;
+  amount: number;
+  land_amount: number | null;
+  ledger_tx_id: number | null;
+  opening_version: string;
+  actor_id: string;
+}
+
+interface ChipGroupAuditRow {
+  group_key: string;
+  kind: string;
+  actor_id: string;
+  status: string;
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -124,7 +231,7 @@ export class CasinoIntegrity {
   constructor(
     private readonly db: Database.Database,
     private readonly ledger: Ledger,
-    private readonly ether: EtherExchange,
+    private readonly ether: ChipLedger,
     private readonly escrow: Escrow,
   ) {
     this.chipTx = ether.chipTx;
@@ -223,6 +330,20 @@ export class CasinoIntegrity {
    */
   checkB(): CasinoCheckResult {
     const version = this.chipTx.currentVersion();
+    const kind = classifyOpeningVersion(version);
+
+    // **fail-closed**（PR8監査・ブロッカーC）。未知版では準備口座そのものが決まらないので、
+    // 「正常」と誤認させず、ここで明確に検算Bを落とす（`reserveHolder()`の例外に頼らない）。
+    if (kind === "unknown") {
+      return {
+        id: "B",
+        name: "チップの裏付け",
+        ok: false,
+        detail: `未知のopening_version「${version}」。準備口座を決定できないため検算不能`,
+        mismatches: [{ subject: version, expected: 0, actual: 0, note: "unknown_opening_version" }],
+      };
+    }
+
     const baseline = this.chipTx.openingLandBaseline(version);
     if (!baseline) {
       return {
@@ -240,20 +361,32 @@ export class CasinoIntegrity {
     let inflow = 0;
     let outflow = 0;
     for (const row of rows) {
-      const problem = this.classifyPoolTx(row, version);
+      const problem = this.classifyPoolTxRow(row, version, kind);
       if (problem) {
         mismatches.push({ subject: `tx#${row.id}`, expected: 0, actual: row.amount, note: problem });
         continue;
       }
-      if (row.to_account === ETHER_ESCROW) inflow += row.amount;
+      if (row.to_account === this.ether.reserveHolder()) inflow += row.amount;
       else outflow += row.amount;
     }
 
     const actual = this.ether.pool();
     const expected = baseline.poolLand + inflow - outflow;
     if (expected !== actual) {
-      mismatches.push({ subject: ETHER_ESCROW, expected, actual, note: "balance_mismatch" });
+      mismatches.push({ subject: this.ether.reserveHolder(), expected, actual, note: "balance_mismatch" });
     }
+
+    // **100%準備の直接検算**（PR8監査・ブロッカーF）。opening_v1 では「準備Land ==
+    // 発行済み全chip」が不変条件。上のA〜Cの経路監査が正しくても、この等式を
+    // 直接照合しない限り「経路は正しいのに総量がずれている」を見逃しうる。
+    // legacy_pre_reset は旧変動レート制度なのでこの1:1照合は適用しない。
+    if (kind === "formal") {
+      const outstanding = this.ether.outstanding();
+      if (actual !== outstanding) {
+        mismatches.push({ subject: "100%準備", expected: outstanding, actual, note: "reserve_not_fully_backed" });
+      }
+    }
+
     const ok = mismatches.length === 0;
     return {
       id: "B",
@@ -267,32 +400,58 @@ export class CasinoIntegrity {
   }
 
   private describeBFailure(mismatches: CasinoCheckMismatch[]): string {
-    const unknown = mismatches.filter((m) => m.note !== "balance_mismatch" && m.note !== "baseline_missing");
+    const unknown = mismatches.filter(
+      (m) => m.note !== "balance_mismatch" && m.note !== "baseline_missing" && m.note !== "reserve_not_fully_backed",
+    );
     const balance = mismatches.find((m) => m.note === "balance_mismatch");
+    const reserve = mismatches.find((m) => m.note === "reserve_not_fully_backed");
     const parts: string[] = [];
     if (unknown.length > 0) parts.push(`説明できない準備口座の取引 ${unknown.length}件（${unknown[0]!.subject}: ${unknown[0]!.note}）`);
     if (balance) parts.push(`準備プールが経路と ${(balance.actual - balance.expected).toLocaleString()} Ld ずれている`);
+    if (reserve) parts.push(`準備Land ${reserve.actual.toLocaleString()} と発行済み全chip ${reserve.expected.toLocaleString()} が一致しない`);
     return parts.join(" / ");
   }
 
   /** 版の窓に属する準備口座の出入り（境界の取引IDより後、次の版の境界まで） */
   private poolTransactions(fromLedgerTxId: number, upperBound: number | null): PoolTxRow[] {
     const sql =
-      `SELECT id, idempotency_key, from_account, to_account, amount, type, reason, actor_id
+      `SELECT id, idempotency_key, from_account, to_account, amount, type, reason, actor_id, ref_type, ref_id, approved_by
          FROM transactions
         WHERE (from_account = ? OR to_account = ?) AND id > ?` +
       (upperBound === null ? "" : " AND id <= ?") +
       " ORDER BY id";
-    const params: unknown[] = [ETHER_ESCROW, ETHER_ESCROW, fromLedgerTxId];
+    const reserve = this.ether.reserveHolder();
+    const params: unknown[] = [reserve, reserve, fromLedgerTxId];
     if (upperBound !== null) params.push(upperBound);
     return this.db.prepare(sql).all(...params) as PoolTxRow[];
   }
 
-  /** 1件の準備口座取引を検査する。問題なければ null、あれば理由コードを返す */
-  private classifyPoolTx(row: PoolTxRow, version: string): string | null {
-    const rules = POOL_TX_RULES[row.type];
-    if (!rules) return `unknown_type:${row.type}`;
-    const direction: "in" | "out" = row.to_account === ETHER_ESCROW ? "in" : "out";
+  /**
+   * 1件の準備口座取引を、**版ごとの許可型**で振り分けて検査する
+   * （PR8監査・ブロッカーD / 再監査ブロッカー2）。
+   *
+   * - `legacy_pre_reset`: `ether_*` だけ。`chip_*` は明細が完璧でも拒否する
+   *   （正式開業前は資金操作そのものを止めている＝存在してはいけない取引）。
+   * - `opening_v1`: `chip_*` だけ。`ether_*` は拒否する（新規に作られる経路が無い）。
+   * - それ以外の型: 常に不許可。
+   */
+  private classifyPoolTxRow(row: PoolTxRow, version: string, kind: "legacy" | "formal"): string | null {
+    if (row.type.startsWith("chip_")) {
+      if (kind !== "formal") return `tx_type_not_allowed_for_version:${row.type}`;
+      return this.classifyChipPoolTx(row, version);
+    }
+    if (row.type.startsWith("ether_")) {
+      if (kind !== "legacy") return `tx_type_not_allowed_for_version:${row.type}`;
+      return this.classifyLegacyEtherPoolTx(row, version);
+    }
+    return `tx_type_not_allowed_for_version:${row.type}`;
+  }
+
+  /** legacy_pre_reset専用の歴史的 ether_* 取引を検査する。問題なければ null */
+  private classifyLegacyEtherPoolTx(row: PoolTxRow, version: string): string | null {
+    const rules = LEGACY_ETHER_TX_RULES[row.type];
+    if (!rules) return `tx_type_not_allowed_for_version:${row.type}`;
+    const direction: "in" | "out" = row.to_account === this.ether.reserveHolder() ? "in" : "out";
     // 準備口座から準備口座への自己送金は Ledger 側が弾くが、念のため
     if (row.from_account === row.to_account) return "self_transfer";
 
@@ -336,6 +495,82 @@ export class CasinoIntegrity {
       .prepare("SELECT COUNT(*) AS c FROM casino_tx WHERE group_key = ? AND opening_version = ?")
       .get(groupKey, version) as { c: number };
     return row.c > 0;
+  }
+
+  /**
+   * `chip_*` 取引を検査する（PR8監査・ブロッカーE / 再監査ブロッカー3）。
+   * ここへ来るのは `opening_v1` の窓だけ（版の分離は `classifyPoolTxRow` が済ませている）。
+   *
+   * 「同じ group に何か明細がある」「金額が合っている」だけでは通さない。
+   * Land 取引 (`transactions`) ・チップ明細 (`casino_tx`) ・業務グループ
+   * (`casino_tx_groups`) の**三者が同じ 1 つの業務操作を指している**ことまで確かめる:
+   *
+   * - `ledger_tx_id` で明細を 1 件だけ特定する（0件・複数件はどちらも NG）
+   * - group key / opening_version / tx_kind / chip 額 / land 額 / holder が一致する
+   * - グループの kind が取引型の期待値と一致し、status が `settled` である
+   * - 理由文が正本と完全一致する（理由を書き換えた手動取引を通さない）
+   * - **actor が三者で一致する**。加えて預入・返還は `user:<ref_id>` 本人、
+   *   元手投入は `system:ether` 固定であることを要求する
+   *
+   * 金額と holder だけを見ていると、別人が別の理由で作った同額の取引を
+   * 正規の預入として通してしまう。
+   */
+  private classifyChipPoolTx(row: PoolTxRow, version: string): string | null {
+    const rule = CHIP_POOL_TX_RULES[row.type];
+    if (!rule) return `tx_type_not_allowed_for_version:${row.type}`;
+
+    // ── Land 取引そのものの形 ──
+    if (row.from_account === row.to_account) return "self_transfer";
+    const direction: "in" | "out" = row.to_account === this.ether.reserveHolder() ? "in" : "out";
+    if (direction !== rule.direction) return `wrong_direction:${row.type}`;
+
+    const other = direction === "in" ? row.from_account : row.to_account;
+    if (rule.counterparty === "user" && !other.startsWith("user:")) return `wrong_counterparty:${other}`;
+    if (rule.counterparty === "system" && (!other.startsWith("sys:") || other === TREASURY)) {
+      return `wrong_counterparty:${other}`;
+    }
+    if (row.approved_by !== ETHER_APPROVER) return "wrong_approver";
+    if (row.ref_type !== "casino_chip") return "wrong_ref_type";
+    if (!row.ref_id || !row.ref_id.trim()) return "missing_ref_id";
+    if (row.reason !== rule.reason) return "wrong_reason";
+    // 相手が利用者なら、その口座は ref_id 本人でなければならない
+    if (rule.counterparty === "user" && other !== `user:${row.ref_id}`) return `wrong_counterparty:${other}`;
+    if (rule.actor === "approver" && row.actor_id !== ETHER_APPROVER) return `wrong_actor:${row.actor_id}`;
+    if (rule.actor === "user" && row.actor_id !== `user:${row.ref_id}`) return `wrong_actor:${row.actor_id}`;
+
+    // ── チップ明細（1件だけ特定する） ──
+    // internal_transfer は ledger_tx_id を持たない（casino_tx の CHECK 制約）ので、
+    // 同 group の無関係な内部移動はここで自然に除外される。
+    const details = this.db
+      .prepare(
+        `SELECT group_key, tx_kind, from_holder, to_holder, amount, land_amount, ledger_tx_id, opening_version, actor_id
+           FROM casino_tx WHERE ledger_tx_id = ?`,
+      )
+      .all(row.id) as ChipTxDetailRow[];
+    if (details.length === 0) return "no_matching_chip_tx";
+    if (details.length > 1) return "multiple_matching_chip_tx";
+    const detail = details[0]!;
+
+    if (detail.group_key !== row.idempotency_key) return "group_key_mismatch";
+    if (detail.opening_version !== version) return "chip_tx_version_mismatch";
+    if (detail.tx_kind !== rule.chipTxKind) return "tx_kind_mismatch";
+    if (detail.land_amount !== row.amount) return "land_amount_mismatch";
+    if (detail.amount !== row.amount) return "chip_amount_mismatch";
+    if (detail.actor_id !== row.actor_id) return "chip_tx_actor_mismatch";
+
+    const holder = rule.holderSide === "to" ? detail.to_holder : detail.from_holder;
+    if (holder !== row.ref_id) return "holder_mismatch";
+
+    // ── 業務グループ ──
+    const group = this.db
+      .prepare("SELECT group_key, kind, actor_id, status FROM casino_tx_groups WHERE group_key = ?")
+      .get(row.idempotency_key) as ChipGroupAuditRow | undefined;
+    if (!group) return "no_chip_group";
+    if (group.status !== "settled") return `group_not_settled:${group.status}`;
+    if (group.kind !== rule.groupKind) return "group_kind_mismatch";
+    if (group.actor_id !== row.actor_id) return "group_actor_mismatch";
+
+    return null;
   }
 
   // ── C: 預託 ────────────────────────────────────────────

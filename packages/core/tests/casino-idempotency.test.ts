@@ -4,7 +4,7 @@ import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
 import { Casino, JACKPOT_HOLDER } from "../src/casino/service.js";
-import { EtherExchange, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { Escrow } from "../src/casino/escrow.js";
 import { Items } from "../src/casino/items.js";
 import { Markets } from "../src/casino/market.js";
@@ -12,7 +12,7 @@ import { Stocks } from "../src/casino/stocks.js";
 import { ChipTx } from "../src/casino/chip-tx.js";
 import { deterministicRng } from "../src/casino/rng.js";
 import { deptAccount } from "../src/departments/service.js";
-import { testTransfer, opId } from "./helpers/chip-ctx.js";
+import { testTransfer, opId , openFormally} from "./helpers/chip-ctx.js";
 
 registerDefaultTxTypes();
 
@@ -30,7 +30,9 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  openFormally(ether.chipTx, ledger);
   const items = new Items(db);
   const casino = new Casino(db, ether, events, { items });
   const escrow = new Escrow(db, ether, events);
@@ -52,7 +54,7 @@ function fundUser(ctx: ReturnType<typeof setup>, userId: string, land: number): 
     from: TREASURY, to: `user:${userId}`, amount: land, type: "initial", actor: "t",
     idempotencyKey: `seed:user:${userId}`,
   });
-  ctx.ether.buy(userId, land, `buy:${userId}`);
+  ctx.ether.deposit(userId, land, `buy:${userId}`);
 }
 
 describe("お守りの消費は精算と同じグループ", () => {

@@ -3,7 +3,7 @@ import {
   Casino,
   ChipTx,
   Escrow,
-  EtherExchange,
+  ChipLedger,
   EventLog,
   HOUSE_HOLDER,
   FreeSpins,
@@ -15,6 +15,8 @@ import {
   registerDefaultTxTypes,
   scriptedRng,
   type CasinoRng,
+  FORMAL_OPENING_VERSION,
+  CHIP_ESCROW,
 } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 import { resolveFreeSpin, spinPaid } from "../src/casino/slots.js";
@@ -35,14 +37,16 @@ function setup(rng: CasinoRng) {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  chipTx.captureOpening(FORMAL_OPENING_VERSION, [], { poolLand: ledger.balanceOf(CHIP_ESCROW), fromLedgerTxId: ledger.lastTransactionId() });
   const items = new Items(db);
   const reservations = new HouseReservations(db, ether, events);
   ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
   const casino = new Casino(db, ether, events, { items, reservations });
   const escrow = new Escrow(db, ether, events);
   const freeSpins = new FreeSpins(db);
-  const services = { db, ether, casino, items, escrow, freeSpins, reservations, rng, events } as unknown as Services;
+  const services = { db, ether, chips: ether, chipTx, casino, items, escrow, freeSpins, reservations, rng, events } as unknown as Services;
   return { db, chipTx, ether, casino, items, escrow, freeSpins, reservations, services };
 }
 

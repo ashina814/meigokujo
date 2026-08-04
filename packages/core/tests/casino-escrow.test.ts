@@ -1,10 +1,10 @@
-import { testTransfer, opId } from "./helpers/chip-ctx.js";
+import { testTransfer, opId , openFormally} from "./helpers/chip-ctx.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { EtherExchange, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { ChipTx } from "../src/casino/chip-tx.js";
 import { Casino } from "../src/casino/service.js";
 import { Escrow, escrowHolderFor, ESCROW_QUARANTINE } from "../src/casino/escrow.js";
@@ -27,7 +27,9 @@ registerDefaultTxTypes();
 function setup() {
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
-  const ether = new EtherExchange(db, ledger, new EventLog(db));
+  const ether = new ChipLedger(db, ledger, new EventLog(db));
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  openFormally(ether.chipTx, ledger);
   const casino = new Casino(db, ether, new EventLog(db));
   const escrow = new Escrow(db, ether, new EventLog(db));
   const markets = new Markets(db, ether, new EventLog(db));
@@ -40,7 +42,7 @@ function setup() {
   for (const uid of ["a", "b"]) {
     ledger.ensureAccount(`user:${uid}`, "user");
     ledger.transfer({ from: TREASURY, to: `user:${uid}`, amount: 10_000, type: "initial", actor: "t", idempotencyKey: `seed:${uid}` });
-    ether.buy(uid, 10_000, `seed:buy:${uid}`);
+    ether.deposit(uid, 10_000, `seed:buy:${uid}`);
   }
   return { db, ledger, ether, casino, escrow, markets };
 }
@@ -613,7 +615,9 @@ describe("onPlayerNet は確定精算のときだけ呼ばれる", () => {
     const ledger = new Ledger(db);
     const events = new EventLog(db);
     const chipTx = new ChipTx(db);
-    const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+    const ether = new ChipLedger(db, ledger, events, { chipTx });
+    // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+    openFormally(ether.chipTx, ledger);
     const calls: Array<{ userId: string; net: number }> = [];
     const escrow = new Escrow(db, ether, events, {
       onPlayerNet: (userId, net) => calls.push({ userId, net }),

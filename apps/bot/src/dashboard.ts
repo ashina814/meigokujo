@@ -1,5 +1,6 @@
 import { EmbedBuilder, type Client, type TextChannel } from "discord.js";
 import { fmtLd } from "./format.js";
+import { openingBadge } from "./casino/opening.js";
 import type { Services } from "./services.js";
 
 const TREASURY = "sys:treasury";
@@ -237,7 +238,7 @@ export function getEconomyHealthSummary(services: Services): EconomyHealthSummar
     frozenMarketCount,
     unsettledMarketCount,
     unknownFundModeCount,
-    quarantineBalance: services.ether.balanceOf(ESCROW_QUARANTINE),
+    quarantineBalance: services.chips.balanceOf(ESCROW_QUARANTINE),
     activeLegacyHouseMarketCount,
   };
 }
@@ -376,10 +377,12 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
   const fmtE = (n: number) => `${n.toLocaleString("ja-JP")}◈`;
   const housePool = services.casino.houseBalance();
   const jpPool = services.casino.jackpotPool();
-  const reliefPool = services.ether.balanceOf("relief");
-  const etherOutstanding = services.ether.outstanding();
-  const reservePool = services.ether.pool();
-  const etherRate = services.ether.rate();
+  const reliefPool = services.chips.balanceOf("relief");
+  const etherOutstanding = services.chips.outstanding();
+  // 未知版では準備口座が決まらず `pool()` が例外になる。計器盤ごと落とすと
+  // 「異常であること」すら見えなくなるので、読めない事実として表示する（PR8監査・項目8）
+  const openingPhaseNow = services.chipTx.openingPhase();
+  const reservePool = openingPhaseNow === "unknown" ? null : services.chips.pool();
   const escrowRows = services.db.prepare("SELECT COALESCE(SUM(amount),0) AS s, COUNT(*) AS c FROM casino_escrow").get() as { s: number; c: number };
   // 稼働状態と検算A〜D（PR2）。停止していれば理由をそのまま出す
   const casinoStatus = services.casinoStatus.current();
@@ -388,11 +391,17 @@ export function buildDashboardEmbed(services: Services): EmbedBuilder {
   const failedChecks = integrity.checks.filter((c) => !c.ok);
   const casinoField = [
     `稼働: ${CASINO_STATUS_LABEL[casinoStatus.status] ?? casinoStatus.status}${casinoStatus.status === "open" ? "" : `（${casinoStatus.reason}）`}`,
+    // 稼働が open でも、正式開業初期化が終わるまで資金は動かない（PR8監査・項目8）
+    `開業: ${openingBadge(services)}`,
     integrity.ok
       ? "全点検（Land台帳 + 検算A〜D）: 正常"
       : `⚠️ 点検NG: ${[...(integrity.ledger.ok ? [] : ["Land台帳"]), ...failedChecks.map((c) => `${c.id}(${c.name})`)].join(" / ")}`,
     `胴元: **${fmtE(housePool)}** / JP: ${fmtE(jpPool)} / 救済: ${fmtE(reliefPool)}`,
-    `発行エテル: ${fmtE(etherOutstanding)} ⇄ 準備Land: ${fmtLd(reservePool)}（1Ld=${etherRate.toFixed(2)}◈）`,
+    reservePool === null
+      ? `発行チップ: ${fmtE(etherOutstanding)} ⇄ 準備Land: 読み取り不可（版が異常）`
+      : openingPhaseNow === "formal"
+        ? `発行チップ: ${fmtE(etherOutstanding)} ⇄ 準備Land: ${fmtLd(reservePool)}（1Ld=1◈）`
+        : `発行チップ: ${fmtE(etherOutstanding)} ⇄ 準備Land: ${fmtLd(reservePool)}（1:1交換は opening_v1 確定後）`,
     escrowRows.c > 0 ? `進行中の卓の預かり: ${fmtE(escrowRows.s)}（${escrowRows.c}口）` : "進行中の卓の預かり: なし",
   ].join("\n");
 

@@ -44,7 +44,7 @@ export async function playSashi(
     await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
     return;
   }
-  if (services.ether.balanceOf(challenger.id) < bet || services.ether.balanceOf(opponent.id) < bet) {
+  if (services.chips.balanceOf(challenger.id) < bet || services.chips.balanceOf(opponent.id) < bet) {
     await interaction.reply({ content: "どちらかのエテル残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }

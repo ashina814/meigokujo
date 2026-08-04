@@ -8,10 +8,12 @@ import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { EtherExchange, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { JACKPOT_HOLDER } from "../src/casino/service.js";
 import { ChipTx } from "../src/casino/chip-tx.js";
 import { deptAccount } from "../src/departments/service.js";
+
+import { openFormally } from "./helpers/chip-ctx.js";
 
 registerDefaultTxTypes();
 
@@ -20,7 +22,7 @@ registerDefaultTxTypes();
  *
  * 同じプロセス・同じ接続で繰り返し呼ぶだけでは、better-sqlite3 は同期なので実質直列になり、
  * 「同時に叩かれたらどうなるか」を確かめたことにならない。ここでは一時ファイルDBに対して
- * **別プロセスから本番コード（openDb / ChipTx / EtherExchange.runGroup）** を同じ瞬間に走らせる。
+ * **別プロセスから本番コード（openDb / ChipTx / ChipLedger.runGroup）** を同じ瞬間に走らせる。
  */
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -39,7 +41,9 @@ function setupFileDb() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchange(db, ledger, events, { baseRate: 1, chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  openFormally(ether.chipTx, ledger);
 
   ledger.ensureAccount(deptAccount("賭博場"), "system");
   ledger.transfer({
