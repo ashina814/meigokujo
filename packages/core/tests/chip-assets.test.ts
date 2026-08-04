@@ -97,6 +97,15 @@ function full(path = ":memory:") {
   // 本番servicesと同じ順番で、各モジュール固有schemaを作成する。
   new Escrow(db, chips, events);
   new Markets(db, chips, events);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS casino_house_reservations (
+      key TEXT PRIMARY KEY,
+      amount INTEGER NOT NULL CHECK(amount > 0),
+      game TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+  `);
   ledger.ensureAccount("user:alice", "user");
   ledger.ensureAccount("user:bob", "user");
   for (const userId of ["alice", "bob"]) {
