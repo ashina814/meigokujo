@@ -18,6 +18,7 @@ export interface RedeemResult {
   redeemed: number;
   land: number;
   reason: string;
+  skipped?: "active_ownership";
 }
 
 export interface InactiveRedeemResult {
