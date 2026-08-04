@@ -11,6 +11,7 @@ import {
   Items,
   JACKPOT_HOLDER,
   Ledger,
+  chinchiroMaxPlayerLoss,
   openDb,
   registerDefaultTxTypes,
   scriptedRng,
@@ -20,7 +21,7 @@ import {
 } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 import { resolveFreeSpin, spinPaid } from "../src/casino/slots.js";
-import { settleChinchiroRound } from "../src/casino/chinchiro.js";
+import { chinchiroPreholdSessionId, settleChinchiroRound } from "../src/casino/chinchiro.js";
 import { settleRoulette } from "../src/casino/roulette.js";
 import { drawNagareboshi, ensureNagareboshiTable } from "../src/commands/nagareboshi.js";
 
@@ -55,6 +56,19 @@ function seedBalance(db: ReturnType<typeof openDb>, holder: string, amount: numb
   db.prepare(
     "INSERT INTO ether_balances (user_id, amount, updated_at) VALUES (?, ?, 1) ON CONFLICT(user_id) DO UPDATE SET amount = excluded.amount",
   ).run(holder, amount);
+}
+
+/**
+ * `runRound()` が本番で行う「乱数より前に最大損失 2×bet を預ける」を、
+ * settle 直接呼び出しのテストでも下ごしらえとして再現する（PR11）。
+ */
+function preholdChinchiro(ctx: ReturnType<typeof setup>, uid: string, bet: number, operationId: string): string {
+  const sessionId = chinchiroPreholdSessionId(uid, operationId);
+  const preheld = chinchiroMaxPlayerLoss(bet);
+  if (!ctx.escrow.hold(sessionId, uid, preheld, "チンチロ", operationId)) {
+    throw new Error("test setup: チンチロ事前預託に失敗");
+  }
+  return sessionId;
 }
 
 /**
@@ -112,33 +126,39 @@ describe("スロット: 通常スピンとフリースピンは別のグルー�
   });
 });
 
-describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
-  it("所持額が倍付け損失ちょうどでも、二度実行して減るのは1回分だけ", () => {
+describe("チンチロ: 全分岐が同じラウンドのグループ（PR11: 事前預託2×bet）", () => {
+  it("所持額が事前預託ちょうどでも、二度実行して減るのは1回分だけ", () => {
     const ctx = setup(scriptedRng([0.5]));
     seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
-    seedBalance(ctx.db, "u1", 2_000); // bet 1,000 + 追加徴収 1,000 ちょうど
+    seedBalance(ctx.db, "u1", 2_000); // bet 1,000 の 2倍 = 事前預託ちょうど
+    preholdChinchiro(ctx, "u1", 1_000, "op-1");
+    expect(ctx.ether.balanceOf("u1")).toBe(0);
 
     const first = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
     expect(first.branch).toBe("double_loss");
     expect(ctx.ether.balanceOf("u1")).toBe(0);
 
-    // 残高が0でも、同じ操作の再試行は倍付け負けの結果をそのまま返す
+    // 同じ操作の再試行は倍付け負けの結果をそのまま返す
     // （通常負け側へ回って別グループでもう一度徴収する、が起きない）
     const second = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
     expect(second).toEqual(first);
     expect(ctx.ether.balanceOf("u1")).toBe(0);
+    // 事前預託（"卓への預託"）は runRound 側の別グループで既に確定済み。
+    // 精算グループにはここから先の資金移動だけが残る
     expect(ctx.chipTx.listByGroup("chinchiro:round:u1:op-1").map((r) => r.reason)).toEqual([
       "賭け金",
-      "倍付け負けの追加徴収",
+      "チンチロ倍付け負けの追加損失",
     ]);
     expect(ctx.chipTx.getGroup("solo:チンチロ:u1:op-1")).toBeUndefined();
     ctx.db.close();
   });
 
-  it("所持額が倍付け損失より少し上でも、二度実行して減るのは1回分だけ", () => {
+  it("事前預託を超える残りの所持額には触れない", () => {
     const ctx = setup(scriptedRng([0.5]));
     seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
     seedBalance(ctx.db, "u1", 2_500);
+    preholdChinchiro(ctx, "u1", 1_000, "op-1"); // 2,000だけ事前預託。500は手元に残る
+    expect(ctx.ether.balanceOf("u1")).toBe(500);
 
     const first = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
     expect(first.branch).toBe("double_loss");
@@ -150,17 +170,46 @@ describe("チンチロ: 全分岐が同じラウンドのグループ", () => {
     ctx.db.close();
   });
 
-  it("残高不足のフォールバックも同じグループで確定する", () => {
+  it("通常負けは必要額だけhouseへ、残額は利用者へ返す", () => {
     const ctx = setup(scriptedRng([0.5]));
     seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
-    seedBalance(ctx.db, "u1", 1_500); // 追加徴収 1,000 に足りない
+    seedBalance(ctx.db, "u1", 2_000);
+    preholdChinchiro(ctx, "u1", 1_000, "op-1");
 
-    const first = settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1");
-    expect(first.branch).toBe("fallback_loss");
-    expect(ctx.ether.balanceOf("u1")).toBe(500);
+    const round = settleChinchiroRound(ctx.services, "u1", 1_000, -1, "op-1");
+    expect(round.branch).toBe("loss");
+    expect(round.extra).toBe(0);
+    // 事前預託 2,000 のうち 1,000 が house へ、残り 1,000 が返る
+    expect(ctx.ether.balanceOf("u1")).toBe(1_000);
+    expect(ctx.ether.balanceOf(HOUSE_HOLDER)).toBe(1_001_000);
+    ctx.db.close();
+  });
 
-    expect(settleChinchiroRound(ctx.services, "u1", 1_000, -2, "op-1")).toEqual(first);
-    expect(ctx.ether.balanceOf("u1")).toBe(500);
+  it("勝ち・引分は事前預託が形を変えて全額戻る", () => {
+    const ctx = setup(scriptedRng([0.5]));
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    seedBalance(ctx.db, "u1", 2_000);
+    preholdChinchiro(ctx, "u1", 1_000, "op-push");
+    const push = settleChinchiroRound(ctx.services, "u1", 1_000, 0, "op-push");
+    expect(push.branch).toBe("push");
+    expect(ctx.ether.balanceOf("u1")).toBe(2_000); // 元金がそのまま戻る
+
+    seedBalance(ctx.db, "u2", 2_000);
+    preholdChinchiro(ctx, "u2", 1_000, "op-win");
+    const win = settleChinchiroRound(ctx.services, "u2", 1_000, 1, "op-win");
+    expect(win.branch).toBe("win");
+    expect(ctx.ether.balanceOf("u2")).toBe(2_000 - 1_000 + win.settled.payout);
+    ctx.db.close();
+  });
+
+  it("精算後は casino_escrow に記録を残さない", () => {
+    const ctx = setup(scriptedRng([0.5]));
+    seedBalance(ctx.db, HOUSE_HOLDER, 1_000_000);
+    seedBalance(ctx.db, "u1", 2_000);
+    const sessionId = preholdChinchiro(ctx, "u1", 1_000, "op-1");
+    settleChinchiroRound(ctx.services, "u1", 1_000, -1, "op-1");
+    expect(ctx.escrow.list(sessionId)).toEqual([]);
+    expect(ctx.ether.balanceOf(ctx.escrow.holderId(sessionId))).toBe(0);
     ctx.db.close();
   });
 });
