@@ -28,3 +28,20 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Typecheck
         run: pnpm typecheck
+      - name: Core PR10 targets
+        run: |
+          pnpm --filter @meigokujo/core exec vitest run \
+            tests/casino-chip-flow.test.ts \
+            tests/casino-chip-flow-rebuild.test.ts \
+            tests/casino-recovery-chip-flow.test.ts \
+            tests/casino-recovery.test.ts \
+            tests/casino-integrity-assets.test.ts \
+            tests/chip-assets-scope.test.ts \
+            tests/chip-assets-free-holder.test.ts
+      - name: Bot PR10 targets
+        run: |
+          pnpm --filter @meigokujo/bot exec vitest run \
+            tests/casino-auto-chip-flow.test.ts \
+            tests/casino-known-bugs.test.ts \
+            tests/casino-opening-reset.test.ts \
+            tests/casino-opening-ui.test.ts
