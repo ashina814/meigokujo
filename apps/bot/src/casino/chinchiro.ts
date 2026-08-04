@@ -16,6 +16,7 @@ import {
   CHINCHIRO_MAX_ROLLS,
   CHINCHIRO_WIN_MULT,
   HOUSE_HOLDER,
+  LedgerError,
   chinchiroCompare,
   chinchiroEvaluate,
   chinchiroIsTerminal,
@@ -136,7 +137,7 @@ export function settleChinchiroRound(
       const settled = services.casino.settleSolo(uid, "チンチロ", bet, rawPayout, {
         operationId,
         reservationKey,
-        preheld: { holderId: holder },
+        preheld: { sessionId },
       });
 
       // settle() が holder から house へ bet ぶんを動かした。残りの精算:
@@ -269,8 +270,17 @@ export function beginChinchiroPrehold(services: Services, uid: string, bet: numb
     // validateBet 自身の自動預入（bare な interaction.id）とは別の鍵にする必要があるので、
     // ":" ではなくハイフンで区切る
     services.chipFlow.ensureFreeChips(uid, preheld, `${operationId}-chinchiro-prehold`);
-  } catch {
-    throw new ChinchiroPreholdError("insufficient_funds");
+  } catch (error) {
+    // Land が本当に足りない場合だけ「insufficient_funds」にする（PR11 本監査）。
+    // 賭場停止（opening lock/ERR_CASINO_CLOSED）・冪等キーの衝突・postcondition失敗・
+    // 帳簿破損などを一律 insufficient_funds へ潰すと、利用者には的外れな「Landが足りない」
+    // が出て、運営からは実際の原因（停止中・鍵衝突・破損）が見えなくなる。
+    // それらは推測せずそのまま外へ出す（interactionCreate の共通catchがログと
+    // 汎用エラー応答を行う）。
+    if (error instanceof LedgerError && error.code === "ERR_INSUFFICIENT") {
+      throw new ChinchiroPreholdError("insufficient_funds");
+    }
+    throw error;
   }
   if (!services.escrow.hold(sessionId, uid, preheld, "チンチロ", operationId)) {
     throw new ChinchiroPreholdError("hold_failed");

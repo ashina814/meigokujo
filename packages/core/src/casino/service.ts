@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { ChipLedgerError, ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 import { ChipTxError } from "./chip-tx.js";
+import { escrowHolderFor } from "./escrow.js";
 import type { Items } from "./items.js";
 import type { HouseReservations } from "./reservations.js";
 
@@ -99,9 +100,15 @@ export function soloGroupKey(game: string, userId: string, operationId: string):
  * 事前預託の残額返還は `settle()` の外（呼び出し側の同じチップグループ内）で行う——
  * `Casino` が escrow の存在を知らなくて済むように、ここでは「徴収元を差し替える」
  * ことだけを担当する。連鎖・福の重み・戦績の計算式は一切変えない。
+ *
+ * **holderId を直接は受け取らない**（PR11 本監査・ブロッカー）。任意の文字列を
+ * 受け取ると、呼び出し側のバグ一つで house・他人の escrow セッションを徴収元に
+ * できてしまう。`sessionId` だけを受け取り、`settle()` 自身が
+ * `casino_escrow`（session_id, user_id）でその利用者への帰属を確認してから
+ * holder を導出する。
  */
 export interface PreheldWager {
-  holderId: string;
+  sessionId: string;
 }
 
 export interface SettleOptions {
@@ -270,19 +277,33 @@ export class Casino {
     const useFuku = opts.fuku ?? true;
     const move = { game, sessionId: null };
     // PR11: 徴収元は既定で利用者本人。preheld が渡されていれば、既に確保済みの
-    // holder から徴収する（利用者の残高を精算時点で読み直さない）。holder の残高が
-    // 呼び出し側の主張と食い違うなら、ここで即座に落として資金を動かさない。
-    const chargeFrom = opts.preheld?.holderId ?? userId;
-    if (opts.preheld) {
-      const held = this.ether.balanceOf(opts.preheld.holderId);
-      if (!Number.isSafeInteger(held) || held < bet) {
-        throw new Error(`preheld solo wager insufficient: holder=${opts.preheld.holderId} balance=${held} bet=${bet}`);
-      }
-    }
+    // holder（sessionId から導出）から徴収する。
+    const chargeFrom = opts.preheld ? escrowHolderFor(opts.preheld.sessionId) : userId;
     // 1ゲームの精算をひとまとまりの業務操作として記録する。`operationId` は
     // 「同じ操作の再試行なら同じ値になる」ものを呼び出し側が渡す（Discordの操作IDなど）
     const groupKey = soloGroupKey(game, userId, opts.operationId);
     return this.ether.runGroup({ groupKey, kind: "solo_game", actorId: userId }, (): SettleResult => {
+      // preheld の検証は **runGroup の中**で行う（PR11 本監査・ブロッカー）。
+      // 外に置くと、この保存済み結果を返すだけの再実行（グループは既に settled）でも
+      // 毎回このチェックが走ってしまい、精算後に holder 残高が変わっただけで
+      // 「同じ操作の再試行は保存済みの結果を返す」という全体の約束を破って落ちる。
+      if (opts.preheld) {
+        // 帰属確認: holderId を直接受け取らず、この session が本当にこの userId の
+        // ものだと casino_escrow 台帳で確認してから徴収する。確認しないと、
+        // 呼び出し側のバグ一つで他人の escrow・house 自身を徴収元にできてしまう。
+        const attribution = this.db
+          .prepare("SELECT 1 FROM casino_escrow WHERE session_id = ? AND user_id = ? LIMIT 1")
+          .get(opts.preheld.sessionId, userId);
+        if (!attribution) {
+          throw new Error(
+            `preheld solo wager not attributed to user: session=${opts.preheld.sessionId} user=${userId}`,
+          );
+        }
+        const held = this.ether.balanceOf(chargeFrom);
+        if (!Number.isSafeInteger(held) || held < bet) {
+          throw new Error(`preheld solo wager insufficient: holder=${chargeFrom} balance=${held} bet=${bet}`);
+        }
+      }
       // 徴収
       this.ether.transfer(chargeFrom, HOUSE_HOLDER, bet, { ...move, reason: "賭け金" });
       // 配当
