@@ -8,7 +8,7 @@ import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { ChipLedgerCore, HOUSE_HOLDER, ETHER_ESCROW, CHIP_ESCROW } from "../src/casino/exchange.js";
+import { ChipLedger, HOUSE_HOLDER, ETHER_ESCROW, CHIP_ESCROW } from "../src/casino/exchange.js";
 import { ChipTx, FORMAL_OPENING_VERSION } from "../src/casino/chip-tx.js";
 import { HouseReservations } from "../src/casino/reservations.js";
 import { deptAccount } from "../src/departments/service.js";
@@ -83,7 +83,7 @@ function setupOpenedDb(options: { userLand?: number; houseChips?: number } = {})
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const chips = new ChipLedgerCore(db, ledger, events, { chipTx });
+  const chips = new ChipLedger(db, ledger, events, { chipTx });
   const reservations = new HouseReservations(db, chips as never, events);
   chips.setReservedProvider((h) => (h === HOUSE_HOLDER ? reservations.totalReserved() : 0));
 
@@ -104,7 +104,7 @@ function assertFullyBacked(dbPath: string): { outstanding: number; pool: number 
   const db = openDb(dbPath);
   try {
     const chipTx = new ChipTx(db);
-    const chips = new ChipLedgerCore(db, new Ledger(db), new EventLog(db), { chipTx });
+    const chips = new ChipLedger(db, new Ledger(db), new EventLog(db), { chipTx });
     const outstanding = chips.outstanding();
     const pool = chips.pool();
     expect(chips.reserveHolder()).toBe(CHIP_ESCROW);
@@ -115,13 +115,13 @@ function assertFullyBacked(dbPath: string): { outstanding: number; pool: number 
   }
 }
 
-function read(dbPath: string, fn: (c: { db: ReturnType<typeof openDb>; chips: ChipLedgerCore; chipTx: ChipTx; ledger: Ledger; reservations: HouseReservations }) => void): void {
+function read(dbPath: string, fn: (c: { db: ReturnType<typeof openDb>; chips: ChipLedger; chipTx: ChipTx; ledger: Ledger; reservations: HouseReservations }) => void): void {
   const db = openDb(dbPath);
   try {
     const events = new EventLog(db);
     const chipTx = new ChipTx(db);
     const ledger = new Ledger(db);
-    const chips = new ChipLedgerCore(db, ledger, events, { chipTx });
+    const chips = new ChipLedger(db, ledger, events, { chipTx });
     const reservations = new HouseReservations(db, chips as never, events);
     chips.setReservedProvider((h) => (h === HOUSE_HOLDER ? reservations.totalReserved() : 0));
     fn({ db, chips, chipTx, ledger, reservations });
@@ -235,14 +235,17 @@ describe("資金APIの別プロセス並行性（項目14）", () => {
     const db = openDb(dbPath);
     const ledger = new Ledger(db);
     const chipTx = new ChipTx(db);
-    const chips = new ChipLedgerCore(db, ledger, new EventLog(db), { chipTx });
+    // 構築だけで準備口座の Land 口座が用意される（資金は動かさない）
+    new ChipLedger(db, ledger, new EventLog(db), { chipTx });
     ledger.ensureAccount(DEPT, "system");
     ledger.transfer({ from: TREASURY, to: DEPT, amount: 10_000_000, type: "adjust", actor: "t", approvedBy: "t", idempotencyKey: "seed:dept" });
     ledger.ensureAccount("user:alice", "user");
     ledger.transfer({ from: TREASURY, to: "user:alice", amount: 1_000_000, type: "initial", actor: "t", idempotencyKey: "seed:alice" });
+    // 版切替の前に旧制度で 20,000 預けてある状態を、旧取引 fixture で作る
+    // （正式開業ロックは外せないので、legacy の資金は新APIでは作らない）
+    ledger.transfer({ from: "user:alice", to: ETHER_ESCROW, amount: 20_000, type: "ether_buy", actor: "user:alice", approvedBy: "system:ether", idempotencyKey: "boundary:legacy-buy" });
+    db.prepare("INSERT INTO ether_balances (user_id, amount, updated_at) VALUES ('alice', 20000, 0)").run();
     chipTx.captureLegacyOpening({ poolLand: ledger.balanceOf(ETHER_ESCROW), fromLedgerTxId: ledger.lastTransactionId() });
-    // 版切替の前に legacy で 20,000 預ける
-    chips.deposit("alice", 20_000, "boundary:legacy-deposit");
     expect(ledger.balanceOf(ETHER_ESCROW)).toBe(20_000);
     // 版を opening_v1 へ切り替える（PR12 の完了処理が置く状態）
     chipTx.captureOpening(FORMAL_OPENING_VERSION, [], { poolLand: ledger.balanceOf(CHIP_ESCROW), fromLedgerTxId: ledger.lastTransactionId() });

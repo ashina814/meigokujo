@@ -171,17 +171,20 @@ function assertSafeSum(total: number, field: string, meta: Record<string, unknow
 }
 
 /**
- * 正式開業ロックを持たない基底実装（PR8監査・ブロッカーA）。
+ * 賭場チップ台帳の**唯一の実装**（PR8監査・ブロッカーA）。
  *
- * **直接構築してはいけない。** 正式開業前の資金操作を core 層で確実に止めるのは
- * `./chip-ledger.js` が export する `ChipLedger`（ロック付き）の役目で、そちらが
- * 唯一の公開APIになる。ここに `ChipLedger` という名前を残すと、
- * `../casino/exchange.js` を直接 import するだけでロックを迂回できてしまうため、
- * 名前ごと切り離してある（production からの参照は 0 件であることを grep とテストで固定する）。
+ * 正式開業ロックはこのクラスに**組み込まれていて、外せない**。
+ * ロックなしの派生・ロックを解除するコンストラクタオプションは提供しない。
+ * かつてはロックなしの実装を別名で公開し、「production の call site が
+ * 0 件であること」をソース検査で担保していたが、迂回経路が存在するかぎり
+ * 新しいコードが 1 行足すだけでロックを外せてしまう。**経路そのものを消す**。
  *
- * テストで正式開業前の1:1資金操作そのものを検証したい場合だけ、このクラスを直接使ってよい。
+ * 唯一の例外は chipTx の runMaintenance 区間（起動時の復旧・正式開業初期化）。
+ * ここだけは版が `opening_v1` でなくても資金を動かせる。許可経路を actor 文字列では
+ * なく「その区間を通ったかどうか」にしてあるので、呼び出し側が
+ * 名乗るだけでは素通りできない。
  */
-export class ChipLedgerCore {
+export class ChipLedger {
   /** チップ移動の追記先。賭場の他サービスもここ経由で同じグループに乗る */
   readonly chipTx: ChipTx;
 
@@ -230,9 +233,35 @@ export class ChipLedgerCore {
   /**
    * 業務操作を1グループとして実行する（仕様書 I5）。
    * チップを動かす処理は必ずこの中で行う。すでに外側のグループがあれば合流する。
+   *
+   * **正式開業ロックはここで効く**（PR8監査・ブロッカーA）。判定を `runGroup` の
+   * 本体側へ置くのは、`chipTx.runGroup` が「処理済みグループなら本体を実行せず
+   * 保存済み結果を返す」ためで、そうしておくと**成功済み操作の再試行**は
+   * 版が変わっても同じ結果を返し続ける（資金は動かないので安全）。
    */
   runGroup<T>(input: { groupKey: string; kind: string; actorId: string }, body: () => T): T {
-    return this.chipTx.runGroup(input, body);
+    return this.chipTx.runGroup(input, () => {
+      this.assertOpeningReady(input);
+      return body();
+    });
+  }
+
+  /**
+   * 正式開業（`opening_v1`）が確定するまで、新しい資金グループを開かせない。
+   *
+   * 復旧・正式開業初期化は chipTx の runMaintenance 区間として明示的に通る。
+   * それ以外の経路（利用者操作・運営卓・scheduler・進行中のゲーム）は、
+   * 版が `opening_v1` になるまで一律で断る。
+   */
+  private assertOpeningReady(input: { groupKey: string; kind: string; actorId: string }): void {
+    if (this.chipTx.isMaintenance()) return;
+    const version = this.chipTx.currentVersion();
+    if (version === FORMAL_OPENING_VERSION) return;
+    throw new ChipLedgerError("ERR_CASINO_OPENING_NOT_COMPLETE", {
+      version,
+      requiredVersion: FORMAL_OPENING_VERSION,
+      ...input,
+    });
   }
 
   /** 準備プールの Land 残高 */
@@ -471,19 +500,19 @@ export class ChipLedgerCore {
 }
 
 /**
- * @deprecated PR8後の新規コードでは使わない。内部テストと既存プラグインを段階移行させる
+ * @deprecated PR8後の新規コードでは使わない。既存の呼び出しを段階移行させるための
  * 互換コンストラクタであり、変動レートの振る舞いは復活させない。
- *
- * `ChipLedgerCore` 同様、正式開業ロックを持たない。production からの直接構築は禁止
- * （`./chip-ledger.js` が export するロック付き `EtherExchange` を使うこと）。
  */
 export interface EtherExchangeOptions extends ChipLedgerOptions {
   /** @deprecated 無視される。チップの交換比率は常に1:1。 */
   baseRate?: number | (() => number);
 }
 
-/** @deprecated ロックなし。テスト専用。production は `./chip-ledger.js` の `ChipLedger`/`EtherExchange` を使うこと。 */
-export class EtherExchangeCore extends ChipLedgerCore {
+/**
+ * @deprecated `ChipLedger` を使うこと。名前だけの後方互換で、**同じ正式開業ロックを通る**。
+ * ロックを外した派生は存在しない（PR8監査・ブロッカーA）。
+ */
+export class EtherExchange extends ChipLedger {
   constructor(db: Database.Database, ledger: Ledger, events: EventLog, options: EtherExchangeOptions = {}) {
     super(db, ledger, events, options);
   }

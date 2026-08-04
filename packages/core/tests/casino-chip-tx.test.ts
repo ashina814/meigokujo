@@ -4,7 +4,7 @@ import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
 import { Casino, JACKPOT_HOLDER, RELIEF_HOLDER } from "../src/casino/service.js";
-import { ChipLedgerCore, ETHER_ESCROW, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, CHIP_ESCROW, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { Escrow } from "../src/casino/escrow.js";
 import { Daily } from "../src/casino/daily.js";
 import { Vip } from "../src/casino/vip.js";
@@ -13,7 +13,7 @@ import { Stocks } from "../src/casino/stocks.js";
 import { deterministicRng } from "../src/casino/rng.js";
 import { ChipTx, ChipTxError, LEGACY_OPENING_VERSION } from "../src/casino/chip-tx.js";
 import { deptAccount } from "../src/departments/service.js";
-import { testTransfer, opId } from "./helpers/chip-ctx.js";
+import { testTransfer, opId, inMaintenance, openFormally } from "./helpers/chip-ctx.js";
 
 registerDefaultTxTypes();
 
@@ -27,7 +27,26 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new ChipLedgerCore(db, ledger, events, { chipTx });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  openFormally(ether.chipTx, ledger);
+  const casino = new Casino(db, ether, events);
+  const escrow = new Escrow(db, ether, events);
+  return { db, ledger, events, chipTx, ether, casino, escrow };
+}
+
+/**
+ * 版切替そのものを見るテスト用に、**まだ正式開業していない**状態を作る。
+ *
+ * 正式開業ロックは外せないので、旧版の窓での資金移動は `runMaintenance()` 区間
+ * （＝復旧・正式開業初期化と同じ唯一の例外経路）を通す。ロック解除オプションは無い。
+ */
+function setupLegacy() {
+  const db = openDb(":memory:");
+  const ledger = new Ledger(db);
+  const events = new EventLog(db);
+  const chipTx = new ChipTx(db);
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
   const casino = new Casino(db, ether, events);
   const escrow = new Escrow(db, ether, events);
   return { db, ledger, events, chipTx, ether, casino, escrow };
@@ -89,7 +108,7 @@ describe("取引明細", () => {
       amount: number;
       to_account: string;
     };
-    expect(land).toEqual({ amount: 5_000, to_account: ETHER_ESCROW });
+    expect(land).toEqual({ amount: 5_000, to_account: CHIP_ESCROW });
     ctx.db.close();
   });
 
@@ -271,7 +290,7 @@ describe("開始残高", () => {
     const ctx = setup();
     fundHouse(ctx, 10_000);
     fundUser(ctx, "alice", 3_000);
-    ctx.chipTx.captureLegacyOpening();
+    // 開始残高は setup() の openFormally が opening_v1 として既に置いている
 
     ctx.casino.settle("alice", "スロット", 1_000, 2_500, 50, { operationId: opId() });
     ctx.ether.redeem("alice", 500, "sell:alice");
@@ -504,13 +523,14 @@ describe("runGroup の防御", () => {
 
 describe("開始残高の版切替", () => {
   it("版ごとの窓で区切って、旧版・新版をそれぞれ検算できる", () => {
-    const ctx = setup();
-    fundHouse(ctx, 100_000);
-    fundUser(ctx, "alice", 10_000);
-    ctx.chipTx.captureLegacyOpening();
-
-    // 旧版の窓での取引
-    ctx.casino.settle("alice", "スロット", 1_000, 2_000, 0, { chain: false, fuku: false, operationId: "v0-1" });
+    const ctx = setupLegacy();
+    inMaintenance(ctx.chipTx, () => {
+      fundHouse(ctx, 100_000);
+      fundUser(ctx, "alice", 10_000);
+      ctx.chipTx.captureLegacyOpening();
+      // 旧版の窓での取引
+      ctx.casino.settle("alice", "スロット", 1_000, 2_000, 0, { chain: false, fuku: false, operationId: "v0-1" });
+    });
     const balancesAtSwitch = new Map(
       (ctx.db.prepare("SELECT user_id, amount FROM ether_balances").all() as Array<{ user_id: string; amount: number }>)
         .map((r) => [r.user_id, r.amount] as const),
@@ -538,9 +558,11 @@ describe("開始残高の版切替", () => {
   });
 
   it("取引を挟まず版を切り替えても、新しい版が古い版を飲み込まない", () => {
-    const ctx = setup();
-    fundHouse(ctx, 10_000);
-    ctx.chipTx.captureLegacyOpening();
+    const ctx = setupLegacy();
+    inMaintenance(ctx.chipTx, () => {
+      fundHouse(ctx, 10_000);
+      ctx.chipTx.captureLegacyOpening();
+    });
     // 取引を1件も挟まずに切り替える（境界の取引IDが両版で同じになる）
     expect(ctx.chipTx.captureOpening("opening_v1", [[HOUSE_HOLDER, 10_000]])).toBe(true);
 
@@ -562,11 +584,13 @@ describe("開始残高の版切替", () => {
   // 取引を初期化した後の旧版は「開始残高そのもの」へ戻る。旧制度の取引再現は初期化前
   // （R9 前の preflight）限定で、初期化後の追跡先は R1-b の CSV とスナップショット。
   it("取引を初期化した後は、旧版の再現が開始残高へ戻り、新版だけが実残高と一致する", () => {
-    const ctx = setup();
-    fundHouse(ctx, 100_000);
-    fundUser(ctx, "alice", 10_000);
-    ctx.chipTx.captureLegacyOpening();
-    ctx.casino.settle("alice", "スロット", 1_000, 2_000, 0, { chain: false, fuku: false, operationId: "v0-1" });
+    const ctx = setupLegacy();
+    inMaintenance(ctx.chipTx, () => {
+      fundHouse(ctx, 100_000);
+      fundUser(ctx, "alice", 10_000);
+      ctx.chipTx.captureLegacyOpening();
+      ctx.casino.settle("alice", "スロット", 1_000, 2_000, 0, { chain: false, fuku: false, operationId: "v0-1" });
+    });
 
     const legacyReplay = ctx.chipTx.replayBalances(LEGACY_OPENING_VERSION);
     const legacyRows = ctx.db.prepare("SELECT COUNT(*) AS c FROM casino_tx").get() as { c: number };
@@ -597,9 +621,11 @@ describe("開始残高の版切替", () => {
   });
 
   it("同じ版を二度記録しない", () => {
-    const ctx = setup();
-    fundHouse(ctx, 10_000);
-    ctx.chipTx.captureLegacyOpening();
+    const ctx = setupLegacy();
+    inMaintenance(ctx.chipTx, () => {
+      fundHouse(ctx, 10_000);
+      ctx.chipTx.captureLegacyOpening();
+    });
 
     expect(ctx.chipTx.captureOpening(LEGACY_OPENING_VERSION, [["house", 999]])).toBe(false);
     expect(ctx.chipTx.openingBalances(LEGACY_OPENING_VERSION).get("house")).toBe(10_000);

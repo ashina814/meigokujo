@@ -4,9 +4,11 @@ import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { ChipLedgerCore, ChipLedgerError, HOUSE_HOLDER, type ChipLedgerErrorCode } from "../src/casino/exchange.js";
+import { ChipLedger, ChipLedgerError, HOUSE_HOLDER, type ChipLedgerErrorCode } from "../src/casino/exchange.js";
 import { ChipTx } from "../src/casino/chip-tx.js";
 import { deptAccount } from "../src/departments/service.js";
+
+import { openFormally } from "./helpers/chip-ctx.js";
 
 registerDefaultTxTypes();
 
@@ -18,7 +20,7 @@ registerDefaultTxTypes();
  * ここでは全資金APIについて、拒否理由のコードと**資金が1単位も動いていないこと**を固定する。
  *
  * 正式開業ロック（ブロッカーA）そのものは `chip-ledger.test.ts` が見ているので、
- * ここでは入力検証だけを見るために `ChipLedgerCore`（ロックなし実装）を使う。
+ * ここでは入力検証だけを見るために `ChipLedger`（ロックなし実装）を使う。
  */
 
 const DEPT = deptAccount("賭博場");
@@ -28,7 +30,9 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const chips = new ChipLedgerCore(db, ledger, events, { chipTx });
+  const chips = new ChipLedger(db, ledger, events, { chipTx });
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  openFormally(chips.chipTx, ledger);
   for (const userId of ["a", "b"]) {
     ledger.ensureAccount(`user:${userId}`, "user");
     ledger.transfer({ from: TREASURY, to: `user:${userId}`, amount: 1_000_000, type: "initial", actor: "test", idempotencyKey: `fund:${userId}` });

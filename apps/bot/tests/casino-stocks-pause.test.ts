@@ -8,6 +8,8 @@ import {
   deterministicRng,
   openDb,
   registerDefaultTxTypes,
+  FORMAL_OPENING_VERSION,
+  CHIP_ESCROW,
 } from "@meigokujo/core";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -121,7 +123,9 @@ describe("建玉に触れていない", () => {
     const ledger = new Ledger(db);
     const events = new EventLog(db);
     const chipTx = new ChipTx(db);
-    const ether = new ChipLedger(db, ledger, events, { chipTx, requireOpeningV1: false });
+    const ether = new ChipLedger(db, ledger, events, { chipTx });
+    // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+    chipTx.captureOpening(FORMAL_OPENING_VERSION, [], { poolLand: ledger.balanceOf(CHIP_ESCROW), fromLedgerTxId: ledger.lastTransactionId() });
     const stocks = new Stocks(db, ether, events, { rng: deterministicRng(1) });
 
     // 建玉を1件作っておく（停止前からの保有を模す）

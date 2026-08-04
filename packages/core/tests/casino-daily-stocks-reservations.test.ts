@@ -14,6 +14,8 @@ import {
   registerDefaultTxTypes,
 } from "../src/index.js";
 
+import { openFormally } from "./helpers/chip-ctx.js";
+
 registerDefaultTxTypes();
 
 /**
@@ -29,7 +31,9 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new ChipLedger(db, ledger, events, { chipTx, requireOpeningV1: false });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  openFormally(ether.chipTx, ledger);
   const reservations = new HouseReservations(db, ether, events);
   // services.ts と同じ配線: house だけ予約合計を反映する
   ether.setReservedProvider((holderId: string) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));

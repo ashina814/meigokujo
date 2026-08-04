@@ -3,9 +3,11 @@ import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { ChipLedgerCore, ChipLedgerError, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, ChipLedgerError, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { ChipTx } from "../src/casino/chip-tx.js";
 import { deptAccount } from "../src/departments/service.js";
+
+import { openFormally } from "./helpers/chip-ctx.js";
 
 registerDefaultTxTypes();
 
@@ -55,7 +57,9 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const chips = new ChipLedgerCore(db, ledger, events, { chipTx });
+  const chips = new ChipLedger(db, ledger, events, { chipTx });
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  openFormally(chips.chipTx, ledger);
   ledger.ensureAccount(DEPT, "system");
   ledger.transfer({ from: TREASURY, to: DEPT, amount: 5_000_000, type: "adjust", actor: "t", approvedBy: "t", idempotencyKey: "seed:dept" });
   ledger.ensureAccount("user:a", "user");
@@ -68,7 +72,7 @@ type Ctx = ReturnType<typeof setup>;
 /**
  * 実装の内部を書き換えずに例外を差し込む。
  *
- * `Ledger.transfer`（Land 移動）・`ChipLedgerCore` の残高更新・`ChipTx.record`・
+ * `Ledger.transfer`（Land 移動）・`ChipLedger` の残高更新・`ChipTx.record`・
  * `EventLog.log` を一時的に包んで、指定した位置で必ず例外にする。本番の呼び出し順に
  * 依存するので、順序が変わればこのテストが落ちる（＝実装の変更を検知できる）。
  */

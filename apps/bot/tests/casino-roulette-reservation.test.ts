@@ -13,6 +13,8 @@ import {
   registerDefaultTxTypes,
   scriptedRng,
   type CasinoRng,
+  FORMAL_OPENING_VERSION,
+  CHIP_ESCROW,
 } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 import { acceptRouletteBet, settleRoulette, voidRouletteTable } from "../src/casino/roulette.js";
@@ -36,7 +38,9 @@ function setup(rng: CasinoRng = scriptedRng([0.5])) {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new ChipLedger(db, ledger, events, { chipTx, requireOpeningV1: false });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  chipTx.captureOpening(FORMAL_OPENING_VERSION, [], { poolLand: ledger.balanceOf(CHIP_ESCROW), fromLedgerTxId: ledger.lastTransactionId() });
   const items = new Items(db);
   const reservations = new HouseReservations(db, ether, events);
   ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));

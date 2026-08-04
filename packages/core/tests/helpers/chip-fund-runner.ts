@@ -3,7 +3,7 @@ import { Ledger } from "../../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../../src/ledger/registry.js";
 import { EventLog } from "../../src/events/service.js";
 import { ChipTx } from "../../src/casino/chip-tx.js";
-import { ChipLedgerCore } from "../../src/casino/exchange.js";
+import { ChipLedger } from "../../src/casino/exchange.js";
 import { HouseReservations } from "../../src/casino/reservations.js";
 import { HOUSE_HOLDER } from "../../src/casino/exchange.js";
 
@@ -40,7 +40,7 @@ function main(): void {
   const db = openDb(input.dbPath);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const chips = new ChipLedgerCore(db, new Ledger(db), events, { chipTx });
+  const chips = new ChipLedger(db, new Ledger(db), events, { chipTx });
   const reservations = new HouseReservations(db, chips as never, events);
   // 売上精算は「残高 − 予約」しか出せない（PR5）。別プロセスでも同じ配線にしておかないと、
   // 予約と精算が競合したときの本番の振る舞いを再現できない

@@ -1,10 +1,10 @@
-import { opId } from "./helpers/chip-ctx.js";
+import { opId , openFormally} from "./helpers/chip-ctx.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { ChipLedgerCore, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { Casino, JACKPOT_HOLDER, RELIEF_HOLDER } from "../src/casino/service.js";
 import { deptAccount, Departments } from "../src/departments/service.js";
 
@@ -16,7 +16,9 @@ const RAW = { chain: false, fuku: false } as const;
 function setup() {
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
-  const ether = new ChipLedgerCore(db, ledger, new EventLog(db));
+  const ether = new ChipLedger(db, ledger, new EventLog(db));
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  openFormally(ether.chipTx, ledger);
   const casino = new Casino(db, ether, new EventLog(db));
   const departments = new Departments(db, ledger);
   // 賭博場部署 → 胴元に元手 100,000 Land = 1,000,000 ◈

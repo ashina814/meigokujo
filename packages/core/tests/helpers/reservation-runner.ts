@@ -3,7 +3,7 @@ import { Ledger } from "../../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../../src/ledger/registry.js";
 import { EventLog } from "../../src/events/service.js";
 import { ChipTx } from "../../src/casino/chip-tx.js";
-import { EtherExchangeCore } from "../../src/casino/exchange.js";
+import { EtherExchange } from "../../src/casino/exchange.js";
 import { HouseReservations, ReservationConflictError } from "../../src/casino/reservations.js";
 
 /**
@@ -34,7 +34,7 @@ function main(): void {
   registerDefaultTxTypes();
   const db = openDb(input.dbPath);
   const chipTx = new ChipTx(db);
-  const ether = new EtherExchangeCore(db, new Ledger(db), new EventLog(db), { baseRate: 1, chipTx });
+  const ether = new EtherExchange(db, new Ledger(db), new EventLog(db), { baseRate: 1, chipTx });
   const reservations = new HouseReservations(db, ether, new EventLog(db));
 
   sleepUntil(input.startAt);

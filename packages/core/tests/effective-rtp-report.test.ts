@@ -1,10 +1,10 @@
-import { testTransfer, opId } from "./helpers/chip-ctx.js";
+import { testTransfer, opId , openFormally} from "./helpers/chip-ctx.js";
 import { beforeEach, describe, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
-import { ChipLedgerCore, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, HOUSE_HOLDER } from "../src/casino/exchange.js";
 import { Casino, JACKPOT_HOLDER, RELIEF_HOLDER } from "../src/casino/service.js";
 import { Items } from "../src/casino/items.js";
 import { deptAccount, Departments } from "../src/departments/service.js";
@@ -42,7 +42,7 @@ registerDefaultTxTypes();
 interface Ctx {
   db: ReturnType<typeof openDb>;
   ledger: Ledger;
-  ether: ChipLedgerCore;
+  ether: ChipLedger;
   casino: Casino;
   items: Items;
 }
@@ -50,7 +50,9 @@ interface Ctx {
 function setup(seedHouseEther = 50_000_000, seedPlayerEther = 5_000_000): Ctx {
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
-  const ether = new ChipLedgerCore(db, ledger, new EventLog(db));
+  const ether = new ChipLedger(db, ledger, new EventLog(db));
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  openFormally(ether.chipTx, ledger);
   const casino = new Casino(db, ether, new EventLog(db));
   const items = new Items(db);
   const departments = new Departments(db, ledger);

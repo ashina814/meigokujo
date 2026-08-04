@@ -7,11 +7,11 @@ import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
 import { ChipLedger, ETHER_ESCROW, CHIP_ESCROW, HOUSE_HOLDER } from "../src/casino/chip-ledger.js";
-import { ChipLedgerCore } from "../src/casino/exchange.js";
 import { ChipTx, LEGACY_OPENING_VERSION } from "../src/casino/chip-tx.js";
 import { CasinoStatus } from "../src/casino/status.js";
 import { CasinoIntegrity } from "../src/casino/integrity.js";
 import { Escrow, ESCROW_QUARANTINE } from "../src/casino/escrow.js";
+import { FREE_SPIN_JACKPOT_CLAIMS_HOLDER } from "../src/casino/free-spins.js";
 import { HouseReservations } from "../src/casino/reservations.js";
 import { FreeSpins } from "../src/casino/free-spins.js";
 import { Stocks } from "../src/casino/stocks.js";
@@ -49,9 +49,6 @@ function buildLegacyDb(): string {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  // 旧制度そのものを組み立てるので、ここだけは開業ロックを外した実装を使う
-  // （legacy 側のデータを作る作業であって、PR8 の資金操作ではない）
-  const seedChips = new ChipLedgerCore(db, ledger, events, { chipTx });
 
   ledger.ensureAccount(DEPT, "system");
   ledger.transfer({ from: TREASURY, to: DEPT, amount: 5_000_000, type: "adjust", actor: "seed", approvedBy: "seed", idempotencyKey: "seed:dept" });
@@ -60,26 +57,39 @@ function buildLegacyDb(): string {
     ledger.transfer({ from: TREASURY, to: `user:${u}`, amount: 1_000_000, type: "initial", actor: "seed", idempotencyKey: `seed:${u}` });
   }
 
-  // 旧準備口座に裏付けのある発行済みチップ（利用者・胴元）
-  seedChips.deposit("u1", 120_000, "legacy:deposit:u1");
-  seedChips.deposit("u2", 80_000, "legacy:deposit:u2");
-  seedChips.fundFromAccount(DEPT, 500_000, HOUSE_HOLDER, "legacy:fund:house");
-  // JP 積立・救済プールも旧制度の一部
-  seedChips.runGroup({ groupKey: "legacy:pools", kind: "opening_reset", actorId: "system:seed" }, () => {
-    seedChips.transfer(HOUSE_HOLDER, "jackpot", 30_000, { reason: "JP積立" });
-    seedChips.transfer(HOUSE_HOLDER, "relief", 5_000, { reason: "救済プール" });
-  });
+  // ── 旧準備口座へ入った Land（旧 EtherExchange が作った歴史データそのものの形） ──
+  //
+  // 新APIは使わない。正式開業ロックは外せないので、**旧取引 fixture で作る**のが
+  // 正しい再現でもある（実際の legacy DB は `ether_*` 型の Land 取引で出来ている）。
+  ledger.ensureAccount(ETHER_ESCROW, "system");
+  ledger.ensureAccount(CHIP_ESCROW, "system");
+  ledger.transfer({ from: "user:u1", to: ETHER_ESCROW, amount: 120_000, type: "ether_buy", actor: "user:u1", approvedBy: "system:ether", idempotencyKey: "legacy:buy:u1" });
+  ledger.transfer({ from: "user:u2", to: ETHER_ESCROW, amount: 80_000, type: "ether_buy", actor: "user:u2", approvedBy: "system:ether", idempotencyKey: "legacy:buy:u2" });
+  ledger.transfer({ from: DEPT, to: ETHER_ESCROW, amount: 500_000, type: "ether_house_fund", actor: "system:ether", approvedBy: "system:ether", idempotencyKey: "legacy:fund:house" });
 
-  // 進行中の預託（帳簿と保有者残高が一致した「生きている」預託）
-  const escrow = new Escrow(db, seedChips as never, events);
-  escrow.hold("sess-live", "u1", 10_000, "板", "legacy:escrow:live");
-  // 隔離口座にも残高を置く（復旧が勝手に戻さないことを確認するため）
-  seedChips.ensureHolder(ESCROW_QUARANTINE);
-  seedChips.runGroup({ groupKey: "legacy:quarantine", kind: "opening_reset", actorId: "system:seed" }, () =>
-    seedChips.transfer(HOUSE_HOLDER, ESCROW_QUARANTINE, 2_500, { reason: "旧隔離残高" }),
-  );
+  // ── 旧制度のチップ残高（合計が旧準備口座の Land と一致する＝裏付けが取れている状態） ──
+  const legacyChipBalances: Array<[string, number]> = [
+    ["u1", 110_000], // 120,000 のうち 10,000 は進行中の卓へ預託中
+    ["u2", 80_000],
+    [HOUSE_HOLDER, 462_500],
+    ["jackpot", 23_000],
+    ["relief", 5_000],
+    [ESCROW_QUARANTINE, 2_500],
+    ["escrow:session:sess-live", 10_000],
+    [FREE_SPIN_JACKPOT_CLAIMS_HOLDER, 7_000],
+  ];
+  const insertChip = db.prepare("INSERT INTO ether_balances (user_id, amount, updated_at) VALUES (?, ?, 0)");
+  for (const [holder, amount] of legacyChipBalances) insertChip.run(holder, amount);
+  expect(legacyChipBalances.reduce((a, [, n]) => a + n, 0)).toBe(ledger.balanceOf(ETHER_ESCROW));
 
-  // 保留フリースピン（固定JP請求つき）。請求額は system holder に隔離してある状態
+  // 進行中の預託（帳簿と保有者残高が一致した「生きている」預託）。
+  // `casino_escrow` は Escrow の構築時に作られるので、先に一度作らせる
+  new Escrow(db, new ChipLedger(db, ledger, events, { chipTx }), events);
+  db.prepare(
+    "INSERT INTO casino_escrow (session_id, user_id, amount, game, source, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+  ).run("sess-live", "u1", 10_000, "板", "escrow:session:sess-live", 1_700_000_000);
+
+  // 保留フリースピン（固定JP請求つき）。請求額は system holder に隔離してある
   // （検算Cが「pending の合計 == holder 残高」を要求するので、健全な形で作る）
   const freeSpins = new FreeSpins(db);
   freeSpins.grant({
@@ -87,21 +97,20 @@ function buildLegacyDb(): string {
     reels: ["7", "7", "7"], rawPayout: 0, amuletEffect: { kind: "none", amount: 0 },
     payout: 0, jackpotWon: true, jackpotClaim: 7_000, totalClaim: 7_000,
   });
-  seedChips.runGroup({ groupKey: "legacy:free-spin-claim", kind: "opening_reset", actorId: "system:seed" }, () =>
-    seedChips.transfer("jackpot", freeSpins.jackpotClaimHolder(), 7_000, { reason: "保留フリースピンのJP請求隔離" }),
-  );
+  expect(freeSpins.jackpotClaimHolder()).toBe(FREE_SPIN_JACKPOT_CLAIMS_HOLDER);
 
-  // 胴元債務の予約（進行中ゲームの最大配当）
-  const reservations = new HouseReservations(db, seedChips as never, events);
+  // 胴元債務の予約（進行中ゲームの最大配当）。予約は資金グループを作らないので旧版でも置ける
+  const reservations = new HouseReservations(db, new ChipLedger(db, ledger, events, { chipTx }), events);
   reservations.reserve("legacy:res:1", 40_000, "スロット", "u1");
   reservations.reserve("legacy:res:2", 15_000, "クラッシュ", "u2");
 
   // 株の建玉（PR6で停止しているが、持っているものには触らない）
-  const stocks = new Stocks(db, seedChips as never, events);
+  const stocks = new Stocks(db, new ChipLedger(db, ledger, events, { chipTx }), events);
   const anyStock = stocks.list()[0]!;
   db.prepare("INSERT INTO casino_holdings (user_id, stock_id, shares, avg_cost, bought_at) VALUES (?, ?, ?, ?, ?)").run("u3", anyStock.id, 12, 950, 1_700_000_000);
 
-  // 版は legacy_pre_reset のまま（正式開業初期化は PR12）
+  // 版は legacy_pre_reset のまま（正式開業初期化は PR12）。
+  // ここまでの残高を旧版の開始残高として確定するので、検算Aは「開始残高そのもの」で通る
   chipTx.captureLegacyOpening({ poolLand: ledger.balanceOf(ETHER_ESCROW), fromLedgerTxId: ledger.lastTransactionId() });
   expect(chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
 
@@ -145,7 +154,7 @@ function wire(dbPath: string) {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const chips = new ChipLedger(db, ledger, events, { chipTx, requireOpeningV1: true });
+  const chips = new ChipLedger(db, ledger, events, { chipTx });
   const status = new CasinoStatus(db);
   chipTx.setClosedReason(() => status.denyMessage());
   const escrow = new Escrow(db, chips, events);

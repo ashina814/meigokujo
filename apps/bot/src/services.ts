@@ -113,8 +113,10 @@ export function buildServices() {
   });
   // 賭場の取引監査。全サービスで同じインスタンスを共有する（実行中グループを共有するため）
   const chipTx = new ChipTx(db);
-  // 正式開業前の1:1資金操作は、実行環境名に依存させず本番配線で必ず拒否する。
-  const chips = new ChipLedger(db, ledger, events, { chipTx, requireOpeningV1: true });
+  // 正式開業ロックは `ChipLedger` に組み込まれていて外せない（PR8監査・ブロッカーA）。
+  // 「ロックを解除するオプション」も「ロックなしの派生」も存在しないので、
+  // ここで有効化し忘れる／うっかり無効化する余地が構造的に無い。
+  const chips = new ChipLedger(db, ledger, events, { chipTx });
   // 監査の出発点。導入時のチップ残高と、Land 側の基準（準備プール残高＋境界取引ID）を
   // 一度だけ記録する。ここで基準を持てるのは「まだ何も動いていない」新規DBだけで、
   // すでに版がある既存DBは運営卓の「検算Bの基準を確定」から明示的に置く

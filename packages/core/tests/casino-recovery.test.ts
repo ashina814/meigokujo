@@ -21,6 +21,8 @@ import {
   registerDefaultTxTypes,
 } from "../src/index.js";
 
+import { openFormally } from "./helpers/chip-ctx.js";
+
 registerDefaultTxTypes();
 
 /**
@@ -35,14 +37,16 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
-  const ether = new ChipLedger(db, ledger, events, { chipTx, requireOpeningV1: false });
+  const ether = new ChipLedger(db, ledger, events, { chipTx });
+  // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
+  openFormally(ether.chipTx, ledger);
   const escrow = new Escrow(db, ether, events);
   const casino = new Casino(db, ether, events);
   const integrity = new CasinoIntegrity(db, ledger, ether, escrow);
   const status = new CasinoStatus(db);
   const reservations = new HouseReservations(db, ether, events);
   const registry = new RecoveryRegistry();
-  chipTx.captureLegacyOpening({ poolLand: ledger.balanceOf("sys:escrow:ether"), fromLedgerTxId: ledger.lastTransactionId() });
+  // 検算Bの Land 基準は openFormally が opening_v1 として置いている（旧版の基準は作らない）
   return { db, ledger, events, chipTx, ether, escrow, casino, integrity, status, reservations, registry };
 }
 

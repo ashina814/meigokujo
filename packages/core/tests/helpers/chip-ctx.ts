@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
-import type { ChipLedgerCore } from "../../src/casino/exchange.js";
+import type { Ledger } from "../../src/ledger/service.js";
+import type { ChipTx } from "../../src/casino/chip-tx.js";
+import { FORMAL_OPENING_VERSION } from "../../src/casino/chip-tx.js";
+import { CHIP_ESCROW, type ChipLedger } from "../../src/casino/exchange.js";
 
 /**
  * テストからチップを直接動かすための補助。
@@ -8,9 +11,36 @@ import type { ChipLedgerCore } from "../../src/casino/exchange.js";
  * テストでも同じ規律を通すが、毎回グループを書くと本題が読みにくくなるので、ここでまとめる。
  */
 
+/**
+ * 正式開業（`opening_v1`）を確定させる（PR8監査・ブロッカーA）。
+ *
+ * `ChipLedger` の正式開業ロックは外せないので、資金操作を伴うテストは
+ * **必ずこれを通してから**新APIを使う。「ロックを解除するオプション」は存在しない。
+ *
+ * 資金を1 Ldも動かす前に呼ぶこと。開始残高を空で確定するので、以後の全残高は
+ * `casino_tx` から再現でき、準備Landも新準備口座（`sys:escrow:casino`）に揃う。
+ */
+export function openFormally(chipTx: ChipTx, ledger: Ledger): void {
+  chipTx.captureOpening(FORMAL_OPENING_VERSION, [], {
+    poolLand: ledger.balanceOf(CHIP_ESCROW),
+    fromLedgerTxId: ledger.lastTransactionId(),
+  });
+}
+
+/**
+ * 正式開業前（`legacy_pre_reset`）の窓に資金を作る（PR8監査・ブロッカーA）。
+ *
+ * 正式開業ロックの**唯一の例外**である `runMaintenance()` 区間を通す。復旧と
+ * 正式開業初期化（PR12）が実際に使う経路と同じで、「ロックを解除するオプション」では
+ * ないことがコード上に必ず残る。旧版の窓を作るテストはこれか DB fixture を使うこと。
+ */
+export function inMaintenance<T>(chipTx: ChipTx, body: () => T, reason = "テスト: 復旧・正式開業初期化相当"): T {
+  return chipTx.runMaintenance(reason, body);
+}
+
 /** 使い捨てのグループでチップ移動を1回だけ行う（残高の作り込みや、不整合を作る細工に使う） */
 export function testTransfer(
-  ether: ChipLedgerCore,
+  ether: ChipLedger,
   from: string,
   to: string,
   amount: number,
@@ -22,7 +52,7 @@ export function testTransfer(
 }
 
 /** 複数の移動をまとめて1グループで行う（グループ単位の記録を確認したいとき） */
-export function inTestGroup<T>(ether: ChipLedgerCore, body: () => T, kind = "opening_reset"): T {
+export function inTestGroup<T>(ether: ChipLedger, body: () => T, kind = "opening_reset"): T {
   return ether.runGroup({ groupKey: `test:${randomUUID()}`, kind, actorId: "system:test" }, body);
 }
 
