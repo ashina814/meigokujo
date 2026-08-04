@@ -42,7 +42,7 @@ function setup(rng: CasinoRng = scriptedRng([0.5])) {
   ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
   const casino = new Casino(db, ether, events, { items, reservations });
   const escrow = new Escrow(db, ether, events);
-  const services = { db, ether, casino, items, escrow, reservations, rng, events } as unknown as Services;
+  const services = { db, ether, chips: ether, chipTx, casino, items, escrow, reservations, rng, events } as unknown as Services;
   return { db, ether, casino, items, escrow, reservations, services };
 }
 

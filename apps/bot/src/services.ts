@@ -49,6 +49,25 @@ import { meetsRoleRequirement } from "./rank-requirement.js";
 import { seedSpecialProfiles } from "./special-profile.js";
 
 /**
+ * 旧 `services.ether` に残す**読み取り専用の窓**（PR8監査・項目12）。
+ *
+ * 資金を動かす入口を2つ持つと、片方だけに検証・予約保護・正式開業ロックを足したときに
+ * 保護が食い違う。`deposit` / `redeem` / `fundFromAccount` / `redeemToAccount` /
+ * `transfer` / `runGroup` / 旧 `buy` `sell` `quoteBuy` `quoteSell` を**型から落として**、
+ * `services.ether` 経由では資金が動かせないことをコンパイル時に固定する。
+ * 資金操作も残高の読み取りも、production は必ず `services.chips` を使う
+ * （PR8監査の時点で `services.ether` の production 参照は 0 件）。
+ */
+export interface ChipReadonlyView {
+  balanceOf(holderId: string): number;
+  pool(): number;
+  outstanding(): number;
+  settleableBalance(holderId: string): number;
+  /** 現在の準備口座（opening 状態の読み取り。未知版では例外＝fail-closed） */
+  reserveHolder(): string;
+}
+
+/**
  * コアサービスの組み立て。アプリ層は薄く、ロジックは全て core 側（システム設計.md の原則）。
  */
 export function buildServices() {
@@ -157,9 +176,10 @@ export function buildServices() {
   );
   // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
-  // `ether` はPR8より前のゲーム画面を段階移行するための読み取り兼用エイリアス。
-  // 新規コードは必ず `chips` を使う。
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
+  // 資金を動かす経路は `chips` に一本化した（PR8監査・項目12）。`ether` は
+  // 旧名称で書かれた外部プラグイン・古い呼び出しが**読むだけ**なら壊れないように
+  // 残す互換窓で、型を `ChipReadonlyView` に狭めてある（下の注釈参照）。
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;

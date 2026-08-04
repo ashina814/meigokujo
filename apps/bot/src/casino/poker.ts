@@ -293,7 +293,7 @@ async function runRoundInner(
     game: "ポーカー",
     net: settled.net,
     bet,
-    balance: services.ether.balanceOf(uid),
+    balance: services.chips.balanceOf(uid),
     isJackpot: isJp,
     sections: [
       { icon: "🃏", label: "手札", value: hand.map((c) => `[${showCard(c)}]`).join("  "), inline: false },
@@ -316,7 +316,7 @@ async function runRoundInner(
   }
 
   // ── リトライボタン ──
-  const heldEther = services.ether.balanceOf(uid);
+  const heldEther = services.chips.balanceOf(uid);
   const min = MIN_BET;
   const max = Math.min(effectiveMaxBet(services, uid, "ポーカー"), heldEther);
   const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(

@@ -9,6 +9,7 @@ import {
 } from "discord.js";
 import { fmtEther, fmtLd } from "../format.js";
 import { C_MAMMON, C_JACKPOT, E, HR_THIN, fmtSignedEther } from "../casino/ui.js";
+import { openingNotice, openingPhase } from "../casino/opening.js";
 import type { Services } from "../services.js";
 
 /**
@@ -37,13 +38,16 @@ export async function handleAnnaiButton(interaction: import("discord.js").Button
 
 function renderHome(userId: string, services: Services, serverName?: string) {
   const stats = services.casino.stats(userId);
-  const ether = services.ether;
+  const ether = services.chips;
   const daily = services.daily;
   const heldEther = ether.balanceOf(userId);
   const heldLand = services.ledger.balanceOf(`user:${userId}`);
   const jp = services.casino.jackpotPool();
   const houseBal = services.casino.houseBalance();
-  const pool = ether.pool();
+  // 未知版では準備口座が決まらず pool() が例外になる。案内所ごと落とすと
+  // 「異常であること」も伝わらないので、読めない事実として出す（PR8監査・項目8）
+  const phase = openingPhase(services);
+  const pool = phase === "unknown" ? null : ether.pool();
   const outstanding = ether.outstanding();
 
   const isVip = services.vip.isVip(userId);
@@ -74,8 +78,16 @@ function renderHome(userId: string, services: Services, serverName?: string) {
     .filter(Boolean)
     .join("\n");
 
+  // 「1 Ld = 1 ◈」は opening_v1 が確定してからの約束。それ以前に出すと、
+  // 押しても必ず断られる交換をできると言うことになる（PR8監査・項目8）
+  const rateLine =
+    phase === "formal"
+      ? `**1 Ld = 1 ${E.ether}**   （準備 ${pool!.toLocaleString()} Ld ／ 発行 ${outstanding.toLocaleString()} ${E.ether}）`
+      : phase === "unknown"
+        ? `⚠️ 版が異常（準備口座を特定できません／全操作停止）`
+        : `🚧 **正式開業準備中**（預入・返還は停止中／1:1交換は opening_v1 確定後）　準備 ${pool!.toLocaleString()} Ld ／ 発行 ${outstanding.toLocaleString()} ${E.ether}`;
   const marketValue = [
-    `**1 Ld = 1 ${E.ether}**   （準備 ${pool.toLocaleString()} Ld ／ 発行 ${outstanding.toLocaleString()} ${E.ether}）`,
+    rateLine,
     `${E.jp} JPプール **${fmtEther(jp)}**`,
     `胴元残 ${fmtEther(houseBal)}`,
   ].join("\n");
@@ -111,8 +123,10 @@ function renderHome(userId: string, services: Services, serverName?: string) {
     `${E.paytable} \`/通行証\` — 戦績カード`,
     `🏅 \`/賭場番付\` — Top10（残高/勝率/最大単勝/連勝など）`,
     `${HR_THIN}`,
-    `${E.ether} エテル ⇄ Land はマモンの両替所パネルで`,
-    `　預入・返還は **1:1**（変動レート・奉納・焼却なし）`,
+    `${E.ether} チップ ⇄ Land はマモンの両替所パネルで`,
+    ...(phase === "formal"
+      ? [`　預入・返還は **1:1**（変動レート・奉納・焼却なし）`]
+      : [`　${openingNotice(services).split("\n").join("\n　")}`]),
   ].join("\n");
 
   const embed = new EmbedBuilder()

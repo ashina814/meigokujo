@@ -33,7 +33,7 @@ function renderStatus(userId: string, services: Services) {
   const price = services.vip.price();
   const days = services.vip.days();
   const mult = services.vip.betCapMult();
-  const held = services.ether.balanceOf(userId);
+  const held = services.chips.balanceOf(userId);
 
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · VIP" })
@@ -87,7 +87,7 @@ export async function handleVipButton(
   const r = services.vip.join(uid, interaction.id);
   if (!r.ok) {
     await interaction.reply({
-      content: `❌ 月会費 ${fmtEther(services.vip.price())} に足りない（所持 ${fmtEther(services.ether.balanceOf(uid))}）。`,
+      content: `❌ 月会費 ${fmtEther(services.vip.price())} に足りない（所持 ${fmtEther(services.chips.balanceOf(uid))}）。`,
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -103,7 +103,7 @@ export async function handleVipButton(
     .setColor(C_JACKPOT)
     .setTitle(r.wasExtension ? "💎  VIP を更新" : "💎  VIP に加入")
     .setDescription(`期限: <t:${r.expiresAt}:F>  （<t:${r.expiresAt}:R>）`)
-    .setFooter({ text: `残り ${services.vip.daysLeft(uid)}日 · 所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}` });
+    .setFooter({ text: `残り ${services.vip.daysLeft(uid)}日 · 所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" ◈", "◈")}` });
 
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }

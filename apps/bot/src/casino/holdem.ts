@@ -290,7 +290,7 @@ async function runRoundInner(
       folded = true;
       break;
     }
-    if (action === "call" && services.ether.balanceOf(uid) >= playerBet + ante) {
+    if (action === "call" && services.chips.balanceOf(uid) >= playerBet + ante) {
       playerBet += ante;
       dealerBet += ante; // マモンも同額コール
     }
@@ -350,7 +350,7 @@ async function runRoundInner(
     game: "ホールデム",
     net: settled.net,
     bet: playerBet,
-    balance: services.ether.balanceOf(uid),
+    balance: services.chips.balanceOf(uid),
     sections: [
       { icon: "🃏", label: "ボード", value: showHand([...flop, turn, river]), inline: false },
       {
@@ -375,7 +375,7 @@ async function runRoundInner(
     broadcastBigWin(interaction.client, services, { userId: uid, game: "ホールデム", bet: playerBet, payout: settled.payout });
   }
 
-  const heldEther = services.ether.balanceOf(uid);
+  const heldEther = services.chips.balanceOf(uid);
   const min = MIN_BET;
   const max = Math.min(effectiveMaxBet(services, uid, "ホールデム"), heldEther);
   const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(

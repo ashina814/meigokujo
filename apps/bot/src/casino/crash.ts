@@ -240,7 +240,7 @@ async function runRoundInner(
   collector.stop();
 
   const buildRetryRow = () => {
-    const held = services.ether.balanceOf(uid);
+    const held = services.chips.balanceOf(uid);
     const min = MIN_BET;
     const max = Math.min(effectiveMaxBet(services, uid, "クラッシュ"), held);
     return new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -292,7 +292,7 @@ async function runRoundInner(
       )
       .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
       .setFooter({
-        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
+        text: [`所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
       });
     await reply.edit({ embeds: [embed], components: [buildRetryRow()] }).catch(() => undefined);
     broadcastBigWin(interaction.client, services, { userId: uid, game: "クラッシュ", bet, payout: settled.payout });
@@ -320,7 +320,7 @@ async function runRoundInner(
           .join("\n"),
       )
       .setFooter({
-        text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
+        text: [`所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
       });
     await reply.edit({ embeds: [embed], components: [buildRetryRow()] }).catch(() => undefined);
   }

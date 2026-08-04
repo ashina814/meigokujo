@@ -180,6 +180,7 @@ export {
   type ChipTxRow,
   type ChipBalanceMismatch,
   type ChipTxErrorCode,
+  type OpeningPhase,
 } from "./casino/chip-tx.js";
 export {
   Casino,

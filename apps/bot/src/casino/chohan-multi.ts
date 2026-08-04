@@ -132,7 +132,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
           await sub.reply({ content: "既に張った額以上を指定してくれ（減額は不可）。", flags: MessageFlags.Ephemeral });
           return;
         }
-        if (services.ether.balanceOf(btn.user.id) < additional) {
+        if (services.chips.balanceOf(btn.user.id) < additional) {
           await sub.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
           return;
         }
@@ -142,7 +142,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
         }
         existing.amount = amt;
       } else {
-        if (services.ether.balanceOf(btn.user.id) < amt) {
+        if (services.chips.balanceOf(btn.user.id) < amt) {
           await sub.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
           return;
         }

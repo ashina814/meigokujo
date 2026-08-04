@@ -97,7 +97,7 @@ async function runCreate(interaction: ChatInputCommandInteraction, services: Ser
     await interaction.reply({ content: "選択肢は 2〜4 個で（カンマ/読点区切り）。", flags: MessageFlags.Ephemeral });
     return;
   }
-  if (services.ether.balanceOf(interaction.user.id) < DEFAULT_FEE) {
+  if (services.chips.balanceOf(interaction.user.id) < DEFAULT_FEE) {
     await interaction.reply({
       content: `議題を立てるには手数料 ${fmtEther(DEFAULT_FEE)} かかる。残高が足りない。`,
       flags: MessageFlags.Ephemeral,

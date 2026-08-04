@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
-import { ChipLedgerError as EtherError, ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
+import { ChipLedgerError, ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 import { ChipTxError } from "./chip-tx.js";
 import type { Items } from "./items.js";
 import type { HouseReservations } from "./reservations.js";
@@ -42,7 +42,9 @@ export function chainMultiplier(streak: number): { mult: number; label: string }
 
 /**
  * 福の重み（勝ち分への累進奉納率）。casino-bot 準拠のしきい値 × scale。
- * scale はエテル物価に合わせる係数（既定10 = 冥獄城レート 1Ld=10◈ 相当）。
+ *
+ * scale は「移植元 casino-bot の額面を、冥獄城のチップ物価へ読み替える係数」。
+ * 交換レートとは無関係で、チップは常に 1 Ld = 1 chip（PR8監査・項目9）。
  */
 export function fukuRate(balance: number, scale: number): number {
   if (balance <= 10_000 * scale) return 0;
@@ -248,8 +250,8 @@ export class Casino {
     jackpotCut = 0,
     opts: SettleOptions,
   ): SettleResult {
-    if (!Number.isInteger(bet) || bet <= 0) throw new EtherError("ERR_BAD_AMOUNT", { bet });
-    if (!Number.isInteger(payout) || payout < 0) throw new EtherError("ERR_BAD_AMOUNT", { payout });
+    if (!Number.isInteger(bet) || bet <= 0) throw new ChipLedgerError("ERR_BAD_AMOUNT", { bet });
+    if (!Number.isInteger(payout) || payout < 0) throw new ChipLedgerError("ERR_BAD_AMOUNT", { payout });
     const useChain = opts.chain ?? true;
     const useFuku = opts.fuku ?? true;
     const move = { game, sessionId: null };

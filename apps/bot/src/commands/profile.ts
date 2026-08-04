@@ -148,9 +148,15 @@ const TX_LABEL: Record<string, string> = {
   pension: "年金",
   reward_bump: "bump/up報酬",
   reward_vc: "浮上報酬",
-  ether_buy: "エテル購入",
-  ether_sell: "エテル換金",
-  ether_burn: "退場奉納",
+  // 賭場チップ（PR8以降）。1:1 の預入・返還と、運営の元手投入・売上精算
+  chip_deposit: "チップ預入",
+  chip_redeem: "チップ返還",
+  chip_fund: "胴元の元手",
+  chip_settle: "賭場収益の精算",
+  // 旧エテル為替（変動レート・奉納・焼却）の**歴史データ専用**。新規には作られない
+  ether_buy: "エテル購入（旧制度）",
+  ether_sell: "エテル換金（旧制度）",
+  ether_burn: "退場奉納（旧制度）",
   shop: "ショップ購入",
   dept_in: "部署へ預入",
   dept_out: "部署から引出",
@@ -164,7 +170,9 @@ function accountLabel(account: string, selfId: string): string {
   if (account === `user:${selfId}`) return "自分";
   if (account.startsWith("user:")) return `<@${account.slice(5)}>`;
   if (account === "sys:treasury") return "国庫";
-  if (account === "sys:escrow:ether") return "両替所";
+  // 準備口座は版で切り替わる（PR8）。どちらも利用者から見れば「両替所の準備」
+  if (account === "sys:escrow:ether") return "両替所（旧準備）";
+  if (account === "sys:escrow:casino") return "両替所（準備）";
   if (account.startsWith("dept:")) return `部署「${account.slice(5)}」`;
   if (account.startsWith("sys:")) return account.slice(4);
   return account;

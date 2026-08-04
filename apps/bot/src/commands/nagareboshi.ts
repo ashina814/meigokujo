@@ -156,15 +156,15 @@ function incCount(services: Services, uid: string, day: string): void {
  * 抽選結果も保存するので、再試行は同じ運勢・同じ報酬をそのまま返す。
  */
 export function drawNagareboshi(services: Services, uid: string, day: string, operationId: string): DrawRecord {
-  return services.ether.runGroup(
+  return services.chips.runGroup(
     { groupKey: `nagareboshi:${uid}:${operationId}`, kind: "solo_game", actorId: uid },
     (): DrawRecord => {
       const used = getCount(services, uid, day);
       if (used >= MAX_PER_DAY) return { ok: false, reason: "limit" };
       const fee = used === 0 ? 0 : FEE;
-      const held = services.ether.balanceOf(uid);
+      const held = services.chips.balanceOf(uid);
       if (fee > 0 && held < fee) return { ok: false, reason: "funds", fee, held };
-      if (fee > 0) services.ether.transfer(uid, HOUSE_HOLDER, fee, { reason: "流れ星の祈り代", game: "流れ星" });
+      if (fee > 0) services.chips.transfer(uid, HOUSE_HOLDER, fee, { reason: "流れ星の祈り代", game: "流れ星" });
       incCount(services, uid, day);
 
       const outcome = pickOutcome(services);
@@ -172,8 +172,8 @@ export function drawNagareboshi(services: Services, uid: string, day: string, op
       let paid = 0;
       if (outcome.reward) {
         // JPプールが満額に届かなくても、有るだけ払う（流れ星を空砲にしない）
-        paid = Math.min(outcome.reward, services.ether.balanceOf(JACKPOT_HOLDER));
-        if (paid > 0) services.ether.transfer(JACKPOT_HOLDER, uid, paid, { reason: "流れ星の褒賞", game: "流れ星" });
+        paid = Math.min(outcome.reward, services.chips.balanceOf(JACKPOT_HOLDER));
+        if (paid > 0) services.chips.transfer(JACKPOT_HOLDER, uid, paid, { reason: "流れ星の褒賞", game: "流れ星" });
       }
       return { ok: true, used, fee, outcomeKey: outcome.key, line, paid };
     },
@@ -224,7 +224,7 @@ export async function handleNagareboshiCommand(
       text: [
         `今日の残り ${remaining}/${MAX_PER_DAY - 1}回`,
         fee > 0 ? `占い料 ${fmtEther(fee).replace(" ◈", "◈")}` : "無料",
-        `所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`,
+        `所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" ◈", "◈")}`,
       ].join(" · "),
     });
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });

@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
-import { ChipLedgerError as EtherError, ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
+import { ChipLedgerError, ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 import { defaultRng, type CasinoRng } from "./rng.js";
 
 /**

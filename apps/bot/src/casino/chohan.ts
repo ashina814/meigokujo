@@ -209,7 +209,7 @@ async function runRoundInner(
     )
     .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
     .setFooter({
-      text: [`所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
+      text: [`所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
     });
 
   if (won) {
@@ -221,7 +221,7 @@ async function runRoundInner(
     });
   }
 
-  const held = services.ether.balanceOf(uid);
+  const held = services.chips.balanceOf(uid);
   const nextBet = bet;
   const doubleBet = bet * 2;
   const nextRow = new ActionRowBuilder<ButtonBuilder>().addComponents(

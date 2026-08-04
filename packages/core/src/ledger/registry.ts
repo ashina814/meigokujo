@@ -76,11 +76,15 @@ export function registerDefaultTxTypes(): void {
   registerTxType("bet", { fromKinds: ["user"], toKinds: ["system"], minorBlocked: true });
   registerTxType("prize", { fromKinds: ["system"], toKinds: ["user"], minorBlocked: true });
 
-  // エテル為替（マモンの賭場・第二通貨）。Land 側の裏付け操作のみ台帳に乗る
-  registerTxType("ether_buy", { ...userToSys, minorBlocked: true }); // 住人→準備プール（入場・フェア）
-  registerTxType("ether_sell", { ...sysToUser, minorBlocked: true }); // 準備プール→住人（退場・80%着地）
-  registerTxType("ether_burn", { fromKinds: ["system"], toKinds: ["system"] }); // プール→国庫（10%焼却＝シンク）
-  registerTxType("ether_settle", { fromKinds: ["system"], toKinds: ["system"] }); // プール→部署口座（胴元精算）
+  // 旧エテル為替（変動レート・二割奉納・焼却）の**歴史データ専用**の型（PR8監査・項目9）。
+  // PR8 以降このボットが新しく作ることはなく、legacy_pre_reset の窓に残る過去の行を
+  // 読めるようにするためだけに残してある（検算Bの LEGACY_ETHER_TX_RULES が同じ前提で監査する）。
+  // 新しい預入・返還・元手投入・売上精算は下の chip_* を使う。
+  registerTxType("ether_buy", { ...userToSys, minorBlocked: true }); // 旧: 住人→準備プール（入場）
+  registerTxType("ether_sell", { ...sysToUser, minorBlocked: true }); // 旧: 準備プール→住人（退場・80%着地）
+  registerTxType("ether_burn", { fromKinds: ["system"], toKinds: ["system"] }); // 旧: プール→国庫（10%焼却＝シンク）
+  registerTxType("ether_settle", { fromKinds: ["system"], toKinds: ["system"] }); // 旧: プール→部署口座（胴元精算）
+  // 賭場チップ（PR8）。預入・返還とも常に 1:1 で、奉納も焼却も無い
   registerTxType("chip_deposit", { ...userToSys, minorBlocked: true });
   registerTxType("chip_redeem", { ...sysToUser, minorBlocked: true });
   registerTxType("chip_fund", { fromKinds: ["system"], toKinds: ["system"] });

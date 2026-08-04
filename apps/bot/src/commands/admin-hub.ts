@@ -26,7 +26,7 @@ import {
 import {
   CasinoIntegrity,
   deptAccount,
-  ChipLedgerError as EtherError,
+  ChipLedgerError,
   HOUSE_HOLDER,
   LedgerError,
   recoverCasino,
@@ -44,6 +44,7 @@ import {
 import { updateDashboard } from "../dashboard.js";
 import { updateWaitersBoard, WAITERS_BOARD_CHANNEL_KEY } from "../waiters-board.js";
 import { fmtEther, fmtLd } from "../format.js";
+import { describeChipLedgerError, isFormallyOpen, openingBadge, openingNotice, openingPhase } from "../casino/opening.js";
 import { ticketPanelMessageForPanel } from "./tickets.js";
 import type { Services } from "../services.js";
 
@@ -178,6 +179,10 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
 
   // ── 賭場（マモン） ──
   if (section === "casino" && !action) return void (await interaction.update(casinoHome(services)));
+  // 古いパネルのボタン（stale button）は残る。押された時点の版でも必ず確かめてから modal を開く
+  if (section === "casino" && (action === "fund" || action === "settle") && !isFormallyOpen(services)) {
+    return void (await interaction.reply({ content: openingNotice(services), flags: MessageFlags.Ephemeral }));
+  }
   if (section === "casino" && action === "fund") return void (await interaction.showModal(casinoFundModal()));
   if (section === "casino" && action === "settle") return void (await interaction.showModal(casinoSettleModal()));
   if (section === "casino" && action === "halt") return void (await interaction.showModal(casinoHaltModal()));
@@ -197,7 +202,7 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   }
   if (section === "casino" && action === "baseline") {
     return void (await interaction.showModal(
-      casinoBaselineModal(services.ether.pool(), services.ledger.lastTransactionId()),
+      casinoBaselineModal(services.chips.pool(), services.ledger.lastTransactionId()),
     ));
   }
   if (section === "casino" && action === "rerecover") {
@@ -629,15 +634,21 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       await interaction.reply({ content: `⛔ ${deny}`, flags: MessageFlags.Ephemeral });
       return;
     }
+    // 古いパネルから開いた modal（stale modal）の着地点。正式開業前・未知版は
+    // generic な失敗ではなく、専用の文面で断る（PR8監査・項目8）
+    if (!isFormallyOpen(services)) {
+      await interaction.reply({ content: openingNotice(services), flags: MessageFlags.Ephemeral });
+      return;
+    }
   }
   if (section === "casino" && action === "fund") {
     const amt = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
-    if (!Number.isInteger(amt) || amt <= 0) {
+    if (!Number.isSafeInteger(amt) || amt <= 0) {
       await interaction.reply({ content: "金額は正の整数で。", flags: MessageFlags.Ephemeral });
       return;
     }
     try {
-      const r = services.ether.fundFromAccount(deptAccount(CASINO_DEPT_KEY), amt, HOUSE_HOLDER, `casino:fund:${interaction.id}`);
+      const r = services.chips.fundFromAccount(deptAccount(CASINO_DEPT_KEY), amt, HOUSE_HOLDER, `casino:fund:${interaction.id}`);
       await interaction.reply({
         content: `✅ 胴元へ **${fmtLd(r.land)}** を投入し、**${fmtEther(r.ether)}** になりました（胴元残 ${fmtEther(services.casino.houseBalance())}）。`,
         flags: MessageFlags.Ephemeral,
@@ -646,7 +657,9 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       const msg =
         e instanceof LedgerError && e.code === "ERR_INSUFFICIENT"
           ? `部署「${CASINO_DEPT_KEY}」の残高が足りません（${fmtLd(services.departments.balanceOf(CASINO_DEPT_KEY))}）。`
-          : "処理に失敗しました。";
+          : e instanceof ChipLedgerError
+            ? describeChipLedgerError(e, services, HOUSE_HOLDER)
+            : "処理に失敗しました。";
       await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
     }
     return;
@@ -656,10 +669,10 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
     const held = services.casino.houseBalance();
     // 進行中ゲームの最大配当は予約で押さえてある。その裏付けは精算できない（PR5）。
     // **金額未入力でも全残高ではなく精算可能額だけ**を対象にする
-    const settleable = services.ether.settleableBalance(HOUSE_HOLDER);
+    const settleable = services.chips.settleableBalance(HOUSE_HOLDER);
     const reserved = held - settleable;
     const amt = raw === "" ? settleable : Number(raw);
-    if (!Number.isInteger(amt) || amt <= 0) {
+    if (!Number.isSafeInteger(amt) || amt <= 0) {
       const why =
         held === 0
           ? "胴元残高が 0 です。"
@@ -670,17 +683,17 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       return;
     }
     try {
-      const r = services.ether.redeemFairToAccount(HOUSE_HOLDER, amt, deptAccount(CASINO_DEPT_KEY), `casino:settle:${interaction.id}`);
+      const r = services.chips.redeemFairToAccount(HOUSE_HOLDER, amt, deptAccount(CASINO_DEPT_KEY), `casino:settle:${interaction.id}`);
       await interaction.reply({
         content: `✅ 胴元の **${fmtEther(r.ether)}** を精算し、部署「${CASINO_DEPT_KEY}」へ **${fmtLd(r.land)}** を戻しました（胴元残 ${fmtEther(services.casino.houseBalance())}）。`,
         flags: MessageFlags.Ephemeral,
       });
     } catch (e) {
       const msg =
-        e instanceof EtherError && e.code === "ERR_RESERVED_FUNDS"
+        e instanceof ChipLedgerError && e.code === "ERR_RESERVED_FUNDS"
           ? `進行中ゲームの予約 ${fmtEther(reserved)} は精算できません（いま精算できるのは ${fmtEther(settleable)} まで）。`
-          : e instanceof EtherError && e.code === "ERR_INSUFFICIENT_ETHER"
-            ? `胴元のエテルが足りません（${fmtEther(held)}）。`
+          : e instanceof ChipLedgerError
+            ? describeChipLedgerError(e, services, HOUSE_HOLDER)
             : "処理に失敗しました。";
       await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
     }
@@ -729,7 +742,7 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       await interaction.reply({ content: "❌ 「確定」と入力されなかったので何もしていません。", flags: MessageFlags.Ephemeral });
       return;
     }
-    const poolLand = services.ether.pool();
+    const poolLand = services.chips.pool();
     const ledgerTxId = services.ledger.lastTransactionId();
     const version = services.chipTx.currentVersion();
     const placed = services.chipTx.establishOpeningLandBaseline(version, poolLand, ledgerTxId);
@@ -1975,11 +1988,14 @@ const CASINO_STATUS_LABEL: Record<string, string> = {
 };
 
 function casinoHome(services: Services) {
-  const ether = services.ether;
+  const ether = services.chips;
   const casino = services.casino;
   const dept = services.departments.get(CASINO_DEPT_KEY);
   const deptBal = dept ? services.departments.balanceOf(CASINO_DEPT_KEY) : null;
   const status = services.casinoStatus.current();
+  // 稼働状態が open でも、正式開業初期化（PR12）が終わるまで資金は動かせない。
+  // 「🟢 営業中」だけを見せると運営卓が実態と食い違う（PR8監査・項目8）
+  const phase = openingPhase(services);
   // 起動時・営業再開・再点検・計器盤はすべて同じ全点検（Land台帳 + 検算A〜D）を使う
   const report = services.casinoIntegrity.runFull();
   const checkLines = [
@@ -1993,11 +2009,16 @@ function casinoHome(services: Services) {
       [
         `**稼働状態**: ${CASINO_STATUS_LABEL[status.status] ?? status.status}`,
         `　理由: ${status.reason}（${status.changedBy}）`,
+        `**開業状態**: ${openingBadge(services)}`,
+        ...(phase === "formal" ? [] : ["", openingNotice(services)]),
         "",
         `**胴元残高**: ${fmtEther(casino.houseBalance())} （テーブルリミットの原資）`,
         `**ジャックポット積立**: ${fmtEther(casino.jackpotPool())}`,
-        `**チップ交換比率**: 1 Ld = 1 ◈`,
-        `**準備プール**: ${fmtLd(ether.pool())} ／ **発行エテル**: ${fmtEther(ether.outstanding())}`,
+        // 1:1 は opening_v1 後にだけ動く約束。それ以前に断言すると運営が誤操作する
+        phase === "formal" ? `**チップ交換比率**: 1 Ld = 1 ◈` : `**チップ交換比率**: 停止中（opening_v1 確定後に 1 Ld = 1 ◈）`,
+        phase === "unknown"
+          ? `**準備プール**: 読み取り不可（版が異常）`
+          : `**準備プール**: ${fmtLd(ether.pool())} ／ **発行チップ**: ${fmtEther(ether.outstanding())}`,
         "",
         dept
           ? `**部署「${CASINO_DEPT_KEY}」残高**: ${fmtLd(deptBal!)}`
@@ -2005,8 +2026,9 @@ function casinoHome(services: Services) {
       ].join("\n"),
     )
     .addFields({ name: report.ok ? "▸ 全点検（正常）" : "▸ 全点検（**要対応**）", value: checkLines.join("\n"), inline: false });
-  // 停止中は資金投入・売上精算も押せない（押しても資金層で弾かれるが、UIでも見せる）
-  const closed = status.status !== "open";
+  // 停止中は資金投入・売上精算も押せない（押しても資金層で弾かれるが、UIでも見せる）。
+  // 正式開業前・未知版も同じ扱いにする。押せてしまうと、必ず断られる操作を運営に踏ませる
+  const closed = status.status !== "open" || phase !== "formal";
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:casino:fund").setLabel("資金投入").setEmoji("🔸").setStyle(ButtonStyle.Primary).setDisabled(!dept || closed),
     new ButtonBuilder().setCustomId("mgmt:casino:settle").setLabel("売上精算").setEmoji("🔹").setStyle(ButtonStyle.Secondary).setDisabled(!dept || closed),

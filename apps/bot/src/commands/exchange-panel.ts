@@ -13,15 +13,55 @@ import {
 import { ChipLedgerError, LedgerError } from "@meigokujo/core";
 import { fmtLd, fmtEther } from "../format.js";
 import { C_MAMMON, E, HR_THIN } from "../casino/ui.js";
+import {
+  UNKNOWN_OPENING_NOTICE,
+  describeChipLedgerError,
+  isFormallyOpen,
+  landShortfallMessage,
+  openingBadge,
+  openingNotice,
+  openingPhase,
+} from "../casino/opening.js";
 import type { Services } from "../services.js";
 
 /**
  * マモンの両替所（Land⇄賭場チップ）。預入・返還とも常に1:1。
+ *
+ * ただし 1:1 が動くのは正式開業（`opening_v1`）後だけ。それ以前は既存残高を保持したまま
+ * 資金操作を全停止しているので、パネルもその実態どおりに出す（PR8監査・項目8）。
  */
 
+/** 未知版では残高すら読めない。読もうとして例外を出すより、異常であることだけを出す */
+function unknownVersionPanel(): EmbedBuilder {
+  return new EmbedBuilder()
+    .setAuthor({ name: "マモンの賭場 · 両替所" })
+    .setTitle("⚠️ 賭場の版が異常")
+    .setColor(0x991b1b)
+    .setDescription(UNKNOWN_OPENING_NOTICE);
+}
+
 function ratePanel(services: Services): EmbedBuilder {
+  const phase = openingPhase(services);
+  if (phase === "unknown") return unknownVersionPanel();
+
   const pool = services.chips.pool();
   const outstanding = services.chips.outstanding();
+
+  if (phase !== "formal") {
+    // 見積り（quoteDeposit/quoteRedeem）は 1:1 を約束する表示なので、
+    // まだ 1:1 が始まっていない段階では**一切出さない**
+    return new EmbedBuilder()
+      .setAuthor({ name: "マモンの賭場 · 両替所" })
+      .setTitle(`${E.jp} 正式開業準備中`)
+      .setColor(0x6b7280)
+      .setDescription([openingNotice(services), "", HR_THIN, "**いまの帳簿**"].join("\n"))
+      .addFields(
+        { name: `${E.chart} 準備プール`, value: `${fmtLd(pool)}`, inline: true },
+        { name: `${E.chart} 発行チップ`, value: `${outstanding.toLocaleString()} ${E.ether}`, inline: true },
+        { name: `${E.chart} 状態`, value: openingBadge(services), inline: true },
+      )
+      .setFooter({ text: "変動レート・奉納・焼却はありません" });
+  }
 
   // 直感的にわかる例示 (10,000 Ld で何エテル？ / 10,000 ◈ で何 Ld？)
   const sampleBuy = services.chips.quoteDeposit(10_000);
@@ -45,7 +85,7 @@ function ratePanel(services: Services): EmbedBuilder {
     )
     .addFields(
       { name: `${E.chart} 準備プール`, value: `${fmtLd(pool)}`, inline: true },
-      { name: `${E.chart} 発行エテル`, value: `${outstanding.toLocaleString()} ${E.ether}`, inline: true },
+      { name: `${E.chart} 発行チップ`, value: `${outstanding.toLocaleString()} ${E.ether}`, inline: true },
       { name: `${E.chart} 交換比率`, value: `1 ${E.ether} = 1 Ld`, inline: true },
     )
     .setFooter({ text: "変動レート・奉納・焼却はありません" });
@@ -53,9 +93,22 @@ function ratePanel(services: Services): EmbedBuilder {
 
 export function exchangePanelMessage(services: Services) {
   const embed = ratePanel(services);
+  // 正式開業前・未知版では、押しても必ず断られるボタンを**そもそも出さない**（項目8）。
+  // 押せてしまうと「押したのに何も起きない／エラーになる」という体験になる。
+  const open = isFormallyOpen(services);
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("ether:buy").setLabel("入場（Land → エテル）").setEmoji("🔸").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("ether:sell").setLabel("退場（エテル → Land）").setEmoji("🔹").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("ether:buy")
+      .setLabel("入場（Land → チップ）")
+      .setEmoji("🔸")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(!open),
+    new ButtonBuilder()
+      .setCustomId("ether:sell")
+      .setLabel("退場（チップ → Land）")
+      .setEmoji("🔹")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!open),
     new ButtonBuilder().setCustomId("ether:balance").setLabel("財布").setEmoji("👛").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("ether:refresh").setLabel("更新").setEmoji("🔁").setStyle(ButtonStyle.Secondary),
   );
@@ -73,14 +126,21 @@ export async function handleEtherButton(interaction: ButtonInteraction, services
 
   if (action === "balance") {
     const uid = interaction.user.id;
+    if (openingPhase(services) === "unknown") {
+      await interaction.reply({ embeds: [unknownVersionPanel()], flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const open = isFormallyOpen(services);
     const ether = services.chips.balanceOf(uid);
     const land = services.ledger.balanceOf(`user:${uid}`);
-    const q = ether > 0 ? services.chips.quoteRedeem(ether) : null;
+    // 「今すぐ換金すると」は 1:1 が動いているときだけの約束。停止中に出すと嘘になる
+    const q = open && ether > 0 ? services.chips.quoteRedeem(ether) : null;
     const embed = new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · 財布" })
-      .setColor(C_MAMMON)
+      .setColor(open ? C_MAMMON : 0x6b7280)
+      .setDescription(open ? null : openingNotice(services))
       .addFields(
-        { name: `${E.ether} 所持エテル`, value: `**${fmtEther(ether)}**`, inline: true },
+        { name: `${E.ether} 所持チップ`, value: `**${fmtEther(ether)}**`, inline: true },
         { name: "🪙 所持 Land", value: `**${fmtLd(land)}**`, inline: true },
         ...(q
           ? [
@@ -93,6 +153,12 @@ export async function handleEtherButton(interaction: ButtonInteraction, services
           : []),
       );
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  // 停止中・正式開業前に modal を開かせない。開かせると入力させたあとで断ることになる
+  if ((action === "buy" || action === "sell") && !isFormallyOpen(services)) {
+    await interaction.reply({ content: openingNotice(services), flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -137,8 +203,13 @@ export async function handleEtherButton(interaction: ButtonInteraction, services
 
 export async function handleEtherModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
   const mode = interaction.customId.split(":")[2] as "buy" | "sell";
+  // 古いパネルから開いた modal（stale modal）がここへ着地しうる。版を必ず見直す
+  if (!isFormallyOpen(services)) {
+    await interaction.reply({ content: openingNotice(services), flags: MessageFlags.Ephemeral });
+    return;
+  }
   const amt = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
-  if (!Number.isInteger(amt) || amt <= 0) {
+  if (!Number.isSafeInteger(amt) || amt <= 0) {
     await interaction.reply({ content: "金額は正の整数で入力してくれ。", flags: MessageFlags.Ephemeral });
     return;
   }
@@ -177,17 +248,9 @@ export async function handleEtherModal(interaction: ModalSubmitInteraction, serv
   } catch (e) {
     let msg = "処理に失敗した。";
     if (e instanceof ChipLedgerError) {
-      msg =
-        e.code === "ERR_INSUFFICIENT_ETHER"
-          ? `エテルが足りない（所持 ${fmtEther(Number(e.meta.held ?? 0))}）。`
-          : e.code === "ERR_DUPLICATE"
-            ? "この操作はすでに処理済みだ。"
-            : "金額が不正だ。";
+      msg = describeChipLedgerError(e, services, uid);
     } else if (e instanceof LedgerError) {
-      msg =
-        e.code === "ERR_INSUFFICIENT"
-          ? `Land が足りない（所持 ${fmtLd(services.ledger.balanceOf(`user:${uid}`))}）。`
-          : `台帳エラー: ${e.code}`;
+      msg = e.code === "ERR_INSUFFICIENT" ? landShortfallMessage(services, uid) : `台帳エラー: ${e.code}`;
     }
     await interaction.reply({ content: `❌ ${msg}`, flags: MessageFlags.Ephemeral });
   }

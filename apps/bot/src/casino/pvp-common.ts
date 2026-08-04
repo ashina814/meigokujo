@@ -126,16 +126,16 @@ export function collectStakes(
 
   // 旧方式（session なし・レガシー呼び出し互換）: house へ直接。こちらも1グループ
   try {
-    return services.ether.runGroup(
+    return services.chips.runGroup(
       { groupKey: `pvp:collect:${game}:${operationId}`, kind: "table_hold", actorId: "system:pvp" },
       (): boolean => {
         // 残高確認もグループの中（徴収成功後の再試行を残高不足で false にしない）
         for (const u of userIds) {
-          if (services.ether.balanceOf(u) < bet) throw new StakeShortfall();
+          if (services.chips.balanceOf(u) < bet) throw new StakeShortfall();
         }
         // 通算損益はここでは動かさない（PR3）。徴収は「まだ何も確定していない」状態で、
         // 対局中なのに通算負けが増えるのは定義に合わない。記録は精算のとき一度だけ
-        for (const u of userIds) services.ether.transfer(u, HOUSE_HOLDER, bet, { reason: "対人戦の賭け金", game });
+        for (const u of userIds) services.chips.transfer(u, HOUSE_HOLDER, bet, { reason: "対人戦の賭け金", game });
         return true;
       },
     );
@@ -162,9 +162,9 @@ export function refundAll(services: Services, userIds: string[], bet: number, op
     services.escrow.refundMany(session, userIds, operationId);
     return;
   }
-  services.ether.runGroup({ groupKey: `pvp:refund:${operationId}`, kind: "table_refund", actorId: "system:pvp" }, () => {
+  services.chips.runGroup({ groupKey: `pvp:refund:${operationId}`, kind: "table_refund", actorId: "system:pvp" }, () => {
     // 返金でも通算損益は動かさない（徴収時にも記録していないので差引0のまま・PR3）
-    for (const u of userIds) services.ether.transfer(HOUSE_HOLDER, u, bet, { reason: "対人戦の不成立返金" });
+    for (const u of userIds) services.chips.transfer(HOUSE_HOLDER, u, bet, { reason: "対人戦の不成立返金" });
   });
 }
 
@@ -233,10 +233,10 @@ export function settlePvp(
 
   // 旧方式（session なし・レガシー呼び出し互換）: house から直接動かす
   const src = LEGACY_STAKE_HOLDER;
-  return services.ether.runGroup(
+  return services.chips.runGroup(
     { groupKey: `pvp:settle:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
     () => {
-      if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
+      if (houseCut > 0) services.chips.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
       if (winners.length === 0) {
         recordPvpNet(services, stakes, new Map());
         return { payout: 0, houseCut };
@@ -245,11 +245,11 @@ export function settlePvp(
       const remainder = distributable - share * winners.length;
       const received = new Map<string, number>();
       for (const w of winners) {
-        services.ether.transfer(src, w, share, { reason: "対人戦の配当" });
+        services.chips.transfer(src, w, share, { reason: "対人戦の配当" });
         received.set(w, (received.get(w) ?? 0) + share);
       }
       if (remainder > 0) {
-        services.ether.transfer(src, winners[0]!, remainder, { reason: "対人戦の配当（端数）" });
+        services.chips.transfer(src, winners[0]!, remainder, { reason: "対人戦の配当（端数）" });
         received.set(winners[0]!, (received.get(winners[0]!) ?? 0) + remainder);
       }
       // 通算損益は「受取 − 出した額」を精算時に一度だけ（PR3）
@@ -295,10 +295,10 @@ export function settleProportional(
 
   // 旧方式（session なし）
   const src = LEGACY_STAKE_HOLDER;
-  services.ether.runGroup(
+  services.chips.runGroup(
     { groupKey: `pvp:settle_proportional:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
     () => {
-      if (houseCut > 0) services.ether.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
+      if (houseCut > 0) services.chips.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
       const received = new Map<string, number>();
       let remaining = distributable;
       for (let i = 0; i < winners.length; i++) {
@@ -306,7 +306,7 @@ export function settleProportional(
         const isLast = i === winners.length - 1;
         const share = isLast ? remaining : Math.floor((distributable * w.bet) / winnerPot);
         if (share > 0) {
-          services.ether.transfer(src, w.userId, share, { reason: "対人戦の比例配当" });
+          services.chips.transfer(src, w.userId, share, { reason: "対人戦の比例配当" });
           received.set(w.userId, (received.get(w.userId) ?? 0) + share);
         }
         remaining -= share;

@@ -59,7 +59,7 @@ function setup(rng = scriptedRng([0.5])) {
   const casino = new Casino(db, ether, events, { items, reservations });
   const vip = new Vip(db, ether, events);
   const freeSpins = new FreeSpins(db);
-  const services = { db, ether, casino, items, vip, reservations, freeSpins, events, rng } as unknown as Services;
+  const services = { db, ether, chips: ether, chipTx, casino, items, vip, reservations, freeSpins, events, rng } as unknown as Services;
   return { db, ledger, ether, casino, items, vip, reservations, freeSpins, services };
 }
 

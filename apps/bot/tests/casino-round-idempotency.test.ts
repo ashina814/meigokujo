@@ -42,7 +42,7 @@ function setup(rng: CasinoRng) {
   const casino = new Casino(db, ether, events, { items, reservations });
   const escrow = new Escrow(db, ether, events);
   const freeSpins = new FreeSpins(db);
-  const services = { db, ether, casino, items, escrow, freeSpins, reservations, rng, events } as unknown as Services;
+  const services = { db, ether, chips: ether, chipTx, casino, items, escrow, freeSpins, reservations, rng, events } as unknown as Services;
   return { db, chipTx, ether, casino, items, escrow, freeSpins, reservations, services };
 }
 

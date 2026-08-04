@@ -7,8 +7,8 @@ import { denyIfCasinoClosed, isCasinoInteraction } from "../src/casino/gate.js";
  * 賭場が停止しているあいだ、チップが動きうる操作をひとつも通さないこと。
  * 読むだけの導線と運営卓は止めない（止めると原因調査も復旧もできなくなる）。
  */
-function fakeServices(deny: string | null): Services {
-  return { casinoStatus: { denyMessage: () => deny } } as unknown as Services;
+function fakeServices(deny: string | null, phase: "pre_reset" | "formal" | "unknown" = "formal"): Services {
+  return { casinoStatus: { denyMessage: () => deny }, chipTx: { openingPhase: () => phase } } as unknown as Services;
 }
 
 function command(name: string): Interaction & { reply: ReturnType<typeof vi.fn> } {
@@ -84,5 +84,43 @@ describe("賭場の入口ガード", () => {
     const i = command("遊ぶ");
     i.reply.mockRejectedValue(new Error("interaction expired"));
     expect(await denyIfCasinoClosed(i, services)).toBe(true);
+  });
+
+  // PR8監査・項目8: 稼働状態が open でも、正式開業初期化が終わるまで資金は動かせない
+  it("正式開業前は open でも専用の文面で断る", async () => {
+    const services = fakeServices(null, "pre_reset");
+    for (const i of [command("遊ぶ"), component("ether:buy"), component("slots:retry:50")]) {
+      expect(await denyIfCasinoClosed(i, services)).toBe(true);
+      const arg = i.reply.mock.calls[0]![0] as { content: string };
+      expect(arg.content).toContain("正式開業準備中");
+      expect(arg.content).toContain("既存残高は保持されています");
+      // generic な失敗文言へ落としていないこと
+      expect(arg.content).not.toContain("処理に失敗");
+      expect(arg.content).not.toContain("営業中");
+    }
+  });
+
+  it("未知版では異常であることを明示して全操作を止める", async () => {
+    const services = fakeServices(null, "unknown");
+    const i = command("遊ぶ");
+    expect(await denyIfCasinoClosed(i, services)).toBe(true);
+    const arg = i.reply.mock.calls[0]![0] as { content: string };
+    expect(arg.content).toContain("版が異常");
+  });
+
+  it("正式開業前でも読むだけの導線と運営卓は素通りする", async () => {
+    const services = fakeServices(null, "pre_reset");
+    for (const i of [command("案内"), command("管理"), command("賭場番付")]) {
+      expect(await denyIfCasinoClosed(i, services)).toBe(false);
+      expect(i.reply).not.toHaveBeenCalled();
+    }
+  });
+
+  it("停止理由がある場合は、そちらを優先して見せる", async () => {
+    const services = fakeServices("賭場は改装中だ。", "pre_reset");
+    const i = command("遊ぶ");
+    expect(await denyIfCasinoClosed(i, services)).toBe(true);
+    const arg = i.reply.mock.calls[0]![0] as { content: string };
+    expect(arg.content).toContain("改装中");
   });
 });

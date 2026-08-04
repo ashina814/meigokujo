@@ -138,7 +138,7 @@ function buildSpinEmbed(
 }
 
 function retryButtons(uid: string, bet: number, services: Services): ActionRowBuilder<ButtonBuilder> {
-  const held = services.ether.balanceOf(uid);
+  const held = services.chips.balanceOf(uid);
   const min = MIN_BET;
   const max = Math.min(effectiveMaxBet(services, uid, "スロット"), held);
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -305,7 +305,7 @@ const reelsFromNames = (names: readonly [string, string, string]): [SlotSymbol, 
 export function spinPaid(services: Services, uid: string, bet: number, interactionId: string): SpinRecord {
   const rng = services.rng;
   const groupKey = `slots:spin:${uid}:${interactionId}:paid`;
-  return services.ether.runGroup(
+  return services.chips.runGroup(
     { groupKey, kind: "solo_game", actorId: uid },
     (): SpinRecord => {
       const reelsRaw: [SlotSymbol, SlotSymbol, SlotSymbol] = [spinReel(rng), spinReel(rng), spinReel(rng)];
@@ -349,7 +349,7 @@ export function spinPaid(services: Services, uid: string, bet: number, interacti
           totalClaim: freeAmulet.payout + jackpotClaim,
         });
         if (jackpotClaim > 0) {
-          services.ether.transfer("jackpot", services.freeSpins.jackpotClaimHolder(pendingFreeSpin), jackpotClaim, {
+          services.chips.transfer("jackpot", services.freeSpins.jackpotClaimHolder(pendingFreeSpin), jackpotClaim, {
             reason: "フリースピンJP請求の予約",
             game: "スロット",
           });
@@ -392,7 +392,7 @@ export function resolveFreeSpin(
     reservationKey ? s.reservations.availableIncludingOwn(reservationKey) : s.casino.availableForLiability();
   const key = services.freeSpins.payoutGroupKey(row);
   try {
-    return services.ether.runGroup({ groupKey: key, kind: "solo_game", actorId: row.userId }, (): SpinRecord => {
+    return services.chips.runGroup({ groupKey: key, kind: "solo_game", actorId: row.userId }, (): SpinRecord => {
       const reelsRaw = reelsFromNames(row.reels);
       const spin = evaluate(reelsRaw, row.bet);
       // 払う前に「これから払う」印を付ける。例外が出れば一緒に巻き戻って pending に戻る
@@ -406,11 +406,11 @@ export function resolveFreeSpin(
         throw new FreeSpinUnpayableError(wanted, capacity);
       }
       if (wanted > 0) {
-        services.ether.transfer("house", row.userId, wanted, { reason: "フリースピンの配当", game: "スロット" });
+        services.chips.transfer("house", row.userId, wanted, { reason: "フリースピンの配当", game: "スロット" });
         // 賭けなしの払い出しなので settle を通らない。通算損益にはここで足す
       }
       if (row.jackpotClaim > 0) {
-        services.ether.transfer(services.freeSpins.jackpotClaimHolder(row), row.userId, row.jackpotClaim, {
+        services.chips.transfer(services.freeSpins.jackpotClaimHolder(row), row.userId, row.jackpotClaim, {
           reason: "フリースピンのジャックポット請求",
           game: "スロット",
         });
@@ -623,7 +623,7 @@ async function renderSpin(
     )
     .setFooter({
       text: [
-        `所持 ${fmtEther(services.ether.balanceOf(uid)).replace(" ◈", "◈")}`,
+        `所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" ◈", "◈")}`,
         !isFreeSpin ? `賭け ${fmtEther(bet).replace(" ◈", "◈")}` : "無料",
         winStreak >= 2 ? `🔥 ${winStreak}連勝` : "",
         `JP ${fmtEther(services.casino.jackpotPool()).replace(" ◈", "◈")}`,

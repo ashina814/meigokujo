@@ -88,7 +88,7 @@ function rebuild(db: ReturnType<typeof openDb>, rng: CasinoRng = scriptedRng([0.
   const escrow = new Escrow(db, ether, events, { onPlayerNet: recordPlayerNet });
   const markets = new Markets(db, ether, events, { onPlayerNet: recordPlayerNet });
   const freeSpins = new FreeSpins(db);
-  const services = { db, ether, casino, items, vip, escrow, markets, freeSpins, reservations, rng, events } as unknown as Services;
+  const services = { db, ether, chips: ether, chipTx, casino, items, vip, escrow, markets, freeSpins, reservations, rng, events } as unknown as Services;
   return { db, ledger, chipTx, ether, casino, items, vip, escrow, markets, freeSpins, reservations, events, services };
 }
 

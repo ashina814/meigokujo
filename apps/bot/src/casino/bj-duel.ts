@@ -70,11 +70,11 @@ export async function playBjDuel(
     await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
     return;
   }
-  if (services.ether.balanceOf(challenger.id) < bet) {
+  if (services.chips.balanceOf(challenger.id) < bet) {
     await interaction.reply({ content: "自分のエテル残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }
-  if (services.ether.balanceOf(opponent.id) < bet) {
+  if (services.chips.balanceOf(opponent.id) < bet) {
     await interaction.reply({ content: `<@${opponent.id}> のエテル残高が足りない。`, flags: MessageFlags.Ephemeral });
     return;
   }
