@@ -5,20 +5,26 @@ import { MARKET_LIVE_STATUSES, marketEscrowHolder } from "./market.js";
 
 export interface UserChipAssets {
   userId: string;
-  /** いま賭場で使えるチップ。 */
   freeChips: number;
-  /** 卓・板に拘束され、返還または精算を待つチップ。 */
   escrowed: number;
-  /** 自由チップ + 利用者帰属が確定している拘束チップ。 */
   total: number;
 }
 
 export type EscrowAssetSourceKind = "session" | "market";
+export type EscrowAssetMismatchScope = "global" | "holder" | "user";
 
 export interface EscrowAssetRow {
   userId: string;
   holder: string;
   amount: number;
+  sourceKind: EscrowAssetSourceKind;
+  sourceId: string;
+}
+
+export interface EscrowAssetHolderTotal {
+  holder: string;
+  expected: number;
+  userIds: readonly string[];
   sourceKind: EscrowAssetSourceKind;
   sourceId: string;
 }
@@ -37,6 +43,8 @@ export type EscrowAssetMismatchCode =
 
 export interface EscrowAssetMismatch {
   code: EscrowAssetMismatchCode;
+  scope: EscrowAssetMismatchScope;
+  affectedUserIds?: readonly string[];
   holder: string;
   expected: number | null;
   actual: number | null;
@@ -51,8 +59,13 @@ export interface EscrowAssetVerification {
   mismatches: EscrowAssetMismatch[];
 }
 
-interface EscrowAssetSnapshot extends EscrowAssetVerification {
-  rows: EscrowAssetRow[];
+export interface EscrowAssetInspection extends EscrowAssetVerification {
+  rows: readonly EscrowAssetRow[];
+  holders: readonly EscrowAssetHolderTotal[];
+  knownUserIds: readonly string[];
+}
+
+interface EscrowAssetSnapshot extends EscrowAssetInspection {
   byUser: Map<string, number>;
 }
 
@@ -78,6 +91,12 @@ interface RawMarketBetRow {
 interface RawBalanceRow {
   user_id: unknown;
   amount: unknown;
+}
+
+interface MarketRecord {
+  id: number;
+  status: string;
+  fundMode: string;
 }
 
 const SESSION_PREFIX = "escrow:session:";
@@ -108,27 +127,23 @@ function checkedAdd(left: number, right: number, field: string, meta: Record<str
   return value;
 }
 
+function uniqueSorted(values: Iterable<string>): string[] {
+  return [...new Set(values)].sort((a, b) => a.localeCompare(b));
+}
+
 function mismatchKey(row: EscrowAssetMismatch): string {
   return [
     row.code,
+    row.scope,
     row.holder,
     row.sourceKind ?? "",
     row.sourceId ?? "",
     row.userId ?? "",
+    (row.affectedUserIds ?? []).join(","),
     row.detail ?? "",
   ].join("\u0000");
 }
 
-/**
- * 利用者視点のチップ残高（PR9）。
- *
- * - freeChips: `userId` holder にあり、いま利用できるチップ
- * - escrowed: 現行の卓・板台帳と実holder残高が一致し、本人帰属を一意に決められる拘束額
- * - total: freeChips + escrowed
- *
- * 旧 `source='house'`、未知形式、帳簿不一致、孤児holder、破損schema/金額は推測配分しない。
- * 読み取りAPIは自動返金・隔離・migrationを一切行わない。
- */
 export class CasinoChipAssets {
   constructor(
     private readonly db: Database.Database,
@@ -137,15 +152,14 @@ export class CasinoChipAssets {
 
   freeChips(userId: string): number {
     this.assertUserId(userId);
-    // `ChipLedger.freeChips()` は balanceOf の読み取り別名に留め、この集約層だけが使用する。
     return this.chips.freeChips(userId);
   }
 
   escrowed(userId: string): number {
     this.assertUserId(userId);
     return this.readSnapshot(() => {
-      const snapshot = this.inspectEscrowed();
-      this.assertVerifiable(snapshot);
+      const snapshot = this.buildSnapshot();
+      this.assertVerifiableForUser(snapshot, userId);
       return snapshot.byUser.get(userId) ?? 0;
     });
   }
@@ -153,28 +167,26 @@ export class CasinoChipAssets {
   forUser(userId: string): UserChipAssets {
     this.assertUserId(userId);
     return this.readSnapshot(() => {
-      // 自由残高と拘束台帳を同一 SQLite スナップショットで読む。
       const freeChips = this.chips.freeChips(userId);
-      const snapshot = this.inspectEscrowed();
-      this.assertVerifiable(snapshot);
+      const snapshot = this.buildSnapshot();
+      this.assertVerifiableForUser(snapshot, userId);
       const escrowed = snapshot.byUser.get(userId) ?? 0;
       const total = checkedAdd(freeChips, escrowed, "userTotal", { userId });
       return { userId, freeChips, escrowed, total };
     });
   }
 
-  /**
-   * 拘束チップを双方向に照合する。
-   *
-   * - 帳簿 → 実残高: holder別帳簿合計と実残高が一致すること
-   * - 実残高 → 帳簿: 利用者預託holderに正の残高があるなら対応帳簿があること
-   *
-   * 不一致を補填・返金・隔離せず、理由コード付きで返す。
-   */
   verifyEscrowed(): EscrowAssetVerification {
     return this.readSnapshot(() => {
-      const { ok, mismatches } = this.inspectEscrowed();
+      const { ok, mismatches } = this.buildSnapshot();
       return { ok, mismatches };
+    });
+  }
+
+  inspectEscrowed(): EscrowAssetInspection {
+    return this.readSnapshot(() => {
+      const { ok, mismatches, rows, holders, knownUserIds } = this.buildSnapshot();
+      return { ok, mismatches, rows, holders, knownUserIds };
     });
   }
 
@@ -194,29 +206,42 @@ export class CasinoChipAssets {
     if (!valid) throw new ChipLedgerError("ERR_BAD_IDENTIFIER", { field: "userId", userId });
   }
 
-  private assertVerifiable(snapshot: EscrowAssetSnapshot): void {
-    if (snapshot.ok) return;
+  private assertVerifiableForUser(snapshot: EscrowAssetSnapshot, userId: string): void {
+    const relevant = snapshot.mismatches.filter((mismatch) => {
+      if (mismatch.scope === "global") return true;
+      if (mismatch.affectedUserIds?.includes(userId)) return true;
+      return mismatch.scope === "user" && mismatch.userId === userId;
+    });
+    if (relevant.length === 0) return;
     throw new ChipLedgerError("ERR_CORRUPT_BALANCE", {
       field: "escrowed",
-      mismatches: snapshot.mismatches,
+      userId,
+      mismatches: relevant,
     });
   }
 
-  private inspectEscrowed(): EscrowAssetSnapshot {
+  private buildSnapshot(): EscrowAssetSnapshot {
     const mismatches: EscrowAssetMismatch[] = [];
     const rows: EscrowAssetRow[] = [];
     const expectedByHolder = new Map<string, number>();
+    const usersByHolder = new Map<string, Set<string>>();
     const byUser = new Map<string, number>();
     const invalidHolders = new Set<string>();
     const invalidUsers = new Set<string>();
 
-    const addMismatch = (mismatch: EscrowAssetMismatch): void => {
-      mismatches.push(mismatch);
+    const addMismatch = (input: EscrowAssetMismatch): void => {
+      const affectedUserIds = input.affectedUserIds ? uniqueSorted(input.affectedUserIds) : undefined;
+      mismatches.push({ ...input, ...(affectedUserIds && affectedUserIds.length > 0 ? { affectedUserIds } : {}) });
     };
 
     const knownUsers = this.knownUserIds(addMismatch);
+
     const addAsset = (row: EscrowAssetRow): void => {
       rows.push(row);
+      const holderUsers = usersByHolder.get(row.holder) ?? new Set<string>();
+      holderUsers.add(row.userId);
+      usersByHolder.set(row.holder, holderUsers);
+
       try {
         expectedByHolder.set(
           row.holder,
@@ -230,6 +255,8 @@ export class CasinoChipAssets {
         invalidHolders.add(row.holder);
         addMismatch({
           code: "corrupt_amount",
+          scope: "holder",
+          affectedUserIds: [...holderUsers],
           holder: row.holder,
           expected: null,
           actual: null,
@@ -239,17 +266,18 @@ export class CasinoChipAssets {
           detail: error instanceof Error ? error.message : String(error),
         });
       }
+
       try {
         byUser.set(
           row.userId,
-          checkedAdd(byUser.get(row.userId) ?? 0, row.amount, "userEscrowed", {
-            userId: row.userId,
-          }),
+          checkedAdd(byUser.get(row.userId) ?? 0, row.amount, "userEscrowed", { userId: row.userId }),
         );
       } catch (error) {
         invalidUsers.add(row.userId);
         addMismatch({
           code: "corrupt_amount",
+          scope: "user",
+          affectedUserIds: [row.userId],
           holder: row.holder,
           expected: null,
           actual: null,
@@ -266,7 +294,7 @@ export class CasinoChipAssets {
 
     for (const userId of invalidUsers) byUser.delete(userId);
 
-    const actualByHolder = this.readEscrowBalances(addMismatch);
+    const actualByHolder = this.readEscrowBalances(addMismatch, usersByHolder);
     const compared = new Set<string>();
 
     for (const [holder, expected] of expectedByHolder) {
@@ -274,13 +302,14 @@ export class CasinoChipAssets {
       if (invalidHolders.has(holder)) continue;
       const actual = actualByHolder.get(holder) ?? 0;
       if (expected !== actual) {
-        const description = this.describeHolder(holder);
         addMismatch({
           code: "balance_mismatch",
+          scope: "holder",
+          affectedUserIds: [...(usersByHolder.get(holder) ?? [])],
           holder,
           expected,
           actual,
-          ...(description ?? {}),
+          ...(this.describeHolder(holder) ?? {}),
         });
       }
     }
@@ -291,6 +320,7 @@ export class CasinoChipAssets {
       if (description) {
         addMismatch({
           code: "missing_ledger_rows",
+          scope: "holder",
           holder,
           expected: 0,
           actual,
@@ -300,6 +330,7 @@ export class CasinoChipAssets {
       } else {
         addMismatch({
           code: "unknown_escrow_holder",
+          scope: "holder",
           holder,
           expected: null,
           actual,
@@ -311,13 +342,32 @@ export class CasinoChipAssets {
     const unique = new Map<string, EscrowAssetMismatch>();
     for (const mismatch of mismatches) unique.set(mismatchKey(mismatch), mismatch);
     const sorted = [...unique.values()].sort((a, b) => mismatchKey(a).localeCompare(mismatchKey(b)));
-    return { ok: sorted.length === 0, mismatches: sorted, rows, byUser };
+    const holders: EscrowAssetHolderTotal[] = [...expectedByHolder.entries()]
+      .filter(([holder]) => !invalidHolders.has(holder))
+      .map(([holder, expected]) => {
+        const description = this.describeHolder(holder);
+        if (!description) throw new ChipLedgerError("ERR_CORRUPT_BALANCE", { field: "holder", holder });
+        return {
+          holder,
+          expected,
+          userIds: uniqueSorted(usersByHolder.get(holder) ?? []),
+          ...description,
+        };
+      })
+      .sort((a, b) => a.holder.localeCompare(b.holder));
+
+    return {
+      ok: sorted.length === 0,
+      mismatches: sorted,
+      rows: rows.slice(),
+      holders,
+      knownUserIds: uniqueSorted(knownUsers),
+      byUser,
+    };
   }
 
-  private knownUserIds(
-    addMismatch: (mismatch: EscrowAssetMismatch) => void,
-  ): Set<string> | null {
-    if (!this.requireColumns("accounts", ["id", "kind"], addMismatch)) return null;
+  private knownUserIds(addMismatch: (mismatch: EscrowAssetMismatch) => void): Set<string> {
+    if (!this.requireColumns("accounts", ["id", "kind"], addMismatch)) return new Set();
     const rows = this.db
       .prepare("SELECT id FROM accounts WHERE kind = 'user' AND id LIKE 'user:%'")
       .all() as Array<{ id: unknown }>;
@@ -326,6 +376,7 @@ export class CasinoChipAssets {
       if (typeof row.id !== "string" || !row.id.startsWith("user:") || row.id.length <= "user:".length) {
         addMismatch({
           code: "invalid_user_id",
+          scope: "global",
           holder: "accounts",
           expected: null,
           actual: null,
@@ -337,6 +388,7 @@ export class CasinoChipAssets {
       if (userId.startsWith("user:") || RESERVED_USER_IDS.has(userId) || !isPlayerHolder(userId)) {
         addMismatch({
           code: "invalid_user_id",
+          scope: "global",
           holder: row.id,
           expected: null,
           actual: null,
@@ -351,7 +403,7 @@ export class CasinoChipAssets {
   }
 
   private readSessionRows(
-    knownUsers: ReadonlySet<string> | null,
+    knownUsers: ReadonlySet<string>,
     addMismatch: (mismatch: EscrowAssetMismatch) => void,
     addAsset: (row: EscrowAssetRow) => void,
   ): void {
@@ -361,6 +413,7 @@ export class CasinoChipAssets {
     if (!this.hasColumns(columns, required)) {
       addMismatch({
         code: "schema_incomplete",
+        scope: "global",
         holder: "casino_escrow",
         expected: null,
         actual: null,
@@ -376,6 +429,7 @@ export class CasinoChipAssets {
     for (const raw of rawRows) {
       const sourceId = typeof raw.session_id === "string" ? raw.session_id : String(raw.session_id);
       const userId = typeof raw.user_id === "string" ? raw.user_id : String(raw.user_id);
+      const affected = typeof raw.user_id === "string" && raw.user_id.length > 0 ? [raw.user_id] : [];
       const canonicalHolder =
         typeof raw.session_id === "string" && raw.session_id.length > 0
           ? escrowHolderFor(raw.session_id)
@@ -386,10 +440,12 @@ export class CasinoChipAssets {
         raw.session_id.length === 0 ||
         typeof raw.user_id !== "string" ||
         raw.user_id.length === 0 ||
-        !knownUsers?.has(raw.user_id)
+        !knownUsers.has(raw.user_id)
       ) {
         addMismatch({
           code: "invalid_user_id",
+          scope: "user",
+          affectedUserIds: affected,
           holder: canonicalHolder,
           expected: null,
           actual: null,
@@ -403,6 +459,8 @@ export class CasinoChipAssets {
       if (!isSafePositiveInteger(raw.amount)) {
         addMismatch({
           code: "corrupt_amount",
+          scope: "user",
+          affectedUserIds: [raw.user_id],
           holder: canonicalHolder,
           expected: null,
           actual: typeof raw.amount === "number" ? raw.amount : null,
@@ -416,6 +474,8 @@ export class CasinoChipAssets {
       if (typeof raw.source !== "string" || raw.source !== canonicalHolder) {
         addMismatch({
           code: "invalid_legacy_source",
+          scope: "user",
+          affectedUserIds: [raw.user_id],
           holder: typeof raw.source === "string" ? raw.source : canonicalHolder,
           expected: raw.amount,
           actual: null,
@@ -434,6 +494,8 @@ export class CasinoChipAssets {
       if (ownership.has(key)) {
         addMismatch({
           code: "duplicate_ownership",
+          scope: "user",
+          affectedUserIds: [raw.user_id],
           holder: canonicalHolder,
           expected: raw.amount,
           actual: null,
@@ -456,7 +518,7 @@ export class CasinoChipAssets {
   }
 
   private readMarketRows(
-    knownUsers: ReadonlySet<string> | null,
+    knownUsers: ReadonlySet<string>,
     addMismatch: (mismatch: EscrowAssetMismatch) => void,
     addAsset: (row: EscrowAssetRow) => void,
   ): void {
@@ -466,6 +528,7 @@ export class CasinoChipAssets {
     if (marketColumns === null || betColumns === null) {
       addMismatch({
         code: "schema_incomplete",
+        scope: "global",
         holder: marketColumns === null ? "casino_markets" : "casino_market_bets",
         expected: null,
         actual: null,
@@ -483,6 +546,7 @@ export class CasinoChipAssets {
       ];
       addMismatch({
         code: "schema_incomplete",
+        scope: "global",
         holder: "casino_markets/casino_market_bets",
         expected: null,
         actual: null,
@@ -491,16 +555,13 @@ export class CasinoChipAssets {
       return;
     }
 
-    const markets = this.db.prepare("SELECT id, status, fund_mode FROM casino_markets").all() as RawMarketRow[];
-    const byId = new Map<number, { status: string; fundMode: string }>();
-    for (const raw of markets) {
-      if (
-        !isSafePositiveInteger(raw.id) ||
-        typeof raw.status !== "string" ||
-        typeof raw.fund_mode !== "string"
-      ) {
+    const rawMarkets = this.db.prepare("SELECT id, status, fund_mode FROM casino_markets").all() as RawMarketRow[];
+    const markets = new Map<number, MarketRecord>();
+    for (const raw of rawMarkets) {
+      if (!isSafePositiveInteger(raw.id) || typeof raw.status !== "string" || typeof raw.fund_mode !== "string") {
         addMismatch({
           code: "schema_incomplete",
+          scope: "global",
           holder: "casino_markets",
           expected: null,
           actual: null,
@@ -510,9 +571,10 @@ export class CasinoChipAssets {
         });
         continue;
       }
-      if (byId.has(raw.id)) {
+      if (markets.has(raw.id)) {
         addMismatch({
           code: "duplicate_ownership",
+          scope: "holder",
           holder: marketEscrowHolder(raw.id),
           expected: null,
           actual: null,
@@ -522,142 +584,172 @@ export class CasinoChipAssets {
         });
         continue;
       }
-      if (!LIVE_MARKET_STATUSES.has(raw.status) && !TERMINAL_MARKET_STATUSES.has(raw.status)) {
-        addMismatch({
-          code: "unknown_market_status",
-          holder: marketEscrowHolder(raw.id),
-          expected: null,
-          actual: null,
-          sourceKind: "market",
-          sourceId: String(raw.id),
-          detail: `未知のstatus: ${raw.status}`,
-        });
-      }
-      if (raw.fund_mode !== "escrow" && raw.fund_mode !== "legacy_house") {
-        addMismatch({
-          code: "invalid_fund_mode",
-          holder: marketEscrowHolder(raw.id),
-          expected: null,
-          actual: null,
-          sourceKind: "market",
-          sourceId: String(raw.id),
-          detail: `未知のfund_mode: ${raw.fund_mode}`,
-        });
-      }
-      byId.set(raw.id, { status: raw.status, fundMode: raw.fund_mode });
+      markets.set(raw.id, { id: raw.id, status: raw.status, fundMode: raw.fund_mode });
     }
 
-    const bets = this.db
+    const rawBets = this.db
       .prepare("SELECT market_id, user_id, amount FROM casino_market_bets")
       .all() as RawMarketBetRow[];
-    const ownership = new Set<string>();
-    const legacyReported = new Set<number>();
-    for (const raw of bets) {
+    const betsByMarket = new Map<number, RawMarketBetRow[]>();
+    for (const raw of rawBets) {
       if (!isSafePositiveInteger(raw.market_id)) {
+        const userId = typeof raw.user_id === "string" ? raw.user_id : String(raw.user_id);
         addMismatch({
           code: "missing_ledger_rows",
+          scope: "user",
+          affectedUserIds: typeof raw.user_id === "string" ? [raw.user_id] : [],
           holder: "casino_market_bets",
           expected: null,
           actual: null,
           sourceKind: "market",
           sourceId: String(raw.market_id),
+          userId,
           detail: "betのmarket_idが正のsafe integerではない",
         });
         continue;
       }
-      const holder = marketEscrowHolder(raw.market_id);
-      const market = byId.get(raw.market_id);
-      if (!market) {
+      const list = betsByMarket.get(raw.market_id) ?? [];
+      list.push(raw);
+      betsByMarket.set(raw.market_id, list);
+    }
+
+    for (const [marketId, bets] of betsByMarket) {
+      if (markets.has(marketId)) continue;
+      for (const raw of bets) {
+        const userId = typeof raw.user_id === "string" ? raw.user_id : String(raw.user_id);
         addMismatch({
           code: "missing_ledger_rows",
+          scope: "user",
+          affectedUserIds: typeof raw.user_id === "string" ? [raw.user_id] : [],
+          holder: marketEscrowHolder(marketId),
+          expected: null,
+          actual: null,
+          sourceKind: "market",
+          sourceId: String(marketId),
+          userId,
+          detail: "対応するcasino_markets行がないbet",
+        });
+      }
+    }
+
+    for (const market of markets.values()) {
+      const bets = betsByMarket.get(market.id) ?? [];
+      const participants = uniqueSorted(
+        bets.flatMap((bet) => (typeof bet.user_id === "string" && knownUsers.has(bet.user_id) ? [bet.user_id] : [])),
+      );
+      const holder = marketEscrowHolder(market.id);
+
+      if (!LIVE_MARKET_STATUSES.has(market.status) && !TERMINAL_MARKET_STATUSES.has(market.status)) {
+        addMismatch({
+          code: "unknown_market_status",
+          scope: "holder",
+          affectedUserIds: participants,
           holder,
           expected: null,
           actual: null,
           sourceKind: "market",
-          sourceId: String(raw.market_id),
-          userId: typeof raw.user_id === "string" ? raw.user_id : String(raw.user_id),
-          detail: "対応するcasino_markets行がないbet",
+          sourceId: String(market.id),
+          detail: `未知のstatus: ${market.status}`,
         });
         continue;
       }
-      // 終端状態では bet 行が残る設計だが、資金はholderから払い出し済みなので集計しない。
+      if (market.fundMode !== "escrow" && market.fundMode !== "legacy_house") {
+        addMismatch({
+          code: "invalid_fund_mode",
+          scope: "holder",
+          affectedUserIds: participants,
+          holder,
+          expected: null,
+          actual: null,
+          sourceKind: "market",
+          sourceId: String(market.id),
+          detail: `未知のfund_mode: ${market.fundMode}`,
+        });
+        continue;
+      }
       if (TERMINAL_MARKET_STATUSES.has(market.status)) continue;
-      // 未知status/fund_modeは上で不一致として記録済み。利用者へは推測配分しない。
-      if (!LIVE_MARKET_STATUSES.has(market.status)) continue;
       if (market.fundMode === "legacy_house") {
-        if (!legacyReported.has(raw.market_id)) {
-          legacyReported.add(raw.market_id);
+        if (bets.length > 0) {
           addMismatch({
             code: "invalid_legacy_source",
+            scope: "holder",
+            affectedUserIds: participants,
             holder: "house",
             expected: null,
             actual: null,
             sourceKind: "market",
-            sourceId: String(raw.market_id),
+            sourceId: String(market.id),
             detail: "legacy_house板はhouse混在勘定のため本人資産へ配分しない",
           });
         }
         continue;
       }
-      if (market.fundMode !== "escrow") continue;
-      if (
-        typeof raw.user_id !== "string" ||
-        raw.user_id.length === 0 ||
-        !knownUsers?.has(raw.user_id)
-      ) {
-        addMismatch({
-          code: "invalid_user_id",
-          holder,
-          expected: null,
-          actual: null,
-          sourceKind: "market",
-          sourceId: String(raw.market_id),
-          userId: typeof raw.user_id === "string" ? raw.user_id : String(raw.user_id),
-          detail: "betの本人帰属をLand利用者口座から確定できない",
-        });
-        continue;
-      }
-      if (!isSafePositiveInteger(raw.amount)) {
-        addMismatch({
-          code: "corrupt_amount",
-          holder,
-          expected: null,
-          actual: typeof raw.amount === "number" ? raw.amount : null,
-          sourceKind: "market",
-          sourceId: String(raw.market_id),
-          userId: raw.user_id,
-          detail: "casino_market_bets.amount が正のsafe integerではない",
-        });
-        continue;
-      }
 
-      const key = `${raw.market_id}\u0000${raw.user_id}`;
-      if (ownership.has(key)) {
-        addMismatch({
-          code: "duplicate_ownership",
-          holder,
-          expected: raw.amount,
-          actual: null,
-          sourceKind: "market",
-          sourceId: String(raw.market_id),
+      const ownership = new Set<string>();
+      for (const raw of bets) {
+        const userId = typeof raw.user_id === "string" ? raw.user_id : String(raw.user_id);
+        if (typeof raw.user_id !== "string" || raw.user_id.length === 0 || !knownUsers.has(raw.user_id)) {
+          addMismatch({
+            code: "invalid_user_id",
+            scope: "user",
+            affectedUserIds: typeof raw.user_id === "string" ? [raw.user_id] : [],
+            holder,
+            expected: null,
+            actual: null,
+            sourceKind: "market",
+            sourceId: String(market.id),
+            userId,
+            detail: "betの本人帰属をLand利用者口座から確定できない",
+          });
+          continue;
+        }
+        if (!isSafePositiveInteger(raw.amount)) {
+          addMismatch({
+            code: "corrupt_amount",
+            scope: "user",
+            affectedUserIds: [raw.user_id],
+            holder,
+            expected: null,
+            actual: typeof raw.amount === "number" ? raw.amount : null,
+            sourceKind: "market",
+            sourceId: String(market.id),
+            userId: raw.user_id,
+            detail: "casino_market_bets.amount が正のsafe integerではない",
+          });
+          continue;
+        }
+
+        const key = `${market.id}\u0000${raw.user_id}`;
+        if (ownership.has(key)) {
+          addMismatch({
+            code: "duplicate_ownership",
+            scope: "user",
+            affectedUserIds: [raw.user_id],
+            holder,
+            expected: raw.amount,
+            actual: null,
+            sourceKind: "market",
+            sourceId: String(market.id),
+            userId: raw.user_id,
+            detail: "同一market・userのbet行が複数ある",
+          });
+          continue;
+        }
+        ownership.add(key);
+        addAsset({
           userId: raw.user_id,
-          detail: "同一market・userのbet行が複数ある",
+          holder,
+          amount: raw.amount,
+          sourceKind: "market",
+          sourceId: String(market.id),
         });
-        continue;
       }
-      ownership.add(key);
-      addAsset({
-        userId: raw.user_id,
-        holder,
-        amount: raw.amount,
-        sourceKind: "market",
-        sourceId: String(raw.market_id),
-      });
     }
   }
 
   private readEscrowBalances(
     addMismatch: (mismatch: EscrowAssetMismatch) => void,
+    usersByHolder: ReadonlyMap<string, ReadonlySet<string>>,
   ): Map<string, number> {
     if (!this.requireColumns("ether_balances", ["user_id", "amount"], addMismatch)) return new Map();
     const rows = this.db
@@ -668,6 +760,7 @@ export class CasinoChipAssets {
       if (typeof row.user_id !== "string" || row.user_id.length === 0) {
         addMismatch({
           code: "unknown_escrow_holder",
+          scope: "holder",
           holder: String(row.user_id),
           expected: null,
           actual: typeof row.amount === "number" ? row.amount : null,
@@ -678,10 +771,26 @@ export class CasinoChipAssets {
       if (!isSafeNonNegativeInteger(row.amount)) {
         addMismatch({
           code: "corrupt_amount",
+          scope: "holder",
+          affectedUserIds: [...(usersByHolder.get(row.user_id) ?? [])],
           holder: row.user_id,
           expected: null,
           actual: typeof row.amount === "number" ? row.amount : null,
+          ...(this.describeHolder(row.user_id) ?? {}),
           detail: "holder実残高が非負のsafe integerではない",
+        });
+        continue;
+      }
+      if (balances.has(row.user_id)) {
+        addMismatch({
+          code: "corrupt_amount",
+          scope: "holder",
+          affectedUserIds: [...(usersByHolder.get(row.user_id) ?? [])],
+          holder: row.user_id,
+          expected: null,
+          actual: row.amount,
+          ...(this.describeHolder(row.user_id) ?? {}),
+          detail: "同一holderの実残高行が複数ある",
         });
         continue;
       }
@@ -690,9 +799,7 @@ export class CasinoChipAssets {
     return balances;
   }
 
-  private describeHolder(
-    holder: string,
-  ): { sourceKind: EscrowAssetSourceKind; sourceId: string } | null {
+  private describeHolder(holder: string): { sourceKind: EscrowAssetSourceKind; sourceId: string } | null {
     if (holder.startsWith(SESSION_PREFIX)) {
       const sourceId = holder.slice(SESSION_PREFIX.length);
       return sourceId.length > 0 ? { sourceKind: "session", sourceId } : null;
@@ -713,9 +820,7 @@ export class CasinoChipAssets {
       .get(table);
     if (!exists) return null;
     return new Set(
-      (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
-        (row) => row.name,
-      ),
+      (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name),
     );
   }
 
@@ -728,6 +833,7 @@ export class CasinoChipAssets {
     if (columns && this.hasColumns(columns, required)) return true;
     addMismatch({
       code: "schema_incomplete",
+      scope: "global",
       holder: table,
       expected: null,
       actual: null,
