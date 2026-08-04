@@ -423,9 +423,7 @@ export class CasinoIntegrity {
       ok,
       detail: ok
         ? "卓・板の預り金とフリースピンJP請求は共通資産監査どおり"
-        : freeSpinClaims
-          ? `フリースピンJP請求または資産監査が不一致（${mismatches.length}件）`
-          : `共通資産監査で ${mismatches.length}件の不一致を検出`,
+        : `共通資産監査で ${mismatches.length}件の不一致を検出（${mismatches[0]!.subject}: ${mismatches[0]!.note ?? "detailなし"}）`,
       mismatches: mismatches.slice(0, MAX_MISMATCHES),
     };
   }
@@ -522,7 +520,9 @@ export class CasinoIntegrity {
       ? ` affected=${mismatch.affectedUserIds.join(",")}`
       : "";
     return {
-      subject: mismatch.holder,
+      subject: mismatch.sourceKind && mismatch.sourceId
+        ? `${mismatch.sourceKind}:${mismatch.sourceId}`
+        : mismatch.holder,
       expected: mismatch.expected ?? 0,
       actual: mismatch.actual ?? 0,
       note: `${mismatch.code} scope=${mismatch.scope}${affected}${mismatch.detail ? `: ${mismatch.detail}` : ""}`,
