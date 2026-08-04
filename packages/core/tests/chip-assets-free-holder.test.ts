@@ -76,7 +76,7 @@ describe("自由チップholderのLand利用者口座確認", () => {
     sealOpening(ctx);
 
     const freeError = expectCorrupt(() => ctx.assets.freeChips("ghost"));
-    expect(freeError.details).toEqual(
+    expect(freeError.meta).toEqual(
       expect.objectContaining({
         userId: "ghost",
         mismatches: [
