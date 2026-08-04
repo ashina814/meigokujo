@@ -1,9 +1,9 @@
 name: PR10 source export
 
 on:
-  push:
+  pull_request:
     branches:
-      - audit/pr10-source-export
+      - main
 
 permissions:
   contents: read
