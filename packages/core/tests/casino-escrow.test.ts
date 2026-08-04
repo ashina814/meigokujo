@@ -1,5 +1,5 @@
 import { testTransfer, opId , openFormally} from "./helpers/chip-ctx.js";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
@@ -849,6 +849,14 @@ describe("hold / holdAll: 同一operationIdへの額の取り違えをconflict�
     expect(ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toBe(true);
   });
 
+  it("holdAll: 重複userIdの拒否はamountの妥当性より無条件に先行する（amountが不正でもduplicate扱いを優先する）", () => {
+    // amount <= 0 は本来 false 早期returnの対象だが、重複チェックはそれより前に行う。
+    // 「重複は常に拒否」を amount の値に関わらず保証するため
+    expect(() => ctx.escrow.holdAll("s1", ["a", "a"], -1, "丁半", "op1")).toThrow(/duplicate userId/);
+    expect(() => ctx.escrow.holdAll("s1", ["a", "a"], 0, "丁半", "op1")).toThrow(/duplicate userId/);
+    expect(() => ctx.escrow.holdAll("s1", ["a", "a"], 1.5, "丁半", "op1")).toThrow(/duplicate userId/);
+  });
+
   it("holdAll legacy: この変更より前に確定した生のtrueは、casino_txの明細（参加者集合含む）から復元して照合する", () => {
     expect(ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toBe(true);
     ctx.db.prepare("UPDATE casino_tx_groups SET result_json = 'true' WHERE group_key = ?").run("escrow:hold_all:s1:op1");
@@ -860,5 +868,109 @@ describe("hold / holdAll: 同一operationIdへの額の取り違えをconflict�
     // 額が食い違う要求 → conflict
     expect(() => ctx.escrow.holdAll("s1", ["a", "b"], 9_000, "丁半", "op1")).toThrow(/operation conflict/);
     expect(ctx.ether.balanceOf(escrowHolderFor("s1"))).toBe(4_000); // どのconflictでも動いていない
+  });
+});
+
+/**
+ * hold() / holdAll() の台帳突き合わせは、送金・casino_escrow更新と**同じトランザクション**
+ * （runGroupのコールバックの中）で行う。コールバックの外（runGroupが返ったあと）でしか
+ * 見ないと、検出して例外を投げた時点でもう commit 済みになり、「conflictを検出した」のに
+ * 実際の資金移動は取り消せない——検出はできても原子性が壊れる。
+ *
+ * ここでは `ether.transfer()` を差し替えて「下位層が要求と違う内容を casino_tx へ
+ * 記録してしまった」状況を注入し、hold()/holdAll() が例外を投げたうえで、利用者残高・
+ * escrow holder残高・casino_escrow・casino_tx_groups・casino_tx のすべてが
+ * 呼び出し前の状態へ完全に戻ることを確認する。
+ */
+describe("hold / holdAll: 台帳の食い違いはcommit前に検出し、完全ロールバックする", () => {
+  let ctx: ReturnType<typeof setup>;
+  beforeEach(() => {
+    ctx = setup();
+  });
+
+  function snapshot(c: ReturnType<typeof setup>) {
+    return {
+      balances: c.db.prepare("SELECT user_id, amount FROM ether_balances ORDER BY user_id").all(),
+      escrow: c.db.prepare("SELECT * FROM casino_escrow ORDER BY session_id, user_id").all(),
+      groups: c.db.prepare("SELECT * FROM casino_tx_groups ORDER BY group_key").all(),
+      txs: c.db.prepare("SELECT * FROM casino_tx ORDER BY id").all(),
+    };
+  }
+
+  it("hold: casino_tx明細のamountが要求と食い違って記録されたら、例外になり完全ロールバックする", () => {
+    const before = snapshot(ctx);
+    const originalTransfer = ctx.ether.transfer.bind(ctx.ether);
+    const spy = vi.spyOn(ctx.ether, "transfer").mockImplementationOnce((from, to, amount, meta) => {
+      // 下位層のバグを模す: 要求(3,000)と違う額(3,001)を実際に動かして記録させる
+      return originalTransfer(from, to, amount + 1, meta);
+    });
+
+    expect(() => ctx.escrow.hold("s1", "a", 3_000, "duel", "op1")).toThrow(/operation conflict/);
+
+    spy.mockRestore();
+    // 送金・casino_escrow行・グループ行・casino_tx行のすべてが呼び出し前の状態へ戻っている
+    expect(snapshot(ctx)).toEqual(before);
+  });
+
+  it("hold: casino_tx明細のgameが要求と食い違って記録されたら、例外になり完全ロールバックする", () => {
+    const before = snapshot(ctx);
+    const originalTransfer = ctx.ether.transfer.bind(ctx.ether);
+    const spy = vi.spyOn(ctx.ether, "transfer").mockImplementationOnce((from, to, amount, meta) => {
+      return originalTransfer(from, to, amount, { ...meta, game: "TAMPERED" });
+    });
+
+    expect(() => ctx.escrow.hold("s1", "a", 3_000, "duel", "op1")).toThrow(/operation conflict/);
+
+    spy.mockRestore();
+    expect(snapshot(ctx)).toEqual(before);
+  });
+
+  it("hold: casino_tx明細のto_holderが要求(セッション専用保有者)と食い違って記録されたら、例外になり完全ロールバックする", () => {
+    const before = snapshot(ctx);
+    const originalTransfer = ctx.ether.transfer.bind(ctx.ether);
+    const spy = vi.spyOn(ctx.ether, "transfer").mockImplementationOnce((from, _to, amount, meta) => {
+      // 下位層のバグを模す: 正しいセッション保有者ではなく別の保有者へ実際に移して記録させる
+      return originalTransfer(from, "escrow:session:WRONG", amount, meta);
+    });
+
+    expect(() => ctx.escrow.hold("s1", "a", 3_000, "duel", "op1")).toThrow(/operation conflict/);
+
+    spy.mockRestore();
+    expect(snapshot(ctx)).toEqual(before);
+    expect(ctx.ether.balanceOf("escrow:session:WRONG")).toBe(0); // 誤った移動先にも残っていない
+  });
+
+  it("holdAll: 参加者1人ぶんのcasino_tx明細が食い違って記録されたら、例外になり全員ぶん完全ロールバックする", () => {
+    const before = snapshot(ctx);
+    const originalTransfer = ctx.ether.transfer.bind(ctx.ether);
+    const spy = vi.spyOn(ctx.ether, "transfer").mockImplementation((from, to, amount, meta) => {
+      // bの分だけ下位層が違う額を記録してしまったことを模す（aは正常）
+      if (from === "b") return originalTransfer(from, to, amount + 1, meta);
+      return originalTransfer(from, to, amount, meta);
+    });
+
+    expect(() => ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toThrow(/operation conflict/);
+
+    spy.mockRestore();
+    // aの分も含めて全員ぶんが呼び出し前の状態へ戻っている（部分的に確定していない）
+    expect(snapshot(ctx)).toEqual(before);
+  });
+
+  it("holdAll: 参加者集合の明細が食い違って記録されたら（from_holderが要求外）、例外になり完全ロールバックする", () => {
+    ctx.ledger.ensureAccount("user:c", "user");
+    ctx.ledger.transfer({ from: TREASURY, to: "user:c", amount: 10_000, type: "initial", actor: "t", idempotencyKey: "seed:c" });
+    ctx.ether.deposit("c", 10_000, "seed:buy:c");
+    const before = snapshot(ctx);
+    const originalTransfer = ctx.ether.transfer.bind(ctx.ether);
+    const spy = vi.spyOn(ctx.ether, "transfer").mockImplementation((from, to, amount, meta) => {
+      // bのぶんを、要求していない別の利用者(c)から徴収したかのように記録させてしまう
+      if (from === "b") return originalTransfer("c", to, amount, meta);
+      return originalTransfer(from, to, amount, meta);
+    });
+
+    expect(() => ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toThrow(/operation conflict/);
+
+    spy.mockRestore();
+    expect(snapshot(ctx)).toEqual(before);
   });
 });

@@ -207,6 +207,18 @@ export class Escrow {
    * **取り違えの検出は外側の呼び出し元が自分の fingerprint で行う責任を持つ**
    * （`acceptRouletteBet` 参照。外側が settled なら、この hold() 自体が一度も
    * 呼ばれずに外側の body ごとスキップされるため、ここでは検出できない）。
+   *
+   * ## 台帳突き合わせは commit 前（グループの中）でも行う
+   * 新規実行（このグループを初めて作った側）の台帳突き合わせは、`runGroup` の
+   * コールバックの**中**、送金・`casino_escrow` 更新の直後で行う。ここで検出して
+   * 例外を投げれば、送金・`casino_escrow` 行・グループ行・`casino_tx` 行が
+   * **同じ SQLite トランザクションで丸ごとロールバック**する。
+   * コールバックの外（`runGroup` が返ったあと）でしか見ないと、その時点でもう
+   * トランザクションは commit 済みなので、「不一致を検出して conflict を投げた」のに
+   * 実際の資金移動は取り消せない——検出はできても原子性が壊れる。
+   * コールバックの外の突き合わせ（下記）は、**body が実行されない replay 経路**
+   * （既存の legacy true 行・新規グループの保存済み true replay・別プロセス競合で
+   * 先に確定していた側）のためのもので、新規実行では二重チェックになるだけで無害。
    */
   hold(sessionId: string, userId: string, amount: number, game: string, operationId: string): boolean {
     if (!Number.isInteger(amount) || amount <= 0) return false;
@@ -228,6 +240,9 @@ export class Escrow {
              ON CONFLICT(session_id, user_id) DO UPDATE SET amount = amount + excluded.amount, source = excluded.source`,
           )
           .run(sessionId, userId, amount, game, holder, now());
+        // commit前の突き合わせ（このコールバック内で例外を投げれば上の送金・INSERTごと
+        // ロールバックする）。nested時は自分のgroupKeyに明細が付かないので省略
+        if (!nested) this.assertHoldLedgerMatches(groupKey, userId, holder, amount, game, sessionId, context);
         return { ok: true, fingerprint };
       });
     } catch (e) {
@@ -237,6 +252,7 @@ export class Escrow {
 
     if (typeof stored === "boolean") {
       // legacy: この変更より前に確定した生の真偽値（fingerprint を持たない）。
+      // body は実行されていない（既存グループが replay された）ので、ここで初めて検証する。
       // nested からは`getGroup`が呼ばれないのでここには来ない（legacy 行は常に非nested）
       if (!stored) {
         throw new Error(
@@ -252,6 +268,8 @@ export class Escrow {
         `escrow operation conflict: ${context} stored request ${JSON.stringify(stored.fingerprint)} != requested ${JSON.stringify(fingerprint)}`,
       );
     }
+    // fresh実行ならコールバック内で既に検証済み（ここは無害な再確認）。
+    // 保存済みreplay・別プロセス競合ならbodyが実行されていないので、ここが唯一の検証機会
     if (stored.ok && !nested) this.assertHoldLedgerMatches(groupKey, userId, holder, amount, game, sessionId, context);
     return stored.ok;
   }
@@ -309,13 +327,18 @@ export class Escrow {
    *
    * 参加者は**順序を無視した集合**として比較する（張る順序が違うだけの同一操作を弾かない
    * ため）。同一呼び出し内の重複 userId は、取り違えの温床になる（同じ人から二重徴収の
-   * つもりが片方だけ記録される等）ため、初回呼び出し・replay を問わず常に拒否する。
+   * つもりが片方だけ記録される等）ため、amount の妥当性すら問わず・初回呼び出し・replay を
+   * 問わず常に最初に拒否する。
+   *
+   * 台帳突き合わせは `hold()` と同じく commit 前（`runGroup` コールバックの中、全員ぶんの
+   * 送金・`casino_escrow` 更新が終わった直後）でも行う。理由も `hold()` と同じ:
+   * コールバックの外でしか見ないと、検出した時点でもう commit 済みで原子性が壊れる。
    *
    * @returns 全員から預かれたら true。1人でも足りなければ false（誰からも取らない）
    */
   holdAll(sessionId: string, userIds: readonly string[], amount: number, game: string, operationId: string): boolean {
-    if (!Number.isInteger(amount) || amount <= 0) return false;
     assertNoDuplicateUserIds(userIds, `escrow holdAll ${sessionId}:${operationId}`);
+    if (!Number.isInteger(amount) || amount <= 0) return false;
     const holder = escrowHolderFor(sessionId);
     const groupKey = `escrow:hold_all:${sessionId}:${operationId}`;
     const context = `escrow holdAll ${sessionId}:${operationId}`;
@@ -340,6 +363,8 @@ export class Escrow {
               )
               .run(sessionId, userId, amount, game, holder, now());
           }
+          // commit前の突き合わせ。ここで例外を投げれば全員ぶんの送金・INSERTごとロールバックする
+          if (!nested) this.assertHoldAllLedgerMatches(groupKey, fingerprint.participants, holder, amount, game, sessionId, context);
           return { ok: true, fingerprint };
         },
       );
@@ -351,7 +376,8 @@ export class Escrow {
     }
 
     if (typeof stored === "boolean") {
-      // legacy: この変更より前に確定した生の true（holdAll の false は上記の理由で存在しない）
+      // legacy: この変更より前に確定した生の true（holdAll の false は上記の理由で存在しない）。
+      // body は実行されていない（既存グループが replay された）ので、ここで初めて検証する
       if (!nested) this.assertHoldAllLedgerMatches(groupKey, fingerprint.participants, holder, amount, game, sessionId, context);
       return true;
     }
@@ -360,6 +386,8 @@ export class Escrow {
         `escrow operation conflict: ${context} stored request ${JSON.stringify(stored.fingerprint)} != requested ${JSON.stringify(fingerprint)}`,
       );
     }
+    // fresh実行ならコールバック内で既に検証済み（ここは無害な再確認）。
+    // 保存済みreplay・別プロセス競合ならbodyが実行されていないので、ここが唯一の検証機会
     if (!nested) this.assertHoldAllLedgerMatches(groupKey, fingerprint.participants, holder, amount, game, sessionId, context);
     return stored.ok;
   }
