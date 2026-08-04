@@ -237,8 +237,12 @@ Draft の解除（Ready 化）は、全ブロッカー解消・全テスト成�
 - クラウド sandbox で作業した分はローカルに残らない。未 push commit を疑うときは、
   先に `git fetch` してから `git log --branches --not --remotes` を見る
   （fetch 前はリモート追跡 ref が古く、ブランチ自体が見えないことがある）。
-- コミットメッセージ末尾には次を付ける。
 
-```
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-```
+### commit の Co-Authored-By
+
+AI の `Co-Authored-By` を付ける場合は、次を守る。
+
+- **実際に作業したモデル・環境に一致する表記だけ**を使う。
+- **実際の表記を確定できない場合は、推測して付けない。** 付けないほうが安全。
+- **監査担当モデルを、実装 commit の共同作者として記録しない。**
+  監査で見つけた指摘は、実装した側の commit の作者ではない。
