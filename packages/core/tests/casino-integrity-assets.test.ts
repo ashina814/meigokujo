@@ -240,14 +240,14 @@ describe("startup precheckとpostflightの境界", () => {
       registry: new RecoveryRegistry(),
       events: ctx.events,
     });
-    expect(result.steps).toContain("S4:生存預託収集");
+    expect(result.steps).toContain("S4:生存収集");
     expect(result.outcome).toBe("opened");
     expect(ctx.status.current().status).toBe("open");
   });
 
-  it("recovery後のpostflightで未知holderが残れば営業再開しない", () => {
+  it("recovery後のpostflightで残存する未知market statusがあれば営業再開しない", () => {
     const ctx = setup();
-    setBalance(ctx, "escrow:unknown:thing", 100);
+    insertMarket(ctx, 1, "mystery", "escrow", "alice", 100);
     sealOpening(ctx);
 
     expect(ctx.integrity.runStartupPrecheck().ok).toBe(true);
@@ -261,9 +261,9 @@ describe("startup precheckとpostflightの境界", () => {
       registry: new RecoveryRegistry(),
       events: ctx.events,
     });
-    expect(result.steps).toContain("S4:生存預託収集");
+    expect(result.steps).toContain("S4:生存収集");
     expect(result.outcome).toBe("halted");
     expect(ctx.status.current().status).not.toBe("open");
-    expect(result.reason).toContain("unknown_escrow_holder");
+    expect(result.reason).toContain("unknown_market_status");
   });
 });
