@@ -233,6 +233,10 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     mismatched: [],
     failedSessions: [],
   };
+  // S10 は runMaintenance の中で**グループごとに確定**する（runMaintenance は
+  // 深さカウンタでありトランザクションではない）。後続の postflight や
+  // event 記録が例外になっても、実際に動いた資金の記録を捨ててはいけない（監査項目8）。
+  let redeemedSoFar: InactiveRedeemResult = { redeemed: [], skipped: [], failed: [] };
   try {
     // S1: ここから資金を動かす区間へ入る
     status.beginStartupCheck();
@@ -275,7 +279,12 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
       const redeemedFreeChips =
         chipTx.openingPhase() === "formal"
           ? chipFlow.redeemAllFreeChips("startup")
-          : { redeemed: [], skipped: ["opening_not_formal"], failed: [] };
+          : {
+              redeemed: [],
+              skipped: [{ userId: null, amount: 0, reason: "opening_not_formal" as const }],
+              failed: [],
+            };
+      redeemedSoFar = redeemedFreeChips;
       steps.push("S10:自由チップ返還");
 
       return {
@@ -342,13 +351,42 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     // たまたま通り得るが、復旧そのものは完了していない。recoveringFromHalt に関わらず必ず
     // recovery_halt にして、「復旧を再実行」からの再試行を求める（このセッションだけが
     // 次回また対象になる）。
+    // 未完了の義務は**すべて**理由と event へ残す。outcome は1つしか選べないので、
+    // 優先順位の低い義務（孤児返金の技術失敗・帳簿不一致・postflight NG）が
+    // 報告から消えると、復旧の再実行で何を直すべきか分からなくなる（監査項目8）。
+    const outstanding: string[] = [];
     if (result.redeemedFreeChips.failed.length > 0) {
-      const reason =
+      outstanding.push(
         `S10自由チップ返還失敗 ${result.redeemedFreeChips.failed.length}件（成功済みは再実行で二重返還しない）: ` +
-        result.redeemedFreeChips.failed.map((failure) => `${failure.userId}(${failure.amount}): ${failure.error}`).join(", ");
+          result.redeemedFreeChips.failed
+            .map((failure) => `${failure.userId}(${failure.amount}): ${failure.error}`)
+            .join(", "),
+      );
+    }
+    if (result.failedSessions.length > 0) {
+      outstanding.push(
+        `孤児返金の技術失敗 ${result.failedSessions.length}件（帳簿・残高は維持・要調査）: ` +
+          result.failedSessions.map((f) => `${f.sessionId}: ${f.error}`).join(", "),
+      );
+    }
+    if (result.mismatched.length > 0) {
+      outstanding.push(`帳簿不一致 ${result.mismatched.length}件`);
+    }
+    if (!post.ok) outstanding.push(`後検NG: ${postReason ?? "不明"}`);
+
+    if (result.redeemedFreeChips.failed.length > 0) {
+      const reason = outstanding.join(" / ");
       events.log("casino_recovery_halted", {
         actor: "system:recovery",
-        payload: { steps, reason, redeemedFreeChips: result.redeemedFreeChips, postflightOk: post.ok },
+        payload: {
+          steps,
+          reason,
+          outstanding,
+          redeemedFreeChips: result.redeemedFreeChips,
+          failedSessions: result.failedSessions,
+          mismatched: result.mismatched,
+          postflightOk: post.ok,
+        },
       });
       status.haltForRecovery(recoveringFromHalt ? appendReason(held.reason, reason) : reason);
       return { outcome: "chip_redeem_failed", steps, ...summary, reason };
@@ -419,7 +457,9 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     const summary = {
       ...sweptSoFar,
       releasedReservations: { released: false, count: 0, total: 0 },
-      redeemedFreeChips: { redeemed: [], skipped: [], failed: [] },
+      // 実際に返還した利用者・失敗した利用者・額を消さない。ここを空へ戻すと
+      // 「誰にいくら返し終えたか」が失われ、再実行の義務も見えなくなる（監査項目8）
+      redeemedFreeChips: redeemedSoFar,
     };
     return { outcome: "exception_failed", steps, ...summary, reason };
   }

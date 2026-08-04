@@ -48,9 +48,16 @@ export async function handleAnnaiButton(interaction: import("discord.js").Button
     }
     try {
       const result = services.chipFlow.leaveCasino(interaction.user.id, `leave:${interaction.id}`);
+      // 進行中の所有で見送った場合を「返還可能額なし」と表示しない（監査ブロッカーA）。
+      // 資金は賭場に残っているので、解消後に押し直せば返せると伝える
+      const content = result.skipped === "active_ownership"
+        ? "進行中の勝負・預託・板があるため、いまは返還できません。終わってからもう一度押してください。"
+        : result.redeemed > 0
+          ? `${fmtLd(result.land)} をLandへ返還しました。`
+          : "返還できる自由チップはありません。";
       await interaction.update({
         ...renderHome(interaction.user.id, services, interaction.guild?.name),
-        content: result.redeemed > 0 ? `${fmtLd(result.land)} をLandへ返還しました。` : "返還できる自由チップはありません。",
+        content,
       });
     } catch {
       await interaction.reply({ content: "チップ帳簿または進行状態を確認できないため返還できません。", flags: MessageFlags.Ephemeral });

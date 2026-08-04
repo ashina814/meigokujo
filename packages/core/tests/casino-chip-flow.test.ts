@@ -80,7 +80,7 @@ describe("PR10 自動預入・自由チップ返還", () => {
 
     const result = ctx.flow.redeemInactive(100, "idle");
     expect(result.redeemed.map((entry) => entry.userId)).toEqual(["alice"]);
-    expect(result.skipped).toContain("bob");
+    expect(result.skipped).toEqual([{ userId: "bob", amount: 100, reason: "active_ownership" }]);
     expect(ctx.chips.balanceOf("alice")).toBe(0);
     expect(ctx.chips.balanceOf("bob")).toBe(100);
     ctx.db.close();

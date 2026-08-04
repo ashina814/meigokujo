@@ -134,6 +134,8 @@ function itemDetail(item: ShopItemRow, userHasRole: boolean, balance: number, re
   return { embeds: [embed], components };
 }
 
+type PurchaseOutcome = ReturnType<Services["shop"]["purchase"]> & { replayed?: boolean };
+
 function purchaseOnce(
   services: Services,
   input: {
@@ -144,7 +146,7 @@ function purchaseOnce(
     memberRoleIds: readonly string[];
     mode: "land" | "alt";
   },
-): ReturnType<Services["shop"]["purchase"]> {
+): PurchaseOutcome {
   const execute = services.db.transaction(() => {
     const existing = services.db.prepare(
       "SELECT * FROM shop_purchase_operations WHERE operation_id=?",
@@ -161,7 +163,9 @@ function purchaseOnce(
       const purchase = services.shop.getPurchase(existing.purchase_id);
       const item = services.shop.getItem(existing.item_id);
       if (!purchase || !item) throw new Error("shop operation result is missing");
-      return { purchase, item, needsManualDelivery: item.delivery === "manual" };
+      // 課金は冪等でも配送はそうではない（`extend_deadline` は期限へ加算する）。
+      // 再実行だと分かる印を返し、配送の副作用を二度走らせない（監査項目13）
+      return { purchase, item, needsManualDelivery: item.delivery === "manual", replayed: true };
     }
 
     services.db.prepare(
@@ -182,7 +186,7 @@ function purchaseOnce(
        SET status='completed',purchase_id=?,completed_at=?
        WHERE operation_id=? AND status='executing'`,
     ).run(result.purchase.id, Math.floor(Date.now() / 1_000), input.operationId);
-    return result;
+    return { ...result, replayed: false };
   });
   return execute.immediate();
 }
@@ -190,11 +194,14 @@ function purchaseOnce(
 async function finishPurchase(
   interaction: ButtonInteraction,
   services: Services,
-  result: ReturnType<Services["shop"]["purchase"]>,
+  result: PurchaseOutcome,
 ): Promise<void> {
   const { item, purchase } = result;
   let deliveryNote = "";
-  if (item.delivery === "auto") {
+  if (result.replayed) {
+    // 既に配送済みの購入。ロール付与・期限延長・スタッフ通知をもう一度走らせない
+    deliveryNote = "この購入は完了済みです（配送は実行済み）。";
+  } else if (item.delivery === "auto") {
     deliveryNote = await tryAutoDeliver(interaction, services, item, interaction.user.id).catch(
       () => "自動配送に失敗しました。運営にお問い合わせください。",
     );
@@ -245,6 +252,25 @@ function chipReturnView(confirmationId: string, item: ShopItemRow, land: number,
       ),
     ],
   };
+}
+
+/**
+ * 返還済み・購入未完了で止まった確認票の再試行ボタン（監査項目13）。
+ * 「やめる」は出さない——返還が済んだあとに取り消せる操作ではない。
+ */
+function retryConfirmComponents(
+  confirmationId: string,
+  itemId: number,
+  mode: "land" | "alt",
+): ActionRowBuilder<ButtonBuilder>[] {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`shop:chips:${confirmationId}:${itemId}:${mode}`)
+        .setLabel("購入を再試行")
+        .setStyle(ButtonStyle.Primary),
+    ),
+  ];
 }
 
 export async function handleShopButton(interaction: ButtonInteraction, services: Services): Promise<void> {
@@ -302,6 +328,8 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       return;
     }
     await interaction.deferUpdate();
+    let redeemed = false;
+    let purchased = false;
     try {
       let row = confirmation;
       if (row.status === "pending") row = services.chipFlow.beginExternalConfirmation(confirmationId, interaction.user.id);
@@ -313,6 +341,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         "公式ショップ購入を続けるための返還",
         true,
       );
+      redeemed = true;
       const member = interaction.member;
       const memberRoleIds = member && "roles" in member && "cache" in member.roles
         ? [...member.roles.cache.keys()]
@@ -325,15 +354,27 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         memberRoleIds,
         mode,
       });
+      purchased = true;
       if (!services.chipFlow.completeExternalConfirmation(confirmationId, interaction.user.id)) {
         throw new Error("購入確認の完了記録に失敗しました");
       }
       await finishPurchase(interaction, services, result);
     } catch (error) {
+      // 返還だけが済んで購入が失敗した状態を、ボタンを消して黙って終わらせない（監査項目13）。
+      // 資金が Land 側にあること・購入が未完了であることを明示し、**同じ確認票の
+      // ボタンを残して**再試行できるようにする。返還も購入も安定キーなので、
+      // 押し直しても資金は二重に動かず、購入が成立していれば完了記録だけが収束する。
+      const stranded = redeemed && !purchased;
       await interaction.editReply({
-        content: `❌ ${purchaseErrorMessage(error, services)}`,
+        content: stranded
+          ? [
+              `❌ ${purchaseErrorMessage(error, services)}`,
+              `自由チップは既にLandへ返還済みです（購入は未完了）。`,
+              "同じボタンをもう一度押すと、二重に資金を動かさずこの購入だけを再試行します。",
+            ].join("\n")
+          : `❌ ${purchaseErrorMessage(error, services)}`,
         embeds: [],
-        components: [],
+        components: stranded ? retryConfirmComponents(confirmationId, itemId, mode) : [],
       });
     }
     return;

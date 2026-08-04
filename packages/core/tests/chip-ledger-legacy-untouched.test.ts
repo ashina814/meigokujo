@@ -262,7 +262,11 @@ describe("PR8は既存legacy DBを変更しない（項目13）", () => {
       expect(r.failedSessions).toEqual([]);
       // S9: 進行中でないソロ債務の予約解放は PR7 の正規復旧対象。ここだけは動いてよい
       expect(r.releasedReservations).toEqual({ released: true, count: 2, total: 55_000 });
-      expect(r.redeemedFreeChips).toEqual({ redeemed: [], skipped: ["opening_not_formal"], failed: [] });
+      expect(r.redeemedFreeChips).toEqual({
+        redeemed: [],
+        skipped: [{ userId: null, amount: 0, reason: "opening_not_formal" }],
+        failed: [],
+      });
       // 復旧後も版は legacy のまま（PR8 は暗黙移行しない）
       expect(w.chipTx.openingPhase()).toBe("pre_reset");
       attemptAllFundOperations(w, "after-recovery");

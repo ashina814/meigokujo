@@ -189,8 +189,11 @@ export {
 } from "./casino/chip-assets.js";
 export {
   CasinoChipFlow,
+  ActiveOwnershipError,
+  type CasinoChipFlowOptions,
   type AutoDepositResult,
   type RedeemResult,
+  type RedeemSkip,
   type InactiveRedeemResult,
   type ExternalChipConfirmation,
   type RefundSaga,

@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { isSeatOccupied } from "./casino/common.js";
 import {
   Departments,
   Entry,
@@ -168,7 +169,10 @@ export function buildServices() {
   const markets = new Markets(db, chips, events, { onPlayerNet: recordPlayerNet });
   const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
   const chipAssets = new CasinoChipAssets(db, chips);
-  const chipFlow = new CasinoChipFlow(db, chips, events, chipAssets);
+  // 所有判定の正本をここで一本化する。プロセス内の着席は DB のどの表にも
+  // 現れないので、渡さないとショップの域外確認票がゲーム中の自由チップを
+  // Land へ戻せてしまう（監査ブロッカー・項目11）
+  const chipFlow = new CasinoChipFlow(db, chips, events, chipAssets, { isSeatOccupied });
   const takutate = new Takutate(db, events);
   const casinoIntegrity = new CasinoIntegrity(db, ledger, chips, escrow, chipAssets);
   // 起動時: 全点検 → 通ったときだけ掃除 → 掃除後にもう一度全点検 → 開ける
