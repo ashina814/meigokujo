@@ -704,3 +704,161 @@ describe("onPlayerNet は確定精算のときだけ呼ばれる", () => {
     c.db.close();
   });
 });
+
+/**
+ * hold() / holdAll() は session_id + user_id(+全員) + operationId だけを冪等キーにしており、
+ * 要求額そのものは鍵に含まれない。`runGroup` は保存済みの真偽値を額の検証なしに replay するので、
+ * 同じ operationId を**別の額**で呼ぶ取り違えが起きると、実際には最初の額しか預かっていないのに
+ * 2回目の額が預かれたかのような true を返しかねない（PR11独立監査 #50 で発覚・PR11範囲外の
+ * 既存挙動として指摘）。`CasinoChipFlow.ensureFreeChips` と同じ監査項目を hold()/holdAll() 自身にも持たせ、
+ * 実際に動いた額を `casino_tx` から読み直して食い違いを検出する。
+ */
+describe("hold / holdAll: 同一operationIdへの額の取り違えをconflictにする", () => {
+  let ctx: ReturnType<typeof setup>;
+  beforeEach(() => {
+    ctx = setup();
+  });
+
+  it("hold: 同じ額での再試行は従来どおりreplayされる（冪等性は壊さない）", () => {
+    expect(ctx.escrow.hold("s1", "a", 3_000, "duel", "op1")).toBe(true);
+    expect(ctx.escrow.hold("s1", "a", 3_000, "duel", "op1")).toBe(true);
+    expect(ctx.ether.balanceOf(escrowHolderFor("s1"))).toBe(3_000); // 増えていない
+  });
+
+  it("hold: 同じoperationIdを別の額で呼ぶと例外になり、実際の預り額も動かない", () => {
+    expect(ctx.escrow.hold("s1", "a", 3_000, "duel", "op1")).toBe(true);
+    expect(() => ctx.escrow.hold("s1", "a", 7_000, "duel", "op1")).toThrow(/operation conflict/);
+    // 保存済みの true をそのまま返して「7,000預かった」と誤信させない。実際は3,000のまま
+    expect(ctx.ether.balanceOf(escrowHolderFor("s1"))).toBe(3_000);
+    expect(ctx.escrow.poolOf("s1")).toBe(3_000);
+    expect(ctx.ether.balanceOf("a")).toBe(10_000 - 3_000);
+  });
+
+  it("hold: 残高不足でfalseになったoperationIdを同じ要求(amount/game)で再試行すると、falseがreplayされる", () => {
+    // 最初から所持額を超える額を要求 → 何も移さずfalseで確定（fingerprint込みで保存）
+    expect(ctx.escrow.hold("s1", "a", 999_999, "duel", "op1")).toBe(false);
+    // 同じamount/gameでの再試行 → fingerprintが一致するのでfalseがreplayされる（例外にはならない）
+    expect(ctx.escrow.hold("s1", "a", 999_999, "duel", "op1")).toBe(false);
+    expect(ctx.escrow.poolOf("s1")).toBe(0);
+  });
+
+  it("hold: 残高不足でfalseになったoperationIdを別のamountで再試行すると、黙ってfalse replayせずconflictにする", () => {
+    // 最初から所持額を超える額を要求 → 何も移さずfalseで確定
+    expect(ctx.escrow.hold("s1", "a", 999_999, "duel", "op1")).toBe(false);
+    // 同じoperationIdを妥当な額に変えて再試行 → fingerprintが食い違うのでconflict
+    // （「今回は3,000で残高不足かどうか」を一度も検証していないのに false を返すのは
+    //   利用者に的外れな「残高不足」を見せかねないため、推測せず例外にする）
+    expect(() => ctx.escrow.hold("s1", "a", 3_000, "duel", "op1")).toThrow(/operation conflict/);
+    expect(ctx.escrow.poolOf("s1")).toBe(0);
+  });
+
+  it("hold: 残高不足でfalseになったoperationIdを別のgameで再試行すると、conflictにする", () => {
+    expect(ctx.escrow.hold("s1", "a", 999_999, "duel", "op1")).toBe(false);
+    expect(() => ctx.escrow.hold("s1", "a", 999_999, "keiba", "op1")).toThrow(/operation conflict/);
+  });
+
+  it("hold: 同じoperationIdを別のgameで呼ぶと例外になる", () => {
+    expect(ctx.escrow.hold("s1", "a", 3_000, "duel", "op1")).toBe(true);
+    expect(() => ctx.escrow.hold("s1", "a", 3_000, "keiba", "op1")).toThrow(/operation conflict/);
+  });
+
+  it("hold legacy: この変更より前に確定した生のtrueは、casino_txの明細から要求を復元して照合する", () => {
+    // 正規の hold() で確定させたあと、result_json を legacy 形式（素の "true"）へ書き換えて
+    // 「この変更より前のコードが確定したグループ」を再現する。casino_tx の明細（不変の監査記録）
+    // は本物のままなので、これが legacy 行を検証する唯一の証拠になる。
+    expect(ctx.escrow.hold("s1", "a", 3_000, "duel", "op1")).toBe(true);
+    ctx.db.prepare("UPDATE casino_tx_groups SET result_json = 'true' WHERE group_key = ?").run("escrow:hold:s1:a:op1");
+
+    // 明細と一致する要求で再試行 → 台帳突き合わせを通って true
+    expect(ctx.escrow.hold("s1", "a", 3_000, "duel", "op1")).toBe(true);
+    // 明細と食い違う要求（別額）で再試行 → 台帳突き合わせで検出してconflict
+    expect(() => ctx.escrow.hold("s1", "a", 9_000, "duel", "op1")).toThrow(/operation conflict/);
+    // 明細と食い違う要求（別game）でも同様
+    expect(() => ctx.escrow.hold("s1", "a", 3_000, "keiba", "op1")).toThrow(/operation conflict/);
+    expect(ctx.ether.balanceOf(escrowHolderFor("s1"))).toBe(3_000); // どちらのconflictでも動いていない
+  });
+
+  it("hold legacy: この変更より前に確定した生のfalseは、要求内容を証明する術がないので無条件でconflictにする（推測して一致扱いしない）", () => {
+    // 素の false だけが確定した legacy 行を直接作る（fingerprintも明細も持たない）。
+    // actor_id は hold() が使う `userId` と一致させる（ChipTx.replay の kind/actorId 照合を通すため）
+    const ts = Math.floor(Date.now() / 1000);
+    ctx.db
+      .prepare(
+        "INSERT INTO casino_tx_groups (group_key, kind, status, actor_id, result_json, created_at, settled_at) VALUES (?, 'table_hold', 'settled', ?, 'false', ?, ?)",
+      )
+      .run("escrow:hold:s1:a:op-legacy-false", "a", ts, ts);
+
+    // たとえ今回の要求がたまたま「本当は足りていたかもしれない」額であっても、
+    // 過去の要求内容を証明できない以上は fail-closed で conflict にする
+    expect(() => ctx.escrow.hold("s1", "a", 3_000, "duel", "op-legacy-false")).toThrow(/legacy unverifiable/);
+    expect(ctx.ether.balanceOf(escrowHolderFor("s1"))).toBe(0); // 何も動いていない
+  });
+
+  it("hold: 重複した呼び出しではなく、異なるsessionId/userIdは別のgroupKeyになるので衝突しない", () => {
+    expect(ctx.escrow.hold("s1", "a", 3_000, "duel", "op1")).toBe(true);
+    expect(ctx.escrow.hold("s1", "b", 5_000, "duel", "op1")).toBe(true);
+    expect(ctx.escrow.hold("s2", "a", 7_000, "duel", "op1")).toBe(true);
+  });
+
+  it("holdAll: 同じ額での再試行は従来どおりreplayされる", () => {
+    expect(ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toBe(true);
+    expect(ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toBe(true);
+    expect(ctx.ether.balanceOf(escrowHolderFor("s1"))).toBe(4_000);
+  });
+
+  it("holdAll: 参加者の順序だけが違う再試行は同一要求として扱いreplayされる", () => {
+    expect(ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toBe(true);
+    expect(ctx.escrow.holdAll("s1", ["b", "a"], 2_000, "丁半", "op1")).toBe(true);
+    expect(ctx.ether.balanceOf(escrowHolderFor("s1"))).toBe(4_000); // 増えていない
+  });
+
+  it("holdAll: 同じoperationIdを別の額で呼ぶと例外になり、実際の預り額も動かない", () => {
+    expect(ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toBe(true);
+    expect(() => ctx.escrow.holdAll("s1", ["a", "b"], 6_000, "丁半", "op1")).toThrow(/operation conflict/);
+    expect(ctx.ether.balanceOf(escrowHolderFor("s1"))).toBe(4_000);
+    expect(ctx.escrow.poolOf("s1")).toBe(4_000);
+  });
+
+  it("holdAll: 同じoperationIdを別のgameで呼ぶと例外になる", () => {
+    expect(ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toBe(true);
+    expect(() => ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "テスト", "op1")).toThrow(/operation conflict/);
+  });
+
+  it("holdAll: 参加者を追加した再試行(a,b→a,b,c)は例外になり、cは徴収されない", () => {
+    expect(ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toBe(true);
+    expect(() => ctx.escrow.holdAll("s1", ["a", "b", "c"], 2_000, "丁半", "op1")).toThrow(/operation conflict/);
+    expect(ctx.ether.balanceOf("c")).toBe(0); // 徴収されていない（cはそもそも入金されていない）
+    expect(ctx.escrow.poolOf("s1")).toBe(4_000); // a,bぶんのまま
+  });
+
+  it("holdAll: 参加者を減らした再試行(a,b→a)は例外になる", () => {
+    expect(ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toBe(true);
+    expect(() => ctx.escrow.holdAll("s1", ["a"], 2_000, "丁半", "op1")).toThrow(/operation conflict/);
+  });
+
+  it("holdAll: 参加者を入れ替えた再試行(a,b→a,c)は例外になり、cは徴収されない", () => {
+    expect(ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toBe(true);
+    expect(() => ctx.escrow.holdAll("s1", ["a", "c"], 2_000, "丁半", "op1")).toThrow(/operation conflict/);
+    expect(ctx.ether.balanceOf("c")).toBe(0); // 徴収されていない（cはそもそも入金されていない）
+  });
+
+  it("holdAll: 同一呼び出し内の重複userIdは、初回から即座に拒否する（グループを作らない）", () => {
+    expect(() => ctx.escrow.holdAll("s1", ["a", "a"], 2_000, "丁半", "op1")).toThrow(/duplicate userId/);
+    expect(ctx.ether.balanceOf("a")).toBe(10_000); // 何も動いていない
+    // グループが作られていないので、正しい参加者構成で改めて呼び直せる
+    expect(ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toBe(true);
+  });
+
+  it("holdAll legacy: この変更より前に確定した生のtrueは、casino_txの明細（参加者集合含む）から復元して照合する", () => {
+    expect(ctx.escrow.holdAll("s1", ["a", "b"], 2_000, "丁半", "op1")).toBe(true);
+    ctx.db.prepare("UPDATE casino_tx_groups SET result_json = 'true' WHERE group_key = ?").run("escrow:hold_all:s1:op1");
+
+    // 一致する要求（順序違いも含め同一視）→ true
+    expect(ctx.escrow.holdAll("s1", ["b", "a"], 2_000, "丁半", "op1")).toBe(true);
+    // 参加者集合が食い違う要求 → conflict
+    expect(() => ctx.escrow.holdAll("s1", ["a", "b", "c"], 2_000, "丁半", "op1")).toThrow(/operation conflict/);
+    // 額が食い違う要求 → conflict
+    expect(() => ctx.escrow.holdAll("s1", ["a", "b"], 9_000, "丁半", "op1")).toThrow(/operation conflict/);
+    expect(ctx.ether.balanceOf(escrowHolderFor("s1"))).toBe(4_000); // どのconflictでも動いていない
+  });
+});
