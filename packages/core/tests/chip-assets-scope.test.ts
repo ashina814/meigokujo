@@ -101,9 +101,9 @@ describe("利用者単位のエスクロー不一致", () => {
 
     const verification = assets.verifyEscrowed();
     expect(verification.ok).toBe(false);
-    expect(verification.mismatches).toContainEqual(
-      expect.objectContaining({ code: "missing_ledger_rows", scope: "holder", affectedUserIds: undefined }),
-    );
+    const mismatch = verification.mismatches.find((row) => row.code === "missing_ledger_rows");
+    expect(mismatch).toEqual(expect.objectContaining({ code: "missing_ledger_rows", scope: "holder" }));
+    expect(mismatch).not.toHaveProperty("affectedUserIds");
     expect(assets.forUser("alice").total).toBe(12000);
   });
 
@@ -115,9 +115,9 @@ describe("利用者単位のエスクロー不一致", () => {
 
     const verification = assets.verifyEscrowed();
     expect(verification.ok).toBe(false);
-    expect(verification.mismatches).toContainEqual(
-      expect.objectContaining({ code: "unknown_escrow_holder", scope: "holder", affectedUserIds: undefined }),
-    );
+    const mismatch = verification.mismatches.find((row) => row.code === "unknown_escrow_holder");
+    expect(mismatch).toEqual(expect.objectContaining({ code: "unknown_escrow_holder", scope: "holder" }));
+    expect(mismatch).not.toHaveProperty("affectedUserIds");
     expect(assets.forUser("alice").escrowed).toBe(2000);
   });
 
