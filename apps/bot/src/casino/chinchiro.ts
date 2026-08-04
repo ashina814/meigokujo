@@ -20,7 +20,9 @@ import {
   chinchiroEvaluate,
   chinchiroIsTerminal,
   chinchiroMaxPayout,
+  chinchiroMaxPlayerLoss,
   chinchiroPayout,
+  chinchiroPlayerLoss,
   chinchiroRoll,
   type ChinchiroDice as Dice,
   type ChinchiroHand as Hand,
@@ -51,8 +53,10 @@ import { broadcastBigWin } from "./bigwin.js";
  * - 勝ち倍率: ピンゾロ5 / ゾロ目3 / シゴロ2 / 目1（変更なし）
  * - **負けは最大2倍**（PR4・正本 §1.5）。旧実装はマモンのピンゾロで 5倍払いだった
  * - 同点はマモン勝ち（-1倍）。勝ち利益のエッジは 5% → 15%（負け上限2化で上振れした RTP を戻す）
- * - 倍付け負けは追加徴収。残高不足なら通常負けにフォールバック
- *   （**この事前預託化とフォールバック削除は PR11**。PR4 では倍率だけを直す）
+ * - **開始時に最大損失 `2 × bet` を `escrow:session:<sid>` へ事前預託する**（PR11・正本 §11.4）。
+ *   結果後の追加徴収・残高不足フォールバックはしない。通常負けは必要額だけ house へ、
+ *   残額は利用者へ返す。倍付け負けは全額 house。勝ち・引分は預託全額が形を変えて戻る
+ *   （配当 or 直接返還）。PR4 では倍率だけを直し、事前預託化は行っていなかった
  * - シェイクアニメ 4フレーム、マモンのターンでも同じ演出
  * - 結果画面に「最低/前回/最大/配当表/退席」ボタン
  */
@@ -79,23 +83,32 @@ function describe(h: Hand): string {
 
 /**
  * 1ラウンドの確定結果。`result_json` に保存され、同じ操作の再試行はここから再生される。
- * 分岐（勝ち／引分／通常負け／倍付け負け／残高不足フォールバック）も保存対象。
+ * 分岐（勝ち／引分／通常負け／倍付け負け）も保存対象。
+ *
+ * PR11: 残高不足フォールバックは廃止した（正本 §11.4）。開始時に最大損失
+ * `2 × bet` を事前預託しているので、結果確定時点で残高が足りない事態は起きない。
  */
 export interface ChinchiroRound {
-  branch: "win" | "push" | "loss" | "double_loss" | "fallback_loss";
+  branch: "win" | "push" | "loss" | "double_loss";
   settled: import("@meigokujo/core").SoloRoundResult;
   amuletNote: string | null;
-  /** 倍付け負けの追加徴収額（それ以外は 0） */
+  /** 倍付け負けの追加損失額（それ以外は 0）。資金は開始時に事前預託済み。 */
   extra: number;
 }
 
+/** チンチロの事前預託セッションID。1ラウンド = 1セッション。 */
+export function chinchiroPreholdSessionId(uid: string, operationId: string): string {
+  return `chinchiro:prehold:${uid}:${operationId}`;
+}
+
 /**
- * 1ラウンドの精算。勝ち・引分・通常負け・倍付け負け・残高不足フォールバックを
- * **すべて同じグループ**で処理する。
+ * 事前預託した最大損失 `2 × bet` を確定する。
  *
- * 分岐ごとに別の鍵を使うと、倍付け負けの後の再試行が通常負け側へ回り、
- * 別グループでもう一度徴収できてしまう。残高判定もグループの中に置いて、
- * 最初に確定した分岐と結果を `result_json` から再生する。
+ * `bet` ぶんは `Casino.settleSolo()` の共有経路（連鎖・福の重み・お守り・戦績・
+ * 予約解放）を通し、**徴収元だけ**を事前預託 holder へ差し替える（正本 I5・I8）。
+ * 倍付け負けの追加損失・勝ち引分時の預託残額は、同じチップグループの中で
+ * escrow から直接動かす。ラウンド全体が単一グループなので、途中で例外が
+ * 起きればここまでの送金もすべて巻き戻る。
  *
  * @param mul 勝敗倍率（>0 勝ち / 0 引分 / -1 通常負け / ≤-2 倍付け負け）
  */
@@ -108,34 +121,46 @@ export function settleChinchiroRound(
   /** 胴元債務予約の鍵（PR5）。精算が通った時点で同じトランザクション内で解放される */
   reservationKey?: string,
 ): ChinchiroRound {
+  const sessionId = chinchiroPreholdSessionId(uid, operationId);
   return services.chips.runGroup(
     { groupKey: `chinchiro:round:${uid}:${operationId}`, kind: "solo_game", actorId: uid },
     (): ChinchiroRound => {
-      const held = services.chips.balanceOf(uid);
-      if (mul > 0) {
-        // 勝ち: profit = bet * mul * (1 - edge)、payout = bet + profit
-        const rawPayout = chinchiroPayout(bet, mul);
-        const settled = services.casino.settleSolo(uid, "チンチロ", bet, rawPayout, { operationId, reservationKey });
-        return { branch: "win", settled, amuletNote: settled.amuletNote ?? null, extra: 0 };
+      const holder = services.escrow.holderId(sessionId);
+      const preheld = chinchiroMaxPlayerLoss(bet);
+      const pool = services.escrow.poolOf(sessionId);
+      if (pool !== preheld) {
+        throw new Error(`チンチロ事前預託の帳簿不一致: 期待${preheld} 実際${pool}`);
       }
-      if (mul === 0) {
-        // プッシュ（両方ヒフミ）: 返金
-        const settled = services.casino.settleSolo(uid, "チンチロ", bet, bet, { operationId, reservationKey });
-        return { branch: "push", settled, amuletNote: settled.amuletNote ?? null, extra: 0 };
+
+      const rawPayout = mul > 0 ? chinchiroPayout(bet, mul) : mul === 0 ? bet : 0;
+      const settled = services.casino.settleSolo(uid, "チンチロ", bet, rawPayout, {
+        operationId,
+        reservationKey,
+        preheld: { holderId: holder },
+      });
+
+      // settle() が holder から house へ bet ぶんを動かした。残りの精算:
+      // 倍付け負けの追加損失は holder → house、勝ち・引分・通常負けの残額は holder → 利用者。
+      //
+      // `escrow.payout()` は holder の実残高だけを動かし、`casino_escrow` 台帳は
+      // 更新しない（最後に `clear()` で一括削除する設計）。そのため「残額」は
+      // `poolOf()`（台帳合計・ここでは動かない）ではなく **holder の実残高**で見る。
+      const loss = mul < 0 ? chinchiroPlayerLoss(bet, mul) : 0;
+      const extra = Math.max(0, loss - bet);
+      if (extra > 0) {
+        services.escrow.payout(sessionId, HOUSE_HOLDER, extra, operationId, "チンチロ倍付け負けの追加損失");
       }
-      const extraNeeded = mul <= -2 ? (Math.abs(mul) - 1) * bet : 0;
-      // 倍付け負けは追加徴収まで払えるときだけ。払えなければ通常負けへフォールバック
-      const doubleLoss = extraNeeded > 0 && held >= bet + extraNeeded;
-      const settled = services.casino.settleSolo(uid, "チンチロ", bet, 0, { operationId, reservationKey });
-      if (doubleLoss) {
-        services.chips.transfer(uid, HOUSE_HOLDER, extraNeeded, { reason: "倍付け負けの追加徴収", game: "チンチロ" });
-        return { branch: "double_loss", settled, amuletNote: settled.amuletNote ?? null, extra: extraNeeded };
+      const remaining = services.chips.balanceOf(holder);
+      if (remaining > 0) {
+        services.escrow.payout(sessionId, uid, remaining, operationId, "チンチロ事前預託残額返還");
       }
+      services.escrow.clear(sessionId);
+
       return {
-        branch: extraNeeded > 0 ? "fallback_loss" : "loss",
+        branch: mul > 0 ? "win" : mul === 0 ? "push" : loss >= preheld ? "double_loss" : "loss",
         settled,
         amuletNote: settled.amuletNote ?? null,
-        extra: 0,
+        extra,
       };
     },
   );
@@ -217,6 +242,63 @@ export async function playChinchiro(
   }
 }
 
+/** `beginChinchiroPrehold` が資金を動かせなかったときに投げる、UI 側で捕まえる用の理由分け。 */
+export class ChinchiroPreholdError extends Error {
+  constructor(readonly reason: "insufficient_funds" | "hold_failed") {
+    super(`chinchiro prehold failed: ${reason}`);
+    this.name = "ChinchiroPreholdError";
+  }
+}
+
+/**
+ * 最大損失 `2 × bet` を、乱数・演出より前に事前預託する（PR11・正本 §11.4）。
+ *
+ * 自由チップの不足分はここで自動預入する。それでも足りない・預託そのものが失敗した
+ * 場合は資金を1 Ld も動かさず {@link ChinchiroPreholdError} を投げる（呼び出し側が
+ * 理由に応じた文言を表示する）。
+ *
+ * 事前預託は `escrow.hold()`（既存の卓預託と同じ台帳・同じ復旧経路）を使うので、
+ * 起動時復旧・active ownership 判定・資産検算はすべて既存の仕組みがそのまま拾う——
+ * ここに専用のテーブルや状態機械を新設する必要はない。
+ */
+export function beginChinchiroPrehold(services: Services, uid: string, bet: number, operationId: string): string {
+  const preheld = chinchiroMaxPlayerLoss(bet);
+  const sessionId = chinchiroPreholdSessionId(uid, operationId);
+  try {
+    // ensureFreeChips の operationId は ":" を含められない（区切り文字の注入対策）。
+    // validateBet 自身の自動預入（bare な interaction.id）とは別の鍵にする必要があるので、
+    // ":" ではなくハイフンで区切る
+    services.chipFlow.ensureFreeChips(uid, preheld, `${operationId}-chinchiro-prehold`);
+  } catch {
+    throw new ChinchiroPreholdError("insufficient_funds");
+  }
+  if (!services.escrow.hold(sessionId, uid, preheld, "チンチロ", operationId)) {
+    throw new ChinchiroPreholdError("hold_failed");
+  }
+  return sessionId;
+}
+
+/**
+ * 精算前に中断したラウンドの事前預託を返す（PR11）。
+ *
+ * 精算後（`casino_escrow` は既に空）に呼ばれても `escrow.refund()` は返す対象が
+ * 無いので何もしない（idempotent no-op・資金は動かない）——これで
+ * 「表示失敗で精算済み資金を再び動かす」を構造的に防ぐ。
+ *
+ * 返金そのものが失敗したら、帳簿を残したまま凍結する（原因を消さず、次回起動時の
+ * 登録型復旧に委ねる。正本 I6「不明時は動かさない」）。
+ */
+export function refundChinchiroPreholdOnFailure(services: Services, sessionId: string, causeError: unknown): never {
+  try {
+    services.escrow.refund(sessionId);
+  } catch {
+    throw new Error(
+      `チンチロの事前預託返還に失敗し凍結しました: ${sessionId}（元エラー: ${causeError instanceof Error ? causeError.message : String(causeError)}）`,
+    );
+  }
+  throw causeError;
+}
+
 /**
  * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
  * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
@@ -226,9 +308,39 @@ async function runRound(
   services: Services,
   bet: number,
 ): Promise<void> {
-  await withHouseReservation(interaction, services, "チンチロ", bet, interaction.id, (reservationKey) =>
-    runRoundInner(interaction, services, bet, reservationKey),
-  );
+  await withHouseReservation(interaction, services, "チンチロ", bet, interaction.id, async (reservationKey) => {
+    const uid = interaction.user.id;
+    const operationId = interaction.id;
+    const respond = (content: string) =>
+      interaction.replied || interaction.deferred
+        ? interaction.followUp({ content, flags: MessageFlags.Ephemeral })
+        : interaction.reply({ content, flags: MessageFlags.Ephemeral });
+
+    let sessionId: string;
+    try {
+      sessionId = beginChinchiroPrehold(services, uid, bet, operationId);
+    } catch (error) {
+      if (error instanceof ChinchiroPreholdError && error.reason === "insufficient_funds") {
+        await respond(
+          `チンチロは最大損失ぶん ${fmtEther(chinchiroMaxPlayerLoss(bet))}（賭け ${fmtEther(bet)} の${CHINCHIRO_MAX_LOSS_MULT}倍）を先に預ける必要がある。Land が足りない。`,
+        );
+        return;
+      }
+      if (error instanceof ChinchiroPreholdError) {
+        await respond("チンチロの事前預託に失敗した。もう一度試してほしい。");
+        return;
+      }
+      throw error;
+    }
+
+    // ここから先の例外（Discordの表示失敗・collectorタイムアウト・利用者の中止）は、
+    // 精算が確定する前なら事前預託をそのまま返す。精算後の例外では refund は no-op。
+    try {
+      await runRoundInner(interaction, services, bet, reservationKey);
+    } catch (error) {
+      refundChinchiroPreholdOnFailure(services, sessionId, error);
+    }
+  });
 }
 
 async function runRoundInner(
@@ -424,7 +536,6 @@ async function runRoundInner(
   let payoutText = "";
   const title = "🎲 チンチロ — 対 マモン";
   let color = C_LOSE;
-  let extraNote = "";
   let netForDisplay = 0;
   const amuletNote = round.amuletNote ? `✨ ${round.amuletNote}` : "";
   const settled = round.settled;
@@ -447,10 +558,6 @@ async function runRoundInner(
     const totalLoss = bet + round.extra;
     netForDisplay = -totalLoss;
     payoutText = `💀 -${fmtEther(totalLoss)}（${Math.abs(mul)}倍負け）`;
-  } else if (round.branch === "fallback_loss") {
-    netForDisplay = -bet;
-    payoutText = `💸 -${fmtEther(bet)}（残高不足で追加徴収なし）`;
-    extraNote = "\n*※本来は倍付け負けだったが、残高不足のため通常負けにフォールバック*";
   } else {
     netForDisplay = settled.payout - bet;
     payoutText = settled.payout > 0 ? `🛡 返金 ${fmtEther(settled.payout)}` : `💸 -${fmtEther(bet)}`;
@@ -474,7 +581,7 @@ async function runRoundInner(
   const resultEmbed = new EmbedBuilder()
     .setTitle(title)
     .setColor(color)
-    .setDescription([comparison, "", payoutText + extraNote, amuletNote].filter(Boolean).join("\n"))
+    .setDescription([comparison, "", payoutText, amuletNote].filter(Boolean).join("\n"))
     .setFooter({ text: `所持: ${fmtEther(services.chips.balanceOf(uid))}` });
 
   const heldAfter = services.chips.balanceOf(uid);

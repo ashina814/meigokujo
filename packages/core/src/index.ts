@@ -214,6 +214,7 @@ export {
   type SoloRoundResult,
   type SoloRoundOptions,
   type CasinoOptions,
+  type PreheldWager,
 } from "./casino/service.js";
 export { Daily, type DailyClaim, type DailyClaimResult, type DailyOptions } from "./casino/daily.js";
 export { Items, CONSUMABLES, getConsumableDef, type ItemKind as CasinoItemKind, type ConsumableDef, type ArmResult } from "./casino/items.js";

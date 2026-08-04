@@ -91,6 +91,19 @@ export function soloGroupKey(game: string, userId: string, operationId: string):
   return `solo:${game}:${userId}:${operationId}`;
 }
 
+/**
+ * 賭け金の徴収元を、利用者本人ではなく既に確保済みの escrow holder にする（PR11）。
+ *
+ * チンチロ事前預託のように「最大損失を先に holder へ移してある」ゲームが使う。
+ * `settle()` は `bet` だけをこの holder から house へ動かす。倍付け負けの追加損失・
+ * 事前預託の残額返還は `settle()` の外（呼び出し側の同じチップグループ内）で行う——
+ * `Casino` が escrow の存在を知らなくて済むように、ここでは「徴収元を差し替える」
+ * ことだけを担当する。連鎖・福の重み・戦績の計算式は一切変えない。
+ */
+export interface PreheldWager {
+  holderId: string;
+}
+
 export interface SettleOptions {
   /**
    * この精算を一意に指す値。**同じ操作の再試行では同じ値**を渡すこと
@@ -106,6 +119,7 @@ export interface SettleOptions {
    * 予約はゲーム開始時に取ってあり、この精算が通った時点で債務が確定するので不要になる。
    */
   reservationKey?: string;
+  preheld?: PreheldWager;
 }
 
 export interface SettleResult {
@@ -255,12 +269,22 @@ export class Casino {
     const useChain = opts.chain ?? true;
     const useFuku = opts.fuku ?? true;
     const move = { game, sessionId: null };
+    // PR11: 徴収元は既定で利用者本人。preheld が渡されていれば、既に確保済みの
+    // holder から徴収する（利用者の残高を精算時点で読み直さない）。holder の残高が
+    // 呼び出し側の主張と食い違うなら、ここで即座に落として資金を動かさない。
+    const chargeFrom = opts.preheld?.holderId ?? userId;
+    if (opts.preheld) {
+      const held = this.ether.balanceOf(opts.preheld.holderId);
+      if (!Number.isSafeInteger(held) || held < bet) {
+        throw new Error(`preheld solo wager insufficient: holder=${opts.preheld.holderId} balance=${held} bet=${bet}`);
+      }
+    }
     // 1ゲームの精算をひとまとまりの業務操作として記録する。`operationId` は
     // 「同じ操作の再試行なら同じ値になる」ものを呼び出し側が渡す（Discordの操作IDなど）
     const groupKey = soloGroupKey(game, userId, opts.operationId);
     return this.ether.runGroup({ groupKey, kind: "solo_game", actorId: userId }, (): SettleResult => {
       // 徴収
-      this.ether.transfer(userId, HOUSE_HOLDER, bet, { ...move, reason: "賭け金" });
+      this.ether.transfer(chargeFrom, HOUSE_HOLDER, bet, { ...move, reason: "賭け金" });
       // 配当
       if (payout > 0) this.ether.transfer(HOUSE_HOLDER, userId, payout, { ...move, reason: "配当" });
 
