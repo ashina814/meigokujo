@@ -10,9 +10,9 @@ import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { CasinoChipAssets, type EscrowAssetMismatchCode } from "../src/casino/chip-assets.js";
 import { ChipLedger, ChipLedgerError } from "../src/casino/chip-ledger.js";
-import { escrowHolderFor } from "../src/casino/escrow.js";
+import { Escrow, escrowHolderFor } from "../src/casino/escrow.js";
 import { FREE_SPIN_JACKPOT_CLAIMS_HOLDER } from "../src/casino/free-spins.js";
-import { MARKET_LIVE_STATUSES, marketEscrowHolder } from "../src/casino/market.js";
+import { MARKET_LIVE_STATUSES, Markets, marketEscrowHolder } from "../src/casino/market.js";
 import { openFormally } from "./helpers/chip-ctx.js";
 
 registerDefaultTxTypes();
@@ -92,7 +92,11 @@ function expectCorrupt(operation: () => unknown): void {
 function full(path = ":memory:") {
   const db = openDb(path);
   const ledger = new Ledger(db);
-  const chips = new ChipLedger(db, ledger, new EventLog(db));
+  const events = new EventLog(db);
+  const chips = new ChipLedger(db, ledger, events);
+  // 本番servicesと同じ順番で、各モジュール固有schemaを作成する。
+  new Escrow(db, chips, events);
+  new Markets(db, chips, events);
   ledger.ensureAccount("user:alice", "user");
   ledger.ensureAccount("user:bob", "user");
   for (const userId of ["alice", "bob"]) {
@@ -121,14 +125,18 @@ function moveToSession(ctx: ReturnType<typeof full>, id: string, userId: string,
   });
 }
 
-function moveToMarket(ctx: ReturnType<typeof full>, id: number, userId: string, amount: number, status = "open") {
+function insertOpenMarket(ctx: ReturnType<typeof full>, id: number, userId = "alice") {
+  ctx.db.prepare(
+    `INSERT INTO casino_markets
+     (id,guild_id,creator_id,title,options_json,status,deadline_at,fee,payout_mode,fund_mode,created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,0)`,
+  ).run(id, "g", userId, "test", '["A","B"]', "open", 9_999_999_999, 0, "parimutuel", "escrow");
+}
+
+function moveToMarket(ctx: ReturnType<typeof full>, id: number, userId: string, amount: number) {
+  insertOpenMarket(ctx, id, userId);
   const holder = marketEscrowHolder(id);
   ctx.chips.runGroup({ groupKey: `market:${id}:${userId}`, kind: "market_bet", actorId: userId }, () => {
-    ctx.db.prepare(
-      `INSERT INTO casino_markets
-       (id,guild_id,creator_id,title,options_json,status,deadline_at,fee,payout_mode,fund_mode,created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,0)`,
-    ).run(id, "g", userId, "test", '["A","B"]', status, 9999999999, 0, "parimutuel", "escrow");
     ctx.chips.transfer(userId, holder, amount, { reason: "test market", sessionId: `market:${id}` });
     ctx.db.prepare(
       "INSERT INTO casino_market_bets (market_id,user_id,option_index,amount,created_at) VALUES (?,?,0,?,0)",
@@ -137,12 +145,16 @@ function moveToMarket(ctx: ReturnType<typeof full>, id: number, userId: string, 
 }
 
 function externalExec(path: string, sql: string): void {
-  execFileSync(process.execPath, [
-    "-e",
-    "const D=require('better-sqlite3');const d=new D(process.argv[1],{timeout:5000});d.pragma('journal_mode=WAL');d.exec(process.argv[2]);d.close()",
-    path,
-    sql,
-  ], { cwd: process.cwd(), stdio: "pipe" });
+  execFileSync(
+    process.execPath,
+    [
+      "-e",
+      "const D=require('better-sqlite3');const d=new D(process.argv[1],{timeout:5000});d.pragma('journal_mode=WAL');d.pragma('busy_timeout=5000');d.exec(process.argv[2]);d.close()",
+      path,
+      sql,
+    ],
+    { cwd: process.cwd(), stdio: "pipe" },
+  );
 }
 
 function fileCtx() {
@@ -154,15 +166,23 @@ function fileCtx() {
 
 function tableSnapshot(db: Database.Database): string {
   const names = [
-    "ether_balances", "casino_escrow", "casino_market_bets", "casino_markets",
-    "casino_tx", "casino_tx_groups", "transactions", "events",
-    "casino_chip_opening_versions", "casino_house_reservations", "casino_status",
+    "ether_balances",
+    "casino_escrow",
+    "casino_market_bets",
+    "casino_markets",
+    "casino_tx",
+    "casino_tx_groups",
+    "transactions",
+    "events",
+    "casino_chip_opening_versions",
+    "casino_house_reservations",
+    "casino_status",
   ];
   return JSON.stringify(Object.fromEntries(names.map((name) => [name, db.prepare(`SELECT * FROM ${name}`).all()])));
 }
 
 describe("freeChips / escrowed / total", () => {
-  it("自由のみ、卓のみ、板のみ、卓+板、複数利用者を本人別に合算する", () => {
+  it("自由のみ、卓のみ、板のみ、卓+板、複数卓・板・利用者を本人別に合算する", () => {
     const ctx = bare();
     session(ctx.db, "s1", "alice", 2_000);
     session(ctx.db, "s1", "bob", 500);
@@ -176,12 +196,8 @@ describe("freeChips / escrowed / total", () => {
     balance(ctx.db, marketEscrowHolder(2), 400);
     balance(ctx.db, marketEscrowHolder(3), 700);
 
-    expect(ctx.assets.forUser("alice")).toEqual({
-      userId: "alice", freeChips: 10_000, escrowed: 6_400, total: 16_400,
-    });
-    expect(ctx.assets.forUser("bob")).toEqual({
-      userId: "bob", freeChips: 10_000, escrowed: 1_200, total: 11_200,
-    });
+    expect(ctx.assets.forUser("alice")).toEqual({ userId: "alice", freeChips: 10_000, escrowed: 6_400, total: 16_400 });
+    expect(ctx.assets.forUser("bob")).toEqual({ userId: "bob", freeChips: 10_000, escrowed: 1_200, total: 11_200 });
     expect(ctx.assets.verifyEscrowed()).toEqual({ ok: true, mismatches: [] });
   });
 
@@ -190,15 +206,29 @@ describe("freeChips / escrowed / total", () => {
     session(ctx.db, "bob", "bob", 500);
     balance(ctx.db, escrowHolderFor("bob"), 500);
     for (const [holder, amount] of [
-      ["house", 1], ["jackpot", 2], ["relief", 3], ["sys:escrow:quarantine", 4],
-      [FREE_SPIN_JACKPOT_CLAIMS_HOLDER, 5], ["system:test", 6],
+      ["house", 1],
+      ["jackpot", 2],
+      ["relief", 3],
+      ["sys:escrow:quarantine", 4],
+      [FREE_SPIN_JACKPOT_CLAIMS_HOLDER, 5],
+      ["system:test", 6],
     ] as const) balance(ctx.db, holder, amount);
     expect(ctx.assets.forUser("alice").escrowed).toBe(0);
   });
 
   it.each([
-    "", " ", " alice", "alice ", "user:alice", "user:user:alice",
-    "house", "jackpot", "relief", "sys:test", "system:test", "escrow:session:x",
+    "",
+    " ",
+    " alice",
+    "alice ",
+    "user:alice",
+    "user:user:alice",
+    "house",
+    "jackpot",
+    "relief",
+    "sys:test",
+    "system:test",
+    "escrow:session:x",
   ])("不正な利用者ID %j を拒否する", (userId) => {
     const ctx = bare();
     expect(() => ctx.assets.freeChips(userId)).toThrowError(ChipLedgerError);
@@ -334,9 +364,7 @@ describe("別接続・別プロセスの一貫スナップショット", () => {
         COMMIT;`);
       return value;
     });
-    expect(first.ctx.assets.forUser("alice")).toEqual({
-      userId: "alice", freeChips: 20_000, escrowed: 0, total: 20_000,
-    });
+    expect(first.ctx.assets.forUser("alice")).toEqual({ userId: "alice", freeChips: 20_000, escrowed: 0, total: 20_000 });
 
     const second = fileCtx();
     moveToSession(second.ctx, "p", "alice", 2_000);
@@ -350,18 +378,12 @@ describe("別接続・別プロセスの一貫スナップショット", () => {
         COMMIT;`);
       return value;
     });
-    expect(second.ctx.assets.forUser("alice")).toEqual({
-      userId: "alice", freeChips: 18_000, escrowed: 2_000, total: 20_000,
-    });
+    expect(second.ctx.assets.forUser("alice")).toEqual({ userId: "alice", freeChips: 18_000, escrowed: 2_000, total: 20_000 });
   });
 
   it("market bet中のforUserとsettle中のverifyも一貫状態だけを見る", () => {
     const betting = fileCtx();
-    betting.ctx.db.prepare(
-      `INSERT INTO casino_markets
-       (id,guild_id,creator_id,title,options_json,status,deadline_at,fee,payout_mode,fund_mode,created_at)
-       VALUES (1,'g','alice','t','["A","B"]','open',9999999999,0,'parimutuel','escrow',0)`,
-    ).run();
+    insertOpenMarket(betting.ctx, 1);
     const original = betting.ctx.chips.freeChips.bind(betting.ctx.chips);
     vi.spyOn(betting.ctx.chips, "freeChips").mockImplementation((userId) => {
       const value = original(userId);
@@ -372,39 +394,43 @@ describe("別接続・別プロセスの一貫スナップショット", () => {
         COMMIT;`);
       return value;
     });
-    expect(betting.ctx.assets.forUser("alice").total).toBe(20_000);
+    expect(betting.ctx.assets.forUser("alice")).toEqual({ userId: "alice", freeChips: 20_000, escrowed: 0, total: 20_000 });
 
     const settling = fileCtx();
     moveToMarket(settling.ctx, 1, "alice", 3_000);
     let fired = false;
     const wrapped = new Proxy(settling.ctx.db, {
       get(target, property) {
-        if (property === "prepare") return (sql: string) => {
-          const statement = target.prepare(sql);
-          if (!sql.includes("FROM ether_balances WHERE user_id LIKE 'escrow:%'")) return statement;
-          return new Proxy(statement, {
-            get(stmt, prop) {
-              if (prop === "all") return (...args: unknown[]) => {
-                if (!fired) {
-                  fired = true;
-                  externalExec(settling.path, `BEGIN IMMEDIATE;
-                    UPDATE ether_balances SET amount=20000 WHERE user_id='alice';
-                    UPDATE ether_balances SET amount=0 WHERE user_id='escrow:market:1';
-                    UPDATE casino_markets SET status='settled' WHERE id=1;
-                    COMMIT;`);
+        if (property === "prepare") {
+          return (sql: string) => {
+            const statement = target.prepare(sql);
+            if (!sql.includes("FROM ether_balances WHERE user_id LIKE 'escrow:%'")) return statement;
+            return new Proxy(statement, {
+              get(stmt, prop) {
+                if (prop === "all") {
+                  return (...args: unknown[]) => {
+                    if (!fired) {
+                      fired = true;
+                      externalExec(settling.path, `BEGIN IMMEDIATE;
+                        UPDATE ether_balances SET amount=20000 WHERE user_id='alice';
+                        UPDATE ether_balances SET amount=0 WHERE user_id='escrow:market:1';
+                        UPDATE casino_markets SET status='settled' WHERE id=1;
+                        COMMIT;`);
+                    }
+                    return Reflect.apply(stmt.all as (...values: unknown[]) => unknown[], stmt, args);
+                  };
                 }
-                return Reflect.apply(stmt.all as (...values: unknown[]) => unknown[], stmt, args);
-              };
-              const value = Reflect.get(stmt, prop, stmt);
-              return typeof value === "function" ? value.bind(stmt) : value;
-            },
-          });
-        };
+                const value = Reflect.get(stmt, prop, stmt);
+                return typeof value === "function" ? value.bind(stmt) : value;
+              },
+            });
+          };
+        }
         const value = Reflect.get(target, property, target);
         return typeof value === "function" ? value.bind(target) : value;
       },
     }) as Database.Database;
-    expect(new CasinoChipAssets(wrapped, settling.ctx.chips).verifyEscrowed().ok).toBe(true);
+    expect(new CasinoChipAssets(wrapped, settling.ctx.chips).verifyEscrowed()).toEqual({ ok: true, mismatches: [] });
   });
 });
 
