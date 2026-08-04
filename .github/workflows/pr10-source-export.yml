@@ -1,4 +1,4 @@
-name: PR10 source export
+name: PR10 audit validation
 
 on:
   pull_request:
@@ -9,15 +9,22 @@ permissions:
   contents: read
 
 jobs:
-  export:
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Package source
+      - name: Apply audit patch
         run: |
-          tar --exclude=.git --exclude=node_modules -czf /tmp/meigokujo-pr10-source.tgz .
-      - uses: actions/upload-artifact@v4
+          base64 -d .audit/pr10.patch.gz.b64 | gzip -d > /tmp/pr10.patch
+          git apply --check /tmp/pr10.patch
+          git apply /tmp/pr10.patch
+      - uses: pnpm/action-setup@v4
         with:
-          name: meigokujo-pr10-source
-          path: /tmp/meigokujo-pr10-source.tgz
-          if-no-files-found: error
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
