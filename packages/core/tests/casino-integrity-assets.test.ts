@@ -4,6 +4,7 @@ import { EventLog } from "../src/events/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { CasinoChipAssets } from "../src/casino/chip-assets.js";
+import { CasinoChipFlow } from "../src/casino/chip-flow.js";
 import { CHIP_ESCROW, ChipLedger } from "../src/casino/chip-ledger.js";
 import { ChipTx, FORMAL_OPENING_VERSION } from "../src/casino/chip-tx.js";
 import { Escrow, escrowHolderFor } from "../src/casino/escrow.js";
@@ -24,11 +25,12 @@ function setup() {
   const escrow = new Escrow(db, chips, events);
   const markets = new Markets(db, chips, events);
   const assets = new CasinoChipAssets(db, chips);
+  const chipFlow = new CasinoChipFlow(db, chips, events, assets);
   const integrity = new CasinoIntegrity(db, ledger, chips, escrow, assets);
   const status = new CasinoStatus(db);
   const reservations = new HouseReservations(db, chips, events);
   for (const userId of ["alice", "bob"]) ledger.ensureAccount(`user:${userId}`, "user");
-  return { db, ledger, events, chipTx, chips, escrow, markets, assets, integrity, status, reservations };
+  return { db, ledger, events, chipTx, chips, escrow, markets, assets, chipFlow, integrity, status, reservations };
 }
 
 type Ctx = ReturnType<typeof setup>;
@@ -239,6 +241,7 @@ describe("startup precheckとpostflightの境界", () => {
       reservations: ctx.reservations,
       registry: new RecoveryRegistry(),
       events: ctx.events,
+      chipFlow: ctx.chipFlow,
     });
     expect(result.steps).toContain("S4:生存収集");
     expect(result.outcome).toBe("opened");
@@ -260,6 +263,7 @@ describe("startup precheckとpostflightの境界", () => {
       reservations: ctx.reservations,
       registry: new RecoveryRegistry(),
       events: ctx.events,
+      chipFlow: ctx.chipFlow,
     });
     expect(result.steps).toContain("S4:生存収集");
     expect(result.outcome).toBe("halted");

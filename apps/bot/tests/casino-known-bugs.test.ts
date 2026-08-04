@@ -3,6 +3,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   Casino,
+  CasinoChipAssets,
+  CasinoChipFlow,
   CasinoIntegrity,
   CasinoStatus,
   ChipTx,
@@ -92,8 +94,16 @@ function rebuild(db: ReturnType<typeof openDb>, rng: CasinoRng = scriptedRng([0.
   const escrow = new Escrow(db, ether, events, { onPlayerNet: recordPlayerNet });
   const markets = new Markets(db, ether, events, { onPlayerNet: recordPlayerNet });
   const freeSpins = new FreeSpins(db);
-  const services = { db, ether, chips: ether, chipTx, casino, items, vip, escrow, markets, freeSpins, reservations, rng, events } as unknown as Services;
-  return { db, ledger, chipTx, ether, casino, items, vip, escrow, markets, freeSpins, reservations, events, services };
+  const chipAssets = new CasinoChipAssets(db, ether);
+  const chipFlow = new CasinoChipFlow(db, ether, events, chipAssets);
+  const services = {
+    db, ledger, ether, chips: ether, chipTx, chipAssets, chipFlow, casino, items, vip,
+    escrow, markets, freeSpins, reservations, rng, events,
+  } as unknown as Services;
+  return {
+    db, ledger, chipTx, ether, chipAssets, chipFlow, casino, items, vip, escrow,
+    markets, freeSpins, reservations, events, services,
+  };
 }
 
 /**
@@ -113,6 +123,7 @@ function mintBackedChips(ctx: ReturnType<typeof rebuild>, holder: string, amount
 }
 
 function seedBalance(db: ReturnType<typeof openDb>, holder: string, amount: number): void {
+  if (isPlayerHolder(holder)) new Ledger(db).ensureAccount(`user:${holder}`, "user");
   db.prepare(
     "INSERT INTO ether_balances (user_id, amount, updated_at) VALUES (?, ?, 1) ON CONFLICT(user_id) DO UPDATE SET amount = excluded.amount",
   ).run(holder, amount);
@@ -589,6 +600,7 @@ describe("③b フリースピン権はプロセスをまたいで残る", () =>
       reservations: ctx.reservations,
       registry: new RecoveryRegistry(),
       events: ctx.events,
+      chipFlow: ctx.chipFlow,
     });
 
     expect(recovered.outcome).toBe("opened");
