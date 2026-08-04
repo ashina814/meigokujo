@@ -40,6 +40,7 @@ import {
   Markets,
   Takutate,
   Escrow,
+  CasinoChipAssets,
   defaultRng,
   openDb,
   registerDefaultTxTypes,
@@ -165,8 +166,9 @@ export function buildServices() {
   };
   const markets = new Markets(db, chips, events, { onPlayerNet: recordPlayerNet });
   const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
+  const chipAssets = new CasinoChipAssets(db, chips);
   const takutate = new Takutate(db, events);
-  const casinoIntegrity = new CasinoIntegrity(db, ledger, chips, escrow);
+  const casinoIntegrity = new CasinoIntegrity(db, ledger, chips, escrow, chipAssets);
   // 起動時: 全点検 → 通ったときだけ掃除 → 掃除後にもう一度全点検 → 開ける
   // 起動・復旧（正本 §8.2 S1〜S9, S12）。**所有元が「生きている預託」を自分で申告する**。
   // 板だけを登録し、競馬は登録しない（永続テーブルが無く、再起動でレースごと消えるので
@@ -181,7 +183,7 @@ export function buildServices() {
   // 資金を動かす経路は `chips` に一本化した（PR8監査・項目12）。`ether` は
   // 旧名称で書かれた外部プラグイン・古い呼び出しが**読むだけ**なら壊れないように
   // 残す互換窓で、型を `ChipReadonlyView` に狭めてある（下の注釈参照）。
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;

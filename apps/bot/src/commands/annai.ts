@@ -7,6 +7,11 @@ import {
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
 } from "discord.js";
+import {
+  ChipLedgerError,
+  type OpeningPhase,
+  type UserChipAssets,
+} from "@meigokujo/core";
 import { fmtEther, fmtLd } from "../format.js";
 import { C_MAMMON, C_JACKPOT, E, HR_THIN, fmtSignedEther } from "../casino/ui.js";
 import { openingNotice, openingPhase } from "../casino/opening.js";
@@ -36,19 +41,92 @@ export async function handleAnnaiButton(interaction: import("discord.js").Button
   }
 }
 
+export interface WalletDisplayInput {
+  phase: OpeningPhase;
+  heldLand: number;
+  assets: UserChipAssets | null;
+  assetError: boolean;
+  isVip: boolean;
+  vipDaysLeft: number;
+}
+
+/**
+ * PR9時点の暫定財布表示。
+ *
+ * 最終形の「所持 = 通常Land + 自由チップ」への統合と旧用語除去はPR13の範囲。
+ * ここでは資産分類を誤らず、正式開業後だけ自由チップを利用可能額として表示する。
+ */
+export function renderWalletValue(input: WalletDisplayInput): string {
+  const vipLine = input.isVip ? `${E.jp} **VIP** 残り${input.vipDaysLeft}日` : "";
+  if (input.phase === "unknown") {
+    return [
+      "⚠️ **賭場の版が異常です**",
+      "自由チップ・預け中資金は確認できません（利用可能額へ含めません）",
+      `${fmtLd(input.heldLand)}（通常Land）`,
+      vipLine,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (input.phase !== "formal") {
+    return [
+      "🚧 **正式開業準備中**",
+      "既存チップ残高は保持中です（正式開業まで利用可能額へ含めません）",
+      `${fmtLd(input.heldLand)}（通常Land）`,
+      vipLine,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (input.assetError || !input.assets) {
+    return [
+      "⚠️ **チップ帳簿を確認できません**",
+      "破損値を0として表示せず、自由チップ・預け中資金の表示を停止しています",
+      `${fmtLd(input.heldLand)}（通常Land）`,
+      vipLine,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  return [
+    `**${fmtEther(input.assets.freeChips)}** (自由チップ)`,
+    `${fmtLd(input.heldLand)}（通常Land）`,
+    input.assets.escrowed > 0 ? `卓・板に預け中 **${fmtEther(input.assets.escrowed)}**` : "",
+    vipLine,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function renderCasinoStatusLine(status: string, reason: string): string {
+  return status === "open" ? "" : `⛔ **${status}** — ${reason}`;
+}
+
 function renderHome(userId: string, services: Services, serverName?: string) {
   const stats = services.casino.stats(userId);
   const ether = services.chips;
   const daily = services.daily;
-  const heldEther = ether.balanceOf(userId);
+  const phase = openingPhase(services);
   const heldLand = services.ledger.balanceOf(`user:${userId}`);
+  let assets: UserChipAssets | null = null;
+  let assetError = false;
+  // 正式開業前・未知版では、自由チップを通常利用可能な資産として読んだり表示したりしない。
+  if (phase === "formal") {
+    try {
+      assets = services.chipAssets.forUser(userId);
+    } catch (error) {
+      if (!(error instanceof ChipLedgerError)) throw error;
+      assetError = true;
+    }
+  }
+
   const jp = services.casino.jackpotPool();
   const houseBal = services.casino.houseBalance();
   // 未知版では準備口座が決まらず pool() が例外になる。案内所ごと落とすと
   // 「異常であること」も伝わらないので、読めない事実として出す（PR8監査・項目8）
-  const phase = openingPhase(services);
   const pool = phase === "unknown" ? null : ether.pool();
   const outstanding = ether.outstanding();
+  const casinoStatus = services.casinoStatus.current();
 
   const isVip = services.vip.isVip(userId);
   const vipDaysLeft = isVip ? services.vip.daysLeft(userId) : 0;
@@ -70,13 +148,14 @@ function renderHome(userId: string, services: Services, serverName?: string) {
   // 引いた純益なので、勝った回の賭け額を二重に引いていた。
   const netLifetime = stats.total_earned - stats.total_lost;
 
-  const walletValue = [
-    `**${fmtEther(heldEther)}** (エテル)`,
-    `${fmtLd(heldLand)}`,
-    isVip ? `${E.jp} **VIP** 残り${vipDaysLeft}日` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
+  const walletValue = renderWalletValue({
+    phase,
+    heldLand,
+    assets,
+    assetError,
+    isVip,
+    vipDaysLeft,
+  });
 
   // 「1 Ld = 1 ◈」は opening_v1 が確定してからの約束。それ以前に出すと、
   // 押しても必ず断られる交換をできると言うことになる（PR8監査・項目8）
@@ -87,10 +166,13 @@ function renderHome(userId: string, services: Services, serverName?: string) {
         ? `⚠️ 版が異常（準備口座を特定できません／全操作停止）`
         : `🚧 **正式開業準備中**（預入・返還は停止中／1:1交換は opening_v1 確定後）　準備 ${pool!.toLocaleString()} Ld ／ 発行 ${outstanding.toLocaleString()} ${E.ether}`;
   const marketValue = [
+    renderCasinoStatusLine(casinoStatus.status, casinoStatus.reason),
     rateLine,
     `${E.jp} JPプール **${fmtEther(jp)}**`,
     `胴元残 ${fmtEther(houseBal)}`,
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   const dailyValue = dailyReady
     ? `${E.sparkle} **今すぐ受け取れる** → \`/福分け\``
@@ -129,6 +211,14 @@ function renderHome(userId: string, services: Services, serverName?: string) {
       : [`　${openingNotice(services).split("\n").join("\n　")}`]),
   ].join("\n");
 
+  const walletFooter =
+    phase === "formal"
+      ? assets
+        ? `自由チップ ${fmtEther(assets.freeChips)}`
+        : "チップ帳簿エラー"
+      : phase === "unknown"
+        ? "賭場の版が異常"
+        : "正式開業準備中";
   const embed = new EmbedBuilder()
     .setAuthor({ name: `${serverName ?? "冥獄城"} · マモンの賭場` })
     .setTitle(`${E.home} 案内所`)
@@ -142,7 +232,7 @@ function renderHome(userId: string, services: Services, serverName?: string) {
       { name: `💹 経済・投資`, value: economyValue, inline: false },
       { name: `${E.paytable} 記録・入口`, value: detailValue, inline: false },
     )
-    .setFooter({ text: `所持 ${fmtEther(heldEther)}${isVip ? ` · ${E.jp} VIP` : ""}${stats.current_win_streak >= 2 ? ` · ${E.fire}${stats.current_win_streak}連勝` : ""}` });
+    .setFooter({ text: `${walletFooter}${isVip ? ` · ${E.jp} VIP` : ""}${stats.current_win_streak >= 2 ? ` · ${E.fire}${stats.current_win_streak}連勝` : ""}` });
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("annai:refresh").setLabel("更新").setEmoji("🔁").setStyle(ButtonStyle.Secondary),

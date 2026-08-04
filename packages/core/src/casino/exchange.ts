@@ -301,6 +301,14 @@ export class ChipLedger {
   }
 
   /**
+   * PR9: いまゲームに使える自由チップ。卓・板へ拘束中の資金は含まない
+   * （拘束中資金は `CasinoChipAssets.escrowed` 側で数える）。
+   */
+  freeChips(userId: string): number {
+    return this.balanceOf(userId);
+  }
+
+  /**
    * Land 取引が実際に成立したかを確かめる。Ledger は重複キーで例外を出さず no-op を返すので、
    * それを見逃すと「Land を動かさずチップだけ発行/消却」の不整合になる。
    *
