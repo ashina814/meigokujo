@@ -167,10 +167,12 @@ describe("PR11監査1: crash windowの原子性", () => {
     const sessionId = beginChinchiroPrehold(ctx.services, "u1", 1_000, "op-1");
     const holder = ctx.escrow.holderId(sessionId);
     // casino_escrow の帳簿は 2,000 のまま（settleChinchiroRound の pool チェックは通る）。
-    // holder の実残高だけ bet(1,000) に届かないところまで壊す
+    // holder の実残高だけ bet(1,000) に届かないところまで壊す。settle() 自身の
+    // holder残高==expectedAmount の完全照合が「balance mismatch」として検出する
+    // （betとの比較まで届く前に、より厳密な一致チェックで先に落ちる）
     ctx.db.prepare("UPDATE ether_balances SET amount = 500 WHERE user_id = ?").run(holder);
 
-    expect(() => settleChinchiroRound(ctx.services, "u1", 1_000, -1, "op-1")).toThrow(/insufficient/);
+    expect(() => settleChinchiroRound(ctx.services, "u1", 1_000, -1, "op-1")).toThrow(/holder balance mismatch/);
     expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(0);
     expect(ctx.chips.balanceOf(holder)).toBe(500);
   });

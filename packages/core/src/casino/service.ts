@@ -106,9 +106,30 @@ export function soloGroupKey(game: string, userId: string, operationId: string):
  * できてしまう。`sessionId` だけを受け取り、`settle()` 自身が
  * `casino_escrow`（session_id, user_id）でその利用者への帰属を確認してから
  * holder を導出する。
+ *
+ * **`session_id + user_id` の存在確認だけでは足りない**（PR11 独立本監査2回目・
+ * ブロッカー）。それだけでは、同じ利用者が参加している対人卓のような
+ * **複数人 session**（他の参加者の預託も同じ holder に混ざっている）や、
+ * **別ゲームの session** をそのまま徴収元にできてしまう。`settle()` は
+ * 次のすべてを `casino_escrow` 台帳と holder の実残高で完全に照合する。
+ * 一つでも食い違えば 1 Ld も動かさず例外にする。
+ *
+ * - その session の台帳行が**ちょうど1行**（複数人 session を弾く）
+ * - その1行の `user_id` が `settle()` の `userId` と一致する
+ * - その1行の `game` が `settle()` の `game` と一致する（別ゲーム session を弾く）
+ * - その1行の `source` が `escrowHolderFor(sessionId)` と一致する（新方式のみ。
+ *   `source='house'` の旧行を弾く）
+ * - その1行の `amount` が呼び出し側の主張額（`expectedAmount`）と一致する
+ * - holder の実残高が `expectedAmount` と**過不足なく**一致する（余剰・不足とも拒否）
  */
 export interface PreheldWager {
   sessionId: string;
+  /**
+   * この session に本来入っているべき総額（例: チンチロなら `2 × bet`）。
+   * `settle()` はこれを台帳額・holder実残高の両方と突き合わせる——
+   * `bet` を上回っていれば足りるだろう、では済まさない。
+   */
+  expectedAmount: number;
 }
 
 export interface SettleOptions {
@@ -288,19 +309,47 @@ export class Casino {
       // 毎回このチェックが走ってしまい、精算後に holder 残高が変わっただけで
       // 「同じ操作の再試行は保存済みの結果を返す」という全体の約束を破って落ちる。
       if (opts.preheld) {
-        // 帰属確認: holderId を直接受け取らず、この session が本当にこの userId の
-        // ものだと casino_escrow 台帳で確認してから徴収する。確認しないと、
-        // 呼び出し側のバグ一つで他人の escrow・house 自身を徴収元にできてしまう。
-        const attribution = this.db
-          .prepare("SELECT 1 FROM casino_escrow WHERE session_id = ? AND user_id = ? LIMIT 1")
-          .get(opts.preheld.sessionId, userId);
-        if (!attribution) {
+        // 完全照合（PR11 独立本監査2回目・ブロッカー）。
+        // 「session_id + user_id の行が存在する」だけでは、複数人 session（他の
+        // 参加者の預託と同じ holder に混ざっている）や別ゲームの session をそのまま
+        // 徴収元にできてしまう。台帳行がちょうど1行で、user・game・source・額の
+        // すべてが一致し、holder の実残高も過不足なく一致することを確かめる。
+        const rows = this.db
+          .prepare("SELECT user_id, game, source, amount FROM casino_escrow WHERE session_id = ?")
+          .all(opts.preheld.sessionId) as Array<{ user_id: string; game: string; source: string; amount: number }>;
+        if (rows.length !== 1) {
           throw new Error(
-            `preheld solo wager not attributed to user: session=${opts.preheld.sessionId} user=${userId}`,
+            `preheld solo wager session is not single-row: session=${opts.preheld.sessionId} rows=${rows.length}`,
+          );
+        }
+        const row = rows[0]!;
+        if (row.user_id !== userId) {
+          throw new Error(
+            `preheld solo wager not attributed to user: session=${opts.preheld.sessionId} owner=${row.user_id} requested=${userId}`,
+          );
+        }
+        if (row.game !== game) {
+          throw new Error(
+            `preheld solo wager game mismatch: session=${opts.preheld.sessionId} ledgerGame=${row.game} requestedGame=${game}`,
+          );
+        }
+        if (row.source !== chargeFrom) {
+          throw new Error(
+            `preheld solo wager source mismatch: session=${opts.preheld.sessionId} source=${row.source} expected=${chargeFrom}`,
+          );
+        }
+        if (!Number.isSafeInteger(row.amount) || row.amount !== opts.preheld.expectedAmount) {
+          throw new Error(
+            `preheld solo wager amount mismatch: session=${opts.preheld.sessionId} ledgerAmount=${row.amount} expected=${opts.preheld.expectedAmount}`,
           );
         }
         const held = this.ether.balanceOf(chargeFrom);
-        if (!Number.isSafeInteger(held) || held < bet) {
+        if (!Number.isSafeInteger(held) || held !== opts.preheld.expectedAmount) {
+          throw new Error(
+            `preheld solo wager holder balance mismatch: holder=${chargeFrom} balance=${held} expected=${opts.preheld.expectedAmount}`,
+          );
+        }
+        if (held < bet) {
           throw new Error(`preheld solo wager insufficient: holder=${chargeFrom} balance=${held} bet=${bet}`);
         }
       }

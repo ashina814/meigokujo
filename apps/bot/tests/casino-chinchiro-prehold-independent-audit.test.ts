@@ -14,11 +14,12 @@
  * 5. 同一 operationId で異なる bet・user・session を渡した場合の conflict。
  * 6. 別 SQLite 接続・別 Node プロセスからの競合。
  */
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   Casino,
@@ -198,11 +199,12 @@ describe("PR11独立監査2: PreheldWagerの帰属証明とreplay安全性", () 
     const u1Session = beginChinchiroPrehold(ctx.services, "u1", 1_000, "op-1");
     fundHouse(ctx);
 
-    // u2 の名目で、u1 のセッションを徴収元にしようとする（バグ・不正呼び出しの再現）
+    // u2 の名目で、u1 のセッションを徴収元にしようとする（額は正しく言い当てた
+    // うえでの不正呼び出しを再現。attribution が最初に落ちることを見る）
     expect(() =>
       ctx.casino.settleSolo("u2", "チンチロ", 1_000, 1_000, {
         operationId: "op-attack",
-        preheld: { sessionId: u1Session },
+        preheld: { sessionId: u1Session, expectedAmount: chinchiroMaxPlayerLoss(1_000) },
       }),
     ).toThrow(/not attributed to user/);
 
@@ -211,7 +213,7 @@ describe("PR11独立監査2: PreheldWagerの帰属証明とreplay安全性", () 
     expect(ctx.chips.balanceOf("u2")).toBe(2_000);
   });
 
-  it("存在しない・架空のsessionIdは帰属確認で拒否され、houseを徴収元にできない", () => {
+  it("存在しない・架空のsessionIdは単一行確認で拒否され、houseを徴収元にできない", () => {
     const ctx = setup();
     fund(ctx, "u1", 1_000, 0);
     fundHouse(ctx);
@@ -219,9 +221,101 @@ describe("PR11独立監査2: PreheldWagerの帰属証明とreplay安全性", () 
     expect(() =>
       ctx.casino.settleSolo("u1", "チンチロ", 1_000, 1_000, {
         operationId: "op-fake",
-        preheld: { sessionId: "fabricated-session-id" },
+        preheld: { sessionId: "fabricated-session-id", expectedAmount: 2_000 },
       }),
-    ).toThrow(/not attributed to user/);
+    ).toThrow(/not single-row/);
+    expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(1_000_000);
+  });
+
+  it("複数人session（対人卓のholdAll）を徴収元にできない——他の参加者の預託まで奪えない", () => {
+    const ctx = setup();
+    fund(ctx, "u1", 2_000);
+    fund(ctx, "u2", 2_000);
+    fundHouse(ctx);
+    const tableSession = "roulette:multi-session";
+    // 複数人の対人卓（ルーレット等）が holdAll で同じ session へ複数行を作る状況を再現
+    expect(ctx.escrow.holdAll(tableSession, ["u1", "u2"], 1_000, "ルーレット", "table-op")).toBe(true);
+    expect(ctx.chips.balanceOf(ctx.escrow.holderId(tableSession))).toBe(2_000);
+
+    // u1 が、対人卓の共有 holder を自分のチンチロ精算の徴収元にしようとする
+    expect(() =>
+      ctx.casino.settleSolo("u1", "チンチロ", 1_000, 1_000, {
+        operationId: "op-multi",
+        preheld: { sessionId: tableSession, expectedAmount: 2_000 },
+      }),
+    ).toThrow(/not single-row/);
+
+    // u2 の預託を含め、卓の資金は1 Ldも動いていない
+    expect(ctx.chips.balanceOf(ctx.escrow.holderId(tableSession))).toBe(2_000);
+    expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(1_000_000);
+  });
+
+  it("別ゲームのsessionを徴収元にできない——game名が一致しないと拒否する", () => {
+    const ctx = setup();
+    fund(ctx, "u1", 2_000);
+    fundHouse(ctx);
+    const otherGameSession = "slots:some-session";
+    // 別ゲーム（スロット想定）が同じ escrow.hold() を使って作った session を再現
+    expect(ctx.escrow.hold(otherGameSession, "u1", 2_000, "スロット", "other-op")).toBe(true);
+    const holder = ctx.escrow.holderId(otherGameSession);
+    expect(ctx.chips.balanceOf(holder)).toBe(2_000);
+
+    // この session を "チンチロ" の精算に流用しようとする
+    expect(() =>
+      ctx.casino.settleSolo("u1", "チンチロ", 1_000, 1_000, {
+        operationId: "op-wrong-game",
+        preheld: { sessionId: otherGameSession, expectedAmount: 2_000 },
+      }),
+    ).toThrow(/game mismatch/);
+    expect(ctx.chips.balanceOf(holder)).toBe(2_000);
+    expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(1_000_000);
+  });
+
+  it("旧方式（source='house'）のescrow行を徴収元にできない——sourceが一致しないと拒否する", () => {
+    const ctx = setup();
+    fund(ctx, "u1", 1_000, 0);
+    fundHouse(ctx);
+    const legacySession = "legacy:house-source";
+    // 旧方式の escrow 行（source が holder ではなく 'house' のまま）を直接作る
+    ctx.db
+      .prepare(
+        "INSERT INTO casino_escrow (session_id, user_id, amount, game, source, created_at) VALUES (?,?,?,?,?,?)",
+      )
+      .run(legacySession, "u1", 2_000, "チンチロ", HOUSE_HOLDER, Math.floor(Date.now() / 1000));
+
+    expect(() =>
+      ctx.casino.settleSolo("u1", "チンチロ", 1_000, 1_000, {
+        operationId: "op-legacy",
+        preheld: { sessionId: legacySession, expectedAmount: 2_000 },
+      }),
+    ).toThrow(/source mismatch/);
+    expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(1_000_000);
+  });
+
+  it("expectedAmountを台帳額と食い違って渡すと拒否する——余剰でも不足でも動かさない", () => {
+    const ctx = setup();
+    fund(ctx, "u1", 2_000);
+    fundHouse(ctx);
+    const sessionId = beginChinchiroPrehold(ctx.services, "u1", 1_000, "op-1"); // 台帳2,000
+    const holder = ctx.escrow.holderId(sessionId);
+
+    // 呼び出し側が実際より少ない額を主張（不足の主張）
+    expect(() =>
+      ctx.casino.settleSolo("u1", "チンチロ", 1_000, 1_000, {
+        operationId: "op-under",
+        preheld: { sessionId, expectedAmount: 1_000 },
+      }),
+    ).toThrow(/amount mismatch/);
+
+    // 呼び出し側が実際より多い額を主張（余剰の主張）
+    expect(() =>
+      ctx.casino.settleSolo("u1", "チンチロ", 1_000, 1_000, {
+        operationId: "op-over",
+        preheld: { sessionId, expectedAmount: 3_000 },
+      }),
+    ).toThrow(/amount mismatch/);
+
+    expect(ctx.chips.balanceOf(holder)).toBe(2_000);
     expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(1_000_000);
   });
 
@@ -235,24 +329,26 @@ describe("PR11独立監査2: PreheldWagerの帰属証明とreplay安全性", () 
     // groupKey自体がトップレベルの業務グループになるケース）。
     // settle() は bet ぶんだけを holder から徴収するので、1回の呼び出し後は
     // holder に「ちょうど bet ぶん」が残る（それ以上は動かない）
+    const expectedAmount = chinchiroMaxPlayerLoss(1_000);
     const first = ctx.casino.settleSolo("u1", "チンチロ", 1_000, 1_000, {
       operationId: "op-direct",
-      preheld: { sessionId },
+      preheld: { sessionId, expectedAmount },
     });
     const holder = ctx.escrow.holderId(sessionId);
     expect(ctx.chips.balanceOf(holder)).toBe(1_000);
 
     // settleChinchiroRound が普段この直後に行う「残額を利用者へ返す」を、
-    // ここでは意図的に分離して直接実行する。holder は bet を下回る（0）まで減る
+    // ここでは意図的に分離して直接実行する。holder は bet を下回る（0）まで減り、
+    // casino_escrow 台帳の amount とも食い違う状態になる
     ctx.db.prepare("UPDATE ether_balances SET amount = 0 WHERE user_id = ?").run(holder);
     expect(ctx.chips.balanceOf(holder)).toBe(0);
 
     // 同じ operationId で再実行。事前チェックが runGroup の外にあれば、
-    // 「holder残高(0)がbet(1,000)に届かない」で落ちて保存済み結果を返せない。
+    // 「holder残高(0)が台帳額(2,000)と食い違う」で落ちて保存済み結果を返せない。
     // runGroup の中にあれば replay され、例外にならない（本監査で修正した点）
     const second = ctx.casino.settleSolo("u1", "チンチロ", 1_000, 1_000, {
       operationId: "op-direct",
-      preheld: { sessionId },
+      preheld: { sessionId, expectedAmount },
     });
     expect(second).toEqual(first);
   });
@@ -372,20 +468,27 @@ describe("PR11独立監査5: operationId conflict", () => {
     expect(ctx.chips.balanceOf(holder)).toBe(2_000); // 増えていない
   });
 
-  it("同一sessionを異なるbetでholdしようとしても、既存groupがreplayされ実際には額が変わらない", () => {
+  it("【既知の限界・PR11範囲外】生のescrow.hold()は額の不一致を見ずに保存済みboolをreplayする", () => {
+    // これは「安全」の確認テストではない。escrow.hold() の group key は
+    // session_id + user_id + operationId だけで、要求額を見ずに保存済みの bool を
+    // 返す（PR2 由来、チンチロ以外の既存呼び出し全般に共通する挙動）。
+    // 額を鍵に含めていないので、理屈の上では「2,000のつもりで呼んだのに実は500しか
+    // 確保されていない」状態を作れてしまう——ここではその生の挙動を明文化するだけで、
+    // 正常仕様として固定しない。conflict化するかどうかは PR11 の範囲外として別途判断する。
     const ctx = setup();
     fund(ctx, "u1", 10_000);
     const sessionId = chinchiroPreholdSessionId("u1", "op-1");
-    // 1,000ぶんのholdを直接確定させる
-    expect(ctx.escrow.hold(sessionId, "u1", 2_000, "チンチロ", "op-1")).toBe(true);
+    expect(ctx.escrow.hold(sessionId, "u1", 500, "チンチロ", "op-1")).toBe(true);
     const holder = ctx.escrow.holderId(sessionId);
-    expect(ctx.chips.balanceOf(holder)).toBe(2_000);
+    expect(ctx.chips.balanceOf(holder)).toBe(500);
 
-    // 同じ session・同じoperationIdで異なる額(4,000)を hold しようとしても、
-    // グループキーが同じなので保存済み結果(true)が返るだけで、実際には動かない
-    const replayed = ctx.escrow.hold(sessionId, "u1", 4_000, "チンチロ", "op-1");
-    expect(replayed).toBe(true);
-    expect(ctx.chips.balanceOf(holder)).toBe(2_000); // 4,000にはなっていない
+    // 額を検証せず、保存済みの true を返すだけ（実際には 2,000 になっていない）
+    expect(ctx.escrow.hold(sessionId, "u1", 2_000, "チンチロ", "op-1")).toBe(true);
+    expect(ctx.chips.balanceOf(holder)).toBe(500);
+
+    // チンチロの実経路がここへ到達しないのは、上の「同一user・同一operationIdで
+    // 異なるbetはconflict」テストが示すとおり、escrow.hold() より前に
+    // ensureFreeChips() が同じ検証（同一operationIdで異なるrequired）を行うため
   });
 });
 
@@ -524,4 +627,182 @@ describe("PR11独立監査6: 別SQLite接続・別Nodeプロセスからの競�
 
     a.db.close();
   });
+});
+
+// ── 論点6続き: 実際に同時開始する2プロセスの競合（PR11独立本監査2回目） ──
+//
+// 上の「別プロセス競合」は execFileSync（同期・直列）で「一方が終わってから他方」を
+// 確認しているだけで、本当の同時実行ではなかった（本監査2回目の指摘）。
+// ここでは2つの Node 子プロセスを実際に同時開始させ、prehold・settlement・
+// refund対settlement を競合させる。
+
+const tsxCliPath = createRequire(import.meta.url).resolve("tsx/cli");
+const raceWorkerPath = fileURLToPath(new URL("./helpers/chinchiro-race-worker.ts", import.meta.url));
+
+/**
+ * `action` と引数を渡した子プロセスを起動し、両方が準備完了（DB接続・import完了）
+ * してから同時に "go" を書いて競合させる。両方の終了と結果を待って返す。
+ */
+async function runRace(
+  dbPath: string,
+  workers: ReadonlyArray<{ action: string; args: string[] }>,
+): Promise<Array<{ result: unknown; error: string | null }>> {
+  const dir = mkdtempSync(join(tmpdir(), "chinchiro-race-signal-"));
+  tempDirs.push(dir);
+  const goPath = join(dir, "go");
+
+  const specs = workers.map((w, i) => ({
+    ...w,
+    readyPath: join(dir, `ready-${i}`),
+    outPath: join(dir, `out-${i}`),
+  }));
+
+  const children = specs.map((spec) =>
+    spawn(
+      process.execPath,
+      [tsxCliPath, raceWorkerPath, dbPath, spec.readyPath, goPath, spec.outPath, spec.action, ...spec.args],
+      { stdio: "pipe" },
+    ),
+  );
+
+  const exits = children.map(
+    (child) =>
+      new Promise<void>((resolve, reject) => {
+        let stderr = "";
+        child.stderr?.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        child.on("error", reject);
+        child.on("exit", (code) => {
+          if (code !== 0) reject(new Error(`race worker exited ${code}: ${stderr}`));
+          else resolve();
+        });
+      }),
+  );
+
+  // 全ワーカーの準備完了（"ready" ファイル）を待ってから、一斉に "go" を書く
+  const deadline = Date.now() + 5000;
+  while (!specs.every((spec) => existsSync(spec.readyPath))) {
+    if (Date.now() > deadline) throw new Error("race workers did not become ready in time");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  writeFileSync(goPath, "go");
+
+  await Promise.all(exits);
+
+  return specs.map((spec) => {
+    const raw = readFileSync(spec.outPath, "utf8");
+    return JSON.parse(raw) as { result: unknown; error: string | null };
+  });
+}
+
+describe("PR11独立監査6b: 実際に同時開始する2プロセスの競合", () => {
+  it("2プロセスが同時にbeginChinchiroPreholdを実行しても、事前預託は1回分しか動かない", async () => {
+    const path = newDbPath();
+    const seed = fileSetup(path);
+    seed.chipTx.captureOpening(FORMAL_OPENING_VERSION, [], {
+      poolLand: seed.ledger.balanceOf(CHIP_ESCROW),
+      fromLedgerTxId: seed.ledger.lastTransactionId(),
+    });
+    fund(seed, "u1", 2_000);
+    seed.db.close();
+
+    const outcomes = await runRace(path, [
+      { action: "begin", args: ["u1", "1000", "op-race"] },
+      { action: "begin", args: ["u1", "1000", "op-race"] },
+    ]);
+
+    for (const o of outcomes) {
+      expect(o.error).toBeNull();
+    }
+    // 両方が成功し、同じ sessionId を返している（どちらが先でも replay で揃う）
+    expect(outcomes[0]!.result).toBe(outcomes[1]!.result);
+
+    const check = fileSetup(path);
+    const sessionId = chinchiroPreholdSessionId("u1", "op-race");
+    expect(check.chips.balanceOf("u1")).toBe(0);
+    // 2,000（=2×bet）だけが預託されている。二重預入（4,000）になっていない
+    expect(check.chips.balanceOf(check.escrow.holderId(sessionId))).toBe(2_000);
+    check.db.close();
+  }, 20_000); // 子プロセス2つのtsx起動を伴うため、既定の5秒では並列実行時に不足しうる
+
+  it("2プロセスが同時にsettleChinchiroRoundを実行しても、精算は1回分しか動かない", async () => {
+    const path = newDbPath();
+    const seed = fileSetup(path);
+    seed.chipTx.captureOpening(FORMAL_OPENING_VERSION, [], {
+      poolLand: seed.ledger.balanceOf(CHIP_ESCROW),
+      fromLedgerTxId: seed.ledger.lastTransactionId(),
+    });
+    fund(seed, "u1", 2_000);
+    fundHouse(seed);
+    beginChinchiroPrehold(seed.services, "u1", 1_000, "op-race");
+    seed.db.close();
+
+    const outcomes = await runRace(path, [
+      { action: "settle", args: ["u1", "1000", "-1", "op-race"] },
+      { action: "settle", args: ["u1", "1000", "-1", "op-race"] },
+    ]);
+
+    for (const o of outcomes) {
+      expect(o.error).toBeNull();
+    }
+    expect(outcomes[0]!.result).toEqual(outcomes[1]!.result);
+
+    const check = fileSetup(path);
+    const sessionId = chinchiroPreholdSessionId("u1", "op-race");
+    // 通常負け(mul=-1)は 1,000 だけ house へ、残り 1,000 は利用者へ返る。
+    // 二重精算していれば house が 2,000 増えているはず
+    expect(check.chips.balanceOf(HOUSE_HOLDER)).toBe(1_001_000);
+    expect(check.chips.balanceOf("u1")).toBe(1_000);
+    expect(check.escrow.list(sessionId)).toEqual([]);
+    check.db.close();
+  }, 20_000); // 子プロセス2つのtsx起動を伴うため、既定の5秒では並列実行時に不足しうる
+
+  it("settleChinchiroRoundとrefundChinchiroPreholdOnFailureが同時に同じsessionを取り合っても、資金は一度しか動かない", async () => {
+    const path = newDbPath();
+    const seed = fileSetup(path);
+    seed.chipTx.captureOpening(FORMAL_OPENING_VERSION, [], {
+      poolLand: seed.ledger.balanceOf(CHIP_ESCROW),
+      fromLedgerTxId: seed.ledger.lastTransactionId(),
+    });
+    fund(seed, "u1", 2_000);
+    fundHouse(seed);
+    const sessionId = beginChinchiroPrehold(seed.services, "u1", 1_000, "op-race");
+    seed.db.close();
+
+    // 片方は「結果確定」、もう片方は「精算前に落ちたと誤検知しての緊急返還」を模す。
+    // SQLiteの書き込み直列化により、どちらか一方だけが実際に資金を動かす
+    const outcomes = await runRace(path, [
+      { action: "settle", args: ["u1", "1000", "1", "op-race"] },
+      { action: "refund", args: [sessionId] },
+    ]);
+
+    // settle側は成功(勝ちの精算)か、refundが先に空にしたことによる帳簿不一致失敗のどちらか。
+    // refundChinchiroPreholdOnFailure は必ず（no-opであっても）causeError を投げる設計。
+    // ワーカーはそれを result.threw として捕まえている（error フィールドではない）
+    const [settleOutcome, refundOutcome] = outcomes;
+    expect(refundOutcome!.error).toBeNull();
+    expect(refundOutcome!.result).toMatchObject({ threw: "worker-simulated crash" });
+
+    const check = fileSetup(path);
+    const holder = check.escrow.holderId(sessionId);
+
+    if (settleOutcome!.error === null) {
+      // settle が勝った: 通常の勝ち精算どおりに資金が動き、escrowは空
+      expect(check.escrow.list(sessionId)).toEqual([]);
+      expect(check.chips.balanceOf(holder)).toBe(0);
+      // house は bet(1,000) を受け取り、配当を払っている（純減にはならない額だが、
+      // 少なくとも二重に事前預託ぶん(2,000)が消えてはいない）
+      expect(check.chips.balanceOf("u1")).toBeGreaterThan(0);
+    } else {
+      // refund が勝った: settle は「帳簿不一致」で安全に失敗し、
+      // 事前預託の全額(2,000)がそのまま利用者へ返っている（refundのno-opではない側）
+      expect(settleOutcome!.error).toMatch(/帳簿不一致|not attributed|insufficient|mismatch/);
+      expect(check.chips.balanceOf("u1")).toBe(2_000);
+      expect(check.chips.balanceOf(holder)).toBe(0);
+    }
+    // どちらの結末でも house が二重に受け取っていない（最大でも bet 相当の受取）
+    expect(check.chips.balanceOf(HOUSE_HOLDER)).toBeLessThanOrEqual(1_000_000 + 1_000);
+    check.db.close();
+  }, 20_000); // 子プロセス2つのtsx起動を伴うため、既定の5秒では並列実行時に不足しうる
 });

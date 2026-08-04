@@ -137,7 +137,10 @@ export function settleChinchiroRound(
       const settled = services.casino.settleSolo(uid, "チンチロ", bet, rawPayout, {
         operationId,
         reservationKey,
-        preheld: { sessionId },
+        // settle() 自身が session_id 単位で user・game・source・額・holder実残高を
+        // 完全照合する（PR11 独立本監査2回目）。ここでの pool チェックは
+        // チンチロ固有の分かりやすいメッセージを先に出すための軽い事前確認に過ぎない
+        preheld: { sessionId, expectedAmount: preheld },
       });
 
       // settle() が holder から house へ bet ぶんを動かした。残りの精算:
@@ -254,9 +257,16 @@ export class ChinchiroPreholdError extends Error {
 /**
  * 最大損失 `2 × bet` を、乱数・演出より前に事前預託する（PR11・正本 §11.4）。
  *
- * 自由チップの不足分はここで自動預入する。それでも足りない・預託そのものが失敗した
- * 場合は資金を1 Ld も動かさず {@link ChinchiroPreholdError} を投げる（呼び出し側が
- * 理由に応じた文言を表示する）。
+ * 自由チップの不足分はここで自動預入する。**"insufficient_funds" で失敗した場合は
+ * 何も動いていない**（`ensureFreeChips` 自身が Land 不足で例外を投げ、その中では
+ * 何も移していない）。
+ *
+ * 一方 **"hold_failed" は Land が既に自由チップへ移った後**の失敗（PR11 独立本監査・
+ * 事実誤認の訂正）。`ensureFreeChips` が Land→自由チップの変換に成功した直後、
+ * `escrow.hold()` だけが（残高の再チェック失敗など）落ちたケースで、その変換は
+ * 巻き戻らない。ただし資金は消えても二重に預入されてもいない——利用者の自由チップに
+ * 増えた額としてそのまま残り、同じ operationId での再試行では `ensureFreeChips` が
+ * 保存済みの結果を返して二重預入せず、`escrow.hold()` だけをやり直す。
  *
  * 事前預託は `escrow.hold()`（既存の卓預託と同じ台帳・同じ復旧経路）を使うので、
  * 起動時復旧・active ownership 判定・資産検算はすべて既存の仕組みがそのまま拾う——
