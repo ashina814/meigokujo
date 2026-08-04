@@ -152,7 +152,14 @@ export class CasinoChipAssets {
 
   freeChips(userId: string): number {
     this.assertUserId(userId);
-    return this.chips.freeChips(userId);
+    return this.readSnapshot(() => {
+      const accountMismatches: EscrowAssetMismatch[] = [];
+      const knownUsers = this.knownUserIds((mismatch) => accountMismatches.push(mismatch));
+      this.assertAccountRegistryVerifiable(accountMismatches, userId, "freeChips");
+      const freeChips = this.chips.freeChips(userId);
+      this.assertKnownUserAssets(knownUsers, userId, freeChips, 0, "freeChips");
+      return freeChips;
+    });
   }
 
   escrowed(userId: string): number {
@@ -171,6 +178,7 @@ export class CasinoChipAssets {
       const snapshot = this.buildSnapshot();
       this.assertVerifiableForUser(snapshot, userId);
       const escrowed = snapshot.byUser.get(userId) ?? 0;
+      this.assertKnownUserAssets(new Set(snapshot.knownUserIds), userId, freeChips, escrowed, "assets");
       const total = checkedAdd(freeChips, escrowed, "userTotal", { userId });
       return { userId, freeChips, escrowed, total };
     });
@@ -204,6 +212,46 @@ export class CasinoChipAssets {
       !RESERVED_USER_IDS.has(userId) &&
       isPlayerHolder(userId);
     if (!valid) throw new ChipLedgerError("ERR_BAD_IDENTIFIER", { field: "userId", userId });
+  }
+
+  private assertAccountRegistryVerifiable(
+    mismatches: readonly EscrowAssetMismatch[],
+    userId: string,
+    field: string,
+  ): void {
+    if (mismatches.length === 0) return;
+    throw new ChipLedgerError("ERR_CORRUPT_BALANCE", {
+      field,
+      userId,
+      mismatches,
+    });
+  }
+
+  private assertKnownUserAssets(
+    knownUsers: ReadonlySet<string>,
+    userId: string,
+    freeChips: number,
+    escrowed: number,
+    field: string,
+  ): void {
+    if (knownUsers.has(userId) || (freeChips === 0 && escrowed === 0)) return;
+    const mismatch: EscrowAssetMismatch = {
+      code: "invalid_user_id",
+      scope: "user",
+      affectedUserIds: [userId],
+      holder: userId,
+      expected: 0,
+      actual: freeChips,
+      userId,
+      detail: `Land台帳に user:${userId} 口座がないため、正の利用者資産へ帰属できない`,
+    };
+    throw new ChipLedgerError("ERR_CORRUPT_BALANCE", {
+      field,
+      userId,
+      freeChips,
+      escrowed,
+      mismatches: [mismatch],
+    });
   }
 
   private assertVerifiableForUser(snapshot: EscrowAssetSnapshot, userId: string): void {
