@@ -1,0 +1,23 @@
+name: PR10 source export
+
+on:
+  push:
+    branches:
+      - audit/pr10-source-export
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package source
+        run: |
+          tar --exclude=.git --exclude=node_modules -czf /tmp/meigokujo-pr10-source.tgz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meigokujo-pr10-source
+          path: /tmp/meigokujo-pr10-source.tgz
+          if-no-files-found: error
