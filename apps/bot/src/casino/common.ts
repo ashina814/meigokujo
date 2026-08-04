@@ -467,7 +467,13 @@ export function checkRetry(services: Services, userId: string, betRaw: number, g
   try {
     const free = services.chipAssets.freeChips(userId);
     const land = services.ledger.balanceOf(`user:${userId}`);
-    if (free + land < bet) {
+    // 合算も safe integer の範囲を出ないことを確かめる（監査項目15）。
+    // 素の加算だと、破損した巨大値どうしの和が精度を失ったまま比較へ入る
+    const total = free + land;
+    if (!Number.isSafeInteger(total)) {
+      return { ok: false, reason: "チップ帳簿またはLand口座の残高が異常です。" };
+    }
+    if (total < bet) {
       return { ok: false, reason: `${Mammon.broke()}（所持: 自由チップ ${fmtEther(free)} / Land ${land.toLocaleString()} / 必要 ${fmtEther(bet)}）` };
     }
   } catch {

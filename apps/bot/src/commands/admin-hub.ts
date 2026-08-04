@@ -2212,6 +2212,9 @@ function casinoRefundResult(saga: RefundSaga) {
         ? `✅ 緊急返還が完了しました。対象 ${completed.length}人 / 確認額 ${fmtLd(saga.targetTotal)}。`
         : `⛔ 緊急返還は完了していません（${saga.failure ?? saga.status}）。返還済み ${completed.length}人 / 未完了 ${failed.length}人。`,
     embeds: [],
+    // 取消は core 側で draft のときだけ通る（監査項目12）。blocked/executing で
+    // 「取り消す」を出すと、押しても必ず失敗する死んだボタンになる。
+    // 出口は「安全確認後に再開」だけにして、UI と実際の遷移可能集合を一致させる。
     components:
       saga.status === "completed" || saga.status === "cancelled"
         ? [backButton()]
@@ -2221,10 +2224,14 @@ function casinoRefundResult(saga: RefundSaga) {
                 .setCustomId(`mgmt:casino:refund-execute:${saga.id}`)
                 .setLabel("安全確認後に再開")
                 .setStyle(ButtonStyle.Danger),
-              new ButtonBuilder()
-                .setCustomId(`mgmt:casino:refund-cancel:${saga.id}`)
-                .setLabel("取り消す")
-                .setStyle(ButtonStyle.Secondary),
+              ...(saga.status === "draft"
+                ? [
+                    new ButtonBuilder()
+                      .setCustomId(`mgmt:casino:refund-cancel:${saga.id}`)
+                      .setLabel("取り消す")
+                      .setStyle(ButtonStyle.Secondary),
+                  ]
+                : []),
             ),
             backButton(),
           ],

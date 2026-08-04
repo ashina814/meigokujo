@@ -67,6 +67,17 @@ describe("PR10監査: Bot側の導線", () => {
     expect(source).toContain("redeemed && !purchased");
   });
 
+  it("saga の取消ボタンは core が取り消せる状態でだけ出す", () => {
+    const source = read("../src/commands/admin-hub.ts");
+    // blocked/executing で押しても必ず失敗する死んだボタンを出さない
+    expect(source).toContain('...(saga.status === "draft"');
+  });
+
+  it("retry の所持判定は free + land を checked add で見る", () => {
+    const source = read("../src/casino/common.ts");
+    expect(source).toContain("if (!Number.isSafeInteger(total)) {");
+  });
+
   it("自動預入は胴元余力の確認を通ったあと、拘束の直前だけで行う", () => {
     const source = read("../src/casino/common.ts");
     const capacity = source.indexOf("needed > services.casino.availableForLiability()");
