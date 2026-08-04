@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import {
   Casino,
+  CasinoChipAssets,
+  CasinoChipFlow,
   CasinoIntegrity,
   CasinoStatus,
   ChipTx,
@@ -41,13 +43,15 @@ function setup() {
   // 正式開業ロックは外せない（PR8監査・ブロッカーA）。資金を動かす前に opening_v1 を確定させる
   openFormally(ether.chipTx, ledger);
   const escrow = new Escrow(db, ether, events);
+  const chipAssets = new CasinoChipAssets(db, ether);
+  const chipFlow = new CasinoChipFlow(db, ether, events, chipAssets);
   const casino = new Casino(db, ether, events);
   const integrity = new CasinoIntegrity(db, ledger, ether, escrow);
   const status = new CasinoStatus(db);
   const reservations = new HouseReservations(db, ether, events);
   const registry = new RecoveryRegistry();
   // 検算Bの Land 基準は openFormally が opening_v1 として置いている（旧版の基準は作らない）
-  return { db, ledger, events, chipTx, ether, escrow, casino, integrity, status, reservations, registry };
+  return { db, ledger, events, chipTx, ether, escrow, chipAssets, chipFlow, casino, integrity, status, reservations, registry };
 }
 
 type Ctx = ReturnType<typeof setup>;
@@ -71,6 +75,7 @@ const run = (ctx: Ctx) =>
     reservations: ctx.reservations,
     registry: ctx.registry,
     events: ctx.events,
+    chipFlow: ctx.chipFlow,
   });
 
 describe("レジストリは所有元が自分で申告する", () => {
@@ -126,7 +131,8 @@ describe("生きている預託は維持し、孤児だけ返金する", () => {
     expect(ctx.ether.balanceOf(escrowHolderFor("market:7"))).toBe(5_000);
     // 競馬は返金されて帳簿ごと消える
     expect(ctx.escrow.list("keiba:123")).toEqual([]);
-    expect(ctx.ether.balanceOf("bob")).toBe(30_000);
+    expect(ctx.ether.balanceOf("bob")).toBe(0);
+    expect(ctx.ledger.balanceOf("user:bob")).toBe(30_000);
     ctx.db.close();
   });
 
@@ -136,7 +142,8 @@ describe("生きている預託は維持し、孤児だけ返金する", () => {
     ctx.escrow.hold("keiba:999", "alice", 8_000, "競馬", "op-1");
     ctx.registry.register({ type: "market", listLiveEscrowHolders: () => [] });
     expect(run(ctx).refundedSessions).toBe(1);
-    expect(ctx.ether.balanceOf("alice")).toBe(20_000);
+    expect(ctx.ether.balanceOf("alice")).toBe(0);
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(20_000);
     ctx.db.close();
   });
 
@@ -215,7 +222,8 @@ describe("不一致は返金も隔離もせず記録だけ残す", () => {
     expect(r.mismatched).toHaveLength(1);
     // 正常なほうは返金されている
     expect(r.refundedSessions).toBe(1);
-    expect(ctx.ether.balanceOf("bob")).toBe(30_000);
+    expect(ctx.ether.balanceOf("bob")).toBe(0);
+    expect(ctx.ledger.balanceOf("user:bob")).toBe(30_000);
     expect(ctx.escrow.list("卓:正常")).toEqual([]);
     ctx.db.close();
   });
@@ -301,6 +309,8 @@ describe("債務予約の解放（S9）と再開（S12）", () => {
       "S7:孤児返金",
       "S8:隔離",
       "S9:予約解放",
+      "S10:自由チップ返還",
+      "S12:後検",
       "S12:再開",
     ]);
     expect(ctx.status.current().status).toBe("open");
@@ -439,18 +449,21 @@ describe("孤児返金の技術失敗が結果に残る", () => {
     // 技術失敗が残っている限り open にしない
     expect(first.outcome).toBe("refund_failed");
     expect(ctx.status.current().status).toBe("recovery_halt");
-    // 正常なほうは既に返金済み
-    expect(ctx.ether.balanceOf("bob")).toBe(30_000);
-    const bobBalanceAfterFirst = ctx.ether.balanceOf("bob");
+    // 正常なほうは孤児返金後、S10でLandまで返還済み
+    expect(ctx.ether.balanceOf("bob")).toBe(0);
+    expect(ctx.ledger.balanceOf("user:bob")).toBe(30_000);
+    const bobLandAfterFirst = ctx.ledger.balanceOf("user:bob");
 
     // 再実行: 今度は送金が通る。失敗していたセッションだけが再試行対象になる
     const second = run(ctx);
     expect(second.outcome).toBe("opened");
     expect(second.failedSessions).toHaveLength(0);
     expect(second.refundedSessions).toBe(1); // 「卓:壊れる」だけ（正常分の帳簿はもう無い）
-    expect(ctx.ether.balanceOf("alice")).toBe(30_000);
-    // bob は二重返金されていない
-    expect(ctx.ether.balanceOf("bob")).toBe(bobBalanceAfterFirst);
+    expect(ctx.ether.balanceOf("alice")).toBe(0);
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(30_000);
+    // bob は二重返金・二重Land返還されていない
+    expect(ctx.ether.balanceOf("bob")).toBe(0);
+    expect(ctx.ledger.balanceOf("user:bob")).toBe(bobLandAfterFirst);
     expect(ctx.status.current().status).toBe("open");
     ctx.db.close();
   });
@@ -513,16 +526,20 @@ describe("failedSessionsはpostflightの成否より優先される", () => {
     expect(second.failedSessions).toHaveLength(0);
     expect(second.mismatched).toHaveLength(0);
     expect(second.refundedSessions).toBe(2); // 卓:壊れる + 卓:不一致
-    expect(ctx.ether.balanceOf("alice")).toBe(30_000);
-    expect(ctx.ether.balanceOf("bob")).toBe(30_000);
+    expect(ctx.ether.balanceOf("alice")).toBe(0);
+    expect(ctx.ether.balanceOf("bob")).toBe(0);
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(30_000);
+    expect(ctx.ledger.balanceOf("user:bob")).toBe(30_000);
     expect(ctx.status.current().status).toBe("open");
 
-    // 3回目を回しても、もう返す対象が無いので二重返金は起きない
+    // 3回目を回しても、もう返す対象が無いので二重返金・二重Land返還は起きない
     const third = run(ctx);
     expect(third.outcome).toBe("opened");
     expect(third.refundedSessions).toBe(0);
-    expect(ctx.ether.balanceOf("alice")).toBe(30_000);
-    expect(ctx.ether.balanceOf("bob")).toBe(30_000);
+    expect(ctx.ether.balanceOf("alice")).toBe(0);
+    expect(ctx.ether.balanceOf("bob")).toBe(0);
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(30_000);
+    expect(ctx.ledger.balanceOf("user:bob")).toBe(30_000);
     ctx.db.close();
   });
 });
@@ -595,14 +612,15 @@ describe("S1以降の予期しない例外はrecovery_haltへ着地する", () =
 
     // 5. 原因（予約テーブル破損）を直して再実行すると、S4〜S12が完走してopenになる。
     //    S4〜S8で既に成功していた孤児返金（keiba:1）が二重に返金・隔離されないことも確認する
-    const aliceBalanceBeforeThird = ctx.ether.balanceOf("alice");
+    expect(ctx.ether.balanceOf("alice")).toBe(20_000); // S9例外のためS10は未実行
     ctx.db.prepare("DELETE FROM casino_house_reservations WHERE key = 'corrupt'").run();
     const third = run(ctx);
     expect(third.outcome).toBe("opened");
     expect(ctx.status.current().status).toBe("open");
-    // keiba:1 は最初の成功した実行時点で既に返金済みなので、3回目は返す対象が無い
+    // keiba:1 は既に孤児返金済み。3回目はS10だけが一度実行される
     expect(third.refundedSessions).toBe(0);
-    expect(ctx.ether.balanceOf("alice")).toBe(aliceBalanceBeforeThird);
+    expect(ctx.ether.balanceOf("alice")).toBe(0);
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(20_000);
     ctx.db.close();
   });
 

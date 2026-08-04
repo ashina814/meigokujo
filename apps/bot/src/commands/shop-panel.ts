@@ -9,8 +9,7 @@ import {
   StringSelectMenuInteraction,
   type MessageCreateOptions,
 } from "discord.js";
-import type { ShopItemRow } from "@meigokujo/core";
-import { ShopError } from "@meigokujo/core";
+import { LedgerError, ShopError, type ShopItemRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { refreshEvalStatsForUser } from "../eval-daily.js";
 import { meetsRoleRequirement, requirementLabel } from "../rank-requirement.js";
@@ -22,10 +21,11 @@ import type { Services } from "../services.js";
  */
 
 const CATALOG_LIMIT = 25;
+const EXTERNAL_CONFIRM_TTL_SEC = 2 * 60;
 
 function formatPrice(item: ShopItemRow): string {
   const parts: string[] = [];
-  if (item.price_land !== null) parts.push(`${fmtLd(item.price_land)}`);
+  if (item.price_land !== null) parts.push(fmtLd(item.price_land));
   if (item.price_alt_kind && item.price_alt_amount !== null) {
     const kindJa = item.price_alt_kind === "invite" ? "招待" : item.price_alt_kind;
     parts.push(`${kindJa} ${item.price_alt_amount}`);
@@ -54,14 +54,12 @@ export function shopPanelMessage(services: Services): MessageCreateOptions {
     );
   if (items.length > 0) {
     embed.addFields(
-      items.slice(0, 25).map((it) => ({
-        name: `${it.name} — ${formatPrice(it)}`,
+      items.slice(0, 25).map((item) => ({
+        name: `${item.name} — ${formatPrice(item)}`,
         value: [
-          `${formatKind(it)}${it.require_role_id ? ` / <@&${it.require_role_id}> 限定` : ""}${it.stock !== null ? ` / 在庫 ${it.stock}` : ""}`,
-          it.description ? `_${it.description}_` : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
+          `${formatKind(item)}${item.require_role_id ? ` / <@&${item.require_role_id}> 限定` : ""}${item.stock !== null ? ` / 在庫 ${item.stock}` : ""}`,
+          item.description ? `_${item.description}_` : "",
+        ].filter(Boolean).join("\n"),
       })),
     );
   }
@@ -72,10 +70,10 @@ export function shopPanelMessage(services: Services): MessageCreateOptions {
       .setCustomId("shop:pick")
       .setPlaceholder("商品を選ぶ")
       .addOptions(
-        items.slice(0, CATALOG_LIMIT).map((it) => ({
-          label: `${it.name}`.slice(0, 100),
-          value: String(it.id),
-          description: `${formatPrice(it)} / ${formatKind(it)}`.slice(0, 100),
+        items.slice(0, CATALOG_LIMIT).map((item) => ({
+          label: item.name.slice(0, 100),
+          value: String(item.id),
+          description: `${formatPrice(item)} / ${formatKind(item)}`.slice(0, 100),
         })),
       );
     components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu));
@@ -112,7 +110,8 @@ function itemDetail(item: ShopItemRow, userHasRole: boolean, balance: number, re
         .setLabel(`Land で買う (${fmtLd(item.price_land)})`)
         .setEmoji("💰")
         .setStyle(ButtonStyle.Primary)
-        .setDisabled(!userHasRole || balance < item.price_land || (item.stock !== null && item.stock <= 0)),
+        // Land不足でも押せるようにし、押下後に賭場チップ返還の確認を出す。
+        .setDisabled(!userHasRole || (item.stock !== null && item.stock <= 0)),
     );
   }
   if (item.price_alt_kind && item.price_alt_amount !== null) {
@@ -135,42 +134,249 @@ function itemDetail(item: ShopItemRow, userHasRole: boolean, balance: number, re
   return { embeds: [embed], components };
 }
 
+type PurchaseOutcome = ReturnType<Services["shop"]["purchase"]> & { replayed?: boolean };
+
+function purchaseOnce(
+  services: Services,
+  input: {
+    operationId: string;
+    itemId: number;
+    userId: string;
+    actor: string;
+    memberRoleIds: readonly string[];
+    mode: "land" | "alt";
+  },
+): PurchaseOutcome {
+  const execute = services.db.transaction(() => {
+    const existing = services.db.prepare(
+      "SELECT * FROM shop_purchase_operations WHERE operation_id=?",
+    ).get(input.operationId) as
+      | { user_id: string; item_id: number; mode: string; purchase_id: number | null; status: string }
+      | undefined;
+    if (existing) {
+      if (existing.user_id !== input.userId || existing.item_id !== input.itemId || existing.mode !== input.mode) {
+        throw new Error("shop operation conflict");
+      }
+      if (existing.status !== "completed" || existing.purchase_id === null) {
+        throw new Error("shop operation is incomplete");
+      }
+      const purchase = services.shop.getPurchase(existing.purchase_id);
+      const item = services.shop.getItem(existing.item_id);
+      if (!purchase || !item) throw new Error("shop operation result is missing");
+      // 課金は冪等でも配送はそうではない（`extend_deadline` は期限へ加算する）。
+      // 再実行だと分かる印を返し、配送の副作用を二度走らせない（監査項目13）
+      return { purchase, item, needsManualDelivery: item.delivery === "manual", replayed: true };
+    }
+
+    services.db.prepare(
+      `INSERT INTO shop_purchase_operations
+       (operation_id,user_id,item_id,mode,status,created_at)
+       VALUES (?,?,?,?, 'executing', ?)`,
+    ).run(input.operationId, input.userId, input.itemId, input.mode, Math.floor(Date.now() / 1_000));
+
+    const result = services.shop.purchase({
+      itemId: input.itemId,
+      userId: input.userId,
+      actor: input.actor,
+      memberRoleIds: input.memberRoleIds,
+      payAlt: input.mode === "alt",
+    });
+    services.db.prepare(
+      `UPDATE shop_purchase_operations
+       SET status='completed',purchase_id=?,completed_at=?
+       WHERE operation_id=? AND status='executing'`,
+    ).run(result.purchase.id, Math.floor(Date.now() / 1_000), input.operationId);
+    return { ...result, replayed: false };
+  });
+  return execute.immediate();
+}
+
+async function finishPurchase(
+  interaction: ButtonInteraction,
+  services: Services,
+  result: PurchaseOutcome,
+): Promise<void> {
+  const { item, purchase } = result;
+  let deliveryNote = "";
+  if (result.replayed) {
+    // 既に配送済みの購入。ロール付与・期限延長・スタッフ通知をもう一度走らせない
+    deliveryNote = "この購入は完了済みです（配送は実行済み）。";
+  } else if (item.delivery === "auto") {
+    deliveryNote = await tryAutoDeliver(interaction, services, item, interaction.user.id).catch(
+      () => "自動配送に失敗しました。運営にお問い合わせください。",
+    );
+  } else {
+    deliveryNote = "スタッフが配送の対応をします。";
+    await notifyStaffForDelivery(interaction, services, purchase.id, item).catch(() => undefined);
+  }
+  const expires = purchase.expires_at ? `\n有効期限: <t:${purchase.expires_at}:D>` : "";
+  await interaction.editReply({
+    content: `✅ **${item.name}** を購入しました${deliveryNote ? `\n${deliveryNote}` : ""}${expires}`,
+    embeds: [],
+    components: [],
+  });
+}
+
+function purchaseErrorMessage(error: unknown, services: Services): string {
+  if (error instanceof ShopError) {
+    if (error.code === "ERR_ITEM_DISABLED") return "この商品は現在販売されていません。";
+    if (error.code === "ERR_NO_STOCK") return "在庫切れです。";
+    if (error.code === "ERR_ROLE_REQUIRED") {
+      return `階級要件を満たしていません（要 ${requirementLabel(services.settings, (error.details.roleId as string | undefined) ?? null)}）。`;
+    }
+    if (error.code === "ERR_ALREADY_ACTIVE") return "既にこの月額商品を契約中です。";
+    if (error.code === "ERR_NO_PRICE") return "この商品の価格が設定されていません。";
+  }
+  if (error instanceof LedgerError && error.code === "ERR_INSUFFICIENT") return "残高が足りません。";
+  return error instanceof Error ? error.message : "処理に失敗しました。";
+}
+
+function chipReturnView(confirmationId: string, item: ShopItemRow, land: number, chips: number) {
+  return {
+    content: [
+      `Landが足りません。商品 **${item.name}** は ${fmtLd(item.price_land ?? 0)}、現在のLandは ${fmtLd(land)} です。`,
+      `賭場に **${fmtLd(chips)}** あります。`,
+      "押した場合だけ自由チップをLandへ戻し、この購入を同じoperation IDで一度だけ再試行します。",
+    ].join("\n"),
+    embeds: [],
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`shop:chips:${confirmationId}:${item.id}:land`)
+          .setLabel("Landへ戻して続ける")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`shop:chips-no:${confirmationId}`)
+          .setLabel("やめる")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  };
+}
+
+/**
+ * 返還済み・購入未完了で止まった確認票の再試行ボタン（監査項目13）。
+ * 「やめる」は出さない——返還が済んだあとに取り消せる操作ではない。
+ */
+function retryConfirmComponents(
+  confirmationId: string,
+  itemId: number,
+  mode: "land" | "alt",
+): ActionRowBuilder<ButtonBuilder>[] {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`shop:chips:${confirmationId}:${itemId}:${mode}`)
+        .setLabel("購入を再試行")
+        .setStyle(ButtonStyle.Primary),
+    ),
+  ];
+}
+
 export async function handleShopButton(interaction: ButtonInteraction, services: Services): Promise<void> {
-  const parts = interaction.customId.split(":"); // shop:buy:<itemId>:<land|alt>  shop:contracts
+  const parts = interaction.customId.split(":");
   const action = parts[1];
 
   if (action === "contracts") {
     const rows = services.shop.listUserPurchases(interaction.user.id, { activeOnly: true });
-    const lines =
-      rows.length > 0
-        ? rows.map((p) => {
-            const item = services.shop.getItem(p.item_id);
-            const label = item?.name ?? `#${p.item_id}`;
-            const exp = p.expires_at ? `<t:${p.expires_at}:D>` : "—";
-            const renew = p.auto_renew ? "🔁 自動更新" : "❌ 更新停止";
-            return `・**${label}**（有効期限 ${exp}・${renew}）`;
-          })
-        : ["契約中の商品はありません。"];
-    const embed = new EmbedBuilder()
-      .setTitle("📜 契約中の商品")
-      .setColor(0xdb2777)
-      .setDescription(lines.join("\n"));
-    // 解約ボタン
-    const monthlyRows = rows.filter((p) => p.auto_renew);
+    const lines = rows.length > 0
+      ? rows.map((purchase) => {
+          const item = services.shop.getItem(purchase.item_id);
+          const label = item?.name ?? `#${purchase.item_id}`;
+          const exp = purchase.expires_at ? `<t:${purchase.expires_at}:D>` : "—";
+          const renew = purchase.auto_renew ? "🔁 自動更新" : "❌ 更新停止";
+          return `・**${label}**（有効期限 ${exp}・${renew}）`;
+        })
+      : ["契約中の商品はありません。"];
+    const embed = new EmbedBuilder().setTitle("📜 契約中の商品").setColor(0xdb2777).setDescription(lines.join("\n"));
+    const monthlyRows = rows.filter((purchase) => purchase.auto_renew);
     const components: ActionRowBuilder<StringSelectMenuBuilder>[] = [];
     if (monthlyRows.length > 0) {
       const menu = new StringSelectMenuBuilder()
         .setCustomId("shop:cancel")
         .setPlaceholder("解約する契約を選ぶ")
-        .addOptions(
-          monthlyRows.slice(0, 25).map((p) => {
-            const item = services.shop.getItem(p.item_id);
-            return { label: (item?.name ?? `#${p.item_id}`).slice(0, 100), value: String(p.id) };
-          }),
-        );
+        .addOptions(monthlyRows.slice(0, 25).map((purchase) => {
+          const item = services.shop.getItem(purchase.item_id);
+          return { label: (item?.name ?? `#${purchase.item_id}`).slice(0, 100), value: String(purchase.id) };
+        }));
       components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu));
     }
     await interaction.reply({ embeds: [embed], components, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (action === "chips-no") {
+    const confirmationId = parts[2];
+    if (!confirmationId) return;
+    const cancelled = services.chipFlow.cancelExternalConfirmation(confirmationId, interaction.user.id);
+    await interaction.update({
+      content: cancelled ? "購入をやめました。賭場の自由チップは変更していません。" : "この確認は取り消せません。",
+      embeds: [],
+      components: [],
+    });
+    return;
+  }
+
+  if (action === "chips") {
+    const confirmationId = parts[2];
+    const itemId = Number(parts[3]);
+    const mode = parts[4] as "land" | "alt";
+    if (!confirmationId || !Number.isSafeInteger(itemId) || mode !== "land") return;
+    const confirmation = services.chipFlow.externalConfirmation(confirmationId);
+    if (!confirmation || confirmation.userId !== interaction.user.id || confirmation.operationKind !== `shop:${itemId}:${mode}`) {
+      await interaction.reply({ content: "この確認は利用できません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferUpdate();
+    let redeemed = false;
+    let purchased = false;
+    try {
+      let row = confirmation;
+      if (row.status === "pending") row = services.chipFlow.beginExternalConfirmation(confirmationId, interaction.user.id);
+      if (row.status !== "executing") throw new Error("この確認は既に処理されています");
+      services.chipFlow.redeemExactFreeChips(
+        interaction.user.id,
+        row.chipAmount,
+        `external:${confirmationId}`,
+        "公式ショップ購入を続けるための返還",
+        true,
+      );
+      redeemed = true;
+      const member = interaction.member;
+      const memberRoleIds = member && "roles" in member && "cache" in member.roles
+        ? [...member.roles.cache.keys()]
+        : [];
+      const result = purchaseOnce(services, {
+        operationId: row.operationId,
+        itemId,
+        userId: interaction.user.id,
+        actor: `user:${interaction.user.id}`,
+        memberRoleIds,
+        mode,
+      });
+      purchased = true;
+      if (!services.chipFlow.completeExternalConfirmation(confirmationId, interaction.user.id)) {
+        throw new Error("購入確認の完了記録に失敗しました");
+      }
+      await finishPurchase(interaction, services, result);
+    } catch (error) {
+      // 返還だけが済んで購入が失敗した状態を、ボタンを消して黙って終わらせない（監査項目13）。
+      // 資金が Land 側にあること・購入が未完了であることを明示し、**同じ確認票の
+      // ボタンを残して**再試行できるようにする。返還も購入も安定キーなので、
+      // 押し直しても資金は二重に動かず、購入が成立していれば完了記録だけが収束する。
+      const stranded = redeemed && !purchased;
+      await interaction.editReply({
+        content: stranded
+          ? [
+              `❌ ${purchaseErrorMessage(error, services)}`,
+              `自由チップは既にLandへ返還済みです（購入は未完了）。`,
+              "同じボタンをもう一度押すと、二重に資金を動かさずこの購入だけを再試行します。",
+            ].join("\n")
+          : `❌ ${purchaseErrorMessage(error, services)}`,
+        embeds: [],
+        components: stranded ? retryConfirmComponents(confirmationId, itemId, mode) : [],
+      });
+    }
     return;
   }
 
@@ -183,51 +389,53 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       return;
     }
     const member = interaction.member;
-    const memberRoleIds =
-      member && "roles" in member && "cache" in member.roles ? [...member.roles.cache.keys()] : [];
-    // 自動配送（ロール付与・スレッド更新等）が3秒を超えると reply が 10062 で失敗するため、
-    // 先に defer して「考え中」を返しておく（以降は editReply）。
+    const memberRoleIds = member && "roles" in member && "cache" in member.roles
+      ? [...member.roles.cache.keys()]
+      : [];
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
-      const res = services.shop.purchase({
+      const result = purchaseOnce(services, {
+        operationId: interaction.id,
         itemId,
         userId: interaction.user.id,
         actor: `user:${interaction.user.id}`,
         memberRoleIds,
-        payAlt: mode === "alt",
+        mode,
       });
-      // 自動配送
-      let deliveryNote = "";
-      if (item.delivery === "auto") {
-        deliveryNote = await tryAutoDeliver(interaction, services, item, interaction.user.id).catch(
-          () => "自動配送に失敗しました。運営にお問い合わせください。",
-        );
-      } else {
-        deliveryNote = "スタッフが配送の対応をします。";
-        await notifyStaffForDelivery(interaction, services, res.purchase.id, item).catch(() => undefined);
+      await finishPurchase(interaction, services, result);
+    } catch (error) {
+      if (
+        mode === "land"
+        && item.price_land !== null
+        && error instanceof LedgerError
+        && error.code === "ERR_INSUFFICIENT"
+      ) {
+        const freeChips = services.chipAssets.freeChips(interaction.user.id);
+        const land = services.ledger.balanceOf(`user:${interaction.user.id}`);
+        if (freeChips > 0) {
+          try {
+            const confirmation = services.chipFlow.createExternalConfirmation({
+              id: interaction.id,
+              userId: interaction.user.id,
+              operationKind: `shop:${itemId}:${mode}`,
+              operationId: interaction.id,
+              requiredLand: Math.max(1, item.price_land - land),
+              chipAmount: freeChips,
+              expiresAt: Math.floor(Date.now() / 1_000) + EXTERNAL_CONFIRM_TTL_SEC,
+            });
+            await interaction.editReply(chipReturnView(confirmation.id, item, land, freeChips));
+            return;
+          } catch (confirmationError) {
+            await interaction.editReply({
+              content: `❌ ${confirmationError instanceof Error ? confirmationError.message : "返還確認を作成できません"}`,
+              embeds: [],
+              components: [],
+            });
+            return;
+          }
+        }
       }
-      const expires = res.purchase.expires_at ? `\n有効期限: <t:${res.purchase.expires_at}:D>` : "";
-      await interaction.editReply({
-        content: `✅ **${item.name}** を購入しました${deliveryNote ? `\n${deliveryNote}` : ""}${expires}`,
-      });
-    } catch (e) {
-      const msg =
-        e instanceof ShopError
-          ? e.code === "ERR_ITEM_DISABLED"
-            ? "この商品は現在販売されていません。"
-            : e.code === "ERR_NO_STOCK"
-              ? "在庫切れです。"
-              : e.code === "ERR_ROLE_REQUIRED"
-                ? `階級要件を満たしていません（要 ${requirementLabel(services.settings, (e.details.roleId as string | undefined) ?? null)}）。`
-                : e.code === "ERR_ALREADY_ACTIVE"
-                  ? "既にこの月額商品を契約中です。"
-                  : e.code === "ERR_NO_PRICE"
-                    ? "この商品の価格が設定されていません。"
-                    : "処理に失敗しました。"
-          : e instanceof Error && "code" in e && (e as { code: unknown }).code === "ERR_INSUFFICIENT"
-            ? "残高が足りません。"
-            : "処理に失敗しました。";
-      await interaction.editReply({ content: `❌ ${msg}` });
+      await interaction.editReply({ content: `❌ ${purchaseErrorMessage(error, services)}`, embeds: [], components: [] });
     }
     return;
   }
@@ -246,10 +454,10 @@ export async function handleShopSelect(
       return;
     }
     const member = interaction.member;
-    const memberRoleIds =
-      member && "roles" in member && "cache" in member.roles ? [...member.roles.cache.keys()] : [];
-    const hasRole =
-      !item.require_role_id || meetsRoleRequirement(services.settings, memberRoleIds, item.require_role_id);
+    const memberRoleIds = member && "roles" in member && "cache" in member.roles
+      ? [...member.roles.cache.keys()]
+      : [];
+    const hasRole = !item.require_role_id || meetsRoleRequirement(services.settings, memberRoleIds, item.require_role_id);
     const balance = services.ledger.balanceOf(`user:${interaction.user.id}`);
     const view = itemDetail(item, hasRole, balance, requirementLabel(services.settings, item.require_role_id));
     await interaction.reply({ ...view, flags: MessageFlags.Ephemeral });
@@ -263,16 +471,13 @@ export async function handleShopSelect(
       embeds: [],
       components: [],
     });
-    return;
   }
 }
-
-// ---- 自動配送 ----
 
 async function tryAutoDeliver(
   interaction: ButtonInteraction,
   services: Services,
-  item: import("@meigokujo/core").ShopItemRow,
+  item: ShopItemRow,
   userId: string,
 ): Promise<string> {
   const data: { role_id?: string; days?: number } = item.delivery_data ? JSON.parse(item.delivery_data) : {};
@@ -290,13 +495,9 @@ async function tryAutoDeliver(
     const days = data.days ?? 1;
     const soul = services.entry.getSoul(userId);
     if (!soul || !soul.eval_deadline_at) return "評価期限を持っていないため延長できません。";
-    // 直接更新
     services.db
-      .prepare(
-        "UPDATE souls SET eval_deadline_at = eval_deadline_at + ?, updated_at = ? WHERE user_id = ?",
-      )
-      .run(days * 86_400, Math.floor(Date.now() / 1000), userId);
-    // 評価フォーラムの起点投稿を即時更新（05:30の一括更新を待たせない）
+      .prepare("UPDATE souls SET eval_deadline_at = eval_deadline_at + ?, updated_at = ? WHERE user_id = ?")
+      .run(days * 86_400, Math.floor(Date.now() / 1_000), userId);
     if (interaction.guild) {
       await refreshEvalStatsForUser(interaction.guild, services, userId).catch(() => undefined);
     }
@@ -306,9 +507,7 @@ async function tryAutoDeliver(
     const soul = services.entry.getSoul(userId);
     if (!soul) return "魂記録がありません。";
     if (soul.status !== "meirei") return "現在の状態が迷霊ではありません。";
-    // 案内待ちに戻す（resetToWaiting は現状 waiting 用途だが再評価チャレンジは同等）
     services.entry.resetToWaiting(userId, `shop:${item.id}`);
-    // Discordロールも解除→案内待ちに
     const guild = interaction.guild;
     if (guild) {
       const meireiRoleId = services.settings.getString("role:meirei");
@@ -328,21 +527,23 @@ async function notifyStaffForDelivery(
   interaction: ButtonInteraction,
   services: Services,
   purchaseId: number,
-  item: import("@meigokujo/core").ShopItemRow,
+  item: ShopItemRow,
 ): Promise<void> {
   const shokanChId = services.settings.getString("channel:shokan");
-  const chId = shokanChId ?? services.settings.getString("channel:kessai");
-  if (!chId) return;
-  const ch = await interaction.client.channels.fetch(chId).catch(() => null);
-  if (!ch?.isTextBased() || !("send" in ch)) return;
+  const channelId = shokanChId ?? services.settings.getString("channel:kessai");
+  if (!channelId) return;
+  const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased() || !("send" in channel)) return;
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`shokan:deliver:${purchaseId}`).setLabel("配送完了").setEmoji("📦").setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`shokan:deliver:${purchaseId}`)
+      .setLabel("配送完了")
+      .setEmoji("📦")
+      .setStyle(ButtonStyle.Success),
   );
-  await ch
-    .send({
-      content: `📦 **公式ショップ**: <@${interaction.user.id}> が **${item.name}** を購入。手動配送をお願いします（購入ID #${purchaseId}）。`,
-      components: [row],
-      allowedMentions: { users: [interaction.user.id] },
-    })
-    .catch(() => undefined);
+  await channel.send({
+    content: `📦 **公式ショップ**: <@${interaction.user.id}> が **${item.name}** を購入。手動配送をお願いします（購入ID #${purchaseId}）。`,
+    components: [row],
+    allowedMentions: { users: [interaction.user.id] },
+  }).catch(() => undefined);
 }

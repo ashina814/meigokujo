@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { isSeatOccupied } from "./casino/common.js";
 import {
   Departments,
   Entry,
@@ -41,6 +42,7 @@ import {
   Takutate,
   Escrow,
   CasinoChipAssets,
+  CasinoChipFlow,
   defaultRng,
   openDb,
   registerDefaultTxTypes,
@@ -167,6 +169,10 @@ export function buildServices() {
   const markets = new Markets(db, chips, events, { onPlayerNet: recordPlayerNet });
   const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
   const chipAssets = new CasinoChipAssets(db, chips);
+  // 所有判定の正本をここで一本化する。プロセス内の着席は DB のどの表にも
+  // 現れないので、渡さないとショップの域外確認票がゲーム中の自由チップを
+  // Land へ戻せてしまう（監査ブロッカー・項目11）
+  const chipFlow = new CasinoChipFlow(db, chips, events, chipAssets, { isSeatOccupied });
   const takutate = new Takutate(db, events);
   const casinoIntegrity = new CasinoIntegrity(db, ledger, chips, escrow, chipAssets);
   // 起動時: 全点検 → 通ったときだけ掃除 → 掃除後にもう一度全点検 → 開ける
@@ -176,14 +182,14 @@ export function buildServices() {
   const recoveryRegistry = new RecoveryRegistry();
   recoveryRegistry.register({ type: "market", listLiveEscrowHolders: () => markets.liveEscrowHolders() });
   logRecovery(
-    recoverCasino({ db, status: casinoStatus, integrity: casinoIntegrity, chipTx, escrow, reservations, registry: recoveryRegistry, events }),
+    recoverCasino({ db, status: casinoStatus, integrity: casinoIntegrity, chipTx, escrow, reservations, registry: recoveryRegistry, events, chipFlow }),
   );
   // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
   // 資金を動かす経路は `chips` に一本化した（PR8監査・項目12）。`ether` は
   // 旧名称で書かれた外部プラグイン・古い呼び出しが**読むだけ**なら壊れないように
   // 残す互換窓で、型を `ChipReadonlyView` に狭めてある（下の注釈参照）。
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;
@@ -219,6 +225,9 @@ function logRecovery(r: ReturnType<typeof recoverCasino>): void {
 ` +
           "　→ 原因を直したうえで /管理 → 賭場 → 「復旧を再実行」を押してください（再点検では開きません）",
       );
+      break;
+    case "chip_redeem_failed":
+      console.error(`[賭場] S10自由チップ返還が一部失敗したため復旧停止: ${r.reason}（${summary}）`);
       break;
     case "refund_failed":
       // 孤児返金が技術的に失敗したセッションが残っている＝復旧未完了。営業は開けない（PR7監査）。

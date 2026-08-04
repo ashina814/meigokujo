@@ -7,6 +7,8 @@ import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
 import { ChipLedger, ETHER_ESCROW, CHIP_ESCROW, HOUSE_HOLDER } from "../src/casino/chip-ledger.js";
+import { CasinoChipAssets } from "../src/casino/chip-assets.js";
+import { CasinoChipFlow } from "../src/casino/chip-flow.js";
 import { ChipTx, LEGACY_OPENING_VERSION } from "../src/casino/chip-tx.js";
 import { CasinoStatus } from "../src/casino/status.js";
 import { CasinoIntegrity } from "../src/casino/integrity.js";
@@ -158,13 +160,15 @@ function wire(dbPath: string) {
   const status = new CasinoStatus(db);
   chipTx.setClosedReason(() => status.denyMessage());
   const escrow = new Escrow(db, chips, events);
+  const chipAssets = new CasinoChipAssets(db, chips);
+  const chipFlow = new CasinoChipFlow(db, chips, events, chipAssets);
   const reservations = new HouseReservations(db, chips, events);
   chips.setReservedProvider((h) => (h === HOUSE_HOLDER ? reservations.totalReserved() : 0));
   const integrity = new CasinoIntegrity(db, ledger, chips, escrow);
   const registry = new RecoveryRegistry();
   // 「生きている預託」は所有元が申告する（PR7 S4）。申告しないと孤児として返金されてしまう
   registry.register({ type: "market", listLiveEscrowHolders: () => ["escrow:session:sess-live"] });
-  return { db, ledger, events, chipTx, chips, status, escrow, reservations, integrity, registry };
+  return { db, ledger, events, chipTx, chips, status, escrow, chipAssets, chipFlow, reservations, integrity, registry };
 }
 
 /** UI（両替所・案内所・計器盤・運営卓）が読む値を一通り触る。読むだけで何も動かさないこと */
@@ -248,7 +252,7 @@ describe("PR8は既存legacy DBを変更しない（項目13）", () => {
       // S1〜S12。健全な legacy DB なので、孤児返金・隔離・凍結は発生しない
       const r = recoverCasino({
         db: w.db, status: w.status, integrity: w.integrity, chipTx: w.chipTx,
-        escrow: w.escrow, reservations: w.reservations, registry: w.registry, events: w.events,
+        escrow: w.escrow, reservations: w.reservations, registry: w.registry, events: w.events, chipFlow: w.chipFlow,
       });
       outcome = r.outcome;
       expect(r.refundedSessions).toBe(0);
@@ -258,6 +262,11 @@ describe("PR8は既存legacy DBを変更しない（項目13）", () => {
       expect(r.failedSessions).toEqual([]);
       // S9: 進行中でないソロ債務の予約解放は PR7 の正規復旧対象。ここだけは動いてよい
       expect(r.releasedReservations).toEqual({ released: true, count: 2, total: 55_000 });
+      expect(r.redeemedFreeChips).toEqual({
+        redeemed: [],
+        skipped: [{ userId: null, amount: 0, reason: "opening_not_formal" }],
+        failed: [],
+      });
       // 復旧後も版は legacy のまま（PR8 は暗黙移行しない）
       expect(w.chipTx.openingPhase()).toBe("pre_reset");
       attemptAllFundOperations(w, "after-recovery");

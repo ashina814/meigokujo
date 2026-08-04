@@ -12,6 +12,7 @@ import { tickVoiceXp } from "./rank-tracker.js";
 import { fmtLd } from "./format.js";
 import { announceAutoClose, announceSettle, refreshMarketPanel } from "./commands/ita.js";
 import { ticketStaffRoleIds } from "./commands/tickets.js";
+import { isSeatOccupied } from "./casino/common.js";
 import type { Services } from "./services.js";
 import {
   cleanupCompletedChunkBatches,
@@ -96,6 +97,40 @@ export function nextSessionStart(services: Pick<Services, "sessions">, from = ne
 export function startScheduler(client: Client, services: Services, intervalMs = 60_000): NodeJS.Timeout {
   async function tick(): Promise<void> {
     const now = jstNow();
+
+    // PR10: every minute, return only verified-user free chips idle for ten minutes.
+    // redeemInactive rechecks activity immediately before each redemption and isolates failures.
+    //
+    // 正式開業済み **かつ** 営業中のときだけ動かす（監査項目9）。
+    // 以前は状態を見ずに毎分呼んでいたので、legacy_pre_reset・opening_reset・
+    // manual_halt・recovery_halt・startup_check・未知状態では、対象者ごとに
+    // 資金操作が拒否され、毎分 failed イベントだけが積み上がっていた。
+    // 期限切れの域外確認票の回収は資金を動かさないので、営業状態に関わらず毎分回す。
+    // executing のまま残った票（返還済み・元操作未完了）を永久に放置しない
+    services.chipFlow.expireStaleConfirmations();
+
+    if (services.chipTx.openingPhase() === "formal" && services.casinoStatus.current().status === "open") {
+      const idleCutoff = Math.floor(Date.now() / 1000) - 10 * 60;
+      const idle = services.chipFlow.redeemInactive(
+        idleCutoff,
+        `scheduler:${idleCutoff}`,
+        {
+          activeGameUsers: (userIds) => userIds.filter(isSeatOccupied),
+          processingGroup: () => services.chipTx.isActive(),
+          integrityBlocked: () => {
+            const state = services.casinoStatus.current().status;
+            return state === "integrity_halt" || state === "recovery_halt";
+          },
+        },
+      );
+      // skip は毎分ふつうに起きる（進行中の客）。異常として記録するのは失敗だけにする
+      if (idle.failed.length > 0) {
+        services.events.log("casino_idle_redeem_scan", {
+          actor: "system:scheduler",
+          payload: { cutoff: idleCutoff, failed: idle.failed, skipped: idle.skipped },
+        });
+      }
+    }
 
     // ── 説明会の案内: 実際の開催予定の 5分前に入城案内chへ通知 ──
     // 通常枠は settings、休止・臨時追加は entry_session_overrides。合成は SessionCalendar が持ち、

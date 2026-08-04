@@ -30,6 +30,7 @@ import {
   HOUSE_HOLDER,
   LedgerError,
   recoverCasino,
+  type RefundSaga,
   type TicketPanel,
 } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
@@ -44,6 +45,7 @@ import {
 import { updateDashboard } from "../dashboard.js";
 import { updateWaitersBoard, WAITERS_BOARD_CHANNEL_KEY } from "../waiters-board.js";
 import { fmtEther, fmtLd } from "../format.js";
+import { isSeatOccupied } from "../casino/common.js";
 import { describeChipLedgerError, isFormallyOpen, openingBadge, openingNotice, openingPhase } from "../casino/opening.js";
 import { ticketPanelMessageForPanel } from "./tickets.js";
 import type { Services } from "../services.js";
@@ -185,6 +187,48 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   }
   if (section === "casino" && action === "fund") return void (await interaction.showModal(casinoFundModal()));
   if (section === "casino" && action === "settle") return void (await interaction.showModal(casinoSettleModal()));
+  if (section === "casino" && action === "refund-user") return void (await interaction.showModal(casinoRefundUserModal()));
+  if (section === "casino" && action === "refund-all") {
+    try {
+      const saga = services.chipFlow.createRefundSaga({
+        id: interaction.id,
+        requestedBy: `user:${interaction.user.id}`,
+        scope: "all",
+      });
+      return void (await interaction.update(casinoRefundConfirm(saga)));
+    } catch (error) {
+      return void (await interaction.reply({
+        content: `❌ ${error instanceof Error ? error.message : "緊急返還案を作成できません"}`,
+        flags: MessageFlags.Ephemeral,
+      }));
+    }
+  }
+  if (section === "casino" && action === "refund-cancel" && arg) {
+    const cancelled = services.chipFlow.cancelRefundSaga(arg, `user:${interaction.user.id}`);
+    return void (await interaction.update({
+      content: cancelled ? "緊急返還案を取り消しました。" : "この緊急返還案は取り消せません。",
+      embeds: [],
+      components: [backButton()],
+    }));
+  }
+  if (section === "casino" && action === "refund-execute" && arg) {
+    try {
+      const saga = services.chipFlow.executeRefundSaga(arg, `user:${interaction.user.id}`, {
+        activeGameUsers: (userIds) => userIds.filter(isSeatOccupied),
+        processingGroup: () => services.chipTx.isActive(),
+        integrityBlocked: () => {
+          const state = services.casinoStatus.current().status;
+          return state === "integrity_halt" || state === "recovery_halt";
+        },
+      });
+      return void (await interaction.update(casinoRefundResult(saga)));
+    } catch (error) {
+      return void (await interaction.reply({
+        content: `❌ ${error instanceof Error ? error.message : "緊急返還を実行できません"}`,
+        flags: MessageFlags.Ephemeral,
+      }));
+    }
+  }
   if (section === "casino" && action === "halt") return void (await interaction.showModal(casinoHaltModal()));
   if (section === "casino" && action === "reopen") {
     // 古いパネルのボタンが残っていることがあるので、押された時点の状態でも確かめる
@@ -234,11 +278,13 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
         reservations: services.reservations,
         registry: services.recoveryRegistry,
         events: services.events,
+        chipFlow: services.chipFlow,
       });
       const detail = [
         `維持 ${r.keptHolders}件 / 孤児返金 ${r.refundedSessions}件 / 隔離 ${r.quarantined}件`,
         `不一致 ${r.mismatched.length}件 / 返金失敗 ${r.failedSessions.length}件`,
         r.releasedReservations.released ? `予約解放 ${r.releasedReservations.count}件` : "予約解放は未実行",
+        `自由チップ返還 ${r.redeemedFreeChips.redeemed.length}名 / 失敗 ${r.redeemedFreeChips.failed.length}名`,
       ].join("\n");
       await interaction.reply({
         content:
@@ -475,6 +521,29 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
   const parts = interaction.customId.split(":");
   const section = parts[1];
   const action = parts[2];
+
+  if (section === "casino" && action === "refund-user") {
+    const targetId = interaction.fields.getTextInputValue("user_id").trim();
+    if (!/^\d{15,22}$/.test(targetId)) {
+      await interaction.reply({ content: "Discord利用者IDを入力してください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    try {
+      const saga = services.chipFlow.createRefundSaga({
+        id: interaction.id,
+        requestedBy: `user:${interaction.user.id}`,
+        scope: "user",
+        userId: targetId,
+      });
+      await interaction.reply({ ...casinoRefundConfirm(saga), flags: MessageFlags.Ephemeral });
+    } catch (error) {
+      await interaction.reply({
+        content: `❌ ${error instanceof Error ? error.message : "緊急返還案を作成できません"}`,
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+    return;
+  }
 
   if (section === "tpanel" && action === "create") {
     const id = interaction.fields.getTextInputValue("id").trim().toLowerCase();
@@ -2058,6 +2127,24 @@ function casinoHome(services: Services) {
       : []),
   );
   const rows: ActionRowBuilder<ButtonBuilder>[] = [row];
+  // PR10 emergency refund is a persistent preview/draft saga. Creating or viewing the
+  // confirmation never moves funds; execution rechecks balances and ownership.
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("mgmt:casino:refund-user")
+        .setLabel("緊急返還（個人）")
+        .setEmoji("🚨")
+        .setStyle(ButtonStyle.Danger)
+        .setDisabled(phase !== "formal"),
+      new ButtonBuilder()
+        .setCustomId("mgmt:casino:refund-all")
+        .setLabel("緊急返還（全利用者）")
+        .setEmoji("🚨")
+        .setStyle(ButtonStyle.Danger)
+        .setDisabled(phase !== "formal"),
+    ),
+  );
   // 検算Bの基準が無い版（PR2 以前から動いていたDB）だけ、明示的な基準確定を出す
   if (services.chipTx.openingLandBaseline() === null) {
     rows.push(
@@ -2071,6 +2158,84 @@ function casinoHome(services: Services) {
     );
   }
   return { embeds: [embed], components: [...rows, backButton()] };
+}
+
+function casinoRefundUserModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:refund-user")
+    .setTitle("緊急返還（個人）")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("user_id")
+          .setLabel("返還対象のDiscord利用者ID")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(22),
+      ),
+    );
+}
+
+function casinoRefundConfirm(saga: RefundSaga) {
+  const target = saga.scope === "all" ? "全利用者" : `<@${saga.targetUserId}>`;
+  return {
+    content: [
+      "🚨 **緊急返還の実行前確認**",
+      `対象: ${target} / **${saga.targetCount}人・${fmtLd(saga.targetTotal)}**`,
+      "この時点では資金を動かしていません。",
+      "自由チップだけをLandへ返還します。卓・板の預託、house、JP、relief、quarantine、free-spin claimは対象外です。",
+      "実行時に残高・進行中ゲーム・予約・預託・検算状態を再確認し、staleなら開始しません。",
+    ].join("\n"),
+    embeds: [],
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`mgmt:casino:refund-execute:${saga.id}`)
+          .setLabel("この内容で実行")
+          .setEmoji("✅")
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId(`mgmt:casino:refund-cancel:${saga.id}`)
+          .setLabel("やめる")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  };
+}
+
+function casinoRefundResult(saga: RefundSaga) {
+  const completed = saga.targets.filter((target) => target.status === "completed");
+  const failed = saga.targets.filter((target) => target.status !== "completed");
+  return {
+    content:
+      saga.status === "completed"
+        ? `✅ 緊急返還が完了しました。対象 ${completed.length}人 / 確認額 ${fmtLd(saga.targetTotal)}。`
+        : `⛔ 緊急返還は完了していません（${saga.failure ?? saga.status}）。返還済み ${completed.length}人 / 未完了 ${failed.length}人。`,
+    embeds: [],
+    // 取消は core 側で draft のときだけ通る（監査項目12）。blocked/executing で
+    // 「取り消す」を出すと、押しても必ず失敗する死んだボタンになる。
+    // 出口は「安全確認後に再開」だけにして、UI と実際の遷移可能集合を一致させる。
+    components:
+      saga.status === "completed" || saga.status === "cancelled"
+        ? [backButton()]
+        : [
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder()
+                .setCustomId(`mgmt:casino:refund-execute:${saga.id}`)
+                .setLabel("安全確認後に再開")
+                .setStyle(ButtonStyle.Danger),
+              ...(saga.status === "draft"
+                ? [
+                    new ButtonBuilder()
+                      .setCustomId(`mgmt:casino:refund-cancel:${saga.id}`)
+                      .setLabel("取り消す")
+                      .setStyle(ButtonStyle.Secondary),
+                  ]
+                : []),
+            ),
+            backButton(),
+          ],
+  };
 }
 
 function casinoHaltModal() {

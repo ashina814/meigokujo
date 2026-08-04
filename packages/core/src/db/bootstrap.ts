@@ -411,6 +411,68 @@ CREATE TABLE IF NOT EXISTS ether_balances (
   updated_at INTEGER NOT NULL
 );
 
+
+-- PR10: automatic deposit/redemption activity and persistent confirmation/saga state.
+CREATE TABLE IF NOT EXISTS casino_chip_activity (
+  user_id        TEXT PRIMARY KEY,
+  last_active_at INTEGER NOT NULL CHECK(last_active_at >= 0),
+  updated_at     INTEGER NOT NULL CHECK(updated_at >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_casino_chip_activity_last ON casino_chip_activity(last_active_at);
+
+CREATE TABLE IF NOT EXISTS casino_chip_external_confirmations (
+  id             TEXT PRIMARY KEY,
+  user_id        TEXT NOT NULL,
+  operation_kind TEXT NOT NULL,
+  operation_id   TEXT NOT NULL,
+  required_land  INTEGER NOT NULL CHECK(required_land > 0),
+  chip_amount    INTEGER NOT NULL CHECK(chip_amount > 0),
+  status         TEXT NOT NULL CHECK(status IN ('pending','executing','completed','cancelled','expired')),
+  created_at     INTEGER NOT NULL CHECK(created_at >= 0),
+  expires_at     INTEGER NOT NULL CHECK(expires_at >= created_at),
+  completed_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_chip_external_user_status
+  ON casino_chip_external_confirmations(user_id,status,expires_at);
+
+CREATE TABLE IF NOT EXISTS casino_chip_refund_sagas (
+  id             TEXT PRIMARY KEY,
+  scope          TEXT NOT NULL CHECK(scope IN ('user','all')),
+  requested_by   TEXT NOT NULL,
+  target_user_id TEXT,
+  status         TEXT NOT NULL CHECK(status IN ('draft','executing','completed','blocked','cancelled')),
+  target_count   INTEGER NOT NULL CHECK(target_count >= 0),
+  target_total   INTEGER NOT NULL CHECK(target_total >= 0),
+  created_at     INTEGER NOT NULL CHECK(created_at >= 0),
+  started_at     INTEGER,
+  completed_at   INTEGER,
+  failure_json   TEXT,
+  CHECK((scope='user' AND target_user_id IS NOT NULL) OR (scope='all' AND target_user_id IS NULL))
+);
+
+CREATE TABLE IF NOT EXISTS casino_chip_refund_saga_targets (
+  saga_id      TEXT NOT NULL REFERENCES casino_chip_refund_sagas(id),
+  user_id      TEXT NOT NULL,
+  amount       INTEGER NOT NULL CHECK(amount > 0),
+  status       TEXT NOT NULL CHECK(status IN ('pending','completed','failed','blocked')),
+  group_key    TEXT NOT NULL UNIQUE,
+  result_json  TEXT,
+  failure      TEXT,
+  completed_at INTEGER,
+  PRIMARY KEY(saga_id,user_id)
+);
+
+CREATE TABLE IF NOT EXISTS shop_purchase_operations (
+  operation_id TEXT PRIMARY KEY,
+  user_id      TEXT NOT NULL,
+  item_id      INTEGER NOT NULL,
+  mode         TEXT NOT NULL CHECK(mode IN ('land','alt')),
+  purchase_id  INTEGER,
+  status       TEXT NOT NULL CHECK(status IN ('executing','completed')),
+  created_at   INTEGER NOT NULL,
+  completed_at INTEGER
+);
+
 -- 賭場チップの取引監査（大型UPD PR1）。チップ残高は現在値しか持たないので、
 -- 「業務操作の単位(group)」と「その中の1移動(tx)」を追記し、開始残高から再現できるようにする。
 CREATE TABLE IF NOT EXISTS casino_tx_groups (
@@ -654,6 +716,7 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "recruits", "updated_at", "INTEGER");
   ensureColumn(db, "shop_purchases", "delivery_snapshot_json", "TEXT");
   ensureColumn(db, "scheduler_chunk_batches", "sent_at", "INTEGER");
+  ensureColumn(db, "casino_chip_external_confirmations", "chip_amount", "INTEGER NOT NULL DEFAULT 0 CHECK (chip_amount >= 0)");
   assertNoDuplicateOpenRoomOwnership(db);
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_owner_normal_open
