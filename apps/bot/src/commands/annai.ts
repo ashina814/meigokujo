@@ -40,7 +40,9 @@ function renderHome(userId: string, services: Services, serverName?: string) {
   const stats = services.casino.stats(userId);
   const ether = services.chips;
   const daily = services.daily;
-  const heldEther = ether.balanceOf(userId);
+  // PR9: 自由チップ（いま使える分）と拘束チップ（卓・板に預け中の分）を分離する。
+  const assets = services.chipAssets.forUser(userId);
+  const heldEther = assets.freeChips;
   const heldLand = services.ledger.balanceOf(`user:${userId}`);
   const jp = services.casino.jackpotPool();
   const houseBal = services.casino.houseBalance();
@@ -71,8 +73,9 @@ function renderHome(userId: string, services: Services, serverName?: string) {
   const netLifetime = stats.total_earned - stats.total_lost;
 
   const walletValue = [
-    `**${fmtEther(heldEther)}** (エテル)`,
+    `**${fmtEther(heldEther)}** (自由チップ)`,
     `${fmtLd(heldLand)}`,
+    assets.escrowed > 0 ? `卓・板に預け中 **${fmtEther(assets.escrowed)}**` : "",
     isVip ? `${E.jp} **VIP** 残り${vipDaysLeft}日` : "",
   ]
     .filter(Boolean)

@@ -183,6 +183,11 @@ export {
   type OpeningPhase,
 } from "./casino/chip-tx.js";
 export {
+  CasinoChipAssets,
+  type UserChipAssets,
+  type EscrowAssetMismatch,
+} from "./casino/chip-assets.js";
+export {
   Casino,
   JACKPOT_HOLDER,
   RELIEF_HOLDER,
