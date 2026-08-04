@@ -15,6 +15,7 @@ import {
 import { fmtEther, fmtLd } from "../format.js";
 import { C_MAMMON, C_JACKPOT, E, HR_THIN, fmtSignedEther } from "../casino/ui.js";
 import { openingNotice, openingPhase } from "../casino/opening.js";
+import { isSeatOccupied } from "../casino/common.js";
 import type { Services } from "../services.js";
 
 /**
@@ -38,6 +39,22 @@ export async function handleAnnaiCommand(
 export async function handleAnnaiButton(interaction: import("discord.js").ButtonInteraction, services: Services): Promise<void> {
   if (interaction.customId === "annai:refresh") {
     await interaction.update(renderHome(interaction.user.id, services, interaction.guild?.name));
+    return;
+  }
+  if (interaction.customId === "casino:leave") {
+    if (isSeatOccupied(interaction.user.id)) {
+      await interaction.reply({ content: "進行中の勝負が終わってから賭場を出てください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    try {
+      const result = services.chipFlow.leaveCasino(interaction.user.id, `leave:${interaction.id}`);
+      await interaction.update({
+        ...renderHome(interaction.user.id, services, interaction.guild?.name),
+        content: result.redeemed > 0 ? `${fmtLd(result.land)} をLandへ返還しました。` : "返還できる自由チップはありません。",
+      });
+    } catch {
+      await interaction.reply({ content: "チップ帳簿または進行状態を確認できないため返還できません。", flags: MessageFlags.Ephemeral });
+    }
   }
 }
 
@@ -236,6 +253,7 @@ function renderHome(userId: string, services: Services, serverName?: string) {
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("annai:refresh").setLabel("更新").setEmoji("🔁").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("casino:leave").setLabel("賭場を出る").setEmoji("🚪").setStyle(ButtonStyle.Secondary),
   );
 
   return { embeds: [embed], components: [row] };

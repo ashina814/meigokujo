@@ -188,6 +188,17 @@ export {
   type EscrowAssetMismatch,
 } from "./casino/chip-assets.js";
 export {
+  CasinoChipFlow,
+  type AutoDepositResult,
+  type RedeemResult,
+  type InactiveRedeemResult,
+  type ExternalChipConfirmation,
+  type RefundSaga,
+  type RefundSagaTarget,
+  type RefundSagaStatus,
+  type RefundSafetyGate,
+} from "./casino/chip-flow.js";
+export {
   Casino,
   JACKPOT_HOLDER,
   RELIEF_HOLDER,

@@ -12,6 +12,7 @@ import { tickVoiceXp } from "./rank-tracker.js";
 import { fmtLd } from "./format.js";
 import { announceAutoClose, announceSettle, refreshMarketPanel } from "./commands/ita.js";
 import { ticketStaffRoleIds } from "./commands/tickets.js";
+import { isSeatOccupied } from "./casino/common.js";
 import type { Services } from "./services.js";
 import {
   cleanupCompletedChunkBatches,
@@ -96,6 +97,24 @@ export function nextSessionStart(services: Pick<Services, "sessions">, from = ne
 export function startScheduler(client: Client, services: Services, intervalMs = 60_000): NodeJS.Timeout {
   async function tick(): Promise<void> {
     const now = jstNow();
+
+    // PR10: every minute, return only verified-user free chips idle for ten minutes.
+    // redeemInactive rechecks activity immediately before each redemption and isolates failures.
+    const idleCutoff = Math.floor(Date.now() / 1000) - 10 * 60;
+    const idle = services.chipFlow.redeemInactive(
+      idleCutoff,
+      `scheduler:${idleCutoff}`,
+      {
+        activeGameUsers: (userIds) => userIds.filter(isSeatOccupied),
+        integrityBlocked: () => services.casinoStatus.current().status === "integrity_halt",
+      },
+    );
+    if (idle.failed.length > 0 || idle.skipped.length > 0) {
+      services.events.log("casino_idle_redeem_scan", {
+        actor: "system:scheduler",
+        payload: { cutoff: idleCutoff, failed: idle.failed, skipped: idle.skipped },
+      });
+    }
 
     // ── 説明会の案内: 実際の開催予定の 5分前に入城案内chへ通知 ──
     // 通常枠は settings、休止・臨時追加は entry_session_overrides。合成は SessionCalendar が持ち、

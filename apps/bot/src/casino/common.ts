@@ -76,6 +76,10 @@ export function acquireSeat(userId: string): boolean {
 export function releaseSeat(userId: string): void {
   playing.delete(userId);
 }
+/** PR10 refund/confirmation safety gate for process-local solo games. */
+export function isSeatOccupied(userId: string): boolean {
+  return playing.has(userId);
+}
 
 export interface BetCheck {
   ok: boolean;
@@ -123,14 +127,6 @@ export async function validateBet(
     });
     return { ok: false, bet };
   }
-  const held = services.chips.balanceOf(uid);
-  if (held < bet) {
-    await respond({
-      content: `${Mammon.broke()}（所持 ${fmtEther(held)}）\n→ 両替所パネルで Land をエテルに替えてこい。`,
-      flags: MessageFlags.Ephemeral,
-    });
-    return { ok: false, bet };
-  }
   // `game` は必須引数。モデルが無ければ設定チェックだけ済ませて先へ通すのではなく、
   // 呼び出し側のバグとして即座に落とす（マージ直前レビュー対応）
   const model = liabilityModelFor(game);
@@ -142,6 +138,28 @@ export async function validateBet(
     // 提示額は同じモデルの逆算なので、その額なら予約が取れる
     await respond({
       ...capacityRecoveryPayload(services, effectiveMaxBet(services, uid, game), game),
+      flags: MessageFlags.Ephemeral,
+    });
+    return { ok: false, bet };
+  }
+
+  // PR10: only now, immediately before the caller reserves/holds the bet, deposit the exact
+  // shortage. Capacity rejection above never moves the user's Land.
+  try {
+    const funded = services.chipFlow.ensureFreeChips(uid, bet, interaction.id);
+    if (funded.freeAfter < bet) throw new Error("automatic deposit did not cover the bet");
+  } catch (error) {
+    let held: number | null = null;
+    try {
+      held = services.chipAssets.freeChips(uid);
+    } catch {
+      // Keep corruption fail-closed and do not present it as zero.
+    }
+    await respond({
+      content:
+        held === null
+          ? "⚠️ チップ帳簿またはLand口座を確認できないため、賭けを開始できません。"
+          : `${Mammon.broke()}（自由チップ ${fmtEther(held)} / 必要 ${fmtEther(bet)}）`,
       flags: MessageFlags.Ephemeral,
     });
     return { ok: false, bet };
@@ -446,9 +464,14 @@ export function checkRetry(services: Services, userId: string, betRaw: number, g
         : `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
     };
   }
-  const held = services.chips.balanceOf(userId);
-  if (held < bet) {
-    return { ok: false, reason: `${Mammon.broke()}（所持 ${fmtEther(held)} / 必要 ${fmtEther(bet)}）` };
+  try {
+    const free = services.chipAssets.freeChips(userId);
+    const land = services.ledger.balanceOf(`user:${userId}`);
+    if (free + land < bet) {
+      return { ok: false, reason: `${Mammon.broke()}（所持: 自由チップ ${fmtEther(free)} / Land ${land.toLocaleString()} / 必要 ${fmtEther(bet)}）` };
+    }
+  } catch {
+    return { ok: false, reason: "チップ帳簿またはLand口座を確認できません。" };
   }
   return { ok: true, bet };
 }

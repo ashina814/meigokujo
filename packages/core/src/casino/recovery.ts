@@ -5,6 +5,7 @@ import type { CasinoStatus } from "./status.js";
 import type { ChipTx } from "./chip-tx.js";
 import type { Escrow } from "./escrow.js";
 import type { HouseReservations } from "./reservations.js";
+import type { CasinoChipFlow, InactiveRedeemResult } from "./chip-flow.js";
 
 /**
  * 登録型の復旧レジストリ（大型UPD PR7・正本 §8.1）。
@@ -90,6 +91,8 @@ export interface RecoverCasinoDeps {
   reservations: HouseReservations;
   registry: RecoveryRegistry;
   events: EventLog;
+  /** PR10 S10. Required so startup can never silently skip free-chip redemption. */
+  chipFlow: CasinoChipFlow;
 }
 
 export interface RecoverCasinoResult {
@@ -113,7 +116,7 @@ export interface RecoverCasinoResult {
    * - `held`: 人が止めている状態なので触っていない
    * - `manual`: `integrity_halt` のまま。運営の再点検待ち
    */
-  outcome: "opened" | "halted" | "source_failed" | "refund_failed" | "exception_failed" | "held" | "manual";
+  outcome: "opened" | "halted" | "source_failed" | "refund_failed" | "chip_redeem_failed" | "exception_failed" | "held" | "manual";
   /** 実行したステップ（診断用） */
   steps: string[];
   keptHolders: number;
@@ -131,6 +134,8 @@ export interface RecoverCasinoResult {
   failedSessions: Array<{ sessionId: string; expected: number; actual: number; error: string }>;
   /** ソロ予約の解放結果。`released: false` なら**解放を実行していない** */
   releasedReservations: { released: boolean; count: number; total: number };
+  /** PR10 S10 partial result. Only verified Land-user free-chip holders are candidates. */
+  redeemedFreeChips: InactiveRedeemResult;
   reason?: string;
 }
 
@@ -157,7 +162,7 @@ export interface RecoverCasinoResult {
  * 「所有元が確実に存在しない」と証明できた場合だけ。
  */
 export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
-  const { status, integrity, chipTx, escrow, reservations, registry, events } = deps;
+  const { status, integrity, chipTx, escrow, reservations, registry, events, chipFlow } = deps;
   const steps: string[] = [];
   const empty: Omit<RecoverCasinoResult, "outcome" | "steps" | "reason"> = {
     keptHolders: 0,
@@ -168,6 +173,7 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     failedSessions: [],
     // 予約解放は S9。ここへ到達していない時点では **実行していない**
     releasedReservations: { released: false, count: 0, total: 0 },
+    redeemedFreeChips: { redeemed: [], skipped: [], failed: [] },
   };
 
   const held = status.current();
@@ -264,6 +270,14 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
       const releasedReservations = reservations.releaseAll("起動時の復旧");
       steps.push("S9:予約解放");
 
+      // S10: S4-S9 after ownership recovery, before postflight. The flow joins Land user
+      // accounts and never targets escrow/system/orphan holders.
+      const redeemedFreeChips =
+        chipTx.openingPhase() === "formal"
+          ? chipFlow.redeemAllFreeChips("startup")
+          : { redeemed: [], skipped: ["opening_not_formal"], failed: [] };
+      steps.push("S10:自由チップ返還");
+
       return {
         keptHolders: swept.kept,
         refundedSessions: swept.refundedSessions,
@@ -272,6 +286,7 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
         mismatched: swept.mismatched,
         failedSessions: swept.failed,
         releasedReservations: { released: true, ...releasedReservations },
+        redeemedFreeChips,
         skipped: false as const,
         reason: undefined as string | undefined,
       };
@@ -285,6 +300,7 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
       mismatched: result.mismatched,
       failedSessions: result.failedSessions,
       releasedReservations: result.releasedReservations,
+      redeemedFreeChips: result.redeemedFreeChips,
     };
 
     // **所有元の申告が取れなかったら営業を再開しない**（PR7 レビュー指摘）。
@@ -311,6 +327,7 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     // postflight がたまたま通ってしまうことがあるが、それでも復旧未完了として扱う必要がある。
     // 優先順位: failedSessions（孤児返金の技術失敗） > mismatched（帳簿不一致）
     //           > postflight自体のNG（上記以外） > 正常終了
+    steps.push("S12:後検");
     const post = integrity.runFull();
     const postReason = post.ok ? undefined : describeFailure(post);
     if (!post.ok) {
@@ -325,6 +342,18 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
     // たまたま通り得るが、復旧そのものは完了していない。recoveringFromHalt に関わらず必ず
     // recovery_halt にして、「復旧を再実行」からの再試行を求める（このセッションだけが
     // 次回また対象になる）。
+    if (result.redeemedFreeChips.failed.length > 0) {
+      const reason =
+        `S10自由チップ返還失敗 ${result.redeemedFreeChips.failed.length}件（成功済みは再実行で二重返還しない）: ` +
+        result.redeemedFreeChips.failed.map((failure) => `${failure.userId}(${failure.amount}): ${failure.error}`).join(", ");
+      events.log("casino_recovery_halted", {
+        actor: "system:recovery",
+        payload: { steps, reason, redeemedFreeChips: result.redeemedFreeChips, postflightOk: post.ok },
+      });
+      status.haltForRecovery(recoveringFromHalt ? appendReason(held.reason, reason) : reason);
+      return { outcome: "chip_redeem_failed", steps, ...summary, reason };
+    }
+
     if (result.failedSessions.length > 0) {
       const refundReason =
         `孤児返金の技術失敗 ${result.failedSessions.length}件（帳簿・残高は維持・要調査）: ` +
@@ -387,7 +416,11 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
       payload: { steps, error: message },
     });
     status.haltForRecovery(recoveringFromHalt ? appendReason(held.reason, reason) : reason);
-    const summary = { ...sweptSoFar, releasedReservations: { released: false, count: 0, total: 0 } };
+    const summary = {
+      ...sweptSoFar,
+      releasedReservations: { released: false, count: 0, total: 0 },
+      redeemedFreeChips: { redeemed: [], skipped: [], failed: [] },
+    };
     return { outcome: "exception_failed", steps, ...summary, reason };
   }
 }
