@@ -168,7 +168,7 @@ export function buildServices() {
   const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
   const chipAssets = new CasinoChipAssets(db, chips);
   const takutate = new Takutate(db, events);
-  const casinoIntegrity = new CasinoIntegrity(db, ledger, chips, escrow);
+  const casinoIntegrity = new CasinoIntegrity(db, ledger, chips, escrow, chipAssets);
   // 起動時: 全点検 → 通ったときだけ掃除 → 掃除後にもう一度全点検 → 開ける
   // 起動・復旧（正本 §8.2 S1〜S9, S12）。**所有元が「生きている預託」を自分で申告する**。
   // 板だけを登録し、競馬は登録しない（永続テーブルが無く、再起動でレースごと消えるので
