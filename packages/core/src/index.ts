@@ -271,7 +271,9 @@ export {
   tableColumns,
   schemaFingerprint,
   tableToCsv,
+  playerLandFingerprint,
   type TableContentFingerprint,
+  type PlayerLandFingerprint,
 } from "./casino/opening-canonical.js";
 export {
   CASINO_TABLE_CLASSIFICATION,
@@ -291,7 +293,6 @@ export {
   type BlockerCategory,
   type ProtectedAssetFinding,
   type TableAudit,
-  type PlayerLandFingerprint,
   type LegacyLedgerAudit,
 } from "./casino/opening-plan.js";
 export {

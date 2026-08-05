@@ -403,3 +403,75 @@ describe("OpeningReset.apply — 永続証拠の不在をrankだけで見逃さ�
     await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(/不変条件違反/);
   });
 });
+
+describe("OpeningReset.apply — 利用者Landの口座別postflight検証(監査ブロッカー4)", () => {
+  it("apply transaction中に利用者Land口座間で付け替え(総額・口座数は不変)が起きた場合、accountId別SHA不一致で検出しR6〜R10をまるごとrollbackする", async () => {
+    const ctx = setup();
+    seedLegacy(ctx, { houseChips: 30_000, deptSeed: 100_000 });
+    configureAndOpenReset(ctx);
+
+    ctx.ledger.ensureAccount("user:alice", "user");
+    ctx.ledger.ensureAccount("user:bob", "user");
+    ctx.ledger.transfer({
+      from: TREASURY,
+      to: "user:alice",
+      amount: 1_000,
+      type: "adjust",
+      actor: "t",
+      approvedBy: "t",
+      idempotencyKey: "seed:alice",
+    });
+
+    const before = {
+      alice: ctx.ledger.balanceOf("user:alice"),
+      bob: ctx.ledger.balanceOf("user:bob"),
+      etherEscrow: ctx.ledger.balanceOf(ETHER_ESCROW),
+      dept: ctx.ledger.balanceOf(CASINO_DEPARTMENT_ACCOUNT),
+      chipEscrow: ctx.ledger.balanceOf(CHIP_ESCROW),
+      casinoTx: (ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_tx").get() as { n: number }).n,
+      etherBalances: (ctx.db.prepare("SELECT COUNT(*) AS n FROM ether_balances").get() as { n: number }).n,
+    };
+
+    // apply()の破壊的transaction内、R10(opening_v1確立=casino_chip_opening_versions INSERT)の
+    // 直後にだけ発火する敵対的トリガー。利用者Landの「口座数」と「総額」を保ったまま、
+    // aliceからbobへ1,000を付け替える(単純な口座数・合計額比較では検出できない改竄)。
+    // 台帳の複式簿記(transactions/balances)を正しく整合させて動かすため、V2(ledger整合性)には
+    // 引っかからず、監査ブロッカー4で追加したaccountId別SHA検証だけが検出できることを確認する。
+    ctx.db.exec(`
+      CREATE TEMP TRIGGER sneaky_land_swap
+      AFTER INSERT ON casino_chip_opening_versions
+      WHEN NEW.opening_version = '${FORMAL_OPENING_VERSION}'
+      BEGIN
+        INSERT INTO transactions (idempotency_key, from_account, to_account, amount, type, actor_id, created_at)
+          VALUES ('sneaky-mid-apply-swap', 'user:alice', 'user:bob', 1000, 'adjust', 'sneaky-test', 0);
+        UPDATE balances SET amount = amount - 1000, updated_at = 0 WHERE account_id = 'user:alice';
+        INSERT INTO balances (account_id, amount, updated_at) VALUES ('user:bob', 1000, 0)
+          ON CONFLICT(account_id) DO UPDATE SET amount = balances.amount + 1000, updated_at = 0;
+      END;
+    `);
+
+    const { backup, external } = adapters();
+    await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(/player_land_unchanged/);
+
+    // R6〜R10がまるごとrollbackされ、資金・opening版・執行状態のいずれも変化していない
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(before.alice);
+    expect(ctx.ledger.balanceOf("user:bob")).toBe(before.bob);
+    expect(ctx.ledger.balanceOf(ETHER_ESCROW)).toBe(before.etherEscrow);
+    expect(ctx.ledger.balanceOf(CASINO_DEPARTMENT_ACCOUNT)).toBe(before.dept);
+    expect(ctx.ledger.balanceOf(CHIP_ESCROW)).toBe(before.chipEscrow);
+    expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_tx").get() as { n: number }).n).toBe(before.casinoTx);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM ether_balances").get() as { n: number }).n).toBe(
+      before.etherBalances,
+    );
+    expect(ctx.status.current().status).toBe("opening_reset");
+
+    // executionはapplied化しておらず、failedへ落ちている(opening metadataも巻き戻っている)
+    const planner = new OpeningPlanner({ ...ctx, chips: ctx.ether });
+    const plan = planner.dryRun();
+    expect(plan.blockers).toEqual([]);
+    const execution = ctx.reset.executionStore.getByPlanHash(plan.planHash);
+    expect(execution?.status).toBe("failed");
+    expect(execution?.fundsApplied).toBe(false);
+  });
+});

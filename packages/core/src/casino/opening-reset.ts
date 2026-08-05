@@ -10,7 +10,7 @@ import { Departments } from "../departments/service.js";
 import type { Settings } from "../settings/service.js";
 import { OpeningPlanner, CASINO_DEPARTMENT_ACCOUNT, type OpeningPreflightResult } from "./opening-plan.js";
 import { CASINO_TABLE_CLASSIFICATION } from "./opening-tables.js";
-import { schemaFingerprint, tableExists, tableRowCount, quoteIdent } from "./opening-canonical.js";
+import { playerLandFingerprint, schemaFingerprint, tableExists, tableRowCount, quoteIdent } from "./opening-canonical.js";
 import {
   OpeningExecutionStore,
   type OpeningExecutionRow,
@@ -628,18 +628,18 @@ export class OpeningReset {
     push("no_active_escrow", activeEscrowAfter === 0, `rows=${activeEscrowAfter}`);
     const activeReservationsAfter = tableRowCount(this.deps.db, "casino_house_reservations");
     push("no_active_reservations", activeReservationsAfter === 0, `rows=${activeReservationsAfter}`);
-    const playerLandRows = this.deps.db
-      .prepare(
-        `SELECT a.id AS account_id, COALESCE(b.amount, 0) AS amount
-         FROM accounts a LEFT JOIN balances b ON b.account_id = a.id
-         WHERE a.kind = 'user' ORDER BY a.id`,
-      )
-      .all() as Array<{ account_id: string; amount: number }>;
-    const playerLandTotal = playerLandRows.reduce((s, r) => s + Number(r.amount), 0);
+    // CLAUDE.md監査ブロッカー4: 口座数・合計額の一致だけでは、総額とaccount数を保ったまま
+    // 利用者間でLandを付け替える改竄を検出できない。preflightと同じ実装(playerLandFingerprint)で
+    // accountId別のcanonical SHA-256まで再計算し、3項目すべての一致を要求する。
+    const playerLandAfter = playerLandFingerprint(this.deps.db);
     push(
       "player_land_unchanged",
-      playerLandRows.length === initialPlan.snapshot.playerLand.accounts && playerLandTotal === initialPlan.snapshot.playerLand.total,
-      `accounts=${playerLandRows.length}/${initialPlan.snapshot.playerLand.accounts} total=${playerLandTotal}/${initialPlan.snapshot.playerLand.total}`,
+      playerLandAfter.accounts === initialPlan.snapshot.playerLand.accounts &&
+        playerLandAfter.total === initialPlan.snapshot.playerLand.total &&
+        playerLandAfter.sha256 === initialPlan.snapshot.playerLand.sha256,
+      `accounts=${playerLandAfter.accounts}/${initialPlan.snapshot.playerLand.accounts} ` +
+        `total=${playerLandAfter.total}/${initialPlan.snapshot.playerLand.total} ` +
+        `sha256=${playerLandAfter.sha256 === initialPlan.snapshot.playerLand.sha256 ? "match" : "MISMATCH"}`,
     );
     const schemaAfter = schemaFingerprint(this.deps.db);
     push("schema_unchanged", schemaAfter === initialPlan.snapshot.schemaFingerprint, "schema fingerprint");

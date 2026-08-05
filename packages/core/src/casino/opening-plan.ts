@@ -21,10 +21,12 @@ import {
 } from "./opening-tables.js";
 import {
   canonicalHash,
+  playerLandFingerprint,
   schemaFingerprint,
   tableExists,
   tableFingerprint,
   tableRowCount,
+  type PlayerLandFingerprint,
   type TableContentFingerprint,
 } from "./opening-canonical.js";
 import { readCasinoOpeningConfig, type CasinoOpeningConfig } from "./opening-settings.js";
@@ -119,13 +121,6 @@ export interface TableAudit {
   exists: boolean;
   rows: number;
   fingerprint: TableContentFingerprint | null;
-}
-
-export interface PlayerLandFingerprint {
-  accounts: number;
-  total: number;
-  /** [accountId, amount] のペアをaccountId昇順ソートしたもの */
-  sha256: string;
 }
 
 export interface LegacyLedgerAudit {
@@ -390,7 +385,7 @@ export class OpeningPlanner {
       }
     }
 
-    const playerLand = this.playerLandFingerprint();
+    const playerLand = playerLandFingerprint(this.deps.db);
     const chipHolderBalances = this.chipHolderBalances();
     const schemaFp = schemaFingerprint(this.deps.db);
 
@@ -681,23 +676,6 @@ export class OpeningPlanner {
     }
 
     return findings;
-  }
-
-  private playerLandFingerprint(): PlayerLandFingerprint {
-    const rows = this.deps.db
-      .prepare(
-        `SELECT a.id AS account_id, COALESCE(b.amount, 0) AS amount
-         FROM accounts a
-         LEFT JOIN balances b ON b.account_id = a.id
-         WHERE a.kind = 'user'
-         ORDER BY a.id`,
-      )
-      .all() as Array<{ account_id: string; amount: number }>;
-    return {
-      accounts: rows.length,
-      total: rows.reduce((sum, row) => sum + Number(row.amount), 0),
-      sha256: canonicalHash(rows.map((row) => [row.account_id, Number(row.amount)])),
-    };
   }
 
   private chipHolderBalances(): Array<{ holder: string; amount: number }> {

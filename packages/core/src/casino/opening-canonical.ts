@@ -87,6 +87,35 @@ export function tableColumns(db: Database.Database, table: string): string[] {
  * スキーマ全体のフィンガープリント（sqlite_master の sql 定義そのものを正規化してhash化）。
  * テーブル追加・列追加・CHECK制約変更などを検知する。
  */
+export interface PlayerLandFingerprint {
+  accounts: number;
+  total: number;
+  /** [accountId, amount] のペアをaccountId昇順ソートしたもの */
+  sha256: string;
+}
+
+/**
+ * 利用者Landの口座別フィンガープリント。preflightとpostflightで同じ実装を使うこと
+ * （CLAUDE.md監査ブロッカー4）。口座数・合計額だけでは、総額とaccount数を保ったまま
+ * 利用者間でLandを付け替える改竄を検出できない。
+ */
+export function playerLandFingerprint(db: Database.Database): PlayerLandFingerprint {
+  const rows = db
+    .prepare(
+      `SELECT a.id AS account_id, COALESCE(b.amount, 0) AS amount
+       FROM accounts a
+       LEFT JOIN balances b ON b.account_id = a.id
+       WHERE a.kind = 'user'
+       ORDER BY a.id`,
+    )
+    .all() as Array<{ account_id: string; amount: number }>;
+  return {
+    accounts: rows.length,
+    total: rows.reduce((sum, row) => sum + Number(row.amount), 0),
+    sha256: canonicalHash(rows.map((row) => [row.account_id, Number(row.amount)])),
+  };
+}
+
 export function schemaFingerprint(db: Database.Database): string {
   const rows = db
     .prepare(
