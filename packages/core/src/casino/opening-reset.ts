@@ -384,16 +384,13 @@ export class OpeningReset {
       casinoReopened = this.deps.status.current().status === "open";
     }
 
-    // ---- notifier（失敗しても資金・statusの確定は覆さない）----
-    let notifierStatus: "sent" | "failed" | "pending" = "pending";
-    try {
-      // 本PRでは fake notifier のみ。本番監査チャンネルへは送信しない（CLAUDE.md §15）。
-      notifierStatus = "sent";
-      this.executions.recordNotifierStatus(execution.id, "sent");
-    } catch {
-      notifierStatus = "failed";
-      this.executions.recordNotifierStatus(execution.id, "failed");
-    }
+    // ---- notifier（CLAUDE.md監査ブロッカー6: 本PRでは配線しない）----
+    // 実際には何も送信していないのに notifier_status='sent' を監査記録へ残すことは禁止されている
+    // （未送信を「送った」ことにする虚偽記録になる）。本番Discord・監査チャンネルへの接続は
+    // 本PRの範囲外であり、通知配線は別の明示的GOの後で行う。ここに来た時点で資金は既にCOMMIT
+    // 済みなので、notifier未配線を失敗として扱ったり資金をrollbackしたりはしない。
+    const notifierStatus: "sent" | "failed" | "pending" = "pending";
+    this.executions.recordNotifierStatus(execution.id, "pending");
 
     const finalExecution = this.executions.get(execution.id)!;
     return {

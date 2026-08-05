@@ -176,6 +176,14 @@ describe("OpeningReset.apply — 正常系", () => {
     // legacy_pre_resetのopening metadataは保存されたまま(削除しない)
     const versions = ctx.chipTx.listOpeningVersions();
     expect(versions.map((v) => v.version)).toEqual([LEGACY_OPENING_VERSION, FORMAL_OPENING_VERSION]);
+
+    // notifierは本PRでは配線しない(監査ブロッカー6)。何も送信していないのに'sent'を
+    // 名乗ってはいけない。資金apply自体はnotifierと無関係に成功している。
+    expect(result.notifierStatus).toBe("pending");
+    const notifierRow = ctx.db.prepare("SELECT notifier_status FROM casino_opening_executions WHERE id = ?").get(
+      result.executionId,
+    ) as { notifier_status: string | null };
+    expect(notifierRow.notifier_status).toBe("pending");
   });
 
   it("旧準備口座が0ならR7をスキップする(oldSettlementLandTxIdはnull)", async () => {
@@ -215,6 +223,41 @@ describe("OpeningReset.apply — 正常系", () => {
     const newRow = ctx.db.prepare("SELECT id FROM casino_tx ORDER BY id DESC LIMIT 1").get() as { id: number };
     expect(newRow.id).toBeLessThan(lastLegacyTxId);
     expect(newRow.id).toBe(1);
+  });
+});
+
+describe("OpeningReset.apply — 未送信notifierをsent扱いしない(監査ブロッカー6)", () => {
+  it("本PRはnotifier配線を持たない: 何度applyしてもnotifier_status='sent'は一度も書かれない", async () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    const { backup, external } = adapters();
+
+    const result = await ctx.reset.apply({ actorId: "admin", backup, external });
+
+    expect(result.status).toBe("completed");
+    expect(result.fundsApplied).toBe(true);
+    // 資金apply自体はnotifierと無関係に確定している(notifier未配線を理由にrollbackしない)
+    expect(ctx.ether.balanceOf(HOUSE_HOLDER)).toBe(VALID_CONFIG.openingHouse);
+    expect(result.notifierStatus).toBe("pending");
+
+    // DB全体を見ても、この開業initializationのexecution行にnotifier_status='sent'は
+    // 一度も書き込まれていない(未送信を「送った」ことにする虚偽記録が無いことの確認)
+    const sentCount = (
+      ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_opening_executions WHERE notifier_status = 'sent'").get() as {
+        n: number;
+      }
+    ).n;
+    expect(sentCount).toBe(0);
+
+    // completed後に同じplanへ再度applyすると、そもそも二重開業防止のpreflight blockerで
+    // 即座に拒否される(already_opening_v1)。notifierだけを再送させる専用経路は本PRでは
+    // 存在しない(本PRの範囲: notifier配線自体を持たないため、再送経路も配線しない)。
+    await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(OpeningApplyBlockedError);
+    const executionRow = ctx.db
+      .prepare("SELECT notifier_status FROM casino_opening_executions WHERE id = ?")
+      .get(result.executionId) as { notifier_status: string | null };
+    expect(executionRow.notifier_status).toBe("pending");
   });
 });
 
