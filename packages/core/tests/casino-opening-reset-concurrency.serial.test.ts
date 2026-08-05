@@ -28,6 +28,9 @@ registerDefaultTxTypes();
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNNER = join(HERE, "helpers", "opening-apply-runner.ts");
 
+/** 全worker・単独リトライが共有する、唯一の認可済みactor identity（監査ブロッカー3） */
+const AUTHORIZED_ACTOR_ID = "authorized-admin";
+
 const VALID_CONFIG = {
   openingCapital: 50_000,
   openingHouse: 40_000,
@@ -85,7 +88,11 @@ function runProcesses(dbPath: string, count: number): Promise<RunnerResult[]> {
   return Promise.all(
     Array.from({ length: count }, (_, i) =>
       new Promise<RunnerResult>((resolve, reject) => {
-        const input = JSON.stringify({ dbPath, actorId: `worker-${i}`, startAt });
+        // 監査ブロッカー3: 暗黙の別actor引き継ぎは禁止。同一の認可済みactor identityを
+        // 全workerが使う(現実の運用でも、1つの正式開業initializationは1人の運営者の
+        // 操作として認可されるべきで、プロセスが分かれているだけで別人が引き継ぐわけではない)。
+        void i;
+        const input = JSON.stringify({ dbPath, actorId: AUTHORIZED_ACTOR_ID, startAt });
         const child = spawn(process.execPath, ["--import", "tsx", RUNNER, input], {
           stdio: ["ignore", "pipe", "pipe"],
         });
@@ -164,7 +171,8 @@ describe("OpeningReset.apply — 実プロセス競合(別プロセス・同一�
         integrity: retryIntegrity, status: retryStatus, settings: retrySettings, departments: retryDepartments,
       });
       const retryResult = await retryReset.apply({
-        actorId: "retry-admin",
+        // リトライも同じ認可済みactorで行う(別actorへの暗黙引き継ぎをここでも作らない)
+        actorId: AUTHORIZED_ACTOR_ID,
         backup: new FakeOpeningBackupAdapter(),
         external: new FakeOpeningExternalAdapter(),
       });

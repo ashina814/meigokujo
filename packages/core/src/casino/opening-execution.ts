@@ -234,6 +234,13 @@ export class OpeningExecutionStore {
         insert();
         return { acquired: true, execution: this.getOrThrow(id) };
       }
+      // 取り違え検出（CLAUDE.md監査ブロッカー3）: 暗黙のactor引き継ぎを許さない。
+      // 同じplanHash・同じconfigurationでも、actorが違えば資金・状態・backup・外部工程の
+      // いずれも一切変更せず、ここで即座に拒否する。configuration不一致より先に見る
+      // （actorが違う時点で「そもそも同じ運営者の続きなのか」が確定できないため）。
+      if (existing.actor_id !== actorId) {
+        throw new OpeningExecutionConflictError("actor_mismatch", id);
+      }
       if (existing.configuration_hash !== configurationHash) {
         throw new OpeningExecutionConflictError("configuration_mismatch", id);
       }
@@ -244,8 +251,12 @@ export class OpeningExecutionStore {
     } catch (e) {
       // 真の同時実行: 2接続がどちらも「無い」を見てINSERTへ進んだ場合、片方がUNIQUE制約で落ちる。
       // 負けた側は素直に既存行を読みに行く（資金は動かしていないので安全に再読込できる）。
+      // ここでも同じactor/configuration検査を行う（再読込経路だけ検査を素通りさせない）。
       if (isUniqueViolation(e)) {
         const existing = this.getOrThrow(id);
+        if (existing.actorId !== actorId) {
+          throw new OpeningExecutionConflictError("actor_mismatch", id);
+        }
         if (existing.configurationHash !== configurationHash) {
           throw new OpeningExecutionConflictError("configuration_mismatch", id);
         }

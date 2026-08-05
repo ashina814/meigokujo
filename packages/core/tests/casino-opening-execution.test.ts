@@ -58,6 +58,39 @@ describe("OpeningExecutionStore.acquire", () => {
     );
   });
 
+  it("同じplanHash・同じconfigurationでもactorが違えばactor_mismatchでOpeningExecutionConflictError(監査ブロッカー3)", () => {
+    const { store } = setup();
+    const first = store.acquire("hash1", "admin-a", CONFIG);
+    let error: unknown;
+    try {
+      store.acquire("hash1", "admin-b", CONFIG);
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toBeInstanceOf(OpeningExecutionConflictError);
+    expect((error as InstanceType<typeof OpeningExecutionConflictError>).reason).toBe("actor_mismatch");
+    // 資金・状態は一切変更されていない(暗黙のactor引き継ぎをしない)
+    const after = store.get(first.execution.id);
+    expect(after?.actorId).toBe("admin-a");
+    expect(after?.status).toBe("planned");
+  });
+
+  it("UNIQUE制約競合後の再読込経路でも同じactor検査を行う(別接続・同一ファイルDBでの真の同時実行)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pr12-exec-actor-race-"));
+    tmpDirs.push(dir);
+    const dbPath = join(dir, "race.sqlite");
+    const db1 = openDb(dbPath);
+    const store1 = new OpeningExecutionStore(db1);
+    const db2 = openDb(dbPath);
+    const store2 = new OpeningExecutionStore(db2);
+
+    store1.acquire("race-actor-hash", "admin-a", CONFIG);
+    expect(() => store2.acquire("race-actor-hash", "admin-b", CONFIG)).toThrow(OpeningExecutionConflictError);
+
+    db1.close();
+    db2.close();
+  });
+
   it("異なるplanHashは独立したexecutionを作る", () => {
     const { store } = setup();
     const a = store.acquire("hash-a", "admin", CONFIG);
