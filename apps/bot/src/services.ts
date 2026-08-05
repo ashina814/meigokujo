@@ -39,6 +39,7 @@ import {
   Stocks,
   Vip,
   Markets,
+  MARKET_FINALIZER,
   Takutate,
   Escrow,
   CasinoChipAssets,
@@ -166,7 +167,25 @@ export function buildServices() {
   const recordPlayerNet = (userId: string, net: number) => {
     if (isPlayerHolder(userId)) casino.recordGameNet(userId, net);
   };
-  const markets = new Markets(db, chips, events, { onPlayerNet: recordPlayerNet });
+  // イベントLand板（緊急イベント用 hotfix・PR12とは独立）は生の Ledger（landLedger）を直接使う。
+  // 通常板の資金経路（ChipLedger 経由の `ether`）とは完全に分離したまま渡す。
+  const markets = new Markets(db, chips, events, { onPlayerNet: recordPlayerNet, landLedger: ledger });
+  // 起動時: イベントLand板の未精算（open/closed）分を全額Land返金して void 化する。
+  // recoverCasino()（chip 経済専用）とは独立の掃除経路。Land はカジノチップ経済と別レイヤーで、
+  // liveEscrowHolders() の孤児検出（chip 側）にも含めていないため、ここで明示的に呼ぶ必要がある。
+  {
+    const eventCleanup = markets.refundAllPendingEventLand(MARKET_FINALIZER);
+    if (eventCleanup.total > 0) {
+      console.log(
+        `[event-market] 起動時イベント板の未精算掃除: 対象${eventCleanup.total}件 返金${eventCleanup.refunded}件 凍結${eventCleanup.frozen}件`,
+      );
+    }
+    if (eventCleanup.failed.length > 0) {
+      console.error(
+        `[event-market] 起動時イベント板の返金に失敗: ` + eventCleanup.failed.map((f) => `#${f.id}: ${f.error}`).join(" / "),
+      );
+    }
+  }
   const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
   const chipAssets = new CasinoChipAssets(db, chips);
   // 所有判定の正本をここで一本化する。プロセス内の着席は DB のどの表にも

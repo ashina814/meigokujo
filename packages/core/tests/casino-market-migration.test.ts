@@ -126,3 +126,103 @@ describe("casino_markets status CHECK 制約撤去マイグレーション", () 
     expect(markets.get(m.id)!.status).toBe("frozen"); // CHECK 撤去済みなので永続する
   });
 });
+
+/**
+ * イベントLand板（緊急イベント用 hotfix・PR12とは独立）が追加した DB マイグレーションの回帰テスト。
+ *
+ * `market_mode` / `allowed_role_ids_json` / `approval_mode` / `currency_mode` の4列は
+ * 既存行に対して必ず 'standard' / '[]' / 'participant' / 'chip' で扱われる（＝通常板データを
+ * 一切変更しない）ことを確認する。`makeLegacyMarketsTable()` は上のテストと同じ最古スキーマ
+ * （fund_mode すら無い・CHECK制約あり）を再現するので、CHECK撤去マイグレーションとイベント板列の
+ * 追加が同じコンストラクタ呼び出しの中で両方安全に走ることも同時に確認できる。
+ */
+describe("イベントLand板の列追加マイグレーション（既存行は standard/chip/participant/[] 固定）", () => {
+  it("最古スキーマ（fund_modeも無い）からでも market_mode 等が既定値で追加される", () => {
+    const db = openDb(":memory:");
+    makeLegacyMarketsTable(db);
+    const ledger = new Ledger(db);
+    const ether = new ChipLedger(db, ledger, new EventLog(db));
+    openFormally(ether.chipTx, ledger);
+    const markets = new Markets(db, ether, new EventLog(db));
+    void markets;
+
+    const cols = (db.prepare("PRAGMA table_info(casino_markets)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(cols).toEqual(
+      expect.arrayContaining(["market_mode", "allowed_role_ids_json", "approval_mode", "currency_mode", "fund_mode"]),
+    );
+
+    const rows = db
+      .prepare("SELECT id, market_mode, allowed_role_ids_json, approval_mode, currency_mode, fund_mode FROM casino_markets ORDER BY id")
+      .all() as Array<{
+      id: number;
+      market_mode: string;
+      allowed_role_ids_json: string;
+      approval_mode: string;
+      currency_mode: string;
+      fund_mode: string;
+    }>;
+    expect(rows).toHaveLength(2);
+    for (const r of rows) {
+      expect(r.market_mode).toBe("standard");
+      expect(r.allowed_role_ids_json).toBe("[]");
+      expect(r.approval_mode).toBe("participant");
+      expect(r.currency_mode).toBe("chip");
+      expect(r.fund_mode).toBe("legacy_house");
+    }
+    // 子テーブルの参照は有効なまま（CHECK撤去の再構築と同時に列が消えていない証拠）
+    expect((db.prepare("SELECT COUNT(*) AS c FROM casino_market_bets WHERE market_id=1").get() as { c: number }).c).toBe(1);
+  });
+
+  it("すでに fund_mode 等を持つ新しめのDB（CHECK制約なし）に対しても冪等に4列を追加する", () => {
+    const db = openDb(":memory:");
+    // fund_mode まで持つが market_mode 等はまだ無い中間状態を再現（CHECK制約なし = 新スキーマ相当）
+    db.exec(`
+      CREATE TABLE casino_markets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, creator_id TEXT NOT NULL,
+        title TEXT NOT NULL, options_json TEXT NOT NULL, deadline_at INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open', result_option INTEGER, channel_id TEXT, message_id TEXT,
+        thread_id TEXT, payout_mode TEXT NOT NULL DEFAULT 'parimutuel', fee INTEGER NOT NULL DEFAULT 0,
+        reported_at INTEGER, settled_at INTEGER, fund_mode TEXT NOT NULL DEFAULT 'legacy_house',
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE casino_market_bets (
+        market_id INTEGER NOT NULL REFERENCES casino_markets(id), user_id TEXT NOT NULL,
+        option_index INTEGER NOT NULL, amount INTEGER NOT NULL CHECK(amount > 0), created_at INTEGER NOT NULL
+      );
+      CREATE TABLE casino_market_approvals (
+        market_id INTEGER NOT NULL REFERENCES casino_markets(id), user_id TEXT NOT NULL,
+        vote TEXT NOT NULL CHECK(vote IN ('approve','dispute')), created_at INTEGER NOT NULL,
+        PRIMARY KEY (market_id, user_id)
+      );
+      INSERT INTO casino_markets (id, guild_id, creator_id, title, options_json, deadline_at, status, fund_mode, created_at)
+      VALUES (1,'g','u','T1','["A","B"]',100,'open','escrow',10);
+    `);
+    const ledger = new Ledger(db);
+    const ether = new ChipLedger(db, ledger, new EventLog(db));
+    openFormally(ether.chipTx, ledger);
+    new Markets(db, ether, new EventLog(db)); // 1回目
+    const row1 = db.prepare("SELECT market_mode, fund_mode FROM casino_markets WHERE id=1").get() as {
+      market_mode: string;
+      fund_mode: string;
+    };
+    expect(row1.market_mode).toBe("standard");
+    expect(row1.fund_mode).toBe("escrow"); // 既存の fund_mode は変更しない
+
+    // 冪等性: 2回目の構築でスキーマが変わらない
+    const sql1 = (db.prepare("SELECT sql FROM sqlite_master WHERE name='casino_markets'").get() as { sql: string }).sql;
+    new Markets(db, ether, new EventLog(db));
+    const sql2 = (db.prepare("SELECT sql FROM sqlite_master WHERE name='casino_markets'").get() as { sql: string }).sql;
+    expect(sql1).toBe(sql2);
+  });
+
+  it("event_market_ops テーブルが冪等に作られる（同じスキーマで複数回構築してもエラーにならない）", () => {
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    const ether = new ChipLedger(db, ledger, new EventLog(db));
+    openFormally(ether.chipTx, ledger);
+    new Markets(db, ether, new EventLog(db), { landLedger: ledger });
+    expect(() => new Markets(db, ether, new EventLog(db), { landLedger: ledger })).not.toThrow();
+    const cols = (db.prepare("PRAGMA table_info(event_market_ops)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(cols).toEqual(expect.arrayContaining(["operation_id", "market_id", "kind", "actor_id", "result_json", "created_at"]));
+  });
+});
