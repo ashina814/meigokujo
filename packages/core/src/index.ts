@@ -295,6 +295,19 @@ export {
   type LegacyLedgerAudit,
 } from "./casino/opening-plan.js";
 export {
+  OpeningReset,
+  OpeningApplyBlockedError,
+  OpeningApplyStaleplanError,
+  OpeningApplyManualReviewError,
+  OpeningApplyRolledBackError,
+  OpeningAlreadyAppliedError,
+  type OpeningResetDeps,
+  type OpeningApplyInput,
+  type OpeningApplyResult,
+  type PostflightCheck,
+  type PostflightReport,
+} from "./casino/opening-reset.js";
+export {
   FakeOpeningExternalAdapter,
   type OpeningExternalAdapter,
   type OpeningExternalDisableLegacyRequest,

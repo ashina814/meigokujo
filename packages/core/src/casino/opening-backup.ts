@@ -6,6 +6,7 @@ import {
   schemaFingerprint,
   sha256Hex,
   tableColumns,
+  tableExists,
   tableRowCount,
   tableToCsv,
 } from "./opening-canonical.js";
@@ -185,6 +186,13 @@ export interface ManifestVerificationExpectation {
   schemaFingerprint: string;
   /** table -> row count（backup時点の実カウントと突き合わせる） */
   rowCounts: Readonly<Record<string, number>>;
+  /**
+   * 検証時点のDB接続。渡された場合、manifestが主張するsqliteSha256・各CSVのsha256を
+   * **実データから再計算して突き合わせる**（形式が64桁hexというだけの検証では、
+   * 全部0のような無意味な値でも「形式は正しい」を通過してしまうため）。
+   * 省略した場合は形式検証のみ行う（テストの都合上、明示的に緩めたい場合だけ省略すること）。
+   */
+  liveDb?: Database.Database;
 }
 
 export interface ManifestVerificationResult {
@@ -207,6 +215,11 @@ export function verifyOpeningBackupManifest(
   }
   if (!/^[a-f0-9]{64}$/.test(manifest.sqliteSha256)) {
     problems.push(`sqliteSha256の形式が不正: ${JSON.stringify(manifest.sqliteSha256)}`);
+  } else if (expectation.liveDb) {
+    const actualSqliteSha256 = sha256Hex(expectation.liveDb.serialize());
+    if (actualSqliteSha256 !== manifest.sqliteSha256) {
+      problems.push("sqliteSha256が実データの再計算値と一致しない（バックアップの改竄・取り違えの可能性）");
+    }
   }
   if (manifest.planHash !== expectation.planHash) {
     problems.push(`plan hash不一致: manifest=${manifest.planHash} expected=${expectation.planHash}`);
@@ -235,6 +248,11 @@ export function verifyOpeningBackupManifest(
   for (const entry of manifest.csv) {
     if (!/^[a-f0-9]{64}$/.test(entry.sha256)) {
       problems.push(`CSV hashの形式が不正: ${entry.table}`);
+    } else if (expectation.liveDb && tableExists(expectation.liveDb, entry.table)) {
+      const { csv: actualCsv } = tableToCsv(expectation.liveDb, entry.table);
+      if (sha256Hex(actualCsv) !== entry.sha256) {
+        problems.push(`CSV hashが実データの再計算値と一致しない: ${entry.table}`);
+      }
     }
     const expectedRows = expectation.rowCounts[entry.table];
     if (expectedRows !== undefined && entry.rows !== expectedRows) {

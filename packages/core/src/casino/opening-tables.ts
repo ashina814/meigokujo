@@ -34,6 +34,12 @@ export interface CasinoTableClassification {
   blockerCondition: string;
   /** 分類の根拠（現行mainのどのファイル・コメントに基づくか） */
   rationale: string;
+  /**
+   * plan hashの入力に含めるか（既定true）。PR12自身のbookkeeping table
+   * （casino_opening_executions）は、acquire()のINSERT自体がrow countを変化させてしまい、
+   * 「planを確定した直後に自分自身の書き込みでplanがstale化する」自己参照を起こすため除外する。
+   */
+  includeInPlanHash?: boolean;
 }
 
 const T = (row: CasinoTableClassification): CasinoTableClassification => row;
@@ -158,6 +164,19 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "bootstrap.ts。casino_tx/casino_tx_groupsとは別分類。旧versionのmetadata行" +
       "（legacy_pre_reset, version_seq, from_tx_id, pool_land, from_ledger_tx_id）は" +
       "無条件削除しない — R10はここへopening_v1の新しい1行をINSERTするだけ",
+  }),
+  T({
+    table: "casino_opening_executions",
+    purpose: "正式開業初期化apply自体の永続execution状態機械(PR12が新設)",
+    kind: "core_required",
+    archive: false,
+    resetOnApply: false,
+    preserve: true,
+    blockerCondition: "該当なし（自分自身の実行記録なので初期化対象にもarchive対象にもしない）",
+    rationale:
+      "opening-execution.ts。preflightのunknown table検出を自己検出しないよう明示的に分類表へ含める。" +
+      "plan hashにも含めない（自分自身の状態が変わるたびにplan hashが変わってしまうと再検査が機能しない）",
+    includeInPlanHash: false,
   }),
   T({
     table: "casino_chip_opening_balances",

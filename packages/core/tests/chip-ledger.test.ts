@@ -336,9 +336,12 @@ describe("opening versionのfail-closed化", () => {
  * body が例外を投げても深さが正しく戻ることを固定する。
  */
 describe("runMaintenanceによるロック迂回の棚卸し", () => {
-  it("productionでrunMaintenance()を呼ぶのはrecovery.tsだけ", () => {
+  it("productionでrunMaintenance()を呼ぶのはrecovery.tsとopening-reset.tsだけ", () => {
+    // exchange.ts のコメントが明示する唯一の許可経路は「起動時の復旧・正式開業初期化」の2つ。
+    // PR12(opening-reset.ts)がここに正式な2件目の呼び出し元として加わる。
     const root = fileURLToPath(new URL("../../../", import.meta.url));
     const targets = [join(root, "apps", "bot", "src"), join(root, "packages", "core", "src")];
+    const ALLOWED_CALLERS = ["casino/recovery.ts", "casino/opening-reset.ts"];
     const callers: string[] = [];
     const walk = (dir: string): void => {
       for (const name of readdirSync(dir)) {
@@ -354,8 +357,11 @@ describe("runMaintenanceによるロック迂回の棚卸し", () => {
       }
     };
     for (const t of targets) walk(t);
-    expect(callers.map((f) => f.replace(/\\/g, "/")).filter((f) => f.endsWith("casino/recovery.ts"))).toHaveLength(1);
-    expect(callers).toHaveLength(1);
+    const normalized = callers.map((f) => f.replace(/\\/g, "/"));
+    for (const allowed of ALLOWED_CALLERS) {
+      expect(normalized.filter((f) => f.endsWith(allowed))).toHaveLength(1);
+    }
+    expect(callers).toHaveLength(ALLOWED_CALLERS.length);
   });
 
   it("recovery.tsは deposit/redeem/fundFromAccount/redeemToAccount を直接呼ばない", () => {

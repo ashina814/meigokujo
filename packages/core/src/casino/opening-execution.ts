@@ -43,7 +43,10 @@ const ALLOWED_TRANSITIONS: Record<OpeningExecutionStatus, readonly OpeningExecut
   backup_started: ["backup_verified", "failed"],
   backup_verified: ["external_started", "failed"],
   external_started: ["external_completed", "failed"],
-  external_completed: ["applying", "failed"],
+  // 外部工程(R3相当)完了後にplanがstaleと判明した場合だけ manual_review_required へ倒す
+  // （CLAUDE.md §8: 外部工程は既に完了しているので、DB資金を動かさず・外部工程を再実行せず、
+  //   手動判断が必要な状態として報告する。単純な failed→再挑戦にすると外部工程が二重実行されうる）
+  external_completed: ["applying", "failed", "manual_review_required"],
   // applying → failed はCOMMIT前の失敗（SQLiteトランザクション自体が丸ごとrollbackされている）
   // 場合だけを意味する。COMMIT後に失敗したことが分かった場合は必ず applied を経由する。
   applying: ["applied", "failed"],
@@ -348,6 +351,21 @@ export class OpeningExecutionStore {
   /** failed / manual_review_required の理由付きで停止する（副作用の巻き戻しはこのクラスの責務外） */
   markFailed(id: string, stage: string, reason: string): OpeningExecutionRow {
     return this.transition(id, "failed", { failureStage: stage, failureReason: reason });
+  }
+
+  /**
+   * notifierの状態だけを更新する。**FSMの状態遷移ではない**（`completed` は終端のままでよい）。
+   * CLAUDE.md §15「監査通知の失敗と資金applyの失敗を同じものとして扱わない」— 資金・statusは
+   * 確定済みのまま、notifierだけを独立して何度でも再送・記録できるようにする。
+   */
+  recordNotifierStatus(id: string, status: "pending" | "sent" | "failed"): OpeningExecutionRow {
+    const ts = now();
+    this.db.prepare("UPDATE casino_opening_executions SET notifier_status = ?, updated_at = ? WHERE id = ?").run(
+      status,
+      ts,
+      id,
+    );
+    return this.getOrThrow(id);
   }
 }
 

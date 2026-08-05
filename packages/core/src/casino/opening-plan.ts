@@ -370,6 +370,7 @@ export class OpeningPlanner {
       casinoStatus: casinoStatusRow.status,
       schemaFingerprint: schemaFp,
       tables: tableAudits
+        .filter((a) => a.classification.includeInPlanHash !== false)
         .map((a) => ({
           table: a.table,
           kind: a.classification.kind,

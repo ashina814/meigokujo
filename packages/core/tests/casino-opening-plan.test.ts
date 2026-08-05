@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
@@ -277,13 +277,23 @@ describe("OpeningPlanner.dryRun — plan hash", () => {
     expect(h1).not.toBe(h2);
   });
 
-  it("同一状態を作り直しても同じhashになる（DB取得順・オブジェクトkey順に依存しない）", () => {
-    const build = () => {
-      const ctx = setup();
-      seedLegacy(ctx, { aliceChips: 250 });
-      configureAndOpenReset(ctx);
-      return ctx.planner.dryRun().planHash;
-    };
-    expect(build()).toBe(build());
+  it("同一状態を作り直しても同じhashになる（DB取得順・オブジェクトkey順に依存しない、固定時計）", () => {
+    // captureLegacyOpening等が created_at に実時刻を刻むため、固定時計にしないと
+    // 2回のbuild()がテスト実行中に秒をまたいだ場合だけ偶発的にhashが変わってしまう
+    // （テストの都合上の話であり、実運用では同一DBのdryRun()を2回呼んでも状態自体が
+    //  変化しない限りcreated_at列は変化しないので問題にならない）。
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    try {
+      const build = () => {
+        const ctx = setup();
+        seedLegacy(ctx, { aliceChips: 250 });
+        configureAndOpenReset(ctx);
+        return ctx.planner.dryRun().planHash;
+      };
+      expect(build()).toBe(build());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
