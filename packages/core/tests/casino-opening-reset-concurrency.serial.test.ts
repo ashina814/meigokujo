@@ -83,7 +83,7 @@ interface RunnerResult {
   errorMessage: string | null;
 }
 
-function runProcesses(dbPath: string, count: number): Promise<RunnerResult[]> {
+function runProcesses(dbPath: string, backupDir: string, count: number): Promise<RunnerResult[]> {
   const startAt = Date.now() + 2_000; // 起動のばらつきを吸収してから一斉に走らせる
   return Promise.all(
     Array.from({ length: count }, (_, i) =>
@@ -92,7 +92,7 @@ function runProcesses(dbPath: string, count: number): Promise<RunnerResult[]> {
         // 全workerが使う(現実の運用でも、1つの正式開業initializationは1人の運営者の
         // 操作として認可されるべきで、プロセスが分かれているだけで別人が引き継ぐわけではない)。
         void i;
-        const input = JSON.stringify({ dbPath, actorId: AUTHORIZED_ACTOR_ID, startAt });
+        const input = JSON.stringify({ dbPath, actorId: AUTHORIZED_ACTOR_ID, startAt, backupDir });
         const child = spawn(process.execPath, ["--import", "tsx", RUNNER, input], {
           stdio: ["ignore", "pipe", "pipe"],
         });
@@ -121,8 +121,10 @@ describe("OpeningReset.apply — 実プロセス競合(別プロセス・同一�
     // 「1回目で完了しなければ、競合が収まった後の再試行で必ず完了できる」ことを見る。
     const { dbPath, db } = setupFileDb();
     db.close(); // 子プロセス側の接続だけで競合させる
+    const backupDir = mkdtempSync(join(tmpdir(), "meigokujo-opening-reset-backup-"));
+    tempDirs.push(backupDir);
 
-    const results = await runProcesses(dbPath, 3);
+    const results = await runProcesses(dbPath, backupDir, 3);
     if (process.env.DEBUG_OPENING_RESET_CONCURRENCY) {
       console.error("RESULTS", JSON.stringify(results, null, 2));
     }
@@ -152,7 +154,7 @@ describe("OpeningReset.apply — 実プロセス競合(別プロセス・同一�
       const { CasinoStatus: CasinoStatusCtor } = await import("../src/casino/status.js");
       const { Settings: SettingsCtor } = await import("../src/settings/service.js");
       const { Departments: DepartmentsCtor } = await import("../src/departments/service.js");
-      const { FakeOpeningBackupAdapter } = await import("../src/casino/opening-backup.js");
+      const { TestFilesystemOpeningBackupAdapter } = await import("../src/casino/opening-backup.js");
       const { FakeOpeningExternalAdapter } = await import("../src/casino/opening-external.js");
 
       const retryDb = openDb(dbPath);
@@ -173,7 +175,7 @@ describe("OpeningReset.apply — 実プロセス競合(別プロセス・同一�
       const retryResult = await retryReset.apply({
         // リトライも同じ認可済みactorで行う(別actorへの暗黙引き継ぎをここでも作らない)
         actorId: AUTHORIZED_ACTOR_ID,
-        backup: new FakeOpeningBackupAdapter(),
+        backup: new TestFilesystemOpeningBackupAdapter(backupDir),
         external: new FakeOpeningExternalAdapter(),
       });
       expect(retryResult.status).toBe("completed");

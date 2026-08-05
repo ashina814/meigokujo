@@ -10,13 +10,28 @@ import { Departments } from "../departments/service.js";
 import type { Settings } from "../settings/service.js";
 import { OpeningPlanner, CASINO_DEPARTMENT_ACCOUNT, type OpeningPreflightResult } from "./opening-plan.js";
 import { CASINO_TABLE_CLASSIFICATION } from "./opening-tables.js";
-import { playerLandFingerprint, schemaFingerprint, tableExists, tableRowCount, quoteIdent } from "./opening-canonical.js";
+import {
+  playerLandFingerprint,
+  schemaFingerprint,
+  tableColumns,
+  tableExists,
+  tableRowCount,
+  quoteIdent,
+} from "./opening-canonical.js";
 import {
   OpeningExecutionStore,
   type OpeningExecutionRow,
   type OpeningExecutionStatus,
 } from "./opening-execution.js";
-import { verifyOpeningBackupManifest, type OpeningBackupAdapter, type OpeningBackupManifest } from "./opening-backup.js";
+import {
+  chipGroupGeneration,
+  databaseIdentity,
+  latestChipTransactionId,
+  verifyOpeningBackupManifest,
+  type ManifestVerificationExpectation,
+  type OpeningBackupAdapter,
+  type OpeningBackupManifest,
+} from "./opening-backup.js";
 import type { OpeningExternalAdapter } from "./opening-external.js";
 
 /** R6でDELETEする対象（分類表からresetPhase='R6'だけを抽出。casino_market系はFK順を固定） */
@@ -223,17 +238,42 @@ export class OpeningReset {
           this.safeMarkFailed(execution, "backup_started", "backup", e instanceof Error ? e.message : String(e));
           throw e;
         }
-        const verification = verifyOpeningBackupManifest(manifest, {
+        // 期待値はmanifest自身からは一切引かない（`databaseIdentity: manifest.databaseIdentity`の
+        // ような自己比較はCLAUDE.md監査ブロッカー5.1で禁止された自明にtrueになる検証になる）。
+        // 稼働中DBと確定済みplanから独立に再計算する。
+        const expectation: ManifestVerificationExpectation = {
           archiveTables,
           planHash: execution.planHash,
-          databaseIdentity: manifest.databaseIdentity,
+          databaseIdentity: databaseIdentity(this.deps.db),
           schemaFingerprint: schemaFingerprint(this.deps.db),
           rowCounts: Object.fromEntries(initialPlan.snapshot.tables.filter((t) => t.archive && t.exists).map((t) => [t.table, t.rows])),
+          columns: Object.fromEntries(archiveTables.map((t) => [t, tableColumns(this.deps.db, t)])),
+          openingVersion: LEGACY_OPENING_VERSION,
+          latestLandTransactionId: this.deps.ledger.lastTransactionId(),
+          latestChipTransactionId: latestChipTransactionId(this.deps.db),
+          latestChipGroupGeneration: chipGroupGeneration(this.deps.db),
           liveDb: this.deps.db,
-        });
+        };
+        const verification = verifyOpeningBackupManifest(manifest, expectation);
         if (!verification.ok) {
           const reason = `backup manifest検証失敗: ${verification.problems.join("; ")}`;
           this.safeMarkFailed(execution, "backup_started", "backup_verification", reason);
+          throw new Error(reason);
+        }
+        // 永続証拠でなければ破壊的applyの前提にできない（CLAUDE.md監査ブロッカー5.3）。
+        // インメモリbackupはこのプロセスが終われば消えるため、ここで明示的に弾く。
+        if (input.backup.durability !== "persistent") {
+          const reason = `backup adapterが永続証拠を提供しない(durability=${input.backup.durability})。破壊的transactionへは進めない`;
+          this.safeMarkFailed(execution, "backup_started", "backup_durability", reason);
+          throw new Error(reason);
+        }
+        // manifestオブジェクト自体の整合だけでなく、実際に保存された実体を再読込して
+        // 再検証する（CLAUDE.md監査ブロッカー5.2）。保存に失敗した・保存直後に消えた、
+        // といった故障は`verifyOpeningBackupManifest`だけでは検出できない。
+        const persisted = await input.backup.verifyPersistedBackup(manifest, expectation);
+        if (!persisted.ok) {
+          const reason = `永続backup証拠の再検証に失敗: ${persisted.problems.join("; ")}`;
+          this.safeMarkFailed(execution, "backup_started", "backup_persistence_verification", reason);
           throw new Error(reason);
         }
         execution = this.tryTransition(execution, "backup_started", "backup_verified", { backupManifest: manifest });

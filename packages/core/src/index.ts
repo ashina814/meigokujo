@@ -329,19 +329,23 @@ export {
   BACKUP_FORMAT_VERSION,
   SUPPORTED_BACKUP_FORMAT_VERSIONS,
   databaseIdentity,
+  chipGroupGeneration,
+  latestChipTransactionId,
   computeBackupManifest,
   verifyOpeningBackupManifest,
   verifyOpeningBackupFilesOnDisk,
-  FakeOpeningBackupAdapter,
-  TestFilesystemOpeningBackupAdapter,
   type OpeningBackupAdapter,
+  type OpeningBackupDurability,
   type OpeningBackupRequest,
   type OpeningBackupManifest,
   type OpeningBackupCsvEntry,
+  type OpeningBackupVerificationResult,
   type ManifestVerificationExpectation,
   type ManifestVerificationResult,
   type FileBackupVerificationResult,
 } from "./casino/opening-backup.js";
+// FakeOpeningBackupAdapter / TestFilesystemOpeningBackupAdapter はテスト専用（CLAUDE.md監査
+// ブロッカー5.4）。本番向けpublic indexからは再エクスポートせず、テストは内部pathから直接importする。
 export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";
 export {
   Escrow,

@@ -11,7 +11,7 @@ import { CasinoStatus } from "../../src/casino/status.js";
 import { Settings } from "../../src/settings/service.js";
 import { Departments } from "../../src/departments/service.js";
 import { OpeningReset } from "../../src/casino/opening-reset.js";
-import { FakeOpeningBackupAdapter } from "../../src/casino/opening-backup.js";
+import { TestFilesystemOpeningBackupAdapter } from "../../src/casino/opening-backup.js";
 import { FakeOpeningExternalAdapter } from "../../src/casino/opening-external.js";
 
 /**
@@ -25,6 +25,13 @@ interface RunnerInput {
   actorId: string;
   /** 全プロセスを同じ瞬間に走らせるための開始時刻（epoch ms） */
   startAt: number;
+  /**
+   * 永続backupの保存先。監査ブロッカー5.3により、破壊的applyはdurability="persistent"の
+   * backup adapterしか受け付けないため、全workerが同じ一時ディレクトリを共有する
+   * （同じplanHashを争っているworker同士なので、ファイル名(planHash prefix)は衝突しても
+   * 内容は同じになる。実際に採用されるmanifestはexecution行へCASで書き込まれた1つだけ）。
+   */
+  backupDir: string;
 }
 
 interface RunnerResult {
@@ -62,7 +69,7 @@ async function main(): Promise<void> {
   try {
     const applyResult = await reset.apply({
       actorId: input.actorId,
-      backup: new FakeOpeningBackupAdapter(),
+      backup: new TestFilesystemOpeningBackupAdapter(input.backupDir),
       external: new FakeOpeningExternalAdapter(),
     });
     result = {

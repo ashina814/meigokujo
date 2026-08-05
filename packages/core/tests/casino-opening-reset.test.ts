@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
@@ -20,7 +23,15 @@ import {
   OpeningApplyRolledBackError,
   OpeningReset,
 } from "../src/casino/opening-reset.js";
-import { FakeOpeningBackupAdapter, type OpeningBackupAdapter, type OpeningBackupRequest, type OpeningBackupManifest } from "../src/casino/opening-backup.js";
+import {
+  FakeOpeningBackupAdapter,
+  TestFilesystemOpeningBackupAdapter,
+  type ManifestVerificationExpectation,
+  type OpeningBackupAdapter,
+  type OpeningBackupRequest,
+  type OpeningBackupManifest,
+  type OpeningBackupVerificationResult,
+} from "../src/casino/opening-backup.js";
 import { FakeOpeningExternalAdapter } from "../src/casino/opening-external.js";
 
 registerDefaultTxTypes();
@@ -80,8 +91,22 @@ function configureAndOpenReset(ctx: Ctx, config = VALID_CONFIG): void {
   ctx.status.beginOpeningReset("テスト: 開業初期化準備", "test-admin");
 }
 
+// 監査ブロッカー5.3: 破壊的applyはdurability="persistent"のbackup adapterしか受け付けない。
+// FakeOpeningBackupAdapter(memory)はbackup失敗・manifest改竄など「destructive txへ絶対に
+// 到達しない」経路の注入専用に限定し、実際にapply()が完了/先へ進む経路は全部これを使う。
+const tempDirs: string[] = [];
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function persistentBackupAdapter(): TestFilesystemOpeningBackupAdapter {
+  const dir = mkdtempSync(join(tmpdir(), "pr12-opening-reset-test-"));
+  tempDirs.push(dir);
+  return new TestFilesystemOpeningBackupAdapter(dir);
+}
+
 function adapters() {
-  return { backup: new FakeOpeningBackupAdapter(), external: new FakeOpeningExternalAdapter() };
+  return { backup: persistentBackupAdapter(), external: new FakeOpeningExternalAdapter() };
 }
 
 describe("OpeningReset — constructorは一切書き込まない(監査ブロッカー1)", () => {
@@ -197,8 +222,11 @@ describe("OpeningReset.apply — preflight blocker", () => {
   it("blockerがあれば例外を投げ、executionを一切作らない", async () => {
     const ctx = setup();
     seedLegacy(ctx);
-    // configureAndOpenResetを呼ばない = 設定未完了のblockerが残る
-    const { backup, external } = adapters();
+    // configureAndOpenResetを呼ばない = 設定未完了のblockerが残る。backupが一切呼ばれないことを
+    // `.calls`で見たいので、ここだけはFakeOpeningBackupAdapter(memory)を直接使う
+    // (preflightで止まる経路であり、durabilityゲートには到達しない)。
+    const backup = new FakeOpeningBackupAdapter();
+    const external = new FakeOpeningExternalAdapter();
     await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(OpeningApplyBlockedError);
     expect(backup.calls).toHaveLength(0);
     expect(ctx.reset.executionStore.getByPlanHash("does-not-matter")).toBeUndefined();
@@ -213,7 +241,10 @@ describe("OpeningReset.apply — preflight blocker", () => {
     ).run();
     const rowsBefore = ctx.db.prepare("SELECT * FROM casino_chip_refund_sagas").all();
 
-    const { backup, external } = adapters();
+    // これもpreflightで止まる経路。backupが一切呼ばれないことを`.calls`で確認するため
+    // FakeOpeningBackupAdapter(memory)を直接使う。
+    const backup = new FakeOpeningBackupAdapter();
+    const external = new FakeOpeningExternalAdapter();
     await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(OpeningApplyBlockedError);
 
     // backup/外部工程はおろか、execution行すら作られない(preflightの時点で止まる)
@@ -258,7 +289,7 @@ describe("OpeningReset.apply — backup失敗", () => {
     expect(ctx.ledger.balanceOf(ETHER_ESCROW)).toBe(30_000);
     expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
 
-    const workingBackup = new FakeOpeningBackupAdapter();
+    const workingBackup = persistentBackupAdapter();
     const result = await ctx.reset.apply({ actorId: "admin", backup: workingBackup, external });
     expect(result.status).toBe("completed");
   });
@@ -273,7 +304,7 @@ describe("OpeningReset.apply — backup失敗", () => {
     await expect(ctx.reset.apply({ actorId: "admin", backup: corruptBackup, external })).rejects.toThrow();
     expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
 
-    const workingBackup = new FakeOpeningBackupAdapter();
+    const workingBackup = persistentBackupAdapter();
     const result = await ctx.reset.apply({ actorId: "admin", backup: workingBackup, external });
     expect(result.status).toBe("completed");
   });
@@ -284,7 +315,7 @@ describe("OpeningReset.apply — 外部工程失敗・リトライ", () => {
     const ctx = setup();
     seedLegacy(ctx);
     configureAndOpenReset(ctx);
-    const backup = new FakeOpeningBackupAdapter();
+    const backup = persistentBackupAdapter();
     const flakyExternal = new FakeOpeningExternalAdapter({ failTimes: 2 });
 
     await expect(ctx.reset.apply({ actorId: "admin", backup, external: flakyExternal })).rejects.toThrow();
@@ -299,16 +330,30 @@ describe("OpeningReset.apply — 外部工程失敗・リトライ", () => {
 });
 
 describe("OpeningReset.apply — planのstale化", () => {
-  /** backup adapterのbackup()呼び出し中(非同期の隙)にDBを変化させ、backup後のplan再検査を発火させる */
+  /**
+   * backup adapterのbackup()呼び出し中(非同期の隙)にDBを変化させ、backup後のplan再検査を発火させる。
+   * innerはpersistent adapterを包む(durability/verifyPersistedBackupをそのまま委譲する)。
+   * fakeのmemory adapterを包むと、この検証が始まる前に監査ブロッカー5.3のdurabilityゲートで
+   * 弾かれてしまい、ここで見たいstale-plan検出まで到達できない。
+   */
   class MutatingBackupAdapter implements OpeningBackupAdapter {
     constructor(
       private readonly inner: OpeningBackupAdapter,
       private readonly mutate: () => void,
     ) {}
+    get durability() {
+      return this.inner.durability;
+    }
     async backup(request: OpeningBackupRequest): Promise<OpeningBackupManifest> {
       const manifest = await this.inner.backup(request);
       this.mutate();
       return manifest;
+    }
+    verifyPersistedBackup(
+      manifest: OpeningBackupManifest,
+      expectation: ManifestVerificationExpectation,
+    ): Promise<OpeningBackupVerificationResult> {
+      return this.inner.verifyPersistedBackup(manifest, expectation);
     }
   }
 
@@ -316,7 +361,7 @@ describe("OpeningReset.apply — planのstale化", () => {
     const ctx = setup();
     seedLegacy(ctx);
     configureAndOpenReset(ctx);
-    const mutating = new MutatingBackupAdapter(new FakeOpeningBackupAdapter(), () => {
+    const mutating = new MutatingBackupAdapter(persistentBackupAdapter(), () => {
       ctx.db.prepare(
         "INSERT INTO casino_escrow (session_id, user_id, amount, game, source, created_at) VALUES ('sneaky','bob',10,'test','escrow:session:sneaky',0)",
       ).run();
@@ -329,7 +374,7 @@ describe("OpeningReset.apply — planのstale化", () => {
 
     // 混入行を取り除けば、次のapplyは新しいplan hashで最初から成功する
     ctx.db.prepare("DELETE FROM casino_escrow WHERE session_id = 'sneaky'").run();
-    const result = await ctx.reset.apply({ actorId: "admin", backup: new FakeOpeningBackupAdapter(), external });
+    const result = await ctx.reset.apply({ actorId: "admin", backup: persistentBackupAdapter(), external });
     expect(result.status).toBe("completed");
   });
 
@@ -337,7 +382,7 @@ describe("OpeningReset.apply — planのstale化", () => {
     const ctx = setup();
     seedLegacy(ctx);
     configureAndOpenReset(ctx);
-    const backup = new FakeOpeningBackupAdapter();
+    const backup = persistentBackupAdapter();
     class MutatingExternal extends FakeOpeningExternalAdapter {
       override async disableLegacyCasino(request: Parameters<FakeOpeningExternalAdapter["disableLegacyCasino"]>[0]) {
         const result = await super.disableLegacyCasino(request);
@@ -401,6 +446,93 @@ describe("OpeningReset.apply — 永続証拠の不在をrankだけで見逃さ�
     );
 
     await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(/不変条件違反/);
+  });
+});
+
+describe("OpeningReset.apply — 永続backup証拠をapply前提へ接続(監査ブロッカー5)", () => {
+  /** manifestの内容だけを改竄する(実ファイルはinnerが正しく書いたまま)。5.1の自己比較バグの回帰テスト用 */
+  class DatabaseIdentityCorruptingAdapter implements OpeningBackupAdapter {
+    constructor(private readonly inner: OpeningBackupAdapter) {}
+    get durability() {
+      return this.inner.durability;
+    }
+    async backup(request: OpeningBackupRequest): Promise<OpeningBackupManifest> {
+      const manifest = await this.inner.backup(request);
+      return { ...manifest, databaseIdentity: "0".repeat(64) };
+    }
+    verifyPersistedBackup(
+      manifest: OpeningBackupManifest,
+      expectation: ManifestVerificationExpectation,
+    ): Promise<OpeningBackupVerificationResult> {
+      return this.inner.verifyPersistedBackup(manifest, expectation);
+    }
+  }
+
+  it("manifestのdatabaseIdentityが実DBと食い違う場合を検出する(期待値の自己比較バグの回帰、監査ブロッカー5.1)", async () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    // 「expectation.databaseIdentity: manifest.databaseIdentity」という自己比較のバグが
+    // あれば、この改竄は常にok:trueをすり抜ける(自分自身と比較しているだけなので)。
+    // 稼働中DBから独立に期待値を計算していれば、ここで確実に検出できる。
+    const backup = new DatabaseIdentityCorruptingAdapter(persistentBackupAdapter());
+    const external = new FakeOpeningExternalAdapter();
+
+    await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(/database identity/);
+    expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
+    expect(ctx.ledger.balanceOf(ETHER_ESCROW)).toBe(30_000);
+    expect(ctx.status.current().status).toBe("opening_reset");
+  });
+
+  it("durability=memoryのbackup adapterでは破壊的applyへ進めない(監査ブロッカー5.3)", async () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    const backup = new FakeOpeningBackupAdapter();
+    const external = new FakeOpeningExternalAdapter();
+
+    await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(/durability=memory/);
+    expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
+    expect(ctx.ledger.balanceOf(ETHER_ESCROW)).toBe(30_000);
+    expect(ctx.status.current().status).toBe("opening_reset");
+
+    // durability=persistentへ切り替えれば、同じplanで最初から成功する
+    const result = await ctx.reset.apply({ actorId: "admin", backup: persistentBackupAdapter(), external });
+    expect(result.status).toBe("completed");
+  });
+
+  it("backup()直後に永続実体が消えた場合、再読込による再検証で検出し破壊的applyへ進めない(監査ブロッカー5.2)", async () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    const dir = mkdtempSync(join(tmpdir(), "pr12-backup-vanish-"));
+    tempDirs.push(dir);
+    const inner = new TestFilesystemOpeningBackupAdapter(dir);
+    class VanishingBackupAdapter implements OpeningBackupAdapter {
+      get durability() {
+        return inner.durability;
+      }
+      async backup(request: OpeningBackupRequest): Promise<OpeningBackupManifest> {
+        const manifest = await inner.backup(request);
+        // backup()自身は成功を報告した直後に、保存されたはずの実体が消えた状況を模擬する
+        // (書き込み後にディスク故障・別プロセスによる誤削除などが起きたケース)
+        rmSync(join(dir, `casino-opening-${manifest.planHash}.sqlite`));
+        return manifest;
+      }
+      verifyPersistedBackup(
+        manifest: OpeningBackupManifest,
+        expectation: ManifestVerificationExpectation,
+      ): Promise<OpeningBackupVerificationResult> {
+        return inner.verifyPersistedBackup(manifest, expectation);
+      }
+    }
+    const backup = new VanishingBackupAdapter();
+    const external = new FakeOpeningExternalAdapter();
+
+    await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(/永続backup証拠/);
+    expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
+    expect(ctx.ledger.balanceOf(ETHER_ESCROW)).toBe(30_000);
+    expect(ctx.status.current().status).toBe("opening_reset");
   });
 });
 

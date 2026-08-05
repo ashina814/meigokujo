@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
@@ -13,8 +16,19 @@ import { Settings } from "../src/settings/service.js";
 import { Departments, deptAccount } from "../src/departments/service.js";
 import { writeCasinoOpeningConfig } from "../src/casino/opening-settings.js";
 import { OpeningReset } from "../src/casino/opening-reset.js";
-import { FakeOpeningBackupAdapter } from "../src/casino/opening-backup.js";
+import { TestFilesystemOpeningBackupAdapter } from "../src/casino/opening-backup.js";
 import { FakeOpeningExternalAdapter } from "../src/casino/opening-external.js";
+
+// 監査ブロッカー5.3: 破壊的applyはdurability="persistent"のbackup adapterしか受け付けない。
+const tempDirs: string[] = [];
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+function persistentBackupAdapter(): TestFilesystemOpeningBackupAdapter {
+  const dir = mkdtempSync(join(tmpdir(), "pr12-opening-reset-seq-test-"));
+  tempDirs.push(dir);
+  return new TestFilesystemOpeningBackupAdapter(dir);
+}
 
 registerDefaultTxTypes();
 
@@ -90,7 +104,7 @@ describe("R9: sqlite_sequenceの限定性", () => {
     configureAndOpenReset(ctx);
     // casino_status_historyはbeginOpeningReset()で初めて行ができる(それまでは0行)
     const statusHistorySeqBefore = sequenceOf(ctx.db, "casino_status_history") ?? 0;
-    const result = await ctx.reset.apply({ actorId: "admin", backup: new FakeOpeningBackupAdapter(), external: new FakeOpeningExternalAdapter() });
+    const result = await ctx.reset.apply({ actorId: "admin", backup: persistentBackupAdapter(), external: new FakeOpeningExternalAdapter() });
     expect(result.status).toBe("completed");
 
     // casino_txのsequence行は消える(次回挿入時に1から採番される。行自体が無い＝リセット済み)
@@ -115,7 +129,7 @@ describe("R9: sqlite_sequenceの限定性", () => {
     });
     const legacyLastId = (ctx.db.prepare("SELECT MAX(id) AS id FROM casino_tx").get() as { id: number }).id;
     configureAndOpenReset(ctx);
-    await ctx.reset.apply({ actorId: "admin", backup: new FakeOpeningBackupAdapter(), external: new FakeOpeningExternalAdapter() });
+    await ctx.reset.apply({ actorId: "admin", backup: persistentBackupAdapter(), external: new FakeOpeningExternalAdapter() });
 
     // 採番はリセットされ、新しいidはlegacyLastIdより小さくなる
     ctx.ether.runGroup({ groupKey: "post-open", kind: "opening_reset", actorId: "system:test" }, () => {
@@ -175,7 +189,7 @@ describe("R9: sqlite_sequenceの限定性", () => {
     });
 
     await expect(
-      ctx.reset.apply({ actorId: "admin", backup: new FakeOpeningBackupAdapter(), external: new FakeOpeningExternalAdapter() }),
+      ctx.reset.apply({ actorId: "admin", backup: persistentBackupAdapter(), external: new FakeOpeningExternalAdapter() }),
     ).rejects.toThrow();
 
     vi.restoreAllMocks();
