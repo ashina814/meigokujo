@@ -192,6 +192,82 @@ describe("OpeningPlanner.dryRun — blocker検出", () => {
     expect(result.protectedFindings.some((f) => f.assetType === "stock_holding")).toBe(true);
   });
 
+  it("quarantine残高が正ならblocker", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    ctx.db.prepare("INSERT INTO ether_balances (user_id, amount, updated_at) VALUES ('sys:escrow:quarantine', 500, 0)").run();
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.some((b) => b.code === "quarantine_nonzero")).toBe(true);
+  });
+
+  it("未精算の無料スピン(pending free spin)はblocker", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    ctx.db.exec(`
+      CREATE TABLE IF NOT EXISTS casino_pending_free_spins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+        spin_no INTEGER NOT NULL, bet INTEGER NOT NULL, source_group TEXT NOT NULL,
+        status TEXT NOT NULL, reels_json TEXT NOT NULL, jackpot_claim INTEGER DEFAULT 0
+      );
+    `);
+    ctx.db.prepare(
+      "INSERT INTO casino_pending_free_spins (user_id, operation_id, spin_no, bet, source_group, status, reels_json, jackpot_claim) VALUES ('bob','op1',1,100,'g1','pending','[]',0)",
+    ).run();
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.some((b) => b.code === "pending_free_spin" && b.userId === "bob")).toBe(true);
+  });
+
+  it("進行中のcasino_house_reservationsはblocker", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    ctx.db.exec(`
+      CREATE TABLE IF NOT EXISTS casino_house_reservations (
+        key TEXT PRIMARY KEY, amount INTEGER NOT NULL, game TEXT NOT NULL, user_id TEXT NOT NULL, created_at INTEGER NOT NULL
+      );
+    `);
+    ctx.db.prepare("INSERT INTO casino_house_reservations (key, amount, game, user_id, created_at) VALUES ('r1', 100, 'スロット', 'bob', 0)").run();
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.some((b) => b.code === "active_house_reservations")).toBe(true);
+  });
+
+  it("未終局な板(casino_markets)はblocker", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    ctx.db.exec(`
+      CREATE TABLE IF NOT EXISTS casino_markets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT, creator_id TEXT, title TEXT, options_json TEXT,
+        deadline_at INTEGER, status TEXT NOT NULL DEFAULT 'open', result_option INTEGER, channel_id TEXT, message_id TEXT, created_at INTEGER
+      );
+    `);
+    ctx.db.prepare("INSERT INTO casino_markets (title, status, created_at) VALUES ('テスト板','open',0)").run();
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.some((b) => b.code === "live_market")).toBe(true);
+  });
+
+  it("正の戦績(casino_stats)は保護資産としてblocker", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    ctx.db.exec(`
+      CREATE TABLE IF NOT EXISTS casino_stats (
+        user_id TEXT PRIMARY KEY, games INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0,
+        losses INTEGER NOT NULL DEFAULT 0, total_wagered INTEGER NOT NULL DEFAULT 0, total_earned INTEGER NOT NULL DEFAULT 0,
+        total_lost INTEGER NOT NULL DEFAULT 0, biggest_win INTEGER NOT NULL DEFAULT 0,
+        current_win_streak INTEGER NOT NULL DEFAULT 0, best_win_streak INTEGER NOT NULL DEFAULT 0,
+        current_lose_streak INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
+      );
+    `);
+    ctx.db.prepare(
+      "INSERT INTO casino_stats (user_id, games, total_wagered, total_earned, total_lost, biggest_win, best_win_streak, updated_at) VALUES ('bob',5,500,300,200,100,2,0)",
+    ).run();
+    const result = ctx.planner.dryRun();
+    expect(result.protectedFindings.some((f) => f.assetType === "casino_stats" && f.userId === "bob")).toBe(true);
+  });
+
   it("進行中のcasino_escrow行はblocker（PR11チンチロ事前預託も含む）", () => {
     const ctx = setup();
     seedLegacy(ctx);

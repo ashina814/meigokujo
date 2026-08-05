@@ -373,6 +373,17 @@ describe("runMaintenanceによるロック迂回の棚卸し", () => {
     expect(src).not.toMatch(/\.redeemFairToAccount\(/);
   });
 
+  it("opening-reset.ts(PR12)も同じくdeposit/redeem/fundFromAccount/redeemToAccountを直接呼ばない", () => {
+    // R7/R8はLedger.transfer()を直接呼ぶ純粋なLand移動であり、ChipLedgerの高レベルAPI
+    // （chip側の副作用を伴う）を経由しない設計を維持する（設計判断はCLAUDE.md参照）。
+    const src = readFileSync(new URL("../src/casino/opening-reset.ts", import.meta.url), "utf8");
+    expect(src).not.toMatch(/\.deposit\(/);
+    expect(src).not.toMatch(/\.redeem\(/);
+    expect(src).not.toMatch(/\.fundFromAccount\(/);
+    expect(src).not.toMatch(/\.redeemToAccount\(/);
+    expect(src).not.toMatch(/\.redeemFairToAccount\(/);
+  });
+
   it("runMaintenance区間だけ開業ロック中でも資金移動でき、区間の外では再びロックされる", () => {
     const db = openDb(":memory:");
     const ledger = new Ledger(db);
