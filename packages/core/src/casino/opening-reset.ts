@@ -11,6 +11,7 @@ import type { Settings } from "../settings/service.js";
 import { OpeningPlanner, CASINO_DEPARTMENT_ACCOUNT, type OpeningPreflightResult } from "./opening-plan.js";
 import { CASINO_TABLE_CLASSIFICATION } from "./opening-tables.js";
 import {
+  checkedAddAll,
   playerLandFingerprint,
   schemaFingerprint,
   tableColumns,
@@ -665,16 +666,24 @@ export class OpeningReset {
     const etherEscrowLand = this.deps.ledger.balanceOf(ETHER_ESCROW);
     push("V7", etherEscrowLand === 0, `sys:escrow:ether=${etherEscrowLand}`);
 
-    // 追加確認（CLAUDE.md §14）
-    push(
-      "opening_capital_sum",
-      config.openingHouse + config.openingJackpot + config.openingRelief === config.openingCapital,
-      `${config.openingHouse}+${config.openingJackpot}+${config.openingRelief} vs ${config.openingCapital}`,
+    // 追加確認（CLAUDE.md §14）。ここはtransaction中(監査ブロッカー8): checkedAddAllが
+    // overflowを検出すればそのまま例外を投げさせ、transaction全体をROLLBACKさせる
+    // （catchしてblocker化しない。postflightはCOMMIT直前の最終防衛線であって診断ではない）。
+    const openingCapitalSum = checkedAddAll(
+      [config.openingHouse, config.openingJackpot, config.openingRelief],
+      "postflight.opening_capital_sum",
     );
     push(
+      "opening_capital_sum",
+      openingCapitalSum === config.openingCapital,
+      `${config.openingHouse}+${config.openingJackpot}+${config.openingRelief}=${openingCapitalSum} vs ${config.openingCapital}`,
+    );
+    const departmentExpected =
+      checkedAddAll([ctx.departmentLandBefore, ctx.oldReserveLand], "postflight.department_balance") -
+      config.openingCapital;
+    push(
       "department_balance",
-      this.deps.ledger.balanceOf(CASINO_DEPARTMENT_ACCOUNT) ===
-        ctx.departmentLandBefore + ctx.oldReserveLand - config.openingCapital,
+      this.deps.ledger.balanceOf(CASINO_DEPARTMENT_ACCOUNT) === departmentExpected,
       `department=${this.deps.ledger.balanceOf(CASINO_DEPARTMENT_ACCOUNT)}`,
     );
     push(

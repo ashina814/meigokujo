@@ -21,17 +21,38 @@ import {
 } from "./opening-tables.js";
 import {
   canonicalHash,
+  checkedAddAll,
   playerLandFingerprint,
   schemaFingerprint,
   tableExists,
   tableFingerprint,
   tableRowCount,
+  UnsafeAmountArithmeticError,
   type PlayerLandFingerprint,
   type TableContentFingerprint,
 } from "./opening-canonical.js";
 import { readCasinoOpeningConfig, type CasinoOpeningConfig } from "./opening-settings.js";
 
 const DEPARTMENT_KEY = "賭博場";
+
+/**
+ * preflight（dry-run）中に判明した桁あふれを、例外で落とすのではなく構造化blockerへ
+ * 変換する（CLAUDE.md監査ブロッカー8）。transaction中の同種チェックとは違い、
+ * dry-runは他の不備も併せて報告できることが要件なので、ここでは投げさせない。
+ * 失敗時は呼び出し側が安全なplaceholder値（0）を使えるよう`null`を返す
+ * （blockerが1件でもあればapply()はそもそも先へ進めないため、値そのものは意味を持たない）。
+ */
+function preflightCheckedAdd(blockers: OpeningBlocker[], label: string, values: number[]): number | null {
+  try {
+    return checkedAddAll(values, label);
+  } catch (e) {
+    if (e instanceof UnsafeAmountArithmeticError) {
+      blockers.push({ category: "arithmetic", code: "unsafe_amount_arithmetic", message: e.message });
+      return null;
+    }
+    throw e;
+  }
+}
 
 /**
  * PR10未完了義務の判定はwhitelist方式にする（CLAUDE.md監査ブロッカー2）。
@@ -86,7 +107,8 @@ export type BlockerCategory =
   | "schema"
   | "opening_version"
   | "quarantine"
-  | "backup_source";
+  | "backup_source"
+  | "arithmetic";
 
 export interface OpeningBlocker {
   category: BlockerCategory;
@@ -359,12 +381,17 @@ export class OpeningPlanner {
     const hasUnknownCompensation = compensationCandidates.some((f) => f.estimatedCompensationLand === null);
     const compensationRequiredLand = hasUnknownCompensation
       ? null
-      : compensationCandidates.reduce((sum, f) => sum + (f.estimatedCompensationLand ?? 0), 0);
+      : preflightCheckedAdd(
+          blockers,
+          "compensationRequiredLand",
+          compensationCandidates.map((f) => f.estimatedCompensationLand ?? 0),
+        ) ?? 0;
 
     // ---- Land残高（source of opening capital）----
     const oldReserveLand = this.deps.ledger.balanceOf(ETHER_ESCROW);
     const departmentLandBefore = departmentExists ? this.deps.ledger.balanceOf(CASINO_DEPARTMENT_ACCOUNT) : 0;
-    const openingSourceLand = oldReserveLand + departmentLandBefore;
+    const openingSourceLand =
+      preflightCheckedAdd(blockers, "openingSourceLand", [oldReserveLand, departmentLandBefore]) ?? 0;
     if (configResult.ok && openingSourceLand < configuration.openingCapital) {
       blockers.push({
         category: "backup_source",
@@ -374,7 +401,9 @@ export class OpeningPlanner {
     }
     if (configResult.ok) {
       const remainingAfterOpening = openingSourceLand - configuration.openingCapital;
-      const remainingInDept = departmentLandBefore + oldReserveLand - configuration.openingCapital;
+      const remainingInDept =
+        (preflightCheckedAdd(blockers, "remainingInDept", [departmentLandBefore, oldReserveLand]) ?? 0) -
+        configuration.openingCapital;
       if (remainingAfterOpening !== remainingInDept) {
         // 恒等式のはずだが、他の資金がこの2口座に混入していないかの防御的チェック
         blockers.push({
@@ -385,7 +414,14 @@ export class OpeningPlanner {
       }
     }
 
-    const playerLand = playerLandFingerprint(this.deps.db);
+    let playerLand: PlayerLandFingerprint;
+    try {
+      playerLand = playerLandFingerprint(this.deps.db);
+    } catch (e) {
+      if (!(e instanceof UnsafeAmountArithmeticError)) throw e;
+      blockers.push({ category: "arithmetic", code: "unsafe_amount_arithmetic", message: e.message });
+      playerLand = { accounts: 0, total: 0, sha256: "" };
+    }
     const chipHolderBalances = this.chipHolderBalances();
     const schemaFp = schemaFingerprint(this.deps.db);
 

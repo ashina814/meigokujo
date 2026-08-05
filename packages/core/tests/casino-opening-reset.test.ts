@@ -707,3 +707,33 @@ describe("OpeningReset.apply — 利用者Landの口座別postflight検証(監�
     expect(execution?.fundsApplied).toBe(false);
   });
 });
+
+describe("OpeningReset.apply — 資金合算のchecked add化(監査ブロッカー8)", () => {
+  it("敵対的: 利用者Land残高が個々にはsafe integerでも合算がoverflowする場合、preflightがarithmetic blockerで拒否しexecutionを一切作らない", async () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    ctx.ledger.ensureAccount("user:alice", "user");
+    ctx.ledger.ensureAccount("user:bob", "user");
+    // 通常のledger.transferはmaxAmountで大口を弾くため、safe-integer境界付近の値を
+    // 敵対的に注入するには直接SQLを使う(DB破損・不正操作を模擬)。
+    ctx.db.prepare("INSERT INTO balances (account_id, amount, updated_at) VALUES (?, ?, 0)").run(
+      "user:alice",
+      Number.MAX_SAFE_INTEGER,
+    );
+    ctx.db.prepare("INSERT INTO balances (account_id, amount, updated_at) VALUES (?, ?, 0)").run("user:bob", 1);
+
+    const backup = new FakeOpeningBackupAdapter();
+    const external = new FakeOpeningExternalAdapter();
+    await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(OpeningApplyBlockedError);
+
+    // 破壊的applyへは一切進んでいない(backupすら呼ばれない、execution行も作られない)
+    expect(backup.calls).toHaveLength(0);
+    expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
+
+    // dryRun()自体はクラッシュせず、"arithmetic"カテゴリのblockerとして報告する
+    const planner = new OpeningPlanner({ ...ctx, chips: ctx.ether });
+    const plan = planner.dryRun();
+    expect(plan.blockers.some((b) => b.category === "arithmetic")).toBe(true);
+  });
+});

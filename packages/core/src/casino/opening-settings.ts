@@ -1,4 +1,5 @@
 import type { Settings } from "../settings/service.js";
+import { checkedAddAll, UnsafeAmountArithmeticError } from "./opening-canonical.js";
 
 /**
  * 正式開業設定（PR12）。
@@ -103,10 +104,17 @@ export function readCasinoOpeningConfig(settings: Settings): CasinoOpeningConfig
   if (!(h > 0)) errors.push(`${CASINO_OPENING_SETTING_KEYS.house}: 0より大きい必要がある（現在値 ${h}）`);
   if (!(j >= 0)) errors.push(`${CASINO_OPENING_SETTING_KEYS.jackpot}: 0以上である必要がある（現在値 ${j}）`);
   if (!(r >= 0)) errors.push(`${CASINO_OPENING_SETTING_KEYS.relief}: 0以上である必要がある（現在値 ${r}）`);
-  if (h + j + r !== c) {
-    errors.push(
-      `house(${h}) + jackpot(${j}) + relief(${r}) = ${h + j + r} は capital(${c}) と一致しない`,
-    );
+  // CLAUDE.md監査ブロッカー8: h/j/rは個々にsafe integerでも、合計がsafe integerとは限らない。
+  // 生の`+`で桁あふれを黙って丸めない(checkedAddAllが例外を投げれば、それ自体を
+  // 構造化エラーとしてerrorsへ積む — dry-run同様、preflight的な検証はここでも投げさせない)。
+  try {
+    const sum = checkedAddAll([h, j, r], "house+jackpot+relief");
+    if (sum !== c) {
+      errors.push(`house(${h}) + jackpot(${j}) + relief(${r}) = ${sum} は capital(${c}) と一致しない`);
+    }
+  } catch (e) {
+    if (!(e instanceof UnsafeAmountArithmeticError)) throw e;
+    errors.push(`house/jackpot/reliefの合算でsafe integerを超えた: ${e.message}`);
   }
   if (!(m >= 0)) {
     errors.push(`${CASINO_OPENING_SETTING_KEYS.minWorkingCapital}: 0以上である必要がある（現在値 ${m}）`);

@@ -154,6 +154,25 @@ describe("casino opening settings", () => {
     expect(result.ok).toBe(false);
   });
 
+  it("敵対的: house+jackpot+reliefが個々にはsafe integerでも合算がoverflowする場合はinvalid(監査ブロッカー8)", () => {
+    const { settings } = setup();
+    // 個々の値はすべてNumber.isSafeInteger()を満たすが、3つ足すとsafe integerを超える
+    const overflowing = {
+      openingCapital: Number.MAX_SAFE_INTEGER,
+      openingHouse: Number.MAX_SAFE_INTEGER,
+      openingJackpot: Number.MAX_SAFE_INTEGER - 1,
+      openingRelief: 2,
+      minWorkingCapital: 0,
+      remitRateBps: 0,
+    };
+    writeCasinoOpeningConfig(settings, overflowing, "test");
+    const result = readCasinoOpeningConfig(settings);
+    expect(result.ok).toBe(false);
+    if (!result.ok && result.reason === "invalid") {
+      expect(result.errors.some((e) => e.includes("safe integer"))).toBe(true);
+    }
+  });
+
   it("部分設定（configured=trueだが一部キー欠落）はエラーを列挙し、fail-closedになる", () => {
     const { db, settings } = setup();
     db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, 'true', 0)").run(

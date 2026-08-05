@@ -44,6 +44,44 @@ export function sha256Hex(value: Buffer | string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+/**
+ * PR12内の資金・残高合算が桁あふれを黙って丸めないようにする（CLAUDE.md監査ブロッカー8）。
+ * 個々の入力が`Number.isSafeInteger`でも、合計がsafe integerとは限らない
+ * （`Number.MAX_SAFE_INTEGER`付近の値を複数足すと、生の`+`は誤差を含んだまま黙って通過する）。
+ * `NaN`/`Infinity`/非safe-integerな入力もここで拒否する（`NaN`を0として扱わない）。
+ *
+ * 呼び出し側の文脈で挙動を選ぶこと: preflight（dry-run）で判明する場合は
+ * try/catchして構造化blockerへ変換する。transaction中で判明する場合はそのまま
+ * 投げさせ、transaction全体をROLLBACKさせる。
+ */
+export class UnsafeAmountArithmeticError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnsafeAmountArithmeticError";
+  }
+}
+
+/** `values`をすべてsafe integerの範囲内で合算する。1件でも不正・overflowなら例外を投げる */
+export function checkedAddAll(values: readonly number[], label: string): number {
+  let total = 0;
+  for (const v of values) {
+    if (!Number.isSafeInteger(v)) {
+      throw new UnsafeAmountArithmeticError(`${label}: 入力がsafe integerではない(${v})`);
+    }
+    const next = total + v;
+    if (!Number.isSafeInteger(next)) {
+      throw new UnsafeAmountArithmeticError(`${label}: 合算結果がsafe integer範囲を超えた(overflow): ${total} + ${v}`);
+    }
+    total = next;
+  }
+  return total;
+}
+
+/** 2値版のショートハンド */
+export function checkedAdd(a: number, b: number, label: string): number {
+  return checkedAddAll([a, b], label);
+}
+
 export interface TableContentFingerprint {
   exists: boolean;
   rows: number;
@@ -111,7 +149,7 @@ export function playerLandFingerprint(db: Database.Database): PlayerLandFingerpr
     .all() as Array<{ account_id: string; amount: number }>;
   return {
     accounts: rows.length,
-    total: rows.reduce((sum, row) => sum + Number(row.amount), 0),
+    total: checkedAddAll(rows.map((row) => Number(row.amount)), "playerLandFingerprint.total"),
     sha256: canonicalHash(rows.map((row) => [row.account_id, Number(row.amount)])),
   };
 }

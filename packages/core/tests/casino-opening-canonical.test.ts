@@ -3,9 +3,17 @@ import { openDb } from "../src/db/bootstrap.js";
 import {
   canonicalHash,
   canonicalStringify,
+  checkedAdd,
+  checkedAddAll,
+  playerLandFingerprint,
   schemaFingerprint,
   tableFingerprint,
+  UnsafeAmountArithmeticError,
 } from "../src/casino/opening-canonical.js";
+import { Ledger, TREASURY } from "../src/ledger/service.js";
+import { registerDefaultTxTypes } from "../src/ledger/registry.js";
+
+registerDefaultTxTypes();
 
 describe("canonicalStringify", () => {
   it("オブジェクトのキー順に依存しない", () => {
@@ -147,5 +155,77 @@ describe("schemaFingerprint", () => {
     const fp2 = schemaFingerprint(db2);
 
     expect(fp1).not.toBe(fp2);
+  });
+});
+
+describe("checkedAddAll / checkedAdd（監査ブロッカー8: 資金合算のchecked add化）", () => {
+  it("通常の合算は正しい結果を返す", () => {
+    expect(checkedAddAll([1, 2, 3], "test")).toBe(6);
+    expect(checkedAdd(10, 20, "test")).toBe(30);
+    expect(checkedAddAll([], "test")).toBe(0);
+  });
+
+  it("敵対的: Number.MAX_SAFE_INTEGER付近の値を複数足すとoverflowを検出する(丸めて通過しない)", () => {
+    // 生の`+`だとこれはNumber.isSafeInteger()がfalseになる誤差を含んだ浮動小数点を
+    // 黙って返してしまう。checkedAddはこれを例外として検出する。
+    expect(Number.isSafeInteger(Number.MAX_SAFE_INTEGER + Number.MAX_SAFE_INTEGER)).toBe(false);
+    expect(() => checkedAdd(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, "test")).toThrow(
+      UnsafeAmountArithmeticError,
+    );
+    expect(() => checkedAdd(Number.MAX_SAFE_INTEGER, 1, "test")).toThrow(UnsafeAmountArithmeticError);
+    expect(() => checkedAddAll([Number.MAX_SAFE_INTEGER - 1, 1, 1], "test")).toThrow(UnsafeAmountArithmeticError);
+    // ちょうど境界(overflowしない)は通る
+    expect(checkedAdd(Number.MAX_SAFE_INTEGER - 1, 1, "test")).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it("敵対的: Number.MIN_SAFE_INTEGER付近を含む入力もsafe integer範囲外なら拒否する", () => {
+    expect(() => checkedAdd(Number.MIN_SAFE_INTEGER, -1, "test")).toThrow(UnsafeAmountArithmeticError);
+    expect(checkedAdd(Number.MIN_SAFE_INTEGER, 0, "test")).toBe(Number.MIN_SAFE_INTEGER);
+  });
+
+  it("敵対的: NaN/Infinity/非safe-integerな入力はそのまま拒否する(NaNを0として扱わない)", () => {
+    expect(() => checkedAddAll([NaN, 1], "test")).toThrow(UnsafeAmountArithmeticError);
+    expect(() => checkedAddAll([Infinity, 1], "test")).toThrow(UnsafeAmountArithmeticError);
+    expect(() => checkedAddAll([-Infinity, 1], "test")).toThrow(UnsafeAmountArithmeticError);
+    expect(() => checkedAddAll([1.5, 1], "test")).toThrow(UnsafeAmountArithmeticError);
+  });
+});
+
+describe("playerLandFingerprint — checked add化(監査ブロッカー8)", () => {
+  function setup() {
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    return { db, ledger };
+  }
+
+  it("通常の利用者Land合計は正しく計算できる", () => {
+    const { db, ledger } = setup();
+    ledger.ensureAccount("user:alice", "user");
+    ledger.ensureAccount("user:bob", "user");
+    ledger.transfer({ from: TREASURY, to: "user:alice", amount: 100, type: "adjust", actor: "t", idempotencyKey: "a" });
+    ledger.transfer({ from: TREASURY, to: "user:bob", amount: 200, type: "adjust", actor: "t", idempotencyKey: "b" });
+    const fp = playerLandFingerprint(db);
+    expect(fp.accounts).toBe(2);
+    expect(fp.total).toBe(300);
+  });
+
+  it("敵対的: 個々の残高はsafe integerでも合計がoverflowする場合は例外を投げる(黙って丸めない)", () => {
+    const { db, ledger } = setup();
+    ledger.ensureAccount("user:alice", "user");
+    ledger.ensureAccount("user:bob", "user");
+    // balances直接操作(通常のledger.transferはmaxAmountで大口を弾くため、
+    // safe-integer境界付近の値そのものを敵対的に注入するのに直接SQLを使う)
+    const ts = 0;
+    db.prepare("INSERT INTO balances (account_id, amount, updated_at) VALUES (?, ?, ?)").run(
+      "user:alice",
+      Number.MAX_SAFE_INTEGER,
+      ts,
+    );
+    db.prepare("INSERT INTO balances (account_id, amount, updated_at) VALUES (?, ?, ?)").run(
+      "user:bob",
+      1,
+      ts,
+    );
+    expect(() => playerLandFingerprint(db)).toThrow(UnsafeAmountArithmeticError);
   });
 });
