@@ -295,6 +295,16 @@ export {
   type LegacyLedgerAudit,
 } from "./casino/opening-plan.js";
 export {
+  OPENING_EXECUTION_STATUSES,
+  OpeningExecutionStore,
+  OpeningExecutionConflictError,
+  OpeningExecutionTransitionError,
+  newExternalOperationId,
+  type OpeningExecutionStatus,
+  type OpeningExecutionRow,
+  type AcquireResult,
+} from "./casino/opening-execution.js";
+export {
   BACKUP_FORMAT_VERSION,
   SUPPORTED_BACKUP_FORMAT_VERSIONS,
   databaseIdentity,
