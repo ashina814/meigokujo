@@ -329,6 +329,7 @@ export {
   databaseIdentity,
   computeBackupManifest,
   verifyOpeningBackupManifest,
+  verifyOpeningBackupFilesOnDisk,
   FakeOpeningBackupAdapter,
   TestFilesystemOpeningBackupAdapter,
   type OpeningBackupAdapter,
@@ -337,6 +338,7 @@ export {
   type OpeningBackupCsvEntry,
   type ManifestVerificationExpectation,
   type ManifestVerificationResult,
+  type FileBackupVerificationResult,
 } from "./casino/opening-backup.js";
 export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";
 export {

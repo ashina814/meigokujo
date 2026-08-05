@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, afterEach } from "vitest";
@@ -11,6 +11,7 @@ import {
   computeBackupManifest,
   databaseIdentity,
   verifyOpeningBackupManifest,
+  verifyOpeningBackupFilesOnDisk,
 } from "../src/casino/opening-backup.js";
 
 registerDefaultTxTypes();
@@ -189,5 +190,108 @@ describe("verifyOpeningBackupManifest", () => {
     const result = verifyOpeningBackupManifest(manifest, expectation);
     expect(result.ok).toBe(false);
     expect(result.problems.some((p) => p.includes("schema fingerprint"))).toBe(true);
+  });
+});
+
+describe("verifyOpeningBackupFilesOnDisk — 実ファイル検証", () => {
+  async function realBackup(dir: string) {
+    const { db } = setup();
+    const adapter = new TestFilesystemOpeningBackupAdapter(dir);
+    const manifest = await adapter.backup({ db, planHash: "disk1", archiveTables: ["ether_balances"], openingVersion: "legacy_pre_reset" });
+    return { db, manifest };
+  }
+
+  it("正常なファイル一式はok:true", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pr12-backup-files-"));
+    tmpDirs.push(dir);
+    const { manifest } = await realBackup(dir);
+    const result = verifyOpeningBackupFilesOnDisk(dir, manifest);
+    expect(result.ok).toBe(true);
+    expect(result.problems).toEqual([]);
+  });
+
+  it("SQLiteスナップショットファイルが存在しない(削除された)場合を検出する", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pr12-backup-files-"));
+    tmpDirs.push(dir);
+    const { manifest } = await realBackup(dir);
+    unlinkSync(join(dir, `casino-opening-${manifest.planHash}.sqlite`));
+    const result = verifyOpeningBackupFilesOnDisk(dir, manifest);
+    expect(result.ok).toBe(false);
+    expect(result.problems.some((p) => p.includes("存在しない") && p.includes("sqlite"))).toBe(true);
+  });
+
+  it("CSVファイルが存在しない場合を検出する", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pr12-backup-files-"));
+    tmpDirs.push(dir);
+    const { manifest } = await realBackup(dir);
+    unlinkSync(join(dir, `casino-opening-${manifest.planHash}-ether_balances.csv`));
+    const result = verifyOpeningBackupFilesOnDisk(dir, manifest);
+    expect(result.ok).toBe(false);
+    expect(result.problems.some((p) => p.includes("CSVファイルが存在しない"))).toBe(true);
+  });
+
+  it("SQLiteスナップショットが空ファイルに差し替えられた場合を検出する", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pr12-backup-files-"));
+    tmpDirs.push(dir);
+    const { manifest } = await realBackup(dir);
+    writeFileSync(join(dir, `casino-opening-${manifest.planHash}.sqlite`), "");
+    const result = verifyOpeningBackupFilesOnDisk(dir, manifest);
+    expect(result.ok).toBe(false);
+    expect(result.problems.some((p) => p.includes("空"))).toBe(true);
+  });
+
+  it("CSVが空ファイルに差し替えられた場合を検出する", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pr12-backup-files-"));
+    tmpDirs.push(dir);
+    const { manifest } = await realBackup(dir);
+    writeFileSync(join(dir, `casino-opening-${manifest.planHash}-ether_balances.csv`), "");
+    const result = verifyOpeningBackupFilesOnDisk(dir, manifest);
+    expect(result.ok).toBe(false);
+    expect(result.problems.some((p) => p.includes("CSVファイルが空"))).toBe(true);
+  });
+
+  it("CSVの内容が改変された場合(行の値を書き換え)を検出する", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pr12-backup-files-"));
+    tmpDirs.push(dir);
+    const { manifest } = await realBackup(dir);
+    const csvPath = join(dir, `casino-opening-${manifest.planHash}-ether_balances.csv`);
+    const original = readFileSync(csvPath, "utf8");
+    writeFileSync(csvPath, original.replace(/\d+/g, (m) => String(Number(m) + 1)));
+    const result = verifyOpeningBackupFilesOnDisk(dir, manifest);
+    expect(result.ok).toBe(false);
+    expect(result.problems.some((p) => p.includes("CSVファイルの実ファイルhash"))).toBe(true);
+  });
+
+  it("CSVの行順が改変された場合を検出する(2行以上のテーブルで検証)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pr12-backup-files-"));
+    tmpDirs.push(dir);
+    const { db } = setup();
+    db.prepare("INSERT INTO ether_balances (user_id, amount, updated_at) VALUES ('user2', 100, 0)").run();
+    const adapter = new TestFilesystemOpeningBackupAdapter(dir);
+    const manifest = await adapter.backup({ db, planHash: "disk-order", archiveTables: ["ether_balances"], openingVersion: "legacy_pre_reset" });
+
+    const csvPath = join(dir, `casino-opening-${manifest.planHash}-ether_balances.csv`);
+    const lines = readFileSync(csvPath, "utf8").split("\n");
+    // ヘッダーを除く本体行(空行を除く)を逆順にする
+    const header = lines[0];
+    const body = lines.slice(1).filter((l) => l.length > 0);
+    expect(body.length).toBeGreaterThanOrEqual(2);
+    const reordered = [header, ...body.reverse()].join("\n") + "\n";
+    writeFileSync(csvPath, reordered);
+
+    const result = verifyOpeningBackupFilesOnDisk(dir, manifest);
+    expect(result.ok).toBe(false);
+    expect(result.problems.some((p) => p.includes("CSVファイルの実ファイルhash"))).toBe(true);
+  });
+
+  it("manifestだけ本物で実ファイルが偽物(内容が別物)に差し替えられた場合を検出する", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pr12-backup-files-"));
+    tmpDirs.push(dir);
+    const { manifest } = await realBackup(dir);
+    // sqliteファイルを、全く別内容の(しかし空ではない)バイト列にすり替える
+    writeFileSync(join(dir, `casino-opening-${manifest.planHash}.sqlite`), Buffer.from("not a real sqlite file, but manifest still claims the old hash"));
+    const result = verifyOpeningBackupFilesOnDisk(dir, manifest);
+    expect(result.ok).toBe(false);
+    expect(result.problems.some((p) => p.includes("SQLiteスナップショットの実ファイルhash"))).toBe(true);
   });
 });

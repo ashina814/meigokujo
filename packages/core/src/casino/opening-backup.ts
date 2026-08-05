@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
 import {
@@ -257,6 +257,61 @@ export function verifyOpeningBackupManifest(
     const expectedRows = expectation.rowCounts[entry.table];
     if (expectedRows !== undefined && entry.rows !== expectedRows) {
       problems.push(`row count不一致: ${entry.table} manifest=${entry.rows} expected=${expectedRows}`);
+    }
+  }
+
+  return { ok: problems.length === 0, problems };
+}
+
+export interface FileBackupVerificationResult {
+  ok: boolean;
+  problems: string[];
+}
+
+/**
+ * ファイルシステム上に実際に書き出されたbackupを、manifestの主張と突き合わせて検証する
+ * （CLAUDE.md §7「実ファイルが存在する」「SQLite hash一致」「CSV hash一致」）。
+ *
+ * `verifyOpeningBackupManifest` は manifest と稼働中DBの整合を見るだけで、
+ * **ディスク上のファイル自体**は見ない。こちらは逆に、manifestが主張する
+ * ファイルが実在し、中身のsha256が本当にmanifestの値と一致するかだけを見る
+ * （欠落・空ファイル・改竄・manifestだけ正しい偽ファイル、をすべて検出できる）。
+ *
+ * ファイル名規約は `TestFilesystemOpeningBackupAdapter` と揃える
+ * （`casino-opening-<planHash>.sqlite` / `casino-opening-<planHash>-<table>.csv`）。
+ */
+export function verifyOpeningBackupFilesOnDisk(
+  directory: string,
+  manifest: OpeningBackupManifest,
+): FileBackupVerificationResult {
+  const problems: string[] = [];
+  const prefix = `casino-opening-${manifest.planHash}`;
+
+  const sqlitePath = join(directory, `${prefix}.sqlite`);
+  if (!existsSync(sqlitePath)) {
+    problems.push(`SQLiteスナップショットファイルが存在しない: ${sqlitePath}`);
+  } else if (statSync(sqlitePath).size === 0) {
+    problems.push(`SQLiteスナップショットファイルが空: ${sqlitePath}`);
+  } else {
+    const actual = sha256Hex(readFileSync(sqlitePath));
+    if (actual !== manifest.sqliteSha256) {
+      problems.push(`SQLiteスナップショットの実ファイルhashがmanifestと一致しない: ${sqlitePath}`);
+    }
+  }
+
+  for (const entry of manifest.csv) {
+    const csvPath = join(directory, `${prefix}-${entry.table}.csv`);
+    if (!existsSync(csvPath)) {
+      problems.push(`CSVファイルが存在しない: ${csvPath}`);
+      continue;
+    }
+    if (statSync(csvPath).size === 0) {
+      problems.push(`CSVファイルが空: ${entry.table}`);
+      continue;
+    }
+    const actual = sha256Hex(readFileSync(csvPath, "utf8"));
+    if (actual !== entry.sha256) {
+      problems.push(`CSVファイルの実ファイルhashがmanifestと一致しない: ${entry.table}`);
     }
   }
 
