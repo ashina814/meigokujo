@@ -294,6 +294,21 @@ export {
   type PlayerLandFingerprint,
   type LegacyLedgerAudit,
 } from "./casino/opening-plan.js";
+export {
+  BACKUP_FORMAT_VERSION,
+  SUPPORTED_BACKUP_FORMAT_VERSIONS,
+  databaseIdentity,
+  computeBackupManifest,
+  verifyOpeningBackupManifest,
+  FakeOpeningBackupAdapter,
+  TestFilesystemOpeningBackupAdapter,
+  type OpeningBackupAdapter,
+  type OpeningBackupRequest,
+  type OpeningBackupManifest,
+  type OpeningBackupCsvEntry,
+  type ManifestVerificationExpectation,
+  type ManifestVerificationResult,
+} from "./casino/opening-backup.js";
 export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";
 export {
   Escrow,
