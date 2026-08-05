@@ -239,6 +239,15 @@ export class OpeningReset {
         execution = this.tryTransition(execution, "backup_started", "backup_verified", { backupManifest: manifest });
       }
     }
+    // 状態のrank(reached())だけを根拠に「backupは終わっている」と信じない。
+    // 永続証拠（backupManifest列）が実際に無ければ、rankとDBの記録が矛盾した
+    // 未知の状態組み合わせ＝データ破損の疑いとしてfail-closedで即座に止める
+    // （このexecution行のFSM上どの遷移も試みない — 状態自体が信用できないため）。
+    if (!execution.backupManifest) {
+      throw new Error(
+        `不変条件違反: execution(${execution.id}) は status=${execution.status} だが backupManifest が未記録（データ破損の疑い。手動調査が必要）`,
+      );
+    }
     const manifest = execution.backupManifest as OpeningBackupManifest;
 
     // ---- backup後のplan再検査 ----
@@ -279,6 +288,11 @@ export class OpeningReset {
           }
         }
       }
+    }
+    if (reached(execution, "external_completed") && !execution.externalOperationId) {
+      throw new Error(
+        `不変条件違反: execution(${execution.id}) は status=${execution.status} だが externalOperationId が未記録（データ破損の疑い。手動調査が必要）`,
+      );
     }
 
     // ---- 破壊的DB transaction（R5〜R13）。applying で中断していれば再試行（COMMIT前なので安全）----

@@ -13,7 +13,7 @@ import { CasinoStatus } from "../src/casino/status.js";
 import { Settings } from "../src/settings/service.js";
 import { Departments, deptAccount } from "../src/departments/service.js";
 import { writeCasinoOpeningConfig } from "../src/casino/opening-settings.js";
-import { CASINO_DEPARTMENT_ACCOUNT } from "../src/casino/opening-plan.js";
+import { CASINO_DEPARTMENT_ACCOUNT, OpeningPlanner } from "../src/casino/opening-plan.js";
 import {
   OpeningApplyBlockedError,
   OpeningApplyManualReviewError,
@@ -305,5 +305,38 @@ describe("OpeningReset.apply — 二重開業防止", () => {
     ctx.status.beginMaintenance("test", "admin"); // opening_reset状態ではないのでblockerが先に出る可能性もあるが、
     // 主目的はalready_opening_v1が確実に検出されること
     await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(OpeningApplyBlockedError);
+  });
+});
+
+describe("OpeningReset.apply — 永続証拠の不在をrankだけで見逃さない", () => {
+  it("statusがbackup_verified以降なのにbackupManifestが無い(データ破損)場合は不変条件違反として即座に止まる", async () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    const { backup, external } = adapters();
+    const planner = new OpeningPlanner({ ...ctx, chips: ctx.ether });
+    const plan = planner.dryRun();
+    const acquireResult = ctx.reset.executionStore.acquire(plan.planHash, "admin", plan.snapshot.configuration);
+    // acquireだけ行い、backupManifestを書き込まないまま直接status='backup_verified'を注入する
+    // (実運用では絶対に起きないはずの破損状態を模擬)
+    ctx.db.prepare("UPDATE casino_opening_executions SET status = 'backup_verified' WHERE id = ?").run(acquireResult.execution.id);
+
+    await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(/不変条件違反/);
+  });
+
+  it("statusがexternal_completed以降なのにexternalOperationIdが無い(データ破損)場合は不変条件違反として即座に止まる", async () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    const { backup, external } = adapters();
+    const planner = new OpeningPlanner({ ...ctx, chips: ctx.ether });
+    const plan = planner.dryRun();
+    const acquireResult = ctx.reset.executionStore.acquire(plan.planHash, "admin", plan.snapshot.configuration);
+    // backupManifestは正しく埋めつつ、external関連だけ欠落させた破損状態を作る
+    ctx.db.prepare("UPDATE casino_opening_executions SET status = 'external_completed', backup_manifest_json = '{}' WHERE id = ?").run(
+      acquireResult.execution.id,
+    );
+
+    await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(/不変条件違反/);
   });
 });

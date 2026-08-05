@@ -253,3 +253,13 @@ describe("OpeningExecutionStore — 同時実行", () => {
     db2.close();
   });
 });
+
+describe("OpeningExecutionStore — 未知statusのfail-closed", () => {
+  it("DBのCHECK制約により、statusカラムへ未知の値を直接書き込むことはできない", () => {
+    const { db, store } = setup();
+    const { execution } = store.acquire("hash-unknown", "admin", CONFIG);
+    expect(() => {
+      db.prepare("UPDATE casino_opening_executions SET status = ? WHERE id = ?").run("totally_unknown_status", execution.id);
+    }).toThrow(/CHECK constraint failed/);
+  });
+});
