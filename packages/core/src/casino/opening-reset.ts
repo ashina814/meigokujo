@@ -13,7 +13,6 @@ import { CASINO_TABLE_CLASSIFICATION } from "./opening-tables.js";
 import { schemaFingerprint, tableExists, tableRowCount, quoteIdent } from "./opening-canonical.js";
 import {
   OpeningExecutionStore,
-  OpeningExecutionTransitionError,
   type OpeningExecutionRow,
   type OpeningExecutionStatus,
 } from "./opening-execution.js";
@@ -198,50 +197,52 @@ export class OpeningReset {
 
     // ---- failed（COMMIT前の失敗だけがここに来る）からの再挑戦も、新規と同じ扱いにする ----
     if (execution.status === "planned" || execution.status === "failed") {
-      execution = this.executions.transition(execution.id, "opening_reset_acquired");
+      execution = this.tryTransition(execution, execution.status, "opening_reset_acquired");
     }
 
     // ---- plan再確認 #1（execution取得直後）----
-    this.assertPlanFresh(execution, "opening_reset_acquired");
+    execution = this.assertPlanFresh(execution, "opening_reset_acquired");
 
     const archiveTables = initialPlan.snapshot.tables.filter((t) => t.archive && t.exists).map((t) => t.table);
 
     // ---- backup（opening_reset_acquired または backup_started で中断していれば再試行）----
     if (!reached(execution, "backup_verified")) {
-      if (execution.status !== "backup_started") {
-        execution = this.executions.transition(execution.id, "backup_started");
+      if (execution.status === "opening_reset_acquired") {
+        execution = this.tryTransition(execution, "opening_reset_acquired", "backup_started");
       }
-      let manifest: OpeningBackupManifest;
-      try {
-        manifest = await input.backup.backup({
-          db: this.deps.db,
-          planHash: execution.planHash,
+      if (!reached(execution, "backup_verified")) {
+        let manifest: OpeningBackupManifest;
+        try {
+          manifest = await input.backup.backup({
+            db: this.deps.db,
+            planHash: execution.planHash,
+            archiveTables,
+            openingVersion: LEGACY_OPENING_VERSION,
+          });
+        } catch (e) {
+          this.safeMarkFailed(execution, "backup_started", "backup", e instanceof Error ? e.message : String(e));
+          throw e;
+        }
+        const verification = verifyOpeningBackupManifest(manifest, {
           archiveTables,
-          openingVersion: LEGACY_OPENING_VERSION,
+          planHash: execution.planHash,
+          databaseIdentity: manifest.databaseIdentity,
+          schemaFingerprint: schemaFingerprint(this.deps.db),
+          rowCounts: Object.fromEntries(initialPlan.snapshot.tables.filter((t) => t.archive && t.exists).map((t) => [t.table, t.rows])),
+          liveDb: this.deps.db,
         });
-      } catch (e) {
-        this.safeMarkFailed(execution.id, "backup", e instanceof Error ? e.message : String(e));
-        throw e;
+        if (!verification.ok) {
+          const reason = `backup manifest検証失敗: ${verification.problems.join("; ")}`;
+          this.safeMarkFailed(execution, "backup_started", "backup_verification", reason);
+          throw new Error(reason);
+        }
+        execution = this.tryTransition(execution, "backup_started", "backup_verified", { backupManifest: manifest });
       }
-      const verification = verifyOpeningBackupManifest(manifest, {
-        archiveTables,
-        planHash: execution.planHash,
-        databaseIdentity: manifest.databaseIdentity,
-        schemaFingerprint: schemaFingerprint(this.deps.db),
-        rowCounts: Object.fromEntries(initialPlan.snapshot.tables.filter((t) => t.archive && t.exists).map((t) => [t.table, t.rows])),
-        liveDb: this.deps.db,
-      });
-      if (!verification.ok) {
-        const reason = `backup manifest検証失敗: ${verification.problems.join("; ")}`;
-        this.safeMarkFailed(execution.id, "backup_verification", reason);
-        throw new Error(reason);
-      }
-      execution = this.executions.transition(execution.id, "backup_verified", { backupManifest: manifest });
     }
     const manifest = execution.backupManifest as OpeningBackupManifest;
 
     // ---- backup後のplan再検査 ----
-    this.assertPlanFresh(execution, "backup_verified");
+    execution = this.assertPlanFresh(execution, "backup_verified");
 
     // ---- 外部工程（backup_verified または external_started で中断していれば再試行）----
     // 固定のidempotencyKeyを使う（planHashに含めない）。この外部工程は「一度きりの移行操作」であり、
@@ -249,47 +250,52 @@ export class OpeningReset {
     // hashが変わるたびに外部adapter側が別操作と誤認し、二重実行の危険がある。
     const externalOperationId = "casino-opening:disable-legacy-vcs";
     if (!reached(execution, "external_completed")) {
-      if (execution.status !== "external_started") {
-        execution = this.executions.transition(execution.id, "external_started");
+      if (execution.status === "backup_verified") {
+        execution = this.tryTransition(execution, "backup_verified", "external_started");
       }
-      let externalResult: unknown;
-      try {
-        externalResult = await input.external.disableLegacyCasino({
-          planHash: execution.planHash,
-          idempotencyKey: externalOperationId,
+      if (!reached(execution, "external_completed")) {
+        let externalResult: unknown;
+        try {
+          externalResult = await input.external.disableLegacyCasino({
+            planHash: execution.planHash,
+            idempotencyKey: externalOperationId,
+          });
+        } catch (e) {
+          this.safeMarkFailed(execution, "external_started", "external", e instanceof Error ? e.message : String(e));
+          throw e;
+        }
+        execution = this.tryTransition(execution, "external_started", "external_completed", {
+          externalOperationId,
+          externalOperationResult: externalResult,
         });
-      } catch (e) {
-        this.safeMarkFailed(execution.id, "external", e instanceof Error ? e.message : String(e));
-        throw e;
-      }
-      execution = this.executions.transition(execution.id, "external_completed", {
-        externalOperationId,
-        externalOperationResult: externalResult,
-      });
 
-      // ---- 外部工程後のplan再検査（stale時は manual_review。外部工程を再実行しない）----
-      const postExternalPlan = this.planner.dryRun();
-      if (postExternalPlan.planHash !== execution.planHash || postExternalPlan.blockers.length > 0) {
-        const reason = `外部工程完了後にplanがstale化した（外部工程は再実行しない）: ${postExternalPlan.blockers.map((b) => b.code).join(",")}`;
-        this.safeMarkManualReview(execution.id, reason);
-        const latest = this.executions.get(execution.id);
-        throw new OpeningApplyManualReviewError(execution.id, reason, latest?.fundsApplied ?? execution.fundsApplied);
+        // ---- 外部工程後のplan再検査（stale時は manual_review。外部工程を再実行しない）----
+        if (execution.status === "external_completed") {
+          const postExternalPlan = this.planner.dryRun();
+          if (postExternalPlan.planHash !== execution.planHash || postExternalPlan.blockers.length > 0) {
+            const reason = `外部工程完了後にplanがstale化した（外部工程は再実行しない）: ${postExternalPlan.blockers.map((b) => b.code).join(",")}`;
+            const after = this.safeMarkManualReview(execution, "external_completed", reason);
+            throw new OpeningApplyManualReviewError(execution.id, reason, after.fundsApplied);
+          }
+        }
       }
     }
 
     // ---- 破壊的DB transaction（R5〜R13）。applying で中断していれば再試行（COMMIT前なので安全）----
     if (!reached(execution, "applied")) {
-      if (execution.status !== "applying") {
-        execution = this.executions.transition(execution.id, "applying");
+      if (execution.status === "external_completed") {
+        execution = this.tryTransition(execution, "external_completed", "applying");
       }
-      try {
-        execution = this.runDestructiveTransaction(execution, initialPlan);
-      } catch (e) {
-        // db.transaction() が投げた時点で、SQLite自身が丸ごとROLLBACK済み
-        // （casino_tx削除・R7/R8送金・opening_v1確立・executions更新、すべて元通り）。
-        // COMMIT前の失敗なので安全に再挑戦できる。
-        this.safeMarkFailed(execution.id, "applying", e instanceof Error ? e.message : String(e));
-        throw new OpeningApplyRolledBackError(execution.id, e);
+      if (execution.status === "applying") {
+        try {
+          execution = this.runDestructiveTransaction(execution, initialPlan);
+        } catch (e) {
+          // db.transaction() が投げた時点で、SQLite自身が丸ごとROLLBACK済み
+          // （casino_tx削除・R7/R8送金・opening_v1確立・executions更新、すべて元通り）。
+          // COMMIT前の失敗なので安全に再挑戦できる。
+          this.safeMarkFailed(execution, "applying", "applying", e instanceof Error ? e.message : String(e));
+          throw new OpeningApplyRolledBackError(execution.id, e);
+        }
       }
     }
 
@@ -298,8 +304,8 @@ export class OpeningReset {
     // ここを何度再試行してもcasino_statusを壊さない（post-commitはnotifier含め再試行のみ許可）。
     let casinoReopened = false;
     if (!reached(execution, "completed")) {
-      if (execution.status !== "post_commit_pending") {
-        execution = this.executions.transition(execution.id, "post_commit_pending");
+      if (execution.status === "applied") {
+        execution = this.tryTransition(execution, "applied", "post_commit_pending");
       }
       const reopen = this.deps.status.finishOpeningReset(
         `正式開業初期化完了: ${execution.planHash}`,
@@ -308,11 +314,11 @@ export class OpeningReset {
       );
       if (!reopen.ok) {
         const reason = `COMMIT後、賭場をopenへ戻せなかった: ${reopen.reason ?? "unknown"}`;
-        this.safeMarkManualReview(execution.id, reason);
+        this.safeMarkManualReview(execution, "post_commit_pending", reason);
         throw new OpeningApplyManualReviewError(execution.id, reason, true);
       }
       casinoReopened = true;
-      execution = this.executions.transition(execution.id, "completed");
+      execution = this.tryTransition(execution, "post_commit_pending", "completed");
     } else {
       casinoReopened = this.deps.status.current().status === "open";
     }
@@ -345,39 +351,69 @@ export class OpeningReset {
     };
   }
 
-  /** plan再検査。stale/blocker発生時は failed へ倒して例外を投げる（COMMIT前なので安全に再挑戦できる） */
-  private assertPlanFresh(execution: OpeningExecutionRow, stage: string): void {
-    const plan = this.planner.dryRun();
-    if (plan.planHash !== execution.planHash || plan.blockers.length > 0) {
-      this.safeMarkFailed(execution.id, stage, `plan hashが不一致またはblockerが発生: ${plan.blockers.map((b) => b.code).join(",")}`);
-      throw new OpeningApplyStaleplanError(stage, execution.id);
-    }
+  /**
+   * CAS遷移のラッパー。`applied:false`（＝別プロセスが既に先へ進めていた）は
+   * エラーにせず、実際の最新行を採用してそのまま処理を続ける（resume梯子が
+   * rankベースで先の段階を自動的にスキップする）。
+   */
+  private tryTransition(
+    execution: OpeningExecutionRow,
+    fromStatus: OpeningExecutionStatus,
+    to: OpeningExecutionStatus,
+    patch: Partial<OpeningExecutionRow> = {},
+  ): OpeningExecutionRow {
+    const result = this.executions.transition(execution.id, fromStatus, to, patch);
+    return result.execution;
   }
 
   /**
-   * markFailed の競合安全版。**同じplan hashの実行に複数プロセスが同時に群がった場合**、
-   * 負けた側が自分の失敗を記録しようとした時点で、既に別プロセスがそのexecutionを
-   * `failed`／`applied` 以降へ進めていることがある。その場合の二次的な
-   * `OpeningExecutionTransitionError`（例: `failed -> failed`）は素通しにせず、
-   * **元の失敗理由（呼び出し側が投げる例外）だけを正としてそのまま伝える**。
-   * 資金の安全性はexecutionの状態遷移がSQLiteのIMMEDIATEトランザクションで直列化されている
-   * ことで担保されており、ここで握りつぶしても二重にfundsAppliedになることはない。
+   * plan再検査。stale/blocker発生時は failed へ倒して例外を投げる（COMMIT前なので安全に再挑戦できる）。
+   * 最新のexecution（他プロセスが既に先へ進めていた場合はそちらを採用）を返す。
    */
-  private safeMarkFailed(id: string, stage: string, reason: string): void {
-    try {
-      this.executions.markFailed(id, stage, reason);
-    } catch (e) {
-      if (!(e instanceof OpeningExecutionTransitionError)) throw e;
+  private assertPlanFresh(execution: OpeningExecutionRow, fromStatus: OpeningExecutionStatus): OpeningExecutionRow {
+    if (execution.status !== fromStatus) {
+      // 既に別プロセスがこの段階より先へ進めていた（＝この場所での再検査はもう自分の仕事ではない）。
+      // resume梯子は execution.status のrankだけで次の工程を判断するので、ここで打ち切ってよい。
+      return execution;
     }
+    const plan = this.planner.dryRun();
+    if (plan.planHash !== execution.planHash || plan.blockers.length > 0) {
+      const after = this.safeMarkFailed(
+        execution,
+        fromStatus,
+        fromStatus,
+        `plan hashが不一致またはblockerが発生: ${plan.blockers.map((b) => b.code).join(",")}`,
+      );
+      throw new OpeningApplyStaleplanError(fromStatus, after.id);
+    }
+    return execution;
   }
 
-  /** manual_review_required への遷移の競合安全版（safeMarkFailedと同じ理由） */
-  private safeMarkManualReview(id: string, reason: string): void {
-    try {
-      this.executions.transition(id, "manual_review_required", { manualReviewReason: reason });
-    } catch (e) {
-      if (!(e instanceof OpeningExecutionTransitionError)) throw e;
-    }
+  /**
+   * markFailed の競合安全版CASラッパー。呼び出し側が最後に観測した `fromStatus` を渡す。
+   * CASが一致しなければ（＝別プロセスが既にこの行を先へ進めていた）、勝者の状態をそのまま
+   * 採用して返す（書き換えない）。
+   */
+  private safeMarkFailed(
+    execution: OpeningExecutionRow,
+    fromStatus: OpeningExecutionStatus,
+    stage: string,
+    reason: string,
+  ): OpeningExecutionRow {
+    const result = this.executions.markFailed(execution.id, fromStatus, stage, reason);
+    return result.execution;
+  }
+
+  /** manual_review_required への遷移のCASラッパー（safeMarkFailedと同じ理由） */
+  private safeMarkManualReview(
+    execution: OpeningExecutionRow,
+    fromStatus: OpeningExecutionStatus,
+    reason: string,
+  ): OpeningExecutionRow {
+    const result = this.executions.transition(execution.id, fromStatus, "manual_review_required", {
+      manualReviewReason: reason,
+    });
+    return result.execution;
   }
 
   private runDestructiveTransaction(
@@ -482,12 +518,22 @@ export class OpeningReset {
 
         // R13: ここまで例外が出なければCOMMITする。executionの'applied'遷移も同じtransaction内で
         // 行い、資金変更とexecution状態を1つのCOMMITで確定させる（部分的な確定を作らない）。
-        return this.executions.transition(execution.id, "applied", {
+        // この時点で fromStatus="applying" のCASが不一致（changes=0）になることは、正しく
+        // 動作していれば起こらない — ここは自分だけがIMMEDIATEロックを保持したまま
+        // R6〜R12まで進めてきた区間であり、他プロセスが同じ行のstatusを動かす余地は無い。
+        // 起きた場合は資金移動込みでROLLBACKさせ、不変条件違反として扱う（fail-closed）。
+        const applied = this.executions.transition(execution.id, "applying", "applied", {
           oldSettlementLandTxId,
           newInvestmentLandTxId,
           openingVersion: FORMAL_OPENING_VERSION,
           postflight,
         });
+        if (!applied.applied) {
+          throw new Error(
+            `不変条件違反: applying状態のexecution(${execution.id})への'applied'遷移がCAS不一致で失敗した`,
+          );
+        }
+        return applied.execution;
       });
       return tx.immediate();
     });

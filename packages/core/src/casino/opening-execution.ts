@@ -280,26 +280,46 @@ export class OpeningExecutionStore {
   }
 
   /**
-   * 状態を進める。未許可の遷移は{@link OpeningExecutionTransitionError}でfail-closed。
-   * `failed -> opening_reset_acquired`（再挑戦）は fundsApplied=true の行では常に拒否する
-   * （FSM表だけでなく、ここでも二重に守る）。
+   * 状態を進める（compare-and-swap）。
+   *
+   * `fromStatus` は呼び出し側が**直前に自分で観測した現在の状態**を渡す。UPDATEの
+   * WHERE句へ `id` と `status = fromStatus` の両方を含め、実際に更新できた行数
+   * （`changes`）だけを成功の根拠にする。
+   *
+   * - `fromStatus` と実際のDB上の状態が一致し、更新できた → `{applied:true, execution:更新後}`
+   * - 一致しなかった（**別プロセスが既にこの行を先へ進めていた**） →
+   *   例外を投げず `{applied:false, execution:実際の最新行}` を返す。呼び出し側は
+   *   「自分は競合に負けたが、資金は誰かが正しく処理した（か、処理中）」として
+   *   `execution`（実際の状態）から続行判断すればよい。
+   * - `fromStatus -> to` がFSM上そもそも許されない遷移（プログラムのバグ・状態設計の誤り）は
+   *   `changes` を見るまでもなく即座に{@link OpeningExecutionTransitionError}で落とす
+   *   （これは競合ではなく論理エラーなので握りつぶさない）。
+   *
+   * `changes === 0` を「実質成功」として黙って読み飛ばすことは絶対にしない
+   * （`applied:false` として呼び出し側へ明示的に伝える）。
    */
-  transition(id: string, to: OpeningExecutionStatus, patch: Partial<OpeningExecutionRow> = {}): OpeningExecutionRow {
-    const run = this.db.transaction((): OpeningExecutionRow => {
-      const current = this.getOrThrow(id);
-      if (!this.canTransition(current.status, to)) {
-        throw new OpeningExecutionTransitionError(current.status, to);
+  transition(
+    id: string,
+    fromStatus: OpeningExecutionStatus,
+    to: OpeningExecutionStatus,
+    patch: Partial<OpeningExecutionRow> = {},
+  ): { applied: boolean; execution: OpeningExecutionRow } {
+    if (!this.canTransition(fromStatus, to)) {
+      throw new OpeningExecutionTransitionError(fromStatus, to);
+    }
+    const run = this.db.transaction((): { applied: boolean; execution: OpeningExecutionRow } => {
+      // fundsApplied=trueの行からの failed -> opening_reset_acquired（再挑戦）は、
+      // CASが一致してもなお拒否する（FSM表とは別の、資金確定後の絶対防御）。
+      if (fromStatus === "failed" && to === "opening_reset_acquired") {
+        const current = this.getRaw(id);
+        if (current?.funds_applied === 1) {
+          throw new OpeningExecutionTransitionError(fromStatus, to);
+        }
       }
-      if (current.status === "failed" && to === "opening_reset_acquired" && current.fundsApplied) {
-        throw new OpeningExecutionTransitionError(current.status, to);
-      }
-      const ts = now();
-      const fundsApplied = current.fundsApplied || to === "applied";
-      const reapplyAllowed = fundsApplied ? false : (patch.reapplyAllowed ?? current.reapplyAllowed);
-      const manualReopenRequired =
-        patch.manualReopenRequired ?? (to === "manual_review_required" ? true : current.manualReopenRequired);
 
-      this.db
+      const ts = now();
+      const fundsApplied = fromStatus !== "failed" && to === "applied" ? true : undefined;
+      const info = this.db
         .prepare(
           `UPDATE casino_opening_executions SET
              status = ?,
@@ -311,16 +331,16 @@ export class OpeningExecutionStore {
              opening_version = COALESCE(?, opening_version),
              postflight_json = COALESCE(?, postflight_json),
              notifier_status = COALESCE(?, notifier_status),
-             funds_applied = ?,
-             reapply_allowed = ?,
-             manual_reopen_required = ?,
+             funds_applied = CASE WHEN ? = 1 THEN 1 ELSE funds_applied END,
+             reapply_allowed = CASE WHEN ? = 1 THEN 0 ELSE reapply_allowed END,
+             manual_reopen_required = CASE WHEN ? = 1 THEN 1 ELSE manual_reopen_required END,
              failure_stage = COALESCE(?, failure_stage),
              failure_reason = COALESCE(?, failure_reason),
              manual_review_reason = COALESCE(?, manual_review_reason),
              updated_at = ?,
-             applied_at = COALESCE(?, applied_at),
-             completed_at = COALESCE(?, completed_at)
-           WHERE id = ?`,
+             applied_at = CASE WHEN ? = 1 THEN ? ELSE applied_at END,
+             completed_at = CASE WHEN ? = 1 THEN ? ELSE completed_at END
+           WHERE id = ? AND status = ?`,
         )
         .run(
           to,
@@ -333,24 +353,44 @@ export class OpeningExecutionStore {
           patch.postflight !== undefined ? JSON.stringify(patch.postflight) : null,
           patch.notifierStatus ?? null,
           fundsApplied ? 1 : 0,
-          reapplyAllowed ? 1 : 0,
-          manualReopenRequired ? 1 : 0,
+          to === "applied" ? 1 : 0,
+          to === "manual_review_required" ? 1 : 0,
           patch.failureStage ?? null,
           patch.failureReason ?? null,
           patch.manualReviewReason ?? null,
           ts,
-          to === "applied" ? ts : null,
-          to === "completed" ? ts : null,
+          to === "applied" ? 1 : 0,
+          ts,
+          to === "completed" ? 1 : 0,
+          ts,
           id,
+          fromStatus,
         );
-      return this.getOrThrow(id);
+      // CASの根拠はここだけ。0件更新を成功扱いにしない。
+      if (info.changes === 0) {
+        return { applied: false, execution: this.getOrThrow(id) };
+      }
+      if (info.changes !== 1) {
+        // id は PRIMARY KEY なので複数行更新は原理的に起こらない。起きたらDB破損の疑い
+        throw new Error(`opening execution CAS update affected ${info.changes} rows (expected 0 or 1): ${id}`);
+      }
+      return { applied: true, execution: this.getOrThrow(id) };
     });
     return this.db.inTransaction ? run() : run.immediate();
   }
 
-  /** failed / manual_review_required の理由付きで停止する（副作用の巻き戻しはこのクラスの責務外） */
-  markFailed(id: string, stage: string, reason: string): OpeningExecutionRow {
-    return this.transition(id, "failed", { failureStage: stage, failureReason: reason });
+  /**
+   * `failed` の理由付きで停止する（副作用の巻き戻しはこのクラスの責務外）。
+   * `fromStatus` とのCASが不一致（＝既に別プロセスが先へ進めていた）場合は
+   * `applied:false` を返すだけで、勝者の状態を書き換えない。
+   */
+  markFailed(
+    id: string,
+    fromStatus: OpeningExecutionStatus,
+    stage: string,
+    reason: string,
+  ): { applied: boolean; execution: OpeningExecutionRow } {
+    return this.transition(id, fromStatus, "failed", { failureStage: stage, failureReason: reason });
   }
 
   /**
