@@ -275,6 +275,21 @@ export class OpeningExecutionStore {
     return this.get(`opening-reset:${planHash}`);
   }
 
+  /**
+   * COMMIT後（`funds_applied=1`）でまだ`completed`に達していない行を探す（CLAUDE.md監査
+   * ブロッカー9）。COMMIT後は`opening_v1`が既にDBへ存在するため、通常の`dryRun()`は
+   * 常に`already_opening_v1` blockerを返してしまい、planHashを再計算する経路
+   * （`getByPlanHash`）ではpost-commit工程の再開に使えない。`funds_applied=1`な行は
+   * その資金移動を行ったexecutionの生涯で一度しか作られないため、planHashに頼らず
+   * 直接探してよい。
+   */
+  findAppliedNotCompleted(): OpeningExecutionRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM casino_opening_executions WHERE funds_applied = 1 AND status != 'completed' LIMIT 1")
+      .get() as Raw | undefined;
+    return row ? fromRaw(row) : undefined;
+  }
+
   private getOrThrow(id: string): OpeningExecutionRow {
     const row = this.get(id);
     if (!row) throw new Error(`opening execution not found: ${id}`);

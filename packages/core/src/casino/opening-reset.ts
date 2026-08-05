@@ -20,6 +20,7 @@ import {
   quoteIdent,
 } from "./opening-canonical.js";
 import {
+  OpeningExecutionConflictError,
   OpeningExecutionStore,
   type OpeningExecutionRow,
   type OpeningExecutionStatus,
@@ -49,6 +50,55 @@ const R6_DELETE_ORDER = [
       !["casino_market_bets", "casino_market_approvals", "casino_chip_refund_saga_targets"].includes(t.table),
   ).map((t) => t.table),
 ];
+
+/** 外部工程の固定idempotencyKey。planHashへ混ぜない理由は下のapply()内コメントを参照 */
+const EXTERNAL_DISABLE_LEGACY_OPERATION_ID = "casino-opening:disable-legacy-vcs";
+
+/**
+ * テスト専用のcrash injection地点（CLAUDE.md監査ブロッカー9）。production の通常経路
+ * （`OpeningResetDeps`経由のconstructor、`apply()`の公開シグネチャ）からはこの型・
+ * フックを一切参照できない。`@meigokujo/core`の公開index（`src/index.ts`）はこの型も
+ * `__setCrashHookForTesting`も再エクスポートしない — テストは`opening-reset.js`を
+ * 内部pathから直接importしてのみ使う。
+ */
+export type OpeningResetCrashPoint =
+  | "before_r6"
+  | "r6_after_delete"
+  | "after_r6"
+  | "before_r7"
+  | "after_r7_transfer"
+  | "before_r8"
+  | "after_r8_transfer"
+  | "after_casino_tx_delete"
+  | "after_casino_tx_groups_delete"
+  | "after_sqlite_sequence_delete"
+  | "after_ether_balances_delete"
+  | "after_house_holder_created"
+  | "after_jackpot_holder_created"
+  | "after_relief_holder_created"
+  | "after_opening_v1_captured"
+  | "v1"
+  | "v2"
+  | "v3"
+  | "v4"
+  | "v5"
+  | "v6"
+  | "v7"
+  | "before_applied_cas"
+  | "after_applied_cas"
+  | "before_commit"
+  | "after_commit"
+  | "before_post_commit_pending"
+  | "after_post_commit_pending"
+  | "before_reopen"
+  | "after_reopen"
+  | "before_completed"
+  | "after_completed"
+  | "before_notifier"
+  | "after_notifier";
+
+/** `point`で例外を投げればcrashを模擬できる。何もしなければ通常どおり進む */
+export type OpeningResetCrashHook = (point: OpeningResetCrashPoint, detail?: string) => void;
 
 export interface PostflightCheck {
   id: string;
@@ -177,6 +227,7 @@ export class OpeningReset {
   private readonly planner: OpeningPlanner;
   private readonly executions: OpeningExecutionStore;
   private readonly chipTx: ChipTx;
+  private crashHookForTesting: OpeningResetCrashHook | null = null;
 
   constructor(private readonly deps: OpeningResetDeps) {
     this.planner = new OpeningPlanner(deps);
@@ -189,7 +240,53 @@ export class OpeningReset {
     return this.executions;
   }
 
+  /**
+   * テスト専用のcrash injectionフックを差し込む（CLAUDE.md監査ブロッカー9）。
+   * `OpeningResetCrashHook`型・このメソッドともに`@meigokujo/core`の公開indexからは
+   * 到達できない内部専用のAPIであり、production側の通常経路から呼ばれることは無い。
+   */
+  __setCrashHookForTesting(hook: OpeningResetCrashHook | null): void {
+    this.crashHookForTesting = hook;
+  }
+
+  private fireCrash(point: OpeningResetCrashPoint, detail?: string): void {
+    this.crashHookForTesting?.(point, detail);
+  }
+
   async apply(input: OpeningApplyInput): Promise<OpeningApplyResult> {
+    // ---- COMMIT後の再開（CLAUDE.md監査ブロッカー9）----
+    // funds_applied=1でまだcompletedでない行が既にあれば、post-commit工程だけを再開する。
+    // COMMIT後は`opening_v1`が既にDBへ存在するため、この後に続く通常経路のdryRun()は
+    // 必ずalready_opening_v1 blockerを返してしまう。以前はここを素通りしていたため、
+    // COMMIT〜completed の間で（crash injectionに限らず、本物の異常終了でも）中断すると、
+    // planHashベースの通常経路からは二度とpost-commit工程を再開できなかった
+    // （R6〜R10・opening_v1 captureが再実行される心配は無いが、post-commit工程自体が
+    //  永久に完了できなくなる恐れがあった。監査中に発見）。
+    const inFlight = this.executions.findAppliedNotCompleted();
+    if (inFlight) {
+      if (inFlight.actorId !== input.actorId) {
+        throw new OpeningExecutionConflictError("actor_mismatch", inFlight.id);
+      }
+      if (inFlight.status === "manual_review_required") {
+        throw new OpeningApplyManualReviewError(
+          inFlight.id,
+          inFlight.manualReviewReason ?? "要運営判断",
+          inFlight.fundsApplied,
+        );
+      }
+      if (!inFlight.backupManifest) {
+        throw new Error(
+          `不変条件違反: execution(${inFlight.id}) は funds_applied=true だが backupManifest が未記録（データ破損の疑い。手動調査が必要）`,
+        );
+      }
+      return this.finishAfterCommit(
+        inFlight,
+        input,
+        inFlight.backupManifest as OpeningBackupManifest,
+        EXTERNAL_DISABLE_LEGACY_OPERATION_ID,
+      );
+    }
+
     // ---- R0: opening_reset状態の取得をapply()自身の権限で行う（CLAUDE.md監査ブロッカー7）----
     // 以前は「CasinoStatusが既にopening_resetであること」を`dryRun()`のblockerとして
     // 前提にしているだけで、execution行が名乗る'opening_reset_acquired'という状態名にも
@@ -320,7 +417,7 @@ export class OpeningReset {
     // 固定のidempotencyKeyを使う（planHashに含めない）。この外部工程は「一度きりの移行操作」であり、
     // plan hashが（無関係な理由で）変わっても同じ現実の操作を指す。planHashを混ぜると、
     // hashが変わるたびに外部adapter側が別操作と誤認し、二重実行の危険がある。
-    const externalOperationId = "casino-opening:disable-legacy-vcs";
+    const externalOperationId = EXTERNAL_DISABLE_LEGACY_OPERATION_ID;
     if (!reached(execution, "external_completed")) {
       if (execution.status === "backup_verified") {
         execution = this.tryTransition(execution, "backup_verified", "external_started");
@@ -383,26 +480,50 @@ export class OpeningReset {
       }
     }
 
+    return this.finishAfterCommit(execution, input, manifest, externalOperationId);
+  }
+
+  /**
+   * COMMIT後の工程（post_commit_pending → completed、notifier）。CLAUDE.md監査ブロッカー9で
+   * 独立メソッドへ分離した: `apply()`の通常経路（destructive transaction成功直後）と、
+   * `apply()`冒頭のCOMMIT後再開経路（`findAppliedNotCompleted()`で見つけた行から直接
+   * 再開する場合）の**両方**がここを通ることで、post-commit工程の再試行ロジックを
+   * 単一箇所に保つ。R6〜R10・opening_v1 captureは、このメソッドのどこからも呼ばれない
+   * （＝COMMIT後は絶対に再実行されない）。
+   */
+  private finishAfterCommit(
+    execution: OpeningExecutionRow,
+    input: OpeningApplyInput,
+    manifest: OpeningBackupManifest,
+    externalOperationId: string,
+  ): OpeningApplyResult {
     // ---- COMMIT後: post-commit状態更新（applied または post_commit_pending で中断していれば再試行）----
     // finishOpeningReset() は「すでにopen」なら ok:true を返す設計（CasinoStatus.reopen）なので、
     // ここを何度再試行してもcasino_statusを壊さない（post-commitはnotifier含め再試行のみ許可）。
+    this.fireCrash("after_commit");
     let casinoReopened = false;
     if (!reached(execution, "completed")) {
       if (execution.status === "applied") {
+        this.fireCrash("before_post_commit_pending");
         execution = this.tryTransition(execution, "applied", "post_commit_pending");
+        this.fireCrash("after_post_commit_pending");
       }
+      this.fireCrash("before_reopen");
       const reopen = this.deps.status.finishOpeningReset(
         `正式開業初期化完了: ${execution.planHash}`,
         input.actorId,
         OPENING_RESET_SEAL,
       );
+      this.fireCrash("after_reopen");
       if (!reopen.ok) {
         const reason = `COMMIT後、賭場をopenへ戻せなかった: ${reopen.reason ?? "unknown"}`;
         this.safeMarkManualReview(execution, "post_commit_pending", reason);
         throw new OpeningApplyManualReviewError(execution.id, reason, true);
       }
       casinoReopened = true;
+      this.fireCrash("before_completed");
       execution = this.tryTransition(execution, "post_commit_pending", "completed");
+      this.fireCrash("after_completed");
     } else {
       casinoReopened = this.deps.status.current().status === "open";
     }
@@ -412,8 +533,10 @@ export class OpeningReset {
     // （未送信を「送った」ことにする虚偽記録になる）。本番Discord・監査チャンネルへの接続は
     // 本PRの範囲外であり、通知配線は別の明示的GOの後で行う。ここに来た時点で資金は既にCOMMIT
     // 済みなので、notifier未配線を失敗として扱ったり資金をrollbackしたりはしない。
+    this.fireCrash("before_notifier");
     const notifierStatus: "sent" | "failed" | "pending" = "pending";
     this.executions.recordNotifierStatus(execution.id, "pending");
+    this.fireCrash("after_notifier");
 
     const finalExecution = this.executions.get(execution.id)!;
     return {
@@ -516,13 +639,17 @@ export class OpeningReset {
         // R5: 進行中エスクロー・板が0であることは freshPlan.blockers===0 で既に再確認済み
 
         // R6: 旧賭場専用データの初期化（blocker=0を証明できたテーブルだけ）
+        this.fireCrash("before_r6");
         for (const table of R6_DELETE_ORDER) {
           if (tableExists(this.deps.db, table)) {
             this.deps.db.prepare(`DELETE FROM ${quoteIdent(table)}`).run();
           }
+          this.fireCrash("r6_after_delete", table);
         }
+        this.fireCrash("after_r6");
 
         // R7: 旧準備口座 → 賭博場部署（旧制度清算）。0なら移動そのものをスキップする
+        this.fireCrash("before_r7");
         const oldReserveLand = this.deps.ledger.balanceOf(ETHER_ESCROW);
         let oldSettlementLandTxId: number | null = null;
         if (oldReserveLand > 0) {
@@ -539,9 +666,11 @@ export class OpeningReset {
             idempotencyKey: `casino-opening:${freshPlan.planHash}:legacy-settlement`,
           });
           oldSettlementLandTxId = settlement.tx.id;
+          this.fireCrash("after_r7_transfer");
         }
 
         // R8: 賭博場部署 → 新準備口座（新制度出資）。R7とは別のLand取引・別のidempotencyKey
+        this.fireCrash("before_r8");
         const investment = this.deps.ledger.transfer({
           from: CASINO_DEPARTMENT_ACCOUNT,
           to: CHIP_ESCROW,
@@ -555,24 +684,32 @@ export class OpeningReset {
           idempotencyKey: `casino-opening:${freshPlan.planHash}:new-investment`,
         });
         const newInvestmentLandTxId = investment.tx.id;
+        this.fireCrash("after_r8_transfer");
 
         // R9: 旧chip storage / casino_tx / casino_tx_groups を初期化し、正式開業状態へ切り替える。
         // 削除順序は外部キー制約に従い casino_tx（子）→casino_tx_groups（親）。
         this.deps.db.prepare("DELETE FROM casino_tx").run();
+        this.fireCrash("after_casino_tx_delete");
         this.deps.db.prepare("DELETE FROM casino_tx_groups").run();
+        this.fireCrash("after_casino_tx_groups_delete");
         // casino_tx.id の AUTOINCREMENT カウンタをリセットする。bootstrap.tsの
         // casino_chip_opening_versionsのコメントが「開業初期化でcasino_txを初期化した場合
         // （新版のIDが旧版より小さくなる）」とid巻き戻りを明示的に前提としており、
         // version_seqはまさにこの巻き戻りに耐えるために設計された機構である。
         this.deps.db.prepare("DELETE FROM sqlite_sequence WHERE name = 'casino_tx'").run();
+        this.fireCrash("after_sqlite_sequence_delete");
         this.deps.db.prepare("DELETE FROM ether_balances").run();
+        this.fireCrash("after_ether_balances_delete");
         const insertBalance = this.deps.db.prepare(
           "INSERT INTO ether_balances (user_id, amount, updated_at) VALUES (?, ?, ?)",
         );
         const ts = now();
         insertBalance.run(HOUSE_HOLDER, config.openingHouse, ts);
+        this.fireCrash("after_house_holder_created");
         insertBalance.run(JACKPOT_HOLDER, config.openingJackpot, ts);
+        this.fireCrash("after_jackpot_holder_created");
         insertBalance.run(RELIEF_HOLDER, config.openingRelief, ts);
+        this.fireCrash("after_relief_holder_created");
 
         // R10: opening_v1 開始残高を確立する（同時にR11相当: current versionがopening_v1へ切り替わる）
         const captured = this.chipTx.captureOpening(
@@ -585,6 +722,7 @@ export class OpeningReset {
           { poolLand: config.openingCapital, fromLedgerTxId: newInvestmentLandTxId },
         );
         if (!captured) throw new Error("opening_v1 は既に存在する（二重開業の検出漏れ）");
+        this.fireCrash("after_opening_v1_captured");
 
         // R12: 同一トランザクション内でpostflight V1〜V7
         const postflight = this.runPostflightChecks(initialPlan, config, {
@@ -603,17 +741,20 @@ export class OpeningReset {
         // 動作していれば起こらない — ここは自分だけがIMMEDIATEロックを保持したまま
         // R6〜R12まで進めてきた区間であり、他プロセスが同じ行のstatusを動かす余地は無い。
         // 起きた場合は資金移動込みでROLLBACKさせ、不変条件違反として扱う（fail-closed）。
+        this.fireCrash("before_applied_cas");
         const applied = this.executions.transition(execution.id, "applying", "applied", {
           oldSettlementLandTxId,
           newInvestmentLandTxId,
           openingVersion: FORMAL_OPENING_VERSION,
           postflight,
         });
+        this.fireCrash("after_applied_cas");
         if (!applied.applied) {
           throw new Error(
             `不変条件違反: applying状態のexecution(${execution.id})への'applied'遷移がCAS不一致で失敗した`,
           );
         }
+        this.fireCrash("before_commit");
         return applied.execution;
       });
       return tx.immediate();
@@ -634,27 +775,33 @@ export class OpeningReset {
     const push = (id: string, ok: boolean, detail: string) => checks.push({ id, ok, detail });
 
     // V1: 全chip holder合計 = sys:escrow:casino のLand残高
+    this.fireCrash("v1");
     const outstanding = this.deps.chips.outstanding();
     const reserve = this.deps.ledger.balanceOf(CHIP_ESCROW);
     push("V1", outstanding === reserve, `outstanding=${outstanding} reserve=${reserve}`);
 
     // V2: Land ledger integrity OK
+    this.fireCrash("v2");
     const ledgerCheck = this.deps.ledger.verifyIntegrity();
     push("V2", ledgerCheck.ok, ledgerCheck.ok ? "ok" : `${ledgerCheck.mismatches.length}件不一致`);
 
     // V3: opening_v1開始残高 + 以降のchip取引 = 現在chip残高
+    this.fireCrash("v3");
     const balanceCheck = this.chipTx.verifyBalances(FORMAL_OPENING_VERSION);
     push("V3", balanceCheck.ok, balanceCheck.ok ? "ok" : `${balanceCheck.mismatches.length}件不一致`);
 
     // V4: escrow台帳とescrow holder検算
+    this.fireCrash("v4");
     const escrowCheck = this.deps.chipAssets.verifyEscrowed();
     push("V4", escrowCheck.ok, escrowCheck.ok ? "ok" : `${escrowCheck.mismatches.length}件不一致`);
 
     // V5: 系全体検算D
+    this.fireCrash("v5");
     const checkD = this.deps.integrity.checkD();
     push("V5", checkD.ok, checkD.detail);
 
     // V6: 旧制度holder／未完了義務が0（ether_balancesがhouse/jackpot/relief以外を持たない）
+    this.fireCrash("v6");
     const strayHolders = (
       this.deps.db
         .prepare("SELECT COUNT(*) AS n FROM ether_balances WHERE user_id NOT IN (?,?,?)")
@@ -663,6 +810,7 @@ export class OpeningReset {
     push("V6", strayHolders === 0, `stray holders=${strayHolders}`);
 
     // V7: sys:escrow:ether Land = 0
+    this.fireCrash("v7");
     const etherEscrowLand = this.deps.ledger.balanceOf(ETHER_ESCROW);
     push("V7", etherEscrowLand === 0, `sys:escrow:ether=${etherEscrowLand}`);
 
