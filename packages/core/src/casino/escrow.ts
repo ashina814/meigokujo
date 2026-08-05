@@ -44,6 +44,62 @@ class EscrowShortfall extends Error {
   }
 }
 
+/** hold() の取り違え検出に使う要求の指紋。groupKey（session+user+operationId）に対して一意であるべき内容 */
+interface HoldFingerprint {
+  sessionId: string;
+  userId: string;
+  amount: number;
+  game: string;
+}
+
+/** hold() がグループに保存する形（新規グループのみ。legacy は素の boolean） */
+interface HoldStoredResult {
+  ok: boolean;
+  fingerprint: HoldFingerprint;
+}
+
+function holdFingerprintsEqual(a: HoldFingerprint, b: HoldFingerprint): boolean {
+  return a.sessionId === b.sessionId && a.userId === b.userId && a.amount === b.amount && a.game === b.game;
+}
+
+/** holdAll() の取り違え検出に使う要求の指紋。participants は順序を無視するので常に sort 済みで持つ */
+interface HoldAllFingerprint {
+  sessionId: string;
+  game: string;
+  amount: number;
+  participants: string[];
+}
+
+/** holdAll() がグループに保存する形（新規グループのみ。legacy は素の boolean true） */
+interface HoldAllStoredResult {
+  ok: boolean;
+  fingerprint: HoldAllFingerprint;
+}
+
+function holdAllFingerprintsEqual(a: HoldAllFingerprint, b: HoldAllFingerprint): boolean {
+  return (
+    a.sessionId === b.sessionId &&
+    a.game === b.game &&
+    a.amount === b.amount &&
+    a.participants.length === b.participants.length &&
+    a.participants.every((u, i) => u === b.participants[i])
+  );
+}
+
+/**
+ * holdAll() の重複 userId を初回・replay を問わず拒否する。
+ * 重複は「同じ人から二重徴収したいのか、指定ミスか」を区別できず、取り違えの温床になる。
+ */
+function assertNoDuplicateUserIds(userIds: readonly string[], context: string): void {
+  const seen = new Set<string>();
+  for (const userId of userIds) {
+    if (seen.has(userId)) {
+      throw new Error(`${context}: duplicate userId "${userId}" in participant list`);
+    }
+    seen.add(userId);
+  }
+}
+
 /** セッションIDから専用保有者のIDを作る。他モジュールも同じ命名規則で作ること */
 export const escrowHolderFor = (sessionId: string): string => `escrow:session:${sessionId}`;
 
@@ -112,15 +168,71 @@ export class Escrow {
    * user から amount を徴収してセッション専用保有者に預け、台帳に記録する。
    * 同一セッション・同一ユーザーの2回目以降は加算（丁半の増額など）。
    * 残高不足なら false（何も動かさない）。
+   *
+   * ## 取り違え対策（PR11独立監査 #50・フォローアップ）
+   *
+   * `runGroup` の冪等キーは session_id + user_id + operationId だけで、**要求内容
+   * （amount / game）は鍵に含まれない**。同じ operationId を別の amount・game で
+   * 呼ぶ取り違えが起きると、`runGroup` は保存済みの真偽値をそのまま replay するだけ
+   * なので、実際には1回目の額しか動いていないのに2回目の要求が通ったかのような
+   * true を返しかねない。
+   *
+   * 新規グループは本体の戻り値に要求 fingerprint（sessionId/userId/amount/game）を
+   * 含めて保存し、replay 時にいまの引数と突き合わせる。true の側は**さらに**実際に
+   * 動いた `casino_tx` 明細（from/to/amount/game/session_id/件数/tx_kind）を読み直して
+   * 二重に検証する——fingerprint は「本体を通さず保存された値」を信じる形なので、
+   * 台帳そのものとの一致まで見て初めて「本当にその内容で預かった」と言える。
+   *
+   * ### legacy（この変更より前に確定した生の true/false）との互換
+   * - **true**: fingerprint が無いので、`casino_tx` 明細だけを唯一の証拠として検証する
+   *   （明細は不変の監査記録なので、legacy でも新規でも同じ検証関数が使える）。
+   * - **false**: このコードより前の `hold()` は残高不足を「本体を通して確定した false」
+   *   として保存していたが、当時は要求内容を一切残していない。`casino_tx` にも明細が
+   *   無い（何も移していないので）。つまり **false 側だけは、legacy 分に限り要求内容を
+   *   検証する手段が存在しない**。ここで「たまたま今回の amount/game が一致するかもしれない」
+   *   と推測して通すのは fail-closed の原則に反するので、**legacy の false は無条件で
+   *   conflict 扱いにする**（同じ operationId を使い回さない運用を強制する）。
+   *   新規に確定した false は fingerprint を持つので、通常どおり突き合わせて判定する。
+   *
+   * ## nested 呼び出し（例: ルーレット）は台帳突き合わせの対象外
+   * `roulette:bet:*` のように、他の `runGroup` の**中から**呼ばれる hold() は、
+   * `ChipTx.runGroup` が「すでに active なグループがあれば新しいグループを作らず
+   * 本体を素通しする」ため、この groupKey 自体は `getGroup`/replay の対象にならず、
+   * 呼ばれるたびに本体がそのまま実行される（fingerprint の食い違いは原理上起きない）。
+   * さらに、実際に動いた `casino_tx` の明細は**外側の active なグループのキー**に
+   * 記録される（この hold() 自身の groupKey には明細が残らない）ため、台帳突き合わせ
+   * （`assertHoldLedgerMatches`）を nested 時にそのまま実行すると「明細が0件」で
+   * 常に誤検出してしまう。そのため nested 時は台帳突き合わせを行わない
+   * （fingerprint 比較は残すが、body が毎回フレッシュに実行される以上は常に一致し無害）。
+   * **取り違えの検出は外側の呼び出し元が自分の fingerprint で行う責任を持つ**
+   * （`acceptRouletteBet` 参照。外側が settled なら、この hold() 自体が一度も
+   * 呼ばれずに外側の body ごとスキップされるため、ここでは検出できない）。
+   *
+   * ## 台帳突き合わせは commit 前（グループの中）でも行う
+   * 新規実行（このグループを初めて作った側）の台帳突き合わせは、`runGroup` の
+   * コールバックの**中**、送金・`casino_escrow` 更新の直後で行う。ここで検出して
+   * 例外を投げれば、送金・`casino_escrow` 行・グループ行・`casino_tx` 行が
+   * **同じ SQLite トランザクションで丸ごとロールバック**する。
+   * コールバックの外（`runGroup` が返ったあと）でしか見ないと、その時点でもう
+   * トランザクションは commit 済みなので、「不一致を検出して conflict を投げた」のに
+   * 実際の資金移動は取り消せない——検出はできても原子性が壊れる。
+   * コールバックの外の突き合わせ（下記）は、**body が実行されない replay 経路**
+   * （既存の legacy true 行・新規グループの保存済み true replay・別プロセス競合で
+   * 先に確定していた側）のためのもので、新規実行では二重チェックになるだけで無害。
    */
   hold(sessionId: string, userId: string, amount: number, game: string, operationId: string): boolean {
     if (!Number.isInteger(amount) || amount <= 0) return false;
     const holder = escrowHolderFor(sessionId);
+    const groupKey = `escrow:hold:${sessionId}:${userId}:${operationId}`;
+    const context = `escrow hold ${sessionId}:${userId}:${operationId}`;
+    const fingerprint: HoldFingerprint = { sessionId, userId, amount, game };
+    const nested = this.ether.chipTx.isActive();
+    let stored: boolean | HoldStoredResult;
     try {
-      return this.ether.runGroup({ groupKey: `escrow:hold:${sessionId}:${userId}:${operationId}`, kind: "table_hold", actorId: userId }, () => {
+      stored = this.ether.runGroup({ groupKey, kind: "table_hold", actorId: userId }, (): HoldStoredResult => {
         // 残高判定はグループの中。外でやると、預託成功後の再試行が
         // 「保存済みの結果（true）を返す」前に残高不足で false になる
-        if (this.ether.balanceOf(userId) < amount) return false;
+        if (this.ether.balanceOf(userId) < amount) return { ok: false, fingerprint };
         this.ether.transfer(userId, holder, amount, { reason: "卓への預託", game, sessionId });
         this.db
           .prepare(
@@ -128,11 +240,74 @@ export class Escrow {
              ON CONFLICT(session_id, user_id) DO UPDATE SET amount = amount + excluded.amount, source = excluded.source`,
           )
           .run(sessionId, userId, amount, game, holder, now());
-        return true;
+        // commit前の突き合わせ（このコールバック内で例外を投げれば上の送金・INSERTごと
+        // ロールバックする）。nested時は自分のgroupKeyに明細が付かないので省略
+        if (!nested) this.assertHoldLedgerMatches(groupKey, userId, holder, amount, game, sessionId, context);
+        return { ok: true, fingerprint };
       });
     } catch (e) {
       if (e instanceof ChipLedgerError) return false;
       throw e;
+    }
+
+    if (typeof stored === "boolean") {
+      // legacy: この変更より前に確定した生の真偽値（fingerprint を持たない）。
+      // body は実行されていない（既存グループが replay された）ので、ここで初めて検証する。
+      // nested からは`getGroup`が呼ばれないのでここには来ない（legacy 行は常に非nested）
+      if (!stored) {
+        throw new Error(
+          `escrow operation conflict: ${context} is a legacy unverifiable false result (no request fingerprint, no ledger entry to check against) — refusing to assume the requested amount/game match. Use a new operationId.`,
+        );
+      }
+      this.assertHoldLedgerMatches(groupKey, userId, holder, amount, game, sessionId, context);
+      return true;
+    }
+
+    if (!holdFingerprintsEqual(stored.fingerprint, fingerprint)) {
+      throw new Error(
+        `escrow operation conflict: ${context} stored request ${JSON.stringify(stored.fingerprint)} != requested ${JSON.stringify(fingerprint)}`,
+      );
+    }
+    // fresh実行ならコールバック内で既に検証済み（ここは無害な再確認）。
+    // 保存済みreplay・別プロセス競合ならbodyが実行されていないので、ここが唯一の検証機会
+    if (stored.ok && !nested) this.assertHoldLedgerMatches(groupKey, userId, holder, amount, game, sessionId, context);
+    return stored.ok;
+  }
+
+  /**
+   * グループが実際に holder へ移した額の明細（from/to/amount/game/session_id/件数/tx_kind）が
+   * 要求どおりかを見る。一致しなければ fail-closed で例外にする。
+   *
+   * legacy の true・新規の true のどちらも、この関数だけで検証できる
+   * （`casino_tx` は不変の監査記録なので、いつ確定したグループかを問わない）。
+   */
+  private assertHoldLedgerMatches(
+    groupKey: string,
+    userId: string,
+    toHolder: string,
+    amount: number,
+    game: string,
+    sessionId: string,
+    context: string,
+  ): void {
+    const rows = this.ether.chipTx.listByGroup(groupKey);
+    if (rows.length !== 1) {
+      throw new Error(`escrow operation conflict: ${context} expected exactly 1 ledger entry, found ${rows.length}`);
+    }
+    const tx = rows[0]!;
+    if (
+      tx.tx_kind !== "internal_transfer" ||
+      tx.from_holder !== userId ||
+      tx.to_holder !== toHolder ||
+      tx.amount !== amount ||
+      tx.game !== game ||
+      tx.session_id !== sessionId
+    ) {
+      throw new Error(
+        `escrow operation conflict: ${context} stored ledger entry ${JSON.stringify({
+          from: tx.from_holder, to: tx.to_holder, amount: tx.amount, game: tx.game, sessionId: tx.session_id, kind: tx.tx_kind,
+        })} != requested ${JSON.stringify({ from: userId, to: toHolder, amount, game, sessionId, kind: "internal_transfer" })}`,
+      );
     }
   }
 
@@ -140,19 +315,44 @@ export class Escrow {
    * 複数人からまとめて預託する（対人卓の参加徴収）。**全員ぶんで1グループ**。
    *
    * 途中の1人が足りなければ例外でグループごと巻き戻すので、先に取った人の分も残らない
-   * （「1人目だけ徴収されて卓が立たない」状態を作らない）。
-   * 事前の残高確認もグループの中で行う。外でやると、成功後の再試行が
-   * 「保存済みの結果（true）を返す」前に残高不足で false になる。
+   * （「1人目だけ徴収されて卓が立たない」状態を作らない）。事前の残高確認もグループの
+   * 中で行う。外でやると、成功後の再試行が「保存済みの結果（true）を返す」前に
+   * 残高不足で false になる。
+   *
+   * `hold()` と違い、残高不足は**例外**でグループごと巻き戻す（＝グループが確定しない）ので、
+   * false は常に「その場で再計算された結果」であり、legacy の false replay 問題は存在しない
+   * （false を保存済みグループとして持つことがそもそも無い）。取り違え対策が要るのは
+   * **成功（true）** 側だけ: 同じ operationId を別の amount・game・参加者構成で呼ぶと、
+   * `runGroup` が保存済みの true を要求内容の検証なしに replay してしまう。
+   *
+   * 参加者は**順序を無視した集合**として比較する（張る順序が違うだけの同一操作を弾かない
+   * ため）。同一呼び出し内の重複 userId は、取り違えの温床になる（同じ人から二重徴収の
+   * つもりが片方だけ記録される等）ため、amount の妥当性すら問わず・初回呼び出し・replay を
+   * 問わず常に最初に拒否する。
+   *
+   * 台帳突き合わせは `hold()` と同じく commit 前（`runGroup` コールバックの中、全員ぶんの
+   * 送金・`casino_escrow` 更新が終わった直後）でも行う。理由も `hold()` と同じ:
+   * コールバックの外でしか見ないと、検出した時点でもう commit 済みで原子性が壊れる。
    *
    * @returns 全員から預かれたら true。1人でも足りなければ false（誰からも取らない）
    */
   holdAll(sessionId: string, userIds: readonly string[], amount: number, game: string, operationId: string): boolean {
+    assertNoDuplicateUserIds(userIds, `escrow holdAll ${sessionId}:${operationId}`);
     if (!Number.isInteger(amount) || amount <= 0) return false;
     const holder = escrowHolderFor(sessionId);
+    const groupKey = `escrow:hold_all:${sessionId}:${operationId}`;
+    const context = `escrow holdAll ${sessionId}:${operationId}`;
+    const fingerprint: HoldAllFingerprint = { sessionId, game, amount, participants: [...userIds].sort() };
+    // nested（他の runGroup の中から呼ばれた）場合は、実際の明細が外側グループのキーに
+    // 記録されるため、この groupKey で台帳突き合わせをすると常に「0件」と誤検出する。
+    // hold() 側と同じ理由で nested 時は台帳突き合わせを省略する（現状の生産コードに
+    // nested な holdAll 呼び出しは無いが、将来の呼び出し元のために備える）
+    const nested = this.ether.chipTx.isActive();
+    let stored: boolean | HoldAllStoredResult;
     try {
-      return this.ether.runGroup(
-        { groupKey: `escrow:hold_all:${sessionId}:${operationId}`, kind: "table_hold", actorId: "system:escrow" },
-        (): boolean => {
+      stored = this.ether.runGroup(
+        { groupKey, kind: "table_hold", actorId: "system:escrow" },
+        (): HoldAllStoredResult => {
           for (const userId of userIds) {
             if (this.ether.balanceOf(userId) < amount) throw new EscrowShortfall(userId);
             this.ether.transfer(userId, holder, amount, { reason: "卓への預託", game, sessionId });
@@ -163,13 +363,74 @@ export class Escrow {
               )
               .run(sessionId, userId, amount, game, holder, now());
           }
-          return true;
+          // commit前の突き合わせ。ここで例外を投げれば全員ぶんの送金・INSERTごとロールバックする
+          if (!nested) this.assertHoldAllLedgerMatches(groupKey, fingerprint.participants, holder, amount, game, sessionId, context);
+          return { ok: true, fingerprint };
         },
       );
     } catch (e) {
-      // 足りない人がいた／送金が通らなかった → グループごと巻き戻り済み。誰からも取っていない
+      // 足りない人がいた／送金が通らなかった → グループごと巻き戻り済み。誰からも取っていない。
+      // グループが確定していないので replay の対象にもならない（次回また新規実行される）
       if (e instanceof EscrowShortfall || e instanceof ChipLedgerError) return false;
       throw e;
+    }
+
+    if (typeof stored === "boolean") {
+      // legacy: この変更より前に確定した生の true（holdAll の false は上記の理由で存在しない）。
+      // body は実行されていない（既存グループが replay された）ので、ここで初めて検証する
+      if (!nested) this.assertHoldAllLedgerMatches(groupKey, fingerprint.participants, holder, amount, game, sessionId, context);
+      return true;
+    }
+    if (!holdAllFingerprintsEqual(stored.fingerprint, fingerprint)) {
+      throw new Error(
+        `escrow operation conflict: ${context} stored request ${JSON.stringify(stored.fingerprint)} != requested ${JSON.stringify(fingerprint)}`,
+      );
+    }
+    // fresh実行ならコールバック内で既に検証済み（ここは無害な再確認）。
+    // 保存済みreplay・別プロセス競合ならbodyが実行されていないので、ここが唯一の検証機会
+    if (!nested) this.assertHoldAllLedgerMatches(groupKey, fingerprint.participants, holder, amount, game, sessionId, context);
+    return stored.ok;
+  }
+
+  /**
+   * holdAll のグループが実際に holder へ移した明細一式が要求どおりかを見る:
+   * 件数 === 参加者数、各行が tx_kind=internal_transfer / to_holder=holder / amount / game /
+   * session_id 一致、かつ from_holder の集合が参加者集合とちょうど一致する（過不足なし）。
+   */
+  private assertHoldAllLedgerMatches(
+    groupKey: string,
+    participants: readonly string[],
+    toHolder: string,
+    amount: number,
+    game: string,
+    sessionId: string,
+    context: string,
+  ): void {
+    const rows = this.ether.chipTx.listByGroup(groupKey);
+    if (rows.length !== participants.length) {
+      throw new Error(
+        `escrow operation conflict: ${context} expected ${participants.length} ledger entries, found ${rows.length}`,
+      );
+    }
+    const seen = new Set<string>();
+    for (const tx of rows) {
+      if (
+        tx.tx_kind !== "internal_transfer" ||
+        !tx.from_holder ||
+        tx.to_holder !== toHolder ||
+        tx.amount !== amount ||
+        tx.game !== game ||
+        tx.session_id !== sessionId
+      ) {
+        throw new Error(`escrow operation conflict: ${context} unexpected ledger entry ${JSON.stringify(tx)}`);
+      }
+      seen.add(tx.from_holder);
+    }
+    const expected = new Set(participants);
+    if (seen.size !== expected.size || [...expected].some((u) => !seen.has(u))) {
+      throw new Error(
+        `escrow operation conflict: ${context} ledger participants ${JSON.stringify([...seen].sort())} != requested ${JSON.stringify([...expected].sort())}`,
+      );
     }
   }
 

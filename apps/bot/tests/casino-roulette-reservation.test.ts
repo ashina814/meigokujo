@@ -276,3 +276,73 @@ describe("voidRouletteTable: 返金と予約解放を同じトランザクショ
     expect(c.reservations.get(RESERVATION_KEY(session))).toBeUndefined();
   });
 });
+
+/**
+ * PR11独立監査 #50 フォローアップ: `escrow.hold()` は `roulette:bet:*` という外側グループの
+ * 中から呼ばれる nested 呼び出しなので、hold() 自身の取り違え検出はそもそも実行されない
+ * （外側グループが settled なら本体ごとスキップされ、hold() は一度も呼ばれない）。
+ * 取り違え検出は `acceptRouletteBet` 自身が外側グループの戻り値（要求指紋）で行う。
+ */
+describe("acceptRouletteBet: 外側グループ(roulette:bet:*)自体の取り違え検出", () => {
+  it("同じoperationIdを別のtype/amountで呼んでも、実際に預かった内容は書き換わらない（bets/エスクローとも初回のまま）", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    seed(c.db, "alice", 100_000);
+    const session = "roulette:s1";
+    const bets = new Map();
+
+    const first = acceptRouletteBet(c.services, session, bets, "alice", "red", 1_000, "op1");
+    expect(first.ok).toBe(true);
+    expect(bets.get("alice")).toEqual({ userId: "alice", type: "red", amount: 1_000 });
+    expect(c.escrow.poolOf(session)).toBe(1_000);
+
+    // 同じ operationId（= 同じ外側グループキー）を別の type・amount で呼ぶ取り違え。
+    // 外側グループは既に settled なので、runGroup は本体（escrow.hold 呼び出しを含む）を
+    // 一度も実行せず保存済みの指紋を返すだけ——それでも bets を書き換えて資金と食い違う
+    // 状態を作ってはいけない
+    const second = acceptRouletteBet(c.services, session, bets, "alice", "black", 5_000, "op1");
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.reason).toBe("conflict");
+
+    // bets・エスクローとも初回のまま。5,000は徴収されておらず、type も black に化けていない
+    expect(bets.get("alice")).toEqual({ userId: "alice", type: "red", amount: 1_000 });
+    expect(c.escrow.poolOf(session)).toBe(1_000);
+    expect(c.ether.balanceOf("alice")).toBe(100_000 - 1_000);
+  });
+
+  it("amountだけ違う（typeは同じ）取り違えもconflictにする", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    seed(c.db, "alice", 100_000);
+    const session = "roulette:s1";
+    const bets = new Map();
+
+    acceptRouletteBet(c.services, session, bets, "alice", "red", 1_000, "op1");
+    const second = acceptRouletteBet(c.services, session, bets, "alice", "red", 2_000, "op1");
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.reason).toBe("conflict");
+    expect(bets.get("alice")).toEqual({ userId: "alice", type: "red", amount: 1_000 });
+  });
+
+  it("legacy: この変更より前に確定した外側グループ(値を返さない=result_json NULL)のreplayは、type/amountを検証できないので無条件でconflictにする", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    seed(c.db, "alice", 100_000);
+    const session = "roulette:s1";
+    const bets = new Map();
+
+    acceptRouletteBet(c.services, session, bets, "alice", "red", 1_000, "op1");
+    // この変更より前のコードを模す: 外側グループの result_json を NULL に戻す
+    // （当時の本体は値を返していなかったので、finishGroup は NULL を保存していた）
+    c.db
+      .prepare("UPDATE casino_tx_groups SET result_json = NULL WHERE group_key = ?")
+      .run(`roulette:bet:${session}:alice:op1`);
+
+    // 同じ type・amount で呼び直しても、legacy行はfingerprintを持たないので検証できず、
+    // fail-closedでconflict扱いにする（「たまたま一致するかもしれない」を信じない）
+    const replayed = acceptRouletteBet(c.services, session, bets, "alice", "red", 1_000, "op1");
+    expect(replayed.ok).toBe(false);
+    if (!replayed.ok) expect(replayed.reason).toBe("conflict");
+    expect(bets.get("alice")).toEqual({ userId: "alice", type: "red", amount: 1_000 }); // 書き換わっていない
+  });
+});

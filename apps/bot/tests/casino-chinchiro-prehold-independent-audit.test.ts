@@ -468,13 +468,11 @@ describe("PR11独立監査5: operationId conflict", () => {
     expect(ctx.chips.balanceOf(holder)).toBe(2_000); // 増えていない
   });
 
-  it("【既知の限界・PR11範囲外】生のescrow.hold()は額の不一致を見ずに保存済みboolをreplayする", () => {
-    // これは「安全」の確認テストではない。escrow.hold() の group key は
-    // session_id + user_id + operationId だけで、要求額を見ずに保存済みの bool を
-    // 返す（PR2 由来、チンチロ以外の既存呼び出し全般に共通する挙動）。
-    // 額を鍵に含めていないので、理屈の上では「2,000のつもりで呼んだのに実は500しか
-    // 確保されていない」状態を作れてしまう——ここではその生の挙動を明文化するだけで、
-    // 正常仕様として固定しない。conflict化するかどうかは PR11 の範囲外として別途判断する。
+  it("生のescrow.hold()も同一operationIdで異なる額を要求されればconflictで拒否する（PR11範囲外の限界を解消）", () => {
+    // かつてはここで「保存済みの true を額の検証なしに replay する」限界があった
+    // （session_id + user_id + operationId だけを鍵にしていたため）。
+    // ensureFreeChips() と同じ監査項目（stored amount と requested amount の突合）を
+    // escrow.hold() 自身に持たせたので、生の hold() 単体を叩いても取り違えは通らない。
     const ctx = setup();
     fund(ctx, "u1", 10_000);
     const sessionId = chinchiroPreholdSessionId("u1", "op-1");
@@ -482,13 +480,18 @@ describe("PR11独立監査5: operationId conflict", () => {
     const holder = ctx.escrow.holderId(sessionId);
     expect(ctx.chips.balanceOf(holder)).toBe(500);
 
-    // 額を検証せず、保存済みの true を返すだけ（実際には 2,000 になっていない）
-    expect(ctx.escrow.hold(sessionId, "u1", 2_000, "チンチロ", "op-1")).toBe(true);
+    // 額を検証し、conflict として例外を投げる（実際には 2,000 になっていない、を隠さない）
+    expect(() => ctx.escrow.hold(sessionId, "u1", 2_000, "チンチロ", "op-1")).toThrow(/operation conflict/);
+    expect(ctx.chips.balanceOf(holder)).toBe(500); // 何も動いていない
+
+    // 同じ額での再試行は従来どおり replay される（冪等性は保たれる）
+    expect(ctx.escrow.hold(sessionId, "u1", 500, "チンチロ", "op-1")).toBe(true);
     expect(ctx.chips.balanceOf(holder)).toBe(500);
 
     // チンチロの実経路がここへ到達しないのは、上の「同一user・同一operationIdで
     // 異なるbetはconflict」テストが示すとおり、escrow.hold() より前に
-    // ensureFreeChips() が同じ検証（同一operationIdで異なるrequired）を行うため
+    // ensureFreeChips() が同じ検証（同一operationIdで異なるrequired）を行うため。
+    // 今回の変更で escrow.hold() 自身もその2段目として同じ性質を持つようになった。
   });
 });
 

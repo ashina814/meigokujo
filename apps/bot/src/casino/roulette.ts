@@ -70,7 +70,16 @@ class RouletteEscrowShortfall extends Error {
 export type AcceptRouletteBetResult =
   | { ok: true }
   | { ok: false; reason: "capacity"; available: number }
-  | { ok: false; reason: "broke" };
+  | { ok: false; reason: "broke" }
+  | { ok: false; reason: "conflict" };
+
+/** 外側グループ（`roulette:bet:*`）の要求指紋。replay 時に今回の引数と突き合わせる */
+interface RouletteBetFingerprint {
+  session: string;
+  userId: string;
+  type: BetType;
+  amount: number;
+}
 
 /**
  * 卓へのベット受付（新規・張り増し・張り直し）を1つの原子操作として行う（PR5）。
@@ -83,6 +92,31 @@ export type AcceptRouletteBetResult =
  * 2〜4 を**同じ業務グループ**にまとめてあるので、途中のどこで失敗しても
  * 予約・エスクロー・呼び出し側の `bets` マップが食い違わない
  * （成功したときだけ `bets` を書き換える。失敗時は3点とも直前の状態のまま）。
+ *
+ * ## 取り違え対策（PR11独立監査 #50・フォローアップ）
+ *
+ * `services.escrow.hold()` はこの関数の**外側グループの中から**呼ばれる nested 呼び出しで、
+ * `ChipTx.runGroup` は「すでに active な外側グループがあれば新しいグループを作らず本体を
+ * 素通しする」ため、hold() 自身の取り違え検出には（内側の `escrow:hold:*` キーの replay 判定
+ * にはそもそも来ないので）到達しない。**さらに悪いことに**、外側グループ自体が既に settled
+ * なら `runGroup` は本体（＝ hold() 呼び出しそのもの）ごと実行せず保存済みの結果を返すだけなので、
+ * 同じ operationId を別の type・amount で呼び直すと、hold() は一度も呼ばれないまま
+ * `bets.set(userId, { userId, type, amount })` だけが**今回の**（実際には預かっていない）
+ * type・amount で実行されてしまう——エスクローの実額と `bets` マップの内容が食い違う。
+ *
+ * そのため、外側グループ自身の戻り値に要求指紋（session/userId/type/amount）を積み、
+ * replay されたときにいまの引数と突き合わせる。不一致（＝取り違え）なら `bets` を更新せず
+ * `{ ok: false, reason: "conflict" }` を返す。
+ *
+ * この関数は Discord のボタン collector から直接呼ばれ、呼び出し側は
+ * `void (async () => {...})()` で fire-and-forget しており、プロセス全体に波及する
+ * unhandled rejection を避ける必要がある。したがって conflict は例外ではなく
+ * `AcceptRouletteBetResult` の一種として返し、呼び出し側が通常のエラー応答として処理する。
+ *
+ * ### legacy（この変更より前に確定した外側グループ）との互換
+ * 以前の本体は値を返していなかった（`undefined` が保存される）。type はどこにも永続化
+ * されないため、legacy の replay からは要求内容を一切復元できない。fail-closed の原則により、
+ * legacy な外側グループの replay は**無条件で** conflict 扱いにする。
  */
 export function acceptRouletteBet(
   services: Services,
@@ -97,10 +131,12 @@ export function acceptRouletteBet(
   const wantedTotal = tableLiabilityOf([...otherBets, { userId, type, amount }]);
   const reservationKey = reservationKeyFor(session);
   const wasRebet = bets.has(userId);
+  const requested: RouletteBetFingerprint = { session, userId, type, amount };
+  let stored: RouletteBetFingerprint | undefined;
   try {
-    services.chips.runGroup(
+    stored = services.chips.runGroup(
       { groupKey: `roulette:bet:${session}:${userId}:${operationId}`, kind: "table_hold", actorId: userId },
-      () => {
+      (): RouletteBetFingerprint => {
         const r = services.reservations.resize(reservationKey, wantedTotal, "ルーレット", RESERVATION_OWNER);
         if (!r.ok) throw new RouletteCapacityError(wantedTotal, r.available);
         // 張り直しは上書き: 前の張りを返してから新しい額をエスクロー
@@ -108,12 +144,26 @@ export function acceptRouletteBet(
         if (!services.escrow.hold(session, userId, amount, "roulette", operationId)) {
           throw new RouletteEscrowShortfall();
         }
+        return requested;
       },
     );
   } catch (e) {
     if (e instanceof RouletteCapacityError) return { ok: false, reason: "capacity", available: e.available };
     if (e instanceof RouletteEscrowShortfall) return { ok: false, reason: "broke" };
     throw e;
+  }
+  if (
+    stored === undefined || // legacy: この変更より前に確定した外側グループ（値を返していない）
+    stored.session !== session ||
+    stored.userId !== userId ||
+    stored.type !== type ||
+    stored.amount !== amount
+  ) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[roulette] bet operation conflict: session=${session} userId=${userId} operationId=${operationId} stored=${JSON.stringify(stored)} requested=${JSON.stringify(requested)}`,
+    );
+    return { ok: false, reason: "conflict" };
   }
   bets.set(userId, { userId, type, amount });
   return { ok: true };
@@ -348,6 +398,10 @@ export async function playRoulette(
         if (!accepted.ok) {
           if (accepted.reason === "capacity") {
             await sub.reply({ content: Mammon.tableClosed(), flags: MessageFlags.Ephemeral });
+            return;
+          }
+          if (accepted.reason === "conflict") {
+            await sub.reply({ content: "処理に失敗した。もう一度張り直してくれ。", flags: MessageFlags.Ephemeral });
             return;
           }
           await sub.reply({ content: `${Mammon.broke()}（所持 ${fmtEther(services.chips.balanceOf(btn.user.id))}）`, flags: MessageFlags.Ephemeral });
