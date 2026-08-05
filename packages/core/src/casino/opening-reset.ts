@@ -293,6 +293,13 @@ export class OpeningReset {
           // db.transaction() が投げた時点で、SQLite自身が丸ごとROLLBACK済み
           // （casino_tx削除・R7/R8送金・opening_v1確立・executions更新、すべて元通り）。
           // COMMIT前の失敗なので安全に再挑戦できる。
+          //
+          // ただし chipTx.captureOpening() のバージョンキャッシュはSQLトランザクション境界の
+          // 外にある生のJS状態なので、ROLLBACKされても古いまま残る（PR12監査で発見）。
+          // 明示的に破棄し、次回 currentVersion() が必ずDBから読み直すようにする
+          // （破棄しないと、DBはlegacy_pre_resetのままなのにopening_v1と錯覚し、
+          //  ChipLedgerの正式開業ロックが誤って解除されたと見なしてしまう恐れがある）。
+          this.chipTx.invalidateVersionCache();
           this.safeMarkFailed(execution, "applying", "applying", e instanceof Error ? e.message : String(e));
           throw new OpeningApplyRolledBackError(execution.id, e);
         }

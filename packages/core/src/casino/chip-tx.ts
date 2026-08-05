@@ -398,6 +398,27 @@ export class ChipTx {
   }
 
   /**
+   * バージョンキャッシュを強制的に破棄する（PR12監査対応）。
+   *
+   * `captureOpening()` はキャッシュを**呼び出し元のSQLトランザクションが実際にCOMMITしたかを
+   * 待たずに**同期的に更新する。通常は `captureOpening()` 自身が単発でCOMMIT/ROLLBACKするので
+   * 問題にならないが、正式開業初期化（PR12）のように**さらに外側の大きなtransactionへ合流して
+   * 呼ばれる場合**、そのtransactionが後段（postflight等）で失敗してROLLBACKされても、
+   * このキャッシュだけはROLLBACKされない生のJS状態のため古い値のまま残ってしまう。
+   *
+   * 長寿命の `ChipTx` インスタンス（bot本体が保持し続けるもの）でこれが起きると、
+   * DBは `legacy_pre_reset` のままなのに `currentVersion()` は `opening_v1` を返し続け、
+   * `ChipLedger.assertOpeningReady()` のロックが誤って解除されたと錯覚しうる（実害は
+   * 「本来ロックされているはずの資金操作が誤って通ってしまう」という重大な安全性の穴）。
+   *
+   * ROLLBACKが起きうる呼び出し元（PR12のapply core）は、失敗を検知した時点で必ずこれを呼び、
+   * 次回 `currentVersion()` がDBから正しく読み直すようにする。
+   */
+  invalidateVersionCache(): void {
+    this.cachedVersion = null;
+  }
+
+  /**
    * 正式開業がどこまで進んだか（PR8監査・項目8）。
    *
    * UI は `CasinoStatus` だけでは正しい文言を出せない。稼働状態が `open` でも
