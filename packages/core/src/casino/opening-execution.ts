@@ -135,21 +135,49 @@ interface Raw {
   completed_at: number | null;
 }
 
+/**
+ * 破損したexecution行はfail-closedで扱う（CLAUDE.md監査ブロッカー2の原則を
+ * casino_opening_executions自身にも適用する）。DBのCHECK制約は正常経路の書き込みを
+ * 防ぐだけで、外部から直接書き込まれた行や、より緩いCHECKだった旧DBの行までは
+ * 防げない。ここで安全側に倒す。
+ */
+export class CorruptedExecutionRowError extends Error {
+  constructor(id: string, reason: string) {
+    super(`corrupted casino_opening_executions row (${id}): ${reason}`);
+    this.name = "CorruptedExecutionRowError";
+  }
+}
+
+function parseJsonColumn<T>(id: string, column: string, raw: string | null): T | null {
+  if (raw === null) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new CorruptedExecutionRowError(id, `${column} が不正なJSON`);
+  }
+}
+
 function fromRaw(row: Raw): OpeningExecutionRow {
+  if (!(OPENING_EXECUTION_STATUSES as readonly string[]).includes(row.status)) {
+    // DBのCHECK制約は通常これを防ぐが、旧schema由来の行や直接書き込みまでは守れない。
+    throw new CorruptedExecutionRowError(row.id, `未知のstatus「${row.status}」`);
+  }
   return {
     id: row.id,
     planHash: row.plan_hash,
     status: row.status as OpeningExecutionStatus,
     actorId: row.actor_id,
-    configuration: JSON.parse(row.configuration_json) as CasinoOpeningConfig,
+    configuration: parseJsonColumn<CasinoOpeningConfig>(row.id, "configuration_json", row.configuration_json) ?? (() => {
+      throw new CorruptedExecutionRowError(row.id, "configuration_json が必須なのにNULL");
+    })(),
     configurationHash: row.configuration_hash,
-    backupManifest: row.backup_manifest_json ? (JSON.parse(row.backup_manifest_json) as OpeningBackupManifest) : null,
+    backupManifest: parseJsonColumn<OpeningBackupManifest>(row.id, "backup_manifest_json", row.backup_manifest_json),
     externalOperationId: row.external_operation_id,
-    externalOperationResult: row.external_operation_result_json ? JSON.parse(row.external_operation_result_json) : null,
+    externalOperationResult: parseJsonColumn(row.id, "external_operation_result_json", row.external_operation_result_json),
     oldSettlementLandTxId: row.old_settlement_land_tx_id,
     newInvestmentLandTxId: row.new_investment_land_tx_id,
     openingVersion: row.opening_version,
-    postflight: row.postflight_json ? JSON.parse(row.postflight_json) : null,
+    postflight: parseJsonColumn(row.id, "postflight_json", row.postflight_json),
     notifierStatus: (row.notifier_status as OpeningExecutionRow["notifierStatus"]) ?? null,
     fundsApplied: row.funds_applied === 1,
     reapplyAllowed: row.reapply_allowed === 1,

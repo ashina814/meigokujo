@@ -203,6 +203,46 @@ describe("OpeningReset.apply — preflight blocker", () => {
     expect(backup.calls).toHaveLength(0);
     expect(ctx.reset.executionStore.getByPlanHash("does-not-matter")).toBeUndefined();
   });
+
+  it("PR10未完了義務(refund saga)が残っている限り、R6のDELETEへ絶対に到達しない(監査ブロッカー2)", async () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    ctx.db.prepare(
+      "INSERT INTO casino_chip_refund_sagas (id,scope,requested_by,target_user_id,status,target_count,target_total,created_at) VALUES ('s1','user','admin','bob','blocked',1,100,0)",
+    ).run();
+    const rowsBefore = ctx.db.prepare("SELECT * FROM casino_chip_refund_sagas").all();
+
+    const { backup, external } = adapters();
+    await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(OpeningApplyBlockedError);
+
+    // backup/外部工程はおろか、execution行すら作られない(preflightの時点で止まる)
+    expect(backup.calls).toHaveLength(0);
+    // R6のDELETEに到達していない証拠: 行がそのまま残っている
+    const rowsAfter = ctx.db.prepare("SELECT * FROM casino_chip_refund_sagas").all();
+    expect(rowsAfter).toEqual(rowsBefore);
+    expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
+  });
+
+  it("PR10未完了義務(refund saga target)が残っている限り、R6のDELETEへ絶対に到達しない(監査ブロッカー2)", async () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    ctx.db.prepare(
+      "INSERT INTO casino_chip_refund_sagas (id,scope,requested_by,target_user_id,status,target_count,target_total,created_at) VALUES ('s1','user','admin','bob','executing',1,100,0)",
+    ).run();
+    ctx.db.prepare(
+      "INSERT INTO casino_chip_refund_saga_targets (saga_id,user_id,amount,status,group_key) VALUES ('s1','bob',100,'failed','g1')",
+    ).run();
+    const targetRowsBefore = ctx.db.prepare("SELECT * FROM casino_chip_refund_saga_targets").all();
+
+    const { backup, external } = adapters();
+    await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(OpeningApplyBlockedError);
+
+    const targetRowsAfter = ctx.db.prepare("SELECT * FROM casino_chip_refund_saga_targets").all();
+    expect(targetRowsAfter).toEqual(targetRowsBefore);
+    expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
+  });
 });
 
 describe("OpeningReset.apply — backup失敗", () => {

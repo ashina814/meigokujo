@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import {
+  CorruptedExecutionRowError,
   OpeningExecutionConflictError,
   OpeningExecutionStore,
   OpeningExecutionTransitionError,
@@ -297,5 +298,42 @@ describe("OpeningExecutionStore — 未知statusのfail-closed", () => {
     expect(() => {
       db.prepare("UPDATE casino_opening_executions SET status = ? WHERE id = ?").run("totally_unknown_status", execution.id);
     }).toThrow(/CHECK constraint failed/);
+  });
+
+  it("CHECK制約より緩い(旧)schemaに由来する未知statusの行は、読み取り時にCorruptedExecutionRowErrorでfail-closed", () => {
+    const { db, store } = setup();
+    const { execution } = store.acquire("hash-corrupt", "admin", CONFIG);
+    // CHECK制約を持たない版へ差し替えて、schema上ありえない値を模擬する(旧DB由来の想定)
+    db.exec(`
+      DROP TABLE casino_opening_executions;
+      CREATE TABLE casino_opening_executions (
+        id TEXT PRIMARY KEY, plan_hash TEXT NOT NULL, status TEXT NOT NULL, actor_id TEXT NOT NULL,
+        configuration_json TEXT NOT NULL, configuration_hash TEXT NOT NULL,
+        backup_manifest_json TEXT, external_operation_id TEXT, external_operation_result_json TEXT,
+        old_settlement_land_tx_id INTEGER, new_investment_land_tx_id INTEGER, opening_version TEXT,
+        postflight_json TEXT, notifier_status TEXT, funds_applied INTEGER NOT NULL DEFAULT 0,
+        reapply_allowed INTEGER NOT NULL DEFAULT 1, manual_reopen_required INTEGER NOT NULL DEFAULT 0,
+        failure_stage TEXT, failure_reason TEXT, manual_review_reason TEXT,
+        started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, applied_at INTEGER, completed_at INTEGER
+      );
+    `);
+    db.prepare(
+      "INSERT INTO casino_opening_executions (id,plan_hash,status,actor_id,configuration_json,configuration_hash,started_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+    ).run(execution.id, "hash-corrupt", "totally_unknown_status", "admin", JSON.stringify(CONFIG), "hash", 0, 0);
+    expect(() => store.get(execution.id)).toThrow(CorruptedExecutionRowError);
+  });
+
+  it("configuration_jsonが壊れている行はCorruptedExecutionRowErrorでfail-closed", () => {
+    const { db, store } = setup();
+    const { execution } = store.acquire("hash-corrupt-json", "admin", CONFIG);
+    db.prepare("UPDATE casino_opening_executions SET configuration_json = ? WHERE id = ?").run("{not valid json", execution.id);
+    expect(() => store.get(execution.id)).toThrow(CorruptedExecutionRowError);
+  });
+
+  it("backup_manifest_jsonが壊れている行はCorruptedExecutionRowErrorでfail-closed", () => {
+    const { db, store } = setup();
+    const { execution } = store.acquire("hash-corrupt-manifest", "admin", CONFIG);
+    db.prepare("UPDATE casino_opening_executions SET backup_manifest_json = ? WHERE id = ?").run("{not valid json", execution.id);
+    expect(() => store.get(execution.id)).toThrow(CorruptedExecutionRowError);
   });
 });

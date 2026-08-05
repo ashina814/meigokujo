@@ -245,7 +245,7 @@ describe("OpeningPlanner.dryRun — blocker検出", () => {
     `);
     ctx.db.prepare("INSERT INTO casino_markets (title, status, created_at) VALUES ('テスト板','open',0)").run();
     const result = ctx.planner.dryRun();
-    expect(result.blockers.some((b) => b.code === "live_market")).toBe(true);
+    expect(result.blockers.some((b) => b.code === "live_market_row")).toBe(true);
   });
 
   it("正の戦績(casino_stats)は保護資産としてblocker", () => {
@@ -301,6 +301,202 @@ describe("OpeningPlanner.dryRun — blocker検出", () => {
     expect(result.blockers.some((b) => b.code === "pending_external_confirmation" && b.userId === "bob")).toBe(true);
   });
 
+});
+
+describe("OpeningPlanner.dryRun — PR10未完了義務のwhitelist方式判定(監査ブロッカー2)", () => {
+  // casino_chip_external_confirmations / casino_chip_refund_sagas / casino_chip_refund_saga_targets は
+  // packages/core/src/db/bootstrap.ts のDDLに既に存在する（openDb()の時点で作成済み）ため、
+  // ここで独自のCREATE TABLEを重ねない（CREATE TABLE IF NOT EXISTSは無条件で無視され、
+  // 実際にはbootstrap側のCHECK制約付きschemaがそのまま使われる）。挿入時は実schemaの
+  // NOT NULL/CHECK制約（target_count/target_total必須、amount>0、group_key必須等）に従う。
+  let sagaTargetSeq = 0;
+  function insertRefundSaga(ctx: Ctx, id: string, status: string, extra: { failureJson?: string | null } = {}): void {
+    ctx.db.prepare(
+      "INSERT INTO casino_chip_refund_sagas (id,scope,requested_by,target_user_id,status,target_count,target_total,created_at,failure_json) VALUES (?,?,?,?,?,?,?,?,?)",
+    ).run(id, "user", "admin", "bob", status, 1, 100, 0, extra.failureJson ?? null);
+  }
+  function insertRefundSagaTarget(
+    ctx: Ctx,
+    sagaId: string,
+    userId: string,
+    status: string,
+    extra: { resultJson?: string | null; failure?: string | null } = {},
+  ): void {
+    sagaTargetSeq++;
+    ctx.db.prepare(
+      "INSERT INTO casino_chip_refund_saga_targets (saga_id,user_id,amount,status,group_key,result_json,failure) VALUES (?,?,?,?,?,?,?)",
+    ).run(sagaId, userId, 100, status, `group-${sagaTargetSeq}`, extra.resultJson ?? null, extra.failure ?? null);
+  }
+  function insertExternalConfirmation(ctx: Ctx, id: string, userId: string, status: string): void {
+    ctx.db.prepare(
+      "INSERT INTO casino_chip_external_confirmations (id,user_id,operation_kind,operation_id,required_land,chip_amount,status,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)",
+    ).run(id, userId, "leave", `op-${id}`, 100, 100, status, 0, 1000);
+  }
+
+  /**
+   * bootstrap.tsのschemaはstatusにCHECK制約を持つため、通常のINSERTでは
+   * schema許容集合外の値をそもそも作れない（=DB層で既に強く守られている）。
+   * これは「古いDB・移行前の行に未知statusが残っている」ケースを模したもので、
+   * 現行のCHECK制約より緩い（=CHECK無し）版へテスト用に差し替えて未知値を作る。
+   */
+  function dropStatusCheck(ctx: Ctx, table: string, createSql: string): void {
+    ctx.db.exec(`DROP TABLE IF EXISTS ${table}; ${createSql}`);
+  }
+
+  function withMarketsTable(ctx: Ctx): void {
+    ctx.db.exec(`
+      CREATE TABLE IF NOT EXISTS casino_markets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT, creator_id TEXT, title TEXT, options_json TEXT,
+        deadline_at INTEGER, status TEXT NOT NULL DEFAULT 'open', result_option INTEGER, channel_id TEXT, message_id TEXT, created_at INTEGER
+      );
+    `);
+  }
+  function withFreeSpinsTable(ctx: Ctx): void {
+    ctx.db.exec(`
+      CREATE TABLE IF NOT EXISTS casino_pending_free_spins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+        spin_no INTEGER NOT NULL, bet INTEGER NOT NULL, source_group TEXT NOT NULL,
+        status TEXT NOT NULL, reels_json TEXT NOT NULL, jackpot_claim INTEGER DEFAULT 0
+      );
+    `);
+  }
+
+  it("refund saga: status='blocked'は見落とされずblocker(旧実装の見落とし回帰)", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    insertRefundSaga(ctx, "s1", "blocked");
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.some((b) => b.code === "unfinished_refund_saga")).toBe(true);
+  });
+
+  it("refund saga target: status='failed'/'blocked'は見落とされずblocker(旧実装の見落とし回帰)", () => {
+    for (const status of ["failed", "blocked"]) {
+      const ctx = setup();
+      seedLegacy(ctx);
+      configureAndOpenReset(ctx);
+      insertRefundSaga(ctx, "s1", "executing"); // FK親行(targetのsaga_idが参照する)
+      insertRefundSagaTarget(ctx, "s1", "bob", status);
+      const result = ctx.planner.dryRun();
+      expect(result.blockers.some((b) => b.code === "unfinished_refund_saga_target" && b.userId === "bob"), `status=${status}`).toBe(true);
+    }
+  });
+
+  it("external confirmation: schema許容集合外の未知statusはunknown_statusとしてfail-closed(旧DBの移行残り相当)", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    dropStatusCheck(
+      ctx,
+      "casino_chip_external_confirmations",
+      `CREATE TABLE casino_chip_external_confirmations (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL, operation_kind TEXT NOT NULL, operation_id TEXT NOT NULL,
+        required_land INTEGER NOT NULL, chip_amount INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL, created_at INTEGER, expires_at INTEGER, completed_at INTEGER
+      )`,
+    );
+    insertExternalConfirmation(ctx, "c1", "bob", "totally_unknown");
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.some((b) => b.code === "unknown_status_external_confirmation" && b.userId === "bob")).toBe(true);
+  });
+
+  it("refund saga: schema許容集合外の未知statusはunknown_statusとしてfail-closed(旧DBの移行残り相当)", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    dropStatusCheck(
+      ctx,
+      "casino_chip_refund_sagas",
+      `CREATE TABLE casino_chip_refund_sagas (
+        id TEXT PRIMARY KEY, scope TEXT NOT NULL, requested_by TEXT NOT NULL, target_user_id TEXT,
+        status TEXT NOT NULL, target_count INTEGER NOT NULL DEFAULT 0, target_total INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER, started_at INTEGER, completed_at INTEGER, failure_json TEXT
+      )`,
+    );
+    insertRefundSaga(ctx, "s1", "totally_unknown");
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.some((b) => b.code === "unknown_status_refund_saga")).toBe(true);
+  });
+
+  it("refund saga target: schema許容集合外の未知statusはunknown_statusとしてfail-closed(旧DBの移行残り相当)", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    insertRefundSaga(ctx, "s1", "executing"); // FK親行(CHECKは緩めない。親テーブルは通常schemaのまま)
+    dropStatusCheck(
+      ctx,
+      "casino_chip_refund_saga_targets",
+      `CREATE TABLE casino_chip_refund_saga_targets (
+        saga_id TEXT NOT NULL, user_id TEXT NOT NULL, amount INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL, group_key TEXT, result_json TEXT, failure TEXT, completed_at INTEGER,
+        PRIMARY KEY (saga_id, user_id)
+      )`,
+    );
+    insertRefundSagaTarget(ctx, "s1", "bob", "totally_unknown");
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.some((b) => b.code === "unknown_status_refund_saga_target" && b.userId === "bob")).toBe(true);
+  });
+
+  it("pending free spin: schema許容集合外の未知statusはunknown_statusとしてfail-closed", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    withFreeSpinsTable(ctx);
+    ctx.db.prepare(
+      "INSERT INTO casino_pending_free_spins (user_id,operation_id,spin_no,bet,source_group,status,reels_json) VALUES ('bob','op1',1,100,'g1','totally_unknown','[]')",
+    ).run();
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.some((b) => b.code === "unknown_status_pending_free_spin" && b.userId === "bob")).toBe(true);
+  });
+
+  it("market: schema許容集合外の未知statusはunknown_statusとしてfail-closed", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    withMarketsTable(ctx);
+    ctx.db.prepare("INSERT INTO casino_markets (title, status, created_at) VALUES ('板','totally_unknown',0)").run();
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.some((b) => b.code === "unknown_status_market")).toBe(true);
+  });
+
+  it("refund saga: status='completed'でもfailure_jsonが破損していれば正常・完了として扱わずblocker", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    insertRefundSaga(ctx, "s1", "completed", { failureJson: "{not valid json" });
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.some((b) => b.code === "corrupt_json_refund_saga")).toBe(true);
+  });
+
+  it("refund saga target: status='completed'でもresult_json/failureが破損していれば正常・完了として扱わずblocker", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    insertRefundSaga(ctx, "s1", "executing"); // FK親行
+    insertRefundSagaTarget(ctx, "s1", "bob", "completed", { resultJson: "{not valid json" });
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.some((b) => b.code === "corrupt_json_refund_saga_target" && b.userId === "bob")).toBe(true);
+  });
+
+  it("正常終端(completed/cancelled/settled/void等)のみの状態ならPR10 blockerは出ない", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    withMarketsTable(ctx);
+    withFreeSpinsTable(ctx);
+    insertExternalConfirmation(ctx, "c1", "bob", "completed");
+    insertRefundSaga(ctx, "s1", "completed");
+    insertRefundSagaTarget(ctx, "s1", "bob", "completed");
+    ctx.db.prepare("INSERT INTO casino_markets (title, status, created_at) VALUES ('板','settled',0)").run();
+    ctx.db.prepare(
+      "INSERT INTO casino_pending_free_spins (user_id,operation_id,spin_no,bet,source_group,status,reels_json) VALUES ('bob','op1',1,100,'g1','settled','[]')",
+    ).run();
+    const result = ctx.planner.dryRun();
+    expect(result.blockers.filter((b) => b.category === "pr10_obligation" || b.category === "market")).toEqual([]);
+  });
+});
+
+describe("OpeningPlanner.dryRun — 未知テーブル・その他blocker", () => {
   it("未知のcasino_*テーブルはblocker（推測で分類しない）", () => {
     const ctx = setup();
     seedLegacy(ctx);

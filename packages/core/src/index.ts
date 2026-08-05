@@ -318,6 +318,7 @@ export {
   OpeningExecutionStore,
   OpeningExecutionConflictError,
   OpeningExecutionTransitionError,
+  CorruptedExecutionRowError,
   newExternalOperationId,
   type OpeningExecutionStatus,
   type OpeningExecutionRow,

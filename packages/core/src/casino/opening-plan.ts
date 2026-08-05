@@ -12,7 +12,6 @@ import { ChipLedger, ETHER_ESCROW, CHIP_ESCROW, isPlayerHolder } from "./chip-le
 import { CasinoChipAssets, type EscrowAssetInspection } from "./chip-assets.js";
 import { CasinoIntegrity, type CasinoCheckResult } from "./integrity.js";
 import { CasinoStatus, type CasinoStatusValue } from "./status.js";
-import { MARKET_LIVE_STATUSES } from "./market.js";
 import { FREE_SPIN_JACKPOT_CLAIMS_HOLDER } from "./free-spins.js";
 import { ESCROW_QUARANTINE } from "./escrow.js";
 import {
@@ -31,6 +30,44 @@ import {
 import { readCasinoOpeningConfig, type CasinoOpeningConfig } from "./opening-settings.js";
 
 const DEPARTMENT_KEY = "賭博場";
+
+/**
+ * PR10未完了義務の判定はwhitelist方式にする（CLAUDE.md監査ブロッカー2）。
+ * 「未完了とみなす値を列挙する」のではなく「安全に初期化してよい終端状態を列挙し、
+ * それ以外はすべてblocker」にする。こうすると、schemaのCHECK制約に載っている値を
+ * 見落とす（例: 旧実装は`casino_chip_refund_sagas.status='blocked'`を見ていなかった）
+ * ことも、CHECK制約の範囲外の未知の値（DB破損・将来のschema変更）も、同じ1つの
+ * ロジックでfail-closedにできる。
+ */
+const EXTERNAL_CONFIRMATION_STATUSES: ReadonlySet<string> = new Set([
+  "pending", "executing", "completed", "cancelled", "expired",
+]);
+const EXTERNAL_CONFIRMATION_SAFE_STATUSES: ReadonlySet<string> = new Set(["completed", "cancelled", "expired"]);
+
+const REFUND_SAGA_STATUSES: ReadonlySet<string> = new Set(["draft", "executing", "completed", "blocked", "cancelled"]);
+const REFUND_SAGA_SAFE_STATUSES: ReadonlySet<string> = new Set(["completed", "cancelled"]);
+
+const REFUND_SAGA_TARGET_STATUSES: ReadonlySet<string> = new Set(["pending", "completed", "failed", "blocked"]);
+const REFUND_SAGA_TARGET_SAFE_STATUSES: ReadonlySet<string> = new Set(["completed"]);
+
+const PENDING_FREE_SPIN_STATUSES: ReadonlySet<string> = new Set(["pending", "processing", "settled"]);
+const PENDING_FREE_SPIN_SAFE_STATUSES: ReadonlySet<string> = new Set(["settled"]);
+
+const MARKET_ALL_STATUSES: ReadonlySet<string> = new Set([
+  "open", "closed", "reported", "disputed", "settled", "void", "frozen",
+]);
+const MARKET_SAFE_STATUSES: ReadonlySet<string> = new Set(["settled", "void"]);
+
+/** JSONカラムが非nullなのに壊れている場合はtrue（"safe"を名乗らせない） */
+function isMalformedJson(raw: string | null): boolean {
+  if (raw === null) return false;
+  try {
+    JSON.parse(raw);
+    return false;
+  } catch {
+    return true;
+  }
+}
 
 /** R7/R8が使う部署アカウント。1箇所に一本化する（現行mainでは apps/bot 側のローカル定数しか無かった） */
 export const CASINO_DEPARTMENT_KEY = DEPARTMENT_KEY;
@@ -296,14 +333,8 @@ export class OpeningPlanner {
         message: `casino_house_reservationsに${activeReservations}件の進行中予約がある`,
       });
     }
-    const liveMarkets = this.countLiveMarkets();
-    if (liveMarkets > 0) {
-      blockers.push({
-        category: "market",
-        code: "live_market",
-        message: `casino_marketsに${liveMarkets}件の未終局な板がある（open/closed/reported/disputed/frozen）`,
-      });
-    }
+    // 板(casino_markets)の未終局・未知status検出は pr10Blockers() 内で行単位・
+    // whitelist方式(MARKET_SAFE_STATUSES)により行う（集計だけのIN句だと未知の値を見落とすため）。
 
     // ---- PR10未完了義務 ----
     for (const b of this.pr10Blockers()) blockers.push(b);
@@ -432,77 +463,91 @@ export class OpeningPlanner {
     return { checkA, checkB, checkC, checkD, ok: checkA.ok && checkB.ok && checkC.ok && checkD.ok };
   }
 
-  private countLiveMarkets(): number {
-    if (!tableExists(this.deps.db, "casino_markets")) return 0;
-    const placeholders = MARKET_LIVE_STATUSES.map(() => "?").join(",");
-    const row = this.deps.db
-      .prepare(`SELECT COUNT(*) AS n FROM casino_markets WHERE status IN (${placeholders})`)
-      .get(...MARKET_LIVE_STATUSES) as { n: number };
-    return row.n;
-  }
-
   private pr10Blockers(): OpeningBlocker[] {
     const blockers: OpeningBlocker[] = [];
+
     if (tableExists(this.deps.db, "casino_chip_external_confirmations")) {
       const rows = this.deps.db
-        .prepare(
-          "SELECT id, user_id, status FROM casino_chip_external_confirmations WHERE status IN ('pending','executing') ORDER BY id",
-        )
+        .prepare("SELECT id, user_id, status FROM casino_chip_external_confirmations ORDER BY id")
         .all() as Array<{ id: string; user_id: string; status: string }>;
       for (const row of rows) {
+        if (EXTERNAL_CONFIRMATION_SAFE_STATUSES.has(row.status)) continue;
+        const unknown = !EXTERNAL_CONFIRMATION_STATUSES.has(row.status);
         blockers.push({
           category: "pr10_obligation",
-          code: "pending_external_confirmation",
-          message: `casino_chip_external_confirmations #${row.id}: status=${row.status}`,
+          code: unknown ? "unknown_status_external_confirmation" : "pending_external_confirmation",
+          message: `casino_chip_external_confirmations #${row.id}: status=${row.status}${unknown ? "（schema許容集合外の未知status）" : ""}`,
           userId: row.user_id,
         });
       }
     }
+
     if (tableExists(this.deps.db, "casino_chip_refund_sagas")) {
       const rows = this.deps.db
-        .prepare(
-          "SELECT id, target_user_id, status FROM casino_chip_refund_sagas WHERE status IN ('draft','executing') ORDER BY id",
-        )
-        .all() as Array<{ id: string; target_user_id: string | null; status: string }>;
+        .prepare("SELECT id, target_user_id, status, failure_json FROM casino_chip_refund_sagas ORDER BY id")
+        .all() as Array<{ id: string; target_user_id: string | null; status: string; failure_json: string | null }>;
       for (const row of rows) {
+        const unknown = !REFUND_SAGA_STATUSES.has(row.status);
+        const malformed = isMalformedJson(row.failure_json);
+        if (!unknown && !malformed && REFUND_SAGA_SAFE_STATUSES.has(row.status)) continue;
         blockers.push({
           category: "pr10_obligation",
-          code: "unfinished_refund_saga",
-          message: `casino_chip_refund_sagas #${row.id}: status=${row.status}`,
+          code: unknown ? "unknown_status_refund_saga" : malformed ? "corrupt_json_refund_saga" : "unfinished_refund_saga",
+          message: `casino_chip_refund_sagas #${row.id}: status=${row.status}${unknown ? "（schema許容集合外の未知status）" : ""}${malformed ? "（failure_jsonが破損）" : ""}`,
           userId: row.target_user_id ?? undefined,
         });
       }
     }
+
     if (tableExists(this.deps.db, "casino_chip_refund_saga_targets")) {
       const rows = this.deps.db
-        .prepare(
-          "SELECT saga_id, user_id, status FROM casino_chip_refund_saga_targets WHERE status = 'pending' ORDER BY saga_id, user_id",
-        )
-        .all() as Array<{ saga_id: string; user_id: string; status: string }>;
+        .prepare("SELECT saga_id, user_id, status, result_json, failure FROM casino_chip_refund_saga_targets ORDER BY saga_id, user_id")
+        .all() as Array<{ saga_id: string; user_id: string; status: string; result_json: string | null; failure: string | null }>;
       for (const row of rows) {
+        const unknown = !REFUND_SAGA_TARGET_STATUSES.has(row.status);
+        const malformed = isMalformedJson(row.result_json) || isMalformedJson(row.failure);
+        if (!unknown && !malformed && REFUND_SAGA_TARGET_SAFE_STATUSES.has(row.status)) continue;
         blockers.push({
           category: "pr10_obligation",
-          code: "unfinished_refund_saga_target",
-          message: `casino_chip_refund_saga_targets saga=${row.saga_id}: status=${row.status}`,
+          code: unknown ? "unknown_status_refund_saga_target" : malformed ? "corrupt_json_refund_saga_target" : "unfinished_refund_saga_target",
+          message: `casino_chip_refund_saga_targets saga=${row.saga_id} user=${row.user_id}: status=${row.status}${unknown ? "（schema許容集合外の未知status）" : ""}${malformed ? "（result_json/failureが破損）" : ""}`,
           userId: row.user_id,
         });
       }
     }
+
     if (tableExists(this.deps.db, "casino_pending_free_spins")) {
       const rows = this.deps.db
-        .prepare(
-          "SELECT id, user_id, status, jackpot_claim FROM casino_pending_free_spins WHERE status != 'settled' ORDER BY id",
-        )
+        .prepare("SELECT id, user_id, status, jackpot_claim FROM casino_pending_free_spins ORDER BY id")
         .all() as Array<{ id: number; user_id: string; status: string; jackpot_claim: number }>;
       for (const row of rows) {
+        if (PENDING_FREE_SPIN_SAFE_STATUSES.has(row.status)) continue;
+        const unknown = !PENDING_FREE_SPIN_STATUSES.has(row.status);
         blockers.push({
           category: "pr10_obligation",
-          code: "pending_free_spin",
-          message: `casino_pending_free_spins #${row.id}: status=${row.status} jackpot_claim=${row.jackpot_claim}`,
+          code: unknown ? "unknown_status_pending_free_spin" : "pending_free_spin",
+          message: `casino_pending_free_spins #${row.id}: status=${row.status}${unknown ? "（schema許容集合外の未知status）" : ""} jackpot_claim=${row.jackpot_claim}`,
           userId: row.user_id,
         });
       }
     }
+
+    if (tableExists(this.deps.db, "casino_markets")) {
+      const rows = this.deps.db.prepare("SELECT id, status FROM casino_markets ORDER BY id").all() as Array<{
+        id: number;
+        status: string;
+      }>;
+      for (const row of rows) {
+        if (MARKET_SAFE_STATUSES.has(row.status)) continue;
+        const unknown = !MARKET_ALL_STATUSES.has(row.status);
+        blockers.push({
+          category: "market",
+          code: unknown ? "unknown_status_market" : "live_market_row",
+          message: `casino_markets #${row.id}: status=${row.status}${unknown ? "（schema許容集合外の未知status）" : ""}`,
+        });
+      }
+    }
+
     return blockers;
   }
 
