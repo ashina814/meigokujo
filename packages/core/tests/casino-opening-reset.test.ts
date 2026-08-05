@@ -261,6 +261,63 @@ describe("OpeningReset.apply — 未送信notifierをsent扱いしない(監査�
   });
 });
 
+describe("OpeningReset.apply — opening_reset取得責務(監査ブロッカー7)", () => {
+  it("statusがopenで他にblockerが無ければ、apply()自身がactorIdの権限でopening_resetへ進める", async () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    // configureAndOpenResetを呼ばない: beginOpeningReset()を別処理で先に呼ばず、
+    // 設定(writeCasinoOpeningConfig)だけ済ませておく。statusはopenのまま。
+    writeCasinoOpeningConfig(ctx.settings, VALID_CONFIG, "test-admin");
+    expect(ctx.status.current().status).toBe("open");
+    const { backup, external } = adapters();
+
+    const result = await ctx.reset.apply({ actorId: "admin-x", backup, external });
+
+    expect(result.status).toBe("completed");
+    expect(result.fundsApplied).toBe(true);
+    // opening_resetへの遷移がこのapply()呼び出し自身のactorIdの下で記録されている
+    // (execution行が'opening_reset_acquired'を名乗る以上、実際にその状態を取得したのが
+    // 誰かを確認できなければならない、というのが監査ブロッカー7の要求)
+    const openingResetEntry = ctx.status.history(10).find((h) => h.status === "opening_reset");
+    expect(openingResetEntry?.changedBy).toBe("admin-x");
+    // 最終的には正常にopenへ戻る
+    expect(ctx.status.current().status).toBe("open");
+  });
+
+  it("maintenance等の人為的な停止状態からは、apply()がCasinoStatusへ一切触れずblockerで拒否する", async () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    writeCasinoOpeningConfig(ctx.settings, VALID_CONFIG, "test-admin");
+    ctx.status.beginMaintenance("点検中", "ops");
+    const historyBefore = ctx.status.history(10);
+    const { backup, external } = adapters();
+
+    // 破壊的applyが、人が明示的に入れた停止状態(maintenance)を暗黙に踏み越えて
+    // opening_resetへ進めてしまわないことを確認する。
+    await expect(ctx.reset.apply({ actorId: "admin-x", backup, external })).rejects.toThrow(OpeningApplyBlockedError);
+
+    expect(ctx.status.current().status).toBe("maintenance");
+    // CasinoStatusへ一切書き込んでいない(履歴が1件も増えていない)
+    expect(ctx.status.history(10)).toEqual(historyBefore);
+  });
+
+  it("既にopening_resetの場合は、apply()は再度beginOpeningResetを呼ばず(履歴が増えず)そのまま進む", async () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx); // 既存の運用導線どおり、別処理で先にopening_resetへ入れておく
+    const openingResetCountBefore = ctx.status.history(20).filter((h) => h.status === "opening_reset").length;
+    const { backup, external } = adapters();
+
+    const result = await ctx.reset.apply({ actorId: "admin", backup, external });
+
+    expect(result.status).toBe("completed");
+    // apply()開始時点で既にopening_resetだったので、apply()自身は新たな
+    // opening_resetへの遷移を記録しない(素通りするだけ)
+    const openingResetCountAfter = ctx.status.history(20).filter((h) => h.status === "opening_reset").length;
+    expect(openingResetCountAfter).toBe(openingResetCountBefore);
+  });
+});
+
 describe("OpeningReset.apply — preflight blocker", () => {
   it("blockerがあれば例外を投げ、executionを一切作らない", async () => {
     const ctx = setup();

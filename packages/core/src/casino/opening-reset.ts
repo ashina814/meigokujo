@@ -189,7 +189,29 @@ export class OpeningReset {
   }
 
   async apply(input: OpeningApplyInput): Promise<OpeningApplyResult> {
-    const initialPlan = this.planner.dryRun();
+    // ---- R0: opening_reset状態の取得をapply()自身の権限で行う（CLAUDE.md監査ブロッカー7）----
+    // 以前は「CasinoStatusが既にopening_resetであること」を`dryRun()`のblockerとして
+    // 前提にしているだけで、execution行が名乗る'opening_reset_acquired'という状態名にも
+    // かかわらず、実際にその状態へ入れたのがこのapply()呼び出し自身なのか、無関係な
+    // 別処理なのかを一切確認・保証していなかった。
+    //
+    // ここでは「statusがopenで、それ以外のblockerが一切無い（＝status以外はすべて準備完了）」
+    // ことを確認できた場合に**限り**、apply()自身がCasinoStatusをopening_resetへ進める。
+    // 他のblockerが残っている場合や、open/opening_reset以外の状態（maintenance・
+    // manual_halt・integrity_halt・recovery_halt等の人為的な停止）からは、CasinoStatusに
+    // 一切触れない（blocker=0を証明できるまでは副作用ゼロという既存の不変条件を保つ）。
+    // 既にopening_resetの場合（前回のapply()が進めた状態からの再試行）は、このまま素通りする。
+    const preCheck = this.planner.dryRun();
+    const currentStatus = this.deps.status.current().status;
+    const readyExceptStatus =
+      currentStatus === "open" &&
+      preCheck.blockers.length > 0 &&
+      preCheck.blockers.every((b) => b.code === "status_not_opening_reset");
+    let initialPlan = preCheck;
+    if (readyExceptStatus) {
+      this.deps.status.beginOpeningReset(`正式開業初期化: ${input.actorId}による開始`, input.actorId);
+      initialPlan = this.planner.dryRun();
+    }
     if (initialPlan.blockers.length > 0) {
       throw new OpeningApplyBlockedError(initialPlan.blockers);
     }
