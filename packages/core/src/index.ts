@@ -295,6 +295,12 @@ export {
   type LegacyLedgerAudit,
 } from "./casino/opening-plan.js";
 export {
+  FakeOpeningExternalAdapter,
+  type OpeningExternalAdapter,
+  type OpeningExternalDisableLegacyRequest,
+  type OpeningExternalDisableLegacyResult,
+} from "./casino/opening-external.js";
+export {
   OPENING_EXECUTION_STATUSES,
   OpeningExecutionStore,
   OpeningExecutionConflictError,
