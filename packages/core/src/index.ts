@@ -253,6 +253,47 @@ export {
   type CasinoCheckMismatch,
   type CasinoIntegrityReport,
 } from "./casino/integrity.js";
+export {
+  CASINO_OPENING_SETTING_KEYS,
+  readCasinoOpeningConfig,
+  writeCasinoOpeningConfig,
+  clearCasinoOpeningConfig,
+  type CasinoOpeningConfig,
+  type CasinoOpeningConfigResult,
+} from "./casino/opening-settings.js";
+export {
+  canonicalStringify,
+  canonicalHash,
+  sha256Hex,
+  tableFingerprint,
+  tableExists,
+  tableRowCount,
+  tableColumns,
+  schemaFingerprint,
+  tableToCsv,
+  type TableContentFingerprint,
+} from "./casino/opening-canonical.js";
+export {
+  CASINO_TABLE_CLASSIFICATION,
+  KNOWN_CASINO_TABLE_NAMES,
+  classificationFor,
+  type CasinoTableKind,
+  type CasinoTableClassification,
+} from "./casino/opening-tables.js";
+export {
+  OpeningPlanner,
+  CASINO_DEPARTMENT_KEY,
+  CASINO_DEPARTMENT_ACCOUNT,
+  type OpeningPlannerDeps,
+  type OpeningPlanSnapshot,
+  type OpeningPreflightResult,
+  type OpeningBlocker,
+  type BlockerCategory,
+  type ProtectedAssetFinding,
+  type TableAudit,
+  type PlayerLandFingerprint,
+  type LegacyLedgerAudit,
+} from "./casino/opening-plan.js";
 export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";
 export {
   Escrow,
