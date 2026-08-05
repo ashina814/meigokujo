@@ -254,6 +254,42 @@ describe("OpeningExecutionStore — 同時実行", () => {
   });
 });
 
+describe("OpeningExecutionStore — constructorは一切書き込まない(監査ブロッカー1)", () => {
+  it("PRAGMA query_only=ONでもconstructorが成功する", () => {
+    const db = openDb(":memory:");
+    db.pragma("query_only = ON");
+    expect(() => new OpeningExecutionStore(db)).not.toThrow();
+    db.pragma("query_only = OFF");
+  });
+
+  it("構築するだけでは、schema・row count・outboxのいずれも変化しない", () => {
+    const db = openDb(":memory:");
+    const schemaBefore = db.prepare("SELECT sql FROM sqlite_master WHERE type IN ('table','index') ORDER BY name").all();
+    const tableNamesBefore = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map((r) => r.name);
+    const countsBefore = Object.fromEntries(
+      tableNamesBefore.map((name) => [name, (db.prepare(`SELECT COUNT(*) AS n FROM "${name}"`).get() as { n: number }).n]),
+    );
+
+    new OpeningExecutionStore(db);
+    new OpeningExecutionStore(db); // 二度目でも変化しないこと
+
+    const schemaAfter = db.prepare("SELECT sql FROM sqlite_master WHERE type IN ('table','index') ORDER BY name").all();
+    const countsAfter = Object.fromEntries(
+      tableNamesBefore.map((name) => [name, (db.prepare(`SELECT COUNT(*) AS n FROM "${name}"`).get() as { n: number }).n]),
+    );
+    expect(schemaAfter).toEqual(schemaBefore);
+    expect(countsAfter).toEqual(countsBefore);
+    expect(countsAfter["outbox"]).toBe(0);
+  });
+
+  it("casino_opening_executionsのDDLはbootstrap(openDb)だけが担当する(旧DBへのmigrationもbootstrap側)", () => {
+    const db = openDb(":memory:");
+    // openDb()の時点で既にテーブルが存在する(=OpeningExecutionStoreを一度も構築せずとも存在)
+    const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='casino_opening_executions'").get();
+    expect(exists).toBeTruthy();
+  });
+});
+
 describe("OpeningExecutionStore — 未知statusのfail-closed", () => {
   it("DBのCHECK制約により、statusカラムへ未知の値を直接書き込むことはできない", () => {
     const { db, store } = setup();

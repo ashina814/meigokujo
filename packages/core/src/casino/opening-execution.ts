@@ -171,41 +171,13 @@ export interface AcquireResult {
 }
 
 export class OpeningExecutionStore {
-  constructor(private readonly db: Database.Database) {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS casino_opening_executions (
-        id                              TEXT PRIMARY KEY,
-        plan_hash                       TEXT NOT NULL,
-        status                          TEXT NOT NULL CHECK (status IN (
-          'planned','opening_reset_acquired','backup_started','backup_verified',
-          'external_started','external_completed','applying','applied',
-          'post_commit_pending','completed','failed','manual_review_required'
-        )),
-        actor_id                        TEXT NOT NULL,
-        configuration_json              TEXT NOT NULL,
-        configuration_hash              TEXT NOT NULL,
-        backup_manifest_json            TEXT,
-        external_operation_id           TEXT,
-        external_operation_result_json  TEXT,
-        old_settlement_land_tx_id       INTEGER,
-        new_investment_land_tx_id       INTEGER,
-        opening_version                 TEXT,
-        postflight_json                 TEXT,
-        notifier_status                 TEXT,
-        funds_applied                   INTEGER NOT NULL DEFAULT 0,
-        reapply_allowed                 INTEGER NOT NULL DEFAULT 1,
-        manual_reopen_required          INTEGER NOT NULL DEFAULT 0,
-        failure_stage                   TEXT,
-        failure_reason                  TEXT,
-        manual_review_reason            TEXT,
-        started_at                      INTEGER NOT NULL,
-        updated_at                      INTEGER NOT NULL,
-        applied_at                      INTEGER,
-        completed_at                    INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS idx_casino_opening_executions_plan ON casino_opening_executions(plan_hash);
-    `);
-  }
+  /**
+   * このconstructorは一切書き込まない（CLAUDE.md監査ブロッカー1）。
+   * `casino_opening_executions` のDDLは `packages/core/src/db/bootstrap.ts` にのみ存在し、
+   * 旧DBへのmigrationはbootstrap（`openDb()`）だけが担当する。preflight用にこのクラスだけを
+   * 構築しても、schema・row count・timestamp・outboxのいずれも変化してはいけない。
+   */
+  constructor(private readonly db: Database.Database) {}
 
   /**
    * execution を取得する（無ければ新規作成）。**INSERTの成否そのものを排他制御に使う**

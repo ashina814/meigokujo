@@ -84,6 +84,29 @@ function adapters() {
   return { backup: new FakeOpeningBackupAdapter(), external: new FakeOpeningExternalAdapter() };
 }
 
+describe("OpeningReset — constructorは一切書き込まない(監査ブロッカー1)", () => {
+  it("PRAGMA query_only=ONでもOpeningResetを構築できる", () => {
+    const ctx = setup();
+    ctx.db.pragma("query_only = ON");
+    expect(() => new OpeningReset({ ...ctx, chips: ctx.ether })).not.toThrow();
+    ctx.db.pragma("query_only = OFF");
+  });
+
+  it("構築するだけでは、schema・row count・outboxのいずれも変化しない", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    const tableNames = (ctx.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map((r) => r.name);
+    const countsBefore = Object.fromEntries(
+      tableNames.map((name) => [name, (ctx.db.prepare(`SELECT COUNT(*) AS n FROM "${name}"`).get() as { n: number }).n]),
+    );
+    new OpeningReset({ ...ctx, chips: ctx.ether });
+    const countsAfter = Object.fromEntries(
+      tableNames.map((name) => [name, (ctx.db.prepare(`SELECT COUNT(*) AS n FROM "${name}"`).get() as { n: number }).n]),
+    );
+    expect(countsAfter).toEqual(countsBefore);
+  });
+});
+
 describe("OpeningReset.apply — 正常系", () => {
   it("blocker=0の状態でapplyすると、opening_v1が確立し賭場がopenへ戻る", async () => {
     const ctx = setup();
