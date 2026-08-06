@@ -24,11 +24,13 @@ import {
   UserSelectMenuInteraction,
 } from "discord.js";
 import {
+  CASINO_OPENING_SETTING_KEYS,
   CasinoIntegrity,
   deptAccount,
   ChipLedgerError,
   HOUSE_HOLDER,
   LedgerError,
+  readCasinoOpeningConfig,
   recoverCasino,
   type RefundSaga,
   type TicketPanel,
@@ -46,6 +48,7 @@ import { updateDashboard } from "../dashboard.js";
 import { updateWaitersBoard, WAITERS_BOARD_CHANNEL_KEY } from "../waiters-board.js";
 import { fmtEther, fmtLd } from "../format.js";
 import { isSeatOccupied } from "../casino/common.js";
+import { houseCapacityReport } from "../casino/capacity-report.js";
 import { describeChipLedgerError, isFormallyOpen, openingBadge, openingNotice, openingPhase } from "../casino/opening.js";
 import { ticketPanelMessageForPanel } from "./tickets.js";
 import type { Services } from "../services.js";
@@ -1068,9 +1071,9 @@ const NUMBER_KEYS: Array<[string, string]> = [
   ["room_recruit_expire_hours", "蜜月募集の失効（時間）"],
   ["room_recruit_refund", "蜜月失効の返金"],
   ["bump_reward", "bump報酬（Land）"],
-  ["ether_rate_base", "エテル初期レート（1Land=?◈）"],
+  ["ether_rate_base", "旧制度の固定比率（互換設定）"],
   ["ether_fuku_scale", "福の重みスケール"],
-  ["vip_price", "VIP月会費（エテル）"],
+  ["vip_price", "VIP月会費（Land）"],
   ["vip_days", "VIP日数"],
   ["vip_bet_cap_mult", "VIP賭け上限倍率"],
   ["confession_body_retention_days", "トート本文の保持日数"],
@@ -1245,7 +1248,6 @@ const PANEL_KIND_CHOICES: Array<[string, string]> = [
   ["entry", "入城申請"],
   ["rank", "ランク確認"],
   ["shop", "公式ショップ"],
-  ["exchange", "マモンの両替所"],
   ["takutate", "卓建て"],
   ["ticket_return", "出戻り申請"],
   ["ticket_consult", "個別相談"],
@@ -2056,6 +2058,30 @@ const CASINO_STATUS_LABEL: Record<string, string> = {
   opening_reset: "🚧 開業準備中",
 };
 
+/** ソロゲーム名。`LIABILITY_MODELS`（packages/core）・`/遊ぶ` のサブコマンド名と揃える */
+const CAPACITY_REPORT_GAMES = ["スロット", "丁半", "クラッシュ", "チンチロ", "ブラックジャック", "ポーカー", "ホールデム"];
+
+/**
+ * PR13: 運転資金の目安（`houseCapacityReport`）を運営卓へ表示する。
+ *
+ * 最低運転資金は `casino_opening_settings`（PR12・SELECT専用）から読む。未設定なら
+ * 推測で埋めず「未設定」と出す（CLAUDE.md §7・運営設定値を推測で埋めない）。
+ * 各ゲームの1件最大予約額・人数別必要額は `liabilityModelFor` から導出し、
+ * ここへ数値を手入力しない。
+ */
+function capacityWorksheetLine(services: Services): string {
+  const openingConfig = readCasinoOpeningConfig(services.settings);
+  const minWorkingCapital = openingConfig.ok ? openingConfig.config.minWorkingCapital : 0;
+  const report = houseCapacityReport(minWorkingCapital, CAPACITY_REPORT_GAMES);
+  const worst = report.games.reduce((a, b) => (b.maximumReservation > a.maximumReservation ? b : a), report.games[0]!);
+  return [
+    `最低運転資金: ${openingConfig.ok ? fmtLd(minWorkingCapital) : `未設定（\`${CASINO_OPENING_SETTING_KEYS.minWorkingCapital}\` 未設定・開業設定前）`}`,
+    `最大予約（1件）: ${fmtLd(worst.maximumReservation)}（${worst.game}）`,
+    `同時10人時の必要額（同ゲーム）: ${fmtLd(worst.users[10])}`,
+    `推奨house残高: **${fmtLd(report.recommendedOpeningHouse)}**`,
+  ].join("\n");
+}
+
 function casinoHome(services: Services) {
   const ether = services.chips;
   const casino = services.casino;
@@ -2084,17 +2110,20 @@ function casinoHome(services: Services) {
         `**胴元残高**: ${fmtEther(casino.houseBalance())} （テーブルリミットの原資）`,
         `**ジャックポット積立**: ${fmtEther(casino.jackpotPool())}`,
         // 1:1 は opening_v1 後にだけ動く約束。それ以前に断言すると運営が誤操作する
-        phase === "formal" ? `**チップ交換比率**: 1 Ld = 1 ◈` : `**チップ交換比率**: 停止中（opening_v1 確定後に 1 Ld = 1 ◈）`,
+        phase === "formal" ? `**チップ比率**: 1 チップ = 1 Ld` : `**チップ比率**: 停止中（opening_v1 確定後に 1 チップ = 1 Ld）`,
         phase === "unknown"
           ? `**準備プール**: 読み取り不可（版が異常）`
-          : `**準備プール**: ${fmtLd(ether.pool())} ／ **発行チップ**: ${fmtEther(ether.outstanding())}`,
+          : `**準備プール**: ${fmtLd(ether.pool())} ／ **発行済みチップ**: ${fmtEther(ether.outstanding())}`,
         "",
         dept
           ? `**部署「${CASINO_DEPT_KEY}」残高**: ${fmtLd(deptBal!)}`
           : `⚠️ 部署「${CASINO_DEPT_KEY}」が未作成です。先に 部署→作成 で作ってください。`,
       ].join("\n"),
     )
-    .addFields({ name: report.ok ? "▸ 全点検（正常）" : "▸ 全点検（**要対応**）", value: checkLines.join("\n"), inline: false });
+    .addFields(
+      { name: report.ok ? "▸ 全点検（正常）" : "▸ 全点検（**要対応**）", value: checkLines.join("\n"), inline: false },
+      { name: "▸ 運転資金目安（PR13）", value: capacityWorksheetLine(services), inline: false },
+    );
   // 停止中は資金投入・売上精算も押せない（押しても資金層で弾かれるが、UIでも見せる）。
   // 正式開業前・未知版も同じ扱いにする。押せてしまうと、必ず断られる操作を運営に踏ませる
   const closed = status.status !== "open" || phase !== "formal";
@@ -2307,7 +2336,7 @@ function casinoSettleModal() {
     .setTitle("売上精算（胴元→賭博場口座）")
     .addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("amount").setLabel("精算するエテル（空欄=全額）").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(15),
+        new TextInputBuilder().setCustomId("amount").setLabel("精算する自由チップ（空欄=全額）").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(15),
       ),
     );
 }
