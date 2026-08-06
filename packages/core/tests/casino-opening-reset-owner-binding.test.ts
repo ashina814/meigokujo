@@ -147,7 +147,7 @@ describe("OpeningReset.apply — opening_reset所有権の原子的binding(PR12�
     expect(ctx.status.current().status).toBe("opening_reset");
   });
 
-  it("別configurationはresumeできない: 新規executionが作られても丸ごとROLLBACKされ、資金・所有権は変わらない", async () => {
+  it("別configurationでのresumeは、owner-first resumeにより旧executionがfailedへ記録された上で所有権が新plan executionへ原子的に移譲され、安全に再計画される（PR12監査: owner-first resume。旧仕様の「bindのCAS不一致で不変条件違反」は誤りだったため置き換え）", async () => {
     const ctx = setup();
     seedLegacy(ctx);
     writeCasinoOpeningConfig(ctx.settings, VALID_CONFIG, "test-admin");
@@ -155,21 +155,43 @@ describe("OpeningReset.apply — opening_reset所有権の原子的binding(PR12�
     const external = new FakeOpeningExternalAdapter();
     await expect(ctx.reset.apply({ actorId: "admin-x", backup, external })).rejects.toThrow();
     const before = owner(ctx);
-    const executionIdsBefore = (ctx.db.prepare("SELECT id FROM casino_opening_executions ORDER BY id").all() as Array<{ id: string }>).map(
-      (r) => r.id,
-    );
+    const oldExecutionId = before.opening_execution_id!;
+    const oldRowBefore = ctx.db
+      .prepare("SELECT status, funds_applied FROM casino_opening_executions WHERE id = ?")
+      .get(oldExecutionId) as { status: string; funds_applied: number };
+    // backup失敗はcatch内でbackup_started->failedへ直接倒すので、この時点で既にfailed
+    expect(oldRowBefore.status).toBe("failed");
+    expect(oldRowBefore.funds_applied).toBe(0);
 
-    // 同じactorだが別configurationへ書き換える(=別planHash=別execution id)
+    // 同じactorだが別configurationへ書き換える(=別planHash=別execution id)。
+    // 外部工程開始前(failed)なので、新仕様では安全に再計画され、新plan executionが
+    // 最初から正常に完了できる(旧仕様のような永久デッドロックにならない)。
     writeCasinoOpeningConfig(ctx.settings, OTHER_CONFIG, "test-admin");
-    await expect(ctx.reset.apply({ actorId: "admin-x", backup, external })).rejects.toThrow(/不変条件違反/);
+    const result = await ctx.reset.apply({ actorId: "admin-x", backup: persistentBackupAdapter(), external });
 
-    // 新しいexecution行が一瞬INSERTされても、bindのCAS不一致でtransaction全体がROLLBACKされ、
-    // 結果としてexecution行は増えていない・所有権は元のまま
-    const executionIdsAfter = (ctx.db.prepare("SELECT id FROM casino_opening_executions ORDER BY id").all() as Array<{ id: string }>).map(
-      (r) => r.id,
-    );
-    expect(executionIdsAfter).toEqual(executionIdsBefore);
-    expect(owner(ctx)).toEqual(before);
+    expect(result.status).toBe("completed");
+    expect(result.executionId).not.toBe(oldExecutionId);
+    // 新configuration(OTHER_CONFIG)の金額で開業している(=現在のplan hashで再計画された証拠)
+    expect(ctx.ether.balanceOf(HOUSE_HOLDER)).toBe(OTHER_CONFIG.openingHouse);
+
+    // 旧executionは削除されず、failedのまま資金未確定で残る(監査記録として保持)
+    const oldRowAfter = ctx.db
+      .prepare("SELECT status, funds_applied FROM casino_opening_executions WHERE id = ?")
+      .get(oldExecutionId) as { status: string; funds_applied: number };
+    expect(oldRowAfter.status).toBe("failed");
+    expect(oldRowAfter.funds_applied).toBe(0);
+
+    // executionは旧(failed)・新(completed)の2件だけ
+    const allExecutions = ctx.db.prepare("SELECT id, status FROM casino_opening_executions ORDER BY id").all() as Array<{
+      id: string;
+      status: string;
+    }>;
+    expect(allExecutions).toHaveLength(2);
+    expect(allExecutions.map((e) => e.status).sort()).toEqual(["completed", "failed"]);
+
+    // 所有権(casino_status)は最終的に新executionの完了によりクリアされている(R14)
+    expect(ctx.status.current().status).toBe("open");
+    expect(owner(ctx)).toEqual({ opening_execution_id: null, opening_actor_id: null });
   });
 
   it("R0途中(statusをopening_resetへ進めた直後・execution確定前)でcrashすると、statusの遷移も含めて完全にROLLBACKされる", async () => {
