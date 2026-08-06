@@ -88,9 +88,17 @@ function seedLegacy(ctx: Ctx, opts: { houseChips?: number; deptSeed?: number } =
   ctx.departments.upsert("賭博場", "賭博場", null);
 }
 
-function configureAndOpenReset(ctx: Ctx): void {
+/**
+ * status='opening_reset' へ進めるだけでなく、owner（execution/actor）も同時にbindする
+ * （PR12監査: owner-first resume。R0は「status='opening_reset'ならownerは必ず完全にbind
+ * 済み」を前提にしたため、`beginOpeningReset()`単独呼び出しだけでは不変条件違反になる）。
+ */
+function configureAndOpenReset(ctx: Ctx, actorId = "admin"): void {
   writeCasinoOpeningConfig(ctx.settings, VALID_CONFIG, "test-admin");
   ctx.status.beginOpeningReset("テスト: 開業初期化準備", "test-admin");
+  const plan = ctx.planner.dryRun();
+  const execution = ctx.reset.executionStore.acquire(plan.planHash, actorId, plan.snapshot.configuration).execution;
+  ctx.status.bindOpeningExecutionOwner(execution.id, actorId);
 }
 
 function seedLand(ledger: Ledger, userId: string, amount: number): void {
@@ -218,7 +226,13 @@ describe("正式開業初期化 — activeイベント板はpreflight blocker(PR
       }
       // open はそのまま
 
-      configureAndOpenReset(ctx);
+      // ここでは意図的に configureAndOpenReset() を使わず status='open' のまま維持する。
+      // blockerが残っている限りexecutionが一切作られないことを検証したいので、
+      // apply()自身に「open→opening_reset→blocker検出→ロールバックでopenへ戻る」の
+      // 一連をR0のIMMEDIATE transactionの中で行わせる（実運用でこの状態が起きる経路と一致させる。
+      // PR12監査: owner-first resumeにより、あらかじめopening_resetへ進めてしまうと
+      // ownerが未bindのまま観測される＝それ自体が別の不変条件違反になってしまうため）。
+      writeCasinoOpeningConfig(ctx.settings, VALID_CONFIG, "test-admin");
       const preflight = ctx.planner.dryRun();
       const blocker = preflight.blockers.find((b) => b.code === "active_event_land_market");
       expect(blocker, `active_event_land_market blockerが検出される(status=${targetStatus})`).toBeTruthy();
@@ -263,7 +277,9 @@ describe("正式開業初期化 — terminalイベント板のescrow異常はblo
     });
     expect(ctx.ledger.balanceOf(eventMarketEscrowHolder(m.id))).toBe(999);
 
-    configureAndOpenReset(ctx);
+    // 意図的にconfigureAndOpenReset()を使わずstatus='open'のまま維持する（理由は上記の
+    // activeイベント板blockerテストと同じ。PR12監査: owner-first resume）。
+    writeCasinoOpeningConfig(ctx.settings, VALID_CONFIG, "test-admin");
     const preflight = ctx.planner.dryRun();
     const blocker = preflight.blockers.find((b) => b.code === "terminal_event_market_escrow_nonzero");
     expect(blocker, "terminal_event_market_escrow_nonzero blockerが検出される").toBeTruthy();

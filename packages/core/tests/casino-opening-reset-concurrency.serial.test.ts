@@ -7,12 +7,18 @@ import { afterEach, describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
+import { EventLog } from "../src/events/service.js";
 import { ChipTx } from "../src/casino/chip-tx.js";
-import { ETHER_ESCROW, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { ChipLedger, ETHER_ESCROW, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { Escrow } from "../src/casino/escrow.js";
+import { CasinoChipAssets } from "../src/casino/chip-assets.js";
+import { CasinoIntegrity } from "../src/casino/integrity.js";
 import { Settings } from "../src/settings/service.js";
 import { Departments, deptAccount } from "../src/departments/service.js";
 import { CasinoStatus } from "../src/casino/status.js";
 import { writeCasinoOpeningConfig } from "../src/casino/opening-settings.js";
+import { OpeningPlanner } from "../src/casino/opening-plan.js";
+import { OpeningExecutionStore } from "../src/casino/opening-execution.js";
 
 registerDefaultTxTypes();
 
@@ -51,7 +57,12 @@ function setupFileDb() {
   const dbPath = join(dir, "casino.db");
   const db = openDb(dbPath);
   const ledger = new Ledger(db);
+  const events = new EventLog(db);
   const chipTx = new ChipTx(db);
+  const chips = new ChipLedger(db, ledger, events, { chipTx });
+  const escrow = new Escrow(db, chips, events);
+  const chipAssets = new CasinoChipAssets(db, chips);
+  const integrity = new CasinoIntegrity(db, ledger, chips, escrow, chipAssets);
   const settings = new Settings(db);
   const departments = new Departments(db, ledger);
   const status = new CasinoStatus(db);
@@ -71,6 +82,13 @@ function setupFileDb() {
   departments.upsert("賭博場", "賭博場", null);
   writeCasinoOpeningConfig(settings, VALID_CONFIG, "test-admin");
   status.beginOpeningReset("テスト: 実プロセス競合検証", "test-admin");
+  // status='opening_reset'ならownerは必ず完全にbind済みであるべき（PR12監査続き）なので、
+  // ここでもacquire+bindしてから3つのworkerプロセスを同時に走らせる。workerは全員
+  // AUTHORIZED_ACTOR_IDで叩くので、bindするactorもそれに合わせる。
+  const planner = new OpeningPlanner({ db, ledger, chips, chipAssets, integrity, status, settings, departments });
+  const plan = planner.dryRun();
+  const execution = new OpeningExecutionStore(db).acquire(plan.planHash, AUTHORIZED_ACTOR_ID, plan.snapshot.configuration).execution;
+  status.bindOpeningExecutionOwner(execution.id, AUTHORIZED_ACTOR_ID);
 
   return { dbPath, db };
 }

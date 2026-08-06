@@ -16,7 +16,7 @@ import { CasinoStatus } from "../src/casino/status.js";
 import { Settings } from "../src/settings/service.js";
 import { Departments, deptAccount } from "../src/departments/service.js";
 import { writeCasinoOpeningConfig } from "../src/casino/opening-settings.js";
-import { CASINO_DEPARTMENT_ACCOUNT } from "../src/casino/opening-plan.js";
+import { CASINO_DEPARTMENT_ACCOUNT, OpeningPlanner } from "../src/casino/opening-plan.js";
 import { OpeningReset, R6_ALL_DELETE_TABLES } from "../src/casino/opening-reset.js";
 import { TestFilesystemOpeningBackupAdapter } from "../src/casino/opening-backup.js";
 import { FakeOpeningExternalAdapter } from "../src/casino/opening-external.js";
@@ -94,9 +94,17 @@ function seedLegacy(ctx: Ctx, opts: { houseChips?: number; deptSeed?: number } =
   ctx.departments.upsert("賭博場", "賭博場", null);
 }
 
-function configureAndOpenReset(ctx: Ctx): void {
+/**
+ * status='opening_reset' へ進めるだけでなく、owner（execution/actor）も同時にbindする
+ * （PR12監査: owner-first resume。R0は「status='opening_reset'ならownerは必ず完全にbind
+ * 済み」を前提にしたため、`beginOpeningReset()`単独呼び出しだけでは不変条件違反になる）。
+ */
+function configureAndOpenReset(ctx: Ctx, actorId = "admin"): void {
   writeCasinoOpeningConfig(ctx.settings, VALID_CONFIG, "test-admin");
   ctx.status.beginOpeningReset("テスト: 開業初期化準備", "test-admin");
+  const plan = new OpeningPlanner({ ...ctx, chips: ctx.ether }).dryRun();
+  const execution = ctx.reset.executionStore.acquire(plan.planHash, actorId, plan.snapshot.configuration).execution;
+  ctx.status.bindOpeningExecutionOwner(execution.id, actorId);
 }
 
 function seedLand(ledger: Ledger, userId: string, amount: number): void {

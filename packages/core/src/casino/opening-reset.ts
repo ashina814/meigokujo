@@ -399,19 +399,35 @@ export class OpeningReset {
         // CASが恒久的に失敗し続け、通常のapply()から二度と復旧できなくなるバグがあった
         // （旧executionへ到達できず、かつ別executionへの上書きも拒否されるため）。
         if (currentStatus === "opening_reset") {
-          const owner = this.deps.status.currentOpeningOwner();
-          if (owner) {
-            return this.resumeFromOwner(input.actorId, owner);
+          // `currentOpeningOwner()` は「両方非NULL」以外（両方NULL・片方だけNULL）を
+          // 区別せず一律 null に丸めるため、ここでは生の列値（`openingOwnerRawFields()`）を
+          // 使う（PR12監査: owner-first resumeの続き）。
+          //
+          // 本設計では、status='opening_reset' への遷移とowner bind（`opening_execution_id`/
+          // `opening_actor_id`の設定）は常に単一のIMMEDIATE transaction内で行われる
+          // （このtransaction自身がそう。crash injection地点`r0_after_status_flip`の回帰テストが
+          // 「statusだけ進んでownerが無い」状態を作ろうとしても、丸ごとROLLBACKされることを
+          // 保証している）。したがって、正しく動作しているシステムでは
+          // status='opening_reset' かつ owner列が両方NULL、または片方だけNULLという状態は
+          // **決して観測されないはず**である。もし観測されたら、それは「まだ誰も取得していない」
+          // 正常な中間状態ではなく、想定していない経路（例: 何らかの理由で`beginOpeningReset()`
+          // だけが単独で実行された等）によるデータ不整合を意味する。資金・status・executionを
+          // 一切変更せず、推測で新規acquireへ進まずfail-closedで即座に停止する。
+          const raw = this.deps.status.openingOwnerRawFields();
+          if (raw.executionId !== null && raw.actorId !== null) {
+            return this.resumeFromOwner(input.actorId, { executionId: raw.executionId, actorId: raw.actorId });
           }
-          // owner未確定（両方NULL）: このDBの生涯でR0のacquire+bindがまだ一度もCOMMITされて
-          // いない（例: 運用導線が`beginOpeningReset()`を直接呼んでstatusだけ先に進めた場合。
-          // acquireとbindは常に同一transactionでCOMMITされる設計なので、「片方だけ確定した」
-          // 状態は存在しない＝これはfail-closed対象ではなく、単に「まだ誰も取得していない」）。
-          // 下の新規acquireロジックへそのまま進む。
+          throw new Error(
+            `不変条件違反: casino_status.status='opening_reset'だがowner列が完全にbindされていない` +
+              `（opening_execution_id=${raw.executionId ?? "NULL"}, opening_actor_id=${raw.actorId ?? "NULL"}）。` +
+              `status='opening_reset'への遷移とowner bindは常に同一transactionで行われる設計のため、` +
+              `この状態は本来観測されないはず（データ破損または想定外の経路の疑い。手動調査が必要）`,
+          );
         }
 
-        // ---- 新規acquire（status===openからの遷移、またはstatus===opening_resetだが
-        // まだownerが確定していない場合の両方をカバーする）----
+        // ---- 新規acquire（status===openからの遷移のみ。status===opening_resetは
+        // 上のブロックで owner-first resume するか、owner未bindならfail-closedで
+        // 停止しているので、ここへは到達しない）----
         const preCheck = this.planner.dryRun();
         const readyExceptStatus =
           currentStatus === "open" &&
@@ -788,6 +804,17 @@ export class OpeningReset {
     // ---- plan hashが変化していた（このメソッドが解決すべき本題）----
     if (isPreExternalResumable(ownerExecution)) {
       // 外部工程開始前: 資金・外部工程とも未確定。安全に再計画してよい。
+      //
+      // ただし、新しいplanにblockerが残っている場合は、旧executionをfailedへ倒したり
+      // 新規executionをacquireしたりする**前に**OpeningApplyBlockedErrorで即座に拒否する。
+      // 「新規acquire」経路（status===openからの初回開始）は元々
+      // `if (plan.blockers.length > 0) throw new OpeningApplyBlockedError(...)` を
+      // execution取得より前に行っており、「blockerが残っている限りexecution行すら
+      // 作らない」という不変条件がある（監査ブロッカー2・8のテストが検証している）。
+      // owner-first resumeの再計画でもこの不変条件を崩さないよう、ここで同じ順序を守る。
+      if (currentPlan.blockers.length > 0) {
+        throw new OpeningApplyBlockedError(currentPlan.blockers);
+      }
       // 旧executionを`failed`へ記録した上で、所有権を新plan executionへ原子的に移譲する
       // （旧executionを残したままownerだけ無条件で上書きしない）。
       let previous = ownerExecution;

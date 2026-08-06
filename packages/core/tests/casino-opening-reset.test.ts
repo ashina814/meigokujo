@@ -86,9 +86,17 @@ function seedLegacy(ctx: Ctx, opts: { houseChips?: number; deptSeed?: number } =
   ctx.departments.upsert("賭博場", "賭博場", null);
 }
 
-function configureAndOpenReset(ctx: Ctx, config = VALID_CONFIG): void {
+/**
+ * status='opening_reset' へ進めるだけでなく、owner（execution/actor）も同時にbindする
+ * （PR12監査: owner-first resume。R0は「status='opening_reset'ならownerは必ず完全にbind
+ * 済み」を前提にしたため、`beginOpeningReset()`単独呼び出しだけでは不変条件違反になる）。
+ */
+function configureAndOpenReset(ctx: Ctx, config = VALID_CONFIG, actorId = "admin"): void {
   writeCasinoOpeningConfig(ctx.settings, config, "test-admin");
   ctx.status.beginOpeningReset("テスト: 開業初期化準備", "test-admin");
+  const plan = new OpeningPlanner({ ...ctx, chips: ctx.ether }).dryRun();
+  const execution = ctx.reset.executionStore.acquire(plan.planHash, actorId, plan.snapshot.configuration).execution;
+  ctx.status.bindOpeningExecutionOwner(execution.id, actorId);
 }
 
 // 監査ブロッカー5.3: 破壊的applyはdurability="persistent"のbackup adapterしか受け付けない。

@@ -339,6 +339,102 @@ describe("OpeningReset.apply — owner-first resume: plan hash変化時の段階
       expect(row.actor_id).toBe("bob");
       expect(row.status).toBe("planned");
     });
+
+    // PR12監査(続き): `currentOpeningOwner()`は「両方非NULL」以外(両方NULL・片方だけNULL)を
+    // 一律nullへ丸めてしまうため、R0が誤ってそれを「まだ誰も取得していない」と判断し、
+    // 新規acquireへ進んでしまう(＝破損状態を推測で補完してしまう)おそれがあった。
+    // R0は`openingOwnerRawFields()`の生値を見て、次の3パターンをすべてfail-closedにする。
+    //
+    // 上の「opening_actor_idだけがNULL」テストは`opening_execution_id`に**実在しないbogus値**
+    // (`"opening-reset:bogus"`)を使っていたため、後段の「executionが見つからない」不変条件違反
+    // で止まっているだけの可能性があり、部分NULLそのものを検知しているとは言い切れなかった。
+    // ここでは実在する正規のexecution行を指すexecution_idを使い、部分NULL自体が
+    // (resumeFromOwnerへ進む前に)検知されていることを確認する。
+    it("opening_execution_idは実在executionを指しているのにopening_actor_idだけがNULL(部分破損)の場合、新規acquireへ逃げず不変条件違反で止まる", async () => {
+      const ctx = setup();
+      seedLegacy(ctx);
+      writeCasinoOpeningConfig(ctx.settings, VALID_CONFIG, "test-admin");
+      ctx.status.beginOpeningReset("テスト", "admin");
+      const plan = ctx.planner.dryRun();
+      expect(plan.blockers).toEqual([]);
+      // execution行は正規にacquire+bindしてから、owner側のactor_idだけを直接NULLへ戻す
+      // (bindOpeningExecutionOwner()のCASを経由しては起きないはずの破損を模擬する)
+      const acquireResult = ctx.reset.executionStore.acquire(plan.planHash, "admin", plan.snapshot.configuration);
+      const bound = ctx.status.bindOpeningExecutionOwner(acquireResult.execution.id, "admin");
+      expect(bound).toBe(true);
+      ctx.db.prepare("UPDATE casino_status SET opening_actor_id = NULL WHERE id = 1").run();
+      const before = owner(ctx);
+      expect(before).toEqual({ opening_execution_id: acquireResult.execution.id, opening_actor_id: null });
+      const executionCountBefore = (ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_opening_executions").get() as { n: number }).n;
+      const lastTxBefore = ctx.ledger.lastTransactionId();
+
+      const backup = new FakeOpeningBackupAdapter();
+      const external = new FakeOpeningExternalAdapter();
+      await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(/不変条件違反/);
+
+      // 新規executionを作らない・owner列を書き換えない・statusを変更しない・
+      // backupを呼ばない・R6/Land資金移動へ進まない
+      expect(backup.calls).toHaveLength(0);
+      expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_opening_executions").get() as { n: number }).n).toBe(executionCountBefore);
+      expect(owner(ctx)).toEqual(before);
+      expect(ctx.status.current().status).toBe("opening_reset");
+      expect(ctx.ledger.lastTransactionId()).toBe(lastTxBefore);
+      expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
+      // execution行自体も書き換わっていない
+      const row = readExecutionRow(ctx, acquireResult.execution.id);
+      expect(row.status).toBe("planned");
+    });
+
+    it("opening_execution_idがNULLでopening_actor_idだけが設定されている(部分破損)の場合、新規acquireへ逃げず不変条件違反で止まる", async () => {
+      const ctx = setup();
+      seedLegacy(ctx);
+      writeCasinoOpeningConfig(ctx.settings, VALID_CONFIG, "test-admin");
+      ctx.status.beginOpeningReset("テスト", "admin");
+      // execution_idはNULLのまま、actor_idだけ直接注入する
+      ctx.db.prepare("UPDATE casino_status SET opening_actor_id = ? WHERE id = 1").run("admin");
+      const before = owner(ctx);
+      expect(before).toEqual({ opening_execution_id: null, opening_actor_id: "admin" });
+      const executionCountBefore = (ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_opening_executions").get() as { n: number }).n;
+      const lastTxBefore = ctx.ledger.lastTransactionId();
+
+      const backup = new FakeOpeningBackupAdapter();
+      const external = new FakeOpeningExternalAdapter();
+      await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(/不変条件違反/);
+
+      expect(backup.calls).toHaveLength(0);
+      expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_opening_executions").get() as { n: number }).n).toBe(executionCountBefore);
+      expect(owner(ctx)).toEqual(before);
+      expect(ctx.status.current().status).toBe("opening_reset");
+      expect(ctx.ledger.lastTransactionId()).toBe(lastTxBefore);
+      expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
+    });
+
+    it("opening_execution_id・opening_actor_idが両方NULL(status='opening_reset'なのにownerが一度も確定していない)場合、新規acquireへ逃げず不変条件違反で止まる", async () => {
+      const ctx = setup();
+      seedLegacy(ctx);
+      writeCasinoOpeningConfig(ctx.settings, VALID_CONFIG, "test-admin");
+      // beginOpeningReset()だけを呼び、acquire/bindは一切行わない
+      // (`apply()`自身のR0はstatus遷移とacquire+bindを単一transactionで行うため、
+      //  正しく動作しているシステムではこの状態は本来観測されないはず。ここではその
+      //  「あり得ないはずの中間状態」を直接注入して、fail-closedになることを確認する)
+      ctx.status.beginOpeningReset("テスト", "admin");
+      const before = owner(ctx);
+      expect(before).toEqual({ opening_execution_id: null, opening_actor_id: null });
+      const executionCountBefore = (ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_opening_executions").get() as { n: number }).n;
+      expect(executionCountBefore).toBe(0);
+      const lastTxBefore = ctx.ledger.lastTransactionId();
+
+      const backup = new FakeOpeningBackupAdapter();
+      const external = new FakeOpeningExternalAdapter();
+      await expect(ctx.reset.apply({ actorId: "admin", backup, external })).rejects.toThrow(/不変条件違反/);
+
+      expect(backup.calls).toHaveLength(0);
+      expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_opening_executions").get() as { n: number }).n).toBe(0);
+      expect(owner(ctx)).toEqual(before);
+      expect(ctx.status.current().status).toBe("opening_reset");
+      expect(ctx.ledger.lastTransactionId()).toBe(lastTxBefore);
+      expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
+    });
   });
 
   it("F(回帰): 同じplan hashでの正常resumeは引き続き成功する(backup失敗→再試行で完了)", async () => {
@@ -346,6 +442,11 @@ describe("OpeningReset.apply — owner-first resume: plan hash変化時の段階
     seedLegacy(ctx);
     writeCasinoOpeningConfig(ctx.settings, VALID_CONFIG, "test-admin");
     ctx.status.beginOpeningReset("テスト", "admin");
+    // status='opening_reset'ならownerは必ず完全にbind済みであるべき（PR12監査続き）なので、
+    // ここでもacquire+bindしてから最初のapply()を呼ぶ。
+    const initialPlan = ctx.planner.dryRun();
+    const initialExecution = ctx.reset.executionStore.acquire(initialPlan.planHash, "admin", initialPlan.snapshot.configuration).execution;
+    ctx.status.bindOpeningExecutionOwner(initialExecution.id, "admin");
     const failingBackup = new FakeOpeningBackupAdapter({ fail: true });
     const external = new FakeOpeningExternalAdapter();
     await expect(ctx.reset.apply({ actorId: "admin", backup: failingBackup, external })).rejects.toThrow();
