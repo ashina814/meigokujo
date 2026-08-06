@@ -7,17 +7,22 @@ import {
 
 describe("capacity report runtime context", () => {
   it("並行する管理リクエストごとにVIP倍率を隔離する", async () => {
-    const [x2, x3] = await Promise.all([
-      runWithCapacityVipBetCapMult(2, async () => {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-        return houseCapacityReport(0, CAPACITY_REPORT_GAMES);
-      }),
-      runWithCapacityVipBetCapMult(3, async () => {
-        await Promise.resolve();
-        return houseCapacityReport(0, CAPACITY_REPORT_GAMES);
-      }),
-    ]);
+    let releaseX2!: () => void;
+    const x2MayContinue = new Promise<void>((resolve) => {
+      releaseX2 = resolve;
+    });
 
+    const x2Promise = runWithCapacityVipBetCapMult(2, async () => {
+      await x2MayContinue;
+      return houseCapacityReport(0, CAPACITY_REPORT_GAMES);
+    });
+    const x3Promise = runWithCapacityVipBetCapMult(3, async () => {
+      const report = houseCapacityReport(0, CAPACITY_REPORT_GAMES);
+      releaseX2();
+      return report;
+    });
+
+    const [x2, x3] = await Promise.all([x2Promise, x3Promise]);
     expect(x2.assumptions.vipBetCapMult).toBe(2);
     expect(x2.assumptions.maximumBet).toBe(200_000);
     expect(x3.assumptions.vipBetCapMult).toBe(3);
