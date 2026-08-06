@@ -894,7 +894,7 @@ export class Markets {
   liveEscrowHolders(): string[] {
     // market_mode='standard' に限定する（PR12とは独立のhotfix・追加アーキ指針§D）。
     // イベント板の Land escrow（sys:escrow:market:<id>、生Ledger所属）は ChipLedger の
-    // 孤児検出とは完全に別経済圏なので、ここへ含めない（別途 refundAllPendingEventLand() が扱う）。
+    // 孤児検出とは完全に別経済圏なので、ここへ含めない（別途 auditPendingEventLand() が扱う）。
     const placeholders = MARKET_LIVE_STATUSES.map(() => "?").join(",");
     const rows = this.db
       .prepare(`SELECT id FROM casino_markets WHERE market_mode = 'standard' AND status IN (${placeholders})`)
@@ -909,7 +909,8 @@ export class Markets {
     failed: Array<{ id: number; error: string }>;
   } {
     // market_mode='standard' に限定する。イベント板（Land・別台帳）は
-    // refundAllPendingEventLand() が別経路で掃除する（chip 側の this.refund() を通さない）。
+    // auditPendingEventLand()（通常起動）/ adminRefundAllPendingEventLand()（明示的な管理者操作）
+    // が別経路で扱う（chip 側の this.refund() を通さない）。
     const rows = this.db
       .prepare("SELECT id FROM casino_markets WHERE market_mode = 'standard' AND status IN ('open','closed','reported','disputed')")
       .all() as Array<{ id: number }>;
@@ -1466,12 +1467,19 @@ export class Markets {
   }
 
   /**
-   * 起動時: market_mode='event' の未精算板（open/closed）を全部 Land 全額返金 & void。
+   * ⚠️ 明示的な管理者操作専用。通常のBot起動経路（`buildServices()`）から呼び出さないこと。
+   *
+   * market_mode='event' の未精算板（open/closed）を全部 Land 全額返金 & void。
    * frozen は対象外（既存同様・運営の手動調査を待つ）。settled/void はそもそも対象外。
    * 個別の板でエラーが出ても他の板を止めない。operationId は marketId から導出する
    * 安定値にして、再起動のたびに同じ板を二重返金しない（時刻を混ぜない）。
+   *
+   * 監査指摘1（PR#94独立監査）: 以前はこの関数を無条件に Bot 起動時へ配線していたため、
+   * deploy・クラッシュ・自動再起動のたびに**正常な進行中イベント板**まで全額返金・void化
+   * されてしまうバグがあった。通常起動からは資金を一切動かさない `auditPendingEventLand()`
+   * を呼ぶこと。この関数は将来の明示的な管理者操作（運営コマンド等）用に残す。
    */
-  refundAllPendingEventLand(actor: string): {
+  adminRefundAllPendingEventLand(actor: string): {
     total: number;
     refunded: number;
     frozen: number;
@@ -1498,6 +1506,61 @@ export class Markets {
       }
     }
     return { total: rows.length, refunded, frozen, failed };
+  }
+
+  /**
+   * 起動時: market_mode='event' の未精算板（open/closed）を**監査するだけ**の読み取り専用API。
+   * 資金・statusを一切変更しない（監査指摘1・PR#94独立監査）。
+   *
+   * 各板について `casino_market_bets` の合計（pot）と `eventMarketEscrowHolder(id)` の
+   * Land残高を突き合わせる。
+   * - 一致（0=0を含む）: 健全。status・bet行・Land残高・event_market_opsのいずれも変更しない。
+   *   open/closedのまま維持するので、再起動後もイベントは継続できる。
+   * - 不一致: Landを一切動かさず、既存の `freeze()`（bet()の資金整合ガードで使われている
+   *   独立トランザクション）で status を frozen にする。理由・pot・escrowBalance・marketId
+   *   を event ログのメタ情報として残す。
+   *
+   * 冪等性: frozen化した板は次回以降 `status IN ('open','closed')` の対象から自然に外れるため、
+   * 監査を繰り返しても再度書き込まない。健全な板はそもそも一切書き込まない。
+   *
+   * 個別の板で例外が出ても他の板の処理は続ける（`adminRefundAllPendingEventLand()` と同じ
+   * 「1件の失敗で全体を止めない」流儀）。
+   */
+  auditPendingEventLand(actor: string): {
+    total: number;
+    healthy: number;
+    frozen: number;
+    failed: Array<{ id: number; error: string }>;
+  } {
+    const ledger = this.requireLandLedger();
+    const rows = this.db
+      .prepare("SELECT id FROM casino_markets WHERE market_mode = 'event' AND status IN ('open','closed')")
+      .all() as Array<{ id: number }>;
+    let healthy = 0;
+    let frozen = 0;
+    const failed: Array<{ id: number; error: string }> = [];
+    for (const r of rows) {
+      try {
+        const pot = (
+          this.db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM casino_market_bets WHERE market_id = ?").get(r.id) as {
+            s: number;
+          }
+        ).s;
+        const escBal = ledger.balanceOf(eventMarketEscrowHolder(r.id));
+        if (escBal === pot) {
+          healthy++;
+          continue;
+        }
+        // 不一致: Landは一切動かさず frozen 化するだけ（返金・void はしない）。
+        this.freeze(r.id, actor, "event_escrow_mismatch_on_audit", { pot, escrowBalance: escBal, marketId: r.id });
+        frozen++;
+      } catch (e) {
+        const err = e instanceof MarketError ? `${e.code}:${JSON.stringify(e.meta)}` : (e as Error).message;
+        failed.push({ id: r.id, error: err });
+        this.events.log("event_market_audit_failed", { actor, payload: { id: r.id, error: err } });
+      }
+    }
+    return { total: rows.length, healthy, frozen, failed };
   }
 }
 

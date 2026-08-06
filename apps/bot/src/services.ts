@@ -170,19 +170,25 @@ export function buildServices() {
   // イベントLand板（緊急イベント用 hotfix・PR12とは独立）は生の Ledger（landLedger）を直接使う。
   // 通常板の資金経路（ChipLedger 経由の `ether`）とは完全に分離したまま渡す。
   const markets = new Markets(db, chips, events, { onPlayerNet: recordPlayerNet, landLedger: ledger });
-  // 起動時: イベントLand板の未精算（open/closed）分を全額Land返金して void 化する。
-  // recoverCasino()（chip 経済専用）とは独立の掃除経路。Land はカジノチップ経済と別レイヤーで、
+  // 起動時: イベントLand板の未精算（open/closed）分を**監査するだけ**（資金は一切動かさない）。
+  // recoverCasino()（chip 経済専用）とは独立の監査経路。Land はカジノチップ経済と別レイヤーで、
   // liveEscrowHolders() の孤児検出（chip 側）にも含めていないため、ここで明示的に呼ぶ必要がある。
+  //
+  // 監査指摘1（PR#94独立監査）: 以前はここで adminRefundAllPendingEventLand()（旧名
+  // refundAllPendingEventLand）を無条件に呼んでいたため、deploy・クラッシュ・自動再起動の
+  // たびに正常な進行中イベント板まで全額返金・void化されてしまっていた。通常のBot起動経路
+  // では資金を動かさない auditPendingEventLand() だけを呼ぶ。escrow残高とbet合計が一致する
+  // 健全な板は open/closed のまま継続し、不一致の板だけ資金移動なしで frozen にする。
   {
-    const eventCleanup = markets.refundAllPendingEventLand(MARKET_FINALIZER);
-    if (eventCleanup.total > 0) {
+    const eventAudit = markets.auditPendingEventLand(MARKET_FINALIZER);
+    if (eventAudit.total > 0) {
       console.log(
-        `[event-market] 起動時イベント板の未精算掃除: 対象${eventCleanup.total}件 返金${eventCleanup.refunded}件 凍結${eventCleanup.frozen}件`,
+        `[event-market] 起動時イベント板の監査: 対象${eventAudit.total}件 健全${eventAudit.healthy}件 凍結${eventAudit.frozen}件`,
       );
     }
-    if (eventCleanup.failed.length > 0) {
+    if (eventAudit.failed.length > 0) {
       console.error(
-        `[event-market] 起動時イベント板の返金に失敗: ` + eventCleanup.failed.map((f) => `#${f.id}: ${f.error}`).join(" / "),
+        `[event-market] 起動時イベント板の監査に失敗: ` + eventAudit.failed.map((f) => `#${f.id}: ${f.error}`).join(" / "),
       );
     }
   }

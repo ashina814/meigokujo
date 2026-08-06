@@ -586,13 +586,13 @@ describe("イベントLand板: 管理者無効化", () => {
   });
 });
 
-describe("イベントLand板: 起動時未精算掃除", () => {
+describe("イベントLand板: 明示的な管理者操作による一括返金（adminRefundAllPendingEventLand・通常起動からは呼ばない）", () => {
   let ctx: ReturnType<typeof setup>;
   beforeEach(() => {
     ctx = setup();
   });
 
-  it("refundAllPendingEventLand は open/closed のイベント板だけ返金し、frozen/settled/voidは対象外", () => {
+  it("adminRefundAllPendingEventLand は open/closed のイベント板だけ返金し、frozen/settled/voidは対象外", () => {
     const mOpen = createEventMarket(ctx, { creatorId: "c1" });
     seedLand(ctx.ledger, "u1", 1_000);
     ctx.markets.betEventLand(mOpen.id, "u1", [ROLE_A], 0, 500, opId());
@@ -602,7 +602,7 @@ describe("イベントLand板: 起動時未精算掃除", () => {
     ctx.markets.betEventLand(mClosed.id, "u2", [ROLE_A], 0, 300, opId());
     ctx.markets.close(mClosed.id, "c2");
 
-    const r = ctx.markets.refundAllPendingEventLand("system:startup");
+    const r = ctx.markets.adminRefundAllPendingEventLand("system:startup");
     expect(r.total).toBe(2);
     expect(r.refunded).toBe(2);
     expect(ctx.ledger.balanceOf("user:u1")).toBe(1_000);
@@ -613,9 +613,178 @@ describe("イベントLand板: 起動時未精算掃除", () => {
 
   it("通常板（market_mode='standard'）には触れない", () => {
     const std = ctx.markets.create({ operationId: opId(), guildId: "g", creatorId: "std-user", title: "通常板", options: ["A", "B"], durationMin: 10, fee: 0 });
-    const r = ctx.markets.refundAllPendingEventLand("system:startup");
+    const r = ctx.markets.adminRefundAllPendingEventLand("system:startup");
     expect(r.total).toBe(0);
     expect(ctx.markets.get(std.id)!.status).toBe("open"); // 触れられていない
+  });
+});
+
+describe("イベントLand板: 起動時監査（auditPendingEventLand・資金移動なし・監査指摘1）", () => {
+  let ctx: ReturnType<typeof setup>;
+  beforeEach(() => {
+    ctx = setup();
+  });
+
+  it("正常なopen板の再起動: statusはopenのまま・bet行不変・利用者残高不変・escrow残高不変・fee口座不変・event_market_ops不変", () => {
+    const m = createEventMarket(ctx, { creatorId: "c1" });
+    seedLand(ctx.ledger, "u1", 1_000);
+    seedLand(ctx.ledger, "u2", 1_000);
+    ctx.markets.betEventLand(m.id, "u1", [ROLE_A], 0, 500, opId());
+    ctx.markets.betEventLand(m.id, "u2", [ROLE_A], 1, 300, opId());
+    expect(ctx.markets.get(m.id)!.status).toBe("open");
+
+    const betsBefore = ctx.markets.bets(m.id);
+    const u1Before = ctx.ledger.balanceOf("user:u1");
+    const u2Before = ctx.ledger.balanceOf("user:u2");
+    const escBefore = ctx.ledger.balanceOf(eventMarketEscrowHolder(m.id));
+    const feeBefore = ctx.ledger.balanceOf(EVENT_MARKET_FEES_HOLDER);
+    const opsCountBefore = (ctx.db.prepare("SELECT COUNT(*) AS c FROM event_market_ops").get() as { c: number }).c;
+
+    // 「Botの再起動」相当: 新しい Markets/Ledger インスタンスを同じ db 上に作り直して監査する
+    const ledger2 = new Ledger(ctx.db);
+    const ether2 = new ChipLedger(ctx.db, ledger2, new EventLog(ctx.db));
+    const markets2 = new Markets(ctx.db, ether2, new EventLog(ctx.db), { landLedger: ledger2 });
+    const r = markets2.auditPendingEventLand("system:startup");
+
+    expect(r.total).toBe(1);
+    expect(r.healthy).toBe(1);
+    expect(r.frozen).toBe(0);
+    expect(r.failed).toEqual([]);
+    expect(ctx.markets.get(m.id)!.status).toBe("open");
+    expect(ctx.markets.bets(m.id)).toEqual(betsBefore);
+    expect(ctx.ledger.balanceOf("user:u1")).toBe(u1Before);
+    expect(ctx.ledger.balanceOf("user:u2")).toBe(u2Before);
+    expect(ctx.ledger.balanceOf(eventMarketEscrowHolder(m.id))).toBe(escBefore);
+    expect(ctx.ledger.balanceOf(EVENT_MARKET_FEES_HOLDER)).toBe(feeBefore);
+    const opsCountAfter = (ctx.db.prepare("SELECT COUNT(*) AS c FROM event_market_ops").get() as { c: number }).c;
+    expect(opsCountAfter).toBe(opsCountBefore);
+  });
+
+  it("正常なclosed板の再起動: statusはclosedのまま維持され、監査後もそのまま精算できる", () => {
+    const m = createEventMarket(ctx, { creatorId: "c1" });
+    seedLand(ctx.ledger, "u1", 1_000);
+    seedLand(ctx.ledger, "u2", 1_000);
+    ctx.markets.betEventLand(m.id, "u1", [ROLE_A], 0, 500, opId());
+    ctx.markets.betEventLand(m.id, "u2", [ROLE_A], 1, 300, opId());
+    ctx.markets.close(m.id, "c1");
+    expect(ctx.markets.get(m.id)!.status).toBe("closed");
+
+    const r = ctx.markets.auditPendingEventLand("system:startup");
+    expect(r.total).toBe(1);
+    expect(r.healthy).toBe(1);
+    expect(r.frozen).toBe(0);
+    expect(ctx.markets.get(m.id)!.status).toBe("closed");
+
+    // 監査後も即時精算できる（statusを壊していない証拠）
+    const settled = ctx.markets.reportAndSettleEventLand(m.id, "c1", 0, opId(), false);
+    expect(settled.void).toBe(false);
+    expect(ctx.markets.get(m.id)!.status).toBe("settled");
+  });
+
+  it("escrow不足（pot > escrow）: 資金移動なしでfrozenにし、pot/escrow差分をログに残す", () => {
+    const m = createEventMarket(ctx, { creatorId: "c1" });
+    seedLand(ctx.ledger, "u1", 1_000);
+    ctx.markets.betEventLand(m.id, "u1", [ROLE_A], 0, 500, opId());
+    const betsBefore = ctx.markets.bets(m.id);
+
+    // escrowから抜き取って不整合を作る（テストのみが直接 ledger を叩ける操作。本番コードは通らない）
+    ctx.ledger.transfer({
+      from: eventMarketEscrowHolder(m.id),
+      to: "user:u1",
+      amount: 200,
+      type: "prize",
+      actor: "test",
+      idempotencyKey: `test-drain:${m.id}`,
+    });
+    expect(ctx.ledger.balanceOf(eventMarketEscrowHolder(m.id))).toBe(300); // pot(500) > escrow(300)
+    const u1AfterDrain = ctx.ledger.balanceOf("user:u1"); // ここまではテストのdrain操作による変化（本番コードとは無関係）
+
+    const r = ctx.markets.auditPendingEventLand("system:startup");
+    expect(r.total).toBe(1);
+    expect(r.healthy).toBe(0);
+    expect(r.frozen).toBe(1);
+    expect(ctx.markets.get(m.id)!.status).toBe("frozen");
+    // bet行は監査では一切変更しない
+    expect(ctx.markets.bets(m.id)).toEqual(betsBefore);
+    // 監査自体はLandを一切動かさない（drain後の残高からさらに変化しない）
+    expect(ctx.ledger.balanceOf("user:u1")).toBe(u1AfterDrain);
+    expect(ctx.ledger.balanceOf(eventMarketEscrowHolder(m.id))).toBe(300); // escrowも監査では動かない
+
+    const frozenEvents = ctx.events
+      .listByType("market_frozen")
+      .map((e) => JSON.parse(e.payload_json ?? "{}") as { id?: number; reason?: string; pot?: number; escrowBalance?: number; marketId?: number })
+      .filter((p) => p.id === m.id);
+    expect(frozenEvents.length).toBe(1);
+    const payload = frozenEvents[0]!;
+    expect(payload.reason).toBe("event_escrow_mismatch_on_audit");
+    expect(payload.pot).toBe(500);
+    expect(payload.escrowBalance).toBe(300);
+    expect(payload.marketId).toBe(m.id);
+  });
+
+  it("escrow過剰（pot < escrow）も同様にfrozenにする", () => {
+    const m = createEventMarket(ctx, { creatorId: "c1" });
+    seedLand(ctx.ledger, "u1", 1_000);
+    ctx.markets.betEventLand(m.id, "u1", [ROLE_A], 0, 500, opId());
+
+    // escrowへ余分に足して不整合を作る
+    seedLand(ctx.ledger, "extra", 100);
+    ctx.ledger.transfer({
+      from: "user:extra",
+      to: eventMarketEscrowHolder(m.id),
+      amount: 100,
+      type: "bet",
+      actor: "test",
+      idempotencyKey: `test-overfund:${m.id}`,
+    });
+    expect(ctx.ledger.balanceOf(eventMarketEscrowHolder(m.id))).toBe(600); // pot(500) < escrow(600)
+
+    const r = ctx.markets.auditPendingEventLand("system:startup");
+    expect(r.healthy).toBe(0);
+    expect(r.frozen).toBe(1);
+    expect(ctx.markets.get(m.id)!.status).toBe("frozen");
+    expect(ctx.ledger.balanceOf(eventMarketEscrowHolder(m.id))).toBe(600); // 監査は資金を動かさない
+  });
+
+  it("冪等性: 複数回実行しても、正常板は変化せず、frozen板を再度変更せず、Landを動かさない", () => {
+    const mHealthy = createEventMarket(ctx, { creatorId: "c1" });
+    seedLand(ctx.ledger, "u1", 1_000);
+    ctx.markets.betEventLand(mHealthy.id, "u1", [ROLE_A], 0, 500, opId());
+
+    const mBad = createEventMarket(ctx, { creatorId: "c2" });
+    seedLand(ctx.ledger, "u2", 1_000);
+    ctx.markets.betEventLand(mBad.id, "u2", [ROLE_A], 0, 500, opId());
+    ctx.ledger.transfer({
+      from: eventMarketEscrowHolder(mBad.id),
+      to: "user:u2",
+      amount: 500,
+      type: "prize",
+      actor: "test",
+      idempotencyKey: `test-drain2:${mBad.id}`,
+    });
+
+    const r1 = ctx.markets.auditPendingEventLand("system:startup");
+    expect(r1.total).toBe(2);
+    expect(r1.healthy).toBe(1);
+    expect(r1.frozen).toBe(1);
+    expect(ctx.markets.get(mBad.id)!.status).toBe("frozen");
+
+    const u2AfterFirst = ctx.ledger.balanceOf("user:u2");
+    const opsCountAfterFirst = (ctx.db.prepare("SELECT COUNT(*) AS c FROM event_market_ops").get() as { c: number }).c;
+    const frozenEventsAfterFirst = ctx.events.listByType("market_frozen", 1000).length;
+
+    // 2回目: mBadは既にfrozenなので対象から外れ、mHealthyだけが健全として再確認される
+    const r2 = ctx.markets.auditPendingEventLand("system:startup");
+    expect(r2.total).toBe(1);
+    expect(r2.healthy).toBe(1);
+    expect(r2.frozen).toBe(0);
+    expect(ctx.markets.get(mHealthy.id)!.status).toBe("open");
+    expect(ctx.markets.get(mBad.id)!.status).toBe("frozen"); // 変化なし
+    expect(ctx.ledger.balanceOf("user:u2")).toBe(u2AfterFirst); // Landは動いていない
+    const opsCountAfterSecond = (ctx.db.prepare("SELECT COUNT(*) AS c FROM event_market_ops").get() as { c: number }).c;
+    expect(opsCountAfterSecond).toBe(opsCountAfterFirst); // 資金操作は増えていない
+    const frozenEventsAfterSecond = ctx.events.listByType("market_frozen", 1000).length;
+    expect(frozenEventsAfterSecond).toBe(frozenEventsAfterFirst); // 再frozen化していない
   });
 });
 
