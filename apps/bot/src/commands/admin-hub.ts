@@ -2071,14 +2071,16 @@ const CAPACITY_REPORT_GAMES = ["スロット", "丁半", "クラッシュ", "チ
  */
 function capacityWorksheetLine(services: Services): string {
   const openingConfig = readCasinoOpeningConfig(services.settings);
-  const minWorkingCapital = openingConfig.ok ? openingConfig.config.minWorkingCapital : 0;
+  // PR13監査: 未設定を0として計算に使わない（`houseCapacityReport`が`null`のまま
+  // `recommendedOpeningHouse`を計算しないので、ここで推測して埋めない）。
+  const minWorkingCapital = openingConfig.ok ? openingConfig.config.minWorkingCapital : null;
   const report = houseCapacityReport(minWorkingCapital, CAPACITY_REPORT_GAMES);
   const worst = report.games.reduce((a, b) => (b.maximumReservation > a.maximumReservation ? b : a), report.games[0]!);
   return [
-    `最低運転資金: ${openingConfig.ok ? fmtLd(minWorkingCapital) : `未設定（\`${CASINO_OPENING_SETTING_KEYS.minWorkingCapital}\` 未設定・開業設定前）`}`,
+    `最低運転資金: ${openingConfig.ok ? fmtLd(minWorkingCapital!) : `未設定（\`${CASINO_OPENING_SETTING_KEYS.minWorkingCapital}\` 未設定・開業設定前）`}`,
     `最大予約（1件）: ${fmtLd(worst.maximumReservation)}（${worst.game}）`,
     `同時10人時の必要額（同ゲーム）: ${fmtLd(worst.users[10])}`,
-    `推奨house残高: **${fmtLd(report.recommendedOpeningHouse)}**`,
+    `推奨house残高: ${report.recommendedOpeningHouse === null ? "未設定（最低運転資金が未確定）" : `**${fmtLd(report.recommendedOpeningHouse)}**`}`,
   ].join("\n");
 }
 
