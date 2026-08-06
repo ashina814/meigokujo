@@ -40,11 +40,14 @@ export interface HouseCapacityReport {
 /** 運転資金表の対象ゲーム正本。モデル追加時は自動的に対象へ入る。 */
 export const CAPACITY_REPORT_GAMES: readonly string[] = Object.freeze(Object.keys(LIABILITY_MODELS));
 
+type VipBetCapMultSource = number | (() => number);
+type VipBetCapMultProvider = () => number;
+
 /**
- * 管理interaction単位のVIP倍率。module-globalな「最後に見たprovider」と違い、
+ * 管理interaction単位のVIP倍率provider。module-globalな「最後に見たprovider」と違い、
  * AsyncLocalStorageが並行リクエストごとに値を隔離する。
  */
-const capacityVipBetCapMultContext = new AsyncLocalStorage<number>();
+const capacityVipBetCapMultContext = new AsyncLocalStorage<VipBetCapMultProvider>();
 
 function requireValidVipBetCapMult(value: number): number {
   if (!Number.isFinite(value) || value <= 0) {
@@ -54,17 +57,18 @@ function requireValidVipBetCapMult(value: number): number {
 }
 
 /**
- * 管理ハンドラ全体を、そのリクエストで読んだVIP倍率のスコープ内で実行する。
- * ここでは値を検証しない。壊れた倍率で給与・設定など無関係な管理操作まで止めず、
- * capacity reportを実際に計算した時だけfail-closedにする。
+ * 管理ハンドラ全体を、そのリクエストのVIP倍率providerスコープ内で実行する。
+ * providerはここでは呼ばない。壊れた設定・DB読取失敗で給与など無関係な管理操作まで
+ * 止めず、capacity reportを実際に計算した時だけ読み取ってfail-closedにする。
  */
-export function runWithCapacityVipBetCapMult<T>(vipBetCapMult: number, callback: () => T): T {
-  return capacityVipBetCapMultContext.run(vipBetCapMult, callback);
+export function runWithCapacityVipBetCapMult<T>(source: VipBetCapMultSource, callback: () => T): T {
+  const provider: VipBetCapMultProvider = typeof source === "function" ? source : () => source;
+  return capacityVipBetCapMultContext.run(provider, callback);
 }
 
 function contextualVipBetCapMult(): number {
-  const scoped = capacityVipBetCapMultContext.getStore();
-  if (scoped !== undefined) return scoped;
+  const provider = capacityVipBetCapMultContext.getStore();
+  if (provider) return provider();
   // 既存の部分mockテストは管理ルータを経由しない。productionでの経路漏れは黙って既定値へ倒さない。
   if (process.env.NODE_ENV === "test") return SETTING_DEFAULTS.vip_bet_cap_mult;
   throw new Error("capacity VIP multiplier context is not set");

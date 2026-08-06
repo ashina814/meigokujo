@@ -32,8 +32,14 @@ describe("capacity report runtime context", () => {
     );
   });
 
-  it("壊れた倍率は無関係な管理処理を止めず、capacity計算時だけfail-closed", () => {
-    expect(runWithCapacityVipBetCapMult(0, () => "unrelated-admin-ok")).toBe("unrelated-admin-ok");
+  it("壊れた倍率providerは無関係な管理処理では読まず、capacity計算時だけfail-closed", () => {
+    const brokenProvider = () => {
+      throw new Error("vip settings read failed");
+    };
+    expect(runWithCapacityVipBetCapMult(brokenProvider, () => "unrelated-admin-ok")).toBe("unrelated-admin-ok");
+    expect(() =>
+      runWithCapacityVipBetCapMult(brokenProvider, () => houseCapacityReport(0, CAPACITY_REPORT_GAMES)),
+    ).toThrow(/vip settings read failed/);
     expect(() =>
       runWithCapacityVipBetCapMult(0, () => houseCapacityReport(0, CAPACITY_REPORT_GAMES)),
     ).toThrow(/vipBetCapMult/);
