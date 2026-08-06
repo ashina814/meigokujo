@@ -32,6 +32,13 @@ describe("capacity report runtime context", () => {
     );
   });
 
+  it("壊れた倍率は無関係な管理処理を止めず、capacity計算時だけfail-closed", () => {
+    expect(runWithCapacityVipBetCapMult(0, () => "unrelated-admin-ok")).toBe("unrelated-admin-ok");
+    expect(() =>
+      runWithCapacityVipBetCapMult(0, () => houseCapacityReport(0, CAPACITY_REPORT_GAMES)),
+    ).toThrow(/vipBetCapMult/);
+  });
+
   it("管理画面経路のゲーム一覧が正本を欠いたらfail-closed", () => {
     const incomplete = CAPACITY_REPORT_GAMES.slice(0, -1);
     expect(() =>
