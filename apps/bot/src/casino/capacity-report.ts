@@ -53,9 +53,13 @@ function requireValidVipBetCapMult(value: number): number {
   return value;
 }
 
-/** 管理ハンドラ全体を、そのリクエストで読んだVIP倍率のスコープ内で実行する。 */
+/**
+ * 管理ハンドラ全体を、そのリクエストで読んだVIP倍率のスコープ内で実行する。
+ * ここでは値を検証しない。壊れた倍率で給与・設定など無関係な管理操作まで止めず、
+ * capacity reportを実際に計算した時だけfail-closedにする。
+ */
 export function runWithCapacityVipBetCapMult<T>(vipBetCapMult: number, callback: () => T): T {
-  return capacityVipBetCapMultContext.run(requireValidVipBetCapMult(vipBetCapMult), callback);
+  return capacityVipBetCapMultContext.run(vipBetCapMult, callback);
 }
 
 function contextualVipBetCapMult(): number {
