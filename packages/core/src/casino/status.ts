@@ -140,6 +140,11 @@ export class CasinoStatus {
       this.db
         .prepare("UPDATE casino_status SET status = ?, reason = ?, changed_by = ?, changed_at = ? WHERE id = 1")
         .run(status, reason.trim(), changedBy, ts);
+      // opening_reset から出るときは、所有権bind（opening_execution_id/opening_actor_id）を
+      // 必ず消す（PR12監査: 完了・再開後に古い所有者情報が残り続けないようにする）。
+      if (status !== "opening_reset") {
+        this.clearOpeningExecutionOwner();
+      }
       this.db
         .prepare(
           "INSERT INTO casino_status_history (status, reason, changed_by, changed_at) VALUES (?, ?, ?, ?)",
@@ -232,6 +237,57 @@ export class CasinoStatus {
   /** 正式開業初期化に入る（実装計画 R0） */
   beginOpeningReset(reason: string, changedBy: string): void {
     this.set("opening_reset", reason, changedBy);
+  }
+
+  /**
+   * opening_reset の所有者（execution・actor）をDB上で機械的に照合可能にする
+   * （PR12監査: opening_reset取得の完全原子化）。
+   *
+   * `set()` と違い、historyやoutboxへは書かない — 所有権のbindは状態遷移そのものではなく、
+   * 既にopening_resetへ遷移した後に従属する記録の確定であるため。呼び出し側
+   * （`OpeningReset.apply()`のR0）が、statusの遷移（またはstatusが既にopening_resetである
+   * ことの確認）・executionの確定・このbindを**単一のDBトランザクション**の中で行うことで、
+   * 「statusはopening_resetだが所有executionが無い」という窓を構造的に無くす。
+   *
+   * CAS: `status = 'opening_reset'` かつ（未bind、または同じ execution/actor への再bind）の
+   * 場合だけ成功する。既に**別の** execution/actor へbind済みなら `false` を返し、
+   * 呼び出し側はfail-closedで例外を投げてtransaction全体をROLLBACKさせること
+   * （＝別executionが所有するopening_resetを横取りできない）。
+   */
+  bindOpeningExecutionOwner(executionId: string, actorId: string): boolean {
+    if (!executionId.trim()) throw new Error("CasinoStatus.bindOpeningExecutionOwner: executionId は必須");
+    if (!actorId.trim()) throw new Error("CasinoStatus.bindOpeningExecutionOwner: actorId は必須");
+    const info = this.db
+      .prepare(
+        `UPDATE casino_status SET opening_execution_id = ?, opening_actor_id = ?
+         WHERE id = 1 AND status = 'opening_reset'
+           AND (opening_execution_id IS NULL OR opening_execution_id = ?)
+           AND (opening_actor_id IS NULL OR opening_actor_id = ?)`,
+      )
+      .run(executionId, actorId, executionId, actorId);
+    return info.changes === 1;
+  }
+
+  /**
+   * 現在の opening_reset 所有者（execution・actor）。status が opening_reset でない、
+   * またはまだ誰もbindしていない場合は `null`。
+   */
+  currentOpeningOwner(): { executionId: string; actorId: string } | null {
+    const row = this.db.prepare("SELECT opening_execution_id, opening_actor_id FROM casino_status WHERE id = 1").get() as
+      | { opening_execution_id: string | null; opening_actor_id: string | null }
+      | undefined;
+    if (!row || !row.opening_execution_id || !row.opening_actor_id) return null;
+    return { executionId: row.opening_execution_id, actorId: row.opening_actor_id };
+  }
+
+  /**
+   * opening_reset 所有権のbindを消す（R14: 正式開業初期化の完了・再開時に呼ぶ）。
+   * status が opening_reset でなくなった後も所有者情報が残り続けないようにする。
+   */
+  private clearOpeningExecutionOwner(): void {
+    this.db
+      .prepare("UPDATE casino_status SET opening_execution_id = NULL, opening_actor_id = NULL WHERE id = 1")
+      .run();
   }
 
   // ── 開ける経路（状態ごとに1本ずつ） ─────────────────────

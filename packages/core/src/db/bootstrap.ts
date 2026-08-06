@@ -753,6 +753,11 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "shop_purchases", "delivery_snapshot_json", "TEXT");
   ensureColumn(db, "scheduler_chunk_batches", "sent_at", "INTEGER");
   ensureColumn(db, "casino_chip_external_confirmations", "chip_amount", "INTEGER NOT NULL DEFAULT 0 CHECK (chip_amount >= 0)");
+  // PR12監査: opening_resetの所有権（execution・actor）をcasino_status自体から機械的に
+  // 照合できるようにする。beginOpeningReset()とOpeningExecutionStore.acquire()を
+  // 単一のトランザクションへ統合し（opening-reset.tsのapply() R0）、その結果をここへ書く。
+  ensureColumn(db, "casino_status", "opening_execution_id", "TEXT");
+  ensureColumn(db, "casino_status", "opening_actor_id", "TEXT");
   assertNoDuplicateOpenRoomOwnership(db);
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_owner_normal_open
