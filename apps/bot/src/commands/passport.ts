@@ -29,6 +29,9 @@ export async function handlePassportCommand(
   const stats = services.casino.stats(uid);
   const etherBalance = services.chips.balanceOf(uid);
   const landBalance = services.ledger.balanceOf(`user:${uid}`);
+  // 所持 = 通常Land + 自由チップ（正本 §4.3・PR13）。卓・板への預け中は含めない。
+  const combinedAvailable = landBalance + etherBalance;
+  const availableBalance = Number.isSafeInteger(combinedAvailable) ? combinedAvailable : landBalance;
   const winRate = stats.games > 0 ? stats.wins / stats.games : 0;
 
   const member = (await interaction.guild?.members.fetch(uid).catch(() => null)) as GuildMember | null;
@@ -40,7 +43,7 @@ export async function handlePassportCommand(
     avatarUrl,
     serverName: interaction.guild?.name,
     serverIconUrl: interaction.guild?.iconURL({ extension: "png", size: 128 }) ?? null,
-    etherBalance,
+    availableBalance,
     landBalance,
     stats: {
       games: stats.games,

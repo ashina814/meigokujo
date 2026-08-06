@@ -75,10 +75,11 @@ export interface WalletDisplayInput {
 }
 
 /**
- * PR9時点の暫定財布表示。
+ * PR13: 「所持 = 通常Land + 自由チップ」へ統合した財布表示（正本 §4.3）。
  *
- * 最終形の「所持 = 通常Land + 自由チップ」への統合と旧用語除去はPR13の範囲。
- * ここでは資産分類を誤らず、正式開業後だけ自由チップを利用可能額として表示する。
+ * 正式開業前・未知版・チップ帳簿エラー時は、自由チップ・預け中資金を
+ * 利用可能額へ含めない（資産分類を誤らない・fail-closed）。
+ * 拘束中資金（卓・板への預け）があるときだけ補助行を出す。
  */
 export function renderWalletValue(input: WalletDisplayInput): string {
   const vipLine = input.isVip ? `${E.jp} **VIP** 残り${input.vipDaysLeft}日` : "";
@@ -86,7 +87,7 @@ export function renderWalletValue(input: WalletDisplayInput): string {
     return [
       "⚠️ **賭場の版が異常です**",
       "自由チップ・預け中資金は確認できません（利用可能額へ含めません）",
-      `${fmtLd(input.heldLand)}（通常Land）`,
+      `所持 ${fmtLd(input.heldLand)}（通常Landのみ）`,
       vipLine,
     ]
       .filter(Boolean)
@@ -96,7 +97,7 @@ export function renderWalletValue(input: WalletDisplayInput): string {
     return [
       "🚧 **正式開業準備中**",
       "既存チップ残高は保持中です（正式開業まで利用可能額へ含めません）",
-      `${fmtLd(input.heldLand)}（通常Land）`,
+      `所持 ${fmtLd(input.heldLand)}（通常Landのみ）`,
       vipLine,
     ]
       .filter(Boolean)
@@ -106,16 +107,27 @@ export function renderWalletValue(input: WalletDisplayInput): string {
     return [
       "⚠️ **チップ帳簿を確認できません**",
       "破損値を0として表示せず、自由チップ・預け中資金の表示を停止しています",
-      `${fmtLd(input.heldLand)}（通常Land）`,
+      `所持 ${fmtLd(input.heldLand)}（通常Landのみ）`,
+      vipLine,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  // 利用可能額 = 通常Land + 自由チップ。卓・板への預け中は別枠（二重加算しない）
+  const total = input.heldLand + input.assets.freeChips;
+  if (!Number.isSafeInteger(total)) {
+    return [
+      "⚠️ **残高の合算に失敗しました**",
+      "チップ帳簿またはLand口座の値が異常です（利用可能額へ含めません）",
+      `所持 ${fmtLd(input.heldLand)}（通常Landのみ）`,
       vipLine,
     ]
       .filter(Boolean)
       .join("\n");
   }
   return [
-    `**${fmtEther(input.assets.freeChips)}** (自由チップ)`,
-    `${fmtLd(input.heldLand)}（通常Land）`,
-    input.assets.escrowed > 0 ? `卓・板に預け中 **${fmtEther(input.assets.escrowed)}**` : "",
+    `所持 **${fmtLd(total)}**`,
+    input.assets.escrowed > 0 ? `卓・板に預け中 ${fmtLd(input.assets.escrowed)}` : "",
     vipLine,
   ]
     .filter(Boolean)
@@ -181,14 +193,14 @@ function renderHome(userId: string, services: Services, serverName?: string) {
     vipDaysLeft,
   });
 
-  // 「1 Ld = 1 ◈」は opening_v1 が確定してからの約束。それ以前に出すと、
+  // 「1 チップ = 1 Ld」は opening_v1 が確定してからの約束。それ以前に出すと、
   // 押しても必ず断られる交換をできると言うことになる（PR8監査・項目8）
   const rateLine =
     phase === "formal"
-      ? `**1 Ld = 1 ${E.ether}**   （準備 ${pool!.toLocaleString()} Ld ／ 発行 ${outstanding.toLocaleString()} ${E.ether}）`
+      ? `**1 チップ = 1 Ld**   （準備 ${pool!.toLocaleString()} Ld ／ 発行 ${outstanding.toLocaleString()} チップ）`
       : phase === "unknown"
         ? `⚠️ 版が異常（準備口座を特定できません／全操作停止）`
-        : `🚧 **正式開業準備中**（預入・返還は停止中／1:1交換は opening_v1 確定後）　準備 ${pool!.toLocaleString()} Ld ／ 発行 ${outstanding.toLocaleString()} ${E.ether}`;
+        : `🚧 **正式開業準備中**（預入・返還は停止中／1:1交換は opening_v1 確定後）　準備 ${pool!.toLocaleString()} Ld ／ 発行 ${outstanding.toLocaleString()} チップ`;
   const marketValue = [
     renderCasinoStatusLine(casinoStatus.status, casinoStatus.reason),
     rateLine,
@@ -200,7 +212,7 @@ function renderHome(userId: string, services: Services, serverName?: string) {
 
   const dailyValue = dailyReady
     ? `${E.sparkle} **今すぐ受け取れる** → \`/福分け\``
-    : `次は <t:${nextClaim}:R>  ／  連続 ${streak}日  ${streak >= 7 ? `**+${Math.min(200, Math.floor(streak / 7) * 50)}◈ボーナス**` : ""}`;
+    : `次は <t:${nextClaim}:R>  ／  連続 ${streak}日  ${streak >= 7 ? `**+${Math.min(200, Math.floor(streak / 7) * 50)} Ldボーナス**` : ""}`;
 
   const statsValue = [
     `${E.chart} 総 **${stats.games}** ／ 勝 ${stats.wins} 負 ${stats.losses}  勝率 **${winRate.toFixed(1)}%**`,
@@ -229,9 +241,9 @@ function renderHome(userId: string, services: Services, serverName?: string) {
     `${E.paytable} \`/通行証\` — 戦績カード`,
     `🏅 \`/賭場番付\` — Top10（残高/勝率/最大単勝/連勝など）`,
     `${HR_THIN}`,
-    `${E.ether} チップ ⇄ Land はマモンの両替所パネルで`,
+    `賭場では自由チップを内部で使いますが、表示と利用者資産はLandです。`,
     ...(phase === "formal"
-      ? [`　預入・返還は **1:1**（変動レート・奉納・焼却なし）`]
+      ? [`　入退場は自動で **1:1**（ゲーム開始時に預入・「賭場を出る」で返還／変動比率・焼却なし）`]
       : [`　${openingNotice(services).split("\n").join("\n　")}`]),
   ].join("\n");
 

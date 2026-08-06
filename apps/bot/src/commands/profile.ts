@@ -63,7 +63,17 @@ export async function handleProfile(
   const newlyGranted = services.titles.evaluate(target.id);
 
   const soul = services.entry.getSoul(target.id);
-  const balance = services.ledger.balanceOf(`user:${target.id}`);
+  const landBalance = services.ledger.balanceOf(`user:${target.id}`);
+  // 所持 = 通常Land + 自由チップ（正本 §4.3・PR13）。卓・板への預け中は含めない。
+  // チップ帳簿が読めない・合算が safe integer を外れる場合は、破損値を混ぜず
+  // 確認できている通常Landだけを表示する（fail-closed）。
+  let balance = landBalance;
+  try {
+    const combined = landBalance + services.chipAssets.freeChips(target.id);
+    if (Number.isSafeInteger(combined)) balance = combined;
+  } catch {
+    // チップ帳簿を確認できない。通常Landのみの表示に留める
+  }
 
   // 鯖のニックネーム・アバター・参加日を確実に読むため cache ではなく fetch する
   const member = (await interaction.guild?.members.fetch(target.id).catch(() => null)) as
