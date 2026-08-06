@@ -557,6 +557,32 @@ describe("開始残高の版切替", () => {
     ctx.db.close();
   });
 
+  it("invalidateVersionCache(): captureOpeningが外側のtransactionごとROLLBACKされた後もキャッシュが古い値を返し続けない（PR12監査）", () => {
+    const ctx = setupLegacy();
+    inMaintenance(ctx.chipTx, () => {
+      fundHouse(ctx, 10_000);
+      ctx.chipTx.captureLegacyOpening();
+    });
+    expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
+
+    // captureOpeningを、失敗して丸ごとROLLBACKされる「外側の大きなtransaction」の中から呼ぶ
+    // （PR12のopening-reset.tsが正式開業初期化のR6〜R13を1つのtransactionにまとめる構造の再現）。
+    expect(() => {
+      ctx.db.transaction(() => {
+        ctx.chipTx.captureOpening("opening_v1", []); // ここでキャッシュだけ楽観的に更新される
+        throw new Error("postflight相当の失敗でROLLBACKさせる");
+      })();
+    }).toThrow();
+
+    // DB上はROLLBACKされ、opening_v1は存在しないはず
+    expect(ctx.chipTx.listOpeningVersions().map((v) => v.version)).toEqual([LEGACY_OPENING_VERSION]);
+    // invalidateVersionCache()を呼ばなければ、in-memoryキャッシュだけが"opening_v1"のまま残る
+    // （これがPR12監査で見つかった実バグの再現。修正後はここでinvalidateする）
+    ctx.chipTx.invalidateVersionCache();
+    expect(ctx.chipTx.currentVersion()).toBe(LEGACY_OPENING_VERSION);
+    ctx.db.close();
+  });
+
   it("取引を挟まず版を切り替えても、新しい版が古い版を飲み込まない", () => {
     const ctx = setupLegacy();
     inMaintenance(ctx.chipTx, () => {

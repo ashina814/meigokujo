@@ -564,6 +564,42 @@ CREATE TABLE IF NOT EXISTS casino_chip_opening_balances (
   PRIMARY KEY (opening_version, holder)
 );
 
+-- 正式開業初期化（PR12）自体の永続execution状態機械。apply()がどの工程まで進んだ状態で
+-- プロセスが落ちても、再起動後にどこから再開してよいかを判定する唯一の真実源。
+-- 分類表上は archive/reset の対象外（PR12自身の記録なので、正式開業initializationの
+-- plan hashにも含めない — 自分自身の書き込みでplanがstale化する自己参照を避けるため）。
+CREATE TABLE IF NOT EXISTS casino_opening_executions (
+  id                              TEXT PRIMARY KEY,
+  plan_hash                       TEXT NOT NULL,
+  status                          TEXT NOT NULL CHECK (status IN (
+    'planned','opening_reset_acquired','backup_started','backup_verified',
+    'external_started','external_completed','applying','applied',
+    'post_commit_pending','completed','failed','manual_review_required'
+  )),
+  actor_id                        TEXT NOT NULL,
+  configuration_json              TEXT NOT NULL,
+  configuration_hash               TEXT NOT NULL,
+  backup_manifest_json            TEXT,
+  external_operation_id           TEXT,
+  external_operation_result_json  TEXT,
+  old_settlement_land_tx_id       INTEGER,
+  new_investment_land_tx_id       INTEGER,
+  opening_version                 TEXT,
+  postflight_json                 TEXT,
+  notifier_status                 TEXT,
+  funds_applied                   INTEGER NOT NULL DEFAULT 0,
+  reapply_allowed                 INTEGER NOT NULL DEFAULT 1,
+  manual_reopen_required          INTEGER NOT NULL DEFAULT 0,
+  failure_stage                   TEXT,
+  failure_reason                  TEXT,
+  manual_review_reason            TEXT,
+  started_at                      INTEGER NOT NULL,
+  updated_at                      INTEGER NOT NULL,
+  applied_at                      INTEGER,
+  completed_at                    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_casino_opening_executions_plan ON casino_opening_executions(plan_hash);
+
 CREATE TABLE IF NOT EXISTS shop_items (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   name              TEXT NOT NULL,
@@ -717,6 +753,11 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "shop_purchases", "delivery_snapshot_json", "TEXT");
   ensureColumn(db, "scheduler_chunk_batches", "sent_at", "INTEGER");
   ensureColumn(db, "casino_chip_external_confirmations", "chip_amount", "INTEGER NOT NULL DEFAULT 0 CHECK (chip_amount >= 0)");
+  // PR12監査: opening_resetの所有権（execution・actor）をcasino_status自体から機械的に
+  // 照合できるようにする。beginOpeningReset()とOpeningExecutionStore.acquire()を
+  // 単一のトランザクションへ統合し（opening-reset.tsのapply() R0）、その結果をここへ書く。
+  ensureColumn(db, "casino_status", "opening_execution_id", "TEXT");
+  ensureColumn(db, "casino_status", "opening_actor_id", "TEXT");
   assertNoDuplicateOpenRoomOwnership(db);
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_owner_normal_open

@@ -262,6 +262,99 @@ export {
   type CasinoCheckMismatch,
   type CasinoIntegrityReport,
 } from "./casino/integrity.js";
+export {
+  CASINO_OPENING_SETTING_KEYS,
+  readCasinoOpeningConfig,
+  writeCasinoOpeningConfig,
+  clearCasinoOpeningConfig,
+  type CasinoOpeningConfig,
+  type CasinoOpeningConfigResult,
+} from "./casino/opening-settings.js";
+export {
+  canonicalStringify,
+  canonicalHash,
+  sha256Hex,
+  tableFingerprint,
+  tableExists,
+  tableRowCount,
+  tableColumns,
+  schemaFingerprint,
+  tableToCsv,
+  playerLandFingerprint,
+  type TableContentFingerprint,
+  type PlayerLandFingerprint,
+} from "./casino/opening-canonical.js";
+export {
+  CASINO_TABLE_CLASSIFICATION,
+  KNOWN_CASINO_TABLE_NAMES,
+  classificationFor,
+  type CasinoTableKind,
+  type CasinoTableClassification,
+} from "./casino/opening-tables.js";
+export {
+  OpeningPlanner,
+  CASINO_DEPARTMENT_KEY,
+  CASINO_DEPARTMENT_ACCOUNT,
+  type OpeningPlannerDeps,
+  type OpeningPlanSnapshot,
+  type OpeningPreflightResult,
+  type OpeningBlocker,
+  type BlockerCategory,
+  type ProtectedAssetFinding,
+  type TableAudit,
+  type LegacyLedgerAudit,
+} from "./casino/opening-plan.js";
+export {
+  OpeningReset,
+  OpeningApplyBlockedError,
+  OpeningApplyStaleplanError,
+  OpeningApplyManualReviewError,
+  OpeningApplyRolledBackError,
+  OpeningAlreadyAppliedError,
+  type OpeningResetDeps,
+  type OpeningApplyInput,
+  type OpeningApplyResult,
+  type PostflightCheck,
+  type PostflightReport,
+} from "./casino/opening-reset.js";
+export {
+  FakeOpeningExternalAdapter,
+  type OpeningExternalAdapter,
+  type OpeningExternalDisableLegacyRequest,
+  type OpeningExternalDisableLegacyResult,
+} from "./casino/opening-external.js";
+export {
+  OPENING_EXECUTION_STATUSES,
+  OpeningExecutionStore,
+  OpeningExecutionConflictError,
+  OpeningExecutionTransitionError,
+  CorruptedExecutionRowError,
+  newExternalOperationId,
+  type OpeningExecutionStatus,
+  type OpeningExecutionRow,
+  type AcquireResult,
+} from "./casino/opening-execution.js";
+export {
+  BACKUP_FORMAT_VERSION,
+  SUPPORTED_BACKUP_FORMAT_VERSIONS,
+  databaseIdentity,
+  chipGroupGeneration,
+  latestChipTransactionId,
+  computeBackupManifest,
+  verifyOpeningBackupManifest,
+  verifyOpeningBackupFilesOnDisk,
+  type OpeningBackupAdapter,
+  type OpeningBackupDurability,
+  type OpeningBackupRequest,
+  type OpeningBackupManifest,
+  type OpeningBackupCsvEntry,
+  type OpeningBackupVerificationResult,
+  type ManifestVerificationExpectation,
+  type ManifestVerificationResult,
+  type FileBackupVerificationResult,
+} from "./casino/opening-backup.js";
+// FakeOpeningBackupAdapter / TestFilesystemOpeningBackupAdapter はテスト専用（CLAUDE.md監査
+// ブロッカー5.4）。本番向けpublic indexからは再エクスポートせず、テストは内部pathから直接importする。
 export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";
 export {
   Escrow,
