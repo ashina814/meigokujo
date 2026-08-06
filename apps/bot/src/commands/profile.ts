@@ -14,6 +14,7 @@ import { fmtLd, fmtLdCompact } from "../format.js";
 import { renderProfileCard } from "../render/profile-card.js";
 import { isAdmin } from "../permissions.js";
 import { resolveSpecialProfile } from "../special-profile.js";
+import { readAvailableWallet } from "../casino/wallet.js";
 import {
   TEXT_TIERS,
   VOICE_TIERS,
@@ -31,6 +32,15 @@ const RANK_LABEL: Record<string, string> = {
   meirei: "迷霊",
   departed: "去りし魂",
 };
+
+/**
+ * プロフィールカードに出す「所持」= 利用可能額（正本 §4.3・PR13監査）。
+ * 判定・合算は `readAvailableWallet()` へ一本化してある（opening phase前・未知版・
+ * チップ帳簿エラー・overflowでは通常Landのみを返す。fail-closed）。
+ */
+export function resolveProfileBalance(services: Services, userId: string): number {
+  return readAvailableWallet(services, userId).available;
+}
 
 export const profileCommand = new SlashCommandBuilder()
   .setName("プロフィール")
@@ -63,17 +73,7 @@ export async function handleProfile(
   const newlyGranted = services.titles.evaluate(target.id);
 
   const soul = services.entry.getSoul(target.id);
-  const landBalance = services.ledger.balanceOf(`user:${target.id}`);
-  // 所持 = 通常Land + 自由チップ（正本 §4.3・PR13）。卓・板への預け中は含めない。
-  // チップ帳簿が読めない・合算が safe integer を外れる場合は、破損値を混ぜず
-  // 確認できている通常Landだけを表示する（fail-closed）。
-  let balance = landBalance;
-  try {
-    const combined = landBalance + services.chipAssets.freeChips(target.id);
-    if (Number.isSafeInteger(combined)) balance = combined;
-  } catch {
-    // チップ帳簿を確認できない。通常Landのみの表示に留める
-  }
+  const balance = resolveProfileBalance(services, target.id);
 
   // 鯖のニックネーム・アバター・参加日を確実に読むため cache ではなく fetch する
   const member = (await interaction.guild?.members.fetch(target.id).catch(() => null)) as

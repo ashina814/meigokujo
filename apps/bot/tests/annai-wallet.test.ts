@@ -1,20 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { renderCasinoStatusLine, renderWalletValue } from "../src/commands/annai.js";
+import type { AvailableWalletSnapshot } from "../src/casino/wallet.js";
 
-const assets = (escrowed: number) => ({
-  userId: "alice",
+const formalWallet = (escrowed: number): AvailableWalletSnapshot => ({
+  status: "formal",
+  available: 1_000 + 9_000,
+  land: 1_000,
   freeChips: 9_000,
   escrowed,
-  total: 9_000 + escrowed,
 });
 
 describe("案内所のPR13財布表示（所持 = 通常Land + 自由チップ）", () => {
   it("正式開業後、escrowed=0なら通常Land+自由チップの合算だけを出し、補助行を出さない", () => {
     const text = renderWalletValue({
-      phase: "formal",
-      heldLand: 1_000,
-      assets: assets(0),
-      assetError: false,
+      wallet: formalWallet(0),
       isVip: false,
       vipDaysLeft: 0,
     });
@@ -24,10 +23,7 @@ describe("案内所のPR13財布表示（所持 = 通常Land + 自由チップ�
 
   it("正式開業後、escrowed>0なら合算額に加えて預け中の補助行を出す（二重加算しない）", () => {
     const text = renderWalletValue({
-      phase: "formal",
-      heldLand: 1_000,
-      assets: assets(2_000),
-      assetError: false,
+      wallet: formalWallet(2_000),
       isVip: false,
       vipDaysLeft: 0,
     });
@@ -35,12 +31,9 @@ describe("案内所のPR13財布表示（所持 = 通常Land + 自由チップ�
     expect(text).toContain("卓・板に預け中 2,000 Ld");
   });
 
-  it("legacy_pre_resetでは自由チップを利用可能額として表示しない", () => {
+  it("正式開業前(pre_opening)では自由チップを利用可能額として表示しない", () => {
     const text = renderWalletValue({
-      phase: "legacy",
-      heldLand: 1_000,
-      assets: assets(2_000),
-      assetError: false,
+      wallet: { status: "pre_opening", available: 1_000, land: 1_000, freeChips: null, escrowed: null },
       isVip: false,
       vipDaysLeft: 0,
     });
@@ -52,10 +45,7 @@ describe("案内所のPR13財布表示（所持 = 通常Land + 自由チップ�
 
   it("未知版では自由チップ・預け中を確認不能として表示する", () => {
     const text = renderWalletValue({
-      phase: "unknown",
-      heldLand: 1_000,
-      assets: assets(2_000),
-      assetError: false,
+      wallet: { status: "unknown", available: 1_000, land: 1_000, freeChips: null, escrowed: null },
       isVip: false,
       vipDaysLeft: 0,
     });
@@ -64,12 +54,9 @@ describe("案内所のPR13財布表示（所持 = 通常Land + 自由チップ�
     expect(text).not.toContain("10,000 Ld");
   });
 
-  it("資産検算例外を0へ丸めず表示停止する", () => {
+  it("資産検算例外を0へ丸めず表示停止する（ledger_error）", () => {
     const text = renderWalletValue({
-      phase: "formal",
-      heldLand: 1_000,
-      assets: null,
-      assetError: true,
+      wallet: { status: "ledger_error", available: 1_000, land: 1_000, freeChips: null, escrowed: null },
       isVip: false,
       vipDaysLeft: 0,
     });
@@ -77,6 +64,16 @@ describe("案内所のPR13財布表示（所持 = 通常Land + 自由チップ�
     expect(text).toContain("破損値を0として表示せず");
     // 合算できないので、通常Landだけを出し「合算した所持額」を捏造しない
     expect(text).not.toContain("10,000 Ld");
+  });
+
+  it("合算がsafe integerを超える場合は破損値を出さない（overflow）", () => {
+    const text = renderWalletValue({
+      wallet: { status: "overflow", available: 1_000, land: 1_000, freeChips: null, escrowed: null },
+      isVip: false,
+      vipDaysLeft: 0,
+    });
+    expect(text).toContain("残高の合算に失敗しました");
+    expect(text).toContain("1,000 Ld");
   });
 
   it("integrity_halt / recovery_haltの停止理由を維持する", () => {
