@@ -9,6 +9,7 @@ import {
   type ChipBalanceMismatch,
 } from "./chip-tx.js";
 import { ChipLedger, ETHER_ESCROW, CHIP_ESCROW, isPlayerHolder } from "./chip-ledger.js";
+import { eventMarketEscrowHolder } from "./market.js";
 import { CasinoChipAssets, type EscrowAssetInspection } from "./chip-assets.js";
 import { CasinoIntegrity, type CasinoCheckResult } from "./integrity.js";
 import { CasinoStatus, type CasinoStatusValue } from "./status.js";
@@ -24,6 +25,7 @@ import {
   checkedAddAll,
   playerLandFingerprint,
   schemaFingerprint,
+  tableColumns,
   tableExists,
   tableFingerprint,
   tableRowCount,
@@ -564,11 +566,54 @@ export class OpeningPlanner {
     }
 
     if (tableExists(this.deps.db, "casino_markets")) {
-      const rows = this.deps.db.prepare("SELECT id, status FROM casino_markets ORDER BY id").all() as Array<{
-        id: number;
-        status: string;
-      }>;
+      // market_mode 列は PR#94（イベントLand板）のhotfixで追加された。旧DB・旧テスト
+      // fixtureがこの列を持たない場合は、既存挙動を保つため全行を market_mode='standard'
+      // として扱う（addColumnIfMissingがNOT NULL DEFAULT 'standard'で追加するmigration後の
+      // 実DBと同じ既定値）。
+      const hasMarketMode = tableColumns(this.deps.db, "casino_markets").includes("market_mode");
+      const rows = this.deps.db
+        .prepare(`SELECT id, status, title${hasMarketMode ? ", market_mode" : ""} FROM casino_markets ORDER BY id`)
+        .all() as Array<{ id: number; status: string; title: string; market_mode?: string }>;
       for (const row of rows) {
+        const marketMode = row.market_mode ?? "standard";
+        if (marketMode === "event") {
+          // イベントLand板（PR#94・raw Ledger経済）。正式開業初期化（チップ経済）とは
+          // 完全に別の資金系であり、通常板と同じ live_market_row 判定は適用しない
+          // （PR12監査: イベントLand板の完全保護 2-D/2-E）。
+          if (!MARKET_SAFE_STATUSES.has(row.status)) {
+            // settled/void以外（open/closed/frozen/reported/未知statusを含む）は
+            // fail-closedのpreflight blocker。自動でvoid/refund/freezeしない。
+            const pot = (
+              this.deps.db
+                .prepare("SELECT COALESCE(SUM(amount),0) AS pot FROM casino_market_bets WHERE market_id = ?")
+                .get(row.id) as { pot: number }
+            ).pot;
+            const escrowBalance = this.deps.ledger.balanceOf(eventMarketEscrowHolder(row.id));
+            blockers.push({
+              category: "market",
+              code: "active_event_land_market",
+              message:
+                `イベントLand板が未終局: marketId=${row.id} status=${row.status} title=${JSON.stringify(row.title)} ` +
+                `pot=${pot} escrowBalance=${escrowBalance}（正式開業初期化は自動でvoid/refund/freezeしない。人手で終局させてから再実行すること）`,
+              userId: undefined,
+            });
+          } else {
+            // settled/void: 板自体は保持してよいが、清算漏れ（escrow残高が非0）は
+            // 自動補正せず人手の調査へ回す（PR12監査 2-E）。
+            const escrowBalance = this.deps.ledger.balanceOf(eventMarketEscrowHolder(row.id));
+            if (escrowBalance !== 0) {
+              blockers.push({
+                category: "market",
+                code: "terminal_event_market_escrow_nonzero",
+                message:
+                  `終局済みイベントLand板のescrow残高が0でない: marketId=${row.id} status=${row.status} ` +
+                  `title=${JSON.stringify(row.title)} escrowBalance=${escrowBalance}（自動返金・自動精算はしない。手動調査が必要）`,
+              });
+            }
+          }
+          continue;
+        }
+        // market_mode='standard'（既存挙動を維持）
         if (MARKET_SAFE_STATUSES.has(row.status)) continue;
         const unknown = !MARKET_ALL_STATUSES.has(row.status);
         blockers.push({

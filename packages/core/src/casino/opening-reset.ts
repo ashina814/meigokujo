@@ -12,12 +12,14 @@ import { OpeningPlanner, CASINO_DEPARTMENT_ACCOUNT, type OpeningPreflightResult 
 import { CASINO_TABLE_CLASSIFICATION } from "./opening-tables.js";
 import {
   checkedAddAll,
+  eventProtectionFingerprint,
   playerLandFingerprint,
   schemaFingerprint,
   tableColumns,
   tableExists,
   tableRowCount,
   quoteIdent,
+  type EventProtectionFingerprint,
 } from "./opening-canonical.js";
 import {
   OpeningExecutionConflictError,
@@ -36,20 +38,37 @@ import {
 } from "./opening-backup.js";
 import type { OpeningExternalAdapter } from "./opening-external.js";
 
-/** R6でDELETEする対象（分類表からresetPhase='R6'だけを抽出。casino_market系はFK順を固定） */
+/**
+ * casino_markets / casino_market_bets / casino_market_approvals は market_mode='standard'
+ * （チップ経済・PR12対象）と market_mode='event'（イベントLand板・PR#94・raw Ledger経済）が
+ * 混在するテーブルなので、汎用の`DELETE FROM <table>`（全件削除）では扱えない
+ * （PR12監査: イベントLand板の完全保護 2-B）。この3テーブルはR6_DELETE_ORDERから除外し、
+ * `runDestructiveTransaction`内で`market_mode='standard'`の行だけを対象にしたfiltered delete
+ * を個別に行う。削除順序はFKを守る: approvals → bets → markets（いずれも子→親）。
+ */
+const R6_MIXED_MARKET_TABLES = ["casino_market_approvals", "casino_market_bets", "casino_markets"] as const;
+
+/** R6でDELETEする対象（分類表からresetPhase='R6'だけを抽出。mixed market tableは別扱い） */
 const R6_DELETE_ORDER = [
   // 子（FK先）を先に消す
-  "casino_market_bets",
-  "casino_market_approvals",
   "casino_chip_refund_saga_targets",
-  // 残りは順不同で構わない
+  // 残りは順不同で構わない（mixed market tableは除外。下のR6_MIXED_MARKET_TABLESで個別処理する）
   ...CASINO_TABLE_CLASSIFICATION.filter(
     (t) =>
       t.resetOnApply &&
       t.resetPhase === "R6" &&
-      !["casino_market_bets", "casino_market_approvals", "casino_chip_refund_saga_targets"].includes(t.table),
+      t.table !== "casino_chip_refund_saga_targets" &&
+      !(R6_MIXED_MARKET_TABLES as readonly string[]).includes(t.table),
   ).map((t) => t.table),
 ];
+
+/**
+ * R6で実際に削除操作（全件 or market_mode='standard'限定）を行うテーブルの完全な一覧
+ * （実行順）。crash injectionテスト（CLAUDE.md監査ブロッカーD）が「R6の全DELETE地点」を
+ * 漏れなく列挙するために公開する。`opening-reset.js`の内部pathからのみ参照される
+ * （`@meigokujo/core`の公開indexからは再エクスポートしない）。
+ */
+export const R6_ALL_DELETE_TABLES: readonly string[] = [...R6_DELETE_ORDER, ...R6_MIXED_MARKET_TABLES];
 
 /** 外部工程の固定idempotencyKey。planHashへ混ぜない理由は下のapply()内コメントを参照 */
 const EXTERNAL_DISABLE_LEGACY_OPERATION_ID = "casino-opening:disable-legacy-vcs";
@@ -62,6 +81,8 @@ const EXTERNAL_DISABLE_LEGACY_OPERATION_ID = "casino-opening:disable-legacy-vcs"
  * 内部pathから直接importしてのみ使う。
  */
 export type OpeningResetCrashPoint =
+  | "r0_after_status_flip"
+  | "r0_after_acquire"
   | "before_r6"
   | "r6_after_delete"
   | "after_r6"
@@ -287,11 +308,18 @@ export class OpeningReset {
       );
     }
 
-    // ---- R0: opening_reset状態の取得をapply()自身の権限で行う（CLAUDE.md監査ブロッカー7）----
+    // ---- R0: opening_reset状態の取得とexecutionの確定をapply()自身の権限で、かつ単一の
+    // IMMEDIATE transactionとして原子的に行う（CLAUDE.md監査ブロッカー7・監査ブロッカーB）。
+    //
     // 以前は「CasinoStatusが既にopening_resetであること」を`dryRun()`のblockerとして
     // 前提にしているだけで、execution行が名乗る'opening_reset_acquired'という状態名にも
     // かかわらず、実際にその状態へ入れたのがこのapply()呼び出し自身なのか、無関係な
-    // 別処理なのかを一切確認・保証していなかった。
+    // 別処理なのかを一切確認・保証していなかった。さらに`beginOpeningReset()`（statusの
+    // 遷移）と`executions.acquire()`（executionの確定）が別々のtransactionだったため、
+    // 片方だけcommitしてクラッシュすると「opening_resetだが所有executionが無い」窓が
+    // 生じ得た。また`casino_status`自体には実行中のexecution・actorを機械的に照合できる
+    // 列が無く、2プロセスが同時に`readyExceptStatus`をtrueと読んだ場合に両方が
+    // `beginOpeningReset()`を実行してしまう余地があった。
     //
     // ここでは「statusがopenで、それ以外のblockerが一切無い（＝status以外はすべて準備完了）」
     // ことを確認できた場合に**限り**、apply()自身がCasinoStatusをopening_resetへ進める。
@@ -299,23 +327,53 @@ export class OpeningReset {
     // manual_halt・integrity_halt・recovery_halt等の人為的な停止）からは、CasinoStatusに
     // 一切触れない（blocker=0を証明できるまでは副作用ゼロという既存の不変条件を保つ）。
     // 既にopening_resetの場合（前回のapply()が進めた状態からの再試行）は、このまま素通りする。
-    const preCheck = this.planner.dryRun();
-    const currentStatus = this.deps.status.current().status;
-    const readyExceptStatus =
-      currentStatus === "open" &&
-      preCheck.blockers.length > 0 &&
-      preCheck.blockers.every((b) => b.code === "status_not_opening_reset");
-    let initialPlan = preCheck;
-    if (readyExceptStatus) {
-      this.deps.status.beginOpeningReset(`正式開業初期化: ${input.actorId}による開始`, input.actorId);
-      initialPlan = this.planner.dryRun();
-    }
-    if (initialPlan.blockers.length > 0) {
-      throw new OpeningApplyBlockedError(initialPlan.blockers);
-    }
+    //
+    // status遷移・execution確定・所有権bind（`CasinoStatus.opening_execution_id`/
+    // `opening_actor_id`）を全部この1つのtransactionへ入れることで、SQLiteのIMMEDIATEロックが
+    // 他の書き込みtransactionと直列化する。1つでも失敗（blocker発生・actor/configuration不一致・
+    // bind CAS不一致）すれば、statusの遷移も含めて全部ROLLBACKされ、呼出前の状態に戻る。
+    const r0 = this.deps.db
+      .transaction((): { initialPlan: OpeningPreflightResult; execution: OpeningExecutionRow } => {
+        const preCheck = this.planner.dryRun();
+        const currentStatus = this.deps.status.current().status;
+        const readyExceptStatus =
+          currentStatus === "open" &&
+          preCheck.blockers.length > 0 &&
+          preCheck.blockers.every((b) => b.code === "status_not_opening_reset");
+        let plan = preCheck;
+        if (readyExceptStatus) {
+          this.deps.status.beginOpeningReset(`正式開業初期化: ${input.actorId}による開始`, input.actorId);
+          // テスト専用crash injection地点（CLAUDE.md監査ブロッカーB）: statusをopening_resetへ
+          // 進めた直後・execution確定前。ここで例外が飛べば、R0全体が単一transactionのため
+          // status遷移そのものも含めて丸ごとROLLBACKされる（旧設計では別transactionだったため
+          // ここに「statusはopening_resetだが所有executionが無い」窓が生じ得た）。
+          this.fireCrash("r0_after_status_flip");
+          plan = this.planner.dryRun();
+        }
+        if (plan.blockers.length > 0) {
+          throw new OpeningApplyBlockedError(plan.blockers);
+        }
 
-    const acquireResult = this.executions.acquire(initialPlan.planHash, input.actorId, initialPlan.snapshot.configuration);
-    let execution = acquireResult.execution;
+        const acquireResult = this.executions.acquire(plan.planHash, input.actorId, plan.snapshot.configuration);
+        const acquiredExecution = acquireResult.execution;
+        // テスト専用crash injection地点: execution確定直後・所有権bind前。
+        this.fireCrash("r0_after_acquire");
+
+        // 所有権をcasino_statusへ機械的に結合する（同一transaction内・CAS）。
+        // 別executionが既にbind済みなら（横取り）、資金・status・executionを一切変更せずに
+        // fail-closedで例外を投げ、transaction全体をROLLBACKさせる。
+        const bound = this.deps.status.bindOpeningExecutionOwner(acquiredExecution.id, input.actorId);
+        if (!bound) {
+          throw new Error(
+            `不変条件違反: casino_statusのopening_reset所有権をexecution(${acquiredExecution.id})/actor(${input.actorId})へ` +
+              `結合できなかった（別の所有者が既に存在する疑い）`,
+          );
+        }
+        return { initialPlan: plan, execution: acquiredExecution };
+      })
+      .immediate();
+    const initialPlan = r0.initialPlan;
+    let execution = r0.execution;
 
     if (execution.status === "completed") {
       throw new OpeningAlreadyAppliedError(execution.id);
@@ -339,6 +397,11 @@ export class OpeningReset {
     execution = this.assertPlanFresh(execution, "opening_reset_acquired");
 
     const archiveTables = initialPlan.snapshot.tables.filter((t) => t.archive && t.exists).map((t) => t.table);
+
+    // このapply()呼び出し自身が新規にbackupを取る（＝これから検証する）のか、
+    // 既に別の呼び出しでbackup_verified以降まで進んだ行を再開するのかを記録しておく
+    // （CLAUDE.md監査ブロッカーC: resume時の永続backup再検証の要否判定に使う）。
+    const enteredBackupStepFresh = !reached(execution, "backup_verified");
 
     // ---- backup（opening_reset_acquired または backup_started で中断していれば再試行）----
     if (!reached(execution, "backup_verified")) {
@@ -410,6 +473,39 @@ export class OpeningReset {
     }
     const manifest = execution.backupManifest as OpeningBackupManifest;
 
+    // resume時のbackup再検証（次のブロック）はmanifestが正しい形をしている前提で動く。
+    // その前提自体が壊れている（externalOperationIdが未記録なのにexternal_completed以降を
+    // 名乗っている等）場合は、永続backupの再検証を試みるより先に、この既存の不変条件
+    // チェック（後段の"外部工程"ブロックにもある同一チェック）で早期にfail-closedする。
+    if (reached(execution, "external_completed") && !execution.externalOperationId) {
+      throw new Error(
+        `不変条件違反: execution(${execution.id}) は status=${execution.status} だが externalOperationId が未記録（データ破損の疑い。手動調査が必要）`,
+      );
+    }
+
+    // ---- ブロッカーC: resume時の永続backup再検証 ----
+    // このapply()呼び出しが新規にbackupを取ったのではなく、既にbackup_verified以降まで
+    // 進んだexecutionを（別プロセス・別呼び出しから）再開する場合、backupManifest列の
+    // 内容を信じるだけでなく、ディスク上の実体から改めて再検証する
+    // （欠落・改竄・別DBとの取り違えは、backup_verifiedというrankの記録だけでは検出できない）。
+    if (!enteredBackupStepFresh) {
+      const reverify = await this.reverifyPersistedBackup(execution, manifest, archiveTables, input);
+      if (!reverify.ok) {
+        const reason = `resume時の永続backup再検証に失敗: ${reverify.problems.join("; ")}`;
+        if (execution.status === "backup_verified") {
+          // 外部工程未到達: 資金移動なし・R6開始なし。failedへ倒し、再backupから
+          // 安全に再挑戦できる状態にする（外部工程がまだ実行されていないため二重実行の懸念が無い）。
+          const after = this.safeMarkFailed(execution, "backup_verified", "backup_reverify_resume", reason);
+          throw new Error(`${reason}（execution=${after.id}, status=${after.status}）`);
+        }
+        // external_started 以降（external_completed・applying を含む）: 外部工程が既に
+        // 実行されたか不明、または完了済みのため、外部工程を再実行せず・R6も開始せず、
+        // manual_review_requiredへ倒す（資金は未確定のまま。fundsAppliedは呼び出し側へ正確に伝える）。
+        const after = this.safeMarkManualReview(execution, execution.status, reason);
+        throw new OpeningApplyManualReviewError(after.id, reason, after.fundsApplied);
+      }
+    }
+
     // ---- backup後のplan再検査 ----
     execution = this.assertPlanFresh(execution, "backup_verified");
 
@@ -461,6 +557,15 @@ export class OpeningReset {
         execution = this.tryTransition(execution, "external_completed", "applying");
       }
       if (execution.status === "applying") {
+        // ---- ブロッカーC: 破壊的R6 transactionへ入る直前の永続backup再検証 ----
+        // このapply()呼び出しの中でbackupを新規取得した場合でも、外部工程を挟んで時間が
+        // 経過している可能性があるため、R6直前でもう一度ディスク上の実体から再検証する。
+        const preR6Reverify = await this.reverifyPersistedBackup(execution, manifest, archiveTables, input);
+        if (!preR6Reverify.ok) {
+          const reason = `R6直前の永続backup再検証に失敗: ${preR6Reverify.problems.join("; ")}`;
+          const after = this.safeMarkManualReview(execution, "applying", reason);
+          throw new OpeningApplyManualReviewError(after.id, reason, after.fundsApplied);
+        }
         try {
           execution = this.runDestructiveTransaction(execution, initialPlan);
         } catch (e) {
@@ -620,6 +725,49 @@ export class OpeningReset {
     return result.execution;
   }
 
+  /**
+   * 保存済みbackupManifestを、**ディスク上の永続証拠自体**から再検証する
+   * （CLAUDE.md監査ブロッカーC）。
+   *
+   * 意図的に`liveDb`・生の`rowCounts`/`columns`・`latestLandTransactionId`等の
+   * 「今のライブDBとの一致」を要求する項目は渡さない。backup_verified以降、
+   * casino_opening_executions（FSM自身の書き込み）やイベントLand板（別台帳・
+   * 正式開業初期化とは無関係に稼働し続ける — CLAUDE.md §「イベントLand板保護」）は
+   * 正当に変化し続けるため、「backup時点のライブDBスナップショットと今のライブDBが
+   * 完全一致するか」を再検証条件にすると、何も壊れていなくても必ず不一致になる
+   * （誤検知でmanual_reviewを乱発してしまう）。
+   *
+   * ここで再検証したいのはあくまで「backup直後に検証した永続証拠（SQLite snapshot・
+   * CSV・manifestファイル自体）が、その後に欠損・改竄されていないか」であり、
+   * `OpeningBackupAdapter.verifyPersistedBackup` → `verifyOpeningBackupFilesOnDisk`
+   * （ディスク上の実ファイルとmanifest自身が記録したSHA-256を突き合わせるだけで、
+   *  ライブDBは一切参照しない）が正確にその役割を持つ。加えて、`databaseIdentity`・
+   * `schemaFingerprint`・`planHash`（execution自身の値。manifest.planHashとの
+   * 自己比較にしない）だけは、apply()の生涯を通じて不変であるべき値として引き続き
+   * ライブDBと突き合わせる。
+   */
+  private async reverifyPersistedBackup(
+    execution: OpeningExecutionRow,
+    manifest: OpeningBackupManifest,
+    archiveTables: string[],
+    input: OpeningApplyInput,
+  ): Promise<{ ok: boolean; problems: string[] }> {
+    const expectation: ManifestVerificationExpectation = {
+      archiveTables,
+      planHash: execution.planHash,
+      databaseIdentity: databaseIdentity(this.deps.db),
+      schemaFingerprint: schemaFingerprint(this.deps.db),
+      rowCounts: {},
+      openingVersion: LEGACY_OPENING_VERSION,
+    };
+    const manifestCheck = verifyOpeningBackupManifest(manifest, expectation);
+    if (!manifestCheck.ok) {
+      return { ok: false, problems: manifestCheck.problems };
+    }
+    const persisted = await input.backup.verifyPersistedBackup(manifest, expectation);
+    return persisted.ok ? { ok: true, problems: [] } : { ok: false, problems: persisted.problems };
+  }
+
   private runDestructiveTransaction(
     execution: OpeningExecutionRow,
     initialPlan: OpeningPreflightResult,
@@ -640,12 +788,39 @@ export class OpeningReset {
 
         // R6: 旧賭場専用データの初期化（blocker=0を証明できたテーブルだけ）
         this.fireCrash("before_r6");
+        // イベントLand板保護fingerprint（PR12監査: イベントLand板の完全保護 2-F）。
+        // R6開始直前に計算し、R6〜R13完了後（COMMIT前）に再計算して一致を要求する。
+        const eventBefore = eventProtectionFingerprint(this.deps.db, this.deps.ledger);
         for (const table of R6_DELETE_ORDER) {
           if (tableExists(this.deps.db, table)) {
             this.deps.db.prepare(`DELETE FROM ${quoteIdent(table)}`).run();
           }
           this.fireCrash("r6_after_delete", table);
         }
+        // mixed market table（casino_markets/casino_market_bets/casino_market_approvals）:
+        // market_mode='standard' の行だけを対象にしたfiltered delete。イベントLand板
+        // （market_mode='event'）の行・bet・escrowは一切変更しない（PR12監査 2-B）。
+        // FK順: approvals → bets → markets（いずれも子→親）。
+        if (tableExists(this.deps.db, "casino_market_approvals")) {
+          this.deps.db
+            .prepare(
+              "DELETE FROM casino_market_approvals WHERE market_id IN (SELECT id FROM casino_markets WHERE market_mode = 'standard')",
+            )
+            .run();
+        }
+        this.fireCrash("r6_after_delete", "casino_market_approvals");
+        if (tableExists(this.deps.db, "casino_market_bets")) {
+          this.deps.db
+            .prepare(
+              "DELETE FROM casino_market_bets WHERE market_id IN (SELECT id FROM casino_markets WHERE market_mode = 'standard')",
+            )
+            .run();
+        }
+        this.fireCrash("r6_after_delete", "casino_market_bets");
+        if (tableExists(this.deps.db, "casino_markets")) {
+          this.deps.db.prepare("DELETE FROM casino_markets WHERE market_mode = 'standard'").run();
+        }
+        this.fireCrash("r6_after_delete", "casino_markets");
         this.fireCrash("after_r6");
 
         // R7: 旧準備口座 → 賭博場部署（旧制度清算）。0なら移動そのものをスキップする
@@ -724,12 +899,13 @@ export class OpeningReset {
         if (!captured) throw new Error("opening_v1 は既に存在する（二重開業の検出漏れ）");
         this.fireCrash("after_opening_v1_captured");
 
-        // R12: 同一トランザクション内でpostflight V1〜V7
+        // R12: 同一トランザクション内でpostflight V1〜V7・V-event-1〜V-event-5
         const postflight = this.runPostflightChecks(initialPlan, config, {
           oldReserveLand,
           departmentLandBefore: freshPlan.snapshot.departmentLandBefore,
           oldSettlementLandTxId,
           newInvestmentLandTxId,
+          eventBefore,
         });
         if (!postflight.ok) {
           throw new Error(`postflight失敗: ${postflight.checks.filter((c) => !c.ok).map((c) => c.id).join(",")}`);
@@ -769,6 +945,7 @@ export class OpeningReset {
       departmentLandBefore: number;
       oldSettlementLandTxId: number | null;
       newInvestmentLandTxId: number;
+      eventBefore: EventProtectionFingerprint;
     },
   ): PostflightReport {
     const checks: PostflightCheck[] = [];
@@ -813,6 +990,38 @@ export class OpeningReset {
     this.fireCrash("v7");
     const etherEscrowLand = this.deps.ledger.balanceOf(ETHER_ESCROW);
     push("V7", etherEscrowLand === 0, `sys:escrow:ether=${etherEscrowLand}`);
+
+    // V-event-1〜V-event-5: イベントLand板保護fingerprintの不変検算（PR12監査 2-F）。
+    // R6〜R13の間、イベントLand板（market_mode='event'）のデータ・resultなし・
+    // event_market_ops・そのescrow・fee holderが1件・1Ldも変化していないことを要求する。
+    // どれか1つでも不一致ならpostflight失敗としてtransaction全体をROLLBACKさせる
+    // （row countだけでなく行内容・残高そのものを比較するため、canonical hashを使う）。
+    const eventAfter = eventProtectionFingerprint(this.deps.db, this.deps.ledger);
+    push(
+      "V-event-1",
+      eventAfter.eventMarketsSha256 === ctx.eventBefore.eventMarketsSha256,
+      "event markets hash（market_mode='event'のcasino_markets全行）",
+    );
+    push(
+      "V-event-2",
+      eventAfter.eventBetsSha256 === ctx.eventBefore.eventBetsSha256,
+      "event bets hash（イベント板に属するcasino_market_bets全行）",
+    );
+    push(
+      "V-event-3",
+      eventAfter.eventMarketOpsSha256 === ctx.eventBefore.eventMarketOpsSha256,
+      "event_market_ops hash（全行）",
+    );
+    push(
+      "V-event-4",
+      eventAfter.eventEscrowSha256 === ctx.eventBefore.eventEscrowSha256,
+      "event escrow balances hash（各sys:escrow:market:<id>残高）",
+    );
+    push(
+      "V-event-5",
+      eventAfter.eventFeesHolderBalance === ctx.eventBefore.eventFeesHolderBalance,
+      `event fees holder balance: before=${ctx.eventBefore.eventFeesHolderBalance} after=${eventAfter.eventFeesHolderBalance}`,
+    );
 
     // 追加確認（CLAUDE.md §14）。ここはtransaction中(監査ブロッカー8): checkedAddAllが
     // overflowを検出すればそのまま例外を投げさせ、transaction全体をROLLBACKさせる

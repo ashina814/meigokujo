@@ -384,36 +384,60 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
   }),
   T({
     table: "casino_markets",
-    purpose: "板（予測市場）マスタ",
+    purpose:
+      "板（予測市場）マスタ。market_mode='standard'（チップ経済・PR12対象）と" +
+      "market_mode='event'（イベントLand板・PR#94・raw Ledger経済・PR12は一切触れない）が混在する",
     kind: "optional_feature",
     archive: true,
     resetOnApply: true,
     resetPhase: "R6",
     preserve: false,
-    blockerCondition: "statusがlive系（open/reported等の未終局状態）の行が1件でもあればblocker",
-    rationale: "market.ts。settled/void/cancelled等の終局状態のみならreset可",
+    blockerCondition:
+      "market_mode='standard': statusがlive系（open/reported等の未終局状態）の行が1件でもあればblocker。" +
+      "market_mode='event': settled/void以外の行が1件でもあれば active_event_land_market としてblocker" +
+      "（イベントLand板はチップ経済とは別の資金系であり、PR12は自動でvoid/refund/freezeしない）。" +
+      "settled/void のevent行はblockerにしないが、そのescrow残高が非0ならterminal_event_market_escrow_nonzeroとしてblocker",
+    rationale:
+      "market.ts。R6のDELETEは market_mode='standard' の行だけを対象にしたfiltered deleteへ限定する" +
+      "（PR12監査: イベントLand板の完全保護）。archive（backup）はテーブル全体（standard+event混在）を含めてよい" +
+      "— backupは読み取り専用の証拠保存であり削除ではないため",
   }),
   T({
     table: "casino_market_bets",
-    purpose: "板の賭け明細",
+    purpose: "板の賭け明細。casino_marketsと同じくstandard/eventが混在する",
     kind: "optional_feature",
     archive: true,
     resetOnApply: true,
     resetPhase: "R6",
     preserve: false,
-    blockerCondition: "親casino_marketsがlive系ならblocker（親子で連動判定）",
-    rationale: "market.ts",
+    blockerCondition: "親casino_marketsの分類（standard/event）に連動して判定する（casino_markets参照）",
+    rationale: "market.ts。R6のDELETEは親がmarket_mode='standard'の行だけに限定する",
   }),
   T({
     table: "casino_market_approvals",
-    purpose: "板の承認投票",
+    purpose: "板の承認投票。casino_marketsと同じくstandard/eventが混在する",
     kind: "optional_feature",
     archive: true,
     resetOnApply: true,
     resetPhase: "R6",
     preserve: false,
-    blockerCondition: "親casino_marketsがlive系ならblocker",
-    rationale: "market.ts",
+    blockerCondition: "親casino_marketsの分類（standard/event）に連動して判定する（casino_markets参照）",
+    rationale: "market.ts。R6のDELETEは親がmarket_mode='standard'の行だけに限定する",
+  }),
+  T({
+    table: "event_market_ops",
+    purpose: "イベントLand板（PR#94 hotfix）のcreate/bet/settle/voidを記録する冪等性・原子性テーブル",
+    kind: "core_required",
+    archive: false,
+    resetOnApply: false,
+    preserve: true,
+    blockerCondition: "該当なし（イベントLand板は別台帳・別経済であり、正式開業初期化は一切変更しない）",
+    rationale:
+      "market.ts。casino_opening_executionsと同じ扱いで分類表へ明示登録する（PR12監査: イベントLand板の保護）。" +
+      "preserve:true・resetOnApply:falseで削除・archive対象から除外する。plan hashにも含めない" +
+      "— イベント板のbet/settle/void操作が進行するたびにこのテーブルの内容が変わり、既存planが" +
+      "陳腐化する自己参照問題を避けるため（casino_opening_executionsと同じ理由）",
+    includeInPlanHash: false,
   }),
   T({
     table: "casino_temp_vcs",

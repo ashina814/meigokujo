@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
+import { eventMarketEscrowHolder, EVENT_MARKET_FEES_HOLDER } from "./market.js";
+import type { Ledger } from "../ledger/service.js";
 
 /**
  * 決定的な正規化シリアライズ（PR12 plan hash の基盤）。
@@ -163,6 +165,61 @@ export function schemaFingerprint(db: Database.Database): string {
     )
     .all() as Array<{ type: string; name: string; tbl_name: string; sql: string | null }>;
   return canonicalHash(rows.map((r) => ({ type: r.type, name: r.name, tbl_name: r.tbl_name, sql: r.sql })));
+}
+
+/**
+ * イベントLand板（market_mode='event'）保護fingerprint（PR12監査: イベントLand板の完全保護）。
+ *
+ * 破壊的transaction（R6）の直前と、R6〜R13完了後（同一transaction内・COMMIT前）の2回計算し、
+ * 一致することを要求する。一致しなければCOMMITせず、transaction全体をROLLBACKさせる
+ * （postflightの他のV1〜V7と同じ思想: row countだけでなく行内容・残高の値そのものを比較する）。
+ *
+ * `tableFingerprint` と同じパターン（行を正規化文字列へ変換 → ソート → hash）で、
+ * SELECTの物理的な返却順に依存しない。
+ */
+export interface EventProtectionFingerprint {
+  eventMarketsSha256: string;
+  eventBetsSha256: string;
+  eventMarketOpsSha256: string;
+  eventEscrowSha256: string;
+  eventFeesHolderBalance: number;
+}
+
+export function eventProtectionFingerprint(db: Database.Database, ledger: Ledger): EventProtectionFingerprint {
+  const hasMarketMode = tableExists(db, "casino_markets") && tableColumns(db, "casino_markets").includes("market_mode");
+
+  const eventMarkets = hasMarketMode
+    ? (db.prepare("SELECT * FROM casino_markets WHERE market_mode = 'event' ORDER BY id").all() as Array<
+        Record<string, unknown>
+      >)
+    : [];
+  const eventMarketIds = eventMarkets.map((r) => Number(r.id));
+
+  const eventBets =
+    eventMarketIds.length > 0 && tableExists(db, "casino_market_bets")
+      ? (db
+          .prepare(
+            `SELECT * FROM casino_market_bets WHERE market_id IN (${eventMarketIds.map(() => "?").join(",")}) ` +
+              `ORDER BY market_id, user_id, option_index, created_at`,
+          )
+          .all(...eventMarketIds) as Array<Record<string, unknown>>)
+      : [];
+
+  const eventOps = tableExists(db, "event_market_ops")
+    ? (db.prepare("SELECT * FROM event_market_ops ORDER BY operation_id").all() as Array<Record<string, unknown>>)
+    : [];
+
+  const escrowPairs: Array<[string, number]> = eventMarketIds
+    .map((id): [string, number] => [eventMarketEscrowHolder(id), ledger.balanceOf(eventMarketEscrowHolder(id))])
+    .sort((a, b) => a[0].localeCompare(b[0]));
+
+  return {
+    eventMarketsSha256: canonicalHash(eventMarkets.map((r) => canonicalStringify(r)).sort()),
+    eventBetsSha256: canonicalHash(eventBets.map((r) => canonicalStringify(r)).sort()),
+    eventMarketOpsSha256: canonicalHash(eventOps.map((r) => canonicalStringify(r)).sort()),
+    eventEscrowSha256: canonicalHash(escrowPairs),
+    eventFeesHolderBalance: ledger.balanceOf(EVENT_MARKET_FEES_HOLDER),
+  };
 }
 
 export function quoteIdent(value: string): string {
