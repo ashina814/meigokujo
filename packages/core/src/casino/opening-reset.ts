@@ -237,6 +237,60 @@ function reached(execution: OpeningExecutionRow, target: OpeningExecutionStatus)
 }
 
 /**
+ * owner-first resume（PR12監査: `opening_execution_id`起点の再開）で、
+ * 「外部工程（`disableLegacyCasino`）が一度も呼ばれていないと確定できる」生存中の状態。
+ * この集合に載っている状態は、plan hashが変化していても安全に再計画してよい
+ * （資金・外部工程とも未確定なため）。
+ */
+const PRE_EXTERNAL_LIVE_STATUSES: ReadonlySet<OpeningExecutionStatus> = new Set([
+  "planned",
+  "opening_reset_acquired",
+  "backup_started",
+  "backup_verified",
+]);
+
+/**
+ * `status = 'failed'` の行について、`failureStage`（`markFailed`/`safeMarkFailed`が
+ * 記録した文字列）が「外部工程開始前の失敗」であると確認できる値の集合。
+ *
+ * `status`列は`failed`という1つの値へ丸められてしまうため、「どの段階で失敗したか」は
+ * `failureStage`にしか残っていない。ここに無い（未知の）`failureStage`は安全側に倒し、
+ * 外部工程開始後と同じ扱い（自動再計画しない）にする（fail-closed）。
+ *
+ * 対応関係:
+ * - "opening_reset_acquired" / "backup_verified": `assertPlanFresh()`がそのチェックポイント名を
+ *   そのまま stage として渡す。
+ * - "backup" / "backup_verification" / "backup_durability" / "backup_persistence_verification":
+ *   backup工程内の各失敗地点（外部工程より前）。
+ * - "backup_reverify_resume": resume時の永続backup再検証失敗。backup_verified状態からの
+ *   失敗であり、外部工程には未到達。
+ */
+const PRE_EXTERNAL_FAILURE_STAGES: ReadonlySet<string> = new Set([
+  "opening_reset_acquired",
+  "backup_started",
+  "backup",
+  "backup_verification",
+  "backup_durability",
+  "backup_persistence_verification",
+  "backup_verified",
+  "backup_reverify_resume",
+]);
+
+/**
+ * owner-first resumeで「外部工程開始前」とみなしてよいか（＝安全に再計画可能か）。
+ * `status`のrankだけでなく、`failed`行については`failureStage`まで見て判定する
+ * （CLAUDE.md監査: 外部工程開始後の失敗を`status='failed'`という見た目だけで
+ *  「未着手」と誤認しないため）。
+ */
+function isPreExternalResumable(execution: OpeningExecutionRow): boolean {
+  if (PRE_EXTERNAL_LIVE_STATUSES.has(execution.status)) return true;
+  if (execution.status === "failed") {
+    return PRE_EXTERNAL_FAILURE_STAGES.has(execution.failureStage ?? "");
+  }
+  return false;
+}
+
+/**
  * 正式開業初期化のapply core（CLAUDE.md §9〜§15）。
  *
  * `dryRun()`（=`OpeningPlanner`）と違い、このクラスは**破壊的処理を持つ**。
@@ -334,8 +388,31 @@ export class OpeningReset {
     // bind CAS不一致）すれば、statusの遷移も含めて全部ROLLBACKされ、呼出前の状態に戻る。
     const r0 = this.deps.db
       .transaction((): { initialPlan: OpeningPreflightResult; execution: OpeningExecutionRow } => {
-        const preCheck = this.planner.dryRun();
         const currentStatus = this.deps.status.current().status;
+
+        // ---- owner-first resume（PR12監査: opening_execution_id起点の再開）----
+        // statusが既にopening_resetで、かつ`casino_status.opening_execution_id`/
+        // `opening_actor_id`へ既にbindされている（＝過去のapply()呼び出しがR0を完了させた）
+        // 場合は、**現在のplan hashで新規executionをacquireしてはいけない**。旧executionを
+        // ownerから直接引く。以前はここでも「現在のplan hashでacquire」を行っていたため、
+        // COMMIT前にplan hashへ影響する（安全な）DB変化が起きただけで、bindOpeningExecutionOwner()の
+        // CASが恒久的に失敗し続け、通常のapply()から二度と復旧できなくなるバグがあった
+        // （旧executionへ到達できず、かつ別executionへの上書きも拒否されるため）。
+        if (currentStatus === "opening_reset") {
+          const owner = this.deps.status.currentOpeningOwner();
+          if (owner) {
+            return this.resumeFromOwner(input.actorId, owner);
+          }
+          // owner未確定（両方NULL）: このDBの生涯でR0のacquire+bindがまだ一度もCOMMITされて
+          // いない（例: 運用導線が`beginOpeningReset()`を直接呼んでstatusだけ先に進めた場合。
+          // acquireとbindは常に同一transactionでCOMMITされる設計なので、「片方だけ確定した」
+          // 状態は存在しない＝これはfail-closed対象ではなく、単に「まだ誰も取得していない」）。
+          // 下の新規acquireロジックへそのまま進む。
+        }
+
+        // ---- 新規acquire（status===openからの遷移、またはstatus===opening_resetだが
+        // まだownerが確定していない場合の両方をカバーする）----
+        const preCheck = this.planner.dryRun();
         const readyExceptStatus =
           currentStatus === "open" &&
           preCheck.blockers.length > 0 &&
@@ -658,6 +735,117 @@ export class OpeningReset {
       casinoReopened,
       notifierStatus,
     };
+  }
+
+  /**
+   * owner-first resume本体（PR12監査: `opening_execution_id`起点の再開）。
+   *
+   * R0（単一IMMEDIATE transaction）の中から呼ばれる。呼び出し時点で
+   * `casino_status.status === 'opening_reset'` かつ `owner`（execution/actor）が
+   * 既にbind済みであることを呼び出し側が確認済み。
+   *
+   * ここでは**現在のplan hashをexecution識別子として使わない**。所有executionは常に
+   * `owner.executionId`から直接引く。
+   */
+  private resumeFromOwner(
+    actorId: string,
+    owner: { executionId: string; actorId: string },
+  ): { initialPlan: OpeningPreflightResult; execution: OpeningExecutionRow } {
+    // 別actor: 資金・status・executionを一切変更せず即座に拒否する（監査ブロッカー3と同じ思想。
+    // 暗黙のactor引き継ぎを許さない）。ここまで一切の書き込みを行っていないので、
+    // 例外によるtransaction ROLLBACKは実質的なno-opになる。
+    if (owner.actorId !== actorId) {
+      throw new OpeningExecutionConflictError("actor_mismatch", owner.executionId);
+    }
+
+    const ownerExecution = this.executions.get(owner.executionId);
+    if (!ownerExecution) {
+      // casino_statusが指すexecutionがcasino_opening_executionsに存在しない。
+      // acquire+bindは常に同一transactionでCOMMITされる設計なので、通常はあり得ない
+      // （データ破損の疑い）。推測で新規executionを作らずfail-closedで止める。
+      throw new Error(
+        `不変条件違反: casino_statusが指すopening_reset所有execution(${owner.executionId})が` +
+          `casino_opening_executionsに存在しない（データ破損の疑い。手動調査が必要）`,
+      );
+    }
+    if (ownerExecution.actorId !== owner.actorId) {
+      // execution行自身のactor_idとcasino_status側のowner.actorIdが食い違う
+      // （両方とも「同じ人物」を指しているはずの値が矛盾している＝データ破損の疑い）。
+      throw new Error(
+        `不変条件違反: execution(${ownerExecution.id})のactorId(${ownerExecution.actorId})と` +
+          `casino_statusのowner.actorId(${owner.actorId})が食い違う（データ破損の疑い。手動調査が必要）`,
+      );
+    }
+
+    const currentPlan = this.planner.dryRun();
+    if (currentPlan.planHash === ownerExecution.planHash) {
+      // 同じplan hash: 所有executionをそのままresumeする（新規executionは作らない）。
+      // 以降のstale判定（assertPlanFresh・backup後の再検査・外部工程後の再検査・R6直前の
+      // freshPlanチェック）は、apply()の通常の梯子がそれぞれの到達段階で改めて行う。
+      return { initialPlan: currentPlan, execution: ownerExecution };
+    }
+
+    // ---- plan hashが変化していた（このメソッドが解決すべき本題）----
+    if (isPreExternalResumable(ownerExecution)) {
+      // 外部工程開始前: 資金・外部工程とも未確定。安全に再計画してよい。
+      // 旧executionを`failed`へ記録した上で、所有権を新plan executionへ原子的に移譲する
+      // （旧executionを残したままownerだけ無条件で上書きしない）。
+      let previous = ownerExecution;
+      if (previous.status !== "failed") {
+        const failResult = this.executions.markFailed(
+          previous.id,
+          previous.status,
+          previous.status,
+          "plan hashが変化したため再計画（外部工程開始前・安全に再計画可能と判定）",
+        );
+        if (!failResult.applied) {
+          // 単一IMMEDIATE transaction内・直前にgetしたばかりの行なので、他プロセスの割込みは
+          // 無いはず。CAS不一致が起きたら不変条件違反として扱う（fail-closed）。
+          throw new Error(
+            `不変条件違反: execution(${previous.id})を再計画のためfailedへ倒すCASが不一致になった` +
+              `（別プロセスの割込みの疑い）`,
+          );
+        }
+        previous = failResult.execution;
+      }
+
+      const acquireResult = this.executions.acquire(currentPlan.planHash, actorId, currentPlan.snapshot.configuration);
+      const nextExecution = acquireResult.execution;
+
+      const transferred = this.deps.status.transferOpeningExecutionOwner({
+        fromExecutionId: previous.id,
+        fromActorId: actorId,
+        toExecutionId: nextExecution.id,
+        toActorId: actorId,
+      });
+      if (!transferred) {
+        throw new Error(
+          `不変条件違反: opening_reset所有権をexecution(${previous.id})からexecution(${nextExecution.id})へ` +
+            `移譲するCASが不一致になった（別の所有者が既に存在する疑い）`,
+        );
+      }
+      return { initialPlan: currentPlan, execution: nextExecution };
+    }
+
+    // ---- 外部工程開始後・fundsApplied=false（R0手前のfindAppliedNotCompleted()により
+    // fundsApplied=trueはここへ到達しない）: 外部工程が実行された可能性があるため、
+    // 新plan executionへ自動移譲しない。既存owner executionを直接manual_review_requiredへ
+    // 倒す（外部adapter・backup・R6以降を再実行しない）----
+    if (ownerExecution.status === "manual_review_required") {
+      // 既に同状態: そのまま返す（呼び出し側がOpeningApplyManualReviewErrorへ変換する）。
+      return { initialPlan: currentPlan, execution: ownerExecution };
+    }
+    const reviewResult = this.executions.transition(ownerExecution.id, ownerExecution.status, "manual_review_required", {
+      manualReviewReason:
+        "plan hashが外部工程開始後に変化した（外部工程・R6以降の破壊的処理を再実行しない。手動判断が必要）",
+    });
+    if (!reviewResult.applied) {
+      throw new Error(
+        `不変条件違反: execution(${ownerExecution.id})をmanual_review_requiredへ倒すCASが不一致になった` +
+          `（別プロセスの割込みの疑い）`,
+      );
+    }
+    return { initialPlan: currentPlan, execution: reviewResult.execution };
   }
 
   /**

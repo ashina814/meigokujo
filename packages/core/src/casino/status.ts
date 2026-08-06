@@ -271,6 +271,10 @@ export class CasinoStatus {
   /**
    * 現在の opening_reset 所有者（execution・actor）。status が opening_reset でない、
    * またはまだ誰もbindしていない場合は `null`。
+   *
+   * **両方NULL**（＝まだ一度もbindされていない）と**片方だけNULL**（＝データ破損）を
+   * ここでは区別しない（どちらも`null`を返す）。呼び出し側が破損を検出したい場合は
+   * {@link openingOwnerRawFields} で生の列値を見ること（PR12監査: owner-first resume）。
    */
   currentOpeningOwner(): { executionId: string; actorId: string } | null {
     const row = this.db.prepare("SELECT opening_execution_id, opening_actor_id FROM casino_status WHERE id = 1").get() as
@@ -278,6 +282,58 @@ export class CasinoStatus {
       | undefined;
     if (!row || !row.opening_execution_id || !row.opening_actor_id) return null;
     return { executionId: row.opening_execution_id, actorId: row.opening_actor_id };
+  }
+
+  /**
+   * `opening_execution_id`/`opening_actor_id` の生の列値（NULL/非NULLを区別する）。
+   *
+   * `currentOpeningOwner()` は「両方揃っているか」だけを見て`null`に丸めるため、
+   * 「片方だけ埋まっている」という本来あり得ないはずの破損状態を呼び出し側が
+   * 検出できない。owner-first resume（`OpeningReset.apply()`のR0）は、
+   * `currentOpeningOwner()`が`null`を返した場合に「まだ一度もbindされていない
+   * （＝新規acquireしてよい）」と「片方だけ壊れている（＝fail-closedで止めるべき）」を
+   * 区別するためにこちらを使う。
+   */
+  openingOwnerRawFields(): { executionId: string | null; actorId: string | null } {
+    const row = this.db.prepare("SELECT opening_execution_id, opening_actor_id FROM casino_status WHERE id = 1").get() as
+      | { opening_execution_id: string | null; opening_actor_id: string | null }
+      | undefined;
+    return { executionId: row?.opening_execution_id ?? null, actorId: row?.opening_actor_id ?? null };
+  }
+
+  /**
+   * opening_reset 所有権を、既存の所有者(execution/actor)から**別のexecution**へ
+   * 原子的に移譲する（PR12監査: owner-first resumeでplan hashが変化した場合の再計画）。
+   *
+   * `bindOpeningExecutionOwner()` は「未bind、または同じexecution/actorへの再bind」しか
+   * 許さない（別executionへの上書きを拒否する）。plan hashが変わって新しいexecutionへ
+   * 移る必要がある場合は、こちらを使う。
+   *
+   * CAS: `status = 'opening_reset' AND opening_execution_id = fromExecutionId AND
+   * opening_actor_id = fromActorId` の場合**だけ**更新する（無条件UPDATEは禁止）。
+   * 呼び出し側（`OpeningReset.apply()`）は、旧executionを`failed`へ記録する処理と
+   * このメソッドを**同一のIMMEDIATE transaction**の中で呼ぶこと。CAS不一致（`false`）は
+   * 別の所有者が既に存在する疑いとして扱い、fail-closedで例外を投げてtransaction全体を
+   * ROLLBACKさせること。
+   */
+  transferOpeningExecutionOwner(params: {
+    fromExecutionId: string;
+    fromActorId: string;
+    toExecutionId: string;
+    toActorId: string;
+  }): boolean {
+    const { fromExecutionId, fromActorId, toExecutionId, toActorId } = params;
+    if (!fromExecutionId.trim() || !fromActorId.trim() || !toExecutionId.trim() || !toActorId.trim()) {
+      throw new Error("CasinoStatus.transferOpeningExecutionOwner: 引数はすべて必須");
+    }
+    const info = this.db
+      .prepare(
+        `UPDATE casino_status SET opening_execution_id = ?, opening_actor_id = ?
+         WHERE id = 1 AND status = 'opening_reset'
+           AND opening_execution_id = ? AND opening_actor_id = ?`,
+      )
+      .run(toExecutionId, toActorId, fromExecutionId, fromActorId);
+    return info.changes === 1;
   }
 
   /**

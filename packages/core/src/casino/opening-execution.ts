@@ -61,7 +61,14 @@ const ALLOWED_TRANSITIONS: Record<OpeningExecutionStatus, readonly OpeningExecut
   post_commit_pending: ["completed", "manual_review_required"],
   // 資金未確定(fundsApplied=false)の failed だけが再挑戦を許される。
   // fundsApplied=true の failed は存在しない設計（コードがそこへ到達させない）。
-  failed: ["opening_reset_acquired"],
+  //
+  // failed -> manual_review_required（PR12監査: owner-first resume）: このexecutionが
+  // 「外部工程開始後」に失敗した（failureStageが external・applying 等）ことを呼び出し側
+  // （`OpeningReset`のowner-first resume）が判定し、plan hashが変化していて安全に
+  // 再計画できないと分かった場合に使う。failed -> opening_reset_acquired（無条件の再挑戦）
+  // と違い、こちらは「外部工程が実行された可能性がある状態を、人間の確認無しに
+  // 自動で再計画しない」という設計上の要求のために存在する。
+  failed: ["opening_reset_acquired", "manual_review_required"],
   manual_review_required: ["completed"],
   completed: [],
 };
