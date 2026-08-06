@@ -1,6 +1,5 @@
 import { MessageFlags, type Interaction, type RepliableInteraction } from "discord.js";
 import type { Services } from "../services.js";
-import { bindCapacityVipBetCapMultProvider } from "./capacity-report.js";
 import { isFormallyOpen, openingNotice } from "./opening.js";
 
 /**
@@ -76,23 +75,6 @@ export function isCasinoInteraction(interaction: Interaction): boolean {
   return false;
 }
 
-function isManagementInteraction(interaction: Interaction): boolean {
-  if (interaction.isChatInputCommand()) return interaction.commandName === "管理";
-  return "customId" in interaction && typeof interaction.customId === "string" && interaction.customId.startsWith("mgmt:");
-}
-
-/**
- * PR13 capacity reportは、運営卓を開いた瞬間の現在VIP倍率で最大賭け額を算出する。
- * `denyIfCasinoClosed()`は全interactionの最初に呼ばれるため、管理導線だけproviderを同期する。
- * テスト用の不完全なServicesではvipが無い場合があるので、その場合は既定値のままにする。
- */
-function syncCapacityVipMultiplier(interaction: Interaction, services: Services): void {
-  if (!isManagementInteraction(interaction)) return;
-  const vip = (services as Partial<Services>).vip;
-  if (!vip || typeof vip.betCapMult !== "function") return;
-  bindCapacityVipBetCapMultProvider(() => vip.betCapMult());
-}
-
 /**
  * 賭場が閉まっていれば理由を返して true（＝呼び出し側は処理を中止する）。
  * 開いていれば false。
@@ -103,7 +85,6 @@ function syncCapacityVipMultiplier(interaction: Interaction, services: Services)
  * 利用者に近いので、稼働状態の判定を先に置く。
  */
 export async function denyIfCasinoClosed(interaction: Interaction, services: Services): Promise<boolean> {
-  syncCapacityVipMultiplier(interaction, services);
   if (!isCasinoInteraction(interaction)) return false;
   const deny = services.casinoStatus.denyMessage() ?? (isFormallyOpen(services) ? null : openingNotice(services));
   if (!deny) return false;

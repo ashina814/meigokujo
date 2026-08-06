@@ -1,8 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { LAND_SCALE, houseCapacityReport } from "../src/casino/capacity-report.js";
+import { LIABILITY_MODELS } from "@meigokujo/core";
+import {
+  CAPACITY_REPORT_GAMES,
+  LAND_SCALE,
+  houseCapacityReport,
+} from "../src/casino/capacity-report.js";
 import { exchangePanelMessage } from "../src/commands/exchange-panel.js";
 
 describe("PR13 Land表示と運転資金表", () => {
+  it("capacity対象ゲームはLIABILITY_MODELS正本の全件と一致する", () => {
+    expect(CAPACITY_REPORT_GAMES).toEqual(Object.keys(LIABILITY_MODELS));
+    expect(new Set(CAPACITY_REPORT_GAMES).size).toBe(CAPACITY_REPORT_GAMES.length);
+  });
+
   it("VIP上限・最大連鎖・armed_win上限を含む最悪条件で2/5/10人の予約額を出す", () => {
     expect(LAND_SCALE).toEqual({ minBet: 5, maxBet: 100_000, etherFukuScale: 10 });
     const report = houseCapacityReport(

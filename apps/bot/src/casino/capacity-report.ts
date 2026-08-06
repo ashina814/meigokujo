@@ -1,6 +1,8 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   CHAIN_TIERS,
   CONSUMABLES,
+  LIABILITY_MODELS,
   SETTING_DEFAULTS,
   liabilityModelFor,
   type LiabilityContext,
@@ -35,18 +37,46 @@ export interface HouseCapacityReport {
   games: GameCapacityRow[];
 }
 
-let runtimeVipBetCapMultProvider: (() => number) | null = null;
+/** 運転資金表の対象ゲーム正本。モデル追加時は自動的に対象へ入る。 */
+export const CAPACITY_REPORT_GAMES: readonly string[] = Object.freeze(Object.keys(LIABILITY_MODELS));
 
 /**
- * productionの管理導線から、現在のVIP倍率を読むproviderを接続する。
- * 読み取り専用で、設定・台帳・statusは変更しない。
+ * 管理interaction単位のVIP倍率。module-globalな「最後に見たprovider」と違い、
+ * AsyncLocalStorageが並行リクエストごとに値を隔離する。
  */
-export function bindCapacityVipBetCapMultProvider(provider: () => number): void {
-  runtimeVipBetCapMultProvider = provider;
+const capacityVipBetCapMultContext = new AsyncLocalStorage<number>();
+
+function requireValidVipBetCapMult(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`vipBetCapMult must be finite and positive: ${String(value)}`);
+  }
+  return value;
 }
 
-function currentVipBetCapMult(): number {
-  return runtimeVipBetCapMultProvider?.() ?? SETTING_DEFAULTS.vip_bet_cap_mult;
+/** 管理ハンドラ全体を、そのリクエストで読んだVIP倍率のスコープ内で実行する。 */
+export function runWithCapacityVipBetCapMult<T>(vipBetCapMult: number, callback: () => T): T {
+  return capacityVipBetCapMultContext.run(requireValidVipBetCapMult(vipBetCapMult), callback);
+}
+
+function contextualVipBetCapMult(): number {
+  const scoped = capacityVipBetCapMultContext.getStore();
+  if (scoped !== undefined) return scoped;
+  // 既存の部分mockテストは管理ルータを経由しない。productionでの経路漏れは黙って既定値へ倒さない。
+  if (process.env.NODE_ENV === "test") return SETTING_DEFAULTS.vip_bet_cap_mult;
+  throw new Error("capacity VIP multiplier context is not set");
+}
+
+function assertCanonicalGameCoverage(games: readonly string[]): void {
+  const actual = new Set(games);
+  const complete =
+    games.length === CAPACITY_REPORT_GAMES.length &&
+    actual.size === games.length &&
+    CAPACITY_REPORT_GAMES.every((game) => actual.has(game));
+  if (!complete) {
+    throw new Error(
+      `capacity report game coverage mismatch: expected=${CAPACITY_REPORT_GAMES.join(",")} actual=${games.join(",")}`,
+    );
+  }
 }
 
 function requireNonNegativeSafeInteger(value: number, label: string): number {
@@ -95,9 +125,7 @@ function maximumArmedWinBonusCap(): number {
 }
 
 function maximumConfiguredBet(vipBetCapMult: number): number {
-  if (!Number.isFinite(vipBetCapMult) || vipBetCapMult <= 0) {
-    throw new Error(`vipBetCapMult must be finite and positive: ${String(vipBetCapMult)}`);
-  }
+  requireValidVipBetCapMult(vipBetCapMult);
   // configuredMaxBet()と同じくVIP側はfloorする。倍率が1未満でも通常利用者のMAX_BETを下回らせない。
   const vipMaximumBet = Math.floor(MAX_BET * vipBetCapMult);
   requireNonNegativeSafeInteger(vipMaximumBet, "vipMaximumBet");
@@ -112,19 +140,24 @@ function maximumConfiguredBet(vipBetCapMult: number): number {
  * - 連鎖: CHAIN_TIERSの最大倍率
  * - 勝利お守り: armed_win系の有限cap合計
  *
- * 未知ゲーム・無制限お守り・不正倍率・safe integer超過はすべてfail-closed。
+ * 第3引数を省略する管理画面経路では、リクエストスコープのVIP倍率を使用し、
+ * 対象ゲームがLIABILITY_MODELSの全件と一致することも確認する。モデル追加漏れは
+ * 推奨額の過小表示へ倒さずfail-closed。
  */
 export function houseCapacityReport(
   minimumWorkingCapital: number | null,
-  games: string[],
-  vipBetCapMult: number = currentVipBetCapMult(),
+  games: readonly string[],
+  vipBetCapMult?: number,
 ): HouseCapacityReport {
   if (minimumWorkingCapital !== null) {
     requireNonNegativeSafeInteger(minimumWorkingCapital, "minimumWorkingCapital");
   }
   if (games.length === 0) throw new Error("capacity report requires at least one game");
 
-  const maximumBet = maximumConfiguredBet(vipBetCapMult);
+  const usesRuntimeContext = vipBetCapMult === undefined;
+  if (usesRuntimeContext) assertCanonicalGameCoverage(games);
+  const resolvedVipBetCapMult = vipBetCapMult ?? contextualVipBetCapMult();
+  const maximumBet = maximumConfiguredBet(resolvedVipBetCapMult);
   const chain = maximumChainContext();
   const maximumWinBonusCap = maximumArmedWinBonusCap();
   const context: Omit<LiabilityContext, "bet"> = {
@@ -159,7 +192,7 @@ export function houseCapacityReport(
         : checkedAdd(minimumWorkingCapital, worstTen, "recommendedOpeningHouse"),
     assumptions: {
       maximumBet,
-      vipBetCapMult,
+      vipBetCapMult: resolvedVipBetCapMult,
       maximumWinStreak: chain.maximumWinStreak,
       maximumChainMultiplier: chain.maximumChainMultiplier,
       maximumWinBonusCap,
