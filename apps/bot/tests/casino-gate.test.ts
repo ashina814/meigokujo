@@ -6,15 +6,17 @@ import { denyIfCasinoClosed, isCasinoInteraction } from "../src/casino/gate.js";
 /**
  * 賭場が停止しているあいだ、チップが動きうる操作をひとつも通さないこと。
  * 読むだけの導線と運営卓は止めない（止めると原因調査も復旧もできなくなる）。
+ * イベントLand板はチップ賭場とは別経済なので、正式開業前でも止めない。
  */
 function fakeServices(deny: string | null, phase: "pre_reset" | "formal" | "unknown" = "formal"): Services {
   return { casinoStatus: { denyMessage: () => deny }, chipTx: { openingPhase: () => phase } } as unknown as Services;
 }
 
-function command(name: string): Interaction & { reply: ReturnType<typeof vi.fn> } {
+function command(name: string, subcommand: string | null = null): Interaction & { reply: ReturnType<typeof vi.fn> } {
   return {
     isChatInputCommand: () => true,
     commandName: name,
+    options: { getSubcommand: vi.fn().mockReturnValue(subcommand) },
     replied: false,
     deferred: false,
     reply: vi.fn().mockResolvedValue(undefined),
@@ -32,10 +34,17 @@ function component(customId: string): Interaction & { reply: ReturnType<typeof v
 }
 
 describe("賭場の入口ガード", () => {
-  it("チップが動く操作を対象にし、読むだけの導線と運営卓は対象にしない", () => {
-    for (const name of ["遊ぶ", "勝負", "福分け", "賭場商店", "株", "競馬", "vip", "流れ星", "板"]) {
+  it("チップが動く操作を対象にし、読むだけの導線とイベントLand板は対象にしない", () => {
+    for (const name of ["遊ぶ", "勝負", "福分け", "賭場商店", "株", "競馬", "vip", "流れ星"]) {
       expect(isCasinoInteraction(command(name))).toBe(true);
     }
+    // `/板` はサブコマンド単位で判定する。未知・欠落はfail-closed。
+    expect(isCasinoInteraction(command("板", "立てる"))).toBe(true);
+    expect(isCasinoInteraction(command("板", "イベント立てる"))).toBe(false);
+    expect(isCasinoInteraction(command("板", "一覧"))).toBe(false);
+    expect(isCasinoInteraction(command("板", "将来追加された未知操作"))).toBe(true);
+    expect(isCasinoInteraction(command("板"))).toBe(true);
+
     for (const name of ["管理", "案内", "賭場番付", "通行証", "あそびかた", "プロフィール"]) {
       expect(isCasinoInteraction(command(name))).toBe(false);
     }
@@ -47,6 +56,10 @@ describe("賭場の入口ガード", () => {
       "bjd:accept", "ccd:accept", "ind:call", "sashi:accept", "rem:12345",
     ]) {
       expect(isCasinoInteraction(component(id))).toBe(true);
+    }
+    // イベントLand板は `itaevt:` という別namespaceで、チップ賭場の停止対象ではない。
+    for (const id of ["itaevt:bet:1", "itaevt:close:1", "itaevt:settle:1:0", "itaevt:void:1"]) {
+      expect(isCasinoInteraction(component(id))).toBe(false);
     }
     // 運営卓は入口では止めない（停止中の資金操作は運営卓のハンドラと資金層で断る）
     for (const id of ["mgmt:casino:fund", "ticket:close", "entry:apply", "rank:next"]) {
@@ -86,10 +99,10 @@ describe("賭場の入口ガード", () => {
     expect(await denyIfCasinoClosed(i, services)).toBe(true);
   });
 
-  // PR8監査・項目8: 稼働状態が open でも、正式開業初期化が終わるまで資金は動かせない
-  it("正式開業前は open でも専用の文面で断る", async () => {
+  // PR8監査・項目8: 稼働状態が open でも、正式開業初期化が終わるまでチップ資金は動かせない
+  it("正式開業前は open でもチップ操作を専用の文面で断る", async () => {
     const services = fakeServices(null, "pre_reset");
-    for (const i of [command("遊ぶ"), component("ether:buy"), component("slots:retry:50")]) {
+    for (const i of [command("遊ぶ"), command("板", "立てる"), component("ether:buy"), component("slots:retry:50")]) {
       expect(await denyIfCasinoClosed(i, services)).toBe(true);
       const arg = i.reply.mock.calls[0]![0] as { content: string };
       expect(arg.content).toContain("正式開業準備中");
@@ -100,7 +113,20 @@ describe("賭場の入口ガード", () => {
     }
   });
 
-  it("未知版では異常であることを明示して全操作を止める", async () => {
+  it("正式開業前でもイベントLand板と板一覧は素通りする", async () => {
+    const services = fakeServices(null, "pre_reset");
+    for (const i of [
+      command("板", "イベント立てる"),
+      command("板", "一覧"),
+      component("itaevt:bet:1"),
+      component("itaevt:close:1"),
+    ]) {
+      expect(await denyIfCasinoClosed(i, services)).toBe(false);
+      expect(i.reply).not.toHaveBeenCalled();
+    }
+  });
+
+  it("未知版では異常であることを明示してチップ操作を止める", async () => {
     const services = fakeServices(null, "unknown");
     const i = command("遊ぶ");
     expect(await denyIfCasinoClosed(i, services)).toBe(true);
