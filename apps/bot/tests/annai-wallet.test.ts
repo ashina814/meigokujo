@@ -8,8 +8,8 @@ const assets = (escrowed: number) => ({
   total: 9_000 + escrowed,
 });
 
-describe("案内所のPR9財布表示", () => {
-  it("正式開業後、escrowed=0なら補助行を出さない", () => {
+describe("案内所のPR13財布表示（所持 = 通常Land + 自由チップ）", () => {
+  it("正式開業後、escrowed=0なら通常Land+自由チップの合算だけを出し、補助行を出さない", () => {
     const text = renderWalletValue({
       phase: "formal",
       heldLand: 1_000,
@@ -18,11 +18,11 @@ describe("案内所のPR9財布表示", () => {
       isVip: false,
       vipDaysLeft: 0,
     });
-    expect(text).toContain("9,000 ◈");
+    expect(text).toContain("所持 **10,000 Ld**");
     expect(text).not.toContain("卓・板に預け中");
   });
 
-  it("正式開業後、escrowed>0なら補助行を出す", () => {
+  it("正式開業後、escrowed>0なら合算額に加えて預け中の補助行を出す（二重加算しない）", () => {
     const text = renderWalletValue({
       phase: "formal",
       heldLand: 1_000,
@@ -31,7 +31,8 @@ describe("案内所のPR9財布表示", () => {
       isVip: false,
       vipDaysLeft: 0,
     });
-    expect(text).toContain("卓・板に預け中 **2,000 ◈**");
+    expect(text).toContain("所持 **10,000 Ld**");
+    expect(text).toContain("卓・板に預け中 2,000 Ld");
   });
 
   it("legacy_pre_resetでは自由チップを利用可能額として表示しない", () => {
@@ -45,7 +46,7 @@ describe("案内所のPR9財布表示", () => {
     });
     expect(text).toContain("正式開業準備中");
     expect(text).toContain("1,000 Ld");
-    expect(text).not.toContain("9,000 ◈");
+    expect(text).not.toContain("10,000 Ld");
     expect(text).not.toContain("卓・板に預け中");
   });
 
@@ -60,7 +61,7 @@ describe("案内所のPR9財布表示", () => {
     });
     expect(text).toContain("賭場の版が異常");
     expect(text).toContain("利用可能額へ含めません");
-    expect(text).not.toContain("9,000 ◈");
+    expect(text).not.toContain("10,000 Ld");
   });
 
   it("資産検算例外を0へ丸めず表示停止する", () => {
@@ -74,7 +75,8 @@ describe("案内所のPR9財布表示", () => {
     });
     expect(text).toContain("チップ帳簿を確認できません");
     expect(text).toContain("破損値を0として表示せず");
-    expect(text).not.toContain("0 ◈");
+    // 合算できないので、通常Landだけを出し「合算した所持額」を捏造しない
+    expect(text).not.toContain("10,000 Ld");
   });
 
   it("integrity_halt / recovery_haltの停止理由を維持する", () => {
