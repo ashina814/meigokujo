@@ -1003,8 +1003,20 @@ export class Markets {
         .prepare("SELECT market_id, kind, actor_id, result_json FROM event_market_ops WHERE operation_id = ?")
         .get(operationId) as { market_id: number; kind: string; actor_id: string; result_json: string } | undefined;
       if (!existing) return undefined;
-      if (existing.market_id !== marketId || existing.kind !== kind) {
-        throw new MarketError("ERR_OPERATION_CONFLICT", { operationId, existing, marketId, kind });
+      // market_id・kind に加えて actor_id も照合する。ここを素通りすると、別の actor が
+      // 同じ operationId を使い回すだけで他人の保存済み結果（bet/settle/void の中身）を
+      // 受け取れてしまう（監査指摘2）。この閉包は通常経路（後段の replayExisting() 呼び出し）と
+      // UNIQUE制約競合後の再読込経路の両方から呼ばれる共通処理なので、ここ一箇所の修正で両方に効く。
+      if (existing.market_id !== marketId || existing.kind !== kind || existing.actor_id !== actorId) {
+        throw new MarketError("ERR_OPERATION_CONFLICT", {
+          operationId,
+          existingMarketId: existing.market_id,
+          requestedMarketId: marketId,
+          existingKind: existing.kind,
+          requestedKind: kind,
+          existingActorId: existing.actor_id,
+          requestedActorId: actorId,
+        });
       }
       return JSON.parse(existing.result_json) as T;
     };

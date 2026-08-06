@@ -288,4 +288,59 @@ describe("イベントLand板: 複数接続・別プロセスからの同時実�
     expect(marketRow.status).toBe("void");
     expect(u1Bal).toBe(2_000); // 全額1回だけ返金（2000のまま、二重返金で2800等になっていない）
   }, 60_000);
+
+  it("同じoperationIdを別のactorが同時に使うと片方だけ成功し、もう片方は必ずERR_OPERATION_CONFLICTになる（監査指摘2・敗者は勝者の結果を成功扱いで受け取らない）", async () => {
+    const ctx = setupFileDb();
+    seedLand(ctx.ledger, "creator", EVENT_MARKET_CREATE_FEE);
+    const m = ctx.markets.createEvent({
+      guildId: "g",
+      creatorId: "creator",
+      title: "並行actor衝突",
+      options: ["A", "B"],
+      durationMin: 60,
+      allowedRoleIds: [ROLE_A],
+      operationId: "create-op-5",
+    });
+    seedLand(ctx.ledger, "racerA", 2_000);
+    seedLand(ctx.ledger, "racerB", 2_000);
+    ctx.db.close();
+
+    const sameOp = "actor-conflict-op-shared";
+    const results = await runProcesses(ctx.dbPath, [
+      { action: "bet", marketId: m.id, userId: "racerA", roleIds: [ROLE_A], optionIndex: 0, amount: 500, operationId: sameOp },
+      { action: "bet", marketId: m.id, userId: "racerB", roleIds: [ROLE_A], optionIndex: 1, amount: 700, operationId: sameOp },
+    ]);
+
+    const winners = results.filter((r) => r.outcome === "ok");
+    const losers = results.filter((r) => r.outcome === "error");
+    // 片方だけが成功し、もう片方は必ず ERR_OPERATION_CONFLICT で失敗する
+    // （修正前は敗者が「もう一方が確定させた結果」を自分の成功結果として受け取っていた）
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    expect(losers[0]!.errorCode).toBe("ERR_OPERATION_CONFLICT");
+    expect(losers[0]!.payload).toBeNull();
+
+    const reopened = openDb(ctx.dbPath);
+    const ledger2 = new Ledger(reopened);
+    const bets = reopened.prepare("SELECT * FROM casino_market_bets WHERE market_id = ?").all(m.id) as Array<{
+      user_id: string;
+      amount: number;
+    }>;
+    const opsRows = reopened
+      .prepare("SELECT operation_id, actor_id FROM event_market_ops WHERE operation_id = ?")
+      .all(sameOp) as Array<{ operation_id: string; actor_id: string }>;
+
+    // event_market_ops には勝者の行だけが1行残る（敗者の行は作られない）
+    expect(opsRows).toHaveLength(1);
+    const winnerUserId = opsRows[0]!.actor_id;
+    const loserUserId = winnerUserId === "racerA" ? "racerB" : "racerA";
+    // 勝者だけがbetを持ち、敗者のbetは存在しない
+    expect(bets).toHaveLength(1);
+    expect(bets[0]!.user_id).toBe(winnerUserId);
+    // 敗者のLandは動いていない
+    expect(ledger2.balanceOf(`user:${loserUserId}`)).toBe(2_000);
+    // 勝者のLandは自分のbet額分だけ減っている
+    expect(ledger2.balanceOf(`user:${winnerUserId}`)).toBe(2_000 - bets[0]!.amount);
+    reopened.close();
+  }, 60_000);
 });

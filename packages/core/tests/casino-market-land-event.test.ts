@@ -802,6 +802,63 @@ describe("イベントLand板: 冪等キー衝突", () => {
     ctx.markets.betEventLand(m1.id, "u1", [ROLE_A], 0, 500, op);
     expect(() => ctx.markets.betEventLand(m2.id, "u1", [ROLE_A], 0, 500, op)).toThrow(MarketError);
   });
+
+  it("同じoperationIdを別のactorが再利用すると ERR_OPERATION_CONFLICT（bet）。Aの結果はBへ返らずBのLandも動かない（監査指摘2）", () => {
+    const m = createEventMarket(ctx, { creatorId: "c1" });
+    seedLand(ctx.ledger, "u1", 1_000);
+    seedLand(ctx.ledger, "u2", 1_000);
+    const op = opId();
+    ctx.markets.betEventLand(m.id, "u1", [ROLE_A], 0, 500, op); // actor=u1 が先に確定
+
+    const opsCountBefore = (ctx.db.prepare("SELECT COUNT(*) AS c FROM event_market_ops").get() as { c: number }).c;
+    let caught: unknown;
+    try {
+      ctx.markets.betEventLand(m.id, "u2", [ROLE_A], 1, 300, op); // actor=u2 が同じoperationIdを再利用
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(MarketError);
+    expect((caught as MarketError).code).toBe("ERR_OPERATION_CONFLICT");
+
+    // u1の結果がu2へ返っていない・u2のbetは作られていない・u1のbetは変更されていない
+    expect(ctx.markets.betOf(m.id, "u1")).toMatchObject({ market_id: m.id, user_id: "u1", option_index: 0, amount: 500 });
+    expect(ctx.markets.betOf(m.id, "u2")).toBeUndefined();
+    // u2のLandは動いていない
+    expect(ctx.ledger.balanceOf("user:u2")).toBe(1_000);
+    // event_market_opsは1行のまま（Bの試行は書き込まれていない）
+    const opsCountAfter = (ctx.db.prepare("SELECT COUNT(*) AS c FROM event_market_ops").get() as { c: number }).c;
+    expect(opsCountAfter).toBe(opsCountBefore);
+  });
+
+  it("同じoperationIdを別のactorが再利用すると ERR_OPERATION_CONFLICT（settle）。二重配当されない（監査指摘2）", () => {
+    const m = createEventMarket(ctx, { creatorId: "c1" });
+    seedLand(ctx.ledger, "winner", 1_000);
+    seedLand(ctx.ledger, "loser", 1_000);
+    ctx.markets.betEventLand(m.id, "winner", [ROLE_A], 0, 500, opId());
+    ctx.markets.betEventLand(m.id, "loser", [ROLE_A], 1, 300, opId());
+    ctx.markets.close(m.id, "c1");
+
+    const op = opId();
+    ctx.markets.reportAndSettleEventLand(m.id, "c1", 0, op, false); // actor="c1" が先に確定
+    const winnerBalAfterFirst = ctx.ledger.balanceOf("user:winner");
+    const opsCountBefore = (ctx.db.prepare("SELECT COUNT(*) AS c FROM event_market_ops").get() as { c: number }).c;
+
+    let caught: unknown;
+    try {
+      // actor="admin" が同じoperationIdを再利用（isAdmin=trueで正規の権限を持っていても、
+      // actor不一致は fn() 実行前の replayExisting() で弾かれる）
+      ctx.markets.reportAndSettleEventLand(m.id, "admin", 0, op, true);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(MarketError);
+    expect((caught as MarketError).code).toBe("ERR_OPERATION_CONFLICT");
+
+    expect(ctx.markets.get(m.id)!.status).toBe("settled"); // 既にsettled・変化なし
+    expect(ctx.ledger.balanceOf("user:winner")).toBe(winnerBalAfterFirst); // 二重配当されない
+    const opsCountAfter = (ctx.db.prepare("SELECT COUNT(*) AS c FROM event_market_ops").get() as { c: number }).c;
+    expect(opsCountAfter).toBe(opsCountBefore); // 新しい行は作られていない
+  });
 });
 
 describe("通常板（ChipLedger決済）の回帰", () => {
