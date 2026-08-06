@@ -75,6 +75,11 @@ export function registerDefaultTxTypes(): void {
   // 賭け系（新カジノ実装用に汎用型として保持・未成年ゲート対象）
   registerTxType("bet", { fromKinds: ["user"], toKinds: ["system"], minorBlocked: true });
   registerTxType("prize", { fromKinds: ["system"], toKinds: ["user"], minorBlocked: true });
+  // イベント板（Land決済・板 → 手数料escrow）の場代3%専用型。
+  // system→system の資金移動は bet（user→system）でも prize（system→user）でも表現できないため、
+  // 「イベント板の Land escrow → sys:escrow:market:fees への場代掃き出し」専用にこれだけ追加する。
+  // 賭け金の徴収・返金・配当はすべて既存の bet/prize を使い分け、新設はこの1型だけに限定する。
+  registerTxType("market_house_fee", { fromKinds: ["system"], toKinds: ["system"] });
 
   // 旧エテル為替（変動レート・二割奉納・焼却）の**歴史データ専用**の型（PR8監査・項目9）。
   // PR8 以降このボットが新しく作ることはなく、legacy_pre_reset の窓に残る過去の行を
