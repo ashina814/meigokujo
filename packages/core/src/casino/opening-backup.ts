@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type Database from "better-sqlite3";
 import {
   canonicalHash,
+  canonicalStringify,
   schemaFingerprint,
   sha256Hex,
   tableColumns,
@@ -398,6 +399,27 @@ export function verifyOpeningBackupFilesOnDisk(
 ): FileBackupVerificationResult {
   const problems: string[] = [];
   const prefix = `casino-opening-${manifest.planHash}`;
+
+  // manifest自体もディスク上の実体として存在し、保持しているmanifestオブジェクトと
+  // 一致することを確認する（PR12監査ブロッカーC: resume時の永続backup再検証）。
+  // manifest.jsonが削除・改竄されていても、実行中プロセスはDBに保存済みの
+  // backupManifest列（インメモリのJSオブジェクト）だけを見て「検証済み」と誤認しうるため、
+  // ディスク上の実ファイルも独立して確認する。
+  const manifestPath = join(directory, `${prefix}-manifest.json`);
+  if (!existsSync(manifestPath)) {
+    problems.push(`manifestファイルが存在しない: ${manifestPath}`);
+  } else if (statSync(manifestPath).size === 0) {
+    problems.push(`manifestファイルが空: ${manifestPath}`);
+  } else {
+    try {
+      const onDisk = JSON.parse(readFileSync(manifestPath, "utf8")) as OpeningBackupManifest;
+      if (canonicalStringify(onDisk) !== canonicalStringify(manifest)) {
+        problems.push(`manifestファイルの内容が保持しているmanifestと一致しない: ${manifestPath}`);
+      }
+    } catch {
+      problems.push(`manifestファイルのJSONが不正: ${manifestPath}`);
+    }
+  }
 
   const sqlitePath = join(directory, `${prefix}.sqlite`);
   if (!existsSync(sqlitePath)) {

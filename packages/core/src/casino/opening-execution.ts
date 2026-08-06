@@ -42,14 +42,21 @@ const ALLOWED_TRANSITIONS: Record<OpeningExecutionStatus, readonly OpeningExecut
   opening_reset_acquired: ["backup_started", "failed"],
   backup_started: ["backup_verified", "failed"],
   backup_verified: ["external_started", "failed"],
-  external_started: ["external_completed", "failed"],
-  // 外部工程(R3相当)完了後にplanがstaleと判明した場合だけ manual_review_required へ倒す
+  // external_started → manual_review_required（PR12監査ブロッカーC）: resume時の永続backup
+  // 再検証に失敗した場合。外部工程が実行された可能性がある状態から、DB資金を動かさず・
+  // 外部工程を再実行せず、手動判断が必要な状態として報告する。
+  external_started: ["external_completed", "failed", "manual_review_required"],
+  // 外部工程(R3相当)完了後にplanがstaleと判明した場合、またはresume時の永続backup再検証に
+  // 失敗した場合（PR12監査ブロッカーC）に manual_review_required へ倒す
   // （CLAUDE.md §8: 外部工程は既に完了しているので、DB資金を動かさず・外部工程を再実行せず、
   //   手動判断が必要な状態として報告する。単純な failed→再挑戦にすると外部工程が二重実行されうる）
   external_completed: ["applying", "failed", "manual_review_required"],
   // applying → failed はCOMMIT前の失敗（SQLiteトランザクション自体が丸ごとrollbackされている）
   // 場合だけを意味する。COMMIT後に失敗したことが分かった場合は必ず applied を経由する。
-  applying: ["applied", "failed"],
+  // applying → manual_review_required（PR12監査ブロッカーC）: R6直前の永続backup再検証に
+  // 失敗した場合。COMMIT前なので資金は未確定のままだが、外部工程は既に完了しているため
+  // 単純な再挑戦（failed）にはせず、手動判断が必要な状態として報告する。
+  applying: ["applied", "failed", "manual_review_required"],
   applied: ["post_commit_pending", "manual_review_required"],
   post_commit_pending: ["completed", "manual_review_required"],
   // 資金未確定(fundsApplied=false)の failed だけが再挑戦を許される。
