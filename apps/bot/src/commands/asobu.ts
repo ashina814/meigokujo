@@ -12,7 +12,7 @@ import { playHoldem } from "../casino/holdem.js";
 
 /**
  * /遊ぶ — マモンの賭場の全ソロゲーム集約コマンド（casino-bot の /遊ぶ 方式）。
- * 賭けはすべてエテル建て。両替はマモンの両替所パネルで。
+ * 賭けはすべてLand建て。入退場はゲーム開始時の自動預入・「賭場を出る」ボタンで。
  *
  * **`setMaxValue` は付けない（PR3）。** 上限は利用者ごとに違う（VIP は ×2）のに、
  * スラッシュコマンドの定義は全員共通で1つしか持てない。`MAX_BET` を焼き込むと
@@ -21,14 +21,14 @@ import { playHoldem } from "../casino/holdem.js";
  */
 export const asobuCommand = new SlashCommandBuilder()
   .setName("遊ぶ")
-  .setDescription("🎰 マモンの賭場で遊ぶ（エテル建て）")
+  .setDescription("🎰 マモンの賭場で遊ぶ（Land建て）")
   .setDMPermission(false)
   .addSubcommand((sub) =>
     sub
       .setName("スロット")
       .setDescription("🎰 スロットを回す（JPは😈マモン3つ揃い）")
       .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるエテル").setRequired(true).setMinValue(MIN_BET),
+        o.setName("賭け").setDescription("賭けるLand").setRequired(true).setMinValue(MIN_BET),
       ),
   )
   .addSubcommand((sub) =>
@@ -36,7 +36,7 @@ export const asobuCommand = new SlashCommandBuilder()
       .setName("丁半")
       .setDescription("🎲 丁半 — 丁（偶数）か半（奇数）か")
       .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるエテル").setRequired(true).setMinValue(MIN_BET),
+        o.setName("賭け").setDescription("賭けるLand").setRequired(true).setMinValue(MIN_BET),
       ),
   )
   .addSubcommand((sub) =>
@@ -44,7 +44,7 @@ export const asobuCommand = new SlashCommandBuilder()
       .setName("クラッシュ")
       .setDescription("📈 クラッシュ — 崩壊する前に離脱しろ")
       .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるエテル").setRequired(true).setMinValue(MIN_BET),
+        o.setName("賭け").setDescription("賭けるLand").setRequired(true).setMinValue(MIN_BET),
       ),
   )
   .addSubcommand((sub) =>
@@ -52,7 +52,7 @@ export const asobuCommand = new SlashCommandBuilder()
       .setName("チンチロ")
       .setDescription("🎲 チンチロ — マモンと3つのサイコロで勝負")
       .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるエテル").setRequired(true).setMinValue(MIN_BET),
+        o.setName("賭け").setDescription("賭けるLand").setRequired(true).setMinValue(MIN_BET),
       ),
   )
   .addSubcommand((sub) =>
@@ -63,7 +63,7 @@ export const asobuCommand = new SlashCommandBuilder()
       .setName("ブラックジャック")
       .setDescription("🃏 ブラックジャック — マモンと21勝負")
       .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるエテル").setRequired(true).setMinValue(MIN_BET),
+        o.setName("賭け").setDescription("賭けるLand").setRequired(true).setMinValue(MIN_BET),
       ),
   )
   .addSubcommand((sub) =>
@@ -71,7 +71,7 @@ export const asobuCommand = new SlashCommandBuilder()
       .setName("ポーカー")
       .setDescription("🃏 ドローポーカー（Jacks or Better・ロイヤル250倍）")
       .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるエテル").setRequired(true).setMinValue(MIN_BET),
+        o.setName("賭け").setDescription("賭けるLand").setRequired(true).setMinValue(MIN_BET),
       ),
   )
   .addSubcommand((sub) =>

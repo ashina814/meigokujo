@@ -99,7 +99,7 @@ function paytableEmbed(): EmbedBuilder {
         `　 (プールは賭金の ${JP_CONTRIBUTION * 100}% を毎回積立)`,
         "",
         "**⚖️ 福の重み**",
-        "　残高が多いほど勝ち利益から累進奉納（0/5/10/20/30%）。半分は JP・半分は救済プールへ",
+        "　チップ残高が多いほど勝ち利益から累進積立（0/5/10/20/30%）。半分は JP・半分は救済プールへ",
         "**🔥 連鎖**",
         "　2連勝目から倍率が乗る（最大 ×2.0）。連敗でリセット",
       ].join("\n"),
@@ -131,8 +131,8 @@ function buildSpinEmbed(
     .setDescription(face(slots[0], slots[1], slots[2]))
     .setFooter({
       text: [
-        isFreeSpin ? "ベット: 無料" : `ベット ${fmtEther(bet).replace(" ◈", "◈")}`,
-        `JP ${fmtEther(jp).replace(" ◈", "◈")}${jpHigh ? " 🔥" : ""}`,
+        isFreeSpin ? "ベット: 無料" : `ベット ${fmtEther(bet).replace(" Ld", "Ld")}`,
+        `JP ${fmtEther(jp).replace(" Ld", "Ld")}${jpHigh ? " 🔥" : ""}`,
       ].join(" · "),
     });
 }
@@ -599,7 +599,7 @@ async function renderSpin(
   const color = isJp ? 0xf0b429 : bigWin ? 0x16a34a : won ? 0x22c55e : 0x991b1b;
 
   const tag = isJp ? "💎 JACKPOT!" : bigWin ? "🔥 大勝ち" : won ? "🟢 勝ち" : "🔴 ハズレ";
-  const netStr = net === 0 ? "±0 ◈" : `${net > 0 ? "+" : "−"}${Math.abs(net).toLocaleString("ja-JP")} ◈`;
+  const netStr = net === 0 ? "±0 Ld" : `${net > 0 ? "+" : "−"}${Math.abs(net).toLocaleString("ja-JP")} Ld`;
 
   const bonusBits: string[] = [];
   if (settled && settled.chainBonus > 0) {
@@ -623,10 +623,10 @@ async function renderSpin(
     )
     .setFooter({
       text: [
-        `所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" ◈", "◈")}`,
-        !isFreeSpin ? `賭け ${fmtEther(bet).replace(" ◈", "◈")}` : "無料",
+        `所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" Ld", "Ld")}`,
+        !isFreeSpin ? `賭け ${fmtEther(bet).replace(" Ld", "Ld")}` : "無料",
         winStreak >= 2 ? `🔥 ${winStreak}連勝` : "",
-        `JP ${fmtEther(services.casino.jackpotPool()).replace(" ◈", "◈")}`,
+        `JP ${fmtEther(services.casino.jackpotPool()).replace(" Ld", "Ld")}`,
       ].filter(Boolean).join(" · "),
     });
   // 大勝ち速報

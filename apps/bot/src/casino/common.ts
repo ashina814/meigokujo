@@ -20,8 +20,9 @@ import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
 import { C_BIGWIN, C_LOSE, C_MAMMON, C_PUSH, C_WIN, E, fmtBigDelta } from "./ui.js";
 
-export const MIN_BET = 50;
-export const MAX_BET = 1_000_000;
+/** PR13: 旧チップ時代の賭け額を1/10へ。利用者画面の単位はLandのみ。 */
+export const MIN_BET = 5;
+export const MAX_BET = 100_000;
 
 /** 設定上の賭け上限（VIP なら倍率を掛ける）。胴元の余力は見ない */
 export function configuredMaxBet(services: Services, userId: string): number {
@@ -90,7 +91,7 @@ export interface BetCheck {
  * 賭けの共通前処理。座席確保はしない（呼び出し側で）。
  *
  * - bet の整数/範囲チェック
- * - 残高チェック（不足ならマモンが両替所へ誘導）
+ * - 残高チェック（不足分は自動預入で補う。それでも足りなければ断る）
  * - テーブルリミット（胴元がこの賭けの**純債務**を予約できるか）
  *
  * NG のときは reply 済みで ok:false を返す。
@@ -122,7 +123,7 @@ export async function validateBet(
     interaction.replied || interaction.deferred ? interaction.followUp(payload) : interaction.reply(payload);
   if (!Number.isInteger(bet) || bet < MIN_BET || bet > cap) {
     await respond({
-      content: `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
+      content: `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} Ld で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
       flags: MessageFlags.Ephemeral,
     });
     return { ok: false, bet };
@@ -186,7 +187,7 @@ export function capacityRecoveryPayload(
     };
   }
   const content = [
-    `⚠️ いまこの卓で受けられるのは **${maxAcceptable.toLocaleString()} ◈** まで。`,
+    `⚠️ いまこの卓で受けられるのは **${maxAcceptable.toLocaleString()} Ld** まで。`,
     "（他の客が大きく張っている。下のどれかなら必ず通る）",
   ].join("\n");
   if (!game) return { content, components: [] };
@@ -460,8 +461,8 @@ export function checkRetry(services: Services, userId: string, betRaw: number, g
     return {
       ok: false,
       reason: capped
-        ? `いまこの卓で受けられるのは ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ まで。（他の客が大きく張っている）`
-        : `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} ◈ で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
+        ? `いまこの卓で受けられるのは ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} Ld まで。（他の客が大きく張っている）`
+        : `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} Ld で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
     };
   }
   try {
@@ -579,8 +580,8 @@ export function resultEmbed(opts: {
 
   const mammonLine = opts.isJackpot ? Mammon.jackpot() : bigWin ? Mammon.bigWin() : won ? Mammon.win() : push ? Mammon.push() : Mammon.lose();
 
-  const footerBits = [`所持 ${fmtEther(opts.balance).replace(" ◈", "◈")}`];
-  if (opts.bet) footerBits.push(`賭け ${fmtEther(opts.bet).replace(" ◈", "◈")}`);
+  const footerBits = [`所持 ${fmtEther(opts.balance).replace(" Ld", "Ld")}`];
+  if (opts.bet) footerBits.push(`賭け ${fmtEther(opts.bet).replace(" Ld", "Ld")}`);
   if (opts.streak && opts.streak >= 2) footerBits.push(`${E.fire} ${opts.streak}連勝`);
 
   return new EmbedBuilder()

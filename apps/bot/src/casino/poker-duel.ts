@@ -167,7 +167,7 @@ export async function playPokerDuel(
 ): Promise<void> {
   const uid = interaction.user.id;
   if (bet < MIN_BET || bet > MAX_BET) {
-    await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} Ld で。`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (opponent && (opponent.bot || opponent.id === uid)) {
@@ -175,7 +175,7 @@ export async function playPokerDuel(
     return;
   }
   if (services.chips.balanceOf(uid) < bet) {
-    await interaction.reply({ content: "自分のエテル残高が足りない。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "自分のLand残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -201,7 +201,7 @@ export async function playPokerDuel(
   } else {
     // オープン: host は自動参加でエスクロー
     if (!collectStakes(services, [uid], bet, `${id}:collect:${uid}`, id, "poker-duel")) {
-      await interaction.reply({ content: "エテル徴収に失敗した。", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Land徴収に失敗した。", flags: MessageFlags.Ephemeral });
       return;
     }
     session.players.set(uid, { hand: [], discardDone: false });
@@ -262,7 +262,7 @@ function buildSashiInvite(s: Session, opponentId: string): EmbedBuilder {
   return new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · ポーカー" })
     .setColor(C_MAMMON)
-    .setTitle(`🃏  サシ勝負  ·  ${fmtEther(s.bet).replace(" ◈", "◈")}`)
+    .setTitle(`🃏  サシ勝負  ·  ${fmtEther(s.bet).replace(" Ld", "Ld")}`)
     .setDescription(
       [
         `<@${s.hostId}> が <@${opponentId}> にポーカーを挑んだ。`,
@@ -291,10 +291,10 @@ function buildOpenLobby(s: Session): EmbedBuilder {
   return new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · ポーカー" })
     .setColor(C_MAMMON)
-    .setTitle(`🃏  オープン募集  ·  ${fmtEther(s.bet).replace(" ◈", "◈")}`)
+    .setTitle(`🃏  オープン募集  ·  ${fmtEther(s.bet).replace(" Ld", "Ld")}`)
     .setDescription(
       [
-        `立て主: <@${s.hostId}>  ·  参加費: **${fmtEther(s.bet).replace(" ◈", "◈")}**`,
+        `立て主: <@${s.hostId}>  ·  参加費: **${fmtEther(s.bet).replace(" Ld", "Ld")}**`,
         "",
         `参加者（${players.length}/${MAX_OPEN}人）:`,
         players.length === 0 ? "　（まだいない）" : players.map((p) => `　・<@${p}>`).join("\n"),
@@ -352,7 +352,7 @@ async function sashiAccept(interaction: ButtonInteraction, services: Services, s
   }
   // 両者から徴収
   if (!collectStakes(services, [s.hostId, s.opponentId], s.bet, `${s.id}:collect:duel`, s.id, "poker-duel")) {
-    await interaction.reply({ content: "どちらかのエテル残高が足りない。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "どちらかのLand残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }
   s.players.set(s.hostId, { hand: [], discardDone: false });
@@ -401,7 +401,7 @@ async function openJoin(interaction: ButtonInteraction, services: Services, s: S
     return;
   }
   if (services.chips.balanceOf(uid) < s.bet) {
-    await interaction.reply({ content: "エテル残高が足りない。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "Land残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }
   if (!collectStakes(services, [uid], s.bet, `${s.id}:collect:${uid}`, s.id, "poker-duel")) {
@@ -507,10 +507,10 @@ function buildDealtPanel(s: Session): EmbedBuilder {
   return new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · ポーカー" })
     .setColor(C_MAMMON)
-    .setTitle(`🎴  配布完了  ·  Pot ${fmtEther(pot).replace(" ◈", "◈")}`)
+    .setTitle(`🎴  配布完了  ·  Pot ${fmtEther(pot).replace(" Ld", "Ld")}`)
     .setDescription(
       [
-        `参加 ${players.length}人  ·  賭け ${fmtEther(s.bet).replace(" ◈", "◈")}  ·  場代 ${Math.round(RAKE_PCT * 100)}%`,
+        `参加 ${players.length}人  ·  賭け ${fmtEther(s.bet).replace(" Ld", "Ld")}  ·  場代 ${Math.round(RAKE_PCT * 100)}%`,
         "",
         players.map(([uid, p]) => `${p.discardDone ? "✋ 確定" : "…待機"}  <@${uid}>`).join("\n"),
         "",
@@ -681,10 +681,10 @@ async function postResult(
     .setColor(isJp ? C_JACKPOT : C_WIN)
     .setTitle(
       isJp
-        ? `💎  ${winners[0]!.ev.label}！  ·  Pot ${fmtEther(totalPot).replace(" ◈", "◈")}`
+        ? `💎  ${winners[0]!.ev.label}！  ·  Pot ${fmtEther(totalPot).replace(" Ld", "Ld")}`
         : winners.length === 1
-          ? `🏆  <@${winners[0]!.userId}> の勝利  ·  Pot ${fmtEther(totalPot).replace(" ◈", "◈")}`
-          : `🤝  ${winners.length}人で同役  ·  Pot ${fmtEther(totalPot).replace(" ◈", "◈")}`,
+          ? `🏆  <@${winners[0]!.userId}> の勝利  ·  Pot ${fmtEther(totalPot).replace(" Ld", "Ld")}`
+          : `🤝  ${winners.length}人で同役  ·  Pot ${fmtEther(totalPot).replace(" Ld", "Ld")}`,
     );
   const lines = entries.map((e) => {
     const won = winners.includes(e);
@@ -695,8 +695,8 @@ async function postResult(
   embed.setFooter({
     text:
       winners.length === 1
-        ? `場代 ${fmtEther(houseCut).replace(" ◈", "◈")} → JPプール  ·  勝者総取り`
-        : `場代 ${fmtEther(houseCut).replace(" ◈", "◈")} → JPプール  ·  ${winners.length}人で均等分配`,
+        ? `場代 ${fmtEther(houseCut).replace(" Ld", "Ld")} → JPプール  ·  勝者総取り`
+        : `場代 ${fmtEther(houseCut).replace(" Ld", "Ld")} → JPプール  ·  ${winners.length}人で均等分配`,
   });
   const mentions = winners.map((w) => w.userId);
   await editMessage(client, s, {
