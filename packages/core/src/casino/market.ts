@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
 import { ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 import { JACKPOT_HOLDER } from "./service.js";
+import { Ledger } from "../ledger/service.js";
 
 /**
  * 賭場の板（公開賭け市場・casino-bot 完全準拠版）。
@@ -33,6 +34,29 @@ const now = () => Math.floor(Date.now() / 1000);
 export const marketEscrowHolder = (id: number): string => `escrow:market:${id}`;
 
 /**
+ * イベントLand板（緊急イベント用・PR12とは独立の hotfix）の設計。
+ *
+ * 通常板の資金は `ChipLedger`（賭場チップ・別台帳・別 holder 名前空間・opening lock 対象）を通す。
+ * イベント板は Land 決済で、生の `Ledger`（packages/core/src/ledger/service.ts）を直接使う。
+ * 通貨も台帳もホルダー名前空間も完全に分離し、混同を防ぐため命名を変える:
+ *   - 通常板: `escrow:market:<id>`（ChipLedger 保有者・sys: 接頭辞なし）
+ *   - イベント板: `sys:escrow:market:<id>`（生 Ledger の system 口座・sys: 接頭辞あり）
+ * この2つは別の台帳・別のテーブル（chip_accounts 系 / accounts）に属する別物であり、
+ * 文字列が似ていても混同してはいけない。
+ */
+export const eventMarketEscrowHolder = (id: number): string => `sys:escrow:market:${id}`;
+/** イベント板の手数料・場代の一時保管口座。ここから国庫・部署等への送金は今回のPRでは行わない（所有先は本線PRで決定）。 */
+export const EVENT_MARKET_FEES_HOLDER = "sys:escrow:market:fees";
+/** イベント板の開設手数料（Ld）。通常板の DEFAULT_FEE とは別の値として明示管理する。 */
+export const EVENT_MARKET_CREATE_FEE = 500;
+/** イベント板: 個人の1口上限（張り直し後の合計額として判定・Ld）。 */
+export const EVENT_MARKET_PERSONAL_CAP = 100_000;
+/** イベント板: 板全体のpot上限（Ld）。 */
+export const EVENT_MARKET_POT_CAP = 900_000;
+/** イベント板が受け付ける選択肢の最大数。通常板は 4 のまま変更しない。 */
+export const EVENT_MARKET_MAX_OPTIONS = 32;
+
+/**
  * 起動時の復旧で「返してはいけない」板のエスクロー保有者（PR7・正本 §8.1）。
  *
  * frozen も含める。返金に失敗して調査待ちの板は、所有者情報が `casino_market_bets` に
@@ -56,6 +80,15 @@ export type PayoutMode = "parimutuel" | "winner_take_all";
  * - "legacy_house": 分離前の既存板。賭け金は house 直接。新規ベット禁止・起動時返金のみ。
  */
 export type MarketFundMode = "escrow" | "legacy_house";
+/**
+ * 板の種別。既存行はすべて 'standard'（通常板・ChipLedger決済）として扱う。
+ * 'event' はイベント専用板（Land決済・ロール制限・承認なし即時精算）。
+ */
+export type MarketMode = "standard" | "event";
+/** 精算の承認方式。'participant'=既存の参加者承認/異議、'instant'=本人最終確認のみで即時精算。 */
+export type ApprovalMode = "participant" | "instant";
+/** 板の決済通貨。'chip'=賭場チップ（ChipLedger）、'land'=生Land（Ledger）。 */
+export type CurrencyMode = "chip" | "land";
 
 export interface Market {
   id: number;
@@ -75,6 +108,14 @@ export interface Market {
   settled_at: number | null;
   fund_mode: MarketFundMode;
   created_at: number;
+  /** 板の種別。旧行は 'standard'。 */
+  market_mode: MarketMode;
+  /** イベント板の参加許可ロールID（Discord snowflake）のJSON配列。旧行・通常板は '[]'。 */
+  allowed_role_ids_json: string;
+  /** 精算の承認方式。旧行・通常板は 'participant'。イベント板は 'instant'。 */
+  approval_mode: ApprovalMode;
+  /** 決済通貨。旧行・通常板は 'chip'。イベント板は 'land'。 */
+  currency_mode: CurrencyMode;
 }
 export interface MarketBet {
   market_id: number;
@@ -103,7 +144,24 @@ export type MarketErrorCode =
   | "ERR_BAD_MODE"
   | "ERR_UNDERFUNDED_ESCROW"
   | "ERR_ESCROW_MISMATCH"
-  | "ERR_LEGACY_BET_FORBIDDEN";
+  | "ERR_LEGACY_BET_FORBIDDEN"
+  // ── イベントLand板専用 ──
+  /** イベント板の bet を、指定ロールをどれも持たない利用者が試みた */
+  | "ERR_ROLE_NOT_ALLOWED"
+  /** 参加ロール指定が 1〜5個・重複除去後の形式を満たさない */
+  | "ERR_BAD_ROLE_LIST"
+  /** イベント板専用APIを通常板（またはその逆）へ使おうとした */
+  | "ERR_NOT_EVENT_MARKET"
+  /** Markets に landLedger（生Ledger）が注入されていない状態でイベント板APIを呼んだ */
+  | "ERR_LAND_LEDGER_NOT_CONFIGURED"
+  /** Land残高が足りない（ChipLedgerのERR_INSUFFICIENT_ETHERとは別コード） */
+  | "ERR_INSUFFICIENT_LAND"
+  /** 個人の1口上限（張り直し後合計）を超える */
+  | "ERR_PERSONAL_CAP_EXCEEDED"
+  /** 板全体のpot上限を超える */
+  | "ERR_POT_CAP_EXCEEDED"
+  /** 同じ operationId を別の市場・種別で再利用しようとした（event_market_ops の鍵衝突） */
+  | "ERR_OPERATION_CONFLICT";
 export class MarketError extends Error {
   constructor(readonly code: MarketErrorCode, readonly meta: Record<string, unknown> = {}) {
     super(code);
@@ -124,10 +182,21 @@ export interface MarketsOptions {
    * `settle()` の資金グループの中から呼ばれるので、再試行で二度は呼ばれない。
    */
   onPlayerNet?: (userId: string, net: number) => void;
+  /**
+   * イベントLand板が資金を動かすのに使う、生の `Ledger`（Land・packages/core/src/ledger/service.ts）。
+   *
+   * 通常板の資金は一切これを経由しない（`ether: ChipLedger` のみを使い続ける）。
+   * 未指定のままイベント板専用APIを呼ぶと `ERR_LAND_LEDGER_NOT_CONFIGURED` で fail-closed する。
+   * casino chip 経済の開業ロック（legacy_pre_reset / opening_v1）・稼働状態（casinoStatus）は
+   * 生 Ledger には存在しない別レイヤーの概念であり、イベント板の Land 決済はこれらの影響を受けない
+   * （意図的な設計判断。他の給与・VC報酬などの Land 取引と同じ扱い）。
+   */
+  landLedger?: Ledger;
 }
 
 export class Markets {
   private readonly onPlayerNet: (userId: string, net: number) => void;
+  private readonly landLedger: Ledger | undefined;
 
   constructor(
     private readonly db: Database.Database,
@@ -136,6 +205,7 @@ export class Markets {
     options: MarketsOptions = {},
   ) {
     this.onPlayerNet = options.onPlayerNet ?? (() => undefined);
+    this.landLedger = options.landLedger;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS casino_markets (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,9 +246,33 @@ export class Markets {
     // 資金源を DB に明示。既存の板は 'legacy_house'（分離前データ）として扱う。
     // 起動時 refundAllPending() で返金・void 化されるので、以降 legacy は残らないのが正常。
     this.addColumnIfMissing("casino_markets", "fund_mode", "TEXT NOT NULL DEFAULT 'legacy_house'");
+    // イベントLand板（緊急イベント用 hotfix）。既存行はすべて次の既定値で扱う:
+    //   market_mode='standard' / currency_mode='chip' / approval_mode='participant' / allowed_role_ids_json='[]'
+    // これにより通常板の既存データ・fund_mode・Chip escrow は一切変更しない。
+    this.addColumnIfMissing("casino_markets", "market_mode", "TEXT NOT NULL DEFAULT 'standard'");
+    this.addColumnIfMissing("casino_markets", "allowed_role_ids_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumnIfMissing("casino_markets", "approval_mode", "TEXT NOT NULL DEFAULT 'participant'");
+    this.addColumnIfMissing("casino_markets", "currency_mode", "TEXT NOT NULL DEFAULT 'chip'");
     // 旧 DB は status に古い CHECK 制約（'disputed'/'frozen' を含まない）が付いている場合がある。
     // SQLite は CHECK を ALTER で変更できないため、必要ならテーブルを作り直して制約を外す。
+    // ここより前に上の addColumnIfMissing がすべて完了している必要がある
+    // （移行後の再構築テーブルは、その時点で存在する列だけを明示コピーするため）。
     this.migrateStatusCheckConstraint();
+
+    // イベントLand板の冪等性・原子性テーブル（PR12とは独立のhotfix・正本は追加アーキ指針§B）。
+    // create/bet/settle/void の全 Land 資金操作を runEventOp() でここへ記録する。
+    // 既存の casino_markets 等と同じ場所・同じ流儀（CREATE TABLE IF NOT EXISTS）で冪等に作る。
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS event_market_ops (
+        operation_id TEXT PRIMARY KEY,
+        market_id    INTEGER NOT NULL,
+        kind         TEXT NOT NULL CHECK(kind IN ('create','bet','settle','void')),
+        actor_id     TEXT NOT NULL,
+        result_json  TEXT NOT NULL,
+        created_at   INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_event_market_ops_market ON event_market_ops(market_id, kind);
+    `);
   }
 
   /**
@@ -226,16 +320,31 @@ export class Markets {
           reported_at    INTEGER,
           settled_at     INTEGER,
           fund_mode      TEXT NOT NULL DEFAULT 'legacy_house',
+          market_mode    TEXT NOT NULL DEFAULT 'standard',
+          allowed_role_ids_json TEXT NOT NULL DEFAULT '[]',
+          approval_mode  TEXT NOT NULL DEFAULT 'participant',
+          currency_mode  TEXT NOT NULL DEFAULT 'chip',
           created_at     INTEGER NOT NULL
         );
       `);
+      // この時点で market_mode 等の列がまだ無ければ（addColumnIfMissing 実行前に呼ばれた場合）
+      // SELECT が失敗する。呼び出し順序はコンストラクタで固定しているが、fail-closed のため
+      // 列の存在を明示確認してから SELECT 文を組み立てる。
+      const hasEventColumns = (this.db.prepare("PRAGMA table_info(casino_markets)").all() as Array<{ name: string }>).some(
+        (c) => c.name === "market_mode",
+      );
+      const eventCols = hasEventColumns
+        ? "market_mode, allowed_role_ids_json, approval_mode, currency_mode"
+        : "'standard' AS market_mode, '[]' AS allowed_role_ids_json, 'participant' AS approval_mode, 'chip' AS currency_mode";
       this.db.exec(`
         INSERT INTO casino_markets_new
           (id, guild_id, creator_id, title, options_json, deadline_at, status, result_option,
-           channel_id, message_id, thread_id, payout_mode, fee, reported_at, settled_at, fund_mode, created_at)
+           channel_id, message_id, thread_id, payout_mode, fee, reported_at, settled_at, fund_mode,
+           market_mode, allowed_role_ids_json, approval_mode, currency_mode, created_at)
         SELECT
            id, guild_id, creator_id, title, options_json, deadline_at, status, result_option,
-           channel_id, message_id, thread_id, payout_mode, fee, reported_at, settled_at, fund_mode, created_at
+           channel_id, message_id, thread_id, payout_mode, fee, reported_at, settled_at, fund_mode,
+           ${eventCols}, created_at
         FROM casino_markets;
       `);
       this.db.exec("DROP TABLE casino_markets");
@@ -584,6 +693,12 @@ export class Markets {
 
   /**
    * 異議ウィンドウ経過（scheduler tick）で自動精算。既に精算 or 異議が入ってたら no-op。
+   *
+   * イベントLand板（market_mode='event'）は `reported` へ一切遷移しない設計
+   * （closed → 本人確認後に直接 settled/void。`reportAndSettleEventLand()` 参照）。
+   * そのため `listPastDisputeWindow()`（status='reported' のみ対象）にも
+   * この `finalizeIfNoDispute()` にも、イベント板は構造上出現しない。
+   * 追加のフィルタリングは不要（念のためここに明記する）。
    */
   finalizeIfNoDispute(id: number): MarketSettleResult | null {
     const m = this.get(id);
@@ -777,9 +892,12 @@ export class Markets {
    * 掃除の側が `casino_markets` を直接読むのをやめ、**所有元が自分で申告する**形にする。
    */
   liveEscrowHolders(): string[] {
+    // market_mode='standard' に限定する（PR12とは独立のhotfix・追加アーキ指針§D）。
+    // イベント板の Land escrow（sys:escrow:market:<id>、生Ledger所属）は ChipLedger の
+    // 孤児検出とは完全に別経済圏なので、ここへ含めない（別途 auditPendingEventLand() が扱う）。
     const placeholders = MARKET_LIVE_STATUSES.map(() => "?").join(",");
     const rows = this.db
-      .prepare(`SELECT id FROM casino_markets WHERE status IN (${placeholders})`)
+      .prepare(`SELECT id FROM casino_markets WHERE market_mode = 'standard' AND status IN (${placeholders})`)
       .all(...MARKET_LIVE_STATUSES) as Array<{ id: number }>;
     return rows.map((r) => marketEscrowHolder(r.id));
   }
@@ -790,8 +908,11 @@ export class Markets {
     frozen: number;
     failed: Array<{ id: number; error: string }>;
   } {
+    // market_mode='standard' に限定する。イベント板（Land・別台帳）は
+    // auditPendingEventLand()（通常起動）/ adminRefundAllPendingEventLand()（明示的な管理者操作）
+    // が別経路で扱う（chip 側の this.refund() を通さない）。
     const rows = this.db
-      .prepare("SELECT id FROM casino_markets WHERE status IN ('open','closed','reported','disputed')")
+      .prepare("SELECT id FROM casino_markets WHERE market_mode = 'standard' AND status IN ('open','closed','reported','disputed')")
       .all() as Array<{ id: number }>;
     let refunded = 0;
     let frozen = 0;
@@ -821,6 +942,637 @@ export class Markets {
       }
     }
     return { total: rows.length, refunded, frozen, failed };
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // イベントLand板（緊急イベント用 hotfix・PR12とは独立）
+  //
+  // 通常板（上のメソッド群）は一切変更していない。以下はすべて
+  // market_mode='event' の板だけを対象にする新しい経路で、資金は必ず
+  // 生の Ledger（landLedger）を通す（ChipLedger は一切使わない）。
+  // ══════════════════════════════════════════════════════════════════
+
+  private requireLandLedger(): Ledger {
+    if (!this.landLedger) throw new MarketError("ERR_LAND_LEDGER_NOT_CONFIGURED");
+    return this.landLedger;
+  }
+
+  /** 参加ロールIDの正規化: 空白除去・空値除去・重複除去（順序保持）。1〜5個でなければ拒否。 */
+  private normalizeRoleIds(raw: string[]): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const r of raw) {
+      const id = typeof r === "string" ? r.trim() : "";
+      if (!id || !/^\d{1,32}$/.test(id)) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+    }
+    if (out.length < 1 || out.length > 5) {
+      throw new MarketError("ERR_BAD_ROLE_LIST", { count: out.length, raw });
+    }
+    return out;
+  }
+
+  /**
+   * イベントLand板の資金操作（create/bet/settle/void）を冪等・原子的に包む共通ヘルパー
+   * （追加アーキ指針§B）。
+   *
+   * - 同じ operationId が既にあれば、**現在のDB状態を一切読み直さず**保存済みの結果をそのまま返す。
+   *   これが「現在の bet 行を『旧ベット』と誤認して返金処理を組み直す」問題を構造的に防ぐ。
+   * - 同じ operationId を別の market_id / kind で再利用したら ERR_OPERATION_CONFLICT。
+   * - `fn()` は `this.db.transaction()` の中で実行される。内部で呼ぶ `landLedger.transfer()` は
+   *   それぞれ自前で `db.transaction()` を開くが、better-sqlite3 は同一接続上のネストした
+   *   `Database.transaction()` 呼び出しを SAVEPOINT として正しく扱うため、`fn()` の途中で
+   *   例外が飛べば SAVEPOINT を含めて丸ごと rollback される（片方だけ確定した窓を作らない）。
+   * - `result_json` を書き込む前に例外が飛べば `event_market_ops` には何も残らない。
+   *   次の同じ operationId での呼び出しはまっさらな状態から再実行される。
+   */
+  private runEventOp<T>(
+    operationId: string,
+    marketId: number,
+    kind: "create" | "bet" | "settle" | "void",
+    actorId: string,
+    fn: () => T,
+  ): T {
+    if (typeof operationId !== "string" || operationId.trim().length === 0) {
+      throw new MarketError("ERR_BAD_AMOUNT", { operationId });
+    }
+    const replayExisting = (): T | undefined => {
+      const existing = this.db
+        .prepare("SELECT market_id, kind, actor_id, result_json FROM event_market_ops WHERE operation_id = ?")
+        .get(operationId) as { market_id: number; kind: string; actor_id: string; result_json: string } | undefined;
+      if (!existing) return undefined;
+      // market_id・kind に加えて actor_id も照合する。ここを素通りすると、別の actor が
+      // 同じ operationId を使い回すだけで他人の保存済み結果（bet/settle/void の中身）を
+      // 受け取れてしまう（監査指摘2）。この閉包は通常経路（後段の replayExisting() 呼び出し）と
+      // UNIQUE制約競合後の再読込経路の両方から呼ばれる共通処理なので、ここ一箇所の修正で両方に効く。
+      if (existing.market_id !== marketId || existing.kind !== kind || existing.actor_id !== actorId) {
+        throw new MarketError("ERR_OPERATION_CONFLICT", {
+          operationId,
+          existingMarketId: existing.market_id,
+          requestedMarketId: marketId,
+          existingKind: existing.kind,
+          requestedKind: kind,
+          existingActorId: existing.actor_id,
+          requestedActorId: actorId,
+        });
+      }
+      return JSON.parse(existing.result_json) as T;
+    };
+
+    const cached = replayExisting();
+    if (cached !== undefined) return cached;
+
+    // IMMEDIATE で始める（chip-tx.ts の runGroup と同じ理由）。遅延トランザクションだと、
+    // 後から書き込みへ昇格する時点で SQLITE_BUSY が busy handler を通らずに即失敗しうる
+    // （複数接続・複数プロセスで同時に書き込もうとしたとき）。
+    const tx = this.db.transaction((): T => {
+      const result = fn();
+      this.db
+        .prepare(
+          "INSERT INTO event_market_ops (operation_id, market_id, kind, actor_id, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .run(operationId, marketId, kind, actorId, JSON.stringify(result), now());
+      return result;
+    });
+    try {
+      return tx.immediate();
+    } catch (e) {
+      // 上の事前チェック（SELECT）と IMMEDIATE トランザクション開始の間には隙間がある。
+      // 複数接続が同じ operationId を同時に叩いた場合、片方が先に確定した直後にもう片方が
+      // fn() を実行すると（例: 板の状態が既に変わっていて ERR_NOT_CLOSED 等の業務エラーになる、
+      // または event_market_ops.operation_id の PRIMARY KEY 制約違反になる）、
+      // それは「自分が失敗した」のではなく「もう一方が正しく確定させた」ことを意味する。
+      // 資金グループは runEventOp のトランザクションごと丸ごと rollback 済みなので、
+      // ここで確定済みの結果を安全に読み直して返してよい（二重には何も実行していない）。
+      const settled = replayExisting();
+      if (settled !== undefined) return settled;
+      throw e;
+    }
+  }
+
+  /**
+   * イベントLand板を立てる。creator の開設手数料 500Ld → `sys:escrow:market:fees` の徴収と
+   * 板の作成を同一の `runEventOp`（＝同一SQLiteトランザクション）で行うので、
+   * 「手数料だけ引かれて板が無い」「板はあるが手数料未収」は構造的に起きない。
+   * 再送（同じ operationId）は保存済みの Market をそのまま返し、二重徴収しない。
+   */
+  createEvent(input: {
+    guildId: string;
+    creatorId: string;
+    title: string;
+    options: string[];
+    durationMin: number;
+    payoutMode?: PayoutMode;
+    /** Discord role ID の一覧（重複可・ここで正規化する） */
+    allowedRoleIds: string[];
+    operationId: string;
+  }): Market {
+    if (input.options.length < 2 || input.options.length > EVENT_MARKET_MAX_OPTIONS) {
+      throw new MarketError("ERR_BAD_OPTION", { count: input.options.length });
+    }
+    if (!Number.isInteger(input.durationMin) || input.durationMin < 1 || input.durationMin > 1440) {
+      throw new MarketError("ERR_BAD_AMOUNT", { durationMin: input.durationMin });
+    }
+    const payoutMode: PayoutMode = input.payoutMode ?? "parimutuel";
+    if (payoutMode !== "parimutuel" && payoutMode !== "winner_take_all") {
+      throw new MarketError("ERR_BAD_MODE", { payoutMode });
+    }
+    const roleIds = this.normalizeRoleIds(input.allowedRoleIds);
+    const ledger = this.requireLandLedger();
+    const t = now();
+    const deadline = t + input.durationMin * 60;
+    // create には対象 marketId がまだ無い（INSERT で初めて採番される）ので、
+    // runEventOp の marketId 引数には固定の sentinel（0・実IDは1始まり）を使う。
+    return this.runEventOp(input.operationId, 0, "create", input.creatorId, (): Market => {
+      ledger.ensureAccount(EVENT_MARKET_FEES_HOLDER, "system");
+      const creatorAccount = `user:${input.creatorId}`;
+      const held = ledger.balanceOf(creatorAccount);
+      if (held < EVENT_MARKET_CREATE_FEE) {
+        throw new MarketError("ERR_INSUFFICIENT_LAND", { held, fee: EVENT_MARKET_CREATE_FEE });
+      }
+      ledger.transfer({
+        from: creatorAccount,
+        to: EVENT_MARKET_FEES_HOLDER,
+        amount: EVENT_MARKET_CREATE_FEE,
+        type: "bet",
+        actor: input.creatorId,
+        idempotencyKey: `event-market:create-fee:${input.operationId}`,
+        reason: "イベント板の開設手数料",
+      });
+      const info = this.db
+        .prepare(
+          `INSERT INTO casino_markets
+             (guild_id, creator_id, title, options_json, deadline_at, status, payout_mode, fee, fund_mode,
+              market_mode, allowed_role_ids_json, approval_mode, currency_mode, created_at)
+           VALUES (?, ?, ?, ?, ?, 'open', ?, ?, 'escrow', 'event', ?, 'instant', 'land', ?)`,
+        )
+        .run(
+          input.guildId,
+          input.creatorId,
+          input.title.slice(0, 200),
+          JSON.stringify(input.options),
+          deadline,
+          payoutMode,
+          EVENT_MARKET_CREATE_FEE,
+          JSON.stringify(roleIds),
+          t,
+        );
+      const id = Number(info.lastInsertRowid);
+      ledger.ensureAccount(eventMarketEscrowHolder(id), "system");
+      this.events.log("event_market_create", {
+        actor: input.creatorId,
+        payload: { id, title: input.title, options: input.options, deadline, payoutMode, allowedRoleIds: roleIds },
+      });
+      return this.get(id)!;
+    });
+  }
+
+  /**
+   * イベントLand板へ賭ける／張り直す。ChipLedger は一切使わず、生 Ledger の
+   * `user:<userId>` ⇄ `sys:escrow:market:<marketId>` 間のみで資金を動かす。
+   *
+   * - roleIds（Discordから渡された「今この利用者が持っているロールID一覧」）と
+   *   板の allowed_role_ids_json の積集合が空なら ERR_ROLE_NOT_ALLOWED（Land・bet行とも不変）。
+   *   管理者フラグ・作成者フラグによるバイパスは存在しない（呼び出し側にも渡していない）。
+   * - amount は「張り直し後の合計額」（既存の標準板 bet() と同じ意味論）。
+   * - 個人上限（張り直し後合計）・板全体pot上限は資金移動の**前**に検証する。
+   * - 資金整合ガード: 既存 pot がある場合、escrow 残高 === 既存 pot でなければ
+   *   資金を一切動かさず例外＋市場を frozen 化する（標準板 bet() と同じ設計）。
+   */
+  betEventLand(
+    marketId: number,
+    userId: string,
+    roleIds: string[],
+    optionIndex: number,
+    amount: number,
+    operationId: string,
+    /**
+     * テスト専用フック。張り直しの「旧額返金」直後・「新額徴収」直前に呼ばれる
+     * （`refundAllBets` の `_beforeStep` と同じ流儀）。本番呼び出しは省略する。
+     * ここで例外を投げると crash window（片方だけ確定した状態）を再現でき、
+     * `runEventOp` の transaction ごと全 rollback されることを確認できる。
+     */
+    _midStepFailure?: () => void,
+  ): { previous: number | null; net: number } {
+    if (!Number.isInteger(amount) || amount <= 0) throw new MarketError("ERR_BAD_AMOUNT", { amount });
+    const ledger = this.requireLandLedger();
+    const escHolder = eventMarketEscrowHolder(marketId);
+    let freezeRequest: { reason: string; meta: Record<string, unknown> } | null = null;
+    try {
+      return this.runEventOp(operationId, marketId, "bet", userId, (): { previous: number | null; net: number } => {
+        const m = this.get(marketId);
+        if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { marketId });
+        if (m.market_mode !== "event") throw new MarketError("ERR_NOT_EVENT_MARKET", { marketId, mode: m.market_mode });
+        if (m.status !== "open") throw new MarketError("ERR_NOT_OPEN", { marketId, status: m.status });
+        if (m.deadline_at <= now()) throw new MarketError("ERR_NOT_OPEN", { marketId, deadline: m.deadline_at });
+
+        const allowedRoleIds = JSON.parse(m.allowed_role_ids_json) as string[];
+        const hasRole = roleIds.some((r) => allowedRoleIds.includes(r));
+        if (!hasRole) throw new MarketError("ERR_ROLE_NOT_ALLOWED", { marketId, allowedRoleIds, roleIds });
+
+        const options = JSON.parse(m.options_json) as string[];
+        if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= options.length) {
+          throw new MarketError("ERR_BAD_OPTION", { optionIndex, count: options.length });
+        }
+
+        // ── 資金整合ガード: escrow 残高 === 既存 pot（全ベット合計）を検証 ──
+        const existingPot = (
+          this.db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM casino_market_bets WHERE market_id = ?").get(marketId) as {
+            s: number;
+          }
+        ).s;
+        if (existingPot > 0) {
+          const escBal = ledger.balanceOf(escHolder);
+          if (escBal !== existingPot) {
+            freezeRequest = { reason: "event_escrow_mismatch_on_bet", meta: { existingPot, escrowBalance: escBal } };
+            if (escBal < existingPot) {
+              throw new MarketError("ERR_UNDERFUNDED_ESCROW", { marketId, pot: existingPot, escrowBalance: escBal });
+            }
+            throw new MarketError("ERR_ESCROW_MISMATCH", { marketId, pot: existingPot, escrowBalance: escBal });
+          }
+        }
+
+        const existingRows = this.db
+          .prepare("SELECT amount FROM casino_market_bets WHERE market_id = ? AND user_id = ?")
+          .all(marketId, userId) as Array<{ amount: number }>;
+        const existingTotal = existingRows.reduce((s, r) => s + r.amount, 0);
+
+        if (amount > EVENT_MARKET_PERSONAL_CAP) {
+          throw new MarketError("ERR_PERSONAL_CAP_EXCEEDED", { amount, cap: EVENT_MARKET_PERSONAL_CAP });
+        }
+        const potAfter = existingPot - existingTotal + amount;
+        if (potAfter > EVENT_MARKET_POT_CAP) {
+          throw new MarketError("ERR_POT_CAP_EXCEEDED", { potAfter, cap: EVENT_MARKET_POT_CAP });
+        }
+
+        const additionalRequired = Math.max(0, amount - existingTotal);
+        const userAccount = `user:${userId}`;
+        const held = ledger.balanceOf(userAccount);
+        if (held < additionalRequired) {
+          throw new MarketError("ERR_INSUFFICIENT_LAND", { held, additionalRequired, amount, existingTotal });
+        }
+
+        if (existingTotal > 0) {
+          // 張り直し: 旧額を escrow → 利用者へ返金してから bet 行を消す
+          ledger.transfer({
+            from: escHolder,
+            to: userAccount,
+            amount: existingTotal,
+            type: "prize",
+            actor: userId,
+            idempotencyKey: `event-bet:refund:${operationId}`,
+            reason: "イベント板の賭け直しによる返金",
+          });
+          this.db.prepare("DELETE FROM casino_market_bets WHERE market_id = ? AND user_id = ?").run(marketId, userId);
+        }
+        _midStepFailure?.();
+        // 新額を利用者 → escrow へ徴収
+        ledger.transfer({
+          from: userAccount,
+          to: escHolder,
+          amount,
+          type: "bet",
+          actor: userId,
+          idempotencyKey: `event-bet:charge:${operationId}`,
+          reason: "イベント板への賭け",
+        });
+        this.db
+          .prepare("INSERT INTO casino_market_bets (market_id, user_id, option_index, amount, created_at) VALUES (?, ?, ?, ?, ?)")
+          .run(marketId, userId, optionIndex, amount, now());
+        this.events.log("event_market_bet", {
+          actor: userId,
+          payload: { marketId, optionIndex, amount, previous: existingTotal > 0 ? existingTotal : null },
+        });
+        return { previous: existingTotal > 0 ? existingTotal : null, net: amount - existingTotal };
+      });
+    } catch (e) {
+      const req = freezeRequest as { reason: string; meta: Record<string, unknown> } | null;
+      if (req) this.freeze(marketId, "system:event-bet-guard", req.reason, req.meta);
+      throw e;
+    }
+  }
+
+  /**
+   * イベントLand板専用の原子的な結果確定＋精算API。
+   *
+   * closed のイベント板だけ受理し、creator または運営（isAdmin）だけが呼べる。
+   * result_option の保存と Land 精算を同一 `runEventOp` の中で行うので、途中失敗は
+   * 全部 rollback（reported へは一切止まらない・approvals 行は作らない・dispute window の
+   * scheduler 対象にもならない＝status が reported にならないので構造的に対象外）。
+   *
+   * 精算前に「Land escrow残高 = casino_market_betsの合計」を完全一致確認し、
+   * 不一致なら資金を一切動かさずイベント板を frozen にする。
+   *
+   * 同じ operationId の再試行（replay）は保存済みの結果をそのまま返すので二重配当しない。
+   */
+  reportAndSettleEventLand(
+    marketId: number,
+    actorId: string,
+    winningOption: number,
+    operationId: string,
+    isAdmin = false,
+  ): MarketSettleResult {
+    const ledger = this.requireLandLedger();
+    let freezeRequest: { reason: string; meta: Record<string, unknown> } | null = null;
+    try {
+      return this.runEventOp(operationId, marketId, "settle", actorId, (): MarketSettleResult => {
+        const m = this.get(marketId);
+        if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { marketId });
+        if (m.market_mode !== "event") throw new MarketError("ERR_NOT_EVENT_MARKET", { marketId, mode: m.market_mode });
+        if (!isAdmin && m.creator_id !== actorId) throw new MarketError("ERR_NOT_CREATOR", { creator: m.creator_id, actor: actorId });
+        if (m.status !== "closed") throw new MarketError("ERR_NOT_CLOSED", { status: m.status });
+        const options = JSON.parse(m.options_json) as string[];
+        if (!Number.isInteger(winningOption) || winningOption < 0 || winningOption >= options.length) {
+          throw new MarketError("ERR_BAD_OPTION", { winningOption, count: options.length });
+        }
+
+        const bets = this.bets(marketId);
+        const pot = bets.reduce((s, b) => s + b.amount, 0);
+        const escHolder = eventMarketEscrowHolder(marketId);
+        const escBal = ledger.balanceOf(escHolder);
+        if (escBal !== pot) {
+          freezeRequest = { reason: "event_escrow_mismatch_on_settle", meta: { pot, escrowBalance: escBal } };
+          throw new MarketError("ERR_ESCROW_MISMATCH", { marketId, pot, escrowBalance: escBal });
+        }
+
+        const winners = bets.filter((b) => b.option_index === winningOption);
+
+        // 的中者なし → 全額返金 & void（場代は取らない）
+        if (winners.length === 0) {
+          for (const b of bets) {
+            ledger.transfer({
+              from: escHolder,
+              to: `user:${b.user_id}`,
+              amount: b.amount,
+              type: "prize",
+              actor: "system:event-market",
+              idempotencyKey: `event-settle:refund:${operationId}:${b.user_id}`,
+              reason: "イベント板の返金（的中者なし）",
+            });
+          }
+          this.db
+            .prepare("UPDATE casino_markets SET status = 'void', result_option = ?, settled_at = ? WHERE id = ?")
+            .run(winningOption, now(), marketId);
+          this.events.log("event_market_settle_void", { actor: actorId, payload: { id: marketId, pot, winningOption } });
+          return {
+            id: marketId,
+            pot,
+            houseCut: 0,
+            distributable: 0,
+            winnerCount: 0,
+            payouts: [],
+            mode: m.payout_mode,
+            resultOption: winningOption,
+            void: true,
+          };
+        }
+
+        const winnersPot = winners.reduce((s, b) => s + b.amount, 0);
+        // 場代（既存 MARKET_HOUSE_CUT の3%）。単独配当が承認閾値(既定100万Ld)を超えないことは
+        // pot上限90万Ldから計算上保証される（900,000 × 0.97 = 873,000 < 1,000,000）。
+        // テストで数値的に裏付ける（casino-market-land-event.test.ts）。
+        const houseCut = Math.floor(pot * HOUSE_CUT);
+        if (houseCut > 0) {
+          ledger.transfer({
+            from: escHolder,
+            to: EVENT_MARKET_FEES_HOLDER,
+            amount: houseCut,
+            type: "market_house_fee",
+            actor: "system:event-market",
+            idempotencyKey: `event-settle:fee:${operationId}`,
+            reason: "イベント板の場代",
+          });
+        }
+        const distributable = pot - houseCut;
+
+        const payouts: Array<{ userId: string; amount: number }> = [];
+        if (m.payout_mode === "parimutuel") {
+          let remaining = distributable;
+          for (let i = 0; i < winners.length; i++) {
+            const w = winners[i]!;
+            const isLast = i === winners.length - 1;
+            const share = isLast ? remaining : Math.floor((distributable * w.amount) / winnersPot);
+            if (share > 0) {
+              ledger.transfer({
+                from: escHolder,
+                to: `user:${w.user_id}`,
+                amount: share,
+                type: "prize",
+                actor: "system:event-market",
+                idempotencyKey: `event-settle:prize:${operationId}:${i}:${w.user_id}`,
+                reason: "イベント板の配当",
+              });
+            }
+            remaining -= share;
+            payouts.push({ userId: w.user_id, amount: share });
+          }
+        } else {
+          const uniqueWinners = Array.from(new Set(winners.map((w) => w.user_id)));
+          const per = Math.floor(distributable / uniqueWinners.length);
+          const leftover = distributable - per * uniqueWinners.length;
+          for (let i = 0; i < uniqueWinners.length; i++) {
+            const uid = uniqueWinners[i]!;
+            const share = i === 0 ? per + leftover : per;
+            if (share > 0) {
+              ledger.transfer({
+                from: escHolder,
+                to: `user:${uid}`,
+                amount: share,
+                type: "prize",
+                actor: "system:event-market",
+                idempotencyKey: `event-settle:prize:${operationId}:${i}:${uid}`,
+                reason: "イベント板の配当",
+              });
+            }
+            payouts.push({ userId: uid, amount: share });
+          }
+        }
+
+        // 通算損益（onPlayerNet）はここでは呼ばない: casino chip 経済の戦績集計は
+        // ChipLedger 保有者ID（sys:/system:/escrow: を除く裸ID）を前提にしており、
+        // Land 経済とは別レイヤー（追加アーキ指針§E）。混ぜると chip 側の戦績が
+        // Land の勝敗で汚染されるため、意図的に呼ばない。
+
+        this.db
+          .prepare("UPDATE casino_markets SET status = 'settled', result_option = ?, settled_at = ? WHERE id = ?")
+          .run(winningOption, now(), marketId);
+        this.events.log("event_market_settle", {
+          actor: actorId,
+          payload: { id: marketId, pot, houseCut, winnerCount: winners.length, mode: m.payout_mode, winningOption },
+        });
+        return {
+          id: marketId,
+          pot,
+          houseCut,
+          distributable,
+          winnerCount: winners.length,
+          payouts,
+          mode: m.payout_mode,
+          resultOption: winningOption,
+          void: false,
+        };
+      });
+    } catch (e) {
+      const req = freezeRequest as { reason: string; meta: Record<string, unknown> } | null;
+      if (req) this.freeze(marketId, "system:event-settle-guard", req.reason, req.meta);
+      throw e;
+    }
+  }
+
+  /**
+   * イベントLand板の管理者無効化: 全額Land返金 → void。
+   *
+   * open または closed のイベント板だけ対象。すでに settled/void なら
+   * `alreadyClosed: true`（資金は動かさない）を返す（標準板 refund() と同じ設計）。
+   * frozen・disputed・reported（構造上イベント板には出現しない）は ERR_NOT_OPEN で拒否し、
+   * 「凍結中の市場を自動で無効化・返金する」経路を作らない（運営の手動調査を待つ）。
+   *
+   * 部分返金後に例外が飛べば `runEventOp` の `db.transaction()` ごと全rollbackされる。
+   * escrow 残高と pot が不一致なら資金を動かさず frozen 化する。
+   */
+  adminVoidEventLand(marketId: number, actorId: string, operationId: string): MarketRefundResult {
+    const ledger = this.requireLandLedger();
+    let freezeRequest: { reason: string; meta: Record<string, unknown> } | null = null;
+    try {
+      return this.runEventOp(operationId, marketId, "void", actorId, (): MarketRefundResult => {
+        const m = this.get(marketId);
+        if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { marketId });
+        if (m.market_mode !== "event") throw new MarketError("ERR_NOT_EVENT_MARKET", { marketId, mode: m.market_mode });
+        if (m.status === "settled" || m.status === "void") {
+          return { id: marketId, refunded: 0, users: 0, alreadyClosed: true };
+        }
+        if (m.status !== "open" && m.status !== "closed") {
+          throw new MarketError("ERR_NOT_OPEN", { marketId, status: m.status });
+        }
+
+        const bets = this.bets(marketId);
+        const pot = bets.reduce((s, b) => s + b.amount, 0);
+        const escHolder = eventMarketEscrowHolder(marketId);
+        const escBal = ledger.balanceOf(escHolder);
+        if (escBal !== pot) {
+          freezeRequest = { reason: "event_escrow_mismatch_on_void", meta: { pot, escrowBalance: escBal } };
+          throw new MarketError("ERR_ESCROW_MISMATCH", { marketId, pot, escrowBalance: escBal });
+        }
+
+        for (const b of bets) {
+          ledger.transfer({
+            from: escHolder,
+            to: `user:${b.user_id}`,
+            amount: b.amount,
+            type: "prize",
+            actor: "system:event-market",
+            idempotencyKey: `event-void:refund:${operationId}:${b.user_id}`,
+            reason: "イベント板の無効化による返金",
+          });
+        }
+        this.db.prepare("UPDATE casino_markets SET status = 'void', settled_at = ? WHERE id = ?").run(now(), marketId);
+        this.events.log("event_market_admin_void", { actor: actorId, payload: { id: marketId, refunded: pot, users: bets.length } });
+        return { id: marketId, refunded: pot, users: bets.length, alreadyClosed: false };
+      });
+    } catch (e) {
+      const req = freezeRequest as { reason: string; meta: Record<string, unknown> } | null;
+      if (req) this.freeze(marketId, "system:event-void-guard", req.reason, req.meta);
+      throw e;
+    }
+  }
+
+  /**
+   * ⚠️ 明示的な管理者操作専用。通常のBot起動経路（`buildServices()`）から呼び出さないこと。
+   *
+   * market_mode='event' の未精算板（open/closed）を全部 Land 全額返金 & void。
+   * frozen は対象外（既存同様・運営の手動調査を待つ）。settled/void はそもそも対象外。
+   * 個別の板でエラーが出ても他の板を止めない。operationId は marketId から導出する
+   * 安定値にして、再起動のたびに同じ板を二重返金しない（時刻を混ぜない）。
+   *
+   * 監査指摘1（PR#94独立監査）: 以前はこの関数を無条件に Bot 起動時へ配線していたため、
+   * deploy・クラッシュ・自動再起動のたびに**正常な進行中イベント板**まで全額返金・void化
+   * されてしまうバグがあった。通常起動からは資金を一切動かさない `auditPendingEventLand()`
+   * を呼ぶこと。この関数は将来の明示的な管理者操作（運営コマンド等）用に残す。
+   */
+  adminRefundAllPendingEventLand(actor: string): {
+    total: number;
+    refunded: number;
+    frozen: number;
+    failed: Array<{ id: number; error: string }>;
+  } {
+    const rows = this.db
+      .prepare("SELECT id FROM casino_markets WHERE market_mode = 'event' AND status IN ('open','closed')")
+      .all() as Array<{ id: number }>;
+    let refunded = 0;
+    let frozen = 0;
+    const failed: Array<{ id: number; error: string }> = [];
+    for (const r of rows) {
+      try {
+        this.adminVoidEventLand(r.id, actor, `event-startup-void:${r.id}`);
+        refunded++;
+      } catch (e) {
+        const err = e instanceof MarketError ? `${e.code}:${JSON.stringify(e.meta)}` : (e as Error).message;
+        failed.push({ id: r.id, error: err });
+        // adminVoidEventLand 内の catch で ERR_ESCROW_MISMATCH は既に frozen 化されている。
+        // ここでの再カウントは frozen 化が実際に効いたかを確認してから行う。
+        const fresh = this.get(r.id);
+        if (fresh?.status === "frozen") frozen++;
+        this.events.log("event_market_refund_failed", { actor, payload: { id: r.id, error: err } });
+      }
+    }
+    return { total: rows.length, refunded, frozen, failed };
+  }
+
+  /**
+   * 起動時: market_mode='event' の未精算板（open/closed）を**監査するだけ**の読み取り専用API。
+   * 資金・statusを一切変更しない（監査指摘1・PR#94独立監査）。
+   *
+   * 各板について `casino_market_bets` の合計（pot）と `eventMarketEscrowHolder(id)` の
+   * Land残高を突き合わせる。
+   * - 一致（0=0を含む）: 健全。status・bet行・Land残高・event_market_opsのいずれも変更しない。
+   *   open/closedのまま維持するので、再起動後もイベントは継続できる。
+   * - 不一致: Landを一切動かさず、既存の `freeze()`（bet()の資金整合ガードで使われている
+   *   独立トランザクション）で status を frozen にする。理由・pot・escrowBalance・marketId
+   *   を event ログのメタ情報として残す。
+   *
+   * 冪等性: frozen化した板は次回以降 `status IN ('open','closed')` の対象から自然に外れるため、
+   * 監査を繰り返しても再度書き込まない。健全な板はそもそも一切書き込まない。
+   *
+   * 個別の板で例外が出ても他の板の処理は続ける（`adminRefundAllPendingEventLand()` と同じ
+   * 「1件の失敗で全体を止めない」流儀）。
+   */
+  auditPendingEventLand(actor: string): {
+    total: number;
+    healthy: number;
+    frozen: number;
+    failed: Array<{ id: number; error: string }>;
+  } {
+    const ledger = this.requireLandLedger();
+    const rows = this.db
+      .prepare("SELECT id FROM casino_markets WHERE market_mode = 'event' AND status IN ('open','closed')")
+      .all() as Array<{ id: number }>;
+    let healthy = 0;
+    let frozen = 0;
+    const failed: Array<{ id: number; error: string }> = [];
+    for (const r of rows) {
+      try {
+        const pot = (
+          this.db.prepare("SELECT COALESCE(SUM(amount),0) AS s FROM casino_market_bets WHERE market_id = ?").get(r.id) as {
+            s: number;
+          }
+        ).s;
+        const escBal = ledger.balanceOf(eventMarketEscrowHolder(r.id));
+        if (escBal === pot) {
+          healthy++;
+          continue;
+        }
+        // 不一致: Landは一切動かさず frozen 化するだけ（返金・void はしない）。
+        this.freeze(r.id, actor, "event_escrow_mismatch_on_audit", { pot, escrowBalance: escBal, marketId: r.id });
+        frozen++;
+      } catch (e) {
+        const err = e instanceof MarketError ? `${e.code}:${JSON.stringify(e.meta)}` : (e as Error).message;
+        failed.push({ id: r.id, error: err });
+        this.events.log("event_market_audit_failed", { actor, payload: { id: r.id, error: err } });
+      }
+    }
+    return { total: rows.length, healthy, frozen, failed };
   }
 }
 

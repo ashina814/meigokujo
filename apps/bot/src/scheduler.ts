@@ -305,12 +305,31 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     // 賭場が停止していれば、資金を動かす tick は丸ごと飛ばす。
     // （資金層でも弾かれるが、毎分例外を出し続けないようにここでも見る）
     const casinoClosed = services.casinoStatus.denyMessage() !== null;
-    if (casinoClosed) console.log("[賭場] 停止中のため板の tick を飛ばします");
+    if (casinoClosed) console.log("[賭場] 停止中のため通常板の tick を飛ばします");
 
-    // ── 賭場の板: 締切を過ぎた open を closed へ + reported の5分無異議で自動精算 ──
+    // ── イベントLand板: 自動締切だけは casino 稼働状態と独立して常に動かす ──
+    // casinoStatus（賭場チップ経済の稼働状態）は生Ledgerのイベント板Land決済とは
+    // 別レイヤーの概念であり、連動させない方針（追加アーキ指針§E）。仕様上も
+    // 「自動締切はイベント板でも動かす」と明記されているため、賭場チップ経済が
+    // 何らかの理由で停止していてもイベント板の締切は止めない。
+    // イベント板は reported へ遷移しないため listPastDisputeWindow/finalizeIfNoDispute の対象には
+    // 構造上出現せず、ここでは autoClose だけを扱えばよい。
+    try {
+      const pending = services.markets.listPastDeadline();
+      for (const m of pending) {
+        if (m.market_mode !== "event") continue;
+        services.markets.autoClose(m.id);
+        await announceAutoClose(client, services, m.id).catch(() => undefined);
+      }
+    } catch (e) {
+      console.error("[event-market] auto-close tick失敗:", e);
+    }
+
+    // ── 賭場の板（通常板）: 締切を過ぎた open を closed へ + reported の5分無異議で自動精算 ──
     if (!casinoClosed) try {
       const pending = services.markets.listPastDeadline();
       for (const m of pending) {
+        if (m.market_mode === "event") continue; // 上のブロックで処理済み
         services.markets.autoClose(m.id);
         await announceAutoClose(client, services, m.id).catch(() => undefined);
       }

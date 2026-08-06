@@ -21,7 +21,15 @@ import { handleKeibaCommand } from "./commands/keiba.js";
 import { handleAnnaiButton, handleAnnaiCommand } from "./commands/annai.js";
 import { handleVipButton, handleVipCommand } from "./commands/vip.js";
 import { handleNagareboshiCommand } from "./commands/nagareboshi.js";
-import { handleItaButton, handleItaCommand, handleItaModal, handleItaSelect } from "./commands/ita.js";
+import {
+  handleItaButton,
+  handleItaCommand,
+  handleItaEventButton,
+  handleItaEventModal,
+  handleItaEventSelect,
+  handleItaModal,
+  handleItaSelect,
+} from "./commands/ita.js";
 import { handleTakuButton, handleTakuVoiceUpdate, sweepStaleTables } from "./commands/takutate-panel.js";
 import { handlePokerDuelButton, handlePokerDuelSelect } from "./casino/poker-duel.js";
 import { denyIfCasinoClosed } from "./casino/gate.js";
@@ -299,12 +307,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleItaSelect(interaction, services);
       return;
     }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("itaevt:")) {
+      await handleItaEventSelect(interaction, services);
+      return;
+    }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("mimi:")) {
       await handleConfessionModal(interaction, services);
       return;
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("ita:")) {
       await handleItaModal(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("itaevt:")) {
+      await handleItaEventModal(interaction, services);
       return;
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("stocks:")) {
@@ -385,6 +401,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("ita:")) {
         await handleItaButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("itaevt:")) {
+        await handleItaEventButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("pkr:")) {
