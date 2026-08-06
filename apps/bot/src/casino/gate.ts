@@ -10,10 +10,11 @@ import { isFormallyOpen, openingNotice } from "./opening.js";
  * 「分からないときは動かさない」を入口で徹底する。
  *
  * 停止中でも通すもの: 遊びの説明・番付・通行証などの**読むだけ**の導線と、運営卓（/管理）。
- * 停止理由は利用者にそのまま見せる（黙って何も起きないのが一番困る）。
+ * PR #94のイベントLand板はチップ賭場とは別経済なので、`/板 イベント立てる` と
+ * `itaevt:` コンポーネントも通す。停止理由は利用者にそのまま見せる。
  */
 
-/** チップが動きうるスラッシュコマンド */
+/** チップが動きうるスラッシュコマンド（`/板` はサブコマンド単位で下で判定する） */
 const GUARDED_COMMANDS = new Set([
   "遊ぶ",
   "勝負",
@@ -23,19 +24,22 @@ const GUARDED_COMMANDS = new Set([
   "競馬",
   "vip",
   "流れ星",
-  "板",
 ]);
+
+/** 正式開業前でも通す `/板` サブコマンド。未知の追加サブコマンドはfail-closedで止める。 */
+const UNGUARDED_ITA_SUBCOMMANDS = new Set(["イベント立てる", "一覧"]);
 
 /**
  * チップが動きうるコンポーネント（ボタン・選択・モーダル）の customId 接頭辞。
  * `apps/bot/src/casino/*.ts` と賭場系コマンドの `setCustomId` を全部拾ってある。
+ * イベントLand板の `itaevt:` は意図的に含めない。
  */
 const GUARDED_PREFIXES = [
   "ether:", // 両替（預入・返還）
   "bakuten:", // 賭場商店
   "stocks:", // 株
   "vip:", // VIP加入
-  "ita:", // 板
+  "ita:", // 通常チップ板
   "rl:", // ルーレット
   "slots:",
   "chinchiro:",
@@ -57,7 +61,13 @@ const GUARDED_PREFIXES = [
 
 /** その操作が賭場のチップを動かしうるか */
 export function isCasinoInteraction(interaction: Interaction): boolean {
-  if (interaction.isChatInputCommand()) return GUARDED_COMMANDS.has(interaction.commandName);
+  if (interaction.isChatInputCommand()) {
+    if (interaction.commandName === "板") {
+      const subcommand = interaction.options.getSubcommand(false);
+      return !subcommand || !UNGUARDED_ITA_SUBCOMMANDS.has(subcommand);
+    }
+    return GUARDED_COMMANDS.has(interaction.commandName);
+  }
   if ("customId" in interaction && typeof interaction.customId === "string") {
     const id = interaction.customId;
     return GUARDED_PREFIXES.some((p) => id.startsWith(p));
