@@ -67,14 +67,14 @@ interface RunnerResult {
   error?: string;
 }
 
-function runProcesses(
+function spawnRunner(
   dbPath: string,
-  action: "approve" | "execute",
+  action: "draft" | "approve" | "execute",
   key: string,
-  actors: string[],
-): Promise<RunnerResult[]> {
-  const startAt = Date.now() + 2_000;
-  return Promise.all(actors.map((actor) => new Promise<RunnerResult>((resolve, reject) => {
+  actor: string,
+  startAt: number,
+): Promise<RunnerResult> {
+  return new Promise<RunnerResult>((resolve, reject) => {
     const input = JSON.stringify({ dbPath, action, key, actor, startAt });
     const child = spawn(process.execPath, ["--import", "tsx", RUNNER, input], {
       stdio: ["ignore", "pipe", "pipe"],
@@ -89,7 +89,25 @@ function runProcesses(
       if (!line) return reject(new Error(`runner exited ${code}: ${err.slice(-2000)}`));
       resolve(JSON.parse(line) as RunnerResult);
     });
-  })));
+  });
+}
+
+function runProcesses(
+  dbPath: string,
+  action: "approve" | "execute",
+  key: string,
+  actors: string[],
+): Promise<RunnerResult[]> {
+  const startAt = Date.now() + 2_000;
+  return Promise.all(actors.map((actor) => spawnRunner(dbPath, action, key, actor, startAt)));
+}
+
+function runDraftProcesses(
+  dbPath: string,
+  attempts: Array<{ key: string; actor: string }>,
+): Promise<RunnerResult[]> {
+  const startAt = Date.now() + 2_000;
+  return Promise.all(attempts.map(({ key, actor }) => spawnRunner(dbPath, "draft", key, actor, startAt)));
 }
 
 describe("PR14 cross-process concurrency", () => {
@@ -109,6 +127,30 @@ describe("PR14 cross-process concurrency", () => {
     };
     expect(row.status).toBe("approved");
     expect(["reviewer-a", "reviewer-b"]).toContain(row.approved_by);
+    db.close();
+  }, 60_000);
+
+  it("別Nodeプロセスから同一月・別keyを同時draftしても1件だけ成立する", async () => {
+    const c = setupFileDb();
+    c.db.close();
+
+    const results = await runDraftProcesses(c.dbPath, [
+      { key: "m1", actor: "maker-a" },
+      { key: "m2", actor: "maker-b" },
+    ]);
+    expect(results.filter((r) => r.ok)).toHaveLength(1);
+    expect(results.filter((r) => !r.ok)).toHaveLength(1);
+    expect(results.find((r) => !r.ok)?.code).toBe("ERR_REMITTANCE_PERIOD_LOCKED");
+
+    const db = openDb(c.dbPath);
+    const rows = db.prepare(`
+      SELECT key, status FROM casino_remittances
+      WHERE kind='remittance' AND status IN ('draft','approved','executed')
+      ORDER BY key
+    `).all() as Array<{ key: string; status: string }>;
+    expect(rows).toHaveLength(1);
+    expect(["m1", "m2"]).toContain(rows[0]?.key);
+    expect(rows[0]?.status).toBe("draft");
     db.close();
   }, 60_000);
 
