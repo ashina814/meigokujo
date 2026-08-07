@@ -20,7 +20,8 @@ export interface PassportCardData {
   avatarUrl: string;
   serverName?: string;
   serverIconUrl?: string | null;
-  etherBalance: number;
+  /** 所持 = 通常Land + 自由チップ（正本 §4.3）。卓・板への預け中は含めない。 */
+  availableBalance: number;
   landBalance: number;
   stats: {
     games: number;
@@ -73,7 +74,7 @@ export async function renderPassportCard(data: PassportCardData): Promise<Buffer
   ctx.fillText("所持", WIDTH - PAD, avY + 114);
   ctx.fillStyle = "#f0b429";
   ctx.font = `700 34px ${SERIF}`;
-  ctx.fillText(fmtEther(data.etherBalance), WIDTH - PAD, avY + 152);
+  ctx.fillText(fmtLd(data.availableBalance), WIDTH - PAD, avY + 152);
   ctx.textAlign = "left";
 
   // ── ゲーム統計 ──

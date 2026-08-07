@@ -53,6 +53,8 @@ function fakeServices(status: StatusValue) {
     departments: { get: () => ({ name: "賭博場" }), balanceOf: () => 0 },
     // 正式開業初期化の導線そのものを見るテストなので、既定は「開業前」に置く
     chipTx: { openingLandBaseline: () => ({ poolLand: 0 }), openingPhase: () => "pre_reset" },
+    // PR13: 運営卓の運転資金目安は開業設定をSELECTのみで読む。未設定を模す
+    settings: { getString: () => undefined },
   } as unknown as Services;
   return { services, finishOpeningReset };
 }

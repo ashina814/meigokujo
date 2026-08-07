@@ -52,7 +52,7 @@ function paytableEmbed(): EmbedBuilder {
         "　結果画面から前回の倍額で即再挑戦できる。連勝チャレンジ用",
         "",
         "**⚖️ 福の重み / 🔥 連鎖チェーン**",
-        "　勝ちで発動（残高が多いほど奉納・連勝で倍率）",
+        "　勝ちで発動（残高が多いほど福分け積立・連勝で倍率）",
       ].join("\n"),
     );
 }
@@ -112,7 +112,7 @@ async function runRoundInner(
         "**丁（偶数）** か **半（奇数）** か——15秒以内に選べ。",
       ].join("\n"),
     )
-    .setFooter({ text: `賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
+    .setFooter({ text: `賭け ${fmtEther(bet).replace(" Ld", "Ld")}` });
   const choiceRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("chohan:cho").setLabel("丁（偶数）").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("chohan:han").setLabel("半（奇数）").setStyle(ButtonStyle.Danger),
@@ -158,7 +158,7 @@ async function runRoundInner(
           "```",
         ].join("\n"),
       )
-      .setFooter({ text: `賭け ${fmtEther(bet).replace(" ◈", "◈")}` });
+      .setFooter({ text: `賭け ${fmtEther(bet).replace(" Ld", "Ld")}` });
   };
   for (let f = 0; f < 3; f++) {
     await reply.edit({ embeds: [shakeEmbed(f)], components: [] }).catch(() => undefined);
@@ -184,10 +184,10 @@ async function runRoundInner(
       ? `${settled.chainLabel} 連鎖 **${settled.chainStreak}連勝** ×${settled.chainMult.toFixed(2)} → **+${fmtEther(settled.chainBonus)}**`
       : "";
   const fukuLine =
-    settled.fukuTax > 0 ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 奉納` : "";
+    settled.fukuTax > 0 ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 福分け積立` : "";
 
   const tag = won ? "🟢 的中" : settled.net === 0 ? "⚪ 返金（お守り）" : "🔴 外れ";
-  const netStr = settled.net === 0 ? "±0 ◈" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} ◈`;
+  const netStr = settled.net === 0 ? "±0 Ld" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} Ld`;
   const bonusBits: string[] = [];
   if (streakLine) bonusBits.push(streakLine);
   if (fukuLine) bonusBits.push(fukuLine);
@@ -209,7 +209,7 @@ async function runRoundInner(
     )
     .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
     .setFooter({
-      text: [`所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" ◈", "◈")}`, `賭け ${fmtEther(bet).replace(" ◈", "◈")}`].join(" · "),
+      text: [`所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" Ld", "Ld")}`, `賭け ${fmtEther(bet).replace(" Ld", "Ld")}`].join(" · "),
     });
 
   if (won) {

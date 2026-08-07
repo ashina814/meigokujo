@@ -110,15 +110,15 @@ export async function playChinchiroDuel(
     return;
   }
   if (!Number.isInteger(bet) || bet < MIN_BET || bet > MAX_BET) {
-    await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} Ld で。`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (services.chips.balanceOf(challenger.id) < bet) {
-    await interaction.reply({ content: "自分のエテル残高が足りない。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "自分のLand残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }
   if (services.chips.balanceOf(opponent.id) < bet) {
-    await interaction.reply({ content: `<@${opponent.id}> のエテル残高が足りない。`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `<@${opponent.id}> のLand残高が足りない。`, flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -181,7 +181,7 @@ export async function playChinchiroDuel(
     refundAll(services, [challenger.id], bet, `${session}:refund:opponent_broke`, session);
     await interaction.editReply({
       content: "",
-      embeds: [buildPvpAbort("対戦チンチロ", "🎲", "対戦相手のエテル徴収に失敗。挑戦者に全額返金。")],
+      embeds: [buildPvpAbort("対戦チンチロ", "🎲", "対戦相手のLand徴収に失敗。挑戦者に全額返金。")],
       components: [],
     });
     return;

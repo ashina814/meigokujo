@@ -4,9 +4,9 @@ export function fmtLd(n: number): string {
   return `${n.toLocaleString("ja-JP")} Ld`;
 }
 
-/** エテル（マモンの賭場の第二通貨）。◈ は通貨記号 */
+/** @deprecated 内部チップ量を利用者へ出すときも Land として表示する。 */
 export function fmtEther(n: number): string {
-  return `${n.toLocaleString("ja-JP")} ◈`;
+  return fmtLd(n);
 }
 
 /**

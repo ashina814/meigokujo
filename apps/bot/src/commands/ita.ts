@@ -130,7 +130,7 @@ export const itaCommand = new SlashCommandBuilder()
   .addSubcommand((sub) =>
     sub
       .setName("立てる")
-      .setDescription("板を立てる（議題 + 選択肢2〜4 + 締切分・議題手数料500◈）")
+      .setDescription("板を立てる（議題 + 選択肢2〜4 + 締切分・議題手数料500Ld）")
       .addStringOption((o) => o.setName("議題").setDescription("何に賭ける？").setRequired(true).setMaxLength(120))
       .addStringOption((o) =>
         o
@@ -438,7 +438,7 @@ function buildMarketEmbed(services: Services, m: Market): EmbedBuilder {
     } else if (m.payout_mode === "winner_take_all" && count > 0) {
       extra = `  ·  ${count}人`;
     }
-    return `${mark}  **${opt}**\n　\`${gauge}\`  ${pct}%  ·  ${fmtEther(total).replace(" ◈", "◈")}${extra}`;
+    return `${mark}  **${opt}**\n　\`${gauge}\`  ${pct}%  ·  ${fmtEther(total).replace(" Ld", "Ld")}${extra}`;
   });
   const color = voided
     ? C_LOSE
@@ -470,7 +470,7 @@ function buildMarketEmbed(services: Services, m: Market): EmbedBuilder {
       { name: "▸ 選択肢", value: optionLines.join("\n\n"), inline: false },
     )
     .setFooter({
-      text: `総額 ${fmtEther(pot).replace(" ◈", "◈")}  ·  場代 3% → JPプール  ·  1人1口（張り直しは上書き）`,
+      text: `総額 ${fmtEther(pot).replace(" Ld", "Ld")}  ·  場代 3% → JPプール  ·  1人1口（張り直しは上書き）`,
     });
   if (settled) {
     embed.setDescription(`🏆 **結果**: ${options[m.result_option!]}`);
@@ -667,7 +667,7 @@ export async function handleItaModal(interaction: ModalSubmitInteraction, servic
   const optionIndex = Number(parts[3]);
   const amt = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
   if (!Number.isInteger(amt) || amt < MIN_BET || amt > MAX_BET) {
-    await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} Ld で。`, flags: MessageFlags.Ephemeral });
     return;
   }
   try {
@@ -688,15 +688,15 @@ export async function handleItaModal(interaction: ModalSubmitInteraction, servic
       await postToThread(
         interaction.client,
         fresh,
-        `${bigLabel}🎲 <@${interaction.user.id}> が【${optLabel}】に ${fmtEther(amt).replace(" ◈", "◈")} を投じた${
-          result.previous !== null ? `（張り直し・前額 ${fmtEther(result.previous).replace(" ◈", "◈")} を返金）` : ""
+        `${bigLabel}🎲 <@${interaction.user.id}> が【${optLabel}】に ${fmtEther(amt).replace(" Ld", "Ld")} を投じた${
+          result.previous !== null ? `（張り直し・前額 ${fmtEther(result.previous).replace(" Ld", "Ld")} を返金）` : ""
         }`,
       );
     }
   } catch (e) {
     const msg =
       e instanceof MarketError && e.code === "ERR_INSUFFICIENT_ETHER"
-        ? "エテル残高が足りない。"
+        ? "Land残高が足りない。"
         : e instanceof MarketError
           ? e.code
           : "処理失敗。";
@@ -786,7 +786,7 @@ export async function announceSettle(client: Client, m: Market, settled: MarketS
   const resultLabel = settled.resultOption !== null ? options[settled.resultOption] : "?";
   const payoutLines = settled.payouts
     .slice(0, 20)
-    .map((p) => `<@${p.userId}>  +${p.amount.toLocaleString("ja-JP")}◈`)
+    .map((p) => `<@${p.userId}>  +${p.amount.toLocaleString("ja-JP")}Ld`)
     .join("\n");
   const modeLabel = settled.mode === "parimutuel" ? "パリミュ" : "総取り";
   const extra =
@@ -796,7 +796,7 @@ export async function announceSettle(client: Client, m: Market, settled: MarketS
     m,
     [
       `🎉 板 #${m.id} 精算完了！ 勝ちは【${resultLabel}】（${modeLabel}）`,
-      `プール ${settled.pot.toLocaleString("ja-JP")}◈ ・ 場代 ${settled.houseCut.toLocaleString("ja-JP")}◈ → JP`,
+      `プール ${settled.pot.toLocaleString("ja-JP")}Ld ・ 場代 ${settled.houseCut.toLocaleString("ja-JP")}Ld → JP`,
       "",
       payoutLines + extra || "（配当なし）",
     ].join("\n"),

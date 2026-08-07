@@ -69,6 +69,9 @@ function fakeServices(phase: Phase, status = "open") {
       }),
     },
     departments: { get: () => ({ name: "賭博場" }), balanceOf: () => 1_000_000 },
+    // PR13: 運営卓の運転資金目安（capacityWorksheetLine）は開業設定をSELECTのみで読む。
+    // 未設定（settings行なし）を模して getString は常に undefined を返す
+    settings: { getString: () => undefined },
   } as unknown as Services;
 }
 
@@ -105,79 +108,44 @@ const text = (fn: ReturnType<typeof vi.fn>): string => {
   return arg.content ?? "";
 };
 
-describe("両替所パネル（項目8）", () => {
-  it("正式開業前は『正式開業準備中』を出し、預入・返還ボタンを押せなくする", () => {
-    const msg = exchangePanelMessage(fakeServices("pre_reset"));
-    const embed = msg.embeds[0]!.toJSON();
-    expect(embed.description).toContain("正式開業準備中");
-    expect(embed.description).toContain("預入・返還・賭け・資金投入・売上精算は停止中");
-    expect(embed.description).toContain("既存残高は保持されています");
-    expect(embed.description).toContain("opening_v1 確定後に開始します");
-    // 1:1 を約束する文言は出さない
-    expect(embed.title).not.toContain("1 Ld ＝ 1");
-    expect(JSON.stringify(embed.fields)).not.toContain("1 Ld");
-    const buttons = msg.components[0]!.toJSON().components as Array<{ custom_id: string; disabled?: boolean }>;
-    expect(buttons.find((b) => b.custom_id === "ether:buy")?.disabled).toBe(true);
-    expect(buttons.find((b) => b.custom_id === "ether:sell")?.disabled).toBe(true);
-  });
+describe("旧両替所パネル（PR13で無効化）", () => {
+  it.each(["pre_reset", "formal", "unknown"] as const)(
+    "%s でも同じ無効化パネルを返し、コンポーネントを持たない",
+    (phase) => {
+      const msg = exchangePanelMessage(fakeServices(phase));
+      const embed = msg.embeds[0]!.toJSON();
+      expect(embed.description).toContain("旧パネルは無効です");
+      expect(msg.components).toEqual([]);
+      expect(JSON.stringify(embed)).not.toContain("エテル");
+      expect(JSON.stringify(embed)).not.toContain("ether:");
+    },
+  );
 
-  it("opening_v1のときだけ『1 Ld ＝ 1』と預入・返還可能を出す", () => {
-    const msg = exchangePanelMessage(fakeServices("formal"));
-    const embed = msg.embeds[0]!.toJSON();
-    expect(embed.title).toContain("1 Ld ＝ 1");
-    expect(embed.description).toContain("預入・返還は常に1:1");
-    expect(embed.description).not.toContain("正式開業準備中");
-    const buttons = msg.components[0]!.toJSON().components as Array<{ custom_id: string; disabled?: boolean }>;
-    expect(buttons.find((b) => b.custom_id === "ether:buy")?.disabled).toBeFalsy();
-    expect(buttons.find((b) => b.custom_id === "ether:sell")?.disabled).toBeFalsy();
-  });
+  it.each(["pre_reset", "formal", "unknown"] as const)(
+    "%s でも旧ボタン（入場・退場・財布・更新）を押すと資金を動かさず無効の旨だけ返す",
+    async (phase) => {
+      for (const id of ["ether:buy", "ether:sell", "ether:balance", "ether:refresh"]) {
+        const services = fakeServices(phase);
+        const b = button(id);
+        await handleEtherButton(b.i, services);
+        expect(text(b.reply)).toContain("この旧ボタンは無効です");
+        expect(services.chips.deposit).not.toHaveBeenCalled();
+        expect(services.chips.redeem).not.toHaveBeenCalled();
+      }
+    },
+  );
 
-  it("未知版では異常表示にして、残高の読み取りで落ちない", () => {
-    const msg = exchangePanelMessage(fakeServices("unknown"));
-    const embed = msg.embeds[0]!.toJSON();
-    expect(embed.title).toContain("版が異常");
-    expect(embed.description).toContain("準備口座を特定できない");
-    const buttons = msg.components[0]!.toJSON().components as Array<{ custom_id: string; disabled?: boolean }>;
-    expect(buttons.find((b) => b.custom_id === "ether:buy")?.disabled).toBe(true);
-    expect(buttons.find((b) => b.custom_id === "ether:sell")?.disabled).toBe(true);
-  });
-
-  it("財布は残高を出しつつ、開業前は換金見積りを出さない", async () => {
-    const pre = button("ether:balance");
-    await handleEtherButton(pre.i, fakeServices("pre_reset"));
-    const preEmbed = (pre.reply.mock.calls[0]![0] as { embeds: Array<{ toJSON(): Record<string, unknown> }> }).embeds[0]!.toJSON() as {
-      description?: string;
-      fields?: Array<{ name: string }>;
-    };
-    expect(preEmbed.description).toContain("正式開業準備中");
-    expect(preEmbed.fields?.map((f) => f.name).join()).not.toContain("今すぐ換金すると");
-
-    const open = button("ether:balance");
-    await handleEtherButton(open.i, fakeServices("formal"));
-    const openEmbed = (open.reply.mock.calls[0]![0] as { embeds: Array<{ toJSON(): Record<string, unknown> }> }).embeds[0]!.toJSON() as {
-      fields?: Array<{ name: string }>;
-    };
-    expect(openEmbed.fields?.map((f) => f.name).join()).toContain("今すぐ換金すると");
-  });
-
-  it.each(["pre_reset", "unknown"] as const)("%s では stale ボタンから modal を開かせず、専用文面で断る", async (phase) => {
-    for (const id of ["ether:buy", "ether:sell"]) {
-      const b = button(id);
-      await handleEtherButton(b.i, fakeServices(phase));
-      expect(b.showModal).not.toHaveBeenCalled();
-      expect(text(b.reply)).toContain(phase === "unknown" ? "版が異常" : "正式開業準備中");
-      expect(text(b.reply)).not.toContain("処理に失敗");
-    }
-  });
-
-  it.each(["pre_reset", "unknown"] as const)("%s では stale modal の着地も専用文面で断り、資金APIを呼ばない", async (phase) => {
-    const services = fakeServices(phase);
-    const m = modal("ether:modal:buy", "10000");
-    await handleEtherModal(m.i, services);
-    expect(text(m.reply)).toContain(phase === "unknown" ? "版が異常" : "正式開業準備中");
-    expect(services.chips.deposit).not.toHaveBeenCalled();
-    expect(services.chips.redeem).not.toHaveBeenCalled();
-  });
+  it.each(["pre_reset", "formal", "unknown"] as const)(
+    "%s でも旧フォーム送信は資金を動かさず無効の旨だけ返す",
+    async (phase) => {
+      const services = fakeServices(phase);
+      const m = modal("ether:modal:buy", "10000");
+      await handleEtherModal(m.i, services);
+      expect(text(m.reply)).toContain("この旧フォームは無効です");
+      expect(services.chips.deposit).not.toHaveBeenCalled();
+      expect(services.chips.redeem).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("運営卓の賭場ホーム（項目8）", () => {
@@ -195,16 +163,16 @@ describe("運営卓の賭場ホーム（項目8）", () => {
     const { description, buttons } = await casinoHomeText("pre_reset");
     expect(description).toContain("正式開業準備中");
     expect(description).toContain("預入・返還・賭け・資金投入・売上精算は停止中");
-    expect(description).toContain("チップ交換比率**: 停止中");
-    expect(description).not.toMatch(/チップ交換比率\*\*: 1 Ld = 1 ◈/);
+    expect(description).toContain("チップ比率**: 停止中");
+    expect(description).not.toMatch(/チップ比率\*\*: 1 チップ = 1 Ld/);
     // 資金投入・売上精算は押せない
     expect(buttons.find((b) => b.custom_id === "mgmt:casino:fund")?.disabled).toBe(true);
     expect(buttons.find((b) => b.custom_id === "mgmt:casino:settle")?.disabled).toBe(true);
   });
 
-  it("opening_v1 では 1 Ld = 1 ◈ を出し、資金投入・売上精算を開放する", async () => {
+  it("opening_v1 では 1 チップ = 1 Ld を出し、資金投入・売上精算を開放する", async () => {
     const { description, buttons } = await casinoHomeText("formal");
-    expect(description).toContain("チップ交換比率**: 1 Ld = 1 ◈");
+    expect(description).toContain("チップ比率**: 1 チップ = 1 Ld");
     expect(description).not.toContain("正式開業準備中");
     expect(buttons.find((b) => b.custom_id === "mgmt:casino:fund")?.disabled).toBeFalsy();
     expect(buttons.find((b) => b.custom_id === "mgmt:casino:settle")?.disabled).toBeFalsy();

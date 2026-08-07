@@ -14,6 +14,7 @@ import { fmtLd, fmtLdCompact } from "../format.js";
 import { renderProfileCard } from "../render/profile-card.js";
 import { isAdmin } from "../permissions.js";
 import { resolveSpecialProfile } from "../special-profile.js";
+import { readAvailableWallet } from "../casino/wallet.js";
 import {
   TEXT_TIERS,
   VOICE_TIERS,
@@ -31,6 +32,15 @@ const RANK_LABEL: Record<string, string> = {
   meirei: "迷霊",
   departed: "去りし魂",
 };
+
+/**
+ * プロフィールカードに出す「所持」= 利用可能額（正本 §4.3・PR13監査）。
+ * 判定・合算は `readAvailableWallet()` へ一本化してある（opening phase前・未知版・
+ * チップ帳簿エラー・overflowでは通常Landのみを返す。fail-closed）。
+ */
+export function resolveProfileBalance(services: Services, userId: string): number {
+  return readAvailableWallet(services, userId).available;
+}
 
 export const profileCommand = new SlashCommandBuilder()
   .setName("プロフィール")
@@ -63,7 +73,7 @@ export async function handleProfile(
   const newlyGranted = services.titles.evaluate(target.id);
 
   const soul = services.entry.getSoul(target.id);
-  const balance = services.ledger.balanceOf(`user:${target.id}`);
+  const balance = resolveProfileBalance(services, target.id);
 
   // 鯖のニックネーム・アバター・参加日を確実に読むため cache ではなく fetch する
   const member = (await interaction.guild?.members.fetch(target.id).catch(() => null)) as

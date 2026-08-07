@@ -20,12 +20,12 @@ import type { Services } from "../services.js";
 
 /**
  * /賭場商店 — マモンの賭場のお守り商店。
- * casino-bot /商店 準拠。エテル建てで消耗品を買う → 「装備」→ 発動条件で自動消費。
+ * casino-bot /商店 準拠。Land表示の価格で消耗品を買う → 「装備」→ 発動条件で自動消費。
  * 冥獄城の /商館（Land建てショップ）とは経済圏が分離されている（賭場内で完結）。
  */
 export const bakutenCommand = new SlashCommandBuilder()
   .setName("賭場商店")
-  .setDescription("🛍 マモンの賭場のお守り商店（エテル建て）")
+  .setDescription("🛍 マモンの賭場のお守り商店（Land建て）")
   .setDMPermission(false);
 
 export async function handleBakutenCommand(
@@ -57,7 +57,7 @@ function buildEmbed(userId: string, services: Services): EmbedBuilder {
     const own = inv.find((i) => i.key === c.key)?.quantity ?? 0;
     const armedMark = armed.has(c.key) ? " 🟢" : "";
     embed.addFields({
-      name: `${c.name}${armedMark}  ·  ${fmtEther(c.price).replace(" ◈", "◈")}`,
+      name: `${c.name}${armedMark}  ·  ${fmtEther(c.price).replace(" Ld", "Ld")}`,
       value: [
         `${c.desc}`,
         `所持 **${own}**${armed.has(c.key) ? "  ／  装備中" : ""}`,
@@ -77,7 +77,7 @@ function buildComponents(): ActionRowBuilder<StringSelectMenuBuilder | ButtonBui
     .setPlaceholder("買う商品を選ぶ")
     .addOptions(
       CONSUMABLES.map((c) => ({
-        label: `${c.name} — ${c.price.toLocaleString()} ◈`,
+        label: `${c.name} — ${c.price.toLocaleString()} Ld`,
         value: c.key,
         description: c.desc.slice(0, 100),
       })),
@@ -159,7 +159,7 @@ export async function handleBakutenSelect(
     const bought = buyConsumable(services, uid, def.key, interaction.id);
     if (!bought.ok) {
       await interaction.reply({
-        content: `エテルが足りない（所持 ${fmtEther(bought.held)} / 必要 ${fmtEther(def.price)}）。`,
+        content: `利用可能額が足りない（所持 ${fmtEther(bought.held)} / 必要 ${fmtEther(def.price)}）。`,
         flags: MessageFlags.Ephemeral,
       });
       return;

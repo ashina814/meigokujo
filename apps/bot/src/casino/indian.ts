@@ -55,11 +55,11 @@ export async function playIndian(
     return;
   }
   if (!Number.isInteger(stake) || stake < MIN_BET || stake > MAX_BET) {
-    await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} ◈ で。`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} Ld で。`, flags: MessageFlags.Ephemeral });
     return;
   }
   if (services.chips.balanceOf(challenger.id) < stake || services.chips.balanceOf(opponent.id) < stake) {
-    await interaction.reply({ content: "どちらかのエテル残高が足りない。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "どちらかのLand残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }
   const session = `indian:${interaction.id}`;
