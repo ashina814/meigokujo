@@ -43,6 +43,7 @@ export type CasinoRemittanceErrorCode =
   | "ERR_OPENING_CONFIG_REQUIRED"
   | "ERR_FUKU_RESERVE_UNCONFIGURED"
   | "ERR_FUKU_RESERVE_INVALID"
+  | "ERR_REMITTANCE_PERIOD_LOCKED"
   | "ERR_UNCLASSIFIED_HOUSE_TX"
   | "ERR_CORRUPT_STATE"
   | "ERR_NOT_DRAFT"
@@ -414,8 +415,44 @@ export class CasinoRemittance {
       );
       CREATE INDEX IF NOT EXISTS idx_casino_remittances_status
         ON casino_remittances(status, kind, period);
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_casino_remittances_active_period
+        ON casino_remittances(period)
+        WHERE kind='remittance' AND status IN ('draft','approved','executed');
     `);
     this.schemaReady = true;
+  }
+
+  private activeRemittanceForPeriod(periodInput: string): { key: string; status: "draft" | "approved" | "executed" } | undefined {
+    const period = assertPeriod(periodInput);
+    const row = this.db.prepare(`
+      SELECT key, status
+      FROM casino_remittances
+      WHERE kind='remittance'
+        AND period=?
+        AND status IN ('draft','approved','executed')
+      ORDER BY id
+      LIMIT 1
+    `).get(period) as { key: unknown; status: unknown } | undefined;
+    if (!row) return undefined;
+    if (row.status !== "draft" && row.status !== "approved" && row.status !== "executed") {
+      throw new CasinoRemittanceError("ERR_CORRUPT_STATE", {
+        field: "activeRemittance.status",
+        value: row.status,
+      });
+    }
+    return { key: assertPlanKey(row.key), status: row.status };
+  }
+
+  private assertRemittancePeriodAvailable(period: string, key: string): void {
+    const active = this.activeRemittanceForPeriod(period);
+    if (active && active.key !== key) {
+      throw new CasinoRemittanceError("ERR_REMITTANCE_PERIOD_LOCKED", {
+        period,
+        key,
+        existingKey: active.key,
+        existingStatus: active.status,
+      });
+    }
   }
 
   private now(): number {
@@ -691,6 +728,9 @@ export class CasinoRemittance {
           return existing;
         }
       }
+      if (snapshot.kind === "remittance") {
+        this.assertRemittancePeriodAvailable(snapshot.period, key);
+      }
       throw e;
     }
     return this.get(key)!;
@@ -700,7 +740,11 @@ export class CasinoRemittance {
     this.ensureSchema();
     const key = assertPlanKey(keyInput);
     const actor = assertIdentifier(actorInput, "actor");
-    const run = this.db.transaction(() => this.insertDraft(key, this.remittanceSnapshot(), actor, null));
+    const run = this.db.transaction(() => {
+      const snapshot = this.remittanceSnapshot();
+      this.assertRemittancePeriodAvailable(snapshot.period, key);
+      return this.insertDraft(key, snapshot, actor, null);
+    });
     return this.db.inTransaction ? run() : run.immediate();
   }
 
