@@ -11,7 +11,7 @@ registerDefaultTxTypes();
 
 const input = JSON.parse(process.argv[2] ?? "{}") as {
   dbPath: string;
-  action: "approve" | "execute";
+  action: "draft" | "approve" | "execute";
   key: string;
   actor: string;
   startAt: number;
@@ -26,13 +26,17 @@ const reservations = new HouseReservations(db, chips, events);
 chips.setReservedProvider((holder) => holder === HOUSE_HOLDER ? reservations.totalReserved() : 0);
 const remit = new CasinoRemittance(db, ledger, chips, reservations, settings, { fukuReserve: () => 0 });
 
-// barrier前にschema/account初期化を済ませ、競合対象をapprove/execute本体へ限定する。
+// barrier前にschema/account初期化を済ませ、競合対象をdraft/approve/execute本体へ限定する。
 remit.get(input.key);
 
 const delay = Math.max(0, input.startAt - Date.now());
 setTimeout(() => {
   try {
-    const row = input.action === "approve" ? remit.approve(input.key, input.actor) : remit.execute(input.key, input.actor);
+    const row = input.action === "draft"
+      ? remit.draftRemittance(input.key, input.actor)
+      : input.action === "approve"
+        ? remit.approve(input.key, input.actor)
+        : remit.execute(input.key, input.actor);
     console.log(JSON.stringify({ ok: true, status: row.status, approvedBy: row.approvedBy, executedBy: row.executedBy }));
   } catch (e) {
     const err = e as Error & { code?: string };
