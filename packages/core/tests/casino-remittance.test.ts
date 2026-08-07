@@ -226,6 +226,118 @@ describe("PR14 clean remittance / bailout", () => {
     c.db.close();
   });
 
+  it("SQLite partial UNIQUEが同一月のactive remittanceをDB直書きでも拒否する", () => {
+    const c = setup();
+    configure(c, { bps: 0 });
+    fund(c, HOUSE_HOLDER, 1000, "seed:house");
+    c.remit.draftRemittance("m1", "maker");
+    expect(() => c.db.prepare(`
+      INSERT INTO casino_remittances
+        (key, kind, period, amount, status, plan_hash, snapshot_json, reason, created_by, created_at)
+      SELECT 'm2', kind, period, amount, 'draft', plan_hash, snapshot_json, NULL, 'other', created_at
+      FROM casino_remittances WHERE key='m1'
+    `).run()).toThrow();
+    expect(c.db.prepare(`
+      SELECT COUNT(*) AS n FROM casino_remittances
+      WHERE kind='remittance' AND period='2026-08' AND status IN ('draft','approved','executed')
+    `).get()).toEqual({ n: 1 });
+    c.db.close();
+  });
+
+  it("同月に別keyで2件目remittance draftを拒否する", () => {
+    const c = setup();
+    configure(c, { bps: 0 });
+    fund(c, HOUSE_HOLDER, 1000, "seed:house");
+    c.remit.draftRemittance("m1", "maker");
+    expect(() => c.remit.draftRemittance("m2", "other"))
+      .toThrowError(expect.objectContaining({ code: "ERR_REMITTANCE_PERIOD_LOCKED" }));
+    c.db.close();
+  });
+
+  it("同月のremittanceがdraft中なら2件目を拒否する", () => {
+    const c = setup();
+    configure(c, { bps: 0 });
+    fund(c, HOUSE_HOLDER, 1000, "seed:house");
+    expect(c.remit.draftRemittance("m1", "maker").status).toBe("draft");
+    expect(() => c.remit.draftRemittance("m2", "other"))
+      .toThrowError(expect.objectContaining({
+        code: "ERR_REMITTANCE_PERIOD_LOCKED",
+        meta: expect.objectContaining({ existingStatus: "draft" }),
+      }));
+    c.db.close();
+  });
+
+  it("同月のremittanceがapproved中なら2件目を拒否する", () => {
+    const c = setup();
+    configure(c, { bps: 0 });
+    fund(c, HOUSE_HOLDER, 1000, "seed:house");
+    c.remit.draftRemittance("m1", "maker");
+    c.remit.approve("m1", "reviewer");
+    expect(() => c.remit.draftRemittance("m2", "other"))
+      .toThrowError(expect.objectContaining({
+        code: "ERR_REMITTANCE_PERIOD_LOCKED",
+        meta: expect.objectContaining({ existingStatus: "approved" }),
+      }));
+    c.db.close();
+  });
+
+  it("同月のremittanceがexecuted後も2件目を拒否する", () => {
+    const c = setup();
+    configure(c, { bps: 0 });
+    fund(c, HOUSE_HOLDER, 1000, "seed:house");
+    c.remit.draftRemittance("m1", "maker");
+    c.remit.approve("m1", "reviewer");
+    c.remit.execute("m1", "operator");
+    expect(() => c.remit.draftRemittance("m2", "other"))
+      .toThrowError(expect.objectContaining({
+        code: "ERR_REMITTANCE_PERIOD_LOCKED",
+        meta: expect.objectContaining({ existingStatus: "executed" }),
+      }));
+    c.db.close();
+  });
+
+  it("rejected後は同一月に別keyでremittanceを再起案できる", () => {
+    const c = setup();
+    configure(c, { bps: 0 });
+    fund(c, HOUSE_HOLDER, 1000, "seed:house");
+    c.remit.draftRemittance("m1", "maker");
+    c.remit.reject("m1", "reviewer", "redo");
+    expect(c.remit.draftRemittance("m2", "maker2")).toMatchObject({
+      key: "m2", period: "2026-08", status: "draft",
+    });
+    c.db.close();
+  });
+
+  it("JST翌月なら前月active remittanceがあっても起案できる", () => {
+    const c = setup({ now: JST_JULY_END });
+    configure(c, { bps: 0 });
+    fund(c, HOUSE_HOLDER, 1000, "seed:house");
+    expect(c.remit.draftRemittance("july", "maker").period).toBe("2026-07");
+    c.setNow(JST_AUG_START);
+    expect(c.remit.draftRemittance("aug", "maker")).toMatchObject({
+      period: "2026-08", status: "draft",
+    });
+    c.db.close();
+  });
+
+  it("納付率50%を同月に二重適用できない", () => {
+    const c = setup();
+    configure(c, { min: 0, bps: 5000 });
+    fund(c, HOUSE_HOLDER, 200, "seed:house");
+    createProfit(c, 800);
+    expect(c.remit.draftRemittance("m1", "maker").amount).toBe(400);
+    c.remit.approve("m1", "reviewer");
+    c.remit.execute("m1", "operator");
+    expect(() => c.remit.draftRemittance("m2", "maker2"))
+      .toThrowError(expect.objectContaining({ code: "ERR_REMITTANCE_PERIOD_LOCKED" }));
+    expect(c.db.prepare(`
+      SELECT COALESCE(SUM(amount),0) AS total FROM casino_remittances
+      WHERE kind='remittance' AND period='2026-08' AND status='executed'
+    `).get()).toEqual({ total: 400 });
+    expect(c.chips.balanceOf(HOUSE_HOLDER)).toBe(600);
+    c.db.close();
+  });
+
   it("JST月境界でYYYY-MMを決める", () => {
     const c = setup({ now: JST_JULY_END });
     configure(c, { bps: 0 });
