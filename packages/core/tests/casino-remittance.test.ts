@@ -193,6 +193,7 @@ describe("PR14 clean remittance / bailout", () => {
     configure(c);
     fund(c, HOUSE_HOLDER, 1000, "seed:house");
     fund(c, "u1", 100, "seed:u1");
+    c.ledger.ensureAccount("user:u1", "user");
     c.chips.redeem("u1", 10, "redeem:u1");
     expect(c.remit.syncRealized()).toBe(0);
     expect(c.remit.cumulativeProfit()).toBe(0);
