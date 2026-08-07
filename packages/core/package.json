@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./casino/remittance": "./src/casino/remittance.ts"
   },
   "scripts": {
     "test": "vitest run && vitest run --config vitest.serial.config.ts",
