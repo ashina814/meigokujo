@@ -29,7 +29,6 @@ import type { Services } from "../services.js";
 import {
   MIN_BET,
   acquireSeat,
-  effectiveMaxBet,
   handleRetryPress,
   releaseHouseLiability,
   releaseSeat,
@@ -41,6 +40,7 @@ import {
 } from "./common.js";
 import { C_MAMMON } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
+import { buildSoloResult } from "./solo-result.js";
 
 /**
  * 🎰 スロット。casino-bot 準拠。数値モデルは core/casino/slots-model へ委譲。
@@ -62,7 +62,7 @@ const cycleAt = (n: number) => CYCLE[n % CYCLE.length]!;
 
 const isScatter = (s: SlotSymbol) => s.kind === "scatter";
 
-function paytableEmbed(): EmbedBuilder {
+export function paytableEmbed(): EmbedBuilder {
   const tripleLines = Object.entries(TRIPLE_PAYOUTS)
     .map(([name, mul]) => {
       const sym = SYMBOLS.find((s) => s.name === name)!;
@@ -135,30 +135,6 @@ function buildSpinEmbed(
         `JP ${fmtEther(jp).replace(" Ld", "Ld")}${jpHigh ? " 🔥" : ""}`,
       ].join(" · "),
     });
-}
-
-function retryButtons(uid: string, bet: number, services: Services): ActionRowBuilder<ButtonBuilder> {
-  const held = services.chips.balanceOf(uid);
-  const min = MIN_BET;
-  const max = Math.min(effectiveMaxBet(services, uid, "スロット"), held);
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`slots:retry:${min}`)
-      .setLabel(`最低 ${min.toLocaleString()}`)
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(held < min),
-    new ButtonBuilder()
-      .setCustomId(`slots:retry:${bet}`)
-      .setLabel(`🎰 もう一回 ${bet.toLocaleString()}`)
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(held < bet),
-    new ButtonBuilder()
-      .setCustomId(`slots:retry:${max}`)
-      .setLabel(`最大 ${max.toLocaleString()}`)
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(max < min),
-    new ButtonBuilder().setCustomId("slots:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
-  );
 }
 
 export async function playSlots(
@@ -596,10 +572,7 @@ async function renderSpin(
   // 結果 embed（Fields でセクション化）
   const isJp = spin.kind === "jackpot";
   const bigWin = won && totalPayout >= bet * 5;
-  const color = isJp ? 0xf0b429 : bigWin ? 0x16a34a : won ? 0x22c55e : 0x991b1b;
-
-  const tag = isJp ? "💎 JACKPOT!" : bigWin ? "🔥 大勝ち" : won ? "🟢 勝ち" : "🔴 ハズレ";
-  const netStr = net === 0 ? "±0 Ld" : `${net > 0 ? "+" : "−"}${Math.abs(net).toLocaleString("ja-JP")} Ld`;
+  const color = isJp ? 0xf0b429 : bigWin ? 0x16a34a : won ? 0x22c55e : net === 0 ? 0x78716c : 0x991b1b;
 
   const bonusBits: string[] = [];
   if (settled && settled.chainBonus > 0) {
@@ -611,24 +584,21 @@ async function renderSpin(
   if (amulet.note) bonusBits.push(`✨ ${amulet.note}`);
   if (jpWon > 0) bonusBits.push(`💎 JP獲得  +${fmtEther(jpWon)}（残 ${fmtEther(services.casino.jackpotPool())}）`);
 
-  const resultEmbed = new EmbedBuilder()
-    .setAuthor({ name: `マモンの賭場 · スロット${isFreeSpin ? " · フリースピン" : ""}` })
-    .setColor(color)
-    .setTitle(`${tag}  **${netStr}**`)
-    .setDescription(reelDisplay + (payoutLabel ? `\n\n${payoutLabel}` : "") + (spin.freeSpin && !isFreeSpin ? `\n\n✨ **魂片3つ！フリースピン獲得！** ✨` : ""))
-    .addFields(
-      ...(bonusBits.length > 0
-        ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }]
-        : []),
-    )
-    .setFooter({
-      text: [
-        `所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" Ld", "Ld")}`,
-        !isFreeSpin ? `賭け ${fmtEther(bet).replace(" Ld", "Ld")}` : "無料",
-        winStreak >= 2 ? `🔥 ${winStreak}連勝` : "",
-        `JP ${fmtEther(services.casino.jackpotPool()).replace(" Ld", "Ld")}`,
-      ].filter(Boolean).join(" · "),
-    });
+  const resultPayload = buildSoloResult({
+    services,
+    userId: uid,
+    game: "スロット",
+    net,
+    wager: isFreeSpin ? "無料" : bet,
+    retryBet: bet,
+    isJackpot: isJp,
+    colorOverride: color,
+    description: reelDisplay + (payoutLabel ? `\n\n${payoutLabel}` : "") + (spin.freeSpin && !isFreeSpin ? `\n\n✨ **魂片3つ！フリースピン獲得！** ✨` : ""),
+    sections: [
+      ...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []),
+      { name: "▸ JP", value: `JP ${fmtEther(services.casino.jackpotPool())}${winStreak >= 2 ? ` · 🔥 ${winStreak}連勝` : ""}`, inline: false },
+    ],
+  });
   // 大勝ち速報
   if (won) {
     broadcastBigWin(interaction.client, services, {
@@ -643,7 +613,7 @@ async function renderSpin(
   // フリースピンなら結果表示後に自動で回す（原作準拠）。
   // 権利は DB に残っているので、ここで落ちても次の起動で払われる（PR3）
   if (record.pendingFreeSpin) {
-    await edit(resultEmbed, []);
+    await reply.edit({ embeds: resultPayload.embeds, components: [] }).catch(() => undefined);
     await sleep(2500);
     try {
       const free = resolveFreeSpin(services, record.pendingFreeSpin, reservationKey);
@@ -663,19 +633,15 @@ async function renderSpin(
     return;
   }
 
-  await edit(resultEmbed, [retryButtons(uid, bet, services)]);
+  await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
 
   // ── 「もう一回」/配当表 コレクタ ──
   const collector = reply.createMessageComponentCollector({
     componentType: ComponentType.Button,
     time: 60_000,
-    filter: (i) => i.user.id === uid,
+    filter: (i) => i.user.id === uid && i.customId.startsWith("slots:retry:"),
   });
   collector.on("collect", async (btn) => {
-    if (btn.customId === "slots:paytable") {
-      await btn.reply({ embeds: [paytableEmbed()], flags: MessageFlags.Ephemeral });
-      return;
-    }
     if (btn.customId.startsWith("slots:retry:")) {
       // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
       // 断るなら collector を止めない ＝ 押し直せる。
@@ -691,6 +657,6 @@ async function renderSpin(
     }
   });
   collector.on("end", async (_col, reason) => {
-    if (reason !== "retry") await edit(resultEmbed, []).catch(() => undefined);
+    if (reason !== "retry") await reply.edit({ components: [] }).catch(() => undefined);
   });
 }

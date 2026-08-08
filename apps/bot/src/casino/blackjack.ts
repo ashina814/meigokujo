@@ -15,7 +15,6 @@ import type { Services } from "../services.js";
 import {
   MIN_BET,
   acquireSeat,
-  effectiveMaxBet,
   handleRetryPress,
   releaseSeat,
   reserveBlackjackLiability,
@@ -25,6 +24,7 @@ import {
 } from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
+import { buildSoloResult } from "./solo-result.js";
 
 /**
  * 🃏 ブラックジャック（対マモン・ソロ）。
@@ -67,7 +67,7 @@ const showCard = (c: Card) => `${c.suit}${c.rank}`;
 const showHand = (hand: Card[], hideSecond = false) =>
   hand.map((c, i) => (hideSecond && i === 1 ? "🂠" : showCard(c))).join(" ");
 
-function paytableEmbed(): EmbedBuilder {
+export function paytableEmbed(): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle("📖 ブラックジャック — ルール")
     .setColor(C_MAMMON)
@@ -216,11 +216,16 @@ async function runRoundInner(
     if (fukuLine) bonusBits.push(fukuLine);
     if (amulet.note) bonusBits.push(`✨ ${amulet.note}`);
 
-    const embed = new EmbedBuilder()
-      .setAuthor({ name: "マモンの賭場 · ブラックジャック" })
-      .setColor(won ? C_WIN : push ? 0x78716c : C_LOSE)
-      .setTitle(`${tag}  **${netStr}**`)
-      .setDescription(
+    const resultPayload = buildSoloResult({
+      services,
+      userId: uid,
+      game: "ブラックジャック",
+      net: settled.net,
+      wager: totalBet,
+      retryBet: bet,
+      titleOverride: won ? "🟢 勝ち" : push ? "⚪ 引き分け" : "🔴 負け",
+      colorOverride: won ? C_WIN : push ? 0x78716c : C_LOSE,
+      description:
         [
           "```",
           `😈 マモン    ${showHand(dealer)}   合計 ${handValue(dealer)}`,
@@ -229,54 +234,19 @@ async function runRoundInner(
           "```",
           note,
         ].join("\n"),
-      )
-      .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
-      .setFooter({
-        text: [`所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" Ld", "Ld")}`, `賭け ${fmtEther(totalBet).replace(" Ld", "Ld")}`].join(" · "),
-      });
+      sections: bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : [],
+    });
 
     if (won) broadcastBigWin(interaction.client, services, { userId: uid, game: "ブラックジャック", bet: totalBet, payout: settled.payout });
 
-    const held = services.chips.balanceOf(uid);
-    const min = MIN_BET;
-    const max = Math.min(effectiveMaxBet(services, uid, "ブラックジャック"), held);
-    const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`bj:retry:${min}`)
-        .setLabel(`最低 ${min.toLocaleString()}`)
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(held < min),
-      new ButtonBuilder()
-        .setCustomId(`bj:retry:${bet}`)
-        .setLabel(`🎰 もう一回 ${bet.toLocaleString()}`)
-        .setStyle(ButtonStyle.Primary)
-        .setDisabled(held < bet),
-      new ButtonBuilder()
-        .setCustomId(`bj:retry:${max}`)
-        .setLabel(`最大 ${max.toLocaleString()}`)
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(max < min),
-      new ButtonBuilder().setCustomId("bj:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("bj:quit").setLabel("🚪 退席").setStyle(ButtonStyle.Secondary),
-    );
-    await reply.edit({ embeds: [embed], components: [retryRow] }).catch(() => undefined);
+    await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
 
     const collector = reply.createMessageComponentCollector({
       componentType: ComponentType.Button,
       time: 60_000,
-      filter: (i) => i.user.id === uid,
+      filter: (i) => i.user.id === uid && i.customId.startsWith("bj:retry:"),
     });
     collector.on("collect", async (btn) => {
-      if (btn.customId === "bj:paytable") {
-        await btn.reply({ embeds: [paytableEmbed()], flags: MessageFlags.Ephemeral });
-        return;
-      }
-      if (btn.customId === "bj:quit") {
-        collector.stop("quit");
-        await btn.deferUpdate();
-        await reply.edit({ components: [] }).catch(() => undefined);
-        return;
-      }
       if (btn.customId.startsWith("bj:retry:")) {
         // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
         // 断るなら collector を止めない ＝ 押し直せる
@@ -291,7 +261,7 @@ async function runRoundInner(
       }
     });
     collector.on("end", async (_c, reason) => {
-      if (reason !== "retry" && reason !== "quit") await reply.edit({ components: [] }).catch(() => undefined);
+      if (reason !== "retry") await reply.edit({ components: [] }).catch(() => undefined);
     });
   };
 

@@ -43,6 +43,7 @@ import {
   handleCasinoAmountModal,
   handleCasinoGameSelect,
 } from "./casino/amount-picker.js";
+import { handleCasinoResultButton, isCasinoResultButton } from "./casino/result-route.js";
 import {
   handleBankButton,
   handleDeptPanelButton,
@@ -421,6 +422,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith(CASINO_AMOUNT_CUSTOM_PREFIX)) {
         await handleCasinoAmountButton(interaction, services);
+        return;
+      }
+      if (isCasinoResultButton(interaction.customId)) {
+        await handleCasinoResultButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("vip:")) {

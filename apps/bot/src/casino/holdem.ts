@@ -15,7 +15,6 @@ import type { Services } from "../services.js";
 import {
   MIN_BET,
   acquireSeat,
-  effectiveMaxBet,
   handleRetryPress,
   releaseSeat,
   sleep,
@@ -23,7 +22,8 @@ import {
   withHouseReservation,
 } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
-import { C_MAMMON, E, HR_THIN, buildResultEmbed, fmtBigDelta } from "./ui.js";
+import { C_MAMMON, E, HR_THIN, fmtBigDelta } from "./ui.js";
+import { buildSoloResult } from "./solo-result.js";
 
 /**
  * 🃏 テキサスホールデム（対マモン簡易版・ソロ）。
@@ -164,6 +164,21 @@ function compareEval(a: HandEval, b: HandEval): number {
 }
 
 const showHand = (hand: Card[], hide = false) => (hide ? hand.map(() => "🂠").join(" ") : hand.map(showCard).join(" "));
+
+export function holdemRulesEmbed(): EmbedBuilder {
+  return new EmbedBuilder()
+    .setAuthor({ name: "マモンの賭場 · ホールデム" })
+    .setColor(C_MAMMON)
+    .setTitle("📖 ホールデム — ルール")
+    .setDescription(
+      [
+        "2枚の手札と5枚の共有札から最強の5枚役を作る。",
+        "プリフロップ、フロップ、ターン、リバーでコール・チェック・フォールドを選ぶ。",
+        "コールは開始anteと同額を追加し、マモンも同額を積む。",
+        "ショウダウンでは強い役がpot総取り。引き分けは自分の最終賭けを返却。",
+      ].join("\n"),
+    );
+}
 
 export async function playHoldem(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
@@ -346,16 +361,17 @@ async function runRoundInner(
   }
   if (amulet.note) bonusBits.push(`${E.sparkle} ${amulet.note}`);
 
-  const resultEmbed = buildResultEmbed({
+  const resultPayload = buildSoloResult({
+    services,
+    userId: uid,
     game: "ホールデム",
     net: settled.net,
-    bet: playerBet,
-    balance: services.chips.balanceOf(uid),
+    wager: playerBet,
+    retryBet: ante,
     sections: [
-      { icon: "🃏", label: "ボード", value: showHand([...flop, turn, river]), inline: false },
+      { name: "🃏 ボード", value: showHand([...flop, turn, river]), inline: false },
       {
-        icon: "👥",
-        label: "手役",
+        name: "👥 手役",
         value: [
           `${E.crown} お前     ${showHand(pHand)}`,
           `${E.demon} マモン   ${folded ? "🂠 🂠" : showHand(dHand)}`,
@@ -366,7 +382,7 @@ async function runRoundInner(
         inline: false,
       },
       ...(bonusBits.length > 0
-        ? [{ icon: "🔥", label: "ボーナス", value: bonusBits.join("\n"), inline: false } as const]
+        ? [{ name: "🔥 ボーナス", value: bonusBits.join("\n"), inline: false } as const]
         : []),
     ],
   });
@@ -375,41 +391,14 @@ async function runRoundInner(
     broadcastBigWin(interaction.client, services, { userId: uid, game: "ホールデム", bet: playerBet, payout: settled.payout });
   }
 
-  const heldEther = services.chips.balanceOf(uid);
-  const min = MIN_BET;
-  const max = Math.min(effectiveMaxBet(services, uid, "ホールデム"), heldEther);
-  const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`holdem:retry:${min}`)
-      .setLabel(`最低 ${min.toLocaleString()}`)
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(heldEther < min),
-    new ButtonBuilder()
-      .setCustomId(`holdem:retry:${ante}`)
-      .setLabel(`🎰 もう一回 ${ante.toLocaleString()}`)
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(heldEther < ante),
-    new ButtonBuilder()
-      .setCustomId(`holdem:retry:${max}`)
-      .setLabel(`最大 ${max.toLocaleString()}`)
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(max < min),
-    new ButtonBuilder().setCustomId("holdem:quit").setLabel("🚪 退席").setStyle(ButtonStyle.Secondary),
-  );
-  await reply.edit({ embeds: [resultEmbed], components: [retryRow] }).catch(() => undefined);
+  await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
 
   const collector = reply.createMessageComponentCollector({
     componentType: ComponentType.Button,
     time: 60_000,
-    filter: (i) => i.user.id === uid,
+    filter: (i) => i.user.id === uid && i.customId.startsWith("holdem:retry:"),
   });
   collector.on("collect", async (btn) => {
-    if (btn.customId === "holdem:quit") {
-      collector.stop("quit");
-      await btn.deferUpdate();
-      await reply.edit({ components: [] }).catch(() => undefined);
-      return;
-    }
     if (btn.customId.startsWith("holdem:retry:")) {
       // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
       // 断るなら collector を止めない ＝ 押し直せる
@@ -424,6 +413,6 @@ async function runRoundInner(
     }
   });
   collector.on("end", async (_c, reason) => {
-    if (reason !== "retry" && reason !== "quit") await reply.edit({ components: [] }).catch(() => undefined);
+    if (reason !== "retry") await reply.edit({ components: [] }).catch(() => undefined);
   });
 }

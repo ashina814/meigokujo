@@ -15,7 +15,6 @@ import type { Services } from "../services.js";
 import {
   MIN_BET,
   acquireSeat,
-  effectiveMaxBet,
   handleRetryPress,
   releaseSeat,
   sleep,
@@ -23,7 +22,8 @@ import {
   withHouseReservation,
 } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
-import { C_JACKPOT, C_MAMMON, E, HR_THIN, buildResultEmbed, fmtBigDelta } from "./ui.js";
+import { C_JACKPOT, C_MAMMON, E, HR_THIN, fmtBigDelta } from "./ui.js";
+import { buildSoloResult } from "./solo-result.js";
 
 /**
  * 🃏 ドローポーカー（Jacks or Better・ソロ）。対胴元の簡易版。
@@ -116,7 +116,7 @@ function evaluate(hand: Card[]): HandEval {
   return { category: cat, label: CAT_LABELS[cat]!, payMult: CAT_PAYS[cat]! };
 }
 
-function paytableEmbed(): EmbedBuilder {
+export function paytableEmbed(): EmbedBuilder {
   const lines = [
     "🏆  ロイヤルフラッシュ  ·  **×250**",
     "🌟  ストレートフラッシュ  ·  **×50**",
@@ -289,17 +289,20 @@ async function runRoundInner(
   }
   if (amulet.note) bonusBits.push(`${E.sparkle} ${amulet.note}`);
 
-  const resultEmbed = buildResultEmbed({
+  const resultPayload = buildSoloResult({
+    services,
+    userId: uid,
     game: "ポーカー",
     net: settled.net,
-    bet,
-    balance: services.chips.balanceOf(uid),
+    wager: bet,
+    retryBet: bet,
     isJackpot: isJp,
     sections: [
-      { icon: "🃏", label: "手札", value: hand.map((c) => `[${showCard(c)}]`).join("  "), inline: false },
-      { icon: "🏆", label: `${ev.label}  ·  配当倍率 ×${ev.payMult}`, value: bonusBits.length > 0 ? bonusBits.join("\n") : "─", inline: false },
+      { name: "🃏 手札", value: hand.map((c) => `[${showCard(c)}]`).join("  "), inline: false },
+      { name: `🏆 ${ev.label}  ·  配当倍率 ×${ev.payMult}`, value: bonusBits.length > 0 ? bonusBits.join("\n") : "─", inline: false },
     ],
   });
+  const resultEmbed = resultPayload.embeds![0] as EmbedBuilder;
   if (isJp) {
     resultEmbed.setColor(C_JACKPOT).setTitle(`💎  ロイヤルフラッシュ  ${fmtBigDelta(settled.net)}`);
   }
@@ -315,47 +318,14 @@ async function runRoundInner(
     });
   }
 
-  // ── リトライボタン ──
-  const heldEther = services.chips.balanceOf(uid);
-  const min = MIN_BET;
-  const max = Math.min(effectiveMaxBet(services, uid, "ポーカー"), heldEther);
-  const retryRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`poker:retry:${min}`)
-      .setLabel(`最低 ${min.toLocaleString()}`)
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(heldEther < min),
-    new ButtonBuilder()
-      .setCustomId(`poker:retry:${bet}`)
-      .setLabel(`🎰 もう一回 ${bet.toLocaleString()}`)
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(heldEther < bet),
-    new ButtonBuilder()
-      .setCustomId(`poker:retry:${max}`)
-      .setLabel(`最大 ${max.toLocaleString()}`)
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(max < min),
-    new ButtonBuilder().setCustomId("poker:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("poker:quit").setLabel("🚪 退席").setStyle(ButtonStyle.Secondary),
-  );
-  await reply.edit({ embeds: [resultEmbed], components: [retryRow] }).catch(() => undefined);
+  await reply.edit({ embeds: [resultEmbed], components: resultPayload.components }).catch(() => undefined);
 
   const collector = reply.createMessageComponentCollector({
     componentType: ComponentType.Button,
     time: 60_000,
-    filter: (i) => i.user.id === uid,
+    filter: (i) => i.user.id === uid && i.customId.startsWith("poker:retry:"),
   });
   collector.on("collect", async (btn) => {
-    if (btn.customId === "poker:paytable") {
-      await btn.reply({ embeds: [paytableEmbed()], flags: MessageFlags.Ephemeral });
-      return;
-    }
-    if (btn.customId === "poker:quit") {
-      collector.stop("quit");
-      await btn.deferUpdate();
-      await reply.edit({ components: [] }).catch(() => undefined);
-      return;
-    }
     if (btn.customId.startsWith("poker:retry:")) {
       // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
       // 断るなら collector を止めない ＝ 押し直せる
@@ -370,6 +340,6 @@ async function runRoundInner(
     }
   });
   collector.on("end", async (_c, reason) => {
-    if (reason !== "retry" && reason !== "quit") await reply.edit({ components: [] }).catch(() => undefined);
+    if (reason !== "retry") await reply.edit({ components: [] }).catch(() => undefined);
   });
 }
