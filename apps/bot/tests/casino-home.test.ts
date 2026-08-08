@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Interaction } from "discord.js";
+import { ChipLedgerError } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 import { isCasinoInteraction, denyIfCasinoClosed } from "../src/casino/gate.js";
 import { isCasinoPlayButton } from "../src/casino/play-route.js";
@@ -18,6 +19,7 @@ function fakeServices(opts: {
   pref?: { game: string; amount: number } | null;
   maxLiability?: number;
   jpThrows?: boolean;
+  ledgerError?: boolean;
 } = {}): Services {
   const phase = opts.phase ?? "formal";
   const status = opts.status ?? "open";
@@ -33,7 +35,10 @@ function fakeServices(opts: {
     chipTx: { openingPhase: () => phase },
     ledger: { balanceOf: () => land },
     chipAssets: {
-      forUser: () => ({ userId: "u1", freeChips: free, escrowed, total: free + escrowed }),
+      forUser: () => {
+        if (opts.ledgerError) throw new ChipLedgerError("ERR_CORRUPT_BALANCE");
+        return { userId: "u1", freeChips: free, escrowed, total: free + escrowed };
+      },
       freeChips: () => free,
     },
     casino: {
@@ -88,9 +93,11 @@ describe("/賭場 ホーム", () => {
   });
 
   it("legacy_pre_reset では正式開業準備中を表示し、操作ボタンを押せる見た目にしない", async () => {
-    const services = fakeServices({ phase: "pre_reset" });
+    const services = fakeServices({ phase: "pre_reset", land: 50_000, ledgerError: true });
     const { embed, buttons } = homeJson(services);
     expect(embed.description).toContain("正式開業準備中");
+    expect(embed.description).toContain("通常Land 50,000 Ld");
+    expect(embed.description).toContain("自由チップは正式開業まで利用できません");
     expect(embed.description).toContain("資金操作");
     expect(embed.description).toContain("福分けは正式開業後に利用できます");
     expect(buttons.find((b) => b.custom_id === "casino:play:スロット:100")?.disabled).toBe(true);
@@ -100,10 +107,13 @@ describe("/賭場 ホーム", () => {
     expect((stale.reply.mock.calls[0]![0] as { content: string }).content).toContain("正式開業準備中");
   });
 
-  it("unknown opening version では異常表示になり、操作を通さない", async () => {
-    const services = fakeServices({ phase: "unknown", jpThrows: true });
+  it("unknown opening version では通常Landだけを残してfail-closed表示になり、操作を通さない", async () => {
+    const services = fakeServices({ phase: "unknown", land: 50_000, free: 12_400, jpThrows: true });
     const { embed } = homeJson(services);
     expect(embed.description).toContain("版が異常");
+    expect(embed.description).toContain("所持 50,000 Ld（通常Landのみ）");
+    expect(embed.description).toContain("自由チップ・預け中資金は確認できません");
+    expect(embed.description).not.toContain("62,400 Ld");
     expect(embed.description).toContain("福分け 確認停止");
     expect(embed.description).toContain("JP 確認停止");
     expect(embed.description).not.toContain("JP 8,420 Ld");
@@ -113,11 +123,33 @@ describe("/賭場 ホーム", () => {
     expect((stale.reply.mock.calls[0]![0] as { content: string }).content).toContain("版が異常");
   });
 
-  it("formal opening では自由チップだけを所持Landとして表示し、escrowedを混ぜない", () => {
+  it("formal opening では通常Land + 自由チップを所持として表示し、escrowedは別行にする", () => {
     const { embed } = homeJson(fakeServices({ phase: "formal", land: 50_000, free: 12_400, escrowed: 500 }));
-    expect(embed.description).toContain("所持 **12,400 Ld**");
+    expect(embed.description).toContain("所持 **62,400 Ld**");
     expect(embed.description).toContain("預け中 500 Ld");
+    expect(embed.description).not.toContain("62,900 Ld");
+    expect(embed.footer?.text).toBe("通常Land 50,000 Ld · 自由チップ 12,400 Ld · 預け中 500 Ld");
+  });
+
+  it("formalでチップ帳簿を読めない場合は破損値を0扱いせず通常Landだけを表示する", () => {
+    const { embed } = homeJson(fakeServices({ phase: "formal", land: 50_000, free: 12_400, ledgerError: true }));
+    expect(embed.description).toContain("所持 50,000 Ld（通常Landのみ）");
+    expect(embed.description).toContain("チップ帳簿を確認できません");
     expect(embed.description).not.toContain("62,400 Ld");
+    expect(embed.footer?.text).toBe("チップ帳簿エラー");
+  });
+
+  it("safe integer overflowは正常な所持額として表示せず通常Landだけにfail-closedする", () => {
+    const { embed } = homeJson(fakeServices({
+      phase: "formal",
+      land: Number.MAX_SAFE_INTEGER,
+      free: 10,
+      escrowed: 500,
+    }));
+    expect(embed.description).toContain("所持 9,007,199,254,740,991 Ld（通常Landのみ）");
+    expect(embed.description).toContain("残高の合算に失敗しました");
+    expect(embed.description).not.toContain("預け中 500 Ld");
+    expect(embed.footer?.text).toBe("残高合算エラー");
   });
 
   it("JP実残高とDaily受取可能/不可を表示する", () => {

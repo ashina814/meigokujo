@@ -12,6 +12,7 @@ import { fmtLd } from "../format.js";
 import { C_JACKPOT, C_MAMMON, E } from "../casino/ui.js";
 import { checkRetry } from "../casino/common.js";
 import { openingNotice, openingPhase, operatingLabel } from "../casino/opening.js";
+import { readAvailableWallet } from "../casino/wallet.js";
 import type { Services } from "../services.js";
 
 const DEFAULT_GAME = "スロット";
@@ -153,26 +154,37 @@ export function renderCasinoHome(userId: string, services: Services, serverName?
 }
 
 function casinoHomeWallet(userId: string, services: Services): { lines: string[]; footer: string } {
-  const phase = openingPhase(services);
-  if (phase === "unknown") {
+  const wallet = readAvailableWallet(services, userId);
+  if (wallet.status === "unknown") {
     return {
-      lines: ["所持 読み取り停止", "自由チップ・預け中資金は確認できません"],
+      lines: [`所持 ${fmtLd(wallet.land)}（通常Landのみ）`, "自由チップ・預け中資金は確認できません"],
       footer: "賭場の版が異常",
     };
   }
-  if (phase !== "formal") {
+  if (wallet.status === "pre_opening") {
     return {
-      lines: [`通常Land ${fmtLd(services.ledger.balanceOf(`user:${userId}`))}`, "自由チップは正式開業まで利用できません"],
+      lines: [`通常Land ${fmtLd(wallet.land)}`, "自由チップは正式開業まで利用できません"],
       footer: "正式開業準備中",
     };
   }
-  const assets = services.chipAssets.forUser(userId);
+  if (wallet.status === "ledger_error") {
+    return {
+      lines: [`所持 ${fmtLd(wallet.land)}（通常Landのみ）`, "チップ帳簿を確認できません"],
+      footer: "チップ帳簿エラー",
+    };
+  }
+  if (wallet.status === "overflow") {
+    return {
+      lines: [`所持 ${fmtLd(wallet.land)}（通常Landのみ）`, "残高の合算に失敗しました"],
+      footer: "残高合算エラー",
+    };
+  }
   return {
     lines: [
-      `所持 **${fmtLd(assets.freeChips)}**`,
-      assets.escrowed > 0 ? `預け中 ${fmtLd(assets.escrowed)}` : "",
+      `所持 **${fmtLd(wallet.available)}**`,
+      wallet.escrowed! > 0 ? `預け中 ${fmtLd(wallet.escrowed!)}` : "",
     ].filter(Boolean),
-    footer: `自由チップ ${fmtLd(assets.freeChips)} · 預け中 ${fmtLd(assets.escrowed)} · 合計 ${fmtLd(assets.total)}`,
+    footer: `通常Land ${fmtLd(wallet.land)} · 自由チップ ${fmtLd(wallet.freeChips!)} · 預け中 ${fmtLd(wallet.escrowed!)}`,
   };
 }
 
