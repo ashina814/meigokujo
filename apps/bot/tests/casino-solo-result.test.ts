@@ -197,6 +197,35 @@ describe("結果後navigationと退場", () => {
     expect(interaction.reply.mock.calls[0]![0].content).toContain("500 LdをLandへ戻して");
   });
 
+  it("redeemFreeChipsがthrowしたらcomponentsを残し、資金返還エラーとして返す", async () => {
+    const redeem = vi.fn(() => {
+      throw new Error("redeem failed");
+    });
+    const interaction = button(resultExitCustomId("u1"));
+
+    await handleCasinoResultButton(interaction, fakeServices({ redeem }));
+
+    expect(redeem).toHaveBeenCalledOnce();
+    expect(interaction.message.edit).not.toHaveBeenCalled();
+    expect(interaction.reply).toHaveBeenCalledOnce();
+    expect(interaction.reply.mock.calls[0]![0].content).toContain("自由チップの返還処理でエラー");
+    expect(interaction.reply.mock.calls[0]![0].content).not.toContain("資金は動かしていません");
+  });
+
+  it("redeem成功後にreplyが失敗しても資金結果をfailureへ再分類せず、二重通知しない", async () => {
+    const redeem = vi.fn(() => ({ userId: "u1", redeemed: 500, land: 500, reason: "賭場を出る" }));
+    const interaction = button(resultExitCustomId("u1"));
+    interaction.reply.mockRejectedValueOnce(new Error("discord reply failed"));
+
+    await handleCasinoResultButton(interaction, fakeServices({ redeem }));
+
+    expect(redeem).toHaveBeenCalledOnce();
+    expect(interaction.reply).toHaveBeenCalledOnce();
+    expect(interaction.reply.mock.calls[0]![0].content).toContain("500 LdをLandへ戻して");
+    expect(interaction.reply.mock.calls[0]![0].content).not.toContain("資金は動かしていません");
+    expect(interaction.message.edit).toHaveBeenCalledWith({ components: [] });
+  });
+
   it("自由チップ0は正常退場、active_ownership skipはcomponentsを維持する", async () => {
     const zero = button(resultExitCustomId("u1"));
     await handleCasinoResultButton(zero, fakeServices({
