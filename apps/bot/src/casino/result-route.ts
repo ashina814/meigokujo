@@ -78,28 +78,32 @@ async function handleCasinoExit(interaction: ButtonInteraction, services: Servic
   }
   if (!(await assertOwner(interaction, parsed.ownerId))) return;
 
+  let result: ReturnType<Services["chipFlow"]["redeemFreeChips"]>;
   try {
-    const result = services.chipFlow.redeemFreeChips(interaction.user.id, interaction.id, "賭場を出る");
-    if (result.skipped === "active_ownership") {
-      await interaction.reply({
-        content: "進行中の勝負・卓・板等があるため、今は返還できません。",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    await interaction.message.edit({ components: [] }).catch(() => undefined);
-    await interaction.reply({
-      content: result.redeemed > 0
-        ? `${fmtLd(result.redeemed)}をLandへ戻して賭場を出ました。`
-        : "戻す自由チップはありません。賭場を出ました。",
-      flags: MessageFlags.Ephemeral,
-    });
+    result = services.chipFlow.redeemFreeChips(interaction.user.id, interaction.id, "賭場を出る");
   } catch {
     await interaction.reply({
-      content: "⚠️ 自由チップの返還を確認できませんでした。資金は動かしていません。",
+      content: "⚠️ 自由チップの返還処理でエラーが発生しました。残高を確認してください。",
       flags: MessageFlags.Ephemeral,
     });
+    return;
   }
+
+  if (result.skipped === "active_ownership") {
+    await interaction.reply({
+      content: "進行中の勝負・卓・板等があるため、今は返還できません。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  await interaction.reply({
+    content: result.redeemed > 0
+      ? `${fmtLd(result.redeemed)}をLandへ戻して賭場を出ました。`
+      : "戻す自由チップはありません。賭場を出ました。",
+    flags: MessageFlags.Ephemeral,
+  }).catch(() => undefined);
+  await interaction.message.edit({ components: [] }).catch(() => undefined);
 }
 
 function rulesEmbed(game: CasinoSoloGame): EmbedBuilder {
