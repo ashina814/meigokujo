@@ -54,6 +54,7 @@ describe("賭場の入口ガード", () => {
       "rl:red", "slots:retry:50", "chinchiro:stop", "keiba:bet", "crash:cashout",
       "chohan:cho", "chm:join", "bj:hit", "holdem:call", "poker:hold:1", "pkr:join",
       "bjd:accept", "ccd:accept", "ind:call", "sashi:accept", "rem:12345",
+      "casino:amount:custom:スロット", "casino:amount:modal:スロット",
       "casino:play:スロット:100", "casino:daily:claim",
     ]) {
       expect(isCasinoInteraction(component(id))).toBe(true);
@@ -63,7 +64,7 @@ describe("賭場の入口ガード", () => {
       expect(isCasinoInteraction(component(id))).toBe(false);
     }
     // 運営卓は入口では止めない（停止中の資金操作は運営卓のハンドラと資金層で断る）
-    for (const id of ["mgmt:casino:fund", "ticket:close", "entry:apply", "rank:next"]) {
+    for (const id of ["mgmt:casino:fund", "ticket:close", "entry:apply", "rank:next", "casino:home:game-select"]) {
       expect(isCasinoInteraction(component(id))).toBe(false);
     }
   });

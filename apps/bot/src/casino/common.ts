@@ -114,14 +114,14 @@ export async function validateBet(
   /** 債務モデルを持つゲーム名。上限表示・事前検証・予約がこの1つのモデルを共有する */
   game: string,
 ): Promise<BetCheck> {
-  const bet = Math.floor(betRaw);
+  const bet = betRaw;
   const uid = interaction.user.id;
   const cap = configuredMaxBet(services, uid);
   // 保留中の無料スピンを先に通知した場合、ここは2通目になる。
   // 未応答 interaction には reply、応答済み／defer 済みなら followUp を使う。
   const respond = (payload: Parameters<typeof interaction.reply>[0]) =>
     interaction.replied || interaction.deferred ? interaction.followUp(payload) : interaction.reply(payload);
-  if (!Number.isInteger(bet) || bet < MIN_BET || bet > cap) {
+  if (!Number.isSafeInteger(bet) || bet < MIN_BET || bet > cap) {
     await respond({
       content: `賭け額は ${MIN_BET.toLocaleString()}〜${cap.toLocaleString()} Ld で。${cap > MAX_BET ? "（💎 VIP 賭け上限拡張中）" : ""}`,
       flags: MessageFlags.Ephemeral,

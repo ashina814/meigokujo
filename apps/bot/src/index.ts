@@ -36,6 +36,14 @@ import { handlePokerDuelButton, handlePokerDuelSelect } from "./casino/poker-due
 import { denyIfCasinoClosed } from "./casino/gate.js";
 import { handleCasinoPlayButton, isCasinoPlayButton } from "./casino/play-route.js";
 import {
+  CASINO_AMOUNT_CUSTOM_PREFIX,
+  CASINO_AMOUNT_MODAL_PREFIX,
+  CASINO_GAME_SELECT_CUSTOM_ID,
+  handleCasinoAmountButton,
+  handleCasinoAmountModal,
+  handleCasinoGameSelect,
+} from "./casino/amount-picker.js";
+import {
   handleBankButton,
   handleDeptPanelButton,
   handleDeptPanelModal,
@@ -262,6 +270,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleEtherModal(interaction, services);
       return;
     }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith(CASINO_AMOUNT_MODAL_PREFIX)) {
+      await handleCasinoAmountModal(interaction, services);
+      return;
+    }
     if (
       (interaction.isStringSelectMenu() ||
         interaction.isUserSelectMenu() ||
@@ -305,6 +317,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("pkr:")) {
       await handlePokerDuelSelect(interaction, services);
+      return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId === CASINO_GAME_SELECT_CUSTOM_ID) {
+      await handleCasinoGameSelect(interaction, services);
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("ita:")) {
@@ -401,6 +417,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("casino:home:") || interaction.customId.startsWith("casino:daily:")) {
         await handleCasinoHomeButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith(CASINO_AMOUNT_CUSTOM_PREFIX)) {
+        await handleCasinoAmountButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("vip:")) {
