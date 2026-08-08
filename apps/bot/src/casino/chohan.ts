@@ -62,8 +62,6 @@ export async function playChohan(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "丁半");
-  if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
       await interaction.followUp({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
@@ -73,6 +71,8 @@ export async function playChohan(
     return;
   }
   try {
+    const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "丁半");
+    if (!check.ok) return;
     await runRound(interaction, services, check.bet);
   } finally {
     releaseSeat(uid);
