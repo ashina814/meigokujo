@@ -80,6 +80,15 @@ describe("賭場の土台", () => {
     expect(ctx.ether.balanceOf("a")).toBe(100_000);
   });
 
+  it("/賭場ホーム用の再戦ショートカットは成功した精算だけから明示的に保存する", () => {
+    expect(ctx.casino.homePreference("a")).toBeNull();
+    ctx.casino.settle("a", "スロット", 1_000, 0, 0, { ...RAW, operationId: opId() });
+    expect(ctx.casino.homePreference("a")).toMatchObject({ user_id: "a", last_game: "スロット", last_amount: 1_000 });
+
+    expect(() => ctx.casino.settle("a", "丁半", 999_999_999, 0, 0, { ...RAW, operationId: opId() })).toThrow();
+    expect(ctx.casino.homePreference("a")).toMatchObject({ last_game: "スロット", last_amount: 1_000 });
+  });
+
   it("テーブルリミット: 胴元残高を超える配当は受けられない", () => {
     expect(ctx.casino.canAccept(ctx.casino.houseBalance() + 1)).toBe(false);
     expect(ctx.casino.canAccept(ctx.casino.houseBalance())).toBe(true);

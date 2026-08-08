@@ -84,6 +84,14 @@ export interface CasinoStatsRow {
   updated_at: number;
 }
 
+/** `/賭場` ホームの再戦ショートカット専用。分析・監査・損益計算には使わない。 */
+export interface CasinoHomePreferenceRow {
+  user_id: string;
+  last_game: string;
+  last_amount: number;
+  updated_at: number;
+}
+
 /**
  * ソロゲーム1回の業務グループ鍵。`Casino.settle` / `settleSolo` と
  * 胴元債務予約（PR5）が**同じ文字列**を使う（予約鍵 = 精算グループ鍵）。
@@ -243,6 +251,14 @@ export class Casino {
     if (!cols.some((c) => c.name === "total_lost")) {
       this.db.exec("ALTER TABLE casino_stats ADD COLUMN total_lost INTEGER NOT NULL DEFAULT 0");
     }
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS casino_home_preferences (
+        user_id      TEXT PRIMARY KEY,
+        last_game    TEXT NOT NULL,
+        last_amount  INTEGER NOT NULL CHECK(last_amount > 0),
+        updated_at   INTEGER NOT NULL
+      );
+    `);
   }
 
   /** 胴元のエテル残高（＝配当余力） */
@@ -419,6 +435,7 @@ export class Casino {
       // 連鎖ボーナスは通算損益に乗らず、福の重みは引かれていなかった。
       // JP積立は胴元 → JP の移動なので利用者の損益には関係しない
       this.recordResult(userId, bet, effectivePayout);
+      this.rememberHomePreference(userId, game, bet);
       this.events.log("casino_game", { actor: userId, payload: { game, bet, payout: effectivePayout, net, chainBonus, fukuTax } });
       return {
         wagered: bet,
@@ -581,6 +598,30 @@ export class Casino {
         updated_at: 0,
       }
     );
+  }
+
+  /** `/賭場` ホームの主ボタンに使う、直近プレイの明示的な保存値。 */
+  homePreference(userId: string): CasinoHomePreferenceRow | null {
+    const row = this.db.prepare("SELECT * FROM casino_home_preferences WHERE user_id = ?").get(userId) as
+      | CasinoHomePreferenceRow
+      | undefined;
+    if (!row) return null;
+    if (!Number.isSafeInteger(row.last_amount) || row.last_amount <= 0) return null;
+    return row;
+  }
+
+  private rememberHomePreference(userId: string, game: string, amount: number): void {
+    if (!Number.isSafeInteger(amount) || amount <= 0) return;
+    this.db
+      .prepare(
+        `INSERT INTO casino_home_preferences (user_id, last_game, last_amount, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET
+           last_game = excluded.last_game,
+           last_amount = excluded.last_amount,
+           updated_at = excluded.updated_at`,
+      )
+      .run(userId, game, amount, now());
   }
 
   /** 賭場番付用: 指標別 Top N */

@@ -210,6 +210,7 @@ export {
   chainMultiplier,
   fukuRate,
   type CasinoStatsRow,
+  type CasinoHomePreferenceRow,
   type SettleResult,
   type SoloRoundResult,
   type SoloRoundOptions,

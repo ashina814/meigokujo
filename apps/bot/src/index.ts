@@ -19,6 +19,7 @@ import { handleBakutenButton, handleBakutenCommand, handleBakutenSelect } from "
 import { replyStocksPaused } from "./casino/stocks-pause.js";
 import { handleKeibaCommand } from "./commands/keiba.js";
 import { handleAnnaiButton, handleAnnaiCommand } from "./commands/annai.js";
+import { handleCasinoHomeButton, handleCasinoHomeCommand } from "./commands/casino-home.js";
 import { handleVipButton, handleVipCommand } from "./commands/vip.js";
 import { handleNagareboshiCommand } from "./commands/nagareboshi.js";
 import {
@@ -182,6 +183,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "あそびかた":
           await handleHelpCommand(interaction, services);
+          return;
+        case "賭場":
+          await handleCasinoHomeCommand(interaction, services);
           return;
         case "遊ぶ":
           await handleAsobuCommand(interaction, services);
@@ -393,6 +397,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("annai:")) {
         await handleAnnaiButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("casino:home:") || interaction.customId.startsWith("casino:daily:")) {
+        await handleCasinoHomeButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("vip:")) {
