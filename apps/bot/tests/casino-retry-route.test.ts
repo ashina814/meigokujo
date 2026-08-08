@@ -164,6 +164,18 @@ describe("casino retry route", () => {
     expect(startCasinoSoloGameMock).not.toHaveBeenCalled();
   });
 
+  it("does not start a game when deferUpdate fails", async () => {
+    const game = CASINO_SOLO_GAMES[1]!;
+    const { services } = fakeServices({ land: 10_000, free: 0 });
+    const interaction = button(retryCustomIdFor(game, 500, OWNER_ID));
+    interaction.deferUpdate.mockRejectedValueOnce(new Error("discord unavailable"));
+
+    await expect(handleCasinoResultButton(interaction, services)).rejects.toThrow("discord unavailable");
+
+    expect(interaction.deferUpdate).toHaveBeenCalledOnce();
+    expect(startCasinoSoloGameMock).not.toHaveBeenCalled();
+  });
+
   it("defers and dispatches through the canonical solo game starter after retry checks pass", async () => {
     const game = CASINO_SOLO_GAMES[1]!;
     const { services } = fakeServices({ land: 10_000, free: 0 });
