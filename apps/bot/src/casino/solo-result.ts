@@ -15,16 +15,7 @@ import { C_BIGWIN, C_JACKPOT, C_LOSE, C_PUSH, C_WIN, E, fmtBigDelta } from "./ui
 
 export const CASINO_RESULT_PREFIX = "casino:result:";
 export const CASINO_EXIT_PREFIX = "casino:exit:";
-
-const RETRY_PREFIX: Readonly<Record<CasinoSoloGame, string>> = {
-  スロット: "slots:retry",
-  丁半: "chohan:retry",
-  クラッシュ: "crash:retry",
-  チンチロ: "chinchiro:retry",
-  ブラックジャック: "bj:retry",
-  ポーカー: "poker:retry",
-  ホールデム: "holdem:retry",
-};
+export const CASINO_RETRY_PREFIX = "casino:retry:";
 
 export interface SoloResultSection {
   name: string;
@@ -48,8 +39,8 @@ export function resultExitCustomId(ownerId: string): string {
   return `${CASINO_EXIT_PREFIX}${ownerId}`;
 }
 
-export function retryCustomIdFor(game: CasinoSoloGame, retryBet: number): string {
-  return `${RETRY_PREFIX[game]}:${retryBet}`;
+export function retryCustomIdFor(game: CasinoSoloGame, retryBet: number, ownerId: string): string {
+  return `${CASINO_RETRY_PREFIX}${game}:${retryBet}:${ownerId}`;
 }
 
 export function buildSoloResult(opts: {
@@ -94,7 +85,7 @@ export function soloResultActions(
   const retry = retryStatus(services, userId, game, retryBet);
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setCustomId(retryCustomIdFor(game, retryBet))
+      .setCustomId(retryCustomIdFor(game, retryBet, userId))
       .setLabel(`もう一度 ${retryBet.toLocaleString("ja-JP")} Ld`)
       .setStyle(ButtonStyle.Primary)
       .setDisabled(!retry.ok),

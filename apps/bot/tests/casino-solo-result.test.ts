@@ -10,6 +10,7 @@ import {
   resultExitCustomId,
   resultGamesCustomId,
   resultRulesCustomId,
+  retryCustomIdFor,
 } from "../src/casino/solo-result.js";
 import { CASINO_SOLO_GAMES, type CasinoSoloGame } from "../src/casino/games.js";
 
@@ -122,18 +123,18 @@ describe("ソロゲーム共通結果UI", () => {
   it("結果後アクションは5個・指定順で、retryBetとcustomIdへ反映する", () => {
     const { buttons } = resultJson({
       services: fakeServices({ land: 1_000, free: 0 }),
-      userId: "u1",
+      userId: "123456789012345678",
       game: "ブラックジャック",
       net: 500,
       wager: 1_000,
       retryBet: 500,
     });
     expect(buttons.map((b) => b.label)).toEqual(["もう一度 500 Ld", "金額を変える", "別の遊び", "ルール", "賭場を出る"]);
-    expect(buttons[0]!.custom_id).toBe("bj:retry:500");
-    expect(buttons[1]!.custom_id).toBe(resultAmountCustomId("ブラックジャック", "u1"));
-    expect(buttons[2]!.custom_id).toBe(resultGamesCustomId("u1"));
-    expect(buttons[3]!.custom_id).toBe(resultRulesCustomId("ブラックジャック", "u1"));
-    expect(buttons[4]!.custom_id).toBe(resultExitCustomId("u1"));
+    expect(buttons[0]!.custom_id).toBe(retryCustomIdFor("ブラックジャック", 500, "123456789012345678"));
+    expect(buttons[1]!.custom_id).toBe(resultAmountCustomId("ブラックジャック", "123456789012345678"));
+    expect(buttons[2]!.custom_id).toBe(resultGamesCustomId("123456789012345678"));
+    expect(buttons[3]!.custom_id).toBe(resultRulesCustomId("ブラックジャック", "123456789012345678"));
+    expect(buttons[4]!.custom_id).toBe(resultExitCustomId("123456789012345678"));
     expect(buttons[0]!.disabled).toBe(false);
   });
 
@@ -243,13 +244,29 @@ describe("結果後navigationと退場", () => {
   });
 });
 
-describe("PR17境界", () => {
-  it("7ゲームの最終結果は共通builderを参照し、retry collectorはhandleRetryPressを維持する", () => {
+describe("PR18境界", () => {
+  it("7ゲームの最終結果は共通builderを参照し、retry collectorは持たない", () => {
     for (const file of ["slots", "chohan", "crash", "chinchiro", "blackjack", "poker", "holdem"]) {
       const source = readFileSync(join(process.cwd(), "src", "casino", `${file}.ts`), "utf8");
       expect(source).toContain("buildSoloResult");
-      expect(source).toContain("handleRetryPress");
+      expect(source).not.toContain("handleRetryPress");
+      expect(source).not.toMatch(/(?:slots|chohan|crash|chinchiro|bj|poker|holdem):retry:/);
       expect(source).not.toContain("casino:play:");
+    }
+  });
+
+  it("進行中操作のcollector用customIdは各ゲームに残す", () => {
+    const expected = {
+      chohan: ["chohan:cho", "chohan:han"],
+      crash: ["crash:out"],
+      chinchiro: ["chinchiro:stop", "chinchiro:reroll"],
+      blackjack: ["bj:hit", "bj:stand", "bj:double"],
+      poker: ["poker:hold:", "poker:draw"],
+      holdem: ["holdem:call", "holdem:check", "holdem:fold"],
+    } as const;
+    for (const [file, ids] of Object.entries(expected)) {
+      const source = readFileSync(join(process.cwd(), "src", "casino", `${file}.ts`), "utf8");
+      for (const id of ids) expect(source).toContain(id);
     }
   });
 

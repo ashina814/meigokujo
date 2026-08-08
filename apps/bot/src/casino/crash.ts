@@ -20,7 +20,6 @@ import type { Services } from "../services.js";
 import {
   MIN_BET,
   acquireSeat,
-  handleRetryPress,
   releaseSeat,
   sleep,
   validateBet,
@@ -99,8 +98,6 @@ export async function playCrash(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "クラッシュ");
-  if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
       await interaction.followUp({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
@@ -110,6 +107,8 @@ export async function playCrash(
     return;
   }
   try {
+    const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "クラッシュ");
+    if (!check.ok) return;
     await runRound(interaction, services, check.bet);
   } finally {
     releaseSeat(uid);
@@ -238,7 +237,6 @@ async function runRoundInner(
     }
   }
   collector.stop();
-
   // ── 精算 ──
   let resultPayload: ReturnType<typeof buildSoloResult>;
   if (cashedOut && cashOutMul >= 1.0) {
@@ -305,27 +303,4 @@ async function runRoundInner(
     await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
   }
 
-  // ── リトライ/配当表/退席 コレクタ ──
-  const retryCollector = reply.createMessageComponentCollector({
-    componentType: ComponentType.Button,
-    time: 60_000,
-    filter: (i) => i.user.id === uid && i.customId.startsWith("crash:retry:"),
-  });
-  retryCollector.on("collect", async (btn) => {
-    if (btn.customId.startsWith("crash:retry:")) {
-      // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
-      // 断るなら collector を止めない ＝ 押し直せる
-      await handleRetryPress({
-        services,
-        btn,
-        collector: retryCollector,
-        game: "クラッシュ",
-        betRaw: Number(btn.customId.split(":")[2]),
-        run: (bet) => runRound(btn, services, bet),
-      });
-    }
-  });
-  retryCollector.on("end", async (_c, reason) => {
-    if (reason !== "retry") await reply.edit({ components: [] }).catch(() => undefined);
-  });
 }

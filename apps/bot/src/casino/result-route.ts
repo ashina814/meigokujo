@@ -2,8 +2,11 @@ import { MessageFlags, type ButtonInteraction, type EmbedBuilder } from "discord
 import { fmtLd } from "../format.js";
 import type { Services } from "../services.js";
 import { renderCasinoAmountPicker, renderCasinoGameSelect } from "./amount-picker.js";
+import { checkRetry, isSeatOccupied, SEAT_BUSY_REASON } from "./common.js";
 import { isCasinoSoloGame, type CasinoSoloGame } from "./games.js";
-import { CASINO_EXIT_PREFIX, CASINO_RESULT_PREFIX } from "./solo-result.js";
+import { startCasinoSoloGame } from "./play-route.js";
+import { CASINO_EXIT_PREFIX, CASINO_RESULT_PREFIX, CASINO_RETRY_PREFIX } from "./solo-result.js";
+import { parseStrictPositiveInteger } from "./wager-input.js";
 import { paytableEmbed as blackjackRulesEmbed } from "./blackjack.js";
 import { paytableEmbed as chinchiroRulesEmbed } from "./chinchiro.js";
 import { paytableEmbed as chohanRulesEmbed } from "./chohan.js";
@@ -17,11 +20,19 @@ type ResultNav =
   | { ok: true; kind: "games"; ownerId: string }
   | { ok: false };
 
+export type CasinoRetryButtonParse =
+  | { ok: true; game: CasinoSoloGame; amount: number; ownerId: string }
+  | { ok: false };
+
 export function isCasinoResultButton(customId: string): boolean {
-  return customId.startsWith(CASINO_RESULT_PREFIX) || customId.startsWith(CASINO_EXIT_PREFIX);
+  return customId.startsWith(CASINO_RESULT_PREFIX) || customId.startsWith(CASINO_RETRY_PREFIX) || customId.startsWith(CASINO_EXIT_PREFIX);
 }
 
 export async function handleCasinoResultButton(interaction: ButtonInteraction, services: Services): Promise<void> {
+  if (interaction.customId.startsWith(CASINO_RETRY_PREFIX)) {
+    await handleCasinoRetry(interaction, services);
+    return;
+  }
   if (interaction.customId.startsWith(CASINO_EXIT_PREFIX)) {
     await handleCasinoExit(interaction, services);
     return;
@@ -43,6 +54,48 @@ export async function handleCasinoResultButton(interaction: ButtonInteraction, s
     return;
   }
   await interaction.reply({ embeds: [rulesEmbed(parsed.game)], flags: MessageFlags.Ephemeral });
+}
+
+export function parseCasinoRetryButton(customId: string): CasinoRetryButtonParse {
+  const parts = customId.split(":");
+  if (parts.length !== 5 || parts[0] !== "casino" || parts[1] !== "retry") return { ok: false };
+  const [, , game, amountRaw, ownerId] = parts;
+  if (!game || !isCasinoSoloGame(game)) return { ok: false };
+  const parsedAmount = parseStrictPositiveInteger(amountRaw ?? "");
+  if (!parsedAmount.ok) return { ok: false };
+  if (!ownerId || !/^\d+$/.test(ownerId)) return { ok: false };
+  return { ok: true, game, amount: parsedAmount.amount, ownerId };
+}
+
+async function handleCasinoRetry(interaction: ButtonInteraction, services: Services): Promise<void> {
+  const parsed = parseCasinoRetryButton(interaction.customId);
+  if (!parsed.ok) {
+    await interaction.reply({ content: "❌ 不明な再戦操作です。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!(await assertOwner(interaction, parsed.ownerId))) return;
+  if (isSeatOccupied(interaction.user.id)) {
+    await interaction.reply({ content: SEAT_BUSY_REASON, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  let retry: ReturnType<typeof checkRetry>;
+  try {
+    retry = checkRetry(services, interaction.user.id, parsed.amount, parsed.game);
+  } catch {
+    await interaction.reply({
+      content: "❌ 現在の残高・胴元余力を確認できないため、再戦できません。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (!retry.ok) {
+    await interaction.reply({ content: `❌ ${retry.reason}`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await interaction.deferUpdate();
+  await startCasinoSoloGame(interaction, services, parsed.game, retry.bet);
 }
 
 function parseResultNav(customId: string): ResultNav {

@@ -15,7 +15,6 @@ import type { Services } from "../services.js";
 import {
   MIN_BET,
   acquireSeat,
-  handleRetryPress,
   releaseSeat,
   sleep,
   validateBet,
@@ -63,8 +62,6 @@ export async function playChohan(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "丁半");
-  if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
       await interaction.followUp({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
@@ -74,6 +71,8 @@ export async function playChohan(
     return;
   }
   try {
+    const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "丁半");
+    if (!check.ok) return;
     await runRound(interaction, services, check.bet);
   } finally {
     releaseSeat(uid);
@@ -224,27 +223,4 @@ async function runRoundInner(
   }
 
   await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
-
-  const collector = reply.createMessageComponentCollector({
-    componentType: ComponentType.Button,
-    time: 30_000,
-    filter: (i) => i.user.id === uid && i.customId.startsWith("chohan:retry:"),
-  });
-  collector.on("collect", async (btn) => {
-    if (btn.customId.startsWith("chohan:retry:")) {
-      // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
-      // 断るなら collector を止めない ＝ 押し直せる
-      await handleRetryPress({
-        services,
-        btn,
-        collector,
-        game: "丁半",
-        betRaw: Number(btn.customId.split(":")[2]),
-        run: (bet) => runRound(btn, services, bet),
-      });
-    }
-  });
-  collector.on("end", async (_c, reason) => {
-    if (reason !== "retry") await reply.edit({ components: [] }).catch(() => undefined);
-  });
 }

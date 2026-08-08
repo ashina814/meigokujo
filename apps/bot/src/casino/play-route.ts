@@ -51,5 +51,14 @@ export async function handleCasinoPlayButton(interaction: ButtonInteraction, ser
     await interaction.reply({ content: "❌ 不明な卓だ。", flags: MessageFlags.Ephemeral });
     return;
   }
-  await PLAYERS[parsed.game](interaction, services, parsed.amount);
+  await startCasinoSoloGame(interaction, services, parsed.game, parsed.amount);
+}
+
+export async function startCasinoSoloGame(
+  interaction: ButtonInteraction,
+  services: Services,
+  game: CasinoSoloGame,
+  amount: number,
+): Promise<void> {
+  await PLAYERS[game](interaction, services, amount);
 }
