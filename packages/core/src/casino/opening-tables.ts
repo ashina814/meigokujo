@@ -339,6 +339,18 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "安全側でblocker化する。旧opening-reset.tsもprotectedFindings.casinoStatsとして同様に扱っていた",
   }),
   T({
+    table: "casino_home_preferences",
+    purpose: "/賭場ホームの再戦ショートカット用last game/amount",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "該当なし（非金融メタデータ。正式開業時に旧制度の再戦導線を持ち越さない）",
+    rationale:
+      "service.ts。/賭場ホームの再戦ショートカット用非金融メタデータ。正式開業時には旧制度のlast game/amountを持ち越さず初期化する。",
+  }),
+  T({
     table: "casino_items",
     purpose: "利用者所持アイテム",
     kind: "optional_feature",

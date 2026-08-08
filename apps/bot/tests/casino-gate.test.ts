@@ -45,7 +45,7 @@ describe("賭場の入口ガード", () => {
     expect(isCasinoInteraction(command("板", "将来追加された未知操作"))).toBe(true);
     expect(isCasinoInteraction(command("板"))).toBe(true);
 
-    for (const name of ["管理", "案内", "賭場番付", "通行証", "あそびかた", "プロフィール"]) {
+    for (const name of ["管理", "案内", "賭場", "賭場番付", "通行証", "あそびかた", "プロフィール"]) {
       expect(isCasinoInteraction(command(name))).toBe(false);
     }
     // 賭場系の customId 接頭辞は全部（対人戦・再戦オファーを含む）
@@ -54,6 +54,7 @@ describe("賭場の入口ガード", () => {
       "rl:red", "slots:retry:50", "chinchiro:stop", "keiba:bet", "crash:cashout",
       "chohan:cho", "chm:join", "bj:hit", "holdem:call", "poker:hold:1", "pkr:join",
       "bjd:accept", "ccd:accept", "ind:call", "sashi:accept", "rem:12345",
+      "casino:play:スロット:100", "casino:daily:claim",
     ]) {
       expect(isCasinoInteraction(component(id))).toBe(true);
     }
@@ -136,7 +137,7 @@ describe("賭場の入口ガード", () => {
 
   it("正式開業前でも読むだけの導線と運営卓は素通りする", async () => {
     const services = fakeServices(null, "pre_reset");
-    for (const i of [command("案内"), command("管理"), command("賭場番付")]) {
+    for (const i of [command("案内"), command("賭場"), command("管理"), command("賭場番付")]) {
       expect(await denyIfCasinoClosed(i, services)).toBe(false);
       expect(i.reply).not.toHaveBeenCalled();
     }
