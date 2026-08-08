@@ -40,7 +40,7 @@ describe("PR19 slots analytics finish ordering", () => {
   });
 
   it("rendering no longer owns the direct game_finish write", () => {
-    const render = between("async function renderSpin(", "export function resumePendingFreeSpins(");
+    const render = source.slice(source.indexOf("async function renderSpin("));
     expect(render).not.toContain("recordCasinoGameFinishBestEffort(");
   });
 });
