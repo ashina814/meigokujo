@@ -32,6 +32,7 @@ export type CasinoMetricsErrorCode =
   | "ERR_METRIC_BAD_NUMBER"
   | "ERR_METRIC_BAD_KEY"
   | "ERR_METRIC_BAD_DATE"
+  | "ERR_METRIC_BAD_RESULT"
   | "ERR_METRIC_HOUSE_PNL_UNCLASSIFIED";
 
 export class CasinoMetricsError extends Error {
@@ -92,9 +93,23 @@ export interface CasinoMetricDailyRow {
   updated_at: number;
 }
 
+interface CasinoMetricDailyStorageRow extends CasinoMetricDailyRow {
+  revisit_cohort_json: string | null;
+  revisit_finalized_at: number | null;
+}
+
+interface PersistedSlotSpinResult {
+  payout: number;
+  jpWon: number;
+  chainBonus: number;
+  fukuTax: number;
+  pendingFreeSpin: unknown;
+}
+
 const EVENT_TYPES = new Set<string>(CASINO_METRIC_EVENT_TYPES);
 const DAY_SEC = 86_400;
 const JST_OFFSET_SEC = 9 * 60 * 60;
+const RAW_RETENTION_DAYS = 90;
 
 function nowSec(): number {
   return Math.floor(Date.now() / 1000);
@@ -107,6 +122,20 @@ function assertSafeInteger(value: number, field: string): void {
 function assertNonNegative(value: number, field: string): void {
   assertSafeInteger(value, field);
   if (value < 0) throw new CasinoMetricsError("ERR_METRIC_BAD_NUMBER", { field, value });
+}
+
+function checkedAdd(a: number, b: number, field: string): number {
+  assertSafeInteger(a, `${field}.left`);
+  assertSafeInteger(b, `${field}.right`);
+  const result = a + b;
+  if (!Number.isSafeInteger(result)) throw new CasinoMetricsError("ERR_METRIC_BAD_NUMBER", { field, a, b });
+  return result;
+}
+
+function checkedAddAll(values: readonly number[], field: string): number {
+  let total = 0;
+  for (const value of values) total = checkedAdd(total, value, field);
+  return total;
 }
 
 function canonicalPayload(payload: unknown): string | null {
@@ -130,12 +159,21 @@ function jstDateStart(date: string): number {
 }
 
 function addJstDays(date: string, days: number): string {
-  return jstDate(jstDateStart(date) + days * DAY_SEC);
+  assertSafeInteger(days, "days");
+  const delta = days * DAY_SEC;
+  if (!Number.isSafeInteger(delta)) throw new CasinoMetricsError("ERR_METRIC_BAD_NUMBER", { field: "day_delta", days });
+  return jstDate(checkedAdd(jstDateStart(date), delta, "jst_date_add"));
 }
 
 function bps(numerator: number, denominator: number): number | null {
+  assertNonNegative(numerator, "bps.numerator");
+  assertNonNegative(denominator, "bps.denominator");
   if (denominator === 0) return null;
-  return Math.floor((numerator * 10_000) / denominator);
+  const raw = (BigInt(numerator) * 10_000n) / BigInt(denominator);
+  if (raw > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new CasinoMetricsError("ERR_METRIC_BAD_NUMBER", { field: "bps.result", numerator, denominator });
+  }
+  return Number(raw);
 }
 
 function playerIdFromHolder(holder: string | null): string | null {
@@ -168,6 +206,65 @@ function normalize(input: CasinoMetricEventInput, ts: number): CasinoMetricEvent
   };
 }
 
+function validateEventRowNumbers(row: CasinoMetricEventRow): void {
+  assertNonNegative(row.occurred_at, "stored.occurred_at");
+  if (row.wager != null) assertNonNegative(row.wager, "stored.wager");
+  if (row.payout != null) assertNonNegative(row.payout, "stored.payout");
+  if (row.amount != null) assertNonNegative(row.amount, "stored.amount");
+  if (row.net != null) assertSafeInteger(row.net, "stored.net");
+}
+
+function parseJsonObject(json: string | null, field: string): Record<string, unknown> {
+  if (json == null) throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field, reason: "missing" });
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field, reason: "not_object" });
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    if (error instanceof CasinoMetricsError) throw error;
+    throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field, reason: "invalid_json" });
+  }
+}
+
+function parseCohort(json: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "revisit_cohort_json", reason: "invalid_json" });
+  }
+  if (!Array.isArray(parsed) || parsed.some((v) => typeof v !== "string" || v.length === 0)) {
+    throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "revisit_cohort_json", reason: "invalid_cohort" });
+  }
+  const cohort = parsed as string[];
+  if (new Set(cohort).size !== cohort.length) {
+    throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "revisit_cohort_json", reason: "duplicate_user" });
+  }
+  return cohort;
+}
+
+function toPublicDaily(row: CasinoMetricDailyStorageRow): CasinoMetricDailyRow {
+  return {
+    date: row.date,
+    play_count: row.play_count,
+    unique_users: row.unique_users,
+    total_wager: row.total_wager,
+    total_payout: row.total_payout,
+    house_pnl: row.house_pnl,
+    table_fee_income: row.table_fee_income,
+    jackpot_delta: row.jackpot_delta,
+    fuku_outflow: row.fuku_outflow,
+    table_open_count: row.table_open_count,
+    table_start_count: row.table_start_count,
+    table_dispute_count: row.table_dispute_count,
+    replay_rate_bps: row.replay_rate_bps,
+    revisit_rate_bps: row.revisit_rate_bps,
+    updated_at: row.updated_at,
+  };
+}
+
 export class CasinoMetrics {
   private schemaReady = false;
 
@@ -180,6 +277,7 @@ export class CasinoMetrics {
   ensureSchema(): boolean {
     if (this.chipTx.openingPhase() !== "formal") return false;
     if (this.schemaReady && tableExists(this.db, "casino_metric_events") && tableExists(this.db, "casino_metric_daily")) {
+      this.ensureDailyColumns();
       return true;
     }
     this.db.exec(`
@@ -218,16 +316,30 @@ export class CasinoMetrics {
         table_dispute_count INTEGER NOT NULL DEFAULT 0,
         replay_rate_bps INTEGER,
         revisit_rate_bps INTEGER,
+        revisit_cohort_json TEXT,
+        revisit_finalized_at INTEGER,
         updated_at INTEGER NOT NULL
       );
     `);
+    this.ensureDailyColumns();
     this.schemaReady = true;
     return true;
   }
 
+  private ensureDailyColumns(): void {
+    if (!tableExists(this.db, "casino_metric_daily")) return;
+    const columns = new Set(
+      (this.db.prepare("PRAGMA table_info(casino_metric_daily)").all() as Array<{ name: string }>).map((r) => r.name),
+    );
+    if (!columns.has("revisit_cohort_json")) this.db.exec("ALTER TABLE casino_metric_daily ADD COLUMN revisit_cohort_json TEXT");
+    if (!columns.has("revisit_finalized_at")) this.db.exec("ALTER TABLE casino_metric_daily ADD COLUMN revisit_finalized_at INTEGER");
+  }
+
   record(input: CasinoMetricEventInput): { recorded: boolean; skipped: boolean } {
     const ts = this.clock();
+    assertNonNegative(ts, "clock");
     if (!this.ensureSchema()) return { recorded: false, skipped: true };
+    const occurredAtExplicit = input.occurredAt !== undefined;
     const row = normalize(input, ts);
     const inserted = this.db.prepare(`
       INSERT OR IGNORE INTO casino_metric_events
@@ -253,7 +365,10 @@ export class CasinoMetrics {
       .prepare(`SELECT event_key, event_type, user_id, game, source, operation_id, wager, payout, net, amount, payload_json, occurred_at
                 FROM casino_metric_events WHERE event_key=?`)
       .get(row.event_key) as CasinoMetricEventRow | undefined;
-    if (!existing || canonicalStringify(existing) !== canonicalStringify(row)) {
+    if (!existing) throw new CasinoMetricsError("ERR_METRIC_EVENT_CONFLICT", { eventKey: row.event_key });
+    validateEventRowNumbers(existing);
+    const expected = occurredAtExplicit ? row : { ...row, occurred_at: existing.occurred_at };
+    if (canonicalStringify(existing) !== canonicalStringify(expected)) {
       throw new CasinoMetricsError("ERR_METRIC_EVENT_CONFLICT", { eventKey: row.event_key });
     }
     return { recorded: false, skipped: false };
@@ -326,16 +441,21 @@ export class CasinoMetrics {
     });
   }
 
-  syncChipExchangeEvents(): number {
+  syncChipExchangeEvents(retentionDays = RAW_RETENTION_DAYS): number {
     if (!this.ensureSchema()) return 0;
+    assertNonNegative(retentionDays, "retentionDays");
+    const retentionSec = retentionDays * DAY_SEC;
+    if (!Number.isSafeInteger(retentionSec)) throw new CasinoMetricsError("ERR_METRIC_BAD_NUMBER", { field: "retentionSec" });
+    const cutoff = checkedAdd(this.clock(), -retentionSec, "chip_sync_cutoff");
     const rows = this.db.prepare(`
       SELECT id, tx_kind, from_holder, to_holder, amount, created_at
       FROM casino_tx
       WHERE opening_version=?
         AND tx_kind IN ('deposit', 'redeem')
         AND amount > 0
+        AND created_at >= ?
       ORDER BY id
-    `).all(FORMAL_OPENING_VERSION) as Array<{
+    `).all(FORMAL_OPENING_VERSION, cutoff) as Array<{
       id: number;
       tx_kind: "deposit" | "redeem";
       from_holder: string | null;
@@ -345,6 +465,9 @@ export class CasinoMetrics {
     }>;
     let recorded = 0;
     for (const row of rows) {
+      assertNonNegative(row.id, "casino_tx.id");
+      assertNonNegative(row.amount, "casino_tx.amount");
+      assertNonNegative(row.created_at, "casino_tx.created_at");
       const userId = row.tx_kind === "deposit" ? playerIdFromHolder(row.to_holder) : playerIdFromHolder(row.from_holder);
       if (!userId) continue;
       const result = this.record({
@@ -363,38 +486,64 @@ export class CasinoMetrics {
 
   synthesizeDailyOnly(date: string): number {
     if (!this.ensureSchema()) return 0;
-    if (date >= jstDate(this.clock())) return 0;
-    const start = jstDateStart(date);
-    const end = start + DAY_SEC;
+    const openingAt = this.formalOpeningTimestamp();
+    if (date < jstDate(openingAt) || date >= jstDate(this.clock())) return 0;
+    const dayStart = jstDateStart(date);
+    const start = Math.max(dayStart, openingAt);
+    const end = checkedAdd(dayStart, DAY_SEC, "daily_end");
     const claimRows = this.db.prepare(`
-      SELECT DISTINCT g.actor_id AS user_id, COALESCE(g.settled_at, g.created_at) AS occurred_at
-      FROM casino_tx_groups g
-      JOIN casino_tx t ON t.group_key=g.group_key
-      WHERE g.kind='daily'
-        AND g.status='settled'
-        AND t.opening_version=?
-        AND t.tx_kind='internal_transfer'
-        AND t.to_holder IS NOT NULL
-        AND t.amount > 0
-        AND COALESCE(g.settled_at, g.created_at) >= ?
-        AND COALESCE(g.settled_at, g.created_at) < ?
-    `).all(FORMAL_OPENING_VERSION, start, end) as Array<{ user_id: string; occurred_at: number }>;
+      SELECT group_key, actor_id AS user_id, result_json, COALESCE(settled_at, created_at) AS occurred_at
+      FROM casino_tx_groups
+      WHERE kind='daily'
+        AND status='settled'
+        AND COALESCE(settled_at, created_at) >= ?
+        AND COALESCE(settled_at, created_at) < ?
+      ORDER BY group_key
+    `).all(start, end) as Array<{ group_key: string; user_id: string; result_json: string | null; occurred_at: number }>;
+
+    const successful = new Map<string, number>();
+    for (const row of claimRows) {
+      if (!row.user_id || typeof row.user_id !== "string") {
+        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "daily.actor_id", groupKey: row.group_key });
+      }
+      assertNonNegative(row.occurred_at, "daily.occurred_at");
+      const result = parseJsonObject(row.result_json, `daily.result_json:${row.group_key}`);
+      if (result.ok === false && result.reason === "ALREADY_CLAIMED") continue;
+      if (result.ok !== true) {
+        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "daily.result_json", groupKey: row.group_key });
+      }
+      const claim = result.claim;
+      if (!claim || typeof claim !== "object" || Array.isArray(claim)) {
+        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "daily.claim", groupKey: row.group_key });
+      }
+      const total = (claim as { total?: unknown }).total;
+      if (typeof total !== "number") {
+        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "daily.claim.total", groupKey: row.group_key });
+      }
+      assertNonNegative(total, "daily.claim.total");
+      if (!successful.has(row.user_id)) successful.set(row.user_id, row.occurred_at);
+    }
+
     const gameUsers = new Set(
       (this.db.prepare(`
         SELECT DISTINCT user_id FROM casino_metric_events
         WHERE event_type='game_start' AND user_id IS NOT NULL AND occurred_at >= ? AND occurred_at < ?
       `).all(start, end) as Array<{ user_id: string }>).map((r) => r.user_id),
     );
+
+    for (const userId of gameUsers) {
+      this.db.prepare("DELETE FROM casino_metric_events WHERE event_key=? AND event_type='daily_only'").run(`daily_only:${date}:${userId}`);
+    }
+
     let recorded = 0;
-    for (const row of claimRows) {
-      const userId = playerIdFromHolder(row.user_id) ?? row.user_id;
-      if (!userId || gameUsers.has(userId)) continue;
+    for (const [userId, occurredAt] of successful) {
+      if (gameUsers.has(userId)) continue;
       const result = this.record({
         eventKey: `daily_only:${date}:${userId}`,
         eventType: "daily_only",
         userId,
         payload: { date, userId },
-        occurredAt: row.occurred_at,
+        occurredAt,
       });
       if (result.recorded) recorded++;
     }
@@ -403,42 +552,122 @@ export class CasinoMetrics {
 
   rollupDaily(date: string): CasinoMetricDailyRow | null {
     if (!this.ensureSchema()) return null;
-    const start = jstDateStart(date);
-    const end = start + DAY_SEC;
-    const game = this.db.prepare(`
-      SELECT COUNT(*) AS play_count,
-             COUNT(DISTINCT user_id) AS unique_users,
-             COALESCE(SUM(wager), 0) AS total_wager,
-             COALESCE(SUM(payout), 0) AS total_payout
-      FROM casino_metric_events
-      WHERE event_type='game_finish' AND occurred_at >= ? AND occurred_at < ?
-    `).get(start, end) as Pick<CasinoMetricDailyRow, "play_count" | "unique_users" | "total_wager" | "total_payout">;
-    const starts = this.countEvents("game_start", start, end);
-    const replays = this.countEvents("replay", start, end);
-    const row: CasinoMetricDailyRow = {
+    const openingAt = this.formalOpeningTimestamp();
+    const openingDate = jstDate(openingAt);
+    if (date < openingDate) {
+      this.db.prepare("DELETE FROM casino_metric_daily WHERE date=?").run(date);
+      return null;
+    }
+
+    const existing = this.readDailyStorage(date);
+    if (existing?.revisit_finalized_at != null) return toPublicDaily(existing);
+
+    const dayStart = jstDateStart(date);
+    const start = Math.max(dayStart, openingAt);
+    const end = checkedAdd(dayStart, DAY_SEC, "rollup_end");
+    const rawCutoff = checkedAdd(this.clock(), -(RAW_RETENTION_DAYS * DAY_SEC), "raw_cutoff");
+    const preserveBase = start < rawCutoff;
+
+    let base: Omit<CasinoMetricDailyRow, "date" | "revisit_rate_bps" | "updated_at">;
+    if (preserveBase) {
+      if (!existing) {
+        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { date, reason: "daily_row_missing_after_raw_window" });
+      }
+      this.validateDailyStorage(existing);
+      base = {
+        play_count: existing.play_count,
+        unique_users: existing.unique_users,
+        total_wager: existing.total_wager,
+        total_payout: existing.total_payout,
+        house_pnl: existing.house_pnl,
+        table_fee_income: existing.table_fee_income,
+        jackpot_delta: existing.jackpot_delta,
+        fuku_outflow: existing.fuku_outflow,
+        table_open_count: existing.table_open_count,
+        table_start_count: existing.table_start_count,
+        table_dispute_count: existing.table_dispute_count,
+        replay_rate_bps: existing.replay_rate_bps,
+      };
+    } else {
+      const finishRows = this.db.prepare(`
+        SELECT user_id, wager, payout
+        FROM casino_metric_events
+        WHERE event_type='game_finish' AND occurred_at >= ? AND occurred_at < ?
+        ORDER BY id
+      `).all(start, end) as Array<{ user_id: string | null; wager: number | null; payout: number | null }>;
+      const users = new Set<string>();
+      const wagers: number[] = [];
+      const payouts: number[] = [];
+      for (const row of finishRows) {
+        if (row.wager == null || row.payout == null) {
+          throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { date, reason: "game_finish_amount_missing" });
+        }
+        assertNonNegative(row.wager, "game_finish.wager");
+        assertNonNegative(row.payout, "game_finish.payout");
+        wagers.push(row.wager);
+        payouts.push(row.payout);
+        if (row.user_id != null) users.add(row.user_id);
+      }
+      assertNonNegative(finishRows.length, "play_count");
+      assertNonNegative(users.size, "unique_users");
+      const starts = this.countEvents("game_start", start, end);
+      const replays = this.countEvents("replay", start, end);
+      base = {
+        play_count: finishRows.length,
+        unique_users: users.size,
+        total_wager: checkedAddAll(wagers, "total_wager"),
+        total_payout: checkedAddAll(payouts, "total_payout"),
+        house_pnl: this.housePnl(start, end),
+        table_fee_income: 0,
+        jackpot_delta: this.jackpotDelta(start, end),
+        fuku_outflow: this.fukuOutflow(start, end),
+        table_open_count: this.countEvents("table_open", start, end),
+        table_start_count: this.countEvents("table_start", start, end),
+        table_dispute_count: this.countEvents("table_dispute", start, end),
+        replay_rate_bps: bps(replays, starts),
+      };
+    }
+
+    const cohort = existing?.revisit_cohort_json != null
+      ? parseCohort(existing.revisit_cohort_json)
+      : this.captureRevisitCohort(start, end);
+    const cohortJson = canonicalStringify(cohort);
+    const revisitWindowEnd = checkedAdd(end, RAW_RETENTION_DAYS * DAY_SEC, "revisit_window_end");
+    let revisitRate: number | null = null;
+    let finalizedAt: number | null = null;
+    if (this.clock() >= revisitWindowEnd) {
+      let returned = 0;
+      const later = this.db.prepare(`
+        SELECT 1 AS ok FROM casino_metric_events
+        WHERE event_type='home_open' AND user_id=? AND occurred_at >= ? AND occurred_at < ?
+        LIMIT 1
+      `);
+      for (const userId of cohort) {
+        if (later.get(userId, end, revisitWindowEnd)) returned = checkedAdd(returned, 1, "revisit_returned_count");
+      }
+      revisitRate = bps(returned, cohort.length);
+      finalizedAt = this.clock();
+      assertNonNegative(finalizedAt, "revisit_finalized_at");
+    }
+
+    const row: CasinoMetricDailyStorageRow = {
       date,
-      play_count: game.play_count,
-      unique_users: game.unique_users,
-      total_wager: game.total_wager,
-      total_payout: game.total_payout,
-      house_pnl: this.housePnl(start, end),
-      table_fee_income: 0,
-      jackpot_delta: this.jackpotDelta(start, end),
-      fuku_outflow: this.fukuOutflow(start, end),
-      table_open_count: this.countEvents("table_open", start, end),
-      table_start_count: this.countEvents("table_start", start, end),
-      table_dispute_count: this.countEvents("table_dispute", start, end),
-      replay_rate_bps: bps(replays, starts),
-      revisit_rate_bps: this.revisitRateBps(date),
+      ...base,
+      revisit_rate_bps: revisitRate,
+      revisit_cohort_json: cohortJson,
+      revisit_finalized_at: finalizedAt,
       updated_at: this.clock(),
     };
+    this.validateDailyStorage(row);
     this.db.prepare(`
       INSERT INTO casino_metric_daily
         (date, play_count, unique_users, total_wager, total_payout, house_pnl, table_fee_income, jackpot_delta,
-         fuku_outflow, table_open_count, table_start_count, table_dispute_count, replay_rate_bps, revisit_rate_bps, updated_at)
+         fuku_outflow, table_open_count, table_start_count, table_dispute_count, replay_rate_bps, revisit_rate_bps,
+         revisit_cohort_json, revisit_finalized_at, updated_at)
       VALUES
         (@date, @play_count, @unique_users, @total_wager, @total_payout, @house_pnl, @table_fee_income, @jackpot_delta,
-         @fuku_outflow, @table_open_count, @table_start_count, @table_dispute_count, @replay_rate_bps, @revisit_rate_bps, @updated_at)
+         @fuku_outflow, @table_open_count, @table_start_count, @table_dispute_count, @replay_rate_bps, @revisit_rate_bps,
+         @revisit_cohort_json, @revisit_finalized_at, @updated_at)
       ON CONFLICT(date) DO UPDATE SET
         play_count=excluded.play_count,
         unique_users=excluded.unique_users,
@@ -453,37 +682,178 @@ export class CasinoMetrics {
         table_dispute_count=excluded.table_dispute_count,
         replay_rate_bps=excluded.replay_rate_bps,
         revisit_rate_bps=excluded.revisit_rate_bps,
+        revisit_cohort_json=excluded.revisit_cohort_json,
+        revisit_finalized_at=excluded.revisit_finalized_at,
         updated_at=excluded.updated_at
     `).run(row);
-    return row;
+    return toPublicDaily(row);
   }
 
-  runDailyMaintenance(options: { throughDate?: string; maxDays?: number } = {}): { skipped: boolean; dates: string[]; chipEvents: number; pruned: number } {
-    if (!this.ensureSchema()) return { skipped: true, dates: [], chipEvents: 0, pruned: 0 };
+  runDailyMaintenance(options: { throughDate?: string; maxDays?: number } = {}): {
+    skipped: boolean;
+    dates: string[];
+    chipEvents: number;
+    pruned: number;
+    reconciledSlots: number;
+  } {
+    if (!this.ensureSchema()) return { skipped: true, dates: [], chipEvents: 0, pruned: 0, reconciledSlots: 0 };
+    const reconciledSlots = this.reconcileSlotsFinishes();
     const chipEvents = this.syncChipExchangeEvents();
+    const openingDate = jstDate(this.formalOpeningTimestamp());
     const through = options.throughDate ?? addJstDays(jstDate(this.clock()), -1);
-    const maxDays = options.maxDays ?? 90;
+    const maxDays = options.maxDays ?? RAW_RETENTION_DAYS;
+    assertNonNegative(maxDays, "maxDays");
     const dates: string[] = [];
-    for (let i = maxDays - 1; i >= 0; i--) {
+    for (let i = maxDays; i >= 0; i--) {
       const date = addJstDays(through, -i);
-      if (date > through) continue;
+      if (date < openingDate || date > through) continue;
       this.synthesizeDailyOnly(date);
       this.rollupDaily(date);
       dates.push(date);
     }
     const pruned = this.pruneRaw();
-    return { skipped: false, dates, chipEvents, pruned };
+    return { skipped: false, dates, chipEvents, pruned, reconciledSlots };
   }
 
-  pruneRaw(retentionDays = 90): number {
+  pruneRaw(retentionDays = RAW_RETENTION_DAYS): number {
     if (!this.ensureSchema()) return 0;
-    return this.db.prepare("DELETE FROM casino_metric_events WHERE occurred_at < ?").run(this.clock() - retentionDays * DAY_SEC).changes;
+    assertNonNegative(retentionDays, "retentionDays");
+    const retentionSec = retentionDays * DAY_SEC;
+    if (!Number.isSafeInteger(retentionSec)) throw new CasinoMetricsError("ERR_METRIC_BAD_NUMBER", { field: "retentionSec" });
+    const cutoff = checkedAdd(this.clock(), -retentionSec, "prune_cutoff");
+    return this.db.prepare("DELETE FROM casino_metric_events WHERE occurred_at < ?").run(cutoff).changes;
+  }
+
+  /**
+   * スロットの金融正本から、欠落した game_finish を閉じる。
+   * game_start は決して新規作成せず、既存 start の source/wager と settled group result_json、
+   * free-spin 永続行だけを使う。推測できない状態は例外で停止する。
+   */
+  reconcileSlotsFinish(userId: string, operationId: string): boolean {
+    if (!this.ensureSchema()) return false;
+    const start = this.db.prepare(`
+      SELECT user_id, operation_id, wager, source
+      FROM casino_metric_events
+      WHERE event_type='game_start' AND game='スロット' AND user_id=? AND operation_id=?
+      LIMIT 1
+    `).get(userId, operationId) as { user_id: string; operation_id: string; wager: number | null; source: string | null } | undefined;
+    if (!start) return false;
+    if (start.wager == null || !start.source) {
+      throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "slots.game_start", userId, operationId });
+    }
+    assertNonNegative(start.wager, "slots.start.wager");
+    const finishKey = `game_finish:スロット:${userId}:${operationId}`;
+    const already = this.db.prepare("SELECT 1 AS ok FROM casino_metric_events WHERE event_key=?").get(finishKey);
+    if (already) return false;
+
+    const paidGroupKey = `slots:spin:${userId}:${operationId}:paid`;
+    const paidGroup = this.chipTx.getGroup(paidGroupKey);
+    if (!paidGroup) return false;
+    if (paidGroup.status !== "settled" || paidGroup.settled_at == null) {
+      throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "slots.paid_group", paidGroupKey });
+    }
+    assertNonNegative(paidGroup.settled_at, "slots.paid_group.settled_at");
+    const paid = this.parseSlotSpin(paidGroup.result_json, "slots.paid_result");
+    const freeRow = this.db.prepare(`
+      SELECT id, status FROM casino_pending_free_spins
+      WHERE user_id=? AND operation_id=? AND spin_no=1
+    `).get(userId, operationId) as { id: number; status: string } | undefined;
+
+    let payout = this.slotTotalPayout(paid, "slots.paid_total");
+    let settledAt = paidGroup.settled_at;
+    if (!freeRow) {
+      if (paid.pendingFreeSpin != null) {
+        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "slots.pending_free_spin", reason: "missing_row", paidGroupKey });
+      }
+    } else {
+      assertNonNegative(freeRow.id, "slots.free.id");
+      if (paid.pendingFreeSpin == null) {
+        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "slots.pending_free_spin", reason: "unexpected_row", paidGroupKey });
+      }
+      if (freeRow.status !== "settled") return false;
+      const freeGroupKey = `slots:spin:${userId}:${operationId}:free:1`;
+      const freeGroup = this.chipTx.getGroup(freeGroupKey);
+      if (!freeGroup || freeGroup.status !== "settled" || freeGroup.settled_at == null) {
+        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "slots.free_group", freeGroupKey });
+      }
+      assertNonNegative(freeGroup.settled_at, "slots.free_group.settled_at");
+      const free = this.parseSlotSpin(freeGroup.result_json, "slots.free_result");
+      payout = checkedAdd(payout, this.slotTotalPayout(free, "slots.free_total"), "slots.aggregate_payout");
+      settledAt = freeGroup.settled_at;
+    }
+    const net = checkedAdd(payout, -start.wager, "slots.aggregate_net");
+    this.gameFinish({
+      game: "スロット",
+      userId,
+      operationId,
+      wager: start.wager,
+      payout,
+      net,
+      source: start.source,
+      occurredAt: settledAt,
+    });
+    return true;
+  }
+
+  reconcileSlotsFinishes(): number {
+    if (!this.ensureSchema()) return 0;
+    const starts = this.db.prepare(`
+      SELECT user_id, operation_id
+      FROM casino_metric_events s
+      WHERE s.event_type='game_start' AND s.game='スロット'
+        AND s.user_id IS NOT NULL AND s.operation_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM casino_metric_events f
+          WHERE f.event_key = 'game_finish:スロット:' || s.user_id || ':' || s.operation_id
+        )
+      ORDER BY s.id
+    `).all() as Array<{ user_id: string; operation_id: string }>;
+    let reconciled = 0;
+    for (const row of starts) {
+      if (this.reconcileSlotsFinish(row.user_id, row.operation_id)) {
+        reconciled = checkedAdd(reconciled, 1, "slots.reconciled_count");
+      }
+    }
+    return reconciled;
+  }
+
+  private parseSlotSpin(json: string | null, field: string): PersistedSlotSpinResult {
+    const parsed = parseJsonObject(json, field);
+    const payout = parsed.payout;
+    const jpWon = parsed.jpWon;
+    if (typeof payout !== "number" || typeof jpWon !== "number") {
+      throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field, reason: "missing_payout" });
+    }
+    assertNonNegative(payout, `${field}.payout`);
+    assertNonNegative(jpWon, `${field}.jpWon`);
+    let chainBonus = 0;
+    let fukuTax = 0;
+    if (parsed.settled != null) {
+      if (typeof parsed.settled !== "object" || Array.isArray(parsed.settled)) {
+        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field, reason: "bad_settled" });
+      }
+      const settled = parsed.settled as { chainBonus?: unknown; fukuTax?: unknown };
+      if (typeof settled.chainBonus !== "number" || typeof settled.fukuTax !== "number") {
+        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field, reason: "bad_settled_amounts" });
+      }
+      assertNonNegative(settled.chainBonus, `${field}.chainBonus`);
+      assertNonNegative(settled.fukuTax, `${field}.fukuTax`);
+      chainBonus = settled.chainBonus;
+      fukuTax = settled.fukuTax;
+    }
+    return { payout, jpWon, chainBonus, fukuTax, pendingFreeSpin: parsed.pendingFreeSpin ?? null };
+  }
+
+  private slotTotalPayout(result: PersistedSlotSpinResult, field: string): number {
+    return checkedAddAll([result.payout, result.jpWon, result.chainBonus, -result.fukuTax], field);
   }
 
   private countEvents(eventType: CasinoMetricEventType, start: number, end: number): number {
-    return (this.db.prepare(`
+    const n = (this.db.prepare(`
       SELECT COUNT(*) AS n FROM casino_metric_events WHERE event_type=? AND occurred_at >= ? AND occurred_at < ?
     `).get(eventType, start, end) as { n: number }).n;
+    assertNonNegative(n, `count:${eventType}`);
+    return n;
   }
 
   private housePnl(start: number, end: number): number {
@@ -507,12 +877,15 @@ export class CasinoMetrics {
     }>;
     let total = 0;
     for (const row of rows) {
+      assertNonNegative(row.id, "house_pnl.tx_id");
+      assertNonNegative(row.amount, "house_pnl.amount");
       const classified = classifyHousePnlTx(row);
       if (classified.kind === "excluded") continue;
       if (classified.kind === "unclassified") {
         throw new CasinoMetricsError("ERR_METRIC_HOUSE_PNL_UNCLASSIFIED", { chipTxId: row.id, groupKind: row.group_kind });
       }
-      total += classified.amount;
+      assertSafeInteger(classified.amount, "house_pnl.classified_amount");
+      total = checkedAdd(total, classified.amount, "house_pnl");
     }
     return total;
   }
@@ -527,7 +900,13 @@ export class CasinoMetrics {
       to_holder: string | null;
       amount: number;
     }>;
-    return rows.reduce((sum, row) => sum + (row.to_holder === JACKPOT_HOLDER ? row.amount : row.from_holder === JACKPOT_HOLDER ? -row.amount : 0), 0);
+    let total = 0;
+    for (const row of rows) {
+      assertNonNegative(row.amount, "jackpot_delta.amount");
+      const delta = row.to_holder === JACKPOT_HOLDER ? row.amount : row.from_holder === JACKPOT_HOLDER ? -row.amount : 0;
+      total = checkedAdd(total, delta, "jackpot_delta");
+    }
+    return total;
   }
 
   private fukuOutflow(start: number, end: number): number {
@@ -543,30 +922,65 @@ export class CasinoMetrics {
         AND t.created_at < ?
         AND t.to_holder IS NOT NULL
     `).all(FORMAL_OPENING_VERSION, start, end) as Array<{ to_holder: string | null; amount: number }>;
-    return rows.reduce((sum, row) => sum + (row.to_holder && isPlayerHolder(row.to_holder) ? row.amount : 0), 0);
+    let total = 0;
+    for (const row of rows) {
+      assertNonNegative(row.amount, "fuku_outflow.amount");
+      if (row.to_holder && isPlayerHolder(row.to_holder)) total = checkedAdd(total, row.amount, "fuku_outflow");
+    }
+    return total;
   }
 
-  private revisitRateBps(date: string): number | null {
-    const start = jstDateStart(date);
-    const end = start + DAY_SEC;
-    const laterStart = end;
-    const laterEnd = end + 90 * DAY_SEC;
-    const users = (this.db.prepare(`
+  private captureRevisitCohort(start: number, end: number): string[] {
+    const rows = this.db.prepare(`
       SELECT DISTINCT user_id FROM casino_metric_events
       WHERE event_type='home_open' AND user_id IS NOT NULL AND occurred_at >= ? AND occurred_at < ?
-    `).all(start, end) as Array<{ user_id: string }>).map((r) => r.user_id);
-    if (users.length === 0) return null;
-    const later = this.db.prepare(`
-      SELECT 1 AS ok FROM casino_metric_events
-      WHERE event_type='home_open' AND user_id=? AND occurred_at >= ? AND occurred_at < ?
-      LIMIT 1
-    `);
-    let returned = 0;
-    for (const userId of users) {
-      if (later.get(userId, laterStart, laterEnd)) returned++;
+      ORDER BY user_id
+    `).all(start, end) as Array<{ user_id: string }>;
+    for (const row of rows) {
+      if (!row.user_id || typeof row.user_id !== "string") {
+        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "revisit.user_id" });
+      }
     }
-    return bps(returned, users.length);
+    return rows.map((r) => r.user_id);
+  }
+
+  private formalOpeningTimestamp(): number {
+    const row = this.db.prepare(`
+      SELECT created_at FROM casino_chip_opening_versions WHERE opening_version=?
+    `).get(FORMAL_OPENING_VERSION) as { created_at: number } | undefined;
+    if (!row) throw new CasinoMetricsError("ERR_METRIC_BAD_DATE", { reason: "formal_opening_missing" });
+    assertNonNegative(row.created_at, "formal_opening.created_at");
+    return row.created_at;
+  }
+
+  private readDailyStorage(date: string): CasinoMetricDailyStorageRow | undefined {
+    return this.db.prepare(`
+      SELECT date, play_count, unique_users, total_wager, total_payout, house_pnl, table_fee_income,
+             jackpot_delta, fuku_outflow, table_open_count, table_start_count, table_dispute_count,
+             replay_rate_bps, revisit_rate_bps, revisit_cohort_json, revisit_finalized_at, updated_at
+      FROM casino_metric_daily WHERE date=?
+    `).get(date) as CasinoMetricDailyStorageRow | undefined;
+  }
+
+  private validateDailyStorage(row: CasinoMetricDailyStorageRow): void {
+    assertNonNegative(row.play_count, "daily.play_count");
+    assertNonNegative(row.unique_users, "daily.unique_users");
+    assertNonNegative(row.total_wager, "daily.total_wager");
+    assertNonNegative(row.total_payout, "daily.total_payout");
+    assertSafeInteger(row.house_pnl, "daily.house_pnl");
+    assertNonNegative(row.table_fee_income, "daily.table_fee_income");
+    assertSafeInteger(row.jackpot_delta, "daily.jackpot_delta");
+    assertNonNegative(row.fuku_outflow, "daily.fuku_outflow");
+    assertNonNegative(row.table_open_count, "daily.table_open_count");
+    assertNonNegative(row.table_start_count, "daily.table_start_count");
+    assertNonNegative(row.table_dispute_count, "daily.table_dispute_count");
+    if (row.replay_rate_bps != null) assertNonNegative(row.replay_rate_bps, "daily.replay_rate_bps");
+    if (row.revisit_rate_bps != null) assertNonNegative(row.revisit_rate_bps, "daily.revisit_rate_bps");
+    if (row.revisit_finalized_at != null) assertNonNegative(row.revisit_finalized_at, "daily.revisit_finalized_at");
+    assertNonNegative(row.updated_at, "daily.updated_at");
+    if (row.revisit_cohort_json != null) parseCohort(row.revisit_cohort_json);
   }
 }
 
 export const casinoMetricDateForTesting = { jstDate, jstDateStart, addJstDays };
+export const casinoMetricArithmeticForTesting = { checkedAddAll, bps };
