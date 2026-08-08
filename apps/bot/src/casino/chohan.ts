@@ -23,6 +23,14 @@ import {
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { buildSoloResult } from "./solo-result.js";
+import {
+  casinoPlayContext,
+  isCollectorTimeoutError,
+  recordCasinoGameAbandonBestEffort,
+  recordCasinoGameFinishBestEffort,
+  recordCasinoGameStartBestEffort,
+  type CasinoPlayContext,
+} from "./metrics.js";
 
 /**
  * 🎴 丁半（ソロ・casino-bot 準拠）。
@@ -60,6 +68,7 @@ export async function playChohan(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   betRaw: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
   if (!acquireSeat(uid)) {
@@ -73,7 +82,7 @@ export async function playChohan(
   try {
     const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "丁半");
     if (!check.ok) return;
-    await runRound(interaction, services, check.bet);
+    await runRound(interaction, services, check.bet, context);
   } finally {
     releaseSeat(uid);
   }
@@ -87,9 +96,10 @@ async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   await withHouseReservation(interaction, services, "丁半", bet, interaction.id, (reservationKey) =>
-    runRoundInner(interaction, services, bet, reservationKey),
+    runRoundInner(interaction, services, bet, reservationKey, context),
   );
 }
 
@@ -98,8 +108,17 @@ async function runRoundInner(
   services: Services,
   bet: number,
   reservationKey: string,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
+  const playContext = casinoPlayContext(context);
+  recordCasinoGameStartBestEffort(services, {
+    userId: uid,
+    game: "丁半",
+    operationId: interaction.id,
+    wager: bet,
+    source: playContext.source,
+  });
 
   const bettingEmbed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · 丁半" })
@@ -134,7 +153,16 @@ async function runRoundInner(
     });
     picked = btn.customId === "chohan:cho" ? "cho" : "han";
     await btn.deferUpdate();
-  } catch {
+  } catch (error) {
+    if (!isCollectorTimeoutError(error)) throw error;
+    recordCasinoGameAbandonBestEffort(services, {
+      userId: uid,
+      game: "丁半",
+      operationId: interaction.id,
+      wager: bet,
+      source: playContext.source,
+      reason: "choice_timeout",
+    });
     await reply.edit({ content: "⏱ 時間切れ。この卓は流れた。", embeds: [], components: [] }).catch(() => undefined);
     return;
   }
@@ -173,6 +201,15 @@ async function runRoundInner(
   // 連鎖有効時は実効 RTP が 106% を超える回帰が実測レポートで確認された（クラッシュと同構造）。
   // お守りの消費も賭け・配当と同じグループの中（settleSolo）
   const settled = services.casino.settleSolo(uid, "丁半", bet, rawPayout, { chain: false, operationId: interaction.id, reservationKey });
+  recordCasinoGameFinishBestEffort(services, {
+    userId: uid,
+    game: "丁半",
+    operationId: interaction.id,
+    wager: bet,
+    payout: settled.payout,
+    net: settled.net,
+    source: playContext.source,
+  });
   const amulet = { note: settled.amuletNote };
 
   const totalPayout = settled.payout;

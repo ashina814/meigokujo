@@ -34,11 +34,13 @@ import {
 import { handleTakuButton, handleTakuVoiceUpdate, sweepStaleTables } from "./commands/takutate-panel.js";
 import { handlePokerDuelButton, handlePokerDuelSelect } from "./casino/poker-duel.js";
 import { denyIfCasinoClosed } from "./casino/gate.js";
-import { handleCasinoPlayButton, isCasinoPlayButton } from "./casino/play-route.js";
+import { handleCasinoPlayButton, handleCasinoPrimaryButton, isCasinoPlayButton, isCasinoPrimaryButton } from "./casino/play-route.js";
 import {
+  CASINO_AMOUNT_PICK_PREFIX,
   CASINO_AMOUNT_CUSTOM_PREFIX,
   CASINO_AMOUNT_MODAL_PREFIX,
   CASINO_GAME_SELECT_CUSTOM_ID,
+  handleCasinoAmountPickButton,
   handleCasinoAmountButton,
   handleCasinoAmountModal,
   handleCasinoGameSelect,
@@ -424,6 +426,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleCasinoAmountButton(interaction, services);
         return;
       }
+      if (interaction.customId.startsWith(CASINO_AMOUNT_PICK_PREFIX)) {
+        await handleCasinoAmountPickButton(interaction, services);
+        return;
+      }
       if (isCasinoResultButton(interaction.customId)) {
         await handleCasinoResultButton(interaction, services);
         return;
@@ -450,6 +456,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (isCasinoPlayButton(interaction.customId)) {
         await handleCasinoPlayButton(interaction, services);
+        return;
+      }
+      if (isCasinoPrimaryButton(interaction.customId)) {
+        await handleCasinoPrimaryButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("taku:")) {

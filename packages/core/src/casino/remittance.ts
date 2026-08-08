@@ -7,29 +7,9 @@ import { readCasinoOpeningConfig, type CasinoOpeningConfig } from "./opening-set
 import { ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 import { HouseReservations } from "./reservations.js";
 import { FORMAL_OPENING_VERSION } from "./chip-tx.js";
+import { classifyHousePnlTx } from "./house-pnl.js";
 const REMITTANCE_GROUP_PREFIX = "casino:remittance:";
 const BAILOUT_GROUP_PREFIX = "casino:bailout:";
-
-const OPERATING_HOUSE_GROUPS = new Set([
-  "solo_game",
-  "daily",
-  "vip",
-  "shop",
-  "table_start",
-  "table_settle",
-]);
-
-const EXCLUDED_HOUSE_GROUPS = new Set([
-  "refund",
-  "table_refund",
-  "market_bet",
-  "market_settle",
-  "deposit",
-  "redeem",
-  "opening_reset",
-  "remittance",
-  "bailout",
-]);
 
 export type RemittanceStatus = "draft" | "approved" | "executed" | "rejected";
 export type RemittanceKind = "remittance" | "bailout";
@@ -538,8 +518,9 @@ export class CasinoRemittance {
         assertSafeNonNegative(row.created_at, "chipTx.created_at");
         if (row.opening_version !== FORMAL_OPENING_VERSION) continue;
 
-        if (!OPERATING_HOUSE_GROUPS.has(row.group_kind)) {
-          if (EXCLUDED_HOUSE_GROUPS.has(row.group_kind)) continue;
+        const classified = classifyHousePnlTx(row);
+        if (classified.kind === "excluded") continue;
+        if (classified.kind === "unclassified") {
           throw new CasinoRemittanceError("ERR_UNCLASSIFIED_HOUSE_TX", {
             chipTxId: row.id,
             groupKey: row.group_key,
@@ -549,12 +530,7 @@ export class CasinoRemittance {
           });
         }
 
-        const amount =
-          row.to_holder === HOUSE_HOLDER
-            ? row.amount
-            : row.from_holder === HOUSE_HOLDER
-              ? -row.amount
-              : 0;
+        const amount = classified.amount;
         if (amount === 0) continue;
 
         if (

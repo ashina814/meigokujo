@@ -148,6 +148,47 @@ describe("OpeningReset.apply — 正常系", () => {
     ctx.db
       .prepare("INSERT INTO casino_home_preferences (user_id, last_game, last_amount, updated_at) VALUES (?, ?, ?, ?)")
       .run("alice", "スロット", 100, 1);
+    ctx.db.exec(`
+      CREATE TABLE IF NOT EXISTS casino_metric_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_key TEXT NOT NULL UNIQUE,
+        event_type TEXT NOT NULL,
+        user_id TEXT,
+        game TEXT,
+        source TEXT,
+        operation_id TEXT,
+        wager INTEGER,
+        payout INTEGER,
+        net INTEGER,
+        amount INTEGER,
+        payload_json TEXT,
+        occurred_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS casino_metric_daily (
+        date TEXT PRIMARY KEY,
+        play_count INTEGER NOT NULL DEFAULT 0,
+        unique_users INTEGER NOT NULL DEFAULT 0,
+        total_wager INTEGER NOT NULL DEFAULT 0,
+        total_payout INTEGER NOT NULL DEFAULT 0,
+        house_pnl INTEGER NOT NULL DEFAULT 0,
+        table_fee_income INTEGER NOT NULL DEFAULT 0,
+        jackpot_delta INTEGER NOT NULL DEFAULT 0,
+        fuku_outflow INTEGER NOT NULL DEFAULT 0,
+        table_open_count INTEGER NOT NULL DEFAULT 0,
+        table_start_count INTEGER NOT NULL DEFAULT 0,
+        table_dispute_count INTEGER NOT NULL DEFAULT 0,
+        replay_rate_bps INTEGER,
+        revisit_rate_bps INTEGER,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    ctx.db
+      .prepare("INSERT INTO casino_metric_events (event_key, event_type, user_id, occurred_at, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run("home_open:test", "home_open", "alice", 1, 1);
+    ctx.db
+      .prepare("INSERT INTO casino_metric_daily (date, play_count, unique_users, total_wager, total_payout, house_pnl, table_fee_income, jackpot_delta, fuku_outflow, table_open_count, table_start_count, table_dispute_count, updated_at) VALUES (?, 1, 1, 100, 0, 100, 0, 0, 0, 0, 0, 0, 1)")
+      .run("2026-01-01");
     configureAndOpenReset(ctx);
     const { backup, external } = adapters();
 
@@ -159,6 +200,8 @@ describe("OpeningReset.apply — 正常系", () => {
     expect(result.postflight.ok).toBe(true);
     expect(result.postflight.checks.every((c) => c.ok)).toBe(true);
     expect(result.openingVersion).toBe(FORMAL_OPENING_VERSION);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_metric_events").get() as { n: number }).n).toBe(0);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_metric_daily").get() as { n: number }).n).toBe(0);
 
     // holder残高
     expect(ctx.ether.balanceOf(HOUSE_HOLDER)).toBe(VALID_CONFIG.openingHouse);

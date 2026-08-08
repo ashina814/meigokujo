@@ -23,6 +23,13 @@ import {
 import { broadcastBigWin } from "./bigwin.js";
 import { C_JACKPOT, C_MAMMON, E, HR_THIN, fmtBigDelta } from "./ui.js";
 import { buildSoloResult } from "./solo-result.js";
+import {
+  casinoPlayContext,
+  recordCasinoGameAbandonBestEffort,
+  recordCasinoGameFinishBestEffort,
+  recordCasinoGameStartBestEffort,
+  type CasinoPlayContext,
+} from "./metrics.js";
 
 /**
  * 🃏 ドローポーカー（Jacks or Better・ソロ）。対胴元の簡易版。
@@ -143,6 +150,7 @@ export async function playPoker(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   betRaw: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
   if (!acquireSeat(uid)) {
@@ -156,7 +164,7 @@ export async function playPoker(
   try {
     const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "ポーカー");
     if (!check.ok) return;
-    await runRound(interaction, services, check.bet);
+    await runRound(interaction, services, check.bet, context);
   } finally {
     releaseSeat(uid);
   }
@@ -170,9 +178,10 @@ async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   await withHouseReservation(interaction, services, "ポーカー", bet, interaction.id, (reservationKey) =>
-    runRoundInner(interaction, services, bet, reservationKey),
+    runRoundInner(interaction, services, bet, reservationKey, context),
   );
 }
 
@@ -181,8 +190,17 @@ async function runRoundInner(
   services: Services,
   bet: number,
   reservationKey: string,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
+  const playContext = casinoPlayContext(context);
+  recordCasinoGameStartBestEffort(services, {
+    userId: uid,
+    game: "ポーカー",
+    operationId: interaction.id,
+    wager: bet,
+    source: playContext.source,
+  });
   const deck = newDeck(services.rng);
   const hand: Card[] = [];
   for (let i = 0; i < 5; i++) hand.push(deck.pop()!);
@@ -235,7 +253,7 @@ async function runRoundInner(
   }
 
   // ── ドローフェーズ: 保持選択 → 交換 ──
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
     const collector = reply.createMessageComponentCollector({
       componentType: ComponentType.Button,
       filter: (i) => i.user.id === uid && i.customId.startsWith("poker:"),
@@ -260,7 +278,20 @@ async function runRoundInner(
       }
     });
     collector.on("end", (_c, reason) => {
-      if (reason !== "draw") resolve();
+      if (reason === "draw") return;
+      if (reason === "time") {
+        recordCasinoGameAbandonBestEffort(services, {
+          userId: uid,
+          game: "ポーカー",
+          operationId: interaction.id,
+          wager: bet,
+          source: playContext.source,
+          reason: "draw_timeout",
+        });
+        resolve();
+        return;
+      }
+      reject(new Error(`poker collector ended without timeout: ${reason}`));
     });
   });
 
@@ -276,6 +307,15 @@ async function runRoundInner(
   const rawPayout = ev.payMult > 0 ? bet * ev.payMult : 0;
   // お守りの消費も賭け・配当と同じグループの中（settleSolo）
   const settled = services.casino.settleSolo(uid, "ポーカー", bet, rawPayout, { operationId: interaction.id, reservationKey });
+  recordCasinoGameFinishBestEffort(services, {
+    userId: uid,
+    game: "ポーカー",
+    operationId: interaction.id,
+    wager: bet,
+    payout: settled.payout,
+    net: settled.net,
+    source: playContext.source,
+  });
   const amulet = { note: settled.amuletNote };
 
   const isJp = ev.category === 11;

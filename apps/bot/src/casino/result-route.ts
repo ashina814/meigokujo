@@ -95,7 +95,7 @@ async function handleCasinoRetry(interaction: ButtonInteraction, services: Servi
   }
 
   await interaction.deferUpdate();
-  await startCasinoSoloGame(interaction, services, parsed.game, retry.bet);
+  await startCasinoSoloGame(interaction, services, parsed.game, retry.bet, { source: "retry" });
 }
 
 function parseResultNav(customId: string): ResultNav {

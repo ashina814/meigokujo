@@ -28,6 +28,12 @@ import {
 import { C_MAMMON, C_WIN } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { buildSoloResult } from "./solo-result.js";
+import {
+  casinoPlayContext,
+  recordCasinoGameFinishBestEffort,
+  recordCasinoGameStartBestEffort,
+  type CasinoPlayContext,
+} from "./metrics.js";
 
 /**
  * 📈 クラッシュ。casino-bot 準拠の忠実移植。
@@ -96,6 +102,7 @@ export async function playCrash(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   betRaw: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
   if (!acquireSeat(uid)) {
@@ -109,7 +116,7 @@ export async function playCrash(
   try {
     const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "クラッシュ");
     if (!check.ok) return;
-    await runRound(interaction, services, check.bet);
+    await runRound(interaction, services, check.bet, context);
   } finally {
     releaseSeat(uid);
   }
@@ -123,9 +130,10 @@ async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   await withHouseReservation(interaction, services, "クラッシュ", bet, interaction.id, (reservationKey) =>
-    runRoundInner(interaction, services, bet, reservationKey),
+    runRoundInner(interaction, services, bet, reservationKey, context),
   );
 }
 
@@ -134,8 +142,17 @@ async function runRoundInner(
   services: Services,
   bet: number,
   reservationKey: string,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
+  const playContext = casinoPlayContext(context);
+  recordCasinoGameStartBestEffort(services, {
+    userId: uid,
+    game: "クラッシュ",
+    operationId: interaction.id,
+    wager: bet,
+    source: playContext.source,
+  });
   const crashPoint = generateCrashPoint(services.rng);
 
   const START_TIME = Date.now();
@@ -245,6 +262,15 @@ async function runRoundInner(
     // 福の重みは維持（低残高帯では 0% なので影響なし・高残高帯ではプレイヤーから JP/救済へ流す）。
     // お守りの消費も賭け・配当と同じグループの中（settleSolo）
     const settled = services.casino.settleSolo(uid, "クラッシュ", bet, rawPayout, { chain: false, operationId: interaction.id, reservationKey });
+    recordCasinoGameFinishBestEffort(services, {
+      userId: uid,
+      game: "クラッシュ",
+      operationId: interaction.id,
+      wager: bet,
+      payout: settled.payout,
+      net: settled.net,
+      source: playContext.source,
+    });
     const amulet = { note: settled.amuletNote };
     const netStr = `+${settled.net.toLocaleString("ja-JP")} Ld`;
     const bigWin = settled.net >= bet * 5;
@@ -276,6 +302,15 @@ async function runRoundInner(
     const lossSettled = services.casino.settleSolo(uid, "クラッシュ", bet, 0, {
       chain: false,
       operationId: interaction.id, reservationKey,
+    });
+    recordCasinoGameFinishBestEffort(services, {
+      userId: uid,
+      game: "クラッシュ",
+      operationId: interaction.id,
+      wager: bet,
+      payout: lossSettled.payout,
+      net: lossSettled.net,
+      source: playContext.source,
     });
     const lossAmulet = { payout: lossSettled.payout, note: lossSettled.amuletNote };
     const savedByAmulet = lossAmulet.payout > 0;

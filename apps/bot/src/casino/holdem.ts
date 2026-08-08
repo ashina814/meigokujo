@@ -23,6 +23,14 @@ import {
 import { broadcastBigWin } from "./bigwin.js";
 import { C_MAMMON, E, HR_THIN, fmtBigDelta } from "./ui.js";
 import { buildSoloResult } from "./solo-result.js";
+import {
+  casinoPlayContext,
+  isCollectorTimeoutError,
+  recordCasinoGameAbandonBestEffort,
+  recordCasinoGameFinishBestEffort,
+  recordCasinoGameStartBestEffort,
+  type CasinoPlayContext,
+} from "./metrics.js";
 
 /**
  * 🃏 テキサスホールデム（対マモン簡易版・ソロ）。
@@ -183,6 +191,7 @@ export async function playHoldem(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   betRaw: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
   if (!acquireSeat(uid)) {
@@ -196,7 +205,7 @@ export async function playHoldem(
   try {
     const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "ホールデム");
     if (!check.ok) return;
-    await runRound(interaction, services, check.bet);
+    await runRound(interaction, services, check.bet, context);
   } finally {
     releaseSeat(uid);
   }
@@ -210,9 +219,10 @@ async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   ante: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   await withHouseReservation(interaction, services, "ホールデム", ante, interaction.id, (reservationKey) =>
-    runRoundInner(interaction, services, ante, reservationKey),
+    runRoundInner(interaction, services, ante, reservationKey, context),
   );
 }
 
@@ -221,8 +231,17 @@ async function runRoundInner(
   services: Services,
   ante: number,
   reservationKey: string,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
+  const playContext = casinoPlayContext(context);
+  recordCasinoGameStartBestEffort(services, {
+    userId: uid,
+    game: "ホールデム",
+    operationId: interaction.id,
+    wager: ante,
+    source: playContext.source,
+  });
   const deck = newDeck(services.rng);
   const pHand: [Card, Card] = [deck.pop()!, deck.pop()!];
   const dHand: [Card, Card] = [deck.pop()!, deck.pop()!];
@@ -297,7 +316,16 @@ async function runRoundInner(
       const parsed = btn.customId.split(":")[1];
       action = parsed === "call" ? "call" : parsed === "fold" ? "fold" : "check";
       await btn.deferUpdate();
-    } catch {
+    } catch (error) {
+      if (!isCollectorTimeoutError(error)) throw error;
+      recordCasinoGameAbandonBestEffort(services, {
+        userId: uid,
+        game: "ホールデム",
+        operationId: interaction.id,
+        wager: playerBet,
+        source: playContext.source,
+        reason: "action_timeout",
+      });
       action = "check";
     }
     if (action === "fold") {
@@ -347,6 +375,15 @@ async function runRoundInner(
   // お守りの消費も賭け・配当と同じグループの中（settleSolo）
   const settled = services.casino.settleSolo(uid, "ホールデム", playerBet, rawPayout, {
     operationId: interaction.id, reservationKey,
+  });
+  recordCasinoGameFinishBestEffort(services, {
+    userId: uid,
+    game: "ホールデム",
+    operationId: interaction.id,
+    wager: playerBet,
+    payout: settled.payout,
+    net: settled.net,
+    source: playContext.source,
   });
   const amulet = { note: settled.amuletNote };
 

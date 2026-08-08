@@ -3,7 +3,7 @@ import type { Interaction } from "discord.js";
 import { ChipLedgerError } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 import { isCasinoInteraction, denyIfCasinoClosed } from "../src/casino/gate.js";
-import { isCasinoPlayButton } from "../src/casino/play-route.js";
+import { isCasinoPrimaryButton } from "../src/casino/play-route.js";
 import { renderCasinoHome } from "../src/commands/casino-home.js";
 
 type Phase = "pre_reset" | "formal" | "unknown";
@@ -100,9 +100,9 @@ describe("/賭場 ホーム", () => {
     expect(embed.description).toContain("自由チップは正式開業まで利用できません");
     expect(embed.description).toContain("資金操作");
     expect(embed.description).toContain("福分けは正式開業後に利用できます");
-    expect(buttons.find((b) => b.custom_id === "casino:play:スロット:100")?.disabled).toBe(true);
+    expect(buttons.find((b) => b.custom_id === "casino:primary:スロット:100")?.disabled).toBe(true);
 
-    const stale = component("casino:play:スロット:100");
+    const stale = component("casino:primary:スロット:100");
     expect(await denyIfCasinoClosed(stale, services)).toBe(true);
     expect((stale.reply.mock.calls[0]![0] as { content: string }).content).toContain("正式開業準備中");
   });
@@ -161,20 +161,20 @@ describe("/賭場 ホーム", () => {
     const { buttons } = homeJson(fakeServices({ pref: null }));
     const primary = buttons[0]!;
     expect(primary.label).toBe("100 Ldで遊ぶ");
-    expect(primary.custom_id).toBe("casino:play:スロット:100");
-    expect(isCasinoPlayButton(primary.custom_id!)).toBe(true);
+    expect(primary.custom_id).toBe("casino:primary:スロット:100");
+    expect(isCasinoPrimaryButton(primary.custom_id!)).toBe(true);
   });
 
   it("再訪者のlast game/amountが実行可能ならprimary actionへ反映する", () => {
     const { buttons } = homeJson(fakeServices({ pref: { game: "丁半", amount: 500 }, free: 1_000 }));
     const primary = buttons[0]!;
     expect(primary.label).toContain("丁半 500 Ldでもう一度");
-    expect(primary.custom_id).toBe("casino:play:丁半:500");
+    expect(primary.custom_id).toBe("casino:primary:丁半:500");
   });
 
   it("古いlast amountが現在実行不能なら安全確認なしに開始せず、初期ボタンへfallbackする", () => {
     const { buttons } = homeJson(fakeServices({ pref: { game: "丁半", amount: 900_000 }, free: 1_000 }));
-    expect(buttons[0]!.custom_id).toBe("casino:play:スロット:100");
+    expect(buttons[0]!.custom_id).toBe("casino:primary:スロット:100");
   });
 
   it("casino statusが停止中でもホームは読めるが、資金操作は突破できない", async () => {
@@ -184,7 +184,7 @@ describe("/賭場 ホーム", () => {
     expect(embed.description).toContain("福分けは現在停止中");
     expect(buttons[0]!.disabled).toBe(true);
 
-    const stale = component("casino:play:スロット:100");
+    const stale = component("casino:primary:スロット:100");
     expect(await denyIfCasinoClosed(stale, services)).toBe(true);
     expect((stale.reply.mock.calls[0]![0] as { content: string }).content).toContain("点検中");
   });

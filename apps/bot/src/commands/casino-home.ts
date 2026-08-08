@@ -13,6 +13,7 @@ import { C_JACKPOT, C_MAMMON, E } from "../casino/ui.js";
 import { checkRetry } from "../casino/common.js";
 import { renderCasinoGameSelect } from "../casino/amount-picker.js";
 import { CASINO_SOLO_GAME_EMOJI, isCasinoSoloGame } from "../casino/games.js";
+import { recordCasinoMetricBestEffort } from "../casino/metrics.js";
 import { openingNotice, openingPhase, operatingLabel } from "../casino/opening.js";
 import { readAvailableWallet } from "../casino/wallet.js";
 import type { Services } from "../services.js";
@@ -32,6 +33,13 @@ export async function handleCasinoHomeCommand(
   await interaction.reply({
     ...renderCasinoHome(interaction.user.id, services, interaction.guild?.name),
     flags: MessageFlags.Ephemeral,
+  });
+  recordCasinoMetricBestEffort(services, {
+    eventKey: `home_open:${interaction.id}`,
+    eventType: "home_open",
+    userId: interaction.user.id,
+    operationId: interaction.id,
+    payload: { source: "command" },
   });
 }
 
@@ -205,7 +213,7 @@ function primaryAction(userId: string, services: Services): { label: string; emo
       return {
         label: `${pref.last_game} ${pref.last_amount.toLocaleString("ja-JP")} Ldでもう一度`,
         emoji: CASINO_SOLO_GAME_EMOJI[pref.last_game] ?? "🎰",
-        customId: `casino:play:${pref.last_game}:${pref.last_amount}`,
+        customId: `casino:primary:${pref.last_game}:${pref.last_amount}`,
       };
     }
   }
@@ -216,7 +224,7 @@ function defaultPrimaryAction(): { label: string; emoji: string; customId: strin
   return {
     label: `${DEFAULT_BET.toLocaleString("ja-JP")} Ldで遊ぶ`,
     emoji: "🎰",
-    customId: `casino:play:${DEFAULT_GAME}:${DEFAULT_BET}`,
+    customId: `casino:primary:${DEFAULT_GAME}:${DEFAULT_BET}`,
   };
 }
 
