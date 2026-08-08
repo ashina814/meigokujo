@@ -222,6 +222,8 @@ async function runRoundInner(
   const fukuLine =
     settled.fukuTax > 0 ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 福分け積立` : "";
 
+  const tag = won ? "🟢 的中" : settled.net === 0 ? "⚪ 返金（お守り）" : "🔴 外れ";
+  const netStr = settled.net === 0 ? "±0 Ld" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} Ld`;
   const bonusBits: string[] = [];
   if (streakLine) bonusBits.push(streakLine);
   if (fukuLine) bonusBits.push(fukuLine);

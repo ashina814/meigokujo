@@ -143,6 +143,7 @@ function evaluate5(hand: Card[]): HandEval {
   return { category: cat, tiebreak: tb, label: CAT_LABELS[cat] ?? "不明" };
 }
 
+/** 7枚から最強5枚役を計算（C(7,5)=21通り総当たり） */
 function bestOf7(cards: Card[]): HandEval {
   let best: HandEval | null = null;
   const n = cards.length;
@@ -210,6 +211,10 @@ export async function playHoldem(
   }
 }
 
+/**
+ * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
+ * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
+ */
 async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
@@ -249,34 +254,50 @@ async function runRoundInner(
 
   const render = (phase: "preflop" | "flop" | "turn" | "river" | "showdown", note?: string) => {
     const board =
-      phase === "preflop" ? "🂠 🂠 🂠 🂠 🂠"
-        : phase === "flop" ? `${showHand(flop)}  🂠 🂠`
-          : phase === "turn" ? `${showHand([...flop, turn])} 🂠`
+      phase === "preflop"
+        ? "🂠 🂠 🂠 🂠 🂠"
+        : phase === "flop"
+          ? `${showHand(flop)}  🂠 🂠`
+          : phase === "turn"
+            ? `${showHand([...flop, turn])} 🂠`
             : showHand([...flop, turn, river]);
-    const phaseLabel = { preflop: "プリフロップ", flop: "フロップ", turn: "ターン", river: "リバー", showdown: "ショウダウン" }[phase];
+    const phaseLabel = {
+      preflop: "プリフロップ",
+      flop: "フロップ",
+      turn: "ターン",
+      river: "リバー",
+      showdown: "ショウダウン",
+    }[phase];
     const pot = playerBet + dealerBet;
     return new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · ホールデム" })
       .setColor(C_MAMMON)
       .setTitle(`🃏  ${phaseLabel}  ·  Pot ${fmtEther(pot).replace(" Ld", "Ld")}`)
-      .setDescription([
-        `**ボード**   ${board}`,
-        `${E.demon} マモン   ${phase === "showdown" ? showHand(dHand) : "🂠 🂠"}`,
-        `${E.crown} お前     ${showHand(pHand)}`,
-        note ? `${HR_THIN}\n${note}` : "",
-      ].filter(Boolean).join("\n"))
+      .setDescription(
+        [
+          `**ボード**   ${board}`,
+          `${E.demon} マモン   ${phase === "showdown" ? showHand(dHand) : "🂠 🂠"}`,
+          `${E.crown} お前     ${showHand(pHand)}`,
+          note ? `${HR_THIN}\n${note}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      )
       .setFooter({ text: `賭け ${fmtEther(playerBet).replace(" Ld", "Ld")} / マモン ${fmtEther(dealerBet).replace(" Ld", "Ld")}` });
   };
 
-  const actionRow = (phase: string) => new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`holdem:call:${phase}`).setLabel(`コール (+${fmtEther(ante)})`).setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`holdem:check:${phase}`).setLabel("チェック").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`holdem:fold:${phase}`).setLabel("フォールド").setStyle(ButtonStyle.Danger),
-  );
+  const actionRow = (phase: string) =>
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`holdem:call:${phase}`).setLabel(`コール (+${fmtEther(ante)})`).setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`holdem:check:${phase}`).setLabel("チェック").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`holdem:fold:${phase}`).setLabel("フォールド").setStyle(ButtonStyle.Danger),
+    );
 
+  // アンティ徴収は最終精算時（Casino.settle）に一括で
   let reply: Message;
-  if (interaction.replied || interaction.deferred) reply = (await interaction.followUp({ embeds: [render("preflop")], components: [actionRow("preflop")] })) as Message;
-  else {
+  if (interaction.replied || interaction.deferred) {
+    reply = (await interaction.followUp({ embeds: [render("preflop")], components: [actionRow("preflop")] })) as Message;
+  } else {
     await interaction.reply({ embeds: [render("preflop")], components: [actionRow("preflop")] });
     reply = (await interaction.fetchReply()) as Message;
   }
@@ -289,7 +310,7 @@ async function runRoundInner(
     try {
       const btn = await reply.awaitMessageComponent({
         componentType: ComponentType.Button,
-        filter: (i) => i.user.id === uid && i.customId.startsWith("holdem:") && i.customId.endsWith(`:${phase}`),
+        filter: (i) => i.user.id === uid && i.customId.startsWith(`holdem:`) && i.customId.endsWith(`:${phase}`),
         time: 60_000,
       });
       const parsed = btn.customId.split(":")[1];
@@ -313,8 +334,9 @@ async function runRoundInner(
     }
     if (action === "call" && services.chips.balanceOf(uid) >= playerBet + ante) {
       playerBet += ante;
-      dealerBet += ante;
+      dealerBet += ante; // マモンも同額コール
     }
+    // 次フェーズの表示を描画
     const nextIdx = phases.indexOf(phase) + 1;
     if (nextIdx < phases.length) {
       const nextPhase = phases[nextIdx]!;
@@ -323,31 +345,37 @@ async function runRoundInner(
     }
   }
 
+  // ── 精算 ──
   let rawPayout = 0;
   let note = "";
   if (folded) {
+    // フォールド: playerBet を没収
     rawPayout = 0;
     note = "🏳 フォールド。賭けはマモンのもの。";
   } else {
+    // ショウダウン
     const pBest = bestOf7([...pHand, ...flop, turn, river]);
     const dBest = bestOf7([...dHand, ...flop, turn, river]);
     const cmp = compareEval(pBest, dBest);
     const pot = playerBet + dealerBet;
     if (cmp > 0) {
-      rawPayout = pot;
+      rawPayout = pot; // 総取り
       note = `**${pBest.label}** vs **${dBest.label}** — お前の勝ち！`;
     } else if (cmp < 0) {
       rawPayout = 0;
       note = `**${pBest.label}** vs **${dBest.label}** — マモンの勝ち。`;
     } else {
-      rawPayout = playerBet;
+      rawPayout = playerBet; // プッシュ（自分の賭けを返却）
       note = `**${pBest.label}** — 引き分け（プッシュ）`;
     }
     await reply.edit({ embeds: [render("showdown", note)], components: [] }).catch(() => undefined);
     await sleep(1200);
   }
 
-  const settled = services.casino.settleSolo(uid, "ホールデム", playerBet, rawPayout, { operationId: interaction.id, reservationKey });
+  // お守りの消費も賭け・配当と同じグループの中（settleSolo）
+  const settled = services.casino.settleSolo(uid, "ホールデム", playerBet, rawPayout, {
+    operationId: interaction.id, reservationKey,
+  });
   recordCasinoGameFinishBestEffort(services, {
     userId: uid,
     game: "ホールデム",
@@ -357,11 +385,17 @@ async function runRoundInner(
     net: settled.net,
     source: playContext.source,
   });
+  const amulet = { note: settled.amuletNote };
 
+  const won = settled.net > 0;
   const bonusBits: string[] = [];
-  if (settled.chainBonus > 0) bonusBits.push(`${settled.chainLabel} 連鎖 ×${settled.chainMult.toFixed(2)}（${settled.chainStreak}連勝）  ${fmtBigDelta(settled.chainBonus)}`);
-  if (settled.fukuTax > 0) bonusBits.push(`⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}%  ${fmtBigDelta(-settled.fukuTax)}`);
-  if (settled.amuletNote) bonusBits.push(`${E.sparkle} ${settled.amuletNote}`);
+  if (settled.chainBonus > 0) {
+    bonusBits.push(`${settled.chainLabel} 連鎖 ×${settled.chainMult.toFixed(2)}（${settled.chainStreak}連勝）  ${fmtBigDelta(settled.chainBonus)}`);
+  }
+  if (settled.fukuTax > 0) {
+    bonusBits.push(`⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}%  ${fmtBigDelta(-settled.fukuTax)}`);
+  }
+  if (amulet.note) bonusBits.push(`${E.sparkle} ${amulet.note}`);
 
   const resultPayload = buildSoloResult({
     services,
@@ -378,13 +412,20 @@ async function runRoundInner(
           `${E.crown} お前     ${showHand(pHand)}`,
           `${E.demon} マモン   ${folded ? "🂠 🂠" : showHand(dHand)}`,
           note,
-        ].filter(Boolean).join("\n"),
+        ]
+          .filter(Boolean)
+          .join("\n"),
         inline: false,
       },
-      ...(bonusBits.length > 0 ? [{ name: "🔥 ボーナス", value: bonusBits.join("\n"), inline: false } as const] : []),
+      ...(bonusBits.length > 0
+        ? [{ name: "🔥 ボーナス", value: bonusBits.join("\n"), inline: false } as const]
+        : []),
     ],
   });
 
-  if (settled.net > 0) broadcastBigWin(interaction.client, services, { userId: uid, game: "ホールデム", bet: playerBet, payout: settled.payout });
+  if (won) {
+    broadcastBigWin(interaction.client, services, { userId: uid, game: "ホールデム", bet: playerBet, payout: settled.payout });
+  }
+
   await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
 }

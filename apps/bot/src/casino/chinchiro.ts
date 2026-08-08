@@ -471,7 +471,7 @@ async function runRoundInner(
         );
       await reply.edit({ embeds: [e], components: [row] }).catch(() => undefined);
 
-      const choice = await new Promise<"stop" | "reroll">((resolve) => {
+      const choice = await new Promise<"stop" | "reroll">((resolve, reject) => {
         const collector = reply.createMessageComponentCollector({
           componentType: ComponentType.Button,
           time: ROLL_BUTTON_TIMEOUT_MS,
@@ -488,7 +488,8 @@ async function runRoundInner(
           }
         });
         collector.on("end", (_c, reason) => {
-          if (reason !== "stop" && reason !== "reroll") {
+          if (reason === "stop" || reason === "reroll") return;
+          if (reason === "time") {
             recordCasinoGameAbandonBestEffort(services, {
               userId: uid,
               game: "チンチロ",
@@ -497,8 +498,10 @@ async function runRoundInner(
               source: playContext.source,
               reason: "reroll_timeout",
             });
-            resolve("stop"); // 時間切れは保守的に止める
+            resolve("stop"); // 真正timeoutだけ保守的に止める
+            return;
           }
+          reject(new Error(`chinchiro collector ended without timeout: ${reason}`));
         });
       });
       if (choice === "stop") {

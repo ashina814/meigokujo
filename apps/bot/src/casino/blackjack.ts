@@ -45,7 +45,7 @@ const MAX_MULT = BLACKJACK_MAX_PAYOUT_MULT;
 
 interface Card {
   rank: string;
-  value: number;
+  value: number; // A=11（後で減算）
   suit: string;
 }
 
@@ -123,6 +123,10 @@ export async function playBlackjack(
   }
 }
 
+/**
+ * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
+ * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
+ */
 async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
@@ -148,6 +152,7 @@ async function runRoundInner(
   services: Services,
   bet: number,
   reservationKey: string,
+  /** ダブルぶんの債務まで予約できたか。false ならダブルボタンだけ無効化する */
   doubleAllowed: boolean,
   context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
@@ -165,21 +170,23 @@ async function runRoundInner(
   const dealer: Card[] = [deck.pop()!, deck.pop()!];
   let totalBet = bet;
 
-  const table = (hideDealer: boolean) => new EmbedBuilder()
-    .setAuthor({ name: "マモンの賭場 · ブラックジャック" })
-    .setColor(C_MAMMON)
-    .setTitle(`🃏 21 を狙え  ·  賭け ${fmtEther(totalBet)}`)
-    .setDescription(
-      [
-        "```",
-        `😈 マモン    ${showHand(dealer, hideDealer)}`,
-        `           合計 ${hideDealer ? "?" : String(handValue(dealer))}`,
-        "─────────────────────────────",
-        `👤 お前      ${showHand(player)}`,
-        `           合計 ${handValue(player)}`,
-        "```",
-      ].join("\n"),
-    );
+  const table = (hideDealer: boolean) => {
+    return new EmbedBuilder()
+      .setAuthor({ name: "マモンの賭場 · ブラックジャック" })
+      .setColor(C_MAMMON)
+      .setTitle(`🃏 21 を狙え  ·  賭け ${fmtEther(totalBet)}`)
+      .setDescription(
+        [
+          "```",
+          `😈 マモン    ${showHand(dealer, hideDealer)}`,
+          `           合計 ${hideDealer ? "?" : String(handValue(dealer))}`,
+          "─────────────────────────────",
+          `👤 お前      ${showHand(player)}`,
+          `           合計 ${handValue(player)}`,
+          "```",
+        ].join("\n"),
+      );
+  };
 
   let reply: Message;
   const buttons = (canDouble: boolean) =>
@@ -199,13 +206,15 @@ async function runRoundInner(
 
   const openInitial = async (hide: boolean, components: ActionRowBuilder<ButtonBuilder>[] = []) => {
     if (interaction.replied || interaction.deferred) {
-      return (await interaction.followUp({ embeds: [table(hide)], components })) as Message;
+      const m = (await interaction.followUp({ embeds: [table(hide)], components })) as Message;
+      return m;
     }
     await interaction.reply({ embeds: [table(hide)], components });
     return (await interaction.fetchReply()) as Message;
   };
 
   const finish = async (rawPayout: number, note: string) => {
+    // お守りの消費も賭け・配当と同じグループの中（settleSolo）。外で消すと精算が落ちたときお守りだけ消える
     const settled = services.casino.settleSolo(uid, "ブラックジャック", totalBet, rawPayout, {
       operationId: interaction.id, reservationKey,
     });
@@ -227,6 +236,8 @@ async function runRoundInner(
     const fukuLine = settled.fukuTax > 0
       ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 福分け積立`
       : "";
+    const tag = won ? "🟢 勝ち" : push ? "⚪ プッシュ" : "🔴 負け";
+    const netStr = settled.net === 0 ? "±0 Ld" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} Ld`;
     const bonusBits: string[] = [];
     if (chainLine) bonusBits.push(chainLine);
     if (fukuLine) bonusBits.push(fukuLine);
@@ -241,14 +252,15 @@ async function runRoundInner(
       retryBet: bet,
       titleOverride: won ? "🟢 勝ち" : push ? "⚪ 引き分け" : "🔴 負け",
       colorOverride: won ? C_WIN : push ? 0x78716c : C_LOSE,
-      description: [
-        "```",
-        `😈 マモン    ${showHand(dealer)}   合計 ${handValue(dealer)}`,
-        "─────────────────────────────",
-        `👤 お前      ${showHand(player)}   合計 ${handValue(player)}`,
-        "```",
-        note,
-      ].join("\n"),
+      description:
+        [
+          "```",
+          `😈 マモン    ${showHand(dealer)}   合計 ${handValue(dealer)}`,
+          "─────────────────────────────",
+          `👤 お前      ${showHand(player)}   合計 ${handValue(player)}`,
+          "```",
+          note,
+        ].join("\n"),
       sections: bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : [],
     });
 
@@ -256,6 +268,7 @@ async function runRoundInner(
     await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
   };
 
+  // ── ナチュラル判定 ──
   if (playerNatural || dealerNatural) {
     reply = await openInitial(false);
     await sleep(900);
@@ -264,6 +277,9 @@ async function runRoundInner(
     return void (await finish(0, "マモンのブラックジャック。"));
   }
 
+  // ── プレイヤーのターン ──
+  // ダブルの可否は**開始時の予約結果**で決まる（PR5）。
+  // ここで改めて胴元残高を見ると、予約済みの自分の枠を二重に数えて弾いてしまう
   const canDoubleNow = () => player.length === 2 && doubleAllowed && services.chips.balanceOf(uid) >= bet * 2;
   reply = await openInitial(true, [buttons(canDoubleNow())]);
 
@@ -311,6 +327,7 @@ async function runRoundInner(
     standing = true;
   }
 
+  // ── マモンのターン ──
   await reply.edit({ embeds: [table(false)], components: [] }).catch(() => undefined);
   while (handValue(dealer) < 17) {
     await sleep(900);

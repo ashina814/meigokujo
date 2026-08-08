@@ -42,7 +42,7 @@ import { broadcastBigWin } from "./bigwin.js";
 import { buildSoloResult } from "./solo-result.js";
 import {
   casinoPlayContext,
-  recordCasinoGameFinishBestEffort,
+  reconcileSlotsGameFinishBestEffort,
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
@@ -193,7 +193,17 @@ async function runPaidSpin(
         source: playContext.source,
       });
       const record = spinPaid(services, interaction.user.id, bet, interaction.id);
-      await renderSpin(interaction, services, bet, record, false, reservationKey, playContext);
+      reconcileSlotsGameFinishBestEffort(services, interaction.user.id, interaction.id);
+      let immediateFree: SpinRecord | undefined;
+      if (record.pendingFreeSpin) {
+        try {
+          immediateFree = resolveFreeSpin(services, record.pendingFreeSpin, reservationKey);
+          reconcileSlotsGameFinishBestEffort(services, interaction.user.id, interaction.id);
+        } catch {
+          immediateFree = undefined;
+        }
+      }
+      await renderSpin(interaction, services, bet, record, false, reservationKey, playContext, undefined, immediateFree);
     },
   );
 }
@@ -215,6 +225,7 @@ export async function settleLeftoverFreeSpins(
     if (row.operationId === interaction.id) continue;
     try {
       const free = resumeFreeSpin(services, row);
+      reconcileSlotsGameFinishBestEffort(services, row.userId, row.operationId);
       const message = {
           content: `✨ 前回持ち越していた**無料スピン**を回した（配当 ${fmtEther(free.payout + free.jpWon)}）。`,
           flags: MessageFlags.Ephemeral,
@@ -478,11 +489,17 @@ export function resumePendingFreeSpins(services: Services): {
   for (const row of rows) {
     try {
       const r = resumeFreeSpin(services, row);
+      reconcileSlotsGameFinishBestEffort(services, row.userId, row.operationId);
       settled++;
       paid += r.payout + r.jpWon;
     } catch (e) {
       failed.push({ id: row.id, userId: row.userId, error: e instanceof Error ? e.message : String(e) });
     }
+  }
+  try {
+    services.casinoMetrics?.reconcileSlotsFinishes();
+  } catch (error) {
+    console.error("[casino-metrics] slots startup reconcile failed", error);
   }
   if (rows.length > 0) {
     services.events.log("casino_free_spins_resumed", {
@@ -510,6 +527,7 @@ async function renderSpin(
   reservationKey?: string,
   context?: CasinoPlayContext,
   originPaid?: SpinRecord,
+  resolvedFree?: SpinRecord,
 ): Promise<void> {
   const uid = interaction.user.id;
 
@@ -583,20 +601,6 @@ async function renderSpin(
   const won = adjustedPayout > 0;
   const totalPayout = adjustedPayout + jpWon + (settled?.chainBonus ?? 0) - (settled?.fukuTax ?? 0);
   const net = totalPayout - (isFreeSpin ? 0 : bet);
-  const paidTotalPayout = originPaid
-    ? originPaid.payout + originPaid.jpWon + (originPaid.settled?.chainBonus ?? 0) - (originPaid.settled?.fukuTax ?? 0)
-    : totalPayout;
-  if (!record.pendingFreeSpin) {
-    recordCasinoGameFinishBestEffort(services, {
-      userId: uid,
-      game: "スロット",
-      operationId: interaction.id,
-      wager: bet,
-      payout: originPaid ? paidTotalPayout + totalPayout : totalPayout,
-      net: originPaid ? paidTotalPayout + totalPayout - bet : totalPayout - bet,
-      source: context?.source ?? "advanced",
-    });
-  }
   const stats = services.casino.stats(uid);
   const winStreak = won ? stats.current_win_streak : 0;
 
@@ -647,7 +651,8 @@ async function renderSpin(
     await reply.edit({ embeds: resultPayload.embeds, components: [] }).catch(() => undefined);
     await sleep(2500);
     try {
-      const free = resolveFreeSpin(services, record.pendingFreeSpin, reservationKey);
+      const free = resolvedFree ?? resolveFreeSpin(services, record.pendingFreeSpin, reservationKey);
+      reconcileSlotsGameFinishBestEffort(services, uid, interaction.id);
       await renderSpin(interaction, services, bet, free, true, reservationKey, context, record);
     } catch {
       // 胴元不足・賭場停止など。**権利は pending のまま残っている**
