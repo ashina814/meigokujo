@@ -39,10 +39,10 @@ export class ProcessSafeTestOpeningBackupAdapter implements OpeningBackupAdapter
     const deadline = Date.now() + this.waitTimeoutMs;
 
     for (;;) {
-      if (existsSync(manifestPath)) return readManifest(manifestPath, request.planHash);
-
       let lockFd: number | null = null;
       try {
+        // manifestの存在だけでは公開完了とみなさない。
+        // writerはmanifestを書き終えるまでこのlockを保持するため、readerも必ずlock取得後に読む。
         lockFd = openSync(lockPath, "wx", 0o600);
       } catch (e) {
         if (!isAlreadyExists(e)) throw e;
@@ -51,7 +51,7 @@ export class ProcessSafeTestOpeningBackupAdapter implements OpeningBackupAdapter
       if (lockFd !== null) {
         closeSync(lockFd);
         try {
-          // lock取得直前に別workerが公開を完了していた場合も、既存証拠を優先する。
+          // 先行workerが公開済みなら、完成済みの同一manifestを再利用して上書きしない。
           if (existsSync(manifestPath)) return readManifest(manifestPath, request.planHash);
           return await this.delegate.backup(request);
         } finally {
