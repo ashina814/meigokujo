@@ -98,8 +98,6 @@ export async function playCrash(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "クラッシュ");
-  if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
       await interaction.followUp({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
@@ -109,6 +107,8 @@ export async function playCrash(
     return;
   }
   try {
+    const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "クラッシュ");
+    if (!check.ok) return;
     await runRound(interaction, services, check.bet);
   } finally {
     releaseSeat(uid);
@@ -237,7 +237,6 @@ async function runRoundInner(
     }
   }
   collector.stop();
-
   // ── 精算 ──
   let resultPayload: ReturnType<typeof buildSoloResult>;
   if (cashedOut && cashOutMul >= 1.0) {
