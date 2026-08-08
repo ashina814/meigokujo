@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
+// Financial recovery behavior is covered by core casino-metrics.test.ts; this suite fixes bot call ordering.
 const source = readFileSync(new URL("../src/casino/slots.ts", import.meta.url), "utf8");
 
 function between(startNeedle: string, endNeedle: string): string {
