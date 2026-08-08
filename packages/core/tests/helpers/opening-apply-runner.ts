@@ -11,8 +11,8 @@ import { CasinoStatus } from "../../src/casino/status.js";
 import { Settings } from "../../src/settings/service.js";
 import { Departments } from "../../src/departments/service.js";
 import { OpeningReset } from "../../src/casino/opening-reset.js";
-import { TestFilesystemOpeningBackupAdapter } from "../../src/casino/opening-backup.js";
 import { FakeOpeningExternalAdapter } from "../../src/casino/opening-external.js";
+import { ProcessSafeTestOpeningBackupAdapter } from "./process-safe-opening-backup.js";
 
 /**
  * 別プロセスから**本番コードそのもの**（OpeningReset.apply）で正式開業初期化を同時に叩く。
@@ -27,9 +27,10 @@ interface RunnerInput {
   startAt: number;
   /**
    * 永続backupの保存先。監査ブロッカー5.3により、破壊的applyはdurability="persistent"の
-   * backup adapterしか受け付けないため、全workerが同じ一時ディレクトリを共有する
-   * （同じplanHashを争っているworker同士なので、ファイル名(planHash prefix)は衝突しても
-   * 内容は同じになる。実際に採用されるmanifestはexecution行へCASで書き込まれた1つだけ）。
+   * backup adapterしか受け付けないため、全workerが同じ一時ディレクトリを共有する。
+   * shared adapterはplanHash単位で書き込みを直列化し、最初に公開されたmanifestを
+   * 後続workerが再利用する。planHashが同じでもbackup呼び出しごとのmanifest bytesが
+   * 同一とは限らないため、同じ最終ファイル名への並行上書きは許可しない。
    */
   backupDir: string;
 }
@@ -69,7 +70,7 @@ async function main(): Promise<void> {
   try {
     const applyResult = await reset.apply({
       actorId: input.actorId,
-      backup: new TestFilesystemOpeningBackupAdapter(input.backupDir),
+      backup: new ProcessSafeTestOpeningBackupAdapter(input.backupDir),
       external: new FakeOpeningExternalAdapter(),
     });
     result = {
