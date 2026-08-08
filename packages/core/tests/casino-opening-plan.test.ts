@@ -5,6 +5,7 @@ import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
 import { ChipTx } from "../src/casino/chip-tx.js";
 import { ChipLedger, ETHER_ESCROW, HOUSE_HOLDER } from "../src/casino/exchange.js";
+import { Casino } from "../src/casino/service.js";
 import { Escrow } from "../src/casino/escrow.js";
 import { CasinoChipAssets } from "../src/casino/chip-assets.js";
 import { CasinoIntegrity } from "../src/casino/integrity.js";
@@ -505,6 +506,26 @@ describe("OpeningPlanner.dryRun — 未知テーブル・その他blocker", () =
     const result = ctx.planner.dryRun();
     expect(result.blockers.some((b) => b.code === "unknown_table")).toBe(true);
     expect(result.unknownTables).toContain("casino_totally_unknown_table");
+  });
+
+  it("Casino生成済みのcasino_home_preferencesは未知テーブルにも保護資産にもならない", () => {
+    const ctx = setup();
+    new Casino(ctx.db, ctx.ether, ctx.events);
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    ctx.db
+      .prepare("INSERT INTO casino_home_preferences (user_id, last_game, last_amount, updated_at) VALUES (?, ?, ?, ?)")
+      .run("alice", "スロット", 100, 1);
+
+    const result = ctx.planner.dryRun();
+
+    expect(result.unknownTables).not.toContain("casino_home_preferences");
+    expect(result.blockers).toEqual([]);
+    expect(result.protectedFindings.some((f) => f.sourceTable === "casino_home_preferences")).toBe(false);
+    expect(result.tableAudits.find((a) => a.table === "casino_home_preferences")).toMatchObject({
+      exists: true,
+      rows: 1,
+    });
   });
 
   it("既にopening_v1が存在すればblocker", () => {

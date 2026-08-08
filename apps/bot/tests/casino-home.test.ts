@@ -17,6 +17,7 @@ function fakeServices(opts: {
   nextClaimAt?: number;
   pref?: { game: string; amount: number } | null;
   maxLiability?: number;
+  jpThrows?: boolean;
 } = {}): Services {
   const phase = opts.phase ?? "formal";
   const status = opts.status ?? "open";
@@ -36,7 +37,10 @@ function fakeServices(opts: {
       freeChips: () => free,
     },
     casino: {
-      jackpotPool: () => jp,
+      jackpotPool: () => {
+        if (opts.jpThrows) throw new Error("jackpot should not be read");
+        return jp;
+      },
       stats: () => ({ current_win_streak: 0 }),
       availableForLiability: () => opts.maxLiability ?? 1_000_000,
       homePreference: () =>
@@ -88,6 +92,7 @@ describe("/賭場 ホーム", () => {
     const { embed, buttons } = homeJson(services);
     expect(embed.description).toContain("正式開業準備中");
     expect(embed.description).toContain("資金操作");
+    expect(embed.description).toContain("福分けは正式開業後に利用できます");
     expect(buttons.find((b) => b.custom_id === "casino:play:スロット:100")?.disabled).toBe(true);
 
     const stale = component("casino:play:スロット:100");
@@ -96,9 +101,12 @@ describe("/賭場 ホーム", () => {
   });
 
   it("unknown opening version では異常表示になり、操作を通さない", async () => {
-    const services = fakeServices({ phase: "unknown" });
+    const services = fakeServices({ phase: "unknown", jpThrows: true });
     const { embed } = homeJson(services);
     expect(embed.description).toContain("版が異常");
+    expect(embed.description).toContain("福分け 確認停止");
+    expect(embed.description).toContain("JP 確認停止");
+    expect(embed.description).not.toContain("JP 8,420 Ld");
 
     const stale = component("casino:daily:claim");
     expect(await denyIfCasinoClosed(stale, services)).toBe(true);
@@ -141,6 +149,7 @@ describe("/賭場 ホーム", () => {
     const services = fakeServices({ status: "maintenance" });
     const { embed, buttons } = homeJson(services);
     expect(embed.description).toContain("maintenance");
+    expect(embed.description).toContain("福分けは現在停止中");
     expect(buttons[0]!.disabled).toBe(true);
 
     const stale = component("casino:play:スロット:100");

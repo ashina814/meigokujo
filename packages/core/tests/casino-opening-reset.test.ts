@@ -8,7 +8,7 @@ import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import { EventLog } from "../src/events/service.js";
 import { ChipTx, FORMAL_OPENING_VERSION, LEGACY_OPENING_VERSION } from "../src/casino/chip-tx.js";
 import { ChipLedger, ETHER_ESCROW, CHIP_ESCROW, HOUSE_HOLDER } from "../src/casino/exchange.js";
-import { JACKPOT_HOLDER, RELIEF_HOLDER } from "../src/casino/service.js";
+import { Casino, JACKPOT_HOLDER, RELIEF_HOLDER } from "../src/casino/service.js";
 import { Escrow } from "../src/casino/escrow.js";
 import { CasinoChipAssets } from "../src/casino/chip-assets.js";
 import { CasinoIntegrity } from "../src/casino/integrity.js";
@@ -143,7 +143,11 @@ describe("OpeningReset — constructorは一切書き込まない(監査ブロ�
 describe("OpeningReset.apply — 正常系", () => {
   it("blocker=0の状態でapplyすると、opening_v1が確立し賭場がopenへ戻る", async () => {
     const ctx = setup();
+    new Casino(ctx.db, ctx.ether, ctx.events);
     seedLegacy(ctx, { houseChips: 30_000, deptSeed: 100_000 });
+    ctx.db
+      .prepare("INSERT INTO casino_home_preferences (user_id, last_game, last_amount, updated_at) VALUES (?, ?, ?, ?)")
+      .run("alice", "スロット", 100, 1);
     configureAndOpenReset(ctx);
     const { backup, external } = adapters();
 
@@ -176,6 +180,7 @@ describe("OpeningReset.apply — 正常系", () => {
     // casino_tx/casino_tx_groupsは初期化済み(空)
     expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_tx").get() as { n: number }).n).toBe(0);
     expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_tx_groups").get() as { n: number }).n).toBe(0);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_home_preferences").get() as { n: number }).n).toBe(0);
 
     // 版はopening_v1、賭場はopen
     expect(ctx.chipTx.currentVersion()).toBe(FORMAL_OPENING_VERSION);

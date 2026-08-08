@@ -94,25 +94,26 @@ export async function handleCasinoHomeButton(interaction: ButtonInteraction, ser
 export function renderCasinoHome(userId: string, services: Services, serverName?: string) {
   const phase = openingPhase(services);
   const status = services.casinoStatus.current();
-  const daily = dailyState(userId, services);
+  const daily = dailyState(userId, services, phase, status.status);
   const wallet = casinoHomeWallet(userId, services);
-  const jp = services.casino.jackpotPool();
+  const jp = phase === "unknown" ? null : services.casino.jackpotPool();
   const primary = phase === "formal" && status.status === "open" ? primaryAction(userId, services) : defaultPrimaryAction();
   const actionsDisabled = phase !== "formal" || status.status !== "open";
+  const jpLabel = jp === null ? `${E.jp} JP 確認停止` : `${E.jp} JP ${fmtLd(jp)}`;
 
   const lines = [
     operatingLabel(services),
     "",
     wallet.lines.join("\n"),
     daily.label,
-    `${E.jp} JP ${fmtLd(jp)}`,
+    jpLabel,
   ];
   if (phase !== "formal") lines.push("", openingNotice(services));
   else if (status.status !== "open") lines.push("", `資金操作停止中: ${status.reason}`);
 
   const embed = new EmbedBuilder()
     .setAuthor({ name: `${serverName ?? "冥獄城"} · マモンの賭場` })
-    .setColor(jp >= 100_000 ? C_JACKPOT : C_MAMMON)
+    .setColor(jp !== null && jp >= 100_000 ? C_JACKPOT : C_MAMMON)
     .setDescription(lines.filter((line, index, arr) => line !== "" || arr[index - 1] !== "").join("\n"))
     .setFooter({ text: wallet.footer });
 
@@ -175,7 +176,21 @@ function casinoHomeWallet(userId: string, services: Services): { lines: string[]
   };
 }
 
-function dailyState(userId: string, services: Services): { ready: boolean; label: string } {
+function dailyState(
+  userId: string,
+  services: Services,
+  phase: ReturnType<typeof openingPhase>,
+  casinoStatus: string,
+): { ready: boolean; label: string } {
+  if (phase === "unknown") {
+    return { ready: false, label: "福分け 確認停止" };
+  }
+  if (phase !== "formal") {
+    return { ready: false, label: "福分けは正式開業後に利用できます" };
+  }
+  if (casinoStatus !== "open") {
+    return { ready: false, label: "福分けは現在停止中" };
+  }
   const nextClaim = services.daily.nextClaimAt(userId);
   const ready = nextClaim === 0 || nextClaim <= Math.floor(Date.now() / 1000);
   return {
