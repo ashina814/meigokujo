@@ -11,6 +11,18 @@ export function casinoPlayContext(context?: Partial<CasinoPlayContext>): CasinoP
   return { source: context?.source ?? "advanced" };
 }
 
+/**
+ * discord.js の awaitMessageComponent が「collector が time で終了した」場合だけ true。
+ * API failure / messageDelete / channelDelete / system exception を timeout と推測しない。
+ */
+export function isCollectorTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; message?: unknown };
+  return candidate.code === "InteractionCollectorError"
+    && typeof candidate.message === "string"
+    && /reason:\s*time(?:\b|$)/i.test(candidate.message);
+}
+
 export function recordCasinoMetricBestEffort(services: Services, input: CasinoMetricEventInput): void {
   try {
     if (!services.casinoMetrics) return;
@@ -42,6 +54,15 @@ export function recordCasinoGameFinishBestEffort(
     services.casinoMetrics.gameFinish(input);
   } catch (error) {
     console.error("[casino-metrics] game_finish failed", error);
+  }
+}
+
+export function reconcileSlotsGameFinishBestEffort(services: Services, userId: string, operationId: string): void {
+  try {
+    if (!services.casinoMetrics) return;
+    services.casinoMetrics.reconcileSlotsFinish(userId, operationId);
+  } catch (error) {
+    console.error("[casino-metrics] slots finish reconcile failed", error);
   }
 }
 
