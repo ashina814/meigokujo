@@ -20,7 +20,6 @@ import type { Services } from "../services.js";
 import {
   MIN_BET,
   acquireSeat,
-  effectiveMaxBet,
   handleRetryPress,
   releaseSeat,
   sleep,
@@ -29,6 +28,7 @@ import {
 } from "./common.js";
 import { C_MAMMON, C_WIN } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
+import { buildSoloResult } from "./solo-result.js";
 
 /**
  * 📈 クラッシュ。casino-bot 準拠の忠実移植。
@@ -70,7 +70,7 @@ function progressBar(mult: number): string {
   return "▰".repeat(filled) + "😈" + "・".repeat(Math.max(0, steps - filled));
 }
 
-function paytableEmbed(): EmbedBuilder {
+export function paytableEmbed(): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle("📖 クラッシュ — ルール")
     .setColor(C_MAMMON)
@@ -239,32 +239,8 @@ async function runRoundInner(
   }
   collector.stop();
 
-  const buildRetryRow = () => {
-    const held = services.chips.balanceOf(uid);
-    const min = MIN_BET;
-    const max = Math.min(effectiveMaxBet(services, uid, "クラッシュ"), held);
-    return new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`crash:retry:${min}`)
-        .setLabel(`最低 ${min.toLocaleString()}`)
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(held < min),
-      new ButtonBuilder()
-        .setCustomId(`crash:retry:${bet}`)
-        .setLabel(`🎰 もう一回 ${bet.toLocaleString()}`)
-        .setStyle(ButtonStyle.Primary)
-        .setDisabled(held < bet),
-      new ButtonBuilder()
-        .setCustomId(`crash:retry:${max}`)
-        .setLabel(`最大 ${max.toLocaleString()}`)
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(max < min),
-      new ButtonBuilder().setCustomId("crash:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("crash:quit").setLabel("🚪 退席").setStyle(ButtonStyle.Secondary),
-    );
-  };
-
   // ── 精算 ──
+  let resultPayload: ReturnType<typeof buildSoloResult>;
   if (cashedOut && cashOutMul >= 1.0) {
     const rawPayout = Math.floor(bet * cashOutMul);
     // 連鎖ボーナスは無効化（1.5倍固定戦略 × 高勝率で 100% 超になる裁定を防ぐ・PR#6 レビュー指摘）。
@@ -279,22 +255,24 @@ async function runRoundInner(
     if (settled.fukuTax > 0) bonusBits.push(`⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}%  −${fmtEther(settled.fukuTax)}`);
     if (amulet.note) bonusBits.push(`✨ ${amulet.note}`);
 
-    const embed = new EmbedBuilder()
-      .setAuthor({ name: "マモンの賭場 · クラッシュ" })
-      .setColor(bigWin ? 0x16a34a : C_WIN)
-      .setTitle(`${bigWin ? "🔥 大勝ち" : "🪂 離脱成功"}  **${netStr}**`)
-      .setDescription(
+    resultPayload = buildSoloResult({
+      services,
+      userId: uid,
+      game: "クラッシュ",
+      net: settled.net,
+      wager: bet,
+      retryBet: bet,
+      titleOverride: bigWin ? "🔥 大勝ち" : "🟢 勝ち",
+      colorOverride: bigWin ? 0x16a34a : C_WIN,
+      description:
         [
           "```",
           `離脱  ${cashOutMul.toFixed(2)}x   （崩壊 ${crashPoint.toFixed(2)}x）`,
           "```",
         ].join("\n"),
-      )
-      .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
-      .setFooter({
-        text: [`所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" Ld", "Ld")}`, `賭け ${fmtEther(bet).replace(" Ld", "Ld")}`].join(" · "),
-      });
-    await reply.edit({ embeds: [embed], components: [buildRetryRow()] }).catch(() => undefined);
+      sections: bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : [],
+    });
+    await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
     broadcastBigWin(interaction.client, services, { userId: uid, game: "クラッシュ", bet, payout: settled.payout });
   } else {
     const lossSettled = services.casino.settleSolo(uid, "クラッシュ", bet, 0, {
@@ -305,11 +283,16 @@ async function runRoundInner(
     const savedByAmulet = lossAmulet.payout > 0;
     const netStr = savedByAmulet ? `±0 Ld` : `−${bet.toLocaleString("ja-JP")} Ld`;
 
-    const embed = new EmbedBuilder()
-      .setAuthor({ name: "マモンの賭場 · クラッシュ" })
-      .setColor(savedByAmulet ? 0x78716c : 0x450a0a)
-      .setTitle(`${savedByAmulet ? "🛡 敗北無効" : "💥 崩壊"}  **${netStr}**`)
-      .setDescription(
+    resultPayload = buildSoloResult({
+      services,
+      userId: uid,
+      game: "クラッシュ",
+      net: lossSettled.net,
+      wager: bet,
+      retryBet: bet,
+      titleOverride: savedByAmulet ? "⚪ 引き分け" : "🔴 負け",
+      colorOverride: savedByAmulet ? 0x78716c : 0x450a0a,
+      description:
         [
           "```",
           `崩壊  ${crashPoint.toFixed(2)}x`,
@@ -318,30 +301,17 @@ async function runRoundInner(
         ]
           .filter(Boolean)
           .join("\n"),
-      )
-      .setFooter({
-        text: [`所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" Ld", "Ld")}`, `賭け ${fmtEther(bet).replace(" Ld", "Ld")}`].join(" · "),
-      });
-    await reply.edit({ embeds: [embed], components: [buildRetryRow()] }).catch(() => undefined);
+    });
+    await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
   }
 
   // ── リトライ/配当表/退席 コレクタ ──
   const retryCollector = reply.createMessageComponentCollector({
     componentType: ComponentType.Button,
     time: 60_000,
-    filter: (i) => i.user.id === uid,
+    filter: (i) => i.user.id === uid && i.customId.startsWith("crash:retry:"),
   });
   retryCollector.on("collect", async (btn) => {
-    if (btn.customId === "crash:paytable") {
-      await btn.reply({ embeds: [paytableEmbed()], flags: MessageFlags.Ephemeral });
-      return;
-    }
-    if (btn.customId === "crash:quit") {
-      retryCollector.stop("quit");
-      await btn.deferUpdate();
-      await reply.edit({ components: [] }).catch(() => undefined);
-      return;
-    }
     if (btn.customId.startsWith("crash:retry:")) {
       // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
       // 断るなら collector を止めない ＝ 押し直せる
@@ -356,6 +326,6 @@ async function runRoundInner(
     }
   });
   retryCollector.on("end", async (_c, reason) => {
-    if (reason !== "retry" && reason !== "quit") await reply.edit({ components: [] }).catch(() => undefined);
+    if (reason !== "retry") await reply.edit({ components: [] }).catch(() => undefined);
   });
 }

@@ -15,7 +15,6 @@ import type { Services } from "../services.js";
 import {
   MIN_BET,
   acquireSeat,
-  effectiveMaxBet,
   handleRetryPress,
   releaseSeat,
   sleep,
@@ -24,6 +23,7 @@ import {
 } from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
+import { buildSoloResult } from "./solo-result.js";
 
 /**
  * 🎴 丁半（ソロ・casino-bot 準拠）。
@@ -38,7 +38,7 @@ function rollDice(rng: CasinoRng): [number, number] {
   return [rng.int(1, 6), rng.int(1, 6)];
 }
 
-function paytableEmbed(): EmbedBuilder {
+export function paytableEmbed(): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle("📖 丁半 — ルール")
     .setColor(C_MAMMON)
@@ -193,11 +193,16 @@ async function runRoundInner(
   if (fukuLine) bonusBits.push(fukuLine);
   if (amulet.note) bonusBits.push(`✨ ${amulet.note}`);
 
-  const resultEmbed = new EmbedBuilder()
-    .setAuthor({ name: "マモンの賭場 · 丁半" })
-    .setColor(won ? C_WIN : settled.net === 0 ? 0x78716c : C_LOSE)
-    .setTitle(`${tag}  **${netStr}**`)
-    .setDescription(
+  const resultPayload = buildSoloResult({
+    services,
+    userId: uid,
+    game: "丁半",
+    net: settled.net,
+    wager: bet,
+    retryBet: bet,
+    titleOverride: won ? "🟢 勝ち" : settled.net === 0 ? "⚪ 引き分け" : "🔴 負け",
+    colorOverride: won ? C_WIN : settled.net === 0 ? 0x78716c : C_LOSE,
+    description:
       [
         "```",
         `╭─────╮   ╭─────╮`,
@@ -206,11 +211,8 @@ async function runRoundInner(
         "```",
         `**${d1 + d2}** → **${resultLabel}**   ／   お前の張り: **${playerLabel}**`,
       ].join("\n"),
-    )
-    .addFields(...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []))
-    .setFooter({
-      text: [`所持 ${fmtEther(services.chips.balanceOf(uid)).replace(" Ld", "Ld")}`, `賭け ${fmtEther(bet).replace(" Ld", "Ld")}`].join(" · "),
-    });
+    sections: bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : [],
+  });
 
   if (won) {
     broadcastBigWin(interaction.client, services, {
@@ -221,41 +223,14 @@ async function runRoundInner(
     });
   }
 
-  const held = services.chips.balanceOf(uid);
-  const nextBet = bet;
-  const doubleBet = bet * 2;
-  const nextRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`chohan:retry:${nextBet}`)
-      .setLabel(`🎰 もう一回 ${nextBet.toLocaleString()}`)
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(held < nextBet),
-    new ButtonBuilder()
-      .setCustomId(`chohan:retry:${doubleBet}`)
-      .setLabel(`⚡ 倍プッシュ ${doubleBet.toLocaleString()}`)
-      .setStyle(ButtonStyle.Danger)
-      .setDisabled(held < doubleBet || doubleBet > effectiveMaxBet(services, uid, "丁半")),
-    new ButtonBuilder().setCustomId("chohan:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("chohan:quit").setLabel("🚪 退席").setStyle(ButtonStyle.Secondary),
-  );
-  await reply.edit({ embeds: [resultEmbed], components: [nextRow] }).catch(() => undefined);
+  await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
 
   const collector = reply.createMessageComponentCollector({
     componentType: ComponentType.Button,
     time: 30_000,
-    filter: (i) => i.user.id === uid,
+    filter: (i) => i.user.id === uid && i.customId.startsWith("chohan:retry:"),
   });
   collector.on("collect", async (btn) => {
-    if (btn.customId === "chohan:paytable") {
-      await btn.reply({ embeds: [paytableEmbed()], flags: MessageFlags.Ephemeral });
-      return;
-    }
-    if (btn.customId === "chohan:quit") {
-      collector.stop("quit");
-      await btn.deferUpdate();
-      await reply.edit({ components: [] }).catch(() => undefined);
-      return;
-    }
     if (btn.customId.startsWith("chohan:retry:")) {
       // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
       // 断るなら collector を止めない ＝ 押し直せる
@@ -270,6 +245,6 @@ async function runRoundInner(
     }
   });
   collector.on("end", async (_c, reason) => {
-    if (reason !== "retry" && reason !== "quit") await reply.edit({ components: [] }).catch(() => undefined);
+    if (reason !== "retry") await reply.edit({ components: [] }).catch(() => undefined);
   });
 }

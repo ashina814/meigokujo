@@ -34,7 +34,6 @@ import type { Services } from "../services.js";
 import {
   MIN_BET,
   acquireSeat,
-  effectiveMaxBet,
   handleRetryPress,
   releaseSeat,
   sleep,
@@ -43,6 +42,7 @@ import {
 } from "./common.js";
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
+import { buildSoloResult } from "./solo-result.js";
 
 /**
  * 🎲 チンチロ（対マモン・casino-bot 準拠の忠実移植）。
@@ -174,7 +174,7 @@ const isTerminal = chinchiroIsTerminal;
 /** 壺の中に転がる三賽を等幅で並べる（原作準拠の見せ方より視認性重視） */
 const diceDisplay = (d: Dice) => `╭─────╮  ╭─────╮  ╭─────╮\n│  ${DIE_FACES[d[0]]}  │  │  ${DIE_FACES[d[1]]}  │  │  ${DIE_FACES[d[2]]}  │\n╰─────╯  ╰─────╯  ╰─────╯`;
 
-function paytableEmbed(): EmbedBuilder {
+export function paytableEmbed(): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle("📖 チンチロ — ルール")
     .setColor(C_MAMMON)
@@ -598,53 +598,26 @@ async function runRoundInner(
     resultLabel,
   ].join("\n");
 
-  const resultEmbed = new EmbedBuilder()
-    .setTitle(title)
-    .setColor(color)
-    .setDescription([comparison, "", payoutText, amuletNote].filter(Boolean).join("\n"))
-    .setFooter({ text: `所持: ${fmtEther(services.chips.balanceOf(uid))}` });
+  const resultPayload = buildSoloResult({
+    services,
+    userId: uid,
+    game: "チンチロ",
+    net: netForDisplay,
+    wager: bet,
+    retryBet: bet,
+    titleOverride: netForDisplay > 0 ? "🟢 勝ち" : netForDisplay === 0 ? "⚪ 引き分け" : "🔴 負け",
+    colorOverride: color,
+    description: [comparison, "", payoutText, amuletNote].filter(Boolean).join("\n"),
+  });
 
-  const heldAfter = services.chips.balanceOf(uid);
-  const min = MIN_BET;
-  const max = Math.min(effectiveMaxBet(services, uid, "チンチロ"), heldAfter);
-  const nextRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`chinchiro:retry:${min}`)
-      .setLabel(`最低 ${min.toLocaleString()}`)
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(heldAfter < min),
-    new ButtonBuilder()
-      .setCustomId(`chinchiro:retry:${bet}`)
-      .setLabel(`🎰 もう一回 ${bet.toLocaleString()}`)
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(heldAfter < bet),
-    new ButtonBuilder()
-      .setCustomId(`chinchiro:retry:${max}`)
-      .setLabel(`最大 ${max.toLocaleString()}`)
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(max < min),
-    new ButtonBuilder().setCustomId("chinchiro:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("chinchiro:quit").setLabel("🚪 退席").setStyle(ButtonStyle.Secondary),
-  );
-
-  await reply.edit({ embeds: [resultEmbed], components: [nextRow] }).catch(() => undefined);
+  await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
 
   const collector = reply.createMessageComponentCollector({
     componentType: ComponentType.Button,
     time: 60_000,
-    filter: (i) => i.user.id === uid,
+    filter: (i) => i.user.id === uid && i.customId.startsWith("chinchiro:retry:"),
   });
   collector.on("collect", async (btn) => {
-    if (btn.customId === "chinchiro:paytable") {
-      await btn.reply({ embeds: [paytableEmbed()], flags: MessageFlags.Ephemeral });
-      return;
-    }
-    if (btn.customId === "chinchiro:quit") {
-      collector.stop("quit");
-      await btn.deferUpdate();
-      await reply.edit({ components: [] }).catch(() => undefined);
-      return;
-    }
     if (btn.customId.startsWith("chinchiro:retry:")) {
       // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
       // 断るなら collector を止めない ＝ 押し直せる
@@ -659,6 +632,6 @@ async function runRoundInner(
     }
   });
   collector.on("end", async (_c, reason) => {
-    if (reason !== "retry" && reason !== "quit") await reply.edit({ components: [] }).catch(() => undefined);
+    if (reason !== "retry") await reply.edit({ components: [] }).catch(() => undefined);
   });
 }
