@@ -35,7 +35,6 @@ jobs:
                   raise SystemExit(f"{path}: expected exactly one match, got {s.count(old)}\n--- needle ---\n{old}")
               p.write_text(s.replace(old, new))
 
-          # awaitMessageComponent-based games: only discord.js collector `time` rejection is abandonment.
           for path in [
               "apps/bot/src/casino/chohan.ts",
               "apps/bot/src/casino/blackjack.ts",
@@ -57,7 +56,6 @@ jobs:
           '''    } catch {\n      recordCasinoGameAbandonBestEffort(services, {\n        userId: uid,\n        game: "ホールデム",\n        operationId: interaction.id,\n        wager: playerBet,\n        source: playContext.source,\n        reason: "action_timeout",\n      });\n      action = "check";\n    }''',
           '''    } catch (error) {\n      if (!isCollectorTimeoutError(error)) throw error;\n      recordCasinoGameAbandonBestEffort(services, {\n        userId: uid,\n        game: "ホールデム",\n        operationId: interaction.id,\n        wager: playerBet,\n        source: playContext.source,\n        reason: "action_timeout",\n      });\n      action = "check";\n    }''')
 
-          # Explicit collectors expose their actual end reason.
           patch("apps/bot/src/casino/poker.ts",
           '''  await new Promise<void>((resolve) => {''',
           '''  await new Promise<void>((resolve, reject) => {''')
@@ -72,14 +70,13 @@ jobs:
           '''        collector.on("end", (_c, reason) => {\n          if (reason !== "stop" && reason !== "reroll") {\n            recordCasinoGameAbandonBestEffort(services, {\n              userId: uid,\n              game: "チンチロ",\n              operationId: interaction.id,\n              wager: bet,\n              source: playContext.source,\n              reason: "reroll_timeout",\n            });\n            resolve("stop"); // 時間切れは保守的に止める\n          }\n        });''',
           '''        collector.on("end", (_c, reason) => {\n          if (reason === "stop" || reason === "reroll") return;\n          if (reason === "time") {\n            recordCasinoGameAbandonBestEffort(services, {\n              userId: uid,\n              game: "チンチロ",\n              operationId: interaction.id,\n              wager: bet,\n              source: playContext.source,\n              reason: "reroll_timeout",\n            });\n            resolve("stop"); // 真正timeoutだけ保守的に止める\n            return;\n          }\n          reject(new Error(`chinchiro collector ended without timeout: ${reason}`));\n        });''')
 
-          # Slots: financial completion closes analytics before Discord animation; recovery uses durable groups.
           slots = "apps/bot/src/casino/slots.ts"
           patch(slots,
           '''  casinoPlayContext,\n  recordCasinoGameFinishBestEffort,\n  recordCasinoGameStartBestEffort,''',
           '''  casinoPlayContext,\n  reconcileSlotsGameFinishBestEffort,\n  recordCasinoGameStartBestEffort,''')
           patch(slots,
           '''      const record = spinPaid(services, interaction.user.id, bet, interaction.id);\n      await renderSpin(interaction, services, bet, record, false, reservationKey, playContext);''',
-          '''      const record = spinPaid(services, interaction.user.id, bet, interaction.id);\n      // 金融確定の直後に analytics を閉じる。paid-only はここで finish。\n      reconcileSlotsGameFinishBestEffort(services, interaction.user.id, interaction.id);\n      let immediateFree: SpinRecord | undefined;\n      if (record.pendingFreeSpin) {\n        try {\n          immediateFree = resolveFreeSpin(services, record.pendingFreeSpin, reservationKey);\n          // paid + immediate free のaggregate finishもDiscord演出より前に確定。\n          reconcileSlotsGameFinishBestEffort(services, interaction.user.id, interaction.id);\n        } catch {\n          // 従来どおり権利はpending。render後の再試行・起動時recoveryへ委ねる。\n          immediateFree = undefined;\n        }\n      }\n      await renderSpin(interaction, services, bet, record, false, reservationKey, playContext, undefined, immediateFree);''')
+          '''      const record = spinPaid(services, interaction.user.id, bet, interaction.id);\n      reconcileSlotsGameFinishBestEffort(services, interaction.user.id, interaction.id);\n      let immediateFree: SpinRecord | undefined;\n      if (record.pendingFreeSpin) {\n        try {\n          immediateFree = resolveFreeSpin(services, record.pendingFreeSpin, reservationKey);\n          reconcileSlotsGameFinishBestEffort(services, interaction.user.id, interaction.id);\n        } catch {\n          immediateFree = undefined;\n        }\n      }\n      await renderSpin(interaction, services, bet, record, false, reservationKey, playContext, undefined, immediateFree);''')
 
           patch(slots,
           '''      const free = resumeFreeSpin(services, row);\n      const message = {''',
@@ -103,13 +100,13 @@ jobs:
 
           patch(slots,
           '''  if (rows.length > 0) {\n    services.events.log("casino_free_spins_resumed", {''',
-          '''  // free settlement済み→analytics直前crashも、pending行が無くてもここで閉じられる。\n  try {\n    services.casinoMetrics?.reconcileSlotsFinishes();\n  } catch (error) {\n    console.error("[casino-metrics] slots startup reconcile failed", error);\n  }\n  if (rows.length > 0) {\n    services.events.log("casino_free_spins_resumed", {''')
+          '''  try {\n    services.casinoMetrics?.reconcileSlotsFinishes();\n  } catch (error) {\n    console.error("[casino-metrics] slots startup reconcile failed", error);\n  }\n  if (rows.length > 0) {\n    services.events.log("casino_free_spins_resumed", {''')
           PY
           git rm .github/workflows/pr19-audit-fix.yml
           git diff --check
           git diff --stat
           git config user.name "ashina"
           git config user.email "tajitajifj0133@gmail.com"
-          git add apps/bot/src/casino .github/workflows/pr19-audit-fix.yml
+          git add -A
           git commit -m "fix PR19 slots recovery and abandon semantics"
           git push origin HEAD:feat/pr19-casino-metrics
