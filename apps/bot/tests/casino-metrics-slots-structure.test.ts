@@ -33,14 +33,14 @@ describe("PR19 slots analytics finish ordering", () => {
   });
 
   it("pending recovery reconciles finish without creating a new game_start", () => {
-    const recovery = source.slice(source.indexOf("export async function resumePendingFreeSpins("));
+    const recovery = source.slice(source.indexOf("export function resumePendingFreeSpins("));
     expect(recovery).toContain("reconcileSlotsGameFinishBestEffort(services, row.userId, row.operationId)");
     expect(recovery).toContain("services.casinoMetrics?.reconcileSlotsFinishes()");
     expect(recovery).not.toContain("recordCasinoGameStartBestEffort(");
   });
 
   it("rendering no longer owns the direct game_finish write", () => {
-    const render = source.slice(source.indexOf("async function renderSpin("), source.indexOf("export async function resumePendingFreeSpins("));
+    const render = between("async function renderSpin(", "export function resumePendingFreeSpins(");
     expect(render).not.toContain("recordCasinoGameFinishBestEffort(");
   });
 });
