@@ -1,0 +1,86 @@
+name: PR19 audit fixture fix
+on:
+  push:
+    branches: [feat/pr19-casino-metrics]
+    paths: [.github/workflows/pr19-audit-fix-fixtures.yml]
+permissions:
+  contents: write
+jobs:
+  patch-and-target:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Surgical source/test fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          def patch(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              n = s.count(old)
+              if n != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, got {n}\n--- needle ---\n{old}")
+              p.write_text(s.replace(old, new))
+
+          metrics = "packages/core/src/casino/metrics.ts"
+          patch(metrics,
+          '''    const paidGroupKey = `slots:spin:${userId}:${operationId}:paid`;\n    const paidGroup = this.chipTx.getGroup(paidGroupKey);\n    if (!paidGroup) return false;\n    if (paidGroup.status !== "settled" || paidGroup.settled_at == null) {\n      throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "slots.paid_group", paidGroupKey });\n    }\n    assertNonNegative(paidGroup.settled_at, "slots.paid_group.settled_at");\n    const paid = this.parseSlotSpin(paidGroup.result_json, "slots.paid_result");\n    const freeRow = this.db.prepare(`\n      SELECT id, status FROM casino_pending_free_spins\n      WHERE user_id=? AND operation_id=? AND spin_no=1\n    `).get(userId, operationId) as { id: number; status: string } | undefined;''',
+          '''    const freeRow = tableExists(this.db, "casino_pending_free_spins")\n      ? this.db.prepare(`\n          SELECT id, spin_no, source_group, status FROM casino_pending_free_spins\n          WHERE user_id=? AND operation_id=?\n          ORDER BY spin_no\n          LIMIT 1\n        `).get(userId, operationId) as { id: number; spin_no: number; source_group: string; status: string } | undefined\n      : undefined;\n    if (freeRow) {\n      assertNonNegative(freeRow.id, "slots.free.id");\n      assertNonNegative(freeRow.spin_no, "slots.free.spin_no");\n      if (!freeRow.source_group?.trim()) {\n        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "slots.free.source_group", userId, operationId });\n      }\n    }\n    // 無料スピンが永続化されている場合は、その sourceGroup を有料結果の正本として使う。\n    // 行が無い paid-only だけ、元操作のcanonical group keyから復元する。\n    const paidGroupKey = freeRow?.source_group ?? `slots:spin:${userId}:${operationId}:paid`;\n    const paidGroup = this.chipTx.getGroup(paidGroupKey);\n    if (!paidGroup) return false;\n    if (paidGroup.status !== "settled" || paidGroup.settled_at == null) {\n      throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "slots.paid_group", paidGroupKey });\n    }\n    assertNonNegative(paidGroup.settled_at, "slots.paid_group.settled_at");\n    const paid = this.parseSlotSpin(paidGroup.result_json, "slots.paid_result");''')
+
+          patch(metrics,
+          '''      assertNonNegative(freeRow.id, "slots.free.id");\n      if (paid.pendingFreeSpin == null) {''',
+          '''      if (paid.pendingFreeSpin == null) {''')
+          patch(metrics,
+          '''      const freeGroupKey = `slots:spin:${userId}:${operationId}:free:1`;''',
+          '''      const freeGroupKey = `slots:spin:${userId}:${operationId}:free:${freeRow.spin_no}`;''')
+
+          test = "packages/core/tests/casino-metrics.test.ts"
+          patch(test,
+          '''    const windowEnd = START + 91 * DAY;\n    const ctx = setup(windowEnd - 30);\n    openFormal(ctx);\n    ctx.metrics.record({ eventKey: "home_open:cohort", eventType: "home_open", userId: "alice", occurredAt: START + 10 });\n    ctx.metrics.record({ eventKey: "home_open:return", eventType: "home_open", userId: "alice", occurredAt: windowEnd - 60 });\n\n    const before = ctx.metrics.rollupDaily(D);''',
+          '''    const windowEnd = START + 91 * DAY;\n    const ctx = setup(START + 2 * DAY);\n    openFormal(ctx);\n    ctx.metrics.record({ eventKey: "home_open:cohort", eventType: "home_open", userId: "alice", occurredAt: START + 10 });\n\n    // Dの日次base/cohortをrawが生きているうちに保持する。\n    const before = ctx.metrics.rollupDaily(D);''')
+          patch(test,
+          '''    expect(stored.revisit_finalized_at).toBeNull();\n\n    ctx.setNow(windowEnd);''',
+          '''    expect(stored.revisit_finalized_at).toBeNull();\n\n    // D+90 23:59のreturnは観測窓に含まれる。\n    ctx.setNow(windowEnd - 60);\n    ctx.metrics.record({ eventKey: "home_open:return", eventType: "home_open", userId: "alice", occurredAt: windowEnd - 60 });\n    ctx.setNow(windowEnd);''')
+
+          patch(test,
+          '''    ctx.db.prepare(`\n      INSERT INTO casino_tx\n        (group_key, seq, tx_kind, from_holder, to_holder, amount, reason, game, session_id, actor_id,\n         opening_version, land_amount, ledger_tx_id, created_at)\n      VALUES ('deposit:old', 1, 'deposit', 'sys:land', 'alice', 100, 'old', NULL, NULL, 'alice', ?, 100, NULL, ?)\n    `).run(FORMAL_OPENING_VERSION, START);\n    ctx.metrics.record({ eventKey: "chip_deposit:tx:999999", eventType: "chip_deposit", userId: "alice", amount: 100, occurredAt: START });''',
+          '''    const deposit = ctx.db.prepare(`\n      INSERT INTO casino_tx\n        (group_key, seq, tx_kind, from_holder, to_holder, amount, reason, game, session_id, actor_id,\n         opening_version, land_amount, ledger_tx_id, created_at)\n      VALUES ('deposit:old', 1, 'deposit', NULL, 'alice', 100, 'old', NULL, NULL, 'alice', ?, 100, 1, ?)\n    `).run(FORMAL_OPENING_VERSION, START);\n    const txId = Number(deposit.lastInsertRowid);\n    ctx.metrics.record({ eventKey: `chip_deposit:tx:${txId}`, eventType: "chip_deposit", userId: "alice", amount: 100, occurredAt: START });''')
+
+          patch(test,
+          '''    openFormal(ctx);\n    ctx.metrics.gameStart({ game: "スロット", userId: "alice", operationId: "paid", wager: 100, source: "amount", occurredAt: START + 1 });''',
+          '''    openFormal(ctx);\n    new FreeSpins(ctx.db);\n    ctx.metrics.gameStart({ game: "スロット", userId: "alice", operationId: "paid", wager: 100, source: "amount", occurredAt: START + 1 });''')
+
+          insert_before = '''  it("pending free recovery creates no new start and closes the original operation only after free settlement", () => {'''
+          immediate = '''  it("immediate free settlement produces exactly one start and one aggregate finish", () => {\n    const ctx = setup();\n    openFormal(ctx);\n    ctx.metrics.gameStart({ game: "スロット", userId: "alice", operationId: "immediate", wager: 100, source: "amount", occurredAt: START + 1 });\n    insertSettledGroup(ctx, "slots:spin:alice:immediate:paid", "solo_game", "alice", slotResult({ payout: 120, pending: { spinNo: 1 } }), START + 2);\n    insertFreeRow(ctx, { operationId: "immediate", status: "settled", settledAt: START + 3 });\n    insertSettledGroup(ctx, "slots:spin:alice:immediate:free:1", "free_spin", "alice", slotResult({ payout: 80 }), START + 3);\n\n    expect(ctx.metrics.reconcileSlotsFinish("alice", "immediate")).toBe(true);\n    expect(eventCount(ctx, "game_start")).toBe(1);\n    expect(eventCount(ctx, "game_finish")).toBe(1);\n    const finish = ctx.db.prepare("SELECT wager, payout, net FROM casino_metric_events WHERE event_type='game_finish'").get() as { wager: number; payout: number; net: number };\n    expect(finish).toEqual({ wager: 100, payout: 200, net: 100 });\n  });\n\n'''
+          patch(test, insert_before, immediate + insert_before)
+          PY
+          git rm .github/workflows/pr19-audit-fix-fixtures.yml
+          git diff --check
+      - name: Targeted typecheck and tests
+        run: |
+          pnpm --filter @meigokujo/core typecheck
+          pnpm --filter @meigokujo/bot typecheck
+          pnpm --filter @meigokujo/core exec vitest run tests/casino-metrics.test.ts
+          pnpm --filter @meigokujo/bot exec vitest run tests/casino-metrics-abandon.test.ts tests/casino-metrics-slots-structure.test.ts
+      - name: Commit validated patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "ashina"
+          git config user.email "tajitajifj0133@gmail.com"
+          git add -A
+          git commit -m "fix PR19 durable metrics audit cases"
+          git push origin HEAD:feat/pr19-casino-metrics
