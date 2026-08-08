@@ -22,6 +22,7 @@ function fakeServices(opts: {
   maxLiability?: number;
   capacityThrows?: boolean;
   ledgerError?: boolean;
+  formalNull?: "free" | "escrowed";
 } = {}): Services {
   const phase = opts.phase ?? "formal";
   const status = opts.status ?? "open";
@@ -38,7 +39,12 @@ function fakeServices(opts: {
     chipAssets: {
       forUser: () => {
         if (opts.ledgerError) throw new ChipLedgerError("ERR_CORRUPT_BALANCE");
-        return { userId: "u1", freeChips: free, escrowed, total: free + escrowed };
+        return {
+          userId: "u1",
+          freeChips: opts.formalNull === "free" ? null : free,
+          escrowed: opts.formalNull === "escrowed" ? null : escrowed,
+          total: free + escrowed,
+        };
       },
       freeChips: () => free,
     },
@@ -121,6 +127,28 @@ describe("賭場ホームの遊び・金額選択", () => {
     expect(embedsDescription(payload)).toContain("所持 600 Ld");
     expect(embedsDescription(payload)).toContain("預け中 10,000 Ld");
     expect(embedsDescription(payload)).not.toContain("10,600 Ld");
+  });
+
+  it("wallet合算overflowは正常所持として扱わず、全5操作をdisabledにする", () => {
+    const payload = renderCasinoAmountPicker(
+      "u1",
+      "丁半",
+      fakeServices({ land: Number.MAX_SAFE_INTEGER, free: 10, escrowed: 0 }),
+    );
+    const actionButtons = buttons(payload);
+    expect(actionButtons).toHaveLength(5);
+    expect(actionButtons.every((b) => b.disabled === true)).toBe(true);
+    expect(embedsDescription(payload)).toContain("所持額確認停止");
+    expect(embedsDescription(payload)).not.toContain((Number.MAX_SAFE_INTEGER + 10).toLocaleString("ja-JP"));
+  });
+
+  it("formalでもfreeChips/escrowedがnullなら0へ推測せず所持額確認停止にする", () => {
+    for (const formalNull of ["free", "escrowed"] as const) {
+      const payload = renderCasinoAmountPicker("u1", "丁半", fakeServices({ formalNull }));
+      expect(buttons(payload)).toHaveLength(5);
+      expect(buttons(payload).every((b) => b.disabled === true)).toBe(true);
+      expect(embedsDescription(payload)).toContain("所持額確認停止");
+    }
   });
 
   it("胴元上限を超える固定金額はdisabledになり、上限確認失敗時はfail-closedになる", () => {
