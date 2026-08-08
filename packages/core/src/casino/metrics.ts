@@ -746,7 +746,24 @@ export class CasinoMetrics {
     const already = this.db.prepare("SELECT 1 AS ok FROM casino_metric_events WHERE event_key=?").get(finishKey);
     if (already) return false;
 
-    const paidGroupKey = `slots:spin:${userId}:${operationId}:paid`;
+    const freeRow = tableExists(this.db, "casino_pending_free_spins")
+      ? this.db.prepare(`
+          SELECT id, spin_no, source_group, status FROM casino_pending_free_spins
+          WHERE user_id=? AND operation_id=?
+          ORDER BY spin_no
+          LIMIT 1
+        `).get(userId, operationId) as { id: number; spin_no: number; source_group: string; status: string } | undefined
+      : undefined;
+    if (freeRow) {
+      assertNonNegative(freeRow.id, "slots.free.id");
+      assertNonNegative(freeRow.spin_no, "slots.free.spin_no");
+      if (!freeRow.source_group?.trim()) {
+        throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "slots.free.source_group", userId, operationId });
+      }
+    }
+    // 無料スピンが永続化されている場合は、その sourceGroup を有料結果の正本として使う。
+    // 行が無い paid-only だけ、元操作のcanonical group keyから復元する。
+    const paidGroupKey = freeRow?.source_group ?? `slots:spin:${userId}:${operationId}:paid`;
     const paidGroup = this.chipTx.getGroup(paidGroupKey);
     if (!paidGroup) return false;
     if (paidGroup.status !== "settled" || paidGroup.settled_at == null) {
@@ -754,10 +771,6 @@ export class CasinoMetrics {
     }
     assertNonNegative(paidGroup.settled_at, "slots.paid_group.settled_at");
     const paid = this.parseSlotSpin(paidGroup.result_json, "slots.paid_result");
-    const freeRow = this.db.prepare(`
-      SELECT id, status FROM casino_pending_free_spins
-      WHERE user_id=? AND operation_id=? AND spin_no=1
-    `).get(userId, operationId) as { id: number; status: string } | undefined;
 
     let payout = this.slotTotalPayout(paid, "slots.paid_total");
     let settledAt = paidGroup.settled_at;
@@ -766,12 +779,11 @@ export class CasinoMetrics {
         throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "slots.pending_free_spin", reason: "missing_row", paidGroupKey });
       }
     } else {
-      assertNonNegative(freeRow.id, "slots.free.id");
       if (paid.pendingFreeSpin == null) {
         throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "slots.pending_free_spin", reason: "unexpected_row", paidGroupKey });
       }
       if (freeRow.status !== "settled") return false;
-      const freeGroupKey = `slots:spin:${userId}:${operationId}:free:1`;
+      const freeGroupKey = `slots:spin:${userId}:${operationId}:free:${freeRow.spin_no}`;
       const freeGroup = this.chipTx.getGroup(freeGroupKey);
       if (!freeGroup || freeGroup.status !== "settled" || freeGroup.settled_at == null) {
         throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "slots.free_group", freeGroupKey });

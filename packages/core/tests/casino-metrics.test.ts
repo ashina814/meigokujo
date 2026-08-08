@@ -197,11 +197,11 @@ describe("CasinoMetrics daily_only", () => {
 describe("CasinoMetrics revisit / retention", () => {
   it("counts a D+90 23:59 return, finalizes on D+91, prunes raw D, and keeps finalized daily stable", () => {
     const windowEnd = START + 91 * DAY;
-    const ctx = setup(windowEnd - 30);
+    const ctx = setup(START + 2 * DAY);
     openFormal(ctx);
     ctx.metrics.record({ eventKey: "home_open:cohort", eventType: "home_open", userId: "alice", occurredAt: START + 10 });
-    ctx.metrics.record({ eventKey: "home_open:return", eventType: "home_open", userId: "alice", occurredAt: windowEnd - 60 });
 
+    // Dの日次base/cohortをrawが生きているうちに保持する。
     const before = ctx.metrics.rollupDaily(D);
     expect(before?.revisit_rate_bps).toBeNull();
     const stored = ctx.db.prepare("SELECT revisit_cohort_json, revisit_finalized_at FROM casino_metric_daily WHERE date=?").get(D) as {
@@ -211,6 +211,9 @@ describe("CasinoMetrics revisit / retention", () => {
     expect(JSON.parse(stored.revisit_cohort_json)).toEqual(["alice"]);
     expect(stored.revisit_finalized_at).toBeNull();
 
+    // D+90 23:59のreturnは観測窓に含まれる。
+    ctx.setNow(windowEnd - 60);
+    ctx.metrics.record({ eventKey: "home_open:return", eventType: "home_open", userId: "alice", occurredAt: windowEnd - 60 });
     ctx.setNow(windowEnd);
     const finalized = ctx.metrics.rollupDaily(D);
     expect(finalized?.revisit_rate_bps).toBe(10_000);
@@ -231,13 +234,32 @@ describe("CasinoMetrics revisit / retention", () => {
       INSERT INTO casino_tx_groups (group_key, kind, status, actor_id, result_json, created_at, settled_at)
       VALUES ('deposit:old', 'deposit', 'settled', 'alice', '{}', ?, ?)
     `).run(START, START);
-    ctx.db.prepare(`
+    ctx.ledger.ensureAccount("user:alice", "user");
+    ctx.ledger.ensureAccount("sys:casino:test-pool", "system");
+    ctx.ledger.transfer({
+      from: "sys:treasury",
+      to: "user:alice",
+      amount: 100,
+      type: "opening",
+      actor: "test",
+      idempotencyKey: "metric-test-fund",
+    });
+    const landTx = ctx.ledger.transfer({
+      from: "user:alice",
+      to: "sys:casino:test-pool",
+      amount: 100,
+      type: "chip_deposit",
+      actor: "alice",
+      idempotencyKey: "metric-test-old-deposit",
+    }).tx.id;
+    const deposit = ctx.db.prepare(`
       INSERT INTO casino_tx
         (group_key, seq, tx_kind, from_holder, to_holder, amount, reason, game, session_id, actor_id,
          opening_version, land_amount, ledger_tx_id, created_at)
-      VALUES ('deposit:old', 1, 'deposit', 'sys:land', 'alice', 100, 'old', NULL, NULL, 'alice', ?, 100, NULL, ?)
-    `).run(FORMAL_OPENING_VERSION, START);
-    ctx.metrics.record({ eventKey: "chip_deposit:tx:999999", eventType: "chip_deposit", userId: "alice", amount: 100, occurredAt: START });
+      VALUES ('deposit:old', 1, 'deposit', NULL, 'alice', 100, 'old', NULL, NULL, 'alice', ?, 100, ?, ?)
+    `).run(FORMAL_OPENING_VERSION, landTx, START);
+    const txId = Number(deposit.lastInsertRowid);
+    ctx.metrics.record({ eventKey: `chip_deposit:tx:${txId}`, eventType: "chip_deposit", userId: "alice", amount: 100, occurredAt: START });
     ctx.metrics.pruneRaw();
     expect(eventCount(ctx, "chip_deposit")).toBe(0);
     expect(ctx.metrics.syncChipExchangeEvents()).toBe(0);
@@ -308,12 +330,28 @@ describe("CasinoMetrics slots finish reconciliation", () => {
   it("paid-only closes finish from settled financial truth before any display can fail", () => {
     const ctx = setup();
     openFormal(ctx);
+    new FreeSpins(ctx.db);
     ctx.metrics.gameStart({ game: "スロット", userId: "alice", operationId: "paid", wager: 100, source: "amount", occurredAt: START + 1 });
     insertSettledGroup(ctx, "slots:spin:alice:paid:paid", "solo_game", "alice", slotResult({ payout: 150 }), START + 2);
     expect(ctx.metrics.reconcileSlotsFinish("alice", "paid")).toBe(true);
     expect(() => { throw new Error("Discord display failed after settlement"); }).toThrow("Discord display failed");
     expect(eventCount(ctx, "game_start")).toBe(1);
     expect(eventCount(ctx, "game_finish")).toBe(1);
+  });
+
+  it("immediate free settlement produces exactly one start and one aggregate finish", () => {
+    const ctx = setup();
+    openFormal(ctx);
+    ctx.metrics.gameStart({ game: "スロット", userId: "alice", operationId: "immediate", wager: 100, source: "amount", occurredAt: START + 1 });
+    insertSettledGroup(ctx, "slots:spin:alice:immediate:paid", "solo_game", "alice", slotResult({ payout: 120, pending: { spinNo: 1 } }), START + 2);
+    insertFreeRow(ctx, { operationId: "immediate", status: "settled", settledAt: START + 3 });
+    insertSettledGroup(ctx, "slots:spin:alice:immediate:free:1", "free_spin", "alice", slotResult({ payout: 80 }), START + 3);
+
+    expect(ctx.metrics.reconcileSlotsFinish("alice", "immediate")).toBe(true);
+    expect(eventCount(ctx, "game_start")).toBe(1);
+    expect(eventCount(ctx, "game_finish")).toBe(1);
+    const finish = ctx.db.prepare("SELECT wager, payout, net FROM casino_metric_events WHERE event_type='game_finish'").get() as { wager: number; payout: number; net: number };
+    expect(finish).toEqual({ wager: 100, payout: 200, net: 100 });
   });
 
   it("pending free recovery creates no new start and closes the original operation only after free settlement", () => {
