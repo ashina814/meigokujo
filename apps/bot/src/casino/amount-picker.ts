@@ -201,14 +201,16 @@ function amountAvailability(userId: string, game: CasinoSoloGame, services: Serv
   if (phase === "unknown") return { ok: false, wallet, maxBet, reason: "状態確認停止" };
   if (phase !== "formal") return { ok: false, wallet, maxBet, reason: openingNotice(services) };
   if (status.status !== "open") return { ok: false, wallet, maxBet, reason: "賭場は現在停止中" };
-  if (wallet.status !== "formal") return { ok: false, wallet, maxBet, reason: "所持額確認停止" };
+  if (wallet.status !== "formal" || wallet.freeChips === null || wallet.escrowed === null) {
+    return { ok: false, wallet, maxBet, reason: "所持額確認停止" };
+  }
   return {
     ok: true,
     wallet: {
       ...wallet,
       status: "formal",
-      freeChips: wallet.freeChips ?? 0,
-      escrowed: wallet.escrowed ?? 0,
+      freeChips: wallet.freeChips,
+      escrowed: wallet.escrowed,
     },
     maxBet,
   };
