@@ -1,5 +1,15 @@
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import type Database from "better-sqlite3";
 import {
   canonicalHash,
@@ -8,6 +18,7 @@ import {
   sha256Hex,
   tableColumns,
   tableExists,
+  tableRowCount,
   tableToCsv,
 } from "./opening-canonical.js";
 
@@ -238,6 +249,151 @@ export class TestFilesystemOpeningBackupAdapter implements OpeningBackupAdapter 
       ok: manifestCheck.ok && diskCheck.ok,
       problems: [...manifestCheck.problems, ...diskCheck.problems],
     };
+  }
+}
+
+export class ProductionOpeningBackupAdapter implements OpeningBackupAdapter {
+  readonly durability: OpeningBackupDurability = "persistent";
+  private readonly directory: string;
+
+  constructor(directory: string | undefined | null) {
+    if (!directory || directory.trim() === "") {
+      throw new Error("CASINO_OPENING_BACKUP_DIR is not configured");
+    }
+    this.directory = resolve(directory);
+    const normalizedDirectory = this.directory.toLowerCase();
+    const tempRoot = resolve(tmpdir()).toLowerCase();
+    if (normalizedDirectory === tempRoot || normalizedDirectory.startsWith(`${tempRoot}\\`) || normalizedDirectory.startsWith(`${tempRoot}/`)) {
+      throw new Error("CASINO_OPENING_BACKUP_DIR must not be an OS temp directory");
+    }
+  }
+
+  async backup(request: OpeningBackupRequest): Promise<OpeningBackupManifest> {
+    this.ensureUsableDirectory();
+    const prefix = `casino-opening-${request.planHash}`;
+    const manifestPath = join(this.directory, `${prefix}-manifest.json`);
+    const existing = this.readExistingManifest(manifestPath);
+    if (existing) {
+      this.assertExistingBackupMatchesRequest(existing, request);
+      return existing;
+    }
+
+    const tempPrefix = join(this.directory, `.${prefix}.${process.pid}.${Date.now()}`);
+    const bytes = request.db.serialize();
+    const manifest = computeBackupManifest(request);
+    const finalManifest: OpeningBackupManifest = { ...manifest, sqliteSha256: sha256Hex(bytes) };
+
+    const published: string[] = [];
+    const tempFiles: Array<{ temp: string; final: string }> = [];
+    try {
+      const sqliteTemp = `${tempPrefix}.sqlite.tmp`;
+      writeFileSync(sqliteTemp, bytes, { mode: 0o600 });
+      tempFiles.push({ temp: sqliteTemp, final: join(this.directory, `${prefix}.sqlite`) });
+
+      for (const entry of finalManifest.csv) {
+        const { csv: text } = tableToCsv(request.db, entry.table);
+        const temp = `${tempPrefix}-${entry.table}.csv.tmp`;
+        writeFileSync(temp, text, { encoding: "utf8", mode: 0o600 });
+        tempFiles.push({ temp, final: join(this.directory, `${prefix}-${entry.table}.csv`) });
+      }
+
+      const manifestTemp = `${tempPrefix}-manifest.json.tmp`;
+      writeFileSync(manifestTemp, JSON.stringify(finalManifest, null, 2), { encoding: "utf8", mode: 0o600 });
+      tempFiles.push({ temp: manifestTemp, final: manifestPath });
+
+      for (const file of tempFiles) {
+        if (existsSync(file.final)) throw new Error(`opening backup already exists: ${basename(file.final)}`);
+        renameSync(file.temp, file.final);
+        this.restrict(file.final);
+        published.push(file.final);
+      }
+
+      const verified = await this.verifyPersistedBackup(finalManifest, this.expectationForRequest(request));
+      if (!verified.ok) {
+        throw new Error(`opening backup verification failed: ${verified.problems.join("; ")}`);
+      }
+      return finalManifest;
+    } catch (error) {
+      for (const file of tempFiles) {
+        if (existsSync(file.temp)) rmSync(file.temp, { force: true });
+      }
+      for (const file of published) {
+        if (existsSync(file)) rmSync(file, { force: true });
+      }
+      throw error;
+    }
+  }
+
+  async verifyPersistedBackup(
+    manifest: OpeningBackupManifest,
+    expectation: ManifestVerificationExpectation,
+  ): Promise<OpeningBackupVerificationResult> {
+    const manifestCheck = verifyOpeningBackupManifest(manifest, expectation);
+    const diskCheck = verifyOpeningBackupFilesOnDisk(this.directory, manifest);
+    return {
+      ok: manifestCheck.ok && diskCheck.ok,
+      problems: [...manifestCheck.problems, ...diskCheck.problems],
+    };
+  }
+
+  private ensureUsableDirectory(): void {
+    mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    const stat = statSync(this.directory);
+    if (!stat.isDirectory()) throw new Error(`CASINO_OPENING_BACKUP_DIR is not a directory: ${this.directory}`);
+    const probe = join(this.directory, `.opening-backup-probe-${process.pid}-${Date.now()}`);
+    writeFileSync(probe, "ok", { mode: 0o600 });
+    rmSync(probe, { force: true });
+  }
+
+  private readExistingManifest(manifestPath: string): OpeningBackupManifest | null {
+    if (!existsSync(manifestPath)) return null;
+    try {
+      return JSON.parse(readFileSync(manifestPath, "utf8")) as OpeningBackupManifest;
+    } catch {
+      throw new Error(`existing opening backup manifest is corrupt: ${manifestPath}`);
+    }
+  }
+
+  private assertExistingBackupMatchesRequest(manifest: OpeningBackupManifest, request: OpeningBackupRequest): void {
+    const expected = { ...computeBackupManifest(request), createdAt: manifest.createdAt, sqliteSha256: sha256Hex(request.db.serialize()) };
+    if (canonicalStringify(manifest) !== canonicalStringify(expected)) {
+      throw new Error(`opening backup conflict for planHash ${request.planHash}`);
+    }
+    const verified = verifyOpeningBackupFilesOnDisk(this.directory, manifest);
+    if (!verified.ok) {
+      throw new Error(`existing opening backup is incomplete or corrupt: ${verified.problems.join("; ")}`);
+    }
+  }
+
+  private expectationForRequest(request: OpeningBackupRequest): ManifestVerificationExpectation {
+    const rowCounts: Record<string, number> = {};
+    const columns: Record<string, string[]> = {};
+    for (const table of request.archiveTables) {
+      rowCounts[table] = tableExists(request.db, table) ? tableRowCount(request.db, table) : 0;
+      columns[table] = tableExists(request.db, table) ? tableColumns(request.db, table) : [];
+    }
+    return {
+      archiveTables: request.archiveTables,
+      planHash: request.planHash,
+      databaseIdentity: databaseIdentity(request.db),
+      schemaFingerprint: schemaFingerprint(request.db),
+      rowCounts,
+      columns,
+      openingVersion: request.openingVersion,
+      latestLandTransactionId: (request.db.prepare("SELECT COALESCE(MAX(id),0) AS id FROM transactions").get() as { id: number }).id,
+      latestChipTransactionId: latestChipTransactionId(request.db),
+      latestChipGroupGeneration: chipGroupGeneration(request.db),
+      liveDb: request.db,
+    };
+  }
+
+  private restrict(path: string): void {
+    try {
+      chmodSync(path, 0o600);
+      chmodSync(dirname(path), 0o700);
+    } catch {
+      // Windows can ignore POSIX modes; verification is handled by read-back checks.
+    }
   }
 }
 

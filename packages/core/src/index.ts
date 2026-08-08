@@ -359,6 +359,7 @@ export {
   chipGroupGeneration,
   latestChipTransactionId,
   computeBackupManifest,
+  ProductionOpeningBackupAdapter,
   verifyOpeningBackupManifest,
   verifyOpeningBackupFilesOnDisk,
   type OpeningBackupAdapter,

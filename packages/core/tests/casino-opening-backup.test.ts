@@ -7,6 +7,7 @@ import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 import {
   FakeOpeningBackupAdapter,
+  ProductionOpeningBackupAdapter,
   TestFilesystemOpeningBackupAdapter,
   computeBackupManifest,
   databaseIdentity,
@@ -91,6 +92,63 @@ describe("TestFilesystemOpeningBackupAdapter", () => {
     const savedManifest = JSON.parse(readFileSync(join(dir, "casino-opening-filehash1-manifest.json"), "utf8"));
     expect(savedManifest.planHash).toBe(manifest.planHash);
     expect(savedManifest.sqliteSha256).toBe(manifest.sqliteSha256);
+  });
+});
+
+describe("ProductionOpeningBackupAdapter", () => {
+  function persistentDir(): string {
+    const dir = mkdtempSync(join(process.cwd(), "pr195-production-backup-"));
+    tmpDirs.push(dir);
+    return dir;
+  }
+
+  it("writes persistent sqlite/csv/manifest files and verifies them from disk", async () => {
+    const dir = persistentDir();
+    const { db } = setup();
+    const adapter = new ProductionOpeningBackupAdapter(dir);
+    const manifest = await adapter.backup({
+      db,
+      planHash: "prodhash1",
+      archiveTables: ["ether_balances"],
+      openingVersion: "legacy_pre_reset",
+    });
+
+    expect(adapter.durability).toBe("persistent");
+    expect(existsSync(join(dir, "casino-opening-prodhash1.sqlite"))).toBe(true);
+    expect(existsSync(join(dir, "casino-opening-prodhash1-ether_balances.csv"))).toBe(true);
+    expect(existsSync(join(dir, "casino-opening-prodhash1-manifest.json"))).toBe(true);
+
+    const savedManifest = JSON.parse(readFileSync(join(dir, "casino-opening-prodhash1-manifest.json"), "utf8"));
+    expect(savedManifest).toEqual(manifest);
+    const diskCheck = verifyOpeningBackupFilesOnDisk(dir, manifest);
+    expect(diskCheck.ok).toBe(true);
+  });
+
+  it("returns the existing verified backup for the same plan and rejects corrupted published files", async () => {
+    const dir = persistentDir();
+    const { db } = setup();
+    const adapter = new ProductionOpeningBackupAdapter(dir);
+    const manifest = await adapter.backup({
+      db,
+      planHash: "prodhash2",
+      archiveTables: ["ether_balances"],
+      openingVersion: "legacy_pre_reset",
+    });
+
+    await expect(
+      adapter.backup({ db, planHash: "prodhash2", archiveTables: ["ether_balances"], openingVersion: "legacy_pre_reset" }),
+    ).resolves.toEqual(manifest);
+
+    writeFileSync(join(dir, "casino-opening-prodhash2-ether_balances.csv"), "corrupt\n", "utf8");
+    await expect(
+      adapter.backup({ db, planHash: "prodhash2", archiveTables: ["ether_balances"], openingVersion: "legacy_pre_reset" }),
+    ).rejects.toThrow(/incomplete|corrupt/);
+  });
+
+  it("rejects unset and OS temp backup directories", () => {
+    expect(() => new ProductionOpeningBackupAdapter("")).toThrow(/not configured/);
+    expect(() => new ProductionOpeningBackupAdapter(tmpdir())).toThrow(/OS temp/);
+    expect(() => new ProductionOpeningBackupAdapter(join(tmpdir(), "casino-opening-backups"))).toThrow(/OS temp/);
   });
 });
 
