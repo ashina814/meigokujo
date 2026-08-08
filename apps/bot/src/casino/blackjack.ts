@@ -97,8 +97,6 @@ export async function playBlackjack(
   betRaw: number,
 ): Promise<void> {
   const uid = interaction.user.id;
-  const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "ブラックジャック");
-  if (!check.ok) return;
   if (!acquireSeat(uid)) {
     if (interaction.replied || interaction.deferred) {
       await interaction.followUp({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
@@ -108,6 +106,8 @@ export async function playBlackjack(
     return;
   }
   try {
+    const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "ブラックジャック");
+    if (!check.ok) return;
     await runRound(interaction, services, check.bet);
   } finally {
     releaseSeat(uid);
@@ -237,7 +237,6 @@ async function runRoundInner(
     });
 
     if (won) broadcastBigWin(interaction.client, services, { userId: uid, game: "ブラックジャック", bet: totalBet, payout: settled.payout });
-
     await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
   };
 
