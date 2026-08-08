@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   Casino,
@@ -47,7 +45,6 @@ import {
   acquireSeat,
   checkRetry,
   effectiveMaxBet,
-  handleRetryPress,
   releaseSeat,
 } from "../src/casino/common.js";
 import { buyConsumable } from "../src/commands/bakuten.js";
@@ -990,102 +987,4 @@ describe("⑥ リトライは断っても押し直せる", () => {
     ctx.db.close();
   });
 
-  /**
-   * 純関数 `checkRetry` のテストだけでは足りない。壊れていたのは**順序**で、
-   * 「先に collector を止めてから断る」と、ボタンは残っているのに二度と反応しない。
-   * 全ゲームの retry ボタンは `handleRetryPress` を呼ぶだけなので、ここが実ハンドラになる。
-   */
-  function fakeButton(uid: string) {
-    const calls = { reply: [] as string[], followUp: [] as string[], deferUpdate: 0 };
-    return {
-      calls,
-      btn: {
-        user: { id: uid },
-        reply: async (p: { content?: string }) => {
-          calls.reply.push(p.content ?? "");
-        },
-        followUp: async (p: { content?: string }) => {
-          calls.followUp.push(p.content ?? "");
-        },
-        deferUpdate: async () => {
-          calls.deferUpdate++;
-        },
-      },
-    };
-  }
-
-  function fakeCollector() {
-    const stopped: string[] = [];
-    return { stopped, collector: { stop: (reason?: string) => stopped.push(reason ?? "") } };
-  }
-
-  it("断ったときは collector を止めない（もう一度押せる）", async () => {
-    const ctx = setup();
-    seedBalance(ctx.db, "u1", 10_000);
-    const { btn, calls } = fakeButton("u1");
-    const { collector, stopped } = fakeCollector();
-    const ran: number[] = [];
-
-    // 1回目: 所持を超える額 → 断られる
-    await handleRetryPress({
-      services: ctx.services,
-      btn: btn as never,
-      collector,
-      betRaw: 999_999,
-      run: async (bet) => void ran.push(bet),
-    });
-    expect(calls.reply.length).toBe(1);
-    expect(ran).toEqual([]);
-    expect(stopped).toEqual([]); // ← ここが本題。止めていたら次の押下が無応答になる
-    expect(calls.deferUpdate).toBe(0);
-
-    // 2回目: 押し直せば通る
-    await handleRetryPress({
-      services: ctx.services,
-      btn: btn as never,
-      collector,
-      betRaw: 5_000,
-      run: async (bet) => void ran.push(bet),
-    });
-    expect(ran).toEqual([5_000]);
-    expect(stopped).toEqual(["retry"]);
-    expect(calls.deferUpdate).toBe(1);
-    ctx.db.close();
   });
-
-  it("受け付けたときだけ collector を止め、座席を返してから回す", async () => {
-    const ctx = setup();
-    seedBalance(ctx.db, "u1", 10_000);
-    const { btn, calls } = fakeButton("u1");
-    const { collector, stopped } = fakeCollector();
-    let seatDuringRun = false;
-
-    await handleRetryPress({
-      services: ctx.services,
-      btn: btn as never,
-      collector,
-      betRaw: 1_000,
-      // 本体の実行中は座席が確保されている（＝二重起動を防げている）
-      run: async () => void (seatDuringRun = !acquireSeat("u1")),
-    });
-
-    expect(stopped).toEqual(["retry"]);
-    expect(calls.deferUpdate).toBe(1);
-    expect(seatDuringRun).toBe(true);
-    // 本体が終われば座席は返っている
-    expect(acquireSeat("u1")).toBe(true);
-    releaseSeat("u1");
-    ctx.db.close();
-  });
-
-  it("どのゲームも retry の中で collector を直接止めていない", () => {
-    // 順序を各ゲームで書き直せてしまうと、また同じ壊し方に戻る。
-    // 停止は handleRetryPress の中だけ、という構造をここで固定する
-    const dir = fileURLToPath(new URL("../src/casino/", import.meta.url));
-    for (const f of ["slots", "crash", "blackjack", "chinchiro", "chohan", "poker", "holdem"]) {
-      const src = readFileSync(`${dir}${f}.ts`, "utf8");
-      expect(src.includes("handleRetryPress"), `${f}: 共通処理を通していない`).toBe(true);
-      expect(src.includes('stop("retry")'), `${f}: retry で collector を直接止めている`).toBe(false);
-    }
-  });
-});

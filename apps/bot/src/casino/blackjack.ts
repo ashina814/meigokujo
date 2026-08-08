@@ -15,7 +15,6 @@ import type { Services } from "../services.js";
 import {
   MIN_BET,
   acquireSeat,
-  handleRetryPress,
   releaseSeat,
   reserveBlackjackLiability,
   sleep,
@@ -240,29 +239,6 @@ async function runRoundInner(
     if (won) broadcastBigWin(interaction.client, services, { userId: uid, game: "ブラックジャック", bet: totalBet, payout: settled.payout });
 
     await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
-
-    const collector = reply.createMessageComponentCollector({
-      componentType: ComponentType.Button,
-      time: 60_000,
-      filter: (i) => i.user.id === uid && i.customId.startsWith("bj:retry:"),
-    });
-    collector.on("collect", async (btn) => {
-      if (btn.customId.startsWith("bj:retry:")) {
-        // 受付・collector停止・座席の取り直しは共通処理へ（PR3）。
-        // 断るなら collector を止めない ＝ 押し直せる
-        await handleRetryPress({
-          services,
-          btn,
-          collector,
-          game: "ブラックジャック",
-          betRaw: Number(btn.customId.split(":")[2]),
-          run: (bet) => runRound(btn, services, bet),
-        });
-      }
-    });
-    collector.on("end", async (_c, reason) => {
-      if (reason !== "retry") await reply.edit({ components: [] }).catch(() => undefined);
-    });
   };
 
   // ── ナチュラル判定 ──

@@ -51,7 +51,7 @@ describe("賭場の入口ガード", () => {
     // 賭場系の customId 接頭辞は全部（対人戦・再戦オファーを含む）
     for (const id of [
       "ether:buy", "bakuten:buy", "stocks:buy", "vip:join", "ita:bet",
-      "rl:red", "slots:retry:50", "chinchiro:stop", "keiba:bet", "crash:cashout",
+      "rl:red", "casino:retry:スロット:50:123456789012345678", "chinchiro:stop", "keiba:bet", "crash:out",
       "chohan:cho", "chm:join", "bj:hit", "holdem:call", "poker:hold:1", "pkr:join",
       "bjd:accept", "ccd:accept", "ind:call", "sashi:accept", "rem:12345",
       "casino:amount:custom:スロット", "casino:amount:modal:スロット",
@@ -113,7 +113,7 @@ describe("賭場の入口ガード", () => {
   // PR8監査・項目8: 稼働状態が open でも、正式開業初期化が終わるまでチップ資金は動かせない
   it("正式開業前は open でもチップ操作を専用の文面で断る", async () => {
     const services = fakeServices(null, "pre_reset");
-    for (const i of [command("遊ぶ"), command("板", "立てる"), component("ether:buy"), component("slots:retry:50")]) {
+    for (const i of [command("遊ぶ"), command("板", "立てる"), component("ether:buy"), component("casino:retry:スロット:50:123456789012345678")]) {
       expect(await denyIfCasinoClosed(i, services)).toBe(true);
       const arg = i.reply.mock.calls[0]![0] as { content: string };
       expect(arg.content).toContain("正式開業準備中");
