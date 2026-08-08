@@ -31,23 +31,13 @@ import {
   type CasinoPlayContext,
 } from "./metrics.js";
 
-/**
- * 🃏 ドローポーカー（Jacks or Better・ソロ）。対胴元の簡易版。
- * - 5枚配布 → プレイヤーが保持するカードを選択 → 残りを交換 → 役判定 → 配当
- * - 配当表（ジャックス・オア・ベター）:
- *   ロイヤル 250倍 / ストレートフラッシュ 50倍 / 4カード 25倍 /
- *   フルハウス 9倍 / フラッシュ 6倍 / ストレート 4倍 /
- *   3カード 3倍 / ツーペア 2倍 / J以上のペア 1倍 / それ以下 負け
- * - 最大配当250倍 → テーブルリミット判定に使う
- */
-/** ロイヤルフラッシュの払戻倍率。配当表（core）から読む（写さない・PR4） */
 const MAX_MULT = POKER_CATEGORY_PAYOUTS[11]!;
 const SUITS = ["♠", "♥", "♦", "♣"] as const;
 const RANK_LABEL = ["", "", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"] as const;
 
 interface Card {
   suit: (typeof SUITS)[number];
-  rank: number; // 2..14 (A=14)
+  rank: number;
 }
 
 const showCard = (c: Card) => `${c.suit}${RANK_LABEL[c.rank]}`;
@@ -59,35 +49,21 @@ function newDeck(rng: CasinoRng): Card[] {
 }
 
 interface HandEval {
-  category: number; // 1..10
+  category: number;
   label: string;
-  payMult: number; // 配当倍率（賭け金に対する payout 総額）
+  payMult: number;
 }
 const CAT_LABELS: readonly string[] = [
-  "",
-  "ハイカード",
-  "ペア（低）",
-  "ペア（J以上）",
-  "ツーペア",
-  "3カード",
-  "ストレート",
-  "フラッシュ",
-  "フルハウス",
-  "4カード",
-  "ストレートフラッシュ",
-  "ロイヤルフラッシュ",
+  "", "ハイカード", "ペア（低）", "ペア（J以上）", "ツーペア", "3カード", "ストレート",
+  "フラッシュ", "フルハウス", "4カード", "ストレートフラッシュ", "ロイヤルフラッシュ",
 ];
-// 配当表は core の POKER_CATEGORY_PAYOUTS を単一の真実源として import する。
-// テスト（core/tests/casino-game-rtp.test.ts）も同じ定数を参照して RTP を検証する。
 const CAT_PAYS: readonly number[] = POKER_CATEGORY_PAYOUTS;
-// ※ ジャックス・オア・ベター（1x）= 賭け金返却+1x = 2x payout。以降 profit=(bet*X)-bet の関係。
 
 function evaluate(hand: Card[]): HandEval {
   const ranks = hand.map((c) => c.rank).sort((a, b) => b - a);
   const suitCount: Record<string, number> = {};
   for (const c of hand) suitCount[c.suit] = (suitCount[c.suit] ?? 0) + 1;
   const isFlush = Object.values(suitCount).some((n) => n === 5);
-
   const unique = Array.from(new Set(ranks)).sort((a, b) => b - a);
   let isStraight = false;
   let straightHigh = 0;
@@ -100,13 +76,11 @@ function evaluate(hand: Card[]): HandEval {
       straightHigh = 5;
     }
   }
-
   const rankCount: Record<number, number> = {};
   for (const r of ranks) rankCount[r] = (rankCount[r] ?? 0) + 1;
   const groups = Object.entries(rankCount)
     .map(([r, c]) => ({ rank: Number(r), count: c }))
     .sort((a, b) => b.count - a.count || b.rank - a.rank);
-
   let cat = 1;
   if (isStraight && isFlush && straightHigh === 14) cat = 11;
   else if (isStraight && isFlush) cat = 10;
@@ -118,22 +92,14 @@ function evaluate(hand: Card[]): HandEval {
   else if (groups[0]!.count === 2 && groups[1]?.count === 2) cat = 4;
   else if (groups[0]!.count === 2 && groups[0]!.rank >= 11) cat = 3;
   else if (groups[0]!.count === 2) cat = 2;
-
   return { category: cat, label: CAT_LABELS[cat]!, payMult: CAT_PAYS[cat]! };
 }
 
 export function paytableEmbed(): EmbedBuilder {
   const lines = [
-    "🏆  ロイヤルフラッシュ  ·  **×250**",
-    "🌟  ストレートフラッシュ  ·  **×50**",
-    "🎯  4カード  ·  **×25**",
-    "🎴  フルハウス  ·  **×9**",
-    "🔷  フラッシュ  ·  **×6**",
-    "➡  ストレート  ·  **×4**",
-    "🃏  3カード  ·  **×3**",
-    "🎭  ツーペア  ·  **×2**",
-    "💫  J以上のペア  ·  **×1**（元本返却+1倍）",
-    "😔  それ以下  ·  負け",
+    "🏆  ロイヤルフラッシュ  ·  **×250**", "🌟  ストレートフラッシュ  ·  **×50**", "🎯  4カード  ·  **×25**",
+    "🎴  フルハウス  ·  **×9**", "🔷  フラッシュ  ·  **×6**", "➡  ストレート  ·  **×4**",
+    "🃏  3カード  ·  **×3**", "🎭  ツーペア  ·  **×2**", "💫  J以上のペア  ·  **×1**（元本返却+1倍）", "😔  それ以下  ·  負け",
   ];
   return new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · ポーカー" })
@@ -154,11 +120,8 @@ export async function playPoker(
 ): Promise<void> {
   const uid = interaction.user.id;
   if (!acquireSeat(uid)) {
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
-    } else {
-      await interaction.reply({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
-    }
+    if (interaction.replied || interaction.deferred) await interaction.followUp({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
+    else await interaction.reply({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
     return;
   }
   try {
@@ -170,10 +133,6 @@ export async function playPoker(
   }
 }
 
-/**
- * 1回ぶんの入口。**先に最悪ケースの債務を予約**してから本体へ入る（PR5・正本 §11.2）。
- * 予約が取れなければ本体を一度も呼ばず、押せる金額を提示して戻る（金は1 Ld も動かない）。
- */
 async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
@@ -194,13 +153,7 @@ async function runRoundInner(
 ): Promise<void> {
   const uid = interaction.user.id;
   const playContext = casinoPlayContext(context);
-  recordCasinoGameStartBestEffort(services, {
-    userId: uid,
-    game: "ポーカー",
-    operationId: interaction.id,
-    wager: bet,
-    source: playContext.source,
-  });
+  recordCasinoGameStartBestEffort(services, { userId: uid, game: "ポーカー", operationId: interaction.id, wager: bet, source: playContext.source });
   const deck = newDeck(services.rng);
   const hand: Card[] = [];
   for (let i = 0; i < 5; i++) hand.push(deck.pop()!);
@@ -208,52 +161,33 @@ async function runRoundInner(
 
   const buildEmbed = (phase: "draw" | "reveal", finalEval?: HandEval) => {
     const cardsLine = hand.map((c, i) => (held.has(i) ? `[**${showCard(c)}**]` : `[${showCard(c)}]`)).join("  ");
-    const heldCount = held.size;
     return new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · ポーカー" })
       .setColor(C_MAMMON)
-      .setTitle(`🃏  ドロー  ·  保持 ${heldCount}枚 / 交換 ${5 - heldCount}枚`)
-      .setDescription(
-        [
-          cardsLine,
-          HR_THIN,
-          phase === "draw"
-            ? "保持したい札のボタンを押す（再押しで解除）→ **交換** で確定"
-            : finalEval
-              ? `**${finalEval.label}**  ·  配当倍率 **×${finalEval.payMult}**`
-              : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
-      )
+      .setTitle(`🃏  ドロー  ·  保持 ${held.size}枚 / 交換 ${5 - held.size}枚`)
+      .setDescription([
+        cardsLine, HR_THIN,
+        phase === "draw" ? "保持したい札のボタンを押す（再押しで解除）→ **交換** で確定" : finalEval ? `**${finalEval.label}**  ·  配当倍率 **×${finalEval.payMult}**` : "",
+      ].filter(Boolean).join("\n"))
       .setFooter({ text: `賭け ${fmtEther(bet).replace(" Ld", "Ld")}` });
   };
 
-  const cardButtons = () =>
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      ...hand.map((c, i) =>
-        new ButtonBuilder()
-          .setCustomId(`poker:hold:${i}`)
-          .setLabel(showCard(c))
-          .setStyle(held.has(i) ? ButtonStyle.Success : ButtonStyle.Secondary),
-      ),
-    );
-  const actionRow = () =>
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("poker:draw").setLabel(`交換（${5 - held.size}枚）`).setEmoji("♻️").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("poker:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
-    );
+  const cardButtons = () => new ActionRowBuilder<ButtonBuilder>().addComponents(
+    ...hand.map((c, i) => new ButtonBuilder().setCustomId(`poker:hold:${i}`).setLabel(showCard(c)).setStyle(held.has(i) ? ButtonStyle.Success : ButtonStyle.Secondary)),
+  );
+  const actionRow = () => new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("poker:draw").setLabel(`交換（${5 - held.size}枚）`).setEmoji("♻️").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("poker:paytable").setLabel("📖 配当表").setStyle(ButtonStyle.Secondary),
+  );
 
   let reply: Message;
-  if (interaction.replied || interaction.deferred) {
-    reply = (await interaction.followUp({ embeds: [buildEmbed("draw")], components: [cardButtons(), actionRow()] })) as Message;
-  } else {
+  if (interaction.replied || interaction.deferred) reply = (await interaction.followUp({ embeds: [buildEmbed("draw")], components: [cardButtons(), actionRow()] })) as Message;
+  else {
     await interaction.reply({ embeds: [buildEmbed("draw")], components: [cardButtons(), actionRow()] });
     reply = (await interaction.fetchReply()) as Message;
   }
 
-  // ── ドローフェーズ: 保持選択 → 交換 ──
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
     const collector = reply.createMessageComponentCollector({
       componentType: ComponentType.Button,
       filter: (i) => i.user.id === uid && i.customId.startsWith("poker:"),
@@ -272,59 +206,39 @@ async function runRoundInner(
       }
       if (btn.customId.startsWith("poker:hold:")) {
         const idx = Number(btn.customId.split(":")[2]);
-        if (held.has(idx)) held.delete(idx);
-        else held.add(idx);
+        if (held.has(idx)) held.delete(idx); else held.add(idx);
         await btn.update({ embeds: [buildEmbed("draw")], components: [cardButtons(), actionRow()] });
       }
     });
     collector.on("end", (_c, reason) => {
-      if (reason !== "draw") {
+      if (reason === "draw") return;
+      if (reason === "time") {
         recordCasinoGameAbandonBestEffort(services, {
-          userId: uid,
-          game: "ポーカー",
-          operationId: interaction.id,
-          wager: bet,
-          source: playContext.source,
-          reason: "draw_timeout",
+          userId: uid, game: "ポーカー", operationId: interaction.id, wager: bet, source: playContext.source, reason: "draw_timeout",
         });
         resolve();
+        return;
       }
+      reject(new Error(`poker collector ended without timeout: ${reason}`));
     });
   });
 
-  // ── 交換 ──
-  for (let i = 0; i < hand.length; i++) {
-    if (!held.has(i)) hand[i] = deck.pop()!;
-  }
+  for (let i = 0; i < hand.length; i++) if (!held.has(i)) hand[i] = deck.pop()!;
   await reply.edit({ embeds: [buildEmbed("draw")], components: [] }).catch(() => undefined);
   await sleep(700);
 
-  // ── 判定 & 精算 ──
   const ev = evaluate(hand);
   const rawPayout = ev.payMult > 0 ? bet * ev.payMult : 0;
-  // お守りの消費も賭け・配当と同じグループの中（settleSolo）
   const settled = services.casino.settleSolo(uid, "ポーカー", bet, rawPayout, { operationId: interaction.id, reservationKey });
   recordCasinoGameFinishBestEffort(services, {
-    userId: uid,
-    game: "ポーカー",
-    operationId: interaction.id,
-    wager: bet,
-    payout: settled.payout,
-    net: settled.net,
-    source: playContext.source,
+    userId: uid, game: "ポーカー", operationId: interaction.id, wager: bet, payout: settled.payout, net: settled.net, source: playContext.source,
   });
-  const amulet = { note: settled.amuletNote };
+  const bonusBits: string[] = [];
+  if (settled.chainBonus > 0) bonusBits.push(`${settled.chainLabel} 連鎖 ×${settled.chainMult.toFixed(2)}（${settled.chainStreak}連勝）  ${fmtBigDelta(settled.chainBonus)}`);
+  if (settled.fukuTax > 0) bonusBits.push(`⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}%  ${fmtBigDelta(-settled.fukuTax)}`);
+  if (settled.amuletNote) bonusBits.push(`${E.sparkle} ${settled.amuletNote}`);
 
   const isJp = ev.category === 11;
-  const bonusBits: string[] = [];
-  if (settled.chainBonus > 0) {
-    bonusBits.push(`${settled.chainLabel} 連鎖 ×${settled.chainMult.toFixed(2)}（${settled.chainStreak}連勝）  ${fmtBigDelta(settled.chainBonus)}`);
-  }
-  if (settled.fukuTax > 0) {
-    bonusBits.push(`⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}%  ${fmtBigDelta(-settled.fukuTax)}`);
-  }
-  if (amulet.note) bonusBits.push(`${E.sparkle} ${amulet.note}`);
-
   const resultPayload = buildSoloResult({
     services,
     userId: uid,
@@ -339,20 +253,9 @@ async function runRoundInner(
     ],
   });
   const resultEmbed = resultPayload.embeds![0] as EmbedBuilder;
-  if (isJp) {
-    resultEmbed.setColor(C_JACKPOT).setTitle(`💎  ロイヤルフラッシュ  ${fmtBigDelta(settled.net)}`);
+  if (isJp) resultEmbed.setColor(C_JACKPOT).setTitle(`💎  ロイヤルフラッシュ  ${fmtBigDelta(settled.net)}`);
+  if (settled.net > 0) {
+    broadcastBigWin(interaction.client, services, { userId: uid, game: "ポーカー", bet, payout: settled.payout, isJackpot: isJp });
   }
-  const won = settled.net > 0;
-
-  if (won) {
-    broadcastBigWin(interaction.client, services, {
-      userId: uid,
-      game: "ポーカー",
-      bet,
-      payout: settled.payout,
-      isJackpot: ev.category === 11,
-    });
-  }
-
   await reply.edit({ embeds: [resultEmbed], components: resultPayload.components }).catch(() => undefined);
 }
