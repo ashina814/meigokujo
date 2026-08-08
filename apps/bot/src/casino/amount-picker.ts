@@ -1,4 +1,4 @@
-import {
+﻿import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -28,8 +28,11 @@ import {
 import { openingNotice, openingPhase } from "./opening.js";
 import { readAvailableWallet, type AvailableWalletSnapshot } from "./wallet.js";
 import { parseStrictPositiveInteger } from "./wager-input.js";
+import { startCasinoSoloGame } from "./play-route.js";
+import { recordCasinoMetricBestEffort } from "./metrics.js";
 
 export const CASINO_GAME_SELECT_CUSTOM_ID = "casino:home:game-select";
+export const CASINO_AMOUNT_PICK_PREFIX = "casino:amount:pick:";
 export const CASINO_AMOUNT_CUSTOM_PREFIX = "casino:amount:custom:";
 export const CASINO_AMOUNT_MODAL_PREFIX = "casino:amount:modal:";
 
@@ -79,10 +82,52 @@ export async function handleCasinoGameSelect(
     await interaction.reply({ content: "❌ 不明な遊びです。", flags: MessageFlags.Ephemeral });
     return;
   }
+  recordCasinoMetricBestEffort(services, {
+    eventKey: `game_pick:${interaction.id}`,
+    eventType: "game_pick",
+    userId: interaction.user.id,
+    game,
+    operationId: interaction.id,
+    payload: { game },
+  });
   await interaction.reply({
     ...renderCasinoAmountPicker(interaction.user.id, game, services),
     flags: MessageFlags.Ephemeral,
   });
+}
+
+export type CasinoAmountPickParse =
+  | { ok: true; game: CasinoSoloGame; amount: number }
+  | { ok: false };
+
+export function parseCasinoAmountPick(customId: string): CasinoAmountPickParse {
+  if (!customId.startsWith(CASINO_AMOUNT_PICK_PREFIX)) return { ok: false };
+  const parts = customId.split(":");
+  if (parts.length !== 5 || parts[0] !== "casino" || parts[1] !== "amount" || parts[2] !== "pick") return { ok: false };
+  const [, , , game, amountRaw] = parts;
+  if (!game || !isCasinoSoloGame(game)) return { ok: false };
+  const parsed = parseStrictPositiveInteger(amountRaw ?? "");
+  if (!parsed.ok) return { ok: false };
+  return { ok: true, game, amount: parsed.amount };
+}
+
+export async function handleCasinoAmountPickButton(interaction: ButtonInteraction, services: Services): Promise<void> {
+  const parsed = parseCasinoAmountPick(interaction.customId);
+  if (!parsed.ok) {
+    await interaction.reply({ content: "Invalid amount selection.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  recordCasinoMetricBestEffort(services, {
+    eventKey: `amount_pick:${interaction.id}`,
+    eventType: "amount_pick",
+    userId: interaction.user.id,
+    game: parsed.game,
+    source: "fixed",
+    operationId: interaction.id,
+    amount: parsed.amount,
+    payload: { game: parsed.game, amount: parsed.amount, source: "fixed" },
+  });
+  await startCasinoSoloGame(interaction, services, parsed.game, parsed.amount, { source: "amount" });
 }
 
 export async function handleCasinoAmountButton(interaction: ButtonInteraction, _services: Services): Promise<void> {
@@ -131,6 +176,17 @@ export async function handleCasinoAmountModal(
     return;
   }
 
+  recordCasinoMetricBestEffort(services, {
+    eventKey: `amount_pick:${interaction.id}`,
+    eventType: "amount_pick",
+    userId: interaction.user.id,
+    game,
+    source: "custom",
+    operationId: interaction.id,
+    amount: parsed.amount,
+    payload: { game, amount: parsed.amount, source: "custom" },
+  });
+
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`casino:play:${game}:${parsed.amount}`)
@@ -157,7 +213,7 @@ export function renderCasinoAmountPicker(
       ? `${amount.toLocaleString("ja-JP")} / 最大${chinchiroMaxPlayerLoss(amount).toLocaleString("ja-JP")}`
       : amount.toLocaleString("ja-JP");
     return new ButtonBuilder()
-      .setCustomId(`casino:play:${game}:${amount}`)
+      .setCustomId(`casino:amount:pick:${game}:${amount}`)
       .setLabel(label)
       .setStyle(disabled ? ButtonStyle.Secondary : ButtonStyle.Primary)
       .setDisabled(disabled);

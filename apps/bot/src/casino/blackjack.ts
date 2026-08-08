@@ -24,6 +24,13 @@ import {
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { buildSoloResult } from "./solo-result.js";
+import {
+  casinoPlayContext,
+  recordCasinoGameAbandonBestEffort,
+  recordCasinoGameFinishBestEffort,
+  recordCasinoGameStartBestEffort,
+  type CasinoPlayContext,
+} from "./metrics.js";
 
 /**
  * 🃏 ブラックジャック（対マモン・ソロ）。
@@ -95,6 +102,7 @@ export async function playBlackjack(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   betRaw: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
   if (!acquireSeat(uid)) {
@@ -108,7 +116,7 @@ export async function playBlackjack(
   try {
     const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "ブラックジャック");
     if (!check.ok) return;
-    await runRound(interaction, services, check.bet);
+    await runRound(interaction, services, check.bet, context);
   } finally {
     releaseSeat(uid);
   }
@@ -122,6 +130,7 @@ async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   let doubleAllowed = true;
   await withExplicitHouseReservation(
@@ -133,7 +142,7 @@ async function runRound(
       doubleAllowed = r.doubleAllowed;
       return r;
     },
-    (reservationKey) => runRoundInner(interaction, services, bet, reservationKey, doubleAllowed),
+    (reservationKey) => runRoundInner(interaction, services, bet, reservationKey, doubleAllowed, context),
   );
 }
 
@@ -144,8 +153,17 @@ async function runRoundInner(
   reservationKey: string,
   /** ダブルぶんの債務まで予約できたか。false ならダブルボタンだけ無効化する */
   doubleAllowed: boolean,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
+  const playContext = casinoPlayContext(context);
+  recordCasinoGameStartBestEffort(services, {
+    userId: uid,
+    game: "ブラックジャック",
+    operationId: interaction.id,
+    wager: bet,
+    source: playContext.source,
+  });
   const deck = newDeck(services.rng);
   const player: Card[] = [deck.pop()!, deck.pop()!];
   const dealer: Card[] = [deck.pop()!, deck.pop()!];
@@ -198,6 +216,15 @@ async function runRoundInner(
     // お守りの消費も賭け・配当と同じグループの中（settleSolo）。外で消すと精算が落ちたときお守りだけ消える
     const settled = services.casino.settleSolo(uid, "ブラックジャック", totalBet, rawPayout, {
       operationId: interaction.id, reservationKey,
+    });
+    recordCasinoGameFinishBestEffort(services, {
+      userId: uid,
+      game: "ブラックジャック",
+      operationId: interaction.id,
+      wager: totalBet,
+      payout: settled.payout,
+      net: settled.net,
+      source: playContext.source,
     });
     const amulet = { note: settled.amuletNote };
     const won = settled.net > 0;
@@ -267,6 +294,14 @@ async function runRoundInner(
       action = btn.customId.slice(3) as "hit" | "stand" | "double";
       await btn.deferUpdate();
     } catch {
+      recordCasinoGameAbandonBestEffort(services, {
+        userId: uid,
+        game: "ブラックジャック",
+        operationId: interaction.id,
+        wager: totalBet,
+        source: playContext.source,
+        reason: "action_timeout",
+      });
       action = "stand";
     }
 

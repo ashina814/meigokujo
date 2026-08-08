@@ -218,6 +218,23 @@ export {
   type PreheldWager,
 } from "./casino/service.js";
 export { Daily, type DailyClaim, type DailyClaimResult, type DailyOptions } from "./casino/daily.js";
+export {
+  CasinoMetrics,
+  CasinoMetricsError,
+  CASINO_METRIC_EVENT_TYPES,
+  casinoMetricDateForTesting,
+  type CasinoMetricEventType,
+  type CasinoMetricEventInput,
+  type CasinoMetricDailyRow,
+  type CasinoMetricsErrorCode,
+} from "./casino/metrics.js";
+export {
+  OPERATING_HOUSE_GROUPS,
+  EXCLUDED_HOUSE_GROUPS,
+  classifyHousePnlTx,
+  type HousePnlClassification,
+  type HousePnlChipTx,
+} from "./casino/house-pnl.js";
 export { Items, CONSUMABLES, getConsumableDef, type ItemKind as CasinoItemKind, type ConsumableDef, type ArmResult } from "./casino/items.js";
 export { Stocks, StockError, STOCK_HOLD_DAYS, STOCK_SELL_FEE_RATE, type Stock, type Holding, type StockErrorCode } from "./casino/stocks.js";
 export { Vip, type VipOptions, type VipJoinResult } from "./casino/vip.js";

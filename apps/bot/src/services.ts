@@ -25,6 +25,7 @@ import {
   ETHER_ESCROW,
   HOUSE_HOLDER,
   Casino,
+  CasinoMetrics,
   CasinoStatus,
   CasinoIntegrity,
   ChipTx,
@@ -149,6 +150,7 @@ export function buildServices() {
     items,
     reservations,
   });
+  const casinoMetrics = new CasinoMetrics(db, chipTx);
   const daily = new Daily(db, chips, events, {
     base: () => settings.getNumber("daily_base"),
     reliefThreshold: () => settings.getNumber("daily_relief_threshold"),
@@ -214,7 +216,7 @@ export function buildServices() {
   // 資金を動かす経路は `chips` に一本化した（PR8監査・項目12）。`ether` は
   // 旧名称で書かれた外部プラグイン・古い呼び出しが**読むだけ**なら壊れないように
   // 残す互換窓で、型を `ChipReadonlyView` に狭めてある（下の注釈参照）。
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, casino, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, casino, casinoMetrics, casinoStatus, casinoIntegrity, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;

@@ -528,6 +528,58 @@ describe("OpeningPlanner.dryRun — 未知テーブル・その他blocker", () =
     });
   });
 
+  it("casino_metric_events / casino_metric_daily は未知テーブルにも保護資産にもならない", () => {
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    ctx.db.exec(`
+      CREATE TABLE casino_metric_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_key TEXT NOT NULL UNIQUE,
+        event_type TEXT NOT NULL,
+        user_id TEXT,
+        game TEXT,
+        source TEXT,
+        operation_id TEXT,
+        wager INTEGER,
+        payout INTEGER,
+        net INTEGER,
+        amount INTEGER,
+        payload_json TEXT,
+        occurred_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE casino_metric_daily (
+        date TEXT PRIMARY KEY,
+        play_count INTEGER NOT NULL DEFAULT 0,
+        unique_users INTEGER NOT NULL DEFAULT 0,
+        total_wager INTEGER NOT NULL DEFAULT 0,
+        total_payout INTEGER NOT NULL DEFAULT 0,
+        house_pnl INTEGER NOT NULL DEFAULT 0,
+        table_fee_income INTEGER NOT NULL DEFAULT 0,
+        jackpot_delta INTEGER NOT NULL DEFAULT 0,
+        fuku_outflow INTEGER NOT NULL DEFAULT 0,
+        table_open_count INTEGER NOT NULL DEFAULT 0,
+        table_start_count INTEGER NOT NULL DEFAULT 0,
+        table_dispute_count INTEGER NOT NULL DEFAULT 0,
+        replay_rate_bps INTEGER,
+        revisit_rate_bps INTEGER,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    ctx.db
+      .prepare("INSERT INTO casino_metric_events (event_key, event_type, user_id, occurred_at, created_at) VALUES ('home_open:test','home_open','alice',1,1)")
+      .run();
+    ctx.db.prepare("INSERT INTO casino_metric_daily (date, updated_at) VALUES ('2026-01-01', 1)").run();
+
+    const result = ctx.planner.dryRun();
+
+    expect(result.unknownTables).not.toContain("casino_metric_events");
+    expect(result.unknownTables).not.toContain("casino_metric_daily");
+    expect(result.blockers).toEqual([]);
+    expect(result.protectedFindings.some((f) => f.sourceTable === "casino_metric_events" || f.sourceTable === "casino_metric_daily")).toBe(false);
+  });
+
   it("既にopening_v1が存在すればblocker", () => {
     const ctx = setup();
     seedLegacy(ctx);

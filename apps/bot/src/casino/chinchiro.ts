@@ -42,6 +42,13 @@ import {
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { buildSoloResult } from "./solo-result.js";
+import {
+  casinoPlayContext,
+  recordCasinoGameAbandonBestEffort,
+  recordCasinoGameFinishBestEffort,
+  recordCasinoGameStartBestEffort,
+  type CasinoPlayContext,
+} from "./metrics.js";
 
 /**
  * 🎲 チンチロ（対マモン・casino-bot 準拠の忠実移植）。
@@ -226,6 +233,7 @@ export async function playChinchiro(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   betRaw: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
   if (!acquireSeat(uid)) {
@@ -239,7 +247,7 @@ export async function playChinchiro(
   try {
     const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "チンチロ");
     if (!check.ok) return;
-    await runRound(interaction, services, check.bet);
+    await runRound(interaction, services, check.bet, context);
   } finally {
     releaseSeat(uid);
   }
@@ -326,6 +334,7 @@ async function runRound(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   await withHouseReservation(interaction, services, "チンチロ", bet, interaction.id, async (reservationKey) => {
     const uid = interaction.user.id;
@@ -355,7 +364,7 @@ async function runRound(
     // ここから先の例外（Discordの表示失敗・collectorタイムアウト・利用者の中止）は、
     // 精算が確定する前なら事前預託をそのまま返す。精算後の例外では refund は no-op。
     try {
-      await runRoundInner(interaction, services, bet, reservationKey);
+      await runRoundInner(interaction, services, bet, reservationKey, context);
     } catch (error) {
       refundChinchiroPreholdOnFailure(services, sessionId, error);
     }
@@ -367,8 +376,17 @@ async function runRoundInner(
   services: Services,
   bet: number,
   reservationKey: string,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
+  const playContext = casinoPlayContext(context);
+  recordCasinoGameStartBestEffort(services, {
+    userId: uid,
+    game: "チンチロ",
+    operationId: interaction.id,
+    wager: bet,
+    source: playContext.source,
+  });
   const startEmbed = new EmbedBuilder()
     .setTitle("🎲 チンチロ")
     .setColor(C_MAMMON)
@@ -470,7 +488,17 @@ async function runRoundInner(
           }
         });
         collector.on("end", (_c, reason) => {
-          if (reason !== "stop" && reason !== "reroll") resolve("stop"); // 時間切れは保守的に止める
+          if (reason !== "stop" && reason !== "reroll") {
+            recordCasinoGameAbandonBestEffort(services, {
+              userId: uid,
+              game: "チンチロ",
+              operationId: interaction.id,
+              wager: bet,
+              source: playContext.source,
+              reason: "reroll_timeout",
+            });
+            resolve("stop"); // 時間切れは保守的に止める
+          }
         });
       });
       if (choice === "stop") {
@@ -581,6 +609,15 @@ async function runRoundInner(
     netForDisplay = settled.payout - bet;
     payoutText = settled.payout > 0 ? `🛡 返金 ${fmtEther(settled.payout)}` : `💸 -${fmtEther(bet)}`;
   }
+  recordCasinoGameFinishBestEffort(services, {
+    userId: uid,
+    game: "チンチロ",
+    operationId: interaction.id,
+    wager: bet,
+    payout: settled.payout,
+    net: netForDisplay,
+    source: playContext.source,
+  });
 
   const resultLabel =
     cmp.result === "player_win" ? "✨ **お前の勝ち！**" : cmp.result === "push" ? "🌀 **プッシュ**" : "😈 **マモンの勝ち**";

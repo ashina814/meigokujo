@@ -132,6 +132,17 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
+    if (now.hour === 3 && now.minute < 3 && services.chipTx.openingPhase() === "formal") {
+      const marker = `casino_metrics:maintenance:${now.dateStr}`;
+      if (!services.settings.getString(marker)) {
+        await runSchedulerTaskOnce(services, marker, "system:scheduler", () => {
+          const result = services.casinoMetrics.runDailyMaintenance({ maxDays: 90 });
+          if (result.skipped) throw new Error("casino_metrics:maintenance_skipped");
+          console.log(`[casino-metrics] maintenance dates=${result.dates.length} chipEvents=${result.chipEvents} pruned=${result.pruned}`);
+        }).catch((e) => console.error("[casino-metrics] maintenance failed", e));
+      }
+    }
+
     // ── 説明会の案内: 実際の開催予定の 5分前に入城案内chへ通知 ──
     // 通常枠は settings、休止・臨時追加は entry_session_overrides。合成は SessionCalendar が持ち、
     // ここは「その枠が本当に開催されるか」だけを訊く（休止した枠を案内しない・臨時枠は案内する）。

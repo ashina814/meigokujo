@@ -351,6 +351,30 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "service.ts。/賭場ホームの再戦ショートカット用非金融メタデータ。正式開業時には旧制度のlast game/amountを持ち越さず初期化する。",
   }),
   T({
+    table: "casino_metric_events",
+    purpose: "casino usage metric raw events",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "/casino home and play funnel optional analytics. Raw metrics are non-financial metadata and are reset at formal opening.",
+  }),
+  T({
+    table: "casino_metric_daily",
+    purpose: "casino usage metric daily aggregates",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "Daily aggregate analytics derived from raw/formal chip records. Old metrics are not carried across formal opening.",
+  }),
+  T({
     table: "casino_items",
     purpose: "利用者所持アイテム",
     kind: "optional_feature",

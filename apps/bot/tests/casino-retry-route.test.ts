@@ -185,6 +185,6 @@ describe("casino retry route", () => {
 
     expect(interaction.reply).not.toHaveBeenCalled();
     expect(interaction.deferUpdate).toHaveBeenCalledOnce();
-    expect(startCasinoSoloGameMock).toHaveBeenCalledWith(interaction, services, game, 500);
+    expect(startCasinoSoloGameMock).toHaveBeenCalledWith(interaction, services, game, 500, { source: "retry" });
   });
 });

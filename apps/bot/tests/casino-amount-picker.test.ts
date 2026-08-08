@@ -122,8 +122,8 @@ describe("賭場ホームの遊び・金額選択", () => {
     const payload = renderCasinoAmountPicker("u1", "丁半", fakeServices({ land: 300, free: 300, escrowed: 10_000 }));
     const actionButtons = buttons(payload);
     expect(actionButtons.map((b) => b.label)).toEqual(["100", "500", "2,000", "10,000", "自由入力"]);
-    expect(actionButtons.find((b) => b.custom_id === "casino:play:丁半:500")?.disabled).toBe(false);
-    expect(actionButtons.find((b) => b.custom_id === "casino:play:丁半:2000")?.disabled).toBe(true);
+    expect(actionButtons.find((b) => b.custom_id === "casino:amount:pick:丁半:500")?.disabled).toBe(false);
+    expect(actionButtons.find((b) => b.custom_id === "casino:amount:pick:丁半:2000")?.disabled).toBe(true);
     expect(embedsDescription(payload)).toContain("所持 600 Ld");
     expect(embedsDescription(payload)).toContain("預け中 10,000 Ld");
     expect(embedsDescription(payload)).not.toContain("10,600 Ld");
@@ -153,8 +153,8 @@ describe("賭場ホームの遊び・金額選択", () => {
 
   it("胴元上限を超える固定金額はdisabledになり、上限確認失敗時はfail-closedになる", () => {
     const capped = renderCasinoAmountPicker("u1", "丁半", fakeServices({ land: 10_000, free: 10_000, maxLiability: 469 }));
-    expect(buttons(capped).find((b) => b.custom_id === "casino:play:丁半:100")?.disabled).toBe(false);
-    expect(buttons(capped).find((b) => b.custom_id === "casino:play:丁半:500")?.disabled).toBe(true);
+    expect(buttons(capped).find((b) => b.custom_id === "casino:amount:pick:丁半:100")?.disabled).toBe(false);
+    expect(buttons(capped).find((b) => b.custom_id === "casino:amount:pick:丁半:500")?.disabled).toBe(true);
 
     const closed = renderCasinoAmountPicker("u1", "丁半", fakeServices({ capacityThrows: true }));
     expect(buttons(closed).every((b) => b.disabled === true)).toBe(true);
@@ -163,11 +163,11 @@ describe("賭場ホームの遊び・金額選択", () => {
 
   it("チンチロはcoreの最大損失2倍で所持額を判定する", () => {
     const short = renderCasinoAmountPicker("u1", "チンチロ", fakeServices({ land: 999, free: 0 }));
-    expect(buttons(short).find((b) => b.custom_id === "casino:play:チンチロ:500")?.disabled).toBe(true);
-    expect(buttons(short).find((b) => b.custom_id === "casino:play:チンチロ:500")?.label).toContain("最大1,000");
+    expect(buttons(short).find((b) => b.custom_id === "casino:amount:pick:チンチロ:500")?.disabled).toBe(true);
+    expect(buttons(short).find((b) => b.custom_id === "casino:amount:pick:チンチロ:500")?.label).toContain("最大1,000");
 
     const exact = renderCasinoAmountPicker("u1", "チンチロ", fakeServices({ land: 1_000, free: 0 }));
-    expect(buttons(exact).find((b) => b.custom_id === "casino:play:チンチロ:500")?.disabled).toBe(false);
+    expect(buttons(exact).find((b) => b.custom_id === "casino:amount:pick:チンチロ:500")?.disabled).toBe(false);
   });
 
   it("停止中・未知版・帳簿異常は正常な金額操作として表示しない", () => {

@@ -40,6 +40,12 @@ import {
 import { C_MAMMON } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { buildSoloResult } from "./solo-result.js";
+import {
+  casinoPlayContext,
+  recordCasinoGameFinishBestEffort,
+  recordCasinoGameStartBestEffort,
+  type CasinoPlayContext,
+} from "./metrics.js";
 
 /**
  * 🎰 スロット。casino-bot 準拠。数値モデルは core/casino/slots-model へ委譲。
@@ -140,6 +146,7 @@ export async function playSlots(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   betRaw: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
   if (!acquireSeat(uid)) {
@@ -155,7 +162,7 @@ export async function playSlots(
     await settleLeftoverFreeSpins(interaction, services, uid);
     const check = await validateBet(interaction as ChatInputCommandInteraction, services, betRaw, "スロット");
     if (!check.ok) return;
-    await runPaidSpin(interaction, services, check.bet);
+    await runPaidSpin(interaction, services, check.bet, context);
   } finally {
     releaseSeat(uid);
   }
@@ -166,6 +173,7 @@ async function runPaidSpin(
   interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
   bet: number,
+  context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   // **先に1セットぶん（有料 + フリースピン1回）の債務を予約**してから回す（PR5・正本 §11.2）。
   // 予約鍵は精算グループ鍵と別。精算グループ鍵にすると有料スピンの精算で解放され、
@@ -176,8 +184,16 @@ async function runPaidSpin(
     "スロット",
     (uid) => reserveSlotsLiability(services, uid, bet, interaction.id),
     async (reservationKey) => {
+      const playContext = casinoPlayContext(context);
+      recordCasinoGameStartBestEffort(services, {
+        userId: interaction.user.id,
+        game: "スロット",
+        operationId: interaction.id,
+        wager: bet,
+        source: playContext.source,
+      });
       const record = spinPaid(services, interaction.user.id, bet, interaction.id);
-      await renderSpin(interaction, services, bet, record, false, reservationKey);
+      await renderSpin(interaction, services, bet, record, false, reservationKey, playContext);
     },
   );
 }
@@ -492,6 +508,8 @@ async function renderSpin(
   isFreeSpin: boolean,
   /** この操作の予約鍵（PR5）。続けて回す無料スピンはこの予約の範囲で払う */
   reservationKey?: string,
+  context?: CasinoPlayContext,
+  originPaid?: SpinRecord,
 ): Promise<void> {
   const uid = interaction.user.id;
 
@@ -565,6 +583,20 @@ async function renderSpin(
   const won = adjustedPayout > 0;
   const totalPayout = adjustedPayout + jpWon + (settled?.chainBonus ?? 0) - (settled?.fukuTax ?? 0);
   const net = totalPayout - (isFreeSpin ? 0 : bet);
+  const paidTotalPayout = originPaid
+    ? originPaid.payout + originPaid.jpWon + (originPaid.settled?.chainBonus ?? 0) - (originPaid.settled?.fukuTax ?? 0)
+    : totalPayout;
+  if (!record.pendingFreeSpin) {
+    recordCasinoGameFinishBestEffort(services, {
+      userId: uid,
+      game: "スロット",
+      operationId: interaction.id,
+      wager: bet,
+      payout: originPaid ? paidTotalPayout + totalPayout : totalPayout,
+      net: originPaid ? paidTotalPayout + totalPayout - bet : totalPayout - bet,
+      source: context?.source ?? "advanced",
+    });
+  }
   const stats = services.casino.stats(uid);
   const winStreak = won ? stats.current_win_streak : 0;
 
@@ -616,7 +648,7 @@ async function renderSpin(
     await sleep(2500);
     try {
       const free = resolveFreeSpin(services, record.pendingFreeSpin, reservationKey);
-      await renderSpin(interaction, services, bet, free, true, reservationKey);
+      await renderSpin(interaction, services, bet, free, true, reservationKey, context, record);
     } catch {
       // 胴元不足・賭場停止など。**権利は pending のまま残っている**
       await interaction
