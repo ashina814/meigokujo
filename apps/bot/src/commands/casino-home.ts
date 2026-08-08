@@ -11,24 +11,14 @@ import {
 import { fmtLd } from "../format.js";
 import { C_JACKPOT, C_MAMMON, E } from "../casino/ui.js";
 import { checkRetry } from "../casino/common.js";
+import { renderCasinoGameSelect } from "../casino/amount-picker.js";
+import { CASINO_SOLO_GAME_EMOJI, isCasinoSoloGame } from "../casino/games.js";
 import { openingNotice, openingPhase, operatingLabel } from "../casino/opening.js";
 import { readAvailableWallet } from "../casino/wallet.js";
 import type { Services } from "../services.js";
 
 const DEFAULT_GAME = "スロット";
 const DEFAULT_BET = 100;
-
-const GAME_EMOJI: Readonly<Record<string, string>> = {
-  スロット: "🎰",
-  丁半: "🎲",
-  クラッシュ: "📈",
-  チンチロ: "🎲",
-  ブラックジャック: "🃏",
-  ポーカー: "🃏",
-  ホールデム: "🃏",
-};
-
-const PLAYABLE_HOME_GAMES = new Set(Object.keys(GAME_EMOJI));
 
 export const casinoHomeCommand = new SlashCommandBuilder()
   .setName("賭場")
@@ -52,11 +42,7 @@ export async function handleCasinoHomeButton(interaction: ButtonInteraction, ser
   }
   if (interaction.customId === "casino:home:games") {
     await interaction.reply({
-      content: [
-        "**遊びを選ぶ**",
-        "`/遊ぶ スロット` `/遊ぶ 丁半` `/遊ぶ クラッシュ` `/遊ぶ チンチロ` `/遊ぶ ブラックジャック` `/遊ぶ ポーカー` `/遊ぶ ホールデム`",
-        "金額選択画面は PR16 で整えます。いまは既存の `/遊ぶ` ルートを使ってください。",
-      ].join("\n"),
+      ...renderCasinoGameSelect(),
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -213,12 +199,12 @@ function dailyState(
 
 function primaryAction(userId: string, services: Services): { label: string; emoji: string; customId: string } {
   const pref = services.casino.homePreference(userId);
-  if (pref && PLAYABLE_HOME_GAMES.has(pref.last_game)) {
+  if (pref && isCasinoSoloGame(pref.last_game)) {
     const retry = checkRetry(services, userId, pref.last_amount, pref.last_game);
     if (retry.ok) {
       return {
         label: `${pref.last_game} ${pref.last_amount.toLocaleString("ja-JP")} Ldでもう一度`,
-        emoji: GAME_EMOJI[pref.last_game] ?? "🎰",
+        emoji: CASINO_SOLO_GAME_EMOJI[pref.last_game] ?? "🎰",
         customId: `casino:play:${pref.last_game}:${pref.last_amount}`,
       };
     }

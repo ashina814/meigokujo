@@ -7,6 +7,8 @@ import { playChinchiro } from "./chinchiro.js";
 import { playBlackjack } from "./blackjack.js";
 import { playPoker } from "./poker.js";
 import { playHoldem } from "./holdem.js";
+import { isCasinoSoloGame, type CasinoSoloGame } from "./games.js";
+import { parseStrictPositiveInteger } from "./wager-input.js";
 
 /**
  * `casino:play:<ゲーム>:<額>` の入口（PR5）。
@@ -15,7 +17,7 @@ import { playHoldem } from "./holdem.js";
  * そのボタンは**新しい ephemeral メッセージ**に付くので、各ゲームのコレクタでは拾えない。
  * ここを全体のボタン経路に置いて、どのメッセージからでも同じ入口へ入れるようにする。
  */
-const PLAYERS: Readonly<Record<string, (i: ButtonInteraction, s: Services, bet: number) => Promise<void>>> = {
+const PLAYERS: Readonly<Record<CasinoSoloGame, (i: ButtonInteraction, s: Services, bet: number) => Promise<void>>> = {
   スロット: playSlots,
   丁半: playChohan,
   クラッシュ: playCrash,
@@ -29,13 +31,25 @@ export function isCasinoPlayButton(customId: string): boolean {
   return customId.startsWith("casino:play:");
 }
 
+export type CasinoPlayButtonParse =
+  | { ok: true; game: CasinoSoloGame; amount: number }
+  | { ok: false };
+
+export function parseCasinoPlayButton(customId: string): CasinoPlayButtonParse {
+  const parts = customId.split(":");
+  if (parts.length !== 4 || parts[0] !== "casino" || parts[1] !== "play") return { ok: false };
+  const [, , game, amountRaw] = parts;
+  if (!game || !isCasinoSoloGame(game)) return { ok: false };
+  const parsed = parseStrictPositiveInteger(amountRaw ?? "");
+  if (!parsed.ok) return { ok: false };
+  return { ok: true, game, amount: parsed.amount };
+}
+
 export async function handleCasinoPlayButton(interaction: ButtonInteraction, services: Services): Promise<void> {
-  const [, , game, betRaw] = interaction.customId.split(":");
-  const play = game ? PLAYERS[game] : undefined;
-  const bet = Number(betRaw);
-  if (!play || !Number.isFinite(bet)) {
+  const parsed = parseCasinoPlayButton(interaction.customId);
+  if (!parsed.ok) {
     await interaction.reply({ content: "❌ 不明な卓だ。", flags: MessageFlags.Ephemeral });
     return;
   }
-  await play(interaction, services, Math.floor(bet));
+  await PLAYERS[parsed.game](interaction, services, parsed.amount);
 }
