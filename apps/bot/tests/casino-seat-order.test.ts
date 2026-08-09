@@ -60,6 +60,14 @@ function fakeServices(opts: { validationThrows?: boolean } = {}) {
     chipAssets: {
       freeChips: () => 0,
     },
+    dailyRisk: {
+      maxBetForPlayerLoss: (_userId: string, _lossPerBet: (bet: number) => number, cap: number) => cap,
+      authorizeSoloStart: vi.fn(),
+      dayFor: () => ({ lossCap: 1_000_000, remainingLossBudget: 1_000_000 }),
+    },
+    persistentTables: {
+      participantHasLiveTable: () => false,
+    },
   } as unknown as Services;
 
   return { services, ensureFreeChips, availableForLiability, isVip };
@@ -83,7 +91,7 @@ describe("solo game public entry seat ordering", () => {
       const { services, ensureFreeChips, availableForLiability, isVip } = fakeServices();
 
       releaseSeat(uid);
-      expect(acquireSeat(uid)).toBe(true);
+      expect(acquireSeat(services, uid)).toBe(true);
       try {
         await play(interaction, services, 500);
       } finally {

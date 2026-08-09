@@ -5,6 +5,7 @@ import { ChipTxError } from "./chip-tx.js";
 import { escrowHolderFor } from "./escrow.js";
 import type { Items } from "./items.js";
 import type { HouseReservations } from "./reservations.js";
+import type { DailyRisk } from "./daily-risk.js";
 
 /**
  * マモンの賭場の共通土台。
@@ -156,7 +157,28 @@ export interface SettleOptions {
    */
   reservationKey?: string;
   preheld?: PreheldWager;
+  /**
+   * この精算がどの日次リスク枠に属するかの明示（PR23 レビュー BLOCKER C・§16）。
+   *
+   * 省略時は `{ kind: "solo" }`。`Casino.settle()` を通る精算は**すべて**賭博なので、
+   * 「リスク対象外」という選択肢は用意していない。新しいゲームが枠取りを忘れた場合は
+   * `DailyRisk` が `ERR_DAILY_RISK_AUTH_MISSING` で落とし、資金ごと巻き戻る。
+   * 「ゲームは成立するが日次上限だけ無視される」状態を構造的に作れないようにするための型。
+   *
+   * VIP・商店・通常送金・預入/払戻・日次配布などの非賭博操作はそもそも
+   * `Casino.settle()` を通らない（それぞれ専用の資金経路を持つ）。
+   */
+  risk?: CasinoRiskBinding;
 }
+
+/**
+ * 精算1回とリスク枠の結び付け方。
+ * - `solo`: `DailyRisk.authorizeSoloStart()` で取った枠へ帰属（既定）。
+ *   スロットのように精算の `operationId` が開始時のものと違う（`<id>:paid` など）
+ *   ゲームは `startOperationId` で開始枠を明示する。
+ * - `exposure`: ルーレット卓のように `DailyRisk.authorizeExposure()` で取った卓枠へ帰属
+ */
+export type CasinoRiskBinding = { kind: "solo"; startOperationId?: string } | { kind: "exposure"; scopeKey: string };
 
 export interface SettleResult {
   /** 賭け額 */
@@ -196,6 +218,7 @@ export interface CasinoOptions {
    * トランザクション内で解放する。渡さない場合は予約なしとして動く（移植前の経路・テスト）。
    */
   reservations?: HouseReservations;
+  dailyRisk?: DailyRisk;
 }
 
 /** ソロゲーム1回の結果。精算結果に「お守りが何をしたか」を添えたもの */
@@ -217,6 +240,7 @@ export class Casino {
   private readonly fukuScaleOpt: number | (() => number);
   private readonly items?: Items;
   private readonly reservations?: HouseReservations;
+  private readonly dailyRisk?: DailyRisk;
 
   constructor(
     private readonly db: Database.Database,
@@ -227,6 +251,7 @@ export class Casino {
     this.fukuScaleOpt = options.fukuScale ?? 10;
     this.items = options.items;
     this.reservations = options.reservations;
+    this.dailyRisk = options.dailyRisk;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS casino_stats (
         user_id             TEXT PRIMARY KEY,
@@ -431,6 +456,9 @@ export class Casino {
       if (opts.reservationKey) this.reservations?.release(opts.reservationKey);
       const effectivePayout = payout + chainBonus - fukuTax;
       const net = effectivePayout - bet;
+      // 日次リスクの確定は**この資金トランザクションの中**。枠が無ければここで落ちて、
+      // 賭け徴収・配当・予約解放まで丸ごと巻き戻る（fail-closed）
+      this.recordRisk(userId, net, opts);
       // 戦績には**実際に残高が動いた額**を渡す（PR3）。素の payout を渡していたので、
       // 連鎖ボーナスは通算損益に乗らず、福の重みは引かれていなかった。
       // JP積立は胴元 → JP の移動なので利用者の損益には関係しない
@@ -451,6 +479,17 @@ export class Casino {
         jackpotUnfunded,
       };
     });
+  }
+
+  /** 精算の純損益を日次リスク枠へ確定する（`settle()` の資金トランザクション内から呼ぶ） */
+  private recordRisk(userId: string, net: number, opts: SettleOptions): void {
+    if (!this.dailyRisk) return;
+    const binding: CasinoRiskBinding = opts.risk ?? { kind: "solo" };
+    if (binding.kind === "exposure") {
+      this.dailyRisk.settleExposure({ scopeKey: binding.scopeKey, userId, operationId: opts.operationId, netSigned: net });
+      return;
+    }
+    this.dailyRisk.recordSoloResult({ userId, operationId: binding.startOperationId ?? opts.operationId, netSigned: net });
   }
 
   /**

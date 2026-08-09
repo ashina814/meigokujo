@@ -63,7 +63,12 @@ function setup(rng = scriptedRng([0.5])) {
   const casino = new Casino(db, ether, events, { items, reservations });
   const vip = new Vip(db, ether, events);
   const freeSpins = new FreeSpins(db);
-  const services = { db, ether, chips: ether, chipTx, casino, items, vip, reservations, freeSpins, events, rng } as unknown as Services;
+  const dailyRisk = {
+    maxBetForPlayerLoss: (_userId: string, _lossPerBet: (bet: number) => number, cap: number) => cap,
+    authorizeSoloStart: () => undefined,
+    dayFor: () => ({ lossCap: 1_000_000, remainingLossBudget: 1_000_000 }),
+  };
+  const services = { db, ether, chips: ether, chipTx, casino, items, vip, reservations, freeSpins, events, rng, dailyRisk } as unknown as Services;
   return { db, ledger, ether, casino, items, vip, reservations, freeSpins, services };
 }
 

@@ -15,9 +15,13 @@ import {
   type CasinoRng,
   FORMAL_OPENING_VERSION,
   CHIP_ESCROW,
+  CasinoChipAssets,
+  DailyRisk,
+  isPlayerHolder,
 } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 import { acceptRouletteBet, settleRoulette, voidRouletteTable } from "../src/casino/roulette.js";
+import { resetTransientParticipationForTesting } from "../src/casino/participation.js";
 
 registerDefaultTxTypes();
 
@@ -44,16 +48,40 @@ function setup(rng: CasinoRng = scriptedRng([0.5])) {
   const items = new Items(db);
   const reservations = new HouseReservations(db, ether, events);
   ether.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
-  const casino = new Casino(db, ether, events, { items, reservations });
+  const chipAssets = new CasinoChipAssets(db, ether);
+  // PR23: ルーレットも日次リスク（所持50%・当日純損失上限・同時参加排他）を通る
+  const dailyRisk = new DailyRisk(db, ledger, chipAssets);
+  const casino = new Casino(db, ether, events, { items, reservations, dailyRisk });
   const escrow = new Escrow(db, ether, events);
-  const services = { db, ether, chips: ether, chipTx, casino, items, escrow, reservations, rng, events } as unknown as Services;
-  return { db, ether, casino, items, escrow, reservations, services };
+  const services = {
+    db, ether, chips: ether, chipTx, casino, items, escrow, reservations, rng, events, ledger, chipAssets, dailyRisk,
+    persistentTables: { participantHasLiveTable: () => false },
+  } as unknown as Services;
+  // 一時参加はプロセス内 Map なのでテスト間で持ち越さない
+  resetTransientParticipationForTesting();
+  return { db, ledger, ether, casino, items, escrow, reservations, dailyRisk, services };
+}
+
+/** 通常Land の残高を用意する（所持 = 通常Land + 自由チップ） */
+function seedLand(db: ReturnType<typeof openDb>, userId: string, amount: number): void {
+  ensureLandAccount(db, userId);
+  db.prepare(
+    "INSERT INTO balances (account_id, amount, updated_at) VALUES (?, ?, 1) ON CONFLICT(account_id) DO UPDATE SET amount = excluded.amount",
+  ).run(`user:${userId}`, amount);
 }
 
 function seed(db: ReturnType<typeof openDb>, holder: string, amount: number): void {
   db.prepare(
     "INSERT INTO ether_balances (user_id, amount, updated_at) VALUES (?, ?, 1) ON CONFLICT(user_id) DO UPDATE SET amount = excluded.amount",
   ).run(holder, amount);
+  // 利用者の自由チップは Land 口座の存在が前提（chip-assets が帰属を確認する）。
+  // 胴元など非利用者の holder に user: 口座を作ると帳簿検証が壊れるので作らない
+  if (isPlayerHolder(holder)) ensureLandAccount(db, holder);
+}
+
+function ensureLandAccount(db: ReturnType<typeof openDb>, userId: string): void {
+  db.prepare("INSERT INTO accounts (id, kind, status, created_at) VALUES (?, 'user', 'active', 1) ON CONFLICT(id) DO NOTHING").run(`user:${userId}`);
+  db.prepare("INSERT INTO balances (account_id, amount, updated_at) VALUES (?, 0, 1) ON CONFLICT(account_id) DO NOTHING").run(`user:${userId}`);
 }
 
 const RESERVATION_KEY = (session: string) => `roulette:reserve:${session}`;
@@ -142,7 +170,10 @@ describe("acceptRouletteBet: 卓全体の債務を原子的に予約する", () 
   it("残高不足でエスクローへ預けられなければ broke で断り、状態は変わらない", () => {
     const c = setup();
     seed(c.db, HOUSE_HOLDER, 1_000_000);
-    seed(c.db, "alice", 500); // 賭け額 1,000 に届かない
+    seed(c.db, "alice", 500); // 自由チップは賭け額 1,000 に届かない
+    // 所持（通常Land + 自由チップ）は十分にあるので PR23 の安全上限は通り、
+    // エスクローへ預ける段で初めて足りないと分かる経路を見る
+    seedLand(c.db, "alice", 100_000);
     const session = "roulette:s1";
     const bets = new Map();
 

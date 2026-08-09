@@ -10,23 +10,55 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import { HOUSE_HOLDER, JACKPOT_HOLDER } from "@meigokujo/core";
+import { DailyRiskError, JACKPOT_HOLDER } from "@meigokujo/core";
 import type { Services } from "../services.js";
 import { fmtEther } from "../format.js";
+import { acquireTransientParticipation, releaseTransientParticipation } from "./participation.js";
 import { C_LOSE, C_MAMMON, C_WIN } from "./ui.js";
-
-/**
- * session を渡さない旧方式で資金が置かれる場所。
- *
- * 以前は `stakeHolder(session?)` という分岐関数だったが、呼び出しは2箇所とも
- * `stakeHolder(undefined)` で、session がある経路は先に `escrow.settle()` へ抜けていた。
- * 通らない分岐を持つと「session を渡せばここも切り替わる」と読めてしまうので、
- * 旧経路の置き場だけを名前で示す（PR3 の死んだコード整理）。
- */
-const LEGACY_STAKE_HOLDER = HOUSE_HOLDER;
 
 /** 1v1 PvP ゲームが受け取る interaction（/勝負 直叩き or 再戦ボタン経由） */
 export type PvpInteraction = ChatInputCommandInteraction | ButtonInteraction;
+
+/**
+ * `/勝負` の対人卓のリスク枠の名前（PR23）。
+ *
+ * 常設順位卓（`RankedTables`）とは別のシステムだが、**現役のマモン賭博入口**なので
+ * 正本 §15 の安全上限（同時参加1卓・所持50%・日次純損失上限）を同じ `DailyRisk` へ通す。
+ * ここで変えるのは参加可否と上限だけで、場代の行き先・配当・勝敗判定・RTP は一切触らない。
+ */
+export function pvpRiskScope(session: string): string {
+  return `pvp:${session}`;
+}
+
+/**
+ * 徴収の結果。
+ *
+ * `false` を返すだけだと「なぜ弾かれたか」を客に言えないので、PR23 で理由付きにした。
+ * `risk` は正本 §15 の安全上限（同時参加・所持50%・日次純損失上限）に当たった場合で、
+ * この時点で資金は1 Ld も動いていない。
+ */
+export type CollectStakesResult =
+  | { ok: true }
+  | { ok: false; reason: "broke" }
+  | { ok: false; reason: "risk"; userId: string; detail: string };
+
+/** 徴収失敗をそのまま客に見せる文面にする */
+export function stakeFailureText(result: CollectStakesResult): string {
+  if (result.ok) return "";
+  if (result.reason === "risk") return `<@${result.userId}> は勝負を始められない。${result.detail}`;
+  return "どちらかのLand残高が足りない。";
+}
+
+/** PR23 の安全上限に弾かれた（資金は1 Ld も動いていない）。`collectStakes` の内部シグナル */
+class PvpRiskRejectedError extends Error {
+  constructor(
+    readonly userId: string,
+    readonly detail: string,
+  ) {
+    super(`ERR_PVP_RISK: ${userId}`);
+    this.name = "PvpRiskRejectedError";
+  }
+}
 
 /**
  * PvP ゲームの共通経済ルール。
@@ -109,86 +141,183 @@ export function buildPvpResult(opts: {
 }
 
 /**
- * 両者から bet を徴収して house 一時保管。全員から取れなかったら false（取った分は戻す）。
- * session を渡すとエスクロー台帳に記録され、再起動時に自動返金される（推奨）。
+ * 参加者から bet を徴収してエスクローへ預ける。全員から取れなかったら false（取った分は戻る）。
+ *
+ * ## PR23: 資金を動かす前に安全上限を通す
+ *
+ * 徴収の**前**に、参加者ごとに
+ *
+ * 1. 一時参加の排他（順位卓 live / ソロ席 / 他の対人卓 / ルーレット卓）
+ * 2. 所持Landの50%（= 通常Land + 自由チップ。エスクローは含めない）
+ * 3. 当日の残り許容損失
+ *
+ * を確認して露出を確保する。この対人卓での参加者の最大損失は**預ける賭け金そのもの**
+ * （既存の徴収額から一意に決まる。ゲームごとの倍率表は作らない）。多人数丁半の
+ * 増し賭けのように同じ卓で積み増す徴収は `add` で合算して判定する。
+ *
+ * 誰か1人でも通らなければ、**誰の資金も動かさず**に false を返す（§12）。
  */
 export function collectStakes(
   services: Services,
   userIds: string[],
   bet: number,
   operationId: string,
-  session?: string,
+  session: string,
   game = "pvp",
-): boolean {
-  // 新方式（session あり）: 事前の残高確認も含めて **全員ぶんで1グループ**。
-  // 途中で足りない人がいれば、先に取った人の分もグループごと巻き戻る
-  if (session) return services.escrow.holdAll(session, userIds, bet, game, operationId);
-
-  // 旧方式（session なし・レガシー呼び出し互換）: house へ直接。こちらも1グループ
+): CollectStakesResult {
+  const scope = pvpRiskScope(session);
+  const acquired: string[] = [];
+  const authorized: string[] = [];
   try {
-    return services.chips.runGroup(
-      { groupKey: `pvp:collect:${game}:${operationId}`, kind: "table_hold", actorId: "system:pvp" },
-      (): boolean => {
-        // 残高確認もグループの中（徴収成功後の再試行を残高不足で false にしない）
-        for (const u of userIds) {
-          if (services.chips.balanceOf(u) < bet) throw new StakeShortfall();
-        }
-        // 通算損益はここでは動かさない（PR3）。徴収は「まだ何も確定していない」状態で、
-        // 対局中なのに通算負けが増えるのは定義に合わない。記録は精算のとき一度だけ
-        for (const u of userIds) services.chips.transfer(u, HOUSE_HOLDER, bet, { reason: "対人戦の賭け金", game });
-        return true;
-      },
-    );
+    for (const u of userIds) {
+      if (!acquireTransientParticipation(services, u, "pvp", scope, { reentrant: true })) {
+        throw new PvpRiskRejectedError(u, "ほかの卓に着いている。そちらを終わらせてからだ。");
+      }
+      acquired.push(u);
+    }
+    for (const u of userIds) {
+      try {
+        services.dailyRisk.authorizeExposure({
+          userId: u,
+          scopeKey: scope,
+          operationId: `${operationId}:${u}`,
+          game,
+          maxPlayerLoss: bet,
+          mode: "add",
+        });
+      } catch (e) {
+        throw new PvpRiskRejectedError(u, pvpRiskDetail(services, u, e));
+      }
+      authorized.push(u);
+    }
   } catch (e) {
-    if (e instanceof StakeShortfall) return false;
+    rollbackPvpAuthorization(services, scope, operationId, acquired, authorized);
+    if (e instanceof PvpRiskRejectedError) return { ok: false, reason: "risk", userId: e.userId, detail: e.detail };
     throw e;
   }
-}
-
-/** 誰かの残高が足りずに徴収を打ち切ったことを伝える内部例外（グループを巻き戻すため） */
-class StakeShortfall extends Error {
-  constructor() {
-    super("STAKE_SHORTFALL");
-    this.name = "StakeShortfall";
+  // 事前の残高確認も含めて **全員ぶんで1グループ**。
+  // 途中で足りない人がいれば、先に取った人の分もグループごと巻き戻る
+  let ok: boolean;
+  try {
+    ok = services.escrow.holdAll(session, userIds, bet, game, operationId);
+  } catch (e) {
+    rollbackPvpAuthorization(services, scope, operationId, acquired, authorized);
+    throw e;
   }
+  // 資金が1 Ld も動かなかった（全員ぶん巻き戻った）ので、露出と席も同じ状態へ戻す
+  if (!ok) {
+    rollbackPvpAuthorization(services, scope, operationId, acquired, authorized);
+    return { ok: false, reason: "broke" };
+  }
+  return { ok: true };
 }
 
 /**
- * 参加者に返金（勝負不成立時など）。session があれば台帳の預かり額で返して記録も消す。
+ * 徴収が成立しなかったときの巻き戻し。
+ *
+ * 資金は `escrow.holdAll` が全員ぶん原子的に扱うので、ここへ来た時点で
+ * **この呼び出しで動いた資金は無い**。露出は「この呼び出しで足したぶんだけ」を
+ * 取り消す（`revokeExposure`）。同じ卓に先行して成立した露出——多人数丁半の
+ * 1回目の賭けなど——は預り金の裏付けがあるので、その額のまま残る。
+ * 席は露出が完全に消えた人だけ解く（§10）。
+ */
+function rollbackPvpAuthorization(services: Services, scope: string, operationId: string, acquired: string[], authorized: string[]): void {
+  for (const u of authorized) {
+    try {
+      services.dailyRisk.revokeExposure({ scopeKey: scope, userId: u, operationId: `${operationId}:${u}` });
+    } catch {
+      // 露出が残るぶんには安全側（次の賭博が断られるだけ）。ここで握り潰す
+    }
+  }
+  for (const u of acquired) {
+    if (hasLivePvpExposure(services, scope, u)) continue;
+    releaseTransientParticipation(u, "pvp", scope);
+  }
+}
+
+/** `pvp:<session>` から session を戻す（露出の名前空間と台帳の鍵を1箇所で対応づける） */
+function scopeSessionOf(scope: string): string {
+  return scope.startsWith("pvp:") ? scope.slice(4) : scope;
+}
+
+/** その卓に、この利用者の預り金が既に載っているか */
+function hasEscrowStake(services: Services, scope: string, userId: string): boolean {
+  try {
+    return services.escrow.list(scopeSessionOf(scope)).some((row) => row.user_id === userId);
+  } catch {
+    return true;
+  }
+}
+
+/** 露出が残っているか。判定できなければ fail-closed で「残っている」扱い */
+function hasLivePvpExposure(services: Services, scope: string, userId: string): boolean {
+  try {
+    return services.dailyRisk.exposureOf(scope, userId) !== null;
+  } catch {
+    return true;
+  }
+}
+
+/** PR23 拒否理由の文面 */
+function pvpRiskDetail(services: Services, userId: string, error: unknown): string {
+  if (error instanceof DailyRiskError && error.code === "ERR_DAILY_RISK_DAY_ROLLOVER") {
+    return "日付が変わった。この卓への追加はもう受けられない。";
+  }
+  if (error instanceof DailyRiskError && error.code === "ERR_DAILY_RISK_LIMIT") {
+    try {
+      const day = services.dailyRisk.dayFor(userId);
+      return day.remainingLossBudget > 0
+        ? `所持額に対して賭けが大きすぎる。残り許容損失は ${fmtEther(day.remainingLossBudget)}。`
+        : `今日はここまでだ。日次損失上限 ${fmtEther(day.lossCap)} に達している。`;
+    } catch {
+      return "賭場の利用制限を確認できないため、いまは勝負できない。";
+    }
+  }
+  return "賭場の利用制限を確認できないため、いまは勝負できない。";
+}
+
+/**
+ * 参加者に返金（勝負不成立時など）。台帳の預かり額で返して記録も消す。
  * **全員ぶんで1グループ**なので、途中で落ちれば誰にも返らない（＝同じ鍵で再試行できる）。
+ *
+ * PR23: 返金は純損益0なので当日枠は動かさない。資金が戻ってから露出と席を解く。
  */
-export function refundAll(services: Services, userIds: string[], bet: number, operationId: string, session?: string): void {
-  if (session) {
-    services.escrow.refundMany(session, userIds, operationId);
-    return;
-  }
-  services.chips.runGroup({ groupKey: `pvp:refund:${operationId}`, kind: "table_refund", actorId: "system:pvp" }, () => {
-    // 返金でも通算損益は動かさない（徴収時にも記録していないので差引0のまま・PR3）
-    for (const u of userIds) services.chips.transfer(HOUSE_HOLDER, u, bet, { reason: "対人戦の不成立返金" });
-  });
+export function refundAll(services: Services, userIds: string[], bet: number, operationId: string, session: string): void {
+  services.escrow.refundMany(session, userIds, operationId);
+  releasePvpParticipants(services, session, userIds);
 }
 
 /**
- * 旧経路（session なし）の通算損益（PR3）。
+ * 卓ごと流す（全員へ返金し、露出も一括で解く）。純損益0なので当日枠は動かさない。
  *
- * 「徴収時に −bet、配当時に +share」と分けて記録すると、対局中なのに通算負けが増え、
- * 不成立返金でも total_earned / total_lost が両方膨らむ。
- * **確定精算のときに、利用者ごとの純損益を一度だけ**記録する。
- * 場代は「受取が出した額を下回る」形で自然に損失側へ入る。
- *
- * 呼び出し元は必ず精算の資金グループの中なので、再試行では二度呼ばれない。
- * session ありの経路は `Escrow.settle` が帳簿から同じ計算をする。
+ * 返金と露出解放を同じトランザクションに入れるので、「返金だけ通って露出が残る」
+ * （＝その人が以後どの賭博も始められない）状態を作らない。
  */
-function recordPvpNet(
-  services: Services,
-  stakes: ReadonlyArray<{ userId: string; amount: number }> | undefined,
-  received: ReadonlyMap<string, number>,
-): void {
-  if (!stakes || stakes.length === 0) return;
-  const staked = new Map<string, number>();
-  for (const s of stakes) staked.set(s.userId, (staked.get(s.userId) ?? 0) + s.amount);
-  for (const [userId, stake] of staked) {
-    services.casino.recordGameNet(userId, (received.get(userId) ?? 0) - stake);
+export function voidPvpTable(services: Services, session: string): void {
+  const participants = pvpParticipants(services, session);
+  const scope = pvpRiskScope(session);
+  services.chips.runGroup({ groupKey: `pvp:void:${session}`, kind: "table_refund", actorId: "system:pvp" }, () => {
+    services.escrow.refund(session);
+    services.dailyRisk.releaseExposureScope(scope);
+  });
+  for (const u of participants) releaseTransientParticipation(u, "pvp", scope);
+}
+
+/**
+ * 卓が終わった（返金・精算済み）参加者の露出と席を解く。
+ * 資金の後始末が済んでいない人は手放さない（§10）。
+ */
+export function releasePvpParticipants(services: Services, session: string, userIds: readonly string[]): void {
+  const scope = pvpRiskScope(session);
+  for (const u of userIds) {
+    try {
+      if (hasEscrowStake(services, scope, u)) continue;
+      services.dailyRisk.releaseExposure(scope, u);
+    } catch {
+      continue;
+    }
+    if (hasLivePvpExposure(services, scope, u)) continue;
+    releaseTransientParticipation(u, "pvp", scope);
   }
 }
 
@@ -203,60 +332,75 @@ export function settlePvp(
   winners: string[],
   pot: number,
   operationId: string,
-  session?: string,
-  /**
-   * 旧経路（session なし）で通算損益を出すための「誰がいくら出したか」（PR3）。
-   * session ありなら `Escrow.settle` が帳簿から同じことをするので不要。
-   */
-  stakes?: ReadonlyArray<{ userId: string; amount: number }>,
+  session: string,
 ): { payout: number; houseCut: number } {
   const houseCut = Math.floor(pot * HOUSE_CUT);
   const distributable = pot - houseCut;
 
-  if (session) {
-    // 新方式: 単一トランザクションで原子的に分配
-    const distributions: Array<{ to: string; amount: number; reason: string }> = [];
-    if (houseCut > 0) distributions.push({ to: JACKPOT_HOLDER, amount: houseCut, reason: "場代" });
-    if (winners.length > 0) {
-      const share = Math.floor(distributable / winners.length);
-      const remainder = distributable - share * winners.length;
-      for (let i = 0; i < winners.length; i++) {
-        const amount = share + (i === 0 ? remainder : 0);
-        if (amount > 0) distributions.push({ to: winners[i]!, amount, reason: "PvP勝者" });
-      }
-    } else if (distributable > 0) {
-      distributions.push({ to: JACKPOT_HOLDER, amount: distributable, reason: "引き分け残余" });
+  const distributions: Array<{ to: string; amount: number; reason: string }> = [];
+  if (houseCut > 0) distributions.push({ to: JACKPOT_HOLDER, amount: houseCut, reason: "場代" });
+  if (winners.length > 0) {
+    const share = Math.floor(distributable / winners.length);
+    const remainder = distributable - share * winners.length;
+    for (let i = 0; i < winners.length; i++) {
+      const amount = share + (i === 0 ? remainder : 0);
+      if (amount > 0) distributions.push({ to: winners[i]!, amount, reason: "PvP勝者" });
     }
-    services.escrow.settle(session, distributions, "system:pvp", "settlePvp");
-    return { payout: winners.length > 0 ? distributable : 0, houseCut };
+  } else if (distributable > 0) {
+    distributions.push({ to: JACKPOT_HOLDER, amount: distributable, reason: "引き分け残余" });
   }
+  settleWithRisk(services, session, operationId, distributions, "settlePvp");
+  return { payout: winners.length > 0 ? distributable : 0, houseCut };
+}
 
-  // 旧方式（session なし・レガシー呼び出し互換）: house から直接動かす
-  const src = LEGACY_STAKE_HOLDER;
-  return services.chips.runGroup(
-    { groupKey: `pvp:settle:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
+/**
+ * エスクロー精算と日次リスクの確定を**ひとつのトランザクション**で行う（PR23 §13）。
+ *
+ * `Escrow.settle` は自分のグループを開くが、外側グループが動いていれば素通しするので
+ * 送金・帳簿削除・リスク記録が同じトランザクションに入る。リスク記録が落ちれば
+ * 送金ごと巻き戻る（＝場代も配当も動かない）。
+ *
+ * 記録する額は **実際の残高変動そのもの**（受取 − その卓へ出した額）。場代・JPへ抜けた分は
+ * 「受取が出した額を下回る」形で自然に損失側へ入る。**場代の行き先も配当も変えない。**
+ */
+function settleWithRisk(
+  services: Services,
+  session: string,
+  operationId: string,
+  distributions: ReadonlyArray<{ to: string; amount: number; reason: string }>,
+  reason: string,
+): void {
+  const scope = pvpRiskScope(session);
+  // 露出（＝その卓へ出した総額）は帳簿を消す前に読む
+  const participants = pvpParticipants(services, session);
+  services.chips.runGroup(
+    { groupKey: `pvp:risk_settle:${session}:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
     () => {
-      if (houseCut > 0) services.chips.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
-      if (winners.length === 0) {
-        recordPvpNet(services, stakes, new Map());
-        return { payout: 0, houseCut };
-      }
-      const share = Math.floor(distributable / winners.length);
-      const remainder = distributable - share * winners.length;
+      const staked = new Map<string, number>();
+      for (const row of services.escrow.list(session)) staked.set(row.user_id, (staked.get(row.user_id) ?? 0) + row.amount);
       const received = new Map<string, number>();
-      for (const w of winners) {
-        services.chips.transfer(src, w, share, { reason: "対人戦の配当" });
-        received.set(w, (received.get(w) ?? 0) + share);
+      for (const d of distributions) if (d.amount > 0) received.set(d.to, (received.get(d.to) ?? 0) + d.amount);
+      services.escrow.settle(session, [...distributions], "system:pvp", reason);
+      for (const [userId, stake] of staked) {
+        services.dailyRisk.settleExposure({
+          scopeKey: scope,
+          userId,
+          operationId,
+          netSigned: (received.get(userId) ?? 0) - stake,
+        });
       }
-      if (remainder > 0) {
-        services.chips.transfer(src, winners[0]!, remainder, { reason: "対人戦の配当（端数）" });
-        received.set(winners[0]!, (received.get(winners[0]!) ?? 0) + remainder);
-      }
-      // 通算損益は「受取 − 出した額」を精算時に一度だけ（PR3）
-      recordPvpNet(services, stakes, received);
-      return { payout: distributable, houseCut };
     },
   );
+  releasePvpParticipants(services, session, participants);
+}
+
+/** その卓に預けている参加者（精算前に読む） */
+function pvpParticipants(services: Services, session: string): string[] {
+  try {
+    return [...new Set(services.escrow.list(session).map((row) => row.user_id))];
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -269,52 +413,26 @@ export function settleProportional(
   winners: Array<{ userId: string; bet: number }>,
   losers: Array<{ userId: string; bet: number }>,
   operationId: string,
-  session?: string,
+  session: string,
 ): { totalHouseCut: number } {
   const winnerPot = winners.reduce((s, w) => s + w.bet, 0);
   const loserPot = losers.reduce((s, l) => s + l.bet, 0);
   const houseCut = Math.floor((winnerPot + loserPot) * HOUSE_CUT);
   const distributable = winnerPot + loserPot - houseCut;
 
-  if (session) {
-    const distributions: Array<{ to: string; amount: number; reason: string }> = [];
-    if (houseCut > 0) distributions.push({ to: JACKPOT_HOLDER, amount: houseCut, reason: "場代" });
-    if (winnerPot > 0) {
-      let remaining = distributable;
-      for (let i = 0; i < winners.length; i++) {
-        const w = winners[i]!;
-        const isLast = i === winners.length - 1;
-        const share = isLast ? remaining : Math.floor((distributable * w.bet) / winnerPot);
-        if (share > 0) distributions.push({ to: w.userId, amount: share, reason: "比例配当" });
-        remaining -= share;
-      }
+  const distributions: Array<{ to: string; amount: number; reason: string }> = [];
+  if (houseCut > 0) distributions.push({ to: JACKPOT_HOLDER, amount: houseCut, reason: "場代" });
+  if (winnerPot > 0) {
+    let remaining = distributable;
+    for (let i = 0; i < winners.length; i++) {
+      const w = winners[i]!;
+      const isLast = i === winners.length - 1;
+      const share = isLast ? remaining : Math.floor((distributable * w.bet) / winnerPot);
+      if (share > 0) distributions.push({ to: w.userId, amount: share, reason: "比例配当" });
+      remaining -= share;
     }
-    services.escrow.settle(session, distributions, "system:pvp", "settleProportional");
-    return { totalHouseCut: houseCut };
   }
-
-  // 旧方式（session なし）
-  const src = LEGACY_STAKE_HOLDER;
-  services.chips.runGroup(
-    { groupKey: `pvp:settle_proportional:${operationId}`, kind: "table_settle", actorId: "system:pvp" },
-    () => {
-      if (houseCut > 0) services.chips.transfer(src, JACKPOT_HOLDER, houseCut, { reason: "場代" });
-      const received = new Map<string, number>();
-      let remaining = distributable;
-      for (let i = 0; i < winners.length; i++) {
-        const w = winners[i]!;
-        const isLast = i === winners.length - 1;
-        const share = isLast ? remaining : Math.floor((distributable * w.bet) / winnerPot);
-        if (share > 0) {
-          services.chips.transfer(src, w.userId, share, { reason: "対人戦の比例配当" });
-          received.set(w.userId, (received.get(w.userId) ?? 0) + share);
-        }
-        remaining -= share;
-      }
-      // 通算損益は「受取 − 出した額」を精算時に一度だけ（PR3）
-      recordPvpNet(services, [...winners, ...losers].map((p) => ({ userId: p.userId, amount: p.bet })), received);
-    },
-  );
+  settleWithRisk(services, session, operationId, distributions, "settleProportional");
   return { totalHouseCut: houseCut };
 }
 

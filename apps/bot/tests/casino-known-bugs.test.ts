@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   Casino,
   CasinoChipAssets,
+  DailyRisk,
   CasinoChipFlow,
   CasinoIntegrity,
   CasinoStatus,
@@ -49,6 +50,7 @@ import {
 } from "../src/casino/common.js";
 import { buyConsumable } from "../src/commands/bakuten.js";
 import { collectStakes, refundAll, settlePvp } from "../src/casino/pvp-common.js";
+import { resetTransientParticipationForTesting } from "../src/casino/participation.js";
 import { asobuCommand } from "../src/commands/asobu.js";
 import { shobuCommand } from "../src/commands/shobu.js";
 
@@ -72,6 +74,8 @@ function setup(rng: CasinoRng = scriptedRng([0.5])) {
  * 「プロセスが落ちて再起動した」の模擬になる（DB に残っていない状態は当然消える）。
  */
 function rebuild(db: ReturnType<typeof openDb>, rng: CasinoRng = scriptedRng([0.5])) {
+  // プロセス内の一時参加は再起動で消える。テスト間で持ち越さない
+  resetTransientParticipationForTesting();
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const chipTx = new ChipTx(db);
@@ -93,9 +97,13 @@ function rebuild(db: ReturnType<typeof openDb>, rng: CasinoRng = scriptedRng([0.
   const freeSpins = new FreeSpins(db);
   const chipAssets = new CasinoChipAssets(db, ether);
   const chipFlow = new CasinoChipFlow(db, ether, events, chipAssets);
+  // PR23: 対人卓の徴収・精算は実物の DailyRisk を通る。この監査ファイルは
+  // 日次上限そのものを見る場所ではないので、上限は 100% にして他の検証を邪魔しない
+  const dailyRisk = new DailyRisk(db, ledger, chipAssets, { dailyLossLimitBps: () => 10_000 });
   const services = {
     db, ledger, ether, chips: ether, chipTx, chipAssets, chipFlow, casino, items, vip,
-    escrow, markets, freeSpins, reservations, rng, events,
+    escrow, markets, freeSpins, reservations, rng, events, dailyRisk,
+    persistentTables: { participantHasLiveTable: () => false },
   } as unknown as Services;
   return {
     db, ledger, chipTx, ether, chipAssets, chipFlow, casino, items, vip, escrow,
@@ -847,7 +855,7 @@ describe("⑤ 通算損益がゲーム由来の実現損益と一致する", () 
     const lBefore = ctx.ether.balanceOf("loser");
     const bet = 10_000;
 
-    expect(collectStakes(ctx.services, ["winner", "loser"], bet, "op-1", "sess-1", "テスト対人")).toBe(true);
+    expect(collectStakes(ctx.services, ["winner", "loser"], bet, "op-1", "sess-1", "テスト対人").ok).toBe(true);
     const { payout, houseCut } = settlePvp(ctx.services, ["winner"], bet * 2, "op-1", "sess-1");
     expect(houseCut).toBe(Math.floor(bet * 2 * 0.03));
     expect(payout).toBe(bet * 2 - houseCut);
@@ -859,7 +867,7 @@ describe("⑤ 通算損益がゲーム由来の実現損益と一致する", () 
     expect(netOf(ctx, "winner")).toBe(bet - houseCut);
 
     // 不成立返金は差引0
-    expect(collectStakes(ctx.services, ["winner"], bet, "op-2", "sess-2", "テスト対人")).toBe(true);
+    expect(collectStakes(ctx.services, ["winner"], bet, "op-2", "sess-2", "テスト対人").ok).toBe(true);
     refundAll(ctx.services, ["winner"], bet, "op-2", "sess-2");
     expect(netOf(ctx, "winner")).toBe(bet - houseCut);
     ctx.db.close();
@@ -875,7 +883,7 @@ describe("⑤ 通算損益がゲーム由来の実現損益と一致する", () 
     seedBalance(ctx.db, "a", 100_000);
     seedBalance(ctx.db, "b", 100_000);
 
-    expect(collectStakes(ctx.services, ["a", "b"], 10_000, "op-1", "sess-1", "テスト対人")).toBe(true);
+    expect(collectStakes(ctx.services, ["a", "b"], 10_000, "op-1", "sess-1", "テスト対人").ok).toBe(true);
     // 卓は立っているが、まだ何も確定していない
     for (const u of ["a", "b"]) {
       const s = ctx.casino.stats(u);

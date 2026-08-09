@@ -68,6 +68,7 @@ function setup(rng: CasinoRng = scriptedRng([0.5])) {
   const services = {
     db, ledger, events, chipTx, chips, ether: chips, items, reservations, escrow, casino,
     chipAssets, chipFlow, rng,
+    dailyRisk: { recordSoloExtraLoss: () => undefined },
   } as unknown as Services;
   const runRecovery = () =>
     recoverCasino({ db, status, integrity, chipTx, escrow, reservations, registry, events, chipFlow });

@@ -170,6 +170,57 @@ function createPersistentSchemaWithRows(db: ReturnType<typeof openDb>): void {
   `);
 }
 
+function createRiskLimitSchemaWithRows(db: ReturnType<typeof openDb>): void {
+  db.exec(`
+    CREATE TABLE casino_daily_risk_days (
+      user_id TEXT NOT NULL,
+      day_key TEXT NOT NULL,
+      day_start_at INTEGER NOT NULL,
+      opening_holdings INTEGER NOT NULL,
+      limit_bps INTEGER NOT NULL,
+      loss_cap INTEGER NOT NULL,
+      net_signed INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, day_key)
+    );
+    CREATE TABLE casino_daily_risk_events (
+      event_key TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      day_key TEXT NOT NULL,
+      source_kind TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      operation_id TEXT NOT NULL,
+      net_signed INTEGER NOT NULL,
+      payload_fingerprint TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE casino_solo_risk_starts (
+      operation_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      day_key TEXT NOT NULL,
+      game TEXT NOT NULL,
+      bet INTEGER NOT NULL,
+      max_player_loss INTEGER NOT NULL,
+      request_fingerprint TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE casino_ranked_open_history (
+      operation_id TEXT PRIMARY KEY,
+      table_id TEXT NOT NULL UNIQUE,
+      tier_key TEXT NOT NULL,
+      base_amount INTEGER NOT NULL,
+      authority TEXT NOT NULL,
+      request_fingerprint TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    INSERT INTO casino_daily_risk_days VALUES ('alice', '1', 86400, 10000, 3000, 3000, -100, 1, 1);
+    INSERT INTO casino_daily_risk_events VALUES ('e1', 'alice', '1', 'solo_result', 'op1', 'op1', -100, '{}', 1);
+    INSERT INTO casino_solo_risk_starts VALUES ('op1', 'alice', '1', 'slots', 100, 100, '{}', 1);
+    INSERT INTO casino_ranked_open_history VALUES ('create:t', 't', 'middle', 5000, 'employee', '{}', 1);
+  `);
+}
+
 function backupAdapter(): TestFilesystemOpeningBackupAdapter {
   const dir = mkdtempSync(join(tmpdir(), "pr20-persistent-tables-"));
   tempDirs.push(dir);
@@ -414,6 +465,39 @@ describe("PersistentTables opening and recovery integration", () => {
     ctx.db.exec("CREATE TABLE casino_truly_unknown_for_pr20 (id INTEGER)");
     const blocked = ctx.planner.dryRun();
     expect(blocked.unknownTables).toContain("casino_truly_unknown_for_pr20");
+    expect(blocked.blockers.some((b) => b.code === "unknown_table")).toBe(true);
+  });
+
+  it("classifies PR23 risk-limit tables as resettable metadata and still blocks truly unknown casino tables", async () => {
+    for (const table of ["casino_daily_risk_days", "casino_daily_risk_events", "casino_solo_risk_starts", "casino_ranked_open_history"]) {
+      expect(classificationFor(table)?.kind).toBe("optional_feature");
+      expect(classificationFor(table)?.resetPhase).toBe("R6");
+      expect(classificationFor(table)?.preserve).toBe(false);
+    }
+
+    const ctx = setupOpening();
+    seedLegacy(ctx);
+    createRiskLimitSchemaWithRows(ctx.db);
+    configureOpeningReset(ctx);
+
+    const preflight = ctx.planner.dryRun();
+    expect(preflight.unknownTables).not.toContain("casino_daily_risk_days");
+    expect(preflight.unknownTables).not.toContain("casino_daily_risk_events");
+    expect(preflight.unknownTables).not.toContain("casino_solo_risk_starts");
+    expect(preflight.unknownTables).not.toContain("casino_ranked_open_history");
+    expect(preflight.blockers).toEqual([]);
+    expect(preflight.protectedFindings.some((f) => f.sourceTable.startsWith("casino_daily_risk_") || f.sourceTable === "casino_solo_risk_starts" || f.sourceTable === "casino_ranked_open_history")).toBe(false);
+
+    const result = await ctx.reset.apply({ actorId: "admin", backup: backupAdapter(), external: new FakeOpeningExternalAdapter() });
+    expect(result.status).toBe("completed");
+    expect(result.postflight.ok).toBe(true);
+    for (const table of ["casino_daily_risk_days", "casino_daily_risk_events", "casino_solo_risk_starts", "casino_ranked_open_history"]) {
+      expect((ctx.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n).toBe(0);
+    }
+
+    ctx.db.exec("CREATE TABLE casino_unknown_for_pr23 (id INTEGER)");
+    const blocked = ctx.planner.dryRun();
+    expect(blocked.unknownTables).toContain("casino_unknown_for_pr23");
     expect(blocked.blockers.some((b) => b.code === "unknown_table")).toBe(true);
   });
 

@@ -9,6 +9,7 @@ import {
 } from "discord.js";
 import {
   SLOT_MAX_PAYOUT_MULT,
+  DailyRiskError,
   blackjackNoDoubleLiability,
   liabilityModelFor,
   soloGroupKey,
@@ -18,6 +19,7 @@ import {
 import { fmtEther } from "../format.js";
 import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
+import { acquireTransientParticipation, hasTransientParticipation, releaseTransientParticipation } from "./participation.js";
 import { C_BIGWIN, C_LOSE, C_MAMMON, C_PUSH, C_WIN, E, fmtBigDelta } from "./ui.js";
 
 /** PR13: 旧チップ時代の賭け額を1/10へ。利用者画面の単位はLandのみ。 */
@@ -55,7 +57,14 @@ export function effectiveMaxBet(services: Services, userId: string, game?: strin
   if (game === undefined) return cap;
   const model = liabilityModelFor(game);
   if (!model) throw new UnknownLiabilityModelError(game);
-  return Math.min(cap, model.maxBetFor(services.casino.availableForLiability(), liabilityCtx(services, userId)));
+  const ctx = liabilityCtx(services, userId);
+  let riskMax = cap;
+  try {
+    riskMax = services.dailyRisk.maxBetForPlayerLoss(userId, (bet) => model.maxPlayerLoss({ ...ctx, bet }), cap);
+  } catch {
+    riskMax = 0;
+  }
+  return Math.min(cap, model.maxBetFor(services.casino.availableForLiability(), ctx), riskMax);
 }
 
 /** 債務モデルへ渡す文脈（連勝数と装備中お守りの上限） */
@@ -66,20 +75,28 @@ export function liabilityCtx(services: Services, userId: string): Omit<Liability
   };
 }
 
-/** 同時プレイ防止（1人1卓）。プロセス内ロックで足りる（bot は単一プロセス） */
-const playing = new Set<string>();
+/**
+ * ソロゲームの席（同時プレイ防止・1人1卓）。
+ *
+ * 実体は {@link acquireTransientParticipation} の "solo" 種別で、ルーレット卓・
+ * 対人卓と**同じ1枠**を奪い合う（正本 §15.1）。`services` を必ず要求するのは、
+ * 生きている常設順位卓の確認を通さずに席を取れる型を残さないため
+ * （PR23 レビュー BLOCKER D）。
+ */
+const SOLO_PARTICIPATION_KEY = "solo";
 
-export function acquireSeat(userId: string): boolean {
-  if (playing.has(userId)) return false;
-  playing.add(userId);
-  return true;
+export function acquireSeat(services: Pick<Services, "persistentTables">, userId: string): boolean {
+  return acquireTransientParticipation(services, userId, "solo", SOLO_PARTICIPATION_KEY);
 }
 export function releaseSeat(userId: string): void {
-  playing.delete(userId);
+  releaseTransientParticipation(userId, "solo", SOLO_PARTICIPATION_KEY);
 }
-/** PR10 refund/confirmation safety gate for process-local solo games. */
+/**
+ * PR10 refund/confirmation safety gate.
+ * ソロ席だけでなくルーレット・対人卓の一時参加も含む（どれもエスクローに資金がある）。
+ */
 export function isSeatOccupied(userId: string): boolean {
-  return playing.has(userId);
+  return hasTransientParticipation(userId);
 }
 
 export interface BetCheck {
@@ -132,7 +149,27 @@ export async function validateBet(
   // 呼び出し側のバグとして即座に落とす（マージ直前レビュー対応）
   const model = liabilityModelFor(game);
   if (!model) throw new UnknownLiabilityModelError(game);
-  const needed = model.maxHouseLiability({ ...liabilityCtx(services, uid), bet });
+  const ctx = liabilityCtx(services, uid);
+  const maxPlayerLoss = model.maxPlayerLoss({ ...ctx, bet });
+  try {
+    services.dailyRisk.authorizeSoloStart({
+      userId: uid,
+      operationId: interaction.id,
+      game,
+      bet,
+      maxPlayerLoss,
+    });
+  } catch (error) {
+    const day = error instanceof DailyRiskError && error.code === "ERR_DAILY_RISK_LIMIT" ? services.dailyRisk.dayFor(uid) : null;
+    await respond({
+      content: day
+        ? `今日はここまでだ。日次損失上限: ${fmtEther(day.lossCap)} / 残り許容損失: ${fmtEther(day.remainingLossBudget)}`
+        : "賭場の利用制限を確認できないため、いまは開始できません。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return { ok: false, bet };
+  }
+  const needed = model.maxHouseLiability({ ...ctx, bet });
   if (needed > services.casino.availableForLiability()) {
     // 胴元がこの賭けの最悪ケースを引き受けられない。
     // **押し直せば必ず通る金額**を提示して戻す（正本 §5.4 ③）。

@@ -37,6 +37,11 @@ function fakeServices(opts: { vip?: boolean; vipMult?: number } = {}) {
     chipAssets: {
       freeChips: () => 1_000_000,
     },
+    dailyRisk: {
+      maxBetForPlayerLoss: (_userId: string, _lossPerBet: (bet: number) => number, cap: number) => cap,
+      authorizeSoloStart: vi.fn(),
+      dayFor: () => ({ lossCap: 1_000_000, remainingLossBudget: 1_000_000 }),
+    },
   } as unknown as Services;
   return { services, ensureFreeChips };
 }

@@ -22,6 +22,7 @@ import {
   offerRematch,
   refundAll,
   settlePvp,
+  stakeFailureText,
   type PvpInteraction,
 } from "./pvp-common.js";
 
@@ -124,8 +125,9 @@ export async function playChinchiroDuel(
 
   // 挑戦者から先に徴収（受諾されなければ返金）
   const session = `ccduel:${interaction.id}`;
-  if (!collectStakes(services, [challenger.id], bet, `${session}:collect:challenger`, session, "chinchiro-duel")) {
-    await interaction.reply({ content: "徴収に失敗した。", flags: MessageFlags.Ephemeral });
+  const challengerStake = collectStakes(services, [challenger.id], bet, `${session}:collect:challenger`, session, "chinchiro-duel");
+  if (!challengerStake.ok) {
+    await interaction.reply({ content: stakeFailureText(challengerStake), flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -177,11 +179,12 @@ export async function playChinchiroDuel(
     return;
   }
   // 受諾: 対戦相手からも徴収
-  if (!collectStakes(services, [opponent.id], bet, `${session}:collect:opponent`, session, "chinchiro-duel")) {
+  const opponentStake = collectStakes(services, [opponent.id], bet, `${session}:collect:opponent`, session, "chinchiro-duel");
+  if (!opponentStake.ok) {
     refundAll(services, [challenger.id], bet, `${session}:refund:opponent_broke`, session);
     await interaction.editReply({
       content: "",
-      embeds: [buildPvpAbort("対戦チンチロ", "🎲", "対戦相手のLand徴収に失敗。挑戦者に全額返金。")],
+      embeds: [buildPvpAbort("対戦チンチロ", "🎲", `${stakeFailureText(opponentStake)}挑戦者に全額返金。`)],
       components: [],
     });
     return;

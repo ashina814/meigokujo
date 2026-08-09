@@ -15,7 +15,7 @@ import type { CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET } from "./common.js";
-import { collectStakes, refundAll, settlePvp, settleProportional } from "./pvp-common.js";
+import { collectStakes, refundAll, settlePvp, settleProportional, stakeFailureText, voidPvpTable } from "./pvp-common.js";
 import { C_JACKPOT, C_LOSE, C_MAMMON, C_WIN } from "./ui.js";
 
 /**
@@ -200,8 +200,9 @@ export async function playPokerDuel(
     });
   } else {
     // オープン: host は自動参加でエスクロー
-    if (!collectStakes(services, [uid], bet, `${id}:collect:${uid}`, id, "poker-duel")) {
-      await interaction.reply({ content: "Land徴収に失敗した。", flags: MessageFlags.Ephemeral });
+    const hostStake = collectStakes(services, [uid], bet, `${id}:collect:${uid}`, id, "poker-duel");
+    if (!hostStake.ok) {
+      await interaction.reply({ content: stakeFailureText(hostStake), flags: MessageFlags.Ephemeral });
       return;
     }
     session.players.set(uid, { hand: [], discardDone: false });
@@ -242,7 +243,7 @@ async function tryTimeout(client: import("discord.js").Client, id: string, servi
   } else {
     // 参加不足 → 全員返金
     setPhase(s, "void");
-    services.escrow.refund(s.id);
+    voidPvpTable(services, s.id);
     await editMessage(client, s, {
       embeds: [
         new EmbedBuilder()
@@ -351,8 +352,9 @@ async function sashiAccept(interaction: ButtonInteraction, services: Services, s
     return;
   }
   // 両者から徴収
-  if (!collectStakes(services, [s.hostId, s.opponentId], s.bet, `${s.id}:collect:duel`, s.id, "poker-duel")) {
-    await interaction.reply({ content: "どちらかのLand残高が足りない。", flags: MessageFlags.Ephemeral });
+  const duelStake = collectStakes(services, [s.hostId, s.opponentId], s.bet, `${s.id}:collect:duel`, s.id, "poker-duel");
+  if (!duelStake.ok) {
+    await interaction.reply({ content: stakeFailureText(duelStake), flags: MessageFlags.Ephemeral });
     return;
   }
   s.players.set(s.hostId, { hand: [], discardDone: false });
@@ -404,8 +406,9 @@ async function openJoin(interaction: ButtonInteraction, services: Services, s: S
     await interaction.reply({ content: "Land残高が足りない。", flags: MessageFlags.Ephemeral });
     return;
   }
-  if (!collectStakes(services, [uid], s.bet, `${s.id}:collect:${uid}`, s.id, "poker-duel")) {
-    await interaction.reply({ content: "徴収に失敗した。", flags: MessageFlags.Ephemeral });
+  const joinStake = collectStakes(services, [uid], s.bet, `${s.id}:collect:${uid}`, s.id, "poker-duel");
+  if (!joinStake.ok) {
+    await interaction.reply({ content: stakeFailureText(joinStake), flags: MessageFlags.Ephemeral });
     return;
   }
   s.players.set(uid, { hand: [], discardDone: false });
@@ -441,7 +444,7 @@ async function openCancel(interaction: ButtonInteraction, services: Services, s:
     return;
   }
   setPhase(s, "void");
-  services.escrow.refund(s.id);
+  voidPvpTable(services, s.id);
   await interaction.update({
     embeds: [
       new EmbedBuilder()

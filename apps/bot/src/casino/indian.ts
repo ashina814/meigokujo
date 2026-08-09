@@ -21,6 +21,7 @@ import {
   offerRematch,
   refundAll,
   settlePvp,
+  stakeFailureText,
   type PvpInteraction,
 } from "./pvp-common.js";
 
@@ -63,7 +64,11 @@ export async function playIndian(
     return;
   }
   const session = `indian:${interaction.id}`;
-  if (!collectStakes(services, [challenger.id], stake, `${session}:collect:challenger`, session, "indian")) return;
+  const challengerStake = collectStakes(services, [challenger.id], stake, `${session}:collect:challenger`, session, "indian");
+  if (!challengerStake.ok) {
+    await interaction.reply({ content: stakeFailureText(challengerStake), flags: MessageFlags.Ephemeral });
+    return;
+  }
 
   const inviteRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("ind:accept").setLabel("受ける").setEmoji("🃏").setStyle(ButtonStyle.Success),
@@ -111,8 +116,14 @@ export async function playIndian(
     });
     return;
   }
-  if (!collectStakes(services, [opponent.id], stake, `${session}:collect:opponent`, session, "indian")) {
+  const opponentStake = collectStakes(services, [opponent.id], stake, `${session}:collect:opponent`, session, "indian");
+  if (!opponentStake.ok) {
     refundAll(services, [challenger.id], stake, `${session}:refund:opponent_broke`, session);
+    await interaction.editReply({
+      content: "",
+      embeds: [buildPvpAbort("インディアンポーカー", "🃏", `${stakeFailureText(opponentStake)}挑戦者に全額返金。`)],
+      components: [],
+    });
     return;
   }
 

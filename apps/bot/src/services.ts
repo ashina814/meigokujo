@@ -49,6 +49,7 @@ import {
   Escrow,
   CasinoChipAssets,
   CasinoChipFlow,
+  DailyRisk,
   defaultRng,
   openDb,
   registerDefaultTxTypes,
@@ -149,10 +150,17 @@ export function buildServices() {
   const reservations = new HouseReservations(db, chips, events);
   // 売上精算（redeemFairToAccount）も予約分は出せないようにする。UI ではなく資金処理層で止める
   chips.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
+  const chipAssets = new CasinoChipAssets(db, chips);
+  const dailyRisk = new DailyRisk(db, ledger, chipAssets, {
+    openingPhase: () => chipTx.openingPhase(),
+    dailyLossLimitBps: () => settings.getNumber("casino_daily_loss_limit_bps"),
+    boundaryOffsetMinutes: () => settings.getNumber("casino_daily_boundary_offset_minutes"),
+  });
   const casino = new Casino(db, chips, events, {
     fukuScale: () => settings.getNumber("ether_fuku_scale"),
     items,
     reservations,
+    dailyRisk,
   });
   const casinoMetrics = new CasinoMetrics(db, chipTx);
   const daily = new Daily(db, chips, events, {
@@ -200,7 +208,6 @@ export function buildServices() {
   }
   const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
   const persistentTables = new PersistentTables(db, events, { openingPhase: () => chipTx.openingPhase() });
-  const chipAssets = new CasinoChipAssets(db, chips);
   // 所有判定の正本をここで一本化する。プロセス内の着席は DB のどの表にも
   // 現れないので、渡さないとショップの域外確認票がゲーム中の自由チップを
   // Land へ戻せてしまう（監査ブロッカー・項目11）
@@ -208,12 +215,23 @@ export function buildServices() {
   const rankedDisputes = new RankedDisputes(db, chips, escrow, persistentTables, reservations, events, {
     openingPhase: () => chipTx.openingPhase(),
     onPlayerNet: recordPlayerNet,
+    dailyRisk,
   });
   const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, casinoMetrics, {
     chipFlow,
     isSoloSeatOccupied: isSeatOccupied,
     reservations,
     disputes: rankedDisputes,
+    dailyRisk,
+    openingPhase: () => chipTx.openingPhase(),
+    superHighEnabled: () => settings.getNumber("casino_super_high_enabled") === 1,
+    extremeEnabled: () => settings.getNumber("casino_extreme_enabled") === 1,
+    highCooldownSec: () => {
+      const raw = settings.getString("casino_ranked_high_cooldown_sec");
+      if (raw === undefined) return null;
+      const parsed = Number(raw);
+      return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+    },
   });
   const takutate = new Takutate(db, events);
   const casinoIntegrity = new CasinoIntegrity(db, ledger, chips, escrow, chipAssets);
@@ -231,7 +249,7 @@ export function buildServices() {
   // 資金を動かす経路は `chips` に一本化した（PR8監査・項目12）。`ether` は
   // 旧名称で書かれた外部プラグイン・古い呼び出しが**読むだけ**なら壊れないように
   // 残す互換窓で、型を `ChipReadonlyView` に狭めてある（下の注釈参照）。
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, persistentTables, rankedTables, rankedDisputes, takutate, freeSpins, reservations, recoveryRegistry, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, dailyRisk, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, persistentTables, rankedTables, rankedDisputes, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;

@@ -21,6 +21,7 @@ import {
 } from "./ranked-tables.js";
 import { HouseReservations } from "./reservations.js";
 import { rankedFeeReservationKey, RANKED_FEE_RESERVATION_SCOPE } from "./ranked-fee-reservation.js";
+import type { DailyRisk } from "./daily-risk.js";
 
 export const RANKED_EVIDENCE_WINDOW_SEC = 72 * 60 * 60;
 
@@ -210,6 +211,7 @@ export interface RankedDisputesOptions {
   onPlayerNet?: (userId: string, net: number) => void;
   openingPhase?: () => OpeningPhase;
   afterRecoveryDisputeStateForTesting?: () => void;
+  dailyRisk?: DailyRisk;
 }
 
 export class RankedDisputes {
@@ -217,6 +219,7 @@ export class RankedDisputes {
   private readonly onPlayerNet: (userId: string, net: number) => void;
   private readonly openingPhase: () => OpeningPhase;
   private readonly afterRecoveryDisputeStateForTesting?: () => void;
+  private readonly dailyRisk?: DailyRisk;
 
   constructor(
     private readonly db: Database.Database,
@@ -231,6 +234,7 @@ export class RankedDisputes {
     this.onPlayerNet = options.onPlayerNet ?? (() => undefined);
     this.openingPhase = options.openingPhase ?? (() => "formal");
     this.afterRecoveryDisputeStateForTesting = options.afterRecoveryDisputeStateForTesting;
+    this.dailyRisk = options.dailyRisk;
   }
 
   ensureSchemaForTesting(): void {
@@ -556,6 +560,7 @@ export class RankedDisputes {
       const resultJson = canonicalStringify({ orderedUserIds: safe.orderedUserIds });
       const resultHash = canonicalHash({ orderedUserIds: safe.orderedUserIds });
       this.escrow.settle(safe.tableId, distributions, safe.actorId, "ranked arbitration settlement");
+      this.recordResultRiskEvents(safe.tableId, config, distributions, `arbitration:${safe.operationId}`);
       this.applyFeeOutcome(safe.tableId, table.gameKey, config, safe.feeOutcome, safe.actorId);
       this.db
         .prepare(
@@ -847,8 +852,60 @@ export class RankedDisputes {
         this.chips.transfer(HOUSE_HOLDER, userId, config.feePerUser, { reason: "ranked table fault fee refund", game, sessionId: tableId });
         this.onPlayerNet(userId, config.feePerUser);
       }
+      this.recordFeeRefundRiskEvents(tableId, `fee_refund:${actor}:${tableId}`, config.feePerUser);
     }
     this.reservations.release(key);
+  }
+
+  private recordResultRiskEvents(
+    tableId: string,
+    config: RankedTableConfig,
+    distributions: ReadonlyArray<{ to: string; amount: number }>,
+    operationId: string,
+  ): void {
+    if (!this.dailyRisk) return;
+    for (const participant of this.activeParticipants(tableId)) {
+      const receipt = distributions.find((dist) => dist.to === participant.userId)?.amount;
+      if (receipt === undefined) {
+        throw new RankedDisputeError("ERR_DISPUTE_ESCROW_MISMATCH", "ranked result distribution is missing participant", {
+          tableId,
+          userId: participant.userId,
+        });
+      }
+      this.recordRiskEvent(tableId, participant, "table_result", operationId, receipt - config.baseAmount);
+    }
+  }
+
+  private recordFeeRefundRiskEvents(tableId: string, operationId: string, feePerUser: number): void {
+    if (!this.dailyRisk) return;
+    for (const participant of this.activeParticipants(tableId)) {
+      this.recordRiskEvent(tableId, participant, "table_fee_refund", operationId, feePerUser);
+    }
+  }
+
+  private recordRiskEvent(
+    tableId: string,
+    participant: PersistentTableParticipantRow,
+    sourceKind: "table_result" | "table_fee_refund",
+    operationId: string,
+    netSigned: number,
+  ): void {
+    if (!this.dailyRisk) return;
+    if (!participant.riskDayKey || participant.riskMaxLoss === null) {
+      throw new RankedDisputeError("ERR_DISPUTE_ESCROW_MISMATCH", "ranked participant is missing risk metadata", {
+        tableId,
+        userId: participant.userId,
+      });
+    }
+    this.dailyRisk.recordEvent({
+      eventKey: `${sourceKind}:${tableId}:${participant.userId}:${operationId}`,
+      userId: participant.userId,
+      dayKey: participant.riskDayKey,
+      sourceKind,
+      sourceId: tableId,
+      operationId,
+      netSigned,
+    });
   }
 
   private saveResolution(
