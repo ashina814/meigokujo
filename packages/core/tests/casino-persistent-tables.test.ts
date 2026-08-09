@@ -29,6 +29,7 @@ import {
   escrowHolderFor,
   openDb,
   recoverCasino,
+  recoverCasinoAsync,
   registerDefaultTxTypes,
   writeCasinoOpeningConfig,
 } from "../src/index.js";
@@ -211,26 +212,34 @@ describe("PersistentTables", () => {
       operationId: "op:create",
       deadlineAt: 1_700_000_100,
     }).tableId).toBe("t1");
-    expect(() => ctx.persistentTables.create({
+    expect(ctx.persistentTables.create({
       tableId: "t2",
       gameKey: "poker",
       creatorId: "alice",
       operatorId: "alice",
       operationId: "op:create-other",
-    })).toThrow(PersistentTableError);
+    }).tableId).toBe("t2");
 
     const seat = ctx.persistentTables.join({ tableId: "t1", userId: "bob", seat: 1, operationId: "op:join" });
     expect(seat.seat).toBe(1);
     expect(() => ctx.persistentTables.join({ tableId: "t1", userId: "carol", seat: 1, operationId: "op:seat-taken" })).toThrow(PersistentTableError);
 
+    expect(() => ctx.persistentTables.create({
+      tableId: "t3",
+      gameKey: "poker",
+      creatorId: "bob",
+      operatorId: "alice",
+      operationId: "op:create-participant-blocked",
+    })).toThrow(PersistentTableError);
+
     const playing = ctx.persistentTables.transition({
       tableId: "t1",
       from: "recruiting",
-      to: "playing",
+      to: "ready_check",
       expectedRevision: 0,
       actor: "alice",
     });
-    expect(playing.state).toBe("playing");
+    expect(playing.state).toBe("ready_check");
     expect(playing.revision).toBe(1);
     expect(() => ctx.persistentTables.transition({
       tableId: "t1",
@@ -239,7 +248,73 @@ describe("PersistentTables", () => {
       expectedRevision: 0,
       actor: "alice",
     })).toThrow(PersistentTableError);
-    expect(new PersistentTables(ctx.db, ctx.events).get("t1")!.state).toBe("playing");
+    expect(new PersistentTables(ctx.db, ctx.events).get("t1")!.state).toBe("ready_check");
+  });
+
+  it("classifies partial or corrupt schemas as invalid while both absent means no live tables", () => {
+    const ctx = setup(true);
+    expect(ctx.persistentTables.liveEscrowHolders()).toEqual([]);
+
+    ctx.db.exec("CREATE TABLE casino_tables (table_id TEXT PRIMARY KEY)");
+    expect(() => ctx.persistentTables.liveEscrowHolders()).toThrow(PersistentTableError);
+
+    const ctx2 = setup(true);
+    ctx2.db.exec("CREATE TABLE casino_table_participants (table_id TEXT)");
+    expect(() => ctx2.persistentTables.listLiveTables()).toThrow(PersistentTableError);
+
+    const ctx3 = setup(true);
+    ctx3.db.exec(`
+      CREATE TABLE casino_tables (
+        table_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        creator_id TEXT NOT NULL
+      );
+      CREATE TABLE casino_table_participants (
+        table_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        seat INTEGER NOT NULL,
+        joined_at INTEGER NOT NULL,
+        operation_id TEXT NOT NULL UNIQUE,
+        request_fingerprint TEXT NOT NULL,
+        ready_state TEXT,
+        approval_state TEXT
+      );
+    `);
+    expect(() => ctx3.persistentTables.listLiveTables()).toThrow(PersistentTableError);
+  });
+
+  it("fails closed on malformed rows without deriving escrow holders from bad ids", () => {
+    const ctx = setup(true);
+    createPersistentSchemaWithRows(ctx.db);
+    ctx.db.prepare("UPDATE casino_tables SET table_id = '' WHERE table_id = 'legacy-table'").run();
+    expect(() => ctx.persistentTables.liveEscrowHolders()).toThrow(PersistentTableError);
+  });
+
+  it("uses resolved tableId in create idempotency fingerprints", () => {
+    const ctx = setup(true);
+    const first = ctx.persistentTables.create({ tableId: "t1", gameKey: "poker", creatorId: "alice", operatorId: "alice", operationId: "op:same" });
+    expect(ctx.persistentTables.create({ tableId: "t1", gameKey: "poker", creatorId: "alice", operatorId: "alice", operationId: "op:same" })).toEqual(first);
+    expect(() =>
+      ctx.persistentTables.create({ tableId: "t2", gameKey: "poker", creatorId: "alice", operatorId: "alice", operationId: "op:same" }),
+    ).toThrow(PersistentTableError);
+    expect(() =>
+      ctx.persistentTables.create({ tableId: "t1", gameKey: "chinchiro", creatorId: "alice", operatorId: "alice", operationId: "op:same" }),
+    ).toThrow(PersistentTableError);
+  });
+
+  it("enforces the table transition graph and stale revisions", () => {
+    const ctx = setup(true);
+    ctx.persistentTables.create({ tableId: "t1", gameKey: "poker", creatorId: "alice", operatorId: "alice", operationId: "op:t1" });
+    const ready = ctx.persistentTables.transition({ tableId: "t1", from: "recruiting", to: "ready_check", expectedRevision: 0, actor: "alice" });
+    expect(ready.state).toBe("ready_check");
+    expect(ctx.persistentTables.transition({ tableId: "t1", from: "ready_check", to: "ready_check", expectedRevision: 1, actor: "alice" }).revision).toBe(1);
+    const playing = ctx.persistentTables.transition({ tableId: "t1", from: "ready_check", to: "playing", expectedRevision: 1, actor: "alice" });
+    expect(playing.revision).toBe(2);
+    expect(() => ctx.persistentTables.transition({ tableId: "t1", from: "playing", to: "recruiting", expectedRevision: 2, actor: "alice" })).toThrow(PersistentTableError);
+    expect(() => ctx.persistentTables.transition({ tableId: "t1", from: "playing", to: "pending_approval", expectedRevision: 1, actor: "alice" })).toThrow(PersistentTableError);
+    const pending = ctx.persistentTables.transition({ tableId: "t1", from: "playing", to: "pending_approval", expectedRevision: 2, actor: "alice" });
+    const settled = ctx.persistentTables.transition({ tableId: "t1", from: "pending_approval", to: "settled", expectedRevision: pending.revision, actor: "alice" });
+    expect(() => ctx.persistentTables.transition({ tableId: "t1", from: "settled", to: "playing", expectedRevision: settled.revision, actor: "alice" })).toThrow(PersistentTableError);
   });
 
   it("declares live escrow holders and fails closed on corrupt states", () => {
@@ -327,5 +402,103 @@ describe("PersistentTables opening and recovery integration", () => {
     expect(result.steps).toContain("S11:persistent_table_restore");
     expect(result.steps).not.toContain("S12:再開");
     expect(ctx.status.current().status).toBe("recovery_halt");
+  });
+  it("turns partial persistent-table schema into source_failed without moving escrow or user funds", () => {
+    const ctx = setup(true);
+    seedUser(ctx, "alice", 10_000);
+    ctx.db.exec("CREATE TABLE casino_tables (table_id TEXT PRIMARY KEY)");
+    ctx.escrow.hold("t-live", "alice", 2_000, "poker", "op:partial-hold");
+    const beforeEscrow = ctx.escrow.poolOf("t-live");
+    const beforeAliceChips = ctx.chips.balanceOf("alice");
+    const beforeAliceLand = ctx.ledger.balanceOf("user:alice");
+    const beforeHolderChips = ctx.chips.balanceOf(escrowHolderFor("t-live"));
+    const registry = new RecoveryRegistry();
+    registry.register({ type: "table", listLiveEscrowHolders: () => ctx.persistentTables.liveEscrowHolders() });
+
+    const result = recoverCasino({
+      db: ctx.db,
+      status: ctx.status,
+      integrity: ctx.integrity,
+      chipTx: ctx.chipTx,
+      escrow: ctx.escrow,
+      reservations: ctx.reservations,
+      registry,
+      events: ctx.events,
+      chipFlow: ctx.chipFlow,
+      persistentTableRestore: { restored: 0, replaced: 0, disputed: 0, failed: [] },
+    });
+
+    expect(result.outcome).toBe("source_failed");
+    expect(ctx.escrow.poolOf("t-live")).toBe(beforeEscrow);
+    expect(ctx.chips.balanceOf("alice")).toBe(beforeAliceChips);
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(beforeAliceLand);
+    expect(ctx.chips.balanceOf(escrowHolderFor("t-live"))).toBe(beforeHolderChips);
+  });
+
+  it("awaits S11 after S10 while casino is still closed and skips S11 for held statuses", async () => {
+    const ctx = setup(true);
+    let statusDuringS11 = "";
+    const result = await recoverCasinoAsync({
+      db: ctx.db,
+      status: ctx.status,
+      integrity: ctx.integrity,
+      chipTx: ctx.chipTx,
+      escrow: ctx.escrow,
+      reservations: ctx.reservations,
+      registry: new RecoveryRegistry(),
+      events: ctx.events,
+      chipFlow: ctx.chipFlow,
+      persistentTableRestore: async () => {
+        statusDuringS11 = ctx.status.current().status;
+        return { restored: 0, replaced: 0, disputed: 0, failed: [] };
+      },
+    });
+    expect(statusDuringS11).toBe("startup_check");
+    expect(result.outcome).toBe("opened");
+    expect(result.steps.indexOf("S10:自由チップ返還")).toBeLessThan(result.steps.indexOf("S11:persistent_table_restore"));
+    expect(result.steps.indexOf("S11:persistent_table_restore")).toBeLessThan(result.steps.indexOf("S12:後検"));
+
+    const held = setup(true);
+    held.status.haltManually("maintenance", "operator");
+    let called = false;
+    const heldResult = await recoverCasinoAsync({
+      db: held.db,
+      status: held.status,
+      integrity: held.integrity,
+      chipTx: held.chipTx,
+      escrow: held.escrow,
+      reservations: held.reservations,
+      registry: new RecoveryRegistry(),
+      events: held.events,
+      chipFlow: held.chipFlow,
+      persistentTableRestore: async () => {
+        called = true;
+        return { restored: 0, replaced: 0, disputed: 0, failed: [] };
+      },
+    });
+    expect(heldResult.outcome).toBe("held");
+    expect(called).toBe(false);
+  });
+
+  it("keeps S11 rejected providers fail-closed before S12", async () => {
+    const ctx = setup(true);
+    const result = await recoverCasinoAsync({
+      db: ctx.db,
+      status: ctx.status,
+      integrity: ctx.integrity,
+      chipTx: ctx.chipTx,
+      escrow: ctx.escrow,
+      reservations: ctx.reservations,
+      registry: new RecoveryRegistry(),
+      events: ctx.events,
+      chipFlow: ctx.chipFlow,
+      persistentTableRestore: async () => {
+        throw new Error("schema read failed");
+      },
+    });
+    expect(result.outcome).toBe("source_failed");
+    expect(result.reason).toContain("schema read failed");
+    expect(result.steps).toContain("S11:persistent_table_restore");
+    expect(result.steps).not.toContain("S12:再開");
   });
 });

@@ -98,7 +98,21 @@ describe("restorePersistentTableMessages", () => {
     expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith("t1", 3, expect.stringContaining("50001"));
   });
 
-  it("reports transient Discord failures so recovery can halt before S12", async () => {
+  it("marks the table disputed on Unknown Channel", async () => {
+    const client = {
+      channels: {
+        cache: new Map(),
+        fetch: vi.fn(async () => { throw Object.assign(new Error("Unknown Channel"), { code: 10003 }); }),
+      },
+    } as unknown as Client;
+    const table = row();
+    const services = servicesFor(table);
+    const result = await restorePersistentTableMessages(client, services);
+    expect(result).toEqual({ restored: 0, replaced: 0, disputed: 1, failed: [] });
+    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith("t1", 3, expect.stringContaining("10003"));
+  });
+
+  it("marks the table disputed on transient message fetch failures", async () => {
     const channel = {
       guildId: "g",
       isTextBased: () => true,
@@ -109,7 +123,55 @@ describe("restorePersistentTableMessages", () => {
     const services = servicesFor(table);
     const result = await restorePersistentTableMessages(clientFor(channel), services);
     expect(result.restored).toBe(0);
-    expect(result.failed).toEqual([{ tableId: "t1", error: "network timeout" }]);
-    expect(services.persistentTables.markDisputedFromRecovery).not.toHaveBeenCalled();
+    expect(result).toEqual({ restored: 0, replaced: 0, disputed: 1, failed: [] });
+    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith("t1", 3, "network timeout");
+  });
+
+  it("marks wrong-guild channels disputed", async () => {
+    const channel = {
+      guildId: "other-guild",
+      isTextBased: () => true,
+      messages: { fetch: vi.fn() },
+      send: vi.fn(),
+    };
+    const table = row();
+    const services = servicesFor(table);
+    const result = await restorePersistentTableMessages(clientFor(channel), services);
+    expect(result).toEqual({ restored: 0, replaced: 0, disputed: 1, failed: [] });
+    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith("t1", 3, expect.stringContaining("different guild"));
+  });
+
+  it("marks replacement-send failures disputed after Unknown Message", async () => {
+    const channel = {
+      guildId: "g",
+      isTextBased: () => true,
+      messages: { fetch: vi.fn(async () => { throw Object.assign(new Error("Unknown Message"), { code: 10008 }); }) },
+      send: vi.fn(async () => { throw new Error("network timeout while sending"); }),
+    };
+    const table = row();
+    const services = servicesFor(table);
+    const result = await restorePersistentTableMessages(clientFor(channel), services);
+    expect(result).toEqual({ restored: 0, replaced: 0, disputed: 1, failed: [] });
+    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith("t1", 3, "network timeout while sending");
+    expect(services.persistentTables.bindMessage).not.toHaveBeenCalled();
+  });
+
+  it("reports disputed CAS failures so recovery can halt before S12", async () => {
+    const channel = {
+      guildId: "g",
+      isTextBased: () => true,
+      messages: { fetch: vi.fn(async () => { throw new Error("network timeout"); }) },
+      send: vi.fn(),
+    };
+    const table = row();
+    const services = servicesFor(table, {
+      markDisputedFromRecovery: vi.fn(() => {
+        throw new Error("stale revision");
+      }),
+    });
+    const result = await restorePersistentTableMessages(clientFor(channel), services);
+    expect(result.restored).toBe(0);
+    expect(result.disputed).toBe(0);
+    expect(result.failed).toEqual([{ tableId: "t1", error: "stale revision" }]);
   });
 });

@@ -1,26 +1,11 @@
 import { EmbedBuilder, type Client } from "discord.js";
-import { recoverCasino, type PersistentTableRestoreResult, type PersistentTableRow, type RecoverCasinoResult } from "@meigokujo/core";
+import { recoverCasinoAsync, type PersistentTableRestoreResult, type PersistentTableRow, type RecoverCasinoResult } from "@meigokujo/core";
 import type { Services } from "../services.js";
 
 const UNKNOWN_MESSAGE = 10008;
-const UNKNOWN_CHANNEL = 10003;
-const MISSING_ACCESS = 50001;
-const MISSING_PERMISSIONS = 50013;
 
 export async function recoverCasinoWithPersistentTables(client: Client, services: Services): Promise<RecoverCasinoResult> {
-  services.casinoStatus.beginStartupCheck("system:recovery");
-  let persistentTableRestore: PersistentTableRestoreResult;
-  try {
-    persistentTableRestore = await restorePersistentTableMessages(client, services);
-  } catch (e) {
-    persistentTableRestore = {
-      restored: 0,
-      replaced: 0,
-      disputed: 0,
-      failed: [{ tableId: "*", error: e instanceof Error ? e.message : String(e) }],
-    };
-  }
-  return recoverCasino({
+  const result = await recoverCasinoAsync({
     db: services.db,
     status: services.casinoStatus,
     integrity: services.casinoIntegrity,
@@ -30,8 +15,10 @@ export async function recoverCasinoWithPersistentTables(client: Client, services
     registry: services.recoveryRegistry,
     events: services.events,
     chipFlow: services.chipFlow,
-    persistentTableRestore,
+    persistentTableRestore: () => restorePersistentTableMessages(client, services),
   });
+  logCasinoRecovery(result);
+  return result;
 }
 
 export async function restorePersistentTableMessages(
@@ -67,11 +54,7 @@ async function restoreOnePersistentTableMessage(
   try {
     channel = await fetchChannel(client, table.channelId);
   } catch (e) {
-    if (isPermanentDiscordLookupError(e)) {
-      services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, describeDiscordError(e));
-      return "disputed";
-    }
-    throw e;
+    return markDisputed(services, table, describeDiscordError(e));
   }
 
   if (!isUsableTextChannel(channel) || channel.guildId !== table.guildId) {
@@ -91,11 +74,7 @@ async function restoreOnePersistentTableMessage(
     return "restored";
   } catch (e) {
     if (errorCode(e) !== UNKNOWN_MESSAGE) {
-      if (isPermanentDiscordLookupError(e)) {
-        services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, describeDiscordError(e));
-        return "disputed";
-      }
-      throw e;
+      return markDisputed(services, table, describeDiscordError(e));
     }
   }
 
@@ -108,26 +87,35 @@ async function restoreOnePersistentTableMessage(
     );
     return "replaced";
   } catch (e) {
-    if (isPermanentDiscordLookupError(e)) {
-      services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, describeDiscordError(e));
-      return "disputed";
-    }
-    throw e;
+    return markDisputed(services, table, describeDiscordError(e));
   }
 }
 
 function renderPersistentTableRecoveryMessage(table: PersistentTableRow): { embeds: EmbedBuilder[] } {
+  const tableId = boundField(table.tableId);
+  const gameKey = boundField(table.gameKey);
+  const state = boundField(table.state, 64);
   const embed = new EmbedBuilder()
     .setTitle("Casino Table")
     .setDescription("Persistent table restored after bot startup.")
     .addFields(
-      { name: "Table", value: table.tableId, inline: true },
-      { name: "Game", value: table.gameKey, inline: true },
-      { name: "State", value: table.state, inline: true },
+      { name: "Table", value: tableId, inline: true },
+      { name: "Game", value: gameKey, inline: true },
+      { name: "State", value: state, inline: true },
     )
     .setFooter({ text: `rev ${table.revision}` })
     .setColor(table.state === "disputed" ? 0xb91c1c : 0x2563eb);
   return { embeds: [embed] };
+}
+
+function markDisputed(services: Services, table: PersistentTableRow, reason: string): "disputed" {
+  services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, boundField(reason, 500));
+  return "disputed";
+}
+
+function boundField(value: string, maxLength = 256): string {
+  const trimmed = value.trim() || "(empty)";
+  return trimmed.length <= maxLength ? trimmed : `${trimmed.slice(0, maxLength - 3)}...`;
 }
 
 async function fetchChannel(client: Client, channelId: string): Promise<unknown> {
@@ -156,11 +144,6 @@ function isUsableTextChannel(channel: unknown): channel is {
   );
 }
 
-function isPermanentDiscordLookupError(error: unknown): boolean {
-  const code = errorCode(error);
-  return code === UNKNOWN_CHANNEL || code === MISSING_ACCESS || code === MISSING_PERMISSIONS;
-}
-
 function errorCode(error: unknown): unknown {
   return (error as { code?: unknown } | null)?.code;
 }
@@ -169,4 +152,25 @@ function describeDiscordError(error: unknown): string {
   const code = errorCode(error);
   const message = error instanceof Error ? error.message : String(error);
   return code ? `Discord ${code}: ${message}` : message;
+}
+
+export function logCasinoRecovery(r: RecoverCasinoResult): void {
+  const reservations = r.releasedReservations.released
+    ? `reservations released ${r.releasedReservations.count}`
+    : "reservations not released";
+  const summary =
+    `kept ${r.keptHolders} / refunded ${r.refundedSessions}(${r.refundedTotal.toLocaleString("ja-JP")}Ld) / ` +
+    `quarantined ${r.quarantined} / mismatched ${r.mismatched.length} / refund failed ${r.failedSessions.length} / ${reservations}`;
+  switch (r.outcome) {
+    case "opened":
+      console.log(`[casino] startup recovery completed and opened: ${summary}`);
+      break;
+    case "held":
+    case "manual":
+      console.warn(`[casino] startup recovery held: ${r.reason} / ${summary}`);
+      break;
+    default:
+      console.error(`[casino] startup recovery stopped (${r.outcome}): ${r.reason} / ${summary}`);
+      break;
+  }
 }

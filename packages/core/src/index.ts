@@ -271,6 +271,7 @@ export {
   PERSISTENT_TABLE_STATES,
   PERSISTENT_TABLE_LIVE_STATES,
   PERSISTENT_TABLE_TERMINAL_STATES,
+  ALLOWED_TABLE_TRANSITIONS,
   type PersistentTableErrorCode,
   type PersistentTableState,
   type PersistentTableRow,
@@ -520,8 +521,11 @@ export {
 export {
   RecoveryRegistry,
   recoverCasino,
+  recoverCasinoAsync,
   type RecoverySource,
   type RecoverCasinoDeps,
+  type RecoverCasinoAsyncDeps,
   type RecoverCasinoResult,
   type PersistentTableRestoreResult,
+  type PersistentTableRestoreProvider,
 } from "./casino/recovery.js";
