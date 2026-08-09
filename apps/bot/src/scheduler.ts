@@ -13,6 +13,7 @@ import { fmtLd } from "./format.js";
 import { announceAutoClose, announceSettle, refreshMarketPanel } from "./commands/ita.js";
 import { ticketStaffRoleIds } from "./commands/tickets.js";
 import { isSeatOccupied } from "./casino/common.js";
+import { retryPendingRankedTableMessages } from "./casino/ranked-table-ui.js";
 import type { Services } from "./services.js";
 import {
   cleanupCompletedChunkBatches,
@@ -133,6 +134,9 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     }
 
     processRankedTableTimeoutsForScheduler(services, Math.floor(Date.now() / 1000));
+    await retryPendingRankedTableMessages(client, services).catch((e) =>
+      console.error("[casino-ranked] canonical message sync retry failed:", e),
+    );
 
     if (now.hour === 3 && now.minute < 3 && services.chipTx.openingPhase() === "formal") {
       const marker = `casino_metrics:maintenance:${now.dateStr}`;

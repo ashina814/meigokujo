@@ -1,7 +1,7 @@
 import { EmbedBuilder, type Client } from "discord.js";
 import { recoverCasinoAsync, type PersistentTableRestoreResult, type PersistentTableRow, type RecoverCasinoResult } from "@meigokujo/core";
 import type { Services } from "../services.js";
-import { renderRankedTable } from "./ranked-table-ui.js";
+import { renderRankedTable, retryPendingRankedTableMessages } from "./ranked-table-ui.js";
 
 const UNKNOWN_MESSAGE = 10008;
 
@@ -18,6 +18,10 @@ export async function recoverCasinoWithPersistentTables(client: Client, services
     chipFlow: services.chipFlow,
     persistentTableRestore: () => restorePersistentTableMessages(client, services),
   });
+  const messageSync = await retryPendingRankedTableMessages(client, services);
+  if (messageSync.attempted > 0) {
+    console.log(`[casino] startup ranked message sync: ${messageSync.synced}/${messageSync.attempted} synced, ${messageSync.failed} pending`);
+  }
   logCasinoRecovery(result);
   return result;
 }

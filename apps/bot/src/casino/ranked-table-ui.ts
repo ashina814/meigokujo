@@ -10,8 +10,7 @@ import {
   type Client,
   type ModalSubmitInteraction,
 } from "discord.js";
-import type { RankedTableSnapshot } from "@meigokujo/core";
-import type { RankedDisputePublicStatus } from "@meigokujo/core";
+import { rankedReceipts, type RankedDisputePublicStatus, type RankedTableSnapshot } from "@meigokujo/core";
 import type { Services } from "../services.js";
 
 export const RANKED_TABLE_CUSTOM_PREFIX = "rtbl:";
@@ -37,18 +36,34 @@ export function renderRankedTable(snapshot: RankedTableSnapshot, dispute?: Ranke
   ];
   if (result) lines.push(`結果hash: ${result.hash.slice(0, 12)}`);
   if (dispute?.resolvedAt) {
-    lines.push(`arbitration: ${resolutionLabel(dispute.resolutionKind)} / fee ${dispute.feeOutcome ?? "keep"}`);
-    lines.push(`resolved by: ${dispute.resolvedBy ?? "unknown"} / <t:${dispute.resolvedAt}:f>`);
-    if (dispute.publicSummary) lines.push(`summary: ${dispute.publicSummary}`);
-    lines.push("public summary does not include raw evidence, URLs, attachments, testimony details, or external account information.");
-  } else if (table.state === "disputed") {
-    if (dispute?.resolvedAt) {
-      lines.push(`裁定: ${resolutionLabel(dispute.resolutionKind)} / fee ${dispute.feeOutcome ?? "keep"}`);
-      if (dispute.publicSummary) lines.push(`要約: ${dispute.publicSummary}`);
+    lines.push(`裁定: ${resolutionLabel(dispute.resolutionKind)}`);
+    if (dispute.resolutionKind === "ranked_result") {
+      if (!result) throw new Error(`resolved ranked table is missing canonical result: ${table.tableId}`);
+      const receipts = rankedReceipts(config.profile, config.baseAmount);
+      lines.push("分配:");
+      result.orderedUserIds.forEach((userId, index) => {
+        lines.push(`${index + 1}位 <@${userId}> — ${receipts[index]!.toLocaleString("ja-JP")} Ld`);
+      });
     } else {
-      lines.push(`証拠期限: ${dispute ? `<t:${dispute.evidenceDeadlineAt}:R>` : "確認中"}`);
-      lines.push(dispute?.evidenceClosedAt ? "証拠提出は締切済み。裁定待ちです。" : "`/賭場証拠 提出` で証拠を提出できます。");
+      const refunds = dispute.refundAmounts;
+      if (!refunds || refunds.length !== active.length) {
+        throw new Error(`resolved refund is missing canonical refund receipts: ${table.tableId}`);
+      }
+      const refundByUser = new Map(refunds.map((refund) => [refund.userId, refund.amount]));
+      lines.push("返金:");
+      for (const participant of active.slice().sort((a, b) => a.seat - b.seat)) {
+        const amount = refundByUser.get(participant.userId);
+        if (amount === undefined) throw new Error(`resolved refund receipt is missing participant: ${participant.userId}`);
+        lines.push(`<@${participant.userId}> — ${amount.toLocaleString("ja-JP")} Ld`);
+      }
     }
+    lines.push(`場代: ${feeOutcomeLabel(dispute)}`);
+    lines.push(`理由: ${dispute.publicSummary ?? "理由なし"}`);
+    lines.push(`裁定者: ${actorLabel(dispute.resolvedBy)}`);
+    lines.push(`日時: <t:${dispute.resolvedAt}:f>`);
+  } else if (table.state === "disputed") {
+    lines.push(`証拠期限: ${dispute ? `<t:${dispute.evidenceDeadlineAt}:R>` : "確認中"}`);
+    lines.push(dispute?.evidenceClosedAt ? "証拠提出は締切済み。裁定待ちです。" : "`/賭場証拠 提出` で証拠を提出できます。");
   }
   const embed = new EmbedBuilder()
     .setTitle(title)
@@ -134,9 +149,12 @@ async function refresh(
     await interaction.editReply({ content, ...payload });
     return;
   }
-  await interaction.update({ content, ...payload }).catch(async () => {
+  try {
+    await interaction.update({ content, ...payload });
+    services.rankedDisputes.markMessageSyncSucceeded(tableId);
+  } catch {
     await interaction.reply({ content, ephemeral: true });
-  });
+  }
 }
 
 function controlsFor(snapshot: RankedTableSnapshot): ActionRowBuilder<ButtonBuilder> | null {
@@ -169,22 +187,49 @@ function controlsFor(snapshot: RankedTableSnapshot): ActionRowBuilder<ButtonBuil
   return null;
 }
 
-export async function editBoundRankedTableMessage(client: Client, services: Services, tableId: string): Promise<void> {
-  const snapshot = services.rankedTables.snapshot(tableId);
+export async function editBoundRankedTableMessage(client: Client, services: Services, tableId: string): Promise<boolean> {
+  let snapshot: RankedTableSnapshot;
+  try {
+    snapshot = services.rankedTables.snapshot(tableId);
+  } catch (e) {
+    services.rankedDisputes.markMessageSyncFailed(tableId, e);
+    return false;
+  }
   const { table } = snapshot;
-  if (!table.channelId || !table.messageId) return;
+  if (!table.channelId || !table.messageId) {
+    services.rankedDisputes.markMessageSyncFailed(tableId, new Error("ranked table has no canonical Discord message binding"));
+    return false;
+  }
   try {
     const channel = client.channels.cache.get(table.channelId) ?? await client.channels.fetch(table.channelId);
     const textChannel = channel as { messages?: { fetch(id: string): Promise<{ edit(payload: unknown): Promise<unknown> }> } } | null;
-    const message = await textChannel?.messages?.fetch(table.messageId);
-    await message?.edit(renderRankedTable(snapshot, services.rankedDisputes.publicStatus(tableId)));
+    if (!textChannel?.messages?.fetch) throw new Error("ranked table channel is not message-fetchable");
+    const message = await textChannel.messages.fetch(table.messageId);
+    if (!message?.edit) throw new Error("ranked table canonical message is not editable");
+    await message.edit(renderRankedTable(snapshot, services.rankedDisputes.publicStatus(tableId)));
+    services.rankedDisputes.markMessageSyncSucceeded(tableId);
+    return true;
   } catch (e) {
+    services.rankedDisputes.markMessageSyncFailed(tableId, e);
     services.events.log("casino_ranked_message_edit_failed", {
       actor: "system:ranked-ui",
       target: tableId,
       payload: { channelId: table.channelId, messageId: table.messageId, error: e instanceof Error ? e.message : String(e) },
     });
+    return false;
   }
+}
+
+export async function retryPendingRankedTableMessages(
+  client: Client,
+  services: Services,
+): Promise<{ attempted: number; synced: number; failed: number }> {
+  const pending = services.rankedDisputes.listMessageSyncPending();
+  let synced = 0;
+  for (const row of pending) {
+    if (await editBoundRankedTableMessage(client, services, row.tableId)) synced++;
+  }
+  return { attempted: pending.length, synced, failed: pending.length - synced };
 }
 
 function resultModal(tableId: string): ModalBuilder {
@@ -247,4 +292,14 @@ function resolutionLabel(kind: string | null): string {
   if (kind === "refund_collateral") return "預託返金";
   if (kind === "insufficient_evidence") return "証拠不足";
   return "未確定";
+}
+
+function feeOutcomeLabel(dispute: RankedDisputePublicStatus): string {
+  if (dispute.preStart) return "対局開始前のため未確定（預託分を全額返金）";
+  return dispute.feeOutcome === "fault_refund" ? "過失返金（fault_refund）" : "保持（keep）";
+}
+
+function actorLabel(actor: string | null): string {
+  if (!actor) return "不明";
+  return /^\d+$/.test(actor) ? `<@${actor}>` : actor;
 }

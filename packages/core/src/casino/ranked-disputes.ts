@@ -42,6 +42,7 @@ export type RankedDisputeErrorCode =
   | "ERR_DISPUTE_ARBITRATOR_REQUIRED"
   | "ERR_DISPUTE_RESOLUTION_CONFLICT"
   | "ERR_DISPUTE_INSUFFICIENT_EVIDENCE"
+  | "ERR_DISPUTE_PRE_START_RESULT"
   | "ERR_DISPUTE_FEE_RESERVATION"
   | "ERR_DISPUTE_ESCROW_MISMATCH";
 
@@ -56,10 +57,25 @@ export class RankedDisputeError extends Error {
   }
 }
 
+export interface RankedRefundReceipt {
+  userId: string;
+  amount: number;
+}
+
+export interface RankedMessageSyncPending {
+  tableId: string;
+  requestedAt: number;
+  attempts: number;
+  lastAttemptAt: number | null;
+  lastError: string | null;
+}
+
 export interface RankedDisputePublicStatus {
   tableId: string;
   evidenceDeadlineAt: number;
   evidenceClosedAt: number | null;
+  preStart: boolean;
+  refundAmounts: RankedRefundReceipt[] | null;
   assignedArbitratorId: string | null;
   resolutionKind: RankedResolutionKind | null;
   feeOutcome: RankedFeeOutcome | null;
@@ -211,6 +227,58 @@ export class RankedDisputes {
     this.ensureSchema();
   }
 
+  listMessageSyncPending(limit = 100): RankedMessageSyncPending[] {
+    if (this.openingPhase() !== "formal") return [];
+    this.ensureSchema();
+    const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 500) : 100;
+    const rows = this.db
+      .prepare(
+        `SELECT table_id, requested_at, attempts, last_attempt_at, last_error
+           FROM casino_table_message_sync_outbox
+          ORDER BY requested_at, table_id
+          LIMIT ?`,
+      )
+      .all(safeLimit) as Array<{
+        table_id: string;
+        requested_at: number;
+        attempts: number;
+        last_attempt_at: number | null;
+        last_error: string | null;
+      }>;
+    return rows.map((row) => ({
+      tableId: row.table_id,
+      requestedAt: row.requested_at,
+      attempts: row.attempts,
+      lastAttemptAt: row.last_attempt_at,
+      lastError: row.last_error,
+    }));
+  }
+
+  markMessageSyncSucceeded(tableId: string): void {
+    if (this.openingPhase() !== "formal") return;
+    this.ensureSchema();
+    this.db.prepare("DELETE FROM casino_table_message_sync_outbox WHERE table_id=?").run(requiredString(tableId, "tableId"));
+  }
+
+  markMessageSyncFailed(tableId: string, error: unknown): void {
+    if (this.openingPhase() !== "formal") return;
+    this.ensureSchema();
+    const safeTableId = requiredString(tableId, "tableId");
+    const now = this.now();
+    const message = truncate(error instanceof Error ? error.message : String(error), 500);
+    this.db
+      .prepare(
+        `INSERT INTO casino_table_message_sync_outbox
+           (table_id, requested_at, attempts, last_attempt_at, last_error)
+         VALUES (?, ?, 1, ?, ?)
+         ON CONFLICT(table_id) DO UPDATE SET
+           attempts=casino_table_message_sync_outbox.attempts+1,
+           last_attempt_at=excluded.last_attempt_at,
+           last_error=excluded.last_error`,
+      )
+      .run(safeTableId, now, now, message);
+  }
+
   openForTable(table: PersistentTableRow, reason: string): RankedDisputePublicStatus {
     const tx = this.db.transaction(() => {
       this.ensureSchemaForFormal();
@@ -241,6 +309,7 @@ export class RankedDisputes {
           storage.result_submitted_by,
           storage.result_submitted_at,
         );
+      this.queueMessageSync(table.tableId);
       return this.publicStatus(table.tableId)!;
     });
     return this.db.inTransaction ? tx() : tx.immediate();
@@ -446,9 +515,14 @@ export class RankedDisputes {
     };
     return this.resolveWithFingerprint("ranked_result", safe.operationId, safe.actorId, safe.tableId, canonicalStringify(safe), () => {
       this.assertAssignedArbitrator(safe.tableId, safe.actorId);
-      if (!this.hasStoredMainEvidence(safe.tableId)) throw new RankedDisputeError("ERR_DISPUTE_INSUFFICIENT_EVIDENCE", "ranked result arbitration requires stored main evidence");
       const table = this.requireTable(safe.tableId);
       if (table.state !== "disputed") throw new RankedDisputeError("ERR_DISPUTE_NOT_OPEN", "table is not disputed", { state: table.state });
+      if (this.isPreStartDispute(table)) {
+        throw new RankedDisputeError("ERR_DISPUTE_PRE_START_RESULT", "pre-start dispute cannot be resolved as a ranked result", {
+          tableId: safe.tableId,
+        });
+      }
+      if (!this.hasStoredMainEvidence(safe.tableId)) throw new RankedDisputeError("ERR_DISPUTE_INSUFFICIENT_EVIDENCE", "ranked result arbitration requires stored main evidence");
       const config = this.configFor(safe.tableId);
       this.validateRanking(safe.tableId, config, safe.orderedUserIds);
       const distributions = this.distributions(config, safe.orderedUserIds);
@@ -507,12 +581,16 @@ export class RankedDisputes {
     let failed = 0;
     for (const row of rows) {
       try {
-        const closeTx = this.db.transaction((): "closed" | "needs_refund" | "skip" => {
+        const closeTx = this.db.transaction((): "closed" | "needs_refund" | "needs_pre_start_refund" | "skip" => {
           this.ensureSchemaForFormal();
           const table = this.requireTable(row.table_id);
           if (table.state !== "disputed") return "skip";
           const dispute = this.requireDispute(row.table_id);
           if (dispute.resolved_at !== null || dispute.evidence_closed_at !== null || dispute.evidence_deadline_at > now) return "skip";
+          // A recovery dispute whose game never started must never be held indefinitely by evidence.
+          // started_at/fee_committed_at are canonical start boundaries: either missing means all active
+          // escrow rows are still pre-start collateral and must be returned in full at the deadline.
+          if (this.isPreStartDispute(table)) return "needs_pre_start_refund";
           if (!this.hasStoredMainEvidence(row.table_id)) return "needs_refund";
           const changed = this.db
             .prepare(
@@ -523,6 +601,7 @@ export class RankedDisputes {
             .run(now, row.table_id).changes;
           if (changed !== 1) throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "evidence close race", { tableId: row.table_id });
           this.db.prepare("UPDATE casino_tables SET deadline_at=NULL, updated_at=? WHERE table_id=? AND state='disputed'").run(now, row.table_id);
+          this.queueMessageSync(row.table_id);
           return "closed";
         });
         const closeResult = this.db.inTransaction ? closeTx() : closeTx.immediate();
@@ -531,19 +610,34 @@ export class RankedDisputes {
           continue;
         }
         if (closeResult === "skip") continue;
+        const preStart = closeResult === "needs_pre_start_refund";
         const dispute = this.requireDispute(row.table_id);
-        const op = `evidence-timeout:${row.table_id}:${dispute.evidence_deadline_at}`;
-        const fingerprint = canonicalStringify({ tableId: row.table_id, op, kind: "insufficient_evidence" });
-        this.resolveWithFingerprint("insufficient_evidence", op, "system:ranked-evidence-timeout", row.table_id, fingerprint, () => {
+        const kind: RankedResolutionKind = preStart ? "refund_collateral" : "insufficient_evidence";
+        const op = `${preStart ? "pre-start-timeout" : "evidence-timeout"}:${row.table_id}:${dispute.evidence_deadline_at}`;
+        const fingerprint = canonicalStringify({ tableId: row.table_id, op, kind });
+        this.resolveWithFingerprint(kind, op, "system:ranked-evidence-timeout", row.table_id, fingerprint, () => {
           const current = this.requireTable(row.table_id);
           const currentDispute = this.requireDispute(row.table_id);
           if (current.state !== "disputed" || currentDispute.resolved_at !== null || currentDispute.evidence_closed_at !== null || currentDispute.evidence_deadline_at > now) {
             throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "deadline resolution race", { tableId: row.table_id });
           }
-          if (this.hasStoredMainEvidence(row.table_id)) {
+          if (preStart) {
+            if (!this.isPreStartDispute(current)) {
+              throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "pre-start dispute changed before deadline refund", { tableId: row.table_id });
+            }
+          } else if (this.hasStoredMainEvidence(row.table_id)) {
             throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "stored main evidence won the deadline race", { tableId: row.table_id });
           }
-          this.refundCollateralAndFinalize(current, "system:ranked-evidence-timeout", "keep", "cancelled", "insufficient_evidence", "insufficient evidence", op, fingerprint);
+          this.refundCollateralAndFinalize(
+            current,
+            "system:ranked-evidence-timeout",
+            "keep",
+            "cancelled",
+            kind,
+            preStart ? "対局開始前のため預託を全額返金" : "証拠不足",
+            op,
+            fingerprint,
+          );
         });
         autoRefunded++;
       } catch (e) {
@@ -562,10 +656,13 @@ export class RankedDisputes {
     if (!this.hasSchema()) return null;
     const row = this.readDispute(tableId);
     if (!row) return null;
+    const table = this.requireTable(tableId);
     return {
       tableId: row.table_id,
       evidenceDeadlineAt: row.evidence_deadline_at,
       evidenceClosedAt: row.evidence_closed_at,
+      preStart: this.isPreStartDispute(table),
+      refundAmounts: this.resolutionRefunds(row),
       assignedArbitratorId: row.assigned_arbitrator_id,
       resolutionKind: row.resolution_kind,
       feeOutcome: row.fee_outcome,
@@ -574,6 +671,43 @@ export class RankedDisputes {
       resolvedBy: row.resolved_by,
       resolvedAt: row.resolved_at,
     };
+  }
+
+  private resolutionRefunds(row: DisputeRow): RankedRefundReceipt[] | null {
+    if (row.resolved_at === null || row.resolution_kind === "ranked_result") return null;
+    if (!row.resolution_operation_id) {
+      throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "resolved refund is missing operation id", { tableId: row.table_id });
+    }
+    const groupKey = `ranked:dispute:${row.table_id}:${row.resolution_operation_id}`;
+    const txRows = this.db
+      .prepare(
+        `SELECT to_holder, amount
+           FROM casino_tx
+          WHERE group_key=? AND session_id=? AND from_holder=? AND tx_kind='internal_transfer'
+          ORDER BY id`,
+      )
+      .all(groupKey, row.table_id, escrowHolderFor(row.table_id)) as Array<{ to_holder: string | null; amount: number }>;
+    const byUser = new Map<string, number>();
+    for (const tx of txRows) {
+      if (!tx.to_holder || !Number.isSafeInteger(tx.amount) || tx.amount <= 0) {
+        throw new RankedDisputeError("ERR_DISPUTE_ESCROW_MISMATCH", "refund receipt transaction is corrupt", { tableId: row.table_id, tx });
+      }
+      const next = (byUser.get(tx.to_holder) ?? 0) + tx.amount;
+      if (!Number.isSafeInteger(next)) throw new RankedDisputeError("ERR_DISPUTE_ESCROW_MISMATCH", "refund receipt overflow", { tableId: row.table_id });
+      byUser.set(tx.to_holder, next);
+    }
+    const active = this.activeParticipants(row.table_id);
+    if (byUser.size !== active.length || active.some((participant) => !byUser.has(participant.userId))) {
+      throw new RankedDisputeError("ERR_DISPUTE_ESCROW_MISMATCH", "refund receipt participants do not match the table", {
+        tableId: row.table_id,
+        receiptUsers: [...byUser.keys()],
+        activeUsers: active.map((participant) => participant.userId),
+      });
+    }
+    return active
+      .slice()
+      .sort((a, b) => a.seat - b.seat)
+      .map((participant) => ({ userId: participant.userId, amount: byUser.get(participant.userId)! }));
   }
 
   recordUnanimousMatch(tableId: string, gameKey: string, config: RankedTableConfig, orderedUserIds: readonly string[]): void {
@@ -712,6 +846,7 @@ export class RankedDisputes {
       .run(kind, outcome, recordStats ? 1 : 0, summary, actor, this.now(), operationId, fingerprint, this.now(), kind, tableId).changes;
     if (changed !== 1) throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "dispute resolution race", { tableId });
     this.db.prepare("UPDATE casino_tables SET deadline_at=NULL, updated_at=? WHERE table_id=?").run(this.now(), tableId);
+    this.queueMessageSync(tableId);
     this.events.log("casino_ranked_dispute_resolved", {
       actor,
       target: tableId,
@@ -887,6 +1022,7 @@ export class RankedDisputes {
       CREATE INDEX IF NOT EXISTS idx_casino_table_evidence_table ON casino_table_evidence(table_id, evidence_class, storage_status);
     `);
     this.ensureMatchHistorySchema();
+    this.ensureMessageSyncSchema();
   }
 
   private ensureSchemaForFormal(): void {
@@ -946,6 +1082,32 @@ export class RankedDisputes {
 
   private migrateSchema(): void {
     this.addColumnIfMissing("casino_table_evidence", "metadata_json", "TEXT");
+    this.ensureMessageSyncSchema();
+  }
+
+  private ensureMessageSyncSchema(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS casino_table_message_sync_outbox (
+        table_id TEXT PRIMARY KEY,
+        requested_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        last_attempt_at INTEGER,
+        last_error TEXT,
+        FOREIGN KEY(table_id) REFERENCES casino_tables(table_id) ON DELETE CASCADE
+      );
+    `);
+  }
+
+  private queueMessageSync(tableId: string): void {
+    this.ensureMessageSyncSchema();
+    this.db
+      .prepare(
+        `INSERT INTO casino_table_message_sync_outbox
+           (table_id, requested_at, attempts, last_attempt_at, last_error)
+         VALUES (?, ?, 0, NULL, NULL)
+         ON CONFLICT(table_id) DO UPDATE SET requested_at=excluded.requested_at`,
+      )
+      .run(tableId, this.now());
   }
 
   private addColumnIfMissing(table: string, column: string, spec: string): void {

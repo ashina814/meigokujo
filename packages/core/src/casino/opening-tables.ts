@@ -459,6 +459,18 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "ranked-disputes.ts records unanimous/arbitrated ranked match history without overloading casino_stats. Pre-opening rows are reset in R6.",
   }),
   T({
+    table: "casino_table_message_sync_outbox",
+    purpose: "Durable retry queue for canonical Discord ranked-table message synchronization",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "ranked-disputes.ts records non-financial Discord message-sync work here in the same commit as dispute/public-state changes. It is formal-era transient metadata and is reset in R6.",
+  }),
+  T({
     table: "casino_items",
     purpose: "利用者所持アイテム",
     kind: "optional_feature",
