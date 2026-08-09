@@ -173,6 +173,38 @@ describe("casino opening ops settings", () => {
     expect(configResult.ok ? configResult.config.remitRateBps : 0).toBe(250);
   });
 
+  it("allows correcting a valid configured value before execution and clears configured until full read-back succeeds again", async () => {
+    const { services, settings } = makeServices();
+    await handleOpeningOpsModal(
+      modal("mgmt:casino:opening:capital", {
+        openingCapital: "1000",
+        openingHouse: "800",
+        openingJackpot: "150",
+        openingRelief: "50",
+      }).i,
+      services,
+    );
+    await handleOpeningOpsModal(modal("mgmt:casino:opening:ops", { minWorkingCapital: "100", remitRateBps: "250" }).i, services);
+    expect(readCasinoOpeningConfig(settings).ok).toBe(true);
+
+    await handleOpeningOpsModal(
+      modal("mgmt:casino:opening:capital", {
+        openingCapital: "1000",
+        openingHouse: "700",
+        openingJackpot: "200",
+        openingRelief: "100",
+      }).i,
+      services,
+    );
+    expect(readCasinoOpeningConfig(settings)).toEqual({ ok: false, configured: false, reason: "not_configured" });
+
+    await handleOpeningOpsModal(modal("mgmt:casino:opening:ops", { minWorkingCapital: "120", remitRateBps: "300" }).i, services);
+    const reread = readCasinoOpeningConfig(settings);
+    expect(reread.ok).toBe(true);
+    expect(reread.ok ? reread.config.openingHouse : 0).toBe(700);
+    expect(reread.ok ? reread.config.remitRateBps : 0).toBe(300);
+  });
+
   it("requires OWNER_ID for opening operation controls", async () => {
     const { services } = makeServices();
     const i = button("mgmt:casino:opening:capital", "not-owner");
@@ -212,11 +244,12 @@ describe("casino opening ops preflight and apply", () => {
 
   it("wires apply with a persistent backup adapter and registry-only temp VC external adapter", async () => {
     const deleteChannel = vi.fn().mockResolvedValue(undefined);
-    const fetch = vi.fn().mockResolvedValue({
+    const liveChannel = {
       type: ChannelType.GuildVoice,
       guildId: "guild-1",
       delete: deleteChannel,
-    });
+    };
+    const fetch = vi.fn().mockResolvedValueOnce(liveChannel).mockResolvedValueOnce(null);
     const client = { channels: { fetch } };
     const apply = vi.fn(async (input: any) => {
       expect(input.actorId).toBe(config.ownerId);
@@ -224,8 +257,9 @@ describe("casino opening ops preflight and apply", () => {
 
       const first = await input.external.disableLegacyCasino({ planHash: "apply-hash", idempotencyKey: "external-1" });
       const second = await input.external.disableLegacyCasino({ planHash: "apply-hash", idempotencyKey: "external-1" });
-      expect(second).toEqual(first);
-      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(first).toMatchObject({ idempotencyKey: "external-1", disabledChannelIds: ["vc-1"] });
+      expect(second).toMatchObject({ idempotencyKey: "external-1", disabledChannelIds: ["vc-1"] });
+      expect(fetch).toHaveBeenCalledTimes(2);
       expect(deleteChannel).toHaveBeenCalledTimes(1);
 
       return {
