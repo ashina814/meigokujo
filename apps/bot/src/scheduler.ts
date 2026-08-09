@@ -132,6 +132,8 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
+    processRankedTableTimeoutsForScheduler(services, Math.floor(Date.now() / 1000));
+
     if (now.hour === 3 && now.minute < 3 && services.chipTx.openingPhase() === "formal") {
       const marker = `casino_metrics:maintenance:${now.dateStr}`;
       if (!services.settings.getString(marker)) {
@@ -420,6 +422,33 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
 }
 
 /** VC浮上報酬の日次支給: 前日分を計算して1人1取引で発行し、本人にDMで通知 */
+export function processRankedTableTimeoutsForScheduler(services: Services, nowSec: number): void {
+  try {
+    if (services.chipTx.openingPhase() !== "formal" || services.casinoStatus.current().status !== "open") return;
+  } catch (e) {
+    services.events.log("casino_ranked_timeout_scan_failed", {
+      actor: "system:scheduler",
+      payload: { error: e instanceof Error ? e.message : String(e) },
+    });
+    return;
+  }
+
+  try {
+    const result = services.rankedTables.processDueTables(nowSec);
+    if (result.processed > 0 || result.refunded > 0 || result.disputed > 0) {
+      services.events.log("casino_ranked_timeout_scan", {
+        actor: "system:scheduler",
+        payload: result,
+      });
+    }
+  } catch (e) {
+    services.events.log("casino_ranked_timeout_scan_failed", {
+      actor: "system:scheduler",
+      payload: { error: e instanceof Error ? e.message : String(e) },
+    });
+  }
+}
+
 export async function payVcRewards(client: Client, services: Services, dateStr: string): Promise<void> {
   // ブラックリスト方式: 除外リスト(XPと共用)と寝落ちリストを設定から組み立てて渡す。
   const excludedIds = new Set(services.settings.getJson<string[]>("xp_excluded_channels", []));

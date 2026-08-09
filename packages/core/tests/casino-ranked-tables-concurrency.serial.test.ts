@@ -26,6 +26,7 @@ registerDefaultTxTypes();
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNNER = join(HERE, "helpers", "ranked-ready-runner.ts");
+const APPROVAL_RUNNER = join(HERE, "helpers", "ranked-approval-runner.ts");
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -82,6 +83,23 @@ function spawnReadyRunner(dbPath: string, userId: string, startAt: number): Prom
   });
 }
 
+function spawnApprovalRunner(dbPath: string, userId: string, resultHash: string, startAt: number): Promise<ReadyRunnerResult> {
+  return new Promise<ReadyRunnerResult>((resolve, reject) => {
+    const input = JSON.stringify({ dbPath, tableId: "t1", userId, resultHash, operationId: `approve:${userId}`, startAt });
+    const child = spawn(process.execPath, ["--import", "tsx", APPROVAL_RUNNER, input], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (chunk) => (out += String(chunk)));
+    child.stderr.on("data", (chunk) => (err += String(chunk)));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const line = out.trim().split("\n").filter(Boolean).pop();
+      if (!line) return reject(new Error(`runner exited ${code}: ${err.slice(-2000)}`));
+      resolve(JSON.parse(line) as ReadyRunnerResult);
+    });
+  });
+}
+
 describe("PR21 ranked table cross-process readiness", () => {
   it("commits the table fee exactly once when the final ready races from another process", async () => {
     const ctx = setupFileDb();
@@ -110,6 +128,37 @@ describe("PR21 ranked table cross-process readiness", () => {
     ).toEqual([5_000, 5_000]);
     expect((db.prepare("SELECT COUNT(*) AS n FROM casino_tx_groups WHERE kind='table_start'").get() as { n: number }).n).toBe(1);
     expect((db.prepare("SELECT COUNT(*) AS n FROM casino_metric_events WHERE event_type='table_start'").get() as { n: number }).n).toBe(1);
+    db.close();
+  }, 60_000);
+
+  it("settles exactly once when the final approvals race from separate processes", async () => {
+    const ctx = setupFileDb();
+    ctx.rankedTables.create({ tableId: "t1", gameKey: "gf", baseAmount: 5_000, creatorId: "operator", operatorId: "operator", operationId: "create:t1" });
+    seedUser(ctx, "alice");
+    seedUser(ctx, "bob");
+    ctx.rankedTables.join({ tableId: "t1", userId: "alice", seat: 1, operationId: "join:alice" });
+    ctx.rankedTables.join({ tableId: "t1", userId: "bob", seat: 2, operationId: "join:bob" });
+    ctx.rankedTables.ready({ tableId: "t1", userId: "alice", operationId: "ready:alice" });
+    ctx.rankedTables.ready({ tableId: "t1", userId: "bob", operationId: "ready:bob" });
+    const submitted = ctx.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
+    const resultHash = submitted.result!.hash;
+    ctx.db.close();
+
+    const startAt = Date.now() + 2_000;
+    const results = await Promise.all([
+      spawnApprovalRunner(ctx.dbPath, "alice", resultHash, startAt),
+      spawnApprovalRunner(ctx.dbPath, "bob", resultHash, startAt),
+    ]);
+
+    expect(results.every((result) => result.ok)).toBe(true);
+    expect(results.some((result) => result.state === "settled")).toBe(true);
+
+    const db = openDb(ctx.dbPath);
+    expect((db.prepare("SELECT state FROM casino_tables WHERE table_id='t1'").get() as { state: string }).state).toBe("settled");
+    expect((db.prepare("SELECT amount FROM ether_balances WHERE user_id=?").get(escrowHolderFor("t1")) as { amount: number }).amount).toBe(0);
+    expect(db.prepare("SELECT * FROM casino_escrow WHERE session_id='t1'").all()).toEqual([]);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM casino_tx_groups WHERE kind='table_settle'").get() as { n: number }).n).toBe(1);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM casino_metric_events WHERE event_type='table_settle'").get() as { n: number }).n).toBe(1);
     db.close();
   }, 60_000);
 });

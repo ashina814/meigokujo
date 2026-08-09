@@ -33,6 +33,42 @@ function makeSettings() {
   };
 }
 
+function makeRankedTimeoutServices({
+  phase = "formal",
+  status = "open",
+  result = { processed: 1, refunded: 0, disputed: 0 },
+  processThrows,
+  stateThrows,
+}: {
+  phase?: string;
+  status?: string;
+  result?: { processed: number; refunded: number; disputed: number };
+  processThrows?: Error;
+  stateThrows?: Error;
+} = {}) {
+  return {
+    chipTx: {
+      openingPhase: vi.fn(() => {
+        if (stateThrows) throw stateThrows;
+        return phase;
+      }),
+    },
+    casinoStatus: {
+      current: vi.fn(() => {
+        if (stateThrows) throw stateThrows;
+        return { status };
+      }),
+    },
+    rankedTables: {
+      processDueTables: vi.fn(() => {
+        if (processThrows) throw processThrows;
+        return result;
+      }),
+    },
+    events: { log: vi.fn() },
+  };
+}
+
 describe("Scheduler実行済みマーカー", () => {
   it("失敗時はcompletedを保存せず、次回成功時に保存する", async () => {
     const { values, settings } = makeSettings();
@@ -73,6 +109,37 @@ describe("Scheduler実行済みマーカー", () => {
     const afterCompleted = vi.fn(async () => undefined);
     await expect(runSchedulerTaskOnce({ settings } as any, "daily:task", "system:test", afterCompleted)).resolves.toBe(false);
     expect(afterCompleted).not.toHaveBeenCalled();
+  });
+});
+
+describe("ranked table timeout scheduler", () => {
+  it("runs due processing only while formally open", async () => {
+    const { processRankedTableTimeoutsForScheduler } = await schedulerModule;
+    const open = makeRankedTimeoutServices();
+    processRankedTableTimeoutsForScheduler(open as any, 1_700_000_000);
+    expect(open.rankedTables.processDueTables).toHaveBeenCalledWith(1_700_000_000);
+    expect(open.events.log).toHaveBeenCalledWith("casino_ranked_timeout_scan", expect.objectContaining({ payload: { processed: 1, refunded: 0, disputed: 0 } }));
+
+    const preReset = makeRankedTimeoutServices({ phase: "pre_reset" });
+    processRankedTableTimeoutsForScheduler(preReset as any, 1_700_000_000);
+    expect(preReset.rankedTables.processDueTables).not.toHaveBeenCalled();
+
+    const halted = makeRankedTimeoutServices({ status: "recovery_halt" });
+    processRankedTableTimeoutsForScheduler(halted as any, 1_700_000_000);
+    expect(halted.rankedTables.processDueTables).not.toHaveBeenCalled();
+  });
+
+  it("logs scan failures without throwing", async () => {
+    const { processRankedTableTimeoutsForScheduler } = await schedulerModule;
+
+    const corruptState = makeRankedTimeoutServices({ stateThrows: new Error("phase corrupt") });
+    expect(() => processRankedTableTimeoutsForScheduler(corruptState as any, 1_700_000_000)).not.toThrow();
+    expect(corruptState.rankedTables.processDueTables).not.toHaveBeenCalled();
+    expect(corruptState.events.log).toHaveBeenCalledWith("casino_ranked_timeout_scan_failed", expect.objectContaining({ payload: { error: "phase corrupt" } }));
+
+    const processFailure = makeRankedTimeoutServices({ processThrows: new Error("one table failed") });
+    expect(() => processRankedTableTimeoutsForScheduler(processFailure as any, 1_700_000_000)).not.toThrow();
+    expect(processFailure.events.log).toHaveBeenCalledWith("casino_ranked_timeout_scan_failed", expect.objectContaining({ payload: { error: "one table failed" } }));
   });
 });
 

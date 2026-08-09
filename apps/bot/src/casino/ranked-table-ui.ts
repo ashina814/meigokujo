@@ -7,6 +7,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
   type ButtonInteraction,
+  type Client,
   type ModalSubmitInteraction,
 } from "discord.js";
 import type { RankedTableSnapshot } from "@meigokujo/core";
@@ -95,6 +96,7 @@ export async function handleRankedTableModal(interaction: ModalSubmitInteraction
   const orderedUserIds = raw.split(/[\s,]+/).map((value) => value.replace(/[<@!>]/g, "").trim()).filter(Boolean);
   try {
     services.rankedTables.submitResult({ tableId, userId: interaction.user.id, orderedUserIds, operationId: interaction.id });
+    await editBoundRankedTableMessage(interaction.client, services, tableId);
     await refresh(interaction, services, tableId, "結果を入力しました。全員の承認待ちです。");
   } catch (error) {
     await interaction.reply({ content: error instanceof Error ? error.message : String(error), ephemeral: true });
@@ -125,7 +127,8 @@ function controlsFor(snapshot: RankedTableSnapshot): ActionRowBuilder<ButtonBuil
   const { table, config, participants } = snapshot;
   const active = participants.filter((p) => p.participantState !== "declined");
   if (table.state === "recruiting") {
-    const nextSeat = Math.min(active.length + 1, config.participantCount);
+    const taken = new Set(active.map((p) => p.seat));
+    const nextSeat = Array.from({ length: config.participantCount }, (_, index) => index + 1).find((seat) => !taken.has(seat)) ?? config.participantCount;
     return new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`rtbl:join:${table.tableId}:${nextSeat}`).setLabel("参加").setStyle(ButtonStyle.Success),
     );
@@ -148,6 +151,24 @@ function controlsFor(snapshot: RankedTableSnapshot): ActionRowBuilder<ButtonBuil
     );
   }
   return null;
+}
+
+async function editBoundRankedTableMessage(client: Client, services: Services, tableId: string): Promise<void> {
+  const snapshot = services.rankedTables.snapshot(tableId);
+  const { table } = snapshot;
+  if (!table.channelId || !table.messageId) return;
+  try {
+    const channel = client.channels.cache.get(table.channelId) ?? await client.channels.fetch(table.channelId);
+    const textChannel = channel as { messages?: { fetch(id: string): Promise<{ edit(payload: unknown): Promise<unknown> }> } } | null;
+    const message = await textChannel?.messages?.fetch(table.messageId);
+    await message?.edit(renderRankedTable(snapshot));
+  } catch (e) {
+    services.events.log("casino_ranked_message_edit_failed", {
+      actor: "system:ranked-ui",
+      target: tableId,
+      payload: { channelId: table.channelId, messageId: table.messageId, error: e instanceof Error ? e.message : String(e) },
+    });
+  }
 }
 
 function resultModal(tableId: string): ModalBuilder {

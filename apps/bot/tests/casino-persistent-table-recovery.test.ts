@@ -31,7 +31,23 @@ function row(patch: Partial<PersistentTableRow> = {}): PersistentTableRow {
 }
 
 function servicesFor(table: PersistentTableRow, overrides: Partial<Services["persistentTables"]> = {}): Services {
+  const storageRow = {
+    base_amount: null,
+    fee_per_user: null,
+    participant_count: null,
+    rank_profile_json: null,
+    result_json: null,
+    result_hash: null,
+    result_submitted_by: null,
+    result_submitted_at: null,
+  };
   return {
+    db: { prepare: vi.fn(() => ({ get: vi.fn(() => storageRow) })) },
+    rankedTables: {
+      snapshot: vi.fn(() => {
+        throw new Error("not ranked");
+      }),
+    },
     persistentTables: {
       listLiveTables: vi.fn(() => [table]),
       bindMessage: vi.fn(),
@@ -173,5 +189,81 @@ describe("restorePersistentTableMessages", () => {
     expect(result.restored).toBe(0);
     expect(result.disputed).toBe(0);
     expect(result.failed).toEqual([{ tableId: "t1", error: "stale revision" }]);
+  });
+
+  it("keeps pure PR20 generic tables on the generic recovery card", async () => {
+    const edit = vi.fn(async () => undefined);
+    const channel = {
+      guildId: "g",
+      isTextBased: () => true,
+      messages: { fetch: vi.fn(async () => ({ edit })) },
+      send: vi.fn(),
+    };
+    const services = servicesFor(row({ gameKey: "poker" }));
+    const result = await restorePersistentTableMessages(clientFor(channel), services);
+    expect(result).toEqual({ restored: 1, replaced: 0, disputed: 0, failed: [] });
+    expect(services.persistentTables.markDisputedFromRecovery).not.toHaveBeenCalled();
+    expect((edit.mock.calls[0]![0] as { embeds: Array<{ data: { title?: string } }> }).embeds[0]!.data.title).toBe("Casino Table");
+  });
+
+  it("marks partial ranked storage disputed instead of falling back to the generic card", async () => {
+    const edit = vi.fn(async () => undefined);
+    const channel = {
+      guildId: "g",
+      isTextBased: () => true,
+      messages: { fetch: vi.fn(async () => ({ edit })) },
+      send: vi.fn(),
+    };
+    const services = servicesFor(row(), {
+      markDisputedFromRecovery: vi.fn(),
+    });
+    (services.db.prepare as any).mockReturnValueOnce({
+      get: vi.fn(() => ({
+        base_amount: 5_000,
+        fee_per_user: null,
+        participant_count: 2,
+        rank_profile_json: null,
+        result_json: null,
+        result_hash: null,
+        result_submitted_by: null,
+        result_submitted_at: null,
+      })),
+    });
+
+    const result = await restorePersistentTableMessages(clientFor(channel), services);
+
+    expect(result).toEqual({ restored: 0, replaced: 0, disputed: 1, failed: [] });
+    expect(edit).not.toHaveBeenCalled();
+    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith("t1", 3, "not ranked");
+  });
+
+  it("reports partial ranked disputed CAS failures as recovery failures", async () => {
+    const channel = {
+      guildId: "g",
+      isTextBased: () => true,
+      messages: { fetch: vi.fn() },
+      send: vi.fn(),
+    };
+    const services = servicesFor(row(), {
+      markDisputedFromRecovery: vi.fn(() => {
+        throw new Error("stale revision");
+      }),
+    });
+    (services.db.prepare as any).mockReturnValueOnce({
+      get: vi.fn(() => ({
+        base_amount: 5_000,
+        fee_per_user: null,
+        participant_count: 2,
+        rank_profile_json: null,
+        result_json: null,
+        result_hash: null,
+        result_submitted_by: null,
+        result_submitted_at: null,
+      })),
+    });
+
+    const result = await restorePersistentTableMessages(clientFor(channel), services);
+
+    expect(result).toEqual({ restored: 0, replaced: 0, disputed: 0, failed: [{ tableId: "t1", error: "stale revision" }] });
   });
 });

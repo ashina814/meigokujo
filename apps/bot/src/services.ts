@@ -199,12 +199,12 @@ export function buildServices() {
   }
   const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
   const persistentTables = new PersistentTables(db, events, { openingPhase: () => chipTx.openingPhase() });
-  const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, casinoMetrics, { isSoloSeatOccupied: isSeatOccupied });
   const chipAssets = new CasinoChipAssets(db, chips);
   // 所有判定の正本をここで一本化する。プロセス内の着席は DB のどの表にも
   // 現れないので、渡さないとショップの域外確認票がゲーム中の自由チップを
   // Land へ戻せてしまう（監査ブロッカー・項目11）
   const chipFlow = new CasinoChipFlow(db, chips, events, chipAssets, { isSeatOccupied });
+  const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, casinoMetrics, { chipFlow, isSoloSeatOccupied: isSeatOccupied });
   const takutate = new Takutate(db, events);
   const casinoIntegrity = new CasinoIntegrity(db, ledger, chips, escrow, chipAssets);
   const openingPlanner = new OpeningPlanner({ db, ledger, chips, chipAssets, integrity: casinoIntegrity, status: casinoStatus, settings, departments });

@@ -4,6 +4,7 @@ import { canonicalHash, canonicalStringify } from "./opening-canonical.js";
 import type { ChipLedger } from "./chip-ledger.js";
 import { escrowHolderFor, type Escrow } from "./escrow.js";
 import type { CasinoMetrics } from "./metrics.js";
+import type { CasinoChipFlow } from "./chip-flow.js";
 import {
   PersistentTableError,
   type PersistentTableParticipantRow,
@@ -54,7 +55,8 @@ export type RankedTableErrorCode =
   | "ERR_RANKED_OPERATION_CONFLICT"
   | "ERR_RANKED_RESULT_INVALID"
   | "ERR_RANKED_RESULT_STALE"
-  | "ERR_RANKED_ESCROW_MISMATCH";
+  | "ERR_RANKED_ESCROW_MISMATCH"
+  | "ERR_RANKED_RECOVERY_FAILED";
 
 export class RankedTableError extends Error {
   constructor(
@@ -131,9 +133,11 @@ export interface ApproveRankedResultInput {
 
 export interface RankedTablesOptions {
   now?: () => number;
+  chipFlow?: CasinoChipFlow;
   isSoloSeatOccupied?: (userId: string) => boolean;
   afterFeeCommitForTesting?: (tableId: string) => void;
   afterPlayingUpdateForTesting?: (tableId: string) => void;
+  afterAutoDepositForTesting?: (tableId: string, userId: string) => void;
   beforeSettlementTransferForTesting?: (index: number, dist: { to: string; amount: number }) => void;
 }
 
@@ -237,7 +241,7 @@ export class RankedTables {
   }
 
   create(input: CreateRankedTableInput): RankedTableSnapshot {
-    const profile = input.profile ?? fixedProfileFor(input.gameKey);
+    const profile = profileForGame(input.gameKey, input.profile);
     const baseAmount = input.baseAmount ?? tierByKey(input.tierKey ?? "middle").baseAmount;
     const config = validateRankProfile(profile, baseAmount);
     const operationId = requiredString(input.operationId, "operationId");
@@ -321,6 +325,16 @@ export class RankedTables {
         if (active.length >= config.participantCount) throw new RankedTableError("ERR_RANKED_TABLE_NOT_JOINABLE", "ranked table is full");
         if (active.some((p) => p.seat === safeInput.seat)) throw new RankedTableError("ERR_RANKED_SEAT", "ranked table seat is taken");
         const holdAmount = checkedAdd(config.baseAmount, config.feePerUser, "joinHold");
+        try {
+          this.options.chipFlow?.ensureFreeChips(safeInput.userId, holdAmount, chipFlowOperationId("ranked-join", safeInput));
+        } catch (e) {
+          throw new RankedTableError("ERR_RANKED_INSUFFICIENT_FUNDS", "participant does not have enough Land or chips", {
+            userId: safeInput.userId,
+            amount: holdAmount,
+            cause: e instanceof Error ? e.message : String(e),
+          });
+        }
+        this.options.afterAutoDepositForTesting?.(table.tableId, safeInput.userId);
         if (!this.escrow.hold(table.tableId, safeInput.userId, holdAmount, table.gameKey, safeInput.operationId)) {
           throw new RankedTableError("ERR_RANKED_INSUFFICIENT_FUNDS", "participant does not have enough chips", {
             userId: safeInput.userId,
@@ -343,7 +357,7 @@ export class RankedTables {
             reason: "ranked table capacity reached",
           });
           this.db
-            .prepare("UPDATE casino_tables SET deadline_at=?, updated_at=? WHERE table_id=?")
+            .prepare("UPDATE casino_tables SET deadline_at=?, expires_at=NULL, updated_at=? WHERE table_id=?")
             .run(this.now() + READY_DEADLINE_SEC, this.now(), table.tableId);
         }
         this.metrics?.record({
@@ -444,7 +458,15 @@ export class RankedTables {
       userId: requiredString(input.userId, "userId"),
       operationId: requiredString(input.operationId, "operationId"),
     };
+    const fingerprint = canonicalStringify(safeInput);
     const tx = this.db.transaction(() => {
+      const replay = this.participantByDeclineOperation(safeInput.operationId);
+      if (replay) {
+        if (replay.decline_fingerprint !== fingerprint) {
+          throw new RankedTableError("ERR_RANKED_OPERATION_CONFLICT", "decline operation replay conflict");
+        }
+        return this.snapshot(replay.table_id);
+      }
       const table = this.requiredTable(safeInput.tableId);
       if (table.state !== "ready_check") throw new RankedTableError("ERR_RANKED_TABLE_NOT_READY", "ranked table is not in ready_check");
       this.requireActiveParticipant(table.tableId, safeInput.userId);
@@ -452,10 +474,11 @@ export class RankedTables {
       this.db
         .prepare(
           `UPDATE casino_table_participants
-             SET participant_state='declined', ready_state=NULL, approval_state=NULL, declined_at=?
+             SET participant_state='declined', ready_state=NULL, approval_state=NULL,
+                 decline_operation_id=?, decline_fingerprint=?, declined_at=?
            WHERE table_id=? AND user_id=?`,
         )
-        .run(this.now(), table.tableId, safeInput.userId);
+        .run(safeInput.operationId, fingerprint, this.now(), table.tableId, safeInput.userId);
       this.db.prepare("UPDATE casino_table_participants SET ready_state=NULL WHERE table_id=? AND COALESCE(participant_state, 'active') != 'declined'").run(table.tableId);
       this.persistentTables.transition({
         tableId: table.tableId,
@@ -465,7 +488,9 @@ export class RankedTables {
         actor: safeInput.userId,
         reason: "ranked participant declined during ready_check",
       });
-      this.db.prepare("UPDATE casino_tables SET deadline_at=?, updated_at=? WHERE table_id=?").run(this.now() + RECRUITING_DEADLINE_SEC, this.now(), table.tableId);
+      this.db
+        .prepare("UPDATE casino_tables SET deadline_at=?, expires_at=?, updated_at=? WHERE table_id=?")
+        .run(this.now() + RECRUITING_DEADLINE_SEC, table.createdAt + RECRUITING_EXPIRES_SEC, this.now(), table.tableId);
       return this.snapshot(table.tableId);
     });
     return tx.immediate();
@@ -539,7 +564,9 @@ export class RankedTables {
     for (const table of this.persistentTables.listDueTables(now)) {
       const tx = this.db.transaction(() => {
         const current = this.requiredTable(table.tableId);
-        if (current.deadlineAt !== null && current.deadlineAt > now && current.expiresAt !== null && current.expiresAt > now) return;
+        const deadlineDue = current.deadlineAt !== null && current.deadlineAt <= now;
+        const expiresDue = current.state === "recruiting" && current.expiresAt !== null && current.expiresAt <= now;
+        if (!deadlineDue && !expiresDue) return;
         if (current.state === "recruiting") {
           const active = this.activeParticipants(current.tableId);
           refunded += this.escrow.refundMany(current.tableId, active.map((p) => p.userId), `timeout:recruiting:${current.revision}`);
@@ -572,7 +599,9 @@ export class RankedTables {
             actor: "system:ranked-timeout",
             reason: "ranked ready timeout",
           });
-          this.db.prepare("UPDATE casino_tables SET deadline_at=?, updated_at=? WHERE table_id=?").run(now + RECRUITING_DEADLINE_SEC, now, current.tableId);
+          this.db
+            .prepare("UPDATE casino_tables SET deadline_at=?, expires_at=?, updated_at=? WHERE table_id=?")
+            .run(now + RECRUITING_DEADLINE_SEC, current.createdAt + RECRUITING_EXPIRES_SEC, now, current.tableId);
           processed++;
           return;
         }
@@ -582,7 +611,15 @@ export class RankedTables {
           processed++;
         }
       });
-      tx.immediate();
+      try {
+        tx.immediate();
+      } catch (e) {
+        this.events.log("casino_ranked_timeout_failed", {
+          actor: "system:ranked-timeout",
+          target: table.tableId,
+          payload: { error: e instanceof Error ? e.message : String(e) },
+        });
+      }
     }
     return { processed, refunded, disputed };
   }
@@ -647,7 +684,14 @@ export class RankedTables {
           .run(safeInput.operationId, fingerprint, table.tableId, safeInput.userId);
       }
       const active = this.activeParticipants(table.tableId);
-      if (active.every((p) => p.approvalState === "approved")) this.settleApproved(table, safeInput.userId);
+      if (active.every((p) => p.approvalState === "approved")) {
+        try {
+          this.settleApproved(table, safeInput.userId);
+        } catch (e) {
+          if (!isSettlementCorruption(e)) throw e;
+          this.markDisputed(table, e instanceof Error ? e.message : "ranked settlement consistency check failed");
+        }
+      }
       return this.snapshot(table.tableId);
     });
     return tx.immediate();
@@ -819,6 +863,12 @@ export class RankedTables {
       .prepare("SELECT table_id, approval_fingerprint FROM casino_table_participants WHERE approval_operation_id=?")
       .get(operationId) as { table_id: string; approval_fingerprint: string | null } | undefined) ?? null;
   }
+
+  private participantByDeclineOperation(operationId: string): { table_id: string; decline_fingerprint: string | null } | null {
+    return (this.db
+      .prepare("SELECT table_id, decline_fingerprint FROM casino_table_participants WHERE decline_operation_id=?")
+      .get(operationId) as { table_id: string; decline_fingerprint: string | null } | undefined) ?? null;
+  }
 }
 
 function fixedProfileFor(gameKey: string): GenericRankProfile {
@@ -826,6 +876,34 @@ function fixedProfileFor(gameKey: string): GenericRankProfile {
   if (gameKey === "sanma") return RANKED_PROFILES.sanma;
   if (gameKey === "yonma") return RANKED_PROFILES.yonma;
   throw new RankedTableError("ERR_RANKED_BAD_PROFILE", "generic ranked table requires an explicit trusted profile", { gameKey });
+}
+
+function profileForGame(gameKey: string, explicit?: GenericRankProfile): GenericRankProfile {
+  const fixed = gameKey === "gf" || gameKey === "sanma" || gameKey === "yonma" ? fixedProfileFor(gameKey) : null;
+  if (!fixed) {
+    if (!explicit) throw new RankedTableError("ERR_RANKED_BAD_PROFILE", "generic ranked table requires an explicit trusted profile", { gameKey });
+    return explicit;
+  }
+  if (!explicit) return fixed;
+  if (canonicalStringify(explicit) !== canonicalStringify(fixed)) {
+    throw new RankedTableError("ERR_RANKED_BAD_PROFILE", "fixed ranked game cannot override its canonical profile", { gameKey });
+  }
+  return fixed;
+}
+
+function chipFlowOperationId(prefix: string, input: { tableId: string; userId: string; operationId: string }): string {
+  const raw = `${prefix}-${input.tableId}-${input.userId}-${input.operationId}`;
+  return raw.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 180);
+}
+
+function isSettlementCorruption(error: unknown): boolean {
+  if (!(error instanceof RankedTableError)) return false;
+  return (
+    error.code === "ERR_RANKED_ESCROW_MISMATCH" ||
+    error.code === "ERR_RANKED_RESULT_INVALID" ||
+    error.code === "ERR_RANKED_TABLE_NOT_CONFIGURED" ||
+    error.code === "ERR_RANKED_BAD_PROFILE"
+  );
 }
 
 function tierByKey(key: string): RankedTableTier {

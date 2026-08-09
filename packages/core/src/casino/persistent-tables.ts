@@ -153,6 +153,8 @@ export interface PersistentTableParticipantRow {
   readyFingerprint: string | null;
   approvalOperationId: string | null;
   approvalFingerprint: string | null;
+  declineOperationId: string | null;
+  declineFingerprint: string | null;
   declinedAt: number | null;
 }
 
@@ -489,7 +491,11 @@ export class PersistentTables {
 
   listDueTables(now = this.now()): PersistentTableRow[] {
     if (this.schemaStateOrThrow() === "none") return [];
-    return this.listLiveTables().filter((row) => (row.deadlineAt !== null && row.deadlineAt <= now) || (row.expiresAt !== null && row.expiresAt <= now));
+    return this.listLiveTables().filter((row) => {
+      const deadlineDue = row.deadlineAt !== null && row.deadlineAt <= now;
+      const expiresDue = row.state === "recruiting" && row.expiresAt !== null && row.expiresAt <= now;
+      return deadlineDue || expiresDue;
+    });
   }
 
   get(tableId: string): PersistentTableRow | null {
@@ -573,12 +579,16 @@ export class PersistentTables {
         ready_fingerprint TEXT,
         approval_operation_id TEXT,
         approval_fingerprint TEXT,
+        decline_operation_id TEXT,
+        decline_fingerprint TEXT,
         declined_at INTEGER,
         PRIMARY KEY (table_id, user_id),
-        UNIQUE (table_id, seat),
         FOREIGN KEY (table_id) REFERENCES casino_tables(table_id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS idx_casino_table_participants_user ON casino_table_participants(user_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_casino_table_participants_active_seat
+        ON casino_table_participants(table_id, seat)
+        WHERE COALESCE(participant_state, 'active') != 'declined';
     `);
     this.migratePr21Columns();
     this.assertSchemaUsable();
@@ -601,7 +611,57 @@ export class PersistentTables {
     this.addColumnIfMissing("casino_table_participants", "ready_fingerprint", "TEXT");
     this.addColumnIfMissing("casino_table_participants", "approval_operation_id", "TEXT");
     this.addColumnIfMissing("casino_table_participants", "approval_fingerprint", "TEXT");
+    this.addColumnIfMissing("casino_table_participants", "decline_operation_id", "TEXT");
+    this.addColumnIfMissing("casino_table_participants", "decline_fingerprint", "TEXT");
     this.addColumnIfMissing("casino_table_participants", "declined_at", "INTEGER");
+    this.migrateActiveSeatUniqueness();
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_casino_table_participants_user ON casino_table_participants(user_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_casino_table_participants_active_seat
+        ON casino_table_participants(table_id, seat)
+        WHERE COALESCE(participant_state, 'active') != 'declined';
+    `);
+  }
+
+  private migrateActiveSeatUniqueness(): void {
+    const sql = (this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='casino_table_participants'").get() as { sql?: string } | undefined)?.sql ?? "";
+    if (!sql.includes("UNIQUE (table_id, seat)") && !sql.includes("UNIQUE(table_id, seat)")) return;
+    this.db.exec(`
+      DROP INDEX IF EXISTS idx_casino_table_participants_user;
+      DROP INDEX IF EXISTS idx_casino_table_participants_active_seat;
+      CREATE TABLE persistent_table_participants_pr21_tmp (
+        table_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        seat INTEGER NOT NULL,
+        joined_at INTEGER NOT NULL,
+        operation_id TEXT NOT NULL UNIQUE,
+        request_fingerprint TEXT NOT NULL,
+        ready_state TEXT,
+        approval_state TEXT,
+        participant_state TEXT,
+        ready_operation_id TEXT,
+        ready_fingerprint TEXT,
+        approval_operation_id TEXT,
+        approval_fingerprint TEXT,
+        decline_operation_id TEXT,
+        decline_fingerprint TEXT,
+        declined_at INTEGER,
+        PRIMARY KEY (table_id, user_id),
+        FOREIGN KEY (table_id) REFERENCES casino_tables(table_id) ON DELETE CASCADE
+      );
+      INSERT INTO persistent_table_participants_pr21_tmp (
+        table_id, user_id, seat, joined_at, operation_id, request_fingerprint, ready_state, approval_state,
+        participant_state, ready_operation_id, ready_fingerprint, approval_operation_id, approval_fingerprint,
+        decline_operation_id, decline_fingerprint, declined_at
+      )
+      SELECT
+        table_id, user_id, seat, joined_at, operation_id, request_fingerprint, ready_state, approval_state,
+        participant_state, ready_operation_id, ready_fingerprint, approval_operation_id, approval_fingerprint,
+        decline_operation_id, decline_fingerprint, declined_at
+      FROM casino_table_participants;
+      DROP TABLE casino_table_participants;
+      ALTER TABLE persistent_table_participants_pr21_tmp RENAME TO casino_table_participants;
+    `);
   }
 
   private addColumnIfMissing(table: "casino_tables" | "casino_table_participants", column: string, spec: string): void {
@@ -724,6 +784,8 @@ function mapParticipantRow(row: Record<string, unknown>): PersistentTablePartici
     readyFingerprint: optionalString(row.ready_fingerprint, "ready_fingerprint"),
     approvalOperationId: optionalString(row.approval_operation_id, "approval_operation_id"),
     approvalFingerprint: optionalString(row.approval_fingerprint, "approval_fingerprint"),
+    declineOperationId: optionalString(row.decline_operation_id, "decline_operation_id"),
+    declineFingerprint: optionalString(row.decline_fingerprint, "decline_fingerprint"),
     declinedAt: nullableNonnegativeInt(row.declined_at, "declined_at"),
   };
 }

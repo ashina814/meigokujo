@@ -22,6 +22,7 @@ import {
   registerDefaultTxTypes,
   validateRankProfile,
   CasinoChipAssets,
+  CasinoChipFlow,
   CasinoIntegrity,
   CasinoStatus,
   Departments,
@@ -44,14 +45,21 @@ function setup(options: ConstructorParameters<typeof RankedTables>[6] = {}) {
   const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
   const persistentTables = new PersistentTables(db, events, { openingPhase: () => chipTx.openingPhase(), now: () => 1_700_000_000 });
   const metrics = new CasinoMetrics(db, chipTx, () => 1_700_000_000);
-  const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, metrics, { now: () => 1_700_000_000, ...options });
-  return { db, ledger, events, chipTx, chips, casino, escrow, persistentTables, metrics, rankedTables };
+  const chipAssets = new CasinoChipAssets(db, chips);
+  const chipFlow = new CasinoChipFlow(db, chips, events, chipAssets);
+  const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, metrics, { chipFlow, now: () => 1_700_000_000, ...options });
+  return { db, ledger, events, chipTx, chips, casino, escrow, persistentTables, metrics, rankedTables, chipFlow };
 }
 
 function seedUser(ctx: ReturnType<typeof setup>, userId: string, amount = 30_000): void {
   ctx.ledger.ensureAccount(`user:${userId}`, "user");
   ctx.ledger.transfer({ from: TREASURY, to: `user:${userId}`, amount, type: "initial", actor: "test", idempotencyKey: `seed:${userId}:${amount}` });
   ctx.chips.deposit(userId, amount, `deposit:${userId}:${amount}`);
+}
+
+function seedLandOnly(ctx: ReturnType<typeof setup>, userId: string, amount: number): void {
+  ctx.ledger.ensureAccount(`user:${userId}`, "user");
+  ctx.ledger.transfer({ from: TREASURY, to: `user:${userId}`, amount, type: "initial", actor: "test", idempotencyKey: `land:${userId}:${amount}` });
 }
 
 function createTable(ctx: ReturnType<typeof setup>, tableId = "t1", gameKey = "gf", baseAmount = 5_000) {
@@ -107,9 +115,86 @@ describe("ranked table math", () => {
     expect(() => validateRankProfile({ key: "bad", participantCount: 2, rankDeltaBps: [3_333, -3_333] }, 5_000)).toThrow(RankedTableError);
     expect(() => validateRankProfile({ key: "bad", participantCount: 2, rankDeltaBps: [-20_000, 20_000] }, 5_000)).toThrow(RankedTableError);
   });
+
+  it("rejects custom payout profiles for fixed games but accepts canonical fixed and generic explicit profiles", () => {
+    const ctx = setup();
+    expect(() =>
+      ctx.rankedTables.create({ tableId: "bad-gf", gameKey: "gf", baseAmount: 5_000, profile: { key: "gf", participantCount: 2, rankDeltaBps: [5_000, -5_000] }, creatorId: "operator", operatorId: "operator", operationId: "create:bad-gf" }),
+    ).toThrow(RankedTableError);
+    expect(() =>
+      ctx.rankedTables.create({ tableId: "bad-sanma", gameKey: "sanma", baseAmount: 10_000, profile: { key: "sanma", participantCount: 3, rankDeltaBps: [10_000, 0, -10_000] }, creatorId: "operator", operatorId: "operator", operationId: "create:bad-sanma" }),
+    ).toThrow(RankedTableError);
+    expect(() =>
+      ctx.rankedTables.create({ tableId: "bad-yonma", gameKey: "yonma", baseAmount: 10_000, profile: { key: "yonma", participantCount: 4, rankDeltaBps: [15_000, 0, -5_000, -10_000] }, creatorId: "operator", operatorId: "operator", operationId: "create:bad-yonma" }),
+    ).toThrow(RankedTableError);
+    expect(ctx.rankedTables.create({ tableId: "ok-gf", gameKey: "gf", baseAmount: 5_000, profile: RANKED_PROFILES.gf, creatorId: "operator", operatorId: "operator", operationId: "create:ok-gf" }).config.profile).toEqual(RANKED_PROFILES.gf);
+    expect(ctx.rankedTables.create({ tableId: "ok-generic", gameKey: "trusted5", baseAmount: 5_000, profile: { key: "trusted5", participantCount: 5, rankDeltaBps: [10_000, 5_000, 0, -5_000, -10_000] }, creatorId: "operator2", operatorId: "operator", operationId: "create:ok-generic" }).config.participantCount).toBe(5);
+  });
 });
 
 describe("RankedTables join and ready", () => {
+  it("auto-deposits the exact join shortage before holding escrow", () => {
+    const ctx = setup();
+    createTable(ctx);
+    seedLandOnly(ctx, "alice", 5_150);
+    join(ctx, "t1", "alice", 1);
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(0);
+    expect(ctx.chips.balanceOf("alice")).toBe(0);
+    expect(escrowRows(ctx, "t1")).toEqual([{ user_id: "alice", amount: 5_150, source: escrowHolderFor("t1") }]);
+  });
+
+  it("auto-deposits only the missing part when free chips already exist", () => {
+    const ctx = setup();
+    createTable(ctx);
+    seedLandOnly(ctx, "alice", 5_150);
+    ctx.chips.deposit("alice", 1_000, "seed:partial-free");
+    join(ctx, "t1", "alice", 1);
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(0);
+    expect(ctx.chips.balanceOf("alice")).toBe(0);
+    expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(5_150);
+  });
+
+  it("rolls back auto-deposit when later join work fails", () => {
+    const ctx = setup({ afterAutoDepositForTesting: () => { throw new Error("after deposit"); } });
+    createTable(ctx);
+    seedLandOnly(ctx, "alice", 5_150);
+    expect(() => join(ctx, "t1", "alice", 1)).toThrow("after deposit");
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(5_150);
+    expect(ctx.chips.balanceOf("alice")).toBe(0);
+    expect(escrowRows(ctx, "t1")).toEqual([]);
+    expect(ctx.persistentTables.participants("t1")).toEqual([]);
+  });
+
+  it("rolls back auto-deposit and escrow hold when a concurrent seat conflict reaches the insert", () => {
+    const ctx = setup({
+      afterAutoDepositForTesting: () => {
+        ctx.db.prepare(
+          `INSERT INTO casino_table_participants
+             (table_id, user_id, seat, joined_at, operation_id, request_fingerprint, ready_state, approval_state, participant_state)
+           VALUES ('t1', 'carol', 1, 1, 'join:carol', '{}', NULL, NULL, 'active')`,
+        ).run();
+      },
+    });
+    createTable(ctx);
+    seedLandOnly(ctx, "alice", 5_150);
+    expect(() => join(ctx, "t1", "alice", 1)).toThrow();
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(5_150);
+    expect(ctx.chips.balanceOf("alice")).toBe(0);
+    expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(0);
+    expect(ctx.persistentTables.participants("t1")).toEqual([]);
+  });
+
+  it("leaves Land, chips, escrow, and participants unchanged when Land is insufficient", () => {
+    const ctx = setup();
+    createTable(ctx);
+    seedLandOnly(ctx, "alice", 5_149);
+    expect(() => join(ctx, "t1", "alice", 1)).toThrow();
+    expect(ctx.ledger.balanceOf("user:alice")).toBe(5_149);
+    expect(ctx.chips.balanceOf("alice")).toBe(0);
+    expect(escrowRows(ctx, "t1")).toEqual([]);
+    expect(ctx.persistentTables.participants("t1")).toEqual([]);
+  });
+
   it("holds R+fee atomically and replays without double hold", () => {
     const ctx = setup();
     createTable(ctx);
@@ -188,6 +273,25 @@ describe("RankedTables join and ready", () => {
     expect(escrowRows(ctx, "t1")).toEqual([{ user_id: "alice", amount: 5_150, source: escrowHolderFor("t1") }]);
     expect(snapshot.participants.find((p) => p.userId === "alice")!.readyState).toBeNull();
   });
+
+  it("allows replacement users to reuse declined seats without replay double refunds or holds", () => {
+    const ctx = setup();
+    createTable(ctx);
+    seedUser(ctx, "alice");
+    seedUser(ctx, "bob");
+    seedUser(ctx, "carol");
+    join(ctx, "t1", "alice", 1);
+    join(ctx, "t1", "bob", 2);
+    ctx.rankedTables.ready({ tableId: "t1", userId: "alice", operationId: "ready:alice" });
+    ctx.rankedTables.decline({ tableId: "t1", userId: "bob", operationId: "decline:bob" });
+    ctx.rankedTables.decline({ tableId: "t1", userId: "bob", operationId: "decline:bob" });
+    const replaced = join(ctx, "t1", "carol", 2);
+    expect(replaced.participants.filter((p) => p.participantState !== "declined").map((p) => [p.userId, p.seat])).toEqual([["alice", 1], ["carol", 2]]);
+    expect(ctx.chips.balanceOf("bob")).toBe(30_000);
+    expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(10_300);
+    ctx.rankedTables.join({ tableId: "t1", userId: "bob", seat: 2, operationId: "join:t1:bob" });
+    expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(10_300);
+  });
 });
 
 describe("RankedTables result approval and settlement", () => {
@@ -256,6 +360,18 @@ describe("RankedTables result approval and settlement", () => {
     expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(10_000);
     expect(escrowRows(ctx, "t1").map((r) => r.amount)).toEqual([5_000, 5_000]);
   });
+
+  it("moves settlement consistency mismatches to disputed without moving funds", () => {
+    const ctx = setup();
+    startGf(ctx);
+    const submitted = ctx.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
+    ctx.rankedTables.approve({ tableId: "t1", userId: "alice", resultHash: submitted.result!.hash, operationId: "approve:alice" });
+    ctx.db.prepare("UPDATE casino_escrow SET amount=amount-1 WHERE session_id='t1' AND user_id='alice'").run();
+    const disputed = ctx.rankedTables.approve({ tableId: "t1", userId: "bob", resultHash: submitted.result!.hash, operationId: "approve:bob" });
+    expect(disputed.table.state).toBe("disputed");
+    expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(10_000);
+    expect(escrowRows(ctx, "t1").map((r) => r.amount)).toEqual([4_999, 5_000]);
+  });
 });
 
 describe("RankedTables timeout, metrics, and opening safety", () => {
@@ -273,6 +389,48 @@ describe("RankedTables timeout, metrics, and opening safety", () => {
     ctx.db.prepare("UPDATE casino_tables SET deadline_at=? WHERE table_id='playing-timeout'").run(1_699_999_999);
     expect(ctx.rankedTables.processDueTables(1_700_000_000).disputed).toBe(1);
     expect(ctx.chips.balanceOf(escrowHolderFor("playing-timeout"))).toBe(10_000);
+  });
+
+  it("applies state-aware ranked deadlines and keeps the recruiting hard cap anchored to created_at", () => {
+    const ctx = setup();
+    startGf(ctx, "playing-hardcap");
+    ctx.db.prepare("UPDATE casino_tables SET created_at=?, expires_at=?, deadline_at=? WHERE table_id='playing-hardcap'").run(1_699_980_000, 1_699_990_800, 1_700_086_400);
+    expect(ctx.rankedTables.processDueTables(1_700_000_000)).toEqual({ processed: 0, refunded: 0, disputed: 0 });
+    expect(ctx.rankedTables.snapshot("playing-hardcap").table.state).toBe("playing");
+    ctx.db.prepare("UPDATE casino_tables SET deadline_at=? WHERE table_id='playing-hardcap'").run(1_699_999_999);
+    expect(ctx.rankedTables.processDueTables(1_700_000_000).disputed).toBe(1);
+
+    const pending = setup();
+    startGf(pending, "pending-timeout");
+    const submitted = pending.rankedTables.submitResult({ tableId: "pending-timeout", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:pending-timeout" });
+    pending.db.prepare("UPDATE casino_tables SET deadline_at=? WHERE table_id='pending-timeout'").run(1_699_999_999);
+    expect(submitted.table.state).toBe("pending_approval");
+    expect(pending.rankedTables.processDueTables(1_700_000_000).disputed).toBe(1);
+
+    const ready = setup();
+    createTable(ready);
+    seedUser(ready, "alice");
+    seedUser(ready, "bob");
+    join(ready, "t1", "alice", 1);
+    join(ready, "t1", "bob", 2);
+    ready.rankedTables.ready({ tableId: "t1", userId: "alice", operationId: "ready:alice" });
+    ready.db.prepare("UPDATE casino_tables SET created_at=?, deadline_at=? WHERE table_id='t1'").run(1_699_989_300, 1_699_999_999);
+    ready.rankedTables.processDueTables(1_700_000_000);
+    const returned = ready.rankedTables.snapshot("t1").table;
+    expect(returned.state).toBe("recruiting");
+    expect(returned.expiresAt).toBe(1_700_000_100);
+  });
+
+  it("does not process a stale due-list snapshot after the deadline is extended", () => {
+    const ctx = setup();
+    createTable(ctx);
+    seedUser(ctx, "alice");
+    join(ctx, "t1", "alice", 1);
+    ctx.db.prepare("UPDATE casino_tables SET deadline_at=? WHERE table_id='t1'").run(1_699_999_999);
+    expect(ctx.persistentTables.listDueTables(1_700_000_000)).toHaveLength(1);
+    ctx.db.prepare("UPDATE casino_tables SET deadline_at=? WHERE table_id='t1'").run(1_700_000_500);
+    expect(ctx.rankedTables.processDueTables(1_700_000_000)).toEqual({ processed: 0, refunded: 0, disputed: 0 });
+    expect(ctx.rankedTables.snapshot("t1").table.state).toBe("recruiting");
   });
 
   it("rolls up table_fee_income from idempotent table_start metrics and matches house P/L", () => {

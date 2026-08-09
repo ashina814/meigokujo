@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { RankedTableSnapshot } from "@meigokujo/core";
-import { isRankedTableButton, isRankedTableModal, renderRankedTable } from "../src/casino/ranked-table-ui.js";
+import { vi } from "vitest";
+import { handleRankedTableModal, isRankedTableButton, isRankedTableModal, renderRankedTable } from "../src/casino/ranked-table-ui.js";
 
 function snapshot(state: RankedTableSnapshot["table"]["state"]): RankedTableSnapshot {
   return {
@@ -68,5 +69,66 @@ describe("ranked table UI", () => {
     expect(isRankedTableButton("casino:home:open")).toBe(false);
     expect(isRankedTableModal("rtbl:result-modal:t1")).toBe(true);
     expect(isRankedTableModal("rtbl:result:t1")).toBe(false);
+  });
+
+  it("edits the canonical table message to pending approval after modal result submit", async () => {
+    const edit = vi.fn(async () => undefined);
+    const channel = { messages: { fetch: vi.fn(async () => ({ edit })) } };
+    const services = {
+      rankedTables: {
+        submitResult: vi.fn(),
+        snapshot: vi.fn(() => snapshot("pending_approval")),
+      },
+      events: { log: vi.fn() },
+    };
+    const interaction = {
+      customId: "rtbl:result-modal:t1",
+      id: "modal-1",
+      user: { id: "alice" },
+      fields: { getTextInputValue: vi.fn(() => "<@alice> bob") },
+      client: { channels: { cache: new Map([["c", channel]]), fetch: vi.fn() } },
+      isModalSubmit: () => true,
+      reply: vi.fn(async () => undefined),
+    };
+
+    await handleRankedTableModal(interaction as any, services as any);
+
+    expect(services.rankedTables.submitResult).toHaveBeenCalledWith({
+      tableId: "t1",
+      userId: "alice",
+      orderedUserIds: ["alice", "bob"],
+      operationId: "modal-1",
+    });
+    expect(edit).toHaveBeenCalledTimes(1);
+    const payload = edit.mock.calls[0]![0] as ReturnType<typeof renderRankedTable>;
+    expect(payload.components[0]!.components.map((button) => button.data.custom_id)).toEqual(["rtbl:approve:t1", "rtbl:dispute:t1"]);
+    expect(interaction.reply).toHaveBeenCalledWith(expect.objectContaining({ ephemeral: true }));
+  });
+
+  it("keeps the submitted result when canonical message edit fails", async () => {
+    const edit = vi.fn(async () => { throw new Error("Discord edit failed"); });
+    const channel = { messages: { fetch: vi.fn(async () => ({ edit })) } };
+    const services = {
+      rankedTables: {
+        submitResult: vi.fn(),
+        snapshot: vi.fn(() => snapshot("pending_approval")),
+      },
+      events: { log: vi.fn() },
+    };
+    const interaction = {
+      customId: "rtbl:result-modal:t1",
+      id: "modal-2",
+      user: { id: "alice" },
+      fields: { getTextInputValue: vi.fn(() => "alice bob") },
+      client: { channels: { cache: new Map([["c", channel]]), fetch: vi.fn() } },
+      isModalSubmit: () => true,
+      reply: vi.fn(async () => undefined),
+    };
+
+    await handleRankedTableModal(interaction as any, services as any);
+
+    expect(services.rankedTables.submitResult).toHaveBeenCalledTimes(1);
+    expect(services.events.log).toHaveBeenCalledWith("casino_ranked_message_edit_failed", expect.objectContaining({ target: "t1" }));
+    expect(interaction.reply).toHaveBeenCalledWith(expect.objectContaining({ ephemeral: true }));
   });
 });
