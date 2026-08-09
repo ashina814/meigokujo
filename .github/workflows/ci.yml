@@ -32,5 +32,17 @@ jobs:
       - name: Typecheck (core + bot)
         run: pnpm typecheck
 
-      - name: Run tests
-        run: pnpm -r test
+      - name: Core backup targeted
+        run: pnpm --filter @meigokujo/core exec vitest run tests/casino-opening-backup.test.ts tests/casino-opening-production-backup-followup.test.ts
+
+      - name: Core reset targeted
+        run: pnpm --filter @meigokujo/core exec vitest run tests/casino-opening-reset.test.ts tests/casino-opening-plan.test.ts
+
+      - name: Bot opening ops existing
+        run: pnpm --filter @meigokujo/bot exec vitest run tests/casino-opening-ops.test.ts
+
+      - name: Bot opening ops followup
+        run: pnpm --filter @meigokujo/bot exec vitest run tests/casino-opening-ops-followup.test.ts
+
+      - name: Bot opening UI/reset targeted
+        run: pnpm --filter @meigokujo/bot exec vitest run tests/casino-opening-ui.test.ts tests/casino-opening-reset.test.ts
