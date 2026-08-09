@@ -531,13 +531,16 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
     // 妥当性（ゼロ和・整数Land・受取非負・プール保存）は core の validateRankProfile がそのまま判定する
     const profileKey = interaction.fields.getTextInputValue("profile_key").trim();
     const label = interaction.fields.getTextInputValue("label").trim();
-    const deltas = interaction.fields
-      .getTextInputValue("deltas")
-      .split(/[\s,]+/)
-      .map((v) => Number(v.trim()))
-      .filter((v) => Number.isFinite(v));
-    if (deltas.length < 2 || !deltas.every((v) => Number.isSafeInteger(v))) {
-      await interaction.reply({ content: "順位配分は整数を2つ以上、カンマか空白区切りで入力してください。", flags: MessageFlags.Ephemeral });
+    const deltas = parseRankDeltaTokens(interaction.fields.getTextInputValue("deltas"));
+    if (!deltas) {
+      await interaction.reply({
+        content: [
+          "順位配分は**10進整数だけ**を2つ以上、カンマか空白区切りで入力してください。",
+          "例: `10000, 0, -10000`",
+          "小数・指数表記・16進数・数字以外の語が1つでも混ざっていれば登録しません（読み飛ばしません）。",
+        ].join("\n"),
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     }
     const result = registerTrustedRankedProfile(interaction, services, {
@@ -2230,6 +2233,30 @@ function casinoHome(services: Services) {
     );
   }
   return { embeds: [embed], components: [...rows, backButton()] };
+}
+
+/**
+ * 順位配分の入力を**全件 strict に**解釈する（PR24 レビュー BLOCKER 3）。
+ *
+ * 配分式は配当に直結する信頼設定なので、読めない語を黙って捨ててはいけない。
+ * 以前は `.map(Number).filter(Number.isFinite)` だったため
+ * `10000, foo, -10000` が 2人卓 `[10000, -10000]` として登録されえた。
+ *
+ * いまは1トークンでも10進整数でなければ**入力全体を拒否**する。
+ * したがって人数は「有効だったトークン数」ではなく、常に入力された順位トークンの件数になる。
+ * 小数(`1.5`)・指数(`1e4`)・16進(`0x100`)・`NaN`・`Infinity`・語句はすべて弾く。
+ */
+export function parseRankDeltaTokens(raw: string): number[] | null {
+  const tokens = raw.split(/[\s,]+/).filter((token) => token !== "");
+  if (tokens.length < 2) return null;
+  const values: number[] = [];
+  for (const token of tokens) {
+    if (!/^[+-]?\d+$/.test(token)) return null;
+    const value = Number(token);
+    if (!Number.isSafeInteger(value)) return null;
+    values.push(value);
+  }
+  return values;
 }
 
 function rankedProfileModal() {

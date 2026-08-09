@@ -15,7 +15,7 @@ import {
   type ModalSubmitInteraction,
   type StringSelectMenuInteraction,
 } from "discord.js";
-import { RANKED_TABLE_TIERS, type GenericRankProfile } from "@meigokujo/core";
+import { EMPLOYEE_OPERABLE_TIER_KEYS, RANKED_TABLE_TIERS, type GenericRankProfile } from "@meigokujo/core";
 import { renderRankedTable } from "../casino/ranked-table-ui.js";
 import { C_LOSE, C_MAMMON } from "../casino/ui.js";
 import { isAdmin, isCasinoEmployee } from "../permissions.js";
@@ -36,8 +36,11 @@ export const EMPLOYEE_CUSTOM_PREFIX = "cemp:";
 const OPEN_MODAL_PREFIX = "cemp:open-modal:";
 const REPORT_MODAL_PREFIX = "cemp:report-modal:";
 
-/** 従業員が開ける卓ランク。超高卓以上は core の authority 判定が拒否する */
-const EMPLOYEE_TIER_KEYS = ["minarai", "low", "middle", "high"] as const;
+/**
+ * 従業員が扱える卓ランク。正本は core の {@link EMPLOYEE_OPERABLE_TIER_KEYS}。
+ * ここでは候補を絞るためだけに使い、実際の可否は毎回 core が判定する。
+ */
+const EMPLOYEE_TIER_KEYS = EMPLOYEE_OPERABLE_TIER_KEYS;
 
 /** core が正本を持つゲーム。汎用卓は運営登録プロファイルから選ぶ */
 const FIXED_GAMES: ReadonlyArray<{ key: string; label: string }> = [
@@ -85,7 +88,7 @@ export async function handleCasinoEmployeeInteraction(
       if (customId.startsWith("cemp:open:tier:")) return await openTableModal(interaction);
       if (customId === "cemp:close:pick") return await closeTable(interaction, services);
       if (customId === "cemp:post:pick") return await postRecruitment(interaction, services);
-      if (customId === "cemp:report:pick") return await reportModal(interaction);
+      if (customId === "cemp:report:pick") return await reportModal(interaction, services);
       return;
     }
     if (customId === "cemp:guide") return await showGuide(interaction);
@@ -204,7 +207,7 @@ async function pickTier(interaction: StringSelectMenuInteraction, services: Serv
   const gameKey = interaction.values[0]!;
   // 開けるランクは core の判定に聞く（UIで隠すだけにしない）。従業員資格で照会する
   const availability = services.rankedTables.rankedTierAvailability("employee");
-  const options = RANKED_TABLE_TIERS.filter((tier) => (EMPLOYEE_TIER_KEYS as readonly string[]).includes(tier.key)).map((tier) => {
+  const options = RANKED_TABLE_TIERS.filter((tier) => EMPLOYEE_TIER_KEYS.includes(tier.key)).map((tier) => {
     const row = availability.find((a) => a.tierKey === tier.key);
     const open = row?.available === true;
     return {
@@ -275,15 +278,47 @@ async function submitOpenTable(interaction: ModalSubmitInteraction, services: Se
 
 // ── 3. 募集メッセージ ─────────────────────────────────────
 
+/**
+ * 従業員が扱ってよい卓か（PR24 レビュー BLOCKER 2）。
+ *
+ * 判定は2つ。**このサーバーの卓か**と、**従業員資格のランク範囲内か**。
+ * manager が開いた超高卓・極卓・冥獄卓は、開始前でも従業員からは触らせない。
+ * 引継ぎができるよう「自分が開いた卓だけ」には絞らない（ランクで見る）。
+ */
+function employeeMayOperate(services: Services, tableId: string, guildId: string | null): { ok: true } | { ok: false; reason: string } {
+  const table = services.persistentTables.get(tableId);
+  if (!table) return { ok: false, reason: "その卓は見つかりません。" };
+  if (!guildId || !table.guildId || table.guildId !== guildId) {
+    return { ok: false, reason: "その卓はこのサーバーの卓ではありません。" };
+  }
+  let baseAmount: number;
+  try {
+    baseAmount = services.rankedTables.snapshot(tableId).config.baseAmount;
+  } catch {
+    return { ok: false, reason: "その卓の設定を確認できません。" };
+  }
+  const tier = RANKED_TABLE_TIERS.find((t) => t.baseAmount === baseAmount);
+  if (!tier || !EMPLOYEE_TIER_KEYS.includes(tier.key)) {
+    return { ok: false, reason: "その卓は従業員が扱える卓ランクを超えています（高卓まで）。運営の管轄です。" };
+  }
+  return { ok: true };
+}
+
+/** 従業員が扱ってよい生きている卓だけ（サーバー内・高卓まで） */
+function employeeOperableLiveTables(services: Services, guildId: string | null) {
+  const live = services.persistentTables.listLiveTables();
+  return live.filter((table) => employeeMayOperate(services, table.tableId, guildId).ok);
+}
+
 async function pickLiveTable(
   interaction: ButtonInteraction,
   services: Services,
   action: "post" | "close" | "report",
   placeholder: string,
 ): Promise<void> {
-  const tables = services.persistentTables.listLiveTables();
+  const tables = employeeOperableLiveTables(services, interaction.guildId);
   if (tables.length === 0) {
-    await interaction.reply({ content: "いま動いている卓はありません。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "いま従業員が扱える卓はありません。", flags: MessageFlags.Ephemeral });
     return;
   }
   const options = tables.slice(0, 25).map((table) => ({
@@ -307,6 +342,12 @@ async function pickLiveTable(
  */
 async function postRecruitment(interaction: StringSelectMenuInteraction, services: Services): Promise<void> {
   const tableId = interaction.values[0]!;
+  // 選択値は古いことがある。掲示する直前にもう一度、卓を取り直して権限境界を見る
+  const allowed = employeeMayOperate(services, tableId, interaction.guildId);
+  if (!allowed.ok) {
+    await interaction.update({ content: allowed.reason, components: [], embeds: [] });
+    return;
+  }
   const snapshot = services.rankedTables.snapshot(tableId);
   const payload = renderRankedTable(snapshot, services.rankedDisputes.publicStatus(tableId));
   const channel = interaction.channel;
@@ -335,12 +376,22 @@ async function postRecruitment(interaction: StringSelectMenuInteraction, service
  */
 async function closeTable(interaction: StringSelectMenuInteraction, services: Services): Promise<void> {
   const tableId = interaction.values[0]!;
+  // 選択値は古いことがある。閉じる直前に卓を取り直して権限境界を見る。
+  // core 側でも authority / guild を再判定するので、ここは二重の防波堤かつ理由の説明用
+  const allowed = employeeMayOperate(services, tableId, interaction.guildId);
+  if (!allowed.ok) {
+    await interaction.update({ content: allowed.reason, components: [], embeds: [] });
+    return;
+  }
   try {
     const snapshot = services.rankedTables.cancelBeforeStart({
       tableId,
       actorId: interaction.user.id,
       operationId: interaction.id,
       reason: "closed by casino employee",
+      // 資格とサーバー境界は core 側でも判定させる。UIで候補を隠すだけにしない
+      authority: "employee",
+      expectedGuildId: interaction.guildId,
     });
     await interaction.update({
       content: `卓を閉じました（\`${tableId}\`）。参加者の預託は全額返しています。`,
@@ -362,8 +413,13 @@ async function closeTable(interaction: StringSelectMenuInteraction, services: Se
 
 // ── 5. 問題報告 ──────────────────────────────────────────
 
-async function reportModal(interaction: StringSelectMenuInteraction): Promise<void> {
+async function reportModal(interaction: StringSelectMenuInteraction, services: Services): Promise<void> {
   const tableId = interaction.values[0]!;
+  const allowed = employeeMayOperate(services, tableId, interaction.guildId);
+  if (!allowed.ok) {
+    await interaction.update({ content: allowed.reason, components: [], embeds: [] });
+    return;
+  }
   await interaction.showModal(
     new ModalBuilder()
       .setCustomId(`${REPORT_MODAL_PREFIX}${tableId}`)
@@ -387,6 +443,12 @@ async function reportModal(interaction: StringSelectMenuInteraction): Promise<vo
  */
 async function submitReport(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
   const tableId = interaction.customId.slice(REPORT_MODAL_PREFIX.length);
+  // モーダルの customId も直接叩けるので、報告対象がこのサーバーの扱える卓かを再確認する
+  const allowed = employeeMayOperate(services, tableId, interaction.guildId);
+  if (!allowed.ok) {
+    await interaction.reply({ content: allowed.reason, flags: MessageFlags.Ephemeral });
+    return;
+  }
   const reason = interaction.fields.getTextInputValue("reason").trim().slice(0, 300);
   const table = services.persistentTables.get(tableId);
   const at = Math.floor(Date.now() / 1000);
@@ -452,7 +514,7 @@ async function deliverReport(
  * ここで何を出さないかは `casino-employee-panel.test.ts` がソース走査で固定している。
  */
 async function showHistory(interaction: ButtonInteraction, services: Services): Promise<void> {
-  const rows = services.persistentTables.listRecentTables(HISTORY_LIMIT);
+  const rows = services.persistentTables.listRecentTables(HISTORY_LIMIT, interaction.guildId);
   if (rows.length === 0) {
     await interaction.reply({ content: "まだ卓の記録がありません。", flags: MessageFlags.Ephemeral });
     return;

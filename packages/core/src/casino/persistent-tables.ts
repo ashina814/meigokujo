@@ -494,12 +494,20 @@ export class PersistentTables {
    * （`disputeReason` / `failureReason` / `recoveryError` は運営向けの内部文言なので、
    * 従業員向けの履歴には出さない）。
    */
-  listRecentTables(limit = 20): PersistentTableRow[] {
+  listRecentTables(limit = 20, guildId?: string | null): PersistentTableRow[] {
     if (this.schemaStateOrThrow() === "none") return [];
     const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 100) : 20;
-    const rows = this.db
-      .prepare("SELECT * FROM casino_tables ORDER BY created_at DESC, table_id DESC LIMIT ?")
-      .all(safeLimit) as Record<string, unknown>[];
+    // サーバー境界は SQL 側で絞る。あとで絞ると件数が目減りしてしまう。
+    // `guildId` を渡したのに null/空だった場合は fail-closed で空を返す
+    const scoped = guildId !== undefined;
+    if (scoped && !guildId) return [];
+    const rows = (
+      scoped
+        ? this.db
+            .prepare("SELECT * FROM casino_tables WHERE guild_id = ? ORDER BY created_at DESC, table_id DESC LIMIT ?")
+            .all(guildId, safeLimit)
+        : this.db.prepare("SELECT * FROM casino_tables ORDER BY created_at DESC, table_id DESC LIMIT ?").all(safeLimit)
+    ) as Record<string, unknown>[];
     const mapped = rows.map(mapTableRow);
     for (const row of mapped) assertKnownState(row.state);
     return mapped;

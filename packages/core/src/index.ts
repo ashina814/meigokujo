@@ -296,6 +296,7 @@ export {
   RankedTableError,
   RANKED_PROFILES,
   RANKED_TABLE_TIERS,
+  EMPLOYEE_OPERABLE_TIER_KEYS,
   feeForBaseAmount,
   rankedReceipts,
   validateRankProfile,

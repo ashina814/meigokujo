@@ -39,6 +39,12 @@ export const RANKED_TABLE_TIERS: readonly RankedTableTier[] = [
   { key: "meigoku", label: "冥獄卓", baseAmount: 100_000 },
 ] as const;
 
+/**
+ * 賭博場従業員の資格で**操作してよい**卓ランク（正本 §15.1「従業員が開けるのは高卓まで」）。
+ * 作成にも閉鎖にも同じ範囲を使う（PR24）。
+ */
+export const EMPLOYEE_OPERABLE_TIER_KEYS: readonly string[] = ["minarai", "low", "middle", "high"];
+
 export const RANKED_PROFILES = {
   gf: { key: "gf", participantCount: 2, rankDeltaBps: [10_000, -10_000] },
   sanma: { key: "sanma", participantCount: 3, rankDeltaBps: [15_000, -5_000, -10_000] },
@@ -609,14 +615,41 @@ export class RankedTables {
    * `recruiting` / `ready_check` では場代はまだ徴収していない（徴収は
    * ready 完了時の `commitTableFees()`）。したがって全額返金でちょうど純損益0になり、
    * 日次リスクにも1件も記録しない（正本 §27「pre-start table full refund」）。
+   *
+   * ## 権限の境界も core 側で見る（PR24 レビュー BLOCKER 2）
+   *
+   * `authority` は既定で最も狭い `employee`。従業員資格では**高卓までしか閉じられない**
+   * ので、manager が開いた超高卓・極卓・冥獄卓は開始前でも従業員からは取り消せない。
+   * `expectedGuildId` を渡すとサーバー境界もここで再検証する。UI で候補を絞るだけだと、
+   * 古い選択値や customId の直叩きで別サーバー・上位卓へ届いてしまう。
    */
-  cancelBeforeStart(input: { tableId: string; actorId: string; operationId: string; reason?: string }): RankedTableSnapshot {
+  cancelBeforeStart(input: {
+    tableId: string;
+    actorId: string;
+    operationId: string;
+    reason?: string;
+    authority?: RankedCreateAuthority;
+    expectedGuildId?: string | null;
+  }): RankedTableSnapshot {
     const tableId = requiredString(input.tableId, "tableId");
     const actorId = requiredString(input.actorId, "actorId");
     const operationId = requiredString(input.operationId, "operationId");
     const reason = input.reason === undefined ? "ranked table closed before start" : requiredString(input.reason, "reason", 200);
+    const authority = validateAuthority(input.authority ?? "employee");
+    const expectedGuildId = input.expectedGuildId === undefined ? undefined : input.expectedGuildId;
     const tx = this.db.transaction((): RankedTableSnapshot => {
       const table = this.requiredTable(tableId);
+      // サーバー境界。選択値が古くても、実際に閉じる直前のこの再取得で判定する
+      if (expectedGuildId !== undefined) {
+        if (!expectedGuildId || !table.guildId || table.guildId !== expectedGuildId) {
+          throw new RankedTableError("ERR_RANKED_TABLE_NOT_JOINABLE", "ranked table belongs to another guild", {
+            tableId,
+            expectedGuildId,
+          });
+        }
+      }
+      // 卓ランクの権限境界。作成時と同じ「従業員は高卓まで」を閉じる側にも効かせる
+      this.assertTierOperable(tierByBaseAmount(this.configFor(table).baseAmount), authority, tableId);
       if (table.state === "cancelled") {
         // 同じ操作の再試行、または既に閉じ終わっている。二重返金しない
         return this.snapshot(tableId);
@@ -1052,6 +1085,22 @@ export class RankedTables {
     return row?.table_id ?? null;
   }
 
+  /**
+   * その資格でその卓ランクを**操作してよいか**（PR24）。
+   *
+   * 作成時の {@link tierCreateBlockReason} と違い、段階開放やクールダウンは見ない。
+   * それらは「新しく開いてよいか」の条件であって、既にある卓を閉じる可否とは別だから。
+   * ここで見るのは資格のランク範囲だけ——従業員は高卓まで、運営は全部。
+   */
+  private assertTierOperable(tier: RankedTableTier, authority: RankedCreateAuthority, tableId: string): void {
+    if (authority === "employee" && !EMPLOYEE_OPERABLE_TIER_KEYS.includes(tier.key)) {
+      throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "employee authority cannot operate this ranked tier", {
+        tableId,
+        tier: tier.key,
+      });
+    }
+  }
+
   /** 書き込み経路の卓種チェック。必要ならこの中で履歴表を用意する */
   private assertTierCreateAllowed(tier: RankedTableTier, authority: RankedCreateAuthority): void {
     const reason = this.tierCreateBlockReason(tier, authority, { write: true });
@@ -1077,7 +1126,7 @@ export class RankedTables {
       return "ranked table opening phase is unknown";
     }
     if (phase !== "formal") return "ranked tables require formal opening";
-    if (authority === "employee" && !["minarai", "low", "middle", "high"].includes(tier.key)) {
+    if (authority === "employee" && !EMPLOYEE_OPERABLE_TIER_KEYS.includes(tier.key)) {
       return "employee authority cannot open this ranked tier";
     }
     if (tier.key === "super_high" && !this.superHighEnabled()) return "super_high ranked tier is not enabled";

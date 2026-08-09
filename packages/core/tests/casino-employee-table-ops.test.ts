@@ -273,6 +273,175 @@ describe("cancelBeforeStart is the only employee close path", () => {
   });
 });
 
+describe("employee close is bounded by tier and guild", () => {
+  function createAt(ctx: Ctx, tableId: string, baseAmount: number, guildId: string, authority: "employee" | "manager") {
+    return ctx.rankedTables.create({
+      tableId,
+      gameKey: "gf",
+      baseAmount,
+      creatorId: "operator-1",
+      operatorId: "operator-1",
+      guildId,
+      operationId: `create:${tableId}`,
+      authority,
+    });
+  }
+
+  function untouched(ctx: Ctx, tableId: string) {
+    return {
+      state: ctx.rankedTables.snapshot(tableId).table.state,
+      pool: ctx.escrow.poolOf(tableId),
+      alice: ctx.chips.balanceOf("alice"),
+      total: chipTotal(ctx),
+      riskEvents: riskEventCount(ctx),
+    };
+  }
+
+  it("closes an employee-tier table in the same guild", () => {
+    const ctx = setup();
+    createAt(ctx, "t-high", 10_000, "guild-1", "employee");
+    seedChips(ctx, "alice", 40_000);
+    ctx.rankedTables.join({ tableId: "t-high", userId: "alice", seat: 1, operationId: "join:alice" });
+
+    const snapshot = ctx.rankedTables.cancelBeforeStart({
+      tableId: "t-high",
+      actorId: "employee-1",
+      operationId: "close:1",
+      authority: "employee",
+      expectedGuildId: "guild-1",
+    });
+
+    expect(snapshot.table.state).toBe("cancelled");
+    expect(ctx.escrow.poolOf("t-high")).toBe(0);
+  });
+
+  it("refuses every manager-only tier even before start", () => {
+    const ctx = setup({ superHighEnabled: true, extremeEnabled: true });
+    seedChips(ctx, "alice", 400_000);
+    const cases: Array<[string, number]> = [["t-sh", 30_000], ["t-ex", 50_000], ["t-mg", 100_000]];
+    cases.forEach(([tableId, baseAmount], index) => {
+      // 高卓以上は開催クールダウンがあるので、作る側は時計を進めて用意する
+      ctx.setNow(NOW + index * 4_000);
+      createAt(ctx, tableId, baseAmount, "guild-1", "manager");
+      const before = untouched(ctx, tableId);
+
+      expect(() =>
+        ctx.rankedTables.cancelBeforeStart({
+          tableId,
+          actorId: "employee-1",
+          operationId: `close:${tableId}`,
+          authority: "employee",
+          expectedGuildId: "guild-1",
+        }),
+      ).toThrow(RankedTableError);
+
+      expect(untouched(ctx, tableId)).toEqual(before);
+      expect(ctx.rankedTables.snapshot(tableId).table.state).toBe("recruiting");
+    });
+  });
+
+  it("refuses a table that belongs to another guild", () => {
+    const ctx = setup();
+    createAt(ctx, "t-other", 5_000, "guild-2", "employee");
+    seedChips(ctx, "alice", 40_000);
+    ctx.rankedTables.join({ tableId: "t-other", userId: "alice", seat: 1, operationId: "join:alice" });
+    const before = untouched(ctx, "t-other");
+
+    expect(() =>
+      ctx.rankedTables.cancelBeforeStart({
+        tableId: "t-other",
+        actorId: "employee-1",
+        operationId: "close:1",
+        authority: "employee",
+        expectedGuildId: "guild-1",
+      }),
+    ).toThrow(RankedTableError);
+
+    expect(untouched(ctx, "t-other")).toEqual(before);
+  });
+
+  it("fails closed when the caller has no guild context or the table has none", () => {
+    const ctx = setup();
+    createAt(ctx, "t-guilded", 5_000, "guild-1", "employee");
+    ctx.rankedTables.create({
+      tableId: "t-nullguild",
+      gameKey: "gf",
+      baseAmount: 5_000,
+      creatorId: "operator-1",
+      operatorId: "operator-1",
+      operationId: "create:t-nullguild",
+      authority: "employee",
+    });
+
+    for (const [tableId, expectedGuildId] of [["t-guilded", null], ["t-nullguild", "guild-1"]] as const) {
+      expect(() =>
+        ctx.rankedTables.cancelBeforeStart({
+          tableId,
+          actorId: "employee-1",
+          operationId: `close:${tableId}`,
+          authority: "employee",
+          expectedGuildId,
+        }),
+      ).toThrow(RankedTableError);
+      expect(ctx.rankedTables.snapshot(tableId).table.state).toBe("recruiting");
+    }
+  });
+
+  it("defaults to the narrowest authority when the caller forgets to pass one", () => {
+    const ctx = setup({ superHighEnabled: true });
+    createAt(ctx, "t-sh", 30_000, "guild-1", "manager");
+
+    // authority 省略 = employee 扱い。忘れても上位卓へ届かない
+    expect(() => ctx.rankedTables.cancelBeforeStart({ tableId: "t-sh", actorId: "someone", operationId: "close:1" })).toThrow(RankedTableError);
+    expect(ctx.rankedTables.snapshot("t-sh").table.state).toBe("recruiting");
+  });
+
+  it("still lets manager authority close a super-high table before start", () => {
+    const ctx = setup({ superHighEnabled: true });
+    createAt(ctx, "t-sh", 30_000, "guild-1", "manager");
+    seedChips(ctx, "alice", 100_000);
+    ctx.rankedTables.join({ tableId: "t-sh", userId: "alice", seat: 1, operationId: "join:alice" });
+    const before = ctx.chips.balanceOf("alice");
+
+    const snapshot = ctx.rankedTables.cancelBeforeStart({
+      tableId: "t-sh",
+      actorId: "manager-1",
+      operationId: "close:1",
+      authority: "manager",
+      expectedGuildId: "guild-1",
+    });
+
+    expect(snapshot.table.state).toBe("cancelled");
+    expect(ctx.chips.balanceOf("alice")).toBeGreaterThan(before);
+    expect(ctx.escrow.poolOf("t-sh")).toBe(0);
+  });
+
+  it("keeps the state gate unchanged under the new authority argument", () => {
+    const ctx = setup();
+    createAt(ctx, "t-play", 5_000, "guild-1", "employee");
+    seedChips(ctx, "alice", 40_000);
+    seedChips(ctx, "bob", 40_000);
+    ctx.rankedTables.join({ tableId: "t-play", userId: "alice", seat: 1, operationId: "join:alice" });
+    ctx.rankedTables.join({ tableId: "t-play", userId: "bob", seat: 2, operationId: "join:bob" });
+    // ready_check は引き続き閉じられる
+    expect(ctx.rankedTables.snapshot("t-play").table.state).toBe("ready_check");
+    ctx.rankedTables.ready({ tableId: "t-play", userId: "alice", operationId: "ready:alice" });
+    ctx.rankedTables.ready({ tableId: "t-play", userId: "bob", operationId: "ready:bob" });
+    expect(ctx.rankedTables.snapshot("t-play").table.state).toBe("playing");
+
+    expect(() =>
+      ctx.rankedTables.cancelBeforeStart({
+        tableId: "t-play",
+        actorId: "employee-1",
+        operationId: "close:1",
+        authority: "employee",
+        expectedGuildId: "guild-1",
+      }),
+    ).toThrow(RankedTableError);
+    expect(ctx.rankedTables.snapshot("t-play").table.state).toBe("playing");
+  });
+});
+
 describe("read-only table history", () => {
   it("returns recent tables newest first without changing anything", () => {
     const ctx = setup();
@@ -292,6 +461,29 @@ describe("read-only table history", () => {
     expect(ctx.persistentTables.listRecentTables(10)).toEqual([]);
     createTable(ctx, "t1");
     expect(ctx.persistentTables.listRecentTables(1_000)).toHaveLength(1);
+  });
+
+  it("scopes to one guild and fails closed without a guild", () => {
+    const ctx = setup();
+    for (const [tableId, guildId] of [["a", "guild-1"], ["b", "guild-2"], ["c", "guild-1"]] as const) {
+      ctx.rankedTables.create({
+        tableId,
+        gameKey: "gf",
+        baseAmount: 5_000,
+        creatorId: "op",
+        operatorId: "op",
+        guildId,
+        operationId: `create:${tableId}`,
+        authority: "employee",
+      });
+    }
+
+    expect(ctx.persistentTables.listRecentTables(10, "guild-1").map((r) => r.tableId).sort()).toEqual(["a", "c"]);
+    expect(ctx.persistentTables.listRecentTables(10, "guild-2").map((r) => r.tableId)).toEqual(["b"]);
+    // guildId を渡したのに空なら何も返さない（他サーバーの卓へ漏らさない）
+    expect(ctx.persistentTables.listRecentTables(10, null)).toEqual([]);
+    // 絞り込みは SQL 側なので、上限を跨いでも件数が目減りしない
+    expect(ctx.persistentTables.listRecentTables(2, "guild-1")).toHaveLength(2);
   });
 });
 
