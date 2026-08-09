@@ -76,7 +76,14 @@ function setup(options: { dailyLossLimitBps?: number } = {}) {
     rng: scriptedRng([0.5]),
     persistentTables: { participantHasLiveTable: (userId: string) => liveRankedTableUsers.has(userId) },
   } as unknown as Services;
-  return { db, ledger, chips, chipAssets, dailyRisk, casino, escrow, services };
+  // 翌日から同じ卓を触りにいくための窓（日界跨ぎの確認用）
+  const tomorrowRisk = new DailyRisk(db, ledger, chipAssets, {
+    now: () => TEST_NOW + 86_400,
+    openingPhase: () => chipTx.openingPhase(),
+    dailyLossLimitBps: () => options.dailyLossLimitBps ?? 3_000,
+  });
+  const tomorrowServices = { ...services, dailyRisk: tomorrowRisk } as unknown as Services;
+  return { db, ledger, chips, chipAssets, dailyRisk, casino, escrow, services, tomorrowServices };
 }
 
 type Ctx = ReturnType<typeof setup>;
@@ -228,25 +235,56 @@ describe("keiba bets go through the PR23 risk gates", () => {
     expect(ctx.escrow.poolOf("keiba:s1")).toBe(3_500);
   });
 
-  it("does not double-count a replayed bet operation and rejects a changed payload", () => {
+  it("does not double-count a replayed bet operation in money, risk or the in-memory bet list", () => {
     const ctx = setup({ dailyLossLimitBps: 10_000 });
     seedChips(ctx, "alice", 40_000);
     const bets = new Map<string, Bet[]>();
     const scope = keibaRiskScope("keiba:s1");
 
     expect(acceptKeibaBet(ctx.services, "keiba:s1", bets, "alice", 1, "win", 1_000, "op1").ok).toBe(true);
-    expect(acceptKeibaBet(ctx.services, "keiba:s1", bets, "alice", 1, "win", 1_000, "op1").ok).toBe(true);
-    expect(ctx.dailyRisk.exposureOf(scope, "alice")?.maxPlayerLoss).toBe(1_000);
+    expect(allBetsOf(bets)).toHaveLength(1);
     expect(ctx.escrow.poolOf("keiba:s1")).toBe(1_000);
+    expect(ctx.dailyRisk.exposureOf(scope, "alice")?.maxPlayerLoss).toBe(1_000);
 
+    // 同じ操作の replay: 資金・露出はもちろん、賭け一覧も増やさない。
+    // 増やすと配当プールが実際の預り金を上回り、精算が合わなくなる
+    expect(acceptKeibaBet(ctx.services, "keiba:s1", bets, "alice", 1, "win", 1_000, "op1").ok).toBe(true);
+    expect(allBetsOf(bets)).toHaveLength(1);
+    expect(ctx.escrow.poolOf("keiba:s1")).toBe(1_000);
+    expect(ctx.dailyRisk.exposureOf(scope, "alice")?.maxPlayerLoss).toBe(1_000);
+
+    // 同じ操作を別の内容で呼ぶ取り違えは conflict。どれも変わらない
     const conflict = acceptKeibaBet(ctx.services, "keiba:s1", bets, "alice", 4, "place", 9_000, "op1");
     expect(conflict.ok).toBe(false);
     if (!conflict.ok) expect(conflict.reason).toBe("conflict");
-    expect(ctx.dailyRisk.exposureOf(scope, "alice")?.maxPlayerLoss).toBe(1_000);
+    expect(allBetsOf(bets)).toHaveLength(1);
+    expect(allBetsOf(bets)[0]).toMatchObject({ horseId: 1, type: "win", amount: 1_000 });
     expect(ctx.escrow.poolOf("keiba:s1")).toBe(1_000);
-    // replay で bets が書き換わらない（1件目のまま）
-    expect(allBetsOf(bets)).toHaveLength(2);
-    expect(allBetsOf(bets).every((b) => b.horseId === 1 && b.type === "win" && b.amount === 1_000)).toBe(true);
+    expect(ctx.dailyRisk.exposureOf(scope, "alice")?.maxPlayerLoss).toBe(1_000);
+
+    // この状態から精算しても、分配合計と預り金が一致する（＝プールが水増しされていない）
+    const plan = keibaDistributions(allBetsOf(bets), 1, new Set([1, 2, 3]));
+    expect(plan.distributions.reduce((sum, d) => sum + d.amount, 0)).toBe(ctx.escrow.poolOf("keiba:s1"));
+    expect(() => settleKeibaRace(ctx.services, "keiba:s1", plan.distributions)).not.toThrow();
+    expect(ctx.escrow.poolOf("keiba:s1")).toBe(0);
+  });
+
+  it("refuses to carry a race exposure across the daily boundary", () => {
+    const ctx = setup({ dailyLossLimitBps: 10_000 });
+    seedChips(ctx, "alice", 40_000);
+    const bets = new Map<string, Bet[]>();
+    expect(acceptKeibaBet(ctx.services, "keiba:s1", bets, "alice", 1, "win", 3_000, "op1").ok).toBe(true);
+    const before = fundsSnapshot(ctx, ["alice"]);
+
+    // 日付が変わったあとの追加の口は断る（前日に取った枠ごと翌日へ移せてしまうため）
+    const rolled = acceptKeibaBet(ctx.tomorrowServices, "keiba:s1", bets, "alice", 2, "place", 1_000, "op2");
+    expect(rolled.ok).toBe(false);
+    if (!rolled.ok) expect(rolled.reason).toBe("risk");
+
+    expect(fundsSnapshot(ctx, ["alice"])).toEqual(before);
+    expect(allBetsOf(bets)).toHaveLength(1);
+    expect(ctx.escrow.poolOf("keiba:s1")).toBe(3_000);
+    expect(exposureRows(ctx)).toEqual([{ scope_key: keibaRiskScope("keiba:s1"), user_id: "alice", max_player_loss: 3_000 }]);
   });
 
   it("records the winner and loser aggregate nets exactly once, with payouts unchanged", () => {

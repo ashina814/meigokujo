@@ -19,7 +19,8 @@ export type DailyRiskErrorCode =
   | "ERR_DAILY_RISK_LIMIT"
   | "ERR_DAILY_RISK_OPERATION_CONFLICT"
   | "ERR_DAILY_RISK_EVENT_CONFLICT"
-  | "ERR_DAILY_RISK_AUTH_MISSING";
+  | "ERR_DAILY_RISK_AUTH_MISSING"
+  | "ERR_DAILY_RISK_DAY_ROLLOVER";
 
 export class DailyRiskError extends Error {
   constructor(
@@ -229,6 +230,11 @@ export class DailyRisk {
    * 資金を1 Ld でも動かす**前**に呼ぶ。順序は正本 §15.1 のとおり
    * 「最大損失 → 所持50% → 日次見込み損失 → 記録」。ここで例外になれば
    * 呼び出し側は予約もエスクローも触っていないので、資金は動いていない。
+   *
+   * 帰属日はその卓・その人の**最初の受付**で固定する。以後の追加・張り直しが
+   * 日を跨いだら fail-closed で断る（跨ぎを許すと、前日に取った枠ごと翌日へ移せてしまい
+   * 当日上限をすり抜けられる）。成功済み operation の replay は日界判定より**先**に
+   * 保存済みの結果を返すので、日が変わっても再試行は壊れない。
    */
   authorizeExposure(input: {
     userId: string;
@@ -264,16 +270,31 @@ export class DailyRisk {
         return { userId, scopeKey, dayKey: replay.day_key, maxPlayerLoss: replay.resulting_max_loss };
       }
       const current = this.db
-        .prepare("SELECT max_player_loss FROM casino_risk_exposures WHERE scope_key=? AND user_id=?")
-        .get(scopeKey, userId) as { max_player_loss: number } | undefined;
+        .prepare("SELECT day_key, max_player_loss FROM casino_risk_exposures WHERE scope_key=? AND user_id=?")
+        .get(scopeKey, userId) as { day_key: string; max_player_loss: number } | undefined;
       const previousMax = current?.max_player_loss ?? 0;
       // 張り直しは差し替え、増し賭けは積み増し。どちらも「この卓で失いうる総額」を判定に使う
       const nextMax = mode === "add" ? checkedAdd(previousMax, amount, "exposure") : amount;
       const day = this.dayFor(userId);
+      // 日界跨ぎ: 既にこの卓へ露出があるなら、帰属日は**最初の受付日**が正本。
+      // 日を跨いだ追加・張り直しを通すと、23:59 に取った枠ごと翌日へ移してしまい
+      // 当日上限をすり抜けられる。既存の露出は一切変えず fail-closed で断る
+      //（成功済み operation の replay は上の replay 判定で先に返るので影響しない）。
+      if (current && current.day_key !== day.dayKey) {
+        throw new DailyRiskError("ERR_DAILY_RISK_DAY_ROLLOVER", "casino table exposure cannot cross the daily boundary", {
+          scopeKey,
+          userId,
+          exposureDayKey: current.day_key,
+          currentDayKey: day.dayKey,
+        });
+      }
       // その卓へ**既に**預けたぶんは `holdings` から抜けている（エスクローは所持に含めない）。
       // 抜けたまま合計と比べると、同じ額を1口で張るか2口に割るかで判定が変わってしまうので、
       // この卓ぶんだけ足し戻して「この卓に手を出す直前の所持」を基準にする。
-      // 他の卓の預託は同時参加排他があるので存在しない。
+      // **「所持」の一般定義は変えていない**（表示・利用可能額ではエスクローは所持に含めない）。
+      // 正本 §15.1 の同一卓 cumulative max-loss 判定に限って、その卓に既に拘束された
+      // 本人の資金だけを復元しているだけで、他の卓の預託は絶対に足さない
+      //（同時参加排他があるので、そもそも他の卓の預託は存在しない）。
       this.assertHoldingsCoverage(userId, nextMax, previousMax, "casino table participation requires at least 50% holdings coverage");
       this.assertProspective(day, nextMax);
       const at = this.now();
@@ -281,7 +302,7 @@ export class DailyRisk {
         .prepare(
           `INSERT INTO casino_risk_exposures (scope_key, user_id, day_key, game, max_player_loss, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(scope_key, user_id) DO UPDATE SET day_key=excluded.day_key, game=excluded.game,
+           ON CONFLICT(scope_key, user_id) DO UPDATE SET game=excluded.game,
              max_player_loss=excluded.max_player_loss, updated_at=excluded.updated_at`,
         )
         .run(scopeKey, userId, day.dayKey, game, nextMax, at, at);

@@ -67,6 +67,15 @@ export interface Bet {
   horseId: number;
   type: BetType;
   amount: number;
+  /**
+   * この口を受け付けた操作ID（＝資金グループの鍵の一部）。
+   *
+   * 資金の正本はあくまで `runGroup` / エスクロー台帳で、これはプロセス内の
+   * 賭け一覧を**同じ操作で二重に積まない**ための目印。replay では `runGroup` が
+   * 本体を実行しないので資金も露出も増えないのに、配列にだけもう1口積むと、
+   * 配当プールが実際の預り金より大きくなって精算が合わなくなる。
+   */
+  operationId: string;
 }
 
 /**
@@ -192,8 +201,11 @@ export function acceptKeibaBet(
     return { ok: false, reason: "conflict" };
   }
   const arr = bets.get(userId) ?? [];
-  arr.push({ userId, horseId, type, amount });
-  bets.set(userId, arr);
+  // 成功済み操作の replay では資金も露出も動いていない。賭け一覧も同じく増やさない
+  if (!arr.some((b) => b.operationId === operationId)) {
+    arr.push({ userId, horseId, type, amount, operationId });
+    bets.set(userId, arr);
+  }
   return { ok: true };
 }
 
@@ -272,6 +284,9 @@ function hasLiveKeibaExposure(services: Services, riskScope: string, userId: str
 
 /** PR23 拒否理由の文面 */
 function keibaRiskDetail(services: Services, userId: string, error: unknown): string {
+  if (error instanceof DailyRiskError && error.code === "ERR_DAILY_RISK_DAY_ROLLOVER") {
+    return "日付が変わった。この卓への追加はもう受けられない。";
+  }
   if (error instanceof DailyRiskError && error.code === "ERR_DAILY_RISK_LIMIT") {
     try {
       const day = services.dailyRisk.dayFor(userId);

@@ -223,6 +223,9 @@ export function acceptRouletteBet(
 
 /** PR23 拒否理由の文面。日次上限に当たった場合は残り枠まで見せる */
 function riskRejectionDetail(services: Services, userId: string, error: unknown): string {
+  if (error instanceof DailyRiskError && error.code === "ERR_DAILY_RISK_DAY_ROLLOVER") {
+    return "日付が変わった。この卓への追加はもう受けられない。";
+  }
   if (error instanceof DailyRiskError && error.code === "ERR_DAILY_RISK_LIMIT") {
     try {
       const day = services.dailyRisk.dayFor(userId);

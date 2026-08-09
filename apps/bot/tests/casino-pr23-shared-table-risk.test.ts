@@ -87,7 +87,14 @@ function setup(rng: CasinoRng = scriptedRng([0.5]), options: { dailyLossLimitBps
     rng,
     persistentTables: { participantHasLiveTable: (userId: string) => liveRankedTableUsers.has(userId) },
   } as unknown as Services;
-  return { db, ledger, chips, chipAssets, dailyRisk, casino, escrow, reservations, services };
+  // 翌日から同じ卓を触りにいくための窓（日界跨ぎの確認用）
+  const tomorrowRisk = new DailyRisk(db, ledger, chipAssets, {
+    now: () => TEST_NOW + 86_400,
+    openingPhase: () => chipTx.openingPhase(),
+    dailyLossLimitBps: () => options.dailyLossLimitBps ?? 3_000,
+  });
+  const tomorrowServices = { ...services, dailyRisk: tomorrowRisk } as unknown as Services;
+  return { db, ledger, chips, chipAssets, dailyRisk, casino, escrow, reservations, services, tomorrowServices };
 }
 
 type Ctx = ReturnType<typeof setup>;
@@ -523,5 +530,45 @@ describe("solo settlement stays bound to the start taken by validateBet", () => 
 
     expect(fundsSnapshot(ctx, ["alice"])).toEqual(before);
     expect(riskEvents(ctx)).toEqual([]);
+  });
+});
+
+describe("a live table exposure never crosses the daily boundary", () => {
+  it("refuses a roulette rebet made after midnight and leaves the original bet intact", () => {
+    const ctx = setup(scriptedRng([0.5]), { dailyLossLimitBps: 10_000 });
+    fundHouse(ctx, 1_000_000);
+    seedChips(ctx, "alice", 40_000);
+    const scope = rouletteRiskScope("roulette:s1");
+    const bets = new Map();
+    expect(acceptRouletteBet(ctx.services, "roulette:s1", bets, "alice", "red", 1_000, "op1").ok).toBe(true);
+    const acceptedDay = ctx.dailyRisk.exposureOf(scope, "alice")?.dayKey;
+    const before = fundsSnapshot(ctx, ["alice"]);
+
+    const rolled = acceptRouletteBet(ctx.tomorrowServices, "roulette:s1", bets, "alice", "black", 2_000, "op2");
+    expect(rolled.ok).toBe(false);
+    if (!rolled.ok) expect(rolled.reason).toBe("risk");
+
+    expect(fundsSnapshot(ctx, ["alice"])).toEqual(before);
+    expect(ctx.escrow.poolOf("roulette:s1")).toBe(1_000);
+    expect(ctx.dailyRisk.exposureOf(scope, "alice")).toMatchObject({ maxPlayerLoss: 1_000, dayKey: acceptedDay });
+    expect(bets.get("alice")).toEqual({ userId: "alice", type: "red", amount: 1_000 });
+  });
+
+  it("refuses a legacy PvP top-up made after midnight and leaves the first stake intact", () => {
+    const ctx = setup(scriptedRng([0.5]), { dailyLossLimitBps: 10_000 });
+    seedChips(ctx, "alice", 40_000);
+    const scope = pvpRiskScope("chohan:1");
+    expect(collectStakes(ctx.services, ["alice"], 3_000, "op:a", "chohan:1", "chohan-multi").ok).toBe(true);
+    const before = fundsSnapshot(ctx, ["alice"]);
+
+    const rolled = collectStakes(ctx.tomorrowServices, ["alice"], 1_000, "op:a2", "chohan:1", "chohan-multi");
+    expect(rolled.ok).toBe(false);
+    if (!rolled.ok) expect(rolled.reason).toBe("risk");
+
+    expect(fundsSnapshot(ctx, ["alice"])).toEqual(before);
+    expect(ctx.escrow.poolOf("chohan:1")).toBe(3_000);
+    expect(ctx.dailyRisk.exposureOf(scope, "alice")?.maxPlayerLoss).toBe(3_000);
+    // 預り金が残っているので席も手放していない
+    expect(hasTransientParticipation("alice")).toBe(true);
   });
 });

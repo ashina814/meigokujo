@@ -253,6 +253,37 @@ describe("shared-table risk exposure", () => {
     expect(exposureRows(ctx)).toEqual([]);
   });
 
+  it("fixes the exposure day at the first acceptance and refuses to carry it across midnight", () => {
+    const ctx = setup({ dailyLossLimitBps: 10_000, boundaryOffsetMinutes: 0 });
+    seedChips(ctx, "alice", 40_000);
+    const base = { userId: "alice", scopeKey: "keiba:s1", game: "競馬" };
+
+    const first = ctx.dailyRisk.authorizeExposure({ ...base, operationId: "op1", maxPlayerLoss: 3_000, mode: "add" });
+    const dayStart = ctx.dailyRisk.dayFor("alice").dayStartAt;
+    // 23:59 の受付 → 00:00 へ日が変わる
+    ctx.setNow(dayStart + 86_400 + 1);
+    expect(ctx.dailyRisk.dayFor("alice").dayKey).not.toBe(first.dayKey);
+
+    // A: 日を跨いだ積み増しは断る（前日に取った枠ごと翌日へ移せてしまうため）
+    expect(() => ctx.dailyRisk.authorizeExposure({ ...base, operationId: "op2", maxPlayerLoss: 1_000, mode: "add" })).toThrow(DailyRiskError);
+    // B: 張り直しも同じ
+    expect(() => ctx.dailyRisk.authorizeExposure({ ...base, operationId: "op3", maxPlayerLoss: 1_000, mode: "replace" })).toThrow(DailyRiskError);
+    // 既存の露出は日も額も変わっていない
+    expect(exposureRows(ctx)).toEqual([{ scope_key: "keiba:s1", user_id: "alice", day_key: first.dayKey, max_player_loss: 3_000 }]);
+
+    // C: 成功済み操作の replay は日界判定より先に保存済みの結果を返す
+    expect(ctx.dailyRisk.authorizeExposure({ ...base, operationId: "op1", maxPlayerLoss: 3_000, mode: "add" })).toEqual(first);
+    expect(exposureRows(ctx)).toEqual([{ scope_key: "keiba:s1", user_id: "alice", day_key: first.dayKey, max_player_loss: 3_000 }]);
+
+    // D: 翌日に精算しても、当日枠は受付日のほうへ入る
+    ctx.dailyRisk.settleExposure({ scopeKey: "keiba:s1", userId: "alice", operationId: "race", netSigned: -3_000 });
+    expect(eventRows(ctx)).toEqual([
+      expect.objectContaining({ event_key: "exposure_result:keiba:s1:alice", day_key: first.dayKey, net_signed: -3_000 }),
+    ]);
+    expect(ctx.dailyRisk.dayFor("alice", dayStart + 10).netSigned).toBe(-3_000);
+    expect(ctx.dailyRisk.dayFor("alice").netSigned).toBe(0); // 翌日の枠は無傷
+  });
+
   it("rejects a bet once the daily loss cap is reached without touching the exposure table", () => {
     const ctx = setup({ dailyLossLimitBps: 3_000 });
     seedChips(ctx, "alice", 10_000);
