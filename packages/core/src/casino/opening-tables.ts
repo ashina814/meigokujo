@@ -351,6 +351,18 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "service.ts。/賭場ホームの再戦ショートカット用非金融メタデータ。正式開業時には旧制度のlast game/amountを持ち越さず初期化する。",
   }),
   T({
+    table: "casino_nagareboshi",
+    purpose: "Nagareboshi daily draw usage counter",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "apps/bot/src/commands/nagareboshi.ts lazily creates this casino-specific transient usage counter. Formal opening must not carry old per-day draw counts, so it is archived and reset in R6.",
+  }),
+  T({
     table: "casino_metric_events",
     purpose: "casino usage metric raw events",
     kind: "optional_feature",
@@ -485,6 +497,28 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
     preserve: false,
     blockerCondition: "該当なし（Discord実削除はR3相当・本PRはfake interfaceのみで実施しない）",
     rationale: "takutate.ts。行の初期化はDB内のみ。実際のDiscord VC削除は本PR範囲外",
+  }),
+  T({
+    table: "casino_house_pnl",
+    purpose: "Formal-opening-era house PnL source records",
+    kind: "optional_feature",
+    archive: false,
+    resetOnApply: false,
+    preserve: true,
+    blockerCondition: "none",
+    rationale:
+      "remittance.ts creates this schema only when openingPhase is formal. It is not legacy pre-opening casino data and is preserved if present; formal opening reset does not delete or rewrite it.",
+  }),
+  T({
+    table: "casino_remittances",
+    purpose: "Formal-opening-era remittance and bailout workflow records",
+    kind: "optional_feature",
+    archive: false,
+    resetOnApply: false,
+    preserve: true,
+    blockerCondition: "none",
+    rationale:
+      "remittance.ts creates this schema only when openingPhase is formal. Draft/approval/execution records belong to the formal-era remittance workflow and are preserved if present.",
   }),
 ] as const;
 

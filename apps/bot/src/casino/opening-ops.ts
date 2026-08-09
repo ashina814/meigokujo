@@ -39,6 +39,9 @@ import type { Services } from "../services.js";
 
 const OPS_PREFIX = "mgmt:casino:opening";
 const CONFIRM_WORD = "FORMAL-OPENING";
+const DISCORD_EMBED_FIELD_VALUE_LIMIT = 1024;
+const DISCORD_MESSAGE_CONTENT_LIMIT = 2000;
+const BLOCKER_LINE_LIMIT = 180;
 
 export function isOpeningOpsCustomId(customId: string): boolean {
   return customId.startsWith(`${OPS_PREFIX}:`);
@@ -264,9 +267,9 @@ function renderPreflight(plan: OpeningPreflightResult, actorId: string) {
       ].join("\n"),
     )
     .addFields(
-      { name: "Opening Config", value: configSummary(plan.snapshot.configuration), inline: false },
-      { name: "Blockers", value: blockerSummary(plan.blockers), inline: false },
-      { name: "Protected", value: plan.protectedFindings.slice(0, 10).map((f) => `${f.assetType}:${f.userId}:${f.sourceTable}`).join("\n") || "none", inline: false },
+      { name: "Opening Config", value: fieldValue(configSummary(plan.snapshot.configuration)), inline: false },
+      { name: "Blockers", value: blockerSummary(plan.blockers, DISCORD_EMBED_FIELD_VALUE_LIMIT), inline: false },
+      { name: "Protected", value: protectedSummary(plan, DISCORD_EMBED_FIELD_VALUE_LIMIT), inline: false },
     );
   const components =
     isApplyEligiblePreflight(plan) && actorId === openingOwnerId()
@@ -287,7 +290,7 @@ async function runOpeningApply(interaction: ModalSubmitInteraction | ButtonInter
   if (expectedPlanHash) {
     const fresh = services.openingPlanner.dryRun();
     if (fresh.planHash !== expectedPlanHash) return "Plan hash changed after confirmation. Nothing was executed.";
-    if (!isApplyEligiblePreflight(fresh)) return `Preflight is now blocked. Nothing was executed.\n${blockerSummary(fresh.blockers)}`;
+    if (!isApplyEligiblePreflight(fresh)) return blockedPreflightMessage(fresh.blockers);
   }
   try {
     const result = await services.openingReset.apply({
@@ -319,13 +322,16 @@ function applyResultSummary(result: OpeningApplyResult): string {
 }
 
 function openingApplyErrorMessage(error: unknown): string {
-  if (error instanceof OpeningApplyBlockedError) return `OpeningApplyBlockedError\n${blockerSummary(error.blockers)}`;
-  if (error instanceof OpeningApplyStaleplanError) return `OpeningApplyStaleplanError: ${error.stage} / ${error.executionId}`;
-  if (error instanceof OpeningApplyManualReviewError) return `OpeningApplyManualReviewError: ${error.reason} / fundsApplied=${error.fundsApplied}`;
-  if (error instanceof OpeningApplyRolledBackError) return `OpeningApplyRolledBackError: ${error.executionId}`;
-  if (error instanceof OpeningAlreadyAppliedError) return `OpeningAlreadyAppliedError: ${error.executionId}`;
-  if (error instanceof OpeningExecutionConflictError) return `OpeningExecutionConflictError: ${error.reason} / ${error.executionId}`;
-  return `Formal opening apply failed closed: ${error instanceof Error ? error.message : String(error)}`;
+  if (error instanceof OpeningApplyBlockedError) {
+    const prefix = "OpeningApplyBlockedError";
+    return messageContent(`${prefix}\n${blockerSummary(error.blockers, DISCORD_MESSAGE_CONTENT_LIMIT - prefix.length - 1)}`);
+  }
+  if (error instanceof OpeningApplyStaleplanError) return messageContent(`OpeningApplyStaleplanError: ${error.stage} / ${error.executionId}`);
+  if (error instanceof OpeningApplyManualReviewError) return messageContent(`OpeningApplyManualReviewError: ${error.reason} / fundsApplied=${error.fundsApplied}`);
+  if (error instanceof OpeningApplyRolledBackError) return messageContent(`OpeningApplyRolledBackError: ${error.executionId}`);
+  if (error instanceof OpeningAlreadyAppliedError) return messageContent(`OpeningAlreadyAppliedError: ${error.executionId}`);
+  if (error instanceof OpeningExecutionConflictError) return messageContent(`OpeningExecutionConflictError: ${error.reason} / ${error.executionId}`);
+  return messageContent(`Formal opening apply failed closed: ${error instanceof Error ? error.message : String(error)}`);
 }
 
 function ensureOwner(interaction: ButtonInteraction | ModalSubmitInteraction): boolean {
@@ -441,9 +447,60 @@ function configSummary(c: CasinoOpeningConfig): string {
   ].join("\n");
 }
 
-function blockerSummary(blockers: readonly OpeningBlocker[]): string {
+function blockedPreflightMessage(blockers: readonly OpeningBlocker[]): string {
+  const prefix = "Preflight is now blocked. Nothing was executed.";
+  return messageContent(`${prefix}\n${blockerSummary(blockers, DISCORD_MESSAGE_CONTENT_LIMIT - prefix.length - 1)}`);
+}
+
+function fieldValue(value: string): string {
+  return value.length <= DISCORD_EMBED_FIELD_VALUE_LIMIT ? value : boundedLines([value], DISCORD_EMBED_FIELD_VALUE_LIMIT);
+}
+
+function protectedSummary(plan: OpeningPreflightResult, maxLength: number): string {
+  const lines = plan.protectedFindings.map((f) => `${f.assetType}:${f.userId}:${f.sourceTable}`);
+  return boundedLines(lines, maxLength);
+}
+
+function blockerSummary(blockers: readonly OpeningBlocker[], maxLength = DISCORD_EMBED_FIELD_VALUE_LIMIT): string {
   if (blockers.length === 0) return "none";
-  return blockers.slice(0, 12).map((b) => `${b.code}: ${b.message}`.slice(0, 180)).join("\n");
+  return boundedLines(blockers.map((b) => truncateLine(`${b.code}: ${b.message}`, BLOCKER_LINE_LIMIT)), maxLength);
+}
+
+function boundedLines(lines: readonly string[], maxLength: number): string {
+  if (lines.length === 0) return "none";
+  const output: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const remainingAfter = lines.length - i - 1;
+    const candidateLines = [...output, lines[i] ?? ""];
+    if (remainingAfter > 0) candidateLines.push(moreLine(remainingAfter));
+    const candidate = candidateLines.join("\n");
+    if (candidate.length <= maxLength) {
+      output.push(lines[i] ?? "");
+      continue;
+    }
+
+    const more = moreLine(lines.length - i);
+    while (output.length > 0 && `${output.join("\n")}\n${more}`.length > maxLength) {
+      output.pop();
+    }
+    if (output.length > 0) return `${output.join("\n")}\n${more}`;
+    return truncateLine(more, maxLength);
+  }
+  return output.join("\n");
+}
+
+function moreLine(count: number): string {
+  return `... and ${count} more`;
+}
+
+function truncateLine(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  if (maxLength <= 3) return value.slice(0, Math.max(0, maxLength));
+  return `${value.slice(0, maxLength - 3)}...`;
+}
+
+function messageContent(value: string): string {
+  return value.length <= DISCORD_MESSAGE_CONTENT_LIMIT ? value : truncateLine(value, DISCORD_MESSAGE_CONTENT_LIMIT);
 }
 
 function isUnknownChannelError(error: unknown): boolean {

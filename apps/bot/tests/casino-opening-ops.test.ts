@@ -4,6 +4,7 @@ import {
   CASINO_OPENING_SETTING_KEYS,
   FORMAL_OPENING_VERSION,
   LEGACY_OPENING_VERSION,
+  OpeningApplyBlockedError,
   Settings,
   openDb,
   readCasinoOpeningConfig,
@@ -133,6 +134,20 @@ function componentCustomIds(payload: any): string[] {
   return (payload.components ?? []).flatMap((row: any) => row.toJSON().components.map((component: any) => component.custom_id));
 }
 
+function embedFieldValue(payload: any, name: string): string {
+  const embed = payload.embeds[0].toJSON();
+  return embed.fields.find((field: any) => field.name === name).value;
+}
+
+function longBlockers(count = 18): OpeningPreflightResult["blockers"] {
+  return Array.from({ length: count }, (_, index) => ({
+    category: "protected_asset" as const,
+    code: index === 0 ? "opening_config_invalid" : `protected_vip_${index}`,
+    message: `日本語を含む長い本番blocker ${index}: `.repeat(8),
+    userId: `user-${index}`,
+  }));
+}
+
 describe("casino opening ops settings", () => {
   it("rejects invalid capital settings without writing partial values", async () => {
     const { services, settings } = makeServices();
@@ -217,6 +232,33 @@ describe("casino opening ops settings", () => {
 });
 
 describe("casino opening ops preflight and apply", () => {
+  it("bounds long preflight blocker rendering to Discord embed field limits", async () => {
+    const blockers = longBlockers(20);
+    const { services } = makeServices({ plan: preflight("long-blockers", blockers) });
+    const preview = button("mgmt:casino:opening:preflight");
+
+    await expect(handleOpeningOpsButton(preview.i, services)).resolves.toBeUndefined();
+
+    const payload = preview.editReply.mock.calls[0][0];
+    const blockersValue = embedFieldValue(payload, "Blockers");
+    expect(blockersValue.length).toBeLessThanOrEqual(1024);
+    expect(blockersValue).toContain("opening_config_invalid");
+    expect(blockersValue).toContain("... and ");
+    expect(blockersValue).not.toBe("none");
+    expect(componentCustomIds(payload)).toEqual([]);
+  });
+
+  it("renders blocker none and keeps the confirm button for an eligible preflight", async () => {
+    const { services } = makeServices({ plan: preflight("no-blockers", []) });
+    const preview = button("mgmt:casino:opening:preflight");
+
+    await handleOpeningOpsButton(preview.i, services);
+
+    const payload = preview.editReply.mock.calls[0][0];
+    expect(embedFieldValue(payload, "Blockers")).toBe("none");
+    expect(componentCustomIds(payload)).toContain("mgmt:casino:opening:confirm:no-blockers");
+  });
+
   it("renders preflight read-only and only exposes confirmation to the owner", async () => {
     const { services, apply } = makeServices({ plan: preflight("hash-owner") });
     const owner = button("mgmt:casino:opening:preflight");
@@ -304,5 +346,21 @@ describe("casino opening ops preflight and apply", () => {
 
     expect(apply).not.toHaveBeenCalled();
     expect(replyContent(i.editReply)).toContain("Plan hash changed");
+  });
+
+  it("bounds apply blocked error messages to Discord message limits", async () => {
+    const blockers = longBlockers(30);
+    const apply = vi.fn(async () => {
+      throw new OpeningApplyBlockedError(blockers);
+    });
+    const { services } = makeServices({ plan: preflight("blocked-apply"), apply });
+    const i = modal("mgmt:casino:opening:apply:blocked-apply", { confirm: "FORMAL-OPENING blocked-" });
+
+    await handleOpeningOpsModal(i.i, services);
+
+    const content = replyContent(i.editReply);
+    expect(content.length).toBeLessThanOrEqual(2000);
+    expect(content).toContain("OpeningApplyBlockedError");
+    expect(content).toContain("... and ");
   });
 });

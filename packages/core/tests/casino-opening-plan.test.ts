@@ -1,3 +1,6 @@
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
@@ -15,6 +18,7 @@ import { Departments, deptAccount } from "../src/departments/service.js";
 import { writeCasinoOpeningConfig } from "../src/casino/opening-settings.js";
 import { OpeningPlanner } from "../src/casino/opening-plan.js";
 import { tableRowCount, schemaFingerprint } from "../src/casino/opening-canonical.js";
+import { classificationFor } from "../src/casino/opening-tables.js";
 
 registerDefaultTxTypes();
 
@@ -578,6 +582,69 @@ describe("OpeningPlanner.dryRun — 未知テーブル・その他blocker", () =
     expect(result.unknownTables).not.toContain("casino_metric_daily");
     expect(result.blockers).toEqual([]);
     expect(result.protectedFindings.some((f) => f.sourceTable === "casino_metric_events" || f.sourceTable === "casino_metric_daily")).toBe(false);
+  });
+
+  it("casino_nagareboshi is classified as resettable transient data and participates in the plan hash", () => {
+    const classification = classificationFor("casino_nagareboshi");
+    expect(classification).toMatchObject({
+      kind: "optional_feature",
+      archive: true,
+      resetOnApply: true,
+      resetPhase: "R6",
+      preserve: false,
+    });
+    expect(classification?.includeInPlanHash).toBeUndefined();
+
+    const ctx = setup();
+    seedLegacy(ctx);
+    configureAndOpenReset(ctx);
+    ctx.db.exec(`
+      CREATE TABLE IF NOT EXISTS casino_nagareboshi (
+        user_id TEXT NOT NULL,
+        day_key TEXT NOT NULL,
+        count   INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, day_key)
+      );
+    `);
+    ctx.db.prepare("INSERT INTO casino_nagareboshi (user_id, day_key, count) VALUES ('alice', '2026-08-09', 1)").run();
+
+    const first = ctx.planner.dryRun();
+    expect(first.unknownTables).not.toContain("casino_nagareboshi");
+    expect(first.blockers).toEqual([]);
+    expect(first.protectedFindings.some((f) => f.sourceTable === "casino_nagareboshi")).toBe(false);
+    expect(first.tableAudits.find((a) => a.table === "casino_nagareboshi")).toMatchObject({ exists: true, rows: 1 });
+
+    ctx.db.prepare("UPDATE casino_nagareboshi SET count = 2 WHERE user_id = 'alice' AND day_key = '2026-08-09'").run();
+    const second = ctx.planner.dryRun();
+    expect(second.planHash).not.toBe(first.planHash);
+  });
+
+  it("source-created casino_* tables are represented in the opening classification table", () => {
+    const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
+    const srcRoots = [join(repoRoot, "packages", "core", "src"), join(repoRoot, "apps", "bot", "src")];
+    const discovered = new Set<string>();
+    const createTable = /CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(?:[`"])?(casino_[A-Za-z0-9_]+)/gi;
+
+    function visit(dir: string): void {
+      for (const name of readdirSync(dir)) {
+        const full = join(dir, name);
+        if (statSync(full).isDirectory()) {
+          visit(full);
+          continue;
+        }
+        if (!name.endsWith(".ts")) continue;
+        const text = readFileSync(full, "utf8");
+        for (const match of text.matchAll(createTable)) {
+          const table = match[1]!;
+          if (table.endsWith("_new")) continue;
+          discovered.add(table);
+        }
+      }
+    }
+
+    for (const root of srcRoots) visit(root);
+    const missing = [...discovered].filter((table) => !classificationFor(table)).sort();
+    expect(missing).toEqual([]);
   });
 
   it("既にopening_v1が存在すればblocker", () => {
