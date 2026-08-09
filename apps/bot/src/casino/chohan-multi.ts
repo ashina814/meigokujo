@@ -15,7 +15,7 @@ import {
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
-import { collectStakes, settleProportional } from "./pvp-common.js";
+import { collectStakes, settleProportional, stakeFailureText, voidPvpTable } from "./pvp-common.js";
 import { C_LOSE, C_MAMMON, C_WIN, E, boxDice, buildLobbyEmbed, fmtBigDelta } from "./ui.js";
 
 /**
@@ -136,8 +136,9 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
           await sub.reply({ content: "Land残高が足りない。", flags: MessageFlags.Ephemeral });
           return;
         }
-        if (!collectStakes(services, [btn.user.id], additional, `${session}:collect:${btn.id}`, session, "chohan-multi")) {
-          await sub.reply({ content: "徴収に失敗した。", flags: MessageFlags.Ephemeral });
+        const added = collectStakes(services, [btn.user.id], additional, `${session}:collect:${btn.id}`, session, "chohan-multi");
+        if (!added.ok) {
+          await sub.reply({ content: stakeFailureText(added), flags: MessageFlags.Ephemeral });
           return;
         }
         existing.amount = amt;
@@ -146,8 +147,9 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
           await sub.reply({ content: "Land残高が足りない。", flags: MessageFlags.Ephemeral });
           return;
         }
-        if (!collectStakes(services, [btn.user.id], amt, `${session}:collect:${btn.id}`, session, "chohan-multi")) {
-          await sub.reply({ content: "徴収に失敗した。", flags: MessageFlags.Ephemeral });
+        const collected = collectStakes(services, [btn.user.id], amt, `${session}:collect:${btn.id}`, session, "chohan-multi");
+        if (!collected.ok) {
+          await sub.reply({ content: stakeFailureText(collected), flags: MessageFlags.Ephemeral });
           return;
         }
         bets.set(btn.user.id, { userId: btn.user.id, side, amount: amt });
@@ -169,8 +171,8 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
   const chos = [...bets.values()].filter((b) => b.side === "cho");
   const hans = [...bets.values()].filter((b) => b.side === "han");
   if (chos.length === 0 || hans.length === 0) {
-    // 片側だけなら全額返金
-    services.escrow.refund(session);
+    // 片側だけなら全額返金（露出・席も同じトランザクションで解く）
+    voidPvpTable(services, session);
     await interaction.editReply({
       embeds: [
         new EmbedBuilder()
@@ -190,7 +192,7 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
   } catch (e) {
     console.error("[chohan-multi] 異常終了・全額返金:", e);
     try {
-      services.escrow.refund(session);
+      voidPvpTable(services, session);
     } catch {
       /* ignore */
     }

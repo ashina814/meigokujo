@@ -22,6 +22,7 @@ import {
   offerRematch,
   refundAll,
   settlePvp,
+  stakeFailureText,
   type PvpInteraction,
 } from "./pvp-common.js";
 
@@ -79,7 +80,11 @@ export async function playBjDuel(
     return;
   }
   const session = `bjduel:${interaction.id}`;
-  if (!collectStakes(services, [challenger.id], bet, `${session}:collect:challenger`, session, "bj-duel")) return;
+  const challengerStake = collectStakes(services, [challenger.id], bet, `${session}:collect:challenger`, session, "bj-duel");
+  if (!challengerStake.ok) {
+    await interaction.reply({ content: stakeFailureText(challengerStake), flags: MessageFlags.Ephemeral });
+    return;
+  }
 
   const inviteRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("bjd:accept").setLabel("受ける").setEmoji("🃏").setStyle(ButtonStyle.Success),
@@ -123,8 +128,14 @@ export async function playBjDuel(
     });
     return;
   }
-  if (!collectStakes(services, [opponent.id], bet, `${session}:collect:opponent`, session, "bj-duel")) {
+  const opponentStake = collectStakes(services, [opponent.id], bet, `${session}:collect:opponent`, session, "bj-duel");
+  if (!opponentStake.ok) {
     refundAll(services, [challenger.id], bet, `${session}:refund:opponent_broke`, session);
+    await interaction.editReply({
+      content: "",
+      embeds: [buildPvpAbort("BJデュエル", "🃏", `${stakeFailureText(opponentStake)}挑戦者に全額返金。`)],
+      components: [],
+    });
     return;
   }
 

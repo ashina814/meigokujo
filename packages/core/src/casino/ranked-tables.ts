@@ -9,7 +9,7 @@ import type { HouseReservations } from "./reservations.js";
 import { rankedFeeReservationKey, RANKED_FEE_RESERVATION_SCOPE } from "./ranked-fee-reservation.js";
 import type { RankedDisputes } from "./ranked-disputes.js";
 import type { DailyRisk } from "./daily-risk.js";
-import { FORMAL_OPENING_VERSION } from "./chip-tx.js";
+import { FORMAL_OPENING_VERSION, type OpeningPhase } from "./chip-tx.js";
 import {
   PersistentTableError,
   type PersistentTableParticipantRow,
@@ -160,6 +160,8 @@ export interface RankedTablesOptions {
   superHighEnabled?: () => boolean;
   extremeEnabled?: () => boolean;
   highCooldownSec?: () => number | null;
+  /** 開業フェーズ。正式開業前は順位卓を1卓も開けない（履歴表も作らない） */
+  openingPhase?: () => OpeningPhase;
 }
 
 interface RankedTableStorageRow {
@@ -250,6 +252,7 @@ export class RankedTables {
   private readonly superHighEnabled: () => boolean;
   private readonly extremeEnabled: () => boolean;
   private readonly highCooldownSec: () => number | null;
+  private readonly openingPhase: () => OpeningPhase;
 
   constructor(
     private readonly db: Database.Database,
@@ -265,6 +268,7 @@ export class RankedTables {
     this.superHighEnabled = options.superHighEnabled ?? (() => false);
     this.extremeEnabled = options.extremeEnabled ?? (() => false);
     this.highCooldownSec = options.highCooldownSec ?? (() => null);
+    this.openingPhase = options.openingPhase ?? (() => "formal");
   }
 
   create(input: CreateRankedTableInput): RankedTableSnapshot {
@@ -336,20 +340,19 @@ export class RankedTables {
     return tx.immediate();
   }
 
+  /**
+   * 卓種ごとの開催可否の**読み取り専用**照会（PR23 レビュー BLOCKER E）。
+   *
+   * `casino_ranked_open_history` は正式開業後にだけ存在してよい表なので、
+   * この照会は `sqlite_master` を1行も変えない。表が無ければ「過去に高卓以上を
+   * 開いた記録が無い」と読み替えるだけで、CREATE TABLE はしない。
+   * 実際に表を作るのは create の書き込み経路だけ。
+   */
   rankedTierAvailability(authority: RankedCreateAuthority): RankedTierAvailability[] {
     const safeAuthority = validateAuthority(authority);
     return RANKED_TABLE_TIERS.map((tier) => {
-      try {
-        this.assertTierCreateAllowed(tier, safeAuthority);
-        return { tierKey: tier.key, baseAmount: tier.baseAmount, available: true, reason: null };
-      } catch (error) {
-        return {
-          tierKey: tier.key,
-          baseAmount: tier.baseAmount,
-          available: false,
-          reason: error instanceof Error ? error.message : String(error),
-        };
-      }
+      const reason = this.tierCreateBlockReason(tier, safeAuthority, { write: false });
+      return { tierKey: tier.key, baseAmount: tier.baseAmount, available: reason === null, reason };
     });
   }
 
@@ -994,35 +997,66 @@ export class RankedTables {
     return row?.table_id ?? null;
   }
 
+  /** 書き込み経路の卓種チェック。必要ならこの中で履歴表を用意する */
   private assertTierCreateAllowed(tier: RankedTableTier, authority: RankedCreateAuthority): void {
+    const reason = this.tierCreateBlockReason(tier, authority, { write: true });
+    if (reason !== null) throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", reason, { tier: tier.key });
+  }
+
+  /**
+   * 卓種を開けない理由（開けるなら null）。
+   *
+   * 判定順は正本 §15.1 と PR23 の要件どおり:
+   * 開業フェーズ → 権限 → 段階開放設定 → 開業からの経過日数 → 高卓以上のクールダウン。
+   *
+   * `write: false`（照会）では **DB スキーマを一切変えない**。履歴表が無ければ
+   * 「高卓以上の開催記録が無い」として読み取りだけで判断する。
+   * 履歴表が壊れている（必須列が欠けている）場合は、読み取り・書き込みのどちらでも
+   * fail-closed（クールダウンを無視して開けさせない）。
+   */
+  private tierCreateBlockReason(tier: RankedTableTier, authority: RankedCreateAuthority, opts: { write: boolean }): string | null {
+    let phase: OpeningPhase;
+    try {
+      phase = this.openingPhase();
+    } catch {
+      return "ranked table opening phase is unknown";
+    }
+    if (phase !== "formal") return "ranked tables require formal opening";
     if (authority === "employee" && !["minarai", "low", "middle", "high"].includes(tier.key)) {
-      throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "employee authority cannot open this ranked tier", { tier: tier.key });
+      return "employee authority cannot open this ranked tier";
     }
-    if (tier.key === "super_high" && !this.superHighEnabled()) {
-      throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "super_high ranked tier is not enabled", { tier: tier.key });
-    }
-    if (tier.key === "extreme" && !this.extremeEnabled()) {
-      throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "extreme ranked tier is not enabled", { tier: tier.key });
-    }
+    if (tier.key === "super_high" && !this.superHighEnabled()) return "super_high ranked tier is not enabled";
+    if (tier.key === "extreme" && !this.extremeEnabled()) return "extreme ranked tier is not enabled";
     if ((tier.key === "super_high" || tier.key === "extreme") && !this.formalOpeningAgeSatisfied()) {
-      throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "this ranked tier is closed for the first 30 days after formal opening", { tier: tier.key });
+      return "this ranked tier is closed for the first 30 days after formal opening";
     }
-    if (isHighOrAbove(tier)) {
-      const cooldown = this.highCooldownSec();
-      if (typeof cooldown !== "number" || !Number.isSafeInteger(cooldown) || cooldown <= 0) {
-        throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "high ranked tier cooldown setting is unavailable", { tier: tier.key });
-      }
-      this.ensureOpenHistorySchema();
-      const row = this.db
-        .prepare("SELECT created_at FROM casino_ranked_open_history WHERE tier_key IN ('high','super_high','extreme','meigoku') ORDER BY created_at DESC, rowid DESC LIMIT 1")
-        .get() as { created_at: number } | undefined;
-      if (row && this.now() - row.created_at < cooldown) {
-        throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "high ranked tier cooldown is active", {
-          tier: tier.key,
-          remaining: cooldown - (this.now() - row.created_at),
-        });
-      }
+    if (!isHighOrAbove(tier)) return null;
+    const cooldown = this.highCooldownSec();
+    if (typeof cooldown !== "number" || !Number.isSafeInteger(cooldown) || cooldown <= 0) {
+      return "high ranked tier cooldown setting is unavailable";
     }
+    const schema = this.openHistorySchemaState();
+    if (schema === "invalid") return "ranked open history schema is incomplete";
+    if (schema === "none") {
+      // 履歴が無い＝過去に高卓以上を開いていない。照会では作らない
+      if (opts.write) this.ensureOpenHistorySchema();
+      return null;
+    }
+    const row = this.db
+      .prepare("SELECT created_at FROM casino_ranked_open_history WHERE tier_key IN ('high','super_high','extreme','meigoku') ORDER BY created_at DESC, rowid DESC LIMIT 1")
+      .get() as { created_at: number } | undefined;
+    if (row && this.now() - row.created_at < cooldown) return "high ranked tier cooldown is active";
+    return null;
+  }
+
+  /** 履歴表の状態。`invalid` は必須列が欠けた壊れた状態（勝手に直さない） */
+  private openHistorySchemaState(): "none" | "complete" | "invalid" {
+    if (!this.tableExists("casino_ranked_open_history")) return "none";
+    const columns = new Set(
+      (this.db.prepare("PRAGMA table_info(casino_ranked_open_history)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    const required = ["operation_id", "table_id", "tier_key", "base_amount", "authority", "request_fingerprint", "created_at"];
+    return required.every((c) => columns.has(c)) ? "complete" : "invalid";
   }
 
   private formalOpeningAgeSatisfied(): boolean {
@@ -1039,6 +1073,10 @@ export class RankedTables {
     authority: RankedCreateAuthority,
     fingerprint: string,
   ): void {
+    // 書き込み経路のみ。壊れた履歴表を勝手に直して続行しない
+    if (this.openHistorySchemaState() === "invalid") {
+      throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "ranked open history schema is incomplete", { tableId });
+    }
     this.ensureOpenHistorySchema();
     const existing = this.db
       .prepare("SELECT request_fingerprint FROM casino_ranked_open_history WHERE operation_id=?")

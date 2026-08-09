@@ -12,11 +12,18 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import { ROULETTE_PAYOUTS as CORE_ROULETTE_PAYOUTS, rouletteSpin, rouletteTableLiability, type RouletteBet } from "@meigokujo/core";
+import {
+  DailyRiskError,
+  ROULETTE_PAYOUTS as CORE_ROULETTE_PAYOUTS,
+  rouletteSpin,
+  rouletteTableLiability,
+  type RouletteBet,
+} from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
+import { acquireTransientParticipation, releaseTransientParticipation } from "./participation.js";
 import { C_LOSE, C_MAMMON, C_WIN, E, fmtBigDelta } from "./ui.js";
 
 /**
@@ -67,11 +74,28 @@ class RouletteEscrowShortfall extends Error {
   }
 }
 
+/** PR23 の安全上限に弾かれた（同時参加・所持50%・日次純損失上限）。資金は動いていない */
+class RouletteRiskRejected extends Error {
+  constructor(readonly detail: string) {
+    super("ERR_ROULETTE_RISK");
+    this.name = "RouletteRiskRejected";
+  }
+}
+
 export type AcceptRouletteBetResult =
   | { ok: true }
   | { ok: false; reason: "capacity"; available: number }
   | { ok: false; reason: "broke" }
-  | { ok: false; reason: "conflict" };
+  | { ok: false; reason: "conflict" }
+  | { ok: false; reason: "risk"; detail: string };
+
+/**
+ * ルーレット卓のリスク枠の名前（PR23）。卓そのものが単位なので、参加者ごとの
+ * 露出は `(scopeKey, userId)` で1行になる。張り直しは `replace` で差し替える。
+ */
+export function rouletteRiskScope(session: string): string {
+  return `roulette:${session}`;
+}
 
 /** 外側グループ（`roulette:bet:*`）の要求指紋。replay 時に今回の引数と突き合わせる */
 interface RouletteBetFingerprint {
@@ -132,11 +156,32 @@ export function acceptRouletteBet(
   const reservationKey = reservationKeyFor(session);
   const wasRebet = bets.has(userId);
   const requested: RouletteBetFingerprint = { session, userId, type, amount };
+  const riskScope = rouletteRiskScope(session);
+  // 資金へ触る前に一時参加を押さえる（順位卓・ソロ席・対人卓との排他）。
+  // 張り直しは同じ卓なので再取得を許す
+  if (!acquireTransientParticipation(services, userId, "roulette", riskScope, { reentrant: true })) {
+    return { ok: false, reason: "risk", detail: "ほかの卓に着いている。そちらを終わらせてからだ。" };
+  }
   let stored: RouletteBetFingerprint | undefined;
   try {
     stored = services.chips.runGroup(
       { groupKey: `roulette:bet:${session}:${userId}:${operationId}`, kind: "table_hold", actorId: userId },
       (): RouletteBetFingerprint => {
+        // 予約もエスクローも触る前に PR23 の安全上限を通す。ここで例外になれば
+        // グループごと巻き戻るので、Land・自由チップ・エスクロー・予約・casino_tx は
+        // 1行も動かない。ルーレットの最大損失は張った額そのもの（配当モデルは不変）
+        try {
+          services.dailyRisk.authorizeExposure({
+            userId,
+            scopeKey: riskScope,
+            operationId,
+            game: "ルーレット",
+            maxPlayerLoss: amount,
+            mode: "replace",
+          });
+        } catch (e) {
+          throw new RouletteRiskRejected(riskRejectionDetail(services, userId, e));
+        }
         const r = services.reservations.resize(reservationKey, wantedTotal, "ルーレット", RESERVATION_OWNER);
         if (!r.ok) throw new RouletteCapacityError(wantedTotal, r.available);
         // 張り直しは上書き: 前の張りを返してから新しい額をエスクロー
@@ -148,6 +193,13 @@ export function acceptRouletteBet(
       },
     );
   } catch (e) {
+    // 失敗はグループごと巻き戻っているので、この呼び出しでは資金も露出も増えていない。
+    // ただし**露出が残っているなら手放さない**（張り直しの失敗＝元の張りが生きている、
+    // 同一セッションの別操作が先に成立している、のどちらでも預り金が卓にある）。
+    if (!hasLiveRouletteExposure(services, riskScope, userId)) {
+      releaseTransientParticipation(userId, "roulette", riskScope);
+    }
+    if (e instanceof RouletteRiskRejected) return { ok: false, reason: "risk", detail: e.detail };
     if (e instanceof RouletteCapacityError) return { ok: false, reason: "capacity", available: e.available };
     if (e instanceof RouletteEscrowShortfall) return { ok: false, reason: "broke" };
     throw e;
@@ -169,18 +221,48 @@ export function acceptRouletteBet(
   return { ok: true };
 }
 
+/** PR23 拒否理由の文面。日次上限に当たった場合は残り枠まで見せる */
+function riskRejectionDetail(services: Services, userId: string, error: unknown): string {
+  if (error instanceof DailyRiskError && error.code === "ERR_DAILY_RISK_LIMIT") {
+    try {
+      const day = services.dailyRisk.dayFor(userId);
+      const remaining = day.remainingLossBudget;
+      return remaining > 0
+        ? `所持額に対して張りすぎだ。残り許容損失 ${fmtEther(remaining)} の範囲で張り直せ。`
+        : `今日はここまでだ。日次損失上限 ${fmtEther(day.lossCap)} に達している。`;
+    } catch {
+      return "賭場の利用制限を確認できないため、いまは張れない。";
+    }
+  }
+  return "賭場の利用制限を確認できないため、いまは張れない。";
+}
+
+/** その卓にまだ露出（＝預り金の裏付け）が残っているか。fail-closed で「残っている」扱い */
+function hasLiveRouletteExposure(services: Services, riskScope: string, userId: string): boolean {
+  try {
+    return services.dailyRisk.exposureOf(riskScope, userId) !== null;
+  } catch {
+    return true;
+  }
+}
+
 /**
  * 卓を無効化する: 全員へ返金し、卓予約を**同じグループ**で解放する（PR5）。
  * 別々に行うと、返金だけ成功して予約解放が落ちた場合に予約が残り続ける。
+ *
+ * PR23: 返金と同じトランザクションで露出も解く（純損益0なので当日枠は動かさない）。
  */
-export function voidRouletteTable(services: Services, session: string): void {
+export function voidRouletteTable(services: Services, session: string, participants: readonly string[] = []): void {
   services.chips.runGroup(
     { groupKey: `roulette:void:${session}`, kind: "table_refund", actorId: "system:roulette" },
     () => {
       services.escrow.refund(session);
+      services.dailyRisk.releaseExposureScope(rouletteRiskScope(session));
       services.reservations.release(reservationKeyFor(session));
     },
   );
+  // 資金が戻ってから一時参加を解く（順序を逆にすると預り金が卓にあるのに席だけ空く）
+  for (const userId of participants) releaseTransientParticipation(userId, "roulette", rouletteRiskScope(session));
 }
 
 const RED = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
@@ -281,6 +363,9 @@ export function settleRoulette(
           chain: false,
           fuku: false,
           operationId: `${session}:${b.userId}`,
+          // 実際の純損益を、**ベット受付時に決めた day_key** へ1回だけ帰属させる（PR23）。
+          // 露出が無ければここで落ちて回転ごと巻き戻る（日次上限の抜け道を作らない）
+          risk: { kind: "exposure", scopeKey: rouletteRiskScope(session) },
         });
         results.push({ userId: b.userId, type: b.type, amount: b.amount, won, payout, net: settled.net });
       }
@@ -306,8 +391,9 @@ export async function playRoulette(
   }
   activeSessions.add(channelId);
   const session = `roulette:${interaction.id}`;
+  // finally の席解放から見えるよう try の外に置く（PR23）
+  const bets = new Map<string, SessionBet>(); // userId -> bet（上書き）
   try {
-    const bets = new Map<string, SessionBet>(); // userId -> bet（上書き）
 
     const lobbyEmbed = (secondsLeft: number) => {
       const totalPot = [...bets.values()].reduce((s, b) => s + b.amount, 0);
@@ -404,6 +490,10 @@ export async function playRoulette(
             await sub.reply({ content: "処理に失敗した。もう一度張り直してくれ。", flags: MessageFlags.Ephemeral });
             return;
           }
+          if (accepted.reason === "risk") {
+            await sub.reply({ content: accepted.detail, flags: MessageFlags.Ephemeral });
+            return;
+          }
           await sub.reply({ content: `${Mammon.broke()}（所持 ${fmtEther(services.chips.balanceOf(btn.user.id))}）`, flags: MessageFlags.Ephemeral });
           await interaction.editReply({ embeds: [lobbyEmbed(Math.max(0, Math.ceil((endAt - Date.now()) / 1000)))] }).catch(() => undefined);
           return;
@@ -453,14 +543,15 @@ export async function playRoulette(
     // 抽選も core モデルの rouletteSpin() を使う（37 マス構成が単一の真実源）
     // 1回転ぶんを1グループで精算。1人でも払えなければ回転ごと巻き戻る
     let spin: RouletteSpinRecord;
+    const participants = [...bets.keys()];
     try {
       spin = settleRoulette(services, session, [...bets.values()]);
     } catch (e) {
       console.error(`[roulette] 卓 ${session} の精算に失敗。全額返金します`, e);
-      // 精算はまるごと巻き戻っているので、預り金・卓予約はそのまま残っている。
-      // 返金と卓予約の解放を同じグループで行う（voidRouletteTable）
+      // 精算はまるごと巻き戻っているので、預り金・卓予約・露出はそのまま残っている。
+      // 返金・露出解放・卓予約の解放を同じグループで行う（voidRouletteTable）
       try {
-        voidRouletteTable(services, session);
+        voidRouletteTable(services, session, participants);
       } catch (re) {
         console.error(`[roulette] 卓 ${session} の返金にも失敗。起動時の掃除に任せます`, re);
       }
@@ -493,6 +584,18 @@ export async function playRoulette(
       .setFooter({ text: `参加 ${bets.size}人 · 総額 ${fmtEther(totalPot).replace(" Ld", "Ld")}` });
     await interaction.editReply({ embeds: [embed], components: [] });
   } finally {
+    // 卓が終わったので席を空ける。ただし**露出が残っている人は手放さない**
+    // （返金にも失敗して預り金が卓に残っている状態で他の賭博へ行かせない）
+    releaseRouletteParticipants(services, session, [...bets.keys()]);
     activeSessions.delete(channelId);
+  }
+}
+
+/** 資金の後始末が済んだ参加者だけ席を空ける（§10 のライフサイクル） */
+function releaseRouletteParticipants(services: Services, session: string, userIds: readonly string[]): void {
+  const riskScope = rouletteRiskScope(session);
+  for (const userId of userIds) {
+    if (hasLiveRouletteExposure(services, riskScope, userId)) continue;
+    releaseTransientParticipation(userId, "roulette", riskScope);
   }
 }

@@ -10,14 +10,16 @@ export type DailyRiskSourceKind =
   | "solo_bonus"
   | "table_fee"
   | "table_result"
-  | "table_fee_refund";
+  | "table_fee_refund"
+  | "exposure_result";
 
 export type DailyRiskErrorCode =
   | "ERR_DAILY_RISK_UNAVAILABLE"
   | "ERR_DAILY_RISK_BAD_SETTING"
   | "ERR_DAILY_RISK_LIMIT"
   | "ERR_DAILY_RISK_OPERATION_CONFLICT"
-  | "ERR_DAILY_RISK_EVENT_CONFLICT";
+  | "ERR_DAILY_RISK_EVENT_CONFLICT"
+  | "ERR_DAILY_RISK_AUTH_MISSING";
 
 export class DailyRiskError extends Error {
   constructor(
@@ -57,6 +59,27 @@ export interface DailyRiskSoloStart {
 
 export interface DailyRiskTableExposure {
   userId: string;
+  dayKey: string;
+  maxPlayerLoss: number;
+}
+
+/**
+ * 「1つの卓・1つの共有セッションで、その利用者が最大いくら失いうるか」を賭場の DB に
+ * 残しておくための単位（PR23 追補）。
+ *
+ * 常設順位卓は参加者行そのものに risk 情報を持たせているが、ルーレットや `/勝負` の
+ * 対人卓は**永続テーブルを持たない**（プロセス内の Map と `casino_escrow` だけ）。
+ * それらも日次上限・所持50%・同時参加排他の対象なので、卓の識別子（`scopeKey`）
+ * ごとに露出を1行として持つ。
+ *
+ * - `replace`: ルーレットの張り直し（500 → 1000 は「1500」ではなく「1000」）
+ * - `add`: 多人数丁半の増し賭けのように、同じ卓で積み増す徴収
+ */
+export type DailyRiskExposureMode = "replace" | "add";
+
+export interface DailyRiskExposure {
+  userId: string;
+  scopeKey: string;
   dayKey: string;
   maxPlayerLoss: number;
 }
@@ -163,18 +186,21 @@ export class DailyRisk {
     return tx.immediate();
   }
 
+  /**
+   * ソロゲーム1回の実現損益を当日枠へ記録する。
+   *
+   * **対応する `authorizeSoloStart()` が無ければ黙って諦めない**（PR23 レビュー BLOCKER C）。
+   * 以前は `if (!start) return;` だったので、開始時の枠取りを忘れたゲームは
+   * 「遊べるが日次上限だけ効かない」という抜け道になっていた。いまは専用エラーで落とし、
+   * `Casino.settle()` の資金トランザクションごと巻き戻す（＝賭け自体が成立しない）。
+   */
   recordSoloResult(input: { userId: string; operationId: string; netSigned: number }): void {
     const userId = requiredString(input.userId, "userId");
     const operationId = requiredString(input.operationId, "operationId");
-    const start = this.soloStart(operationId);
-    if (!start) return;
-    if (start.userId !== userId) {
-      throw new DailyRiskError("ERR_DAILY_RISK_OPERATION_CONFLICT", "solo risk start user mismatch", { operationId, userId });
-    }
     this.recordEvent({
       eventKey: `solo_result:${operationId}`,
       userId,
-      dayKey: start.dayKey,
+      dayKey: this.requiredSoloStart(operationId, userId).dayKey,
       sourceKind: "solo_result",
       sourceId: operationId,
       operationId,
@@ -182,20 +208,192 @@ export class DailyRisk {
     });
   }
 
+  /** チンチロの倍付け負けのように、賭け額を超える追加損失を同じ開始枠へ足す */
   recordSoloExtraLoss(input: { userId: string; operationId: string; netSigned: number }): void {
     const userId = requiredString(input.userId, "userId");
     const operationId = requiredString(input.operationId, "operationId");
-    const start = this.soloStart(operationId);
-    if (!start) return;
     this.recordEvent({
       eventKey: `solo_extra_loss:${operationId}`,
       userId,
-      dayKey: start.dayKey,
+      dayKey: this.requiredSoloStart(operationId, userId).dayKey,
       sourceKind: "solo_extra_loss",
       sourceId: operationId,
       operationId,
       netSigned: input.netSigned,
     });
+  }
+
+  /**
+   * 永続卓を持たない賭博（ルーレット卓・`/勝負` の対人卓）の露出を確保する。
+   *
+   * 資金を1 Ld でも動かす**前**に呼ぶ。順序は正本 §15.1 のとおり
+   * 「最大損失 → 所持50% → 日次見込み損失 → 記録」。ここで例外になれば
+   * 呼び出し側は予約もエスクローも触っていないので、資金は動いていない。
+   */
+  authorizeExposure(input: {
+    userId: string;
+    scopeKey: string;
+    operationId: string;
+    game: string;
+    maxPlayerLoss: number;
+    mode: DailyRiskExposureMode;
+  }): DailyRiskExposure {
+    const userId = requiredString(input.userId, "userId");
+    const scopeKey = requiredString(input.scopeKey, "scopeKey");
+    const operationId = requiredString(input.operationId, "operationId");
+    const game = requiredString(input.game, "game");
+    const amount = nonnegativeInt(input.maxPlayerLoss, "maxPlayerLoss");
+    const mode = validateExposureMode(input.mode);
+    const fingerprint = canonicalStringify({ userId, scopeKey, operationId, game, amount, mode });
+    const tx = this.db.transaction((): DailyRiskExposure => {
+      this.assertFormal();
+      this.ensureSchema();
+      const replay = this.db
+        .prepare(
+          "SELECT day_key, resulting_max_loss, request_fingerprint FROM casino_risk_exposure_ops WHERE scope_key=? AND user_id=? AND operation_id=?",
+        )
+        .get(scopeKey, userId, operationId) as { day_key: string; resulting_max_loss: number; request_fingerprint: string } | undefined;
+      if (replay) {
+        if (replay.request_fingerprint !== fingerprint) {
+          throw new DailyRiskError("ERR_DAILY_RISK_OPERATION_CONFLICT", "casino risk exposure operation replay conflict", {
+            scopeKey,
+            userId,
+            operationId,
+          });
+        }
+        return { userId, scopeKey, dayKey: replay.day_key, maxPlayerLoss: replay.resulting_max_loss };
+      }
+      const current = this.db
+        .prepare("SELECT max_player_loss FROM casino_risk_exposures WHERE scope_key=? AND user_id=?")
+        .get(scopeKey, userId) as { max_player_loss: number } | undefined;
+      const previousMax = current?.max_player_loss ?? 0;
+      // 張り直しは差し替え、増し賭けは積み増し。どちらも「この卓で失いうる総額」を判定に使う
+      const nextMax = mode === "add" ? checkedAdd(previousMax, amount, "exposure") : amount;
+      const day = this.dayFor(userId);
+      this.assertHoldingsCoverage(userId, nextMax, "casino table participation requires at least 50% holdings coverage");
+      this.assertProspective(day, nextMax);
+      const at = this.now();
+      this.db
+        .prepare(
+          `INSERT INTO casino_risk_exposures (scope_key, user_id, day_key, game, max_player_loss, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(scope_key, user_id) DO UPDATE SET day_key=excluded.day_key, game=excluded.game,
+             max_player_loss=excluded.max_player_loss, updated_at=excluded.updated_at`,
+        )
+        .run(scopeKey, userId, day.dayKey, game, nextMax, at, at);
+      this.db
+        .prepare(
+          `INSERT INTO casino_risk_exposure_ops
+             (scope_key, user_id, operation_id, mode, amount, previous_max_loss, resulting_max_loss, day_key, request_fingerprint, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(scopeKey, userId, operationId, mode, amount, previousMax, nextMax, day.dayKey, fingerprint, at);
+      return { userId, scopeKey, dayKey: day.dayKey, maxPlayerLoss: nextMax };
+    });
+    return tx.immediate();
+  }
+
+  /** いま確保されている露出（無ければ null）。参加排他・監査の読み取り用 */
+  exposureOf(scopeKey: string, userId: string): DailyRiskExposure | null {
+    this.ensureSchema();
+    const row = this.db
+      .prepare("SELECT scope_key, user_id, day_key, max_player_loss FROM casino_risk_exposures WHERE scope_key=? AND user_id=?")
+      .get(requiredString(scopeKey, "scopeKey"), requiredString(userId, "userId")) as
+      | { scope_key: string; user_id: string; day_key: string; max_player_loss: number }
+      | undefined;
+    return row ? { scopeKey: row.scope_key, userId: row.user_id, dayKey: row.day_key, maxPlayerLoss: row.max_player_loss } : null;
+  }
+
+  /**
+   * 露出の確定。**資金精算と同じトランザクションの中で**呼ぶこと。
+   *
+   * 確保が無いのに精算しようとしたら fail-closed（BLOCKER C）。帰属日は
+   * ベット受付時に決めた `day_key` なので、日を跨いで精算されても当日枠は動かない。
+   */
+  settleExposure(input: { scopeKey: string; userId: string; operationId: string; netSigned: number }): void {
+    const scopeKey = requiredString(input.scopeKey, "scopeKey");
+    const userId = requiredString(input.userId, "userId");
+    const operationId = requiredString(input.operationId, "operationId");
+    const netSigned = signedInt(input.netSigned, "netSigned");
+    this.assertFormal();
+    this.ensureSchema();
+    const row = this.db
+      .prepare("SELECT day_key FROM casino_risk_exposures WHERE scope_key=? AND user_id=?")
+      .get(scopeKey, userId) as { day_key: string } | undefined;
+    if (!row) {
+      throw new DailyRiskError("ERR_DAILY_RISK_AUTH_MISSING", "casino risk exposure authorization is missing", { scopeKey, userId });
+    }
+    this.recordEvent({
+      eventKey: `exposure_result:${scopeKey}:${userId}`,
+      userId,
+      dayKey: row.day_key,
+      sourceKind: "exposure_result",
+      sourceId: scopeKey,
+      operationId,
+      netSigned,
+    });
+    this.clearExposure(scopeKey, userId);
+  }
+
+  /**
+   * 直前の {@link authorizeExposure} を**正確に取り消す**（資金が動かずに終わったとき）。
+   *
+   * 単に解放すると、多人数丁半の増し賭けが失敗したときに1回目の露出まで消えてしまい、
+   * 逆に放置すると露出だけ膨らんで精算時の純損益計算がずれる。操作行に「直前の値」を
+   * 持たせてあるので、そこへ戻す。
+   *
+   * 取り消せるのはその卓・その利用者の**最新の操作**だけ（順序が壊れる取り消しは
+   * fail-closed で拒否する）。存在しない操作の取り消しは何もしない（再試行安全）。
+   */
+  revokeExposure(input: { scopeKey: string; userId: string; operationId: string }): void {
+    const scopeKey = requiredString(input.scopeKey, "scopeKey");
+    const userId = requiredString(input.userId, "userId");
+    const operationId = requiredString(input.operationId, "operationId");
+    const tx = this.db.transaction(() => {
+      this.ensureSchema();
+      const op = this.db
+        .prepare(
+          "SELECT rowid AS rid, previous_max_loss FROM casino_risk_exposure_ops WHERE scope_key=? AND user_id=? AND operation_id=?",
+        )
+        .get(scopeKey, userId, operationId) as { rid: number; previous_max_loss: number } | undefined;
+      if (!op) return;
+      const latest = this.db
+        .prepare("SELECT rowid AS rid FROM casino_risk_exposure_ops WHERE scope_key=? AND user_id=? ORDER BY rowid DESC LIMIT 1")
+        .get(scopeKey, userId) as { rid: number } | undefined;
+      if (!latest || latest.rid !== op.rid) {
+        throw new DailyRiskError("ERR_DAILY_RISK_OPERATION_CONFLICT", "casino risk exposure revoke is out of order", {
+          scopeKey,
+          userId,
+          operationId,
+        });
+      }
+      this.db.prepare("DELETE FROM casino_risk_exposure_ops WHERE scope_key=? AND user_id=? AND operation_id=?").run(scopeKey, userId, operationId);
+      if (op.previous_max_loss > 0) {
+        this.db
+          .prepare("UPDATE casino_risk_exposures SET max_player_loss=?, updated_at=? WHERE scope_key=? AND user_id=?")
+          .run(op.previous_max_loss, this.now(), scopeKey, userId);
+        return;
+      }
+      this.db.prepare("DELETE FROM casino_risk_exposures WHERE scope_key=? AND user_id=?").run(scopeKey, userId);
+    });
+    tx.immediate();
+  }
+
+  /**
+   * 返金・不成立で露出を解く（純損益0なので当日枠は動かさない）。
+   * **資金がまだエスクローに残っている状態で呼んではならない**（正本 §15.1 の同時参加管理）。
+   */
+  releaseExposure(scopeKey: string, userId: string): void {
+    this.ensureSchema();
+    this.clearExposure(requiredString(scopeKey, "scopeKey"), requiredString(userId, "userId"));
+  }
+
+  /** 卓ごと流れたときの一括解放（ルーレットの `voidRouletteTable` など） */
+  releaseExposureScope(scopeKey: string): void {
+    const safe = requiredString(scopeKey, "scopeKey");
+    this.ensureSchema();
+    this.db.prepare("DELETE FROM casino_risk_exposure_ops WHERE scope_key=?").run(safe);
+    this.db.prepare("DELETE FROM casino_risk_exposures WHERE scope_key=?").run(safe);
   }
 
   authorizeTableJoin(input: {
@@ -216,15 +414,7 @@ export class DailyRisk {
       this.assertFormal();
       this.ensureSchema();
       const day = this.dayFor(userId);
-      const holdings = this.holdings(userId);
-      if (maxPlayerLoss > 0 && holdings < maxPlayerLoss * 2) {
-        throw new DailyRiskError("ERR_DAILY_RISK_LIMIT", "ranked join requires at least 50% holdings coverage", {
-          userId,
-          holdings,
-          required: maxPlayerLoss * 2,
-          maxPlayerLoss,
-        });
-      }
+      this.assertHoldingsCoverage(userId, maxPlayerLoss, "ranked join requires at least 50% holdings coverage");
       this.assertProspective(day, maxPlayerLoss);
       const eventKey = `table_join_risk:${tableId}:${userId}:${operationId}`;
       const existing = this.db
@@ -274,6 +464,50 @@ export class DailyRisk {
       )
       .run(eventKey, userId, dayKey, sourceKind, sourceId, operationId, netSigned, fingerprint, this.now());
     this.refreshDayNet(userId, dayKey);
+  }
+
+  /**
+   * 正本 §15.1「最大損失が所持Landの50%を超える卓には参加できない」の唯一の実装。
+   *
+   * 所持 = 通常Land + 自由チップ（エスクロー預託分は含めない）。ちょうど50%は通し、
+   * 1 Ld でも超えたら断る。`maxPlayerLoss * 2` ではなく `floor(holdings / 2)` で比較して、
+   * 破損した巨大値どうしの積が safe integer を外れないようにする。
+   */
+  private assertHoldingsCoverage(userId: string, maxPlayerLoss: number, message: string): void {
+    if (maxPlayerLoss <= 0) return;
+    const holdings = this.holdings(userId);
+    if (maxPlayerLoss > Math.floor(holdings / 2)) {
+      throw new DailyRiskError("ERR_DAILY_RISK_LIMIT", message, {
+        userId,
+        holdings,
+        required: maxPlayerLoss * 2,
+        maxPlayerLoss,
+      });
+    }
+  }
+
+  private clearExposure(scopeKey: string, userId: string): void {
+    this.db.prepare("DELETE FROM casino_risk_exposure_ops WHERE scope_key=? AND user_id=?").run(scopeKey, userId);
+    this.db.prepare("DELETE FROM casino_risk_exposures WHERE scope_key=? AND user_id=?").run(scopeKey, userId);
+  }
+
+  /**
+   * 開始枠の取得。存在しなければ fail-closed、別人の枠へ紐づけようとしても fail-closed
+   * （PR23 レビュー BLOCKER C / §17）。
+   */
+  private requiredSoloStart(operationId: string, userId: string): DailyRiskSoloStart {
+    const start = this.soloStart(operationId);
+    if (!start) {
+      throw new DailyRiskError("ERR_DAILY_RISK_AUTH_MISSING", "solo risk start authorization is missing", { operationId, userId });
+    }
+    if (start.userId !== userId) {
+      throw new DailyRiskError("ERR_DAILY_RISK_OPERATION_CONFLICT", "solo risk start user mismatch", {
+        operationId,
+        userId,
+        ownerId: start.userId,
+      });
+    }
+    return start;
   }
 
   private assertProspective(day: DailyRiskDay, maxPlayerLoss: number): void {
@@ -451,6 +685,31 @@ export class DailyRisk {
         created_at INTEGER NOT NULL,
         FOREIGN KEY (user_id, day_key) REFERENCES casino_daily_risk_days(user_id, day_key)
       );
+      CREATE TABLE IF NOT EXISTS casino_risk_exposures (
+        scope_key TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        day_key TEXT NOT NULL,
+        game TEXT NOT NULL,
+        max_player_loss INTEGER NOT NULL CHECK(max_player_loss >= 0),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (scope_key, user_id),
+        FOREIGN KEY (user_id, day_key) REFERENCES casino_daily_risk_days(user_id, day_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_casino_risk_exposures_user ON casino_risk_exposures(user_id);
+      CREATE TABLE IF NOT EXISTS casino_risk_exposure_ops (
+        scope_key TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK(mode IN ('replace','add')),
+        amount INTEGER NOT NULL CHECK(amount >= 0),
+        previous_max_loss INTEGER NOT NULL CHECK(previous_max_loss >= 0),
+        resulting_max_loss INTEGER NOT NULL CHECK(resulting_max_loss >= 0),
+        day_key TEXT NOT NULL,
+        request_fingerprint TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (scope_key, user_id, operation_id)
+      );
     `);
   }
 }
@@ -474,6 +733,11 @@ function nonnegativeInt(value: unknown, field: string): number {
     throw new DailyRiskError("ERR_DAILY_RISK_OPERATION_CONFLICT", "daily risk integer field is invalid", { field, value });
   }
   return value;
+}
+
+function validateExposureMode(value: unknown): DailyRiskExposureMode {
+  if (value === "replace" || value === "add") return value;
+  throw new DailyRiskError("ERR_DAILY_RISK_OPERATION_CONFLICT", "casino risk exposure mode is invalid", { mode: value });
 }
 
 function signedInt(value: unknown, field: string): number {

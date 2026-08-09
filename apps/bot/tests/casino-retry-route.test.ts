@@ -133,7 +133,7 @@ describe("casino retry route", () => {
     const { services, calls } = fakeServices();
     const interaction = button(retryCustomIdFor(game, 500, OWNER_ID));
 
-    expect(acquireSeat(OWNER_ID)).toBe(true);
+    expect(acquireSeat(services, OWNER_ID)).toBe(true);
     try {
       await handleCasinoResultButton(interaction, services);
     } finally {

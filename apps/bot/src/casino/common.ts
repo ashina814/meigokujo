@@ -19,6 +19,7 @@ import {
 import { fmtEther } from "../format.js";
 import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
+import { acquireTransientParticipation, hasTransientParticipation, releaseTransientParticipation } from "./participation.js";
 import { C_BIGWIN, C_LOSE, C_MAMMON, C_PUSH, C_WIN, E, fmtBigDelta } from "./ui.js";
 
 /** PR13: 旧チップ時代の賭け額を1/10へ。利用者画面の単位はLandのみ。 */
@@ -74,31 +75,28 @@ export function liabilityCtx(services: Services, userId: string): Omit<Liability
   };
 }
 
-/** 同時プレイ防止（1人1卓）。プロセス内ロックで足りる（bot は単一プロセス） */
-const playing = new Set<string>();
+/**
+ * ソロゲームの席（同時プレイ防止・1人1卓）。
+ *
+ * 実体は {@link acquireTransientParticipation} の "solo" 種別で、ルーレット卓・
+ * 対人卓と**同じ1枠**を奪い合う（正本 §15.1）。`services` を必ず要求するのは、
+ * 生きている常設順位卓の確認を通さずに席を取れる型を残さないため
+ * （PR23 レビュー BLOCKER D）。
+ */
+const SOLO_PARTICIPATION_KEY = "solo";
 
-export function acquireSeat(userId: string): boolean;
-export function acquireSeat(services: Pick<Services, "persistentTables">, userId: string): boolean;
-export function acquireSeat(first: string | Pick<Services, "persistentTables">, second?: string): boolean {
-  const userId = typeof first === "string" ? first : second;
-  if (!userId) return false;
-  if (typeof first !== "string") {
-    try {
-      if (first.persistentTables.participantHasLiveTable(userId)) return false;
-    } catch {
-      return false;
-    }
-  }
-  if (playing.has(userId)) return false;
-  playing.add(userId);
-  return true;
+export function acquireSeat(services: Pick<Services, "persistentTables">, userId: string): boolean {
+  return acquireTransientParticipation(services, userId, "solo", SOLO_PARTICIPATION_KEY);
 }
 export function releaseSeat(userId: string): void {
-  playing.delete(userId);
+  releaseTransientParticipation(userId, "solo", SOLO_PARTICIPATION_KEY);
 }
-/** PR10 refund/confirmation safety gate for process-local solo games. */
+/**
+ * PR10 refund/confirmation safety gate.
+ * ソロ席だけでなくルーレット・対人卓の一時参加も含む（どれもエスクローに資金がある）。
+ */
 export function isSeatOccupied(userId: string): boolean {
-  return playing.has(userId);
+  return hasTransientParticipation(userId);
 }
 
 export interface BetCheck {

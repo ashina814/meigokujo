@@ -223,6 +223,7 @@ export function buildServices() {
     reservations,
     disputes: rankedDisputes,
     dailyRisk,
+    openingPhase: () => chipTx.openingPhase(),
     superHighEnabled: () => settings.getNumber("casino_super_high_enabled") === 1,
     extremeEnabled: () => settings.getNumber("casino_extreme_enabled") === 1,
     highCooldownSec: () => {

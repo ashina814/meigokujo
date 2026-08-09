@@ -507,6 +507,30 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "daily-risk.ts binds a solo operation to the formal day checked at start. It is non-financial metadata and must not carry old start-day bindings across formal opening.",
   }),
   T({
+    table: "casino_risk_exposures",
+    purpose: "Live per-table player exposure for roulette and /勝負 PvP risk limits",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "daily-risk.ts holds the max-loss exposure of a non-persistent table (roulette session, PvP session) while its stake is escrowed. Funds live in casino_escrow, not here; pre-opening rows are stale policy metadata and are reset in R6.",
+  }),
+  T({
+    table: "casino_risk_exposure_ops",
+    purpose: "Idempotency log for exposure authorize/replace/add operations",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "daily-risk.ts records each exposure operation so replays are detected and a failed collection can be revoked exactly. Non-financial metadata that must not carry pre-opening bindings across formal opening.",
+  }),
+  T({
     table: "casino_ranked_open_history",
     purpose: "Append-only high-tier ranked-table open history for staged availability/cooldown",
     kind: "optional_feature",

@@ -318,6 +318,10 @@ export function spinPaid(services: Services, uid: string, bet: number, interacti
       const settledInGroup = services.casino.settleSolo(uid, "スロット", bet, spin.payout, {
         operationId: `${interactionId}:paid`,
         jackpotCut: jpCut,
+        // 有料スピンの精算鍵は `<interactionId>:paid`（フリースピンと分けるため）だが、
+        // 日次リスクの開始枠は `validateBet()` が interaction.id で取っている。
+        // どちらの鍵を使うかを明示しないと、枠が見つからず fail-closed で落ちる（PR23）
+        risk: { kind: "solo", startOperationId: interactionId },
       });
       const payout = settledInGroup.payout - settledInGroup.chainBonus + settledInGroup.fukuTax;
 
