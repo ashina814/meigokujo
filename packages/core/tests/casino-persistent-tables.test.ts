@@ -334,6 +334,24 @@ describe("PersistentTables", () => {
     expect(() => ctx3.persistentTables.listLiveTables()).toThrow(PersistentTableError);
   });
 
+  it("returns empty instead of throwing for every read path when the schema is absent", () => {
+    // 卓スキーマ未作成のDBでも読み取り系は例外を投げず「無い」と答える。
+    // liveTableForParticipant だけこのガードが抜けていて本番で例外になり、
+    // リポジトリへ戻っていないホットフィックスが本番に残っていた。
+    // 読み取り経路をまとめて押さえ、1つでも抜けたらここで落とす。
+    const ctx = setup(true);
+    const pt = ctx.persistentTables;
+    expect(pt.liveEscrowHolders()).toEqual([]);
+    expect(pt.listLiveTables()).toEqual([]);
+    expect(pt.listRecentTables()).toEqual([]);
+    expect(pt.listDueTables()).toEqual([]);
+    expect(pt.get("t1")).toBeNull();
+    expect(pt.participants("t1")).toEqual([]);
+    expect(pt.liveTableForParticipant("alice")).toBeNull();
+    // 参加チェックはソロ卓に着く前の常時経路なので、ここが投げると賭場全体が止まる
+    expect(pt.participantHasLiveTable("alice")).toBe(false);
+  });
+
   it("fails closed on malformed rows without deriving escrow holders from bad ids", () => {
     const ctx = setup(true);
     createPersistentSchemaWithRows(ctx.db);

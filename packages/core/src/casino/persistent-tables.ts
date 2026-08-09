@@ -763,6 +763,7 @@ export class PersistentTables {
   }
 
   liveTableForParticipant(userId: string): PersistentTableRow | null {
+    if (this.schemaStateOrThrow() === "none") return null;
     const liveStates = Array.from(PERSISTENT_TABLE_LIVE_STATES);
     const placeholders = liveStates.map(() => "?").join(",");
     const row = this.db
