@@ -9,3 +9,16 @@ export function isAdmin(interaction: Interaction, services: Services): boolean {
   const member = interaction.member as GuildMember | null;
   return memberInSlot(member, services, "admin");
 }
+
+/**
+ * 賭博場従業員パネル（/賭場運営）の利用資格（PR24）。
+ *
+ * 運営（OWNER / 管理ロール）は上位資格として当然使える。賭博場従業員ロールは
+ * **このパネルだけ**を開ける資格で、{@link isAdmin} には一切影響しない
+ * ——従業員だからといって /管理 や裁定・金銭操作へ入れるようになってはいけない。
+ */
+export function isCasinoEmployee(interaction: Interaction, services: Services): boolean {
+  if (isAdmin(interaction, services)) return true;
+  const member = interaction.member as GuildMember | null;
+  return memberInSlot(member, services, "casino_employee");
+}

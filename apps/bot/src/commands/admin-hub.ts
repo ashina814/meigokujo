@@ -35,6 +35,7 @@ import {
   type TicketPanel,
 } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
+import { registerTrustedRankedProfile } from "./casino-employee.js";
 import { ROLE_SLOT_META, ROLE_SLOT_ORDER, getRoleIds, setRoleIds, type RoleSlot } from "../church-roles.js";
 import {
   getSpecialProfiles,
@@ -255,6 +256,7 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
     }
     return void (await interaction.showModal(casinoReopenModal(cur.reason)));
   }
+  if (section === "casino" && action === "profile") return void (await interaction.showModal(rankedProfileModal()));
   if (section === "casino" && action === "baseline") {
     return void (await interaction.showModal(
       casinoBaselineModal(services.chips.pool(), services.ledger.lastTransactionId()),
@@ -524,6 +526,37 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
   const section = parts[1];
   const action = parts[2];
 
+  if (section === "casino" && action === "profile") {
+    // 汎用順位卓の順位配分は**運営だけ**が登録できる（PR24）。従業員は登録済みから選ぶだけ。
+    // 妥当性（ゼロ和・整数Land・受取非負・プール保存）は core の validateRankProfile がそのまま判定する
+    const profileKey = interaction.fields.getTextInputValue("profile_key").trim();
+    const label = interaction.fields.getTextInputValue("label").trim();
+    const deltas = parseRankDeltaTokens(interaction.fields.getTextInputValue("deltas"));
+    if (!deltas) {
+      await interaction.reply({
+        content: [
+          "順位配分は**10進整数だけ**を2つ以上、カンマか空白区切りで入力してください。",
+          "例: `10000, 0, -10000`",
+          "小数・指数表記・16進数・数字以外の語が1つでも混ざっていれば登録しません（読み飛ばしません）。",
+        ].join("\n"),
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const result = registerTrustedRankedProfile(interaction, services, {
+      profileKey,
+      label,
+      participantCount: deltas.length,
+      rankDeltaBps: deltas,
+    });
+    await interaction.reply({
+      content: result.ok
+        ? `順位配分「${label}」(\`${profileKey}\`) を登録しました。従業員パネルの「卓を開く」から選べます。`
+        : `❌ 登録できません: ${result.reason}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
   if (section === "casino" && action === "refund-user") {
     const targetId = interaction.fields.getTextInputValue("user_id").trim();
     if (!/^\d{15,22}$/.test(targetId)) {
@@ -2177,6 +2210,16 @@ function casinoHome(services: Services) {
         .setDisabled(phase !== "formal"),
     ),
   );
+  // PR24: 汎用順位卓の順位配分を登録する（資金は動かない。従業員へ選択肢を配るだけ）
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId("mgmt:casino:profile")
+        .setLabel("汎用順位卓の配分を登録")
+        .setEmoji("🧮")
+        .setStyle(ButtonStyle.Secondary),
+    ),
+  );
   // 検算Bの基準が無い版（PR2 以前から動いていたDB）だけ、明示的な基準確定を出す
   if (services.chipTx.openingLandBaseline() === null) {
     rows.push(
@@ -2190,6 +2233,52 @@ function casinoHome(services: Services) {
     );
   }
   return { embeds: [embed], components: [...rows, backButton()] };
+}
+
+/**
+ * 順位配分の入力を**全件 strict に**解釈する（PR24 レビュー BLOCKER 3）。
+ *
+ * 配分式は配当に直結する信頼設定なので、読めない語を黙って捨ててはいけない。
+ * 以前は `.map(Number).filter(Number.isFinite)` だったため
+ * `10000, foo, -10000` が 2人卓 `[10000, -10000]` として登録されえた。
+ *
+ * いまは1トークンでも10進整数でなければ**入力全体を拒否**する。
+ * したがって人数は「有効だったトークン数」ではなく、常に入力された順位トークンの件数になる。
+ * 小数(`1.5`)・指数(`1e4`)・16進(`0x100`)・`NaN`・`Infinity`・語句はすべて弾く。
+ */
+export function parseRankDeltaTokens(raw: string): number[] | null {
+  const tokens = raw.split(/[\s,]+/).filter((token) => token !== "");
+  if (tokens.length < 2) return null;
+  const values: number[] = [];
+  for (const token of tokens) {
+    if (!/^[+-]?\d+$/.test(token)) return null;
+    const value = Number(token);
+    if (!Number.isSafeInteger(value)) return null;
+    values.push(value);
+  }
+  return values;
+}
+
+function rankedProfileModal() {
+  return new ModalBuilder()
+    .setCustomId("mgmt:casino:profile")
+    .setTitle("汎用順位卓の順位配分を登録")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("profile_key").setLabel("識別子（英小文字・数字・_-）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("label").setLabel("表示名").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("deltas")
+          .setLabel("1位から順の増減bps（合計0・例: 10000,-10000）")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(120),
+      ),
+    );
 }
 
 function casinoRefundUserModal() {

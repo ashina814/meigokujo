@@ -10,7 +10,7 @@ import {
   type Client,
   type ModalSubmitInteraction,
 } from "discord.js";
-import { rankedReceipts, type RankedDisputePublicStatus, type RankedTableSnapshot } from "@meigokujo/core";
+import { RANKED_TABLE_TIERS, rankedReceipts, type RankedDisputePublicStatus, type RankedTableSnapshot } from "@meigokujo/core";
 import type { Services } from "../services.js";
 
 export const RANKED_TABLE_CUSTOM_PREFIX = "rtbl:";
@@ -28,8 +28,11 @@ export function renderRankedTable(snapshot: RankedTableSnapshot, dispute?: Ranke
   const { table, config, participants, result } = snapshot;
   const active = participants.filter((p) => p.participantState !== "declined");
   const title = `順位卓 / ${labelForGame(table.gameKey)}`;
+  const tier = tierLabel(config.baseAmount);
   const lines = [
     `状態: ${stateLabel(table.state)}`,
+    // 卓ランクは基準額から一意に決まる。決まらない額（旧データ等）のときは出さない
+    ...(tier ? [`卓ランク: ${tier}`] : []),
     `基準額: ${config.baseAmount.toLocaleString("ja-JP")} Ld`,
     `場代: ${config.feePerUser.toLocaleString("ja-JP")} Ld / 人`,
     `参加: ${active.length}/${config.participantCount}`,
@@ -252,6 +255,11 @@ function parseCustomId(customId: string): { action: string; tableId: string; sea
   if (parts[0] !== "rtbl" || !parts[1] || !parts[2]) return null;
   const parsedSeat = parts[3] ? Number(parts[3]) : undefined;
   return { action: parts[1], tableId: parts[2], ...(parsedSeat !== undefined && Number.isSafeInteger(parsedSeat) && parsedSeat > 0 ? { seat: parsedSeat } : {}) };
+}
+
+/** 正本の卓ランク表記（見習卓 / 低卓 / 中卓 / 高卓 …）。基準額から一意に導ける場合だけ返す */
+function tierLabel(baseAmount: number): string | null {
+  return RANKED_TABLE_TIERS.find((t) => t.baseAmount === baseAmount)?.label ?? null;
 }
 
 function labelForGame(gameKey: string): string {

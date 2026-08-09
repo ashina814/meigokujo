@@ -20,6 +20,11 @@ import { replyStocksPaused } from "./casino/stocks-pause.js";
 import { handleKeibaCommand } from "./commands/keiba.js";
 import { handleAnnaiButton, handleAnnaiCommand } from "./commands/annai.js";
 import { handleCasinoHomeButton, handleCasinoHomeCommand } from "./commands/casino-home.js";
+import {
+  handleCasinoEmployeeCommand,
+  handleCasinoEmployeeInteraction,
+  isCasinoEmployeeInteraction,
+} from "./commands/casino-employee.js";
 import { handleCasinoEvidenceCommand } from "./commands/casino-evidence.js";
 import { handleCasinoArbitrationCommand } from "./commands/casino-arbitration.js";
 import { handleVipButton, handleVipCommand } from "./commands/vip.js";
@@ -203,6 +208,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "賭場":
           await handleCasinoHomeCommand(interaction, services);
           return;
+        case "賭場運営":
+          await handleCasinoEmployeeCommand(interaction, services);
+          return;
         case "賭場証拠":
           await handleCasinoEvidenceCommand(interaction, services);
           return;
@@ -254,6 +262,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       } else if (interaction.commandName === "説明会") {
         await handleSessionScheduleAutocomplete(interaction, services);
       }
+      return;
+    }
+    if (
+      (interaction.isModalSubmit() || interaction.isStringSelectMenu() || interaction.isButton()) &&
+      isCasinoEmployeeInteraction(interaction.customId)
+    ) {
+      await handleCasinoEmployeeInteraction(interaction, services);
       return;
     }
     if (interaction.isModalSubmit() && interaction.customId === "eval:modal") {

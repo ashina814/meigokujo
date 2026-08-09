@@ -296,6 +296,7 @@ export {
   RankedTableError,
   RANKED_PROFILES,
   RANKED_TABLE_TIERS,
+  EMPLOYEE_OPERABLE_TIER_KEYS,
   feeForBaseAmount,
   rankedReceipts,
   validateRankProfile,
@@ -312,7 +313,18 @@ export {
   type ReadyRankedTableInput,
   type SubmitRankedResultInput,
   type ApproveRankedResultInput,
+  type RankedCreateAuthority,
+  type RankedTierAvailability,
 } from "./casino/ranked-tables.js";
+export {
+  RankedProfiles,
+  RankedProfileError,
+  isGenericRankedGame,
+  type RankedProfileRow,
+  type RankedProfileErrorCode,
+  type RankedProfilesOptions,
+  type RegisterRankedProfileInput,
+} from "./casino/ranked-profiles.js";
 export {
   rankedFeeReservationKey,
   RANKED_FEE_RESERVATION_SCOPE,
