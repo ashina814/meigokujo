@@ -372,6 +372,35 @@ describe("RankedTables result approval and settlement", () => {
     expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(10_000);
     expect(escrowRows(ctx, "t1").map((r) => r.amount)).toEqual([4_999, 5_000]);
   });
+
+  it("does not silently coerce partial stored results to no result at runtime", () => {
+    const ctx = setup();
+    startGf(ctx);
+    ctx.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
+    ctx.db.prepare("UPDATE casino_tables SET result_submitted_at=NULL WHERE table_id='t1'").run();
+    expect(() => ctx.rankedTables.snapshot("t1")).toThrow(RankedTableError);
+  });
+
+  it("rejects ranked table states that require or forbid stored results", () => {
+    const pending = setup();
+    startGf(pending);
+    pending.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
+    pending.db
+      .prepare(
+        `UPDATE casino_tables
+            SET result_json=NULL, result_hash=NULL, result_submitted_by=NULL, result_submitted_at=NULL, result_operation_id=NULL
+          WHERE table_id='t1'`,
+      )
+      .run();
+    expect(() => pending.rankedTables.snapshot("t1")).toThrow(RankedTableError);
+
+    const playing = setup();
+    startGf(playing);
+    expect(playing.rankedTables.snapshot("t1").result).toBeNull();
+    playing.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
+    playing.db.prepare("UPDATE casino_tables SET state='playing' WHERE table_id='t1'").run();
+    expect(() => playing.rankedTables.snapshot("t1")).toThrow(RankedTableError);
+  });
 });
 
 describe("RankedTables timeout, metrics, and opening safety", () => {

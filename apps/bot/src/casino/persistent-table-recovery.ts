@@ -96,6 +96,7 @@ async function restoreOnePersistentTableMessage(
 
 function renderPersistentTableRecoveryMessage(services: Services, table: PersistentTableRow): { embeds: EmbedBuilder[]; components?: unknown[] } | "disputed" {
   const rankedState = rankedStorageState(services, table.tableId);
+  if (rankedState === "partial") return markDisputed(services, table, "ranked table storage is partial");
   try {
     return renderRankedTable(services.rankedTables.snapshot(table.tableId));
   } catch (e) {
@@ -124,13 +125,13 @@ function rankedStorageState(services: Services, tableId: string): "none" | "rank
   const row = services.db
     .prepare(
       `SELECT base_amount, fee_per_user, participant_count, rank_profile_json,
-              result_json, result_hash, result_submitted_by, result_submitted_at
+              result_json, result_hash, result_submitted_by, result_submitted_at, result_operation_id
          FROM casino_tables WHERE table_id=?`,
     )
     .get(tableId) as Record<string, unknown> | undefined;
   if (!row) return "none";
   const configValues = [row.base_amount, row.fee_per_user, row.participant_count, row.rank_profile_json];
-  const resultValues = [row.result_json, row.result_hash, row.result_submitted_by, row.result_submitted_at];
+  const resultValues = [row.result_json, row.result_hash, row.result_submitted_by, row.result_submitted_at, row.result_operation_id];
   const hasConfig = configValues.some((value) => value !== null && value !== undefined);
   const fullConfig = configValues.every((value) => value !== null && value !== undefined);
   const hasResult = resultValues.some((value) => value !== null && value !== undefined);

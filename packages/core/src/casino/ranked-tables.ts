@@ -626,11 +626,13 @@ export class RankedTables {
 
   snapshot(tableId: string): RankedTableSnapshot {
     const table = this.requiredTable(tableId);
+    const result = this.resultFor(table);
+    this.assertResultState(table, result);
     return {
       table,
       config: this.configFor(table),
       participants: this.participants(tableId),
-      result: this.resultFor(tableId),
+      result,
     };
   }
 
@@ -699,7 +701,7 @@ export class RankedTables {
 
   private settleApproved(table: PersistentTableRow, actor: string): void {
     const config = this.configFor(table);
-    const result = this.resultFor(table.tableId);
+    const result = this.resultFor(table);
     if (!result) throw new RankedTableError("ERR_RANKED_RESULT_INVALID", "ranked result is missing");
     this.validateRanking(table.tableId, config, result.orderedUserIds);
     const distributions = this.distributions(config, result.orderedUserIds);
@@ -805,18 +807,39 @@ export class RankedTables {
     return config;
   }
 
-  private resultFor(tableId: string): RankedResultSnapshot | null {
-    const storage = this.requiredStorage(tableId);
-    if (storage.result_json == null || storage.result_hash == null || storage.result_submitted_by == null || storage.result_submitted_at == null) return null;
-    const parsed = parseResult(storage.result_json);
+  private resultFor(table: PersistentTableRow): RankedResultSnapshot | null {
+    const storage = this.requiredStorage(table.tableId);
+    const resultJson = storage.result_json;
+    const resultHashValue = storage.result_hash;
+    const submittedBy = storage.result_submitted_by;
+    const submittedAt = storage.result_submitted_at;
+    const operationId = storage.result_operation_id;
+    if (resultJson == null && resultHashValue == null && submittedBy == null && submittedAt == null && operationId == null) return null;
+    if (resultJson == null || resultHashValue == null || submittedBy == null || submittedAt == null || operationId == null) {
+      throw new RankedTableError("ERR_RANKED_RESULT_INVALID", "stored ranked result is partial", { tableId: table.tableId, state: table.state });
+    }
+    const parsed = parseResult(resultJson);
     const hash = resultHash(parsed.orderedUserIds);
-    if (hash !== storage.result_hash) throw new RankedTableError("ERR_RANKED_RESULT_INVALID", "stored ranked result hash is corrupt", { tableId });
+    if (hash !== resultHashValue) throw new RankedTableError("ERR_RANKED_RESULT_INVALID", "stored ranked result hash is corrupt", { tableId: table.tableId });
+    if (!Number.isSafeInteger(submittedAt) || submittedAt < 0) {
+      throw new RankedTableError("ERR_RANKED_RESULT_INVALID", "stored ranked result submitted_at is corrupt", { tableId: table.tableId });
+    }
+    requiredString(operationId, "result_operation_id");
     return {
       orderedUserIds: parsed.orderedUserIds,
       hash,
-      submittedBy: storage.result_submitted_by,
-      submittedAt: storage.result_submitted_at,
+      submittedBy,
+      submittedAt,
     };
+  }
+
+  private assertResultState(table: PersistentTableRow, result: RankedResultSnapshot | null): void {
+    if ((table.state === "pending_approval" || table.state === "settled") && !result) {
+      throw new RankedTableError("ERR_RANKED_RESULT_INVALID", "ranked table state requires a stored result", { tableId: table.tableId, state: table.state });
+    }
+    if ((table.state === "recruiting" || table.state === "ready_check" || table.state === "playing") && result) {
+      throw new RankedTableError("ERR_RANKED_RESULT_INVALID", "ranked table state must not have a stored result", { tableId: table.tableId, state: table.state });
+    }
   }
 
   private requiredStorage(tableId: string): RankedTableStorageRow {
