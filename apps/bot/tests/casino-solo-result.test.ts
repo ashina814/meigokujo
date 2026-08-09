@@ -57,6 +57,9 @@ function fakeServices(opts: {
     items: {
       armedWinBonusCap: () => 0,
     },
+    dailyRisk: {
+      maxBetForPlayerLoss: (_userId: string, _lossPerBet: (bet: number) => number, cap: number) => cap,
+    },
     chipFlow: {
       redeemFreeChips: opts.redeem ?? vi.fn(() => ({ userId: "u1", redeemed: 0, land: 0, reason: "賭場を出る" })),
     },

@@ -153,7 +153,7 @@ export async function playPoker(
   context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
-  if (!acquireSeat(uid)) {
+  if (!acquireSeat(services, uid)) {
     if (interaction.replied || interaction.deferred) {
       await interaction.followUp({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
     } else {

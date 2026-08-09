@@ -219,6 +219,16 @@ export {
 } from "./casino/service.js";
 export { Daily, type DailyClaim, type DailyClaimResult, type DailyOptions } from "./casino/daily.js";
 export {
+  DailyRisk,
+  DailyRiskError,
+  type DailyRiskDay,
+  type DailyRiskErrorCode,
+  type DailyRiskOptions,
+  type DailyRiskSourceKind,
+  type DailyRiskSoloStart,
+  type DailyRiskTableExposure,
+} from "./casino/daily-risk.js";
+export {
   CasinoMetrics,
   CasinoMetricsError,
   CASINO_METRIC_EVENT_TYPES,

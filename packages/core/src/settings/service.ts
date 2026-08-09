@@ -41,6 +41,10 @@ export const SETTING_DEFAULTS = {
   daily_base: 1_000,
   daily_relief_threshold: 10_000,
   daily_relief_max: 500,
+  casino_daily_loss_limit_bps: 3_000,
+  casino_daily_boundary_offset_minutes: 540,
+  casino_super_high_enabled: 0,
+  casino_extreme_enabled: 0,
   // VIP
   vip_price: 30_000,
   vip_days: 30,

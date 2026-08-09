@@ -8,6 +8,8 @@ import type { CasinoChipFlow } from "./chip-flow.js";
 import type { HouseReservations } from "./reservations.js";
 import { rankedFeeReservationKey, RANKED_FEE_RESERVATION_SCOPE } from "./ranked-fee-reservation.js";
 import type { RankedDisputes } from "./ranked-disputes.js";
+import type { DailyRisk } from "./daily-risk.js";
+import { FORMAL_OPENING_VERSION } from "./chip-tx.js";
 import {
   PersistentTableError,
   type PersistentTableParticipantRow,
@@ -93,6 +95,15 @@ export interface RankedResultSnapshot {
   submittedAt: number;
 }
 
+export type RankedCreateAuthority = "employee" | "manager";
+
+export interface RankedTierAvailability {
+  tierKey: string;
+  baseAmount: number;
+  available: boolean;
+  reason: string | null;
+}
+
 export interface CreateRankedTableInput {
   tableId?: string;
   gameKey: string;
@@ -105,6 +116,7 @@ export interface CreateRankedTableInput {
   channelId?: string | null;
   messageId?: string | null;
   operationId: string;
+  authority?: RankedCreateAuthority;
 }
 
 export interface JoinRankedTableInput {
@@ -144,6 +156,10 @@ export interface RankedTablesOptions {
   beforeSettlementTransferForTesting?: (index: number, dist: { to: string; amount: number }) => void;
   reservations?: HouseReservations;
   disputes?: RankedDisputes;
+  dailyRisk?: DailyRisk;
+  superHighEnabled?: () => boolean;
+  extremeEnabled?: () => boolean;
+  highCooldownSec?: () => number | null;
 }
 
 interface RankedTableStorageRow {
@@ -231,6 +247,9 @@ export function feeForBaseAmount(baseAmount: number): number {
 export class RankedTables {
   private readonly now: () => number;
   private readonly isSoloSeatOccupied: (userId: string) => boolean;
+  private readonly superHighEnabled: () => boolean;
+  private readonly extremeEnabled: () => boolean;
+  private readonly highCooldownSec: () => number | null;
 
   constructor(
     private readonly db: Database.Database,
@@ -243,6 +262,9 @@ export class RankedTables {
   ) {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.isSoloSeatOccupied = options.isSoloSeatOccupied ?? (() => false);
+    this.superHighEnabled = options.superHighEnabled ?? (() => false);
+    this.extremeEnabled = options.extremeEnabled ?? (() => false);
+    this.highCooldownSec = options.highCooldownSec ?? (() => null);
   }
 
   create(input: CreateRankedTableInput): RankedTableSnapshot {
@@ -250,12 +272,26 @@ export class RankedTables {
     const baseAmount = input.baseAmount ?? tierByKey(input.tierKey ?? "middle").baseAmount;
     const config = validateRankProfile(profile, baseAmount);
     const operationId = requiredString(input.operationId, "operationId");
+    const authority = validateAuthority(input.authority ?? "employee");
+    const tier = tierByBaseAmount(config.baseAmount);
     const requestedConfig = canonicalStringify({
       gameKey: input.gameKey,
       profile: config.profile,
       baseAmount: config.baseAmount,
+      authority,
     });
     const tx = this.db.transaction(() => {
+      const replayTableId = this.tableIdByOperation(operationId);
+      if (replayTableId) {
+        const stored = this.requiredStorage(replayTableId);
+        if (stored.rank_profile_json !== null && this.storedConfigFingerprint(stored) !== requestedConfig) {
+          throw new RankedTableError("ERR_RANKED_OPERATION_CONFLICT", "ranked table create operation was replayed with different config", {
+            tableId: replayTableId,
+          });
+        }
+        return this.snapshot(replayTableId);
+      }
+      this.assertTierCreateAllowed(tier, authority);
       const table = this.persistentTables.create({
         tableId: input.tableId,
         gameKey: input.gameKey,
@@ -285,6 +321,7 @@ export class RankedTables {
            WHERE table_id=?`,
         )
         .run(config.baseAmount, config.feePerUser, config.participantCount, canonicalStringify(config.profile), this.now(), table.tableId);
+      this.recordOpenHistoryIfNeeded(table.tableId, operationId, tier, authority, requestedConfig);
       this.metrics?.record({
         eventKey: `table_open:${table.tableId}:${operationId}`,
         eventType: "table_open",
@@ -297,6 +334,23 @@ export class RankedTables {
       return this.snapshot(table.tableId);
     });
     return tx.immediate();
+  }
+
+  rankedTierAvailability(authority: RankedCreateAuthority): RankedTierAvailability[] {
+    const safeAuthority = validateAuthority(authority);
+    return RANKED_TABLE_TIERS.map((tier) => {
+      try {
+        this.assertTierCreateAllowed(tier, safeAuthority);
+        return { tierKey: tier.key, baseAmount: tier.baseAmount, available: true, reason: null };
+      } catch (error) {
+        return {
+          tierKey: tier.key,
+          baseAmount: tier.baseAmount,
+          available: false,
+          reason: error instanceof Error ? error.message : String(error),
+        };
+      }
+    });
   }
 
   join(input: JoinRankedTableInput): RankedTableSnapshot {
@@ -330,6 +384,13 @@ export class RankedTables {
         if (active.length >= config.participantCount) throw new RankedTableError("ERR_RANKED_TABLE_NOT_JOINABLE", "ranked table is full");
         if (active.some((p) => p.seat === safeInput.seat)) throw new RankedTableError("ERR_RANKED_SEAT", "ranked table seat is taken");
         const holdAmount = checkedAdd(config.baseAmount, config.feePerUser, "joinHold");
+        const risk = this.options.dailyRisk?.authorizeTableJoin({
+          userId: safeInput.userId,
+          operationId: safeInput.operationId,
+          tableId: table.tableId,
+          baseAmount: config.baseAmount,
+          feePerUser: config.feePerUser,
+        });
         try {
           this.options.chipFlow?.ensureFreeChips(safeInput.userId, holdAmount, chipFlowOperationId("ranked-join", safeInput));
         } catch (e) {
@@ -348,8 +409,14 @@ export class RankedTables {
         }
         this.persistentTables.join(safeInput);
         this.db
-          .prepare("UPDATE casino_table_participants SET participant_state='active' WHERE table_id=? AND user_id=?")
-          .run(table.tableId, safeInput.userId);
+          .prepare(
+            `UPDATE casino_table_participants
+                SET participant_state='active',
+                    risk_day_key=COALESCE(?, risk_day_key),
+                    risk_max_loss=COALESCE(?, risk_max_loss)
+              WHERE table_id=? AND user_id=?`,
+          )
+          .run(risk?.dayKey ?? null, risk?.maxPlayerLoss ?? null, table.tableId, safeInput.userId);
         const joinedActive = this.activeParticipants(table.tableId);
         if (joinedActive.length === config.participantCount) {
           const current = this.requiredTable(table.tableId);
@@ -426,6 +493,7 @@ export class RankedTables {
           operationId: `ready:${safeInput.operationId}`,
           actor: safeInput.userId,
         });
+        this.recordParticipantRiskEvents(table.tableId, active, "table_fee", `ready:${safeInput.operationId}`, () => -config.feePerUser);
         const reservations = this.options.reservations;
         if (!reservations) {
           throw new RankedTableError("ERR_RANKED_RECOVERY_FAILED", "ranked fee refund reservation service is required before starting a ranked table", {
@@ -732,6 +800,13 @@ export class RankedTables {
     const distributions = this.distributions(config, result.orderedUserIds);
     this.assertEscrowBeforeSettlement(table.tableId, config, distributions);
     this.escrow.settle(table.tableId, distributions, actor, "順位卓の精算", this.options.beforeSettlementTransferForTesting);
+    this.recordParticipantRiskEvents(table.tableId, this.activeParticipants(table.tableId), "table_result", result.hash, (participant) => {
+      const receipt = distributions.find((dist) => dist.to === participant.userId)?.amount;
+      if (receipt === undefined) {
+        throw new RankedTableError("ERR_RANKED_RESULT_INVALID", "ranked result is missing participant receipt", { userId: participant.userId });
+      }
+      return receipt - config.baseAmount;
+    });
     this.releaseFeeReservation(table.tableId, config);
     const changed = this.db
       .prepare(
@@ -909,7 +984,130 @@ export class RankedTables {
       gameKey: row.game_key,
       profile: parseProfile(row.rank_profile_json),
       baseAmount: row.base_amount,
+      authority: this.openHistoryAuthority(row.table_id) ?? "employee",
     });
+  }
+
+  private tableIdByOperation(operationId: string): string | null {
+    if (!this.tableExists("casino_tables")) return null;
+    const row = this.db.prepare("SELECT table_id FROM casino_tables WHERE operation_id=?").get(operationId) as { table_id: string } | undefined;
+    return row?.table_id ?? null;
+  }
+
+  private assertTierCreateAllowed(tier: RankedTableTier, authority: RankedCreateAuthority): void {
+    if (authority === "employee" && !["minarai", "low", "middle", "high"].includes(tier.key)) {
+      throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "employee authority cannot open this ranked tier", { tier: tier.key });
+    }
+    if (tier.key === "super_high" && !this.superHighEnabled()) {
+      throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "super_high ranked tier is not enabled", { tier: tier.key });
+    }
+    if (tier.key === "extreme" && !this.extremeEnabled()) {
+      throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "extreme ranked tier is not enabled", { tier: tier.key });
+    }
+    if ((tier.key === "super_high" || tier.key === "extreme") && !this.formalOpeningAgeSatisfied()) {
+      throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "this ranked tier is closed for the first 30 days after formal opening", { tier: tier.key });
+    }
+    if (isHighOrAbove(tier)) {
+      const cooldown = this.highCooldownSec();
+      if (typeof cooldown !== "number" || !Number.isSafeInteger(cooldown) || cooldown <= 0) {
+        throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "high ranked tier cooldown setting is unavailable", { tier: tier.key });
+      }
+      this.ensureOpenHistorySchema();
+      const row = this.db
+        .prepare("SELECT created_at FROM casino_ranked_open_history WHERE tier_key IN ('high','super_high','extreme','meigoku') ORDER BY created_at DESC, rowid DESC LIMIT 1")
+        .get() as { created_at: number } | undefined;
+      if (row && this.now() - row.created_at < cooldown) {
+        throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "high ranked tier cooldown is active", {
+          tier: tier.key,
+          remaining: cooldown - (this.now() - row.created_at),
+        });
+      }
+    }
+  }
+
+  private formalOpeningAgeSatisfied(): boolean {
+    const row = this.db
+      .prepare("SELECT created_at FROM casino_chip_opening_versions WHERE opening_version=?")
+      .get(FORMAL_OPENING_VERSION) as { created_at: number } | undefined;
+    return !!row && this.now() - row.created_at >= 30 * 24 * 60 * 60;
+  }
+
+  private recordOpenHistoryIfNeeded(
+    tableId: string,
+    operationId: string,
+    tier: RankedTableTier,
+    authority: RankedCreateAuthority,
+    fingerprint: string,
+  ): void {
+    this.ensureOpenHistorySchema();
+    const existing = this.db
+      .prepare("SELECT request_fingerprint FROM casino_ranked_open_history WHERE operation_id=?")
+      .get(operationId) as { request_fingerprint: string } | undefined;
+    if (existing) {
+      if (existing.request_fingerprint === fingerprint) return;
+      throw new RankedTableError("ERR_RANKED_OPERATION_CONFLICT", "ranked open history replay conflict", { operationId });
+    }
+    this.db
+      .prepare(
+        `INSERT INTO casino_ranked_open_history
+           (operation_id, table_id, tier_key, base_amount, authority, request_fingerprint, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(operationId, tableId, tier.key, tier.baseAmount, authority, fingerprint, this.now());
+  }
+
+  private openHistoryAuthority(tableId: string): RankedCreateAuthority | null {
+    if (!this.tableExists("casino_ranked_open_history")) return null;
+    const row = this.db.prepare("SELECT authority FROM casino_ranked_open_history WHERE table_id=?").get(tableId) as { authority: string } | undefined;
+    if (!row) return null;
+    return validateAuthority(row.authority);
+  }
+
+  private ensureOpenHistorySchema(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS casino_ranked_open_history (
+        operation_id TEXT PRIMARY KEY,
+        table_id TEXT NOT NULL UNIQUE,
+        tier_key TEXT NOT NULL,
+        base_amount INTEGER NOT NULL,
+        authority TEXT NOT NULL,
+        request_fingerprint TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_casino_ranked_open_history_created ON casino_ranked_open_history(created_at);
+    `);
+  }
+
+  private tableExists(table: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
+  }
+
+  private recordParticipantRiskEvents(
+    tableId: string,
+    participants: PersistentTableParticipantRow[],
+    sourceKind: "table_fee" | "table_result",
+    operationId: string,
+    netFor: (participant: PersistentTableParticipantRow) => number,
+  ): void {
+    const dailyRisk = this.options.dailyRisk;
+    if (!dailyRisk) return;
+    for (const participant of participants) {
+      if (!participant.riskDayKey || participant.riskMaxLoss === null) {
+        throw new RankedTableError("ERR_RANKED_TABLE_NOT_CONFIGURED", "ranked participant is missing risk metadata", {
+          tableId,
+          userId: participant.userId,
+        });
+      }
+      dailyRisk.recordEvent({
+        eventKey: `${sourceKind}:${tableId}:${participant.userId}:${operationId}`,
+        userId: participant.userId,
+        dayKey: participant.riskDayKey,
+        sourceKind,
+        sourceId: tableId,
+        operationId,
+        netSigned: netFor(participant),
+      });
+    }
   }
 
   private participants(tableId: string): PersistentTableParticipantRow[] {
@@ -984,6 +1182,21 @@ function tierByKey(key: string): RankedTableTier {
   const tier = RANKED_TABLE_TIERS.find((row) => row.key === key);
   if (!tier) throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "unknown ranked table tier", { key });
   return tier;
+}
+
+function tierByBaseAmount(baseAmount: number): RankedTableTier {
+  const tier = RANKED_TABLE_TIERS.find((row) => row.baseAmount === baseAmount);
+  if (!tier) throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "ranked table base amount must match a canonical tier", { baseAmount });
+  return tier;
+}
+
+function isHighOrAbove(tier: RankedTableTier): boolean {
+  return ["high", "super_high", "extreme", "meigoku"].includes(tier.key);
+}
+
+function validateAuthority(value: unknown): RankedCreateAuthority {
+  if (value === "employee" || value === "manager") return value;
+  throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "ranked table create authority is invalid", { authority: value });
 }
 
 function validateBaseAmount(value: number): number {

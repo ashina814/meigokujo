@@ -159,6 +159,8 @@ export function settleChinchiroRound(
       const extra = Math.max(0, loss - bet);
       if (extra > 0) {
         services.escrow.payout(sessionId, HOUSE_HOLDER, extra, operationId, "チンチロ倍付け負けの追加損失");
+        services.casino.recordGameNet(uid, -extra);
+        services.dailyRisk.recordSoloExtraLoss({ userId: uid, operationId, netSigned: -extra });
       }
       const remaining = services.chips.balanceOf(holder);
       if (remaining > 0) {
@@ -236,7 +238,7 @@ export async function playChinchiro(
   context?: Partial<CasinoPlayContext>,
 ): Promise<void> {
   const uid = interaction.user.id;
-  if (!acquireSeat(uid)) {
+  if (!acquireSeat(services, uid)) {
     if (interaction.replied || interaction.deferred) {
       await interaction.followUp({ content: "まだ前の勝負が終わっていない。", flags: MessageFlags.Ephemeral });
     } else {

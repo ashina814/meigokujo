@@ -93,9 +93,15 @@ function rebuild(db: ReturnType<typeof openDb>, rng: CasinoRng = scriptedRng([0.
   const freeSpins = new FreeSpins(db);
   const chipAssets = new CasinoChipAssets(db, ether);
   const chipFlow = new CasinoChipFlow(db, ether, events, chipAssets);
+  const dailyRisk = {
+    maxBetForPlayerLoss: (_userId: string, _lossPerBet: (bet: number) => number, cap: number) => cap,
+    authorizeSoloStart: () => undefined,
+    dayFor: () => ({ lossCap: 1_000_000, remainingLossBudget: 1_000_000 }),
+  };
   const services = {
     db, ledger, ether, chips: ether, chipTx, chipAssets, chipFlow, casino, items, vip,
-    escrow, markets, freeSpins, reservations, rng, events,
+    escrow, markets, freeSpins, reservations, rng, events, dailyRisk,
+    persistentTables: { participantHasLiveTable: () => false },
   } as unknown as Services;
   return {
     db, ledger, chipTx, ether, chipAssets, chipFlow, casino, items, vip, escrow,

@@ -156,6 +156,8 @@ export interface PersistentTableParticipantRow {
   declineOperationId: string | null;
   declineFingerprint: string | null;
   declinedAt: number | null;
+  riskDayKey: string | null;
+  riskMaxLoss: number | null;
 }
 
 export interface CreatePersistentTableInput {
@@ -582,6 +584,8 @@ export class PersistentTables {
         decline_operation_id TEXT,
         decline_fingerprint TEXT,
         declined_at INTEGER,
+        risk_day_key TEXT,
+        risk_max_loss INTEGER,
         PRIMARY KEY (table_id, user_id),
         FOREIGN KEY (table_id) REFERENCES casino_tables(table_id) ON DELETE CASCADE
       );
@@ -614,6 +618,8 @@ export class PersistentTables {
     this.addColumnIfMissing("casino_table_participants", "decline_operation_id", "TEXT");
     this.addColumnIfMissing("casino_table_participants", "decline_fingerprint", "TEXT");
     this.addColumnIfMissing("casino_table_participants", "declined_at", "INTEGER");
+    this.addColumnIfMissing("casino_table_participants", "risk_day_key", "TEXT");
+    this.addColumnIfMissing("casino_table_participants", "risk_max_loss", "INTEGER");
     this.migrateActiveSeatUniqueness();
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_casino_table_participants_user ON casino_table_participants(user_id);
@@ -646,18 +652,20 @@ export class PersistentTables {
         decline_operation_id TEXT,
         decline_fingerprint TEXT,
         declined_at INTEGER,
+        risk_day_key TEXT,
+        risk_max_loss INTEGER,
         PRIMARY KEY (table_id, user_id),
         FOREIGN KEY (table_id) REFERENCES casino_tables(table_id) ON DELETE CASCADE
       );
       INSERT INTO persistent_table_participants_pr21_tmp (
         table_id, user_id, seat, joined_at, operation_id, request_fingerprint, ready_state, approval_state,
         participant_state, ready_operation_id, ready_fingerprint, approval_operation_id, approval_fingerprint,
-        decline_operation_id, decline_fingerprint, declined_at
+        decline_operation_id, decline_fingerprint, declined_at, risk_day_key, risk_max_loss
       )
       SELECT
         table_id, user_id, seat, joined_at, operation_id, request_fingerprint, ready_state, approval_state,
         participant_state, ready_operation_id, ready_fingerprint, approval_operation_id, approval_fingerprint,
-        decline_operation_id, decline_fingerprint, declined_at
+        decline_operation_id, decline_fingerprint, declined_at, NULL, NULL
       FROM casino_table_participants;
       DROP TABLE casino_table_participants;
       ALTER TABLE persistent_table_participants_pr21_tmp RENAME TO casino_table_participants;
@@ -724,12 +732,16 @@ export class PersistentTables {
     return row ? mapParticipantRow(row) : null;
   }
 
-  private participantHasLiveTable(userId: string): boolean {
+  participantHasLiveTable(userId: string): boolean {
+    return this.liveTableForParticipant(userId) !== null;
+  }
+
+  liveTableForParticipant(userId: string): PersistentTableRow | null {
     const liveStates = Array.from(PERSISTENT_TABLE_LIVE_STATES);
     const placeholders = liveStates.map(() => "?").join(",");
     const row = this.db
       .prepare(
-        `SELECT 1
+        `SELECT t.*
            FROM casino_tables t
           WHERE t.state IN (${placeholders}) AND EXISTS (
             SELECT 1 FROM casino_table_participants p
@@ -737,8 +749,8 @@ export class PersistentTables {
           )
           LIMIT 1`,
       )
-      .get(...liveStates, userId);
-    return !!row;
+      .get(...liveStates, userId) as Record<string, unknown> | undefined;
+    return row ? mapTableRow(row) : null;
   }
 }
 
@@ -787,6 +799,8 @@ function mapParticipantRow(row: Record<string, unknown>): PersistentTablePartici
     declineOperationId: optionalString(row.decline_operation_id, "decline_operation_id"),
     declineFingerprint: optionalString(row.decline_fingerprint, "decline_fingerprint"),
     declinedAt: nullableNonnegativeInt(row.declined_at, "declined_at"),
+    riskDayKey: optionalString(row.risk_day_key, "risk_day_key"),
+    riskMaxLoss: nullableNonnegativeInt(row.risk_max_loss, "risk_max_loss"),
   };
 }
 

@@ -5,6 +5,7 @@ import { ChipTxError } from "./chip-tx.js";
 import { escrowHolderFor } from "./escrow.js";
 import type { Items } from "./items.js";
 import type { HouseReservations } from "./reservations.js";
+import type { DailyRisk } from "./daily-risk.js";
 
 /**
  * マモンの賭場の共通土台。
@@ -196,6 +197,7 @@ export interface CasinoOptions {
    * トランザクション内で解放する。渡さない場合は予約なしとして動く（移植前の経路・テスト）。
    */
   reservations?: HouseReservations;
+  dailyRisk?: DailyRisk;
 }
 
 /** ソロゲーム1回の結果。精算結果に「お守りが何をしたか」を添えたもの */
@@ -217,6 +219,7 @@ export class Casino {
   private readonly fukuScaleOpt: number | (() => number);
   private readonly items?: Items;
   private readonly reservations?: HouseReservations;
+  private readonly dailyRisk?: DailyRisk;
 
   constructor(
     private readonly db: Database.Database,
@@ -227,6 +230,7 @@ export class Casino {
     this.fukuScaleOpt = options.fukuScale ?? 10;
     this.items = options.items;
     this.reservations = options.reservations;
+    this.dailyRisk = options.dailyRisk;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS casino_stats (
         user_id             TEXT PRIMARY KEY,
@@ -431,6 +435,7 @@ export class Casino {
       if (opts.reservationKey) this.reservations?.release(opts.reservationKey);
       const effectivePayout = payout + chainBonus - fukuTax;
       const net = effectivePayout - bet;
+      this.dailyRisk?.recordSoloResult({ userId, operationId: opts.operationId, netSigned: net });
       // 戦績には**実際に残高が動いた額**を渡す（PR3）。素の payout を渡していたので、
       // 連鎖ボーナスは通算損益に乗らず、福の重みは引かれていなかった。
       // JP積立は胴元 → JP の移動なので利用者の損益には関係しない

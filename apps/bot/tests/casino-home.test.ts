@@ -63,6 +63,9 @@ function fakeServices(opts: {
     items: {
       armedWinBonusCap: () => 0,
     },
+    dailyRisk: {
+      maxBetForPlayerLoss: (_userId: string, _lossPerBet: (bet: number) => number, cap: number) => cap,
+    },
   } as unknown as Services;
 }
 

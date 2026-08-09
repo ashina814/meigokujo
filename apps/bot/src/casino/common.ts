@@ -9,6 +9,7 @@ import {
 } from "discord.js";
 import {
   SLOT_MAX_PAYOUT_MULT,
+  DailyRiskError,
   blackjackNoDoubleLiability,
   liabilityModelFor,
   soloGroupKey,
@@ -55,7 +56,14 @@ export function effectiveMaxBet(services: Services, userId: string, game?: strin
   if (game === undefined) return cap;
   const model = liabilityModelFor(game);
   if (!model) throw new UnknownLiabilityModelError(game);
-  return Math.min(cap, model.maxBetFor(services.casino.availableForLiability(), liabilityCtx(services, userId)));
+  const ctx = liabilityCtx(services, userId);
+  let riskMax = cap;
+  try {
+    riskMax = services.dailyRisk.maxBetForPlayerLoss(userId, (bet) => model.maxPlayerLoss({ ...ctx, bet }), cap);
+  } catch {
+    riskMax = 0;
+  }
+  return Math.min(cap, model.maxBetFor(services.casino.availableForLiability(), ctx), riskMax);
 }
 
 /** 債務モデルへ渡す文脈（連勝数と装備中お守りの上限） */
@@ -69,7 +77,18 @@ export function liabilityCtx(services: Services, userId: string): Omit<Liability
 /** 同時プレイ防止（1人1卓）。プロセス内ロックで足りる（bot は単一プロセス） */
 const playing = new Set<string>();
 
-export function acquireSeat(userId: string): boolean {
+export function acquireSeat(userId: string): boolean;
+export function acquireSeat(services: Pick<Services, "persistentTables">, userId: string): boolean;
+export function acquireSeat(first: string | Pick<Services, "persistentTables">, second?: string): boolean {
+  const userId = typeof first === "string" ? first : second;
+  if (!userId) return false;
+  if (typeof first !== "string") {
+    try {
+      if (first.persistentTables.participantHasLiveTable(userId)) return false;
+    } catch {
+      return false;
+    }
+  }
   if (playing.has(userId)) return false;
   playing.add(userId);
   return true;
@@ -132,7 +151,27 @@ export async function validateBet(
   // 呼び出し側のバグとして即座に落とす（マージ直前レビュー対応）
   const model = liabilityModelFor(game);
   if (!model) throw new UnknownLiabilityModelError(game);
-  const needed = model.maxHouseLiability({ ...liabilityCtx(services, uid), bet });
+  const ctx = liabilityCtx(services, uid);
+  const maxPlayerLoss = model.maxPlayerLoss({ ...ctx, bet });
+  try {
+    services.dailyRisk.authorizeSoloStart({
+      userId: uid,
+      operationId: interaction.id,
+      game,
+      bet,
+      maxPlayerLoss,
+    });
+  } catch (error) {
+    const day = error instanceof DailyRiskError && error.code === "ERR_DAILY_RISK_LIMIT" ? services.dailyRisk.dayFor(uid) : null;
+    await respond({
+      content: day
+        ? `今日はここまでだ。日次損失上限: ${fmtEther(day.lossCap)} / 残り許容損失: ${fmtEther(day.remainingLossBudget)}`
+        : "賭場の利用制限を確認できないため、いまは開始できません。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return { ok: false, bet };
+  }
+  const needed = model.maxHouseLiability({ ...ctx, bet });
   if (needed > services.casino.availableForLiability()) {
     // 胴元がこの賭けの最悪ケースを引き受けられない。
     // **押し直せば必ず通る金額**を提示して戻す（正本 §5.4 ③）。
