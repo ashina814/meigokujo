@@ -80,7 +80,7 @@ describe("ranked table UI", () => {
         snapshot: vi.fn(() => snapshot("pending_approval")),
       },
       events: { log: vi.fn() },
-      rankedDisputes: { publicStatus: vi.fn(() => null) },
+      rankedDisputes: { publicStatus: vi.fn(() => null), markMessageSyncSucceeded: vi.fn(), markMessageSyncFailed: vi.fn() },
     };
     const interaction = {
       customId: "rtbl:result-modal:t1",
@@ -115,7 +115,7 @@ describe("ranked table UI", () => {
         snapshot: vi.fn(() => snapshot("pending_approval")),
       },
       events: { log: vi.fn() },
-      rankedDisputes: { publicStatus: vi.fn(() => null) },
+      rankedDisputes: { publicStatus: vi.fn(() => null), markMessageSyncSucceeded: vi.fn(), markMessageSyncFailed: vi.fn() },
     };
     const interaction = {
       customId: "rtbl:result-modal:t1",
@@ -139,6 +139,8 @@ describe("ranked table UI", () => {
       tableId: "t1",
       evidenceDeadlineAt: 1_700_259_200,
       evidenceClosedAt: null,
+      preStart: false,
+      refundAmounts: null,
       assignedArbitratorId: "judge",
       resolutionKind: null,
       feeOutcome: null,
