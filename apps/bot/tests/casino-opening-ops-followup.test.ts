@@ -283,18 +283,18 @@ describe("PR105 blocker 2: R3 leaves registry to R6", () => {
     const ctx = realSetup();
     const before = ctx.planner.dryRun().planHash;
     const deleteVc = vi.fn().mockResolvedValue(undefined);
-    const fetch = vi.fn(async (id: string) => {
-      if (id !== "vc-1") throw new Error(`unrelated VC fetched: ${id}`);
-      return { type: ChannelType.GuildVoice, guildId: "guild-1", delete: deleteVc };
-    });
+    const liveChannel = { type: ChannelType.GuildVoice, guildId: "guild-1", delete: deleteVc };
+    const fetch = vi.fn().mockResolvedValueOnce(liveChannel).mockResolvedValueOnce(null);
     const adapter = new DiscordTrackedTempVcOpeningExternalAdapter({ channels: { fetch } } as any, ctx.services);
 
     const first = await adapter.disableLegacyCasino({ planHash: before, idempotencyKey: "r3-key" });
     const second = await adapter.disableLegacyCasino({ planHash: before, idempotencyKey: "r3-key" });
 
-    expect(second).toEqual(first);
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect(fetch).toHaveBeenCalledWith("vc-1");
+    expect(first).toMatchObject({ idempotencyKey: "r3-key", disabledChannelIds: ["vc-1"] });
+    expect(second).toMatchObject({ idempotencyKey: "r3-key", disabledChannelIds: ["vc-1"] });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenNthCalledWith(1, "vc-1");
+    expect(fetch).toHaveBeenNthCalledWith(2, "vc-1");
     expect(deleteVc).toHaveBeenCalledTimes(1);
     expect(ctx.takutate.isTracked("vc-1")).toBe(true);
     expect(ctx.planner.dryRun().planHash).toBe(before);
