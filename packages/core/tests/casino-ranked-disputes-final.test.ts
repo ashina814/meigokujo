@@ -23,7 +23,7 @@ import { openFormally } from "./helpers/chip-ctx.js";
 
 registerDefaultTxTypes();
 
-function setup() {
+function setup(options: { afterRecoveryDisputeStateForTesting?: () => void } = {}) {
   const clock = { now: 1_700_000_000 };
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
@@ -41,6 +41,7 @@ function setup() {
     openingPhase: () => chipTx.openingPhase(),
     now: () => clock.now,
     onPlayerNet: (userId, net) => casino.recordGameNet(userId, net),
+    afterRecoveryDisputeStateForTesting: options.afterRecoveryDisputeStateForTesting,
   });
   const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, metrics, {
     now: () => clock.now,
@@ -108,11 +109,44 @@ function createPostStartDispute(ctx: ReturnType<typeof setup>, tableId = "t1", w
 function createPreStartDispute(ctx: ReturnType<typeof setup>, tableId = "t1"): void {
   createJoined(ctx, tableId);
   const current = ctx.persistentTables.get(tableId)!;
-  const disputed = ctx.persistentTables.markDisputedFromRecovery(tableId, current.revision, "pre-start recovery dispute");
-  ctx.disputes.openForTable(disputed, "pre-start recovery dispute");
+  ctx.disputes.markDisputedFromRecovery({ tableId, expectedRevision: current.revision, reason: "pre-start recovery dispute" });
 }
 
 describe("PR22 final review: durable public message sync and pre-start disputes", () => {
+  it("rolls back recovery disputed state, dispute metadata, and outbox when atomic opening fails", () => {
+    const ctx = setup({
+      afterRecoveryDisputeStateForTesting: () => {
+        throw new Error("crash after state update");
+      },
+    });
+    createJoined(ctx);
+    const before = {
+      table: ctx.persistentTables.get("t1")!,
+      alice: ctx.chips.balanceOf("alice"),
+      bob: ctx.chips.balanceOf("bob"),
+      escrow: ctx.chips.balanceOf(escrowHolderFor("t1")),
+      house: ctx.chips.balanceOf(HOUSE_HOLDER),
+    };
+
+    expect(() =>
+      ctx.disputes.markDisputedFromRecovery({
+        tableId: "t1",
+        expectedRevision: before.table.revision,
+        reason: "message restore failed",
+      }),
+    ).toThrow("crash after state update");
+
+    const after = ctx.persistentTables.get("t1")!;
+    expect(after.state).toBe(before.table.state);
+    expect(after.revision).toBe(before.table.revision);
+    expect(ctx.disputes.publicStatus("t1")).toBeNull();
+    expect(ctx.disputes.listMessageSyncPending()).toEqual([]);
+    expect(ctx.chips.balanceOf("alice")).toBe(before.alice);
+    expect(ctx.chips.balanceOf("bob")).toBe(before.bob);
+    expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(before.escrow);
+    expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(before.house);
+  });
+
   it("playing timeout -> disputed queues durable message sync", () => {
     const ctx = setup();
     createJoined(ctx);

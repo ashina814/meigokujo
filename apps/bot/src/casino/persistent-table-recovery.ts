@@ -102,6 +102,16 @@ function renderPersistentTableRecoveryMessage(services: Services, table: Persist
   const rankedState = rankedStorageState(services, table.tableId);
   if (rankedState === "partial") return markDisputed(services, table, "ranked table storage is partial");
   try {
+    let dispute = services.rankedDisputes.publicStatus(table.tableId);
+    if (rankedState === "ranked" && table.state === "disputed" && !dispute) {
+      services.rankedDisputes.markDisputedFromRecovery({
+        tableId: table.tableId,
+        expectedRevision: table.revision,
+        reason: boundField(table.recoveryError ?? table.disputeReason ?? "repair missing ranked dispute metadata", 500),
+      });
+      dispute = services.rankedDisputes.publicStatus(table.tableId);
+      if (!dispute) throw new Error("ranked dispute metadata repair did not create public status");
+    }
     return renderRankedTable(services.rankedTables.snapshot(table.tableId), services.rankedDisputes.publicStatus(table.tableId));
   } catch (e) {
     if (rankedState !== "none") {
@@ -145,8 +155,11 @@ function rankedStorageState(services: Services, tableId: string): "none" | "rank
 }
 
 function markDisputed(services: Services, table: PersistentTableRow, reason: string): "disputed" {
-  const disputed = services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, boundField(reason, 500));
-  services.rankedDisputes.openForTable(disputed, reason);
+  services.rankedDisputes.markDisputedFromRecovery({
+    tableId: table.tableId,
+    expectedRevision: table.revision,
+    reason: boundField(reason, 500),
+  });
   return "disputed";
 }
 

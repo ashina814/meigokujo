@@ -579,8 +579,11 @@ describe("RankedDisputes evidence and arbitration", () => {
     createTable(recruiting);
     seedUser(recruiting, "alice");
     join(recruiting, "t1", "alice", 1);
-    const recDisputed = recruiting.persistentTables.markDisputedFromRecovery("t1", recruiting.persistentTables.get("t1")!.revision, "message restore failed");
-    recruiting.disputes.openForTable(recDisputed, "message restore failed");
+    recruiting.disputes.markDisputedFromRecovery({
+      tableId: "t1",
+      expectedRevision: recruiting.persistentTables.get("t1")!.revision,
+      reason: "message restore failed",
+    });
     expect(recruiting.disputes.processEvidenceDeadlines(1_700_259_200)).toEqual({ closed: 0, autoRefunded: 1, failed: 0 });
     expect(recruiting.persistentTables.get("t1")?.state).toBe("cancelled");
     expect(recruiting.chips.balanceOf("alice")).toBe(30_000);
@@ -593,8 +596,11 @@ describe("RankedDisputes evidence and arbitration", () => {
     seedUser(ready, "bob");
     join(ready, "t1", "alice", 1);
     join(ready, "t1", "bob", 2);
-    const readyDisputed = ready.persistentTables.markDisputedFromRecovery("t1", ready.persistentTables.get("t1")!.revision, "message edit failed");
-    ready.disputes.openForTable(readyDisputed, "message edit failed");
+    ready.disputes.markDisputedFromRecovery({
+      tableId: "t1",
+      expectedRevision: ready.persistentTables.get("t1")!.revision,
+      reason: "message edit failed",
+    });
     expect(ready.disputes.processEvidenceDeadlines(1_700_259_200)).toEqual({ closed: 0, autoRefunded: 1, failed: 0 });
     expect(ready.persistentTables.get("t1")?.state).toBe("cancelled");
     expect(ready.chips.balanceOf("alice")).toBe(30_000);

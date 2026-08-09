@@ -327,6 +327,7 @@ export {
   type AssignRankedArbitratorInput,
   type ResolveRankedResultInput,
   type ResolveCollateralRefundInput,
+  type MarkRankedDisputedFromRecoveryInput,
 } from "./casino/ranked-disputes.js";
 export {
   CasinoStatus,

@@ -53,6 +53,7 @@ function row(patch: Partial<PersistentTableRow> = {}): PersistentTableRow {
 }
 
 function servicesFor(table: PersistentTableRow, overrides: Partial<Services["persistentTables"]> = {}): Services {
+  const markDisputedFromRecovery = overrides.markDisputedFromRecovery ?? vi.fn();
   const storageRow = {
     base_amount: null,
     fee_per_user: null,
@@ -74,11 +75,12 @@ function servicesFor(table: PersistentTableRow, overrides: Partial<Services["per
     rankedDisputes: {
       publicStatus: vi.fn(() => null),
       openForTable: vi.fn(),
+      markDisputedFromRecovery,
     },
     persistentTables: {
       listLiveTables: vi.fn(() => [table]),
       bindMessage: vi.fn(),
-      markDisputedFromRecovery: vi.fn(),
+      markDisputedFromRecovery,
       ...overrides,
     },
     events: { log: vi.fn() },
@@ -191,7 +193,11 @@ describe("restorePersistentTableMessages", () => {
     const services = servicesFor(table);
     const result = await restorePersistentTableMessages(client, services);
     expect(result).toEqual({ restored: 0, replaced: 0, disputed: 1, failed: [] });
-    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith("t1", 3, expect.stringContaining("50001"));
+    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith({
+      tableId: "t1",
+      expectedRevision: 3,
+      reason: expect.stringContaining("50001"),
+    });
   });
 
   it("marks the table disputed on Unknown Channel", async () => {
@@ -205,7 +211,11 @@ describe("restorePersistentTableMessages", () => {
     const services = servicesFor(table);
     const result = await restorePersistentTableMessages(client, services);
     expect(result).toEqual({ restored: 0, replaced: 0, disputed: 1, failed: [] });
-    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith("t1", 3, expect.stringContaining("10003"));
+    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith({
+      tableId: "t1",
+      expectedRevision: 3,
+      reason: expect.stringContaining("10003"),
+    });
   });
 
   it("marks the table disputed on transient message fetch failures", async () => {
@@ -220,7 +230,11 @@ describe("restorePersistentTableMessages", () => {
     const result = await restorePersistentTableMessages(clientFor(channel), services);
     expect(result.restored).toBe(0);
     expect(result).toEqual({ restored: 0, replaced: 0, disputed: 1, failed: [] });
-    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith("t1", 3, "network timeout");
+    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith({
+      tableId: "t1",
+      expectedRevision: 3,
+      reason: "network timeout",
+    });
   });
 
   it("marks wrong-guild channels disputed", async () => {
@@ -234,7 +248,11 @@ describe("restorePersistentTableMessages", () => {
     const services = servicesFor(table);
     const result = await restorePersistentTableMessages(clientFor(channel), services);
     expect(result).toEqual({ restored: 0, replaced: 0, disputed: 1, failed: [] });
-    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith("t1", 3, expect.stringContaining("different guild"));
+    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith({
+      tableId: "t1",
+      expectedRevision: 3,
+      reason: expect.stringContaining("different guild"),
+    });
   });
 
   it("marks replacement-send failures disputed after Unknown Message", async () => {
@@ -248,7 +266,11 @@ describe("restorePersistentTableMessages", () => {
     const services = servicesFor(table);
     const result = await restorePersistentTableMessages(clientFor(channel), services);
     expect(result).toEqual({ restored: 0, replaced: 0, disputed: 1, failed: [] });
-    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith("t1", 3, "network timeout while sending");
+    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith({
+      tableId: "t1",
+      expectedRevision: 3,
+      reason: "network timeout while sending",
+    });
     expect(services.persistentTables.bindMessage).not.toHaveBeenCalled();
   });
 
@@ -392,6 +414,58 @@ describe("restorePersistentTableMessages", () => {
     ctx.db.close();
   });
 
+  it("repairs crash residue where a ranked table is disputed without dispute metadata before restoring", async () => {
+    const ctx = setupRankedRecoveryTable();
+    ctx.db
+      .prepare("UPDATE casino_tables SET state='disputed', dispute_reason='message restore crashed', recovery_error='message restore crashed' WHERE table_id='t1'")
+      .run();
+    const before = balances(ctx);
+    const edit = vi.fn(async () => undefined);
+    const channel = {
+      guildId: "g",
+      isTextBased: () => true,
+      messages: { fetch: vi.fn(async () => ({ edit })) },
+      send: vi.fn(),
+    };
+
+    expect(ctx.services.rankedDisputes.publicStatus("t1")).toBeNull();
+    const result = await restorePersistentTableMessages(clientFor(channel), ctx.services);
+
+    expect(result).toEqual({ restored: 1, replaced: 0, disputed: 0, failed: [] });
+    expect(edit).toHaveBeenCalledTimes(1);
+    expect(ctx.persistentTables.get("t1")?.state).toBe("disputed");
+    expect(ctx.services.rankedDisputes.publicStatus("t1")?.evidenceDeadlineAt).toBe(1_700_259_200);
+    expect(ctx.services.rankedDisputes.listMessageSyncPending().map((row) => row.tableId)).toContain("t1");
+    expect(balances(ctx)).toEqual(before);
+    ctx.db.close();
+  });
+
+  it("restores an already well-formed ranked disputed table idempotently", async () => {
+    const ctx = setupRankedRecoveryTable();
+    const current = ctx.persistentTables.get("t1")!;
+    ctx.services.rankedDisputes.markDisputedFromRecovery({
+      tableId: "t1",
+      expectedRevision: current.revision,
+      reason: "existing recovery dispute",
+    });
+    const deadline = ctx.services.rankedDisputes.publicStatus("t1")!.evidenceDeadlineAt;
+    const edit = vi.fn(async () => undefined);
+    const channel = {
+      guildId: "g",
+      isTextBased: () => true,
+      messages: { fetch: vi.fn(async () => ({ edit })) },
+      send: vi.fn(),
+    };
+
+    const result = await restorePersistentTableMessages(clientFor(channel), ctx.services);
+
+    expect(result).toEqual({ restored: 1, replaced: 0, disputed: 0, failed: [] });
+    expect(edit).toHaveBeenCalledTimes(1);
+    expect(ctx.persistentTables.get("t1")?.state).toBe("disputed");
+    expect(ctx.services.rankedDisputes.publicStatus("t1")?.evidenceDeadlineAt).toBe(deadline);
+    ctx.db.close();
+  });
+
   it("marks partial ranked storage disputed instead of falling back to the generic card", async () => {
     const edit = vi.fn(async () => undefined);
     const channel = {
@@ -421,7 +495,11 @@ describe("restorePersistentTableMessages", () => {
 
     expect(result).toEqual({ restored: 0, replaced: 0, disputed: 1, failed: [] });
     expect(edit).not.toHaveBeenCalled();
-    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith("t1", 3, "ranked table storage is partial");
+    expect(services.persistentTables.markDisputedFromRecovery).toHaveBeenCalledWith({
+      tableId: "t1",
+      expectedRevision: 3,
+      reason: "ranked table storage is partial",
+    });
   });
 
   it("reports partial ranked disputed CAS failures as recovery failures", async () => {

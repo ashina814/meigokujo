@@ -6,6 +6,7 @@ import type { OpeningPhase } from "./chip-tx.js";
 import { escrowHolderFor, type Escrow } from "./escrow.js";
 import {
   PersistentTableError,
+  PERSISTENT_TABLE_TERMINAL_STATES,
   type PersistentTableParticipantRow,
   type PersistentTableRow,
   type PersistentTableState,
@@ -138,6 +139,12 @@ export interface ResolveCollateralRefundInput {
   operationId: string;
 }
 
+export interface MarkRankedDisputedFromRecoveryInput {
+  tableId: string;
+  expectedRevision: number;
+  reason: string;
+}
+
 interface RankedStorageRow {
   table_id: string;
   game_key: string;
@@ -202,12 +209,14 @@ export interface RankedDisputesOptions {
   now?: () => number;
   onPlayerNet?: (userId: string, net: number) => void;
   openingPhase?: () => OpeningPhase;
+  afterRecoveryDisputeStateForTesting?: () => void;
 }
 
 export class RankedDisputes {
   private readonly now: () => number;
   private readonly onPlayerNet: (userId: string, net: number) => void;
   private readonly openingPhase: () => OpeningPhase;
+  private readonly afterRecoveryDisputeStateForTesting?: () => void;
 
   constructor(
     private readonly db: Database.Database,
@@ -221,6 +230,7 @@ export class RankedDisputes {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.onPlayerNet = options.onPlayerNet ?? (() => undefined);
     this.openingPhase = options.openingPhase ?? (() => "formal");
+    this.afterRecoveryDisputeStateForTesting = options.afterRecoveryDisputeStateForTesting;
   }
 
   ensureSchemaForTesting(): void {
@@ -282,35 +292,51 @@ export class RankedDisputes {
   openForTable(table: PersistentTableRow, reason: string): RankedDisputePublicStatus {
     const tx = this.db.transaction(() => {
       this.ensureSchemaForFormal();
-      const storage = this.requiredStorage(table.tableId);
-      const now = this.now();
-      this.db
-        .prepare(
-          `INSERT INTO casino_table_disputes (
-             table_id, opened_at, trigger_reason, evidence_deadline_at,
-             original_result_json, original_result_hash, original_result_submitted_by, original_result_submitted_at,
-             phase, status
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', 'collecting_evidence')
-           ON CONFLICT(table_id) DO UPDATE SET
-             trigger_reason=excluded.trigger_reason,
-             evidence_deadline_at=COALESCE(casino_table_disputes.evidence_deadline_at, excluded.evidence_deadline_at),
-             original_result_json=COALESCE(casino_table_disputes.original_result_json, excluded.original_result_json),
-             original_result_hash=COALESCE(casino_table_disputes.original_result_hash, excluded.original_result_hash),
-             original_result_submitted_by=COALESCE(casino_table_disputes.original_result_submitted_by, excluded.original_result_submitted_by),
-             original_result_submitted_at=COALESCE(casino_table_disputes.original_result_submitted_at, excluded.original_result_submitted_at)`,
-        )
-        .run(
-          table.tableId,
-          now,
-          truncate(reason, 500),
-          now + RANKED_EVIDENCE_WINDOW_SEC,
-          storage.result_json,
-          storage.result_hash,
-          storage.result_submitted_by,
-          storage.result_submitted_at,
-        );
-      this.queueMessageSync(table.tableId);
-      return this.publicStatus(table.tableId)!;
+      return this.openDisputeRowForTable(table, reason);
+    });
+    return this.db.inTransaction ? tx() : tx.immediate();
+  }
+
+  markDisputedFromRecovery(input: MarkRankedDisputedFromRecoveryInput): RankedDisputePublicStatus {
+    const safe = {
+      tableId: requiredString(input.tableId, "tableId"),
+      expectedRevision: requiredNonnegativeInt(input.expectedRevision, "expectedRevision"),
+      reason: truncate(requiredString(input.reason, "reason", 500), 500),
+    };
+    const tx = this.db.transaction(() => {
+      this.ensureSchemaForFormal();
+      const current = this.requireTable(safe.tableId);
+      if (current.revision !== safe.expectedRevision) {
+        throw new PersistentTableError("ERR_STALE_TABLE", "persistent table revision is stale", {
+          tableId: safe.tableId,
+          expectedRevision: safe.expectedRevision,
+          actualRevision: current.revision,
+        });
+      }
+      if (PERSISTENT_TABLE_TERMINAL_STATES.has(current.state)) {
+        throw new PersistentTableError("ERR_TABLE_NOT_LIVE", "terminal table cannot be disputed from recovery", { tableId: safe.tableId, state: current.state });
+      }
+      let table = current;
+      if (current.state !== "disputed") {
+        const now = this.now();
+        const changed = this.db
+          .prepare(
+            `UPDATE casino_tables
+               SET state='disputed', revision=revision+1, updated_at=?, state_changed_at=?,
+                   dispute_reason=?, recovery_error=?
+             WHERE table_id=? AND revision=?`,
+          )
+          .run(now, now, safe.reason, safe.reason, safe.tableId, safe.expectedRevision).changes;
+        if (changed !== 1) throw new PersistentTableError("ERR_STALE_TABLE", "persistent table revision is stale", { tableId: safe.tableId });
+        this.events.log("casino_table_recovery_disputed", {
+          actor: "system:recovery",
+          target: safe.tableId,
+          payload: { reason: safe.reason },
+        });
+        this.afterRecoveryDisputeStateForTesting?.();
+        table = this.requireTable(safe.tableId);
+      }
+      return this.openDisputeRowForTable(table, safe.reason);
     });
     return this.db.inTransaction ? tx() : tx.immediate();
   }
@@ -929,6 +955,38 @@ export class RankedDisputes {
       .run(tableId, gameKey, config.baseAmount, resultJson, resultHash, source, this.now());
   }
 
+  private openDisputeRowForTable(table: PersistentTableRow, reason: string): RankedDisputePublicStatus {
+    const storage = this.requiredStorage(table.tableId);
+    const now = this.now();
+    this.db
+      .prepare(
+        `INSERT INTO casino_table_disputes (
+           table_id, opened_at, trigger_reason, evidence_deadline_at,
+           original_result_json, original_result_hash, original_result_submitted_by, original_result_submitted_at,
+           phase, status
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', 'collecting_evidence')
+         ON CONFLICT(table_id) DO UPDATE SET
+           trigger_reason=excluded.trigger_reason,
+           evidence_deadline_at=COALESCE(casino_table_disputes.evidence_deadline_at, excluded.evidence_deadline_at),
+           original_result_json=COALESCE(casino_table_disputes.original_result_json, excluded.original_result_json),
+           original_result_hash=COALESCE(casino_table_disputes.original_result_hash, excluded.original_result_hash),
+           original_result_submitted_by=COALESCE(casino_table_disputes.original_result_submitted_by, excluded.original_result_submitted_by),
+           original_result_submitted_at=COALESCE(casino_table_disputes.original_result_submitted_at, excluded.original_result_submitted_at)`,
+      )
+      .run(
+        table.tableId,
+        now,
+        truncate(reason, 500),
+        now + RANKED_EVIDENCE_WINDOW_SEC,
+        storage.result_json,
+        storage.result_hash,
+        storage.result_submitted_by,
+        storage.result_submitted_at,
+      );
+    this.queueMessageSync(table.tableId);
+    return this.publicStatus(table.tableId)!;
+  }
+
   private requireTable(tableId: string): PersistentTableRow {
     const table = this.persistentTables.get(tableId);
     if (!table) throw new PersistentTableError("ERR_TABLE_NOT_FOUND", "persistent table does not exist", { tableId });
@@ -1150,6 +1208,13 @@ function requiredString(value: unknown, field: string, maxLength = 200): string 
     throw new RankedDisputeError("ERR_DISPUTE_EVIDENCE_INVALID", "string field is invalid", { field });
   }
   return value;
+}
+
+function requiredNonnegativeInt(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new RankedDisputeError("ERR_DISPUTE_EVIDENCE_INVALID", "integer field is invalid", { field });
+  }
+  return value as number;
 }
 
 function optionalString(value: unknown, field: string, maxLength = 200): string | null {
