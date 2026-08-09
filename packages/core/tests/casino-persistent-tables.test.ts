@@ -302,6 +302,60 @@ describe("PersistentTables", () => {
     ).toThrow(PersistentTableError);
   });
 
+  it("allows new joins only while recruiting but preserves successful join replays", () => {
+    const ctx = setup(true);
+    ctx.persistentTables.create({ tableId: "t-recruiting", gameKey: "poker", creatorId: "owner1", operatorId: "owner1", operationId: "op:create:recruiting" });
+    const replayable = ctx.persistentTables.join({ tableId: "t-recruiting", userId: "alice", seat: 1, operationId: "op:join:alice" });
+    expect(replayable.seat).toBe(1);
+
+    const ready = ctx.persistentTables.transition({
+      tableId: "t-recruiting",
+      from: "recruiting",
+      to: "ready_check",
+      expectedRevision: 0,
+      actor: "owner1",
+    });
+    const playing = ctx.persistentTables.transition({
+      tableId: "t-recruiting",
+      from: "ready_check",
+      to: "playing",
+      expectedRevision: ready.revision,
+      actor: "owner1",
+    });
+    expect(ctx.persistentTables.join({ tableId: "t-recruiting", userId: "alice", seat: 1, operationId: "op:join:alice" })).toEqual(replayable);
+    expect(() => ctx.persistentTables.join({ tableId: "t-recruiting", userId: "bob", seat: 2, operationId: "op:join:bob" })).toThrow(PersistentTableError);
+
+    const pending = ctx.persistentTables.transition({
+      tableId: "t-recruiting",
+      from: "playing",
+      to: "pending_approval",
+      expectedRevision: playing.revision,
+      actor: "owner1",
+    });
+    expect(() => ctx.persistentTables.join({ tableId: "t-recruiting", userId: "carol", seat: 3, operationId: "op:join:carol" })).toThrow(PersistentTableError);
+
+    ctx.persistentTables.create({ tableId: "t-ready", gameKey: "poker", creatorId: "owner2", operatorId: "owner2", operationId: "op:create:ready" });
+    ctx.persistentTables.transition({ tableId: "t-ready", from: "recruiting", to: "ready_check", expectedRevision: 0, actor: "owner2" });
+    expect(() => ctx.persistentTables.join({ tableId: "t-ready", userId: "dave", seat: 1, operationId: "op:join:dave" })).toThrow(PersistentTableError);
+
+    ctx.persistentTables.create({ tableId: "t-disputed", gameKey: "poker", creatorId: "owner3", operatorId: "owner3", operationId: "op:create:disputed" });
+    ctx.persistentTables.transition({ tableId: "t-disputed", from: "recruiting", to: "disputed", expectedRevision: 0, actor: "owner3" });
+    expect(() => ctx.persistentTables.join({ tableId: "t-disputed", userId: "erin", seat: 1, operationId: "op:join:erin" })).toThrow(PersistentTableError);
+
+    ctx.persistentTables.create({ tableId: "t-cancelled", gameKey: "poker", creatorId: "owner4", operatorId: "owner4", operationId: "op:create:cancelled" });
+    ctx.persistentTables.transition({ tableId: "t-cancelled", from: "recruiting", to: "cancelled", expectedRevision: 0, actor: "owner4" });
+    expect(() => ctx.persistentTables.join({ tableId: "t-cancelled", userId: "frank", seat: 1, operationId: "op:join:frank" })).toThrow(PersistentTableError);
+
+    ctx.persistentTables.create({ tableId: "t-settled", gameKey: "poker", creatorId: "owner5", operatorId: "owner5", operationId: "op:create:settled" });
+    const settledReady = ctx.persistentTables.transition({ tableId: "t-settled", from: "recruiting", to: "ready_check", expectedRevision: 0, actor: "owner5" });
+    const settledPlaying = ctx.persistentTables.transition({ tableId: "t-settled", from: "ready_check", to: "playing", expectedRevision: settledReady.revision, actor: "owner5" });
+    const settledPending = ctx.persistentTables.transition({ tableId: "t-settled", from: "playing", to: "pending_approval", expectedRevision: settledPlaying.revision, actor: "owner5" });
+    ctx.persistentTables.transition({ tableId: "t-settled", from: "pending_approval", to: "settled", expectedRevision: settledPending.revision, actor: "owner5" });
+    expect(() => ctx.persistentTables.join({ tableId: "t-settled", userId: "grace", seat: 1, operationId: "op:join:grace" })).toThrow(PersistentTableError);
+
+    expect(pending.state).toBe("pending_approval");
+  });
+
   it("enforces the table transition graph and stale revisions", () => {
     const ctx = setup(true);
     ctx.persistentTables.create({ tableId: "t1", gameKey: "poker", creatorId: "alice", operatorId: "alice", operationId: "op:t1" });
@@ -313,6 +367,13 @@ describe("PersistentTables", () => {
     expect(() => ctx.persistentTables.transition({ tableId: "t1", from: "playing", to: "recruiting", expectedRevision: 2, actor: "alice" })).toThrow(PersistentTableError);
     expect(() => ctx.persistentTables.transition({ tableId: "t1", from: "playing", to: "pending_approval", expectedRevision: 1, actor: "alice" })).toThrow(PersistentTableError);
     const pending = ctx.persistentTables.transition({ tableId: "t1", from: "playing", to: "pending_approval", expectedRevision: 2, actor: "alice" });
+    expect(() => ctx.persistentTables.transition({ tableId: "t1", from: "pending_approval", to: "playing", expectedRevision: pending.revision, actor: "alice" })).toThrow(PersistentTableError);
+    const disputedCtx = setup(true);
+    disputedCtx.persistentTables.create({ tableId: "t2", gameKey: "poker", creatorId: "alice", operatorId: "alice", operationId: "op:t2" });
+    const ready2 = disputedCtx.persistentTables.transition({ tableId: "t2", from: "recruiting", to: "ready_check", expectedRevision: 0, actor: "alice" });
+    const playing2 = disputedCtx.persistentTables.transition({ tableId: "t2", from: "ready_check", to: "playing", expectedRevision: ready2.revision, actor: "alice" });
+    const pending2 = disputedCtx.persistentTables.transition({ tableId: "t2", from: "playing", to: "pending_approval", expectedRevision: playing2.revision, actor: "alice" });
+    expect(disputedCtx.persistentTables.transition({ tableId: "t2", from: "pending_approval", to: "disputed", expectedRevision: pending2.revision, actor: "alice" }).state).toBe("disputed");
     const settled = ctx.persistentTables.transition({ tableId: "t1", from: "pending_approval", to: "settled", expectedRevision: pending.revision, actor: "alice" });
     expect(() => ctx.persistentTables.transition({ tableId: "t1", from: "settled", to: "playing", expectedRevision: settled.revision, actor: "alice" })).toThrow(PersistentTableError);
   });

@@ -78,7 +78,7 @@ export const ALLOWED_TABLE_TRANSITIONS: Readonly<Record<PersistentTableState, re
   recruiting: ["recruiting", "ready_check", "cancelled", "cancelled_by_admin", "cancelled_fault", "disputed"],
   ready_check: ["ready_check", "recruiting", "playing", "cancelled", "cancelled_by_admin", "cancelled_fault", "disputed"],
   playing: ["playing", "pending_approval", "cancelled_by_admin", "cancelled_fault", "disputed"],
-  pending_approval: ["pending_approval", "settled", "playing", "cancelled_by_admin", "cancelled_fault", "disputed"],
+  pending_approval: ["pending_approval", "settled", "cancelled_by_admin", "cancelled_fault", "disputed"],
   disputed: ["disputed", "settled", "cancelled_by_admin", "cancelled_fault"],
   settled: ["settled"],
   cancelled: ["cancelled"],
@@ -293,7 +293,7 @@ export class PersistentTables {
       const table = this.get(tableId);
       if (!table) throw new PersistentTableError("ERR_TABLE_NOT_FOUND", "persistent table does not exist", { tableId });
       assertKnownState(table.state);
-      if (!PERSISTENT_TABLE_LIVE_STATES.has(table.state)) {
+      if (table.state !== "recruiting") {
         throw new PersistentTableError("ERR_TABLE_NOT_LIVE", "persistent table is not joinable", { tableId, state: table.state });
       }
       const existing = this.findParticipant(tableId, userId);
