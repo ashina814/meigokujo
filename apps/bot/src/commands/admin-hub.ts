@@ -31,7 +31,6 @@ import {
   HOUSE_HOLDER,
   LedgerError,
   readCasinoOpeningConfig,
-  recoverCasino,
   type RefundSaga,
   type TicketPanel,
 } from "@meigokujo/core";
@@ -57,6 +56,7 @@ import {
   openingOpsField,
   openingOpsRows,
 } from "../casino/opening-ops.js";
+import { recoverCasinoWithPersistentTables } from "../casino/persistent-table-recovery.js";
 import { ticketPanelMessageForPanel } from "./tickets.js";
 import type { Services } from "../services.js";
 
@@ -280,17 +280,7 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
     // 呼び出しそのもの（deps の組み立て等）で万一例外が出ても interaction を無応答で
     // 終わらせない・成功したかのような表示を出さないための防御（PR7監査・二次レビュー）。
     try {
-      const r = recoverCasino({
-        db: services.db,
-        status: services.casinoStatus,
-        integrity: services.casinoIntegrity,
-        chipTx: services.chipTx,
-        escrow: services.escrow,
-        reservations: services.reservations,
-        registry: services.recoveryRegistry,
-        events: services.events,
-        chipFlow: services.chipFlow,
-      });
+      const r = await recoverCasinoWithPersistentTables(interaction.client, services);
       const detail = [
         `維持 ${r.keptHolders}件 / 孤児返金 ${r.refundedSessions}件 / 隔離 ${r.quarantined}件`,
         `不一致 ${r.mismatched.length}件 / 返金失敗 ${r.failedSessions.length}件`,

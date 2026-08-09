@@ -36,13 +36,13 @@ import {
   FreeSpins,
   HouseReservations,
   RecoveryRegistry,
-  recoverCasino,
   Daily,
   Items,
   Stocks,
   Vip,
   Markets,
   MARKET_FINALIZER,
+  PersistentTables,
   Takutate,
   Escrow,
   CasinoChipAssets,
@@ -197,6 +197,7 @@ export function buildServices() {
     }
   }
   const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
+  const persistentTables = new PersistentTables(db, events, { openingPhase: () => chipTx.openingPhase() });
   const chipAssets = new CasinoChipAssets(db, chips);
   // 所有判定の正本をここで一本化する。プロセス内の着席は DB のどの表にも
   // 現れないので、渡さないとショップの域外確認票がゲーム中の自由チップを
@@ -212,93 +213,16 @@ export function buildServices() {
   // その預託は孤児として返金するのが正しい）。PR20 で対人卓を同じ形で足す。
   const recoveryRegistry = new RecoveryRegistry();
   recoveryRegistry.register({ type: "market", listLiveEscrowHolders: () => markets.liveEscrowHolders() });
-  logRecovery(
-    recoverCasino({ db, status: casinoStatus, integrity: casinoIntegrity, chipTx, escrow, reservations, registry: recoveryRegistry, events, chipFlow }),
-  );
+  recoveryRegistry.register({ type: "table", listLiveEscrowHolders: () => persistentTables.liveEscrowHolders() });
   // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
   // 資金を動かす経路は `chips` に一本化した（PR8監査・項目12）。`ether` は
   // 旧名称で書かれた外部プラグイン・古い呼び出しが**読むだけ**なら壊れないように
   // 残す互換窓で、型を `ChipReadonlyView` に狭めてある（下の注釈参照）。
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, persistentTables, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;
 }
 
 export type Services = ReturnType<typeof buildServices>;
-
-/**
- * 起動・復旧の結果をログへ出す（PR7）。
- *
- * 掃除の中身は core の `recoverCasino()` が持つ。ここは「何が起きたか」を運営が
- * ログで追えるようにするだけで、判断は一切しない。
- */
-function logRecovery(r: ReturnType<typeof recoverCasino>): void {
-  const reservations = r.releasedReservations.released
-    ? `予約解放${r.releasedReservations.count}件`
-    : "予約解放は未実行";
-  const summary =
-    `維持${r.keptHolders}件 / 孤児返金${r.refundedSessions}件(${r.refundedTotal.toLocaleString("ja-JP")}◈) / ` +
-    `隔離${r.quarantined}件 / 不一致${r.mismatched.length}件 / 返金失敗${r.failedSessions.length}件 / ${reservations}`;
-  switch (r.outcome) {
-    case "opened":
-      console.log(`[賭場] 起動時の復旧を完了し、営業を開けました（${summary}）`);
-      break;
-    case "halted":
-      console.error(`[賭場] 起動時の復旧で停止しました: ${r.reason}（${summary}）`);
-      break;
-    case "source_failed":
-      // 所有元の申告が取れなかった＝掃除も再開もしていない。営業は開けない（PR7）。
-      // 通常の「再点検」では開かない専用状態（recovery_halt）にしてある
-      console.error(
-        `[賭場] 生存中エスクローの所有元を確認できなかったため、掃除・予約解放とも実行せず停止しました: ${r.reason}
-` +
-          "　→ 原因を直したうえで /管理 → 賭場 → 「復旧を再実行」を押してください（再点検では開きません）",
-      );
-      break;
-    case "chip_redeem_failed":
-      console.error(`[賭場] S10自由チップ返還が一部失敗したため復旧停止: ${r.reason}（${summary}）`);
-      break;
-    case "refund_failed":
-      // 孤児返金が技術的に失敗したセッションが残っている＝復旧未完了。営業は開けない（PR7監査）。
-      // 帳簿・残高は維持済みなので postflight は通り得るが、それでも recovery_halt にしてある
-      console.error(
-        `[賭場] 孤児返金の技術失敗が残っているため営業を再開しませんでした: ${r.reason}（${summary}）
-` +
-          "　→ 原因を直したうえで /管理 → 賭場 → 「復旧を再実行」を押してください（再点検では開きません）",
-      );
-      break;
-    case "exception_failed":
-      // S1〜S12の途中で予期しない例外＝どこまで安全に完了したか保証できない（PR7監査・二次レビュー）。
-      // 必ずrecovery_haltにしてあるので、原因を直したうえで復旧を再実行するしかない
-      console.error(
-        `[賭場] 起動時の復旧中に予期しない例外が発生したため停止しました: ${r.reason}（${summary}）
-` +
-          "　→ 原因を直したうえで /管理 → 賭場 → 「復旧を再実行」を押してください（再点検では開きません）",
-      );
-      break;
-    case "held":
-      console.warn(`[賭場] 人が止めている状態のため復旧を行いません（${r.reason}）`);
-      break;
-    case "manual":
-      console.warn(`[賭場] ${r.reason}。運営卓の「再点検」で開けてください`);
-      break;
-  }
-  if (r.mismatched.length > 0) {
-    // 帳簿と保有者残高が合わないセッション。返金も隔離もせず凍結してある。要調査
-    console.warn(
-      `[escrow] 帳簿不一致 ${r.mismatched.length}件（返金も隔離もせず凍結・賭場全体も停止）: ` +
-        r.mismatched.map((m) => `${m.sessionId}(帳簿${m.expected}/保有${m.actual})`).join(", "),
-    );
-  }
-  if (r.failedSessions.length > 0) {
-    // 孤児返金の技術失敗。他の復旧は続けたが、失敗が起動ログから消えてはいけない（PR7）
-    console.error(
-      `[escrow] 孤児返金に失敗 ${r.failedSessions.length}件（帳簿・残高は維持）: ` +
-        r.failedSessions
-          .map((f) => `${f.sessionId}(帳簿${f.expected}/保有${f.actual}): ${f.error}`)
-          .join(" / "),
-    );
-  }
-}

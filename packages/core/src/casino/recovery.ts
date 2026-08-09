@@ -93,6 +93,22 @@ export interface RecoverCasinoDeps {
   events: EventLog;
   /** PR10 S10. Required so startup can never silently skip free-chip redemption. */
   chipFlow: CasinoChipFlow;
+  /** PR20 S11. The bot restores durable table messages before S12 can reopen the casino. */
+  persistentTableRestore?: PersistentTableRestoreResult;
+}
+
+export interface PersistentTableRestoreResult {
+  restored: number;
+  replaced: number;
+  disputed: number;
+  failed: Array<{ tableId: string; error: string }>;
+}
+
+export type PersistentTableRestoreProvider = () => PersistentTableRestoreResult | Promise<PersistentTableRestoreResult>;
+
+export interface RecoverCasinoAsyncDeps extends Omit<RecoverCasinoDeps, "persistentTableRestore"> {
+  /** PR20 S11. Runs after S10 and before S12 while casino status remains startup_check. */
+  persistentTableRestore?: PersistentTableRestoreProvider;
 }
 
 export interface RecoverCasinoResult {
@@ -162,6 +178,19 @@ export interface RecoverCasinoResult {
  * 「所有元が確実に存在しない」と証明できた場合だけ。
  */
 export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
+  const result = recoverCasinoCore(deps, deps.persistentTableRestore ? () => deps.persistentTableRestore! : undefined);
+  if (isPromiseLike(result)) throw new Error("recoverCasino received an async persistent table restore provider");
+  return result;
+}
+
+export async function recoverCasinoAsync(deps: RecoverCasinoAsyncDeps): Promise<RecoverCasinoResult> {
+  return await recoverCasinoCore(deps, deps.persistentTableRestore);
+}
+
+function recoverCasinoCore(
+  deps: Omit<RecoverCasinoDeps, "persistentTableRestore">,
+  persistentTableRestore?: PersistentTableRestoreProvider,
+): RecoverCasinoResult | Promise<RecoverCasinoResult> {
   const { status, integrity, chipTx, escrow, reservations, registry, events, chipFlow } = deps;
   const steps: string[] = [];
   const empty: Omit<RecoverCasinoResult, "outcome" | "steps" | "reason"> = {
@@ -329,120 +358,82 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
       return { outcome: "source_failed", steps, ...summary, reason };
     }
 
-    // 掃除のあとに**全点検（A〜D）**を常に実行する（診断のため）。ここで初めて C・D まで見る。
-    //
-    // ただし「最終的にどの停止状態にするか」の優先順位は postflight の成否だけで決めない
-    // （PR7監査・二次レビュー）。failedSessions は帳簿・残高が一致したまま残るため
-    // postflight がたまたま通ってしまうことがあるが、それでも復旧未完了として扱う必要がある。
-    // 優先順位: failedSessions（孤児返金の技術失敗） > mismatched（帳簿不一致）
-    //           > postflight自体のNG（上記以外） > 正常終了
-    steps.push("S12:後検");
-    const post = integrity.runFull();
-    const postReason = post.ok ? undefined : describeFailure(post);
-    if (!post.ok) {
-      events.log("casino_integrity_failed", {
-        actor: "system:recovery",
-        payload: { phase: "recover_post", ledgerOk: post.ledger.ok, failed: post.failed },
+    const completeRecovery = () =>
+      completeRecoveryAfterPersistentTableRestore({
+        status,
+        integrity,
+        events,
+        steps,
+        summary,
+        result,
+        recoveringFromHalt,
+        heldReason: held.reason,
       });
-    }
 
-    // **孤児返金が技術的に失敗したセッションが1件でも残っていれば、営業を再開しない**（PR7監査）。
-    // postflight の成否より優先する。帳簿・残高は一致したまま維持されるため postflight A〜D は
-    // たまたま通り得るが、復旧そのものは完了していない。recoveringFromHalt に関わらず必ず
-    // recovery_halt にして、「復旧を再実行」からの再試行を求める（このセッションだけが
-    // 次回また対象になる）。
-    // 未完了の義務は**すべて**理由と event へ残す。outcome は1つしか選べないので、
-    // 優先順位の低い義務（孤児返金の技術失敗・帳簿不一致・postflight NG）が
-    // 報告から消えると、復旧の再実行で何を直すべきか分からなくなる（監査項目8）。
-    const outstanding: string[] = [];
-    if (result.redeemedFreeChips.failed.length > 0) {
-      outstanding.push(
-        `S10自由チップ返還失敗 ${result.redeemedFreeChips.failed.length}件（成功済みは再実行で二重返還しない）: ` +
-          result.redeemedFreeChips.failed
-            .map((failure) => `${failure.userId}(${failure.amount}): ${failure.error}`)
-            .join(", "),
-      );
-    }
-    if (result.failedSessions.length > 0) {
-      outstanding.push(
-        `孤児返金の技術失敗 ${result.failedSessions.length}件（帳簿・残高は維持・要調査）: ` +
-          result.failedSessions.map((f) => `${f.sessionId}: ${f.error}`).join(", "),
-      );
-    }
-    if (result.mismatched.length > 0) {
-      outstanding.push(`帳簿不一致 ${result.mismatched.length}件`);
-    }
-    if (!post.ok) outstanding.push(`後検NG: ${postReason ?? "不明"}`);
-
-    if (result.redeemedFreeChips.failed.length > 0) {
-      const reason = outstanding.join(" / ");
-      events.log("casino_recovery_halted", {
-        actor: "system:recovery",
-        payload: {
+    if (persistentTableRestore) {
+      steps.push("S11:persistent_table_restore");
+      try {
+        const restored = persistentTableRestore();
+        if (isPromiseLike(restored)) {
+          return restored.then((value) => {
+            const halted = haltForPersistentTableRestoreFailure({
+              status,
+              events,
+              steps,
+              summary,
+              recoveringFromHalt,
+              heldReason: held.reason,
+              persistentTableRestore: value,
+            });
+            return halted ?? completeRecovery();
+          }).catch((e) => {
+            const failed = {
+              restored: 0,
+              replaced: 0,
+              disputed: 0,
+              failed: [{ tableId: "*", error: e instanceof Error ? e.message : String(e) }],
+            };
+            return haltForPersistentTableRestoreFailure({
+              status,
+              events,
+              steps,
+              summary,
+              recoveringFromHalt,
+              heldReason: held.reason,
+              persistentTableRestore: failed,
+            })!;
+          });
+        }
+        const halted = haltForPersistentTableRestoreFailure({
+          status,
+          events,
           steps,
-          reason,
-          outstanding,
-          redeemedFreeChips: result.redeemedFreeChips,
-          failedSessions: result.failedSessions,
-          mismatched: result.mismatched,
-          postflightOk: post.ok,
-        },
-      });
-      status.haltForRecovery(recoveringFromHalt ? appendReason(held.reason, reason) : reason);
-      return { outcome: "chip_redeem_failed", steps, ...summary, reason };
-    }
-
-    if (result.failedSessions.length > 0) {
-      const refundReason =
-        `孤児返金の技術失敗 ${result.failedSessions.length}件（帳簿・残高は維持・要調査）: ` +
-        result.failedSessions.map((f) => `${f.sessionId}(帳簿${f.expected}/保有${f.actual}): ${f.error}`).join(", ");
-      const reason = postReason ? `${refundReason} / 併発した検算NG: ${postReason}` : refundReason;
-      events.log("casino_recovery_halted", {
-        actor: "system:recovery",
-        payload: { steps, reason, failedSessions: result.failedSessions, postflightOk: post.ok },
-      });
-      status.haltForRecovery(recoveringFromHalt ? appendReason(held.reason, reason) : reason);
-      return { outcome: "refund_failed", steps, ...summary, reason };
-    }
-
-    if (!post.ok) {
-      const reason = postReason!;
-      // recovery_halt から再実行していたときは、その義務ごと recovery_halt を維持する
-      // （通常の「再点検（reopenAfterIntegrity）」で開けてしまう integrity_halt に化けさせない）。
-      if (recoveringFromHalt) {
-        status.haltForRecovery(appendReason(held.reason, `検算NG(復旧再実行後の全点検): ${reason}`));
-      } else {
-        status.haltForIntegrity(reason);
+          summary,
+          recoveringFromHalt,
+          heldReason: held.reason,
+          persistentTableRestore: restored,
+        });
+        if (halted) return halted;
+      } catch (e) {
+        const failed = {
+          restored: 0,
+          replaced: 0,
+          disputed: 0,
+          failed: [{ tableId: "*", error: e instanceof Error ? e.message : String(e) }],
+        };
+        return haltForPersistentTableRestoreFailure({
+          status,
+          events,
+          steps,
+          summary,
+          recoveringFromHalt,
+          heldReason: held.reason,
+          persistentTableRestore: failed,
+        })!;
       }
-      return { outcome: "halted", steps, ...summary, reason };
     }
 
-    // 帳簿不一致があれば、対象を凍結したうえで**賭場全体も止める**（運営判断）。
-    // 正本 §6 は「検算A〜D のいずれかが NG なら integrity_halt」なので、
-    // 正式開業前の段階で「1卓だけ止めて営業継続」へは緩和しない。
-    // （現状は checkC が同じ不一致を先に検出して post.ok=false になるため通常は上のブロックへ
-    // 入るが、将来 postflight の実装が変わってもここで recovery_halt を守れるよう同じ判断を残す）
-    if (result.mismatched.length > 0) {
-      const reason =
-        `エスクロー帳簿不一致 ${result.mismatched.length}件（対象は凍結済み・返金も隔離もしていない）: ` +
-        result.mismatched.map((m) => `${m.sessionId}(帳簿${m.expected}/保有${m.actual})`).join(", ");
-      events.log("casino_recovery_halted", {
-        actor: "system:recovery",
-        payload: { steps, reason, mismatched: result.mismatched },
-      });
-      if (recoveringFromHalt) {
-        status.haltForRecovery(appendReason(held.reason, reason));
-      } else {
-        status.haltForIntegrity(reason);
-      }
-      return { outcome: "halted", steps, ...summary, reason };
-    }
-
-    // S12: 元の状態が startup_check のときだけ open へ戻す
-    status.finishStartupCheck("system:recovery");
-    steps.push("S12:再開");
-    events.log("casino_recovered", { actor: "system:recovery", payload: { steps, ...summary } });
-    return { outcome: "opened", steps, ...summary, reason: result.reason };
+    return completeRecovery();
   } catch (e) {
     // S1〜S12 のどこかで予期しない例外。安全性を保証できないので必ず recovery_halt にする
     // （PR7監査・二次レビュー）。S5〜S8 まで確認できていれば、その結果だけは報告する。
@@ -470,6 +461,142 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
  * 同一の失敗で再実行を繰り返しても、その行が既にあれば足さない。新しい異常だけ追記し、
  * 元の recovery_halt 理由（1行目以降の履歴）は保持する。
  */
+type RecoverySummary = Pick<
+  RecoverCasinoResult,
+  | "keptHolders"
+  | "refundedSessions"
+  | "refundedTotal"
+  | "quarantined"
+  | "mismatched"
+  | "failedSessions"
+  | "releasedReservations"
+  | "redeemedFreeChips"
+>;
+
+function haltForPersistentTableRestoreFailure(input: {
+  status: CasinoStatus;
+  events: EventLog;
+  steps: string[];
+  summary: RecoverySummary;
+  recoveringFromHalt: boolean;
+  heldReason: string;
+  persistentTableRestore: PersistentTableRestoreResult;
+}): RecoverCasinoResult | undefined {
+  const { status, events, steps, summary, recoveringFromHalt, heldReason, persistentTableRestore } = input;
+  if (persistentTableRestore.failed.length === 0) return undefined;
+  const reason =
+    `S11 persistent table restore failed: ${persistentTableRestore.failed.length} table(s): ` +
+    persistentTableRestore.failed.map((f) => `${f.tableId}: ${f.error}`).join(", ");
+  events.log("casino_recovery_halted", {
+    actor: "system:recovery",
+    payload: { steps, reason, persistentTableRestore },
+  });
+  status.haltForRecovery(recoveringFromHalt ? appendReason(heldReason, reason) : reason);
+  return { outcome: "source_failed", steps, ...summary, reason };
+}
+
+function completeRecoveryAfterPersistentTableRestore(input: {
+  status: CasinoStatus;
+  integrity: CasinoIntegrity;
+  events: EventLog;
+  steps: string[];
+  summary: RecoverySummary;
+  result: RecoverySummary & { skipped: false; reason?: string };
+  recoveringFromHalt: boolean;
+  heldReason: string;
+}): RecoverCasinoResult {
+  const { status, integrity, events, steps, summary, result, recoveringFromHalt, heldReason } = input;
+
+  steps.push("S12:後検");
+  const post = integrity.runFull();
+  const postReason = post.ok ? undefined : describeFailure(post);
+  if (!post.ok) {
+    events.log("casino_integrity_failed", {
+      actor: "system:recovery",
+      payload: { phase: "recover_post", ledgerOk: post.ledger.ok, failed: post.failed },
+    });
+  }
+
+  const outstanding: string[] = [];
+  if (result.redeemedFreeChips.failed.length > 0) {
+    outstanding.push(
+      `S10自由チップ返還失敗 ${result.redeemedFreeChips.failed.length}件: ` +
+        result.redeemedFreeChips.failed.map((failure) => `${failure.userId}(${failure.amount}): ${failure.error}`).join(", "),
+    );
+  }
+  if (result.failedSessions.length > 0) {
+    outstanding.push(`escrow refund failed: ${result.failedSessions.length}: ${result.failedSessions.map((f) => `${f.sessionId}: ${f.error}`).join(", ")}`);
+  }
+  if (result.mismatched.length > 0) outstanding.push(`escrow balance mismatch: ${result.mismatched.length}`);
+  if (!post.ok) outstanding.push(`後検NG: ${postReason ?? "不明"}`);
+
+  if (result.redeemedFreeChips.failed.length > 0) {
+    const reason = outstanding.join(" / ");
+    events.log("casino_recovery_halted", {
+      actor: "system:recovery",
+      payload: {
+        steps,
+        reason,
+        outstanding,
+        redeemedFreeChips: result.redeemedFreeChips,
+        failedSessions: result.failedSessions,
+        mismatched: result.mismatched,
+        postflightOk: post.ok,
+      },
+    });
+    status.haltForRecovery(recoveringFromHalt ? appendReason(heldReason, reason) : reason);
+    return { outcome: "chip_redeem_failed", steps, ...summary, reason };
+  }
+
+  if (result.failedSessions.length > 0) {
+    const refundReason =
+      `escrow refund failed: ${result.failedSessions.length}: ` +
+      result.failedSessions.map((f) => `${f.sessionId}(expected ${f.expected}/actual ${f.actual}): ${f.error}`).join(", ");
+    const reason = postReason ? `${refundReason} / 検算NG: ${postReason}` : refundReason;
+    events.log("casino_recovery_halted", {
+      actor: "system:recovery",
+      payload: { steps, reason, failedSessions: result.failedSessions, postflightOk: post.ok },
+    });
+    status.haltForRecovery(recoveringFromHalt ? appendReason(heldReason, reason) : reason);
+    return { outcome: "refund_failed", steps, ...summary, reason };
+  }
+
+  if (!post.ok) {
+    const reason = postReason!;
+    if (recoveringFromHalt) {
+      status.haltForRecovery(appendReason(heldReason, `検算NG(復旧再実行後の全点検): ${reason}`));
+    } else {
+      status.haltForIntegrity(reason);
+    }
+    return { outcome: "halted", steps, ...summary, reason };
+  }
+
+  if (result.mismatched.length > 0) {
+    const reason =
+      `escrow balance mismatch: ${result.mismatched.length}: ` +
+      result.mismatched.map((m) => `${m.sessionId}(expected ${m.expected}/actual ${m.actual})`).join(", ");
+    events.log("casino_recovery_halted", {
+      actor: "system:recovery",
+      payload: { steps, reason, mismatched: result.mismatched },
+    });
+    if (recoveringFromHalt) {
+      status.haltForRecovery(appendReason(heldReason, reason));
+    } else {
+      status.haltForIntegrity(reason);
+    }
+    return { outcome: "halted", steps, ...summary, reason };
+  }
+
+  status.finishStartupCheck("system:recovery");
+  steps.push("S12:再開");
+  events.log("casino_recovered", { actor: "system:recovery", payload: { steps, ...summary } });
+  return { outcome: "opened", steps, ...summary, reason: result.reason };
+}
+
+function isPromiseLike<T>(value: T | Promise<T>): value is Promise<T> {
+  return !!value && typeof (value as { then?: unknown }).then === "function";
+}
+
 function appendReason(base: string, addition: string): string {
   const lines = base.split("\n");
   if (lines.includes(addition)) return base;

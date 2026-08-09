@@ -96,6 +96,7 @@ import { startInternalApi } from "./internal-api.js";
 import { startOutboxWorker } from "./outbox.js";
 import { postJoinLog, postLeaveLog } from "./member-log.js";
 import { respondInteractionError } from "./interaction-errors.js";
+import { recoverCasinoWithPersistentTables } from "./casino/persistent-table-recovery.js";
 
 const services = buildServices();
 const client = new Client({
@@ -112,8 +113,9 @@ const client = new Client({
 const inviteTracker = new InviteTracker(client);
 inviteTracker.wire();
 
-client.once(Events.ClientReady, (ready) => {
+client.once(Events.ClientReady, async (ready) => {
   console.log(`⚔️ 冥獄城ボット 起動: ${ready.user.tag}`);
+  await recoverCasinoWithPersistentTables(client, services);
   // 前回のプロセスで払い切れなかった無料スピンを精算する（PR3）。
   // 出目は獲得時に確定・保存してあるので、再起動しても表示も配当も変わらない。
   // 賭場が停止中なら資金グループが作れず失敗するが、権利は pending のまま残る

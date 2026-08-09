@@ -266,6 +266,22 @@ export {
   MARKET_LIVE_STATUSES,
 } from "./casino/market.js";
 export {
+  PersistentTables,
+  PersistentTableError,
+  PERSISTENT_TABLE_STATES,
+  PERSISTENT_TABLE_LIVE_STATES,
+  PERSISTENT_TABLE_TERMINAL_STATES,
+  ALLOWED_TABLE_TRANSITIONS,
+  type PersistentTableErrorCode,
+  type PersistentTableState,
+  type PersistentTableRow,
+  type PersistentTableParticipantRow,
+  type CreatePersistentTableInput,
+  type JoinPersistentTableInput,
+  type TransitionPersistentTableInput,
+  type PersistentTablesOptions,
+} from "./casino/persistent-tables.js";
+export {
   CasinoStatus,
   CASINO_STATUSES,
   isHumanHeld,
@@ -505,7 +521,11 @@ export {
 export {
   RecoveryRegistry,
   recoverCasino,
+  recoverCasinoAsync,
   type RecoverySource,
   type RecoverCasinoDeps,
+  type RecoverCasinoAsyncDeps,
   type RecoverCasinoResult,
+  type PersistentTableRestoreResult,
+  type PersistentTableRestoreProvider,
 } from "./casino/recovery.js";
