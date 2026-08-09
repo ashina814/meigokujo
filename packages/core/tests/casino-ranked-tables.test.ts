@@ -27,6 +27,10 @@ import {
   CasinoStatus,
   Departments,
   Settings,
+  HouseReservations,
+  RankedDisputes,
+  RankedDisputeError,
+  rankedFeeReservationKey,
 } from "../src/index.js";
 import { openFormally } from "./helpers/chip-ctx.js";
 
@@ -41,14 +45,23 @@ function setup(options: ConstructorParameters<typeof RankedTables>[6] = {}) {
   openFormally(chipTx, ledger);
   db.prepare("UPDATE casino_chip_opening_versions SET created_at=? WHERE opening_version='opening_v1'").run(1_700_000_000);
   const casino = new Casino(db, chips, events);
+  const reservations = new HouseReservations(db, chips, events);
+  chips.setReservedProvider((holderId) => holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0);
   const recordPlayerNet = (userId: string, net: number) => casino.recordGameNet(userId, net);
   const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
   const persistentTables = new PersistentTables(db, events, { openingPhase: () => chipTx.openingPhase(), now: () => 1_700_000_000 });
   const metrics = new CasinoMetrics(db, chipTx, () => 1_700_000_000);
   const chipAssets = new CasinoChipAssets(db, chips);
   const chipFlow = new CasinoChipFlow(db, chips, events, chipAssets);
-  const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, metrics, { chipFlow, now: () => 1_700_000_000, ...options });
-  return { db, ledger, events, chipTx, chips, casino, escrow, persistentTables, metrics, rankedTables, chipFlow };
+  const disputes = new RankedDisputes(db, chips, escrow, persistentTables, reservations, events, { now: () => 1_700_000_000, onPlayerNet: recordPlayerNet });
+  const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, metrics, {
+    chipFlow,
+    now: () => 1_700_000_000,
+    reservations,
+    disputes,
+    ...options,
+  });
+  return { db, ledger, events, chipTx, chips, casino, escrow, persistentTables, metrics, rankedTables, chipFlow, reservations, disputes };
 }
 
 function seedUser(ctx: ReturnType<typeof setup>, userId: string, amount = 30_000): void {
@@ -233,6 +246,7 @@ describe("RankedTables join and ready", () => {
     expect(playing.table.state).toBe("playing");
     expect(playing.table.startedAt).toBe(1_700_000_000);
     expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(300);
+    expect(ctx.reservations.get(rankedFeeReservationKey("t1"))?.amount).toBe(300);
     expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(10_000);
     expect(escrowRows(ctx, "t1").map((r) => r.amount)).toEqual([5_000, 5_000]);
     expect(ctx.casino.stats("alice").total_lost).toBe(150);
@@ -310,8 +324,10 @@ describe("RankedTables result approval and settlement", () => {
     expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(0);
     expect(ctx.chips.balanceOf("alice")).toBe(34_850);
     expect(ctx.chips.balanceOf("bob")).toBe(24_850);
+    expect(ctx.reservations.get(rankedFeeReservationKey("t1"))).toBeUndefined();
     expect(ctx.casino.stats("alice").total_earned).toBe(5_000);
     expect(ctx.casino.stats("bob").total_lost).toBe(5_150);
+    expect((ctx.db.prepare("SELECT source FROM casino_ranked_match_history WHERE table_id='t1'").get() as { source: string }).source).toBe("unanimous");
   });
 
   it("rejects stale hashes, outsiders, and records disputes without moving collateral", () => {
@@ -324,6 +340,8 @@ describe("RankedTables result approval and settlement", () => {
     expect(ctx.rankedTables.snapshot("t1").table.state).toBe("disputed");
     expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(10_000);
     expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(300);
+    expect(ctx.reservations.get(rankedFeeReservationKey("t1"))?.amount).toBe(300);
+    expect(ctx.disputes.publicStatus("t1")?.evidenceDeadlineAt).toBe(1_700_259_200);
   });
 
   it("settles every GF and sanma permutation and every yonma permutation conserving the pool", () => {
@@ -400,6 +418,147 @@ describe("RankedTables result approval and settlement", () => {
     playing.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
     playing.db.prepare("UPDATE casino_tables SET state='playing' WHERE table_id='t1'").run();
     expect(() => playing.rankedTables.snapshot("t1")).toThrow(RankedTableError);
+  });
+});
+
+describe("RankedDisputes evidence and arbitration", () => {
+  it("rejects participant third-party testimony and does not count supporting-only evidence for ranked settlement", () => {
+    const ctx = setup();
+    startGf(ctx);
+    const submitted = ctx.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
+    ctx.rankedTables.dispute({ tableId: "t1", userId: "bob", resultHash: submitted.result!.hash, operationId: "dispute:bob" });
+    expect(() =>
+      ctx.disputes.submitEvidence({
+        tableId: "t1",
+        submitterId: "alice",
+        evidenceKind: "third_party_testimony",
+        operationId: "evidence:bad",
+        privateChannelId: "private",
+        privateMessageId: "msg1",
+        payloadDigest: "digest",
+      }),
+    ).toThrow(RankedDisputeError);
+    ctx.disputes.submitEvidence({
+      tableId: "t1",
+      submitterId: "carol",
+      evidenceKind: "third_party_testimony",
+      operationId: "evidence:supporting",
+      privateChannelId: "private",
+      privateMessageId: "msg2",
+      payloadDigest: "digest2",
+    });
+    ctx.disputes.assignArbitrator({ tableId: "t1", arbitratorId: "judge", assignedBy: "owner", operationId: "assign:t1" });
+    expect(() =>
+      ctx.disputes.resolveRankedResult({
+        tableId: "t1",
+        actorId: "judge",
+        orderedUserIds: ["bob", "alice"],
+        feeOutcome: "keep",
+        recordStats: true,
+        publicSummary: "supporting evidence only",
+        operationId: "resolve:t1",
+      }),
+    ).toThrow(RankedDisputeError);
+    expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(10_000);
+    expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(300);
+  });
+
+  it("settles ranked arbitration with stored main evidence and releases fee reservation", () => {
+    const ctx = setup();
+    startGf(ctx);
+    const submitted = ctx.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
+    ctx.rankedTables.dispute({ tableId: "t1", userId: "bob", resultHash: submitted.result!.hash, operationId: "dispute:bob" });
+    ctx.disputes.submitEvidence({
+      tableId: "t1",
+      submitterId: "bob",
+      evidenceKind: "screenshot",
+      operationId: "evidence:main",
+      privateChannelId: "private",
+      privateMessageId: "msg",
+      payloadDigest: "digest",
+    });
+    ctx.disputes.assignArbitrator({ tableId: "t1", arbitratorId: "judge", assignedBy: "owner", operationId: "assign:t1" });
+    const resolved = ctx.disputes.resolveRankedResult({
+      tableId: "t1",
+      actorId: "judge",
+      orderedUserIds: ["bob", "alice"],
+      feeOutcome: "fault_refund",
+      recordStats: true,
+      publicSummary: "main evidence supports reversed order",
+      operationId: "resolve:t1",
+    });
+    expect(resolved.resolutionKind).toBe("ranked_result");
+    expect(ctx.rankedTables.snapshot("t1").table.state).toBe("settled");
+    expect(ctx.chips.balanceOf("alice")).toBe(25_000);
+    expect(ctx.chips.balanceOf("bob")).toBe(35_000);
+    expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(0);
+    expect(ctx.reservations.get(rankedFeeReservationKey("t1"))).toBeUndefined();
+    expect((ctx.db.prepare("SELECT source FROM casino_ranked_match_history WHERE table_id='t1'").get() as { source: string }).source).toBe("arbitration");
+  });
+
+  it("blocks participant arbitrators and refund-resolves collateral without match history", () => {
+    const ctx = setup();
+    startGf(ctx);
+    const submitted = ctx.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
+    ctx.rankedTables.dispute({ tableId: "t1", userId: "bob", resultHash: submitted.result!.hash, operationId: "dispute:bob" });
+    expect(() => ctx.disputes.assignArbitrator({ tableId: "t1", arbitratorId: "alice", assignedBy: "owner", operationId: "assign:alice" })).toThrow(RankedDisputeError);
+    ctx.disputes.assignArbitrator({ tableId: "t1", arbitratorId: "judge", assignedBy: "owner", operationId: "assign:judge" });
+    ctx.disputes.resolveCollateralRefund({
+      tableId: "t1",
+      actorId: "judge",
+      feeOutcome: "keep",
+      publicSummary: "neutral collateral refund",
+      operationId: "refund:t1",
+    });
+    expect(ctx.persistentTables.get("t1")?.state).toBe("cancelled_by_admin");
+    expect(ctx.chips.balanceOf("alice")).toBe(29_850);
+    expect(ctx.chips.balanceOf("bob")).toBe(29_850);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_ranked_match_history WHERE table_id='t1'").get() as { n: number }).n).toBe(0);
+  });
+
+  it("auto-refunds collateral at the 72h evidence deadline when no stored main evidence exists", () => {
+    const ctx = setup();
+    startGf(ctx);
+    const submitted = ctx.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
+    ctx.rankedTables.dispute({ tableId: "t1", userId: "bob", resultHash: submitted.result!.hash, operationId: "dispute:bob" });
+    const processed = ctx.disputes.processEvidenceDeadlines(1_700_259_200);
+    expect(processed).toEqual({ closed: 0, autoRefunded: 1, failed: 0 });
+    expect(ctx.persistentTables.get("t1")?.state).toBe("cancelled");
+    expect(ctx.chips.balanceOf("alice")).toBe(29_850);
+    expect(ctx.chips.balanceOf("bob")).toBe(29_850);
+    expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(300);
+    expect(ctx.reservations.get(rankedFeeReservationKey("t1"))).toBeUndefined();
+  });
+
+  it("closes evidence collection without moving money when stored main evidence exists", () => {
+    const ctx = setup();
+    startGf(ctx);
+    const submitted = ctx.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
+    ctx.rankedTables.dispute({ tableId: "t1", userId: "bob", resultHash: submitted.result!.hash, operationId: "dispute:bob" });
+    ctx.disputes.submitEvidence({
+      tableId: "t1",
+      submitterId: "bob",
+      evidenceKind: "history_url",
+      operationId: "evidence:main",
+      privateChannelId: "private",
+      privateMessageId: "msg",
+      payloadDigest: "digest",
+    });
+    expect(ctx.disputes.processEvidenceDeadlines(1_700_259_200)).toEqual({ closed: 1, autoRefunded: 0, failed: 0 });
+    expect(ctx.persistentTables.get("t1")?.state).toBe("disputed");
+    expect(ctx.chips.balanceOf(escrowHolderFor("t1"))).toBe(10_000);
+    expect(ctx.chips.balanceOf(HOUSE_HOLDER)).toBe(300);
+    expect(() =>
+      ctx.disputes.submitEvidence({
+        tableId: "t1",
+        submitterId: "bob",
+        evidenceKind: "replay_id",
+        operationId: "evidence:late",
+        privateChannelId: "private",
+        privateMessageId: "msg2",
+        payloadDigest: "digest2",
+      }),
+    ).toThrow(RankedDisputeError);
   });
 });
 

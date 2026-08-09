@@ -11,6 +11,7 @@ import {
   type ModalSubmitInteraction,
 } from "discord.js";
 import type { RankedTableSnapshot } from "@meigokujo/core";
+import type { RankedDisputePublicStatus } from "@meigokujo/core";
 import type { Services } from "../services.js";
 
 export const RANKED_TABLE_CUSTOM_PREFIX = "rtbl:";
@@ -24,7 +25,7 @@ export function isRankedTableModal(customId: string): boolean {
   return customId.startsWith(RESULT_MODAL_PREFIX);
 }
 
-export function renderRankedTable(snapshot: RankedTableSnapshot): { embeds: EmbedBuilder[]; components: ActionRowBuilder<ButtonBuilder>[] } {
+export function renderRankedTable(snapshot: RankedTableSnapshot, dispute?: RankedDisputePublicStatus | null): { embeds: EmbedBuilder[]; components: ActionRowBuilder<ButtonBuilder>[] } {
   const { table, config, participants, result } = snapshot;
   const active = participants.filter((p) => p.participantState !== "declined");
   const title = `順位卓 / ${labelForGame(table.gameKey)}`;
@@ -35,6 +36,15 @@ export function renderRankedTable(snapshot: RankedTableSnapshot): { embeds: Embe
     `参加: ${active.length}/${config.participantCount}`,
   ];
   if (result) lines.push(`結果hash: ${result.hash.slice(0, 12)}`);
+  if (table.state === "disputed") {
+    if (dispute?.resolvedAt) {
+      lines.push(`裁定: ${resolutionLabel(dispute.resolutionKind)} / fee ${dispute.feeOutcome ?? "keep"}`);
+      if (dispute.publicSummary) lines.push(`要約: ${dispute.publicSummary}`);
+    } else {
+      lines.push(`証拠期限: ${dispute ? `<t:${dispute.evidenceDeadlineAt}:R>` : "確認中"}`);
+      lines.push(dispute?.evidenceClosedAt ? "証拠提出は締切済み。裁定待ちです。" : "`/賭場証拠 提出` で証拠を提出できます。");
+    }
+  }
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setDescription(lines.join("\n"))
@@ -109,7 +119,8 @@ async function refresh(
   tableId: string,
   content: string,
 ): Promise<void> {
-  const payload = renderRankedTable(services.rankedTables.snapshot(tableId));
+  const snapshot = services.rankedTables.snapshot(tableId);
+  const payload = renderRankedTable(snapshot, services.rankedDisputes.publicStatus(tableId));
   if (interaction.isModalSubmit()) {
     await interaction.reply({ content, ephemeral: true });
     return;
@@ -161,7 +172,7 @@ async function editBoundRankedTableMessage(client: Client, services: Services, t
     const channel = client.channels.cache.get(table.channelId) ?? await client.channels.fetch(table.channelId);
     const textChannel = channel as { messages?: { fetch(id: string): Promise<{ edit(payload: unknown): Promise<unknown> }> } } | null;
     const message = await textChannel?.messages?.fetch(table.messageId);
-    await message?.edit(renderRankedTable(snapshot));
+    await message?.edit(renderRankedTable(snapshot, services.rankedDisputes.publicStatus(tableId)));
   } catch (e) {
     services.events.log("casino_ranked_message_edit_failed", {
       actor: "system:ranked-ui",
@@ -224,4 +235,11 @@ function colorForState(state: string): number {
   if (state === "settled") return 0x15803d;
   if (state === "pending_approval") return 0xca8a04;
   return 0x2563eb;
+}
+
+function resolutionLabel(kind: string | null): string {
+  if (kind === "ranked_result") return "順位確定";
+  if (kind === "refund_collateral") return "預託返金";
+  if (kind === "insufficient_evidence") return "証拠不足";
+  return "未確定";
 }

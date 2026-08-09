@@ -7,6 +7,7 @@ export const OPERATING_HOUSE_GROUPS = new Set([
   "shop",
   "table_start",
   "table_settle",
+  "table_fee_refund",
 ]);
 
 export const EXCLUDED_HOUSE_GROUPS = new Set([

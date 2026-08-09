@@ -80,6 +80,7 @@ describe("ranked table UI", () => {
         snapshot: vi.fn(() => snapshot("pending_approval")),
       },
       events: { log: vi.fn() },
+      rankedDisputes: { publicStatus: vi.fn(() => null) },
     };
     const interaction = {
       customId: "rtbl:result-modal:t1",
@@ -114,6 +115,7 @@ describe("ranked table UI", () => {
         snapshot: vi.fn(() => snapshot("pending_approval")),
       },
       events: { log: vi.fn() },
+      rankedDisputes: { publicStatus: vi.fn(() => null) },
     };
     const interaction = {
       customId: "rtbl:result-modal:t1",
@@ -130,5 +132,26 @@ describe("ranked table UI", () => {
     expect(services.rankedTables.submitResult).toHaveBeenCalledTimes(1);
     expect(services.events.log).toHaveBeenCalledWith("casino_ranked_message_edit_failed", expect.objectContaining({ target: "t1" }));
     expect(interaction.reply).toHaveBeenCalledWith(expect.objectContaining({ ephemeral: true }));
+  });
+
+  it("renders disputed public state without leaking private evidence details", () => {
+    const payload = renderRankedTable(snapshot("disputed"), {
+      tableId: "t1",
+      evidenceDeadlineAt: 1_700_259_200,
+      evidenceClosedAt: null,
+      assignedArbitratorId: "judge",
+      resolutionKind: null,
+      feeOutcome: null,
+      recordStats: null,
+      publicSummary: null,
+      resolvedBy: null,
+      resolvedAt: null,
+    });
+    const raw = JSON.stringify(payload.embeds[0]!.data);
+    expect(raw).toContain("/賭場証拠 提出");
+    expect(raw).toContain("<t:1700259200:R>");
+    expect(raw).not.toContain("private-message");
+    expect(raw).not.toContain("https://");
+    expect(payload.components).toEqual([]);
   });
 });

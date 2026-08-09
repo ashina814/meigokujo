@@ -13,6 +13,8 @@ import {
   Ledger,
   PersistentTables,
   RankedTables,
+  RankedDisputes,
+  HouseReservations,
   TREASURY,
   escrowHolderFor,
   openDb,
@@ -69,6 +71,10 @@ function servicesFor(table: PersistentTableRow, overrides: Partial<Services["per
         throw new Error("not ranked");
       }),
     },
+    rankedDisputes: {
+      publicStatus: vi.fn(() => null),
+      openForTable: vi.fn(),
+    },
     persistentTables: {
       listLiveTables: vi.fn(() => [table]),
       bindMessage: vi.fn(),
@@ -90,11 +96,14 @@ function setupRankedRecoveryTable() {
     fromLedgerTxId: ledger.lastTransactionId(),
   });
   const casino = new Casino(db, chips, events);
+  const reservations = new HouseReservations(db, chips, events);
+  chips.setReservedProvider((holder) => holder === HOUSE_HOLDER ? reservations.totalReserved() : 0);
   const escrow = new Escrow(db, chips, events, { onPlayerNet: (userId, net) => casino.recordGameNet(userId, net) });
   const persistentTables = new PersistentTables(db, events, { openingPhase: () => chipTx.openingPhase(), now: () => 1_700_000_000 });
   const metrics = new CasinoMetrics(db, chipTx, () => 1_700_000_000);
-  const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, metrics, { now: () => 1_700_000_000 });
-  const services = { db, persistentTables, rankedTables, events } as unknown as Services;
+  const rankedDisputes = new RankedDisputes(db, chips, escrow, persistentTables, reservations, events, { now: () => 1_700_000_000, onPlayerNet: (userId, net) => casino.recordGameNet(userId, net) });
+  const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, metrics, { now: () => 1_700_000_000, reservations, disputes: rankedDisputes });
+  const services = { db, persistentTables, rankedTables, rankedDisputes, events } as unknown as Services;
 
   rankedTables.create({
     tableId: "t1",

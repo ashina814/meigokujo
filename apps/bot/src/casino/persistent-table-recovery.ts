@@ -47,7 +47,7 @@ async function restoreOnePersistentTableMessage(
   table: PersistentTableRow,
 ): Promise<"restored" | "replaced" | "disputed"> {
   if (!table.guildId || !table.channelId || !table.messageId) {
-    services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, "missing Discord message binding");
+    markDisputed(services, table, "missing Discord message binding");
     return "disputed";
   }
 
@@ -59,7 +59,7 @@ async function restoreOnePersistentTableMessage(
   }
 
   if (!isUsableTextChannel(channel) || channel.guildId !== table.guildId) {
-    services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, "Discord channel is missing, non-text, or belongs to a different guild");
+    markDisputed(services, table, "Discord channel is missing, non-text, or belongs to a different guild");
     return "disputed";
   }
 
@@ -98,11 +98,10 @@ function renderPersistentTableRecoveryMessage(services: Services, table: Persist
   const rankedState = rankedStorageState(services, table.tableId);
   if (rankedState === "partial") return markDisputed(services, table, "ranked table storage is partial");
   try {
-    return renderRankedTable(services.rankedTables.snapshot(table.tableId));
+    return renderRankedTable(services.rankedTables.snapshot(table.tableId), services.rankedDisputes.publicStatus(table.tableId));
   } catch (e) {
     if (rankedState !== "none") {
-      services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, boundField(e instanceof Error ? e.message : String(e), 500));
-      return "disputed";
+      return markDisputed(services, table, boundField(e instanceof Error ? e.message : String(e), 500));
     }
   }
   const tableId = boundField(table.tableId);
@@ -142,7 +141,8 @@ function rankedStorageState(services: Services, tableId: string): "none" | "rank
 }
 
 function markDisputed(services: Services, table: PersistentTableRow, reason: string): "disputed" {
-  services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, boundField(reason, 500));
+  const disputed = services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, boundField(reason, 500));
+  services.rankedDisputes.openForTable(disputed, reason);
   return "disputed";
 }
 

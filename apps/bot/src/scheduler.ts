@@ -435,10 +435,17 @@ export function processRankedTableTimeoutsForScheduler(services: Services, nowSe
 
   try {
     const result = services.rankedTables.processDueTables(nowSec);
+    const disputes = services.rankedDisputes.processEvidenceDeadlines(nowSec);
     if (result.processed > 0 || result.refunded > 0 || result.disputed > 0) {
       services.events.log("casino_ranked_timeout_scan", {
         actor: "system:scheduler",
         payload: result,
+      });
+    }
+    if (disputes.closed > 0 || disputes.autoRefunded > 0 || disputes.failed > 0) {
+      services.events.log("casino_ranked_dispute_deadline_scan", {
+        actor: "system:scheduler",
+        payload: disputes,
       });
     }
   } catch (e) {

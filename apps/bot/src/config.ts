@@ -15,4 +15,6 @@ export const config = {
   ownerId: required("OWNER_ID"),
   dbPath: process.env.DB_PATH ?? "./data/bot.db",
   openingBackupDir: process.env.CASINO_OPENING_BACKUP_DIR ?? "",
+  casinoEvidenceChannelId: process.env.CASINO_EVIDENCE_CHANNEL_ID ?? "",
+  casinoArbitratorRoleId: process.env.CASINO_ARBITRATOR_ROLE_ID ?? "",
 };

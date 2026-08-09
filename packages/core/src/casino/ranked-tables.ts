@@ -5,6 +5,9 @@ import type { ChipLedger } from "./chip-ledger.js";
 import { escrowHolderFor, type Escrow } from "./escrow.js";
 import type { CasinoMetrics } from "./metrics.js";
 import type { CasinoChipFlow } from "./chip-flow.js";
+import type { HouseReservations } from "./reservations.js";
+import { rankedFeeReservationKey, RANKED_FEE_RESERVATION_SCOPE } from "./ranked-fee-reservation.js";
+import type { RankedDisputes } from "./ranked-disputes.js";
 import {
   PersistentTableError,
   type PersistentTableParticipantRow,
@@ -139,6 +142,8 @@ export interface RankedTablesOptions {
   afterPlayingUpdateForTesting?: (tableId: string) => void;
   afterAutoDepositForTesting?: (tableId: string, userId: string) => void;
   beforeSettlementTransferForTesting?: (index: number, dist: { to: string; amount: number }) => void;
+  reservations?: HouseReservations;
+  disputes?: RankedDisputes;
 }
 
 interface RankedTableStorageRow {
@@ -421,6 +426,20 @@ export class RankedTables {
           operationId: `ready:${safeInput.operationId}`,
           actor: safeInput.userId,
         });
+        const feeReservation = this.options.reservations?.reserve(
+          rankedFeeReservationKey(table.tableId),
+          committed.totalFee,
+          "ranked_fee_refund",
+          `table:${table.tableId}`,
+          RANKED_FEE_RESERVATION_SCOPE,
+        );
+        if (feeReservation && !feeReservation.ok) {
+          throw new RankedTableError("ERR_RANKED_INSUFFICIENT_FUNDS", "house cannot reserve ranked fee refund liability", {
+            tableId: table.tableId,
+            totalFee: committed.totalFee,
+            available: feeReservation.available,
+          });
+        }
         this.options.afterFeeCommitForTesting?.(table.tableId);
         const changed = this.db
           .prepare(
@@ -707,6 +726,7 @@ export class RankedTables {
     const distributions = this.distributions(config, result.orderedUserIds);
     this.assertEscrowBeforeSettlement(table.tableId, config, distributions);
     this.escrow.settle(table.tableId, distributions, actor, "順位卓の精算", this.options.beforeSettlementTransferForTesting);
+    this.options.reservations?.release(rankedFeeReservationKey(table.tableId));
     const changed = this.db
       .prepare(
         `UPDATE casino_tables
@@ -724,6 +744,7 @@ export class RankedTables {
       payload: { tableId: table.tableId, resultHash: result.hash },
       occurredAt: this.now(),
     });
+    this.options.disputes?.recordUnanimousMatch(table.tableId, table.gameKey, config, result.orderedUserIds);
     this.events.log("casino_ranked_table_settled", { actor, target: table.tableId, payload: { resultHash: result.hash } });
   }
 
@@ -737,6 +758,8 @@ export class RankedTables {
       reason,
     });
     this.db.prepare("UPDATE casino_tables SET dispute_reason=?, deadline_at=? WHERE table_id=?").run(reason, this.now() + 72 * 60 * 60, table.tableId);
+    const disputed = this.requiredTable(table.tableId);
+    this.options.disputes?.openForTable(disputed, reason);
     this.metrics?.record({
       eventKey: `table_dispute:${table.tableId}:${table.revision + 1}`,
       eventType: "table_dispute",

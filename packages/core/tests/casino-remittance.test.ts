@@ -165,14 +165,17 @@ describe("PR14 clean remittance / bailout", () => {
     c.chips.runGroup({ groupKey: "daily:1", kind: "daily", actorId: "u1" }, () => {
       c.chips.transfer(HOUSE_HOLDER, "u1", 25, { reason: "whatever" });
     });
+    c.chips.runGroup({ groupKey: "ranked:fee-refund:1", kind: "table_fee_refund", actorId: "judge" }, () => {
+      c.chips.transfer(HOUSE_HOLDER, "u1", 15, { reason: "ranked fee refund" });
+    });
     c.chips.runGroup({ groupKey: "refund:1", kind: "refund", actorId: "system" }, () => {
       c.chips.transfer(HOUSE_HOLDER, "u1", 20, { reason: "not parsed" });
     });
 
-    expect(c.remit.syncRealized()).toBe(5);
+    expect(c.remit.syncRealized()).toBe(6);
     expect(c.remit.syncRealized()).toBe(0);
-    expect(c.remit.pnl().map((x) => x.amount)).toEqual([100, -30, -10, -5, -25]);
-    expect(c.remit.cumulativeProfit()).toBe(30);
+    expect(c.remit.pnl().map((x) => x.amount)).toEqual([100, -30, -10, -5, -25, -15]);
+    expect(c.remit.cumulativeProfit()).toBe(15);
     c.db.close();
   });
 

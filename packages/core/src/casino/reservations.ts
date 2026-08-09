@@ -21,6 +21,7 @@ export interface ReservationRow {
   game: string;
   userId: string;
   createdAt: number;
+  scope: ReservationScope;
 }
 
 export interface ReservationResult {
@@ -41,6 +42,9 @@ export interface ReservationResult {
   conflictWith?: ReservationRow;
 }
 
+export const RESERVATION_SCOPES = ["transient_game", "persistent_table_fee_refund"] as const;
+export type ReservationScope = (typeof RESERVATION_SCOPES)[number];
+
 /**
  * 同じ鍵で内容の違う予約を取ろうとした（PR5 レビュー指摘）。
  *
@@ -53,7 +57,7 @@ export class ReservationConflictError extends Error {
   constructor(
     readonly key: string,
     readonly existing: ReservationRow,
-    readonly requested: { amount: number; game: string; userId: string },
+    readonly requested: { amount: number; game: string; userId: string; scope: ReservationScope },
   ) {
     super(
       `ERR_RESERVATION_CONFLICT: ${key} は既に ` +
@@ -65,6 +69,15 @@ export class ReservationConflictError extends Error {
 }
 
 export type ReservationInputErrorCode = "ERR_BAD_KEY" | "ERR_BAD_GAME" | "ERR_BAD_USER" | "ERR_BAD_AMOUNT";
+
+interface ReservationDbRow {
+  key: string;
+  amount: number;
+  game: string;
+  user_id: string;
+  created_at: number;
+  scope: string;
+}
 
 /**
  * 予約APIへの不正な入力（マージ直前レビュー対応）。
@@ -101,10 +114,19 @@ export class HouseReservations {
         amount     INTEGER NOT NULL CHECK(amount > 0),
         game       TEXT    NOT NULL,
         user_id    TEXT    NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        scope      TEXT    NOT NULL DEFAULT 'transient_game'
+                   CHECK(scope IN ('transient_game','persistent_table_fee_refund'))
       );
       CREATE INDEX IF NOT EXISTS idx_casino_reservations_created ON casino_house_reservations(created_at);
     `);
+    this.addColumnIfMissing("casino_house_reservations", "scope", "TEXT NOT NULL DEFAULT 'transient_game'");
+  }
+
+  private addColumnIfMissing(table: string, column: string, spec: string): void {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (cols.some((c) => c.name === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${spec}`);
   }
 
   /**
@@ -116,6 +138,7 @@ export class HouseReservations {
    * 超えていれば `available()` 計算が信用できないので、丸めず例外にする。
    */
   totalReserved(): number {
+    this.list();
     const row = this.db.prepare("SELECT COALESCE(SUM(amount), 0) AS total FROM casino_house_reservations").get() as {
       total: number;
     };
@@ -172,10 +195,11 @@ export class HouseReservations {
    *
    * @returns 取れたかどうか、実際に保存されている予約、取れなかった場合の現在の上限
    */
-  reserve(key: string, amount: number, game: string, userId: string): ReservationResult {
+  reserve(key: string, amount: number, game: string, userId: string, scope: ReservationScope = "transient_game"): ReservationResult {
     if (typeof key !== "string" || !key.trim()) throw new ReservationInputError("ERR_BAD_KEY", { key });
     if (typeof game !== "string" || !game.trim()) throw new ReservationInputError("ERR_BAD_GAME", { game });
     if (typeof userId !== "string" || !userId.trim()) throw new ReservationInputError("ERR_BAD_USER", { userId });
+    assertScope(scope);
     // amount=0 も不正入力にする（マージ直前レビュー対応）。
     // 現行の全ゲームは正のbetから最大債務0にはならないので、0はここへ来ない想定。
     // 「本当に債務0」を扱いたい場面が将来出たら、この予約APIを呼ばずに別経路へ分けること
@@ -186,8 +210,8 @@ export class HouseReservations {
       const existing = this.get(key);
       if (existing) {
         // 内容が違うなら冪等成功にしない（同じ鍵で別の債務を名乗らせない）
-        if (existing.amount !== amount || existing.game !== game || existing.userId !== userId) {
-          throw new ReservationConflictError(key, existing, { amount, game, userId });
+        if (existing.amount !== amount || existing.game !== game || existing.userId !== userId || existing.scope !== scope) {
+          throw new ReservationConflictError(key, existing, { amount, game, userId, scope });
         }
         return { ok: true, available: this.available(), row: existing };
       }
@@ -195,9 +219,9 @@ export class HouseReservations {
       if (amount > available) return { ok: false, available, reason: "capacity" };
       this.db
         .prepare(
-          "INSERT INTO casino_house_reservations (key, amount, game, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
+          "INSERT INTO casino_house_reservations (key, amount, game, user_id, created_at, scope) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .run(key, amount, game, userId, now());
+        .run(key, amount, game, userId, now(), scope);
       return { ok: true, available: available - amount, row: this.get(key)! };
     });
     // すでに書き込みトランザクションの中（runGroup の内側）ならそのまま合流する
@@ -221,10 +245,11 @@ export class HouseReservations {
    *
    * @returns 変更後の予約状態。`ok:false` のとき額は一切変わっていない
    */
-  resize(key: string, newAmount: number, game: string, userId: string): ReservationResult {
+  resize(key: string, newAmount: number, game: string, userId: string, scope: ReservationScope = "transient_game"): ReservationResult {
     if (typeof key !== "string" || !key.trim()) throw new ReservationInputError("ERR_BAD_KEY", { key });
     if (typeof game !== "string" || !game.trim()) throw new ReservationInputError("ERR_BAD_GAME", { game });
     if (typeof userId !== "string" || !userId.trim()) throw new ReservationInputError("ERR_BAD_USER", { userId });
+    assertScope(scope);
     if (!Number.isSafeInteger(newAmount) || newAmount < 0) {
       throw new ReservationInputError("ERR_BAD_AMOUNT", { amount: newAmount });
     }
@@ -238,13 +263,13 @@ export class HouseReservations {
         if (newAmount > available) return { ok: false, available, reason: "capacity" };
         this.db
           .prepare(
-            "INSERT INTO casino_house_reservations (key, amount, game, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO casino_house_reservations (key, amount, game, user_id, created_at, scope) VALUES (?, ?, ?, ?, ?, ?)",
           )
-          .run(key, newAmount, game, userId, now());
+          .run(key, newAmount, game, userId, now(), scope);
         return { ok: true, available: available - newAmount, row: this.get(key)! };
       }
-      if (existing.game !== game || existing.userId !== userId) {
-        throw new ReservationConflictError(key, existing, { amount: newAmount, game, userId });
+      if (existing.game !== game || existing.userId !== userId || existing.scope !== scope) {
+        throw new ReservationConflictError(key, existing, { amount: newAmount, game, userId, scope });
       }
       if (newAmount === existing.amount) {
         return { ok: true, available: this.available(), row: existing };
@@ -276,17 +301,13 @@ export class HouseReservations {
   }
 
   get(key: string): ReservationRow | undefined {
-    const row = this.db.prepare("SELECT * FROM casino_house_reservations WHERE key = ?").get(key) as
-      | { key: string; amount: number; game: string; user_id: string; created_at: number }
-      | undefined;
-    return row ? { key: row.key, amount: row.amount, game: row.game, userId: row.user_id, createdAt: row.created_at } : undefined;
+    const row = this.db.prepare("SELECT * FROM casino_house_reservations WHERE key = ?").get(key) as ReservationDbRow | undefined;
+    return row ? parseReservationRow(row) : undefined;
   }
 
   list(): ReservationRow[] {
-    const rows = this.db.prepare("SELECT * FROM casino_house_reservations ORDER BY created_at ASC").all() as Array<{
-      key: string; amount: number; game: string; user_id: string; created_at: number;
-    }>;
-    return rows.map((r) => ({ key: r.key, amount: r.amount, game: r.game, userId: r.user_id, createdAt: r.created_at }));
+    const rows = this.db.prepare("SELECT * FROM casino_house_reservations ORDER BY created_at ASC").all() as ReservationDbRow[];
+    return rows.map(parseReservationRow);
   }
 
   count(): number {
@@ -300,12 +321,17 @@ export class HouseReservations {
    * **消す前に件数と総額を events へ残す**（漏れの傾向を後から見るため）。
    */
   releaseAll(reason: string): { count: number; total: number } {
-    const count = this.count();
-    const total = this.totalReserved();
+    this.list();
+    const row = this.db.prepare("SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS total FROM casino_house_reservations WHERE scope='transient_game'").get() as { count: number; total: number };
+    const count = row.count;
+    const total = row.total;
+    if (!Number.isSafeInteger(count) || !Number.isSafeInteger(total)) {
+      throw new ReservationInputError("ERR_BAD_AMOUNT", { field: "releaseAll", count, total });
+    }
     if (count > 0) {
       this.events.log("casino_reservations_released", { actor: "system", payload: { reason, count, total } });
     }
-    this.db.prepare("DELETE FROM casino_house_reservations").run();
+    this.db.prepare("DELETE FROM casino_house_reservations WHERE scope='transient_game'").run();
     return { count, total };
   }
 
@@ -313,9 +339,9 @@ export class HouseReservations {
   stale(olderThanSec = RESERVATION_STALE_SEC): ReservationRow[] {
     const cutoff = now() - olderThanSec;
     const rows = this.db
-      .prepare("SELECT * FROM casino_house_reservations WHERE created_at < ? ORDER BY created_at ASC")
-      .all(cutoff) as Array<{ key: string; amount: number; game: string; user_id: string; created_at: number }>;
-    return rows.map((r) => ({ key: r.key, amount: r.amount, game: r.game, userId: r.user_id, createdAt: r.created_at }));
+      .prepare("SELECT * FROM casino_house_reservations WHERE scope='transient_game' AND created_at < ? ORDER BY created_at ASC")
+      .all(cutoff) as ReservationDbRow[];
+    return rows.map(parseReservationRow);
   }
 
   /**
@@ -337,4 +363,33 @@ export class HouseReservations {
     tx();
     return { count: rows.length, total, rows };
   }
+}
+
+function assertScope(scope: string): asserts scope is ReservationScope {
+  if (!RESERVATION_SCOPES.includes(scope as ReservationScope)) {
+    throw new ReservationInputError("ERR_BAD_GAME", { field: "scope", scope });
+  }
+}
+
+function parseScope(scope: string): ReservationScope {
+  assertScope(scope);
+  return scope;
+}
+
+function parseReservationRow(row: ReservationDbRow): ReservationRow {
+  if (typeof row.key !== "string" || !row.key.trim()) throw new ReservationInputError("ERR_BAD_KEY", { key: row.key });
+  if (typeof row.game !== "string" || !row.game.trim()) throw new ReservationInputError("ERR_BAD_GAME", { game: row.game });
+  if (typeof row.user_id !== "string" || !row.user_id.trim()) throw new ReservationInputError("ERR_BAD_USER", { userId: row.user_id });
+  if (!Number.isSafeInteger(row.amount) || row.amount <= 0) throw new ReservationInputError("ERR_BAD_AMOUNT", { amount: row.amount });
+  if (!Number.isSafeInteger(row.created_at) || row.created_at < 0) {
+    throw new ReservationInputError("ERR_BAD_AMOUNT", { field: "created_at", createdAt: row.created_at });
+  }
+  return {
+    key: row.key,
+    amount: row.amount,
+    game: row.game,
+    userId: row.user_id,
+    createdAt: row.created_at,
+    scope: parseScope(row.scope),
+  };
 }

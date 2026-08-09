@@ -411,6 +411,42 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "persistent-tables.ts creates this schema only when openingPhase is formal. Participant rows are non-ledger table metadata and are archived/reset with casino_tables in R6.",
   }),
   T({
+    table: "casino_table_disputes",
+    purpose: "Persistent PvP dispute metadata and public resolution state",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "ranked-disputes.ts lazily creates this formal-opening-era dispute workflow table. It contains non-financial table metadata and is reset in R6 before formal opening.",
+  }),
+  T({
+    table: "casino_table_evidence",
+    purpose: "Private evidence references for disputed persistent PvP tables",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "ranked-disputes.ts stores only private-channel evidence references and digests here. Pre-opening rows are non-financial metadata and are reset in R6.",
+  }),
+  T({
+    table: "casino_ranked_match_history",
+    purpose: "Ranked PvP match-history records separate from casino_stats",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "ranked-disputes.ts records unanimous/arbitrated ranked match history without overloading casino_stats. Pre-opening rows are reset in R6.",
+  }),
+  T({
     table: "casino_items",
     purpose: "利用者所持アイテム",
     kind: "optional_feature",
