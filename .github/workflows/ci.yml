@@ -32,23 +32,5 @@ jobs:
       - name: Typecheck (core + bot)
         run: pnpm typecheck
 
-      - name: Core backup targeted
-        run: pnpm --filter @meigokujo/core exec vitest run tests/casino-opening-backup.test.ts tests/casino-opening-production-backup-followup.test.ts
-
-      - name: Core reset targeted
-        run: pnpm --filter @meigokujo/core exec vitest run tests/casino-opening-reset.test.ts tests/casino-opening-plan.test.ts
-
-      - name: Bot opening ops existing
-        run: pnpm --filter @meigokujo/bot exec vitest run tests/casino-opening-ops.test.ts
-
-      - name: Bot initial eligibility followup
-        run: pnpm --filter @meigokujo/bot exec vitest run tests/casino-opening-ops-followup.test.ts -t "initial status=open apply eligibility"
-
-      - name: Bot R3 followup
-        run: pnpm --filter @meigokujo/bot exec vitest run tests/casino-opening-ops-followup.test.ts -t "R3 leaves registry to R6"
-
-      - name: Bot real OpeningReset integration
-        run: pnpm --filter @meigokujo/bot exec vitest run tests/casino-opening-ops-followup.test.ts -t "real integration"
-
-      - name: Bot opening UI/reset targeted
-        run: pnpm --filter @meigokujo/bot exec vitest run tests/casino-opening-ui.test.ts tests/casino-opening-reset.test.ts
+      - name: Run tests
+        run: pnpm -r test
