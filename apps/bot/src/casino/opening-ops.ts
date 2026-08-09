@@ -46,10 +46,9 @@ export function isOpeningOpsCustomId(customId: string): boolean {
 
 export function openingOpsRows(services: Services): ActionRowBuilder<ButtonBuilder>[] {
   const phase = services.chipTx.openingPhase();
-  const configured = readCasinoOpeningConfig(services.settings);
   const execution = currentOpeningExecution(services);
   const terminalFormal = phase === "formal" || currentOpeningVersion(services) === FORMAL_OPENING_VERSION;
-  const settingsDisabled = terminalFormal || configured.ok || execution !== null;
+  const settingsDisabled = settingsEditBlockedReason(services) !== null;
   const executeDisabled = terminalFormal;
 
   return [
@@ -124,7 +123,7 @@ export async function handleOpeningOpsButton(interaction: ButtonInteraction, ser
   if (action === "confirm" && arg) {
     if (!ensureOwner(interaction)) return;
     const plan = services.openingPlanner.dryRun();
-    if (plan.planHash !== arg || plan.blockers.length > 0) {
+    if (plan.planHash !== arg || !isApplyEligiblePreflight(plan)) {
       return void (await interaction.reply({
         content: "Preflight is stale or blocked. Run preflight again before executing formal opening.",
         flags: MessageFlags.Ephemeral,
@@ -151,11 +150,11 @@ export async function handleOpeningOpsModal(interaction: ModalSubmitInteraction,
     const values = parsed.values as Pick<CasinoOpeningConfig, "openingCapital" | "openingHouse" | "openingJackpot" | "openingRelief">;
     const validation = validateOpeningCapital(values);
     if (!validation.ok) return void (await interaction.reply({ content: validation.message, flags: MessageFlags.Ephemeral }));
+    services.settings.delete(CASINO_OPENING_SETTING_KEYS.configured, `user:${interaction.user.id}`);
     services.settings.set(CASINO_OPENING_SETTING_KEYS.capital, values.openingCapital, `user:${interaction.user.id}`);
     services.settings.set(CASINO_OPENING_SETTING_KEYS.house, values.openingHouse, `user:${interaction.user.id}`);
     services.settings.set(CASINO_OPENING_SETTING_KEYS.jackpot, values.openingJackpot, `user:${interaction.user.id}`);
     services.settings.set(CASINO_OPENING_SETTING_KEYS.relief, values.openingRelief, `user:${interaction.user.id}`);
-    services.settings.delete(CASINO_OPENING_SETTING_KEYS.configured, `user:${interaction.user.id}`);
     await interaction.reply({
       content: "Opening capital settings saved as partial input. Configure operational settings to validate and mark configured=true.",
       flags: MessageFlags.Ephemeral,
@@ -174,6 +173,7 @@ export async function handleOpeningOpsModal(interaction: ModalSubmitInteraction,
     const candidate: OpeningConfigWrite = { ...capital.values, ...ops };
     const validation = validateOpeningConfig(candidate);
     if (!validation.ok) return void (await interaction.reply({ content: validation.message, flags: MessageFlags.Ephemeral }));
+    services.settings.delete(CASINO_OPENING_SETTING_KEYS.configured, `user:${interaction.user.id}`);
     writeCasinoOpeningConfig(services.settings, candidate, `user:${interaction.user.id}`);
     const reread = readCasinoOpeningConfig(services.settings);
     if (!reread.ok) {
@@ -214,6 +214,15 @@ function openingOpsModal(): ModalBuilder {
     .addComponents(textInput("minWorkingCapital", "minimum working capital", true), textInput("remitRateBps", "remit rate bps", true));
 }
 
+export function isApplyEligiblePreflight(plan: OpeningPreflightResult): boolean {
+  if (plan.blockers.length === 0) return true;
+  return (
+    plan.blockers.length === 1 &&
+    plan.blockers[0]?.code === "status_not_opening_reset" &&
+    plan.snapshot.casinoStatus === "open"
+  );
+}
+
 function openingApplyModal(planHash: string): ModalBuilder {
   return new ModalBuilder()
     .setCustomId(`${OPS_PREFIX}:apply:${planHash}`)
@@ -239,7 +248,7 @@ function textInput(id: string, label: string, required: boolean): ActionRowBuild
 function renderPreflight(plan: OpeningPreflightResult, actorId: string) {
   const embed = new EmbedBuilder()
     .setTitle("Formal Opening Preflight")
-    .setColor(plan.blockers.length === 0 ? 0x166534 : 0x991b1b)
+    .setColor(isApplyEligiblePreflight(plan) ? 0x166534 : 0x991b1b)
     .setDescription(
       [
         `planHash: \`${plan.planHash}\``,
@@ -260,7 +269,7 @@ function renderPreflight(plan: OpeningPreflightResult, actorId: string) {
       { name: "Protected", value: plan.protectedFindings.slice(0, 10).map((f) => `${f.assetType}:${f.userId}:${f.sourceTable}`).join("\n") || "none", inline: false },
     );
   const components =
-    plan.blockers.length === 0 && actorId === openingOwnerId()
+    isApplyEligiblePreflight(plan) && actorId === openingOwnerId()
       ? [
           new ActionRowBuilder<ButtonBuilder>().addComponents(
             new ButtonBuilder()
@@ -278,7 +287,7 @@ async function runOpeningApply(interaction: ModalSubmitInteraction | ButtonInter
   if (expectedPlanHash) {
     const fresh = services.openingPlanner.dryRun();
     if (fresh.planHash !== expectedPlanHash) return "Plan hash changed after confirmation. Nothing was executed.";
-    if (fresh.blockers.length > 0) return `Preflight is now blocked. Nothing was executed.\n${blockerSummary(fresh.blockers)}`;
+    if (!isApplyEligiblePreflight(fresh)) return `Preflight is now blocked. Nothing was executed.\n${blockerSummary(fresh.blockers)}`;
   }
   try {
     const result = await services.openingReset.apply({
@@ -334,8 +343,6 @@ function openingBackupDir(): string {
 }
 
 function settingsEditBlockedReason(services: Services): string | null {
-  const cfg = readCasinoOpeningConfig(services.settings);
-  if (cfg.ok || cfg.configured) return "Opening settings are already configured; editing is prohibited.";
   if (services.chipTx.openingPhase() !== "pre_reset") return "Opening settings can be edited only before formal opening.";
   if (currentOpeningVersion(services) !== LEGACY_OPENING_VERSION) return "Opening settings can be edited only on legacy_pre_reset.";
   const execution = currentOpeningExecution(services);
@@ -439,7 +446,7 @@ function blockerSummary(blockers: readonly OpeningBlocker[]): string {
   return blockers.slice(0, 12).map((b) => `${b.code}: ${b.message}`.slice(0, 180)).join("\n");
 }
 
-class DiscordTrackedTempVcOpeningExternalAdapter implements OpeningExternalAdapter {
+export class DiscordTrackedTempVcOpeningExternalAdapter implements OpeningExternalAdapter {
   constructor(
     private readonly client: Client,
     private readonly services: Services,
@@ -455,7 +462,6 @@ class DiscordTrackedTempVcOpeningExternalAdapter implements OpeningExternalAdapt
     for (const row of rows) {
       const channel = await this.client.channels.fetch(row.channel_id).catch(() => null);
       if (channel === null) {
-        this.services.takutate.untrack(row.channel_id);
         disabled.push(row.channel_id);
         continue;
       }
@@ -463,7 +469,6 @@ class DiscordTrackedTempVcOpeningExternalAdapter implements OpeningExternalAdapt
         throw new Error(`tracked temp VC target mismatch: ${row.channel_id}`);
       }
       await channel.delete(`formal opening ${request.idempotencyKey}`);
-      this.services.takutate.untrack(row.channel_id);
       disabled.push(row.channel_id);
     }
     const result = { idempotencyKey: request.idempotencyKey, disabledChannelIds: disabled, completedAt: Math.floor(Date.now() / 1000) };
