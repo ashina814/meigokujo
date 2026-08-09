@@ -68,9 +68,12 @@ function fakeServices(opts: {
 
 function resultJson(opts: Parameters<typeof buildSoloResult>[0]) {
   const payload = buildSoloResult(opts);
+  const rows = payload.components!.map((row) => row.toJSON().components);
   return {
     embed: payload.embeds![0]!.toJSON(),
-    buttons: payload.components![0]!.toJSON().components,
+    rows,
+    // 段組みは「続ける/離れる」の分け方であって、押せる操作の並び自体は段をまたいで一列
+    buttons: rows.flat(),
   };
 }
 
@@ -99,9 +102,12 @@ describe("ソロゲーム共通結果UI", () => {
     });
     expect(win.embed.title).toContain("勝ち");
     expect(win.embed.title).toContain("+500 Ld");
-    expect(win.embed.footer?.text).toContain("所持 13,000 Ld");
+    // 所持は本文に出す。フッターの極小灰文字だと肝心の数字が読めない
+    expect(win.embed.description).toContain("所持 **13,000** Ld");
     expect(win.embed.footer?.text).toContain("預け中 777 Ld");
     expect(win.embed.footer?.text).toContain("賭け 500 Ld");
+    // 預け中は所持へ混ぜない
+    expect(win.embed.description).not.toContain("13,777");
     expect(win.embed.footer?.text).not.toContain("13,777 Ld");
 
     expect(resultJson({ services: fakeServices(), userId: "u1", game: "丁半", net: 0, wager: 500, retryBet: 500 }).embed.title).toContain("引き分け");
@@ -117,14 +123,16 @@ describe("ソロゲーム共通結果UI", () => {
     ]) {
       const { embed } = resultJson({ services, userId: "u1", game: "丁半", net: 500, wager: 500, retryBet: 500 });
       expect(embed.title).toContain("+500 Ld");
-      expect(embed.footer?.text).toContain("所持 確認停止");
-      expect(embed.footer?.text).toContain("通常Land");
-      expect(embed.footer?.text).not.toContain("12,500 Ld");
+      // 帳簿が読めていないときに通常Landの額を「所持」として断定しない
+      expect(embed.description).toContain("所持 **確認停止**");
+      expect(embed.description).toContain("通常Land");
+      expect(embed.description).not.toContain("12,500 Ld");
+      expect(embed.description).not.toMatch(/所持 \*\*[\d,]/);
     }
   });
 
   it("結果後アクションは5個・指定順で、retryBetとcustomIdへ反映する", () => {
-    const { buttons } = resultJson({
+    const { buttons, rows } = resultJson({
       services: fakeServices({ land: 1_000, free: 0 }),
       userId: "123456789012345678",
       game: "ブラックジャック",
@@ -133,6 +141,10 @@ describe("ソロゲーム共通結果UI", () => {
       retryBet: 500,
     });
     expect(buttons.map((b) => b.label)).toEqual(["もう一度 500 Ld", "金額を変える", "別の遊び", "ルール", "賭場を出る"]);
+    // 「この卓を続ける」と「この卓から離れる」を段で分ける。
+    // 5つを1行に詰めると折り返し位置がクライアント幅任せになり、
+    // 「別の遊び」の隣に「賭場を出る」が来て誤爆する
+    expect(rows.map((row) => row.length)).toEqual([2, 3]);
     expect(buttons[0]!.custom_id).toBe(retryCustomIdFor("ブラックジャック", 500, "123456789012345678"));
     expect(buttons[1]!.custom_id).toBe(resultAmountCustomId("ブラックジャック", "123456789012345678"));
     expect(buttons[2]!.custom_id).toBe(resultGamesCustomId("123456789012345678"));

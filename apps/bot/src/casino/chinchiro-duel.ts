@@ -14,7 +14,7 @@ import type { CasinoRng } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
-import { C_MAMMON, C_WIN } from "./ui.js";
+import { C_MAMMON, C_WIN, diceInline } from "./ui.js";
 import {
   buildPvpAbort,
   buildPvpInvite,
@@ -34,7 +34,6 @@ import {
  */
 const MAX_ROLLS = 3;
 const REROLL_ON_TIE = 5;
-const DIE_FACES = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"] as const;
 
 type Dice = readonly [number, number, number];
 type Hand =
@@ -93,7 +92,10 @@ function describe(h: Hand): string {
   }
 }
 
-const showDice = (d: Dice) => `${DIE_FACES[d[0]]} ${DIE_FACES[d[1]]} ${DIE_FACES[d[2]]}`;
+// 出目は「<@id>: 6・4・2 → 役」と1行に収める場所でしか使わないので、
+// 賽アート（複数行）ではなく数字表記を使う。
+// 旧実装の `⚀⚁⚂` は Discord にグリフが無く□に潰れていた。
+const showDice = (d: Dice) => diceInline(d);
 
 export async function playChinchiroDuel(
   interaction: PvpInteraction,

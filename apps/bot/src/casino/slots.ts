@@ -37,7 +37,7 @@ import {
   validateBet,
   withExplicitHouseReservation,
 } from "./common.js";
-import { C_MAMMON } from "./ui.js";
+import { C_MAMMON, reelText } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { buildSoloResult } from "./solo-result.js";
 import {
@@ -112,13 +112,13 @@ export function paytableEmbed(): EmbedBuilder {
 }
 
 /**
- * リール表示（枠線で囲む・二重枠で目立たせる）
- * ╔═══╦═══╦═══╗
- * ║ 🦇 ║ 👻 ║ 🔥 ║
- * ╚═══╩═══╩═══╝
+ * リール表示。
+ * 以前は `╔═════╦═════╗` の枠に絵文字を流し込んでいたが、等幅フォントでも
+ * 絵文字の送り幅は罫線1セルの2倍にならず、上下の枠が左右にちぎれていた。
+ * 枠を捨てて `##` 見出しに置く。見出しは絵文字を大きく描画するので、
+ * 枠が無くてもリールとして十分に成立する（ui.ts の reelText を参照）。
  */
-const face = (a: string, b: string, c: string) =>
-  ["╔═════╦═════╦═════╗", `║  ${a}  ║  ${b}  ║  ${c}  ║`, "╚═════╩═════╩═════╝"].join("\n");
+const face = (a: string, b: string, c: string) => reelText([a, b, c]);
 
 function buildSpinEmbed(
   services: Services,
@@ -632,11 +632,18 @@ async function renderSpin(
     retryBet: bet,
     isJackpot: isJp,
     colorOverride: color,
-    description: reelDisplay + (payoutLabel ? `\n\n${payoutLabel}` : "") + (spin.freeSpin && !isFreeSpin ? `\n\n✨ **魂片3つ！フリースピン獲得！** ✨` : ""),
-    sections: [
-      ...(bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : []),
-      { name: "▸ JP", value: `JP ${fmtEther(services.casino.jackpotPool())}${winStreak >= 2 ? ` · 🔥 ${winStreak}連勝` : ""}`, inline: false },
-    ],
+    description: [
+      reelDisplay,
+      payoutLabel,
+      spin.freeSpin && !isFreeSpin ? "✨ **魂片3つ！フリースピン獲得！** ✨" : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+    // JP残高と連勝は「見えていれば嬉しい」程度の情報。フィールドを1枠使う価値はない
+    footerExtra: [`💎 JP ${fmtEther(services.casino.jackpotPool())}`, winStreak >= 2 ? `🔥 ${winStreak}連勝` : ""]
+      .filter(Boolean)
+      .join(" · "),
+    sections: bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : [],
   });
   // 大勝ち速報
   if (won) {

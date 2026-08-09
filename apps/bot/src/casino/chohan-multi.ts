@@ -16,7 +16,7 @@ import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
 import { collectStakes, settleProportional, stakeFailureText, voidPvpTable } from "./pvp-common.js";
-import { C_LOSE, C_MAMMON, C_WIN, E, boxDice, buildLobbyEmbed, fmtBigDelta } from "./ui.js";
+import { C_LOSE, C_MAMMON, C_WIN, E, buildLobbyEmbed, diceBlock, diceInline, fmtBigDelta } from "./ui.js";
 
 /**
  * 🎴 多人数丁半（casino-bot /丁半 PvP 準拠）。
@@ -260,7 +260,9 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · 多人数丁半" })
     .setColor(C_WIN)
-    .setTitle(`🎴  ${resultLabel}  ·  ${boxDice([d1, d2])}  =  ${total}`)
+    // 賽アートは複数行なのでタイトルに入らない。タイトルは出目の要約、盤面は description へ
+    .setTitle(`🎴  ${resultLabel}  ·  ${diceInline([d1, d2])}  =  ${total}`)
+    .setDescription(diceBlock([d1, d2]))
     .addFields(
       { name: `${E.win} 勝ち側  ${winners.length}人`, value: winnerLines || "（なし）", inline: false },
       { name: `${E.lose} 負け側  ${losers.length}人`, value: loserLines || "（なし）", inline: false },

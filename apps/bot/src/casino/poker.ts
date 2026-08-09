@@ -21,7 +21,7 @@ import {
   withHouseReservation,
 } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
-import { C_JACKPOT, C_MAMMON, E, HR_THIN, fmtBigDelta } from "./ui.js";
+import { C_JACKPOT, C_MAMMON, E, fmtBigDelta, handHeadline, handText } from "./ui.js";
 import { buildSoloResult } from "./solo-result.js";
 import {
   casinoPlayContext,
@@ -207,20 +207,24 @@ async function runRoundInner(
   const held = new Set<number>();
 
   const buildEmbed = (phase: "draw" | "reveal", finalEval?: HandEval) => {
-    const cardsLine = hand.map((c, i) => (held.has(i) ? `[**${showCard(c)}**]` : `[${showCard(c)}]`)).join("  ");
     const heldCount = held.size;
+    // 手札は結果画面と同じ見出しサイズで出し、`[ ]` の囲みは外す。
+    // 囲みは保持/非保持を示していたが、ボタンの色と重複していて読みにくかった。
+    const heldSummary = heldCount === 0
+      ? "🔓 保持なし（5枚すべて交換）"
+      : `🔒 保持 ${handText(hand.filter((_, i) => held.has(i)).map(showCard))}`;
     return new EmbedBuilder()
       .setAuthor({ name: "マモンの賭場 · ポーカー" })
       .setColor(C_MAMMON)
       .setTitle(`🃏  ドロー  ·  保持 ${heldCount}枚 / 交換 ${5 - heldCount}枚`)
       .setDescription(
         [
-          cardsLine,
-          HR_THIN,
+          handHeadline(hand.map(showCard)),
+          phase === "draw" ? heldSummary : "",
           phase === "draw"
-            ? "保持したい札のボタンを押す（再押しで解除）→ **交換** で確定"
+            ? "残したい札のボタンを押す（再押しで解除）→ **交換** で確定"
             : finalEval
-              ? `**${finalEval.label}**  ·  配当倍率 **×${finalEval.payMult}**`
+              ? `**${finalEval.label}**　·　配当倍率 **×${finalEval.payMult}**`
               : "",
         ]
           .filter(Boolean)
@@ -336,10 +340,11 @@ async function runRoundInner(
     wager: bet,
     retryBet: bet,
     isJackpot: isJp,
-    sections: [
-      { name: "🃏 手札", value: hand.map((c) => `[${showCard(c)}]`).join("  "), inline: false },
-      { name: `🏆 ${ev.label}  ·  配当倍率 ×${ev.payMult}`, value: bonusBits.length > 0 ? bonusBits.join("\n") : "─", inline: false },
-    ],
+    // 手札と役は「盤面」なので description に置く。
+    // 以前は役を field の name に、加算・控除を value に押し込んでいて、
+    // 加算が無いときに value 必須を埋めるための `─` が謎の記号として出ていた。
+    description: [handHeadline(hand.map(showCard)), `🏆 **${ev.label}**　·　配当倍率 **×${ev.payMult}**`].join("\n"),
+    sections: bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : [],
   });
   const resultEmbed = resultPayload.embeds![0] as EmbedBuilder;
   if (isJp) {

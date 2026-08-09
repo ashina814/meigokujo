@@ -25,7 +25,7 @@ import {
   validateBet,
   withHouseReservation,
 } from "./common.js";
-import { C_MAMMON, C_WIN } from "./ui.js";
+import { C_MAMMON, C_WIN, h2 } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { buildSoloResult } from "./solo-result.js";
 import {
@@ -68,11 +68,17 @@ export function cashOutMultiplier(elapsedMs: number, crashPoint: number): number
   return Math.max(1.0, floored);
 }
 
+/**
+ * 上昇バー。**コードブロックには入れない**。
+ * 以前は `▰` と `😈` と `・` を混ぜてコードブロックに入れていたが、3つとも
+ * 送り幅が違うので倍率が上がるたびにバーの右端が伸び縮みしていた。
+ * 塗り/空きを同じ字幅の `▰`/`▱` で揃えれば、通常テキストのままでも安定する。
+ */
 function progressBar(mult: number): string {
   const steps = 15;
   const progress = Math.min(1, Math.log10(mult) / 1.5);
   const filled = Math.floor(progress * steps);
-  return "▰".repeat(filled) + "😈" + "・".repeat(Math.max(0, steps - filled));
+  return `${"▰".repeat(filled)}😈${"▱".repeat(Math.max(0, steps - filled))}`;
 }
 
 export function paytableEmbed(): EmbedBuilder {
@@ -175,9 +181,8 @@ async function runRoundInner(
       .setTitle(`📈  ${multi.toFixed(2)}x   ${canCashOut ? "🟢" : "🔒"}`)
       .setDescription(
         [
-          "```",
           progressBar(multi),
-          "```",
+          "",
           canCashOut
             ? `**降りる → ${fmtEther(currentValue)}** で確定`
             : `⛓ 最低降車 **${MIN_CASHOUT.toFixed(2)}x** まで降りれない`,
@@ -272,7 +277,6 @@ async function runRoundInner(
       source: playContext.source,
     });
     const amulet = { note: settled.amuletNote };
-    const netStr = `+${settled.net.toLocaleString("ja-JP")} Ld`;
     const bigWin = settled.net >= bet * 5;
     const bonusBits: string[] = [];
     if (settled.chainBonus > 0) bonusBits.push(`${settled.chainLabel} 連鎖 ×${settled.chainMult.toFixed(2)}（${settled.chainStreak}連勝）  +${fmtEther(settled.chainBonus)}`);
@@ -288,12 +292,7 @@ async function runRoundInner(
       retryBet: bet,
       titleOverride: bigWin ? "🔥 大勝ち" : "🟢 勝ち",
       colorOverride: bigWin ? 0x16a34a : C_WIN,
-      description:
-        [
-          "```",
-          `離脱  ${cashOutMul.toFixed(2)}x   （崩壊 ${crashPoint.toFixed(2)}x）`,
-          "```",
-        ].join("\n"),
+      description: [h2(`📈 ${cashOutMul.toFixed(2)}x で離脱`), `崩壊は **${crashPoint.toFixed(2)}x** だった`].join("\n"),
       sections: bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : [],
     });
     await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
@@ -314,7 +313,6 @@ async function runRoundInner(
     });
     const lossAmulet = { payout: lossSettled.payout, note: lossSettled.amuletNote };
     const savedByAmulet = lossAmulet.payout > 0;
-    const netStr = savedByAmulet ? `±0 Ld` : `−${bet.toLocaleString("ja-JP")} Ld`;
 
     resultPayload = buildSoloResult({
       services,
@@ -325,15 +323,9 @@ async function runRoundInner(
       retryBet: bet,
       titleOverride: savedByAmulet ? "⚪ 引き分け" : "🔴 負け",
       colorOverride: savedByAmulet ? 0x78716c : 0x450a0a,
-      description:
-        [
-          "```",
-          `崩壊  ${crashPoint.toFixed(2)}x`,
-          "```",
-          savedByAmulet ? `✨ ${lossAmulet.note ?? "お守りで返金"}` : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
+      description: [h2(`💥 ${crashPoint.toFixed(2)}x で崩壊`), savedByAmulet ? `✨ ${lossAmulet.note ?? "お守りで返金"}` : ""]
+        .filter(Boolean)
+        .join("\n"),
     });
     await reply.edit({ embeds: resultPayload.embeds, components: resultPayload.components }).catch(() => undefined);
   }

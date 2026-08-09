@@ -20,7 +20,7 @@ import {
   validateBet,
   withHouseReservation,
 } from "./common.js";
-import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
+import { C_MAMMON, C_WIN, C_LOSE, diceBlock, diceHiddenArt } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { buildSoloResult } from "./solo-result.js";
 import {
@@ -39,7 +39,6 @@ import {
  * - 15秒無操作は賭け金返却
  */
 // 配当倍率は core の CHOHAN_PAYOUT を唯一の真実源として使う（表示配当表・実払戻・RTPテストが一致）
-const DIE = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"] as const;
 
 function rollDice(rng: CasinoRng): [number, number] {
   return [rng.int(1, 6), rng.int(1, 6)];
@@ -126,8 +125,10 @@ async function runRoundInner(
     .setTitle("🎴  丁 か 半 か")
     .setDescription(
       [
-        "壺の中で二賽が転がる。",
-        "**丁（偶数）** か **半（奇数）** か——15秒以内に選べ。",
+        "```",
+        diceHiddenArt(2),
+        "```",
+        "壺の中で二賽が転がる。**丁（偶数）** か **半（奇数）** か——15秒以内に選べ。",
       ].join("\n"),
     )
     .setFooter({ text: `賭け ${fmtEther(bet).replace(" Ld", "Ld")}` });
@@ -176,15 +177,7 @@ async function runRoundInner(
       .setAuthor({ name: "マモンの賭場 · 丁半" })
       .setColor(C_MAMMON)
       .setTitle(`🎴  壺を振る……  ${"・".repeat(frame + 1)}`)
-      .setDescription(
-        [
-          "```",
-          `╭─────╮   ╭─────╮`,
-          `│  ${DIE[d1]}  │   │  ${DIE[d2]}  │`,
-          `╰─────╯   ╰─────╯`,
-          "```",
-        ].join("\n"),
-      )
+      .setDescription(diceBlock([d1, d2]))
       .setFooter({ text: `賭け ${fmtEther(bet).replace(" Ld", "Ld")}` });
   };
   for (let f = 0; f < 3; f++) {
@@ -222,8 +215,8 @@ async function runRoundInner(
   const fukuLine =
     settled.fukuTax > 0 ? `⚖️ 福の重み ${Math.round(settled.fukuRate * 100)}% → ${fmtEther(settled.fukuTax)} 福分け積立` : "";
 
+  // 丁半は「勝ち/負け」より卓の言葉に近い「的中/外れ」で出す
   const tag = won ? "🟢 的中" : settled.net === 0 ? "⚪ 返金（お守り）" : "🔴 外れ";
-  const netStr = settled.net === 0 ? "±0 Ld" : `${settled.net > 0 ? "+" : "−"}${Math.abs(settled.net).toLocaleString("ja-JP")} Ld`;
   const bonusBits: string[] = [];
   if (streakLine) bonusBits.push(streakLine);
   if (fukuLine) bonusBits.push(fukuLine);
@@ -236,16 +229,12 @@ async function runRoundInner(
     net: settled.net,
     wager: bet,
     retryBet: bet,
-    titleOverride: won ? "🟢 勝ち" : settled.net === 0 ? "⚪ 引き分け" : "🔴 負け",
+    titleOverride: tag,
     colorOverride: won ? C_WIN : settled.net === 0 ? 0x78716c : C_LOSE,
     description:
       [
-        "```",
-        `╭─────╮   ╭─────╮`,
-        `│  ${DIE[d1]}  │   │  ${DIE[d2]}  │`,
-        `╰─────╯   ╰─────╯`,
-        "```",
-        `**${d1 + d2}** → **${resultLabel}**   ／   お前の張り: **${playerLabel}**`,
+        diceBlock([d1, d2]),
+        `出目 **${d1 + d2}** → **${resultLabel}**　／　お前の張り **${playerLabel}**`,
       ].join("\n"),
     sections: bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : [],
   });

@@ -406,10 +406,10 @@ export async function playRoulette(
         .setTitle(`🎡  受付中  ·  締切まで ${secondsLeft}秒`)
         .setDescription(
           [
-            "```",
-            `赤・黒・奇数・偶数・大・小  ×  2倍`,
-            `🟢 零                       ×  36倍`,
-            "```",
+            // 絵文字とCJKをコードブロックへ入れると桁が合わない。配当表は普通の行で書く
+            "赤・黒・奇数・偶数・大・小 → **×2倍**",
+            "🟢 零 → **×36倍**",
+            "",
             `*「${Mammon.greeting()}」*`,
           ].join("\n"),
         )

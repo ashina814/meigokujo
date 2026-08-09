@@ -21,7 +21,7 @@ import {
   withHouseReservation,
 } from "./common.js";
 import { broadcastBigWin } from "./bigwin.js";
-import { C_MAMMON, E, HR_THIN, fmtBigDelta } from "./ui.js";
+import { C_MAMMON, E, fmtBigDelta, handHeadline, handText } from "./ui.js";
 import { buildSoloResult } from "./solo-result.js";
 import {
   casinoPlayContext,
@@ -170,7 +170,14 @@ function compareEval(a: HandEval, b: HandEval): number {
   return 0;
 }
 
-const showHand = (hand: Card[], hide = false) => (hide ? hand.map(() => "🂠").join(" ") : hand.map(showCard).join(" "));
+/**
+ * 伏せ札。`🂠`(U+1F0A0) は環境によって豆腐や極小カードになるので使わない。
+ * `▮` なら通常テキストでもボタンでも確実に描画される。
+ */
+const BACK = "▮";
+const backs = (n: number) => handText(Array.from({ length: n }, () => BACK));
+const showHand = (hand: Card[], hide = false) =>
+  hide ? backs(hand.length) : handText(hand.map(showCard));
 
 export function holdemRulesEmbed(): EmbedBuilder {
   return new EmbedBuilder()
@@ -255,11 +262,11 @@ async function runRoundInner(
   const render = (phase: "preflop" | "flop" | "turn" | "river" | "showdown", note?: string) => {
     const board =
       phase === "preflop"
-        ? "🂠 🂠 🂠 🂠 🂠"
+        ? backs(5)
         : phase === "flop"
-          ? `${showHand(flop)}  🂠 🂠`
+          ? `${showHand(flop)}  ${backs(2)}`
           : phase === "turn"
-            ? `${showHand([...flop, turn])} 🂠`
+            ? `${showHand([...flop, turn])}  ${BACK}`
             : showHand([...flop, turn, river]);
     const phaseLabel = {
       preflop: "プリフロップ",
@@ -275,10 +282,11 @@ async function runRoundInner(
       .setTitle(`🃏  ${phaseLabel}  ·  Pot ${fmtEther(pot).replace(" Ld", "Ld")}`)
       .setDescription(
         [
-          `**ボード**   ${board}`,
-          `${E.demon} マモン   ${phase === "showdown" ? showHand(dHand) : "🂠 🂠"}`,
-          `${E.crown} お前     ${showHand(pHand)}`,
-          note ? `${HR_THIN}\n${note}` : "",
+          // 共有札はこの卓の主役なので見出しサイズで。手役は下に通常サイズで並べる
+          handHeadline([board]),
+          `${E.demon} **マモン**　${phase === "showdown" ? showHand(dHand) : backs(2)}`,
+          `${E.crown} **お前**　　${showHand(pHand)}`,
+          note ? `\n${note}` : "",
         ]
           .filter(Boolean)
           .join("\n"),
@@ -404,23 +412,17 @@ async function runRoundInner(
     net: settled.net,
     wager: playerBet,
     retryBet: ante,
-    sections: [
-      { name: "🃏 ボード", value: showHand([...flop, turn, river]), inline: false },
-      {
-        name: "👥 手役",
-        value: [
-          `${E.crown} お前     ${showHand(pHand)}`,
-          `${E.demon} マモン   ${folded ? "🂠 🂠" : showHand(dHand)}`,
-          note,
-        ]
-          .filter(Boolean)
-          .join("\n"),
-        inline: false,
-      },
-      ...(bonusBits.length > 0
-        ? [{ name: "🔥 ボーナス", value: bonusBits.join("\n"), inline: false } as const]
-        : []),
-    ],
+    // 盤面はフィールドに分割せず description にまとめる。
+    // 対戦中の画面と同じ並びのまま結果になるので、目が迷わない
+    description: [
+      handHeadline([showHand([...flop, turn, river])]),
+      `${E.demon} **マモン**　${folded ? backs(2) : showHand(dHand)}`,
+      `${E.crown} **お前**　　${showHand(pHand)}`,
+      note ? `\n${note}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    sections: bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : [],
   });
 
   if (won) {

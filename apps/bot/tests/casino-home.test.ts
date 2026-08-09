@@ -128,7 +128,8 @@ describe("/賭場 ホーム", () => {
 
   it("formal opening では通常Land + 自由チップを所持として表示し、escrowedは別行にする", () => {
     const { embed } = homeJson(fakeServices({ phase: "formal", land: 50_000, free: 12_400, escrowed: 500 }));
-    expect(embed.description).toContain("所持 **62,400 Ld**");
+    // ホームで真っ先に読みたい額なので見出しへ上げる（内訳と同じ字送りだと探す手間が生まれる）
+    expect(embed.description).toContain("## 所持 62,400 Ld");
     expect(embed.description).toContain("預け中 500 Ld");
     expect(embed.description).not.toContain("62,900 Ld");
     expect(embed.footer?.text).toBe("通常Land 50,000 Ld · 自由チップ 12,400 Ld · 預け中 500 Ld");

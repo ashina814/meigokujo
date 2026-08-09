@@ -24,6 +24,7 @@ import {
 import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { buildSoloResult } from "./solo-result.js";
+import { handText } from "./ui.js";
 import {
   casinoPlayContext,
   isCollectorTimeoutError,
@@ -71,8 +72,20 @@ function handValue(hand: Card[]): number {
 }
 
 const showCard = (c: Card) => `${c.suit}${c.rank}`;
+/** 伏せ札は `🂠` だと環境によって幅も色も暴れるので、確実に描ける `▮` を使う */
 const showHand = (hand: Card[], hideSecond = false) =>
-  hand.map((c, i) => (hideSecond && i === 1 ? "🂠" : showCard(c))).join(" ");
+  handText(hand.map((c, i) => (hideSecond && i === 1 ? "▮" : showCard(c))));
+
+/**
+ * 卓の2席。1席1行で、席名・手札・合計をその行に閉じ込める。
+ * かつてコードブロック内で空白を数えて桁を揃えていたが、♥♦ が絵文字として
+ * 描画される環境で崩れていた。行にラベルを持たせれば桁揃え自体が要らない。
+ */
+const seatLines = (dealer: Card[], player: Card[], hideDealer: boolean) =>
+  [
+    `😈 **マモン**　${showHand(dealer, hideDealer)}　合計 **${hideDealer ? "?" : handValue(dealer)}**`,
+    `👤 **お前**　　${showHand(player)}　合計 **${handValue(player)}**`,
+  ].join("\n");
 
 export function paytableEmbed(): EmbedBuilder {
   return new EmbedBuilder()
@@ -175,17 +188,7 @@ async function runRoundInner(
       .setAuthor({ name: "マモンの賭場 · ブラックジャック" })
       .setColor(C_MAMMON)
       .setTitle(`🃏 21 を狙え  ·  賭け ${fmtEther(totalBet)}`)
-      .setDescription(
-        [
-          "```",
-          `😈 マモン    ${showHand(dealer, hideDealer)}`,
-          `           合計 ${hideDealer ? "?" : String(handValue(dealer))}`,
-          "─────────────────────────────",
-          `👤 お前      ${showHand(player)}`,
-          `           合計 ${handValue(player)}`,
-          "```",
-        ].join("\n"),
-      );
+      .setDescription(seatLines(dealer, player, hideDealer));
   };
 
   let reply: Message;
@@ -252,15 +255,7 @@ async function runRoundInner(
       retryBet: bet,
       titleOverride: won ? "🟢 勝ち" : push ? "⚪ 引き分け" : "🔴 負け",
       colorOverride: won ? C_WIN : push ? 0x78716c : C_LOSE,
-      description:
-        [
-          "```",
-          `😈 マモン    ${showHand(dealer)}   合計 ${handValue(dealer)}`,
-          "─────────────────────────────",
-          `👤 お前      ${showHand(player)}   合計 ${handValue(player)}`,
-          "```",
-          note,
-        ].join("\n"),
+      description: [seatLines(dealer, player, false), note].filter(Boolean).join("\n\n"),
       sections: bonusBits.length > 0 ? [{ name: "▸ 加算・控除", value: bonusBits.join("\n"), inline: false }] : [],
     });
 

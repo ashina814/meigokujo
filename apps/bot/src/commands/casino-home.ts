@@ -9,7 +9,7 @@ import {
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { fmtLd } from "../format.js";
-import { C_JACKPOT, C_MAMMON, E } from "../casino/ui.js";
+import { C_JACKPOT, C_MAMMON, E, h2 } from "../casino/ui.js";
 import { checkRetry } from "../casino/common.js";
 import { renderCasinoGameSelect } from "../casino/amount-picker.js";
 import { CASINO_SOLO_GAME_EMOJI, isCasinoSoloGame } from "../casino/games.js";
@@ -173,9 +173,11 @@ function casinoHomeWallet(userId: string, services: Services): { lines: string[]
       footer: "残高合算エラー",
     };
   }
+  // ホームで真っ先に読みたいのは「いくら持っているか」の一点。
+  // 内訳と同じ字送りで並べると探す手間が生まれるので、額だけ見出しへ上げる
   return {
     lines: [
-      `所持 **${fmtLd(wallet.available)}**`,
+      h2(`所持 ${fmtLd(wallet.available)}`),
       wallet.escrowed! > 0 ? `預け中 ${fmtLd(wallet.escrowed!)}` : "",
     ].filter(Boolean),
     footer: `通常Land ${fmtLd(wallet.land)} · 自由チップ ${fmtLd(wallet.freeChips!)} · 預け中 ${fmtLd(wallet.escrowed!)}`,

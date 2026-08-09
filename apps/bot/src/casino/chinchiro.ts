@@ -39,7 +39,7 @@ import {
   validateBet,
   withHouseReservation,
 } from "./common.js";
-import { C_MAMMON, C_WIN, C_LOSE } from "./ui.js";
+import { C_MAMMON, C_WIN, C_LOSE, diceBlock, diceHiddenArt } from "./ui.js";
 import { broadcastBigWin } from "./bigwin.js";
 import { buildSoloResult } from "./solo-result.js";
 import {
@@ -69,7 +69,6 @@ import {
  */
 const MAX_ROLLS = CHINCHIRO_MAX_ROLLS;
 const ROLL_BUTTON_TIMEOUT_MS = 30_000;
-const DIE_FACES = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"] as const;
 /** テーブルリミット判定用の最大払戻倍率。core のモデルから逆算する（写さない） */
 const MAX_MULT = chinchiroMaxPayout(1_000_000) / 1_000_000;
 
@@ -179,8 +178,18 @@ export function settleChinchiroRound(
 }
 
 const isTerminal = chinchiroIsTerminal;
-/** 壺の中に転がる三賽を等幅で並べる（原作準拠の見せ方より視認性重視） */
-const diceDisplay = (d: Dice) => `╭─────╮  ╭─────╮  ╭─────╮\n│  ${DIE_FACES[d[0]]}  │  │  ${DIE_FACES[d[1]]}  │  │  ${DIE_FACES[d[2]]}  │\n╰─────╯  ╰─────╯  ╰─────╯`;
+
+/**
+ * 片側の出目を「見出し（通常テキスト）＋ 賽アート（コードブロック）」で組む。
+ * 賽アートは複数行なので `あなた: ${art}` のように行の途中へ埋め込んではいけない
+ * （2行目以降が行頭に落ちて崩れる）。必ずこの関数を通す。
+ */
+const diceSide = (label: string, dice: Dice, note?: string): string =>
+  [`**${label}**${note ? `　—　${note}` : ""}`, diceBlock(dice)].join("\n");
+
+/** まだ振っていない側。開示後と同じ寸法なのでレイアウトが跳ねない */
+const diceSideHidden = (label: string): string =>
+  [`**${label}**`, "```", diceHiddenArt(3), "```"].join("\n");
 
 export function paytableEmbed(): EmbedBuilder {
   return new EmbedBuilder()
@@ -217,14 +226,7 @@ async function shakeAnimation(reply: Message, header: string[], bet: number, rol
       .setAuthor({ name: "マモンの賭場 · チンチロ" })
       .setColor(C_MAMMON)
       .setTitle(`🎲  壺を振る……  ${"・".repeat(f + 1)}`)
-      .setDescription(
-        [
-          ...header,
-          "```",
-          diceDisplay(shake),
-          "```",
-        ].join("\n"),
-      )
+      .setDescription([...header, diceBlock(shake)].join("\n"))
       .setFooter({ text: `第${rollNo}投 · 残り${remaining} · 賭け ${fmtEther(bet).replace(" Ld", "Ld")}` });
     await reply.edit({ embeds: [e], components: [] }).catch(() => undefined);
     await sleep(220);
@@ -432,7 +434,13 @@ async function runRoundInner(
               new EmbedBuilder()
                 .setTitle("🎲 チンチロ")
                 .setColor(C_MAMMON)
-                .setDescription([describe(playerHand), "", diceDisplay(playerDice), "", `第${rollNo}投 → 自動で再振り…（残り${playerMaxRolls - rollNo}）`].join("\n")),
+                .setDescription(
+                  [
+                    diceBlock(playerDice),
+                    describe(playerHand),
+                    `第${rollNo}投 → 自動で再振り…（残り${playerMaxRolls - rollNo}）`,
+                  ].join("\n"),
+                ),
             ],
             components: [],
           })
@@ -461,9 +469,8 @@ async function runRoundInner(
         .setColor(C_MAMMON)
         .setDescription(
           [
+            diceBlock(playerDice),
             describe(playerHand),
-            "",
-            diceDisplay(playerDice),
             "",
             `**止めるか、もう一度振るか…**（残り ${playerMaxRolls - rollNo}回）`,
             rerollGranted ? "✨ 二度振りの権が効いている（+1投）" : "",
@@ -521,12 +528,7 @@ async function runRoundInner(
           .setTitle("🎲 チンチロ — マモンの番")
           .setColor(C_MAMMON)
           .setDescription(
-            [
-              `あなた: ${diceDisplay(playerDice)}`,
-              `　└ ${describe(playerHand)}`,
-              "",
-              "マモン: ┃ ❓ ┃ ❓ ❓ ❓ ┃",
-            ].join("\n"),
+            [diceSide("あなた", playerDice, describe(playerHand)), diceSideHidden("マモン")].join("\n"),
           ),
       ],
       components: [],
@@ -544,10 +546,8 @@ async function runRoundInner(
         .setColor(C_MAMMON)
         .setDescription(
           [
-            `あなた: ${diceDisplay(playerDice)}`,
-            `　└ ${describe(playerHand)}`,
-            "",
-            `マモン: ${diceDisplay(shake)}`,
+            diceSide("あなた", playerDice, describe(playerHand)),
+            diceSide("マモン", shake),
             `第${rollNo}投（残り${MAX_ROLLS - rollNo + 1}）`,
           ].join("\n"),
         );
@@ -565,11 +565,8 @@ async function runRoundInner(
             .setColor(C_MAMMON)
             .setDescription(
               [
-                `あなた: ${diceDisplay(playerDice)}`,
-                `　└ ${describe(playerHand)}`,
-                "",
-                `マモン: ${diceDisplay(dealerDice)}`,
-                `　└ ${describe(dealerHand)}`,
+                diceSide("あなた", playerDice, describe(playerHand)),
+                diceSide("マモン", dealerDice, describe(dealerHand)),
               ].join("\n"),
             ),
         ],
@@ -627,15 +624,8 @@ async function runRoundInner(
   const resultLabel =
     cmp.result === "player_win" ? "✨ **お前の勝ち！**" : cmp.result === "push" ? "🌀 **プッシュ**" : "😈 **マモンの勝ち**";
   const comparison = [
-    "┌─ お前 ────────────┐",
-    `│ ${diceDisplay(playerDice)}`,
-    `│ ${describe(playerHand)}`,
-    "└──────────────────┘",
-    "┌─ マモン ──────────┐",
-    `│ ${diceDisplay(dealerDice)}`,
-    `│ ${describe(dealerHand)}`,
-    "└──────────────────┘",
-    "",
+    diceSide("お前", playerDice, describe(playerHand)),
+    diceSide("マモン", dealerDice, describe(dealerHand)),
     resultLabel,
   ].join("\n");
 
