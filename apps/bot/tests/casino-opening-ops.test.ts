@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { ChannelType, MessageFlags, type ButtonInteraction, type ModalSubmitInteraction } from "discord.js";
+import { ChannelType, MessageFlags, RESTJSONErrorCodes, type ButtonInteraction, type ModalSubmitInteraction } from "discord.js";
 import {
   CASINO_OPENING_SETTING_KEYS,
   FORMAL_OPENING_VERSION,
@@ -249,7 +249,10 @@ describe("casino opening ops preflight and apply", () => {
       guildId: "guild-1",
       delete: deleteChannel,
     };
-    const fetch = vi.fn().mockResolvedValueOnce(liveChannel).mockResolvedValueOnce(null);
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(liveChannel)
+      .mockRejectedValueOnce({ code: RESTJSONErrorCodes.UnknownChannel });
     const client = { channels: { fetch } };
     const apply = vi.fn(async (input: any) => {
       expect(input.actorId).toBe(config.ownerId);
@@ -260,6 +263,8 @@ describe("casino opening ops preflight and apply", () => {
       expect(first).toMatchObject({ idempotencyKey: "external-1", disabledChannelIds: ["vc-1"] });
       expect(second).toMatchObject({ idempotencyKey: "external-1", disabledChannelIds: ["vc-1"] });
       expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenNthCalledWith(1, "vc-1", { force: true });
+      expect(fetch).toHaveBeenNthCalledWith(2, "vc-1", { force: true });
       expect(deleteChannel).toHaveBeenCalledTimes(1);
 
       return {
