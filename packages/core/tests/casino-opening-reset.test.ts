@@ -149,6 +149,15 @@ describe("OpeningReset.apply — 正常系", () => {
       .prepare("INSERT INTO casino_home_preferences (user_id, last_game, last_amount, updated_at) VALUES (?, ?, ?, ?)")
       .run("alice", "スロット", 100, 1);
     ctx.db.exec(`
+      CREATE TABLE IF NOT EXISTS casino_nagareboshi (
+        user_id TEXT NOT NULL,
+        day_key TEXT NOT NULL,
+        count   INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, day_key)
+      );
+    `);
+    ctx.db.prepare("INSERT INTO casino_nagareboshi (user_id, day_key, count) VALUES ('alice', '2026-08-09', 3)").run();
+    ctx.db.exec(`
       CREATE TABLE IF NOT EXISTS casino_metric_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_key TEXT NOT NULL UNIQUE,
@@ -224,6 +233,7 @@ describe("OpeningReset.apply — 正常系", () => {
     expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_tx").get() as { n: number }).n).toBe(0);
     expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_tx_groups").get() as { n: number }).n).toBe(0);
     expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_home_preferences").get() as { n: number }).n).toBe(0);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_nagareboshi").get() as { n: number }).n).toBe(0);
 
     // 版はopening_v1、賭場はopen
     expect(ctx.chipTx.currentVersion()).toBe(FORMAL_OPENING_VERSION);
