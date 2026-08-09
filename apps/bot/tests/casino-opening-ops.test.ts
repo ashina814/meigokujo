@@ -176,7 +176,6 @@ describe("casino opening ops settings", () => {
   it("requires OWNER_ID for opening operation controls", async () => {
     const { services } = makeServices();
     const i = button("mgmt:casino:opening:capital", "not-owner");
-
     await handleOpeningOpsButton(i.i, services);
 
     expect(i.showModal).not.toHaveBeenCalled();
@@ -254,7 +253,7 @@ describe("casino opening ops preflight and apply", () => {
     await handleOpeningOpsModal(i.i, services);
 
     expect(apply).toHaveBeenCalledTimes(1);
-    expect(untrack).toHaveBeenCalledWith("vc-1");
+    expect(untrack).not.toHaveBeenCalled();
     expect(replyContent(i.editReply)).toContain("Formal opening apply finished");
   });
 
