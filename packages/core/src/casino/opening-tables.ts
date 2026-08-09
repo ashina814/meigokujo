@@ -387,6 +387,30 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "Daily aggregate analytics derived from raw/formal chip records. Old metrics are not carried across formal opening.",
   }),
   T({
+    table: "casino_tables",
+    purpose: "Formal-opening-era persistent PvP table state",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "persistent-tables.ts creates this schema only when openingPhase is formal. If rows exist before formal opening, they are invalid pre-opening casino metadata and are archived/reset in R6 rather than preserved.",
+  }),
+  T({
+    table: "casino_table_participants",
+    purpose: "Formal-opening-era persistent PvP table participants",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "persistent-tables.ts creates this schema only when openingPhase is formal. Participant rows are non-ledger table metadata and are archived/reset with casino_tables in R6.",
+  }),
+  T({
     table: "casino_items",
     purpose: "利用者所持アイテム",
     kind: "optional_feature",

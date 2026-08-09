@@ -43,10 +43,12 @@ import {
   Vip,
   Markets,
   MARKET_FINALIZER,
+  PersistentTables,
   Takutate,
   Escrow,
   CasinoChipAssets,
   CasinoChipFlow,
+  type PersistentTableRestoreResult,
   defaultRng,
   openDb,
   registerDefaultTxTypes,
@@ -197,6 +199,7 @@ export function buildServices() {
     }
   }
   const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
+  const persistentTables = new PersistentTables(db, events, { openingPhase: () => chipTx.openingPhase() });
   const chipAssets = new CasinoChipAssets(db, chips);
   // 所有判定の正本をここで一本化する。プロセス内の着席は DB のどの表にも
   // 現れないので、渡さないとショップの域外確認票がゲーム中の自由チップを
@@ -212,21 +215,36 @@ export function buildServices() {
   // その預託は孤児として返金するのが正しい）。PR20 で対人卓を同じ形で足す。
   const recoveryRegistry = new RecoveryRegistry();
   recoveryRegistry.register({ type: "market", listLiveEscrowHolders: () => markets.liveEscrowHolders() });
-  logRecovery(
-    recoverCasino({ db, status: casinoStatus, integrity: casinoIntegrity, chipTx, escrow, reservations, registry: recoveryRegistry, events, chipFlow }),
-  );
+  recoveryRegistry.register({ type: "table", listLiveEscrowHolders: () => persistentTables.liveEscrowHolders() });
   // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
   // 資金を動かす経路は `chips` に一本化した（PR8監査・項目12）。`ether` は
   // 旧名称で書かれた外部プラグイン・古い呼び出しが**読むだけ**なら壊れないように
   // 残す互換窓で、型を `ChipReadonlyView` に狭めてある（下の注釈参照）。
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, persistentTables, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;
 }
 
 export type Services = ReturnType<typeof buildServices>;
+
+export function runCasinoRecovery(services: Services, persistentTableRestore?: PersistentTableRestoreResult) {
+  const result = recoverCasino({
+    db: services.db,
+    status: services.casinoStatus,
+    integrity: services.casinoIntegrity,
+    chipTx: services.chipTx,
+    escrow: services.escrow,
+    reservations: services.reservations,
+    registry: services.recoveryRegistry,
+    events: services.events,
+    chipFlow: services.chipFlow,
+    persistentTableRestore,
+  });
+  logRecovery(result);
+  return result;
+}
 
 /**
  * 起動・復旧の結果をログへ出す（PR7）。

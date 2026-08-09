@@ -93,6 +93,15 @@ export interface RecoverCasinoDeps {
   events: EventLog;
   /** PR10 S10. Required so startup can never silently skip free-chip redemption. */
   chipFlow: CasinoChipFlow;
+  /** PR20 S11. The bot restores durable table messages before S12 can reopen the casino. */
+  persistentTableRestore?: PersistentTableRestoreResult;
+}
+
+export interface PersistentTableRestoreResult {
+  restored: number;
+  replaced: number;
+  disputed: number;
+  failed: Array<{ tableId: string; error: string }>;
 }
 
 export interface RecoverCasinoResult {
@@ -162,7 +171,7 @@ export interface RecoverCasinoResult {
  * 「所有元が確実に存在しない」と証明できた場合だけ。
  */
 export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
-  const { status, integrity, chipTx, escrow, reservations, registry, events, chipFlow } = deps;
+  const { status, integrity, chipTx, escrow, reservations, registry, events, chipFlow, persistentTableRestore } = deps;
   const steps: string[] = [];
   const empty: Omit<RecoverCasinoResult, "outcome" | "steps" | "reason"> = {
     keptHolders: 0,
@@ -327,6 +336,21 @@ export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
         payload: { steps, reason, reservationsReleased: false },
       });
       return { outcome: "source_failed", steps, ...summary, reason };
+    }
+
+    if (persistentTableRestore) {
+      steps.push("S11:persistent_table_restore");
+      if (persistentTableRestore.failed.length > 0) {
+        const reason =
+          `S11 persistent table restore failed: ${persistentTableRestore.failed.length} table(s): ` +
+          persistentTableRestore.failed.map((f) => `${f.tableId}: ${f.error}`).join(", ");
+        events.log("casino_recovery_halted", {
+          actor: "system:recovery",
+          payload: { steps, reason, persistentTableRestore },
+        });
+        status.haltForRecovery(recoveringFromHalt ? appendReason(held.reason, reason) : reason);
+        return { outcome: "source_failed", steps, ...summary, reason };
+      }
     }
 
     // 掃除のあとに**全点検（A〜D）**を常に実行する（診断のため）。ここで初めて C・D まで見る。
