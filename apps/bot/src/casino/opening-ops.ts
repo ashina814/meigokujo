@@ -453,10 +453,6 @@ export class DiscordTrackedTempVcOpeningExternalAdapter implements OpeningExtern
   ) {}
 
   async disableLegacyCasino(request: OpeningExternalDisableLegacyRequest): Promise<OpeningExternalDisableLegacyResult> {
-    const settingKey = `casino_opening_external:${request.idempotencyKey}`;
-    const cached = this.services.settings.getJson<OpeningExternalDisableLegacyResult | null>(settingKey, null);
-    if (cached?.idempotencyKey === request.idempotencyKey) return cached;
-
     const rows = this.services.takutate.list();
     const disabled: string[] = [];
     for (const row of rows) {
@@ -471,8 +467,10 @@ export class DiscordTrackedTempVcOpeningExternalAdapter implements OpeningExtern
       await channel.delete(`formal opening ${request.idempotencyKey}`);
       disabled.push(row.channel_id);
     }
-    const result = { idempotencyKey: request.idempotencyKey, disabledChannelIds: disabled, completedAt: Math.floor(Date.now() / 1000) };
-    this.services.settings.set(settingKey, result, "system:casino-opening");
-    return result;
+    return {
+      idempotencyKey: request.idempotencyKey,
+      disabledChannelIds: disabled,
+      completedAt: Math.floor(Date.now() / 1000),
+    };
   }
 }
