@@ -33,7 +33,7 @@ import {
   type OpeningExternalDisableLegacyResult,
   type OpeningPreflightResult,
 } from "@meigokujo/core";
-import { ChannelType } from "discord.js";
+import { ChannelType, RESTJSONErrorCodes } from "discord.js";
 import { fmtLd } from "../format.js";
 import type { Services } from "../services.js";
 
@@ -446,6 +446,15 @@ function blockerSummary(blockers: readonly OpeningBlocker[]): string {
   return blockers.slice(0, 12).map((b) => `${b.code}: ${b.message}`.slice(0, 180)).join("\n");
 }
 
+function isUnknownChannelError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === RESTJSONErrorCodes.UnknownChannel
+  );
+}
+
 export class DiscordTrackedTempVcOpeningExternalAdapter implements OpeningExternalAdapter {
   constructor(
     private readonly client: Client,
@@ -456,15 +465,27 @@ export class DiscordTrackedTempVcOpeningExternalAdapter implements OpeningExtern
     const rows = this.services.takutate.list();
     const disabled: string[] = [];
     for (const row of rows) {
-      const channel = await this.client.channels.fetch(row.channel_id).catch(() => null);
+      let channel;
+      try {
+        channel = await this.client.channels.fetch(row.channel_id, { force: true });
+      } catch (error) {
+        if (isUnknownChannelError(error)) {
+          disabled.push(row.channel_id);
+          continue;
+        }
+        throw error;
+      }
       if (channel === null) {
-        disabled.push(row.channel_id);
-        continue;
+        throw new Error(`tracked temp VC fetch returned null without Unknown Channel error: ${row.channel_id}`);
       }
       if (channel.type !== ChannelType.GuildVoice || channel.guildId !== row.guild_id) {
         throw new Error(`tracked temp VC target mismatch: ${row.channel_id}`);
       }
-      await channel.delete(`formal opening ${request.idempotencyKey}`);
+      try {
+        await channel.delete(`formal opening ${request.idempotencyKey}`);
+      } catch (error) {
+        if (!isUnknownChannelError(error)) throw error;
+      }
       disabled.push(row.channel_id);
     }
     return {
