@@ -1,6 +1,6 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { ChannelType, type ButtonInteraction, type ModalSubmitInteraction } from "discord.js";
+import { ChannelType, RESTJSONErrorCodes, type ButtonInteraction, type ModalSubmitInteraction } from "discord.js";
 import {
   Casino,
   CasinoChipAssets,
@@ -284,7 +284,10 @@ describe("PR105 blocker 2: R3 leaves registry to R6", () => {
     const before = ctx.planner.dryRun().planHash;
     const deleteVc = vi.fn().mockResolvedValue(undefined);
     const liveChannel = { type: ChannelType.GuildVoice, guildId: "guild-1", delete: deleteVc };
-    const fetch = vi.fn().mockResolvedValueOnce(liveChannel).mockResolvedValueOnce(null);
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(liveChannel)
+      .mockRejectedValueOnce({ code: RESTJSONErrorCodes.UnknownChannel });
     const adapter = new DiscordTrackedTempVcOpeningExternalAdapter({ channels: { fetch } } as any, ctx.services);
 
     const first = await adapter.disableLegacyCasino({ planHash: before, idempotencyKey: "r3-key" });
@@ -293,21 +296,22 @@ describe("PR105 blocker 2: R3 leaves registry to R6", () => {
     expect(first).toMatchObject({ idempotencyKey: "r3-key", disabledChannelIds: ["vc-1"] });
     expect(second).toMatchObject({ idempotencyKey: "r3-key", disabledChannelIds: ["vc-1"] });
     expect(fetch).toHaveBeenCalledTimes(2);
-    expect(fetch).toHaveBeenNthCalledWith(1, "vc-1");
-    expect(fetch).toHaveBeenNthCalledWith(2, "vc-1");
+    expect(fetch).toHaveBeenNthCalledWith(1, "vc-1", { force: true });
+    expect(fetch).toHaveBeenNthCalledWith(2, "vc-1", { force: true });
     expect(deleteVc).toHaveBeenCalledTimes(1);
     expect(ctx.takutate.isTracked("vc-1")).toBe(true);
     expect(ctx.planner.dryRun().planHash).toBe(before);
   });
 
-  it("tracked VCがDiscord上ですでに無くても成功扱いしregistryをR3で残す", async () => {
+  it("tracked VCがDiscord上ですでに無くてもUnknown Channelだけ成功扱いしregistryをR3で残す", async () => {
     const ctx = realSetup();
-    const fetch = vi.fn().mockResolvedValue(null);
+    const fetch = vi.fn().mockRejectedValue({ code: RESTJSONErrorCodes.UnknownChannel });
     const adapter = new DiscordTrackedTempVcOpeningExternalAdapter({ channels: { fetch } } as any, ctx.services);
 
     await expect(adapter.disableLegacyCasino({ planHash: "missing-vc", idempotencyKey: "missing-key" })).resolves.toMatchObject({
       disabledChannelIds: ["vc-1"],
     });
+    expect(fetch).toHaveBeenCalledWith("vc-1", { force: true });
     expect(ctx.takutate.isTracked("vc-1")).toBe(true);
   });
 });
@@ -343,6 +347,7 @@ describe("PR105 real integration: owner confirm through OpeningReset", () => {
     await handleOpeningOpsModal(submit.interaction, ctx.services);
 
     expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith("vc-1", { force: true });
     expect(deleteVc).toHaveBeenCalledTimes(1);
     expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_temp_vcs").get() as { n: number }).n).toBe(0);
     expect(ctx.chipTx.currentVersion()).toBe(FORMAL_OPENING_VERSION);
