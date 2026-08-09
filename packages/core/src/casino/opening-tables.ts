@@ -531,6 +531,18 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "daily-risk.ts records each exposure operation so replays are detected and a failed collection can be revoked exactly. Non-financial metadata that must not carry pre-opening bindings across formal opening.",
   }),
   T({
+    table: "casino_ranked_profiles",
+    purpose: "Operator-registered trusted rank-distribution profiles for generic ranked tables",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "ranked-profiles.ts stores operator-approved zero-sum rank vectors so casino employees can open generic ranked tables without authoring a payout distribution. It holds no funds; a live table copies its profile into casino_tables at creation, so resetting pre-opening rows in R6 cannot affect any table.",
+  }),
+  T({
     table: "casino_ranked_open_history",
     purpose: "Append-only high-tier ranked-table open history for staged availability/cooldown",
     kind: "optional_feature",

@@ -487,6 +487,24 @@ export class PersistentTables {
     return mapped.filter((row) => PERSISTENT_TABLE_LIVE_STATES.has(row.state));
   }
 
+  /**
+   * 直近の卓を新しい順に返す**読み取り専用**の照会（PR24 の履歴表示用）。
+   *
+   * 状態遷移も資金も触らない。呼び出し側は「何を見せるか」を自分で絞ること
+   * （`disputeReason` / `failureReason` / `recoveryError` は運営向けの内部文言なので、
+   * 従業員向けの履歴には出さない）。
+   */
+  listRecentTables(limit = 20): PersistentTableRow[] {
+    if (this.schemaStateOrThrow() === "none") return [];
+    const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 100) : 20;
+    const rows = this.db
+      .prepare("SELECT * FROM casino_tables ORDER BY created_at DESC, table_id DESC LIMIT ?")
+      .all(safeLimit) as Record<string, unknown>[];
+    const mapped = rows.map(mapTableRow);
+    for (const row of mapped) assertKnownState(row.state);
+    return mapped;
+  }
+
   liveEscrowHolders(): string[] {
     return this.listLiveTables().map((row) => escrowHolderFor(row.tableId));
   }

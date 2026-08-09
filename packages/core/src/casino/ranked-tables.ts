@@ -592,6 +592,61 @@ export class RankedTables {
     return tx.immediate();
   }
 
+  /**
+   * **開始前の卓だけ**を安全に取り消す（PR24）。
+   *
+   * 賭博場従業員の「卓を閉じる」の唯一の入口。中身は既存の募集タイムアウト
+   * （`processDueTables()` の recruiting 分岐）とまったく同じ処理で、
+   * 「参加者へ預託を全額返し、卓を `cancelled` にする」だけ。
+   *
+   * ## 開始後は絶対に通さない
+   *
+   * `playing` / `pending_approval` / `disputed` は資金が確定過程に入っている
+   * （場代が徴収済み、順位の承認待ち、異議対応中）。ここを取り消せるようにすると
+   * 任意返金・強制精算そのものになるので、状態を見て fail-closed で断る。
+   * 開始後の卓に手当てが要るなら PR22 の裁定（`RankedDisputes`）が唯一の経路。
+   *
+   * `recruiting` / `ready_check` では場代はまだ徴収していない（徴収は
+   * ready 完了時の `commitTableFees()`）。したがって全額返金でちょうど純損益0になり、
+   * 日次リスクにも1件も記録しない（正本 §27「pre-start table full refund」）。
+   */
+  cancelBeforeStart(input: { tableId: string; actorId: string; operationId: string; reason?: string }): RankedTableSnapshot {
+    const tableId = requiredString(input.tableId, "tableId");
+    const actorId = requiredString(input.actorId, "actorId");
+    const operationId = requiredString(input.operationId, "operationId");
+    const reason = input.reason === undefined ? "ranked table closed before start" : requiredString(input.reason, "reason", 200);
+    const tx = this.db.transaction((): RankedTableSnapshot => {
+      const table = this.requiredTable(tableId);
+      if (table.state === "cancelled") {
+        // 同じ操作の再試行、または既に閉じ終わっている。二重返金しない
+        return this.snapshot(tableId);
+      }
+      if (table.state !== "recruiting" && table.state !== "ready_check") {
+        throw new RankedTableError("ERR_RANKED_TABLE_NOT_JOINABLE", "ranked table can no longer be closed before start", {
+          tableId,
+          state: table.state,
+        });
+      }
+      const active = this.activeParticipants(tableId);
+      this.escrow.refundMany(tableId, active.map((p) => p.userId), `close_before_start:${operationId}`);
+      this.persistentTables.transition({
+        tableId,
+        from: table.state,
+        to: "cancelled",
+        expectedRevision: table.revision,
+        actor: actorId,
+        reason,
+      });
+      this.events.log("casino_ranked_table_closed_before_start", {
+        actor: actorId,
+        target: tableId,
+        payload: { fromState: table.state, participants: active.length, reason },
+      });
+      return this.snapshot(tableId);
+    });
+    return tx.immediate();
+  }
+
   submitResult(input: SubmitRankedResultInput): RankedTableSnapshot {
     const safeInput = {
       tableId: requiredString(input.tableId, "tableId"),
