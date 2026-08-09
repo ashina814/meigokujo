@@ -283,6 +283,23 @@ describe("起動時の全解放と漏れ検出", () => {
     c.db.close();
   });
 
+  it("releaseAll and stale sweep keep persistent table fee refund reservations", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    c.reservations.reserve("transient", 10_000, "slots", "u1");
+    c.reservations.reserve("fee", 20_000, "ranked_fee_refund", "table:t1", "persistent_table_fee_refund");
+    c.db
+      .prepare("UPDATE casino_house_reservations SET created_at = ?")
+      .run(Math.floor(Date.now() / 1000) - RESERVATION_STALE_SEC - 3600);
+
+    expect(c.reservations.releaseAll("startup")).toEqual({ count: 1, total: 10_000 });
+    expect(c.reservations.get("transient")).toBeUndefined();
+    expect(c.reservations.get("fee")?.scope).toBe("persistent_table_fee_refund");
+    expect(c.reservations.sweepStale()).toEqual({ count: 0, total: 0, rows: [] });
+    expect(c.reservations.get("fee")?.amount).toBe(20_000);
+    c.db.close();
+  });
+
   it("予約が無いときは記録も作らない", () => {
     const c = setup();
     expect(c.reservations.releaseAll("bot 起動")).toEqual({ count: 0, total: 0 });

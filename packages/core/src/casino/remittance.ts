@@ -465,14 +465,17 @@ export class CasinoRemittance {
 
   private reservationState(): { total: number; fingerprint: string } {
     const rows = this.db
-      .prepare("SELECT key, amount, game, user_id, created_at FROM casino_house_reservations ORDER BY key")
-      .all() as Array<{ key: string; amount: number; game: string; user_id: string; created_at: number }>;
+      .prepare("SELECT key, amount, game, user_id, created_at, scope FROM casino_house_reservations ORDER BY key")
+      .all() as Array<{ key: string; amount: number; game: string; user_id: string; created_at: number; scope: string }>;
     for (const row of rows) {
       assertIdentifier(row.key, "reservation.key");
       assertSafePositive(row.amount, "reservation.amount");
       assertIdentifier(row.game, "reservation.game");
       assertIdentifier(row.user_id, "reservation.user_id");
       assertSafeNonNegative(row.created_at, "reservation.created_at");
+      if (row.scope !== "transient_game" && row.scope !== "persistent_table_fee_refund") {
+        throw new CasinoRemittanceError("ERR_CORRUPT_STATE", { field: "reservation.scope", value: row.scope });
+      }
     }
     const total = this.reservations.totalReserved();
     return { total, fingerprint: canonicalHash(rows) };

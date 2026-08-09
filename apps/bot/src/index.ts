@@ -20,6 +20,8 @@ import { replyStocksPaused } from "./casino/stocks-pause.js";
 import { handleKeibaCommand } from "./commands/keiba.js";
 import { handleAnnaiButton, handleAnnaiCommand } from "./commands/annai.js";
 import { handleCasinoHomeButton, handleCasinoHomeCommand } from "./commands/casino-home.js";
+import { handleCasinoEvidenceCommand } from "./commands/casino-evidence.js";
+import { handleCasinoArbitrationCommand } from "./commands/casino-arbitration.js";
 import { handleVipButton, handleVipCommand } from "./commands/vip.js";
 import { handleNagareboshiCommand } from "./commands/nagareboshi.js";
 import {
@@ -200,6 +202,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "賭場":
           await handleCasinoHomeCommand(interaction, services);
+          return;
+        case "賭場証拠":
+          await handleCasinoEvidenceCommand(interaction, services);
+          return;
+        case "casino-arbitration":
+          await handleCasinoArbitrationCommand(interaction, services);
           return;
         case "遊ぶ":
           await handleAsobuCommand(interaction, services);

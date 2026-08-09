@@ -1,7 +1,7 @@
 import { EmbedBuilder, type Client } from "discord.js";
 import { recoverCasinoAsync, type PersistentTableRestoreResult, type PersistentTableRow, type RecoverCasinoResult } from "@meigokujo/core";
 import type { Services } from "../services.js";
-import { renderRankedTable } from "./ranked-table-ui.js";
+import { renderRankedTable, retryPendingRankedTableMessages } from "./ranked-table-ui.js";
 
 const UNKNOWN_MESSAGE = 10008;
 
@@ -18,6 +18,10 @@ export async function recoverCasinoWithPersistentTables(client: Client, services
     chipFlow: services.chipFlow,
     persistentTableRestore: () => restorePersistentTableMessages(client, services),
   });
+  const messageSync = await retryPendingRankedTableMessages(client, services);
+  if (messageSync.attempted > 0) {
+    console.log(`[casino] startup ranked message sync: ${messageSync.synced}/${messageSync.attempted} synced, ${messageSync.failed} pending`);
+  }
   logCasinoRecovery(result);
   return result;
 }
@@ -47,7 +51,7 @@ async function restoreOnePersistentTableMessage(
   table: PersistentTableRow,
 ): Promise<"restored" | "replaced" | "disputed"> {
   if (!table.guildId || !table.channelId || !table.messageId) {
-    services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, "missing Discord message binding");
+    markDisputed(services, table, "missing Discord message binding");
     return "disputed";
   }
 
@@ -59,7 +63,7 @@ async function restoreOnePersistentTableMessage(
   }
 
   if (!isUsableTextChannel(channel) || channel.guildId !== table.guildId) {
-    services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, "Discord channel is missing, non-text, or belongs to a different guild");
+    markDisputed(services, table, "Discord channel is missing, non-text, or belongs to a different guild");
     return "disputed";
   }
 
@@ -98,11 +102,20 @@ function renderPersistentTableRecoveryMessage(services: Services, table: Persist
   const rankedState = rankedStorageState(services, table.tableId);
   if (rankedState === "partial") return markDisputed(services, table, "ranked table storage is partial");
   try {
-    return renderRankedTable(services.rankedTables.snapshot(table.tableId));
+    let dispute = services.rankedDisputes.publicStatus(table.tableId);
+    if (rankedState === "ranked" && table.state === "disputed" && !dispute) {
+      services.rankedDisputes.markDisputedFromRecovery({
+        tableId: table.tableId,
+        expectedRevision: table.revision,
+        reason: boundField(table.recoveryError ?? table.disputeReason ?? "repair missing ranked dispute metadata", 500),
+      });
+      dispute = services.rankedDisputes.publicStatus(table.tableId);
+      if (!dispute) throw new Error("ranked dispute metadata repair did not create public status");
+    }
+    return renderRankedTable(services.rankedTables.snapshot(table.tableId), services.rankedDisputes.publicStatus(table.tableId));
   } catch (e) {
     if (rankedState !== "none") {
-      services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, boundField(e instanceof Error ? e.message : String(e), 500));
-      return "disputed";
+      return markDisputed(services, table, boundField(e instanceof Error ? e.message : String(e), 500));
     }
   }
   const tableId = boundField(table.tableId);
@@ -142,7 +155,11 @@ function rankedStorageState(services: Services, tableId: string): "none" | "rank
 }
 
 function markDisputed(services: Services, table: PersistentTableRow, reason: string): "disputed" {
-  services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, boundField(reason, 500));
+  services.rankedDisputes.markDisputedFromRecovery({
+    tableId: table.tableId,
+    expectedRevision: table.revision,
+    reason: boundField(reason, 500),
+  });
   return "disputed";
 }
 

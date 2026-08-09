@@ -5,8 +5,11 @@ import {
   ChipTx,
   Escrow,
   EventLog,
+  HOUSE_HOLDER,
   Ledger,
+  HouseReservations,
   PersistentTables,
+  RankedDisputes,
   RankedTables,
   openDb,
   registerDefaultTxTypes,
@@ -28,10 +31,21 @@ const events = new EventLog(db);
 const chipTx = new ChipTx(db);
 const chips = new ChipLedger(db, ledger, events, { chipTx });
 const casino = new Casino(db, chips, events);
+const reservations = new HouseReservations(db, chips, events);
+chips.setReservedProvider((holderId) => holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0);
 const escrow = new Escrow(db, chips, events, { onPlayerNet: (userId, net) => casino.recordGameNet(userId, net) });
 const persistentTables = new PersistentTables(db, events, { openingPhase: () => chipTx.openingPhase(), now: () => 1_700_000_000 });
 const metrics = new CasinoMetrics(db, chipTx, () => 1_700_000_000);
-const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, metrics, { now: () => 1_700_000_000 });
+const disputes = new RankedDisputes(db, chips, escrow, persistentTables, reservations, events, {
+  openingPhase: () => chipTx.openingPhase(),
+  now: () => 1_700_000_000,
+  onPlayerNet: (userId, net) => casino.recordGameNet(userId, net),
+});
+const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, metrics, {
+  now: () => 1_700_000_000,
+  reservations,
+  disputes,
+});
 
 rankedTables.snapshot(input.tableId);
 

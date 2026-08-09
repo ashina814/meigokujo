@@ -37,12 +37,14 @@ function makeRankedTimeoutServices({
   phase = "formal",
   status = "open",
   result = { processed: 1, refunded: 0, disputed: 0 },
+  disputeResult = { closed: 1, autoRefunded: 0, failed: 0 },
   processThrows,
   stateThrows,
 }: {
   phase?: string;
   status?: string;
   result?: { processed: number; refunded: number; disputed: number };
+  disputeResult?: { closed: number; autoRefunded: number; failed: number };
   processThrows?: Error;
   stateThrows?: Error;
 } = {}) {
@@ -64,6 +66,9 @@ function makeRankedTimeoutServices({
         if (processThrows) throw processThrows;
         return result;
       }),
+    },
+    rankedDisputes: {
+      processEvidenceDeadlines: vi.fn(() => disputeResult),
     },
     events: { log: vi.fn() },
   };
@@ -118,15 +123,19 @@ describe("ranked table timeout scheduler", () => {
     const open = makeRankedTimeoutServices();
     processRankedTableTimeoutsForScheduler(open as any, 1_700_000_000);
     expect(open.rankedTables.processDueTables).toHaveBeenCalledWith(1_700_000_000);
+    expect(open.rankedDisputes.processEvidenceDeadlines).toHaveBeenCalledWith(1_700_000_000);
     expect(open.events.log).toHaveBeenCalledWith("casino_ranked_timeout_scan", expect.objectContaining({ payload: { processed: 1, refunded: 0, disputed: 0 } }));
+    expect(open.events.log).toHaveBeenCalledWith("casino_ranked_dispute_deadline_scan", expect.objectContaining({ payload: { closed: 1, autoRefunded: 0, failed: 0 } }));
 
     const preReset = makeRankedTimeoutServices({ phase: "pre_reset" });
     processRankedTableTimeoutsForScheduler(preReset as any, 1_700_000_000);
     expect(preReset.rankedTables.processDueTables).not.toHaveBeenCalled();
+    expect(preReset.rankedDisputes.processEvidenceDeadlines).not.toHaveBeenCalled();
 
     const halted = makeRankedTimeoutServices({ status: "recovery_halt" });
     processRankedTableTimeoutsForScheduler(halted as any, 1_700_000_000);
     expect(halted.rankedTables.processDueTables).not.toHaveBeenCalled();
+    expect(halted.rankedDisputes.processEvidenceDeadlines).not.toHaveBeenCalled();
   });
 
   it("logs scan failures without throwing", async () => {

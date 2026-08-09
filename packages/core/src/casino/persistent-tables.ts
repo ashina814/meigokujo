@@ -79,7 +79,7 @@ export const ALLOWED_TABLE_TRANSITIONS: Readonly<Record<PersistentTableState, re
   ready_check: ["ready_check", "recruiting", "playing", "cancelled", "cancelled_by_admin", "cancelled_fault", "disputed"],
   playing: ["playing", "pending_approval", "cancelled_by_admin", "cancelled_fault", "disputed"],
   pending_approval: ["pending_approval", "settled", "cancelled_by_admin", "cancelled_fault", "disputed"],
-  disputed: ["disputed", "settled", "cancelled_by_admin", "cancelled_fault"],
+  disputed: ["disputed", "settled", "cancelled", "cancelled_by_admin", "cancelled_fault"],
   settled: ["settled"],
   cancelled: ["cancelled"],
   cancelled_by_admin: ["cancelled_by_admin"],

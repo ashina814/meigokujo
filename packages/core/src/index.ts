@@ -304,6 +304,32 @@ export {
   type ApproveRankedResultInput,
 } from "./casino/ranked-tables.js";
 export {
+  rankedFeeReservationKey,
+  RANKED_FEE_RESERVATION_SCOPE,
+} from "./casino/ranked-fee-reservation.js";
+export {
+  RankedDisputes,
+  RankedDisputeError,
+  RANKED_EVIDENCE_WINDOW_SEC,
+  RANKED_MAIN_EVIDENCE_KINDS,
+  RANKED_SUPPORTING_EVIDENCE_KINDS,
+  type RankedDisputeErrorCode,
+  type RankedDisputePublicStatus,
+  type RankedEvidenceKind,
+  type RankedEvidenceClass,
+  type RankedEvidenceStorageStatus,
+  type RankedResolutionKind,
+  type RankedFeeOutcome,
+  type RankedDisputesOptions,
+  type SubmitRankedEvidenceInput,
+  type BeginRankedEvidenceSubmissionInput,
+  type FinalizeRankedEvidenceStoredInput,
+  type AssignRankedArbitratorInput,
+  type ResolveRankedResultInput,
+  type ResolveCollateralRefundInput,
+  type MarkRankedDisputedFromRecoveryInput,
+} from "./casino/ranked-disputes.js";
+export {
   CasinoStatus,
   CASINO_STATUSES,
   isHumanHeld,
@@ -535,9 +561,11 @@ export {
   ReservationConflictError,
   ReservationInputError,
   RESERVATION_STALE_SEC,
+  RESERVATION_SCOPES,
   type ReservationRow,
   type ReservationResult,
   type ReservationInputErrorCode,
+  type ReservationScope,
 } from "./casino/reservations.js";
 
 export {
