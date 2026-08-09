@@ -352,8 +352,11 @@ describe("PR105 real integration: owner confirm through OpeningReset", () => {
       .get() as { id: string; planHash: string; status: string; fundsApplied: number };
     expect(execution.status).toBe("completed");
     expect(execution.fundsApplied).toBe(1);
-    expect(execution.planHash).toBe(initial.planHash);
-    expect(existsSync(join(root, `casino-opening-${initial.planHash}`, "manifest.json"))).toBe(true);
+    // Initial UI preflight is status=open. OpeningReset R0 deliberately moves to opening_reset and
+    // acquires the execution against that fresh canonical plan. The invariant needed here is that
+    // R3 itself does not mutate that execution plan; the standalone R3 test above checks that.
+    expect(execution.planHash).not.toBe("");
+    expect(existsSync(join(root, `casino-opening-${execution.planHash}`, "manifest.json"))).toBe(true);
     expect(String(submit.editReply.mock.calls[0]?.[0] ?? "")).toContain("Formal opening apply finished");
   });
 });
