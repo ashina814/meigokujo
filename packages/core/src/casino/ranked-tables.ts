@@ -426,14 +426,20 @@ export class RankedTables {
           operationId: `ready:${safeInput.operationId}`,
           actor: safeInput.userId,
         });
-        const feeReservation = this.options.reservations?.reserve(
+        const reservations = this.options.reservations;
+        if (!reservations) {
+          throw new RankedTableError("ERR_RANKED_RECOVERY_FAILED", "ranked fee refund reservation service is required before starting a ranked table", {
+            tableId: table.tableId,
+          });
+        }
+        const feeReservation = reservations.reserve(
           rankedFeeReservationKey(table.tableId),
           committed.totalFee,
           "ranked_fee_refund",
           `table:${table.tableId}`,
           RANKED_FEE_RESERVATION_SCOPE,
         );
-        if (feeReservation && !feeReservation.ok) {
+        if (!feeReservation.ok) {
           throw new RankedTableError("ERR_RANKED_INSUFFICIENT_FUNDS", "house cannot reserve ranked fee refund liability", {
             tableId: table.tableId,
             totalFee: committed.totalFee,
@@ -726,7 +732,7 @@ export class RankedTables {
     const distributions = this.distributions(config, result.orderedUserIds);
     this.assertEscrowBeforeSettlement(table.tableId, config, distributions);
     this.escrow.settle(table.tableId, distributions, actor, "順位卓の精算", this.options.beforeSettlementTransferForTesting);
-    this.options.reservations?.release(rankedFeeReservationKey(table.tableId));
+    this.releaseFeeReservation(table.tableId, config);
     const changed = this.db
       .prepare(
         `UPDATE casino_tables
@@ -746,6 +752,28 @@ export class RankedTables {
     });
     this.options.disputes?.recordUnanimousMatch(table.tableId, table.gameKey, config, result.orderedUserIds);
     this.events.log("casino_ranked_table_settled", { actor, target: table.tableId, payload: { resultHash: result.hash } });
+  }
+
+  private releaseFeeReservation(tableId: string, config: RankedTableConfig): void {
+    const reservations = this.options.reservations;
+    if (!reservations) {
+      throw new RankedTableError("ERR_RANKED_RECOVERY_FAILED", "ranked fee refund reservation service is required before settlement", { tableId });
+    }
+    const expected = config.feePerUser * config.participantCount;
+    const reservation = reservations.get(rankedFeeReservationKey(tableId));
+    if (
+      !reservation ||
+      reservation.amount !== expected ||
+      reservation.scope !== RANKED_FEE_RESERVATION_SCOPE ||
+      reservation.userId !== `table:${tableId}`
+    ) {
+      throw new RankedTableError("ERR_RANKED_RECOVERY_FAILED", "ranked fee refund reservation is missing or corrupt", {
+        tableId,
+        expected,
+        reservation,
+      });
+    }
+    reservations.release(rankedFeeReservationKey(tableId));
   }
 
   private markDisputed(table: PersistentTableRow, reason: string): void {

@@ -205,7 +205,10 @@ export function buildServices() {
   // 現れないので、渡さないとショップの域外確認票がゲーム中の自由チップを
   // Land へ戻せてしまう（監査ブロッカー・項目11）
   const chipFlow = new CasinoChipFlow(db, chips, events, chipAssets, { isSeatOccupied });
-  const rankedDisputes = new RankedDisputes(db, chips, escrow, persistentTables, reservations, events, { onPlayerNet: recordPlayerNet });
+  const rankedDisputes = new RankedDisputes(db, chips, escrow, persistentTables, reservations, events, {
+    openingPhase: () => chipTx.openingPhase(),
+    onPlayerNet: recordPlayerNet,
+  });
   const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, casinoMetrics, {
     chipFlow,
     isSoloSeatOccupied: isSeatOccupied,

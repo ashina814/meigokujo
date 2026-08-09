@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import type { EventLog } from "../events/service.js";
 import { canonicalHash, canonicalStringify } from "./opening-canonical.js";
 import { HOUSE_HOLDER, type ChipLedger } from "./chip-ledger.js";
+import type { OpeningPhase } from "./chip-tx.js";
 import { escrowHolderFor, type Escrow } from "./escrow.js";
 import {
   PersistentTableError,
@@ -80,6 +81,22 @@ export interface SubmitRankedEvidenceInput {
   storageStatus?: RankedEvidenceStorageStatus;
 }
 
+export interface BeginRankedEvidenceSubmissionInput {
+  tableId: string;
+  submitterId: string;
+  evidenceKind: RankedEvidenceKind;
+  operationId: string;
+  payloadDigest: string;
+  attachmentName?: string | null;
+}
+
+export interface FinalizeRankedEvidenceStoredInput {
+  operationId: string;
+  privateChannelId: string;
+  privateMessageId: string;
+  metadata?: Record<string, unknown> | null;
+}
+
 export interface AssignRankedArbitratorInput {
   tableId: string;
   arbitratorId: string;
@@ -117,6 +134,7 @@ interface RankedStorageRow {
   result_submitted_by: string | null;
   result_submitted_at: number | null;
   result_operation_id: string | null;
+  fee_committed_at: number | null;
   revision: number;
 }
 
@@ -147,14 +165,33 @@ interface DisputeRow {
   status: string | null;
 }
 
+interface EvidenceRow {
+  evidence_id: string;
+  table_id: string;
+  submitter_id: string;
+  evidence_class: RankedEvidenceClass;
+  evidence_kind: RankedEvidenceKind;
+  private_channel_id: string | null;
+  private_message_id: string | null;
+  attachment_name: string | null;
+  payload_digest: string;
+  created_at: number;
+  operation_id: string;
+  fingerprint: string;
+  storage_status: RankedEvidenceStorageStatus;
+  metadata_json: string | null;
+}
+
 export interface RankedDisputesOptions {
   now?: () => number;
   onPlayerNet?: (userId: string, net: number) => void;
+  openingPhase?: () => OpeningPhase;
 }
 
 export class RankedDisputes {
   private readonly now: () => number;
   private readonly onPlayerNet: (userId: string, net: number) => void;
+  private readonly openingPhase: () => OpeningPhase;
 
   constructor(
     private readonly db: Database.Database,
@@ -167,6 +204,7 @@ export class RankedDisputes {
   ) {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.onPlayerNet = options.onPlayerNet ?? (() => undefined);
+    this.openingPhase = options.openingPhase ?? (() => "formal");
   }
 
   ensureSchemaForTesting(): void {
@@ -175,7 +213,7 @@ export class RankedDisputes {
 
   openForTable(table: PersistentTableRow, reason: string): RankedDisputePublicStatus {
     const tx = this.db.transaction(() => {
-      this.ensureSchema();
+      this.ensureSchemaForFormal();
       const storage = this.requiredStorage(table.tableId);
       const now = this.now();
       this.db
@@ -209,25 +247,39 @@ export class RankedDisputes {
   }
 
   submitEvidence(input: SubmitRankedEvidenceInput): { evidenceId: string; status: RankedEvidenceStorageStatus } {
+    const begun = this.beginEvidenceSubmission({
+      tableId: input.tableId,
+      submitterId: input.submitterId,
+      evidenceKind: input.evidenceKind,
+      operationId: input.operationId,
+      payloadDigest: input.payloadDigest,
+      attachmentName: input.attachmentName ?? null,
+    });
+    const storageStatus = input.storageStatus ?? "stored";
+    if (storageStatus === "failed") return this.markEvidenceFailed(input.operationId);
+    if (storageStatus === "pending") return begun;
+    return this.finalizeEvidenceStored({
+      operationId: input.operationId,
+      privateChannelId: input.privateChannelId,
+      privateMessageId: input.privateMessageId,
+      metadata: null,
+    });
+  }
+
+  beginEvidenceSubmission(input: BeginRankedEvidenceSubmissionInput): { evidenceId: string; status: RankedEvidenceStorageStatus } {
     const safe = {
       tableId: requiredString(input.tableId, "tableId"),
       submitterId: requiredString(input.submitterId, "submitterId"),
       evidenceKind: evidenceKind(input.evidenceKind),
       operationId: requiredString(input.operationId, "operationId"),
-      privateChannelId: requiredString(input.privateChannelId, "privateChannelId"),
-      privateMessageId: requiredString(input.privateMessageId, "privateMessageId"),
       payloadDigest: requiredString(input.payloadDigest, "payloadDigest", 256),
       attachmentName: optionalString(input.attachmentName ?? null, "attachmentName", 200),
-      storageStatus: input.storageStatus ?? "stored",
     };
-    if (safe.storageStatus !== "pending" && safe.storageStatus !== "stored" && safe.storageStatus !== "failed") {
-      throw new RankedDisputeError("ERR_DISPUTE_EVIDENCE_INVALID", "unknown evidence storage status");
-    }
     const klass = evidenceClass(safe.evidenceKind);
     const fingerprint = canonicalStringify({ ...safe, evidenceClass: klass });
     const evidenceId = `ev_${canonicalHash({ tableId: safe.tableId, operationId: safe.operationId }).slice(0, 24)}`;
     const tx = this.db.transaction(() => {
-      this.ensureSchema();
+      this.ensureSchemaForFormal();
       const replay = this.db.prepare("SELECT evidence_id, fingerprint, storage_status FROM casino_table_evidence WHERE operation_id=?").get(safe.operationId) as
         | { evidence_id: string; fingerprint: string; storage_status: RankedEvidenceStorageStatus }
         | undefined;
@@ -251,8 +303,8 @@ export class RankedDisputes {
           `INSERT INTO casino_table_evidence (
              evidence_id, table_id, submitter_id, evidence_class, evidence_kind,
              private_channel_id, private_message_id, attachment_name, payload_digest,
-             created_at, operation_id, fingerprint, storage_status
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             created_at, operation_id, fingerprint, storage_status, metadata_json
+           ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, 'pending', NULL)`,
         )
         .run(
           evidenceId,
@@ -260,21 +312,75 @@ export class RankedDisputes {
           safe.submitterId,
           klass,
           safe.evidenceKind,
-          safe.privateChannelId,
-          safe.privateMessageId,
           safe.attachmentName,
           safe.payloadDigest,
           this.now(),
           safe.operationId,
           fingerprint,
-          safe.storageStatus,
         );
       this.events.log("casino_ranked_evidence_submitted", {
         actor: safe.submitterId,
         target: safe.tableId,
-        payload: { evidenceId, evidenceKind: safe.evidenceKind, evidenceClass: klass, storageStatus: safe.storageStatus },
+        payload: { evidenceId, evidenceKind: safe.evidenceKind, evidenceClass: klass, storageStatus: "pending" },
       });
-      return { evidenceId, status: safe.storageStatus };
+      return { evidenceId, status: "pending" as const };
+    });
+    return this.db.inTransaction ? tx() : tx.immediate();
+  }
+
+  finalizeEvidenceStored(input: FinalizeRankedEvidenceStoredInput): { evidenceId: string; status: RankedEvidenceStorageStatus } {
+    const safe = {
+      operationId: requiredString(input.operationId, "operationId"),
+      privateChannelId: requiredString(input.privateChannelId, "privateChannelId"),
+      privateMessageId: requiredString(input.privateMessageId, "privateMessageId"),
+      metadataJson: input.metadata == null ? null : canonicalStringify(input.metadata),
+    };
+    const tx = this.db.transaction(() => {
+      this.ensureSchemaForFormal();
+      const row = this.db.prepare("SELECT * FROM casino_table_evidence WHERE operation_id=?").get(safe.operationId) as EvidenceRow | undefined;
+      if (!row) throw new RankedDisputeError("ERR_DISPUTE_NOT_FOUND", "evidence operation was not begun", { operationId: safe.operationId });
+      const table = this.requireTable(row.table_id);
+      if (table.state !== "disputed") throw new RankedDisputeError("ERR_DISPUTE_NOT_OPEN", "table is not disputed", { tableId: row.table_id, state: table.state });
+      const dispute = this.requireDispute(row.table_id);
+      if (dispute.resolved_at !== null) throw new RankedDisputeError("ERR_DISPUTE_NOT_OPEN", "dispute is already resolved", { tableId: row.table_id });
+      if (dispute.evidence_closed_at !== null || dispute.evidence_deadline_at <= this.now()) {
+        throw new RankedDisputeError("ERR_DISPUTE_DEADLINE_CLOSED", "evidence deadline is closed", { tableId: row.table_id });
+      }
+      if (row.storage_status === "stored") {
+        if (row.private_channel_id !== safe.privateChannelId || row.private_message_id !== safe.privateMessageId) {
+          throw new RankedDisputeError("ERR_DISPUTE_EVIDENCE_CONFLICT", "stored evidence replay conflict", { operationId: safe.operationId });
+        }
+        return { evidenceId: row.evidence_id, status: row.storage_status };
+      }
+      const changed = this.db
+        .prepare(
+          `UPDATE casino_table_evidence
+             SET private_channel_id=?, private_message_id=?, metadata_json=?, storage_status='stored'
+           WHERE operation_id=? AND storage_status IN ('pending','failed')`,
+        )
+        .run(safe.privateChannelId, safe.privateMessageId, safe.metadataJson, safe.operationId).changes;
+      if (changed !== 1) throw new RankedDisputeError("ERR_DISPUTE_EVIDENCE_CONFLICT", "evidence finalize race", { operationId: safe.operationId });
+      return { evidenceId: row.evidence_id, status: "stored" as const };
+    });
+    return this.db.inTransaction ? tx() : tx.immediate();
+  }
+
+  markEvidenceFailed(operationId: string): { evidenceId: string; status: RankedEvidenceStorageStatus } {
+    const safeOperationId = requiredString(operationId, "operationId");
+    const tx = this.db.transaction(() => {
+      this.ensureSchemaForFormal();
+      const row = this.db.prepare("SELECT evidence_id, storage_status FROM casino_table_evidence WHERE operation_id=?").get(safeOperationId) as
+        | { evidence_id: string; storage_status: RankedEvidenceStorageStatus }
+        | undefined;
+      if (!row) throw new RankedDisputeError("ERR_DISPUTE_NOT_FOUND", "evidence operation was not begun", { operationId: safeOperationId });
+      if (row.storage_status !== "stored") {
+        this.db.prepare("UPDATE casino_table_evidence SET storage_status='failed' WHERE operation_id=? AND storage_status!='stored'").run(safeOperationId);
+      }
+      const current = this.db.prepare("SELECT evidence_id, storage_status FROM casino_table_evidence WHERE operation_id=?").get(safeOperationId) as {
+        evidence_id: string;
+        storage_status: RankedEvidenceStorageStatus;
+      };
+      return { evidenceId: current.evidence_id, status: current.storage_status };
     });
     return this.db.inTransaction ? tx() : tx.immediate();
   }
@@ -288,22 +394,36 @@ export class RankedDisputes {
     };
     const fingerprint = canonicalStringify(safe);
     const tx = this.db.transaction(() => {
-      this.ensureSchema();
-      const dispute = this.requireDispute(safe.tableId);
-      if (dispute.assignment_operation_id === safe.operationId) {
-        if (dispute.assignment_fingerprint !== fingerprint) throw new RankedDisputeError("ERR_DISPUTE_EVIDENCE_CONFLICT", "assignment operation replay conflict");
+      this.ensureSchemaForFormal();
+      const replay = this.db.prepare("SELECT fingerprint FROM casino_table_dispute_assignments WHERE operation_id=?").get(safe.operationId) as
+        | { fingerprint: string }
+        | undefined;
+      if (replay) {
+        if (replay.fingerprint !== fingerprint) throw new RankedDisputeError("ERR_DISPUTE_EVIDENCE_CONFLICT", "assignment operation replay conflict");
         return this.publicStatus(safe.tableId)!;
       }
+      const dispute = this.requireDispute(safe.tableId);
+      if (dispute.resolved_at !== null) throw new RankedDisputeError("ERR_DISPUTE_NOT_OPEN", "dispute is already resolved", { tableId: safe.tableId });
+      const table = this.requireTable(safe.tableId);
+      if (table.state !== "disputed") throw new RankedDisputeError("ERR_DISPUTE_NOT_OPEN", "table is not disputed", { tableId: safe.tableId, state: table.state });
       if (this.activeParticipants(safe.tableId).some((p) => p.userId === safe.arbitratorId)) {
         throw new RankedDisputeError("ERR_DISPUTE_ARBITRATOR_CONFLICT", "arbitrator is a table participant", { tableId: safe.tableId });
       }
       this.db
         .prepare(
+          `INSERT INTO casino_table_dispute_assignments
+             (operation_id, table_id, arbitrator_id, assigned_by, assigned_at, fingerprint)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(safe.operationId, safe.tableId, safe.arbitratorId, safe.assignedBy, this.now(), fingerprint);
+      const changed = this.db
+        .prepare(
           `UPDATE casino_table_disputes
              SET assigned_arbitrator_id=?, assigned_by=?, assigned_at=?, assignment_operation_id=?, assignment_fingerprint=?
-           WHERE table_id=?`,
+           WHERE table_id=? AND resolved_at IS NULL`,
         )
-        .run(safe.arbitratorId, safe.assignedBy, this.now(), safe.operationId, fingerprint, safe.tableId);
+        .run(safe.arbitratorId, safe.assignedBy, this.now(), safe.operationId, fingerprint, safe.tableId).changes;
+      if (changed !== 1) throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "assignment race", { tableId: safe.tableId });
       this.events.log("casino_ranked_arbitrator_assigned", {
         actor: safe.assignedBy,
         target: safe.tableId,
@@ -387,22 +507,45 @@ export class RankedDisputes {
     let failed = 0;
     for (const row of rows) {
       try {
-        const table = this.requireTable(row.table_id);
-        if (table.state !== "disputed") continue;
-        if (this.hasStoredMainEvidence(row.table_id)) {
-          this.db.prepare("UPDATE casino_table_disputes SET evidence_closed_at=?, status='awaiting_arbitration' WHERE table_id=? AND evidence_closed_at IS NULL").run(now, row.table_id);
-          this.db.prepare("UPDATE casino_tables SET deadline_at=NULL, updated_at=? WHERE table_id=?").run(now, row.table_id);
-          closed++;
-        } else {
+        const closeTx = this.db.transaction((): "closed" | "needs_refund" | "skip" => {
+          this.ensureSchemaForFormal();
+          const table = this.requireTable(row.table_id);
+          if (table.state !== "disputed") return "skip";
           const dispute = this.requireDispute(row.table_id);
-          const op = `evidence-timeout:${row.table_id}:${dispute.evidence_deadline_at}`;
-          const fingerprint = canonicalStringify({ tableId: row.table_id, op, kind: "insufficient_evidence" });
-          this.resolveWithFingerprint("insufficient_evidence", op, "system:ranked-evidence-timeout", row.table_id, fingerprint, () => {
-            const current = this.requireTable(row.table_id);
-            this.refundCollateralAndFinalize(current, "system:ranked-evidence-timeout", "keep", "cancelled", "insufficient_evidence", "insufficient evidence", op, fingerprint);
-          });
-          autoRefunded++;
+          if (dispute.resolved_at !== null || dispute.evidence_closed_at !== null || dispute.evidence_deadline_at > now) return "skip";
+          if (!this.hasStoredMainEvidence(row.table_id)) return "needs_refund";
+          const changed = this.db
+            .prepare(
+              `UPDATE casino_table_disputes
+                 SET evidence_closed_at=?, status='awaiting_arbitration'
+               WHERE table_id=? AND resolved_at IS NULL AND evidence_closed_at IS NULL`,
+            )
+            .run(now, row.table_id).changes;
+          if (changed !== 1) throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "evidence close race", { tableId: row.table_id });
+          this.db.prepare("UPDATE casino_tables SET deadline_at=NULL, updated_at=? WHERE table_id=? AND state='disputed'").run(now, row.table_id);
+          return "closed";
+        });
+        const closeResult = this.db.inTransaction ? closeTx() : closeTx.immediate();
+        if (closeResult === "closed") {
+          closed++;
+          continue;
         }
+        if (closeResult === "skip") continue;
+        const dispute = this.requireDispute(row.table_id);
+        const op = `evidence-timeout:${row.table_id}:${dispute.evidence_deadline_at}`;
+        const fingerprint = canonicalStringify({ tableId: row.table_id, op, kind: "insufficient_evidence" });
+        this.resolveWithFingerprint("insufficient_evidence", op, "system:ranked-evidence-timeout", row.table_id, fingerprint, () => {
+          const current = this.requireTable(row.table_id);
+          const currentDispute = this.requireDispute(row.table_id);
+          if (current.state !== "disputed" || currentDispute.resolved_at !== null || currentDispute.evidence_closed_at !== null || currentDispute.evidence_deadline_at > now) {
+            throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "deadline resolution race", { tableId: row.table_id });
+          }
+          if (this.hasStoredMainEvidence(row.table_id)) {
+            throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "stored main evidence won the deadline race", { tableId: row.table_id });
+          }
+          this.refundCollateralAndFinalize(current, "system:ranked-evidence-timeout", "keep", "cancelled", "insufficient_evidence", "insufficient evidence", op, fingerprint);
+        });
+        autoRefunded++;
       } catch (e) {
         failed++;
         this.events.log("casino_ranked_dispute_deadline_failed", {
@@ -434,13 +577,13 @@ export class RankedDisputes {
   }
 
   recordUnanimousMatch(tableId: string, gameKey: string, config: RankedTableConfig, orderedUserIds: readonly string[]): void {
-    this.ensureMatchHistorySchema();
+    this.ensureSchemaForFormal();
     const resultJson = canonicalStringify({ orderedUserIds });
     this.recordMatchHistory(tableId, gameKey, config, resultJson, canonicalHash({ orderedUserIds }), "unanimous");
   }
 
   private resolveWithFingerprint(kind: RankedResolutionKind, operationId: string, actor: string, tableId: string, fingerprint: string, body: () => void): RankedDisputePublicStatus {
-    this.ensureSchema();
+    this.ensureSchemaForFormal();
     const existing = this.readDispute(tableId);
     if (existing?.resolution_operation_id === operationId) {
       if (existing.resolution_fingerprint !== fingerprint) throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "resolution operation replay conflict");
@@ -467,6 +610,19 @@ export class RankedDisputes {
     operationId: string,
     fingerprint: string,
   ): void {
+    if (this.isPreStartDispute(table)) {
+      this.refundPreStartEscrow(table, actor, operationId);
+      this.persistentTables.transition({
+        tableId: table.tableId,
+        from: "disputed",
+        to: terminal,
+        expectedRevision: table.revision,
+        actor,
+        reason: kind === "insufficient_evidence" ? "insufficient evidence" : "ranked pre-start collateral refund",
+      });
+      this.saveResolution(table.tableId, kind, "keep", false, summary, actor, operationId, fingerprint);
+      return;
+    }
     const config = this.configFor(table.tableId);
     const participants = this.activeParticipants(table.tableId).map((p) => p.userId);
     const distributions = participants.map((userId) => ({ to: userId, amount: config.baseAmount, reason: "ranked collateral refund" }));
@@ -482,6 +638,38 @@ export class RankedDisputes {
       reason: kind === "insufficient_evidence" ? "insufficient evidence" : "ranked arbitration collateral refund",
     });
     this.saveResolution(table.tableId, kind, outcome, false, summary, actor, operationId, fingerprint);
+  }
+
+  private isPreStartDispute(table: PersistentTableRow): boolean {
+    const storage = this.requiredStorage(table.tableId);
+    return table.startedAt === null || storage.fee_committed_at === null;
+  }
+
+  private refundPreStartEscrow(table: PersistentTableRow, actor: string, operationId: string): void {
+    const active = this.activeParticipants(table.tableId).map((p) => p.userId);
+    const activeSet = new Set(active);
+    const rows = this.escrow.list(table.tableId);
+    if (rows.length !== active.length) {
+      throw new RankedDisputeError("ERR_DISPUTE_ESCROW_MISMATCH", "pre-start escrow participant count mismatch", {
+        tableId: table.tableId,
+        rows: rows.length,
+        active: active.length,
+      });
+    }
+    const holder = escrowHolderFor(table.tableId);
+    let total = 0;
+    for (const row of rows) {
+      if (!activeSet.has(row.user_id) || row.source !== holder || row.game !== table.gameKey || !Number.isSafeInteger(row.amount) || row.amount <= 0) {
+        throw new RankedDisputeError("ERR_DISPUTE_ESCROW_MISMATCH", "pre-start escrow row mismatch", { tableId: table.tableId, row });
+      }
+      total += row.amount;
+      if (!Number.isSafeInteger(total)) throw new RankedDisputeError("ERR_DISPUTE_ESCROW_MISMATCH", "pre-start escrow overflow", { tableId: table.tableId });
+    }
+    if (this.chips.balanceOf(holder) !== total) {
+      throw new RankedDisputeError("ERR_DISPUTE_ESCROW_MISMATCH", "pre-start escrow holder mismatch", { tableId: table.tableId, total });
+    }
+    this.escrow.refundMany(table.tableId, active, `pre-start-dispute:${operationId}`);
+    this.events.log("casino_ranked_pre_start_dispute_refunded", { actor, target: table.tableId, payload: { participants: active.length, total } });
   }
 
   private applyFeeOutcome(tableId: string, game: string, config: RankedTableConfig, outcome: RankedFeeOutcome, actor: string): void {
@@ -595,7 +783,7 @@ export class RankedDisputes {
   }
 
   private recordMatchHistory(tableId: string, gameKey: string, config: RankedTableConfig, resultJson: string, resultHash: string, source: "unanimous" | "arbitration"): void {
-    this.ensureMatchHistorySchema();
+    this.ensureSchemaForFormal();
     this.db
       .prepare(
         `INSERT INTO casino_ranked_match_history
@@ -634,6 +822,12 @@ export class RankedDisputes {
   }
 
   private ensureSchema(): void {
+    const state = this.schemaState();
+    if (state === "invalid") throw new RankedDisputeError("ERR_DISPUTE_SCHEMA_INVALID", "ranked dispute schema is partially present or missing required columns");
+    if (state === "complete") {
+      this.migrateSchema();
+      return;
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS casino_table_disputes (
         table_id TEXT PRIMARY KEY,
@@ -662,24 +856,52 @@ export class RankedDisputes {
         status TEXT,
         FOREIGN KEY(table_id) REFERENCES casino_tables(table_id) ON DELETE CASCADE
       );
+      CREATE TABLE IF NOT EXISTS casino_table_dispute_assignments (
+        operation_id TEXT PRIMARY KEY,
+        table_id TEXT NOT NULL,
+        arbitrator_id TEXT NOT NULL,
+        assigned_by TEXT NOT NULL,
+        assigned_at INTEGER NOT NULL,
+        fingerprint TEXT NOT NULL,
+        FOREIGN KEY(table_id) REFERENCES casino_table_disputes(table_id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_casino_table_dispute_assignments_table
+        ON casino_table_dispute_assignments(table_id, assigned_at);
       CREATE TABLE IF NOT EXISTS casino_table_evidence (
         evidence_id TEXT PRIMARY KEY,
         table_id TEXT NOT NULL,
         submitter_id TEXT NOT NULL,
         evidence_class TEXT NOT NULL CHECK(evidence_class IN ('main','supporting')),
         evidence_kind TEXT NOT NULL,
-        private_channel_id TEXT NOT NULL,
-        private_message_id TEXT NOT NULL,
+        private_channel_id TEXT,
+        private_message_id TEXT,
         attachment_name TEXT,
         payload_digest TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         operation_id TEXT NOT NULL UNIQUE,
         fingerprint TEXT NOT NULL,
         storage_status TEXT NOT NULL CHECK(storage_status IN ('pending','stored','failed')),
+        metadata_json TEXT,
         FOREIGN KEY(table_id) REFERENCES casino_table_disputes(table_id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS idx_casino_table_evidence_table ON casino_table_evidence(table_id, evidence_class, storage_status);
     `);
+    this.ensureMatchHistorySchema();
+  }
+
+  private ensureSchemaForFormal(): void {
+    const phase = this.openingPhase();
+    if (phase !== "formal") {
+      throw new RankedDisputeError("ERR_DISPUTE_NOT_OPEN", "ranked disputes are only writable after formal opening", { phase });
+    }
+    this.ensureSchema();
+  }
+
+  private ensureMatchHistorySchemaForFormal(): void {
+    const phase = this.openingPhase();
+    if (phase !== "formal") {
+      throw new RankedDisputeError("ERR_DISPUTE_NOT_OPEN", "ranked match history is only writable after formal opening", { phase });
+    }
     this.ensureMatchHistorySchema();
   }
 
@@ -698,11 +920,37 @@ export class RankedDisputes {
   }
 
   private hasSchema(): boolean {
-    const disputes = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='casino_table_disputes'").get();
-    const evidence = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='casino_table_evidence'").get();
-    if (!disputes && !evidence) return false;
-    if (disputes && evidence) return true;
+    const state = this.schemaState();
+    if (state === "none") return false;
+    if (state === "complete") return true;
     throw new RankedDisputeError("ERR_DISPUTE_SCHEMA_INVALID", "ranked dispute schema is partially present");
+  }
+
+  private schemaState(): "none" | "complete" | "invalid" {
+    const tables = ["casino_table_disputes", "casino_table_evidence", "casino_ranked_match_history", "casino_table_dispute_assignments"];
+    const exists = tables.map((table) => tableExists(this.db, table));
+    if (exists.every((value) => !value)) return "none";
+    if (!exists.every(Boolean)) return "invalid";
+    const required: Record<string, string[]> = {
+      casino_table_disputes: ["table_id", "evidence_deadline_at", "evidence_closed_at", "resolved_at", "resolution_operation_id"],
+      casino_table_evidence: ["evidence_id", "table_id", "operation_id", "fingerprint", "storage_status", "private_channel_id", "private_message_id"],
+      casino_ranked_match_history: ["table_id", "final_result_json", "final_result_hash", "source"],
+      casino_table_dispute_assignments: ["operation_id", "table_id", "arbitrator_id", "assigned_by", "fingerprint"],
+    };
+    for (const [table, columns] of Object.entries(required)) {
+      const present = new Set((this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name));
+      if (columns.some((column) => !present.has(column))) return "invalid";
+    }
+    return "complete";
+  }
+
+  private migrateSchema(): void {
+    this.addColumnIfMissing("casino_table_evidence", "metadata_json", "TEXT");
+  }
+
+  private addColumnIfMissing(table: string, column: string, spec: string): void {
+    const columns = new Set((this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name));
+    if (!columns.has(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${spec}`);
   }
 }
 
@@ -725,6 +973,9 @@ function feeOutcome(outcome: string): RankedFeeOutcome {
 function publicSummary(summary: string): string {
   const trimmed = requiredString(summary, "publicSummary", 300).trim();
   if (!trimmed) throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "public summary is required");
+  if (/https?:\/\//i.test(trimmed) || /discord(?:app)?\.com\/attachments/i.test(trimmed) || /\breplay[_ -]?id\b/i.test(trimmed)) {
+    throw new RankedDisputeError("ERR_DISPUTE_RESOLUTION_CONFLICT", "public summary must not contain raw evidence, URLs, or replay IDs");
+  }
   return trimmed;
 }
 
@@ -742,4 +993,8 @@ function requiredString(value: unknown, field: string, maxLength = 200): string 
 function optionalString(value: unknown, field: string, maxLength = 200): string | null {
   if (value === null || value === undefined) return null;
   return requiredString(value, field, maxLength);
+}
+
+function tableExists(db: Database.Database, table: string): boolean {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
 }

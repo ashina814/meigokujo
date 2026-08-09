@@ -560,6 +560,96 @@ describe("RankedDisputes evidence and arbitration", () => {
       }),
     ).toThrow(RankedDisputeError);
   });
+
+  it("keeps reassignment idempotency append-only so an old operation replay cannot roll back the current arbitrator", () => {
+    const ctx = setup();
+    startGf(ctx);
+    const submitted = ctx.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
+    ctx.rankedTables.dispute({ tableId: "t1", userId: "bob", resultHash: submitted.result!.hash, operationId: "dispute:bob" });
+    ctx.disputes.assignArbitrator({ tableId: "t1", arbitratorId: "judge-a", assignedBy: "owner", operationId: "assign:1" });
+    ctx.disputes.assignArbitrator({ tableId: "t1", arbitratorId: "judge-b", assignedBy: "owner", operationId: "assign:2" });
+    expect(ctx.disputes.publicStatus("t1")?.assignedArbitratorId).toBe("judge-b");
+    ctx.disputes.assignArbitrator({ tableId: "t1", arbitratorId: "judge-a", assignedBy: "owner", operationId: "assign:1" });
+    expect(ctx.disputes.publicStatus("t1")?.assignedArbitratorId).toBe("judge-b");
+    expect(() => ctx.disputes.assignArbitrator({ tableId: "t1", arbitratorId: "judge-c", assignedBy: "owner", operationId: "assign:1" })).toThrow(RankedDisputeError);
+  });
+
+  it("refunds exact pre-start escrow rows for recruiting and ready_check recovery disputes without fee outcome or match history", () => {
+    const recruiting = setup();
+    createTable(recruiting);
+    seedUser(recruiting, "alice");
+    join(recruiting, "t1", "alice", 1);
+    const recDisputed = recruiting.persistentTables.markDisputedFromRecovery("t1", recruiting.persistentTables.get("t1")!.revision, "message restore failed");
+    recruiting.disputes.openForTable(recDisputed, "message restore failed");
+    expect(recruiting.disputes.processEvidenceDeadlines(1_700_259_200)).toEqual({ closed: 0, autoRefunded: 1, failed: 0 });
+    expect(recruiting.persistentTables.get("t1")?.state).toBe("cancelled");
+    expect(recruiting.chips.balanceOf("alice")).toBe(30_000);
+    expect(recruiting.chips.balanceOf(HOUSE_HOLDER)).toBe(0);
+    expect((recruiting.db.prepare("SELECT COUNT(*) AS n FROM casino_ranked_match_history").get() as { n: number }).n).toBe(0);
+
+    const ready = setup();
+    createTable(ready);
+    seedUser(ready, "alice");
+    seedUser(ready, "bob");
+    join(ready, "t1", "alice", 1);
+    join(ready, "t1", "bob", 2);
+    const readyDisputed = ready.persistentTables.markDisputedFromRecovery("t1", ready.persistentTables.get("t1")!.revision, "message edit failed");
+    ready.disputes.openForTable(readyDisputed, "message edit failed");
+    expect(ready.disputes.processEvidenceDeadlines(1_700_259_200)).toEqual({ closed: 0, autoRefunded: 1, failed: 0 });
+    expect(ready.persistentTables.get("t1")?.state).toBe("cancelled");
+    expect(ready.chips.balanceOf("alice")).toBe(30_000);
+    expect(ready.chips.balanceOf("bob")).toBe(30_000);
+    expect(ready.chips.balanceOf(HOUSE_HOLDER)).toBe(0);
+    expect(ready.reservations.get(rankedFeeReservationKey("t1"))).toBeUndefined();
+  });
+
+  it("does not create dispute schemas before formal opening and fails writes closed", () => {
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    const events = new EventLog(db);
+    const chipTx = new ChipTx(db);
+    const chips = new ChipLedger(db, ledger, events, { chipTx });
+    const casino = new Casino(db, chips, events);
+    const reservations = new HouseReservations(db, chips, events);
+    const escrow = new Escrow(db, chips, events, { onPlayerNet: (userId, net) => casino.recordGameNet(userId, net) });
+    const persistentTables = new PersistentTables(db, events, { openingPhase: () => chipTx.openingPhase() });
+    const disputes = new RankedDisputes(db, chips, escrow, persistentTables, reservations, events, { openingPhase: () => chipTx.openingPhase() });
+    expect(disputes.publicStatus("t1")).toBeNull();
+    expect(() =>
+      disputes.beginEvidenceSubmission({
+        tableId: "t1",
+        submitterId: "alice",
+        evidenceKind: "screenshot",
+        operationId: "evidence:preformal",
+        payloadDigest: "digest",
+      }),
+    ).toThrow(RankedDisputeError);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'casino_table_%'").all()).toEqual([]);
+  });
+
+  it("requires ranked fee refund reservations for start and unanimous settlement", () => {
+    const missingService = setup({ reservations: undefined });
+    createTable(missingService);
+    seedUser(missingService, "alice");
+    seedUser(missingService, "bob");
+    join(missingService, "t1", "alice", 1);
+    join(missingService, "t1", "bob", 2);
+    missingService.rankedTables.ready({ tableId: "t1", userId: "alice", operationId: "ready:alice" });
+    expect(() => missingService.rankedTables.ready({ tableId: "t1", userId: "bob", operationId: "ready:bob" })).toThrow(RankedTableError);
+    expect(missingService.rankedTables.snapshot("t1").table.state).toBe("ready_check");
+    expect(missingService.chips.balanceOf(HOUSE_HOLDER)).toBe(0);
+
+    const missingReservation = setup();
+    startGf(missingReservation);
+    missingReservation.reservations.release(rankedFeeReservationKey("t1"));
+    const submitted = missingReservation.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
+    missingReservation.rankedTables.approve({ tableId: "t1", userId: "alice", resultHash: submitted.result!.hash, operationId: "approve:alice" });
+    expect(() =>
+      missingReservation.rankedTables.approve({ tableId: "t1", userId: "bob", resultHash: submitted.result!.hash, operationId: "approve:bob" }),
+    ).toThrow(RankedTableError);
+    expect(missingReservation.rankedTables.snapshot("t1").table.state).toBe("pending_approval");
+    expect(missingReservation.chips.balanceOf(escrowHolderFor("t1"))).toBe(10_000);
+  });
 });
 
 describe("RankedTables timeout, metrics, and opening safety", () => {

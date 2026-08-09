@@ -423,6 +423,18 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "ranked-disputes.ts lazily creates this formal-opening-era dispute workflow table. It contains non-financial table metadata and is reset in R6 before formal opening.",
   }),
   T({
+    table: "casino_table_dispute_assignments",
+    purpose: "Idempotent arbitrator assignment history for disputed persistent PvP tables",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "ranked-disputes.ts stores append-only assignment operations here so old assignment replays cannot roll back the current arbitrator. Rows are non-financial metadata and are reset in R6.",
+  }),
+  T({
     table: "casino_table_evidence",
     purpose: "Private evidence references for disputed persistent PvP tables",
     kind: "optional_feature",

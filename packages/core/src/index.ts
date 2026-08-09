@@ -322,6 +322,8 @@ export {
   type RankedFeeOutcome,
   type RankedDisputesOptions,
   type SubmitRankedEvidenceInput,
+  type BeginRankedEvidenceSubmissionInput,
+  type FinalizeRankedEvidenceStoredInput,
   type AssignRankedArbitratorInput,
   type ResolveRankedResultInput,
   type ResolveCollateralRefundInput,

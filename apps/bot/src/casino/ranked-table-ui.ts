@@ -36,7 +36,12 @@ export function renderRankedTable(snapshot: RankedTableSnapshot, dispute?: Ranke
     `参加: ${active.length}/${config.participantCount}`,
   ];
   if (result) lines.push(`結果hash: ${result.hash.slice(0, 12)}`);
-  if (table.state === "disputed") {
+  if (dispute?.resolvedAt) {
+    lines.push(`arbitration: ${resolutionLabel(dispute.resolutionKind)} / fee ${dispute.feeOutcome ?? "keep"}`);
+    lines.push(`resolved by: ${dispute.resolvedBy ?? "unknown"} / <t:${dispute.resolvedAt}:f>`);
+    if (dispute.publicSummary) lines.push(`summary: ${dispute.publicSummary}`);
+    lines.push("public summary does not include raw evidence, URLs, attachments, testimony details, or external account information.");
+  } else if (table.state === "disputed") {
     if (dispute?.resolvedAt) {
       lines.push(`裁定: ${resolutionLabel(dispute.resolutionKind)} / fee ${dispute.feeOutcome ?? "keep"}`);
       if (dispute.publicSummary) lines.push(`要約: ${dispute.publicSummary}`);
@@ -164,7 +169,7 @@ function controlsFor(snapshot: RankedTableSnapshot): ActionRowBuilder<ButtonBuil
   return null;
 }
 
-async function editBoundRankedTableMessage(client: Client, services: Services, tableId: string): Promise<void> {
+export async function editBoundRankedTableMessage(client: Client, services: Services, tableId: string): Promise<void> {
   const snapshot = services.rankedTables.snapshot(tableId);
   const { table } = snapshot;
   if (!table.channelId || !table.messageId) return;

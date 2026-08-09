@@ -63,6 +63,21 @@ export async function handleCasinoEvidenceCommand(interaction: ChatInputCommandI
   }
 
   try {
+    const digest = createHash("sha256")
+      .update(canonicalDigestInput({ tableId, kind, text, attachmentName: attachment?.name ?? null, attachmentSize: attachment?.size ?? null }))
+      .digest("hex");
+    const begun = services.rankedDisputes.beginEvidenceSubmission({
+      tableId,
+      submitterId: interaction.user.id,
+      evidenceKind: kind,
+      operationId: interaction.id,
+      attachmentName: attachment?.name ?? null,
+      payloadDigest: digest,
+    });
+    if (begun.status === "stored") {
+      await interaction.reply({ content: `Evidence already stored privately: ${begun.evidenceId}`, ephemeral: true });
+      return;
+    }
     const content = [
       `table: ${tableId}`,
       `kind: ${kind}`,
@@ -73,22 +88,19 @@ export async function handleCasinoEvidenceCommand(interaction: ChatInputCommandI
       content,
       files: attachment ? [new AttachmentBuilder(attachment.url, { name: attachment.name ?? "evidence" })] : [],
     });
-    const digest = createHash("sha256")
-      .update(canonicalDigestInput({ tableId, kind, text, attachmentName: attachment?.name ?? null, attachmentSize: attachment?.size ?? null, privateMessageId: sent.id }))
-      .digest("hex");
-    const result = services.rankedDisputes.submitEvidence({
-      tableId,
-      submitterId: interaction.user.id,
-      evidenceKind: kind,
+    const result = services.rankedDisputes.finalizeEvidenceStored({
       operationId: interaction.id,
       privateChannelId: config.casinoEvidenceChannelId,
       privateMessageId: sent.id,
-      attachmentName: attachment?.name ?? null,
-      payloadDigest: digest,
-      storageStatus: "stored",
+      metadata: { attachmentName: attachment?.name ?? null, attachmentSize: attachment?.size ?? null },
     });
     await interaction.reply({ content: `Evidence stored privately: ${result.evidenceId}`, ephemeral: true });
   } catch (error) {
+    try {
+      services.rankedDisputes.markEvidenceFailed(interaction.id);
+    } catch {
+      // Validation can fail before an evidence operation exists.
+    }
     await interaction.reply({ content: error instanceof Error ? error.message : String(error), ephemeral: true });
   }
 }
