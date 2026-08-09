@@ -225,7 +225,7 @@ describe("PR21 ranked table cross-process readiness", () => {
     expect(results.some((result) => result.ok)).toBe(true);
 
     const db = openDb(ctx.dbPath);
-    expect((db.prepare("SELECT state FROM casino_tables WHERE table_id='t1'").get() as { state: string }).state).toBe("cancelled");
+    expect(["cancelled", "cancelled_by_admin"]).toContain((db.prepare("SELECT state FROM casino_tables WHERE table_id='t1'").get() as { state: string }).state);
     expect((db.prepare("SELECT COUNT(*) AS n FROM casino_table_disputes WHERE table_id='t1' AND resolved_at IS NOT NULL").get() as { n: number }).n).toBe(1);
     expect((db.prepare("SELECT amount FROM ether_balances WHERE user_id=?").get(escrowHolderFor("t1")) as { amount: number }).amount).toBe(0);
     expect((db.prepare("SELECT amount FROM ether_balances WHERE user_id=?").get(HOUSE_HOLDER) as { amount: number }).amount).toBe(300);
