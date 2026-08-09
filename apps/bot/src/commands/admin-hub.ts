@@ -50,6 +50,13 @@ import { fmtEther, fmtLd } from "../format.js";
 import { isSeatOccupied } from "../casino/common.js";
 import { houseCapacityReport } from "../casino/capacity-report.js";
 import { describeChipLedgerError, isFormallyOpen, openingBadge, openingNotice, openingPhase } from "../casino/opening.js";
+import {
+  handleOpeningOpsButton,
+  handleOpeningOpsModal,
+  isOpeningOpsCustomId,
+  openingOpsField,
+  openingOpsRows,
+} from "../casino/opening-ops.js";
 import { ticketPanelMessageForPanel } from "./tickets.js";
 import type { Services } from "../services.js";
 
@@ -184,6 +191,7 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
 
   // ── 賭場（マモン） ──
   if (section === "casino" && !action) return void (await interaction.update(casinoHome(services)));
+  if (section === "casino" && action === "opening") return void (await handleOpeningOpsButton(interaction, services));
   // 古いパネルのボタン（stale button）は残る。押された時点の版でも必ず確かめてから modal を開く
   if (section === "casino" && (action === "fund" || action === "settle") && !isFormallyOpen(services)) {
     return void (await interaction.reply({ content: openingNotice(services), flags: MessageFlags.Ephemeral }));
@@ -521,6 +529,7 @@ export async function handleAdminSelect(
 
 export async function handleAdminModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
   if (!isAdmin(interaction, services)) return;
+  if (isOpeningOpsCustomId(interaction.customId)) return void (await handleOpeningOpsModal(interaction, services));
   const parts = interaction.customId.split(":");
   const section = parts[1];
   const action = parts[2];
@@ -2125,6 +2134,7 @@ function casinoHome(services: Services) {
     .addFields(
       { name: report.ok ? "▸ 全点検（正常）" : "▸ 全点検（**要対応**）", value: checkLines.join("\n"), inline: false },
       { name: "▸ 運転資金目安（PR13）", value: capacityWorksheetLine(services), inline: false },
+      openingOpsField(services),
     );
   // 停止中は資金投入・売上精算も押せない（押しても資金層で弾かれるが、UIでも見せる）。
   // 正式開業前・未知版も同じ扱いにする。押せてしまうと、必ず断られる操作を運営に踏ませる
@@ -2158,6 +2168,7 @@ function casinoHome(services: Services) {
       : []),
   );
   const rows: ActionRowBuilder<ButtonBuilder>[] = [row];
+  rows.push(...openingOpsRows(services));
   // PR10 emergency refund is a persistent preview/draft saga. Creating or viewing the
   // confirmation never moves funds; execution rechecks balances and ownership.
   rows.push(

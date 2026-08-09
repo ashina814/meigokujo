@@ -14,4 +14,5 @@ export const config = {
   clientId: required("CLIENT_ID"),
   ownerId: required("OWNER_ID"),
   dbPath: process.env.DB_PATH ?? "./data/bot.db",
+  openingBackupDir: process.env.CASINO_OPENING_BACKUP_DIR ?? "",
 };
