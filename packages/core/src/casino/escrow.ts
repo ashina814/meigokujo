@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { EventLog } from "../events/service.js";
-import { ChipLedgerError, ChipLedger } from "./chip-ledger.js";
+import { ChipLedgerError, ChipLedger, HOUSE_HOLDER } from "./chip-ledger.js";
 
 /**
  * 賭場のエスクロー台帳。
@@ -487,6 +487,80 @@ export class Escrow {
   /** セッション専用保有者のID（呼び出し側が精算時に使う）。命名を1箇所に閉じ込めるため */
   holderId(sessionId: string): string {
     return escrowHolderFor(sessionId);
+  }
+
+  /**
+   * 永続順位卓の開始時に、参加時に預かった R+fee から fee だけを確定収益へ振り替える。
+   *
+   * holder から house へ fee を移すだけでは、casino_escrow の帳簿合計が holder 残高より
+   * 大きくなり検算 C を壊す。必ず同じ transaction で各 participant の escrow row も
+   * R+fee から R に減額し、終了後も「帳簿合計 == holder実残高 == N*R」を維持する。
+   */
+  commitTableFees(input: {
+    sessionId: string;
+    userIds: readonly string[];
+    stakeAmount: number;
+    feePerUser: number;
+    game: string;
+    operationId: string;
+    actor: string;
+  }): { sessionId: string; totalFee: number; participants: number } {
+    const { sessionId, userIds, stakeAmount, feePerUser, game, operationId, actor } = input;
+    assertNoDuplicateUserIds(userIds, `escrow fee commit ${sessionId}:${operationId}`);
+    if (!Number.isSafeInteger(stakeAmount) || stakeAmount <= 0) throw new Error("Escrow.commitTableFees: bad stakeAmount");
+    if (!Number.isSafeInteger(feePerUser) || feePerUser <= 0) throw new Error("Escrow.commitTableFees: bad feePerUser");
+    const totalFee = feePerUser * userIds.length;
+    if (!Number.isSafeInteger(totalFee)) throw new Error("Escrow.commitTableFees: fee overflow");
+    const holder = this.holderId(sessionId);
+    return this.ether.runGroup(
+      { groupKey: `escrow:commit_fees:${sessionId}:${operationId}`, kind: "table_start", actorId: actor },
+      () => {
+        const rows = this.list(sessionId);
+        const expectedAmount = stakeAmount + feePerUser;
+        if (rows.length !== userIds.length) {
+          throw new Error(`Escrow.commitTableFees: participant count mismatch rows=${rows.length} expected=${userIds.length}`);
+        }
+        const expectedUsers = new Set(userIds);
+        let ledgerTotal = 0;
+        for (const row of rows) {
+          if (!expectedUsers.has(row.user_id)) throw new Error(`Escrow.commitTableFees: unexpected participant ${row.user_id}`);
+          if (row.source !== holder) throw new Error(`Escrow.commitTableFees: source mismatch for ${row.user_id}`);
+          if (row.game !== game) throw new Error(`Escrow.commitTableFees: game mismatch for ${row.user_id}`);
+          if (!Number.isSafeInteger(row.amount) || row.amount !== expectedAmount) {
+            throw new Error(`Escrow.commitTableFees: amount mismatch for ${row.user_id}`);
+          }
+          ledgerTotal += row.amount;
+          if (!Number.isSafeInteger(ledgerTotal)) throw new Error("Escrow.commitTableFees: ledger total overflow");
+        }
+        const expectedHolder = expectedAmount * userIds.length;
+        if (!Number.isSafeInteger(expectedHolder)) throw new Error("Escrow.commitTableFees: holder expectation overflow");
+        if (this.ether.balanceOf(holder) !== expectedHolder) {
+          throw new Error(`Escrow.commitTableFees: holder balance mismatch for ${sessionId}`);
+        }
+        if (ledgerTotal !== expectedHolder) throw new Error(`Escrow.commitTableFees: ledger total mismatch for ${sessionId}`);
+
+        this.ether.transfer(holder, HOUSE_HOLDER, totalFee, { reason: "順位卓の場代", game, sessionId });
+        const update = this.db.prepare("UPDATE casino_escrow SET amount = ? WHERE session_id = ? AND user_id = ? AND amount = ?");
+        for (const userId of userIds) {
+          const changed = update.run(stakeAmount, sessionId, userId, expectedAmount).changes;
+          if (changed !== 1) throw new Error(`Escrow.commitTableFees: escrow row changed for ${userId}`);
+          this.onPlayerNet(userId, -feePerUser);
+        }
+        const remainingLedger = this.poolOf(sessionId);
+        const remainingHolder = this.ether.balanceOf(holder);
+        const expectedRemaining = stakeAmount * userIds.length;
+        if (remainingLedger !== expectedRemaining || remainingHolder !== expectedRemaining) {
+          throw new Error(
+            `Escrow.commitTableFees: post-commit mismatch ledger=${remainingLedger} holder=${remainingHolder} expected=${expectedRemaining}`,
+          );
+        }
+        this.events.log("casino_escrow_fee_committed", {
+          actor,
+          payload: { sessionId, participants: userIds.length, stakeAmount, feePerUser, totalFee },
+        });
+        return { sessionId, totalFee, participants: userIds.length };
+      },
+    );
   }
 
   /**

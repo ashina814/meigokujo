@@ -43,6 +43,7 @@ import {
   Markets,
   MARKET_FINALIZER,
   PersistentTables,
+  RankedTables,
   Takutate,
   Escrow,
   CasinoChipAssets,
@@ -198,6 +199,7 @@ export function buildServices() {
   }
   const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
   const persistentTables = new PersistentTables(db, events, { openingPhase: () => chipTx.openingPhase() });
+  const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, casinoMetrics, { isSoloSeatOccupied: isSeatOccupied });
   const chipAssets = new CasinoChipAssets(db, chips);
   // 所有判定の正本をここで一本化する。プロセス内の着席は DB のどの表にも
   // 現れないので、渡さないとショップの域外確認票がゲーム中の自由チップを
@@ -219,7 +221,7 @@ export function buildServices() {
   // 資金を動かす経路は `chips` に一本化した（PR8監査・項目12）。`ether` は
   // 旧名称で書かれた外部プラグイン・古い呼び出しが**読むだけ**なら壊れないように
   // 残す互換窓で、型を `ChipReadonlyView` に狭めてある（下の注釈参照）。
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, persistentTables, takutate, freeSpins, reservations, recoveryRegistry, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, persistentTables, rankedTables, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;

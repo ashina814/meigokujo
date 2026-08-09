@@ -97,6 +97,7 @@ import { startOutboxWorker } from "./outbox.js";
 import { postJoinLog, postLeaveLog } from "./member-log.js";
 import { respondInteractionError } from "./interaction-errors.js";
 import { recoverCasinoWithPersistentTables } from "./casino/persistent-table-recovery.js";
+import { handleRankedTableButton, handleRankedTableModal, isRankedTableButton, isRankedTableModal } from "./casino/ranked-table-ui.js";
 
 const services = buildServices();
 const client = new Client({
@@ -279,6 +280,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleCasinoAmountModal(interaction, services);
       return;
     }
+    if (interaction.isModalSubmit() && isRankedTableModal(interaction.customId)) {
+      await handleRankedTableModal(interaction, services);
+      return;
+    }
     if (
       (interaction.isStringSelectMenu() ||
         interaction.isUserSelectMenu() ||
@@ -434,6 +439,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (isCasinoResultButton(interaction.customId)) {
         await handleCasinoResultButton(interaction, services);
+        return;
+      }
+      if (isRankedTableButton(interaction.customId)) {
+        await handleRankedTableButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("vip:")) {

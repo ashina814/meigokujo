@@ -1,6 +1,7 @@
 import { EmbedBuilder, type Client } from "discord.js";
 import { recoverCasinoAsync, type PersistentTableRestoreResult, type PersistentTableRow, type RecoverCasinoResult } from "@meigokujo/core";
 import type { Services } from "../services.js";
+import { renderRankedTable } from "./ranked-table-ui.js";
 
 const UNKNOWN_MESSAGE = 10008;
 
@@ -62,7 +63,7 @@ async function restoreOnePersistentTableMessage(
     return "disputed";
   }
 
-  const payload = renderPersistentTableRecoveryMessage(table);
+  const payload = renderPersistentTableRecoveryMessage(services, table);
   try {
     const message = await channel.messages.fetch(table.messageId);
     await message.edit(payload);
@@ -91,7 +92,12 @@ async function restoreOnePersistentTableMessage(
   }
 }
 
-function renderPersistentTableRecoveryMessage(table: PersistentTableRow): { embeds: EmbedBuilder[] } {
+function renderPersistentTableRecoveryMessage(services: Services, table: PersistentTableRow): { embeds: EmbedBuilder[]; components?: unknown[] } {
+  try {
+    return renderRankedTable(services.rankedTables.snapshot(table.tableId));
+  } catch {
+    // PR20-era or corrupt table rows are still rendered in the old fail-closed recovery card.
+  }
   const tableId = boundField(table.tableId);
   const gameKey = boundField(table.gameKey);
   const state = boundField(table.state, 64);

@@ -282,6 +282,28 @@ export {
   type PersistentTablesOptions,
 } from "./casino/persistent-tables.js";
 export {
+  RankedTables,
+  RankedTableError,
+  RANKED_PROFILES,
+  RANKED_TABLE_TIERS,
+  feeForBaseAmount,
+  rankedReceipts,
+  validateRankProfile,
+  rankedTableInternalsForTesting,
+  type GenericRankProfile,
+  type RankedTableConfig,
+  type RankedTableSnapshot,
+  type RankedResultSnapshot,
+  type RankedTableTier,
+  type RankedTableErrorCode,
+  type RankedTablesOptions,
+  type CreateRankedTableInput,
+  type JoinRankedTableInput,
+  type ReadyRankedTableInput,
+  type SubmitRankedResultInput,
+  type ApproveRankedResultInput,
+} from "./casino/ranked-tables.js";
+export {
   CasinoStatus,
   CASINO_STATUSES,
   isHumanHeld,
