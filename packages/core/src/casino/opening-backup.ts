@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import type Database from "better-sqlite3";
 import {
   canonicalHash,
@@ -27,8 +27,6 @@ import {
  *
  * `OpeningBackupAdapter` はSQLite全体のスナップショット・archive対象全tableのCSV・
  * それぞれのSHA-256・スキーマ情報・plan hash等を含む manifest を返す契約だけを持つ。
- * 実ファイルシステムを触る本番adapterは本PRでは実行しない
- * （`TestFilesystemOpeningBackupAdapter` は一時ディレクトリ専用、テストからのみ使う）。
  */
 export const BACKUP_FORMAT_VERSION = 1;
 export const SUPPORTED_BACKUP_FORMAT_VERSIONS: readonly number[] = [BACKUP_FORMAT_VERSION];
@@ -197,21 +195,12 @@ export class FakeOpeningBackupAdapter implements OpeningBackupAdapter {
 
   // eslint-disable-next-line @typescript-eslint/require-await
   async verifyPersistedBackup(): Promise<OpeningBackupVerificationResult> {
-    // memory adapterにはプロセスを跨いで再読込できる実体が無い。durability="memory"により
-    // 破壊的applyのゲートで既に弾かれる想定だが、万一直接呼ばれても常にok:falseで拒否する。
     return { ok: false, problems: ["memory adapterは永続証拠を持たない(durability=memory)"] };
   }
 }
 
-/**
- * テスト・ローカル検証専用のファイルシステムbackup adapter。
- *
- * **本番運用では使わない。** production向けの実装・配線は本PRの範囲外
- * （CLAUDE.md §7「本タスク中に実ファイルシステムのproduction backup adapterを実行しない」）。
- * 呼び出し側は必ず一時ディレクトリ（`os.tmpdir()`配下など）を渡すこと。
- */
+/** テスト・ローカル検証専用のファイルシステムbackup adapter。 */
 export class TestFilesystemOpeningBackupAdapter implements OpeningBackupAdapter {
-  /** ファイルとして保存され、プロセスと切り離して再読込できる（CLAUDE.md監査ブロッカー5.3） */
   readonly durability: OpeningBackupDurability = "persistent";
 
   constructor(private readonly directory: string) {}
@@ -233,12 +222,6 @@ export class TestFilesystemOpeningBackupAdapter implements OpeningBackupAdapter 
     return finalManifest;
   }
 
-  /**
-   * `backup()` が書いたファイル一式を、保存された実体から再読込して再検証する
-   * （CLAUDE.md監査ブロッカー5.2）。manifestオブジェクト自体の自己整合(`verifyOpeningBackupManifest`)
-   * と、ディスク上の実ファイルがmanifestの主張と一致するか(`verifyOpeningBackupFilesOnDisk`)の
-   * 両方を見る。前者だけでは「実体を書き損なった/書いた直後に消えた」を検出できない。
-   */
   async verifyPersistedBackup(
     manifest: OpeningBackupManifest,
     expectation: ManifestVerificationExpectation,
@@ -252,9 +235,19 @@ export class TestFilesystemOpeningBackupAdapter implements OpeningBackupAdapter 
   }
 }
 
+/**
+ * Production backup publisher.
+ *
+ * A backup becomes visible as completed only when a fully written and verified staging directory
+ * is atomically renamed to `casino-opening-<planHash>` on the same filesystem. A process crash
+ * before that rename can therefore leave only an ignored staging directory; a retry creates a new
+ * staging directory and converges. A crash after rename is a completed publish and is read back and
+ * verified on retry.
+ */
 export class ProductionOpeningBackupAdapter implements OpeningBackupAdapter {
   readonly durability: OpeningBackupDurability = "persistent";
   private readonly directory: string;
+  private stagingSequence = 0;
 
   constructor(directory: string | undefined | null) {
     if (!directory || directory.trim() === "") {
@@ -270,43 +263,48 @@ export class ProductionOpeningBackupAdapter implements OpeningBackupAdapter {
 
   async backup(request: OpeningBackupRequest): Promise<OpeningBackupManifest> {
     this.ensureUsableDirectory();
-    const prefix = `casino-opening-${request.planHash}`;
-    const manifestPath = join(this.directory, `${prefix}-manifest.json`);
-    const existing = this.readExistingManifest(manifestPath);
+    const finalDirectory = this.bundleDirectory(request.planHash);
+    const existing = this.readExistingManifest(finalDirectory);
     if (existing) {
-      this.assertExistingBackupMatchesRequest(existing, request);
+      this.assertExistingBackupMatchesRequest(existing, request, finalDirectory);
       return existing;
     }
 
-    const tempPrefix = join(this.directory, `.${prefix}.${process.pid}.${Date.now()}`);
+    const stagingDirectory = join(
+      this.directory,
+      `.casino-opening-${request.planHash}.staging-${process.pid}-${Date.now()}-${++this.stagingSequence}`,
+    );
+    mkdirSync(stagingDirectory, { mode: 0o700 });
+
     const bytes = request.db.serialize();
     const manifest = computeBackupManifest(request);
     const finalManifest: OpeningBackupManifest = { ...manifest, sqliteSha256: sha256Hex(bytes) };
-
-    const published: string[] = [];
-    const tempFiles: Array<{ temp: string; final: string }> = [];
+    let published = false;
     try {
-      const sqliteTemp = `${tempPrefix}.sqlite.tmp`;
-      writeFileSync(sqliteTemp, bytes, { mode: 0o600 });
-      tempFiles.push({ temp: sqliteTemp, final: join(this.directory, `${prefix}.sqlite`) });
-
+      writeFileSync(join(stagingDirectory, "snapshot.sqlite"), bytes, { mode: 0o600 });
       for (const entry of finalManifest.csv) {
         const { csv: text } = tableToCsv(request.db, entry.table);
-        const temp = `${tempPrefix}-${entry.table}.csv.tmp`;
-        writeFileSync(temp, text, { encoding: "utf8", mode: 0o600 });
-        tempFiles.push({ temp, final: join(this.directory, `${prefix}-${entry.table}.csv`) });
+        writeFileSync(this.csvPath(stagingDirectory, entry.table), text, { encoding: "utf8", mode: 0o600 });
+      }
+      // manifest is deliberately last within staging; staging itself is never treated as completed.
+      writeFileSync(join(stagingDirectory, "manifest.json"), JSON.stringify(finalManifest, null, 2), {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+
+      const stagedCheck = this.verifyBundleFiles(stagingDirectory, finalManifest);
+      if (!stagedCheck.ok) {
+        throw new Error(`opening backup staging verification failed: ${stagedCheck.problems.join("; ")}`);
+      }
+      if (existsSync(finalDirectory)) {
+        throw new Error(`opening backup final directory already exists: ${finalDirectory}`);
       }
 
-      const manifestTemp = `${tempPrefix}-manifest.json.tmp`;
-      writeFileSync(manifestTemp, JSON.stringify(finalManifest, null, 2), { encoding: "utf8", mode: 0o600 });
-      tempFiles.push({ temp: manifestTemp, final: manifestPath });
-
-      for (const file of tempFiles) {
-        if (existsSync(file.final)) throw new Error(`opening backup already exists: ${basename(file.final)}`);
-        renameSync(file.temp, file.final);
-        this.restrict(file.final);
-        published.push(file.final);
-      }
+      // Both paths are siblings under the configured persistent root, so this is a same-filesystem
+      // directory rename and publishes sqlite/csv/manifest as one atomic directory entry.
+      renameSync(stagingDirectory, finalDirectory);
+      published = true;
+      this.restrictBundle(finalDirectory, finalManifest);
 
       const verified = await this.verifyPersistedBackup(finalManifest, this.expectationForRequest(request));
       if (!verified.ok) {
@@ -314,11 +312,10 @@ export class ProductionOpeningBackupAdapter implements OpeningBackupAdapter {
       }
       return finalManifest;
     } catch (error) {
-      for (const file of tempFiles) {
-        if (existsSync(file.temp)) rmSync(file.temp, { force: true });
-      }
-      for (const file of published) {
-        if (existsSync(file)) rmSync(file, { force: true });
+      // A real process crash never reaches this catch and may leave an orphan staging directory.
+      // Retries ignore staging directories. Never remove a published/completed final directory here.
+      if (!published && existsSync(stagingDirectory)) {
+        rmSync(stagingDirectory, { recursive: true, force: true });
       }
       throw error;
     }
@@ -329,7 +326,7 @@ export class ProductionOpeningBackupAdapter implements OpeningBackupAdapter {
     expectation: ManifestVerificationExpectation,
   ): Promise<OpeningBackupVerificationResult> {
     const manifestCheck = verifyOpeningBackupManifest(manifest, expectation);
-    const diskCheck = verifyOpeningBackupFilesOnDisk(this.directory, manifest);
+    const diskCheck = this.verifyBundleFiles(this.bundleDirectory(manifest.planHash), manifest);
     return {
       ok: manifestCheck.ok && diskCheck.ok,
       problems: [...manifestCheck.problems, ...diskCheck.problems],
@@ -345,8 +342,26 @@ export class ProductionOpeningBackupAdapter implements OpeningBackupAdapter {
     rmSync(probe, { force: true });
   }
 
-  private readExistingManifest(manifestPath: string): OpeningBackupManifest | null {
-    if (!existsSync(manifestPath)) return null;
+  private bundleDirectory(planHash: string): string {
+    return join(this.directory, `casino-opening-${planHash}`);
+  }
+
+  private csvPath(directory: string, table: string): string {
+    if (table === "" || table.includes("/") || table.includes("\\") || table === "." || table === "..") {
+      throw new Error(`unsafe opening backup table filename: ${JSON.stringify(table)}`);
+    }
+    return join(directory, `${table}.csv`);
+  }
+
+  private readExistingManifest(finalDirectory: string): OpeningBackupManifest | null {
+    if (!existsSync(finalDirectory)) return null;
+    if (!statSync(finalDirectory).isDirectory()) {
+      throw new Error(`existing opening backup path is not a directory: ${finalDirectory}`);
+    }
+    const manifestPath = join(finalDirectory, "manifest.json");
+    if (!existsSync(manifestPath)) {
+      throw new Error(`existing opening backup is incomplete: manifest missing: ${manifestPath}`);
+    }
     try {
       return JSON.parse(readFileSync(manifestPath, "utf8")) as OpeningBackupManifest;
     } catch {
@@ -354,15 +369,77 @@ export class ProductionOpeningBackupAdapter implements OpeningBackupAdapter {
     }
   }
 
-  private assertExistingBackupMatchesRequest(manifest: OpeningBackupManifest, request: OpeningBackupRequest): void {
-    const expected = { ...computeBackupManifest(request), createdAt: manifest.createdAt, sqliteSha256: sha256Hex(request.db.serialize()) };
+  private assertExistingBackupMatchesRequest(
+    manifest: OpeningBackupManifest,
+    request: OpeningBackupRequest,
+    finalDirectory: string,
+  ): void {
+    const expected = {
+      ...computeBackupManifest(request),
+      createdAt: manifest.createdAt,
+      sqliteSha256: sha256Hex(request.db.serialize()),
+    };
     if (canonicalStringify(manifest) !== canonicalStringify(expected)) {
       throw new Error(`opening backup conflict for planHash ${request.planHash}`);
     }
-    const verified = verifyOpeningBackupFilesOnDisk(this.directory, manifest);
+    const verified = this.verifyBundleFiles(finalDirectory, manifest);
     if (!verified.ok) {
       throw new Error(`existing opening backup is incomplete or corrupt: ${verified.problems.join("; ")}`);
     }
+  }
+
+  private verifyBundleFiles(directory: string, manifest: OpeningBackupManifest): FileBackupVerificationResult {
+    const problems: string[] = [];
+    if (!existsSync(directory) || !statSync(directory).isDirectory()) {
+      return { ok: false, problems: [`backup directory does not exist: ${directory}`] };
+    }
+
+    const manifestPath = join(directory, "manifest.json");
+    if (!existsSync(manifestPath)) {
+      problems.push(`manifestファイルが存在しない: ${manifestPath}`);
+    } else if (statSync(manifestPath).size === 0) {
+      problems.push(`manifestファイルが空: ${manifestPath}`);
+    } else {
+      try {
+        const onDisk = JSON.parse(readFileSync(manifestPath, "utf8")) as OpeningBackupManifest;
+        if (canonicalStringify(onDisk) !== canonicalStringify(manifest)) {
+          problems.push(`manifestファイルの内容が保持しているmanifestと一致しない: ${manifestPath}`);
+        }
+      } catch {
+        problems.push(`manifestファイルのJSONが不正: ${manifestPath}`);
+      }
+    }
+
+    const sqlitePath = join(directory, "snapshot.sqlite");
+    if (!existsSync(sqlitePath)) {
+      problems.push(`SQLiteスナップショットファイルが存在しない: ${sqlitePath}`);
+    } else if (statSync(sqlitePath).size === 0) {
+      problems.push(`SQLiteスナップショットファイルが空: ${sqlitePath}`);
+    } else if (sha256Hex(readFileSync(sqlitePath)) !== manifest.sqliteSha256) {
+      problems.push(`SQLiteスナップショットの実ファイルhashがmanifestと一致しない: ${sqlitePath}`);
+    }
+
+    for (const entry of manifest.csv) {
+      let csvPath: string;
+      try {
+        csvPath = this.csvPath(directory, entry.table);
+      } catch (error) {
+        problems.push(error instanceof Error ? error.message : String(error));
+        continue;
+      }
+      if (!existsSync(csvPath)) {
+        problems.push(`CSVファイルが存在しない: ${csvPath}`);
+        continue;
+      }
+      if (statSync(csvPath).size === 0) {
+        problems.push(`CSVファイルが空: ${entry.table}`);
+        continue;
+      }
+      if (sha256Hex(readFileSync(csvPath, "utf8")) !== entry.sha256) {
+        problems.push(`CSVファイルの実ファイルhashがmanifestと一致しない: ${entry.table}`);
+      }
+    }
+    return { ok: problems.length === 0, problems };
   }
 
   private expectationForRequest(request: OpeningBackupRequest): ManifestVerificationExpectation {
@@ -387,12 +464,15 @@ export class ProductionOpeningBackupAdapter implements OpeningBackupAdapter {
     };
   }
 
-  private restrict(path: string): void {
+  private restrictBundle(directory: string, manifest: OpeningBackupManifest): void {
     try {
-      chmodSync(path, 0o600);
-      chmodSync(dirname(path), 0o700);
+      chmodSync(directory, 0o700);
+      chmodSync(join(directory, "snapshot.sqlite"), 0o600);
+      chmodSync(join(directory, "manifest.json"), 0o600);
+      for (const entry of manifest.csv) chmodSync(this.csvPath(directory, entry.table), 0o600);
+      chmodSync(this.directory, 0o700);
     } catch {
-      // Windows can ignore POSIX modes; verification is handled by read-back checks.
+      // Windows can ignore POSIX modes; read-back verification remains authoritative.
     }
   }
 }
@@ -419,9 +499,7 @@ export interface ManifestVerificationExpectation {
   latestChipGroupGeneration?: string;
   /**
    * 検証時点のDB接続。渡された場合、manifestが主張するsqliteSha256・各CSVのsha256を
-   * **実データから再計算して突き合わせる**（形式が64桁hexというだけの検証では、
-   * 全部0のような無意味な値でも「形式は正しい」を通過してしまうため）。
-   * 省略した場合は形式検証のみ行う（テストの都合上、明示的に緩めたい場合だけ省略すること）。
+   * **実データから再計算して突き合わせる**。省略した場合は形式検証のみ行う。
    */
   liveDb?: Database.Database;
 }
@@ -431,10 +509,7 @@ export interface ManifestVerificationResult {
   problems: string[];
 }
 
-/**
- * manifestの完全検証（CLAUDE.md §7）。文字列一致だけでなく、実データとの整合を全部見る。
- * 1件でも不一致ならバックアップは信用できない = applyの破壊的transactionへ進めない。
- */
+/** manifestの完全検証。1件でも不一致ならバックアップは信用しない。 */
 export function verifyOpeningBackupManifest(
   manifest: OpeningBackupManifest,
   expectation: ManifestVerificationExpectation,
@@ -462,25 +537,19 @@ export function verifyOpeningBackupManifest(
     problems.push("schema fingerprint不一致");
   }
   if (expectation.openingVersion !== undefined && manifest.openingVersion !== expectation.openingVersion) {
-    problems.push(
-      `openingVersion不一致: manifest=${manifest.openingVersion} expected=${expectation.openingVersion}`,
-    );
+    problems.push(`openingVersion不一致: manifest=${manifest.openingVersion} expected=${expectation.openingVersion}`);
   }
   if (
     expectation.latestLandTransactionId !== undefined &&
     manifest.latestLandTransactionId !== expectation.latestLandTransactionId
   ) {
-    problems.push(
-      `latestLandTransactionId不一致: manifest=${manifest.latestLandTransactionId} expected=${expectation.latestLandTransactionId}`,
-    );
+    problems.push(`latestLandTransactionId不一致: manifest=${manifest.latestLandTransactionId} expected=${expectation.latestLandTransactionId}`);
   }
   if (
     expectation.latestChipTransactionId !== undefined &&
     manifest.latestChipTransactionId !== expectation.latestChipTransactionId
   ) {
-    problems.push(
-      `latestChipTransactionId不一致: manifest=${manifest.latestChipTransactionId} expected=${expectation.latestChipTransactionId}`,
-    );
+    problems.push(`latestChipTransactionId不一致: manifest=${manifest.latestChipTransactionId} expected=${expectation.latestChipTransactionId}`);
   }
   if (
     expectation.latestChipGroupGeneration !== undefined &&
@@ -521,8 +590,7 @@ export function verifyOpeningBackupManifest(
       const actualColumns = expectation.liveDb && tableExists(expectation.liveDb, entry.table)
         ? tableColumns(expectation.liveDb, entry.table)
         : entry.columns;
-      const same =
-        actualColumns.length === expectedColumns.length && actualColumns.every((c, i) => c === expectedColumns[i]);
+      const same = actualColumns.length === expectedColumns.length && actualColumns.every((c, i) => c === expectedColumns[i]);
       if (!same) {
         problems.push(`CSV列一覧が期待値と一致しない: ${entry.table}`);
       }
@@ -538,16 +606,8 @@ export interface FileBackupVerificationResult {
 }
 
 /**
- * ファイルシステム上に実際に書き出されたbackupを、manifestの主張と突き合わせて検証する
- * （CLAUDE.md §7「実ファイルが存在する」「SQLite hash一致」「CSV hash一致」）。
- *
- * `verifyOpeningBackupManifest` は manifest と稼働中DBの整合を見るだけで、
- * **ディスク上のファイル自体**は見ない。こちらは逆に、manifestが主張する
- * ファイルが実在し、中身のsha256が本当にmanifestの値と一致するかだけを見る
- * （欠落・空ファイル・改竄・manifestだけ正しい偽ファイル、をすべて検出できる）。
- *
- * ファイル名規約は `TestFilesystemOpeningBackupAdapter` と揃える
- * （`casino-opening-<planHash>.sqlite` / `casino-opening-<planHash>-<table>.csv`）。
+ * TestFilesystemOpeningBackupAdapter が使う従来flat layoutの実ファイル検証。
+ * ProductionOpeningBackupAdapter はatomic bundle専用のprivate verifierを使う。
  */
 export function verifyOpeningBackupFilesOnDisk(
   directory: string,
@@ -556,11 +616,6 @@ export function verifyOpeningBackupFilesOnDisk(
   const problems: string[] = [];
   const prefix = `casino-opening-${manifest.planHash}`;
 
-  // manifest自体もディスク上の実体として存在し、保持しているmanifestオブジェクトと
-  // 一致することを確認する（PR12監査ブロッカーC: resume時の永続backup再検証）。
-  // manifest.jsonが削除・改竄されていても、実行中プロセスはDBに保存済みの
-  // backupManifest列（インメモリのJSオブジェクト）だけを見て「検証済み」と誤認しうるため、
-  // ディスク上の実ファイルも独立して確認する。
   const manifestPath = join(directory, `${prefix}-manifest.json`);
   if (!existsSync(manifestPath)) {
     problems.push(`manifestファイルが存在しない: ${manifestPath}`);
