@@ -136,6 +136,7 @@ describe("shared-table risk exposure", () => {
   it("passes at exactly 50% holdings and rejects one Land over without writing an exposure", () => {
     const ctx = setup({ dailyLossLimitBps: 10_000 });
     seedChips(ctx, "alice", 10_000);
+    seedChips(ctx, "bob", 10_000);
 
     // ちょうど50%は通る
     const ok = ctx.dailyRisk.authorizeExposure({
@@ -148,11 +149,11 @@ describe("shared-table risk exposure", () => {
     });
     expect(ok.maxPlayerLoss).toBe(5_000);
 
-    // 1 Ld でも超えたら断る（露出は 5,000 のまま）
+    // 1 Ld でも超えたら断る。露出は1行も書かれない
     expect(() =>
       ctx.dailyRisk.authorizeExposure({
-        userId: "alice",
-        scopeKey: "roulette:s1",
+        userId: "bob",
+        scopeKey: "roulette:s2",
         operationId: "op2",
         game: "ルーレット",
         maxPlayerLoss: 5_001,
@@ -181,13 +182,41 @@ describe("shared-table risk exposure", () => {
     seedChips(ctx, "alice", 10_000);
     const base = { userId: "alice", scopeKey: "pvp:s1", game: "chohan-multi", mode: "add" as const };
 
+    // 実際の徴収と同じ順序（枠を取る → エスクローへ預ける）で積み増す
     ctx.dailyRisk.authorizeExposure({ ...base, operationId: "op1", maxPlayerLoss: 1_000 });
+    ctx.escrow.hold("pvp:s1", "alice", 1_000, "chohan-multi", "hold-1");
     ctx.dailyRisk.authorizeExposure({ ...base, operationId: "op2", maxPlayerLoss: 500 });
+    ctx.escrow.hold("pvp:s1", "alice", 500, "chohan-multi", "hold-2");
     expect(exposureRows(ctx)[0]?.max_player_loss).toBe(1_500);
 
     // 積み増した結果が所持50%を超えるなら断る（積み増しぶんだけでは判定しない）
     expect(() => ctx.dailyRisk.authorizeExposure({ ...base, operationId: "op3", maxPlayerLoss: 4_000 })).toThrow(DailyRiskError);
     expect(exposureRows(ctx)[0]?.max_player_loss).toBe(1_500);
+  });
+
+  it("judges a split stake the same as a single one by adding the table's own escrow back", () => {
+    // 所持は「通常Land + 自由チップ」でエスクローを含めないので、素直に比べると
+    // 同じ 5,000 でも「1口で張る」と「3,000+2,000 に割る」で判定が変わってしまう。
+    // その卓へ預けたぶんだけ足し戻して、どちらでも同じ結論になることを固定する。
+    const single = setup({ dailyLossLimitBps: 10_000 });
+    seedChips(single, "alice", 10_000);
+    expect(
+      single.dailyRisk.authorizeExposure({ userId: "alice", scopeKey: "keiba:s1", operationId: "op1", game: "競馬", maxPlayerLoss: 5_000, mode: "add" })
+        .maxPlayerLoss,
+    ).toBe(5_000);
+
+    const split = setup({ dailyLossLimitBps: 10_000 });
+    seedChips(split, "alice", 10_000);
+    const base = { userId: "alice", scopeKey: "keiba:s1", game: "競馬", mode: "add" as const };
+    split.dailyRisk.authorizeExposure({ ...base, operationId: "op1", maxPlayerLoss: 3_000 });
+    split.escrow.hold("keiba:s1", "alice", 3_000, "keiba", "hold-1");
+    expect(split.dailyRisk.holdings("alice")).toBe(7_000); // エスクローは所持から抜けている
+    expect(split.dailyRisk.authorizeExposure({ ...base, operationId: "op2", maxPlayerLoss: 2_000 }).maxPlayerLoss).toBe(5_000);
+
+    // 1 Ld 上乗せは合計 5,001 になるので、どちらの張り方でも断られる
+    split.escrow.hold("keiba:s1", "alice", 2_000, "keiba", "hold-2");
+    expect(() => split.dailyRisk.authorizeExposure({ ...base, operationId: "op3", maxPlayerLoss: 1 })).toThrow(DailyRiskError);
+    expect(exposureRows(split)[0]?.max_player_loss).toBe(5_000);
   });
 
   it("replays the same operation and rejects the same operation with a different payload", () => {

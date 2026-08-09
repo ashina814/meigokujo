@@ -22,13 +22,14 @@ import type { Services } from "../services.js";
  * ## 排他の全方向
  *
  * ```text
- * 順位卓 live      → ソロ / ルーレット / 対人卓  すべて拒否
- * ソロ live        → 順位卓 / 対人卓 / ルーレット すべて拒否
- * ルーレット live  → 順位卓 / ソロ / 対人卓      すべて拒否
- * 対人卓 live      → 順位卓 / ソロ / ルーレット  すべて拒否
+ * 順位卓 live      → ソロ / ルーレット / 対人卓 / 競馬  すべて拒否
+ * ソロ live        → 順位卓 / 対人卓 / ルーレット / 競馬 すべて拒否
+ * ルーレット live  → 順位卓 / ソロ / 対人卓 / 競馬      すべて拒否
+ * 対人卓 live      → 順位卓 / ソロ / ルーレット / 競馬  すべて拒否
+ * 競馬 live        → 順位卓 / ソロ / ルーレット / 対人卓 すべて拒否
  * ```
  */
-export type TransientParticipationKind = "solo" | "roulette" | "pvp";
+export type TransientParticipationKind = "solo" | "roulette" | "pvp" | "keiba";
 
 interface TransientHolding {
   kind: TransientParticipationKind;

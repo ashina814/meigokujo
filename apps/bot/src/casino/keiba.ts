@@ -13,9 +13,11 @@ import {
   type ChatInputCommandInteraction,
   type Message,
 } from "discord.js";
-import { JACKPOT_HOLDER, KEIBA_HOUSE_RATE, escrowHolderFor } from "@meigokujo/core";
+import { DailyRiskError, JACKPOT_HOLDER, KEIBA_HOUSE_RATE, escrowHolderFor } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
+import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
+import { acquireTransientParticipation, releaseTransientParticipation } from "./participation.js";
 import { C_LOSE, C_MAMMON, C_WIN, E, buildLobbyEmbed } from "./ui.js";
 
 /**
@@ -60,11 +62,227 @@ const HORSES: readonly Horse[] = [
 
 type BetType = "win" | "place";
 
-interface Bet {
+export interface Bet {
   userId: string;
   horseId: number;
   type: BetType;
   amount: number;
+}
+
+/**
+ * 競馬レースのリスク枠の名前（PR23 追補）。
+ *
+ * 競馬は**同一人が同じレースへ何口でも張れる**ので、露出は「レース×利用者」で1行にまとめ、
+ * 追加の賭けは `add` で積み増す。馬や単勝/複勝が違っても、同じレースで同時に全額失いうる以上、
+ * 安全上限は**その人のレース合計**で評価する（正本 §15.1）。
+ */
+export function keibaRiskScope(session: string): string {
+  return `keiba:${session}`;
+}
+
+/** PR23 の安全上限に弾かれた（同時参加・所持50%・日次純損失上限）。資金は動いていない */
+class KeibaRiskRejected extends Error {
+  constructor(readonly detail: string) {
+    super("ERR_KEIBA_RISK");
+    this.name = "KeibaRiskRejected";
+  }
+}
+
+/** エスクローへの預託に失敗した（残高不足）。露出もこの直前の状態へ巻き戻る */
+class KeibaEscrowShortfall extends Error {
+  constructor() {
+    super("ERR_KEIBA_ESCROW_SHORTFALL");
+    this.name = "KeibaEscrowShortfall";
+  }
+}
+
+export type AcceptKeibaBetResult =
+  | { ok: true }
+  | { ok: false; reason: "broke" }
+  | { ok: false; reason: "conflict" }
+  | { ok: false; reason: "risk"; detail: string };
+
+/** 外側グループ（`keiba:bet:*`）の要求指紋。replay 時に今回の引数と突き合わせる */
+interface KeibaBetFingerprint {
+  session: string;
+  userId: string;
+  horseId: number;
+  type: BetType;
+  amount: number;
+}
+
+/**
+ * 1口ぶんの受付を1つの原子操作として行う（PR23 追補）。
+ *
+ * 資金（エスクロー）へ触る**前**に
+ *
+ * 1. 一時参加の排他（順位卓 live / ソロ席 / 対人卓 / ルーレット卓）
+ * 2. レース合計での所持50%
+ * 3. レース合計での当日残り許容損失
+ *
+ * を通し、露出を積み増す。どこで失敗しても外側グループごと巻き戻るので、
+ * 拒否時は Land・自由チップ・エスクロー・JP・`casino_tx` が1行も動かない。
+ *
+ * `escrow.hold()` はこの外側グループの中から呼ばれる nested 呼び出しなので、
+ * hold 自身の取り違え検出には到達しない（ルーレットと同じ事情）。そのため
+ * 外側グループの戻り値に要求指紋を積み、replay 時に突き合わせて conflict を返す。
+ */
+export function acceptKeibaBet(
+  services: Services,
+  session: string,
+  bets: Map<string, Bet[]>,
+  userId: string,
+  horseId: number,
+  type: BetType,
+  amount: number,
+  operationId: string,
+): AcceptKeibaBetResult {
+  const riskScope = keibaRiskScope(session);
+  const requested: KeibaBetFingerprint = { session, userId, horseId, type, amount };
+  // 同じレースへの追加の賭けは同じ卓なので再取得を許す
+  if (!acquireTransientParticipation(services, userId, "keiba", riskScope, { reentrant: true })) {
+    return { ok: false, reason: "risk", detail: "ほかの卓に着いている。そちらを終わらせてからだ。" };
+  }
+  let stored: KeibaBetFingerprint | undefined;
+  try {
+    stored = services.chips.runGroup(
+      { groupKey: `keiba:bet:${session}:${userId}:${operationId}`, kind: "table_hold", actorId: userId },
+      (): KeibaBetFingerprint => {
+        try {
+          services.dailyRisk.authorizeExposure({
+            userId,
+            scopeKey: riskScope,
+            operationId,
+            game: "競馬",
+            maxPlayerLoss: amount,
+            // 同一レースの複数口は合算して判定する（1口ずつでは上限をすり抜けられる）
+            mode: "add",
+          });
+        } catch (e) {
+          throw new KeibaRiskRejected(keibaRiskDetail(services, userId, e));
+        }
+        if (!services.escrow.hold(session, userId, amount, "keiba", operationId)) {
+          throw new KeibaEscrowShortfall();
+        }
+        return requested;
+      },
+    );
+  } catch (e) {
+    // 失敗はグループごと巻き戻っている。ただし同じレースに既に成立した口があるなら
+    // 預り金の裏付けとして席は手放さない（§10 のライフサイクル）
+    if (!hasLiveKeibaExposure(services, riskScope, userId)) {
+      releaseTransientParticipation(userId, "keiba", riskScope);
+    }
+    if (e instanceof KeibaRiskRejected) return { ok: false, reason: "risk", detail: e.detail };
+    if (e instanceof KeibaEscrowShortfall) return { ok: false, reason: "broke" };
+    throw e;
+  }
+  if (
+    stored === undefined ||
+    stored.session !== session ||
+    stored.userId !== userId ||
+    stored.horseId !== horseId ||
+    stored.type !== type ||
+    stored.amount !== amount
+  ) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[keiba] bet operation conflict: session=${session} userId=${userId} operationId=${operationId} stored=${JSON.stringify(stored)} requested=${JSON.stringify(requested)}`,
+    );
+    return { ok: false, reason: "conflict" };
+  }
+  const arr = bets.get(userId) ?? [];
+  arr.push({ userId, horseId, type, amount });
+  bets.set(userId, arr);
+  return { ok: true };
+}
+
+/**
+ * レース精算とリスク確定を**ひとつのトランザクション**で行う（PR23 追補）。
+ *
+ * 記録する額は実際の残高変動そのもの（受取 − そのレースへ出した総額）。
+ * JP へ抜けた場代は「受取が出した額を下回る」形で自然に損失側へ入るので、別途足さない。
+ * リスク記録が落ちればレース精算ごと巻き戻る。
+ *
+ * **配当・場代・JP の行き先・レースルールは一切変えていない。**
+ */
+export function settleKeibaRace(
+  services: Services,
+  session: string,
+  distributions: ReadonlyArray<{ to: string; amount: number; reason: string }>,
+): void {
+  const riskScope = keibaRiskScope(session);
+  const participants = keibaParticipants(services, session);
+  services.chips.runGroup(
+    { groupKey: `keiba:settle:${session}`, kind: "table_settle", actorId: "system:keiba" },
+    () => {
+      // 露出（＝そのレースへ出した総額）は帳簿を消す前に読む
+      const staked = new Map<string, number>();
+      for (const row of services.escrow.list(session)) staked.set(row.user_id, (staked.get(row.user_id) ?? 0) + row.amount);
+      const received = new Map<string, number>();
+      for (const d of distributions) if (d.amount > 0) received.set(d.to, (received.get(d.to) ?? 0) + d.amount);
+      services.escrow.settle(session, [...distributions], "system:keiba", `race ${session}`);
+      for (const [userId, stake] of staked) {
+        services.dailyRisk.settleExposure({
+          scopeKey: riskScope,
+          userId,
+          operationId: session,
+          netSigned: (received.get(userId) ?? 0) - stake,
+        });
+      }
+    },
+  );
+  for (const userId of participants) releaseTransientParticipation(userId, "keiba", riskScope);
+}
+
+/**
+ * レースごと流す（全額返金し、露出も一括で解く）。純損益0なので当日枠は動かさない。
+ * 返金と露出解放を同じトランザクションに入れて、「返金だけ通って露出が残る」状態を作らない。
+ */
+export function voidKeibaRace(services: Services, session: string): void {
+  const riskScope = keibaRiskScope(session);
+  const participants = keibaParticipants(services, session);
+  services.chips.runGroup(
+    { groupKey: `keiba:void:${session}`, kind: "table_refund", actorId: "system:keiba" },
+    () => {
+      services.escrow.refund(session);
+      services.dailyRisk.releaseExposureScope(riskScope);
+    },
+  );
+  for (const userId of participants) releaseTransientParticipation(userId, "keiba", riskScope);
+}
+
+/** そのレースに預けている参加者（精算・返金の前に読む） */
+function keibaParticipants(services: Services, session: string): string[] {
+  try {
+    return [...new Set(services.escrow.list(session).map((row) => row.user_id))];
+  } catch {
+    return [];
+  }
+}
+
+/** 露出が残っているか。判定できなければ fail-closed で「残っている」扱い */
+function hasLiveKeibaExposure(services: Services, riskScope: string, userId: string): boolean {
+  try {
+    return services.dailyRisk.exposureOf(riskScope, userId) !== null;
+  } catch {
+    return true;
+  }
+}
+
+/** PR23 拒否理由の文面 */
+function keibaRiskDetail(services: Services, userId: string, error: unknown): string {
+  if (error instanceof DailyRiskError && error.code === "ERR_DAILY_RISK_LIMIT") {
+    try {
+      const day = services.dailyRisk.dayFor(userId);
+      return day.remainingLossBudget > 0
+        ? `このレースへの賭けが所持額に対して大きすぎる。残り許容損失は ${fmtEther(day.remainingLossBudget)}。`
+        : `今日はここまでだ。日次損失上限 ${fmtEther(day.lossCap)} に達している。`;
+    } catch {
+      return "賭場の利用制限を確認できないため、いまは張れない。";
+    }
+  }
+  return "賭場の利用制限を確認できないため、いまは張れない。";
 }
 
 const activeSessions = new Set<string>();
@@ -191,13 +409,20 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
         await sub.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} Ld で。`, flags: MessageFlags.Ephemeral });
         return;
       }
-      if (!services.escrow.hold(session, btn.user.id, amt, "keiba", btn.id)) {
+      // 資金へ触る前に PR23 の安全上限を通す（拒否時は1 Ld も動かない）
+      const accepted = acceptKeibaBet(services, session, bets, btn.user.id, horseId, type, amt, btn.id);
+      if (!accepted.ok) {
+        if (accepted.reason === "risk") {
+          await sub.reply({ content: accepted.detail, flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (accepted.reason === "conflict") {
+          await sub.reply({ content: "処理に失敗した。もう一度張り直してくれ。", flags: MessageFlags.Ephemeral });
+          return;
+        }
         await sub.reply({ content: "Land残高が足りない。", flags: MessageFlags.Ephemeral });
         return;
       }
-      const arr = bets.get(btn.user.id) ?? [];
-      arr.push({ userId: btn.user.id, horseId, type, amount: amt });
-      bets.set(btn.user.id, arr);
       await sub.reply({
         content: `✅ ${type === "win" ? "単勝" : "複勝"} ${horseId}番 に ${fmtEther(amt)} を張った。`,
         flags: MessageFlags.Ephemeral,
@@ -259,7 +484,8 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
   } catch (e) {
     console.error("[keiba] レース異常終了・全額返金:", e);
     try {
-      services.escrow.refund(session);
+      // 返金・露出解放・席の解放をまとめて行う（純損益0なので当日枠は動かさない）
+      voidKeibaRace(services, session);
     } catch {
       /* houseに残っているはずだが念のため */
     }
@@ -417,8 +643,9 @@ async function runSession(interaction: ChatInputCommandInteraction, services: im
     distributions.push({ to: JACKPOT_HOLDER, amount: placeDistributable, reason: "複勝キャリーオーバー" });
   }
 
-  // 原子的精算（合計 !== プールなら例外・途中失敗も全ロールバック）
-  services.escrow.settle(session, distributions, "system:keiba", `race ${session}`);
+  // 原子的精算（合計 !== プールなら例外・途中失敗も全ロールバック）。
+  // PR23: 参加者ごとの実純損益（受取 − 出した総額）を同じトランザクションで当日枠へ記録する
+  settleKeibaRace(services, session, distributions);
 
   const winnerHorse = HORSES.find((h) => h.id === winnerId)!;
   const top3 = finished.slice(0, 3).map((id, i) => {

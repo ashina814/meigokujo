@@ -270,7 +270,11 @@ export class DailyRisk {
       // 張り直しは差し替え、増し賭けは積み増し。どちらも「この卓で失いうる総額」を判定に使う
       const nextMax = mode === "add" ? checkedAdd(previousMax, amount, "exposure") : amount;
       const day = this.dayFor(userId);
-      this.assertHoldingsCoverage(userId, nextMax, "casino table participation requires at least 50% holdings coverage");
+      // その卓へ**既に**預けたぶんは `holdings` から抜けている（エスクローは所持に含めない）。
+      // 抜けたまま合計と比べると、同じ額を1口で張るか2口に割るかで判定が変わってしまうので、
+      // この卓ぶんだけ足し戻して「この卓に手を出す直前の所持」を基準にする。
+      // 他の卓の預託は同時参加排他があるので存在しない。
+      this.assertHoldingsCoverage(userId, nextMax, previousMax, "casino table participation requires at least 50% holdings coverage");
       this.assertProspective(day, nextMax);
       const at = this.now();
       this.db
@@ -414,7 +418,7 @@ export class DailyRisk {
       this.assertFormal();
       this.ensureSchema();
       const day = this.dayFor(userId);
-      this.assertHoldingsCoverage(userId, maxPlayerLoss, "ranked join requires at least 50% holdings coverage");
+      this.assertHoldingsCoverage(userId, maxPlayerLoss, 0, "ranked join requires at least 50% holdings coverage");
       this.assertProspective(day, maxPlayerLoss);
       const eventKey = `table_join_risk:${tableId}:${userId}:${operationId}`;
       const existing = this.db
@@ -473,9 +477,9 @@ export class DailyRisk {
    * 1 Ld でも超えたら断る。`maxPlayerLoss * 2` ではなく `floor(holdings / 2)` で比較して、
    * 破損した巨大値どうしの積が safe integer を外れないようにする。
    */
-  private assertHoldingsCoverage(userId: string, maxPlayerLoss: number, message: string): void {
+  private assertHoldingsCoverage(userId: string, maxPlayerLoss: number, alreadyEscrowedForScope: number, message: string): void {
     if (maxPlayerLoss <= 0) return;
-    const holdings = this.holdings(userId);
+    const holdings = checkedAdd(this.holdings(userId), alreadyEscrowedForScope, "coverageHoldings");
     if (maxPlayerLoss > Math.floor(holdings / 2)) {
       throw new DailyRiskError("ERR_DAILY_RISK_LIMIT", message, {
         userId,
