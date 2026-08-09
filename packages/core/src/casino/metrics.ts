@@ -618,7 +618,7 @@ export class CasinoMetrics {
         total_wager: checkedAddAll(wagers, "total_wager"),
         total_payout: checkedAddAll(payouts, "total_payout"),
         house_pnl: this.housePnl(start, end),
-        table_fee_income: 0,
+        table_fee_income: this.tableFeeIncome(start, end),
         jackpot_delta: this.jackpotDelta(start, end),
         fuku_outflow: this.fukuOutflow(start, end),
         table_open_count: this.countEvents("table_open", start, end),
@@ -898,6 +898,22 @@ export class CasinoMetrics {
       }
       assertSafeInteger(classified.amount, "house_pnl.classified_amount");
       total = checkedAdd(total, classified.amount, "house_pnl");
+    }
+    return total;
+  }
+
+  private tableFeeIncome(start: number, end: number): number {
+    const rows = this.db.prepare(`
+      SELECT amount
+      FROM casino_metric_events
+      WHERE event_type='table_start' AND occurred_at >= ? AND occurred_at < ?
+      ORDER BY id
+    `).all(start, end) as Array<{ amount: number | null }>;
+    let total = 0;
+    for (const row of rows) {
+      if (row.amount == null) throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "table_start.amount" });
+      assertNonNegative(row.amount, "table_start.amount");
+      total = checkedAdd(total, row.amount, "table_fee_income");
     }
     return total;
   }

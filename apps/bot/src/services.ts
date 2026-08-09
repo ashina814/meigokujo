@@ -43,6 +43,7 @@ import {
   Markets,
   MARKET_FINALIZER,
   PersistentTables,
+  RankedTables,
   Takutate,
   Escrow,
   CasinoChipAssets,
@@ -203,6 +204,7 @@ export function buildServices() {
   // 現れないので、渡さないとショップの域外確認票がゲーム中の自由チップを
   // Land へ戻せてしまう（監査ブロッカー・項目11）
   const chipFlow = new CasinoChipFlow(db, chips, events, chipAssets, { isSeatOccupied });
+  const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, casinoMetrics, { chipFlow, isSoloSeatOccupied: isSeatOccupied });
   const takutate = new Takutate(db, events);
   const casinoIntegrity = new CasinoIntegrity(db, ledger, chips, escrow, chipAssets);
   const openingPlanner = new OpeningPlanner({ db, ledger, chips, chipAssets, integrity: casinoIntegrity, status: casinoStatus, settings, departments });
@@ -219,7 +221,7 @@ export function buildServices() {
   // 資金を動かす経路は `chips` に一本化した（PR8監査・項目12）。`ether` は
   // 旧名称で書かれた外部プラグイン・古い呼び出しが**読むだけ**なら壊れないように
   // 残す互換窓で、型を `ChipReadonlyView` に狭めてある（下の注釈参照）。
-  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, persistentTables, takutate, freeSpins, reservations, recoveryRegistry, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, persistentTables, rankedTables, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;

@@ -1,6 +1,7 @@
 import { EmbedBuilder, type Client } from "discord.js";
 import { recoverCasinoAsync, type PersistentTableRestoreResult, type PersistentTableRow, type RecoverCasinoResult } from "@meigokujo/core";
 import type { Services } from "../services.js";
+import { renderRankedTable } from "./ranked-table-ui.js";
 
 const UNKNOWN_MESSAGE = 10008;
 
@@ -62,7 +63,9 @@ async function restoreOnePersistentTableMessage(
     return "disputed";
   }
 
-  const payload = renderPersistentTableRecoveryMessage(table);
+  const rendered = renderPersistentTableRecoveryMessage(services, table);
+  if (rendered === "disputed") return "disputed";
+  const payload = rendered;
   try {
     const message = await channel.messages.fetch(table.messageId);
     await message.edit(payload);
@@ -91,7 +94,17 @@ async function restoreOnePersistentTableMessage(
   }
 }
 
-function renderPersistentTableRecoveryMessage(table: PersistentTableRow): { embeds: EmbedBuilder[] } {
+function renderPersistentTableRecoveryMessage(services: Services, table: PersistentTableRow): { embeds: EmbedBuilder[]; components?: unknown[] } | "disputed" {
+  const rankedState = rankedStorageState(services, table.tableId);
+  if (rankedState === "partial") return markDisputed(services, table, "ranked table storage is partial");
+  try {
+    return renderRankedTable(services.rankedTables.snapshot(table.tableId));
+  } catch (e) {
+    if (rankedState !== "none") {
+      services.persistentTables.markDisputedFromRecovery(table.tableId, table.revision, boundField(e instanceof Error ? e.message : String(e), 500));
+      return "disputed";
+    }
+  }
   const tableId = boundField(table.tableId);
   const gameKey = boundField(table.gameKey);
   const state = boundField(table.state, 64);
@@ -106,6 +119,26 @@ function renderPersistentTableRecoveryMessage(table: PersistentTableRow): { embe
     .setFooter({ text: `rev ${table.revision}` })
     .setColor(table.state === "disputed" ? 0xb91c1c : 0x2563eb);
   return { embeds: [embed] };
+}
+
+function rankedStorageState(services: Services, tableId: string): "none" | "ranked" | "partial" {
+  const row = services.db
+    .prepare(
+      `SELECT base_amount, fee_per_user, participant_count, rank_profile_json,
+              result_json, result_hash, result_submitted_by, result_submitted_at, result_operation_id
+         FROM casino_tables WHERE table_id=?`,
+    )
+    .get(tableId) as Record<string, unknown> | undefined;
+  if (!row) return "none";
+  const configValues = [row.base_amount, row.fee_per_user, row.participant_count, row.rank_profile_json];
+  const resultValues = [row.result_json, row.result_hash, row.result_submitted_by, row.result_submitted_at, row.result_operation_id];
+  const hasConfig = configValues.some((value) => value !== null && value !== undefined);
+  const fullConfig = configValues.every((value) => value !== null && value !== undefined);
+  const hasResult = resultValues.some((value) => value !== null && value !== undefined);
+  const fullResult = resultValues.every((value) => value !== null && value !== undefined);
+  if (!hasConfig && !hasResult) return "none";
+  if (fullConfig && (!hasResult || fullResult)) return "ranked";
+  return "partial";
 }
 
 function markDisputed(services: Services, table: PersistentTableRow, reason: string): "disputed" {
