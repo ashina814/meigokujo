@@ -1,0 +1,106 @@
+name: PR109 Final Targeted Verification
+
+on:
+  push:
+    branches:
+      - feat/pr22-casino-disputes
+
+permissions:
+  contents: write
+
+jobs:
+  targeted:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/pr22-casino-disputes
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Add deterministic evidence/deadline race order coverage
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+          p = Path('packages/core/tests/casino-ranked-disputes-final-concurrency.serial.test.ts')
+          text = p.read_text(encoding='utf-8')
+          marker = '''  it("B: two manual arbitrations have one winner and move/release/refund/history exactly once", async () => {'''
+          if marker not in text:
+              raise SystemExit('B marker missing')
+          extra = r'''  it("A1: finalize commits first -> deadline closes to awaiting_arbitration and never refunds", async () => {
+    const ctx = setupFileDb();
+    const { deadline, evidenceOperationId } = disputedPostStart(ctx, "pending");
+    ctx.db.close();
+
+    const startAt = Date.now() + 2_000;
+    const [finalize, deadlineRun] = await Promise.all([
+      spawnRunner(ctx.dbPath, "finalize", evidenceOperationId, deadline - 1, deadline, startAt),
+      spawnRunner(ctx.dbPath, "deadline", "deadline:after-finalize", deadline - 1, deadline, startAt + 600),
+    ]);
+
+    expect(finalize.ok).toBe(true);
+    expect(deadlineRun.ok).toBe(true);
+    expect(deadlineRun.result).toEqual({ closed: 1, autoRefunded: 0, failed: 0 });
+    const db = openDb(ctx.dbPath);
+    expect(db.prepare("SELECT storage_status FROM casino_table_evidence WHERE operation_id=?").get(evidenceOperationId)).toEqual({ storage_status: "stored" });
+    expect(db.prepare("SELECT status, resolved_at FROM casino_table_disputes WHERE table_id='t1'").get()).toEqual({ status: "awaiting_arbitration", resolved_at: null });
+    expect(db.prepare("SELECT state FROM casino_tables WHERE table_id='t1'").get()).toEqual({ state: "disputed" });
+    expect((db.prepare("SELECT amount FROM ether_balances WHERE user_id=?").get(escrowHolderFor("t1")) as { amount: number }).amount).toBe(10_000);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM casino_tx_groups WHERE group_key LIKE 'ranked:dispute:t1:evidence-timeout:%'").get() as { n: number }).n).toBe(0);
+    db.close();
+  }, 60_000);
+
+  it("A2: deadline commits first -> one refund and later finalize is rejected", async () => {
+    const ctx = setupFileDb();
+    const { deadline, evidenceOperationId } = disputedPostStart(ctx, "pending");
+    ctx.db.close();
+
+    const startAt = Date.now() + 2_000;
+    const [deadlineRun, finalize] = await Promise.all([
+      spawnRunner(ctx.dbPath, "deadline", "deadline:before-finalize", deadline - 1, deadline, startAt),
+      spawnRunner(ctx.dbPath, "finalize", evidenceOperationId, deadline - 1, deadline, startAt + 600),
+    ]);
+
+    expect(deadlineRun.ok).toBe(true);
+    expect(deadlineRun.result).toEqual({ closed: 0, autoRefunded: 1, failed: 0 });
+    expect(finalize.ok).toBe(false);
+    const db = openDb(ctx.dbPath);
+    expect(db.prepare("SELECT storage_status FROM casino_table_evidence WHERE operation_id=?").get(evidenceOperationId)).toEqual({ storage_status: "pending" });
+    const dispute = db.prepare("SELECT status, resolved_at AS resolvedAt, resolution_kind AS resolutionKind FROM casino_table_disputes WHERE table_id='t1'").get() as { status: string; resolvedAt: number | null; resolutionKind: string | null };
+    expect(dispute.status).toBe("insufficient_evidence");
+    expect(dispute.resolutionKind).toBe("insufficient_evidence");
+    expect(dispute.resolvedAt).not.toBeNull();
+    expect(db.prepare("SELECT state FROM casino_tables WHERE table_id='t1'").get()).toEqual({ state: "cancelled" });
+    expect((db.prepare("SELECT amount FROM ether_balances WHERE user_id=?").get(escrowHolderFor("t1")) as { amount: number }).amount).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM casino_tx_groups WHERE group_key LIKE 'ranked:dispute:t1:evidence-timeout:%'").get() as { n: number }).n).toBe(1);
+    db.close();
+  }, 60_000);
+
+'''
+          p.write_text(text.replace(marker, extra + marker, 1), encoding='utf-8')
+          PY
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Core dispute targeted normal
+        run: pnpm --filter @meigokujo/core exec vitest run tests/casino-ranked-disputes.test.ts tests/casino-ranked-disputes-final.test.ts
+      - name: Core dispute separate-process targeted serial
+        run: pnpm --filter @meigokujo/core exec vitest run --config vitest.serial.config.ts tests/casino-ranked-disputes-concurrency.serial.test.ts tests/casino-ranked-disputes-final-concurrency.serial.test.ts
+      - name: Bot message/startup targeted
+        run: pnpm --filter @meigokujo/bot exec vitest run tests/casino-ranked-table-ui.test.ts tests/casino-ranked-message-sync-final.test.ts tests/casino-ranked-message-sync-startup.test.ts tests/casino-persistent-table-recovery.test.ts tests/casino-arbitration.test.ts
+      - name: Commit tested final review coverage
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/pr109-final-targeted.yml
+          git add packages/core/tests/casino-ranked-disputes-final-concurrency.serial.test.ts
+          git commit -m "test PR22 both evidence deadline race orderings"
+          git push origin HEAD:feat/pr22-casino-disputes
