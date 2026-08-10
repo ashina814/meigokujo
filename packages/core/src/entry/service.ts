@@ -39,7 +39,7 @@ export interface BookingRow {
 
 export interface SoulRow {
   user_id: string;
-  status: "waiting" | "ghost" | "majin" | "mazoku" | "meirei" | "departed";
+  status: "waiting" | "ghost" | "majin" | "kenma" | "mazoku" | "meirei" | "departed";
   joined_at: number | null;
   ghost_at: number | null;
   eval_deadline_at: number | null;
@@ -73,6 +73,7 @@ const DAY = 86_400;
 const ENTERED_STATUSES: ReadonlySet<SoulRow["status"]> = new Set<SoulRow["status"]>([
   "ghost",
   "majin",
+  "kenma",
   "mazoku",
   "meirei",
 ]);
@@ -691,7 +692,7 @@ export class Entry {
             deadline = ts + periodDays * DAY;
             ghostDeadlinesSet++;
           }
-        } else if (e.status === "majin" || e.status === "mazoku") {
+        } else if (e.status === "majin" || e.status === "kenma" || e.status === "mazoku") {
           ghostAt = ghostAt ?? ts;
           deadline = null;
         }

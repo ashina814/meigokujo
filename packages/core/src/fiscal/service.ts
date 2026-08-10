@@ -86,7 +86,7 @@ export class Fiscal {
     const rows = this.db
       .prepare(
         `SELECT user_id, ghost_at FROM souls
-         WHERE ghost_at IS NOT NULL AND ghost_at <= ? AND status IN ('ghost','majin','mazoku')
+         WHERE ghost_at IS NOT NULL AND ghost_at <= ? AND status IN ('ghost','majin','kenma','mazoku')
          ORDER BY ghost_at ASC`,
       )
       .all(cutoff) as Array<{ user_id: string; ghost_at: number }>;

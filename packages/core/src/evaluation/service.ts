@@ -290,6 +290,36 @@ export class Evaluation {
     this.events.log("promotion", { actor, target: targetId, payload: { to: "majin" } });
   }
 
+  /**
+   * Discord のロール構成に合わせて階級を書き直す（rank sync 専用）。
+   *
+   * **どの遷移を許すかはここでは判断しない。** 呼び出し側が
+   * `decideRankSync()` で許可された遷移だけを渡す約束にしてある。
+   * ここを汎用の「任意 status を書く口」にすると、入城処理を迂回して
+   * waiting から魔族へ飛ばす、といった使い方ができてしまう。
+   *
+   * 期待する現在値（`expectedFrom`）を渡し、UPDATE の WHERE で照合する。
+   * 判定してから書くまでの間に別経路が階級を動かしていたら 0 行更新になり、
+   * 古い判断で上書きしない。
+   */
+  syncStatusFromRoles(
+    targetId: string,
+    expectedFrom: string,
+    to: string,
+    actor: string,
+    meta: Record<string, unknown> = {},
+  ): boolean {
+    const changed = this.db
+      .prepare("UPDATE souls SET status = ?, updated_at = ? WHERE user_id = ? AND status = ?")
+      .run(to, now(), targetId, expectedFrom).changes;
+    if (changed !== 1) {
+      this.events.log("rank_sync_stale", { actor, target: targetId, payload: { expectedFrom, to, ...meta } });
+      return false;
+    }
+    this.events.log("rank_sync_applied", { actor, target: targetId, payload: { from: expectedFrom, to, ...meta } });
+    return true;
+  }
+
   // ---- カロンの材料 ----
 
   /** 評価期間中（ghost）の期限一覧。fromTs <= 期限 < toTs */

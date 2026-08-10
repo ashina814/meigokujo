@@ -35,6 +35,7 @@ import {
   type RefundSaga,
   type TicketPanel,
 } from "@meigokujo/core";
+import { reconcileMemberRank } from "../rank-sync.js";
 import { isAdmin } from "../permissions.js";
 import { registerTrustedRankedProfile } from "./casino-employee.js";
 import { ROLE_SLOT_META, ROLE_SLOT_ORDER, getRoleIds, setRoleIds, type RoleSlot } from "../church-roles.js";
@@ -147,6 +148,7 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "setting" && !action) return void (await interaction.update(await settingHome(services)));
   if (section === "setting" && action === "channel-select") return void (await openChannelSetup(interaction, services));
   if (section === "setting" && action === "category-select") return void (await openCategorySetup(interaction, services));
+  if (section === "ranksync" && !action) return void (await interaction.update(rankSyncHome()));
   if (section === "setting" && action === "role-select") return void (await openRoleSetup(interaction, services));
   if (section === "setting" && action === "number-select") return void (await openNumberSetup(interaction, services));
   if (section === "setting" && action === "eval-cap") return void (await interaction.update(evaluationCapHome(services)));
@@ -459,6 +461,23 @@ export async function handleAdminSelect(
     }));
   }
   // ── 特別プロフィール ──
+  if (section === "ranksync" && action === "target" && interaction.isUserSelectMenu()) {
+    const targetId = interaction.values[0]!;
+    if (!interaction.guild) {
+      return void (await interaction.update({ content: "サーバー内で実行してください。", embeds: [], components: [backButton()] }));
+    }
+    // 自動同期と**同じ判定**を即時に走らせるだけ。任意 status を書き込む機能にはしない
+    const outcome = await reconcileMemberRank(interaction.guild, services, targetId, `user:${interaction.user.id}`);
+    const message =
+      outcome.kind === "update"
+        ? `✅ <@${targetId}> の階級を **${outcome.from} → ${outcome.to}** に合わせました。`
+        : outcome.kind === "noop"
+          ? `ℹ️ <@${targetId}> は既にロールと一致しています（${outcome.detail}）。変更していません。`
+          : outcome.kind === "no_soul"
+            ? `⚠️ <@${targetId}> の魂の記録がありません。入城処理を先に行ってください。変更していません。`
+            : `⚠️ <@${targetId}> は自動で判断できません（${outcome.detail}）。変更していません。`;
+    return void (await interaction.update({ content: message, embeds: [], components: [backButton()] }));
+  }
   if (section === "sprof" && action === "pick" && interaction.isRoleSelectMenu()) {
     return void (await interaction.showModal(sprofModal(services, interaction.values[0]!)));
   }
@@ -985,6 +1004,7 @@ async function settingHome(_services: Services) {
     new ButtonBuilder().setCustomId("mgmt:orgrole").setLabel("機関ロール").setEmoji("⛪").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:sprof").setLabel("特別プロフィール").setEmoji("👑").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:setting:eval-cap").setLabel("評価印上限").setEmoji("🪬").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mgmt:ranksync").setLabel("階級の再同期").setEmoji("🔄").setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row, row2, backButton()] };
 }
@@ -1083,6 +1103,32 @@ const CATEGORY_KEYS: Array<[string, string]> = [
   ["eval_den", "巣穴（評価VC）の生成先"],
 ];
 
+/**
+ * 階級の再同期。
+ *
+ * Discord の階級ロールを正として `souls.status` を合わせ直す回収手段。
+ * 自動同期(debounce)が取りこぼした場合や、一括変更のあとに使う。
+ * **強制的に任意の階級を書き込む機能ではない。** 自動同期で曖昧と判断される
+ * ケース（階級ロールが無い・入城処理を迂回する遷移）は、ここでも理由を出して何もしない。
+ */
+function rankSyncHome() {
+  const embed = new EmbedBuilder()
+    .setTitle("🔄 階級の再同期")
+    .setColor(0x6b21a8)
+    .setDescription(
+      [
+        "Discord の階級ロールに合わせて、記録上の階級を確認し直します。",
+        "",
+        "優先順位: **迷霊**（懲罰）が最優先。通常階級は 魔族 > 眷魔 > 魔人 > 亡霊 の上位を採ります。",
+        "",
+        "-# 階級ロールが1つも無い場合や、入城処理を飛ばすことになる変更は、理由を出して何もしません。",
+        "-# ここでは階級を直接指定できません。ロールを先に正しくしてから実行してください。",
+      ].join("\n"),
+    );
+  const menu = new UserSelectMenuBuilder().setCustomId("mgmt:ranksync:target").setPlaceholder("再同期する対象を選ぶ");
+  return { embeds: [embed], components: [new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(menu), backButton()] };
+}
+
 async function openCategorySetup(interaction: ButtonInteraction, _services: Services) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId("mgmt:setting:category-key")
@@ -1146,6 +1192,7 @@ const ROLE_KEYS: Array<[string, string]> = [
   ["ghost", "亡霊"],
   ["meirei", "迷霊"],
   ["majin", "魔人"],
+  ["kenma", "眷魔"],
   ["mazoku", "魔族"],
   ["judge", "門番"],
   ["judge_lead", "門番統括"],

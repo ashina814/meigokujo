@@ -73,6 +73,18 @@ export {
 } from "./rank/service.js";
 export { BumpCounter } from "./rank/bump.js";
 export {
+  MEIREI_ROLE_SETTING_KEY,
+  RANK_LADDER,
+  RANK_ROLE_SETTING_KEYS,
+  decideRankSync,
+  desiredStatusFromRoles,
+  isAutoSyncableTransition,
+  type LadderRank,
+  type RankRoleSnapshot,
+  type RankSyncDecision,
+  type SoulStatus,
+} from "./rank/sync.js";
+export {
   Shop,
   ShopError,
   nextFirstOfMonthJst,

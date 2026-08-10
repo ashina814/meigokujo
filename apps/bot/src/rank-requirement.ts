@@ -1,7 +1,7 @@
 /**
  * ショップ等の「階級要件」を『〇〇以上』として判定する共通ヘルパー。
  *
- * 階級の序列（下から上）: 亡霊 < 魔人 < 魔族。
+ * 階級の序列（下から上）: 亡霊 < 魔人 < 眷魔 < 魔族。
  * 要件ロールがこの序列に含まれる場合、そのロール**以上**のいずれかを
  * 持っていれば要件を満たす（魔族は亡霊要件の商品を買える）。
  * 序列外のロール（カスタムロール要件）は従来どおり完全一致。
@@ -12,7 +12,7 @@ interface SettingsReader {
 }
 
 /** 階級序列の設定キー（下から上の順） */
-const RANK_ORDER_KEYS = ["role:ghost", "role:majin", "role:mazoku"] as const;
+const RANK_ORDER_KEYS = ["role:ghost", "role:majin", "role:kenma", "role:mazoku"] as const;
 
 /** 設定済みの階級ロールIDを序列順（下→上）で返す */
 export function rankOrderRoleIds(settings: SettingsReader): string[] {

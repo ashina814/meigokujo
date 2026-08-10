@@ -24,6 +24,7 @@ import { deliverToUser } from "../notify.js";
 import { isAdmin } from "../permissions.js";
 import { jstNow, nextSessionStart } from "../scheduler.js";
 import { refreshWaitersBoard } from "../waiters-board.js";
+import { scheduleRankReconcile, touchesRankRoles } from "../rank-sync.js";
 import type { Services } from "../services.js";
 
 // ---- パネル ----
@@ -308,10 +309,6 @@ export async function handleMemberRoleUpdate(
   const ghostRoleId = services.settings.getString("role:ghost");
   const maleRoleId = services.settings.getString("role:male");
   const femaleRoleId = services.settings.getString("role:female");
-  const majinRoleId = services.settings.getString("role:majin");
-  const mazokuRoleId = services.settings.getString("role:mazoku");
-  const meireiRoleId = services.settings.getString("role:meirei");
-  const waitRoleId = services.settings.getString("role:queue_wait");
 
   // ① 亡霊ロールが手動付与された → ghostify（冪等）
   if (added.size > 0 && ghostRoleId && added.has(ghostRoleId)) {
@@ -332,25 +329,19 @@ export async function handleMemberRoleUpdate(
     if (ext > 0) console.log(`[entry] 後追い招待延長(女): +${ext}日 for ${newMember.id}`);
   }
 
-  // ③ 亡霊ロールが剥奪された（他の階級ロールが同時に付いていない）→ 案内待ちにリセット
-  if (removed.size > 0 && ghostRoleId && removed.has(ghostRoleId)) {
-    const hasOther =
-      (majinRoleId && after.has(majinRoleId)) ||
-      (mazokuRoleId && after.has(mazokuRoleId)) ||
-      (meireiRoleId && after.has(meireiRoleId));
-    if (!hasOther) {
-      // 台帳側で既に階級が変わっているなら、ロール反映の途中で新ロールがまだ付いていない
-      // 状態のイベントを見ているだけ。案内待ちへ戻すとDB status を上書きし queue_wait を
-      // 付けてしまうので、ここでは何もしない（迷霊落ち・魔人昇格レースへの防護線）。
-      const soul = services.entry.getSoul(newMember.id);
-      if (soul && soul.status !== "ghost" && soul.status !== "waiting") {
-        console.log(`[entry] 亡霊ロール剥奪検知したが台帳は既に ${soul.status}。リセットせず（レース対策）: ${newMember.id}`);
-        return;
-      }
-      services.entry.resetToWaiting(newMember.id, "system:role-remove");
-      if (waitRoleId) await newMember.roles.add(waitRoleId).catch(() => undefined);
-      console.log(`[entry] 亡霊ロール剥奪 → 案内待ちにリセット: ${newMember.id}`);
-    }
+  // ③ 階級ロールの変更 → debounce して最終ロールから再判定する
+  //
+  // 以前はここで「亡霊が剥奪され、他の階級ロールも付いていない」を見て
+  // resetToWaiting + queue_wait 付与まで行っていた。ロール変更は付与と剥奪が
+  // 別イベントで届くため、これは**昇格・降格の途中状態を見て入城前へ巻き戻す**
+  // 動きになる。台帳を見る防護線を足して凌いでいたが、階級が増えるほど
+  // 防護線を足し続けることになるので、最終状態から判定する方式へ寄せた。
+  //
+  // 階級ロールが1つも無くなった場合も台帳は触らない（rank-sync 側で監査ログのみ）。
+  // ロール事故や一括変更の途中で入城状態・評価情報を失う方が損害が大きい。
+  const changedRoleIds = [...added.keys(), ...removed.keys()];
+  if (changedRoleIds.length > 0 && touchesRankRoles(changedRoleIds, services)) {
+    scheduleRankReconcile(newMember.guild, services, newMember.id, "system:role-sync");
   }
 }
 
