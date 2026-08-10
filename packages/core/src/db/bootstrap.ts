@@ -751,6 +751,12 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "recruits", "refund_tx_id", "INTEGER REFERENCES transactions(id)");
   ensureColumn(db, "recruits", "updated_at", "INTEGER");
   ensureColumn(db, "shop_purchases", "delivery_snapshot_json", "TEXT");
+  // 配送状態を課金から分離する（購入は成立したが配送が終わっていない、を表せるようにする）。
+  // 旧行の移行は backfillShopDeliveryState() で行う。
+  ensureColumn(db, "shop_purchases", "delivery_state", "TEXT");
+  ensureColumn(db, "shop_purchases", "delivery_attempts", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "shop_purchases", "delivery_error", "TEXT");
+  ensureColumn(db, "shop_purchases", "delivery_updated_at", "INTEGER");
   ensureColumn(db, "scheduler_chunk_batches", "sent_at", "INTEGER");
   ensureColumn(db, "casino_chip_external_confirmations", "chip_amount", "INTEGER NOT NULL DEFAULT 0 CHECK (chip_amount >= 0)");
   // PR12監査: opening_resetの所有権（execution・actor）をcasino_status自体から機械的に
@@ -773,7 +779,48 @@ export function openDb(path: string): Database.Database {
   `);
   backfillEvaluationMarkWeights(db);
   backfillEvaluationPolicySnapshots(db);
+  backfillShopDeliveryState(db);
   return db;
+}
+
+/**
+ * 既存購入へ配送状態を割り当てる。
+ *
+ * `delivered_at` は「手動配送のスタッフ完了マーク」でしか埋まっておらず、
+ * **自動配送は成功しても NULL のまま**だった。つまり `delivered_at IS NULL` は
+ * 「未配送」ではなく「手動配送の完了操作をしていない」を意味する行が大半を占める。
+ * そのまま `pending` にすると、自動配送の再実行が大量に走ってしまう。
+ *
+ * そこで移行では**再配送を発生させない**ことを優先し、次の規則で割り当てる。
+ * - `delivered_at` が入っている … `delivered`（根拠のある完了）
+ * - 手動配送(`delivery='manual'`)で未マーク … `pending`（元から人手待ち。意味が変わらない）
+ * - 自動配送で未マーク … 原則 `delivered`（過去分は完了扱い）。
+ *   `add_role` と `extend_deadline` は再実行の副作用が読めないので、ここで pending にしない
+ * - **例外**: `revoke_meirei` かつ本人が現在 `waiting` … `pending`。
+ *   この配送だけは再実行しても「ロールを直すだけ」で済むことが構造的に保証されている
+ *   （本人が `waiting` なら再 reset の分岐へ入らない）。実際に本番で
+ *   「DBは戻ったがロールが残った」が発生しており、回収の対象にできないと直せない。
+ *   本人が `meirei` に戻っている場合は後から再降格された可能性があるので `delivered` のまま置く
+ *   （再実行でその降格を巻き戻さないため）。
+ *
+ * `pending` にしても**自動では何も起きない**。運営が回収導線から purchase を選んだ時だけ走る。
+ *
+ * 以後の購入は配送経路が自分で `pending → delivered/failed` を書くので、
+ * この移行が効くのは**この変更より前に作られた行だけ**。
+ */
+function backfillShopDeliveryState(db: Database.Database): void {
+  db.prepare(
+    `UPDATE shop_purchases
+        SET delivery_state = CASE
+              WHEN delivered_at IS NOT NULL THEN 'delivered'
+              WHEN (SELECT delivery FROM shop_items WHERE shop_items.id = shop_purchases.item_id) = 'manual' THEN 'pending'
+              WHEN (SELECT delivery_kind FROM shop_items WHERE shop_items.id = shop_purchases.item_id) = 'revoke_meirei'
+                   AND (SELECT status FROM souls WHERE souls.user_id = shop_purchases.user_id) = 'waiting' THEN 'pending'
+              ELSE 'delivered'
+            END,
+            delivery_updated_at = COALESCE(delivery_updated_at, delivered_at, purchased_at)
+      WHERE delivery_state IS NULL`,
+  ).run();
 }
 
 /** `souls.status` が取り得る値。CHECK制約・型・同期ロジックの唯一の真実源 */

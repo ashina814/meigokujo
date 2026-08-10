@@ -61,7 +61,19 @@ export interface PurchaseRow {
   delivered_at: number | null;
   auto_renew: number;
   delivery_snapshot_json: string | null;
+  delivery_state: DeliveryState | null;
+  delivery_attempts: number;
+  delivery_error: string | null;
+  delivery_updated_at: number | null;
 }
+
+/**
+ * 配送状態。**課金の成否とは独立**に持つ。
+ *
+ * 課金が通ってから配送が失敗する経路が実在し（迷霊ロールの剥奪失敗）、
+ * 「購入は成立したが配送は終わっていない」を表せないと、再配送も検知もできなかった。
+ */
+export type DeliveryState = "pending" | "delivered" | "failed";
 
 export interface ShopRoleRevocationRow {
   purchase_id: number;
@@ -81,7 +93,8 @@ export type ShopErrorCode =
   | "ERR_NO_STOCK"
   | "ERR_ROLE_REQUIRED"
   | "ERR_NO_PRICE"
-  | "ERR_ALREADY_ACTIVE";
+  | "ERR_ALREADY_ACTIVE"
+  | "ERR_PURCHASE_NOT_FOUND";
 
 export class ShopError extends Error {
   constructor(readonly code: ShopErrorCode, readonly details: Record<string, unknown> = {}) {
@@ -380,8 +393,98 @@ export class Shop {
 
   /** 手動配送の完了マーク */
   markDelivered(purchaseId: number, actor: string): void {
-    this.db.prepare("UPDATE shop_purchases SET delivered_at = ? WHERE id = ?").run(now(), purchaseId);
+    this.db
+      .prepare(
+        "UPDATE shop_purchases SET delivered_at = ?, delivery_state = 'delivered', delivery_error = NULL, delivery_updated_at = ? WHERE id = ?",
+      )
+      .run(now(), now(), purchaseId);
     this.events.log("shop_delivered", { actor, payload: { purchaseId } });
+  }
+
+  // ---- 自動配送の状態機械 ----
+  //
+  // 配送は「課金の後始末」ではなく独立した工程として扱う。購入は一度きり、
+  // 配送は成功するまで何度でも試せる、という非対称をここで表現する。
+
+  /**
+   * 配送を始めてよいか判定し、試行回数を進める。
+   *
+   * 既に `delivered` なら `already_delivered` を返す。**呼び出し側はここで打ち切る**ので、
+   * 二度押し・再起動・再配送要求のいずれでも副作用が二度走らない。
+   */
+  beginDelivery(purchaseId: number): { proceed: boolean; state: DeliveryState; attempts: number } {
+    const begin = this.db.transaction(() => {
+      const row = this.db
+        .prepare("SELECT delivery_state, delivery_attempts FROM shop_purchases WHERE id = ?")
+        .get(purchaseId) as { delivery_state: DeliveryState | null; delivery_attempts: number } | undefined;
+      if (!row) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
+      if (row.delivery_state === "delivered") {
+        return { proceed: false, state: "delivered" as DeliveryState, attempts: row.delivery_attempts };
+      }
+      const attempts = row.delivery_attempts + 1;
+      this.db
+        .prepare(
+          "UPDATE shop_purchases SET delivery_state = 'pending', delivery_attempts = ?, delivery_updated_at = ? WHERE id = ?",
+        )
+        .run(attempts, now(), purchaseId);
+      return { proceed: true, state: "pending" as DeliveryState, attempts };
+    });
+    return begin.immediate();
+  }
+
+  /** 配送失敗を記録する。握り潰さずここへ落とすことで、再配送の対象として拾える */
+  markDeliveryFailed(purchaseId: number, reason: string, actor: string): void {
+    this.db
+      .prepare(
+        "UPDATE shop_purchases SET delivery_state = 'failed', delivery_error = ?, delivery_updated_at = ? WHERE id = ?",
+      )
+      .run(reason, now(), purchaseId);
+    this.events.log("shop_delivery_failed", { actor, payload: { purchaseId, reason } });
+  }
+
+  /**
+   * 配送の副作用と完了マークを**同じトランザクションで**確定する。
+   *
+   * `extend_deadline` のように冪等でない配送があるので、効果とマークが割れると
+   * 再試行で二重に効いてしまう。効果の書き込みを `effect` に渡してもらい、まとめて確定する。
+   */
+  completeDeliveryWith(purchaseId: number, actor: string, effect: () => void): void {
+    const run = this.db.transaction(() => {
+      const row = this.db.prepare("SELECT delivery_state FROM shop_purchases WHERE id = ?").get(purchaseId) as
+        | { delivery_state: DeliveryState | null }
+        | undefined;
+      if (!row) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
+      if (row.delivery_state === "delivered") return; // 競合した二重実行。効果を走らせない
+      effect();
+      this.db
+        .prepare(
+          "UPDATE shop_purchases SET delivered_at = ?, delivery_state = 'delivered', delivery_error = NULL, delivery_updated_at = ? WHERE id = ?",
+        )
+        .run(now(), now(), purchaseId);
+    });
+    run.immediate();
+    this.events.log("shop_delivered", { actor, payload: { purchaseId } });
+  }
+
+  /** 完了マークだけ（効果が外部＝Discord側にあり、既にやり切った場合） */
+  markDeliverySucceeded(purchaseId: number, actor: string): void {
+    this.completeDeliveryWith(purchaseId, actor, () => undefined);
+  }
+
+  /** 未完了の自動配送（運営の回収導線用）。手動配送は対象外 */
+  listUndeliveredAuto(limit = 50): Array<PurchaseRow & { item_name: string }> {
+    return this.db
+      .prepare(
+        `SELECT p.*, i.name AS item_name
+           FROM shop_purchases p
+           JOIN shop_items i ON i.id = p.item_id
+          WHERE i.delivery = 'auto'
+            AND p.status = 'active'
+            AND COALESCE(p.delivery_state, 'pending') IN ('pending','failed')
+          ORDER BY p.purchased_at DESC
+          LIMIT ?`,
+      )
+      .all(limit) as Array<PurchaseRow & { item_name: string }>;
   }
 
   /**

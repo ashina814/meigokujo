@@ -291,6 +291,49 @@ export class Evaluation {
   }
 
   /**
+   * 履歴追認: `waiting → majin` を台帳へ書くだけ。
+   *
+   * **評価期間も初期発行も作らない。** 既に運用上は魔人として扱われている人の
+   * 台帳を実態へ合わせるためだけの操作なので、`ghostify()` の副作用を持ち込まない。
+   * `WHERE status='waiting'` を条件に入れてあるので、同時実行や二度押しで
+   * 上位階級を巻き戻すことはない（0行更新になり false が返る）。
+   */
+  backfillHistoricalRank(
+    targetId: string,
+    to: "majin",
+    actor: string,
+    evidence: Record<string, unknown>,
+  ): boolean {
+    const changed = this.db
+      .prepare("UPDATE souls SET status = ?, updated_at = ? WHERE user_id = ? AND status = 'waiting'")
+      .run(to, now(), targetId).changes;
+    if (changed !== 1) {
+      this.events.log("rank_history_backfill_skipped", { actor, target: targetId, payload: { to, reason: "precondition_lost" } });
+      return false;
+    }
+    this.events.log("rank_history_backfill", { actor, target: targetId, payload: { from: "waiting", to, evidence } });
+    return true;
+  }
+
+  /**
+   * 昇格記録の追いつき: `ghost → majin`。
+   *
+   * `promoteToMajin()` と**同じDB意味論**（status と評価期限のクリア）と `promotion` 事件録だけを行う。
+   * ロール付与も公開告知もしない（どちらも既に済んでいるのが前提）。
+   */
+  catchUpPromotion(targetId: string, actor: string, evidence: Record<string, unknown>): boolean {
+    const changed = this.db
+      .prepare("UPDATE souls SET status = 'majin', eval_deadline_at = NULL, updated_at = ? WHERE user_id = ? AND status = 'ghost'")
+      .run(now(), targetId).changes;
+    if (changed !== 1) {
+      this.events.log("promotion_catchup_skipped", { actor, target: targetId, payload: { reason: "precondition_lost" } });
+      return false;
+    }
+    this.events.log("promotion", { actor, target: targetId, payload: { to: "majin", catchup: true, evidence } });
+    return true;
+  }
+
+  /**
    * Discord のロール構成に合わせて階級を書き直す（rank sync 専用）。
    *
    * **どの遷移を許すかはここでは判断しない。** 呼び出し側が

@@ -36,6 +36,17 @@ import {
   type TicketPanel,
 } from "@meigokujo/core";
 import { reconcileMemberRank } from "../rank-sync.js";
+import {
+  backfillConfirm,
+  handleBackfillRun,
+  handlePromotionCatchUp,
+  handleRedeliver,
+  handleRoleRestore,
+  promotionCatchUpPicker,
+  recoveryHome,
+  roleRestorePicker,
+  undeliveredPicker,
+} from "./recovery-hub.js";
 import { isAdmin } from "../permissions.js";
 import { registerTrustedRankedProfile } from "./casino-employee.js";
 import { ROLE_SLOT_META, ROLE_SLOT_ORDER, getRoleIds, setRoleIds, type RoleSlot } from "../church-roles.js";
@@ -108,6 +119,7 @@ function renderHub(): { embeds: EmbedBuilder[]; components: ActionRowBuilder<But
     new ButtonBuilder().setCustomId("mgmt:waiters").setLabel("待ち人").setEmoji("🚪").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:xpex").setLabel("XP除外").setEmoji("🚫").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:casino").setLabel("賭場").setEmoji("🎰").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mgmt:recover").setLabel("回収").setEmoji("🧰").setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row1, row2] };
 }
@@ -149,6 +161,13 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "setting" && action === "channel-select") return void (await openChannelSetup(interaction, services));
   if (section === "setting" && action === "category-select") return void (await openCategorySetup(interaction, services));
   if (section === "ranksync" && !action) return void (await interaction.update(rankSyncHome()));
+  // ── 既存データの回収 ──
+  if (section === "recover" && !action) return void (await interaction.update(recoveryHome()));
+  if (section === "recover" && action === "shop") return void (await interaction.update(undeliveredPicker(services)));
+  if (section === "recover" && action === "role") return void (await interaction.update(roleRestorePicker()));
+  if (section === "recover" && action === "promo") return void (await interaction.update(promotionCatchUpPicker()));
+  if (section === "recover" && action === "backfill") return void (await interaction.update(backfillConfirm(services)));
+  if (section === "recover" && action === "backfill-run") return void (await handleBackfillRun(interaction, services));
   if (section === "setting" && action === "role-select") return void (await openRoleSetup(interaction, services));
   if (section === "setting" && action === "number-select") return void (await openNumberSetup(interaction, services));
   if (section === "setting" && action === "eval-cap") return void (await interaction.update(evaluationCapHome(services)));
@@ -461,6 +480,15 @@ export async function handleAdminSelect(
     }));
   }
   // ── 特別プロフィール ──
+  if (section === "recover" && action === "redeliver" && interaction.isStringSelectMenu()) {
+    return void (await handleRedeliver(interaction, services));
+  }
+  if (section === "recover" && action === "role-target" && interaction.isUserSelectMenu()) {
+    return void (await handleRoleRestore(interaction, services));
+  }
+  if (section === "recover" && action === "promo-target" && interaction.isUserSelectMenu()) {
+    return void (await handlePromotionCatchUp(interaction, services));
+  }
   if (section === "ranksync" && action === "target" && interaction.isUserSelectMenu()) {
     const targetId = interaction.values[0]!;
     if (!interaction.guild) {

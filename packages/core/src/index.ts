@@ -87,6 +87,12 @@ export {
   type SoulStatus,
 } from "./rank/sync.js";
 export {
+  canBackfillHistoricalMajin,
+  canCatchUpPromotion,
+  roleToRestoreForStatus,
+  type RecoveryVerdict,
+} from "./rank/recovery.js";
+export {
   Shop,
   ShopError,
   nextFirstOfMonthJst,
@@ -94,6 +100,7 @@ export {
   type ShopItemRow,
   type ShopItemInput,
   type PurchaseRow,
+  type DeliveryState,
   type ItemKind,
   type DeliveryMode,
   type DeliveryKind,
