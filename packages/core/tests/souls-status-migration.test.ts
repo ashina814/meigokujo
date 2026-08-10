@@ -131,6 +131,65 @@ describe("souls.status CHECK 移行（眷魔の追加）", () => {
     second.close();
   });
 
+  it("移行先が知らない列があれば、DBを一切変えずに起動を止める（fail-closed）", () => {
+    const path = legacyDbPath();
+    // 本番に、この移行コードが知らない列があった状況を作る（将来の追加列・手作業の名残）
+    {
+      const raw = new Database(path);
+      raw.exec("ALTER TABLE souls ADD COLUMN 見知らぬ列 TEXT");
+      raw.prepare("UPDATE souls SET 見知らぬ列 = ? WHERE user_id = ?").run("捨ててはいけない値", "1463201396567441441");
+      raw.close();
+    }
+    const before = (() => {
+      const raw = new Database(path);
+      const sql = (raw.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='souls'").get() as { sql: string }).sql;
+      const rows = raw.prepare("SELECT * FROM souls ORDER BY user_id").all();
+      raw.close();
+      return { sql, rows };
+    })();
+
+    // 列を黙って捨てて起動するより、deploy を失敗させる
+    expect(() => openDb(path)).toThrow(/見知らぬ列/);
+
+    const after = new Database(path);
+    // 元の表がそのまま残っている（作り直していない・DROP していない）
+    expect((after.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='souls'").get() as { sql: string }).sql).toBe(
+      before.sql,
+    );
+    // 中途半端な新表も残っていない
+    expect(after.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='souls__new'").get()).toBeUndefined();
+    // 未知列を含めて全データが無傷
+    expect(after.prepare("SELECT * FROM souls ORDER BY user_id").all()).toEqual(before.rows);
+    expect(
+      (after.prepare("SELECT 見知らぬ列 AS v FROM souls WHERE user_id = ?").get("1463201396567441441") as { v: string }).v,
+    ).toBe("捨ててはいけない値");
+    // 旧CHECK のままなので眷魔は書けない＝移行は本当に走っていない
+    expect(() => after.prepare("UPDATE souls SET status = 'kenma' WHERE user_id = ?").run("2222222222222222222")).toThrow();
+    after.close();
+  });
+
+  it("列を足して知っている状態にすれば、同じDBが移行できる", () => {
+    // fail-closed が「直せば進める」ことを確認する（永久に詰まらない）
+    const path = legacyDbPath();
+    {
+      const raw = new Database(path);
+      raw.exec("ALTER TABLE souls ADD COLUMN 見知らぬ列 TEXT");
+      raw.close();
+    }
+    expect(() => openDb(path)).toThrow();
+
+    // 運用側の対処: 知らない列を落とす（本来は souls__new の定義へ足す）
+    {
+      const raw = new Database(path);
+      raw.exec("ALTER TABLE souls DROP COLUMN 見知らぬ列");
+      raw.close();
+    }
+    const db = openDb(path);
+    db.prepare("UPDATE souls SET status = 'kenma' WHERE user_id = ?").run("2222222222222222222");
+    expect((db.prepare("SELECT COUNT(*) AS n FROM souls").get() as { n: number }).n).toBe(3);
+    db.close();
+  });
+
   it("新規DBは最初から眷魔を受け付ける", () => {
     const dir = mkdtempSync(join(tmpdir(), "meigokujo-souls-new-"));
     tempDirs.push(dir);

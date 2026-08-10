@@ -468,7 +468,7 @@ export async function handleAdminSelect(
     }
     // 自動同期と**同じ判定**を即時に走らせるだけ。任意 status を書き込む機能にはしない
     const outcome = await reconcileMemberRank(interaction.guild, services, targetId, `user:${interaction.user.id}`);
-    const message =
+    const base =
       outcome.kind === "update"
         ? `✅ <@${targetId}> の階級を **${outcome.from} → ${outcome.to}** に合わせました。`
         : outcome.kind === "noop"
@@ -476,6 +476,11 @@ export async function handleAdminSelect(
           : outcome.kind === "no_soul"
             ? `⚠️ <@${targetId}> の魂の記録がありません。入城処理を先に行ってください。変更していません。`
             : `⚠️ <@${targetId}> は自動で判断できません（${outcome.detail}）。変更していません。`;
+    // status が一致していてもロール構成が異常なことがある（迷霊と通常階級の同居など）
+    const message =
+      outcome.anomalies && outcome.anomalies.length > 0
+        ? `${base}\n⚠️ ロール構成に異常があります: ${outcome.anomalies.join(", ")}（余分な階級ロールを手で外してください）`
+        : base;
     return void (await interaction.update({ content: message, embeds: [], components: [backButton()] }));
   }
   if (section === "sprof" && action === "pick" && interaction.isRoleSelectMenu()) {

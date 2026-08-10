@@ -107,6 +107,60 @@ describe("階級の再判定", () => {
     expect(log).toHaveBeenCalledWith("rank_sync_role_anomaly", expect.objectContaining({ target: "u1" }));
   });
 
+  it("既に一致していても、ロール構成の異常は記録する（DB眷魔 + ロール魔人/眷魔）", async () => {
+    // status は合っているので何も書かないが、通常階級が2つ付いたまま放置されている
+    const { guild, services, syncStatusFromRoles, log } = world({ roles: [ROLE.majin, ROLE.kenma], status: "kenma" });
+
+    const outcome = await reconcileMemberRank(guild, services, "u1", "test");
+
+    expect(outcome.kind).toBe("noop");
+    expect(syncStatusFromRoles).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      "rank_sync_role_anomaly",
+      expect.objectContaining({ payload: expect.objectContaining({ anomaly: "multiple_ladder_roles:majin+kenma" }) }),
+    );
+  });
+
+  it("DB迷霊 + ロール迷霊/魔族が一致していても記録する", async () => {
+    const { guild, services, syncStatusFromRoles, log } = world({ roles: [ROLE.mazoku, ROLE.meirei], status: "meirei" });
+
+    const outcome = await reconcileMemberRank(guild, services, "u1", "test");
+
+    expect(outcome.kind).toBe("noop");
+    expect(syncStatusFromRoles).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      "rank_sync_role_anomaly",
+      expect.objectContaining({ payload: expect.objectContaining({ anomaly: "meirei_with_ladder:mazoku" }) }),
+    );
+  });
+
+  it("自動同期を禁じた遷移でも、ロール構成の異常は記録する", async () => {
+    // waiting からは階級を生やさない（ambiguous）。それとは別に迷霊と魔族が同居している
+    const { guild, services, syncStatusFromRoles, log } = world({ roles: [ROLE.mazoku, ROLE.meirei], status: "waiting" });
+
+    const outcome = await reconcileMemberRank(guild, services, "u1", "test");
+
+    expect(outcome.kind).toBe("ambiguous");
+    expect(syncStatusFromRoles).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      "rank_sync_role_anomaly",
+      expect.objectContaining({ payload: expect.objectContaining({ anomaly: "meirei_with_ladder:mazoku" }) }),
+    );
+  });
+
+  it("剥がし漏れの階級ロールは全部ペイロードに書き出す（どれを外せばよいか分かる）", async () => {
+    // 亡霊・魔人・眷魔が残ったまま迷霊が付いている。最上位は眷魔だが迷霊を採る
+    const { guild, services, log } = world({ roles: [ROLE.ghost, ROLE.majin, ROLE.kenma, ROLE.meirei], status: "meirei" });
+
+    const outcome = await reconcileMemberRank(guild, services, "u1", "test");
+
+    expect(outcome.kind).toBe("noop");
+    const anomalies = log.mock.calls
+      .filter(([type]) => type === "rank_sync_role_anomaly")
+      .map(([, opts]) => (opts as { payload: { anomaly: string } }).payload.anomaly);
+    expect(anomalies).toContain("meirei_with_ladder:ghost+majin+kenma");
+  });
+
   it("判定後に別経路が階級を動かしていたら書き込まない（stale）", async () => {
     // syncStatusFromRoles が false = WHERE 条件に合わず0行更新だった
     const { guild, services } = world({ roles: [ROLE.kenma], status: "majin", syncOk: false });

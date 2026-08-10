@@ -67,6 +67,8 @@ export interface ReconcileOutcome {
   detail: string;
   from?: string;
   to?: string;
+  /** ロール構成の異常。DBを書いたかに関わらず入る（運営へ提示するため） */
+  anomalies?: string[];
 }
 
 /**
@@ -95,27 +97,42 @@ export async function reconcileMemberRank(
   const snapshot = snapshotOf(member, services);
   const decision = decideRankSync(soul.status, snapshot);
 
-  if (decision.kind === "noop") return { kind: "noop", detail: decision.reason };
+  // ロール構成の異常は**DBを書いたかどうかと無関係**に記録する。
+  // status が既に一致している構成（DB迷霊 + ロール迷霊/魔族、DB眷魔 + ロール魔人/眷魔 など）や、
+  // 自動同期を禁じた遷移こそ、誰も直さないまま残るので可視化の必要が高い。
+  const desired = decision.kind === "update" ? decision.to : decision.kind === "ambiguous" ? decision.desired : soul.status;
+  for (const anomaly of decision.anomalies) {
+    services.events.log("rank_sync_role_anomaly", {
+      actor,
+      target: userId,
+      payload: { anomaly, from: soul.status, desired, decision: decision.kind },
+    });
+  }
+
+  if (decision.kind === "noop") return { kind: "noop", detail: decision.reason, anomalies: decision.anomalies };
 
   if (decision.kind === "ambiguous") {
     // 階級ロールが無い・自動で越えてはいけない遷移。DBは触らず記録だけ残す
     services.events.log("rank_sync_ambiguous", {
       actor,
       target: userId,
-      payload: { reason: decision.reason, from: decision.from, desired: decision.desired },
+      payload: { reason: decision.reason, from: decision.from, desired: decision.desired, anomalies: decision.anomalies },
     });
-    return { kind: "ambiguous", detail: decision.reason, from: decision.from, to: decision.desired ?? undefined };
+    return {
+      kind: "ambiguous",
+      detail: decision.reason,
+      from: decision.from,
+      to: decision.desired ?? undefined,
+      anomalies: decision.anomalies,
+    };
   }
 
-  for (const anomaly of decision.anomalies) {
-    services.events.log("rank_sync_role_anomaly", { actor, target: userId, payload: { anomaly, to: decision.to } });
-  }
   const applied = services.evaluation.syncStatusFromRoles(userId, decision.from, decision.to, actor, {
     anomalies: decision.anomalies,
   });
   return applied
-    ? { kind: "update", detail: "applied", from: decision.from, to: decision.to }
-    : { kind: "noop", detail: "stale_precondition", from: decision.from, to: decision.to };
+    ? { kind: "update", detail: "applied", from: decision.from, to: decision.to, anomalies: decision.anomalies }
+    : { kind: "noop", detail: "stale_precondition", from: decision.from, to: decision.to, anomalies: decision.anomalies };
 }
 
 /**

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { decideRankSync, desiredStatusFromRoles, isAutoSyncableTransition, type SoulStatus } from "../src/index.js";
+import {
+  decideGhostRoleAdd,
+  decideRankSync,
+  desiredStatusFromRoles,
+  isAutoSyncableTransition,
+  type SoulStatus,
+} from "../src/index.js";
 
 /**
  * Discord の階級ロール → `souls.status` の判定。
@@ -93,9 +99,28 @@ describe("自動同期してよい遷移の線引き", () => {
 
 describe("同期判定の総合", () => {
   it("既に一致していれば何もしない（Botの操作で発火しても二重処理しない）", () => {
-    expect(decideRankSync("majin", snap(["majin"]))).toEqual({ kind: "noop", reason: "already_in_sync" });
+    expect(decideRankSync("majin", snap(["majin"]))).toEqual({ kind: "noop", reason: "already_in_sync", anomalies: [] });
     // 昇格直後（魔人付与済み・亡霊剥奪済み）に来たイベントも noop になる
     expect(decideRankSync("meirei", snap([], true)).kind).toBe("noop");
+  });
+
+  it("status が一致していても、ロール構成の異常は結果に載せる（記録できるように）", () => {
+    // DB迷霊 + ロール迷霊/魔族。status は合っているがロールの剥がし漏れ
+    const meirei = decideRankSync("meirei", snap(["mazoku"], true));
+    expect(meirei).toMatchObject({ kind: "noop" });
+    expect(meirei.anomalies).toContain("meirei_with_ladder:mazoku");
+
+    // DB眷魔 + ロール魔人/眷魔。上位を採るので眷魔と一致するが、通常階級が2つ付いている
+    const kenma = decideRankSync("kenma", snap(["majin", "kenma"]));
+    expect(kenma).toMatchObject({ kind: "noop" });
+    expect(kenma.anomalies).toContain("multiple_ladder_roles:majin+kenma");
+  });
+
+  it("自動同期を禁じた遷移でも、ロール構成の異常は結果に載せる", () => {
+    // waiting からは階級を生やさない。それとは別に迷霊と通常階級が同居している
+    const decision = decideRankSync("waiting", snap(["mazoku"], true));
+    expect(decision.kind).toBe("ambiguous");
+    expect(decision.anomalies).toContain("meirei_with_ladder:mazoku");
   });
 
   it("横移動は更新する", () => {
@@ -125,10 +150,41 @@ describe("同期判定の総合", () => {
     expect((decision as { anomalies: string[] }).anomalies).toContain("meirei_with_ladder:majin");
   });
 
+  it("階級ロールが1つも無いときも anomalies の形は保つ", () => {
+    expect(decideRankSync("majin", snap([])).anomalies).toEqual([]);
+  });
+
   it("昇格の途中状態を見ても、亡霊へ巻き戻さない", () => {
     // 「魔人を付けたが亡霊がまだ残っている」瞬間。最上位を採るので majin へ寄る
     expect(decideRankSync("ghost", snap(["ghost", "majin"]))).toMatchObject({ kind: "ambiguous" });
     // 「亡霊を外したが魔人がまだ付いていない」瞬間。DBは触らない
     expect(decideRankSync("ghost", snap([])).kind).toBe("ambiguous");
+  });
+});
+
+describe("亡霊ロールの手動付与で ghostify してよいか", () => {
+  it("入城前（waiting）と、台帳に居ない人は ghostify する", () => {
+    // 本来の入城
+    expect(decideGhostRoleAdd("waiting")).toEqual({ kind: "ghostify", reason: "waiting" });
+    // 台帳より先にロールが付いた人。巻き戻す既存 status がそもそも無いので従来どおり作る
+    expect(decideGhostRoleAdd(null)).toEqual({ kind: "ghostify", reason: "no_soul_row" });
+  });
+
+  it("既に亡霊なら何もしない", () => {
+    expect(decideGhostRoleAdd("ghost")).toEqual({ kind: "noop", reason: "already_ghost" });
+  });
+
+  it("上位階級・迷霊・離脱済みは ghostify しない（評価前へ巻き戻さない）", () => {
+    // ghostify() は評価期限と評価スナップショットを作り直すので、ここを通してはいけない
+    for (const from of ["majin", "kenma", "mazoku", "meirei", "departed"] as SoulStatus[]) {
+      expect(decideGhostRoleAdd(from)).toEqual({ kind: "blocked", reason: `ghost_role_add_on:${from}`, from });
+    }
+  });
+
+  it("遷移表（上位階級 → ghost は自動同期しない）と同じ線引きになっている", () => {
+    for (const from of ["majin", "kenma", "mazoku", "meirei", "departed"] as SoulStatus[]) {
+      expect(isAutoSyncableTransition(from, "ghost")).toBe(false);
+      expect(decideGhostRoleAdd(from).kind).toBe("blocked");
+    }
   });
 });

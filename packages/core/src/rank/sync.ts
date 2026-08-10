@@ -43,10 +43,18 @@ export interface RankRoleSnapshot {
   meirei: boolean;
 }
 
+/**
+ * 判定結果。**どの結果でも `anomalies` を持つ。**
+ *
+ * ロール構成の異常（迷霊と通常階級の同居・通常階級の複数付与）は、DBを書くかどうかとは
+ * 無関係に起きる。むしろ `status` が既に一致している時（noop）や、自動同期を禁じた遷移
+ * （ambiguous）の方が「誰も直さないまま放置される」ため、記録の必要が高い。
+ * 更新した時だけ記録していると、DB迷霊 + ロール迷霊/魔族 のような異常が可視化されない。
+ */
 export type RankSyncDecision =
-  | { kind: "noop"; reason: string }
+  | { kind: "noop"; reason: string; anomalies: string[] }
   | { kind: "update"; to: SoulStatus; from: SoulStatus; anomalies: string[] }
-  | { kind: "ambiguous"; reason: string; desired: SoulStatus | null; from: SoulStatus };
+  | { kind: "ambiguous"; reason: string; desired: SoulStatus | null; from: SoulStatus; anomalies: string[] };
 
 /**
  * ロール構成から「あるべき status」を決める。
@@ -114,13 +122,40 @@ export function decideRankSync(current: SoulStatus, snapshot: RankRoleSnapshot):
 
   if (desired === null) {
     // 階級ロールが1つも無い。ロール事故・一括変更の途中で入城状態を消さない
-    return { kind: "ambiguous", reason: "no_rank_role", desired: null, from: current };
+    return { kind: "ambiguous", reason: "no_rank_role", desired: null, from: current, anomalies };
   }
   if (desired === current) {
-    return { kind: "noop", reason: anomalies.length > 0 ? `already_in_sync(${anomalies.join(",")})` : "already_in_sync" };
+    return { kind: "noop", reason: "already_in_sync", anomalies };
   }
   if (!isAutoSyncableTransition(current, desired)) {
-    return { kind: "ambiguous", reason: `transition_not_auto_syncable:${current}->${desired}`, desired, from: current };
+    return { kind: "ambiguous", reason: `transition_not_auto_syncable:${current}->${desired}`, desired, from: current, anomalies };
   }
   return { kind: "update", to: desired, from: current, anomalies };
+}
+
+/**
+ * 亡霊ロールが手動で付いたとき、入城処理（ghostify）を走らせてよいか。
+ *
+ * `ghostify()` は `status='ghost'` を上書きし、評価期限・評価スナップショットまで
+ * 作り直す。つまり**上位階級の人に亡霊ロールを足しただけで、評価前まで巻き戻る**。
+ * これは `isAutoSyncableTransition()` の「上位階級 → ghost は自動同期しない」を
+ * reconciler の外から破ることになるので、入口をここで揃える。
+ *
+ * - `waiting` … 本来の入城。ghostify する
+ * - soul row 無し … 台帳より先にロールが付いた人（Bot 停止中の参加・移行前からの在籍）。
+ *   **巻き戻す既存 status がそもそも無い**ので従来どおり ghostify して台帳を作る
+ * - `ghost` … 既に亡霊。ghostify は冪等だが呼ぶ必要が無い
+ * - `majin / kenma / mazoku / meirei / departed` … ghostify しない。
+ *   差し戻しは評価ライフサイクルを伴うので運営の明示操作でやる
+ */
+export type GhostRoleAddDecision =
+  | { kind: "ghostify"; reason: "no_soul_row" | "waiting" }
+  | { kind: "noop"; reason: "already_ghost" }
+  | { kind: "blocked"; reason: string; from: SoulStatus };
+
+export function decideGhostRoleAdd(current: SoulStatus | null): GhostRoleAddDecision {
+  if (current === null) return { kind: "ghostify", reason: "no_soul_row" };
+  if (current === "waiting") return { kind: "ghostify", reason: "waiting" };
+  if (current === "ghost") return { kind: "noop", reason: "already_ghost" };
+  return { kind: "blocked", reason: `ghost_role_add_on:${current}`, from: current };
 }

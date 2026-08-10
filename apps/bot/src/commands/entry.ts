@@ -18,7 +18,7 @@ import {
   type TextChannel,
   type VoiceState,
 } from "discord.js";
-import { describeSessionSchedule } from "@meigokujo/core";
+import { decideGhostRoleAdd, describeSessionSchedule } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { deliverToUser } from "../notify.js";
 import { isAdmin } from "../permissions.js";
@@ -310,12 +310,27 @@ export async function handleMemberRoleUpdate(
   const maleRoleId = services.settings.getString("role:male");
   const femaleRoleId = services.settings.getString("role:female");
 
-  // ① 亡霊ロールが手動付与された → ghostify（冪等）
+  // ① 亡霊ロールが手動付与された → 入城前の人だけ ghostify
+  //
+  // ghostify() は status='ghost' の上書きに加えて評価期限・評価スナップショットを作り直す。
+  // 「上位階級 → ghost は自動同期しない」（isAutoSyncableTransition）を reconciler の外から
+  // 破らないよう、ここでも遷移表と同じ線引きを通す。判断そのものは core の
+  // decideGhostRoleAdd() に置いてあるので、両方の入口が同じ規則を見る。
   if (added.size > 0 && ghostRoleId && added.has(ghostRoleId)) {
     const soul = services.entry.getSoul(newMember.id);
-    if (!soul || soul.status !== "ghost") {
+    const decision = decideGhostRoleAdd(soul?.status ?? null);
+    if (decision.kind === "ghostify") {
       const r = await ghostifyOne(newMember.guild, services, newMember.id, "system:role-add");
-      if (r.ok) console.log(`[entry] 亡霊ロール手動付与検知 → ghostify: ${newMember.id}`);
+      if (r.ok) console.log(`[entry] 亡霊ロール手動付与検知 → ghostify: ${newMember.id} (${decision.reason})`);
+    } else if (decision.kind === "blocked") {
+      // 上位階級・迷霊・離脱済みへ亡霊ロールを足しただけで評価前へ巻き戻さない。
+      // 差し戻したいなら運営の明示操作でやる。ここでは記録だけ残す
+      services.events.log("rank_sync_ambiguous", {
+        actor: "system:role-add",
+        target: newMember.id,
+        payload: { reason: decision.reason, from: decision.from, desired: "ghost" },
+      });
+      console.log(`[entry] 亡霊ロール付与を検知したが ghostify しない: ${newMember.id} (${decision.reason})`);
     }
   }
 

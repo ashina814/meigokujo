@@ -790,6 +790,8 @@ export const SOUL_STATUSES = ["waiting", "ghost", "majin", "kenma", "mazoku", "m
  * 安全のために次を守る。
  * - **列は動的に読む**。ここで列名を書き下すと、あとで `ensureColumn` が増えたときに
  *   移行で列が落ちる。評価スナップショット・招待メタデータもこれで丸ごと運ぶ
+ * - **移行先が知らない列が旧表にあれば、元の表に触れる前に throw する**（fail-closed）。
+ *   警告を出しつつ列を捨てて起動すると、失われたことに気づくのは復旧できなくなった後になる
  * - 新旧に共通する列だけを INSERT..SELECT で移す（順序も明示する）
  * - 1つのトランザクションで行い、途中で落ちたら元のまま
  * - 既に新CHECKなら何もしない（冪等）
@@ -832,17 +834,23 @@ function migrateSoulStatusCheck(db: Database.Database): void {
       )
     `);
     const newColumns = (db.prepare("PRAGMA table_info(souls__new)").all() as Array<{ name: string }>).map((c) => c.name);
-    // 旧表にしか無い列は移せない（そんな列は現状無いが、あれば黙って捨てずに気づけるよう記録する）
+    // 旧表にしか無い列は移せない。**元の表に触れる前に落とす**（fail-closed）。
+    // 移行コードが知らない列が本番にあるなら、それはこのコードが古いということ。
+    // 黙ってデータを捨てて起動するより、deploy を失敗させて人間に判断させる方がよい。
+    // ここで throw すれば ROLLBACK が走り、旧 souls も未知列も全データも元のまま残る。
     const dropped = columns.filter((c) => !newColumns.includes(c));
+    if (dropped.length > 0) {
+      throw new Error(
+        `souls migration blocked: 移行先が知らない列があります: ${dropped.join(", ")}。` +
+          `このまま移すとその列のデータを失います。bootstrap.ts の souls__new の定義へ列を足してから再実行してください（DBは変更していません）。`,
+      );
+    }
     const shared = columns.filter((c) => newColumns.includes(c));
     const quoted = shared.map((c) => `"${c}"`).join(", ");
     db.exec(`INSERT INTO souls__new (${quoted}) SELECT ${quoted} FROM souls`);
     db.exec("DROP TABLE souls");
     db.exec("ALTER TABLE souls__new RENAME TO souls");
     db.exec("COMMIT");
-    if (dropped.length > 0) {
-      console.warn(`[migration] souls の CHECK 移行で運べなかった列: ${dropped.join(", ")}`);
-    }
   } catch (e) {
     db.exec("ROLLBACK");
     throw e;
