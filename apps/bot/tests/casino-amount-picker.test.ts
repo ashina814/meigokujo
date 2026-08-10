@@ -68,8 +68,22 @@ function fakeServices(opts: {
   } as unknown as Services;
 }
 
+/**
+ * 金額操作のボタンだけを見る。
+ * 画面には「賭場ホームへ戻る」も並ぶが、あれは資金を動かさない読むだけの導線なので、
+ * 「全操作が disabled」の検査対象には含めない（含めると戻れなくなってしまう）。
+ */
 function buttons(payload: ReturnType<typeof renderCasinoAmountPicker>) {
-  return payload.components!.flatMap((row) => row.toJSON().components);
+  return payload
+    .components!.flatMap((row) => row.toJSON().components)
+    .filter((b) => typeof b.custom_id === "string" && b.custom_id.startsWith("casino:amount:"));
+}
+
+/** 戻る導線は常に押せる */
+function homeBackButton(payload: { components?: unknown[] }) {
+  return (payload.components as Array<{ toJSON(): { components: Array<{ custom_id?: string; disabled?: boolean }> } }>)
+    .flatMap((row) => row.toJSON().components)
+    .find((b) => b.custom_id === "casino:home:back");
 }
 
 function embedsDescription(payload: ReturnType<typeof renderCasinoAmountPicker>) {
@@ -115,9 +129,11 @@ describe("賭場ホームの遊び・金額選択", () => {
     const interaction = gameSelectInteraction("スロット");
     await handleCasinoGameSelect(interaction, services);
     const reply = interaction.reply.mock.calls[0]![0] as Parameters<typeof interaction.reply>[0];
-    const actionButtons = reply.components!.flatMap((row) => row.toJSON().components);
+    const actionButtons = buttons(reply as never);
     expect(actionButtons).toHaveLength(5);
     expect(actionButtons.every((b) => b.disabled === true)).toBe(true);
+    // 操作は止まっていても、ホームへは帰れる
+    expect(homeBackButton(reply as never)?.disabled).toBeFalsy();
     expect((reply.embeds![0]!.toJSON().description ?? "")).toContain("正式開業準備中");
   });
 

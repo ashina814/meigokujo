@@ -39,9 +39,10 @@ describe("PR10監査: Bot側の導線", () => {
     // どこにもルーティングされておらず、押しても無反応だった）
     const source = read("../src/commands/casino-home.ts");
     expect(source).toContain('result.skipped === "active_ownership"');
-    // skip 分岐が「戻せる自由チップはありません」より前に立っている
+    // skip 分岐が「引き出せる分が無い」より前に立っている。
+    // 順序が逆になると、預託中の利用者に「残高が無い」と誤表示してしまう
     expect(source.indexOf('result.skipped === "active_ownership"'))
-      .toBeLessThan(source.indexOf("戻せる自由チップはありません"));
+      .toBeLessThan(source.indexOf("いま引き出せる分はありません"));
   });
 
   it("10分無操作の自動返還は正式開業かつ営業中のときだけ動かす", () => {

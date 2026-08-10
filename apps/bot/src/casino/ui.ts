@@ -1,4 +1,4 @@
-import { EmbedBuilder } from "discord.js";
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } from "discord.js";
 import { fmtEther, fmtLd } from "../format.js";
 
 /**
@@ -262,6 +262,26 @@ export function reelText(symbols: readonly string[]): string {
  */
 export function balanceLine(balance: number): string {
   return `所持 **${balance.toLocaleString("ja-JP")}** Ld`;
+}
+
+/**
+ * 賭場ホームへ戻る導線。**子画面はどれもこれを付ける**。
+ *
+ * ここ（design system 側）に置いてあるのは、`casino/` から
+ * `commands/casino-home.ts` を参照すると循環参照になるため。
+ * 実際の遷移は customId `casino:home:back` を賭場ホームが受ける。
+ */
+export function casinoHomeBackRow(): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("casino:home:back").setLabel("賭場ホームへ戻る").setEmoji("🏛").setStyle(ButtonStyle.Secondary),
+  );
+}
+
+/** 子画面の payload へ戻る導線を足す。段が上限(5)に達していれば足さない */
+export function withCasinoHomeBack<T extends { components?: unknown[] }>(payload: T): T {
+  const rows = (payload.components ?? []) as unknown[];
+  if (rows.length >= 5) return payload;
+  return { ...payload, components: [...rows, casinoHomeBackRow()] };
 }
 
 /** 賭け → 払戻 の対を1行で。収支の内訳が要るときだけ使う */

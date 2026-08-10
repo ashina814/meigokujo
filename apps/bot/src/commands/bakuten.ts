@@ -16,6 +16,7 @@ import {
 import { CONSUMABLES, getConsumableDef, HOUSE_HOLDER } from "@meigokujo/core";
 import { fmtEther } from "../format.js";
 import { C_MAMMON } from "../casino/ui.js";
+import { readAvailableWallet } from "../casino/wallet.js";
 import type { Services } from "../services.js";
 
 /**
@@ -46,7 +47,13 @@ export async function handleBakutenCommand(
 function buildEmbed(userId: string, services: Services): EmbedBuilder {
   const inv = services.items.inventory(userId);
   const armed = new Set(services.items.armedList(userId));
-  const held = services.chips.balanceOf(userId);
+  // 商店で使えるのは**賭場へ移してある分だけ**。遊ぶときは validateBet が
+  // 手元のLandから自動で寄せるが、購入経路にはその自動移動が無い（core は未対応）。
+  // 額を黙って合算して見せると「所持はあるのに買えない」になるので、
+  // 使える額と手元の残りを分けて出す。資金の扱いはここでは一切変えない
+  const spendable = services.chips.balanceOf(userId);
+  const wallet = readAvailableWallet(services, userId);
+  const atHand = Math.max(0, wallet.land);
 
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · 商店" })
@@ -54,10 +61,13 @@ function buildEmbed(userId: string, services: Services): EmbedBuilder {
     .setTitle("🛍  お守り棚")
     .setDescription(
       [
-        `所持 **${fmtEther(held)}**`,
+        `ここで使える分 **${fmtEther(spendable)}**`,
+        atHand > 0 ? `-# 手元の Land ${fmtEther(atHand)} は、遊びに使うと自動で賭場へ移ります。商店では移しません。` : "",
         "",
         "*買う → 装備する → 発動条件を満たしたら自動で消える。*",
-      ].join("\n"),
+      ]
+        .filter(Boolean)
+        .join("\n"),
     );
 
   // 各お守りを Field で並べる（inline: true で2列レイアウト）

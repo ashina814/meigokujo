@@ -9,7 +9,7 @@ import {
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { fmtLd } from "../format.js";
-import { C_JACKPOT, C_MAMMON, E, h2 } from "../casino/ui.js";
+import { C_JACKPOT, C_MAMMON, E, casinoHomeBackRow, h2, withCasinoHomeBack } from "../casino/ui.js";
 import { checkRetry, isSeatOccupied } from "../casino/common.js";
 import { renderCasinoGameSelect } from "../casino/amount-picker.js";
 import { CASINO_SOLO_GAME_EMOJI, isCasinoSoloGame } from "../casino/games.js";
@@ -66,18 +66,26 @@ export async function handleCasinoHomeButton(interaction: ButtonInteraction, ser
     await interaction.reply({ ...renderPvpGuide(services), flags: MessageFlags.Ephemeral });
     return;
   }
+  // ハブから開いた子画面には戻る導線を足す。単体コマンド（/賭場商店 など）で
+  // 開いたときは付かないので、そちらの見た目は変わらない
   if (interaction.customId === "casino:home:shop") {
-    await interaction.reply({ ...renderShop(interaction.user.id, services), flags: MessageFlags.Ephemeral });
+    await interaction.reply({ ...withCasinoHomeBack(renderShop(interaction.user.id, services)), flags: MessageFlags.Ephemeral });
     return;
   }
   if (interaction.customId === "casino:home:banzuke") {
-    await interaction.reply({ ...renderBanzuke(services, "balance", interaction.user.id), flags: MessageFlags.Ephemeral });
+    await interaction.reply({
+      ...withCasinoHomeBack(renderBanzuke(services, "balance", interaction.user.id)),
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
   if (interaction.customId === "casino:home:passport") {
     // 画像生成に時間がかかるので先に defer する
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    await interaction.editReply({ files: [await buildPassportAttachment(interaction, services)] });
+    await interaction.editReply({
+      files: [await buildPassportAttachment(interaction, services)],
+      components: [casinoHomeBackRow()],
+    });
     return;
   }
   const link = SIDE_GAME_GUIDE[interaction.customId];
@@ -96,9 +104,11 @@ export async function handleCasinoHomeButton(interaction: ButtonInteraction, ser
 }
 
 /**
- * 自由チップをLandへ返す。判定は core（chipFlow.leaveCasino）が持ち、
+ * 賭場に置いている分を Land へ引き出す。判定は core（chipFlow.leaveCasino）が持ち、
  * ここは結果を言葉にするだけ。進行中の預託がある場合は core が見送るので、
- * 「返還できる額が無い」と混ぜずにその理由を出す。
+ * 「引き出せる額が無い」と混ぜずにその理由を出す。
+ *
+ * 利用者向けの文面では内部台帳の語（チップ・自由チップ・チップ帳簿）を出さない。
  */
 async function leaveCasinoFromHome(interaction: ButtonInteraction, services: Services): Promise<void> {
   if (isSeatOccupied(interaction.user.id)) {
@@ -110,12 +120,12 @@ async function leaveCasinoFromHome(interaction: ButtonInteraction, services: Ser
     const result = services.chipFlow.leaveCasino(interaction.user.id, `leave:${interaction.id}`);
     content =
       result.skipped === "active_ownership"
-        ? "進行中の勝負・預託・板があるため、いまは返せません。終わってからもう一度押してください。"
+        ? "進行中の勝負や板があるため、いまは引き出せません。終わってからもう一度押してください。"
         : result.redeemed > 0
-          ? `${fmtLd(result.land)} をLandへ戻しました。`
-          : "戻せる自由チップはありません。";
+          ? `${fmtLd(result.land)} をLandへ引き出しました。`
+          : "いま引き出せる分はありません。";
   } catch {
-    content = "チップ帳簿または進行状態を確認できないため返せません。";
+    content = "残高または進行状態を確認できないため、いまは引き出せません。";
   }
   await interaction.update({ ...renderCasinoHome(interaction.user.id, services, interaction.guild?.name), content });
 }
@@ -167,7 +177,7 @@ function renderPvpGuide(services: Services) {
       inline: false,
     });
   }
-  return { embeds: [embed], components: [backToCasinoHomeRow()] };
+  return { embeds: [embed], components: [casinoHomeBackRow()] };
 }
 
 /** 遊び方。旧「はじめて」を、賭場全体の地図として使えるところまで広げる */
@@ -181,8 +191,9 @@ function renderGuide(services: Services) {
         "**覚えるのは `/賭場` だけでいい。** ここから全部に行けます。",
         "",
         "**お金の単位**",
-        "表示は Land（Ld）です。正式開業後の賭けは自由チップを 1 chip = 1 Ld として使います。",
-        "卓に預けているチップは所持額に混ぜません。",
+        "すべて Land（Ld）で数えます。遊ぶときに必要な分は自動で賭場へ移り、**1 Ld はそのまま 1 Ld** です。",
+        "「Landへ引き出す」で、賭場に置いている分をいつでも手元へ戻せます。",
+        "卓に預けている担保は、勝負が終わるまで所持額に含みません。",
         "",
         "**遊ぶ**",
         "ひとりで遊ぶなら「遊びを選ぶ」。スロット・丁半・クラッシュ・チンチロ・ルーレット・BJ・ポーカー・ホールデム。",
@@ -202,7 +213,7 @@ function renderGuide(services: Services) {
         "-# 停止中や正式開業前は、押しても資金は動きません。現在の状態と理由はホームの先頭に出ています。",
       ].join("\n"),
     );
-  return { embeds: [embed], components: [backToCasinoHomeRow()] };
+  return { embeds: [embed], components: [casinoHomeBackRow()] };
 }
 
 export function renderCasinoHome(userId: string, services: Services, serverName?: string) {
@@ -288,12 +299,12 @@ export function renderCasinoHome(userId: string, services: Services, serverName?
       .setLabel("遊び方")
       .setEmoji("📖")
       .setStyle(ButtonStyle.Secondary),
-    // 自由チップをLandへ返す導線。旧 /案内 にボタンだけあったが customId が
+    // 賭場に置いている分を Land へ引き出す導線。旧 /案内 にボタンだけあったが customId が
     // どこにもルーティングされておらず、押しても無反応の死んだ導線だった。
     // 正規ハブへ繋ぎ直す（core の leaveCasino はそのまま使う）
     new ButtonBuilder()
       .setCustomId("casino:home:leave")
-      .setLabel("チップをLandへ戻す")
+      .setLabel("Landへ引き出す")
       .setEmoji("🚪")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(actionsDisabled),
@@ -302,36 +313,30 @@ export function renderCasinoHome(userId: string, services: Services, serverName?
   return { embeds: [embed], components: [playRow, facilityRow, otherRow, guideRow] };
 }
 
-/** ハブへ戻る導線。どの子画面からでも同じ場所へ帰れるようにする */
-export function backToCasinoHomeRow(): ActionRowBuilder<ButtonBuilder> {
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("casino:home:back").setLabel("賭場ホームへ戻る").setEmoji("🏛").setStyle(ButtonStyle.Secondary),
-  );
-}
 
 function casinoHomeWallet(userId: string, services: Services): { lines: string[]; footer: string } {
   const wallet = readAvailableWallet(services, userId);
   if (wallet.status === "unknown") {
     return {
-      lines: [`所持 ${fmtLd(wallet.land)}（通常Landのみ）`, "自由チップ・預け中資金は確認できません"],
+      lines: [`所持 ${fmtLd(wallet.land)}（手元のLandのみ）`, "賭場に置いている分・卓に預けている分を確認できません"],
       footer: "賭場の版が異常",
     };
   }
   if (wallet.status === "pre_opening") {
     return {
-      lines: [`通常Land ${fmtLd(wallet.land)}`, "自由チップは正式開業まで利用できません"],
+      lines: [`手元のLand ${fmtLd(wallet.land)}`, "賭場での利用は正式開業後に始まります"],
       footer: "正式開業準備中",
     };
   }
   if (wallet.status === "ledger_error") {
     return {
-      lines: [`所持 ${fmtLd(wallet.land)}（通常Landのみ）`, "チップ帳簿を確認できません"],
-      footer: "チップ帳簿エラー",
+      lines: [`所持 ${fmtLd(wallet.land)}（手元のLandのみ）`, "賭場に置いている分を確認できません"],
+      footer: "賭場の残高を確認できません",
     };
   }
   if (wallet.status === "overflow") {
     return {
-      lines: [`所持 ${fmtLd(wallet.land)}（通常Landのみ）`, "残高の合算に失敗しました"],
+      lines: [`所持 ${fmtLd(wallet.land)}（手元のLandのみ）`, "残高の合算に失敗しました"],
       footer: "残高合算エラー",
     };
   }
@@ -342,7 +347,7 @@ function casinoHomeWallet(userId: string, services: Services): { lines: string[]
       h2(`所持 ${fmtLd(wallet.available)}`),
       wallet.escrowed! > 0 ? `預け中 ${fmtLd(wallet.escrowed!)}` : "",
     ].filter(Boolean),
-    footer: `通常Land ${fmtLd(wallet.land)} · 自由チップ ${fmtLd(wallet.freeChips!)} · 預け中 ${fmtLd(wallet.escrowed!)}`,
+    footer: `手元 ${fmtLd(wallet.land)} · 賭場に置いている分 ${fmtLd(wallet.freeChips!)} · 卓に預け中 ${fmtLd(wallet.escrowed!)}`,
   };
 }
 

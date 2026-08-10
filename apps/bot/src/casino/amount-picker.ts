@@ -18,6 +18,7 @@ import { chinchiroMaxPlayerLoss } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import type { Services } from "../services.js";
 import { effectiveMaxBet, MIN_BET } from "./common.js";
+import { withCasinoHomeBack } from "./ui.js";
 import {
   CASINO_SOLO_GAME_DESCRIPTIONS,
   CASINO_SOLO_GAME_EMOJI,
@@ -67,10 +68,10 @@ export function renderCasinoGameSelect(): InteractionReplyOptions {
     .setDescription("遊びを選ぶと、次に金額を選べます。")
     .setColor(0x8b5cf6);
 
-  return {
+  return withCasinoHomeBack({
     embeds: [embed],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)],
-  };
+  });
 }
 
 export async function handleCasinoGameSelect(
@@ -237,10 +238,10 @@ export function renderCasinoAmountPicker(
     .setDescription(lines.join("\n"))
     .setColor(availability.ok ? 0x22c55e : 0x64748b);
 
-  return {
+  return withCasinoHomeBack({
     embeds: [embed],
     components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...fixedButtons, custom)],
-  };
+  });
 }
 
 function amountAvailability(userId: string, game: CasinoSoloGame, services: Services): AmountAvailability {
