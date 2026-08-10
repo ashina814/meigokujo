@@ -86,7 +86,7 @@ export const adminCommand = new SlashCommandBuilder()
 
 // ---- ハブ ----
 
-function renderHub(): { embeds: EmbedBuilder[]; components: ActionRowBuilder<ButtonBuilder>[] } {
+export function renderHub(): { embeds: EmbedBuilder[]; components: ActionRowBuilder<ButtonBuilder>[] } {
   const embed = new EmbedBuilder()
     .setTitle("🏛 冥獄城 管理コンソール")
     .setColor(0x6b21a8)
@@ -104,6 +104,7 @@ function renderHub(): { embeds: EmbedBuilder[]; components: ActionRowBuilder<But
         "・**待ち人**: 門番用の待ち人ボードを設置・更新",
         "・**XP除外**: 発言/浮上XPを付けないチャンネル・カテゴリ",
         "・**賭場**: マモンの賭場（胴元資金・売上精算）",
+        "・**回収**: 未配送の再配送・階級ロールの復元など、既存データの手当て",
       ].join("\n"),
     );
   const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -119,9 +120,12 @@ function renderHub(): { embeds: EmbedBuilder[]; components: ActionRowBuilder<But
     new ButtonBuilder().setCustomId("mgmt:waiters").setLabel("待ち人").setEmoji("🚪").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:xpex").setLabel("XP除外").setEmoji("🚫").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:casino").setLabel("賭場").setEmoji("🎰").setStyle(ButtonStyle.Secondary),
+  );
+  // 1行は5個まで。増やすときは必ず行を足す（超えると /管理 の描画自体が落ちる）
+  const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:recover").setLabel("回収").setEmoji("🧰").setStyle(ButtonStyle.Secondary),
   );
-  return { embeds: [embed], components: [row1, row2] };
+  return { embeds: [embed], components: [row1, row2, row3] };
 }
 
 const backButton = () =>
