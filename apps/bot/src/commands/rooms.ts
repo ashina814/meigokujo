@@ -178,6 +178,18 @@ async function createRoomChannel(
   const secret = kind === "oborozuki";
   const parentFetched = parentCategoryId ? await guild.channels.fetch(parentCategoryId).catch(() => null) : null;
   const category = parentFetched?.type === ChannelType.GuildCategory ? (parentFetched as CategoryChannel) : null;
+  // 生成先が指定されているのに解決できないなら**作らない**。
+  // ここで黙って `parent: undefined` へ落ちると、カテゴリが消された・別種別の
+  // チャンネルIDが入っていた、というだけで宿VCがサーバー直下に生まれ、
+  // 親カテゴリでのXP除外が効かなくなる（今回直した不具合がそのまま再発する）。
+  // カテゴリ未指定(null)のときだけ、従来互換でカテゴリ無し生成を許す
+  if (parentCategoryId !== null && !category) {
+    console.error(
+      `[room] 生成先カテゴリを解決できないため作成を中止: kind=${kind} categoryId=${parentCategoryId} ` +
+        `(${parentFetched ? `type=${parentFetched.type}` : "取得不可"})`,
+    );
+    return null;
+  }
   const everyone = guild.roles.everyone.id;
   const adminRoleId = services.settings.getString("role:admin");
 
@@ -491,7 +503,7 @@ async function createAndReply(
 
     channel = await createRoomChannel(guild, services, kind, owner, members, roomCategoryId(services, kind, panelCategoryId(interaction)));
     if (!channel) {
-      await finish("部屋の作成に失敗しました。運営にパネルの設置場所（カテゴリ）を確認してもらってください。");
+      await finish("部屋の作成に失敗しました。運営に宿の生成先カテゴリ設定を確認してもらってください。");
       return;
     }
 
@@ -796,7 +808,7 @@ export async function handleRecruitModal(interaction: ModalSubmitInteraction, se
 
   const channel = await createRoomChannel(guild, services, "mitsugetsu", owner, [owner.id], roomCategoryId(services, "mitsugetsu", panelCategoryId(interaction)));
   if (!channel) {
-    await interaction.editReply({ content: "部屋の作成に失敗しました。課金していません。" });
+    await interaction.editReply({ content: "部屋の作成に失敗しました。課金していません。運営に宿の生成先カテゴリ設定を確認してもらってください。" });
     return;
   }
 
@@ -1086,7 +1098,7 @@ async function handleOboroDecision(interaction: ButtonInteraction, services: Ser
   // DMの承諾から作るので参照できる親カテゴリが無い。設定が唯一の生成先になる
   const channel = await createRoomChannel(guild, services, "oborozuki", requester, [requester.id, target.id], roomCategoryId(services, "oborozuki", null));
   if (!channel) {
-    await interaction.editReply({ content: "秘密部屋の作成に失敗しました。課金していません。", components: [] });
+    await interaction.editReply({ content: "秘密部屋の作成に失敗しました。課金していません。運営に宿の生成先カテゴリ設定を確認してもらってください。", components: [] });
     return;
   }
   let acceptedRoom: RoomRow | undefined;

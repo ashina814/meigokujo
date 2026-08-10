@@ -262,3 +262,93 @@ describe("生成先カテゴリがXP除外へ繋がる", () => {
     expect(open).toHaveBeenCalledWith("u1", "root-vc", null, false, false);
   });
 });
+
+describe("生成先カテゴリを解決できないときは作らない（fail-closed）", () => {
+  /**
+   * 指定されたカテゴリが消えている・別種別のIDが入っている、というだけで
+   * サーバー直下へ宿VCが生まれると、親カテゴリでのXP除外がまた効かなくなる。
+   * 黙って parent なしへ落ちるのではなく、作らずに失敗させる。
+   */
+  it("朧月: 存在しないカテゴリIDならVCを作らない", async () => {
+    const { guild } = makeGuild(null); // どのIDも解決できない
+    const services = makeServices({ "category:room_oborozuki": "cat-deleted" });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const interaction = oborozukiAcceptInteraction(guild);
+
+    await handleRoomButton(interaction as never, services as never);
+
+    expect(guild.channels.create).not.toHaveBeenCalled();
+    // 課金もしない
+    expect(services.rooms.acceptOborozukiInvite).not.toHaveBeenCalled();
+    expect(JSON.stringify(interaction.editReply.mock.calls.at(-1)?.[0])).toContain("生成先カテゴリ設定");
+    errorSpy.mockRestore();
+  });
+
+  it("朧月: 設定値がカテゴリ以外（テキストch等）を指していたらVCを作らない", async () => {
+    const { guild } = makeGuild(null);
+    // ID は取れるがカテゴリではない
+    guild.channels.fetch = vi.fn(async (id: string) => ({ id, type: ChannelType.GuildText }));
+    const services = makeServices({ "category:room_oborozuki": "not-a-category" });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await handleRoomButton(oborozukiAcceptInteraction(guild) as never, services as never);
+
+    expect(guild.channels.create).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it("蜜月: 設定カテゴリが削除済みでも、パネルの親へ勝手にfallbackしない", async () => {
+    const created = { id: "mitsu-vc", send: vi.fn(async () => undefined), delete: vi.fn(async () => undefined), lockPermissions: vi.fn(async () => undefined) };
+    const owner = { id: "owner", displayName: "owner", user: { bot: false }, voice: {}, roles: { cache: new Map() } };
+    const guild = {
+      client: { channels: { fetch: vi.fn(async () => ({ isTextBased: () => true, send: vi.fn(async () => ({ id: "panel-msg" })) })) } },
+      roles: { everyone: { id: "everyone" } },
+      members: { fetch: vi.fn(async () => owner) },
+      channels: {
+        // 設定カテゴリは消えている。パネルの親カテゴリだけは生きている
+        fetch: vi.fn(async (id: string) =>
+          id === PANEL_CATEGORY_ID ? { id, type: ChannelType.GuildCategory } : null,
+        ),
+        create: vi.fn(async () => created),
+      },
+    };
+    const services = {
+      ledger: { balanceOf: vi.fn(() => 100000) },
+      settings: {
+        getString: vi.fn((key: string) =>
+          key === "role:male" ? "male-role" : key === "channel:recruit" ? "recruit-channel" : key === "category:room_mitsugetsu" ? "cat-deleted" : undefined,
+        ),
+      },
+      rooms: {
+        priceFor: vi.fn(() => 5000),
+        ownershipConflict: vi.fn(() => undefined),
+        registerWithRecruit: vi.fn(),
+        setRecruitPanel: vi.fn(),
+        refundUnusedPaidRoom: vi.fn(),
+        requestDelete: vi.fn(),
+        cancelRecruit: vi.fn(),
+        markDeleteFailed: vi.fn(),
+        markDeletedAndClosed: vi.fn(),
+      },
+    };
+    const editReply = vi.fn(async () => undefined);
+    const interaction = {
+      customId: "room:recruit:male",
+      user: { id: "owner" },
+      guild,
+      channel: { isDMBased: () => false, parentId: PANEL_CATEGORY_ID },
+      fields: { getTextInputValue: vi.fn(() => "雑談") },
+      deferReply: vi.fn(async () => undefined),
+      editReply,
+    };
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await handleRecruitModal(interaction as never, services as never);
+
+    // パネルの親カテゴリへ逃がさない。作らずに失敗させる
+    expect(guild.channels.create).not.toHaveBeenCalled();
+    expect(services.rooms.registerWithRecruit).not.toHaveBeenCalled();
+    expect(JSON.stringify(editReply.mock.calls.at(-1)?.[0])).toContain("生成先カテゴリ設定");
+    errorSpy.mockRestore();
+  });
+});
