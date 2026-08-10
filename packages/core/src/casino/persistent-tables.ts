@@ -38,6 +38,22 @@ const MAX_ID_LENGTH = 200;
 const MAX_GAME_KEY_LENGTH = 80;
 const MAX_REASON_LENGTH = 500;
 
+/**
+ * 要求指紋（request/ready/approval/decline fingerprint）の長さ上限。
+ *
+ * **ID の上限を流用してはいけない。** 指紋は識別子ではなく、複数のIDと数値を
+ * 並べた正規化JSONなので、長さは「項目数 × 各項目の上限」で決まる。
+ * 以前は `MAX_ID_LENGTH`(200) で読み戻していたため、実際の Discord Snowflake
+ * （19桁）を6つ並べる `create` の指紋が250文字になり、**INSERT は通るのに
+ * 読み戻しで落ちてトランザクションごと巻き戻る**という本番専用の不具合になっていた
+ * （結果承認の指紋も202文字で同じ穴に落ちていた）。
+ *
+ * 上限の根拠: 最長は `create` の指紋で、ID6件（各最大 MAX_ID_LENGTH）＋
+ * game_key（最大 MAX_GAME_KEY_LENGTH）＋整数2件＋JSONの装飾で最悪 1,400 文字程度。
+ * 2,000 はそれを十分に超え、かつ破損値を見逃さない範囲に収めた値。
+ */
+const MAX_FINGERPRINT_LENGTH = 2_000;
+
 const REQUIRED_TABLE_COLUMNS = [
   "table_id",
   "state",
@@ -217,17 +233,22 @@ export class PersistentTables {
     const messageId = optionalString(input.messageId ?? null, "message_id");
     const deadlineAt = nullableNonnegativeInt(input.deadlineAt ?? null, "deadline_at");
     const expiresAt = nullableNonnegativeInt(input.expiresAt ?? null, "expires_at");
-    const fingerprint = canonicalStringify({
-      tableId,
-      gameKey,
-      creatorId,
-      operatorId,
-      guildId,
-      channelId,
-      messageId,
-      deadlineAt,
-      expiresAt,
-    });
+    // 保存前に読み戻しと同じ検証を通す。長すぎる指紋はここで落ちるので、
+    // 「INSERT は通ったのに読み戻しで rollback」という追いにくい失敗にならない
+    const fingerprint = persistentTableFingerprint(
+      canonicalStringify({
+        tableId,
+        gameKey,
+        creatorId,
+        operatorId,
+        guildId,
+        channelId,
+        messageId,
+        deadlineAt,
+        expiresAt,
+      }),
+      "request_fingerprint",
+    );
     const tx = this.db.transaction(() => {
       this.ensureSchemaForFormal();
       const existing = this.findByOperation(operationId);
@@ -286,11 +307,7 @@ export class PersistentTables {
     const userId = requiredString(input.userId, "user_id");
     const seat = positiveInt(input.seat, "seat");
     const operationId = requiredString(input.operationId, "operation_id");
-    const fingerprint = canonicalStringify({
-      tableId,
-      userId,
-      seat,
-    });
+    const fingerprint = persistentTableFingerprint(canonicalStringify({ tableId, userId, seat }), "request_fingerprint");
     const tx = this.db.transaction(() => {
       this.ensureSchemaForFormal();
       const replay = this.findParticipantByOperation(operationId);
@@ -801,7 +818,7 @@ function mapTableRow(row: Record<string, unknown>): PersistentTableRow {
     expiresAt: nullableNonnegativeInt(row.expires_at, "expires_at"),
     revision: requiredNonnegativeInt(row.revision, "revision"),
     operationId: requiredString(row.operation_id, "operation_id"),
-    requestFingerprint: requiredString(row.request_fingerprint, "request_fingerprint"),
+    requestFingerprint: persistentTableFingerprint(row.request_fingerprint, "request_fingerprint"),
     failureReason: optionalString(row.failure_reason, "failure_reason", MAX_REASON_LENGTH),
     disputeReason: optionalString(row.dispute_reason, "dispute_reason", MAX_REASON_LENGTH),
     recoveryError: optionalString(row.recovery_error, "recovery_error", MAX_REASON_LENGTH),
@@ -815,16 +832,16 @@ function mapParticipantRow(row: Record<string, unknown>): PersistentTablePartici
     seat: positiveInt(row.seat, "seat"),
     joinedAt: requiredNonnegativeInt(row.joined_at, "joined_at"),
     operationId: requiredString(row.operation_id, "operation_id"),
-    requestFingerprint: requiredString(row.request_fingerprint, "request_fingerprint"),
+    requestFingerprint: persistentTableFingerprint(row.request_fingerprint, "request_fingerprint"),
     readyState: optionalString(row.ready_state, "ready_state"),
     approvalState: optionalString(row.approval_state, "approval_state"),
     participantState: optionalString(row.participant_state, "participant_state"),
     readyOperationId: optionalString(row.ready_operation_id, "ready_operation_id"),
-    readyFingerprint: optionalString(row.ready_fingerprint, "ready_fingerprint"),
+    readyFingerprint: optionalFingerprint(row.ready_fingerprint, "ready_fingerprint"),
     approvalOperationId: optionalString(row.approval_operation_id, "approval_operation_id"),
-    approvalFingerprint: optionalString(row.approval_fingerprint, "approval_fingerprint"),
+    approvalFingerprint: optionalFingerprint(row.approval_fingerprint, "approval_fingerprint"),
     declineOperationId: optionalString(row.decline_operation_id, "decline_operation_id"),
-    declineFingerprint: optionalString(row.decline_fingerprint, "decline_fingerprint"),
+    declineFingerprint: optionalFingerprint(row.decline_fingerprint, "decline_fingerprint"),
     declinedAt: nullableNonnegativeInt(row.declined_at, "declined_at"),
     riskDayKey: optionalString(row.risk_day_key, "risk_day_key"),
     riskMaxLoss: nullableNonnegativeInt(row.risk_max_loss, "risk_max_loss"),
@@ -858,6 +875,22 @@ function requiredString(value: unknown, field: string, maxLength = MAX_ID_LENGTH
     });
   }
   return value;
+}
+
+/**
+ * 要求指紋を検証して返す。**書き込み前と読み戻しの両方でこれを通すこと。**
+ *
+ * 元の不具合は「書けるが読めない値」を保存できてしまったことなので、
+ * 入口と出口で同じ関数を使い、契約を1か所に持たせる。長すぎる指紋は
+ * 保存前にここで落ちるため、原因の分かりにくい rollback にならない。
+ */
+export function persistentTableFingerprint(value: unknown, field: string): string {
+  return requiredString(value, field, MAX_FINGERPRINT_LENGTH);
+}
+
+function optionalFingerprint(value: unknown, field: string): string | null {
+  if (value === null || value === undefined) return null;
+  return persistentTableFingerprint(value, field);
 }
 
 function optionalString(value: unknown, field: string, maxLength = MAX_ID_LENGTH): string | null {

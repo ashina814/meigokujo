@@ -43,8 +43,10 @@ export const SETTING_DEFAULTS = {
   daily_relief_max: 500,
   casino_daily_loss_limit_bps: 3_000,
   casino_daily_boundary_offset_minutes: 540,
-  casino_super_high_enabled: 0,
+  // 順位卓の段階解放。見習〜超高卓は通常営業なので設定を持たない。
+  // 極卓・冥獄卓だけ運営が明示的に解放する（0 = 未解放）
   casino_extreme_enabled: 0,
+  casino_meigoku_enabled: 0,
   // VIP
   vip_price: 30_000,
   vip_days: 30,

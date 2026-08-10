@@ -30,6 +30,7 @@ import {
   ChipLedgerError,
   HOUSE_HOLDER,
   LedgerError,
+  RANKED_TABLE_TIERS,
   readCasinoOpeningConfig,
   type RefundSaga,
   type TicketPanel,
@@ -257,6 +258,36 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
     return void (await interaction.showModal(casinoReopenModal(cur.reason)));
   }
   if (section === "casino" && action === "profile") return void (await interaction.showModal(rankedProfileModal()));
+  if (section === "casino" && action === "unlock") return void (await interaction.update(rankedUnlockPanel(services)));
+  if (section === "casino" && action === "unlock-toggle") {
+    // 段階解放の切り替え。**資金は1 Ld も動かない**（開催可否の設定だけ）。
+    // 極 → 冥獄 の順に1段ずつ入れる運用なので、極が閉じたまま冥獄だけ開けさせない。
+    const tierKey = parts[3] ?? "";
+    const key = RANKED_UNLOCK_SETTING[tierKey];
+    if (!key) {
+      return void (await interaction.reply({ content: "❌ 未知の卓ランクです。", flags: MessageFlags.Ephemeral }));
+    }
+    const next = services.settings.getNumber(key) === 1 ? 0 : 1;
+    if (tierKey === "meigoku" && next === 1 && services.settings.getNumber("casino_extreme_enabled") !== 1) {
+      return void (await interaction.reply({
+        content: "❌ 冥獄卓は極卓を解放してからにしてください（段階解放は1段ずつ）。",
+        flags: MessageFlags.Ephemeral,
+      }));
+    }
+    if (tierKey === "extreme" && next === 0 && services.settings.getNumber("casino_meigoku_enabled") === 1) {
+      return void (await interaction.reply({
+        content: "❌ 冥獄卓が解放中です。先に冥獄卓を閉じてください。",
+        flags: MessageFlags.Ephemeral,
+      }));
+    }
+    services.settings.set(key, String(next), interaction.user.id);
+    services.events.log("casino_ranked_tier_unlock_changed", {
+      actor: interaction.user.id,
+      target: tierKey,
+      payload: { unlocked: next === 1 },
+    });
+    return void (await interaction.update(rankedUnlockPanel(services)));
+  }
   if (section === "casino" && action === "baseline") {
     return void (await interaction.showModal(
       casinoBaselineModal(services.chips.pool(), services.ledger.lastTransactionId()),
@@ -2218,6 +2249,12 @@ function casinoHome(services: Services) {
         .setLabel("汎用順位卓の配分を登録")
         .setEmoji("🧮")
         .setStyle(ButtonStyle.Secondary),
+      // 極卓・冥獄卓の段階解放。開催可否だけを変える（資金は動かない）
+      new ButtonBuilder()
+        .setCustomId("mgmt:casino:unlock")
+        .setLabel("順位卓の段階解放")
+        .setEmoji("🔓")
+        .setStyle(ButtonStyle.Secondary),
     ),
   );
   // 検算Bの基準が無い版（PR2 以前から動いていたDB）だけ、明示的な基準確定を出す
@@ -2233,6 +2270,52 @@ function casinoHome(services: Services) {
     );
   }
   return { embeds: [embed], components: [...rows, backButton()] };
+}
+
+/**
+ * 段階解放の対象と、対応する設定キー。
+ *
+ * 見習〜超高卓は通常営業なので**ここに載せない**（設定を持たない＝常に開ける）。
+ * 一律の時間クールダウンは廃止した。時間で勝手に開くと「いま開けてよいか」の判断が
+ * 運営の手を離れるうえ、設定値が未投入だと逆に全ランクが死ぬ事故が起きたため。
+ */
+const RANKED_UNLOCK_SETTING: Readonly<Record<string, "casino_extreme_enabled" | "casino_meigoku_enabled">> = {
+  extreme: "casino_extreme_enabled",
+  meigoku: "casino_meigoku_enabled",
+};
+
+/** 段階解放パネル。ここでの操作は開催可否だけを変え、資金には一切触れない */
+function rankedUnlockPanel(services: Services) {
+  const tiers = RANKED_TABLE_TIERS.filter((tier) => RANKED_UNLOCK_SETTING[tier.key]);
+  const state = (tierKey: string): boolean => services.settings.getNumber(RANKED_UNLOCK_SETTING[tierKey]!) === 1;
+  const embed = new EmbedBuilder()
+    .setTitle("🔓 順位卓の段階解放")
+    .setColor(0xc9a227)
+    .setDescription(
+      [
+        "見習卓〜**超高卓（30,000 Ld）** までは従業員が通常営業で開けます。設定は要りません。",
+        "**極卓・冥獄卓は運営が解放したときだけ**開けます。解放は極 → 冥獄の順に1段ずつ。",
+        "",
+        ...tiers.map((tier) => `${state(tier.key) ? "🟢 解放中" : "🔒 未解放"}　**${tier.label}**（${tier.baseAmount.toLocaleString("ja-JP")} Ld）`),
+        "",
+        "-# 解放しても、担保・場代・日次損失上限・残高確認はこれまでどおり効きます。",
+      ].join("\n"),
+    );
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    ...tiers.map((tier) =>
+      new ButtonBuilder()
+        .setCustomId(`mgmt:casino:unlock-toggle:${tier.key}`)
+        .setLabel(`${tier.label}を${state(tier.key) ? "閉じる" : "解放する"}`)
+        .setEmoji(state(tier.key) ? "🔒" : "🔓")
+        .setStyle(state(tier.key) ? ButtonStyle.Danger : ButtonStyle.Success),
+    ),
+  );
+  return {
+    embeds: [embed],
+    components: [row, new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("mgmt:casino").setLabel("賭場へ戻る").setEmoji("◀").setStyle(ButtonStyle.Secondary),
+    )],
+  };
 }
 
 /**

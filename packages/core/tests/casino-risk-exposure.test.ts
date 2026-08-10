@@ -40,9 +40,7 @@ function setup(
     now?: number;
     dailyLossLimitBps?: number;
     boundaryOffsetMinutes?: number;
-    highCooldownSec?: number | null;
-    superHighEnabled?: boolean;
-    extremeEnabled?: boolean;
+    unlockedTiers?: readonly string[];
     /** 正式開業させない（開業前の照会・作成を見るテスト用） */
     preformal?: boolean;
   } = {},
@@ -83,9 +81,7 @@ function setup(
     disputes,
     dailyRisk,
     openingPhase: () => chipTx.openingPhase(),
-    highCooldownSec: () => options.highCooldownSec ?? null,
-    superHighEnabled: () => options.superHighEnabled === true,
-    extremeEnabled: () => options.extremeEnabled === true,
+    tierUnlocked: (tierKey) => (options.unlockedTiers ?? []).includes(tierKey),
   });
   return {
     db,
@@ -486,7 +482,7 @@ describe("ranked tier availability is read-only before formal opening", () => {
   }
 
   it("reports every tier as unavailable before formal opening without touching sqlite_master", () => {
-    const ctx = setup({ preformal: true, highCooldownSec: 3_600, superHighEnabled: true, extremeEnabled: true });
+    const ctx = setup({ preformal: true, unlockedTiers: ["extreme", "meigoku"] });
     const before = schemaSnapshot(ctx);
 
     for (const authority of ["employee", "manager"] as const) {
@@ -501,7 +497,7 @@ describe("ranked tier availability is read-only before formal opening", () => {
   });
 
   it("rejects a pre-formal high create and leaves the open-history schema absent", () => {
-    const ctx = setup({ preformal: true, highCooldownSec: 3_600 });
+    const ctx = setup({ preformal: true });
     const before = schemaSnapshot(ctx);
 
     expect(() =>
@@ -513,33 +509,39 @@ describe("ranked tier availability is read-only before formal opening", () => {
   });
 
   it("does not mutate the schema when reading availability after formal opening either", () => {
-    const ctx = setup({ highCooldownSec: 3_600 });
+    const ctx = setup({});
     const before = schemaSnapshot(ctx);
     const rows = ctx.rankedTables.rankedTierAvailability("employee");
     expect(rows.find((row) => row.tierKey === "high")?.available).toBe(true);
-    expect(rows.find((row) => row.tierKey === "super_high")?.available).toBe(false);
+    // 超高卓まで通常営業。極・冥獄は段階解放待ちで閉じている
+    expect(rows.find((row) => row.tierKey === "super_high")?.available).toBe(true);
+    expect(rows.find((row) => row.tierKey === "extreme")?.available).toBe(false);
     expect(schemaSnapshot(ctx)).toBe(before);
   });
 
   it("creates the open-history table only on the real write path", () => {
-    const ctx = setup({ highCooldownSec: 3_600 });
+    const ctx = setup({});
     ctx.rankedTables.create({ tableId: "high1", gameKey: "gf", baseAmount: 10_000, creatorId: "operator", operatorId: "operator", operationId: "create:high1" });
     expect(ctx.db.prepare("SELECT 1 FROM sqlite_master WHERE name='casino_ranked_open_history'").get()).toBeDefined();
     expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_ranked_open_history").get()).toEqual({ n: 1 });
   });
 
   it("fails closed on a partial open-history schema instead of repairing it", () => {
-    const ctx = setup({ highCooldownSec: 3_600 });
+    const ctx = setup({});
     ctx.db.exec("CREATE TABLE casino_ranked_open_history (operation_id TEXT PRIMARY KEY, table_id TEXT NOT NULL)");
 
+    // 開催履歴は全ランクで記録するので、壊れていればどのランクも開けない。
+    // 照会と作成で答えが食い違わないことが要点（旧実装は中卓を「開ける」と表示していた）
     const rows = ctx.rankedTables.rankedTierAvailability("employee");
-    expect(rows.find((row) => row.tierKey === "high")?.reason).toBe("ranked open history schema is incomplete");
-    // 見習い〜中卓（高卓未満）はクールダウンの対象外なので影響を受けない
-    expect(rows.find((row) => row.tierKey === "middle")?.available).toBe(true);
+    for (const key of ["minarai", "middle", "high", "super_high"]) {
+      expect(rows.find((row) => row.tierKey === key)?.reason).toBe("ranked open history schema is incomplete");
+    }
 
-    expect(() =>
-      ctx.rankedTables.create({ tableId: "high1", gameKey: "gf", baseAmount: 10_000, creatorId: "operator", operatorId: "operator", operationId: "create:high1" }),
-    ).toThrow(RankedTableError);
+    for (const [tableId, amount] of [["mid1", 5_000], ["high1", 10_000]] as const) {
+      expect(() =>
+        ctx.rankedTables.create({ tableId, gameKey: "gf", baseAmount: amount, creatorId: "operator", operatorId: "operator", operationId: `create:${tableId}` }),
+      ).toThrow(RankedTableError);
+    }
     // 壊れた表を勝手に直していない
     expect((ctx.db.prepare("PRAGMA table_info(casino_ranked_open_history)").all() as Array<{ name: string }>).map((c) => c.name)).toEqual([
       "operation_id",
@@ -552,39 +554,45 @@ describe("ranked tier policy regression", () => {
   const create = (ctx: ReturnType<typeof setup>, tableId: string, baseAmount: number, authority: "employee" | "manager") =>
     ctx.rankedTables.create({ tableId, gameKey: "gf", baseAmount, creatorId: "operator", operatorId: "operator", operationId: `create:${tableId}`, authority });
 
-  it("lets an employee open minarai through high, but nothing above it", () => {
-    const ctx = setup({ highCooldownSec: 3_600, superHighEnabled: true, extremeEnabled: true });
+  it("lets an employee open minarai through super high, but never a staged-unlock tier", () => {
+    // 超高卓（30,000）までが通常営業。極・冥獄は解放済みでも従業員には開けない
+    const ctx = setup({ unlockedTiers: ["extreme", "meigoku"] });
     const rows = ctx.rankedTables.rankedTierAvailability("employee");
-    expect(rows.filter((row) => row.available).map((row) => row.tierKey)).toEqual(["minarai", "low", "middle", "high"]);
-    expect(() => create(ctx, "super1", 30_000, "employee")).toThrow(RankedTableError);
+    expect(rows.filter((row) => row.available).map((row) => row.tierKey)).toEqual(["minarai", "low", "middle", "high", "super_high"]);
+    expect(create(ctx, "super1", 30_000, "employee").config.baseAmount).toBe(30_000);
     expect(() => create(ctx, "extreme1", 50_000, "employee")).toThrow(RankedTableError);
+    expect(() => create(ctx, "meigoku1", 100_000, "employee")).toThrow(RankedTableError);
   });
 
-  it("closes high-or-above when the cooldown setting is missing or invalid", () => {
-    for (const cooldown of [null, 0, -1]) {
-      const ctx = setup({ highCooldownSec: cooldown });
-      expect(ctx.rankedTables.rankedTierAvailability("employee").find((row) => row.tierKey === "high")?.available).toBe(false);
-      expect(() => create(ctx, "high1", 10_000, "employee")).toThrow(RankedTableError);
-      // 高卓未満は通常どおり開ける
-      expect(create(ctx, "mid1", 5_000, "employee").config.baseAmount).toBe(5_000);
-    }
+  it("opens high and super high with no time cooldown and no opening-age wait", () => {
+    // 一律クールダウンと開業30日待ちは廃止した。設定が1件も無くても通常営業できる
+    const ctx = setup({});
+    const availability = ctx.rankedTables.rankedTierAvailability("employee");
+    expect(availability.find((row) => row.tierKey === "high")?.available).toBe(true);
+    expect(availability.find((row) => row.tierKey === "super_high")?.available).toBe(true);
+    expect(create(ctx, "high1", 10_000, "employee").config.baseAmount).toBe(10_000);
+    // 直後に続けて開いてもクールダウンで弾かれない
+    expect(create(ctx, "high2", 10_000, "employee").config.baseAmount).toBe(10_000);
   });
 
-  it("keeps super high closed until 30 formal days and an explicit enable, and meigoku manager-only", () => {
-    const disabled = setup({ highCooldownSec: 3_600 });
-    expect(() => create(disabled, "super1", 30_000, "manager")).toThrow(RankedTableError);
+  it("keeps extreme and meigoku closed until the operator unlocks each one", () => {
+    const locked = setup({});
+    expect(locked.rankedTables.rankedTierAvailability("manager").filter((row) => row.available).map((row) => row.tierKey))
+      .toEqual(["minarai", "low", "middle", "high", "super_high"]);
+    expect(() => create(locked, "extreme1", 50_000, "manager")).toThrow(RankedTableError);
+    expect(() => create(locked, "meigoku1", 100_000, "manager")).toThrow(RankedTableError);
 
-    const youngNow = 1_700_000_000;
-    const young = setup({ now: youngNow, highCooldownSec: 3_600, superHighEnabled: true });
-    young.db.prepare("UPDATE casino_chip_opening_versions SET created_at=? WHERE opening_version='opening_v1'").run(youngNow - 29 * 24 * 60 * 60);
-    expect(() => create(young, "super2", 30_000, "manager")).toThrow(RankedTableError);
+    // 解放は1段ずつ。極を開けても冥獄はまだ閉じたまま
+    const extremeOnly = setup({ unlockedTiers: ["extreme"] });
+    expect(create(extremeOnly, "extreme2", 50_000, "manager").config.baseAmount).toBe(50_000);
+    expect(() => create(extremeOnly, "meigoku2", 100_000, "manager")).toThrow(RankedTableError);
 
-    const ready = setup({ highCooldownSec: 3_600, superHighEnabled: true });
-    expect(create(ready, "super3", 30_000, "manager").config.baseAmount).toBe(30_000);
+    const both = setup({ unlockedTiers: ["extreme", "meigoku"] });
+    expect(create(both, "meigoku3", 100_000, "manager").config.baseAmount).toBe(100_000);
   });
 
   it("cannot bypass the canonical tier list with a raw base amount", () => {
-    const ctx = setup({ highCooldownSec: 3_600 });
+    const ctx = setup({});
     expect(() => create(ctx, "odd1", 9_900, "manager")).toThrow(RankedTableError);
   });
 });

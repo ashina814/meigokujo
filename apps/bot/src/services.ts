@@ -225,13 +225,12 @@ export function buildServices() {
     disputes: rankedDisputes,
     dailyRisk,
     openingPhase: () => chipTx.openingPhase(),
-    superHighEnabled: () => settings.getNumber("casino_super_high_enabled") === 1,
-    extremeEnabled: () => settings.getNumber("casino_extreme_enabled") === 1,
-    highCooldownSec: () => {
-      const raw = settings.getString("casino_ranked_high_cooldown_sec");
-      if (raw === undefined) return null;
-      const parsed = Number(raw);
-      return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+    // 段階解放。極卓・冥獄卓だけが対象で、運営が /管理 の賭場パネルから入れる。
+    // 未知のランクは false（fail-closed）
+    tierUnlocked: (tierKey) => {
+      if (tierKey === "extreme") return settings.getNumber("casino_extreme_enabled") === 1;
+      if (tierKey === "meigoku") return settings.getNumber("casino_meigoku_enabled") === 1;
+      return false;
     },
   });
   // 汎用順位卓の信頼プロファイル台帳（PR24）。登録は運営、選択は従業員

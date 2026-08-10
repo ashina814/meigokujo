@@ -352,7 +352,7 @@ describe("RankedTables result approval and settlement", () => {
     ];
     for (const c of cases) {
       for (const order of permutations(c.users)) {
-        const ctx = setup(c.base >= 10_000 ? { highCooldownSec: () => 3_600 } : {});
+        const ctx = setup({});
         createTable(ctx, "t", c.game, c.base);
         c.users.forEach((userId, index) => {
           seedUser(ctx, userId, 50_000);

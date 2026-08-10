@@ -31,9 +31,7 @@ function setup(options: {
   now?: number;
   dailyLossLimitBps?: number;
   boundaryOffsetMinutes?: number;
-  highCooldownSec?: number | null;
-  superHighEnabled?: boolean;
-  extremeEnabled?: boolean;
+  unlockedTiers?: readonly string[];
 } = {}) {
   let now = options.now ?? DEFAULT_TEST_NOW;
   const db = openDb(":memory:");
@@ -67,9 +65,7 @@ function setup(options: {
     reservations,
     disputes,
     dailyRisk,
-    highCooldownSec: () => options.highCooldownSec ?? null,
-    superHighEnabled: () => options.superHighEnabled === true,
-    extremeEnabled: () => options.extremeEnabled === true,
+    tierUnlocked: (tierKey) => (options.unlockedTiers ?? []).includes(tierKey),
   });
   return {
     db,
@@ -201,24 +197,26 @@ describe("ranked table risk gates", () => {
 });
 
 describe("ranked tier availability", () => {
-  it("requires explicit staged settings for high-or-above tiers and preserves create replay during cooldown", () => {
-    const ctx = setup({ highCooldownSec: 3_600 });
-    const first = ctx.rankedTables.create({ tableId: "high1", gameKey: "gf", baseAmount: 10_000, creatorId: "operator", operatorId: "operator", operationId: "create:high1", authority: "employee" });
+  const create = (ctx: ReturnType<typeof setup>, tableId: string, baseAmount: number, authority: "employee" | "manager") =>
+    ctx.rankedTables.create({ tableId, gameKey: "gf", baseAmount, creatorId: "operator", operatorId: "operator", operationId: `create:${tableId}`, authority });
+
+  it("keeps create idempotent for high tiers across repeated calls", () => {
+    const ctx = setup({});
+    const first = create(ctx, "high1", 10_000, "employee");
     expect(first.config.baseAmount).toBe(10_000);
     ctx.setNow(1_700_000_100);
-    expect(ctx.rankedTables.create({ tableId: "high1", gameKey: "gf", baseAmount: 10_000, creatorId: "operator", operatorId: "operator", operationId: "create:high1", authority: "employee" }).table.tableId).toBe("high1");
-    expect(() => ctx.rankedTables.create({ tableId: "high2", gameKey: "gf", baseAmount: 10_000, creatorId: "operator", operatorId: "operator", operationId: "create:high2", authority: "employee" })).toThrow(RankedTableError);
+    // 同じ operationId の再送は同じ卓を返す（クールダウン廃止後も冪等性は変わらない）
+    expect(create(ctx, "high1", 10_000, "employee").table.tableId).toBe("high1");
+    // 別の卓も続けて開ける。時間による締め出しは無い
+    expect(create(ctx, "high2", 10_000, "employee").config.baseAmount).toBe(10_000);
   });
 
-  it("keeps super high and extreme closed by default and blocks them during the first 30 formal-opening days", () => {
-    expect(() => setup({ highCooldownSec: 3_600 }).rankedTables.create({ tableId: "super1", gameKey: "gf", baseAmount: 30_000, creatorId: "operator", operatorId: "operator", operationId: "create:super1", authority: "manager" })).toThrow(RankedTableError);
-
-    const youngNow = 1_700_000_000;
-    const young = setup({ now: youngNow, highCooldownSec: 3_600, superHighEnabled: true });
-    young.db.prepare("UPDATE casino_chip_opening_versions SET created_at=? WHERE opening_version='opening_v1'").run(youngNow - 29 * 24 * 60 * 60);
-    expect(() => young.rankedTables.create({ tableId: "super2", gameKey: "gf", baseAmount: 30_000, creatorId: "operator", operatorId: "operator", operationId: "create:super2", authority: "manager" })).toThrow(RankedTableError);
-
-    const employee = setup({ highCooldownSec: 3_600, superHighEnabled: true, extremeEnabled: true });
-    expect(() => employee.rankedTables.create({ tableId: "extreme1", gameKey: "gf", baseAmount: 50_000, creatorId: "operator", operatorId: "operator", operationId: "create:extreme1", authority: "employee" })).toThrow(RankedTableError);
+  it("keeps extreme and meigoku closed by default for every authority", () => {
+    const ctx = setup({});
+    expect(() => create(ctx, "extreme1", 50_000, "manager")).toThrow(RankedTableError);
+    expect(() => create(ctx, "meigoku1", 100_000, "manager")).toThrow(RankedTableError);
+    // 解放しても従業員資格では開けない
+    const unlocked = setup({ unlockedTiers: ["extreme", "meigoku"] });
+    expect(() => create(unlocked, "extreme2", 50_000, "employee")).toThrow(RankedTableError);
   });
 });

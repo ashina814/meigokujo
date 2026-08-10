@@ -9,9 +9,10 @@ import type { HouseReservations } from "./reservations.js";
 import { rankedFeeReservationKey, RANKED_FEE_RESERVATION_SCOPE } from "./ranked-fee-reservation.js";
 import type { RankedDisputes } from "./ranked-disputes.js";
 import type { DailyRisk } from "./daily-risk.js";
-import { FORMAL_OPENING_VERSION, type OpeningPhase } from "./chip-tx.js";
+import type { OpeningPhase } from "./chip-tx.js";
 import {
   PersistentTableError,
+  persistentTableFingerprint,
   type PersistentTableParticipantRow,
   type PersistentTableRow,
   type PersistentTables,
@@ -40,10 +41,23 @@ export const RANKED_TABLE_TIERS: readonly RankedTableTier[] = [
 ] as const;
 
 /**
- * 賭博場従業員の資格で**操作してよい**卓ランク（正本 §15.1「従業員が開けるのは高卓まで」）。
- * 作成にも閉鎖にも同じ範囲を使う（PR24）。
+ * 賭博場従業員の資格で**操作してよい**卓ランク。作成にも閉鎖にも同じ範囲を使う（PR24）。
+ *
+ * 正式開業後の経済規模を見て、超高卓（30,000）までを通常営業へ引き上げた
+ * （正本 §15.1 の「高卓まで」から運用方針を変更）。
+ * 極卓・冥獄卓は運営専任のまま、下の段階解放を通したときだけ開けられる。
  */
-export const EMPLOYEE_OPERABLE_TIER_KEYS: readonly string[] = ["minarai", "low", "middle", "high"];
+export const EMPLOYEE_OPERABLE_TIER_KEYS: readonly string[] = ["minarai", "low", "middle", "high", "super_high"];
+
+/**
+ * 段階解放でしか開けない卓ランク。運営が明示的に解放するまで誰も開けない。
+ *
+ * 高額卓を一律の時間クールダウンで抑えるのはやめた。時間で自動的に開いてしまうため
+ * 「いま開けてよいか」の判断が運営の手を離れるうえ、設定値が無いと逆に全ランクが
+ * 死ぬ（実際、クールダウン設定が未投入で高卓が永久に開けなくなっていた）。
+ * 代わりに、極・冥獄は運営が解放を1つずつ入れる段階解放にする。
+ */
+export const STAGED_UNLOCK_TIER_KEYS: readonly string[] = ["extreme", "meigoku"];
 
 export const RANKED_PROFILES = {
   gf: { key: "gf", participantCount: 2, rankDeltaBps: [10_000, -10_000] },
@@ -163,9 +177,8 @@ export interface RankedTablesOptions {
   reservations?: HouseReservations;
   disputes?: RankedDisputes;
   dailyRisk?: DailyRisk;
-  superHighEnabled?: () => boolean;
-  extremeEnabled?: () => boolean;
-  highCooldownSec?: () => number | null;
+  /** 段階解放された卓ランクか。極卓・冥獄卓だけがこれを見る */
+  tierUnlocked?: (tierKey: string) => boolean;
   /** 開業フェーズ。正式開業前は順位卓を1卓も開けない（履歴表も作らない） */
   openingPhase?: () => OpeningPhase;
 }
@@ -255,9 +268,7 @@ export function feeForBaseAmount(baseAmount: number): number {
 export class RankedTables {
   private readonly now: () => number;
   private readonly isSoloSeatOccupied: (userId: string) => boolean;
-  private readonly superHighEnabled: () => boolean;
-  private readonly extremeEnabled: () => boolean;
-  private readonly highCooldownSec: () => number | null;
+  private readonly tierUnlocked: (tierKey: string) => boolean;
   private readonly openingPhase: () => OpeningPhase;
 
   constructor(
@@ -271,9 +282,8 @@ export class RankedTables {
   ) {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.isSoloSeatOccupied = options.isSoloSeatOccupied ?? (() => false);
-    this.superHighEnabled = options.superHighEnabled ?? (() => false);
-    this.extremeEnabled = options.extremeEnabled ?? (() => false);
-    this.highCooldownSec = options.highCooldownSec ?? (() => null);
+    // 既定は fail-closed。解放設定を渡さない呼び出し側では極・冥獄が開かない
+    this.tierUnlocked = options.tierUnlocked ?? (() => false);
     this.openingPhase = options.openingPhase ?? (() => "formal");
   }
 
@@ -369,7 +379,7 @@ export class RankedTables {
       seat: safePositiveInt(input.seat, "seat"),
       operationId: requiredString(input.operationId, "operationId"),
     };
-    const fingerprint = canonicalStringify(safeInput);
+    const fingerprint = persistentTableFingerprint(canonicalStringify(safeInput), "request_fingerprint");
     const result = this.chips.runGroup(
       { groupKey: `ranked:join:${safeInput.tableId}:${safeInput.userId}:${safeInput.operationId}`, kind: "table_hold", actorId: safeInput.userId },
       () => {
@@ -464,7 +474,7 @@ export class RankedTables {
       userId: requiredString(input.userId, "userId"),
       operationId: requiredString(input.operationId, "operationId"),
     };
-    const fingerprint = canonicalStringify(safeInput);
+    const fingerprint = persistentTableFingerprint(canonicalStringify(safeInput), "request_fingerprint");
     const tx = this.db.transaction(() => {
       const replay = this.participantByReadyOperation(safeInput.operationId);
       if (replay) {
@@ -560,7 +570,7 @@ export class RankedTables {
       userId: requiredString(input.userId, "userId"),
       operationId: requiredString(input.operationId, "operationId"),
     };
-    const fingerprint = canonicalStringify(safeInput);
+    const fingerprint = persistentTableFingerprint(canonicalStringify(safeInput), "request_fingerprint");
     const tx = this.db.transaction(() => {
       const replay = this.participantByDeclineOperation(safeInput.operationId);
       if (replay) {
@@ -827,7 +837,7 @@ export class RankedTables {
       resultHash: requiredString(input.resultHash, "resultHash"),
       operationId: requiredString(input.operationId, "operationId"),
     };
-    const fingerprint = canonicalStringify({ ...safeInput, action });
+    const fingerprint = persistentTableFingerprint(canonicalStringify({ ...safeInput, action }), "approval_fingerprint");
     const tx = this.db.transaction(() => {
       const replay = this.participantByApprovalOperation(safeInput.operationId);
       if (replay) {
@@ -1110,13 +1120,14 @@ export class RankedTables {
   /**
    * 卓種を開けない理由（開けるなら null）。
    *
-   * 判定順は正本 §15.1 と PR23 の要件どおり:
-   * 開業フェーズ → 権限 → 段階開放設定 → 開業からの経過日数 → 高卓以上のクールダウン。
+   * 判定順: 開業フェーズ → 権限 → 段階解放。
    *
-   * `write: false`（照会）では **DB スキーマを一切変えない**。履歴表が無ければ
-   * 「高卓以上の開催記録が無い」として読み取りだけで判断する。
-   * 履歴表が壊れている（必須列が欠けている）場合は、読み取り・書き込みのどちらでも
-   * fail-closed（クールダウンを無視して開けさせない）。
+   * 見習〜超高卓は正式開業後の通常営業。極卓・冥獄卓だけが段階解放を要求する。
+   * 解放は運営の明示操作でしか入らないので、時間経過で勝手に開くことはない。
+   *
+   * `write` は履歴表を用意してよいかの区別。照会（`write: false`）では
+   * **DBスキーマを一切変えない**。いまは判定に履歴表を読まないので副作用は無いが、
+   * 呼び分けの契約は残しておく（作成経路だけが表を作る）。
    */
   private tierCreateBlockReason(tier: RankedTableTier, authority: RankedCreateAuthority, opts: { write: boolean }): string | null {
     let phase: OpeningPhase;
@@ -1129,27 +1140,15 @@ export class RankedTables {
     if (authority === "employee" && !EMPLOYEE_OPERABLE_TIER_KEYS.includes(tier.key)) {
       return "employee authority cannot open this ranked tier";
     }
-    if (tier.key === "super_high" && !this.superHighEnabled()) return "super_high ranked tier is not enabled";
-    if (tier.key === "extreme" && !this.extremeEnabled()) return "extreme ranked tier is not enabled";
-    if ((tier.key === "super_high" || tier.key === "extreme") && !this.formalOpeningAgeSatisfied()) {
-      return "this ranked tier is closed for the first 30 days after formal opening";
+    if (STAGED_UNLOCK_TIER_KEYS.includes(tier.key) && !this.tierUnlocked(tier.key)) {
+      return `${tier.key} ranked tier is not unlocked`;
     }
-    if (!isHighOrAbove(tier)) return null;
-    const cooldown = this.highCooldownSec();
-    if (typeof cooldown !== "number" || !Number.isSafeInteger(cooldown) || cooldown <= 0) {
-      return "high ranked tier cooldown setting is unavailable";
-    }
-    const schema = this.openHistorySchemaState();
-    if (schema === "invalid") return "ranked open history schema is incomplete";
-    if (schema === "none") {
-      // 履歴が無い＝過去に高卓以上を開いていない。照会では作らない
-      if (opts.write) this.ensureOpenHistorySchema();
-      return null;
-    }
-    const row = this.db
-      .prepare("SELECT created_at FROM casino_ranked_open_history WHERE tier_key IN ('high','super_high','extreme','meigoku') ORDER BY created_at DESC, rowid DESC LIMIT 1")
-      .get() as { created_at: number } | undefined;
-    if (row && this.now() - row.created_at < cooldown) return "high ranked tier cooldown is active";
+    // 開催履歴は「誰が開いた卓か」の判定（openHistoryAuthority）に使うので**全ランクで**記録する。
+    // 壊れていれば作成は必ず失敗するので、照会でも同じ理由を返して表示と実際を一致させる
+    // （旧実装は高卓以上でしか見ておらず、中卓が「開ける」と表示されるのに作成で落ちていた）。
+    // 壊れた表は勝手に直さない
+    if (this.openHistorySchemaState() === "invalid") return "ranked open history schema is incomplete";
+    if (opts.write) this.ensureOpenHistorySchema();
     return null;
   }
 
@@ -1161,13 +1160,6 @@ export class RankedTables {
     );
     const required = ["operation_id", "table_id", "tier_key", "base_amount", "authority", "request_fingerprint", "created_at"];
     return required.every((c) => columns.has(c)) ? "complete" : "invalid";
-  }
-
-  private formalOpeningAgeSatisfied(): boolean {
-    const row = this.db
-      .prepare("SELECT created_at FROM casino_chip_opening_versions WHERE opening_version=?")
-      .get(FORMAL_OPENING_VERSION) as { created_at: number } | undefined;
-    return !!row && this.now() - row.created_at >= 30 * 24 * 60 * 60;
   }
 
   private recordOpenHistoryIfNeeded(
@@ -1330,10 +1322,6 @@ function tierByBaseAmount(baseAmount: number): RankedTableTier {
   const tier = RANKED_TABLE_TIERS.find((row) => row.baseAmount === baseAmount);
   if (!tier) throw new RankedTableError("ERR_RANKED_BAD_AMOUNT", "ranked table base amount must match a canonical tier", { baseAmount });
   return tier;
-}
-
-function isHighOrAbove(tier: RankedTableTier): boolean {
-  return ["high", "super_high", "extreme", "meigoku"].includes(tier.key);
 }
 
 function validateAuthority(value: unknown): RankedCreateAuthority {

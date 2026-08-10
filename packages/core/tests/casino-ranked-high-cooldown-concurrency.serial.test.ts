@@ -74,25 +74,51 @@ function spawnRunner(script: string, input: Record<string, unknown>): Promise<Ru
   });
 }
 
-describe("high-tier ranked cooldown under cross-process contention", () => {
-  it("lets exactly one of two simultaneous high creates through", async () => {
+describe("high-tier ranked table creation under cross-process contention", () => {
+  /**
+   * 高卓以上の一律クールダウンは廃止した（運用方針の変更）。
+   * 時間で自動的に開いてしまい「いま開けてよいか」が運営の手を離れるうえ、
+   * 設定値が未投入だと逆に全ランクが死ぬ事故が実際に起きたため。
+   *
+   * したがってここで担保するのは「片方だけ通る」ことではなく、
+   * **同時に開いても履歴表が壊れない**こと。別プロセスの同時 INSERT で
+   * operation_id / table_id の一意制約が競合しても、行が落ちたり重複したりしない。
+   */
+  it("lets simultaneous high creates through without corrupting the open history", async () => {
     const ctx = setupFileDb();
     ctx.db.close();
     const startAt = Date.now() + 700;
-    const common = { dbPath: ctx.dbPath, baseAmount: 10_000, highCooldownSec: 3_600, now: NOW, startAt };
+    const common = { dbPath: ctx.dbPath, baseAmount: 10_000, now: NOW, startAt };
 
     const [a, b] = await Promise.all([
       spawnRunner(CREATE_RUNNER, { ...common, tableId: "high-a", operationId: "create:high-a" }),
       spawnRunner(CREATE_RUNNER, { ...common, tableId: "high-b", operationId: "create:high-b" }),
     ]);
 
-    const winners = [a, b].filter((r) => r.ok);
-    expect(winners).toHaveLength(1);
+    expect({ a: a.ok, b: b.ok }).toEqual({ a: true, b: true });
 
     const reopened = openDb(ctx.dbPath);
-    const rows = reopened.prepare("SELECT table_id FROM casino_ranked_open_history").all() as Array<{ table_id: string }>;
-    expect(rows).toHaveLength(1);
-    expect(rows[0]?.table_id).toBe(winners[0]?.tableId);
+    const rows = reopened.prepare("SELECT table_id FROM casino_ranked_open_history ORDER BY table_id").all() as Array<{ table_id: string }>;
+    expect(rows.map((r) => r.table_id)).toEqual(["high-a", "high-b"]);
+    expect((reopened.prepare("SELECT COUNT(*) AS n FROM casino_tables").get() as { n: number }).n).toBe(2);
+    reopened.close();
+  }, 60_000);
+
+  it("keeps a staged-unlock tier closed in every process until it is unlocked", async () => {
+    const ctx = setupFileDb();
+    ctx.db.close();
+    const startAt = Date.now() + 700;
+    // 極卓は段階解放が入るまで、どのプロセスから叩いても開かない（fail-closed）
+    const locked = { dbPath: ctx.dbPath, baseAmount: 50_000, now: NOW, startAt };
+    const [a, b] = await Promise.all([
+      spawnRunner(CREATE_RUNNER, { ...locked, tableId: "ex-a", operationId: "create:ex-a" }),
+      spawnRunner(CREATE_RUNNER, { ...locked, tableId: "ex-b", operationId: "create:ex-b" }),
+    ]);
+    expect({ a: a.ok, b: b.ok }).toEqual({ a: false, b: false });
+
+    // 解放前は判定で止まるので、卓の表そのものが作られない（fail-closed）
+    const reopened = openDb(ctx.dbPath);
+    expect(reopened.prepare("SELECT 1 FROM sqlite_master WHERE name='casino_tables'").get()).toBeUndefined();
     reopened.close();
   }, 60_000);
 

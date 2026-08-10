@@ -35,7 +35,7 @@ registerDefaultTxTypes();
 
 const NOW = Math.floor(Date.now() / 1000) + 2 * 24 * 60 * 60;
 
-function setup(options: { highCooldownSec?: number | null; superHighEnabled?: boolean; extremeEnabled?: boolean } = {}) {
+function setup(options: { unlockedTiers?: readonly string[] } = {}) {
   let now = NOW;
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
@@ -69,9 +69,7 @@ function setup(options: { highCooldownSec?: number | null; superHighEnabled?: bo
     disputes,
     dailyRisk,
     openingPhase: () => chipTx.openingPhase(),
-    highCooldownSec: () => options.highCooldownSec ?? 3_600,
-    superHighEnabled: () => options.superHighEnabled === true,
-    extremeEnabled: () => options.extremeEnabled === true,
+    tierUnlocked: (tierKey) => (options.unlockedTiers ?? []).includes(tierKey),
   });
   const rankedProfiles = new RankedProfiles(db, { now: () => now });
   return {
@@ -120,14 +118,15 @@ function riskEventCount(ctx: Ctx): number {
 }
 
 describe("employee-openable ranked tiers", () => {
-  it("lets an employee open minarai through high but nothing above", () => {
-    const ctx = setup({ superHighEnabled: true, extremeEnabled: true });
+  it("lets an employee open minarai through super high but nothing above", () => {
+    const ctx = setup({ unlockedTiers: ["extreme", "meigoku"] });
     const available = ctx.rankedTables.rankedTierAvailability("employee").filter((row) => row.available).map((row) => row.tierKey);
-    expect(available).toEqual(["minarai", "low", "middle", "high"]);
+    expect(available).toEqual(["minarai", "low", "middle", "high", "super_high"]);
 
     expect(createTable(ctx, "mid", 5_000).config.baseAmount).toBe(5_000);
-    // 超高卓以上は authority 判定が拒否する（UIの出し分けに頼らない）
-    for (const [tableId, baseAmount] of [["sh", 30_000], ["ex", 50_000], ["mg", 100_000]] as const) {
+    expect(createTable(ctx, "sh", 30_000).config.baseAmount).toBe(30_000);
+    // 極卓・冥獄卓は解放済みでも authority 判定が拒否する（UIの出し分けに頼らない）
+    for (const [tableId, baseAmount] of [["ex", 50_000], ["mg", 100_000]] as const) {
       expect(() =>
         ctx.rankedTables.create({
           tableId,
@@ -316,11 +315,10 @@ describe("employee close is bounded by tier and guild", () => {
   });
 
   it("refuses every manager-only tier even before start", () => {
-    const ctx = setup({ superHighEnabled: true, extremeEnabled: true });
+    const ctx = setup({ unlockedTiers: ["extreme", "meigoku"] });
     seedChips(ctx, "alice", 400_000);
-    const cases: Array<[string, number]> = [["t-sh", 30_000], ["t-ex", 50_000], ["t-mg", 100_000]];
+    const cases: Array<[string, number]> = [["t-ex", 50_000], ["t-mg", 100_000]];
     cases.forEach(([tableId, baseAmount], index) => {
-      // 高卓以上は開催クールダウンがあるので、作る側は時計を進めて用意する
       ctx.setNow(NOW + index * 4_000);
       createAt(ctx, tableId, baseAmount, "guild-1", "manager");
       const before = untouched(ctx, tableId);
@@ -388,23 +386,24 @@ describe("employee close is bounded by tier and guild", () => {
   });
 
   it("defaults to the narrowest authority when the caller forgets to pass one", () => {
-    const ctx = setup({ superHighEnabled: true });
-    createAt(ctx, "t-sh", 30_000, "guild-1", "manager");
+    const ctx = setup({ unlockedTiers: ["extreme"] });
+    createAt(ctx, "t-ex", 50_000, "guild-1", "manager");
 
     // authority 省略 = employee 扱い。忘れても上位卓へ届かない
-    expect(() => ctx.rankedTables.cancelBeforeStart({ tableId: "t-sh", actorId: "someone", operationId: "close:1" })).toThrow(RankedTableError);
-    expect(ctx.rankedTables.snapshot("t-sh").table.state).toBe("recruiting");
+    expect(() => ctx.rankedTables.cancelBeforeStart({ tableId: "t-ex", actorId: "someone", operationId: "close:1" })).toThrow(RankedTableError);
+    expect(ctx.rankedTables.snapshot("t-ex").table.state).toBe("recruiting");
   });
 
-  it("still lets manager authority close a super-high table before start", () => {
-    const ctx = setup({ superHighEnabled: true });
-    createAt(ctx, "t-sh", 30_000, "guild-1", "manager");
-    seedChips(ctx, "alice", 100_000);
-    ctx.rankedTables.join({ tableId: "t-sh", userId: "alice", seat: 1, operationId: "join:alice" });
+  it("still lets manager authority close an extreme table before start", () => {
+    const ctx = setup({ unlockedTiers: ["extreme"] });
+    createAt(ctx, "t-ex", 50_000, "guild-1", "manager");
+    // 担保は所持の50%までという安全制限があるので、極卓(50,000)には十分な所持が要る
+    seedChips(ctx, "alice", 300_000);
+    ctx.rankedTables.join({ tableId: "t-ex", userId: "alice", seat: 1, operationId: "join:alice" });
     const before = ctx.chips.balanceOf("alice");
 
     const snapshot = ctx.rankedTables.cancelBeforeStart({
-      tableId: "t-sh",
+      tableId: "t-ex",
       actorId: "manager-1",
       operationId: "close:1",
       authority: "manager",
@@ -413,7 +412,7 @@ describe("employee close is bounded by tier and guild", () => {
 
     expect(snapshot.table.state).toBe("cancelled");
     expect(ctx.chips.balanceOf("alice")).toBeGreaterThan(before);
-    expect(ctx.escrow.poolOf("t-sh")).toBe(0);
+    expect(ctx.escrow.poolOf("t-ex")).toBe(0);
   });
 
   it("keeps the state gate unchanged under the new authority argument", () => {

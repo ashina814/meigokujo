@@ -24,7 +24,7 @@ const input = JSON.parse(process.argv[2] ?? "{}") as {
   tableId: string;
   operationId: string;
   baseAmount: number;
-  highCooldownSec: number;
+  tierUnlocked?: boolean;
   now: number;
   startAt: number;
 };
@@ -43,7 +43,7 @@ const rankedTables = new RankedTables(db, chips, escrow, persistentTables, event
   now: () => input.now,
   reservations,
   openingPhase: () => chipTx.openingPhase(),
-  highCooldownSec: () => input.highCooldownSec,
+  tierUnlocked: () => input.tierUnlocked === true,
 });
 
 const delay = Math.max(0, input.startAt - Date.now());

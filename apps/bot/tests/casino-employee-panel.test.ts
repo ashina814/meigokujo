@@ -269,7 +269,8 @@ describe("employee target authorization (guild + tier)", () => {
   it("only offers same-guild employee-tier tables as close/post/report candidates", async () => {
     const { services } = tableWorld([
       { tableId: "ok-high", guildId: "guild-1", baseAmount: 10_000 },
-      { tableId: "too-big", guildId: "guild-1", baseAmount: 30_000 },
+      { tableId: "ok-super", guildId: "guild-1", baseAmount: 30_000 },
+      { tableId: "too-big", guildId: "guild-1", baseAmount: 50_000 },
       { tableId: "other-guild", guildId: "guild-2", baseAmount: 5_000 },
       { tableId: "no-guild", guildId: null, baseAmount: 5_000 },
     ]);
@@ -281,7 +282,8 @@ describe("employee target authorization (guild + tier)", () => {
       components: Array<{ components: Array<{ options: Array<{ data: { value: string } }> }> }>;
     };
     const offered = payload.components[0]!.components[0]!.options.map((o) => o.data.value);
-    expect(offered).toEqual(["ok-high"]);
+    // 超高卓(30,000)までが従業員の担当。極卓(50,000)以上は候補に出さない
+    expect(offered).toEqual(["ok-high", "ok-super"]);
   });
 
   it("refuses a stale/crafted select value pointing at another guild's table", async () => {
@@ -295,7 +297,7 @@ describe("employee target authorization (guild + tier)", () => {
   });
 
   it("refuses a stale/crafted select value pointing at a manager-only tier", async () => {
-    for (const baseAmount of [30_000, 50_000, 100_000]) {
+    for (const baseAmount of [50_000, 100_000]) {
       const { services, cancelBeforeStart } = tableWorld([{ tableId: "big", guildId: "guild-1", baseAmount }]);
       const interaction = selectFor("cemp:close:pick", "big", "guild-1");
 
@@ -318,7 +320,7 @@ describe("employee target authorization (guild + tier)", () => {
   });
 
   it("refuses to post a recruitment message for an out-of-bounds table", async () => {
-    const { services, bindMessage, send } = tableWorld([{ tableId: "big", guildId: "guild-1", baseAmount: 30_000 }]);
+    const { services, bindMessage, send } = tableWorld([{ tableId: "big", guildId: "guild-1", baseAmount: 50_000 }]);
     const interaction = selectFor("cemp:post:pick", "big", "guild-1", { channel: { send } });
 
     await handleCasinoEmployeeInteraction(interaction, services);
