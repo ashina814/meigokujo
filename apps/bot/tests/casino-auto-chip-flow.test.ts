@@ -35,11 +35,13 @@ describe("PR10監査: Bot側の導線", () => {
   });
 
   it("退場表示は active ownership の skip を「返還可能額なし」と誤表示しない", () => {
-    const source = read("../src/commands/annai.ts");
+    // 返還の導線は /案内 から /賭場 ハブへ移した（旧ボタンは customId が
+    // どこにもルーティングされておらず、押しても無反応だった）
+    const source = read("../src/commands/casino-home.ts");
     expect(source).toContain('result.skipped === "active_ownership"');
-    // skip 分岐が「返還できる自由チップはありません」より前に立っている
+    // skip 分岐が「戻せる自由チップはありません」より前に立っている
     expect(source.indexOf('result.skipped === "active_ownership"'))
-      .toBeLessThan(source.indexOf("返還できる自由チップはありません"));
+      .toBeLessThan(source.indexOf("戻せる自由チップはありません"));
   });
 
   it("10分無操作の自動返還は正式開業かつ営業中のときだけ動かす", () => {

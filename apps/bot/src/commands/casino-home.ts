@@ -10,12 +10,15 @@ import {
 } from "discord.js";
 import { fmtLd } from "../format.js";
 import { C_JACKPOT, C_MAMMON, E, h2 } from "../casino/ui.js";
-import { checkRetry } from "../casino/common.js";
+import { checkRetry, isSeatOccupied } from "../casino/common.js";
 import { renderCasinoGameSelect } from "../casino/amount-picker.js";
 import { CASINO_SOLO_GAME_EMOJI, isCasinoSoloGame } from "../casino/games.js";
 import { recordCasinoMetricBestEffort } from "../casino/metrics.js";
 import { openingNotice, openingPhase, operatingLabel } from "../casino/opening.js";
 import { readAvailableWallet } from "../casino/wallet.js";
+import { renderShop } from "./bakuten.js";
+import { renderBanzuke } from "./banzuke.js";
+import { buildPassportAttachment } from "./passport.js";
 import type { Services } from "../services.js";
 
 const DEFAULT_GAME = "スロット";
@@ -55,35 +58,151 @@ export async function handleCasinoHomeButton(interaction: ButtonInteraction, ser
     });
     return;
   }
-  if (interaction.customId === "casino:home:pvp") {
-    await interaction.reply({
-      content: [
-        "**みんなで勝負**",
-        "`/勝負 丁半` `/勝負 チンチロ` `/勝負 bj` `/勝負 サシ` `/勝負 インディアン` `/勝負 ポーカー`",
-        "永続卓と従業員導線は PR20 以降です。現行の安全な対人ルートだけ案内します。",
-      ].join("\n"),
-      flags: MessageFlags.Ephemeral,
-    });
+  if (interaction.customId === "casino:home:back") {
+    await interaction.update(renderCasinoHome(interaction.user.id, services, interaction.guild?.name));
     return;
   }
-  if (interaction.customId === "casino:home:record") {
-    await interaction.reply({
-      content: "**記録**\n`/通行証` で自分の戦績カード、`/賭場番付` で番付を見られます。",
-      flags: MessageFlags.Ephemeral,
-    });
+  if (interaction.customId === "casino:home:pvp") {
+    await interaction.reply({ ...renderPvpGuide(services), flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (interaction.customId === "casino:home:shop") {
+    await interaction.reply({ ...renderShop(interaction.user.id, services), flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (interaction.customId === "casino:home:banzuke") {
+    await interaction.reply({ ...renderBanzuke(services, "balance", interaction.user.id), flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (interaction.customId === "casino:home:passport") {
+    // 画像生成に時間がかかるので先に defer する
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await interaction.editReply({ files: [await buildPassportAttachment(interaction, services)] });
+    return;
+  }
+  const link = SIDE_GAME_GUIDE[interaction.customId];
+  if (link) {
+    await interaction.reply({ content: link, flags: MessageFlags.Ephemeral });
     return;
   }
   if (interaction.customId === "casino:home:first") {
-    await interaction.reply({
-      content: [
-        "**はじめて**",
-        "表示単位は Land です。正式開業後の賭けは自由チップを 1 chip = 1 Ld として使います。",
-        "預け中のチップは所持額に混ぜません。正式開業前や停止中は、ホームからも資金操作は通りません。",
-      ].join("\n"),
-      flags: MessageFlags.Ephemeral,
-    });
+    await interaction.reply({ ...renderGuide(services), flags: MessageFlags.Ephemeral });
     return;
   }
+  if (interaction.customId === "casino:home:leave") {
+    await leaveCasinoFromHome(interaction, services);
+    return;
+  }
+}
+
+/**
+ * 自由チップをLandへ返す。判定は core（chipFlow.leaveCasino）が持ち、
+ * ここは結果を言葉にするだけ。進行中の預託がある場合は core が見送るので、
+ * 「返還できる額が無い」と混ぜずにその理由を出す。
+ */
+async function leaveCasinoFromHome(interaction: ButtonInteraction, services: Services): Promise<void> {
+  if (isSeatOccupied(interaction.user.id)) {
+    await interaction.reply({ content: "進行中の勝負が終わってからにしてください。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  let content: string;
+  try {
+    const result = services.chipFlow.leaveCasino(interaction.user.id, `leave:${interaction.id}`);
+    content =
+      result.skipped === "active_ownership"
+        ? "進行中の勝負・預託・板があるため、いまは返せません。終わってからもう一度押してください。"
+        : result.redeemed > 0
+          ? `${fmtLd(result.land)} をLandへ戻しました。`
+          : "戻せる自由チップはありません。";
+  } catch {
+    content = "チップ帳簿または進行状態を確認できないため返せません。";
+  }
+  await interaction.update({ ...renderCasinoHome(interaction.user.id, services, interaction.guild?.name), content });
+}
+
+/**
+ * チャンネルに公開の卓を立てる遊びは、本人にだけ見えるハブからは開けない。
+ * ここは「何ができるか」と「どのコマンドか」を示すだけにする。
+ */
+const SIDE_GAME_GUIDE: Readonly<Record<string, string>> = {
+  "casino:home:keiba": "🏇 **競馬** — 冥馬6頭のパリミュチュエル（単勝・複勝）。\nチャンネルで `/競馬` を実行すると発走します。",
+  "casino:home:ita": "📋 **板** — 議題を立てて何にでも賭けられる公開市場。\nチャンネルで `/板 立てる` を実行します。進行中は `/板 一覧`。",
+  "casino:home:vip": "💎 **VIP** — 月額で賭け上限が上がります。`/vip` で条件と期限を確認できます。",
+  "casino:home:hoshi": "✨ **流れ星** — 1日5回の占い（初回無料）。`/流れ星` で引けます。",
+};
+
+/**
+ * 対人戦の案内。
+ *
+ * 以前は「永続卓と従業員導線は PR20 以降です」と書いたまま固定されていたが、
+ * PR20〜24 で順位卓・従業員運営・異議処理まで入っている。現行の姿へ更新する。
+ */
+function renderPvpGuide(services: Services) {
+  const phase = openingPhase(services);
+  const status = services.casinoStatus.current();
+  const open = phase === "formal" && status.status === "open";
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: "マモンの賭場 · みんなで勝負" })
+    .setColor(open ? C_MAMMON : 0x78716c)
+    .setTitle("⚔  みんなで勝負")
+    .setDescription(
+      [
+        "**その場で始める**（相手を指名、または募集）",
+        "`/勝負 チンチロ` `/勝負 bj` `/勝負 サシ` `/勝負 インディアン` `/勝負 ポーカー`",
+        "`/勝負 丁半` は多人数戦（60秒受付・両側そろえば成立）",
+        "",
+        "**順位卓**（賭博場従業員が開く常設卓）",
+        "見習卓 500 ／ 低卓 2,000 ／ 中卓 5,000 ／ 高卓 10,000 ／ 超高卓 30,000 Ld",
+        "卓が立つと募集が掲示されます。着席 → 準備完了 → 対局 → 結果承認の順に進みます。",
+        "極卓・冥獄卓は運営が解放したときだけ開かれます。",
+        "",
+        "-# 担保は着席時に預かり、結果が全員承認されるまで動きません。",
+        "-# 結果に納得できないときは異議を出せます（証拠は非公開で扱われます）。",
+      ].join("\n"),
+    );
+  if (!open) {
+    embed.addFields({
+      name: "▸ いまは受け付けていません",
+      value: phase !== "formal" ? openingNotice(services) : `賭場を停止中です（${status.reason}）`,
+      inline: false,
+    });
+  }
+  return { embeds: [embed], components: [backToCasinoHomeRow()] };
+}
+
+/** 遊び方。旧「はじめて」を、賭場全体の地図として使えるところまで広げる */
+function renderGuide(services: Services) {
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: "マモンの賭場 · 遊び方" })
+    .setColor(C_MAMMON)
+    .setTitle("📖  賭場の歩き方")
+    .setDescription(
+      [
+        "**覚えるのは `/賭場` だけでいい。** ここから全部に行けます。",
+        "",
+        "**お金の単位**",
+        "表示は Land（Ld）です。正式開業後の賭けは自由チップを 1 chip = 1 Ld として使います。",
+        "卓に預けているチップは所持額に混ぜません。",
+        "",
+        "**遊ぶ**",
+        "ひとりで遊ぶなら「遊びを選ぶ」。スロット・丁半・クラッシュ・チンチロ・ルーレット・BJ・ポーカー・ホールデム。",
+        "誰かと遊ぶなら「みんなで勝負」。",
+        "",
+        "**続けるために**",
+        "「福分け」は1日1回受け取れます。連続日数でボーナスが増えます。",
+        "「商店」のお守りは、買って装備すると条件を満たしたときに自動で効きます。",
+        "",
+        "**記録**",
+        "「通行証・戦績」は自分の成績カード、「番付」は上位10人です。",
+        "",
+        // 株は導線から外しているが、建玉を持っている人が「消えた」と誤解しないよう
+        // 停止していることだけは必ず残す（旧 /案内 から引き継いだ告知）
+        "**株式市場は現在 停止中** です。持っている株はそのままで、購入も売却もできません。`/株` で詳細を出せます。",
+        "",
+        "-# 停止中や正式開業前は、押しても資金は動きません。現在の状態と理由はホームの先頭に出ています。",
+      ].join("\n"),
+    );
+  return { embeds: [embed], components: [backToCasinoHomeRow()] };
 }
 
 export function renderCasinoHome(userId: string, services: Services, serverName?: string) {
@@ -112,7 +231,9 @@ export function renderCasinoHome(userId: string, services: Services, serverName?
     .setDescription(lines.filter((line, index, arr) => line !== "" || arr[index - 1] !== "").join("\n"))
     .setFooter({ text: wallet.footer });
 
-  const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+  // 段は役割で分ける。1段目=遊ぶ / 2段目=賭場の設備 / 3段目=別系統の賭け / 4段目=受け取りと案内。
+  // 「/賭場 だけ覚えていれば全部に届く」ことを、段の並びで示す
+  const playRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(primary.customId)
       .setLabel(primary.label)
@@ -122,29 +243,70 @@ export function renderCasinoHome(userId: string, services: Services, serverName?
     new ButtonBuilder()
       .setCustomId("casino:home:games")
       .setLabel("遊びを選ぶ")
-      .setStyle(ButtonStyle.Secondary),
+      .setEmoji("🎲")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(actionsDisabled),
     new ButtonBuilder()
       .setCustomId("casino:home:pvp")
       .setLabel("みんなで勝負")
+      .setEmoji("⚔")
       .setStyle(ButtonStyle.Secondary),
   );
-  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+  const facilityRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("casino:home:shop")
+      .setLabel("商店")
+      .setEmoji("🛍")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(actionsDisabled),
+    new ButtonBuilder()
+      .setCustomId("casino:home:passport")
+      .setLabel("通行証・戦績")
+      .setEmoji("🎫")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("casino:home:banzuke")
+      .setLabel("番付")
+      .setEmoji("🏅")
+      .setStyle(ButtonStyle.Secondary),
+  );
+  const otherRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("casino:home:keiba").setLabel("競馬").setEmoji("🏇").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("casino:home:ita").setLabel("板").setEmoji("📋").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("casino:home:vip").setLabel("VIP").setEmoji("💎").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("casino:home:hoshi").setLabel("流れ星").setEmoji("✨").setStyle(ButtonStyle.Secondary),
+  );
+  const guideRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId("casino:daily:claim")
       .setLabel("福分け")
+      .setEmoji("🎁")
       .setStyle(daily.ready ? ButtonStyle.Success : ButtonStyle.Secondary)
       .setDisabled(actionsDisabled || !daily.ready),
     new ButtonBuilder()
-      .setCustomId("casino:home:record")
-      .setLabel("記録")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
       .setCustomId("casino:home:first")
-      .setLabel("はじめて")
+      .setLabel("遊び方")
+      .setEmoji("📖")
       .setStyle(ButtonStyle.Secondary),
+    // 自由チップをLandへ返す導線。旧 /案内 にボタンだけあったが customId が
+    // どこにもルーティングされておらず、押しても無反応の死んだ導線だった。
+    // 正規ハブへ繋ぎ直す（core の leaveCasino はそのまま使う）
+    new ButtonBuilder()
+      .setCustomId("casino:home:leave")
+      .setLabel("チップをLandへ戻す")
+      .setEmoji("🚪")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(actionsDisabled),
   );
 
-  return { embeds: [embed], components: [row1, row2] };
+  return { embeds: [embed], components: [playRow, facilityRow, otherRow, guideRow] };
+}
+
+/** ハブへ戻る導線。どの子画面からでも同じ場所へ帰れるようにする */
+export function backToCasinoHomeRow(): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("casino:home:back").setLabel("賭場ホームへ戻る").setEmoji("🏛").setStyle(ButtonStyle.Secondary),
+  );
 }
 
 function casinoHomeWallet(userId: string, services: Services): { lines: string[]; footer: string } {

@@ -2,6 +2,7 @@ import {
   AttachmentBuilder,
   MessageFlags,
   SlashCommandBuilder,
+  type ButtonInteraction,
   type ChatInputCommandInteraction,
   type GuildMember,
 } from "discord.js";
@@ -32,11 +33,14 @@ export function resolvePassportBalances(services: Services, userId: string): { a
   return { availableBalance: wallet.available, landBalance: wallet.land };
 }
 
-export async function handlePassportCommand(
-  interaction: ChatInputCommandInteraction,
+/**
+ * 通行証カードを描いて添付にする。`/通行証` と `/賭場` ハブの両方から使う。
+ * 画像生成に時間がかかるので、呼び出し側で先に defer しておくこと。
+ */
+export async function buildPassportAttachment(
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
-): Promise<void> {
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+): Promise<AttachmentBuilder> {
   const uid = interaction.user.id;
   const stats = services.casino.stats(uid);
   const { availableBalance, landBalance } = resolvePassportBalances(services, uid);
@@ -65,6 +69,14 @@ export async function handlePassportCommand(
       bestWinStreak: stats.best_win_streak,
     },
   });
-
-  await interaction.editReply({ files: [new AttachmentBuilder(png, { name: "passport.png" })] });
+  return new AttachmentBuilder(png, { name: "passport.png" });
 }
+
+export async function handlePassportCommand(
+  interaction: ChatInputCommandInteraction,
+  services: Services,
+): Promise<void> {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  await interaction.editReply({ files: [await buildPassportAttachment(interaction, services)] });
+}
+

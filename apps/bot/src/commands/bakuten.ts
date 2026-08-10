@@ -28,11 +28,19 @@ export const bakutenCommand = new SlashCommandBuilder()
   .setDescription("🛍 マモンの賭場のお守り商店（Land建て）")
   .setDMPermission(false);
 
+/**
+ * 商店の描画。`/賭場商店` と `/賭場` ハブの両方から使う。
+ * 入口が増えても中身が食い違わないよう、描画は必ずここを通す。
+ */
+export function renderShop(userId: string, services: Services) {
+  return { embeds: [buildEmbed(userId, services)], components: buildComponents() };
+}
+
 export async function handleBakutenCommand(
   interaction: ChatInputCommandInteraction,
   services: Services,
 ): Promise<void> {
-  await interaction.reply({ embeds: [buildEmbed(interaction.user.id, services)], components: buildComponents(), flags: MessageFlags.Ephemeral });
+  await interaction.reply({ ...renderShop(interaction.user.id, services), flags: MessageFlags.Ephemeral });
 }
 
 function buildEmbed(userId: string, services: Services): EmbedBuilder {

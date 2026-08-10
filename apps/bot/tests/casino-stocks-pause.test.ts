@@ -56,10 +56,14 @@ describe("コマンド登録から外れている", () => {
     expect(existsSync(path)).toBe(false);
   });
 
-  it("ホーム（/案内）の導線から外れ、停止中とだけ書いてある", () => {
-    const src = srcOf("../src/commands/annai.ts");
-    expect(src).not.toContain("6銘柄・1時間毎更新");
-    expect(src).toContain("**停止中**");
+  it("賭場ハブの導線から外れ、停止中とだけ書いてある", () => {
+    // 入口は /案内 から /賭場 へ一本化した。株の告知も遊び方へ引き継いである
+    const hub = srcOf("../src/commands/casino-home.ts");
+    expect(hub).not.toContain("6銘柄・1時間毎更新");
+    expect(hub).toContain("**株式市場は現在 停止中**");
+    // 旧ホームは誘導だけになり、機能を宣伝しない
+    const annai = srcOf("../src/commands/annai.ts");
+    expect(annai).not.toContain("6銘柄・1時間毎更新");
   });
 });
 

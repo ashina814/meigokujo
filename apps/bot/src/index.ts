@@ -13,7 +13,7 @@ import { handleEtherButton, handleEtherModal } from "./commands/exchange-panel.j
 import { handleAsobuCommand } from "./commands/asobu.js";
 import { handleDailyCommand } from "./commands/daily.js";
 import { handlePassportCommand } from "./commands/passport.js";
-import { handleBanzukeCommand } from "./commands/banzuke.js";
+import { BANZUKE_SELECT_ID, handleBanzukeCommand, renderBanzuke } from "./commands/banzuke.js";
 import { handleShobuCommand } from "./commands/shobu.js";
 import { handleBakutenButton, handleBakutenCommand, handleBakutenSelect } from "./commands/bakuten.js";
 import { replyStocksPaused } from "./casino/stocks-pause.js";
@@ -342,6 +342,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("bakuten:")) {
       await handleBakutenSelect(interaction, services);
+      return;
+    }
+    // 番付の種別切り替え（/賭場 ハブから開いたときも同じ画面で切り替えられる）
+    if (interaction.isStringSelectMenu() && interaction.customId === BANZUKE_SELECT_ID) {
+      await interaction.update(renderBanzuke(services, interaction.values[0] ?? "balance", interaction.user.id));
       return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("stocks:")) {

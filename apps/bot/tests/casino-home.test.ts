@@ -88,11 +88,50 @@ function component(customId: string): Interaction & { reply: ReturnType<typeof v
 }
 
 describe("/賭場 ホーム", () => {
-  it("ホームを生成し、6ボタン・2行以内に収める", () => {
+  it("賭場機能のすべてへ、ホームから1押しで届く", () => {
     const { embed, rows, buttons } = homeJson(fakeServices());
     expect(embed.author?.name).toContain("冥獄城 · マモンの賭場");
-    expect(rows).toHaveLength(2);
-    expect(buttons).toHaveLength(6);
+    // 段は役割ごと。Discord の上限（5段・1段5個）に収まっていること
+    expect(rows.length).toBeLessThanOrEqual(5);
+    for (const row of rows) expect(row.components.length).toBeLessThanOrEqual(5);
+
+    // 「/賭場 だけ覚えていればいい」を守る。ここが欠けると利用者は
+    // どのコマンドを打てばいいか分からない状態へ戻る
+    const ids = buttons.map((b) => b.custom_id);
+    for (const required of [
+      "casino:home:games",
+      "casino:home:pvp",
+      "casino:home:shop",
+      "casino:home:passport",
+      "casino:home:banzuke",
+      "casino:daily:claim",
+      "casino:home:first",
+      "casino:home:leave",
+      "casino:home:keiba",
+      "casino:home:ita",
+      "casino:home:vip",
+      "casino:home:hoshi",
+    ]) {
+      expect(ids).toContain(required);
+    }
+    // 同じ機能への入口が重複していないこと
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("停止中は理由を画面に出し、資金が動くボタンを押せる見た目にしない", () => {
+    for (const status of ["integrity_halt", "recovery_halt", "maintenance"]) {
+      const { embed, buttons } = homeJson(fakeServices({ status }));
+      // 「押してからエラー」ではなく、状態と理由をホームで見せる
+      expect(embed.description).toContain(status);
+      expect(embed.description).toContain("点検中");
+      const byId = new Map(buttons.map((b) => [b.custom_id, b]));
+      for (const id of ["casino:home:games", "casino:home:shop", "casino:home:leave", "casino:daily:claim"]) {
+        expect(byId.get(id)?.disabled).toBe(true);
+      }
+      // 読むだけの導線は停止中でも使える
+      expect(byId.get("casino:home:first")?.disabled).toBeFalsy();
+      expect(byId.get("casino:home:banzuke")?.disabled).toBeFalsy();
+    }
   });
 
   it("legacy_pre_reset では正式開業準備中を表示し、操作ボタンを押せる見た目にしない", async () => {
