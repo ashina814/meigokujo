@@ -28,6 +28,7 @@ const RANK_LABEL: Record<string, string> = {
   waiting: "入城案内待ち",
   ghost: "亡霊",
   majin: "魔人",
+  kenma: "眷魔",
   mazoku: "魔族",
   meirei: "迷霊",
   departed: "去りし魂",

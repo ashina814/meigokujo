@@ -75,7 +75,7 @@ CREATE INDEX IF NOT EXISTS idx_events_target ON events(target_id, created_at);
 CREATE TABLE IF NOT EXISTS souls (
   user_id             TEXT PRIMARY KEY,
   status              TEXT NOT NULL DEFAULT 'waiting'
-                      CHECK (status IN ('waiting','ghost','majin','mazoku','meirei','departed')),
+                      CHECK (status IN ('waiting','ghost','majin','kenma','mazoku','meirei','departed')),
   joined_at           INTEGER,
   ghost_at            INTEGER,
   eval_deadline_at    INTEGER,
@@ -758,6 +758,7 @@ export function openDb(path: string): Database.Database {
   // 単一のトランザクションへ統合し（opening-reset.tsのapply() R0）、その結果をここへ書く。
   ensureColumn(db, "casino_status", "opening_execution_id", "TEXT");
   ensureColumn(db, "casino_status", "opening_actor_id", "TEXT");
+  migrateSoulStatusCheck(db);
   assertNoDuplicateOpenRoomOwnership(db);
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_owner_normal_open
@@ -773,6 +774,89 @@ export function openDb(path: string): Database.Database {
   backfillEvaluationMarkWeights(db);
   backfillEvaluationPolicySnapshots(db);
   return db;
+}
+
+/** `souls.status` が取り得る値。CHECK制約・型・同期ロジックの唯一の真実源 */
+export const SOUL_STATUSES = ["waiting", "ghost", "majin", "kenma", "mazoku", "meirei", "departed"] as const;
+
+/**
+ * `souls.status` の CHECK 制約へ `kenma`（眷魔）を足す。
+ *
+ * **DDL を書き換えるだけでは既存DBに効かない。** `CREATE TABLE IF NOT EXISTS` は
+ * 表がある限り何もしないので、本番のように既に souls を持つDBは旧CHECKのまま残り、
+ * `status='kenma'` の書き込みが CHECK 違反で落ちる。SQLite は CHECK だけを
+ * 後から変更する構文を持たないため、表を作り直して移す必要がある。
+ *
+ * 安全のために次を守る。
+ * - **列は動的に読む**。ここで列名を書き下すと、あとで `ensureColumn` が増えたときに
+ *   移行で列が落ちる。評価スナップショット・招待メタデータもこれで丸ごと運ぶ
+ * - **移行先が知らない列が旧表にあれば、元の表に触れる前に throw する**（fail-closed）。
+ *   警告を出しつつ列を捨てて起動すると、失われたことに気づくのは復旧できなくなった後になる
+ * - 新旧に共通する列だけを INSERT..SELECT で移す（順序も明示する）
+ * - 1つのトランザクションで行い、途中で落ちたら元のまま
+ * - 既に新CHECKなら何もしない（冪等）
+ */
+function migrateSoulStatusCheck(db: Database.Database): void {
+  const sql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='souls'").get() as { sql?: string } | undefined)?.sql;
+  if (!sql) return; // souls がまだ無い＝新規DB。DDL が新CHECKで作る
+  if (sql.includes("'kenma'")) return; // 移行済み
+
+  const columns = (db.prepare("PRAGMA table_info(souls)").all() as Array<{ name: string }>).map((c) => c.name);
+  if (columns.length === 0) return;
+
+  // 外部キーの再解決を止めてから作り直す（souls を参照する表の行を壊さない）
+  const foreignKeysWereOn = db.pragma("foreign_keys", { simple: true }) === 1;
+  if (foreignKeysWereOn) db.pragma("foreign_keys = OFF");
+  try {
+    db.exec("BEGIN");
+    db.exec(`
+      CREATE TABLE souls__new (
+        user_id             TEXT PRIMARY KEY,
+        status              TEXT NOT NULL DEFAULT 'waiting'
+                            CHECK (status IN ('waiting','ghost','majin','kenma','mazoku','meirei','departed')),
+        joined_at           INTEGER,
+        ghost_at            INTEGER,
+        eval_deadline_at    INTEGER,
+        eval_extension_days INTEGER NOT NULL DEFAULT 0,
+        eval_started_at     INTEGER,
+        eval_policy_version TEXT,
+        eval_promotion_required INTEGER,
+        eval_demotion_threshold INTEGER,
+        eval_invite_mark_per_person REAL,
+        eval_invite_mark_cap REAL,
+        inviter_user_id     TEXT,
+        inviter_source      TEXT,
+        inviter_hint_user_id TEXT,
+        inviter_hint_source  TEXT,
+        inviter_hint_origin  TEXT,
+        inviter_hint_at      INTEGER,
+        updated_at          INTEGER NOT NULL
+      )
+    `);
+    const newColumns = (db.prepare("PRAGMA table_info(souls__new)").all() as Array<{ name: string }>).map((c) => c.name);
+    // 旧表にしか無い列は移せない。**元の表に触れる前に落とす**（fail-closed）。
+    // 移行コードが知らない列が本番にあるなら、それはこのコードが古いということ。
+    // 黙ってデータを捨てて起動するより、deploy を失敗させて人間に判断させる方がよい。
+    // ここで throw すれば ROLLBACK が走り、旧 souls も未知列も全データも元のまま残る。
+    const dropped = columns.filter((c) => !newColumns.includes(c));
+    if (dropped.length > 0) {
+      throw new Error(
+        `souls migration blocked: 移行先が知らない列があります: ${dropped.join(", ")}。` +
+          `このまま移すとその列のデータを失います。bootstrap.ts の souls__new の定義へ列を足してから再実行してください（DBは変更していません）。`,
+      );
+    }
+    const shared = columns.filter((c) => newColumns.includes(c));
+    const quoted = shared.map((c) => `"${c}"`).join(", ");
+    db.exec(`INSERT INTO souls__new (${quoted}) SELECT ${quoted} FROM souls`);
+    db.exec("DROP TABLE souls");
+    db.exec("ALTER TABLE souls__new RENAME TO souls");
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  } finally {
+    if (foreignKeysWereOn) db.pragma("foreign_keys = ON");
+  }
 }
 
 function ensureColumn(db: Database.Database, table: string, column: string, definition: string): void {
