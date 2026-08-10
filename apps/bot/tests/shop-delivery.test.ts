@@ -4,7 +4,6 @@ import type { Guild } from "discord.js";
 import { Entry, EventLog, Ledger, Settings, Shop, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import type { PurchaseRow, ShopItemRow } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
-import { deliverPurchase, redeliverPurchase } from "../src/shop-delivery.js";
 
 /**
  * 自動配送を「課金の後始末」から独立させた状態機械のテスト。
@@ -19,6 +18,10 @@ process.env.DISCORD_TOKEN = process.env.DISCORD_TOKEN ?? "test-token";
 process.env.CLIENT_ID = process.env.CLIENT_ID ?? "test-client";
 process.env.OWNER_ID = process.env.OWNER_ID ?? "test-owner";
 registerDefaultTxTypes();
+
+// config.ts は環境変数が無いと process.exit(1) するため、shop-delivery は静的 import できない。
+// env を先に立ててから動的 import する（ita-land-event.test.ts と同じ流儀）
+const deliveryModule = import("../src/shop-delivery.js");
 
 const ROLE = { meirei: "r-meirei", wait: "r-wait" };
 const USER = "1463201396567441441";
@@ -106,7 +109,7 @@ describe("再評価チャレンジの自動配送", () => {
     const purchase = buy(ctx);
     const { guild, member } = guildWith({ roles: [ROLE.meirei] });
 
-    const outcome = await deliverPurchase(ctx.services, guild, purchase, ctx.item as ShopItemRow, "test");
+    const outcome = await (await deliveryModule).deliverPurchase(ctx.services, guild, purchase, ctx.item as ShopItemRow, "test");
 
     expect(outcome.state).toBe("delivered");
     expect(ctx.entry.getSoul(USER)!.status).toBe("waiting");
@@ -124,7 +127,7 @@ describe("再評価チャレンジの自動配送", () => {
 
     // 1回目: ロール削除だけ失敗する
     const failing = guildWith({ roles: [ROLE.meirei], removeFails: true });
-    const first = await deliverPurchase(ctx.services, failing.guild, purchase, ctx.item as ShopItemRow, "test");
+    const first = await (await deliveryModule).deliverPurchase(ctx.services, failing.guild, purchase, ctx.item as ShopItemRow, "test");
 
     expect(first.state).toBe("failed");
     expect(first.error).toContain("meirei_role_remove_failed");
@@ -136,7 +139,7 @@ describe("再評価チャレンジの自動配送", () => {
 
     // 2回目: ロール操作が通る環境で再試行
     const working = guildWith({ roles: [ROLE.meirei] });
-    const second = await deliverPurchase(ctx.services, working.guild, ctx.shop.getPurchase(purchase.id)!, ctx.item as ShopItemRow, "test");
+    const second = await (await deliveryModule).deliverPurchase(ctx.services, working.guild, ctx.shop.getPurchase(purchase.id)!, ctx.item as ShopItemRow, "test");
 
     expect(second.state).toBe("delivered");
     expect(working.member.roles.remove).toHaveBeenCalledWith(ROLE.meirei);
@@ -153,7 +156,7 @@ describe("再評価チャレンジの自動配送", () => {
     const { guild, member } = guildWith({ roles: [ROLE.meirei] });
     const before = ctx.entry.getSoul(USER)!.updated_at;
 
-    const outcome = await deliverPurchase(ctx.services, guild, purchase, ctx.item as ShopItemRow, "test");
+    const outcome = await (await deliveryModule).deliverPurchase(ctx.services, guild, purchase, ctx.item as ShopItemRow, "test");
 
     expect(outcome.state).toBe("delivered");
     expect(member.roles.remove).toHaveBeenCalledWith(ROLE.meirei);
@@ -169,7 +172,7 @@ describe("再評価チャレンジの自動配送", () => {
     const purchase = buy(ctx);
     const { guild, member } = guildWith({ roles: [ROLE.wait] });
 
-    const outcome = await deliverPurchase(ctx.services, guild, purchase, ctx.item as ShopItemRow, "test");
+    const outcome = await (await deliveryModule).deliverPurchase(ctx.services, guild, purchase, ctx.item as ShopItemRow, "test");
 
     expect(outcome.state).toBe("delivered");
     expect(member.roles.remove).not.toHaveBeenCalled();
@@ -183,7 +186,7 @@ describe("再評価チャレンジの自動配送", () => {
     const purchase = buy(ctx);
     const { guild } = guildWith({ roles: [ROLE.meirei], memberMissing: true });
 
-    const outcome = await deliverPurchase(ctx.services, guild, purchase, ctx.item as ShopItemRow, "test");
+    const outcome = await (await deliveryModule).deliverPurchase(ctx.services, guild, purchase, ctx.item as ShopItemRow, "test");
 
     expect(outcome.state).toBe("failed");
     expect(outcome.error).toBe("member_fetch_failed");
@@ -194,7 +197,7 @@ describe("再評価チャレンジの自動配送", () => {
     ctx.entry.recordJoin(USER);
     const purchase = buy(ctx);
 
-    const outcome = await deliverPurchase(ctx.services, null, purchase, ctx.item as ShopItemRow, "test");
+    const outcome = await (await deliveryModule).deliverPurchase(ctx.services, null, purchase, ctx.item as ShopItemRow, "test");
 
     expect(outcome.state).toBe("failed");
     expect(outcome.error).toBe("guild_unavailable");
@@ -206,7 +209,7 @@ describe("再評価チャレンジの自動配送", () => {
     const purchase = buy(ctx);
     const { guild } = guildWith({ roles: [] });
 
-    const outcome = await deliverPurchase(ctx.services, guild, purchase, ctx.item as ShopItemRow, "test");
+    const outcome = await (await deliveryModule).deliverPurchase(ctx.services, guild, purchase, ctx.item as ShopItemRow, "test");
 
     expect(outcome.state).toBe("failed");
     expect(outcome.error).toBe("unexpected_status:ghost");
@@ -219,12 +222,12 @@ describe("再評価チャレンジの自動配送", () => {
     ctx.db.prepare("UPDATE souls SET status='meirei' WHERE user_id=?").run(USER);
     const purchase = buy(ctx);
     const first = guildWith({ roles: [ROLE.meirei] });
-    await deliverPurchase(ctx.services, first.guild, purchase, ctx.item as ShopItemRow, "test");
+    await (await deliveryModule).deliverPurchase(ctx.services, first.guild, purchase, ctx.item as ShopItemRow, "test");
     const soulAfter = ctx.db.prepare("SELECT * FROM souls WHERE user_id=?").get(USER);
     const attemptsAfter = stateOf(ctx, purchase.id).delivery_attempts;
 
     const again = guildWith({ roles: [] });
-    const outcome = await deliverPurchase(ctx.services, again.guild, ctx.shop.getPurchase(purchase.id)!, ctx.item as ShopItemRow, "test");
+    const outcome = await (await deliveryModule).deliverPurchase(ctx.services, again.guild, ctx.shop.getPurchase(purchase.id)!, ctx.item as ShopItemRow, "test");
 
     expect(outcome.state).toBe("already_delivered");
     expect(again.guild.members.fetch).not.toHaveBeenCalled();
@@ -242,10 +245,10 @@ describe("再評価チャレンジの自動配送", () => {
     const balanceAfterPurchase = ctx.ledger.balanceOf(`user:${USER}`);
 
     const failing = guildWith({ roles: [ROLE.meirei], removeFails: true });
-    await deliverPurchase(ctx.services, failing.guild, purchase, ctx.item as ShopItemRow, "test");
-    await deliverPurchase(ctx.services, failing.guild, ctx.shop.getPurchase(purchase.id)!, ctx.item as ShopItemRow, "test");
+    await (await deliveryModule).deliverPurchase(ctx.services, failing.guild, purchase, ctx.item as ShopItemRow, "test");
+    await (await deliveryModule).deliverPurchase(ctx.services, failing.guild, ctx.shop.getPurchase(purchase.id)!, ctx.item as ShopItemRow, "test");
     const working = guildWith({ roles: [ROLE.meirei] });
-    await deliverPurchase(ctx.services, working.guild, ctx.shop.getPurchase(purchase.id)!, ctx.item as ShopItemRow, "test");
+    await (await deliveryModule).deliverPurchase(ctx.services, working.guild, ctx.shop.getPurchase(purchase.id)!, ctx.item as ShopItemRow, "test");
 
     expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(balanceAfterPurchase);
     expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_purchases").get()).toEqual({ n: 1 });
@@ -259,7 +262,7 @@ describe("運営の回収導線（purchase ID 指定の再配送）", () => {
     const purchase = buy(ctx);
     const { guild, member } = guildWith({ roles: [ROLE.meirei] });
 
-    const outcome = await redeliverPurchase(ctx.services, guild, purchase.id, "user:staff");
+    const outcome = await (await deliveryModule).redeliverPurchase(ctx.services, guild, purchase.id, "user:staff");
 
     expect(outcome.state).toBe("delivered");
     expect(member.roles.remove).toHaveBeenCalledWith(ROLE.meirei);
@@ -272,10 +275,10 @@ describe("運営の回収導線（purchase ID 指定の再配送）", () => {
     const purchase = buy(ctx);
     const { guild } = guildWith({ roles: [ROLE.meirei] });
 
-    expect((await redeliverPurchase(ctx.services, guild, 9999, "user:staff")).error).toBe("purchase_not_found");
+    expect((await (await deliveryModule).redeliverPurchase(ctx.services, guild, 9999, "user:staff")).error).toBe("purchase_not_found");
 
     ctx.db.prepare("UPDATE shop_purchases SET status='refunded' WHERE id=?").run(purchase.id);
-    const refunded = await redeliverPurchase(ctx.services, guild, purchase.id, "user:staff");
+    const refunded = await (await deliveryModule).redeliverPurchase(ctx.services, guild, purchase.id, "user:staff");
     expect(refunded.error).toBe("purchase_not_active");
     expect(refunded.state).toBe("failed");
   });
@@ -287,7 +290,7 @@ describe("運営の回収導線（purchase ID 指定の再配送）", () => {
     expect(ctx.shop.listUndeliveredAuto().map((p) => p.id)).toEqual([purchase.id]);
 
     const { guild } = guildWith({ roles: [ROLE.meirei] });
-    await deliverPurchase(ctx.services, guild, purchase, ctx.item as ShopItemRow, "test");
+    await (await deliveryModule).deliverPurchase(ctx.services, guild, purchase, ctx.item as ShopItemRow, "test");
     expect(ctx.shop.listUndeliveredAuto()).toHaveLength(0);
   });
 });
