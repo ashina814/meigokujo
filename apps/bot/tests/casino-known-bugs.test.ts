@@ -716,6 +716,146 @@ describe("④ 賭場商店の購入が単一トランザクション", () => {
     ctx.db.close();
   });
 
+  /**
+   * 商店の自動入金。
+   *
+   * 賭場は利用者へ Land を単一の通貨として見せており、ソロ・チンチロ・順位卓は
+   * 手元の Land から不足分を自動で寄せる。商店だけ「事前に賭場へ置いた分しか
+   * 使えない」のは利用者から見て不自然なので、購入経路も同じ扱いに揃える。
+   *
+   * 新しい資金方式は作らず、既存の `chipFlow.ensureFreeChips` を
+   * **購入と同じ runGroup の中で**呼ぶ。ChipTx は内側の runGroup を同じグループへ
+   * 合流させるので、預入だけ先に確定して残ることがない。
+   */
+  /** 手元の Land だけを与える（賭場には1枚も置いていない状態） */
+  function seedLandOnly(ctx: ReturnType<typeof rebuild>, userId: string, land: number): void {
+    ctx.ledger.ensureAccount(`user:${userId}`, "user");
+    ctx.ledger.transfer({
+      from: "sys:treasury", to: `user:${userId}`, amount: land, type: "adjust", actor: "t", approvedBy: "t",
+      idempotencyKey: `seed:land:${userId}:${land}`,
+    });
+  }
+  const landOf = (ctx: ReturnType<typeof rebuild>, userId: string) => ctx.ledger.balanceOf(`user:${userId}`);
+
+  it("賭場内残高0でも、手元のLandが足りていれば買える", () => {
+    const ctx = setup();
+    seedLandOnly(ctx, "u1", PRICE * 3);
+    expect(ctx.ether.balanceOf("u1")).toBe(0);
+
+    const r = buyConsumable(ctx.services, "u1", ITEM, "op-land-only");
+
+    expect(r.ok).toBe(true);
+    expect(ctx.items.inventory("u1").find((i) => i.key === ITEM)?.quantity).toBe(1);
+    // 代金ぶんだけ Land が減り、賭場側に余りを残さない
+    expect(landOf(ctx, "u1")).toBe(PRICE * 3 - PRICE);
+    expect(ctx.ether.balanceOf("u1")).toBe(0);
+    ctx.db.close();
+  });
+
+  it("賭場内残高が一部だけあるときは、不足分だけ Land から動く", () => {
+    const ctx = setup();
+    const already = Math.floor(PRICE / 2);
+    mintBackedChips(ctx, "u1", already);
+    seedLandOnly(ctx, "u1", PRICE * 2);
+    const landBefore = landOf(ctx, "u1");
+
+    const r = buyConsumable(ctx.services, "u1", ITEM, "op-partial");
+
+    expect(r.ok).toBe(true);
+    // 動いた Land は「価格 - もともと賭場にあった分」ちょうど
+    expect(landBefore - landOf(ctx, "u1")).toBe(PRICE - already);
+    expect(ctx.ether.balanceOf("u1")).toBe(0);
+    ctx.db.close();
+  });
+
+  it("賭場内残高だけで足りるときは Land を動かさない", () => {
+    const ctx = setup();
+    mintBackedChips(ctx, "u1", PRICE * 2);
+    seedLandOnly(ctx, "u1", PRICE * 5);
+    const landBefore = landOf(ctx, "u1");
+
+    const r = buyConsumable(ctx.services, "u1", ITEM, "op-chips-enough");
+
+    expect(r.ok).toBe(true);
+    expect(landOf(ctx, "u1")).toBe(landBefore);
+    expect(ctx.ether.balanceOf("u1")).toBe(PRICE * 2 - PRICE);
+    ctx.db.close();
+  });
+
+  it("手元のLandと賭場内残高を足しても届かないなら、資金も在庫も1つも動かない", () => {
+    const ctx = setup();
+    mintBackedChips(ctx, "u1", 1);
+    seedLandOnly(ctx, "u1", PRICE - 5);
+    const landBefore = landOf(ctx, "u1");
+    const chipsBefore = ctx.ether.balanceOf("u1");
+
+    const r = buyConsumable(ctx.services, "u1", ITEM, "op-short");
+
+    expect(r.ok).toBe(false);
+    // 不足の判定は「手元 + 賭場」で行う（利用者に見えている所持と同じ）
+    expect(r.held).toBe(landBefore + chipsBefore);
+    expect(landOf(ctx, "u1")).toBe(landBefore);
+    expect(ctx.ether.balanceOf("u1")).toBe(chipsBefore);
+    expect(ctx.items.inventory("u1").find((i) => i.key === ITEM)?.quantity ?? 0).toBe(0);
+    // 入金だけ先に走ってしまっていないこと
+    expect(ctx.chipTx.listByGroup(r.groupKey)).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("自動入金を挟んでも、同じ interaction ID の再送で二重入金・二重課金・二重付与しない", () => {
+    const ctx = setup();
+    seedLandOnly(ctx, "u1", PRICE * 3);
+
+    const first = buyConsumable(ctx.services, "u1", ITEM, "same-op-autofund");
+    const second = buyConsumable(ctx.services, "u1", ITEM, "same-op-autofund");
+
+    expect(first.ok).toBe(true);
+    expect(second.groupKey).toBe(first.groupKey);
+    expect(landOf(ctx, "u1")).toBe(PRICE * 3 - PRICE);
+    expect(ctx.ether.balanceOf("u1")).toBe(0);
+    expect(ctx.items.inventory("u1").find((i) => i.key === ITEM)?.quantity).toBe(1);
+    ctx.db.close();
+  });
+
+  it("自動入金のあとで付与が失敗したら、Land の移動ごと全部戻る", () => {
+    const ctx = setup();
+    seedLandOnly(ctx, "u1", PRICE * 3);
+    const landBefore = landOf(ctx, "u1");
+
+    const realGrant = ctx.items.grant.bind(ctx.items);
+    ctx.items.grant = () => {
+      throw new Error("grant 失敗");
+    };
+    expect(() => buyConsumable(ctx.services, "u1", ITEM, "op-autofund-fail")).toThrow("grant 失敗");
+    ctx.items.grant = realGrant;
+
+    // 預入だけが残る＝利用者の Land が賭場に取り残される、が起きないこと
+    expect(landOf(ctx, "u1")).toBe(landBefore);
+    expect(ctx.ether.balanceOf("u1")).toBe(0);
+    expect(ctx.items.inventory("u1").find((i) => i.key === ITEM)?.quantity ?? 0).toBe(0);
+    const groupKey = `shop:buy:u1:${ITEM}:op-autofund-fail`;
+    expect(ctx.chipTx.getGroup(groupKey)).toBeUndefined();
+    expect(ctx.chipTx.listByGroup(groupKey)).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("賭場が停止中なら、自動入金も購入も1 Ld たりとも動かない", () => {
+    const ctx = setup();
+    seedLandOnly(ctx, "u1", PRICE * 3);
+    const landBefore = landOf(ctx, "u1");
+    // 資金が動く操作は ChipTx がグループ生成の時点で断る（UI表示を信用しない）
+    ctx.chipTx.setClosedReason(() => "点検中");
+
+    expect(() => buyConsumable(ctx.services, "u1", ITEM, "op-closed")).toThrow();
+
+    expect(landOf(ctx, "u1")).toBe(landBefore);
+    expect(ctx.ether.balanceOf("u1")).toBe(0);
+    expect(ctx.items.inventory("u1").find((i) => i.key === ITEM)?.quantity ?? 0).toBe(0);
+    expect(ctx.chipTx.getGroup(`shop:buy:u1:${ITEM}:op-closed`)).toBeUndefined();
+    ctx.chipTx.setClosedReason(null);
+    ctx.db.close();
+  });
+
   it("同じ interaction ID の再送で二重課金・二重付与しない", () => {
     const ctx = setup();
     seedBalance(ctx.db, "u1", PRICE * 10);

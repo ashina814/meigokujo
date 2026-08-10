@@ -47,13 +47,10 @@ export async function handleBakutenCommand(
 function buildEmbed(userId: string, services: Services): EmbedBuilder {
   const inv = services.items.inventory(userId);
   const armed = new Set(services.items.armedList(userId));
-  // 商店で使えるのは**賭場へ移してある分だけ**。遊ぶときは validateBet が
-  // 手元のLandから自動で寄せるが、購入経路にはその自動移動が無い（core は未対応）。
-  // 額を黙って合算して見せると「所持はあるのに買えない」になるので、
-  // 使える額と手元の残りを分けて出す。資金の扱いはここでは一切変えない
-  const spendable = services.chips.balanceOf(userId);
+  // 購入時に不足分を手元のLandから自動で寄せるので、ここは賭場の他の画面と
+  // 同じ「所持」を出す。利用者から見て Land は単一の通貨で、置き場所の違いは見せない
   const wallet = readAvailableWallet(services, userId);
-  const atHand = Math.max(0, wallet.land);
+  const held = wallet.status === "formal" ? wallet.available : services.chips.balanceOf(userId);
 
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · 商店" })
@@ -61,13 +58,10 @@ function buildEmbed(userId: string, services: Services): EmbedBuilder {
     .setTitle("🛍  お守り棚")
     .setDescription(
       [
-        `ここで使える分 **${fmtEther(spendable)}**`,
-        atHand > 0 ? `-# 手元の Land ${fmtEther(atHand)} は、遊びに使うと自動で賭場へ移ります。商店では移しません。` : "",
+        `所持 **${fmtEther(held)}**`,
         "",
         "*買う → 装備する → 発動条件を満たしたら自動で消える。*",
-      ]
-        .filter(Boolean)
-        .join("\n"),
+      ].join("\n"),
     );
 
   // 各お守りを Field で並べる（inline: true で2列レイアウト）
@@ -150,8 +144,23 @@ export function buyConsumable(
   const r = services.chips.runGroup(
     { groupKey, kind: "shop", actorId: userId },
     (): { ok: boolean; held: number } => {
-      const held = services.chips.balanceOf(userId);
+      // 利用者から見た所持は「手元のLand + 賭場に置いている分」。
+      // 賭場に置いている分だけで判定すると、ホームでは買えるように見えて商店で弾かれる。
+      // 判定にはホームと同じスナップショットを使い、表示と挙動を一致させる。
+      const wallet = readAvailableWallet(services, userId);
+      // 版が異常・帳簿破損・overflow のときは available が通常Landだけに落ちる。
+      // その状態では自動移動もさせない（fail-closed のまま）
+      const trustworthy = wallet.status === "formal";
+      const held = trustworthy ? wallet.available : services.chips.balanceOf(userId);
       if (held < def.price) return { ok: false, held };
+
+      // 不足分だけ手元のLandから寄せる。**この runGroup の中で呼ぶ**ので、
+      // ChipTx は内側の auto-deposit を同じグループへ合流させ、預入・代金・付与が
+      // 1つの業務操作として確定する（預入だけ先に確定して残ることがない）。
+      // operationId は呼び出し元の interaction.id なので、再送しても
+      // 外側 shop:buy の replay に吸収されて二重入金・二重課金・二重付与にならない。
+      if (trustworthy) services.chipFlow.ensureFreeChips(userId, def.price, operationId);
+
       services.chips.transfer(userId, HOUSE_HOLDER, def.price, { reason: `賭場商店での購入: ${def.key}` });
       services.items.grant(userId, def.key, 1);
       return { ok: true, held };
