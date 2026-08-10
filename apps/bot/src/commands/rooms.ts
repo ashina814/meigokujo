@@ -64,6 +64,41 @@ function panelCategoryId(
   return null;
 }
 
+/** 宿の種別ごとの正規カテゴリ設定キー（巣穴の `category:eval_den` と同じ流儀） */
+export const ROOM_CATEGORY_SETTING_KEYS: Readonly<Record<RoomKind, string>> = {
+  normal: "category:room_normal",
+  mitsugetsu: "category:room_mitsugetsu",
+  oborozuki: "category:room_oborozuki",
+  game: "category:room_game",
+};
+
+/** 種別ごとの設定が無いときに使う共通の宿カテゴリ */
+export const ROOM_CATEGORY_FALLBACK_KEY = "category:rooms";
+
+/**
+ * 宿VCを作る**正規の**カテゴリを決める。
+ *
+ * 生成先は「操作されたパネルがたまたま置かれている場所」ではなく、種別ごとの設定で決める。
+ * パネルを別カテゴリへ動かしたら宿VCまでそこへ作られる、という状態にしないため。
+ *
+ * とくに秘密の宿(oborozuki)は **DMの承諾ボタン**から作られるので、そもそも参照できる
+ * 親カテゴリが存在せず、これまで常にカテゴリ外（サーバー直下）へ作られていた。
+ * カテゴリが付かないと XP・浮上報酬の除外判定（チャンネルID または 親カテゴリID）が
+ * 親側で成立せず、除外設定に載せる方法が無くなる。
+ *
+ * 未設定のあいだは従来どおり `fallbackCategoryId`（パネルの親）へ落とす。
+ * デプロイした瞬間に既存サーバーの生成先が変わらないようにするため。
+ * ただし未設定のままでは秘密の宿のXP漏れは直らないので、運営が
+ * 「⚙️設定 → カテゴリ」で入れることが前提。
+ */
+function roomCategoryId(services: Services, kind: RoomKind, fallbackCategoryId: string | null): string | null {
+  return (
+    services.settings.getString(ROOM_CATEGORY_SETTING_KEYS[kind]) ??
+    services.settings.getString(ROOM_CATEGORY_FALLBACK_KEY) ??
+    fallbackCategoryId
+  );
+}
+
 function formatHours(hours: number): string {
   return `${hours}時間`;
 }
@@ -454,7 +489,7 @@ async function createAndReply(
       return;
     }
 
-    channel = await createRoomChannel(guild, services, kind, owner, members, panelCategoryId(interaction));
+    channel = await createRoomChannel(guild, services, kind, owner, members, roomCategoryId(services, kind, panelCategoryId(interaction)));
     if (!channel) {
       await finish("部屋の作成に失敗しました。運営にパネルの設置場所（カテゴリ）を確認してもらってください。");
       return;
@@ -759,7 +794,7 @@ export async function handleRecruitModal(interaction: ModalSubmitInteraction, se
     return;
   }
 
-  const channel = await createRoomChannel(guild, services, "mitsugetsu", owner, [owner.id], panelCategoryId(interaction));
+  const channel = await createRoomChannel(guild, services, "mitsugetsu", owner, [owner.id], roomCategoryId(services, "mitsugetsu", panelCategoryId(interaction)));
   if (!channel) {
     await interaction.editReply({ content: "部屋の作成に失敗しました。課金していません。" });
     return;
@@ -1048,7 +1083,8 @@ async function handleOboroDecision(interaction: ButtonInteraction, services: Ser
     await interaction.editReply({ content: "申請者または対象者がサーバー内に確認できないため中止しました。課金していません。", components: [] });
     return;
   }
-  const channel = await createRoomChannel(guild, services, "oborozuki", requester, [requester.id, target.id], null);
+  // DMの承諾から作るので参照できる親カテゴリが無い。設定が唯一の生成先になる
+  const channel = await createRoomChannel(guild, services, "oborozuki", requester, [requester.id, target.id], roomCategoryId(services, "oborozuki", null));
   if (!channel) {
     await interaction.editReply({ content: "秘密部屋の作成に失敗しました。課金していません。", components: [] });
     return;

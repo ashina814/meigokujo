@@ -146,6 +146,7 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   // ── 設定 ──
   if (section === "setting" && !action) return void (await interaction.update(await settingHome(services)));
   if (section === "setting" && action === "channel-select") return void (await openChannelSetup(interaction, services));
+  if (section === "setting" && action === "category-select") return void (await openCategorySetup(interaction, services));
   if (section === "setting" && action === "role-select") return void (await openRoleSetup(interaction, services));
   if (section === "setting" && action === "number-select") return void (await openNumberSetup(interaction, services));
   if (section === "setting" && action === "eval-cap") return void (await interaction.update(evaluationCapHome(services)));
@@ -414,6 +415,14 @@ export async function handleAdminSelect(
 
   if (section === "setting" && action === "channel-key" && interaction.isStringSelectMenu()) {
     return void (await interaction.update(await settingChannelPicker(interaction.values[0]!)));
+  }
+  if (section === "setting" && action === "category-key" && interaction.isStringSelectMenu()) {
+    return void (await interaction.update(await settingCategoryPicker(interaction.values[0]!)));
+  }
+  if (section === "setting" && action === "category-pick" && interaction.isChannelSelectMenu()) {
+    const key = parts[3]!;
+    services.settings.set(`category:${key}`, interaction.values[0]!, `user:${interaction.user.id}`);
+    return void (await interaction.update({ content: `✅ **category:${key}** に <#${interaction.values[0]}> を設定しました。`, embeds: [], components: [backButton()] }));
   }
   if (section === "setting" && action === "channel-pick" && interaction.isChannelSelectMenu()) {
     const key = parts[3]!;
@@ -968,6 +977,7 @@ async function settingHome(_services: Services) {
     .setColor(0x6b21a8);
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:setting:channel-select").setLabel("チャンネル").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("mgmt:setting:category-select").setLabel("カテゴリ").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("mgmt:setting:role-select").setLabel("ロール").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("mgmt:setting:number-select").setLabel("数値").setStyle(ButtonStyle.Primary),
   );
@@ -1053,6 +1063,60 @@ const CHANNEL_KEYS: Array<[string, string]> = [
   ["emergency_reports", "緊急対応の通知先"],
   ["handoff_notify", "対応先変更・大司教呼出の通知先（省略時はトートの耳）"],
 ];
+
+/**
+ * カテゴリ設定。**チャンネルとは別扱いにする**。
+ *
+ * ここへ入れた値は「その機能が作るVCの置き場所」を決める。
+ * パネルの位置など、そのときのDiscordの状態に依存させないための設定なので、
+ * 選ばせる対象もカテゴリだけに絞る。
+ *
+ * `category:eval_den` は以前から読まれていたのに設定する導線が無く、
+ * 実質いつも未設定だった。同じ仕組みなのでここへまとめる。
+ */
+const CATEGORY_KEYS: Array<[string, string]> = [
+  ["rooms", "宿ぜんぶの既定カテゴリ（種別ごとの指定が無いとき）"],
+  ["room_normal", "通常宿の生成先"],
+  ["room_mitsugetsu", "蜜月の生成先"],
+  ["room_oborozuki", "朧月（秘密の宿）の生成先"],
+  ["room_game", "ゲーム部屋の生成先"],
+  ["eval_den", "巣穴（評価VC）の生成先"],
+];
+
+async function openCategorySetup(interaction: ButtonInteraction, _services: Services) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("mgmt:setting:category-key")
+    .setPlaceholder("設定するカテゴリ種別を選ぶ")
+    .addOptions(CATEGORY_KEYS.map(([v, name]) => ({ label: name.slice(0, 100), value: v })));
+  await interaction.update({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle("⚙️ カテゴリ設定")
+        .setDescription(
+          [
+            "種別を選んでからカテゴリを指定します。",
+            "",
+            "宿のVCはここで指定したカテゴリへ作られます。未設定のあいだは、これまでどおり",
+            "パネルが置かれているカテゴリへ作られます（朧月はDMから作るためカテゴリ無しになります）。",
+            "",
+            "-# XP・浮上報酬から外したい宿は、生成先を決めたうえで **XP除外** にそのカテゴリを追加してください。",
+          ].join("\n"),
+        ),
+    ],
+    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu), backButton()],
+  });
+}
+
+async function settingCategoryPicker(key: string) {
+  const picker = new ChannelSelectMenuBuilder()
+    .setCustomId(`mgmt:setting:category-pick:${key}`)
+    .setPlaceholder("カテゴリを選ぶ")
+    .addChannelTypes(ChannelType.GuildCategory);
+  return {
+    embeds: [new EmbedBuilder().setTitle(`⚙️ ${key}`).setDescription("このカテゴリの中へVCが作られます。")],
+    components: [new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(picker), backButton()],
+  };
+}
 
 async function openChannelSetup(interaction: ButtonInteraction, _services: Services) {
   const menu = new StringSelectMenuBuilder()
