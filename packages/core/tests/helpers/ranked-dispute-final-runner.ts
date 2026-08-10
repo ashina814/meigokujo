@@ -12,6 +12,7 @@ import {
   openDb,
   registerDefaultTxTypes,
 } from "../../src/index.js";
+import { barrierReadyAndWait } from "./process-barrier.js";
 
 registerDefaultTxTypes();
 
@@ -23,7 +24,10 @@ const input = JSON.parse(process.argv[2] ?? "{}") as {
   actor: string;
   serviceNow: number;
   deadlineNow: number;
-  startAt: number;
+  /** ファイルバリアの置き場。親が全員の ready を確認してから解放する */
+  barrierDir: string;
+  /** このプロセスのバリア名 */
+  barrierName: string;
 };
 
 const db = openDb(input.dbPath);
@@ -42,37 +46,41 @@ const disputes = new RankedDisputes(db, chips, escrow, persistentTables, reserva
   onPlayerNet: (userId, net) => casino.recordGameNet(userId, net),
 });
 
+// 事前読み込み。プリペアドステートメントのコンパイルとスキーマ確認をここで済ませ、
+// バリア解放後に残る仕事を「競わせたい操作そのもの」だけにする。
 disputes.publicStatus(input.tableId);
 
-setTimeout(() => {
-  try {
-    if (input.operation === "deadline") {
-      const result = disputes.processEvidenceDeadlines(input.deadlineNow);
-      console.log(JSON.stringify({ ok: true, result }));
-    } else if (input.operation === "finalize") {
-      const result = disputes.finalizeEvidenceStored({
-        operationId: input.operationId,
-        privateChannelId: "private-channel",
-        privateMessageId: "private-message",
-        metadata: { source: "race-test" },
-      });
-      console.log(JSON.stringify({ ok: true, result }));
-    } else {
-      const result = disputes.resolveRankedResult({
-        tableId: input.tableId,
-        actorId: input.actor,
-        orderedUserIds: ["alice", "bob"],
-        feeOutcome: "fault_refund",
-        recordStats: true,
-        publicSummary: "manual arbitration race",
-        operationId: input.operationId,
-      });
-      console.log(JSON.stringify({ ok: true, resolutionKind: result.resolutionKind, resolvedAt: result.resolvedAt }));
-    }
-  } catch (error) {
-    const err = error as Error & { code?: string };
-    console.log(JSON.stringify({ ok: false, code: err.code ?? err.name, error: err.message }));
-  } finally {
-    db.close();
+// 準備完了を申告し、親が全員そろったと判断するまで待つ。
+// 壁時計での申し合わせと違い、遅い環境でも解放時点の足並みが揃う。
+barrierReadyAndWait(input.barrierDir, input.barrierName);
+
+try {
+  if (input.operation === "deadline") {
+    const result = disputes.processEvidenceDeadlines(input.deadlineNow);
+    console.log(JSON.stringify({ ok: true, result }));
+  } else if (input.operation === "finalize") {
+    const result = disputes.finalizeEvidenceStored({
+      operationId: input.operationId,
+      privateChannelId: "private-channel",
+      privateMessageId: "private-message",
+      metadata: { source: "race-test" },
+    });
+    console.log(JSON.stringify({ ok: true, result }));
+  } else {
+    const result = disputes.resolveRankedResult({
+      tableId: input.tableId,
+      actorId: input.actor,
+      orderedUserIds: ["alice", "bob"],
+      feeOutcome: "fault_refund",
+      recordStats: true,
+      publicSummary: "manual arbitration race",
+      operationId: input.operationId,
+    });
+    console.log(JSON.stringify({ ok: true, resolutionKind: result.resolutionKind, resolvedAt: result.resolvedAt }));
   }
-}, Math.max(0, input.startAt - Date.now()));
+} catch (error) {
+  const err = error as Error & { code?: string };
+  console.log(JSON.stringify({ ok: false, code: err.code ?? err.name, error: err.message }));
+} finally {
+  db.close();
+}
