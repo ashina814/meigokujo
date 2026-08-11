@@ -109,9 +109,28 @@ export interface ChipTxRow {
   game: string | null;
   session_id: string | null;
   actor_id: string;
+  /**
+   * この取引が属する開始残高の版（検算の窓）。`record()` 時点の `currentVersion()` を刻む。
+   *
+   * 版を取引そのものに持たせているので、正式開業初期化で採番が巻き戻っても
+   * 旧版の取引と混ざらない（`replayBalances()` はこの列で窓を切る）。
+   * 列の作成時（PR1 `1e57ad4`）から `TEXT NOT NULL` で、後付けの ALTER も既定値も無いため非 null。
+   */
+  opening_version: string;
   land_amount: number | null;
   ledger_tx_id: number | null;
   created_at: number;
+  /**
+   * その明細を動かした操作（入れ子なら内側の `runGroup`）の冪等キーと実行者。
+   * Land 取引の `idempotency_key` / `actor_id` と 1:1 で対応する。
+   *
+   * 内側の `runGroup` は外側グループへ合流するので、`group_key` / `actor_id` では
+   * 「どの操作が動かしたか」を特定できない。検算Bが Land 取引と突き合わせる正本はこちら。
+   * 検算B修正（2026-08-11）より前に記録された行は埋め戻しで埋まるが、
+   * 埋め戻しが走る前のDBを読む可能性があるので null を許す。
+   */
+  op_key: string | null;
+  op_actor_id: string | null;
 }
 
 export interface ChipBalanceMismatch {
