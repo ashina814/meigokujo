@@ -7,6 +7,7 @@ import {
   UserSelectMenuBuilder,
   type ButtonInteraction,
   type Guild,
+  type GuildMember,
   type StringSelectMenuInteraction,
   type UserSelectMenuInteraction,
 } from "discord.js";
@@ -18,6 +19,7 @@ import {
   type LadderRank,
 } from "@meigokujo/core";
 import { redeliverPurchase } from "../shop-delivery.js";
+import { REEVAL_ITEM_SETTING_KEY } from "./reeval.js";
 import type { Services } from "./../services.js";
 
 /**
@@ -60,6 +62,7 @@ export function recoveryHome() {
         "**階級ロールの復元** … 台帳の階級に対してロールが欠けている人へ、その階級のロールを足します。",
         "**昇格記録の追いつき** … ロール上は魔人だが台帳が亡霊のままの人の記録を合わせます（告知はしません）。",
         "**履歴追認** … 監査で特定した4名限定の waiting→魔人 追認です。",
+        "**旧自動解除の巻き戻し** … 撤回した自動配送で迷霊が外れた2名を、面談を受けられる状態へ戻します。",
         "",
         "-# どれも実行前に条件を再確認し、条件を満たさなければ何もせず理由を出します。",
       ].join("\n"),
@@ -69,6 +72,7 @@ export function recoveryHome() {
     new ButtonBuilder().setCustomId("mgmt:recover:role").setLabel("階級ロールの復元").setEmoji("🎖").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:recover:promo").setLabel("昇格記録の追いつき").setEmoji("⚔️").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mgmt:recover:backfill").setLabel("履歴追認（4名限定）").setEmoji("📜").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mgmt:recover:legacy").setLabel("旧自動解除の巻き戻し").setEmoji("↩️").setStyle(ButtonStyle.Secondary),
   );
   const back = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:hub").setLabel("← ハブへ").setStyle(ButtonStyle.Secondary),
@@ -348,6 +352,148 @@ export async function handleBackfillRun(interaction: ButtonInteraction, services
       applied.length > 0 ? `✅ 追認しました（${applied.length}名）: ${applied.join(", ")}` : "追認した人はいません。",
       skipped.length > 0 ? `⏭ 見送り（${skipped.length}名）: ${skipped.join(", ")}` : "",
       "-# 初期発行・評価期間・告知は発生していません。",
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    embeds: [],
+    components: [backRow()],
+    allowedMentions: { parse: [] },
+  });
+}
+
+// ---- 旧ショップ自動解除の巻き戻し（2名限定）----
+
+/**
+ * 撤回した `revoke_meirei` 自動配送が、面談を経ずに迷霊を解除してしまった2名。
+ *
+ * どちらも `ghost_reset`(actor=`shop:5`) が事件録に残っており、DBだけ案内待ちへ
+ * 落ちた状態で止まっている。面談を受けられる状態（迷霊）へ戻すためだけの一回限りの操作。
+ *
+ * `@amaguri3807` は**入れない**。あの人は購入時にDBが迷霊でなく配送が拒否されたので、
+ * 「旧自動解除で迷霊が外れた」証拠が無く、別判断になる。
+ */
+export const REEVAL_LEGACY_ROLLBACK: ReadonlyArray<{ userId: string; purchaseId: number }> = [
+  { userId: "1004526260522856638", purchaseId: 63 }, // @zhese
+  { userId: "1081838999980757064", purchaseId: 64 }, // @el_cy1
+];
+
+export function legacyRollbackConfirm(services: Services) {
+  const lines = REEVAL_LEGACY_ROLLBACK.map(({ userId, purchaseId }) => {
+    const soul = services.entry.getSoul(userId);
+    return `・<@${userId}> — 台帳: ${soul?.status ?? "記録なし"} / 面談権: 購入 #${purchaseId}`;
+  });
+  const embed = new EmbedBuilder()
+    .setTitle("↩️ 旧ショップ自動解除の巻き戻し（2名限定）")
+    .setColor(0xb45309)
+    .setDescription(
+      [
+        "撤回した自動配送が、面談を経ずに迷霊を解除してしまった2名を**迷霊へ戻します**。",
+        "",
+        ...lines,
+        "",
+        "行うこと: `status` を案内待ちから迷霊へ戻し、案内待ちロールが残っていれば外すだけ。",
+        "**行わないこと**: 亡霊化時刻・以前の評価期限・policy snapshot・印・Land・招待実績の復元。",
+        "",
+        "-# 戻した後、本人は追加料金なしで購入 #63/#64 を使って再評価面談チケットを開けます。",
+        "-# 実行時に許可リスト・台帳・購入・旧解除の記録・在籍・迷霊ロールを再確認します。",
+      ].join("\n"),
+    );
+  return {
+    embeds: [embed],
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("mgmt:recover:legacy-run").setLabel("2名を迷霊へ戻す").setStyle(ButtonStyle.Danger),
+      ),
+      backRow(),
+    ],
+  };
+}
+
+/** 実行前の前提確認。1つでも崩れていれば理由を返して何もしない */
+export async function legacyRollbackVerdict(
+  services: Services,
+  guild: Guild,
+  entry: { userId: string; purchaseId: number },
+): Promise<{ ok: true; member: GuildMember; meireiRoleId: string } | { ok: false; reason: string }> {
+  const inAllowlist = REEVAL_LEGACY_ROLLBACK.some((e) => e.userId === entry.userId && e.purchaseId === entry.purchaseId);
+  if (!inAllowlist) return { ok: false, reason: "not_in_allowlist" };
+
+  const soul = services.entry.getSoul(entry.userId);
+  if (!soul) return { ok: false, reason: "no_soul_row" };
+  if (soul.status !== "waiting") return { ok: false, reason: `unexpected_status:${soul.status}` };
+
+  const itemId = Number(services.settings.getString(REEVAL_ITEM_SETTING_KEY));
+  if (!Number.isInteger(itemId) || itemId <= 0) return { ok: false, reason: "reeval_item_setting_missing" };
+  const purchase = services.shop.getPurchase(entry.purchaseId);
+  if (!purchase) return { ok: false, reason: "purchase_not_found" };
+  if (purchase.user_id !== entry.userId) return { ok: false, reason: "purchase_user_mismatch" };
+  if (purchase.item_id !== itemId) return { ok: false, reason: "purchase_item_mismatch" };
+
+  // 旧自動解除の痕跡。これが無いなら「機械が外した」根拠が無い
+  const events = services.events.listByTarget(entry.userId, 200);
+  if (!events.some((e) => e.type === "ghost_reset" && (e.actor_id ?? "").startsWith("shop:"))) {
+    return { ok: false, reason: "no_legacy_ghost_reset" };
+  }
+  // 面談の結果が既に出ているなら巻き戻さない
+  if (events.some((e) => e.type === "reeval_reinstated" || e.type === "reeval_rejected")) {
+    return { ok: false, reason: "already_interviewed" };
+  }
+
+  const member = await guild.members.fetch(entry.userId).catch(() => null);
+  if (!member) return { ok: false, reason: "member_not_found" };
+  const meireiRoleId = services.settings.getString("role:meirei");
+  if (!meireiRoleId) return { ok: false, reason: "meirei_role_setting_missing" };
+  // 迷霊ロールが残っていることが「Discord上は迷霊のまま」の根拠
+  if (!member.roles.cache.has(meireiRoleId)) return { ok: false, reason: "meirei_role_missing" };
+
+  return { ok: true, member, meireiRoleId };
+}
+
+export async function handleLegacyRollbackRun(interaction: ButtonInteraction, services: Services): Promise<void> {
+  const guild = interaction.guild;
+  if (!guild) {
+    return void (await interaction.update({ content: "サーバー内で実行してください。", embeds: [], components: [backRow()] }));
+  }
+  const actor = `user:${interaction.user.id}`;
+  const applied: string[] = [];
+  const skipped: string[] = [];
+
+  for (const entry of REEVAL_LEGACY_ROLLBACK) {
+    const verdict = await legacyRollbackVerdict(services, guild, entry);
+    if (!verdict.ok) {
+      skipped.push(`<@${entry.userId}>（${verdict.reason}）`);
+      continue;
+    }
+    const ok = services.evaluation.legacyRollbackToMeirei(entry.userId, actor, {
+      purchaseId: entry.purchaseId,
+      basis: "shop_auto_revoke_meirei_withdrawn",
+      note: "撤回した自動配送が面談を経ずに迷霊を解除したため、面談を受けられる状態へ戻す",
+      auditedAt: "2026-08-11",
+    });
+    if (!ok) {
+      skipped.push(`<@${entry.userId}>（precondition_lost）`);
+      continue;
+    }
+    // 案内待ちロールが残っていれば外す（迷霊ロールは既にあるので触らない）
+    const waitRoleId = services.settings.getString("role:queue_wait");
+    if (waitRoleId && verdict.member.roles.cache.has(waitRoleId)) {
+      const removed = await verdict.member.roles.remove(waitRoleId).then(() => true).catch((e: Error) => e.message);
+      if (removed !== true) {
+        services.events.log("reeval_legacy_rollback_role_failed", {
+          actor,
+          target: entry.userId,
+          payload: { roleId: waitRoleId, error: removed },
+        });
+      }
+    }
+    applied.push(`<@${entry.userId}>（購入 #${entry.purchaseId}）`);
+  }
+
+  await interaction.update({
+    content: [
+      applied.length > 0 ? `✅ 迷霊へ戻しました（${applied.length}名）: ${applied.join(", ")}` : "戻した人はいません。",
+      skipped.length > 0 ? `⏭ 見送り（${skipped.length}名）: ${skipped.join(", ")}` : "",
+      "-# 評価期間・印・Land・招待実績は復元していません。面談OK時に新しい評価サイクルが正規に始まります。",
     ]
       .filter(Boolean)
       .join("\n"),

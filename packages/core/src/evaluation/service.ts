@@ -323,7 +323,7 @@ export class Evaluation {
       `reeval:${promotionRequired}:${demotionThreshold}:${inviteMarkPerPerson}:${inviteMarkCap}:${ts}`;
     const deadline = ts + baseDays * 86_400;
 
-    const run = this.db.transaction(() => {
+    const body = () => {
       const changed = this.db
         .prepare(
           `UPDATE souls
@@ -348,8 +348,10 @@ export class Evaluation {
         .prepare("UPDATE marks SET revoked_at = ? WHERE target_id = ? AND revoked_at IS NULL")
         .run(ts, targetId).changes;
       return { revokedMarks };
-    });
-    const result = run.immediate();
+    };
+    // 呼び出し側が「面談結果 + 購入の消費 + チケットclose」を1トランザクションに
+    // まとめることがあるので、既にトランザクション中ならそこへ相乗りする
+    const result = this.db.inTransaction ? body() : this.db.transaction(body).immediate();
     if (!result) {
       this.events.log("reeval_reinstate_skipped", { actor, target: targetId, payload: { reason: "precondition_lost" } });
       return null;
@@ -376,6 +378,27 @@ export class Evaluation {
       },
     });
     return { deadline, revokedMarks: result.revokedMarks, policyVersion };
+  }
+
+  /**
+   * 旧ショップ自動解除の巻き戻し（`waiting → meirei`）。
+   *
+   * 撤回した自動配送が迷霊を機械的に解除してしまった人を、面談を受けられる状態へ戻す。
+   * **status だけ**を戻し、旧自動解除で消えた評価期間情報は推測して作り直さない。
+   * 面談OKになった時点で `reinstateFromMeirei()` が新しい評価サイクルを正規に作る。
+   *
+   * 呼び出し側が対象を固定の許可リストへ限る前提の、一回限りの回収操作。
+   */
+  legacyRollbackToMeirei(targetId: string, actor: string, evidence: Record<string, unknown>): boolean {
+    const changed = this.db
+      .prepare("UPDATE souls SET status = 'meirei', updated_at = ? WHERE user_id = ? AND status = 'waiting'")
+      .run(now(), targetId).changes;
+    if (changed !== 1) {
+      this.events.log("reeval_legacy_rollback_skipped", { actor, target: targetId, payload: { reason: "precondition_lost" } });
+      return false;
+    }
+    this.events.log("reeval_legacy_rollback", { actor, target: targetId, payload: { from: "waiting", to: "meirei", ...evidence } });
+    return true;
   }
 
   /** 再評価面談NG。status・ロール・印のどれも動かさず、判断だけ残す */

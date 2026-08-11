@@ -39,6 +39,8 @@ import { reconcileMemberRank } from "../rank-sync.js";
 import {
   backfillConfirm,
   handleBackfillRun,
+  handleLegacyRollbackRun,
+  legacyRollbackConfirm,
   handlePromotionCatchUp,
   handleRedeliver,
   handleRoleRestore,
@@ -172,6 +174,8 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "recover" && action === "promo") return void (await interaction.update(promotionCatchUpPicker()));
   if (section === "recover" && action === "backfill") return void (await interaction.update(backfillConfirm(services)));
   if (section === "recover" && action === "backfill-run") return void (await handleBackfillRun(interaction, services));
+  if (section === "recover" && action === "legacy") return void (await interaction.update(legacyRollbackConfirm(services)));
+  if (section === "recover" && action === "legacy-run") return void (await handleLegacyRollbackRun(interaction, services));
   if (section === "setting" && action === "role-select") return void (await openRoleSetup(interaction, services));
   if (section === "setting" && action === "number-select") return void (await openNumberSetup(interaction, services));
   if (section === "setting" && action === "eval-cap") return void (await interaction.update(evaluationCapHome(services)));

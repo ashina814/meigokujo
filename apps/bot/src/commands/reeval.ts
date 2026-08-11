@@ -63,6 +63,10 @@ export function findUnconsumedReevalPurchase(services: Services, userId: string)
       `SELECT p.id
          FROM shop_purchases p
         WHERE p.item_id = ? AND p.user_id = ? AND p.status = 'active'
+          -- まだ面談サービスを提供していない購入だけ（消費済みは delivered で表す）
+          AND p.delivered_at IS NULL
+          AND COALESCE(p.delivery_state, 'pending') <> 'delivered'
+          -- 他のチケットが予約中でない
           AND NOT EXISTS (SELECT 1 FROM tickets t WHERE t.linked_purchase_id = p.id)
         ORDER BY p.purchased_at
         LIMIT 1`,
@@ -71,16 +75,63 @@ export function findUnconsumedReevalPurchase(services: Services, userId: string)
   return row ?? null;
 }
 
-/** チケット作成直後に面談権を結び付ける。無ければ結ばない（承認は後で弾かれる） */
+/**
+ * チケット作成直後に面談権を**予約**する。無ければ結ばない（承認は後で弾かれる）。
+ *
+ * ここでの紐付けは予約でしかない。消費されるのは面談結果を出したときだけで、
+ * 結果を出さずに閉じたチケットの予約は `Tickets.close()` が戻す。
+ */
 export function linkReevalPurchase(services: Services, threadId: string, userId: string): number | null {
   const purchase = findUnconsumedReevalPurchase(services, userId);
   if (!purchase) return null;
   return services.tickets.linkPurchase(threadId, purchase.id, `user:${userId}`) ? purchase.id : null;
 }
 
+/** 面談結果の確定。結果の記録・購入の消費・チケットのcloseを1トランザクションで行う */
+function settleInterview(
+  services: Services,
+  input: { threadId: string; targetId: string; purchaseId: number; actor: string; approve: boolean; evidence: Record<string, unknown> },
+): { ok: true; reinstated: ReturnType<Services["evaluation"]["reinstateFromMeirei"]> } | { ok: false } {
+  const run = services.db.transaction(() => {
+    if (input.approve) {
+      const reinstated = services.evaluation.reinstateFromMeirei(input.targetId, input.actor, input.evidence);
+      if (!reinstated) return { ok: false as const };
+      // 面談を提供したので購入権を消費する（手動配送の完了と同じ意味）
+      services.shop.markDelivered(input.purchaseId, input.actor);
+      services.tickets.close(input.threadId, input.actor);
+      return { ok: true as const, reinstated };
+    }
+    services.evaluation.recordReevalRejection(input.targetId, input.actor, input.evidence);
+    services.shop.markDelivered(input.purchaseId, input.actor);
+    services.tickets.close(input.threadId, input.actor);
+    return { ok: true as const, reinstated: null };
+  });
+  return run.immediate();
+}
+
 type Guard =
   | { ok: true; member: GuildMember; targetId: string; purchaseId: number }
   | { ok: false; message: string };
+
+/**
+ * 面談権として使ってよい購入かを**その場で取り直して**確かめる。
+ *
+ * `linked_purchase_id` を信用しない。予約した後に返金・取消されている、
+ * 別人・別商品の購入が誤って結ばれている、といった状態で承認させないため。
+ */
+function verifyPurchase(services: Services, purchaseId: number, ticketUserId: string): string | null {
+  const itemId = Number(services.settings.getString(REEVAL_ITEM_SETTING_KEY));
+  if (!Number.isInteger(itemId) || itemId <= 0) return "再評価チャレンジの商品ID（`shop:reeval_item_id`）が未設定です。";
+  const purchase = services.shop.getPurchase(purchaseId);
+  if (!purchase) return `面談権の購入 #${purchaseId} が見つかりません。`;
+  if (purchase.user_id !== ticketUserId) return `購入 #${purchaseId} は別の利用者のものです。`;
+  if (purchase.item_id !== itemId) return `購入 #${purchaseId} は再評価チャレンジではありません。`;
+  if (purchase.status !== "active") return `購入 #${purchaseId} は ${purchase.status} のため面談権として使えません。`;
+  if (purchase.delivered_at !== null || purchase.delivery_state === "delivered") {
+    return `購入 #${purchaseId} は既に面談で消費済みです。`;
+  }
+  return null;
+}
 
 /**
  * 承認の前提をすべて取り直して確かめる。
@@ -126,6 +177,9 @@ async function guardApproval(interaction: ButtonInteraction, services: Services,
     }
     return { ok: true, member, targetId, purchaseId: claimed };
   }
+  // 予約済みでも、いまも面談権として有効かを取り直して確かめる
+  const invalid = verifyPurchase(services, ticket.linked_purchase_id, targetId);
+  if (invalid) return { ok: false, message: `${invalid} 復帰処理は行いません。` };
   return { ok: true, member, targetId, purchaseId: ticket.linked_purchase_id };
 }
 
@@ -141,17 +195,25 @@ export async function handleReevalApprove(interaction: ButtonInteraction, servic
   await interaction.deferReply();
   const actor = `user:${interaction.user.id}`;
 
-  const result = services.evaluation.reinstateFromMeirei(guard.targetId, actor, {
-    ticketThreadId: interaction.channelId,
+  const settled = settleInterview(services, {
+    threadId: interaction.channelId,
+    targetId: guard.targetId,
     purchaseId: guard.purchaseId,
-    approver: interaction.user.id,
-    panelId: REEVAL_PANEL_ID,
+    actor,
+    approve: true,
+    evidence: {
+      ticketThreadId: interaction.channelId,
+      purchaseId: guard.purchaseId,
+      approver: interaction.user.id,
+      panelId: REEVAL_PANEL_ID,
+    },
   });
-  if (!result) {
+  if (!settled.ok || !settled.reinstated) {
     return void (await interaction.editReply(
       "⚠️ 直前に階級が変わったため中止しました（迷霊ではなくなっています）。何も変更していません。",
     ));
   }
+  const result = settled.reinstated;
 
   // ロール入れ替え。**失敗を握り潰さない**（台帳だけ進んでロールが残る事故を再発させない）
   const meireiRoleId = services.settings.getString("role:meirei");
@@ -182,7 +244,7 @@ export async function handleReevalApprove(interaction: ButtonInteraction, servic
     content: [
       `✅ <@${guard.targetId}> の復帰を承認しました（**迷霊 → 亡霊**）。`,
       `新しい評価期間の締切: ${deadline}${result.revokedMarks > 0 ? ` / 以前の印 ${result.revokedMarks}件を取り消し（履歴は保持）` : ""}`,
-      `面談権: 購入 #${guard.purchaseId}`,
+      `面談権: 購入 #${guard.purchaseId} を消費（チケットは完了）。`,
       roleErrors.length > 0
         ? `⚠️ **ロールの入れ替えに失敗しました**（台帳は復帰済み）:\n${roleErrors.map((e) => `・${e}`).join("\n")}\n手動で迷霊を外し亡霊を付けてください。`
         : "",
@@ -204,15 +266,22 @@ export async function handleReevalReject(interaction: ButtonInteraction, service
     return void (await interaction.reply({ content: `⚠️ ${guard.message}`, flags: MessageFlags.Ephemeral }));
   }
   await interaction.deferReply();
-  services.evaluation.recordReevalRejection(guard.targetId, `user:${interaction.user.id}`, {
-    ticketThreadId: interaction.channelId,
+  settleInterview(services, {
+    threadId: interaction.channelId,
+    targetId: guard.targetId,
     purchaseId: guard.purchaseId,
-    approver: interaction.user.id,
-    panelId: REEVAL_PANEL_ID,
+    actor: `user:${interaction.user.id}`,
+    approve: false,
+    evidence: {
+      ticketThreadId: interaction.channelId,
+      purchaseId: guard.purchaseId,
+      approver: interaction.user.id,
+      panelId: REEVAL_PANEL_ID,
+    },
   });
   await interaction.editReply({
     content: [
-      `🚫 <@${guard.targetId}> の復帰は今回見送りとしました。`,
+      `🚫 <@${guard.targetId}> の復帰は今回見送りとしました。チケットは完了にしました。`,
       "階級・ロール・評価印はいずれも変更していません。",
       "-# 購入代は面談を受ける権利に対するものなので、返金は行いません。",
     ].join("\n"),
