@@ -100,6 +100,7 @@ import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
 import { handlePaydayButton } from "./payday.js";
 import { startScheduler } from "./scheduler.js";
+import { enforceConversationCourtRestrictionForGuild, handleConversationCourtVoiceUpdate } from "./conversation-court.js";
 import { resumePendingFreeSpins } from "./casino/slots.js";
 import { startInternalApi } from "./internal-api.js";
 import { startOutboxWorker } from "./outbox.js";
@@ -148,6 +149,9 @@ client.once(Events.ClientReady, async (ready) => {
   // 招待キャッシュを初期化（全ギルド）
   for (const [, guild] of ready.guilds.cache) {
     void inviteTracker.initGuild(guild).catch((e) => console.error("[invite] 初期化失敗:", e));
+    void enforceConversationCourtRestrictionForGuild(guild, services, new Date(), "startup").catch((e) =>
+      console.error("[conversation-court] startup scan failed", e),
+    );
   }
 
   // 起動時に必ず帳簿を検算する（経済設計.md §8）
@@ -596,6 +600,9 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     trackVoiceState(oldState, newState, services);
     handleVoiceAttendance(oldState, newState, services);
     handleRoomVoiceUpdate(oldState, newState, services);
+    void handleConversationCourtVoiceUpdate(oldState, newState, services).catch((err) =>
+      console.error("[conversation-court] voice state handling failed", err),
+    );
     void handleDenVoice(oldState, newState, services).catch((err) => console.error("[den] 処理失敗:", err));
     void handleTakuVoiceUpdate(oldState, newState, services).catch((err) => console.error("[taku] 処理失敗:", err));
   } catch (err) {

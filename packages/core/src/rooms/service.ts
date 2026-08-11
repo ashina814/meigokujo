@@ -22,6 +22,8 @@ export type RoomErrorCode =
   | "ERR_ROOM_CLOSED"
   | "ERR_ROOM_EXPIRED"
   | "ERR_CAPACITY_LIMIT"
+  | "ERR_CAPACITY_CHANGED"
+  | "ERR_PRICE_CHANGED"
   | "ERR_RECRUIT_CLOSED"
   | "ERR_RECRUIT_CLAIMED"
   | "ERR_INVITE_PENDING"
@@ -291,28 +293,47 @@ export class Rooms {
       .all(ts) as RoomRow[];
   }
 
-  addSlot(roomId: number, payerId: string): RoomRow {
+  addSlot(
+    roomId: number,
+    payerId: string,
+    opts: { waiveFee?: boolean; expectedCapacity?: number; expectedPrice?: number } = {},
+  ): RoomRow {
     const run = this.db.transaction(() => {
       const room = this.get(roomId);
       if (room.status !== "open") throw new RoomError("ERR_ROOM_CLOSED", { roomId });
       if (room.kind !== "normal") throw new RoomError("ERR_INVALID_ROOM", { roomId, kind: room.kind });
+
+      const price = this.settings.getNumber("room_slot_price");
+      if (opts.expectedPrice !== undefined && price !== opts.expectedPrice) {
+        throw new RoomError("ERR_PRICE_CHANGED", { roomId, expectedPrice: opts.expectedPrice, currentPrice: price });
+      }
+      if (opts.expectedCapacity !== undefined && room.capacity !== opts.expectedCapacity) {
+        throw new RoomError("ERR_CAPACITY_CHANGED", {
+          roomId,
+          expectedCapacity: opts.expectedCapacity,
+          currentCapacity: room.capacity,
+        });
+      }
+
       const max = this.settings.getNumber("room_normal_max_capacity");
       if (room.capacity >= max) throw new RoomError("ERR_CAPACITY_LIMIT", { roomId, capacity: room.capacity, max });
 
-      const price = this.settings.getNumber("room_slot_price");
-      const account = `user:${payerId}`;
-      this.ledger.ensureAccount(account, "user");
-      this.ledger.transfer({
-        from: account,
-        to: TREASURY,
-        amount: price,
-        type: "room_fee",
-        actor: account,
-        reason: "宿の人数枠+1",
-        refType: "room:slot",
-        refId: room.channel_id,
-        idempotencyKey: `room:slot:${roomId}:${room.capacity + 1}`,
-      });
+      if (price < 0) throw new Error("room slot price must be non-negative");
+      if (opts.waiveFee !== true && price > 0) {
+        const account = `user:${payerId}`;
+        this.ledger.ensureAccount(account, "user");
+        this.ledger.transfer({
+          from: account,
+          to: TREASURY,
+          amount: price,
+          type: "room_fee",
+          actor: account,
+          reason: "宿の人数枠+1",
+          refType: "room:slot",
+          refId: room.channel_id,
+          idempotencyKey: `room:slot:${roomId}:${room.capacity + 1}`,
+        });
+      }
 
       const updated = this.db
         .prepare(

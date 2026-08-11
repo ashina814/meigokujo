@@ -1136,6 +1136,7 @@ const CHANNEL_KEYS: Array<[string, string]> = [
  * 実質いつも未設定だった。同じ仕組みなのでここへまとめる。
  */
 const CATEGORY_KEYS: Array<[string, string]> = [
+  ["conversation_court_core_block", "会話廷コアタイムVC制限カテゴリ"],
   ["rooms", "宿ぜんぶの既定カテゴリ（種別ごとの指定が無いとき）"],
   ["room_normal", "通常宿の生成先"],
   ["room_mitsugetsu", "蜜月の生成先"],
