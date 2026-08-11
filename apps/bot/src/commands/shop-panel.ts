@@ -373,15 +373,21 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
           const item = services.shop.getItem(purchase.item_id);
           const label = item?.name ?? `#${purchase.item_id}`;
           if (!purchase.expires_at) return `・**${label}**`;
-          return `・**${label}** — 残り **${daysLeft(purchase.expires_at)}日**（<t:${purchase.expires_at}:D> まで）`;
+          const head = `・**${label}** — 残り **${daysLeft(purchase.expires_at)}日**（<t:${purchase.expires_at}:D> まで）`;
+          // 延長ボタンが出ない契約に「延長してください」とだけ書くと、
+          // 押す場所が無いのに催促されているように読める
+          if (item && !services.shop.isExtendable(item)) return `${head}\n　↳ この契約の延長は現在、運営対応です`;
+          return head;
         })
       : ["契約中の商品はありません。"];
     // 自動更新を廃止したので「自動更新中／停止中」も「解約する」も出さない。
-    // 利用者がすることは「残りを見て、続けたければ延長を押す」だけにする
+    // 利用者がすることは「残りを見て、延長できるものは押す」だけにする
     const embed = new EmbedBuilder()
       .setTitle("📜 契約中の商品")
       .setColor(0xdb2777)
-      .setDescription([...lines, "", "-# 自動での再課金はありません。続ける場合だけ延長してください。"].join("\n"));
+      .setDescription(
+        [...lines, "", "-# 自動での再課金はありません。商館から延長できる契約は、下のボタンから延長できます。"].join("\n"),
+      );
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
     for (const purchase of terms.slice(0, 5)) {
       const item = services.shop.getItem(purchase.item_id);

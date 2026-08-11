@@ -349,8 +349,38 @@ describe("Botが権利を管理していない契約（旧オリジナルロー�
       embeds: { data: { description: string } }[];
       components: unknown[];
     };
-    expect(payload.embeds[0]!.data.description).toContain("残り **30日**");
+    const description = payload.embeds[0]!.data.description;
+    expect(description).toContain("残り **30日**");
+    // 押す場所が無いのに「延長してください」と催促しない
+    expect(description).toContain("この契約の延長は現在、運営対応です");
     expect(payload.components).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("延長できる契約と混在しても、行ごとに正しく案内する", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 1_000_000);
+    ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
+    const extendable = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const reply = vi.fn(async () => undefined);
+
+    await handleShopButton({ customId: "shop:contracts", user: { id: USER }, reply } as never, ctx.services);
+
+    const payload = (reply.mock.calls[0] as never[])[0] as {
+      embeds: { data: { description: string } }[];
+      components: { toJSON(): { components: { custom_id: string }[] } }[];
+    };
+    const lines = payload.embeds[0]!.data.description.split("\n");
+    const legacyLine = lines.findIndex((l) => l.includes("オリジナルロール継続"));
+    // 運営対応の注記は、旧#2の行の直後にだけ付く
+    expect(lines[legacyLine + 1]).toContain("運営対応です");
+    expect(lines.filter((l) => l.includes("運営対応です"))).toHaveLength(1);
+    // 延長ボタンは延長できる契約の分だけ
+    const ids = payload.components.flatMap((row) => row.toJSON().components).map((c) => c.custom_id);
+    expect(ids).toEqual([`shop:extend:${extendable.id}`]);
+    // 共通の案内文が延長不能契約と矛盾しない
+    expect(payload.embeds[0]!.data.description).toContain("商館から延長できる契約は、下のボタンから延長できます");
     ctx.db.close();
   });
 
