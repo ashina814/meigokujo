@@ -1,6 +1,5 @@
 import type { Client } from "discord.js";
 import { parseDeliverySnapshot } from "@meigokujo/core";
-import { deliverPurchase } from "./shop-delivery.js";
 import type { Services } from "./services.js";
 
 const AUTODROP_PENDING_KEY = "autodrop:pending_role_sync";
@@ -141,6 +140,10 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
     savePending(services, pending);
   }
 
+  // **静的importにしない。** `shop-delivery` の依存の先で `config.ts` が
+  // 環境変数を検証して `process.exit(1)` するため、このモジュールを読むだけで
+  // 落ちる環境（CIのユニットテスト）ができてしまう
+  const { deliverPurchase } = await import("./shop-delivery.js");
   const guildId = services.settings.getString("guild:main");
   if (!guildId) throw new Error("autodrop:guild_id_missing");
   const guild = await client.guilds.fetch(guildId).catch((error) => {
@@ -371,6 +374,10 @@ export async function convergePendingNicknameChanges(client: Client, services: S
     return snapshot?.delivery_kind === "set_nickname";
   });
   if (targets.length === 0) return;
+  // **静的importにしない。** `shop-delivery` の依存の先で `config.ts` が
+  // 環境変数を検証して `process.exit(1)` するため、このモジュールを読むだけで
+  // 落ちる環境（CIのユニットテスト）ができてしまう
+  const { deliverPurchase } = await import("./shop-delivery.js");
   const guildId = services.settings.getString("guild:main");
   const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
   for (const purchase of targets) {
@@ -439,7 +446,11 @@ export async function processShopRoleRevocations(client: Client, services: Servi
     backfillShopRoleRevocations(services);
     const pending = services.shop.pendingRoleRevocations();
     if (pending.length === 0) return;
-    const guildId = services.settings.getString("guild:main");
+    // **静的importにしない。** `shop-delivery` の依存の先で `config.ts` が
+  // 環境変数を検証して `process.exit(1)` するため、このモジュールを読むだけで
+  // 落ちる環境（CIのユニットテスト）ができてしまう
+  const { deliverPurchase } = await import("./shop-delivery.js");
+  const guildId = services.settings.getString("guild:main");
     if (!guildId) throw new Error("shop_role_revoke:guild_id_missing");
     const guild = await client.guilds.fetch(guildId).catch((error) => {
       throw new Error(`shop_role_revoke:guild_fetch_failed:${error instanceof Error ? error.message : String(error)}`);
