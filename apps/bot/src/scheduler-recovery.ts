@@ -341,11 +341,14 @@ export function backfillShopRoleRevocations(services: Pick<Services, "db">): voi
   })();
 }
 
-export function chargeMonthlySubscriptionsAtomically(
-  services: Pick<Services, "db" | "shop">,
-  actor: string,
-) {
-  return services.db.transaction(() => services.shop.chargeMonthlySubscriptions(actor))();
+/**
+ * 期限切れの失効を巡回する。**自動課金は行わない**（月額の一括請求は廃止した）。
+ *
+ * `Shop.expireOverdue` が1件ずつ確定させるので、ここは呼ぶだけにしておく。
+ * 外側でまとめてトランザクションを張ると、1件の失敗で全件が巻き戻る。
+ */
+export function expireOverduePurchases(services: Pick<Services, "shop">, actor: string) {
+  return services.shop.expireOverdue(actor);
 }
 
 function markRoleRevocationDoneOnce(services: Services, purchaseId: number, reason: string): void {

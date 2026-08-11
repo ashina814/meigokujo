@@ -222,6 +222,22 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   }
   if (action === "deliver" && arg) {
     const id = Number(arg);
+    // **再評価チャレンジはここで完了させない。** 買ったのは面談を受ける権利で、
+    // 消費するのは既存の再評価面談フローだけ。ここで配送済みにすると
+    // 未使用の権利が消え、面談前に 500,000 Ld が失われる（購入 #44 で起きた形）。
+    // 通知は出さなくなったが、**過去に流れた通知のボタンはまだ押せる**ので受け側で止める。
+    const purchase = services.shop.getPurchase(id);
+    const reevalItemId = Number(services.settings.getString("shop:reeval_item_id"));
+    if (purchase && Number.isInteger(reevalItemId) && purchase.item_id === reevalItemId) {
+      await interaction.reply({
+        content: [
+          `⚠️ 購入 #${id} は**再評価を受ける権利**です。ここでは完了にできません。`,
+          "面談の結果を記録すると権利が消費されます（再評価面談チケットの承認・見送り）。",
+        ].join("\n"),
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     services.shop.markDelivered(id, `user:${interaction.user.id}`);
     await interaction.reply({ content: `📦 購入 #${id} を配送済みにしました。`, flags: MessageFlags.Ephemeral });
     // 元メッセージのボタンを無効化

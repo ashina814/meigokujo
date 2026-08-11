@@ -325,7 +325,7 @@ describe("チケット24時間通知のスナップショット", () => {
   });
 });
 
-describe("ショップ月額ロール剥奪", () => {
+describe("ショップ 失効とロール剥奪", () => {
   function setupShop(roleId = "role_old") {
     const db = openDb(":memory:");
     const ledger = new Ledger(db);
@@ -352,8 +352,8 @@ describe("ショップ月額ロール剥奪", () => {
       "staff",
     );
     const purchase = shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
-    db.prepare("UPDATE shop_purchases SET expires_at=1, auto_renew=0 WHERE id=?").run(purchase.id);
-    shop.chargeMonthlySubscriptions("system:test");
+    db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(purchase.id);
+    shop.expireOverdue("system:test");
     return { db, events, shop, item, purchase };
   }
 
@@ -422,20 +422,29 @@ describe("ショップ月額ロール剥奪", () => {
     db.close();
   });
 
-  it("月額処理途中で例外が起きた場合は外側トランザクションでDB変更を戻す", async () => {
+  it("失効の確定は1件ずつ巻き戻る（1件の失敗が他の失効を巻き添えにしない）", async () => {
     const db = openDb(":memory:");
-    db.exec("CREATE TABLE scheduler_atomic_probe (id INTEGER PRIMARY KEY)");
-    const fakeShop = {
-      chargeMonthlySubscriptions: vi.fn(() => {
-        db.prepare("INSERT INTO scheduler_atomic_probe(id) VALUES (1)").run();
-        throw new Error("after expire queue failure");
-      }),
-    };
-    const { chargeMonthlySubscriptionsAtomically } = await import("../src/scheduler-recovery.js");
+    const ledger = new Ledger(db);
+    const events = new EventLog(db);
+    const shop = new Shop(db, ledger, events);
+    const item = shop.createItem(
+      { name: "月額", price_land: 100, kind: "monthly", delivery: "auto", delivery_kind: "add_role", delivery_data: JSON.stringify({ role_id: "r1" }) },
+      "staff",
+    );
+    for (const u of ["u1", "u2"]) {
+      ledger.ensureAccount(`user:${u}`, "user");
+      ledger.transfer({ from: TREASURY, to: `user:${u}`, amount: 1_000, type: "adjust", actor: "t", approvedBy: "t", idempotencyKey: `seed:${u}` });
+    }
+    const a = shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const b = shop.purchase({ itemId: item.id, userId: "u2", actor: "u2", memberRoleIds: [] }).purchase;
+    db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id IN (?,?)").run(a.id, b.id);
 
-    expect(() => chargeMonthlySubscriptionsAtomically({ db, shop: fakeShop } as any, "system:test")).toThrow("after expire queue failure");
-    const count = db.prepare("SELECT COUNT(*) AS c FROM scheduler_atomic_probe").get() as { c: number };
-    expect(count.c).toBe(0);
+    const { expireOverduePurchases } = await import("../src/scheduler-recovery.js");
+    const { expired, failed } = expireOverduePurchases({ shop } as never, "system:test");
+
+    expect(failed).toEqual([]);
+    expect(expired.map((p) => p.id).sort()).toEqual([a.id, b.id].sort());
+    expect(db.prepare("SELECT COUNT(*) AS c FROM shop_role_revocations WHERE status='pending'").get()).toEqual({ c: 2 });
     db.close();
   });
 });

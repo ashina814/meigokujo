@@ -35,17 +35,18 @@ function setup() {
   return { db, shop, createRoleItem };
 }
 
+/** 期限を過去にして、失効スイープの対象にする */
 function lapse(db: ReturnType<typeof openDb>, purchaseId: number) {
-  db.prepare("UPDATE shop_purchases SET expires_at=1, auto_renew=0 WHERE id=?").run(purchaseId);
+  db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(purchaseId);
 }
 
-describe("ショップ月額ロール剥奪キュー", () => {
+describe("ショップ 失効時のロール剥奪キュー", () => {
   it("失効購入Aの後に同じ商品を再購入Bした場合、有効購入が同じロールを保護する", () => {
     const { shop, createRoleItem, db } = setup();
     const item = createRoleItem("月額A", "role_old");
     const a = shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     lapse(db, a.id);
-    shop.chargeMonthlySubscriptions("system:test");
+    shop.expireOverdue("system:test");
     const b = shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
 
     expect(b.status).toBe("active");
@@ -58,7 +59,7 @@ describe("ショップ月額ロール剥奪キュー", () => {
     const bItem = createRoleItem("月額B", "role_shared");
     const a = shop.purchase({ itemId: aItem.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     lapse(db, a.id);
-    shop.chargeMonthlySubscriptions("system:test");
+    shop.expireOverdue("system:test");
     shop.purchase({ itemId: bItem.id, userId: "user1", actor: "user1", memberRoleIds: [] });
 
     expect(shop.activePurchaseGrantsRole("user1", "role_shared", a.id)).toBe(true);
@@ -69,7 +70,7 @@ describe("ショップ月額ロール剥奪キュー", () => {
     const item = createRoleItem("月額A", "role_old");
     const a = shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     lapse(db, a.id);
-    shop.chargeMonthlySubscriptions("system:test");
+    shop.expireOverdue("system:test");
 
     expect(shop.activePurchaseGrantsRole("user1", "role_old", a.id)).toBe(false);
   });
@@ -80,7 +81,7 @@ describe("ショップ月額ロール剥奪キュー", () => {
     const a = shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     shop.updateItem(item.id, { delivery_data: JSON.stringify({ role_id: "role_new" }) }, "staff");
     lapse(db, a.id);
-    shop.chargeMonthlySubscriptions("system:test");
+    shop.expireOverdue("system:test");
 
     expect(shop.pendingRoleRevocations()[0]?.role_id).toBe("role_old");
   });
@@ -93,7 +94,7 @@ describe("ショップ月額ロール剥奪キュー", () => {
     const pGood = shop.purchase({ itemId: good.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     lapse(db, pBad.id);
     lapse(db, pGood.id);
-    shop.chargeMonthlySubscriptions("system:test");
+    shop.expireOverdue("system:test");
 
     expect(shop.pendingRoleRevocations().map((r) => r.purchase_id)).toEqual([pGood.id]);
     const failed = db.prepare("SELECT * FROM shop_role_revocations WHERE purchase_id=?").get(pBad.id) as { status: string };

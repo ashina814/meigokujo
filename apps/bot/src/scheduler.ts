@@ -25,7 +25,7 @@ import {
   sendChunkedLinesResumable,
 } from "./scheduler-utils.js";
 import {
-  chargeMonthlySubscriptionsAtomically,
+  expireOverduePurchases,
   processShopRoleRevocations,
   recoverAutoDropNoEvalGhosts,
 } from "./scheduler-recovery.js";
@@ -341,25 +341,35 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     // 「試験データと確認できた建玉の初期化」は PR12 の正式開業初期化の仕事で、
     // ここで清算すると、正式資産だった場合の補償基準（時価）を自分で壊すことになる。
 
-    // ── 公式ショップの月額一括請求: 毎月1日 08:00 JST ──
-    if (now.day === 1 && now.hour === 8) {
-      const shopMarker = `shop:monthly:${now.period}`;
-      if (!services.settings.getString(shopMarker)) {
-        await runSchedulerTaskOnce(services, shopMarker, "system:scheduler", async () => {
-          const { charged, lapsed } = chargeMonthlySubscriptionsAtomically(services, "system:shop-monthly");
-          console.log(`[ショップ] 月額一括: 課金 ${charged.length}件 / 失効 ${lapsed.length}件`);
-          // 本人通知はbest effort。Discord上の権利剥奪は購入履歴から別タスクで再試行する。
-          for (const l of lapsed) {
-            const user = await client.users.fetch(l.purchase.user_id).catch(() => null);
-            await user
-              ?.send(`🛒 **${l.item.name}** の月額更新が失敗しました（${l.reason}）。当月末で権利が失効します。再購入は公式ショップから。`)
-              .catch(() => undefined);
-          }
-        }).catch((e) => console.error("[ショップ] 月額一括処理失敗:", e));
+    // ── 公式ショップ: 期限切れの失効（自動課金はしない）──
+    // 月額の一括再課金は廃止した。期限が来たら失効させ、権利を剥がすところまでを
+    // **課金と無関係に**毎分回す。以前は失効判定が月次請求の中にしか無かったので、
+    // 請求を止めると期限切れが来なくなる構造だった。
+    try {
+      const { expired, failed } = expireOverduePurchases(services, "system:shop-expiry");
+      if (failed.length > 0) {
+        // 失敗した件は次の巡回で再試行される（active のまま残っている）
+        console.error(`[ショップ] 失効に失敗 ${failed.length}件:`, failed.map((f) => `#${f.purchaseId} ${f.error}`).join(" / "));
       }
+      if (expired.length > 0) {
+        console.log(`[ショップ] 期限切れ ${expired.length}件を失効`);
+        // 黙って権利が消えないようにする（旧・月次処理にも本人通知があった）。
+        // 届かなくても失効自体は確定済みなので best effort でよい
+        for (const purchase of expired) {
+          const item = services.shop.getItem(purchase.item_id);
+          const user = await client.users.fetch(purchase.user_id).catch(() => null);
+          await user
+            ?.send(
+              `🛒 **${item?.name ?? `商品#${purchase.item_id}`}** の期限が切れました。自動での再課金は行いません。続ける場合は公式ショップから買い直してください。`,
+            )
+            .catch(() => undefined);
+        }
+      }
+    } catch (e) {
+      console.error("[ショップ] 失効スイープ失敗:", e);
     }
 
-    // 失効購入のロール剥奪は月次請求と分離し、購入ID単位で毎分自己修復する。
+    // 失効購入のロール剥奪は失効処理と分離し、購入ID単位で毎分自己修復する。
     await processShopRoleRevocations(client, services).catch((e) =>
       console.error("[ショップ] 失効ロール剥奪失敗:", e),
     );
