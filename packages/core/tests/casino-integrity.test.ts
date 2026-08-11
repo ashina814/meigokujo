@@ -442,7 +442,7 @@ describe("検算B: opening_v1のLand-chip厳密対応（PR8監査・ブロッカ
     ctx.db.close();
   });
 
-  it("group_key違い（同groupの無関係internal_transferには対応しない・ledger_tx_id自体は残す）", () => {
+  it("別groupへ付け替えた明細は、入れ子として許されない業務種別として止まる", () => {
     const ctx = formalCtx();
     fundUser(ctx, "alice", 5_000);
     const aliceTxId = lastLedgerTxId(ctx);
@@ -453,7 +453,9 @@ describe("検算B: opening_v1のLand-chip厳密対応（PR8監査・ブロッカ
 
     const b = ctx.integrity.checkB();
     expect(b.ok).toBe(false);
-    expect(b.mismatches.some((m) => m.note === "group_key_mismatch")).toBe(true);
+    // 操作キー（Land取引と1:1）はそのままなので、崩れるのは「どのグループの中で動いたか」。
+    // 預入グループは他人の預入を内包できないので、入れ子として認めない
+    expect(b.mismatches.some((m) => m.note === "group_kind_not_nestable:deposit")).toBe(true);
     ctx.db.close();
   });
 
@@ -786,11 +788,19 @@ describe("検算B: chip取引のactor/reason/group厳密照合（PR8監査・再
     ctx.db.close();
   });
 
-  it("group_keyを差し替えるとgroup_key_mismatch", () => {
+  it("group_keyを差し替えると、入れ子として許されない業務種別として止まる", () => {
     const { ctx, depositTxId, fundTxId } = withAllChipTx();
     const other = (ctx.db.prepare("SELECT group_key FROM casino_tx WHERE ledger_tx_id = ?").get(fundTxId) as { group_key: string }).group_key;
     ctx.db.prepare("UPDATE casino_tx SET group_key = ?, seq = 99 WHERE ledger_tx_id = ?").run(other, depositTxId);
-    expect(ctx.integrity.checkB().mismatches.map((m) => m.note)).toContain("group_key_mismatch");
+    // 付け替え先も預入グループなので、内側から資金を動かしてよい業務ではない
+    expect(ctx.integrity.checkB().mismatches.map((m) => m.note)).toContain("group_kind_not_nestable:deposit");
+    ctx.db.close();
+  });
+
+  it("操作キーを差し替えるとop_key_mismatch（Land取引との1:1が崩れる）", () => {
+    const { ctx, depositTxId } = withAllChipTx();
+    ctx.db.prepare("UPDATE casino_tx SET op_key = 'chip:deposit:alice:other' WHERE ledger_tx_id = ?").run(depositTxId);
+    expect(ctx.integrity.checkB().mismatches.map((m) => m.note)).toContain("op_key_mismatch");
     ctx.db.close();
   });
 

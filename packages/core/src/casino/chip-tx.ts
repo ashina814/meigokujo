@@ -151,6 +151,15 @@ interface ActiveGroup {
   depth: number;
   /** このグループで記録した明細数（seq の採番）。毎回 MAX(seq) を引かない */
   seq: number;
+  /**
+   * 入れ子の呼び出しを内側から順に積む。**いま動かしている操作が何か**を残すため。
+   *
+   * 内側の `runGroup` は外側へ合流するので、グループ行としては残らない。
+   * それでも「この明細はどの操作の冪等キーで動いたか」は監査に要る
+   * （Land取引の冪等キーと突き合わせる正本がここにしか無い）。合流を理由に
+   * 内側の身元を捨てると、正規の入れ子を検算が説明できなくなる。
+   */
+  frames: { groupKey: string; kind: string; actorId: string }[];
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -198,8 +207,8 @@ export class ChipTx {
       insertTx: db.prepare(
         `INSERT INTO casino_tx
            (group_key, seq, tx_kind, from_holder, to_holder, amount, reason, game, session_id, actor_id,
-            opening_version, land_amount, ledger_tx_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            opening_version, land_amount, ledger_tx_id, created_at, op_key, op_actor_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       getTx: db.prepare("SELECT * FROM casino_tx WHERE id = ?"),
     };
@@ -249,9 +258,11 @@ export class ChipTx {
     assertGroupKey(input);
     if (this.active) {
       this.active.depth++;
+      this.active.frames.push({ groupKey: input.groupKey, kind: input.kind, actorId: input.actorId });
       try {
         return this.assertSync(body(), input);
       } finally {
+        this.active.frames.pop();
         this.active.depth--;
       }
     }
@@ -271,7 +282,7 @@ export class ChipTx {
     const tx = this.db.transaction((): T => {
       const ts = now();
       this.stmt.insertGroup.run(input.groupKey, input.kind, input.actorId, ts);
-      this.active = { ...input, depth: 1, seq: 0 };
+      this.active = { ...input, depth: 1, seq: 0, frames: [{ ...input }] };
       try {
         const result = this.assertSync(body(), input);
         this.stmt.finishGroup.run(result === undefined ? null : JSON.stringify(result), now(), input.groupKey);
@@ -353,6 +364,7 @@ export class ChipTx {
     }
 
     const seq = ++group.seq;
+    const op = group.frames.at(-1) ?? { groupKey: group.groupKey, kind: group.kind, actorId: group.actorId };
     const info = this.stmt.insertTx.run(
         group.groupKey,
         seq,
@@ -368,6 +380,9 @@ export class ChipTx {
         move.txKind === "internal_transfer" ? null : (move.landAmount ?? 0),
         move.ledgerTxId ?? null,
         now(),
+        // いま動かしている操作（入れ子なら内側）の身元。Land取引の冪等キーと1:1で対応する
+        op.groupKey,
+        op.actorId,
       );
     return Number(info.lastInsertRowid);
   }

@@ -83,6 +83,25 @@ interface ChipPoolTxRule {
   actor: "user" | "approver" | "any";
 }
 
+/**
+ * 内側から預入・返還を起こしてよい業務グループの種別。
+ *
+ * **call-site 監査の結果をそのまま写したもの**（2026-08-11）。ここに無い種別の中で
+ * Land が動いていたら、設計外の経路なので検算Bで止める。
+ * - `shop` … 賭場商店の購入で不足分を自動預入（`shop:buy:*`）
+ * - `table_hold` … ランク卓の着席で不足分を自動預入（`ranked:join:*`）
+ * - `remittance` … 月次納付。胴元チップを精算してLandへ戻す
+ * - `bailout` … 補填。Landを胴元チップへ replenish する
+ *
+ * 新しい入れ子を作るときは、ここへ足すことが設計判断の記録になる。
+ */
+const NESTED_CHIP_GROUP_KINDS = new Set(["shop", "table_hold", "remittance", "bailout"]);
+
+/** `user:123` と `123` を同じ人として比べる（グループの actor 表記が経路で揺れている） */
+function principalOf(actor: string): string {
+  return actor.startsWith("user:") ? actor.slice("user:".length) : actor;
+}
+
 const CHIP_POOL_TX_RULES: Record<string, ChipPoolTxRule> = {
   chip_deposit: {
     direction: "in", counterparty: "user", reason: "賭場チップ預入",
@@ -126,6 +145,10 @@ interface PoolTxRow {
 
 interface ChipTxDetailRow {
   group_key: string;
+  /** この明細を動かした操作の冪等キー（入れ子なら内側）。Land取引の冪等キーと1:1 */
+  op_key: string | null;
+  /** その操作の実行者。入れ子では外側グループの actor と異なりうる */
+  op_actor_id: string | null;
   tx_kind: string;
   from_holder: string | null;
   to_holder: string | null;
@@ -382,29 +405,64 @@ export class CasinoIntegrity {
 
     const details = this.db
       .prepare(
-        `SELECT group_key, tx_kind, from_holder, to_holder, amount, land_amount, ledger_tx_id, opening_version, actor_id
+        `SELECT group_key, tx_kind, from_holder, to_holder, amount, land_amount, ledger_tx_id, opening_version,
+                actor_id, op_key, op_actor_id
            FROM casino_tx WHERE ledger_tx_id = ?`,
       )
       .all(row.id) as ChipTxDetailRow[];
     if (details.length === 0) return "no_matching_chip_tx";
     if (details.length > 1) return "multiple_matching_chip_tx";
     const detail = details[0]!;
-    if (detail.group_key !== row.idempotency_key) return "group_key_mismatch";
+    // 操作キーが正本。入れ子で動いた明細は外側グループへ合流するので group_key では特定できない
+    if (!detail.op_key) return "missing_op_key";
+    if (detail.op_key !== row.idempotency_key) return "op_key_mismatch";
+    const sameOpKey = this.db
+      .prepare("SELECT COUNT(*) AS c FROM casino_tx WHERE op_key = ? AND ledger_tx_id IS NOT NULL")
+      .get(detail.op_key) as { c: number };
+    if (sameOpKey.c !== 1) return "op_key_not_unique";
     if (detail.opening_version !== version) return "chip_tx_version_mismatch";
     if (detail.tx_kind !== rule.chipTxKind) return "tx_kind_mismatch";
     if (detail.land_amount !== row.amount) return "land_amount_mismatch";
     if (detail.amount !== row.amount) return "chip_amount_mismatch";
-    if (detail.actor_id !== row.actor_id) return "chip_tx_actor_mismatch";
+    if ((detail.op_actor_id ?? detail.actor_id) !== row.actor_id) return "chip_tx_actor_mismatch";
     const holder = rule.holderSide === "to" ? detail.to_holder : detail.from_holder;
     if (holder !== row.ref_id) return "holder_mismatch";
 
+    return this.classifyChipGroup(row, detail, rule);
+  }
+
+  /**
+   * この明細が属するグループを検める。
+   *
+   * **単独の操作**（`op_key === group_key`）は従来どおり厳密に見る。
+   * **入れ子**（正規の業務操作の中で自動預入・精算が動いた場合）は、外側グループの
+   * 種別まで deposit/redeem を求めると必ず落ちる。入れ子を許すのは
+   * 「そこから資金移動を起こしてよい」と設計上決めた業務種別だけに限り、
+   * 誰の資金かは `op_actor_id` と holder で押さえる。
+   */
+  private classifyChipGroup(row: PoolTxRow, detail: ChipTxDetailRow, rule: ChipPoolTxRule): string | null {
     const group = this.db
       .prepare("SELECT group_key, kind, actor_id, status FROM casino_tx_groups WHERE group_key = ?")
-      .get(row.idempotency_key) as ChipGroupAuditRow | undefined;
+      .get(detail.group_key) as ChipGroupAuditRow | undefined;
     if (!group) return "no_chip_group";
     if (group.status !== "settled") return `group_not_settled:${group.status}`;
-    if (group.kind !== rule.groupKind) return "group_kind_mismatch";
-    if (group.actor_id !== row.actor_id) return "group_actor_mismatch";
+
+    const nested = detail.op_key !== detail.group_key;
+    if (nested) {
+      if (!NESTED_CHIP_GROUP_KINDS.has(group.kind)) return `group_kind_not_nestable:${group.kind}`;
+      // 利用者の資金は、その利用者の業務操作の中でしか動かせない
+      // （`user:` の有無は呼び出し側で揺れているため、principal を揃えて比べる）
+      if (rule.actor === "user" && principalOf(group.actor_id) !== principalOf(row.actor_id)) {
+        return "group_actor_mismatch";
+      }
+    } else {
+      if (group.kind !== rule.groupKind) return "group_kind_mismatch";
+      if (group.actor_id !== row.actor_id) return "group_actor_mismatch";
+    }
+
+    // 明細の actor は必ず所属グループの actor（`record()` がそう書く）。
+    // ここが崩れているなら、明細かグループのどちらかが後から書き換えられている
+    if (detail.actor_id !== group.actor_id) return "chip_tx_actor_mismatch";
     return null;
   }
 

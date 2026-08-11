@@ -503,6 +503,11 @@ CREATE TABLE IF NOT EXISTS casino_tx (
   land_amount  INTEGER,                              -- 預入・返還で動いたLand（内部移動はNULL）
   ledger_tx_id INTEGER REFERENCES transactions(id),
   created_at   INTEGER NOT NULL,
+  -- いま動かしている操作そのものの冪等キーと実行者（入れ子なら内側）。
+  -- 内側の runGroup は外側グループへ合流するので group_key では操作を特定できない。
+  -- Land取引の冪等キーと 1:1 で突き合わせる正本はこちら。
+  op_key       TEXT,
+  op_actor_id  TEXT,
   -- 内部移動は両側必須でLandを動かさない。預入は発行、返還は消却。
   -- 預入・返還は動いたLand額を必ず持ち、1 Ldでも動いたなら対応するLand取引IDも必須。
   -- （端数で0 Ldになる返還は現行仕様として存在するため、land_amount = 0 のときだけID無しを許す）
@@ -724,6 +729,13 @@ export function openDb(path: string): Database.Database {
   // マイグレーション: 旧カジノの chip_balances は ether_balances に置き換え（旧カジノは開帳前に廃止＝データ無し）
   db.exec("DROP TABLE IF EXISTS chip_balances");
   db.exec(DDL);
+  ensureColumn(db, "casino_tx", "op_key", "TEXT");
+  ensureColumn(db, "casino_tx", "op_actor_id", "TEXT");
+  backfillChipTxOperationKey(db);
+  // Land を動かした明細は、操作キーで一意。同じ操作キーで二重に動かせない
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_casino_tx_op_key ON casino_tx(op_key) WHERE ledger_tx_id IS NOT NULL",
+  );
   ensureColumn(db, "casino_chip_opening_versions", "pool_land", "INTEGER");
   ensureColumn(db, "casino_chip_opening_versions", "from_ledger_tx_id", "INTEGER");
   ensureColumn(db, "vc_segments", "parent_id", "TEXT");
@@ -1003,6 +1015,56 @@ function migrateSoulStatusCheck(db: Database.Database): void {
   } finally {
     if (foreignKeysWereOn) db.pragma("foreign_keys = ON");
   }
+}
+
+/**
+ * 既存の `casino_tx` へ「操作の冪等キー」を埋める。
+ *
+ * Land が動いた明細は `ledger_tx_id` で Land 取引と 1:1 に結ばれており、その取引の
+ * 冪等キーこそが**その明細を動かした操作のキー**（入れ子でも外側へ合流するため
+ * `group_key` では特定できない）。Land が動かない内部移動は操作＝グループなので
+ * `group_key` を入れる。
+ *
+ * **この埋め戻しの弱点は明示しておく。** 過去行については「Land取引のキー」を
+ * そのまま写すので、`op_key` と Land 側キーの一致検査は過去行に対しては
+ * 実質的な検査にならない（他の突き合わせ—金額・holder・actor・種別・版・
+ * グループ確定—はそのまま効く）。以後に記録される行は `ChipTx.record()` が
+ * Land 取引とは独立に書くため、一致検査が本来の意味を持つ。
+ * 何件をどちらの根拠で埋めたかは監査記録として残す。
+ */
+function backfillChipTxOperationKey(db: Database.Database): void {
+  const pending = db.prepare("SELECT COUNT(*) AS n FROM casino_tx WHERE op_key IS NULL").get() as { n: number };
+  if (pending.n === 0) return;
+
+  const nested = db
+    .prepare(
+      `SELECT c.id, c.group_key, t.idempotency_key
+         FROM casino_tx c JOIN transactions t ON t.id = c.ledger_tx_id
+        WHERE c.op_key IS NULL AND t.idempotency_key <> c.group_key`,
+    )
+    .all() as Array<{ id: number; group_key: string; idempotency_key: string }>;
+
+  const fromLedger = db.prepare(
+    `UPDATE casino_tx
+        SET op_key = (SELECT t.idempotency_key FROM transactions t WHERE t.id = casino_tx.ledger_tx_id),
+            op_actor_id = actor_id
+      WHERE op_key IS NULL AND ledger_tx_id IS NOT NULL`,
+  ).run().changes;
+  const fromGroup = db.prepare(
+    "UPDATE casino_tx SET op_key = group_key, op_actor_id = actor_id WHERE op_key IS NULL",
+  ).run().changes;
+
+  db.prepare("INSERT INTO outbox (kind, payload, created_at) VALUES ('audit_log', ?, ?)").run(
+    JSON.stringify({
+      event: "casino_tx_op_key_backfilled",
+      fromLedger,
+      fromGroup,
+      // 入れ子で動いていた明細（＝旧検算が group_key_mismatch と呼んでいたもの）
+      nested: nested.map((r) => ({ id: r.id, groupKey: r.group_key, opKey: r.idempotency_key })),
+      actor: "system:migration",
+    }),
+    Math.floor(Date.now() / 1000),
+  );
 }
 
 function ensureColumn(db: Database.Database, table: string, column: string, definition: string): void {
