@@ -47,7 +47,7 @@ export function shopPanelMessage(services: Services): MessageCreateOptions {
     .setDescription(
       [
         "冥界商館が扱う公式商品です。**支払いは Land を焼却**します（通貨は循環から消えます）。",
-        "月額購入は **毎月1日に自動再課金**、当月末までは有効。",
+        "期限付きの商品が切れても**自動で再課金しません**。続ける場合はご自身で買い直してください。",
         "",
         `**${items.length}件** の商品`,
       ].join("\n"),
@@ -328,24 +328,18 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
           const item = services.shop.getItem(purchase.item_id);
           const label = item?.name ?? `#${purchase.item_id}`;
           const exp = purchase.expires_at ? `<t:${purchase.expires_at}:D>` : "—";
-          const renew = purchase.auto_renew ? "🔁 自動更新" : "❌ 更新停止";
-          return `・**${label}**（有効期限 ${exp}・${renew}）`;
+          return `・**${label}**（有効期限 ${exp}）`;
         })
       : ["契約中の商品はありません。"];
-    const embed = new EmbedBuilder().setTitle("📜 契約中の商品").setColor(0xdb2777).setDescription(lines.join("\n"));
-    const monthlyRows = rows.filter((purchase) => purchase.auto_renew);
-    const components: ActionRowBuilder<StringSelectMenuBuilder>[] = [];
-    if (monthlyRows.length > 0) {
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId("shop:cancel")
-        .setPlaceholder("解約する契約を選ぶ")
-        .addOptions(monthlyRows.slice(0, 25).map((purchase) => {
-          const item = services.shop.getItem(purchase.item_id);
-          return { label: (item?.name ?? `#${purchase.item_id}`).slice(0, 100), value: String(purchase.id) };
-        }));
-      components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu));
-    }
-    await interaction.reply({ embeds: [embed], components, flags: MessageFlags.Ephemeral });
+    // 自動更新を廃止したので「自動更新中／停止中」も「解約する」も出さない。
+    // 放っておけば期限で終わるだけで、利用者が止める操作は存在しない
+    const embed = new EmbedBuilder()
+      .setTitle("📜 契約中の商品")
+      .setColor(0xdb2777)
+      .setDescription(
+        [...lines, "", "-# 期限が切れても自動では再課金しません。続ける場合は商館から買い直してください。"].join("\n"),
+      );
+    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -506,15 +500,6 @@ export async function handleShopSelect(
     const view = itemDetail(item, hasRole, balance, requirementLabel(services.settings, item.require_role_id));
     await interaction.reply({ ...view, flags: MessageFlags.Ephemeral });
     return;
-  }
-  if (action === "cancel") {
-    const purchaseId = Number(interaction.values[0]);
-    services.shop.cancelSubscription(purchaseId, `user:${interaction.user.id}`);
-    await interaction.update({
-      content: "🛑 解約しました（次月から自動更新しません。当月末までは有効）。",
-      embeds: [],
-      components: [],
-    });
   }
 }
 

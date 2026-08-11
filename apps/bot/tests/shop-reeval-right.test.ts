@@ -181,3 +181,39 @@ describe("汎用の配送完了操作", () => {
     ctx.db.close();
   });
 });
+
+describe("自動更新を廃止した後の利用者表示", () => {
+  it("ショップ本文に自動再課金の案内が無い", async () => {
+    const { shopPanelMessage } = await shopPanelModule;
+    const ctx = setup();
+
+    const text = JSON.stringify(shopPanelMessage(ctx.services));
+
+    expect(text).not.toContain("毎月1日");
+    expect(text).not.toContain("自動再課金");
+    expect(text).toContain("自動で再課金しません");
+    ctx.db.close();
+  });
+
+  it("契約中に自動更新・解約が出ない（存在しない操作を見せない）", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 1_000_000);
+    ctx.shop.purchase({ itemId: ctx.nickname.id, userId: USER, actor: USER, memberRoleIds: [] });
+    const reply = vi.fn(async () => undefined);
+
+    await handleShopButton(
+      { customId: "shop:contracts", user: { id: USER }, reply } as never,
+      ctx.services,
+    );
+
+    const payload = (reply.mock.calls[0] as never[])[0] as { embeds: { data: { description: string } }[]; components?: unknown[] };
+    const description = payload.embeds[0]!.data.description;
+    expect(description).not.toContain("自動更新");
+    expect(description).not.toContain("更新停止");
+    expect(description).toContain("自動では再課金しません");
+    // 解約の選択メニューそのものを出さない
+    expect(payload.components ?? []).toEqual([]);
+    ctx.db.close();
+  });
+});

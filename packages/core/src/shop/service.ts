@@ -4,7 +4,7 @@ import { EventLog } from "../events/service.js";
 
 /**
  * 公式ショップ（冥界商館）。
- * Land支払いは焼却（tip_burn 型で TREASURY へ）。月額は毎月1日一括で自動再課金。
+ * Land支払いは焼却（tip_burn 型で TREASURY へ）。**自動再課金はしない**（期限が来たら失効）。
  * 商品ごとに階級ロール制限・在庫・自動/手動配送を持たせられる。
  */
 
@@ -157,7 +157,7 @@ export class ShopError extends Error {
 const now = () => Math.floor(Date.now() / 1000);
 const DAY = 86_400;
 
-/** 「翌月1日 00:00 JST」の unix秒（毎月1日一括請求で有効期限を切る用） */
+/** 「翌月1日 00:00 JST」の unix秒（暦月期限の名残。30日制への移行で不要になる） */
 export function nextFirstOfMonthJst(fromUnixSec: number = now()): number {
   const d = new Date((fromUnixSec + 9 * 3600) * 1000); // JSTに寄せる
   const y = d.getUTCFullYear();
@@ -325,7 +325,7 @@ export class Shop {
    * 商品を購入する。
    * - 権限（require_role_id）は bot 側で事前チェック（このメソッドには memberRoleIds を渡す）
    * - Land支払いは tip_burn で TREASURY 焼却（インフレ抑制）
-   * - 月額は expires_at を当月末に、one_shot で duration_days ありなら期限付きに
+   * - 月額は expires_at を当月末に（30日制へ移行するまでの暫定）、one_shot で duration_days ありなら期限付きに
    * - 同一 item の月額でアクティブがあれば ERR_ALREADY_ACTIVE
    */
   purchase(input: {
@@ -434,13 +434,6 @@ export class Shop {
     return (this.db.prepare("SELECT COUNT(*) AS c FROM shop_purchases").get() as { c: number }).c;
   }
 
-  /** 月額購読の解約（次月から自動更新しない・当月末までは有効） */
-  cancelSubscription(purchaseId: number, actor: string): void {
-    this.db
-      .prepare("UPDATE shop_purchases SET auto_renew = 0 WHERE id = ? AND status = 'active'")
-      .run(purchaseId);
-    this.events.log("shop_cancelled", { actor, payload: { purchaseId } });
-  }
 
   /** 手動配送の完了マーク */
   markDelivered(purchaseId: number, actor: string): void {
@@ -604,7 +597,7 @@ export class Shop {
    * 1件ずつトランザクションで確定させる。status の更新と剥奪キューへの登録は
    * 必ず一緒に成立させ、途中で失敗した1件が他の件を巻き添えにしないため。
    */
-  expireOverdue(actor: string, limit = 200): PurchaseRow[] {
+  expireOverdue(actor: string, limit = 200): { expired: PurchaseRow[]; failed: Array<{ purchaseId: number; error: string }> } {
     const ts = now();
     const due = this.db
       .prepare(
@@ -615,15 +608,25 @@ export class Shop {
       )
       .all(ts, limit) as Array<{ id: number }>;
     const expired: PurchaseRow[] = [];
+    const failed: Array<{ purchaseId: number; error: string }> = [];
     for (const row of due) {
-      const one = this.db.transaction(() => {
-        this.expire(row.id, actor);
-        return this.getPurchase(row.id);
-      });
-      const purchase = this.db.inTransaction ? one() : one.immediate();
-      if (purchase) expired.push(purchase);
+      try {
+        const one = this.db.transaction(() => {
+          this.expire(row.id, actor);
+          return this.getPurchase(row.id);
+        });
+        const purchase = this.db.inTransaction ? one() : one.immediate();
+        if (purchase) expired.push(purchase);
+      } catch (error) {
+        // **1件の失敗で巡回を止めない。** 止めると、失敗した1件より後ろに並んでいる
+        // 期限切れが永久に処理されない（status='active' のままなので次回も先頭に来る）。
+        // その件は記録だけ残し、次の巡回で再試行する
+        const message = error instanceof Error ? error.message : String(error);
+        failed.push({ purchaseId: row.id, error: message });
+        this.events.log("shop_expire_failed", { actor, payload: { purchaseId: row.id, error: message.slice(0, 500) } });
+      }
     }
-    return expired;
+    return { expired, failed };
   }
 
   private expire(purchaseId: number, actor: string): void {

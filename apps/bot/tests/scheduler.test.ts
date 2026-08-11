@@ -440,8 +440,9 @@ describe("ショップ 失効とロール剥奪", () => {
     db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id IN (?,?)").run(a.id, b.id);
 
     const { expireOverduePurchases } = await import("../src/scheduler-recovery.js");
-    const expired = expireOverduePurchases({ shop } as never, "system:test");
+    const { expired, failed } = expireOverduePurchases({ shop } as never, "system:test");
 
+    expect(failed).toEqual([]);
     expect(expired.map((p) => p.id).sort()).toEqual([a.id, b.id].sort());
     expect(db.prepare("SELECT COUNT(*) AS c FROM shop_role_revocations WHERE status='pending'").get()).toEqual({ c: 2 });
     db.close();

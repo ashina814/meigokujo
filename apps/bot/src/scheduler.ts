@@ -375,7 +375,11 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     // **課金と無関係に**毎分回す。以前は失効判定が月次請求の中にしか無かったので、
     // 請求を止めると期限切れが来なくなる構造だった。
     try {
-      const expired = expireOverduePurchases(services, "system:shop-expiry");
+      const { expired, failed } = expireOverduePurchases(services, "system:shop-expiry");
+      if (failed.length > 0) {
+        // 失敗した件は次の巡回で再試行される（active のまま残っている）
+        console.error(`[ショップ] 失効に失敗 ${failed.length}件:`, failed.map((f) => `#${f.purchaseId} ${f.error}`).join(" / "));
+      }
       if (expired.length > 0) {
         console.log(`[ショップ] 期限切れ ${expired.length}件を失効`);
         // 黙って権利が消えないようにする（旧・月次処理にも本人通知があった）。
@@ -385,7 +389,7 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
           const user = await client.users.fetch(purchase.user_id).catch(() => null);
           await user
             ?.send(
-              `🛒 **${item?.name ?? `商品#${purchase.item_id}`}** の期限が切れました。自動での再課金は行いません。続ける場合は公式ショップから延長してください。`,
+              `🛒 **${item?.name ?? `商品#${purchase.item_id}`}** の期限が切れました。自動での再課金は行いません。続ける場合は公式ショップから買い直してください。`,
             )
             .catch(() => undefined);
         }
