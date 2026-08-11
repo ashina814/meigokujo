@@ -1,5 +1,5 @@
 import type { Guild } from "discord.js";
-import type { PurchaseRow, ShopItemRow } from "@meigokujo/core";
+import { AUTO_DELIVERABLE_KINDS, parseDeliverySnapshot, type PurchaseRow } from "@meigokujo/core";
 import { refreshEvalStatsForUser } from "./eval-daily.js";
 import type { Services } from "./services.js";
 
@@ -31,29 +31,17 @@ export interface DeliveryOutcome {
   error?: string;
 }
 
-/** 購入に記録された配送内容。商品の現在値ではなく**売った時点のスナップショット**を使う */
-function deliveryOf(purchase: PurchaseRow, item: ShopItemRow): { kind: string | null; data: { role_id?: string; days?: number } } {
-  const raw = purchase.delivery_snapshot_json;
-  if (raw) {
-    try {
-      const snapshot = JSON.parse(raw) as { delivery_kind?: string; delivery_data?: string | null };
-      const data = snapshot.delivery_data ? (JSON.parse(snapshot.delivery_data) as { role_id?: string; days?: number }) : {};
-      return { kind: snapshot.delivery_kind ?? null, data };
-    } catch {
-      /* 壊れていたら商品定義へフォールバック */
-    }
-  }
-  return {
-    kind: item.delivery_kind,
-    data: item.delivery_data ? (JSON.parse(item.delivery_data) as { role_id?: string; days?: number }) : {},
-  };
-}
-
+/**
+ * 購入に記録された配送内容。**商品の現在定義へフォールバックしない。**
+ *
+ * 再配送は「その購入で何を売ったか」だけを再実行する約束なので、スナップショットが
+ * 無い・壊れている・知らない種別なら何もしない（legacy unknown）。ここでフォールバックすると、
+ * 商品定義を後から変えただけで過去の購入の配送内容が変わってしまう。
+ */
 export async function deliverPurchase(
   services: Services,
   guild: Guild | null,
   purchase: PurchaseRow,
-  item: ShopItemRow,
   actor: string,
 ): Promise<DeliveryOutcome> {
   const begin = services.shop.beginDelivery(purchase.id);
@@ -67,7 +55,24 @@ export async function deliverPurchase(
     return { state: "failed", message: userMessage, error: reason };
   };
 
-  const { kind, data } = deliveryOf(purchase, item);
+  const snapshot = parseDeliverySnapshot(purchase.delivery_snapshot_json);
+  if (!snapshot) {
+    // 購入時の配送内容が読めない。商品の現在設定で代用せず、何もせず failed にする
+    return fail(
+      purchase.delivery_snapshot_json ? "snapshot_unreadable" : "snapshot_missing",
+      "この購入には配送内容の記録がないため自動配送できません。運営にお問い合わせください。",
+    );
+  }
+  if (!AUTO_DELIVERABLE_KINDS.has(snapshot.delivery_kind)) {
+    // 撤回された配送種別（再評価チャレンジの revoke_meirei）。
+    // 面談を経ずに status とロールを動かさない。過去の購入も自動では実行しない
+    return fail(
+      `auto_delivery_withdrawn:${snapshot.delivery_kind}`,
+      "この商品は自動での適用を行いません。**再評価面談チケット**を開いてください。",
+    );
+  }
+  const kind = snapshot.delivery_kind;
+  const data = snapshot.delivery_data as { role_id?: string; days?: number };
   const userId = purchase.user_id;
 
   try {
@@ -103,10 +108,6 @@ export async function deliverPurchase(
       return { state: "delivered", message: `評価期限を **+${days}日** 延長しました。` };
     }
 
-    if (kind === "revoke_meirei") {
-      return await deliverRevokeMeirei(services, guild, purchase, actor, fail);
-    }
-
     return fail(`unsupported_delivery_kind:${kind ?? "null"}`, "自動配送は未対応の種類です。運営にお問い合わせください。");
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);
@@ -115,65 +116,10 @@ export async function deliverPurchase(
 }
 
 /**
- * 再評価チャレンジ（迷霊 → 案内待ち）。
- *
- * DB と Discord ロールの**片方だけ済んでいる状態から再開できる**必要がある。
- * 実際に「DBはwaitingに戻ったが迷霊ロールが残ったまま」が本番で発生している。
- *
- * - DB=meirei … `resetToWaiting()` してからロール修復へ進む
- * - DB=waiting … 既にreset済み。**再resetせず**ロール修復だけ続行する
- * - それ以外 … 触らない（亡霊や魔人へ勝手に効かせない）
- *
- * ロールが既に正しければ何もせず成功（冪等）。
- */
-async function deliverRevokeMeirei(
-  services: Services,
-  guild: Guild | null,
-  purchase: PurchaseRow,
-  actor: string,
-  fail: (reason: string, userMessage: string) => DeliveryOutcome,
-): Promise<DeliveryOutcome> {
-  const userId = purchase.user_id;
-  const soul = services.entry.getSoul(userId);
-  if (!soul) return fail("no_soul_row", "魂の記録がないため適用できませんでした。運営にお問い合わせください。");
-
-  if (soul.status === "meirei") {
-    services.entry.resetToWaiting(userId, actor);
-  } else if (soul.status !== "waiting") {
-    // 亡霊・魔人などへ再評価チャレンジを効かせない
-    return fail(`unexpected_status:${soul.status}`, `現在の状態（${soul.status}）では適用できませんでした。運営にお問い合わせください。`);
-  }
-
-  // ここから先はロール修復。DBが既に waiting でも、ロールが残っていれば直す
-  if (!guild) return fail("guild_unavailable", "サーバー情報が取れずロールを直せませんでした。運営にお問い合わせください。");
-  const member = await guild.members.fetch(userId).catch(() => null);
-  if (!member) return fail("member_fetch_failed", "メンバー情報の取得に失敗しロールを直せませんでした。運営にお問い合わせください。");
-
-  const meireiRoleId = services.settings.getString("role:meirei");
-  const waitRoleId = services.settings.getString("role:queue_wait");
-
-  if (meireiRoleId && member.roles.cache.has(meireiRoleId)) {
-    const removed = await member.roles.remove(meireiRoleId).then(() => true).catch((e: Error) => e.message);
-    if (removed !== true) {
-      return fail(`meirei_role_remove_failed:${removed}`, "迷霊ロールの解除に失敗しました。運営にお問い合わせください（再配送で復旧できます）。");
-    }
-  }
-  if (waitRoleId && !member.roles.cache.has(waitRoleId)) {
-    const added = await member.roles.add(waitRoleId).then(() => true).catch((e: Error) => e.message);
-    if (added !== true) {
-      return fail(`queue_wait_role_add_failed:${added}`, "案内待ちロールの付与に失敗しました。運営にお問い合わせください（再配送で復旧できます）。");
-    }
-  }
-
-  services.shop.markDeliverySucceeded(purchase.id, actor);
-  return { state: "delivered", message: "迷霊から案内待ちに戻しました（再評価チャレンジ発動）。" };
-}
-
-/**
  * 運営の回収導線: purchase ID を指定して再配送する。
  *
  * **任意の商品効果を撃てる汎用口にはしない。** 対象は
- * 「実在する購入」「status=active」「自動配送の商品」「配送が未完了」に限り、
+ * 「実在する購入」「status=active」「購入時に自動配送として売られた記録がある」に限り、
  * 実行する内容もその購入に記録された配送スナップショットだけ。
  */
 export async function redeliverPurchase(
@@ -187,15 +133,33 @@ export async function redeliverPurchase(
   if (purchase.status !== "active") {
     return { state: "failed", message: `この購入は ${purchase.status} のため再配送できません。`, error: "purchase_not_active" };
   }
-  const item = services.shop.getItem(purchase.item_id);
-  if (!item) return { state: "failed", message: "商品定義が見つかりません。", error: "item_not_found" };
-  if (item.delivery !== "auto") {
-    return { state: "failed", message: "手動配送の商品は再配送の対象外です。", error: "not_auto_delivery" };
+  // 可否は**購入時スナップショット**で決める。商品の現在設定を根拠にすると、
+  // 買った後に商品を自動配送へ変えただけで過去の購入が再配送できてしまう
+  const snapshot = parseDeliverySnapshot(purchase.delivery_snapshot_json);
+  if (!snapshot) {
+    return {
+      state: "failed",
+      message: "この購入には自動配送の記録がありません（手動配送・または記録以前の購入）。再配送の対象外です。",
+      error: purchase.delivery_snapshot_json ? "snapshot_unreadable" : "snapshot_missing",
+    };
+  }
+  if (!AUTO_DELIVERABLE_KINDS.has(snapshot.delivery_kind)) {
+    return {
+      state: "failed",
+      message: "この配送種別は自動実行を取りやめています（再評価チャレンジは面談を経て復帰します）。再配送できません。",
+      error: `auto_delivery_withdrawn:${snapshot.delivery_kind}`,
+    };
   }
   services.events.log("shop_redelivery_requested", {
     actor,
     target: purchase.user_id,
-    payload: { purchaseId, itemId: item.id, previousState: purchase.delivery_state, attempts: purchase.delivery_attempts },
+    payload: {
+      purchaseId,
+      itemId: purchase.item_id,
+      deliveryKind: snapshot.delivery_kind,
+      previousState: purchase.delivery_state,
+      attempts: purchase.delivery_attempts,
+    },
   });
-  return deliverPurchase(services, guild, purchase, item, actor);
+  return deliverPurchase(services, guild, purchase, actor);
 }

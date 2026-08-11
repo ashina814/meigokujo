@@ -202,7 +202,7 @@ async function finishPurchase(
   if (item.delivery === "auto") {
     // **replayed でも配送を試す。** 課金は冪等（operation IDで一度きり）だが、
     // 配送は成功するまで再試行してよい。二度配らないのは配送状態が保証する。
-    const outcome = await deliverPurchase(services, interaction.guild, purchase, item, `user:${interaction.user.id}`);
+    const outcome = await deliverPurchase(services, interaction.guild, purchase, `user:${interaction.user.id}`);
     deliveryNote = outcome.message;
     delivered = outcome.state !== "failed";
   } else if (result.replayed) {

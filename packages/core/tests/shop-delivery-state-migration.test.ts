@@ -37,18 +37,22 @@ function seeded(): string {
   const manualId = Number(item.run("手動商品", 100, "one_shot", "manual", null).lastInsertRowid);
   const revokeId = Number(item.run("再評価チャレンジ", 100, "one_shot", "auto", "revoke_meirei").lastInsertRowid);
   const buy = db.prepare(
-    "INSERT INTO shop_purchases (item_id,user_id,purchased_at,paid_land,status,delivered_at) VALUES (?,?,?,?,?,?)",
+    "INSERT INTO shop_purchases (item_id,user_id,purchased_at,paid_land,status,delivered_at,delivery_snapshot_json) VALUES (?,?,?,?,?,?,?)",
   );
-  buy.run(autoId, "auto_undelivered", 100, 100, "active", null);
-  buy.run(autoId, "auto_delivered", 100, 100, "active", 200);
-  buy.run(manualId, "manual_undelivered", 100, 100, "active", null);
-  buy.run(manualId, "manual_delivered", 100, 100, "active", 200);
+  const snap = (kind: string) => JSON.stringify({ delivery: "auto", delivery_kind: kind, delivery_data: null, captured_at: 1 });
+  buy.run(autoId, "auto_undelivered", 100, 100, "active", null, snap("add_role"));
+  buy.run(autoId, "auto_delivered", 100, 100, "active", 200, snap("add_role"));
+  buy.run(manualId, "manual_undelivered", 100, 100, "active", null, null);
+  buy.run(manualId, "manual_delivered", 100, 100, "active", 200, null);
   // 再評価チャレンジ: 本人が waiting（＝DBのresetは済んでいる）と、meirei に戻っている場合
-  buy.run(revokeId, "revoke_now_waiting", 100, 100, "active", null);
-  buy.run(revokeId, "revoke_now_meirei", 100, 100, "active", null);
+  buy.run(revokeId, "revoke_now_waiting", 100, 100, "active", null, snap("revoke_meirei"));
+  buy.run(revokeId, "revoke_now_meirei", 100, 100, "active", null, snap("revoke_meirei"));
+  // スナップショットを持たない旧購入。現在の商品定義が revoke_meirei でも根拠にしない
+  buy.run(revokeId, "legacy_no_snapshot", 100, 100, "active", null, null);
   const soul = db.prepare("INSERT INTO souls (user_id,status,updated_at) VALUES (?,?,1)");
   soul.run("revoke_now_waiting", "waiting");
   soul.run("revoke_now_meirei", "meirei");
+  soul.run("legacy_no_snapshot", "waiting");
   // 移行前の状態にする（この列は今回の変更で入る）
   db.prepare("UPDATE shop_purchases SET delivery_state = NULL").run();
   db.close();
@@ -72,19 +76,31 @@ describe("既存購入への配送状態の割り当て", () => {
     db.close();
   });
 
-  it("再評価チャレンジは本人が waiting のときだけ pending にする（ロール修復の余地を残す）", () => {
+  it("自動配送を取りやめた再評価チャレンジは failed として残す（自動でも回収導線でも実行しない）", () => {
     const db = openDb(seeded());
-    // DBのresetは済んでロールだけ残っている可能性がある行 → 回収対象にできる
-    expect(stateOf(db, "revoke_now_waiting")).toBe("pending");
-    // 後から再降格された人は触らない（再実行でその降格を巻き戻さない）
-    expect(stateOf(db, "revoke_now_meirei")).toBe("delivered");
+    // 「配送は終わっていない」という事実は残す。ただし delivered とは言わない
+    expect(stateOf(db, "revoke_now_waiting")).toBe("failed");
+    expect(stateOf(db, "revoke_now_meirei")).toBe("failed");
+    const errors = db
+      .prepare("SELECT DISTINCT delivery_error AS e FROM shop_purchases WHERE user_id IN ('revoke_now_waiting','revoke_now_meirei')")
+      .all();
+    expect(errors).toEqual([{ e: "auto_delivery_withdrawn:revoke_meirei" }]);
     db.close();
   });
 
-  it("過去分が回収一覧を埋め尽くさない（対象は手動待ち1件 + 再評価チャレンジ1件だけ）", () => {
+  it("自動再配送の候補には手動待ちの1件も再評価チャレンジも出さない", () => {
     const db = openDb(seeded());
-    const rows = db.prepare("SELECT user_id FROM shop_purchases WHERE delivery_state <> 'delivered' ORDER BY user_id").all();
-    expect(rows).toEqual([{ user_id: "manual_undelivered" }, { user_id: "revoke_now_waiting" }]);
+    const rows = db
+      .prepare("SELECT user_id FROM shop_purchases WHERE delivery_state = 'pending' ORDER BY user_id")
+      .all();
+    // pending は「人手待ちの手動配送」だけ
+    expect(rows).toEqual([{ user_id: "manual_undelivered" }]);
+    db.close();
+  });
+
+  it("スナップショットの無い旧購入は、現在の商品定義が revoke_meirei でも候補にしない", () => {
+    const db = openDb(seeded());
+    expect(stateOf(db, "legacy_no_snapshot")).toBe("delivered");
     db.close();
   });
 

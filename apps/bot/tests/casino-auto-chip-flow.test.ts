@@ -64,11 +64,13 @@ describe("PR10監査: Bot側の導線", () => {
     // 課金だけ成立して詰まった）。いまは購入行の配送状態で守るので、
     // replay でも配送を試し、delivered なら中で止まる。
     const panel = read("../src/commands/shop-panel.ts");
-    expect(panel).toContain("deliverPurchase(services, interaction.guild, purchase, item");
+    expect(panel).toContain("deliverPurchase(services, interaction.guild, purchase,");
     const delivery = read("../src/shop-delivery.ts");
     // 配送の入口が必ず状態機械を通る
     expect(delivery).toContain("services.shop.beginDelivery(purchase.id)");
     expect(delivery.indexOf("beginDelivery")).toBeLessThan(delivery.indexOf('kind === "add_role"'));
+    // 配送内容は購入時スナップショットだけを正本にする（商品の現在定義へ落ちない）
+    expect(delivery).toContain("parseDeliverySnapshot(purchase.delivery_snapshot_json)");
     // 実際の副作用の有無は shop-delivery.test.ts で振る舞いとして検証している
   });
 

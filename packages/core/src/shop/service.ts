@@ -75,6 +75,57 @@ export interface PurchaseRow {
  */
 export type DeliveryState = "pending" | "delivered" | "failed";
 
+/** 購入時に凍結した配送内容。**再配送はこれだけを正本にする** */
+export interface DeliverySnapshot {
+  delivery: DeliveryMode;
+  delivery_kind: Exclude<DeliveryKind, null>;
+  delivery_data: Record<string, unknown>;
+  captured_at?: number;
+}
+
+/**
+ * いま自動配送してよい種別。
+ *
+ * `revoke_meirei` は**意図的に外してある**。再評価チャレンジは
+ * 「購入 → 再評価面談チケット → 人間が面談 → OKなら亡霊へ復帰」へ仕様変更され、
+ * 購入時点では status もロールも評価期間も動かさない。過去に売った購入も
+ * 自動では実行しない（面談を経ずに復帰させないため）。
+ */
+export const AUTO_DELIVERABLE_KINDS: ReadonlySet<string> = new Set(["add_role", "extend_deadline"]);
+/** 過去に自動配送として売られたが、いまは自動実行しない種別 */
+export const WITHDRAWN_DELIVERY_KINDS: ReadonlySet<string> = new Set(["revoke_meirei"]);
+const KNOWN_DELIVERY_KINDS: ReadonlySet<string> = new Set([...AUTO_DELIVERABLE_KINDS, ...WITHDRAWN_DELIVERY_KINDS]);
+
+/**
+ * 購入行の配送スナップショットを読む。
+ *
+ * **商品の現在定義へフォールバックしない。** 「購入時の配送内容だけを再実行する」という
+ * 設計なので、スナップショットが無い・壊れている・知らない種別なら `null` を返し、
+ * 呼び出し側は何もしない（legacy unknown として扱う）。
+ */
+export function parseDeliverySnapshot(raw: string | null | undefined): DeliverySnapshot | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { delivery?: unknown; delivery_kind?: unknown; delivery_data?: unknown; captured_at?: unknown };
+    if (parsed.delivery !== "auto") return null; // 自動配送として売った記録が無い
+    if (typeof parsed.delivery_kind !== "string" || !KNOWN_DELIVERY_KINDS.has(parsed.delivery_kind)) return null;
+    let data: Record<string, unknown> = {};
+    if (typeof parsed.delivery_data === "string" && parsed.delivery_data.trim()) {
+      data = JSON.parse(parsed.delivery_data) as Record<string, unknown>;
+    } else if (parsed.delivery_data && typeof parsed.delivery_data === "object") {
+      data = parsed.delivery_data as Record<string, unknown>;
+    }
+    return {
+      delivery: "auto",
+      delivery_kind: parsed.delivery_kind as Exclude<DeliveryKind, null>,
+      delivery_data: data,
+      captured_at: typeof parsed.captured_at === "number" ? parsed.captured_at : undefined,
+    };
+  } catch {
+    return null; // 壊れている。現在の商品定義で代用しない
+  }
+}
+
 export interface ShopRoleRevocationRow {
   purchase_id: number;
   user_id: string;
@@ -432,14 +483,29 @@ export class Shop {
     return begin.immediate();
   }
 
-  /** 配送失敗を記録する。握り潰さずここへ落とすことで、再配送の対象として拾える */
-  markDeliveryFailed(purchaseId: number, reason: string, actor: string): void {
-    this.db
+  /**
+   * 配送失敗を記録する。握り潰さずここへ落とすことで、再配送の対象として拾える。
+   *
+   * **確定した成功を上書きしない。** 同じ購入に複数の試行が並走したとき、
+   * 先に成功した試行が `delivered` にした後で、古い試行の失敗が届くことがある。
+   * それで `failed` へ戻すと、配送済みの購入が回収一覧へ再登場し、
+   * 運営が二度目を撃つことになる。`delivered` なら何も書かない。
+   */
+  markDeliveryFailed(purchaseId: number, reason: string, actor: string): boolean {
+    const changed = this.db
       .prepare(
-        "UPDATE shop_purchases SET delivery_state = 'failed', delivery_error = ?, delivery_updated_at = ? WHERE id = ?",
+        `UPDATE shop_purchases
+            SET delivery_state = 'failed', delivery_error = ?, delivery_updated_at = ?
+          WHERE id = ? AND COALESCE(delivery_state, 'pending') <> 'delivered'`,
       )
-      .run(reason, now(), purchaseId);
+      .run(reason, now(), purchaseId).changes;
+    if (changed !== 1) {
+      // 既に成功が確定している。事実として記録だけ残し、状態は動かさない
+      this.events.log("shop_delivery_failure_ignored", { actor, payload: { purchaseId, reason } });
+      return false;
+    }
     this.events.log("shop_delivery_failed", { actor, payload: { purchaseId, reason } });
+    return true;
   }
 
   /**
@@ -448,43 +514,59 @@ export class Shop {
    * `extend_deadline` のように冪等でない配送があるので、効果とマークが割れると
    * 再試行で二重に効いてしまう。効果の書き込みを `effect` に渡してもらい、まとめて確定する。
    */
-  completeDeliveryWith(purchaseId: number, actor: string, effect: () => void): void {
+  completeDeliveryWith(purchaseId: number, actor: string, effect: () => void): boolean {
     const run = this.db.transaction(() => {
       const row = this.db.prepare("SELECT delivery_state FROM shop_purchases WHERE id = ?").get(purchaseId) as
         | { delivery_state: DeliveryState | null }
         | undefined;
       if (!row) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
-      if (row.delivery_state === "delivered") return; // 競合した二重実行。効果を走らせない
+      if (row.delivery_state === "delivered") return false; // 競合した二重実行。効果を走らせない
       effect();
       this.db
         .prepare(
           "UPDATE shop_purchases SET delivered_at = ?, delivery_state = 'delivered', delivery_error = NULL, delivery_updated_at = ? WHERE id = ?",
         )
         .run(now(), now(), purchaseId);
+      return true;
     });
-    run.immediate();
-    this.events.log("shop_delivered", { actor, payload: { purchaseId } });
+    const transitioned = run.immediate();
+    // **実際に pending/failed → delivered へ動いたときだけ**記録する。
+    // 競合した二重実行でも event を積むと、配送回数を事件録から数えられなくなる
+    if (transitioned) this.events.log("shop_delivered", { actor, payload: { purchaseId } });
+    return transitioned;
   }
 
   /** 完了マークだけ（効果が外部＝Discord側にあり、既にやり切った場合） */
-  markDeliverySucceeded(purchaseId: number, actor: string): void {
-    this.completeDeliveryWith(purchaseId, actor, () => undefined);
+  markDeliverySucceeded(purchaseId: number, actor: string): boolean {
+    return this.completeDeliveryWith(purchaseId, actor, () => undefined);
   }
 
-  /** 未完了の自動配送（運営の回収導線用）。手動配送は対象外 */
+  /**
+   * 未完了の自動配送（運営の回収導線用）。
+   *
+   * **対象かどうかは購入時スナップショットで決める。** 商品の現在設定を根拠にすると、
+   * 買った後に商品を自動配送へ変えただけで過去の購入が再配送候補になってしまう。
+   * スナップショットを持たない旧購入（手動配送・列の導入前）はここに出さない。
+   */
   listUndeliveredAuto(limit = 50): Array<PurchaseRow & { item_name: string }> {
-    return this.db
+    const rows = this.db
       .prepare(
         `SELECT p.*, i.name AS item_name
            FROM shop_purchases p
            JOIN shop_items i ON i.id = p.item_id
-          WHERE i.delivery = 'auto'
-            AND p.status = 'active'
+          WHERE p.status = 'active'
+            AND p.delivery_snapshot_json IS NOT NULL
             AND COALESCE(p.delivery_state, 'pending') IN ('pending','failed')
-          ORDER BY p.purchased_at DESC
-          LIMIT ?`,
+          ORDER BY p.purchased_at DESC`,
       )
-      .all(limit) as Array<PurchaseRow & { item_name: string }>;
+      .all() as Array<PurchaseRow & { item_name: string }>;
+    return rows
+      .filter((p) => {
+        const snapshot = parseDeliverySnapshot(p.delivery_snapshot_json);
+        // 撤回された種別は運営にも再配送させない（面談を経ない復帰を作らない）
+        return snapshot !== null && AUTO_DELIVERABLE_KINDS.has(snapshot.delivery_kind);
+      })
+      .slice(0, limit);
   }
 
   /**
