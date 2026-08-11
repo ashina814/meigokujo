@@ -140,10 +140,6 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
     savePending(services, pending);
   }
 
-  // **静的importにしない。** `shop-delivery` の依存の先で `config.ts` が
-  // 環境変数を検証して `process.exit(1)` するため、このモジュールを読むだけで
-  // 落ちる環境（CIのユニットテスト）ができてしまう
-  const { deliverPurchase } = await import("./shop-delivery.js");
   const guildId = services.settings.getString("guild:main");
   if (!guildId) throw new Error("autodrop:guild_id_missing");
   const guild = await client.guilds.fetch(guildId).catch((error) => {
@@ -446,11 +442,7 @@ export async function processShopRoleRevocations(client: Client, services: Servi
     backfillShopRoleRevocations(services);
     const pending = services.shop.pendingRoleRevocations();
     if (pending.length === 0) return;
-    // **静的importにしない。** `shop-delivery` の依存の先で `config.ts` が
-  // 環境変数を検証して `process.exit(1)` するため、このモジュールを読むだけで
-  // 落ちる環境（CIのユニットテスト）ができてしまう
-  const { deliverPurchase } = await import("./shop-delivery.js");
-  const guildId = services.settings.getString("guild:main");
+    const guildId = services.settings.getString("guild:main");
     if (!guildId) throw new Error("shop_role_revoke:guild_id_missing");
     const guild = await client.guilds.fetch(guildId).catch((error) => {
       throw new Error(`shop_role_revoke:guild_fetch_failed:${error instanceof Error ? error.message : String(error)}`);
