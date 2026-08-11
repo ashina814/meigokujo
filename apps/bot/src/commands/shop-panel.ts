@@ -134,6 +134,27 @@ function itemDetail(item: ShopItemRow, userHasRole: boolean, balance: number, re
   return { embeds: [embed], components };
 }
 
+/**
+ * その商品が「再評価を受ける権利」か。
+ *
+ * 再評価チャレンジは**配送する物が無い**。購入で権利が立ち、消費するのは
+ * 既存の再評価面談フローだけ。ここを配送商品として扱うと、汎用の「配送完了」で
+ * `delivered_at` が入り、**面談前に権利が消える**（購入 #44 で実際に起きた形）。
+ */
+function isReevalItem(services: Services, item: ShopItemRow): boolean {
+  const configured = Number(services.settings.getString("shop:reeval_item_id"));
+  return Number.isInteger(configured) && configured === item.id;
+}
+
+/** 再評価面談の受付パネルへのジャンプリンク（未設置なら null） */
+function reevalPanelLink(services: Services, guildId: string | null): string | null {
+  if (!guildId) return null;
+  const panel = services.tickets.getPanel("reeval");
+  if (!panel || !panel.enabled || panel.archivedAt) return null;
+  if (!panel.channelId || !panel.messageId) return null;
+  return `https://discord.com/channels/${guildId}/${panel.channelId}/${panel.messageId}`;
+}
+
 type PurchaseOutcome = ReturnType<Services["shop"]["purchase"]> & { replayed?: boolean };
 
 function purchaseOnce(
@@ -211,11 +232,19 @@ async function finishPurchase(
     const outcome = await deliverPurchase(services, interaction.guild, purchase, `user:${interaction.user.id}`);
     deliveryNote = outcome.message;
     delivered = outcome.state !== "failed";
+  } else if (isReevalItem(services, item)) {
+    // **配送しない。** 買ったのは面談を受ける権利で、消費するのは既存の再評価面談フロー。
+    // スタッフへ配送依頼を投げると「配送完了」で権利を消せてしまうので、通知も出さない
+    const link = reevalPanelLink(services, interaction.guildId);
+    deliveryNote = [
+      "🎟 **再評価を受ける権利**を取得しました（この時点では階級は変わりません）。",
+      link ? `▶ **[再評価面談の受付はこちら](${link})**` : "受付の場所は運営にご確認ください。",
+    ].join("\n");
   } else if (result.replayed) {
     deliveryNote = manualDeliveryNote(item, "この購入は受付済みです（スタッフ対応待ち）。");
   } else {
-    // 手動配送は商品ごとに次の一手が違う（再評価チャレンジなら面談チケットを開く）。
-    // 商品説明をそのまま出して、案内を商品側のデータで持てるようにする
+    // 手動配送は商品ごとに次の一手が違う。商品説明をそのまま出して、
+    // 案内を商品側のデータで持てるようにする
     deliveryNote = manualDeliveryNote(item, "スタッフが配送の対応をします。");
     await notifyStaffForDelivery(interaction, services, purchase.id, item).catch(() => undefined);
   }
