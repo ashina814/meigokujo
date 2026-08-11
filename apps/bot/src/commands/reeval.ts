@@ -9,6 +9,7 @@ import {
 } from "discord.js";
 import { RANK_ROLE_SETTING_KEYS } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
+import { finalizeTicketDiscordState, ticketActionRow } from "./ticket-display.js";
 import type { Services } from "../services.js";
 
 /**
@@ -342,6 +343,14 @@ export async function handleReevalApprove(interaction: ButtonInteraction, servic
     });
   }
 
+  // 台帳は確定済み。Discord側の表示も完了状態へ揃える（失敗しても巻き戻さない）
+  const displayProblems = await finalizeTicketDiscordState(
+    services,
+    interaction.channel as never,
+    services.tickets.get(interaction.channelId),
+    { controlMessage: null, components: [ticketActionRow("closed"), reevalActionRow(true)], actor, reason: "再評価面談の対応完了" },
+  ).catch(() => ["表示の完了処理に失敗しました"]);
+
   const deadline = `<t:${result.deadline}:D>`;
   await interaction.editReply({
     content: [
@@ -350,6 +359,9 @@ export async function handleReevalApprove(interaction: ButtonInteraction, servic
       `面談権: 購入 #${guard.purchaseId} を消費（チケットは完了）。`,
       roleErrors.length > 0
         ? `⚠️ **ロールの入れ替えに失敗しました**（台帳は亡霊で確定済み）:\n${roleErrors.map((e) => `・${e}`).join("\n")}\n-# 迷霊ロールが残っている場合、亡霊ロールは**わざと付けていません**（両方付くと階級同期が台帳を迷霊へ戻すため）。先に迷霊ロールを外してください。`
+        : "",
+      displayProblems.length > 0
+        ? `⚠️ 表示の完了処理に失敗しました（台帳は確定済み）: ${displayProblems.join(" / ")}`
         : "",
       "-# 初期Landの再発行・招待実績の再計上・招待者の期限延長は行っていません。",
     ]
@@ -387,6 +399,12 @@ export async function handleReevalReject(interaction: ButtonInteraction, service
       `⚠️ 直前に状態が変わったため中止しました（\`${settled.reason}\`）。階級・購入・チケットのいずれも変更していません。`,
     ));
   }
+  await finalizeTicketDiscordState(
+    services,
+    interaction.channel as never,
+    services.tickets.get(interaction.channelId),
+    { controlMessage: null, components: [ticketActionRow("closed"), reevalActionRow(true)], actor: `user:${interaction.user.id}`, reason: "再評価面談の対応完了（見送り）" },
+  ).catch(() => undefined);
   await interaction.editReply({
     content: [
       `🚫 <@${guard.targetId}> の復帰は今回見送りとしました。チケットは完了にしました。`,

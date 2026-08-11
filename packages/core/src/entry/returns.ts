@@ -185,6 +185,23 @@ export class Returns {
     return true;
   }
 
+  /**
+   * 出戻り対応が要る人か。
+   *
+   * 一度退出して戻ってきた人は、**通常の説明会・`/審判` からは亡霊にしない**。
+   * 過去の在籍を見ずに新規と同じ扱いをすると、抜けた経緯も元の階級も無視して
+   * 入城処理が走ってしまう。必ず出戻り申請 → 運営判断を通す。
+   */
+  isReturnee(userId: string): boolean {
+    const soul = this.db.prepare("SELECT status, returned_at, left_at, rank_at_leave FROM souls WHERE user_id = ?").get(userId) as
+      | { status: SoulStatus; returned_at: number | null; left_at: number | null; rank_at_leave: SoulStatus | null }
+      | undefined;
+    if (!soul) return false;
+    if (soul.status !== "waiting") return false;
+    // 再参加を検知した／退出の記録がある／退出時の階級を退避した、のいずれか
+    return soul.returned_at !== null || soul.left_at !== null || soul.rank_at_leave !== null;
+  }
+
   /** 判断材料をまとめて読む（読み取りのみ） */
   context(userId: string): ReturnContext {
     const soul = this.db.prepare("SELECT * FROM souls WHERE user_id = ?").get(userId) as

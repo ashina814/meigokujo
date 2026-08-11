@@ -23,6 +23,7 @@ import {
   type ReturnTarget,
 } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
+import { finalizeTicketDiscordState, ticketActionRow } from "./ticket-display.js";
 import type { Services } from "../services.js";
 
 /**
@@ -218,6 +219,15 @@ export async function handleReturnReasonSubmit(interaction: ModalSubmitInteracti
     services.events.log("entry_return_role_repair_failed", { actor, target: pre.targetId, payload: { to: target, errors: roleErrors } });
   }
 
+  // 台帳は確定済み。Discord側の表示も通常のクローズと同じ完了状態にする。
+  // ここが失敗しても台帳は巻き戻さず、表示の修復として記録する
+  const displayProblems = await finalizeTicketDiscordState(
+    services,
+    interaction.channel as never,
+    services.tickets.get(interaction.channelId!),
+    { controlMessage: null, components: [ticketActionRow("closed"), returnActionRow(true)], actor, reason: "出戻り申請の対応完了" },
+  ).catch(() => ["表示の完了処理に失敗しました"]);
+
   const cycle = settled.result?.cycle;
   await interaction.editReply({
     content: [
@@ -230,6 +240,10 @@ export async function handleReturnReasonSubmit(interaction: ModalSubmitInteracti
       `理由: ${reason}`,
       roleErrors.length > 0
         ? `⚠️ **ロールの入れ替えに失敗しました**（台帳は確定済み）:\n${roleErrors.map((e) => `・${e}`).join("\n")}\n-# 危険な組み合わせを作らないため、外せなかった場合は目標ロールを付けていません。手で直してください。`
+        : "",
+      displayProblems.length > 0
+        ? `⚠️ 表示の完了処理に失敗しました（台帳は確定済み）: ${displayProblems.join(" / ")}
+-# もう一度クローズを押せば表示だけ直せます。`
         : "",
       "-# 初期Landの再発行・招待実績の再計上は行っていません。",
     ]
@@ -374,6 +388,39 @@ export async function postCheckRoles(
     payload: { to: target, problems },
   });
   return problems;
+}
+
+/**
+ * 設置済み `return` パネルへのリンク。**未設置なら壊れたリンクを出さない。**
+ *
+ * 「申請してください」と言いながら飛び先が無いのが一番困るので、
+ * リンクを作れないときは案内文を変え、設定が要ることを記録する。
+ */
+export function returnPanelLink(services: Services, guildId: string): string | null {
+  const panel = services.tickets.getPanel(RETURN_PANEL_ID);
+  if (!panel || !panel.enabled || panel.archivedAt) return null;
+  if (!panel.channelId || !panel.messageId) return null;
+  return `https://discord.com/channels/${guildId}/${panel.channelId}/${panel.messageId}`;
+}
+
+/** 再参加した人へ送るDM。通常の説明会案内は送らない */
+export function returnWelcomeMessage(services: Services, guildId: string): { embeds: EmbedBuilder[] } {
+  const link = returnPanelLink(services, guildId);
+  const embed = new EmbedBuilder()
+    .setTitle("🔄 おかえりなさい")
+    .setColor(0x0369a1)
+    .setDescription(
+      [
+        "過去に在籍記録があるため、**通常の入城説明会ではなく出戻り申請から**復帰手続きを行ってください。",
+        "過去の階級・在籍状況を確認し、運営が今回の復帰階級を決定します。",
+        "",
+        link
+          ? `▶ **[出戻り申請はこちら](${link})**`
+          : "⚠️ 申請の受付場所がまだ設定されていません。**運営にお声がけください。**",
+      ].join("\n"),
+    )
+    .setFooter({ text: "説明会に参加しても、出戻りの方は通常の判定では処理できません。" });
+  return { embeds: [embed] };
 }
 
 /** 出戻り申請ボタンを出す条件を人が読めるようにしたヘルパ（チケット作成時に使う） */

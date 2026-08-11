@@ -18,6 +18,16 @@ import type { TicketKind, TicketPanel, TicketRow } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
 import { REEVAL_PANEL_ID, linkReevalPurchase, reevalActionRow } from "./reeval.js";
 import { RETURN_PANEL_ID, returnActionRow, returnContextEmbed, returnTicketIntro } from "./entry-return.js";
+import {
+  finalizeTicketDiscordState,
+  lockAndArchiveThread,
+  safeThreadPart,
+  ticketActionRow,
+  ticketBaseThreadName,
+  ticketStatusContent,
+  ticketThreadName,
+  type LockableThread,
+} from "./ticket-display.js";
 import type { Services } from "../services.js";
 
 const LEGACY_KIND_LABELS: Record<string, string> = { return: "出戻り申請", consult: "個別相談" };
@@ -25,11 +35,6 @@ const OPEN_PREFIX = "ticket:open:";
 const CLOSE_CONFIRM_PREFIX = "ticket:close-confirm:";
 const inFlightTickets = new Set<string>();
 
-type LockableThread = {
-  id: string;
-  setLocked(locked: boolean, reason?: string): Promise<unknown>;
-  setArchived(archived: boolean, reason?: string): Promise<unknown>;
-};
 
 function uniq(values: string[]): string[] {
   return [...new Set(values.map((v) => v.trim()).filter(Boolean))];
@@ -56,59 +61,10 @@ function interactionDisplayName(interaction: ButtonInteraction): string {
   return interaction.user.globalName ?? interaction.user.username;
 }
 
-function safeThreadPart(value: string, fallback: string): string {
-  const cleaned = value.replace(/[\r\n｜]/gu, " ").replace(/\s+/gu, " ").trim();
-  return (cleaned || fallback).slice(0, 24);
-}
 
-function ticketBaseThreadName(name: string): string {
-  return name
-    .replace(/^🔴未対応｜/u, "")
-    .replace(/^🟡[^｜]{1,30}対応中｜/u, "")
-    .replace(/^✅完了｜/u, "");
-}
 
-function ticketThreadName(
-  status: "open" | "claimed" | "closed",
-  currentOrBase: string,
-  staffName?: string,
-): string {
-  const base = ticketBaseThreadName(currentOrBase);
-  const prefix =
-    status === "open"
-      ? "🔴未対応｜"
-      : status === "claimed"
-        ? `🟡${safeThreadPart(staffName ?? "担当者", "担当者")}対応中｜`
-        : "✅完了｜";
-  return `${prefix}${base}`.slice(0, 90);
-}
 
-function ticketStatusContent(content: string, statusLine: string): string {
-  const lines = content
-    .split("\n")
-    .filter(
-      (line) =>
-        !line.startsWith("🔴 **対応状況:**") &&
-        !line.startsWith("🟡 **対応状況:**") &&
-        !line.startsWith("✅ **対応状況:**"),
-    );
-  while (lines.at(-1) === "") lines.pop();
-  return [...lines, "", statusLine].join("\n");
-}
 
-function ticketActionRow(status: TicketRow["status"]): ActionRowBuilder<ButtonBuilder> {
-  const claim = new ButtonBuilder()
-    .setCustomId("ticket:claim")
-    .setLabel(status === "open" ? "対応する" : "対応済み")
-    .setStyle(status === "open" ? ButtonStyle.Primary : ButtonStyle.Secondary)
-    .setDisabled(status !== "open");
-  const close = new ButtonBuilder()
-    .setCustomId("ticket:close")
-    .setLabel(status === "closed" ? "クローズ済み" : "クローズ")
-    .setStyle(status === "closed" ? ButtonStyle.Secondary : ButtonStyle.Danger)
-    .setDisabled(status === "closed");
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(claim, close);
-}
 
 function closeConfirmationRow(controlMessageId: string): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -169,6 +125,39 @@ export function buildTicketOpeningMessage(
     embeds: extraEmbeds,
     components: [ticketActionRow("open"), ...extraRows],
   };
+}
+
+/**
+ * 受付固有の運営操作の行だけを作る。
+ *
+ * `claim` や `close` でメッセージを更新するとき、ここを足し忘れると
+ * **「対応する」を押した瞬間に専用操作が消える**。状態遷移のたびに組み直せるよう
+ * 単独で取り出せる形にしてある。
+ */
+export function panelExtraRows(
+  services: Services,
+  panelId: string | null | undefined,
+  opts: { disabled?: boolean; reevalPurchaseId?: number | null } = {},
+): ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] {
+  if (panelId === REEVAL_PANEL_ID) {
+    const linked = opts.reevalPurchaseId ?? null;
+    return [reevalActionRow(opts.disabled || !linked)];
+  }
+  if (panelId === RETURN_PANEL_ID) return [returnActionRow(opts.disabled)];
+  return [];
+}
+
+/** チケットの状態に応じた全操作行（共通ボタン + 受付固有） */
+export function ticketRowsFor(
+  services: Services,
+  ticket: TicketRow | undefined,
+  status: TicketRow["status"],
+): ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] {
+  const extra = panelExtraRows(services, ticket?.panel_id, {
+    disabled: status === "closed",
+    reevalPurchaseId: ticket?.linked_purchase_id ?? null,
+  });
+  return [ticketActionRow(status), ...extra];
 }
 
 export function ticketOpenCustomId(panelId: string): string {
@@ -291,10 +280,14 @@ async function addMembersToThread(thread: PrivateThreadChannel, memberIds: strin
   return { added, failed };
 }
 
-async function lockAndArchiveThread(thread: LockableThread, reason: string): Promise<void> {
-  await thread.setLocked(true, reason).catch((e) => console.warn(`[ticket] スレッドのロックに失敗: ${thread.id}`, e));
-  await thread.setArchived(true, reason).catch((e) => console.warn(`[ticket] スレッドのアーカイブに失敗: ${thread.id}`, e));
-}
+
+/**
+ * DB上でクローズ済みのチケットを、Discord 側でも完了状態にする。
+ *
+ * 出戻り・再評価の確定は台帳の方を先に確定させるので、ここが失敗しても
+ * **DBを巻き戻さない**。表示だけの問題として repair event を残し、
+ * もう一度呼べば直せる形にしておく。
+ */
 
 async function cleanupCreatedThread(thread: PrivateThreadChannel, reason: string): Promise<void> {
   try {
@@ -476,7 +469,12 @@ async function claimTicket(interaction: ButtonInteraction, services: Services): 
   }
 
   const content = ticketStatusContent(interaction.message.content, `🟡 **対応状況:** <@${interaction.user.id}> が対応中`);
-  const payload = { content, components: [ticketActionRow("claimed")], allowedMentions: { parse: [] as never[] } };
+  // 受付固有の操作（出戻りの戻し先選択・再評価の承認/見送り）を消さない
+  const payload = {
+    content,
+    components: ticketRowsFor(services, claimed, "claimed"),
+    allowedMentions: { parse: [] as never[] },
+  };
   try {
     await interaction.update(payload);
   } catch (e) {
@@ -563,7 +561,9 @@ async function confirmTicketClose(
       });
       if (controlMessage) {
         const content = ticketStatusContent(controlMessage.content, `✅ **対応状況:** <@${interaction.user.id}> がクローズ`);
-        await controlMessage.edit({ content, components: [ticketActionRow("closed")], allowedMentions: { parse: [] } }).catch((e) => console.warn("[ticket] クローズ状態のメッセージ更新に失敗", e));
+        await controlMessage
+          .edit({ content, components: ticketRowsFor(services, closed, "closed"), allowedMentions: { parse: [] } })
+          .catch((e) => console.warn("[ticket] クローズ状態のメッセージ更新に失敗", e));
       }
       await thread.setName(ticketThreadName("closed", thread.name), "チケット完了").catch((e) => console.warn("[ticket] 完了スレッド名への更新に失敗", e));
     }

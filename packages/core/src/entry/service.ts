@@ -71,6 +71,8 @@ export interface SoulRow {
 
 export interface GhostifyResult {
   userId: string;
+  /** 入城処理を行わなかった理由。出戻りは通常導線から亡霊にしない */
+  blocked?: "returnee";
   granted: number; // 初期発行額（既発行なら 0）
   evalDeadlineAt: number;
   inviterExtendedDays: number; // 招待者の評価期限を何日延長したか
@@ -388,6 +390,18 @@ export class Entry {
         evalDeadlineAt: soul.eval_deadline_at ?? ts,
         inviterExtendedDays: 0,
       };
+    }
+
+    // **出戻りは通常の入城処理から亡霊にしない。**
+    // 説明会の判定・亡霊ロールの手動付与など、どの経路から来てもここで止める。
+    // 復帰は出戻り申請 → 運営判断（Returns.reinstate）だけが行える
+    if (soul && soul.status === "waiting" && (soul.returned_at !== null || soul.left_at !== null || soul.rank_at_leave !== null)) {
+      this.events.log("entry_ghostify_blocked_returnee", {
+        actor,
+        target: userId,
+        payload: { reason: "returnee_requires_return_request", rankAtLeave: soul.rank_at_leave, leftAt: soul.left_at },
+      });
+      return { userId, blocked: "returnee", granted: 0, evalDeadlineAt: 0, inviterExtendedDays: 0 };
     }
 
     const deadline = ts + baseDays * DAY;

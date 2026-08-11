@@ -25,6 +25,7 @@ import { isAdmin } from "../permissions.js";
 import { jstNow, nextSessionStart } from "../scheduler.js";
 import { refreshWaitersBoard } from "../waiters-board.js";
 import { scheduleRankReconcile, touchesRankRoles } from "../rank-sync.js";
+import { returnPanelLink, returnWelcomeMessage } from "./entry-return.js";
 import type { Services } from "../services.js";
 
 // ---- パネル ----
@@ -228,13 +229,17 @@ export async function handleMemberJoin(
     console.log(`[invite] 自動検出: ${member.id} は ${inviterId} の招待リンクで入城`);
   }
 
+  // 出戻りには通常の説明会案内を送らない。案内先は出戻り申請だけ
+  const returnLink = isReturnee ? returnPanelLink(services, member.guild.id) : null;
+  if (isReturnee && !returnLink) {
+    services.events.log("entry_return_panel_missing", {
+      target: member.id,
+      payload: { reason: "出戻りの案内先（returnパネル）が未設置・無効のためリンクを出せなかった" },
+    });
+    console.warn(`[entry] 出戻りの案内先が未設置です（returnパネルを設置してください）: ${member.id}`);
+  }
   const result = await deliverToUser(member.client, services, member.id, {
-    dm: {
-      embeds: [buildWelcomeEmbed(member, services)],
-      content: isReturnee
-        ? "おかえりなさい。いったん**入城案内待ち**からの再開になります。以前の階級で戻したい場合は、**出戻り申請**から運営へお知らせください。"
-        : undefined,
-    },
+    dm: isReturnee ? returnWelcomeMessage(services, member.guild.id) : { embeds: [buildWelcomeEmbed(member, services)] },
     fallback: {
       channelKey: "channel:entry_guide",
       content: "案内をDMへ送れなかったため、上部の常設パネルを確認してください。",
@@ -470,7 +475,26 @@ export function isJudge(
  * ロール無しでも魂が waiting なら対象（ロール付与失敗の救済）。
  * 案内待ちロール保持でも高階級ロール(魔族/魔人/迷霊)がある場合は対象外（誤操作防止）。
  */
+/**
+ * 説明会VCに居る判定対象と、**出戻りのため通常判定にかけられない人**を分けて返す。
+ *
+ * 一度退出して戻った人は、過去の在籍と元の階級を運営が見たうえで戻し先を決める。
+ * 通常の `/審判` で亡霊にしてしまうと、その判断を飛ばして新規と同じ扱いになる。
+ */
 async function presentWaiters(guild: Guild, services: Services): Promise<string[]> {
+  const { targets } = await presentWaitersSplit(guild, services);
+  return targets;
+}
+
+async function presentWaitersSplit(guild: Guild, services: Services): Promise<{ targets: string[]; returnees: string[] }> {
+  const all = await presentWaitersRaw(guild, services);
+  const targets: string[] = [];
+  const returnees: string[] = [];
+  for (const id of all) (services.returns.isReturnee(id) ? returnees : targets).push(id);
+  return { targets, returnees };
+}
+
+async function presentWaitersRaw(guild: Guild, services: Services): Promise<string[]> {
   const vcIds = [
     services.settings.getString("channel:session_vc"),
     services.settings.getString("channel:session_vc2"),
@@ -534,15 +558,21 @@ export async function handleSessionCommand(
     });
     return;
   }
-  const present = await presentWaiters(guild, services);
+  const { targets: present, returnees } = await presentWaitersSplit(guild, services);
   if (present.length === 0) {
     const vcMentions = [vc1, vc2].filter(Boolean).map((id) => `<#${id}>`).join(" / ");
     await interaction.reply({
       content: [
-        `いま ${vcMentions} に「案内待ち」の人がいません。`,
+        `いま ${vcMentions} に判定できる「案内待ち」の人がいません。`,
         "（対象は **入城案内待ちロール保持者** か **魂の状態が waiting** の人だけ。既に亡霊/魔人などになっている人は対象外です）",
-      ].join("\n"),
+        returnees.length > 0
+          ? `\n🔄 **出戻り対象が ${returnees.length}名います**（${returnees.map((id) => `<@${id}>`).join(", ")}）。\n通常判定では処理できません。**出戻り申請から対応してください。**`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
       flags: MessageFlags.Ephemeral,
+      allowedMentions: { parse: [] },
     });
     return;
   }
@@ -554,7 +584,7 @@ export async function handleSessionCommand(
   // 検出・補足が1件でもあれば「確認済み」。`none`（誰の招待でもない）も門番が確認した
   // 結果なので未検出には数えない。
   const missing = present.filter((uid) => !services.entry.getInviterHint(uid));
-  judgeState.set(interaction.user.id, { present, missing, hold: new Set() });
+  judgeState.set(interaction.user.id, { present, missing, hold: new Set(), returnees });
   await interaction.reply({ ...renderJudgment(services, interaction.user.id), flags: MessageFlags.Ephemeral });
 }
 
@@ -650,12 +680,14 @@ interface JudgeSel {
   present: string[]; // 今VCにいる案内待ち＝判定対象（招待経路の有無は問わない）
   missing: string[]; // うち招待経路が未検出の人。警告表示のみで、判定は妨げない
   hold: Set<string>; // 保留＝今回は通さない（案内待ちのまま。次回の判定で再度出る）
+  /** 出戻りのため通常判定にかけられない人。**選択にも合格にも出さない**（表示だけ） */
+  returnees: string[];
 }
 const judgeState = new Map<string, JudgeSel>(); // key = 判定者のユーザーID
 
 /** 判定メッセージ（今VCにいる案内待ち + 保留の選択UI）を組み立てる */
 function renderJudgment(_services: Services, judgeId: string) {
-  const st = judgeState.get(judgeId) ?? ({ present: [], missing: [], hold: new Set<string>() } as JudgeSel);
+  const st = judgeState.get(judgeId) ?? ({ present: [], missing: [], hold: new Set<string>(), returnees: [] } as JudgeSel);
   const toGhost = st.present.filter((id) => !st.hold.has(id));
 
   const line = (ids: string[]) => (ids.length > 0 ? ids.map((id) => `・<@${id}>`).join("\n") : "（なし）");
@@ -670,6 +702,9 @@ function renderJudgment(_services: Services, judgeId: string) {
         st.hold.size > 0 ? `⏸ **保留 ${st.hold.size}名**（今回は通さない・案内待ちのまま）:\n${line([...st.hold])}\n` : "",
         st.missing.length > 0
           ? `⚠️ **招待経路 未検出 ${st.missing.length}名**（判定は通せます。必要なら \`/審判 招待\` で後から登録）:\n${line(st.missing)}\n`
+          : "",
+        st.returnees.length > 0
+          ? `🔄 **出戻り対象 ${st.returnees.length}名**（通常判定では処理できません。**出戻り申請から対応してください**）:\n${line(st.returnees)}\n`
           : "",
       ]
         .filter((s) => s !== "")
@@ -722,7 +757,9 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
   await interaction.update({ content: "⏳ 判定を実行中…", embeds: [], components: [] });
 
   const guild = interaction.guild!;
-  const toGhost = sel.present.filter((id) => !sel.hold.has(id));
+  // 判定を開いてから確定するまでに出戻りと判明した人が混ざらないよう、直前にも外す
+  const blockedReturnees = sel.present.filter((id) => !sel.hold.has(id) && services.returns.isReturnee(id));
+  const toGhost = sel.present.filter((id) => !sel.hold.has(id) && !services.returns.isReturnee(id));
 
   const passed: string[] = [];
   const failed: string[] = [];
@@ -730,6 +767,10 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
   let totalGranted = 0;
   for (const id of toGhost) {
     const r = await ghostifyOne(guild, services, id, actor);
+    if (r.blocked) {
+      blockedReturnees.push(id);
+      continue;
+    }
     if (r.ok) {
       totalGranted += r.granted;
       passed.push(id);
@@ -747,6 +788,9 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
       : "",
     failed.length > 0 ? `❌ 亡霊化そのものに失敗: ${failed.map((id) => `<@${id}>`).join(", ")}` : "",
     sel.hold.size > 0 ? `⏸ 保留（案内待ちのまま）: ${sel.hold.size}名` : "",
+    blockedReturnees.length > 0
+      ? `🔄 **出戻り対象のため処理していません（${blockedReturnees.length}名）**: ${blockedReturnees.map((id) => `<@${id}>`).join(", ")}\n　→ 通常判定では処理できません。**出戻り申請から対応してください。**`
+      : "",
   ].filter(Boolean);
   await interaction.editReply({ content: lines.join("\n"), allowedMentions: { parse: [] } });
 }
@@ -758,7 +802,7 @@ async function ghostifyOne(
   services: Services,
   userId: string,
   actor: string,
-): Promise<{ ok: boolean; granted: number; roleOk: boolean; roleError?: string }> {
+): Promise<{ ok: boolean; granted: number; roleOk: boolean; roleError?: string; blocked?: "returnee" }> {
   try {
     const member = await guild.members.fetch(userId);
     const maleRoleId = services.settings.getString("role:male");
@@ -770,6 +814,11 @@ async function ghostifyOne(
           ? ("female" as const)
           : null;
     const result = services.entry.ghostify(userId, actor, { inviteeGender: gender });
+    if (result.blocked) {
+      // 出戻りは通常導線から亡霊にしない（説明会判定・亡霊ロールの手動付与のどちらも）
+      console.log(`[entry] 出戻り対象のため通常の亡霊化を行いませんでした: ${userId}`);
+      return { ok: false, granted: 0, roleOk: true, blocked: result.blocked };
+    }
     const waitRoleId = services.settings.getString("role:queue_wait");
     const ghostRoleId = services.settings.getString("role:ghost");
     // ロール変更の成否を捕捉する。ghostify(DB) は成功しているので握り潰さず、
