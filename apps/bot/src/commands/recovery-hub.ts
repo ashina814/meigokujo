@@ -431,7 +431,8 @@ export async function legacyRollbackVerdict(
 
   // 旧自動解除の痕跡。これが無いなら「機械が外した」根拠が無い
   const events = services.events.listByTarget(entry.userId, 200);
-  if (!events.some((e) => e.type === "ghost_reset" && (e.actor_id ?? "").startsWith("shop:"))) {
+  // 「その商品の自動配送が外した」ことまで確かめる（単なる shop: 前方一致にしない）
+  if (!events.some((e) => e.type === "ghost_reset" && (e.actor_id ?? "") === `shop:${itemId}`)) {
     return { ok: false, reason: "no_legacy_ghost_reset" };
   }
   // 面談の結果が既に出ているなら巻き戻さない

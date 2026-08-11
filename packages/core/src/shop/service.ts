@@ -542,6 +542,30 @@ export class Shop {
   }
 
   /**
+   * 人手のサービス提供（再評価面談など）として購入を消費する。
+   *
+   * **条件付き UPDATE で1行だけ動かす。** 確認してから書くまでの間に返金・取消・
+   * 二重消費が挟まる余地を残さないため、`active` かつ未消費であることを
+   * 書き込みと同じ文で確かめる。呼び出し側は `false` を「消費できなかった」として
+   * トランザクションごと巻き戻す。
+   */
+  consumePurchaseForService(purchaseId: number, actor: string, meta: Record<string, unknown> = {}): boolean {
+    const changed = this.db
+      .prepare(
+        `UPDATE shop_purchases
+            SET delivered_at = ?, delivery_state = 'delivered', delivery_error = NULL, delivery_updated_at = ?
+          WHERE id = ?
+            AND status = 'active'
+            AND delivered_at IS NULL
+            AND COALESCE(delivery_state, 'pending') <> 'delivered'`,
+      )
+      .run(now(), now(), purchaseId).changes;
+    if (changed !== 1) return false;
+    this.events.log("shop_delivered", { actor, payload: { purchaseId, via: "service", ...meta } });
+    return true;
+  }
+
+  /**
    * 未完了の自動配送（運営の回収導線用）。
    *
    * **対象かどうかは購入時スナップショットで決める。** 商品の現在設定を根拠にすると、

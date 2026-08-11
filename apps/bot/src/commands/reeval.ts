@@ -87,26 +87,80 @@ export function linkReevalPurchase(services: Services, threadId: string, userId:
   return services.tickets.linkPurchase(threadId, purchase.id, `user:${userId}`) ? purchase.id : null;
 }
 
-/** 面談結果の確定。結果の記録・購入の消費・チケットのcloseを1トランザクションで行う */
-function settleInterview(
+/** 確定を中止する理由。投げてトランザクションごと巻き戻す */
+class SettleAbort extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+    this.name = "SettleAbort";
+  }
+}
+
+export type SettleResult =
+  | { ok: true; reinstated: ReturnType<Services["evaluation"]["reinstateFromMeirei"]> }
+  | { ok: false; reason: string };
+
+/**
+ * 面談結果の確定。結果の記録・購入の消費・チケットのcloseを1トランザクションで行う。
+ *
+ * ## 確定直前にもう一度確かめる
+ *
+ * `guardApproval()` を通ってからここへ来るまでに、購入が返金される・階級が動く・
+ * 別のスタッフがチケットを閉じる、といった変化が挟まりうる（TOCTOU）。
+ * **IMMEDIATE トランザクションの中で正本をすべて取り直し**、1つでも崩れていれば
+ * 何も書かずに巻き戻す。購入の消費も条件付き UPDATE で1行動いたことを確かめる。
+ *
+ * 通常の close と競合しても、どちらか一方だけが成立する。
+ * - close が先 … チケットが closed になり、ここは `ticket_closed` で中止する
+ * - 確定が先 … 購入を消費してから close するので、後続の close は権利を戻さない
+ */
+export function settleInterview(
   services: Services,
   input: { threadId: string; targetId: string; purchaseId: number; actor: string; approve: boolean; evidence: Record<string, unknown> },
-): { ok: true; reinstated: ReturnType<Services["evaluation"]["reinstateFromMeirei"]> } | { ok: false } {
-  const run = services.db.transaction(() => {
+): SettleResult {
+  const run = services.db.transaction((): SettleResult => {
+    // ---- 正本の再確認（ここから下は同じトランザクション内） ----
+    const ticket = services.tickets.get(input.threadId);
+    if (!ticket || ticket.panel_id !== REEVAL_PANEL_ID) throw new SettleAbort("ticket_missing_or_wrong_panel");
+    if (ticket.user_id !== input.targetId) throw new SettleAbort("ticket_user_mismatch");
+    if (ticket.status !== "open" && ticket.status !== "claimed") throw new SettleAbort(`ticket_${ticket.status}`);
+    if (ticket.linked_purchase_id !== input.purchaseId) throw new SettleAbort("purchase_link_changed");
+
+    const itemId = Number(services.settings.getString(REEVAL_ITEM_SETTING_KEY));
+    if (!Number.isInteger(itemId) || itemId <= 0) throw new SettleAbort("reeval_item_setting_missing");
+    const purchase = services.shop.getPurchase(input.purchaseId);
+    if (!purchase) throw new SettleAbort("purchase_not_found");
+    if (purchase.user_id !== input.targetId) throw new SettleAbort("purchase_user_mismatch");
+    if (purchase.item_id !== itemId) throw new SettleAbort("purchase_item_mismatch");
+    if (purchase.status !== "active") throw new SettleAbort(`purchase_${purchase.status}`);
+    if (purchase.delivered_at !== null) throw new SettleAbort("purchase_already_delivered");
+    if (purchase.delivery_state === "delivered") throw new SettleAbort("purchase_already_consumed");
+
+    const soul = services.entry.getSoul(input.targetId);
+    if (!soul) throw new SettleAbort("no_soul_row");
+    if (soul.status !== "meirei") throw new SettleAbort(`not_meirei:${soul.status}`);
+
+    // ---- 書き込み ----
+    let reinstated: ReturnType<Services["evaluation"]["reinstateFromMeirei"]> = null;
     if (input.approve) {
-      const reinstated = services.evaluation.reinstateFromMeirei(input.targetId, input.actor, input.evidence);
-      if (!reinstated) return { ok: false as const };
-      // 面談を提供したので購入権を消費する（手動配送の完了と同じ意味）
-      services.shop.markDelivered(input.purchaseId, input.actor);
-      services.tickets.close(input.threadId, input.actor);
-      return { ok: true as const, reinstated };
+      reinstated = services.evaluation.reinstateFromMeirei(input.targetId, input.actor, input.evidence);
+      if (!reinstated) throw new SettleAbort("reinstate_precondition_lost");
+    } else {
+      services.evaluation.recordReevalRejection(input.targetId, input.actor, input.evidence);
     }
-    services.evaluation.recordReevalRejection(input.targetId, input.actor, input.evidence);
-    services.shop.markDelivered(input.purchaseId, input.actor);
-    services.tickets.close(input.threadId, input.actor);
-    return { ok: true as const, reinstated: null };
+    // 面談を提供したので購入権を消費する（手動配送の完了と同じ意味）。
+    // **close より先に消費する**。順序が逆だと close が予約を戻してしまう
+    if (!services.shop.consumePurchaseForService(input.purchaseId, input.actor, { via: "reeval", threadId: input.threadId })) {
+      throw new SettleAbort("purchase_consume_failed");
+    }
+    if (!services.tickets.close(input.threadId, input.actor)) throw new SettleAbort("ticket_close_failed");
+    return { ok: true, reinstated };
   });
-  return run.immediate();
+  try {
+    return run.immediate();
+  } catch (e) {
+    if (e instanceof SettleAbort) return { ok: false, reason: e.reason };
+    throw e;
+  }
 }
 
 type Guard =
@@ -208,12 +262,12 @@ export async function handleReevalApprove(interaction: ButtonInteraction, servic
       panelId: REEVAL_PANEL_ID,
     },
   });
-  if (!settled.ok || !settled.reinstated) {
+  if (!settled.ok) {
     return void (await interaction.editReply(
-      "⚠️ 直前に階級が変わったため中止しました（迷霊ではなくなっています）。何も変更していません。",
+      `⚠️ 直前に状態が変わったため中止しました（\`${settled.reason}\`）。階級・購入・チケットのいずれも変更していません。`,
     ));
   }
-  const result = settled.reinstated;
+  const result = settled.reinstated!;
 
   // ロール入れ替え。**失敗を握り潰さない**（台帳だけ進んでロールが残る事故を再発させない）
   const meireiRoleId = services.settings.getString("role:meirei");
@@ -266,7 +320,7 @@ export async function handleReevalReject(interaction: ButtonInteraction, service
     return void (await interaction.reply({ content: `⚠️ ${guard.message}`, flags: MessageFlags.Ephemeral }));
   }
   await interaction.deferReply();
-  settleInterview(services, {
+  const settled = settleInterview(services, {
     threadId: interaction.channelId,
     targetId: guard.targetId,
     purchaseId: guard.purchaseId,
@@ -279,6 +333,11 @@ export async function handleReevalReject(interaction: ButtonInteraction, service
       panelId: REEVAL_PANEL_ID,
     },
   });
+  if (!settled.ok) {
+    return void (await interaction.editReply(
+      `⚠️ 直前に状態が変わったため中止しました（\`${settled.reason}\`）。階級・購入・チケットのいずれも変更していません。`,
+    ));
+  }
   await interaction.editReply({
     content: [
       `🚫 <@${guard.targetId}> の復帰は今回見送りとしました。チケットは完了にしました。`,
