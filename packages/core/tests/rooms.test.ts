@@ -90,6 +90,19 @@ describe("部屋システム", () => {
     expect(ctx.ledger.balanceOf("user:payer")).toBe(95_000);
   });
 
+  it("通常部屋の無料枠追加は定員だけ増やし、Land取引を作らない", () => {
+    const room = ctx.rooms.register({ kind: "normal", channelId: "free-slot", ownerId: "owner" });
+    const beforeBalance = ctx.ledger.balanceOf("user:payer");
+    const beforeTx = (ctx.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE type = 'room_fee'").get() as { n: number }).n;
+
+    const updated = ctx.rooms.addSlot(room.id, "payer", { priceOverride: 0 });
+
+    expect(updated.capacity).toBe(3);
+    expect(ctx.ledger.balanceOf("user:payer")).toBe(beforeBalance);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE type = 'room_fee'").get() as { n: number }).n).toBe(beforeTx);
+    expect(ctx.ledger.findByIdempotencyKey(`room:slot:${room.id}:3`)).toBeUndefined();
+  });
+
   it("宿以外・closed部屋・最大定員超過への増枠を拒否し、課金しない", () => {
     const game = ctx.rooms.register({ kind: "game", channelId: "game-cap", ownerId: "owner", hours: 2 });
     const beforeInvalid = ctx.ledger.balanceOf("user:payer");

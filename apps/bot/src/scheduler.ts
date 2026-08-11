@@ -15,6 +15,7 @@ import { ticketStaffRoleIds } from "./commands/tickets.js";
 import { isSeatOccupied } from "./casino/common.js";
 import { retryPendingRankedTableMessages } from "./casino/ranked-table-ui.js";
 import type { Services } from "./services.js";
+import { enforceConversationCourtRestrictionForClient } from "./conversation-court.js";
 import {
   cleanupCompletedChunkBatches,
   finalizeChunkBatch,
@@ -109,6 +110,8 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     // 期限切れの域外確認票の回収は資金を動かさないので、営業状態に関わらず毎分回す。
     // executing のまま残った票（返還済み・元操作未完了）を永久に放置しない
     services.chipFlow.expireStaleConfirmations();
+
+    await enforceConversationCourtRestrictionForClient(client, services, new Date(), "scheduler");
 
     if (services.chipTx.openingPhase() === "formal" && services.casinoStatus.current().status === "open") {
       const idleCutoff = Math.floor(Date.now() / 1000) - 10 * 60;

@@ -291,7 +291,7 @@ export class Rooms {
       .all(ts) as RoomRow[];
   }
 
-  addSlot(roomId: number, payerId: string): RoomRow {
+  addSlot(roomId: number, payerId: string, opts: { priceOverride?: number } = {}): RoomRow {
     const run = this.db.transaction(() => {
       const room = this.get(roomId);
       if (room.status !== "open") throw new RoomError("ERR_ROOM_CLOSED", { roomId });
@@ -299,20 +299,23 @@ export class Rooms {
       const max = this.settings.getNumber("room_normal_max_capacity");
       if (room.capacity >= max) throw new RoomError("ERR_CAPACITY_LIMIT", { roomId, capacity: room.capacity, max });
 
-      const price = this.settings.getNumber("room_slot_price");
-      const account = `user:${payerId}`;
-      this.ledger.ensureAccount(account, "user");
-      this.ledger.transfer({
-        from: account,
-        to: TREASURY,
-        amount: price,
-        type: "room_fee",
-        actor: account,
-        reason: "宿の人数枠+1",
-        refType: "room:slot",
-        refId: room.channel_id,
-        idempotencyKey: `room:slot:${roomId}:${room.capacity + 1}`,
-      });
+      const price = opts.priceOverride ?? this.settings.getNumber("room_slot_price");
+      if (price < 0) throw new Error("room slot price must be non-negative");
+      if (price > 0) {
+        const account = `user:${payerId}`;
+        this.ledger.ensureAccount(account, "user");
+        this.ledger.transfer({
+          from: account,
+          to: TREASURY,
+          amount: price,
+          type: "room_fee",
+          actor: account,
+          reason: "宿の人数枠+1",
+          refType: "room:slot",
+          refId: room.channel_id,
+          idempotencyKey: `room:slot:${roomId}:${room.capacity + 1}`,
+        });
+      }
 
       const updated = this.db
         .prepare(

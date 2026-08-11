@@ -20,6 +20,7 @@ export type RoleSlot =
   | "church_consult" // 相談対応（シスター・修道士）※複数
   | "church_manage" // 冥教会管理（大司教）
   | "normal_ops" // 通常運営（使令など）
+  | "room_normal_free" // normal room paid actions become free for holders
   | "kaiwa" // 諧和廷担当
   | "court" // 冥府裁判所担当
   | "emergency" // 緊急対応担当
@@ -36,6 +37,11 @@ export const ROLE_SLOT_META: Record<RoleSlot, { label: string; hint: string; mul
   church_consult: { label: "相談対応ロール（シスター・修道士）", hint: "🕯️相談・🙏懺悔の一次対応。複数選択可", multi: true },
   church_manage: { label: "冥教会管理ロール（大司教）", hint: "冥教会案件の管理・担当調整・引継ぎ確認", multi: true },
   normal_ops: { label: "通常運営ロール（使令など）", hint: "サーバー規約対応・警告・処分は運営の管轄", multi: true },
+  room_normal_free: {
+    label: "通常部屋 無料特典ロール",
+    hint: "通常部屋の有料操作だけを無料にします。特殊部屋には適用しません。",
+    multi: true,
+  },
   // 諧和廷はトートの対応先から廃止（旧運用）。既存 roles:kaiwa の読み取り用に型としては残すが、UIには出さない
   kaiwa: { label: "諧和廷担当ロール（旧運用・非表示）", hint: "廃止済み", multi: true },
   court: { label: "冥府裁判所担当ロール", hint: "冥府裁判所への送致先", multi: true },
@@ -55,6 +61,7 @@ export const ROLE_SLOT_ORDER: RoleSlot[] = [
   "church_consult",
   "church_manage",
   "normal_ops",
+  "room_normal_free",
   "court",
   "emergency",
   "opinion",

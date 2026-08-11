@@ -27,6 +27,7 @@ import {
 import { LedgerError, RoomError, roomOwnershipSlot, type RoomKind, type RoomRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import type { Services } from "../services.js";
+import { memberInSlot } from "../church-roles.js";
 
 const KIND_LABELS: Record<RoomKind, string> = {
   normal: "宿",
@@ -237,6 +238,22 @@ function roomAccessConflictMessage(error: RoomError): string {
 function balanceLine(services: Services, userId: string, price: number): string {
   const balance = services.ledger.balanceOf(`user:${userId}`);
   return [`現在残高: ${fmtLd(balance)}`, `支払後残高: ${fmtLd(balance - price)}`].join("\n");
+}
+
+function normalSlotPriceQuote(member: GuildMember | null | undefined, services: Services): { normalPrice: number; effectivePrice: number; freeByRole: boolean } {
+  const normalPrice = services.settings.getNumber("room_slot_price");
+  const freeByRole = memberInSlot(member ?? null, services, "room_normal_free");
+  return { normalPrice, effectivePrice: freeByRole ? 0 : normalPrice, freeByRole };
+}
+
+function normalSlotPaymentLine(quote: { normalPrice: number; effectivePrice: number; freeByRole: boolean }): string {
+  return quote.freeByRole ? `支払額: ${fmtLd(quote.normalPrice)} -> 無料（宿特典）` : `支払額: ${fmtLd(quote.normalPrice)}`;
+}
+
+async function currentGuildMember(interaction: ButtonInteraction): Promise<GuildMember | null> {
+  const member = interaction.member as GuildMember | null;
+  if (interaction.guild) return (await interaction.guild.members.fetch(interaction.user.id).catch(() => member)) as GuildMember | null;
+  return member;
 }
 
 function operationPanel(room: RoomRow, services: Services): ActionRowBuilder<ButtonBuilder>[] {
@@ -553,24 +570,29 @@ async function createAndReply(
 async function showAddSlotConfirm(interaction: ButtonInteraction, services: Services): Promise<void> {
   const roomId = Number(interaction.customId.split(":")[2]);
   const room = services.rooms.get(roomId);
-  const price = services.settings.getNumber("room_slot_price");
+  const quote = normalSlotPriceQuote(await currentGuildMember(interaction), services);
   const content = [
     "操作: 宿の人数枠を1つ追加",
     `対象部屋: ${KIND_LABELS[room.kind]} / <#${room.channel_id}>`,
     `現在の定員: ${room.capacity}人`,
     `変更後の定員: ${room.capacity + 1}人`,
-    `支払額: ${fmtLd(price)}`,
-    balanceLine(services, interaction.user.id, price),
+    normalSlotPaymentLine(quote),
+    ...(quote.effectivePrice > 0 ? [balanceLine(services, interaction.user.id, quote.effectivePrice)] : []),
   ].join("\n");
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`room:slotpay:${room.id}:${price}:${room.capacity}`).setLabel("支払って実行").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`room:slotpay:${room.id}:${quote.normalPrice}:${room.capacity}`)
+      .setLabel(quote.freeByRole ? "無料で実行" : "支払って実行")
+      .setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("room:createcancel").setLabel("やめる").setStyle(ButtonStyle.Secondary),
   );
   await interaction.reply({ content, components: [row], flags: MessageFlags.Ephemeral });
 }
 
 async function executeAddSlot(interaction: ButtonInteraction, services: Services): Promise<void> {
-  const [, , roomIdStr, priceStr, capacityStr] = interaction.customId.split(":");
+  const parts = interaction.customId.split(":");
+  const roomIdStr = parts[2];
+  const capacityStr = parts[4];
   const roomId = Number(roomIdStr);
   const room = services.rooms.get(roomId);
   const ch = interaction.channel;
@@ -578,12 +600,13 @@ async function executeAddSlot(interaction: ButtonInteraction, services: Services
     await interaction.update({ content: "このVCに入ってから枠を追加してください。課金していません。", components: [] });
     return;
   }
-  if (services.settings.getNumber("room_slot_price") !== Number(priceStr) || room.capacity !== Number(capacityStr)) {
-    await interaction.update({ content: "料金または定員が確認時から変わっています。課金していません。もう一度操作してください。", components: [] });
+  const quote = normalSlotPriceQuote(await currentGuildMember(interaction), services);
+  if (room.capacity !== Number(capacityStr)) {
+    await interaction.update({ content: "定員が確認時から変わっています。課金していません。もう一度操作してください。", components: [] });
     return;
   }
   try {
-    const updated = services.rooms.addSlot(roomId, interaction.user.id);
+    const updated = services.rooms.addSlot(roomId, interaction.user.id, { priceOverride: quote.effectivePrice });
     try {
       await (ch as VoiceChannel).setUserLimit(updated.capacity);
     } catch (error) {
@@ -594,12 +617,16 @@ async function executeAddSlot(interaction: ButtonInteraction, services: Services
         error,
       });
       await interaction.update({
-        content: `⚠️ 枠追加の支払いと記録は完了しましたが、Discord側の定員反映に失敗しました（DB上の定員: ${updated.capacity}人）。運営へ連絡してください。`,
+        content: `${quote.effectivePrice > 0 ? "支払いとDB更新" : "無料特典でのDB更新"}は完了しましたが、Discord側の定員反映に失敗しました（DB上の定員: ${updated.capacity}人）。運営へ連絡してください。`,
         components: [],
       });
       return;
     }
-    await interaction.update({ content: `✅ <@${interaction.user.id}> が枠を追加しました（定員 ${updated.capacity}人）。`, components: [], allowedMentions: { parse: [] } });
+    await interaction.update({
+      content: `✅ <@${interaction.user.id}> が枠を追加しました（定員 ${updated.capacity}人 / ${normalSlotPaymentLine(quote)}）。`,
+      components: [],
+      allowedMentions: { parse: [] },
+    });
   } catch (error) {
     const msg =
       error instanceof LedgerError && error.code === "ERR_INSUFFICIENT"

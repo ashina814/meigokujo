@@ -117,7 +117,7 @@ describe("部屋Bot UI", () => {
         })),
         addSlot,
       },
-      settings: { getNumber: vi.fn(() => 7000) },
+      settings: { getNumber: vi.fn(() => 7000), getJson: vi.fn((_key: string, fallback: string[]) => fallback) },
     };
     const interaction = {
       customId: "room:slotpay:1:7000:2",
@@ -135,12 +135,95 @@ describe("部屋Bot UI", () => {
 
     await handleRoomButton(interaction as any, services as any);
 
-    expect(addSlot).toHaveBeenCalledWith(1, "payer");
+    expect(addSlot).toHaveBeenCalledWith(1, "payer", { priceOverride: 7000 });
     expect(setUserLimit).toHaveBeenCalledWith(3);
-    expect(update).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("支払いと記録は完了") }));
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("支払いとDB更新") }));
     expect(JSON.stringify(update.mock.calls[0]?.[0])).not.toContain("課金していません");
     expect(JSON.stringify(update.mock.calls[0]?.[0])).not.toContain("✅");
     errorSpy.mockRestore();
+  });
+
+  it("通常部屋の枠追加は実行時に無料ロールを取り直して0円で実行する", async () => {
+    const update = vi.fn(async () => undefined);
+    const setUserLimit = vi.fn(async () => undefined);
+    const addSlot = vi.fn(() => ({
+      id: 1,
+      kind: "normal",
+      channel_id: "vc1",
+      owner_id: "owner",
+      status: "open",
+      capacity: 3,
+    }));
+    const services = {
+      rooms: {
+        get: vi.fn(() => ({
+          id: 1,
+          kind: "normal",
+          channel_id: "vc1",
+          owner_id: "owner",
+          status: "open",
+          capacity: 2,
+        })),
+        addSlot,
+      },
+      settings: {
+        getNumber: vi.fn(() => 7000),
+        getJson: vi.fn((key: string, fallback: string[]) => (key === "roles:room_normal_free" ? ["free-role"] : fallback)),
+      },
+    };
+    const fetched = { id: "payer", roles: { cache: new Map([["free-role", { id: "free-role" }]]) } };
+    const interaction = {
+      customId: "room:slotpay:1:7000:2",
+      isButton: () => true,
+      isStringSelectMenu: () => false,
+      isUserSelectMenu: () => false,
+      user: { id: "payer" },
+      guild: { members: { fetch: vi.fn(async () => fetched) } },
+      channel: {
+        type: ChannelType.GuildVoice,
+        members: { has: vi.fn(() => true) },
+        setUserLimit,
+      },
+      update,
+    };
+
+    await handleRoomButton(interaction as any, services as any);
+
+    expect(addSlot).toHaveBeenCalledWith(1, "payer", { priceOverride: 0 });
+    expect(JSON.stringify(update.mock.calls.at(-1)?.[0])).toContain("無料");
+  });
+
+  it("通常部屋の枠追加は確認後に無料ロールを失っていれば通常価格で実行する", async () => {
+    const update = vi.fn(async () => undefined);
+    const addSlot = vi.fn(() => ({ id: 1, kind: "normal", channel_id: "vc1", owner_id: "owner", status: "open", capacity: 3 }));
+    const services = {
+      rooms: {
+        get: vi.fn(() => ({ id: 1, kind: "normal", channel_id: "vc1", owner_id: "owner", status: "open", capacity: 2 })),
+        addSlot,
+      },
+      settings: {
+        getNumber: vi.fn(() => 7000),
+        getJson: vi.fn((key: string, fallback: string[]) => (key === "roles:room_normal_free" ? ["free-role"] : fallback)),
+      },
+    };
+    const interaction = {
+      customId: "room:slotpay:1:7000:2",
+      isButton: () => true,
+      isStringSelectMenu: () => false,
+      isUserSelectMenu: () => false,
+      user: { id: "payer" },
+      guild: { members: { fetch: vi.fn(async () => ({ id: "payer", roles: { cache: new Map() } })) } },
+      channel: {
+        type: ChannelType.GuildVoice,
+        members: { has: vi.fn(() => true) },
+        setUserLimit: vi.fn(async () => undefined),
+      },
+      update,
+    };
+
+    await handleRoomButton(interaction as any, services as any);
+
+    expect(addSlot).toHaveBeenCalledWith(1, "payer", { priceOverride: 7000 });
   });
 
   it("VoiceStateUpdateで部屋への人間入室を即時利用済みにする", () => {
