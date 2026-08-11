@@ -163,6 +163,70 @@ export function settleInterview(
   }
 }
 
+/**
+ * 復帰後のロール入れ替え。**順序そのものを fail-safe にする。**
+ *
+ * ## なぜ順序が効くか
+ *
+ * 階級同期は「迷霊ロールがあれば通常階級より優先」かつ「`ghost → meirei` は
+ * 自動同期してよい」ルールで動く（どちらも通常の降格反映として必要なので変えない）。
+ * そのため **迷霊ロールを外し損ねたまま亡霊ロールを付ける**と、Discord が
+ * 「迷霊 + 亡霊」になり、その付与イベントで走った同期が
+ * **台帳を ghost から meirei へ戻してしまう**。承認した復帰が消える。
+ *
+ * 抑止フラグで防ぐのではなく、そういう状態を**作らない**ことで防ぐ。
+ *
+ * - 迷霊ロールがあるなら、まず外す。外せなければ**亡霊ロールを付けない**
+ *   （付けなければ付与イベント自体が起きず、同期も走らない）
+ * - 外せたことを force fetch で確かめてから亡霊ロールへ進む
+ * - 亡霊ロールの付与に失敗しても「DB=ghost・階級ロール無し」で済む。
+ *   この構成は同期側で `no_rank_role` の ambiguous になり、台帳は書き換わらない
+ * - もともと迷霊ロールが無いならそのまま亡霊ロールを付けてよい
+ */
+export async function applyReinstateRoles(
+  services: Services,
+  guild: Guild,
+  member: GuildMember,
+  targetId: string,
+  actor: string,
+): Promise<{ errors: string[] }> {
+  const meireiRoleId = services.settings.getString("role:meirei");
+  const ghostRoleId = services.settings.getString(RANK_ROLE_SETTING_KEYS.ghost);
+  const errors: string[] = [];
+  let current = member;
+
+  if (meireiRoleId && current.roles.cache.has(meireiRoleId)) {
+    const removed = await current.roles.remove(meireiRoleId).then(() => true).catch((e: Error) => e.message);
+    if (removed !== true) {
+      // ここで亡霊ロールを付けると「迷霊+亡霊」になり、同期が台帳を迷霊へ戻す
+      errors.push(`迷霊ロールの解除に失敗: ${removed}（台帳は亡霊。迷霊ロールを手で外してください）`);
+      return { errors };
+    }
+    // 実際に消えたかを取り直して確かめる（remove が通っても反映を待つ場合がある）
+    const refetched = await guild.members.fetch({ user: targetId, force: true }).catch(() => null);
+    if (!refetched) {
+      errors.push("迷霊ロール解除後の再取得に失敗（亡霊ロールは付けていません。手で確認してください）");
+      return { errors };
+    }
+    if (meireiRoleId && refetched.roles.cache.has(meireiRoleId)) {
+      errors.push("迷霊ロールが解除後も残っています（亡霊ロールは付けていません。手で外してください）");
+      return { errors };
+    }
+    current = refetched;
+  }
+
+  if (!ghostRoleId) {
+    errors.push("亡霊ロールが未設定");
+    return { errors };
+  }
+  if (!current.roles.cache.has(ghostRoleId)) {
+    const added = await current.roles.add(ghostRoleId).then(() => true).catch((e: Error) => e.message);
+    // 失敗しても「階級ロール無し」で止まる。同期は no_rank_role で台帳を触らない
+    if (added !== true) errors.push(`亡霊ロールの付与に失敗: ${added}（迷霊ロールは外れています）`);
+  }
+  return { errors };
+}
+
 type Guard =
   | { ok: true; member: GuildMember; targetId: string; purchaseId: number }
   | { ok: false; message: string };
@@ -269,22 +333,7 @@ export async function handleReevalApprove(interaction: ButtonInteraction, servic
   }
   const result = settled.reinstated!;
 
-  // ロール入れ替え。**失敗を握り潰さない**（台帳だけ進んでロールが残る事故を再発させない）
-  const meireiRoleId = services.settings.getString("role:meirei");
-  const ghostRoleId = services.settings.getString(RANK_ROLE_SETTING_KEYS.ghost);
-  const roleErrors: string[] = [];
-  if (meireiRoleId && guard.member.roles.cache.has(meireiRoleId)) {
-    const removed = await guard.member.roles.remove(meireiRoleId).then(() => true).catch((e: Error) => e.message);
-    if (removed !== true) roleErrors.push(`迷霊ロールの解除に失敗: ${removed}`);
-  }
-  if (ghostRoleId) {
-    if (!guard.member.roles.cache.has(ghostRoleId)) {
-      const added = await guard.member.roles.add(ghostRoleId).then(() => true).catch((e: Error) => e.message);
-      if (added !== true) roleErrors.push(`亡霊ロールの付与に失敗: ${added}`);
-    }
-  } else {
-    roleErrors.push("亡霊ロールが未設定");
-  }
+  const { errors: roleErrors } = await applyReinstateRoles(services, guild, guard.member, guard.targetId, actor);
   if (roleErrors.length > 0) {
     services.events.log("reeval_role_repair_failed", {
       actor,
@@ -300,7 +349,7 @@ export async function handleReevalApprove(interaction: ButtonInteraction, servic
       `新しい評価期間の締切: ${deadline}${result.revokedMarks > 0 ? ` / 以前の印 ${result.revokedMarks}件を取り消し（履歴は保持）` : ""}`,
       `面談権: 購入 #${guard.purchaseId} を消費（チケットは完了）。`,
       roleErrors.length > 0
-        ? `⚠️ **ロールの入れ替えに失敗しました**（台帳は復帰済み）:\n${roleErrors.map((e) => `・${e}`).join("\n")}\n手動で迷霊を外し亡霊を付けてください。`
+        ? `⚠️ **ロールの入れ替えに失敗しました**（台帳は亡霊で確定済み）:\n${roleErrors.map((e) => `・${e}`).join("\n")}\n-# 迷霊ロールが残っている場合、亡霊ロールは**わざと付けていません**（両方付くと階級同期が台帳を迷霊へ戻すため）。先に迷霊ロールを外してください。`
         : "",
       "-# 初期Landの再発行・招待実績の再計上・招待者の期限延長は行っていません。",
     ]
