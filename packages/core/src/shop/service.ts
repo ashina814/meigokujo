@@ -664,6 +664,36 @@ export class Shop {
   }
 
   /**
+   * 人が対応しないと終わらない購入（運営の作業キュー）。
+   *
+   * 「手動配送の商品で、まだ配送済みになっていない購入」。**通知が流れても
+   * ここを見れば残っている仕事が分かる**ようにするためのもので、通知メッセージを
+   * 業務の正本にしない。
+   *
+   * 除外する商品IDは呼び出し側が決める。再評価チャレンジのように
+   * 「配送する物が無く、専用フローが権利を消費する」商品を、ここへ混ぜないため。
+   */
+  listPendingManual(
+    opts: { excludeItemIds?: readonly number[]; limit?: number } = {},
+  ): Array<PurchaseRow & { item_name: string }> {
+    const exclude = opts.excludeItemIds ?? [];
+    const placeholders = exclude.map(() => "?").join(",");
+    return this.db
+      .prepare(
+        `SELECT p.*, i.name AS item_name
+           FROM shop_purchases p
+           JOIN shop_items i ON i.id = p.item_id
+          WHERE p.status = 'active'
+            AND i.delivery = 'manual'
+            AND p.delivered_at IS NULL
+            ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}
+          ORDER BY p.purchased_at
+          LIMIT ?`,
+      )
+      .all(...exclude, opts.limit ?? 25) as Array<PurchaseRow & { item_name: string }>;
+  }
+
+  /**
    * 未完了の自動配送（運営の回収導線用）。
    *
    * **対象かどうかは購入時スナップショットで決める。** 商品の現在設定を根拠にすると、
