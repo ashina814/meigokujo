@@ -274,6 +274,9 @@ async function finishPurchase(
     const outcome = await deliverPurchase(services, interaction.guild, purchase, `user:${interaction.user.id}`);
     deliveryNote = outcome.message;
     delivered = outcome.state !== "failed";
+    // **1回目の失敗でスタッフへ回す。** ここで知らせないと、利用者だけが
+    // 「届いていない」と分かっている状態になる
+    if (!delivered) await notifyStaffForFailure(interaction, services, purchase.id, item);
   } else if (isReevalItem(services, item)) {
     // **配送しない。** 買ったのは面談を受ける権利で、消費するのは既存の再評価面談フロー。
     // スタッフへ配送依頼を投げると「配送完了」で権利を消せてしまうので、通知も出さない
@@ -650,6 +653,31 @@ export async function handleShopSelect(
     await interaction.reply({ ...view, flags: MessageFlags.Ephemeral });
     return;
   }
+}
+
+/**
+ * 自動処理が失敗したことをスタッフへ知らせる。
+ *
+ * 管理パネルの「処理失敗」の件数を更新し、通知は**変化のお知らせだけ**にする。
+ * ここにボタンを置くと、また通知が仕事の正本になる。
+ */
+async function notifyStaffForFailure(
+  interaction: ButtonInteraction,
+  services: Services,
+  purchaseId: number,
+  item: ShopItemRow,
+): Promise<void> {
+  await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
+  const channelId = services.settings.getString("channel:shokan") ?? services.settings.getString("channel:kessai");
+  if (!channelId) return;
+  const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased() || !("send" in channel)) return;
+  await channel
+    .send({
+      content: `⚠️ **自動処理に失敗しました**（購入 #${purchaseId} / ${item.name}）。商館の管理パネルの「処理失敗」から確認してください。`,
+      allowedMentions: { parse: [] },
+    })
+    .catch(() => undefined);
 }
 
 /**

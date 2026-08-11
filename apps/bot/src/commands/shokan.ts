@@ -23,7 +23,7 @@ import type { PurchaseRow, ShopItemRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import { requirementLabel } from "../rank-requirement.js";
-import { deliverPurchase } from "../shop-delivery.js";
+import { redeliverPurchase } from "../shop-delivery.js";
 import type { Services } from "../services.js";
 
 /**
@@ -44,7 +44,8 @@ export const shokanCommand = new SlashCommandBuilder()
 
 const SHOKAN_DEPT_KEY = "冥界商館";
 const HISTORY_PAGE = 20;
-const QUEUE_LIMIT = 10;
+/** 1画面に出す件数。出したものには必ず操作ボタンを付ける（数だけ見せて押せない、を作らない） */
+const QUEUE_DISPLAY = 8;
 
 function canOperate(
   interaction:
@@ -74,12 +75,25 @@ function excludedItemIds(services: Services): number[] {
 }
 
 function pendingManual(services: Services): Array<PurchaseRow & { item_name: string }> {
-  return services.shop.listPendingManual({ excludeItemIds: excludedItemIds(services), limit: QUEUE_LIMIT });
+  return services.shop.listPendingManual({ excludeItemIds: excludedItemIds(services), limit: QUEUE_DISPLAY });
 }
 
 /** 自動配送が終わっていない購入（＝Botが自力で終われなかったもの） */
 function failedAuto(services: Services): Array<PurchaseRow & { item_name: string }> {
-  return services.shop.listUndeliveredAuto(QUEUE_LIMIT);
+  return services.shop.listUndeliveredAuto(QUEUE_DISPLAY);
+}
+
+/** 残件数。**表示上限で数えない**（11件目以降も正しく出す） */
+function queueCounts(services: Services): { pending: number; failed: number } {
+  return {
+    pending: services.shop.countPendingManual({ excludeItemIds: excludedItemIds(services) }),
+    failed: services.shop.countUndeliveredAuto(),
+  };
+}
+
+/** 表示しきれなかった分の注記。押せないボタンを並べる代わりに件数で伝える */
+function overflowNote(shown: number, total: number): string[] {
+  return total > shown ? ["", `-# ほか **${total - shown}件**（対応すると次が出ます）`] : [];
 }
 
 function backButton() {
@@ -102,8 +116,7 @@ function fmtJstDate(unixSec: number): string {
  * 個人ごとの情報は載せない（押した後の ephemeral で出す）ので、そのまま設置できる。
  */
 export function shopAdminPanelMessage(services: Services): MessageCreateOptions {
-  const pending = pendingManual(services).length;
-  const failed = failedAuto(services).length;
+  const { pending, failed } = queueCounts(services);
   const embed = new EmbedBuilder()
     .setTitle("🛠 冥界商館 管理")
     .setColor(pending + failed > 0 ? 0xdc2626 : 0x64748b)
@@ -155,62 +168,66 @@ export async function refreshShopAdminPanels(client: Client, services: Services)
   }
 }
 
+/**
+ * 表示した案件のぶんだけボタンを作る。
+ * **一覧に出したものには必ず操作を付ける**（数だけ見せて押せない、を作らない）。
+ */
+function queueButtons(
+  rows: Array<{ id: number }>,
+  build: (id: number) => ButtonBuilder,
+): ActionRowBuilder<ButtonBuilder>[] {
+  const components: ActionRowBuilder<ButtonBuilder>[] = [];
+  for (const row of rows) {
+    const last = components.at(-1);
+    if (last && last.components.length < 2) last.addComponents(build(row.id));
+    else components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(build(row.id)));
+  }
+  return components;
+}
+
 function renderPending(services: Services) {
   const rows = pendingManual(services);
+  const total = services.shop.countPendingManual({ excludeItemIds: excludedItemIds(services) });
   const embed = new EmbedBuilder().setTitle("🔴 要対応").setColor(0xdc2626);
   if (rows.length === 0) {
     embed.setDescription("対応待ちはありません。");
     return { embeds: [embed], components: [backButton()], allowedMentions: { parse: [] as never[] } };
   }
   embed.setDescription(
-    rows
-      .map((p) => `\`#${p.id}\` **${p.item_name}** — <@${p.user_id}>（${fmtJstDate(p.purchased_at)}）`)
-      .join("\n"),
+    [
+      ...rows.map((p) => `\`#${p.id}\` **${p.item_name}** — <@${p.user_id}>（${fmtJstDate(p.purchased_at)}）`),
+      ...overflowNote(rows.length, total),
+    ].join("\n"),
   );
-  embed.setFooter({ text: "対応が終わったら「完了」を押してください。" });
-  // 1件1ボタン。押す場所を探さずに済むよう、一覧と同じ画面に置く
-  const components: ActionRowBuilder<ButtonBuilder>[] = [];
-  for (const p of rows.slice(0, 10)) {
-    const button = new ButtonBuilder()
-      .setCustomId(`shokan:deliver:${p.id}`)
-      .setLabel(`#${p.id} ${p.item_name}`.slice(0, 40))
-      .setEmoji("📦")
-      .setStyle(ButtonStyle.Success);
-    const last = components.at(-1);
-    if (last && last.components.length < 2) last.addComponents(button);
-    else components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(button));
-  }
-  return { embeds: [embed], components: [...components.slice(0, 4), backButton()], allowedMentions: { parse: [] as never[] } };
+  embed.setFooter({ text: `対応が終わったら「完了」を押してください（全 ${total}件）。` });
+  const components = queueButtons(rows, (id) =>
+    new ButtonBuilder().setCustomId(`shokan:deliver:${id}`).setLabel(`#${id} 完了`).setEmoji("📦").setStyle(ButtonStyle.Success),
+  );
+  return { embeds: [embed], components: [...components, backButton()], allowedMentions: { parse: [] as never[] } };
 }
 
 function renderFailed(services: Services) {
   const rows = failedAuto(services);
+  const total = services.shop.countUndeliveredAuto();
   const embed = new EmbedBuilder().setTitle("⚠️ 処理失敗").setColor(0xdc2626);
   if (rows.length === 0) {
     embed.setDescription("Botが終われなかった処理はありません。");
     return { embeds: [embed], components: [backButton()], allowedMentions: { parse: [] as never[] } };
   }
   embed.setDescription(
-    rows
-      .map(
+    [
+      ...rows.map(
         (p) =>
           `\`#${p.id}\` **${p.item_name}** — <@${p.user_id}>\n　${p.delivery_error ? `理由: ${p.delivery_error.slice(0, 80)}` : "未実行"}（${p.delivery_attempts}回試行）`,
-      )
-      .join("\n"),
+      ),
+      ...overflowNote(rows.length, total),
+    ].join("\n"),
   );
-  embed.setFooter({ text: "原因を直してから再試行してください。二度配ることはありません。" });
-  const components: ActionRowBuilder<ButtonBuilder>[] = [];
-  for (const p of rows.slice(0, 10)) {
-    const button = new ButtonBuilder()
-      .setCustomId(`shokan:retry:${p.id}`)
-      .setLabel(`#${p.id} 再試行`)
-      .setEmoji("🔁")
-      .setStyle(ButtonStyle.Primary);
-    const last = components.at(-1);
-    if (last && last.components.length < 2) last.addComponents(button);
-    else components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(button));
-  }
-  return { embeds: [embed], components: [...components.slice(0, 4), backButton()], allowedMentions: { parse: [] as never[] } };
+  embed.setFooter({ text: `原因を直してから再試行してください。二度配ることはありません（全 ${total}件）。` });
+  const components = queueButtons(rows, (id) =>
+    new ButtonBuilder().setCustomId(`shokan:retry:${id}`).setLabel(`#${id} 再試行`).setEmoji("🔁").setStyle(ButtonStyle.Primary),
+  );
+  return { embeds: [embed], components: [...components, backButton()], allowedMentions: { parse: [] as never[] } };
 }
 
 function renderHistory(services: Services, offset: number) {
@@ -257,7 +274,8 @@ function renderList(services: Services) {
     [
       ...items.slice(0, 25).map((it) => {
         const price = it.price_land !== null ? fmtLd(it.price_land) : "—";
-        return `${it.enabled ? "🟢" : "⚫"} \`#${it.id}\` **${it.name}** — ${price} / ${it.duration_days ? `${it.duration_days}日間` : "単発"}`;
+        const mark = it.enabled ? "🟢" : services.shop.isSalesLocked(it) ? "🔒" : "⚫";
+        return `${mark} \`#${it.id}\` **${it.name}** — ${price} / ${it.duration_days ? `${it.duration_days}日間` : "単発"}`;
       }),
       "",
       "-# 変更できるのは 名前・価格・説明・階級要件・販売のON/OFF です。",
@@ -287,15 +305,20 @@ function renderItem(item: ShopItemRow, services: Services) {
       { name: "期間", value: item.duration_days ? `${item.duration_days}日間` : "単発", inline: true },
       { name: "階級要件", value: requirementLabel(services.settings, item.require_role_id), inline: true },
       { name: "配送", value: item.delivery === "auto" ? "自動" : "手動（スタッフ対応）", inline: true },
-      { name: "状態", value: item.enabled ? "🟢 販売中" : "⚫ 停止中", inline: true },
+      {
+        name: "状態",
+        value: item.enabled ? "🟢 販売中" : services.shop.isSalesLocked(item) ? "🔒 移行待ち（再開不可）" : "⚫ 停止中",
+        inline: true,
+      },
     );
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`shokan:edit-basic:${item.id}`).setLabel("名前・価格・説明").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`shokan:edit-role:${item.id}`).setLabel("階級要件").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`shokan:toggle:${item.id}`)
-      .setLabel(item.enabled ? "販売を止める" : "販売する")
-      .setStyle(item.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+      .setLabel(item.enabled ? "販売を止める" : services.shop.isSalesLocked(item) ? "移行待ち" : "販売する")
+      .setStyle(item.enabled ? ButtonStyle.Danger : ButtonStyle.Success)
+      .setDisabled(!item.enabled && services.shop.isSalesLocked(item)),
   );
   return { embeds: [embed], components: [row, backButton()] };
 }
@@ -339,17 +362,30 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
     const id = Number(arg);
     const item = services.shop.getItem(id);
     if (!item) return;
+    // 移行待ちの商品は再販売できない（契約の実体をBotが知らないまま売らない）
+    if (!item.enabled && services.shop.isSalesLocked(item)) {
+      await interaction.reply({
+        content: `⚠️ **${item.name}** は移行待ちのため販売を再開できません（専用台帳へ移すまで停止）。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     services.shop.setEnabled(id, !item.enabled, `user:${interaction.user.id}`);
     return void (await show(renderItem(services.shop.getItem(id)!, services) as never));
   }
 
   if (action === "deliver" && arg) {
     const id = Number(arg);
-    // **再評価チャレンジはここで完了させない。** 買ったのは面談を受ける権利で、
-    // 消費するのは既存の再評価面談フローだけ。ここで配送済みにすると
-    // 未使用の権利が消え、面談前に 500,000 Ld が失われる（購入 #44 で起きた形）。
+    // **古い画面から押されうる。** ボタンを作った時点ではなく、いまの状態で判断する
     const purchase = services.shop.getPurchase(id);
-    if (purchase && excludedItemIds(services).includes(purchase.item_id)) {
+    if (!purchase) {
+      await interaction.reply({ content: `購入 #${id} が見つかりません。`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    // 再評価チャレンジはここで完了させない。買ったのは面談を受ける権利で、
+    // 消費するのは既存の再評価面談フローだけ。ここで配送済みにすると
+    // 未使用の権利が消え、面談前に 500,000 Ld が失われる（購入 #44 で起きた形）
+    if (excludedItemIds(services).includes(purchase.item_id)) {
       await interaction.reply({
         content: [
           `⚠️ 購入 #${id} は**再評価を受ける権利**です。ここでは完了にできません。`,
@@ -359,8 +395,23 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
       });
       return;
     }
-    if (!purchase || purchase.delivered_at !== null) {
+    const item = services.shop.getItem(purchase.item_id);
+    if (purchase.status !== "active") {
+      await interaction.reply({
+        content: `購入 #${id} は **${purchase.status}** のため完了にできません。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (purchase.delivered_at !== null) {
       await interaction.reply({ content: `購入 #${id} は既に対応済みです。`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!item || item.delivery !== "manual") {
+      await interaction.reply({
+        content: `購入 #${id} は手動対応の商品ではありません。`,
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     }
     services.shop.markDelivered(id, `user:${interaction.user.id}`);
@@ -371,13 +422,10 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
 
   if (action === "retry" && arg) {
     const id = Number(arg);
-    const purchase = services.shop.getPurchase(id);
-    if (!purchase) {
-      await interaction.reply({ content: `購入 #${id} が見つかりません。`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    // 実際の配送処理は購入時と同じ経路。二度配らないのは配送状態が保証する
-    const outcome = await deliverPurchase(services, interaction.guild, purchase, `user:${interaction.user.id}`);
+    // 再配送の可否判定は `redeliverPurchase` が持っている。
+    // **購入時スナップショット**と現在の status を見るので、expired/refunded/cancelled や
+    // 撤回済みの配送種別は古いボタンから実行できない
+    const outcome = await redeliverPurchase(services, interaction.guild, id, `user:${interaction.user.id}`);
     await interaction.reply({
       content: `${outcome.state === "failed" ? "⚠️" : "✅"} 購入 #${id}: ${outcome.message}`,
       flags: MessageFlags.Ephemeral,

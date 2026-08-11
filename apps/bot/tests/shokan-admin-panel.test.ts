@@ -65,6 +65,21 @@ type Ctx = ReturnType<typeof setup>;
 const buy = (ctx: Ctx, itemId: number) =>
   ctx.shop.purchase({ itemId, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
 
+/** 別の利用者としてまとめて購入する（キューを積むため） */
+function buyAs(ctx: Ctx, itemId: number, userId: string) {
+  ctx.ledger.ensureAccount(`user:${userId}`, "user");
+  ctx.ledger.transfer({
+    from: "sys:treasury",
+    to: `user:${userId}`,
+    amount: 1_000_000,
+    type: "adjust",
+    actor: "t",
+    approvedBy: "t",
+    idempotencyKey: `seed:${userId}`,
+  });
+  return ctx.shop.purchase({ itemId, userId, actor: userId, memberRoleIds: [] }).purchase;
+}
+
 /** 常設パネル（=ephemeralではないメッセージ）から押した体のインタラクション */
 function panelPress(customId: string, reply: ReturnType<typeof vi.fn>) {
   return {
@@ -315,6 +330,200 @@ describe("通知", () => {
     const notice = (send.mock.calls[0] as never[])[0] as { content: string; components?: unknown[] };
     expect(notice.components ?? []).toEqual([]);
     expect(notice.content).toContain("要対応");
+    ctx.db.close();
+  });
+});
+
+describe("件数と操作の対応（表示上限で数えない）", () => {
+  it("11件以上でも正確な件数を出し、表示した分には全部ボタンが付く", async () => {
+    const { shopAdminPanelMessage, handleShokanButton } = await shokanModule;
+    const ctx = setup();
+    for (let i = 0; i < 12; i += 1) buyAs(ctx, ctx.nickname.id, `u${i}`);
+
+    const panel = shopAdminPanelMessage(ctx.services) as ReturnType<typeof payloadOf>;
+    expect(panel.embeds[0]!.data.description).toContain("要対応 12件");
+
+    const reply = vi.fn(async () => undefined);
+    await handleShokanButton(panelPress("shokan:pending", reply), ctx.services);
+    const view = payloadOf(reply);
+    const listed = (view.embeds[0]!.data.description ?? "").match(/`#\d+`/g) ?? [];
+    const buttons = idsOf(view).filter((id) => id.startsWith("shokan:deliver:"));
+    // 出した案件の数とボタンの数が一致する
+    expect(buttons).toHaveLength(listed.length);
+    expect(listed.length).toBe(8);
+    expect(view.embeds[0]!.data.description).toContain("ほか **4件**");
+    expect(view.embeds[0]!.data.footer?.text ?? "").toContain("全 12件");
+    ctx.db.close();
+  });
+
+  it("処理失敗も表示上限で数えない", async () => {
+    const { shopAdminPanelMessage } = await shokanModule;
+    const ctx = setup();
+    for (let i = 0; i < 11; i += 1) {
+      const p = buyAs(ctx, ctx.pass.id, `f${i}`);
+      ctx.shop.beginDelivery(p.id);
+      ctx.shop.markDeliveryFailed(p.id, "Missing Permissions");
+    }
+
+    expect((shopAdminPanelMessage(ctx.services) as ReturnType<typeof payloadOf>).embeds[0]!.data.description).toContain(
+      "処理失敗 11件",
+    );
+    ctx.db.close();
+  });
+});
+
+describe("古い画面からの操作", () => {
+  it("失効・返金・取消の購入は完了にできない", async () => {
+    const { handleShokanButton } = await shokanModule;
+    for (const status of ["expired", "refunded", "cancelled"] as const) {
+      const ctx = setup();
+      const purchase = buy(ctx, ctx.nickname.id);
+      ctx.db.prepare("UPDATE shop_purchases SET status=? WHERE id=?").run(status, purchase.id);
+      const reply = vi.fn(async () => undefined);
+
+      await handleShokanButton(panelPress(`shokan:deliver:${purchase.id}`, reply), ctx.services);
+
+      expect(String(payloadOf(reply).content)).toContain(status);
+      expect(ctx.shop.getPurchase(purchase.id)!.delivered_at).toBeNull();
+      expect(ctx.events.listByType("shop_delivered")).toHaveLength(0);
+      ctx.db.close();
+    }
+  });
+
+  it("自動配送の購入を手動完了ボタンからは終われない", async () => {
+    const { handleShokanButton } = await shokanModule;
+    const ctx = setup();
+    const purchase = buy(ctx, ctx.pass.id);
+    const reply = vi.fn(async () => undefined);
+
+    await handleShokanButton(panelPress(`shokan:deliver:${purchase.id}`, reply), ctx.services);
+
+    expect(String(payloadOf(reply).content)).toContain("手動対応の商品ではありません");
+    expect(ctx.shop.getPurchase(purchase.id)!.delivered_at).toBeNull();
+    ctx.db.close();
+  });
+
+  it("失効した購入は古い再試行ボタンから再配送されない", async () => {
+    const { handleShokanButton } = await shokanModule;
+    const ctx = setup();
+    const purchase = buy(ctx, ctx.pass.id);
+    ctx.shop.beginDelivery(purchase.id);
+    ctx.shop.markDeliveryFailed(purchase.id, "Missing Permissions");
+    ctx.db.prepare("UPDATE shop_purchases SET status='expired' WHERE id=?").run(purchase.id);
+    const reply = vi.fn(async () => undefined);
+
+    await handleShokanButton(panelPress(`shokan:retry:${purchase.id}`, reply), ctx.services);
+
+    expect(String(payloadOf(reply).content)).toContain("expired");
+    expect(ctx.shop.getPurchase(purchase.id)!.delivery_state).toBe("failed");
+    ctx.db.close();
+  });
+
+  it("既に完了した購入を二度完了できない（古い一覧からの二度押し）", async () => {
+    const { handleShokanButton } = await shokanModule;
+    const ctx = setup();
+    const purchase = buy(ctx, ctx.nickname.id);
+    await handleShokanButton(panelPress(`shokan:deliver:${purchase.id}`, vi.fn(async () => undefined)), ctx.services);
+    const second = vi.fn(async () => undefined);
+
+    await handleShokanButton(panelPress(`shokan:deliver:${purchase.id}`, second), ctx.services);
+
+    expect(String(payloadOf(second).content)).toContain("既に対応済み");
+    expect(ctx.events.listByType("shop_delivered")).toHaveLength(1);
+    ctx.db.close();
+  });
+});
+
+describe("移行待ちの商品", () => {
+  function legacyItem(ctx: Ctx) {
+    const legacy = ctx.shop.createItem(
+      { name: "オリジナルロール継続or付与", price_land: 250_000, kind: "monthly", delivery: "manual" },
+      "staff",
+    );
+    ctx.db.prepare("UPDATE shop_items SET enabled=0, duration_days=30 WHERE id=?").run(legacy.id);
+    return legacy;
+  }
+
+  it("販売停止した旧オリジナルロール継続は再販売できない", async () => {
+    const { handleShokanButton } = await shokanModule;
+    const ctx = setup();
+    const legacy = legacyItem(ctx);
+    const reply = vi.fn(async () => undefined);
+
+    await handleShokanButton(panelPress(`shokan:toggle:${legacy.id}`, reply), ctx.services);
+
+    expect(String(payloadOf(reply).content)).toContain("移行待ち");
+    expect(ctx.shop.getItem(legacy.id)!.enabled).toBe(0);
+    ctx.db.close();
+  });
+
+  it("coreでも再販売を拒否する（UIを迂回されても止まる）", async () => {
+    const ctx = setup();
+    const legacy = legacyItem(ctx);
+
+    expect(() => ctx.shop.setEnabled(legacy.id, true, "staff")).toThrow("ERR_SALES_LOCKED");
+    // 自動配送の期限商品は普通に止めて再開できる
+    ctx.shop.setEnabled(ctx.pass.id, false, "staff");
+    ctx.shop.setEnabled(ctx.pass.id, true, "staff");
+    expect(ctx.shop.getItem(ctx.pass.id)!.enabled).toBe(1);
+    ctx.db.close();
+  });
+
+  it("商品一覧で「移行待ち」と分かる", async () => {
+    const { handleShokanButton } = await shokanModule;
+    const ctx = setup();
+    legacyItem(ctx);
+    const reply = vi.fn(async () => undefined);
+
+    await handleShokanButton(panelPress("shokan:list", reply), ctx.services);
+
+    expect(payloadOf(reply).embeds[0]!.data.description).toContain("🔒");
+    ctx.db.close();
+  });
+});
+
+describe("自動処理の失敗通知", () => {
+  it("初回の失敗でスタッフへ知らせる（ボタンは置かない）", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    ctx.settings.set("channel:kessai", "ch-1", "staff");
+    const send = vi.fn(async () => undefined);
+    const interaction = {
+      customId: `shop:buy:${ctx.pass.id}:land`,
+      user: { id: USER },
+      guildId: "g1",
+      guild: {
+        id: "g1",
+        roles: { cache: new Collection() },
+        members: {
+          fetch: vi.fn(async () => ({
+            id: USER,
+            roles: {
+              cache: new Collection(),
+              add: vi.fn(async () => {
+                throw new Error("Missing Permissions");
+              }),
+            },
+          })),
+        },
+      },
+      member: { roles: { cache: new Collection() } },
+      id: "op-fail",
+      client: { channels: { fetch: vi.fn(async () => ({ isTextBased: () => true, send, messages: { fetch: vi.fn() } })) } },
+      deferReply: vi.fn(async () => undefined),
+      editReply: vi.fn(async () => undefined),
+      reply: vi.fn(async () => undefined),
+    } as never;
+
+    await handleShopButton(interaction, ctx.services);
+
+    const purchase = ctx.shop.listUserPurchases(USER, { activeOnly: true })[0]!;
+    expect(purchase.delivery_state).toBe("failed");
+    expect(send).toHaveBeenCalledTimes(1);
+    const notice = (send.mock.calls[0] as never[])[0] as { content: string; components?: unknown[] };
+    expect(notice.content).toContain("自動処理に失敗");
+    expect(notice.content).toContain("処理失敗");
+    expect(notice.components ?? []).toEqual([]);
     ctx.db.close();
   });
 });
