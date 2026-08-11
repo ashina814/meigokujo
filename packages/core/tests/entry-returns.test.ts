@@ -54,7 +54,7 @@ describe("退出と再参加", () => {
     const id = member(ctx);
     ctx.returns.recordDeparture(id);
 
-    const previous = ctx.returns.markReturnedToWaiting(id);
+    const previous = ctx.returns.markReturnedToWaiting(id, null);
 
     expect(previous).toBe("majin");
     const soul = soulOf(ctx);
@@ -67,12 +67,25 @@ describe("退出と再参加", () => {
     expect(ctx.events.listByTarget(id).map((e) => e.type)).toContain("entry_returned_to_waiting");
   });
 
-  it("退出の記録が無くても（Bot停止中の退出）、再参加で階級を退避できる", () => {
+  it("退出の記録が無くても、Discord側の参加時刻が新しければ再参加と認める", () => {
     const ctx = setup();
     const id = member(ctx);
-    // recordDeparture を呼ばずにいきなり再参加
-    expect(ctx.returns.markReturnedToWaiting(id)).toBe("majin");
+    const soulJoined = soulOf(ctx).joined_at!;
+    // recordDeparture を呼ばずにいきなり再参加（Bot停止中に抜けた場合）
+    expect(ctx.returns.markReturnedToWaiting(id, soulJoined + 3600)).toBe("majin");
     expect(soulOf(ctx).rank_at_leave).toBe("majin");
+  });
+
+  it("退出の証拠が無ければ何もしない（在籍中の人を入城前へ落とさない）", () => {
+    const ctx = setup();
+    const id = member(ctx);
+    const before = ctx.db.prepare("SELECT * FROM souls WHERE user_id=?").get(id);
+
+    // GuildMemberAdd が在籍中の人へ再送された状況。退出記録も無く、参加時刻も動いていない
+    expect(ctx.returns.markReturnedToWaiting(id, soulOf(ctx).joined_at)).toBeNull();
+
+    expect(ctx.db.prepare("SELECT * FROM souls WHERE user_id=?").get(id)).toEqual(before);
+    expect(ctx.events.listByTarget(id).map((e) => e.type)).toContain("entry_rejoin_ignored");
   });
 
   it("迷霊だった人は ever_meirei が立つ（判断画面に出すため）", () => {
@@ -80,8 +93,11 @@ describe("退出と再参加", () => {
     ctx.entry.recordJoin("u1");
     ctx.entry.ghostify("u1", STAFF);
     ctx.evaluation.demoteToMeirei("u1", STAFF, "期限到達");
+    // 迷霊になった時点で既に立つ（再参加を待たない）
+    expect(soulOf(ctx).ever_meirei).toBe(1);
+    ctx.returns.recordDeparture("u1");
 
-    ctx.returns.markReturnedToWaiting("u1");
+    ctx.returns.markReturnedToWaiting("u1", null);
 
     expect(soulOf(ctx).ever_meirei).toBe(1);
     expect(ctx.returns.context("u1").everMeirei).toBe(true);
@@ -94,7 +110,7 @@ describe("退出と再参加", () => {
     ctx.evaluation.addMark(id, "promotion", "user:e1", "evaluation");
     const land = ctx.ledger.balanceOf(`user:${id}`);
 
-    ctx.returns.markReturnedToWaiting(id);
+    ctx.returns.markReturnedToWaiting(id, null);
 
     expect(ctx.ledger.balanceOf(`user:${id}`)).toBe(land);
     expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM marks WHERE target_id=?").get(id)).toEqual({ n: 1 });
@@ -105,7 +121,7 @@ describe("運営が選ぶ戻し先", () => {
   function returnee(ctx: ReturnType<typeof setup>, id = "u1") {
     member(ctx, id);
     ctx.returns.recordDeparture(id);
-    ctx.returns.markReturnedToWaiting(id);
+    ctx.returns.markReturnedToWaiting(id, null);
     return id;
   }
 
@@ -258,7 +274,7 @@ describe("判断材料", () => {
     ctx.evaluation.addMark(id, "demotion", "user:e2", "evaluation");
     ctx.db.prepare("INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?,?,?)").run(id, "g1", 1);
     ctx.returns.recordDeparture(id);
-    ctx.returns.markReturnedToWaiting(id);
+    ctx.returns.markReturnedToWaiting(id, null);
 
     const c = ctx.returns.context(id);
     expect(c).toMatchObject({ hasSoul: true, currentStatus: "waiting", hasHistory: true, rankAtLeave: "majin" });

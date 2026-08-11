@@ -201,8 +201,9 @@ export async function handleMemberJoin(
   // 出戻り: 既に魂の記録がある＝一度抜けて戻ってきた人。
   // **以前の階級へ自動復帰させない。** いったん案内待ちへ戻し、以前の階級は
   // rank_at_leave へ退避しておく（運営が出戻り申請の画面で参考にする）
-  const previousStatus = created ? null : services.returns.markReturnedToWaiting(member.id);
-  const isReturnee = !created;
+  const joinedAt = member.joinedTimestamp ? Math.floor(member.joinedTimestamp / 1000) : null;
+  const previousStatus = created ? null : services.returns.markReturnedToWaiting(member.id, joinedAt);
+  const isReturnee = previousStatus !== null;
 
   const waitRoleId = services.settings.getString("role:queue_wait");
   if (waitRoleId)

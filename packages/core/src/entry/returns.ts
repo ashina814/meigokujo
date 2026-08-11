@@ -106,9 +106,24 @@ export class Returns {
    * `evaluations` / `marks` / `invites` は触らないので、後から参照できる。
    * 既に `waiting` なら何もしない（冪等）。
    */
-  markReturnedToWaiting(userId: string, actor = "system:member-add"): SoulStatus | null {
-    const soul = this.db.prepare("SELECT status FROM souls WHERE user_id = ?").get(userId) as { status: SoulStatus } | undefined;
+  markReturnedToWaiting(userId: string, joinedAt: number | null, actor = "system:member-add"): SoulStatus | null {
+    const soul = this.db.prepare("SELECT status, joined_at, left_at FROM souls WHERE user_id = ?").get(userId) as
+      | { status: SoulStatus; joined_at: number | null; left_at: number | null }
+      | undefined;
     if (!soul) return null;
+    // **本当に出直したという証拠を要求する。**
+    // `GuildMemberAdd` は再接続などで在籍中の人に再送されることがある。行があるだけで
+    // 案内待ちへ落とすと、その拍子に魔族が入城前へ戻る。退出の記録があるか、
+    // Discord側の参加時刻が台帳の参加時刻より後になっていることを確かめる
+    const rejoined = joinedAt !== null && soul.joined_at !== null && joinedAt > soul.joined_at + 60;
+    if (soul.left_at === null && !rejoined) {
+      this.events.log("entry_rejoin_ignored", {
+        actor,
+        target: userId,
+        payload: { status: soul.status, soulJoinedAt: soul.joined_at, discordJoinedAt: joinedAt },
+      });
+      return null;
+    }
     const ts = now();
     if (soul.status === "waiting") {
       this.db.prepare("UPDATE souls SET returned_at = ?, updated_at = ? WHERE user_id = ?").run(ts, ts, userId);
@@ -133,10 +148,11 @@ export class Returns {
                 eval_invite_mark_cap = NULL,
                 eval_invite_baseline = NULL,
                 eval_invite_threshold = NULL,
+                joined_at = COALESCE(?, joined_at),
                 updated_at = ?
           WHERE user_id = ? AND status = ?`,
       )
-      .run(soul.status, ts, soul.status, ts, userId, soul.status).changes;
+      .run(soul.status, ts, soul.status, joinedAt, ts, userId, soul.status).changes;
     if (changed !== 1) return null;
     this.events.log("entry_returned_to_waiting", { actor, target: userId, payload: { previousStatus: soul.status } });
     return soul.status;

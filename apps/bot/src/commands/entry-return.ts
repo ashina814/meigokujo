@@ -133,9 +133,18 @@ async function preflight(interaction: ModalSubmitInteraction, services: Services
   const targetId = ticket.user_id;
   const member = await guild.members.fetch({ user: targetId, force: true }).catch(() => null);
   if (!member) return { ok: false, message: `<@${targetId}> がサーバーに見つかりません。何も変更していません。` };
-  const soul = services.entry.getSoul(targetId);
+  let soul = services.entry.getSoul(targetId);
   if (!soul) {
-    return { ok: false, message: `<@${targetId}> の魂の記録がありません。再参加の記録が作られていない可能性があります（運営へ確認してください）。` };
+    // Bot停止中の参加など、入城処理が一度も走らなかった人。ここで案内待ちの行を作る。
+    // 作るのは **waiting の行だけ** で、戻し先はこの後の運営の選択に委ねる
+    services.entry.recordJoin(targetId);
+    services.events.log("entry_soul_created_for_return", {
+      actor: "system:return-preflight",
+      target: targetId,
+      payload: { reason: "出戻り申請の対応時に台帳の行が無かったため作成" },
+    });
+    soul = services.entry.getSoul(targetId);
+    if (!soul) return { ok: false, message: `<@${targetId}> の魂の記録を作成できませんでした。` };
   }
   if (soul.status !== "waiting") {
     return { ok: false, message: `<@${targetId}> は現在 **${soul.status}** です。出戻りの反映は案内待ちからのみ行えます。` };
@@ -220,7 +229,7 @@ type Settled = { ok: true; result: ReturnType<Services["returns"]["reinstate"]> 
  * 確定直前にチケットと台帳を取り直すので、二重クリック・複数運営の同時操作・
  * 古いチケットからの操作はすべて2回目以降が空振りになる。
  */
-function settleReturn(
+export function settleReturn(
   services: Services,
   input: { threadId: string; targetId: string; target: ReturnTarget; actor: string; reason: string; evidence: Record<string, unknown> },
 ): Settled {
@@ -253,7 +262,7 @@ function settleReturn(
  * そこで **余分な階級ロールを先に外し、消えたことを確かめてから目標ロールを付ける**。
  * 外せなければ目標ロールは付けない（付与イベントを起こさなければ同期も走らない）。
  */
-async function applyReturnRoles(
+export async function applyReturnRoles(
   services: Services,
   guild: Guild,
   member: GuildMember,

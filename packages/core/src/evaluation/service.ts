@@ -279,8 +279,10 @@ export class Evaluation {
   // ---- 階級遷移（ロール操作はbot側。ここは魂台帳と事件録のみ）----
 
   demoteToMeirei(targetId: string, actor: string, reason: string): void {
+    // ever_meirei は「迷霊になった事実」なので、ここで立てる。
+    // 出戻りの判断画面で「以前は迷霊でした」と出すために使う（自動処理の根拠にはしない）
     this.db
-      .prepare("UPDATE souls SET status = 'meirei', updated_at = ? WHERE user_id = ?")
+      .prepare("UPDATE souls SET status = 'meirei', ever_meirei = 1, updated_at = ? WHERE user_id = ?")
       .run(now(), targetId);
     this.events.log("demotion", { actor, target: targetId, payload: { reason } });
   }
