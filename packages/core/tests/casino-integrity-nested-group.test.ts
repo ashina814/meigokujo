@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
@@ -257,5 +260,60 @@ describe("異常系: 検算Bが止める", () => {
         .run(detail.group_key, detail.ledger_tx_id, detail.op_key),
     ).toThrow(/UNIQUE/);
     ctx.db.close();
+  });
+});
+
+describe("移行: 既存DBの入れ子明細を説明できるようにする", () => {
+  it("op_key を持たない既存DBでも、移行後は検算Bが通る（本番 tx#3306 と同じ形）", () => {
+    const dir = mkdtempSync(join(tmpdir(), "casino-op-key-"));
+    const file = join(dir, "bot.db");
+    try {
+      // 1) 本番と同じ形のデータを作る: ランク卓着席の中で自動預入
+      const ctx = { ...setup(), db: openDb(file) } as unknown as Ctx;
+      const built = (() => {
+        const db = ctx.db;
+        const ledger = new Ledger(db);
+        const events = new EventLog(db);
+        const chipTx = new ChipTx(db);
+        const chips = new ChipLedger(db, ledger, events, { chipTx });
+        const escrow = new Escrow(db, chips, events);
+        const chipFlow = new CasinoChipFlow(db, chips, events);
+        openFormally(chipTx, ledger);
+        const built = { db, ledger, events, chipTx, chips, escrow, chipFlow, integrity: new CasinoIntegrity(db, ledger, chips, escrow) };
+        fundUser(built as unknown as Ctx, "alice", 50_000);
+        chips.runGroup({ groupKey: "ranked:join:pt_1:alice:op1", kind: "table_hold", actorId: "alice" }, () => {
+          chipFlow.ensureFreeChips("alice", 30_900, "ranked-join-pt_1-alice-op1");
+        });
+        return built;
+      })();
+      expect(built.integrity.checkB().ok).toBe(true);
+
+      // 2) 移行前の状態へ戻す（op_key を持たない既存行）
+      built.db.prepare("UPDATE casino_tx SET op_key = NULL, op_actor_id = NULL").run();
+      built.db.close();
+
+      // 3) 開き直す＝移行が走る
+      const db = openDb(file);
+      const ledger = new Ledger(db);
+      const events = new EventLog(db);
+      const chips = new ChipLedger(db, ledger, events, { chipTx: new ChipTx(db) });
+      const integrity = new CasinoIntegrity(db, ledger, chips, new Escrow(db, chips, events));
+
+      const nested = db
+        .prepare("SELECT op_key, op_actor_id, group_key FROM casino_tx WHERE ledger_tx_id IS NOT NULL")
+        .get() as { op_key: string; op_actor_id: string; group_key: string };
+      expect(nested.op_key).toBe("chip:auto-deposit:alice:ranked-join-pt_1-alice-op1");
+      expect(nested.op_actor_id).toBe("user:alice");
+      expect(nested.group_key).toBe("ranked:join:pt_1:alice:op1");
+      expect(integrity.checkB().ok).toBe(true);
+      // 埋めた根拠は監査へ残す
+      const audit = db
+        .prepare("SELECT payload FROM outbox WHERE payload LIKE ? ORDER BY id DESC LIMIT 1")
+        .get("%casino_tx_op_key_backfilled%") as { payload: string };
+      expect(JSON.parse(audit.payload).nested).toHaveLength(1);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

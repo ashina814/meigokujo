@@ -1025,10 +1025,10 @@ function migrateSoulStatusCheck(db: Database.Database): void {
  * `group_key` では特定できない）。Land が動かない内部移動は操作＝グループなので
  * `group_key` を入れる。
  *
- * **この埋め戻しの弱点は明示しておく。** 過去行については「Land取引のキー」を
- * そのまま写すので、`op_key` と Land 側キーの一致検査は過去行に対しては
- * 実質的な検査にならない（他の突き合わせ—金額・holder・actor・種別・版・
- * グループ確定—はそのまま効く）。以後に記録される行は `ChipTx.record()` が
+ * **この埋め戻しの弱点は明示しておく。** 過去行については Land 取引のキーと実行者を
+ * そのまま写すので、`op_key` / `op_actor_id` と Land 側の一致検査は過去行に対しては
+ * 実質的な検査にならない（他の突き合わせ—金額・holder・種別・版・グループ確定・
+ * 明細とグループの actor 一致—はそのまま効く）。以後に記録される行は `ChipTx.record()` が
  * Land 取引とは独立に書くため、一致検査が本来の意味を持つ。
  * 何件をどちらの根拠で埋めたかは監査記録として残す。
  */
@@ -1044,10 +1044,12 @@ function backfillChipTxOperationKey(db: Database.Database): void {
     )
     .all() as Array<{ id: number; group_key: string; idempotency_key: string }>;
 
+  // Land が動いた明細は、その Land 取引が操作そのもの。キーも実行者もそこから取る
+  // （入れ子だと `actor_id` は外側グループの実行者になっており、表記も揺れている）
   const fromLedger = db.prepare(
     `UPDATE casino_tx
         SET op_key = (SELECT t.idempotency_key FROM transactions t WHERE t.id = casino_tx.ledger_tx_id),
-            op_actor_id = actor_id
+            op_actor_id = (SELECT t.actor_id FROM transactions t WHERE t.id = casino_tx.ledger_tx_id)
       WHERE op_key IS NULL AND ledger_tx_id IS NOT NULL`,
   ).run().changes;
   const fromGroup = db.prepare(
