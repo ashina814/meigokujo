@@ -732,6 +732,7 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "casino_tx", "op_key", "TEXT");
   ensureColumn(db, "casino_tx", "op_actor_id", "TEXT");
   backfillChipTxOperationKey(db);
+  migrateMonthlyToThirtyDayTerms(db);
   // Land を動かした明細は、操作キーで一意。同じ操作キーで二重に動かせない
   db.exec(
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_casino_tx_op_key ON casino_tx(op_key) WHERE ledger_tx_id IS NOT NULL",
@@ -1067,6 +1068,63 @@ function backfillChipTxOperationKey(db: Database.Database): void {
     }),
     Math.floor(Date.now() / 1000),
   );
+}
+
+/**
+ * 暦月の月額を「購入から30日」へ移す。
+ *
+ * 旧仕様は「当月末まで有効・毎月1日に一括再課金」だったので、月末に買った人ほど
+ * 短い期間に満額を払っていた（本番では8/8購入が23日間）。30日制へ揃えるにあたり、
+ * **誰の期限も短くしない**ことを唯一の条件にする。
+ *
+ * 起点は「最後に支払いが成立した時刻」。初回購入だけの契約は購入時刻、
+ * 一括請求で更新された契約はその請求の時刻を使う（Land取引に残っている）。
+ * そこから30日を数え、いまの期限より後になる場合だけ延ばす。
+ */
+function migrateMonthlyToThirtyDayTerms(db: Database.Database): void {
+  const target = db
+    .prepare("SELECT COUNT(*) AS n FROM shop_items WHERE kind = 'monthly' AND (duration_days IS NULL OR duration_days <= 0)")
+    .get() as { n: number };
+  if (target.n === 0) return;
+
+  const ts = Math.floor(Date.now() / 1000);
+  const run = db.transaction(() => {
+    // 商品側: 暦月ではなく30日の期限商品にする
+    db.prepare(
+      "UPDATE shop_items SET duration_days = 30, updated_at = ? WHERE kind = 'monthly' AND (duration_days IS NULL OR duration_days <= 0)",
+    ).run(ts);
+
+    // 契約側: 最後に払った時刻 + 30日 と、いまの期限の遅い方へ
+    const rows = db
+      .prepare(
+        `SELECT p.id, p.expires_at,
+                MAX(p.purchased_at, COALESCE(
+                  (SELECT MAX(t.created_at) FROM transactions t
+                    WHERE t.ref_type = 'shop_monthly' AND t.ref_id = CAST(p.id AS TEXT)), 0)) AS last_paid_at
+           FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
+          WHERE p.status = 'active' AND i.duration_days = 30 AND p.expires_at IS NOT NULL`,
+      )
+      .all() as Array<{ id: number; expires_at: number; last_paid_at: number }>;
+    const changed: Array<{ purchaseId: number; from: number; to: number }> = [];
+    const update = db.prepare("UPDATE shop_purchases SET expires_at = ? WHERE id = ?");
+    for (const row of rows) {
+      const next = Math.max(row.expires_at, row.last_paid_at + 30 * 86_400);
+      if (next === row.expires_at) continue;
+      update.run(next, row.id);
+      changed.push({ purchaseId: row.id, from: row.expires_at, to: next });
+    }
+    db.prepare("INSERT INTO outbox (kind, payload, created_at) VALUES ('audit_log', ?, ?)").run(
+      JSON.stringify({
+        event: "shop_term_migrated_to_30d",
+        items: target.n,
+        contracts: rows.length,
+        extended: changed,
+        actor: "system:migration",
+      }),
+      ts,
+    );
+  });
+  run.immediate();
 }
 
 function ensureColumn(db: Database.Database, table: string, column: string, definition: string): void {

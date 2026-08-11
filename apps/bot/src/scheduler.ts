@@ -369,6 +369,25 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       console.error("[ショップ] 失効スイープ失敗:", e);
     }
 
+    // ── 期限が近い契約への予告（1契約につき1回だけ）──
+    // 自動更新が無いので、黙って切れるのが一番の不利益になる。延長するかは本人に委ねる
+    try {
+      for (const purchase of services.shop.expiringSoon(3)) {
+        const marker = `shop:expiry_notified:${purchase.id}:${purchase.expires_at}`;
+        if (services.settings.getString(marker)) continue;
+        const item = services.shop.getItem(purchase.item_id);
+        const user = await client.users.fetch(purchase.user_id).catch(() => null);
+        await user
+          ?.send(
+            `⏳ **${item?.name ?? `商品#${purchase.item_id}`}** の期限が <t:${purchase.expires_at}:D> に切れます。自動更新はありません。続ける場合は公式ショップの「契約中」から延長してください。`,
+          )
+          .catch(() => undefined);
+        services.settings.set(marker, 1, "system:shop-expiry");
+      }
+    } catch (e) {
+      console.error("[ショップ] 期限予告失敗:", e);
+    }
+
     // 失効購入のロール剥奪は失効処理と分離し、購入ID単位で毎分自己修復する。
     await processShopRoleRevocations(client, services).catch((e) =>
       console.error("[ショップ] 失効ロール剥奪失敗:", e),

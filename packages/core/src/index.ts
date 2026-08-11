@@ -103,8 +103,9 @@ export {
 export {
   Shop,
   ShopError,
-  nextFirstOfMonthJst,
-  endOfMonthJst,
+  DEFAULT_TERM_DAYS,
+  termDays,
+  extendedExpiry,
   type ShopItemRow,
   type ShopItemInput,
   type PurchaseRow,

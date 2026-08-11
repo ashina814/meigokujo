@@ -145,7 +145,10 @@ export type ShopErrorCode =
   | "ERR_ROLE_REQUIRED"
   | "ERR_NO_PRICE"
   | "ERR_ALREADY_ACTIVE"
-  | "ERR_PURCHASE_NOT_FOUND";
+  | "ERR_PURCHASE_NOT_FOUND"
+  | "ERR_NOT_OWNER"
+  | "ERR_NOT_ACTIVE"
+  | "ERR_NOT_EXTENDABLE";
 
 export class ShopError extends Error {
   constructor(readonly code: ShopErrorCode, readonly details: Record<string, unknown> = {}) {
@@ -157,18 +160,27 @@ export class ShopError extends Error {
 const now = () => Math.floor(Date.now() / 1000);
 const DAY = 86_400;
 
-/** 「翌月1日 00:00 JST」の unix秒（暦月期限の名残。30日制への移行で不要になる） */
-export function nextFirstOfMonthJst(fromUnixSec: number = now()): number {
-  const d = new Date((fromUnixSec + 9 * 3600) * 1000); // JSTに寄せる
-  const y = d.getUTCFullYear();
-  const m = d.getUTCMonth(); // 0..11
-  const next = Date.UTC(y, m + 1, 1, 0, 0, 0);
-  return Math.floor(next / 1000) - 9 * 3600;
+/** 期限商品の既定の期間。旧「月額」もここへ寄せる（暦月ではなく購入から30日） */
+export const DEFAULT_TERM_DAYS = 30;
+
+/**
+ * その商品の有効期間（日）。期限を持たない単発商品は null。
+ *
+ * 暦月（当月末まで・毎月1日一括）は廃止した。月末に買った人が数日で切れて
+ * すぐ再課金される、という不公平がそのまま料金になっていたため。
+ */
+export function termDays(item: Pick<ShopItemRow, "kind" | "duration_days">): number | null {
+  if (item.duration_days && item.duration_days > 0) return item.duration_days;
+  // 旧データの保険。移行で duration_days=30 を埋めるが、取りこぼしても月額扱いを続けない
+  return item.kind === "monthly" ? DEFAULT_TERM_DAYS : null;
 }
 
-/** 「当月末 23:59:59 JST」の unix秒 */
-export function endOfMonthJst(fromUnixSec: number = now()): number {
-  return nextFirstOfMonthJst(fromUnixSec) - 1;
+/**
+ * 延長後の期限。**残り期間を損しない。**
+ * 期限前に延長しても切り捨てず、切れた後なら今から数え直す。
+ */
+export function extendedExpiry(currentExpiresAt: number | null, days: number, from: number = now()): number {
+  return Math.max(currentExpiresAt ?? 0, from) + days * DAY;
 }
 
 export interface ShopOptions {
@@ -342,8 +354,8 @@ export class Shop {
       throw new ShopError("ERR_ROLE_REQUIRED", { roleId: item.require_role_id });
     }
     if (item.stock !== null && item.stock <= 0) throw new ShopError("ERR_NO_STOCK", { itemId: item.id });
-    // 月額の重複防止
-    if (item.kind === "monthly") {
+    // 期限商品を二重に契約させない（UI側はこの場合「延長」を出す）
+    if (termDays(item) !== null) {
       const existing = this.db
         .prepare("SELECT id FROM shop_purchases WHERE item_id = ? AND user_id = ? AND status = 'active'")
         .get(item.id, input.userId) as { id: number } | undefined;
@@ -377,13 +389,9 @@ export class Shop {
       paidLand = item.price_land;
     }
 
-    // 期限計算
-    let expiresAt: number | null = null;
-    if (item.kind === "monthly") {
-      expiresAt = endOfMonthJst(ts);
-    } else if (item.duration_days) {
-      expiresAt = ts + item.duration_days * DAY;
-    }
+    // 期限計算: 買った時点から数える（暦月ではない）
+    const days = termDays(item);
+    const expiresAt = days === null ? null : ts + days * DAY;
 
     const info = this.db
       .prepare(
@@ -405,6 +413,56 @@ export class Shop {
 
   getPurchase(id: number): PurchaseRow | undefined {
     return this.db.prepare("SELECT * FROM shop_purchases WHERE id = ?").get(id) as PurchaseRow | undefined;
+  }
+
+  /**
+   * 期限を30日延ばす。**自動更新ではない**（本人が押したときだけ動く）。
+   *
+   * 支払いは購入と同じ Land 焼却。契約は行を増やさず同じ1行を延ばすので、
+   * 「いま何を契約していて、いつまでか」が利用者からも運営からも1行で読める。
+   * 二重延長は Land 取引の冪等キーで止める（同じ操作IDなら2回目は資金も期限も動かない）。
+   */
+  extend(input: {
+    purchaseId: number;
+    userId: string;
+    actor: string;
+    operationId: string;
+  }): { purchase: PurchaseRow; item: ShopItemRow; extended: boolean; addedDays: number } {
+    const purchase = this.getPurchase(input.purchaseId);
+    if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+    if (purchase.user_id !== input.userId) throw new ShopError("ERR_NOT_OWNER", { purchaseId: input.purchaseId });
+    if (purchase.status !== "active") throw new ShopError("ERR_NOT_ACTIVE", { status: purchase.status });
+    const item = this.getItem(purchase.item_id);
+    if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: purchase.item_id });
+    if (!item.enabled) throw new ShopError("ERR_ITEM_DISABLED", { itemId: item.id });
+    const days = termDays(item);
+    if (days === null) throw new ShopError("ERR_NOT_EXTENDABLE", { itemId: item.id });
+    if (item.price_land === null) throw new ShopError("ERR_NO_PRICE", { itemId: item.id });
+
+    const account = `user:${input.userId}`;
+    this.ledger.ensureAccount(account, "user");
+    const paid = this.ledger.transfer({
+      from: account,
+      to: TREASURY,
+      amount: item.price_land,
+      type: "tip_burn",
+      actor: input.actor,
+      reason: `公式ショップ延長: ${item.name}`,
+      refType: "shop_extend",
+      refId: String(purchase.id),
+      idempotencyKey: `shop:extend:${purchase.id}:${input.operationId}`,
+    });
+    // 同じ操作の再送。資金が動いていないので期限も動かさない
+    if (paid.duplicate) return { purchase, item, extended: false, addedDays: 0 };
+
+    const nextExpires = extendedExpiry(purchase.expires_at, days);
+    this.db.prepare("UPDATE shop_purchases SET expires_at = ? WHERE id = ?").run(nextExpires, purchase.id);
+    this.events.log("shop_extended", {
+      actor: input.actor,
+      target: input.userId,
+      payload: { purchaseId: purchase.id, itemId: item.id, days, from: purchase.expires_at, to: nextExpires },
+    });
+    return { purchase: this.getPurchase(purchase.id)!, item, extended: true, addedDays: days };
   }
 
   listUserPurchases(userId: string, opts: { activeOnly?: boolean } = {}): PurchaseRow[] {
@@ -597,6 +655,24 @@ export class Shop {
    * 1件ずつトランザクションで確定させる。status の更新と剥奪キューへの登録は
    * 必ず一緒に成立させ、途中で失敗した1件が他の件を巻き添えにしないため。
    */
+  /**
+   * まもなく期限が切れる契約（既定は3日以内）。
+   *
+   * 自動更新をやめた以上、**黙って権利が消える**のが一番の不利益になる。
+   * 「残りが少ない」ことだけ知らせて、延長するかは本人に委ねる。
+   */
+  expiringSoon(withinDays = 3): PurchaseRow[] {
+    const ts = now();
+    return this.db
+      .prepare(
+        `SELECT * FROM shop_purchases
+          WHERE status = 'active' AND expires_at IS NOT NULL
+            AND expires_at > ? AND expires_at <= ?
+          ORDER BY expires_at`,
+      )
+      .all(ts, ts + withinDays * DAY) as PurchaseRow[];
+  }
+
   expireOverdue(actor: string, limit = 200): { expired: PurchaseRow[]; failed: Array<{ purchaseId: number; error: string }> } {
     const ts = now();
     const due = this.db
