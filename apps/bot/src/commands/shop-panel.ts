@@ -11,7 +11,7 @@ import {
 } from "discord.js";
 import { LedgerError, ShopError, type ShopItemRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
-import { refreshEvalStatsForUser } from "../eval-daily.js";
+import { deliverPurchase } from "../shop-delivery.js";
 import { meetsRoleRequirement, requirementLabel } from "../rank-requirement.js";
 import type { Services } from "../services.js";
 
@@ -163,8 +163,8 @@ function purchaseOnce(
       const purchase = services.shop.getPurchase(existing.purchase_id);
       const item = services.shop.getItem(existing.item_id);
       if (!purchase || !item) throw new Error("shop operation result is missing");
-      // 課金は冪等でも配送はそうではない（`extend_deadline` は期限へ加算する）。
-      // 再実行だと分かる印を返し、配送の副作用を二度走らせない（監査項目13）
+      // 課金だけが冪等。**配送は再実行してよい**（未配送なら届けるのが正しい）。
+      // 二度配らないのは購入行の配送状態が保証するので、ここでは印を返すだけにする
       return { purchase, item, needsManualDelivery: item.delivery === "manual", replayed: true };
     }
 
@@ -191,6 +191,12 @@ function purchaseOnce(
   return execute.immediate();
 }
 
+/** 手動配送の案内。商品説明があれば併記する */
+function manualDeliveryNote(item: ShopItemRow, head: string): string {
+  return item.description ? `${head}
+${item.description}` : head;
+}
+
 async function finishPurchase(
   interaction: ButtonInteraction,
   services: Services,
@@ -198,20 +204,29 @@ async function finishPurchase(
 ): Promise<void> {
   const { item, purchase } = result;
   let deliveryNote = "";
-  if (result.replayed) {
-    // 既に配送済みの購入。ロール付与・期限延長・スタッフ通知をもう一度走らせない
-    deliveryNote = "この購入は完了済みです（配送は実行済み）。";
-  } else if (item.delivery === "auto") {
-    deliveryNote = await tryAutoDeliver(interaction, services, item, interaction.user.id).catch(
-      () => "自動配送に失敗しました。運営にお問い合わせください。",
-    );
+  let delivered = true;
+  if (item.delivery === "auto") {
+    // **replayed でも配送を試す。** 課金は冪等（operation IDで一度きり）だが、
+    // 配送は成功するまで再試行してよい。二度配らないのは配送状態が保証する。
+    const outcome = await deliverPurchase(services, interaction.guild, purchase, `user:${interaction.user.id}`);
+    deliveryNote = outcome.message;
+    delivered = outcome.state !== "failed";
+  } else if (result.replayed) {
+    deliveryNote = manualDeliveryNote(item, "この購入は受付済みです（スタッフ対応待ち）。");
   } else {
-    deliveryNote = "スタッフが配送の対応をします。";
+    // 手動配送は商品ごとに次の一手が違う（再評価チャレンジなら面談チケットを開く）。
+    // 商品説明をそのまま出して、案内を商品側のデータで持てるようにする
+    deliveryNote = manualDeliveryNote(item, "スタッフが配送の対応をします。");
     await notifyStaffForDelivery(interaction, services, purchase.id, item).catch(() => undefined);
   }
   const expires = purchase.expires_at ? `\n有効期限: <t:${purchase.expires_at}:D>` : "";
+  // 配送が失敗したのに「購入しました」だけ出すと、届いたように読める。
+  // 課金は成立し配送は未完了、という事実をそのまま書く
+  const head = delivered
+    ? `✅ **${item.name}** を購入しました`
+    : `⚠️ **${item.name}** の支払いは完了しましたが、**配送が完了していません**（購入 #${purchase.id}）`;
   await interaction.editReply({
-    content: `✅ **${item.name}** を購入しました${deliveryNote ? `\n${deliveryNote}` : ""}${expires}`,
+    content: `${head}${deliveryNote ? `\n${deliveryNote}` : ""}${expires}`,
     embeds: [],
     components: [],
   });
@@ -472,55 +487,6 @@ export async function handleShopSelect(
       components: [],
     });
   }
-}
-
-async function tryAutoDeliver(
-  interaction: ButtonInteraction,
-  services: Services,
-  item: ShopItemRow,
-  userId: string,
-): Promise<string> {
-  const data: { role_id?: string; days?: number } = item.delivery_data ? JSON.parse(item.delivery_data) : {};
-  if (item.delivery_kind === "add_role") {
-    const roleId = data.role_id;
-    if (!roleId) return "配送設定が不完全です（ロールID未設定）。";
-    const guild = interaction.guild;
-    if (!guild) return "ギルド情報が取れませんでした。";
-    const member = await guild.members.fetch(userId).catch(() => null);
-    if (!member) return "メンバー情報の取得に失敗しました。";
-    await member.roles.add(roleId).catch(() => undefined);
-    return `ロールを付与しました: <@&${roleId}>`;
-  }
-  if (item.delivery_kind === "extend_deadline") {
-    const days = data.days ?? 1;
-    const soul = services.entry.getSoul(userId);
-    if (!soul || !soul.eval_deadline_at) return "評価期限を持っていないため延長できません。";
-    services.db
-      .prepare("UPDATE souls SET eval_deadline_at = eval_deadline_at + ?, updated_at = ? WHERE user_id = ?")
-      .run(days * 86_400, Math.floor(Date.now() / 1_000), userId);
-    if (interaction.guild) {
-      await refreshEvalStatsForUser(interaction.guild, services, userId).catch(() => undefined);
-    }
-    return `評価期限を **+${days}日** 延長しました。評価スレッドにも反映済みです。`;
-  }
-  if (item.delivery_kind === "revoke_meirei") {
-    const soul = services.entry.getSoul(userId);
-    if (!soul) return "魂記録がありません。";
-    if (soul.status !== "meirei") return "現在の状態が迷霊ではありません。";
-    services.entry.resetToWaiting(userId, `shop:${item.id}`);
-    const guild = interaction.guild;
-    if (guild) {
-      const meireiRoleId = services.settings.getString("role:meirei");
-      const waitRoleId = services.settings.getString("role:queue_wait");
-      const member = await guild.members.fetch(userId).catch(() => null);
-      if (member) {
-        if (meireiRoleId) await member.roles.remove(meireiRoleId).catch(() => undefined);
-        if (waitRoleId) await member.roles.add(waitRoleId).catch(() => undefined);
-      }
-    }
-    return "迷霊から案内待ちに戻しました（再評価チャレンジ発動）。";
-  }
-  return "自動配送は未対応の種類です。";
 }
 
 async function notifyStaffForDelivery(

@@ -291,6 +291,165 @@ export class Evaluation {
   }
 
   /**
+   * 再評価面談OK: `meirei → ghost` の復帰。
+   *
+   * **`ghostify()` を流用しない。** あちらは入城処理なので初期発行・招待実績の計上・
+   * 招待者の期限延長まで抱えている。ここは「一度落ちた人がもう一度評価を受け直す」
+   * 復帰なので、**新しい評価サイクルの開始だけ**を行う。
+   *
+   * - 初期Landの再発行なし・`invites` の再計上なし・招待者の期限延長なし・予約行に触れない
+   * - 招待実績由来の昇格スコアは `invites` を消さないので現状どおり引き継がれる
+   * - 以前の昇格印・降格印は**履歴を残したまま** revoked にする（新しい評価を白紙から始める）
+   *
+   * `WHERE status='meirei'` を条件に入れてあるので、面談中に別経路で階級が動いていたら
+   * 0行更新で `null` を返す（前提が崩れた状態で書かない）。
+   */
+  reinstateFromMeirei(
+    targetId: string,
+    actor: string,
+    evidence: Record<string, unknown>,
+  ): { deadline: number; revokedMarks: number; policyVersion: string } | null {
+    const ts = now();
+    const baseDays = positiveInt(this.settings.getNumber("eval_base_period_days")) ?? SETTING_DEFAULTS.eval_base_period_days;
+    const promotionRequired =
+      positiveInt(this.settings.getNumber("promotion_marks_required")) ?? SETTING_DEFAULTS.promotion_marks_required;
+    const demotionThreshold =
+      positiveInt(this.settings.getNumber("demotion_marks_threshold")) ?? SETTING_DEFAULTS.demotion_marks_threshold;
+    const inviteMarkPerPerson =
+      nonNegativeNumber(this.settings.getNumber("invite_mark_per_person")) ?? SETTING_DEFAULTS.invite_mark_per_person;
+    const inviteMarkCap = nonNegativeNumber(this.settings.getNumber("invite_mark_cap")) ?? SETTING_DEFAULTS.invite_mark_cap;
+    const policyVersion =
+      this.settings.getString("eval_policy_version") ??
+      `reeval:${promotionRequired}:${demotionThreshold}:${inviteMarkPerPerson}:${inviteMarkCap}:${ts}`;
+    const deadline = ts + baseDays * 86_400;
+
+    const body = () => {
+      const changed = this.db
+        .prepare(
+          `UPDATE souls
+              SET status = 'ghost',
+                  ghost_at = ?,
+                  eval_started_at = ?,
+                  eval_deadline_at = ?,
+                  eval_extension_days = 0,
+                  eval_policy_version = ?,
+                  eval_promotion_required = ?,
+                  eval_demotion_threshold = ?,
+                  eval_invite_mark_per_person = ?,
+                  eval_invite_mark_cap = ?,
+                  updated_at = ?
+            WHERE user_id = ? AND status = 'meirei'`,
+        )
+        .run(ts, ts, deadline, policyVersion, promotionRequired, demotionThreshold, inviteMarkPerPerson, inviteMarkCap, ts, targetId)
+        .changes;
+      if (changed !== 1) return null;
+      // 履歴は消さず、有効な印だけ取り消す（再評価は白紙から）
+      const revokedMarks = this.db
+        .prepare("UPDATE marks SET revoked_at = ? WHERE target_id = ? AND revoked_at IS NULL")
+        .run(ts, targetId).changes;
+      return { revokedMarks };
+    };
+    // 呼び出し側が「面談結果 + 購入の消費 + チケットclose」を1トランザクションに
+    // まとめることがあるので、既にトランザクション中ならそこへ相乗りする
+    const result = this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+    if (!result) {
+      this.events.log("reeval_reinstate_skipped", { actor, target: targetId, payload: { reason: "precondition_lost" } });
+      return null;
+    }
+    if (result.revokedMarks > 0) {
+      this.events.log("reeval_marks_reset", {
+        actor,
+        target: targetId,
+        payload: { revoked: result.revokedMarks, reason: "再評価サイクル開始のため以前の印を取り消し" },
+      });
+    }
+    this.events.log("reeval_reinstated", {
+      actor,
+      target: targetId,
+      payload: {
+        from: "meirei",
+        to: "ghost",
+        ghostAt: ts,
+        evalStartedAt: ts,
+        evalDeadlineAt: deadline,
+        policy: { policyVersion, promotionRequired, demotionThreshold, inviteMarkPerPerson, inviteMarkCap, baseDays },
+        revokedMarks: result.revokedMarks,
+        ...evidence,
+      },
+    });
+    return { deadline, revokedMarks: result.revokedMarks, policyVersion };
+  }
+
+  /**
+   * 旧ショップ自動解除の巻き戻し（`waiting → meirei`）。
+   *
+   * 撤回した自動配送が迷霊を機械的に解除してしまった人を、面談を受けられる状態へ戻す。
+   * **status だけ**を戻し、旧自動解除で消えた評価期間情報は推測して作り直さない。
+   * 面談OKになった時点で `reinstateFromMeirei()` が新しい評価サイクルを正規に作る。
+   *
+   * 呼び出し側が対象を固定の許可リストへ限る前提の、一回限りの回収操作。
+   */
+  legacyRollbackToMeirei(targetId: string, actor: string, evidence: Record<string, unknown>): boolean {
+    const changed = this.db
+      .prepare("UPDATE souls SET status = 'meirei', updated_at = ? WHERE user_id = ? AND status = 'waiting'")
+      .run(now(), targetId).changes;
+    if (changed !== 1) {
+      this.events.log("reeval_legacy_rollback_skipped", { actor, target: targetId, payload: { reason: "precondition_lost" } });
+      return false;
+    }
+    this.events.log("reeval_legacy_rollback", { actor, target: targetId, payload: { from: "waiting", to: "meirei", ...evidence } });
+    return true;
+  }
+
+  /** 再評価面談NG。status・ロール・印のどれも動かさず、判断だけ残す */
+  recordReevalRejection(targetId: string, actor: string, evidence: Record<string, unknown>): void {
+    this.events.log("reeval_rejected", { actor, target: targetId, payload: evidence });
+  }
+
+  /**
+   * 履歴追認: `waiting → majin` を台帳へ書くだけ。
+   *
+   * **評価期間も初期発行も作らない。** 既に運用上は魔人として扱われている人の
+   * 台帳を実態へ合わせるためだけの操作なので、`ghostify()` の副作用を持ち込まない。
+   * `WHERE status='waiting'` を条件に入れてあるので、同時実行や二度押しで
+   * 上位階級を巻き戻すことはない（0行更新になり false が返る）。
+   */
+  backfillHistoricalRank(
+    targetId: string,
+    to: "majin",
+    actor: string,
+    evidence: Record<string, unknown>,
+  ): boolean {
+    const changed = this.db
+      .prepare("UPDATE souls SET status = ?, updated_at = ? WHERE user_id = ? AND status = 'waiting'")
+      .run(to, now(), targetId).changes;
+    if (changed !== 1) {
+      this.events.log("rank_history_backfill_skipped", { actor, target: targetId, payload: { to, reason: "precondition_lost" } });
+      return false;
+    }
+    this.events.log("rank_history_backfill", { actor, target: targetId, payload: { from: "waiting", to, evidence } });
+    return true;
+  }
+
+  /**
+   * 昇格記録の追いつき: `ghost → majin`。
+   *
+   * `promoteToMajin()` と**同じDB意味論**（status と評価期限のクリア）と `promotion` 事件録だけを行う。
+   * ロール付与も公開告知もしない（どちらも既に済んでいるのが前提）。
+   */
+  catchUpPromotion(targetId: string, actor: string, evidence: Record<string, unknown>): boolean {
+    const changed = this.db
+      .prepare("UPDATE souls SET status = 'majin', eval_deadline_at = NULL, updated_at = ? WHERE user_id = ? AND status = 'ghost'")
+      .run(now(), targetId).changes;
+    if (changed !== 1) {
+      this.events.log("promotion_catchup_skipped", { actor, target: targetId, payload: { reason: "precondition_lost" } });
+      return false;
+    }
+    this.events.log("promotion", { actor, target: targetId, payload: { to: "majin", catchup: true, evidence } });
+    return true;
+  }
+
+  /**
    * Discord のロール構成に合わせて階級を書き直す（rank sync 専用）。
    *
    * **どの遷移を許すかはここでは判断しない。** 呼び出し側が

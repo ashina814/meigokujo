@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { WITHDRAWN_DELIVERY_KINDS, parseDeliverySnapshot } from "../shop/service.js";
 
 /**
  * スキーマは追記専用の台帳を中心に設計されている（経済設計.md §3）。
@@ -751,6 +752,12 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "recruits", "refund_tx_id", "INTEGER REFERENCES transactions(id)");
   ensureColumn(db, "recruits", "updated_at", "INTEGER");
   ensureColumn(db, "shop_purchases", "delivery_snapshot_json", "TEXT");
+  // 配送状態を課金から分離する（購入は成立したが配送が終わっていない、を表せるようにする）。
+  // 旧行の移行は backfillShopDeliveryState() で行う。
+  ensureColumn(db, "shop_purchases", "delivery_state", "TEXT");
+  ensureColumn(db, "shop_purchases", "delivery_attempts", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "shop_purchases", "delivery_error", "TEXT");
+  ensureColumn(db, "shop_purchases", "delivery_updated_at", "INTEGER");
   ensureColumn(db, "scheduler_chunk_batches", "sent_at", "INTEGER");
   ensureColumn(db, "casino_chip_external_confirmations", "chip_amount", "INTEGER NOT NULL DEFAULT 0 CHECK (chip_amount >= 0)");
   // PR12監査: opening_resetの所有権（execution・actor）をcasino_status自体から機械的に
@@ -773,7 +780,89 @@ export function openDb(path: string): Database.Database {
   `);
   backfillEvaluationMarkWeights(db);
   backfillEvaluationPolicySnapshots(db);
+  backfillShopDeliveryState(db);
   return db;
+}
+
+/**
+ * 既存購入へ配送状態を割り当てる。
+ *
+ * `delivered_at` は「手動配送のスタッフ完了マーク」でしか埋まっておらず、
+ * **自動配送は成功しても NULL のまま**だった。つまり `delivered_at IS NULL` は
+ * 「未配送」ではなく「手動配送の完了操作をしていない」を意味する行が大半を占める。
+ * そのまま `pending` にすると、自動配送の再実行が大量に走ってしまう。
+ *
+ * そこで移行では**再配送を発生させない**ことを優先し、次の規則で割り当てる。
+ * - `delivered_at` が入っている … `delivered`（根拠のある完了）
+ * - 手動配送(`delivery='manual'`)で未マーク … `pending`（元から人手待ち。意味が変わらない）
+ * - 自動配送で未マーク … 原則 `delivered`（過去分は完了扱い）。
+ *   `add_role` と `extend_deadline` は再実行の副作用が読めないので、ここで pending にしない
+ * - **自動配送を取りやめた種別**（`revoke_meirei`＝再評価チャレンジ）… `failed`。
+ *   配送は完了していないという事実を残しつつ、自動でも運営の回収導線でも実行しない。
+ *   この商品は「購入 → 再評価面談チケット → 面談OKで亡霊へ復帰」に変わったため、
+ *   機械が status とロールを動かしてよい対象ではなくなった。
+ *
+ * 判定の根拠は**購入時スナップショットだけ**にする。商品の現在設定を見ると、買った後に
+ * 商品を自動配送へ変えただけで過去の購入が再配送候補になってしまう。スナップショットを
+ * 持たない旧購入は「legacy unknown」として自動再配送の候補にしない。
+ *
+ * `pending` にしても**自動では何も起きない**。運営が回収導線から purchase を選んだ時だけ走る。
+ *
+ * 以後の購入は配送経路が自分で `pending → delivered/failed` を書くので、
+ * この移行が効くのは**この変更より前に作られた行だけ**。
+ */
+function backfillShopDeliveryState(db: Database.Database): void {
+  const rows = db
+    .prepare(
+      `SELECT p.id, p.user_id, p.delivered_at, p.purchased_at, p.delivery_snapshot_json,
+              i.delivery AS item_delivery,
+              (SELECT status FROM souls WHERE souls.user_id = p.user_id) AS soul_status
+         FROM shop_purchases p
+         JOIN shop_items i ON i.id = p.item_id
+        WHERE p.delivery_state IS NULL`,
+    )
+    .all() as Array<{
+    id: number;
+    user_id: string;
+    delivered_at: number | null;
+    purchased_at: number;
+    delivery_snapshot_json: string | null;
+    item_delivery: string;
+    soul_status: string | null;
+  }>;
+  if (rows.length === 0) return;
+
+  const update = db.prepare("UPDATE shop_purchases SET delivery_state = ?, delivery_updated_at = ? WHERE id = ? AND delivery_state IS NULL");
+  const markWithdrawn = db.prepare(
+    "UPDATE shop_purchases SET delivery_error = 'auto_delivery_withdrawn:revoke_meirei' WHERE id = ? AND delivery_error IS NULL",
+  );
+  const withdrawn: number[] = [];
+  const assign = db.transaction(() => {
+    for (const row of rows) {
+      let state: "delivered" | "pending" | "failed" = "delivered";
+      if (row.delivered_at !== null) {
+        state = "delivered";
+      } else {
+        // 判定の根拠は**購入時スナップショット**。商品の現在設定は使わない
+        const snapshot = parseDeliverySnapshot(row.delivery_snapshot_json);
+        if (snapshot && WITHDRAWN_DELIVERY_KINDS.has(snapshot.delivery_kind)) {
+          // 自動配送を取りやめた種別（再評価チャレンジ）。配送は完了していないが、
+          // 自動でも運営の回収導線でも実行しない。事実として failed に置き、
+          // 面談導線で人が処理する
+          withdrawn.push(row.id);
+          state = "failed";
+        } else if (snapshot === null && row.item_delivery === "manual") {
+          // スナップショットを持たない手動配送＝元から人手待ちのキュー。
+          // 自動再配送の候補にはならない（listUndeliveredAuto はスナップショット必須）ので、
+          // 意味を変えずに pending のまま残す
+          state = "pending";
+        }
+      }
+      update.run(state, row.delivered_at ?? row.purchased_at, row.id);
+    }
+    for (const id of withdrawn) markWithdrawn.run(id);
+  });
+  assign.immediate();
 }
 
 /** `souls.status` が取り得る値。CHECK制約・型・同期ロジックの唯一の真実源 */

@@ -17,6 +17,7 @@ export interface TicketRow {
   claimed_by: string | null;
   reminded_at: number | null;
   panel_id: string | null;
+  linked_purchase_id: number | null;
   panel_name: string | null;
   panel_notify_role_ids_json: string | null;
   panel_staff_role_ids_json: string | null;
@@ -185,6 +186,12 @@ export class Tickets {
     this.addTicketColumn("panel_name", "TEXT");
     this.addTicketColumn("panel_notify_role_ids_json", "TEXT");
     this.addTicketColumn("panel_staff_role_ids_json", "TEXT");
+    // 再評価面談チケットと、その面談権（再評価チャレンジの購入）の紐付け。
+    // 1つの購入を複数チケットで消費できないよう、DB側で一意にする
+    this.addTicketColumn("linked_purchase_id", "INTEGER");
+    this.db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_linked_purchase ON tickets(linked_purchase_id) WHERE linked_purchase_id IS NOT NULL",
+    );
     this.addPanelColumn("archived_at", "INTEGER");
     this.addPanelColumn("archived_by", "TEXT");
     const ts = now();
@@ -437,6 +444,9 @@ export class Tickets {
         .prepare("UPDATE tickets SET status = 'closed', updated_at = ? WHERE thread_id = ? AND status IN ('open','claimed')")
         .run(now(), threadId);
       if (changed.changes !== 1) return undefined;
+      // 面談結果を出さずに閉じたなら、予約していた購入権を戻す。
+      // 消費済み（承認・見送り済み）なら戻らない
+      if (ticket.linked_purchase_id !== null) this.releaseUnconsumedPurchase(threadId, staffId);
       this.events.log("ticket_closed", {
         actor: staffId,
         target: ticket.user_id,
@@ -456,6 +466,59 @@ export class Tickets {
 
   markReminded(threadId: string): void {
     this.db.prepare("UPDATE tickets SET reminded_at = ? WHERE thread_id = ?").run(now(), threadId);
+  }
+
+  /**
+   * 面談権（購入）をチケットへ結び付ける。
+   *
+   * 一意インデックスが効くので、同じ購入を2つのチケットへは結べない。
+   * 競合したら `false` を返し、呼び出し側は「他のチケットで消費済み」として扱う。
+   */
+  linkPurchase(threadId: string, purchaseId: number, actor: string): boolean {
+    try {
+      const changed = this.db
+        .prepare("UPDATE tickets SET linked_purchase_id = ?, updated_at = ? WHERE thread_id = ? AND linked_purchase_id IS NULL")
+        .run(purchaseId, now(), threadId).changes;
+      if (changed !== 1) return false;
+    } catch {
+      return false; // 一意制約違反＝他のチケットが先に消費した
+    }
+    this.events.log("ticket_purchase_linked", { actor, payload: { threadId, purchaseId } });
+    return true;
+  }
+
+  /**
+   * 面談結果が出ないまま閉じたチケットの予約を戻す。
+   *
+   * `linked_purchase_id` は**予約**でしかない。面談結果（承認・見送り）を出して初めて
+   * 消費になる。結果を出さずに普通に閉じた場合、購入権が閉じたチケットへ
+   * 永久に取られたままだと、次の面談チケットで使えなくなる。
+   *
+   * 消費済み（購入が delivered）なら戻さない。承認・見送りの後で閉じても権利は復活しない。
+   */
+  releaseUnconsumedPurchase(threadId: string, actor: string): number | null {
+    const row = this.db
+      .prepare(
+        `SELECT t.linked_purchase_id AS purchase_id
+           FROM tickets t
+           JOIN shop_purchases p ON p.id = t.linked_purchase_id
+          WHERE t.thread_id = ?
+            AND p.delivered_at IS NULL
+            AND COALESCE(p.delivery_state, 'pending') <> 'delivered'`,
+      )
+      .get(threadId) as { purchase_id: number } | undefined;
+    if (!row) return null;
+    const changed = this.db
+      .prepare("UPDATE tickets SET linked_purchase_id = NULL, updated_at = ? WHERE thread_id = ? AND linked_purchase_id = ?")
+      .run(now(), threadId, row.purchase_id).changes;
+    if (changed !== 1) return null;
+    this.events.log("ticket_purchase_released", { actor, payload: { threadId, purchaseId: row.purchase_id } });
+    return row.purchase_id;
+  }
+
+  /** その購入を消費しているチケット（あれば） */
+  ticketByPurchase(purchaseId: number): TicketRow | undefined {
+    return this.db.prepare("SELECT * FROM tickets WHERE linked_purchase_id = ?").get(purchaseId) as TicketRow | undefined;
   }
 
   openByUserPanel(userId: string, panelId: string): TicketRow | undefined {

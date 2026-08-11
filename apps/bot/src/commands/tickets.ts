@@ -15,6 +15,7 @@ import {
 } from "discord.js";
 import type { TicketKind, TicketPanel, TicketRow } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
+import { REEVAL_PANEL_ID, linkReevalPurchase, reevalActionRow } from "./reeval.js";
 import type { Services } from "../services.js";
 
 const LEGACY_KIND_LABELS: Record<string, string> = { return: "出戻り申請", consult: "個別相談" };
@@ -349,6 +350,10 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
       staffRoleIds: validStaffRoleIds,
     });
     ticketCreated = true;
+    // 再評価面談は面談権（再評価チャレンジの購入）と機械的に紐付ける。
+    // 同じ購入は一意インデックスで1チケットしか消費できない
+    const reevalPurchaseId =
+      panel.id === REEVAL_PANEL_ID ? linkReevalPurchase(services, thread.id, interaction.user.id) : null;
     await thread.send({
       content: [
         ...[
