@@ -15,6 +15,8 @@ import { ticketStaffRoleIds } from "./commands/tickets.js";
 import { isSeatOccupied } from "./casino/common.js";
 import { retryPendingRankedTableMessages } from "./casino/ranked-table-ui.js";
 import type { Services } from "./services.js";
+import { enforceConversationCourtRestrictionForClient } from "./conversation-court.js";
+import { jstNow } from "./jst-time.js";
 import {
   cleanupCompletedChunkBatches,
   finalizeChunkBatch,
@@ -29,40 +31,7 @@ import {
 } from "./scheduler-recovery.js";
 
 export { processShopRoleRevocations } from "./scheduler-recovery.js";
-
-/** JSTの現在時刻の分解値。VPSのTZに依存しないよう明示的に変換する */
-export function jstNow(date = new Date()): {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  period: string;
-  dateStr: string; // 'YYYY-MM-DD'
-} {
-  const parts = new Intl.DateTimeFormat("ja-JP", {
-    timeZone: "Asia/Tokyo",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(date);
-  const get = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? 0);
-  const year = get("year");
-  const month = get("month");
-  const day = get("day");
-  return {
-    year,
-    month,
-    day,
-    hour: get("hour") % 24,
-    minute: get("minute"),
-    period: `${year}-${String(month).padStart(2, "0")}`,
-    dateStr: `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`,
-  };
-}
+export { jstNow };
 
 // ── 説明会の開催予定 ──
 // 通常枠（settings）と日付ごとの例外（entry_session_overrides）の合成は core の
@@ -109,6 +78,8 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     // 期限切れの域外確認票の回収は資金を動かさないので、営業状態に関わらず毎分回す。
     // executing のまま残った票（返還済み・元操作未完了）を永久に放置しない
     services.chipFlow.expireStaleConfirmations();
+
+    await enforceConversationCourtRestrictionForClient(client, services, new Date(), "scheduler");
 
     if (services.chipTx.openingPhase() === "formal" && services.casinoStatus.current().status === "open") {
       const idleCutoff = Math.floor(Date.now() / 1000) - 10 * 60;

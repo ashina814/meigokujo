@@ -90,6 +90,44 @@ describe("部屋システム", () => {
     expect(ctx.ledger.balanceOf("user:payer")).toBe(95_000);
   });
 
+  it("通常部屋の無料枠追加は定員だけ増やし、Land取引を作らない", () => {
+    const room = ctx.rooms.register({ kind: "normal", channelId: "free-slot", ownerId: "owner" });
+    const beforeBalance = ctx.ledger.balanceOf("user:payer");
+    const beforeTx = (ctx.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE type = 'room_fee'").get() as { n: number }).n;
+
+    const updated = ctx.rooms.addSlot(room.id, "payer", { waiveFee: true });
+
+    expect(updated.capacity).toBe(3);
+    expect(ctx.ledger.balanceOf("user:payer")).toBe(beforeBalance);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE type = 'room_fee'").get() as { n: number }).n).toBe(beforeTx);
+    expect(ctx.ledger.findByIdempotencyKey(`room:slot:${room.id}:3`)).toBeUndefined();
+  });
+
+  it("確認後に枠料金が変わった場合は課金せず拒否する", () => {
+    const room = ctx.rooms.register({ kind: "normal", channelId: "price-changed", ownerId: "owner" });
+    const beforeBalance = ctx.ledger.balanceOf("user:payer");
+    const confirmedPrice = ctx.settings.getNumber("room_slot_price");
+    ctx.settings.set("room_slot_price", confirmedPrice + 1_000, "test");
+
+    expect(() =>
+      ctx.rooms.addSlot(room.id, "payer", { expectedCapacity: room.capacity, expectedPrice: confirmedPrice }),
+    ).toThrowError(/ERR_PRICE_CHANGED/);
+    expect(ctx.rooms.get(room.id).capacity).toBe(room.capacity);
+    expect(ctx.ledger.balanceOf("user:payer")).toBe(beforeBalance);
+  });
+
+  it("同じ定員を確認した枠追加は1件だけ成功し、2件目を課金前に拒否する", () => {
+    const room = ctx.rooms.register({ kind: "normal", channelId: "capacity-race", ownerId: "owner" });
+    const expectedPrice = ctx.settings.getNumber("room_slot_price");
+    const opts = { expectedCapacity: room.capacity, expectedPrice };
+
+    expect(ctx.rooms.addSlot(room.id, "payer", opts).capacity).toBe(3);
+    const afterFirst = ctx.ledger.balanceOf("user:payer");
+    expect(() => ctx.rooms.addSlot(room.id, "payer", opts)).toThrowError(/ERR_CAPACITY_CHANGED/);
+    expect(ctx.rooms.get(room.id).capacity).toBe(3);
+    expect(ctx.ledger.balanceOf("user:payer")).toBe(afterFirst);
+  });
+
   it("宿以外・closed部屋・最大定員超過への増枠を拒否し、課金しない", () => {
     const game = ctx.rooms.register({ kind: "game", channelId: "game-cap", ownerId: "owner", hours: 2 });
     const beforeInvalid = ctx.ledger.balanceOf("user:payer");
