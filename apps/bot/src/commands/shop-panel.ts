@@ -5,13 +5,18 @@ import {
   ButtonStyle,
   EmbedBuilder,
   MessageFlags,
+  ModalBuilder,
+  ModalSubmitInteraction,
   StringSelectMenuBuilder,
   StringSelectMenuInteraction,
+  TextInputBuilder,
+  TextInputStyle,
+  type GuildMember,
   type MessageCreateOptions,
 } from "discord.js";
 import { LedgerError, ShopError, termDays, type PurchaseRow, type ShopItemRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
-import { deliverPurchase } from "../shop-delivery.js";
+import { deliverPurchase, nicknameBlockReason } from "../shop-delivery.js";
 import { meetsRoleRequirement, requirementLabel } from "../rank-requirement.js";
 import { refreshShopAdminPanels } from "./shokan.js";
 import type { Services } from "../services.js";
@@ -144,6 +149,23 @@ function itemDetail(
     return { embeds: [embed], components: [new ActionRowBuilder<ButtonBuilder>().addComponents(extend)] };
   }
 
+  // 名前変更は「買う」ではなく「名前を変える」。入力→確認→完了で終わらせる
+  if (isNicknameItem(item) && item.price_land !== null) {
+    return {
+      embeds: [embed],
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`shop:nick:${item.id}`)
+            .setLabel(`名前を変える (${fmtLd(item.price_land)})`)
+            .setEmoji("✏️")
+            .setStyle(ButtonStyle.Primary)
+            .setDisabled(!userHasRole),
+        ),
+      ],
+    };
+  }
+
   const buttons: ButtonBuilder[] = [];
   if (item.price_land !== null) {
     buttons.push(
@@ -197,6 +219,55 @@ function reevalPanelLink(services: Services, guildId: string | null): string | n
   return `https://discord.com/channels/${guildId}/${panel.channelId}/${panel.messageId}`;
 }
 
+
+/** Botが自分でニックネームを変える商品か（配送種別で決める） */
+function isNicknameItem(item: ShopItemRow): boolean {
+  return item.delivery === "auto" && item.delivery_kind === "set_nickname";
+}
+
+const NICKNAME_MAX = 32;
+
+/** 入力の形だけを見る検査（Discord側の可否は nicknameBlockReason が見る） */
+function validateNickname(input: string, current: string | null): string | null {
+  const name = input.trim();
+  if (!name) return "新しい名前を入れてください。";
+  if (name.length > NICKNAME_MAX) return `名前は ${NICKNAME_MAX} 文字までです（いまは ${name.length} 文字）。`;
+  if (name === current) return "いまの名前と同じです。";
+  return null;
+}
+
+/**
+ * 課金前に、Botが変更できる相手かを確かめる。
+ *
+ * **ここで止めたものはスタッフの仕事にしない。** 払う前に分かることで人を呼ばない。
+ */
+function nicknamePreflight(
+  interaction: ButtonInteraction | ModalSubmitInteraction,
+): { ok: true; member: GuildMember } | { ok: false; message: string } {
+  const guild = interaction.guild;
+  const member = interaction.member as GuildMember | null;
+  if (!guild || !member) return { ok: false, message: "サーバー内で実行してください。" };
+  const blocked = nicknameBlockReason(guild, member);
+  return blocked ? { ok: false, message: blocked.message } : { ok: true, member };
+}
+
+function nicknameModal(itemId: number, current: string | null) {
+  return new ModalBuilder()
+    .setCustomId(`shop:nick-input:${itemId}`)
+    .setTitle("名前変更")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("nickname")
+          .setLabel("新しいサーバーニックネーム")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(NICKNAME_MAX)
+          .setValue(current ?? ""),
+      ),
+    );
+}
+
 type PurchaseOutcome = ReturnType<Services["shop"]["purchase"]> & { replayed?: boolean };
 
 function purchaseOnce(
@@ -208,6 +279,8 @@ function purchaseOnce(
     actor: string;
     memberRoleIds: readonly string[];
     mode: "land" | "alt";
+    /** 本人が入力した内容。課金と同じトランザクションで購入行へ残す */
+    request?: Record<string, unknown>;
   },
 ): PurchaseOutcome {
   const execute = services.db.transaction(() => {
@@ -243,6 +316,7 @@ function purchaseOnce(
       actor: input.actor,
       memberRoleIds: input.memberRoleIds,
       payAlt: input.mode === "alt",
+      request: input.request,
     });
     services.db.prepare(
       `UPDATE shop_purchase_operations
@@ -408,6 +482,82 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       else components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(button));
     }
     await interaction.reply({ embeds: [embed], components, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+
+  // ── 名前変更（セルフサービス）──
+  // 押す → 入力 → 金額と内容を確認 → 変更する、で終わり。
+  // 課金前に分かる不可（所有者・ロール階層）はここで止め、人を呼ばない
+  if (action === "nick") {
+    const itemId = Number(parts[2]);
+    const item = services.shop.getItem(itemId);
+    if (!item || !item.enabled || !isNicknameItem(item)) {
+      await interaction.reply({ content: "この商品はいま購入できません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const pre = nicknamePreflight(interaction);
+    if (!pre.ok) {
+      await interaction.reply({ content: `⚠️ ${pre.message}`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.showModal(nicknameModal(itemId, pre.member.nickname));
+    return;
+  }
+
+  if (action === "nick-do") {
+    const itemId = Number(parts[2]);
+    const confirmationId = parts[3] ?? "";
+    const wanted = parts.slice(4).join(":");
+    const item = services.shop.getItem(itemId);
+    if (!item || !item.enabled || !isNicknameItem(item) || item.price_land === null) {
+      await interaction.update({ content: "この商品はいま購入できません。", embeds: [], components: [] });
+      return;
+    }
+    const pre = nicknamePreflight(interaction);
+    if (!pre.ok) {
+      await interaction.update({ content: `⚠️ ${pre.message}`, embeds: [], components: [] });
+      return;
+    }
+    const invalid = validateNickname(wanted, pre.member.nickname);
+    if (invalid) {
+      await interaction.update({ content: `⚠️ ${invalid}`, embeds: [], components: [] });
+      return;
+    }
+    await interaction.deferUpdate();
+
+    let purchase: PurchaseOutcome;
+    try {
+      // 課金・購入行・希望内容を1トランザクションで確定する。
+      // ここで落ちれば何も残らない（＝二重課金にならない）
+      purchase = purchaseOnce(services, {
+        operationId: confirmationId,
+        itemId,
+        userId: interaction.user.id,
+        actor: `user:${interaction.user.id}`,
+        memberRoleIds: [...pre.member.roles.cache.keys()],
+        mode: "land",
+        request: { nickname: wanted },
+      });
+    } catch (error) {
+      await interaction.editReply({ content: `❌ ${purchaseErrorMessage(error, services)}`, embeds: [], components: [] });
+      return;
+    }
+
+    const outcome = await deliverPurchase(services, interaction.guild, purchase.purchase, `user:${interaction.user.id}`);
+    if (outcome.state !== "failed") {
+      await interaction.editReply({ content: `✅ ${outcome.message}`, embeds: [], components: [] });
+      return;
+    }
+    // 変更できなかった。**自分で返して終わらせる**（ここでスタッフを呼ばない）
+    const refunded = await refundQuietly(services, purchase.purchase.id, outcome.error ?? "delivery_failed", interaction);
+    await interaction.editReply({
+      content: refunded
+        ? `変更できなかったため、${fmtLd(purchase.purchase.paid_land ?? 0)}は返金しました。\n-# ${outcome.message}`
+        : `⚠️ 変更に失敗し、返金も完了できませんでした。運営が対応します（購入 #${purchase.purchase.id}）。\n-# ${outcome.message}`,
+      embeds: [],
+      components: [],
+    });
     return;
   }
 
@@ -704,4 +854,81 @@ async function notifyStaffForDelivery(
       allowedMentions: { users: [interaction.user.id] },
     })
     .catch(() => undefined);
+}
+
+/**
+ * 返金して静かに終わらせる。返金まで失敗したときだけ、管理側の「処理失敗」へ残す。
+ */
+async function refundQuietly(
+  services: Services,
+  purchaseId: number,
+  reason: string,
+  interaction: ButtonInteraction,
+): Promise<boolean> {
+  try {
+    services.shop.refund(purchaseId, reason, `user:${interaction.user.id}`);
+    return true;
+  } catch (error) {
+    services.events.log("shop_refund_failed", {
+      actor: `user:${interaction.user.id}`,
+      target: interaction.user.id,
+      payload: { purchaseId, reason, error: (error as Error).message },
+    });
+    // 返金できなかったものだけスタッフへ回す
+    await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
+    const channelId = services.settings.getString("channel:shokan") ?? services.settings.getString("channel:kessai");
+    if (channelId) {
+      const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
+      if (channel?.isTextBased() && "send" in channel) {
+        await channel
+          .send({
+            content: `⚠️ **返金に失敗しました**（購入 #${purchaseId}）。商館の管理パネルの「処理失敗」から確認してください。`,
+            allowedMentions: { parse: [] },
+          })
+          .catch(() => undefined);
+      }
+    }
+    return false;
+  }
+}
+
+/** 名前変更の入力を受け取り、金額と変更内容を確認する */
+export async function handleShopModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
+  const parts = interaction.customId.split(":");
+  if (parts[1] !== "nick-input") return;
+  const itemId = Number(parts[2]);
+  const item = services.shop.getItem(itemId);
+  if (!item || !item.enabled || !isNicknameItem(item) || item.price_land === null) {
+    await interaction.reply({ content: "この商品はいま購入できません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const pre = nicknamePreflight(interaction);
+  if (!pre.ok) {
+    await interaction.reply({ content: `⚠️ ${pre.message}`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const wanted = interaction.fields.getTextInputValue("nickname").trim();
+  const invalid = validateNickname(wanted, pre.member.nickname);
+  if (invalid) {
+    await interaction.reply({ content: `⚠️ ${invalid}`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const balance = services.ledger.balanceOf(`user:${interaction.user.id}`);
+  await interaction.reply({
+    content: [
+      `✏️ サーバーニックネームを変更します。`,
+      `**${pre.member.nickname ?? interaction.user.username}** → **${wanted}**`,
+      `料金 **${fmtLd(item.price_land)}** ／ 残高 ${fmtLd(balance)}`,
+    ].join("\n"),
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          // 同じ確認画面からの実行は同じ操作IDになる（二重課金しない）
+          .setCustomId(`shop:nick-do:${itemId}:${interaction.id}:${wanted}`)
+          .setLabel("変更する")
+          .setStyle(ButtonStyle.Success),
+      ),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
 }

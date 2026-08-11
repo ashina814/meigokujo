@@ -26,6 +26,7 @@ import {
   sendChunkedLinesResumable,
 } from "./scheduler-utils.js";
 import {
+  convergePendingNicknameChanges,
   expireOverduePurchases,
   processShopRoleRevocations,
   recoverAutoDropNoEvalGhosts,
@@ -389,6 +390,16 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     } catch (e) {
       console.error("[ショップ] 期限予告失敗:", e);
+    }
+
+    // ── 名前変更の未完了を収束させる ──
+    // 課金後にBotが落ちると「払ったのに変わっていない」が残る。既に希望どおりなら
+    // 完了に、まだなら変更をやり直し、それも駄目なら返金する。返金まで失敗したものだけ
+    // 「処理失敗」に残り、人の出番になる
+    try {
+      await convergePendingNicknameChanges(client, services);
+    } catch (e) {
+      console.error("[ショップ] 名前変更の収束失敗:", e);
     }
 
     // 失効購入のロール剥奪は失効処理と分離し、購入ID単位で毎分自己修復する。

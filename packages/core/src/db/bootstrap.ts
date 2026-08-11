@@ -794,6 +794,8 @@ export function openDb(path: string): Database.Database {
   db.exec(DDL);
   // 既に member_names がある本番へ後から足す（承認済みの語を記録する列）
   ensureColumn(db, "member_names", "flag_ok_words", "TEXT");
+  ensureColumn(db, "shop_purchases", "request_json", "TEXT");
+  configureNicknameItem(db);
   ensureColumn(db, "casino_tx", "op_key", "TEXT");
   ensureColumn(db, "casino_tx", "op_actor_id", "TEXT");
   backfillChipTxOperationKey(db);
@@ -1198,6 +1200,26 @@ function migrateMonthlyToThirtyDayTerms(db: Database.Database): void {
     );
   });
   run.immediate();
+}
+
+/**
+ * 名前変更をセルフサービスへ切り替える（運営が有効化したときだけ）。
+ *
+ * `shop:nickname_item_id` が指す商品を「Botが自分で処理する商品」にする。
+ * **設定が無ければ何もしない**ので、コードを入れただけでは挙動が変わらない。
+ * 運営が設定を入れた時点で、次の購入からセルフサービスになる。
+ */
+function configureNicknameItem(db: Database.Database): void {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'shop:nickname_item_id'").get() as
+    | { value: string }
+    | undefined;
+  const itemId = Number(row?.value);
+  if (!Number.isInteger(itemId) || itemId <= 0) return;
+  db.prepare(
+    `UPDATE shop_items
+        SET delivery = 'auto', delivery_kind = 'set_nickname', updated_at = ?
+      WHERE id = ? AND (delivery <> 'auto' OR delivery_kind IS NOT 'set_nickname')`,
+  ).run(Math.floor(Date.now() / 1000), itemId);
 }
 
 function ensureColumn(db: Database.Database, table: string, column: string, definition: string): void {

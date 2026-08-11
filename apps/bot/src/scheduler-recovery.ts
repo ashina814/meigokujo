@@ -1,4 +1,6 @@
 import type { Client } from "discord.js";
+import { parseDeliverySnapshot } from "@meigokujo/core";
+import { deliverPurchase } from "./shop-delivery.js";
 import type { Services } from "./services.js";
 
 const AUTODROP_PENDING_KEY = "autodrop:pending_role_sync";
@@ -349,6 +351,45 @@ export function backfillShopRoleRevocations(services: Pick<Services, "db">): voi
  */
 export function expireOverduePurchases(services: Pick<Services, "shop">, actor: string) {
   return services.shop.expireOverdue(actor);
+}
+
+/**
+ * 課金済みなのに終わっていない名前変更を収束させる。
+ *
+ * 課金と購入行は1トランザクションなので「払ったのに記録が無い」は起きない。
+ * 起こりうるのは**課金後・変更前にBotが落ちる**ケースで、そのまま放置すると
+ * 利用者は払っただけになる。ここで毎分、次のどれかへ必ず倒す:
+ *
+ * - 既に希望どおりの名前 … 完了にする（**返金しない**）
+ * - まだ変わっていない … 変更をやり直す
+ * - 変更できない … 返金する
+ * - 返金もできない … `処理失敗` に残す（ここだけ人の出番）
+ */
+export async function convergePendingNicknameChanges(client: Client, services: Services): Promise<void> {
+  const targets = services.shop.listUndeliveredAuto(20).filter((p) => {
+    const snapshot = parseDeliverySnapshot(p.delivery_snapshot_json);
+    return snapshot?.delivery_kind === "set_nickname";
+  });
+  if (targets.length === 0) return;
+  const guildId = services.settings.getString("guild:main");
+  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
+  for (const purchase of targets) {
+    const outcome = await deliverPurchase(services, guild, purchase, "system:shop-nickname");
+    if (outcome.state !== "failed") continue;
+    try {
+      services.shop.refund(purchase.id, outcome.error ?? "delivery_failed", "system:shop-nickname");
+      const user = await client.users.fetch(purchase.user_id).catch(() => null);
+      await user
+        ?.send(`🛒 名前の変更ができなかったため、**${(purchase.paid_land ?? 0).toLocaleString()} Ld** を返金しました。`)
+        .catch(() => undefined);
+    } catch (error) {
+      services.events.log("shop_refund_failed", {
+        actor: "system:shop-nickname",
+        target: purchase.user_id,
+        payload: { purchaseId: purchase.id, error: (error as Error).message },
+      });
+    }
+  }
 }
 
 function markRoleRevocationDoneOnce(services: Services, purchaseId: number, reason: string): void {

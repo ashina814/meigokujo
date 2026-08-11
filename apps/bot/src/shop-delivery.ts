@@ -1,4 +1,4 @@
-import type { Guild } from "discord.js";
+import type { Guild, GuildMember } from "discord.js";
 import { AUTO_DELIVERABLE_KINDS, parseDeliverySnapshot, type PurchaseRow } from "@meigokujo/core";
 import { refreshEvalStatsForUser } from "./eval-daily.js";
 import type { Services } from "./services.js";
@@ -38,6 +38,42 @@ export interface DeliveryOutcome {
  * 無い・壊れている・知らない種別なら何もしない（legacy unknown）。ここでフォールバックすると、
  * 商品定義を後から変えただけで過去の購入の配送内容が変わってしまう。
  */
+/** 購入時に本人が入力した内容 */
+export function parseRequest(json: string | null): Record<string, unknown> | null {
+  if (!json) return null;
+  try {
+    const parsed: unknown = JSON.parse(json);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Botがニックネームを変えられない理由。**課金前にも同じ判定を使う**ので、
+ * 「払ったのに変えられない」を作らない。
+ */
+export function nicknameBlockReason(
+  guild: Pick<Guild, "ownerId"> & { members: { me: GuildMember | null } },
+  member: Pick<GuildMember, "id"> & { roles: { highest: { position: number } } },
+): { reason: string; message: string } | null {
+  if (guild.ownerId === member.id) {
+    return {
+      reason: "target_is_owner",
+      message: "サーバー所有者のニックネームはBotから変更できません。お手数ですがご自身で変更してください。",
+    };
+  }
+  const me = guild.members.me;
+  if (!me) return { reason: "bot_member_unavailable", message: "Bot自身の情報が取れないため変更できません。" };
+  if (me.roles.highest.position <= member.roles.highest.position) {
+    return {
+      reason: "role_hierarchy",
+      message: "あなたのロールがBotより上位のため、Botからは変更できません。運営にご相談ください。",
+    };
+  }
+  return null;
+}
+
 export async function deliverPurchase(
   services: Services,
   guild: Guild | null,
@@ -89,6 +125,27 @@ export async function deliverPurchase(
       }
       services.shop.markDeliverySucceeded(purchase.id, actor);
       return { state: "delivered", message: `ロールを付与しました: <@&${roleId}>` };
+    }
+
+    if (kind === "set_nickname") {
+      const request = parseRequest(purchase.request_json);
+      const wanted = typeof request?.nickname === "string" ? request.nickname : null;
+      if (!wanted) return fail("nickname_missing", "希望の名前が記録されていないため変更できませんでした。");
+      if (!guild) return fail("guild_unavailable", "サーバー情報が取れず変更できませんでした。");
+      // **最新の状態を取り直す。** 課金後にBotが落ちた場合、変更だけ先に済んでいることがある
+      const member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
+      if (!member) return fail("member_fetch_failed", "メンバー情報の取得に失敗し変更できませんでした。");
+      if (member.nickname === wanted) {
+        // 既に希望どおり。**返金せず完了にする**（変わったのに返金する、を防ぐ）
+        services.shop.markDeliverySucceeded(purchase.id, actor);
+        return { state: "delivered", message: `サーバーニックネームは既に **${wanted}** です。` };
+      }
+      const blocked = nicknameBlockReason(guild, member);
+      if (blocked) return fail(blocked.reason, blocked.message);
+      const changed = await member.setNickname(wanted, "公式ショップ: 名前変更").then(() => true).catch((e: Error) => e.message);
+      if (changed !== true) return fail(`nickname_set_failed:${changed}`, "名前の変更に失敗しました。");
+      services.shop.markDeliverySucceeded(purchase.id, actor);
+      return { state: "delivered", message: `サーバーニックネームを **${wanted}** に変更しました。` };
     }
 
     if (kind === "extend_deadline") {

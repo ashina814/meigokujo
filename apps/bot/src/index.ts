@@ -3,7 +3,7 @@ import { InviteTracker } from "./invite-tracker.js";
 import { config } from "./config.js";
 import { buildServices } from "./services.js";
 import { handleAdminCommand, handleAdminButton, handleAdminSelect, handleAdminModal } from "./commands/admin-payroll-recovery.js";
-import { handleShopButton, handleShopSelect } from "./commands/shop-panel.js";
+import { handleShopButton, handleShopModal, handleShopSelect } from "./commands/shop-panel.js";
 import { handleShokanCommand, handleShokanButton, handleShokanSelect, handleShokanModal } from "./commands/shokan.js";
 import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
 import { handleTip } from "./commands/tip.js";
@@ -313,6 +313,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("entry:")) {
       await handleEntryModal(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("shop:")) {
+      await handleShopModal(interaction, services);
       return;
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("ether:")) {
