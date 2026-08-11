@@ -112,6 +112,17 @@ export interface ChipTxRow {
   land_amount: number | null;
   ledger_tx_id: number | null;
   created_at: number;
+  /**
+   * その明細を動かした操作（入れ子なら内側の `runGroup`）の冪等キーと実行者。
+   * Land 取引の `idempotency_key` / `actor_id` と 1:1 で対応する。
+   *
+   * 内側の `runGroup` は外側グループへ合流するので、`group_key` / `actor_id` では
+   * 「どの操作が動かしたか」を特定できない。検算Bが Land 取引と突き合わせる正本はこちら。
+   * 検算B修正（2026-08-11）より前に記録された行は埋め戻しで埋まるが、
+   * 埋め戻しが走る前のDBを読む可能性があるので null を許す。
+   */
+  op_key: string | null;
+  op_actor_id: string | null;
 }
 
 export interface ChipBalanceMismatch {
