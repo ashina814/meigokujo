@@ -149,7 +149,8 @@ export type ShopErrorCode =
   | "ERR_NOT_OWNER"
   | "ERR_NOT_ACTIVE"
   | "ERR_NOT_EXTENDABLE"
-  | "ERR_TERMS_CHANGED";
+  | "ERR_TERMS_CHANGED"
+  | "ERR_SALES_LOCKED";
 
 export class ShopError extends Error {
   constructor(readonly code: ShopErrorCode, readonly details: Record<string, unknown> = {}) {
@@ -319,7 +320,23 @@ export class Shop {
     this.events.log("shop_item_updated", { actor, payload: { id, keys: Object.keys(patch) } });
   }
 
+  /**
+   * 販売を再開してはいけない商品か。
+   *
+   * **手動配送の期限商品**（旧「オリジナルロール継続」）が該当する。契約の実体が
+   * どのDiscordロールなのかDBが知らないため、売っても期限だけが伸びて権利は伸びない。
+   * 専用台帳へ移すまでは、停止したものを戻せないようにしておく。
+   */
+  isSalesLocked(item: Pick<ShopItemRow, "kind" | "duration_days" | "delivery">): boolean {
+    return termDays(item as ShopItemRow) !== null && item.delivery !== "auto";
+  }
+
   setEnabled(id: number, enabled: boolean, actor: string): void {
+    const item = this.getItem(id);
+    if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: id });
+    if (enabled && !item.enabled && this.isSalesLocked(item)) {
+      throw new ShopError("ERR_SALES_LOCKED", { itemId: id });
+    }
     this.updateItem(id, { enabled }, actor);
   }
 
@@ -661,6 +678,56 @@ export class Shop {
     if (changed !== 1) return false;
     this.events.log("shop_delivered", { actor, payload: { purchaseId, via: "service", ...meta } });
     return true;
+  }
+
+  /**
+   * 人が対応しないと終わらない購入（運営の作業キュー）。
+   *
+   * 「手動配送の商品で、まだ配送済みになっていない購入」。**通知が流れても
+   * ここを見れば残っている仕事が分かる**ようにするためのもので、通知メッセージを
+   * 業務の正本にしない。
+   *
+   * 除外する商品IDは呼び出し側が決める。再評価チャレンジのように
+   * 「配送する物が無く、専用フローが権利を消費する」商品を、ここへ混ぜないため。
+   */
+  listPendingManual(
+    opts: { excludeItemIds?: readonly number[]; limit?: number } = {},
+  ): Array<PurchaseRow & { item_name: string }> {
+    const exclude = opts.excludeItemIds ?? [];
+    const placeholders = exclude.map(() => "?").join(",");
+    return this.db
+      .prepare(
+        `SELECT p.*, i.name AS item_name
+           FROM shop_purchases p
+           JOIN shop_items i ON i.id = p.item_id
+          WHERE p.status = 'active'
+            AND i.delivery = 'manual'
+            AND p.delivered_at IS NULL
+            ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}
+          ORDER BY p.purchased_at
+          LIMIT ?`,
+      )
+      .all(...exclude, opts.limit ?? 25) as Array<PurchaseRow & { item_name: string }>;
+  }
+
+  /** 手動対応が残っている件数。表示の上限とは無関係に正確な数を返す */
+  countPendingManual(opts: { excludeItemIds?: readonly number[] } = {}): number {
+    const exclude = opts.excludeItemIds ?? [];
+    const placeholders = exclude.map(() => "?").join(",");
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS c
+           FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
+          WHERE p.status = 'active' AND i.delivery = 'manual' AND p.delivered_at IS NULL
+            ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}`,
+      )
+      .get(...exclude) as { c: number };
+    return row.c;
+  }
+
+  /** 未完了の自動配送の件数（`listUndeliveredAuto` と同じ判定・上限なし） */
+  countUndeliveredAuto(): number {
+    return this.listUndeliveredAuto(Number.MAX_SAFE_INTEGER).length;
   }
 
   /**

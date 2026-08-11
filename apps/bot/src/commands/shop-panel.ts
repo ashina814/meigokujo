@@ -13,6 +13,7 @@ import { LedgerError, ShopError, termDays, type PurchaseRow, type ShopItemRow } 
 import { fmtLd } from "../format.js";
 import { deliverPurchase } from "../shop-delivery.js";
 import { meetsRoleRequirement, requirementLabel } from "../rank-requirement.js";
+import { refreshShopAdminPanels } from "./shokan.js";
 import type { Services } from "../services.js";
 
 /**
@@ -273,6 +274,9 @@ async function finishPurchase(
     const outcome = await deliverPurchase(services, interaction.guild, purchase, `user:${interaction.user.id}`);
     deliveryNote = outcome.message;
     delivered = outcome.state !== "failed";
+    // **1回目の失敗でスタッフへ回す。** ここで知らせないと、利用者だけが
+    // 「届いていない」と分かっている状態になる
+    if (!delivered) await notifyStaffForFailure(interaction, services, purchase.id, item);
   } else if (isReevalItem(services, item)) {
     // **配送しない。** 買ったのは面談を受ける権利で、消費するのは既存の再評価面談フロー。
     // スタッフへ配送依頼を投げると「配送完了」で権利を消せてしまうので、通知も出さない
@@ -651,27 +655,53 @@ export async function handleShopSelect(
   }
 }
 
+/**
+ * 自動処理が失敗したことをスタッフへ知らせる。
+ *
+ * 管理パネルの「処理失敗」の件数を更新し、通知は**変化のお知らせだけ**にする。
+ * ここにボタンを置くと、また通知が仕事の正本になる。
+ */
+async function notifyStaffForFailure(
+  interaction: ButtonInteraction,
+  services: Services,
+  purchaseId: number,
+  item: ShopItemRow,
+): Promise<void> {
+  await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
+  const channelId = services.settings.getString("channel:shokan") ?? services.settings.getString("channel:kessai");
+  if (!channelId) return;
+  const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased() || !("send" in channel)) return;
+  await channel
+    .send({
+      content: `⚠️ **自動処理に失敗しました**（購入 #${purchaseId} / ${item.name}）。商館の管理パネルの「処理失敗」から確認してください。`,
+      allowedMentions: { parse: [] },
+    })
+    .catch(() => undefined);
+}
+
+/**
+ * 手動対応が必要になったことをスタッフへ知らせる。
+ *
+ * **ここにボタンは置かない。** 以前はこの通知の「配送完了」だけが完了手段で、
+ * 流れて見失うと復旧できなかった（購入 #1 が1か月放置された）。仕事の一覧と
+ * 完了操作は常設の管理パネルにあり、通知は変化のお知らせに徹する。
+ */
 async function notifyStaffForDelivery(
   interaction: ButtonInteraction,
   services: Services,
   purchaseId: number,
   item: ShopItemRow,
 ): Promise<void> {
-  const shokanChId = services.settings.getString("channel:shokan");
-  const channelId = shokanChId ?? services.settings.getString("channel:kessai");
+  await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
+  const channelId = services.settings.getString("channel:shokan") ?? services.settings.getString("channel:kessai");
   if (!channelId) return;
   const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
   if (!channel?.isTextBased() || !("send" in channel)) return;
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`shokan:deliver:${purchaseId}`)
-      .setLabel("配送完了")
-      .setEmoji("📦")
-      .setStyle(ButtonStyle.Success),
-  );
-  await channel.send({
-    content: `📦 **公式ショップ**: <@${interaction.user.id}> が **${item.name}** を購入。手動配送をお願いします（購入ID #${purchaseId}）。`,
-    components: [row],
-    allowedMentions: { users: [interaction.user.id] },
-  }).catch(() => undefined);
+  await channel
+    .send({
+      content: `📦 **公式ショップ**: <@${interaction.user.id}> が **${item.name}** を購入しました（購入 #${purchaseId}）。対応は \`/商館\` か商館の管理パネルの「要対応」から。`,
+      allowedMentions: { users: [interaction.user.id] },
+    })
+    .catch(() => undefined);
 }

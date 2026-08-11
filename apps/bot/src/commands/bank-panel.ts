@@ -21,6 +21,7 @@ import { isAdmin } from "../permissions.js";
 import { entryPanelMessage, entryFlexPanelMessage } from "./entry.js";
 import { rankPanelMessage } from "./rank-panel.js";
 import { shopPanelMessage } from "./shop-panel.js";
+import { shopAdminPanelMessage } from "./shokan.js";
 import { takutatePanelMessage } from "./takutate-panel.js";
 import { ticketPanelMessage } from "./tickets.js";
 import { confessionPanelMessage } from "./confession.js";
@@ -93,6 +94,7 @@ const PANEL_KINDS = [
   "entry_flex",
   "rank",
   "shop",
+  "shop_admin",
   "takutate",
   "ticket_return",
   "ticket_consult",
@@ -110,6 +112,7 @@ const PANEL_LABELS: Record<(typeof PANEL_KINDS)[number], string> = {
   entry_flex: "時間外希望受付",
   rank: "ランク確認",
   shop: "公式ショップ",
+  shop_admin: "冥界商館 管理",
   takutate: "卓建て",
   ticket_return: "出戻り申請",
   ticket_consult: "個別相談",
@@ -234,6 +237,7 @@ function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services,
   if (kind === "entry_flex") return entryFlexPanelMessage(services); // 廃止済み（撤去専用）
   if (kind === "rank") return rankPanelMessage();
   if (kind === "shop") return shopPanelMessage(services);
+  if (kind === "shop_admin") return shopAdminPanelMessage(services);
   if (kind === "takutate") return takutatePanelMessage();
   if (kind === "ticket_return") return ticketPanelMessage("return", services);
   if (kind === "ticket_consult") return ticketPanelMessage("consult", services);

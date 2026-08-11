@@ -146,7 +146,10 @@ describe("再評価チャレンジの購入", () => {
     await handleShopButton(buyInteraction(ctx, ctx.nickname.id, send), ctx.services);
 
     expect(send).toHaveBeenCalledTimes(1);
-    expect(String((send.mock.calls[0] as never[])[0].content)).toContain("手動配送をお願いします");
+    // 通知は変化のお知らせだけ。仕事の一覧と完了操作は管理パネル側にある
+    const notice = (send.mock.calls[0] as never[])[0] as { content: string; components?: unknown[] };
+    expect(notice.content).toContain("購入しました");
+    expect(notice.components ?? []).toEqual([]);
     ctx.db.close();
   });
 });
@@ -157,7 +160,9 @@ describe("汎用の配送完了操作", () => {
       customId,
       user: { id: STAFF, username: "staff" },
       member: { roles: { cache: new Collection([[ADMIN_ROLE, { id: ADMIN_ROLE }]]) } },
-      message: { editable: false, content: "📦 通知", edit: vi.fn() },
+      message: { flags: { has: () => false } },
+      client: { channels: { fetch: vi.fn(async () => null) } },
+      guild: null,
       reply,
       update: vi.fn(async () => undefined),
     } as never;
@@ -193,7 +198,9 @@ describe("汎用の配送完了操作", () => {
     await handleShokanButton(staffInteraction(`shokan:deliver:${purchase.id}`, reply), ctx.services);
 
     expect(ctx.shop.getPurchase(purchase.id)!.delivered_at).not.toBeNull();
-    expect(lastReply(reply)).toContain("配送済み");
+    // 完了すると要対応の一覧が描き直され、その購入は消える
+    const payload = (reply.mock.calls.at(-1) as never[])[0] as { embeds: { data: { description: string } }[] };
+    expect(payload.embeds[0]!.data.description).toContain("対応待ちはありません");
     ctx.db.close();
   });
 });

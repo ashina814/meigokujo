@@ -15,32 +15,85 @@ import {
   StringSelectMenuInteraction,
   TextInputBuilder,
   TextInputStyle,
+  type Client,
   type GuildMember,
+  type MessageCreateOptions,
 } from "discord.js";
-import type { ShopItemRow } from "@meigokujo/core";
+import type { PurchaseRow, ShopItemRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import { requirementLabel } from "../rank-requirement.js";
+import { redeliverPurchase } from "../shop-delivery.js";
 import type { Services } from "../services.js";
 
 /**
- * /商館: 冥界商館スタッフ用のショップ管理ハブ。
- * 権限: 運営 or 「冥界商館」部署の担当ロール保持者。
- * 商品CRUDと購入配送マークを行う。
+ * 冥界商館スタッフの常設パネルと `/商館`。
+ *
+ * **通知を仕事の正本にしない。** 以前は手動配送の依頼が #決裁 へ流れ、その
+ * メッセージの「配送完了」ボタンだけが完了手段だった。流れて見失うと復旧できず、
+ * 実際に購入 #1 が1か月放置された。ここでは「いま何が残っているか」を常設パネルから
+ * 必ず引けるようにし、通知は**変化を知らせるだけ**にする。
+ *
+ * 出すのは「これからやる仕事」だけ。本日完了・差し戻し中のような
+ * 見て終わりの一覧は置かない。
  */
 export const shokanCommand = new SlashCommandBuilder()
   .setName("商館")
-  .setDescription("冥界商館の管理（商品追加・編集・配送）")
+  .setDescription("冥界商館の管理（要対応・商品設定）")
   .setDMPermission(false);
 
 const SHOKAN_DEPT_KEY = "冥界商館";
+const HISTORY_PAGE = 20;
+/** 1画面に出す件数。出したものには必ず操作ボタンを付ける（数だけ見せて押せない、を作らない） */
+const QUEUE_DISPLAY = 8;
 
-function canOperate(interaction: ButtonInteraction | ChatInputCommandInteraction | StringSelectMenuInteraction | RoleSelectMenuInteraction | ModalSubmitInteraction, services: Services): boolean {
+function canOperate(
+  interaction:
+    | ButtonInteraction
+    | ChatInputCommandInteraction
+    | StringSelectMenuInteraction
+    | RoleSelectMenuInteraction
+    | ModalSubmitInteraction,
+  services: Services,
+): boolean {
   if (isAdmin(interaction, services)) return true;
   const dept = services.departments.get(SHOKAN_DEPT_KEY);
   if (!dept?.role_id) return false;
   const member = interaction.member as GuildMember | null;
   return member?.roles.cache.has(dept.role_id) ?? false;
+}
+
+/**
+ * 手動対応のキューから外す商品。
+ *
+ * 再評価チャレンジは配送する物が無く、権利を消費するのは既存の再評価面談フロー。
+ * ここへ出すと「終わらせる方法が無い仕事」がキューに居座る。
+ */
+function excludedItemIds(services: Services): number[] {
+  const reeval = Number(services.settings.getString("shop:reeval_item_id"));
+  return Number.isInteger(reeval) && reeval > 0 ? [reeval] : [];
+}
+
+function pendingManual(services: Services): Array<PurchaseRow & { item_name: string }> {
+  return services.shop.listPendingManual({ excludeItemIds: excludedItemIds(services), limit: QUEUE_DISPLAY });
+}
+
+/** 自動配送が終わっていない購入（＝Botが自力で終われなかったもの） */
+function failedAuto(services: Services): Array<PurchaseRow & { item_name: string }> {
+  return services.shop.listUndeliveredAuto(QUEUE_DISPLAY);
+}
+
+/** 残件数。**表示上限で数えない**（11件目以降も正しく出す） */
+function queueCounts(services: Services): { pending: number; failed: number } {
+  return {
+    pending: services.shop.countPendingManual({ excludeItemIds: excludedItemIds(services) }),
+    failed: services.shop.countUndeliveredAuto(),
+  };
+}
+
+/** 表示しきれなかった分の注記。押せないボタンを並べる代わりに件数で伝える */
+function overflowNote(shown: number, total: number): string[] {
+  return total > shown ? ["", `-# ほか **${total - shown}件**（対応すると次が出ます）`] : [];
 }
 
 function backButton() {
@@ -49,29 +102,6 @@ function backButton() {
   );
 }
 
-function renderHub(services: Services) {
-  const items = services.shop.listItems();
-  const enabled = items.filter((i) => i.enabled).length;
-  const embed = new EmbedBuilder()
-    .setTitle("🛒 冥界商館 管理コンソール")
-    .setColor(0xdb2777)
-    .setDescription(
-      [
-        `**商品**: ${items.length}件（有効 ${enabled} / 無効 ${items.length - enabled}）`,
-        "",
-        "商品を追加・編集・無効化できます。購入者への手動配送は `#決裁` or `channel:shokan` に投稿される通知から。",
-      ].join("\n"),
-    );
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("shokan:list").setLabel("一覧").setEmoji("📃").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("shokan:new").setLabel("新規商品").setEmoji("➕").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("shokan:history:0").setLabel("購入履歴").setEmoji("📜").setStyle(ButtonStyle.Secondary),
-  );
-  return { embeds: [embed], components: [row] };
-}
-
-const HISTORY_PAGE = 20;
-
 function fmtJstDate(unixSec: number): string {
   const d = new Date((unixSec + 9 * 3600) * 1000);
   const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
@@ -79,6 +109,125 @@ function fmtJstDate(unixSec: number): string {
   const hh = String(d.getUTCHours()).padStart(2, "0");
   const mi = String(d.getUTCMinutes()).padStart(2, "0");
   return `${d.getUTCFullYear()}/${mm}/${dd} ${hh}:${mi}`;
+}
+
+/**
+ * 商館スタッフの常設パネル。
+ * 個人ごとの情報は載せない（押した後の ephemeral で出す）ので、そのまま設置できる。
+ */
+export function shopAdminPanelMessage(services: Services): MessageCreateOptions {
+  const { pending, failed } = queueCounts(services);
+  const embed = new EmbedBuilder()
+    .setTitle("🛠 冥界商館 管理")
+    .setColor(pending + failed > 0 ? 0xdc2626 : 0x64748b)
+    .setDescription(
+      [
+        pending + failed > 0
+          ? `**残っている仕事: 要対応 ${pending}件 / 処理失敗 ${failed}件**`
+          : "残っている仕事はありません。",
+        "",
+        "-# 通知は変化のお知らせです。仕事の一覧は必ずここから開けます。",
+      ].join("\n"),
+    );
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("shokan:pending")
+      .setLabel(pending > 0 ? `要対応 ${pending}` : "要対応")
+      .setEmoji("🔴")
+      .setStyle(pending > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("shokan:failed")
+      .setLabel(failed > 0 ? `処理失敗 ${failed}` : "処理失敗")
+      .setEmoji("⚠️")
+      .setStyle(failed > 0 ? ButtonStyle.Danger : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("shokan:list").setLabel("商品設定").setEmoji("📦").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("shokan:history:0").setLabel("購入履歴").setEmoji("📜").setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+/**
+ * 設置済みの管理パネルを、いまの残件数で描き直す。
+ *
+ * 仕事が増減したときだけ呼ぶ。届かなくても実害は無い（数字が古くなるだけで、
+ * 押せば必ず最新が出る）ので best effort でよい。
+ */
+export async function refreshShopAdminPanels(client: Client, services: Services): Promise<void> {
+  const rows = services.db
+    .prepare("SELECT key, value FROM settings WHERE key LIKE 'panel:shop_admin:%'")
+    .all() as Array<{ key: string; value: string }>;
+  if (rows.length === 0) return;
+  const payload = shopAdminPanelMessage(services);
+  for (const row of rows) {
+    const channelId = row.key.split(":")[2];
+    if (!channelId) continue;
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (!channel?.isTextBased() || !("messages" in channel)) continue;
+    const message = await channel.messages.fetch(row.value).catch(() => null);
+    await message?.edit({ embeds: payload.embeds, components: payload.components }).catch(() => undefined);
+  }
+}
+
+/**
+ * 表示した案件のぶんだけボタンを作る。
+ * **一覧に出したものには必ず操作を付ける**（数だけ見せて押せない、を作らない）。
+ */
+function queueButtons(
+  rows: Array<{ id: number }>,
+  build: (id: number) => ButtonBuilder,
+): ActionRowBuilder<ButtonBuilder>[] {
+  const components: ActionRowBuilder<ButtonBuilder>[] = [];
+  for (const row of rows) {
+    const last = components.at(-1);
+    if (last && last.components.length < 2) last.addComponents(build(row.id));
+    else components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(build(row.id)));
+  }
+  return components;
+}
+
+function renderPending(services: Services) {
+  const rows = pendingManual(services);
+  const total = services.shop.countPendingManual({ excludeItemIds: excludedItemIds(services) });
+  const embed = new EmbedBuilder().setTitle("🔴 要対応").setColor(0xdc2626);
+  if (rows.length === 0) {
+    embed.setDescription("対応待ちはありません。");
+    return { embeds: [embed], components: [backButton()], allowedMentions: { parse: [] as never[] } };
+  }
+  embed.setDescription(
+    [
+      ...rows.map((p) => `\`#${p.id}\` **${p.item_name}** — <@${p.user_id}>（${fmtJstDate(p.purchased_at)}）`),
+      ...overflowNote(rows.length, total),
+    ].join("\n"),
+  );
+  embed.setFooter({ text: `対応が終わったら「完了」を押してください（全 ${total}件）。` });
+  const components = queueButtons(rows, (id) =>
+    new ButtonBuilder().setCustomId(`shokan:deliver:${id}`).setLabel(`#${id} 完了`).setEmoji("📦").setStyle(ButtonStyle.Success),
+  );
+  return { embeds: [embed], components: [...components, backButton()], allowedMentions: { parse: [] as never[] } };
+}
+
+function renderFailed(services: Services) {
+  const rows = failedAuto(services);
+  const total = services.shop.countUndeliveredAuto();
+  const embed = new EmbedBuilder().setTitle("⚠️ 処理失敗").setColor(0xdc2626);
+  if (rows.length === 0) {
+    embed.setDescription("Botが終われなかった処理はありません。");
+    return { embeds: [embed], components: [backButton()], allowedMentions: { parse: [] as never[] } };
+  }
+  embed.setDescription(
+    [
+      ...rows.map(
+        (p) =>
+          `\`#${p.id}\` **${p.item_name}** — <@${p.user_id}>\n　${p.delivery_error ? `理由: ${p.delivery_error.slice(0, 80)}` : "未実行"}（${p.delivery_attempts}回試行）`,
+      ),
+      ...overflowNote(rows.length, total),
+    ].join("\n"),
+  );
+  embed.setFooter({ text: `原因を直してから再試行してください。二度配ることはありません（全 ${total}件）。` });
+  const components = queueButtons(rows, (id) =>
+    new ButtonBuilder().setCustomId(`shokan:retry:${id}`).setLabel(`#${id} 再試行`).setEmoji("🔁").setStyle(ButtonStyle.Primary),
+  );
+  return { embeds: [embed], components: [...components, backButton()], allowedMentions: { parse: [] as never[] } };
 }
 
 function renderHistory(services: Services, offset: number) {
@@ -90,23 +239,13 @@ function renderHistory(services: Services, offset: number) {
     return { embeds: [embed], components: [backButton()] };
   }
   const lines = rows.map((p) => {
-    const dateStr = fmtJstDate(p.purchased_at);
     const priceStr = p.paid_land !== null ? fmtLd(p.paid_land) : p.paid_alt_kind ? `${p.paid_alt_kind} ${p.paid_alt_amount}` : "—";
-    const pendingManual = p.item_delivery === "manual" && p.delivered_at === null && p.status === "active";
-    const statusIcon =
-      p.status === "expired"
-        ? "⚫"
-        : pendingManual
-          ? "📦"
-          : p.delivered_at
-            ? "✅"
-            : "🟢";
-    return `${statusIcon} \`#${p.id}\` ${dateStr} — <@${p.user_id}> **${p.item_name}** — ${priceStr}`;
+    const pendingManualRow = p.item_delivery === "manual" && p.delivered_at === null && p.status === "active";
+    const statusIcon = p.status === "expired" ? "⚫" : pendingManualRow ? "📦" : p.delivered_at ? "✅" : "🟢";
+    return `${statusIcon} \`#${p.id}\` ${fmtJstDate(p.purchased_at)} — <@${p.user_id}> **${p.item_name}** — ${priceStr}`;
   });
-  const from = offset + 1;
-  const to = offset + rows.length;
   embed.setDescription(lines.join("\n"));
-  embed.setFooter({ text: `${from}〜${to} / 全 ${total} 件（📦=手動配送待ち, ✅=配送済, 🟢=自動配送済/購読中, ⚫=期限切れ）` });
+  embed.setFooter({ text: `${offset + 1}〜${offset + rows.length} / 全 ${total} 件（📦=手動対応待ち, ✅=対応済, 🟢=自動処理済/契約中, ⚫=期限切れ）` });
   const nav = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`shokan:history:${Math.max(0, offset - HISTORY_PAGE)}`)
@@ -117,37 +256,39 @@ function renderHistory(services: Services, offset: number) {
       .setCustomId(`shokan:history:${offset + HISTORY_PAGE}`)
       .setLabel("古い方へ")
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(to >= total),
+      .setDisabled(offset + rows.length >= total),
   );
   return { embeds: [embed], components: [nav, backButton()], allowedMentions: { parse: [] as never[] } };
 }
 
 function renderList(services: Services) {
   const items = services.shop.listItems();
-  const embed = new EmbedBuilder().setTitle("📃 商品一覧").setColor(0xdb2777);
+  const embed = new EmbedBuilder().setTitle("📦 商品設定").setColor(0xdb2777);
   if (items.length === 0) {
-    embed.setDescription("まだ商品がありません。「新規商品」から追加してください。");
+    embed.setDescription("商品がありません。");
     return { embeds: [embed], components: [backButton()] };
   }
+  // 商品の新規作成はここから行わない。Botが処理方法を知らない商品を作れてしまうと、
+  // 必ず「買えるが誰も終わらせられない」手動対応に戻る
   embed.setDescription(
-    items
-      .slice(0, 25)
-      .map((it) => {
-        const status = it.enabled ? "🟢" : "⚫";
-        const kind = it.kind === "monthly" ? "月額" : "単発";
+    [
+      ...items.slice(0, 25).map((it) => {
         const price = it.price_land !== null ? fmtLd(it.price_land) : "—";
-        return `${status} \`#${it.id}\` **${it.name}** — ${price} / ${kind}`;
-      })
-      .join("\n"),
+        const mark = it.enabled ? "🟢" : services.shop.isSalesLocked(it) ? "🔒" : "⚫";
+        return `${mark} \`#${it.id}\` **${it.name}** — ${price} / ${it.duration_days ? `${it.duration_days}日間` : "単発"}`;
+      }),
+      "",
+      "-# 変更できるのは 名前・価格・説明・階級要件・販売のON/OFF です。",
+    ].join("\n"),
   );
   const menu = new StringSelectMenuBuilder()
     .setCustomId("shokan:pick")
     .setPlaceholder("編集する商品を選ぶ")
     .addOptions(
       items.slice(0, 25).map((it) => ({
-        label: `${it.enabled ? "" : "[無効] "}${it.name}`.slice(0, 100),
+        label: `${it.enabled ? "" : "[停止中] "}${it.name}`.slice(0, 100),
         value: String(it.id),
-        description: `${it.price_land !== null ? fmtLd(it.price_land) : "—"} / ${it.kind === "monthly" ? "月額" : "単発"}`.slice(0, 100),
+        description: `${it.price_land !== null ? fmtLd(it.price_land) : "—"} / ${it.duration_days ? `${it.duration_days}日間` : "単発"}`.slice(0, 100),
       })),
     );
   return { embeds: [embed], components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu), backButton()] };
@@ -155,35 +296,34 @@ function renderList(services: Services) {
 
 function renderItem(item: ShopItemRow, services: Services) {
   const embed = new EmbedBuilder()
-    .setTitle(`🛒 ${item.name}`)
+    .setTitle(`📦 ${item.name}`)
     .setColor(item.enabled ? 0xdb2777 : 0x6b7280)
     .addFields(
       { name: "説明", value: item.description ?? "（説明なし）" },
       { name: "価格 (Land)", value: item.price_land !== null ? fmtLd(item.price_land) : "—", inline: true },
       { name: "代替価格", value: item.price_alt_kind ? `${item.price_alt_kind} ${item.price_alt_amount}` : "—", inline: true },
-      { name: "種類", value: item.kind === "monthly" ? "月額" : "単発", inline: true },
-      { name: "期限（日）", value: String(item.duration_days ?? "—"), inline: true },
+      { name: "期間", value: item.duration_days ? `${item.duration_days}日間` : "単発", inline: true },
       { name: "階級要件", value: requirementLabel(services.settings, item.require_role_id), inline: true },
-      { name: "配送", value: `${item.delivery === "auto" ? "自動" : "手動"}${item.delivery_kind ? ` (${item.delivery_kind})` : ""}`, inline: true },
-      { name: "在庫", value: item.stock === null ? "無限" : String(item.stock), inline: true },
-      { name: "状態", value: item.enabled ? "🟢 有効" : "⚫ 無効", inline: true },
+      { name: "配送", value: item.delivery === "auto" ? "自動" : "手動（スタッフ対応）", inline: true },
+      {
+        name: "状態",
+        value: item.enabled ? "🟢 販売中" : services.shop.isSalesLocked(item) ? "🔒 移行待ち（再開不可）" : "⚫ 停止中",
+        inline: true,
+      },
     );
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`shokan:edit-basic:${item.id}`).setLabel("基本情報を編集").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`shokan:edit-basic:${item.id}`).setLabel("名前・価格・説明").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`shokan:edit-role:${item.id}`).setLabel("階級要件").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`shokan:edit-delivery:${item.id}`).setLabel("配送設定").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`shokan:toggle:${item.id}`)
-      .setLabel(item.enabled ? "無効化" : "有効化")
-      .setStyle(item.enabled ? ButtonStyle.Danger : ButtonStyle.Success),
+      .setLabel(item.enabled ? "販売を止める" : services.shop.isSalesLocked(item) ? "移行待ち" : "販売する")
+      .setStyle(item.enabled ? ButtonStyle.Danger : ButtonStyle.Success)
+      .setDisabled(!item.enabled && services.shop.isSalesLocked(item)),
   );
   return { embeds: [embed], components: [row, backButton()] };
 }
 
-export async function handleShokanCommand(
-  interaction: ChatInputCommandInteraction,
-  services: Services,
-): Promise<void> {
+export async function handleShokanCommand(interaction: ChatInputCommandInteraction, services: Services): Promise<void> {
   if (!canOperate(interaction, services)) {
     await interaction.reply({
       content: "この操作には運営または「冥界商館」部署の担当ロールが必要です。",
@@ -191,7 +331,7 @@ export async function handleShokanCommand(
     });
     return;
   }
-  await interaction.reply({ ...renderHub(services), flags: MessageFlags.Ephemeral });
+  await interaction.reply({ ...shopAdminPanelMessage(services), flags: MessageFlags.Ephemeral });
 }
 
 export async function handleShokanButton(interaction: ButtonInteraction, services: Services): Promise<void> {
@@ -203,32 +343,49 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   const action = parts[1];
   const arg = parts[2];
 
-  if (action === "hub") return void (await interaction.update(renderHub(services)));
-  if (action === "list") return void (await interaction.update(renderList(services)));
-  if (action === "new") return void (await interaction.showModal(newItemModal()));
-  if (action === "history") {
-    const offset = Math.max(0, Number(arg ?? 0));
-    return void (await interaction.update(renderHistory(services, offset)));
-  }
+  // 常設パネルのボタンは**元のパネルを書き換えない**（全員に見えるため）。
+  // 押した人にだけ ephemeral で出す
+  const fromPanel = interaction.message.flags?.has?.(MessageFlags.Ephemeral) === false;
+  const show = async (view: Parameters<ButtonInteraction["reply"]>[0]) => {
+    if (fromPanel) await interaction.reply({ ...(view as object), flags: MessageFlags.Ephemeral });
+    else await interaction.update(view as never);
+  };
+
+  if (action === "hub") return void (await show(shopAdminPanelMessage(services) as never));
+  if (action === "pending") return void (await show(renderPending(services) as never));
+  if (action === "failed") return void (await show(renderFailed(services) as never));
+  if (action === "list") return void (await show(renderList(services) as never));
+  if (action === "history") return void (await show(renderHistory(services, Math.max(0, Number(arg ?? 0))) as never));
   if (action === "edit-basic" && arg) return void (await interaction.showModal(editBasicModal(Number(arg), services)));
-  if (action === "edit-role" && arg) return void (await interaction.update(roleEditor(Number(arg))));
-  if (action === "edit-delivery" && arg) return void (await interaction.showModal(editDeliveryModal(Number(arg), services)));
+  if (action === "edit-role" && arg) return void (await show(roleEditor(Number(arg)) as never));
   if (action === "toggle" && arg) {
     const id = Number(arg);
     const item = services.shop.getItem(id);
     if (!item) return;
+    // 移行待ちの商品は再販売できない（契約の実体をBotが知らないまま売らない）
+    if (!item.enabled && services.shop.isSalesLocked(item)) {
+      await interaction.reply({
+        content: `⚠️ **${item.name}** は移行待ちのため販売を再開できません（専用台帳へ移すまで停止）。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     services.shop.setEnabled(id, !item.enabled, `user:${interaction.user.id}`);
-    return void (await interaction.update(renderItem(services.shop.getItem(id)!, services)));
+    return void (await show(renderItem(services.shop.getItem(id)!, services) as never));
   }
+
   if (action === "deliver" && arg) {
     const id = Number(arg);
-    // **再評価チャレンジはここで完了させない。** 買ったのは面談を受ける権利で、
-    // 消費するのは既存の再評価面談フローだけ。ここで配送済みにすると
-    // 未使用の権利が消え、面談前に 500,000 Ld が失われる（購入 #44 で起きた形）。
-    // 通知は出さなくなったが、**過去に流れた通知のボタンはまだ押せる**ので受け側で止める。
+    // **古い画面から押されうる。** ボタンを作った時点ではなく、いまの状態で判断する
     const purchase = services.shop.getPurchase(id);
-    const reevalItemId = Number(services.settings.getString("shop:reeval_item_id"));
-    if (purchase && Number.isInteger(reevalItemId) && purchase.item_id === reevalItemId) {
+    if (!purchase) {
+      await interaction.reply({ content: `購入 #${id} が見つかりません。`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    // 再評価チャレンジはここで完了させない。買ったのは面談を受ける権利で、
+    // 消費するのは既存の再評価面談フローだけ。ここで配送済みにすると
+    // 未使用の権利が消え、面談前に 500,000 Ld が失われる（購入 #44 で起きた形）
+    if (excludedItemIds(services).includes(purchase.item_id)) {
       await interaction.reply({
         content: [
           `⚠️ 購入 #${id} は**再評価を受ける権利**です。ここでは完了にできません。`,
@@ -238,17 +395,42 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
       });
       return;
     }
-    services.shop.markDelivered(id, `user:${interaction.user.id}`);
-    await interaction.reply({ content: `📦 購入 #${id} を配送済みにしました。`, flags: MessageFlags.Ephemeral });
-    // 元メッセージのボタンを無効化
-    if (interaction.message.editable) {
-      await interaction.message
-        .edit({
-          content: `${interaction.message.content}\n✅ 配送完了（${interaction.user.username}）`,
-          components: [],
-        })
-        .catch(() => undefined);
+    const item = services.shop.getItem(purchase.item_id);
+    if (purchase.status !== "active") {
+      await interaction.reply({
+        content: `購入 #${id} は **${purchase.status}** のため完了にできません。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
     }
+    if (purchase.delivered_at !== null) {
+      await interaction.reply({ content: `購入 #${id} は既に対応済みです。`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!item || item.delivery !== "manual") {
+      await interaction.reply({
+        content: `購入 #${id} は手動対応の商品ではありません。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    services.shop.markDelivered(id, `user:${interaction.user.id}`);
+    await show(renderPending(services) as never);
+    await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
+    return;
+  }
+
+  if (action === "retry" && arg) {
+    const id = Number(arg);
+    // 再配送の可否判定は `redeliverPurchase` が持っている。
+    // **購入時スナップショット**と現在の status を見るので、expired/refunded/cancelled や
+    // 撤回済みの配送種別は古いボタンから実行できない
+    const outcome = await redeliverPurchase(services, interaction.guild, id, `user:${interaction.user.id}`);
+    await interaction.reply({
+      content: `${outcome.state === "failed" ? "⚠️" : "✅"} 購入 #${id}: ${outcome.message}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
     return;
   }
 }
@@ -284,157 +466,57 @@ export async function handleShokanSelect(
 export async function handleShokanModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
   if (!canOperate(interaction, services)) return;
   const parts = interaction.customId.split(":");
-  const action = parts[1];
+  if (parts[1] !== "edit-basic") return;
 
-  if (action === "new") {
-    const name = interaction.fields.getTextInputValue("name").trim();
-    const price = Number(interaction.fields.getTextInputValue("price").replaceAll(",", "").trim());
-    const kindRaw = interaction.fields.getTextInputValue("kind").trim().toLowerCase();
-    const durationRaw = interaction.fields.getTextInputValue("duration").trim();
-    const desc = interaction.fields.getTextInputValue("desc").trim() || null;
-    if (!name || !Number.isFinite(price) || price < 0) {
-      await interaction.reply({ content: "名前と 0以上の価格 を入れてください。", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const kind = kindRaw === "m" || kindRaw === "monthly" || kindRaw === "月額" ? "monthly" : "one_shot";
-    const duration = durationRaw ? Number(durationRaw) : null;
-    const created = services.shop.createItem(
-      {
-        name,
-        description: desc,
-        price_land: price,
-        kind,
-        duration_days: duration && Number.isFinite(duration) ? duration : null,
-        delivery: "manual",
-        enabled: true,
-      },
-      `user:${interaction.user.id}`,
-    );
-    await interaction.reply({
-      content: `✅ 商品 #${created.id} 「${created.name}」を追加しました。編集は「一覧」から。`,
-      flags: MessageFlags.Ephemeral,
-    });
+  const id = Number(parts[2]);
+  const name = interaction.fields.getTextInputValue("name").trim();
+  const price = Number(interaction.fields.getTextInputValue("price").replaceAll(",", "").trim());
+  const desc = interaction.fields.getTextInputValue("desc").trim() || null;
+  if (!name || !Number.isFinite(price) || price < 0) {
+    await interaction.reply({ content: "名前と 0以上の価格 を入れてください。", flags: MessageFlags.Ephemeral });
     return;
   }
-  if (action === "edit-basic") {
-    const id = Number(parts[2]);
-    const name = interaction.fields.getTextInputValue("name").trim();
-    const price = Number(interaction.fields.getTextInputValue("price").replaceAll(",", "").trim());
-    const kindRaw = interaction.fields.getTextInputValue("kind").trim().toLowerCase();
-    const durationRaw = interaction.fields.getTextInputValue("duration").trim();
-    const desc = interaction.fields.getTextInputValue("desc").trim() || null;
-    const kind = kindRaw === "m" || kindRaw === "monthly" || kindRaw === "月額" ? "monthly" : "one_shot";
-    const duration = durationRaw ? Number(durationRaw) : null;
-    services.shop.updateItem(
-      id,
-      {
-        name,
-        description: desc,
-        price_land: Number.isFinite(price) && price >= 0 ? price : null,
-        kind,
-        duration_days: duration && Number.isFinite(duration) ? duration : null,
-      },
-      `user:${interaction.user.id}`,
-    );
-    await interaction.reply({ content: `✅ 商品 #${id} を更新しました。`, flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (action === "edit-delivery") {
-    const id = Number(parts[2]);
-    const modeRaw = interaction.fields.getTextInputValue("mode").trim().toLowerCase();
-    const kindRaw = interaction.fields.getTextInputValue("kind").trim().toLowerCase();
-    const dataRaw = interaction.fields.getTextInputValue("data").trim();
-    const mode = modeRaw === "auto" || modeRaw === "自動" ? "auto" : "manual";
-    const kind =
-      kindRaw === "add_role"
-        ? "add_role"
-        : kindRaw === "extend_deadline"
-          ? "extend_deadline"
-          : kindRaw === "revoke_meirei"
-            ? "revoke_meirei"
-            : null;
-    services.shop.updateItem(
-      id,
-      { delivery: mode, delivery_kind: kind, delivery_data: dataRaw || null },
-      `user:${interaction.user.id}`,
-    );
-    await interaction.reply({ content: `✅ 配送設定を更新しました。`, flags: MessageFlags.Ephemeral });
-    return;
-  }
+  // 期間・配送方法はここから変えない。Botの処理内容と結びついているため、
+  // 変えるならコード側の対応が要る
+  services.shop.updateItem(id, { name, description: desc, price_land: price }, `user:${interaction.user.id}`);
+  await interaction.reply({ content: `✅ 商品 #${id} を更新しました。`, flags: MessageFlags.Ephemeral });
 }
 
 // ---- Modals & Selects ----
 
-function newItemModal() {
-  return new ModalBuilder()
-    .setCustomId("shokan:new")
-    .setTitle("新規商品")
-    .addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("name").setLabel("商品名").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(80),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("price").setLabel("価格（Land）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("kind").setLabel("種類: monthly / one_shot").setStyle(TextInputStyle.Short).setRequired(true).setValue("one_shot"),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("duration").setLabel("期限日数（単発の期限付きのみ・空欄可）").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(6),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("desc").setLabel("説明").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500),
-      ),
-    );
-}
-
 function editBasicModal(id: number, services: Services) {
   const item = services.shop.getItem(id);
-  const modal = new ModalBuilder().setCustomId(`shokan:edit-basic:${id}`).setTitle(`#${id} 基本情報の編集`);
+  const modal = new ModalBuilder().setCustomId(`shokan:edit-basic:${id}`).setTitle(`#${id} 名前・価格・説明`);
   const inputs = [
-    new TextInputBuilder().setCustomId("name").setLabel("商品名").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(80).setValue(item?.name ?? ""),
-    new TextInputBuilder().setCustomId("price").setLabel("価格（Land）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(15).setValue(item?.price_land !== undefined && item?.price_land !== null ? String(item.price_land) : "0"),
-    new TextInputBuilder().setCustomId("kind").setLabel("種類: monthly / one_shot").setStyle(TextInputStyle.Short).setRequired(true).setValue(item?.kind ?? "one_shot"),
-    new TextInputBuilder().setCustomId("duration").setLabel("期限日数（空欄可）").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(6).setValue(item?.duration_days ? String(item.duration_days) : ""),
-    new TextInputBuilder().setCustomId("desc").setLabel("説明").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500).setValue(item?.description ?? ""),
+    new TextInputBuilder()
+      .setCustomId("name")
+      .setLabel("商品名")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(80)
+      .setValue(item?.name ?? ""),
+    new TextInputBuilder()
+      .setCustomId("price")
+      .setLabel("価格（Land）")
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(15)
+      .setValue(item?.price_land != null ? String(item.price_land) : "0"),
+    new TextInputBuilder()
+      .setCustomId("desc")
+      .setLabel("説明")
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(false)
+      .setMaxLength(500)
+      .setValue(item?.description ?? ""),
   ];
-  modal.addComponents(
-    ...inputs.map((i) => new ActionRowBuilder<TextInputBuilder>().addComponents(i)),
-  );
-  return modal;
-}
-
-function editDeliveryModal(id: number, services: Services) {
-  const item = services.shop.getItem(id);
-  const modal = new ModalBuilder().setCustomId(`shokan:edit-delivery:${id}`).setTitle(`#${id} 配送設定`);
-  modal.addComponents(
-    new ActionRowBuilder<TextInputBuilder>().addComponents(
-      new TextInputBuilder().setCustomId("mode").setLabel("配送: auto / manual").setStyle(TextInputStyle.Short).setRequired(true).setValue(item?.delivery ?? "manual"),
-    ),
-    new ActionRowBuilder<TextInputBuilder>().addComponents(
-      new TextInputBuilder()
-        .setCustomId("kind")
-        .setLabel("自動配送種別: add_role / extend_deadline / revoke_meirei / 空欄")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(false)
-        .setValue(item?.delivery_kind ?? ""),
-    ),
-    new ActionRowBuilder<TextInputBuilder>().addComponents(
-      new TextInputBuilder()
-        .setCustomId("data")
-        .setLabel("配送データ JSON（例: {\"role_id\":\"…\"} / {\"days\":1}）")
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(false)
-        .setMaxLength(500)
-        .setValue(item?.delivery_data ?? ""),
-    ),
-  );
+  modal.addComponents(...inputs.map((i) => new ActionRowBuilder<TextInputBuilder>().addComponents(i)));
   return modal;
 }
 
 function roleEditor(id: number) {
   const embed = new EmbedBuilder()
-    .setTitle(`#${id} 階級要件の設定`)
+    .setTitle(`#${id} 階級要件`)
     .setColor(0xdb2777)
     .setDescription("要件ロールを選ぶか、「解除」で無条件にします。");
   const picker = new RoleSelectMenuBuilder().setCustomId(`shokan:role-set:${id}`).setPlaceholder("要件ロールを選ぶ");
