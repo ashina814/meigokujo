@@ -109,6 +109,14 @@ export interface ChipTxRow {
   game: string | null;
   session_id: string | null;
   actor_id: string;
+  /**
+   * この取引が属する開始残高の版（検算の窓）。`record()` 時点の `currentVersion()` を刻む。
+   *
+   * 版を取引そのものに持たせているので、正式開業初期化で採番が巻き戻っても
+   * 旧版の取引と混ざらない（`replayBalances()` はこの列で窓を切る）。
+   * 列の作成時（PR1 `1e57ad4`）から `TEXT NOT NULL` で、後付けの ALTER も既定値も無いため非 null。
+   */
+  opening_version: string;
   land_amount: number | null;
   ledger_tx_id: number | null;
   created_at: number;
