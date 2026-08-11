@@ -291,6 +291,99 @@ export class Evaluation {
   }
 
   /**
+   * 再評価面談OK: `meirei → ghost` の復帰。
+   *
+   * **`ghostify()` を流用しない。** あちらは入城処理なので初期発行・招待実績の計上・
+   * 招待者の期限延長まで抱えている。ここは「一度落ちた人がもう一度評価を受け直す」
+   * 復帰なので、**新しい評価サイクルの開始だけ**を行う。
+   *
+   * - 初期Landの再発行なし・`invites` の再計上なし・招待者の期限延長なし・予約行に触れない
+   * - 招待実績由来の昇格スコアは `invites` を消さないので現状どおり引き継がれる
+   * - 以前の昇格印・降格印は**履歴を残したまま** revoked にする（新しい評価を白紙から始める）
+   *
+   * `WHERE status='meirei'` を条件に入れてあるので、面談中に別経路で階級が動いていたら
+   * 0行更新で `null` を返す（前提が崩れた状態で書かない）。
+   */
+  reinstateFromMeirei(
+    targetId: string,
+    actor: string,
+    evidence: Record<string, unknown>,
+  ): { deadline: number; revokedMarks: number; policyVersion: string } | null {
+    const ts = now();
+    const baseDays = positiveInt(this.settings.getNumber("eval_base_period_days")) ?? SETTING_DEFAULTS.eval_base_period_days;
+    const promotionRequired =
+      positiveInt(this.settings.getNumber("promotion_marks_required")) ?? SETTING_DEFAULTS.promotion_marks_required;
+    const demotionThreshold =
+      positiveInt(this.settings.getNumber("demotion_marks_threshold")) ?? SETTING_DEFAULTS.demotion_marks_threshold;
+    const inviteMarkPerPerson =
+      nonNegativeNumber(this.settings.getNumber("invite_mark_per_person")) ?? SETTING_DEFAULTS.invite_mark_per_person;
+    const inviteMarkCap = nonNegativeNumber(this.settings.getNumber("invite_mark_cap")) ?? SETTING_DEFAULTS.invite_mark_cap;
+    const policyVersion =
+      this.settings.getString("eval_policy_version") ??
+      `reeval:${promotionRequired}:${demotionThreshold}:${inviteMarkPerPerson}:${inviteMarkCap}:${ts}`;
+    const deadline = ts + baseDays * 86_400;
+
+    const run = this.db.transaction(() => {
+      const changed = this.db
+        .prepare(
+          `UPDATE souls
+              SET status = 'ghost',
+                  ghost_at = ?,
+                  eval_started_at = ?,
+                  eval_deadline_at = ?,
+                  eval_extension_days = 0,
+                  eval_policy_version = ?,
+                  eval_promotion_required = ?,
+                  eval_demotion_threshold = ?,
+                  eval_invite_mark_per_person = ?,
+                  eval_invite_mark_cap = ?,
+                  updated_at = ?
+            WHERE user_id = ? AND status = 'meirei'`,
+        )
+        .run(ts, ts, deadline, policyVersion, promotionRequired, demotionThreshold, inviteMarkPerPerson, inviteMarkCap, ts, targetId)
+        .changes;
+      if (changed !== 1) return null;
+      // 履歴は消さず、有効な印だけ取り消す（再評価は白紙から）
+      const revokedMarks = this.db
+        .prepare("UPDATE marks SET revoked_at = ? WHERE target_id = ? AND revoked_at IS NULL")
+        .run(ts, targetId).changes;
+      return { revokedMarks };
+    });
+    const result = run.immediate();
+    if (!result) {
+      this.events.log("reeval_reinstate_skipped", { actor, target: targetId, payload: { reason: "precondition_lost" } });
+      return null;
+    }
+    if (result.revokedMarks > 0) {
+      this.events.log("reeval_marks_reset", {
+        actor,
+        target: targetId,
+        payload: { revoked: result.revokedMarks, reason: "再評価サイクル開始のため以前の印を取り消し" },
+      });
+    }
+    this.events.log("reeval_reinstated", {
+      actor,
+      target: targetId,
+      payload: {
+        from: "meirei",
+        to: "ghost",
+        ghostAt: ts,
+        evalStartedAt: ts,
+        evalDeadlineAt: deadline,
+        policy: { policyVersion, promotionRequired, demotionThreshold, inviteMarkPerPerson, inviteMarkCap, baseDays },
+        revokedMarks: result.revokedMarks,
+        ...evidence,
+      },
+    });
+    return { deadline, revokedMarks: result.revokedMarks, policyVersion };
+  }
+
+  /** 再評価面談NG。status・ロール・印のどれも動かさず、判断だけ残す */
+  recordReevalRejection(targetId: string, actor: string, evidence: Record<string, unknown>): void {
+    this.events.log("reeval_rejected", { actor, target: targetId, payload: evidence });
+  }
+
+  /**
    * 履歴追認: `waiting → majin` を台帳へ書くだけ。
    *
    * **評価期間も初期発行も作らない。** 既に運用上は魔人として扱われている人の

@@ -72,6 +72,7 @@ import {
 } from "./commands/session-schedule.js";
 import { refreshWaitersBoard } from "./waiters-board.js";
 import { handleTicketButton } from "./commands/ticket-handler-safe.js";
+import { handleReevalApprove, handleReevalReject } from "./commands/reeval.js";
 import {
   handleConfessionButton,
   handleConfessionModal,
@@ -403,6 +404,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isButton()) {
       if (interaction.customId.startsWith("entry:")) {
         await handleEntryButton(interaction, services);
+        return;
+      }
+      if (interaction.customId.startsWith("reeval:")) {
+        const action = interaction.customId.split(":")[1];
+        if (action === "approve") await handleReevalApprove(interaction, services);
+        else if (action === "reject") await handleReevalReject(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("ticket:")) {

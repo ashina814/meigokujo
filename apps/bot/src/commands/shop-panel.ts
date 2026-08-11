@@ -191,6 +191,12 @@ function purchaseOnce(
   return execute.immediate();
 }
 
+/** 手動配送の案内。商品説明があれば併記する */
+function manualDeliveryNote(item: ShopItemRow, head: string): string {
+  return item.description ? `${head}
+${item.description}` : head;
+}
+
 async function finishPurchase(
   interaction: ButtonInteraction,
   services: Services,
@@ -206,9 +212,11 @@ async function finishPurchase(
     deliveryNote = outcome.message;
     delivered = outcome.state !== "failed";
   } else if (result.replayed) {
-    deliveryNote = "この購入は受付済みです（スタッフ対応待ち）。";
+    deliveryNote = manualDeliveryNote(item, "この購入は受付済みです（スタッフ対応待ち）。");
   } else {
-    deliveryNote = "スタッフが配送の対応をします。";
+    // 手動配送は商品ごとに次の一手が違う（再評価チャレンジなら面談チケットを開く）。
+    // 商品説明をそのまま出して、案内を商品側のデータで持てるようにする
+    deliveryNote = manualDeliveryNote(item, "スタッフが配送の対応をします。");
     await notifyStaffForDelivery(interaction, services, purchase.id, item).catch(() => undefined);
   }
   const expires = purchase.expires_at ? `\n有効期限: <t:${purchase.expires_at}:D>` : "";

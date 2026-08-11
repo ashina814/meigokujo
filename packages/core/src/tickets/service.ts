@@ -17,6 +17,7 @@ export interface TicketRow {
   claimed_by: string | null;
   reminded_at: number | null;
   panel_id: string | null;
+  linked_purchase_id: number | null;
   panel_name: string | null;
   panel_notify_role_ids_json: string | null;
   panel_staff_role_ids_json: string | null;
@@ -185,6 +186,12 @@ export class Tickets {
     this.addTicketColumn("panel_name", "TEXT");
     this.addTicketColumn("panel_notify_role_ids_json", "TEXT");
     this.addTicketColumn("panel_staff_role_ids_json", "TEXT");
+    // 再評価面談チケットと、その面談権（再評価チャレンジの購入）の紐付け。
+    // 1つの購入を複数チケットで消費できないよう、DB側で一意にする
+    this.addTicketColumn("linked_purchase_id", "INTEGER");
+    this.db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_linked_purchase ON tickets(linked_purchase_id) WHERE linked_purchase_id IS NOT NULL",
+    );
     this.addPanelColumn("archived_at", "INTEGER");
     this.addPanelColumn("archived_by", "TEXT");
     const ts = now();
@@ -456,6 +463,30 @@ export class Tickets {
 
   markReminded(threadId: string): void {
     this.db.prepare("UPDATE tickets SET reminded_at = ? WHERE thread_id = ?").run(now(), threadId);
+  }
+
+  /**
+   * 面談権（購入）をチケットへ結び付ける。
+   *
+   * 一意インデックスが効くので、同じ購入を2つのチケットへは結べない。
+   * 競合したら `false` を返し、呼び出し側は「他のチケットで消費済み」として扱う。
+   */
+  linkPurchase(threadId: string, purchaseId: number, actor: string): boolean {
+    try {
+      const changed = this.db
+        .prepare("UPDATE tickets SET linked_purchase_id = ?, updated_at = ? WHERE thread_id = ? AND linked_purchase_id IS NULL")
+        .run(purchaseId, now(), threadId).changes;
+      if (changed !== 1) return false;
+    } catch {
+      return false; // 一意制約違反＝他のチケットが先に消費した
+    }
+    this.events.log("ticket_purchase_linked", { actor, payload: { threadId, purchaseId } });
+    return true;
+  }
+
+  /** その購入を消費しているチケット（あれば） */
+  ticketByPurchase(purchaseId: number): TicketRow | undefined {
+    return this.db.prepare("SELECT * FROM tickets WHERE linked_purchase_id = ?").get(purchaseId) as TicketRow | undefined;
   }
 
   openByUserPanel(userId: string, panelId: string): TicketRow | undefined {
