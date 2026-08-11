@@ -120,7 +120,7 @@ type Preflight =
   | { ok: false; message: string };
 
 /** 確定前の下見。ここで弾けるものは弾き、最終判断はトランザクション内で取り直す */
-async function preflight(interaction: ModalSubmitInteraction, services: Services, guild: Guild): Promise<Preflight> {
+async function preflight(interaction: ModalSubmitInteraction, services: Services, guild: Guild, target: ReturnTarget): Promise<Preflight> {
   const panel = services.tickets.getPanel(RETURN_PANEL_ID);
   if (!panel || !panel.enabled || panel.archivedAt) {
     return { ok: false, message: "出戻り申請の受付（`return`）が未作成・無効です。`/管理 → 受付パネル` で用意してください。" };
@@ -135,13 +135,13 @@ async function preflight(interaction: ModalSubmitInteraction, services: Services
   if (!member) return { ok: false, message: `<@${targetId}> がサーバーに見つかりません。何も変更していません。` };
   let soul = services.entry.getSoul(targetId);
   if (!soul) {
-    // Bot停止中の参加など、入城処理が一度も走らなかった人。ここで案内待ちの行を作る。
-    // 作るのは **waiting の行だけ** で、戻し先はこの後の運営の選択に委ねる
-    services.entry.recordJoin(targetId);
-    services.events.log("entry_soul_created_for_return", {
-      actor: "system:return-preflight",
-      target: targetId,
-      payload: { reason: "出戻り申請の対応時に台帳の行が無かったため作成" },
+    // Bot停止中の参加など、入城処理が一度も走らなかった人。案内待ちの行だけを作る。
+    // **`recordJoin()` は使わない**（通常の参加イベントと「いま参加した」joined_at を
+    // 捏造してしまうため）。Discord が持っている実際の参加時刻を使う
+    const joinedAt = member.joinedTimestamp ? Math.floor(member.joinedTimestamp / 1000) : null;
+    services.returns.createWaitingSoulForReturn(targetId, joinedAt, "system:return-preflight", {
+      reason: "出戻り申請の対応時に台帳の行が無かったため作成",
+      ticketThreadId: interaction.channelId,
     });
     soul = services.entry.getSoul(targetId);
     if (!soul) return { ok: false, message: `<@${targetId}> の魂の記録を作成できませんでした。` };
@@ -149,7 +149,27 @@ async function preflight(interaction: ModalSubmitInteraction, services: Services
   if (soul.status !== "waiting") {
     return { ok: false, message: `<@${targetId}> は現在 **${soul.status}** です。出戻りの反映は案内待ちからのみ行えます。` };
   }
+  // **ロールを確定の前に検証する。** 台帳を書いてから「ロールが無い」と分かると、
+  // 台帳だけ進んだ中途半端な状態が残る
+  const roleCheck = checkTargetRole(services, guild, target);
+  if (!roleCheck.ok) return { ok: false, message: `${roleCheck.message} 台帳・チケットとも変更していません。` };
   return { ok: true, member, targetId, previousStatus: soul.status };
+}
+
+/** 戻し先のロールが設定され、実在し、Botが操作できるか */
+export function checkTargetRole(services: Services, guild: Guild, target: ReturnTarget): { ok: true } | { ok: false; message: string } {
+  if (target === "waiting") return { ok: true }; // ロールを触らない
+  const key = target === "meirei" ? MEIREI_ROLE_SETTING_KEY : RANK_ROLE_SETTING_KEYS[target as LadderRank];
+  const roleId = services.settings.getString(key);
+  if (!roleId) return { ok: false, message: `${RETURN_TARGET_LABELS[target]} のロール設定（\`${key}\`）がありません。` };
+  const role = guild.roles.cache.get(roleId);
+  if (!role) return { ok: false, message: `設定されたロール（${roleId}）がサーバーに見つかりません。` };
+  const me = guild.members.me;
+  if (!me) return { ok: false, message: "Bot自身のメンバー情報を取得できませんでした。" };
+  if (role.position >= me.roles.highest.position) {
+    return { ok: false, message: `Botのロールが <@&${roleId}> より下にあるため操作できません（ロール順を上げてください）。` };
+  }
+  return { ok: true };
 }
 
 export async function handleReturnReasonSubmit(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
@@ -160,7 +180,7 @@ export async function handleReturnReasonSubmit(interaction: ModalSubmitInteracti
   const guild = interaction.guild;
   if (!guild) return void (await interaction.reply({ content: "サーバー内で実行してください。", flags: MessageFlags.Ephemeral }));
 
-  const pre = await preflight(interaction, services, guild);
+  const pre = await preflight(interaction, services, guild, target);
   if (!pre.ok) return void (await interaction.reply({ content: `⚠️ ${pre.message}`, flags: MessageFlags.Ephemeral }));
   await interaction.deferReply();
 
@@ -190,6 +210,10 @@ export async function handleReturnReasonSubmit(interaction: ModalSubmitInteracti
   }
 
   const roleErrors = target === "waiting" ? [] : await applyReturnRoles(services, guild, pre.member, pre.targetId, target, actor);
+  // 最終確認: 目標階級ロールだけが付き、迷霊と競合せず、案内待ちも残っていないか
+  if (target !== "waiting" && roleErrors.length === 0) {
+    roleErrors.push(...(await postCheckRoles(services, guild, pre.targetId, target, actor)));
+  }
   if (roleErrors.length > 0) {
     services.events.log("entry_return_role_repair_failed", { actor, target: pre.targetId, payload: { to: target, errors: roleErrors } });
   }
@@ -201,7 +225,7 @@ export async function handleReturnReasonSubmit(interaction: ModalSubmitInteracti
         ? `🚫 <@${pre.targetId}> は今回復帰させないことにしました（案内待ちのまま）。`
         : `✅ <@${pre.targetId}> を **${RETURN_TARGET_LABELS[target]}** で反映しました。`,
       cycle
-        ? `新しい評価期間: <t:${cycle.deadline}:D> まで / 必要アリ **${cycle.promotionRequired}**（出戻りのため通常より多い）/ 招待は ${cycle.inviteThreshold}人から1アリ（過去分は持ち越さず、いまの ${cycle.inviteBaseline}人を起点）${cycle.revokedMarks > 0 ? ` / 以前の印 ${cycle.revokedMarks}件を無効化（履歴は保持）` : ""}`
+        ? `新しい評価期間: <t:${cycle.deadline}:D> まで / 必要アリ **${cycle.promotionRequired}**（出戻りのため通常より多い）/ 招待は ${cycle.inviteThreshold}人から1アリ（過去分は持ち越さず、いまの ${cycle.inviteBaseline}人を起点）${(settled.result?.revokedMarks ?? 0) > 0 ? ` / 以前の印 ${settled.result!.revokedMarks}件を無効化（履歴は保持）` : ""}`
         : "",
       `理由: ${reason}`,
       roleErrors.length > 0
@@ -314,6 +338,42 @@ export async function applyReturnRoles(
   }
   services.events.log("entry_return_roles_applied", { actor, target: targetId, payload: { to: target, removed: toRemove, added: wanted, errors } });
   return errors;
+}
+
+/**
+ * ロール反映後の最終確認。**force fetch で取り直してから**見る。
+ *
+ * 目標階級ロールだけが付いていること・迷霊と通常階級が同居していないこと・
+ * 案内待ちが残っていないことを確かめ、崩れていれば修復が必要な状態として記録する。
+ */
+export async function postCheckRoles(
+  services: Services,
+  guild: Guild,
+  targetId: string,
+  target: Exclude<ReturnTarget, "waiting">,
+  actor: string,
+): Promise<string[]> {
+  const problems: string[] = [];
+  const member = await guild.members.fetch({ user: targetId, force: true }).catch(() => null);
+  if (!member) {
+    problems.push("反映後の再取得に失敗しました（ロール構成を確認できていません）");
+  } else {
+    const wanted = target === "meirei" ? services.settings.getString(MEIREI_ROLE_SETTING_KEY) : services.settings.getString(RANK_ROLE_SETTING_KEYS[target as LadderRank]);
+    const others = [
+      ...RANK_LADDER.map((r) => [r as string, services.settings.getString(RANK_ROLE_SETTING_KEYS[r])] as const),
+      ["meirei", services.settings.getString(MEIREI_ROLE_SETTING_KEY)] as const,
+    ].filter(([, id]) => !!id && id !== wanted && member.roles.cache.has(id!));
+    if (wanted && !member.roles.cache.has(wanted)) problems.push(`目標の ${target} ロールが付いていません`);
+    if (others.length > 0) problems.push(`余分な階級ロールが残っています: ${others.map(([r]) => r).join(", ")}`);
+    const waitRoleId = services.settings.getString("role:queue_wait");
+    if (waitRoleId && member.roles.cache.has(waitRoleId)) problems.push("案内待ちロールが残っています");
+  }
+  services.events.log(problems.length === 0 ? "entry_return_roles_verified" : "entry_return_roles_repair_needed", {
+    actor,
+    target: targetId,
+    payload: { to: target, problems },
+  });
+  return problems;
 }
 
 /** 出戻り申請ボタンを出す条件を人が読めるようにしたヘルパ（チケット作成時に使う） */

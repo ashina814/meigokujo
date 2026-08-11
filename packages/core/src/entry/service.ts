@@ -394,8 +394,9 @@ export class Entry {
     const promotionRequired = positiveInt(this.settings.getNumber("promotion_marks_required"), SETTING_DEFAULTS.promotion_marks_required);
     const demotionThreshold = positiveInt(this.settings.getNumber("demotion_marks_threshold"), SETTING_DEFAULTS.demotion_marks_threshold);
     const inviteThreshold = positiveInt(this.settings.getNumber("invite_marks_threshold"), SETTING_DEFAULTS.invite_marks_threshold);
-    // このサイクルで数える招待の起点。過去に招待実績があっても新しい評価へは持ち越さない
-    const inviteBaseline = (this.db.prepare("SELECT COUNT(*) AS c FROM invites WHERE inviter_id = ?").get(userId) as { c: number }).c;
+    // 通常の入城は従来どおり過去の招待も数える（起点0）。
+    // 過去分を切るのは**出戻り**のルールで、そちらは Returns 側で起点を焼く
+    const inviteBaseline = 0;
     const policyVersion =
       this.settings.getString("eval_policy_version") ??
       `manual:${promotionRequired}:${demotionThreshold}:${inviteThreshold}:${ts}`;

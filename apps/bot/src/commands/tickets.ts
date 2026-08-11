@@ -5,6 +5,7 @@ import {
   ButtonStyle,
   ChannelType,
   EmbedBuilder,
+  StringSelectMenuBuilder,
   MessageFlags,
   ThreadAutoArchiveDuration,
   type Guild,
@@ -117,6 +118,57 @@ function closeConfirmationRow(controlMessageId: string): ActionRowBuilder<Button
       .setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId("ticket:close-cancel").setLabel("キャンセル").setStyle(ButtonStyle.Secondary),
   );
+}
+
+/**
+ * チケットを開いたときにスレッドへ出す最初のメッセージ。
+ *
+ * **受付ごとの運営操作をここへ集約する。** 以前、判断材料と操作行を
+ * `thread.send` へ足し忘れて「押せる画面が無いチケット」を作ってしまった
+ * （再評価面談・出戻りの両方）。組み立てを関数として切り出し、
+ * 「その受付に必要な操作が付いているか」をテストで固定できるようにしてある。
+ */
+export function buildTicketOpeningMessage(
+  services: Services,
+  panel: TicketPanel,
+  requesterId: string,
+  requesterMember: GuildMember | null,
+  opts: { panelName: string; notifyRoleIds: string[]; invitedFailed: number; reevalPurchaseId: number | null },
+): { content: string; embeds: EmbedBuilder[]; components: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] } {
+  const extraRows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [];
+  const extraEmbeds: EmbedBuilder[] = [];
+  const extraLines: string[] = [];
+
+  if (panel.id === REEVAL_PANEL_ID) {
+    extraRows.push(reevalActionRow(!opts.reevalPurchaseId));
+    extraLines.push(
+      "",
+      opts.reevalPurchaseId
+        ? `🎟 面談権を確認しました（購入 #${opts.reevalPurchaseId}）。面談のうえ、下のボタンで結果を記録してください。`
+        : "⚠️ **未処理の再評価チャレンジの購入が見つかりません。** 復帰の承認はできません（購入済みなら運営に確認してください）。",
+    );
+  }
+  if (panel.id === RETURN_PANEL_ID) {
+    extraRows.push(returnActionRow());
+    extraEmbeds.push(returnContextEmbed(services, requesterId, requesterMember));
+    extraLines.push("", returnTicketIntro(services, requesterId));
+  }
+
+  return {
+    content: [
+      ...[
+        `📮 **${opts.panelName}** — <@${requesterId}>`,
+        opts.notifyRoleIds.length > 0 ? opts.notifyRoleIds.map((id) => `<@&${id}>`).join(" ") : "",
+        panel.description,
+        opts.invitedFailed > 0 ? `⚠️ 一部担当者をスレッドへ追加できませんでした（失敗 ${opts.invitedFailed}件）。` : "",
+      ].filter(Boolean),
+      "",
+      "🔴 **対応状況:** 未対応",
+      ...extraLines,
+    ].join("\n"),
+    embeds: extraEmbeds,
+    components: [ticketActionRow("open"), ...extraRows],
+  };
 }
 
 export function ticketOpenCustomId(panelId: string): string {
@@ -356,17 +408,12 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
     const reevalPurchaseId =
       panel.id === REEVAL_PANEL_ID ? linkReevalPurchase(services, thread.id, interaction.user.id) : null;
     await thread.send({
-      content: [
-        ...[
-          `📮 **${ticket.panel_name ?? panel.name}** — <@${interaction.user.id}>`,
-          validNotifyRoleIds.length > 0 ? validNotifyRoleIds.map((id) => `<@&${id}>`).join(" ") : "",
-          panel.description,
-          invited.failed > 0 ? `⚠️ 一部担当者をスレッドへ追加できませんでした（失敗 ${invited.failed}件）。` : "",
-        ].filter(Boolean),
-        "",
-        "🔴 **対応状況:** 未対応",
-      ].join("\n"),
-      components: [ticketActionRow("open")],
+      ...buildTicketOpeningMessage(services, panel, interaction.user.id, interaction.member as GuildMember | null, {
+        panelName: ticket.panel_name ?? panel.name,
+        notifyRoleIds: validNotifyRoleIds,
+        invitedFailed: invited.failed,
+        reevalPurchaseId,
+      }),
       allowedMentions: { users: [interaction.user.id], roles: validNotifyRoleIds },
     });
     initialized = true;

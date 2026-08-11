@@ -203,6 +203,12 @@ export async function handleMemberJoin(
   // rank_at_leave へ退避しておく（運営が出戻り申請の画面で参考にする）
   const joinedAt = member.joinedTimestamp ? Math.floor(member.joinedTimestamp / 1000) : null;
   const previousStatus = created ? null : services.returns.markReturnedToWaiting(member.id, joinedAt);
+  if (!created && previousStatus === null) {
+    // 既に台帳がある人へ `GuildMemberAdd` が再送された。出直した証拠が無いので
+    // **何もしない**。ここで案内待ちロールや入城案内を出すと、在籍中の階級者に
+    // 「これから入城する人」の扱いを被せてしまう
+    return;
+  }
   const isReturnee = previousStatus !== null;
 
   const waitRoleId = services.settings.getString("role:queue_wait");

@@ -148,7 +148,7 @@ describe("運営が選ぶ戻し先", () => {
     expect(ctx.evaluation.promotionScore(id).inviteCount).toBe(0);
     expect(ctx.evaluation.promotionScore(id).inviteScore).toBe(0);
     // 印は履歴を残したまま無効化
-    expect(result.cycle!.revokedMarks).toBe(2);
+    expect(result.revokedMarks).toBe(2);
     expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM marks WHERE target_id=?").get(id)).toEqual({ n: 2 });
     expect(ctx.evaluation.promotionScore(id).evalMarks).toBe(0);
     expect(ctx.evaluation.demotionCount(id)).toBe(0);
@@ -282,6 +282,59 @@ describe("判断材料", () => {
     expect(c.pastDemotionMarks).toBe(1);
     expect(c.inviteCount).toBe(1);
     expect(c.land).toBeGreaterThan(0);
+  });
+});
+
+describe("招待の起点は出戻りだけのルール", () => {
+  it("通常入城は過去の招待も数える（起点0）", () => {
+    const ctx = setup();
+    for (const g of ["g1", "g2", "g3"]) {
+      ctx.db.prepare("INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?,?,?)").run("u1", g, 1);
+    }
+    ctx.entry.recordJoin("u1");
+    ctx.entry.ghostify("u1", STAFF);
+
+    expect(soulOf(ctx).eval_invite_baseline).toBe(0);
+    expect(ctx.evaluation.promotionScore("u1").inviteCount).toBe(3);
+    expect(ctx.evaluation.promotionScore("u1").inviteScore).toBe(1);
+  });
+});
+
+describe("退出前の評価進捗を有効なまま残さない", () => {
+  function returnee2(ctx: ReturnType<typeof setup>) {
+    member(ctx);
+    ctx.evaluation.addMark("u1", "promotion", "user:e1", "evaluation");
+    ctx.evaluation.addMark("u1", "demotion", "user:e2", "evaluation");
+    ctx.returns.recordDeparture("u1");
+    ctx.returns.markReturnedToWaiting("u1", null);
+  }
+
+  for (const to of ["majin", "kenma", "mazoku", "meirei"] as const) {
+    it(`${to} で戻しても退出前の印は無効化される（履歴は残す）`, () => {
+      const ctx = setup();
+      returnee2(ctx);
+
+      const result = ctx.returns.reinstate("u1", to, STAFF, {})!;
+
+      expect(result.revokedMarks).toBe(2);
+      expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM marks WHERE target_id='u1'").get()).toEqual({ n: 2 });
+      expect(ctx.evaluation.promotionScore("u1").evalMarks).toBe(0);
+      expect(ctx.evaluation.demotionCount("u1")).toBe(0);
+      expect(ctx.events.listByTarget("u1").map((e) => e.type)).toContain("entry_return_marks_reset");
+    });
+  }
+
+  it("復帰させずwaitingのままにした後、通常入城しても旧印は復活しない", () => {
+    const ctx = setup();
+    returnee2(ctx);
+
+    ctx.returns.reinstate("u1", "waiting", STAFF, {});
+    // その後あらためて通常の入城導線を通った
+    ctx.entry.ghostify("u1", STAFF);
+
+    expect(ctx.evaluation.promotionScore("u1").evalMarks).toBe(0);
+    expect(ctx.evaluation.demotionCount("u1")).toBe(0);
+    expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM marks WHERE target_id='u1'").get()).toEqual({ n: 2 });
   });
 });
 

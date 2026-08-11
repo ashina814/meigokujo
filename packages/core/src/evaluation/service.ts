@@ -123,8 +123,9 @@ export class Evaluation {
     const currentInviteThreshold = positiveInt(this.settings.getNumber("invite_marks_threshold")) ?? SETTING_DEFAULTS.invite_marks_threshold;
     const promotionRequired = positiveInt(row?.eval_promotion_required) ?? currentPromotion;
     const demotionThreshold = positiveInt(row?.eval_demotion_threshold) ?? currentDemotion;
-    // 招待アリは段階式へ変わった。**旧snapshot（閾値を持たない行）は現在の閾値で評価する**。
-    // 旧モデル（1人=0.5・上限1）を残すと、同時期に評価される人の基準が割れるため
+    // 進行中のサイクルへは deploy 時の移行で閾値を焼いてある。ここへ来る NULL は
+    // 「評価サイクルを持たない人」なので、現在設定で答えるのは表示用途として妥当。
+    // **評価中の人が現在設定を参照し続けることは無い**（移行で焼かれているため）
     const inviteThreshold = positiveInt(row?.eval_invite_threshold) ?? currentInviteThreshold;
     const inviteBaseline = nonNegativeNumber(row?.eval_invite_baseline) ?? 0;
     return {

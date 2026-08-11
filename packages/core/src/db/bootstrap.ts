@@ -792,7 +792,31 @@ export function openDb(path: string): Database.Database {
   backfillEvaluationPolicySnapshots(db);
   backfillShopDeliveryState(db);
   backfillEverMeirei(db);
+  backfillInviteThresholdSnapshot(db);
   return db;
+}
+
+/**
+ * 進行中の評価サイクルへ、いまの招待アリ閾値を**焼き付ける**。
+ *
+ * 招待アリは「3人以上で1アリ・最大1」の段階式へ変わった。旧サイクルは閾値を
+ * 持たないので、読むたびに現在設定を参照することになる。それだと後で設定を変えたときに
+ * **進行中の人の基準が後から動いてしまう**（policy snapshot を持つ意味が消える）。
+ * ここで一度だけ現在値を焼き、以後はその値で評価する。
+ *
+ * 旧モデル（1人=0.5・上限1）は再現しない。廃止された仕様なので、進行中の人も
+ * 新ルールへ移す（この移行の影響は deploy 前に dry-run で一覧化する）。
+ */
+function backfillInviteThresholdSnapshot(db: Database.Database): void {
+  const threshold = settingNumber(db, "invite_marks_threshold", 3);
+  db.prepare(
+    `UPDATE souls
+        SET eval_invite_threshold = ?,
+            eval_invite_baseline = COALESCE(eval_invite_baseline, 0)
+      WHERE eval_invite_threshold IS NULL
+        AND status = 'ghost'
+        AND eval_deadline_at IS NOT NULL`,
+  ).run(threshold);
 }
 
 /**

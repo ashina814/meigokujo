@@ -54,13 +54,14 @@ export interface ReturnContext {
 
 export interface ReinstateResult {
   to: ReturnTarget;
+  /** 退出前の有効な印を無効化した件数（履歴行は残す）。どの戻し先でも整理する */
+  revokedMarks?: number;
   /** 亡霊復帰のときだけ入る新しい評価サイクル */
   cycle?: {
     deadline: number;
     promotionRequired: number;
     inviteBaseline: number;
     inviteThreshold: number;
-    revokedMarks: number;
     policyVersion: string;
   };
 }
@@ -107,16 +108,20 @@ export class Returns {
    * 既に `waiting` なら何もしない（冪等）。
    */
   markReturnedToWaiting(userId: string, joinedAt: number | null, actor = "system:member-add"): SoulStatus | null {
-    const soul = this.db.prepare("SELECT status, joined_at, left_at FROM souls WHERE user_id = ?").get(userId) as
-      | { status: SoulStatus; joined_at: number | null; left_at: number | null }
+    const soul = this.db.prepare("SELECT status, joined_at, left_at, returned_at FROM souls WHERE user_id = ?").get(userId) as
+      | { status: SoulStatus; joined_at: number | null; left_at: number | null; returned_at: number | null }
       | undefined;
     if (!soul) return null;
     // **本当に出直したという証拠を要求する。**
     // `GuildMemberAdd` は再接続などで在籍中の人に再送されることがある。行があるだけで
-    // 案内待ちへ落とすと、その拍子に魔族が入城前へ戻る。退出の記録があるか、
-    // Discord側の参加時刻が台帳の参加時刻より後になっていることを確かめる
+    // 案内待ちへ落とすと、その拍子に魔族が入城前へ戻る。
+    //
+    // 退出の記録は「まだ処理していない退出」でなければ証拠にならない。`left_at` は
+    // 復帰後も残るので、**前回の復帰より後の退出か**（`returned_at` が無いなら未処理）で見る。
+    // 加えて Discord 側の参加時刻が台帳より後になっていることも証拠として認める
+    const unhandledDeparture = soul.left_at !== null && (soul.returned_at === null || soul.left_at > soul.returned_at);
     const rejoined = joinedAt !== null && soul.joined_at !== null && joinedAt > soul.joined_at + 60;
-    if (soul.left_at === null && !rejoined) {
+    if (!unhandledDeparture && !rejoined) {
       this.events.log("entry_rejoin_ignored", {
         actor,
         target: userId,
@@ -156,6 +161,28 @@ export class Returns {
     if (changed !== 1) return null;
     this.events.log("entry_returned_to_waiting", { actor, target: userId, payload: { previousStatus: soul.status } });
     return soul.status;
+  }
+
+  /**
+   * 出戻り対応のために案内待ちの魂を作る。
+   *
+   * Bot停止中の参加などで台帳の行が無い人が対象。`recordJoin()` は使わない。
+   * あれは**通常の参加イベント**で、`join` の事件録と「いま参加した」という
+   * `joined_at` を作ってしまう。歴史の回収で偽の参加を作らないよう、
+   * Discord が持っている実際の参加時刻を使い、専用の事件録だけを残す。
+   */
+  createWaitingSoulForReturn(userId: string, joinedAt: number | null, actor: string, evidence: Record<string, unknown> = {}): boolean {
+    const ts = now();
+    const changed = this.db
+      .prepare("INSERT INTO souls (user_id, status, joined_at, updated_at) VALUES (?, 'waiting', ?, ?) ON CONFLICT(user_id) DO NOTHING")
+      .run(userId, joinedAt ?? ts, ts).changes;
+    if (changed !== 1) return false;
+    this.events.log("entry_soul_created_for_return", {
+      actor,
+      target: userId,
+      payload: { joinedAt: joinedAt ?? ts, joinedAtSource: joinedAt === null ? "unknown_fallback_now" : "discord", ...evidence },
+    });
+    return true;
   }
 
   /** 判断材料をまとめて読む（読み取りのみ） */
@@ -200,17 +227,32 @@ export class Returns {
    */
   reinstate(userId: string, to: ReturnTarget, actor: string, evidence: Record<string, unknown>): ReinstateResult | null {
     if (to === "waiting") {
-      // 「今回は戻さない」。DBは触らず判断だけ残す
-      this.events.log("entry_return_declined", { actor, target: userId, payload: evidence });
-      return { to };
+      // 「今回は戻さない」。階級は動かさないが、**退出前の印はここで整理する**。
+      // 残したままだと後で通常入城したときに古い進捗が生き返る
+      const revokedMarks = this.db.prepare("UPDATE marks SET revoked_at = ? WHERE target_id = ? AND revoked_at IS NULL").run(now(), userId).changes;
+      if (revokedMarks > 0) {
+        this.events.log("entry_return_marks_reset", {
+          actor,
+          target: userId,
+          payload: { revoked: revokedMarks, to, reason: "復帰させない場合も退出前の評価進捗は持ち越さない" },
+        });
+      }
+      this.events.log("entry_return_declined", { actor, target: userId, payload: { revokedMarks, ...evidence } });
+      return { to, revokedMarks };
     }
 
     const body = (): ReinstateResult | null => {
       if (to !== "ghost") {
+        const ts = now();
         const changed = this.db
           .prepare("UPDATE souls SET status = ?, ever_meirei = CASE WHEN ? = 'meirei' THEN 1 ELSE ever_meirei END, updated_at = ? WHERE user_id = ? AND status = 'waiting'")
-          .run(to, to, now(), userId).changes;
-        return changed === 1 ? { to } : null;
+          .run(to, to, ts, userId).changes;
+        if (changed !== 1) return null;
+        // **どの戻し先でも退出前の印は持ち越さない。** 上位階級には評価サイクルが無いので
+        // すぐには効かないが、後で迷霊落ち→再評価となったときに古い印が生き返る。
+        // 履歴は消さず revoked にする
+        const revokedMarks = this.db.prepare("UPDATE marks SET revoked_at = ? WHERE target_id = ? AND revoked_at IS NULL").run(ts, userId).changes;
+        return { to, revokedMarks };
       }
 
       // ---- 亡霊復帰: 新しい評価サイクルを最初から始める ----
@@ -250,7 +292,8 @@ export class Returns {
       const revokedMarks = this.db.prepare("UPDATE marks SET revoked_at = ? WHERE target_id = ? AND revoked_at IS NULL").run(ts, userId).changes;
       return {
         to,
-        cycle: { deadline, promotionRequired, inviteBaseline, inviteThreshold, revokedMarks, policyVersion },
+        revokedMarks,
+        cycle: { deadline, promotionRequired, inviteBaseline, inviteThreshold, policyVersion },
       };
     };
 
@@ -259,14 +302,18 @@ export class Returns {
       this.events.log("entry_return_skipped", { actor, target: userId, payload: { to, reason: "precondition_lost" } });
       return null;
     }
-    if (result.cycle && result.cycle.revokedMarks > 0) {
+    if ((result.revokedMarks ?? 0) > 0) {
       this.events.log("entry_return_marks_reset", {
         actor,
         target: userId,
-        payload: { revoked: result.cycle.revokedMarks, reason: "出戻り亡霊は評価を最初からやり直すため以前の印を取り消し" },
+        payload: { revoked: result.revokedMarks, to, reason: "出戻りでは退出前の評価進捗を持ち越さないため以前の印を取り消し" },
       });
     }
-    this.events.log("entry_return_reinstated", { actor, target: userId, payload: { to, cycle: result.cycle ?? null, ...evidence } });
+    this.events.log("entry_return_reinstated", {
+      actor,
+      target: userId,
+      payload: { to, cycle: result.cycle ?? null, revokedMarks: result.revokedMarks ?? 0, ...evidence },
+    });
     return result;
   }
 }
