@@ -145,7 +145,11 @@ export type ShopErrorCode =
   | "ERR_ROLE_REQUIRED"
   | "ERR_NO_PRICE"
   | "ERR_ALREADY_ACTIVE"
-  | "ERR_PURCHASE_NOT_FOUND";
+  | "ERR_PURCHASE_NOT_FOUND"
+  | "ERR_NOT_OWNER"
+  | "ERR_NOT_ACTIVE"
+  | "ERR_NOT_EXTENDABLE"
+  | "ERR_TERMS_CHANGED";
 
 export class ShopError extends Error {
   constructor(readonly code: ShopErrorCode, readonly details: Record<string, unknown> = {}) {
@@ -157,18 +161,27 @@ export class ShopError extends Error {
 const now = () => Math.floor(Date.now() / 1000);
 const DAY = 86_400;
 
-/** 「翌月1日 00:00 JST」の unix秒（暦月期限の名残。30日制への移行で不要になる） */
-export function nextFirstOfMonthJst(fromUnixSec: number = now()): number {
-  const d = new Date((fromUnixSec + 9 * 3600) * 1000); // JSTに寄せる
-  const y = d.getUTCFullYear();
-  const m = d.getUTCMonth(); // 0..11
-  const next = Date.UTC(y, m + 1, 1, 0, 0, 0);
-  return Math.floor(next / 1000) - 9 * 3600;
+/** 期限商品の既定の期間。旧「月額」もここへ寄せる（暦月ではなく購入から30日） */
+export const DEFAULT_TERM_DAYS = 30;
+
+/**
+ * その商品の有効期間（日）。期限を持たない単発商品は null。
+ *
+ * 暦月（当月末まで・毎月1日一括）は廃止した。月末に買った人が数日で切れて
+ * すぐ再課金される、という不公平がそのまま料金になっていたため。
+ */
+export function termDays(item: Pick<ShopItemRow, "kind" | "duration_days">): number | null {
+  if (item.duration_days && item.duration_days > 0) return item.duration_days;
+  // 旧データの保険。移行で duration_days=30 を埋めるが、取りこぼしても月額扱いを続けない
+  return item.kind === "monthly" ? DEFAULT_TERM_DAYS : null;
 }
 
-/** 「当月末 23:59:59 JST」の unix秒 */
-export function endOfMonthJst(fromUnixSec: number = now()): number {
-  return nextFirstOfMonthJst(fromUnixSec) - 1;
+/**
+ * 延長後の期限。**残り期間を損しない。**
+ * 期限前に延長しても切り捨てず、切れた後なら今から数え直す。
+ */
+export function extendedExpiry(currentExpiresAt: number | null, days: number, from: number = now()): number {
+  return Math.max(currentExpiresAt ?? 0, from) + days * DAY;
 }
 
 export interface ShopOptions {
@@ -342,8 +355,8 @@ export class Shop {
       throw new ShopError("ERR_ROLE_REQUIRED", { roleId: item.require_role_id });
     }
     if (item.stock !== null && item.stock <= 0) throw new ShopError("ERR_NO_STOCK", { itemId: item.id });
-    // 月額の重複防止
-    if (item.kind === "monthly") {
+    // 期限商品を二重に契約させない（UI側はこの場合「延長」を出す）
+    if (termDays(item) !== null) {
       const existing = this.db
         .prepare("SELECT id FROM shop_purchases WHERE item_id = ? AND user_id = ? AND status = 'active'")
         .get(item.id, input.userId) as { id: number } | undefined;
@@ -377,13 +390,9 @@ export class Shop {
       paidLand = item.price_land;
     }
 
-    // 期限計算
-    let expiresAt: number | null = null;
-    if (item.kind === "monthly") {
-      expiresAt = endOfMonthJst(ts);
-    } else if (item.duration_days) {
-      expiresAt = ts + item.duration_days * DAY;
-    }
+    // 期限計算: 買った時点から数える（暦月ではない）
+    const days = termDays(item);
+    const expiresAt = days === null ? null : ts + days * DAY;
 
     const info = this.db
       .prepare(
@@ -405,6 +414,102 @@ export class Shop {
 
   getPurchase(id: number): PurchaseRow | undefined {
     return this.db.prepare("SELECT * FROM shop_purchases WHERE id = ?").get(id) as PurchaseRow | undefined;
+  }
+
+  /**
+   * 汎用の30日延長を受け付けてよい商品か。
+   *
+   * **Botが利用権そのものを管理している商品だけ**（自動でロールを付け、失効で剥がす）。
+   * 手動配送の期限商品は、Landを取っても実際の権利が伸びる保証がない
+   * （旧「オリジナルロール継続」は、どのDiscordロールが契約の実体かDBが知らない）。
+   * そこへ汎用の延長ボタンを出すと、**払わせただけで何も起きない**を作ってしまう。
+   */
+  isExtendable(item: Pick<ShopItemRow, "kind" | "duration_days" | "delivery" | "delivery_kind" | "enabled">): boolean {
+    if (termDays(item as ShopItemRow) === null) return false;
+    if (!item.enabled) return false;
+    return item.delivery === "auto" && item.delivery_kind === "add_role";
+  }
+
+  /**
+   * 期限を30日延ばす。**自動更新ではない**（本人が押したときだけ動く）。
+   *
+   * 課金・期限更新・記録を1トランザクションで確定させる。分けると
+   * 「Landだけ減って期限が伸びない」が作れてしまう。
+   *
+   * `expected` は確認画面に出した条件。確定までの間に価格・期間・期限が動いていたら
+   * **無課金で拒否**する（勝手に新しい条件で課金しない）。ただし同じ確認画面の二度押しは
+   * 条件検査より先に replay として返すので、正常な連打が「条件が変わった」にはならない。
+   */
+  extend(input: {
+    purchaseId: number;
+    userId: string;
+    actor: string;
+    /** 同じ確認画面からの実行は同じ値になること（二度押しの冪等はこれで決まる） */
+    operationId: string;
+    memberRoleIds: readonly string[];
+    expected: { priceLand: number; days: number; expiresAt: number | null };
+  }): { purchase: PurchaseRow; item: ShopItemRow; extended: boolean; addedDays: number } {
+    const idempotencyKey = `shop:extend:${input.purchaseId}:${input.operationId}`;
+    const run = this.db.transaction(() => {
+      const purchase = this.getPurchase(input.purchaseId);
+      if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+      if (purchase.user_id !== input.userId) throw new ShopError("ERR_NOT_OWNER", { purchaseId: input.purchaseId });
+      const item = this.getItem(purchase.item_id);
+      if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: purchase.item_id });
+
+      // **同じ確認画面の二度押しが先。** 1回目で期限が動いているので、
+      // 条件検査を先にすると正常な連打が「内容が変わった」になってしまう
+      const alreadyPaid = this.db
+        .prepare("SELECT id FROM transactions WHERE idempotency_key = ?")
+        .get(idempotencyKey) as { id: number } | undefined;
+      if (alreadyPaid) return { purchase, item, extended: false, addedDays: 0 };
+
+      if (purchase.status !== "active") throw new ShopError("ERR_NOT_ACTIVE", { status: purchase.status });
+      if (!item.enabled) throw new ShopError("ERR_ITEM_DISABLED", { itemId: item.id });
+      if (!this.isExtendable(item)) throw new ShopError("ERR_NOT_EXTENDABLE", { itemId: item.id });
+      if (item.price_land === null) throw new ShopError("ERR_NO_PRICE", { itemId: item.id });
+      // 階級要件は**課金の直前**にもう一度見る（購入後に落ちた人へ売り続けない）
+      if (item.require_role_id && !this.roleSatisfied(input.memberRoleIds, item.require_role_id)) {
+        throw new ShopError("ERR_ROLE_REQUIRED", { roleId: item.require_role_id });
+      }
+
+      const days = termDays(item)!;
+      // 確認画面に出した条件と一致しているか。1つでも動いていたら課金しない
+      if (
+        input.expected.priceLand !== item.price_land ||
+        input.expected.days !== days ||
+        input.expected.expiresAt !== purchase.expires_at
+      ) {
+        throw new ShopError("ERR_TERMS_CHANGED", {
+          expected: input.expected,
+          actual: { priceLand: item.price_land, days, expiresAt: purchase.expires_at },
+        });
+      }
+
+      const account = `user:${input.userId}`;
+      this.ledger.ensureAccount(account, "user");
+      this.ledger.transfer({
+        from: account,
+        to: TREASURY,
+        amount: item.price_land,
+        type: "tip_burn",
+        actor: input.actor,
+        reason: `公式ショップ延長: ${item.name}`,
+        refType: "shop_extend",
+        refId: String(purchase.id),
+        idempotencyKey,
+      });
+
+      const nextExpires = extendedExpiry(purchase.expires_at, days);
+      this.db.prepare("UPDATE shop_purchases SET expires_at = ? WHERE id = ?").run(nextExpires, purchase.id);
+      this.events.log("shop_extended", {
+        actor: input.actor,
+        target: input.userId,
+        payload: { purchaseId: purchase.id, itemId: item.id, days, from: purchase.expires_at, to: nextExpires },
+      });
+      return { purchase: this.getPurchase(purchase.id)!, item, extended: true, addedDays: days };
+    });
+    return this.db.inTransaction ? run() : run.immediate();
   }
 
   listUserPurchases(userId: string, opts: { activeOnly?: boolean } = {}): PurchaseRow[] {
@@ -597,6 +702,24 @@ export class Shop {
    * 1件ずつトランザクションで確定させる。status の更新と剥奪キューへの登録は
    * 必ず一緒に成立させ、途中で失敗した1件が他の件を巻き添えにしないため。
    */
+  /**
+   * まもなく期限が切れる契約（既定は3日以内）。
+   *
+   * 自動更新をやめた以上、**黙って権利が消える**のが一番の不利益になる。
+   * 「残りが少ない」ことだけ知らせて、延長するかは本人に委ねる。
+   */
+  expiringSoon(withinDays = 3): PurchaseRow[] {
+    const ts = now();
+    return this.db
+      .prepare(
+        `SELECT * FROM shop_purchases
+          WHERE status = 'active' AND expires_at IS NOT NULL
+            AND expires_at > ? AND expires_at <= ?
+          ORDER BY expires_at`,
+      )
+      .all(ts, ts + withinDays * DAY) as PurchaseRow[];
+  }
+
   expireOverdue(actor: string, limit = 200): { expired: PurchaseRow[]; failed: Array<{ purchaseId: number; error: string }> } {
     const ts = now();
     const due = this.db

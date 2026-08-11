@@ -40,11 +40,27 @@ function setup() {
     { name: "名前変更", description: "運営が対応します。", price_land: 50_000, kind: "one_shot", delivery: "manual" },
     "staff",
   );
+  const pass = shop.createItem(
+    {
+      name: "裏チャット入場券",
+      price_land: 80_000,
+      kind: "monthly",
+      delivery: "auto",
+      delivery_kind: "add_role",
+      delivery_data: JSON.stringify({ role_id: "r-ura" }),
+    },
+    "staff",
+  );
+  // 旧「オリジナルロール継続」相当（手動配送の期限商品）
+  const legacy = shop.createItem(
+    { name: "オリジナルロール継続or付与", price_land: 250_000, kind: "monthly", delivery: "manual" },
+    "staff",
+  );
   settings.set("shop:reeval_item_id", reeval.id, "staff");
   settings.set("role:admin", ADMIN_ROLE, "staff");
   settings.set("channel:kessai", "ch-kessai", "staff");
   const services = { db, ledger, settings, events, shop, tickets } as unknown as Services;
-  return { db, ledger, settings, events, shop, tickets, reeval, nickname, services };
+  return { db, ledger, settings, events, shop, tickets, reeval, nickname, pass, legacy, services };
 }
 
 type Ctx = ReturnType<typeof setup>;
@@ -211,9 +227,205 @@ describe("自動更新を廃止した後の利用者表示", () => {
     const description = payload.embeds[0]!.data.description;
     expect(description).not.toContain("自動更新");
     expect(description).not.toContain("更新停止");
-    expect(description).toContain("自動では再課金しません");
+    expect(description).toContain("自動での再課金はありません");
     // 解約の選択メニューそのものを出さない
     expect(payload.components ?? []).toEqual([]);
+    ctx.db.close();
+  });
+});
+
+describe("期限商品の延長（利用者の手数を増やさない）", () => {
+  it("契約中 → 残り日数と延長ボタン → 確認 → 確定 で終わる", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 1_000_000);
+    const purchase = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+
+    // 1) 契約中を見る
+    const list = vi.fn(async () => undefined);
+    await handleShopButton({ customId: "shop:contracts", user: { id: USER }, reply: list } as never, ctx.services);
+    const listed = (list.mock.calls[0] as never[])[0] as {
+      embeds: { data: { description: string } }[];
+      components: { toJSON(): { components: { custom_id: string; label: string }[] } }[];
+    };
+    expect(listed.embeds[0]!.data.description).toContain("残り **30日**");
+    const extendButton = listed.components.flatMap((row) => row.toJSON().components)[0]!;
+    expect(extendButton.custom_id).toBe(`shop:extend:${purchase.id}`);
+    expect(extendButton.label).toContain("30日延長");
+
+    // 2) 延長を押す → 料金と延長後の期限が出る
+    const confirm = vi.fn(async () => undefined);
+    await handleShopButton(
+      { customId: extendButton.custom_id, user: { id: USER }, reply: confirm } as never,
+      ctx.services,
+    );
+    const confirmPayload = (confirm.mock.calls[0] as never[])[0] as {
+      content: string;
+      components: { toJSON(): { components: { custom_id: string }[] } }[];
+    };
+    expect(confirmPayload.content).toContain("80,000");
+    expect(confirmPayload.content).toContain("→");
+    const doButton = confirmPayload.components.flatMap((row) => row.toJSON().components)[0]!;
+
+    // 3) 確定
+    const done = vi.fn(async () => undefined);
+    await handleShopButton(
+      { customId: doButton.custom_id, user: { id: USER }, id: "op-extend-1", update: done } as never,
+      ctx.services,
+    );
+
+    expect(String((done.mock.calls[0] as never[])[0].content)).toContain("30日延長しました");
+    expect(ctx.shop.getPurchase(purchase.id)!.expires_at).toBe(purchase.expires_at! + 30 * 86_400);
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(1_000_000 - 80_000 * 2);
+    ctx.db.close();
+  });
+
+  it("契約中の商品を選ぶと「買う」ではなく「延長」が出る", async () => {
+    const { handleShopSelect } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 1_000_000);
+    const purchase = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const reply = vi.fn(async () => undefined);
+
+    await handleShopSelect(
+      {
+        customId: "shop:pick",
+        values: [String(ctx.pass.id)],
+        user: { id: USER },
+        member: { roles: { cache: new Collection() } },
+        reply,
+      } as never,
+      ctx.services,
+    );
+
+    const payload = (reply.mock.calls[0] as never[])[0] as {
+      components: { toJSON(): { components: { custom_id: string }[] } }[];
+    };
+    const ids = payload.components.flatMap((row) => row.toJSON().components).map((c) => c.custom_id);
+    expect(ids).toEqual([`shop:extend:${purchase.id}`]);
+    ctx.db.close();
+  });
+
+  it("延長の確定を二度押しても二重課金・二重延長しない", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 1_000_000);
+    const purchase = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    // 同じ確認画面から出た確定ボタン（＝同じ確認ID）を2回押す。
+    // interaction.id は毎回違うので、冪等が確認IDで決まっていないと二重課金になる
+    const confirmId = `shop:extend-do:${purchase.id}:conf-1:80000:30:${purchase.expires_at}`;
+    const press = async () => {
+      const update = vi.fn(async () => undefined);
+      await handleShopButton(
+        { customId: confirmId, user: { id: USER }, id: `press-${Math.random()}`, guild: null, update } as never,
+        ctx.services,
+      );
+      return String((update.mock.calls[0] as never[])[0].content);
+    };
+
+    await press();
+    const balance = ctx.ledger.balanceOf(`user:${USER}`);
+    const expires = ctx.shop.getPurchase(purchase.id)!.expires_at;
+    const second = await press();
+
+    expect(second).toContain("受付済み");
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(balance);
+    expect(ctx.shop.getPurchase(purchase.id)!.expires_at).toBe(expires);
+    ctx.db.close();
+  });
+});
+
+describe("Botが権利を管理していない契約（旧オリジナルロール継続）", () => {
+  it("契約中には期限だけ出し、延長ボタンを出さない", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 1_000_000);
+    ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
+    const reply = vi.fn(async () => undefined);
+
+    await handleShopButton({ customId: "shop:contracts", user: { id: USER }, reply } as never, ctx.services);
+
+    const payload = (reply.mock.calls[0] as never[])[0] as {
+      embeds: { data: { description: string } }[];
+      components: unknown[];
+    };
+    const description = payload.embeds[0]!.data.description;
+    expect(description).toContain("残り **30日**");
+    // 押す場所が無いのに「延長してください」と催促しない
+    expect(description).toContain("この契約の延長は現在、運営対応です");
+    expect(payload.components).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("延長できる契約と混在しても、行ごとに正しく案内する", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 1_000_000);
+    ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
+    const extendable = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const reply = vi.fn(async () => undefined);
+
+    await handleShopButton({ customId: "shop:contracts", user: { id: USER }, reply } as never, ctx.services);
+
+    const payload = (reply.mock.calls[0] as never[])[0] as {
+      embeds: { data: { description: string } }[];
+      components: { toJSON(): { components: { custom_id: string }[] } }[];
+    };
+    const lines = payload.embeds[0]!.data.description.split("\n");
+    const legacyLine = lines.findIndex((l) => l.includes("オリジナルロール継続"));
+    // 運営対応の注記は、旧#2の行の直後にだけ付く
+    expect(lines[legacyLine + 1]).toContain("運営対応です");
+    expect(lines.filter((l) => l.includes("運営対応です"))).toHaveLength(1);
+    // 延長ボタンは延長できる契約の分だけ
+    const ids = payload.components.flatMap((row) => row.toJSON().components).map((c) => c.custom_id);
+    expect(ids).toEqual([`shop:extend:${extendable.id}`]);
+    // 共通の案内文が延長不能契約と矛盾しない
+    expect(payload.embeds[0]!.data.description).toContain("商館から延長できる契約は、下のボタンから延長できます");
+    ctx.db.close();
+  });
+
+  it("商品を選んでも延長ボタンが出ず、運営対応と案内する", async () => {
+    const { handleShopSelect } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 1_000_000);
+    ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
+    const reply = vi.fn(async () => undefined);
+
+    await handleShopSelect(
+      {
+        customId: "shop:pick",
+        values: [String(ctx.legacy.id)],
+        user: { id: USER },
+        member: { roles: { cache: new Collection() } },
+        reply,
+      } as never,
+      ctx.services,
+    );
+
+    const payload = (reply.mock.calls[0] as never[])[0] as {
+      embeds: { data: { footer?: { text: string } } }[];
+      components: unknown[];
+    };
+    expect(payload.components).toEqual([]);
+    expect(payload.embeds[0]!.data.footer?.text).toContain("運営が対応");
+    ctx.db.close();
+  });
+
+  it("延長ボタンを直接叩いても無課金で拒否する", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 1_000_000);
+    const purchase = ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const balance = ctx.ledger.balanceOf(`user:${USER}`);
+    const reply = vi.fn(async () => undefined);
+
+    await handleShopButton(
+      { customId: `shop:extend:${purchase.id}`, user: { id: USER }, reply } as never,
+      ctx.services,
+    );
+
+    expect(lastReply(reply)).toContain("ここからは延長できません");
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(balance);
     ctx.db.close();
   });
 });
