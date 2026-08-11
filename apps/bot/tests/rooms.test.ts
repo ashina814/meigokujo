@@ -135,7 +135,11 @@ describe("部屋Bot UI", () => {
 
     await handleRoomButton(interaction as any, services as any);
 
-    expect(addSlot).toHaveBeenCalledWith(1, "payer", { priceOverride: 7000 });
+    expect(addSlot).toHaveBeenCalledWith(1, "payer", {
+      waiveFee: false,
+      expectedPrice: 7000,
+      expectedCapacity: 2,
+    });
     expect(setUserLimit).toHaveBeenCalledWith(3);
     expect(update).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("支払いとDB更新") }));
     expect(JSON.stringify(update.mock.calls[0]?.[0])).not.toContain("課金していません");
@@ -189,7 +193,11 @@ describe("部屋Bot UI", () => {
 
     await handleRoomButton(interaction as any, services as any);
 
-    expect(addSlot).toHaveBeenCalledWith(1, "payer", { priceOverride: 0 });
+    expect(addSlot).toHaveBeenCalledWith(1, "payer", {
+      waiveFee: true,
+      expectedPrice: 7000,
+      expectedCapacity: 2,
+    });
     expect(JSON.stringify(update.mock.calls.at(-1)?.[0])).toContain("無料");
   });
 
@@ -223,7 +231,96 @@ describe("部屋Bot UI", () => {
 
     await handleRoomButton(interaction as any, services as any);
 
-    expect(addSlot).toHaveBeenCalledWith(1, "payer", { priceOverride: 7000 });
+    expect(addSlot).toHaveBeenCalledWith(1, "payer", {
+      waiveFee: false,
+      expectedPrice: 7000,
+      expectedCapacity: 2,
+    });
+  });
+
+  it("通常部屋の枠料金が確認後に変わった場合は課金せず再確認を求める", async () => {
+    const update = vi.fn(async () => undefined);
+    const addSlot = vi.fn();
+    const services = {
+      rooms: {
+        get: vi.fn(() => ({ id: 1, kind: "normal", channel_id: "vc1", owner_id: "owner", status: "open", capacity: 2 })),
+        addSlot,
+      },
+      settings: {
+        getNumber: vi.fn(() => 8_000),
+        getJson: vi.fn((key: string, fallback: string[]) => (key === "roles:room_normal_free" ? ["free-role"] : fallback)),
+      },
+    };
+    const interaction = {
+      customId: "room:slotpay:1:7000:2",
+      isButton: () => true,
+      isStringSelectMenu: () => false,
+      isUserSelectMenu: () => false,
+      user: { id: "payer" },
+      guild: {
+        members: { fetch: vi.fn(async () => ({ id: "payer", roles: { cache: new Map([["free-role", { id: "free-role" }]]) } })) },
+      },
+      channel: {
+        type: ChannelType.GuildVoice,
+        members: { has: vi.fn(() => true) },
+      },
+      update,
+    };
+
+    await handleRoomButton(interaction as any, services as any);
+
+    expect(addSlot).not.toHaveBeenCalled();
+    expect(update).toHaveBeenCalledWith({
+      content: "料金が変更されたためもう一度操作してください。課金していません。",
+      components: [],
+    });
+  });
+
+  it("同じ定員を確認した枠追加は1件成功後の2件目を拒否する", async () => {
+    let capacity = 2;
+    const addSlot = vi.fn((_roomId: number, _payerId: string, opts: { expectedCapacity: number }) => {
+      expect(opts.expectedCapacity).toBe(capacity);
+      capacity += 1;
+      return { id: 1, kind: "normal", channel_id: "vc1", owner_id: "owner", status: "open", capacity };
+    });
+    const services = {
+      rooms: {
+        get: vi.fn(() => ({ id: 1, kind: "normal", channel_id: "vc1", owner_id: "owner", status: "open", capacity })),
+        addSlot,
+      },
+      settings: {
+        getNumber: vi.fn(() => 7_000),
+        getJson: vi.fn((_key: string, fallback: string[]) => fallback),
+      },
+    };
+    const guild = { members: { fetch: vi.fn(async () => ({ id: "payer", roles: { cache: new Map() } })) } };
+    const channel = {
+      type: ChannelType.GuildVoice,
+      members: { has: vi.fn(() => true) },
+      setUserLimit: vi.fn(async () => undefined),
+    };
+    const firstUpdate = vi.fn(async () => undefined);
+    const secondUpdate = vi.fn(async () => undefined);
+    const interaction = (update: typeof firstUpdate) => ({
+      customId: "room:slotpay:1:7000:2",
+      isButton: () => true,
+      isStringSelectMenu: () => false,
+      isUserSelectMenu: () => false,
+      user: { id: "payer" },
+      guild,
+      channel,
+      update,
+    });
+
+    await handleRoomButton(interaction(firstUpdate) as any, services as any);
+    await handleRoomButton(interaction(secondUpdate) as any, services as any);
+
+    expect(addSlot).toHaveBeenCalledTimes(1);
+    expect(capacity).toBe(3);
+    expect(secondUpdate).toHaveBeenCalledWith({
+      content: "定員が確認時から変わっています。課金していません。もう一度操作してください。",
+      components: [],
+    });
   });
 
   it("VoiceStateUpdateで部屋への人間入室を即時利用済みにする", () => {

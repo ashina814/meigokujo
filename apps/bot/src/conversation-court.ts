@@ -59,7 +59,7 @@ export async function conversationCourtRestrictionState(
   const categoryId = services.settings.getString(CONVERSATION_COURT_CATEGORY_SETTING_KEY);
   if (!categoryId) return { active: false, reason: "category_unset" };
 
-  const channel = await guild.channels.fetch(categoryId).catch(() => null);
+  const channel = guild.channels.cache.get(categoryId) ?? (await guild.channels.fetch(categoryId).catch(() => null));
   if (!channel) {
     logInvalidCategory(services, guild.id, categoryId, "category_missing");
     return { active: false, reason: "category_missing", categoryId };
@@ -99,7 +99,6 @@ export async function enforceConversationCourtRestrictionForGuild(
   const state = await conversationCourtRestrictionState(guild, services, date);
   if (!state.active) return { active: false, disconnected: 0, reason: state.reason };
 
-  await guild.channels.fetch().catch(() => null);
   let disconnected = 0;
   for (const channel of guild.channels.cache.values()) {
     if (!isRestrictedVoiceChannel(channel, state.categoryId)) continue;
@@ -145,7 +144,10 @@ export async function handleConversationCourtVoiceUpdate(
   const state = await conversationCourtRestrictionState(newState.guild, services, date);
   if (!state.active) return false;
 
-  const channel = newState.channel ?? ((await newState.guild.channels.fetch(newState.channelId).catch(() => null)) as GuildBasedChannel | null);
+  const channel =
+    newState.channel ??
+    newState.guild.channels.cache.get(newState.channelId) ??
+    ((await newState.guild.channels.fetch(newState.channelId).catch(() => null)) as GuildBasedChannel | null);
   if (!isRestrictedVoiceChannel(channel, state.categoryId)) return false;
 
   return disconnectIfRestricted(newState.member, services, "voice_state_update");

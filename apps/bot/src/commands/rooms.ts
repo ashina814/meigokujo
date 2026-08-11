@@ -590,23 +590,33 @@ async function showAddSlotConfirm(interaction: ButtonInteraction, services: Serv
 }
 
 async function executeAddSlot(interaction: ButtonInteraction, services: Services): Promise<void> {
-  const parts = interaction.customId.split(":");
-  const roomIdStr = parts[2];
-  const capacityStr = parts[4];
+  const [, , roomIdStr, priceStr, capacityStr] = interaction.customId.split(":");
   const roomId = Number(roomIdStr);
-  const room = services.rooms.get(roomId);
   const ch = interaction.channel;
   if (!ch || ch.type !== ChannelType.GuildVoice || !(ch as VoiceChannel).members.has(interaction.user.id)) {
     await interaction.update({ content: "このVCに入ってから枠を追加してください。課金していません。", components: [] });
     return;
   }
-  const quote = normalSlotPriceQuote(await currentGuildMember(interaction), services);
-  if (room.capacity !== Number(capacityStr)) {
+
+  const member = await currentGuildMember(interaction);
+  const room = services.rooms.get(roomId);
+  const quote = normalSlotPriceQuote(member, services);
+  const expectedPrice = Number(priceStr);
+  const expectedCapacity = Number(capacityStr);
+  if (quote.normalPrice !== expectedPrice) {
+    await interaction.update({ content: "料金が変更されたためもう一度操作してください。課金していません。", components: [] });
+    return;
+  }
+  if (room.capacity !== expectedCapacity) {
     await interaction.update({ content: "定員が確認時から変わっています。課金していません。もう一度操作してください。", components: [] });
     return;
   }
   try {
-    const updated = services.rooms.addSlot(roomId, interaction.user.id, { priceOverride: quote.effectivePrice });
+    const updated = services.rooms.addSlot(roomId, interaction.user.id, {
+      waiveFee: quote.freeByRole,
+      expectedPrice,
+      expectedCapacity,
+    });
     try {
       await (ch as VoiceChannel).setUserLimit(updated.capacity);
     } catch (error) {
@@ -631,9 +641,13 @@ async function executeAddSlot(interaction: ButtonInteraction, services: Services
     const msg =
       error instanceof LedgerError && error.code === "ERR_INSUFFICIENT"
         ? "残高が足りません。課金していません。"
-        : error instanceof RoomError && error.code === "ERR_CAPACITY_LIMIT"
-          ? "最大定員に達しています。課金していません。"
-          : "枠の追加に失敗しました。課金していません。";
+        : error instanceof RoomError && error.code === "ERR_PRICE_CHANGED"
+          ? "料金が変更されたためもう一度操作してください。課金していません。"
+          : error instanceof RoomError && error.code === "ERR_CAPACITY_CHANGED"
+            ? "定員が確認時から変わっています。課金していません。もう一度操作してください。"
+            : error instanceof RoomError && error.code === "ERR_CAPACITY_LIMIT"
+              ? "最大定員に達しています。課金していません。"
+              : "枠の追加に失敗しました。課金していません。";
     await interaction.update({ content: msg, components: [] });
   }
 }

@@ -90,6 +90,21 @@ describe("conversation court core-time VC restriction", () => {
     expect(result).toMatchObject({ active: true, disconnected: 1 });
     expect(normal.voice.disconnect).toHaveBeenCalledTimes(1);
     expect(admin.voice.disconnect).not.toHaveBeenCalled();
+    expect(guild.channels.fetch).not.toHaveBeenCalled();
+  });
+
+  it("uses the category cache first and fetches only the configured category when missing", async () => {
+    const svc = services("cat") as any;
+    const category = { id: "cat", guildId: "guild", type: ChannelType.GuildCategory };
+    const fetch = vi.fn(async (id?: string) => (id === "cat" ? category : null));
+    const guild = { id: "guild", channels: { cache: new Collection(), fetch } } as any;
+
+    expect(await conversationCourtRestrictionState(guild, svc, new Date("2026-08-11T12:30:00Z"))).toEqual({
+      active: true,
+      categoryId: "cat",
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith("cat");
   });
 
   it("voice update ignores mute/deaf-only events and disconnects only moves into the target category", async () => {
@@ -108,10 +123,11 @@ describe("conversation court core-time VC restriction", () => {
 
     await handleConversationCourtVoiceUpdate(
       { channelId: null } as any,
-      { channelId: "voice", member: moved, guild, channel: targetChannel } as any,
+      { channelId: "voice", member: moved, guild, channel: null } as any,
       svc,
       new Date("2026-08-11T12:30:00Z"),
     );
     expect(moved.voice.disconnect).toHaveBeenCalledTimes(1);
+    expect(guild.channels.fetch).not.toHaveBeenCalled();
   });
 });
