@@ -48,8 +48,18 @@ export interface SoulRow {
   eval_policy_version: string | null;
   eval_promotion_required: number | null;
   eval_demotion_threshold: number | null;
+  /** 旧モデルの名残。新しい評価サイクルでは書かない（列は既存行のために残す） */
   eval_invite_mark_per_person: number | null;
   eval_invite_mark_cap: number | null;
+  /** そのサイクルで数える招待の起点。出戻り亡霊はここに過去分を焼いて持ち越さない */
+  eval_invite_baseline: number | null;
+  /** そのサイクルで適用する招待アリの閾値人数 */
+  eval_invite_threshold: number | null;
+  /** 出戻り関連。退出の記録と、退出時点の階級の退避先 */
+  left_at: number | null;
+  returned_at: number | null;
+  rank_at_leave: SoulRow["status"] | null;
+  ever_meirei: number;
   inviter_user_id: string | null;
   inviter_source: string | null;
   inviter_hint_user_id: string | null;
@@ -383,17 +393,18 @@ export class Entry {
     const deadline = ts + baseDays * DAY;
     const promotionRequired = positiveInt(this.settings.getNumber("promotion_marks_required"), SETTING_DEFAULTS.promotion_marks_required);
     const demotionThreshold = positiveInt(this.settings.getNumber("demotion_marks_threshold"), SETTING_DEFAULTS.demotion_marks_threshold);
-    const inviteMarkPerPerson = nonNegativeNumber(this.settings.getNumber("invite_mark_per_person"), SETTING_DEFAULTS.invite_mark_per_person);
-    const inviteMarkCap = nonNegativeNumber(this.settings.getNumber("invite_mark_cap"), SETTING_DEFAULTS.invite_mark_cap);
+    const inviteThreshold = positiveInt(this.settings.getNumber("invite_marks_threshold"), SETTING_DEFAULTS.invite_marks_threshold);
+    // このサイクルで数える招待の起点。過去に招待実績があっても新しい評価へは持ち越さない
+    const inviteBaseline = (this.db.prepare("SELECT COUNT(*) AS c FROM invites WHERE inviter_id = ?").get(userId) as { c: number }).c;
     const policyVersion =
       this.settings.getString("eval_policy_version") ??
-      `manual:${promotionRequired}:${demotionThreshold}:${inviteMarkPerPerson}:${inviteMarkCap}:${ts}`;
+      `manual:${promotionRequired}:${demotionThreshold}:${inviteThreshold}:${ts}`;
     this.db
       .prepare(
         `INSERT INTO souls (
            user_id, status, joined_at, ghost_at, eval_deadline_at, eval_started_at,
            eval_policy_version, eval_promotion_required, eval_demotion_threshold,
-           eval_invite_mark_per_person, eval_invite_mark_cap, updated_at
+           eval_invite_baseline, eval_invite_threshold, updated_at
          )
          VALUES (?, 'ghost', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET
@@ -403,11 +414,11 @@ export class Entry {
            eval_policy_version = excluded.eval_policy_version,
            eval_promotion_required = excluded.eval_promotion_required,
            eval_demotion_threshold = excluded.eval_demotion_threshold,
-           eval_invite_mark_per_person = excluded.eval_invite_mark_per_person,
-           eval_invite_mark_cap = excluded.eval_invite_mark_cap,
+           eval_invite_baseline = excluded.eval_invite_baseline,
+           eval_invite_threshold = excluded.eval_invite_threshold,
            updated_at = excluded.updated_at`,
       )
-      .run(userId, ts, ts, deadline, ts, policyVersion, promotionRequired, demotionThreshold, inviteMarkPerPerson, inviteMarkCap, ts);
+      .run(userId, ts, ts, deadline, ts, policyVersion, promotionRequired, demotionThreshold, inviteBaseline, inviteThreshold, ts);
 
     // 初期発行（冪等キーで二重発行不可）
     const grant = this.settings.getNumber("initial_grant");
@@ -449,7 +460,7 @@ export class Entry {
       payload: {
         deadline,
         granted: grantResult.duplicate ? 0 : grant,
-        evalPolicy: { version: policyVersion, promotionRequired, demotionThreshold, inviteMarkPerPerson, inviteMarkCap, startedAt: ts },
+        evalPolicy: { version: policyVersion, promotionRequired, demotionThreshold, inviteThreshold, inviteBaseline, startedAt: ts },
       },
     });
     return {

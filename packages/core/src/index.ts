@@ -35,6 +35,14 @@ export { Migration, MigrationError, type MigrationErrorCode, type StagingRow, ty
 export { EventLog, type EventRow } from "./events/service.js";
 export { Entry, type BookingRow, type SoulRow, type GhostifyResult, type BookingStatus, type InviterSource } from "./entry/service.js";
 export {
+  Returns,
+  RETURN_TARGETS,
+  RETURN_TARGET_LABELS,
+  type ReturnTarget,
+  type ReturnContext,
+  type ReinstateResult,
+} from "./entry/returns.js";
+export {
   SessionCalendar,
   SessionCalendarError,
   sessionSchedule,

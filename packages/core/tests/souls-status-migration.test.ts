@@ -82,17 +82,20 @@ describe("souls.status CHECK 移行（眷魔の追加）", () => {
 
     const before = (() => {
       const raw = new Database(path);
-      const row = raw.prepare("SELECT * FROM souls WHERE user_id = ?").get("1463201396567441441");
+      const columns = (raw.prepare("PRAGMA table_info(souls)").all() as Array<{ name: string }>).map((c) => c.name);
+      const quoted = columns.map((c) => `"${c}"`).join(", ");
+      const row = raw.prepare(`SELECT ${quoted} FROM souls WHERE user_id = ?`).get("1463201396567441441");
       const count = (raw.prepare("SELECT COUNT(*) AS n FROM souls").get() as { n: number }).n;
       raw.close();
-      return { row, count };
+      return { row, count, columns, quoted };
     })();
 
     const db = openDb(path);
 
     // 行数・全列の値が一致（評価スナップショットと招待メタデータを落としていない）
     expect((db.prepare("SELECT COUNT(*) AS n FROM souls").get() as { n: number }).n).toBe(before.count);
-    expect(db.prepare("SELECT * FROM souls WHERE user_id = ?").get("1463201396567441441")).toEqual(before.row);
+    // 移行後は openDb が足す新しい列が増えるので、**移行前にあった列だけ**で比べる
+    expect(db.prepare(`SELECT ${before.quoted} FROM souls WHERE user_id = ?`).get("1463201396567441441")).toEqual(before.row);
     // NULL のままの行も保たれる
     expect(db.prepare("SELECT status, updated_at FROM souls WHERE user_id = ?").get("2222222222222222222")).toEqual({
       status: "majin",
@@ -142,24 +145,26 @@ describe("souls.status CHECK 移行（眷魔の追加）", () => {
     }
     const before = (() => {
       const raw = new Database(path);
-      const sql = (raw.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='souls'").get() as { sql: string }).sql;
-      const rows = raw.prepare("SELECT * FROM souls ORDER BY user_id").all();
+      const columns = (raw.prepare("PRAGMA table_info(souls)").all() as Array<{ name: string }>).map((c) => c.name);
+      const quoted = columns.map((c) => `"${c}"`).join(", ");
+      const rows = raw.prepare(`SELECT ${quoted} FROM souls ORDER BY user_id`).all();
       raw.close();
-      return { sql, rows };
+      return { rows, columns, quoted };
     })();
 
     // 列を黙って捨てて起動するより、deploy を失敗させる
     expect(() => openDb(path)).toThrow(/見知らぬ列/);
 
     const after = new Database(path);
-    // 元の表がそのまま残っている（作り直していない・DROP していない）
-    expect((after.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='souls'").get() as { sql: string }).sql).toBe(
-      before.sql,
-    );
+    // 表は作り直されていない＝旧CHECKのまま（kenma を許していない）
+    const ddl = (after.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='souls'").get() as { sql: string }).sql;
+    expect(ddl).not.toContain("'kenma'");
     // 中途半端な新表も残っていない
     expect(after.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='souls__new'").get()).toBeUndefined();
-    // 未知列を含めて全データが無傷
-    expect(after.prepare("SELECT * FROM souls ORDER BY user_id").all()).toEqual(before.rows);
+    // 未知列を含めて、移行前にあった列の全データが無傷
+    const stillThere = (after.prepare("PRAGMA table_info(souls)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(before.columns.filter((c) => !stillThere.includes(c))).toEqual([]);
+    expect(after.prepare(`SELECT ${before.quoted} FROM souls ORDER BY user_id`).all()).toEqual(before.rows);
     expect(
       (after.prepare("SELECT 見知らぬ列 AS v FROM souls WHERE user_id = ?").get("1463201396567441441") as { v: string }).v,
     ).toBe("捨ててはいけない値");

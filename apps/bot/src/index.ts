@@ -73,6 +73,7 @@ import {
 import { refreshWaitersBoard } from "./waiters-board.js";
 import { handleTicketButton } from "./commands/ticket-handler-safe.js";
 import { handleReevalApprove, handleReevalReject } from "./commands/reeval.js";
+import { handleReturnReasonSubmit, handleReturnTargetSelect } from "./commands/entry-return.js";
 import {
   handleConfessionButton,
   handleConfessionModal,
@@ -270,6 +271,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       isCasinoEmployeeInteraction(interaction.customId)
     ) {
       await handleCasinoEmployeeInteraction(interaction, services);
+      return;
+    }
+    // 出戻り申請: 戻し先の選択 → 理由モーダル → 確定
+    if (interaction.isStringSelectMenu() && interaction.customId === "ret:target") {
+      await handleReturnTargetSelect(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("ret:reason:")) {
+      await handleReturnReasonSubmit(interaction, services);
       return;
     }
     if (interaction.isModalSubmit() && interaction.customId === "eval:modal") {
@@ -558,6 +568,15 @@ client.on(Events.GuildMemberAdd, (member) => {
 
 // 退城ログ
 client.on(Events.GuildMemberRemove, (member) => {
+  // 退出の記録。status は変えない（階級は退出で消える性質のものではない）。
+  // 再参加時に案内待ちへ戻すときの参考情報として残す
+  if (!member.user?.bot) {
+    try {
+      services.returns.recordDeparture(member.id);
+    } catch (err) {
+      console.error("[entry] 退出記録に失敗:", err);
+    }
+  }
   void postLeaveLog(client, services, member).catch((err) =>
     console.error("[member-log] 退城ログ失敗:", err),
   );

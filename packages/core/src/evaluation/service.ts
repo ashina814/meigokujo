@@ -21,16 +21,20 @@ export interface EvalTexts {
 
 export interface PromotionScore {
   evalMarks: number;
+  /** その評価サイクルで数える招待数（過去サイクル分は baseline で除外済み） */
   inviteCount: number;
-  inviteScore: number; // 0.5/人・上限1.0（設定値）
+  /** 招待由来のアリ。**段階式で 0 か 1 のどちらか**（閾値人数に達したら1） */
+  inviteScore: number;
   total: number;
 }
 
 export interface EvalThresholds {
   promotionRequired: number;
   demotionThreshold: number;
-  inviteMarkPerPerson: number;
-  inviteMarkCap: number;
+  /** 招待アリが付く人数。これに達したら1アリ、それ以上増えても1のまま */
+  inviteThreshold: number;
+  /** そのサイクルの招待の起点。過去の招待を持ち越さないために引く */
+  inviteBaseline: number;
   policyVersion: string;
   startedAt: number | null;
   snapshotted: boolean;
@@ -101,7 +105,7 @@ export class Evaluation {
     const row = this.db
       .prepare(
         `SELECT eval_started_at, eval_policy_version, eval_promotion_required, eval_demotion_threshold
-              , eval_invite_mark_per_person, eval_invite_mark_cap
+              , eval_invite_baseline, eval_invite_threshold
          FROM souls WHERE user_id = ?`,
       )
       .get(targetId) as
@@ -110,30 +114,27 @@ export class Evaluation {
           eval_policy_version: string | null;
           eval_promotion_required: number | null;
           eval_demotion_threshold: number | null;
-          eval_invite_mark_per_person: number | null;
-          eval_invite_mark_cap: number | null;
+          eval_invite_baseline: number | null;
+          eval_invite_threshold: number | null;
         }
       | undefined;
     const currentPromotion = positiveInt(this.settings.getNumber("promotion_marks_required")) ?? SETTING_DEFAULTS.promotion_marks_required;
     const currentDemotion = positiveInt(this.settings.getNumber("demotion_marks_threshold")) ?? SETTING_DEFAULTS.demotion_marks_threshold;
-    const currentInvitePer = nonNegativeNumber(this.settings.getNumber("invite_mark_per_person")) ?? SETTING_DEFAULTS.invite_mark_per_person;
-    const currentInviteCap = nonNegativeNumber(this.settings.getNumber("invite_mark_cap")) ?? SETTING_DEFAULTS.invite_mark_cap;
+    const currentInviteThreshold = positiveInt(this.settings.getNumber("invite_marks_threshold")) ?? SETTING_DEFAULTS.invite_marks_threshold;
     const promotionRequired = positiveInt(row?.eval_promotion_required) ?? currentPromotion;
     const demotionThreshold = positiveInt(row?.eval_demotion_threshold) ?? currentDemotion;
-    const inviteMarkPerPerson = nonNegativeNumber(row?.eval_invite_mark_per_person) ?? currentInvitePer;
-    const inviteMarkCap = nonNegativeNumber(row?.eval_invite_mark_cap) ?? currentInviteCap;
+    // 招待アリは段階式へ変わった。**旧snapshot（閾値を持たない行）は現在の閾値で評価する**。
+    // 旧モデル（1人=0.5・上限1）を残すと、同時期に評価される人の基準が割れるため
+    const inviteThreshold = positiveInt(row?.eval_invite_threshold) ?? currentInviteThreshold;
+    const inviteBaseline = nonNegativeNumber(row?.eval_invite_baseline) ?? 0;
     return {
       promotionRequired,
       demotionThreshold,
-      inviteMarkPerPerson,
-      inviteMarkCap,
-      policyVersion: row?.eval_policy_version ?? `current:${currentPromotion}:${currentDemotion}:${currentInvitePer}:${currentInviteCap}`,
+      inviteThreshold,
+      inviteBaseline,
+      policyVersion: row?.eval_policy_version ?? `current:${currentPromotion}:${currentDemotion}:${currentInviteThreshold}`,
       startedAt: row?.eval_started_at ?? null,
-      snapshotted:
-        row?.eval_promotion_required != null &&
-        row?.eval_demotion_threshold != null &&
-        row?.eval_invite_mark_per_person != null &&
-        row?.eval_invite_mark_cap != null,
+      snapshotted: row?.eval_promotion_required != null && row?.eval_demotion_threshold != null,
     };
   }
 
@@ -162,13 +163,14 @@ export class Evaluation {
         .prepare("SELECT COALESCE(SUM(weight), 0) AS c FROM marks WHERE target_id = ? AND kind = 'promotion' AND revoked_at IS NULL")
         .get(targetId) as { c: number }
     ).c;
-    const inviteCount = (
+    const totalInvites = (
       this.db.prepare("SELECT COUNT(*) AS c FROM invites WHERE inviter_id = ?").get(targetId) as { c: number }
     ).c;
     const thresholds = this.thresholdsFor(targetId);
-    const per = thresholds.inviteMarkPerPerson;
-    const cap = thresholds.inviteMarkCap;
-    const inviteScore = Math.min(inviteCount * per, cap);
+    // 過去サイクルの招待は持ち越さない。履歴は消さず、起点を引いて今回分だけ数える
+    const inviteCount = Math.max(0, totalInvites - thresholds.inviteBaseline);
+    // 段階式: 閾値に達したら1アリ。それ以上増えても1のまま（人数比例で積み上がらない）
+    const inviteScore = inviteCount >= thresholds.inviteThreshold ? 1 : 0;
     return { evalMarks, inviteCount, inviteScore, total: evalMarks + inviteScore };
   }
 
@@ -315,12 +317,14 @@ export class Evaluation {
       positiveInt(this.settings.getNumber("promotion_marks_required")) ?? SETTING_DEFAULTS.promotion_marks_required;
     const demotionThreshold =
       positiveInt(this.settings.getNumber("demotion_marks_threshold")) ?? SETTING_DEFAULTS.demotion_marks_threshold;
-    const inviteMarkPerPerson =
-      nonNegativeNumber(this.settings.getNumber("invite_mark_per_person")) ?? SETTING_DEFAULTS.invite_mark_per_person;
-    const inviteMarkCap = nonNegativeNumber(this.settings.getNumber("invite_mark_cap")) ?? SETTING_DEFAULTS.invite_mark_cap;
+    const inviteThreshold = positiveInt(this.settings.getNumber("invite_marks_threshold")) ?? SETTING_DEFAULTS.invite_marks_threshold;
+    // **招待実績はここでは持ち越す**（在籍したまま受け直す復帰なので、招待した事実は消えない）。
+    // 過去の招待を切り捨てるのは「一度城を出た」出戻りのルールで、こちらとは別物。
+    // 起点0を明示的に焼いて、後から意味を取り違えないようにする
+    const inviteBaseline = 0;
     const policyVersion =
       this.settings.getString("eval_policy_version") ??
-      `reeval:${promotionRequired}:${demotionThreshold}:${inviteMarkPerPerson}:${inviteMarkCap}:${ts}`;
+      `reeval:${promotionRequired}:${demotionThreshold}:${inviteThreshold}:${ts}`;
     const deadline = ts + baseDays * 86_400;
 
     const body = () => {
@@ -335,12 +339,12 @@ export class Evaluation {
                   eval_policy_version = ?,
                   eval_promotion_required = ?,
                   eval_demotion_threshold = ?,
-                  eval_invite_mark_per_person = ?,
-                  eval_invite_mark_cap = ?,
+                  eval_invite_baseline = ?,
+                  eval_invite_threshold = ?,
                   updated_at = ?
             WHERE user_id = ? AND status = 'meirei'`,
         )
-        .run(ts, ts, deadline, policyVersion, promotionRequired, demotionThreshold, inviteMarkPerPerson, inviteMarkCap, ts, targetId)
+        .run(ts, ts, deadline, policyVersion, promotionRequired, demotionThreshold, inviteBaseline, inviteThreshold, ts, targetId)
         .changes;
       if (changed !== 1) return null;
       // 履歴は消さず、有効な印だけ取り消す（再評価は白紙から）
@@ -372,7 +376,7 @@ export class Evaluation {
         ghostAt: ts,
         evalStartedAt: ts,
         evalDeadlineAt: deadline,
-        policy: { policyVersion, promotionRequired, demotionThreshold, inviteMarkPerPerson, inviteMarkCap, baseDays },
+        policy: { policyVersion, promotionRequired, demotionThreshold, inviteThreshold, inviteBaseline, baseDays },
         revokedMarks: result.revokedMarks,
         ...evidence,
       },

@@ -741,6 +741,16 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "souls", "inviter_hint_source", "TEXT");
   ensureColumn(db, "souls", "inviter_hint_origin", "TEXT");
   ensureColumn(db, "souls", "inviter_hint_at", "INTEGER");
+  // 出戻り（退出→再参加）の記録。再参加でいったん waiting へ戻すため、
+  // 元の階級を失わないよう退避先を持つ
+  ensureColumn(db, "souls", "left_at", "INTEGER");
+  ensureColumn(db, "souls", "returned_at", "INTEGER");
+  ensureColumn(db, "souls", "rank_at_leave", "TEXT");
+  ensureColumn(db, "souls", "ever_meirei", "INTEGER NOT NULL DEFAULT 0");
+  // 評価サイクルごとの招待の起点と、そのサイクルで適用するアリ閾値。
+  // 過去の招待数を新しいサイクルへ持ち越さないために使う
+  ensureColumn(db, "souls", "eval_invite_baseline", "INTEGER");
+  ensureColumn(db, "souls", "eval_invite_threshold", "INTEGER");
   ensureColumn(db, "rooms", "pending_delete", "INTEGER NOT NULL DEFAULT 0 CHECK (pending_delete IN (0,1))");
   ensureColumn(db, "rooms", "delete_attempts", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "rooms", "next_delete_retry_at", "INTEGER");
@@ -781,7 +791,24 @@ export function openDb(path: string): Database.Database {
   backfillEvaluationMarkWeights(db);
   backfillEvaluationPolicySnapshots(db);
   backfillShopDeliveryState(db);
+  backfillEverMeirei(db);
   return db;
+}
+
+/**
+ * 「過去に迷霊だったことがあるか」を既存データから復元する。
+ *
+ * 出戻りの判断画面で「以前は迷霊でした」と出すために使う。いま迷霊の人と、
+ * 降格の事件録が残っている人を立てる。**判断材料であって自動処理の根拠にはしない。**
+ */
+function backfillEverMeirei(db: Database.Database): void {
+  db.prepare(
+    `UPDATE souls
+        SET ever_meirei = 1
+      WHERE ever_meirei = 0
+        AND (status = 'meirei'
+             OR EXISTS (SELECT 1 FROM events WHERE events.target_id = souls.user_id AND events.type = 'demotion'))`,
+  ).run();
 }
 
 /**
@@ -919,6 +946,12 @@ function migrateSoulStatusCheck(db: Database.Database): void {
         inviter_hint_source  TEXT,
         inviter_hint_origin  TEXT,
         inviter_hint_at      INTEGER,
+        left_at             INTEGER,
+        returned_at         INTEGER,
+        rank_at_leave       TEXT,
+        ever_meirei         INTEGER NOT NULL DEFAULT 0,
+        eval_invite_baseline INTEGER,
+        eval_invite_threshold INTEGER,
         updated_at          INTEGER NOT NULL
       )
     `);

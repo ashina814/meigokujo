@@ -174,21 +174,18 @@ describe("印台帳と閾値", () => {
   it("対象者ごとの必要印数は評価開始時点で固定される", () => {
     ctx.settings.set("promotion_marks_required", 6, "staff");
     ctx.settings.set("demotion_marks_threshold", 3, "staff");
-    ctx.settings.set("invite_mark_per_person", 0.5, "staff");
-    ctx.settings.set("invite_mark_cap", 1, "staff");
+    ctx.settings.set("invite_marks_threshold", 3, "staff");
     ctx.entry.book("frozen", "flex", { source: "none" });
     ctx.entry.ghostify("frozen", "staff");
 
     ctx.settings.set("promotion_marks_required", 2, "staff");
     ctx.settings.set("demotion_marks_threshold", 2, "staff");
-    ctx.settings.set("invite_mark_per_person", 2, "staff");
-    ctx.settings.set("invite_mark_cap", 10, "staff");
+    ctx.settings.set("invite_marks_threshold", 9, "staff");
 
     const thresholds = ctx.evaluation.thresholdsFor("frozen");
     expect(thresholds.promotionRequired).toBe(6);
     expect(thresholds.demotionThreshold).toBe(3);
-    expect(thresholds.inviteMarkPerPerson).toBe(0.5);
-    expect(thresholds.inviteMarkCap).toBe(1);
+    expect(thresholds.inviteThreshold).toBe(3);
     expect(thresholds.snapshotted).toBe(true);
 
     for (const guest of ["fg1", "fg2", "fg3"]) {

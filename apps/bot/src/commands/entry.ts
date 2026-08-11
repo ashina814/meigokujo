@@ -197,7 +197,12 @@ export async function handleMemberJoin(
   inviterId?: string | null,
 ): Promise<void> {
   if (member.user.bot) return;
-  services.entry.recordJoin(member.id);
+  const created = services.entry.recordJoin(member.id);
+  // 出戻り: 既に魂の記録がある＝一度抜けて戻ってきた人。
+  // **以前の階級へ自動復帰させない。** いったん案内待ちへ戻し、以前の階級は
+  // rank_at_leave へ退避しておく（運営が出戻り申請の画面で参考にする）
+  const previousStatus = created ? null : services.returns.markReturnedToWaiting(member.id);
+  const isReturnee = !created;
 
   const waitRoleId = services.settings.getString("role:queue_wait");
   if (waitRoleId)
@@ -217,13 +222,18 @@ export async function handleMemberJoin(
   }
 
   const result = await deliverToUser(member.client, services, member.id, {
-    dm: { embeds: [buildWelcomeEmbed(member, services)] },
+    dm: {
+      embeds: [buildWelcomeEmbed(member, services)],
+      content: isReturnee
+        ? "おかえりなさい。いったん**入城案内待ち**からの再開になります。以前の階級で戻したい場合は、**出戻り申請**から運営へお知らせください。"
+        : undefined,
+    },
     fallback: {
       channelKey: "channel:entry_guide",
       content: "案内をDMへ送れなかったため、上部の常設パネルを確認してください。",
     },
   });
-  services.events.log("entry_guide_sent", { target: member.id, payload: { via: result.via } });
+  services.events.log("entry_guide_sent", { target: member.id, payload: { via: result.via, returnee: isReturnee, previousStatus } });
   if (!result.delivered) {
     console.warn(`[entry] 入城案内が届きませんでした（DM拒否＋フォールバック不可）: ${member.id}`);
   }

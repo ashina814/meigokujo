@@ -16,6 +16,11 @@ export const SETTING_DEFAULTS = {
   vc_reward_min_session_min: 10,
   // 評価・カロン（換算値はすべて可変にするのが決定事項）
   eval_base_period_days: 14,
+  // 招待によるアリ: 段階式。**この人数に達したら1アリ、それ以上増えても1のまま**。
+  // 旧仕様（1人=0.5アリ・上限1）の連続加算は廃止した
+  invite_marks_threshold: 3,
+  // 出戻り亡霊の上乗せ。通常より昇格に必要なアリが1個多い
+  returnee_promotion_extra: 1,
   invite_mark_per_person: 0.5,
   invite_mark_cap: 1.0,
   invite_extend_days_male: 1,

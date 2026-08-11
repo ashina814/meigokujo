@@ -16,6 +16,7 @@ import {
 import type { TicketKind, TicketPanel, TicketRow } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
 import { REEVAL_PANEL_ID, linkReevalPurchase, reevalActionRow } from "./reeval.js";
+import { RETURN_PANEL_ID, returnActionRow, returnContextEmbed, returnTicketIntro } from "./entry-return.js";
 import type { Services } from "../services.js";
 
 const LEGACY_KIND_LABELS: Record<string, string> = { return: "出戻り申請", consult: "個別相談" };

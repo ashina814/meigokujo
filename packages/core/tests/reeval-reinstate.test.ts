@@ -90,18 +90,21 @@ describe("再評価面談OKの復帰", () => {
   it("招待実績由来の昇格スコアは引き継ぐ", () => {
     const ctx = setup();
     const user = demoted(ctx);
-    // 招待実績を持たせる（invites は復帰で消さない）
-    ctx.db.prepare("INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?,?,?)").run(user, "guest1", 1);
-    ctx.db.prepare("INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?,?,?)").run(user, "guest2", 1);
+    // 招待実績を持たせる（invites は復帰で消さない）。閾値3人ちょうどで1アリ
+    for (const guest of ["guest1", "guest2", "guest3"]) {
+      ctx.db.prepare("INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?,?,?)").run(user, guest, 1);
+    }
     const inviteScoreBefore = ctx.evaluation.promotionScore(user).inviteScore;
-    expect(inviteScoreBefore).toBeGreaterThan(0);
+    expect(inviteScoreBefore).toBe(1);
 
     ctx.evaluation.reinstateFromMeirei(user, STAFF, {});
 
+    // **在籍したまま受け直す復帰なので、招待実績は持ち越す**（出戻りとは別ルール）
     const after = ctx.evaluation.promotionScore(user);
-    expect(after.inviteCount).toBe(2);
-    expect(after.inviteScore).toBe(inviteScoreBefore);
-    expect(after.total).toBe(inviteScoreBefore); // 評価印だけが白紙
+    expect(after.inviteCount).toBe(3);
+    expect(after.inviteScore).toBe(1);
+    expect(after.total).toBe(1); // 評価印だけが白紙
+    expect(ctx.entry.getSoul(user)!.eval_invite_baseline).toBe(0);
   });
 
   it("初期Landを再発行しない・招待実績を再計上しない・予約行に触れない", () => {
