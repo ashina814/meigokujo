@@ -1102,7 +1102,7 @@ function migrateMonthlyToThirtyDayTerms(db: Database.Database): void {
                   (SELECT MAX(t.created_at) FROM transactions t
                     WHERE t.ref_type = 'shop_monthly' AND t.ref_id = CAST(p.id AS TEXT)), 0)) AS last_paid_at
            FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
-          WHERE p.status = 'active' AND i.duration_days = 30 AND p.expires_at IS NOT NULL`,
+          WHERE p.status = 'active' AND i.kind = 'monthly' AND p.expires_at IS NOT NULL`,
       )
       .all() as Array<{ id: number; expires_at: number; last_paid_at: number }>;
     const changed: Array<{ purchaseId: number; from: number; to: number }> = [];
@@ -1113,12 +1113,20 @@ function migrateMonthlyToThirtyDayTerms(db: Database.Database): void {
       update.run(next, row.id);
       changed.push({ purchaseId: row.id, from: row.expires_at, to: next });
     }
+    // **手動配送の旧月額は販売を止める。** Botが利用権の実体を管理していないので
+    // （どのDiscordロールが契約かDBが知らない）、汎用の30日延長を受け付けられない。
+    // 既存契約は期限まで有効なまま残し、専用台帳へ移すまで新規購入だけ塞ぐ
+    const stopped = db
+      .prepare("UPDATE shop_items SET enabled = 0, updated_at = ? WHERE kind = 'monthly' AND delivery <> 'auto' AND enabled = 1")
+      .run(ts).changes;
+
     db.prepare("INSERT INTO outbox (kind, payload, created_at) VALUES ('audit_log', ?, ?)").run(
       JSON.stringify({
         event: "shop_term_migrated_to_30d",
         items: target.n,
         contracts: rows.length,
         extended: changed,
+        stoppedManualMonthly: stopped,
         actor: "system:migration",
       }),
       ts,

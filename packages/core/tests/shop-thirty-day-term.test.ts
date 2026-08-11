@@ -42,8 +42,32 @@ function fund(ctx: Ctx, userId: string, amount: number) {
   });
 }
 
+/** Botが利用権を管理する期限商品（自動でロールを付ける＝延長してよい） */
 const termItem = (ctx: Ctx, name = "30日券", price = 1_000) =>
+  ctx.shop.createItem(
+    { name, price_land: price, kind: "monthly", delivery: "auto", delivery_kind: "add_role", delivery_data: JSON.stringify({ role_id: "r1" }) },
+    "staff",
+  );
+
+/** 手動配送の期限商品（旧オリジナルロール継続。汎用延長の対象外） */
+const manualTermItem = (ctx: Ctx, name = "旧月額", price = 1_000) =>
   ctx.shop.createItem({ name, price_land: price, kind: "monthly", delivery: "manual" }, "staff");
+
+/** 確認画面に出したのと同じ条件 */
+function terms(ctx: Ctx, purchaseId: number) {
+  const purchase = ctx.shop.getPurchase(purchaseId)!;
+  const item = ctx.shop.getItem(purchase.item_id)!;
+  return { priceLand: item.price_land!, days: termDays(item)!, expiresAt: purchase.expires_at };
+}
+
+const extendInput = (ctx: Ctx, purchaseId: number, userId: string, operationId: string, roles: string[] = []) => ({
+  purchaseId,
+  userId,
+  actor: userId,
+  operationId,
+  memberRoleIds: roles,
+  expected: terms(ctx, purchaseId),
+});
 
 describe("期限の数え方", () => {
   it("購入した時点から30日（暦月ではない）", () => {
@@ -91,7 +115,7 @@ describe("延長", () => {
     const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
     const balance = ctx.ledger.balanceOf("user:u1");
 
-    const result = ctx.shop.extend({ purchaseId: p.id, userId: "u1", actor: "u1", operationId: "op-1" });
+    const result = ctx.shop.extend(extendInput(ctx, p.id, "u1", "op-1"));
 
     expect(result.extended).toBe(true);
     expect(result.purchase.expires_at).toBe(p.expires_at! + 30 * DAY);
@@ -106,9 +130,11 @@ describe("延長", () => {
     fund(ctx, "u1", 10_000);
     const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
 
-    const first = ctx.shop.extend({ purchaseId: p.id, userId: "u1", actor: "u1", operationId: "op-1" });
+    const input = extendInput(ctx, p.id, "u1", "op-1");
+    const first = ctx.shop.extend(input);
     const balance = ctx.ledger.balanceOf("user:u1");
-    const second = ctx.shop.extend({ purchaseId: p.id, userId: "u1", actor: "u1", operationId: "op-1" });
+    // **同じ確認画面の二度押し**（条件は1回目のまま古い）
+    const second = ctx.shop.extend(input);
 
     expect(second.extended).toBe(false);
     expect(second.purchase.expires_at).toBe(first.purchase.expires_at);
@@ -122,11 +148,12 @@ describe("延長", () => {
     fund(ctx, "u1", 1_000);
     const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
 
-    expect(() => ctx.shop.extend({ purchaseId: p.id, userId: "u2", actor: "u2", operationId: "x" })).toThrow("ERR_NOT_OWNER");
+    expect(() => ctx.shop.extend(extendInput(ctx, p.id, "u2", "x"))).toThrow("ERR_NOT_OWNER");
     // 残高は購入で使い切っている
-    expect(() => ctx.shop.extend({ purchaseId: p.id, userId: "u1", actor: "u1", operationId: "y" })).toThrow("ERR_INSUFFICIENT");
+    expect(() => ctx.shop.extend(extendInput(ctx, p.id, "u1", "y"))).toThrow("ERR_INSUFFICIENT");
+    const expired = extendInput(ctx, p.id, "u1", "z");
     ctx.db.prepare("UPDATE shop_purchases SET status='expired' WHERE id=?").run(p.id);
-    expect(() => ctx.shop.extend({ purchaseId: p.id, userId: "u1", actor: "u1", operationId: "z" })).toThrow("ERR_NOT_ACTIVE");
+    expect(() => ctx.shop.extend(expired)).toThrow("ERR_NOT_ACTIVE");
     ctx.db.close();
   });
 
@@ -217,5 +244,122 @@ describe("暦月からの移行", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("汎用延長を受け付ける商品の線引き", () => {
+  it("Botがロールを付ける期限商品だけが延長できる", () => {
+    const ctx = setup();
+    const auto = ctx.shop.getItem(termItem(ctx).id)!;
+    const manual = ctx.shop.getItem(manualTermItem(ctx).id)!;
+    const oneShot = ctx.shop.getItem(
+      ctx.shop.createItem({ name: "単発", price_land: 1, kind: "one_shot", delivery: "auto", delivery_kind: "extend_deadline" }, "staff").id,
+    )!;
+
+    expect(ctx.shop.isExtendable(auto)).toBe(true);
+    expect(ctx.shop.isExtendable(manual)).toBe(false); // 旧オリジナルロール継続
+    expect(ctx.shop.isExtendable(oneShot)).toBe(false); // 期限が無い
+    ctx.db.close();
+  });
+
+  it("手動配送の期限商品は無課金で拒否する（旧#2を汎用延長させない）", () => {
+    const ctx = setup();
+    const item = manualTermItem(ctx);
+    fund(ctx, "u1", 10_000);
+    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const balance = ctx.ledger.balanceOf("user:u1");
+
+    expect(() => ctx.shop.extend(extendInput(ctx, p.id, "u1", "op-1"))).toThrow("ERR_NOT_EXTENDABLE");
+    expect(ctx.ledger.balanceOf("user:u1")).toBe(balance);
+    expect(ctx.shop.getPurchase(p.id)!.expires_at).toBe(p.expires_at);
+    ctx.db.close();
+  });
+});
+
+describe("確認した内容と実際の課金内容", () => {
+  it("価格・期間・期限のどれかが変わっていたら無課金で拒否する", () => {
+    for (const change of ["price", "expiry"] as const) {
+      const ctx = setup();
+      const item = termItem(ctx);
+      fund(ctx, "u1", 10_000);
+      const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+      const stale = extendInput(ctx, p.id, "u1", `op-${change}`);
+      // 確認画面を出したあとに条件が動く
+      if (change === "price") ctx.shop.updateItem(item.id, { price_land: 2_000 }, "staff");
+      else ctx.db.prepare("UPDATE shop_purchases SET expires_at = expires_at + 86400 WHERE id = ?").run(p.id);
+      const balance = ctx.ledger.balanceOf("user:u1");
+      const expires = ctx.shop.getPurchase(p.id)!.expires_at;
+
+      expect(() => ctx.shop.extend(stale)).toThrow("ERR_TERMS_CHANGED");
+      expect(ctx.ledger.balanceOf("user:u1")).toBe(balance);
+      expect(ctx.shop.getPurchase(p.id)!.expires_at).toBe(expires);
+      ctx.db.close();
+    }
+  });
+
+  it("古い確認画面は拒否されるが、新しい確認画面ならそのまま通る", () => {
+    const ctx = setup();
+    const item = termItem(ctx);
+    fund(ctx, "u1", 10_000);
+    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const old = extendInput(ctx, p.id, "u1", "op-old");
+    ctx.shop.extend(extendInput(ctx, p.id, "u1", "op-new")); // 別の画面から先に延長された
+
+    expect(() => ctx.shop.extend(old)).toThrow("ERR_TERMS_CHANGED");
+    // 出し直せば通る
+    expect(ctx.shop.extend(extendInput(ctx, p.id, "u1", "op-new2")).extended).toBe(true);
+    ctx.db.close();
+  });
+});
+
+describe("課金と期限更新の原子性", () => {
+  it("期限更新に失敗したらLandも減らない。障害が去れば同じ操作で成功する", () => {
+    const ctx = setup();
+    const item = termItem(ctx);
+    fund(ctx, "u1", 10_000);
+    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const balance = ctx.ledger.balanceOf("user:u1");
+    const input = extendInput(ctx, p.id, "u1", "op-1");
+    // 課金の**後**に来る期限更新だけを失敗させる
+    ctx.db
+      .prepare(
+        `CREATE TRIGGER fail_extend BEFORE UPDATE OF expires_at ON shop_purchases
+           BEGIN SELECT RAISE(ABORT, 'injected failure'); END`,
+      )
+      .run();
+
+    expect(() => ctx.shop.extend(input)).toThrow("injected failure");
+    expect(ctx.ledger.balanceOf("user:u1")).toBe(balance);
+    expect(ctx.shop.getPurchase(p.id)!.expires_at).toBe(p.expires_at);
+    // Land取引ごと巻き戻っているので、同じ冪等キーで再試行できる
+    expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE idempotency_key = ?").get(`shop:extend:${p.id}:op-1`)).toEqual({ n: 0 });
+
+    ctx.db.prepare("DROP TRIGGER fail_extend").run();
+    const retry = ctx.shop.extend(input);
+
+    expect(retry.extended).toBe(true);
+    expect(ctx.ledger.balanceOf("user:u1")).toBe(balance - 1_000);
+    expect(retry.purchase.expires_at).toBe(p.expires_at! + 30 * DAY);
+    ctx.db.close();
+  });
+});
+
+describe("延長時の階級要件", () => {
+  it("購入後に要件を失っていたら無課金で拒否する", () => {
+    const ctx = setup();
+    const item = termItem(ctx);
+    ctx.shop.updateItem(item.id, { require_role_id: "role-majin" }, "staff");
+    fund(ctx, "u1", 10_000);
+    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: ["role-majin"] }).purchase;
+    const balance = ctx.ledger.balanceOf("user:u1");
+
+    // いまは要件ロールを持っていない
+    expect(() => ctx.shop.extend(extendInput(ctx, p.id, "u1", "op-1", []))).toThrow("ERR_ROLE_REQUIRED");
+    expect(ctx.ledger.balanceOf("user:u1")).toBe(balance);
+    expect(ctx.shop.getPurchase(p.id)!.expires_at).toBe(p.expires_at);
+
+    // 持っていれば通る
+    expect(ctx.shop.extend(extendInput(ctx, p.id, "u1", "op-2", ["role-majin"])).extended).toBe(true);
+    ctx.db.close();
   });
 });

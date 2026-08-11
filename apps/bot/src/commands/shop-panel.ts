@@ -45,8 +45,13 @@ function daysLeft(expiresAt: number | null): number {
 }
 
 /** その利用者が契約中の同じ商品（あれば購入から延長へ導線を変える） */
-function activeContractFor(services: Services, userId: string, itemId: number): PurchaseRow | undefined {
-  return services.shop.listUserPurchases(userId, { activeOnly: true }).find((p) => p.item_id === itemId);
+function contractView(
+  services: Services,
+  userId: string,
+  item: ShopItemRow,
+): { purchase: PurchaseRow; extendable: boolean } | undefined {
+  const purchase = services.shop.listUserPurchases(userId, { activeOnly: true }).find((p) => p.item_id === item.id);
+  return purchase ? { purchase, extendable: services.shop.isExtendable(item) } : undefined;
 }
 
 export function shopPanelMessage(services: Services): MessageCreateOptions {
@@ -101,7 +106,7 @@ function itemDetail(
   userHasRole: boolean,
   balance: number,
   requireLabel: string,
-  contract?: PurchaseRow,
+  contract?: { purchase: PurchaseRow; extendable: boolean },
 ): {
   embeds: EmbedBuilder[];
   components: ActionRowBuilder<ButtonBuilder>[];
@@ -123,14 +128,18 @@ function itemDetail(
   if (contract) {
     embed.addFields({
       name: "契約中",
-      value: `残り **${daysLeft(contract.expires_at)}日**（<t:${contract.expires_at}:D> まで）`,
+      value: `残り **${daysLeft(contract.purchase.expires_at)}日**（<t:${contract.purchase.expires_at}:D> まで）`,
     });
+    // Botが利用権を管理していない商品には延長を出さない（払っても伸びる保証が無い）
+    if (!contract.extendable || item.price_land === null) {
+      embed.setFooter({ text: "この契約の延長は運営が対応します。" });
+      return { embeds: [embed], components: [] };
+    }
     const extend = new ButtonBuilder()
-      .setCustomId(`shop:extend:${contract.id}`)
-      .setLabel(`${termDays(item) ?? 30}日延長 (${fmtLd(item.price_land ?? 0)})`)
+      .setCustomId(`shop:extend:${contract.purchase.id}`)
+      .setLabel(`${termDays(item) ?? 30}日延長 (${fmtLd(item.price_land)})`)
       .setEmoji("♻️")
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(item.price_land === null);
+      .setStyle(ButtonStyle.Primary);
     return { embeds: [embed], components: [new ActionRowBuilder<ButtonBuilder>().addComponents(extend)] };
   }
 
@@ -302,7 +311,8 @@ function purchaseErrorMessage(error: unknown, services: Services): string {
     }
     if (error.code === "ERR_ALREADY_ACTIVE") return "既に契約中です。「契約中」から延長してください。";
     if (error.code === "ERR_NOT_OWNER" || error.code === "ERR_NOT_ACTIVE") return "この契約は延長できません。";
-    if (error.code === "ERR_NOT_EXTENDABLE") return "この商品は期限がないため延長できません。";
+    if (error.code === "ERR_NOT_EXTENDABLE") return "この契約はここからは延長できません。運営にご確認ください。";
+    if (error.code === "ERR_TERMS_CHANGED") return "内容が変わったので、もう一度確認してください（料金は発生していません）。";
     if (error.code === "ERR_NO_PRICE") return "この商品の価格が設定されていません。";
   }
   if (error instanceof LedgerError && error.code === "ERR_INSUFFICIENT") return "残高が足りません。";
@@ -375,7 +385,9 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
     for (const purchase of terms.slice(0, 5)) {
       const item = services.shop.getItem(purchase.item_id);
-      if (!item || item.price_land === null) continue;
+      // Botが利用権を管理していない商品（旧オリジナルロール継続など）には延長を出さない。
+      // 払っても実際の権利が伸びる保証が無いため
+      if (!item || item.price_land === null || !services.shop.isExtendable(item)) continue;
       const button = new ButtonBuilder()
         .setCustomId(`shop:extend:${purchase.id}`)
         .setLabel(`${item.name.slice(0, 30)} を${termDays(item) ?? 30}日延長`)
@@ -398,9 +410,19 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       await interaction.reply({ content: "この契約は延長できません。", flags: MessageFlags.Ephemeral });
       return;
     }
+    if (!services.shop.isExtendable(item)) {
+      await interaction.reply({
+        content: "この契約はここからは延長できません。運営にご確認ください。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     const days = termDays(item) ?? 30;
     const nowSec = Math.floor(Date.now() / 1000);
     const nextExpires = Math.max(purchase.expires_at ?? 0, nowSec) + days * 86_400;
+    // **この確認画面のID。** 確定ボタンへ埋めるので、同じ画面から何度押しても
+    // 同じ操作として扱える（別の古い確認画面は下の条件検査で弾かれる）
+    const confirmationId = interaction.id;
     await interaction.reply({
       content: [
         `♻️ **${item.name}** を${days}日延長します。`,
@@ -409,7 +431,12 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       ].join("\n"),
       components: [
         new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder().setCustomId(`shop:extend-do:${purchaseId}`).setLabel("延長する").setStyle(ButtonStyle.Success),
+          new ButtonBuilder()
+            .setCustomId(
+              `shop:extend-do:${purchaseId}:${confirmationId}:${item.price_land ?? 0}:${days}:${purchase.expires_at ?? 0}`,
+            )
+            .setLabel("延長する")
+            .setStyle(ButtonStyle.Success),
         ),
       ],
       flags: MessageFlags.Ephemeral,
@@ -418,13 +445,26 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
   }
 
   if (action === "extend-do") {
-    const purchaseId = Number(parts[2]);
+    const [purchaseId, confirmationId, price, days, expiresAt] = [
+      Number(parts[2]),
+      parts[3] ?? "",
+      Number(parts[4]),
+      Number(parts[5]),
+      Number(parts[6]),
+    ];
     try {
+      // 階級要件は課金の直前に取り直す（キャッシュだと剥奪直後でも通ってしまう）
+      const member = interaction.guild
+        ? await interaction.guild.members.fetch({ user: interaction.user.id, force: true }).catch(() => null)
+        : null;
       const result = services.shop.extend({
         purchaseId,
         userId: interaction.user.id,
         actor: `user:${interaction.user.id}`,
-        operationId: interaction.id,
+        // 同じ確認画面からの実行は必ず同じ操作IDになる
+        operationId: confirmationId,
+        memberRoleIds: member ? [...member.roles.cache.keys()] : [],
+        expected: { priceLand: price, days, expiresAt: expiresAt === 0 ? null : expiresAt },
       });
       await interaction.update({
         content: result.extended
@@ -598,7 +638,7 @@ export async function handleShopSelect(
       hasRole,
       balance,
       requirementLabel(services.settings, item.require_role_id),
-      activeContractFor(services, interaction.user.id, item.id),
+      contractView(services, interaction.user.id, item),
     );
     await interaction.reply({ ...view, flags: MessageFlags.Ephemeral });
     return;

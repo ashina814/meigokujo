@@ -148,7 +148,8 @@ export type ShopErrorCode =
   | "ERR_PURCHASE_NOT_FOUND"
   | "ERR_NOT_OWNER"
   | "ERR_NOT_ACTIVE"
-  | "ERR_NOT_EXTENDABLE";
+  | "ERR_NOT_EXTENDABLE"
+  | "ERR_TERMS_CHANGED";
 
 export class ShopError extends Error {
   constructor(readonly code: ShopErrorCode, readonly details: Record<string, unknown> = {}) {
@@ -416,53 +417,99 @@ export class Shop {
   }
 
   /**
+   * 汎用の30日延長を受け付けてよい商品か。
+   *
+   * **Botが利用権そのものを管理している商品だけ**（自動でロールを付け、失効で剥がす）。
+   * 手動配送の期限商品は、Landを取っても実際の権利が伸びる保証がない
+   * （旧「オリジナルロール継続」は、どのDiscordロールが契約の実体かDBが知らない）。
+   * そこへ汎用の延長ボタンを出すと、**払わせただけで何も起きない**を作ってしまう。
+   */
+  isExtendable(item: Pick<ShopItemRow, "kind" | "duration_days" | "delivery" | "delivery_kind" | "enabled">): boolean {
+    if (termDays(item as ShopItemRow) === null) return false;
+    if (!item.enabled) return false;
+    return item.delivery === "auto" && item.delivery_kind === "add_role";
+  }
+
+  /**
    * 期限を30日延ばす。**自動更新ではない**（本人が押したときだけ動く）。
    *
-   * 支払いは購入と同じ Land 焼却。契約は行を増やさず同じ1行を延ばすので、
-   * 「いま何を契約していて、いつまでか」が利用者からも運営からも1行で読める。
-   * 二重延長は Land 取引の冪等キーで止める（同じ操作IDなら2回目は資金も期限も動かない）。
+   * 課金・期限更新・記録を1トランザクションで確定させる。分けると
+   * 「Landだけ減って期限が伸びない」が作れてしまう。
+   *
+   * `expected` は確認画面に出した条件。確定までの間に価格・期間・期限が動いていたら
+   * **無課金で拒否**する（勝手に新しい条件で課金しない）。ただし同じ確認画面の二度押しは
+   * 条件検査より先に replay として返すので、正常な連打が「条件が変わった」にはならない。
    */
   extend(input: {
     purchaseId: number;
     userId: string;
     actor: string;
+    /** 同じ確認画面からの実行は同じ値になること（二度押しの冪等はこれで決まる） */
     operationId: string;
+    memberRoleIds: readonly string[];
+    expected: { priceLand: number; days: number; expiresAt: number | null };
   }): { purchase: PurchaseRow; item: ShopItemRow; extended: boolean; addedDays: number } {
-    const purchase = this.getPurchase(input.purchaseId);
-    if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
-    if (purchase.user_id !== input.userId) throw new ShopError("ERR_NOT_OWNER", { purchaseId: input.purchaseId });
-    if (purchase.status !== "active") throw new ShopError("ERR_NOT_ACTIVE", { status: purchase.status });
-    const item = this.getItem(purchase.item_id);
-    if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: purchase.item_id });
-    if (!item.enabled) throw new ShopError("ERR_ITEM_DISABLED", { itemId: item.id });
-    const days = termDays(item);
-    if (days === null) throw new ShopError("ERR_NOT_EXTENDABLE", { itemId: item.id });
-    if (item.price_land === null) throw new ShopError("ERR_NO_PRICE", { itemId: item.id });
+    const idempotencyKey = `shop:extend:${input.purchaseId}:${input.operationId}`;
+    const run = this.db.transaction(() => {
+      const purchase = this.getPurchase(input.purchaseId);
+      if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+      if (purchase.user_id !== input.userId) throw new ShopError("ERR_NOT_OWNER", { purchaseId: input.purchaseId });
+      const item = this.getItem(purchase.item_id);
+      if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: purchase.item_id });
 
-    const account = `user:${input.userId}`;
-    this.ledger.ensureAccount(account, "user");
-    const paid = this.ledger.transfer({
-      from: account,
-      to: TREASURY,
-      amount: item.price_land,
-      type: "tip_burn",
-      actor: input.actor,
-      reason: `公式ショップ延長: ${item.name}`,
-      refType: "shop_extend",
-      refId: String(purchase.id),
-      idempotencyKey: `shop:extend:${purchase.id}:${input.operationId}`,
-    });
-    // 同じ操作の再送。資金が動いていないので期限も動かさない
-    if (paid.duplicate) return { purchase, item, extended: false, addedDays: 0 };
+      // **同じ確認画面の二度押しが先。** 1回目で期限が動いているので、
+      // 条件検査を先にすると正常な連打が「内容が変わった」になってしまう
+      const alreadyPaid = this.db
+        .prepare("SELECT id FROM transactions WHERE idempotency_key = ?")
+        .get(idempotencyKey) as { id: number } | undefined;
+      if (alreadyPaid) return { purchase, item, extended: false, addedDays: 0 };
 
-    const nextExpires = extendedExpiry(purchase.expires_at, days);
-    this.db.prepare("UPDATE shop_purchases SET expires_at = ? WHERE id = ?").run(nextExpires, purchase.id);
-    this.events.log("shop_extended", {
-      actor: input.actor,
-      target: input.userId,
-      payload: { purchaseId: purchase.id, itemId: item.id, days, from: purchase.expires_at, to: nextExpires },
+      if (purchase.status !== "active") throw new ShopError("ERR_NOT_ACTIVE", { status: purchase.status });
+      if (!item.enabled) throw new ShopError("ERR_ITEM_DISABLED", { itemId: item.id });
+      if (!this.isExtendable(item)) throw new ShopError("ERR_NOT_EXTENDABLE", { itemId: item.id });
+      if (item.price_land === null) throw new ShopError("ERR_NO_PRICE", { itemId: item.id });
+      // 階級要件は**課金の直前**にもう一度見る（購入後に落ちた人へ売り続けない）
+      if (item.require_role_id && !this.roleSatisfied(input.memberRoleIds, item.require_role_id)) {
+        throw new ShopError("ERR_ROLE_REQUIRED", { roleId: item.require_role_id });
+      }
+
+      const days = termDays(item)!;
+      // 確認画面に出した条件と一致しているか。1つでも動いていたら課金しない
+      if (
+        input.expected.priceLand !== item.price_land ||
+        input.expected.days !== days ||
+        input.expected.expiresAt !== purchase.expires_at
+      ) {
+        throw new ShopError("ERR_TERMS_CHANGED", {
+          expected: input.expected,
+          actual: { priceLand: item.price_land, days, expiresAt: purchase.expires_at },
+        });
+      }
+
+      const account = `user:${input.userId}`;
+      this.ledger.ensureAccount(account, "user");
+      this.ledger.transfer({
+        from: account,
+        to: TREASURY,
+        amount: item.price_land,
+        type: "tip_burn",
+        actor: input.actor,
+        reason: `公式ショップ延長: ${item.name}`,
+        refType: "shop_extend",
+        refId: String(purchase.id),
+        idempotencyKey,
+      });
+
+      const nextExpires = extendedExpiry(purchase.expires_at, days);
+      this.db.prepare("UPDATE shop_purchases SET expires_at = ? WHERE id = ?").run(nextExpires, purchase.id);
+      this.events.log("shop_extended", {
+        actor: input.actor,
+        target: input.userId,
+        payload: { purchaseId: purchase.id, itemId: item.id, days, from: purchase.expires_at, to: nextExpires },
+      });
+      return { purchase: this.getPurchase(purchase.id)!, item, extended: true, addedDays: days };
     });
-    return { purchase: this.getPurchase(purchase.id)!, item, extended: true, addedDays: days };
+    return this.db.inTransaction ? run() : run.immediate();
   }
 
   listUserPurchases(userId: string, opts: { activeOnly?: boolean } = {}): PurchaseRow[] {

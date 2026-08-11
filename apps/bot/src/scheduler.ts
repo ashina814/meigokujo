@@ -376,10 +376,12 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         const marker = `shop:expiry_notified:${purchase.id}:${purchase.expires_at}`;
         if (services.settings.getString(marker)) continue;
         const item = services.shop.getItem(purchase.item_id);
+        // 自分で延長できない契約に「商館から延長してください」と案内しない
+        if (!item || !services.shop.isExtendable(item)) continue;
         const user = await client.users.fetch(purchase.user_id).catch(() => null);
         await user
           ?.send(
-            `⏳ **${item?.name ?? `商品#${purchase.item_id}`}** の期限が <t:${purchase.expires_at}:D> に切れます。自動更新はありません。続ける場合は公式ショップの「契約中」から延長してください。`,
+            `⏳ **${item.name}** の期限が <t:${purchase.expires_at}:D> に切れます。自動更新はありません。続ける場合は公式ショップの「契約中」から延長してください。`,
           )
           .catch(() => undefined);
         services.settings.set(marker, 1, "system:shop-expiry");
