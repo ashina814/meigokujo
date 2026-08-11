@@ -172,9 +172,12 @@ describe("チケットの状態が変わっても受付固有の操作を消さ�
     const select = rows.flatMap((r) => r.toJSON().components).find((c) => (c as { custom_id?: string }).custom_id === "ret:target");
     expect(select).toBeDefined();
     expect((select as { disabled?: boolean }).disabled).toBe(true);
-    // 共通ボタンも完了状態
-    const close = rows.flatMap((r) => r.toJSON().components).find((c) => (c as { custom_id?: string }).custom_id === "ticket:close");
-    expect((close as { disabled?: boolean }).disabled).toBe(true);
+    // 共通ボタンも完了状態（ただしクローズは「表示を修復」として押せるまま残す）
+    const byId = (id: string) => rows.flatMap((r) => r.toJSON().components).find((c) => (c as { custom_id?: string }).custom_id === id);
+    expect((byId("ticket:claim") as { disabled?: boolean }).disabled).toBe(true);
+    const close = byId("ticket:close") as { disabled?: boolean; label?: string };
+    expect(close.disabled).toBeFalsy();
+    expect(close.label).toBe("表示を修復");
   });
 
   it("面談権が無い再評価チケットでは承認を押せない", async () => {

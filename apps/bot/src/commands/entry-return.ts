@@ -23,7 +23,7 @@ import {
   type ReturnTarget,
 } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
-import { finalizeTicketDiscordState, ticketActionRow } from "./ticket-display.js";
+import { controlMessageOf, finalizeTicketDiscordState, ticketActionRow } from "./ticket-display.js";
 import type { Services } from "../services.js";
 
 /**
@@ -66,7 +66,17 @@ export function returnContextEmbed(services: Services, userId: string, member: G
     .setColor(0x0369a1)
     .setDescription(`対象: <@${userId}>`)
     .addFields(
-      { name: "過去の在籍", value: ctx.hasSoul ? (ctx.hasHistory ? "あり（退出の記録あり）" : "あり（退出の記録なし）") : "**記録なし**", inline: true },
+      {
+        name: "過去の在籍",
+        value: !ctx.hasSoul
+          ? "**記録なし**"
+          : ctx.historyFromRecovery
+            ? "台帳に記録なし（出戻り対応で作成）"
+            : ctx.leftAt !== null
+              ? "あり（退出の記録あり）"
+              : "あり（退出の記録なし）",
+        inline: true,
+      },
       { name: "最終退出", value: jst(ctx.leftAt), inline: true },
       { name: "最終階級", value: ctx.rankAtLeave ?? "—", inline: true },
       { name: "現在の台帳", value: ctx.currentStatus ?? "**行なし**", inline: true },
@@ -225,7 +235,7 @@ export async function handleReturnReasonSubmit(interaction: ModalSubmitInteracti
     services,
     interaction.channel as never,
     services.tickets.get(interaction.channelId!),
-    { controlMessage: null, components: [ticketActionRow("closed"), returnActionRow(true)], actor, reason: "出戻り申請の対応完了" },
+    { controlMessage: controlMessageOf(interaction), components: [ticketActionRow("closed"), returnActionRow(true)], actor, reason: "出戻り申請の対応完了" },
   ).catch(() => ["表示の完了処理に失敗しました"]);
 
   const cycle = settled.result?.cycle;
@@ -243,7 +253,7 @@ export async function handleReturnReasonSubmit(interaction: ModalSubmitInteracti
         : "",
       displayProblems.length > 0
         ? `⚠️ 表示の完了処理に失敗しました（台帳は確定済み）: ${displayProblems.join(" / ")}
--# もう一度クローズを押せば表示だけ直せます。`
+-# チケットの「表示を修復」を押すと、表示だけやり直せます（台帳は変わりません）。`
         : "",
       "-# 初期Landの再発行・招待実績の再計上は行っていません。",
     ]

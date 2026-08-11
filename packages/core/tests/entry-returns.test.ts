@@ -356,3 +356,38 @@ describe("再評価面談との分離", () => {
     expect(ctx.evaluation.promotionScore("u1").inviteScore).toBe(1);
   });
 });
+
+describe("台帳に記録が無い出戻り（歴史回収）", () => {
+  it("出戻り対応で作った行は出戻りとして扱われ、通常の入城導線では亡霊にできない", () => {
+    const ctx = setup();
+    // Bot停止中の参加などで souls 行そのものが無い人
+    expect(ctx.entry.getSoul("u1")).toBeUndefined();
+
+    const created = ctx.returns.createWaitingSoulForReturn("u1", null, STAFF, { note: "歴史回収" });
+
+    expect(created).toBe(true);
+    expect(ctx.returns.isReturnee("u1")).toBe(true);
+    // 退出の記録は無いが、出戻り対応で作られた行だと判別できる
+    const context = ctx.returns.context("u1");
+    expect(context.hasHistory).toBe(true);
+    expect(context.historyFromRecovery).toBe(true);
+
+    // 通常の /審判 から亡霊にしようとしても弾かれる（戻し先は運営が決める）
+    const result = ctx.entry.ghostify("u1", STAFF);
+    expect(result.blocked).toBe("returnee");
+    expect(ctx.entry.getSoul("u1")!.status).toBe("waiting");
+    expect(ctx.events.listByType("entry_ghostify_blocked_returnee")).toHaveLength(1);
+  });
+
+  it("既に行がある人には作らない（元の履歴を上書きしない）", () => {
+    const ctx = setup();
+    ctx.entry.recordJoin("u1");
+    ctx.entry.ghostify("u1", STAFF);
+
+    const created = ctx.returns.createWaitingSoulForReturn("u1", null, STAFF, {});
+
+    expect(created).toBe(false);
+    expect(ctx.entry.getSoul("u1")!.status).toBe("ghost");
+    expect(ctx.entry.getSoul("u1")!.returned_at).toBeNull();
+  });
+});

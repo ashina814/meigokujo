@@ -9,7 +9,7 @@ import {
 } from "discord.js";
 import { RANK_ROLE_SETTING_KEYS } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
-import { finalizeTicketDiscordState, ticketActionRow } from "./ticket-display.js";
+import { controlMessageOf, finalizeTicketDiscordState, ticketActionRow } from "./ticket-display.js";
 import type { Services } from "../services.js";
 
 /**
@@ -348,7 +348,7 @@ export async function handleReevalApprove(interaction: ButtonInteraction, servic
     services,
     interaction.channel as never,
     services.tickets.get(interaction.channelId),
-    { controlMessage: null, components: [ticketActionRow("closed"), reevalActionRow(true)], actor, reason: "再評価面談の対応完了" },
+    { controlMessage: controlMessageOf(interaction), components: [ticketActionRow("closed"), reevalActionRow(true)], actor, reason: "再評価面談の対応完了" },
   ).catch(() => ["表示の完了処理に失敗しました"]);
 
   const deadline = `<t:${result.deadline}:D>`;
@@ -361,7 +361,8 @@ export async function handleReevalApprove(interaction: ButtonInteraction, servic
         ? `⚠️ **ロールの入れ替えに失敗しました**（台帳は亡霊で確定済み）:\n${roleErrors.map((e) => `・${e}`).join("\n")}\n-# 迷霊ロールが残っている場合、亡霊ロールは**わざと付けていません**（両方付くと階級同期が台帳を迷霊へ戻すため）。先に迷霊ロールを外してください。`
         : "",
       displayProblems.length > 0
-        ? `⚠️ 表示の完了処理に失敗しました（台帳は確定済み）: ${displayProblems.join(" / ")}`
+        ? `⚠️ 表示の完了処理に失敗しました（台帳は確定済み）: ${displayProblems.join(" / ")}
+-# チケットの「表示を修復」を押すと、表示だけやり直せます。`
         : "",
       "-# 初期Landの再発行・招待実績の再計上・招待者の期限延長は行っていません。",
     ]
@@ -403,7 +404,7 @@ export async function handleReevalReject(interaction: ButtonInteraction, service
     services,
     interaction.channel as never,
     services.tickets.get(interaction.channelId),
-    { controlMessage: null, components: [ticketActionRow("closed"), reevalActionRow(true)], actor: `user:${interaction.user.id}`, reason: "再評価面談の対応完了（見送り）" },
+    { controlMessage: controlMessageOf(interaction), components: [ticketActionRow("closed"), reevalActionRow(true)], actor: `user:${interaction.user.id}`, reason: "再評価面談の対応完了（見送り）" },
   ).catch(() => undefined);
   await interaction.editReply({
     content: [

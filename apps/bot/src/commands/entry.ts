@@ -18,7 +18,13 @@ import {
   type TextChannel,
   type VoiceState,
 } from "discord.js";
-import { decideGhostRoleAdd, describeSessionSchedule } from "@meigokujo/core";
+import {
+  MEIREI_ROLE_SETTING_KEY,
+  RANK_LADDER,
+  RANK_ROLE_SETTING_KEYS,
+  decideGhostRoleAdd,
+  describeSessionSchedule,
+} from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { deliverToUser } from "../notify.js";
 import { isAdmin } from "../permissions.js";
@@ -486,7 +492,7 @@ async function presentWaiters(guild: Guild, services: Services): Promise<string[
   return targets;
 }
 
-async function presentWaitersSplit(guild: Guild, services: Services): Promise<{ targets: string[]; returnees: string[] }> {
+export async function presentWaitersSplit(guild: Guild, services: Services): Promise<{ targets: string[]; returnees: string[] }> {
   const all = await presentWaitersRaw(guild, services);
   const targets: string[] = [];
   const returnees: string[] = [];
@@ -500,10 +506,12 @@ async function presentWaitersRaw(guild: Guild, services: Services): Promise<stri
     services.settings.getString("channel:session_vc2"),
   ].filter((v): v is string => !!v);
   const waitRoleId = services.settings.getString("role:queue_wait");
-  const ghostRoleId = services.settings.getString("role:ghost");
-  const majinRoleId = services.settings.getString("role:majin");
-  const mazokuRoleId = services.settings.getString("role:mazoku");
-  const meireiRoleId = services.settings.getString("role:meirei");
+  // 階級ロールは個別に並べず RANK_LADDER から引く。眷魔のように階級が増えたとき
+  // ここへ足し忘れると、その階級の人を案内待ちへ「修復」してしまう
+  const rankRoleIds = [
+    ...RANK_LADDER.map((rank) => services.settings.getString(RANK_ROLE_SETTING_KEYS[rank])),
+    services.settings.getString(MEIREI_ROLE_SETTING_KEY),
+  ].filter((id): id is string => !!id);
   const ids = new Set<string>();
   for (const vcId of vcIds) {
     const ch = await guild.channels.fetch(vcId).catch(() => null);
@@ -512,12 +520,8 @@ async function presentWaitersRaw(guild: Guild, services: Services): Promise<stri
       if (m.user.bot) continue;
       const roles = m.roles.cache;
       const hasWait = !!(waitRoleId && roles.has(waitRoleId));
-      const hasGhost = !!(ghostRoleId && roles.has(ghostRoleId));
-      const hasHigher =
-        (majinRoleId && roles.has(majinRoleId)) ||
-        (mazokuRoleId && roles.has(mazokuRoleId)) ||
-        (meireiRoleId && roles.has(meireiRoleId));
-      if (hasHigher || hasGhost) continue; // 亡霊以上は判定対象外
+      // 階級ロール（亡霊・魔人・眷魔・魔族・迷霊）を持つ人は判定対象外
+      if (rankRoleIds.some((id) => roles.has(id))) continue;
       const soul = services.entry.getSoul(m.id);
       if (hasWait) {
         // 案内待ちロール保持者は対象。魂とのズレを見つけたら修復

@@ -49,23 +49,51 @@ export function ticketStatusContent(content: string, statusLine: string): string
   return [...lines, "", statusLine].join("\n");
 }
 
+/**
+ * このやり取りの元になったチケット操作メッセージ。
+ *
+ * ボタンからの操作はそのメッセージ自身、モーダルからの操作も
+ * 「どのメッセージのコンポーネントから開いたか」を discord.js が持っている。
+ * ここが取れないと**操作UIを完了状態にできない**（実際それで無効化できていなかった）。
+ */
+export function controlMessageOf(interaction: {
+  message?: unknown;
+}): { content: string; edit: (payload: unknown) => Promise<unknown> } | null {
+  const message = interaction.message as { content?: unknown; edit?: unknown } | null | undefined;
+  if (!message || typeof message.content !== "string" || typeof message.edit !== "function") return null;
+  return message as { content: string; edit: (payload: unknown) => Promise<unknown> };
+}
+
 export function ticketActionRow(status: TicketRow["status"]): ActionRowBuilder<ButtonBuilder> {
   const claim = new ButtonBuilder()
     .setCustomId("ticket:claim")
     .setLabel(status === "open" ? "対応する" : "対応済み")
     .setStyle(status === "open" ? ButtonStyle.Primary : ButtonStyle.Secondary)
     .setDisabled(status !== "open");
+  // クローズ済みでも押せるままにしておく。台帳は閉じたのに表示だけ失敗した場合、
+  // ここが唯一の修復導線になる（押すと表示だけをやり直す）
   const close = new ButtonBuilder()
     .setCustomId("ticket:close")
-    .setLabel(status === "closed" ? "クローズ済み" : "クローズ")
-    .setStyle(status === "closed" ? ButtonStyle.Secondary : ButtonStyle.Danger)
-    .setDisabled(status === "closed");
+    .setLabel(status === "closed" ? "表示を修復" : "クローズ")
+    .setStyle(status === "closed" ? ButtonStyle.Secondary : ButtonStyle.Danger);
   return new ActionRowBuilder<ButtonBuilder>().addComponents(claim, close);
 }
 
-export async function lockAndArchiveThread(thread: LockableThread, reason: string): Promise<void> {
-  await thread.setLocked(true, reason).catch((e) => console.warn(`[ticket] スレッドのロックに失敗: ${thread.id}`, e));
-  await thread.setArchived(true, reason).catch((e) => console.warn(`[ticket] スレッドのアーカイブに失敗: ${thread.id}`, e));
+/**
+ * スレッドを閉じる。**失敗を握り潰さず呼び出し側へ返す。**
+ * 握ったままだと「ロックだけ失敗した」チケットが修復対象に出てこない。
+ */
+export async function lockAndArchiveThread(thread: LockableThread, reason: string): Promise<string[]> {
+  const problems: string[] = [];
+  await thread.setLocked(true, reason).catch((e) => {
+    console.warn(`[ticket] スレッドのロックに失敗: ${thread.id}`, e);
+    problems.push(`スレッドのロックに失敗: ${(e as Error).message}`);
+  });
+  await thread.setArchived(true, reason).catch((e) => {
+    console.warn(`[ticket] スレッドのアーカイブに失敗: ${thread.id}`, e);
+    problems.push(`スレッドのアーカイブに失敗: ${(e as Error).message}`);
+  });
+  return problems;
 }
 
 /**
@@ -100,7 +128,7 @@ export async function finalizeTicketDiscordState(
     problems.push(`スレッド名の更新に失敗: ${(e as Error).message}`);
   });
   if (thread.setLocked && thread.setArchived) {
-    await lockAndArchiveThread(thread as LockableThread, opts.reason);
+    problems.push(...(await lockAndArchiveThread(thread as LockableThread, opts.reason)));
   }
   if (problems.length > 0) {
     services.events.log("ticket_display_repair_needed", {

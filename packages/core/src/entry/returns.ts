@@ -38,6 +38,8 @@ export interface ReturnContext {
   currentStatus: SoulStatus | null;
   /** 過去に在籍していたか（再参加を検知したか、退出を記録したか） */
   hasHistory: boolean;
+  /** 退出の記録が無いまま出戻り対応で作った行（Bot停止中の参加などの歴史回収） */
+  historyFromRecovery: boolean;
   leftAt: number | null;
   returnedAt: number | null;
   /** 退出時点の階級（再参加で waiting へ戻す前に退避したもの） */
@@ -173,9 +175,13 @@ export class Returns {
    */
   createWaitingSoulForReturn(userId: string, joinedAt: number | null, actor: string, evidence: Record<string, unknown> = {}): boolean {
     const ts = now();
+    // **`returned_at` を必ず立てる。** これが無いと `isReturnee()` から見て
+    // ただの新規案内待ちと区別が付かず、通常の `/審判` で亡霊にできてしまう
     const changed = this.db
-      .prepare("INSERT INTO souls (user_id, status, joined_at, updated_at) VALUES (?, 'waiting', ?, ?) ON CONFLICT(user_id) DO NOTHING")
-      .run(userId, joinedAt ?? ts, ts).changes;
+      .prepare(
+        "INSERT INTO souls (user_id, status, joined_at, returned_at, updated_at) VALUES (?, 'waiting', ?, ?, ?) ON CONFLICT(user_id) DO NOTHING",
+      )
+      .run(userId, joinedAt ?? ts, ts, ts).changes;
     if (changed !== 1) return false;
     this.events.log("entry_soul_created_for_return", {
       actor,
@@ -219,6 +225,8 @@ export class Returns {
       hasSoul: !!soul,
       currentStatus: soul?.status ?? null,
       hasHistory: !!soul && (soul.left_at !== null || soul.returned_at !== null || soul.rank_at_leave !== null),
+      // 退出の記録が無いまま出戻り対応で作られた行か（歴史回収のケース）
+      historyFromRecovery: !!soul && soul.left_at === null && soul.rank_at_leave === null && soul.returned_at !== null,
       leftAt: soul?.left_at ?? null,
       returnedAt: soul?.returned_at ?? null,
       rankAtLeave: soul?.rank_at_leave ?? null,

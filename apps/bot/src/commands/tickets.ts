@@ -19,6 +19,7 @@ import { isAdmin } from "../permissions.js";
 import { REEVAL_PANEL_ID, linkReevalPurchase, reevalActionRow } from "./reeval.js";
 import { RETURN_PANEL_ID, returnActionRow, returnContextEmbed, returnTicketIntro } from "./entry-return.js";
 import {
+  controlMessageOf,
   finalizeTicketDiscordState,
   lockAndArchiveThread,
   safeThreadPart,
@@ -506,7 +507,22 @@ async function requestTicketClose(interaction: ButtonInteraction, services: Serv
     return;
   }
   if (ticket.status === "closed") {
-    await interaction.reply({ content: "このチケットは既にクローズされています。", flags: MessageFlags.Ephemeral });
+    // **表示の修復導線。** 出戻り・再評価の確定は台帳を先に閉じるので、
+    // その後の表示更新だけが失敗している状態がありうる。DBは既にクローズ済みなので
+    // ここでは**表示だけ**やり直す（台帳は触らない）
+    const problems = await finalizeTicketDiscordState(services, interaction.channel as never, ticket, {
+      controlMessage: controlMessageOf(interaction),
+      components: ticketRowsFor(services, ticket, "closed"),
+      actor: `user:${interaction.user.id}`,
+      reason: "完了表示の修復",
+    }).catch((e) => [`修復に失敗: ${(e as Error).message}`]);
+    await interaction.reply({
+      content:
+        problems.length === 0
+          ? "このチケットは既にクローズ済みです。表示を完了状態に直しました。"
+          : `このチケットは既にクローズ済みです。表示の修復に一部失敗しました:\n${problems.map((p) => `・${p}`).join("\n")}`,
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
   await interaction.reply({
