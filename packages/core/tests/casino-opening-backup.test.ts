@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, afterEach, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { Ledger, TREASURY } from "../src/ledger/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
@@ -34,8 +34,14 @@ afterEach(() => {
 
 describe("databaseIdentity", () => {
   it("同一DB内容なら同じ識別子、別DBなら異なる", () => {
+    // 識別子には sys:treasury の作成時刻（**秒単位**）が入る。2つのDBを作る間に
+    // 秒が跨ると、中身が同じでも別物と判定されて落ちる。実機の速さで結果が
+    // 変わってしまうので、比較する2つは同じ時刻で作る
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
     const a = setup();
     const b = setup();
+    vi.useRealTimers();
     expect(databaseIdentity(a.db)).toBe(databaseIdentity(b.db));
 
     const c = openDb(":memory:");
