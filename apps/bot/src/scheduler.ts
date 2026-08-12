@@ -10,6 +10,7 @@ import { updateDashboard } from "./dashboard.js";
 import { updateWaitersBoard } from "./waiters-board.js";
 import { tickVoiceXp } from "./rank-tracker.js";
 import { fmtLd } from "./format.js";
+import { entryOpsChannelId } from "./entry-channels.js";
 import { announceAutoClose, announceSettle, refreshMarketPanel } from "./commands/ita.js";
 import { ticketStaffRoleIds } from "./commands/tickets.js";
 import { isSeatOccupied } from "./casino/common.js";
@@ -509,7 +510,8 @@ export async function sendSessionNotification(
   startHour: number,
   kind: "30m" | "5m",
 ): Promise<void> {
-  const guideId = services.settings.getString("channel:entry_guide");
+  // 運用側のチャンネルへ出す（未設定なら従来どおり案内側）
+  const guideId = entryOpsChannelId(services);
   if (!guideId) throw new Error("session_notify:channel_entry_guide_missing");
   const waitRoleId = services.settings.getString("role:queue_wait");
   const ch = await client.channels.fetch(guideId).catch((e) => {

@@ -39,6 +39,7 @@ import { jstNow, nextSessionStart } from "../scheduler.js";
 import { refreshWaitersBoard } from "../waiters-board.js";
 import { scheduleRankReconcile, touchesRankRoles } from "../rank-sync.js";
 import { withUserLock } from "../user-lock.js";
+import { entryOpsChannelId } from "../entry-channels.js";
 import { returnPanelLink, returnWelcomeMessage } from "./entry-return.js";
 import type { Services } from "../services.js";
 
@@ -1241,7 +1242,8 @@ async function openFlexTicket(
   userId: string,
 ): Promise<void> {
   const guild = interaction.guild!;
-  const guideId = services.settings.getString("channel:entry_guide");
+  // スレッドは運用側に作る（未設定なら従来どおり案内側）
+  const guideId = entryOpsChannelId(services);
   const guide = guideId ? await guild.channels.fetch(guideId).catch(() => null) : null;
   const base = (guide?.isTextBased() ? guide : interaction.channel) as TextChannel | null;
   if (!base || !("threads" in base)) {
