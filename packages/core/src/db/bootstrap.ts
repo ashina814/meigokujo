@@ -754,6 +754,9 @@ CREATE TABLE IF NOT EXISTS member_names (
   -- 名前を変えたら承認も消える（別の名前は見ていないため）
   flag_ok_at     INTEGER,
   flag_ok_by     TEXT,
+  -- 承認した時点で「実際に当たっていた要確認語」。あとから別の要確認語が
+  -- 増えたとき、**門番が見ていない語まで承認済みに見えてしまう**のを防ぐ
+  flag_ok_words  TEXT,
   set_via        TEXT NOT NULL,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL
@@ -789,6 +792,8 @@ export function openDb(path: string): Database.Database {
   // マイグレーション: 旧カジノの chip_balances は ether_balances に置き換え（旧カジノは開帳前に廃止＝データ無し）
   db.exec("DROP TABLE IF EXISTS chip_balances");
   db.exec(DDL);
+  // 既に member_names がある本番へ後から足す（承認済みの語を記録する列）
+  ensureColumn(db, "member_names", "flag_ok_words", "TEXT");
   ensureColumn(db, "casino_tx", "op_key", "TEXT");
   ensureColumn(db, "casino_tx", "op_actor_id", "TEXT");
   backfillChipTxOperationKey(db);

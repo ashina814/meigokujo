@@ -22,6 +22,7 @@ export interface MemberNameRow {
   locked_at: number | null;
   flag_ok_at: number | null;
   flag_ok_by: string | null;
+  flag_ok_words: string | null;
   set_via: NameSetVia;
   created_at: number;
   updated_at: number;
@@ -60,8 +61,9 @@ export type ClaimResult =
  * **一括合格には含めない。** 門番が目で見て通したときだけ `ok` になる。
  */
 export type NameStatus =
-  | { kind: "ok"; nickname: string; flagged: string | null }
-  | { kind: "review"; nickname: string; flagged: string }
+  /** `flagged` は**いま当たっている要確認語すべて**。門番はこれを全部見て通す */
+  | { kind: "ok"; nickname: string; flagged: string[] }
+  | { kind: "review"; nickname: string; flagged: string[] }
   | { kind: "violation"; nickname: string; reason: string }
   | { kind: "unset" };
 
@@ -164,6 +166,31 @@ export class Nicknames {
   }
 
   /**
+   * その名前に当たっている**要確認語をすべて**返す（並びは安定させる）。
+   *
+   * 承認は「この語を見たうえで通した」という記録なので、当たっている語の集合が
+   * 変われば承認は無効になる。1件だけ覚えると、**あとから増えた語を門番が
+   * 見ないまま通った状態**になってしまう。
+   */
+  /** 承認時に記録した語。読めなければ「何も見ていない」として扱う（安全側） */
+  private parseWords(raw: string | null): string[] {
+    if (!raw) return [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+
+  flaggedWords(key: string): string[] {
+    return this.listDenyWords()
+      .filter((w) => w.action === "flag" && w.pattern && key.includes(w.pattern))
+      .map((w) => w.pattern)
+      .sort();
+  }
+
+  /**
    * 禁止語に触れているか。判定は**正規化済みの鍵に対する部分一致**だけ。
    *
    * **`reject` を優先する。** 最初に見つかった1件で決めると、`flag` の語が
@@ -248,12 +275,13 @@ export class Nicknames {
       const keepApproval = previousName?.nickname === nickname;
       this.db
         .prepare(
-          `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, flag_ok_at, flag_ok_by, set_via, created_at, updated_at)
-           VALUES (?,?,?,'registered',?,?,?,?,?,?,?)
+          `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, flag_ok_at, flag_ok_by, flag_ok_words, set_via, created_at, updated_at)
+           VALUES (?,?,?,'registered',?,?,?,?,?,?,?,?)
            ON CONFLICT(user_id) DO UPDATE SET
              nickname = excluded.nickname, name_key = excluded.name_key, state = 'registered',
              policy_version = excluded.policy_version, flag_ok_at = excluded.flag_ok_at,
-             flag_ok_by = excluded.flag_ok_by, set_via = excluded.set_via, updated_at = excluded.updated_at`,
+             flag_ok_by = excluded.flag_ok_by, flag_ok_words = excluded.flag_ok_words,
+             set_via = excluded.set_via, updated_at = excluded.updated_at`,
         )
         .run(
           input.userId,
@@ -263,6 +291,7 @@ export class Nicknames {
           previousName?.locked_at ?? null,
           keepApproval ? (previousName?.flag_ok_at ?? null) : null,
           keepApproval ? (previousName?.flag_ok_by ?? null) : null,
+          keepApproval ? (previousName?.flag_ok_words ?? null) : null,
           input.setVia,
           previousName?.created_at ?? ts,
           ts,
@@ -303,8 +332,8 @@ export class Nicknames {
       if (p) {
         this.db
           .prepare(
-            `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, flag_ok_at, flag_ok_by, set_via, created_at, updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+            `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, flag_ok_at, flag_ok_by, flag_ok_words, set_via, created_at, updated_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
           )
           .run(
             p.user_id,
@@ -315,6 +344,7 @@ export class Nicknames {
             p.locked_at,
             p.flag_ok_at,
             p.flag_ok_by,
+            p.flag_ok_words,
             p.set_via,
             p.created_at,
             p.updated_at,
@@ -358,11 +388,20 @@ export class Nicknames {
     }
     const evaluated = this.evaluate(row.nickname);
     if (!evaluated.ok) return { kind: "violation", nickname: row.nickname, reason: "名前の規則に合いません" };
-    // flag は自動では通さない。**門番が見て許可するまで保留**
-    if (evaluated.flagged && !row.flag_ok_at) {
-      return { kind: "review", nickname: row.nickname, flagged: evaluated.flagged };
+    // flag は自動では通さない。**門番が見て許可するまで保留**。
+    //
+    // 許可済みでも、**門番が見ていない語が増えていれば保留へ戻す**。判定は
+    // 「いま当たっている語 ⊆ 承認したときに見た語」。完全一致にすると、
+    // 語が消えて規則が緩くなっただけでも再確認を強いることになる
+    const current = this.flaggedWords(evaluated.key);
+    if (current.length > 0) {
+      const approved = new Set(row.flag_ok_at ? this.parseWords(row.flag_ok_words) : []);
+      const unreviewed = current.filter((w) => !approved.has(w));
+      if (unreviewed.length > 0) {
+        return { kind: "review", nickname: row.nickname, flagged: current };
+      }
     }
-    return { kind: "ok", nickname: row.nickname, flagged: evaluated.flagged };
+    return { kind: "ok", nickname: row.nickname, flagged: current };
   }
 
   /**
@@ -375,13 +414,20 @@ export class Nicknames {
     const status = this.status(userId);
     if (status.kind !== "review") return false;
     const ts = now();
+    // **これまでに見た語へ積む。** 一度見た語は、消えて戻ってきても見た事実が残る。
+    // いま当たっている語だけで上書きすると、その履歴を毎回捨てることになる
+    const row = this.get(userId);
+    const prior = row?.flag_ok_at ? this.parseWords(row.flag_ok_words) : [];
+    const words = JSON.stringify(
+      [...new Set([...prior, ...this.flaggedWords(nicknameKey(status.nickname))])].sort(),
+    );
     this.db
-      .prepare("UPDATE member_names SET flag_ok_at = ?, flag_ok_by = ?, updated_at = ? WHERE user_id = ?")
-      .run(ts, actor, ts, userId);
+      .prepare("UPDATE member_names SET flag_ok_at = ?, flag_ok_by = ?, flag_ok_words = ?, updated_at = ? WHERE user_id = ?")
+      .run(ts, actor, words, ts, userId);
     this.events.log("nickname_flag_approved", {
       actor,
       target: userId,
-      payload: { nickname: status.nickname, flagged: status.flagged },
+      payload: { nickname: status.nickname, flagged: status.flagged, words },
     });
     return true;
   }
@@ -489,8 +535,8 @@ export class Nicknames {
   ): void {
     this.db
       .prepare(
-        `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, flag_ok_at, flag_ok_by, set_via, created_at, updated_at)
-         VALUES (?,?,?,?,NULL,?,NULL,NULL,'staff',?,?)
+        `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, flag_ok_at, flag_ok_by, flag_ok_words, set_via, created_at, updated_at)
+         VALUES (?,?,?,?,NULL,?,NULL,NULL,NULL,'staff',?,?)
          ON CONFLICT(user_id) DO UPDATE SET nickname = excluded.nickname, name_key = excluded.name_key,
            state = excluded.state, locked_at = excluded.locked_at, updated_at = excluded.updated_at`,
       )
