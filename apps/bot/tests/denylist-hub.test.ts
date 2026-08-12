@@ -357,3 +357,42 @@ describe("確認画面と中身の紐づけ", () => {
     ctx.db.close();
   });
 });
+
+describe("確認の期限", () => {
+  it("**15分を過ぎた確認は、押しても登録されない**（新しい確認が作られなくても切れる）", async () => {
+    const { handleDenywordModal, handleDenywordButton } = await hubModule;
+    const ctx = setup();
+    ctx.nicknames.importLegacy([{ userId: "u1", nickname: "あかり" }], "staff");
+    const m = modal("reject", "あか");
+    await handleDenywordModal(m.interaction, ctx.services);
+    const token = tokenOf(m.reply);
+
+    // 誰も新しい確認を作らないまま16分が過ぎた
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(Date.now() + 16 * 60_000));
+    const p = press(`mgmt:denyword:confirm:${token}`);
+    await handleDenywordButton(p.interaction, ctx.services);
+    vi.useRealTimers();
+
+    expect(ctx.nicknames.listDenyWords()).toHaveLength(0);
+    expect(String((p.update.mock.calls.at(-1) as never[])[0]?.content)).toContain("期限切れ");
+    ctx.db.close();
+  });
+
+  it("15分以内なら押せる", async () => {
+    const { handleDenywordModal, handleDenywordButton } = await hubModule;
+    const ctx = setup();
+    ctx.nicknames.importLegacy([{ userId: "u1", nickname: "あかり" }], "staff");
+    const m = modal("reject", "あか");
+    await handleDenywordModal(m.interaction, ctx.services);
+    const token = tokenOf(m.reply);
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(Date.now() + 14 * 60_000));
+    await handleDenywordButton(press(`mgmt:denyword:confirm:${token}`).interaction, ctx.services);
+    vi.useRealTimers();
+
+    expect(ctx.nicknames.listDenyWords().map((w) => w.pattern)).toEqual(["あか"]);
+    ctx.db.close();
+  });
+});

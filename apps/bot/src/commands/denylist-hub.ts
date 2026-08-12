@@ -141,11 +141,21 @@ function prunePending(): void {
   for (const [token, p] of pendingAdd) if (p.createdAt < limit) pendingAdd.delete(token);
 }
 
-/** 自分の確認だけを取り出す。他人の確認は触らせない */
+/**
+ * 自分の確認だけを取り出す。他人の確認は触らせない。
+ *
+ * **期限はここでも見る。** 掃除を「新しい確認を作るとき」だけに任せると、
+ * 誰も追加しなければ古い確認が残り続け、15分どころか何時間後でも
+ * 押せてしまう。読むたびに期限を確かめ、過ぎていれば捨てる。
+ */
 function takePending(token: string | undefined, userId: string): PendingAdd | null {
   if (!token) return null;
   const pending = pendingAdd.get(token);
   if (!pending || pending.userId !== userId) return null;
+  if (Date.now() - pending.createdAt >= PENDING_TTL_MS) {
+    pendingAdd.delete(token);
+    return null;
+  }
   return pending;
 }
 
