@@ -429,7 +429,11 @@ export class Nicknames {
       const ts = now();
       for (const [key, members] of groups) {
         const existing = this.reservation(key);
-        const collides = members.length > 1 || (existing !== null && existing.kind === "member");
+        // **予約が既にあれば、種類を問わず衝突**。`kind === 'member'` だけを見ると、
+        // 誰の持ち物でもない予約（`legacy_conflict`）と同じ名前の人を後日取り込んだとき、
+        // その人だけ「重複していない名前」として記録されてしまう。
+        // 予約自体は残るので新規登録は止まるが、当人は入城の名前ゲートを通ってしまう
+        const collides = members.length > 1 || existing !== null;
         if (!collides) {
           const m = members[0]!;
           this.db

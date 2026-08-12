@@ -191,6 +191,38 @@ describe("既存の重複（legacy conflict）", () => {
     db.close();
   });
 
+  it("**後日の再取り込みで legacy_conflict の名前を持つ人が来ても conflict にする**", () => {
+    const { db, names } = withLegacyDuplicate();
+    expect(names.reservation("来世")?.kind).toBe("legacy_conflict");
+
+    // 初回取り込みの後に参加した人が、たまたま同じ名前を使っていた
+    const later = "444444444444444444";
+    const result = names.importLegacy([{ userId: later, nickname: "来世", locked: false }], "staff");
+
+    expect(names.get(later)?.state).toBe("conflict"); // legacy にしない
+    expect(names.status(later).kind).toBe("violation"); // 名前ゲートを通さない
+    expect(result.conflicted).toBe(1);
+    expect(result.imported).toBe(0);
+    // 予約は誰の持ち物でもないまま
+    expect(names.reservation("来世")?.kind).toBe("legacy_conflict");
+    expect(names.reservation("来世")?.user_id).toBeNull();
+    db.close();
+  });
+
+  it("後日の再取り込みで、他人の個人予約と同じ名前でも conflict にする", () => {
+    const { db, names } = setup();
+    names.claim({ userId: A, nickname: "ひとり", setVia: "entry", actor: "t" });
+    expect(names.reservation("ひとり")?.kind).toBe("member");
+
+    names.importLegacy([{ userId: B, nickname: "ひとり", locked: true }], "staff");
+
+    expect(names.get(B)?.state).toBe("conflict");
+    // 先に持っていた人も conflict へ落ちる（同じ名前が2人いる事実は変わらない）
+    expect(names.get(A)?.state).toBe("conflict");
+    expect(names.reservation("ひとり")?.kind).toBe("legacy_conflict");
+    db.close();
+  });
+
   it("既存の名前に記号が入っていても取り込む（取りこぼすと新規に取られる）", () => {
     const { db, names } = setup();
     const r = names.importLegacy([{ userId: A, nickname: "★星★" }], "staff");
