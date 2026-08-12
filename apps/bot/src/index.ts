@@ -61,6 +61,7 @@ import {
 } from "./commands/bank-panel.js";
 import {
   handleEntryButton,
+  handleEntryModal,
   handleMemberJoin,
   handleMemberRoleUpdate,
   handleSessionCommand,
@@ -308,6 +309,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("shokan:")) {
       await handleShokanModal(interaction, services);
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("entry:")) {
+      await handleEntryModal(interaction, services);
       return;
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("ether:")) {

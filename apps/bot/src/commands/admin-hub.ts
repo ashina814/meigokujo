@@ -74,6 +74,7 @@ import {
 } from "../casino/opening-ops.js";
 import { recoverCasinoWithPersistentTables } from "../casino/persistent-table-recovery.js";
 import { ticketPanelMessageForPanel } from "./tickets.js";
+import { handleLegacyNameImportRun, legacyNameImportConfirm, previewLegacyImport } from "../nickname-import.js";
 import type { Services } from "../services.js";
 
 /**
@@ -176,6 +177,9 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "recover" && action === "backfill-run") return void (await handleBackfillRun(interaction, services));
   if (section === "recover" && action === "legacy") return void (await interaction.update(legacyRollbackConfirm(services)));
   if (section === "recover" && action === "legacy-run") return void (await handleLegacyRollbackRun(interaction, services));
+  if (section === "recover" && action === "names")
+    return void (await interaction.update(legacyNameImportConfirm(await previewLegacyImport(interaction.guild!, services))));
+  if (section === "recover" && action === "names-run") return void (await handleLegacyNameImportRun(interaction, services));
   if (section === "setting" && action === "role-select") return void (await openRoleSetup(interaction, services));
   if (section === "setting" && action === "number-select") return void (await openNumberSetup(interaction, services));
   if (section === "setting" && action === "eval-cap") return void (await interaction.update(evaluationCapHome(services)));

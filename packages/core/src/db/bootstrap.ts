@@ -711,6 +711,61 @@ CREATE TABLE IF NOT EXISTS fiscal_runs (
   updated_at  INTEGER NOT NULL,
   UNIQUE (kind, period)
 );
+
+-- ============================================================
+-- 名前（サーバーニックネーム）の正本
+-- ============================================================
+--
+-- 唯一性は **nickname_reservations だけ**が担保する。member_names 側に
+-- UNIQUE を置かないのは、既存の重複（同じ名前の2人）をそのまま記録として
+-- 残せるようにするため。片方を消したり勝手に改名したりしない。
+
+CREATE TABLE IF NOT EXISTS nickname_reservations (
+  -- 正規化済みの鍵。**これが同名禁止の正本**で、主キーなので二重登録は
+  -- アプリの事前チェックをすり抜けても DB が必ず落とす
+  name_key   TEXT PRIMARY KEY,
+  -- member         … 特定の1人が持っている予約
+  -- legacy_conflict … **誰の持ち物でもない**。制度導入前から複数人が使っていた
+  --                   名前で、当人たちを改名させないまま新規の取得だけを止める。
+  --                   所有者を立てると、その人が改名・退出した瞬間に予約が外れ、
+  --                   まだ同じ名前で残っている人がいるのに新規へ開放されてしまう
+  kind       TEXT NOT NULL CHECK (kind IN ('member','legacy_conflict')),
+  user_id    TEXT,
+  display    TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK ((kind = 'member' AND user_id IS NOT NULL) OR (kind = 'legacy_conflict' AND user_id IS NULL))
+);
+-- 1人が2つの名前を予約したままにしない
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nickname_res_user ON nickname_reservations(user_id) WHERE user_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS member_names (
+  user_id        TEXT PRIMARY KEY,
+  nickname       TEXT NOT NULL,
+  name_key       TEXT NOT NULL,
+  -- registered … 新制度で登録した（入城の条件を満たす）
+  -- legacy     … 制度導入前からの名前を取り込んだだけ（重複なし）
+  -- conflict   … 導入前からの名前で、他の人と重なっている（予約は legacy_conflict 側）
+  state          TEXT NOT NULL CHECK (state IN ('registered','legacy','conflict')),
+  policy_version TEXT,
+  locked_at      INTEGER,
+  set_via        TEXT NOT NULL,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_member_names_key ON member_names(name_key);
+
+-- 不適切名の語彙。**コードに焼き込まない**（語を足すたびに deploy したくない）。
+-- 判定は正規化済みの鍵に対する部分一致だけ。正規表現は今は持たない
+CREATE TABLE IF NOT EXISTS nickname_denylist (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  pattern    TEXT NOT NULL UNIQUE,
+  -- reject … その場で拒否   flag … 登録は通すが門番へ⚠️で上げる（「過度な」の線引きは人が持つ）
+  action     TEXT NOT NULL DEFAULT 'reject' CHECK (action IN ('reject','flag')),
+  note       TEXT,
+  added_by   TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 `;
 
 export function openDb(path: string): Database.Database {
