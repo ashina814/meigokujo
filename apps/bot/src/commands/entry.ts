@@ -275,8 +275,10 @@ export async function handleEntryModal(interaction: ModalSubmitInteraction, serv
     if (failure !== null) {
       // **エラーが返っても、変わっていることがある**（応答が落ちた・内部で再試行された）。
       // 確かめずに巻き戻すと、Discordは新しい名前・正本は古い名前、で食い違う
+      // **見るのは `nickname`。** `displayName` はグローバル表示名も混ざるので、
+      // 実際にはニックネームが付いていないのに「変わっている」と誤認する
       const latest = await guild.members.fetch({ user: interaction.user.id, force: true }).catch(() => null);
-      if (latest?.displayName !== claimed.nickname) {
+      if (latest?.nickname !== claimed.nickname) {
         services.nicknames.rollback(claimed.snapshot, actor);
         services.events.log("nickname_set_failed", {
           actor,

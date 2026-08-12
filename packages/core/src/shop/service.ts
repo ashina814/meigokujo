@@ -10,7 +10,7 @@ import { EventLog } from "../events/service.js";
 
 export type ItemKind = "one_shot" | "monthly";
 export type DeliveryMode = "auto" | "manual";
-export type DeliveryKind = "add_role" | "extend_deadline" | "revoke_meirei" | null;
+export type DeliveryKind = "add_role" | "extend_deadline" | "set_nickname" | "revoke_meirei" | null;
 export type PurchaseStatus = "active" | "expired" | "refunded" | "cancelled";
 
 export interface ShopItemInput {
@@ -61,6 +61,8 @@ export interface PurchaseRow {
   delivered_at: number | null;
   auto_renew: number;
   delivery_snapshot_json: string | null;
+  /** 本人が入力した内容（希望ニックネームなど） */
+  request_json: string | null;
   delivery_state: DeliveryState | null;
   delivery_attempts: number;
   delivery_error: string | null;
@@ -91,7 +93,7 @@ export interface DeliverySnapshot {
  * 購入時点では status もロールも評価期間も動かさない。過去に売った購入も
  * 自動では実行しない（面談を経ずに復帰させないため）。
  */
-export const AUTO_DELIVERABLE_KINDS: ReadonlySet<string> = new Set(["add_role", "extend_deadline"]);
+export const AUTO_DELIVERABLE_KINDS: ReadonlySet<string> = new Set(["add_role", "extend_deadline", "set_nickname"]);
 /** 過去に自動配送として売られたが、いまは自動実行しない種別 */
 export const WITHDRAWN_DELIVERY_KINDS: ReadonlySet<string> = new Set(["revoke_meirei"]);
 const KNOWN_DELIVERY_KINDS: ReadonlySet<string> = new Set([...AUTO_DELIVERABLE_KINDS, ...WITHDRAWN_DELIVERY_KINDS]);
@@ -150,7 +152,9 @@ export type ShopErrorCode =
   | "ERR_NOT_ACTIVE"
   | "ERR_NOT_EXTENDABLE"
   | "ERR_TERMS_CHANGED"
-  | "ERR_SALES_LOCKED";
+  | "ERR_SALES_LOCKED"
+  | "ERR_ALREADY_DELIVERED"
+  | "ERR_REFUND_RACE";
 
 export class ShopError extends Error {
   constructor(readonly code: ShopErrorCode, readonly details: Record<string, unknown> = {}) {
@@ -364,6 +368,11 @@ export class Shop {
     actor: string;
     memberRoleIds: readonly string[];
     payAlt?: boolean; // 代替支払いを使うか（Landの代わりに price_alt を消費）
+    /**
+     * 本人が入力した内容（希望ニックネームなど）。**課金と同じトランザクションで残す。**
+     * ここに無いと、課金後にBotが落ちたとき「何をする約束だったか」が分からなくなる。
+     */
+    request?: Record<string, unknown>;
   }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
     const item = this.getItem(input.itemId);
     if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: input.itemId });
@@ -414,10 +423,20 @@ export class Shop {
     const info = this.db
       .prepare(
         `INSERT INTO shop_purchases
-         (item_id, user_id, purchased_at, expires_at, paid_land, paid_alt_kind, paid_alt_amount, status, auto_renew, delivery_snapshot_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?)`,
+         (item_id, user_id, purchased_at, expires_at, paid_land, paid_alt_kind, paid_alt_amount, status, auto_renew, delivery_snapshot_json, request_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
       )
-      .run(item.id, input.userId, ts, expiresAt, paidLand, paidAltKind, paidAltAmount, this.deliverySnapshot(item));
+      .run(
+        item.id,
+        input.userId,
+        ts,
+        expiresAt,
+        paidLand,
+        paidAltKind,
+        paidAltAmount,
+        this.deliverySnapshot(item),
+        input.request ? JSON.stringify(input.request) : null,
+      );
     if (item.stock !== null) {
       this.db.prepare("UPDATE shop_items SET stock = stock - 1, updated_at = ? WHERE id = ?").run(ts, item.id);
     }
@@ -557,6 +576,57 @@ export class Shop {
   }
 
 
+  /**
+   * 課金を取り消して返す。**サービスを提供できなかったときの収束先。**
+   *
+   * 二重返金は2つで止める: Land取引の冪等キー（UNIQUE）と、`active` からの条件付き更新。
+   * どちらかが先に成立していれば2回目は何も動かさない。
+   * 返金そのものに失敗したら例外を投げる。**そこだけが人の出番**になる。
+   */
+  refund(purchaseId: number, reason: string, actor: string): { refunded: boolean; amount: number } {
+    const run = this.db.transaction(() => {
+      const purchase = this.getPurchase(purchaseId);
+      if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
+      if (purchase.status === "refunded") return { refunded: false, amount: purchase.paid_land ?? 0 };
+      if (purchase.status !== "active") throw new ShopError("ERR_NOT_ACTIVE", { status: purchase.status });
+      // 提供済みのものは返さない（ニックネームが変わったのに返金する、を防ぐ）
+      if (purchase.delivered_at !== null || purchase.delivery_state === "delivered") {
+        throw new ShopError("ERR_ALREADY_DELIVERED", { purchaseId });
+      }
+      const amount = purchase.paid_land ?? 0;
+      if (amount > 0) {
+        const account = `user:${purchase.user_id}`;
+        this.ledger.ensureAccount(account, "user");
+        this.ledger.transfer({
+          from: TREASURY,
+          to: account,
+          amount,
+          type: "adjust",
+          actor,
+          reason: `公式ショップ返金: ${reason}`,
+          refType: "shop_refund",
+          refId: String(purchase.id),
+          idempotencyKey: `shop:refund:${purchase.id}`,
+        });
+      }
+      const updated = this.db
+        .prepare(
+          `UPDATE shop_purchases
+              SET status = 'refunded', delivery_state = 'failed', delivery_error = ?, delivery_updated_at = ?
+            WHERE id = ? AND status = 'active'`,
+        )
+        .run(`refunded:${reason}`.slice(0, 500), now(), purchase.id).changes;
+      if (updated !== 1) throw new ShopError("ERR_REFUND_RACE", { purchaseId });
+      this.events.log("shop_refunded", {
+        actor,
+        target: purchase.user_id,
+        payload: { purchaseId: purchase.id, amount, reason },
+      });
+      return { refunded: true, amount };
+    });
+    return this.db.inTransaction ? run() : run.immediate();
+  }
+
   /** 手動配送の完了マーク */
   markDelivered(purchaseId: number, actor: string): void {
     this.db
@@ -577,15 +647,43 @@ export class Shop {
    *
    * 既に `delivered` なら `already_delivered` を返す。**呼び出し側はここで打ち切る**ので、
    * 二度押し・再起動・再配送要求のいずれでも副作用が二度走らない。
+   *
+   * **返金・取消・失効した購入も打ち切る。** 課金の冪等は「同じ確認画面から二度課金しない」
+   * までしか保証しない。返金まで済んだ購入の確認画面が後から再送されると、課金は起きないまま
+   * 配送だけが走り、「返したのにサービスは提供した」が成立してしまう。status は配送の
+   * 直前に、この1文の中で確かめる。
    */
-  beginDelivery(purchaseId: number): { proceed: boolean; state: DeliveryState; attempts: number } {
+  beginDelivery(purchaseId: number): {
+    proceed: boolean;
+    state: DeliveryState;
+    attempts: number;
+    reason?: "delivered" | "not_active";
+    status?: PurchaseStatus;
+  } {
     const begin = this.db.transaction(() => {
       const row = this.db
-        .prepare("SELECT delivery_state, delivery_attempts FROM shop_purchases WHERE id = ?")
-        .get(purchaseId) as { delivery_state: DeliveryState | null; delivery_attempts: number } | undefined;
+        .prepare("SELECT status, delivery_state, delivery_attempts FROM shop_purchases WHERE id = ?")
+        .get(purchaseId) as
+        | { status: PurchaseStatus; delivery_state: DeliveryState | null; delivery_attempts: number }
+        | undefined;
       if (!row) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
       if (row.delivery_state === "delivered") {
-        return { proceed: false, state: "delivered" as DeliveryState, attempts: row.delivery_attempts };
+        return {
+          proceed: false,
+          state: "delivered" as DeliveryState,
+          attempts: row.delivery_attempts,
+          reason: "delivered" as const,
+          status: row.status,
+        };
+      }
+      if (row.status !== "active") {
+        return {
+          proceed: false,
+          state: row.delivery_state ?? ("pending" as DeliveryState),
+          attempts: row.delivery_attempts,
+          reason: "not_active" as const,
+          status: row.status,
+        };
       }
       const attempts = row.delivery_attempts + 1;
       this.db
@@ -628,14 +726,18 @@ export class Shop {
    *
    * `extend_deadline` のように冪等でない配送があるので、効果とマークが割れると
    * 再試行で二重に効いてしまう。効果の書き込みを `effect` に渡してもらい、まとめて確定する。
+   *
+   * **有効な購入にしか配送済みの印を付けない。** 返金・取消・失効した購入が
+   * `delivered` になると、「返したのに提供した」が帳簿の上で成立してしまう。
    */
   completeDeliveryWith(purchaseId: number, actor: string, effect: () => void): boolean {
     const run = this.db.transaction(() => {
-      const row = this.db.prepare("SELECT delivery_state FROM shop_purchases WHERE id = ?").get(purchaseId) as
-        | { delivery_state: DeliveryState | null }
+      const row = this.db.prepare("SELECT status, delivery_state FROM shop_purchases WHERE id = ?").get(purchaseId) as
+        | { status: PurchaseStatus; delivery_state: DeliveryState | null }
         | undefined;
       if (!row) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
       if (row.delivery_state === "delivered") return false; // 競合した二重実行。効果を走らせない
+      if (row.status !== "active") return false; // 返金・取消・失効した購入。効果を走らせない
       effect();
       this.db
         .prepare(
@@ -683,9 +785,10 @@ export class Shop {
   /**
    * 人が対応しないと終わらない購入（運営の作業キュー）。
    *
-   * 「手動配送の商品で、まだ配送済みになっていない購入」。**通知が流れても
-   * ここを見れば残っている仕事が分かる**ようにするためのもので、通知メッセージを
-   * 業務の正本にしない。
+   * 「**購入した時点で**手動対応だった購入のうち、まだ完了していないもの」。
+   * 商品の現在設定では決めない。あとから商品を自動化しても、**それ以前の購入は
+   * 人が終わらせるしかない**（当時の希望内容が残っていないため）ので、
+   * 自動化のたびに過去の仕事がキューから消えるのは誤り。
    *
    * 除外する商品IDは呼び出し側が決める。再評価チャレンジのように
    * 「配送する物が無く、専用フローが権利を消費する」商品を、ここへ混ぜないため。
@@ -701,7 +804,7 @@ export class Shop {
            FROM shop_purchases p
            JOIN shop_items i ON i.id = p.item_id
           WHERE p.status = 'active'
-            AND i.delivery = 'manual'
+            AND p.delivery_snapshot_json IS NULL
             AND p.delivered_at IS NULL
             ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}
           ORDER BY p.purchased_at
@@ -718,7 +821,7 @@ export class Shop {
       .prepare(
         `SELECT COUNT(*) AS c
            FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
-          WHERE p.status = 'active' AND i.delivery = 'manual' AND p.delivered_at IS NULL
+          WHERE p.status = 'active' AND p.delivery_snapshot_json IS NULL AND p.delivered_at IS NULL
             ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}`,
       )
       .get(...exclude) as { c: number };
@@ -736,8 +839,15 @@ export class Shop {
    * **対象かどうかは購入時スナップショットで決める。** 商品の現在設定を根拠にすると、
    * 買った後に商品を自動配送へ変えただけで過去の購入が再配送候補になってしまう。
    * スナップショットを持たない旧購入（手動配送・列の導入前）はここに出さない。
+   *
+   * `kinds` を指定すると、その配送種別だけを返す。**絞り込みは `limit` より先に効く。**
+   * 呼び出し側が全種別を取ってから種別で filter すると、他種別の失敗が上限ぶん溜まった
+   * だけで対象が1件も残らず、その種別の収束が永久に止まる。
    */
-  listUndeliveredAuto(limit = 50): Array<PurchaseRow & { item_name: string }> {
+  listUndeliveredAuto(
+    limit = 50,
+    opts: { kinds?: readonly string[] } = {},
+  ): Array<PurchaseRow & { item_name: string }> {
     const rows = this.db
       .prepare(
         `SELECT p.*, i.name AS item_name
@@ -753,7 +863,8 @@ export class Shop {
       .filter((p) => {
         const snapshot = parseDeliverySnapshot(p.delivery_snapshot_json);
         // 撤回された種別は運営にも再配送させない（面談を経ない復帰を作らない）
-        return snapshot !== null && AUTO_DELIVERABLE_KINDS.has(snapshot.delivery_kind);
+        if (snapshot === null || !AUTO_DELIVERABLE_KINDS.has(snapshot.delivery_kind)) return false;
+        return opts.kinds ? opts.kinds.includes(snapshot.delivery_kind) : true;
       })
       .slice(0, limit);
   }

@@ -1,4 +1,4 @@
-export { openDb } from "./db/bootstrap.js";
+export { openDb, applyNicknameItemSetting } from "./db/bootstrap.js";
 export { LedgerError, type LedgerErrorCode } from "./ledger/errors.js";
 export {
   registerTxType,
@@ -50,6 +50,7 @@ export {
   type LegacyNameEntry,
   type MemberNameRow,
   type NameSetVia,
+  type NameRestorePoint,
   type NameSnapshot,
   type NameState,
   type NameStatus,

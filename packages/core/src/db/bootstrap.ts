@@ -732,12 +732,17 @@ CREATE TABLE IF NOT EXISTS nickname_reservations (
   kind       TEXT NOT NULL CHECK (kind IN ('member','legacy_conflict')),
   user_id    TEXT,
   display    TEXT NOT NULL,
+  -- 改名の途中で押さえている予約。**旧名を手放す前に新名を確保する**ために使う。
+  -- 商館の改名は「新名を仮押さえ → Discord変更 → 成功したら旧名を解放」の順で進む。
+  -- 先に旧名を解放すると、Discord変更に失敗して戻すときには他の人に取られている
+  staged_for_purchase INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   CHECK ((kind = 'member' AND user_id IS NOT NULL) OR (kind = 'legacy_conflict' AND user_id IS NULL))
 );
--- 1人が2つの名前を予約したままにしない
-CREATE UNIQUE INDEX IF NOT EXISTS idx_nickname_res_user ON nickname_reservations(user_id) WHERE user_id IS NOT NULL;
+-- 確定済みの予約は1人1つ。仮押さえ（staged_for_purchase あり）は数えない
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nickname_res_user_committed
+  ON nickname_reservations(user_id) WHERE user_id IS NOT NULL AND staged_for_purchase IS NULL;
 
 CREATE TABLE IF NOT EXISTS member_names (
   user_id        TEXT PRIMARY KEY,
@@ -794,6 +799,14 @@ export function openDb(path: string): Database.Database {
   db.exec(DDL);
   // 既に member_names がある本番へ後から足す（承認済みの語を記録する列）
   ensureColumn(db, "member_names", "flag_ok_words", "TEXT");
+  // 改名の仮押さえ列。旧い一意制約（1人1予約）は仮押さえを許さないので張り替える
+  ensureColumn(db, "nickname_reservations", "staged_for_purchase", "INTEGER");
+  db.exec("DROP INDEX IF EXISTS idx_nickname_res_user");
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_nickname_res_user_committed ON nickname_reservations(user_id) WHERE user_id IS NOT NULL AND staged_for_purchase IS NULL",
+  );
+  ensureColumn(db, "shop_purchases", "request_json", "TEXT");
+  applyNicknameItemSetting(db);
   ensureColumn(db, "casino_tx", "op_key", "TEXT");
   ensureColumn(db, "casino_tx", "op_actor_id", "TEXT");
   backfillChipTxOperationKey(db);
@@ -1198,6 +1211,31 @@ function migrateMonthlyToThirtyDayTerms(db: Database.Database): void {
     );
   });
   run.immediate();
+}
+
+/**
+ * 名前変更をセルフサービスへ切り替える（運営が有効化したときだけ）。
+ *
+ * `shop:nickname_item_id` が指す商品を「Botが自分で処理する商品」にする。
+ * **設定が無ければ何もしない**ので、コードを入れただけでは挙動が変わらない。
+ *
+ * ## 反映のタイミング
+ *
+ * ここは `openDb()` の中、つまり**起動時にだけ**走る。設定を入れただけでは
+ * 商品は切り替わらず、**Botの再起動（deploy で自動）で反映**される。
+ * 起動を待たずに反映したい場合は、設定を書いたあとにこの関数を直接呼ぶ。
+ */
+export function applyNicknameItemSetting(db: Database.Database): void {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'shop:nickname_item_id'").get() as
+    | { value: string }
+    | undefined;
+  const itemId = Number(row?.value);
+  if (!Number.isInteger(itemId) || itemId <= 0) return;
+  db.prepare(
+    `UPDATE shop_items
+        SET delivery = 'auto', delivery_kind = 'set_nickname', updated_at = ?
+      WHERE id = ? AND (delivery <> 'auto' OR delivery_kind IS NOT 'set_nickname')`,
+  ).run(Math.floor(Date.now() / 1000), itemId);
 }
 
 function ensureColumn(db: Database.Database, table: string, column: string, definition: string): void {

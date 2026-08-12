@@ -427,7 +427,7 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
     // 撤回済みの配送種別は古いボタンから実行できない
     const outcome = await redeliverPurchase(services, interaction.guild, id, `user:${interaction.user.id}`);
     await interaction.reply({
-      content: `${outcome.state === "failed" ? "⚠️" : "✅"} 購入 #${id}: ${outcome.message}`,
+      content: `${outcome.state === "failed" ? "⚠️" : outcome.state === "delivered" ? "✅" : "ℹ️"} 購入 #${id}: ${outcome.message}`,
       flags: MessageFlags.Ephemeral,
     });
     await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);

@@ -1,0 +1,102 @@
+import type { Client, Guild } from "discord.js";
+import { ShopError, type PurchaseRow } from "@meigokujo/core";
+import { refreshShopAdminPanels } from "./commands/shokan.js";
+import {
+  deliverPurchaseUnlocked,
+  withNicknameSerialization,
+  withPurchaseLock,
+  type DeliveryOutcome,
+} from "./shop-delivery.js";
+import type { Services } from "./services.js";
+
+/**
+ * 返金の結末。
+ *
+ * - `refunded` … 返した（既に返金済みだった場合も含む）
+ * - `already_delivered` … サービスは提供済みだった。**返さないのが正しい**
+ * - `escalated` … 返金そのものに失敗した。**ここだけが人の出番**
+ */
+export type RefundOutcome = "refunded" | "already_delivered" | "escalated";
+
+/** 配送の結果と、失敗したときの後始末。`refund` は配送が失敗したときだけ付く */
+export interface Settlement {
+  outcome: DeliveryOutcome;
+  refund?: RefundOutcome;
+}
+
+/**
+ * 配って、駄目なら返す。**ここまでを1つの区間として直列化する。**
+ *
+ * 配送だけを直列化しても足りない。失敗した1本目が返金を書き込むより先に2本目が
+ * 走ると、2本目は「まだ有効な購入」を見てサービスを提供してしまい、直後に1本目の
+ * 返金が通る——**変えたうえで返した**が成立する。返金までロックの中に入れると、
+ * 2本目は必ず「返金済み」を見て何もしない。
+ */
+export function deliverOrRefund(
+  client: Client,
+  services: Services,
+  guild: Guild | null,
+  purchase: PurchaseRow,
+  actor: string,
+): Promise<Settlement> {
+  return withNicknameSerialization(purchase, () =>
+    withPurchaseLock(purchase.id, async () => {
+      const outcome = await deliverPurchaseUnlocked(services, guild, purchase, actor);
+      if (outcome.state !== "failed") return { outcome };
+      const refund = await refundOrEscalate(client, services, purchase, outcome.error ?? "delivery_failed", actor);
+      return { outcome, refund };
+    }),
+  );
+}
+
+/**
+ * 配送できなかった課金を返す。**返金まで失敗したときだけ**運営へ上げる。
+ *
+ * 利用者から見た約束は「変わらなかったなら払っていない」なので、返金が通る限り
+ * スタッフの仕事を作らない。通らなかったときは、放っておくと利用者が払っただけに
+ * なるので、管理パネルを更新したうえで**ボタンの無い**通知を出す。
+ * 操作は管理パネル（正本）に集約し、通知メッセージを業務の入口にしない。
+ */
+export async function refundOrEscalate(
+  client: Client,
+  services: Services,
+  purchase: { id: number; user_id: string },
+  reason: string,
+  actor: string,
+): Promise<RefundOutcome> {
+  try {
+    services.shop.refund(purchase.id, reason, actor);
+    return "refunded";
+  } catch (error) {
+    if (error instanceof ShopError && error.code === "ERR_ALREADY_DELIVERED") {
+      // 配送が先に確定していた。返さないのが正しいので、人も呼ばない
+      services.events.log("shop_refund_skipped_delivered", {
+        actor,
+        target: purchase.user_id,
+        payload: { purchaseId: purchase.id, reason },
+      });
+      return "already_delivered";
+    }
+    services.events.log("shop_refund_failed", {
+      actor,
+      target: purchase.user_id,
+      payload: { purchaseId: purchase.id, reason, error: (error as Error).message },
+    });
+    await refreshShopAdminPanels(client, services).catch(() => undefined);
+    await notifyRefundFailure(client, services, purchase.id).catch(() => undefined);
+    return "escalated";
+  }
+}
+
+async function notifyRefundFailure(client: Client, services: Services, purchaseId: number): Promise<void> {
+  const channelId = services.settings.getString("channel:shokan") ?? services.settings.getString("channel:kessai");
+  if (!channelId) return;
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased() || !("send" in channel)) return;
+  await channel
+    .send({
+      content: `⚠️ **返金に失敗しました**（購入 #${purchaseId}）。商館の管理パネルの「処理失敗」から確認してください。`,
+      allowedMentions: { parse: [] },
+    })
+    .catch(() => undefined);
+}

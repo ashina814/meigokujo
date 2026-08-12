@@ -143,7 +143,9 @@ export async function handleRedeliver(interaction: StringSelectMenuInteraction, 
       ? `✅ 購入 #${purchaseId} の配送が完了しました。`
       : outcome.state === "already_delivered"
         ? `ℹ️ 購入 #${purchaseId} は既に配送済みです。何もしていません。`
-        : `⚠️ 購入 #${purchaseId} の再配送に失敗しました（\`${outcome.error ?? "unknown"}\`）。状態は failed のまま残るので、原因を直してからもう一度実行できます。`;
+        : outcome.state === "not_active"
+          ? `ℹ️ 購入 #${purchaseId} は有効な購入ではありません。何もしていません。`
+          : `⚠️ 購入 #${purchaseId} の再配送に失敗しました（\`${outcome.error ?? "unknown"}\`）。状態は failed のまま残るので、原因を直してからもう一度実行できます。`;
   await interaction.update({ content: `${head}\n${outcome.message}`, embeds: [], components: [backRow()] });
 }
 

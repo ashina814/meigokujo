@@ -5,13 +5,27 @@ import {
   ButtonStyle,
   EmbedBuilder,
   MessageFlags,
+  ModalBuilder,
+  ModalSubmitInteraction,
   StringSelectMenuBuilder,
   StringSelectMenuInteraction,
+  TextInputBuilder,
+  TextInputStyle,
+  type GuildMember,
   type MessageCreateOptions,
 } from "discord.js";
-import { LedgerError, ShopError, termDays, type PurchaseRow, type ShopItemRow } from "@meigokujo/core";
+import {
+  LedgerError,
+  NICKNAME_MAX_LENGTH,
+  ShopError,
+  describeRejection,
+  termDays,
+  type PurchaseRow,
+  type ShopItemRow,
+} from "@meigokujo/core";
 import { fmtLd } from "../format.js";
-import { deliverPurchase } from "../shop-delivery.js";
+import { deliverPurchase, nicknameBlockReason } from "../shop-delivery.js";
+import { deliverOrRefund } from "../shop-refund.js";
 import { meetsRoleRequirement, requirementLabel } from "../rank-requirement.js";
 import { refreshShopAdminPanels } from "./shokan.js";
 import type { Services } from "../services.js";
@@ -144,6 +158,23 @@ function itemDetail(
     return { embeds: [embed], components: [new ActionRowBuilder<ButtonBuilder>().addComponents(extend)] };
   }
 
+  // 名前変更は「買う」ではなく「名前を変える」。入力→確認→完了で終わらせる
+  if (isNicknameItem(item) && item.price_land !== null) {
+    return {
+      embeds: [embed],
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`shop:nick:${item.id}`)
+            .setLabel(`名前を変える (${fmtLd(item.price_land)})`)
+            .setEmoji("✏️")
+            .setStyle(ButtonStyle.Primary)
+            .setDisabled(!userHasRole),
+        ),
+      ],
+    };
+  }
+
   const buttons: ButtonBuilder[] = [];
   if (item.price_land !== null) {
     buttons.push(
@@ -197,6 +228,132 @@ function reevalPanelLink(services: Services, guildId: string | null): string | n
   return `https://discord.com/channels/${guildId}/${panel.channelId}/${panel.messageId}`;
 }
 
+
+/** Botが自分でニックネームを変える商品か（配送種別で決める） */
+function isNicknameItem(item: ShopItemRow): boolean {
+  return item.delivery === "auto" && item.delivery_kind === "set_nickname";
+}
+
+/**
+ * いま城で名乗っている名前。**登録済みなら正本（`member_names`）を見る。**
+ *
+ * 入城の名前制度が入る前から居る人は、まだ登録が無いことがある。その場合だけ
+ * 「利用者に見えている名前」で代用する（登録が無いからといって、見えている名前と
+ * 同じ名前へ有料で変えさせない）。
+ */
+function currentName(services: Services, member: GuildMember): string {
+  return services.nicknames.get(member.id)?.nickname ?? member.displayName;
+}
+
+/**
+ * 課金前の検査を**入城パネルと同じ規則**で行う。
+ *
+ * 名前の決まり（使える文字・禁止語）と同名禁止は `NicknamePolicy` と
+ * 予約テーブルが正本。ここで独自に判定すると、**払えば規則を迂回できる**
+ * 抜け道になる。払う前に分かる不可はすべてここで止め、人を呼ばない。
+ */
+function checkNicknameBeforeCharge(
+  services: Services,
+  member: GuildMember,
+  input: string,
+): { ok: true; nickname: string } | { ok: false; message: string } {
+  const evaluated = services.nicknames.evaluate(input);
+  if (!evaluated.ok) return { ok: false, message: describeRejection(evaluated.rejection) };
+  // **確認が要る名前は自動で変えない。** 入城側では門番の確認待ちになるので、
+  // 払えば素通しになる経路を作らない。どの語で止まったかは本人に見せない
+  if (evaluated.flagged) {
+    return {
+      ok: false,
+      message: "この名前は運営の確認が必要です。別の名前をお選びいただくか、運営にご相談ください。",
+    };
+  }
+  if (evaluated.nickname === currentName(services, member)) {
+    return { ok: false, message: "いまの名前と同じです。" };
+  }
+  // 予約は名前の唯一の正本。自分がいま押さえている名前なら通す
+  const reservation = services.nicknames.reservation(evaluated.key);
+  if (reservation && !(reservation.kind === "member" && reservation.user_id === member.id)) {
+    return {
+      ok: false,
+      message:
+        reservation.kind === "legacy_conflict"
+          ? "その名前は既に城内で使われているため、お使いいただけません。別の名前をお願いします。"
+          : "その名前は既に他の方が使っています。別の名前をお願いします。",
+    };
+  }
+  return { ok: true, nickname: evaluated.nickname };
+}
+
+/**
+ * 課金前に、Botが変更できる相手かを確かめる。
+ *
+ * **ここで止めたものはスタッフの仕事にしない。** 払う前に分かることで人を呼ばない。
+ */
+function nicknamePreflight(
+  interaction: ButtonInteraction | ModalSubmitInteraction,
+): { ok: true; member: GuildMember } | { ok: false; message: string } {
+  const guild = interaction.guild;
+  const member = interaction.member as GuildMember | null;
+  if (!guild || !member) return { ok: false, message: "サーバー内で実行してください。" };
+  const blocked = nicknameBlockReason(guild, member);
+  return blocked ? { ok: false, message: blocked.message } : { ok: true, member };
+}
+
+function nicknameModal(itemId: number, current: string) {
+  return new ModalBuilder()
+    .setCustomId(`shop:nick-input:${itemId}`)
+    .setTitle("名前変更")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("nickname")
+          .setLabel("新しいサーバーニックネーム")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setPlaceholder("漢字・かな・カナ・英数字のみ（記号や空白は使えません）")
+          .setMaxLength(NICKNAME_MAX_LENGTH)
+          .setValue(current.slice(0, NICKNAME_MAX_LENGTH)),
+      ),
+    );
+}
+
+/**
+ * 変更内容と料金の確認。**ここで見せた料金を確定操作まで持たせる。**
+ *
+ * 確認画面のボタンに料金を焼き込み、確定時に商品の現在価格と突き合わせる。
+ * 確定時の価格をそのまま課金すると、確認してから押すまでの間に運営が値段を変えただけで
+ * 「見せていない額」を引くことになる。
+ */
+function nicknameConfirm(
+  services: Services,
+  item: ShopItemRow,
+  member: GuildMember,
+  wanted: string,
+  confirmationId: string,
+  opts: { priceChanged?: boolean } = {},
+) {
+  const price = item.price_land ?? 0;
+  const balance = services.ledger.balanceOf(`user:${member.id}`);
+  return {
+    content: [
+      opts.priceChanged
+        ? "⚠️ 確認したあとに料金が変わりました。**まだ引き落としていません。**新しい料金でご確認ください。"
+        : "✏️ サーバーニックネームを変更します。",
+      `**${currentName(services, member)}** → **${wanted}**`,
+      `料金 **${fmtLd(price)}** ／ 残高 ${fmtLd(balance)}`,
+    ].join("\n"),
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          // 同じ確認画面からの実行は同じ操作IDになる（二重課金しない）
+          .setCustomId(`shop:nick-do:${item.id}:${confirmationId}:${price}:${wanted}`)
+          .setLabel("変更する")
+          .setStyle(ButtonStyle.Success),
+      ),
+    ],
+  };
+}
+
 type PurchaseOutcome = ReturnType<Services["shop"]["purchase"]> & { replayed?: boolean };
 
 function purchaseOnce(
@@ -208,6 +365,8 @@ function purchaseOnce(
     actor: string;
     memberRoleIds: readonly string[];
     mode: "land" | "alt";
+    /** 本人が入力した内容。課金と同じトランザクションで購入行へ残す */
+    request?: Record<string, unknown>;
   },
 ): PurchaseOutcome {
   const execute = services.db.transaction(() => {
@@ -243,6 +402,7 @@ function purchaseOnce(
       actor: input.actor,
       memberRoleIds: input.memberRoleIds,
       payAlt: input.mode === "alt",
+      request: input.request,
     });
     services.db.prepare(
       `UPDATE shop_purchase_operations
@@ -408,6 +568,105 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       else components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(button));
     }
     await interaction.reply({ embeds: [embed], components, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+
+  // ── 名前変更（セルフサービス）──
+  // 押す → 入力 → 金額と内容を確認 → 変更する、で終わり。
+  // 課金前に分かる不可（所有者・ロール階層）はここで止め、人を呼ばない
+  if (action === "nick") {
+    const itemId = Number(parts[2]);
+    const item = services.shop.getItem(itemId);
+    if (!item || !item.enabled || !isNicknameItem(item)) {
+      await interaction.reply({ content: "この商品はいま購入できません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const pre = nicknamePreflight(interaction);
+    if (!pre.ok) {
+      await interaction.reply({ content: `⚠️ ${pre.message}`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.showModal(nicknameModal(itemId, currentName(services, pre.member)));
+    return;
+  }
+
+  if (action === "nick-do") {
+    const itemId = Number(parts[2]);
+    const confirmationId = parts[3] ?? "";
+    const quotedPrice = Number(parts[4]);
+    const wanted = parts.slice(5).join(":");
+    const item = services.shop.getItem(itemId);
+    if (!item || !item.enabled || !isNicknameItem(item) || item.price_land === null) {
+      await interaction.update({ content: "この商品はいま購入できません。", embeds: [], components: [] });
+      return;
+    }
+    const pre = nicknamePreflight(interaction);
+    if (!pre.ok) {
+      await interaction.update({ content: `⚠️ ${pre.message}`, embeds: [], components: [] });
+      return;
+    }
+    // 確定の直前にもう一度検める。確認してから押すまでに、他の人がその名前を
+    // 取っていたり、禁止語が増えていたりする
+    const checked = checkNicknameBeforeCharge(services, pre.member, wanted);
+    if (!checked.ok) {
+      await interaction.update({ content: `⚠️ ${checked.message}`, embeds: [], components: [] });
+      return;
+    }
+    // **確認した料金でしか引き落とさない。** 変わっていたら課金せず、新しい料金で確認し直す。
+    // 別の料金になる以上、確認IDも取り直す（前の確認への同意を流用しない）
+    if (!Number.isInteger(quotedPrice) || quotedPrice !== item.price_land) {
+      await interaction.update({
+        ...nicknameConfirm(services, item, pre.member, wanted, interaction.id, { priceChanged: true }),
+        embeds: [],
+      });
+      return;
+    }
+    await interaction.deferUpdate();
+
+    let purchase: PurchaseOutcome;
+    try {
+      // 課金・購入行・希望内容を1トランザクションで確定する。
+      // ここで落ちれば何も残らない（＝二重課金にならない）
+      purchase = purchaseOnce(services, {
+        operationId: confirmationId,
+        itemId,
+        userId: interaction.user.id,
+        actor: `user:${interaction.user.id}`,
+        memberRoleIds: [...pre.member.roles.cache.keys()],
+        mode: "land",
+        request: { nickname: wanted },
+      });
+    } catch (error) {
+      await interaction.editReply({ content: `❌ ${purchaseErrorMessage(error, services)}`, embeds: [], components: [] });
+      return;
+    }
+
+    // 変更できなかったときは**自分で返して終わらせる**（ここでスタッフを呼ばない）。
+    // 配送と返金は同じ区間で行われるので、同時押しでも「変えたうえで返す」にならない
+    const { outcome, refund } = await deliverOrRefund(
+      interaction.client,
+      services,
+      interaction.guild,
+      purchase.purchase,
+      `user:${interaction.user.id}`,
+    );
+    if (outcome.state === "not_active") {
+      // 返金・取消済みの購入への再送。名前は変えていないし、返金もしない
+      await interaction.editReply({ content: `⚠️ ${outcome.message}`, embeds: [], components: [] });
+      return;
+    }
+    if (outcome.state !== "failed") {
+      await interaction.editReply({ content: `✅ ${outcome.message}`, embeds: [], components: [] });
+      return;
+    }
+    const content =
+      refund === "refunded"
+        ? `変更できなかったため、${fmtLd(purchase.purchase.paid_land ?? 0)}は返金しました。\n-# ${outcome.message}`
+        : refund === "already_delivered"
+          ? `✅ 名前の変更は完了しています。`
+          : `⚠️ 変更に失敗し、返金も完了できませんでした。運営が対応します（購入 #${purchase.purchase.id}）。\n-# ${outcome.message}`;
+    await interaction.editReply({ content, embeds: [], components: [] });
     return;
   }
 
@@ -704,4 +963,31 @@ async function notifyStaffForDelivery(
       allowedMentions: { users: [interaction.user.id] },
     })
     .catch(() => undefined);
+}
+
+/** 名前変更の入力を受け取り、金額と変更内容を確認する */
+export async function handleShopModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
+  const parts = interaction.customId.split(":");
+  if (parts[1] !== "nick-input") return;
+  const itemId = Number(parts[2]);
+  const item = services.shop.getItem(itemId);
+  if (!item || !item.enabled || !isNicknameItem(item) || item.price_land === null) {
+    await interaction.reply({ content: "この商品はいま購入できません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const pre = nicknamePreflight(interaction);
+  if (!pre.ok) {
+    await interaction.reply({ content: `⚠️ ${pre.message}`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const wanted = interaction.fields.getTextInputValue("nickname").trim();
+  const checked = checkNicknameBeforeCharge(services, pre.member, wanted);
+  if (!checked.ok) {
+    await interaction.reply({ content: `⚠️ ${checked.message}`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.reply({
+    ...nicknameConfirm(services, item, pre.member, checked.nickname, interaction.id),
+    flags: MessageFlags.Ephemeral,
+  });
 }
