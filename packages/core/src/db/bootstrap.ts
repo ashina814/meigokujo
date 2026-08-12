@@ -740,9 +740,8 @@ CREATE TABLE IF NOT EXISTS nickname_reservations (
   updated_at INTEGER NOT NULL,
   CHECK ((kind = 'member' AND user_id IS NOT NULL) OR (kind = 'legacy_conflict' AND user_id IS NULL))
 );
--- 確定済みの予約は1人1つ。仮押さえ（staged_for_purchase あり）は数えない
-CREATE UNIQUE INDEX IF NOT EXISTS idx_nickname_res_user_committed
-  ON nickname_reservations(user_id) WHERE user_id IS NOT NULL AND staged_for_purchase IS NULL;
+-- 「確定済みは1人1つ」の索引は **DDLではなく移行側で張る**。
+-- 既存DBではこの時点でまだ staged_for_purchase 列が無く、列を参照する索引は作れない
 
 CREATE TABLE IF NOT EXISTS member_names (
   user_id        TEXT PRIMARY KEY,
