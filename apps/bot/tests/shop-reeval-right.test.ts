@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { Collection } from "discord.js";
-import { EventLog, Ledger, Settings, Shop, Tickets, openDb, registerDefaultTxTypes } from "@meigokujo/core";
+import { EventLog, Ledger, OriginalRoles, Settings, Shop, Tickets, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 
 /**
@@ -59,7 +59,8 @@ function setup() {
   settings.set("shop:reeval_item_id", reeval.id, "staff");
   settings.set("role:admin", ADMIN_ROLE, "staff");
   settings.set("channel:kessai", "ch-kessai", "staff");
-  const services = { db, ledger, settings, events, shop, tickets } as unknown as Services;
+  const originalRoles = new OriginalRoles(db, ledger, events);
+  const services = { db, ledger, settings, events, shop, originalRoles, tickets } as unknown as Services;
   return { db, ledger, settings, events, shop, tickets, reeval, nickname, pass, legacy, services };
 }
 

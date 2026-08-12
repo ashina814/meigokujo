@@ -11,6 +11,7 @@ import { updateWaitersBoard } from "./waiters-board.js";
 import { tickVoiceXp } from "./rank-tracker.js";
 import { fmtLd } from "./format.js";
 import { entryOpsChannelId } from "./entry-channels.js";
+import { cancelUnpaidOriginalRoles, expireOriginalRoles, notifyExpiringOriginalRoles } from "./original-role-jobs.js";
 import { announceAutoClose, announceSettle, refreshMarketPanel } from "./commands/ita.js";
 import { ticketStaffRoleIds } from "./commands/tickets.js";
 import { isSeatOccupied } from "./casino/common.js";
@@ -390,6 +391,17 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     } catch (e) {
       console.error("[ショップ] 期限予告失敗:", e);
+    }
+
+    // ── オリジナルロールの期限まわり ──
+    // 期限予告・期限切れの剥奪・未払い申請の取り消し。通知は知らせるだけで、
+    // 業務の正本は original_roles の状態
+    try {
+      await notifyExpiringOriginalRoles(client, services);
+      await expireOriginalRoles(client, services);
+      await cancelUnpaidOriginalRoles(client, services);
+    } catch (e) {
+      console.error("[オリジナルロール] 期限処理失敗:", e);
     }
 
     // ── 名前変更の未完了を収束させる ──

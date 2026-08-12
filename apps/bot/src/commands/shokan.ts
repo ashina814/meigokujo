@@ -24,6 +24,12 @@ import { fmtLd } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import { requirementLabel } from "../rank-requirement.js";
 import { redeliverPurchase } from "../shop-delivery.js";
+import {
+  decisionModal,
+  handleOriginalRoleApprove,
+  handleOriginalRoleDecision,
+  originalRoleReviewPanel,
+} from "./original-role-admin.js";
 import type { Services } from "../services.js";
 
 /**
@@ -125,6 +131,9 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
         pending + failed > 0
           ? `**残っている仕事: 要対応 ${pending}件 / 処理失敗 ${failed}件**`
           : "残っている仕事はありません。",
+        services.originalRoles.countByStatus("pending") > 0
+          ? `**オリジナルロールの申請 ${services.originalRoles.countByStatus("pending")}件** が承認待ちです。`
+          : "",
         "",
         "-# 通知は変化のお知らせです。仕事の一覧は必ずここから開けます。",
       ].join("\n"),
@@ -141,6 +150,15 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
       .setEmoji("⚠️")
       .setStyle(failed > 0 ? ButtonStyle.Danger : ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("shokan:list").setLabel("商品設定").setEmoji("📦").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("shokan:orole")
+      .setLabel(
+        services.originalRoles.countByStatus("pending") > 0
+          ? `オリジナルロール ${services.originalRoles.countByStatus("pending")}`
+          : "オリジナルロール",
+      )
+      .setEmoji("🎨")
+      .setStyle(services.originalRoles.countByStatus("pending") > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("shokan:history:0").setLabel("購入履歴").setEmoji("📜").setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row] };
@@ -343,6 +361,11 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   const action = parts[1];
   const arg = parts[2];
 
+  if (action === "orole") return void (await interaction.update(originalRoleReviewPanel(services)));
+  if (action === "orole-approve" && arg) return void (await handleOriginalRoleApprove(interaction, services, Number(arg)));
+  if (action === "orole-return" && arg) return void (await interaction.showModal(decisionModal("returned", Number(arg))));
+  if (action === "orole-reject" && arg) return void (await interaction.showModal(decisionModal("rejected", Number(arg))));
+
   // 常設パネルのボタンは**元のパネルを書き換えない**（全員に見えるため）。
   // 押した人にだけ ephemeral で出す
   const fromPanel = interaction.message.flags?.has?.(MessageFlags.Ephemeral) === false;
@@ -466,6 +489,10 @@ export async function handleShokanSelect(
 export async function handleShokanModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
   if (!canOperate(interaction, services)) return;
   const parts = interaction.customId.split(":");
+  if (parts[1] === "orole-decide") {
+    await handleOriginalRoleDecision(interaction, services);
+    return;
+  }
   if (parts[1] !== "edit-basic") return;
 
   const id = Number(parts[2]);

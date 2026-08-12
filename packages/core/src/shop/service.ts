@@ -10,7 +10,7 @@ import { EventLog } from "../events/service.js";
 
 export type ItemKind = "one_shot" | "monthly";
 export type DeliveryMode = "auto" | "manual";
-export type DeliveryKind = "add_role" | "extend_deadline" | "set_nickname" | "revoke_meirei" | null;
+export type DeliveryKind = "add_role" | "extend_deadline" | "set_nickname" | "create_original_role" | "revoke_meirei" | null;
 export type PurchaseStatus = "active" | "expired" | "refunded" | "cancelled";
 
 export interface ShopItemInput {
@@ -93,7 +93,12 @@ export interface DeliverySnapshot {
  * 購入時点では status もロールも評価期間も動かさない。過去に売った購入も
  * 自動では実行しない（面談を経ずに復帰させないため）。
  */
-export const AUTO_DELIVERABLE_KINDS: ReadonlySet<string> = new Set(["add_role", "extend_deadline", "set_nickname"]);
+export const AUTO_DELIVERABLE_KINDS: ReadonlySet<string> = new Set([
+  "add_role",
+  "extend_deadline",
+  "set_nickname",
+  "create_original_role",
+]);
 /** 過去に自動配送として売られたが、いまは自動実行しない種別 */
 export const WITHDRAWN_DELIVERY_KINDS: ReadonlySet<string> = new Set(["revoke_meirei"]);
 const KNOWN_DELIVERY_KINDS: ReadonlySet<string> = new Set([...AUTO_DELIVERABLE_KINDS, ...WITHDRAWN_DELIVERY_KINDS]);

@@ -273,6 +273,59 @@ export async function deliverPurchaseUnlocked(
       return { state: "delivered", message: `サーバーニックネームを **${wanted}** に変更しました。` };
     }
 
+    if (kind === "create_original_role") {
+      const request = parseRequest(purchase.request_json);
+      const applicationId = typeof request?.applicationId === "number" ? request.applicationId : null;
+      if (!applicationId) return fail("application_missing", "申請の記録が無いため作成できませんでした。");
+      if (!guild) return fail("guild_unavailable", "サーバー情報が取れず作成できませんでした。");
+      const application = services.originalRoles.get(applicationId);
+      if (!application) return fail("application_not_found", "申請が見つかりません。運営にお問い合わせください。");
+      if (application.user_id !== userId) return fail("application_owner_mismatch", "申請の持ち主が違います。");
+      // 落ちて再実行された場合、ロールは作れているのに契約が始まっていないことがある。
+      // **作り直さない**（同じ名前のロールが増える）。作った記録があればそれを使う
+      if (application.status === "active" && application.role_id) {
+        services.shop.markDeliverySucceeded(purchase.id, actor);
+        return { state: "delivered", message: `オリジナルロール <@&${application.role_id}> は作成済みです。` };
+      }
+      if (application.status !== "approved") {
+        return fail(`application_bad_status:${application.status}`, "この申請は承認待ちの状態ではありません。");
+      }
+      const member = await guild.members.fetch(userId).catch(() => null);
+      if (!member) return fail("member_fetch_failed", "メンバー情報の取得に失敗しました。");
+      // **危険な権限は付けない。** 見た目のためのロールなので権限は空で作る
+      const created = await guild.roles
+        .create({
+          name: application.name,
+          color: application.color ?? undefined,
+          permissions: [],
+          mentionable: false,
+          hoist: false,
+          reason: `公式ショップ: オリジナルロール作成（申請 #${application.id}）`,
+        })
+        .then((role) => role)
+        .catch((e: Error) => e.message || "unknown");
+      if (typeof created === "string") return fail(`role_create_failed:${created}`, "ロールの作成に失敗しました。");
+      const added = await member.roles
+        .add(created.id, "公式ショップ: オリジナルロール付与")
+        .then(() => true)
+        .catch((e: Error) => e.message || "unknown");
+      if (added !== true) {
+        // 付けられないロールを残さない（誰のものでもないロールが増える）
+        await created.delete("公式ショップ: 付与に失敗したため取り消し").catch(() => undefined);
+        return fail(`role_add_failed:${added}`, "ロールの付与に失敗しました。");
+      }
+      if (!services.originalRoles.activate({ id: application.id, roleId: created.id, purchaseId: purchase.id, actor })) {
+        // 競合した二重実行。作ってしまったロールは残さない
+        await created.delete("公式ショップ: 二重実行のため取り消し").catch(() => undefined);
+        return fail("activate_conflict", "契約の開始に失敗しました。運営にお問い合わせください。");
+      }
+      services.shop.markDeliverySucceeded(purchase.id, actor);
+      return {
+        state: "delivered",
+        message: `オリジナルロール <@&${created.id}> を作成しました。**30日間**ご利用いただけます。`,
+      };
+    }
+
     if (kind === "extend_deadline") {
       const days = data.days ?? 1;
       const soul = services.entry.getSoul(userId);
