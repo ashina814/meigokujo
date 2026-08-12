@@ -339,6 +339,74 @@ describe("不適切名（denylist）", () => {
     db.close();
   });
 
+  it("**あとから別の要確認語を足したら、承認は無効に戻る**（見ていない語で通さない）", () => {
+    const { db, names } = setup();
+    names.addDenyWord("あやしい", "staff", { action: "flag" });
+    names.claim({ userId: A, nickname: "あやしいことば", setVia: "entry", actor: "t" });
+    names.approveFlagged(A, "user:judge");
+    expect(names.status(A).kind).toBe("ok");
+
+    // 門番が見ていない語を追加。同じ名前にも当たる
+    names.addDenyWord("ことば", "staff", { action: "flag" });
+
+    expect(names.status(A).kind).toBe("review");
+    db.close();
+  });
+
+  it("当たらない要確認語を足しても、既存の承認は生きたまま", () => {
+    const { db, names } = setup();
+    names.addDenyWord("あやしい", "staff", { action: "flag" });
+    names.claim({ userId: A, nickname: "あやしいことば", setVia: "entry", actor: "t" });
+    names.approveFlagged(A, "user:judge");
+
+    names.addDenyWord("まったくべつ", "staff", { action: "flag" });
+
+    expect(names.status(A).kind).toBe("ok"); // 無関係な語で再確認を強いない
+    db.close();
+  });
+
+  it("承認済みの語を消したときも、承認は無効に戻る", () => {
+    const { db, names } = setup();
+    names.addDenyWord("あやしい", "staff", { action: "flag" });
+    names.addDenyWord("ことば", "staff", { action: "flag" });
+    names.claim({ userId: A, nickname: "あやしいことば", setVia: "entry", actor: "t" });
+    names.approveFlagged(A, "user:judge");
+    expect(names.status(A).kind).toBe("ok");
+
+    names.removeDenyWord("ことば", "staff");
+
+    // 当たっている語の集合が変わったので、いったん保留へ戻る
+    expect(names.status(A).kind).toBe("review");
+    names.approveFlagged(A, "user:judge");
+    expect(names.status(A).kind).toBe("ok");
+    db.close();
+  });
+
+  it("要確認語が全部消えたら、承認の有無に関わらず通る", () => {
+    const { db, names } = setup();
+    names.addDenyWord("あやしい", "staff", { action: "flag" });
+    names.claim({ userId: A, nickname: "あやしい人", setVia: "entry", actor: "t" });
+    expect(names.status(A).kind).toBe("review");
+
+    names.removeDenyWord("あやしい", "staff");
+
+    expect(names.status(A).kind).toBe("ok");
+    db.close();
+  });
+
+  it("要確認語が拒否語に変わったら、承認済みでも違反になる", () => {
+    const { db, names } = setup();
+    names.addDenyWord("あやしい", "staff", { action: "flag" });
+    names.claim({ userId: A, nickname: "あやしい人", setVia: "entry", actor: "t" });
+    names.approveFlagged(A, "user:judge");
+    expect(names.status(A).kind).toBe("ok");
+
+    names.addDenyWord("あやしい", "staff", { action: "reject" }); // 同じ語の区分を変える
+
+    expect(names.status(A).kind).toBe("violation");
+    db.close();
+  });
+
   it("同じ名前を出し直しただけなら承認は残る", () => {
     const { db, names } = setup();
     names.addDenyWord("あやしい", "staff", { action: "flag" });

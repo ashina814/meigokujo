@@ -75,6 +75,7 @@ import {
 import { recoverCasinoWithPersistentTables } from "../casino/persistent-table-recovery.js";
 import { ticketPanelMessageForPanel } from "./tickets.js";
 import { handleLegacyNameImportRun, legacyNameImportConfirm, previewLegacyImport } from "../nickname-import.js";
+import { denylistHome, handleDenywordButton, handleDenywordModal, handleDenywordRemove } from "./denylist-hub.js";
 import type { Services } from "../services.js";
 
 /**
@@ -108,6 +109,7 @@ export function renderHub(): { embeds: EmbedBuilder[]; components: ActionRowBuil
         "・**XP除外**: 発言/浮上XPを付けないチャンネル・カテゴリ",
         "・**賭場**: マモンの賭場（胴元資金・売上精算）",
         "・**回収**: 未配送の再配送・階級ロールの復元など、既存データの手当て",
+        "・**禁止語**: 名前に使えない語の管理（拒否／門番の要確認）",
       ].join("\n"),
     );
   const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -127,6 +129,7 @@ export function renderHub(): { embeds: EmbedBuilder[]; components: ActionRowBuil
   // 1行は5個まで。増やすときは必ず行を足す（超えると /管理 の描画自体が落ちる）
   const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:recover").setLabel("回収").setEmoji("🧰").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mgmt:denyword").setLabel("禁止語").setEmoji("🚫").setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row1, row2, row3] };
 }
@@ -169,6 +172,7 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "setting" && action === "category-select") return void (await openCategorySetup(interaction, services));
   if (section === "ranksync" && !action) return void (await interaction.update(rankSyncHome()));
   // ── 既存データの回収 ──
+  if (section === "denyword") return void (await handleDenywordButton(interaction, services));
   if (section === "recover" && !action) return void (await interaction.update(recoveryHome()));
   if (section === "recover" && action === "shop") return void (await interaction.update(undeliveredPicker(services)));
   if (section === "recover" && action === "role") return void (await interaction.update(roleRestorePicker()));
@@ -446,6 +450,9 @@ export async function handleAdminSelect(
   const section = parts[1];
   const action = parts[2];
 
+  if (section === "denyword" && action === "remove" && interaction.isStringSelectMenu()) {
+    return void (await handleDenywordRemove(interaction, services));
+  }
   if (section === "setting" && action === "channel-key" && interaction.isStringSelectMenu()) {
     return void (await interaction.update(await settingChannelPicker(interaction.values[0]!)));
   }
@@ -629,6 +636,8 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
   const parts = interaction.customId.split(":");
   const section = parts[1];
   const action = parts[2];
+
+  if (section === "denyword" && action === "save") return void (await handleDenywordModal(interaction, services));
 
   if (section === "casino" && action === "profile") {
     // 汎用順位卓の順位配分は**運営だけ**が登録できる（PR24）。従業員は登録済みから選ぶだけ。
