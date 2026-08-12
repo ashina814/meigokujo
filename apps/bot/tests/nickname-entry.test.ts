@@ -26,7 +26,7 @@ const ROLE = { ghost: "r-ghost", wait: "r-wait" };
 const USER = "1463201396567441441";
 const OTHER = "1463201396567441442";
 
-function setup() {
+function setup(opts: { nameGate?: boolean } = {}) {
   const db = openDb(":memory:");
   const ledger = new Ledger(db);
   const settings = new Settings(db);
@@ -37,6 +37,8 @@ function setup() {
   settings.set("role:ghost", ROLE.ghost, "test");
   settings.set("role:queue_wait", ROLE.wait, "test");
   settings.set("channel:waiters_board", "ch-board", "test");
+  // このファイルは名前ゲートの挙動を見るので既定でON（本番の既定はOFF）
+  settings.set("entry_require_name", opts.nameGate === false ? 0 : 1, "test");
   const services = {
     db,
     ledger,
@@ -337,6 +339,60 @@ describe("手で入城ロールを付けられたとき", () => {
 
     expect(w.roleRemove).toHaveBeenCalledWith(ROLE.ghost, expect.any(String));
     expect(ctx.entry.getSoul(USER)?.status ?? "waiting").not.toBe("ghost");
+    ctx.db.close();
+  });
+});
+
+describe("名前ゲートが OFF のあいだ（deploy直後の既定）", () => {
+  it("既定は OFF。名前が無くても従来どおり入城できる", async () => {
+    const { handleMemberRoleUpdate, nameGateEnabled } = await entryModule;
+    const ctx = setup({ nameGate: false });
+    expect(nameGateEnabled(ctx.services)).toBe(false);
+    const w = roleAdded(ctx);
+
+    await handleMemberRoleUpdate(w.oldMember, w.newMember, ctx.services);
+
+    expect(ctx.entry.getSoul(USER)?.status).toBe("ghost"); // 入城できる
+    expect(w.roleRemove).not.toHaveBeenCalledWith(ROLE.ghost, expect.any(String));
+    expect(ctx.events.listByType("entry_blocked_by_name")).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  it("規則違反の名前でも止めない（ONにするまで挙動を変えない）", async () => {
+    const { handleMemberRoleUpdate } = await entryModule;
+    const ctx = setup({ nameGate: false });
+    ctx.nicknames.claim({ userId: USER, nickname: "ばつわーど", setVia: "entry", actor: "t" });
+    ctx.nicknames.addDenyWord("ばつわーど", "staff");
+    const w = roleAdded(ctx);
+
+    await handleMemberRoleUpdate(w.oldMember, w.newMember, ctx.services);
+
+    expect(ctx.entry.getSoul(USER)?.status).toBe("ghost");
+    ctx.db.close();
+  });
+
+  it("OFF でも名前の設定そのものは使える（先に決めてもらえる）", async () => {
+    const { handleEntryModal } = await entryModule;
+    const ctx = setup({ nameGate: false });
+    const m = modalSubmit("こはく");
+
+    await handleEntryModal(m.interaction, ctx.services);
+
+    expect(m.state.nickname).toBe("こはく");
+    expect(ctx.nicknames.get(USER)?.nickname).toBe("こはく");
+    ctx.db.close();
+  });
+
+  it("ONにした時点から必須になる", async () => {
+    const { handleMemberRoleUpdate } = await entryModule;
+    const ctx = setup({ nameGate: false });
+    ctx.settings.set("entry_require_name", 1, "staff");
+    const w = roleAdded(ctx);
+
+    await handleMemberRoleUpdate(w.oldMember, w.newMember, ctx.services);
+
+    expect(ctx.entry.getSoul(USER)?.status ?? "waiting").not.toBe("ghost");
+    expect(w.roleRemove).toHaveBeenCalledWith(ROLE.ghost, expect.any(String));
     ctx.db.close();
   });
 });

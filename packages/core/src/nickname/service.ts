@@ -163,12 +163,21 @@ export class Nicknames {
     }>;
   }
 
-  /** 禁止語に触れているか。判定は**正規化済みの鍵に対する部分一致**だけ */
+  /**
+   * 禁止語に触れているか。判定は**正規化済みの鍵に対する部分一致**だけ。
+   *
+   * **`reject` を優先する。** 最初に見つかった1件で決めると、`flag` の語が
+   * 先に並んでいるだけで拒否すべき名前が「確認待ち」に落ちる。
+   * 拒否語に1つでも触れていれば、他に何が当たっていても拒否する。
+   */
   private matchDenylist(key: string): { pattern: string; action: "reject" | "flag" } | null {
+    let flagged: { pattern: string; action: "flag" } | null = null;
     for (const row of this.listDenyWords()) {
-      if (row.pattern && key.includes(row.pattern)) return { pattern: row.pattern, action: row.action };
+      if (!row.pattern || !key.includes(row.pattern)) continue;
+      if (row.action === "reject") return { pattern: row.pattern, action: "reject" };
+      flagged ??= { pattern: row.pattern, action: "flag" };
     }
-    return null;
+    return flagged;
   }
 
   /**

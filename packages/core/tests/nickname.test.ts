@@ -319,6 +319,33 @@ describe("不適切名（denylist）", () => {
     db.close();
   });
 
+  it("**reject と flag の両方に当たったら reject**（最初に見つかった1件で決めない）", () => {
+    const { db, names } = setup();
+    // 一覧は pattern 順に並ぶので、flag が先に来る並びをわざと作る
+    names.addDenyWord("あいてむ", "staff", { action: "flag" });
+    names.addDenyWord("ばつ", "staff", { action: "reject" });
+    const listed = names.listDenyWords().map((w) => w.pattern);
+    expect(listed.indexOf("あいてむ")).toBeLessThan(listed.indexOf("ばつ")); // flag が先
+
+    const r = names.claim({ userId: A, nickname: "あいてむばつ", setVia: "entry", actor: "t" });
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.rejection).toEqual({ code: "denylisted", pattern: "ばつ" });
+    db.close();
+  });
+
+  it("reject が後ろに並んでいても拒否する（登録済みの名前の見直しでも同じ）", () => {
+    const { db, names } = setup();
+    names.claim({ userId: A, nickname: "あいてむばつ", setVia: "entry", actor: "t" });
+    names.addDenyWord("あいてむ", "staff", { action: "flag" });
+    expect(names.status(A).kind).toBe("review");
+
+    names.addDenyWord("ばつ", "staff", { action: "reject" });
+
+    expect(names.status(A).kind).toBe("violation"); // flag ではなく違反として見える
+    db.close();
+  });
+
   it("**あとから禁止語を足すと、既に登録済みの名前も違反として見える**", () => {
     const { db, names } = setup();
     names.claim({ userId: A, nickname: "ばつわーど", setVia: "entry", actor: "t" });

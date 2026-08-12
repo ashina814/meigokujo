@@ -755,6 +755,10 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
       await interaction.reply({ content: "昇格印・低評価印の必要数は、1以上の整数で入力してください。", flags: MessageFlags.Ephemeral });
       return;
     }
+    if (FLAG_NUMBER_KEYS.has(key) && n !== 0 && n !== 1) {
+      await interaction.reply({ content: "この設定は 0（OFF）か 1（ON）で入力してください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
     if (NON_NEGATIVE_NUMBER_KEYS.has(key) && n < 0) {
       await interaction.reply({ content: "招待印の換算値・上限は、0以上の数値で入力してください。", flags: MessageFlags.Ephemeral });
       return;
@@ -1298,9 +1302,12 @@ const NUMBER_KEYS: Array<[string, string]> = [
   ["vip_bet_cap_mult", "VIP賭け上限倍率"],
   ["confession_body_retention_days", "トート本文の保持日数"],
   ["confession_court_retention_days", "トート送致案件の本文保持日数"],
+  ["entry_require_name", "入城に名前の登録を必須にする（1でON・既定0）"],
 ];
 
 const POSITIVE_INTEGER_NUMBER_KEYS = new Set(["promotion_marks_required", "demotion_marks_threshold"]);
+/** 0か1しか受けない設定（段階有効化のフラグ） */
+const FLAG_NUMBER_KEYS = new Set(["entry_require_name"]);
 const NON_NEGATIVE_NUMBER_KEYS = new Set(["invite_mark_per_person", "invite_mark_cap"]);
 
 async function openNumberSetup(interaction: ButtonInteraction, _services: Services) {

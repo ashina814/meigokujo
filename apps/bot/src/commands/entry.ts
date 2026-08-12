@@ -176,6 +176,20 @@ export async function handleEntryButton(
   }
 }
 
+/**
+ * 名前を入城の条件にするか。**既定は OFF。**
+ *
+ * コードを入れただけで入城の条件を変えない。既存の名前の取り込みと
+ * 入城案内パネルの再設置が済んでいない状態で必須にすると、名前を決める手段が
+ * 無いまま説明会の合格が止まる。運営が `/管理 → 設定 → 数値` で
+ * `entry_require_name` を 1 にした時点から必須になる。
+ *
+ * **OFF の間も名前の設定そのものは動く**（先に決めてもらって構わない）。
+ */
+export function nameGateEnabled(services: Services): boolean {
+  return services.settings.getNumber("entry_require_name") === 1;
+}
+
 /** 状態画面の「城での名前」欄。未登録なら**入城できないことまで**書く */
 function nameFieldValue(services: Services, userId: string): string {
   const status = services.nicknames.status(userId);
@@ -844,15 +858,19 @@ const judgeState = new Map<string, JudgeSel>(); // key = 判定者のユーザ�
 function renderJudgment(services: Services, judgeId: string) {
   const st = judgeState.get(judgeId) ?? ({ present: [], missing: [], hold: new Set<string>(), returnees: [] } as JudgeSel);
   const selected = st.present.filter((id) => !st.hold.has(id));
-  // **押す前に分かるようにする。** 押してから弾くと、説明会のその場で止まる
-  const named = selected.filter((id) => services.nicknames.status(id).kind === "ok");
+  const gateOn = nameGateEnabled(services);
+  // **押す前に分かるようにする。** 押してから弾くと、説明会のその場で止まる。
+  // 名前ゲートが OFF の間は、状態を見せるだけで合格対象からは外さない
+  const named = gateOn ? selected.filter((id) => services.nicknames.status(id).kind === "ok") : selected;
   // 禁止語の flag に触れた名前。**一括合格には入れない。**
   // 機械で白黒つかないものなので、門番が見て通したときだけ合格対象になる
-  const review = selected.filter((id) => services.nicknames.status(id).kind === "review");
-  const unnamed = selected.filter((id) => {
-    const kind = services.nicknames.status(id).kind;
-    return kind === "unset" || kind === "violation";
-  });
+  const review = gateOn ? selected.filter((id) => services.nicknames.status(id).kind === "review") : [];
+  const unnamed = gateOn
+    ? selected.filter((id) => {
+        const kind = services.nicknames.status(id).kind;
+        return kind === "unset" || kind === "violation";
+      })
+    : [];
 
   const line = (ids: string[]) => (ids.length > 0 ? ids.map((id) => `・<@${id}>`).join("\n") : "（なし）");
   /** 名前の状態を1行で。門番はこれを見て確認するだけでよい */
@@ -934,8 +952,29 @@ async function handleJudgeSelect(interaction: UserSelectMenuInteraction, service
   }
   if (interaction.customId === "entry:judgeflag") {
     // 禁止語に触れた名前を、門番が中身を見て通す。**承認は名前ごとに残る**ので、
-    // 別の入口（亡霊ロールの手動付与・時間外チケット）から入っても同じ判断が効く
-    for (const id of interaction.values) services.nicknames.approveFlagged(id, `user:${interaction.user.id}`);
+    // 別の入口（亡霊ロールの手動付与・時間外チケット）から入っても同じ判断が効く。
+    //
+    // **いまの判定対象だけに限る。** UserSelect は誰でも選べてしまうので、
+    // 説明会に来ていない人・保留にした人まで、画面に出ていないまま承認できてしまう。
+    // 承認は入城の可否を動かす操作なので、その場で見えている相手にだけ効かせる
+    const approvable = new Set(
+      sel.present.filter((id) => !sel.hold.has(id) && services.nicknames.status(id).kind === "review"),
+    );
+    const approved: string[] = [];
+    const ignored: string[] = [];
+    for (const id of interaction.values) {
+      if (!approvable.has(id)) {
+        ignored.push(id);
+        continue;
+      }
+      if (services.nicknames.approveFlagged(id, `user:${interaction.user.id}`)) approved.push(id);
+    }
+    if (ignored.length > 0) {
+      services.events.log("nickname_flag_approval_ignored", {
+        actor: `user:${interaction.user.id}`,
+        payload: { ignored },
+      });
+    }
     await interaction.update(renderJudgment(services, interaction.user.id));
     return;
   }
@@ -1079,7 +1118,7 @@ async function ghostifyOne(
     // （門番の一括合格・亡霊ロールの手動付与・時間外チケット）から来るので、
     // 入口ごとではなくここで一度だけ見る。手動付与を暗黙の override にしない
     const name = services.nicknames.status(userId);
-    if (name.kind !== "ok") {
+    if (nameGateEnabled(services) && name.kind !== "ok") {
       services.events.log("entry_blocked_by_name", {
         actor,
         target: userId,
