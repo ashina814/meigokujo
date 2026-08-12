@@ -23,6 +23,7 @@ const recoveryModule = import("../src/scheduler-recovery.js");
 
 const USER = "1463201396567441441";
 const OWNER = "999999999999999999";
+const OTHER = "888888888888888888";
 const PRICE = 50_000;
 
 function setup() {
@@ -230,10 +231,7 @@ describe("通常の流れ", () => {
     expect(balance(ctx)).toBe(1_000_000 - PRICE);
     const purchase = ctx.shop.listUserPurchases(USER)[0]!;
     expect(purchase.delivery_state).toBe("delivered");
-    const request = JSON.parse(purchase.request_json!) as { nickname: string; before: unknown };
-    expect(request.nickname).toBe("あたらしい名前");
-    // 落ちても戻せるように、改名前の状態も購入行へ残す
-    expect(request).toHaveProperty("before");
+    expect(JSON.parse(purchase.request_json!)).toEqual({ nickname: "あたらしい名前" });
     ctx.db.close();
   });
 
@@ -885,22 +883,72 @@ describe("レビュー指摘の4点", () => {
     ctx.db.close();
   });
 
-  it("**claim後に落ちても、再試行の失敗で元の名前へ戻る**", async () => {
+  it("**A→BのDiscord変更待ち中、別の人はAを取得できない**", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "えー", setDelayMs: 40 });
+    ctx.nicknames.claim({ userId: USER, nickname: "えー", setVia: "entry", actor: "t" });
+
+    const pending = handleShopButton(pressInteraction(ctx, nickDo(ctx, "conf-1", "びー"), w), ctx.services);
+    await new Promise((r) => setTimeout(r, 15)); // Discord 変更の途中
+
+    // 旧名は手放していない
+    expect(ctx.nicknames.reservation("えー")?.user_id).toBe(USER);
+    expect(ctx.nicknames.claim({ userId: OTHER, nickname: "えー", setVia: "entry", actor: "t" }).ok).toBe(false);
+    // 新名も既に押さえてある（他の人は取れない）
+    expect(ctx.nicknames.claim({ userId: OTHER, nickname: "びー", setVia: "entry", actor: "t" }).ok).toBe(false);
+    await pending;
+    ctx.db.close();
+  });
+
+  it("**A→Bが失敗したら、Aの登録も予約もそのまま残る**", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "えー", setFails: "Missing Permissions" });
+    ctx.nicknames.claim({ userId: USER, nickname: "えー", setVia: "entry", actor: "t" });
+
+    await handleShopButton(pressInteraction(ctx, nickDo(ctx, "conf-1", "びー"), w), ctx.services);
+
+    expect(ctx.nicknames.get(USER)?.nickname).toBe("えー");
+    expect(ctx.nicknames.reservation("えー")?.user_id).toBe(USER);
+    expect(ctx.nicknames.reservation("えー")?.staged_for_purchase).toBeNull();
+    expect(ctx.nicknames.reservation("びー")).toBeNull(); // 仮押さえだけ解放
+    expect(balance(ctx)).toBe(1_000_000); // 返金済み
+    ctx.db.close();
+  });
+
+  it("**A→B成功後はAが解放され、別の人が取得できる**", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "えー" });
+    ctx.nicknames.claim({ userId: USER, nickname: "えー", setVia: "entry", actor: "t" });
+
+    await handleShopButton(pressInteraction(ctx, nickDo(ctx, "conf-1", "びー"), w), ctx.services);
+
+    expect(w.state.nickname).toBe("びー");
+    expect(ctx.nicknames.get(USER)?.nickname).toBe("びー");
+    expect(ctx.nicknames.reservation("びー")?.staged_for_purchase).toBeNull(); // 確定済み
+    expect(ctx.nicknames.reservation("えー")).toBeNull(); // 解放された
+    expect(ctx.nicknames.claim({ userId: OTHER, nickname: "えー", setVia: "entry", actor: "t" }).ok).toBe(true);
+    ctx.db.close();
+  });
+
+  it("**仮押さえ後に落ちて、再試行も失敗した場合もAが残る**", async () => {
     const { convergePendingNicknameChanges } = await recoveryModule;
     const ctx = setup();
-    const w = world({ nickname: "もとの", setFails: "Missing Permissions" });
-    ctx.nicknames.claim({ userId: USER, nickname: "もとの", setVia: "entry", actor: "t" });
-    const before = ctx.nicknames.captureRestorePoint(USER);
-    // 課金 → 予約まで済んで落ちた状態を作る（購入行には改名前の控えが残っている）
-    ctx.shop.purchase({
+    const w = world({ nickname: "えー", setFails: "Missing Permissions" });
+    ctx.nicknames.claim({ userId: USER, nickname: "えー", setVia: "entry", actor: "t" });
+    // 課金と仮押さえまで済んで落ちた状態
+    const purchase = ctx.shop.purchase({
       itemId: ctx.item.id,
       userId: USER,
       actor: USER,
       memberRoleIds: [],
-      request: { nickname: "あたらしい", before },
-    });
-    ctx.nicknames.claim({ userId: USER, nickname: "あたらしい", setVia: "shop", actor: "t", allowLocked: true });
-    expect(ctx.nicknames.get(USER)?.nickname).toBe("あたらしい"); // 落ちた時点では改名後
+      request: { nickname: "びー" },
+    }).purchase;
+    ctx.nicknames.stageRename({ userId: USER, nickname: "びー", purchaseId: purchase.id, actor: "t", allowLocked: true });
+    // 落ちている間も旧名は他の人に取られない
+    expect(ctx.nicknames.claim({ userId: OTHER, nickname: "えー", setVia: "entry", actor: "t" }).ok).toBe(false);
 
     const client = {
       guilds: { fetch: vi.fn(async () => w.guild) },
@@ -909,11 +957,39 @@ describe("レビュー指摘の4点", () => {
     } as never;
     await convergePendingNicknameChanges(client, ctx.services);
 
-    // Discord変更に失敗したので、**元の名前と予約へ戻る**
-    expect(ctx.nicknames.get(USER)?.nickname).toBe("もとの");
-    expect(ctx.nicknames.reservation("もとの")?.user_id).toBe(USER);
-    expect(ctx.nicknames.reservation("あたらしい")).toBeNull();
-    expect(balance(ctx)).toBe(1_000_000); // 返金済み
+    expect(ctx.nicknames.get(USER)?.nickname).toBe("えー");
+    expect(ctx.nicknames.reservation("えー")?.user_id).toBe(USER);
+    expect(ctx.nicknames.reservation("びー")).toBeNull();
+    expect(balance(ctx)).toBe(1_000_000);
+    ctx.db.close();
+  });
+
+  it("Discord変更だけ成功して落ちても、巡回で確定できる", async () => {
+    const { convergePendingNicknameChanges } = await recoveryModule;
+    const ctx = setup();
+    // Discord は既に びー。仮押さえのまま落ちた
+    const w = world({ nickname: "びー" });
+    ctx.nicknames.claim({ userId: USER, nickname: "えー", setVia: "entry", actor: "t" });
+    const purchase = ctx.shop.purchase({
+      itemId: ctx.item.id,
+      userId: USER,
+      actor: USER,
+      memberRoleIds: [],
+      request: { nickname: "びー" },
+    }).purchase;
+    ctx.nicknames.stageRename({ userId: USER, nickname: "びー", purchaseId: purchase.id, actor: "t", allowLocked: true });
+
+    const client = {
+      guilds: { fetch: vi.fn(async () => w.guild) },
+      users: { fetch: vi.fn(async () => ({ send: vi.fn(async () => undefined) })) },
+      channels: { fetch: vi.fn(async () => null) },
+    } as never;
+    await convergePendingNicknameChanges(client, ctx.services);
+
+    expect(ctx.nicknames.get(USER)?.nickname).toBe("びー"); // 確定した
+    expect(ctx.nicknames.reservation("びー")?.staged_for_purchase).toBeNull();
+    expect(ctx.nicknames.reservation("えー")).toBeNull();
+    expect(balance(ctx)).toBe(1_000_000 - PRICE); // 提供できたので返金しない
     ctx.db.close();
   });
 

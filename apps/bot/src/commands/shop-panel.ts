@@ -635,9 +635,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         actor: `user:${interaction.user.id}`,
         memberRoleIds: [...pre.member.roles.cache.keys()],
         mode: "land",
-        // **落ちても戻せるように、改名前の状態を購入行へ残す。** `claim()` の控えは
-        // メモリにしか無く、予約を取った直後に落ちると元の名前が分からなくなる
-        request: { nickname: wanted, before: services.nicknames.captureRestorePoint(interaction.user.id) },
+        request: { nickname: wanted },
       });
     } catch (error) {
       await interaction.editReply({ content: `❌ ${purchaseErrorMessage(error, services)}`, embeds: [], components: [] });

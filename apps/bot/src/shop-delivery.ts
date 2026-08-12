@@ -3,7 +3,6 @@ import {
   AUTO_DELIVERABLE_KINDS,
   describeRejection,
   parseDeliverySnapshot,
-  type NameRestorePoint,
   type PurchaseRow,
 } from "@meigokujo/core";
 import { refreshEvalStatsForUser } from "./eval-daily.js";
@@ -59,14 +58,6 @@ export function parseRequest(json: string | null): Record<string, unknown> | nul
   } catch {
     return null;
   }
-}
-
-/** 購入行に残した「改名前の状態」。読めなければ使わない（握り潰さない） */
-function parseRestorePoint(raw: unknown): NameRestorePoint | null {
-  if (!raw || typeof raw !== "object") return null;
-  const point = raw as { name?: unknown; reservation?: unknown };
-  if (!("name" in point) || !("reservation" in point)) return null;
-  return point as NameRestorePoint;
 }
 
 /**
@@ -225,47 +216,40 @@ export async function deliverPurchaseUnlocked(
       const member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
       if (!member) return fail("member_fetch_failed", "メンバー情報の取得に失敗し変更できませんでした。");
 
-      // **名前の正本は入城制度と同じ。** 予約を先に取ってから Discord を叩く。
-      // 逆にすると、設定は通ったのに予約が取れない（＝同じ名前の人が増える）順序が生まれる。
-      // 商館の改名だけが入城後の固定を越えられる（`allowLocked`）
-      const claimed = services.nicknames.claim({
+      // **名前の正本は入城制度と同じ。** ただし有料の改名は二段階で進める。
+      // 新名を仮押さえし、**旧名は Discord の変更が通るまで手放さない**。
+      // 先に手放すと、変更に失敗して戻すときに旧名を他の人へ取られている
+      const staged = services.nicknames.stageRename({
         userId,
         nickname: raw,
-        setVia: "shop",
+        purchaseId: purchase.id,
         actor,
-        allowLocked: true,
+        allowLocked: true, // 入城後の固定を越えられるのは商館の正式な改名だけ
       });
-      if (!claimed.ok) {
-        const r = claimed.rejection;
+      if (!staged.ok) {
+        const r = staged.rejection;
         if (r.code === "taken") {
           return fail(
             `nickname_taken:${r.by}`,
             "その名前は購入後に他の方が使い始めたため、お使いいただけませんでした。",
           );
         }
-        // `allowLocked` を渡しているので固定では止まらないが、握り潰さず落とす
         if (r.code === "locked") return fail("nickname_locked", "名前が固定されているため変更できませんでした。");
         return fail(`nickname_rejected:${r.code}`, describeRejection(r));
       }
-      const { nickname: wanted, snapshot } = claimed;
-      // 巻き戻しは**購入行に残した控え**を優先する。予約を取った直後に落ちて
-      // 再試行された場合、`claim()` の控えは「改名後の状態」しか指していない
-      const persisted = parseRestorePoint(request?.before);
-      const restoreName = (): void => {
-        if (persisted) services.nicknames.restore(userId, persisted, actor);
-        else services.nicknames.rollback(snapshot, actor);
-      };
+      const { nickname: wanted, key } = staged;
 
       // **見るのは `nickname`（サーバーニックネーム）。** `displayName` はグローバル
       // 表示名も混ざるので、まだ変えていないのに「変わっている」と誤認する
       if (member.nickname === wanted) {
-        // 既に希望どおり（課金後の落ち・再実行）。**返金せず完了にする**
+        // Discord だけ変わって落ちた場合もここに来る。確定させて終わらせる
+        services.nicknames.commitRename(userId, key, actor);
         services.shop.markDeliverySucceeded(purchase.id, actor);
         return { state: "delivered", message: `サーバーニックネームは既に **${wanted}** です。` };
       }
       const blocked = nicknameBlockReason(guild, member);
       if (blocked) {
-        restoreName();
+        services.nicknames.abortRename(userId, key, actor);
         return fail(blocked.reason, blocked.message);
       }
       const setError = await member
@@ -274,15 +258,17 @@ export async function deliverPurchaseUnlocked(
         .catch((e: Error) => e.message || "unknown");
       if (setError !== null) {
         // **エラーが返っても、変わっていることがある。** 応答が落ちただけ・内部再試行で
-        // 通っていた、など。ここで確かめずに巻き戻すと「名前は変わったのに返金もした」に
-        // なる。最新のメンバーを取り直し、希望どおりに見えていれば成功として扱う
+        // 通っていた、など。ここで確かめずに取り消すと「名前は変わったのに返金もした」に
+        // なる。最新のメンバーを取り直し、希望どおりなら成功として扱う
         const latest = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
         if (latest?.nickname !== wanted) {
-          // **予約を残さない。** 誰も名乗っていない名前が取れなくなる
-          restoreName();
+          // **仮押さえだけ解放する。旧名はそのまま。** 名乗っている名前は変わらない
+          services.nicknames.abortRename(userId, key, actor);
           return fail(`nickname_set_failed:${setError}`, "名前の変更に失敗しました。");
         }
       }
+      // ここで初めて旧名を手放す
+      services.nicknames.commitRename(userId, key, actor);
       services.shop.markDeliverySucceeded(purchase.id, actor);
       return { state: "delivered", message: `サーバーニックネームを **${wanted}** に変更しました。` };
     }

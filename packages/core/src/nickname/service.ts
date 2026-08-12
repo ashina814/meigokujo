@@ -33,6 +33,8 @@ export interface NicknameReservationRow {
   kind: "member" | "legacy_conflict";
   user_id: string | null;
   display: string;
+  /** 改名の仮押さえ中なら、その購入ID。確定済みの予約は null */
+  staged_for_purchase: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -256,13 +258,14 @@ export class Nicknames {
       const previousReservation = previousName ? this.reservation(previousName.name_key) : null;
       const existing = this.reservation(key);
       // 他人の予約・誰のものでもない予約（既存重複）は取れない
-      if (existing && !(existing.kind === "member" && existing.user_id === input.userId)) {
-        throw new Taken(existing.kind);
-      }
+      // 自分が持っている予約（確定・仮押さえのどちらでも）なら通す
+      if (existing && existing.user_id !== input.userId) throw new Taken(existing.kind);
       // 自分の古い予約を外してから取り直す。**1人が2つの名前を予約したままにしない**
       if (previousName && previousName.name_key !== key) {
         this.db
-          .prepare("DELETE FROM nickname_reservations WHERE name_key = ? AND kind = 'member' AND user_id = ?")
+          .prepare(
+            "DELETE FROM nickname_reservations WHERE name_key = ? AND kind = 'member' AND user_id = ? AND staged_for_purchase IS NULL",
+          )
           .run(previousName.name_key, input.userId);
       }
       const ts = now();
@@ -351,7 +354,9 @@ export class Nicknames {
   restore(userId: string, point: NameRestorePoint, actor: string): void {
     const run = this.db.transaction(() => {
       // いま自分が持っている予約を外す（名前が変わっていれば鍵も違う）
-      this.db.prepare("DELETE FROM nickname_reservations WHERE kind = 'member' AND user_id = ?").run(userId);
+      this.db
+        .prepare("DELETE FROM nickname_reservations WHERE kind = 'member' AND user_id = ? AND staged_for_purchase IS NULL")
+        .run(userId);
       this.db.prepare("DELETE FROM member_names WHERE user_id = ?").run(userId);
       const p = point.name;
       if (p) {
@@ -387,6 +392,128 @@ export class Nicknames {
     });
     run.immediate();
     this.events.log("nickname_rollback", { actor, target: userId, payload: { restored: point.name?.nickname ?? null } });
+  }
+
+  // ---- 有料の改名（二段階）----
+  //
+  // 商館の改名は Discord への変更を挟むので、`claim()` の一発では危ない。
+  // `claim()` は**旧名の予約を先に手放す**ため、Discord へ書く前に落ちたり
+  // 失敗したりすると、その隙に旧名を他の人に取られる。戻そうにも予約が無い。
+  //
+  // そこで「新名を仮押さえ（旧名は持ったまま）→ Discord変更 → 成功したら確定」
+  // の順に分ける。**旧名は最後まで手放さない。**
+
+  /**
+   * 新しい名前を仮押さえする。**旧名の予約も登録もそのまま残す。**
+   * 同じ購入からなら何度呼んでも同じ状態になる（落ちて再試行しても増えない）。
+   */
+  stageRename(input: {
+    userId: string;
+    nickname: string;
+    purchaseId: number;
+    actor: string;
+    allowLocked?: boolean;
+  }): { ok: true; nickname: string; key: string } | { ok: false; rejection: ClaimRejection } {
+    const evaluated = this.evaluate(input.nickname);
+    if (!evaluated.ok) return { ok: false, rejection: evaluated.rejection };
+    const { nickname, key } = evaluated;
+
+    const run = this.db.transaction((): { ok: true; nickname: string; key: string } | { ok: false; rejection: ClaimRejection } => {
+      const current = this.get(input.userId);
+      if (current?.locked_at && !input.allowLocked) return { ok: false, rejection: { code: "locked" } };
+      const existing = this.reservation(key);
+      if (existing && existing.user_id !== input.userId) throw new Taken(existing.kind);
+      // 既に自分のもの（確定済みの自分の名前 or 同じ購入の仮押さえ）なら、そのまま進む
+      if (!existing) {
+        const ts = now();
+        this.db
+          .prepare(
+            `INSERT INTO nickname_reservations (name_key, kind, user_id, display, staged_for_purchase, created_at, updated_at)
+             VALUES (?, 'member', ?, ?, ?, ?, ?)`,
+          )
+          .run(key, input.userId, nickname, input.purchaseId, ts, ts);
+        this.events.log("nickname_stage", {
+          actor: input.actor,
+          target: input.userId,
+          payload: { nickname, key, purchaseId: input.purchaseId, from: current?.nickname ?? null },
+        });
+      }
+      return { ok: true, nickname, key };
+    });
+
+    try {
+      return run.immediate();
+    } catch (e) {
+      if (e instanceof Taken) return { ok: false, rejection: { code: "taken", by: e.by } };
+      throw e;
+    }
+  }
+
+  /**
+   * 仮押さえを確定する。**ここで初めて旧名を手放す。**
+   * Discord の変更が通ったあとにだけ呼ぶ。
+   */
+  commitRename(userId: string, key: string, actor: string): boolean {
+    const run = this.db.transaction(() => {
+      const staged = this.reservation(key);
+      if (!staged || staged.user_id !== userId) return false;
+      const previous = this.get(userId);
+      const ts = now();
+      // 旧名の確定予約を手放す（仮押さえ行は残す）
+      if (previous && previous.name_key !== key) {
+        this.db
+          .prepare(
+            "DELETE FROM nickname_reservations WHERE name_key = ? AND kind = 'member' AND user_id = ? AND staged_for_purchase IS NULL",
+          )
+          .run(previous.name_key, userId);
+      }
+      this.db
+        .prepare("UPDATE nickname_reservations SET staged_for_purchase = NULL, updated_at = ? WHERE name_key = ?")
+        .run(ts, key);
+      // 名前が変わったので、前の名前に対する門番の承認は無効になる
+      const keepApproval = previous?.nickname === staged.display;
+      this.db
+        .prepare(
+          `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, flag_ok_at, flag_ok_by, flag_ok_words, set_via, created_at, updated_at)
+           VALUES (?,?,?,'registered',?,?,?,?,?,'shop',?,?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             nickname = excluded.nickname, name_key = excluded.name_key, state = 'registered',
+             policy_version = excluded.policy_version, flag_ok_at = excluded.flag_ok_at,
+             flag_ok_by = excluded.flag_ok_by, flag_ok_words = excluded.flag_ok_words,
+             set_via = 'shop', updated_at = excluded.updated_at`,
+        )
+        .run(
+          userId,
+          staged.display,
+          key,
+          NICKNAME_POLICY_VERSION,
+          previous?.locked_at ?? null,
+          keepApproval ? (previous?.flag_ok_at ?? null) : null,
+          keepApproval ? (previous?.flag_ok_by ?? null) : null,
+          keepApproval ? (previous?.flag_ok_words ?? null) : null,
+          previous?.created_at ?? ts,
+          ts,
+        );
+      this.events.log("nickname_rename_committed", {
+        actor,
+        target: userId,
+        payload: { nickname: staged.display, key, from: previous?.nickname ?? null },
+      });
+      return true;
+    });
+    return run.immediate();
+  }
+
+  /**
+   * 仮押さえを取り消す。**旧名には一切触れない**ので、そのまま名乗り続けられる。
+   */
+  abortRename(userId: string, key: string, actor: string): void {
+    const changed = this.db
+      .prepare(
+        "DELETE FROM nickname_reservations WHERE name_key = ? AND user_id = ? AND staged_for_purchase IS NOT NULL",
+      )
+      .run(key, userId).changes;
+    if (changed > 0) this.events.log("nickname_stage_aborted", { actor, target: userId, payload: { key } });
   }
 
   /** 入城完了で名前を固定する */
