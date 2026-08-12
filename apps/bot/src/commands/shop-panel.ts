@@ -17,6 +17,7 @@ import {
 import { LedgerError, ShopError, termDays, type PurchaseRow, type ShopItemRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { deliverPurchase, nicknameBlockReason } from "../shop-delivery.js";
+import { deliverOrRefund } from "../shop-refund.js";
 import { meetsRoleRequirement, requirementLabel } from "../rank-requirement.js";
 import { refreshShopAdminPanels } from "./shokan.js";
 import type { Services } from "../services.js";
@@ -227,12 +228,18 @@ function isNicknameItem(item: ShopItemRow): boolean {
 
 const NICKNAME_MAX = 32;
 
-/** 入力の形だけを見る検査（Discord側の可否は nicknameBlockReason が見る） */
-function validateNickname(input: string, current: string | null): string | null {
+/**
+ * 入力の形だけを見る検査（Discord側の可否は nicknameBlockReason が見る）。
+ *
+ * 「同じ名前」は **`displayName`（利用者に実際に見えている名前）** で判定する。
+ * `nickname` で見ると、ニックネーム未設定の人が見えているとおりの名前を入れたとき
+ * 「変更できる」と受け取ってしまい、払ったのに何も変わらない結果になる。
+ */
+function validateNickname(input: string, currentDisplayName: string): string | null {
   const name = input.trim();
   if (!name) return "新しい名前を入れてください。";
   if (name.length > NICKNAME_MAX) return `名前は ${NICKNAME_MAX} 文字までです（いまは ${name.length} 文字）。`;
-  if (name === current) return "いまの名前と同じです。";
+  if (name === currentDisplayName) return "いまの名前と同じです。";
   return null;
 }
 
@@ -251,7 +258,7 @@ function nicknamePreflight(
   return blocked ? { ok: false, message: blocked.message } : { ok: true, member };
 }
 
-function nicknameModal(itemId: number, current: string | null) {
+function nicknameModal(itemId: number, currentDisplayName: string) {
   return new ModalBuilder()
     .setCustomId(`shop:nick-input:${itemId}`)
     .setTitle("名前変更")
@@ -263,9 +270,46 @@ function nicknameModal(itemId: number, current: string | null) {
           .setStyle(TextInputStyle.Short)
           .setRequired(true)
           .setMaxLength(NICKNAME_MAX)
-          .setValue(current ?? ""),
+          .setValue(currentDisplayName.slice(0, NICKNAME_MAX)),
       ),
     );
+}
+
+/**
+ * 変更内容と料金の確認。**ここで見せた料金を確定操作まで持たせる。**
+ *
+ * 確認画面のボタンに料金を焼き込み、確定時に商品の現在価格と突き合わせる。
+ * 確定時の価格をそのまま課金すると、確認してから押すまでの間に運営が値段を変えただけで
+ * 「見せていない額」を引くことになる。
+ */
+function nicknameConfirm(
+  services: Services,
+  item: ShopItemRow,
+  member: GuildMember,
+  wanted: string,
+  confirmationId: string,
+  opts: { priceChanged?: boolean } = {},
+) {
+  const price = item.price_land ?? 0;
+  const balance = services.ledger.balanceOf(`user:${member.id}`);
+  return {
+    content: [
+      opts.priceChanged
+        ? "⚠️ 確認したあとに料金が変わりました。**まだ引き落としていません。**新しい料金でご確認ください。"
+        : "✏️ サーバーニックネームを変更します。",
+      `**${member.displayName}** → **${wanted}**`,
+      `料金 **${fmtLd(price)}** ／ 残高 ${fmtLd(balance)}`,
+    ].join("\n"),
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          // 同じ確認画面からの実行は同じ操作IDになる（二重課金しない）
+          .setCustomId(`shop:nick-do:${item.id}:${confirmationId}:${price}:${wanted}`)
+          .setLabel("変更する")
+          .setStyle(ButtonStyle.Success),
+      ),
+    ],
+  };
 }
 
 type PurchaseOutcome = ReturnType<Services["shop"]["purchase"]> & { replayed?: boolean };
@@ -501,14 +545,15 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       await interaction.reply({ content: `⚠️ ${pre.message}`, flags: MessageFlags.Ephemeral });
       return;
     }
-    await interaction.showModal(nicknameModal(itemId, pre.member.nickname));
+    await interaction.showModal(nicknameModal(itemId, pre.member.displayName));
     return;
   }
 
   if (action === "nick-do") {
     const itemId = Number(parts[2]);
     const confirmationId = parts[3] ?? "";
-    const wanted = parts.slice(4).join(":");
+    const quotedPrice = Number(parts[4]);
+    const wanted = parts.slice(5).join(":");
     const item = services.shop.getItem(itemId);
     if (!item || !item.enabled || !isNicknameItem(item) || item.price_land === null) {
       await interaction.update({ content: "この商品はいま購入できません。", embeds: [], components: [] });
@@ -519,9 +564,18 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       await interaction.update({ content: `⚠️ ${pre.message}`, embeds: [], components: [] });
       return;
     }
-    const invalid = validateNickname(wanted, pre.member.nickname);
+    const invalid = validateNickname(wanted, pre.member.displayName);
     if (invalid) {
       await interaction.update({ content: `⚠️ ${invalid}`, embeds: [], components: [] });
+      return;
+    }
+    // **確認した料金でしか引き落とさない。** 変わっていたら課金せず、新しい料金で確認し直す。
+    // 別の料金になる以上、確認IDも取り直す（前の確認への同意を流用しない）
+    if (!Number.isInteger(quotedPrice) || quotedPrice !== item.price_land) {
+      await interaction.update({
+        ...nicknameConfirm(services, item, pre.member, wanted, interaction.id, { priceChanged: true }),
+        embeds: [],
+      });
       return;
     }
     await interaction.deferUpdate();
@@ -544,20 +598,31 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       return;
     }
 
-    const outcome = await deliverPurchase(services, interaction.guild, purchase.purchase, `user:${interaction.user.id}`);
+    // 変更できなかったときは**自分で返して終わらせる**（ここでスタッフを呼ばない）。
+    // 配送と返金は同じ区間で行われるので、同時押しでも「変えたうえで返す」にならない
+    const { outcome, refund } = await deliverOrRefund(
+      interaction.client,
+      services,
+      interaction.guild,
+      purchase.purchase,
+      `user:${interaction.user.id}`,
+    );
+    if (outcome.state === "not_active") {
+      // 返金・取消済みの購入への再送。名前は変えていないし、返金もしない
+      await interaction.editReply({ content: `⚠️ ${outcome.message}`, embeds: [], components: [] });
+      return;
+    }
     if (outcome.state !== "failed") {
       await interaction.editReply({ content: `✅ ${outcome.message}`, embeds: [], components: [] });
       return;
     }
-    // 変更できなかった。**自分で返して終わらせる**（ここでスタッフを呼ばない）
-    const refunded = await refundQuietly(services, purchase.purchase.id, outcome.error ?? "delivery_failed", interaction);
-    await interaction.editReply({
-      content: refunded
+    const content =
+      refund === "refunded"
         ? `変更できなかったため、${fmtLd(purchase.purchase.paid_land ?? 0)}は返金しました。\n-# ${outcome.message}`
-        : `⚠️ 変更に失敗し、返金も完了できませんでした。運営が対応します（購入 #${purchase.purchase.id}）。\n-# ${outcome.message}`,
-      embeds: [],
-      components: [],
-    });
+        : refund === "already_delivered"
+          ? `✅ 名前の変更は完了しています。`
+          : `⚠️ 変更に失敗し、返金も完了できませんでした。運営が対応します（購入 #${purchase.purchase.id}）。\n-# ${outcome.message}`;
+    await interaction.editReply({ content, embeds: [], components: [] });
     return;
   }
 
@@ -856,42 +921,6 @@ async function notifyStaffForDelivery(
     .catch(() => undefined);
 }
 
-/**
- * 返金して静かに終わらせる。返金まで失敗したときだけ、管理側の「処理失敗」へ残す。
- */
-async function refundQuietly(
-  services: Services,
-  purchaseId: number,
-  reason: string,
-  interaction: ButtonInteraction,
-): Promise<boolean> {
-  try {
-    services.shop.refund(purchaseId, reason, `user:${interaction.user.id}`);
-    return true;
-  } catch (error) {
-    services.events.log("shop_refund_failed", {
-      actor: `user:${interaction.user.id}`,
-      target: interaction.user.id,
-      payload: { purchaseId, reason, error: (error as Error).message },
-    });
-    // 返金できなかったものだけスタッフへ回す
-    await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
-    const channelId = services.settings.getString("channel:shokan") ?? services.settings.getString("channel:kessai");
-    if (channelId) {
-      const channel = await interaction.client.channels.fetch(channelId).catch(() => null);
-      if (channel?.isTextBased() && "send" in channel) {
-        await channel
-          .send({
-            content: `⚠️ **返金に失敗しました**（購入 #${purchaseId}）。商館の管理パネルの「処理失敗」から確認してください。`,
-            allowedMentions: { parse: [] },
-          })
-          .catch(() => undefined);
-      }
-    }
-    return false;
-  }
-}
-
 /** 名前変更の入力を受け取り、金額と変更内容を確認する */
 export async function handleShopModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
   const parts = interaction.customId.split(":");
@@ -908,27 +937,13 @@ export async function handleShopModal(interaction: ModalSubmitInteraction, servi
     return;
   }
   const wanted = interaction.fields.getTextInputValue("nickname").trim();
-  const invalid = validateNickname(wanted, pre.member.nickname);
+  const invalid = validateNickname(wanted, pre.member.displayName);
   if (invalid) {
     await interaction.reply({ content: `⚠️ ${invalid}`, flags: MessageFlags.Ephemeral });
     return;
   }
-  const balance = services.ledger.balanceOf(`user:${interaction.user.id}`);
   await interaction.reply({
-    content: [
-      `✏️ サーバーニックネームを変更します。`,
-      `**${pre.member.nickname ?? interaction.user.username}** → **${wanted}**`,
-      `料金 **${fmtLd(item.price_land)}** ／ 残高 ${fmtLd(balance)}`,
-    ].join("\n"),
-    components: [
-      new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder()
-          // 同じ確認画面からの実行は同じ操作IDになる（二重課金しない）
-          .setCustomId(`shop:nick-do:${itemId}:${interaction.id}:${wanted}`)
-          .setLabel("変更する")
-          .setStyle(ButtonStyle.Success),
-      ),
-    ],
+    ...nicknameConfirm(services, item, pre.member, wanted, interaction.id),
     flags: MessageFlags.Ephemeral,
   });
 }

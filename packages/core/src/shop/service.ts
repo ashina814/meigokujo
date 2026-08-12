@@ -647,15 +647,43 @@ export class Shop {
    *
    * 既に `delivered` なら `already_delivered` を返す。**呼び出し側はここで打ち切る**ので、
    * 二度押し・再起動・再配送要求のいずれでも副作用が二度走らない。
+   *
+   * **返金・取消・失効した購入も打ち切る。** 課金の冪等は「同じ確認画面から二度課金しない」
+   * までしか保証しない。返金まで済んだ購入の確認画面が後から再送されると、課金は起きないまま
+   * 配送だけが走り、「返したのにサービスは提供した」が成立してしまう。status は配送の
+   * 直前に、この1文の中で確かめる。
    */
-  beginDelivery(purchaseId: number): { proceed: boolean; state: DeliveryState; attempts: number } {
+  beginDelivery(purchaseId: number): {
+    proceed: boolean;
+    state: DeliveryState;
+    attempts: number;
+    reason?: "delivered" | "not_active";
+    status?: PurchaseStatus;
+  } {
     const begin = this.db.transaction(() => {
       const row = this.db
-        .prepare("SELECT delivery_state, delivery_attempts FROM shop_purchases WHERE id = ?")
-        .get(purchaseId) as { delivery_state: DeliveryState | null; delivery_attempts: number } | undefined;
+        .prepare("SELECT status, delivery_state, delivery_attempts FROM shop_purchases WHERE id = ?")
+        .get(purchaseId) as
+        | { status: PurchaseStatus; delivery_state: DeliveryState | null; delivery_attempts: number }
+        | undefined;
       if (!row) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
       if (row.delivery_state === "delivered") {
-        return { proceed: false, state: "delivered" as DeliveryState, attempts: row.delivery_attempts };
+        return {
+          proceed: false,
+          state: "delivered" as DeliveryState,
+          attempts: row.delivery_attempts,
+          reason: "delivered" as const,
+          status: row.status,
+        };
+      }
+      if (row.status !== "active") {
+        return {
+          proceed: false,
+          state: row.delivery_state ?? ("pending" as DeliveryState),
+          attempts: row.delivery_attempts,
+          reason: "not_active" as const,
+          status: row.status,
+        };
       }
       const attempts = row.delivery_attempts + 1;
       this.db
@@ -698,14 +726,18 @@ export class Shop {
    *
    * `extend_deadline` のように冪等でない配送があるので、効果とマークが割れると
    * 再試行で二重に効いてしまう。効果の書き込みを `effect` に渡してもらい、まとめて確定する。
+   *
+   * **有効な購入にしか配送済みの印を付けない。** 返金・取消・失効した購入が
+   * `delivered` になると、「返したのに提供した」が帳簿の上で成立してしまう。
    */
   completeDeliveryWith(purchaseId: number, actor: string, effect: () => void): boolean {
     const run = this.db.transaction(() => {
-      const row = this.db.prepare("SELECT delivery_state FROM shop_purchases WHERE id = ?").get(purchaseId) as
-        | { delivery_state: DeliveryState | null }
+      const row = this.db.prepare("SELECT status, delivery_state FROM shop_purchases WHERE id = ?").get(purchaseId) as
+        | { status: PurchaseStatus; delivery_state: DeliveryState | null }
         | undefined;
       if (!row) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
       if (row.delivery_state === "delivered") return false; // 競合した二重実行。効果を走らせない
+      if (row.status !== "active") return false; // 返金・取消・失効した購入。効果を走らせない
       effect();
       this.db
         .prepare(
@@ -807,8 +839,15 @@ export class Shop {
    * **対象かどうかは購入時スナップショットで決める。** 商品の現在設定を根拠にすると、
    * 買った後に商品を自動配送へ変えただけで過去の購入が再配送候補になってしまう。
    * スナップショットを持たない旧購入（手動配送・列の導入前）はここに出さない。
+   *
+   * `kinds` を指定すると、その配送種別だけを返す。**絞り込みは `limit` より先に効く。**
+   * 呼び出し側が全種別を取ってから種別で filter すると、他種別の失敗が上限ぶん溜まった
+   * だけで対象が1件も残らず、その種別の収束が永久に止まる。
    */
-  listUndeliveredAuto(limit = 50): Array<PurchaseRow & { item_name: string }> {
+  listUndeliveredAuto(
+    limit = 50,
+    opts: { kinds?: readonly string[] } = {},
+  ): Array<PurchaseRow & { item_name: string }> {
     const rows = this.db
       .prepare(
         `SELECT p.*, i.name AS item_name
@@ -824,7 +863,8 @@ export class Shop {
       .filter((p) => {
         const snapshot = parseDeliverySnapshot(p.delivery_snapshot_json);
         // 撤回された種別は運営にも再配送させない（面談を経ない復帰を作らない）
-        return snapshot !== null && AUTO_DELIVERABLE_KINDS.has(snapshot.delivery_kind);
+        if (snapshot === null || !AUTO_DELIVERABLE_KINDS.has(snapshot.delivery_kind)) return false;
+        return opts.kinds ? opts.kinds.includes(snapshot.delivery_kind) : true;
       })
       .slice(0, limit);
   }

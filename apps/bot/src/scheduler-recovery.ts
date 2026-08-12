@@ -1,5 +1,4 @@
 import type { Client } from "discord.js";
-import { parseDeliverySnapshot } from "@meigokujo/core";
 import type { Services } from "./services.js";
 
 const AUTODROP_PENDING_KEY = "autodrop:pending_role_sync";
@@ -365,32 +364,29 @@ export function expireOverduePurchases(services: Pick<Services, "shop">, actor: 
  * - 返金もできない … `処理失敗` に残す（ここだけ人の出番）
  */
 export async function convergePendingNicknameChanges(client: Client, services: Services): Promise<void> {
-  const targets = services.shop.listUndeliveredAuto(20).filter((p) => {
-    const snapshot = parseDeliverySnapshot(p.delivery_snapshot_json);
-    return snapshot?.delivery_kind === "set_nickname";
-  });
+  // **絞り込みを DB 側へ渡す。** 上限20件を取ってから種別で filter すると、
+  // 他種別の失敗が20件溜まっただけで名前変更が1件も拾えなくなり、
+  // 「払ったのに変わらない」が巡回では二度と解けなくなる
+  const targets = services.shop.listUndeliveredAuto(20, { kinds: ["set_nickname"] });
   if (targets.length === 0) return;
-  // **静的importにしない。** `shop-delivery` の依存の先で `config.ts` が
+  // **静的importにしない。** `shop-refund` の依存の先で `config.ts` が
   // 環境変数を検証して `process.exit(1)` するため、このモジュールを読むだけで
   // 落ちる環境（CIのユニットテスト）ができてしまう
-  const { deliverPurchase } = await import("./shop-delivery.js");
+  const { deliverOrRefund } = await import("./shop-refund.js");
   const guildId = services.settings.getString("guild:main");
   const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
   for (const purchase of targets) {
-    const outcome = await deliverPurchase(services, guild, purchase, "system:shop-nickname");
-    if (outcome.state !== "failed") continue;
+    // 配送→駄目なら返金まで。返金も失敗したら管理パネルを更新してスタッフへ知らせる
+    const { refund } = await deliverOrRefund(client, services, guild, purchase, "system:shop-nickname");
+    if (refund !== "refunded") continue;
+    // 知らせに失敗しても収束は済んでいる。次の購入の処理まで巻き込まない
     try {
-      services.shop.refund(purchase.id, outcome.error ?? "delivery_failed", "system:shop-nickname");
       const user = await client.users.fetch(purchase.user_id).catch(() => null);
-      await user
-        ?.send(`🛒 名前の変更ができなかったため、**${(purchase.paid_land ?? 0).toLocaleString()} Ld** を返金しました。`)
-        .catch(() => undefined);
-    } catch (error) {
-      services.events.log("shop_refund_failed", {
-        actor: "system:shop-nickname",
-        target: purchase.user_id,
-        payload: { purchaseId: purchase.id, error: (error as Error).message },
-      });
+      await user?.send(
+        `🛒 名前の変更ができなかったため、**${(purchase.paid_land ?? 0).toLocaleString()} Ld** を返金しました。`,
+      );
+    } catch {
+      /* DMが閉じている・届かない。返金は済んでいるので、ここで止めない */
     }
   }
 }

@@ -53,16 +53,46 @@ function setup() {
 type Ctx = ReturnType<typeof setup>;
 
 /** ニックネーム変更の成否を差し込めるメンバー／ギルド */
-function world(opts: { nickname?: string | null; owner?: boolean; myPosition?: number; theirPosition?: number; setFails?: string } = {}) {
-  const state = { nickname: opts.nickname ?? null };
+function world(
+  opts: {
+    nickname?: string | null;
+    /** ニックネーム未設定のときに見えている名前（グローバル表示名） */
+    globalName?: string;
+    owner?: boolean;
+    myPosition?: number;
+    theirPosition?: number;
+    setFails?: string;
+    /** 最初の N 回だけ失敗する（一時的な失敗＝そのあと成功する、を作る） */
+    failCalls?: number;
+    /** setNickname はエラーを返すが、実際には変わってしまうケース */
+    setChangesAnyway?: boolean;
+    /** 同時押しを実際に交差させるための待ち */
+    setDelayMs?: number;
+  } = {},
+) {
+  const state = {
+    nickname: opts.nickname ?? null,
+    fails: opts.setFails ?? null,
+    failCalls: opts.failCalls ?? Number.POSITIVE_INFINITY,
+  };
+  const globalName = opts.globalName ?? "グローバル名";
   const member = {
     id: USER,
     get nickname() {
       return state.nickname;
     },
+    /** 利用者に実際に見えている名前。ニックネームが無ければグローバル表示名 */
+    get displayName() {
+      return state.nickname ?? globalName;
+    },
     roles: { cache: new Collection(), highest: { position: opts.theirPosition ?? 10 } },
     setNickname: vi.fn(async (name: string) => {
-      if (opts.setFails) throw new Error(opts.setFails);
+      if (opts.setDelayMs) await new Promise((r) => setTimeout(r, opts.setDelayMs));
+      if (state.fails && state.failCalls > 0) {
+        state.failCalls -= 1;
+        if (opts.setChangesAnyway) state.nickname = name; // APIは失敗を返したが、実際は変わった
+        throw new Error(state.fails);
+      }
       state.nickname = name;
       return undefined;
     }),
@@ -98,6 +128,18 @@ function pressInteraction(ctx: Ctx, customId: string, w: ReturnType<typeof world
 
 const contentOf = (fn: ReturnType<typeof vi.fn>) => String((fn.mock.calls.at(-1) as never[])[0]?.content ?? "");
 const balance = (ctx: Ctx) => ctx.ledger.balanceOf(`user:${USER}`);
+
+/** 確認画面のボタン（確認したときの料金を持つ） */
+const nickDo = (ctx: Ctx, confirmationId: string, wanted: string, price: number = PRICE) =>
+  `shop:nick-do:${ctx.item.id}:${confirmationId}:${price}:${wanted}`;
+
+/** 直近の返信からボタンの custom_id を取り出す */
+function buttonIdOf(fn: ReturnType<typeof vi.fn>): string {
+  const payload = (fn.mock.calls.at(-1) as never[])[0] as {
+    components: { toJSON(): { components: { custom_id: string }[] } }[];
+  };
+  return payload.components.flatMap((r) => r.toJSON().components)[0]!.custom_id;
+}
 
 describe("課金前に止まるケース（スタッフの仕事にしない）", () => {
   it("Botより上位ロールの相手は無課金で止まり、運営相談を案内する", async () => {
@@ -195,7 +237,7 @@ describe("通常の流れ", () => {
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     const w = world({ nickname: "まえ" });
-    const customId = `shop:nick-do:${ctx.item.id}:conf-1:あたらしい`;
+    const customId = nickDo(ctx, "conf-1", "あたらしい");
 
     await handleShopButton(pressInteraction(ctx, customId, w), ctx.services);
     const after = balance(ctx);
@@ -212,7 +254,7 @@ describe("課金後に変更できなかったとき", () => {
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     const w = world({ nickname: "まえ", setFails: "Missing Permissions" });
-    const press = pressInteraction(ctx, `shop:nick-do:${ctx.item.id}:conf-1:あたらしい`, w) as unknown as {
+    const press = pressInteraction(ctx, nickDo(ctx, "conf-1", "あたらしい"), w) as unknown as {
       editReply: ReturnType<typeof vi.fn>;
     };
 
@@ -232,7 +274,7 @@ describe("課金後に変更できなかったとき", () => {
     const ctx = setup();
     const w = world({ nickname: "まえ", setFails: "Missing Permissions" });
     const { handleShopButton } = await shopPanelModule;
-    await handleShopButton(pressInteraction(ctx, `shop:nick-do:${ctx.item.id}:conf-1:あたらしい`, w), ctx.services);
+    await handleShopButton(pressInteraction(ctx, nickDo(ctx, "conf-1", "あたらしい"), w), ctx.services);
     const purchase = ctx.shop.listUserPurchases(USER)[0]!;
     const after = balance(ctx);
 
@@ -249,7 +291,7 @@ describe("課金後に変更できなかったとき", () => {
     const w = world({ nickname: "まえ", setFails: "Missing Permissions" });
     // 返金のLand移動を失敗させる
     ctx.db.prepare("CREATE TRIGGER fail_refund BEFORE INSERT ON transactions WHEN NEW.type='adjust' AND NEW.ref_type='shop_refund' BEGIN SELECT RAISE(ABORT,'injected'); END").run();
-    const press = pressInteraction(ctx, `shop:nick-do:${ctx.item.id}:conf-1:あたらしい`, w) as unknown as {
+    const press = pressInteraction(ctx, nickDo(ctx, "conf-1", "あたらしい"), w) as unknown as {
       editReply: ReturnType<typeof vi.fn>;
     };
 
@@ -339,7 +381,7 @@ describe("課金後にBotが落ちた場合の収束", () => {
     const ctx = setup();
     const w = world({ nickname: "まえ", setFails: "Missing Permissions" });
     await crashedPurchase(ctx, w);
-    const client = fakeClient(w, vi.fn());
+    const client = fakeClient(w, vi.fn(async () => undefined));
 
     await convergePendingNicknameChanges(client, ctx.services);
     await convergePendingNicknameChanges(client, ctx.services);
@@ -347,6 +389,277 @@ describe("課金後にBotが落ちた場合の収束", () => {
 
     expect(balance(ctx)).toBe(1_000_000);
     expect(ctx.events.listByType("shop_refunded")).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("他種別の未完了が上限ぶん溜まっていても、名前変更は収束する", async () => {
+    const { convergePendingNicknameChanges } = await recoveryModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ" });
+    const purchase = await crashedPurchase(ctx, w);
+    // 名前変更のほうが古い＝新しい順の一覧では最後尾になる
+    ctx.db.prepare("UPDATE shop_purchases SET purchased_at = purchased_at - 3600 WHERE id = ?").run(purchase.id);
+    // 別種別（ロール付与）の失敗が上限を超えて積まれている
+    const roleItem = ctx.shop.createItem(
+      {
+        name: "ロール",
+        price_land: 1,
+        kind: "one_shot",
+        delivery: "auto",
+        delivery_kind: "add_role",
+        delivery_data: JSON.stringify({ role_id: "r1" }),
+      },
+      "staff",
+    );
+    for (let i = 0; i < 25; i++) {
+      const p = ctx.shop.purchase({ itemId: roleItem.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+      ctx.shop.markDeliveryFailed(p.id, "boom", "test");
+    }
+    // 前提: 全種別から素直に20件取ると、名前変更は1件も入らない
+    expect(ctx.shop.listUndeliveredAuto(20).some((p) => p.id === purchase.id)).toBe(false);
+
+    await convergePendingNicknameChanges(fakeClient(w, vi.fn()), ctx.services);
+
+    expect(w.state.nickname).toBe("あたらしい");
+    expect(ctx.shop.getPurchase(purchase.id)!.delivery_state).toBe("delivered");
+    ctx.db.close();
+  });
+
+  it("巡回側で返金まで失敗したら、管理パネルを更新してスタッフへ知らせる", async () => {
+    const { convergePendingNicknameChanges } = await recoveryModule;
+    const { shopAdminPanelMessage } = await shokanModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ", setFails: "Missing Permissions" });
+    const purchase = await crashedPurchase(ctx, w);
+    ctx.db
+      .prepare(
+        "CREATE TRIGGER fail_refund BEFORE INSERT ON transactions WHEN NEW.type='adjust' AND NEW.ref_type='shop_refund' BEGIN SELECT RAISE(ABORT,'injected'); END",
+      )
+      .run();
+    ctx.settings.set("channel:shokan", "chan-1", "staff");
+    ctx.settings.set("panel:shop_admin:chan-1", "msg-1", "staff");
+    const send = vi.fn(async () => undefined);
+    const edit = vi.fn(async () => undefined);
+    const channel = { isTextBased: () => true, send, messages: { fetch: vi.fn(async () => ({ edit })) } };
+    const dm = vi.fn(async () => undefined);
+    const client = {
+      guilds: { fetch: vi.fn(async () => w.guild) },
+      users: { fetch: vi.fn(async () => ({ send: dm })) },
+      channels: { fetch: vi.fn(async () => channel) },
+    } as never;
+
+    await convergePendingNicknameChanges(client, ctx.services);
+
+    expect(ctx.shop.getPurchase(purchase.id)!.status).toBe("active"); // 返せていない
+    expect(ctx.events.listByType("shop_refund_failed")).toHaveLength(1);
+    expect(edit).toHaveBeenCalled(); // 管理パネルを更新した
+    const notice = (send.mock.calls.at(-1) as never[])[0] as { content: string; components?: unknown[] };
+    expect(notice.content).toContain("返金に失敗");
+    expect(notice.components ?? []).toHaveLength(0); // 通知にボタンは付けない（操作は管理パネルが正本）
+    expect(dm).not.toHaveBeenCalled(); // 返せていないのに「返金しました」とは言わない
+    const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description: string } }[] };
+    expect(panel.embeds[0]!.data.description).toContain("処理失敗 1件");
+    ctx.db.close();
+  });
+});
+
+describe("確認した内容を確定まで持たせる", () => {
+  it("確認したあとに料金が変わったら、課金せず新しい料金で確認し直す", async () => {
+    const { handleShopModal, handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ" });
+    const modal = pressInteraction(ctx, `shop:nick-input:${ctx.item.id}`, w, {
+      fields: { getTextInputValue: () => "あたらしい" },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+    await handleShopModal(modal as never, ctx.services);
+    const confirmed = buttonIdOf(modal.reply);
+    // 押す前に運営が値上げした
+    ctx.db.prepare("UPDATE shop_items SET price_land = 80000 WHERE id = ?").run(ctx.item.id);
+
+    const press = pressInteraction(ctx, confirmed, w) as unknown as {
+      update: ReturnType<typeof vi.fn>;
+      deferUpdate: ReturnType<typeof vi.fn>;
+    };
+    await handleShopButton(press as never, ctx.services);
+
+    // 確認した額でしか引かない。違ったら**1Ldも動かさず**新しい料金で出し直す
+    expect(balance(ctx)).toBe(1_000_000);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    expect(w.state.nickname).toBe("まえ");
+    expect(press.deferUpdate).not.toHaveBeenCalled();
+    expect(contentOf(press.update)).toContain("まだ引き落としていません");
+    expect(contentOf(press.update)).toContain("80,000");
+
+    // 出し直した確認から確定すれば、新しい料金で通る
+    await handleShopButton(pressInteraction(ctx, buttonIdOf(press.update), w), ctx.services);
+    expect(balance(ctx)).toBe(1_000_000 - 80_000);
+    expect(w.state.nickname).toBe("あたらしい");
+    ctx.db.close();
+  });
+
+  it("ニックネーム未設定でも、いま見えている名前と同じ入力は無課金で止まる", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    // ニックネームは無い。利用者に見えているのはグローバル表示名のほう
+    const w = world({ nickname: null, globalName: "タロウ" });
+    const modal = pressInteraction(ctx, `shop:nick-input:${ctx.item.id}`, w, {
+      fields: { getTextInputValue: () => "タロウ" },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(modal as never, ctx.services);
+
+    expect(contentOf(modal.reply)).toContain("同じです");
+    expect(balance(ctx)).toBe(1_000_000);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  it("確認画面には、いま見えている名前を旧名として出す", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: null, globalName: "タロウ" });
+    const modal = pressInteraction(ctx, `shop:nick-input:${ctx.item.id}`, w, {
+      fields: { getTextInputValue: () => "ジロウ" },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(modal as never, ctx.services);
+
+    expect(contentOf(modal.reply)).toContain("**タロウ** → **ジロウ**");
+    ctx.db.close();
+  });
+});
+
+describe("返金済み・同時押しでも、変えたうえで返す が起きない", () => {
+  it("返金まで済んだあとに古い確認画面を再送しても、名前は変わらない", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ", setFails: "Missing Permissions" });
+    const customId = nickDo(ctx, "conf-1", "あたらしい");
+    await handleShopButton(pressInteraction(ctx, customId, w), ctx.services);
+    const purchase = ctx.shop.listUserPurchases(USER)[0]!;
+    expect(purchase.status).toBe("refunded");
+
+    // 変更できる状態に戻ってから、同じ確認画面をもう一度押す
+    w.state.fails = null;
+    const press = pressInteraction(ctx, customId, w) as unknown as { editReply: ReturnType<typeof vi.fn> };
+    await handleShopButton(press as never, ctx.services);
+
+    expect(w.state.nickname).toBe("まえ"); // 返した以上、サービスは提供しない
+    expect(w.member.setNickname).toHaveBeenCalledTimes(1); // 2回目は Discord を叩きもしない
+    expect(balance(ctx)).toBe(1_000_000);
+    expect(contentOf(press.editReply)).toContain("返金済み");
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(1);
+    expect(ctx.events.listByType("shop_refunded")).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("同じ確認画面の同時二度押し: 変更が通るなら、返金は一切起きない", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ", setDelayMs: 5 });
+    const customId = nickDo(ctx, "conf-1", "あたらしい");
+
+    await Promise.all([
+      handleShopButton(pressInteraction(ctx, customId, w), ctx.services),
+      handleShopButton(pressInteraction(ctx, customId, w), ctx.services),
+    ]);
+
+    const purchase = ctx.shop.listUserPurchases(USER)[0]!;
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(1); // 二重課金なし
+    expect(w.state.nickname).toBe("あたらしい");
+    expect(purchase.status).toBe("active");
+    expect(purchase.delivery_state).toBe("delivered");
+    expect(balance(ctx)).toBe(1_000_000 - PRICE);
+    expect(ctx.events.listByType("shop_refunded")).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  it("同じ確認画面の同時二度押し: 変更が通らないなら、返金は一度だけ", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ", setFails: "Missing Permissions", setDelayMs: 5 });
+    const customId = nickDo(ctx, "conf-1", "あたらしい");
+
+    await Promise.all([
+      handleShopButton(pressInteraction(ctx, customId, w), ctx.services),
+      handleShopButton(pressInteraction(ctx, customId, w), ctx.services),
+    ]);
+
+    const purchase = ctx.shop.listUserPurchases(USER)[0]!;
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(1); // 二重課金なし
+    expect(w.state.nickname).toBe("まえ");
+    expect(purchase.status).toBe("refunded");
+    expect(balance(ctx)).toBe(1_000_000);
+    expect(ctx.events.listByType("shop_refunded")).toHaveLength(1); // 二重返金なし
+    // **これが本命**: 「名前が変わった」と「返金した」は絶対に両立しない
+    expect(w.state.nickname === "あたらしい" && purchase.status === "refunded").toBe(false);
+    ctx.db.close();
+  });
+
+  it("同時二度押しで一方が失敗・他方が成功しても、変更と返金は両立しない", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    // 1回目だけ失敗する＝返金へ倒れる裏で、もう1本が変更を成功させうる並び
+    const w = world({ nickname: "まえ", setFails: "Server Error", failCalls: 1, setDelayMs: 5 });
+    const customId = nickDo(ctx, "conf-1", "あたらしい");
+
+    await Promise.all([
+      handleShopButton(pressInteraction(ctx, customId, w), ctx.services),
+      handleShopButton(pressInteraction(ctx, customId, w), ctx.services),
+    ]);
+
+    const purchase = ctx.shop.listUserPurchases(USER)[0]!;
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(1); // 二重課金なし
+    // どちらへ倒れてもよいが、**倒れた先と辻褄が合っていること**。
+    // 「名前は変わったのに返金もした」＝払わずにサービスを受けた、を許さない
+    if (purchase.status === "refunded") {
+      expect(w.state.nickname).toBe("まえ");
+      expect(balance(ctx)).toBe(1_000_000);
+    } else {
+      expect(w.state.nickname).toBe("あたらしい");
+      expect(purchase.delivery_state).toBe("delivered");
+      expect(balance(ctx)).toBe(1_000_000 - PRICE);
+      expect(ctx.events.listByType("shop_refunded")).toHaveLength(0);
+    }
+    ctx.db.close();
+  });
+});
+
+describe("setNickname がエラーを返したとき", () => {
+  it("取り直して希望どおりになっていれば、成功として扱い返金しない", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    // APIはエラーを返したが、実際には変わっていた（応答だけ落ちた等）
+    const w = world({ nickname: "まえ", setFails: "Service Unavailable", setChangesAnyway: true });
+    const press = pressInteraction(ctx, nickDo(ctx, "conf-1", "あたらしい"), w) as unknown as {
+      editReply: ReturnType<typeof vi.fn>;
+    };
+
+    await handleShopButton(press as never, ctx.services);
+
+    expect(w.state.nickname).toBe("あたらしい");
+    const purchase = ctx.shop.listUserPurchases(USER)[0]!;
+    expect(purchase.delivery_state).toBe("delivered");
+    expect(purchase.status).toBe("active");
+    expect(balance(ctx)).toBe(1_000_000 - PRICE); // 変わったのだから返さない
+    expect(ctx.events.listByType("shop_refunded")).toHaveLength(0);
+    expect(contentOf(press.editReply)).toContain("変更しました");
+    ctx.db.close();
+  });
+
+  it("取り直しても変わっていなければ返金する", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ", setFails: "Missing Permissions" });
+    const press = pressInteraction(ctx, nickDo(ctx, "conf-1", "あたらしい"), w) as unknown as {
+      editReply: ReturnType<typeof vi.fn>;
+    };
+
+    await handleShopButton(press as never, ctx.services);
+
+    expect(w.state.nickname).toBe("まえ");
+    expect(balance(ctx)).toBe(1_000_000);
+    expect(contentOf(press.editReply)).toContain("返金しました");
     ctx.db.close();
   });
 });

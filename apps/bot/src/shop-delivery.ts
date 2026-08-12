@@ -24,7 +24,12 @@ import type { Services } from "./services.js";
  */
 
 export interface DeliveryOutcome {
-  state: "delivered" | "failed" | "already_delivered";
+  /**
+   * `not_active` は返金・取消・失効した購入への配送要求。**`failed` と混ぜない。**
+   * `failed` は「配れなかったので返金へ倒す」合図なので、返金済みの購入がここへ入ると
+   * 二重返金を試みることになる。
+   */
+  state: "delivered" | "failed" | "already_delivered" | "not_active";
   /** 利用者へ見せる文言。**失敗時に「配送しました」と読める文言を返さない** */
   message: string;
   /** 失敗理由（記録用） */
@@ -74,13 +79,67 @@ export function nicknameBlockReason(
   return null;
 }
 
-export async function deliverPurchase(
+const purchaseLocks = new Map<number, Promise<unknown>>();
+
+/**
+ * 同じ購入への操作を**同時に2本走らせない。**
+ *
+ * 状態の判定（`beginDelivery`）と実行（Discord API）の間には必ず待ちがあり、
+ * その隙に2本目が入ると、両方が「まだ配送していない」を見てから両方が動く。
+ * 片方が名前を変え、もう片方が失敗して返金する——**変えたうえで返した**が成立する。
+ * DBの条件付き更新は書き込みの二重化までしか止められないので、Discord側の副作用を
+ * 含めて直列化する。Botは単一プロセスなので、プロセス内の直列化で足りる。
+ *
+ * **区間は「配送して、駄目なら返す」まで。** 配送だけを直列化すると、失敗した1本目が
+ * 返金を書き終える前に2本目が「まだ有効な購入」を見てしまい、同じ穴が残る
+ * （`deliverOrRefund` がこのロックを取る）。
+ */
+export function withPurchaseLock<T>(purchaseId: number, run: () => Promise<T>): Promise<T> {
+  const previous = purchaseLocks.get(purchaseId);
+  const next = (previous ? previous.then(noop, noop) : Promise.resolve()).then(run);
+  purchaseLocks.set(purchaseId, next);
+  return next.finally(() => {
+    // 後続が並んでいれば、その最後の1本だけが自分を消す
+    if (purchaseLocks.get(purchaseId) === next) purchaseLocks.delete(purchaseId);
+  });
+}
+
+function noop(): void {
+  /* 直前の操作の成否は、次の操作の判定に影響しない（DBの状態だけを見る） */
+}
+
+export function deliverPurchase(
+  services: Services,
+  guild: Guild | null,
+  purchase: PurchaseRow,
+  actor: string,
+): Promise<DeliveryOutcome> {
+  return withPurchaseLock(purchase.id, () => deliverPurchaseUnlocked(services, guild, purchase, actor));
+}
+
+/**
+ * 配送の本体。**`withPurchaseLock` の中からだけ呼ぶこと。**
+ * 返金までを1区間にしたい呼び出し側（`deliverOrRefund`）のために開けてある。
+ */
+export async function deliverPurchaseUnlocked(
   services: Services,
   guild: Guild | null,
   purchase: PurchaseRow,
   actor: string,
 ): Promise<DeliveryOutcome> {
   const begin = services.shop.beginDelivery(purchase.id);
+  if (begin.reason === "not_active") {
+    // 返金・取消・失効した購入への配送要求（古い確認画面の再送・巡回の取りこぼし）。
+    // **返金済みなら名前は変えない。** ここを failed にすると呼び出し側が二重返金を試みる
+    return {
+      state: "not_active",
+      message:
+        begin.status === "refunded"
+          ? "この購入は返金済みのため、何もしていません。"
+          : `この購入は ${begin.status} のため、何もしていません。`,
+      error: `purchase_not_active:${begin.status}`,
+    };
+  }
   if (!begin.proceed) {
     // 二度押し・再起動・再配送要求。副作用を一切走らせない
     return { state: "already_delivered", message: "この購入は配送済みです。" };
@@ -135,15 +194,30 @@ export async function deliverPurchase(
       // **最新の状態を取り直す。** 課金後にBotが落ちた場合、変更だけ先に済んでいることがある
       const member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
       if (!member) return fail("member_fetch_failed", "メンバー情報の取得に失敗し変更できませんでした。");
-      if (member.nickname === wanted) {
+      // 判定は `nickname` ではなく **利用者に見えている名前**（`displayName`）で行う。
+      // ニックネーム未設定なら見えているのはグローバル表示名で、利用者にとっての
+      // 「いまの名前」はそちら。`nickname` で見ると、既に希望どおりに見えている人へ
+      // 「変わっていない」と判定してしまう
+      if (member.displayName === wanted) {
         // 既に希望どおり。**返金せず完了にする**（変わったのに返金する、を防ぐ）
         services.shop.markDeliverySucceeded(purchase.id, actor);
         return { state: "delivered", message: `サーバーニックネームは既に **${wanted}** です。` };
       }
       const blocked = nicknameBlockReason(guild, member);
       if (blocked) return fail(blocked.reason, blocked.message);
-      const changed = await member.setNickname(wanted, "公式ショップ: 名前変更").then(() => true).catch((e: Error) => e.message);
-      if (changed !== true) return fail(`nickname_set_failed:${changed}`, "名前の変更に失敗しました。");
+      const setError = await member
+        .setNickname(wanted, "公式ショップ: 名前変更")
+        .then(() => null)
+        .catch((e: Error) => e.message || "unknown");
+      if (setError !== null) {
+        // **エラーが返っても、変わっていることがある。** 応答が落ちただけ・内部再試行で
+        // 通っていた、など。ここで確かめずに返金すると「名前は変わったのに返金もした」に
+        // なる。最新のメンバーを取り直し、希望どおりに見えていれば成功として扱う
+        const latest = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
+        if (latest?.displayName !== wanted) {
+          return fail(`nickname_set_failed:${setError}`, "名前の変更に失敗しました。");
+        }
+      }
       services.shop.markDeliverySucceeded(purchase.id, actor);
       return { state: "delivered", message: `サーバーニックネームを **${wanted}** に変更しました。` };
     }
