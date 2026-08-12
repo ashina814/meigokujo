@@ -230,7 +230,10 @@ describe("通常の流れ", () => {
     expect(balance(ctx)).toBe(1_000_000 - PRICE);
     const purchase = ctx.shop.listUserPurchases(USER)[0]!;
     expect(purchase.delivery_state).toBe("delivered");
-    expect(JSON.parse(purchase.request_json!)).toEqual({ nickname: "あたらしい名前" });
+    const request = JSON.parse(purchase.request_json!) as { nickname: string; before: unknown };
+    expect(request.nickname).toBe("あたらしい名前");
+    // 落ちても戻せるように、改名前の状態も購入行へ残す
+    expect(request).toHaveProperty("before");
     ctx.db.close();
   });
 
@@ -859,6 +862,99 @@ describe("入城の名前制度との統合", () => {
     expect(w.state.nickname).toBe("まえ"); // 変えていない
     expect(balance(ctx)).toBe(1_000_000); // 返金した
     expect(ctx.nicknames.reservation("よこどり")?.user_id).toBe("999999999999999999"); // 横取りしない
+    ctx.db.close();
+  });
+});
+
+describe("レビュー指摘の4点", () => {
+  it("**確認が必要な名前（flag）は課金前に止める**（払っても素通しにしない）", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ" });
+    ctx.nicknames.addDenyWord("ようかくにん", "staff", { action: "flag" });
+    const m = pressInteraction(ctx, `shop:nick-input:${ctx.item.id}`, w, {
+      fields: { getTextInputValue: () => "ようかくにんな名前" },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(m as never, ctx.services);
+
+    expect(contentOf(m.reply)).toContain("確認が必要");
+    expect(contentOf(m.reply)).not.toContain("ようかくにん"); // どの語で止まったかは見せない
+    expect(balance(ctx)).toBe(1_000_000);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  it("**claim後に落ちても、再試行の失敗で元の名前へ戻る**", async () => {
+    const { convergePendingNicknameChanges } = await recoveryModule;
+    const ctx = setup();
+    const w = world({ nickname: "もとの", setFails: "Missing Permissions" });
+    ctx.nicknames.claim({ userId: USER, nickname: "もとの", setVia: "entry", actor: "t" });
+    const before = ctx.nicknames.captureRestorePoint(USER);
+    // 課金 → 予約まで済んで落ちた状態を作る（購入行には改名前の控えが残っている）
+    ctx.shop.purchase({
+      itemId: ctx.item.id,
+      userId: USER,
+      actor: USER,
+      memberRoleIds: [],
+      request: { nickname: "あたらしい", before },
+    });
+    ctx.nicknames.claim({ userId: USER, nickname: "あたらしい", setVia: "shop", actor: "t", allowLocked: true });
+    expect(ctx.nicknames.get(USER)?.nickname).toBe("あたらしい"); // 落ちた時点では改名後
+
+    const client = {
+      guilds: { fetch: vi.fn(async () => w.guild) },
+      users: { fetch: vi.fn(async () => ({ send: vi.fn(async () => undefined) })) },
+      channels: { fetch: vi.fn(async () => null) },
+    } as never;
+    await convergePendingNicknameChanges(client, ctx.services);
+
+    // Discord変更に失敗したので、**元の名前と予約へ戻る**
+    expect(ctx.nicknames.get(USER)?.nickname).toBe("もとの");
+    expect(ctx.nicknames.reservation("もとの")?.user_id).toBe(USER);
+    expect(ctx.nicknames.reservation("あたらしい")).toBeNull();
+    expect(balance(ctx)).toBe(1_000_000); // 返金済み
+    ctx.db.close();
+  });
+
+  it("**同じ人の別購入（A→B と A→C）が同時に走っても正本が壊れない**", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    // 1本目だけ Discord 変更に失敗する＝巻き戻しと、もう1本の登録が噛み合う並び
+    const w = world({ nickname: "もとの", setFails: "Missing Permissions", failCalls: 1, setDelayMs: 5 });
+    ctx.nicknames.claim({ userId: USER, nickname: "もとの", setVia: "entry", actor: "t" });
+
+    await Promise.all([
+      handleShopButton(pressInteraction(ctx, nickDo(ctx, "conf-B", "びー"), w), ctx.services),
+      handleShopButton(pressInteraction(ctx, nickDo(ctx, "conf-C", "しー"), w), ctx.services),
+    ]);
+
+    // **DBの正本と Discord の表示が食い違わない**（片方の巻き戻しが他方を消さない）
+    const row = ctx.nicknames.get(USER);
+    expect(row?.nickname ?? null).toBe(w.state.nickname);
+    if (row) {
+      expect(ctx.nicknames.reservation(row.name_key)?.user_id).toBe(USER);
+      const keys = (ctx.db.prepare("SELECT name_key FROM nickname_reservations").all() as Array<{ name_key: string }>)
+        .map((r) => r.name_key);
+      expect(keys).toEqual([row.name_key]); // 使っていない名前の予約が残らない
+    }
+    ctx.db.close();
+  });
+
+  it("**成功判定は nickname を見る**（グローバル表示名の一致で誤認しない）", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    // 登録名は別。ニックネームは未設定で、グローバル表示名がたまたま希望と同じ
+    const w = world({ nickname: null, globalName: "きぼう", setFails: "Missing Permissions" });
+    ctx.nicknames.claim({ userId: USER, nickname: "とうろく", setVia: "entry", actor: "t" });
+
+    await handleShopButton(pressInteraction(ctx, nickDo(ctx, "conf-1", "きぼう"), w), ctx.services);
+
+    // displayName で見ていると「既に希望どおり」と誤認し、課金したまま完了になる
+    expect(w.member.setNickname).toHaveBeenCalled(); // 変更を試みている
+    expect(w.state.nickname).toBeNull(); // 実際には変わっていない
+    expect(balance(ctx)).toBe(1_000_000); // 返金された
+    expect(ctx.nicknames.get(USER)?.nickname).toBe("とうろく"); // 元の登録へ戻る
     ctx.db.close();
   });
 });

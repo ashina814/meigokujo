@@ -74,6 +74,12 @@ export type NameStatus =
  * 「入城しているのに本人が入城パネルから変えられる」状態になり、
  * 入城後は商館の正式な改名だけ、という約束が既存メンバーにだけ効かなくなる。
  */
+/** 改名前の状態。購入行など**落ちても残る場所**へ保存して使う */
+export interface NameRestorePoint {
+  name: MemberNameRow | null;
+  reservation: NicknameReservationRow | null;
+}
+
 export interface LegacyNameEntry {
   userId: string;
   nickname: string;
@@ -323,12 +329,31 @@ export class Nicknames {
    * 予約だけ残ると、誰も名乗っていない名前が永久に取れなくなる。
    */
   rollback(snapshot: NameSnapshot, actor: string): void {
+    this.restore(snapshot.userId, { name: snapshot.previousName, reservation: snapshot.previousReservation }, actor);
+  }
+
+  /**
+   * 改名する前の状態を控える。**プロセスが落ちても戻せるように、呼び出し側が保存する。**
+   *
+   * `claim()` の返す控えはメモリにしか無い。課金 → 予約 → Discord変更 の途中で
+   * 落ちると、再起動後の再試行は「予約を取り直す」ところから始まり、
+   * **元の名前が分からなくなる**。購入行のように残る場所へ入れておく。
+   */
+  captureRestorePoint(userId: string): NameRestorePoint {
+    const name = this.get(userId);
+    return { name, reservation: name ? this.reservation(name.name_key) : null };
+  }
+
+  /**
+   * 控えた状態へ戻す。いまの登録と予約を外してから、控えを書き戻す。
+   * 何度呼んでも同じ結果になる（同じ控えなら同じ状態に落ち着く）。
+   */
+  restore(userId: string, point: NameRestorePoint, actor: string): void {
     const run = this.db.transaction(() => {
-      this.db
-        .prepare("DELETE FROM nickname_reservations WHERE name_key = ? AND user_id = ?")
-        .run(snapshot.claimedKey, snapshot.userId);
-      this.db.prepare("DELETE FROM member_names WHERE user_id = ?").run(snapshot.userId);
-      const p = snapshot.previousName;
+      // いま自分が持っている予約を外す（名前が変わっていれば鍵も違う）
+      this.db.prepare("DELETE FROM nickname_reservations WHERE kind = 'member' AND user_id = ?").run(userId);
+      this.db.prepare("DELETE FROM member_names WHERE user_id = ?").run(userId);
+      const p = point.name;
       if (p) {
         this.db
           .prepare(
@@ -336,7 +361,7 @@ export class Nicknames {
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
           )
           .run(
-            p.user_id,
+            userId,
             p.nickname,
             p.name_key,
             p.state,
@@ -350,7 +375,7 @@ export class Nicknames {
             p.updated_at,
           );
       }
-      const r = snapshot.previousReservation;
+      const r = point.reservation;
       if (r) {
         this.db
           .prepare(
@@ -361,7 +386,7 @@ export class Nicknames {
       }
     });
     run.immediate();
-    this.events.log("nickname_rollback", { actor, target: snapshot.userId, payload: { key: snapshot.claimedKey } });
+    this.events.log("nickname_rollback", { actor, target: userId, payload: { restored: point.name?.nickname ?? null } });
   }
 
   /** 入城完了で名前を固定する */

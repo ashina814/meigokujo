@@ -795,7 +795,7 @@ export function openDb(path: string): Database.Database {
   // 既に member_names がある本番へ後から足す（承認済みの語を記録する列）
   ensureColumn(db, "member_names", "flag_ok_words", "TEXT");
   ensureColumn(db, "shop_purchases", "request_json", "TEXT");
-  configureNicknameItem(db);
+  applyNicknameItemSetting(db);
   ensureColumn(db, "casino_tx", "op_key", "TEXT");
   ensureColumn(db, "casino_tx", "op_actor_id", "TEXT");
   backfillChipTxOperationKey(db);
@@ -1207,9 +1207,14 @@ function migrateMonthlyToThirtyDayTerms(db: Database.Database): void {
  *
  * `shop:nickname_item_id` が指す商品を「Botが自分で処理する商品」にする。
  * **設定が無ければ何もしない**ので、コードを入れただけでは挙動が変わらない。
- * 運営が設定を入れた時点で、次の購入からセルフサービスになる。
+ *
+ * ## 反映のタイミング
+ *
+ * ここは `openDb()` の中、つまり**起動時にだけ**走る。設定を入れただけでは
+ * 商品は切り替わらず、**Botの再起動（deploy で自動）で反映**される。
+ * 起動を待たずに反映したい場合は、設定を書いたあとにこの関数を直接呼ぶ。
  */
-function configureNicknameItem(db: Database.Database): void {
+export function applyNicknameItemSetting(db: Database.Database): void {
   const row = db.prepare("SELECT value FROM settings WHERE key = 'shop:nickname_item_id'").get() as
     | { value: string }
     | undefined;

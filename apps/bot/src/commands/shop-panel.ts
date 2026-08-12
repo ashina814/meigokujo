@@ -259,6 +259,14 @@ function checkNicknameBeforeCharge(
 ): { ok: true; nickname: string } | { ok: false; message: string } {
   const evaluated = services.nicknames.evaluate(input);
   if (!evaluated.ok) return { ok: false, message: describeRejection(evaluated.rejection) };
+  // **確認が要る名前は自動で変えない。** 入城側では門番の確認待ちになるので、
+  // 払えば素通しになる経路を作らない。どの語で止まったかは本人に見せない
+  if (evaluated.flagged) {
+    return {
+      ok: false,
+      message: "この名前は運営の確認が必要です。別の名前をお選びいただくか、運営にご相談ください。",
+    };
+  }
   if (evaluated.nickname === currentName(services, member)) {
     return { ok: false, message: "いまの名前と同じです。" };
   }
@@ -627,7 +635,9 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         actor: `user:${interaction.user.id}`,
         memberRoleIds: [...pre.member.roles.cache.keys()],
         mode: "land",
-        request: { nickname: wanted },
+        // **落ちても戻せるように、改名前の状態を購入行へ残す。** `claim()` の控えは
+        // メモリにしか無く、予約を取った直後に落ちると元の名前が分からなくなる
+        request: { nickname: wanted, before: services.nicknames.captureRestorePoint(interaction.user.id) },
       });
     } catch (error) {
       await interaction.editReply({ content: `❌ ${purchaseErrorMessage(error, services)}`, embeds: [], components: [] });

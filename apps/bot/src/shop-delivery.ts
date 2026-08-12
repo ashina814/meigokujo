@@ -1,6 +1,13 @@
 import type { Guild, GuildMember } from "discord.js";
-import { AUTO_DELIVERABLE_KINDS, describeRejection, parseDeliverySnapshot, type PurchaseRow } from "@meigokujo/core";
+import {
+  AUTO_DELIVERABLE_KINDS,
+  describeRejection,
+  parseDeliverySnapshot,
+  type NameRestorePoint,
+  type PurchaseRow,
+} from "@meigokujo/core";
 import { refreshEvalStatsForUser } from "./eval-daily.js";
+import { withUserLock } from "./user-lock.js";
 import type { Services } from "./services.js";
 
 /**
@@ -52,6 +59,14 @@ export function parseRequest(json: string | null): Record<string, unknown> | nul
   } catch {
     return null;
   }
+}
+
+/** 購入行に残した「改名前の状態」。読めなければ使わない（握り潰さない） */
+function parseRestorePoint(raw: unknown): NameRestorePoint | null {
+  if (!raw || typeof raw !== "object") return null;
+  const point = raw as { name?: unknown; reservation?: unknown };
+  if (!("name" in point) || !("reservation" in point)) return null;
+  return point as NameRestorePoint;
 }
 
 /**
@@ -114,7 +129,22 @@ export function deliverPurchase(
   purchase: PurchaseRow,
   actor: string,
 ): Promise<DeliveryOutcome> {
-  return withPurchaseLock(purchase.id, () => deliverPurchaseUnlocked(services, guild, purchase, actor));
+  return withNicknameSerialization(purchase, () =>
+    withPurchaseLock(purchase.id, () => deliverPurchaseUnlocked(services, guild, purchase, actor)),
+  );
+}
+
+/**
+ * 名前変更は**利用者単位でも直列化する**。
+ *
+ * 購入ごとのロックだけだと、同じ人の別の改名purchase（A→B と A→C）が同時に走る。
+ * 予約の取り合いと巻き戻しが噛み合って、正本が壊れる。入城パネルと同じ鍵を使うので、
+ * 商館とパネルの同時操作も噛み合わない。
+ */
+export function withNicknameSerialization<T>(purchase: PurchaseRow, run: () => Promise<T>): Promise<T> {
+  const snapshot = parseDeliverySnapshot(purchase.delivery_snapshot_json);
+  if (snapshot?.delivery_kind !== "set_nickname") return run();
+  return withUserLock(`nickname:${purchase.user_id}`, run);
 }
 
 /**
@@ -218,15 +248,24 @@ export async function deliverPurchaseUnlocked(
         return fail(`nickname_rejected:${r.code}`, describeRejection(r));
       }
       const { nickname: wanted, snapshot } = claimed;
+      // 巻き戻しは**購入行に残した控え**を優先する。予約を取った直後に落ちて
+      // 再試行された場合、`claim()` の控えは「改名後の状態」しか指していない
+      const persisted = parseRestorePoint(request?.before);
+      const restoreName = (): void => {
+        if (persisted) services.nicknames.restore(userId, persisted, actor);
+        else services.nicknames.rollback(snapshot, actor);
+      };
 
-      if (member.displayName === wanted) {
+      // **見るのは `nickname`（サーバーニックネーム）。** `displayName` はグローバル
+      // 表示名も混ざるので、まだ変えていないのに「変わっている」と誤認する
+      if (member.nickname === wanted) {
         // 既に希望どおり（課金後の落ち・再実行）。**返金せず完了にする**
         services.shop.markDeliverySucceeded(purchase.id, actor);
         return { state: "delivered", message: `サーバーニックネームは既に **${wanted}** です。` };
       }
       const blocked = nicknameBlockReason(guild, member);
       if (blocked) {
-        services.nicknames.rollback(snapshot, actor);
+        restoreName();
         return fail(blocked.reason, blocked.message);
       }
       const setError = await member
@@ -238,9 +277,9 @@ export async function deliverPurchaseUnlocked(
         // 通っていた、など。ここで確かめずに巻き戻すと「名前は変わったのに返金もした」に
         // なる。最新のメンバーを取り直し、希望どおりに見えていれば成功として扱う
         const latest = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
-        if (latest?.displayName !== wanted) {
+        if (latest?.nickname !== wanted) {
           // **予約を残さない。** 誰も名乗っていない名前が取れなくなる
-          services.nicknames.rollback(snapshot, actor);
+          restoreName();
           return fail(`nickname_set_failed:${setError}`, "名前の変更に失敗しました。");
         }
       }

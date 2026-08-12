@@ -1,7 +1,12 @@
 import type { Client, Guild } from "discord.js";
 import { ShopError, type PurchaseRow } from "@meigokujo/core";
 import { refreshShopAdminPanels } from "./commands/shokan.js";
-import { deliverPurchaseUnlocked, withPurchaseLock, type DeliveryOutcome } from "./shop-delivery.js";
+import {
+  deliverPurchaseUnlocked,
+  withNicknameSerialization,
+  withPurchaseLock,
+  type DeliveryOutcome,
+} from "./shop-delivery.js";
 import type { Services } from "./services.js";
 
 /**
@@ -34,12 +39,14 @@ export function deliverOrRefund(
   purchase: PurchaseRow,
   actor: string,
 ): Promise<Settlement> {
-  return withPurchaseLock(purchase.id, async () => {
-    const outcome = await deliverPurchaseUnlocked(services, guild, purchase, actor);
-    if (outcome.state !== "failed") return { outcome };
-    const refund = await refundOrEscalate(client, services, purchase, outcome.error ?? "delivery_failed", actor);
-    return { outcome, refund };
-  });
+  return withNicknameSerialization(purchase, () =>
+    withPurchaseLock(purchase.id, async () => {
+      const outcome = await deliverPurchaseUnlocked(services, guild, purchase, actor);
+      if (outcome.state !== "failed") return { outcome };
+      const refund = await refundOrEscalate(client, services, purchase, outcome.error ?? "delivery_failed", actor);
+      return { outcome, refund };
+    }),
+  );
 }
 
 /**
