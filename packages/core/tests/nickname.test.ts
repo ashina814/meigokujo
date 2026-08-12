@@ -301,7 +301,7 @@ describe("不適切名（denylist）", () => {
     expect(r.ok).toBe(true);
     const status = names.status(A);
     expect(status.kind).toBe("review");
-    if (status.kind === "review") expect(status.flagged).toBe("あやしい");
+    if (status.kind === "review") expect(status.flagged).toEqual(["あやしい"]);
     db.close();
   });
 
@@ -353,6 +353,32 @@ describe("不適切名（denylist）", () => {
     db.close();
   });
 
+  it("**当たっている要確認語をすべて返す**（門番が全部見て通せるように）", () => {
+    const { db, names } = setup();
+    names.addDenyWord("あやしい", "staff", { action: "flag" });
+    names.addDenyWord("ことば", "staff", { action: "flag" });
+    names.claim({ userId: A, nickname: "あやしいことば", setVia: "entry", actor: "t" });
+
+    const status = names.status(A);
+
+    expect(status.kind).toBe("review");
+    if (status.kind === "review") expect(status.flagged).toEqual(["あやしい", "ことば"]);
+    db.close();
+  });
+
+  it("複数語に当たっていても、まとめて承認できる", () => {
+    const { db, names } = setup();
+    names.addDenyWord("あやしい", "staff", { action: "flag" });
+    names.addDenyWord("ことば", "staff", { action: "flag" });
+    names.claim({ userId: A, nickname: "あやしいことば", setVia: "entry", actor: "t" });
+
+    expect(names.approveFlagged(A, "user:judge")).toBe(true);
+
+    expect(names.status(A).kind).toBe("ok");
+    expect(JSON.parse(names.get(A)!.flag_ok_words!)).toEqual(["あやしい", "ことば"]);
+    db.close();
+  });
+
   it("当たらない要確認語を足しても、既存の承認は生きたまま", () => {
     const { db, names } = setup();
     names.addDenyWord("あやしい", "staff", { action: "flag" });
@@ -365,20 +391,17 @@ describe("不適切名（denylist）", () => {
     db.close();
   });
 
-  it("承認済みの語を消したときも、承認は無効に戻る", () => {
+  it("**承認済みの語が減っただけなら、再確認は要らない**（規則が緩くなっただけ）", () => {
     const { db, names } = setup();
     names.addDenyWord("あやしい", "staff", { action: "flag" });
     names.addDenyWord("ことば", "staff", { action: "flag" });
     names.claim({ userId: A, nickname: "あやしいことば", setVia: "entry", actor: "t" });
-    names.approveFlagged(A, "user:judge");
+    names.approveFlagged(A, "user:judge"); // A+B を見て承認
     expect(names.status(A).kind).toBe("ok");
 
-    names.removeDenyWord("ことば", "staff");
+    names.removeDenyWord("ことば", "staff"); // B が消える
 
-    // 当たっている語の集合が変わったので、いったん保留へ戻る
-    expect(names.status(A).kind).toBe("review");
-    names.approveFlagged(A, "user:judge");
-    expect(names.status(A).kind).toBe("ok");
+    expect(names.status(A).kind).toBe("ok"); // 見た語の部分集合なので通ったまま
     db.close();
   });
 

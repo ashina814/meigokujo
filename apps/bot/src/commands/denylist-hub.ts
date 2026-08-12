@@ -115,6 +115,26 @@ export function denywordModal(action: "reject" | "flag") {
     );
 }
 
+/**
+ * 確認待ちの追加。**既存の名前に当たる語は、見せてから保存する。**
+ *
+ * 保存してから件数を出すと、短い語で大勢を巻き込んだあとに気づくことになる。
+ * プロセス内に置くだけなので、再起動で消えても入れ直せばよい。
+ */
+const pendingAdd = new Map<string, { pattern: string; action: "reject" | "flag"; note?: string; affected: number }>();
+
+function savedMessage(pattern: string, action: "reject" | "flag", raw: string, affected: number): string {
+  return [
+    `✅ ${action === "reject" ? "**拒否**" : "**要確認**"}の語として \`${pattern}\` を登録しました。`,
+    raw.trim() !== pattern ? `-# 入力 \`${raw.trim()}\` を正規化して保存しています。` : "",
+    affected > 0
+      ? `⚠️ **登録済みの名前 ${affected}件がこの語に一致します。**${action === "reject" ? "入城の判定で違反として扱われます（遡って改名はさせません）。" : "門番の確認待ちになります。"}`
+      : "登録済みの名前で一致するものはありません。",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 export async function handleDenywordModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
   const action = interaction.customId.split(":")[3] === "flag" ? "flag" : "reject";
   const raw = interaction.fields.getTextInputValue("pattern");
@@ -124,20 +144,51 @@ export async function handleDenywordModal(interaction: ModalSubmitInteraction, s
     await interaction.reply({ content: "⚠️ 語が空です。", flags: MessageFlags.Ephemeral });
     return;
   }
-  // **足す前に影響を出す。** 短い語は関係ない名前まで巻き込むので、数で気づけるようにする
   const affected = affectedCount(services, pattern);
-  services.nicknames.addDenyWord(pattern, `user:${interaction.user.id}`, { action, note });
+  if (affected === 0) {
+    // 誰にも当たらないなら、そのまま入れてよい
+    services.nicknames.addDenyWord(pattern, `user:${interaction.user.id}`, { action, note });
+    await interaction.reply({ content: savedMessage(pattern, action, raw, 0), flags: MessageFlags.Ephemeral });
+    return;
+  }
+  // **まだ保存しない。** 何件に当たるかを見てから決めてもらう
+  pendingAdd.set(interaction.user.id, { pattern, action, note, affected });
   await interaction.reply({
     content: [
-      `✅ ${action === "reject" ? "**拒否**" : "**要確認**"}の語として \`${pattern}\` を登録しました。`,
-      raw.trim() !== pattern ? `-# 入力 \`${raw.trim()}\` を正規化して保存しています。` : "",
-      affected > 0
-        ? `⚠️ **登録済みの名前 ${affected}件がこの語に一致します。**${action === "reject" ? "入城の判定で違反として扱われます（遡って改名はさせません）。" : "門番の確認待ちになります。"}`
-        : "登録済みの名前で一致するものはありません。",
+      `⚠️ \`${pattern}\` は **登録済みの名前 ${affected}件に一致します。**`,
+      raw.trim() !== pattern ? `-# 入力 \`${raw.trim()}\` を正規化した結果です。` : "",
+      action === "reject"
+        ? "登録すると、その方々の名前は入城の判定で**違反**として扱われます（遡って改名はさせません）。"
+        : "登録すると、その方々は**門番の確認待ち**になります。既に門番が通した名前も、この語を見ていなければもう一度確認が要ります。",
+      "",
+      "**まだ登録していません。** よければ下のボタンで確定してください。",
     ]
       .filter(Boolean)
       .join("\n"),
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("mgmt:denyword:confirm").setLabel(`${affected}件に一致するが登録する`).setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("mgmt:denyword:cancel").setLabel("やめる").setStyle(ButtonStyle.Secondary),
+      ),
+    ],
     flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function confirmAdd(interaction: ButtonInteraction, services: Services): Promise<void> {
+  const pending = pendingAdd.get(interaction.user.id);
+  if (!pending) {
+    await interaction.update({ content: "⌛ この確認は期限切れです。もう一度追加からやり直してください。", components: [] });
+    return;
+  }
+  pendingAdd.delete(interaction.user.id);
+  services.nicknames.addDenyWord(pending.pattern, `user:${interaction.user.id}`, {
+    action: pending.action,
+    note: pending.note,
+  });
+  await interaction.update({
+    content: savedMessage(pending.pattern, pending.action, pending.pattern, pending.affected),
+    components: [],
   });
 }
 
@@ -158,6 +209,12 @@ export async function handleDenywordButton(interaction: ButtonInteraction, servi
   if (action === undefined) return false;
   if (action === "add-reject") return void (await interaction.showModal(denywordModal("reject"))), true;
   if (action === "add-flag") return void (await interaction.showModal(denywordModal("flag"))), true;
+  if (action === "confirm") return void (await confirmAdd(interaction, services)), true;
+  if (action === "cancel") {
+    pendingAdd.delete(interaction.user.id);
+    await interaction.update({ content: "登録をやめました。", components: [] });
+    return true;
+  }
   await interaction.update(denylistHome(services));
   return true;
 }

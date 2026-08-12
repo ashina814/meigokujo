@@ -180,3 +180,34 @@ describe("確認が要る名前の承認", () => {
     ctx.db.close();
   });
 });
+
+describe("複数の要確認語に当たっている場合", () => {
+  it("**門番の画面に一致した語を全部出す**（1語だけ見て通させない）", async () => {
+    const { handleSessionCommand } = await entryModule;
+    const ctx = setup();
+    ctx.entry.recordJoin(PRESENT);
+    ctx.nicknames.claim({ userId: PRESENT, nickname: "あやしいことば", setVia: "entry", actor: "t" });
+    ctx.nicknames.addDenyWord("あやしい", "staff", { action: "flag" });
+    ctx.nicknames.addDenyWord("ことば", "staff", { action: "flag" });
+
+    const judge = memberOf(JUDGE, [ROLE.judge]);
+    const present = memberOf(PRESENT, [ROLE.wait]);
+    const reply = vi.fn(async () => undefined);
+    await handleSessionCommand(
+      {
+        guild: guildWith([judge, present]),
+        member: judge,
+        user: { id: JUDGE },
+        options: { getSubcommand: () => "判定" },
+        reply,
+      } as unknown as ChatInputCommandInteraction,
+      ctx.services,
+    );
+
+    const desc = descOf(reply);
+    expect(desc).toContain("2件に一致");
+    expect(desc).toContain("あやしい");
+    expect(desc).toContain("ことば");
+    ctx.db.close();
+  });
+});

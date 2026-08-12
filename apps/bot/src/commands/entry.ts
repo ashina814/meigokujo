@@ -879,7 +879,11 @@ function renderJudgment(services: Services, judgeId: string) {
     const status = services.nicknames.status(id);
     if (status.kind === "unset") return `・⚠️ <@${id}> — **名前が未登録**`;
     if (status.kind === "violation") return `・❌ <@${id}> — **${status.nickname}**（${status.reason}）`;
-    if (status.kind === "review") return `・🔍 <@${id}> — **${status.nickname}**（\`${status.flagged}\` を含みます）`;
+    if (status.kind === "review") {
+      // **当たっている語を全部出す。** 1つだけ見せると、門番は残りを見ないまま通してしまう
+      const words = status.flagged.map((w) => `\`${w}\``).join(" / ");
+      return `・🔍 <@${id}> — **${status.nickname}**（${status.flagged.length}件に一致: ${words}）`;
+    }
     return `・✅ <@${id}> — **${status.nickname}**`;
   };
   const embed = new EmbedBuilder()

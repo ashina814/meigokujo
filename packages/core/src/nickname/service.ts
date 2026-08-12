@@ -61,8 +61,9 @@ export type ClaimResult =
  * **一括合格には含めない。** 門番が目で見て通したときだけ `ok` になる。
  */
 export type NameStatus =
-  | { kind: "ok"; nickname: string; flagged: string | null }
-  | { kind: "review"; nickname: string; flagged: string }
+  /** `flagged` は**いま当たっている要確認語すべて**。門番はこれを全部見て通す */
+  | { kind: "ok"; nickname: string; flagged: string[] }
+  | { kind: "review"; nickname: string; flagged: string[] }
   | { kind: "violation"; nickname: string; reason: string }
   | { kind: "unset" };
 
@@ -171,6 +172,17 @@ export class Nicknames {
    * 変われば承認は無効になる。1件だけ覚えると、**あとから増えた語を門番が
    * 見ないまま通った状態**になってしまう。
    */
+  /** 承認時に記録した語。読めなければ「何も見ていない」として扱う（安全側） */
+  private parseWords(raw: string | null): string[] {
+    if (!raw) return [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+
   flaggedWords(key: string): string[] {
     return this.listDenyWords()
       .filter((w) => w.action === "flag" && w.pattern && key.includes(w.pattern))
@@ -377,15 +389,19 @@ export class Nicknames {
     const evaluated = this.evaluate(row.nickname);
     if (!evaluated.ok) return { kind: "violation", nickname: row.nickname, reason: "名前の規則に合いません" };
     // flag は自動では通さない。**門番が見て許可するまで保留**。
-    // 許可済みでも、**当たっている語が変わっていれば保留へ戻す**。
-    // 禁止語を足したあと、門番が見ていない語まで承認済みとして通るのを防ぐ
-    if (evaluated.flagged) {
-      const current = JSON.stringify(this.flaggedWords(evaluated.key));
-      if (!row.flag_ok_at || row.flag_ok_words !== current) {
-        return { kind: "review", nickname: row.nickname, flagged: evaluated.flagged };
+    //
+    // 許可済みでも、**門番が見ていない語が増えていれば保留へ戻す**。判定は
+    // 「いま当たっている語 ⊆ 承認したときに見た語」。完全一致にすると、
+    // 語が消えて規則が緩くなっただけでも再確認を強いることになる
+    const current = this.flaggedWords(evaluated.key);
+    if (current.length > 0) {
+      const approved = new Set(row.flag_ok_at ? this.parseWords(row.flag_ok_words) : []);
+      const unreviewed = current.filter((w) => !approved.has(w));
+      if (unreviewed.length > 0) {
+        return { kind: "review", nickname: row.nickname, flagged: current };
       }
     }
-    return { kind: "ok", nickname: row.nickname, flagged: evaluated.flagged };
+    return { kind: "ok", nickname: row.nickname, flagged: current };
   }
 
   /**
@@ -398,8 +414,13 @@ export class Nicknames {
     const status = this.status(userId);
     if (status.kind !== "review") return false;
     const ts = now();
-    // **見た語をそのまま残す。** あとで語が増減したら、この記録と食い違うので承認が切れる
-    const words = JSON.stringify(this.flaggedWords(nicknameKey(status.nickname)));
+    // **これまでに見た語へ積む。** 一度見た語は、消えて戻ってきても見た事実が残る。
+    // いま当たっている語だけで上書きすると、その履歴を毎回捨てることになる
+    const row = this.get(userId);
+    const prior = row?.flag_ok_at ? this.parseWords(row.flag_ok_words) : [];
+    const words = JSON.stringify(
+      [...new Set([...prior, ...this.flaggedWords(nicknameKey(status.nickname))])].sort(),
+    );
     this.db
       .prepare("UPDATE member_names SET flag_ok_at = ?, flag_ok_by = ?, flag_ok_words = ?, updated_at = ? WHERE user_id = ?")
       .run(ts, actor, words, ts, userId);
