@@ -268,13 +268,21 @@ export async function handleDenywordRemove(interaction: StringSelectMenuInteract
     .catch(() => undefined);
 }
 
-export async function handleDenywordButton(interaction: ButtonInteraction, services: Services): Promise<boolean> {
+/**
+ * 禁止語のボタン。**どの枝を通っても必ず interaction へ返す。**
+ *
+ * 以前は「何もしない」で抜ける枝があり、親ボタン（`mgmt:denyword`）を押すと
+ * 応答が無いまま Discord 側がタイムアウトしていた。返り値で成否を伝える形は
+ * その穴を作りやすいので、常に描画して void を返す。
+ */
+export async function handleDenywordButton(interaction: ButtonInteraction, services: Services): Promise<void> {
   const action = interaction.customId.split(":")[2];
-  if (action === undefined) return false;
-  if (action === "add-reject") return void (await interaction.showModal(denywordModal("reject"))), true;
-  if (action === "add-flag") return void (await interaction.showModal(denywordModal("flag"))), true;
+  // 親ボタン（`mgmt:denyword`）。一覧を出す
+  if (action === undefined) return void (await interaction.update(denylistHome(services)));
+  if (action === "add-reject") return void (await interaction.showModal(denywordModal("reject")));
+  if (action === "add-flag") return void (await interaction.showModal(denywordModal("flag")));
   const token = interaction.customId.split(":")[3];
-  if (action === "confirm") return void (await confirmAdd(interaction, services, token)), true;
+  if (action === "confirm") return void (await confirmAdd(interaction, services, token));
   if (action === "cancel") {
     // **その画面の分だけ消す。** 別に開いている確認は残す
     const pending = takePending(token, interaction.user.id);
@@ -283,8 +291,8 @@ export async function handleDenywordButton(interaction: ButtonInteraction, servi
       content: pending ? `登録をやめました（\`${pending.pattern}\`）。` : "この確認は期限切れです。",
       components: [],
     });
-    return true;
+    return;
   }
+  // 知らない枝でも黙って落とさない（応答なしはタイムアウトになる）
   await interaction.update(denylistHome(services));
-  return true;
 }

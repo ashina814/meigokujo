@@ -396,3 +396,67 @@ describe("確認の期限", () => {
     ctx.db.close();
   });
 });
+
+describe("/管理 からの経路（親ボタン）", () => {
+  /**
+   * 描画関数が正しくても、**ディスパッチャが応答を返さなければ**
+   * Discord 側は「時間内に応答しませんでした」になる。
+   * 親ボタンを実際に `handleAdminButton` へ通して、画面が返ることを固定する。
+   */
+  async function pressFromHub(ctx: ReturnType<typeof setup>, customId: string) {
+    const { handleAdminButton } = await import("../src/commands/admin-hub.js");
+    const update = vi.fn(async () => undefined);
+    const reply = vi.fn(async () => undefined);
+    const showModal = vi.fn(async () => undefined);
+    await handleAdminButton(
+      {
+        customId,
+        // OWNER_ID と一致させて管理権限を通す
+        user: { id: process.env.OWNER_ID },
+        member: null,
+        update,
+        reply,
+        showModal,
+      } as never,
+      ctx.services,
+    );
+    return { update, reply, showModal };
+  }
+
+  it("**`mgmt:denyword` を押すと禁止語ホームが返る**（応答なしで落ちない）", async () => {
+    const ctx = setup();
+
+    const { update, reply } = await pressFromHub(ctx, "mgmt:denyword");
+
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(reply).not.toHaveBeenCalled();
+    const payload = (update.mock.calls[0] as never[])[0] as {
+      embeds: { data: { title: string } }[];
+      components: unknown[];
+    };
+    expect(payload.embeds[0]!.data.title).toContain("禁止語");
+    expect(payload.components.length).toBeGreaterThan(0);
+    ctx.db.close();
+  });
+
+  it("語が登録済みでも親ボタンから開ける", async () => {
+    const ctx = setup();
+    ctx.nicknames.addDenyWord("ばつ", "staff", { action: "reject" });
+
+    const { update } = await pressFromHub(ctx, "mgmt:denyword");
+
+    const payload = (update.mock.calls[0] as never[])[0] as { embeds: { data: { description: string } }[] };
+    expect(payload.embeds[0]!.data.description).toContain("拒否 1件");
+    ctx.db.close();
+  });
+
+  it("追加ボタンはモーダルを返す（こちらも応答が返る）", async () => {
+    const ctx = setup();
+
+    const { showModal, update } = await pressFromHub(ctx, "mgmt:denyword:add-reject");
+
+    expect(showModal).toHaveBeenCalledTimes(1);
+    expect(update).not.toHaveBeenCalled();
+    ctx.db.close();
+  });
+});
