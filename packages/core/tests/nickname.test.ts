@@ -201,6 +201,51 @@ describe("既存の重複（legacy conflict）", () => {
   });
 });
 
+describe("取り込み時の固定", () => {
+  it("入城済みは固定、案内待ちは未固定で取り込む", () => {
+    const { db, names } = setup();
+    names.importLegacy(
+      [
+        { userId: A, nickname: "にゅうじょうずみ", locked: true },
+        { userId: B, nickname: "あんないまち", locked: false },
+        { userId: C, nickname: "していなし" },
+      ],
+      "staff",
+    );
+    expect(names.get(A)?.locked_at).not.toBeNull();
+    expect(names.get(B)?.locked_at).toBeNull();
+    expect(names.get(C)?.locked_at).toBeNull(); // 既定は未固定
+    db.close();
+  });
+
+  it("固定して取り込んだ人は、本人からは変更できない", () => {
+    const { db, names } = setup();
+    names.importLegacy([{ userId: A, nickname: "にゅうじょうずみ", locked: true }], "staff");
+    const r = names.claim({ userId: A, nickname: "べつめい", setVia: "entry", actor: "t" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.rejection).toEqual({ code: "locked" });
+    // 商館の正式な改名は通る
+    expect(names.claim({ userId: A, nickname: "べつめい", setVia: "shop", actor: "t", allowLocked: true }).ok).toBe(true);
+    db.close();
+  });
+
+  it("重複していても入城済みなら固定する", () => {
+    const { db, names } = setup();
+    const r = names.importLegacy(
+      [
+        { userId: A, nickname: "かぶり", locked: true },
+        { userId: B, nickname: "かぶり", locked: true },
+      ],
+      "staff",
+    );
+    expect(r.conflicted).toBe(2);
+    expect(r.locked).toBe(2);
+    expect(names.get(A)?.locked_at).not.toBeNull();
+    expect(names.get(B)?.locked_at).not.toBeNull();
+    db.close();
+  });
+});
+
 describe("不適切名（denylist）", () => {
   it("既定では語彙を持たない（勝手に作らない）", () => {
     const { db, names } = setup();
@@ -217,15 +262,60 @@ describe("不適切名（denylist）", () => {
     db.close();
   });
 
-  it("flag は登録を止めず、門番の確認へ回す", () => {
+  it("flag は登録を止めないが、**自動では通さない**（門番の確認待ちになる）", () => {
     const { db, names } = setup();
     names.addDenyWord("あやしい", "staff", { action: "flag" });
     const r = names.claim({ userId: A, nickname: "あやしい人", setVia: "entry", actor: "t" });
     expect(r.ok).toBe(true);
-    if (r.ok) expect(r.flagged).toBe("あやしい");
     const status = names.status(A);
-    expect(status.kind).toBe("ok");
-    if (status.kind === "ok") expect(status.flagged).toBe("あやしい");
+    expect(status.kind).toBe("review");
+    if (status.kind === "review") expect(status.flagged).toBe("あやしい");
+    db.close();
+  });
+
+  it("門番が確認して初めて通る", () => {
+    const { db, names } = setup();
+    names.addDenyWord("あやしい", "staff", { action: "flag" });
+    names.claim({ userId: A, nickname: "あやしい人", setVia: "entry", actor: "t" });
+
+    expect(names.approveFlagged(A, "user:judge")).toBe(true);
+
+    expect(names.status(A).kind).toBe("ok");
+    expect(names.get(A)?.flag_ok_by).toBe("user:judge");
+    db.close();
+  });
+
+  it("確認が要らない名前を承認しても何も起きない（空振りの承認を残さない）", () => {
+    const { db, names } = setup();
+    names.claim({ userId: A, nickname: "ふつう", setVia: "entry", actor: "t" });
+    expect(names.approveFlagged(A, "user:judge")).toBe(false);
+    expect(names.get(A)?.flag_ok_at).toBeNull();
+    db.close();
+  });
+
+  it("**名前を変えたら承認は消える**（別の名前は見ていない）", () => {
+    const { db, names } = setup();
+    names.addDenyWord("あやしい", "staff", { action: "flag" });
+    names.claim({ userId: A, nickname: "あやしい人", setVia: "entry", actor: "t" });
+    names.approveFlagged(A, "user:judge");
+    expect(names.status(A).kind).toBe("ok");
+
+    names.claim({ userId: A, nickname: "あやしい者", setVia: "entry", actor: "t" });
+
+    expect(names.status(A).kind).toBe("review");
+    expect(names.get(A)?.flag_ok_at).toBeNull();
+    db.close();
+  });
+
+  it("同じ名前を出し直しただけなら承認は残る", () => {
+    const { db, names } = setup();
+    names.addDenyWord("あやしい", "staff", { action: "flag" });
+    names.claim({ userId: A, nickname: "あやしい人", setVia: "entry", actor: "t" });
+    names.approveFlagged(A, "user:judge");
+
+    names.claim({ userId: A, nickname: "あやしい人", setVia: "entry", actor: "t" });
+
+    expect(names.status(A).kind).toBe("ok");
     db.close();
   });
 

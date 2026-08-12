@@ -20,6 +20,8 @@ export interface MemberNameRow {
   state: NameState;
   policy_version: string | null;
   locked_at: number | null;
+  flag_ok_at: number | null;
+  flag_ok_by: string | null;
   set_via: NameSetVia;
   created_at: number;
   updated_at: number;
@@ -51,11 +53,30 @@ export type ClaimResult =
   | { ok: true; nickname: string; key: string; flagged: string | null; snapshot: NameSnapshot }
   | { ok: false; rejection: ClaimRejection };
 
-/** 入城の可否に使う、いまの名前の状態 */
+/**
+ * 入城の可否に使う、いまの名前の状態。
+ *
+ * `review` は禁止語の `flag` に触れているが、機械では白黒つけないもの。
+ * **一括合格には含めない。** 門番が目で見て通したときだけ `ok` になる。
+ */
 export type NameStatus =
   | { kind: "ok"; nickname: string; flagged: string | null }
+  | { kind: "review"; nickname: string; flagged: string }
   | { kind: "violation"; nickname: string; reason: string }
   | { kind: "unset" };
+
+/**
+ * 取り込む1件。`locked` は**その時点で既に城の中にいるか**で決める。
+ *
+ * 入城済みの人の名前は、制度上そこで確定している。未固定のまま取り込むと
+ * 「入城しているのに本人が入城パネルから変えられる」状態になり、
+ * 入城後は商館の正式な改名だけ、という約束が既存メンバーにだけ効かなくなる。
+ */
+export interface LegacyNameEntry {
+  userId: string;
+  nickname: string;
+  locked?: boolean;
+}
 
 class Taken extends Error {
   constructor(readonly by: "member" | "legacy_conflict") {
@@ -214,13 +235,16 @@ export class Nicknames {
       // ON CONFLICT の条件が偽なら1行も動かない＝他人が持っている。ここで検める
       const after = this.reservation(key);
       if (!after || after.kind !== "member" || after.user_id !== input.userId) throw new Taken(after?.kind ?? "member");
+      // 名前が変われば、前の名前に対する門番の承認は無効になる（別の名前は見ていない）
+      const keepApproval = previousName?.nickname === nickname;
       this.db
         .prepare(
-          `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, set_via, created_at, updated_at)
-           VALUES (?,?,?,'registered',?,?,?,?,?)
+          `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, flag_ok_at, flag_ok_by, set_via, created_at, updated_at)
+           VALUES (?,?,?,'registered',?,?,?,?,?,?,?)
            ON CONFLICT(user_id) DO UPDATE SET
              nickname = excluded.nickname, name_key = excluded.name_key, state = 'registered',
-             policy_version = excluded.policy_version, set_via = excluded.set_via, updated_at = excluded.updated_at`,
+             policy_version = excluded.policy_version, flag_ok_at = excluded.flag_ok_at,
+             flag_ok_by = excluded.flag_ok_by, set_via = excluded.set_via, updated_at = excluded.updated_at`,
         )
         .run(
           input.userId,
@@ -228,6 +252,8 @@ export class Nicknames {
           key,
           NICKNAME_POLICY_VERSION,
           previousName?.locked_at ?? null,
+          keepApproval ? (previousName?.flag_ok_at ?? null) : null,
+          keepApproval ? (previousName?.flag_ok_by ?? null) : null,
           input.setVia,
           previousName?.created_at ?? ts,
           ts,
@@ -268,10 +294,22 @@ export class Nicknames {
       if (p) {
         this.db
           .prepare(
-            `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, set_via, created_at, updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?)`,
+            `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, flag_ok_at, flag_ok_by, set_via, created_at, updated_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
           )
-          .run(p.user_id, p.nickname, p.name_key, p.state, p.policy_version, p.locked_at, p.set_via, p.created_at, p.updated_at);
+          .run(
+            p.user_id,
+            p.nickname,
+            p.name_key,
+            p.state,
+            p.policy_version,
+            p.locked_at,
+            p.flag_ok_at,
+            p.flag_ok_by,
+            p.set_via,
+            p.created_at,
+            p.updated_at,
+          );
       }
       const r = snapshot.previousReservation;
       if (r) {
@@ -311,7 +349,32 @@ export class Nicknames {
     }
     const evaluated = this.evaluate(row.nickname);
     if (!evaluated.ok) return { kind: "violation", nickname: row.nickname, reason: "名前の規則に合いません" };
+    // flag は自動では通さない。**門番が見て許可するまで保留**
+    if (evaluated.flagged && !row.flag_ok_at) {
+      return { kind: "review", nickname: row.nickname, flagged: evaluated.flagged };
+    }
     return { kind: "ok", nickname: row.nickname, flagged: evaluated.flagged };
+  }
+
+  /**
+   * `flag` に触れた名前を、門番が目で見て通す。
+   *
+   * **いまの名前に対する承認**なので、名前が変われば `claim()` 側で消える。
+   * 承認できるのは実際に flag に触れている名前だけ（空振りの承認を残さない）。
+   */
+  approveFlagged(userId: string, actor: string): boolean {
+    const status = this.status(userId);
+    if (status.kind !== "review") return false;
+    const ts = now();
+    this.db
+      .prepare("UPDATE member_names SET flag_ok_at = ?, flag_ok_by = ?, updated_at = ? WHERE user_id = ?")
+      .run(ts, actor, ts, userId);
+    this.events.log("nickname_flag_approved", {
+      actor,
+      target: userId,
+      payload: { nickname: status.nickname, flagged: status.flagged },
+    });
+    return true;
   }
 
   // ---- 移行 ----
@@ -327,11 +390,17 @@ export class Nicknames {
    * ここで弾くと取り込めず、結果としてその名前が新規に取られてしまう。
    */
   importLegacy(
-    entries: ReadonlyArray<{ userId: string; nickname: string }>,
+    entries: ReadonlyArray<LegacyNameEntry>,
     actor: string,
-  ): { imported: number; conflicted: number; skipped: number; conflicts: Array<{ display: string; users: string[] }> } {
+  ): {
+    imported: number;
+    conflicted: number;
+    skipped: number;
+    locked: number;
+    conflicts: Array<{ display: string; users: string[] }>;
+  } {
     const run = this.db.transaction(() => {
-      const groups = new Map<string, Array<{ userId: string; nickname: string }>>();
+      const groups = new Map<string, LegacyNameEntry[]>();
       let skipped = 0;
       for (const e of entries) {
         const nickname = normalizeNickname(e.nickname);
@@ -342,10 +411,11 @@ export class Nicknames {
         }
         const key = nicknameKey(nickname);
         if (!groups.has(key)) groups.set(key, []);
-        groups.get(key)!.push({ userId: e.userId, nickname });
+        groups.get(key)!.push({ ...e, nickname });
       }
       let imported = 0;
       let conflicted = 0;
+      let locked = 0;
       const conflicts: Array<{ display: string; users: string[] }> = [];
       const ts = now();
       for (const [key, members] of groups) {
@@ -359,8 +429,9 @@ export class Nicknames {
                VALUES (?, 'member', ?, ?, ?, ?) ON CONFLICT(name_key) DO NOTHING`,
             )
             .run(key, m.userId, m.nickname, ts, ts);
-          this.writeName(m.userId, m.nickname, key, "legacy", ts);
+          this.writeName(m.userId, m.nickname, key, "legacy", ts, m.locked === true);
           imported += 1;
+          if (m.locked) locked += 1;
           continue;
         }
         // 重複。**所有者を立てず**、名前そのものを予約する
@@ -372,31 +443,44 @@ export class Nicknames {
           )
           .run(key, members[0]?.nickname ?? key, ts, ts);
         for (const m of members) {
-          this.writeName(m.userId, m.nickname, key, "conflict", ts);
+          this.writeName(m.userId, m.nickname, key, "conflict", ts, m.locked === true);
           conflicted += 1;
+          if (m.locked) locked += 1;
         }
         // 先に単独で取り込まれていた人も conflict へ落とす
         this.db.prepare("UPDATE member_names SET state = 'conflict', updated_at = ? WHERE name_key = ?").run(ts, key);
         conflicts.push({ display: members[0]?.nickname ?? key, users: this.holdersOf(key).map((r) => r.user_id) });
       }
-      return { imported, conflicted, skipped, conflicts };
+      return { imported, conflicted, skipped, locked, conflicts };
     });
     const result = run.immediate();
     this.events.log("nickname_legacy_imported", {
       actor,
-      payload: { imported: result.imported, conflicted: result.conflicted, skipped: result.skipped },
+      payload: {
+        imported: result.imported,
+        conflicted: result.conflicted,
+        skipped: result.skipped,
+        locked: result.locked,
+      },
     });
     return result;
   }
 
-  private writeName(userId: string, nickname: string, key: string, state: NameState, ts: number): void {
+  private writeName(
+    userId: string,
+    nickname: string,
+    key: string,
+    state: NameState,
+    ts: number,
+    locked: boolean,
+  ): void {
     this.db
       .prepare(
-        `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, set_via, created_at, updated_at)
-         VALUES (?,?,?,?,NULL,NULL,'staff',?,?)
+        `INSERT INTO member_names (user_id, nickname, name_key, state, policy_version, locked_at, flag_ok_at, flag_ok_by, set_via, created_at, updated_at)
+         VALUES (?,?,?,?,NULL,?,NULL,NULL,'staff',?,?)
          ON CONFLICT(user_id) DO UPDATE SET nickname = excluded.nickname, name_key = excluded.name_key,
-           state = excluded.state, updated_at = excluded.updated_at`,
+           state = excluded.state, locked_at = excluded.locked_at, updated_at = excluded.updated_at`,
       )
-      .run(userId, nickname, key, state, ts, ts);
+      .run(userId, nickname, key, state, locked ? ts : null, ts, ts);
   }
 }

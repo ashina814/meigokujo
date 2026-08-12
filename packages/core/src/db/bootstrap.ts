@@ -749,6 +749,11 @@ CREATE TABLE IF NOT EXISTS member_names (
   state          TEXT NOT NULL CHECK (state IN ('registered','legacy','conflict')),
   policy_version TEXT,
   locked_at      INTEGER,
+  -- 禁止語の flag に触れた名前を、門番が目で見て通した記録。
+  -- flag は機械では白黒つかないものなので、**人が1回許可して初めて通る**。
+  -- 名前を変えたら承認も消える（別の名前は見ていないため）
+  flag_ok_at     INTEGER,
+  flag_ok_by     TEXT,
   set_via        TEXT NOT NULL,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL

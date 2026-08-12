@@ -50,16 +50,29 @@ function setup() {
   return { db, ledger, settings, events, entry, nicknames, services };
 }
 
-/** 名前設定モーダルの送信 */
-function modalSubmit(input: string, opts: { setFails?: string } = {}) {
-  const state = { nickname: null as string | null };
+/**
+ * 名前設定モーダルの送信。
+ * `shared` を渡すと同じ相手（＝同じ Discord 側の状態）へ複数本ぶつけられる。
+ */
+function modalSubmit(
+  input: string,
+  opts: { setFails?: string; setChangesAnyway?: boolean; delayMs?: number; shared?: { nickname: string | null } } = {},
+) {
+  const state = opts.shared ?? { nickname: null as string | null };
   const member = {
     id: USER,
     get nickname() {
       return state.nickname;
     },
+    get displayName() {
+      return state.nickname ?? "グローバル名";
+    },
     setNickname: vi.fn(async (name: string) => {
-      if (opts.setFails) throw new Error(opts.setFails);
+      if (opts.delayMs) await new Promise((r) => setTimeout(r, opts.delayMs));
+      if (opts.setFails) {
+        if (opts.setChangesAnyway) state.nickname = name; // APIは失敗を返したが実際は変わった
+        throw new Error(opts.setFails);
+      }
       state.nickname = name;
       return undefined;
     }),
@@ -67,7 +80,7 @@ function modalSubmit(input: string, opts: { setFails?: string } = {}) {
   const interaction = {
     customId: "entry:name-input",
     user: { id: USER },
-    guild: { id: "g1" },
+    guild: { id: "g1", members: { fetch: vi.fn(async () => member) } },
     member,
     fields: { getTextInputValue: () => input },
     reply: vi.fn(async () => undefined),
@@ -151,6 +164,21 @@ describe("案内待ちが自分で名前を決める", () => {
     ctx.db.close();
   });
 
+  it("**setNickname がエラーでも、取り直して希望どおりなら成功として扱う**", async () => {
+    const { handleEntryModal } = await entryModule;
+    const ctx = setup();
+    // APIはエラーを返したが、実際には変わっていた（応答だけ落ちた等）
+    const m = modalSubmit("こはく", { setFails: "Service Unavailable", setChangesAnyway: true });
+
+    await handleEntryModal(m.interaction, ctx.services);
+
+    expect(m.state.nickname).toBe("こはく");
+    expect(ctx.nicknames.get(USER)?.nickname).toBe("こはく"); // 正本を巻き戻さない
+    expect(ctx.nicknames.reservation("こはく")?.user_id).toBe(USER);
+    expect(contentOf(m.reply)).toContain("こはく");
+    ctx.db.close();
+  });
+
   it("説明会までは何度でも変えられる", async () => {
     const { handleEntryModal } = await entryModule;
     const ctx = setup();
@@ -165,28 +193,110 @@ describe("案内待ちが自分で名前を決める", () => {
   });
 });
 
-describe("手で入城ロールを付けられたとき", () => {
-  function roleAdded(ctx: ReturnType<typeof setup>) {
-    const cacheOf = (ids: string[]) => new Collection(ids.map((id) => [id, { id }] as [string, { id: string }]));
-    const roleRemove = vi.fn(async () => undefined);
-    const send = vi.fn(async () => undefined);
-    const guild = {
-      id: "g1",
-      members: { fetch: vi.fn(async () => newMember) },
-      channels: { fetch: vi.fn(async () => ({ isTextBased: () => true, send })) },
-      client: { channels: { fetch: vi.fn(async () => null) } },
-    } as unknown as Guild;
-    const oldMember = { id: USER, user: { bot: false }, guild, roles: { cache: cacheOf([ROLE.wait]) } } as unknown as GuildMember;
-    const newMember = {
-      id: USER,
-      user: { bot: false },
-      guild,
-      roles: { cache: cacheOf([ROLE.wait, ROLE.ghost]), add: vi.fn(async () => undefined), remove: roleRemove },
-      send: vi.fn(async () => undefined),
-    } as unknown as GuildMember;
-    return { oldMember, newMember, guild, roleRemove, send };
+describe("同じ人が並行して名前を送ったとき", () => {
+  /** 正本（DB）と Discord の表示が一致し、取り残した予約が無いこと */
+  function assertConsistent(ctx: ReturnType<typeof setup>, discordName: string | null) {
+    const row = ctx.nicknames.get(USER);
+    expect(row).not.toBeNull();
+    expect(row!.nickname).toBe(discordName); // DB と Discord が食い違わない
+    expect(ctx.nicknames.reservation(row!.name_key)?.user_id).toBe(USER);
+    // 使っていない名前の予約が残っていない
+    const all = ctx.db.prepare("SELECT name_key FROM nickname_reservations").all() as Array<{ name_key: string }>;
+    expect(all.map((r) => r.name_key)).toEqual([row!.name_key]);
   }
 
+  it("A→B を同時に送っても、DBとDiscordが食い違わない", async () => {
+    const { handleEntryModal } = await entryModule;
+    const ctx = setup();
+    const shared = { nickname: null as string | null };
+    const a = modalSubmit("えーめい", { shared, delayMs: 5 });
+    const b = modalSubmit("びーめい", { shared, delayMs: 5 });
+
+    await Promise.all([handleEntryModal(a.interaction, ctx.services), handleEntryModal(b.interaction, ctx.services)]);
+
+    assertConsistent(ctx, shared.nickname);
+    expect(["えーめい", "びーめい"]).toContain(shared.nickname);
+    ctx.db.close();
+  });
+
+  it("**片方が失敗しても、もう片方の正本を消さない**", async () => {
+    const { handleEntryModal } = await entryModule;
+    const ctx = setup();
+    const shared = { nickname: null as string | null };
+    // 1本目は Discord 側で必ず失敗する。巻き戻しが2本目を巻き込まないこと
+    const failing = modalSubmit("しっぱい", { shared, setFails: "Missing Permissions", delayMs: 5 });
+    const ok = modalSubmit("せいこう", { shared, delayMs: 5 });
+
+    await Promise.all([
+      handleEntryModal(failing.interaction, ctx.services),
+      handleEntryModal(ok.interaction, ctx.services),
+    ]);
+
+    expect(shared.nickname).toBe("せいこう");
+    assertConsistent(ctx, "せいこう");
+    ctx.db.close();
+  });
+
+  it("同じ名前を同時に2本送っても壊れない", async () => {
+    const { handleEntryModal } = await entryModule;
+    const ctx = setup();
+    const shared = { nickname: null as string | null };
+    const a = modalSubmit("おなじ", { shared, delayMs: 5 });
+    const b = modalSubmit("おなじ", { shared, delayMs: 5 });
+
+    await Promise.all([handleEntryModal(a.interaction, ctx.services), handleEntryModal(b.interaction, ctx.services)]);
+
+    assertConsistent(ctx, "おなじ");
+    ctx.db.close();
+  });
+});
+
+describe("確認が要る名前（denylist の flag）", () => {
+  it("一括合格の対象から外れ、門番が通して初めて入城できる", async () => {
+    const { handleMemberRoleUpdate } = await entryModule;
+    const ctx = setup();
+    ctx.nicknames.claim({ userId: USER, nickname: "ようかくにん", setVia: "entry", actor: "t" });
+    ctx.nicknames.addDenyWord("ようかくにん", "staff", { action: "flag" });
+    const w = roleAdded(ctx);
+
+    // 未確認のうちは通さない（ロールごと差し戻す）
+    await handleMemberRoleUpdate(w.oldMember, w.newMember, ctx.services);
+    expect(w.roleRemove).toHaveBeenCalledWith(ROLE.ghost, expect.any(String));
+    expect(ctx.entry.getSoul(USER)?.status ?? "waiting").not.toBe("ghost");
+
+    // 門番が確認して通す
+    expect(ctx.nicknames.approveFlagged(USER, "user:judge")).toBe(true);
+    const w2 = roleAdded(ctx);
+    await handleMemberRoleUpdate(w2.oldMember, w2.newMember, ctx.services);
+
+    expect(ctx.entry.getSoul(USER)?.status).toBe("ghost");
+    ctx.db.close();
+  });
+});
+
+/** 亡霊ロールが手で付いた瞬間の GuildMemberUpdate */
+function roleAdded(_ctx: ReturnType<typeof setup>) {
+  const cacheOf = (ids: string[]) => new Collection(ids.map((id) => [id, { id }] as [string, { id: string }]));
+  const roleRemove = vi.fn(async () => undefined);
+  const send = vi.fn(async () => undefined);
+  const guild = {
+    id: "g1",
+    members: { fetch: vi.fn(async () => newMember) },
+    channels: { fetch: vi.fn(async () => ({ isTextBased: () => true, send })) },
+    client: { channels: { fetch: vi.fn(async () => null) } },
+  } as unknown as Guild;
+  const oldMember = { id: USER, user: { bot: false }, guild, roles: { cache: cacheOf([ROLE.wait]) } } as unknown as GuildMember;
+  const newMember = {
+    id: USER,
+    user: { bot: false },
+    guild,
+    roles: { cache: cacheOf([ROLE.wait, ROLE.ghost]), add: vi.fn(async () => undefined), remove: roleRemove },
+    send: vi.fn(async () => undefined),
+  } as unknown as GuildMember;
+  return { oldMember, newMember, guild, roleRemove, send };
+}
+
+describe("手で入城ロールを付けられたとき", () => {
   it("名前が未登録なら**ロールを差し戻し**、理由を記録してスタッフへ知らせる", async () => {
     const { handleMemberRoleUpdate } = await entryModule;
     const ctx = setup();

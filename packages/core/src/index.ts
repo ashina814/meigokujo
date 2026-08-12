@@ -47,6 +47,7 @@ export {
   Nicknames,
   type ClaimResult,
   type ClaimRejection,
+  type LegacyNameEntry,
   type MemberNameRow,
   type NameSetVia,
   type NameSnapshot,

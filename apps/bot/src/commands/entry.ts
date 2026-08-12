@@ -38,6 +38,7 @@ import { isAdmin } from "../permissions.js";
 import { jstNow, nextSessionStart } from "../scheduler.js";
 import { refreshWaitersBoard } from "../waiters-board.js";
 import { scheduleRankReconcile, touchesRankRoles } from "../rank-sync.js";
+import { withUserLock } from "../user-lock.js";
 import { returnPanelLink, returnWelcomeMessage } from "./entry-return.js";
 import type { Services } from "../services.js";
 
@@ -165,7 +166,7 @@ export async function handleEntryButton(
     return;
   }
 
-  if (id.startsWith("entry:judgehold") && interaction.isUserSelectMenu()) {
+  if ((id.startsWith("entry:judgehold") || id.startsWith("entry:judgeflag")) && interaction.isUserSelectMenu()) {
     await handleJudgeSelect(interaction, services);
     return;
   }
@@ -181,6 +182,10 @@ function nameFieldValue(services: Services, userId: string): string {
   if (status.kind === "ok") return `**${status.nickname}**（登録済み）`;
   if (status.kind === "violation") {
     return [`**${status.nickname}** … ${status.reason}`, "下の「名前を設定する」から決め直してください。"].join("\n");
+  }
+  if (status.kind === "review") {
+    // 何の語で止まっているかは本人に見せない（迂回の手掛かりにしない）
+    return [`**${status.nickname}**（登録済み）`, "-# 説明会で門番が名前を確認します。"].join("\n");
   }
   return ["**まだ決まっていません。**", "下の「名前を設定する」から決めてください。**入城には名前の登録が必要です。**"].join("\n");
 }
@@ -230,46 +235,48 @@ function claimRejectionMessage(rejection: ClaimRejection): string {
 export async function handleEntryModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
   if (interaction.customId !== NICKNAME_MODAL_ID) return;
   const member = interaction.member as GuildMember | null;
-  if (!interaction.guild || !member) {
+  const guild = interaction.guild;
+  if (!guild || !member) {
     await interaction.reply({ content: "サーバー内で実行してください。", flags: MessageFlags.Ephemeral });
     return;
   }
   const input = interaction.fields.getTextInputValue("nickname");
-  const claimed = services.nicknames.claim({
-    userId: interaction.user.id,
-    nickname: input,
-    setVia: "entry",
-    actor: `user:${interaction.user.id}`,
-  });
-  if (!claimed.ok) {
-    await interaction.reply({ content: `⚠️ ${claimRejectionMessage(claimed.rejection)}`, flags: MessageFlags.Ephemeral });
-    return;
-  }
-  const failure = await member
-    .setNickname(claimed.nickname, "冥獄城: 本人による名前の設定")
-    .then(() => null)
-    .catch((e: Error) => e.message || "unknown");
-  if (failure !== null) {
-    // Discord 側が受け付けなかった。**予約を残さない**
-    services.nicknames.rollback(claimed.snapshot, `user:${interaction.user.id}`);
-    services.events.log("nickname_set_failed", {
-      actor: `user:${interaction.user.id}`,
-      target: interaction.user.id,
-      payload: { nickname: claimed.nickname, error: failure },
+  const actor = `user:${interaction.user.id}`;
+  // **予約から巻き戻しまでを1区間として直列化する。** 同じ人が A→B を続けて送ると、
+  // Aの巻き戻しが後から入ったBの正本を消したり、DBはB・DiscordはA という
+  // 食い違いが残る。2本目は1本目が終わってから走らせる
+  const content = await withUserLock(`nickname:${interaction.user.id}`, async () => {
+    const claimed = services.nicknames.claim({
+      userId: interaction.user.id,
+      nickname: input,
+      setVia: "entry",
+      actor,
     });
-    await interaction.reply({
-      content: "⚠️ 名前を設定できませんでした。お手数ですが運営にお声がけください。",
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-  await interaction.reply({
-    content: [
+    if (!claimed.ok) return `⚠️ ${claimRejectionMessage(claimed.rejection)}`;
+    const failure = await member
+      .setNickname(claimed.nickname, "冥獄城: 本人による名前の設定")
+      .then(() => null)
+      .catch((e: Error) => e.message || "unknown");
+    if (failure !== null) {
+      // **エラーが返っても、変わっていることがある**（応答が落ちた・内部で再試行された）。
+      // 確かめずに巻き戻すと、Discordは新しい名前・正本は古い名前、で食い違う
+      const latest = await guild.members.fetch({ user: interaction.user.id, force: true }).catch(() => null);
+      if (latest?.displayName !== claimed.nickname) {
+        services.nicknames.rollback(claimed.snapshot, actor);
+        services.events.log("nickname_set_failed", {
+          actor,
+          target: interaction.user.id,
+          payload: { nickname: claimed.nickname, error: failure },
+        });
+        return "⚠️ 名前を設定できませんでした。お手数ですが運営にお声がけください。";
+      }
+    }
+    return [
       `✅ あなたの城での名前を **${claimed.nickname}** にしました。`,
       "説明会までの間は、このボタンから何度でも変えられます。**入城後は変更できません**（公式ショップの「名前変更」から正式に改名できます）。",
-    ].join("\n"),
-    flags: MessageFlags.Ephemeral,
+    ].join("\n");
   });
+  await interaction.reply({ content, flags: MessageFlags.Ephemeral });
 }
 
 /**
@@ -491,7 +498,7 @@ export async function handleMemberRoleUpdate(
       // **ロールを戻す。** 亡霊ロールは住民用チャンネルを一気に開けるので、
       // ghostify を止めただけでは「台帳は未入城なのに実質フルアクセス」になる。
       // 手動付与を暗黙の override にしない＝入城させるなら先に名前を設定する
-      if (r.blocked === "name_unset" || r.blocked === "name_violation") {
+      if (r.blocked === "name_unset" || r.blocked === "name_violation" || r.blocked === "name_review") {
         await revertEntryRole(newMember, services, ghostRoleId, r.blocked);
       }
     } else if (decision.kind === "blocked") {
@@ -839,7 +846,13 @@ function renderJudgment(services: Services, judgeId: string) {
   const selected = st.present.filter((id) => !st.hold.has(id));
   // **押す前に分かるようにする。** 押してから弾くと、説明会のその場で止まる
   const named = selected.filter((id) => services.nicknames.status(id).kind === "ok");
-  const unnamed = selected.filter((id) => services.nicknames.status(id).kind !== "ok");
+  // 禁止語の flag に触れた名前。**一括合格には入れない。**
+  // 機械で白黒つかないものなので、門番が見て通したときだけ合格対象になる
+  const review = selected.filter((id) => services.nicknames.status(id).kind === "review");
+  const unnamed = selected.filter((id) => {
+    const kind = services.nicknames.status(id).kind;
+    return kind === "unset" || kind === "violation";
+  });
 
   const line = (ids: string[]) => (ids.length > 0 ? ids.map((id) => `・<@${id}>`).join("\n") : "（なし）");
   /** 名前の状態を1行で。門番はこれを見て確認するだけでよい */
@@ -847,10 +860,8 @@ function renderJudgment(services: Services, judgeId: string) {
     const status = services.nicknames.status(id);
     if (status.kind === "unset") return `・⚠️ <@${id}> — **名前が未登録**`;
     if (status.kind === "violation") return `・❌ <@${id}> — **${status.nickname}**（${status.reason}）`;
-    // 禁止語に触れているが自動では落とさないもの。**「過度な」の線引きは人が持つ**
-    return status.flagged
-      ? `・✅ <@${id}> — **${status.nickname}** 🔍要確認（\`${status.flagged}\`）`
-      : `・✅ <@${id}> — **${status.nickname}**`;
+    if (status.kind === "review") return `・🔍 <@${id}> — **${status.nickname}**（\`${status.flagged}\` を含みます）`;
+    return `・✅ <@${id}> — **${status.nickname}**`;
   };
   const embed = new EmbedBuilder()
     .setTitle("⚖️ 説明会の判定（今VCにいる案内待ち）")
@@ -860,6 +871,9 @@ function renderJudgment(services: Services, judgeId: string) {
         `**合格→亡霊にする ${named.length}名**:`,
         named.length > 0 ? named.map(nameLine).join("\n") : "（なし）",
         "",
+        review.length > 0
+          ? `🔍 **名前の確認が要る ${review.length}名**（**合格に含めていません**。中身を見て問題なければ下の選択で通してください）:\n${review.map(nameLine).join("\n")}\n`
+          : "",
         unnamed.length > 0
           ? `⚠️ **名前が未登録・規則違反 ${unnamed.length}名**（合格させられません。本人に入城案内パネルから設定してもらってください）:\n${unnamed.map(nameLine).join("\n")}\n`
           : "",
@@ -884,6 +898,18 @@ function renderJudgment(services: Services, judgeId: string) {
       ),
     );
   }
+  // **確認が要る人が居るときだけ出す。** 通常の名前しか居ない回では操作が増えない
+  if (review.length > 0) {
+    rows.push(
+      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+        new UserSelectMenuBuilder()
+          .setCustomId("entry:judgeflag")
+          .setPlaceholder("🔍 名前を確認して通す人")
+          .setMinValues(0)
+          .setMaxValues(Math.min(25, review.length)),
+      ),
+    );
+  }
   const bottom = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId("entry:pass")
@@ -904,6 +930,13 @@ async function handleJudgeSelect(interaction: UserSelectMenuInteraction, service
   const sel = judgeState.get(interaction.user.id);
   if (!sel) {
     await interaction.update({ content: "⌛ この判定は期限切れです。`/審判 判定` からやり直してください。", components: [], embeds: [] });
+    return;
+  }
+  if (interaction.customId === "entry:judgeflag") {
+    // 禁止語に触れた名前を、門番が中身を見て通す。**承認は名前ごとに残る**ので、
+    // 別の入口（亡霊ロールの手動付与・時間外チケット）から入っても同じ判断が効く
+    for (const id of interaction.values) services.nicknames.approveFlagged(id, `user:${interaction.user.id}`);
+    await interaction.update(renderJudgment(services, interaction.user.id));
     return;
   }
   sel.hold = new Set(interaction.values);
@@ -936,7 +969,7 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
   let totalGranted = 0;
   for (const id of toGhost) {
     const r = await ghostifyOne(guild, services, id, actor);
-    if (r.blocked === "name_unset" || r.blocked === "name_violation") {
+    if (r.blocked === "name_unset" || r.blocked === "name_violation" || r.blocked === "name_review") {
       blockedByName.push(id);
       continue;
     }
@@ -983,7 +1016,7 @@ async function revertEntryRole(
   member: GuildMember,
   services: Services,
   roleId: string,
-  reason: "name_unset" | "name_violation",
+  reason: "name_unset" | "name_violation" | "name_review",
 ): Promise<void> {
   const removed = await member.roles
     .remove(roleId, "冥獄城: 名前の登録が未了のため入城ロールを戻しました")
@@ -994,7 +1027,12 @@ async function revertEntryRole(
     target: member.id,
     payload: { roleId, reason, removed: removed === true, error: removed === true ? null : removed },
   });
-  const label = reason === "name_unset" ? "名前が未登録" : "名前が城の規則に合っていない";
+  const label =
+    reason === "name_unset"
+      ? "名前が未登録"
+      : reason === "name_review"
+        ? "名前に確認が要る語が含まれており、まだ門番の確認を受けていない"
+        : "名前が城の規則に合っていない";
   const detail =
     removed === true
       ? `<@${member.id}> に手動で付与された入城ロールを**戻しました**（${label}）。`
@@ -1033,7 +1071,7 @@ async function ghostifyOne(
   granted: number;
   roleOk: boolean;
   roleError?: string;
-  blocked?: "returnee" | "name_unset" | "name_violation";
+  blocked?: "returnee" | "name_unset" | "name_violation" | "name_review";
 }> {
   try {
     const member = await guild.members.fetch(userId);
@@ -1045,9 +1083,11 @@ async function ghostifyOne(
       services.events.log("entry_blocked_by_name", {
         actor,
         target: userId,
-        payload: { reason: name.kind, nickname: name.kind === "violation" ? name.nickname : null },
+        payload: { reason: name.kind, nickname: name.kind === "unset" ? null : name.nickname },
       });
-      return { ok: false, granted: 0, roleOk: true, blocked: name.kind === "unset" ? "name_unset" : "name_violation" };
+      const blocked =
+        name.kind === "unset" ? "name_unset" : name.kind === "review" ? "name_review" : "name_violation";
+      return { ok: false, granted: 0, roleOk: true, blocked };
     }
     const maleRoleId = services.settings.getString("role:male");
     const femaleRoleId = services.settings.getString("role:female");
