@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Collection } from "discord.js";
 import type { Guild, GuildMember } from "discord.js";
-import { Entry, EventLog, Evaluation, Ledger, Settings, openDb, registerDefaultTxTypes } from "@meigokujo/core";
+import { Entry, EventLog, Evaluation, Ledger, Nicknames, Settings, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 import { resetRankSyncForTesting } from "../src/rank-sync.js";
 
@@ -42,8 +42,21 @@ function setup() {
   ] as const) {
     settings.set(key, id, "test");
   }
-  const services = { db, ledger, settings, events, entry, evaluation, titles: { evaluate: vi.fn(() => []) } } as unknown as Services;
-  return { db, ledger, settings, events, entry, evaluation, services };
+  const nicknames = new Nicknames(db, events);
+  // 入城には名前の登録が要る。ここは**ロール付与の判定**を見るテストなので、
+  // 名前は満たしている前提を作る（名前ゲート自体は nickname-entry.test.ts が見る）
+  nicknames.claim({ userId: USER, nickname: "なまえ", setVia: "entry", actor: "test" });
+  const services = {
+    db,
+    ledger,
+    settings,
+    events,
+    entry,
+    evaluation,
+    nicknames,
+    titles: { evaluate: vi.fn(() => []) },
+  } as unknown as Services;
+  return { db, ledger, settings, events, entry, evaluation, nicknames, services };
 }
 
 /** 「ロールが1本増えた」だけの GuildMemberUpdate を作る */

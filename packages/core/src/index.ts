@@ -33,6 +33,28 @@ export {
 export { parseBalanceDump, splitForMigration, type DumpEntry, type ParsedDump, type MigrationSplit } from "./migration/parse.js";
 export { Migration, MigrationError, type MigrationErrorCode, type StagingRow, type StagingStatus, type MemberNameInfo, type ImportSummary, type MigrationReport } from "./migration/service.js";
 export { EventLog, type EventRow } from "./events/service.js";
+export {
+  NICKNAME_MAX_LENGTH,
+  NICKNAME_POLICY_VERSION,
+  checkNicknameShape,
+  describeRejection,
+  nicknameKey,
+  nicknameLength,
+  normalizeNickname,
+  type NicknameRejection,
+} from "./nickname/policy.js";
+export {
+  Nicknames,
+  type ClaimResult,
+  type ClaimRejection,
+  type LegacyNameEntry,
+  type MemberNameRow,
+  type NameSetVia,
+  type NameSnapshot,
+  type NameState,
+  type NameStatus,
+  type NicknameReservationRow,
+} from "./nickname/service.js";
 export { Entry, type BookingRow, type SoulRow, type GhostifyResult, type BookingStatus, type InviterSource } from "./entry/service.js";
 export {
   Returns,

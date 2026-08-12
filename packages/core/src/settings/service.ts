@@ -61,6 +61,14 @@ export const SETTING_DEFAULTS = {
   // トートの耳（相談本文の保持期間）
   confession_body_retention_days: 90, // 通常案件はクローズからN日後に本文purge可能
   confession_court_retention_days: 365, // 裁判所送致案件は審理中に確認できるよう延長保持
+  /**
+   * 入城に名前の登録を必須にするか（1でON）。**既定は0＝OFF。**
+   *
+   * コードを入れただけでは入城の条件を変えない。既存の名前の取り込み・
+   * 入城案内パネルの再設置が済んでから運営がONにし、その時点から必須になる。
+   * OFFの間も名前の設定・登録そのものは動く（先に決めてもらって構わない）。
+   */
+  entry_require_name: 0,
 } as const;
 
 export type SettingKey = keyof typeof SETTING_DEFAULTS;

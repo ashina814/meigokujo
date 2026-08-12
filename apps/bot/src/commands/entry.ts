@@ -8,7 +8,11 @@ import {
   ChatInputCommandInteraction,
   EmbedBuilder,
   MessageFlags,
+  ModalBuilder,
+  ModalSubmitInteraction,
   SlashCommandBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   ThreadAutoArchiveDuration,
   UserSelectMenuBuilder,
   UserSelectMenuInteraction,
@@ -22,8 +26,11 @@ import {
   MEIREI_ROLE_SETTING_KEY,
   RANK_LADDER,
   RANK_ROLE_SETTING_KEYS,
+  NICKNAME_MAX_LENGTH,
   decideGhostRoleAdd,
+  describeRejection,
   describeSessionSchedule,
+  type ClaimRejection,
 } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { deliverToUser } from "../notify.js";
@@ -31,6 +38,7 @@ import { isAdmin } from "../permissions.js";
 import { jstNow, nextSessionStart } from "../scheduler.js";
 import { refreshWaitersBoard } from "../waiters-board.js";
 import { scheduleRankReconcile, touchesRankRoles } from "../rank-sync.js";
+import { withUserLock } from "../user-lock.js";
 import { returnPanelLink, returnWelcomeMessage } from "./entry-return.js";
 import type { Services } from "../services.js";
 
@@ -63,7 +71,11 @@ export function entryPanelMessage(services: Services): MessageCreateOptions {
       },
       {
         name: "🎯 やること",
-        value: ["**1.** 時間になったら説明会場VCに入る", "**2.** 門番の案内を待つ（10分ほどで終わります）"].join("\n"),
+        value: [
+          "**1.** 下の「名前を設定する」で城での名前を決める",
+          "**2.** 時間になったら説明会場VCに入る",
+          "**3.** 門番の案内を待つ（10分ほどで終わります）",
+        ].join("\n"),
       },
       {
         name: "⏰ その時間に来られない",
@@ -72,6 +84,9 @@ export function entryPanelMessage(services: Services): MessageCreateOptions {
     )
     .setFooter({ text: "次の説明会が何時かは「いまの自分の状態を見る」で確認できます" });
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    // **入城には名前の登録が要る。** 一般メンバーは自分でニックネームを変更できない
+    // 権限設定なので、ここが案内待ちの人にとって唯一の設定手段になる
+    new ButtonBuilder().setCustomId("entry:name").setLabel("名前を設定する").setEmoji("✒️").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("entry:status").setLabel("いまの自分の状態を見る").setEmoji("🕯️").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("entry:flex").setLabel("時間外・個別希望").setEmoji("⏰").setStyle(ButtonStyle.Secondary),
   );
@@ -121,6 +136,23 @@ export async function handleEntryButton(
     return;
   }
 
+  if (id === "entry:name" && interaction.isButton()) {
+    const current = services.nicknames.get(userId);
+    if (current?.locked_at) {
+      // 入城後の名前は固定。変えるなら商館の正式な改名を通る
+      await interaction.reply({
+        content: [
+          `あなたの城での名前は **${current.nickname}** で確定しています。`,
+          "入城後の変更は**公式ショップの「名前変更」**からお願いします。",
+        ].join("\n"),
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await interaction.showModal(nicknameModal(current?.nickname ?? ""));
+    return;
+  }
+
   // 旧パネル（招待経路を本人に登録させる導線）の互換。撤去前のパネルが残っていても
   // 迷子にしない。本人からの招待経路の登録は受け付けない方針になった。
   if (id === "entry:book" || id === "entry:invsel" || id.startsWith("entry:inv:")) {
@@ -134,7 +166,7 @@ export async function handleEntryButton(
     return;
   }
 
-  if (id.startsWith("entry:judgehold") && interaction.isUserSelectMenu()) {
+  if ((id.startsWith("entry:judgehold") || id.startsWith("entry:judgeflag")) && interaction.isUserSelectMenu()) {
     await handleJudgeSelect(interaction, services);
     return;
   }
@@ -142,6 +174,123 @@ export async function handleEntryButton(
   if (id.startsWith("entry:pass") && interaction.isButton()) {
     await handlePassButton(interaction, services);
   }
+}
+
+/**
+ * 名前を入城の条件にするか。**既定は OFF。**
+ *
+ * コードを入れただけで入城の条件を変えない。既存の名前の取り込みと
+ * 入城案内パネルの再設置が済んでいない状態で必須にすると、名前を決める手段が
+ * 無いまま説明会の合格が止まる。運営が `/管理 → 設定 → 数値` で
+ * `entry_require_name` を 1 にした時点から必須になる。
+ *
+ * **OFF の間も名前の設定そのものは動く**（先に決めてもらって構わない）。
+ */
+export function nameGateEnabled(services: Services): boolean {
+  return services.settings.getNumber("entry_require_name") === 1;
+}
+
+/** 状態画面の「城での名前」欄。未登録なら**入城できないことまで**書く */
+function nameFieldValue(services: Services, userId: string): string {
+  const status = services.nicknames.status(userId);
+  if (status.kind === "ok") return `**${status.nickname}**（登録済み）`;
+  if (status.kind === "violation") {
+    return [`**${status.nickname}** … ${status.reason}`, "下の「名前を設定する」から決め直してください。"].join("\n");
+  }
+  if (status.kind === "review") {
+    // 何の語で止まっているかは本人に見せない（迂回の手掛かりにしない）
+    return [`**${status.nickname}**（登録済み）`, "-# 説明会で門番が名前を確認します。"].join("\n");
+  }
+  return ["**まだ決まっていません。**", "下の「名前を設定する」から決めてください。**入城には名前の登録が必要です。**"].join("\n");
+}
+
+// ---- 名前の設定（案内待ちのセルフサービス）----
+
+const NICKNAME_MODAL_ID = "entry:name-input";
+
+function nicknameModal(current: string) {
+  return new ModalBuilder()
+    .setCustomId(NICKNAME_MODAL_ID)
+    .setTitle("城での名前を決める")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("nickname")
+          .setLabel("あなたの名前")
+          .setPlaceholder("漢字・かな・カナ・英数字のみ（記号や空白は使えません）")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(NICKNAME_MAX_LENGTH)
+          .setValue(current),
+      ),
+    );
+}
+
+/** 断り文句。**規則の本文はここに書かない**（`describeRejection` が正本） */
+function claimRejectionMessage(rejection: ClaimRejection): string {
+  if (rejection.code === "taken") {
+    return rejection.by === "legacy_conflict"
+      ? "その名前は既に城内で使われているため、お使いいただけません。別の名前をお願いします。"
+      : "その名前は既に他の方が使っています。別の名前をお願いします。";
+  }
+  if (rejection.code === "locked") {
+    return "あなたの名前は既に確定しています。変更は公式ショップの「名前変更」からお願いします。";
+  }
+  return describeRejection(rejection);
+}
+
+/**
+ * 名前を決める。**予約 → Discord へ設定 → 失敗したら予約を戻す**、の順で行う。
+ *
+ * 先に Discord を設定してから予約を取ると、設定は通ったのに予約が取れない
+ * （＝同じ名前の人が増える）順序が生まれる。逆にすると、予約だけ残って
+ * 誰も名乗っていない名前が取れなくなるので、失敗時は必ず戻す。
+ */
+export async function handleEntryModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
+  if (interaction.customId !== NICKNAME_MODAL_ID) return;
+  const member = interaction.member as GuildMember | null;
+  const guild = interaction.guild;
+  if (!guild || !member) {
+    await interaction.reply({ content: "サーバー内で実行してください。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const input = interaction.fields.getTextInputValue("nickname");
+  const actor = `user:${interaction.user.id}`;
+  // **予約から巻き戻しまでを1区間として直列化する。** 同じ人が A→B を続けて送ると、
+  // Aの巻き戻しが後から入ったBの正本を消したり、DBはB・DiscordはA という
+  // 食い違いが残る。2本目は1本目が終わってから走らせる
+  const content = await withUserLock(`nickname:${interaction.user.id}`, async () => {
+    const claimed = services.nicknames.claim({
+      userId: interaction.user.id,
+      nickname: input,
+      setVia: "entry",
+      actor,
+    });
+    if (!claimed.ok) return `⚠️ ${claimRejectionMessage(claimed.rejection)}`;
+    const failure = await member
+      .setNickname(claimed.nickname, "冥獄城: 本人による名前の設定")
+      .then(() => null)
+      .catch((e: Error) => e.message || "unknown");
+    if (failure !== null) {
+      // **エラーが返っても、変わっていることがある**（応答が落ちた・内部で再試行された）。
+      // 確かめずに巻き戻すと、Discordは新しい名前・正本は古い名前、で食い違う
+      const latest = await guild.members.fetch({ user: interaction.user.id, force: true }).catch(() => null);
+      if (latest?.displayName !== claimed.nickname) {
+        services.nicknames.rollback(claimed.snapshot, actor);
+        services.events.log("nickname_set_failed", {
+          actor,
+          target: interaction.user.id,
+          payload: { nickname: claimed.nickname, error: failure },
+        });
+        return "⚠️ 名前を設定できませんでした。お手数ですが運営にお声がけください。";
+      }
+    }
+    return [
+      `✅ あなたの城での名前を **${claimed.nickname}** にしました。`,
+      "説明会までの間は、このボタンから何度でも変えられます。**入城後は変更できません**（公式ショップの「名前変更」から正式に改名できます）。",
+    ].join("\n");
+  });
+  await interaction.reply({ content, flags: MessageFlags.Ephemeral });
 }
 
 /**
@@ -183,6 +332,12 @@ export function entryStatusMessage(services: Services, userId: string): MessageC
         name: "📍 集合場所",
         value: vcIds.length > 0 ? vcIds.map((id) => `<#${id}>`).join("\n") : "説明会場VC",
         inline: true,
+      },
+      // **入城の条件なので、当日まで分からないままにしない。**
+      // 説明会に来てから「名前がありません」で止まるのが一番損
+      {
+        name: "✒️ 城での名前",
+        value: nameFieldValue(services, userId),
       },
     )
     .setFooter({ text: "その時間に来られない場合はパネルの「時間外・個別希望」からどうぞ" });
@@ -280,7 +435,11 @@ function buildWelcomeEmbed(member: GuildMember, services: Services): EmbedBuilde
     })
     .join("\n");
 
-  const steps = ["時間になったら説明会場VCに入る", "門番の案内を待つ（10分ほどで終わります）"]
+  const steps = [
+    "入城案内チャンネルのパネルから**城での名前を決める**",
+    "時間になったら説明会場VCに入る",
+    "門番の案内を待つ（10分ほどで終わります）",
+  ]
     .map((s, i) => `**${i + 1}.** ${s}`)
     .join("\n");
 
@@ -350,6 +509,12 @@ export async function handleMemberRoleUpdate(
     if (decision.kind === "ghostify") {
       const r = await ghostifyOne(newMember.guild, services, newMember.id, "system:role-add");
       if (r.ok) console.log(`[entry] 亡霊ロール手動付与検知 → ghostify: ${newMember.id} (${decision.reason})`);
+      // **ロールを戻す。** 亡霊ロールは住民用チャンネルを一気に開けるので、
+      // ghostify を止めただけでは「台帳は未入城なのに実質フルアクセス」になる。
+      // 手動付与を暗黙の override にしない＝入城させるなら先に名前を設定する
+      if (r.blocked === "name_unset" || r.blocked === "name_violation" || r.blocked === "name_review") {
+        await revertEntryRole(newMember, services, ghostRoleId, r.blocked);
+      }
     } else if (decision.kind === "blocked") {
       // 上位階級・迷霊・離脱済みへ亡霊ロールを足しただけで評価前へ巻き戻さない。
       // 差し戻したいなら運営の明示操作でやる。ここでは記録だけ残す
@@ -690,19 +855,46 @@ interface JudgeSel {
 const judgeState = new Map<string, JudgeSel>(); // key = 判定者のユーザーID
 
 /** 判定メッセージ（今VCにいる案内待ち + 保留の選択UI）を組み立てる */
-function renderJudgment(_services: Services, judgeId: string) {
+function renderJudgment(services: Services, judgeId: string) {
   const st = judgeState.get(judgeId) ?? ({ present: [], missing: [], hold: new Set<string>(), returnees: [] } as JudgeSel);
-  const toGhost = st.present.filter((id) => !st.hold.has(id));
+  const selected = st.present.filter((id) => !st.hold.has(id));
+  const gateOn = nameGateEnabled(services);
+  // **押す前に分かるようにする。** 押してから弾くと、説明会のその場で止まる。
+  // 名前ゲートが OFF の間は、状態を見せるだけで合格対象からは外さない
+  const named = gateOn ? selected.filter((id) => services.nicknames.status(id).kind === "ok") : selected;
+  // 禁止語の flag に触れた名前。**一括合格には入れない。**
+  // 機械で白黒つかないものなので、門番が見て通したときだけ合格対象になる
+  const review = gateOn ? selected.filter((id) => services.nicknames.status(id).kind === "review") : [];
+  const unnamed = gateOn
+    ? selected.filter((id) => {
+        const kind = services.nicknames.status(id).kind;
+        return kind === "unset" || kind === "violation";
+      })
+    : [];
 
   const line = (ids: string[]) => (ids.length > 0 ? ids.map((id) => `・<@${id}>`).join("\n") : "（なし）");
+  /** 名前の状態を1行で。門番はこれを見て確認するだけでよい */
+  const nameLine = (id: string): string => {
+    const status = services.nicknames.status(id);
+    if (status.kind === "unset") return `・⚠️ <@${id}> — **名前が未登録**`;
+    if (status.kind === "violation") return `・❌ <@${id}> — **${status.nickname}**（${status.reason}）`;
+    if (status.kind === "review") return `・🔍 <@${id}> — **${status.nickname}**（\`${status.flagged}\` を含みます）`;
+    return `・✅ <@${id}> — **${status.nickname}**`;
+  };
   const embed = new EmbedBuilder()
     .setTitle("⚖️ 説明会の判定（今VCにいる案内待ち）")
     .setColor(0x6b21a8)
     .setDescription(
       [
-        `**合格→亡霊にする ${toGhost.length}名**:`,
-        line(toGhost),
+        `**合格→亡霊にする ${named.length}名**:`,
+        named.length > 0 ? named.map(nameLine).join("\n") : "（なし）",
         "",
+        review.length > 0
+          ? `🔍 **名前の確認が要る ${review.length}名**（**合格に含めていません**。中身を見て問題なければ下の選択で通してください）:\n${review.map(nameLine).join("\n")}\n`
+          : "",
+        unnamed.length > 0
+          ? `⚠️ **名前が未登録・規則違反 ${unnamed.length}名**（合格させられません。本人に入城案内パネルから設定してもらってください）:\n${unnamed.map(nameLine).join("\n")}\n`
+          : "",
         st.hold.size > 0 ? `⏸ **保留 ${st.hold.size}名**（今回は通さない・案内待ちのまま）:\n${line([...st.hold])}\n` : "",
         st.missing.length > 0
           ? `⚠️ **招待経路 未検出 ${st.missing.length}名**（判定は通せます。必要なら \`/審判 招待\` で後から登録）:\n${line(st.missing)}\n`
@@ -724,8 +916,24 @@ function renderJudgment(_services: Services, judgeId: string) {
       ),
     );
   }
+  // **確認が要る人が居るときだけ出す。** 通常の名前しか居ない回では操作が増えない
+  if (review.length > 0) {
+    rows.push(
+      new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(
+        new UserSelectMenuBuilder()
+          .setCustomId("entry:judgeflag")
+          .setPlaceholder("🔍 名前を確認して通す人")
+          .setMinValues(0)
+          .setMaxValues(Math.min(25, review.length)),
+      ),
+    );
+  }
   const bottom = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("entry:pass").setLabel(`${toGhost.length}名を合格（亡霊化）`).setStyle(ButtonStyle.Success).setDisabled(toGhost.length === 0),
+    new ButtonBuilder()
+      .setCustomId("entry:pass")
+      .setLabel(`${named.length}名を合格（亡霊化）`)
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(named.length === 0),
   );
   rows.push(bottom);
   return { embeds: [embed], components: rows, allowedMentions: { parse: [] } };
@@ -740,6 +948,34 @@ async function handleJudgeSelect(interaction: UserSelectMenuInteraction, service
   const sel = judgeState.get(interaction.user.id);
   if (!sel) {
     await interaction.update({ content: "⌛ この判定は期限切れです。`/審判 判定` からやり直してください。", components: [], embeds: [] });
+    return;
+  }
+  if (interaction.customId === "entry:judgeflag") {
+    // 禁止語に触れた名前を、門番が中身を見て通す。**承認は名前ごとに残る**ので、
+    // 別の入口（亡霊ロールの手動付与・時間外チケット）から入っても同じ判断が効く。
+    //
+    // **いまの判定対象だけに限る。** UserSelect は誰でも選べてしまうので、
+    // 説明会に来ていない人・保留にした人まで、画面に出ていないまま承認できてしまう。
+    // 承認は入城の可否を動かす操作なので、その場で見えている相手にだけ効かせる
+    const approvable = new Set(
+      sel.present.filter((id) => !sel.hold.has(id) && services.nicknames.status(id).kind === "review"),
+    );
+    const approved: string[] = [];
+    const ignored: string[] = [];
+    for (const id of interaction.values) {
+      if (!approvable.has(id)) {
+        ignored.push(id);
+        continue;
+      }
+      if (services.nicknames.approveFlagged(id, `user:${interaction.user.id}`)) approved.push(id);
+    }
+    if (ignored.length > 0) {
+      services.events.log("nickname_flag_approval_ignored", {
+        actor: `user:${interaction.user.id}`,
+        payload: { ignored },
+      });
+    }
+    await interaction.update(renderJudgment(services, interaction.user.id));
     return;
   }
   sel.hold = new Set(interaction.values);
@@ -768,9 +1004,14 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
   const passed: string[] = [];
   const failed: string[] = [];
   const roleFailed: string[] = []; // DBは亡霊化したがロール変更に失敗＝手動対応が必要
+  const blockedByName: string[] = []; // 名前が未設定・規則違反で通せなかった
   let totalGranted = 0;
   for (const id of toGhost) {
     const r = await ghostifyOne(guild, services, id, actor);
+    if (r.blocked === "name_unset" || r.blocked === "name_violation" || r.blocked === "name_review") {
+      blockedByName.push(id);
+      continue;
+    }
     if (r.blocked) {
       blockedReturnees.push(id);
       continue;
@@ -792,11 +1033,69 @@ async function handlePassButton(interaction: ButtonInteraction, services: Servic
       : "",
     failed.length > 0 ? `❌ 亡霊化そのものに失敗: ${failed.map((id) => `<@${id}>`).join(", ")}` : "",
     sel.hold.size > 0 ? `⏸ 保留（案内待ちのまま）: ${sel.hold.size}名` : "",
+    blockedByName.length > 0
+      ? `⚠️ **名前が未登録・規則違反のため通していません（${blockedByName.length}名）**: ${blockedByName.map((id) => `<@${id}>`).join(", ")}\n　→ 本人に**入城案内パネルの「名前を設定する」**から設定してもらってください。設定後にもう一度判定できます。`
+      : "",
     blockedReturnees.length > 0
       ? `🔄 **出戻り対象のため処理していません（${blockedReturnees.length}名）**: ${blockedReturnees.map((id) => `<@${id}>`).join(", ")}\n　→ 通常判定では処理できません。**出戻り申請から対応してください。**`
       : "",
   ].filter(Boolean);
   await interaction.editReply({ content: lines.join("\n"), allowedMentions: { parse: [] } });
+}
+
+/**
+ * 名前の条件を満たさないまま手で付けられた入城系ロールを外す。
+ *
+ * **ロールを残したまま ghostify だけ止めても、入城ゲートにならない。**
+ * 亡霊ロールは住民用チャンネルをまとめて開けるので、外さなければ
+ * 「台帳の上では未入城なのに、実際は中に入れている」状態が成立する。
+ * 外した事実と理由は必ず記録し、スタッフへ知らせる（黙って戻さない）。
+ */
+async function revertEntryRole(
+  member: GuildMember,
+  services: Services,
+  roleId: string,
+  reason: "name_unset" | "name_violation" | "name_review",
+): Promise<void> {
+  const removed = await member.roles
+    .remove(roleId, "冥獄城: 名前の登録が未了のため入城ロールを戻しました")
+    .then(() => true)
+    .catch((e: Error) => e.message);
+  services.events.log("entry_role_reverted", {
+    actor: "system:name-gate",
+    target: member.id,
+    payload: { roleId, reason, removed: removed === true, error: removed === true ? null : removed },
+  });
+  const label =
+    reason === "name_unset"
+      ? "名前が未登録"
+      : reason === "name_review"
+        ? "名前に確認が要る語が含まれており、まだ門番の確認を受けていない"
+        : "名前が城の規則に合っていない";
+  const detail =
+    removed === true
+      ? `<@${member.id}> に手動で付与された入城ロールを**戻しました**（${label}）。`
+      : `<@${member.id}> の入城ロールを**戻せませんでした**（${label}／\`${removed}\`）。手動で外してください。`;
+  await notifyStaff(
+    member.guild,
+    services,
+    [
+      `⚠️ **名前の登録が済んでいないため、入城させていません。**`,
+      detail,
+      "本人に**入城案内パネルの「名前を設定する」**から設定してもらってください。設定後に改めてロールを付けるか、説明会の判定で通せます。",
+    ].join("\n"),
+  );
+}
+
+/** 運営へ知らせる。操作は付けない（判断と操作は既存の導線に置く） */
+async function notifyStaff(guild: Guild, services: Services, content: string): Promise<void> {
+  // 門番の作業場を第一候補にする（名前の未登録は門番が拾う話なので）
+  const channelId =
+    services.settings.getString("channel:waiters_board") ?? services.settings.getString("channel:shurei");
+  if (!channelId) return;
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased() || !("send" in channel)) return;
+  await channel.send({ content, allowedMentions: { parse: [] } }).catch(() => undefined);
 }
 
 // ---- 亡霊化（1人分の共通処理: 判定バッチ・時間外チケット両方から使う）----
@@ -806,9 +1105,29 @@ async function ghostifyOne(
   services: Services,
   userId: string,
   actor: string,
-): Promise<{ ok: boolean; granted: number; roleOk: boolean; roleError?: string; blocked?: "returnee" }> {
+): Promise<{
+  ok: boolean;
+  granted: number;
+  roleOk: boolean;
+  roleError?: string;
+  blocked?: "returnee" | "name_unset" | "name_violation" | "name_review";
+}> {
   try {
     const member = await guild.members.fetch(userId);
+    // **入城の条件は「有効な名前を持っていること」。** 判定は3つの入口
+    // （門番の一括合格・亡霊ロールの手動付与・時間外チケット）から来るので、
+    // 入口ごとではなくここで一度だけ見る。手動付与を暗黙の override にしない
+    const name = services.nicknames.status(userId);
+    if (nameGateEnabled(services) && name.kind !== "ok") {
+      services.events.log("entry_blocked_by_name", {
+        actor,
+        target: userId,
+        payload: { reason: name.kind, nickname: name.kind === "unset" ? null : name.nickname },
+      });
+      const blocked =
+        name.kind === "unset" ? "name_unset" : name.kind === "review" ? "name_review" : "name_violation";
+      return { ok: false, granted: 0, roleOk: true, blocked };
+    }
     const maleRoleId = services.settings.getString("role:male");
     const femaleRoleId = services.settings.getString("role:female");
     const gender =
@@ -849,6 +1168,8 @@ async function ghostifyOne(
     if (!roleOk) {
       console.error(`[entry] 亡霊化のロール変更失敗 ${userId}: ${roleError}（ボットのロールを階級より上へ）`);
     }
+    // 入城が確定したので名前を固定する。以後の変更は商館の正式な改名だけ
+    services.nicknames.lock(userId, actor);
 
     // 招待者への波及処理: 称号評価 + 招待による昇格印の閾値到達チェック
     const inviteeSoul = services.entry.getSoul(userId);
