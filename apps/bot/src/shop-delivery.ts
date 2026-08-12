@@ -1,5 +1,5 @@
 import type { Guild, GuildMember } from "discord.js";
-import { AUTO_DELIVERABLE_KINDS, parseDeliverySnapshot, type PurchaseRow } from "@meigokujo/core";
+import { AUTO_DELIVERABLE_KINDS, describeRejection, parseDeliverySnapshot, type PurchaseRow } from "@meigokujo/core";
 import { refreshEvalStatsForUser } from "./eval-daily.js";
 import type { Services } from "./services.js";
 
@@ -188,33 +188,59 @@ export async function deliverPurchaseUnlocked(
 
     if (kind === "set_nickname") {
       const request = parseRequest(purchase.request_json);
-      const wanted = typeof request?.nickname === "string" ? request.nickname : null;
-      if (!wanted) return fail("nickname_missing", "希望の名前が記録されていないため変更できませんでした。");
+      const raw = typeof request?.nickname === "string" ? request.nickname : null;
+      if (!raw) return fail("nickname_missing", "希望の名前が記録されていないため変更できませんでした。");
       if (!guild) return fail("guild_unavailable", "サーバー情報が取れず変更できませんでした。");
       // **最新の状態を取り直す。** 課金後にBotが落ちた場合、変更だけ先に済んでいることがある
       const member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
       if (!member) return fail("member_fetch_failed", "メンバー情報の取得に失敗し変更できませんでした。");
-      // 判定は `nickname` ではなく **利用者に見えている名前**（`displayName`）で行う。
-      // ニックネーム未設定なら見えているのはグローバル表示名で、利用者にとっての
-      // 「いまの名前」はそちら。`nickname` で見ると、既に希望どおりに見えている人へ
-      // 「変わっていない」と判定してしまう
+
+      // **名前の正本は入城制度と同じ。** 予約を先に取ってから Discord を叩く。
+      // 逆にすると、設定は通ったのに予約が取れない（＝同じ名前の人が増える）順序が生まれる。
+      // 商館の改名だけが入城後の固定を越えられる（`allowLocked`）
+      const claimed = services.nicknames.claim({
+        userId,
+        nickname: raw,
+        setVia: "shop",
+        actor,
+        allowLocked: true,
+      });
+      if (!claimed.ok) {
+        const r = claimed.rejection;
+        if (r.code === "taken") {
+          return fail(
+            `nickname_taken:${r.by}`,
+            "その名前は購入後に他の方が使い始めたため、お使いいただけませんでした。",
+          );
+        }
+        // `allowLocked` を渡しているので固定では止まらないが、握り潰さず落とす
+        if (r.code === "locked") return fail("nickname_locked", "名前が固定されているため変更できませんでした。");
+        return fail(`nickname_rejected:${r.code}`, describeRejection(r));
+      }
+      const { nickname: wanted, snapshot } = claimed;
+
       if (member.displayName === wanted) {
-        // 既に希望どおり。**返金せず完了にする**（変わったのに返金する、を防ぐ）
+        // 既に希望どおり（課金後の落ち・再実行）。**返金せず完了にする**
         services.shop.markDeliverySucceeded(purchase.id, actor);
         return { state: "delivered", message: `サーバーニックネームは既に **${wanted}** です。` };
       }
       const blocked = nicknameBlockReason(guild, member);
-      if (blocked) return fail(blocked.reason, blocked.message);
+      if (blocked) {
+        services.nicknames.rollback(snapshot, actor);
+        return fail(blocked.reason, blocked.message);
+      }
       const setError = await member
         .setNickname(wanted, "公式ショップ: 名前変更")
         .then(() => null)
         .catch((e: Error) => e.message || "unknown");
       if (setError !== null) {
         // **エラーが返っても、変わっていることがある。** 応答が落ちただけ・内部再試行で
-        // 通っていた、など。ここで確かめずに返金すると「名前は変わったのに返金もした」に
+        // 通っていた、など。ここで確かめずに巻き戻すと「名前は変わったのに返金もした」に
         // なる。最新のメンバーを取り直し、希望どおりに見えていれば成功として扱う
         const latest = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
         if (latest?.displayName !== wanted) {
+          // **予約を残さない。** 誰も名乗っていない名前が取れなくなる
+          services.nicknames.rollback(snapshot, actor);
           return fail(`nickname_set_failed:${setError}`, "名前の変更に失敗しました。");
         }
       }

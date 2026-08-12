@@ -14,7 +14,15 @@ import {
   type GuildMember,
   type MessageCreateOptions,
 } from "discord.js";
-import { LedgerError, ShopError, termDays, type PurchaseRow, type ShopItemRow } from "@meigokujo/core";
+import {
+  LedgerError,
+  NICKNAME_MAX_LENGTH,
+  ShopError,
+  describeRejection,
+  termDays,
+  type PurchaseRow,
+  type ShopItemRow,
+} from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { deliverPurchase, nicknameBlockReason } from "../shop-delivery.js";
 import { deliverOrRefund } from "../shop-refund.js";
@@ -226,21 +234,46 @@ function isNicknameItem(item: ShopItemRow): boolean {
   return item.delivery === "auto" && item.delivery_kind === "set_nickname";
 }
 
-const NICKNAME_MAX = 32;
+/**
+ * いま城で名乗っている名前。**登録済みなら正本（`member_names`）を見る。**
+ *
+ * 入城の名前制度が入る前から居る人は、まだ登録が無いことがある。その場合だけ
+ * 「利用者に見えている名前」で代用する（登録が無いからといって、見えている名前と
+ * 同じ名前へ有料で変えさせない）。
+ */
+function currentName(services: Services, member: GuildMember): string {
+  return services.nicknames.get(member.id)?.nickname ?? member.displayName;
+}
 
 /**
- * 入力の形だけを見る検査（Discord側の可否は nicknameBlockReason が見る）。
+ * 課金前の検査を**入城パネルと同じ規則**で行う。
  *
- * 「同じ名前」は **`displayName`（利用者に実際に見えている名前）** で判定する。
- * `nickname` で見ると、ニックネーム未設定の人が見えているとおりの名前を入れたとき
- * 「変更できる」と受け取ってしまい、払ったのに何も変わらない結果になる。
+ * 名前の決まり（使える文字・禁止語）と同名禁止は `NicknamePolicy` と
+ * 予約テーブルが正本。ここで独自に判定すると、**払えば規則を迂回できる**
+ * 抜け道になる。払う前に分かる不可はすべてここで止め、人を呼ばない。
  */
-function validateNickname(input: string, currentDisplayName: string): string | null {
-  const name = input.trim();
-  if (!name) return "新しい名前を入れてください。";
-  if (name.length > NICKNAME_MAX) return `名前は ${NICKNAME_MAX} 文字までです（いまは ${name.length} 文字）。`;
-  if (name === currentDisplayName) return "いまの名前と同じです。";
-  return null;
+function checkNicknameBeforeCharge(
+  services: Services,
+  member: GuildMember,
+  input: string,
+): { ok: true; nickname: string } | { ok: false; message: string } {
+  const evaluated = services.nicknames.evaluate(input);
+  if (!evaluated.ok) return { ok: false, message: describeRejection(evaluated.rejection) };
+  if (evaluated.nickname === currentName(services, member)) {
+    return { ok: false, message: "いまの名前と同じです。" };
+  }
+  // 予約は名前の唯一の正本。自分がいま押さえている名前なら通す
+  const reservation = services.nicknames.reservation(evaluated.key);
+  if (reservation && !(reservation.kind === "member" && reservation.user_id === member.id)) {
+    return {
+      ok: false,
+      message:
+        reservation.kind === "legacy_conflict"
+          ? "その名前は既に城内で使われているため、お使いいただけません。別の名前をお願いします。"
+          : "その名前は既に他の方が使っています。別の名前をお願いします。",
+    };
+  }
+  return { ok: true, nickname: evaluated.nickname };
 }
 
 /**
@@ -258,7 +291,7 @@ function nicknamePreflight(
   return blocked ? { ok: false, message: blocked.message } : { ok: true, member };
 }
 
-function nicknameModal(itemId: number, currentDisplayName: string) {
+function nicknameModal(itemId: number, current: string) {
   return new ModalBuilder()
     .setCustomId(`shop:nick-input:${itemId}`)
     .setTitle("名前変更")
@@ -269,8 +302,9 @@ function nicknameModal(itemId: number, currentDisplayName: string) {
           .setLabel("新しいサーバーニックネーム")
           .setStyle(TextInputStyle.Short)
           .setRequired(true)
-          .setMaxLength(NICKNAME_MAX)
-          .setValue(currentDisplayName.slice(0, NICKNAME_MAX)),
+          .setPlaceholder("漢字・かな・カナ・英数字のみ（記号や空白は使えません）")
+          .setMaxLength(NICKNAME_MAX_LENGTH)
+          .setValue(current.slice(0, NICKNAME_MAX_LENGTH)),
       ),
     );
 }
@@ -297,7 +331,7 @@ function nicknameConfirm(
       opts.priceChanged
         ? "⚠️ 確認したあとに料金が変わりました。**まだ引き落としていません。**新しい料金でご確認ください。"
         : "✏️ サーバーニックネームを変更します。",
-      `**${member.displayName}** → **${wanted}**`,
+      `**${currentName(services, member)}** → **${wanted}**`,
       `料金 **${fmtLd(price)}** ／ 残高 ${fmtLd(balance)}`,
     ].join("\n"),
     components: [
@@ -545,7 +579,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       await interaction.reply({ content: `⚠️ ${pre.message}`, flags: MessageFlags.Ephemeral });
       return;
     }
-    await interaction.showModal(nicknameModal(itemId, pre.member.displayName));
+    await interaction.showModal(nicknameModal(itemId, currentName(services, pre.member)));
     return;
   }
 
@@ -564,9 +598,11 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       await interaction.update({ content: `⚠️ ${pre.message}`, embeds: [], components: [] });
       return;
     }
-    const invalid = validateNickname(wanted, pre.member.displayName);
-    if (invalid) {
-      await interaction.update({ content: `⚠️ ${invalid}`, embeds: [], components: [] });
+    // 確定の直前にもう一度検める。確認してから押すまでに、他の人がその名前を
+    // 取っていたり、禁止語が増えていたりする
+    const checked = checkNicknameBeforeCharge(services, pre.member, wanted);
+    if (!checked.ok) {
+      await interaction.update({ content: `⚠️ ${checked.message}`, embeds: [], components: [] });
       return;
     }
     // **確認した料金でしか引き落とさない。** 変わっていたら課金せず、新しい料金で確認し直す。
@@ -937,13 +973,13 @@ export async function handleShopModal(interaction: ModalSubmitInteraction, servi
     return;
   }
   const wanted = interaction.fields.getTextInputValue("nickname").trim();
-  const invalid = validateNickname(wanted, pre.member.displayName);
-  if (invalid) {
-    await interaction.reply({ content: `⚠️ ${invalid}`, flags: MessageFlags.Ephemeral });
+  const checked = checkNicknameBeforeCharge(services, pre.member, wanted);
+  if (!checked.ok) {
+    await interaction.reply({ content: `⚠️ ${checked.message}`, flags: MessageFlags.Ephemeral });
     return;
   }
   await interaction.reply({
-    ...nicknameConfirm(services, item, pre.member, wanted, interaction.id),
+    ...nicknameConfirm(services, item, pre.member, checked.nickname, interaction.id),
     flags: MessageFlags.Ephemeral,
   });
 }

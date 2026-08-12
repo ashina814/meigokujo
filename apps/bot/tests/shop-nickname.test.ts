@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { Collection } from "discord.js";
-import { EventLog, Ledger, Settings, Shop, openDb, registerDefaultTxTypes } from "@meigokujo/core";
+import { EventLog, Ledger, Nicknames, Settings, Shop, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 
 /**
@@ -46,8 +46,9 @@ function setup() {
     approvedBy: "t",
     idempotencyKey: "seed",
   });
-  const services = { db, ledger, settings, events, shop } as unknown as Services;
-  return { db, ledger, settings, events, shop, item, services };
+  const nicknames = new Nicknames(db, events);
+  const services = { db, ledger, settings, events, shop, nicknames } as unknown as Services;
+  return { db, ledger, settings, events, shop, nicknames, item, services };
 }
 
 type Ctx = ReturnType<typeof setup>;
@@ -681,6 +682,183 @@ describe("旧購入の扱い", () => {
     expect(ctx.shop.listPendingManual().map((p) => p.id)).toEqual([legacy.id]);
     // 自動処理の対象にはしない（当時の希望内容が無いので勝手に動かさない）
     expect(ctx.shop.listUndeliveredAuto(10)).toHaveLength(0);
+    ctx.db.close();
+  });
+});
+
+describe("入城の名前制度との統合", () => {
+  it("**予約が正本**。改名すると予約が移り、古い名前は他の人が取れる", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ" });
+    ctx.nicknames.claim({ userId: USER, nickname: "まえ", setVia: "entry", actor: "t" });
+
+    await handleShopButton(pressInteraction(ctx, nickDo(ctx, "conf-1", "あと"), w), ctx.services);
+
+    expect(w.state.nickname).toBe("あと");
+    expect(ctx.nicknames.get(USER)?.nickname).toBe("あと");
+    expect(ctx.nicknames.reservation("あと")?.user_id).toBe(USER);
+    expect(ctx.nicknames.reservation("まえ")).toBeNull(); // 手放した
+    ctx.db.close();
+  });
+
+  it("**入城で固定された名前も、商館の正式な改名なら越えられる**", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "こてい" });
+    ctx.nicknames.claim({ userId: USER, nickname: "こてい", setVia: "entry", actor: "t" });
+    ctx.nicknames.lock(USER, "staff");
+
+    await handleShopButton(pressInteraction(ctx, nickDo(ctx, "conf-1", "あたらしい"), w), ctx.services);
+
+    expect(w.state.nickname).toBe("あたらしい");
+    expect(ctx.nicknames.get(USER)?.nickname).toBe("あたらしい");
+    expect(ctx.nicknames.get(USER)?.locked_at).not.toBeNull(); // 固定は外れない
+    expect(ctx.nicknames.get(USER)?.set_via).toBe("shop");
+    ctx.db.close();
+  });
+
+  it("記号を含む名前は無課金で止まる（入城パネルと同じ規則）", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ" });
+    const m = pressInteraction(ctx, `shop:nick-input:${ctx.item.id}`, w, {
+      fields: { getTextInputValue: () => "★ほし★" },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(m as never, ctx.services);
+
+    expect(contentOf(m.reply)).toContain("使えない文字");
+    expect(balance(ctx)).toBe(1_000_000);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  it("禁止語に当たる名前は無課金で止まる（払っても規則を迂回できない）", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ" });
+    ctx.nicknames.addDenyWord("ばつ", "staff", { action: "reject" });
+    const m = pressInteraction(ctx, `shop:nick-input:${ctx.item.id}`, w, {
+      fields: { getTextInputValue: () => "ばつわーど" },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(m as never, ctx.services);
+
+    expect(balance(ctx)).toBe(1_000_000);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  it("他の人が使っている名前は無課金で止まる", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ" });
+    ctx.nicknames.claim({ userId: "999999999999999999", nickname: "とられている", setVia: "entry", actor: "t" });
+    const m = pressInteraction(ctx, `shop:nick-input:${ctx.item.id}`, w, {
+      fields: { getTextInputValue: () => "とられている" },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(m as never, ctx.services);
+
+    expect(contentOf(m.reply)).toContain("既に他の方");
+    expect(balance(ctx)).toBe(1_000_000);
+    ctx.db.close();
+  });
+
+  it("既存の重複（誰の持ち物でもない予約）も無課金で止まる", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ" });
+    ctx.nicknames.importLegacy(
+      [
+        { userId: "888888888888888888", nickname: "かぶり" },
+        { userId: "999999999999999999", nickname: "かぶり" },
+      ],
+      "staff",
+    );
+    const m = pressInteraction(ctx, `shop:nick-input:${ctx.item.id}`, w, {
+      fields: { getTextInputValue: () => "かぶり" },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(m as never, ctx.services);
+
+    expect(contentOf(m.reply)).toContain("既に城内で使われている");
+    expect(balance(ctx)).toBe(1_000_000);
+    ctx.db.close();
+  });
+
+  it("**確認後に他の人へ取られていたら、課金せず止まる**", async () => {
+    const { handleShopModal, handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ" });
+    const modal = pressInteraction(ctx, `shop:nick-input:${ctx.item.id}`, w, {
+      fields: { getTextInputValue: () => "きそう" },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+    await handleShopModal(modal as never, ctx.services);
+    const doId = buttonIdOf(modal.reply);
+
+    // 確認画面を見ている間に、別の人がその名前を取った
+    ctx.nicknames.claim({ userId: "999999999999999999", nickname: "きそう", setVia: "entry", actor: "t" });
+    const press = pressInteraction(ctx, doId, w) as unknown as { update: ReturnType<typeof vi.fn> };
+    await handleShopButton(press as never, ctx.services);
+
+    expect(balance(ctx)).toBe(1_000_000);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    expect(w.state.nickname).toBe("まえ");
+    expect(contentOf(press.update)).toContain("既に他の方");
+    ctx.db.close();
+  });
+
+  it("**課金後にDiscordが失敗したら、予約も返金も戻す**", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ", setFails: "Missing Permissions" });
+
+    await handleShopButton(pressInteraction(ctx, nickDo(ctx, "conf-1", "とれない"), w), ctx.services);
+
+    expect(balance(ctx)).toBe(1_000_000); // 返金済み
+    expect(ctx.nicknames.get(USER)).toBeNull(); // 正本を残さない
+    expect(ctx.nicknames.reservation("とれない")).toBeNull(); // 予約も残さない
+    // 他の人がその名前を取れる
+    expect(ctx.nicknames.claim({ userId: "999999999999999999", nickname: "とれない", setVia: "entry", actor: "t" }).ok).toBe(true);
+    ctx.db.close();
+  });
+
+  it("巻き戻しても、それ以前に登録していた名前は失われない", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ nickname: "もとの", setFails: "Missing Permissions" });
+    ctx.nicknames.claim({ userId: USER, nickname: "もとの", setVia: "entry", actor: "t" });
+
+    await handleShopButton(pressInteraction(ctx, nickDo(ctx, "conf-1", "あたらしい"), w), ctx.services);
+
+    expect(ctx.nicknames.get(USER)?.nickname).toBe("もとの");
+    expect(ctx.nicknames.reservation("もとの")?.user_id).toBe(USER);
+    expect(ctx.nicknames.reservation("あたらしい")).toBeNull();
+    expect(balance(ctx)).toBe(1_000_000);
+    ctx.db.close();
+  });
+
+  it("購入後に他の人へ取られていたら、配送で気づいて返金する", async () => {
+    const { convergePendingNicknameChanges } = await recoveryModule;
+    const ctx = setup();
+    const w = world({ nickname: "まえ" });
+    // 課金だけ済んで落ちた
+    ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [], request: { nickname: "よこどり" } });
+    // 落ちている間に別の人がその名前を取った
+    ctx.nicknames.claim({ userId: "999999999999999999", nickname: "よこどり", setVia: "entry", actor: "t" });
+    const client = {
+      guilds: { fetch: vi.fn(async () => w.guild) },
+      users: { fetch: vi.fn(async () => ({ send: vi.fn(async () => undefined) })) },
+      channels: { fetch: vi.fn(async () => null) },
+    } as never;
+
+    await convergePendingNicknameChanges(client, ctx.services);
+
+    expect(w.state.nickname).toBe("まえ"); // 変えていない
+    expect(balance(ctx)).toBe(1_000_000); // 返金した
+    expect(ctx.nicknames.reservation("よこどり")?.user_id).toBe("999999999999999999"); // 横取りしない
     ctx.db.close();
   });
 });
