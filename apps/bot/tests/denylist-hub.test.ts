@@ -26,17 +26,34 @@ function setup() {
   return { db, events, nicknames, services };
 }
 
-function modal(action: "reject" | "flag", pattern: string, note = "") {
+let modalSeq = 0;
+function modal(action: "reject" | "flag", pattern: string, note = "", userId = ADMIN) {
   const reply = vi.fn(async () => undefined);
+  const id = `int-${++modalSeq}`;
   return {
+    id,
     interaction: {
+      id,
       customId: `mgmt:denyword:save:${action}`,
-      user: { id: ADMIN },
-      fields: { getTextInputValue: (id: string) => (id === "pattern" ? pattern : note) },
+      user: { id: userId },
+      fields: { getTextInputValue: (f: string) => (f === "pattern" ? pattern : note) },
       reply,
     } as never,
     reply,
   };
+}
+
+/** 確認画面のボタンから、その画面に紐づく鍵を取り出す */
+function tokenOf(reply: ReturnType<typeof vi.fn>): string {
+  const payload = (reply.mock.calls.at(-1) as never[])[0] as {
+    components: { toJSON(): { components: { custom_id: string }[] } }[];
+  };
+  return payload.components.flatMap((r) => r.toJSON().components)[0]!.custom_id.split(":")[3]!;
+}
+
+function press(customId: string, userId = ADMIN) {
+  const update = vi.fn(async () => undefined);
+  return { interaction: { customId, user: { id: userId }, update } as never, update };
 }
 
 const contentOf = (fn: ReturnType<typeof vi.fn>) => String((fn.mock.calls.at(-1) as never[])[0]?.content ?? "");
@@ -142,16 +159,14 @@ describe("追加", () => {
     const { handleDenywordModal, handleDenywordButton } = await hubModule;
     const ctx = setup();
     ctx.nicknames.importLegacy([{ userId: "u1", nickname: "あかり" }], "staff");
-    await handleDenywordModal(modal("reject", "あか").interaction, ctx.services);
-    const update = vi.fn(async () => undefined);
+    const m = modal("reject", "あか");
+    await handleDenywordModal(m.interaction, ctx.services);
+    const p = press(`mgmt:denyword:confirm:${tokenOf(m.reply)}`);
 
-    await handleDenywordButton(
-      { customId: "mgmt:denyword:confirm", user: { id: ADMIN }, update } as never,
-      ctx.services,
-    );
+    await handleDenywordButton(p.interaction, ctx.services);
 
     expect(ctx.nicknames.listDenyWords()).toEqual([{ pattern: "あか", action: "reject", note: null }]);
-    expect(String((update.mock.calls.at(-1) as never[])[0]?.content)).toContain("登録しました");
+    expect(String((p.update.mock.calls.at(-1) as never[])[0]?.content)).toContain("登録しました");
     ctx.db.close();
   });
 
@@ -159,20 +174,15 @@ describe("追加", () => {
     const { handleDenywordModal, handleDenywordButton } = await hubModule;
     const ctx = setup();
     ctx.nicknames.importLegacy([{ userId: "u1", nickname: "あかり" }], "staff");
-    await handleDenywordModal(modal("reject", "あか").interaction, ctx.services);
-    const update = vi.fn(async () => undefined);
+    const m = modal("reject", "あか");
+    await handleDenywordModal(m.interaction, ctx.services);
+    const token = tokenOf(m.reply);
 
-    await handleDenywordButton(
-      { customId: "mgmt:denyword:cancel", user: { id: ADMIN }, update } as never,
-      ctx.services,
-    );
+    await handleDenywordButton(press(`mgmt:denyword:cancel:${token}`).interaction, ctx.services);
 
     expect(ctx.nicknames.listDenyWords()).toHaveLength(0);
-    // 確認が消えているので、そのまま確定ボタンを押しても入らない
-    await handleDenywordButton(
-      { customId: "mgmt:denyword:confirm", user: { id: ADMIN }, update } as never,
-      ctx.services,
-    );
+    // 確認が消えているので、同じボタンを押しても入らない
+    await handleDenywordButton(press(`mgmt:denyword:confirm:${token}`).interaction, ctx.services);
     expect(ctx.nicknames.listDenyWords()).toHaveLength(0);
     ctx.db.close();
   });
@@ -239,10 +249,7 @@ describe("要確認語を足したときの承認の扱い", () => {
     expect(contentOf(m.reply)).toContain("まだ登録していません");
     expect(ctx.nicknames.status("u1").kind).toBe("ok"); // 確認前は何も変わらない
 
-    await handleDenywordButton(
-      { customId: "mgmt:denyword:confirm", user: { id: ADMIN }, update: vi.fn(async () => undefined) } as never,
-      ctx.services,
-    );
+    await handleDenywordButton(press(`mgmt:denyword:confirm:${tokenOf(m.reply)}`).interaction, ctx.services);
 
     expect(ctx.nicknames.status("u1").kind).toBe("review");
     ctx.db.close();
@@ -258,6 +265,95 @@ describe("要確認語を足したときの承認の扱い", () => {
     await handleDenywordModal(modal("flag", "まったくべつ").interaction, ctx.services);
 
     expect(ctx.nicknames.status("u1").kind).toBe("ok");
+    ctx.db.close();
+  });
+});
+
+describe("確認画面と中身の紐づけ", () => {
+  /** 同じ管理者が確認待ちを2件（A→B）作る */
+  async function twoPending(ctx: ReturnType<typeof setup>) {
+    const { handleDenywordModal } = await hubModule;
+    ctx.nicknames.importLegacy(
+      [
+        { userId: "u1", nickname: "あかり" },
+        { userId: "u2", nickname: "ほのか" },
+      ],
+      "staff",
+    );
+    const a = modal("reject", "あか");
+    await handleDenywordModal(a.interaction, ctx.services);
+    const b = modal("reject", "ほの");
+    await handleDenywordModal(b.interaction, ctx.services);
+    expect(ctx.nicknames.listDenyWords()).toHaveLength(0);
+    return { tokenA: tokenOf(a.reply), tokenB: tokenOf(b.reply) };
+  }
+
+  it("**AのconfirmはAだけを登録する**（新しいBを確定しない）", async () => {
+    const { handleDenywordButton } = await hubModule;
+    const ctx = setup();
+    const { tokenA } = await twoPending(ctx);
+
+    await handleDenywordButton(press(`mgmt:denyword:confirm:${tokenA}`).interaction, ctx.services);
+
+    expect(ctx.nicknames.listDenyWords().map((w) => w.pattern)).toEqual(["あか"]);
+    ctx.db.close();
+  });
+
+  it("**AのcancelはBを消さない**（Bはそのまま確定できる）", async () => {
+    const { handleDenywordButton } = await hubModule;
+    const ctx = setup();
+    const { tokenA, tokenB } = await twoPending(ctx);
+
+    await handleDenywordButton(press(`mgmt:denyword:cancel:${tokenA}`).interaction, ctx.services);
+    await handleDenywordButton(press(`mgmt:denyword:confirm:${tokenB}`).interaction, ctx.services);
+
+    expect(ctx.nicknames.listDenyWords().map((w) => w.pattern)).toEqual(["ほの"]);
+    // Aは取り消したので、あとから押しても入らない
+    await handleDenywordButton(press(`mgmt:denyword:confirm:${tokenA}`).interaction, ctx.services);
+    expect(ctx.nicknames.listDenyWords().map((w) => w.pattern)).toEqual(["ほの"]);
+    ctx.db.close();
+  });
+
+  it("他の管理者の確認は動かせない", async () => {
+    const { handleDenywordModal, handleDenywordButton } = await hubModule;
+    const ctx = setup();
+    ctx.nicknames.importLegacy([{ userId: "u1", nickname: "あかり" }], "staff");
+    const m = modal("reject", "あか");
+    await handleDenywordModal(m.interaction, ctx.services);
+    const token = tokenOf(m.reply);
+
+    // 別の管理者が同じボタンIDを押しても効かない
+    await handleDenywordButton(press(`mgmt:denyword:confirm:${token}`, "999999999999999999").interaction, ctx.services);
+    expect(ctx.nicknames.listDenyWords()).toHaveLength(0);
+
+    // 本人が押せば入る
+    await handleDenywordButton(press(`mgmt:denyword:confirm:${token}`).interaction, ctx.services);
+    expect(ctx.nicknames.listDenyWords()).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("**確認前後で件数が変わったら、そのまま保存しない**", async () => {
+    const { handleDenywordModal, handleDenywordButton } = await hubModule;
+    const ctx = setup();
+    ctx.nicknames.importLegacy([{ userId: "u1", nickname: "あかり" }], "staff");
+    const m = modal("reject", "あか");
+    await handleDenywordModal(m.interaction, ctx.services);
+    expect(contentOf(m.reply)).toContain("1件");
+    const token = tokenOf(m.reply);
+
+    // 見せてから押すまでの間に、同じ語に当たる人が増えた
+    ctx.nicknames.importLegacy([{ userId: "u2", nickname: "あかつき" }], "staff");
+    const first = press(`mgmt:denyword:confirm:${token}`);
+    await handleDenywordButton(first.interaction, ctx.services);
+
+    expect(ctx.nicknames.listDenyWords()).toHaveLength(0); // 保存していない
+    const shown = String((first.update.mock.calls.at(-1) as never[])[0]?.content);
+    expect(shown).toContain("1件 → 2件");
+    expect(shown).toContain("まだ登録していません");
+
+    // 新しい件数で改めて確定すれば入る
+    await handleDenywordButton(press(`mgmt:denyword:confirm:${token}`).interaction, ctx.services);
+    expect(ctx.nicknames.listDenyWords().map((w) => w.pattern)).toEqual(["あか"]);
     ctx.db.close();
   });
 });
