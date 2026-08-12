@@ -1,5 +1,6 @@
 import { EmbedBuilder, type Client, type Guild, type TextChannel } from "discord.js";
 import { addJstDays, formatJstDate, jstDateStr } from "@meigokujo/core";
+import { entryOpsChannelId } from "./entry-channels.js";
 import type { Services } from "./services.js";
 
 /**
@@ -275,14 +276,18 @@ async function countVcPresent(
 }
 
 /**
- * 時間外希望の件数。受付は入城案内chの非公開スレッドなので、生きているスレッド数を数える。
+ * 時間外希望の件数。受付は**運用ch**の非公開スレッドなので、生きているスレッド数を数える。
  * スレッドを取れないときは、記録した受付件数（直近7日）で代替する。
+ *
+ * 数える場所は `openFlexTicket` が作る場所と同じでなければならない。片方だけ
+ * 変えると、スレッドはあるのにボードの件数が 0 になる。
  */
-async function countFlexRequests(
+export async function countFlexRequests(
   guild: Guild,
   services: Services,
 ): Promise<{ flexOpen: number | null; flexFallback: boolean }> {
-  const guideId = services.settings.getString("channel:entry_guide");
+  // 数える相手はスレッドを作った場所＝運用側（未設定なら従来どおり案内側）
+  const guideId = entryOpsChannelId(services);
   const guide = guideId ? await guild.channels.fetch(guideId).catch(() => null) : null;
   if (guide?.isTextBased() && "threads" in guide) {
     const active = await guide.threads.fetchActive().catch(() => null);
