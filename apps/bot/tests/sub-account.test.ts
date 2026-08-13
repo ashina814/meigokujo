@@ -75,12 +75,18 @@ const balance = (ctx: Ctx) => ctx.ledger.balanceOf(`user:${MAIN}`);
 function world(
   opts: {
     addFails?: string;
+    /** このロールの付与だけ失敗させる（未指定なら全部） */
+    addFailsFor?: string;
     addActuallyApplies?: boolean;
     removeFails?: boolean;
     /** エラーを返すが、Discord側では剥奪が通っていた */
     removeActuallyApplies?: boolean;
     /** 取り直し（force fetch）が失敗する＝実状態を確認できない */
     forceFetchFails?: boolean;
+    /** N回目以降の force fetch だけ失敗させる（途中まで進んでから確認不能になる） */
+    forceFetchFailsAfter?: number;
+    /** 実体には無いが、**古いcacheにだけ**載っているロール */
+    staleOnly?: string[];
     altMissing?: boolean;
   } = {},
 ) {
@@ -91,7 +97,7 @@ function world(
     roles: {
       cache,
       add: vi.fn(async (id: string) => {
-        if (opts.addFails) {
+        if (opts.addFails && (opts.addFailsFor === undefined || opts.addFailsFor === id)) {
           if (opts.addActuallyApplies) {
             altRoles.push(id);
             cache.set(id, true);
@@ -115,19 +121,30 @@ function world(
       }),
     },
   };
+  // 古いcache。**実体には無いロールが載っている**状況を作れる
+  const staleCache = new Collection<string, unknown>();
+  for (const id of opts.staleOnly ?? []) staleCache.set(id, true);
+  const staleAlt = { id: ALT, roles: { ...alt.roles, cache: staleCache } };
+  let forceCalls = 0;
   const guild = {
     id: "g1",
     members: {
       fetch: vi.fn(async (arg?: unknown) => {
         if (opts.altMissing) throw new Error("Unknown Member");
+        const isForce = typeof arg === "object" && arg !== null;
+        if (!isForce) return (opts.staleOnly ? staleAlt : alt) as never;
         // 取り直し（{ user, force }）だけ失敗させられるようにする
-        if (opts.forceFetchFails && typeof arg === "object" && arg !== null) throw new Error("Service Unavailable");
+        forceCalls += 1;
+        if (opts.forceFetchFails) throw new Error("Service Unavailable");
+        if (opts.forceFetchFailsAfter !== undefined && forceCalls >= opts.forceFetchFailsAfter) {
+          throw new Error("Service Unavailable");
+        }
         return alt;
       }),
     },
     roles: { cache: new Collection() },
   };
-  return { guild, alt, altRoles };
+  return { guild, alt, altRoles, staleCache };
 }
 
 function press(customId: string, w: ReturnType<typeof world>, userId = MAIN, extra: Record<string, unknown> = {}) {
@@ -777,6 +794,87 @@ describe("有効化に失敗したら階級ロールも元へ戻す", () => {
 
     expect(balance(ctx)).toBe(1_000_000 - PRICE); // **返金していない**
     expect(ctx.shop.listUserPurchases(MAIN).filter((p) => p.status === "active")).toHaveLength(1);
+    vi.restoreAllMocks();
+    ctx.db.close();
+  });
+});
+
+describe("正規化の途中で失敗したときも副作用を戻す", () => {
+  const MAZOKU_ROLE = "role-mazoku";
+  const KENMA_ROLE = "role-kenma";
+
+  it("**剥奪後・付与がAPIエラー・最終確認も不能 → 自動返金しない**（払っていないのに階級が残る、を作らない）", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup(); // main = 魔人
+    const row = approved(ctx);
+    // 魔族のremoveは成功し、魔人のaddはDiscord側で通るがAPIはエラー。
+    // その後の取り直しが落ちて実状態が読めない
+    const w = world({ addFails: "Service Unavailable", addActuallyApplies: true, forceFetchFailsAfter: 3 });
+    w.alt.roles.cache.set(MAZOKU_ROLE, true);
+    w.altRoles.push(MAZOKU_ROLE);
+
+    await handleShopButton(press(payId(ctx, row.id), w), ctx.services);
+
+    expect(balance(ctx)).toBe(1_000_000 - PRICE); // **返金していない**
+    expect(ctx.shop.listUserPurchases(MAIN).filter((p) => p.status === "active")).toHaveLength(1);
+    expect(ctx.subAccounts.get(row.id)!.status).toBe("approved");
+    ctx.db.close();
+  });
+
+  it("付与の失敗が確認できるなら、開始前へ戻してから返金する", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const row = approved(ctx);
+    const w = world({ addFails: "Missing Permissions", addFailsFor: MAJIN_ROLE }); // 魔人だけ付かない
+    w.alt.roles.cache.set(MAZOKU_ROLE, true);
+    w.altRoles.push(MAZOKU_ROLE);
+
+    await handleShopButton(press(payId(ctx, row.id), w), ctx.services);
+
+    expect(w.altRoles).toEqual([MAZOKU_ROLE]); // 開始前へ戻っている
+    expect(balance(ctx)).toBe(1_000_000); // 返金済み
+    expect(ctx.subAccounts.get(row.id)!.status).toBe("approved");
+    ctx.db.close();
+  });
+
+  it("余分なロールの一部しか剥がせなかった場合も、開始前へ戻してから返金する", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const row = approved(ctx);
+    const w = world();
+    // 魔族と剣魔を持っている。剣魔だけ剥がせない
+    w.alt.roles.cache.set(MAZOKU_ROLE, true);
+    w.alt.roles.cache.set(KENMA_ROLE, true);
+    w.altRoles.push(MAZOKU_ROLE, KENMA_ROLE);
+    const realRemove = w.alt.roles.remove;
+    w.alt.roles.remove = vi.fn(async (id: string, reason?: string) => {
+      if (id === KENMA_ROLE && reason?.includes("本体の階級に合わせる")) return undefined;
+      return realRemove(id, reason);
+    }) as never;
+
+    await handleShopButton(press(payId(ctx, row.id), w), ctx.services);
+
+    expect([...w.altRoles].sort()).toEqual([KENMA_ROLE, MAZOKU_ROLE].sort()); // 両方戻っている
+    expect(w.altRoles).not.toContain(MAJIN_ROLE); // 魔人は足していない
+    expect(balance(ctx)).toBe(1_000_000); // 返金済み
+    ctx.db.close();
+  });
+
+  it("**開始前の状態は古いcacheではなく実体から取る**（持っていなかったロールを新しく付けない）", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const row = approved(ctx);
+    // cache上は魔族を持っているように見えるが、実体には階級ロールが無い
+    const w = world({ staleOnly: [MAZOKU_ROLE] });
+    vi.spyOn(ctx.subAccounts, "activate").mockImplementationOnce(() => {
+      ctx.db.prepare("UPDATE sub_accounts SET status='cancelled' WHERE id=?").run(row.id);
+      return false;
+    });
+
+    await handleShopButton(press(payId(ctx, row.id), w), ctx.services);
+
+    expect(w.altRoles).toEqual([]); // 巻き戻しても魔族を新規付与しない
+    expect(balance(ctx)).toBe(1_000_000); // 返金済み
     vi.restoreAllMocks();
     ctx.db.close();
   });

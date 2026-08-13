@@ -402,9 +402,15 @@ export async function deliverPurchaseUnlocked(
       // 毎分の巡回と同じ処理を使う（片方だけ緩い、を作らない）
       const synced = await reconcileAltRank(services, guild, alt, userId);
       if (!synced.ok) {
+        // **変更を始めたあとの失敗は、開始前へ戻せた確認が取れるまで返金しない。**
+        // 返金だけ通ると「払っていないのに階級ロールが残っている」が起きる
+        const safeToRefund = synced.restored === true;
         return fail(
-          `alt_rank_sync_failed:${synced.reason}`,
-          "サブ垢の階級を本体に合わせられなかったため有効化できませんでした。",
+          `alt_rank_sync_failed:${synced.reason}${synced.restored === true ? "" : ":rollback_unconfirmed"}`,
+          safeToRefund
+            ? "サブ垢の階級を本体に合わせられなかったため有効化できませんでした。"
+            : "サブ垢の階級を戻せたか確認できませんでした。運営が確認しますので、そのままお待ちください。",
+          { refundable: safeToRefund },
         );
       }
       const previousRanks = synced.previous;
