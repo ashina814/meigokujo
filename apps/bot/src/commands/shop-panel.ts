@@ -41,7 +41,9 @@ import {
 import {
   handleApplyModal as handleSubApplyModal,
   applyModal as subApplyModal,
+  hasUnresolvedLegacySubAccount,
   isSubAccountItem,
+  LEGACY_SUB_ACCOUNT_BLOCK_MESSAGE,
   mainRank as subMainRank,
   payRequote as subPayRequote,
   subAccountActions,
@@ -611,6 +613,14 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     const applyItem = services.shop.getItem(Number(parts[2]));
     if (!applyItem || !applyItem.enabled || !isSubAccountItem(services, applyItem)) {
       await interaction.update({ content: "この商品はいま申請できません。", embeds: [], components: [] });
+      return;
+    }
+    if (hasUnresolvedLegacySubAccount(services, interaction.user.id)) {
+      await interaction.update({
+        content: `⚠️ ${LEGACY_SUB_ACCOUNT_BLOCK_MESSAGE}`,
+        embeds: [],
+        components: [],
+      });
       return;
     }
     await interaction.showModal(subApplyModal(applyItem.id));

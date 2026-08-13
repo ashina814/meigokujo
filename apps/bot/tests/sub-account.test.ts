@@ -33,6 +33,7 @@ const shopPanelModule = import("../src/commands/shop-panel.js");
 
 const MAIN = "1463201396567441441";
 const ALT = "1463201396567441442";
+const ALT2 = "1463201396567441443";
 const PRICE = 80_000;
 const MAJIN_ROLE = "role-majin";
 
@@ -232,6 +233,92 @@ describe("申請", () => {
 
     expect(ctx.subAccounts.listByMain(MAIN)).toHaveLength(0);
     expect(contentOf(m.reply)).toContain("Discord ID");
+    ctx.db.close();
+  });
+});
+
+describe("旧契約の二重課金防止", () => {
+  function legacyPurchase(ctx: Ctx, status: "active" | "refunded" = "active") {
+    const legacy = ctx.shop.createItem(
+      { name: "サブ垢追加(旧)", price_land: PRICE, kind: "one_shot", delivery: "manual" },
+      "staff",
+    );
+    ctx.settings.set("shop:sub_account_legacy_item_id", String(legacy.id), "staff");
+    const outcome = ctx.shop.purchase({ userId: MAIN, itemId: legacy.id, actor: "t", memberRoleIds: [] });
+    if (status === "refunded") ctx.shop.refund(outcome.purchase.id, "test", "staff");
+    return outcome.purchase;
+  }
+
+  it("legacy active + 未引き継ぎならbuttonとmodalの両方で止め、申請もLand移動もない", async () => {
+    const { handleShopButton, handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    legacyPurchase(ctx);
+    const before = balance(ctx);
+    const w = world();
+    const button = press(`shop:sub-apply:${ctx.item.id}`, w) as unknown as {
+      showModal: ReturnType<typeof vi.fn>;
+      update: ReturnType<typeof vi.fn>;
+    };
+    const modal = press(`shop:sub-input:${ctx.item.id}`, w, MAIN, {
+      fields: { getTextInputValue: () => ALT },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopButton(button as never, ctx.services);
+    await handleShopModal(modal as never, ctx.services);
+
+    expect(button.showModal).not.toHaveBeenCalled();
+    expect(contentOf(button.update)).toContain("旧サブ垢契約が残っています");
+    expect(contentOf(modal.reply)).toContain("二重に支払わず");
+    expect(ctx.subAccounts.listByMain(MAIN)).toHaveLength(0);
+    expect(balance(ctx)).toBe(before);
+    ctx.db.close();
+  });
+
+  it("legacy activeでもactive sub_accountsがあれば通常の追加申請ルールへ進む", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    legacyPurchase(ctx);
+    ctx.subAccounts.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" });
+    const before = balance(ctx);
+    const modal = press(`shop:sub-input:${ctx.item.id}`, world(), MAIN, {
+      fields: { getTextInputValue: () => ALT2 },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(modal as never, ctx.services);
+
+    expect(ctx.subAccounts.listByMain(MAIN).map((row) => row.status)).toEqual(["active", "pending"]);
+    expect(balance(ctx)).toBe(before);
+    ctx.db.close();
+  });
+
+  it("legacy refundedはblockerにならない", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    legacyPurchase(ctx, "refunded");
+    const before = balance(ctx);
+    const modal = press(`shop:sub-input:${ctx.item.id}`, world(), MAIN, {
+      fields: { getTextInputValue: () => ALT },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(modal as never, ctx.services);
+
+    expect(ctx.subAccounts.listByMain(MAIN)[0]!.status).toBe("pending");
+    expect(balance(ctx)).toBe(before);
+    ctx.db.close();
+  });
+
+  it("legacy設定が未設定なら通常動作する", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    const before = balance(ctx);
+    const modal = press(`shop:sub-input:${ctx.item.id}`, world(), MAIN, {
+      fields: { getTextInputValue: () => ALT },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(modal as never, ctx.services);
+
+    expect(ctx.subAccounts.listByMain(MAIN)[0]!.status).toBe("pending");
+    expect(balance(ctx)).toBe(before);
     ctx.db.close();
   });
 });
