@@ -43,6 +43,17 @@ export function deliverOrRefund(
     withPurchaseLock(purchase.id, async () => {
       const outcome = await deliverPurchaseUnlocked(services, guild, purchase, actor);
       if (outcome.state !== "failed") return { outcome };
+      if (outcome.refundable === false) {
+        // Discord側の副作用を戻せたか確認できていない。**返金しないで人へ渡す**
+        services.events.log("shop_refund_withheld", {
+          actor,
+          target: purchase.user_id,
+          payload: { purchaseId: purchase.id, reason: outcome.error ?? "delivery_failed" },
+        });
+        await refreshShopAdminPanels(client, services).catch(() => undefined);
+        await notifyRefundFailure(client, services, purchase.id).catch(() => undefined);
+        return { outcome, refund: "escalated" as const };
+      }
       const refund = await refundOrEscalate(client, services, purchase, outcome.error ?? "delivery_failed", actor);
       return { outcome, refund };
     }),

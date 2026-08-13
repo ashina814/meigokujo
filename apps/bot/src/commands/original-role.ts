@@ -91,8 +91,9 @@ export function originalRoleActions(services: Services, item: ShopItemRow, userI
     );
     buttons.push(
       new ButtonBuilder()
-        // 画面ごとの鍵。二度押しは1回にまとまり、開き直せば新しい挑戦になる
-        .setCustomId(`shop:orole-pay:${item.id}:${approved.id}:${payAttemptToken()}`)
+        // **表示した額を確定まで持たせる**（押した時の最新価格で引かない）。
+        // 画面ごとの鍵で、二度押しは1回にまとまり、開き直せば新しい挑戦になる
+        .setCustomId(`shop:orole-pay:${item.id}:${approved.id}:${item.price_land ?? 0}:${payAttemptToken()}`)
         .setLabel(`支払って作成する (${fmtLd(item.price_land ?? 0)})`)
         .setEmoji("💰")
         .setStyle(ButtonStyle.Success),
@@ -315,4 +316,25 @@ async function notifyStaff(
   await channel
     .send({ content: `${content}\n-# 商館の管理パネルの「オリジナルロール」から確認してください。`, allowedMentions: { parse: [] } })
     .catch(() => undefined);
+}
+
+/** 価格が変わっていたときの再確認。**1 Ld も動かさないまま新しい額で確かめ直す** */
+export function payRequote(item: ShopItemRow, applicationId: number, roleName: string) {
+  const price = item.price_land ?? 0;
+  return {
+    content: [
+      `⚠️ 確認したあとに料金が変わりました。**まだ引き落としていません。**`,
+      `オリジナルロール **${roleName}** の作成料金は現在 **${fmtLd(price)}** です。`,
+    ].join("\n"),
+    embeds: [],
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`shop:orole-pay:${item.id}:${applicationId}:${price}:${payAttemptToken()}`)
+          .setLabel(`この料金で支払う (${fmtLd(price)})`)
+          .setEmoji("💰")
+          .setStyle(ButtonStyle.Success),
+      ),
+    ],
+  };
 }

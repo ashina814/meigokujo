@@ -41,6 +41,13 @@ export interface DeliveryOutcome {
   message: string;
   /** 失敗理由（記録用） */
   error?: string;
+  /**
+   * `false` のときは**失敗しても返金しない**。
+   *
+   * Discord 側の副作用を戻せたか確認できなかったときに使う。返金してしまうと
+   * 「払っていないのにロールを持っている」が残る。ここは人が見て決める。
+   */
+  refundable?: boolean;
 }
 
 /**
@@ -167,9 +174,9 @@ export async function deliverPurchaseUnlocked(
     return { state: "already_delivered", message: "この購入は配送済みです。" };
   }
 
-  const fail = (reason: string, userMessage: string): DeliveryOutcome => {
+  const fail = (reason: string, userMessage: string, opts: { refundable?: boolean } = {}): DeliveryOutcome => {
     services.shop.markDeliveryFailed(purchase.id, reason, actor);
-    return { state: "failed", message: userMessage, error: reason };
+    return { state: "failed", message: userMessage, error: reason, refundable: opts.refundable };
   };
 
   const snapshot = parseDeliverySnapshot(purchase.delivery_snapshot_json);
@@ -312,10 +319,15 @@ export async function deliverPurchaseUnlocked(
         }
       }
 
-      const added = await member.roles
+      let added = await member.roles
         .add(role.id, "公式ショップ: オリジナルロール付与")
         .then(() => true)
         .catch((e: Error) => e.message || "unknown");
+      if (added !== true) {
+        // **エラーだけで決めない。** Discord側では通っていることがある。
+        // 取り直して実際に持っていれば、付与は成功として先へ進む
+        if (await memberHasRole(guild, userId, role.id)) added = true;
+      }
       if (added !== true) {
         // 付けられないロールを残さない（誰のものでもないロールが増える）。
         // 前回の続きで拾ったロールは消さずに残す——記録と結び付いているので、
@@ -333,7 +345,20 @@ export async function deliverPurchaseUnlocked(
         // **返金する前に、今つけた副作用を戻す。** 返金だけして付与が残ると
         // 「払っていないのに持っている」になる。引き継いだ既存ロールは消さず、
         // 本人からの付与だけ外す（他の契約の持ち物かもしれない）
-        await member.roles.remove(role.id, "公式ショップ: 契約を開始できなかったため取り消し").catch(() => undefined);
+        const removed = await member.roles
+          .remove(role.id, "公式ショップ: 契約を開始できなかったため取り消し")
+          .then(() => true)
+          .catch(() => false);
+        // **外せたかどうかを実物で確かめる。** 外れていないまま返金すると
+        // 「払っていないのに持っている」が残る。確認できなければ返金しない
+        const stillHeld = removed ? await memberHasRole(guild, userId, role.id) : await memberHasRoleStrict(guild, userId, role.id);
+        if (stillHeld !== false) {
+          return fail(
+            "activate_conflict_rollback_failed",
+            "契約の開始に失敗しました。運営が確認しますので、そのままお待ちください。",
+            { refundable: false },
+          );
+        }
         if (createdNow) await role.delete("公式ショップ: 二重実行のため取り消し").catch(() => undefined);
         return fail("activate_conflict", "契約の開始に失敗しました。運営にお問い合わせください。");
       }
@@ -493,4 +518,20 @@ async function resolveOriginalRole(
   // **付与より先に記録する。** ここで落ちても role_id から拾い直せる
   services.originalRoles.attachRole(application.id, created.id, actor);
   return { role: created, createdNow: true };
+}
+
+/** 本当に持っているか、取り直して確かめる。確認できなければ「持っていない」とは言わない */
+async function memberHasRole(guild: Guild, userId: string, roleId: string): Promise<boolean> {
+  const fresh = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
+  return fresh?.roles.cache.has(roleId) ?? false;
+}
+
+/**
+ * 外れたかどうかを確かめる。**「確認できなかった」を「外れた」に倒さない。**
+ * `null` は確認できなかった合図で、呼び出し側は返金を止める。
+ */
+async function memberHasRoleStrict(guild: Guild, userId: string, roleId: string): Promise<boolean | null> {
+  const fresh = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
+  if (!fresh) return null;
+  return fresh.roles.cache.has(roleId);
 }

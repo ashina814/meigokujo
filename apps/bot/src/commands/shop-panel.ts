@@ -33,6 +33,7 @@ import {
   handleRenewConfirm,
   isOriginalRoleItem,
   originalRoleActions,
+  payRequote,
   renewConfirm,
   renewPicker,
 } from "./original-role.js";
@@ -599,11 +600,19 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
   if (action === "orole-pay") {
     const itemId = Number(parts[2]);
     const applicationId = Number(parts[3]);
+    // 表示した額。**押した時の最新価格ではなく、これで引く**
+    const quotedPrice = Number(parts[4]);
     // 支払い画面ごとの鍵。**同じ画面の二度押しは1回**、開き直せば新しい挑戦になる
-    const attempt = parts[4] ?? "";
+    const attempt = parts[5] ?? "";
     const item = services.shop.getItem(itemId);
     if (!item || !item.enabled || !isOriginalRoleItem(services, item) || item.price_land === null) {
       await interaction.update({ content: "この商品はいま購入できません。", embeds: [], components: [] });
+      return;
+    }
+    if (quotedPrice !== item.price_land) {
+      // **1 Ld も動かさずに**、新しい額で確かめ直してもらう（新しい鍵を配る）
+      const application = services.originalRoles.get(applicationId);
+      await interaction.update(payRequote(item, applicationId, application?.name ?? ""));
       return;
     }
     await interaction.deferUpdate();

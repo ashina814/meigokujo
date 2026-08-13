@@ -65,7 +65,19 @@ type Ctx = ReturnType<typeof setup>;
 const balance = (ctx: Ctx) => ctx.ledger.balanceOf(`user:${USER}`);
 
 /** ロール作成の成否を差し込めるギルド */
-function world(opts: { createFails?: string; addFails?: string; fetchFails?: boolean; notRemovable?: boolean } = {}) {
+function world(
+  opts: {
+    createFails?: string;
+    addFails?: string;
+    /** エラーを返すが、Discord側では付与が通っていた（外部APIではよくある） */
+    addActuallyApplies?: boolean;
+    removeFails?: boolean;
+    /** エラーを返すが、Discord側では剥奪が通っていた */
+    removeActuallyApplies?: boolean;
+    fetchFails?: boolean;
+    notRemovable?: boolean;
+  } = {},
+) {
   const roleDeleted: string[] = [];
   const memberRoles: string[] = [];
   const memberRoleCache = new Collection<string, unknown>();
@@ -74,14 +86,27 @@ function world(opts: { createFails?: string; addFails?: string; fetchFails?: boo
     roles: {
       cache: memberRoleCache,
       add: vi.fn(async (id: string) => {
-        if (opts.addFails) throw new Error(opts.addFails);
+        if (opts.addFails) {
+          if (opts.addActuallyApplies) {
+            memberRoles.push(id);
+            memberRoleCache.set(id, true);
+          }
+          throw new Error(opts.addFails);
+        }
         memberRoles.push(id);
         memberRoleCache.set(id, true);
       }),
       remove: vi.fn(async (id: string) => {
-        const i = memberRoles.indexOf(id);
-        if (i >= 0) memberRoles.splice(i, 1);
-        memberRoleCache.delete(id);
+        const drop = () => {
+          const i = memberRoles.indexOf(id);
+          if (i >= 0) memberRoles.splice(i, 1);
+          memberRoleCache.delete(id);
+        };
+        if (opts.removeFails) {
+          if (opts.removeActuallyApplies) drop();
+          throw new Error("Service Unavailable");
+        }
+        drop();
       }),
     },
   };
@@ -121,6 +146,7 @@ function world(opts: { createFails?: string; addFails?: string; fetchFails?: boo
       }),
       cache: living,
     },
+    // force fetch でも同じ member を返す（cache が実物の代わり）
     members: { fetch: vi.fn(async () => member) },
   };
   return { guild, member, memberRoles, roleDeleted, living, makeRole };
@@ -209,7 +235,7 @@ describe("承認後の支払いと作成", () => {
     const row = approved(ctx);
     const w = world();
 
-    await handleShopButton(press(ctx, `shop:orole-pay:${ctx.item.id}:${row.id}`, w), ctx.services);
+    await handleShopButton(press(ctx, `shop:orole-pay:${ctx.item.id}:${row.id}:${PRICE}:a1`, w), ctx.services);
 
     expect(w.guild.roles.create).toHaveBeenCalled();
     expect(w.memberRoles).toHaveLength(1);
@@ -227,7 +253,7 @@ describe("承認後の支払いと作成", () => {
     const row = approved(ctx);
     const w = world();
 
-    await handleShopButton(press(ctx, `shop:orole-pay:${ctx.item.id}:${row.id}`, w), ctx.services);
+    await handleShopButton(press(ctx, `shop:orole-pay:${ctx.item.id}:${row.id}:${PRICE}:a1`, w), ctx.services);
 
     const opts = (w.guild.roles.create.mock.calls[0] as never[])[0] as {
       permissions: unknown[];
@@ -246,7 +272,7 @@ describe("承認後の支払いと作成", () => {
     const row = ctx.originalRoles.apply({ userId: USER, name: "あ", color: null, actor: "t" });
     const w = world();
 
-    await handleShopButton(press(ctx, `shop:orole-pay:${ctx.item.id}:${row.id}`, w), ctx.services);
+    await handleShopButton(press(ctx, `shop:orole-pay:${ctx.item.id}:${row.id}:${PRICE}:a1`, w), ctx.services);
 
     expect(balance(ctx)).toBe(5_000_000);
     expect(w.guild.roles.create).not.toHaveBeenCalled();
@@ -259,7 +285,7 @@ describe("承認後の支払いと作成", () => {
     const row = approved(ctx);
     const w = world({ createFails: "Missing Permissions" });
 
-    const p = press(ctx, `shop:orole-pay:${ctx.item.id}:${row.id}`, w) as unknown as {
+    const p = press(ctx, `shop:orole-pay:${ctx.item.id}:${row.id}:${PRICE}:a1`, w) as unknown as {
       editReply: ReturnType<typeof vi.fn>;
     };
     await handleShopButton(p as never, ctx.services);
@@ -276,7 +302,7 @@ describe("承認後の支払いと作成", () => {
     const row = approved(ctx);
     const w = world({ addFails: "Missing Permissions" });
 
-    await handleShopButton(press(ctx, `shop:orole-pay:${ctx.item.id}:${row.id}`, w), ctx.services);
+    await handleShopButton(press(ctx, `shop:orole-pay:${ctx.item.id}:${row.id}:${PRICE}:a1`, w), ctx.services);
 
     expect(w.roleDeleted).toEqual(["role-1"]); // 誰のものでもないロールを残さない
     expect(balance(ctx)).toBe(5_000_000); // 返金済み
@@ -288,7 +314,7 @@ describe("承認後の支払いと作成", () => {
     const ctx = setup();
     const row = approved(ctx);
     const w = world();
-    const id = `shop:orole-pay:${ctx.item.id}:${row.id}`;
+    const id = `shop:orole-pay:${ctx.item.id}:${row.id}:${PRICE}:a1`;
 
     await handleShopButton(press(ctx, id, w), ctx.services);
     await handleShopButton(press(ctx, id, w), ctx.services);
@@ -618,7 +644,7 @@ describe("支払いのやり直し", () => {
     return row;
   }
   const payId = (ctx: Ctx, appId: number, attempt: string) =>
-    `shop:orole-pay:${ctx.item.id}:${appId}:${attempt}`;
+    `shop:orole-pay:${ctx.item.id}:${appId}:${PRICE}:${attempt}`;
 
   it("同じ支払い画面を二度押しても課金は1回", async () => {
     const { handleShopButton } = await shopPanelModule;
@@ -822,6 +848,166 @@ describe("旧契約の引き継ぎ（運営導線）", () => {
 
     expect(text).toContain("未登録 **1件**");
     expect(text).toContain(USER);
+    ctx.db.close();
+  });
+});
+
+describe("表示した価格で払う", () => {
+  function approved(ctx: Ctx) {
+    const row = ctx.originalRoles.apply({ userId: USER, name: "冥き翼", color: null, actor: "t" });
+    ctx.originalRoles.approve(row.id, "staff");
+    return row;
+  }
+
+  it("**表示後に値上げされても、古いボタンでは1 Ldも動かない。再確認すれば新価格で1回だけ**", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const { payRequote } = await import("../src/commands/original-role.js");
+    const ctx = setup();
+    const row = approved(ctx);
+    const w = world();
+    const before = balance(ctx);
+
+    // 750,000 と表示されたボタンを持ったまま、運営が 800,000 へ変更
+    const stale = press(ctx, `shop:orole-pay:${ctx.item.id}:${row.id}:${PRICE}:a1`, w) as unknown as {
+      update: ReturnType<typeof vi.fn>;
+    };
+    ctx.shop.updateItem(ctx.item.id, { price_land: 800_000 }, "staff");
+
+    await handleShopButton(stale as never, ctx.services);
+
+    expect(balance(ctx)).toBe(before); // **無課金**
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    expect(w.guild.roles.create).not.toHaveBeenCalled();
+    expect(contentOf(stale.update)).toContain("まだ引き落としていません");
+
+    // 再確認の画面には新しい額と新しい鍵が載っている
+    const requote = payRequote(ctx.shop.getItem(ctx.item.id)!, row.id, "冥き翼");
+    const nextId = String(requote.components[0]!.toJSON().components[0]!.custom_id);
+    expect(nextId).toContain(`:${row.id}:800000:`);
+    expect(nextId).not.toBe(`shop:orole-pay:${ctx.item.id}:${row.id}:${PRICE}:a1`);
+
+    await handleShopButton(press(ctx, nextId, w), ctx.services);
+    await handleShopButton(press(ctx, nextId, w), ctx.services); // 二度押しても1回
+
+    expect(balance(ctx)).toBe(before - 800_000);
+    expect(ctx.shop.listUserPurchases(USER).filter((p) => p.status === "active")).toHaveLength(1);
+    expect(ctx.originalRoles.get(row.id)!.status).toBe("active");
+    ctx.db.close();
+  });
+
+  it("値下げされていても、表示した額と違えば引かずに確かめ直す", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const row = approved(ctx);
+    const w = world();
+    const before = balance(ctx);
+    ctx.shop.updateItem(ctx.item.id, { price_land: 500_000 }, "staff");
+
+    await handleShopButton(press(ctx, `shop:orole-pay:${ctx.item.id}:${row.id}:${PRICE}:a1`, w), ctx.services);
+
+    expect(balance(ctx)).toBe(before);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    ctx.db.close();
+  });
+});
+
+describe("Discordの反映をエラーだけで決めない", () => {
+  const fakeClient = () => ({ channels: { fetch: async () => null }, users: { fetch: async () => null } }) as never;
+
+  function paidButUnfinished(ctx: Ctx) {
+    const row = ctx.originalRoles.apply({ userId: USER, name: "冥き翼", color: null, actor: "t" });
+    ctx.originalRoles.approve(row.id, "staff");
+    const { purchase } = ctx.shop.purchase({
+      userId: USER,
+      itemId: ctx.item.id,
+      actor: "t",
+      memberRoleIds: [],
+      request: { applicationId: row.id },
+    });
+    return { row, purchase };
+  }
+
+  const settle = async (ctx: Ctx, w: ReturnType<typeof world>, purchaseId: number) => {
+    const { deliverOrRefund } = await import("../src/shop-refund.js");
+    return deliverOrRefund(fakeClient(), ctx.services, w.guild as never, ctx.shop.getPurchase(purchaseId)! as never, "system:test");
+  };
+
+  it("**付与がエラーでも、実際に付いていれば契約を始める**（返金しない）", async () => {
+    const ctx = setup();
+    // エラーを返しつつ、Discord側では付与が通っていた状況
+    const w = world({ addFails: "Service Unavailable", addActuallyApplies: true });
+    const { row, purchase } = paidButUnfinished(ctx);
+    const before = balance(ctx);
+
+    const { outcome, refund } = await settle(ctx, w, purchase.id);
+
+    expect(outcome.state).toBe("delivered");
+    expect(refund).toBeUndefined();
+    expect(balance(ctx)).toBe(before);
+    expect(ctx.originalRoles.get(row.id)!.status).toBe("active");
+    ctx.db.close();
+  });
+
+  it("付与がエラーで、実際にも付いていなければ失敗して返金する", async () => {
+    const ctx = setup();
+    const w = world({ addFails: "Missing Permissions" });
+    const { purchase } = paidButUnfinished(ctx);
+    const before = balance(ctx);
+
+    const { outcome, refund } = await settle(ctx, w, purchase.id);
+
+    expect(outcome.state).toBe("failed");
+    expect(refund).toBe("refunded");
+    expect(balance(ctx)).toBe(before + PRICE);
+    ctx.db.close();
+  });
+
+  it("**契約に失敗し、ロールも外せず残っているなら自動返金しない**（人へ渡す）", async () => {
+    const ctx = setup();
+    const w = world({ removeFails: true });
+    const { row, purchase } = paidButUnfinished(ctx);
+    const recovered = w.makeRole("冥き翼");
+    ctx.originalRoles.markRoleCreationStarted(row.id);
+    ctx.originalRoles.attachRole(row.id, recovered.id, "system:test");
+    const realActivate = ctx.originalRoles.activate.bind(ctx.originalRoles);
+    vi.spyOn(ctx.originalRoles, "activate").mockImplementationOnce(() => {
+      ctx.db.prepare("UPDATE original_roles SET status='cancelled' WHERE id=?").run(row.id);
+      return realActivate({ id: row.id, roleId: recovered.id, purchaseId: purchase.id, actor: "t" });
+    });
+    const before = balance(ctx);
+
+    const { outcome, refund } = await settle(ctx, w, purchase.id);
+
+    expect(outcome.state).toBe("failed");
+    expect(outcome.refundable).toBe(false);
+    expect(refund).toBe("escalated"); // 運営対応へ
+    expect(balance(ctx)).toBe(before); // **返金していない**
+    expect(w.memberRoles).toContain(recovered.id); // ロールは本人に残ったまま
+    expect(ctx.shop.getPurchase(purchase.id)!.status).toBe("active");
+    vi.restoreAllMocks();
+    ctx.db.close();
+  });
+
+  it("剥奪がエラーでも、実際に外れていれば返金して収束する", async () => {
+    const ctx = setup();
+    const w = world({ removeFails: true, removeActuallyApplies: true });
+    const { row, purchase } = paidButUnfinished(ctx);
+    const recovered = w.makeRole("冥き翼");
+    ctx.originalRoles.markRoleCreationStarted(row.id);
+    ctx.originalRoles.attachRole(row.id, recovered.id, "system:test");
+    const realActivate = ctx.originalRoles.activate.bind(ctx.originalRoles);
+    vi.spyOn(ctx.originalRoles, "activate").mockImplementationOnce(() => {
+      ctx.db.prepare("UPDATE original_roles SET status='cancelled' WHERE id=?").run(row.id);
+      return realActivate({ id: row.id, roleId: recovered.id, purchaseId: purchase.id, actor: "t" });
+    });
+    const before = balance(ctx);
+
+    const { refund } = await settle(ctx, w, purchase.id);
+
+    expect(refund).toBe("refunded");
+    expect(balance(ctx)).toBe(before + PRICE);
+    expect(w.memberRoles).not.toContain(recovered.id);
+    vi.restoreAllMocks();
     ctx.db.close();
   });
 });
