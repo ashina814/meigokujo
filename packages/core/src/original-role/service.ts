@@ -46,6 +46,7 @@ export interface OriginalRoleRow {
   purchase_id: number | null;
   notified_expiry_at: number | null;
   role_removed_at: number | null;
+  role_creation_started_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -65,7 +66,8 @@ export type OriginalRoleErrorCode =
   | "ERR_NOT_OWNER"
   | "ERR_BAD_STATUS"
   | "ERR_NAME_TAKEN"
-  | "ERR_ROLE_TAKEN";
+  | "ERR_ROLE_TAKEN"
+  | "ERR_EXPIRED";
 
 export class OriginalRoleError extends Error {
   constructor(readonly code: OriginalRoleErrorCode, readonly details: Record<string, unknown> = {}) {
@@ -206,15 +208,36 @@ export class OriginalRoles {
    * 新規作成は Discord へロールを作る工程があるので購入行と配送状態で追うが、
    * 更新は DB の中で閉じる。途中で落ちて「払ったのに伸びていない」が起きない。
    */
-  renew(input: { id: number; userId: string; price: number; actor: string }): OriginalRoleRow {
+  renew(input: {
+    id: number;
+    userId: string;
+    price: number;
+    actor: string;
+    /** 確認画面ごとの鍵。**永続的に消費する**ので、同じ画面を何度押しても1回しか動かない */
+    operationId: string;
+  }): OriginalRoleRow {
     const run = this.db.transaction(() => {
+      // 既に消費済みの確認なら、何もせず今の状態を返す（二重課金・二重延長を止める）
+      const consumed = this.db
+        .prepare("SELECT original_role_id FROM original_role_renewals WHERE operation_id = ?")
+        .get(input.operationId) as { original_role_id: number } | undefined;
+      if (consumed) return this.get(consumed.original_role_id)!;
+
       const row = this.get(input.id);
       if (!row) throw new OriginalRoleError("ERR_NOT_FOUND", { id: input.id });
       if (row.user_id !== input.userId) throw new OriginalRoleError("ERR_NOT_OWNER", { id: input.id });
-      // 期限切れからの復活も認める（ロールの再付与は呼び出し側が行う）
-      if (row.status !== "active" && row.status !== "expired") {
-        throw new OriginalRoleError("ERR_BAD_STATUS", { id: input.id, status: row.status });
+      if (row.status !== "active") throw new OriginalRoleError("ERR_BAD_STATUS", { id: input.id, status: row.status });
+      // **期限を過ぎたものは更新で戻せない。** ロールは既に外れている（か、これから外れる）ので、
+      // 期限だけ伸ばすと「ロールが無いのに契約中」になる。作り直しからやってもらう
+      if (row.expires_at !== null && row.expires_at <= now()) {
+        throw new OriginalRoleError("ERR_EXPIRED", { id: input.id, expiresAt: row.expires_at });
       }
+      const ts = now();
+      this.db
+        .prepare(
+          "INSERT INTO original_role_renewals (operation_id, original_role_id, user_id, price, created_at) VALUES (?,?,?,?,?)",
+        )
+        .run(input.operationId, row.id, input.userId, input.price, ts);
       const account = `user:${input.userId}`;
       this.ledger.transfer({
         from: account,
@@ -225,9 +248,8 @@ export class OriginalRoles {
         reason: `オリジナルロール更新: ${row.name}`,
         refType: "original_role",
         refId: String(row.id),
-        idempotencyKey: `original_role:renew:${row.id}:${now()}`,
+        idempotencyKey: `original_role:renew:${input.operationId}`,
       });
-      const ts = now();
       this.db
         .prepare(
           "UPDATE original_roles SET status = 'active', expires_at = ?, notified_expiry_at = NULL, role_removed_at = NULL, updated_at = ? WHERE id = ?",
@@ -236,11 +258,39 @@ export class OriginalRoles {
       this.events.log("original_role_renewed", {
         actor: input.actor,
         target: input.userId,
-        payload: { id: row.id, price: input.price, expiresAt: this.get(row.id)!.expires_at },
+        payload: { id: row.id, price: input.price, operationId: input.operationId, expiresAt: this.get(row.id)!.expires_at },
       });
       return this.get(row.id)!;
     });
     return run.immediate();
+  }
+
+  // ---- 作成中の取り違えを防ぐ ----
+
+  /**
+   * Discord へロールを作りにいく直前に印を置く。
+   *
+   * 作成が返る前に落ちると「作ったかどうか」が分からなくなる。印があれば、
+   * 再試行は**まず既にあるロールを探す**（同じ名前のロールを2個作らないため）。
+   */
+  markRoleCreationStarted(id: number): void {
+    this.db
+      .prepare("UPDATE original_roles SET role_creation_started_at = ?, updated_at = ? WHERE id = ?")
+      .run(now(), now(), id);
+  }
+
+  /** 作成したロールを**付与より先に**書き留める（窓を最小にする） */
+  attachRole(id: number, roleId: string, actor: string): void {
+    this.db.prepare("UPDATE original_roles SET role_id = ?, updated_at = ? WHERE id = ?").run(roleId, now(), id);
+    this.events.log("original_role_role_attached", { actor, payload: { id, roleId } });
+  }
+
+  /** そのロールが既に別の契約で使われているか */
+  roleTaken(roleId: string, exceptId?: number): boolean {
+    const row = this.db.prepare("SELECT id FROM original_roles WHERE role_id = ?").get(roleId) as
+      | { id: number }
+      | undefined;
+    return row !== undefined && row.id !== exceptId;
   }
 
   // ---- 期限まわり（巡回から呼ぶ）----

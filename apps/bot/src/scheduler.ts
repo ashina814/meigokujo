@@ -28,6 +28,7 @@ import {
 } from "./scheduler-utils.js";
 import {
   convergePendingNicknameChanges,
+  convergePendingOriginalRoles,
   expireOverduePurchases,
   processShopRoleRevocations,
   recoverAutoDropNoEvalGhosts,
@@ -412,6 +413,14 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       await convergePendingNicknameChanges(client, services);
     } catch (e) {
       console.error("[ショップ] 名前変更の収束失敗:", e);
+    }
+
+    // ── オリジナルロール作成の未完了を収束させる ──
+    // 同じ理由（課金とDiscord側の副作用の間にクラッシュ窓がある）。作りきるか、返金する
+    try {
+      await convergePendingOriginalRoles(client, services);
+    } catch (e) {
+      console.error("[ショップ] オリジナルロール作成の収束失敗:", e);
     }
 
     // 失効購入のロール剥奪は失効処理と分離し、購入ID単位で毎分自己修復する。

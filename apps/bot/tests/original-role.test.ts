@@ -83,18 +83,35 @@ function world(opts: { createFails?: string; addFails?: string } = {}) {
     },
   };
   let seq = 0;
+  // 作られたロールはギルドに残る。**クラッシュ後の再試行がこれを見つけられるか**が要点
+  const living = new Collection<string, { id: string; name: string; createdTimestamp: number; delete: () => Promise<void> }>();
+  const makeRole = (name: string, createdTimestamp = Date.now()) => {
+    const id = `role-${++seq}`;
+    const role = {
+      id,
+      name,
+      createdTimestamp,
+      delete: vi.fn(async () => {
+        roleDeleted.push(id);
+        living.delete(id);
+      }),
+    };
+    living.set(id, role);
+    return role;
+  };
   const guild = {
     id: "g1",
     roles: {
       create: vi.fn(async (o: { name: string }) => {
         if (opts.createFails) throw new Error(opts.createFails);
-        const id = `role-${++seq}`;
-        return { id, name: o.name, delete: vi.fn(async () => void roleDeleted.push(id)) };
+        return makeRole(o.name);
       }),
+      fetch: vi.fn(async (id?: string) => (id === undefined ? living : (living.get(id) ?? null))),
+      cache: living,
     },
     members: { fetch: vi.fn(async () => member) },
   };
-  return { guild, member, memberRoles, roleDeleted };
+  return { guild, member, memberRoles, roleDeleted, living, makeRole };
 }
 
 function press(ctx: Ctx, customId: string, w: ReturnType<typeof world>, extra: Record<string, unknown> = {}) {
@@ -403,6 +420,235 @@ describe("期限まわり", () => {
 
     expect(ctx.originalRoles.get(row.id)!.status).toBe("cancelled");
     expect(String((dm.mock.calls[0] as never[])[0])).toContain("取り消し");
+    ctx.db.close();
+  });
+});
+
+describe("作成途中で落ちたとき（Discord側とDBの間のクラッシュ窓）", () => {
+  const fakeClient = () =>
+    ({ channels: { fetch: async () => null }, users: { fetch: async () => null } }) as never;
+
+  function paidButUnfinished(ctx: Ctx) {
+    // 課金と購入行は済んでいるが、契約が始まっていない状態を作る
+    const row = ctx.originalRoles.apply({ userId: USER, name: "冥き翼", color: null, actor: "t" });
+    ctx.originalRoles.approve(row.id, "staff");
+    const { purchase } = ctx.shop.purchase({
+      userId: USER,
+      itemId: ctx.item.id,
+      actor: "t",
+      memberRoleIds: [],
+      request: { applicationId: row.id },
+    });
+    return { row, purchase };
+  }
+
+  it("**ロールを作った直後に落ちても、作り直さずそのロールを使う**", async () => {
+    const { deliverOrRefund } = await import("../src/shop-refund.js");
+    const ctx = setup();
+    const w = world();
+    const { row, purchase } = paidButUnfinished(ctx);
+    // 「作りにいった印」だけ残り、role_id を書く前に落ちた状況
+    ctx.originalRoles.markRoleCreationStarted(row.id);
+    const orphan = w.makeRole("冥き翼");
+
+    await deliverOrRefund(fakeClient(), ctx.services, w.guild as never, ctx.shop.getPurchase(purchase.id)! as never, "system:test");
+
+    expect(w.guild.roles.create).not.toHaveBeenCalled(); // 2個目を作らない
+    expect(ctx.originalRoles.get(row.id)!.role_id).toBe(orphan.id);
+    expect(ctx.originalRoles.get(row.id)!.status).toBe("active");
+    expect(w.memberRoles).toEqual([orphan.id]);
+    ctx.db.close();
+  });
+
+  it("同じ名前の候補が2つあれば**選ばずに運営へ回す**（別人のロールを掴まない）", async () => {
+    const { deliverOrRefund } = await import("../src/shop-refund.js");
+    const ctx = setup();
+    const w = world();
+    const { row, purchase } = paidButUnfinished(ctx);
+    ctx.originalRoles.markRoleCreationStarted(row.id);
+    w.makeRole("冥き翼");
+    w.makeRole("冥き翼");
+    const before = balance(ctx);
+
+    const settlement = await deliverOrRefund(
+      fakeClient(),
+      ctx.services,
+      w.guild as never,
+      ctx.shop.getPurchase(purchase.id)! as never,
+      "system:test",
+    );
+
+    expect(settlement.outcome.state).toBe("failed");
+    expect(settlement.refund).toBe("refunded"); // 作れないなら返す
+    expect(balance(ctx)).toBe(before + PRICE);
+    expect(ctx.originalRoles.get(row.id)!.status).toBe("approved");
+    ctx.db.close();
+  });
+
+  it("既に自分のロールが記録されていれば、それを使って付与だけやり直す", async () => {
+    const { deliverOrRefund } = await import("../src/shop-refund.js");
+    const ctx = setup();
+    const w = world();
+    const { row, purchase } = paidButUnfinished(ctx);
+    const known = w.makeRole("冥き翼");
+    ctx.originalRoles.markRoleCreationStarted(row.id);
+    ctx.originalRoles.attachRole(row.id, known.id, "system:test");
+
+    await deliverOrRefund(fakeClient(), ctx.services, w.guild as never, ctx.shop.getPurchase(purchase.id)! as never, "system:test");
+
+    expect(w.guild.roles.create).not.toHaveBeenCalled();
+    expect(w.memberRoles).toEqual([known.id]);
+    expect(ctx.originalRoles.get(row.id)!.status).toBe("active");
+    ctx.db.close();
+  });
+
+  it("記録したロールが消されていたら、作り直して契約を始める", async () => {
+    const { deliverOrRefund } = await import("../src/shop-refund.js");
+    const ctx = setup();
+    const w = world();
+    const { row, purchase } = paidButUnfinished(ctx);
+    ctx.originalRoles.attachRole(row.id, "role-deleted-by-human", "system:test");
+
+    await deliverOrRefund(fakeClient(), ctx.services, w.guild as never, ctx.shop.getPurchase(purchase.id)! as never, "system:test");
+
+    expect(w.guild.roles.create).toHaveBeenCalledTimes(1);
+    const after = ctx.originalRoles.get(row.id)!;
+    expect(after.status).toBe("active");
+    expect(after.role_id).not.toBe("role-deleted-by-human");
+    ctx.db.close();
+  });
+
+  it("**再起動後の巡回が、払ったまま止まっている購入を自動で収束させる**", async () => {
+    const { convergePendingOriginalRoles } = await import("../src/scheduler-recovery.js");
+    const ctx = setup();
+    const w = world();
+    const { row, purchase } = paidButUnfinished(ctx);
+    const client = {
+      guilds: { fetch: vi.fn(async () => w.guild) },
+      users: { fetch: vi.fn(async () => null) },
+      channels: { fetch: vi.fn(async () => null) },
+    };
+
+    await convergePendingOriginalRoles(client as never, ctx.services);
+
+    expect(ctx.originalRoles.get(row.id)!.status).toBe("active");
+    expect(ctx.shop.getPurchase(purchase.id)!.delivery_state).toBe("delivered");
+    expect(w.memberRoles).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("作れないまま巡回に拾われたら返金する（返金できたら人を呼ばない）", async () => {
+    const { convergePendingOriginalRoles } = await import("../src/scheduler-recovery.js");
+    const ctx = setup();
+    const w = world({ createFails: "Missing Permissions" });
+    const { purchase } = paidButUnfinished(ctx);
+    const before = balance(ctx);
+    const client = {
+      guilds: { fetch: vi.fn(async () => w.guild) },
+      users: { fetch: vi.fn(async () => null) },
+      channels: { fetch: vi.fn(async () => null) },
+    };
+
+    await convergePendingOriginalRoles(client as never, ctx.services);
+
+    expect(balance(ctx)).toBe(before + PRICE);
+    expect(ctx.shop.getPurchase(purchase.id)!.status).toBe("refunded");
+    ctx.db.close();
+  });
+});
+
+describe("旧契約の引き継ぎ（運営導線）", () => {
+  const importUi = () => import("../src/commands/original-role-import.js");
+
+  it("**購入履歴からロールを推測しない**（人が選んだロールだけを登録する）", async () => {
+    const { importConfirm, handleImportRun } = await importUi();
+    const ctx = setup();
+    const w = world();
+    const role = w.makeRole("旧オリジナル");
+    const view = importConfirm(ctx.services, USER, role.id, role.name);
+
+    // 確認画面に buyer / role / 期限 が全部出ている
+    const fields = (view.embeds[0]!.toJSON().fields ?? []).map((f) => `${f.name}:${f.value}`).join("|");
+    expect(fields).toContain(USER);
+    expect(fields).toContain(role.id);
+    expect(fields).toContain("期限");
+
+    const expires = Math.floor(Date.now() / 1000) + 10 * DAY;
+    await handleImportRun(
+      press(ctx, `mgmt:recover:orole-import-run:${USER}:${role.id}:${expires}`, w) as never,
+      ctx.services,
+    );
+
+    const rows = ctx.originalRoles.listByUser(USER);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.role_id).toBe(role.id);
+    expect(rows[0]!.status).toBe("active");
+    expect(rows[0]!.expires_at).toBe(expires);
+    ctx.db.close();
+  });
+
+  it("同じロールは二重に登録できない（2件目は何も書かない）", async () => {
+    const { handleImportRun, importConfirm } = await importUi();
+    const ctx = setup();
+    const w = world();
+    const role = w.makeRole("旧オリジナル");
+    const expires = Math.floor(Date.now() / 1000) + 10 * DAY;
+    await handleImportRun(
+      press(ctx, `mgmt:recover:orole-import-run:${USER}:${role.id}:${expires}`, w) as never,
+      ctx.services,
+    );
+
+    const other = press(ctx, `mgmt:recover:orole-import-run:999:${role.id}:${expires}`, w) as unknown as {
+      update: ReturnType<typeof vi.fn>;
+    };
+    await handleImportRun(other as never, ctx.services);
+
+    expect(ctx.originalRoles.listByUser("999")).toHaveLength(0);
+    expect(contentOf(other.update)).toContain("何も登録していません");
+    // 確認画面の段階でも押せないようにしてある
+    const button = importConfirm(ctx.services, "999", role.id, role.name).components[0]!.toJSON().components[0]!;
+    expect(button.disabled).toBe(true);
+    ctx.db.close();
+  });
+
+  it("引き継いだ契約は、本人が更新できる", async () => {
+    const { handleImportRun } = await importUi();
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world();
+    const role = w.makeRole("旧オリジナル");
+    const expires = Math.floor(Date.now() / 1000) + 10 * DAY;
+    await handleImportRun(
+      press(ctx, `mgmt:recover:orole-import-run:${USER}:${role.id}:${expires}`, w) as never,
+      ctx.services,
+    );
+    const contract = ctx.originalRoles.listByUser(USER)[0]!;
+    const before = balance(ctx);
+
+    await handleShopButton(
+      press(ctx, `shop:orole-renew-do:${ctx.item.id}:${contract.id}:${RENEW}:op-import`, w),
+      ctx.services,
+    );
+
+    expect(balance(ctx)).toBe(before - RENEW);
+    expect(ctx.originalRoles.get(contract.id)!.expires_at).toBe(expires + 30 * DAY);
+    ctx.db.close();
+  });
+
+  it("旧商品の残件を一覧に出す（誰がまだ未登録か分かる）", async () => {
+    const { importHome } = await importUi();
+    const ctx = setup();
+    const legacy = ctx.shop.createItem(
+      { name: "オリジナルロール継続or付与 月額", price_land: RENEW, kind: "monthly", delivery: "manual" },
+      "staff",
+    );
+    ctx.settings.set("shop:original_role_legacy_item_id", String(legacy.id), "staff");
+    ctx.shop.purchase({ userId: USER, itemId: legacy.id, actor: "t", memberRoleIds: [] });
+
+    const text = String(importHome(ctx.services).embeds[0]!.toJSON().description);
+
+    expect(text).toContain("未登録 **1件**");
+    expect(text).toContain(USER);
     ctx.db.close();
   });
 });

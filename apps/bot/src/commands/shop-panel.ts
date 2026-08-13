@@ -658,7 +658,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
   }
 
   if (action === "orole-renew-do") {
-    await handleRenewConfirm(interaction, services, Number(parts[3]), Number(parts[4]));
+    await handleRenewConfirm(interaction, services, Number(parts[3]), Number(parts[4]), parts[5] ?? "");
     return;
   }
 
@@ -985,7 +985,8 @@ export async function handleShopSelect(
       await interaction.update({ content: "その契約が見つかりません。", embeds: [], components: [] });
       return;
     }
-    await interaction.update(renewConfirm(services, Number(interaction.customId.split(":")[2]), row));
+    // 確認画面ごとに1つの鍵を配る（この操作IDを core が消費して二重課金を止める）
+    await interaction.update(renewConfirm(services, Number(interaction.customId.split(":")[2]), row, interaction.id));
     return;
   }
   if (action === "pick") {

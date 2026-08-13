@@ -160,7 +160,7 @@ describe("更新", () => {
     const row = activated(ctx);
     const before = balance(ctx);
 
-    const renewed = ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t" });
+    const renewed = ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t", operationId: "op-1" });
 
     expect(balance(ctx)).toBe(before - 250_000);
     expect(renewed.expires_at! - row.expires_at!).toBe(ORIGINAL_ROLE_TERM_DAYS * DAY);
@@ -171,8 +171,8 @@ describe("更新", () => {
     const ctx = setup();
     const row = activated(ctx);
 
-    ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t" });
-    const twice = ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t" });
+    ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t", operationId: "op-2" });
+    const twice = ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t", operationId: "op-3" });
 
     expect(twice.expires_at! - row.expires_at!).toBe(2 * ORIGINAL_ROLE_TERM_DAYS * DAY);
     ctx.db.close();
@@ -183,7 +183,7 @@ describe("更新", () => {
     const row = activated(ctx);
     const before = balance(ctx);
 
-    expect(() => ctx.roles.renew({ id: row.id, userId: OTHER, price: 250_000, actor: "t" })).toThrow(OriginalRoleError);
+    expect(() => ctx.roles.renew({ id: row.id, userId: OTHER, price: 250_000, actor: "t", operationId: "op-4" })).toThrow(OriginalRoleError);
     expect(balance(ctx)).toBe(before);
     ctx.db.close();
   });
@@ -193,24 +193,70 @@ describe("更新", () => {
     const row = activated(ctx);
     const before = ctx.roles.get(row.id)!.expires_at;
 
-    expect(() => ctx.roles.renew({ id: row.id, userId: USER, price: 99_000_000, actor: "t" })).toThrow();
+    expect(() => ctx.roles.renew({ id: row.id, userId: USER, price: 99_000_000, actor: "t", operationId: "op-5" })).toThrow();
 
     expect(ctx.roles.get(row.id)!.expires_at).toBe(before);
     ctx.db.close();
   });
 
-  it("期限切れからでも更新して戻せる", () => {
+  it("**期限切れは更新できない**（ロールが無いのに契約中、を作らない）", () => {
     const ctx = setup();
     const row = activated(ctx);
+    const before = balance(ctx);
     ctx.db.prepare("UPDATE original_roles SET status='expired', expires_at=? WHERE id=?").run(
       Math.floor(Date.now() / 1000) - DAY,
       row.id,
     );
 
-    const renewed = ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t" });
+    expect(() => ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t", operationId: "x" })).toThrow(
+      OriginalRoleError,
+    );
+    expect(balance(ctx)).toBe(before);
+    ctx.db.close();
+  });
 
-    expect(renewed.status).toBe("active");
-    expect(renewed.expires_at!).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  it("**active のまま期限だけ過ぎたものも更新できない**（確認画面を開いたあとに切れた場合）", () => {
+    const ctx = setup();
+    const row = activated(ctx);
+    const before = balance(ctx);
+    // 巡回が expired にする前の一瞬。ここを通すと Land だけ引かれてロールは戻らない
+    ctx.db.prepare("UPDATE original_roles SET expires_at=? WHERE id=?").run(Math.floor(Date.now() / 1000) - 1, row.id);
+
+    let code = "";
+    try {
+      ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t", operationId: "late" });
+    } catch (e) {
+      code = (e as OriginalRoleError).code;
+    }
+
+    expect(code).toBe("ERR_EXPIRED");
+    expect(balance(ctx)).toBe(before); // **Land を引かない**
+    ctx.db.close();
+  });
+
+  it("**同じ確認画面を何度押しても課金は1回**（操作IDを消費する）", () => {
+    const ctx = setup();
+    const row = activated(ctx);
+    const before = balance(ctx);
+
+    const first = ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t", operationId: "same" });
+    const second = ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t", operationId: "same" });
+
+    expect(balance(ctx)).toBe(before - 250_000);
+    expect(second.expires_at).toBe(first.expires_at); // 期限も1回ぶんしか伸びない
+    ctx.db.close();
+  });
+
+  it("別の確認画面なら別々に効く（連続更新は止めない）", () => {
+    const ctx = setup();
+    const row = activated(ctx);
+    const before = balance(ctx);
+
+    ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t", operationId: "a" });
+    const twice = ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t", operationId: "b" });
+
+    expect(balance(ctx)).toBe(before - 500_000);
+    expect(twice.expires_at! - row.expires_at!).toBe(2 * ORIGINAL_ROLE_TERM_DAYS * DAY);
     ctx.db.close();
   });
 });
@@ -259,7 +305,7 @@ describe("期限まわり", () => {
     const id = activeWithExpiry(ctx, Math.floor(Date.now() / 1000) + DAY);
     ctx.roles.markExpiryNotified(id);
 
-    ctx.roles.renew({ id, userId: USER, price: 250_000, actor: "t" });
+    ctx.roles.renew({ id, userId: USER, price: 250_000, actor: "t", operationId: "op-7" });
 
     expect(ctx.roles.get(id)!.notified_expiry_at).toBeNull();
     ctx.db.close();
@@ -293,7 +339,7 @@ describe("旧契約の引き継ぎ", () => {
 
     expect(row.status).toBe("active");
     expect(row.expires_at).toBe(expiresAt);
-    expect(ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t" }).expires_at).toBe(
+    expect(ctx.roles.renew({ id: row.id, userId: USER, price: 250_000, actor: "t", operationId: "op-8" }).expires_at).toBe(
       expiresAt + ORIGINAL_ROLE_TERM_DAYS * DAY,
     );
     ctx.db.close();

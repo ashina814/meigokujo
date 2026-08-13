@@ -218,8 +218,14 @@ export function renewPicker(services: Services, itemId: number, userId: string) 
   return { embeds: [embed], components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)] };
 }
 
-/** 更新の確認。**確認した料金を確定まで持たせる** */
-export function renewConfirm(services: Services, itemId: number, row: OriginalRoleRow) {
+/**
+ * 更新の確認。**確認した料金を確定まで持たせる。**
+ *
+ * `operationId` はこの確認画面ごとに1つ。core 側が**永続的に消費する**ので、
+ * 同じ画面のボタンを何度押しても課金も期限延長も1回で止まる。時刻を鍵にすると
+ * 秒をまたいだ連打が2回とおるので、画面と1対1の値を使う。
+ */
+export function renewConfirm(services: Services, itemId: number, row: OriginalRoleRow, operationId: string) {
   const price = renewPrice(services);
   return {
     content: [
@@ -230,7 +236,7 @@ export function renewConfirm(services: Services, itemId: number, row: OriginalRo
     components: [
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
-          .setCustomId(`shop:orole-renew-do:${itemId}:${row.id}:${price}`)
+          .setCustomId(`shop:orole-renew-do:${itemId}:${row.id}:${price}:${operationId}`)
           .setLabel("更新する")
           .setStyle(ButtonStyle.Success),
       ),
@@ -248,7 +254,9 @@ export async function handleRenewConfirm(
   services: Services,
   roleRowId: number,
   quotedPrice: number,
+  operationId: string,
 ): Promise<void> {
+  const itemId = Number(interaction.customId.split(":")[2]);
   const price = renewPrice(services);
   if (quotedPrice !== price) {
     const row = services.originalRoles.get(roleRowId);
@@ -256,10 +264,11 @@ export async function handleRenewConfirm(
       await interaction.update({ content: "その契約が見つかりません。", embeds: [], components: [] });
       return;
     }
-    // 確認した額でしか引き落とさない
+    // 確認した額でしか引き落とさない。**新しい確認画面には新しい鍵を配る**
+    const next = renewConfirm(services, itemId, row, interaction.id);
     await interaction.update({
-      ...renewConfirm(services, Number(interaction.customId.split(":")[2]), row),
-      content: `⚠️ 確認したあとに料金が変わりました。**まだ引き落としていません。**\n${renewConfirm(services, 0, row).content}`,
+      ...next,
+      content: `⚠️ 確認したあとに料金が変わりました。**まだ引き落としていません。**\n${next.content}`,
     });
     return;
   }
@@ -269,6 +278,7 @@ export async function handleRenewConfirm(
       userId: interaction.user.id,
       price,
       actor: `user:${interaction.user.id}`,
+      operationId,
     });
     await interaction.update({
       content: `✅ **${renewed.name}** を更新しました。期限は <t:${renewed.expires_at ?? 0}:D> までです。`,
@@ -278,7 +288,9 @@ export async function handleRenewConfirm(
   } catch (error) {
     const message =
       error instanceof OriginalRoleError
-        ? "この契約は更新できません（他の方のもの、または状態が変わっています）。"
+        ? error.code === "ERR_EXPIRED"
+          ? "この契約は期限切れです。**引き落としていません。** 更新では戻せないので、新規作成から申請してください。"
+          : "この契約は更新できません（他の方のもの、または状態が変わっています）。"
         : "残高が足りないか、更新に失敗しました。";
     await interaction.update({ content: `❌ ${message}`, embeds: [], components: [] });
   }

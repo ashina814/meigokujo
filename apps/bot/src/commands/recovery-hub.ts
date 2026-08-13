@@ -64,6 +64,7 @@ export function recoveryHome() {
         "**履歴追認** … 監査で特定した4名限定の waiting→魔人 追認です。",
         "**旧自動解除の巻き戻し** … 撤回した自動配送で迷霊が外れた2名を、面談を受けられる状態へ戻します。",
         "**既存の名前の取り込み** … いま設定されているニックネームを名前の正本へ記録します（誰も改名しません）。",
+        "**オリジナルロールの引き継ぎ** … 旧商品で契約中の方を、本人とロールを人が突き合わせて新制度へ移します。",
         "",
         "-# どれも実行前に条件を再確認し、条件を満たさなければ何もせず理由を出します。",
       ].join("\n"),
@@ -78,6 +79,7 @@ export function recoveryHome() {
   // 1行は5個まで。行を足す（超えると描画そのものが落ちる）
   const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:recover:names").setLabel("既存の名前の取り込み").setEmoji("✒️").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mgmt:recover:orole-import").setLabel("オリジナルロールの引き継ぎ").setEmoji("🎨").setStyle(ButtonStyle.Secondary),
   );
   const back = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("mgmt:hub").setLabel("← ハブへ").setStyle(ButtonStyle.Secondary),

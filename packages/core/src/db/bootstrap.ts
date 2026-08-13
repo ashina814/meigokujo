@@ -803,8 +803,20 @@ CREATE TABLE IF NOT EXISTS original_roles (
   notified_expiry_at INTEGER,
   -- ロールを剥奪できた時刻。剥奪に失敗しても巡回で拾い直す
   role_removed_at    INTEGER,
+  -- Discord へロールを作りにいった時刻。**作成と記録の間にクラッシュ窓がある**ので、
+  -- 「作りかけた」ことだけ先に残す。再試行はこれを見て、同じロールを2個作らずに拾い直す
+  role_creation_started_at INTEGER,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
+);
+-- 更新の確認画面ごとに1回だけ課金する。**確認IDを永続的に消費する**ので、
+-- 同じ確認画面を何度押しても2回目以降は何も動かない
+CREATE TABLE IF NOT EXISTS original_role_renewals (
+  operation_id     TEXT PRIMARY KEY,
+  original_role_id INTEGER NOT NULL,
+  user_id          TEXT NOT NULL,
+  price            INTEGER NOT NULL,
+  created_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_original_roles_user ON original_roles(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_original_roles_status ON original_roles(status, expires_at);
@@ -848,6 +860,8 @@ export function openDb(path: string): Database.Database {
   );
   ensureColumn(db, "shop_purchases", "request_json", "TEXT");
   applyNicknameItemSetting(db);
+  // 既に original_roles がある本番へ後から足す
+  ensureColumn(db, "original_roles", "role_creation_started_at", "INTEGER");
   applyOriginalRoleItemSetting(db);
   ensureColumn(db, "casino_tx", "op_key", "TEXT");
   ensureColumn(db, "casino_tx", "op_actor_id", "TEXT");
