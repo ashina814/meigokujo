@@ -55,6 +55,12 @@ import {
   handleImportUser,
   importHome,
 } from "./original-role-import.js";
+import {
+  handleImportAlt as handleSubImportAlt,
+  handleImportMain as handleSubImportMain,
+  handleImportRun as handleSubImportRun,
+  importHome as subImportHome,
+} from "./sub-account-import.js";
 import { isAdmin } from "../permissions.js";
 import { registerTrustedRankedProfile } from "./casino-employee.js";
 import { ROLE_SLOT_META, ROLE_SLOT_ORDER, getRoleIds, setRoleIds, type RoleSlot } from "../church-roles.js";
@@ -193,6 +199,8 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   // 旧オリジナルロールの引き継ぎ。**購入履歴からロールを推測しない**ので、人が3段で確定させる
   if (section === "recover" && action === "orole-import") return void (await interaction.update(importHome(services)));
   if (section === "recover" && action === "orole-import-run") return void (await handleImportRun(interaction, services));
+  if (section === "recover" && action === "sub-import") return void (await interaction.update(subImportHome(services)));
+  if (section === "recover" && action === "sub-import-run") return void (await handleSubImportRun(interaction, services));
   if (section === "setting" && action === "role-select") return void (await openRoleSetup(interaction, services));
   if (section === "setting" && action === "number-select") return void (await openNumberSetup(interaction, services));
   if (section === "setting" && action === "eval-cap") return void (await interaction.update(evaluationCapHome(services)));
@@ -510,6 +518,12 @@ export async function handleAdminSelect(
   // ── 特別プロフィール ──
   if (section === "recover" && action === "redeliver" && interaction.isStringSelectMenu()) {
     return void (await handleRedeliver(interaction, services));
+  }
+  if (section === "recover" && action === "sub-import-main" && interaction.isUserSelectMenu()) {
+    return void (await handleSubImportMain(interaction, services));
+  }
+  if (section === "recover" && action === "sub-import-alt" && interaction.isUserSelectMenu()) {
+    return void (await handleSubImportAlt(interaction, services));
   }
   if (section === "recover" && action === "orole-import-user" && interaction.isUserSelectMenu()) {
     return void (await handleImportUser(interaction, services));

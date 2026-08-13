@@ -818,6 +818,37 @@ CREATE TABLE IF NOT EXISTS original_role_renewals (
   price            INTEGER NOT NULL,
   created_at       INTEGER NOT NULL
 );
+-- サブ垢。**main ↔ alt の対応はここが正本。**
+-- 旧商品の購入履歴には「買った」しか残っておらず、どのアカウントがサブ垢かの記録が無い。
+-- 推測すると他人のアカウントを本体に紐付ける事故になるので、必ず人が突き合わせる
+CREATE TABLE IF NOT EXISTS sub_accounts (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  main_user_id   TEXT NOT NULL,
+  alt_user_id    TEXT NOT NULL,
+  status         TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending','approved','active','returned','rejected','cancelled')),
+  purchase_id    INTEGER,
+  approved_by    TEXT,
+  approved_at    INTEGER,
+  decided_by     TEXT,
+  decided_at     INTEGER,
+  decide_reason  TEXT,
+  activated_at   INTEGER,
+  -- 有効化を始める前の階級ロール集合（JSON配列）。**Discordを変更する前に書く。**
+  -- 途中で落ちても、再起動後の再試行がここを基準に巻き戻せる
+  activation_rank_baseline TEXT,
+  activation_rank_settled_at INTEGER,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  -- 自分自身をサブ垢にはできない
+  CHECK (main_user_id <> alt_user_id)
+);
+-- 1つのサブ垢が2人の本体にぶら下がらない。**進行中のものだけを見る**ので、
+-- 却下・解除された古い組み合わせは同じ相手の再登録を邪魔しない
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_accounts_alt_open
+  ON sub_accounts(alt_user_id) WHERE status IN ('pending','approved','active');
+CREATE INDEX IF NOT EXISTS idx_sub_accounts_main ON sub_accounts(main_user_id, status);
+CREATE INDEX IF NOT EXISTS idx_sub_accounts_status ON sub_accounts(status);
 CREATE INDEX IF NOT EXISTS idx_original_roles_user ON original_roles(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_original_roles_status ON original_roles(status, expires_at);
 -- 同じロールを2つの契約に結び付けない（引き継ぎ登録の二重実行を止める）
@@ -863,6 +894,10 @@ export function openDb(path: string): Database.Database {
   // 既に original_roles がある本番へ後から足す
   ensureColumn(db, "original_roles", "role_creation_started_at", "INTEGER");
   applyOriginalRoleItemSetting(db);
+  // 既に sub_accounts がある本番へ後から足す
+  ensureColumn(db, "sub_accounts", "activation_rank_baseline", "TEXT");
+  ensureColumn(db, "sub_accounts", "activation_rank_settled_at", "INTEGER");
+  applySubAccountItemSetting(db);
   ensureColumn(db, "casino_tx", "op_key", "TEXT");
   ensureColumn(db, "casino_tx", "op_actor_id", "TEXT");
   backfillChipTxOperationKey(db);
@@ -1297,6 +1332,39 @@ export function applyOriginalRoleItemSetting(db: Database.Database): void {
         SET delivery = 'auto', delivery_kind = 'create_original_role', updated_at = ?
       WHERE id = ? AND (delivery <> 'auto' OR delivery_kind IS NOT 'create_original_role')`,
   ).run(Math.floor(Date.now() / 1000), itemId);
+}
+
+/**
+ * `shop:sub_account_item_id` が指す商品を「Botが自分で処理する商品」にする。
+ *
+ * **同時に魔人以上の要件を必ず固定する。** 旧商品#4は `require_role_id` が
+ * 作成時から未設定のまま売られ、迷霊のまま購入が成立した。運用ルールを人の記憶に
+ * 置いた結果なので、開業の手続きそのものに要件の設定を組み込む。
+ *
+ * `role:majin` が未設定なら**何もしない**（fail-closed）。要件を付けられないまま
+ * 自動化だけ進むと、同じ事故をもう一度起こす。
+ *
+ * なお資格判定の正本は `souls.status` の3段階判定（申請・承認・支払い直前）で、
+ * ここで入れる Discord ロール要件は**二重防御**。
+ */
+export function applySubAccountItemSetting(db: Database.Database): void {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'shop:sub_account_item_id'").get() as
+    | { value: string }
+    | undefined;
+  const itemId = Number(row?.value);
+  if (!Number.isInteger(itemId) || itemId <= 0) return;
+  const majin = db.prepare("SELECT value FROM settings WHERE key = 'role:majin'").get() as
+    | { value: string }
+    | undefined;
+  const majinRoleId = majin?.value?.trim();
+  // **要件を付けられないなら自動化もしない**
+  if (!majinRoleId) return;
+  db.prepare(
+    `UPDATE shop_items
+        SET delivery = 'auto', delivery_kind = 'activate_sub_account', require_role_id = ?, updated_at = ?
+      WHERE id = ?
+        AND (delivery <> 'auto' OR delivery_kind IS NOT 'activate_sub_account' OR require_role_id IS NOT ?)`,
+  ).run(majinRoleId, Math.floor(Date.now() / 1000), itemId, majinRoleId);
 }
 
 export function applyNicknameItemSetting(db: Database.Database): void {

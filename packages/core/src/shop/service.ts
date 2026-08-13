@@ -10,7 +10,14 @@ import { EventLog } from "../events/service.js";
 
 export type ItemKind = "one_shot" | "monthly";
 export type DeliveryMode = "auto" | "manual";
-export type DeliveryKind = "add_role" | "extend_deadline" | "set_nickname" | "create_original_role" | "revoke_meirei" | null;
+export type DeliveryKind =
+  | "add_role"
+  | "extend_deadline"
+  | "set_nickname"
+  | "create_original_role"
+  | "activate_sub_account"
+  | "revoke_meirei"
+  | null;
 export type PurchaseStatus = "active" | "expired" | "refunded" | "cancelled";
 
 export interface ShopItemInput {
@@ -98,6 +105,7 @@ export const AUTO_DELIVERABLE_KINDS: ReadonlySet<string> = new Set([
   "extend_deadline",
   "set_nickname",
   "create_original_role",
+  "activate_sub_account",
 ]);
 /** 過去に自動配送として売られたが、いまは自動実行しない種別 */
 export const WITHDRAWN_DELIVERY_KINDS: ReadonlySet<string> = new Set(["revoke_meirei"]);

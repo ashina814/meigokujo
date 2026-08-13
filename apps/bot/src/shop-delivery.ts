@@ -1,6 +1,7 @@
 import type { Guild, GuildMember, Role } from "discord.js";
 import {
   AUTO_DELIVERABLE_KINDS,
+  roleToRestoreForStatus,
   describeRejection,
   parseDeliverySnapshot,
   type OriginalRoleRow,
@@ -8,6 +9,12 @@ import {
 } from "@meigokujo/core";
 import { refreshEvalStatsForUser } from "./eval-daily.js";
 import { withUserLock } from "./user-lock.js";
+import {
+  currentLadderRoles,
+  missingLadderRoleKeys,
+  reconcileAltRank,
+  restoreAltRank,
+} from "./sub-account-rank.js";
 import type { Services } from "./services.js";
 
 /**
@@ -369,6 +376,96 @@ export async function deliverPurchaseUnlocked(
       };
     }
 
+    if (kind === "activate_sub_account") {
+      const request = parseRequest(purchase.request_json);
+      const applicationId = typeof request?.applicationId === "number" ? request.applicationId : null;
+      if (!applicationId) return fail("application_missing", "申請の記録が無いため有効化できませんでした。");
+      if (!guild) return fail("guild_unavailable", "サーバー情報が取れず有効化できませんでした。");
+      const application = services.subAccounts.get(applicationId);
+      if (!application) return fail("application_not_found", "申請が見つかりません。運営にお問い合わせください。");
+      if (application.main_user_id !== userId) return fail("application_owner_mismatch", "申請の持ち主が違います。");
+      // 落ちて再実行された場合、ロールは付いているのに記録が終わっていないことがある
+      if (application.status === "active") {
+        services.shop.markDeliverySucceeded(purchase.id, actor);
+        return { state: "delivered", message: `サブ垢 <@${application.alt_user_id}> は有効化済みです。` };
+      }
+      if (application.status !== "approved") {
+        return fail(`application_bad_status:${application.status}`, "この申請は承認待ちの状態ではありません。");
+      }
+      const alt = await guild.members.fetch(application.alt_user_id).catch(() => null);
+      if (!alt) return fail("alt_not_in_guild", "サブ垢がサーバーに参加していないため有効化できませんでした。");
+
+      // **入城処理（ghostify）は流用しない。** あれは初期発行・評価期間の開始・
+      // 招待実績の確定までやるので、サブ垢に流すと同じ人が二重に初期発行を受け、
+      // 評価期間まで生える。サブ垢に渡すのは本体と同じ階級ロールだけ
+      const soul = services.entry.getSoul(userId);
+      if (!soul || !roleToRestoreForStatus(soul.status)) {
+        return fail("main_rank_unavailable", "本体の階級が確認できないため有効化できませんでした。運営にお問い合わせください。");
+      }
+      // **1個 add するだけにしない。** 別の階級ロールが残っていれば正規化し、
+      // 本体と完全に同じ状態になったことを実状態で確かめてから契約を始める。
+      // 毎分の巡回と同じ処理を使う（片方だけ緩い、を作らない）
+      // **Discord を変更する前に、巻き戻しの基準を DB へ残す。**
+      // ここに残さないと、剥がした直後に落ちたとき「元は何を持っていたか」が
+      // プロセスと一緒に消え、再起動後の再試行が剥がしたあとの状態を
+      // 「開始前」と誤認して、返金したうえで元の階級を消したままにする
+      const missingKeys = missingLadderRoleKeys(services);
+      if (missingKeys.length > 0) {
+        return fail(
+          `alt_rank_config_missing:${missingKeys.join(",")}`,
+          "階級ロールの設定が足りないため有効化できませんでした。運営にお問い合わせください。",
+        );
+      }
+      let baseline = services.subAccounts.activationBaseline(application.id);
+      if (baseline === null) {
+        const current = await currentLadderRoles(services, guild, application.alt_user_id);
+        if (current === null) {
+          return fail("alt_rank_unverifiable", "サブ垢の状態を確認できなかったため有効化できませんでした。");
+        }
+        baseline = services.subAccounts.saveActivationBaseline(application.id, current);
+      }
+      const synced = await reconcileAltRank(services, guild, alt, userId, { baseline });
+      if (!synced.ok) {
+        // **変更を始めたあとの失敗は、開始前へ戻せた確認が取れるまで返金しない。**
+        // 返金だけ通ると「払っていないのに階級ロールが残っている」が起きる
+        const safeToRefund = synced.restored === true;
+        return fail(
+          `alt_rank_sync_failed:${synced.reason}${synced.restored === true ? "" : ":rollback_unconfirmed"}`,
+          safeToRefund
+            ? "サブ垢の階級を本体に合わせられなかったため有効化できませんでした。"
+            : "サブ垢の階級を戻せたか確認できませんでした。運営が確認しますので、そのままお待ちください。",
+          { refundable: safeToRefund },
+        );
+      }
+
+
+      if (!services.subAccounts.activate({ id: application.id, purchaseId: purchase.id, actor })) {
+        const settled = services.subAccounts.get(application.id);
+        // 相手が先に有効化していたなら、これは成功の収束
+        if (settled?.status === "active") {
+          services.shop.markDeliverySucceeded(purchase.id, actor);
+          return { state: "delivered", message: `サブ垢 <@${application.alt_user_id}> を有効化しました。` };
+        }
+        // **返金の前に、階級ロールを処理開始前の状態へ戻す。**
+        // 正規化で剥がしたものは戻し、足したものは外す。今回付けていない
+        // 元からのロールを巻き添えで剥がさない
+        const restored = await restoreAltRank(services, guild, alt, baseline);
+        if (restored !== true) {
+          return fail(
+            "sub_account_conflict_rollback_failed",
+            "サブ垢の有効化に失敗しました。運営が確認しますので、そのままお待ちください。",
+            { refundable: false },
+          );
+        }
+        return fail("sub_account_activate_conflict", "サブ垢の有効化に失敗しました。運営にお問い合わせください。");
+      }
+      services.shop.markDeliverySucceeded(purchase.id, actor);
+      return {
+        state: "delivered",
+        message: `サブ垢 <@${application.alt_user_id}> を有効化しました。階級は本体に合わせて自動で追従します。`,
+      };
+    }
+
     if (kind === "extend_deadline") {
       const days = data.days ?? 1;
       const soul = services.entry.getSoul(userId);
@@ -535,3 +632,4 @@ async function memberHasRoleStrict(guild: Guild, userId: string, roleId: string)
   if (!fresh) return null;
   return fresh.roles.cache.has(roleId);
 }
+

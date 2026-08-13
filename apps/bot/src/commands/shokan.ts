@@ -1,4 +1,10 @@
 import {
+  decisionModal as subDecisionModal,
+  handleSubAccountApprove,
+  handleSubAccountDecision,
+  subAccountReviewPanel,
+} from "./sub-account-admin.js";
+import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonInteraction,
@@ -161,7 +167,16 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
       .setStyle(services.originalRoles.countByStatus("pending") > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("shokan:history:0").setLabel("購入履歴").setEmoji("📜").setStyle(ButtonStyle.Secondary),
   );
-  return { embeds: [embed], components: [row] };
+  // 1行は5個まで。増えたぶんは行を足す（超えると描画そのものが落ちる）
+  const subPending = services.subAccounts.countByStatus("pending");
+  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("shokan:sub")
+      .setLabel(subPending > 0 ? `サブ垢 ${subPending}` : "サブ垢")
+      .setEmoji("👥")
+      .setStyle(subPending > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row, row2] };
 }
 
 /**
@@ -362,6 +377,10 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   const arg = parts[2];
 
   if (action === "orole") return void (await interaction.update(originalRoleReviewPanel(services)));
+  if (action === "sub") return void (await interaction.update(subAccountReviewPanel(services)));
+  if (action === "sub-approve" && arg) return void (await handleSubAccountApprove(interaction, services, Number(arg)));
+  if (action === "sub-return" && arg) return void (await interaction.showModal(subDecisionModal("returned", Number(arg))));
+  if (action === "sub-reject" && arg) return void (await interaction.showModal(subDecisionModal("rejected", Number(arg))));
   if (action === "orole-approve" && arg) return void (await handleOriginalRoleApprove(interaction, services, Number(arg)));
   if (action === "orole-return" && arg) return void (await interaction.showModal(decisionModal("returned", Number(arg))));
   if (action === "orole-reject" && arg) return void (await interaction.showModal(decisionModal("rejected", Number(arg))));
@@ -489,6 +508,10 @@ export async function handleShokanSelect(
 export async function handleShokanModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
   if (!canOperate(interaction, services)) return;
   const parts = interaction.customId.split(":");
+  if (parts[1] === "sub-decide") {
+    await handleSubAccountDecision(interaction, services);
+    return;
+  }
   if (parts[1] === "orole-decide") {
     await handleOriginalRoleDecision(interaction, services);
     return;

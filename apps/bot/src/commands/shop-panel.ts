@@ -18,6 +18,7 @@ import {
   LedgerError,
   NICKNAME_MAX_LENGTH,
   ShopError,
+  SubAccountError,
   describeRejection,
   termDays,
   type PurchaseRow,
@@ -37,6 +38,14 @@ import {
   renewConfirm,
   renewPicker,
 } from "./original-role.js";
+import {
+  handleApplyModal as handleSubApplyModal,
+  applyModal as subApplyModal,
+  isSubAccountItem,
+  mainRank as subMainRank,
+  payRequote as subPayRequote,
+  subAccountActions,
+} from "./sub-account.js";
 import { meetsRoleRequirement, requirementLabel } from "../rank-requirement.js";
 import { refreshShopAdminPanels } from "./shokan.js";
 import type { Services } from "../services.js";
@@ -597,6 +606,107 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     return;
   }
 
+  if (action === "sub-apply") {
+    // 古いボタンから来ることがある。**商品が今も売られているか確かめてから**開く
+    const applyItem = services.shop.getItem(Number(parts[2]));
+    if (!applyItem || !applyItem.enabled || !isSubAccountItem(services, applyItem)) {
+      await interaction.update({ content: "この商品はいま申請できません。", embeds: [], components: [] });
+      return;
+    }
+    await interaction.showModal(subApplyModal(applyItem.id));
+    return;
+  }
+
+  if (action === "sub-pay") {
+    const itemId = Number(parts[2]);
+    const applicationId = Number(parts[3]);
+    const quotedPrice = Number(parts[4]);
+    const attempt = parts[5] ?? "";
+    const item = services.shop.getItem(itemId);
+    if (!item || !item.enabled || !isSubAccountItem(services, item) || item.price_land === null) {
+      await interaction.update({ content: "この商品はいま購入できません。", embeds: [], components: [] });
+      return;
+    }
+    const application = services.subAccounts.get(applicationId);
+    if (quotedPrice !== item.price_land) {
+      // **1 Ld も動かさずに**、新しい額で確かめ直してもらう
+      await interaction.update(subPayRequote(item, applicationId, application?.alt_user_id ?? ""));
+      return;
+    }
+    await interaction.deferUpdate();
+    interface SubAttempt {
+      error?: string;
+      purchase?: PurchaseRow;
+      settled?: Settlement;
+    }
+    const settlement = await withUserLock<SubAttempt>(`sub-pay:${applicationId}`, async () => {
+      const open = services.shop.findActivePurchaseByRequest(interaction.user.id, itemId, "applicationId", applicationId);
+      if (open) {
+        return {
+          purchase: open,
+          settled: await deliverOrRefund(interaction.client, services, interaction.guild, open, `user:${interaction.user.id}`),
+        };
+      }
+      try {
+        // **最後の関門。** 承認後に降格していれば、ここで 1 Ld も引かずに止める
+        services.subAccounts.assertPayable(applicationId, interaction.user.id, subMainRank(services, interaction.user.id));
+      } catch (error) {
+        const code = error instanceof SubAccountError ? error.code : "";
+        return {
+          error:
+            code === "ERR_RANK_TOO_LOW"
+              ? "⚠️ サブ垢の追加は**魔人以上**の方が対象です。承認後に階級が変わっているため、お支払いは行いませんでした。"
+              : "⚠️ この申請はいま支払える状態ではありません（取り消されたか、既に支払い済みです）。",
+        } as SubAttempt;
+      }
+      let purchase: PurchaseOutcome;
+      try {
+        purchase = purchaseOnce(services, {
+          operationId: `sub:${applicationId}:${attempt}`,
+          itemId,
+          userId: interaction.user.id,
+          actor: `user:${interaction.user.id}`,
+          memberRoleIds: [...((interaction.member as GuildMember | null)?.roles.cache.keys() ?? [])],
+          mode: "land",
+          request: { applicationId },
+        });
+      } catch (error) {
+        return { error: `❌ ${purchaseErrorMessage(error, services)}` } as SubAttempt;
+      }
+      return {
+        purchase: purchase.purchase,
+        settled: await deliverOrRefund(
+          interaction.client,
+          services,
+          interaction.guild,
+          purchase.purchase,
+          `user:${interaction.user.id}`,
+        ),
+      };
+    });
+    if (settlement.error !== undefined) {
+      await interaction.editReply({ content: settlement.error, embeds: [], components: [] });
+      return;
+    }
+    const paidSub = settlement.purchase!;
+    const { outcome, refund } = settlement.settled!;
+    if (outcome.state !== "failed") {
+      await interaction.editReply({ content: `✅ ${outcome.message}`, embeds: [], components: [] });
+      return;
+    }
+    await interaction.editReply({
+      content:
+        refund === "refunded"
+          ? `有効化できなかったため、${fmtLd(paidSub.paid_land ?? 0)}は返金しました。
+-# ${outcome.message}`
+          : `⚠️ 有効化に失敗し、返金も完了できませんでした。運営が対応します（購入 #${paidSub.id}）。
+-# ${outcome.message}`,
+      embeds: [],
+      components: [],
+    });
+    return;
+  }
+
   if (action === "orole-pay") {
     const itemId = Number(parts[2]);
     const applicationId = Number(parts[3]);
@@ -1058,6 +1168,18 @@ export async function handleShopSelect(
       await interaction.reply({ embeds: view.embeds, components: actions.components, flags: MessageFlags.Ephemeral });
       return;
     }
+    // サブ垢も同じ形（申請 → 本人確認 → 支払い）。先払いには戻さない
+    if (isSubAccountItem(services, item)) {
+      const actions = subAccountActions(services, item, interaction.user.id);
+      view.embeds[0]?.addFields({ name: "手続き", value: actions.notes.join(String.fromCharCode(10)).slice(0, 1024) });
+      await interaction.reply({
+        embeds: view.embeds,
+        components: actions.components,
+        flags: MessageFlags.Ephemeral,
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
     await interaction.reply({ ...view, flags: MessageFlags.Ephemeral });
     return;
   }
@@ -1119,6 +1241,10 @@ export async function handleShopModal(interaction: ModalSubmitInteraction, servi
   const parts = interaction.customId.split(":");
   if (parts[1] === "orole-input") {
     await handleApplyModal(interaction, services, Number(parts[2]));
+    return;
+  }
+  if (parts[1] === "sub-input") {
+    await handleSubApplyModal(interaction, services, Number(parts[2]));
     return;
   }
   if (parts[1] !== "nick-input") return;
