@@ -834,6 +834,10 @@ CREATE TABLE IF NOT EXISTS sub_accounts (
   decided_at     INTEGER,
   decide_reason  TEXT,
   activated_at   INTEGER,
+  -- 有効化を始める前の階級ロール集合（JSON配列）。**Discordを変更する前に書く。**
+  -- 途中で落ちても、再起動後の再試行がここを基準に巻き戻せる
+  activation_rank_baseline TEXT,
+  activation_rank_settled_at INTEGER,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL,
   -- 自分自身をサブ垢にはできない
@@ -890,6 +894,9 @@ export function openDb(path: string): Database.Database {
   // 既に original_roles がある本番へ後から足す
   ensureColumn(db, "original_roles", "role_creation_started_at", "INTEGER");
   applyOriginalRoleItemSetting(db);
+  // 既に sub_accounts がある本番へ後から足す
+  ensureColumn(db, "sub_accounts", "activation_rank_baseline", "TEXT");
+  ensureColumn(db, "sub_accounts", "activation_rank_settled_at", "INTEGER");
   applySubAccountItemSetting(db);
   ensureColumn(db, "casino_tx", "op_key", "TEXT");
   ensureColumn(db, "casino_tx", "op_actor_id", "TEXT");

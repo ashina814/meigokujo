@@ -80,6 +80,14 @@ export async function reconcileAltRank(
   guild: Guild,
   member: GuildMember,
   mainUserId: string,
+  opts: {
+    /**
+     * 巻き戻しの基準。**課金がからむ初回の有効化では、Discord を変更する前に
+     * DB へ残したものを渡す。** 再起動後の再試行が取り直すと、剥がしたあとの
+     * 状態を「開始前」と誤認してしまう
+     */
+    baseline?: readonly string[];
+  } = {},
 ): Promise<RankSyncResult> {
   // **設定が揃っていなければ何も触らない。** 判定の前に確かめる
   const missingKeys = missingLadderRoleKeys(services);
@@ -91,12 +99,15 @@ export async function reconcileAltRank(
 
   // **開始前の状態も実物から取る。** `roles.cache` は古いことがあり、古い集合を
   // 「開始前」として巻き戻すと、持っていなかったロールを新しく付けてしまう
-  const previous = await freshLadderRoles(guild, member.id, ladder);
+  const previous = opts.baseline ? [...opts.baseline] : await freshLadderRoles(guild, member.id, ladder);
   if (previous === null) {
     // まだ何も触っていないので、戻すものは無い
     return { ok: false, reason: "unverifiable", wanted, mutated: false, restored: true };
   }
-  const toRemove = previous.filter((id) => id !== wanted);
+  // 剥がす対象は**いまの実状態**から決める（基準は巻き戻し用で、現在の状態とは別物）
+  const presentState = opts.baseline ? await freshLadderRoles(guild, member.id, ladder) : previous;
+  if (presentState === null) return { ok: false, reason: "unverifiable", wanted, mutated: false, restored: true };
+  const toRemove = presentState.filter((id) => id !== wanted);
 
   /** 変更を始めたあとの失敗。**開始前へ戻してから**でないと返金させない */
   const rollback = async (
@@ -112,7 +123,7 @@ export async function reconcileAltRank(
     await member.roles.remove(id, "サブ垢: 本体の階級に合わせる").catch(() => undefined);
   }
   // **剥がせたか確かめてから足す。** 確認できないうちは何も足さない
-  const afterRemoval = toRemove.length > 0 ? await freshLadderRoles(guild, member.id, ladder) : previous;
+  const afterRemoval = toRemove.length > 0 ? await freshLadderRoles(guild, member.id, ladder) : presentState;
   if (afterRemoval === null) return rollback("unverifiable");
   const stillExtra = afterRemoval.filter((id) => id !== wanted);
   if (stillExtra.length > 0) return rollback("mismatch", stillExtra, wanted);
@@ -170,6 +181,14 @@ export async function restoreAltRank(
  * いま実際に付いている階級ロール。**取り直して**から見る。
  * 確認できなければ `null`（「付いていない」と混同しない）。
  */
+export async function currentLadderRoles(
+  services: Services,
+  guild: Guild,
+  userId: string,
+): Promise<string[] | null> {
+  return freshLadderRoles(guild, userId, ladderRoleIds(services));
+}
+
 async function freshLadderRoles(guild: Guild, userId: string, ladder: readonly string[]): Promise<string[] | null> {
   const fresh = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
   if (!fresh) return null;

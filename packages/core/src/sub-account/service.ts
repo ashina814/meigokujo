@@ -56,6 +56,8 @@ export interface SubAccountRow {
   decided_at: number | null;
   decide_reason: string | null;
   activated_at: number | null;
+  activation_rank_baseline: string | null;
+  activation_rank_settled_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -243,6 +245,40 @@ export class SubAccounts {
     return row;
   }
 
+  // ---- 有効化の巻き戻し基準 ----
+
+  /**
+   * 有効化を始める前の階級ロール集合を残す。**Discord を変更する前に呼ぶ。**
+   *
+   * ここに残さないと、剥がした直後に落ちたときに「元は何を持っていたか」が
+   * プロセスと一緒に消える。再起動後の再試行が新しく取り直すと、剥がしたあとの
+   * 状態を「開始前」と誤認し、返金したうえで元の階級を消したままにしてしまう。
+   *
+   * **一度書いたら上書きしない。** 再試行は最初の基準を使い続ける。
+   *
+   * @returns 実際に使う基準（既に保存済みならそちら）
+   */
+  saveActivationBaseline(id: number, roles: readonly string[]): string[] {
+    this.db
+      .prepare(
+        "UPDATE sub_accounts SET activation_rank_baseline = ?, updated_at = ? WHERE id = ? AND activation_rank_baseline IS NULL",
+      )
+      .run(JSON.stringify([...roles]), now(), id);
+    return this.activationBaseline(id) ?? [...roles];
+  }
+
+  /** 保存済みの巻き戻し基準（無ければ null）。**推測で生やさない** */
+  activationBaseline(id: number): string[] | null {
+    const row = this.get(id);
+    if (!row?.activation_rank_baseline) return null;
+    try {
+      const parsed = JSON.parse(row.activation_rank_baseline) as unknown;
+      return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : null;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * 有効化する。**Discord 側のロール付与が済んでから呼ぶ。**
    * `approved` からの条件付き更新なので、同じ承認から2回有効化されない。
@@ -251,10 +287,12 @@ export class SubAccounts {
     const ts = now();
     const changed = this.db
       .prepare(
-        `UPDATE sub_accounts SET status = 'active', purchase_id = ?, activated_at = ?, updated_at = ?
+        `UPDATE sub_accounts
+            SET status = 'active', purchase_id = ?, activated_at = ?, updated_at = ?,
+                activation_rank_settled_at = ?
           WHERE id = ? AND status = 'approved'`,
       )
-      .run(input.purchaseId, ts, ts, input.id).changes;
+      .run(input.purchaseId, ts, ts, ts, input.id).changes;
     if (changed !== 1) return false;
     const row = this.get(input.id)!;
     this.events.log("sub_account_activated", {

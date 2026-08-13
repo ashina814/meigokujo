@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Collection } from "discord.js";
 import {
   Entry,
@@ -33,8 +36,8 @@ const ALT = "1463201396567441442";
 const PRICE = 80_000;
 const MAJIN_ROLE = "role-majin";
 
-function setup(mainStatus: "majin" | "meirei" | "ghost" = "majin") {
-  const db = openDb(":memory:");
+function setup(mainStatus: "majin" | "meirei" | "ghost" = "majin", path = ":memory:") {
+  const db = openDb(path);
   const ledger = new Ledger(db);
   const settings = new Settings(db);
   const events = new EventLog(db);
@@ -65,6 +68,20 @@ function setup(mainStatus: "majin" | "meirei" | "ghost" = "majin") {
     approvedBy: "t",
     idempotencyKey: "seed",
   });
+  const services = { db, ledger, settings, events, shop, entry, subAccounts } as unknown as Services;
+  return { db, ledger, settings, events, shop, entry, subAccounts, item, services };
+}
+
+/** 同じDBを開き直す（再起動相当）。**種まきはしない** */
+function reopen(path: string): Ctx {
+  const db = openDb(path);
+  const ledger = new Ledger(db);
+  const settings = new Settings(db);
+  const events = new EventLog(db);
+  const shop = new Shop(db, ledger, events);
+  const entry = new Entry(db, ledger, events, settings);
+  const subAccounts = new SubAccounts(db, events);
+  const item = shop.getItem(Number(settings.getString("shop:sub_account_item_id")))!;
   const services = { db, ledger, settings, events, shop, entry, subAccounts } as unknown as Services;
   return { db, ledger, settings, events, shop, entry, subAccounts, item, services };
 }
@@ -876,6 +893,144 @@ describe("正規化の途中で失敗したときも副作用を戻す", () => {
     expect(w.altRoles).toEqual([]); // 巻き戻しても魔族を新規付与しない
     expect(balance(ctx)).toBe(1_000_000); // 返金済み
     vi.restoreAllMocks();
+    ctx.db.close();
+  });
+});
+
+/**
+ * **再起動をまたいでも巻き戻しの基準を失わない。**
+ *
+ * 剥がした直後に落ちると「元は何を持っていたか」がプロセスと一緒に消える。
+ * 再試行が取り直すと、剥がしたあとの状態を「開始前」と誤認し、返金したうえで
+ * 元の階級を消したままにしてしまう。だから Discord を触る前にDBへ残す。
+ */
+describe("クラッシュと再起動をまたぐ巻き戻し", () => {
+  const MAZOKU_ROLE = "role-mazoku";
+  const tmpDb = () => join(mkdtempSync(join(tmpdir(), "sub-crash-")), "bot.db");
+
+  /**
+   * 課金済み・未配送の購入を作る。
+   *
+   * `delivery_state` を明示しておく。NULL のままだと、開き直したときに
+   * 「列の導入前からある旧購入」とみなす移行が配送済みへ倒してしまう
+   * （本番は移行済みなので起きないが、テストではDBを作った直後に開き直す）。
+   */
+  function paid(ctx: Ctx, rowId: number) {
+    const { purchase } = ctx.shop.purchase({
+      userId: MAIN,
+      itemId: ctx.item.id,
+      actor: "t",
+      memberRoleIds: [],
+      request: { applicationId: rowId },
+    });
+    ctx.db.prepare("UPDATE shop_purchases SET delivery_state='pending' WHERE id=?").run(purchase.id);
+    return ctx.shop.getPurchase(purchase.id)!;
+  }
+
+  const clientOf = (w: ReturnType<typeof world>) =>
+    ({
+      guilds: { fetch: vi.fn(async () => w.guild) },
+      users: { fetch: vi.fn(async () => null) },
+      channels: { fetch: vi.fn(async () => null) },
+    }) as never;
+
+  it("**剥奪後にクラッシュしても、保存した基準へ戻してから返金する**", async () => {
+    const { convergePendingSubAccounts } = await import("../src/scheduler-recovery.js");
+    const path = tmpDb();
+    const first = setup("majin", path);
+    const row = approved(first);
+    paid(first, row.id);
+    const w = world({ addFails: "Missing Permissions", addFailsFor: MAJIN_ROLE });
+    w.alt.roles.cache.set(MAZOKU_ROLE, true);
+    w.altRoles.push(MAZOKU_ROLE);
+
+    // 1回目: 基準を保存 → 魔族を剥がしたところで落ちる
+    const saved = first.subAccounts.saveActivationBaseline(row.id, [MAZOKU_ROLE]);
+    expect(saved).toEqual([MAZOKU_ROLE]);
+    await w.alt.roles.remove(MAZOKU_ROLE, "crash test");
+    expect(w.altRoles).toEqual([]);
+    first.db.close();
+
+    // 再起動: 同じDBを開き直す
+    const second = reopen(path);
+    expect(second.subAccounts.activationBaseline(row.id)).toEqual([MAZOKU_ROLE]);
+
+    await convergePendingSubAccounts(clientOf(w), second.services);
+
+    // **新しく取り直した空集合ではなく、保存した基準へ戻っている**
+    expect(w.altRoles).toEqual([MAZOKU_ROLE]);
+    expect(second.ledger.balanceOf(`user:${MAIN}`)).toBe(1_000_000); // 返金済み
+    expect(second.subAccounts.get(row.id)!.status).toBe("approved");
+    second.db.close();
+  });
+
+  it("正規化のあと・契約開始の直前に落ちても、再起動後に正しく有効化する", async () => {
+    const { convergePendingSubAccounts } = await import("../src/scheduler-recovery.js");
+    const path = tmpDb();
+    const first = setup("majin", path);
+    const row = approved(first);
+    paid(first, row.id);
+    const w = world();
+    // 正規化まで終わっていた状態（魔人が付いている）
+    first.subAccounts.saveActivationBaseline(row.id, []);
+    await w.alt.roles.add(MAJIN_ROLE, "crash test");
+    const addCallsBefore = w.alt.roles.add.mock.calls.length;
+    first.db.close();
+
+    const second = reopen(path);
+    await convergePendingSubAccounts(clientOf(w), second.services);
+
+    expect(second.subAccounts.get(row.id)!.status).toBe("active");
+    expect(w.altRoles).toEqual([MAJIN_ROLE]);
+    // 既に合っているので、余計なロール操作をしない
+    expect(w.alt.roles.add.mock.calls.length).toBe(addCallsBefore);
+    expect(w.alt.roles.remove).not.toHaveBeenCalled();
+    // 課金は1回だけ（再収束で買い直さない）
+    expect(second.shop.listUserPurchases(MAIN).filter((p) => p.status === "active")).toHaveLength(1);
+    expect(second.ledger.balanceOf(`user:${MAIN}`)).toBe(1_000_000 - PRICE);
+    second.db.close();
+  });
+
+  it("基準を保存する前に失敗すれば、Discordは無傷で安全に返金できる", async () => {
+    const { convergePendingSubAccounts } = await import("../src/scheduler-recovery.js");
+    const ctx = setup();
+    ctx.settings.set("role:kenma", "", "staff"); // 設定欠損で基準の保存前に止まる
+    const row = approved(ctx);
+    paid(ctx, row.id);
+    const w = world();
+    w.alt.roles.cache.set(MAZOKU_ROLE, true);
+    w.altRoles.push(MAZOKU_ROLE);
+
+    await convergePendingSubAccounts(clientOf(w), ctx.services);
+
+    expect(w.alt.roles.add).not.toHaveBeenCalled();
+    expect(w.alt.roles.remove).not.toHaveBeenCalled();
+    expect(w.altRoles).toEqual([MAZOKU_ROLE]);
+    expect(ctx.subAccounts.activationBaseline(row.id)).toBeNull(); // 基準を作っていない
+    expect(ctx.ledger.balanceOf(`user:${MAIN}`)).toBe(1_000_000); // 返金済み
+    ctx.db.close();
+  });
+
+  it("有効化に成功した基準は「処理済み」として残る", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const row = approved(ctx);
+    const w = world();
+
+    await handleShopButton(press(payId(ctx, row.id), w), ctx.services);
+
+    const after = ctx.subAccounts.get(row.id)!;
+    expect(after.status).toBe("active");
+    expect(after.activation_rank_settled_at).not.toBeNull();
+    ctx.db.close();
+  });
+
+  it("既存データへ推測で基準を生やさない（保存していなければ null のまま）", () => {
+    const ctx = setup();
+    const row = ctx.subAccounts.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" });
+
+    expect(ctx.subAccounts.activationBaseline(row.id)).toBeNull();
+    expect(ctx.subAccounts.get(row.id)!.activation_rank_baseline).toBeNull();
     ctx.db.close();
   });
 });

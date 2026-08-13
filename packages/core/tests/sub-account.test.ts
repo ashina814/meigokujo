@@ -309,6 +309,10 @@ describe("既存DB（sub_accounts が無い）からの移行", () => {
     expect(idx).toContain("idx_sub_accounts_alt_open");
     expect((db.prepare("SELECT COUNT(*) c FROM shop_purchases WHERE item_id=4").get() as { c: number }).c).toBe(1);
 
+    const cols = (db.prepare("PRAGMA table_info(sub_accounts)").all() as Array<{ name: string }>).map((r) => r.name);
+    expect(cols).toContain("activation_rank_baseline");
+    expect(cols).toContain("activation_rank_settled_at");
+
     // 移行後のDBで、そのまま登録できる
     const subs = new SubAccounts(db, new EventLog(db));
     expect(subs.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" }).status).toBe("active");
@@ -377,5 +381,32 @@ describe("開業時に魔人要件を固定する", () => {
 
     expect(ctx.shop.getItem(ctx.item.id)!.require_role_id).toBe("role-majin");
     ctx.db.close();
+  });
+});
+
+/** 列を足す前の `sub_accounts` がある本番から起動できること */
+describe("既存DB（activation_rank_baseline 列が無い）からの移行", () => {
+  it("openDb が通り、列が足され、既存行が残る", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "sub-mig2-")), "old.db");
+    const old = new Database(path);
+    old.exec(`CREATE TABLE sub_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, main_user_id TEXT NOT NULL, alt_user_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', purchase_id INTEGER,
+      approved_by TEXT, approved_at INTEGER, decided_by TEXT, decided_at INTEGER, decide_reason TEXT,
+      activated_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);`);
+    old.prepare("INSERT INTO sub_accounts (main_user_id,alt_user_id,status,created_at,updated_at) VALUES (?,?,'active',0,0)")
+      .run(MAIN, ALT);
+    old.close();
+
+    const db = openDb(path);
+
+    const cols = (db.prepare("PRAGMA table_info(sub_accounts)").all() as Array<{ name: string }>).map((r) => r.name);
+    expect(cols).toContain("activation_rank_baseline");
+    expect(cols).toContain("activation_rank_settled_at");
+    expect((db.prepare("SELECT COUNT(*) c FROM sub_accounts").get() as { c: number }).c).toBe(1);
+    // **既存行に推測で基準を生やさない**
+    const subs = new SubAccounts(db, new EventLog(db));
+    expect(subs.activationBaseline(1)).toBeNull();
+    db.close();
   });
 });
