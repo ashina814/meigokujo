@@ -51,6 +51,21 @@ export function eligible(services: Services, userId: string): boolean {
   return isEligibleMainRank(mainRank(services, userId));
 }
 
+export const LEGACY_SUB_ACCOUNT_BLOCK_MESSAGE =
+  "旧サブ垢契約が残っています。二重に支払わず、運営へ引き継ぎを依頼してください。";
+
+/** 旧契約が未引き継ぎなら、新制度の申請を作らせない。購入履歴から alt は推測しない。 */
+export function hasUnresolvedLegacySubAccount(services: Services, userId: string): boolean {
+  const legacyItemId = Number(services.settings.getString("shop:sub_account_legacy_item_id"));
+  if (!Number.isInteger(legacyItemId) || legacyItemId <= 0) return false;
+  if (services.subAccounts.listByMain(userId).some((row) => row.status === "active")) return false;
+  return Boolean(
+    services.db
+      .prepare("SELECT 1 FROM shop_purchases WHERE item_id = ? AND user_id = ? AND status = 'active' LIMIT 1")
+      .get(legacyItemId, userId),
+  );
+}
+
 export const RANK_REQUIRED_MESSAGE =
   "サブ垢の追加は**魔人以上**の方が対象です。現在の階級では申請・支払いができません。";
 
@@ -65,6 +80,9 @@ export const PAIR_ERROR_MESSAGE: Record<string, string> = {
 /** 商品の詳細に出す操作。**いま何をすればいいか**だけを見せる */
 export function subAccountActions(services: Services, item: ShopItemRow, userId: string) {
   const rows = services.subAccounts.listByMain(userId);
+  if (hasUnresolvedLegacySubAccount(services, userId)) {
+    return { notes: [`⚠️ ${LEGACY_SUB_ACCOUNT_BLOCK_MESSAGE}`], components: [] };
+  }
   // **押せるボタンで資格を表さない。** 出す前に今の階級を見る
   if (!eligible(services, userId) && rows.every((r) => r.status !== "active")) {
     return { notes: [`⚠️ ${RANK_REQUIRED_MESSAGE}`], components: [] };
@@ -156,6 +174,13 @@ export async function handleApplyModal(
   if (!item || !item.enabled || !isSubAccountItem(services, item)) {
     await interaction.reply({
       content: "⚠️ この商品はいま申請できません（販売が停止されました）。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (hasUnresolvedLegacySubAccount(services, interaction.user.id)) {
+    await interaction.reply({
+      content: `⚠️ ${LEGACY_SUB_ACCOUNT_BLOCK_MESSAGE}`,
       flags: MessageFlags.Ephemeral,
     });
     return;
