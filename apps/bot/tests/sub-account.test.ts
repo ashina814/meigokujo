@@ -70,7 +70,18 @@ function setup(mainStatus: "majin" | "meirei" | "ghost" = "majin") {
 type Ctx = ReturnType<typeof setup>;
 const balance = (ctx: Ctx) => ctx.ledger.balanceOf(`user:${MAIN}`);
 
-function world(opts: { addFails?: string; addActuallyApplies?: boolean; removeFails?: boolean; altMissing?: boolean } = {}) {
+function world(
+  opts: {
+    addFails?: string;
+    addActuallyApplies?: boolean;
+    removeFails?: boolean;
+    /** エラーを返すが、Discord側では剥奪が通っていた */
+    removeActuallyApplies?: boolean;
+    /** 取り直し（force fetch）が失敗する＝実状態を確認できない */
+    forceFetchFails?: boolean;
+    altMissing?: boolean;
+  } = {},
+) {
   const altRoles: string[] = [];
   const cache = new Collection<string, unknown>();
   const alt = {
@@ -89,16 +100,29 @@ function world(opts: { addFails?: string; addActuallyApplies?: boolean; removeFa
         cache.set(id, true);
       }),
       remove: vi.fn(async (id: string) => {
-        if (opts.removeFails) throw new Error("Service Unavailable");
-        const i = altRoles.indexOf(id);
-        if (i >= 0) altRoles.splice(i, 1);
-        cache.delete(id);
+        const drop = () => {
+          const i = altRoles.indexOf(id);
+          if (i >= 0) altRoles.splice(i, 1);
+          cache.delete(id);
+        };
+        if (opts.removeFails) {
+          if (opts.removeActuallyApplies) drop();
+          throw new Error("Service Unavailable");
+        }
+        drop();
       }),
     },
   };
   const guild = {
     id: "g1",
-    members: { fetch: vi.fn(async () => (opts.altMissing ? Promise.reject(new Error("Unknown Member")) : alt)) },
+    members: {
+      fetch: vi.fn(async (arg?: unknown) => {
+        if (opts.altMissing) throw new Error("Unknown Member");
+        // 取り直し（{ user, force }）だけ失敗させられるようにする
+        if (opts.forceFetchFails && typeof arg === "object" && arg !== null) throw new Error("Service Unavailable");
+        return alt;
+      }),
+    },
     roles: { cache: new Collection() },
   };
   return { guild, alt, altRoles };
@@ -422,6 +446,194 @@ describe("旧#4の引き継ぎ（運営導線）", () => {
 
     expect(text).toContain("未登録 **1件**");
     expect(text).toContain(MAIN);
+    ctx.db.close();
+  });
+});
+
+describe("階級同期は実状態で判定する", () => {
+  const MAZOKU_ROLE = "role-mazoku";
+  const clientOf = (w: ReturnType<typeof world>) => ({ guilds: { fetch: vi.fn(async () => w.guild) } }) as never;
+  const syncedEvents = (ctx: Ctx) =>
+    ctx.db.prepare("SELECT type FROM events WHERE type LIKE 'sub_account_rank_sync%'").all() as Array<{ type: string }>;
+
+  function activeSub(ctx: Ctx) {
+    ctx.settings.set("role:mazoku", MAZOKU_ROLE, "staff");
+    return ctx.subAccounts.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" });
+  }
+
+  it("**剥奪に失敗したら下位ロールを足さない**（魔族+魔人の二重階級を作らない）", async () => {
+    const { syncSubAccountRanks } = await import("../src/sub-account-jobs.js");
+    const ctx = setup(); // main = 魔人
+    activeSub(ctx);
+    const w = world({ removeFails: true });
+    w.alt.roles.cache.set(MAZOKU_ROLE, true);
+    w.altRoles.push(MAZOKU_ROLE);
+
+    await syncSubAccountRanks(clientOf(w), ctx.services);
+
+    expect(w.altRoles).toEqual([MAZOKU_ROLE]); // 魔人を足していない
+    expect(w.alt.roles.add).not.toHaveBeenCalled();
+    expect(syncedEvents(ctx).map((e) => e.type)).toEqual(["sub_account_rank_sync_failed"]);
+    ctx.db.close();
+  });
+
+  it("**本体が迷霊で剥奪に失敗したら「同期済み」にしない**（古いロールが残っているのを検知する）", async () => {
+    const { syncSubAccountRanks } = await import("../src/sub-account-jobs.js");
+    const ctx = setup();
+    activeSub(ctx);
+    ctx.db.prepare("UPDATE souls SET status='meirei' WHERE user_id=?").run(MAIN);
+    const w = world({ removeFails: true });
+    w.alt.roles.cache.set(MAJIN_ROLE, true);
+    w.altRoles.push(MAJIN_ROLE);
+
+    await syncSubAccountRanks(clientOf(w), ctx.services);
+
+    expect(w.altRoles).toEqual([MAJIN_ROLE]); // 外れていない
+    const events = syncedEvents(ctx);
+    expect(events.map((e) => e.type)).toEqual(["sub_account_rank_sync_failed"]);
+    const payload = String(
+      (ctx.db.prepare("SELECT payload_json p FROM events WHERE type='sub_account_rank_sync_failed'").get() as { p: string }).p,
+    );
+    expect(payload).toContain(MAJIN_ROLE); // 何が残っているか記録に出る
+    ctx.db.close();
+  });
+
+  it("**剥奪がエラーでも実際には外れていれば成功にする**（取り直して確かめる）", async () => {
+    const { syncSubAccountRanks } = await import("../src/sub-account-jobs.js");
+    const ctx = setup();
+    activeSub(ctx);
+    const w = world({ removeFails: true, removeActuallyApplies: true });
+    w.alt.roles.cache.set(MAZOKU_ROLE, true);
+    w.altRoles.push(MAZOKU_ROLE);
+
+    await syncSubAccountRanks(clientOf(w), ctx.services);
+
+    expect(w.altRoles).toEqual([MAJIN_ROLE]);
+    expect(syncedEvents(ctx).map((e) => e.type)).toEqual(["sub_account_rank_synced"]);
+    ctx.db.close();
+  });
+
+  it("実状態を確認できないときは成功にしない", async () => {
+    const { syncSubAccountRanks } = await import("../src/sub-account-jobs.js");
+    const ctx = setup();
+    activeSub(ctx);
+    const w = world({ forceFetchFails: true });
+    w.alt.roles.cache.set(MAZOKU_ROLE, true);
+    w.altRoles.push(MAZOKU_ROLE);
+
+    await syncSubAccountRanks(clientOf(w), ctx.services);
+
+    expect(syncedEvents(ctx).map((e) => e.type)).toEqual(["sub_account_rank_sync_failed"]);
+    ctx.db.close();
+  });
+
+  it("**初回有効化でも、別の階級ロールが残っていれば正規化してから active にする**", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    ctx.settings.set("role:mazoku", MAZOKU_ROLE, "staff");
+    const row = approved(ctx);
+    const w = world();
+    // 昔つけた魔族ロールが残っている
+    w.alt.roles.cache.set(MAZOKU_ROLE, true);
+    w.altRoles.push(MAZOKU_ROLE);
+
+    await handleShopButton(press(payId(ctx, row.id), w), ctx.services);
+
+    expect(w.altRoles).toEqual([MAJIN_ROLE]); // 本体と完全に同じ状態
+    expect(ctx.subAccounts.get(row.id)!.status).toBe("active");
+    ctx.db.close();
+  });
+
+  it("初回有効化で正規化できなければ active にせず返金する", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    ctx.settings.set("role:mazoku", MAZOKU_ROLE, "staff");
+    const row = approved(ctx);
+    const w = world({ removeFails: true });
+    w.alt.roles.cache.set(MAZOKU_ROLE, true);
+    w.altRoles.push(MAZOKU_ROLE);
+
+    await handleShopButton(press(payId(ctx, row.id), w), ctx.services);
+
+    expect(ctx.subAccounts.get(row.id)!.status).toBe("approved");
+    expect(balance(ctx)).toBe(1_000_000); // 返金済み
+    expect(w.altRoles).toEqual([MAZOKU_ROLE]); // 魔人を足していない
+    ctx.db.close();
+  });
+});
+
+describe("審査パネルの行数", () => {
+  it("**承認待ちが5件以上でも ActionRow は5行を超えない**", async () => {
+    const { subAccountReviewPanel, MAX_ACTION_ROWS } = await import("../src/commands/sub-account-admin.js");
+    const ctx = setup();
+    for (let i = 0; i < 8; i++) {
+      const alt = `2222222222222222${String(i).padStart(2, "0")}`;
+      ctx.db
+        .prepare(
+          "INSERT INTO sub_accounts (main_user_id,alt_user_id,status,created_at,updated_at) VALUES (?,?, 'pending', ?, ?)",
+        )
+        .run(MAIN, alt, i, i);
+    }
+
+    const panel = subAccountReviewPanel(ctx.services);
+
+    expect(ctx.subAccounts.countByStatus("pending")).toBe(8);
+    expect(panel.components.length).toBeLessThanOrEqual(MAX_ACTION_ROWS);
+    // 「← 管理へ」は必ず残る（運営が戻れなくならない）
+    const last = panel.components.at(-1)!.toJSON().components[0]!;
+    expect(last.custom_id).toBe("shokan:hub");
+    expect(String(panel.embeds[0]!.toJSON().description)).toContain("承認待ち 8件");
+    ctx.db.close();
+  });
+});
+
+describe("止まった商品からは申請させない", () => {
+  it("販売停止後の古いボタンでは modal を開かない", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    ctx.shop.updateItem(ctx.item.id, { enabled: 0 }, "staff");
+    const p = press(`shop:sub-apply:${ctx.item.id}`, world()) as unknown as {
+      showModal: ReturnType<typeof vi.fn>;
+      update: ReturnType<typeof vi.fn>;
+    };
+
+    await handleShopButton(p as never, ctx.services);
+
+    expect(p.showModal).not.toHaveBeenCalled();
+    expect(contentOf(p.update)).toContain("申請できません");
+    ctx.db.close();
+  });
+
+  it("**modalを開いたあとに停止されたら、submitしても申請を作らない**", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    ctx.shop.updateItem(ctx.item.id, { enabled: 0 }, "staff");
+    const m = press(`shop:sub-input:${ctx.item.id}`, world(), MAIN, {
+      fields: { getTextInputValue: () => ALT },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(m as never, ctx.services);
+
+    expect(ctx.subAccounts.listByMain(MAIN)).toHaveLength(0);
+    expect(contentOf(m.reply)).toContain("申請できません");
+    ctx.db.close();
+  });
+
+  it("`shop:sub_account_item_id` を外したあとも申請を作らない", async () => {
+    const { handleShopButton, handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    ctx.settings.set("shop:sub_account_item_id", "", "staff");
+    const w = world();
+    const p = press(`shop:sub-apply:${ctx.item.id}`, w) as unknown as { showModal: ReturnType<typeof vi.fn> };
+    const m = press(`shop:sub-input:${ctx.item.id}`, w, MAIN, {
+      fields: { getTextInputValue: () => ALT },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopButton(p as never, ctx.services);
+    await handleShopModal(m as never, ctx.services);
+
+    expect(p.showModal).not.toHaveBeenCalled();
+    expect(ctx.subAccounts.listByMain(MAIN)).toHaveLength(0);
     ctx.db.close();
   });
 });

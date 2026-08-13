@@ -21,7 +21,16 @@ import type { Services } from "../services.js";
  * 支払いは本人の操作に残る（通らなかったものに先に払わせない）。
  */
 
-const LIST_LIMIT = 5;
+/**
+ * 1画面に出す申請の件数。
+ *
+ * **Discord の ActionRow は1メッセージ5行まで。** 申請1件につき1行使い、最後に
+ * 「← 管理へ」で1行使うので、申請は4件までしか置けない。5件置くと6行になり、
+ * 描画そのものが落ちて運営が何も操作できなくなる。
+ */
+const LIST_LIMIT = 4;
+/** Discord の上限。ここを超える components は作らない */
+export const MAX_ACTION_ROWS = 5;
 
 export function subAccountReviewPanel(services: Services) {
   const pending = services.subAccounts.listByStatus("pending", LIST_LIMIT);
@@ -32,7 +41,7 @@ export function subAccountReviewPanel(services: Services) {
     .setColor(total > 0 ? 0xdc2626 : 0x64748b)
     .setDescription(
       [
-        total > 0 ? `**承認待ち ${total}件**` : "承認待ちはありません。",
+        total > 0 ? `**承認待ち ${total}件**${total > LIST_LIMIT ? `（古い順に ${LIST_LIMIT}件だけ操作できます）` : ""}` : "承認待ちはありません。",
         "",
         ...pending.map((r) => {
           const rank = mainRank(services, r.main_user_id);
@@ -67,12 +76,11 @@ export function subAccountReviewPanel(services: Services) {
       ),
     );
   }
-  rows.push(
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("shokan:hub").setLabel("← 管理へ").setStyle(ButtonStyle.Secondary),
-    ),
+  // 戻る行のぶんを必ず残す。**上限を超えたら申請行のほうを削る**
+  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("shokan:hub").setLabel("← 管理へ").setStyle(ButtonStyle.Secondary),
   );
-  return { embeds: [embed], components: rows, content: "" };
+  return { embeds: [embed], components: [...rows.slice(0, MAX_ACTION_ROWS - 1), backRow], content: "" };
 }
 
 export function decisionModal(decision: "returned" | "rejected", id: number) {

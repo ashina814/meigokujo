@@ -151,6 +151,15 @@ export async function handleApplyModal(
   services: Services,
   itemId: number,
 ): Promise<void> {
+  // **modalを開いたあとに商品が止まることがある。** 確定時にも確かめる
+  const item = services.shop.getItem(itemId);
+  if (!item || !item.enabled || !isSubAccountItem(services, item)) {
+    await interaction.reply({
+      content: "⚠️ この商品はいま申請できません（販売が停止されました）。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
   const altUserId = parseUserId(interaction.fields.getTextInputValue("alt"));
   if (!altUserId) {
     await interaction.reply({

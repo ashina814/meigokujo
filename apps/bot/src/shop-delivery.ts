@@ -1,7 +1,6 @@
 import type { Guild, GuildMember, Role } from "discord.js";
 import {
   AUTO_DELIVERABLE_KINDS,
-  RANK_ROLE_SETTING_KEYS,
   roleToRestoreForStatus,
   describeRejection,
   parseDeliverySnapshot,
@@ -10,6 +9,7 @@ import {
 } from "@meigokujo/core";
 import { refreshEvalStatsForUser } from "./eval-daily.js";
 import { withUserLock } from "./user-lock.js";
+import { reconcileAltRank } from "./sub-account-rank.js";
 import type { Services } from "./services.js";
 
 /**
@@ -393,19 +393,21 @@ export async function deliverPurchaseUnlocked(
       // **入城処理（ghostify）は流用しない。** あれは初期発行・評価期間の開始・
       // 招待実績の確定までやるので、サブ垢に流すと同じ人が二重に初期発行を受け、
       // 評価期間まで生える。サブ垢に渡すのは本体と同じ階級ロールだけ
-      const roleId = rankRoleIdFor(services, userId);
-      if (!roleId) {
+      const soul = services.entry.getSoul(userId);
+      if (!soul || !roleToRestoreForStatus(soul.status)) {
         return fail("main_rank_unavailable", "本体の階級が確認できないため有効化できませんでした。運営にお問い合わせください。");
       }
-      let added = await alt.roles
-        .add(roleId, "公式ショップ: サブ垢の有効化")
-        .then(() => true)
-        .catch((e: Error) => e.message || "unknown");
-      if (added !== true) {
-        // **エラーだけで決めない。** Discord側では通っていることがある
-        if (await memberHasRole(guild, application.alt_user_id, roleId)) added = true;
+      // **1個 add するだけにしない。** 別の階級ロールが残っていれば正規化し、
+      // 本体と完全に同じ状態になったことを実状態で確かめてから契約を始める。
+      // 毎分の巡回と同じ処理を使う（片方だけ緩い、を作らない）
+      const synced = await reconcileAltRank(services, guild, alt, userId);
+      if (!synced.ok) {
+        return fail(
+          `alt_rank_sync_failed:${synced.reason}`,
+          "サブ垢の階級を本体に合わせられなかったため有効化できませんでした。",
+        );
       }
-      if (added !== true) return fail(`alt_role_add_failed:${added}`, "サブ垢へのロール付与に失敗しました。");
+      const roleId = synced.wanted!;
 
       if (!services.subAccounts.activate({ id: application.id, purchaseId: purchase.id, actor })) {
         const settled = services.subAccounts.get(application.id);
@@ -605,16 +607,3 @@ async function memberHasRoleStrict(guild: Guild, userId: string, roleId: string)
   return fresh.roles.cache.has(roleId);
 }
 
-/**
- * 本体の階級に対応するロール。**サブ垢に渡すのはこれだけ。**
- *
- * 迷霊（懲罰）と入城前・離脱済みは対象にしない。前者はサブ垢へ広げる意味が無く、
- * 後者はそもそも渡せる階級が無い。
- */
-export function rankRoleIdFor(services: Services, mainUserId: string): string | null {
-  const soul = services.entry.getSoul(mainUserId);
-  const rank = roleToRestoreForStatus(soul?.status ?? null);
-  if (!rank) return null;
-  const key = RANK_ROLE_SETTING_KEYS[rank as keyof typeof RANK_ROLE_SETTING_KEYS];
-  return key ? (services.settings.getString(key) ?? null) : null;
-}

@@ -607,7 +607,13 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
   }
 
   if (action === "sub-apply") {
-    await interaction.showModal(subApplyModal(Number(parts[2])));
+    // 古いボタンから来ることがある。**商品が今も売られているか確かめてから**開く
+    const applyItem = services.shop.getItem(Number(parts[2]));
+    if (!applyItem || !applyItem.enabled || !isSubAccountItem(services, applyItem)) {
+      await interaction.update({ content: "この商品はいま申請できません。", embeds: [], components: [] });
+      return;
+    }
+    await interaction.showModal(subApplyModal(applyItem.id));
     return;
   }
 

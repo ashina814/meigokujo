@@ -1,5 +1,5 @@
 import type { Client } from "discord.js";
-import { RANK_ROLE_SETTING_KEYS, roleToRestoreForStatus, type LadderRank } from "@meigokujo/core";
+import { describeRankSyncFailure, reconcileAltRank } from "./sub-account-rank.js";
 import type { Services } from "./services.js";
 
 /**
@@ -27,20 +27,11 @@ export async function cancelUnpaidSubAccounts(client: Client, services: Services
   }
 }
 
-/** 本体の階級に対応するロールID（対象外なら null） */
-export function rankRoleIdForStatus(services: Services, mainUserId: string): string | null {
-  const rank = roleToRestoreForStatus(services.entry.getSoul(mainUserId)?.status ?? null);
-  if (!rank) return null;
-  const key = RANK_ROLE_SETTING_KEYS[rank as LadderRank];
-  return key ? (services.settings.getString(key) ?? null) : null;
-}
-
 /**
- * サブ垢の階級を本体に合わせる。
+ * サブ垢の階級を本体に合わせる。**成功判定は Discord の実状態で行う。**
  *
- * 本体が昇格すればサブ垢も上がり、降格すれば下がる。本体が迷霊・離脱になったら
- * **階級ロールをすべて外す**（サブ垢だけが特権を持ち続けるのを防ぐ）。
- * ここは毎回の巡回で同じ結果に収束するように書く（差分だけを当てる）。
+ * 剥奪に失敗したまま別の階級を足すと、サブ垢だけが2つの階級を持つ状態が固定される。
+ * 剥がせなければそこで止め、失敗として残して次の巡回で再試行する。
  */
 export async function syncSubAccountRanks(client: Client, services: Services): Promise<void> {
   const rows = services.subAccounts.listActive();
@@ -48,27 +39,30 @@ export async function syncSubAccountRanks(client: Client, services: Services): P
   const guildId = services.settings.getString("guild:main");
   const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
   if (!guild) return;
-  const ladderRoleIds = Object.values(RANK_ROLE_SETTING_KEYS)
-    .map((key) => services.settings.getString(key))
-    .filter((id): id is string => !!id);
 
   for (const row of rows) {
     const alt = await guild.members.fetch(row.alt_user_id).catch(() => null);
-    if (!alt) continue; // 抜けている。ここでは記録を触らない（人の判断に残す）
-    const wanted = rankRoleIdForStatus(services, row.main_user_id);
-    const toRemove = ladderRoleIds.filter((id) => id !== wanted && alt.roles.cache.has(id));
-    for (const id of toRemove) {
-      await alt.roles.remove(id, "サブ垢: 本体の階級に合わせる").catch(() => undefined);
-    }
-    if (wanted && !alt.roles.cache.has(wanted)) {
-      await alt.roles.add(wanted, "サブ垢: 本体の階級に合わせる").catch(() => undefined);
-    }
-    if (toRemove.length > 0 || (wanted && !alt.roles.cache.has(wanted))) {
-      services.events.log("sub_account_rank_synced", {
+    if (!alt) continue; // 抜けている。記録は触らず人の判断に残す
+    const result = await reconcileAltRank(services, guild, alt, row.main_user_id);
+    if (!result.ok) {
+      // **合わせられていないものを「同期済み」にしない**
+      services.events.log("sub_account_rank_sync_failed", {
         actor: ACTOR,
         target: row.main_user_id,
-        payload: { id: row.id, altUserId: row.alt_user_id, wanted, removed: toRemove },
+        payload: {
+          id: row.id,
+          altUserId: row.alt_user_id,
+          wanted: result.wanted,
+          detail: describeRankSyncFailure(result),
+        },
       });
+      continue;
     }
+    if (!result.changed) continue;
+    services.events.log("sub_account_rank_synced", {
+      actor: ACTOR,
+      target: row.main_user_id,
+      payload: { id: row.id, altUserId: row.alt_user_id, wanted: result.wanted },
+    });
   }
 }
