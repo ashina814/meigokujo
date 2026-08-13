@@ -1327,17 +1327,37 @@ export function applyOriginalRoleItemSetting(db: Database.Database): void {
   ).run(Math.floor(Date.now() / 1000), itemId);
 }
 
+/**
+ * `shop:sub_account_item_id` が指す商品を「Botが自分で処理する商品」にする。
+ *
+ * **同時に魔人以上の要件を必ず固定する。** 旧商品#4は `require_role_id` が
+ * 作成時から未設定のまま売られ、迷霊のまま購入が成立した。運用ルールを人の記憶に
+ * 置いた結果なので、開業の手続きそのものに要件の設定を組み込む。
+ *
+ * `role:majin` が未設定なら**何もしない**（fail-closed）。要件を付けられないまま
+ * 自動化だけ進むと、同じ事故をもう一度起こす。
+ *
+ * なお資格判定の正本は `souls.status` の3段階判定（申請・承認・支払い直前）で、
+ * ここで入れる Discord ロール要件は**二重防御**。
+ */
 export function applySubAccountItemSetting(db: Database.Database): void {
   const row = db.prepare("SELECT value FROM settings WHERE key = 'shop:sub_account_item_id'").get() as
     | { value: string }
     | undefined;
   const itemId = Number(row?.value);
   if (!Number.isInteger(itemId) || itemId <= 0) return;
+  const majin = db.prepare("SELECT value FROM settings WHERE key = 'role:majin'").get() as
+    | { value: string }
+    | undefined;
+  const majinRoleId = majin?.value?.trim();
+  // **要件を付けられないなら自動化もしない**
+  if (!majinRoleId) return;
   db.prepare(
     `UPDATE shop_items
-        SET delivery = 'auto', delivery_kind = 'activate_sub_account', updated_at = ?
-      WHERE id = ? AND (delivery <> 'auto' OR delivery_kind IS NOT 'activate_sub_account')`,
-  ).run(Math.floor(Date.now() / 1000), itemId);
+        SET delivery = 'auto', delivery_kind = 'activate_sub_account', require_role_id = ?, updated_at = ?
+      WHERE id = ?
+        AND (delivery <> 'auto' OR delivery_kind IS NOT 'activate_sub_account' OR require_role_id IS NOT ?)`,
+  ).run(majinRoleId, Math.floor(Date.now() / 1000), itemId, majinRoleId);
 }
 
 export function applyNicknameItemSetting(db: Database.Database): void {

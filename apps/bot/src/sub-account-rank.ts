@@ -39,9 +39,22 @@ export function ladderRoleIds(services: Services): string[] {
     .filter((id): id is string => !!id);
 }
 
+/**
+ * 階級ロール設定のうち、値が入っていないもの。
+ *
+ * **1つでも欠けていたら階級を触らない。** 欠けたぶんは「そのロールを持っていない」
+ * ようにしか見えないので、設定漏れが「階級なしが正解」に化けて、既存の階級を
+ * 剥がしたうえで成功扱いになってしまう。
+ */
+export function missingLadderRoleKeys(services: Services): string[] {
+  return Object.values(RANK_ROLE_SETTING_KEYS).filter((key) => !services.settings.getString(key));
+}
+
 export type RankSyncResult =
-  /** 望む状態になっている（何もしなかった場合を含む） */
-  | { ok: true; changed: boolean; wanted: string | null }
+  /** 望む状態になっている（何もしなかった場合を含む）。`previous` は触る前の階級ロール */
+  | { ok: true; changed: boolean; wanted: string | null; previous: string[] }
+  /** 階級ロールの設定が欠けている。**Discord は一切変更していない** */
+  | { ok: false; reason: "config_missing"; wanted: null; missingKeys: string[] }
   /** 望む状態にできなかった。`extra` が残っているロール */
   | { ok: false; reason: "mismatch"; wanted: string | null; extra: string[]; missing: string | null }
   /** Discord から実状態を確認できなかった */
@@ -58,6 +71,9 @@ export async function reconcileAltRank(
   member: GuildMember,
   mainUserId: string,
 ): Promise<RankSyncResult> {
+  // **設定が揃っていなければ何も触らない。** 判定の前に確かめる
+  const missingKeys = missingLadderRoleKeys(services);
+  if (missingKeys.length > 0) return { ok: false, reason: "config_missing", wanted: null, missingKeys };
   const wanted = wantedRankRoleId(services, mainUserId);
   const ladder = ladderRoleIds(services);
   const before = ladder.filter((id) => member.roles.cache.has(id));
@@ -86,7 +102,7 @@ export async function reconcileAltRank(
   if (extra.length > 0 || missing !== null) {
     return { ok: false, reason: "mismatch", wanted, extra, missing };
   }
-  return { ok: true, changed: toRemove.length > 0 || needsAdd, wanted };
+  return { ok: true, changed: toRemove.length > 0 || needsAdd, wanted, previous: before };
 }
 
 /**
@@ -101,9 +117,41 @@ async function freshLadderRoles(guild: Guild, userId: string, ladder: readonly s
 
 /** 記録に残す用の説明。運営が読んで次の手が分かる粒度にする */
 export function describeRankSyncFailure(result: Extract<RankSyncResult, { ok: false }>): string {
+  if (result.reason === "config_missing") {
+    return `階級ロールの設定が足りません（${result.missingKeys.join(", ")}）。Discordは変更していません`;
+  }
   if (result.reason === "unverifiable") return "Discordから実状態を確認できませんでした";
   const parts: string[] = [];
   if (result.extra.length > 0) parts.push(`余分な階級ロールが残っています: ${result.extra.join(", ")}`);
   if (result.missing) parts.push(`付けられませんでした: ${result.missing}`);
   return parts.join(" / ");
+}
+
+/**
+ * 階級ロールを**処理を始める前の状態へ戻す**。
+ *
+ * 契約が成立しないなら、こちらが正規化した副作用も残さない。返金だけして
+ * 「勝手に階級を剥がされた」を残さないため、剥がしたものは戻し、足したものは外す。
+ *
+ * @returns 戻せたら `true`、戻せなければ `false`、実状態を確認できなければ `null`
+ */
+export async function restoreAltRank(
+  services: Services,
+  guild: Guild,
+  member: GuildMember,
+  previous: readonly string[],
+): Promise<boolean | null> {
+  const ladder = ladderRoleIds(services);
+  const want = new Set(previous);
+  for (const id of ladder) {
+    const has = member.roles.cache.has(id);
+    if (want.has(id) && !has) {
+      await member.roles.add(id, "サブ垢: 契約が成立しなかったため元に戻す").catch(() => undefined);
+    } else if (!want.has(id) && has) {
+      await member.roles.remove(id, "サブ垢: 契約が成立しなかったため元に戻す").catch(() => undefined);
+    }
+  }
+  const fresh = await freshLadderRoles(guild, member.id, ladder);
+  if (fresh === null) return null;
+  return fresh.length === want.size && fresh.every((id) => want.has(id));
 }

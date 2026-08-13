@@ -9,7 +9,7 @@ import {
 } from "@meigokujo/core";
 import { refreshEvalStatsForUser } from "./eval-daily.js";
 import { withUserLock } from "./user-lock.js";
-import { reconcileAltRank } from "./sub-account-rank.js";
+import { reconcileAltRank, restoreAltRank } from "./sub-account-rank.js";
 import type { Services } from "./services.js";
 
 /**
@@ -407,7 +407,7 @@ export async function deliverPurchaseUnlocked(
           "サブ垢の階級を本体に合わせられなかったため有効化できませんでした。",
         );
       }
-      const roleId = synced.wanted!;
+      const previousRanks = synced.previous;
 
       if (!services.subAccounts.activate({ id: application.id, purchaseId: purchase.id, actor })) {
         const settled = services.subAccounts.get(application.id);
@@ -416,15 +416,11 @@ export async function deliverPurchaseUnlocked(
           services.shop.markDeliverySucceeded(purchase.id, actor);
           return { state: "delivered", message: `サブ垢 <@${application.alt_user_id}> を有効化しました。` };
         }
-        // **返金の前に、今つけたロールを戻す。** 外せたか確認できないなら返金しない
-        const removed = await alt.roles
-          .remove(roleId, "公式ショップ: 有効化できなかったため取り消し")
-          .then(() => true)
-          .catch(() => false);
-        const stillHeld = removed
-          ? await memberHasRole(guild, application.alt_user_id, roleId)
-          : await memberHasRoleStrict(guild, application.alt_user_id, roleId);
-        if (stillHeld !== false) {
+        // **返金の前に、階級ロールを処理開始前の状態へ戻す。**
+        // 正規化で剥がしたものは戻し、足したものは外す。今回付けていない
+        // 元からのロールを巻き添えで剥がさない
+        const restored = await restoreAltRank(services, guild, alt, previousRanks);
+        if (restored !== true) {
           return fail(
             "sub_account_conflict_rollback_failed",
             "サブ垢の有効化に失敗しました。運営が確認しますので、そのままお待ちください。",

@@ -49,6 +49,8 @@ function setup(mainStatus: "majin" | "meirei" | "ghost" = "majin") {
   settings.set("shop:sub_account_item_id", String(item.id), "staff");
   settings.set("role:majin", MAJIN_ROLE, "staff");
   settings.set("role:ghost", "role-ghost", "staff");
+  settings.set("role:kenma", "role-kenma", "staff");
+  settings.set("role:mazoku", "role-mazoku", "staff");
   settings.set("role:meirei", "role-meirei", "staff");
   // 本体の階級は台帳が正本。Discordのロールは見ない
   const ts = Math.floor(Date.now() / 1000);
@@ -634,6 +636,148 @@ describe("止まった商品からは申請させない", () => {
 
     expect(p.showModal).not.toHaveBeenCalled();
     expect(ctx.subAccounts.listByMain(MAIN)).toHaveLength(0);
+    ctx.db.close();
+  });
+});
+
+describe("階級ロール設定の欠損", () => {
+  const MAZOKU_ROLE = "role-mazoku";
+  const clientOf = (w: ReturnType<typeof world>) => ({ guilds: { fetch: vi.fn(async () => w.guild) } }) as never;
+  const failEvents = (ctx: Ctx) =>
+    ctx.db.prepare("SELECT payload_json p FROM events WHERE type='sub_account_rank_sync_failed'").all() as Array<{
+      p: string;
+    }>;
+
+  /** 4つの階級ロールを全部入れた状態を作る（既定では kenma / mazoku が未設定） */
+  function fullConfig(ctx: Ctx) {
+    ctx.settings.set("role:kenma", "role-kenma", "staff");
+    ctx.settings.set("role:mazoku", MAZOKU_ROLE, "staff");
+  }
+
+  it("**設定が欠けていたら、何も remove/add せず失敗として残す**", async () => {
+    const { syncSubAccountRanks } = await import("../src/sub-account-jobs.js");
+    const ctx = setup(); // main = 魔人
+    fullConfig(ctx);
+    ctx.settings.set("role:majin", "", "staff"); // 魔人ロールの設定だけ消える
+    ctx.subAccounts.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" });
+    const w = world();
+
+    await syncSubAccountRanks(clientOf(w), ctx.services);
+
+    expect(w.alt.roles.remove).not.toHaveBeenCalled();
+    expect(w.alt.roles.add).not.toHaveBeenCalled();
+    expect(failEvents(ctx)).toHaveLength(1);
+    expect(failEvents(ctx)[0]!.p).toContain("role:majin");
+    ctx.db.close();
+  });
+
+  it("**設定欠損で既存の階級を剥がさない**（設定漏れを「階級なし」と読まない）", async () => {
+    const { syncSubAccountRanks } = await import("../src/sub-account-jobs.js");
+    const ctx = setup();
+    fullConfig(ctx);
+    ctx.settings.set("role:kenma", "", "staff"); // 別の階級の設定が欠けているだけ
+    ctx.subAccounts.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" });
+    const w = world();
+    w.alt.roles.cache.set(MAJIN_ROLE, true);
+    w.altRoles.push(MAJIN_ROLE);
+
+    await syncSubAccountRanks(clientOf(w), ctx.services);
+
+    expect(w.altRoles).toEqual([MAJIN_ROLE]); // 剥がされていない
+    expect(w.alt.roles.remove).not.toHaveBeenCalled();
+    expect(failEvents(ctx)).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("初回有効化でも、設定が欠けていれば active にせず返金する", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fullConfig(ctx);
+    ctx.settings.set("role:mazoku", "", "staff");
+    const row = approved(ctx);
+    const w = world();
+
+    await handleShopButton(press(payId(ctx, row.id), w), ctx.services);
+
+    expect(w.alt.roles.add).not.toHaveBeenCalled();
+    expect(ctx.subAccounts.get(row.id)!.status).toBe("approved");
+    expect(balance(ctx)).toBe(1_000_000); // 返金済み
+    ctx.db.close();
+  });
+});
+
+describe("有効化に失敗したら階級ロールも元へ戻す", () => {
+  const MAZOKU_ROLE = "role-mazoku";
+
+  function conflictOnActivate(ctx: Ctx, rowId: number) {
+    // 正規化のあと、契約を始める直前に別経路がさらっていった状況
+    vi.spyOn(ctx.subAccounts, "activate").mockImplementationOnce(() => {
+      ctx.db.prepare("UPDATE sub_accounts SET status='cancelled' WHERE id=?").run(rowId);
+      return false;
+    });
+  }
+
+  it("**正規化で剥がした元の階級を戻す**（返金したうえで元の魔族に復帰）", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup(); // main = 魔人
+    ctx.settings.set("role:kenma", "role-kenma", "staff");
+    ctx.settings.set("role:mazoku", MAZOKU_ROLE, "staff");
+    const row = approved(ctx);
+    const w = world();
+    w.alt.roles.cache.set(MAZOKU_ROLE, true);
+    w.altRoles.push(MAZOKU_ROLE);
+    conflictOnActivate(ctx, row.id);
+
+    await handleShopButton(press(payId(ctx, row.id), w), ctx.services);
+
+    expect(w.altRoles).toEqual([MAZOKU_ROLE]); // 開始前の状態へ戻っている
+    expect(balance(ctx)).toBe(1_000_000); // 返金済み
+    vi.restoreAllMocks();
+    ctx.db.close();
+  });
+
+  it("**元から持っていた wanted role は剥がさない**", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    ctx.settings.set("role:kenma", "role-kenma", "staff");
+    ctx.settings.set("role:mazoku", MAZOKU_ROLE, "staff");
+    const row = approved(ctx);
+    const w = world();
+    // 最初から魔人を持っている（今回のBotが付けたものではない）
+    w.alt.roles.cache.set(MAJIN_ROLE, true);
+    w.altRoles.push(MAJIN_ROLE);
+    conflictOnActivate(ctx, row.id);
+
+    await handleShopButton(press(payId(ctx, row.id), w), ctx.services);
+
+    expect(w.altRoles).toEqual([MAJIN_ROLE]); // 巻き添えで剥がさない
+    expect(balance(ctx)).toBe(1_000_000);
+    vi.restoreAllMocks();
+    ctx.db.close();
+  });
+
+  it("戻せたか確認できないときは自動返金しない（処理失敗として人へ）", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    ctx.settings.set("role:kenma", "role-kenma", "staff");
+    ctx.settings.set("role:mazoku", MAZOKU_ROLE, "staff");
+    const row = approved(ctx);
+    const w = world();
+    w.alt.roles.cache.set(MAZOKU_ROLE, true);
+    w.altRoles.push(MAZOKU_ROLE);
+    conflictOnActivate(ctx, row.id);
+    // 正規化までは通し、巻き戻しの確認だけ落とす
+    let calls = 0;
+    w.guild.members.fetch = vi.fn(async (arg?: unknown) => {
+      if (typeof arg === "object" && arg !== null && ++calls > 2) throw new Error("Service Unavailable");
+      return w.alt;
+    }) as never;
+
+    await handleShopButton(press(payId(ctx, row.id), w), ctx.services);
+
+    expect(balance(ctx)).toBe(1_000_000 - PRICE); // **返金していない**
+    expect(ctx.shop.listUserPurchases(MAIN).filter((p) => p.status === "active")).toHaveLength(1);
+    vi.restoreAllMocks();
     ctx.db.close();
   });
 });

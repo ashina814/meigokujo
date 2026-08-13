@@ -11,6 +11,7 @@ import {
   SubAccountError,
   SubAccounts,
   TREASURY,
+  applySubAccountItemSetting,
   isEligibleMainRank,
   openDb,
   registerDefaultTxTypes,
@@ -312,5 +313,69 @@ describe("既存DB（sub_accounts が無い）からの移行", () => {
     const subs = new SubAccounts(db, new EventLog(db));
     expect(subs.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" }).status).toBe("active");
     db.close();
+  });
+});
+
+/**
+ * 旧事故は「商品#4の要件設定漏れ」だった。運用ルールを人の記憶に置かず、
+ * 開業の手続きそのものに要件の設定を組み込む。
+ */
+describe("開業時に魔人要件を固定する", () => {
+  function shopDb() {
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    const settings = new Settings(db);
+    const shop = new Shop(db, ledger, new EventLog(db));
+    const item = shop.createItem({ name: "サブ垢追加", price_land: 80_000, kind: "one_shot", delivery: "manual" }, "staff");
+    return { db, settings, shop, item };
+  }
+
+  it("**開業すると require_role_id に魔人ロールが入る**", () => {
+    const ctx = shopDb();
+    ctx.settings.set("role:majin", "role-majin", "staff");
+    ctx.settings.set("shop:sub_account_item_id", String(ctx.item.id), "staff");
+
+    applySubAccountItemSetting(ctx.db);
+
+    const after = ctx.shop.getItem(ctx.item.id)!;
+    expect(after.require_role_id).toBe("role-majin");
+    expect(after.delivery).toBe("auto");
+    expect(after.delivery_kind).toBe("activate_sub_account");
+    ctx.db.close();
+  });
+
+  it("**`role:majin` が未設定なら何もしない**（要件を付けられないまま自動化しない）", () => {
+    const ctx = shopDb();
+    ctx.settings.set("shop:sub_account_item_id", String(ctx.item.id), "staff");
+
+    applySubAccountItemSetting(ctx.db);
+
+    const after = ctx.shop.getItem(ctx.item.id)!;
+    expect(after.require_role_id).toBeNull();
+    expect(after.delivery).toBe("manual"); // 自動化も進めない
+    ctx.db.close();
+  });
+
+  it("商品IDが未設定なら何も触らない", () => {
+    const ctx = shopDb();
+    ctx.settings.set("role:majin", "role-majin", "staff");
+
+    applySubAccountItemSetting(ctx.db);
+
+    expect(ctx.shop.getItem(ctx.item.id)!.delivery).toBe("manual");
+    ctx.db.close();
+  });
+
+  it("要件が後から消されても、起動のたびに入れ直す", () => {
+    const ctx = shopDb();
+    ctx.settings.set("role:majin", "role-majin", "staff");
+    ctx.settings.set("shop:sub_account_item_id", String(ctx.item.id), "staff");
+    applySubAccountItemSetting(ctx.db);
+    ctx.db.prepare("UPDATE shop_items SET require_role_id=NULL WHERE id=?").run(ctx.item.id);
+
+    applySubAccountItemSetting(ctx.db);
+
+    expect(ctx.shop.getItem(ctx.item.id)!.require_role_id).toBe("role-majin");
+    ctx.db.close();
   });
 });
