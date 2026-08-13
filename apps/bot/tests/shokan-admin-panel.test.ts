@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { Collection } from "discord.js";
-import { Departments, EventLog, Ledger, Settings, Shop, openDb, registerDefaultTxTypes } from "@meigokujo/core";
+import { Departments, EventLog, Ledger, OriginalRoles, Settings, Shop, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 
 /**
@@ -56,7 +56,8 @@ function setup() {
     approvedBy: "t",
     idempotencyKey: "seed",
   });
-  const services = { db, ledger, settings, events, shop, departments } as unknown as Services;
+  const originalRoles = new OriginalRoles(db, ledger, events);
+  const services = { db, ledger, settings, events, shop, originalRoles, departments } as unknown as Services;
   return { db, ledger, settings, events, shop, departments, nickname, reeval, pass, services };
 }
 
@@ -114,7 +115,7 @@ describe("常設パネルの表示", () => {
     const panel = shopAdminPanelMessage(ctx.services) as ReturnType<typeof payloadOf>;
 
     expect(panel.embeds[0]!.data.description).toContain("要対応 1件");
-    expect(idsOf(panel)).toEqual(["shokan:pending", "shokan:failed", "shokan:list", "shokan:history:0"]);
+    expect(idsOf(panel)).toEqual(["shokan:pending", "shokan:failed", "shokan:list", "shokan:orole", "shokan:history:0"]);
     ctx.db.close();
   });
 

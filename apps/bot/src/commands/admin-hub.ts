@@ -49,6 +49,12 @@ import {
   roleRestorePicker,
   undeliveredPicker,
 } from "./recovery-hub.js";
+import {
+  handleImportRole,
+  handleImportRun,
+  handleImportUser,
+  importHome,
+} from "./original-role-import.js";
 import { isAdmin } from "../permissions.js";
 import { registerTrustedRankedProfile } from "./casino-employee.js";
 import { ROLE_SLOT_META, ROLE_SLOT_ORDER, getRoleIds, setRoleIds, type RoleSlot } from "../church-roles.js";
@@ -184,6 +190,9 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
   if (section === "recover" && action === "names")
     return void (await interaction.update(legacyNameImportConfirm(await previewLegacyImport(interaction.guild!, services))));
   if (section === "recover" && action === "names-run") return void (await handleLegacyNameImportRun(interaction, services));
+  // 旧オリジナルロールの引き継ぎ。**購入履歴からロールを推測しない**ので、人が3段で確定させる
+  if (section === "recover" && action === "orole-import") return void (await interaction.update(importHome(services)));
+  if (section === "recover" && action === "orole-import-run") return void (await handleImportRun(interaction, services));
   if (section === "setting" && action === "role-select") return void (await openRoleSetup(interaction, services));
   if (section === "setting" && action === "number-select") return void (await openNumberSetup(interaction, services));
   if (section === "setting" && action === "eval-cap") return void (await interaction.update(evaluationCapHome(services)));
@@ -501,6 +510,12 @@ export async function handleAdminSelect(
   // ── 特別プロフィール ──
   if (section === "recover" && action === "redeliver" && interaction.isStringSelectMenu()) {
     return void (await handleRedeliver(interaction, services));
+  }
+  if (section === "recover" && action === "orole-import-user" && interaction.isUserSelectMenu()) {
+    return void (await handleImportUser(interaction, services));
+  }
+  if (section === "recover" && action === "orole-import-role" && interaction.isRoleSelectMenu()) {
+    return void (await handleImportRole(interaction, services));
   }
   if (section === "recover" && action === "role-target" && interaction.isUserSelectMenu()) {
     return void (await handleRoleRestore(interaction, services));

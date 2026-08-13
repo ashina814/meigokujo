@@ -11,6 +11,7 @@ import { updateWaitersBoard } from "./waiters-board.js";
 import { tickVoiceXp } from "./rank-tracker.js";
 import { fmtLd } from "./format.js";
 import { entryOpsChannelId } from "./entry-channels.js";
+import { cancelUnpaidOriginalRoles, expireOriginalRoles, notifyExpiringOriginalRoles } from "./original-role-jobs.js";
 import { announceAutoClose, announceSettle, refreshMarketPanel } from "./commands/ita.js";
 import { ticketStaffRoleIds } from "./commands/tickets.js";
 import { isSeatOccupied } from "./casino/common.js";
@@ -27,6 +28,7 @@ import {
 } from "./scheduler-utils.js";
 import {
   convergePendingNicknameChanges,
+  convergePendingOriginalRoles,
   expireOverduePurchases,
   processShopRoleRevocations,
   recoverAutoDropNoEvalGhosts,
@@ -392,6 +394,17 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       console.error("[ショップ] 期限予告失敗:", e);
     }
 
+    // ── オリジナルロールの期限まわり ──
+    // 期限予告・期限切れの剥奪・未払い申請の取り消し。通知は知らせるだけで、
+    // 業務の正本は original_roles の状態
+    try {
+      await notifyExpiringOriginalRoles(client, services);
+      await expireOriginalRoles(client, services);
+      await cancelUnpaidOriginalRoles(client, services);
+    } catch (e) {
+      console.error("[オリジナルロール] 期限処理失敗:", e);
+    }
+
     // ── 名前変更の未完了を収束させる ──
     // 課金後にBotが落ちると「払ったのに変わっていない」が残る。既に希望どおりなら
     // 完了に、まだなら変更をやり直し、それも駄目なら返金する。返金まで失敗したものだけ
@@ -400,6 +413,14 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       await convergePendingNicknameChanges(client, services);
     } catch (e) {
       console.error("[ショップ] 名前変更の収束失敗:", e);
+    }
+
+    // ── オリジナルロール作成の未完了を収束させる ──
+    // 同じ理由（課金とDiscord側の副作用の間にクラッシュ窓がある）。作りきるか、返金する
+    try {
+      await convergePendingOriginalRoles(client, services);
+    } catch (e) {
+      console.error("[ショップ] オリジナルロール作成の収束失敗:", e);
     }
 
     // 失効購入のロール剥奪は失効処理と分離し、購入ID単位で毎分自己修復する。

@@ -69,6 +69,8 @@ export const SETTING_DEFAULTS = {
    * OFFの間も名前の設定・登録そのものは動く（先に決めてもらって構わない）。
    */
   entry_require_name: 0,
+  /** オリジナルロールの更新料。旧商品#2の価格を引き継ぐが、参照はしない（別設定として持つ） */
+  original_role_renew_price: 250_000,
 } as const;
 
 export type SettingKey = keyof typeof SETTING_DEFAULTS;

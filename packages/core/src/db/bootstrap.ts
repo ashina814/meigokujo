@@ -769,6 +769,60 @@ CREATE INDEX IF NOT EXISTS idx_member_names_key ON member_names(name_key);
 
 -- 不適切名の語彙。**コードに焼き込まない**（語を足すたびに deploy したくない）。
 -- 判定は正規化済みの鍵に対する部分一致だけ。正規表現は今は持たない
+-- ============================================================
+-- オリジナルロール（申請 → 承認 → 支払い → 作成・付与 → 30日契約）
+-- ============================================================
+--
+-- **支払いは承認のあとだけ。** 申請の時点では Land を一切動かさない。
+-- 1人で複数持てるので、行は「1契約 = 1行」。誰のどのロールかは**この表だけ**が
+-- 正本で、旧商品の購入履歴からは推測しない（対応の記録がそもそも無い）。
+CREATE TABLE IF NOT EXISTS original_roles (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id       TEXT NOT NULL,
+  -- 作成後に入る。承認前・支払い前は NULL
+  role_id       TEXT,
+  name          TEXT NOT NULL,
+  color         INTEGER,
+  -- pending   … 申請中（運営待ち）
+  -- approved  … 承認済み・支払い待ち（放置されたら期限で cancelled へ）
+  -- active    … 支払い済み・ロール作成/付与済み・契約中
+  -- expired   … 期限切れ（ロールは剥奪する）
+  -- returned  … 差し戻し（直して申請し直せる）
+  -- rejected  … 却下
+  -- cancelled … 承認後に支払われないまま期限が来た
+  status        TEXT NOT NULL CHECK (status IN ('pending','approved','active','expired','returned','rejected','cancelled')),
+  expires_at    INTEGER,
+  approved_by   TEXT,
+  approved_at   INTEGER,
+  decided_by    TEXT,
+  decided_at    INTEGER,
+  decide_reason TEXT,
+  -- 新規作成の課金。更新は購入行を作らない（課金と期限延長が同じ取引で閉じるため）
+  purchase_id   INTEGER,
+  -- 期限予告を出した時刻。**通知は業務の正本にしない**が、二重に出さないために持つ
+  notified_expiry_at INTEGER,
+  -- ロールを剥奪できた時刻。剥奪に失敗しても巡回で拾い直す
+  role_removed_at    INTEGER,
+  -- Discord へロールを作りにいった時刻。**作成と記録の間にクラッシュ窓がある**ので、
+  -- 「作りかけた」ことだけ先に残す。再試行はこれを見て、同じロールを2個作らずに拾い直す
+  role_creation_started_at INTEGER,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+-- 更新の確認画面ごとに1回だけ課金する。**確認IDを永続的に消費する**ので、
+-- 同じ確認画面を何度押しても2回目以降は何も動かない
+CREATE TABLE IF NOT EXISTS original_role_renewals (
+  operation_id     TEXT PRIMARY KEY,
+  original_role_id INTEGER NOT NULL,
+  user_id          TEXT NOT NULL,
+  price            INTEGER NOT NULL,
+  created_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_original_roles_user ON original_roles(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_original_roles_status ON original_roles(status, expires_at);
+-- 同じロールを2つの契約に結び付けない（引き継ぎ登録の二重実行を止める）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_original_roles_role ON original_roles(role_id) WHERE role_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS nickname_denylist (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   pattern    TEXT NOT NULL UNIQUE,
@@ -806,6 +860,9 @@ export function openDb(path: string): Database.Database {
   );
   ensureColumn(db, "shop_purchases", "request_json", "TEXT");
   applyNicknameItemSetting(db);
+  // 既に original_roles がある本番へ後から足す
+  ensureColumn(db, "original_roles", "role_creation_started_at", "INTEGER");
+  applyOriginalRoleItemSetting(db);
   ensureColumn(db, "casino_tx", "op_key", "TEXT");
   ensureColumn(db, "casino_tx", "op_actor_id", "TEXT");
   backfillChipTxOperationKey(db);
@@ -1224,6 +1281,24 @@ function migrateMonthlyToThirtyDayTerms(db: Database.Database): void {
  * 商品は切り替わらず、**Botの再起動（deploy で自動）で反映**される。
  * 起動を待たずに反映したい場合は、設定を書いたあとにこの関数を直接呼ぶ。
  */
+/**
+ * オリジナルロールの新規作成を、Botが自分で処理する商品にする（運営が有効化したときだけ）。
+ * `shop:original_role_item_id` が指す商品だけを切り替える。**設定が無ければ何もしない。**
+ * 反映は `openDb()` の中＝起動時（deploy で自動）。
+ */
+export function applyOriginalRoleItemSetting(db: Database.Database): void {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'shop:original_role_item_id'").get() as
+    | { value: string }
+    | undefined;
+  const itemId = Number(row?.value);
+  if (!Number.isInteger(itemId) || itemId <= 0) return;
+  db.prepare(
+    `UPDATE shop_items
+        SET delivery = 'auto', delivery_kind = 'create_original_role', updated_at = ?
+      WHERE id = ? AND (delivery <> 'auto' OR delivery_kind IS NOT 'create_original_role')`,
+  ).run(Math.floor(Date.now() / 1000), itemId);
+}
+
 export function applyNicknameItemSetting(db: Database.Database): void {
   const row = db.prepare("SELECT value FROM settings WHERE key = 'shop:nickname_item_id'").get() as
     | { value: string }

@@ -490,3 +490,31 @@ export async function processShopRoleRevocations(client: Client, services: Servi
     shopRoleRevocationInFlight = false;
   }
 }
+
+/**
+ * 課金済みなのに始まっていないオリジナルロールを収束させる。
+ *
+ * 名前変更と同じ形。**課金 → Discordロール作成 → 契約開始** の途中で落ちると、
+ * 利用者は払っただけになる。ここで毎分、作れるなら作りきり、作れないなら返す。
+ * 作りかけのロールを見失わない仕組みは `resolveOriginalRole`（配送側）が持つ。
+ */
+export async function convergePendingOriginalRoles(client: Client, services: Services): Promise<void> {
+  // 絞り込みは limit より先に効かせる（他種別の失敗で埋まると収束が止まる）
+  const targets = services.shop.listUndeliveredAuto(20, { kinds: ["create_original_role"] });
+  if (targets.length === 0) return;
+  const { deliverOrRefund } = await import("./shop-refund.js");
+  const guildId = services.settings.getString("guild:main");
+  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
+  for (const purchase of targets) {
+    const { refund } = await deliverOrRefund(client, services, guild, purchase, "system:shop-original-role");
+    if (refund !== "refunded") continue;
+    try {
+      const user = await client.users.fetch(purchase.user_id).catch(() => null);
+      await user?.send(
+        `🛒 オリジナルロールを作成できなかったため、**${(purchase.paid_land ?? 0).toLocaleString()} Ld** を返金しました。`,
+      );
+    } catch {
+      /* DMが閉じている。返金は済んでいるので、ここで止めない */
+    }
+  }
+}

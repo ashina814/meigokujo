@@ -25,7 +25,18 @@ import {
 } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { deliverPurchase, nicknameBlockReason } from "../shop-delivery.js";
-import { deliverOrRefund } from "../shop-refund.js";
+import { deliverOrRefund, type Settlement } from "../shop-refund.js";
+import { withUserLock } from "../user-lock.js";
+import {
+  applyModal,
+  handleApplyModal,
+  handleRenewConfirm,
+  isOriginalRoleItem,
+  originalRoleActions,
+  payRequote,
+  renewConfirm,
+  renewPicker,
+} from "./original-role.js";
 import { meetsRoleRequirement, requirementLabel } from "../rank-requirement.js";
 import { refreshShopAdminPanels } from "./shokan.js";
 import type { Services } from "../services.js";
@@ -403,6 +414,9 @@ function purchaseOnce(
       memberRoleIds: input.memberRoleIds,
       payAlt: input.mode === "alt",
       request: input.request,
+      // **操作ごとに違う鍵で課金する。** 既定の鍵は秒までしか分けないので、
+      // 返金後のやり直しが同じ秒に入ると Land が動かないまま購入行だけができる
+      idempotencyKey: `shop:purchase:op:${input.operationId}`,
     });
     services.db.prepare(
       `UPDATE shop_purchase_operations
@@ -571,6 +585,123 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     return;
   }
 
+
+  // ── オリジナルロール ──
+  if (action === "orole-apply") {
+    const item = services.shop.getItem(Number(parts[2]));
+    if (!item || !item.enabled || !isOriginalRoleItem(services, item)) {
+      await interaction.reply({ content: "この商品はいま申請できません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.showModal(applyModal(item.id));
+    return;
+  }
+
+  if (action === "orole-pay") {
+    const itemId = Number(parts[2]);
+    const applicationId = Number(parts[3]);
+    // 表示した額。**押した時の最新価格ではなく、これで引く**
+    const quotedPrice = Number(parts[4]);
+    // 支払い画面ごとの鍵。**同じ画面の二度押しは1回**、開き直せば新しい挑戦になる
+    const attempt = parts[5] ?? "";
+    const item = services.shop.getItem(itemId);
+    if (!item || !item.enabled || !isOriginalRoleItem(services, item) || item.price_land === null) {
+      await interaction.update({ content: "この商品はいま購入できません。", embeds: [], components: [] });
+      return;
+    }
+    if (quotedPrice !== item.price_land) {
+      // **1 Ld も動かさずに**、新しい額で確かめ直してもらう（新しい鍵を配る）
+      const application = services.originalRoles.get(applicationId);
+      await interaction.update(payRequote(item, applicationId, application?.name ?? ""));
+      return;
+    }
+    await interaction.deferUpdate();
+    // **同じ申請の支払いを直列化する。** 2本同時に押されても、2本目は
+    // 1本目が作った購入を見つけて課金しない
+    interface Attempt {
+      error?: string;
+      purchase?: PurchaseRow;
+      settled?: Settlement;
+    }
+    const settlement = await withUserLock<Attempt>(`orole-pay:${applicationId}`, async () => {
+      // 返金されていない購入が既にあるなら、それを進めるだけ（二重課金しない）。
+      // 返金済みは「まだ払っていない」ので、ここには出てこない＝再挑戦できる
+      const open = services.shop.findActivePurchaseByRequest(
+        interaction.user.id,
+        itemId,
+        "applicationId",
+        applicationId,
+      );
+      if (open) {
+        return {
+          purchase: open,
+          settled: await deliverOrRefund(interaction.client, services, interaction.guild, open, `user:${interaction.user.id}`),
+        };
+      }
+      try {
+        services.originalRoles.assertPayable(applicationId, interaction.user.id);
+      } catch {
+          return { error: "⚠️ この申請はいま支払える状態ではありません（取り消されたか、既に支払い済みです）。" } as Attempt;
+      }
+      let purchase: PurchaseOutcome;
+      try {
+        // 課金・購入行・どの申請かを1トランザクションで確定する
+        purchase = purchaseOnce(services, {
+          operationId: `orole:${applicationId}:${attempt}`,
+          itemId,
+          userId: interaction.user.id,
+          actor: `user:${interaction.user.id}`,
+          memberRoleIds: [...((interaction.member as GuildMember | null)?.roles.cache.keys() ?? [])],
+          mode: "land",
+          request: { applicationId },
+        });
+      } catch (error) {
+        return { error: `❌ ${purchaseErrorMessage(error, services)}` } as Attempt;
+      }
+      return {
+        purchase: purchase.purchase,
+        settled: await deliverOrRefund(
+          interaction.client,
+          services,
+          interaction.guild,
+          purchase.purchase,
+          `user:${interaction.user.id}`,
+        ),
+      };
+    });
+    if (settlement.error !== undefined) {
+      await interaction.editReply({ content: settlement.error, embeds: [], components: [] });
+      return;
+    }
+    const paid = settlement.purchase!;
+    const { outcome, refund } = settlement.settled!;
+    if (outcome.state !== "failed") {
+      await interaction.editReply({ content: `✅ ${outcome.message}`, embeds: [], components: [] });
+      return;
+    }
+    await interaction.editReply({
+      content:
+        refund === "refunded"
+          ? `作成できなかったため、${fmtLd(paid.paid_land ?? 0)}は返金しました。
+-# ${outcome.message}`
+          : `⚠️ 作成に失敗し、返金も完了できませんでした。運営が対応します（購入 #${paid.id}）。
+-# ${outcome.message}`,
+      embeds: [],
+      components: [],
+    });
+    return;
+  }
+
+  if (action === "orole-renew") {
+    const itemId = Number(parts[2]);
+    await interaction.update({ ...renewPicker(services, itemId, interaction.user.id), content: "" });
+    return;
+  }
+
+  if (action === "orole-renew-do") {
+    await handleRenewConfirm(interaction, services, Number(parts[3]), Number(parts[4]), parts[5] ?? "");
+    return;
+  }
 
   // ── 名前変更（セルフサービス）──
   // 押す → 入力 → 金額と内容を確認 → 変更する、で終わり。
@@ -889,6 +1020,16 @@ export async function handleShopSelect(
   services: Services,
 ): Promise<void> {
   const action = interaction.customId.split(":")[1];
+  if (action === "orole-renew-pick") {
+    const row = services.originalRoles.get(Number(interaction.values[0]));
+    if (!row || row.user_id !== interaction.user.id) {
+      await interaction.update({ content: "その契約が見つかりません。", embeds: [], components: [] });
+      return;
+    }
+    // 確認画面ごとに1つの鍵を配る（この操作IDを core が消費して二重課金を止める）
+    await interaction.update(renewConfirm(services, Number(interaction.customId.split(":")[2]), row, interaction.id));
+    return;
+  }
   if (action === "pick") {
     const itemId = Number(interaction.values[0]);
     const item = services.shop.getItem(itemId);
@@ -909,6 +1050,14 @@ export async function handleShopSelect(
       requirementLabel(services.settings, item.require_role_id),
       contractView(services, interaction.user.id, item),
     );
+    // オリジナルロールは「買う」ではなく「申請 → 承認 → 支払い」。
+    // いま本人が何をすればいいかだけを出す
+    if (isOriginalRoleItem(services, item)) {
+      const actions = originalRoleActions(services, item, interaction.user.id);
+      view.embeds[0]?.addFields({ name: "手続き", value: actions.notes.join(String.fromCharCode(10)).slice(0, 1024) });
+      await interaction.reply({ embeds: view.embeds, components: actions.components, flags: MessageFlags.Ephemeral });
+      return;
+    }
     await interaction.reply({ ...view, flags: MessageFlags.Ephemeral });
     return;
   }
@@ -968,6 +1117,10 @@ async function notifyStaffForDelivery(
 /** 名前変更の入力を受け取り、金額と変更内容を確認する */
 export async function handleShopModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
   const parts = interaction.customId.split(":");
+  if (parts[1] === "orole-input") {
+    await handleApplyModal(interaction, services, Number(parts[2]));
+    return;
+  }
   if (parts[1] !== "nick-input") return;
   const itemId = Number(parts[2]);
   const item = services.shop.getItem(itemId);

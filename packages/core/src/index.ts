@@ -1,4 +1,4 @@
-export { openDb, applyNicknameItemSetting } from "./db/bootstrap.js";
+export { openDb, applyNicknameItemSetting, applyOriginalRoleItemSetting } from "./db/bootstrap.js";
 export { LedgerError, type LedgerErrorCode } from "./ledger/errors.js";
 export {
   registerTxType,
@@ -33,6 +33,16 @@ export {
 export { parseBalanceDump, splitForMigration, type DumpEntry, type ParsedDump, type MigrationSplit } from "./migration/parse.js";
 export { Migration, MigrationError, type MigrationErrorCode, type StagingRow, type StagingStatus, type MemberNameInfo, type ImportSummary, type MigrationReport } from "./migration/service.js";
 export { EventLog, type EventRow } from "./events/service.js";
+export {
+  OriginalRoles,
+  OriginalRoleError,
+  ORIGINAL_ROLE_NOTICE_DAYS,
+  ORIGINAL_ROLE_PAYMENT_GRACE_DAYS,
+  ORIGINAL_ROLE_TERM_DAYS,
+  type OriginalRoleErrorCode,
+  type OriginalRoleRow,
+  type OriginalRoleStatus,
+} from "./original-role/service.js";
 export {
   NICKNAME_MAX_LENGTH,
   NICKNAME_POLICY_VERSION,

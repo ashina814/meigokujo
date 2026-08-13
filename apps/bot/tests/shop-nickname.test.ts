@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { Collection } from "discord.js";
-import { EventLog, Ledger, Nicknames, Settings, Shop, openDb, registerDefaultTxTypes } from "@meigokujo/core";
+import { EventLog, Ledger, Nicknames, OriginalRoles, Settings, Shop, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 
 /**
@@ -48,7 +48,8 @@ function setup() {
     idempotencyKey: "seed",
   });
   const nicknames = new Nicknames(db, events);
-  const services = { db, ledger, settings, events, shop, nicknames } as unknown as Services;
+  const originalRoles = new OriginalRoles(db, ledger, events);
+  const services = { db, ledger, settings, events, shop, originalRoles, nicknames } as unknown as Services;
   return { db, ledger, settings, events, shop, nicknames, item, services };
 }
 
