@@ -378,6 +378,13 @@ export class Shop {
      * ここに無いと、課金後にBotが落ちたとき「何をする約束だったか」が分からなくなる。
      */
     request?: Record<string, unknown>;
+    /**
+     * 課金の冪等鍵。**同じ人が同じ商品を1秒以内にもう一度買うことがある**呼び出し
+     * （返金後のやり直し・巡回からの再実行）では、必ず操作ごとに違う値を渡すこと。
+     * 既定値は秒までしか分けないので、同じ秒の2回目が「同じ課金の再送」と見なされ、
+     * 購入行だけができて Land が動かない。
+     */
+    idempotencyKey?: string;
   }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
     const item = this.getItem(input.itemId);
     if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: input.itemId });
@@ -416,7 +423,7 @@ export class Shop {
         reason: `公式ショップ購入: ${item.name}`,
         refType: "shop",
         refId: String(item.id),
-        idempotencyKey: `shop:purchase:${input.userId}:${item.id}:${ts}`,
+        idempotencyKey: input.idempotencyKey ?? `shop:purchase:${input.userId}:${item.id}:${ts}`,
       });
       paidLand = item.price_land;
     }
@@ -451,6 +458,27 @@ export class Shop {
       payload: { itemId: item.id, purchaseId: purchase.id, paidLand, paidAltKind, paidAltAmount, expiresAt },
     });
     return { purchase, item, needsManualDelivery: item.delivery === "manual" };
+  }
+
+  /**
+   * 本人の入力（`request_json`）で購入を引く。**二重課金を止めるための照会。**
+   *
+   * 同じ申請に対して既に返金されていない購入があるなら、もう一度課金してはいけない。
+   * 逆に、返金済みのものは残っていても「まだ払っていない」ので、ここには出さない。
+   */
+  findActivePurchaseByRequest(userId: string, itemId: number, key: string, value: unknown): PurchaseRow | undefined {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM shop_purchases WHERE user_id = ? AND item_id = ? AND status = 'active' AND request_json IS NOT NULL ORDER BY id DESC",
+      )
+      .all(userId, itemId) as PurchaseRow[];
+    return rows.find((row) => {
+      try {
+        return (JSON.parse(row.request_json!) as Record<string, unknown>)[key] === value;
+      } catch {
+        return false;
+      }
+    });
   }
 
   getPurchase(id: number): PurchaseRow | undefined {

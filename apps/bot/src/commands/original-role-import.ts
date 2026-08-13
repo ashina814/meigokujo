@@ -10,6 +10,7 @@ import {
   type UserSelectMenuInteraction,
 } from "discord.js";
 import { ORIGINAL_ROLE_TERM_DAYS, OriginalRoleError } from "@meigokujo/core";
+import type { Guild, Role } from "discord.js";
 import type { Services } from "../services.js";
 
 /**
@@ -133,14 +134,63 @@ export function importRolePicker(services: Services, userId: string) {
   };
 }
 
-/** 3段目。**buyer / role / 期限をすべて出してから**でないと登録させない */
-export function importConfirm(services: Services, userId: string, roleId: string, roleName: string) {
+/**
+ * 登録してよいロールか。**期限切れに剥奪できないロールを契約にしない。**
+ *
+ * ここを通さないと、期限が来ても外せないロールを「契約中」として抱え込み、
+ * 運営が手で外すまで残る。@everyone や連携ロール（Bot・ブースト等）は
+ * そもそも人に付け外しできない。
+ */
+export type ImportBlock = "not_held" | "managed" | "everyone" | "not_removable";
+
+export const IMPORT_BLOCK_REASON: Record<ImportBlock, string> = {
+  not_held: "この方はこのロールを持っていません。**本人が実際に使っているロール**を選んでください。",
+  managed: "このロールは連携（Bot・ブースト等）が管理しているため、契約にできません。",
+  everyone: "@everyone は契約にできません。",
+  not_removable: "Botがこのロールを外せません（Botより上の位置にあるか、権限が足りません）。期限切れに剥奪できないため登録できません。",
+};
+
+export async function checkImportTarget(
+  guild: Guild | null,
+  userId: string,
+  roleId: string,
+): Promise<{ ok: true; role: Role } | { ok: false; reason: ImportBlock | "unavailable" }> {
+  if (!guild) return { ok: false, reason: "unavailable" };
+  if (roleId === guild.id) return { ok: false, reason: "everyone" };
+  let role: Role | null;
+  try {
+    role = (await guild.roles.fetch()).get(roleId) ?? null;
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+  if (!role) return { ok: false, reason: "unavailable" };
+  if (role.managed) return { ok: false, reason: "managed" };
+  // `editable` は「Botの最上位ロールより下」かつ「ロール管理権限がある」を見る。
+  // 付け外しできる条件と同じなので、剥奪できるかの判定にそのまま使える
+  if (!role.editable) return { ok: false, reason: "not_removable" };
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) return { ok: false, reason: "unavailable" };
+  if (!member.roles.cache.has(roleId)) return { ok: false, reason: "not_held" };
+  return { ok: true, role };
+}
+
+/** 3段目。**buyer / role / 期限をすべて出し、登録してよいか確かめてから**でないと押させない */
+export async function importConfirm(services: Services, guild: Guild | null, userId: string, roleId: string) {
   const legacy = legacyOf(services, userId);
   const expiresAt = legacy?.expiresAt ?? Math.floor(Date.now() / 1000) + ORIGINAL_ROLE_TERM_DAYS * DAY;
+  const check = await checkImportTarget(guild, userId, roleId);
   const taken = services.originalRoles.roleTaken(roleId);
+  const blocked = taken
+    ? "⚠️ **このロールは既に別の契約で登録されています。** 二重登録はできません。"
+    : check.ok
+      ? null
+      : check.reason === "unavailable"
+        ? "⚠️ Discordから対象を確認できませんでした。**確認できないまま登録はしません。** 少し待って開き直してください。"
+        : `⚠️ ${IMPORT_BLOCK_REASON[check.reason]}`;
+  const roleName = check.ok ? check.role.name : roleId;
   const embed = new EmbedBuilder()
     .setTitle("🎨 この内容で引き継ぎます")
-    .setColor(taken ? 0xdc2626 : 0x0f766e)
+    .setColor(blocked ? 0xdc2626 : 0x0f766e)
     .addFields(
       { name: "対象者", value: `<@${userId}>`, inline: true },
       { name: "ロール", value: `<@&${roleId}>（${roleName}）`, inline: true },
@@ -152,9 +202,7 @@ export function importConfirm(services: Services, userId: string, roleId: string
       },
     )
     .setDescription(
-      taken
-        ? "⚠️ **このロールは既に別の契約で登録されています。** 二重登録はできません。"
-        : "登録すると、本人が公式ショップから更新できるようになります。期限切れでこのロールは剥奪されます。",
+      blocked ?? "登録すると、本人が公式ショップから更新できるようになります。期限切れでこのロールは剥奪されます。",
     );
   return {
     embeds: [embed],
@@ -165,7 +213,7 @@ export function importConfirm(services: Services, userId: string, roleId: string
           .setCustomId(`mgmt:recover:orole-import-run:${userId}:${roleId}:${expiresAt}`)
           .setLabel("この内容で登録する")
           .setStyle(ButtonStyle.Success)
-          .setDisabled(taken),
+          .setDisabled(blocked !== null),
         new ButtonBuilder().setCustomId("mgmt:recover:orole-import").setLabel("やり直す").setStyle(ButtonStyle.Secondary),
       ),
       backRow(),
@@ -179,9 +227,7 @@ export async function handleImportUser(interaction: UserSelectMenuInteraction, s
 
 export async function handleImportRole(interaction: RoleSelectMenuInteraction, services: Services): Promise<void> {
   const userId = interaction.customId.split(":")[3]!;
-  const roleId = interaction.values[0]!;
-  const role = interaction.roles.first() ?? interaction.guild?.roles.cache.get(roleId) ?? null;
-  await interaction.update(importConfirm(services, userId, roleId, role?.name ?? roleId));
+  await interaction.update(await importConfirm(services, interaction.guild, userId, interaction.values[0]!));
 }
 
 export async function handleImportRun(interaction: ButtonInteraction, services: Services): Promise<void> {
@@ -189,12 +235,22 @@ export async function handleImportRun(interaction: ButtonInteraction, services: 
   const userId = parts[3]!;
   const roleId = parts[4]!;
   const expiresAt = Number(parts[5]);
-  const role = interaction.guild?.roles.cache.get(roleId) ?? null;
+  // **画面の表示を信用しない。** 押されたときにもう一度確かめる
+  const check = await checkImportTarget(interaction.guild, userId, roleId);
+  if (!check.ok) {
+    const reason =
+      check.reason === "unavailable"
+        ? "Discordから対象を確認できませんでした。**何も登録していません。**"
+        : `${IMPORT_BLOCK_REASON[check.reason]}
+**何も登録していません。**`;
+    await interaction.update({ embeds: [], content: `❌ ${reason}`, components: [backRow()] });
+    return;
+  }
   try {
     const row = services.originalRoles.importExisting({
       userId,
       roleId,
-      name: role?.name ?? `旧オリジナルロール(${roleId})`,
+      name: check.role.name,
       expiresAt,
       actor: `user:${interaction.user.id}`,
     });

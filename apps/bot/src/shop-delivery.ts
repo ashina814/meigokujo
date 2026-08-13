@@ -295,8 +295,22 @@ export async function deliverPurchaseUnlocked(
       if (!member) return fail("member_fetch_failed", "メンバー情報の取得に失敗しました。");
 
       const resolved = await resolveOriginalRole(services, guild, application, actor);
-      if (typeof resolved === "string") return fail(resolved, ORIGINAL_ROLE_MESSAGES[resolved] ?? "ロールの作成に失敗しました。");
+      if ("error" in resolved) {
+        return fail(resolved.error, ORIGINAL_ROLE_MESSAGES[resolved.error] ?? "ロールの作成に失敗しました。");
+      }
       const { role, createdNow } = resolved;
+
+      // 仮の名前のままなら、付与の直前に本来の名前へ変える
+      if (role.name !== application.name) {
+        const renamed = await role
+          .edit({ name: application.name, reason: `公式ショップ: オリジナルロール命名（申請 #${application.id}）` })
+          .then(() => true)
+          .catch((e: Error) => e.message || "unknown");
+        if (renamed !== true) {
+          if (createdNow) await role.delete("公式ショップ: 命名に失敗したため取り消し").catch(() => undefined);
+          return fail(`role_rename_failed:${renamed}`, "ロール名の設定に失敗しました。");
+        }
+      }
 
       const added = await member.roles
         .add(role.id, "公式ショップ: オリジナルロール付与")
@@ -310,12 +324,16 @@ export async function deliverPurchaseUnlocked(
         return fail(`role_add_failed:${added}`, "ロールの付与に失敗しました。");
       }
       if (!services.originalRoles.activate({ id: application.id, roleId: role.id, purchaseId: purchase.id, actor })) {
-        // 競合した二重実行。相手が別のロールで契約を始めていたら、こちらが作ったぶんは残さない
         const settled = services.originalRoles.get(application.id);
+        // 相手が同じロールで契約を始めていたなら、これは成功の収束。何も戻さない
         if (settled?.status === "active" && settled.role_id === role.id) {
           services.shop.markDeliverySucceeded(purchase.id, actor);
           return { state: "delivered", message: `オリジナルロール <@&${role.id}> を作成しました。**30日間**ご利用いただけます。` };
         }
+        // **返金する前に、今つけた副作用を戻す。** 返金だけして付与が残ると
+        // 「払っていないのに持っている」になる。引き継いだ既存ロールは消さず、
+        // 本人からの付与だけ外す（他の契約の持ち物かもしれない）
+        await member.roles.remove(role.id, "公式ショップ: 契約を開始できなかったため取り消し").catch(() => undefined);
         if (createdNow) await role.delete("公式ショップ: 二重実行のため取り消し").catch(() => undefined);
         return fail("activate_conflict", "契約の開始に失敗しました。運営にお問い合わせください。");
       }
@@ -412,33 +430,49 @@ export async function redeliverPurchase(
  * 3. どれも無ければ、新しく作る
  */
 const ORIGINAL_ROLE_MESSAGES: Record<string, string> = {
+  role_lookup_failed: "Discordのロール一覧を確認できなかったため、作成を見送りました。少し待って再度お試しください。",
   role_create_ambiguous: "作りかけのロールが複数見つかったため、自動では進められませんでした。運営にお問い合わせください。",
 };
+
+/**
+ * 作りかけのロールに付ける**一意な仮の名前**。
+ *
+ * 「本来の名前 + だいたいの時刻」で探すと、たまたま同じ名前の別人のロールを拾いうる。
+ * 申請IDを埋めた名前で作れば、**作った直後に落ちても自分のものだけを一意に回収できる**。
+ * 付与の直前に本来の名前へ変える。
+ */
+export function stagingRoleName(applicationId: number): string {
+  return `作成中-オリジナルロール-申請${applicationId}`;
+}
 
 async function resolveOriginalRole(
   services: Services,
   guild: Guild,
   application: OriginalRoleRow,
   actor: string,
-): Promise<{ role: Role; createdNow: boolean } | string> {
+): Promise<{ role: Role; createdNow: boolean } | { error: string }> {
+  // **「無い」と「確認できない」を分ける。** APIが読めなかっただけで作りに進むと、
+  // 既にあるロールの隣に2個目ができる。読めなければ何も作らずに終わる
+  let all: Awaited<ReturnType<Guild["roles"]["fetch"]>> | null;
+  try {
+    all = await guild.roles.fetch();
+  } catch {
+    return { error: "role_lookup_failed" };
+  }
+  if (!all) return { error: "role_lookup_failed" };
+
   if (application.role_id) {
-    const known = await guild.roles.fetch(application.role_id).catch(() => null);
-    // 記録があるロールが消えている（人が消した）なら、作り直してよい
+    const known = all.get(application.role_id);
+    // 記録があるロールが消えている（人が消した）ときだけ、作り直しへ進む
     if (known) return { role: known, createdNow: false };
   }
   if (application.role_creation_started_at !== null) {
-    const all = await guild.roles.fetch().catch(() => null);
-    if (all) {
-      const since = application.role_creation_started_at * 1000 - 60_000;
-      const candidates = [...all.values()].filter(
-        (r) => r.name === application.name && r.createdTimestamp >= since && !services.originalRoles.roleTaken(r.id, application.id),
-      );
-      // 1つに決まらないなら推測しない
-      if (candidates.length > 1) return "role_create_ambiguous";
-      if (candidates.length === 1) {
-        services.originalRoles.attachRole(application.id, candidates[0]!.id, actor);
-        return { role: candidates[0]!, createdNow: false };
-      }
+    // 仮の名前は申請IDで一意。**名前と時刻での推測ではない**
+    const staged = [...all.values()].filter((r) => r.name === stagingRoleName(application.id));
+    if (staged.length > 1) return { error: "role_create_ambiguous" };
+    if (staged.length === 1) {
+      services.originalRoles.attachRole(application.id, staged[0]!.id, actor);
+      return { role: staged[0]!, createdNow: false };
     }
   }
   // **作りにいく前に印を置く。** これが無いと、次の再試行は探すことすらできない
@@ -446,7 +480,7 @@ async function resolveOriginalRole(
   // **危険な権限は付けない。** 見た目のためのロールなので権限は空で作る
   const created = await guild.roles
     .create({
-      name: application.name,
+      name: stagingRoleName(application.id),
       color: application.color ?? undefined,
       permissions: [],
       mentionable: false,
@@ -455,7 +489,7 @@ async function resolveOriginalRole(
     })
     .then((role) => role)
     .catch((e: Error) => e.message || "unknown");
-  if (typeof created === "string") return `role_create_failed:${created}`;
+  if (typeof created === "string") return { error: `role_create_failed:${created}` };
   // **付与より先に記録する。** ここで落ちても role_id から拾い直せる
   services.originalRoles.attachRole(application.id, created.id, actor);
   return { role: created, createdNow: true };

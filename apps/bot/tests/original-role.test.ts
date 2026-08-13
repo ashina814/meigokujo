@@ -65,32 +65,40 @@ type Ctx = ReturnType<typeof setup>;
 const balance = (ctx: Ctx) => ctx.ledger.balanceOf(`user:${USER}`);
 
 /** ロール作成の成否を差し込めるギルド */
-function world(opts: { createFails?: string; addFails?: string } = {}) {
+function world(opts: { createFails?: string; addFails?: string; fetchFails?: boolean; notRemovable?: boolean } = {}) {
   const roleDeleted: string[] = [];
   const memberRoles: string[] = [];
+  const memberRoleCache = new Collection<string, unknown>();
   const member = {
     id: USER,
     roles: {
-      cache: new Collection(),
+      cache: memberRoleCache,
       add: vi.fn(async (id: string) => {
         if (opts.addFails) throw new Error(opts.addFails);
         memberRoles.push(id);
+        memberRoleCache.set(id, true);
       }),
       remove: vi.fn(async (id: string) => {
         const i = memberRoles.indexOf(id);
         if (i >= 0) memberRoles.splice(i, 1);
+        memberRoleCache.delete(id);
       }),
     },
   };
   let seq = 0;
   // 作られたロールはギルドに残る。**クラッシュ後の再試行がこれを見つけられるか**が要点
-  const living = new Collection<string, { id: string; name: string; createdTimestamp: number; delete: () => Promise<void> }>();
-  const makeRole = (name: string, createdTimestamp = Date.now()) => {
+  const living = new Collection<string, ReturnType<typeof makeRole>>();
+  const makeRole = (name: string) => {
     const id = `role-${++seq}`;
     const role = {
       id,
       name,
-      createdTimestamp,
+      managed: false,
+      editable: !opts.notRemovable,
+      edit: vi.fn(async (o: { name?: string }) => {
+        if (o.name) role.name = o.name;
+        return role;
+      }),
       delete: vi.fn(async () => {
         roleDeleted.push(id);
         living.delete(id);
@@ -106,7 +114,11 @@ function world(opts: { createFails?: string; addFails?: string } = {}) {
         if (opts.createFails) throw new Error(opts.createFails);
         return makeRole(o.name);
       }),
-      fetch: vi.fn(async (id?: string) => (id === undefined ? living : (living.get(id) ?? null))),
+      fetch: vi.fn(async (id?: string) => {
+        // **一覧が読めない**状況（APIの失敗）。これを「無い」と混同しない
+        if (opts.fetchFails) throw new Error("Service Unavailable");
+        return id === undefined ? living : (living.get(id) ?? null);
+      }),
       cache: living,
     },
     members: { fetch: vi.fn(async () => member) },
@@ -425,8 +437,7 @@ describe("期限まわり", () => {
 });
 
 describe("作成途中で落ちたとき（Discord側とDBの間のクラッシュ窓）", () => {
-  const fakeClient = () =>
-    ({ channels: { fetch: async () => null }, users: { fetch: async () => null } }) as never;
+  const fakeClient = () => ({ channels: { fetch: async () => null }, users: { fetch: async () => null } }) as never;
 
   function paidButUnfinished(ctx: Ctx) {
     // 課金と購入行は済んでいるが、契約が始まっていない状態を作る
@@ -442,51 +453,67 @@ describe("作成途中で落ちたとき（Discord側とDBの間のクラッシ�
     return { row, purchase };
   }
 
-  it("**ロールを作った直後に落ちても、作り直さずそのロールを使う**", async () => {
+  const settle = async (ctx: Ctx, w: ReturnType<typeof world>, purchaseId: number) => {
     const { deliverOrRefund } = await import("../src/shop-refund.js");
+    return deliverOrRefund(fakeClient(), ctx.services, w.guild as never, ctx.shop.getPurchase(purchaseId)! as never, "system:test");
+  };
+
+  it("**一覧を取得できないときは新しいロールを作らない**（無いのか確認できないのかを分ける）", async () => {
     const ctx = setup();
-    const w = world();
+    const w = world({ fetchFails: true });
     const { row, purchase } = paidButUnfinished(ctx);
-    // 「作りにいった印」だけ残り、role_id を書く前に落ちた状況
-    ctx.originalRoles.markRoleCreationStarted(row.id);
-    const orphan = w.makeRole("冥き翼");
+    const before = balance(ctx);
 
-    await deliverOrRefund(fakeClient(), ctx.services, w.guild as never, ctx.shop.getPurchase(purchase.id)! as never, "system:test");
+    const { outcome, refund } = await settle(ctx, w, purchase.id);
 
-    expect(w.guild.roles.create).not.toHaveBeenCalled(); // 2個目を作らない
-    expect(ctx.originalRoles.get(row.id)!.role_id).toBe(orphan.id);
-    expect(ctx.originalRoles.get(row.id)!.status).toBe("active");
-    expect(w.memberRoles).toEqual([orphan.id]);
+    expect(w.guild.roles.create).not.toHaveBeenCalled(); // 確認できないまま2個目を作らない
+    expect(outcome.state).toBe("failed");
+    expect(refund).toBe("refunded");
+    expect(balance(ctx)).toBe(before + PRICE);
+    expect(ctx.originalRoles.get(row.id)!.status).toBe("approved"); // 次の支払いでやり直せる
     ctx.db.close();
   });
 
-  it("同じ名前の候補が2つあれば**選ばずに運営へ回す**（別人のロールを掴まない）", async () => {
-    const { deliverOrRefund } = await import("../src/shop-refund.js");
+  it("**開始前からあった同名のロールは拾わない**（別人のロールを掴まない）", async () => {
+    const ctx = setup();
+    const w = world();
+    const stranger = w.makeRole("冥き翼"); // 他人が先に持っていた同名ロール
+    const { row, purchase } = paidButUnfinished(ctx);
+    // 作りにいった印はあるが、自分のロールはまだ無い状況。ここで同名を拾ってはいけない
+    ctx.originalRoles.markRoleCreationStarted(row.id);
+
+    await settle(ctx, w, purchase.id);
+
+    const after = ctx.originalRoles.get(row.id)!;
+    expect(after.role_id).not.toBe(stranger.id);
+    expect(w.guild.roles.create).toHaveBeenCalledTimes(1); // 自分のぶんを作る
+    expect(after.status).toBe("active");
+    ctx.db.close();
+  });
+
+  it("**作った直後に落ちても、自分のロールだけを一意に回収する**", async () => {
+    const { stagingRoleName } = await import("../src/shop-delivery.js");
     const ctx = setup();
     const w = world();
     const { row, purchase } = paidButUnfinished(ctx);
+    // 申請IDを埋めた仮名で作った直後に落ちた状況（role_id を書く前）
     ctx.originalRoles.markRoleCreationStarted(row.id);
-    w.makeRole("冥き翼");
-    w.makeRole("冥き翼");
-    const before = balance(ctx);
+    const mine = w.makeRole(stagingRoleName(row.id));
+    const stranger = w.makeRole("冥き翼"); // 紛らわしい他人のロール
 
-    const settlement = await deliverOrRefund(
-      fakeClient(),
-      ctx.services,
-      w.guild as never,
-      ctx.shop.getPurchase(purchase.id)! as never,
-      "system:test",
-    );
+    await settle(ctx, w, purchase.id);
 
-    expect(settlement.outcome.state).toBe("failed");
-    expect(settlement.refund).toBe("refunded"); // 作れないなら返す
-    expect(balance(ctx)).toBe(before + PRICE);
-    expect(ctx.originalRoles.get(row.id)!.status).toBe("approved");
+    expect(w.guild.roles.create).not.toHaveBeenCalled(); // 2個目を作らない
+    const after = ctx.originalRoles.get(row.id)!;
+    expect(after.role_id).toBe(mine.id);
+    expect(after.role_id).not.toBe(stranger.id);
+    expect(mine.name).toBe("冥き翼"); // 仮名から本来の名前へ変わっている
+    expect(w.memberRoles).toEqual([mine.id]);
+    expect(after.status).toBe("active");
     ctx.db.close();
   });
 
   it("既に自分のロールが記録されていれば、それを使って付与だけやり直す", async () => {
-    const { deliverOrRefund } = await import("../src/shop-refund.js");
     const ctx = setup();
     const w = world();
     const { row, purchase } = paidButUnfinished(ctx);
@@ -494,7 +521,7 @@ describe("作成途中で落ちたとき（Discord側とDBの間のクラッシ�
     ctx.originalRoles.markRoleCreationStarted(row.id);
     ctx.originalRoles.attachRole(row.id, known.id, "system:test");
 
-    await deliverOrRefund(fakeClient(), ctx.services, w.guild as never, ctx.shop.getPurchase(purchase.id)! as never, "system:test");
+    await settle(ctx, w, purchase.id);
 
     expect(w.guild.roles.create).not.toHaveBeenCalled();
     expect(w.memberRoles).toEqual([known.id]);
@@ -503,18 +530,45 @@ describe("作成途中で落ちたとき（Discord側とDBの間のクラッシ�
   });
 
   it("記録したロールが消されていたら、作り直して契約を始める", async () => {
-    const { deliverOrRefund } = await import("../src/shop-refund.js");
     const ctx = setup();
     const w = world();
     const { row, purchase } = paidButUnfinished(ctx);
     ctx.originalRoles.attachRole(row.id, "role-deleted-by-human", "system:test");
 
-    await deliverOrRefund(fakeClient(), ctx.services, w.guild as never, ctx.shop.getPurchase(purchase.id)! as never, "system:test");
+    await settle(ctx, w, purchase.id);
 
     expect(w.guild.roles.create).toHaveBeenCalledTimes(1);
     const after = ctx.originalRoles.get(row.id)!;
     expect(after.status).toBe("active");
     expect(after.role_id).not.toBe("role-deleted-by-human");
+    ctx.db.close();
+  });
+
+  it("**付与したあとに契約を開始できなければ、付与を戻してから返金する**", async () => {
+    const ctx = setup();
+    const w = world();
+    const { row, purchase } = paidButUnfinished(ctx);
+    // 引き継ぎ等で拾った既存ロール（消してはいけない）
+    const recovered = w.makeRole("冥き翼");
+    ctx.originalRoles.markRoleCreationStarted(row.id);
+    ctx.originalRoles.attachRole(row.id, recovered.id, "system:test");
+    // 付与のあと・activate の直前に、別経路が申請をさらっていった状況を作る
+    const realActivate = ctx.originalRoles.activate.bind(ctx.originalRoles);
+    vi.spyOn(ctx.originalRoles, "activate").mockImplementationOnce(() => {
+      ctx.db.prepare("UPDATE original_roles SET status='cancelled' WHERE id=?").run(row.id);
+      return realActivate({ id: row.id, roleId: recovered.id, purchaseId: purchase.id, actor: "t" });
+    });
+    const before = balance(ctx);
+
+    const { outcome, refund } = await settle(ctx, w, purchase.id);
+
+    expect(outcome.state).toBe("failed");
+    expect(refund).toBe("refunded");
+    expect(balance(ctx)).toBe(before + PRICE);
+    expect(w.memberRoles).toEqual([]); // **本人にロールが残らない**
+    expect(w.roleDeleted).not.toContain(recovered.id); // 拾った既存ロールは消さない
+    expect(w.living.has(recovered.id)).toBe(true);
+    vi.restoreAllMocks();
     ctx.db.close();
   });
 
@@ -557,33 +611,162 @@ describe("作成途中で落ちたとき（Discord側とDBの間のクラッシ�
   });
 });
 
+describe("支払いのやり直し", () => {
+  function approved(ctx: Ctx) {
+    const row = ctx.originalRoles.apply({ userId: USER, name: "冥き翼", color: null, actor: "t" });
+    ctx.originalRoles.approve(row.id, "staff");
+    return row;
+  }
+  const payId = (ctx: Ctx, appId: number, attempt: string) =>
+    `shop:orole-pay:${ctx.item.id}:${appId}:${attempt}`;
+
+  it("同じ支払い画面を二度押しても課金は1回", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const row = approved(ctx);
+    const w = world();
+    const before = balance(ctx);
+
+    await handleShopButton(press(ctx, payId(ctx, row.id, "a1"), w), ctx.services);
+    await handleShopButton(press(ctx, payId(ctx, row.id, "a1"), w), ctx.services);
+
+    expect(balance(ctx)).toBe(before - PRICE);
+    expect(ctx.shop.listUserPurchases(USER).filter((p) => p.status === "active")).toHaveLength(1);
+    expect(w.guild.roles.create).toHaveBeenCalledTimes(1);
+    ctx.db.close();
+  });
+
+  it("**返金されたあとは、開き直せばもう一度支払える**", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const row = approved(ctx);
+    const before = balance(ctx);
+    // 1回目は作成に失敗 → 自動返金
+    await handleShopButton(press(ctx, payId(ctx, row.id, "a1"), world({ createFails: "boom" })), ctx.services);
+    expect(balance(ctx)).toBe(before);
+    expect(ctx.originalRoles.get(row.id)!.status).toBe("approved");
+
+    // 商品を開き直すと新しい鍵になる
+    const w2 = world();
+    await handleShopButton(press(ctx, payId(ctx, row.id, "a2"), w2), ctx.services);
+
+    expect(balance(ctx)).toBe(before - PRICE);
+    expect(ctx.originalRoles.get(row.id)!.status).toBe("active");
+    expect(w2.memberRoles).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("**別々の鍵で同時に押されても、二重課金・二重作成しない**", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const row = approved(ctx);
+    const w = world();
+    const before = balance(ctx);
+
+    await Promise.all([
+      handleShopButton(press(ctx, payId(ctx, row.id, "a1"), w), ctx.services),
+      handleShopButton(press(ctx, payId(ctx, row.id, "a2"), w), ctx.services),
+    ]);
+
+    expect(balance(ctx)).toBe(before - PRICE);
+    expect(ctx.shop.listUserPurchases(USER).filter((p) => p.status === "active")).toHaveLength(1);
+    expect(w.guild.roles.create).toHaveBeenCalledTimes(1);
+    expect(w.memberRoles).toHaveLength(1);
+    ctx.db.close();
+  });
+});
+
 describe("旧契約の引き継ぎ（運営導線）", () => {
   const importUi = () => import("../src/commands/original-role-import.js");
+  const held = (w: ReturnType<typeof world>, name: string) => {
+    const role = w.makeRole(name);
+    w.member.roles.cache.set(role.id, true);
+    return role;
+  };
+  const runId = (userId: string, roleId: string, expires: number) =>
+    `mgmt:recover:orole-import-run:${userId}:${roleId}:${expires}`;
+  const EXPIRES = Math.floor(Date.now() / 1000) + 10 * DAY;
 
   it("**購入履歴からロールを推測しない**（人が選んだロールだけを登録する）", async () => {
     const { importConfirm, handleImportRun } = await importUi();
     const ctx = setup();
     const w = world();
-    const role = w.makeRole("旧オリジナル");
-    const view = importConfirm(ctx.services, USER, role.id, role.name);
+    const role = held(w, "旧オリジナル");
+    const view = await importConfirm(ctx.services, w.guild as never, USER, role.id);
 
     // 確認画面に buyer / role / 期限 が全部出ている
     const fields = (view.embeds[0]!.toJSON().fields ?? []).map((f) => `${f.name}:${f.value}`).join("|");
     expect(fields).toContain(USER);
     expect(fields).toContain(role.id);
     expect(fields).toContain("期限");
+    expect(view.components[0]!.toJSON().components[0]!.disabled).toBe(false);
 
-    const expires = Math.floor(Date.now() / 1000) + 10 * DAY;
-    await handleImportRun(
-      press(ctx, `mgmt:recover:orole-import-run:${USER}:${role.id}:${expires}`, w) as never,
-      ctx.services,
-    );
+    await handleImportRun(press(ctx, runId(USER, role.id, EXPIRES), w) as never, ctx.services);
 
     const rows = ctx.originalRoles.listByUser(USER);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.role_id).toBe(role.id);
     expect(rows[0]!.status).toBe("active");
-    expect(rows[0]!.expires_at).toBe(expires);
+    expect(rows[0]!.expires_at).toBe(EXPIRES);
+    ctx.db.close();
+  });
+
+  it("**本人が持っていないロールは登録できない**", async () => {
+    const { importConfirm, handleImportRun } = await importUi();
+    const ctx = setup();
+    const w = world();
+    const role = w.makeRole("誰かの飾り"); // 本人は持っていない
+
+    const view = await importConfirm(ctx.services, w.guild as never, USER, role.id);
+    expect(view.components[0]!.toJSON().components[0]!.disabled).toBe(true);
+
+    const btn = press(ctx, runId(USER, role.id, EXPIRES), w) as unknown as { update: ReturnType<typeof vi.fn> };
+    await handleImportRun(btn as never, ctx.services);
+
+    expect(ctx.originalRoles.listByUser(USER)).toHaveLength(0);
+    expect(contentOf(btn.update)).toContain("持っていません");
+    ctx.db.close();
+  });
+
+  it("**Botが外せないロールは登録できない**（期限切れに剥奪できない）", async () => {
+    const { importConfirm, handleImportRun } = await importUi();
+    const ctx = setup();
+    const w = world({ notRemovable: true });
+    const role = held(w, "上位ロール");
+
+    const view = await importConfirm(ctx.services, w.guild as never, USER, role.id);
+    expect(view.components[0]!.toJSON().components[0]!.disabled).toBe(true);
+
+    const btn = press(ctx, runId(USER, role.id, EXPIRES), w) as unknown as { update: ReturnType<typeof vi.fn> };
+    await handleImportRun(btn as never, ctx.services);
+
+    expect(ctx.originalRoles.listByUser(USER)).toHaveLength(0);
+    expect(contentOf(btn.update)).toContain("外せません");
+    ctx.db.close();
+  });
+
+  it("連携ロール・@everyone は登録できない", async () => {
+    const { checkImportTarget } = await importUi();
+    const ctx = setup();
+    const w = world();
+    const bot = held(w, "統合Bot");
+    bot.managed = true;
+
+    expect(await checkImportTarget(w.guild as never, USER, bot.id)).toEqual({ ok: false, reason: "managed" });
+    expect(await checkImportTarget(w.guild as never, USER, w.guild.id)).toEqual({ ok: false, reason: "everyone" });
+    ctx.db.close();
+  });
+
+  it("Discordを確認できないときは登録しない", async () => {
+    const { handleImportRun } = await importUi();
+    const ctx = setup();
+    const w = world({ fetchFails: true });
+
+    const btn = press(ctx, runId(USER, "role-x", EXPIRES), w) as unknown as { update: ReturnType<typeof vi.fn> };
+    await handleImportRun(btn as never, ctx.services);
+
+    expect(ctx.originalRoles.listByUser(USER)).toHaveLength(0);
+    expect(contentOf(btn.update)).toContain("確認できませんでした");
     ctx.db.close();
   });
 
@@ -591,23 +774,17 @@ describe("旧契約の引き継ぎ（運営導線）", () => {
     const { handleImportRun, importConfirm } = await importUi();
     const ctx = setup();
     const w = world();
-    const role = w.makeRole("旧オリジナル");
-    const expires = Math.floor(Date.now() / 1000) + 10 * DAY;
-    await handleImportRun(
-      press(ctx, `mgmt:recover:orole-import-run:${USER}:${role.id}:${expires}`, w) as never,
-      ctx.services,
-    );
+    const role = held(w, "旧オリジナル");
+    await handleImportRun(press(ctx, runId(USER, role.id, EXPIRES), w) as never, ctx.services);
 
-    const other = press(ctx, `mgmt:recover:orole-import-run:999:${role.id}:${expires}`, w) as unknown as {
-      update: ReturnType<typeof vi.fn>;
-    };
+    const other = press(ctx, runId("999", role.id, EXPIRES), w) as unknown as { update: ReturnType<typeof vi.fn> };
     await handleImportRun(other as never, ctx.services);
 
     expect(ctx.originalRoles.listByUser("999")).toHaveLength(0);
     expect(contentOf(other.update)).toContain("何も登録していません");
     // 確認画面の段階でも押せないようにしてある
-    const button = importConfirm(ctx.services, "999", role.id, role.name).components[0]!.toJSON().components[0]!;
-    expect(button.disabled).toBe(true);
+    const view = await importConfirm(ctx.services, w.guild as never, "999", role.id);
+    expect(view.components[0]!.toJSON().components[0]!.disabled).toBe(true);
     ctx.db.close();
   });
 
@@ -616,12 +793,8 @@ describe("旧契約の引き継ぎ（運営導線）", () => {
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     const w = world();
-    const role = w.makeRole("旧オリジナル");
-    const expires = Math.floor(Date.now() / 1000) + 10 * DAY;
-    await handleImportRun(
-      press(ctx, `mgmt:recover:orole-import-run:${USER}:${role.id}:${expires}`, w) as never,
-      ctx.services,
-    );
+    const role = held(w, "旧オリジナル");
+    await handleImportRun(press(ctx, runId(USER, role.id, EXPIRES), w) as never, ctx.services);
     const contract = ctx.originalRoles.listByUser(USER)[0]!;
     const before = balance(ctx);
 
@@ -631,7 +804,7 @@ describe("旧契約の引き継ぎ（運営導線）", () => {
     );
 
     expect(balance(ctx)).toBe(before - RENEW);
-    expect(ctx.originalRoles.get(contract.id)!.expires_at).toBe(expires + 30 * DAY);
+    expect(ctx.originalRoles.get(contract.id)!.expires_at).toBe(EXPIRES + 30 * DAY);
     ctx.db.close();
   });
 

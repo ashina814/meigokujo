@@ -25,7 +25,8 @@ import {
 } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { deliverPurchase, nicknameBlockReason } from "../shop-delivery.js";
-import { deliverOrRefund } from "../shop-refund.js";
+import { deliverOrRefund, type Settlement } from "../shop-refund.js";
+import { withUserLock } from "../user-lock.js";
 import {
   applyModal,
   handleApplyModal,
@@ -412,6 +413,9 @@ function purchaseOnce(
       memberRoleIds: input.memberRoleIds,
       payAlt: input.mode === "alt",
       request: input.request,
+      // **操作ごとに違う鍵で課金する。** 既定の鍵は秒までしか分けないので、
+      // 返金後のやり直しが同じ秒に入ると Land が動かないまま購入行だけができる
+      idempotencyKey: `shop:purchase:op:${input.operationId}`,
     });
     services.db.prepare(
       `UPDATE shop_purchase_operations
@@ -595,45 +599,73 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
   if (action === "orole-pay") {
     const itemId = Number(parts[2]);
     const applicationId = Number(parts[3]);
+    // 支払い画面ごとの鍵。**同じ画面の二度押しは1回**、開き直せば新しい挑戦になる
+    const attempt = parts[4] ?? "";
     const item = services.shop.getItem(itemId);
     if (!item || !item.enabled || !isOriginalRoleItem(services, item) || item.price_land === null) {
       await interaction.update({ content: "この商品はいま購入できません。", embeds: [], components: [] });
       return;
     }
-    try {
-      services.originalRoles.assertPayable(applicationId, interaction.user.id);
-    } catch {
-      await interaction.update({
-        content: "⚠️ この申請はいま支払える状態ではありません（取り消されたか、既に支払い済みです）。",
-        embeds: [],
-        components: [],
-      });
-      return;
-    }
     await interaction.deferUpdate();
-    let purchase: PurchaseOutcome;
-    try {
-      // 課金・購入行・どの申請かを1トランザクションで確定する
-      purchase = purchaseOnce(services, {
-        operationId: `orole:${applicationId}`,
+    // **同じ申請の支払いを直列化する。** 2本同時に押されても、2本目は
+    // 1本目が作った購入を見つけて課金しない
+    interface Attempt {
+      error?: string;
+      purchase?: PurchaseRow;
+      settled?: Settlement;
+    }
+    const settlement = await withUserLock<Attempt>(`orole-pay:${applicationId}`, async () => {
+      // 返金されていない購入が既にあるなら、それを進めるだけ（二重課金しない）。
+      // 返金済みは「まだ払っていない」ので、ここには出てこない＝再挑戦できる
+      const open = services.shop.findActivePurchaseByRequest(
+        interaction.user.id,
         itemId,
-        userId: interaction.user.id,
-        actor: `user:${interaction.user.id}`,
-        memberRoleIds: [...((interaction.member as GuildMember | null)?.roles.cache.keys() ?? [])],
-        mode: "land",
-        request: { applicationId },
-      });
-    } catch (error) {
-      await interaction.editReply({ content: `❌ ${purchaseErrorMessage(error, services)}`, embeds: [], components: [] });
+        "applicationId",
+        applicationId,
+      );
+      if (open) {
+        return {
+          purchase: open,
+          settled: await deliverOrRefund(interaction.client, services, interaction.guild, open, `user:${interaction.user.id}`),
+        };
+      }
+      try {
+        services.originalRoles.assertPayable(applicationId, interaction.user.id);
+      } catch {
+          return { error: "⚠️ この申請はいま支払える状態ではありません（取り消されたか、既に支払い済みです）。" } as Attempt;
+      }
+      let purchase: PurchaseOutcome;
+      try {
+        // 課金・購入行・どの申請かを1トランザクションで確定する
+        purchase = purchaseOnce(services, {
+          operationId: `orole:${applicationId}:${attempt}`,
+          itemId,
+          userId: interaction.user.id,
+          actor: `user:${interaction.user.id}`,
+          memberRoleIds: [...((interaction.member as GuildMember | null)?.roles.cache.keys() ?? [])],
+          mode: "land",
+          request: { applicationId },
+        });
+      } catch (error) {
+        return { error: `❌ ${purchaseErrorMessage(error, services)}` } as Attempt;
+      }
+      return {
+        purchase: purchase.purchase,
+        settled: await deliverOrRefund(
+          interaction.client,
+          services,
+          interaction.guild,
+          purchase.purchase,
+          `user:${interaction.user.id}`,
+        ),
+      };
+    });
+    if (settlement.error !== undefined) {
+      await interaction.editReply({ content: settlement.error, embeds: [], components: [] });
       return;
     }
-    const { outcome, refund } = await deliverOrRefund(
-      interaction.client,
-      services,
-      interaction.guild,
-      purchase.purchase,
-      `user:${interaction.user.id}`,
-    );
+    const paid = settlement.purchase!;
+    const { outcome, refund } = settlement.settled!;
     if (outcome.state !== "failed") {
       await interaction.editReply({ content: `✅ ${outcome.message}`, embeds: [], components: [] });
       return;
@@ -641,9 +673,9 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     await interaction.editReply({
       content:
         refund === "refunded"
-          ? `作成できなかったため、${fmtLd(purchase.purchase.paid_land ?? 0)}は返金しました。
+          ? `作成できなかったため、${fmtLd(paid.paid_land ?? 0)}は返金しました。
 -# ${outcome.message}`
-          : `⚠️ 作成に失敗し、返金も完了できませんでした。運営が対応します（購入 #${purchase.purchase.id}）。
+          : `⚠️ 作成に失敗し、返金も完了できませんでした。運営が対応します（購入 #${paid.id}）。
 -# ${outcome.message}`,
       embeds: [],
       components: [],

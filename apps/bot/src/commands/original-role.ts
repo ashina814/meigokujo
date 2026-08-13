@@ -42,6 +42,11 @@ export function isOriginalRoleItem(services: Services, item: ShopItemRow): boole
   return Number.isInteger(configured) && configured === item.id;
 }
 
+/** 支払い画面ごとの一意な鍵。返金されたあとに開き直すと別の値になる */
+export function payAttemptToken(): string {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
 export function renewPrice(services: Services): number {
   return services.settings.getNumber("original_role_renew_price");
 }
@@ -86,7 +91,8 @@ export function originalRoleActions(services: Services, item: ShopItemRow, userI
     );
     buttons.push(
       new ButtonBuilder()
-        .setCustomId(`shop:orole-pay:${item.id}:${approved.id}`)
+        // 画面ごとの鍵。二度押しは1回にまとまり、開き直せば新しい挑戦になる
+        .setCustomId(`shop:orole-pay:${item.id}:${approved.id}:${payAttemptToken()}`)
         .setLabel(`支払って作成する (${fmtLd(item.price_land ?? 0)})`)
         .setEmoji("💰")
         .setStyle(ButtonStyle.Success),
