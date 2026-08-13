@@ -26,9 +26,11 @@ import {
   runSchedulerTaskOnce,
   sendChunkedLinesResumable,
 } from "./scheduler-utils.js";
+import { cancelUnpaidSubAccounts, syncSubAccountRanks } from "./sub-account-jobs.js";
 import {
   convergePendingNicknameChanges,
   convergePendingOriginalRoles,
+  convergePendingSubAccounts,
   expireOverduePurchases,
   processShopRoleRevocations,
   recoverAutoDropNoEvalGhosts,
@@ -421,6 +423,22 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       await convergePendingOriginalRoles(client, services);
     } catch (e) {
       console.error("[ショップ] オリジナルロール作成の収束失敗:", e);
+    }
+
+    // ── サブ垢の有効化の未完了を収束させる ──
+    try {
+      await convergePendingSubAccounts(client, services);
+    } catch (e) {
+      console.error("[ショップ] サブ垢有効化の収束失敗:", e);
+    }
+
+    // ── サブ垢まわりの巡回（未払いの取消・階級の追従）──
+    // 追従の正本は本体の souls.status。ロールを正本にすると剥がし忘れが資格になる
+    try {
+      await cancelUnpaidSubAccounts(client, services);
+      await syncSubAccountRanks(client, services);
+    } catch (e) {
+      console.error("[サブ垢] 巡回失敗:", e);
     }
 
     // 失効購入のロール剥奪は失効処理と分離し、購入ID単位で毎分自己修復する。

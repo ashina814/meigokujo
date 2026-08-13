@@ -1,4 +1,9 @@
-export { openDb, applyNicknameItemSetting, applyOriginalRoleItemSetting } from "./db/bootstrap.js";
+export {
+  openDb,
+  applyNicknameItemSetting,
+  applyOriginalRoleItemSetting,
+  applySubAccountItemSetting,
+} from "./db/bootstrap.js";
 export { LedgerError, type LedgerErrorCode } from "./ledger/errors.js";
 export {
   registerTxType,
@@ -668,3 +673,4 @@ export {
   type PersistentTableRestoreResult,
   type PersistentTableRestoreProvider,
 } from "./casino/recovery.js";
+export * from "./sub-account/service.js";

@@ -13,6 +13,7 @@ import {
   Migration,
   Nicknames,
   OriginalRoles,
+  SubAccounts,
   Payroll,
   Settings,
   Rooms,
@@ -106,6 +107,7 @@ export function buildServices() {
   const nicknames = new Nicknames(db, events);
   // オリジナルロール（申請 → 承認 → 支払い → 作成・付与 → 30日契約）
   const originalRoles = new OriginalRoles(db, ledger, events);
+  const subAccounts = new SubAccounts(db, events);
   // 出戻り（退出→再参加→申請→運営判断）。入城処理とは別の意味論として分けてある
   const returns = new Returns(db, settings, events);
   // 説明会の開催予定（通常枠 × 日付ごとの例外）。案内・通知・ボードは全部ここを見る
@@ -260,7 +262,7 @@ export function buildServices() {
   // 資金を動かす経路は `chips` に一本化した（PR8監査・項目12）。`ether` は
   // 旧名称で書かれた外部プラグイン・古い呼び出しが**読むだけ**なら壊れないように
   // 残す互換窓で、型を `ChipReadonlyView` に狭めてある（下の注釈参照）。
-  const services = { db, settings, ledger, payroll, migration, events, entry, nicknames, originalRoles, returns, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, dailyRisk, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, persistentTables, rankedTables, rankedDisputes, rankedProfiles, takutate, freeSpins, reservations, recoveryRegistry, rng };
+  const services = { db, settings, ledger, payroll, migration, events, entry, nicknames, originalRoles, subAccounts, returns, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, dailyRisk, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, persistentTables, rankedTables, rankedDisputes, rankedProfiles, takutate, freeSpins, reservations, recoveryRegistry, rng };
   // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
   seedSpecialProfiles(services);
   return services;

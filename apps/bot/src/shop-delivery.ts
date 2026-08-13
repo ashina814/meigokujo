@@ -1,6 +1,8 @@
 import type { Guild, GuildMember, Role } from "discord.js";
 import {
   AUTO_DELIVERABLE_KINDS,
+  RANK_ROLE_SETTING_KEYS,
+  roleToRestoreForStatus,
   describeRejection,
   parseDeliverySnapshot,
   type OriginalRoleRow,
@@ -369,6 +371,73 @@ export async function deliverPurchaseUnlocked(
       };
     }
 
+    if (kind === "activate_sub_account") {
+      const request = parseRequest(purchase.request_json);
+      const applicationId = typeof request?.applicationId === "number" ? request.applicationId : null;
+      if (!applicationId) return fail("application_missing", "申請の記録が無いため有効化できませんでした。");
+      if (!guild) return fail("guild_unavailable", "サーバー情報が取れず有効化できませんでした。");
+      const application = services.subAccounts.get(applicationId);
+      if (!application) return fail("application_not_found", "申請が見つかりません。運営にお問い合わせください。");
+      if (application.main_user_id !== userId) return fail("application_owner_mismatch", "申請の持ち主が違います。");
+      // 落ちて再実行された場合、ロールは付いているのに記録が終わっていないことがある
+      if (application.status === "active") {
+        services.shop.markDeliverySucceeded(purchase.id, actor);
+        return { state: "delivered", message: `サブ垢 <@${application.alt_user_id}> は有効化済みです。` };
+      }
+      if (application.status !== "approved") {
+        return fail(`application_bad_status:${application.status}`, "この申請は承認待ちの状態ではありません。");
+      }
+      const alt = await guild.members.fetch(application.alt_user_id).catch(() => null);
+      if (!alt) return fail("alt_not_in_guild", "サブ垢がサーバーに参加していないため有効化できませんでした。");
+
+      // **入城処理（ghostify）は流用しない。** あれは初期発行・評価期間の開始・
+      // 招待実績の確定までやるので、サブ垢に流すと同じ人が二重に初期発行を受け、
+      // 評価期間まで生える。サブ垢に渡すのは本体と同じ階級ロールだけ
+      const roleId = rankRoleIdFor(services, userId);
+      if (!roleId) {
+        return fail("main_rank_unavailable", "本体の階級が確認できないため有効化できませんでした。運営にお問い合わせください。");
+      }
+      let added = await alt.roles
+        .add(roleId, "公式ショップ: サブ垢の有効化")
+        .then(() => true)
+        .catch((e: Error) => e.message || "unknown");
+      if (added !== true) {
+        // **エラーだけで決めない。** Discord側では通っていることがある
+        if (await memberHasRole(guild, application.alt_user_id, roleId)) added = true;
+      }
+      if (added !== true) return fail(`alt_role_add_failed:${added}`, "サブ垢へのロール付与に失敗しました。");
+
+      if (!services.subAccounts.activate({ id: application.id, purchaseId: purchase.id, actor })) {
+        const settled = services.subAccounts.get(application.id);
+        // 相手が先に有効化していたなら、これは成功の収束
+        if (settled?.status === "active") {
+          services.shop.markDeliverySucceeded(purchase.id, actor);
+          return { state: "delivered", message: `サブ垢 <@${application.alt_user_id}> を有効化しました。` };
+        }
+        // **返金の前に、今つけたロールを戻す。** 外せたか確認できないなら返金しない
+        const removed = await alt.roles
+          .remove(roleId, "公式ショップ: 有効化できなかったため取り消し")
+          .then(() => true)
+          .catch(() => false);
+        const stillHeld = removed
+          ? await memberHasRole(guild, application.alt_user_id, roleId)
+          : await memberHasRoleStrict(guild, application.alt_user_id, roleId);
+        if (stillHeld !== false) {
+          return fail(
+            "sub_account_conflict_rollback_failed",
+            "サブ垢の有効化に失敗しました。運営が確認しますので、そのままお待ちください。",
+            { refundable: false },
+          );
+        }
+        return fail("sub_account_activate_conflict", "サブ垢の有効化に失敗しました。運営にお問い合わせください。");
+      }
+      services.shop.markDeliverySucceeded(purchase.id, actor);
+      return {
+        state: "delivered",
+        message: `サブ垢 <@${application.alt_user_id}> を有効化しました。階級は本体に合わせて自動で追従します。`,
+      };
+    }
+
     if (kind === "extend_deadline") {
       const days = data.days ?? 1;
       const soul = services.entry.getSoul(userId);
@@ -534,4 +603,18 @@ async function memberHasRoleStrict(guild: Guild, userId: string, roleId: string)
   const fresh = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
   if (!fresh) return null;
   return fresh.roles.cache.has(roleId);
+}
+
+/**
+ * 本体の階級に対応するロール。**サブ垢に渡すのはこれだけ。**
+ *
+ * 迷霊（懲罰）と入城前・離脱済みは対象にしない。前者はサブ垢へ広げる意味が無く、
+ * 後者はそもそも渡せる階級が無い。
+ */
+export function rankRoleIdFor(services: Services, mainUserId: string): string | null {
+  const soul = services.entry.getSoul(mainUserId);
+  const rank = roleToRestoreForStatus(soul?.status ?? null);
+  if (!rank) return null;
+  const key = RANK_ROLE_SETTING_KEYS[rank as keyof typeof RANK_ROLE_SETTING_KEYS];
+  return key ? (services.settings.getString(key) ?? null) : null;
 }

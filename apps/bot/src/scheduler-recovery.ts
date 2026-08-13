@@ -518,3 +518,27 @@ export async function convergePendingOriginalRoles(client: Client, services: Ser
     }
   }
 }
+
+/**
+ * 課金済みなのに有効化されていないサブ垢を収束させる。
+ * 有効化できるならやりきり、できないなら返金する（返金も駄目なときだけ人へ）。
+ */
+export async function convergePendingSubAccounts(client: Client, services: Services): Promise<void> {
+  const targets = services.shop.listUndeliveredAuto(20, { kinds: ["activate_sub_account"] });
+  if (targets.length === 0) return;
+  const { deliverOrRefund } = await import("./shop-refund.js");
+  const guildId = services.settings.getString("guild:main");
+  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
+  for (const purchase of targets) {
+    const { refund } = await deliverOrRefund(client, services, guild, purchase, "system:shop-sub-account");
+    if (refund !== "refunded") continue;
+    try {
+      const user = await client.users.fetch(purchase.user_id).catch(() => null);
+      await user?.send(
+        `🛒 サブ垢を有効化できなかったため、**${(purchase.paid_land ?? 0).toLocaleString()} Ld** を返金しました。`,
+      );
+    } catch {
+      /* DMが閉じている。返金は済んでいるので、ここで止めない */
+    }
+  }
+}
