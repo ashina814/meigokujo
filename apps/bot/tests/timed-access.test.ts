@@ -1,7 +1,8 @@
 import { Collection, type Guild } from "discord.js";
 import { describe, expect, it, vi } from "vitest";
 import { EventLog, Ledger, Shop, TREASURY, openDb, registerDefaultTxTypes } from "@meigokujo/core";
-import { reconcileTimedAccessRoles } from "../src/timed-access.js";
+import { reconcileTimedAccessForClient, reconcileTimedAccessForGuild } from "../src/timed-access.js";
+import { collectTimedAccessLegacyExpectations } from "../src/timed-access-legacy-migration.js";
 import type { Services } from "../src/services.js";
 
 const USER = "user-1";
@@ -44,12 +45,13 @@ function setup(opts: { legacy?: boolean } = {}) {
   } else {
     db.prepare("UPDATE shop_purchases SET delivery_state='delivered' WHERE id=?").run(purchase.id);
   }
-  return { db, ledger, events, shop, item, purchase, services: { shop, events } as Services };
+  const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "main-guild" : undefined) };
+  return { db, ledger, events, shop, item, purchase, services: { shop, events, settings } as Services };
 }
 
 function guildWith(
   roles: string[] = [],
-  opts: { addFails?: boolean; finalFetchFails?: boolean; expireOnAdd?: () => void } = {},
+  opts: { id?: string; addFails?: boolean; finalFetchFails?: boolean; expireOnAdd?: () => void } = {},
 ) {
   const cache = new Collection(roles.map((id) => [id, { id }]));
   let fetches = 0;
@@ -68,6 +70,7 @@ function guildWith(
     },
   };
   const guild = {
+    id: opts.id ?? "main-guild",
     members: {
       fetch: vi.fn(async () => {
         fetches += 1;
@@ -84,7 +87,7 @@ describe("期限付きアクセスの自己修復", () => {
     const ctx = setup();
     const discord = guildWith();
 
-    const result = await reconcileTimedAccessRoles(discord.guild, ctx.services);
+    const result = await reconcileTimedAccessForGuild(discord.guild, ctx.services);
 
     expect(result).toMatchObject({ checked: 1, restored: 1, failed: [] });
     expect(discord.member.roles.add).toHaveBeenCalledWith(ROLE, expect.any(String));
@@ -98,13 +101,13 @@ describe("期限付きアクセスの自己修復", () => {
     const ctx = setup();
     const failing = guildWith([], { addFails: true });
 
-    const first = await reconcileTimedAccessRoles(failing.guild, ctx.services);
+    const first = await reconcileTimedAccessForGuild(failing.guild, ctx.services);
     expect(first.failed).toHaveLength(1);
     expect(ctx.shop.getPurchase(ctx.purchase.id)!.status).toBe("active");
     expect(failing.cache.has(ROLE)).toBe(false);
 
     const working = guildWith();
-    const second = await reconcileTimedAccessRoles(working.guild, ctx.services);
+    const second = await reconcileTimedAccessForGuild(working.guild, ctx.services);
     expect(second.restored).toBe(1);
     expect(working.cache.has(ROLE)).toBe(true);
     ctx.db.close();
@@ -116,7 +119,7 @@ describe("期限付きアクセスの自己修復", () => {
       expireOnAdd: () => ctx.db.prepare("UPDATE shop_purchases SET status='expired' WHERE id=?").run(ctx.purchase.id),
     });
 
-    await reconcileTimedAccessRoles(discord.guild, ctx.services);
+    await reconcileTimedAccessForGuild(discord.guild, ctx.services);
 
     expect(ctx.shop.getPurchase(ctx.purchase.id)!.status).toBe("expired");
     expect(discord.member.roles.remove).toHaveBeenCalledWith(ROLE, expect.any(String));
@@ -129,7 +132,7 @@ describe("期限付きアクセスの自己修復", () => {
     ctx.db.prepare("UPDATE shop_purchases SET delivery_state='failed' WHERE id=?").run(ctx.purchase.id);
     const discord = guildWith([], { finalFetchFails: true });
 
-    const result = await reconcileTimedAccessRoles(discord.guild, ctx.services);
+    const result = await reconcileTimedAccessForGuild(discord.guild, ctx.services);
 
     expect(result.failed).toHaveLength(1);
     expect(ctx.shop.getPurchase(ctx.purchase.id)!.delivery_state).toBe("failed");
@@ -141,10 +144,62 @@ describe("期限付きアクセスの自己修復", () => {
     const ctx = setup({ legacy: true });
     const discord = guildWith();
 
-    const result = await reconcileTimedAccessRoles(discord.guild, ctx.services, USER);
+    const result = await reconcileTimedAccessForGuild(discord.guild, ctx.services, USER);
 
     expect(result.restored).toBe(1);
     expect(discord.cache.has(ROLE)).toBe(true);
+    ctx.db.close();
+  });
+
+  it("GuildMemberAdd相当の復元はmain guild以外でmember fetchもrole変更もしない", async () => {
+    const ctx = setup();
+    const other = guildWith([], { id: "other-guild" });
+
+    const result = await reconcileTimedAccessForGuild(other.guild, ctx.services, USER);
+
+    expect(result).toEqual({ checked: 0, restored: 0, absent: 0, failed: [] });
+    expect(other.guild.members.fetch).not.toHaveBeenCalled();
+    expect(other.member.roles.add).not.toHaveBeenCalled();
+    ctx.db.close();
+  });
+
+  it("起動時復元はguild:mainだけをfetchして収束する", async () => {
+    const ctx = setup();
+    const main = guildWith();
+    const client = { guilds: { fetch: vi.fn(async (id: string) => {
+      expect(id).toBe("main-guild");
+      return main.guild;
+    }) } };
+
+    const result = await reconcileTimedAccessForClient(client as never, ctx.services);
+
+    expect(client.guilds.fetch).toHaveBeenCalledTimes(1);
+    expect(result.restored).toBe(1);
+    expect(main.cache.has(ROLE)).toBe(true);
+    ctx.db.close();
+  });
+});
+
+describe("legacy移行候補のDiscord実状態取得", () => {
+  it("force取得したmain guild memberのうち商品設定roleを持つ人だけを渡す", async () => {
+    const ctx = setup();
+    const holders = new Collection([
+      ["role-user", { id: "role-user", roles: { cache: new Collection([[ROLE, { id: ROLE }]]) } }],
+      ["plain-user", { id: "plain-user", roles: { cache: new Collection() } }],
+    ]);
+    const fetch = vi.fn(async () => holders);
+    const guild = { id: "main-guild", members: { fetch } } as unknown as Guild;
+
+    const expectations = await collectTimedAccessLegacyExpectations(
+      guild,
+      ctx.shop,
+      [{ itemId: ctx.item.id, expectedCount: 1 }],
+    );
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(expectations).toEqual([
+      { itemId: ctx.item.id, roleId: ROLE, expectedCount: 1, roleHolderIds: ["role-user"] },
+    ]);
     ctx.db.close();
   });
 });

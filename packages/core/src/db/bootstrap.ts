@@ -643,6 +643,31 @@ CREATE TABLE IF NOT EXISTS shop_purchases (
 CREATE INDEX IF NOT EXISTS idx_shop_purchases_user ON shop_purchases(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_shop_purchases_expiry ON shop_purchases(status, expires_at);
 
+CREATE TABLE IF NOT EXISTS shop_timed_access_legacy_runs (
+  migration_key TEXT PRIMARY KEY,
+  plan_json     TEXT NOT NULL,
+  actor_id      TEXT NOT NULL,
+  reason        TEXT NOT NULL,
+  started_at    INTEGER NOT NULL,
+  completed_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shop_timed_access_legacy_imports (
+  purchase_id   INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
+  migration_key TEXT NOT NULL REFERENCES shop_timed_access_legacy_runs(migration_key),
+  item_id       INTEGER NOT NULL REFERENCES shop_items(id),
+  user_id       TEXT NOT NULL,
+  role_id       TEXT NOT NULL,
+  started_at    INTEGER NOT NULL,
+  expires_at    INTEGER NOT NULL,
+  reason        TEXT NOT NULL,
+  actor_id      TEXT NOT NULL,
+  created_at    INTEGER NOT NULL,
+  UNIQUE(item_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_shop_timed_access_legacy_imports_run
+  ON shop_timed_access_legacy_imports(migration_key, item_id);
+
 CREATE TABLE IF NOT EXISTS shop_role_revocations (
   purchase_id INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
   user_id     TEXT NOT NULL,

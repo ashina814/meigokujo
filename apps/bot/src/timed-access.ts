@@ -9,6 +9,8 @@ export interface TimedAccessReconcileResult {
   failed: Array<{ userId: string; roleId: string; error: string }>;
 }
 
+const emptyResult = (): TimedAccessReconcileResult => ({ checked: 0, restored: 0, absent: 0, failed: [] });
+
 function errorCode(error: unknown): number | undefined {
   if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
   const code = Number((error as { code?: unknown }).code);
@@ -27,7 +29,7 @@ function uniqueGrants(grants: TimedAccessGrant[]): TimedAccessGrant[] {
  * role addの直前と直後に契約を再確認する。期限切れ処理と競合して古い一覧からaddした場合は、
  * activeな別契約が無いことを確かめて自分で剥がし、expiredなのにロールだけ残す順序を作らない。
  */
-export async function reconcileTimedAccessRoles(
+async function reconcileTimedAccessRoles(
   guild: Guild,
   services: Pick<Services, "shop" | "events">,
   userId?: string,
@@ -115,5 +117,16 @@ export async function reconcileTimedAccessForClient(
   const guildId = services.settings.getString("guild:main");
   if (!guildId) throw new Error("shop_timed_access:guild_id_missing");
   const guild = await client.guilds.fetch(guildId);
+  return reconcileTimedAccessForGuild(guild, services, userId);
+}
+
+/** 起動時・再参加時とも、設定上のmain guild以外ではDiscordを一切読まない。 */
+export async function reconcileTimedAccessForGuild(
+  guild: Guild,
+  services: Pick<Services, "shop" | "settings" | "events">,
+  userId?: string,
+): Promise<TimedAccessReconcileResult> {
+  const guildId = services.settings.getString("guild:main");
+  if (!guildId || guild.id !== guildId) return emptyResult();
   return reconcileTimedAccessRoles(guild, services, userId);
 }
