@@ -1,4 +1,5 @@
 import type { Client } from "discord.js";
+import { randomUUID } from "node:crypto";
 import { describeRankSyncFailure, reconcileAltRank } from "./sub-account-rank.js";
 import type { Services } from "./services.js";
 
@@ -41,28 +42,37 @@ export async function syncSubAccountRanks(client: Client, services: Services): P
   if (!guild) return;
 
   for (const row of rows) {
-    const alt = await guild.members.fetch(row.alt_user_id).catch(() => null);
-    if (!alt) continue; // 抜けている。記録は触らず人の判断に残す
-    const result = await reconcileAltRank(services, guild, alt, row.main_user_id);
-    if (!result.ok) {
-      // **合わせられていないものを「同期済み」にしない**
-      services.events.log("sub_account_rank_sync_failed", {
+    const operationToken = randomUUID();
+    // 一覧を読んだあとに運営解除が始まっていても、同じleaseは取れない。
+    if (!services.subAccounts.claimRankOperation(row.id, "sync", operationToken)) continue;
+    try {
+      const alt = await guild.members.fetch(row.alt_user_id).catch(() => null);
+      if (!alt) continue; // 抜けている。記録は触らず人の判断に残す
+      const result = await reconcileAltRank(services, guild, alt, row.main_user_id, {
+        renewOperation: () => services.subAccounts.renewRankOperation(row.id, operationToken),
+      });
+      if (!result.ok) {
+        // **合わせられていないものを「同期済み」にしない**
+        services.events.log("sub_account_rank_sync_failed", {
+          actor: ACTOR,
+          target: row.main_user_id,
+          payload: {
+            id: row.id,
+            altUserId: row.alt_user_id,
+            wanted: result.wanted,
+            detail: describeRankSyncFailure(result),
+          },
+        });
+        continue;
+      }
+      if (!result.changed) continue;
+      services.events.log("sub_account_rank_synced", {
         actor: ACTOR,
         target: row.main_user_id,
-        payload: {
-          id: row.id,
-          altUserId: row.alt_user_id,
-          wanted: result.wanted,
-          detail: describeRankSyncFailure(result),
-        },
+        payload: { id: row.id, altUserId: row.alt_user_id, wanted: result.wanted },
       });
-      continue;
+    } finally {
+      services.subAccounts.releaseRankOperation(row.id, operationToken);
     }
-    if (!result.changed) continue;
-    services.events.log("sub_account_rank_synced", {
-      actor: ACTOR,
-      target: row.main_user_id,
-      payload: { id: row.id, altUserId: row.alt_user_id, wanted: result.wanted },
-    });
   }
 }

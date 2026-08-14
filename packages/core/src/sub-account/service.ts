@@ -40,6 +40,7 @@ export function isEligibleMainRank(status: SoulStatus | null | undefined): boole
 }
 
 export type SubAccountStatus = "pending" | "approved" | "active" | "returned" | "rejected" | "cancelled";
+export type SubAccountRankOperationKind = "sync" | "deactivate";
 
 /** 進行中とみなす状態。ここに居る間は同じ相手を重ねて登録できない */
 export const SUB_ACCOUNT_OPEN_STATUSES: readonly SubAccountStatus[] = ["pending", "approved", "active"];
@@ -56,6 +57,8 @@ export interface SubAccountRow {
   decided_at: number | null;
   decide_reason: string | null;
   activated_at: number | null;
+  /** 人が旧契約の main/alt を突き合わせて引き継いだ時刻。解除後も未引き継ぎ判定に使う。 */
+  legacy_imported_at: number | null;
   activation_rank_baseline: string | null;
   activation_rank_settled_at: number | null;
   created_at: number;
@@ -100,10 +103,10 @@ export class SubAccounts {
     return (this.db.prepare("SELECT * FROM sub_accounts WHERE id = ?").get(id) as SubAccountRow) ?? null;
   }
 
-  listByStatus(status: SubAccountStatus, limit = 50): SubAccountRow[] {
+  listByStatus(status: SubAccountStatus, limit = 50, offset = 0): SubAccountRow[] {
     return this.db
-      .prepare("SELECT * FROM sub_accounts WHERE status = ? ORDER BY created_at LIMIT ?")
-      .all(status, limit) as SubAccountRow[];
+      .prepare("SELECT * FROM sub_accounts WHERE status = ? ORDER BY created_at, id LIMIT ? OFFSET ?")
+      .all(status, limit, offset) as SubAccountRow[];
   }
 
   countByStatus(status: SubAccountStatus): number {
@@ -123,6 +126,74 @@ export class SubAccounts {
     return this.db
       .prepare("SELECT * FROM sub_accounts WHERE status = 'active' ORDER BY id LIMIT ?")
       .all(limit) as SubAccountRow[];
+  }
+
+  /** 旧契約の組み合わせを人が一度でも明示登録したか。解除済みも履歴として含む。 */
+  hasLegacyImport(mainUserId: string): boolean {
+    return Boolean(
+      this.db
+        .prepare("SELECT 1 FROM sub_accounts WHERE main_user_id = ? AND legacy_imported_at IS NOT NULL LIMIT 1")
+        .get(mainUserId),
+    );
+  }
+
+  /**
+   * Discord階級操作の短期leaseを取る。
+   *
+   * scheduler同期と運営解除は同じ契約へ同時に副作用を出してはいけない。DBの
+   * immediate transactionでclaimを直列化し、古い一覧を読んだschedulerもここで止める。
+   * クラッシュでleaseが残っても期限後に再取得でき、activeなら同期へ収束する。
+   */
+  claimRankOperation(
+    id: number,
+    kind: SubAccountRankOperationKind,
+    token: string,
+    leaseSeconds = 300,
+  ): boolean {
+    const run = this.db.transaction(() => {
+      const ts = now();
+      this.db
+        .prepare("DELETE FROM sub_account_rank_operations WHERE sub_account_id = ? AND expires_at <= ?")
+        .run(id, ts);
+      const active = this.db
+        .prepare("SELECT 1 FROM sub_accounts WHERE id = ? AND status = 'active'")
+        .get(id);
+      if (!active) return false;
+      return (
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO sub_account_rank_operations
+               (sub_account_id, kind, token, expires_at, created_at)
+             VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(id, kind, token, ts + leaseSeconds, ts).changes === 1
+      );
+    });
+    return run.immediate();
+  }
+
+  /** 自分が持つleaseだけを解放する。他の処理のleaseは触らない。 */
+  releaseRankOperation(id: number, token: string): boolean {
+    return (
+      this.db
+        .prepare("DELETE FROM sub_account_rank_operations WHERE sub_account_id = ? AND token = ?")
+        .run(id, token).changes === 1
+    );
+  }
+
+  /** Discord変更の直前に所有権を再確認し、実行中のleaseを延長する。 */
+  renewRankOperation(id: number, token: string, leaseSeconds = 300): boolean {
+    const ts = now();
+    return (
+      this.db
+        .prepare(
+          `UPDATE sub_account_rank_operations
+              SET expires_at = ?
+            WHERE sub_account_id = ? AND token = ?
+              AND EXISTS (SELECT 1 FROM sub_accounts WHERE id = ? AND status = 'active')`,
+        )
+        .run(ts + leaseSeconds, id, token, id).changes === 1
+    );
   }
 
   /** そのアカウントが誰かのサブ垢なら、その組み合わせ */
@@ -335,10 +406,12 @@ export class SubAccounts {
       const id = Number(
         this.db
           .prepare(
-            `INSERT INTO sub_accounts (main_user_id, alt_user_id, status, approved_by, approved_at, activated_at, created_at, updated_at)
-             VALUES (?,?, 'active', ?, ?, ?, ?, ?)`,
+            `INSERT INTO sub_accounts
+               (main_user_id, alt_user_id, status, approved_by, approved_at, activated_at,
+                legacy_imported_at, created_at, updated_at)
+             VALUES (?,?, 'active', ?, ?, ?, ?, ?, ?)`,
           )
-          .run(input.mainUserId, input.altUserId, input.actor, ts, ts, ts, ts).lastInsertRowid,
+          .run(input.mainUserId, input.altUserId, input.actor, ts, ts, ts, ts, ts).lastInsertRowid,
       );
       this.events.log("sub_account_imported", {
         actor: input.actor,
@@ -350,17 +423,34 @@ export class SubAccounts {
     return run.immediate();
   }
 
-  /** 解除する（本体が離脱した・運営が取り消した） */
-  deactivate(id: number, actor: string, reason: string): boolean {
-    const changed = this.db
-      .prepare("UPDATE sub_accounts SET status = 'cancelled', updated_at = ? WHERE id = ? AND status = 'active'")
-      .run(now(), id).changes;
-    if (changed !== 1) return false;
-    this.events.log("sub_account_deactivated", {
-      actor,
-      target: this.get(id)!.main_user_id,
-      payload: { id, reason },
+  /**
+   * 解除を確定する。Discord階級ロール0件の確認を終えたdeactivate lease所有者だけが呼べる。
+   * status更新とlease解放・eventを同じtransactionに入れ、DBだけ先に解除しない。
+   */
+  deactivate(id: number, actor: string, reason: string, operationToken: string): boolean {
+    const run = this.db.transaction(() => {
+      const owned = this.db
+        .prepare(
+          `SELECT 1 FROM sub_account_rank_operations
+            WHERE sub_account_id = ? AND kind = 'deactivate' AND token = ?`,
+        )
+        .get(id, operationToken);
+      if (!owned) return false;
+      const changed = this.db
+        .prepare("UPDATE sub_accounts SET status = 'cancelled', updated_at = ? WHERE id = ? AND status = 'active'")
+        .run(now(), id).changes;
+      if (changed !== 1) return false;
+      const row = this.get(id)!;
+      this.db
+        .prepare("DELETE FROM sub_account_rank_operations WHERE sub_account_id = ? AND token = ?")
+        .run(id, operationToken);
+      this.events.log("sub_account_deactivated", {
+        actor,
+        target: row.main_user_id,
+        payload: { id, altUserId: row.alt_user_id, purchaseId: row.purchase_id, reason },
+      });
+      return true;
     });
-    return true;
+    return run.immediate();
   }
 }

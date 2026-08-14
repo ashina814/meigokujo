@@ -59,6 +59,8 @@ export function hasUnresolvedLegacySubAccount(services: Services, userId: string
   const legacyItemId = Number(services.settings.getString("shop:sub_account_legacy_item_id"));
   if (!Number.isInteger(legacyItemId) || legacyItemId <= 0) return false;
   if (services.subAccounts.listByMain(userId).some((row) => row.status === "active")) return false;
+  // 人が一度でも旧契約を明示登録していれば、正式解除後も「未引き継ぎ」へ戻さない。
+  if (services.subAccounts.hasLegacyImport(userId)) return false;
   return Boolean(
     services.db
       .prepare("SELECT 1 FROM shop_purchases WHERE item_id = ? AND user_id = ? AND status = 'active' LIMIT 1")
