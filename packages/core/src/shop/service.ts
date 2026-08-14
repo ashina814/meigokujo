@@ -233,7 +233,13 @@ export type ShopErrorCode =
   | "ERR_REEVAL_INVITES_INSUFFICIENT"
   | "ERR_REEVAL_NOT_CONSUMED"
   | "ERR_REEVAL_ALREADY_COMPENSATED"
-  | "ERR_REEVAL_COMPENSATION_UNAVAILABLE";
+  | "ERR_REEVAL_COMPENSATION_UNAVAILABLE"
+  | "ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED"
+  | "ERR_EVAL_EXTENSION_ITEM_CONFIG"
+  | "ERR_EVAL_EXTENSION_STATUS"
+  | "ERR_EVAL_EXTENSION_CYCLE"
+  | "ERR_EVAL_EXTENSION_EXPIRED"
+  | "ERR_EVAL_EXTENSION_LIMIT";
 
 export class ShopError extends Error {
   constructor(readonly code: ShopErrorCode, readonly details: Record<string, unknown> = {}) {
@@ -249,6 +255,8 @@ const DAY = 86_400;
 export const DEFAULT_TERM_DAYS = 30;
 export const REEVAL_PRICE_LAND = 500_000;
 export const REEVAL_INVITE_COUNT = 5;
+export const EVAL_EXTENSION_PRICE_LAND = 50_000;
+export const EVAL_EXTENSION_MAX_USES = 5;
 
 export interface ReevalInviteUseRow {
   invite_id: number;
@@ -266,6 +274,25 @@ export interface ReevalCompensationRow {
   reason: string;
   actor_id: string;
   ledger_transaction_id: number;
+  created_at: number;
+}
+
+export interface EvaluationExtensionQuote {
+  cycleStartedAt: number;
+  currentDeadlineAt: number;
+  nextDeadlineAt: number;
+  usedCount: number;
+  remainingCount: number;
+}
+
+export interface EvaluationExtensionUseRow {
+  purchase_id: number;
+  item_id: number;
+  user_id: string;
+  eval_started_at: number;
+  previous_deadline_at: number;
+  new_deadline_at: number;
+  sequence: number;
   created_at: number;
 }
 
@@ -294,6 +321,22 @@ export function isTimedAccessItem(
   item: Pick<ShopItemRow, "kind" | "duration_days" | "delivery" | "delivery_kind">,
 ): boolean {
   return termDays(item as ShopItemRow) !== null && item.delivery === "auto" && item.delivery_kind === "add_role";
+}
+
+/** 評価期限を1日延ばす即時商品。商品IDではなく配送の意味で特定する。 */
+export function isEvaluationExtensionItem(
+  item: Pick<ShopItemRow, "kind" | "delivery" | "delivery_kind">,
+): boolean {
+  return item.kind === "one_shot" && item.delivery === "auto" && item.delivery_kind === "extend_deadline";
+}
+
+function evaluationExtensionDays(item: Pick<ShopItemRow, "delivery_data">): number | null {
+  try {
+    const data = item.delivery_data ? JSON.parse(item.delivery_data) as Record<string, unknown> : {};
+    return typeof data.days === "number" ? data.days : null;
+  } catch {
+    return null;
+  }
 }
 
 /** 商品設定からアクセス先を読む。商品IDやチャンネルIDはコードへ持ち込まない。 */
@@ -392,6 +435,19 @@ export class Shop {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_shop_reeval_compensations_user ON shop_reeval_compensations(user_id, created_at);
+      CREATE TABLE IF NOT EXISTS shop_eval_extension_uses (
+        purchase_id INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
+        item_id INTEGER NOT NULL REFERENCES shop_items(id),
+        user_id TEXT NOT NULL,
+        eval_started_at INTEGER NOT NULL,
+        previous_deadline_at INTEGER NOT NULL,
+        new_deadline_at INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 5),
+        created_at INTEGER NOT NULL,
+        UNIQUE(user_id, eval_started_at, sequence)
+      );
+      CREATE INDEX IF NOT EXISTS idx_shop_eval_extension_uses_cycle
+        ON shop_eval_extension_uses(user_id, eval_started_at, sequence);
     `);
   }
 
@@ -554,6 +610,10 @@ export class Shop {
     if (this.options.reevalItemId?.() === input.itemId) {
       throw new ShopError("ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
     }
+    const item = this.getItem(input.itemId);
+    if (item && isEvaluationExtensionItem(item)) {
+      throw new ShopError("ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
+    }
     return this.purchaseInternal(input);
   }
 
@@ -646,6 +706,199 @@ export class Shop {
       payload: { itemId: item.id, purchaseId: purchase.id, paidLand, paidAltKind, paidAltAmount, expiresAt },
     });
     return { purchase, item, needsManualDelivery: item.delivery === "manual" };
+  }
+
+  /**
+   * 評価期限延長の購入前表示と、課金直前の同じ判定。
+   *
+   * 旧V1購入は書き換えない。ただし現在サイクル中に配送済みの同一商品購入は
+   * 既に1日を受け取った事実なので上限へ含め、V2化で回数が0へ戻らないようにする。
+   */
+  checkEvaluationExtensionPurchase(input: {
+    itemId: number;
+    userId: string;
+    expected?: Pick<EvaluationExtensionQuote, "cycleStartedAt" | "currentDeadlineAt" | "usedCount"> & {
+      priceLand: number;
+    };
+  }): EvaluationExtensionQuote {
+    const item = this.getItem(input.itemId);
+    if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: input.itemId });
+    if (!item.enabled) throw new ShopError("ERR_ITEM_DISABLED", { itemId: item.id });
+    if (
+      !isEvaluationExtensionItem(item) ||
+      evaluationExtensionDays(item) !== 1 ||
+      item.price_land !== EVAL_EXTENSION_PRICE_LAND ||
+      item.price_alt_kind !== null ||
+      item.price_alt_amount !== null ||
+      item.duration_days !== null ||
+      item.require_role_id !== null ||
+      item.stock !== null
+    ) {
+      throw new ShopError("ERR_EVAL_EXTENSION_ITEM_CONFIG", { itemId: item.id });
+    }
+
+    const soul = this.db
+      .prepare("SELECT status, eval_started_at, eval_deadline_at FROM souls WHERE user_id = ?")
+      .get(input.userId) as
+      | { status: string; eval_started_at: number | null; eval_deadline_at: number | null }
+      | undefined;
+    if (soul?.status !== "ghost") {
+      throw new ShopError("ERR_EVAL_EXTENSION_STATUS", { userId: input.userId, status: soul?.status ?? null });
+    }
+    if (soul.eval_started_at === null || soul.eval_deadline_at === null) {
+      throw new ShopError("ERR_EVAL_EXTENSION_CYCLE", { userId: input.userId });
+    }
+    if (soul.eval_deadline_at <= now()) {
+      throw new ShopError("ERR_EVAL_EXTENSION_EXPIRED", { userId: input.userId, deadlineAt: soul.eval_deadline_at });
+    }
+
+    const usedCount = (this.db
+      .prepare(
+        `SELECT COUNT(*) AS n
+           FROM shop_purchases p
+          WHERE p.item_id = ? AND p.user_id = ? AND p.purchased_at >= ?
+            AND COALESCE(p.delivery_state, CASE WHEN p.delivered_at IS NOT NULL THEN 'delivered' END) = 'delivered'`,
+      )
+      .get(item.id, input.userId, soul.eval_started_at) as { n: number }).n;
+    if (usedCount >= EVAL_EXTENSION_MAX_USES) {
+      throw new ShopError("ERR_EVAL_EXTENSION_LIMIT", { usedCount, maxUses: EVAL_EXTENSION_MAX_USES });
+    }
+    if (
+      input.expected &&
+      (input.expected.priceLand !== item.price_land ||
+        input.expected.cycleStartedAt !== soul.eval_started_at ||
+        input.expected.currentDeadlineAt !== soul.eval_deadline_at ||
+        input.expected.usedCount !== usedCount)
+    ) {
+      throw new ShopError("ERR_TERMS_CHANGED", {
+        expected: input.expected,
+        actual: {
+          priceLand: item.price_land,
+          cycleStartedAt: soul.eval_started_at,
+          currentDeadlineAt: soul.eval_deadline_at,
+          usedCount,
+        },
+      });
+    }
+    return {
+      cycleStartedAt: soul.eval_started_at,
+      currentDeadlineAt: soul.eval_deadline_at,
+      nextDeadlineAt: soul.eval_deadline_at + DAY,
+      usedCount,
+      remainingCount: EVAL_EXTENSION_MAX_USES - usedCount,
+    };
+  }
+
+  /** 資格・上限、Land課金、購入、期限更新、使用台帳を1つのIMMEDIATE transactionで確定する。 */
+  purchaseEvaluationExtension(input: {
+    itemId: number;
+    userId: string;
+    actor: string;
+    memberRoleIds: readonly string[];
+    expected: Pick<EvaluationExtensionQuote, "cycleStartedAt" | "currentDeadlineAt" | "usedCount"> & {
+      priceLand: number;
+    };
+    request?: Record<string, unknown>;
+    idempotencyKey: string;
+  }): {
+    purchase: PurchaseRow;
+    item: ShopItemRow;
+    needsManualDelivery: false;
+    extension: EvaluationExtensionUseRow;
+  } {
+    const body = () => {
+      // 画面表示時とは別に、Landを動かす直前のDB正本を読む。
+      const quote = this.checkEvaluationExtensionPurchase({
+        itemId: input.itemId,
+        userId: input.userId,
+        expected: input.expected,
+      });
+      const result = this.purchaseInternal({
+        itemId: input.itemId,
+        userId: input.userId,
+        actor: input.actor,
+        memberRoleIds: input.memberRoleIds,
+        request: {
+          ...input.request,
+          evaluationExtension: {
+            cycleStartedAt: quote.cycleStartedAt,
+            previousDeadlineAt: quote.currentDeadlineAt,
+            newDeadlineAt: quote.nextDeadlineAt,
+            sequence: quote.usedCount + 1,
+          },
+        },
+        idempotencyKey: input.idempotencyKey,
+      });
+      const ts = now();
+      const changed = this.db
+        .prepare(
+          `UPDATE souls
+              SET eval_deadline_at = ?, updated_at = ?
+            WHERE user_id = ? AND status = 'ghost'
+              AND eval_started_at = ? AND eval_deadline_at = ? AND eval_deadline_at > ?`,
+        )
+        .run(
+          quote.nextDeadlineAt,
+          ts,
+          input.userId,
+          quote.cycleStartedAt,
+          quote.currentDeadlineAt,
+          ts,
+        ).changes;
+      if (changed !== 1) throw new ShopError("ERR_TERMS_CHANGED", { itemId: input.itemId });
+
+      const delivered = this.db
+        .prepare(
+          `UPDATE shop_purchases
+              SET delivered_at = ?, delivery_state = 'delivered', delivery_error = NULL, delivery_updated_at = ?
+            WHERE id = ? AND status = 'active' AND COALESCE(delivery_state, 'pending') <> 'delivered'`,
+        )
+        .run(ts, ts, result.purchase.id).changes;
+      if (delivered !== 1) throw new ShopError("ERR_TERMS_CHANGED", { purchaseId: result.purchase.id });
+      const sequence = quote.usedCount + 1;
+      this.db
+        .prepare(
+          `INSERT INTO shop_eval_extension_uses
+             (purchase_id,item_id,user_id,eval_started_at,previous_deadline_at,new_deadline_at,sequence,created_at)
+           VALUES (?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          result.purchase.id,
+          result.item.id,
+          input.userId,
+          quote.cycleStartedAt,
+          quote.currentDeadlineAt,
+          quote.nextDeadlineAt,
+          sequence,
+          ts,
+        );
+      this.events.log("shop_eval_extension_purchased", {
+        actor: input.actor,
+        target: input.userId,
+        payload: {
+          purchaseId: result.purchase.id,
+          itemId: result.item.id,
+          evalStartedAt: quote.cycleStartedAt,
+          previousDeadlineAt: quote.currentDeadlineAt,
+          newDeadlineAt: quote.nextDeadlineAt,
+          sequence,
+          maxUses: EVAL_EXTENSION_MAX_USES,
+        },
+      });
+      return {
+        purchase: this.getPurchase(result.purchase.id)!,
+        item: result.item,
+        needsManualDelivery: false as const,
+        extension: this.getEvaluationExtensionUse(result.purchase.id)!,
+      };
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  getEvaluationExtensionUse(purchaseId: number): EvaluationExtensionUseRow | undefined {
+    return this.db
+      .prepare("SELECT * FROM shop_eval_extension_uses WHERE purchase_id = ?")
+      .get(purchaseId) as EvaluationExtensionUseRow | undefined;
   }
 
   /**

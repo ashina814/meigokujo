@@ -15,15 +15,18 @@ import {
   type MessageCreateOptions,
 } from "discord.js";
 import {
+  EVAL_EXTENSION_MAX_USES,
   LedgerError,
   NICKNAME_MAX_LENGTH,
   ShopError,
   SubAccountError,
   describeRejection,
+  isEvaluationExtensionItem,
   isTimedAccessItem,
   termDays,
   timedAccessConfig,
   type PurchaseRow,
+  type EvaluationExtensionQuote,
   type ShopItemRow,
 } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
@@ -270,6 +273,44 @@ function isReevalItem(services: Services, item: ShopItemRow | undefined): item i
   return !!item && Number.isInteger(configured) && configured === item.id;
 }
 
+function evaluationExtensionView(
+  item: ShopItemRow,
+  quote: EvaluationExtensionQuote,
+  balance: number,
+  confirmationId: string,
+) {
+  const price = item.price_land ?? 0;
+  return {
+    embeds: [
+      new EmbedBuilder()
+        .setTitle(`⏳ ${item.name}`)
+        .setColor(0xdb2777)
+        .setDescription(item.description ?? "評価期限を1日延長します。")
+        .addFields(
+          { name: "価格", value: fmtLd(price), inline: true },
+          { name: "現在の期限", value: `<t:${quote.currentDeadlineAt}:F>（<t:${quote.currentDeadlineAt}:R>）` },
+          { name: "延長後の期限", value: `<t:${quote.nextDeadlineAt}:F>` },
+          {
+            name: "この評価サイクルの使用回数",
+            value: `現在 **${quote.usedCount} / ${EVAL_EXTENSION_MAX_USES}** → 購入後 **${quote.usedCount + 1} / ${EVAL_EXTENSION_MAX_USES}**`,
+          },
+          { name: "あなたの残高", value: fmtLd(balance), inline: true },
+        ),
+    ],
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(
+            `shop:evalext-buy:${item.id}:${confirmationId}:${price}:${quote.cycleStartedAt}:${quote.currentDeadlineAt}:${quote.usedCount}`,
+          )
+          .setLabel(`1日延長する (${fmtLd(price)})`)
+          .setEmoji("⏳")
+          .setStyle(ButtonStyle.Primary),
+      ),
+    ],
+  };
+}
+
 /** 再評価面談の受付パネルへのジャンプリンク（未設置なら null） */
 function reevalPanelLink(services: Services, guildId: string | null): string | null {
   if (!guildId) return null;
@@ -418,6 +459,10 @@ function purchaseOnce(
     mode: "land" | "alt";
     /** 本人が入力した内容。課金と同じトランザクションで購入行へ残す */
     request?: Record<string, unknown>;
+    evaluationExtensionExpected?: Pick<
+      EvaluationExtensionQuote,
+      "cycleStartedAt" | "currentDeadlineAt" | "usedCount"
+    > & { priceLand: number };
   },
 ): PurchaseOutcome {
   const execute = services.db.transaction(() => {
@@ -447,27 +492,44 @@ function purchaseOnce(
        VALUES (?,?,?,?, 'executing', ?)`,
     ).run(input.operationId, input.userId, input.itemId, input.mode, Math.floor(Date.now() / 1_000));
 
-    const result = isReevalItem(services, services.shop.getItem(input.itemId))
-      ? services.shop.purchaseReevaluation({
-          itemId: input.itemId,
-          userId: input.userId,
-          actor: input.actor,
-          memberRoleIds: input.memberRoleIds,
-          mode: input.mode === "alt" ? "invite" : "land",
-          request: input.request,
-          idempotencyKey: `shop:purchase:op:${input.operationId}`,
-        })
-      : services.shop.purchase({
-          itemId: input.itemId,
-          userId: input.userId,
-          actor: input.actor,
-          memberRoleIds: input.memberRoleIds,
-          payAlt: input.mode === "alt",
-          request: input.request,
-          // **操作ごとに違う鍵で課金する。** 既定の鍵は秒までしか分けないので、
-          // 返金後のやり直しが同じ秒に入ると Land が動かないまま購入行だけができる
-          idempotencyKey: `shop:purchase:op:${input.operationId}`,
-        });
+    const selectedItem = services.shop.getItem(input.itemId);
+    let result;
+    if (isReevalItem(services, selectedItem)) {
+      result = services.shop.purchaseReevaluation({
+        itemId: input.itemId,
+        userId: input.userId,
+        actor: input.actor,
+        memberRoleIds: input.memberRoleIds,
+        mode: input.mode === "alt" ? "invite" : "land",
+        request: input.request,
+        idempotencyKey: `shop:purchase:op:${input.operationId}`,
+      });
+    } else if (selectedItem && isEvaluationExtensionItem(selectedItem)) {
+      if (input.mode !== "land" || !input.evaluationExtensionExpected) {
+        throw new ShopError("ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
+      }
+      result = services.shop.purchaseEvaluationExtension({
+        itemId: input.itemId,
+        userId: input.userId,
+        actor: input.actor,
+        memberRoleIds: input.memberRoleIds,
+        expected: input.evaluationExtensionExpected,
+        request: input.request,
+        idempotencyKey: `shop:purchase:op:${input.operationId}`,
+      });
+    } else {
+      result = services.shop.purchase({
+        itemId: input.itemId,
+        userId: input.userId,
+        actor: input.actor,
+        memberRoleIds: input.memberRoleIds,
+        payAlt: input.mode === "alt",
+        request: input.request,
+        // **操作ごとに違う鍵で課金する。** 既定の鍵は秒までしか分けないので、
+        // 返金後のやり直しが同じ秒に入ると Land が動かないまま購入行だけができる
+        idempotencyKey: `shop:purchase:op:${input.operationId}`,
+      });
+    }
     services.db.prepare(
       `UPDATE shop_purchase_operations
        SET status='completed',purchase_id=?,completed_at=?
@@ -492,7 +554,19 @@ async function finishPurchase(
   const { item, purchase } = result;
   let deliveryNote = "";
   let delivered = true;
-  if (item.delivery === "auto") {
+  if (isEvaluationExtensionItem(item)) {
+    const use = services.shop.getEvaluationExtensionUse(purchase.id);
+    if (!use) {
+      delivered = false;
+      deliveryNote = "期限延長の監査記録を確認できません。料金を再度支払わず、運営へご連絡ください。";
+    } else {
+      deliveryNote = [
+        "評価期限を **1日** 延長しました。",
+        `新しい期限: <t:${use.new_deadline_at}:F>（<t:${use.new_deadline_at}:R>）`,
+        `使用回数: **${use.sequence} / ${EVAL_EXTENSION_MAX_USES}**（残り **${EVAL_EXTENSION_MAX_USES - use.sequence}回**）`,
+      ].join("\n");
+    }
+  } else if (item.delivery === "auto") {
     // **replayed でも配送を試す。** 課金は冪等（operation IDで一度きり）だが、
     // 配送は成功するまで再試行してよい。二度配らないのは配送状態が保証する。
     const outcome = await deliverPurchase(services, interaction.guild, purchase, `user:${interaction.user.id}`);
@@ -532,6 +606,16 @@ async function finishPurchase(
 
 function purchaseErrorMessage(error: unknown, services: Services): string {
   if (error instanceof ShopError) {
+    if (error.code === "ERR_EVAL_EXTENSION_STATUS") return "評価期間の延長は、現在評価中の亡霊だけが購入できます。";
+    if (error.code === "ERR_EVAL_EXTENSION_CYCLE") return "現在の評価サイクルを確認できないため、料金を引かずに停止しました。";
+    if (error.code === "ERR_EVAL_EXTENSION_EXPIRED") return "評価期限を過ぎているため、料金を引かずに停止しました。";
+    if (error.code === "ERR_EVAL_EXTENSION_LIMIT") return "この評価サイクルでは5回すべて使用済みです。";
+    if (
+      error.code === "ERR_EVAL_EXTENSION_ITEM_CONFIG" ||
+      error.code === "ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED"
+    ) {
+      return "評価期間延長商品の設定を確認できないため、料金を引かずに停止しました。運営へご連絡ください。";
+    }
     if (error.code === "ERR_REEVAL_STATUS") return "再評価チャレンジは迷霊の方だけが購入できます。";
     if (error.code === "ERR_REEVAL_RIGHT_EXISTS") return "未使用の再評価権を既に持っています。面談結果の確定後にご利用ください。";
     if (error.code === "ERR_REEVAL_INVITES_INSUFFICIENT") return "未使用の確定招待実績が5件必要です。";
@@ -645,6 +729,74 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       else components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(button));
     }
     await interaction.reply({ embeds: [embed], components, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (action === "evalext-buy") {
+    const itemId = Number(parts[2]);
+    const confirmationId = parts[3] ?? "";
+    const expected = {
+      priceLand: Number(parts[4]),
+      cycleStartedAt: Number(parts[5]),
+      currentDeadlineAt: Number(parts[6]),
+      usedCount: Number(parts[7]),
+    };
+    const item = services.shop.getItem(itemId);
+    if (
+      !item ||
+      !confirmationId ||
+      !isEvaluationExtensionItem(item) ||
+      !Object.values(expected).every(Number.isSafeInteger)
+    ) {
+      await interaction.update({
+        content: "この確認画面は利用できません。商品を選び直してください。",
+        embeds: [],
+        components: [],
+      });
+      return;
+    }
+    await interaction.deferUpdate();
+    try {
+      const quote = services.shop.checkEvaluationExtensionPurchase({
+        itemId,
+        userId: interaction.user.id,
+        expected,
+      });
+      const result = purchaseOnce(services, {
+        operationId: confirmationId,
+        itemId,
+        userId: interaction.user.id,
+        actor: `user:${interaction.user.id}`,
+        memberRoleIds: [],
+        mode: "land",
+        evaluationExtensionExpected: {
+          priceLand: expected.priceLand,
+          cycleStartedAt: quote.cycleStartedAt,
+          currentDeadlineAt: quote.currentDeadlineAt,
+          usedCount: quote.usedCount,
+        },
+      });
+      await finishPurchase(interaction, services, result);
+    } catch (error) {
+      try {
+        const refreshed = services.shop.checkEvaluationExtensionPurchase({ itemId, userId: interaction.user.id });
+        await interaction.editReply({
+          content: `❌ ${purchaseErrorMessage(error, services)}\n内容を更新しました。料金は発生していません。`,
+          ...evaluationExtensionView(
+            item,
+            refreshed,
+            services.ledger.balanceOf(`user:${interaction.user.id}`),
+            interaction.id,
+          ),
+        });
+      } catch {
+        await interaction.editReply({
+          content: `❌ ${purchaseErrorMessage(error, services)}`,
+          embeds: [],
+          components: [],
+        });
+      }
+    }
     return;
   }
 
@@ -1137,6 +1289,24 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       await interaction.reply({ content: "商品が見つかりません。", flags: MessageFlags.Ephemeral });
       return;
     }
+    if (isEvaluationExtensionItem(item)) {
+      try {
+        if (mode !== "land") throw new ShopError("ERR_EVAL_EXTENSION_ITEM_CONFIG", { itemId });
+        const quote = services.shop.checkEvaluationExtensionPurchase({ itemId, userId: interaction.user.id });
+        await interaction.reply({
+          ...evaluationExtensionView(
+            item,
+            quote,
+            services.ledger.balanceOf(`user:${interaction.user.id}`),
+            interaction.id,
+          ),
+          flags: MessageFlags.Ephemeral,
+        });
+      } catch (error) {
+        await interaction.reply({ content: `❌ ${purchaseErrorMessage(error, services)}`, flags: MessageFlags.Ephemeral });
+      }
+      return;
+    }
     if (isReevalItem(services, item)) {
       try {
         services.shop.checkReevaluationPurchase({
@@ -1228,6 +1398,18 @@ export async function handleShopSelect(
       : [];
     const hasRole = !item.require_role_id || meetsRoleRequirement(services.settings, memberRoleIds, item.require_role_id);
     const balance = services.ledger.balanceOf(`user:${interaction.user.id}`);
+    if (isEvaluationExtensionItem(item)) {
+      try {
+        const quote = services.shop.checkEvaluationExtensionPurchase({ itemId, userId: interaction.user.id });
+        await interaction.reply({
+          ...evaluationExtensionView(item, quote, balance, interaction.id),
+          flags: MessageFlags.Ephemeral,
+        });
+      } catch (error) {
+        await interaction.reply({ content: `❌ ${purchaseErrorMessage(error, services)}`, flags: MessageFlags.Ephemeral });
+      }
+      return;
+    }
     const access = timedAccessConfig(item);
     const view = itemDetail(
       item,
