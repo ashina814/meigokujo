@@ -226,6 +226,8 @@ export type ShopErrorCode =
   | "ERR_SALES_LOCKED"
   | "ERR_ALREADY_DELIVERED"
   | "ERR_REFUND_RACE"
+  | "ERR_ORIGINAL_ROLE_SPECIAL_PURCHASE_REQUIRED"
+  | "ERR_ORIGINAL_ROLE_ITEM_CONFIG"
   | "ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_REEVAL_ITEM_CONFIG"
   | "ERR_REEVAL_STATUS"
@@ -363,6 +365,10 @@ export interface ShopOptions {
   roleCheck?: (memberRoleIds: readonly string[], requireRoleId: string) => boolean;
   /** 設定済みの再評価商品。null の間は旧挙動を維持する。 */
   reevalItemId?: () => number | null;
+  /** 設定済みのオリジナルロール新規作成商品。 */
+  originalRoleItemId?: () => number | null;
+  /** 専用購入の課金直前に、承認済みの本人申請か再確認する。 */
+  assertOriginalRolePayable?: (applicationId: number, userId: string) => void;
   /** 例外補償の部署支出に使用する。未注入なら補償は fail-closed。 */
   departments?: Departments;
 }
@@ -607,6 +613,9 @@ export class Shop {
      */
     idempotencyKey?: string;
   }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
+    if (this.options.originalRoleItemId?.() === input.itemId) {
+      throw new ShopError("ERR_ORIGINAL_ROLE_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
+    }
     if (this.options.reevalItemId?.() === input.itemId) {
       throw new ShopError("ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
     }
@@ -615,6 +624,50 @@ export class Shop {
       throw new ShopError("ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
     }
     return this.purchaseInternal(input);
+  }
+
+  /**
+   * オリジナルロールの承認済み申請専用購入。
+   * 申請の再検査、applicationIdの購入行への記録、課金を同じIMMEDIATE transactionで確定する。
+   */
+  purchaseOriginalRole(input: {
+    itemId: number;
+    applicationId: number;
+    userId: string;
+    actor: string;
+    memberRoleIds: readonly string[];
+    idempotencyKey: string;
+  }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
+    const run = () => {
+      const item = this.getItem(input.itemId);
+      if (
+        this.options.originalRoleItemId?.() !== input.itemId ||
+        !this.options.assertOriginalRolePayable ||
+        !item ||
+        item.kind !== "one_shot" ||
+        item.delivery !== "auto" ||
+        item.delivery_kind !== "create_original_role" ||
+        item.price_land === null ||
+        !Number.isSafeInteger(input.applicationId) ||
+        input.applicationId <= 0
+      ) {
+        throw new ShopError("ERR_ORIGINAL_ROLE_ITEM_CONFIG", {
+          itemId: input.itemId,
+          configuredId: this.options.originalRoleItemId?.() ?? null,
+          applicationId: input.applicationId,
+        });
+      }
+      this.options.assertOriginalRolePayable(input.applicationId, input.userId);
+      return this.purchaseInternal({
+        itemId: input.itemId,
+        userId: input.userId,
+        actor: input.actor,
+        memberRoleIds: input.memberRoleIds,
+        request: { applicationId: input.applicationId },
+        idempotencyKey: input.idempotencyKey,
+      });
+    };
+    return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
   }
 
   private purchaseInternal(input: {

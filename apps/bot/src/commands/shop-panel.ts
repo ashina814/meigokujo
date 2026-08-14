@@ -459,6 +459,7 @@ function purchaseOnce(
     mode: "land" | "alt";
     /** 本人が入力した内容。課金と同じトランザクションで購入行へ残す */
     request?: Record<string, unknown>;
+    originalRoleApplicationId?: number;
     evaluationExtensionExpected?: Pick<
       EvaluationExtensionQuote,
       "cycleStartedAt" | "currentDeadlineAt" | "usedCount"
@@ -494,7 +495,19 @@ function purchaseOnce(
 
     const selectedItem = services.shop.getItem(input.itemId);
     let result;
-    if (isReevalItem(services, selectedItem)) {
+    if (selectedItem && isOriginalRoleItem(services, selectedItem)) {
+      if (input.mode !== "land" || input.originalRoleApplicationId === undefined) {
+        throw new ShopError("ERR_ORIGINAL_ROLE_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
+      }
+      result = services.shop.purchaseOriginalRole({
+        itemId: input.itemId,
+        applicationId: input.originalRoleApplicationId,
+        userId: input.userId,
+        actor: input.actor,
+        memberRoleIds: input.memberRoleIds,
+        idempotencyKey: `shop:purchase:op:${input.operationId}`,
+      });
+    } else if (isReevalItem(services, selectedItem)) {
       result = services.shop.purchaseReevaluation({
         itemId: input.itemId,
         userId: input.userId,
@@ -606,6 +619,12 @@ async function finishPurchase(
 
 function purchaseErrorMessage(error: unknown, services: Services): string {
   if (error instanceof ShopError) {
+    if (
+      error.code === "ERR_ORIGINAL_ROLE_ITEM_CONFIG" ||
+      error.code === "ERR_ORIGINAL_ROLE_SPECIAL_PURCHASE_REQUIRED"
+    ) {
+      return "オリジナルロールは、申請が承認されたあとの専用画面からのみ購入できます。料金は発生していません。";
+    }
     if (error.code === "ERR_EVAL_EXTENSION_STATUS") return "評価期間の延長は、現在評価中の亡霊だけが購入できます。";
     if (error.code === "ERR_EVAL_EXTENSION_CYCLE") return "現在の評価サイクルを確認できないため、料金を引かずに停止しました。";
     if (error.code === "ERR_EVAL_EXTENSION_EXPIRED") return "評価期限を過ぎているため、料金を引かずに停止しました。";
@@ -641,6 +660,18 @@ function purchaseErrorMessage(error: unknown, services: Services): string {
   }
   if (error instanceof LedgerError && error.code === "ERR_INSUFFICIENT") return "残高が足りません。";
   return error instanceof Error ? error.message : "処理に失敗しました。";
+}
+
+function originalRolePurchaseRedirect(services: Services, item: ShopItemRow, userId: string) {
+  const actions = originalRoleActions(services, item, userId);
+  return {
+    content: [
+      "オリジナルロールは専用手続きからのみ購入できます。料金は発生していません。",
+      ...(item.enabled ? actions.notes : ["現在、この商品の受付は停止しています。"]),
+    ].join("\n"),
+    embeds: [],
+    components: item.enabled ? actions.components : [],
+  };
 }
 
 function chipReturnView(confirmationId: string, item: ShopItemRow, land: number, chips: number) {
@@ -967,7 +998,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
           actor: `user:${interaction.user.id}`,
           memberRoleIds: [...((interaction.member as GuildMember | null)?.roles.cache.keys() ?? [])],
           mode: "land",
-          request: { applicationId },
+          originalRoleApplicationId: applicationId,
         });
       } catch (error) {
         return { error: `❌ ${purchaseErrorMessage(error, services)}` } as Attempt;
@@ -1221,6 +1252,12 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     try {
       const configuredItem = services.shop.getItem(itemId);
       if (!configuredItem) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId });
+      // 旧generic購入画面で作られたチップ返還確認から来ても、
+      // 専用申請を通らない商品では資金を動かさず現在の手続きへ戻す。
+      if (isOriginalRoleItem(services, configuredItem)) {
+        await interaction.editReply(originalRolePurchaseRedirect(services, configuredItem, interaction.user.id));
+        return;
+      }
       if (isReevalItem(services, configuredItem)) {
         services.shop.checkReevaluationPurchase({ itemId, userId: interaction.user.id, mode: "land" });
       }
@@ -1277,6 +1314,14 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     const item = services.shop.getItem(itemId);
     if (!item) {
       await interaction.reply({ content: "商品が見つかりません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    // staleなgeneric購入ボタンも課金処理へ入れず、本人の現在状態に合う専用導線へ戻す。
+    if (isOriginalRoleItem(services, item)) {
+      await interaction.reply({
+        ...originalRolePurchaseRedirect(services, item, interaction.user.id),
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     }
     if (isEvaluationExtensionItem(item)) {

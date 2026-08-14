@@ -6,6 +6,7 @@ import {
   OriginalRoles,
   Settings,
   Shop,
+  ShopError,
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
@@ -39,8 +40,16 @@ function setup() {
   const ledger = new Ledger(db);
   const settings = new Settings(db);
   const events = new EventLog(db);
-  const shop = new Shop(db, ledger, events);
   const originalRoles = new OriginalRoles(db, ledger, events);
+  const shop = new Shop(db, ledger, events, {
+    originalRoleItemId: () => {
+      const id = Number(settings.getString("shop:original_role_item_id"));
+      return Number.isSafeInteger(id) && id > 0 ? id : null;
+    },
+    assertOriginalRolePayable: (applicationId, userId) => {
+      originalRoles.assertPayable(applicationId, userId);
+    },
+  });
   const item = shop.createItem(
     { name: "オリジナルロール新規作成", price_land: PRICE, kind: "one_shot", delivery: "auto", delivery_kind: "create_original_role" },
     "staff",
@@ -57,8 +66,16 @@ function setup() {
     approvedBy: "t",
     idempotencyKey: "seed",
   });
-  const services = { db, ledger, settings, events, shop, originalRoles } as unknown as Services;
-  return { db, ledger, settings, events, shop, originalRoles, item, services };
+  const chipFlow = {
+    externalConfirmation: vi.fn(),
+    beginExternalConfirmation: vi.fn(),
+    redeemExactFreeChips: vi.fn(),
+    completeExternalConfirmation: vi.fn(),
+    cancelExternalConfirmation: vi.fn(),
+    createExternalConfirmation: vi.fn(),
+  };
+  const services = { db, ledger, settings, events, shop, originalRoles, chipFlow } as unknown as Services;
+  return { db, ledger, settings, events, shop, originalRoles, item, chipFlow, services };
 }
 
 type Ctx = ReturnType<typeof setup>;
@@ -171,6 +188,130 @@ function press(ctx: Ctx, customId: string, w: ReturnType<typeof world>, extra: R
 
 const contentOf = (fn: ReturnType<typeof vi.fn>) => String((fn.mock.calls.at(-1) as never[])[0]?.content ?? "");
 
+function expectShopError(run: () => unknown, code: ShopError["code"]) {
+  try {
+    run();
+    throw new Error(`expected ${code}`);
+  } catch (error) {
+    expect(error).toBeInstanceOf(ShopError);
+    expect((error as ShopError).code).toBe(code);
+  }
+}
+
+describe("専用購入経路", () => {
+  it("coreのgeneric購入は課金も購入行作成もしない", () => {
+    const ctx = setup();
+
+    expectShopError(
+      () =>
+        ctx.shop.purchase({
+          itemId: ctx.item.id,
+          userId: USER,
+          actor: `user:${USER}`,
+          memberRoleIds: [],
+          idempotencyKey: "generic-orole",
+        }),
+      "ERR_ORIGINAL_ROLE_SPECIAL_PURCHASE_REQUIRED",
+    );
+
+    expect(balance(ctx)).toBe(5_000_000);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  it("古いgeneric購入ボタンは無課金で申請導線へ戻す", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const p = press(ctx, `shop:buy:${ctx.item.id}:land`, world()) as unknown as {
+      reply: ReturnType<typeof vi.fn>;
+    };
+
+    await handleShopButton(p as never, ctx.services);
+
+    const payload = JSON.stringify(p.reply.mock.calls.at(-1)?.[0]);
+    expect(payload).toContain("料金は発生していません");
+    expect(payload).toContain(`shop:orole-apply:${ctx.item.id}`);
+    expect(balance(ctx)).toBe(5_000_000);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  it("古いgeneric購入ボタンはpending/approved/activeの現在状態へ戻す", async () => {
+    const { handleShopButton } = await shopPanelModule;
+
+    const pendingCtx = setup();
+    pendingCtx.originalRoles.apply({ userId: USER, name: "確認中", color: null, actor: "t" });
+    const pendingPress = press(pendingCtx, `shop:buy:${pendingCtx.item.id}:land`, world()) as unknown as {
+      reply: ReturnType<typeof vi.fn>;
+    };
+    await handleShopButton(pendingPress as never, pendingCtx.services);
+    expect(contentOf(pendingPress.reply)).toContain("確認待ち");
+    expect(pendingCtx.shop.listUserPurchases(USER)).toHaveLength(0);
+    pendingCtx.db.close();
+
+    const approvedCtx = setup();
+    const approved = approvedCtx.originalRoles.apply({ userId: USER, name: "承認済み", color: null, actor: "t" });
+    approvedCtx.originalRoles.approve(approved.id, "staff");
+    const approvedPress = press(approvedCtx, `shop:buy:${approvedCtx.item.id}:land`, world()) as unknown as {
+      reply: ReturnType<typeof vi.fn>;
+    };
+    await handleShopButton(approvedPress as never, approvedCtx.services);
+    expect(JSON.stringify(approvedPress.reply.mock.calls.at(-1)?.[0])).toContain("shop:orole-pay:");
+    expect(approvedCtx.shop.listUserPurchases(USER)).toHaveLength(0);
+    approvedCtx.db.close();
+
+    const activeCtx = setup();
+    const active = activeCtx.originalRoles.apply({ userId: USER, name: "契約中", color: null, actor: "t" });
+    activeCtx.originalRoles.approve(active.id, "staff");
+    activeCtx.originalRoles.activate({ id: active.id, roleId: "role-active", purchaseId: 1, actor: "t" });
+    const activePress = press(activeCtx, `shop:buy:${activeCtx.item.id}:land`, world()) as unknown as {
+      reply: ReturnType<typeof vi.fn>;
+    };
+    await handleShopButton(activePress as never, activeCtx.services);
+    expect(JSON.stringify(activePress.reply.mock.calls.at(-1)?.[0])).toContain("shop:orole-renew:");
+    expect(activeCtx.shop.listUserPurchases(USER)).toHaveLength(0);
+    activeCtx.db.close();
+  });
+
+  it("古いchip返還確認でも資金を動かさず専用導線へ戻す", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    ctx.chipFlow.externalConfirmation.mockReturnValue({
+      id: "chip-confirm",
+      userId: USER,
+      operationKind: `shop:${ctx.item.id}:land`,
+      operationId: "generic-chip-orole",
+      chipAmount: PRICE,
+      status: "pending",
+    });
+    const p = press(ctx, `shop:chips:chip-confirm:${ctx.item.id}:land`, world()) as unknown as {
+      editReply: ReturnType<typeof vi.fn>;
+    };
+
+    await handleShopButton(p as never, ctx.services);
+
+    expect(ctx.chipFlow.beginExternalConfirmation).not.toHaveBeenCalled();
+    expect(ctx.chipFlow.redeemExactFreeChips).not.toHaveBeenCalled();
+    expect(JSON.stringify(p.editReply.mock.calls.at(-1)?.[0])).toContain(`shop:orole-apply:${ctx.item.id}`);
+    expect(balance(ctx)).toBe(5_000_000);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  it("未申請の専用支払いボタンでも課金しない", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world();
+
+    await handleShopButton(press(ctx, `shop:orole-pay:${ctx.item.id}:999:${PRICE}:a1`, w), ctx.services);
+
+    expect(balance(ctx)).toBe(5_000_000);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    expect(w.guild.roles.create).not.toHaveBeenCalled();
+    ctx.db.close();
+  });
+});
+
 describe("申請", () => {
   it("**申請では Land を動かさない**", async () => {
     const { handleShopModal } = await shopPanelModule;
@@ -244,6 +385,8 @@ describe("承認後の支払いと作成", () => {
     expect(after.role_id).toBe("role-1");
     expect(after.expires_at! - Math.floor(Date.now() / 1000)).toBeGreaterThan(29 * DAY);
     expect(balance(ctx)).toBe(5_000_000 - PRICE);
+    const purchase = ctx.shop.listUserPurchases(USER)[0]!;
+    expect(JSON.parse(purchase.request_json ?? "{}")).toEqual({ applicationId: row.id });
     ctx.db.close();
   });
 
@@ -469,12 +612,13 @@ describe("作成途中で落ちたとき（Discord側とDBの間のクラッシ�
     // 課金と購入行は済んでいるが、契約が始まっていない状態を作る
     const row = ctx.originalRoles.apply({ userId: USER, name: "冥き翼", color: null, actor: "t" });
     ctx.originalRoles.approve(row.id, "staff");
-    const { purchase } = ctx.shop.purchase({
+    const { purchase } = ctx.shop.purchaseOriginalRole({
       userId: USER,
       itemId: ctx.item.id,
+      applicationId: row.id,
       actor: "t",
       memberRoleIds: [],
-      request: { applicationId: row.id },
+      idempotencyKey: `test:orole:${row.id}`,
     });
     return { row, purchase };
   }
@@ -917,12 +1061,13 @@ describe("Discordの反映をエラーだけで決めない", () => {
   function paidButUnfinished(ctx: Ctx) {
     const row = ctx.originalRoles.apply({ userId: USER, name: "冥き翼", color: null, actor: "t" });
     ctx.originalRoles.approve(row.id, "staff");
-    const { purchase } = ctx.shop.purchase({
+    const { purchase } = ctx.shop.purchaseOriginalRole({
       userId: USER,
       itemId: ctx.item.id,
+      applicationId: row.id,
       actor: "t",
       memberRoleIds: [],
-      request: { applicationId: row.id },
+      idempotencyKey: `test:orole:${row.id}`,
     });
     return { row, purchase };
   }
