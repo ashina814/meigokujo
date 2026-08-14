@@ -176,7 +176,7 @@ describe("評価期間+1日 V2", () => {
     expect(ctx.db.prepare("SELECT eval_deadline_at FROM souls WHERE user_id=?").get(USER)).toEqual({ eval_deadline_at: beforeDeadline });
   });
 
-  it("同じ古い確認内容の二度押しは1回だけ成立し、2回目は無課金", () => {
+  it("別operationが同じ古い確認内容を使った場合は1回だけ成立し、2回目は無課金", () => {
     const ctx = setup();
     const quote = ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER });
     const expected = { ...quote, priceLand: EVAL_EXTENSION_PRICE_LAND };

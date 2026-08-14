@@ -757,11 +757,6 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     }
     await interaction.deferUpdate();
     try {
-      const quote = services.shop.checkEvaluationExtensionPurchase({
-        itemId,
-        userId: interaction.user.id,
-        expected,
-      });
       const result = purchaseOnce(services, {
         operationId: confirmationId,
         itemId,
@@ -769,12 +764,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         actor: `user:${interaction.user.id}`,
         memberRoleIds: [],
         mode: "land",
-        evaluationExtensionExpected: {
-          priceLand: expected.priceLand,
-          cycleStartedAt: quote.cycleStartedAt,
-          currentDeadlineAt: quote.currentDeadlineAt,
-          usedCount: quote.usedCount,
-        },
+        evaluationExtensionExpected: expected,
       });
       await finishPurchase(interaction, services, result);
     } catch (error) {

@@ -130,20 +130,44 @@ describe("評価期間+1日の購入UI", () => {
     ctx.db.close();
   });
 
-  it("同じ確認ボタンの二度押しは1回だけ課金・延長する", async () => {
+  it("commit後に応答を失って同じ確認ボタンを再押下しても成功結果をreplayする", async () => {
     const { handleShopSelect, handleShopButton } = await shopPanelModule;
     const ctx = setup();
     const picked = select(ctx);
     await handleShopSelect(picked.interaction, ctx.services);
     const id = buttonId(picked.reply);
 
-    await handleShopButton(press(id, "press-a").interaction, ctx.services);
+    const first = press(id, "press-a");
+    await handleShopButton(first.interaction, ctx.services);
     const second = press(id, "press-b");
     await handleShopButton(second.interaction, ctx.services);
 
     expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(150_000);
     expect(ctx.shop.listUserPurchases(USER)).toHaveLength(1);
-    expect(lastContent(second.editReply)).toContain("料金は発生していません");
+    expect(lastContent(second.editReply)).toBe(lastContent(first.editReply));
+    expect(lastContent(second.editReply)).toContain("新しい期限: <t:");
+    expect(lastContent(second.editReply)).toContain("使用回数: **1 / 5**");
+    expect(lastContent(second.editReply)).toContain("残り **4回**");
+    expect(lastContent(second.editReply)).not.toContain("料金は発生していません");
+    ctx.db.close();
+  });
+
+  it("別operationの古い確認は無課金でstale表示し、最新内容へ更新する", async () => {
+    const { handleShopSelect, handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const firstPicked = select(ctx, "select-a");
+    const secondPicked = select(ctx, "select-b");
+    await handleShopSelect(firstPicked.interaction, ctx.services);
+    await handleShopSelect(secondPicked.interaction, ctx.services);
+
+    await handleShopButton(press(buttonId(firstPicked.reply), "press-a").interaction, ctx.services);
+    const stale = press(buttonId(secondPicked.reply), "press-b");
+    await handleShopButton(stale.interaction, ctx.services);
+
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(150_000);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(1);
+    expect(lastContent(stale.editReply)).toContain("料金は発生していません");
+    expect(JSON.stringify(stale.editReply.mock.calls.at(-1)?.[0])).toContain("1 / 5");
     ctx.db.close();
   });
 
