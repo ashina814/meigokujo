@@ -93,6 +93,57 @@ export interface DeliverySnapshot {
   captured_at?: number;
 }
 
+export interface TimedAccessConfig {
+  roleId: string;
+  channelId: string | null;
+}
+
+export interface TimedAccessGrant extends TimedAccessConfig {
+  purchase: PurchaseRow;
+  item: ShopItemRow;
+}
+
+export interface TimedAccessLegacyMigrationExpectation {
+  itemId: number;
+  roleId: string;
+  expectedCount: number;
+  roleHolderIds: readonly string[];
+}
+
+export interface TimedAccessLegacyMigrationPlanItem {
+  itemId: number;
+  roleId: string;
+  expectedCount: number;
+  actualCount: number;
+  candidateUserIds: string[];
+}
+
+export interface TimedAccessLegacyMigrationPlan {
+  items: TimedAccessLegacyMigrationPlanItem[];
+  expectedTotal: number;
+  actualTotal: number;
+  matchesExpected: boolean;
+}
+
+export interface TimedAccessLegacyImportRow {
+  purchase_id: number;
+  migration_key: string;
+  item_id: number;
+  user_id: string;
+  role_id: string;
+  started_at: number;
+  expires_at: number;
+  reason: string;
+  actor_id: string;
+  created_at: number;
+}
+
+export interface TimedAccessLegacyMigrationResult {
+  alreadyApplied: boolean;
+  plan: TimedAccessLegacyMigrationPlan;
+  imports: TimedAccessLegacyImportRow[];
+}
+
 /**
  * いま自動配送してよい種別。
  *
@@ -161,6 +212,12 @@ export type ShopErrorCode =
   | "ERR_ROLE_REQUIRED"
   | "ERR_NO_PRICE"
   | "ERR_ALREADY_ACTIVE"
+  | "ERR_TIMED_ACCESS_CONFIG"
+  | "ERR_TIMED_ACCESS_ROLE_PRESENT"
+  | "ERR_TIMED_ACCESS_STATE_UNAVAILABLE"
+  | "ERR_TIMED_ACCESS_LEGACY_CONFIG"
+  | "ERR_TIMED_ACCESS_LEGACY_COUNT"
+  | "ERR_TIMED_ACCESS_LEGACY_CONFLICT"
   | "ERR_PURCHASE_NOT_FOUND"
   | "ERR_NOT_OWNER"
   | "ERR_NOT_ACTIVE"
@@ -232,6 +289,29 @@ export function extendedExpiry(currentExpiresAt: number | null, days: number, fr
   return Math.max(currentExpiresAt ?? 0, from) + days * DAY;
 }
 
+/** Botが期限とDiscordロールをともに正本管理する、汎用の期限付きアクセス商品。 */
+export function isTimedAccessItem(
+  item: Pick<ShopItemRow, "kind" | "duration_days" | "delivery" | "delivery_kind">,
+): boolean {
+  return termDays(item as ShopItemRow) !== null && item.delivery === "auto" && item.delivery_kind === "add_role";
+}
+
+/** 商品設定からアクセス先を読む。商品IDやチャンネルIDはコードへ持ち込まない。 */
+export function timedAccessConfig(item: ShopItemRow): TimedAccessConfig | null {
+  if (!isTimedAccessItem(item)) return null;
+  try {
+    const data = item.delivery_data ? JSON.parse(item.delivery_data) as Record<string, unknown> : {};
+    const roleId = typeof data.role_id === "string" ? data.role_id.trim() : "";
+    if (!roleId) return null;
+    const channelId = typeof data.channel_id === "string" && data.channel_id.trim()
+      ? data.channel_id.trim()
+      : null;
+    return { roleId, channelId };
+  } catch {
+    return null;
+  }
+}
+
 export interface ShopOptions {
   /**
    * 階級要件の判定。既定は「そのロールを持っているか」の完全一致。
@@ -269,6 +349,29 @@ export class Shop {
         completed_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_shop_role_revocations_status ON shop_role_revocations(status, updated_at);
+      CREATE TABLE IF NOT EXISTS shop_timed_access_legacy_runs (
+        migration_key TEXT PRIMARY KEY,
+        plan_json TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS shop_timed_access_legacy_imports (
+        purchase_id INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
+        migration_key TEXT NOT NULL REFERENCES shop_timed_access_legacy_runs(migration_key),
+        item_id INTEGER NOT NULL REFERENCES shop_items(id),
+        user_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(item_id, user_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_shop_timed_access_legacy_imports_run
+        ON shop_timed_access_legacy_imports(migration_key, item_id);
       CREATE TABLE IF NOT EXISTS shop_reeval_invite_uses (
         invite_id INTEGER PRIMARY KEY REFERENCES invites(id),
         purchase_id INTEGER NOT NULL REFERENCES shop_purchases(id),
@@ -476,6 +579,14 @@ export class Shop {
         .prepare("SELECT id FROM shop_purchases WHERE item_id = ? AND user_id = ? AND status = 'active'")
         .get(item.id, input.userId) as { id: number } | undefined;
       if (existing) throw new ShopError("ERR_ALREADY_ACTIVE", { itemId: item.id, purchaseId: existing.id });
+    }
+    if (isTimedAccessItem(item)) {
+      const access = timedAccessConfig(item);
+      if (!access) throw new ShopError("ERR_TIMED_ACCESS_CONFIG", { itemId: item.id });
+      // 契約根拠が不明な既存ロールを30日契約と推測しない。権利を残したまま無課金で止める。
+      if (input.memberRoleIds.includes(access.roleId)) {
+        throw new ShopError("ERR_TIMED_ACCESS_ROLE_PRESENT", { itemId: item.id, roleId: access.roleId });
+      }
     }
 
     const ts = now();
@@ -1174,6 +1285,271 @@ export class Shop {
         return opts.kinds ? opts.kinds.includes(snapshot.delivery_kind) : true;
       })
       .slice(0, limit);
+  }
+
+  /**
+   * 期限内の汎用アクセス契約。購入時スナップショットを正本にし、スナップショット導入前の
+   * delivered契約だけは、現在も同じ期限付きadd_role商品である場合に限り互換維持する。
+   */
+  listActiveTimedAccess(userId?: string): TimedAccessGrant[] {
+    const params: unknown[] = [now()];
+    let userClause = "";
+    if (userId !== undefined) {
+      userClause = " AND user_id = ?";
+      params.push(userId);
+    }
+    const purchases = this.db
+      .prepare(
+        `SELECT * FROM shop_purchases
+          WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > ?${userClause}
+          ORDER BY id`,
+      )
+      .all(...params) as PurchaseRow[];
+
+    const grants: TimedAccessGrant[] = [];
+    for (const purchase of purchases) {
+      const item = this.getItem(purchase.item_id);
+      if (!item) continue;
+      const current = timedAccessConfig(item);
+      const snapshot = parseDeliverySnapshot(purchase.delivery_snapshot_json);
+      let roleId: string | null = null;
+      let channelId: string | null = null;
+      if (snapshot?.delivery_kind === "add_role") {
+        roleId = typeof snapshot.delivery_data.role_id === "string"
+          ? snapshot.delivery_data.role_id.trim()
+          : null;
+        channelId = typeof snapshot.delivery_data.channel_id === "string" && snapshot.delivery_data.channel_id.trim()
+          ? snapshot.delivery_data.channel_id.trim()
+          : null;
+        if (!channelId && current?.roleId === roleId) channelId = current.channelId;
+      } else if (purchase.delivery_snapshot_json === null && purchase.delivery_state === "delivered" && current) {
+        // legacyの購入ID・期限・配送完了は確定事実。ロールだけの人にはこの経路を使わない。
+        roleId = current.roleId;
+        channelId = current.channelId;
+      }
+      if (roleId) grants.push({ purchase, item, roleId, channelId });
+    }
+    return grants;
+  }
+
+  activeTimedAccessGrantsRole(userId: string, roleId: string): boolean {
+    return this.listActiveTimedAccess(userId).some((grant) => grant.roleId === roleId);
+  }
+
+  hasTimedAccessLegacyMigration(migrationKey: string): boolean {
+    return !!this.db
+      .prepare("SELECT 1 FROM shop_timed_access_legacy_runs WHERE migration_key = ?")
+      .get(migrationKey.trim());
+  }
+
+  /**
+   * Discordでroleを持つ一方、同商品のactive契約が無い利用者だけを列挙する。
+   * これは明示的な一回限り移行の事前確認用で、通常起動・購入処理からは呼ばない。
+   */
+  planTimedAccessLegacyMigration(
+    expectations: readonly TimedAccessLegacyMigrationExpectation[],
+  ): TimedAccessLegacyMigrationPlan {
+    const seenItems = new Set<number>();
+    const items: TimedAccessLegacyMigrationPlanItem[] = [];
+    for (const expectation of [...expectations].sort((a, b) => a.itemId - b.itemId)) {
+      if (
+        seenItems.has(expectation.itemId) ||
+        !Number.isSafeInteger(expectation.itemId) ||
+        expectation.itemId <= 0 ||
+        !Number.isSafeInteger(expectation.expectedCount) ||
+        expectation.expectedCount < 0
+      ) {
+        throw new ShopError("ERR_TIMED_ACCESS_LEGACY_CONFIG", { itemId: expectation.itemId });
+      }
+      seenItems.add(expectation.itemId);
+      const item = this.getItem(expectation.itemId);
+      const access = item ? timedAccessConfig(item) : null;
+      if (!item || !access || access.roleId !== expectation.roleId || termDays(item) !== DEFAULT_TERM_DAYS) {
+        throw new ShopError("ERR_TIMED_ACCESS_LEGACY_CONFIG", {
+          itemId: expectation.itemId,
+          reason: !item
+            ? "item_missing"
+            : !access
+              ? "timed_access_config_invalid"
+              : access.roleId !== expectation.roleId
+                ? "role_changed_after_fetch"
+                : "duration_not_30_days",
+        });
+      }
+      const active = new Set(
+        (this.db
+          .prepare("SELECT user_id FROM shop_purchases WHERE item_id = ? AND status = 'active'")
+          .all(item.id) as Array<{ user_id: string }>).map((row) => row.user_id),
+      );
+      const candidateUserIds = [...new Set(expectation.roleHolderIds.map((id) => id.trim()).filter(Boolean))]
+        .filter((userId) => !active.has(userId))
+        .sort();
+      items.push({
+        itemId: item.id,
+        roleId: access.roleId,
+        expectedCount: expectation.expectedCount,
+        actualCount: candidateUserIds.length,
+        candidateUserIds,
+      });
+    }
+    const expectedTotal = items.reduce((sum, item) => sum + item.expectedCount, 0);
+    const actualTotal = items.reduce((sum, item) => sum + item.actualCount, 0);
+    return {
+      items,
+      expectedTotal,
+      actualTotal,
+      matchesExpected: items.every((item) => item.expectedCount === item.actualCount),
+    };
+  }
+
+  /**
+   * role-only利用者を無償30日契約へ一度だけ取り込む。
+   * 件数照合・購入行・専用台帳・audit eventを同じIMMEDIATE transactionで確定する。
+   */
+  migrateTimedAccessLegacy(input: {
+    migrationKey: string;
+    expectations: readonly TimedAccessLegacyMigrationExpectation[];
+    actor: string;
+    reason: string;
+    startedAt?: number;
+  }): TimedAccessLegacyMigrationResult {
+    const migrationKey = input.migrationKey.trim();
+    const actor = input.actor.trim();
+    const reason = input.reason.trim();
+    const startedAt = input.startedAt ?? now();
+    if (!migrationKey || !actor || !reason || !Number.isSafeInteger(startedAt) || startedAt <= 0) {
+      throw new ShopError("ERR_TIMED_ACCESS_LEGACY_CONFIG", { migrationKey, actor, startedAt });
+    }
+    const planKey = JSON.stringify(
+      [...input.expectations]
+        .map(({ itemId, roleId, expectedCount }) => ({ itemId, roleId, expectedCount }))
+        .sort((a, b) => a.itemId - b.itemId),
+    );
+    const body = (): TimedAccessLegacyMigrationResult => {
+      const existingRun = this.db
+        .prepare("SELECT plan_json FROM shop_timed_access_legacy_runs WHERE migration_key = ?")
+        .get(migrationKey) as { plan_json: string } | undefined;
+      if (existingRun) {
+        if (existingRun.plan_json !== planKey) {
+          throw new ShopError("ERR_TIMED_ACCESS_LEGACY_CONFLICT", { migrationKey });
+        }
+        const imports = this.db
+          .prepare("SELECT * FROM shop_timed_access_legacy_imports WHERE migration_key = ? ORDER BY item_id, user_id")
+          .all(migrationKey) as TimedAccessLegacyImportRow[];
+        const plan: TimedAccessLegacyMigrationPlan = {
+          items: [...input.expectations]
+            .sort((a, b) => a.itemId - b.itemId)
+            .map((expectation) => {
+              const rows = imports.filter((row) => row.item_id === expectation.itemId);
+              return {
+                itemId: expectation.itemId,
+                roleId: rows[0]?.role_id ?? "",
+                expectedCount: expectation.expectedCount,
+                actualCount: rows.length,
+                candidateUserIds: rows.map((row) => row.user_id),
+              };
+            }),
+          expectedTotal: input.expectations.reduce((sum, item) => sum + item.expectedCount, 0),
+          actualTotal: imports.length,
+          matchesExpected: true,
+        };
+        return { alreadyApplied: true, plan, imports };
+      }
+
+      // Discord取得後にactive契約が増えた場合も、ここで再計算して件数不一致として全件止める。
+      const plan = this.planTimedAccessLegacyMigration(input.expectations);
+      if (!plan.matchesExpected) {
+        throw new ShopError("ERR_TIMED_ACCESS_LEGACY_COUNT", {
+          expected: plan.items.map((item) => ({ itemId: item.itemId, count: item.expectedCount })),
+          actual: plan.items.map((item) => ({ itemId: item.itemId, count: item.actualCount })),
+        });
+      }
+      this.db
+        .prepare(
+          `INSERT INTO shop_timed_access_legacy_runs
+             (migration_key,plan_json,actor_id,reason,started_at,completed_at)
+           VALUES (?,?,?,?,?,?)`,
+        )
+        .run(migrationKey, planKey, actor, reason, startedAt, startedAt);
+      const insertPurchase = this.db.prepare(
+        `INSERT INTO shop_purchases
+           (item_id,user_id,purchased_at,expires_at,paid_land,paid_alt_kind,paid_alt_amount,status,
+            delivered_at,auto_renew,delivery_snapshot_json,request_json,delivery_state,
+            delivery_attempts,delivery_error,delivery_updated_at)
+         VALUES (?,?,?, ?,NULL,NULL,NULL,'active', ?,0,?,?,'delivered',0,NULL,?)`,
+      );
+      const insertImport = this.db.prepare(
+        `INSERT INTO shop_timed_access_legacy_imports
+           (purchase_id,migration_key,item_id,user_id,role_id,started_at,expires_at,reason,actor_id,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      );
+      for (const planned of plan.items) {
+        const item = this.getItem(planned.itemId)!;
+        const expiresAt = startedAt + DEFAULT_TERM_DAYS * DAY;
+        const snapshot = JSON.stringify({
+          delivery: "auto",
+          delivery_kind: "add_role",
+          delivery_data: item.delivery_data,
+          captured_at: startedAt,
+        });
+        for (const userId of planned.candidateUserIds) {
+          const request = JSON.stringify({
+            source: "legacy_role_only_import",
+            migrationKey,
+            roleId: planned.roleId,
+            startedAt,
+            expiresAt,
+            reason,
+          });
+          const purchaseInfo = insertPurchase.run(
+            item.id,
+            userId,
+            startedAt,
+            expiresAt,
+            startedAt,
+            snapshot,
+            request,
+            startedAt,
+          );
+          const purchaseId = Number(purchaseInfo.lastInsertRowid);
+          insertImport.run(
+            purchaseId,
+            migrationKey,
+            item.id,
+            userId,
+            planned.roleId,
+            startedAt,
+            expiresAt,
+            reason,
+            actor,
+            startedAt,
+          );
+          this.events.log("shop_timed_access_legacy_imported", {
+            actor,
+            target: userId,
+            payload: {
+              userId,
+              itemId: item.id,
+              purchaseId,
+              roleId: planned.roleId,
+              startedAt,
+              expiresAt,
+              reason,
+              migrationKey,
+            },
+          });
+        }
+      }
+      this.events.log("shop_timed_access_legacy_migration_completed", {
+        actor,
+        payload: { migrationKey, startedAt, reason, items: plan.items, imported: plan.actualTotal },
+      });
+      const imports = this.db
+        .prepare("SELECT * FROM shop_timed_access_legacy_imports WHERE migration_key = ? ORDER BY item_id, user_id")
+        .all(migrationKey) as TimedAccessLegacyImportRow[];
+      return { alreadyApplied: false, plan, imports };
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
   }
 
   /**

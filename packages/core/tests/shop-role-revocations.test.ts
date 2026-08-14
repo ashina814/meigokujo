@@ -88,10 +88,11 @@ describe("ショップ 失効時のロール剥奪キュー", () => {
 
   it("delivery_data不正の購入があっても、他の正常購入は処理候補に残る", () => {
     const { shop, createRoleItem, db } = setup();
-    const bad = createRoleItem("bad", "unused", "{");
+    const bad = createRoleItem("bad", "unused");
     const good = createRoleItem("good", "role_good");
     const pBad = shop.purchase({ itemId: bad.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     const pGood = shop.purchase({ itemId: good.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
+    db.prepare("UPDATE shop_purchases SET delivery_snapshot_json='{' WHERE id=?").run(pBad.id);
     lapse(db, pBad.id);
     lapse(db, pGood.id);
     shop.expireOverdue("system:test");

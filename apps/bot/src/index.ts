@@ -101,6 +101,7 @@ import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
 import { handlePaydayButton } from "./payday.js";
 import { startScheduler } from "./scheduler.js";
+import { reconcileTimedAccessForClient, reconcileTimedAccessForGuild } from "./timed-access.js";
 import { enforceConversationCourtRestrictionForGuild, handleConversationCourtVoiceUpdate } from "./conversation-court.js";
 import { resumePendingFreeSpins } from "./casino/slots.js";
 import { startInternalApi } from "./internal-api.js";
@@ -154,6 +155,10 @@ client.once(Events.ClientReady, async (ready) => {
       console.error("[conversation-court] startup scan failed", e),
     );
   }
+  // 期限付きアクセスはschedulerと同じguild:mainだけを正本にする。
+  void reconcileTimedAccessForClient(ready, services).catch((e) =>
+    console.error("[ショップ] 起動時の期限付きアクセス収束失敗:", e),
+  );
 
   // 起動時に必ず帳簿を検算する（経済設計.md §8）
   const integrity = services.ledger.verifyIntegrity();
@@ -572,7 +577,12 @@ client.on(Events.MessageCreate, (message) => {
 client.on(Events.GuildMemberAdd, (member) => {
   void (async () => {
     const detection = await inviteTracker.detectInvite(member.guild).catch(() => null);
-    await handleMemberJoin(member, services, detection?.inviterId ?? null);
+    await handleMemberJoin(member, services, detection?.inviterId ?? null).catch((err) =>
+      console.error("[entry] 参加処理失敗:", err),
+    );
+    await reconcileTimedAccessForGuild(member.guild, services, member.id).catch((err) =>
+      console.error("[ショップ] 再参加時の期限付きアクセス復元失敗:", err),
+    );
     await postJoinLog(client, services, member, detection).catch((err) =>
       console.error("[member-log] 入城ログ投稿失敗:", err),
     );

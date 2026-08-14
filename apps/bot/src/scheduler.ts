@@ -27,6 +27,7 @@ import {
   sendChunkedLinesResumable,
 } from "./scheduler-utils.js";
 import { cancelUnpaidSubAccounts, syncSubAccountRanks } from "./sub-account-jobs.js";
+import { reconcileTimedAccessForClient } from "./timed-access.js";
 import {
   convergePendingNicknameChanges,
   convergePendingOriginalRoles,
@@ -426,6 +427,14 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     await processShopRoleRevocations(client, services).catch((e) =>
       console.error("[ショップ] 失効ロール剥奪失敗:", e),
     );
+
+    // activeな期限付きアクセスはDB契約を正本に、消えたロールだけを定期的に戻す。
+    // 毎分全員をfetchせず10分おきにし、再参加時と起動時は別経路で即時収束する。
+    if (now.minute % 10 === 0) {
+      await reconcileTimedAccessForClient(client, services).catch((e) =>
+        console.error("[ショップ] 期限付きアクセスの収束失敗:", e),
+      );
+    }
 
     // ── 給与の自動ドラフト: 毎月1日 09:00 JST 以降、その月にまだ投稿していなければ ──
     const marker = `payroll:draft_posted:${now.period}`;

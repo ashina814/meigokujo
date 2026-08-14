@@ -58,7 +58,7 @@ function setup() {
       kind: "monthly",
       delivery: "auto",
       delivery_kind: "add_role",
-      delivery_data: JSON.stringify({ role_id: "r-ura" }),
+      delivery_data: JSON.stringify({ role_id: "r-ura", channel_id: "ch-ura" }),
     },
     "staff",
   );
@@ -108,6 +108,83 @@ function buyInteraction(ctx: Ctx, itemId: number, send: ReturnType<typeof vi.fn>
 }
 
 const lastReply = (fn: ReturnType<typeof vi.fn>) => String((fn.mock.calls.at(-1) as never[])[0].content ?? "");
+
+describe("期限付きアクセスの購入体験", () => {
+  function accessBuyInteraction(itemId: number, initialRoles: string[] = []) {
+    const cache = new Collection(initialRoles.map((id) => [id, { id }]));
+    const member = {
+      id: USER,
+      roles: {
+        cache,
+        add: vi.fn(async (id: string) => cache.set(id, { id })),
+      },
+    };
+    const editReply = vi.fn(async () => undefined);
+    return {
+      interaction: {
+        customId: `shop:buy:${itemId}:land`,
+        user: { id: USER },
+        guildId: "g1",
+        guild: { id: "g1", members: { fetch: vi.fn(async () => member) } },
+        member,
+        id: `access-${Math.random()}`,
+        client: { channels: { fetch: vi.fn(async () => null) } },
+        deferReply: vi.fn(async () => undefined),
+        editReply,
+      } as never,
+      editReply,
+      cache,
+    };
+  }
+
+  it("初回購入で即時利用可能・具体的期限・利用先を一画面に出す", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 200_000);
+    const ui = accessBuyInteraction(ctx.pass.id);
+
+    await handleShopButton(ui.interaction, ctx.services);
+
+    const content = lastReply(ui.editReply);
+    expect(content).toContain(ctx.pass.name);
+    expect(content).toContain("利用可能になりました");
+    expect(content).toContain("有効期限: <t:");
+    expect(content).toContain("利用先: <#ch-ura>");
+    expect(ui.cache.has("r-ura")).toBe(true);
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(120_000);
+    ctx.db.close();
+  });
+
+  it("契約根拠のない既存ロールはforce fetchで検出し、無課金で案内する", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 200_000);
+    const ui = accessBuyInteraction(ctx.pass.id, ["r-ura"]);
+
+    await handleShopButton(ui.interaction, ctx.services);
+
+    expect(lastReply(ui.editReply)).toContain("二重課金を防ぐため購入せず");
+    expect(ctx.shop.listUserPurchases(USER)).toEqual([]);
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(200_000);
+    ctx.db.close();
+  });
+
+  it("課金直前のDiscord実状態を取得できなければLandを動かさない", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 200_000);
+    const ui = accessBuyInteraction(ctx.pass.id);
+    (ui.interaction as unknown as { guild: { members: { fetch: ReturnType<typeof vi.fn> } } }).guild.members.fetch =
+      vi.fn(async () => { throw new Error("Discord unavailable"); });
+
+    await handleShopButton(ui.interaction, ctx.services);
+
+    expect(lastReply(ui.editReply)).toContain("料金を引かずに停止");
+    expect(ctx.shop.listUserPurchases(USER)).toEqual([]);
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(200_000);
+    ctx.db.close();
+  });
+});
 
 describe("再評価チャレンジの購入", () => {
   it("配送通知を出さず、権利として案内する", async () => {
@@ -301,6 +378,7 @@ describe("期限商品の延長（利用者の手数を増やさない）", () =
     );
 
     expect(String((done.mock.calls[0] as never[])[0].content)).toContain("30日延長しました");
+    expect(String((done.mock.calls[0] as never[])[0].content)).toContain("利用先: <#ch-ura>");
     expect(ctx.shop.getPurchase(purchase.id)!.expires_at).toBe(purchase.expires_at! + 30 * 86_400);
     expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(1_000_000 - 80_000 * 2);
     ctx.db.close();

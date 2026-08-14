@@ -20,7 +20,9 @@ import {
   ShopError,
   SubAccountError,
   describeRejection,
+  isTimedAccessItem,
   termDays,
+  timedAccessConfig,
   type PurchaseRow,
   type ShopItemRow,
 } from "@meigokujo/core";
@@ -73,6 +75,22 @@ function formatPrice(item: ShopItemRow): string {
 function formatKind(item: ShopItemRow): string {
   const days = termDays(item);
   return days === null ? "単発" : `${days}日間`;
+}
+
+function accessDestination(item: ShopItemRow): string | null {
+  const channelId = timedAccessConfig(item)?.channelId;
+  return channelId ? `<#${channelId}>` : null;
+}
+
+async function verifiedPurchaseRoleIds(interaction: ButtonInteraction, item: ShopItemRow): Promise<string[]> {
+  const cached = interaction.member && "roles" in interaction.member && "cache" in interaction.member.roles
+    ? [...interaction.member.roles.cache.keys()]
+    : [];
+  if (!isTimedAccessItem(item)) return cached;
+  if (!interaction.guild) throw new ShopError("ERR_TIMED_ACCESS_STATE_UNAVAILABLE", { reason: "guild_unavailable" });
+  const member = await interaction.guild.members.fetch({ user: interaction.user.id, force: true }).catch(() => null);
+  if (!member) throw new ShopError("ERR_TIMED_ACCESS_STATE_UNAVAILABLE", { reason: "member_fetch_failed" });
+  return [...member.roles.cache.keys()];
 }
 
 /** 残り日数。切り上げないと「あと0日」で1日残っている状態が出る */
@@ -144,6 +162,7 @@ function itemDetail(
   balance: number,
   requireLabel: string,
   contract?: { purchase: PurchaseRow; extendable: boolean },
+  accessRolePresent = false,
 ): {
   embeds: EmbedBuilder[];
   components: ActionRowBuilder<ButtonBuilder>[];
@@ -160,6 +179,8 @@ function itemDetail(
       { name: "在庫", value: item.stock === null ? "無限" : String(item.stock), inline: true },
       { name: "あなたの残高", value: fmtLd(balance), inline: true },
     );
+  const destination = accessDestination(item);
+  if (destination) embed.addFields({ name: "利用先", value: destination, inline: true });
   // 既に契約中なら「買い直す」ではなく「延長する」。同じ商品を二重に契約させない代わりに、
   // 利用者には**同じ場所で続きの操作**として見せる（新しい手順を覚えさせない）
   if (contract) {
@@ -178,6 +199,14 @@ function itemDetail(
       .setEmoji("♻️")
       .setStyle(ButtonStyle.Primary);
     return { embeds: [embed], components: [new ActionRowBuilder<ButtonBuilder>().addComponents(extend)] };
+  }
+
+  if (accessRolePresent && timedAccessConfig(item)) {
+    embed.addFields({
+      name: "既存の利用権を確認しました",
+      value: "期限の根拠を自動で推測せず、二重課金を防ぐため購入を停止しています。運営へ契約確認をご依頼ください。",
+    });
+    return { embeds: [embed], components: [] };
   }
 
   // 名前変更は「買う」ではなく「名前を変える」。入力→確認→完了で終わらせる
@@ -515,6 +544,12 @@ function purchaseErrorMessage(error: unknown, services: Services): string {
       return `階級要件を満たしていません（要 ${requirementLabel(services.settings, (error.details.roleId as string | undefined) ?? null)}）。`;
     }
     if (error.code === "ERR_ALREADY_ACTIVE") return "既に契約中です。「契約中」から延長してください。";
+    if (error.code === "ERR_TIMED_ACCESS_ROLE_PRESENT") {
+      return "既にこの利用権ロールをお持ちです。二重課金を防ぐため購入せず、運営へ契約確認をご依頼ください。";
+    }
+    if (error.code === "ERR_TIMED_ACCESS_CONFIG" || error.code === "ERR_TIMED_ACCESS_STATE_UNAVAILABLE") {
+      return "利用権の設定または現在のDiscord状態を確認できないため、料金を引かずに停止しました。時間をおいて再度お試しください。";
+    }
     if (error.code === "ERR_NOT_OWNER" || error.code === "ERR_NOT_ACTIVE") return "この契約は延長できません。";
     if (error.code === "ERR_NOT_EXTENDABLE") return "この契約はここからは延長できません。運営にご確認ください。";
     if (error.code === "ERR_TERMS_CHANGED") return "内容が変わったので、もう一度確認してください（料金は発生していません）。";
@@ -578,7 +613,8 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
           const item = services.shop.getItem(purchase.item_id);
           const label = item?.name ?? `#${purchase.item_id}`;
           if (!purchase.expires_at) return `・**${label}**`;
-          const head = `・**${label}** — 残り **${daysLeft(purchase.expires_at)}日**（<t:${purchase.expires_at}:D> まで）`;
+          const destination = item ? accessDestination(item) : null;
+          const head = `・**${label}** — 残り **${daysLeft(purchase.expires_at)}日**（<t:${purchase.expires_at}:D> まで）${destination ? ` / ${destination}` : ""}`;
           // 延長ボタンが出ない契約に「延長してください」とだけ書くと、
           // 押す場所が無いのに催促されているように読める
           if (item && !services.shop.isExtendable(item)) return `${head}\n　↳ この契約の延長は現在、運営対応です`;
@@ -1004,7 +1040,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       });
       await interaction.update({
         content: result.extended
-          ? `✅ **${result.item.name}** を${result.addedDays}日延長しました（<t:${result.purchase.expires_at!}:D> まで）。`
+          ? `✅ **${result.item.name}** を${result.addedDays}日延長しました（<t:${result.purchase.expires_at!}:D> まで）。${accessDestination(result.item) ? `\n利用先: ${accessDestination(result.item)}` : ""}`
           : `この延長は受付済みです（<t:${result.purchase.expires_at!}:D> まで）。`,
         embeds: [],
         components: [],
@@ -1042,9 +1078,12 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     let purchased = false;
     try {
       const configuredItem = services.shop.getItem(itemId);
+      if (!configuredItem) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId });
       if (isReevalItem(services, configuredItem)) {
         services.shop.checkReevaluationPurchase({ itemId, userId: interaction.user.id, mode: "land" });
       }
+      // チップをLandへ戻す前に、期限付きアクセスの既存ロールを実状態で確認する。
+      const memberRoleIds = await verifiedPurchaseRoleIds(interaction, configuredItem);
       let row = confirmation;
       if (row.status === "pending") row = services.chipFlow.beginExternalConfirmation(confirmationId, interaction.user.id);
       if (row.status !== "executing") throw new Error("この確認は既に処理されています");
@@ -1056,10 +1095,6 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         true,
       );
       redeemed = true;
-      const member = interaction.member;
-      const memberRoleIds = member && "roles" in member && "cache" in member.roles
-        ? [...member.roles.cache.keys()]
-        : [];
       const result = purchaseOnce(services, {
         operationId: row.operationId,
         itemId,
@@ -1102,10 +1137,6 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       await interaction.reply({ content: "商品が見つかりません。", flags: MessageFlags.Ephemeral });
       return;
     }
-    const member = interaction.member;
-    const memberRoleIds = member && "roles" in member && "cache" in member.roles
-      ? [...member.roles.cache.keys()]
-      : [];
     if (isReevalItem(services, item)) {
       try {
         services.shop.checkReevaluationPurchase({
@@ -1120,6 +1151,8 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
+      // stale cacheでlegacyロールを見落とし、二重に課金しない。
+      const memberRoleIds = await verifiedPurchaseRoleIds(interaction, item);
       const result = purchaseOnce(services, {
         operationId: interaction.id,
         itemId,
@@ -1195,12 +1228,14 @@ export async function handleShopSelect(
       : [];
     const hasRole = !item.require_role_id || meetsRoleRequirement(services.settings, memberRoleIds, item.require_role_id);
     const balance = services.ledger.balanceOf(`user:${interaction.user.id}`);
+    const access = timedAccessConfig(item);
     const view = itemDetail(
       item,
       hasRole,
       balance,
       requirementLabel(services.settings, item.require_role_id),
       contractView(services, interaction.user.id, item),
+      !!access && memberRoleIds.includes(access.roleId),
     );
     // オリジナルロールは「買う」ではなく「申請 → 承認 → 支払い」。
     // いま本人が何をすればいいかだけを出す
