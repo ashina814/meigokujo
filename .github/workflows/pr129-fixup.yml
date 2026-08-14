@@ -95,14 +95,14 @@ jobs:
           )
           start = text.index('const DEN_LOW_SECONDS = 30 * 60;')
           end = text.index('/** 同じBotプロセス内で、同一評価サイクルのDiscord threadを二重生成しない。 */', start)
-          text = text[:start] + text[end:]
+          text = text[:start] + 'const TARGETS_PER_MENU = 25;\nconst MAX_TARGET_MENUS = 5;\n\n' + text[end:]
           start = text.index('// ---- /評価（旧入力フォームは廃止。運営が常設パネルを置くための入口だけ残す） ----')
           cmd_start = text.index('export const evaluationCommand = new SlashCommandBuilder()', start)
           panel_start = text.index('function panelRow()', cmd_start)
           text = text[:cmd_start] + text[panel_start:]
           ref_start = text.index('export function evaluationReferenceText(')
-          swordsman_start = text.index('async function targetMenus(', ref_start)
-          text = text[:ref_start] + text[swordsman_start:]
+          target_menus_start = text.index('async function targetMenus(', ref_start)
+          text = text[:ref_start] + text[target_menus_start:]
           title_start = text.index('export function threadTitleFor(')
           swordsman_ids_start = text.index('async function swordsmanIds(', title_start)
           text = text[:title_start] + text[swordsman_ids_start:]
