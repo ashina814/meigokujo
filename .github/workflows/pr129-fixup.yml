@@ -1,0 +1,164 @@
+name: PR129 structural fixup
+
+on:
+  push:
+    branches:
+      - feat/evaluation-forum-v2
+    paths:
+      - .github/workflows/pr129-fixup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fixup:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply requested PR129 structure
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+
+          # 1) scheduler.ts を正本へ戻し、旧評価自動化だけ通常 tick から外す。
+          scheduler_legacy = Path('apps/bot/src/scheduler-legacy.ts')
+          scheduler = Path('apps/bot/src/scheduler.ts')
+          text = scheduler_legacy.read_text(encoding='utf-8')
+          text = text.replace(
+              'import { refreshEvalStats } from "./eval-daily.js";',
+              'import { refreshEvaluationForums } from "./evaluation-forum-daily.js";',
+          )
+          text = text.replace(
+              '          refreshEvalStats(client, services),',
+              '          refreshEvaluationForums(client, services),',
+          )
+          start = text.index('    // ── カロン: 毎日 09:00 台に期限リスト・演出通知・迷霊落ち承認パネル・題名同期 ──')
+          end = text.index('    // ── VIP 期限切れ: ロール剥奪 & DB クリア ──', start)
+          text = text[:start] + '''    // ── 旧評価制度の自動判断は通常schedulerから実行しない ──\n    // アリ数/期限によるカロン判断、旧eval_threads前提の題名同期、\n    // 「フォーラム未作成＝自動迷霊」と旧pending降格queueは互換helperとして残すが、\n    // 評価制度の最終判断をBotへ戻さないため、このtickからは呼ばない。\n\n''' + text[end:]
+          scheduler.write_text(text, encoding='utf-8')
+          scheduler_legacy.unlink()
+
+          if 'withoutLegacyEvaluationAutomation' in text or 'startLegacyScheduler' in text:
+              raise SystemExit('scheduler wrapper remnants remain')
+
+          # 2) eval_cycle_threads は bootstrap DDL で additive に作る。旧 eval_threads は変更しない。
+          bootstrap = Path('packages/core/src/db/bootstrap.ts')
+          text = bootstrap.read_text(encoding='utf-8')
+          old = '''CREATE TABLE IF NOT EXISTS eval_threads (\n  user_id   TEXT PRIMARY KEY,\n  thread_id TEXT NOT NULL\n);\n'''
+          new = old + '''\n-- 評価フォーラムv2。旧 eval_threads は既存 Evaluation API / 履歴互換のためそのまま残し、\n-- 新方式だけを評価サイクル単位の additive table へ保存する。\nCREATE TABLE IF NOT EXISTS eval_cycle_threads (\n  user_id          TEXT NOT NULL,\n  cycle_started_at INTEGER NOT NULL,\n  thread_id        TEXT NOT NULL,\n  created_at       INTEGER NOT NULL,\n  PRIMARY KEY (user_id, cycle_started_at)\n);\nCREATE UNIQUE INDEX IF NOT EXISTS idx_eval_cycle_threads_thread\n  ON eval_cycle_threads(thread_id);\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'unexpected eval_threads DDL count: {text.count(old)}')
+          text = text.replace(old, new, 1)
+          bootstrap.write_text(text, encoding='utf-8')
+
+          # 3) Store constructor から migration side effect を除去する。
+          forum = Path('packages/core/src/evaluation/forum.ts')
+          text = forum.read_text(encoding='utf-8')
+          class_start = text.index('export class EvaluationForumStore {')
+          list_start = text.index('  listCurrentCycles(): EvaluationCycleContext[] {', class_start)
+          text = (
+              text[:class_start]
+              + 'export class EvaluationForumStore {\n  constructor(private readonly db: Database.Database) {}\n\n'
+              + text[list_start:]
+          )
+          if 'ensureThreadSchema' in text or 'this.db.exec(' in text:
+              raise SystemExit('schema mutation remains in EvaluationForumStore')
+          forum.write_text(text, encoding='utf-8')
+
+          # 4) 既存 eval-daily helper を base と同じ依存境界へ戻す。
+          #    通常scheduler用のv2 refreshは別ファイルに分離する。
+          import subprocess
+          legacy_eval_daily = subprocess.check_output(
+              ['git', 'show', 'origin/main:apps/bot/src/eval-daily.ts'], text=True
+          )
+          Path('apps/bot/src/eval-daily.ts').write_text(legacy_eval_daily, encoding='utf-8')
+
+          Path('apps/bot/src/evaluation-forum-daily.ts').write_text('''import type { Client } from "discord.js";\nimport { EvaluationForumStore } from "@meigokujo/core/evaluation/forum";\nimport { refreshEvaluationForumForUser } from "./commands/evaluation.js";\nimport type { Services } from "./services.js";\n\n/**\n * 評価フォーラムv2の日次refresh。\n * 既に作成済みの現在サイクルthreadだけを、客観情報で更新する。\n * フォーラム生成・アリ数・昇降格判断は行わない。\n */\nexport async function refreshEvaluationForums(client: Client, services: Services): Promise<void> {\n  const guildId = services.settings.getString("guild:main");\n  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;\n  if (!guild) throw new Error("guild_fetch_failed");\n\n  const store = new EvaluationForumStore(services.db);\n  const failures: string[] = [];\n  for (const cycle of store.listCurrentCycles()) {\n    try {\n      await refreshEvaluationForumForUser(guild, services, cycle.userId);\n    } catch (error) {\n      failures.push(`${cycle.userId}:${error instanceof Error ? error.message : String(error)}`);\n    }\n  }\n  if (failures.length > 0) throw new Error(`refreshEvaluationForums failed: ${failures.join(", ")}`);\n}\n''', encoding='utf-8')
+
+          # 5) UIの純粋ロジックを permissions/config から分離する。
+          Path('apps/bot/src/evaluation-forum-view.ts').write_text('''import { SlashCommandBuilder } from "discord.js";\nimport type { EvaluationPresenceSummary } from "@meigokujo/core/evaluation/forum";\n\nconst DEN_LOW_SECONDS = 30 * 60;\nconst SWORDSMAN_LOW_SECONDS = 15 * 60;\n\nexport const evaluationCommand = new SlashCommandBuilder()\n  .setName("評価")\n  .setDescription("評価フォーラム方式の案内を表示する")\n  .setDMPermission(false);\n\nexport function evaluationReferenceText(summary: EvaluationPresenceSummary): string {\n  if (summary.denSeconds < DEN_LOW_SECONDS) {\n    return "巣穴での活動がまだ少なく、評価材料が不足している可能性があります。";\n  }\n  if (summary.swordsmanSeconds < SWORDSMAN_LOW_SECONDS) {\n    return "巣穴への参加はありますが、魔剣士との同席が少なく、評価機会が不足している可能性があります。";\n  }\n  return "魔剣士との同席機会があります。評価できる材料があるか確認してみてください。";\n}\n\nexport function threadTitleFor(displayName: string, _deadlineTs?: number | null): string {\n  const suffix = "｜亡霊評価";\n  return `${displayName.slice(0, Math.max(1, 95 - suffix.length))}${suffix}`.slice(0, 95);\n}\n\nexport const evaluationForumThresholdsForTesting = {\n  denLowSeconds: DEN_LOW_SECONDS,\n  swordsmanLowSeconds: SWORDSMAN_LOW_SECONDS,\n};\n''', encoding='utf-8')
+
+          command = Path('apps/bot/src/commands/evaluation.ts')
+          text = command.read_text(encoding='utf-8')
+          text = text.replace('  SlashCommandBuilder,\n', '')
+          text = text.replace(
+              'import { EvaluationForumStore, type EvaluationPresenceSummary } from "@meigokujo/core/evaluation/forum";\n',
+              'import { EvaluationForumStore } from "@meigokujo/core/evaluation/forum";\n',
+          )
+          text = text.replace(
+              'import { isAdmin } from "../permissions.js";\n',
+              'import { isAdmin } from "../permissions.js";\nimport { evaluationCommand, evaluationReferenceText, threadTitleFor } from "../evaluation-forum-view.js";\nexport { evaluationCommand, evaluationForumThresholdsForTesting, evaluationReferenceText, threadTitleFor } from "../evaluation-forum-view.js";\n',
+          )
+          start = text.index('const DEN_LOW_SECONDS = 30 * 60;')
+          end = text.index('/** 同じBotプロセス内で、同一評価サイクルのDiscord threadを二重生成しない。 */', start)
+          text = text[:start] + text[end:]
+          start = text.index('// ---- /評価（旧入力フォームは廃止。運営が常設パネルを置くための入口だけ残す） ----')
+          cmd_start = text.index('export const evaluationCommand = new SlashCommandBuilder()', start)
+          panel_start = text.index('function panelRow()', cmd_start)
+          text = text[:cmd_start] + text[panel_start:]
+          ref_start = text.index('export function evaluationReferenceText(')
+          swordsman_start = text.index('async function targetMenus(', ref_start)
+          text = text[:ref_start] + text[swordsman_start:]
+          title_start = text.index('export function threadTitleFor(')
+          swordsman_ids_start = text.index('async function swordsmanIds(', title_start)
+          text = text[:title_start] + text[swordsman_ids_start:]
+          threshold_start = text.index('export const evaluationForumThresholdsForTesting = {')
+          text = text[:threshold_start].rstrip() + '\n'
+          command.write_text(text, encoding='utf-8')
+
+          ui_test = Path('apps/bot/tests/evaluation-forum-v2.test.ts')
+          text = ui_test.read_text(encoding='utf-8')
+          text = text.replace('../src/commands/evaluation.js', '../src/evaluation-forum-view.js')
+          ui_test.write_text(text, encoding='utf-8')
+
+          # 6) Store constructorがschemaを作らないことを回帰テストで固定する。
+          core_test = Path('packages/core/tests/evaluation-forum.test.ts')
+          text = core_test.read_text(encoding='utf-8')
+          text = text.replace(
+              'import { describe, expect, it } from "vitest";\n',
+              'import Database from "better-sqlite3";\nimport { describe, expect, it } from "vitest";\n',
+              1,
+          )
+          marker = 'describe("EvaluationForumStore", () => {\n'
+          addition = '''describe("EvaluationForumStore", () => {\n  it("constructorはschema migrationを行わない", () => {\n    const db = new Database(":memory:");\n    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'eval_cycle_threads'").get()).toBeUndefined();\n    new EvaluationForumStore(db);\n    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'eval_cycle_threads'").get()).toBeUndefined();\n    db.close();\n  });\n\n'''
+          if text.count(marker) != 1:
+              raise SystemExit('EvaluationForumStore describe marker mismatch')
+          text = text.replace(marker, addition, 1)
+          core_test.write_text(text, encoding='utf-8')
+
+          # 7) scheduler構造を弱めず、今回の禁止事項を追加監査する。
+          Path('apps/bot/tests/evaluation-scheduler-v2.test.ts').write_text('''import { existsSync, readFileSync } from "node:fs";\nimport { describe, expect, it } from "vitest";\n\nconst schedulerUrl = new URL("../src/scheduler.ts", import.meta.url);\nconst scheduler = readFileSync(schedulerUrl, "utf-8");\nconst start = scheduler.indexOf("export function startScheduler");\nconst end = scheduler.indexOf("/** VC浮上報酬の日次支給", start);\nconst normalScheduler = scheduler.slice(start, end);\n\ndescribe("評価フォーラムv2 scheduler境界", () => {\n  it("scheduler.tsが正本で、wrapper/Proxy/legacy退避を使わない", () => {\n    expect(existsSync(new URL("../src/scheduler-legacy.ts", import.meta.url))).toBe(false);\n    expect(scheduler).not.toContain("withoutLegacyEvaluationAutomation");\n    expect(scheduler).not.toContain("startLegacyScheduler");\n    expect(scheduler).not.toContain("new Proxy(");\n  });\n\n  it("通常schedulerは客観情報refreshだけを実行し、旧評価自動判断を呼ばない", () => {\n    expect(normalScheduler).toContain("refreshEvaluationForums(client, services)");\n    expect(normalScheduler).not.toContain("postCharonDueList(client, services)");\n    expect(normalScheduler).not.toContain("sendCharonNotifications(client, services)");\n    expect(normalScheduler).not.toContain("postCharonOverduePanel(client, services)");\n    expect(normalScheduler).not.toContain("syncCharonThreadTitles(client, services)");\n    expect(normalScheduler).not.toContain("autoDropNoEvalGhosts(client, services)");\n    expect(normalScheduler).not.toContain("recoverAutoDropNoEvalGhosts(client, services)");\n  });\n});\n''', encoding='utf-8')
+          PY
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm -r test
+
+      - name: Commit verified fixup
+        if: success()
+        shell: bash
+        run: |
+          rm .github/workflows/pr129-fixup.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: make evaluation forum scheduler migration explicit"
+          git push origin HEAD:feat/evaluation-forum-v2
