@@ -142,6 +142,8 @@ export {
   Shop,
   ShopError,
   DEFAULT_TERM_DAYS,
+  REEVAL_PRICE_LAND,
+  REEVAL_INVITE_COUNT,
   termDays,
   extendedExpiry,
   type ShopItemRow,
@@ -158,6 +160,8 @@ export {
   type PurchaseStatus,
   type ShopErrorCode,
   type ShopRoleRevocationRow,
+  type ReevalInviteUseRow,
+  type ReevalCompensationRow,
 } from "./shop/service.js";
 export {
   Tickets,
@@ -215,6 +219,7 @@ export {
   type DepartmentRow,
   type DepartmentBalance,
   type DepartmentErrorCode,
+  type DeptTxArgs,
 } from "./departments/service.js";
 export {
   Fiscal,

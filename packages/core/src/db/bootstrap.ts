@@ -860,6 +860,34 @@ CREATE TABLE IF NOT EXISTS sub_account_rank_operations (
   expires_at     INTEGER NOT NULL,
   created_at     INTEGER NOT NULL
 );
+
+-- 再評価チャレンジの招待払い。invites は歴史の正本なので変更せず、
+-- 商館で使った事実だけを追記する。既存購入への遡及登録は行わない。
+CREATE TABLE IF NOT EXISTS shop_reeval_invite_uses (
+  invite_id   INTEGER PRIMARY KEY REFERENCES invites(id),
+  purchase_id INTEGER NOT NULL REFERENCES shop_purchases(id),
+  user_id     TEXT NOT NULL,
+  used_at     INTEGER NOT NULL,
+  UNIQUE(purchase_id, invite_id)
+);
+CREATE INDEX IF NOT EXISTS idx_shop_reeval_invite_uses_purchase
+  ON shop_reeval_invite_uses(purchase_id);
+
+-- 例外補償は元購入の返金ではなく部署経費。1購入につき1回だけ許可する。
+CREATE TABLE IF NOT EXISTS shop_reeval_compensations (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  purchase_id           INTEGER NOT NULL UNIQUE REFERENCES shop_purchases(id),
+  user_id               TEXT NOT NULL,
+  -- 実行時点の部署キーを監査スナップショットとして保持する。部署削除後も履歴を残すためFKは張らない。
+  department_key        TEXT NOT NULL,
+  amount                INTEGER NOT NULL CHECK(amount > 0),
+  reason                TEXT NOT NULL,
+  actor_id               TEXT NOT NULL,
+  ledger_transaction_id INTEGER NOT NULL UNIQUE REFERENCES transactions(id),
+  created_at             INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shop_reeval_compensations_user
+  ON shop_reeval_compensations(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_sub_account_rank_operations_expiry
   ON sub_account_rank_operations(expires_at);
 CREATE INDEX IF NOT EXISTS idx_original_roles_user ON original_roles(user_id, status);

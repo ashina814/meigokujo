@@ -41,7 +41,7 @@ const now = () => Math.floor(Date.now() / 1000);
 /** 部署キー → 台帳の口座ID */
 export const deptAccount = (key: string): string => `sys:dept:${key}`;
 
-interface DeptTxArgs {
+export interface DeptTxArgs {
   key: string;
   amount: number;
   actor: string;
@@ -49,6 +49,9 @@ interface DeptTxArgs {
   reason?: string;
   /** 高額承認（#決裁）を通した場合の承認者 */
   approvedBy?: string;
+  /** 専用業務から呼ぶ場合の監査参照。省略時は従来どおり部署自身を参照する。 */
+  refType?: string;
+  refId?: string;
 }
 
 export class Departments {
@@ -131,8 +134,8 @@ export class Departments {
       actor: args.actor,
       idempotencyKey: args.idempotencyKey,
       reason: args.reason,
-      refType: "dept",
-      refId: args.key,
+      refType: args.refType ?? "dept",
+      refId: args.refId ?? args.key,
       approvedBy: args.approvedBy,
     });
   }
@@ -148,8 +151,8 @@ export class Departments {
       actor: args.actor,
       idempotencyKey: args.idempotencyKey,
       reason: args.reason,
-      refType: "dept",
-      refId: args.key,
+      refType: args.refType ?? "dept",
+      refId: args.refId ?? args.key,
       approvedBy: args.approvedBy,
     });
   }
