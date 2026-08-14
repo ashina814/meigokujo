@@ -1,4 +1,5 @@
 import type { Client } from "discord.js";
+import { EvaluationForumStore } from "@meigokujo/core/evaluation/forum";
 import type { Services } from "./services.js";
 import { startScheduler as startLegacyScheduler } from "./scheduler-legacy.js";
 
@@ -47,5 +48,7 @@ function withoutLegacyEvaluationAutomation(services: Services): Services {
 }
 
 export function startScheduler(client: Client, services: Services, intervalMs = 60_000): NodeJS.Timeout {
+  // 起動時に additive な eval_cycle_threads を作る。旧 eval_threads は変更しない。
+  new EvaluationForumStore(services.db);
   return startLegacyScheduler(client, withoutLegacyEvaluationAutomation(services), intervalMs);
 }
