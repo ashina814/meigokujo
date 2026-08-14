@@ -57,6 +57,8 @@ export interface SubAccountRow {
   decided_at: number | null;
   decide_reason: string | null;
   activated_at: number | null;
+  /** 人が旧契約の main/alt を突き合わせて引き継いだ時刻。解除後も未引き継ぎ判定に使う。 */
+  legacy_imported_at: number | null;
   activation_rank_baseline: string | null;
   activation_rank_settled_at: number | null;
   created_at: number;
@@ -101,10 +103,10 @@ export class SubAccounts {
     return (this.db.prepare("SELECT * FROM sub_accounts WHERE id = ?").get(id) as SubAccountRow) ?? null;
   }
 
-  listByStatus(status: SubAccountStatus, limit = 50): SubAccountRow[] {
+  listByStatus(status: SubAccountStatus, limit = 50, offset = 0): SubAccountRow[] {
     return this.db
-      .prepare("SELECT * FROM sub_accounts WHERE status = ? ORDER BY created_at LIMIT ?")
-      .all(status, limit) as SubAccountRow[];
+      .prepare("SELECT * FROM sub_accounts WHERE status = ? ORDER BY created_at, id LIMIT ? OFFSET ?")
+      .all(status, limit, offset) as SubAccountRow[];
   }
 
   countByStatus(status: SubAccountStatus): number {
@@ -124,6 +126,15 @@ export class SubAccounts {
     return this.db
       .prepare("SELECT * FROM sub_accounts WHERE status = 'active' ORDER BY id LIMIT ?")
       .all(limit) as SubAccountRow[];
+  }
+
+  /** 旧契約の組み合わせを人が一度でも明示登録したか。解除済みも履歴として含む。 */
+  hasLegacyImport(mainUserId: string): boolean {
+    return Boolean(
+      this.db
+        .prepare("SELECT 1 FROM sub_accounts WHERE main_user_id = ? AND legacy_imported_at IS NOT NULL LIMIT 1")
+        .get(mainUserId),
+    );
   }
 
   /**
@@ -395,10 +406,12 @@ export class SubAccounts {
       const id = Number(
         this.db
           .prepare(
-            `INSERT INTO sub_accounts (main_user_id, alt_user_id, status, approved_by, approved_at, activated_at, created_at, updated_at)
-             VALUES (?,?, 'active', ?, ?, ?, ?, ?)`,
+            `INSERT INTO sub_accounts
+               (main_user_id, alt_user_id, status, approved_by, approved_at, activated_at,
+                legacy_imported_at, created_at, updated_at)
+             VALUES (?,?, 'active', ?, ?, ?, ?, ?, ?)`,
           )
-          .run(input.mainUserId, input.altUserId, input.actor, ts, ts, ts, ts).lastInsertRowid,
+          .run(input.mainUserId, input.altUserId, input.actor, ts, ts, ts, ts, ts).lastInsertRowid,
       );
       this.events.log("sub_account_imported", {
         actor: input.actor,

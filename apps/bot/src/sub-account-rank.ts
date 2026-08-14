@@ -180,7 +180,9 @@ export async function reconcileAltRank(
     extra?: string[],
     missing?: string | null,
   ): Promise<RankSyncResult> => {
-    const restored = await restoreAltRank(services, guild, member, previous);
+    const restored = await restoreAltRank(services, guild, member, previous, {
+      renewOperation: opts.renewOperation,
+    });
     return { ok: false, reason, wanted, mutated: true, restored, extra, missing };
   };
 
@@ -238,16 +240,22 @@ export async function restoreAltRank(
   guild: Guild,
   member: GuildMember,
   previous: readonly string[],
+  opts: { renewOperation?: () => boolean } = {},
 ): Promise<boolean | null> {
   const ladder = ladderRoleIds(services);
   const want = new Set(previous);
+  // schedulerの古いoperationは、leaseを失った時点から読み取り以外を行わない。
+  // 初回activationはcallbackを渡さないため、従来どおりrollbackできる。
+  if (opts.renewOperation && !opts.renewOperation()) return null;
   const current = await freshLadderRoles(guild, member.id, ladder);
   if (current === null) return null;
   for (const id of ladder) {
     const has = current.includes(id);
     if (want.has(id) && !has) {
+      if (opts.renewOperation && !opts.renewOperation()) return null;
       await member.roles.add(id, "サブ垢: 契約が成立しなかったため元に戻す").catch(() => undefined);
     } else if (!want.has(id) && has) {
+      if (opts.renewOperation && !opts.renewOperation()) return null;
       await member.roles.remove(id, "サブ垢: 契約が成立しなかったため元に戻す").catch(() => undefined);
     }
   }

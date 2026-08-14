@@ -834,6 +834,8 @@ CREATE TABLE IF NOT EXISTS sub_accounts (
   decided_at     INTEGER,
   decide_reason  TEXT,
   activated_at   INTEGER,
+  -- 人が旧契約のmain/altを明示確認して引き継いだ事実。解除後も消さない
+  legacy_imported_at INTEGER,
   -- 有効化を始める前の階級ロール集合（JSON配列）。**Discordを変更する前に書く。**
   -- 途中で落ちても、再起動後の再試行がここを基準に巻き戻せる
   activation_rank_baseline TEXT,
@@ -906,6 +908,31 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "original_roles", "role_creation_started_at", "INTEGER");
   applyOriginalRoleItemSetting(db);
   // 既に sub_accounts がある本番へ後から足す
+  ensureColumn(db, "sub_accounts", "legacy_imported_at", "INTEGER");
+  // PR125で登録済みの行は、明示的なimport eventの契約ID一致だけを根拠に移す。
+  // purchase_id/activated_atからaltを推測するbackfillはしない。
+  db.exec(`
+    UPDATE sub_accounts
+       SET legacy_imported_at = (
+         SELECT MIN(e.created_at)
+           FROM events e
+          WHERE e.type = 'sub_account_imported'
+            AND e.target_id = sub_accounts.main_user_id
+            AND CASE WHEN json_valid(e.payload_json)
+                     THEN CAST(json_extract(e.payload_json, '$.id') AS INTEGER)
+                END = sub_accounts.id
+       )
+     WHERE legacy_imported_at IS NULL
+       AND EXISTS (
+         SELECT 1
+           FROM events e
+          WHERE e.type = 'sub_account_imported'
+            AND e.target_id = sub_accounts.main_user_id
+            AND CASE WHEN json_valid(e.payload_json)
+                     THEN CAST(json_extract(e.payload_json, '$.id') AS INTEGER)
+                END = sub_accounts.id
+       )
+  `);
   ensureColumn(db, "sub_accounts", "activation_rank_baseline", "TEXT");
   ensureColumn(db, "sub_accounts", "activation_rank_settled_at", "INTEGER");
   applySubAccountItemSetting(db);

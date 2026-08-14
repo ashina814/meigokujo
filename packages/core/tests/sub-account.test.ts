@@ -258,6 +258,8 @@ describe("旧契約の引き継ぎ", () => {
     const row = ctx.subs.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" });
 
     expect(row.status).toBe("active");
+    expect(row.legacy_imported_at).not.toBeNull();
+    expect(ctx.subs.hasLegacyImport(MAIN)).toBe(true);
     expect(ctx.subs.findByAlt(ALT)?.main_user_id).toBe(MAIN);
     ctx.db.close();
   });
@@ -350,6 +352,7 @@ describe("既存DB（sub_accounts が無い）からの移行", () => {
     expect((db.prepare("SELECT COUNT(*) c FROM shop_purchases WHERE item_id=4").get() as { c: number }).c).toBe(1);
 
     const cols = (db.prepare("PRAGMA table_info(sub_accounts)").all() as Array<{ name: string }>).map((r) => r.name);
+    expect(cols).toContain("legacy_imported_at");
     expect(cols).toContain("activation_rank_baseline");
     expect(cols).toContain("activation_rank_settled_at");
     expect(
@@ -436,9 +439,16 @@ describe("既存DB（activation_rank_baseline 列が無い）からの移行", (
       id INTEGER PRIMARY KEY AUTOINCREMENT, main_user_id TEXT NOT NULL, alt_user_id TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending', purchase_id INTEGER,
       approved_by TEXT, approved_at INTEGER, decided_by TEXT, decided_at INTEGER, decide_reason TEXT,
-      activated_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);`);
+      activated_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, actor_id TEXT, target_id TEXT,
+        payload_json TEXT, created_at INTEGER NOT NULL);`);
     old.prepare("INSERT INTO sub_accounts (main_user_id,alt_user_id,status,created_at,updated_at) VALUES (?,?,'active',0,0)")
       .run(MAIN, ALT);
+    old.prepare("INSERT INTO sub_accounts (main_user_id,alt_user_id,status,activated_at,created_at,updated_at) VALUES (?,?,'cancelled',1,0,0)")
+      .run(OTHER, "444444444444444444");
+    old.prepare("INSERT INTO events (type,actor_id,target_id,payload_json,created_at) VALUES ('sub_account_imported','staff',?,?,123)")
+      .run(MAIN, JSON.stringify({ id: 1, altUserId: ALT }));
     old.close();
 
     const db = openDb(path);
@@ -446,10 +456,16 @@ describe("既存DB（activation_rank_baseline 列が無い）からの移行", (
     const cols = (db.prepare("PRAGMA table_info(sub_accounts)").all() as Array<{ name: string }>).map((r) => r.name);
     expect(cols).toContain("activation_rank_baseline");
     expect(cols).toContain("activation_rank_settled_at");
-    expect((db.prepare("SELECT COUNT(*) c FROM sub_accounts").get() as { c: number }).c).toBe(1);
+    expect(cols).toContain("legacy_imported_at");
+    expect((db.prepare("SELECT COUNT(*) c FROM sub_accounts").get() as { c: number }).c).toBe(2);
     // **既存行に推測で基準を生やさない**
     const subs = new SubAccounts(db, new EventLog(db));
     expect(subs.activationBaseline(1)).toBeNull();
+    // import eventで契約IDまで一致する行だけを引き継ぎ済みにする。purchase_id/activated_atでは推測しない。
+    expect(subs.get(1)!.legacy_imported_at).toBe(123);
+    expect(subs.get(2)!.legacy_imported_at).toBeNull();
+    expect(subs.hasLegacyImport(MAIN)).toBe(true);
+    expect(subs.hasLegacyImport(OTHER)).toBe(false);
     db.close();
   });
 });

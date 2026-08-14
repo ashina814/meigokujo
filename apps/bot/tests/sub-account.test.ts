@@ -14,6 +14,8 @@ import {
   registerDefaultTxTypes,
 } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
+import { hasUnresolvedLegacySubAccount } from "../src/commands/sub-account.js";
+import { deactivateSubAccount } from "../src/sub-account-deactivation.js";
 
 /**
  * サブ垢の導線。
@@ -270,6 +272,7 @@ describe("旧契約の二重課金防止", () => {
     expect(contentOf(button.update)).toContain("旧サブ垢契約が残っています");
     expect(contentOf(modal.reply)).toContain("二重に支払わず");
     expect(ctx.subAccounts.listByMain(MAIN)).toHaveLength(0);
+    expect(hasUnresolvedLegacySubAccount(ctx.services, MAIN)).toBe(true);
     expect(balance(ctx)).toBe(before);
     ctx.db.close();
   });
@@ -278,7 +281,9 @@ describe("旧契約の二重課金防止", () => {
     const { handleShopModal } = await shopPanelModule;
     const ctx = setup();
     legacyPurchase(ctx);
-    ctx.subAccounts.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" });
+    const imported = ctx.subAccounts.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" });
+    expect(imported.legacy_imported_at).not.toBeNull();
+    expect(hasUnresolvedLegacySubAccount(ctx.services, MAIN)).toBe(false);
     const before = balance(ctx);
     const modal = press(`shop:sub-input:${ctx.item.id}`, world(), MAIN, {
       fields: { getTextInputValue: () => ALT2 },
@@ -288,6 +293,31 @@ describe("旧契約の二重課金防止", () => {
 
     expect(ctx.subAccounts.listByMain(MAIN).map((row) => row.status)).toEqual(["active", "pending"]);
     expect(balance(ctx)).toBe(before);
+    ctx.db.close();
+  });
+
+  it("legacy import済み契約を正式解除してもblockerは復活せず、Land・旧purchaseを変えず再申請できる", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    const purchase = legacyPurchase(ctx);
+    const imported = ctx.subAccounts.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" });
+    const before = balance(ctx);
+    const w = world();
+    w.altRoles.push(MAJIN_ROLE);
+    w.alt.roles.cache.set(MAJIN_ROLE, true);
+
+    expect((await deactivateSubAccount(ctx.services, w.guild as never, imported.id, "staff")).ok).toBe(true);
+    expect(ctx.subAccounts.get(imported.id)).toMatchObject({ status: "cancelled", legacy_imported_at: expect.any(Number) });
+    expect(hasUnresolvedLegacySubAccount(ctx.services, MAIN)).toBe(false);
+
+    const modal = press(`shop:sub-input:${ctx.item.id}`, world(), MAIN, {
+      fields: { getTextInputValue: () => ALT2 },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+    await handleShopModal(modal as never, ctx.services);
+
+    expect(ctx.subAccounts.listByMain(MAIN)).toMatchObject([{ status: "pending", alt_user_id: ALT2 }]);
+    expect(balance(ctx)).toBe(before);
+    expect(ctx.shop.getPurchase(purchase.id)!.status).toBe("active");
     ctx.db.close();
   });
 
@@ -303,6 +333,7 @@ describe("旧契約の二重課金防止", () => {
     await handleShopModal(modal as never, ctx.services);
 
     expect(ctx.subAccounts.listByMain(MAIN)[0]!.status).toBe("pending");
+    expect(hasUnresolvedLegacySubAccount(ctx.services, MAIN)).toBe(false);
     expect(balance(ctx)).toBe(before);
     ctx.db.close();
   });

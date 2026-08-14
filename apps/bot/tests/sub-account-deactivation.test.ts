@@ -11,7 +11,11 @@ import {
   openDb,
   registerDefaultTxTypes,
 } from "@meigokujo/core";
-import { activeSubAccountPanel, subAccountDeactivationConfirm } from "../src/commands/sub-account-admin.js";
+import {
+  activeSubAccountPanel,
+  handleSubAccountDeactivation,
+  subAccountDeactivationConfirm,
+} from "../src/commands/sub-account-admin.js";
 import { deactivateSubAccount } from "../src/sub-account-deactivation.js";
 import { syncSubAccountRanks } from "../src/sub-account-jobs.js";
 import type { Services } from "../src/services.js";
@@ -81,6 +85,7 @@ function discordWorld(
     removeNoop?: boolean;
     forceFailsAt?: number;
     blockFirstForce?: { entered: () => void; wait: Promise<void> };
+    blockForce?: { at: number; entered: () => void; wait: Promise<void>; failAfterWait?: boolean };
   } = {},
 ) {
   const roles = new Set(initialRoles);
@@ -113,6 +118,11 @@ function discordWorld(
       if (forceCalls === 1 && opts.blockFirstForce) {
         opts.blockFirstForce.entered();
         await opts.blockFirstForce.wait;
+      }
+      if (opts.blockForce && forceCalls === opts.blockForce.at) {
+        opts.blockForce.entered();
+        await opts.blockForce.wait;
+        if (opts.blockForce.failAfterWait) throw new Error("Discord unavailable");
       }
       if (opts.forceFailsAt === forceCalls) throw new Error("Discord unavailable");
     }
@@ -283,27 +293,102 @@ describe("運営によるサブ垢解除", () => {
     expect(w.member.roles.add).not.toHaveBeenCalled();
     ctx.db.close();
   });
+
+  it("leaseを失った古いschedulerはrollbackでprevious rankを再付与しない", async () => {
+    const ctx = setup("majin");
+    const row = active(ctx);
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => (entered = resolve));
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const w = discordWorld([LADDER.ghost], {
+      blockForce: { at: 2, entered, wait: gate, failAfterWait: true },
+    });
+
+    const syncing = syncSubAccountRanks(w.client, ctx.services);
+    await enteredPromise;
+    expect([...w.roles]).toEqual([]); // schedulerは余分なrankを剥がすところまで進んだ
+
+    ctx.db.prepare("UPDATE sub_account_rank_operations SET expires_at = 0 WHERE sub_account_id = ?").run(row.id);
+    expect((await deactivateSubAccount(ctx.services, w.guild, row.id, "staff")).ok).toBe(true);
+    expect(ctx.subAccounts.get(row.id)!.status).toBe("cancelled");
+    expect([...w.roles]).toEqual([]);
+
+    release();
+    await syncing;
+
+    expect(w.member.roles.add).not.toHaveBeenCalled();
+    expect(ctx.subAccounts.get(row.id)!.status).toBe("cancelled");
+    expect([...w.roles]).toEqual([]);
+    ctx.db.close();
+  });
 });
 
 describe("サブ垢解除UI", () => {
-  it("有効一覧はActionRow 5以下で、確認画面に本体・サブ垢・現在階級を出す", () => {
+  const customIds = (view: ReturnType<typeof activeSubAccountPanel>) =>
+    view.components.flatMap((component) =>
+      component.toJSON().components.map((button) => ("custom_id" in button ? button.custom_id : undefined)).filter(Boolean),
+    ) as string[];
+
+  it("activeが5件以上でも全ページの任意契約から確認画面へ進め、ActionRowは常に5以下", () => {
     const ctx = setup("majin");
-    const row = active(ctx);
-    for (let i = 0; i < 6; i++) {
-      ctx.db
-        .prepare("INSERT INTO sub_accounts (main_user_id,alt_user_id,status,created_at,updated_at) VALUES (?,?, 'active', ?, ?)")
-        .run(MAIN, `24632013965674414${String(i).padStart(2, "0")}`, i + 1, i + 1);
+    const rows = [active(ctx)];
+    for (let i = 0; i < 5; i++) {
+      rows.push(
+        ctx.subAccounts.importExisting({
+          mainUserId: MAIN,
+          altUserId: `24632013965674414${String(i).padStart(2, "0")}`,
+          actor: "staff",
+        }),
+      );
     }
 
-    const list = activeSubAccountPanel(ctx.services);
-    const confirm = subAccountDeactivationConfirm(ctx.services, row.id);
-    const fields = confirm.embeds[0]!.toJSON().fields ?? [];
+    const first = activeSubAccountPanel(ctx.services, 0);
+    const second = activeSubAccountPanel(ctx.services, 1);
+    const fifth = rows[4]!;
+    expect(customIds(first)).toContain("shokan:sub-active:1");
+    expect(customIds(second)).toContain(`shokan:sub-active-view:${fifth.id}:1`);
 
-    expect(list.components.length).toBeLessThanOrEqual(5);
-    expect(fields.map((field) => field.name)).toEqual(["本体", "サブ垢", "現在の本体階級"]);
-    expect(fields.map((field) => field.value).join("|")).toContain(MAIN);
-    expect(fields.map((field) => field.value).join("|")).toContain(ALT);
-    expect(fields.map((field) => field.value).join("|")).toContain("majin");
+    for (const [page, row] of [
+      [0, rows[1]!],
+      [1, rows[5]!],
+    ] as const) {
+      const confirm = subAccountDeactivationConfirm(ctx.services, row.id, page);
+      const fields = confirm.embeds[0]!.toJSON().fields ?? [];
+      expect(fields.map((field) => field.name)).toEqual(["本体", "サブ垢", "現在の本体階級"]);
+      expect(fields.map((field) => field.value).join("|")).toContain(row.alt_user_id);
+      expect(confirm.components[0]!.toJSON().components[0]).toMatchObject({
+        custom_id: `shokan:sub-deactivate:${row.id}:${page}`,
+      });
+    }
+
+    expect(first.components.length).toBeLessThanOrEqual(5);
+    expect(second.components.length).toBeLessThanOrEqual(5);
+    ctx.db.close();
+  });
+
+  it("stale pageは範囲内へ丸め、存在しない・解除済みのstale buttonはDiscordへ触れない", async () => {
+    const ctx = setup("majin");
+    const row = active(ctx);
+    const w = discordWorld([LADDER.majin]);
+    ctx.db.prepare("UPDATE sub_accounts SET status='cancelled' WHERE id=?").run(row.id);
+    const interaction = {
+      user: { id: MAIN },
+      guild: w.guild,
+      update: vi.fn(async () => undefined),
+      deferUpdate: vi.fn(async () => undefined),
+    };
+
+    const stalePage = activeSubAccountPanel(ctx.services, 999);
+    const missing = subAccountDeactivationConfirm(ctx.services, 999_999, 999);
+    await handleSubAccountDeactivation(interaction as never, ctx.services, row.id, 999);
+
+    expect(stalePage.components.length).toBeLessThanOrEqual(5);
+    expect(customIds(stalePage)).not.toContainEqual(expect.stringContaining("sub-active-view"));
+    expect(missing.embeds).toHaveLength(0);
+    expect(interaction.deferUpdate).not.toHaveBeenCalled();
+    expect(w.fetch).not.toHaveBeenCalled();
+    expect(ctx.subAccounts.get(row.id)!.status).toBe("cancelled");
     ctx.db.close();
   });
 });
