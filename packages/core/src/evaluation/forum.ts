@@ -29,8 +29,6 @@ interface CycleRow {
   eval_invite_baseline: number | null;
 }
 
-const LEGACY_CYCLE = 0;
-
 function mergeIntervals(input: Interval[]): Interval[] {
   const sorted = input
     .filter((i) => Number.isFinite(i.start) && Number.isFinite(i.end) && i.end > i.start)
@@ -95,55 +93,24 @@ export class EvaluationForumStore {
   }
 
   /**
-   * 旧 eval_threads(user_id PRIMARY KEY, thread_id) を履歴を消さずに移行する。
-   * 旧行がどの評価サイクルのものかDBだけでは断定できないため cycle_started_at=0 に隔離する。
-   * これにより既存フォーラムは保持しつつ、現在サイクルを誤って過去フォーラムへ再接続しない。
+   * 旧 eval_threads(user_id PRIMARY KEY, thread_id) は既存 Evaluation API と監査履歴のため一切変更しない。
+   * 新しいサイクル別フォーラムだけを additive な別テーブルへ保存する。
+   *
+   * 旧 thread が現在サイクルのものか過去サイクルのものかは DB だけでは断定できないため、
+   * 自動移行・自動再利用はしない。現在サイクルで初めて選択された時に新テーブルへ新規threadを作る。
    */
   private ensureThreadSchema(): void {
-    const exists = this.db
-      .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='eval_threads'")
-      .get() as { ok: number } | undefined;
-    if (!exists) {
-      this.db.exec(`
-        CREATE TABLE eval_threads (
-          user_id TEXT NOT NULL,
-          cycle_started_at INTEGER NOT NULL,
-          thread_id TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          PRIMARY KEY (user_id, cycle_started_at)
-        );
-        CREATE UNIQUE INDEX idx_eval_threads_thread ON eval_threads(thread_id);
-      `);
-      return;
-    }
-
-    const columns = this.db.prepare("PRAGMA table_info(eval_threads)").all() as Array<{ name: string }>;
-    if (columns.some((c) => c.name === "cycle_started_at")) {
-      this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_eval_threads_thread ON eval_threads(thread_id)");
-      return;
-    }
-
-    const migrate = this.db.transaction(() => {
-      this.db.exec("ALTER TABLE eval_threads RENAME TO eval_threads_legacy");
-      this.db.exec(`
-        CREATE TABLE eval_threads (
-          user_id TEXT NOT NULL,
-          cycle_started_at INTEGER NOT NULL,
-          thread_id TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          PRIMARY KEY (user_id, cycle_started_at)
-        )
-      `);
-      this.db
-        .prepare(
-          `INSERT INTO eval_threads (user_id, cycle_started_at, thread_id, created_at)
-           SELECT user_id, ?, thread_id, 0 FROM eval_threads_legacy`,
-        )
-        .run(LEGACY_CYCLE);
-      this.db.exec("DROP TABLE eval_threads_legacy");
-      this.db.exec("CREATE UNIQUE INDEX idx_eval_threads_thread ON eval_threads(thread_id)");
-    });
-    migrate.immediate();
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS eval_cycle_threads (
+        user_id TEXT NOT NULL,
+        cycle_started_at INTEGER NOT NULL,
+        thread_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (user_id, cycle_started_at)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_eval_cycle_threads_thread
+        ON eval_cycle_threads(thread_id);
+    `);
   }
 
   listCurrentCycles(): EvaluationCycleContext[] {
@@ -204,7 +171,7 @@ export class EvaluationForumStore {
 
   threadFor(userId: string, cycleStartedAt: number): string | null {
     const row = this.db
-      .prepare("SELECT thread_id FROM eval_threads WHERE user_id = ? AND cycle_started_at = ?")
+      .prepare("SELECT thread_id FROM eval_cycle_threads WHERE user_id = ? AND cycle_started_at = ?")
       .get(userId, cycleStartedAt) as { thread_id: string } | undefined;
     return row?.thread_id ?? null;
   }
@@ -212,16 +179,19 @@ export class EvaluationForumStore {
   setThread(userId: string, cycleStartedAt: number, threadId: string, createdAt = Math.floor(Date.now() / 1000)): void {
     this.db
       .prepare(
-        `INSERT INTO eval_threads (user_id, cycle_started_at, thread_id, created_at)
+        `INSERT INTO eval_cycle_threads (user_id, cycle_started_at, thread_id, created_at)
          VALUES (?, ?, ?, ?)
          ON CONFLICT(user_id, cycle_started_at) DO UPDATE SET thread_id = excluded.thread_id`,
       )
       .run(userId, cycleStartedAt, threadId, createdAt);
   }
 
-  /** 旧マッピングは監査用に保持するだけで、新しい評価サイクルからは参照しない。 */
+  /** 旧 per-user thread は監査・旧内部API互換用。新サイクル判定には使わない。 */
   legacyThreadFor(userId: string): string | null {
-    return this.threadFor(userId, LEGACY_CYCLE);
+    const row = this.db.prepare("SELECT thread_id FROM eval_threads WHERE user_id = ?").get(userId) as
+      | { thread_id: string }
+      | undefined;
+    return row?.thread_id ?? null;
   }
 
   /**
@@ -301,5 +271,4 @@ export const evaluationForumInternalsForTesting = {
   intersectIntervals,
   intervalJstDays,
   intervalSeconds,
-  LEGACY_CYCLE,
 };
