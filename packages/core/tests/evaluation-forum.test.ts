@@ -101,7 +101,7 @@ describe("EvaluationForumStore", () => {
     expect(store.inviteCountSinceCycle("u", 100)).toBe(2);
   });
 
-  it("冥獣の巣カテゴリ・評価開始後だけを集計し、魔剣士3人の重複を三重加算しない", () => {
+  it("冥獣の巣・評価開始後・同じVCだけを集計し、魔剣士3人の重複を三重加算しない", () => {
     const db = openDb(":memory:");
     const store = new EvaluationForumStore(db);
     const start = 1_000;
@@ -109,11 +109,13 @@ describe("EvaluationForumStore", () => {
     vc(db, "ghost", "den", 500, 900, "before");
     vc(db, "ghost", "other", start, end, "outside");
     vc(db, "ghost", "den", start, end, "den-main");
-    for (const id of ["sw1", "sw2", "sw3"]) vc(db, id, "den", start, end, `${id}-vc`);
+    for (const id of ["sw1", "sw2", "sw3"]) vc(db, id, "den", start, end, "den-main");
+    // 同じ冥獣の巣カテゴリでも別VCなら同席扱いにしない。
+    vc(db, "sw-other", "den", start, end, "den-other");
 
     const summary = store.presenceForCycle({
       userId: "ghost",
-      swordsmanIds: ["sw1", "sw2", "sw3"],
+      swordsmanIds: ["sw1", "sw2", "sw3", "sw-other"],
       denParentId: "den",
       startedAt: start,
       now: 3_000,
@@ -122,13 +124,31 @@ describe("EvaluationForumStore", () => {
     expect(summary.swordsmanSeconds).toBe(1_800);
   });
 
+  it("同じカテゴリでも別VCにしか魔剣士がいなければ同席時間は0", () => {
+    const db = openDb(":memory:");
+    const store = new EvaluationForumStore(db);
+    vc(db, "ghost", "den", 1_000, 2_000, "den-a");
+    vc(db, "sw", "den", 1_000, 2_000, "den-b");
+
+    const summary = store.presenceForCycle({
+      userId: "ghost",
+      swordsmanIds: ["sw"],
+      denParentId: "den",
+      startedAt: 1_000,
+      now: 3_000,
+    });
+    expect(summary.denSeconds).toBe(1_000);
+    expect(summary.swordsmanSeconds).toBe(0);
+    expect(summary.swordsmanDays).toBe(0);
+  });
+
   it("JSTの日付境界をまたぐ滞在は2日として数え、進行中セッションもnowまで含める", () => {
     const db = openDb(":memory:");
     const store = new EvaluationForumStore(db);
     const start = Math.floor(Date.parse("2026-08-14T14:50:00Z") / 1000); // JST 23:50
     const now = Math.floor(Date.parse("2026-08-14T15:10:00Z") / 1000); // JST 翌00:10
     vc(db, "ghost", "den", start, null, "ongoing");
-    vc(db, "sw", "den", start, null, "ongoing-sw");
+    vc(db, "sw", "den", start, null, "ongoing");
 
     const summary = store.presenceForCycle({
       userId: "ghost",
