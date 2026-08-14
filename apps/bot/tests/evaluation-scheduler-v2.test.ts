@@ -17,6 +17,7 @@ describe("評価フォーラムv2 scheduler境界", () => {
 
   it("通常schedulerは客観情報refreshだけを実行し、旧評価自動判断を呼ばない", () => {
     expect(normalScheduler).toContain("refreshEvaluationForums(client, services)");
+    expect(normalScheduler).not.toContain("runCharonDaily(client, services)");
     expect(normalScheduler).not.toContain("postCharonDueList(client, services)");
     expect(normalScheduler).not.toContain("sendCharonNotifications(client, services)");
     expect(normalScheduler).not.toContain("postCharonOverduePanel(client, services)");
