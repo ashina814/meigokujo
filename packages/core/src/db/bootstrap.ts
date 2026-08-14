@@ -227,6 +227,18 @@ CREATE TABLE IF NOT EXISTS eval_threads (
   thread_id TEXT NOT NULL
 );
 
+-- 評価フォーラムv2。旧 eval_threads は既存 Evaluation API / 履歴互換のためそのまま残し、
+-- 新方式だけを評価サイクル単位の additive table へ保存する。
+CREATE TABLE IF NOT EXISTS eval_cycle_threads (
+  user_id          TEXT NOT NULL,
+  cycle_started_at INTEGER NOT NULL,
+  thread_id        TEXT NOT NULL,
+  created_at       INTEGER NOT NULL,
+  PRIMARY KEY (user_id, cycle_started_at)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_eval_cycle_threads_thread
+  ON eval_cycle_threads(thread_id);
+
 CREATE TABLE IF NOT EXISTS titles (
   user_id    TEXT NOT NULL,
   title_key  TEXT NOT NULL,

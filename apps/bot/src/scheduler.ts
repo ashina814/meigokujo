@@ -5,7 +5,7 @@ import { threadTitleFor } from "./commands/evaluation.js";
 import { checkBumpCooldowns } from "./bump.js";
 import { scanRooms } from "./rooms-lifecycle.js";
 import { scanDens } from "./dens.js";
-import { refreshEvalStats } from "./eval-daily.js";
+import { refreshEvaluationForums } from "./evaluation-forum-daily.js";
 import { updateDashboard } from "./dashboard.js";
 import { updateWaitersBoard } from "./waiters-board.js";
 import { tickVoiceXp } from "./rank-tracker.js";
@@ -228,7 +228,7 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       const marker = `eval_stats:refreshed:${now.dateStr}`;
       if (!services.settings.getString(marker)) {
         await runSchedulerTaskOnce(services, marker, "system:scheduler", () =>
-          refreshEvalStats(client, services),
+          refreshEvaluationForums(client, services),
         ).catch((e) => console.error("[評価] 実績更新失敗:", e));
       }
     }
@@ -245,29 +245,10 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
-    // ── カロン: 毎日 09:00 台に期限リスト・演出通知・迷霊落ち承認パネル・題名同期 ──
-    if (now.hour === 9) {
-      await runSchedulerTaskOnce(services, `charon:due_list:${now.dateStr}`, "system:scheduler", () =>
-        postCharonDueList(client, services),
-      ).catch((e) => console.error("[カロン] 期限リスト失敗:", e));
-      await sendCharonNotifications(client, services).catch((e) => console.error("[カロン] 本人通知失敗:", e));
-      await runSchedulerTaskOnce(services, `charon:overdue_panel:${now.dateStr}`, "system:scheduler", () =>
-        postCharonOverduePanel(client, services),
-      ).catch((e) => console.error("[カロン] 承認パネル失敗:", e));
-      await runSchedulerTaskOnce(services, `charon:title_sync:${now.dateStr}`, "system:scheduler", () =>
-        syncCharonThreadTitles(client, services),
-      ).catch((e) => console.error("[カロン] 題名同期失敗:", e));
-    }
-
-    // ── 14日経ってフォーラム未作成の亡霊は自動で迷霊に落とす（毎日 09:15）──
-    if (now.hour === 9 && now.minute >= 15 && now.minute < 18) {
-      const marker = `autodrop:noeval:${now.dateStr}`;
-      if (!services.settings.getString(marker)) {
-        await runSchedulerTaskOnce(services, marker, "system:scheduler", () =>
-          autoDropNoEvalGhosts(client, services),
-        ).catch((e) => console.error("[自動迷霊] 失敗:", e));
-      }
-    }
+    // ── 旧評価制度の自動判断は通常schedulerから実行しない ──
+    // アリ数/期限によるカロン判断、旧eval_threads前提の題名同期、
+    // 「フォーラム未作成＝自動迷霊」と旧pending降格queueは互換helperとして残すが、
+    // 評価制度の最終判断をBotへ戻さないため、このtickからは呼ばない。
 
     // ── VIP 期限切れ: ロール剥奪 & DB クリア ──
     try {
