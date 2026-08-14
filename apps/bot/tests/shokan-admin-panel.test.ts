@@ -30,7 +30,7 @@ function setup() {
   const settings = new Settings(db);
   const events = new EventLog(db);
   const shop = new Shop(db, ledger, events);
-  const departments = new Departments(db, events);
+  const departments = new Departments(db, ledger);
   const nickname = shop.createItem({ name: "名前変更", price_land: 50_000, kind: "one_shot", delivery: "manual" }, "staff");
   const reeval = shop.createItem({ name: "再評価チャレンジ", price_land: 500_000, kind: "one_shot", delivery: "manual" }, "staff");
   const pass = shop.createItem(
@@ -83,11 +83,16 @@ function buyAs(ctx: Ctx, itemId: number, userId: string) {
 }
 
 /** 常設パネル（=ephemeralではないメッセージ）から押した体のインタラクション */
-function panelPress(customId: string, reply: ReturnType<typeof vi.fn>) {
+function panelPress(
+  customId: string,
+  reply: ReturnType<typeof vi.fn>,
+  options: { userId?: string; roleIds?: string[] } = {},
+) {
+  const roleIds = options.roleIds ?? [ADMIN_ROLE];
   return {
     customId,
-    user: { id: STAFF, username: "staff" },
-    member: { roles: { cache: new Collection([[ADMIN_ROLE, { id: ADMIN_ROLE }]]) } },
+    user: { id: options.userId ?? STAFF, username: "staff" },
+    member: { roles: { cache: new Collection(roleIds.map((id) => [id, { id }])) } },
     message: { flags: { has: () => false } },
     client: { channels: { fetch: vi.fn(async () => null) } },
     guild: null,
@@ -159,6 +164,67 @@ describe("常設パネルの表示", () => {
 
     expect(shopPanelMessage(ctx.services).embeds).toBeDefined();
     expect((shopAdminPanelMessage(ctx.services) as ReturnType<typeof payloadOf>).embeds[0]!.data.title).toBe("🛠 冥界商館 管理");
+    ctx.db.close();
+  });
+});
+
+describe("再評価チャレンジ例外補償の権限", () => {
+  it("商館部署担当者だけでは補償一覧を開けず、既存の運営権限なら開ける", async () => {
+    const { handleShokanButton } = await shokanModule;
+    const ctx = setup();
+    ctx.departments.upsert("冥界商館", "冥界商館", "role:shop");
+
+    const deniedReply = vi.fn(async () => undefined);
+    await handleShokanButton(
+      panelPress("shokan:reeval-comp", deniedReply, { userId: "shop-staff", roleIds: ["role:shop"] }),
+      ctx.services,
+    );
+    expect(String(payloadOf(deniedReply).content)).toContain("獄卒判断");
+
+    const allowedReply = vi.fn(async () => undefined);
+    await handleShokanButton(panelPress("shokan:reeval-comp", allowedReply), ctx.services);
+    expect(payloadOf(allowedReply).embeds[0]!.data.title).toContain("再評価チャレンジ");
+    ctx.db.close();
+  });
+
+  it("商館部署担当者はstale selectやmodalからも補償を確定できない", async () => {
+    const { handleShokanModal, handleShokanSelect } = await shokanModule;
+    const ctx = setup();
+    ctx.departments.upsert("冥界商館", "冥界商館", "role:shop");
+
+    const selectReply = vi.fn(async () => undefined);
+    const selectUpdate = vi.fn(async () => undefined);
+    await handleShokanSelect(
+      {
+        customId: "shokan:reeval-comp-purchase",
+        values: ["1"],
+        user: { id: "shop-staff" },
+        member: { roles: { cache: new Collection([["role:shop", { id: "role:shop" }]]) } },
+        isStringSelectMenu: () => true,
+        isRoleSelectMenu: () => false,
+        reply: selectReply,
+        update: selectUpdate,
+      } as never,
+      ctx.services,
+    );
+    expect(String(payloadOf(selectReply).content)).toContain("獄卒判断");
+    expect(selectUpdate).not.toHaveBeenCalled();
+
+    const before = ctx.ledger.balanceOf(`user:${USER}`);
+    const modalReply = vi.fn(async () => undefined);
+    await handleShokanModal(
+      {
+        customId: "shokan:reeval-comp-submit:1:stale-token",
+        user: { id: "shop-staff" },
+        member: { roles: { cache: new Collection([["role:shop", { id: "role:shop" }]]) } },
+        fields: { getTextInputValue: (id: string) => (id === "amount" ? "500000" : "人間判断") },
+        reply: modalReply,
+      } as never,
+      ctx.services,
+    );
+    expect(String(payloadOf(modalReply).content)).toContain("獄卒判断");
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(before);
+    expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_reeval_compensations").get()).toEqual({ n: 0 });
     ctx.db.close();
   });
 });

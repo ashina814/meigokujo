@@ -61,6 +61,8 @@ export const shokanCommand = new SlashCommandBuilder()
 const SHOKAN_DEPT_KEY = "冥界商館";
 const HISTORY_PAGE = 20;
 const REEVAL_COMPENSATION_PAGE = 25;
+const REEVAL_COMPENSATION_AUTH_MESSAGE =
+  "例外補償の確定は獄卒判断として、運営権限を持つ方だけが実行できます。";
 /** 1画面に出す件数。出したものには必ず操作ボタンを付ける（数だけ見せて押せない、を作らない） */
 const QUEUE_DISPLAY = 8;
 
@@ -385,6 +387,11 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   const action = parts[1];
   const arg = parts[2];
 
+  if (action?.startsWith("reeval-comp") && !isAdmin(interaction, services)) {
+    await interaction.reply({ content: REEVAL_COMPENSATION_AUTH_MESSAGE, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
   if (action === "orole") return void (await interaction.update(originalRoleReviewPanel(services)));
   if (action === "sub") return void (await interaction.update(subAccountReviewPanel(services)));
   if (action === "sub-active") {
@@ -509,6 +516,11 @@ export async function handleShokanSelect(
   }
   const parts = interaction.customId.split(":");
   const action = parts[1];
+
+  if (action?.startsWith("reeval-comp") && !isAdmin(interaction, services)) {
+    await interaction.reply({ content: REEVAL_COMPENSATION_AUTH_MESSAGE, flags: MessageFlags.Ephemeral });
+    return;
+  }
 
   if (action === "pick" && interaction.isStringSelectMenu()) {
     const item = services.shop.getItem(Number(interaction.values[0]));
@@ -734,6 +746,10 @@ function reevalCompensationModal(purchaseId: number, departmentKey: string) {
 }
 
 async function handleReevalCompensation(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
+  if (!isAdmin(interaction, services)) {
+    await interaction.reply({ content: REEVAL_COMPENSATION_AUTH_MESSAGE, flags: MessageFlags.Ephemeral });
+    return;
+  }
   const parts = interaction.customId.split(":");
   const purchaseId = Number(parts[2]);
   const token = parts[3] ?? "";
@@ -741,14 +757,8 @@ async function handleReevalCompensation(interaction: ModalSubmitInteraction, ser
   const departmentKey = matchingDepartments.length === 1 ? matchingDepartments[0]!.key : null;
   const amount = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
   const reason = interaction.fields.getTextInputValue("reason").trim();
-  const member = interaction.member as GuildMember | null;
-  const roleIds = member ? [...member.roles.cache.keys()] : [];
   if (!departmentKey) {
     await interaction.reply({ content: "支出部署を一意に確認できません。選択からやり直してください。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (!isAdmin(interaction, services) && !services.departments.canOperate(departmentKey, roleIds)) {
-    await interaction.reply({ content: "この部署口座から支出する権限がありません。", flags: MessageFlags.Ephemeral });
     return;
   }
   const itemId = configuredReevalItemId(services);
@@ -764,6 +774,7 @@ async function handleReevalCompensation(interaction: ModalSubmitInteraction, ser
       amount,
       reason,
       actor: `user:${interaction.user.id}`,
+      approvedBy: `user:${interaction.user.id}`,
       idempotencyKey: `shop:reeval:compensation:${purchaseId}`,
     });
     await interaction.reply({

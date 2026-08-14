@@ -878,7 +878,8 @@ CREATE TABLE IF NOT EXISTS shop_reeval_compensations (
   id                    INTEGER PRIMARY KEY AUTOINCREMENT,
   purchase_id           INTEGER NOT NULL UNIQUE REFERENCES shop_purchases(id),
   user_id               TEXT NOT NULL,
-  department_key        TEXT NOT NULL REFERENCES departments(key),
+  -- 実行時点の部署キーを監査スナップショットとして保持する。部署削除後も履歴を残すためFKは張らない。
+  department_key        TEXT NOT NULL,
   amount                INTEGER NOT NULL CHECK(amount > 0),
   reason                TEXT NOT NULL,
   actor_id               TEXT NOT NULL,

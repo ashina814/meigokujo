@@ -281,7 +281,7 @@ export class Shop {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         purchase_id INTEGER NOT NULL UNIQUE REFERENCES shop_purchases(id),
         user_id TEXT NOT NULL,
-        department_key TEXT NOT NULL REFERENCES departments(key),
+        department_key TEXT NOT NULL,
         amount INTEGER NOT NULL CHECK(amount > 0),
         reason TEXT NOT NULL,
         actor_id TEXT NOT NULL,

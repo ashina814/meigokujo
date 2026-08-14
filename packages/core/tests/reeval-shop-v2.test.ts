@@ -196,7 +196,7 @@ describe("再評価チャレンジ例外補償", () => {
     ctx.ledger.transfer({
       from: TREASURY,
       to: deptAccount("商館"),
-      amount: 600_000,
+      amount: 500_000,
       type: "adjust",
       actor: STAFF,
       idempotencyKey: "seed:dept",
@@ -211,6 +211,7 @@ describe("再評価チャレンジ例外補償", () => {
       amount: 500_000,
       reason: "運営判断による例外補償",
       actor: STAFF,
+      approvedBy: STAFF,
       idempotencyKey: `reeval:compensation:${purchase.id}`,
     });
 
@@ -221,6 +222,19 @@ describe("再評価チャレンジ例外補償", () => {
     expect(tx.type).toBe("dept_out");
     expect(tx.ref_type).toBe("shop_reeval_compensation");
     expect(tx.ref_id).toBe(String(purchase.id));
+    expect(tx.actor_id).toBe(STAFF);
+    expect(tx.approved_by).toBe(STAFF);
+    expect(compensation.department_key).toBe("商館");
+    expect(compensation.actor_id).toBe(STAFF);
+    const compensationEvent = ctx.db
+      .prepare("SELECT actor_id,payload_json FROM events WHERE type='shop_reeval_compensated'")
+      .get() as { actor_id: string; payload_json: string };
+    expect(compensationEvent.actor_id).toBe(STAFF);
+    expect(JSON.parse(compensationEvent.payload_json)).toMatchObject({
+      purchaseId: purchase.id,
+      departmentKey: "商館",
+      amount: 500_000,
+    });
     expect(ctx.shop.getPurchase(purchase.id)!.status).toBe("active");
     expect(ctx.shop.getPurchase(purchase.id)!.delivery_state).toBe("delivered");
     expect(ctx.shop.listReevalInviteUses(purchase.id)).toHaveLength(5);
@@ -239,6 +253,14 @@ describe("再評価チャレンジ例外補償", () => {
       ),
     ).toBe("ERR_REEVAL_ALREADY_COMPENSATED");
     expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(beforeUser + 500_000);
+
+    expect(ctx.departments.balanceOf("商館")).toBe(0);
+    ctx.departments.remove("商館");
+    expect(ctx.departments.get("商館")).toBeUndefined();
+    expect(ctx.shop.getReevalCompensation(purchase.id)).toMatchObject({
+      department_key: "商館",
+      actor_id: STAFF,
+    });
   });
 
   it("未消費権には補償を実行しない", () => {
@@ -280,6 +302,11 @@ describe("再評価V2 migration", () => {
     });
     expect(after.prepare("SELECT COUNT(*) AS n FROM shop_reeval_invite_uses").get()).toEqual({ n: 0 });
     expect(after.prepare("SELECT COUNT(*) AS n FROM shop_reeval_compensations").get()).toEqual({ n: 0 });
+    const compensationFks = after.prepare("PRAGMA foreign_key_list(shop_reeval_compensations)").all() as Array<{
+      table: string;
+      from: string;
+    }>;
+    expect(compensationFks).not.toContainEqual(expect.objectContaining({ table: "departments", from: "department_key" }));
     after.close();
   });
 });
