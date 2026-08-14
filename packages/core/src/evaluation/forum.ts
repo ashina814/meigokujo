@@ -29,6 +29,12 @@ interface CycleRow {
   eval_invite_baseline: number | null;
 }
 
+interface VcIntervalRow {
+  channel_id: string;
+  started_at: number;
+  ended_at: number;
+}
+
 function mergeIntervals(input: Interval[]): Interval[] {
   const sorted = input
     .filter((i) => Number.isFinite(i.start) && Number.isFinite(i.end) && i.end > i.start)
@@ -79,6 +85,19 @@ function intervalJstDays(intervals: Interval[]): number {
 
 function placeholders(count: number): string {
   return Array.from({ length: count }, () => "?").join(",");
+}
+
+function intervalByChannel(rows: VcIntervalRow[], startedAt: number, nowSec: number): Map<string, Interval[]> {
+  const byChannel = new Map<string, Interval[]>();
+  for (const row of rows) {
+    const interval = { start: Math.max(row.started_at, startedAt), end: Math.min(row.ended_at, nowSec) };
+    if (interval.end <= interval.start) continue;
+    const current = byChannel.get(row.channel_id) ?? [];
+    current.push(interval);
+    byChannel.set(row.channel_id, current);
+  }
+  for (const [channelId, intervals] of byChannel) byChannel.set(channelId, mergeIntervals(intervals));
+  return byChannel;
 }
 
 /**
@@ -209,6 +228,7 @@ export class EvaluationForumStore {
   /**
    * 冥獣の巣カテゴリだけの滞在と、現在の魔剣士との重複時間を集計する。
    * parent_id を使うため、動的VCが削除され den_vcs から掃除された後も履歴を失わない。
+   * 同席は「同じカテゴリ」ではなく channel_id が同じVCの時間だけを数える。
    */
   presenceForCycle(args: {
     userId: string;
@@ -220,48 +240,43 @@ export class EvaluationForumStore {
     const nowSec = args.now ?? Math.floor(Date.now() / 1000);
     const targetRows = this.db
       .prepare(
-        `SELECT started_at, COALESCE(ended_at, ?) AS ended_at
+        `SELECT channel_id, started_at, COALESCE(ended_at, ?) AS ended_at
            FROM vc_segments
           WHERE user_id = ?
             AND parent_id = ?
             AND started_at < ?
             AND COALESCE(ended_at, ?) > ?`,
       )
-      .all(nowSec, args.userId, args.denParentId, nowSec, nowSec, args.startedAt) as Array<{
-      started_at: number;
-      ended_at: number;
-    }>;
-    const target = mergeIntervals(
-      targetRows.map((r) => ({ start: Math.max(r.started_at, args.startedAt), end: Math.min(r.ended_at, nowSec) })),
-    );
+      .all(nowSec, args.userId, args.denParentId, nowSec, nowSec, args.startedAt) as VcIntervalRow[];
+    const targetByChannel = intervalByChannel(targetRows, args.startedAt, nowSec);
+    const target = mergeIntervals([...targetByChannel.values()].flat());
 
-    let swordsmen: Interval[] = [];
     const ids = [...new Set(args.swordsmanIds.filter((id) => id && id !== args.userId))];
+    let swordsmanByChannel = new Map<string, Interval[]>();
     if (ids.length > 0) {
       const rows = this.db
         .prepare(
-          `SELECT started_at, COALESCE(ended_at, ?) AS ended_at
+          `SELECT channel_id, started_at, COALESCE(ended_at, ?) AS ended_at
              FROM vc_segments
             WHERE user_id IN (${placeholders(ids.length)})
               AND parent_id = ?
               AND started_at < ?
               AND COALESCE(ended_at, ?) > ?`,
         )
-        .all(nowSec, ...ids, args.denParentId, nowSec, nowSec, args.startedAt) as Array<{
-        started_at: number;
-        ended_at: number;
-      }>;
-      swordsmen = mergeIntervals(
-        rows.map((r) => ({ start: Math.max(r.started_at, args.startedAt), end: Math.min(r.ended_at, nowSec) })),
-      );
+        .all(nowSec, ...ids, args.denParentId, nowSec, nowSec, args.startedAt) as VcIntervalRow[];
+      swordsmanByChannel = intervalByChannel(rows, args.startedAt, nowSec);
     }
 
-    const overlap = intersectIntervals(target, swordsmen);
+    const overlap: Interval[] = [];
+    for (const [channelId, targetIntervals] of targetByChannel) {
+      overlap.push(...intersectIntervals(targetIntervals, swordsmanByChannel.get(channelId) ?? []));
+    }
+    const mergedOverlap = mergeIntervals(overlap);
     return {
       denDays: intervalJstDays(target),
       denSeconds: intervalSeconds(target),
-      swordsmanDays: intervalJstDays(overlap),
-      swordsmanSeconds: intervalSeconds(overlap),
+      swordsmanDays: intervalJstDays(mergedOverlap),
+      swordsmanSeconds: intervalSeconds(mergedOverlap),
     };
   }
 }
