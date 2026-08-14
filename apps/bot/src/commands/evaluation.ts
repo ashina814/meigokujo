@@ -5,7 +5,6 @@ import {
   ChatInputCommandInteraction,
   MessageFlags,
   ModalSubmitInteraction,
-  SlashCommandBuilder,
   StringSelectMenuBuilder,
   StringSelectMenuInteraction,
   type AnyThreadChannel,
@@ -13,12 +12,12 @@ import {
   type Guild,
   type GuildMember,
 } from "discord.js";
-import { EvaluationForumStore, type EvaluationPresenceSummary } from "@meigokujo/core/evaluation/forum";
+import { EvaluationForumStore } from "@meigokujo/core/evaluation/forum";
 import { isAdmin } from "../permissions.js";
+import { evaluationCommand, evaluationReferenceText, threadTitleFor } from "../evaluation-forum-view.js";
+export { evaluationCommand, evaluationForumThresholdsForTesting, evaluationReferenceText, threadTitleFor } from "../evaluation-forum-view.js";
 import type { Services } from "../services.js";
 
-const DEN_LOW_SECONDS = 30 * 60;
-const SWORDSMAN_LOW_SECONDS = 15 * 60;
 const TARGETS_PER_MENU = 25;
 const MAX_TARGET_MENUS = 5;
 
@@ -39,11 +38,6 @@ export function isSwordsman(
 }
 
 // ---- /評価（旧入力フォームは廃止。運営が常設パネルを置くための入口だけ残す） ----
-
-export const evaluationCommand = new SlashCommandBuilder()
-  .setName("評価")
-  .setDescription("評価フォーラム方式の案内を表示する")
-  .setDMPermission(false);
 
 function panelRow(): ActionRowBuilder<StringSelectMenuBuilder> {
   return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
@@ -107,16 +101,6 @@ function fmtDuration(seconds: number): string {
   const hours = Math.floor(safe / 3600);
   const minutes = Math.floor((safe % 3600) / 60);
   return hours > 0 ? `${hours}時間${minutes}分` : `${minutes}分`;
-}
-
-export function evaluationReferenceText(summary: EvaluationPresenceSummary): string {
-  if (summary.denSeconds < DEN_LOW_SECONDS) {
-    return "巣穴での活動がまだ少なく、評価材料が不足している可能性があります。";
-  }
-  if (summary.swordsmanSeconds < SWORDSMAN_LOW_SECONDS) {
-    return "巣穴への参加はありますが、魔剣士との同席が少なく、評価機会が不足している可能性があります。";
-  }
-  return "魔剣士との同席機会があります。評価できる材料があるか確認してみてください。";
 }
 
 async function targetMenus(guild: Guild, services: Services): Promise<{
@@ -227,11 +211,6 @@ export async function handleEvaluationSelect(
 }
 
 // ---- フォーラム生成・客観情報 ----
-
-export function threadTitleFor(displayName: string, _deadlineTs?: number | null): string {
-  const suffix = "｜亡霊評価";
-  return `${displayName.slice(0, Math.max(1, 95 - suffix.length))}${suffix}`.slice(0, 95);
-}
 
 async function swordsmanIds(guild: Guild, services: Services): Promise<string[]> {
   const roleId = services.settings.getString("role:swordsman");
@@ -405,8 +384,3 @@ export async function handleCharonButton(interaction: ButtonInteraction, service
     embeds: [],
   });
 }
-
-export const evaluationForumThresholdsForTesting = {
-  denLowSeconds: DEN_LOW_SECONDS,
-  swordsmanLowSeconds: SWORDSMAN_LOW_SECONDS,
-};

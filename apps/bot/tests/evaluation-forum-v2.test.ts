@@ -4,7 +4,7 @@ import {
   evaluationForumThresholdsForTesting,
   evaluationReferenceText,
   threadTitleFor,
-} from "../src/commands/evaluation.js";
+} from "../src/evaluation-forum-view.js";
 
 describe("evaluation forum v2 UI", () => {
   it("/評価から旧4項目・対象user optionを外している", () => {

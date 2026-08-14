@@ -107,30 +107,7 @@ function intervalByChannel(rows: VcIntervalRow[], startedAt: number, nowSec: num
  * 評価サイクルとフォーラムの対応、現在サイクルの招待件数、VCの客観的な重複時間だけを扱う。
  */
 export class EvaluationForumStore {
-  constructor(private readonly db: Database.Database) {
-    this.ensureThreadSchema();
-  }
-
-  /**
-   * 旧 eval_threads(user_id PRIMARY KEY, thread_id) は既存 Evaluation API と監査履歴のため一切変更しない。
-   * 新しいサイクル別フォーラムだけを additive な別テーブルへ保存する。
-   *
-   * 旧 thread が現在サイクルのものか過去サイクルのものかは DB だけでは断定できないため、
-   * 自動移行・自動再利用はしない。現在サイクルで初めて選択された時に新テーブルへ新規threadを作る。
-   */
-  private ensureThreadSchema(): void {
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS eval_cycle_threads (
-        user_id TEXT NOT NULL,
-        cycle_started_at INTEGER NOT NULL,
-        thread_id TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        PRIMARY KEY (user_id, cycle_started_at)
-      );
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_eval_cycle_threads_thread
-        ON eval_cycle_threads(thread_id);
-    `);
-  }
+  constructor(private readonly db: Database.Database) {}
 
   listCurrentCycles(): EvaluationCycleContext[] {
     const rows = this.db

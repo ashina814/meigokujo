@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { EvaluationForumStore, evaluationForumInternalsForTesting } from "../src/evaluation/forum.js";
@@ -35,6 +36,14 @@ function vc(
 }
 
 describe("EvaluationForumStore", () => {
+  it("constructorはschema migrationを行わない", () => {
+    const db = new Database(":memory:");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'eval_cycle_threads'").get()).toBeUndefined();
+    new EvaluationForumStore(db);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'eval_cycle_threads'").get()).toBeUndefined();
+    db.close();
+  });
+
   it("現在の亡霊かつ評価サイクルがある人だけを列挙する", () => {
     const db = openDb(":memory:");
     soul(db, "ghost", "ghost", 100, 500);
