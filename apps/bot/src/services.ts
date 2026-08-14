@@ -136,6 +136,13 @@ export function buildServices() {
       const id = Number(settings.getString("shop:reeval_item_id"));
       return Number.isSafeInteger(id) && id > 0 ? id : null;
     },
+    originalRoleItemId: () => {
+      const id = Number(settings.getString("shop:original_role_item_id"));
+      return Number.isSafeInteger(id) && id > 0 ? id : null;
+    },
+    assertOriginalRolePayable: (applicationId, userId) => {
+      originalRoles.assertPayable(applicationId, userId);
+    },
     departments,
   });
   // 賭場の取引監査。全サービスで同じインスタンスを共有する（実行中グループを共有するため）
