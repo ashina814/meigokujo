@@ -1,0 +1,368 @@
+name: PR132 evaluation picker fix
+
+on:
+  push:
+    branches:
+      - fix/evaluation-picker-membership
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/evaluation-picker-membership
+          fetch-depth: 0
+
+      - name: Apply evaluation picker usability fix
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('apps/bot/src/commands/evaluation.ts')
+          src = path.read_text()
+
+          def replace_once(old, new, label):
+              global src
+              if old not in src:
+                  raise SystemExit(f'missing replacement target: {label}')
+              src = src.replace(old, new, 1)
+
+          replace_once(
+              '  ButtonInteraction,\n  ChannelType,',
+              '  ButtonInteraction,\n  ButtonBuilder,\n  ButtonStyle,\n  ChannelType,',
+              'discord button imports',
+          )
+          replace_once(
+              '  interaction: ChatInputCommandInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,',
+              '  interaction: ChatInputCommandInteraction | ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,',
+              'swordsman interaction union',
+          )
+
+          panel_pattern = re.compile(r'function panelRow\(\): ActionRowBuilder<StringSelectMenuBuilder> \{.*?\n\}\n\nexport async function handleEvaluationCommand', re.S)
+          panel_replacement = '''function panelRow(): ActionRowBuilder<ButtonBuilder> {
+            return new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder()
+                .setCustomId("eval:open")
+                .setLabel("評価する亡霊を選択")
+                .setStyle(ButtonStyle.Primary),
+            );
+          }
+
+          export async function handleEvaluationCommand'''
+          src, count = panel_pattern.subn(panel_replacement, src, count=1)
+          if count != 1:
+              raise SystemExit(f'panelRow replacement count={count}')
+
+          target_pattern = re.compile(r'async function targetMenus\(guild: Guild, services: Services\): Promise<\{.*?\n\}\n\nexport async function handleEvaluationSelect', re.S)
+          target_replacement = '''async function targetMenus(
+            guild: Guild,
+            services: Services,
+            excludeUserId?: string,
+          ): Promise<{
+            rows: ActionRowBuilder<StringSelectMenuBuilder>[];
+            total: number;
+            shown: number;
+            memberIds: Set<string>;
+          }> {
+            const store = new EvaluationForumStore(services.db);
+            const cycles = store.listCurrentCycles();
+            if (cycles.length === 0) return { rows: [], total: 0, shown: 0, memberIds: new Set() };
+
+            // Guild在籍を正本として一覧を作る。取得失敗時は呼び出し側で再試行を案内し、ID表示へは逃がさない。
+            const members = await guild.members.fetch();
+            const memberIds = new Set(members.keys());
+            const presentCycles = cycles.filter((cycle) => cycle.userId !== excludeUserId && memberIds.has(cycle.userId));
+            const shownCycles = presentCycles.slice(0, TARGETS_PER_MENU * MAX_TARGET_MENUS);
+            const rows: ActionRowBuilder<StringSelectMenuBuilder>[] = [];
+            for (let offset = 0; offset < shownCycles.length; offset += TARGETS_PER_MENU) {
+              const chunk = shownCycles.slice(offset, offset + TARGETS_PER_MENU);
+              const index = Math.floor(offset / TARGETS_PER_MENU);
+              rows.push(
+                new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+                  new StringSelectMenuBuilder()
+                    .setCustomId(`eval:target:${index}`)
+                    .setPlaceholder(index === 0 ? "現在の亡霊から選択" : `現在の亡霊から選択（${index + 1}）`)
+                    .addOptions(
+                      chunk.map((cycle) => {
+                        const member = members.get(cycle.userId);
+                        if (!member) throw new Error(`guild member disappeared while rendering evaluation target: ${cycle.userId}`);
+                        const deadline = cycle.deadlineAt ? `期限 ${fmtJstShortDate(cycle.deadlineAt)}` : "期限未設定";
+                        return { label: member.displayName.slice(0, 100), value: cycle.userId, description: deadline.slice(0, 100) };
+                      }),
+                    ),
+                ),
+              );
+            }
+            return { rows, total: presentCycles.length, shown: shownCycles.length, memberIds };
+          }
+
+          async function replyWithTargetMenus(
+            interaction: ButtonInteraction | StringSelectMenuInteraction,
+            services: Services,
+          ): Promise<void> {
+            if (!interaction.guild) {
+              await interaction.reply({ content: "サーバー内で使用してください。", flags: MessageFlags.Ephemeral });
+              return;
+            }
+            let menus: Awaited<ReturnType<typeof targetMenus>>;
+            try {
+              menus = await targetMenus(interaction.guild, services);
+            } catch {
+              await interaction.reply({
+                content: "メンバー一覧の取得に失敗しました。もう一度押してください。",
+                flags: MessageFlags.Ephemeral,
+              });
+              return;
+            }
+            if (menus.total === 0) {
+              await interaction.reply({ content: "現在、評価期間中かつサーバーに在籍している亡霊はいません。", flags: MessageFlags.Ephemeral });
+              return;
+            }
+            const omitted = menus.total - menus.shown;
+            await interaction.reply({
+              content:
+                omitted > 0
+                  ? `現在の評価対象は ${menus.total}名です。Discordの表示上限のため先頭${menus.shown}名を表示しています。`
+                  : `現在の評価対象は ${menus.total}名です。対象を選んでください。`,
+              components: menus.rows,
+              flags: MessageFlags.Ephemeral,
+            });
+          }
+
+          export async function handleEvaluationButton(
+            interaction: ButtonInteraction,
+            services: Services,
+          ): Promise<void> {
+            if (interaction.customId !== "eval:open") return;
+            if (!isSwordsman(interaction, services)) {
+              await interaction.reply({ content: "評価フォーラムは魔剣士のみ利用できます。", flags: MessageFlags.Ephemeral });
+              return;
+            }
+            await replyWithTargetMenus(interaction, services);
+          }
+
+          export async function handleEvaluationSelect'''
+          src, count = target_pattern.subn(target_replacement, src, count=1)
+          if count != 1:
+              raise SystemExit(f'targetMenus replacement count={count}')
+
+          old_open = '''  if (interaction.customId === "eval:open") {
+            const menus = await targetMenus(interaction.guild, services);
+            if (menus.total === 0) {
+              await interaction.reply({ content: "現在、評価期間中の亡霊はいません。", flags: MessageFlags.Ephemeral });
+              return;
+            }
+            const omitted = menus.total - menus.shown;
+            await interaction.reply({
+              content:
+                omitted > 0
+                  ? `現在の評価対象は ${menus.total}名です。Discordの表示上限のため先頭${menus.shown}名を表示しています。`
+                  : `現在の評価対象は ${menus.total}名です。対象を選んでください。`,
+              components: menus.rows,
+              flags: MessageFlags.Ephemeral,
+            });
+            return;
+          }
+          '''
+          new_open = '''  if (interaction.customId === "eval:open") {
+            // deploy前に設置された旧1択selectも、同じ最新一覧へ案内してinteraction failureを避ける。
+            await replyWithTargetMenus(interaction, services);
+            return;
+          }
+          '''
+          replace_once(old_open, new_open, 'legacy eval:open select compatibility')
+
+          selection_pattern = re.compile(r'  const targetId = interaction\.values\[0\];.*?\n  \}\n\n// ---- フォーラム生成・客観情報 ----', re.S)
+          selection_replacement = '''  const targetId = interaction.values[0];
+            if (!targetId) {
+              await interaction.update({ content: "対象を取得できませんでした。パネルから一覧を開き直してください。", components: [] });
+              return;
+            }
+
+            // Discordへの応答だけ先に確定し、以降は最新のGuild在籍とDB評価サイクルを再検証する。
+            await interaction.deferUpdate();
+
+            let menus: Awaited<ReturnType<typeof targetMenus>>;
+            try {
+              menus = await targetMenus(interaction.guild, services, targetId);
+            } catch {
+              await interaction.editReply({
+                content: "メンバー一覧の取得に失敗しました。もう一度パネルの［評価する亡霊を選択］を押してください。",
+                components: [],
+              });
+              return;
+            }
+
+            const store = new EvaluationForumStore(services.db);
+            const cycle = store.currentCycle(targetId);
+            if (!cycle) {
+              await interaction.editReply({
+                content: "この人は現在の評価対象ではありません。最新の一覧から選び直してください。",
+                components: menus.rows,
+              });
+              return;
+            }
+            if (!menus.memberIds.has(targetId)) {
+              await interaction.editReply({
+                content: [
+                  "この人は現在サーバーに在籍していないため、評価対象一覧から外れました。",
+                  menus.total > 0 ? "**続けて別の亡霊を選択できます。**" : "現在ほかに選択できる亡霊はいません。",
+                ].join("\\n\\n"),
+                components: menus.rows,
+              });
+              return;
+            }
+
+            try {
+              const thread = await ensureEvaluationThread(interaction.guild, services, targetId);
+              await interaction.editReply({
+                content: thread
+                  ? [
+                      `評価フォーラムを開きました: ${thread.toString()}`,
+                      "以降はフォーラムへ通常のDiscordメッセージとして自由に評価を書いてください。",
+                      menus.total > 0 ? "**続けて別の亡霊も選択できます。**" : "現在ほかに選択できる亡霊はいません。",
+                    ].join("\\n\\n")
+                  : "評価フォーラムを作成できませんでした。対象の在籍状況と `channel:eval_forum` の設定を確認してください。",
+                components: menus.rows,
+              });
+            } catch (error) {
+              await interaction.editReply({
+                content: `評価フォーラムを開けませんでした: ${error instanceof Error ? error.message : String(error)}`,
+                components: menus.rows,
+              });
+            }
+          }
+
+          // ---- フォーラム生成・客観情報 ----'''
+          src, count = selection_pattern.subn(selection_replacement, src, count=1)
+          if count != 1:
+              raise SystemExit(f'selection flow replacement count={count}')
+
+          replace_once(
+              '  const member = await guild.members.fetch(targetId).catch(() => null);\n  const displayName = member?.displayName ?? targetId;',
+              '  const member = await guild.members.fetch(targetId).catch(() => null);\n  if (!member) return null;\n  const displayName = member.displayName;',
+              'starter membership guard',
+          )
+          replace_once(
+              '  const member = await guild.members.fetch(targetId).catch(() => null);\n  const expectedName = threadTitleFor(member?.displayName ?? targetId);',
+              '  const member = await guild.members.fetch(targetId).catch(() => null);\n  if (!member) return;\n  const expectedName = threadTitleFor(member.displayName);',
+              'refresh membership guard',
+          )
+          replace_once(
+              '  const current = store.currentCycle(targetId);\n  if (!current || current.startedAt !== cycleStartedAt) return null;\n\n  const forumId = services.settings.getString("channel:eval_forum");',
+              '  const current = store.currentCycle(targetId);\n  if (!current || current.startedAt !== cycleStartedAt) return null;\n  const member = await guild.members.fetch(targetId).catch(() => null);\n  if (!member) return null;\n\n  const forumId = services.settings.getString("channel:eval_forum");',
+              'thread creation membership guard',
+          )
+          replace_once(
+              '  const member = await guild.members.fetch(targetId).catch(() => null);\n  const content = await starterContent(guild, services, targetId);',
+              '  const content = await starterContent(guild, services, targetId);',
+              'remove duplicate thread member fetch',
+          )
+          replace_once(
+              '    name: threadTitleFor(member?.displayName ?? targetId),',
+              '    name: threadTitleFor(member.displayName),',
+              'thread title no id fallback',
+          )
+
+          path.write_text(src)
+
+          index_path = Path('apps/bot/src/index.ts')
+          index = index_path.read_text()
+          if '  handleEvaluationButton,\n  handleEvaluationCommand,' not in index:
+              index = index.replace(
+                  '  handleCharonButton,\n  handleEvaluationCommand,',
+                  '  handleCharonButton,\n  handleEvaluationButton,\n  handleEvaluationCommand,',
+                  1,
+              )
+          route_old = '''      if (interaction.customId.startsWith("mimi:")) {
+                await handleConfessionButton(interaction, services);
+                return;
+              }
+              if (interaction.customId.startsWith("charon:")) {'''
+          route_new = '''      if (interaction.customId.startsWith("mimi:")) {
+                await handleConfessionButton(interaction, services);
+                return;
+              }
+              if (interaction.customId === "eval:open") {
+                await handleEvaluationButton(interaction, services);
+                return;
+              }
+              if (interaction.customId.startsWith("charon:")) {'''
+          if route_old not in index:
+              raise SystemExit('missing index button route target')
+          index = index.replace(route_old, route_new, 1)
+          index_path.write_text(index)
+
+          test_path = Path('apps/bot/tests/evaluation-picker-membership.test.ts')
+          test_path.write_text('''import { readFileSync } from "node:fs";
+          import { describe, expect, it } from "vitest";
+
+          const source = readFileSync(new URL("../src/commands/evaluation.ts", import.meta.url), "utf8");
+          const indexSource = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+
+          describe("evaluation picker membership UX", () => {
+            it("常設入口は1択selectではなく何度でも押せるbutton", () => {
+              const panelStart = source.indexOf("function panelRow");
+              const panelEnd = source.indexOf("export async function handleEvaluationCommand", panelStart);
+              const panel = source.slice(panelStart, panelEnd);
+              expect(panel).toContain("ActionRowBuilder<ButtonBuilder>");
+              expect(panel).toContain('setCustomId("eval:open")');
+              expect(panel).toContain('setLabel("評価する亡霊を選択")');
+              expect(panel).not.toContain("StringSelectMenuBuilder");
+              expect(indexSource).toContain('interaction.customId === "eval:open"');
+              expect(indexSource).toContain("handleEvaluationButton(interaction, services)");
+            });
+
+            it("DB評価中とGuild在籍の積集合だけを表示しIDへフォールバックしない", () => {
+              expect(source).toContain("const members = await guild.members.fetch();");
+              expect(source).toContain("memberIds.has(cycle.userId)");
+              expect(source).toContain("member.displayName.slice(0, 100)");
+              expect(source).not.toContain("member?.displayName ?? cycle.userId");
+              expect(source).toContain("メンバー一覧の取得に失敗しました。もう一度押してください。");
+            });
+
+            it("選択確定時も在籍を再確認し、成功後に残り一覧を消さない", () => {
+              expect(source).toContain("if (!menus.memberIds.has(targetId))");
+              expect(source).toContain("現在サーバーに在籍していないため、評価対象一覧から外れました");
+              expect(source).toContain("**続けて別の亡霊も選択できます。**");
+              expect(source).toContain("components: menus.rows");
+              expect(source).toContain("if (!member) return null;");
+              expect(source).not.toContain('name: threadTitleFor(member?.displayName ?? targetId)');
+            });
+          });
+          ''')
+          PY
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm -r test
+
+      - name: Commit verified fix
+        shell: bash
+        run: |
+          git config user.name "ashina814"
+          git config user.email "233315635+ashina814@users.noreply.github.com"
+          git rm .github/workflows/pr132-evaluation-picker-fix.yml
+          git add apps/bot/src/commands/evaluation.ts apps/bot/src/index.ts apps/bot/tests/evaluation-picker-membership.test.ts
+          git commit -m "fix: 評価対象を在籍中の亡霊だけに絞る"
+          git push origin HEAD:fix/evaluation-picker-membership
