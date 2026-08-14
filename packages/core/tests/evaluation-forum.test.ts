@@ -45,7 +45,7 @@ describe("EvaluationForumStore", () => {
     expect(store.listCurrentCycles().map((c) => c.userId)).toEqual(["ghost"]);
   });
 
-  it("旧 user_id 単位のthreadを履歴として残し、現在サイクルとは分離する", () => {
+  it("旧 user_id 単位のthreadを一切変更せず、新しいサイクルthreadを別テーブルへ保存する", () => {
     const db = openDb(":memory:");
     db.prepare("INSERT INTO eval_threads (user_id, thread_id) VALUES (?, ?)").run("u", "old-thread");
 
@@ -59,9 +59,19 @@ describe("EvaluationForumStore", () => {
     expect(store.threadFor("u", 100)).toBe("cycle-100");
     expect(store.threadFor("u", 200)).toBe("cycle-200");
     expect(store.legacyThreadFor("u")).toBe("old-thread");
-    const rows = db.prepare("SELECT cycle_started_at, thread_id FROM eval_threads WHERE user_id = ? ORDER BY cycle_started_at").all("u");
+
+    // 旧テーブルはschemaも行もそのまま。既存Evaluation APIの ON CONFLICT(user_id) を壊さない。
+    const legacyColumns = db.prepare("PRAGMA table_info(eval_threads)").all() as Array<{ name: string }>;
+    expect(legacyColumns.map((c) => c.name)).toEqual(["user_id", "thread_id"]);
+    expect(db.prepare("SELECT * FROM eval_threads WHERE user_id = ?").get("u")).toEqual({
+      user_id: "u",
+      thread_id: "old-thread",
+    });
+
+    const rows = db
+      .prepare("SELECT cycle_started_at, thread_id FROM eval_cycle_threads WHERE user_id = ? ORDER BY cycle_started_at")
+      .all("u");
     expect(rows).toEqual([
-      { cycle_started_at: 0, thread_id: "old-thread" },
       { cycle_started_at: 100, thread_id: "cycle-100" },
       { cycle_started_at: 200, thread_id: "cycle-200" },
     ]);
