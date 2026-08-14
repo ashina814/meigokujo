@@ -144,9 +144,12 @@ export {
   DEFAULT_TERM_DAYS,
   REEVAL_PRICE_LAND,
   REEVAL_INVITE_COUNT,
+  EVAL_EXTENSION_PRICE_LAND,
+  EVAL_EXTENSION_MAX_USES,
   termDays,
   extendedExpiry,
   isTimedAccessItem,
+  isEvaluationExtensionItem,
   timedAccessConfig,
   type ShopItemRow,
   type ShopItemInput,
@@ -171,6 +174,8 @@ export {
   type ShopRoleRevocationRow,
   type ReevalInviteUseRow,
   type ReevalCompensationRow,
+  type EvaluationExtensionQuote,
+  type EvaluationExtensionUseRow,
 } from "./shop/service.js";
 export {
   Tickets,

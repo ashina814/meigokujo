@@ -925,6 +925,22 @@ CREATE TABLE IF NOT EXISTS shop_reeval_compensations (
 );
 CREATE INDEX IF NOT EXISTS idx_shop_reeval_compensations_user
   ON shop_reeval_compensations(user_id, created_at);
+
+-- 評価期間+1日の使用台帳。eval_started_atをサイクルIDとして期限変化を監査する。
+-- 旧購入は推測backfillせず、V2購入から追記する。
+CREATE TABLE IF NOT EXISTS shop_eval_extension_uses (
+  purchase_id          INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
+  item_id              INTEGER NOT NULL REFERENCES shop_items(id),
+  user_id              TEXT NOT NULL,
+  eval_started_at      INTEGER NOT NULL,
+  previous_deadline_at INTEGER NOT NULL,
+  new_deadline_at      INTEGER NOT NULL,
+  sequence             INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 5),
+  created_at           INTEGER NOT NULL,
+  UNIQUE(user_id, eval_started_at, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_shop_eval_extension_uses_cycle
+  ON shop_eval_extension_uses(user_id, eval_started_at, sequence);
 CREATE INDEX IF NOT EXISTS idx_sub_account_rank_operations_expiry
   ON sub_account_rank_operations(expires_at);
 CREATE INDEX IF NOT EXISTS idx_original_roles_user ON original_roles(user_id, status);
