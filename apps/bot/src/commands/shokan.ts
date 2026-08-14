@@ -1,7 +1,10 @@
 import {
   decisionModal as subDecisionModal,
+  activeSubAccountPanel,
   handleSubAccountApprove,
+  handleSubAccountDeactivation,
   handleSubAccountDecision,
+  subAccountDeactivationConfirm,
   subAccountReviewPanel,
 } from "./sub-account-admin.js";
 import {
@@ -378,6 +381,13 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
 
   if (action === "orole") return void (await interaction.update(originalRoleReviewPanel(services)));
   if (action === "sub") return void (await interaction.update(subAccountReviewPanel(services)));
+  if (action === "sub-active") return void (await interaction.update(activeSubAccountPanel(services)));
+  if (action === "sub-active-view" && arg) {
+    return void (await interaction.update(subAccountDeactivationConfirm(services, Number(arg))));
+  }
+  if (action === "sub-deactivate" && arg) {
+    return void (await handleSubAccountDeactivation(interaction, services, Number(arg)));
+  }
   if (action === "sub-approve" && arg) return void (await handleSubAccountApprove(interaction, services, Number(arg)));
   if (action === "sub-return" && arg) return void (await interaction.showModal(subDecisionModal("returned", Number(arg))));
   if (action === "sub-reject" && arg) return void (await interaction.showModal(subDecisionModal("rejected", Number(arg))));

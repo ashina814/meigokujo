@@ -849,6 +849,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_accounts_alt_open
   ON sub_accounts(alt_user_id) WHERE status IN ('pending','approved','active');
 CREATE INDEX IF NOT EXISTS idx_sub_accounts_main ON sub_accounts(main_user_id, status);
 CREATE INDEX IF NOT EXISTS idx_sub_accounts_status ON sub_accounts(status);
+-- サブ垢のDiscord階級操作を直列化する短期lease。
+-- scheduler同期と運営解除が同時に走り、解除中に階級を付け直す競合を防ぐ。
+CREATE TABLE IF NOT EXISTS sub_account_rank_operations (
+  sub_account_id INTEGER PRIMARY KEY REFERENCES sub_accounts(id) ON DELETE CASCADE,
+  kind           TEXT NOT NULL CHECK (kind IN ('sync','deactivate')),
+  token          TEXT NOT NULL,
+  expires_at     INTEGER NOT NULL,
+  created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sub_account_rank_operations_expiry
+  ON sub_account_rank_operations(expires_at);
 CREATE INDEX IF NOT EXISTS idx_original_roles_user ON original_roles(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_original_roles_status ON original_roles(status, expires_at);
 -- 同じロールを2つの契約に結び付けない（引き継ぎ登録の二重実行を止める）

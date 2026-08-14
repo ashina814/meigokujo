@@ -12,6 +12,7 @@ import {
 } from "discord.js";
 import { SUB_ACCOUNT_PAYMENT_GRACE_DAYS } from "@meigokujo/core";
 import { RANK_REQUIRED_MESSAGE, eligible, mainRank } from "./sub-account.js";
+import { deactivateSubAccount } from "../sub-account-deactivation.js";
 import type { Services } from "../services.js";
 
 /**
@@ -29,6 +30,7 @@ import type { Services } from "../services.js";
  * 描画そのものが落ちて運営が何も操作できなくなる。
  */
 const LIST_LIMIT = 4;
+const ACTIVE_LIST_LIMIT = 4;
 /** Discord の上限。ここを超える components は作らない */
 export const MAX_ACTION_ROWS = 5;
 
@@ -79,8 +81,102 @@ export function subAccountReviewPanel(services: Services) {
   // 戻る行のぶんを必ず残す。**上限を超えたら申請行のほうを削る**
   const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("shokan:hub").setLabel("← 管理へ").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("shokan:sub-active")
+      .setLabel(`有効なサブ垢 ${services.subAccounts.countByStatus("active")}`)
+      .setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [...rows.slice(0, MAX_ACTION_ROWS - 1), backRow], content: "" };
+}
+
+/** 有効契約の一覧。1件1行＋戻る1行でActionRow上限5を守る。 */
+export function activeSubAccountPanel(services: Services) {
+  const active = services.subAccounts.listByStatus("active", ACTIVE_LIST_LIMIT);
+  const total = services.subAccounts.countByStatus("active");
+  const embed = new EmbedBuilder()
+    .setTitle("👥 有効なサブ垢")
+    .setColor(total > 0 ? 0x2563eb : 0x64748b)
+    .setDescription(
+      [
+        total > 0
+          ? `**有効 ${total}件**${total > ACTIVE_LIST_LIMIT ? `（古い順に ${ACTIVE_LIST_LIMIT}件だけ操作できます）` : ""}`
+          : "有効なサブ垢はありません。",
+        "",
+        ...active.map(
+          (row) =>
+            `**#${row.id}** 本体 <@${row.main_user_id}>（階級 ${mainRank(services, row.main_user_id) ?? "不明"}）\nサブ垢 <@${row.alt_user_id}>`,
+        ),
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  const rows = active.map((row) =>
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`shokan:sub-active-view:${row.id}`)
+        .setLabel(`#${row.id} 解除を確認`)
+        .setStyle(ButtonStyle.Secondary),
+    ),
+  );
+  const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("shokan:sub").setLabel("← サブ垢管理").setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [...rows.slice(0, MAX_ACTION_ROWS - 1), backRow], content: "" };
+}
+
+/** 解除の最終確認。表示時にもactiveを再確認し、本体・サブ垢・本体階級を明示する。 */
+export function subAccountDeactivationConfirm(services: Services, id: number, content = "") {
+  const row = services.subAccounts.get(id);
+  if (!row || row.status !== "active") {
+    return {
+      content: "⚠️ この契約は既に解除済みか、現在は解除できません。",
+      embeds: [],
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId("shokan:sub-active").setLabel("← 有効なサブ垢").setStyle(ButtonStyle.Secondary),
+        ),
+      ],
+    };
+  }
+  const embed = new EmbedBuilder()
+    .setTitle(`サブ垢 #${id} の解除確認`)
+    .setColor(0xdc2626)
+    .addFields(
+      { name: "本体", value: `<@${row.main_user_id}>`, inline: true },
+      { name: "サブ垢", value: `<@${row.alt_user_id}>`, inline: true },
+      { name: "現在の本体階級", value: mainRank(services, row.main_user_id) ?? "不明", inline: true },
+    )
+    .setDescription("サブ垢の階級ロールをすべて回収し、Discord実状態で0件を確認してから契約を解除します。返金は行いません。");
+  const rowButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`shokan:sub-deactivate:${id}`).setLabel("解除する").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("shokan:sub-active").setLabel("戻る").setStyle(ButtonStyle.Secondary),
+  );
+  return { content, embeds: [embed], components: [rowButtons] };
+}
+
+export async function handleSubAccountDeactivation(
+  interaction: ButtonInteraction,
+  services: Services,
+  id: number,
+): Promise<void> {
+  // stale button対策。Discordへ触る前にactiveを再確認する。
+  if (services.subAccounts.get(id)?.status !== "active") {
+    await interaction.update(subAccountDeactivationConfirm(services, id));
+    return;
+  }
+  await interaction.deferUpdate();
+  const result = await deactivateSubAccount(services, interaction.guild, id, `user:${interaction.user.id}`);
+  if (result.ok) {
+    await interaction.editReply({ ...activeSubAccountPanel(services), content: `✅ サブ垢 #${id} を解除しました。返金は行っていません。` });
+    return;
+  }
+  const message =
+    result.reason === "not_active"
+      ? "この契約は既に解除済みです。"
+      : result.reason === "busy"
+        ? "別の階級同期が進行中です。少し待ってから再度確認してください。"
+        : `解除できませんでした。契約はactiveのままです。${result.detail ? `\n${result.detail}` : ""}`;
+  await interaction.editReply(subAccountDeactivationConfirm(services, id, `⚠️ ${message}`));
 }
 
 export function decisionModal(decision: "returned" | "rejected", id: number) {

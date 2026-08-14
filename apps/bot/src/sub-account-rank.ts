@@ -33,9 +33,13 @@ export function wantedRankRoleId(services: Services, mainUserId: string): string
 
 /** 設定されている階級ロールすべて */
 export function ladderRoleIds(services: Services): string[] {
-  return Object.values(RANK_ROLE_SETTING_KEYS)
-    .map((key) => services.settings.getString(key))
-    .filter((id): id is string => !!id);
+  return [
+    ...new Set(
+      Object.values(RANK_ROLE_SETTING_KEYS)
+        .map((key) => services.settings.getString(key))
+        .filter((id): id is string => !!id),
+    ),
+  ];
 }
 
 /**
@@ -70,6 +74,65 @@ export type RankSyncResult =
       missing?: string | null;
     };
 
+export type RankClearResult =
+  | { ok: true; removed: string[] }
+  | { ok: false; reason: "config_missing"; missingKeys: string[]; removed: [] }
+  | {
+      ok: false;
+      reason:
+        | "member_unavailable"
+        | "remove_failed"
+        | "final_unverifiable"
+        | "roles_remaining"
+        | "config_changed"
+        | "operation_lost";
+      removed: string[];
+      remaining?: string[];
+      failed?: string[];
+    };
+
+/**
+ * 解除用にサブ垢の階級ロールを0件へ回収する。
+ *
+ * 設定を先に全件検査し、操作前後ともforce fetchしたDiscord実状態だけを正本にする。
+ * removeが例外を返した場合は、結果的に剥がれていても解除成功にはしない。
+ */
+export async function clearAltRankRoles(
+  services: Services,
+  guild: Guild,
+  userId: string,
+  renewOperation: () => boolean,
+): Promise<RankClearResult> {
+  const missingKeys = missingLadderRoleKeys(services);
+  if (missingKeys.length > 0) return { ok: false, reason: "config_missing", missingKeys, removed: [] };
+
+  const ladder = ladderRoleIds(services);
+  const member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
+  if (!member) return { ok: false, reason: "member_unavailable", removed: [] };
+  const present = ladder.filter((id) => member.roles.cache.has(id));
+  const failed: string[] = [];
+  for (const id of present) {
+    if (!renewOperation()) {
+      return { ok: false, reason: "operation_lost", removed: present, remaining: present };
+    }
+    await member.roles.remove(id, "サブ垢: 契約解除").catch(() => failed.push(id));
+  }
+
+  const finalMember = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
+  if (!finalMember) return { ok: false, reason: "final_unverifiable", removed: present, failed };
+  const remaining = ladder.filter((id) => finalMember.roles.cache.has(id));
+  if (failed.length > 0) return { ok: false, reason: "remove_failed", removed: present, remaining, failed };
+  if (remaining.length > 0) return { ok: false, reason: "roles_remaining", removed: present, remaining };
+
+  const currentMissing = missingLadderRoleKeys(services);
+  const currentLadder = ladderRoleIds(services);
+  if (currentMissing.length > 0 || currentLadder.length !== ladder.length || currentLadder.some((id) => !ladder.includes(id))) {
+    return { ok: false, reason: "config_changed", removed: present, remaining: [] };
+  }
+  if (!renewOperation()) return { ok: false, reason: "operation_lost", removed: present, remaining: [] };
+  return { ok: true, removed: present };
+}
+
 /**
  * サブ垢の階級ロールを本体に合わせ、**実状態で確かめてから**結果を返す。
  *
@@ -87,6 +150,8 @@ export async function reconcileAltRank(
      * 状態を「開始前」と誤認してしまう
      */
     baseline?: readonly string[];
+    /** scheduler leaseの所有権をDiscord変更の直前に再確認・延長する */
+    renewOperation?: () => boolean;
   } = {},
 ): Promise<RankSyncResult> {
   // **設定が揃っていなければ何も触らない。** 判定の前に確かめる
@@ -119,8 +184,19 @@ export async function reconcileAltRank(
     return { ok: false, reason, wanted, mutated: true, restored, extra, missing };
   };
 
+  let operationMutated = false;
   for (const id of toRemove) {
+    if (opts.renewOperation && !opts.renewOperation()) {
+      return {
+        ok: false,
+        reason: "unverifiable",
+        wanted,
+        mutated: operationMutated,
+        restored: operationMutated ? null : true,
+      };
+    }
     await member.roles.remove(id, "サブ垢: 本体の階級に合わせる").catch(() => undefined);
+    operationMutated = true;
   }
   // **剥がせたか確かめてから足す。** 確認できないうちは何も足さない
   const afterRemoval = toRemove.length > 0 ? await freshLadderRoles(guild, member.id, ladder) : presentState;
@@ -130,6 +206,9 @@ export async function reconcileAltRank(
 
   const needsAdd = wanted !== null && !afterRemoval.includes(wanted);
   if (needsAdd) {
+    if (opts.renewOperation && !opts.renewOperation()) {
+      return { ok: false, reason: "unverifiable", wanted, mutated: operationMutated, restored: operationMutated ? null : true };
+    }
     await member.roles.add(wanted, "サブ垢: 本体の階級に合わせる").catch(() => undefined);
   }
   // 最後にもう一度、実状態で見る

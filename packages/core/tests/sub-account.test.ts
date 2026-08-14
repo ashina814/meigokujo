@@ -81,6 +81,46 @@ describe("資格（魔人以上）", () => {
   });
 });
 
+describe("Discord階級操作のlease", () => {
+  it("scheduler同期と運営解除を同時にclaimさせない", () => {
+    const ctx = setup();
+    const row = ctx.subs.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" });
+
+    expect(ctx.subs.claimRankOperation(row.id, "sync", "sync-1")).toBe(true);
+    expect(ctx.subs.claimRankOperation(row.id, "deactivate", "deactivate-1")).toBe(false);
+    expect(ctx.subs.releaseRankOperation(row.id, "deactivate-1")).toBe(false);
+    expect(ctx.subs.releaseRankOperation(row.id, "sync-1")).toBe(true);
+    expect(ctx.subs.claimRankOperation(row.id, "deactivate", "deactivate-1")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("期限切れleaseを別処理が取得したら、古いtokenは更新できない", () => {
+    const ctx = setup();
+    const row = ctx.subs.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" });
+
+    expect(ctx.subs.claimRankOperation(row.id, "sync", "stale", 0)).toBe(true);
+    expect(ctx.subs.claimRankOperation(row.id, "deactivate", "current")).toBe(true);
+    expect(ctx.subs.renewRankOperation(row.id, "stale")).toBe(false);
+    expect(ctx.subs.renewRankOperation(row.id, "current")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("解除確定はdeactivate lease所有者だけが行い、purchase_idを残す", () => {
+    const ctx = setup();
+    const row = ctx.subs.importExisting({ mainUserId: MAIN, altUserId: ALT, actor: "staff" });
+    ctx.db.prepare("UPDATE sub_accounts SET purchase_id=42 WHERE id=?").run(row.id);
+
+    expect(ctx.subs.deactivate(row.id, "staff", "test", "not-owned")).toBe(false);
+    expect(ctx.subs.get(row.id)!.status).toBe("active");
+    expect(ctx.subs.claimRankOperation(row.id, "deactivate", "owned")).toBe(true);
+    expect(ctx.subs.deactivate(row.id, "staff", "test", "owned")).toBe(true);
+    expect(ctx.subs.get(row.id)!.status).toBe("cancelled");
+    expect(ctx.subs.get(row.id)!.purchase_id).toBe(42);
+    expect(ctx.subs.deactivate(row.id, "staff", "again", "owned")).toBe(false);
+    ctx.db.close();
+  });
+});
+
 describe("申請と審査", () => {
   it("**申請でも承認でも Land を動かさない**", () => {
     const db = openDb(":memory:");
@@ -312,6 +352,9 @@ describe("既存DB（sub_accounts が無い）からの移行", () => {
     const cols = (db.prepare("PRAGMA table_info(sub_accounts)").all() as Array<{ name: string }>).map((r) => r.name);
     expect(cols).toContain("activation_rank_baseline");
     expect(cols).toContain("activation_rank_settled_at");
+    expect(
+      db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sub_account_rank_operations'").get(),
+    ).toBeTruthy();
 
     // 移行後のDBで、そのまま登録できる
     const subs = new SubAccounts(db, new EventLog(db));
