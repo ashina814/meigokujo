@@ -30,12 +30,23 @@ function setup() {
   const ledger = new Ledger(db);
   const settings = new Settings(db);
   const events = new EventLog(db);
-  const shop = new Shop(db, ledger, events);
+  let reevalItemId: number | null = null;
+  const shop = new Shop(db, ledger, events, { reevalItemId: () => reevalItemId });
   const tickets = new Tickets(db, events);
   const reeval = shop.createItem(
-    { name: "再評価チャレンジ", description: "面談を受ける権利です。", price_land: 500_000, kind: "one_shot", delivery: "manual" },
+    {
+      name: "再評価チャレンジ",
+      description: "面談を受ける権利です。",
+      price_land: 500_000,
+      price_alt_kind: "invite",
+      price_alt_amount: 5,
+      kind: "one_shot",
+      delivery: "manual",
+    },
     "staff",
   );
+  reevalItemId = reeval.id;
+  db.prepare("INSERT INTO souls (user_id,status,updated_at) VALUES (?, 'meirei', 1)").run(USER);
   const nickname = shop.createItem(
     { name: "名前変更", description: "運営が対応します。", price_land: 50_000, kind: "one_shot", delivery: "manual" },
     "staff",
@@ -174,7 +185,14 @@ describe("汎用の配送完了操作", () => {
     const { findUnconsumedReevalPurchase } = await reevalModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    const purchase = ctx.shop.purchase({ itemId: ctx.reeval.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchaseReevaluation({
+      itemId: ctx.reeval.id,
+      userId: USER,
+      actor: USER,
+      memberRoleIds: [],
+      mode: "land",
+      idempotencyKey: "reeval:deliver-guard",
+    }).purchase;
     const reply = vi.fn(async () => undefined);
 
     await handleShokanButton(staffInteraction(`shokan:deliver:${purchase.id}`, reply), ctx.services);

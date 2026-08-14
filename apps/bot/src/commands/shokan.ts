@@ -28,7 +28,8 @@ import {
   type GuildMember,
   type MessageCreateOptions,
 } from "discord.js";
-import type { PurchaseRow, ShopItemRow } from "@meigokujo/core";
+import { createHash } from "node:crypto";
+import { ShopError, type PurchaseRow, type ShopItemRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import { requirementLabel } from "../rank-requirement.js";
@@ -59,6 +60,7 @@ export const shokanCommand = new SlashCommandBuilder()
 
 const SHOKAN_DEPT_KEY = "冥界商館";
 const HISTORY_PAGE = 20;
+const REEVAL_COMPENSATION_PAGE = 25;
 /** 1画面に出す件数。出したものには必ず操作ボタンを付ける（数だけ見せて押せない、を作らない） */
 const QUEUE_DISPLAY = 8;
 
@@ -178,6 +180,10 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
       .setLabel(subPending > 0 ? `サブ垢 ${subPending}` : "サブ垢")
       .setEmoji("👥")
       .setStyle(subPending > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("shokan:reeval-comp")
+      .setLabel("再評価の例外補償")
+      .setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row, row2] };
 }
@@ -411,6 +417,9 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   if (action === "failed") return void (await show(renderFailed(services) as never));
   if (action === "list") return void (await show(renderList(services) as never));
   if (action === "history") return void (await show(renderHistory(services, Math.max(0, Number(arg ?? 0))) as never));
+  if (action === "reeval-comp") {
+    return void (await show(renderReevalCompensations(services, Math.max(0, Number(arg ?? 0))) as never));
+  }
   if (action === "edit-basic" && arg) return void (await interaction.showModal(editBasicModal(Number(arg), services)));
   if (action === "edit-role" && arg) return void (await show(roleEditor(Number(arg)) as never));
   if (action === "toggle" && arg) {
@@ -516,6 +525,16 @@ export async function handleShokanSelect(
     services.shop.updateItem(id, { require_role_id: null }, `user:${interaction.user.id}`);
     return void (await interaction.update(renderItem(services.shop.getItem(id)!, services)));
   }
+  if (action === "reeval-comp-purchase" && interaction.isStringSelectMenu()) {
+    const purchaseId = Number(interaction.values[0]);
+    return void (await interaction.update(renderReevalCompensationDepartments(services, purchaseId)));
+  }
+  if (action === "reeval-comp-dept" && interaction.isStringSelectMenu()) {
+    const purchaseId = Number(parts[2]);
+    const departmentKey = interaction.values[0];
+    if (!departmentKey) return;
+    return void (await interaction.showModal(reevalCompensationModal(purchaseId, departmentKey)));
+  }
 }
 
 export async function handleShokanModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
@@ -527,6 +546,10 @@ export async function handleShokanModal(interaction: ModalSubmitInteraction, ser
   }
   if (parts[1] === "orole-decide") {
     await handleOriginalRoleDecision(interaction, services);
+    return;
+  }
+  if (parts[1] === "reeval-comp-submit") {
+    await handleReevalCompensation(interaction, services);
     return;
   }
   if (parts[1] !== "edit-basic") return;
@@ -543,6 +566,217 @@ export async function handleShokanModal(interaction: ModalSubmitInteraction, ser
   // 変えるならコード側の対応が要る
   services.shop.updateItem(id, { name, description: desc, price_land: price }, `user:${interaction.user.id}`);
   await interaction.reply({ content: `✅ 商品 #${id} を更新しました。`, flags: MessageFlags.Ephemeral });
+}
+
+function configuredReevalItemId(services: Services): number | null {
+  const id = Number(services.settings.getString("shop:reeval_item_id"));
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function renderReevalCompensations(services: Services, offset = 0) {
+  const itemId = configuredReevalItemId(services);
+  const total = itemId === null
+    ? 0
+    : (services.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM shop_purchases p
+            LEFT JOIN shop_reeval_compensations c ON c.purchase_id = p.id
+           WHERE p.item_id = ? AND p.status = 'active'
+             AND p.delivered_at IS NOT NULL AND p.delivery_state = 'delivered' AND c.id IS NULL`,
+        )
+        .get(itemId) as { n: number }).n;
+  const rows = itemId === null
+    ? []
+    : (services.db
+        .prepare(
+          `SELECT p.* FROM shop_purchases p
+            LEFT JOIN shop_reeval_compensations c ON c.purchase_id = p.id
+           WHERE p.item_id = ?
+             AND p.status = 'active'
+             AND p.delivered_at IS NOT NULL
+             AND p.delivery_state = 'delivered'
+             AND c.id IS NULL
+           ORDER BY p.delivered_at DESC, p.id DESC
+           LIMIT ? OFFSET ?`,
+        )
+        .all(itemId, REEVAL_COMPENSATION_PAGE, offset) as PurchaseRow[]);
+  const embed = new EmbedBuilder()
+    .setTitle("再評価チャレンジ 例外補償")
+    .setColor(0xb45309)
+    .setDescription(
+      rows.length === 0
+        ? "補償可能な消費済み再評価権はありません。"
+        : [
+            "対象を選び、支出する部署・金額・理由を確認します。",
+            "元購入、面談結果、招待使用履歴は変更されません。",
+          ].join("\n"),
+    );
+  if (rows.length > 0) {
+    embed.addFields(
+      rows.slice(0, 10).map((row) => ({
+        name: `購入 #${row.id} / <@${row.user_id}>`,
+        value: `${row.paid_land !== null ? fmtLd(row.paid_land) : `${row.paid_alt_kind} ${row.paid_alt_amount}`} / <t:${row.purchased_at}:f>`,
+      })),
+    );
+  }
+  const components: Array<ActionRowBuilder<StringSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>> = [];
+  if (rows.length > 0) {
+    components.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId("shokan:reeval-comp-purchase")
+          .setPlaceholder("補償対象の購入を選択")
+          .addOptions(
+            rows.map((row) => ({
+              label: `購入 #${row.id}`,
+              description: `${row.user_id} / ${row.paid_land !== null ? `${row.paid_land}Ld` : "招待5件"}`.slice(0, 100),
+              value: String(row.id),
+            })),
+          ),
+      ),
+    );
+  }
+  if (total > REEVAL_COMPENSATION_PAGE) {
+    components.push(
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`shokan:reeval-comp:${Math.max(0, offset - REEVAL_COMPENSATION_PAGE)}`)
+          .setLabel("前へ")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(offset === 0),
+        new ButtonBuilder()
+          .setCustomId(`shokan:reeval-comp:${offset + REEVAL_COMPENSATION_PAGE}`)
+          .setLabel("次へ")
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(offset + REEVAL_COMPENSATION_PAGE >= total),
+      ),
+    );
+  }
+  components.push(backButton());
+  return { embeds: [embed], components, allowedMentions: { parse: [] as never[] } };
+}
+
+function renderReevalCompensationDepartments(services: Services, purchaseId: number) {
+  const itemId = configuredReevalItemId(services);
+  const purchase = itemId === null ? undefined : services.shop.getPurchase(purchaseId);
+  const already = services.shop.getReevalCompensation(purchaseId);
+  if (
+    !purchase ||
+    purchase.item_id !== itemId ||
+    purchase.status !== "active" ||
+    purchase.delivered_at === null ||
+    purchase.delivery_state !== "delivered" ||
+    already
+  ) {
+    return {
+      content: "この購入は補償対象ではないか、既に補償済みです。",
+      embeds: [],
+      components: [backButton()],
+    };
+  }
+  const departments = services.departments.listWithBalance().slice(0, 25);
+  const embed = new EmbedBuilder()
+    .setTitle(`購入 #${purchase.id} の例外補償`)
+    .setColor(0xb45309)
+    .setDescription(
+      [`対象: <@${purchase.user_id}>`, `購入: ${purchase.paid_land !== null ? fmtLd(purchase.paid_land) : "確定招待5件"}`, "支出部署を選んでください。"].join("\n"),
+    );
+  const components: Array<ActionRowBuilder<StringSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>> = [];
+  if (departments.length > 0) {
+    components.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`shokan:reeval-comp-dept:${purchase.id}`)
+          .setPlaceholder("支出部署を選択")
+          .addOptions(
+            departments.map((department) => ({
+              label: department.name.slice(0, 100),
+              description: `残高 ${fmtLd(department.balance)}`.slice(0, 100),
+              value: department.key,
+            })),
+          ),
+      ),
+    );
+  } else {
+    embed.addFields({ name: "支出不可", value: "部署口座が登録されていません。" });
+  }
+  components.push(backButton());
+  return { embeds: [embed], components, allowedMentions: { parse: [] as never[] } };
+}
+
+function departmentToken(departmentKey: string): string {
+  return createHash("sha256").update(departmentKey, "utf8").digest("hex").slice(0, 24);
+}
+
+function reevalCompensationModal(purchaseId: number, departmentKey: string) {
+  const modal = new ModalBuilder()
+    .setCustomId(`shokan:reeval-comp-submit:${purchaseId}:${departmentToken(departmentKey)}`)
+    .setTitle(`再評価補償 #${purchaseId}`);
+  modal.addComponents(
+    new ActionRowBuilder<TextInputBuilder>().addComponents(
+      new TextInputBuilder()
+        .setCustomId("amount")
+        .setLabel("補償額（Ld）")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(15),
+    ),
+    new ActionRowBuilder<TextInputBuilder>().addComponents(
+      new TextInputBuilder()
+        .setCustomId("reason")
+        .setLabel("例外補償の理由")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setMaxLength(500),
+    ),
+  );
+  return modal;
+}
+
+async function handleReevalCompensation(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
+  const parts = interaction.customId.split(":");
+  const purchaseId = Number(parts[2]);
+  const token = parts[3] ?? "";
+  const matchingDepartments = services.departments.list().filter((department) => departmentToken(department.key) === token);
+  const departmentKey = matchingDepartments.length === 1 ? matchingDepartments[0]!.key : null;
+  const amount = Number(interaction.fields.getTextInputValue("amount").replaceAll(",", "").trim());
+  const reason = interaction.fields.getTextInputValue("reason").trim();
+  const member = interaction.member as GuildMember | null;
+  const roleIds = member ? [...member.roles.cache.keys()] : [];
+  if (!departmentKey) {
+    await interaction.reply({ content: "支出部署を一意に確認できません。選択からやり直してください。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!isAdmin(interaction, services) && !services.departments.canOperate(departmentKey, roleIds)) {
+    await interaction.reply({ content: "この部署口座から支出する権限がありません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const itemId = configuredReevalItemId(services);
+  if (itemId === null || !Number.isSafeInteger(purchaseId) || !Number.isSafeInteger(amount) || amount <= 0 || !reason) {
+    await interaction.reply({ content: "補償内容を確認できません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  try {
+    const row = services.shop.compensateReevaluation({
+      itemId,
+      purchaseId,
+      departmentKey,
+      amount,
+      reason,
+      actor: `user:${interaction.user.id}`,
+      idempotencyKey: `shop:reeval:compensation:${purchaseId}`,
+    });
+    await interaction.reply({
+      content: `購入 #${purchaseId} へ ${fmtLd(row.amount)} を ${departmentKey} から例外補償しました。`,
+      flags: MessageFlags.Ephemeral,
+      allowedMentions: { parse: [] },
+    });
+  } catch (error) {
+    const message = error instanceof ShopError && error.code === "ERR_REEVAL_ALREADY_COMPENSATED"
+      ? "この購入は既に補償済みです。"
+      : `補償できませんでした: ${error instanceof Error ? error.message : String(error)}`;
+    await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
+  }
 }
 
 // ---- Modals & Selects ----

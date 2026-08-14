@@ -236,9 +236,9 @@ function itemDetail(
  * 既存の再評価面談フローだけ。ここを配送商品として扱うと、汎用の「配送完了」で
  * `delivered_at` が入り、**面談前に権利が消える**（購入 #44 で実際に起きた形）。
  */
-function isReevalItem(services: Services, item: ShopItemRow): boolean {
+function isReevalItem(services: Services, item: ShopItemRow | undefined): item is ShopItemRow {
   const configured = Number(services.settings.getString("shop:reeval_item_id"));
-  return Number.isInteger(configured) && configured === item.id;
+  return !!item && Number.isInteger(configured) && configured === item.id;
 }
 
 /** 再評価面談の受付パネルへのジャンプリンク（未設置なら null） */
@@ -418,17 +418,27 @@ function purchaseOnce(
        VALUES (?,?,?,?, 'executing', ?)`,
     ).run(input.operationId, input.userId, input.itemId, input.mode, Math.floor(Date.now() / 1_000));
 
-    const result = services.shop.purchase({
-      itemId: input.itemId,
-      userId: input.userId,
-      actor: input.actor,
-      memberRoleIds: input.memberRoleIds,
-      payAlt: input.mode === "alt",
-      request: input.request,
-      // **操作ごとに違う鍵で課金する。** 既定の鍵は秒までしか分けないので、
-      // 返金後のやり直しが同じ秒に入ると Land が動かないまま購入行だけができる
-      idempotencyKey: `shop:purchase:op:${input.operationId}`,
-    });
+    const result = isReevalItem(services, services.shop.getItem(input.itemId))
+      ? services.shop.purchaseReevaluation({
+          itemId: input.itemId,
+          userId: input.userId,
+          actor: input.actor,
+          memberRoleIds: input.memberRoleIds,
+          mode: input.mode === "alt" ? "invite" : "land",
+          request: input.request,
+          idempotencyKey: `shop:purchase:op:${input.operationId}`,
+        })
+      : services.shop.purchase({
+          itemId: input.itemId,
+          userId: input.userId,
+          actor: input.actor,
+          memberRoleIds: input.memberRoleIds,
+          payAlt: input.mode === "alt",
+          request: input.request,
+          // **操作ごとに違う鍵で課金する。** 既定の鍵は秒までしか分けないので、
+          // 返金後のやり直しが同じ秒に入ると Land が動かないまま購入行だけができる
+          idempotencyKey: `shop:purchase:op:${input.operationId}`,
+        });
     services.db.prepare(
       `UPDATE shop_purchase_operations
        SET status='completed',purchase_id=?,completed_at=?
@@ -493,6 +503,12 @@ async function finishPurchase(
 
 function purchaseErrorMessage(error: unknown, services: Services): string {
   if (error instanceof ShopError) {
+    if (error.code === "ERR_REEVAL_STATUS") return "再評価チャレンジは迷霊の方だけが購入できます。";
+    if (error.code === "ERR_REEVAL_RIGHT_EXISTS") return "未使用の再評価権を既に持っています。面談結果の確定後にご利用ください。";
+    if (error.code === "ERR_REEVAL_INVITES_INSUFFICIENT") return "未使用の確定招待実績が5件必要です。";
+    if (error.code === "ERR_REEVAL_ITEM_CONFIG" || error.code === "ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED") {
+      return "再評価チャレンジの設定を確認できないため、購入を停止しました。運営へご連絡ください。";
+    }
     if (error.code === "ERR_ITEM_DISABLED") return "この商品は現在販売されていません。";
     if (error.code === "ERR_NO_STOCK") return "在庫切れです。";
     if (error.code === "ERR_ROLE_REQUIRED") {
@@ -1025,6 +1041,10 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     let redeemed = false;
     let purchased = false;
     try {
+      const configuredItem = services.shop.getItem(itemId);
+      if (isReevalItem(services, configuredItem)) {
+        services.shop.checkReevaluationPurchase({ itemId, userId: interaction.user.id, mode: "land" });
+      }
       let row = confirmation;
       if (row.status === "pending") row = services.chipFlow.beginExternalConfirmation(confirmationId, interaction.user.id);
       if (row.status !== "executing") throw new Error("この確認は既に処理されています");
@@ -1086,6 +1106,18 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     const memberRoleIds = member && "roles" in member && "cache" in member.roles
       ? [...member.roles.cache.keys()]
       : [];
+    if (isReevalItem(services, item)) {
+      try {
+        services.shop.checkReevaluationPurchase({
+          itemId,
+          userId: interaction.user.id,
+          mode: mode === "alt" ? "invite" : "land",
+        });
+      } catch (error) {
+        await interaction.reply({ content: `❌ ${purchaseErrorMessage(error, services)}`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+    }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const result = purchaseOnce(services, {

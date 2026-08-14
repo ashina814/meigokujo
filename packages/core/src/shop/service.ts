@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { Ledger, TREASURY } from "../ledger/service.js";
 import { EventLog } from "../events/service.js";
+import type { Departments } from "../departments/service.js";
 
 /**
  * 公式ショップ（冥界商館）。
@@ -167,7 +168,15 @@ export type ShopErrorCode =
   | "ERR_TERMS_CHANGED"
   | "ERR_SALES_LOCKED"
   | "ERR_ALREADY_DELIVERED"
-  | "ERR_REFUND_RACE";
+  | "ERR_REFUND_RACE"
+  | "ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED"
+  | "ERR_REEVAL_ITEM_CONFIG"
+  | "ERR_REEVAL_STATUS"
+  | "ERR_REEVAL_RIGHT_EXISTS"
+  | "ERR_REEVAL_INVITES_INSUFFICIENT"
+  | "ERR_REEVAL_NOT_CONSUMED"
+  | "ERR_REEVAL_ALREADY_COMPENSATED"
+  | "ERR_REEVAL_COMPENSATION_UNAVAILABLE";
 
 export class ShopError extends Error {
   constructor(readonly code: ShopErrorCode, readonly details: Record<string, unknown> = {}) {
@@ -181,6 +190,27 @@ const DAY = 86_400;
 
 /** 期限商品の既定の期間。旧「月額」もここへ寄せる（暦月ではなく購入から30日） */
 export const DEFAULT_TERM_DAYS = 30;
+export const REEVAL_PRICE_LAND = 500_000;
+export const REEVAL_INVITE_COUNT = 5;
+
+export interface ReevalInviteUseRow {
+  invite_id: number;
+  purchase_id: number;
+  user_id: string;
+  used_at: number;
+}
+
+export interface ReevalCompensationRow {
+  id: number;
+  purchase_id: number;
+  user_id: string;
+  department_key: string;
+  amount: number;
+  reason: string;
+  actor_id: string;
+  ledger_transaction_id: number;
+  created_at: number;
+}
 
 /**
  * その商品の有効期間（日）。期限を持たない単発商品は null。
@@ -208,6 +238,10 @@ export interface ShopOptions {
    * bot 側から階層対応（「〇〇以上」= 上位階級も可）の判定を注入できる。
    */
   roleCheck?: (memberRoleIds: readonly string[], requireRoleId: string) => boolean;
+  /** 設定済みの再評価商品。null の間は旧挙動を維持する。 */
+  reevalItemId?: () => number | null;
+  /** 例外補償の部署支出に使用する。未注入なら補償は fail-closed。 */
+  departments?: Departments;
 }
 
 export class Shop {
@@ -235,6 +269,26 @@ export class Shop {
         completed_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_shop_role_revocations_status ON shop_role_revocations(status, updated_at);
+      CREATE TABLE IF NOT EXISTS shop_reeval_invite_uses (
+        invite_id INTEGER PRIMARY KEY REFERENCES invites(id),
+        purchase_id INTEGER NOT NULL REFERENCES shop_purchases(id),
+        user_id TEXT NOT NULL,
+        used_at INTEGER NOT NULL,
+        UNIQUE(purchase_id, invite_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_shop_reeval_invite_uses_purchase ON shop_reeval_invite_uses(purchase_id);
+      CREATE TABLE IF NOT EXISTS shop_reeval_compensations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        purchase_id INTEGER NOT NULL UNIQUE REFERENCES shop_purchases(id),
+        user_id TEXT NOT NULL,
+        department_key TEXT NOT NULL REFERENCES departments(key),
+        amount INTEGER NOT NULL CHECK(amount > 0),
+        reason TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        ledger_transaction_id INTEGER NOT NULL UNIQUE REFERENCES transactions(id),
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_shop_reeval_compensations_user ON shop_reeval_compensations(user_id, created_at);
     `);
   }
 
@@ -394,6 +448,21 @@ export class Shop {
      */
     idempotencyKey?: string;
   }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
+    if (this.options.reevalItemId?.() === input.itemId) {
+      throw new ShopError("ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
+    }
+    return this.purchaseInternal(input);
+  }
+
+  private purchaseInternal(input: {
+    itemId: number;
+    userId: string;
+    actor: string;
+    memberRoleIds: readonly string[];
+    payAlt?: boolean;
+    request?: Record<string, unknown>;
+    idempotencyKey?: string;
+  }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
     const item = this.getItem(input.itemId);
     if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: input.itemId });
     if (!item.enabled) throw new ShopError("ERR_ITEM_DISABLED", { itemId: item.id });
@@ -466,6 +535,203 @@ export class Shop {
       payload: { itemId: item.id, purchaseId: purchase.id, paidLand, paidAltKind, paidAltAmount, expiresAt },
     });
     return { purchase, item, needsManualDelivery: item.delivery === "manual" };
+  }
+
+  /**
+   * 再評価権を購入する。資格確認、支払い、購入行、招待使用台帳を同じ IMMEDIATE transaction で確定する。
+   */
+  checkReevaluationPurchase(input: {
+    itemId: number;
+    userId: string;
+    mode: "land" | "invite";
+  }): { availableInvites: number } {
+    const configuredId = this.options.reevalItemId?.() ?? null;
+    const item = this.getItem(input.itemId);
+    if (
+      configuredId !== input.itemId ||
+      !item ||
+      !item.enabled ||
+      item.price_land !== REEVAL_PRICE_LAND ||
+      item.price_alt_kind !== "invite" ||
+      item.price_alt_amount !== REEVAL_INVITE_COUNT ||
+      item.kind !== "one_shot" ||
+      item.delivery !== "manual"
+    ) {
+      throw new ShopError("ERR_REEVAL_ITEM_CONFIG", { itemId: input.itemId, configuredId });
+    }
+    const soul = this.db.prepare("SELECT status FROM souls WHERE user_id = ?").get(input.userId) as
+      | { status: string }
+      | undefined;
+    if (soul?.status !== "meirei") {
+      throw new ShopError("ERR_REEVAL_STATUS", { userId: input.userId, status: soul?.status ?? null });
+    }
+    const existing = this.db
+      .prepare(
+        `SELECT id FROM shop_purchases
+          WHERE item_id = ? AND user_id = ? AND status = 'active'
+            AND delivered_at IS NULL
+            AND COALESCE(delivery_state, 'pending') <> 'delivered'
+          ORDER BY id DESC LIMIT 1`,
+      )
+      .get(input.itemId, input.userId) as { id: number } | undefined;
+    if (existing) throw new ShopError("ERR_REEVAL_RIGHT_EXISTS", { purchaseId: existing.id });
+    const availableInvites = input.mode === "invite"
+      ? (this.db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM invites i
+              LEFT JOIN shop_reeval_invite_uses u ON u.invite_id = i.id
+             WHERE i.inviter_id = ? AND u.invite_id IS NULL`,
+          )
+          .get(input.userId) as { n: number }).n
+      : 0;
+    if (input.mode === "invite" && availableInvites < REEVAL_INVITE_COUNT) {
+      throw new ShopError("ERR_REEVAL_INVITES_INSUFFICIENT", {
+        available: availableInvites,
+        required: REEVAL_INVITE_COUNT,
+      });
+    }
+    return { availableInvites };
+  }
+
+  purchaseReevaluation(input: {
+    itemId: number;
+    userId: string;
+    actor: string;
+    memberRoleIds: readonly string[];
+    mode: "land" | "invite";
+    request?: Record<string, unknown>;
+    idempotencyKey: string;
+  }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
+    const configuredId = this.options.reevalItemId?.() ?? null;
+    if (configuredId !== input.itemId) {
+      throw new ShopError("ERR_REEVAL_ITEM_CONFIG", { itemId: input.itemId, configuredId });
+    }
+    const body = () => {
+      // UIでの事前確認とは別に、支払い確定の直前にもDBの正本を再読する。
+      this.checkReevaluationPurchase({ itemId: input.itemId, userId: input.userId, mode: input.mode });
+
+      let inviteIds: number[] = [];
+      if (input.mode === "invite") {
+        inviteIds = (
+          this.db
+            .prepare(
+              `SELECT i.id
+                 FROM invites i
+                 LEFT JOIN shop_reeval_invite_uses u ON u.invite_id = i.id
+                WHERE i.inviter_id = ? AND u.invite_id IS NULL
+                ORDER BY i.credited_at, i.id
+                LIMIT ?`,
+            )
+            .all(input.userId, REEVAL_INVITE_COUNT) as Array<{ id: number }>
+        ).map((row) => row.id);
+        if (inviteIds.length < REEVAL_INVITE_COUNT) {
+          throw new ShopError("ERR_REEVAL_INVITES_INSUFFICIENT", {
+            available: inviteIds.length,
+            required: REEVAL_INVITE_COUNT,
+          });
+        }
+      }
+
+      const result = this.purchaseInternal({
+        itemId: input.itemId,
+        userId: input.userId,
+        actor: input.actor,
+        memberRoleIds: input.memberRoleIds,
+        payAlt: input.mode === "invite",
+        request: input.request,
+        idempotencyKey: input.idempotencyKey,
+      });
+      if (input.mode === "invite") {
+        const insert = this.db.prepare(
+          "INSERT INTO shop_reeval_invite_uses (invite_id,purchase_id,user_id,used_at) VALUES (?,?,?,?)",
+        );
+        const ts = now();
+        for (const inviteId of inviteIds) insert.run(inviteId, result.purchase.id, input.userId, ts);
+      }
+      this.events.log("shop_reeval_right_purchased", {
+        actor: input.actor,
+        payload: { purchaseId: result.purchase.id, userId: input.userId, mode: input.mode, inviteIds },
+      });
+      return result;
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  listReevalInviteUses(purchaseId: number): ReevalInviteUseRow[] {
+    return this.db
+      .prepare("SELECT * FROM shop_reeval_invite_uses WHERE purchase_id = ? ORDER BY invite_id")
+      .all(purchaseId) as ReevalInviteUseRow[];
+  }
+
+  getReevalCompensation(purchaseId: number): ReevalCompensationRow | undefined {
+    return this.db.prepare("SELECT * FROM shop_reeval_compensations WHERE purchase_id = ?").get(purchaseId) as
+      | ReevalCompensationRow
+      | undefined;
+  }
+
+  /** 消費済み再評価権への例外補償。購入・結果・招待使用は一切巻き戻さない。 */
+  compensateReevaluation(input: {
+    itemId: number;
+    purchaseId: number;
+    departmentKey: string;
+    amount: number;
+    reason: string;
+    actor: string;
+    approvedBy?: string;
+    idempotencyKey: string;
+  }): ReevalCompensationRow {
+    const departments = this.options.departments;
+    if (this.options.reevalItemId?.() !== input.itemId || !departments) {
+      throw new ShopError("ERR_REEVAL_COMPENSATION_UNAVAILABLE", { itemId: input.itemId });
+    }
+    const body = () => {
+      const purchase = this.getPurchase(input.purchaseId);
+      if (!purchase || purchase.item_id !== input.itemId) {
+        throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+      }
+      if (purchase.status !== "active" || purchase.delivered_at === null || purchase.delivery_state !== "delivered") {
+        throw new ShopError("ERR_REEVAL_NOT_CONSUMED", { purchaseId: input.purchaseId });
+      }
+      if (this.getReevalCompensation(input.purchaseId)) {
+        throw new ShopError("ERR_REEVAL_ALREADY_COMPENSATED", { purchaseId: input.purchaseId });
+      }
+      const reason = input.reason.trim();
+      if (!reason || !Number.isInteger(input.amount) || input.amount <= 0) {
+        throw new ShopError("ERR_REEVAL_COMPENSATION_UNAVAILABLE", { amount: input.amount });
+      }
+      const transfer = departments.withdraw(purchase.user_id, {
+        key: input.departmentKey,
+        amount: input.amount,
+        actor: input.actor,
+        approvedBy: input.approvedBy,
+        idempotencyKey: input.idempotencyKey,
+        reason: `再評価チャレンジ例外補償 #${purchase.id}: ${reason}`,
+        refType: "shop_reeval_compensation",
+        refId: String(purchase.id),
+      });
+      const ts = now();
+      const info = this.db
+        .prepare(
+          `INSERT INTO shop_reeval_compensations
+             (purchase_id,user_id,department_key,amount,reason,actor_id,ledger_transaction_id,created_at)
+           VALUES (?,?,?,?,?,?,?,?)`,
+        )
+        .run(purchase.id, purchase.user_id, input.departmentKey, input.amount, reason, input.actor, transfer.tx.id, ts);
+      this.events.log("shop_reeval_compensated", {
+        actor: input.actor,
+        payload: {
+          compensationId: info.lastInsertRowid,
+          purchaseId: purchase.id,
+          userId: purchase.user_id,
+          departmentKey: input.departmentKey,
+          amount: input.amount,
+          ledgerTransactionId: transfer.tx.id,
+          reason,
+        },
+      });
+      return this.getReevalCompensation(purchase.id)!;
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
   }
 
   /**

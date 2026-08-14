@@ -123,7 +123,9 @@ describe("常設パネルの表示", () => {
       "shokan:orole",
       "shokan:history:0",
       "shokan:sub",
+      "shokan:reeval-comp",
     ]);
+    expect(panel.components?.every((row) => row.toJSON().components.length <= 5)).toBe(true);
     ctx.db.close();
   });
 

@@ -132,6 +132,11 @@ export function buildServices() {
   // 階級要件は「〇〇以上」判定（亡霊 < 魔人 < 魔族。上位階級は下位要件の商品を買える）
   const shop = new Shop(db, ledger, events, {
     roleCheck: (memberRoleIds, requireRoleId) => meetsRoleRequirement(settings, memberRoleIds, requireRoleId),
+    reevalItemId: () => {
+      const id = Number(settings.getString("shop:reeval_item_id"));
+      return Number.isSafeInteger(id) && id > 0 ? id : null;
+    },
+    departments,
   });
   // 賭場の取引監査。全サービスで同じインスタンスを共有する（実行中グループを共有するため）
   const chipTx = new ChipTx(db);
