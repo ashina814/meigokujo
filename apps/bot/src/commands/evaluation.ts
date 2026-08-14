@@ -3,37 +3,24 @@ import {
   ButtonInteraction,
   ChannelType,
   ChatInputCommandInteraction,
-  EmbedBuilder,
   MessageFlags,
-  ModalBuilder,
   ModalSubmitInteraction,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
   StringSelectMenuInteraction,
-  TextInputBuilder,
-  TextInputStyle,
   type AnyThreadChannel,
   type ForumChannel,
+  type Guild,
   type GuildMember,
 } from "discord.js";
-import type { Conclusion, EvalScores, PreviousEvaluation } from "@meigokujo/core";
+import { EvaluationForumStore, type EvaluationPresenceSummary } from "@meigokujo/core/evaluation/forum";
 import { isAdmin } from "../permissions.js";
-import { refreshEvalStatsForUser } from "../eval-daily.js";
-import { markWeightLimitForRoleIds } from "../evaluation-rules.js";
 import type { Services } from "../services.js";
 
-const AXES = [
-  ["voice", "声の良さ"],
-  ["communication", "コミュニケーション力"],
-  ["presence", "浮上率"],
-  ["understanding", "鯖理解度"],
-] as const;
-
-const CONCLUSIONS: Array<[Conclusion, string]> = [
-  ["none", "印なし（様子見）"],
-  ["promotion", "昇格印を付ける"],
-  ["demotion", "低評価印を付ける"],
-];
+const DEN_LOW_SECONDS = 30 * 60;
+const SWORDSMAN_LOW_SECONDS = 15 * 60;
+const TARGETS_PER_MENU = 25;
+const MAX_TARGET_MENUS = 5;
 
 // ---- 権限 ----
 
@@ -48,144 +35,20 @@ export function isSwordsman(
   return member?.roles.cache.has(roleId) ?? false;
 }
 
-// ---- /評価 ----
+// ---- /評価（旧入力フォームは廃止。運営が常設パネルを置くための入口だけ残す） ----
 
 export const evaluationCommand = new SlashCommandBuilder()
   .setName("評価")
-  .setDescription("評価を投稿する（魔剣士専用）")
-  .setDMPermission(false)
-  .addUserOption((o) => o.setName("対象").setDescription("評価する相手").setRequired(true));
+  .setDescription("評価フォーラム方式の案内を表示する")
+  .setDMPermission(false);
 
-interface PendingEval {
-  targetId: string;
-  scores: Partial<Record<(typeof AXES)[number][0], number>>;
-  conclusion?: Conclusion;
-  markWeight?: number;
-  maxMarkWeight?: number;
-  previous?: PreviousEvaluation;
-}
-
-/** 評価員ごとの入力途中状態（送信までスレッドには何も出ない） */
-const pendingEvals = new Map<string, PendingEval>();
-
-function markCapsByRole(services: Services): Record<string, number> {
-  const raw = services.settings.getJson<Record<string, unknown>>("eval_mark_caps_by_role", {});
-  return Object.fromEntries(
-    Object.entries(raw)
-      .map(([roleId, value]) => [roleId, Math.trunc(Number(value))] as const)
-      .filter(([, value]) => Number.isInteger(value) && value > 0),
+function panelRow(): ActionRowBuilder<StringSelectMenuBuilder> {
+  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId("eval:open")
+      .setPlaceholder("評価する亡霊を選択")
+      .addOptions({ label: "評価する亡霊を選択", value: "open", description: "現在の評価対象一覧を開きます" }),
   );
-}
-
-function maxMarkWeightForMember(member: GuildMember | null, services: Services): number {
-  if (!member) return 1;
-  return markWeightLimitForRoleIds(member.roles.cache.keys(), markCapsByRole(services));
-}
-
-function renderEvaluationRows(pending: PendingEval): ActionRowBuilder<StringSelectMenuBuilder>[] {
-  const rows = AXES.map(([key, label]) =>
-    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId(`eval:s:${key}`)
-        .setPlaceholder(`${label}（1〜5点）${pending.scores[key] ? `: 現在 ${pending.scores[key]}点` : ""}`)
-        .addOptions([1, 2, 3, 4, 5].map((n) => ({ label: `${label}: ${n}点`, value: String(n), default: pending.scores[key] === n }))),
-    ),
-  );
-  rows.push(
-    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId("eval:s:conclusion")
-        .setPlaceholder(
-          pending.conclusion
-            ? `結論: ${CONCLUSIONS.find(([v]) => v === pending.conclusion)?.[1] ?? pending.conclusion}`
-            : "結論（最後に選ぶとコメント入力へ進みます）",
-        )
-        .addOptions(CONCLUSIONS.map(([value, label]) => ({ label, value, default: pending.conclusion === value }))),
-    ),
-  );
-  return rows;
-}
-
-function prefillFromPrevious(pending: PendingEval, previous: PreviousEvaluation): void {
-  pending.scores = { ...previous.scores };
-  pending.conclusion = previous.conclusion;
-  pending.markWeight = previous.markWeight;
-}
-
-function modalFromPending(pending: PendingEval, inheritTexts = false): ModalBuilder {
-  const texts = inheritTexts ? pending.previous?.texts : undefined;
-  const input = (id: keyof NonNullable<typeof texts>, label: string, style: TextInputStyle, required: boolean, maxLength: number) => {
-    const builder = new TextInputBuilder()
-      .setCustomId(id)
-      .setLabel(label)
-      .setStyle(style)
-      .setRequired(required)
-      .setMaxLength(maxLength);
-    const value = texts?.[id];
-    if (value) builder.setValue(value.slice(0, maxLength));
-    return builder;
-  };
-  return new ModalBuilder()
-    .setCustomId("eval:modal")
-    .setTitle("評価コメント")
-    .addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        input("detail", "詳細（声・コミュ力・浮上率・鯖理解度）", TextInputStyle.Paragraph, true, 1000),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(input("merit", "鯖メリット", TextInputStyle.Paragraph, false, 500)),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(input("concern", "不安点", TextInputStyle.Paragraph, false, 500)),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(input("feedback", "フィードバック", TextInputStyle.Paragraph, false, 500)),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(input("others", "評価高い人・低い人", TextInputStyle.Short, false, 200)),
-    );
-}
-
-async function continueAfterConclusion(interaction: StringSelectMenuInteraction, services: Services, pending: PendingEval): Promise<void> {
-  const member = interaction.member as GuildMember | null;
-  const maxWeight = maxMarkWeightForMember(member, services);
-  pending.maxMarkWeight = maxWeight;
-  if (pending.conclusion === "none") {
-    pending.markWeight = 0;
-    await showDraftChoiceOrModal(interaction, pending);
-    return;
-  }
-  const inherited = Math.min(Math.max(pending.markWeight ?? 1, 1), maxWeight);
-  if (maxWeight <= 1) {
-    pending.markWeight = 1;
-    await showDraftChoiceOrModal(interaction, pending);
-    return;
-  }
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId("eval:s:markWeight")
-    .setPlaceholder(`印数を選んでください（上限 ${maxWeight}印）`)
-    .addOptions(
-      Array.from({ length: maxWeight }, (_, i) => i + 1).map((n) => ({
-        label: `${n}印`,
-        value: String(n),
-        default: inherited === n,
-      })),
-    );
-  await interaction.update({
-    content: `結論を受け付けました。今回付ける印数を選んでください（あなたの現在の上限: ${maxWeight}印）。`,
-    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
-  });
-}
-
-async function showDraftChoiceOrModal(interaction: StringSelectMenuInteraction, pending: PendingEval): Promise<void> {
-  if (!pending.previous) {
-    await interaction.showModal(modalFromPending(pending));
-    return;
-  }
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId("eval:s:draft")
-    .setPlaceholder("コメント入力の開始方法を選んでください")
-    .addOptions([
-      { label: "前回内容を引き継いで編集", value: "inherit" },
-      { label: "新しく書く", value: "fresh" },
-    ]);
-  await interaction.update({
-    content: "前回の評価履歴があります。コメント欄へ前回内容を入れて編集するか、新規入力するか選んでください。",
-    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
-  });
 }
 
 export async function handleEvaluationCommand(
@@ -193,321 +56,321 @@ export async function handleEvaluationCommand(
   services: Services,
 ): Promise<void> {
   if (!isSwordsman(interaction, services)) {
-    await interaction.reply({ content: "評価の投稿は魔剣士のみ可能です。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  const target = interaction.options.getUser("対象", true);
-  if (target.bot || target.id === interaction.user.id) {
-    await interaction.reply({ content: "その相手は評価できません。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "評価フォーラムは魔剣士のみ利用できます。", flags: MessageFlags.Ephemeral });
     return;
   }
 
-  const previous = services.evaluation.latestByEvaluator(target.id, interaction.user.id);
-  const pending: PendingEval = {
-    targetId: target.id,
-    scores: {},
-    previous,
-    maxMarkWeight: maxMarkWeightForMember(interaction.member as GuildMember | null, services),
-  };
-  pendingEvals.set(interaction.user.id, pending);
-
-  if (previous) {
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId("eval:s:prefill")
-      .setPlaceholder("前回内容を引き継ぎますか？")
-      .addOptions([
-        { label: "前回内容を引き継ぐ", value: "inherit", description: "4項目・結論・印数を初期値にします" },
-        { label: "新規入力する", value: "fresh", description: "空の状態から評価します" },
-      ]);
-    await interaction.reply({
-      content: `📝 <@${target.id}> の前回評価があります。引き継ぎ方法を選んでください。`,
-      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
-      flags: MessageFlags.Ephemeral,
-      allowedMentions: { parse: [] },
+  // 運営だけは /評価 を「常設パネルをこのチャンネルへ置く」ためにも使える。
+  // 魔剣士の日常操作はこのコマンドではなく、設置済みパネルから行う。
+  if (isAdmin(interaction, services) && interaction.channel?.isTextBased() && "send" in interaction.channel) {
+    const message = await interaction.channel.send({
+      content: ["## 【亡霊評価】", "現在評価期間中の亡霊を選んでください。"].join("\n"),
+      components: [panelRow()],
     });
+    services.settings.set("eval_forum_panel_channel", interaction.channel.id, interaction.user.id);
+    services.settings.set("eval_forum_panel_message", message.id, interaction.user.id);
+    await interaction.reply({ content: `評価対象パネルを設置しました: ${message.url}`, flags: MessageFlags.Ephemeral });
     return;
   }
 
   await interaction.reply({
-    content: `📝 <@${target.id}> の評価。4項目の点数を選び、最後に結論を選んでください。印の上限: ${pending.maxMarkWeight}印。`,
-    components: renderEvaluationRows(pending),
+    content: "評価は現在、評価フォーラムへ直接記入する方式です。評価対象パネルから対象者を選んでください。",
     flags: MessageFlags.Ephemeral,
-    allowedMentions: { parse: [] },
   });
+}
+
+// ---- 評価対象パネル ----
+
+function fmtJstDate(ts: number | null): string {
+  if (!ts) return "—";
+  return new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    month: "long",
+    day: "numeric",
+  }).format(new Date(ts * 1000));
+}
+
+function fmtJstShortDate(ts: number | null): string {
+  if (!ts) return "—";
+  return new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    month: "numeric",
+    day: "numeric",
+  }).format(new Date(ts * 1000));
+}
+
+function fmtDuration(seconds: number): string {
+  const safe = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  return hours > 0 ? `${hours}時間${minutes}分` : `${minutes}分`;
+}
+
+export function evaluationReferenceText(summary: EvaluationPresenceSummary): string {
+  if (summary.denSeconds < DEN_LOW_SECONDS) {
+    return "巣穴での活動がまだ少なく、評価材料が不足している可能性があります。";
+  }
+  if (summary.swordsmanSeconds < SWORDSMAN_LOW_SECONDS) {
+    return "巣穴への参加はありますが、魔剣士との同席が少なく、評価機会が不足している可能性があります。";
+  }
+  return "魔剣士との同席機会があります。評価できる材料があるか確認してみてください。";
+}
+
+async function targetMenus(guild: Guild, services: Services): Promise<{
+  rows: ActionRowBuilder<StringSelectMenuBuilder>[];
+  total: number;
+  shown: number;
+}> {
+  const store = new EvaluationForumStore(services.db);
+  const cycles = store.listCurrentCycles();
+  if (cycles.length === 0) return { rows: [], total: 0, shown: 0 };
+
+  // 表示名を一括取得。取得に失敗した人も user_id で選択できるよう落とさない。
+  await guild.members.fetch().catch(() => undefined);
+  const shownCycles = cycles.slice(0, TARGETS_PER_MENU * MAX_TARGET_MENUS);
+  const rows: ActionRowBuilder<StringSelectMenuBuilder>[] = [];
+  for (let offset = 0; offset < shownCycles.length; offset += TARGETS_PER_MENU) {
+    const chunk = shownCycles.slice(offset, offset + TARGETS_PER_MENU);
+    const index = Math.floor(offset / TARGETS_PER_MENU);
+    rows.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`eval:target:${index}`)
+          .setPlaceholder(index === 0 ? "現在の亡霊から選択" : `現在の亡霊から選択（${index + 1}）`)
+          .addOptions(
+            chunk.map((cycle) => {
+              const member = guild.members.cache.get(cycle.userId);
+              const label = (member?.displayName ?? cycle.userId).slice(0, 100);
+              const deadline = cycle.deadlineAt ? `期限 ${fmtJstShortDate(cycle.deadlineAt)}` : "期限未設定";
+              return { label, value: cycle.userId, description: deadline.slice(0, 100) };
+            }),
+          ),
+      ),
+    );
+  }
+  return { rows, total: cycles.length, shown: shownCycles.length };
 }
 
 export async function handleEvaluationSelect(
   interaction: StringSelectMenuInteraction,
   services: Services,
 ): Promise<void> {
-  const pending = pendingEvals.get(interaction.user.id);
-  if (!pending) {
-    await interaction.update({ content: "⌛ 期限切れです。もう一度 `/評価` からどうぞ。", components: [] });
-    return;
-  }
   if (!isSwordsman(interaction, services)) {
-    pendingEvals.delete(interaction.user.id);
-    await interaction.reply({ content: "評価資格が確認できません。もう一度、現在のロールを確認してから `/評価` を実行してください。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "評価フォーラムは魔剣士のみ利用できます。", flags: MessageFlags.Ephemeral });
     return;
   }
-  const key = interaction.customId.split(":")[2];
-  const value = interaction.values[0];
-  if (!key || !value) return;
-
-  if (key === "prefill") {
-    if (value === "inherit" && pending.previous) prefillFromPrevious(pending, pending.previous);
-    await interaction.update({
-      content: `📝 <@${pending.targetId}> の評価。4項目の点数を確認・必要なら変更し、最後に結論を選んでください。印の上限: ${pending.maxMarkWeight ?? 1}印。`,
-      components: renderEvaluationRows(pending),
-      allowedMentions: { parse: [] },
-    });
+  if (!interaction.guild) {
+    await interaction.reply({ content: "サーバー内で使用してください。", flags: MessageFlags.Ephemeral });
     return;
   }
 
-  if (key !== "conclusion") {
-    if (key === "markWeight") {
-      const max = pending.maxMarkWeight ?? maxMarkWeightForMember(interaction.member as GuildMember | null, services);
-      const n = Number(value);
-      if (!Number.isInteger(n) || n < 1 || n > max) {
-        await interaction.reply({ content: `印数が上限を超えています（現在の上限: ${max}印）。`, flags: MessageFlags.Ephemeral });
-        return;
-      }
-      pending.markWeight = n;
-      await showDraftChoiceOrModal(interaction, pending);
+  if (interaction.customId === "eval:open") {
+    const menus = await targetMenus(interaction.guild, services);
+    if (menus.total === 0) {
+      await interaction.reply({ content: "現在、評価期間中の亡霊はいません。", flags: MessageFlags.Ephemeral });
       return;
     }
-    if (key === "draft") {
-      await interaction.showModal(modalFromPending(pending, value === "inherit"));
-      return;
-    }
-    pending.scores[key as (typeof AXES)[number][0]] = Number(value);
-    await interaction.deferUpdate();
-    return;
-  }
-
-  // 結論が選ばれた → 4項目そろっていればモーダルへ
-  const missing = AXES.filter(([k]) => pending.scores[k] === undefined).map(([, label]) => label);
-  if (missing.length > 0) {
+    const omitted = menus.total - menus.shown;
     await interaction.reply({
-      content: `先に点数を選んでください: ${missing.join("・")}`,
+      content:
+        omitted > 0
+          ? `現在の評価対象は ${menus.total}名です。Discordの表示上限のため先頭${menus.shown}名を表示しています。`
+          : `現在の評価対象は ${menus.total}名です。対象を選んでください。`,
+      components: menus.rows,
       flags: MessageFlags.Ephemeral,
     });
     return;
   }
-  pending.conclusion = value as Conclusion;
-  await continueAfterConclusion(interaction, services, pending);
+
+  if (!interaction.customId.startsWith("eval:target:")) return;
+  const targetId = interaction.values[0];
+  if (!targetId) return;
+
+  const store = new EvaluationForumStore(services.db);
+  const cycle = store.currentCycle(targetId);
+  if (!cycle) {
+    await interaction.update({
+      content: "この人は現在の評価対象ではありません。パネルから一覧を開き直してください。",
+      components: [],
+    });
+    return;
+  }
+
+  await interaction.update({ content: "評価フォーラムを確認しています…", components: [] });
+  try {
+    const thread = await ensureEvaluationThread(interaction.guild, services, targetId);
+    await interaction.editReply({
+      content: thread
+        ? `評価フォーラムを開きました: ${thread.toString()}\n以降はフォーラムへ通常のDiscordメッセージとして自由に評価を書いてください。`
+        : "評価フォーラムを作成できませんでした。`channel:eval_forum` の設定を確認してください。",
+      components: [],
+    });
+  } catch (error) {
+    await interaction.editReply({
+      content: `評価フォーラムを開けませんでした: ${error instanceof Error ? error.message : String(error)}`,
+      components: [],
+    });
+  }
 }
 
-// ---- 送信（モーダル）→ フォーラム投稿・印台帳・閾値アクション ----
+// ---- フォーラム生成・客観情報 ----
 
-function fmtDeadline(ts: number | null | undefined): string {
-  if (!ts) return "—";
-  const d = new Date(ts * 1000);
-  return new Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo", month: "2-digit", day: "2-digit" }).format(d);
+export function threadTitleFor(displayName: string, _deadlineTs?: number | null): string {
+  const suffix = "｜亡霊評価";
+  return `${displayName.slice(0, Math.max(1, 95 - suffix.length))}${suffix}`.slice(0, 95);
 }
 
-export function threadTitleFor(displayName: string, deadlineTs: number | null | undefined): string {
-  return `${displayName}【期限: ${fmtDeadline(deadlineTs)}】`.slice(0, 95);
+async function swordsmanIds(guild: Guild, services: Services): Promise<string[]> {
+  const roleId = services.settings.getString("role:swordsman");
+  if (!roleId) return [];
+  const members = await guild.members.fetch().catch(() => guild.members.cache);
+  return [...members.values()].filter((m) => !m.user.bot && m.roles.cache.has(roleId)).map((m) => m.id);
 }
 
-async function ensureEvalThread(
-  interaction: ModalSubmitInteraction,
+async function starterContent(guild: Guild, services: Services, targetId: string): Promise<string | null> {
+  const store = new EvaluationForumStore(services.db);
+  const cycle = store.currentCycle(targetId);
+  if (!cycle) return null;
+  const member = await guild.members.fetch(targetId).catch(() => null);
+  const displayName = member?.displayName ?? targetId;
+  const inviteCount = store.inviteCountSinceCycle(targetId, cycle.startedAt);
+  const denParentId = services.settings.getString("category:eval_den");
+
+  const lines: string[] = [`👻 **${threadTitleFor(displayName)}**`];
+  if (cycle.origin === "return") lines.push("", "🔄 **出戻り**");
+  lines.push("", `評価開始：${fmtJstDate(cycle.startedAt)}`, `現在期限：${fmtJstDate(cycle.deadlineAt)}`, "", "🐾 **冥獣の巣**");
+
+  if (!denParentId) {
+    lines.push("集計設定（`category:eval_den`）が見つかりません。", "", "💭 **参考**", "冥獣の巣の集計設定を確認してください。");
+  } else {
+    const presence = store.presenceForCycle({
+      userId: targetId,
+      swordsmanIds: await swordsmanIds(guild, services),
+      denParentId,
+      startedAt: cycle.startedAt,
+    });
+    lines.push(
+      `参加：${presence.denDays}日`,
+      `滞在：${fmtDuration(presence.denSeconds)}`,
+      `魔剣士との同席：${presence.swordsmanDays}日 / ${fmtDuration(presence.swordsmanSeconds)}`,
+      "",
+      "💭 **参考**",
+      evaluationReferenceText(presence),
+    );
+  }
+
+  lines.push("", "📨 **招待**", `今回の評価開始後：${inviteCount}人`);
+  return lines.join("\n");
+}
+
+async function refreshThread(
+  guild: Guild,
+  services: Services,
+  thread: AnyThreadChannel,
+  targetId: string,
+): Promise<void> {
+  const content = await starterContent(guild, services, targetId);
+  if (!content) return;
+  const member = await guild.members.fetch(targetId).catch(() => null);
+  const expectedName = threadTitleFor(member?.displayName ?? targetId);
+  if (thread.archived) await thread.setArchived(false).catch(() => undefined);
+  if (thread.name !== expectedName) await thread.setName(expectedName).catch(() => undefined);
+
+  const starter = await thread.messages.fetch(thread.id).catch(() => null);
+  if (starter) {
+    await starter.edit({ content, embeds: [] });
+  } else {
+    // 旧フォーラム等で起点メッセージが取得できない場合だけ、最新情報を1件追加する。
+    await thread.send({ content });
+  }
+}
+
+export async function ensureEvaluationThread(
+  guild: Guild,
   services: Services,
   targetId: string,
 ): Promise<AnyThreadChannel | null> {
+  const store = new EvaluationForumStore(services.db);
+  const cycle = store.currentCycle(targetId);
+  if (!cycle) return null;
+
   const forumId = services.settings.getString("channel:eval_forum");
   if (!forumId) return null;
-  const forum = (await interaction.client.channels.fetch(forumId).catch(() => null)) as ForumChannel | null;
+  const forum = (await guild.client.channels.fetch(forumId).catch(() => null)) as ForumChannel | null;
   if (!forum || forum.type !== ChannelType.GuildForum) return null;
 
-  const existingId = services.evaluation.threadFor(targetId);
+  const existingId = store.threadFor(targetId, cycle.startedAt);
   if (existingId) {
-    const thread = (await interaction.client.channels.fetch(existingId).catch(() => null)) as AnyThreadChannel | null;
-    if (thread?.isThread()) {
-      if (thread.archived) await thread.setArchived(false).catch(() => undefined);
-      return thread;
+    const existing = (await guild.client.channels.fetch(existingId).catch(() => null)) as AnyThreadChannel | null;
+    if (existing?.isThread()) {
+      await refreshThread(guild, services, existing, targetId);
+      return existing;
     }
   }
 
-  const member = await interaction.guild?.members.fetch(targetId).catch(() => null);
-  const soul = services.entry.getSoul(targetId);
-  const whitelist = services.settings.getJson<string[]>("vc_whitelist", []);
-  const presence = services.vc.presence(targetId, 14, whitelist.length > 0 ? whitelist : undefined);
-  const hours = Math.floor(presence.totalSeconds / 3600);
-  const mins = Math.floor((presence.totalSeconds % 3600) / 60);
-  const thresholds = services.evaluation.thresholdsFor(targetId);
-
+  const member = await guild.members.fetch(targetId).catch(() => null);
+  const content = await starterContent(guild, services, targetId);
+  if (!content) return null;
   const thread = await forum.threads.create({
-    name: threadTitleFor(member?.displayName ?? targetId, soul?.eval_deadline_at),
-    message: {
-      content: [
-        `📄 対象者: <@${targetId}>`,
-        `入城: ${soul?.ghost_at ? `<t:${soul.ghost_at}:D>` : "—"} / 審判期限: ${soul?.eval_deadline_at ? `<t:${soul.eval_deadline_at}:D>` : "—"}`,
-        `適用基準: 昇格印 **${thresholds.promotionRequired}** / 低評価印 **${thresholds.demotionThreshold}**`,
-        `浮上実績（直近14日・評価対象VC）: **${hours}時間${mins}分 / 出現${presence.daysSeen}日**`,
-      ].join("\n"),
-    },
+    name: threadTitleFor(member?.displayName ?? targetId),
+    message: { content },
   });
-  services.evaluation.setThread(targetId, thread.id);
-  // 起点メッセージを最新の実績で即上書き（以降は毎日05:30に自動更新）
-  if (interaction.guild) await refreshEvalStatsForUser(interaction.guild, services, targetId);
+  store.setThread(targetId, cycle.startedAt, thread.id);
   return thread;
 }
 
-export async function handleEvaluationModal(
-  interaction: ModalSubmitInteraction,
-  services: Services,
-): Promise<void> {
-  const pending = pendingEvals.get(interaction.user.id);
-  if (!pending?.conclusion) {
-    await interaction.reply({ content: "⌛ 期限切れです。もう一度 `/評価` からどうぞ。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (!isSwordsman(interaction, services)) {
-    pendingEvals.delete(interaction.user.id);
-    await interaction.reply({ content: "評価資格が確認できません。評価は記録されませんでした。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  pendingEvals.delete(interaction.user.id);
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+/** 日次更新用。フォーラムは自動生成せず、現在サイクルに既にあるものだけ更新する。 */
+export async function refreshEvaluationForumForUser(guild: Guild, services: Services, targetId: string): Promise<boolean> {
+  const store = new EvaluationForumStore(services.db);
+  const cycle = store.currentCycle(targetId);
+  if (!cycle) return false;
+  const threadId = store.threadFor(targetId, cycle.startedAt);
+  if (!threadId) return false;
+  const thread = (await guild.client.channels.fetch(threadId).catch(() => null)) as AnyThreadChannel | null;
+  if (!thread?.isThread()) return false;
+  await refreshThread(guild, services, thread, targetId);
+  return true;
+}
 
-  const texts = {
-    detail: interaction.fields.getTextInputValue("detail"),
-    merit: interaction.fields.getTextInputValue("merit") || undefined,
-    concern: interaction.fields.getTextInputValue("concern") || undefined,
-    feedback: interaction.fields.getTextInputValue("feedback") || undefined,
-    others: interaction.fields.getTextInputValue("others") || undefined,
-  };
-  const scores = pending.scores as EvalScores;
-  const total = scores.voice + scores.communication + scores.presence + scores.understanding;
-  const maxMarkWeight = maxMarkWeightForMember(interaction.member as GuildMember | null, services);
-  const markWeight = pending.conclusion === "none" ? 0 : (pending.markWeight ?? 1);
-  if (markWeight > maxMarkWeight) {
-    await interaction.editReply(
-      `❌ 現在のロール設定では ${markWeight}印 は付けられません（上限: ${maxMarkWeight}印）。もう一度 \`/評価\` からやり直してください。`,
-    );
-    return;
-  }
-
-  const thread = await ensureEvalThread(interaction, services, pending.targetId);
-  const result = services.evaluation.submitEvaluation({
-    targetId: pending.targetId,
-    evaluatorId: interaction.user.id,
-    scores,
-    texts,
-    conclusion: pending.conclusion,
-    markWeight,
-    threadId: thread?.id,
-  });
-
-  // フォーラムに評価を掲示（本人不可視はフォーラム自体の権限設定で担保）
-  if (thread) {
-    const whitelist = services.settings.getJson<string[]>("vc_whitelist", []);
-    const presence = services.vc.presence(pending.targetId, 14, whitelist.length > 0 ? whitelist : undefined);
-    const embed = new EmbedBuilder()
-      .setTitle(`評価員: ${interaction.member && "displayName" in interaction.member ? interaction.member.displayName : interaction.user.username}`)
-      .setDescription(
-        [
-          `声: **${scores.voice}** / コミュ力: **${scores.communication}** / 浮上率: **${scores.presence}** / 鯖理解度: **${scores.understanding}** — 合計 **${total}/20**`,
-          "",
-          `**詳細** ${texts.detail}`,
-          texts.merit ? `**鯖メリット** ${texts.merit}` : "",
-          texts.concern ? `**不安点** ${texts.concern}` : "",
-          texts.feedback ? `**フィードバック** ${texts.feedback}` : "",
-          texts.others ? `**評価高い人・低い人** ${texts.others}` : "",
-          "",
-          `**結論**: ${CONCLUSIONS.find(([v]) => v === pending.conclusion)?.[1]}${markWeight > 0 ? `（${markWeight}印）` : ""}`,
-          `現在 — 昇格印 **${result.promotion.total}/${result.thresholds.promotionRequired}**（うち招待 ${result.promotion.inviteScore}）・低評価印 **${result.demotionCount}/${result.thresholds.demotionThreshold}**・評価 ${services.evaluation.evaluationCount(pending.targetId)}件`,
-          `浮上実績（直近14日）: ${Math.floor(presence.totalSeconds / 3600)}時間${Math.floor((presence.totalSeconds % 3600) / 60)}分 / 出現${presence.daysSeen}日`,
-        ]
-          .filter(Boolean)
-          .join("\n"),
-      )
-      .setColor(pending.conclusion === "demotion" ? 0xdc2626 : pending.conclusion === "promotion" ? 0x16a34a : 0x6b21a8);
-    await thread.send({ embeds: [embed] });
-  }
-
-  // 閾値アクション
-  const guild = interaction.guild!;
-  const notes: string[] = [];
-  if (result.demotionReached) {
-    await executeDemotion(services, guild, pending.targetId, `低評価印${result.thresholds.demotionThreshold}個到達（即落ちルール）`);
-    notes.push(`⚠️ 低評価印${result.thresholds.demotionThreshold}個に到達 → **迷霊落ちを執行しました**`);
-  } else if (result.promotionReached) {
-    const mendanRoleId = services.settings.getString("role:mendan");
-    const member = await guild.members.fetch(pending.targetId).catch(() => null);
-    if (mendanRoleId && member) await member.roles.add(mendanRoleId).catch(() => undefined);
-    // 昇格面談呼び出し: channel:promotion_call（未設定なら channel:shurei にフォールバック）
-    const callChId =
-      services.settings.getString("channel:promotion_call") ?? services.settings.getString("channel:shurei");
-    const shinRoleId = services.settings.getString("role:shin");
-    if (callChId) {
-      const channel = await guild.client.channels.fetch(callChId).catch(() => null);
-      if (channel?.isTextBased() && "send" in channel) {
-        await channel.send(
-          `⚔️ ${shinRoleId ? `<@&${shinRoleId}> ` : ""}<@${pending.targetId}> の昇格印が **${result.promotion.total}/${result.thresholds.promotionRequired}** に到達しました。昇格面談をお願いします。`,
-        );
-      }
-    }
-    notes.push(`🎉 昇格印${result.thresholds.promotionRequired}個に到達 → 面談待ちロールを付与し、昇格面談呼び出しチャンネルに通知しました`);
-  }
-
-  await interaction.editReply({
-    content: [
-      `✅ 評価を投稿しました${thread ? `: ${thread.toString()}` : "（評価フォーラム未設定のため記録のみ）"}`,
-      `昇格印 **${result.promotion.total}/${result.thresholds.promotionRequired}** ・ 低評価印 **${result.demotionCount}/${result.thresholds.demotionThreshold}**`,
-      ...notes,
-    ].join("\n"),
+/** 旧Modalから遅れて送信されたinteractionは記録せず、新方式へ案内する。 */
+export async function handleEvaluationModal(interaction: ModalSubmitInteraction, _services: Services): Promise<void> {
+  await interaction.reply({
+    content: "評価入力フォームは終了しました。現在は評価フォーラムへ通常のメッセージとして記入してください。",
+    flags: MessageFlags.Ephemeral,
   });
 }
 
-/** 迷霊落ちの執行（印4個の即落ち・カロンの期限切れ承認、両方から使う） */
+// ---- 旧カロンの自動評価執行は停止 ----
+
+/**
+ * 互換export。新方式では制度判断をBotへ戻さないため自動執行には使わない。
+ * 他モジュールが直接呼んでも事故らないよう、明示的に例外にする。
+ */
 export async function executeDemotion(
-  services: Services,
-  guild: import("discord.js").Guild,
-  targetId: string,
-  reason: string,
+  _services: Services,
+  _guild: Guild,
+  _targetId: string,
+  _reason: string,
 ): Promise<void> {
-  services.evaluation.demoteToMeirei(targetId, "system:marks", reason);
-  const ghostRoleId = services.settings.getString("role:ghost");
-  const meireiRoleId = services.settings.getString("role:meirei");
-  const member = await guild.members.fetch(targetId).catch(() => null);
-  if (member) {
-    // 迷霊を「先に」付けてから亡霊を剥がす。逆順にすると Discord の2イベント間で
-    // handleMemberRoleUpdate ③（亡霊剥奪検知）が「他の階級ロールなし」と誤判定して
-    // 案内待ちにリセット＋queue_wait 付与＋DB status='waiting' 上書きの副作用を起こす。
-    if (meireiRoleId) await member.roles.add(meireiRoleId).catch(() => undefined);
-    if (ghostRoleId) await member.roles.remove(ghostRoleId).catch(() => undefined);
-    await member
-      .send(`⚖️ 冥獄城の審判が下りました。汝は**迷霊**となった（理由: ${reason}）。贖罪の道は運営に相談を。`)
-      .catch(() => undefined);
-  }
+  throw new Error("automatic evaluation demotion is disabled; review the evaluation forum and decide manually");
 }
-
-// ---- カロンの迷霊落ち承認ボタン ----
 
 export async function handleCharonButton(interaction: ButtonInteraction, services: Services): Promise<void> {
   if (!isAdmin(interaction, services)) {
     await interaction.reply({ content: "承認は運営のみ可能です。", flags: MessageFlags.Ephemeral });
     return;
   }
-  if (interaction.customId === "charon:cancel") {
-    await interaction.update({ content: "見送りました（対象は明日のカロンに再掲されます）。", components: [], embeds: [] });
-    return;
-  }
-  if (interaction.customId !== "charon:drop") return;
-
-  await interaction.update({ content: "⏳ 執行中…", components: [], embeds: [] });
-  const overdue = services.evaluation.overdue();
-  const done: string[] = [];
-  for (const row of overdue) {
-    await executeDemotion(services, interaction.guild!, row.user_id, "評価期限到達・昇格印不足");
-    done.push(row.user_id);
-  }
-  await interaction.editReply({
-    content:
-      done.length > 0
-        ? `⚖️ **${done.length}名** を迷霊に落としました: ${done.map((id) => `<@${id}>`).join(", ")}`
-        : "対象はいませんでした（期限内に変動があった模様）。",
+  await interaction.update({
+    content: [
+      "⚖️ この自動執行は停止しました。",
+      "現在の評価制度では、アリ数や評価点からBotが迷霊落ちを判断しません。対象者の評価フォーラムを確認し、人間側で最終判断してください。",
+    ].join("\n"),
+    components: [],
+    embeds: [],
   });
 }
+
+export const evaluationForumThresholdsForTesting = {
+  denLowSeconds: DEN_LOW_SECONDS,
+  swordsmanLowSeconds: SWORDSMAN_LOW_SECONDS,
+};
