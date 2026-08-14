@@ -1,0 +1,119 @@
+name: PR129 evaluation picker fix
+
+on:
+  push:
+    branches:
+      - feat/evaluation-forum-v2
+    paths:
+      - .github/workflows/pr129-picker-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply picker usability fix
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+
+          # 1) config非依存UI helper: 常設入口はButton、在籍フィルタは純粋関数。
+          Path('apps/bot/src/evaluation-forum-view.ts').write_text('''import { ActionRowBuilder, ButtonBuilder, ButtonStyle, SlashCommandBuilder } from "discord.js";\nimport type { EvaluationCycleContext, EvaluationPresenceSummary } from "@meigokujo/core/evaluation/forum";\n\nconst DEN_LOW_SECONDS = 30 * 60;\nconst SWORDSMAN_LOW_SECONDS = 15 * 60;\n\nexport interface EvaluationTargetView {\n  userId: string;\n  displayName: string;\n  deadlineAt: number | null;\n}\n\nexport const evaluationCommand = new SlashCommandBuilder()\n  .setName("評価")\n  .setDescription("評価フォーラム方式の案内を表示する")\n  .setDMPermission(false);\n\nexport function evaluationPanelRow(): ActionRowBuilder<ButtonBuilder> {\n  return new ActionRowBuilder<ButtonBuilder>().addComponents(\n    new ButtonBuilder()\n      .setCustomId("eval:open")\n      .setLabel("評価する亡霊を選択")\n      .setStyle(ButtonStyle.Primary),\n  );\n}\n\n/** DB上で評価中かつ、現在Discord Guildに在籍する人だけをUI対象にする。 */\nexport function currentGuildEvaluationTargets(\n  cycles: EvaluationCycleContext[],\n  members: ReadonlyMap<string, { displayName: string }>,\n  omitUserId?: string,\n): EvaluationTargetView[] {\n  const targets: EvaluationTargetView[] = [];\n  for (const cycle of cycles) {\n    if (cycle.userId === omitUserId) continue;\n    const member = members.get(cycle.userId);\n    if (!member) continue;\n    targets.push({\n      userId: cycle.userId,\n      displayName: member.displayName,\n      deadlineAt: cycle.deadlineAt,\n    });\n  }\n  return targets;\n}\n\nexport function evaluationReferenceText(summary: EvaluationPresenceSummary): string {\n  if (summary.denSeconds < DEN_LOW_SECONDS) {\n    return "巣穴での活動がまだ少なく、評価材料が不足している可能性があります。";\n  }\n  if (summary.swordsmanSeconds < SWORDSMAN_LOW_SECONDS) {\n    return "巣穴への参加はありますが、魔剣士との同席が少なく、評価機会が不足している可能性があります。";\n  }\n  return "魔剣士との同席機会があります。評価できる材料があるか確認してみてください。";\n}\n\nexport function threadTitleFor(displayName: string, _deadlineTs?: number | null): string {\n  const suffix = "｜亡霊評価";\n  return `${displayName.slice(0, Math.max(1, 95 - suffix.length))}${suffix}`.slice(0, 95);\n}\n\nexport const evaluationForumThresholdsForTesting = {\n  denLowSeconds: DEN_LOW_SECONDS,\n  swordsmanLowSeconds: SWORDSMAN_LOW_SECONDS,\n};\n''', encoding='utf-8')
+
+          # 2) 評価command: 入口button化、一覧はGuild在籍者だけ、選択後も最新一覧を残す。
+          command = Path('apps/bot/src/commands/evaluation.ts')
+          text = command.read_text(encoding='utf-8')
+          old_import = 'import { evaluationCommand, evaluationReferenceText, threadTitleFor } from "../evaluation-forum-view.js";\nexport { evaluationCommand, evaluationForumThresholdsForTesting, evaluationReferenceText, threadTitleFor } from "../evaluation-forum-view.js";'
+          new_import = 'import {\n  currentGuildEvaluationTargets,\n  evaluationCommand,\n  evaluationPanelRow,\n  evaluationReferenceText,\n  threadTitleFor,\n} from "../evaluation-forum-view.js";\nexport {\n  currentGuildEvaluationTargets,\n  evaluationCommand,\n  evaluationForumThresholdsForTesting,\n  evaluationPanelRow,\n  evaluationReferenceText,\n  threadTitleFor,\n} from "../evaluation-forum-view.js";'
+          if old_import not in text:
+              raise SystemExit('evaluation view import marker not found')
+          text = text.replace(old_import, new_import, 1)
+          text = text.replace(
+              '  interaction: ChatInputCommandInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,',
+              '  interaction: ChatInputCommandInteraction | StringSelectMenuInteraction | ModalSubmitInteraction | ButtonInteraction,',
+              1,
+          )
+
+          panel_start = text.index('function panelRow(): ActionRowBuilder<StringSelectMenuBuilder> {')
+          command_start = text.index('export async function handleEvaluationCommand(', panel_start)
+          text = text[:panel_start] + text[command_start:]
+          text = text.replace('components: [panelRow()],', 'components: [evaluationPanelRow()],', 1)
+
+          target_start = text.index('async function targetMenus(')
+          select_start = text.index('export async function handleEvaluationSelect(', target_start)
+          forum_comment = text.index('// ---- フォーラム生成・客観情報 ----', select_start)
+          replacement = '''async function targetMenus(\n  guild: Guild,\n  services: Services,\n  omitUserId?: string,\n): Promise<{\n  rows: ActionRowBuilder<StringSelectMenuBuilder>[];\n  total: number;\n  shown: number;\n}> {\n  const store = new EvaluationForumStore(services.db);\n  const cycles = store.listCurrentCycles();\n  if (cycles.length === 0) return { rows: [], total: 0, shown: 0 };\n\n  // 一覧の正本は「DB上で評価中 AND 現在Guildに在籍」。\n  // member fetchに失敗した時はID表示へフォールバックせず、呼び出し元へ失敗を返す。\n  const members = await guild.members.fetch();\n  const targets = currentGuildEvaluationTargets(cycles, members, omitUserId);\n  const shownTargets = targets.slice(0, TARGETS_PER_MENU * MAX_TARGET_MENUS);\n  const rows: ActionRowBuilder<StringSelectMenuBuilder>[] = [];\n  for (let offset = 0; offset < shownTargets.length; offset += TARGETS_PER_MENU) {\n    const chunk = shownTargets.slice(offset, offset + TARGETS_PER_MENU);\n    const index = Math.floor(offset / TARGETS_PER_MENU);\n    rows.push(\n      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(\n        new StringSelectMenuBuilder()\n          .setCustomId(`eval:target:${index}`)\n          .setPlaceholder(index === 0 ? "現在の亡霊から選択" : `現在の亡霊から選択（${index + 1}）`)\n          .addOptions(\n            chunk.map((target) => {\n              const deadline = target.deadlineAt ? `期限 ${fmtJstShortDate(target.deadlineAt)}` : "期限未設定";\n              return {\n                label: target.displayName.slice(0, 100),\n                value: target.userId,\n                description: deadline.slice(0, 100),\n              };\n            }),\n          ),\n      ),\n    );\n  }\n  return { rows, total: targets.length, shown: shownTargets.length };\n}\n\nfunction targetListContent(total: number, shown: number): string {\n  const omitted = total - shown;\n  return omitted > 0\n    ? `現在の評価対象は ${total}名です。Discordの表示上限のため先頭${shown}名を表示しています。`\n    : `現在の評価対象は ${total}名です。対象を選んでください。`;\n}\n\nexport async function handleEvaluationButton(\n  interaction: ButtonInteraction,\n  services: Services,\n): Promise<void> {\n  if (interaction.customId !== "eval:open") return;\n  if (!isSwordsman(interaction, services)) {\n    await interaction.reply({ content: "評価フォーラムは魔剣士のみ利用できます。", flags: MessageFlags.Ephemeral });\n    return;\n  }\n  if (!interaction.guild) {\n    await interaction.reply({ content: "サーバー内で使用してください。", flags: MessageFlags.Ephemeral });\n    return;\n  }\n\n  try {\n    const menus = await targetMenus(interaction.guild, services);\n    if (menus.total === 0) {\n      await interaction.reply({ content: "現在、サーバーに在籍している評価期間中の亡霊はいません。", flags: MessageFlags.Ephemeral });\n      return;\n    }\n    await interaction.reply({\n      content: targetListContent(menus.total, menus.shown),\n      components: menus.rows,\n      flags: MessageFlags.Ephemeral,\n    });\n  } catch {\n    await interaction.reply({\n      content: "亡霊一覧の取得に失敗しました。もう一度［評価する亡霊を選択］を押してください。",\n      flags: MessageFlags.Ephemeral,\n    });\n  }\n}\n\nasync function editWithFreshTargets(\n  interaction: StringSelectMenuInteraction,\n  services: Services,\n  content: string,\n  omitUserId?: string,\n): Promise<void> {\n  try {\n    const menus = await targetMenus(interaction.guild!, services, omitUserId);\n    const continuation =\n      menus.total > 0\n        ? "\\n\\n**続けて別の亡霊も選択できます。**"\n        : "\\n\\n現在、ほかにサーバー在籍中の評価対象はいません。";\n    await interaction.editReply({ content: `${content}${continuation}`, components: menus.rows });\n  } catch {\n    await interaction.editReply({\n      content: `${content}\\n\\n亡霊一覧の再取得に失敗しました。常設パネルの［評価する亡霊を選択］をもう一度押してください。`,\n      components: [],\n    });\n  }\n}\n\nexport async function handleEvaluationSelect(\n  interaction: StringSelectMenuInteraction,\n  services: Services,\n): Promise<void> {\n  if (!isSwordsman(interaction, services)) {\n    await interaction.reply({ content: "評価フォーラムは魔剣士のみ利用できます。", flags: MessageFlags.Ephemeral });\n    return;\n  }\n  if (!interaction.guild) {\n    await interaction.reply({ content: "サーバー内で使用してください。", flags: MessageFlags.Ephemeral });\n    return;\n  }\n\n  if (!interaction.customId.startsWith("eval:target:")) {\n    // deploy直後に残った旧 /評価 select を触っても interaction failure にせず新方式へ案内する。\n    await interaction.reply({\n      content: "この評価入力UIは旧方式です。常設パネルの［評価する亡霊を選択］から対象を選んでください。",\n      flags: MessageFlags.Ephemeral,\n    });\n    return;\n  }\n\n  const targetId = interaction.values[0];\n  if (!targetId) {\n    await interaction.reply({ content: "対象を取得できませんでした。常設パネルから開き直してください。", flags: MessageFlags.Ephemeral });\n    return;\n  }\n\n  await interaction.deferUpdate();\n\n  const store = new EvaluationForumStore(services.db);\n  const cycle = store.currentCycle(targetId);\n  if (!cycle) {\n    await editWithFreshTargets(\n      interaction,\n      services,\n      "この人は現在の評価対象ではなくなりました。最新の一覧に更新しました。",\n    );\n    return;\n  }\n\n  // ephemeral一覧を開いた後の退城も弾く。DB statusは出戻り用に保持されるのでGuild在籍を別途確認する。\n  const member = await interaction.guild.members.fetch(targetId).catch(() => null);\n  if (!member) {\n    await editWithFreshTargets(\n      interaction,\n      services,\n      "選択した亡霊は現在サーバーに在籍していません。最新の一覧に更新しました。",\n    );\n    return;\n  }\n\n  try {\n    const thread = await ensureEvaluationThread(interaction.guild, services, targetId);\n    if (!thread) {\n      await editWithFreshTargets(\n        interaction,\n        services,\n        "評価フォーラムを作成できませんでした。`channel:eval_forum` の設定を確認してください。",\n      );\n      return;\n    }\n    await editWithFreshTargets(\n      interaction,\n      services,\n      `**${member.displayName}** の評価フォーラムを開きました → ${thread.toString()}\\nフォーラムへ通常のDiscordメッセージとして自由に評価を書いてください。`,\n      targetId,\n    );\n  } catch (error) {\n    await editWithFreshTargets(\n      interaction,\n      services,\n      `評価フォーラムを開けませんでした: ${error instanceof Error ? error.message : String(error)}`,\n    );\n  }\n}\n\n'''
+          text = text[:target_start] + replacement + text[forum_comment:]
+
+          text = text.replace(
+              '  const member = await guild.members.fetch(targetId).catch(() => null);\n  const displayName = member?.displayName ?? targetId;',
+              '  const member = await guild.members.fetch(targetId).catch(() => null);\n  if (!member) return null;\n  const displayName = member.displayName;',
+              1,
+          )
+          text = text.replace(
+              '  const member = await guild.members.fetch(targetId).catch(() => null);\n  const expectedName = threadTitleFor(member?.displayName ?? targetId);',
+              '  const member = await guild.members.fetch(targetId).catch(() => null);\n  if (!member) return;\n  const expectedName = threadTitleFor(member.displayName);',
+              1,
+          )
+          text = text.replace(
+              '  const member = await guild.members.fetch(targetId).catch(() => null);\n  const content = await starterContent(guild, services, targetId);\n  if (!content) return null;\n  const thread = await forum.threads.create({\n    name: threadTitleFor(member?.displayName ?? targetId),',
+              '  const member = await guild.members.fetch(targetId).catch(() => null);\n  if (!member) throw new Error("target_member_not_found");\n  const content = await starterContent(guild, services, targetId);\n  if (!content) return null;\n  const thread = await forum.threads.create({\n    name: threadTitleFor(member.displayName),',
+              1,
+          )
+          command.write_text(text, encoding='utf-8')
+
+          # 3) interaction routerでeval:open Buttonを処理する。
+          index = Path('apps/bot/src/index.ts')
+          text = index.read_text(encoding='utf-8')
+          text = text.replace(
+              '  handleCharonButton,\n  handleEvaluationCommand,',
+              '  handleCharonButton,\n  handleEvaluationButton,\n  handleEvaluationCommand,',
+              1,
+          )
+          marker = '''      if (interaction.customId.startsWith("charon:")) {\n        await handleCharonButton(interaction, services);\n        return;\n      }'''
+          insertion = '''      if (interaction.customId.startsWith("eval:")) {\n        await handleEvaluationButton(interaction, services);\n        return;\n      }\n''' + marker
+          if marker not in text:
+              raise SystemExit('charon button route marker not found')
+          text = text.replace(marker, insertion, 1)
+          index.write_text(text, encoding='utf-8')
+
+          # 4) config非依存テストでbutton・在籍フィルタ・連続選択用除外を固定する。
+          test = Path('apps/bot/tests/evaluation-forum-v2.test.ts')
+          test.write_text('''import { readFileSync } from "node:fs";\nimport { describe, expect, it } from "vitest";\nimport {\n  currentGuildEvaluationTargets,\n  evaluationCommand,\n  evaluationForumThresholdsForTesting,\n  evaluationPanelRow,\n  evaluationReferenceText,\n  threadTitleFor,\n} from "../src/evaluation-forum-view.js";\n\nconst indexSource = readFileSync(new URL("../src/index.ts", import.meta.url), "utf-8");\n\ndescribe("evaluation forum v2 UI", () => {\n  it("/評価から旧4項目・対象user optionを外している", () => {\n    const json = evaluationCommand.toJSON();\n    expect(json.options ?? []).toEqual([]);\n    expect(JSON.stringify(json)).not.toContain("点");\n    expect(JSON.stringify(json)).not.toContain("印");\n  });\n\n  it("常設入口は1択selectではなく何度でも押せるbutton", () => {\n    const row = evaluationPanelRow().toJSON();\n    expect(row.components).toHaveLength(1);\n    expect(row.components[0]).toMatchObject({\n      type: 2,\n      custom_id: "eval:open",\n      label: "評価する亡霊を選択",\n    });\n    expect(indexSource).toContain("handleEvaluationButton");\n    expect(indexSource).toContain('interaction.customId.startsWith("eval:")');\n  });\n\n  it("DB上で評価中でもGuild不在なら一覧に出さず、IDを表示名へフォールバックしない", () => {\n    const cycles = [\n      { userId: "in-guild", startedAt: 100, deadlineAt: 200, inviteBaseline: 0, origin: "entry" as const },\n      { userId: "left-guild", startedAt: 100, deadlineAt: 300, inviteBaseline: 0, origin: "entry" as const },\n    ];\n    const members = new Map([["in-guild", { displayName: "山田" }]]);\n    expect(currentGuildEvaluationTargets(cycles, members)).toEqual([\n      { userId: "in-guild", displayName: "山田", deadlineAt: 200 },\n    ]);\n    expect(JSON.stringify(currentGuildEvaluationTargets(cycles, members))).not.toContain("left-guild");\n  });\n\n  it("1人選択後はその人を除いた一覧を続けて表示できる", () => {\n    const cycles = [\n      { userId: "a", startedAt: 100, deadlineAt: 200, inviteBaseline: 0, origin: "entry" as const },\n      { userId: "b", startedAt: 100, deadlineAt: 300, inviteBaseline: 0, origin: "entry" as const },\n      { userId: "c", startedAt: 100, deadlineAt: 400, inviteBaseline: 0, origin: "entry" as const },\n    ];\n    const members = new Map([\n      ["a", { displayName: "山田" }],\n      ["b", { displayName: "佐藤" }],\n      ["c", { displayName: "田中" }],\n    ]);\n    expect(currentGuildEvaluationTargets(cycles, members, "a").map((target) => target.displayName)).toEqual(["佐藤", "田中"]);\n  });\n\n  it("フォーラムタイトルへ期限を焼かない", () => {\n    expect(threadTitleFor("テスト亡霊", 1_800_000_000)).toBe("テスト亡霊｜亡霊評価");\n    expect(threadTitleFor("テスト亡霊", null)).toBe("テスト亡霊｜亡霊評価");\n    expect(threadTitleFor("テスト亡霊", 1_800_000_000)).not.toContain("期限");\n  });\n\n  it("参考文は断定せず3分類に留める", () => {\n    const { denLowSeconds, swordsmanLowSeconds } = evaluationForumThresholdsForTesting;\n    const lowDen = evaluationReferenceText({\n      denDays: 1,\n      denSeconds: denLowSeconds - 1,\n      swordsmanDays: 0,\n      swordsmanSeconds: 0,\n    });\n    const lowOverlap = evaluationReferenceText({\n      denDays: 2,\n      denSeconds: denLowSeconds,\n      swordsmanDays: 0,\n      swordsmanSeconds: swordsmanLowSeconds - 1,\n    });\n    const enoughOverlap = evaluationReferenceText({\n      denDays: 2,\n      denSeconds: denLowSeconds,\n      swordsmanDays: 1,\n      swordsmanSeconds: swordsmanLowSeconds,\n    });\n\n    expect(lowDen).toContain("可能性があります");\n    expect(lowOverlap).toContain("可能性があります");\n    expect(enoughOverlap).toContain("確認してみてください");\n    for (const text of [lowDen, lowOverlap, enoughOverlap]) {\n      expect(text).not.toContain("昇格不可");\n      expect(text).not.toContain("評価可能です");\n      expect(text).not.toContain("材料不足です");\n    }\n  });\n});\n''', encoding='utf-8')
+          PY
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm -r test
+
+      - name: Commit verified picker fix
+        if: success()
+        shell: bash
+        run: |
+          rm .github/workflows/pr129-picker-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: keep evaluation picker reusable and guild-scoped"
+          git push origin HEAD:feat/evaluation-forum-v2
