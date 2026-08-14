@@ -5,7 +5,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./casino/remittance": "./src/casino/remittance.ts"
+    "./casino/remittance": "./src/casino/remittance.ts",
+    "./evaluation/forum": "./src/evaluation/forum.ts"
   },
   "scripts": {
     "test": "vitest run && vitest run --config vitest.serial.config.ts",
