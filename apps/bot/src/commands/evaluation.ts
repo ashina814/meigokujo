@@ -22,6 +22,9 @@ const SWORDSMAN_LOW_SECONDS = 15 * 60;
 const TARGETS_PER_MENU = 25;
 const MAX_TARGET_MENUS = 5;
 
+/** 同じBotプロセス内で、同一評価サイクルのDiscord threadを二重生成しない。 */
+const threadCreationLocks = new Map<string, Promise<AnyThreadChannel | null>>();
+
 // ---- 権限 ----
 
 export function isSwordsman(
@@ -182,9 +185,19 @@ export async function handleEvaluationSelect(
     return;
   }
 
-  if (!interaction.customId.startsWith("eval:target:")) return;
+  if (!interaction.customId.startsWith("eval:target:")) {
+    // deploy直後に残った旧 /評価 select を触っても interaction failure にせず新方式へ案内する。
+    await interaction.reply({
+      content: "この評価入力UIは旧方式です。現在は評価対象パネルから対象者を選び、フォーラムへ直接記入してください。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
   const targetId = interaction.values[0];
-  if (!targetId) return;
+  if (!targetId) {
+    await interaction.update({ content: "対象を取得できませんでした。パネルから一覧を開き直してください。", components: [] });
+    return;
+  }
 
   const store = new EvaluationForumStore(services.db);
   const cycle = store.currentCycle(targetId);
@@ -280,26 +293,27 @@ async function refreshThread(
   if (starter) {
     await starter.edit({ content, embeds: [] });
   } else {
-    // 旧フォーラム等で起点メッセージが取得できない場合だけ、最新情報を1件追加する。
+    // 起点メッセージを取得できない場合だけ、最新情報を1件追加する。
     await thread.send({ content });
   }
 }
 
-export async function ensureEvaluationThread(
+async function ensureEvaluationThreadUnlocked(
   guild: Guild,
   services: Services,
   targetId: string,
+  cycleStartedAt: number,
 ): Promise<AnyThreadChannel | null> {
   const store = new EvaluationForumStore(services.db);
-  const cycle = store.currentCycle(targetId);
-  if (!cycle) return null;
+  const current = store.currentCycle(targetId);
+  if (!current || current.startedAt !== cycleStartedAt) return null;
 
   const forumId = services.settings.getString("channel:eval_forum");
   if (!forumId) return null;
   const forum = (await guild.client.channels.fetch(forumId).catch(() => null)) as ForumChannel | null;
   if (!forum || forum.type !== ChannelType.GuildForum) return null;
 
-  const existingId = store.threadFor(targetId, cycle.startedAt);
+  const existingId = store.threadFor(targetId, cycleStartedAt);
   if (existingId) {
     const existing = (await guild.client.channels.fetch(existingId).catch(() => null)) as AnyThreadChannel | null;
     if (existing?.isThread()) {
@@ -315,8 +329,30 @@ export async function ensureEvaluationThread(
     name: threadTitleFor(member?.displayName ?? targetId),
     message: { content },
   });
-  store.setThread(targetId, cycle.startedAt, thread.id);
+  store.setThread(targetId, cycleStartedAt, thread.id);
   return thread;
+}
+
+export async function ensureEvaluationThread(
+  guild: Guild,
+  services: Services,
+  targetId: string,
+): Promise<AnyThreadChannel | null> {
+  const store = new EvaluationForumStore(services.db);
+  const cycle = store.currentCycle(targetId);
+  if (!cycle) return null;
+
+  const key = `${targetId}:${cycle.startedAt}`;
+  const running = threadCreationLocks.get(key);
+  if (running) return running;
+
+  const task = ensureEvaluationThreadUnlocked(guild, services, targetId, cycle.startedAt);
+  threadCreationLocks.set(key, task);
+  try {
+    return await task;
+  } finally {
+    if (threadCreationLocks.get(key) === task) threadCreationLocks.delete(key);
+  }
 }
 
 /** 日次更新用。フォーラムは自動生成せず、現在サイクルに既にあるものだけ更新する。 */
