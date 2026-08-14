@@ -93,6 +93,16 @@ export interface DeliverySnapshot {
   captured_at?: number;
 }
 
+export interface TimedAccessConfig {
+  roleId: string;
+  channelId: string | null;
+}
+
+export interface TimedAccessGrant extends TimedAccessConfig {
+  purchase: PurchaseRow;
+  item: ShopItemRow;
+}
+
 /**
  * いま自動配送してよい種別。
  *
@@ -161,6 +171,9 @@ export type ShopErrorCode =
   | "ERR_ROLE_REQUIRED"
   | "ERR_NO_PRICE"
   | "ERR_ALREADY_ACTIVE"
+  | "ERR_TIMED_ACCESS_CONFIG"
+  | "ERR_TIMED_ACCESS_ROLE_PRESENT"
+  | "ERR_TIMED_ACCESS_STATE_UNAVAILABLE"
   | "ERR_PURCHASE_NOT_FOUND"
   | "ERR_NOT_OWNER"
   | "ERR_NOT_ACTIVE"
@@ -230,6 +243,29 @@ export function termDays(item: Pick<ShopItemRow, "kind" | "duration_days">): num
  */
 export function extendedExpiry(currentExpiresAt: number | null, days: number, from: number = now()): number {
   return Math.max(currentExpiresAt ?? 0, from) + days * DAY;
+}
+
+/** Botが期限とDiscordロールをともに正本管理する、汎用の期限付きアクセス商品。 */
+export function isTimedAccessItem(
+  item: Pick<ShopItemRow, "kind" | "duration_days" | "delivery" | "delivery_kind">,
+): boolean {
+  return termDays(item as ShopItemRow) !== null && item.delivery === "auto" && item.delivery_kind === "add_role";
+}
+
+/** 商品設定からアクセス先を読む。商品IDやチャンネルIDはコードへ持ち込まない。 */
+export function timedAccessConfig(item: ShopItemRow): TimedAccessConfig | null {
+  if (!isTimedAccessItem(item)) return null;
+  try {
+    const data = item.delivery_data ? JSON.parse(item.delivery_data) as Record<string, unknown> : {};
+    const roleId = typeof data.role_id === "string" ? data.role_id.trim() : "";
+    if (!roleId) return null;
+    const channelId = typeof data.channel_id === "string" && data.channel_id.trim()
+      ? data.channel_id.trim()
+      : null;
+    return { roleId, channelId };
+  } catch {
+    return null;
+  }
 }
 
 export interface ShopOptions {
@@ -476,6 +512,14 @@ export class Shop {
         .prepare("SELECT id FROM shop_purchases WHERE item_id = ? AND user_id = ? AND status = 'active'")
         .get(item.id, input.userId) as { id: number } | undefined;
       if (existing) throw new ShopError("ERR_ALREADY_ACTIVE", { itemId: item.id, purchaseId: existing.id });
+    }
+    if (isTimedAccessItem(item)) {
+      const access = timedAccessConfig(item);
+      if (!access) throw new ShopError("ERR_TIMED_ACCESS_CONFIG", { itemId: item.id });
+      // 契約根拠が不明な既存ロールを30日契約と推測しない。権利を残したまま無課金で止める。
+      if (input.memberRoleIds.includes(access.roleId)) {
+        throw new ShopError("ERR_TIMED_ACCESS_ROLE_PRESENT", { itemId: item.id, roleId: access.roleId });
+      }
     }
 
     const ts = now();
@@ -1174,6 +1218,55 @@ export class Shop {
         return opts.kinds ? opts.kinds.includes(snapshot.delivery_kind) : true;
       })
       .slice(0, limit);
+  }
+
+  /**
+   * 期限内の汎用アクセス契約。購入時スナップショットを正本にし、スナップショット導入前の
+   * delivered契約だけは、現在も同じ期限付きadd_role商品である場合に限り互換維持する。
+   */
+  listActiveTimedAccess(userId?: string): TimedAccessGrant[] {
+    const params: unknown[] = [now()];
+    let userClause = "";
+    if (userId !== undefined) {
+      userClause = " AND user_id = ?";
+      params.push(userId);
+    }
+    const purchases = this.db
+      .prepare(
+        `SELECT * FROM shop_purchases
+          WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > ?${userClause}
+          ORDER BY id`,
+      )
+      .all(...params) as PurchaseRow[];
+
+    const grants: TimedAccessGrant[] = [];
+    for (const purchase of purchases) {
+      const item = this.getItem(purchase.item_id);
+      if (!item) continue;
+      const current = timedAccessConfig(item);
+      const snapshot = parseDeliverySnapshot(purchase.delivery_snapshot_json);
+      let roleId: string | null = null;
+      let channelId: string | null = null;
+      if (snapshot?.delivery_kind === "add_role") {
+        roleId = typeof snapshot.delivery_data.role_id === "string"
+          ? snapshot.delivery_data.role_id.trim()
+          : null;
+        channelId = typeof snapshot.delivery_data.channel_id === "string" && snapshot.delivery_data.channel_id.trim()
+          ? snapshot.delivery_data.channel_id.trim()
+          : null;
+        if (!channelId && current?.roleId === roleId) channelId = current.channelId;
+      } else if (purchase.delivery_snapshot_json === null && purchase.delivery_state === "delivered" && current) {
+        // legacyの購入ID・期限・配送完了は確定事実。ロールだけの人にはこの経路を使わない。
+        roleId = current.roleId;
+        channelId = current.channelId;
+      }
+      if (roleId) grants.push({ purchase, item, roleId, channelId });
+    }
+    return grants;
+  }
+
+  activeTimedAccessGrantsRole(userId: string, roleId: string): boolean {
+    return this.listActiveTimedAccess(userId).some((grant) => grant.roleId === roleId);
   }
 
   /**

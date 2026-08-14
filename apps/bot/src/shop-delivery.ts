@@ -203,7 +203,7 @@ export async function deliverPurchaseUnlocked(
     );
   }
   const kind = snapshot.delivery_kind;
-  const data = snapshot.delivery_data as { role_id?: string; days?: number };
+  const data = snapshot.delivery_data as { role_id?: string; channel_id?: string; days?: number };
   const userId = purchase.user_id;
 
   try {
@@ -211,15 +211,23 @@ export async function deliverPurchaseUnlocked(
       const roleId = data.role_id;
       if (!roleId) return fail("role_id_missing", "配送設定が不完全です（ロールID未設定）。運営にお問い合わせください。");
       if (!guild) return fail("guild_unavailable", "サーバー情報が取れず配送できませんでした。運営にお問い合わせください。");
-      const member = await guild.members.fetch(userId).catch(() => null);
+      let member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
       if (!member) return fail("member_fetch_failed", "メンバー情報の取得に失敗し配送できませんでした。運営にお問い合わせください。");
       if (!member.roles.cache.has(roleId)) {
-        // 付与済みなら何もしない（冪等）
-        const added = await member.roles.add(roleId).then(() => true).catch((e: Error) => e.message);
-        if (added !== true) return fail(`role_add_failed:${added}`, "ロールの付与に失敗しました。運営にお問い合わせください。");
+        // APIの返り値だけでは成功としない。エラー応答でも実際には付いている場合があるため、
+        // mutation後にforce fetchしたDiscord実状態を正本にする。
+        const addError = await member.roles.add(roleId).then(() => null).catch((e: Error) => e.message);
+        member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
+        if (!member) return fail("member_final_fetch_failed", "ロール付与後の状態を確認できませんでした。自動で再試行します。");
+        if (!member.roles.cache.has(roleId)) {
+          return fail(`role_add_failed:${addError ?? "role_missing"}`, "ロールの付与に失敗しました。自動で再試行します。");
+        }
       }
       services.shop.markDeliverySucceeded(purchase.id, actor);
-      return { state: "delivered", message: `ロールを付与しました: <@&${roleId}>` };
+      const destination = typeof data.channel_id === "string" && data.channel_id.trim()
+        ? `\n利用先: <#${data.channel_id.trim()}>`
+        : "";
+      return { state: "delivered", message: `利用可能になりました（<@&${roleId}>）。${destination}` };
     }
 
     if (kind === "set_nickname") {

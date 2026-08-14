@@ -107,6 +107,80 @@ describe("期限の数え方", () => {
   });
 });
 
+describe("汎用の期限付きアクセス", () => {
+  it("契約根拠のない既存ロール保有者には課金も購入行作成もしない", () => {
+    const ctx = setup();
+    const item = termItem(ctx);
+    fund(ctx, "legacy", 10_000);
+    const before = ctx.ledger.balanceOf("user:legacy");
+
+    expect(() => ctx.shop.purchase({
+      itemId: item.id,
+      userId: "legacy",
+      actor: "legacy",
+      memberRoleIds: ["r1"],
+    })).toThrow("ERR_TIMED_ACCESS_ROLE_PRESENT");
+
+    expect(ctx.ledger.balanceOf("user:legacy")).toBe(before);
+    expect(ctx.shop.listUserPurchases("legacy")).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("ロール設定が欠けた期限付き商品はfail-closedでLandを動かさない", () => {
+    const ctx = setup();
+    const item = ctx.shop.createItem(
+      { name: "broken", price_land: 1_000, kind: "monthly", delivery: "auto", delivery_kind: "add_role" },
+      "staff",
+    );
+    fund(ctx, "u1", 10_000);
+    const before = ctx.ledger.balanceOf("user:u1");
+
+    expect(() => ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }))
+      .toThrow("ERR_TIMED_ACCESS_CONFIG");
+    expect(ctx.ledger.balanceOf("user:u1")).toBe(before);
+    expect(ctx.shop.listUserPurchases("u1")).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("購入時スナップショットのロールと設定上の利用先をactive grantとして返す", () => {
+    const ctx = setup();
+    const item = ctx.shop.createItem(
+      {
+        name: "access",
+        price_land: 1_000,
+        kind: "monthly",
+        delivery: "auto",
+        delivery_kind: "add_role",
+        delivery_data: JSON.stringify({ role_id: "access-role", channel_id: "access-channel" }),
+      },
+      "staff",
+    );
+    fund(ctx, "u1", 10_000);
+    const purchase = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+
+    expect(ctx.shop.listActiveTimedAccess("u1")).toMatchObject([
+      { purchase: { id: purchase.id }, item: { id: item.id }, roleId: "access-role", channelId: "access-channel" },
+    ]);
+    ctx.db.prepare("UPDATE shop_purchases SET status='expired'").run();
+    expect(ctx.shop.listActiveTimedAccess("u1")).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("snapshot導入前でも配送完了と期限が確定した旧購入だけを互換維持する", () => {
+    const ctx = setup();
+    const item = termItem(ctx);
+    fund(ctx, "legacy", 10_000);
+    const purchase = ctx.shop.purchase({ itemId: item.id, userId: "legacy", actor: "legacy", memberRoleIds: [] }).purchase;
+    ctx.db.prepare(
+      "UPDATE shop_purchases SET delivery_snapshot_json=NULL, delivery_state='delivered' WHERE id=?",
+    ).run(purchase.id);
+
+    expect(ctx.shop.listActiveTimedAccess("legacy").map((grant) => grant.purchase.id)).toEqual([purchase.id]);
+    expect(ctx.shop.listActiveTimedAccess("role-only")).toEqual([]);
+    ctx.db.close();
+  });
+});
+
 describe("延長", () => {
   it("料金を払って30日延び、残り期間は加算される", () => {
     const ctx = setup();
