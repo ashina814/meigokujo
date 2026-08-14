@@ -85,6 +85,7 @@ import {
 } from "./commands/confession.js";
 import {
   handleCharonButton,
+  handleEvaluationButton,
   handleEvaluationCommand,
   handleEvaluationModal,
   handleEvaluationSelect,
@@ -446,6 +447,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (interaction.customId.startsWith("mimi:")) {
         await handleConfessionButton(interaction, services);
+        return;
+      }
+      if (interaction.customId === "eval:open") {
+        await handleEvaluationButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("charon:")) {

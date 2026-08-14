@@ -1,6 +1,8 @@
 import {
   ActionRowBuilder,
   ButtonInteraction,
+  ButtonBuilder,
+  ButtonStyle,
   ChannelType,
   ChatInputCommandInteraction,
   MessageFlags,
@@ -27,7 +29,7 @@ const threadCreationLocks = new Map<string, Promise<AnyThreadChannel | null>>();
 // ---- 権限 ----
 
 export function isSwordsman(
-  interaction: ChatInputCommandInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
+  interaction: ChatInputCommandInteraction | ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction,
   services: Services,
 ): boolean {
   if (isAdmin(interaction, services)) return true;
@@ -39,12 +41,12 @@ export function isSwordsman(
 
 // ---- /評価（旧入力フォームは廃止。運営が常設パネルを置くための入口だけ残す） ----
 
-function panelRow(): ActionRowBuilder<StringSelectMenuBuilder> {
-  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-    new StringSelectMenuBuilder()
+function panelRow(): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
       .setCustomId("eval:open")
-      .setPlaceholder("評価する亡霊を選択")
-      .addOptions({ label: "評価する亡霊を選択", value: "open", description: "現在の評価対象一覧を開きます" }),
+      .setLabel("評価する亡霊を選択")
+      .setStyle(ButtonStyle.Primary),
   );
 }
 
@@ -103,18 +105,25 @@ function fmtDuration(seconds: number): string {
   return hours > 0 ? `${hours}時間${minutes}分` : `${minutes}分`;
 }
 
-async function targetMenus(guild: Guild, services: Services): Promise<{
+async function targetMenus(
+  guild: Guild,
+  services: Services,
+  excludeUserId?: string,
+): Promise<{
   rows: ActionRowBuilder<StringSelectMenuBuilder>[];
   total: number;
   shown: number;
+  memberIds: Set<string>;
 }> {
   const store = new EvaluationForumStore(services.db);
   const cycles = store.listCurrentCycles();
-  if (cycles.length === 0) return { rows: [], total: 0, shown: 0 };
+  if (cycles.length === 0) return { rows: [], total: 0, shown: 0, memberIds: new Set() };
 
-  // 表示名を一括取得。取得に失敗した人も user_id で選択できるよう落とさない。
-  await guild.members.fetch().catch(() => undefined);
-  const shownCycles = cycles.slice(0, TARGETS_PER_MENU * MAX_TARGET_MENUS);
+  // Guild在籍を正本として一覧を作る。取得失敗時は呼び出し側で再試行を案内し、ID表示へは逃がさない。
+  const members = await guild.members.fetch();
+  const memberIds = new Set(members.keys());
+  const presentCycles = cycles.filter((cycle) => cycle.userId !== excludeUserId && memberIds.has(cycle.userId));
+  const shownCycles = presentCycles.slice(0, TARGETS_PER_MENU * MAX_TARGET_MENUS);
   const rows: ActionRowBuilder<StringSelectMenuBuilder>[] = [];
   for (let offset = 0; offset < shownCycles.length; offset += TARGETS_PER_MENU) {
     const chunk = shownCycles.slice(offset, offset + TARGETS_PER_MENU);
@@ -126,16 +135,64 @@ async function targetMenus(guild: Guild, services: Services): Promise<{
           .setPlaceholder(index === 0 ? "現在の亡霊から選択" : `現在の亡霊から選択（${index + 1}）`)
           .addOptions(
             chunk.map((cycle) => {
-              const member = guild.members.cache.get(cycle.userId);
-              const label = (member?.displayName ?? cycle.userId).slice(0, 100);
+              const member = members.get(cycle.userId);
+              if (!member) throw new Error(`guild member disappeared while rendering evaluation target: ${cycle.userId}`);
               const deadline = cycle.deadlineAt ? `期限 ${fmtJstShortDate(cycle.deadlineAt)}` : "期限未設定";
-              return { label, value: cycle.userId, description: deadline.slice(0, 100) };
+              return { label: member.displayName.slice(0, 100), value: cycle.userId, description: deadline.slice(0, 100) };
             }),
           ),
       ),
     );
   }
-  return { rows, total: cycles.length, shown: shownCycles.length };
+  return { rows, total: presentCycles.length, shown: shownCycles.length, memberIds };
+}
+
+async function replyWithTargetMenus(
+  interaction: ButtonInteraction | StringSelectMenuInteraction,
+  services: Services,
+): Promise<void> {
+  if (!interaction.guild) {
+    await interaction.reply({ content: "サーバー内で使用してください。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  let menus: Awaited<ReturnType<typeof targetMenus>>;
+  try {
+    menus = await targetMenus(interaction.guild, services);
+  } catch {
+    await interaction.reply({
+      content: "メンバー一覧の取得に失敗しました。もう一度押してください。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (menus.total === 0) {
+    await interaction.reply({
+      content: "現在、評価期間中かつサーバーに在籍している亡霊はいません。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  const omitted = menus.total - menus.shown;
+  await interaction.reply({
+    content:
+      omitted > 0
+        ? `現在の評価対象は ${menus.total}名です。Discordの表示上限のため先頭${menus.shown}名を表示しています。`
+        : `現在の評価対象は ${menus.total}名です。対象を選んでください。`,
+    components: menus.rows,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+export async function handleEvaluationButton(
+  interaction: ButtonInteraction,
+  services: Services,
+): Promise<void> {
+  if (interaction.customId !== "eval:open") return;
+  if (!isSwordsman(interaction, services)) {
+    await interaction.reply({ content: "評価フォーラムは魔剣士のみ利用できます。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await replyWithTargetMenus(interaction, services);
 }
 
 export async function handleEvaluationSelect(
@@ -152,60 +209,74 @@ export async function handleEvaluationSelect(
   }
 
   if (interaction.customId === "eval:open") {
-    const menus = await targetMenus(interaction.guild, services);
-    if (menus.total === 0) {
-      await interaction.reply({ content: "現在、評価期間中の亡霊はいません。", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const omitted = menus.total - menus.shown;
-    await interaction.reply({
-      content:
-        omitted > 0
-          ? `現在の評価対象は ${menus.total}名です。Discordの表示上限のため先頭${menus.shown}名を表示しています。`
-          : `現在の評価対象は ${menus.total}名です。対象を選んでください。`,
-      components: menus.rows,
-      flags: MessageFlags.Ephemeral,
-    });
+    // deploy前に設置された旧1択selectも、同じ最新一覧へ案内してinteraction failureを避ける。
+    await replyWithTargetMenus(interaction, services);
     return;
   }
 
   if (!interaction.customId.startsWith("eval:target:")) {
-    // deploy直後に残った旧 /評価 select を触っても interaction failure にせず新方式へ案内する。
     await interaction.reply({
       content: "この評価入力UIは旧方式です。現在は評価対象パネルから対象者を選び、フォーラムへ直接記入してください。",
       flags: MessageFlags.Ephemeral,
     });
     return;
   }
+
   const targetId = interaction.values[0];
   if (!targetId) {
     await interaction.update({ content: "対象を取得できませんでした。パネルから一覧を開き直してください。", components: [] });
     return;
   }
 
-  const store = new EvaluationForumStore(services.db);
-  const cycle = store.currentCycle(targetId);
-  if (!cycle) {
-    await interaction.update({
-      content: "この人は現在の評価対象ではありません。パネルから一覧を開き直してください。",
+  await interaction.deferUpdate();
+
+  let menus: Awaited<ReturnType<typeof targetMenus>>;
+  try {
+    menus = await targetMenus(interaction.guild, services, targetId);
+  } catch {
+    await interaction.editReply({
+      content: "メンバー一覧の取得に失敗しました。もう一度パネルの［評価する亡霊を選択］を押してください。",
       components: [],
     });
     return;
   }
 
-  await interaction.update({ content: "評価フォーラムを確認しています…", components: [] });
+  const store = new EvaluationForumStore(services.db);
+  const cycle = store.currentCycle(targetId);
+  if (!cycle) {
+    await interaction.editReply({
+      content: "この人は現在の評価対象ではありません。最新の一覧から選び直してください。",
+      components: menus.rows,
+    });
+    return;
+  }
+  if (!menus.memberIds.has(targetId)) {
+    await interaction.editReply({
+      content: [
+        "この人は現在サーバーに在籍していないため、評価対象一覧から外れました。",
+        menus.total > 0 ? "**続けて別の亡霊を選択できます。**" : "現在ほかに選択できる亡霊はいません。",
+      ].join("\n\n"),
+      components: menus.rows,
+    });
+    return;
+  }
+
   try {
     const thread = await ensureEvaluationThread(interaction.guild, services, targetId);
     await interaction.editReply({
       content: thread
-        ? `評価フォーラムを開きました: ${thread.toString()}\n以降はフォーラムへ通常のDiscordメッセージとして自由に評価を書いてください。`
-        : "評価フォーラムを作成できませんでした。`channel:eval_forum` の設定を確認してください。",
-      components: [],
+        ? [
+            `評価フォーラムを開きました: ${thread.toString()}`,
+            "以降はフォーラムへ通常のDiscordメッセージとして自由に評価を書いてください。",
+            menus.total > 0 ? "**続けて別の亡霊も選択できます。**" : "現在ほかに選択できる亡霊はいません。",
+          ].join("\n\n")
+        : "評価フォーラムを作成できませんでした。対象の在籍状況と `channel:eval_forum` の設定を確認してください。",
+      components: menus.rows,
     });
   } catch (error) {
     await interaction.editReply({
       content: `評価フォーラムを開けませんでした: ${error instanceof Error ? error.message : String(error)}`,
-      components: [],
+      components: menus.rows,
     });
   }
 }
@@ -224,7 +295,8 @@ async function starterContent(guild: Guild, services: Services, targetId: string
   const cycle = store.currentCycle(targetId);
   if (!cycle) return null;
   const member = await guild.members.fetch(targetId).catch(() => null);
-  const displayName = member?.displayName ?? targetId;
+  if (!member) return null;
+  const displayName = member.displayName;
   const inviteCount = store.inviteCountSinceCycle(targetId, cycle.startedAt);
   const denParentId = services.settings.getString("category:eval_den");
 
@@ -264,7 +336,8 @@ async function refreshThread(
   const content = await starterContent(guild, services, targetId);
   if (!content) return;
   const member = await guild.members.fetch(targetId).catch(() => null);
-  const expectedName = threadTitleFor(member?.displayName ?? targetId);
+  if (!member) return;
+  const expectedName = threadTitleFor(member.displayName);
   if (thread.archived) await thread.setArchived(false).catch(() => undefined);
   if (thread.name !== expectedName) await thread.setName(expectedName).catch(() => undefined);
 
@@ -286,6 +359,8 @@ async function ensureEvaluationThreadUnlocked(
   const store = new EvaluationForumStore(services.db);
   const current = store.currentCycle(targetId);
   if (!current || current.startedAt !== cycleStartedAt) return null;
+  const member = await guild.members.fetch(targetId).catch(() => null);
+  if (!member) return null;
 
   const forumId = services.settings.getString("channel:eval_forum");
   if (!forumId) return null;
@@ -301,11 +376,10 @@ async function ensureEvaluationThreadUnlocked(
     }
   }
 
-  const member = await guild.members.fetch(targetId).catch(() => null);
   const content = await starterContent(guild, services, targetId);
   if (!content) return null;
   const thread = await forum.threads.create({
-    name: threadTitleFor(member?.displayName ?? targetId),
+    name: threadTitleFor(member.displayName),
     message: { content },
   });
   store.setThread(targetId, cycleStartedAt, thread.id);
