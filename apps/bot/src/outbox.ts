@@ -119,6 +119,56 @@ function formatAuditDigest(items: DigestItem[], startedAtMs: number, endedAtMs: 
   return [`📋 **取引サマリ** <t:${started}:t>〜<t:${ended}:t>`, ...lines, `合計: ${items.length}件`].join("\n");
 }
 
+export function formatShopPurchaseLog(raw: string): string {
+  const p = JSON.parse(raw) as {
+    purchaseId: number;
+    transactionId?: number | null;
+    itemName: string;
+    userId: string;
+    paidLand?: number | null;
+    paidAltKind?: string | null;
+    paidAltAmount?: number | null;
+    amount?: number | null; // pre-generalization original-role payload compatibility
+    purchasedAt: number;
+    deliveryMode?: string | null;
+    deliveryKind?: string | null;
+    workType?: string | null;
+    ticketThreadId?: string | null;
+    staffId?: string | null;
+    issuedBy?: string | null;
+    invoiceId?: number | null;
+    invoiceKind?: string | null;
+    invoiceReason?: string | null;
+    source?: string | null;
+    migrationKey?: string | null;
+  };
+  const land = typeof p.paidLand === "number" ? p.paidLand : (typeof p.amount === "number" ? p.amount : null);
+  const payment = land !== null
+    ? `Land / ${land.toLocaleString()} Ld`
+    : p.paidAltKind && typeof p.paidAltAmount === "number"
+      ? `代替（${p.paidAltKind}） / ${p.paidAltAmount.toLocaleString()}`
+      : p.source === "legacy_timed_access_import"
+        ? "無償 / legacy import"
+        : "無償 / 記録のみ";
+  const work = p.workType ?? ([p.deliveryMode, p.deliveryKind].filter(Boolean).join(" / ") || "未指定");
+  const staffRaw = p.staffId ?? p.issuedBy ?? null;
+  const staff = staffRaw ? (staffRaw.startsWith("user:") ? `<@${staffRaw.slice(5)}>` : staffRaw) : null;
+  const kind = p.invoiceKind
+    ? (({ new: "新規", continuation: "継続", restart: "再開", exception: "例外" } as Record<string,string>)[p.invoiceKind] ?? p.invoiceKind)
+    : null;
+  return [
+    `🧾 **公式ショップ購入** — 購入 #${p.purchaseId}${p.transactionId ? ` / 取引 #${p.transactionId}` : ""}`,
+    `<@${p.userId}> / **${p.itemName}**`,
+    `支払: **${payment}**`,
+    `処理: \`${work}\``,
+    p.invoiceId ? `請求 #${p.invoiceId}${kind ? ` / ${kind}` : ""}${staff ? ` / 担当 ${staff}` : ""}` : (staff ? `担当: ${staff}` : ""),
+    p.ticketThreadId ? `チケット: <#${p.ticketThreadId}>` : "",
+    p.invoiceReason ? `理由: ${p.invoiceReason}` : "",
+    p.migrationKey ? `移行キー: \`${p.migrationKey}\`` : "",
+    `<t:${p.purchasedAt}:F>`,
+  ].filter(Boolean).join("\n");
+}
+
 function formatOriginalRolePurchase(raw: string): string {
   const p = JSON.parse(raw) as {
     purchaseId: number; transactionId: number; itemName: string; userId: string; amount: number;
@@ -216,7 +266,7 @@ export function startOutboxWorker(client: Client, services: Services, intervalMs
             entry.kind === "public_log"
               ? formatPublic(JSON.parse(entry.payload) as TxPayload)
               : entry.kind === "shop_purchase_log"
-                ? formatOriginalRolePurchase(entry.payload)
+                ? formatShopPurchaseLog(entry.payload)
                 : formatAudit(entry.kind, entry.payload);
 
           await channel.send({

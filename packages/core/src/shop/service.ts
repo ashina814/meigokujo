@@ -375,6 +375,44 @@ export interface ShopOptions {
   departments?: Departments;
 }
 
+interface ShopPurchaseLogExtra {
+  transactionId?: number | null;
+  deliveryMode?: DeliveryMode;
+  deliveryKind?: DeliveryKind;
+  workType?: string | null;
+  ticketThreadId?: string | null;
+  staffId?: string | null;
+  invoiceId?: number | null;
+  invoiceKind?: string | null;
+  invoiceReason?: string | null;
+  paidBy?: string | null;
+  source?: string;
+  migrationKey?: string | null;
+}
+
+interface ShopPurchaseLogPayload {
+  purchaseId: number;
+  transactionId: number | null;
+  itemId: number;
+  itemName: string;
+  userId: string;
+  paidLand: number | null;
+  paidAltKind: string | null;
+  paidAltAmount: number | null;
+  purchasedAt: number;
+  deliveryMode: DeliveryMode;
+  deliveryKind: DeliveryKind;
+  workType: string | null;
+  ticketThreadId: string | null;
+  staffId: string | null;
+  invoiceId: number | null;
+  invoiceKind: string | null;
+  invoiceReason: string | null;
+  paidBy: string | null;
+  source: string;
+  migrationKey: string | null;
+}
+
 export class Shop {
   constructor(
     private readonly db: Database.Database,
@@ -400,6 +438,11 @@ export class Shop {
         completed_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_shop_role_revocations_status ON shop_role_revocations(status, updated_at);
+      -- shop_purchases が正本。1 purchase につき Discord購入ログoutboxは1件だけ積む。
+      CREATE TABLE IF NOT EXISTS shop_purchase_log_enqueues (
+        purchase_id INTEGER PRIMARY KEY REFERENCES shop_purchases(id) ON DELETE RESTRICT,
+        created_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS shop_timed_access_legacy_runs (
         migration_key TEXT PRIMARY KEY,
         plan_json TEXT NOT NULL,
@@ -478,6 +521,60 @@ export class Shop {
       delivery_data: item.delivery_data,
       captured_at: now(),
     });
+  }
+
+  private shopPurchaseLogPayload(
+    purchase: PurchaseRow,
+    item: ShopItemRow,
+    extra: ShopPurchaseLogExtra = {},
+  ): ShopPurchaseLogPayload {
+    return {
+      purchaseId: purchase.id,
+      transactionId: extra.transactionId ?? null,
+      itemId: item.id,
+      itemName: item.name,
+      userId: purchase.user_id,
+      paidLand: purchase.paid_land,
+      paidAltKind: purchase.paid_alt_kind,
+      paidAltAmount: purchase.paid_alt_amount,
+      purchasedAt: purchase.purchased_at,
+      deliveryMode: extra.deliveryMode ?? item.delivery,
+      deliveryKind: extra.deliveryKind === undefined ? item.delivery_kind : extra.deliveryKind,
+      workType: extra.workType ?? null,
+      ticketThreadId: extra.ticketThreadId ?? null,
+      staffId: extra.staffId ?? null,
+      invoiceId: extra.invoiceId ?? null,
+      invoiceKind: extra.invoiceKind ?? null,
+      invoiceReason: extra.invoiceReason ?? null,
+      paidBy: extra.paidBy ?? null,
+      source: extra.source ?? "shop_purchase",
+      migrationKey: extra.migrationKey ?? null,
+    };
+  }
+
+  /**
+   * 購入ログを purchase ID 単位で一度だけ outbox へ積む。
+   * Discord配送は別workerなので、API失敗で購入/支払いを巻き戻さない。
+   */
+  private enqueueShopPurchaseLog(
+    purchase: PurchaseRow,
+    item: ShopItemRow,
+    extra: ShopPurchaseLogExtra = {},
+  ): ShopPurchaseLogPayload {
+    const payload = this.shopPurchaseLogPayload(purchase, item, extra);
+    const body = () => {
+      const claimed = this.db
+        .prepare("INSERT OR IGNORE INTO shop_purchase_log_enqueues (purchase_id, created_at) VALUES (?, ?)")
+        .run(purchase.id, purchase.purchased_at);
+      if (claimed.changes === 1) {
+        this.db
+          .prepare("INSERT INTO outbox (kind, payload, created_at) VALUES ('shop_purchase_log', ?, ?)")
+          .run(JSON.stringify(payload), purchase.purchased_at);
+      }
+    };
+    if (this.db.inTransaction) body();
+    else this.db.transaction(body).immediate();
+    return payload;
   }
 
   private roleIdFromDelivery(snapshotJson: string | null | undefined, item?: ShopItemRow): { roleId?: string; error?: string } {
@@ -795,23 +892,26 @@ export class Shop {
         },
       });
 
-      const logPayload = JSON.stringify({
-        purchaseId: purchase.id,
+      const genericLog = this.enqueueShopPurchaseLog(purchase, item, {
         transactionId: transferred.tx.id,
-        itemId: item.id,
-        itemName: item.name,
-        userId: input.userId,
-        amount: invoice.amount,
+        deliveryMode: "manual",
+        deliveryKind: null,
+        workType: `original_role_invoice:${invoice.kind}`,
+        ticketThreadId: invoice.ticket_thread_id,
+        staffId: invoice.issued_by,
         invoiceId: invoice.id,
         invoiceKind: invoice.kind,
         invoiceReason: invoice.reason,
-        issuedBy: invoice.issued_by,
         paidBy: input.actor,
-        ticketThreadId: invoice.ticket_thread_id,
-        purchasedAt: ts,
+        source: "original_role_invoice",
       });
-      this.db.prepare("INSERT INTO outbox (kind, payload, created_at) VALUES ('shop_purchase_log', ?, ?)").run(logPayload, ts);
-      this.db.prepare("INSERT INTO outbox (kind, payload, created_at) VALUES ('original_role_ticket_receipt', ?, ?)").run(logPayload, ts);
+      // チケット内の領収記録は購入ログとは別用途なので、そのまま維持する。
+      const receiptPayload = JSON.stringify({
+        ...genericLog,
+        amount: invoice.amount,
+        issuedBy: invoice.issued_by,
+      });
+      this.db.prepare("INSERT INTO outbox (kind, payload, created_at) VALUES ('original_role_ticket_receipt', ?, ?)").run(receiptPayload, ts);
       return { purchase, item, transactionId: transferred.tx.id, replayed: false };
     };
     return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
@@ -853,6 +953,7 @@ export class Shop {
     let paidLand: number | null = null;
     let paidAltKind: string | null = null;
     let paidAltAmount: number | null = null;
+    let transactionId: number | null = null;
     const useAlt = input.payAlt && item.price_alt_kind && item.price_alt_amount;
     if (useAlt) {
       paidAltKind = item.price_alt_kind;
@@ -862,7 +963,7 @@ export class Shop {
       // Land を焼却
       const account = `user:${input.userId}`;
       this.ledger.ensureAccount(account, "user");
-      this.ledger.transfer({
+      const transferred = this.ledger.transfer({
         from: account,
         to: TREASURY,
         amount: item.price_land,
@@ -873,6 +974,7 @@ export class Shop {
         refId: String(item.id),
         idempotencyKey: input.idempotencyKey ?? `shop:purchase:${input.userId}:${item.id}:${ts}`,
       });
+      transactionId = transferred.tx.id;
       paidLand = item.price_land;
     }
 
@@ -905,6 +1007,7 @@ export class Shop {
       actor: input.userId,
       payload: { itemId: item.id, purchaseId: purchase.id, paidLand, paidAltKind, paidAltAmount, expiresAt },
     });
+    this.enqueueShopPurchaseLog(purchase, item, { transactionId });
     return { purchase, item, needsManualDelivery: item.delivery === "manual" };
   }
 
@@ -1977,6 +2080,12 @@ export class Shop {
             actor,
             startedAt,
           );
+          const importedPurchase = this.getPurchase(purchaseId)!;
+          this.enqueueShopPurchaseLog(importedPurchase, item, {
+            workType: "legacy_timed_access_import",
+            source: "legacy_timed_access_import",
+            migrationKey,
+          });
           this.events.log("shop_timed_access_legacy_imported", {
             actor,
             target: userId,

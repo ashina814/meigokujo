@@ -86,6 +86,13 @@ describe("original role service invoices", () => {
     const outbox = ctx.db.prepare("SELECT kind FROM outbox WHERE delivered_at IS NULL ORDER BY id").all() as Array<{kind:string}>;
     expect(outbox.map((r) => r.kind)).toContain("shop_purchase_log");
     expect(outbox.map((r) => r.kind)).toContain("original_role_ticket_receipt");
+    const purchaseLog = ctx.db.prepare("SELECT payload FROM outbox WHERE kind='shop_purchase_log'").get() as {payload:string};
+    const payload = JSON.parse(purchaseLog.payload) as Record<string, unknown>;
+    expect(payload.purchaseId).toBe(paid.purchase.id);
+    expect(payload.transactionId).toBe(paid.transactionId);
+    expect(payload.ticketThreadId).toBe("thread-1");
+    expect(payload.staffId).toBe("user:staff");
+    expect(payload.workType).toBe("original_role_invoice:new");
     ctx.db.close();
   });
 
@@ -98,6 +105,21 @@ describe("original role service invoices", () => {
     expect(second.replayed).toBe(true);
     expect(second.purchase.id).toBe(first.purchase.id);
     expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(before - 750_000);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM outbox WHERE kind='shop_purchase_log'").get() as {n:number}).n).toBe(1);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM outbox WHERE kind='original_role_ticket_receipt'").get() as {n:number}).n).toBe(1);
+    ctx.db.close();
+  });
+
+  it("支払い済みinvoiceとカルテはticket/case削除からRESTRICTで保護する", () => {
+    const ctx = setup();
+    const invoice = ctx.cases.issueInvoice({ threadId: "thread-1", kind: "new", amount: 750_000, actor: "user:staff" });
+    ctx.shop.purchaseOriginalRoleInvoice({ invoiceId: invoice.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [], idempotencyKey: `invoice:${invoice.id}` });
+    expect(() => ctx.db.prepare("DELETE FROM tickets WHERE thread_id='thread-1'").run()).toThrow();
+    expect(() => ctx.db.prepare("DELETE FROM original_role_cases WHERE id=?").run(ctx.serviceCase.id)).toThrow();
+    const kept = ctx.cases.invoice(invoice.id)!;
+    expect(kept.status).toBe("paid");
+    expect(kept.purchase_id).toBeTypeOf("number");
+    expect(kept.transaction_id).toBeTypeOf("number");
     ctx.db.close();
   });
 
@@ -144,6 +166,10 @@ describe("openDb migration", () => {
     expect((db.prepare("SELECT name FROM original_roles WHERE role_id='legacy-real-role'").get() as {name:string}).name).toBe("旧契約");
     expect((db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='original_role_cases'").get() as {name:string}).name).toBe("original_role_cases");
     expect((db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='original_role_invoices'").get() as {name:string}).name).toBe("original_role_invoices");
+    const caseFks = db.prepare("PRAGMA foreign_key_list(original_role_cases)").all() as Array<{table:string;from:string;on_delete:string}>;
+    const invoiceFks = db.prepare("PRAGMA foreign_key_list(original_role_invoices)").all() as Array<{table:string;from:string;on_delete:string}>;
+    expect(caseFks.find((fk) => fk.from === "ticket_thread_id")).toMatchObject({ table: "tickets", on_delete: "RESTRICT" });
+    expect(invoiceFks.find((fk) => fk.from === "case_id")).toMatchObject({ table: "original_role_cases", on_delete: "RESTRICT" });
     db.close();
     rmSync(dir, { recursive: true, force: true });
   });

@@ -859,7 +859,7 @@ CREATE TABLE IF NOT EXISTS original_role_renewals (
 -- オリジナルロールの人対応カルテ。既存 original_roles は契約/実ロール互換台帳として残す。
 CREATE TABLE IF NOT EXISTS original_role_cases (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
-  ticket_thread_id TEXT NOT NULL UNIQUE REFERENCES tickets(thread_id) ON DELETE CASCADE,
+  ticket_thread_id TEXT NOT NULL UNIQUE REFERENCES tickets(thread_id) ON DELETE RESTRICT,
   user_id          TEXT NOT NULL,
   original_role_id INTEGER UNIQUE REFERENCES original_roles(id),
   created_by       TEXT NOT NULL,
@@ -871,7 +871,7 @@ CREATE INDEX IF NOT EXISTS idx_original_role_cases_user ON original_role_cases(u
 -- 金額と意味を分離して明示保存する。Botは金額から new/continuation/restart を推測しない。
 CREATE TABLE IF NOT EXISTS original_role_invoices (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
-  case_id        INTEGER NOT NULL REFERENCES original_role_cases(id) ON DELETE CASCADE,
+  case_id INTEGER NOT NULL REFERENCES original_role_cases(id) ON DELETE RESTRICT,
   user_id        TEXT NOT NULL,
   kind           TEXT NOT NULL CHECK (kind IN ('new','continuation','restart','exception')),
   amount         INTEGER NOT NULL CHECK (amount > 0),
