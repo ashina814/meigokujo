@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import type { EventLog } from "../events/service.js";
 import type { OriginalRoleRow } from "./service.js";
+import { Settings } from "../settings/service.js";
 
 export const ORIGINAL_ROLE_TICKET_PANEL_ID = "original_role";
 export const ORIGINAL_ROLE_NEW_BASELINE_LAND = 750_000;
@@ -48,6 +49,7 @@ export type OriginalRoleCaseErrorCode =
   | "ERR_INVOICE_NOT_PENDING"
   | "ERR_INVOICE_OWNER_MISMATCH"
   | "ERR_INVALID_INVOICE_AMOUNT"
+  | "ERR_INVOICE_NEEDS_APPROVAL"
   | "ERR_EXCEPTION_REASON_REQUIRED";
 
 export class OriginalRoleCaseError extends Error {
@@ -67,10 +69,14 @@ const now = () => Math.floor(Date.now() / 1000);
  * いくら請求したか」を別に保存する。金額から請求種別を推測しない。
  */
 export class OriginalRoleCases {
+  private readonly settings: Settings;
+
   constructor(
     private readonly db: Database.Database,
     private readonly events: EventLog,
-  ) {}
+  ) {
+    this.settings = new Settings(db);
+  }
 
   get(id: number): OriginalRoleCaseRow | undefined {
     return this.db.prepare("SELECT * FROM original_role_cases WHERE id = ?").get(id) as OriginalRoleCaseRow | undefined;
@@ -186,6 +192,15 @@ export class OriginalRoleCases {
     }
     const reason = input.reason?.trim() || null;
     if (input.kind === "exception" && !reason) throw new OriginalRoleCaseError("ERR_EXCEPTION_REASON_REQUIRED");
+    const approvalThreshold = this.settings.getNumber("approval_threshold");
+    // Ledger.transfer と同じ境界: threshold ちょうどは承認不要、超過だけ承認必須。
+    // この請求フローには approvedBy を渡す経路を作らないため、支払不能なpending invoiceを先に作らない。
+    if (input.amount > approvalThreshold) {
+      throw new OriginalRoleCaseError("ERR_INVOICE_NEEDS_APPROVAL", {
+        amount: input.amount,
+        threshold: approvalThreshold,
+      });
+    }
     if (this.pendingInvoiceByCase(serviceCase.id)) {
       throw new OriginalRoleCaseError("ERR_PENDING_INVOICE_EXISTS", { caseId: serviceCase.id });
     }

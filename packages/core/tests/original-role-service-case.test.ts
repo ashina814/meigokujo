@@ -11,6 +11,7 @@ import {
   OriginalRoles,
   Shop,
   ShopError,
+  Settings,
   Tickets,
   TREASURY,
   openDb,
@@ -24,7 +25,8 @@ const OTHER = "222222222222222222";
 function setup() {
   const db = openDb(":memory:");
   const events = new EventLog(db);
-  const ledger = new Ledger(db);
+  const settings = new Settings(db);
+  const ledger = new Ledger(db, { approvalThreshold: () => settings.getNumber("approval_threshold") });
   const tickets = new Tickets(db, events);
   const roles = new OriginalRoles(db, ledger, events);
   const cases = new OriginalRoleCases(db, events);
@@ -44,7 +46,7 @@ function setup() {
   const panel = tickets.defaultPanel("original_role")!;
   tickets.create("thread-1", USER, "original_role", { id: panel.id, name: panel.name, notifyRoleIds: [], staffRoleIds: [] });
   const serviceCase = cases.ensureCase("thread-1", USER, "user:staff");
-  return { db, events, ledger, tickets, roles, cases, shop, item, serviceCase };
+  return { db, events, settings, ledger, tickets, roles, cases, shop, item, serviceCase };
 }
 
 describe("original role service invoices", () => {
@@ -61,6 +63,51 @@ describe("original role service invoices", () => {
     expect(() => ctx.cases.issueInvoice({ threadId: "thread-1", kind: "exception", amount: 123_456, actor: "user:staff" })).toThrow(OriginalRoleCaseError);
     const invoice = ctx.cases.issueInvoice({ threadId: "thread-1", kind: "exception", amount: 123_456, reason: "個別調整", actor: "user:staff" });
     expect(invoice.reason).toBe("個別調整");
+    ctx.db.close();
+  });
+
+  it("approval thresholdちょうどの請求は発行でき、本人が支払える", () => {
+    const ctx = setup();
+    ctx.settings.set("approval_threshold", 750_000, "test");
+    const invoice = ctx.cases.issueInvoice({ threadId: "thread-1", kind: "new", amount: 750_000, actor: "user:staff" });
+    const before = ctx.ledger.balanceOf(`user:${USER}`);
+    const paid = ctx.shop.purchaseOriginalRoleInvoice({ invoiceId: invoice.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [], idempotencyKey: `threshold-equal:${invoice.id}` });
+    expect(paid.purchase.paid_land).toBe(750_000);
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(before - 750_000);
+    expect(ctx.cases.invoice(invoice.id)?.status).toBe("paid");
+    ctx.db.close();
+  });
+
+  it("approval threshold超は標準/例外ともpending invoiceを作らずLandも動かさない", () => {
+    const ctx = setup();
+    ctx.settings.set("approval_threshold", 749_999, "test");
+    const beforeBalance = ctx.ledger.balanceOf(`user:${USER}`);
+    const beforeInvoices = (ctx.db.prepare("SELECT COUNT(*) AS n FROM original_role_invoices").get() as { n: number }).n;
+    const beforePurchases = ctx.shop.countPurchases();
+    const beforeTransactions = (ctx.db.prepare("SELECT COUNT(*) AS n FROM transactions").get() as { n: number }).n;
+
+    let standardError: unknown;
+    try {
+      ctx.cases.issueInvoice({ threadId: "thread-1", kind: "new", amount: 750_000, actor: "user:staff" });
+    } catch (error) {
+      standardError = error;
+    }
+    expect(standardError).toBeInstanceOf(OriginalRoleCaseError);
+    expect((standardError as OriginalRoleCaseError).code).toBe("ERR_INVOICE_NEEDS_APPROVAL");
+    expect((standardError as OriginalRoleCaseError).details).toMatchObject({ amount: 750_000, threshold: 749_999 });
+
+    expect(() => ctx.cases.issueInvoice({
+      threadId: "thread-1",
+      kind: "exception",
+      amount: 750_000,
+      reason: "閾値超の例外",
+      actor: "user:staff",
+    })).toThrowError(OriginalRoleCaseError);
+
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM original_role_invoices").get() as { n: number }).n).toBe(beforeInvoices);
+    expect(ctx.shop.countPurchases()).toBe(beforePurchases);
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM transactions").get() as { n: number }).n).toBe(beforeTransactions);
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(beforeBalance);
     ctx.db.close();
   });
 

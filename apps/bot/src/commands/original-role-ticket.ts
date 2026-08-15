@@ -62,6 +62,13 @@ function baselineContinuation(services: Services): number {
   return Number.isSafeInteger(raw) && raw > 0 ? raw : ORIGINAL_ROLE_CONTINUATION_BASELINE_LAND;
 }
 
+function invoiceApprovalBlockMessage(error: unknown, amount: number): string | null {
+  if (!(error instanceof OriginalRoleCaseError) || error.code !== "ERR_INVOICE_NEEDS_APPROVAL") return null;
+  const threshold = Number(error.details.threshold);
+  const thresholdLabel = Number.isFinite(threshold) ? fmtLd(threshold) : "現在の高額承認閾値";
+  return `請求額 ${fmtLd(amount)} は高額承認閾値 ${thresholdLabel} を超えるため発行できません。**請求は作成していません。** 金額または設定価格を閾値以下にしてください。`;
+}
+
 export function originalRoleTicketControlRow() {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId("orole:invoice").setLabel("請求を出す").setStyle(ButtonStyle.Success),
@@ -163,6 +170,11 @@ async function issueStandard(
     await interaction.reply({ content: `請求 #${invoice.id} を発行しました。`, flags: MessageFlags.Ephemeral });
     await postInvoice(interaction, invoice);
   } catch (error) {
+    const approvalBlocked = invoiceApprovalBlockMessage(error, amount);
+    if (approvalBlocked) {
+      await interaction.reply({ content: approvalBlocked, flags: MessageFlags.Ephemeral });
+      return;
+    }
     const pending = services.originalRoleCases.pendingInvoiceByTicket(ticket.thread_id);
     await interaction.reply({
       content: pending ? `未払いの請求 #${pending.id} があるため、新しい請求は出していません。既存請求を再掲します。` : `請求を発行できませんでした: ${String(error)}`,
@@ -382,9 +394,10 @@ export async function handleOriginalRoleTicketModal(interaction: ModalSubmitInte
     await interaction.reply({ content: `例外請求 #${invoice.id} を発行しました。`, flags: MessageFlags.Ephemeral });
     await postInvoice(interaction, invoice);
   } catch (error) {
-    const message = error instanceof OriginalRoleCaseError && error.code === "ERR_PENDING_INVOICE_EXISTS"
-      ? "未払い請求があるため、新しい請求は出していません。"
-      : "例外請求を発行できませんでした。";
+    const message = invoiceApprovalBlockMessage(error, amount)
+      ?? (error instanceof OriginalRoleCaseError && error.code === "ERR_PENDING_INVOICE_EXISTS"
+        ? "未払い請求があるため、新しい請求は出していません。"
+        : "例外請求を発行できませんでした。");
     await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
   }
   return true;

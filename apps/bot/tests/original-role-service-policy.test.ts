@@ -26,6 +26,13 @@ describe("original role human-service policy", () => {
     expect(ticket).toContain("setRequired(true)");
   });
 
+  it("unpayable high-value invoices are blocked at issue time with a clear staff message", () => {
+    expect(ticket).toContain("ERR_INVOICE_NEEDS_APPROVAL");
+    expect(ticket).toContain("請求は作成していません");
+    expect(ticket).toContain("金額または設定価格を閾値以下にしてください");
+    expect(ticket).toContain('error.code === "ERR_NEEDS_APPROVAL"');
+  });
+
   it("legacy real role can be linked without purchase inference", () => {
     expect(ticket).toContain("実ロールをカルテ登録");
     expect(ticket).toContain("expiresAt: null");
