@@ -6,6 +6,7 @@ const root = resolve(import.meta.dirname, "..");
 const shop = readFileSync(resolve(root, "src/commands/shop-panel.ts"), "utf8");
 const userUi = readFileSync(resolve(root, "src/commands/original-role.ts"), "utf8");
 const ticket = readFileSync(resolve(root, "src/commands/original-role-ticket.ts"), "utf8");
+const cases = readFileSync(resolve(root, "../../packages/core/src/original-role/cases.ts"), "utf8");
 const jobs = readFileSync(resolve(root, "src/original-role-jobs.ts"), "utf8");
 const legacyAdmin = readFileSync(resolve(root, "src/commands/original-role-admin.ts"), "utf8");
 
@@ -31,6 +32,8 @@ describe("original role human-service policy", () => {
     expect(ticket).toContain("請求は作成していません");
     expect(ticket).toContain("金額または設定価格を閾値以下にしてください");
     expect(ticket).toContain('error.code === "ERR_NEEDS_APPROVAL"');
+    expect(cases).toContain('if (input.amount > approvalThreshold)');
+    expect(cases).not.toContain('if (input.amount >= approvalThreshold)');
   });
 
   it("legacy real role can be linked without purchase inference", () => {
