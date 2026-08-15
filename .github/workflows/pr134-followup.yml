@@ -1,0 +1,61 @@
+name: PR134 purchase log follow-up
+
+on:
+  push:
+    branches: [agent/original-role-service-and-purchase-log]
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/original-role-service-and-purchase-log
+          fetch-depth: 0
+
+      - name: Apply follow-up
+        run: |
+          cp tools/pr134-followup.py /tmp/pr134-followup.py
+          python /tmp/pr134-followup.py
+          count=$(grep -R "INSERT INTO shop_purchases" packages/core/src apps/bot/src --include='*.ts' | wc -l)
+          echo "shop_purchases source insert sites: $count"
+          grep -R "INSERT INTO shop_purchases" packages/core/src apps/bot/src --include='*.ts' || true
+          test "$count" -eq 3
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Targeted tests
+        run: |
+          pnpm --filter @meigokujo/core exec vitest run tests/shop-purchase-log.test.ts tests/original-role-service-case.test.ts
+          pnpm --filter @meigokujo/bot exec vitest run tests/shop-purchase-log-format.test.ts
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Full tests
+        run: pnpm -r test
+
+      - name: Commit verified follow-up
+        run: |
+          rm -f .github/workflows/pr134-followup.yml tools/pr134-followup.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git status --short
+          git commit -m "fix(shop): log all purchases and retain original-role history" \
+            -m "Generalize shop purchase outbox logging across all shop_purchases creation paths and make original-role audit foreign keys restrictive."
+          git push origin HEAD:agent/original-role-service-and-purchase-log
