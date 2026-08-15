@@ -1,0 +1,111 @@
+name: nickname manageability investigation
+
+on:
+  push:
+    branches:
+      - fix/shop-nickname-manageability
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/shop-nickname-manageability
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Reproduce current preflight defects
+        run: |
+          cat > apps/bot/tests/_nickname-preflight-baseline.test.ts <<'EOF'
+          import { describe, expect, it } from "vitest";
+
+          process.env.DISCORD_TOKEN = process.env.DISCORD_TOKEN ?? "test-token";
+          process.env.CLIENT_ID = process.env.CLIENT_ID ?? "test-client";
+          process.env.OWNER_ID = process.env.OWNER_ID ?? "test-owner";
+
+          const delivery = import("../src/shop-delivery.js");
+
+          describe("current nickname preflight defect reproduction", () => {
+            it("hierarchy below still passes preflight even when the bot lacks ManageNicknames", async () => {
+              const { nicknameBlockReason } = await delivery;
+              const guild = {
+                ownerId: "owner",
+                members: {
+                  me: {
+                    permissions: { has: () => false },
+                    roles: { highest: { id: "bot", position: 100 } },
+                  },
+                },
+              };
+              const member = {
+                id: "user",
+                manageable: true,
+                roles: { highest: { id: "target", position: 10 } },
+              };
+              expect(nicknameBlockReason(guild as never, member as never)).toBeNull();
+            });
+
+            it("current helper ignores Discord.js manageable and trusts its own position comparison", async () => {
+              const { nicknameBlockReason } = await delivery;
+              const guild = {
+                ownerId: "owner",
+                members: {
+                  me: {
+                    permissions: { has: () => true },
+                    roles: { highest: { id: "bot", position: 100 } },
+                  },
+                },
+              };
+              const member = {
+                id: "user",
+                manageable: false,
+                roles: { highest: { id: "target", position: 10 } },
+              };
+              expect(nicknameBlockReason(guild as never, member as never)).toBeNull();
+            });
+          });
+          EOF
+          pnpm --filter @meigokujo/bot exec vitest run tests/_nickname-preflight-baseline.test.ts
+          rm apps/bot/tests/_nickname-preflight-baseline.test.ts
+
+      - name: Apply minimal fix
+        run: |
+          cp tools/nickname-manageability-fix.py /tmp/nickname-manageability-fix.py
+          python /tmp/nickname-manageability-fix.py
+          git diff --check
+
+      - name: Targeted nickname tests
+        run: pnpm --filter @meigokujo/bot exec vitest run tests/shop-nickname.test.ts
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Full tests
+        run: pnpm -r test
+
+      - name: Commit verified fix only
+        run: |
+          rm -f tools/nickname-manageability-fix.py .github/workflows/nickname-manageability-fix.yml
+          git diff --check
+          git status --short
+          git config user.name "ashina"
+          git config user.email "tajitajifj0133@gmail.com"
+          git add -A
+          git diff --cached --stat
+          git commit -m "fix(shop): use Discord manageability for nickname changes"
+          git push origin HEAD:fix/shop-nickname-manageability
