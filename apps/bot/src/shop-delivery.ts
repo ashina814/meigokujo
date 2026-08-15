@@ -1,4 +1,4 @@
-import type { Guild, GuildMember, Role } from "discord.js";
+import { PermissionFlagsBits, type Guild, type GuildMember, type Role } from "discord.js";
 import {
   AUTO_DELIVERABLE_KINDS,
   roleToRestoreForStatus,
@@ -81,7 +81,7 @@ export function parseRequest(json: string | null): Record<string, unknown> | nul
  */
 export function nicknameBlockReason(
   guild: Pick<Guild, "ownerId"> & { members: { me: GuildMember | null } },
-  member: Pick<GuildMember, "id"> & { roles: { highest: { position: number } } },
+  member: Pick<GuildMember, "id" | "manageable">,
 ): { reason: string; message: string } | null {
   if (guild.ownerId === member.id) {
     return {
@@ -91,10 +91,18 @@ export function nicknameBlockReason(
   }
   const me = guild.members.me;
   if (!me) return { reason: "bot_member_unavailable", message: "Bot自身の情報が取れないため変更できません。" };
-  if (me.roles.highest.position <= member.roles.highest.position) {
+  if (!me.permissions.has(PermissionFlagsBits.ManageNicknames)) {
+    return {
+      reason: "missing_manage_nicknames",
+      message: "Botに「ニックネームの管理」権限がないため、現在は名前を変更できません。運営にご相談ください。",
+    };
+  }
+  // Discord.js が owner / bot自身 / ロール順序まで含めて算出する manageability を正本にする。
+  // 独自の position 数値比較を重ねると、ライブラリ側の判定と二重管理になる。
+  if (!member.manageable) {
     return {
       reason: "role_hierarchy",
-      message: "あなたのロールがBotより上位のため、Botからは変更できません。運営にご相談ください。",
+      message: "Discord上のロール階層によりBotから管理できないため、名前を変更できません。運営にご相談ください。",
     };
   }
   return null;
@@ -278,7 +286,34 @@ export async function deliverPurchaseUnlocked(
       const setError = await member
         .setNickname(wanted, "公式ショップ: 名前変更")
         .then(() => null)
-        .catch((e: Error) => e.message || "unknown");
+        .catch((e: unknown) => {
+          const message = e instanceof Error ? e.message || "unknown" : String(e);
+          const code =
+            typeof e === "object" && e !== null && "code" in e
+              ? String((e as { code?: unknown }).code ?? "") || null
+              : null;
+          const me = guild.members.me;
+          try {
+            services.events.log("shop_nickname_set_failed", {
+              actor,
+              target: userId,
+              payload: {
+                purchaseId: purchase.id,
+                error: message,
+                code,
+                memberManageable: member.manageable,
+                botHasManageNicknames: me?.permissions.has(PermissionFlagsBits.ManageNicknames) ?? false,
+                botHighestRoleId: me?.roles.highest.id ?? null,
+                botHighestRolePosition: me?.roles.highest.position ?? null,
+                memberHighestRoleId: member.roles.highest.id,
+                memberHighestRolePosition: member.roles.highest.position,
+              },
+            });
+          } catch {
+            // 診断ログの失敗で既存の返金・収束経路を壊さない。
+          }
+          return message;
+        });
       if (setError !== null) {
         // **エラーが返っても、変わっていることがある。** 応答が落ちただけ・内部再試行で
         // 通っていた、など。ここで確かめずに取り消すと「名前は変わったのに返金もした」に

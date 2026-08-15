@@ -377,12 +377,33 @@ function checkNicknameBeforeCharge(
  */
 function nicknamePreflight(
   interaction: ButtonInteraction | ModalSubmitInteraction,
+  services: Services,
 ): { ok: true; member: GuildMember } | { ok: false; message: string } {
   const guild = interaction.guild;
   const member = interaction.member as GuildMember | null;
   if (!guild || !member) return { ok: false, message: "サーバー内で実行してください。" };
   const blocked = nicknameBlockReason(guild, member);
-  return blocked ? { ok: false, message: blocked.message } : { ok: true, member };
+  if (!blocked) return { ok: true, member };
+
+  const me = guild.members.me;
+  try {
+    services.events.log("shop_nickname_preflight_blocked", {
+      actor: `user:${interaction.user.id}`,
+      target: member.id,
+      payload: {
+        reason: blocked.reason,
+        guildId: guild.id,
+        memberManageable: blocked.reason === "bot_member_unavailable" ? null : member.manageable,
+        botHighestRoleId: me?.roles.highest.id ?? null,
+        botHighestRolePosition: me?.roles.highest.position ?? null,
+        memberHighestRoleId: member.roles.highest.id,
+        memberHighestRolePosition: member.roles.highest.position,
+      },
+    });
+  } catch {
+    // 診断ログの失敗で購入前ガード自体を壊さない。
+  }
+  return { ok: false, message: blocked.message };
 }
 
 function nicknameModal(itemId: number, current: string) {
@@ -994,7 +1015,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       await interaction.reply({ content: "この商品はいま購入できません。", flags: MessageFlags.Ephemeral });
       return;
     }
-    const pre = nicknamePreflight(interaction);
+    const pre = nicknamePreflight(interaction, services);
     if (!pre.ok) {
       await interaction.reply({ content: `⚠️ ${pre.message}`, flags: MessageFlags.Ephemeral });
       return;
@@ -1013,7 +1034,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       await interaction.update({ content: "この商品はいま購入できません。", embeds: [], components: [] });
       return;
     }
-    const pre = nicknamePreflight(interaction);
+    const pre = nicknamePreflight(interaction, services);
     if (!pre.ok) {
       await interaction.update({ content: `⚠️ ${pre.message}`, embeds: [], components: [] });
       return;
@@ -1489,7 +1510,7 @@ export async function handleShopModal(interaction: ModalSubmitInteraction, servi
     await interaction.reply({ content: "この商品はいま購入できません。", flags: MessageFlags.Ephemeral });
     return;
   }
-  const pre = nicknamePreflight(interaction);
+  const pre = nicknamePreflight(interaction, services);
   if (!pre.ok) {
     await interaction.reply({ content: `⚠️ ${pre.message}`, flags: MessageFlags.Ephemeral });
     return;
