@@ -22,6 +22,17 @@ jobs:
           cp tools/pr134-followup.py /tmp/pr134-followup.py
           sed -i 's/case_id        INTEGER NOT NULL REFERENCES original_role_cases(id) ON DELETE CASCADE,/case_id INTEGER NOT NULL REFERENCES original_role_cases(id) ON DELETE CASCADE,/' packages/core/src/db/bootstrap.ts
           python /tmp/pr134-followup.py
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('apps/bot/src/outbox.ts')
+          text = p.read_text()
+          text = text.replace(
+              'const work = p.workType ?? [p.deliveryMode, p.deliveryKind].filter(Boolean).join(" / ") || "未指定";',
+              'const work = p.workType ?? ([p.deliveryMode, p.deliveryKind].filter(Boolean).join(" / ") || "未指定");',
+          )
+          text = text.replace('].filter(Boolean).join("\n");', '].filter(Boolean).join("\\n");')
+          p.write_text(text)
+          PY
           count=$(grep -R "INSERT INTO shop_purchases" packages/core/src apps/bot/src --include='*.ts' | wc -l)
           echo "shop_purchases source insert sites: $count"
           grep -R "INSERT INTO shop_purchases" packages/core/src apps/bot/src --include='*.ts' || true
