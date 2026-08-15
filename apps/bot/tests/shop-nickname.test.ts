@@ -2,12 +2,13 @@ import { describe, expect, it, vi } from "vitest";
 import { Collection } from "discord.js";
 import { EventLog, Ledger, Nicknames, OriginalRoles, Settings, Shop, SubAccounts, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
+import { meetsRoleRequirement } from "../src/rank-requirement.js";
 
 /**
  * 名前変更のセルフサービス。
  *
  * 通常のケースでスタッフの仕事を作らないことが要点。
- * - **課金前に分かる不可**（サーバー所有者・Botより上位ロール）は無課金で止める
+ * - **課金前に分かる不可**（所有者・Bot権限不足・Discord manageability不可）は無課金で止める
  * - 課金後に変更できなかったら**自分で返金して**終わらせる
  * - 「処理失敗」に残すのは、**返金まで失敗して自力で収束できなかったとき**だけ
  */
@@ -65,6 +66,12 @@ function world(
     owner?: boolean;
     myPosition?: number;
     theirPosition?: number;
+    /** Discord.js GuildMember.manageable の判定。未指定なら旧テスト互換でpositionから算出 */
+    manageable?: boolean;
+    /** Botが ManageNicknames を持つか。Administrator相当を含む has() の結果 */
+    botCanManageNicknames?: boolean;
+    /** 対象が持つ複数ロール。業務ロール名に依存しない回帰用 */
+    roleIds?: string[];
     setFails?: string;
     /** 最初の N 回だけ失敗する（一時的な失敗＝そのあと成功する、を作る） */
     failCalls?: number;
@@ -89,7 +96,13 @@ function world(
     get displayName() {
       return state.nickname ?? globalName;
     },
-    roles: { cache: new Collection(), highest: { position: opts.theirPosition ?? 10 } },
+    roles: {
+      cache: new Collection((opts.roleIds ?? []).map((id) => [id, true])),
+      highest: { id: "target-highest", position: opts.theirPosition ?? 10 },
+    },
+    get manageable() {
+      return opts.manageable ?? (!opts.owner && (opts.myPosition ?? 100) > (opts.theirPosition ?? 10));
+    },
     setNickname: vi.fn(async (name: string) => {
       if (opts.setDelayMs) await new Promise((r) => setTimeout(r, opts.setDelayMs));
       if (state.fails && state.failCalls > 0) {
@@ -105,7 +118,11 @@ function world(
     id: "g1",
     ownerId: opts.owner ? USER : OWNER,
     members: {
-      me: { roles: { highest: { position: opts.myPosition ?? 100 } } },
+      me: {
+        id: "bot",
+        permissions: { has: vi.fn(() => opts.botCanManageNicknames ?? true) },
+        roles: { highest: { id: "bot-highest", position: opts.myPosition ?? 100 } },
+      },
       fetch: vi.fn(async () => member),
     },
   };
@@ -183,6 +200,61 @@ describe("課金前に止まるケース（スタッフの仕事にしない）"
     ctx.db.close();
   });
 
+  it("BotにManage Nicknames権限がなければ課金前に止める", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ botCanManageNicknames: false, manageable: true });
+    const interaction = pressInteraction(ctx, `shop:nick:${ctx.item.id}`, w) as unknown as {
+      reply: ReturnType<typeof vi.fn>;
+      showModal: ReturnType<typeof vi.fn>;
+    };
+    const before = balance(ctx);
+
+    await handleShopButton(interaction as never, ctx.services);
+
+    expect(contentOf(interaction.reply)).toContain("ニックネームの管理");
+    expect(interaction.showModal).not.toHaveBeenCalled();
+    expect(balance(ctx)).toBe(before);
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    expect(ctx.events.listByType("shop_nickname_preflight_blocked")).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("Discord.js manageable=falseなら自前position値が下位でも課金前に止める", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({ myPosition: 100, theirPosition: 10, manageable: false });
+    const interaction = pressInteraction(ctx, `shop:nick:${ctx.item.id}`, w) as unknown as {
+      reply: ReturnType<typeof vi.fn>;
+      showModal: ReturnType<typeof vi.fn>;
+    };
+
+    await handleShopButton(interaction as never, ctx.services);
+
+    expect(contentOf(interaction.reply)).toContain("ロール階層");
+    expect(interaction.showModal).not.toHaveBeenCalled();
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  it("Discord.js manageable=trueなら独自position比較で上書きしない", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    // contract test: manageabilityを正本にし、positionの二重判定を復活させない。
+    const w = world({ myPosition: 5, theirPosition: 50, manageable: true });
+    const interaction = pressInteraction(ctx, `shop:nick:${ctx.item.id}`, w) as unknown as {
+      reply: ReturnType<typeof vi.fn>;
+      showModal: ReturnType<typeof vi.fn>;
+    };
+
+    await handleShopButton(interaction as never, ctx.services);
+
+    expect(interaction.showModal).toHaveBeenCalledTimes(1);
+    expect(interaction.reply).not.toHaveBeenCalled();
+    expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    ctx.db.close();
+  });
+
   it("入力が不正なら無課金で止まる", async () => {
     const { handleShopModal } = await shopPanelModule;
     const ctx = setup();
@@ -204,6 +276,37 @@ describe("課金前に止まるケース（スタッフの仕事にしない）"
 });
 
 describe("通常の流れ", () => {
+  it("魔人 + 別業務ロールでも亡霊以上の購入資格を満たす（manageabilityとは別判定）", () => {
+    const ctx = setup();
+    ctx.settings.set("role:ghost", "role-ghost", "test");
+    ctx.settings.set("role:majin", "role-majin", "test");
+    ctx.settings.set("role:kenma", "role-kenma", "test");
+    ctx.settings.set("role:mazoku", "role-mazoku", "test");
+
+    expect(meetsRoleRequirement(ctx.settings, ["role-majin", "role-shop-manager"], "role-ghost")).toBe(true);
+    ctx.db.close();
+  });
+
+  it("Botより下位の複数ロールを持つユーザーは正常に変更できる", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const w = world({
+      nickname: "まえ",
+      myPosition: 100,
+      theirPosition: 40,
+      manageable: true,
+      roleIds: ["role-majin", "role-shop-manager", "role-extra"],
+    });
+
+    await handleShopButton(pressInteraction(ctx, nickDo(ctx, "multi-role", "あたらしい"), w), ctx.services);
+
+    expect(w.state.nickname).toBe("あたらしい");
+    expect(w.member.setNickname).toHaveBeenCalledTimes(1);
+    expect(balance(ctx)).toBe(1_000_000 - PRICE);
+    expect(ctx.shop.listUserPurchases(USER)[0]?.delivery_state).toBe("delivered");
+    ctx.db.close();
+  });
+
   it("入力 → 確認 → 変更する で完了する", async () => {
     const { handleShopModal, handleShopButton } = await shopPanelModule;
     const ctx = setup();
@@ -269,6 +372,7 @@ describe("課金後に変更できなかったとき", () => {
     const purchase = ctx.shop.listUserPurchases(USER)[0]!;
     expect(purchase.status).toBe("refunded");
     expect(ctx.events.listByType("shop_refunded")).toHaveLength(1);
+    expect(ctx.events.listByType("shop_nickname_set_failed")).toHaveLength(1);
     // 「処理失敗」には出ない（自分で収束したので人の出番が無い）
     expect(ctx.shop.listUndeliveredAuto(10)).toHaveLength(0);
     ctx.db.close();
