@@ -76,56 +76,42 @@ export function validateRoleName(raw: string): string | null {
  * 商品#7 の詳細に出す操作。**状態によって出すものを変える**ので、
  * 利用者は「いま自分が何をすればいいか」だけを見る。
  */
-export function originalRoleActions(services: Services, item: ShopItemRow, userId: string) {
-  const rows = services.originalRoles.listByUser(userId);
-  const pending = rows.find((r) => r.status === "pending");
-  const approved = rows.find((r) => r.status === "approved");
-  const active = rows.filter((r) => r.status === "active");
-  const buttons: ButtonBuilder[] = [];
-  const notes: string[] = [];
+export function originalRoleActions(services: Services, _item: ShopItemRow, userId: string) {
+  const cases = services.originalRoleCases.listByUser(userId);
+  const buttons: ButtonBuilder[] = [
+    new ButtonBuilder()
+      .setCustomId("ticket:open:original_role")
+      .setLabel("新しいオリロを相談する")
+      .setEmoji("🎨")
+      .setStyle(ButtonStyle.Primary),
+  ];
+  const notes: string[] = [
+    "オリジナルロールは**商館スタッフと相談して進める商品**です。",
+    "ロール名・色・グラデーション・作成/付与・継続/再開の扱いは、専用チケットで決めます。",
+    "**ここでは課金しません。** スタッフがチケット内で請求を出した場合だけ、本人が支払えます。",
+  ];
 
-  if (approved) {
-    notes.push(
-      `✅ 申請 **${approved.name}** が承認されています。下のボタンから ${fmtLd(item.price_land ?? 0)} をお支払いください。`,
-      `-# 承認から **${ORIGINAL_ROLE_PAYMENT_GRACE_DAYS}日** を過ぎると申請は取り消されます。`,
-    );
-    buttons.push(
-      new ButtonBuilder()
-        // **表示した額を確定まで持たせる**（押した時の最新価格で引かない）。
-        // 画面ごとの鍵で、二度押しは1回にまとまり、開き直せば新しい挑戦になる
-        .setCustomId(`shop:orole-pay:${item.id}:${approved.id}:${item.price_land ?? 0}:${payAttemptToken()}`)
-        .setLabel(`支払って作成する (${fmtLd(item.price_land ?? 0)})`)
-        .setEmoji("💰")
-        .setStyle(ButtonStyle.Success),
-    );
-  } else if (pending) {
-    notes.push(`⏳ 申請 **${pending.name}** は運営の確認待ちです。結果はDMでお知らせします。`);
-  } else {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId(`shop:orole-apply:${item.id}`)
-        .setLabel("申請する")
-        .setEmoji("🎨")
-        .setStyle(ButtonStyle.Primary),
-    );
-    notes.push("-# 申請の時点では課金しません。運営が承認したあとに支払いへ進みます。");
+  for (const serviceCase of cases) {
+    const ticket = services.tickets.get(serviceCase.ticket_thread_id);
+    const linked = serviceCase.original_role_id ? services.originalRoles.get(serviceCase.original_role_id) : undefined;
+    const label = linked?.name ?? `相談 #${serviceCase.id}`;
+    if (ticket?.status === "closed") {
+      if (buttons.length < 5) {
+        buttons.push(
+          new ButtonBuilder()
+            .setCustomId(`shop:orole-resume:${serviceCase.id}`)
+            .setLabel(`${label.slice(0, 45)}を再開`)
+            .setStyle(ButtonStyle.Secondary),
+        );
+      }
+    } else if (ticket) {
+      notes.push(`・**${label}** — 対応中 <#${ticket.thread_id}>`);
+    }
   }
-
-  if (active.length > 0) {
-    notes.push(
-      "",
-      `**契約中のオリジナルロール ${active.length}件**`,
-      ...active.map((r) => `・<@&${r.role_id ?? ""}> 期限 <t:${r.expires_at ?? 0}:D>`),
-    );
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId(`shop:orole-renew:${item.id}`)
-        .setLabel(`更新する (${fmtLd(renewPrice(services))})`)
-        .setEmoji("♻️")
-        .setStyle(ButtonStyle.Secondary),
-    );
+  if (cases.some((c) => services.tickets.get(c.ticket_thread_id)?.status === "closed")) {
+    notes.push("-# 過去のカルテは新しく作り直さず、上の「再開」から同じチケットを使います。");
   }
-  return { notes, components: buttons.length > 0 ? [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)] : [] };
+  return { notes, components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)] };
 }
 
 export function applyModal(itemId: number) {

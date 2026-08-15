@@ -14,7 +14,7 @@ import {
   type PrivateThreadChannel,
   type TextChannel,
 } from "discord.js";
-import type { TicketKind, TicketPanel, TicketRow } from "@meigokujo/core";
+import { ORIGINAL_ROLE_TICKET_PANEL_ID, type TicketKind, type TicketPanel, type TicketRow } from "@meigokujo/core";
 import { isAdmin } from "../permissions.js";
 import { REEVAL_PANEL_ID, linkReevalPurchase, reevalActionRow } from "./reeval.js";
 import { RETURN_PANEL_ID, returnActionRow, returnContextEmbed, returnTicketIntro } from "./entry-return.js";
@@ -110,6 +110,15 @@ export function buildTicketOpeningMessage(
     extraEmbeds.push(returnContextEmbed(services, requesterId, requesterMember));
     extraLines.push("", returnTicketIntro(services, requesterId));
   }
+  if (panel.id === ORIGINAL_ROLE_TICKET_PANEL_ID) {
+    extraRows.push(...panelExtraRows(services, panel.id));
+    extraLines.push(
+      "",
+      "🎨 **このスレッドが、このオリジナルロール専用のカルテです。**",
+      "制作・継続・再開・今後の相談も、毎月新しいチケットを作らずここへ残します。",
+      "請求の意味と金額は商館スタッフが本人と相談して決め、Botは請求・支払い・記録だけを担当します。",
+    );
+  }
 
   return {
     content: [
@@ -145,6 +154,15 @@ export function panelExtraRows(
     return [reevalActionRow(opts.disabled || !linked)];
   }
   if (panelId === RETURN_PANEL_ID) return [returnActionRow(opts.disabled)];
+  if (panelId === ORIGINAL_ROLE_TICKET_PANEL_ID) {
+    return [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("orole:invoice").setLabel("請求を出す").setStyle(ButtonStyle.Success).setDisabled(!!opts.disabled),
+        new ButtonBuilder().setCustomId("orole:link").setLabel("既存契約を紐付け").setStyle(ButtonStyle.Secondary).setDisabled(!!opts.disabled),
+        new ButtonBuilder().setCustomId("orole:import-role").setLabel("実ロールをカルテ登録").setStyle(ButtonStyle.Secondary).setDisabled(!!opts.disabled),
+      ),
+    ];
+  }
   return [];
 }
 
@@ -174,6 +192,10 @@ export function panelIdFromTicketButton(customId: string): string | undefined {
 
 function fallbackStaffRoleId(services: Services): string | undefined {
   return services.settings.getString("role:ticket_staff");
+}
+
+function originalRoleStaffRoleId(services: Services): string | undefined {
+  return services.departments.get("冥界商館")?.role_id ?? undefined;
 }
 
 export function ticketPanelMessageForPanel(panel: TicketPanel): MessageCreateOptions {
@@ -215,6 +237,10 @@ export function ticketPanelMessage(kind: TicketKind, services?: Services): Messa
 }
 
 export function panelStaffRoleIds(panel: TicketPanel, services: Services): string[] {
+  if (panel.id === ORIGINAL_ROLE_TICKET_PANEL_ID) {
+    const merchant = originalRoleStaffRoleId(services);
+    if (merchant) return [merchant];
+  }
   const fallback = fallbackStaffRoleId(services);
   return panel.staffRoleIds.length > 0 ? panel.staffRoleIds : fallback ? [fallback] : [];
 }
@@ -397,6 +423,9 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
       staffRoleIds: validStaffRoleIds,
     });
     ticketCreated = true;
+    if (panel.id === ORIGINAL_ROLE_TICKET_PANEL_ID) {
+      services.originalRoleCases.ensureCase(thread.id, interaction.user.id, `user:${interaction.user.id}`);
+    }
     // 再評価面談は面談権（再評価チャレンジの購入）と機械的に紐付ける。
     // 同じ購入は一意インデックスで1チケットしか消費できない
     const reevalPurchaseId =
@@ -555,6 +584,14 @@ async function confirmTicketClose(
     } finally {
       if (thread) await lockAndArchiveThread(thread, "既に完了済みのチケットを修復");
     }
+    return;
+  }
+
+  if (current.panel_id === ORIGINAL_ROLE_TICKET_PANEL_ID && services.originalRoleCases.pendingInvoiceByTicket(current.thread_id)) {
+    await interaction.update({
+      content: "未払いの請求が残っています。支払いまたは請求取消を行ってから対応完了にしてください。",
+      components: [],
+    });
     return;
   }
 

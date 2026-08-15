@@ -86,6 +86,18 @@ export interface TicketPanelRemovalResult {
 
 const now = () => Math.floor(Date.now() / 1000);
 
+const ORIGINAL_ROLE_VIRTUAL_PANEL: TicketPanelInput = {
+  id: "original_role",
+  name: "オリジナルロール相談",
+  title: "🎨 オリジナルロール相談",
+  description: [
+    "制作・継続・再開・既存ロールの引き継ぎ相談はこちらから。",
+    "料金や扱いは商館スタッフと相談し、請求が出た場合だけ本人が支払います。",
+  ].join("\n"),
+  buttonLabel: "オリロ相談を始める",
+  buttonEmoji: "🎨",
+};
+
 const LEGACY_PANELS: TicketPanelInput[] = [
   {
     id: "return",
@@ -217,7 +229,7 @@ export class Tickets {
   }
 
   defaultPanel(id: string): TicketPanel | undefined {
-    const found = LEGACY_PANELS.find((p) => p.id === id);
+    const found = LEGACY_PANELS.find((p) => p.id === id) ?? (id === ORIGINAL_ROLE_VIRTUAL_PANEL.id ? ORIGINAL_ROLE_VIRTUAL_PANEL : undefined);
     if (!found) return undefined;
     const ts = now();
     return {
@@ -433,6 +445,22 @@ export class Tickets {
     this.db
       .prepare("UPDATE tickets SET status = 'claimed', claimed_by = ?, updated_at = ? WHERE thread_id = ? AND status = 'open'")
       .run(staffId, now(), threadId);
+    return this.get(threadId);
+  }
+
+  reopen(threadId: string, actor: string): TicketRow | undefined {
+    const before = this.get(threadId);
+    if (!before) return undefined;
+    if (before.status !== "closed") return before;
+    try {
+      const changed = this.db.prepare(
+        "UPDATE tickets SET status='open', claimed_by=NULL, reminded_at=NULL, updated_at=? WHERE thread_id=? AND status='closed'",
+      ).run(now(), threadId);
+      if (changed.changes !== 1) return undefined;
+    } catch {
+      return undefined; // 同じ受付の別チケットが開いている等
+    }
+    this.events.log("ticket_reopened", { actor, target: before.user_id, payload: { threadId, kind: before.kind } });
     return this.get(threadId);
   }
 

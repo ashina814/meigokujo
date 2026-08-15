@@ -228,6 +228,8 @@ export type ShopErrorCode =
   | "ERR_REFUND_RACE"
   | "ERR_ORIGINAL_ROLE_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_ORIGINAL_ROLE_ITEM_CONFIG"
+  | "ERR_ORIGINAL_ROLE_INVOICE_NOT_FOUND"
+  | "ERR_ORIGINAL_ROLE_INVOICE_NOT_PAYABLE"
   | "ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_REEVAL_ITEM_CONFIG"
   | "ERR_REEVAL_STATUS"
@@ -373,6 +375,44 @@ export interface ShopOptions {
   departments?: Departments;
 }
 
+interface ShopPurchaseLogExtra {
+  transactionId?: number | null;
+  deliveryMode?: DeliveryMode;
+  deliveryKind?: DeliveryKind;
+  workType?: string | null;
+  ticketThreadId?: string | null;
+  staffId?: string | null;
+  invoiceId?: number | null;
+  invoiceKind?: string | null;
+  invoiceReason?: string | null;
+  paidBy?: string | null;
+  source?: string;
+  migrationKey?: string | null;
+}
+
+interface ShopPurchaseLogPayload {
+  purchaseId: number;
+  transactionId: number | null;
+  itemId: number;
+  itemName: string;
+  userId: string;
+  paidLand: number | null;
+  paidAltKind: string | null;
+  paidAltAmount: number | null;
+  purchasedAt: number;
+  deliveryMode: DeliveryMode;
+  deliveryKind: DeliveryKind;
+  workType: string | null;
+  ticketThreadId: string | null;
+  staffId: string | null;
+  invoiceId: number | null;
+  invoiceKind: string | null;
+  invoiceReason: string | null;
+  paidBy: string | null;
+  source: string;
+  migrationKey: string | null;
+}
+
 export class Shop {
   constructor(
     private readonly db: Database.Database,
@@ -398,6 +438,11 @@ export class Shop {
         completed_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_shop_role_revocations_status ON shop_role_revocations(status, updated_at);
+      -- shop_purchases が正本。1 purchase につき Discord購入ログoutboxは1件だけ積む。
+      CREATE TABLE IF NOT EXISTS shop_purchase_log_enqueues (
+        purchase_id INTEGER PRIMARY KEY REFERENCES shop_purchases(id) ON DELETE RESTRICT,
+        created_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS shop_timed_access_legacy_runs (
         migration_key TEXT PRIMARY KEY,
         plan_json TEXT NOT NULL,
@@ -476,6 +521,60 @@ export class Shop {
       delivery_data: item.delivery_data,
       captured_at: now(),
     });
+  }
+
+  private shopPurchaseLogPayload(
+    purchase: PurchaseRow,
+    item: ShopItemRow,
+    extra: ShopPurchaseLogExtra = {},
+  ): ShopPurchaseLogPayload {
+    return {
+      purchaseId: purchase.id,
+      transactionId: extra.transactionId ?? null,
+      itemId: item.id,
+      itemName: item.name,
+      userId: purchase.user_id,
+      paidLand: purchase.paid_land,
+      paidAltKind: purchase.paid_alt_kind,
+      paidAltAmount: purchase.paid_alt_amount,
+      purchasedAt: purchase.purchased_at,
+      deliveryMode: extra.deliveryMode ?? item.delivery,
+      deliveryKind: extra.deliveryKind === undefined ? item.delivery_kind : extra.deliveryKind,
+      workType: extra.workType ?? null,
+      ticketThreadId: extra.ticketThreadId ?? null,
+      staffId: extra.staffId ?? null,
+      invoiceId: extra.invoiceId ?? null,
+      invoiceKind: extra.invoiceKind ?? null,
+      invoiceReason: extra.invoiceReason ?? null,
+      paidBy: extra.paidBy ?? null,
+      source: extra.source ?? "shop_purchase",
+      migrationKey: extra.migrationKey ?? null,
+    };
+  }
+
+  /**
+   * 購入ログを purchase ID 単位で一度だけ outbox へ積む。
+   * Discord配送は別workerなので、API失敗で購入/支払いを巻き戻さない。
+   */
+  private enqueueShopPurchaseLog(
+    purchase: PurchaseRow,
+    item: ShopItemRow,
+    extra: ShopPurchaseLogExtra = {},
+  ): ShopPurchaseLogPayload {
+    const payload = this.shopPurchaseLogPayload(purchase, item, extra);
+    const body = () => {
+      const claimed = this.db
+        .prepare("INSERT OR IGNORE INTO shop_purchase_log_enqueues (purchase_id, created_at) VALUES (?, ?)")
+        .run(purchase.id, purchase.purchased_at);
+      if (claimed.changes === 1) {
+        this.db
+          .prepare("INSERT INTO outbox (kind, payload, created_at) VALUES ('shop_purchase_log', ?, ?)")
+          .run(JSON.stringify(payload), purchase.purchased_at);
+      }
+    };
+    if (this.db.inTransaction) body();
+    else this.db.transaction(body).immediate();
+    return payload;
   }
 
   private roleIdFromDelivery(snapshotJson: string | null | undefined, item?: ShopItemRow): { roleId?: string; error?: string } {
@@ -670,6 +769,154 @@ export class Shop {
     return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
   }
 
+  /**
+   * スタッフがチケットで発行したオリジナルロール請求を本人が支払う。
+   *
+   * - 請求種別は invoice.kind が正本。金額から意味を推測しない。
+   * - 購入行は /商館 → 購入履歴 の正本へ必ず残す。
+   * - 新方式は実Discordロールを自動配送しないため、購入行は payment record として
+   *   delivery_state=delivered で閉じ、旧 create_original_role purchase の復旧経路には載せない。
+   * - Discordログ/チケット領収書は outbox。配送失敗でこのトランザクションを巻き戻さない。
+   */
+  purchaseOriginalRoleInvoice(input: {
+    invoiceId: number;
+    userId: string;
+    actor: string;
+    memberRoleIds: readonly string[];
+    idempotencyKey: string;
+  }): { purchase: PurchaseRow; item: ShopItemRow; transactionId: number; replayed: boolean } {
+    const run = () => {
+      const invoice = this.db.prepare(
+        `SELECT i.*, c.ticket_thread_id
+           FROM original_role_invoices i
+           JOIN original_role_cases c ON c.id = i.case_id
+          WHERE i.id = ?`,
+      ).get(input.invoiceId) as
+        | {
+            id: number; case_id: number; user_id: string; kind: string; amount: number; reason: string | null;
+            status: string; issued_by: string; purchase_id: number | null; transaction_id: number | null;
+            ticket_thread_id: string;
+          }
+        | undefined;
+      if (!invoice) throw new ShopError("ERR_ORIGINAL_ROLE_INVOICE_NOT_FOUND", { invoiceId: input.invoiceId });
+      if (invoice.user_id !== input.userId) {
+        throw new ShopError("ERR_ORIGINAL_ROLE_INVOICE_NOT_PAYABLE", { invoiceId: input.invoiceId, reason: "owner" });
+      }
+      if (invoice.status === "paid" && invoice.purchase_id !== null && invoice.transaction_id !== null) {
+        const purchase = this.getPurchase(invoice.purchase_id);
+        const item = purchase ? this.getItem(purchase.item_id) : undefined;
+        if (!purchase || !item) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: invoice.purchase_id });
+        return { purchase, item, transactionId: invoice.transaction_id, replayed: true };
+      }
+      if (invoice.status !== "pending") {
+        throw new ShopError("ERR_ORIGINAL_ROLE_INVOICE_NOT_PAYABLE", { invoiceId: input.invoiceId, status: invoice.status });
+      }
+
+      const itemId = this.options.originalRoleItemId?.() ?? null;
+      const item = itemId ? this.getItem(itemId) : undefined;
+      if (!itemId || !item || !item.enabled || item.kind !== "one_shot") {
+        throw new ShopError("ERR_ORIGINAL_ROLE_ITEM_CONFIG", { configuredId: itemId });
+      }
+      if (item.require_role_id && !this.roleSatisfied(input.memberRoleIds, item.require_role_id)) {
+        throw new ShopError("ERR_ROLE_REQUIRED", { roleId: item.require_role_id });
+      }
+      if (item.stock !== null && item.stock <= 0) throw new ShopError("ERR_NO_STOCK", { itemId: item.id });
+
+      const ts = now();
+      const account = `user:${input.userId}`;
+      this.ledger.ensureAccount(account, "user");
+      const transferred = this.ledger.transfer({
+        from: account,
+        to: TREASURY,
+        amount: invoice.amount,
+        type: "tip_burn",
+        actor: input.actor,
+        reason: `オリジナルロール請求 #${invoice.id} (${invoice.kind})`,
+        refType: "original_role_invoice",
+        refId: String(invoice.id),
+        idempotencyKey: input.idempotencyKey,
+      });
+
+      const request = {
+        originalRoleInvoiceId: invoice.id,
+        originalRoleCaseId: invoice.case_id,
+        ticketThreadId: invoice.ticket_thread_id,
+        invoiceKind: invoice.kind,
+        invoiceAmount: invoice.amount,
+        invoiceReason: invoice.reason,
+        issuedBy: invoice.issued_by,
+      };
+      const info = this.db.prepare(
+        `INSERT INTO shop_purchases
+         (item_id, user_id, purchased_at, expires_at, paid_land, paid_alt_kind, paid_alt_amount,
+          status, delivered_at, auto_renew, delivery_snapshot_json, request_json,
+          delivery_state, delivery_attempts, delivery_error, delivery_updated_at)
+         VALUES (?, ?, ?, NULL, ?, NULL, NULL, 'active', ?, 0, NULL, ?, 'delivered', 0, NULL, ?)`,
+      ).run(item.id, input.userId, ts, invoice.amount, ts, JSON.stringify(request), ts);
+      if (item.stock !== null) {
+        this.db.prepare("UPDATE shop_items SET stock = stock - 1, updated_at = ? WHERE id = ?").run(ts, item.id);
+      }
+      const purchase = this.getPurchase(Number(info.lastInsertRowid))!;
+      const changed = this.db.prepare(
+        `UPDATE original_role_invoices
+            SET status='paid', paid_by=?, paid_at=?, purchase_id=?, transaction_id=?
+          WHERE id=? AND status='pending'`,
+      ).run(input.actor, ts, purchase.id, transferred.tx.id, invoice.id);
+      if (changed.changes !== 1) {
+        throw new ShopError("ERR_ORIGINAL_ROLE_INVOICE_NOT_PAYABLE", { invoiceId: invoice.id, reason: "race" });
+      }
+
+      this.events.log("shop_purchased", {
+        actor: input.userId,
+        payload: {
+          itemId: item.id,
+          purchaseId: purchase.id,
+          paidLand: invoice.amount,
+          originalRoleInvoiceId: invoice.id,
+          invoiceKind: invoice.kind,
+          transactionId: transferred.tx.id,
+        },
+      });
+      this.events.log("original_role_invoice_paid", {
+        actor: input.actor,
+        target: input.userId,
+        payload: {
+          invoiceId: invoice.id,
+          caseId: invoice.case_id,
+          kind: invoice.kind,
+          amount: invoice.amount,
+          issuedBy: invoice.issued_by,
+          purchaseId: purchase.id,
+          transactionId: transferred.tx.id,
+          ticketThreadId: invoice.ticket_thread_id,
+        },
+      });
+
+      const genericLog = this.enqueueShopPurchaseLog(purchase, item, {
+        transactionId: transferred.tx.id,
+        deliveryMode: "manual",
+        deliveryKind: null,
+        workType: `original_role_invoice:${invoice.kind}`,
+        ticketThreadId: invoice.ticket_thread_id,
+        staffId: invoice.issued_by,
+        invoiceId: invoice.id,
+        invoiceKind: invoice.kind,
+        invoiceReason: invoice.reason,
+        paidBy: input.actor,
+        source: "original_role_invoice",
+      });
+      // チケット内の領収記録は購入ログとは別用途なので、そのまま維持する。
+      const receiptPayload = JSON.stringify({
+        ...genericLog,
+        amount: invoice.amount,
+        issuedBy: invoice.issued_by,
+      });
+      this.db.prepare("INSERT INTO outbox (kind, payload, created_at) VALUES ('original_role_ticket_receipt', ?, ?)").run(receiptPayload, ts);
+      return { purchase, item, transactionId: transferred.tx.id, replayed: false };
+    };
+    return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
+  }
+
   private purchaseInternal(input: {
     itemId: number;
     userId: string;
@@ -706,6 +953,7 @@ export class Shop {
     let paidLand: number | null = null;
     let paidAltKind: string | null = null;
     let paidAltAmount: number | null = null;
+    let transactionId: number | null = null;
     const useAlt = input.payAlt && item.price_alt_kind && item.price_alt_amount;
     if (useAlt) {
       paidAltKind = item.price_alt_kind;
@@ -715,7 +963,7 @@ export class Shop {
       // Land を焼却
       const account = `user:${input.userId}`;
       this.ledger.ensureAccount(account, "user");
-      this.ledger.transfer({
+      const transferred = this.ledger.transfer({
         from: account,
         to: TREASURY,
         amount: item.price_land,
@@ -726,6 +974,7 @@ export class Shop {
         refId: String(item.id),
         idempotencyKey: input.idempotencyKey ?? `shop:purchase:${input.userId}:${item.id}:${ts}`,
       });
+      transactionId = transferred.tx.id;
       paidLand = item.price_land;
     }
 
@@ -758,6 +1007,7 @@ export class Shop {
       actor: input.userId,
       payload: { itemId: item.id, purchaseId: purchase.id, paidLand, paidAltKind, paidAltAmount, expiresAt },
     });
+    this.enqueueShopPurchaseLog(purchase, item, { transactionId });
     return { purchase, item, needsManualDelivery: item.delivery === "manual" };
   }
 
@@ -1830,6 +2080,12 @@ export class Shop {
             actor,
             startedAt,
           );
+          const importedPurchase = this.getPurchase(purchaseId)!;
+          this.enqueueShopPurchaseLog(importedPurchase, item, {
+            workType: "legacy_timed_access_import",
+            source: "legacy_timed_access_import",
+            migrationKey,
+          });
           this.events.log("shop_timed_access_legacy_imported", {
             actor,
             target: userId,

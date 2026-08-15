@@ -49,6 +49,18 @@ export {
   type OriginalRoleStatus,
 } from "./original-role/service.js";
 export {
+  OriginalRoleCases,
+  OriginalRoleCaseError,
+  ORIGINAL_ROLE_TICKET_PANEL_ID,
+  ORIGINAL_ROLE_NEW_BASELINE_LAND,
+  ORIGINAL_ROLE_CONTINUATION_BASELINE_LAND,
+  type OriginalRoleCaseRow,
+  type OriginalRoleInvoiceRow,
+  type OriginalRoleInvoiceKind,
+  type OriginalRoleInvoiceStatus,
+  type OriginalRoleCaseErrorCode,
+} from "./original-role/cases.js";
+export {
   NICKNAME_MAX_LENGTH,
   NICKNAME_POLICY_VERSION,
   checkNicknameShape,

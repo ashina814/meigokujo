@@ -89,8 +89,11 @@ function canOperate(
  * ここへ出すと「終わらせる方法が無い仕事」がキューに居座る。
  */
 function excludedItemIds(services: Services): number[] {
-  const reeval = Number(services.settings.getString("shop:reeval_item_id"));
-  return Number.isInteger(reeval) && reeval > 0 ? [reeval] : [];
+  const ids = [
+    Number(services.settings.getString("shop:reeval_item_id")),
+    Number(services.settings.getString("shop:original_role_item_id")),
+  ];
+  return ids.filter((id) => Number.isInteger(id) && id > 0);
 }
 
 function pendingManual(services: Services): Array<PurchaseRow & { item_name: string }> {
@@ -145,7 +148,7 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
           ? `**残っている仕事: 要対応 ${pending}件 / 処理失敗 ${failed}件**`
           : "残っている仕事はありません。",
         services.originalRoles.countByStatus("pending") > 0
-          ? `**オリジナルロールの申請 ${services.originalRoles.countByStatus("pending")}件** が承認待ちです。`
+          ? `**旧方式オリジナルロール ${services.originalRoles.countByStatus("pending")}件** がカルテ移行待ちです。`
           : "",
         "",
         "-# 通知は変化のお知らせです。仕事の一覧は必ずここから開けます。",
@@ -167,7 +170,7 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
       .setCustomId("shokan:orole")
       .setLabel(
         services.originalRoles.countByStatus("pending") > 0
-          ? `オリジナルロール ${services.originalRoles.countByStatus("pending")}`
+          ? `旧オリロ移行 ${services.originalRoles.countByStatus("pending")}`
           : "オリジナルロール",
       )
       .setEmoji("🎨")
