@@ -34,14 +34,8 @@ import { deliverPurchase, nicknameBlockReason } from "../shop-delivery.js";
 import { deliverOrRefund, type Settlement } from "../shop-refund.js";
 import { withUserLock } from "../user-lock.js";
 import {
-  applyModal,
-  handleApplyModal,
-  handleRenewConfirm,
   isOriginalRoleItem,
   originalRoleActions,
-  payRequote,
-  renewConfirm,
-  renewPicker,
 } from "./original-role.js";
 import {
   handleApplyModal as handleSubApplyModal,
@@ -666,7 +660,7 @@ function originalRolePurchaseRedirect(services: Services, item: ShopItemRow, use
   const actions = originalRoleActions(services, item, userId);
   return {
     content: [
-      "オリジナルロールは専用手続きからのみ購入できます。料金は発生していません。",
+      "オリジナルロールは専用カルテで相談し、スタッフが請求を出した場合だけ本人が支払います。ここでは料金は発生していません。",
       ...(item.enabled ? actions.notes : ["現在、この商品の受付は停止しています。"]),
     ].join("\n"),
     embeds: [],
@@ -823,13 +817,53 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
 
 
   // ── オリジナルロール ──
-  if (action === "orole-apply") {
-    const item = services.shop.getItem(Number(parts[2]));
-    if (!item || !item.enabled || !isOriginalRoleItem(services, item)) {
-      await interaction.reply({ content: "この商品はいま申請できません。", flags: MessageFlags.Ephemeral });
+  if (action === "orole-resume") {
+    const caseId = Number(parts[2]);
+    const serviceCase = services.originalRoleCases.get(caseId);
+    if (!serviceCase || serviceCase.user_id !== interaction.user.id || !interaction.guild) {
+      await interaction.reply({ content: "このカルテは再開できません。", flags: MessageFlags.Ephemeral });
       return;
     }
-    await interaction.showModal(applyModal(item.id));
+    const ticket = services.tickets.get(serviceCase.ticket_thread_id);
+    if (!ticket) {
+      await interaction.reply({ content: "カルテのチケット情報が見つかりません。運営に確認してください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (ticket.status !== "closed") {
+      await interaction.reply({ content: `このカルテは既に対応中です: <#${ticket.thread_id}>`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const other = services.tickets.openByUserPanel(interaction.user.id, "original_role");
+    if (other && other.thread_id !== ticket.thread_id) {
+      await interaction.reply({ content: `別のオリロ相談が対応中です: <#${other.thread_id}>`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const channel = await interaction.client.channels.fetch(ticket.thread_id).catch(() => null);
+    if (!channel?.isThread()) {
+      await interaction.reply({ content: "保存していたDiscordスレッドを取得できません。運営に確認してください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await channel.setArchived(false, "オリジナルロール相談を再開").catch(() => undefined);
+    if (channel.locked) await channel.setLocked(false, "オリジナルロール相談を再開").catch(() => undefined);
+    await channel.members.add(interaction.user.id).catch(() => undefined);
+    const reopened = services.tickets.reopen(ticket.thread_id, `user:${interaction.user.id}`);
+    if (!reopened) {
+      await interaction.reply({ content: "カルテを再開できませんでした。別の未完了相談がないか確認してください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await channel.send({
+      content: `🔄 <@${interaction.user.id}> がオリジナルロール相談を再開しました。**この既存カルテを続けて使います。**`,
+      allowedMentions: { users: [interaction.user.id] },
+    }).catch(() => undefined);
+    await interaction.reply({ content: `✅ 同じカルテを再開しました: <#${ticket.thread_id}>`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (action === "orole-apply") {
+    await interaction.reply({
+      content: "旧申請UIは終了しました。公式ショップでオリジナルロールを選び、専用チケットから相談を始めてください。料金は発生していません。",
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
 
@@ -942,109 +976,11 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     return;
   }
 
-  if (action === "orole-pay") {
-    const itemId = Number(parts[2]);
-    const applicationId = Number(parts[3]);
-    // 表示した額。**押した時の最新価格ではなく、これで引く**
-    const quotedPrice = Number(parts[4]);
-    // 支払い画面ごとの鍵。**同じ画面の二度押しは1回**、開き直せば新しい挑戦になる
-    const attempt = parts[5] ?? "";
-    const item = services.shop.getItem(itemId);
-    if (!item || !item.enabled || !isOriginalRoleItem(services, item) || item.price_land === null) {
-      await interaction.update({ content: "この商品はいま購入できません。", embeds: [], components: [] });
-      return;
-    }
-    if (quotedPrice !== item.price_land) {
-      // **1 Ld も動かさずに**、新しい額で確かめ直してもらう（新しい鍵を配る）
-      const application = services.originalRoles.get(applicationId);
-      await interaction.update(payRequote(item, applicationId, application?.name ?? ""));
-      return;
-    }
-    await interaction.deferUpdate();
-    // **同じ申請の支払いを直列化する。** 2本同時に押されても、2本目は
-    // 1本目が作った購入を見つけて課金しない
-    interface Attempt {
-      error?: string;
-      purchase?: PurchaseRow;
-      settled?: Settlement;
-    }
-    const settlement = await withUserLock<Attempt>(`orole-pay:${applicationId}`, async () => {
-      // 返金されていない購入が既にあるなら、それを進めるだけ（二重課金しない）。
-      // 返金済みは「まだ払っていない」ので、ここには出てこない＝再挑戦できる
-      const open = services.shop.findActivePurchaseByRequest(
-        interaction.user.id,
-        itemId,
-        "applicationId",
-        applicationId,
-      );
-      if (open) {
-        return {
-          purchase: open,
-          settled: await deliverOrRefund(interaction.client, services, interaction.guild, open, `user:${interaction.user.id}`),
-        };
-      }
-      try {
-        services.originalRoles.assertPayable(applicationId, interaction.user.id);
-      } catch {
-          return { error: "⚠️ この申請はいま支払える状態ではありません（取り消されたか、既に支払い済みです）。" } as Attempt;
-      }
-      let purchase: PurchaseOutcome;
-      try {
-        // 課金・購入行・どの申請かを1トランザクションで確定する
-        purchase = purchaseOnce(services, {
-          operationId: `orole:${applicationId}:${attempt}`,
-          itemId,
-          userId: interaction.user.id,
-          actor: `user:${interaction.user.id}`,
-          memberRoleIds: [...((interaction.member as GuildMember | null)?.roles.cache.keys() ?? [])],
-          mode: "land",
-          originalRoleApplicationId: applicationId,
-        });
-      } catch (error) {
-        return { error: `❌ ${purchaseErrorMessage(error, services)}` } as Attempt;
-      }
-      return {
-        purchase: purchase.purchase,
-        settled: await deliverOrRefund(
-          interaction.client,
-          services,
-          interaction.guild,
-          purchase.purchase,
-          `user:${interaction.user.id}`,
-        ),
-      };
+  if (action === "orole-pay" || action === "orole-renew" || action === "orole-renew-do") {
+    await interaction.reply({
+      content: "この旧オリジナルロール支払い/更新UIは終了しました。**自動で新規・継続・再開を判断したり課金したりしません。** 公式ショップから専用カルテを開いて商館スタッフへご相談ください。",
+      flags: MessageFlags.Ephemeral,
     });
-    if (settlement.error !== undefined) {
-      await interaction.editReply({ content: settlement.error, embeds: [], components: [] });
-      return;
-    }
-    const paid = settlement.purchase!;
-    const { outcome, refund } = settlement.settled!;
-    if (outcome.state !== "failed") {
-      await interaction.editReply({ content: `✅ ${outcome.message}`, embeds: [], components: [] });
-      return;
-    }
-    await interaction.editReply({
-      content:
-        refund === "refunded"
-          ? `作成できなかったため、${fmtLd(paid.paid_land ?? 0)}は返金しました。
--# ${outcome.message}`
-          : `⚠️ 作成に失敗し、返金も完了できませんでした。運営が対応します（購入 #${paid.id}）。
--# ${outcome.message}`,
-      embeds: [],
-      components: [],
-    });
-    return;
-  }
-
-  if (action === "orole-renew") {
-    const itemId = Number(parts[2]);
-    await interaction.update({ ...renewPicker(services, itemId, interaction.user.id), content: "" });
-    return;
-  }
-
-  if (action === "orole-renew-do") {
-    await handleRenewConfirm(interaction, services, Number(parts[3]), Number(parts[4]), parts[5] ?? "");
     return;
   }
 
@@ -1411,13 +1347,11 @@ export async function handleShopSelect(
 ): Promise<void> {
   const action = interaction.customId.split(":")[1];
   if (action === "orole-renew-pick") {
-    const row = services.originalRoles.get(Number(interaction.values[0]));
-    if (!row || row.user_id !== interaction.user.id) {
-      await interaction.update({ content: "その契約が見つかりません。", embeds: [], components: [] });
-      return;
-    }
-    // 確認画面ごとに1つの鍵を配る（この操作IDを core が消費して二重課金を止める）
-    await interaction.update(renewConfirm(services, Number(interaction.customId.split(":")[2]), row, interaction.id));
+    await interaction.update({
+      content: "旧セルフ更新UIは終了しました。公式ショップから専用カルテを再開して商館スタッフへご相談ください。",
+      embeds: [],
+      components: [],
+    });
     return;
   }
   if (action === "pick") {
@@ -1445,6 +1379,21 @@ export async function handleShopSelect(
       }
       return;
     }
+    if (isOriginalRoleItem(services, item)) {
+      const actions = originalRoleActions(services, item, interaction.user.id);
+      const embed = new EmbedBuilder()
+        .setTitle(`🎨 ${item.name}`)
+        .setColor(0xdb2777)
+        .setDescription([item.description ?? "オリジナルロールの制作・継続相談です。", "", ...actions.notes].join("\n"))
+        .addFields(
+          { name: "新規の現行基準", value: fmtLd(item.price_land ?? 750_000), inline: true },
+          { name: "継続/再開の現行基準", value: fmtLd(Number(services.settings.getString("original_role_renew_price")) || 250_000), inline: true },
+          { name: "支払い", value: "スタッフがカルテ内で請求を発行した後だけ", inline: false },
+        )
+        .setFooter({ text: "金額から請求種別を自動判定しません。例外金額は理由付きでスタッフが発行します。" });
+      await interaction.reply({ embeds: [embed], components: actions.components, flags: MessageFlags.Ephemeral });
+      return;
+    }
     const access = timedAccessConfig(item);
     const view = itemDetail(
       item,
@@ -1454,14 +1403,6 @@ export async function handleShopSelect(
       contractView(services, interaction.user.id, item),
       !!access && memberRoleIds.includes(access.roleId),
     );
-    // オリジナルロールは「買う」ではなく「申請 → 承認 → 支払い」。
-    // いま本人が何をすればいいかだけを出す
-    if (isOriginalRoleItem(services, item)) {
-      const actions = originalRoleActions(services, item, interaction.user.id);
-      view.embeds[0]?.addFields({ name: "手続き", value: actions.notes.join(String.fromCharCode(10)).slice(0, 1024) });
-      await interaction.reply({ embeds: view.embeds, components: actions.components, flags: MessageFlags.Ephemeral });
-      return;
-    }
     // サブ垢も同じ形（申請 → 本人確認 → 支払い）。先払いには戻さない
     if (isSubAccountItem(services, item)) {
       const actions = subAccountActions(services, item, interaction.user.id);
@@ -1534,7 +1475,7 @@ async function notifyStaffForDelivery(
 export async function handleShopModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
   const parts = interaction.customId.split(":");
   if (parts[1] === "orole-input") {
-    await handleApplyModal(interaction, services, Number(parts[2]));
+    await interaction.reply({ content: "旧申請フォームは終了しました。公式ショップから専用カルテを開いてください。", flags: MessageFlags.Ephemeral });
     return;
   }
   if (parts[1] === "sub-input") {

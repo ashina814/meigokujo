@@ -363,7 +363,7 @@ export class OriginalRoles {
     userId: string;
     roleId: string;
     name: string;
-    expiresAt: number;
+    expiresAt: number | null;
     actor: string;
   }): OriginalRoleRow {
     const existing = this.db.prepare("SELECT * FROM original_roles WHERE role_id = ?").get(input.roleId) as

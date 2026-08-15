@@ -111,6 +111,12 @@ import { postJoinLog, postLeaveLog } from "./member-log.js";
 import { respondInteractionError } from "./interaction-errors.js";
 import { recoverCasinoWithPersistentTables } from "./casino/persistent-table-recovery.js";
 import { handleRankedTableButton, handleRankedTableModal, isRankedTableButton, isRankedTableModal } from "./casino/ranked-table-ui.js";
+import {
+  handleOriginalRoleTicketButton,
+  handleOriginalRoleTicketModal,
+  handleOriginalRoleTicketRoleSelect,
+  handleOriginalRoleTicketSelect,
+} from "./commands/original-role-ticket.js";
 
 const services = buildServices();
 const client = new Client({
@@ -407,6 +413,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleItaModal(interaction, services);
       return;
     }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("orole:")) {
+      if (await handleOriginalRoleTicketModal(interaction, services)) return;
+    }
     if (interaction.isModalSubmit() && interaction.customId.startsWith("itaevt:")) {
       await handleItaEventModal(interaction, services);
       return;
@@ -414,6 +423,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isModalSubmit() && interaction.customId.startsWith("stocks:")) {
       await replyStocksPaused(interaction);
       return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("orole:")) {
+      if (await handleOriginalRoleTicketSelect(interaction, services)) return;
+    }
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith("orole:")) {
+      if (await handleOriginalRoleTicketRoleSelect(interaction, services)) return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("eval:")) {
       await handleEvaluationSelect(interaction, services);
@@ -431,6 +446,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith("orole:")) {
+        if (await handleOriginalRoleTicketButton(interaction, services)) return;
+      }
       if (interaction.customId.startsWith("entry:")) {
         await handleEntryButton(interaction, services);
         return;

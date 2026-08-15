@@ -119,6 +119,23 @@ function formatAuditDigest(items: DigestItem[], startedAtMs: number, endedAtMs: 
   return [`📋 **取引サマリ** <t:${started}:t>〜<t:${ended}:t>`, ...lines, `合計: ${items.length}件`].join("\n");
 }
 
+function formatOriginalRolePurchase(raw: string): string {
+  const p = JSON.parse(raw) as {
+    purchaseId: number; transactionId: number; itemName: string; userId: string; amount: number;
+    invoiceId: number; invoiceKind: string; invoiceReason?: string | null; issuedBy: string; paidBy: string; ticketThreadId: string; purchasedAt: number;
+  };
+  const kind = ({ new: "新規", continuation: "継続", restart: "再開", exception: "例外" } as Record<string,string>)[p.invoiceKind] ?? p.invoiceKind;
+  const staff = p.issuedBy.startsWith("user:") ? `<@${p.issuedBy.slice(5)}>` : p.issuedBy;
+  const payer = p.paidBy.startsWith("user:") ? `<@${p.paidBy.slice(5)}>` : p.paidBy;
+  return [
+    `🧾 **オリジナルロール支払い** — 購入 #${p.purchaseId} / 取引 #${p.transactionId}`,
+    `<@${p.userId}> / **${kind}** / **${p.amount.toLocaleString()} Ld**`,
+    `請求 #${p.invoiceId} / 発行 ${staff} / 支払 ${payer} / <#${p.ticketThreadId}>`,
+    p.invoiceReason ? `理由: ${p.invoiceReason}` : "",
+    `<t:${p.purchasedAt}:F>`,
+  ].filter(Boolean).join("\n");
+}
+
 /**
  * outbox ワーカー: 取引と同一コミットで積まれた通知を Discord に配送する（経済設計.md §7）。
  * 配送先チャンネル未設定・API障害時はエントリが残り、次のループで再試行される。
@@ -130,8 +147,9 @@ export function startOutboxWorker(client: Client, services: Services, intervalMs
   let auditDigestStartedAt = Date.now();
 
   async function channelFor(kind: string): Promise<TextChannel | undefined> {
-    const channelKind = kind === "public_log" ? "public_log" : "audit_log";
-    const id = settings.getString(`channel:${channelKind}`);
+    const id = kind === "shop_purchase_log"
+      ? (settings.getString("channel:shop_purchase_log") ?? settings.getString("channel:shokan") ?? settings.getString("channel:audit_log"))
+      : settings.getString(`channel:${kind === "public_log" ? "public_log" : "audit_log"}`);
     if (!id) return undefined;
     const channel = await client.channels.fetch(id).catch(() => null);
     return channel?.isTextBased() ? (channel as TextChannel) : undefined;
@@ -179,6 +197,15 @@ export function startOutboxWorker(client: Client, services: Services, intervalMs
             }
           }
 
+          if (entry.kind === "original_role_ticket_receipt") {
+            const p = JSON.parse(entry.payload) as { ticketThreadId: string };
+            const target = await client.channels.fetch(p.ticketThreadId).catch(() => null);
+            if (!target?.isTextBased() || !("send" in target)) throw new Error("original role ticket unavailable");
+            await target.send({ content: formatOriginalRolePurchase(entry.payload), allowedMentions: { parse: [] } });
+            ledger.markOutboxDelivered(entry.id);
+            continue;
+          }
+
           const channel = await channelFor(entry.kind);
           if (!channel) {
             // 配送先未設定の間は attempts を増やさず待つ（設定されたら一気に流れる）
@@ -188,7 +215,9 @@ export function startOutboxWorker(client: Client, services: Services, intervalMs
           const content =
             entry.kind === "public_log"
               ? formatPublic(JSON.parse(entry.payload) as TxPayload)
-              : formatAudit(entry.kind, entry.payload);
+              : entry.kind === "shop_purchase_log"
+                ? formatOriginalRolePurchase(entry.payload)
+                : formatAudit(entry.kind, entry.payload);
 
           await channel.send({
             content,

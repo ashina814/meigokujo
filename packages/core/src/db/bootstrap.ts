@@ -855,6 +855,41 @@ CREATE TABLE IF NOT EXISTS original_role_renewals (
   price            INTEGER NOT NULL,
   created_at       INTEGER NOT NULL
 );
+
+-- オリジナルロールの人対応カルテ。既存 original_roles は契約/実ロール互換台帳として残す。
+CREATE TABLE IF NOT EXISTS original_role_cases (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_thread_id TEXT NOT NULL UNIQUE REFERENCES tickets(thread_id) ON DELETE CASCADE,
+  user_id          TEXT NOT NULL,
+  original_role_id INTEGER UNIQUE REFERENCES original_roles(id),
+  created_by       TEXT NOT NULL,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_original_role_cases_user ON original_role_cases(user_id, id);
+
+-- 金額と意味を分離して明示保存する。Botは金額から new/continuation/restart を推測しない。
+CREATE TABLE IF NOT EXISTS original_role_invoices (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  case_id        INTEGER NOT NULL REFERENCES original_role_cases(id) ON DELETE CASCADE,
+  user_id        TEXT NOT NULL,
+  kind           TEXT NOT NULL CHECK (kind IN ('new','continuation','restart','exception')),
+  amount         INTEGER NOT NULL CHECK (amount > 0),
+  reason         TEXT,
+  status         TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','paid','cancelled')),
+  issued_by      TEXT NOT NULL,
+  issued_at      INTEGER NOT NULL,
+  paid_by        TEXT,
+  paid_at        INTEGER,
+  purchase_id    INTEGER UNIQUE REFERENCES shop_purchases(id),
+  transaction_id INTEGER UNIQUE REFERENCES transactions(id),
+  cancelled_by   TEXT,
+  cancelled_at   INTEGER,
+  CHECK (kind <> 'exception' OR (reason IS NOT NULL AND length(trim(reason)) > 0))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_original_role_invoice_pending
+  ON original_role_invoices(case_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_original_role_invoices_user ON original_role_invoices(user_id, issued_at);
 -- サブ垢。**main ↔ alt の対応はここが正本。**
 -- 旧商品の購入履歴には「買った」しか残っておらず、どのアカウントがサブ垢かの記録が無い。
 -- 推測すると他人のアカウントを本体に紐付ける事故になるので、必ず人が突き合わせる

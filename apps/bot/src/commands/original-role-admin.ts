@@ -10,7 +10,7 @@ import {
   type ButtonInteraction,
   type ModalSubmitInteraction,
 } from "discord.js";
-import { ORIGINAL_ROLE_PAYMENT_GRACE_DAYS } from "@meigokujo/core";
+import { ORIGINAL_ROLE_TICKET_PANEL_ID } from "@meigokujo/core";
 import type { Services } from "../services.js";
 
 /**
@@ -25,36 +25,29 @@ const LIST_LIMIT = 5;
 export function originalRoleReviewPanel(services: Services) {
   const pending = services.originalRoles.listByStatus("pending", LIST_LIMIT);
   const approved = services.originalRoles.listByStatus("approved", LIST_LIMIT);
-  const total = services.originalRoles.countByStatus("pending");
+  const totalPending = services.originalRoles.countByStatus("pending");
+  const totalApproved = services.originalRoles.countByStatus("approved");
   const embed = new EmbedBuilder()
-    .setTitle("🎨 オリジナルロールの申請")
-    .setColor(total > 0 ? 0xdc2626 : 0x64748b)
+    .setTitle("🎨 旧方式オリジナルロール申請（移行用）")
+    .setColor(totalPending + totalApproved > 0 ? 0xd97706 : 0x64748b)
     .setDescription(
       [
-        total > 0 ? `**承認待ち ${total}件**` : "承認待ちはありません。",
+        "この一覧は**制度変更前の未完了申請を見失わないための互換表示**です。",
+        "ここから旧方式の新規承認・自動作成には進めません。本人へ公式ショップ → オリジナルロール相談を案内し、専用カルテで続けてください。",
         "",
-        ...pending.map(
-          (r) =>
-            `**#${r.id}** <@${r.user_id}> ／ ロール名 **${r.name}**${r.color === null ? "" : ` ／ 色 #${r.color.toString(16).padStart(6, "0").toUpperCase()}`}`,
-        ),
-        approved.length > 0
-          ? [
-              "",
-              `**支払い待ち ${services.originalRoles.countByStatus("approved")}件**（承認から ${ORIGINAL_ROLE_PAYMENT_GRACE_DAYS}日で自動取消）`,
-              ...approved.map((r) => `・#${r.id} <@${r.user_id}> **${r.name}**`),
-            ].join("\n")
-          : "",
+        totalPending > 0 ? `**旧・承認待ち ${totalPending}件**` : "旧・承認待ちはありません。",
+        ...pending.map((r) => `・#${r.id} <@${r.user_id}> **${r.name}**`),
+        totalApproved > 0 ? `**旧・支払い前 ${totalApproved}件**` : "",
+        ...approved.map((r) => `・#${r.id} <@${r.user_id}> **${r.name}** — 旧支払いUIでは課金しません`),
         "",
-        "-# 承認しても課金はしません。支払いは本人が公式ショップから行います。",
-      ]
-        .filter((line) => line !== "")
-        .join("\n"),
+        "-# 支払済み create_original_role purchase の復旧互換は別経路で残しています。ここで扱うのは未払いの旧申請だけです。",
+      ].filter(Boolean).join("\n"),
     );
   const rows: ActionRowBuilder<ButtonBuilder>[] = [];
   for (const r of pending) {
     rows.push(
       new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId(`shokan:orole-approve:${r.id}`).setLabel(`#${r.id} 承認`).setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`shokan:orole-approve:${r.id}`).setLabel(`#${r.id} カルテ移行を案内`).setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId(`shokan:orole-return:${r.id}`).setLabel("差し戻し").setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId(`shokan:orole-reject:${r.id}`).setLabel("却下").setStyle(ButtonStyle.Danger),
       ),
@@ -89,26 +82,34 @@ export async function handleOriginalRoleApprove(
   services: Services,
   id: number,
 ): Promise<void> {
-  try {
-    const row = services.originalRoles.approve(id, `user:${interaction.user.id}`);
-    await interaction.update(originalRoleReviewPanel(services));
-    const user = await interaction.client.users.fetch(row.user_id).catch(() => null);
-    await user
-      ?.send(
-        [
-          `✅ オリジナルロール **${row.name}** の申請が承認されました。`,
-          `公式ショップの「オリジナルロール新規作成」からお支払いいただくと、Botがロールを作成してお付けします。`,
-          `-# 承認から **${ORIGINAL_ROLE_PAYMENT_GRACE_DAYS}日** を過ぎると申請は取り消されます。`,
-        ].join("\n"),
-      )
-      .catch(() => undefined);
-  } catch {
+  const row = services.originalRoles.get(id);
+  if (!row || row.status !== "pending") {
     await interaction.update({
-      content: "⚠️ この申請はいま承認できません（既に処理されています）。",
+      content: "⚠️ この旧申請は既に処理済みです。",
       embeds: [],
       components: [],
     });
+    return;
   }
+
+  // 旧「承認→本人セルフ支払い→Bot自動作成」へは戻さない。
+  // レコードはpendingのまま保持し、本人が新しい専用カルテを開始してから人が引き継ぐ。
+  services.events.log("original_role_legacy_migration_requested", {
+    actor: `user:${interaction.user.id}`,
+    target: row.user_id,
+    payload: { applicationId: row.id, panelId: ORIGINAL_ROLE_TICKET_PANEL_ID },
+  });
+  await interaction.update(originalRoleReviewPanel(services));
+  const user = await interaction.client.users.fetch(row.user_id).catch(() => null);
+  await user
+    ?.send(
+      [
+        `🎨 旧方式のオリジナルロール申請 **${row.name}** について、手続き方式が変わりました。`,
+        "**料金は発生していません。** 旧申請を新しく承認してBotがロールを作る方式には進みません。",
+        "公式ショップのオリジナルロールから専用の相談カルテを開き、商館スタッフと続きを相談してください。",
+      ].join("\n"),
+    )
+    .catch(() => undefined);
 }
 
 export async function handleOriginalRoleDecision(

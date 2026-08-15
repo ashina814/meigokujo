@@ -18,8 +18,8 @@ export async function notifyExpiringOriginalRoles(client: Client, services: Serv
       ?.send(
         [
           `⏳ オリジナルロール **${row.name}** の期限が近づいています（<t:${row.expires_at ?? 0}:D>）。`,
-          `公式ショップから **${fmtLd(services.settings.getNumber("original_role_renew_price"))}** で ${ORIGINAL_ROLE_TERM_DAYS}日 延長できます。`,
-          "期限を過ぎるとロールは外れます（同じ名前で作り直すことはできます）。",
+          "継続・再開・料金はBotが自動判定しません。公式ショップから同じカルテを開き、商館スタッフへご相談ください。",
+          "期限後の実ロールの扱いも、本人と商館スタッフが相談して決めます。",
         ].join("\n"),
       )
       .catch(() => undefined);
@@ -29,35 +29,32 @@ export async function notifyExpiringOriginalRoles(client: Client, services: Serv
 }
 
 /**
- * 期限が切れた契約のロールを外す。
- * 外せなかったものは記録を残さず、次の巡回で拾い直す。
+ * 期限到来は「人が判断する仕事」に変わった。
+ *
+ * BotはここでDiscordロールを外さず、契約種別や再請求額も決めない。
+ * 期限前通知を逃した行だけ一度知らせ、以後は専用カルテで商館スタッフが
+ * 継続・再開・例外や実ロールの扱いを本人と決める。
  */
 export async function expireOriginalRoles(client: Client, services: Services): Promise<void> {
-  const targets = services.originalRoles.listExpired();
-  if (targets.length === 0) return;
-  const guildId = services.settings.getString("guild:main");
-  const guild = guildId ? await client.guilds.fetch(guildId).catch(() => null) : null;
-  for (const row of targets) {
-    let removed = false;
-    if (guild && row.role_id) {
-      const member = await guild.members.fetch(row.user_id).catch(() => null);
-      if (!member) {
-        // 退出済み。剥奪する相手が居ないので、これ以上追いかけない
-        removed = true;
-      } else {
-        removed = await member.roles
-          .remove(row.role_id, "公式ショップ: オリジナルロールの期限切れ")
-          .then(() => true)
-          .catch(() => false);
-      }
-    }
-    services.originalRoles.markExpired(row.id, "system:original-role", removed);
-    if (removed && row.status === "active") {
+  for (const row of services.originalRoles.listExpired()) {
+    // 旧制度で既にexpiredへ移っている行は、実ロールを自動剥奪せず人の判断へ残す。
+    if (row.status === "expired") continue;
+    // 3日前通知済みでも、期限到来という客観事実はDBへ反映する。
+    if (!row.notified_expiry_at) {
       const user = await client.users.fetch(row.user_id).catch(() => null);
       await user
-        ?.send(`⌛ オリジナルロール **${row.name}** の期限が切れたため、ロールを外しました。`)
+        ?.send(
+          [
+            `⌛ オリジナルロール **${row.name}** は記録上の期限を迎えました。`,
+            "Botはロールを自動で外さず、新規/継続/再開や料金も自動判定しません。",
+            "公式ショップからオリジナルロールのカルテを開き、商館スタッフへご相談ください。",
+          ].join("\n"),
+        )
         .catch(() => undefined);
+      services.originalRoles.markExpiryNotified(row.id);
     }
+    // 実Discordロールは残したまま。失効後の扱いは本人+商館スタッフが決める。
+    services.originalRoles.markExpired(row.id, "system:original-role-expiry", false);
   }
 }
 
