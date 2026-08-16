@@ -63,6 +63,7 @@ const GUARDED_PREFIXES = [
   "casino:retry:", // 結果画面の「もう一度」（押すと新しい勝負が始まる）
   "casino:exit:", // 結果画面の退場（自由チップをLandへ返還）
   "casino:daily:", // `/賭場` ホームの福分け受け取りボタン（既存Daily処理へ接続）
+  "casino:home:pvpopen-accept:", // 公開1v1の受諾（この先で両者を一括徴収）
 ];
 
 /**

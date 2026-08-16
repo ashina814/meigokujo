@@ -16,6 +16,7 @@ import { renderCasinoGameSelect } from "../casino/amount-picker.js";
 import { CASINO_SOLO_GAME_EMOJI, isCasinoSoloGame } from "../casino/games.js";
 import { recordCasinoMetricBestEffort } from "../casino/metrics.js";
 import { openingNotice, openingPhase, operatingLabel } from "../casino/opening.js";
+import { isPvpCardButton, handlePvpCardButton } from "../casino/pvp-route.js";
 import { readAvailableWallet } from "../casino/wallet.js";
 import { renderShop } from "./bakuten.js";
 import { itaCreateModal } from "./ita.js";
@@ -52,6 +53,12 @@ export async function handleCasinoHomeCommand(
 }
 
 export async function handleCasinoHomeButton(interaction: ButtonInteraction, services: Services): Promise<void> {
+  // 公開募集カードの accept/cancel は同じ casino:home: 配下だが、通常の本人限定ハブとは
+  // ライフサイクルが別。accept はこの先で同期 claim するので、ここでも呼び出し前に await を置かない。
+  if (isPvpCardButton(interaction.customId)) {
+    await handlePvpCardButton(interaction, services);
+    return;
+  }
   if (interaction.customId === CASINO_PANEL_OPEN) {
     await interaction.reply({
       ...renderCasinoHome(interaction.user.id, services, interaction.guild?.name),
