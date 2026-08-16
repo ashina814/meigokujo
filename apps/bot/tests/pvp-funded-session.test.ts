@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { runFundedSession } from "../src/casino/pvp-common.js";
 
@@ -8,27 +9,27 @@ import { runFundedSession } from "../src/casino/pvp-common.js";
  * 預り金と露出が残る。公開募集では募集カードが3分間チャンネルに晒され、
  * 削除・権限変更で `edit()` が落ちる面積が広いので、ここが最後の防波堤になる。
  */
-describe("fund済みセッションは資金を取り残さない", () => {
-  /** voidPvpTable が実際に触るものだけを最小限で観測する */
-  function fakeServices(onRefund?: () => void) {
-    const calls: string[] = [];
-    const services = {
-      chips: { runGroup: (_opts: unknown, fn: () => void) => fn() },
-      escrow: {
-        // voidPvpTable は pvpParticipants() 経由でこれを引く。
-        // 持たせないと catch へ落ちて参加者列挙を素通りしてしまう
-        list: () => [],
-        refund: (session: string) => {
-          onRefund?.();
-          calls.push(session);
-        },
+/** voidPvpTable が実際に触るものだけを最小限で観測する */
+function fakeServices(onRefund?: () => void) {
+  const calls: string[] = [];
+  const services = {
+    chips: { runGroup: (_opts: unknown, fn: () => void) => fn() },
+    escrow: {
+      // voidPvpTable は pvpParticipants() 経由でこれを引く。
+      // 持たせないと catch へ落ちて参加者列挙を素通りしてしまう
+      list: () => [],
+      refund: (session: string) => {
+        onRefund?.();
+        calls.push(session);
       },
-      dailyRisk: { releaseExposureScope: () => undefined },
-      events: { log: () => undefined },
-    } as never;
-    return { services, calls };
-  }
+    },
+    dailyRisk: { releaseExposureScope: () => undefined },
+    events: { log: () => undefined },
+  } as never;
+  return { services, calls };
+}
 
+describe("fund済みセッションは資金を取り残さない", () => {
   it("精算前に落ちたら返金して、元の例外をそのまま投げる", async () => {
     const { services, calls } = fakeServices();
     const boom = new Error("Missing Permissions");
@@ -109,5 +110,51 @@ describe("二重障害はどちらの入口でも両方残す", () => {
     expect(errors).toHaveLength(2);
     expect(errors[0]?.message, "契約違反そのものが消えている").toContain("exited without settlement or refund");
     expect(errors[1]).toBe(cleanupBoom);
+  });
+});
+
+describe("fund済み後の盤面取得は保護区間の内側にある", () => {
+  it("view.message() が落ちても返金される", async () => {
+    // BJ・インディアンは本体の最初に盤面を取りにいく。ここを runFundedSession の
+    // 外で呼ぶと、fund 済みなのに void されないまま資金が残る
+    const { services, calls } = fakeServices();
+    const boom = new Error("Unknown Message");
+    await expect(
+      runFundedSession(services, "s7", async () => {
+        throw boom; // view.message() の失敗を模す
+      }),
+    ).rejects.toBe(boom);
+    expect(calls, "盤面取得の失敗で資金が残っている").toContain("s7");
+  });
+
+  it("対話型の本体は message() を保護区間の内側で呼ぶ", () => {
+    for (const file of ["bj-duel", "indian"]) {
+      const source = readFileSync(new URL(`../src/casino/${file}.ts`, import.meta.url), "utf8");
+      const sessionAt = source.indexOf("await runFundedSession(");
+      const messageAt = source.indexOf("await view.message()");
+      expect(sessionAt, `${file}: runFundedSession が無い`).toBeGreaterThan(-1);
+      expect(messageAt, `${file}: view.message() が無い`).toBeGreaterThan(-1);
+      expect(messageAt, `${file}: view.message() が保護区間の外`).toBeGreaterThan(sessionAt);
+    }
+  });
+
+  it("指名導線は fund 後に fetchReply をやり直さない", () => {
+    for (const file of ["bj-duel", "indian"]) {
+      const source = readFileSync(new URL(`../src/casino/${file}.ts`, import.meta.url), "utf8");
+      // 受諾待ちで取得済みの reply を factory へ渡し、余計な Discord API を叩かない
+      expect(source, `${file}: 取得済み reply を再利用していない`).toContain(
+        "pvpViewFromInteraction(interaction, reply)",
+      );
+    }
+  });
+});
+
+describe("インディアンは DM 失敗で再戦を出さない", () => {
+  it("返金はするが、再戦オファーの手前で抜ける", () => {
+    const source = readFileSync(new URL("../src/casino/indian.ts", import.meta.url), "utf8");
+    // 切り出し前は playIndian ごと return していたので offerRematch へ到達しなかった。
+    // callback の return はセッションを抜けるだけなので、明示的に止める必要がある
+    expect(source).toContain("rematchEligible = false;");
+    expect(source).toContain("if (!rematchEligible || !rematchInteraction) return;");
   });
 });

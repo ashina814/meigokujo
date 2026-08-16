@@ -82,12 +82,18 @@ export interface FundedPvpContext {
   rematchInteraction?: PvpInteraction;
 }
 
-/** 指名招待（`playX` 内）から本体へ渡す view。編集も collector も招待メッセージへ向く */
-export function pvpViewFromInteraction(interaction: PvpInteraction): PvpView {
+/**
+ * 指名招待（`playX` 内）から本体へ渡す view。編集も collector も招待メッセージへ向く。
+ *
+ * BJ・インディアンは招待の受諾待ちで既に `fetchReply()` 済みなので、その Message を
+ * `knownMessage` へ渡す。fund 後に余計な Discord API を叩かずに済み、
+ * そこで落ちる窓もなくなる。
+ */
+export function pvpViewFromInteraction(interaction: PvpInteraction, knownMessage?: Message): PvpView {
   return {
     edit: (payload) => interaction.editReply(payload),
     followUp: (payload) => interaction.followUp(payload),
-    message: async () => (await interaction.fetchReply()) as Message,
+    message: async () => knownMessage ?? ((await interaction.fetchReply()) as Message),
   };
 }
 

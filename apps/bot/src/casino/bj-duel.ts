@@ -147,7 +147,7 @@ export async function playBjDuel(
     opponent,
     bet,
     session,
-    view: pvpViewFromInteraction(interaction),
+    view: pvpViewFromInteraction(interaction, reply),
     rematchInteraction: interaction,
   });
 }
@@ -165,9 +165,10 @@ export async function playBjDuel(
  */
 export async function runFundedBjDuel(services: Services, ctx: FundedPvpContext): Promise<void> {
   const { challenger, opponent, bet, session, view, rematchInteraction } = ctx;
-  const tableMessage = await view.message();
 
   await runFundedSession(services, session, async (markResolved) => {
+  // fund 済みなので、盤面の取得で落ちてもこの保護区間の内側であること
+  const tableMessage = await view.message();
   const deck = newDeck(services.rng);
   const cHand: Card[] = [deck.pop()!, deck.pop()!];
   const oHand: Card[] = [deck.pop()!, deck.pop()!];

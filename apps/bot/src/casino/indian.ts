@@ -135,7 +135,7 @@ export async function playIndian(
     opponent,
     bet: stake,
     session,
-    view: pvpViewFromInteraction(interaction),
+    view: pvpViewFromInteraction(interaction, reply),
     rematchInteraction: interaction,
   });
 }
@@ -152,9 +152,13 @@ export async function playIndian(
  */
 export async function runFundedIndian(services: Services, ctx: FundedPvpContext): Promise<void> {
   const { challenger, opponent, bet: stake, session, view, rematchInteraction } = ctx;
-  const tableMessage = await view.message();
+  // 金銭的に解決したことと、再戦を提案してよい正常終了かは別概念。
+  // DM が閉じていて対戦を流した場合は返金するが、再戦は出さない（切り出し前の挙動）
+  let rematchEligible = true;
 
   await runFundedSession(services, session, async (markResolved) => {
+  // fund 済みなので、盤面の取得で落ちてもこの保護区間の内側であること
+  const tableMessage = await view.message();
   // 配札
   const cChallenger = draw(services.rng);
   const cOpponent = draw(services.rng);
@@ -177,6 +181,7 @@ export async function runFundedIndian(services: Services, ctx: FundedPvpContext)
   if (dmFailed) {
     refundAll(services, [challenger.id, opponent.id], stake, `${session}:refund:dm_failed`, session);
     markResolved();
+    rematchEligible = false;
     await view.followUp({
       content: `<@${dmFailed}> DM が閉じていて相手のカードを送れなかった。この対戦は流す（両者返金）。`,
       allowedMentions: { users: [dmFailed] },
@@ -289,7 +294,7 @@ export async function runFundedIndian(services: Services, ctx: FundedPvpContext)
 
   });
 
-  if (!rematchInteraction) return;
+  if (!rematchEligible || !rematchInteraction) return;
   await offerRematch(rematchInteraction, {
     aId: challenger.id,
     bId: opponent.id,
