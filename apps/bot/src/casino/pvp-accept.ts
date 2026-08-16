@@ -33,13 +33,15 @@ export interface AcceptDeps {
    * テストで固定したい**から。
    */
   collect?: typeof collectStakes;
+  /** 挑戦者の解決。**徴収より前**に呼ぶ（fund 後の Discord API 失敗を作らないため） */
+  fetchUser?: (interaction: ButtonInteraction, userId: string) => Promise<{ id: string }>;
   /** カードのボタンを外して文面を差し替える。失敗しても募集は戻さない */
   closeCard: (card: Message, text: string) => Promise<unknown>;
 }
 
 export type AcceptOutcome =
   | { ok: true }
-  | { ok: false; reason: "gone" | "self" | "bot" | "defer_failed" | "stakes_failed" };
+  | { ok: false; reason: "gone" | "self" | "bot" | "defer_failed" | "challenger_unresolved" | "stakes_failed" };
 
 export async function acceptPvpChallenge(
   interaction: ButtonInteraction,
@@ -65,7 +67,19 @@ export async function acceptPvpChallenge(
     return { ok: false, reason: "defer_failed" };
   }
 
-  // ── 3. 両者を1回で徴収（誰か駄目なら資金は動かない）──
+  // ── 3. 挑戦者を解決する。**徴収より前**であること ──
+  // 徴収後にここを置くと、Discord API の失敗で runFundedX() へ到達できず、
+  // runFundedSession() の保護区間にも入らないまま資金と露出が残る
+  let challenger: { id: string };
+  try {
+    challenger = await (deps.fetchUser ?? defaultFetchUser)(interaction, challenge.challengerId);
+  } catch (e) {
+    console.error(`[pvp] 挑戦者を解決できず不成立 id=${challengeId}:`, e);
+    await closeQuietly(deps, interaction.message, "挑戦者を確認できないため、この募集は不成立です。");
+    return { ok: false, reason: "challenger_unresolved" };
+  }
+
+  // ── 4. 両者を1回で徴収（誰か駄目なら資金は動かない）──
   const session = `pvpopen:${challengeId}`;
   const stakes = (deps.collect ?? collectStakes)(
     services,
@@ -73,17 +87,16 @@ export async function acceptPvpChallenge(
     challenge.bet,
     `${session}:collect`,
     session,
-    gameLabel(challenge.game),
+    riskGameOf(challenge.game),
   );
   if (!stakes.ok) {
     await closeQuietly(deps, interaction.message, `${stakeFailureText(stakes)}この募集は不成立です。`);
     return { ok: false, reason: "stakes_failed" };
   }
 
-  // ── 4. 募集カードをそのまま対戦盤にして本体へ渡す ──
-  const challenger = await interaction.client.users.fetch(challenge.challengerId);
+  // ── 5. 募集カードをそのまま対戦盤にして本体へ渡す ──
   await deps.runners[challenge.game](services, {
-    challenger,
+    challenger: challenger as never,
     opponent: interaction.user,
     bet: challenge.bet,
     session,
@@ -99,8 +112,13 @@ function claimFailureText(reason: "gone" | "self" | "bot"): string {
   return "この募集は終了しています。";
 }
 
-function gameLabel(game: PvpGameKey): string {
-  return pvpGame(game)?.label ?? game;
+/** 台帳へ入る内部識別子。指名導線と同じ値でなければならない */
+function riskGameOf(game: PvpGameKey): string {
+  return pvpGame(game)?.riskGame ?? game;
+}
+
+async function defaultFetchUser(interaction: ButtonInteraction, userId: string): Promise<{ id: string }> {
+  return interaction.client.users.fetch(userId);
 }
 
 /** 応答できない状況でも処理を止めないため握り潰す */

@@ -121,3 +121,30 @@ describe("どこで失敗しても募集を復活させない", () => {
     expect(retry).toEqual({ ok: false, reason: "gone" });
   });
 });
+
+describe("挑戦者の解決は徴収より前", () => {
+  it("挑戦者を取れなければ徴収も対戦も起きず、再受諾もできない", async () => {
+    const { interaction, deps, collect, run, closeCard } = setup();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    // 徴収後にここが落ちると runFundedSession の保護区間へ入れず資金が残る。
+    // だから解決は徴収より前で、失敗しても1 Ld も動かないこと
+    (deps as { fetchUser?: unknown }).fetchUser = async () => {
+      throw new Error("Unknown User");
+    };
+
+    const result = await acceptPvpChallenge(interaction, {} as never, "c1", deps);
+
+    expect(result).toEqual({ ok: false, reason: "challenger_unresolved" });
+    expect(collect, "挑戦者を確認できないのに資金を動かしている").not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+    expect(closeCard).toHaveBeenCalled();
+    expect(getChallenge("c1")).toBeUndefined();
+  });
+
+  it("台帳へ入る game 名が指名導線と同じ内部識別子になる", async () => {
+    const { interaction, deps, collect } = setup();
+    await acceptPvpChallenge(interaction, {} as never, "c1", deps);
+    // 表示名（"チンチロ"）ではなく、既存の /勝負 チンチロ と同じ値
+    expect(collect.mock.calls[0]?.[5]).toBe("chinchiro-duel");
+  });
+});
