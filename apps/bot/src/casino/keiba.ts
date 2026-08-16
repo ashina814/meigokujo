@@ -302,7 +302,10 @@ function keibaRiskDetail(services: Services, userId: string, error: unknown): st
 
 const activeSessions = new Set<string>();
 
-export async function playKeiba(interaction: ChatInputCommandInteraction, services: import("../services.js").Services): Promise<void> {
+/** `/競馬` と常設ゲームパネルの両方から発走できる。卓はチャンネルへ公開投稿される */
+export type KeibaStarter = ChatInputCommandInteraction | ButtonInteraction;
+
+export async function playKeiba(interaction: KeibaStarter, services: import("../services.js").Services): Promise<void> {
   const channelId = interaction.channelId;
   if (activeSessions.has(channelId)) {
     await interaction.reply({ content: "この卓は既にレース中。", flags: MessageFlags.Ephemeral });
@@ -316,7 +319,7 @@ export async function playKeiba(interaction: ChatInputCommandInteraction, servic
   }
 }
 
-async function runSession(interaction: ChatInputCommandInteraction, services: import("../services.js").Services): Promise<void> {
+async function runSession(interaction: KeibaStarter, services: import("../services.js").Services): Promise<void> {
   const bets = new Map<string, Bet[]>(); // userId -> bets
   const endAt = Date.now() + LOBBY_SEC * 1000;
   const session = `keiba:${interaction.id}`;

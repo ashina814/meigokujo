@@ -197,10 +197,33 @@ export async function handleItaCommand(
 }
 
 async function runCreate(interaction: ChatInputCommandInteraction, services: Services): Promise<void> {
-  const title = interaction.options.getString("議題", true).trim();
-  const rawOptions = interaction.options.getString("選択肢", true);
-  const durationMin = interaction.options.getInteger("締切分", true);
-  const payoutMode = (interaction.options.getString("方式") as PayoutMode | null) ?? "parimutuel";
+  await createMarket(interaction, services, {
+    title: interaction.options.getString("議題", true).trim(),
+    rawOptions: interaction.options.getString("選択肢", true),
+    durationMin: interaction.options.getInteger("締切分", true),
+    payoutMode: (interaction.options.getString("方式") as PayoutMode | null) ?? "parimutuel",
+  });
+}
+
+/**
+ * 板を1件立てる。`/板 立てる` と常設ゲームパネルのモーダルが**同じ経路**を通る。
+ *
+ * 入力の解釈だけを呼び出し側に任せ、手数料・作成・パネル投下・スレッド生成は
+ * ここに閉じ込める。導線が増えても作成処理が分岐しないようにするため。
+ */
+export interface CreateMarketInput {
+  title: string;
+  rawOptions: string;
+  durationMin: number;
+  payoutMode: PayoutMode;
+}
+
+async function createMarket(
+  interaction: ChatInputCommandInteraction | ModalSubmitInteraction,
+  services: Services,
+  input: CreateMarketInput,
+): Promise<void> {
+  const { title, rawOptions, durationMin, payoutMode } = input;
 
   const options = rawOptions.split(/[,、，]/).map((s) => s.trim()).filter(Boolean);
   if (options.length < 2 || options.length > 4) {
@@ -661,7 +684,50 @@ async function runAdminVoid(interaction: ButtonInteraction, services: Services, 
 }
 
 // ─── modal / select dispatch ────────────────────────
+/** 常設ゲームパネル／賭場ハブの「板を立てる」から開くモーダル */
+export const ITA_CREATE_MODAL = "ita:create";
+
+export function itaCreateModal(): ModalBuilder {
+  return new ModalBuilder()
+    .setCustomId(ITA_CREATE_MODAL)
+    .setTitle("板を立てる")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("title").setLabel("議題").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(100),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("options")
+          .setLabel("選択肢（2〜4個・カンマ区切り）")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(200),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId("minutes").setLabel("締切まで何分").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(4),
+      ),
+    );
+}
+
+async function handleItaCreateModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
+  const raw = interaction.fields.getTextInputValue("minutes").trim();
+  const durationMin = Number(raw);
+  if (!Number.isInteger(durationMin) || durationMin < 1 || durationMin > 1440) {
+    await interaction.reply({ content: "締切は 1〜1440 分の整数で。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await createMarket(interaction, services, {
+    title: interaction.fields.getTextInputValue("title").trim(),
+    rawOptions: interaction.fields.getTextInputValue("options"),
+    durationMin,
+    // モーダルはセレクトを持てないので、パネル経由は既定の parimutuel 固定。
+    // 方式を選びたいときは `/板 立てる` を使う
+    payoutMode: "parimutuel",
+  });
+}
+
 export async function handleItaModal(interaction: ModalSubmitInteraction, services: Services): Promise<void> {
+  if (interaction.customId === ITA_CREATE_MODAL) return handleItaCreateModal(interaction, services);
   const parts = interaction.customId.split(":"); // ita:amt:marketId:optionIndex:btnId
   const marketId = Number(parts[2]);
   const optionIndex = Number(parts[3]);

@@ -61,6 +61,9 @@ import {
   importHome as subImportHome,
 } from "./sub-account-import.js";
 import { isAdmin } from "../permissions.js";
+// パネル種別の正本は panel-kinds.ts（データだけの葉モジュール）。
+// 描画を持つ bank-panel.ts を静的 import すると循環するので、選択肢はこちらから作る
+import { installablePanelChoices, removablePanelChoices } from "./panel-kinds.js";
 import { ROLE_SLOT_META, ROLE_SLOT_ORDER, getRoleIds, setRoleIds, type RoleSlot } from "../church-roles.js";
 import {
   getSpecialProfiles,
@@ -1445,25 +1448,6 @@ function sprofModal(services: Services, roleId: string) {
 
 // ---- パネルサブパネル ----
 
-const PANEL_KIND_CHOICES: Array<[string, string]> = [
-  ["bank", "冥獄銀行"],
-  ["entry", "入城申請"],
-  ["rank", "ランク確認"],
-  ["shop", "公式ショップ"],
-  ["takutate", "卓建て"],
-  ["ticket_return", "出戻り申請"],
-  ["ticket_consult", "個別相談"],
-  ["confession", "トートの耳（匿名タレコミ）"],
-  ["room_normal", "宿"],
-  ["room_mitsugetsu", "蜜月"],
-  ["room_oborozuki", "朧月"],
-  ["room_game", "ゲーム部屋"],
-  ["dept", "部署運用"],
-];
-
-// 廃止済みで新規設置はできないが、既に設置してあるものを撤去する必要がある種別
-const RETIRED_PANEL_KIND_CHOICES: Array<[string, string]> = [["entry_flex", "時間外希望受付（廃止・撤去用）"]];
-
 function panelHome(services: Services) {
   const ticketPanels = services.tickets.listPanels().length;
   const embed = new EmbedBuilder()
@@ -1486,7 +1470,7 @@ function panelInstallPicker() {
   const menu = new StringSelectMenuBuilder()
     .setCustomId("mgmt:panel:install-pick")
     .setPlaceholder("設置するパネルを選ぶ")
-    .addOptions(PANEL_KIND_CHOICES.map(([v, name]) => ({ label: name, value: v })));
+    .addOptions(installablePanelChoices().map(({ name, value }) => ({ label: name, value })));
   return {
     embeds: [new EmbedBuilder().setTitle("🪧 パネル設置").setDescription("今いるチャンネルに設置します。")],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu), backButton()],
@@ -1497,9 +1481,7 @@ function panelRemovePicker() {
   const menu = new StringSelectMenuBuilder()
     .setCustomId("mgmt:panel:remove-pick")
     .setPlaceholder("撤去するパネルを選ぶ")
-    .addOptions(
-      [...PANEL_KIND_CHOICES, ...RETIRED_PANEL_KIND_CHOICES].map(([v, name]) => ({ label: name, value: v })),
-    );
+    .addOptions(removablePanelChoices().map(({ name, value }) => ({ label: name, value })));
   return {
     embeds: [new EmbedBuilder().setTitle("🪧 パネル撤去").setDescription("今いるチャンネルから撤去します。")],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu), backButton()],
