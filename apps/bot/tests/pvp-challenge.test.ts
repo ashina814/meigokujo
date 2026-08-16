@@ -78,13 +78,37 @@ describe("claim は timeout を巻き込まない", () => {
     expect(onExpire).not.toHaveBeenCalled();
   });
 
-  it("誰も受けなければ3分で期限切れになり、以後は受けられない", () => {
+  it("誰も受けなければ3分で期限切れになり、以後は受けられない", async () => {
     vi.useFakeTimers();
     const onExpire = vi.fn();
     open(onExpire);
     vi.advanceTimersByTime(CHALLENGE_WINDOW_MS + 1);
+    // onExpire は表示失敗を隔離するため microtask 経由で呼ばれる
+    await vi.runAllTimersAsync();
     expect(onExpire).toHaveBeenCalledTimes(1);
     expect(onExpire.mock.calls[0]![0].state).toBe("expired");
     expect(claimChallenge("c1", "bob", false).ok).toBe(false);
+  });
+});
+
+describe("同じIDの募集を二重に作れない", () => {
+  it("重複IDは拒否される", () => {
+    open();
+    expect(() => open()).toThrow("Duplicate challenge id");
+  });
+
+  it("期限切れ表示が落ちても募集は復活しない", async () => {
+    vi.useFakeTimers();
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    open(() => {
+      throw new Error("Unknown Message");
+    });
+    vi.advanceTimersByTime(CHALLENGE_WINDOW_MS + 1);
+    await vi.runAllTimersAsync();
+
+    // 表示に失敗しても expired のまま。受諾できるように戻らない
+    expect(claimChallenge("c1", "bob", false).ok).toBe(false);
+    expect(err).toHaveBeenCalled();
+    err.mockRestore();
   });
 });

@@ -48,8 +48,11 @@ export function createChallenge(input: {
   game: PvpGameKey;
   bet: number;
   channelId: string;
-  onExpire: (challenge: PvpChallenge) => void;
+  onExpire: (challenge: PvpChallenge) => void | Promise<void>;
 }): PvpChallenge {
+  // 同じ ID を二度使うと、古い timer が新しい challenge を expire させられる。
+  // 実運用では randomUUID なので起きないが、状態機械の不変条件として塞ぐ
+  if (challenges.has(input.id)) throw new Error(`Duplicate challenge id: ${input.id}`);
   const challenge: PvpChallenge = {
     id: input.id,
     challengerId: input.challengerId,
@@ -61,12 +64,18 @@ export function createChallenge(input: {
   };
   challenge.timer = setTimeout(() => {
     // claim 側が timer を解除し損ねても、ここで状態を二重に確認して
-    // 進行中の対戦盤を「募集終了」で潰さないようにする
+    // 進行中の対戦盤を「募集終了」で潰さないようにする。
+    // 同一性まで見るのは、同じ ID の別 challenge を巻き込まないため
     const current = challenges.get(input.id);
-    if (!current || current.state !== "open") return;
+    if (current !== challenge || current.state !== "open") return;
     current.state = "expired";
     challenges.delete(input.id);
-    input.onExpire(current);
+    // **expired への遷移自体は成功扱い。** 期限切れカードの更新（Discord API）が
+    // 失敗しても challenge を復活させず、timer 由来の未処理例外で
+    // Bot プロセスを巻き込まない
+    void Promise.resolve()
+      .then(() => input.onExpire(current))
+      .catch((e) => console.error(`[pvp] 募集の期限切れ表示に失敗 id=${input.id}:`, e));
   }, CHALLENGE_WINDOW_MS);
   challenges.set(input.id, challenge);
   return challenge;
