@@ -74,9 +74,10 @@ export type AcceptOutcome =
         | "stakes_failed";
     };
 
+type ReservedClaimFailureReason = "gone" | "self" | "bot" | "challenger_busy" | "accepter_busy";
 type ReservedClaimResult =
   | { ok: true; challenge: PvpChallenge; session: string }
-  | { ok: false; reason: "gone" | "self" | "bot" | "challenger_busy" | "accepter_busy" };
+  | { ok: false; reason: ReservedClaimFailureReason };
 
 export async function acceptPvpChallenge(
   interaction: ButtonInteraction,
@@ -221,7 +222,7 @@ function collectAndStartFunded(
   };
 }
 
-function claimFailureText(reason: ReservedClaimResult extends infer _ ? "gone" | "self" | "bot" | "challenger_busy" | "accepter_busy" : never): string {
+function claimFailureText(reason: ReservedClaimFailureReason): string {
   if (reason === "self") return "自分の募集は受けられません。";
   if (reason === "bot") return "ボットは参加できません。";
   if (reason === "challenger_busy") return "挑戦者がほかの卓に参加中です。終わってからもう一度受けてください。";
