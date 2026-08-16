@@ -22,6 +22,7 @@ import type { Services } from "../services.js";
 
 const TARGETS_PER_MENU = 25;
 const MAX_TARGET_MENUS = 5;
+const MEMBER_FETCH_BATCH = 100;
 
 /** 同じBotプロセス内で、同一評価サイクルのDiscord threadを二重生成しない。 */
 const threadCreationLocks = new Map<string, Promise<AnyThreadChannel | null>>();
@@ -109,6 +110,61 @@ function isPendingJudgement(deadlineAt: number | null, nowSec: number): boolean 
   return deadlineAt !== null && deadlineAt <= nowSec;
 }
 
+function discordErrorCode(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  const code = Number((error as { code?: unknown }).code);
+  return Number.isFinite(code) ? code : undefined;
+}
+
+async function fetchEvaluationMembers(
+  guild: Guild,
+  userIds: string[],
+): Promise<{ members: Map<string, GuildMember>; unresolvedIds: Set<string> }> {
+  const ids = [...new Set(userIds.filter(Boolean))];
+  const members = new Map<string, GuildMember>();
+  const unresolvedIds = new Set<string>();
+
+  for (let offset = 0; offset < ids.length; offset += MEMBER_FETCH_BATCH) {
+    const chunk = ids.slice(offset, offset + MEMBER_FETCH_BATCH);
+    try {
+      // サーバー全員ではなく、現在の評価サイクルにいる対象だけをまとめて取得する。
+      const fetched = await guild.members.fetch({ user: chunk });
+      for (const [userId, member] of fetched) members.set(userId, member);
+      continue;
+    } catch (error) {
+      console.warn(
+        `[eval-forum] targeted member fetch failed; falling back to per-user fetch (${chunk.length} targets)`,
+        error,
+      );
+    }
+
+    await Promise.all(
+      chunk.map(async (userId) => {
+        try {
+          const member = await guild.members.fetch({ user: userId, force: true });
+          members.set(userId, member);
+        } catch (error) {
+          // DiscordのUnknown Memberは「退城済み」として正常に一覧から除外する。
+          if (discordErrorCode(error) === 10007) return;
+
+          // 一時的なAPI/Gateway失敗では、既に観測済みのcacheを使って一覧全体を殺さない。
+          const cached = guild.members.cache.get(userId);
+          if (cached) {
+            members.set(userId, cached);
+            console.warn(`[eval-forum] member fetch failed; using cache user=${userId}`, error);
+            return;
+          }
+
+          unresolvedIds.add(userId);
+          console.error(`[eval-forum] member fetch failed user=${userId}`, error);
+        }
+      }),
+    );
+  }
+
+  return { members, unresolvedIds };
+}
+
 async function targetMenus(
   guild: Guild,
   services: Services,
@@ -122,6 +178,7 @@ async function targetMenus(
   pendingTotal: number;
   pendingShown: number;
   memberIds: Set<string>;
+  unresolvedIds: Set<string>;
 }> {
   const store = new EvaluationForumStore(services.db);
   const cycles = store.listCurrentCycles();
@@ -135,11 +192,13 @@ async function targetMenus(
       pendingTotal: 0,
       pendingShown: 0,
       memberIds: new Set(),
+      unresolvedIds: new Set(),
     };
   }
 
-  // Guild在籍を正本として一覧を作る。取得失敗時は呼び出し側で再試行を案内し、ID表示へは逃がさない。
-  const members = await guild.members.fetch();
+  // Guild在籍を正本として一覧を作る。ただし全Guild member取得には依存せず、評価対象だけを照会する。
+  // excludeUserIdも在籍再確認には必要なので、fetch対象からは除外しない。
+  const { members, unresolvedIds } = await fetchEvaluationMembers(guild, cycles.map((cycle) => cycle.userId));
   const memberIds = new Set(members.keys());
   const presentCycles = cycles.filter((cycle) => cycle.userId !== excludeUserId && memberIds.has(cycle.userId));
   const nowSec = Math.floor(Date.now() / 1000);
@@ -201,6 +260,7 @@ async function targetMenus(
     pendingTotal: pendingCycles.length,
     pendingShown: pendingShownCycles.length,
     memberIds,
+    unresolvedIds,
   };
 }
 
@@ -212,32 +272,42 @@ async function replyWithTargetMenus(
     await interaction.reply({ content: "サーバー内で使用してください。", flags: MessageFlags.Ephemeral });
     return;
   }
+
+  // member取得が遅れてもDiscordの3秒制限でinteractionを失わないよう、先に応答を確保する。
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
   let menus: Awaited<ReturnType<typeof targetMenus>>;
   try {
     menus = await targetMenus(interaction.guild, services);
-  } catch {
-    await interaction.reply({
-      content: "メンバー一覧の取得に失敗しました。もう一度押してください。",
-      flags: MessageFlags.Ephemeral,
+  } catch (error) {
+    console.error("[eval-forum] target menu build failed", error);
+    await interaction.editReply({
+      content: "評価対象一覧の作成に失敗しました。もう一度押してください。",
+      components: [],
     });
     return;
   }
   if (menus.total === 0) {
-    await interaction.reply({
-      content: "現在、サーバーに在籍している評価対象・判定待ちの亡霊はいません。",
-      flags: MessageFlags.Ephemeral,
+    await interaction.editReply({
+      content:
+        menus.unresolvedIds.size > 0
+          ? `評価対象 ${menus.unresolvedIds.size}名の在籍確認に失敗しました。もう一度押してください。`
+          : "現在、サーバーに在籍している評価対象・判定待ちの亡霊はいません。",
+      components: [],
     });
     return;
   }
   const omitted = menus.total - menus.shown;
   const summary = `評価期間中 **${menus.activeTotal}名** / ⏳ 期限超過・判定待ち **${menus.pendingTotal}名**`;
-  await interaction.reply({
+  const unresolved = menus.unresolvedIds.size > 0
+    ? `\n⚠️ 在籍確認できなかった評価対象が ${menus.unresolvedIds.size}名います。確認できた対象だけ表示しています。`
+    : "";
+  await interaction.editReply({
     content:
-      omitted > 0
+      (omitted > 0
         ? `${summary}です。Discordの表示上限のため、評価期間中 ${menus.activeShown}/${menus.activeTotal}名・判定待ち ${menus.pendingShown}/${menus.pendingTotal}名を表示しています。`
-        : `${summary}です。対象を選んでください。`,
+        : `${summary}です。対象を選んでください。`) + unresolved,
     components: menus.rows,
-    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -291,9 +361,10 @@ export async function handleEvaluationSelect(
   let menus: Awaited<ReturnType<typeof targetMenus>>;
   try {
     menus = await targetMenus(interaction.guild, services, targetId);
-  } catch {
+  } catch (error) {
+    console.error("[eval-forum] target menu refresh failed", error);
     await interaction.editReply({
-      content: "メンバー一覧の取得に失敗しました。もう一度パネルの［評価する亡霊を選択］を押してください。",
+      content: "評価対象一覧の作成に失敗しました。もう一度パネルの［評価する亡霊を選択］を押してください。",
       components: [],
     });
     return;
@@ -308,11 +379,18 @@ export async function handleEvaluationSelect(
     });
     return;
   }
+  if (menus.unresolvedIds.has(targetId)) {
+    await interaction.editReply({
+      content: "この人の在籍確認に失敗しました。もう一度パネルから開き直してください。",
+      components: menus.rows,
+    });
+    return;
+  }
   if (!menus.memberIds.has(targetId)) {
     await interaction.editReply({
       content: [
         "この人は現在サーバーに在籍していないため、評価対象一覧から外れました。",
-        menus.total > 0 ? "**続けて別の亡霊を選択できます。**" : "現在ほかに選択できる亡霊はいません。",
+        menus.total > 0 ? "**続けて別の亡霊も選択できます。**" : "現在ほかに選択できる亡霊はいません。",
       ].join("\n\n"),
       components: menus.rows,
     });
