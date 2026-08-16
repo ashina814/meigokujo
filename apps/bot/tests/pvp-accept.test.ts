@@ -84,6 +84,26 @@ function setup(opts: { stakesOk?: boolean; deferThrows?: boolean } = {}) {
   return { interaction, deps, order, collect, run, closeCard };
 }
 
+function realCollectServices(opts: { holdThrows?: boolean } = {}) {
+  const holdAll = vi.fn(() => {
+    if (opts.holdThrows) throw new Error("escrow unavailable");
+    return true;
+  });
+  const authorizeExposure = vi.fn(() => undefined);
+  const revokeExposure = vi.fn(() => undefined);
+  const exposureOf = vi.fn(() => null);
+  return {
+    holdAll,
+    authorizeExposure,
+    revokeExposure,
+    exposureOf,
+    value: {
+      dailyRisk: { authorizeExposure, revokeExposure, exposureOf },
+      escrow: { holdAll },
+    } as never,
+  };
+}
+
 describe("受諾は 席確保 → claim → defer → 徴収 → 本体 の順で進む", () => {
   it("正常系の順序が固定される", async () => {
     const { interaction, deps, order, collect, run } = setup();
@@ -213,6 +233,47 @@ describe("どこで失敗しても募集を復活させない", () => {
 
     const retry = await acceptPvpChallenge(interaction, {} as never, "c1", deps);
     expect(retry).toEqual({ ok: false, reason: "gone" });
+  });
+});
+
+describe("本物の collectStakes と公開受諾の接続", () => {
+  it("claim 前に取った同じ scope の参加席へ reentrant し、holdAll を1回だけ呼ぶ", async () => {
+    const { interaction, deps, run } = setup();
+    delete (deps as { collect?: unknown }).collect;
+    const services = realCollectServices();
+
+    const result = await acceptPvpChallenge(interaction, services.value, "c1", deps);
+
+    expect(result).toEqual({ ok: true });
+    expect(services.authorizeExposure).toHaveBeenCalledTimes(2);
+    expect(services.holdAll).toHaveBeenCalledTimes(1);
+    expect(services.holdAll).toHaveBeenCalledWith(
+      "pvpopen:c1",
+      ["alice", "bob"],
+      1_000,
+      "chinchiro-duel",
+      "pvpopen:c1:collect",
+    );
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("本物の collectStakes が技術例外を投げても rollback 後にカードを閉じる", async () => {
+    const { interaction, deps, run, closeCard } = setup();
+    delete (deps as { collect?: unknown }).collect;
+    const services = realCollectServices({ holdThrows: true });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await acceptPvpChallenge(interaction, services.value, "c1", deps);
+
+    expect(result).toEqual({ ok: false, reason: "stakes_failed" });
+    expect(services.holdAll).toHaveBeenCalledTimes(1);
+    expect(services.revokeExposure).toHaveBeenCalledTimes(2);
+    expect(run).not.toHaveBeenCalled();
+    expect(closeCard).toHaveBeenCalledTimes(1);
+    expect(closeCard.mock.calls[0]?.[1]).toContain("賭け金を確認できない");
+    expect(hasTransientParticipation("alice")).toBe(false);
+    expect(hasTransientParticipation("bob")).toBe(false);
+    expect(getChallenge("c1")).toBeUndefined();
   });
 });
 
