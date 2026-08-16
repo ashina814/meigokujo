@@ -35,21 +35,15 @@ export interface PvpView {
    *
    * **不変条件: `edit()` と `message()` は必ず同じ Discord メッセージを指す。**
    * ズレると「画面Aを編集しているのに collector は画面Bに張る」状態になる。
-   * この型を手で組み立てず、必ず下の factory を使うこと。
+   *
+   * これは**規約であって型強制ではない**（structural interface なので手でも作れる）。
+   * 新しい入口を足すときは必ず下の factory を使うこと。
    */
   message: () => Promise<Message>;
 }
 
 /**
- * **両者の徴収が済んだ**対戦の実行文脈。
- *
- * ⚠️ `collectStakes()` が challenger・opponent の**両方について成功済み**であることを
- * 前提とする。この型を取る `runFunded*` 系を新しい入口から直接呼ばないこと。
- * 必ず指名招待の受諾処理か、公開募集の成立処理を経由する
- * ——さもないと、資金を確保しないまま勝敗と配当だけが確定する。
- */
-/**
- * 資金ライフサイクルは入口ごとに違う。**本体は「両者 fund 済み」の後だけ動く。**
+ * **両者の徴収が済んだ**対戦の実行文脈。資金ライフサイクルは入口ごとに違う。**本体は「両者 fund 済み」の後だけ動く。**
  *
  * ```text
  * /勝負（指名）        公開募集
@@ -66,6 +60,10 @@ export interface PvpView {
  * 参加者全員の排他・日次リスク・残高を見てから `holdAll()` で一括確保し、
  * 誰か一人でも駄目なら資金を動かさず戻す設計だから。分けて呼ぶと
  * 「挑戦者だけ一瞬徴収 → 受諾者失敗 → 返金」という中間状態を自分で作ることになる。
+ *
+ * ⚠️ **`collectStakes()` が challenger・opponent の両方について成功済みであることを前提とする。**
+ * この型を取る `runFunded*` 系を新しい入口から直接呼ばないこと。必ず指名招待の受諾処理か、
+ * 公開募集の成立処理を経由する——さもないと、資金を確保しないまま勝敗と配当だけが確定する。
  */
 export interface FundedPvpContext {
   challenger: User;
@@ -103,7 +101,7 @@ export function pvpViewFromMessage(card: Message): PvpView {
     followUp: async (payload) => {
       const channel = card.channel;
       // PartialGroupDMChannel だけ send を持たない。届けられないなら握り潰さず
-      // カード自身へ追記して、決着が消えないようにする
+      // カード自身を最終結果へ更新して、決着が消えないようにする
       if (!("send" in channel)) return card.edit(payload);
       return channel.send(payload);
     },
@@ -374,6 +372,39 @@ function pvpRiskDetail(services: Services, userId: string, error: unknown): stri
  *
  * PR23: 返金は純損益0なので当日枠は動かさない。資金が戻ってから露出と席を解く。
  */
+/**
+ * **両者 fund 済みの本体**を、資金を取り残さずに実行する。
+ *
+ * 本体は最初に `view.edit()` を呼ぶ。公開募集ではその瞬間に募集カードが削除・
+ * 権限変更されている可能性があり（3分間チャンネルに晒されるので面積が広い）、
+ * edit が throw すると勝敗にも返金にも精算にも到達しないまま、両者の預り金と
+ * 露出だけが残る。BJ・インディアンは対戦中ずっと edit と collector を使うので、
+ * 窓はさらに広い。
+ *
+ * そこで「**精算・返金が終わる前に落ちたら必ず void する**」を4ゲーム共通の
+ * 不変条件にする。逆に、`settlePvp()` / `refundAll()` が成功した後に Discord API
+ * だけ落ちた場合は**金銭処理を巻き戻さない**——表示できなかったことを理由に
+ * 確定済みの勝敗を消してはいけない。
+ *
+ * したがって `markResolved()` を呼ぶ位置は**精算・返金の直後**であって、
+ * 表示の成功ではない。
+ */
+export async function runFundedSession(
+  services: Services,
+  session: string,
+  run: (markResolved: () => void) => Promise<void>,
+): Promise<void> {
+  let resolved = false;
+  try {
+    await run(() => {
+      resolved = true;
+    });
+  } catch (error) {
+    if (!resolved) voidPvpTable(services, session);
+    throw error;
+  }
+}
+
 export function refundAll(services: Services, userIds: string[], bet: number, operationId: string, session: string): void {
   services.escrow.refundMany(session, userIds, operationId);
   releasePvpParticipants(services, session, userIds);
