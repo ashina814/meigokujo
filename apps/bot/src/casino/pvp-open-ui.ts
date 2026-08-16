@@ -205,17 +205,15 @@ async function postPvpChallenge(
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const g = pvpGame(game);
+  let card: Awaited<ReturnType<typeof postChallenge>>;
   try {
-    const card = await postChallenge({
+    card = await postChallenge({
       channel: channel as Parameters<typeof postChallenge>[0]["channel"],
       challengerId: interaction.user.id,
       game,
       bet: amount,
       onExpire: (_challenge, expiredCard) =>
         closeChallengeCard(expiredCard, "⌛ 3分経過したため、この募集は締め切りました。"),
-    });
-    await interaction.editReply({
-      content: `${g?.emoji ?? "⚔"} **${g?.label ?? game} / ${fmtLd(amount)}** で募集を出しました。3分以内に誰かが受ければ開始します。\n${card.url}`,
     });
   } catch (e) {
     // postChallenge は、send 後の登録失敗なら公開済みカードを先に閉じてから投げる。
@@ -225,6 +223,17 @@ async function postPvpChallenge(
     }
     console.error("[pvp] 公開募集の投稿に失敗:", e);
     await interaction.editReply({ content: "❌ 募集を開始できませんでした。時間を置いてもう一度試してください。" });
+    return;
+  }
+
+  // ここまで来たら公開カードと challenge は成立済み。確認用の ephemeral 表示だけが
+  // 失敗しても、成功済みの募集を「既存募集エラー」へ誤分類したり閉じたりしない。
+  try {
+    await interaction.editReply({
+      content: `${g?.emoji ?? "⚔"} **${g?.label ?? game} / ${fmtLd(amount)}** で募集を出しました。3分以内に誰かが受ければ開始します。\n${card.url}`,
+    });
+  } catch (e) {
+    console.error("[pvp] 募集開始後の確認表示に失敗:", e);
   }
 }
 
