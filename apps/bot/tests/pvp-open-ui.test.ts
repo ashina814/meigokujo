@@ -114,6 +114,22 @@ describe("公開募集の投稿", () => {
     expect(getOpenChallengeForChallenger("alice")?.game).toBe("sashi");
   });
 
+  it("募集成功後の確認 editReply だけ落ちても、募集を成功状態のまま維持する", async () => {
+    const s = services();
+    const { interaction, send } = buttonInteraction(`${PVP_POST_PREFIX}chinchiro:500`);
+    interaction.editReply = vi.fn(async () => {
+      throw new Error("Unknown interaction");
+    }) as never;
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await expect(handlePvpOpenSetupButton(interaction, s.value)).resolves.toBeUndefined();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(interaction.editReply).toHaveBeenCalledTimes(1);
+    expect(getOpenChallengeForChallenger("alice")?.state).toBe("open");
+    expect(errorLog).toHaveBeenCalledWith("[pvp] 募集開始後の確認表示に失敗:", expect.any(Error));
+  });
+
   it("3分経過で募集を終端表示にしてボタンを外す", async () => {
     vi.useFakeTimers();
     const s = services();
