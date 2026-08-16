@@ -23,9 +23,6 @@ import { vipCommand } from "./commands/vip.js";
 import { nagareboshiCommand } from "./commands/nagareboshi.js";
 import { itaCommand } from "./commands/ita.js";
 import { casinoHomeCommand } from "./commands/casino-home.js";
-import { casinoEmployeeCommand } from "./commands/casino-employee.js";
-import { casinoEvidenceCommand } from "./commands/casino-evidence.js";
-import { casinoArbitrationCommand } from "./commands/casino-arbitration.js";
 
 // /管理 はBot内部で OWNER_ID / 管理コマンド利用ロールを検証する。
 // Discord側のManageGuild制限を外し、設定したロール保持者にもコマンドを表示する。
@@ -47,9 +44,6 @@ const commands = [
   rankingCommand.toJSON(),
   helpCommand.toJSON(),
   casinoHomeCommand.toJSON(),
-  casinoEmployeeCommand.toJSON(),
-  casinoEvidenceCommand.toJSON(),
-  casinoArbitrationCommand.toJSON(),
   asobuCommand.toJSON(),
   dailyCommand.toJSON(),
   passportCommand.toJSON(),

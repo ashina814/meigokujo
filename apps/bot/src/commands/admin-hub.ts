@@ -30,7 +30,6 @@ import {
   ChipLedgerError,
   HOUSE_HOLDER,
   LedgerError,
-  RANKED_TABLE_TIERS,
   readCasinoOpeningConfig,
   type RefundSaga,
   type TicketPanel,
@@ -62,7 +61,6 @@ import {
   importHome as subImportHome,
 } from "./sub-account-import.js";
 import { isAdmin } from "../permissions.js";
-import { registerTrustedRankedProfile } from "./casino-employee.js";
 import { ROLE_SLOT_META, ROLE_SLOT_ORDER, getRoleIds, setRoleIds, type RoleSlot } from "../church-roles.js";
 import {
   getSpecialProfiles,
@@ -84,7 +82,7 @@ import {
   openingOpsField,
   openingOpsRows,
 } from "../casino/opening-ops.js";
-import { recoverCasinoWithPersistentTables } from "../casino/persistent-table-recovery.js";
+import { runCasinoRecovery } from "../casino/recovery-run.js";
 import { ticketPanelMessageForPanel } from "./tickets.js";
 import { handleLegacyNameImportRun, legacyNameImportConfirm, previewLegacyImport } from "../nickname-import.js";
 import { denylistHome, handleDenywordButton, handleDenywordModal, handleDenywordRemove } from "./denylist-hub.js";
@@ -312,37 +310,6 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
     }
     return void (await interaction.showModal(casinoReopenModal(cur.reason)));
   }
-  if (section === "casino" && action === "profile") return void (await interaction.showModal(rankedProfileModal()));
-  if (section === "casino" && action === "unlock") return void (await interaction.update(rankedUnlockPanel(services)));
-  if (section === "casino" && action === "unlock-toggle") {
-    // 段階解放の切り替え。**資金は1 Ld も動かない**（開催可否の設定だけ）。
-    // 極 → 冥獄 の順に1段ずつ入れる運用なので、極が閉じたまま冥獄だけ開けさせない。
-    const tierKey = parts[3] ?? "";
-    const key = RANKED_UNLOCK_SETTING[tierKey];
-    if (!key) {
-      return void (await interaction.reply({ content: "❌ 未知の卓ランクです。", flags: MessageFlags.Ephemeral }));
-    }
-    const next = services.settings.getNumber(key) === 1 ? 0 : 1;
-    if (tierKey === "meigoku" && next === 1 && services.settings.getNumber("casino_extreme_enabled") !== 1) {
-      return void (await interaction.reply({
-        content: "❌ 冥獄卓は極卓を解放してからにしてください（段階解放は1段ずつ）。",
-        flags: MessageFlags.Ephemeral,
-      }));
-    }
-    if (tierKey === "extreme" && next === 0 && services.settings.getNumber("casino_meigoku_enabled") === 1) {
-      return void (await interaction.reply({
-        content: "❌ 冥獄卓が解放中です。先に冥獄卓を閉じてください。",
-        flags: MessageFlags.Ephemeral,
-      }));
-    }
-    services.settings.set(key, String(next), interaction.user.id);
-    services.events.log("casino_ranked_tier_unlock_changed", {
-      actor: interaction.user.id,
-      target: tierKey,
-      payload: { unlocked: next === 1 },
-    });
-    return void (await interaction.update(rankedUnlockPanel(services)));
-  }
   if (section === "casino" && action === "baseline") {
     return void (await interaction.showModal(
       casinoBaselineModal(services.chips.pool(), services.ledger.lastTransactionId()),
@@ -368,7 +335,7 @@ export async function handleAdminButton(interaction: ButtonInteraction, services
     // 呼び出しそのもの（deps の組み立て等）で万一例外が出ても interaction を無応答で
     // 終わらせない・成功したかのような表示を出さないための防御（PR7監査・二次レビュー）。
     try {
-      const r = await recoverCasinoWithPersistentTables(interaction.client, services);
+      const r = runCasinoRecovery(services);
       const detail = [
         `維持 ${r.keptHolders}件 / 孤児返金 ${r.refundedSessions}件 / 隔離 ${r.quarantined}件`,
         `不一致 ${r.mismatched.length}件 / 返金失敗 ${r.failedSessions.length}件`,
@@ -668,37 +635,6 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
 
   if (section === "denyword" && action === "save") return void (await handleDenywordModal(interaction, services));
 
-  if (section === "casino" && action === "profile") {
-    // 汎用順位卓の順位配分は**運営だけ**が登録できる（PR24）。従業員は登録済みから選ぶだけ。
-    // 妥当性（ゼロ和・整数Land・受取非負・プール保存）は core の validateRankProfile がそのまま判定する
-    const profileKey = interaction.fields.getTextInputValue("profile_key").trim();
-    const label = interaction.fields.getTextInputValue("label").trim();
-    const deltas = parseRankDeltaTokens(interaction.fields.getTextInputValue("deltas"));
-    if (!deltas) {
-      await interaction.reply({
-        content: [
-          "順位配分は**10進整数だけ**を2つ以上、カンマか空白区切りで入力してください。",
-          "例: `10000, 0, -10000`",
-          "小数・指数表記・16進数・数字以外の語が1つでも混ざっていれば登録しません（読み飛ばしません）。",
-        ].join("\n"),
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    const result = registerTrustedRankedProfile(interaction, services, {
-      profileKey,
-      label,
-      participantCount: deltas.length,
-      rankDeltaBps: deltas,
-    });
-    await interaction.reply({
-      content: result.ok
-        ? `順位配分「${label}」(\`${profileKey}\`) を登録しました。従業員パネルの「卓を開く」から選べます。`
-        : `❌ 登録できません: ${result.reason}`,
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
   if (section === "casino" && action === "refund-user") {
     const targetId = interaction.fields.getTextInputValue("user_id").trim();
     if (!/^\d{15,22}$/.test(targetId)) {
@@ -2444,22 +2380,6 @@ function casinoHome(services: Services) {
         .setDisabled(phase !== "formal"),
     ),
   );
-  // PR24: 汎用順位卓の順位配分を登録する（資金は動かない。従業員へ選択肢を配るだけ）
-  rows.push(
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId("mgmt:casino:profile")
-        .setLabel("汎用順位卓の配分を登録")
-        .setEmoji("🧮")
-        .setStyle(ButtonStyle.Secondary),
-      // 極卓・冥獄卓の段階解放。開催可否だけを変える（資金は動かない）
-      new ButtonBuilder()
-        .setCustomId("mgmt:casino:unlock")
-        .setLabel("順位卓の段階解放")
-        .setEmoji("🔓")
-        .setStyle(ButtonStyle.Secondary),
-    ),
-  );
   // 検算Bの基準が無い版（PR2 以前から動いていたDB）だけ、明示的な基準確定を出す
   if (services.chipTx.openingLandBaseline() === null) {
     rows.push(
@@ -2473,98 +2393,6 @@ function casinoHome(services: Services) {
     );
   }
   return { embeds: [embed], components: [...rows, backButton()] };
-}
-
-/**
- * 段階解放の対象と、対応する設定キー。
- *
- * 見習〜超高卓は通常営業なので**ここに載せない**（設定を持たない＝常に開ける）。
- * 一律の時間クールダウンは廃止した。時間で勝手に開くと「いま開けてよいか」の判断が
- * 運営の手を離れるうえ、設定値が未投入だと逆に全ランクが死ぬ事故が起きたため。
- */
-const RANKED_UNLOCK_SETTING: Readonly<Record<string, "casino_extreme_enabled" | "casino_meigoku_enabled">> = {
-  extreme: "casino_extreme_enabled",
-  meigoku: "casino_meigoku_enabled",
-};
-
-/** 段階解放パネル。ここでの操作は開催可否だけを変え、資金には一切触れない */
-function rankedUnlockPanel(services: Services) {
-  const tiers = RANKED_TABLE_TIERS.filter((tier) => RANKED_UNLOCK_SETTING[tier.key]);
-  const state = (tierKey: string): boolean => services.settings.getNumber(RANKED_UNLOCK_SETTING[tierKey]!) === 1;
-  const embed = new EmbedBuilder()
-    .setTitle("🔓 順位卓の段階解放")
-    .setColor(0xc9a227)
-    .setDescription(
-      [
-        "見習卓〜**超高卓（30,000 Ld）** までは従業員が通常営業で開けます。設定は要りません。",
-        "**極卓・冥獄卓は運営が解放したときだけ**開けます。解放は極 → 冥獄の順に1段ずつ。",
-        "",
-        ...tiers.map((tier) => `${state(tier.key) ? "🟢 解放中" : "🔒 未解放"}　**${tier.label}**（${tier.baseAmount.toLocaleString("ja-JP")} Ld）`),
-        "",
-        "-# 解放しても、担保・場代・日次損失上限・残高確認はこれまでどおり効きます。",
-      ].join("\n"),
-    );
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    ...tiers.map((tier) =>
-      new ButtonBuilder()
-        .setCustomId(`mgmt:casino:unlock-toggle:${tier.key}`)
-        .setLabel(`${tier.label}を${state(tier.key) ? "閉じる" : "解放する"}`)
-        .setEmoji(state(tier.key) ? "🔒" : "🔓")
-        .setStyle(state(tier.key) ? ButtonStyle.Danger : ButtonStyle.Success),
-    ),
-  );
-  return {
-    embeds: [embed],
-    components: [row, new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId("mgmt:casino").setLabel("賭場へ戻る").setEmoji("◀").setStyle(ButtonStyle.Secondary),
-    )],
-  };
-}
-
-/**
- * 順位配分の入力を**全件 strict に**解釈する（PR24 レビュー BLOCKER 3）。
- *
- * 配分式は配当に直結する信頼設定なので、読めない語を黙って捨ててはいけない。
- * 以前は `.map(Number).filter(Number.isFinite)` だったため
- * `10000, foo, -10000` が 2人卓 `[10000, -10000]` として登録されえた。
- *
- * いまは1トークンでも10進整数でなければ**入力全体を拒否**する。
- * したがって人数は「有効だったトークン数」ではなく、常に入力された順位トークンの件数になる。
- * 小数(`1.5`)・指数(`1e4`)・16進(`0x100`)・`NaN`・`Infinity`・語句はすべて弾く。
- */
-export function parseRankDeltaTokens(raw: string): number[] | null {
-  const tokens = raw.split(/[\s,]+/).filter((token) => token !== "");
-  if (tokens.length < 2) return null;
-  const values: number[] = [];
-  for (const token of tokens) {
-    if (!/^[+-]?\d+$/.test(token)) return null;
-    const value = Number(token);
-    if (!Number.isSafeInteger(value)) return null;
-    values.push(value);
-  }
-  return values;
-}
-
-function rankedProfileModal() {
-  return new ModalBuilder()
-    .setCustomId("mgmt:casino:profile")
-    .setTitle("汎用順位卓の順位配分を登録")
-    .addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("profile_key").setLabel("識別子（英小文字・数字・_-）").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder().setCustomId("label").setLabel("表示名").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60),
-      ),
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        new TextInputBuilder()
-          .setCustomId("deltas")
-          .setLabel("1位から順の増減bps（合計0・例: 10000,-10000）")
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true)
-          .setMaxLength(120),
-      ),
-    );
 }
 
 function casinoRefundUserModal() {

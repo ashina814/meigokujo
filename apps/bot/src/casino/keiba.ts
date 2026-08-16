@@ -149,7 +149,7 @@ export function acceptKeibaBet(
   const riskScope = keibaRiskScope(session);
   const requested: KeibaBetFingerprint = { session, userId, horseId, type, amount };
   // 同じレースへの追加の賭けは同じ卓なので再取得を許す
-  if (!acquireTransientParticipation(services, userId, "keiba", riskScope, { reentrant: true })) {
+  if (!acquireTransientParticipation(userId, "keiba", riskScope, { reentrant: true })) {
     return { ok: false, reason: "risk", detail: "ほかの卓に着いている。そちらを終わらせてからだ。" };
   }
   let stored: KeibaBetFingerprint | undefined;

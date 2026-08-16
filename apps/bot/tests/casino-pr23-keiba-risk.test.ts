@@ -35,7 +35,6 @@ registerDefaultTxTypes();
  * 一切変えていない**（このファイルでも既存の配当計算をそのまま再現して照合する）。
  */
 
-let liveRankedTableUsers = new Set<string>();
 
 /** 当日枠の基準時刻。種まき取引より後の日を「今日」にする */
 const TEST_NOW = Math.floor(Date.now() / 1000) + 2 * 24 * 60 * 60;
@@ -74,7 +73,6 @@ function setup(options: { dailyLossLimitBps?: number } = {}) {
     reservations,
     dailyRisk,
     rng: scriptedRng([0.5]),
-    persistentTables: { participantHasLiveTable: (userId: string) => liveRankedTableUsers.has(userId) },
   } as unknown as Services;
   // 翌日から同じ卓を触りにいくための窓（日界跨ぎの確認用）
   const tomorrowRisk = new DailyRisk(db, ledger, chipAssets, {
@@ -178,7 +176,6 @@ function allBetsOf(bets: Map<string, Bet[]>): Bet[] {
 }
 
 beforeEach(() => {
-  liveRankedTableUsers = new Set<string>();
   resetTransientParticipationForTesting();
 });
 
@@ -398,34 +395,23 @@ describe("keiba bets go through the PR23 risk gates", () => {
 });
 
 describe("keiba participates in the unified exclusion model", () => {
-  it("rejects a keiba bet while a persistent ranked table is live", () => {
-    const ctx = setup({ dailyLossLimitBps: 10_000 });
-    seedChips(ctx, "alice", 40_000);
-    liveRankedTableUsers.add("alice");
-
-    const r = acceptKeibaBet(ctx.services, "keiba:s1", new Map(), "alice", 1, "win", 1_000, "op1");
-    expect(r.ok).toBe(false);
-    expect(ctx.escrow.poolOf("keiba:s1")).toBe(0);
-    expect(exposureRows(ctx)).toEqual([]);
-  });
-
   it("rejects a keiba bet while a solo seat is held, and the reverse", () => {
     const ctx = setup({ dailyLossLimitBps: 10_000 });
     seedChips(ctx, "alice", 40_000);
 
-    expect(acquireSeat(ctx.services, "alice")).toBe(true);
+    expect(acquireSeat("alice")).toBe(true);
     expect(acceptKeibaBet(ctx.services, "keiba:s1", new Map(), "alice", 1, "win", 1_000, "op1").ok).toBe(false);
 
     resetTransientParticipationForTesting();
     const bets = new Map<string, Bet[]>();
     expect(acceptKeibaBet(ctx.services, "keiba:s1", bets, "alice", 1, "win", 1_000, "op1").ok).toBe(true);
     // 競馬に着いている間はソロ席も順位卓（isSoloSeatOccupied 経由）も取れない
-    expect(acquireSeat(ctx.services, "alice")).toBe(false);
+    expect(acquireSeat("alice")).toBe(false);
     expect(hasTransientParticipation("alice")).toBe(true);
 
     voidKeibaRace(ctx.services, "keiba:s1");
     expect(hasTransientParticipation("alice")).toBe(false);
-    expect(acquireSeat(ctx.services, "alice")).toBe(true);
+    expect(acquireSeat("alice")).toBe(true);
   });
 
   it("fails closed when the persistent ranked lookup is broken", () => {

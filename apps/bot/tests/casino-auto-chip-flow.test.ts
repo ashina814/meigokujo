@@ -3,13 +3,10 @@ import { describe, expect, it } from "vitest";
 import { isSeatOccupied, acquireSeat, releaseSeat } from "../src/casino/common.js";
 import type { Services } from "../src/services.js";
 
-/** 常設順位卓の照会だけを持つ最小の services（着席は順位卓との排他も見る） */
-const noLiveTable = { persistentTables: { participantHasLiveTable: () => false } } as unknown as Services;
-
 describe("PR10 process-local ownership gate", () => {
   it("tracks active solo-game ownership for refund and external-confirmation gates", () => {
     expect(isSeatOccupied("alice")).toBe(false);
-    expect(acquireSeat(noLiveTable, "alice")).toBe(true);
+    expect(acquireSeat("alice")).toBe(true);
     expect(isSeatOccupied("alice")).toBe(true);
     releaseSeat("alice");
     expect(isSeatOccupied("alice")).toBe(false);

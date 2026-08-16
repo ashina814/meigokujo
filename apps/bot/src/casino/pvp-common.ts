@@ -170,7 +170,7 @@ export function collectStakes(
   const authorized: string[] = [];
   try {
     for (const u of userIds) {
-      if (!acquireTransientParticipation(services, u, "pvp", scope, { reentrant: true })) {
+      if (!acquireTransientParticipation(u, "pvp", scope, { reentrant: true })) {
         throw new PvpRiskRejectedError(u, "ほかの卓に着いている。そちらを終わらせてからだ。");
       }
       acquired.push(u);

@@ -25,8 +25,7 @@ export type RoleSlot =
   | "court" // 冥府裁判所担当
   | "emergency" // 緊急対応担当
   | "opinion" // 意見・改善担当
-  | "discipline" // 規律対応担当
-  | "casino_employee"; // 賭博場従業員（卓運営係。金銭権限は持たない）
+  | "discipline"; // 規律対応担当
 
 export const ROLE_SLOT_META: Record<RoleSlot, { label: string; hint: string; multi: boolean }> = {
   admin: {
@@ -48,11 +47,6 @@ export const ROLE_SLOT_META: Record<RoleSlot, { label: string; hint: string; mul
   emergency: { label: "緊急対応担当ロール", hint: "🚨緊急の安全問題の通知先", multi: true },
   opinion: { label: "意見・改善担当ロール", hint: "📮意見・要望の通知先", multi: true },
   discipline: { label: "規律対応担当ロール", hint: "⚠️問題・規約違反の報告の通知先", multi: true },
-  casino_employee: {
-    label: "賭博場従業員ロール",
-    hint: "🎴 /賭場運営 で順位卓の開催・掲示・開始前の閉鎖・問題報告ができる。金銭操作の権限は一切付かない",
-    multi: true,
-  },
 };
 
 // 運営ボードに表示する区分（諧和廷=kaiwa は廃止したため一覧から除外）
@@ -66,7 +60,6 @@ export const ROLE_SLOT_ORDER: RoleSlot[] = [
   "emergency",
   "opinion",
   "discipline",
-  "casino_employee",
 ];
 
 const key = (slot: RoleSlot) => `roles:${slot}`;

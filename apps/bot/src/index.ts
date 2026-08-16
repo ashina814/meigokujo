@@ -20,13 +20,6 @@ import { replyStocksPaused } from "./casino/stocks-pause.js";
 import { handleKeibaCommand } from "./commands/keiba.js";
 import { handleAnnaiButton, handleAnnaiCommand } from "./commands/annai.js";
 import { handleCasinoHomeButton, handleCasinoHomeCommand } from "./commands/casino-home.js";
-import {
-  handleCasinoEmployeeCommand,
-  handleCasinoEmployeeInteraction,
-  isCasinoEmployeeInteraction,
-} from "./commands/casino-employee.js";
-import { handleCasinoEvidenceCommand } from "./commands/casino-evidence.js";
-import { handleCasinoArbitrationCommand } from "./commands/casino-arbitration.js";
 import { handleVipButton, handleVipCommand } from "./commands/vip.js";
 import { handleNagareboshiCommand } from "./commands/nagareboshi.js";
 import {
@@ -109,8 +102,7 @@ import { startInternalApi } from "./internal-api.js";
 import { startOutboxWorker } from "./outbox.js";
 import { postJoinLog, postLeaveLog } from "./member-log.js";
 import { respondInteractionError } from "./interaction-errors.js";
-import { recoverCasinoWithPersistentTables } from "./casino/persistent-table-recovery.js";
-import { handleRankedTableButton, handleRankedTableModal, isRankedTableButton, isRankedTableModal } from "./casino/ranked-table-ui.js";
+import { runCasinoRecovery } from "./casino/recovery-run.js";
 import {
   handleOriginalRoleTicketButton,
   handleOriginalRoleTicketModal,
@@ -135,7 +127,7 @@ inviteTracker.wire();
 
 client.once(Events.ClientReady, async (ready) => {
   console.log(`⚔️ 冥獄城ボット 起動: ${ready.user.tag}`);
-  await recoverCasinoWithPersistentTables(client, services);
+  runCasinoRecovery(services);
   // 前回のプロセスで払い切れなかった無料スピンを精算する（PR3）。
   // 出目は獲得時に確定・保存してあるので、再起動しても表示も配当も変わらない。
   // 賭場が停止中なら資金グループが作れず失敗するが、権利は pending のまま残る
@@ -227,15 +219,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "賭場":
           await handleCasinoHomeCommand(interaction, services);
           return;
-        case "賭場運営":
-          await handleCasinoEmployeeCommand(interaction, services);
-          return;
-        case "賭場証拠":
-          await handleCasinoEvidenceCommand(interaction, services);
-          return;
-        case "casino-arbitration":
-          await handleCasinoArbitrationCommand(interaction, services);
-          return;
         case "遊ぶ":
           await handleAsobuCommand(interaction, services);
           return;
@@ -281,13 +264,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       } else if (interaction.commandName === "説明会") {
         await handleSessionScheduleAutocomplete(interaction, services);
       }
-      return;
-    }
-    if (
-      (interaction.isModalSubmit() || interaction.isStringSelectMenu() || interaction.isButton()) &&
-      isCasinoEmployeeInteraction(interaction.customId)
-    ) {
-      await handleCasinoEmployeeInteraction(interaction, services);
       return;
     }
     // 出戻り申請: 戻し先の選択 → 理由モーダル → 確定
@@ -337,10 +313,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith(CASINO_AMOUNT_MODAL_PREFIX)) {
       await handleCasinoAmountModal(interaction, services);
-      return;
-    }
-    if (interaction.isModalSubmit() && isRankedTableModal(interaction.customId)) {
-      await handleRankedTableModal(interaction, services);
       return;
     }
     if (
@@ -525,10 +497,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (isCasinoResultButton(interaction.customId)) {
         await handleCasinoResultButton(interaction, services);
-        return;
-      }
-      if (isRankedTableButton(interaction.customId)) {
-        await handleRankedTableButton(interaction, services);
         return;
       }
       if (interaction.customId.startsWith("vip:")) {

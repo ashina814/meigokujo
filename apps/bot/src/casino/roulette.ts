@@ -159,7 +159,7 @@ export function acceptRouletteBet(
   const riskScope = rouletteRiskScope(session);
   // 資金へ触る前に一時参加を押さえる（順位卓・ソロ席・対人卓との排他）。
   // 張り直しは同じ卓なので再取得を許す
-  if (!acquireTransientParticipation(services, userId, "roulette", riskScope, { reentrant: true })) {
+  if (!acquireTransientParticipation(userId, "roulette", riskScope, { reentrant: true })) {
     return { ok: false, reason: "risk", detail: "ほかの卓に着いている。そちらを終わらせてからだ。" };
   }
   let stored: RouletteBetFingerprint | undefined;
