@@ -63,7 +63,7 @@ export async function handleEvaluationCommand(
   // 魔剣士の日常操作はこのコマンドではなく、設置済みパネルから行う。
   if (isAdmin(interaction, services) && interaction.channel?.isTextBased() && "send" in interaction.channel) {
     const message = await interaction.channel.send({
-      content: ["## 【亡霊評価】", "現在評価期間中の亡霊を選んでください。"].join("\n"),
+      content: ["## 【亡霊評価】", "評価期間中の亡霊と、期限超過で判定待ちの亡霊を確認できます。"].join("\n"),
       components: [panelRow()],
     });
     services.settings.set("eval_forum_panel_channel", interaction.channel.id, interaction.user.id);
@@ -105,6 +105,10 @@ function fmtDuration(seconds: number): string {
   return hours > 0 ? `${hours}時間${minutes}分` : `${minutes}分`;
 }
 
+function isPendingJudgement(deadlineAt: number | null, nowSec: number): boolean {
+  return deadlineAt !== null && deadlineAt <= nowSec;
+}
+
 async function targetMenus(
   guild: Guild,
   services: Services,
@@ -113,26 +117,47 @@ async function targetMenus(
   rows: ActionRowBuilder<StringSelectMenuBuilder>[];
   total: number;
   shown: number;
+  activeTotal: number;
+  activeShown: number;
+  pendingTotal: number;
+  pendingShown: number;
   memberIds: Set<string>;
 }> {
   const store = new EvaluationForumStore(services.db);
   const cycles = store.listCurrentCycles();
-  if (cycles.length === 0) return { rows: [], total: 0, shown: 0, memberIds: new Set() };
+  if (cycles.length === 0) {
+    return {
+      rows: [],
+      total: 0,
+      shown: 0,
+      activeTotal: 0,
+      activeShown: 0,
+      pendingTotal: 0,
+      pendingShown: 0,
+      memberIds: new Set(),
+    };
+  }
 
   // Guild在籍を正本として一覧を作る。取得失敗時は呼び出し側で再試行を案内し、ID表示へは逃がさない。
   const members = await guild.members.fetch();
   const memberIds = new Set(members.keys());
   const presentCycles = cycles.filter((cycle) => cycle.userId !== excludeUserId && memberIds.has(cycle.userId));
-  const shownCycles = presentCycles.slice(0, TARGETS_PER_MENU * MAX_TARGET_MENUS);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const activeCycles = presentCycles.filter((cycle) => !isPendingJudgement(cycle.deadlineAt, nowSec));
+  const pendingCycles = presentCycles.filter((cycle) => isPendingJudgement(cycle.deadlineAt, nowSec));
   const rows: ActionRowBuilder<StringSelectMenuBuilder>[] = [];
-  for (let offset = 0; offset < shownCycles.length; offset += TARGETS_PER_MENU) {
-    const chunk = shownCycles.slice(offset, offset + TARGETS_PER_MENU);
+
+  // 判定待ちがいる場合は最低1行を必ず残す。通常対象が多くても判定待ちを一覧から隠さない。
+  const maxActiveRows = pendingCycles.length > 0 ? MAX_TARGET_MENUS - 1 : MAX_TARGET_MENUS;
+  const activeShownCycles = activeCycles.slice(0, maxActiveRows * TARGETS_PER_MENU);
+  for (let offset = 0; offset < activeShownCycles.length; offset += TARGETS_PER_MENU) {
+    const chunk = activeShownCycles.slice(offset, offset + TARGETS_PER_MENU);
     const index = Math.floor(offset / TARGETS_PER_MENU);
     rows.push(
       new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
         new StringSelectMenuBuilder()
-          .setCustomId(`eval:target:${index}`)
-          .setPlaceholder(index === 0 ? "現在の亡霊から選択" : `現在の亡霊から選択（${index + 1}）`)
+          .setCustomId(`eval:target:active:${index}`)
+          .setPlaceholder(index === 0 ? "評価期間中の亡霊" : `評価期間中の亡霊（${index + 1}）`)
           .addOptions(
             chunk.map((cycle) => {
               const member = members.get(cycle.userId);
@@ -144,7 +169,39 @@ async function targetMenus(
       ),
     );
   }
-  return { rows, total: presentCycles.length, shown: shownCycles.length, memberIds };
+
+  const pendingRowBudget = MAX_TARGET_MENUS - rows.length;
+  const pendingShownCycles = pendingCycles.slice(0, pendingRowBudget * TARGETS_PER_MENU);
+  for (let offset = 0; offset < pendingShownCycles.length; offset += TARGETS_PER_MENU) {
+    const chunk = pendingShownCycles.slice(offset, offset + TARGETS_PER_MENU);
+    const index = Math.floor(offset / TARGETS_PER_MENU);
+    rows.push(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`eval:target:pending:${index}`)
+          .setPlaceholder(index === 0 ? "⏳ 期限超過・判定待ち" : `⏳ 期限超過・判定待ち（${index + 1}）`)
+          .addOptions(
+            chunk.map((cycle) => {
+              const member = members.get(cycle.userId);
+              if (!member) throw new Error(`guild member disappeared while rendering evaluation target: ${cycle.userId}`);
+              const deadline = `期限超過 ${fmtJstShortDate(cycle.deadlineAt)} / 判定待ち`;
+              return { label: member.displayName.slice(0, 100), value: cycle.userId, description: deadline.slice(0, 100) };
+            }),
+          ),
+      ),
+    );
+  }
+
+  return {
+    rows,
+    total: presentCycles.length,
+    shown: activeShownCycles.length + pendingShownCycles.length,
+    activeTotal: activeCycles.length,
+    activeShown: activeShownCycles.length,
+    pendingTotal: pendingCycles.length,
+    pendingShown: pendingShownCycles.length,
+    memberIds,
+  };
 }
 
 async function replyWithTargetMenus(
@@ -167,17 +224,18 @@ async function replyWithTargetMenus(
   }
   if (menus.total === 0) {
     await interaction.reply({
-      content: "現在、評価期間中かつサーバーに在籍している亡霊はいません。",
+      content: "現在、サーバーに在籍している評価対象・判定待ちの亡霊はいません。",
       flags: MessageFlags.Ephemeral,
     });
     return;
   }
   const omitted = menus.total - menus.shown;
+  const summary = `評価期間中 **${menus.activeTotal}名** / ⏳ 期限超過・判定待ち **${menus.pendingTotal}名**`;
   await interaction.reply({
     content:
       omitted > 0
-        ? `現在の評価対象は ${menus.total}名です。Discordの表示上限のため先頭${menus.shown}名を表示しています。`
-        : `現在の評価対象は ${menus.total}名です。対象を選んでください。`,
+        ? `${summary}です。Discordの表示上限のため、評価期間中 ${menus.activeShown}/${menus.activeTotal}名・判定待ち ${menus.pendingShown}/${menus.pendingTotal}名を表示しています。`
+        : `${summary}です。対象を選んでください。`,
     components: menus.rows,
     flags: MessageFlags.Ephemeral,
   });
@@ -263,11 +321,12 @@ export async function handleEvaluationSelect(
 
   try {
     const thread = await ensureEvaluationThread(interaction.guild, services, targetId);
+    const pending = isPendingJudgement(cycle.deadlineAt, Math.floor(Date.now() / 1000));
     await interaction.editReply({
       content: thread
         ? [
             `評価フォーラムを開きました: ${thread.toString()}`,
-            "以降はフォーラムへ通常のDiscordメッセージとして自由に評価を書いてください。",
+            pending ? "⏳ **この対象は期限超過・判定待ちです。** 評価内容を確認し、人間側で最終判断してください。" : "以降はフォーラムへ通常のDiscordメッセージとして自由に評価を書いてください。",
             menus.total > 0 ? "**続けて別の亡霊も選択できます。**" : "現在ほかに選択できる亡霊はいません。",
           ].join("\n\n")
         : "評価フォーラムを作成できませんでした。対象の在籍状況と `channel:eval_forum` の設定を確認してください。",
@@ -299,10 +358,12 @@ async function starterContent(guild: Guild, services: Services, targetId: string
   const displayName = member.displayName;
   const inviteCount = store.inviteCountSinceCycle(targetId, cycle.startedAt);
   const denParentId = services.settings.getString("category:eval_den");
+  const nowSec = Math.floor(Date.now() / 1000);
 
   const lines: string[] = [`👻 **${threadTitleFor(displayName)}**`];
   if (cycle.origin === "return") lines.push("", "🔄 **出戻り**");
-  lines.push("", `評価開始：${fmtJstDate(cycle.startedAt)}`, `現在期限：${fmtJstDate(cycle.deadlineAt)}`, "", "🐾 **冥獣の巣**");
+  if (isPendingJudgement(cycle.deadlineAt, nowSec)) lines.push("", "⏳ **期限超過・判定待ち**");
+  lines.push("", `評価開始：${fmtJstDate(cycle.startedAt)}`, `評価期限：${fmtJstDate(cycle.deadlineAt)}`, "", "🐾 **冥獣の巣**");
 
   if (!denParentId) {
     lines.push("集計設定（`category:eval_den`）が見つかりません。", "", "💭 **参考**", "冥獣の巣の集計設定を確認してください。");
