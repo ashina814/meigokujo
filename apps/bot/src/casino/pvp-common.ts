@@ -367,12 +367,6 @@ function pvpRiskDetail(services: Services, userId: string, error: unknown): stri
 }
 
 /**
- * 参加者に返金（勝負不成立時など）。台帳の預かり額で返して記録も消す。
- * **全員ぶんで1グループ**なので、途中で落ちれば誰にも返らない（＝同じ鍵で再試行できる）。
- *
- * PR23: 返金は純損益0なので当日枠は動かさない。資金が戻ってから露出と席を解く。
- */
-/**
  * **両者 fund 済みの本体**を、資金を取り残さずに実行する。
  *
  * 本体は最初に `view.edit()` を呼ぶ。公開募集ではその瞬間に募集カードが削除・
@@ -388,6 +382,13 @@ function pvpRiskDetail(services: Services, userId: string, error: unknown): stri
  *
  * したがって `markResolved()` を呼ぶ位置は**精算・返金の直後**であって、
  * 表示の成功ではない。
+ *
+ * ## 契約
+ *
+ * **callback は「`markResolved()` を呼ぶ」か「throw する」かのどちらかで終わること。**
+ * 途中の `return` で静かに抜けると資金が fund 済みのまま残るので、その場合も
+ * ここが強制返金したうえで異常終了させる。BJ・インディアンのように分岐が多い本体で
+ * `markResolved()` を書き損ねても、金だけ残るより返して落ちるほうが安全。
  */
 export async function runFundedSession(
   services: Services,
@@ -400,11 +401,44 @@ export async function runFundedSession(
       resolved = true;
     });
   } catch (error) {
-    if (!resolved) voidPvpTable(services, session);
+    cleanupUnresolvedFundedSession(services, session, resolved, error);
     throw error;
+  }
+  if (resolved) return;
+  // 正常終了したのに精算も返金もしていない＝実装の穴。資金を残さず落とす
+  cleanupUnresolvedFundedSession(services, session, false, undefined);
+  throw new Error(`Funded PvP session ${session} exited without settlement or refund`);
+}
+
+/**
+ * 未解決の fund 済みセッションを片付ける。
+ *
+ * **返金自体が落ちたときに、元の障害を握り潰さない。** 「ゲームが落ちた」と
+ * 「返金にも失敗した」は両方とも運営が知る必要があるので、両方載せて投げる。
+ */
+function cleanupUnresolvedFundedSession(
+  services: Services,
+  session: string,
+  resolved: boolean,
+  cause: unknown,
+): void {
+  if (resolved) return;
+  try {
+    voidPvpTable(services, session);
+  } catch (cleanupError) {
+    throw new AggregateError(
+      cause === undefined ? [cleanupError] : [cause, cleanupError],
+      `Funded PvP session ${session} failed and cleanup also failed`,
+    );
   }
 }
 
+/**
+ * 参加者に返金（勝負不成立時など）。台帳の預かり額で返して記録も消す。
+ * **全員ぶんで1グループ**なので、途中で落ちれば誰にも返らない（＝同じ鍵で再試行できる）。
+ *
+ * PR23: 返金は純損益0なので当日枠は動かさない。資金が戻ってから露出と席を解く。
+ */
 export function refundAll(services: Services, userIds: string[], bet: number, operationId: string, session: string): void {
   services.escrow.refundMany(session, userIds, operationId);
   releasePvpParticipants(services, session, userIds);
