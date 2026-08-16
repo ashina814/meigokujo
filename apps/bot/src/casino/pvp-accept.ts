@@ -51,6 +51,10 @@ export interface AcceptDeps {
    * 両者ぶんの徴収。本番は {@link collectStakes} をそのまま渡す。
    * 注入にしてあるのは、**順序（席確保 → claim → defer → 徴収 → 本体）そのものを
    * テストで固定したい**から。
+   *
+   * 呼び出した後の失敗時ロールバック（露出・参加席）は `collectStakes` 側の責務。
+   * 外側から無条件に席を解くと、露出解除に失敗して fail-closed で残した席まで
+   * 開放してしまうので、徴収へ入った後はこの入口から参加席を触らない。
    */
   collect?: typeof collectStakes;
   /** 挑戦者の解決。**徴収より前**に呼ぶ（fund 後の Discord API 失敗を作らないため） */
@@ -125,9 +129,8 @@ export async function acceptPvpChallenge(
     interaction,
   });
   if (!started.ok) {
-    // 本番 collectStakes も失敗時に席を戻すが、この入口が確保した分も明示的に解く。
-    // 同じ key の release は冪等なので二重解放にはならない。
-    releaseReservedSeats(session, challenge.challengerId, interaction.user.id);
+    // ここまで来たら参加席の所有権は collectStakes 側へ渡している。
+    // 露出解除に失敗した場合は fail-closed で席を残す設計なので、外側から解放しない。
     await closeQuietly(deps, interaction.message, `${stakeFailureText(started.stakes)}この募集は不成立です。`);
     return { ok: false, reason: "stakes_failed" };
   }
