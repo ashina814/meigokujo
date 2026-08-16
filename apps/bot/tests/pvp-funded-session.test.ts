@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { runFundedBjDuel } from "../src/casino/bj-duel.js";
 import { runFundedSession } from "../src/casino/pvp-common.js";
 
 /**
@@ -114,17 +115,29 @@ describe("二重障害はどちらの入口でも両方残す", () => {
 });
 
 describe("fund済み後の盤面取得は保護区間の内側にある", () => {
-  it("view.message() が落ちても返金される", async () => {
-    // BJ・インディアンは本体の最初に盤面を取りにいく。ここを runFundedSession の
-    // 外で呼ぶと、fund 済みなのに void されないまま資金が残る
+  it("runFundedBjDuel の view.message() が実際に落ちても返金される", async () => {
+    // 以前のテストは runFundedSession に直接 throw を渡しただけで、BJ 本体を通っていなかった。
+    // 実際の runner を通し、最初の view.message() が落ちたときに同じ session が void されることを固定する。
     const { services, calls } = fakeServices();
     const boom = new Error("Unknown Message");
+    const view = {
+      edit: async () => undefined,
+      followUp: async () => undefined,
+      message: async () => {
+        throw boom;
+      },
+    } as never;
+
     await expect(
-      runFundedSession(services, "s7", async () => {
-        throw boom; // view.message() の失敗を模す
+      runFundedBjDuel(services, {
+        challenger: { id: "alice" } as never,
+        opponent: { id: "bob" } as never,
+        bet: 500,
+        session: "s7",
+        view,
       }),
     ).rejects.toBe(boom);
-    expect(calls, "盤面取得の失敗で資金が残っている").toContain("s7");
+    expect(calls, "BJ本体の盤面取得失敗で資金が残っている").toContain("s7");
   });
 
   it("対話型の本体は message() を保護区間の内側で呼ぶ", () => {
