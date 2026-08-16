@@ -78,7 +78,7 @@ export async function handleCasinoHomeButton(interaction: ButtonInteraction, ser
     return;
   }
   if (interaction.customId === "casino:home:back") {
-    await interaction.update(renderCasinoHome(interaction.user.id, services, interaction.guild?.name));
+    await respondWithHome(interaction, services);
     return;
   }
   if (interaction.customId === "casino:home:pvp") {
@@ -159,7 +159,29 @@ async function leaveCasinoFromHome(interaction: ButtonInteraction, services: Ser
   } catch {
     content = "残高または進行状態を確認できないため、いまは引き出せません。";
   }
-  await interaction.update({ ...renderCasinoHome(interaction.user.id, services, interaction.guild?.name), content });
+  await respondWithHome(interaction, services, content);
+}
+
+/**
+ * ホームを返す。**押されたメッセージが公開か本人限定かで返し方を変える。**
+ *
+ * `/賭場` のホームは ephemeral なので `update()` で差し替えてよい。しかし常設パネルは
+ * **チャンネルに公開された1枚**なので、そこで `update()` すると看板そのものが
+ * 押した人の残高・所持額・福分け状態入りのホームへ化ける
+ * ——個人情報の公開と、常設パネルの破壊が同時に起きる。
+ * 公開メッセージから押されたときは元メッセージへ一切触れず、本人にだけ返す。
+ */
+async function respondWithHome(interaction: ButtonInteraction, services: Services, content?: string): Promise<void> {
+  const home = renderCasinoHome(interaction.user.id, services, interaction.guild?.name);
+  // content を渡さないときは既存の本文へ触れない（`content: ""` は消去になってしまう）
+  const payload = content === undefined ? home : { ...home, content };
+  // 判定できないときは公開扱いにする。誤って公開看板を書き換えるより、
+  // 本人にだけ返して看板を残すほうが安全（fail-closed の向き）
+  if (interaction.message?.flags?.has(MessageFlags.Ephemeral) === true) {
+    await interaction.update(payload);
+    return;
+  }
+  await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
 }
 
 /**
@@ -261,7 +283,8 @@ export function casinoGamesPanelMessage(_services: Services): MessageCreateOptio
     .setColor(C_MAMMON)
     .setDescription(
       [
-        "Land を賭けて遊ぶ場所。**押すとあなたにだけ開きます。**",
+        "Land を賭けて遊ぶ場所。**操作画面は本人だけに開きます。**",
+        "競馬と板は、立てた卓だけがこのチャンネルへ公開されます。",
         "",
         "🎲 **ひとり遊び** — スロット・丁半・クラッシュ・チンチロ・ルーレット・BJ・ポーカー",
         "⚔ **みんなで勝負** — 相手を指名、または募集して対人戦",
@@ -406,11 +429,13 @@ export function renderCasinoHome(userId: string, services: Services, serverName?
       .setEmoji("🏅")
       .setStyle(ButtonStyle.Secondary),
   );
+  // 競馬・板・流れ星は押した時点で資金や卓が動くので、停止中は押せなくする。
+  // VIP は状態表示なので停止中も開ける（加入の `vip:` 側が別途ガードされる）
   const otherRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("casino:home:keiba").setLabel("競馬").setEmoji("🏇").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("casino:home:ita").setLabel("板").setEmoji("📋").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("casino:home:keiba").setLabel("競馬").setEmoji("🏇").setStyle(ButtonStyle.Secondary).setDisabled(actionsDisabled),
+    new ButtonBuilder().setCustomId("casino:home:ita").setLabel("板").setEmoji("📋").setStyle(ButtonStyle.Secondary).setDisabled(actionsDisabled),
     new ButtonBuilder().setCustomId("casino:home:vip").setLabel("VIP").setEmoji("💎").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("casino:home:hoshi").setLabel("流れ星").setEmoji("✨").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("casino:home:hoshi").setLabel("流れ星").setEmoji("✨").setStyle(ButtonStyle.Secondary).setDisabled(actionsDisabled),
   );
   const guideRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()

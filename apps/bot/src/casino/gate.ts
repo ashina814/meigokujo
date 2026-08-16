@@ -9,7 +9,8 @@ import { isFormallyOpen, openingNotice } from "./opening.js";
  * 検算が落ちている状態で資金を動かすと、壊れた帳簿の上に取引を積むことになるので、
  * 「分からないときは動かさない」を入口で徹底する。
  *
- * 停止中でも通すもの: 遊びの説明・番付・通行証などの**読むだけ**の導線と、運営卓（/管理）。
+ * 停止中でも通すもの: 遊びの説明・番付・通行証・VIPの状態表示などの**読むだけ**の導線と、
+ * 運営卓（/管理）。常設パネルの「賭場へ入る」も、開くだけなので通す。
  * PR #94のイベントLand板はチップ賭場とは別経済なので、`/板 イベント立てる` と
  * `itaevt:` コンポーネントも通す。停止理由は利用者にそのまま見せる。
  */
@@ -64,6 +65,25 @@ const GUARDED_PREFIXES = [
   "casino:daily:", // `/賭場` ホームの福分け受け取りボタン（既存Daily処理へ接続）
 ];
 
+/**
+ * `casino:home:` のうち、**実際に資金や卓を動かすもの**。
+ *
+ * かつてこの4つは「チャンネルで `/競馬` を実行してください」と案内するだけの
+ * 行き止まりだったので、接頭辞ごとガード対象外にしてあった。実処理へ繋いだ時点で
+ * その前提が崩れる（流れ星は押した瞬間に 1,000 Ld を徴収し、競馬は公開レースを立てる）。
+ *
+ * `casino:home:` を丸ごとガードすると通行証・番付・遊び方まで閉じてしまうので、
+ * **読み取り専用と資金操作を ID 単位で分ける**。ここへ足し忘れると、停止中に
+ * 「今は○○のため停止中です」という理由付き拒否を失い、core 側の例外による
+ * generic な失敗に化ける。
+ */
+const GUARDED_COMPONENT_IDS = new Set([
+  "casino:home:keiba", // 公開レースを立てる
+  "casino:home:ita", // 板の作成モーダルを開く
+  "casino:home:hoshi", // 流れ星（2回目以降 1,000 Ld）
+  "casino:home:leave", // 自由チップを Land へ返還
+]);
+
 /** その操作が賭場のチップを動かしうるか */
 export function isCasinoInteraction(interaction: Interaction): boolean {
   if (interaction.isChatInputCommand()) {
@@ -75,7 +95,7 @@ export function isCasinoInteraction(interaction: Interaction): boolean {
   }
   if ("customId" in interaction && typeof interaction.customId === "string") {
     const id = interaction.customId;
-    return GUARDED_PREFIXES.some((p) => id.startsWith(p));
+    return GUARDED_COMPONENT_IDS.has(id) || GUARDED_PREFIXES.some((p) => id.startsWith(p));
   }
   return false;
 }

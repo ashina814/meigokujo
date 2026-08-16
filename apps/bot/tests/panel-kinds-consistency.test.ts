@@ -229,3 +229,77 @@ describe("ゲームパネルと施設パネル", () => {
     expect(source).toContain("ITA_CREATE_MODAL");
   });
 });
+
+describe("公開パネルのボタンは公開メッセージを壊さない", () => {
+  /** 公開（=非ephemeral）メッセージ上のボタンとして押された状況を作る */
+  function publicButton(customId: string, reply: unknown, update: unknown) {
+    return {
+      customId,
+      id: "op-1",
+      user: { id: "u1" },
+      guild: { name: "冥獄城" },
+      message: { flags: { has: () => false } },
+      reply,
+      update,
+    } as never;
+  }
+
+  it("施設パネルのLand引き出しは看板を書き換えず、本人にだけ返す", async () => {
+    const { handleCasinoHomeButton } = await import("../src/commands/casino-home.js");
+    const { services } = fakeCasinoServices();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const update = vi.fn().mockResolvedValue(undefined);
+
+    await handleCasinoHomeButton(publicButton("casino:home:leave", reply, update), {
+      ...services,
+      chipFlow: { leaveCasino: () => ({ skipped: null, redeemed: 0, land: 0 }) },
+    } as never);
+
+    // update() は元メッセージ（=公開看板）を書き換えるので、公開経路では絶対に呼ばない
+    expect(update, "公開パネルを書き換えている").not.toHaveBeenCalled();
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect((reply.mock.calls[0]![0] as { flags?: number }).flags).toBe(MessageFlags.Ephemeral);
+  });
+
+  it("本人だけのホーム上では従来どおり差し替える", async () => {
+    const { handleCasinoHomeButton } = await import("../src/commands/casino-home.js");
+    const { services } = fakeCasinoServices();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const update = vi.fn().mockResolvedValue(undefined);
+    const ephemeral = { ...publicButton("casino:home:leave", reply, update), message: { flags: { has: () => true } } } as never;
+
+    await handleCasinoHomeButton(ephemeral, {
+      ...services,
+      chipFlow: { leaveCasino: () => ({ skipped: null, redeemed: 0, land: 0 }) },
+    } as never);
+
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(reply).not.toHaveBeenCalled();
+  });
+});
+
+describe("停止ガードは資金操作と読み取りを取り違えない", () => {
+  const asButton = (customId: string) => ({ customId, isChatInputCommand: () => false }) as never;
+
+  it("実処理へ繋がった casino:home:* は停止ガードの対象", async () => {
+    const { isCasinoInteraction } = await import("../src/casino/gate.js");
+    for (const id of ["casino:home:keiba", "casino:home:ita", "casino:home:hoshi", "casino:home:leave"]) {
+      expect(isCasinoInteraction(asButton(id)), id + " がガードされていない").toBe(true);
+    }
+  });
+
+  it("読み取り専用の casino:home:* は停止中も通す", async () => {
+    const { isCasinoInteraction } = await import("../src/casino/gate.js");
+    // casino:home: を接頭辞で丸ごとガードすると、停止中に通行証も番付も開けなくなる
+    for (const id of [
+      "casino:home:panel-open",
+      "casino:home:passport",
+      "casino:home:banzuke",
+      "casino:home:vip",
+      "casino:home:first",
+      "casino:home:back",
+    ]) {
+      expect(isCasinoInteraction(asButton(id)), id + " まで閉じている").toBe(false);
+    }
+  });
+});

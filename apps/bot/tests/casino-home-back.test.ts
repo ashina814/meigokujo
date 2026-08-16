@@ -67,7 +67,9 @@ describe("/賭場 の子画面はホームへ帰れる", () => {
   });
 
   it("戻るボタンはホームを描き直す", async () => {
-    const interaction = buttonFor("casino:home:back");
+    // 戻るボタンは本人だけのホーム（ephemeral）にしか出ない。
+    // 公開メッセージ上では update せず ephemeral reply になる（看板を壊さないため）
+    const interaction = { ...buttonFor("casino:home:back"), message: { flags: { has: () => true } } };
     await handleCasinoHomeButton(interaction, fakeServices());
     const payload = (interaction.update as ReturnType<typeof vi.fn>).mock.calls[0]![0];
     expect(backButtonIds(payload)).toContain("casino:home:games");
