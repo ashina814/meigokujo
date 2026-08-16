@@ -15,25 +15,26 @@ import { pvpGame, type PvpGameKey } from "./pvp-games.js";
  * 公開募集の受諾。**順序そのものがこの機能の本体**なので、経路を1本に閉じる。
  *
  * ```text
+ * 両者の資金・上限を事前確認   ← 明らかに成立不能な人が募集だけ食うのを防ぐ
  * 両者の参加席を同期確保      ← 他卓参加者が募集だけ食うのを防ぐ
  * claimChallenge()          ← await を挟まない。最初の1人だけが通る
  * deferUpdate()             ← ここが最初の await
  * 挑戦者 User を解決         ← 徴収より前
- * collectStakes([両者])      ← 1回。同じ席へ reentrant に入る
+ * collectStakes([両者])      ← 1回。同じ席へ reentrant に入り、ここが最終判定
  * pvpViewFromMessage(card)  ← 募集カードがそのまま対戦盤になる
  * runFundedX()              ← 資金保全は runFundedSession に任せる
  * ```
  *
- * ## なぜ claim より前に参加席を取るか
+ * ## なぜ claim より前に資格確認するか
  *
- * `claimChallenge()` を先に確定すると、その後 `collectStakes()` で「別の卓に参加中」と
- * 弾かれる人でも募集を消せてしまう。さらに同じ人が別々の challenge をほぼ同時に押すと、
- * 2件とも claim した後で片方だけ徴収失敗になり、複数人の募集を食える。
+ * `claimChallenge()` を先に確定すると、その後 `collectStakes()` で「別の卓に参加中」や
+ * 「残高不足・日次上限」と弾かれる人でも募集を消せてしまう。公開カードなので、
+ * これは第三者が他人の募集を潰せる DoS になる。
  *
- * そこで challenge を読む → 両者の一時参加席を同じ `pvpRiskScope(session)` で確保 →
- * claim までを **await なし**で行う。資格のない受諾者は challenge を open のまま残す。
- * `collectStakes()` は同じ scope を `{ reentrant: true }` で取り直すため、この仮確保を
- * そのまま正式な参加状態へ引き継げる。
+ * そこで challenge を読む → **資金を動かさない事前確認** → 両者の一時参加席を同じ
+ * `pvpRiskScope(session)` で確保 → claim までを **await なし**で行う。
+ * 事前確認は TOCTOU を消すための最終判定ではない。受諾後に状況が変わり得るので、
+ * 本当の資金・露出確保は従来どおり `collectStakes()` が正本としてもう一度行う。
  *
  * ## Discord 側が落ちても募集を復活させない
  *
@@ -43,13 +44,14 @@ import { pvpGame, type PvpGameKey } from "./pvp-games.js";
  * 一時参加席だけを解放する。
  */
 export type FundedRunner = (services: Services, ctx: FundedPvpContext) => Promise<void>;
+export type StakePreflight = (services: Services, userId: string, bet: number) => string | null;
 
 export interface AcceptDeps {
   /** ゲーム種別 → 徴収済み本体。テストから差し替える */
   runners: Record<PvpGameKey, FundedRunner>;
   /**
    * 両者ぶんの徴収。本番は {@link collectStakes} をそのまま渡す。
-   * 注入にしてあるのは、**順序（席確保 → claim → defer → 徴収 → 本体）そのものを
+   * 注入にしてあるのは、**順序（事前確認 → 席確保 → claim → defer → 徴収 → 本体）そのものを
    * テストで固定したい**から。
    *
    * 呼び出した後の失敗時ロールバック（露出・参加席）は `collectStakes` 側の責務。
@@ -57,6 +59,8 @@ export interface AcceptDeps {
    * 開放してしまうので、徴収へ入った後はこの入口から参加席を触らない。
    */
   collect?: typeof collectStakes;
+  /** claim 前の読み取りだけの資格確認。資金・露出・参加席は動かさない */
+  preflight?: StakePreflight;
   /** 挑戦者の解決。**徴収より前**に呼ぶ（fund 後の Discord API 失敗を作らないため） */
   fetchUser?: (interaction: ButtonInteraction, userId: string) => Promise<User>;
   /** カードのボタンを外して文面を差し替える。失敗しても募集は戻さない */
@@ -71,6 +75,8 @@ export type AcceptOutcome =
         | "gone"
         | "self"
         | "bot"
+        | "challenger_ineligible"
+        | "accepter_ineligible"
         | "challenger_busy"
         | "accepter_busy"
         | "defer_failed"
@@ -78,10 +84,17 @@ export type AcceptOutcome =
         | "stakes_failed";
     };
 
-type ReservedClaimFailureReason = "gone" | "self" | "bot" | "challenger_busy" | "accepter_busy";
+type ReservedClaimFailureReason =
+  | "gone"
+  | "self"
+  | "bot"
+  | "challenger_ineligible"
+  | "accepter_ineligible"
+  | "challenger_busy"
+  | "accepter_busy";
 type ReservedClaimResult =
   | { ok: true; challenge: PvpChallenge; session: string }
-  | { ok: false; reason: ReservedClaimFailureReason };
+  | { ok: false; reason: ReservedClaimFailureReason; detail?: string };
 
 export async function acceptPvpChallenge(
   interaction: ButtonInteraction,
@@ -89,10 +102,16 @@ export async function acceptPvpChallenge(
   challengeId: string,
   deps: AcceptDeps,
 ): Promise<AcceptOutcome> {
-  // ── 1. 両者の参加席と challenge 所有権を同期で確定させる（await を挟まない）──
-  const claim = reserveSeatsAndClaim(challengeId, interaction.user.id, interaction.user.bot);
+  // ── 1. 両者の資格・参加席と challenge 所有権を同期で確定させる（await を挟まない）──
+  const claim = reserveSeatsAndClaim(
+    services,
+    deps.preflight ?? preflightStake,
+    challengeId,
+    interaction.user.id,
+    interaction.user.bot,
+  );
   if (!claim.ok) {
-    await replyQuietly(interaction, claimFailureText(claim.reason));
+    await replyQuietly(interaction, claimFailureText(claim));
     return { ok: false, reason: claim.reason };
   }
   const { challenge, session } = claim;
@@ -144,15 +163,31 @@ export async function acceptPvpChallenge(
 }
 
 /**
- * challenge を消費する前に、挑戦者と受諾者の「1人1卓」を同じ scope で同期確保する。
+ * challenge を消費する前に、「いま明らかに成立不能でない」ことと両者の1人1卓を同期確保する。
  * この関数は意図的に non-async。ここへ await が入ると、別 interaction が割り込んで
  * 同じ人が複数 challenge を claim できる窓が復活する。
  */
-function reserveSeatsAndClaim(challengeId: string, accepterId: string, accepterIsBot: boolean): ReservedClaimResult {
+function reserveSeatsAndClaim(
+  services: Services,
+  preflight: StakePreflight,
+  challengeId: string,
+  accepterId: string,
+  accepterIsBot: boolean,
+): ReservedClaimResult {
   const challenge = getChallenge(challengeId);
   if (!challenge || challenge.state !== "open") return { ok: false, reason: "gone" };
   if (accepterIsBot) return { ok: false, reason: "bot" };
   if (accepterId === challenge.challengerId) return { ok: false, reason: "self" };
+
+  // ここでは読み取りだけ。資金も露出も参加席もまだ動かさない。
+  const challengerDenial = preflight(services, challenge.challengerId, challenge.bet);
+  if (challengerDenial) {
+    return { ok: false, reason: "challenger_ineligible", detail: challengerDenial };
+  }
+  const accepterDenial = preflight(services, accepterId, challenge.bet);
+  if (accepterDenial) {
+    return { ok: false, reason: "accepter_ineligible", detail: accepterDenial };
+  }
 
   const session = `pvpopen:${challengeId}`;
   const scope = pvpRiskScope(session);
@@ -176,6 +211,31 @@ function reserveSeatsAndClaim(challengeId: string, accepterId: string, accepterI
     return claim;
   }
   return { ok: true, challenge: claim.challenge, session };
+}
+
+/**
+ * claim 前の best-effort 資格確認。
+ *
+ * `collectStakes()` の最終判定を置き換えない。ここは「残高0の人が他人の募集を
+ * 押すだけで消せる」のような明白な不成立を claim 前に弾くための読み取り専用ゲート。
+ * 受諾後の await 中に状況が変わっても、最後は collectStakes が改めて確認する。
+ */
+function preflightStake(services: Services, userId: string, bet: number): string | null {
+  try {
+    if (services.chips.balanceOf(userId) < bet) {
+      return "賭場に置いているLandが足りません。";
+    }
+    if (bet > Math.floor(services.dailyRisk.holdings(userId) / 2)) {
+      return "所持額に対して賭け金が大きすぎます。";
+    }
+    const riskMax = services.dailyRisk.maxBetForPlayerLoss(userId, (amount) => amount, bet);
+    if (riskMax < bet) {
+      return "日次損失上限のため、この賭け金では参加できません。";
+    }
+  } catch {
+    return "残高または利用上限を確認できません。";
+  }
+  return null;
 }
 
 function releaseReservedSeats(session: string, challengerId: string, accepterId: string): void {
@@ -238,11 +298,17 @@ function collectAndStartFunded(
   };
 }
 
-function claimFailureText(reason: ReservedClaimFailureReason): string {
-  if (reason === "self") return "自分の募集は受けられません。";
-  if (reason === "bot") return "ボットは参加できません。";
-  if (reason === "challenger_busy") return "挑戦者がほかの卓に参加中です。終わってからもう一度受けてください。";
-  if (reason === "accepter_busy") return "ほかの卓に参加中です。そちらを終えてから受けてください。";
+function claimFailureText(result: Extract<ReservedClaimResult, { ok: false }>): string {
+  if (result.reason === "self") return "自分の募集は受けられません。";
+  if (result.reason === "bot") return "ボットは参加できません。";
+  if (result.reason === "challenger_ineligible") {
+    return "挑戦者が現在この賭け金で参加できません。募集はそのまま残しています。";
+  }
+  if (result.reason === "accepter_ineligible") {
+    return `この募集はまだ残しています。${result.detail ?? "現在この賭け金では参加できません。"}`;
+  }
+  if (result.reason === "challenger_busy") return "挑戦者がほかの卓に参加中です。終わってからもう一度受けてください。";
+  if (result.reason === "accepter_busy") return "ほかの卓に参加中です。そちらを終えてから受けてください。";
   return "この募集は終了しています。";
 }
 
