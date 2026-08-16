@@ -7,6 +7,7 @@ import {
   SlashCommandBuilder,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
+  type MessageCreateOptions,
 } from "discord.js";
 import { fmtLd } from "../format.js";
 import { C_JACKPOT, C_MAMMON, E, casinoHomeBackRow, h2, withCasinoHomeBack } from "../casino/ui.js";
@@ -47,6 +48,20 @@ export async function handleCasinoHomeCommand(
 }
 
 export async function handleCasinoHomeButton(interaction: ButtonInteraction, services: Services): Promise<void> {
+  if (interaction.customId === CASINO_PANEL_OPEN) {
+    await interaction.reply({
+      ...renderCasinoHome(interaction.user.id, services, interaction.guild?.name),
+      flags: MessageFlags.Ephemeral,
+    });
+    recordCasinoMetricBestEffort(services, {
+      eventKey: `home_open:${interaction.id}`,
+      eventType: "home_open",
+      userId: interaction.user.id,
+      operationId: interaction.id,
+      payload: { source: "panel" },
+    });
+    return;
+  }
   if (interaction.customId === "casino:daily:claim") {
     await claimDailyFromHome(interaction, services);
     return;
@@ -207,6 +222,44 @@ function renderGuide(services: Services) {
     );
   return { embeds: [embed], components: [casinoHomeBackRow()] };
 }
+
+/**
+ * 賭場の常設パネル（`/管理 → パネル → マモンの賭場` で設置）。
+ *
+ * `/賭場` はコマンドを知っている人しか辿り着けない。チャンネルに常駐する看板を置いて、
+ * 目に入った人がそのまま入れるようにする。銀行・ショップ・ランクのパネルと同じ型で、
+ * **この1枚は全員が見る**ので個人の残高・福分けの可否は出さない。
+ * 押した人にだけエフェメラルで {@link renderCasinoHome} を返す。
+ */
+export function casinoPanelMessage(services: Services): MessageCreateOptions {
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: "マモンの賭場" })
+    .setTitle("🏛  マモンの賭場")
+    .setColor(C_MAMMON)
+    .setDescription(
+      [
+        operatingLabel(services),
+        "",
+        "Land を賭けて遊ぶ場所。**入口はここひとつ**。",
+        "スロット・丁半・ポーカーなどのひとり遊びから、対人の勝負、競馬、板、商店まで、",
+        "下のボタンを押すとあなたにだけ見える形で開きます。",
+        "",
+        "-# 賭けは任意参加です。引き際は自分で決めてください。",
+      ].join("\n"),
+    );
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(CASINO_PANEL_OPEN).setLabel("賭場へ入る").setEmoji("🎰").setStyle(ButtonStyle.Primary),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+/**
+ * 常設パネルの入口ボタン。
+ *
+ * `casino:home:` 接頭辞に揃えてあるので、index.ts のルーティングを増やさずに
+ * 既存の賭場ハブ経路へ乗る。
+ */
+export const CASINO_PANEL_OPEN = "casino:home:panel-open";
 
 export function renderCasinoHome(userId: string, services: Services, serverName?: string) {
   const phase = openingPhase(services);

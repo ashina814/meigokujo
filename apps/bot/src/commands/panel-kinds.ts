@@ -21,6 +21,7 @@ export interface PanelKindMeta {
 }
 
 export const PANEL_KINDS = [
+  { key: "casino", label: "マモンの賭場", installable: true },
   { key: "bank", label: "冥獄銀行", installable: true },
   { key: "entry", label: "入城申請", installable: true },
   // 入城案内パネルへ統合済み。新規設置はできないが、既設分の撤去のために種別は残す

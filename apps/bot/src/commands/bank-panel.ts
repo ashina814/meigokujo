@@ -26,6 +26,7 @@ import { shopAdminPanelMessage } from "./shokan.js";
 import { takutatePanelMessage } from "./takutate-panel.js";
 import { ticketPanelMessage } from "./tickets.js";
 import { confessionPanelMessage } from "./confession.js";
+import { casinoPanelMessage } from "./casino-home.js";
 import { roomPanelMessage } from "./rooms.js";
 import { deptAccount, LedgerError } from "@meigokujo/core";
 import {
@@ -46,6 +47,7 @@ import type { Services } from "../services.js";
  * 表へ種別を足して描画を書き忘れると**型エラーになる**。
  */
 const PANEL_MESSAGES: Record<PanelKind, (services: Services, channelId: string) => MessageCreateOptions> = {
+  casino: (s) => casinoPanelMessage(s),
   bank: () => bankPanelMessage(),
   entry: (s) => entryPanelMessage(s),
   entry_flex: (s) => entryFlexPanelMessage(s),

@@ -56,3 +56,29 @@ describe("パネル種別は単一の表から生成される", () => {
     expect(retiredPanelChoices().map((c) => c.value)).toEqual(["entry_flex"]);
   });
 });
+
+describe("賭場の常設パネル", () => {
+  it("設置できる種別として登録されている", () => {
+    expect(installablePanelChoices().map((c) => c.value)).toContain("casino");
+  });
+
+  it("入口ボタンが既存の賭場ハブ経路に乗る接頭辞を使う", async () => {
+    const { CASINO_PANEL_OPEN } = await import("../src/commands/casino-home.js");
+    // index.ts は customId.startsWith("casino:home:") で賭場ハブへ流す。
+    // 接頭辞が外れるとボタンが無反応になる（押しても何も起きない事故の再発防止）
+    expect(CASINO_PANEL_OPEN.startsWith("casino:home:")).toBe(true);
+    const indexSource = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+    expect(indexSource).toContain('customId.startsWith("casino:home:")');
+  });
+
+  it("全員が見る1枚なので個人の残高や福分けの可否を出さない", async () => {
+    const { casinoPanelMessage } = await import("../src/commands/casino-home.js");
+    const services = { settings: { getString: () => null, getNumber: () => 0 }, chipTx: { openingPhase: () => "formal" }, casinoStatus: { current: () => ({ status: "open", reason: "" }) } } as never;
+    const panel = casinoPanelMessage(services);
+    const json = JSON.stringify(panel);
+    for (const personal of ["福分け", "所持", "残高"]) {
+      expect(json, `${personal} が常設パネルに出ている`).not.toContain(personal);
+    }
+    expect(panel.components).toHaveLength(1);
+  });
+});
