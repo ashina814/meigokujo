@@ -27,7 +27,7 @@ export async function handleVipCommand(
   await interaction.reply({ ...renderStatus(interaction.user.id, services), flags: MessageFlags.Ephemeral });
 }
 
-function renderStatus(userId: string, services: Services) {
+export function renderStatus(userId: string, services: Services) {
   const active = services.vip.isVip(userId);
   const left = services.vip.daysLeft(userId);
   const price = services.vip.price();

@@ -26,7 +26,7 @@ import { shopAdminPanelMessage } from "./shokan.js";
 import { takutatePanelMessage } from "./takutate-panel.js";
 import { ticketPanelMessage } from "./tickets.js";
 import { confessionPanelMessage } from "./confession.js";
-import { casinoPanelMessage } from "./casino-home.js";
+import { casinoFacilityPanelMessage, casinoGamesPanelMessage, casinoPanelMessage } from "./casino-home.js";
 import { roomPanelMessage } from "./rooms.js";
 import { deptAccount, LedgerError } from "@meigokujo/core";
 import {
@@ -48,6 +48,8 @@ import type { Services } from "../services.js";
  */
 const PANEL_MESSAGES: Record<PanelKind, (services: Services, channelId: string) => MessageCreateOptions> = {
   casino: (s) => casinoPanelMessage(s),
+  casino_games: (s) => casinoGamesPanelMessage(s),
+  casino_facility: (s) => casinoFacilityPanelMessage(s),
   bank: () => bankPanelMessage(),
   entry: (s) => entryPanelMessage(s),
   entry_flex: (s) => entryFlexPanelMessage(s),

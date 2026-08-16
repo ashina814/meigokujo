@@ -24,7 +24,9 @@ export interface PanelKindMeta {
 }
 
 export const PANEL_KINDS = [
-  { key: "casino", label: "マモンの賭場", installable: true },
+  { key: "casino", label: "マモンの賭場（玄関）", installable: true },
+  { key: "casino_games", label: "賭場 · 遊ぶ", installable: true },
+  { key: "casino_facility", label: "賭場 · 施設", installable: true },
   { key: "bank", label: "冥獄銀行", installable: true },
   { key: "entry", label: "入城申請", installable: true },
   // 入城案内パネルへ統合済み。新規設置はできないが、既設分の撤去のために種別は残す

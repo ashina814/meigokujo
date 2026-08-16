@@ -3,6 +3,7 @@ import {
   EmbedBuilder,
   MessageFlags,
   SlashCommandBuilder,
+  type ButtonInteraction,
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { HOUSE_HOLDER, JACKPOT_HOLDER } from "@meigokujo/core";
@@ -186,7 +187,7 @@ export const nagareboshiCommand = new SlashCommandBuilder()
   .setDMPermission(false);
 
 export async function handleNagareboshiCommand(
-  interaction: ChatInputCommandInteraction,
+  interaction: ChatInputCommandInteraction | ButtonInteraction,
   services: Services,
 ): Promise<void> {
   ensureNagareboshiTable(services);

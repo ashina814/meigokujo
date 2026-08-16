@@ -18,6 +18,10 @@ import { recordCasinoMetricBestEffort } from "../casino/metrics.js";
 import { openingNotice, openingPhase, operatingLabel } from "../casino/opening.js";
 import { readAvailableWallet } from "../casino/wallet.js";
 import { renderShop } from "./bakuten.js";
+import { itaCreateModal } from "./ita.js";
+import { handleNagareboshiCommand } from "./nagareboshi.js";
+import { renderStatus as renderVipStatus } from "./vip.js";
+import { playKeiba } from "../casino/keiba.js";
 import { renderBanzuke } from "./banzuke.js";
 import { buildPassportAttachment } from "./passport.js";
 import type { Services } from "../services.js";
@@ -103,9 +107,22 @@ export async function handleCasinoHomeButton(interaction: ButtonInteraction, ser
     });
     return;
   }
-  const link = SIDE_GAME_GUIDE[interaction.customId];
-  if (link) {
-    await interaction.reply({ content: link, flags: MessageFlags.Ephemeral });
+  // 競馬・板・VIP・流れ星は、かつて「チャンネルで /競馬 を実行してください」と
+  // 案内するだけの行き止まりだった。ハブやパネルまで来た人をコマンドへ突き返さない
+  if (interaction.customId === "casino:home:keiba") {
+    await playKeiba(interaction, services);
+    return;
+  }
+  if (interaction.customId === "casino:home:ita") {
+    await interaction.showModal(itaCreateModal());
+    return;
+  }
+  if (interaction.customId === "casino:home:vip") {
+    await interaction.reply({ ...withCasinoHomeBack(renderVipStatus(interaction.user.id, services)), flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (interaction.customId === "casino:home:hoshi") {
+    await handleNagareboshiCommand(interaction, services);
     return;
   }
   if (interaction.customId === "casino:home:first") {
@@ -149,13 +166,6 @@ async function leaveCasinoFromHome(interaction: ButtonInteraction, services: Ser
  * チャンネルに公開の卓を立てる遊びは、本人にだけ見えるハブからは開けない。
  * ここは「何ができるか」と「どのコマンドか」を示すだけにする。
  */
-const SIDE_GAME_GUIDE: Readonly<Record<string, string>> = {
-  "casino:home:keiba": "🏇 **競馬** — 冥馬6頭のパリミュチュエル（単勝・複勝）。\nチャンネルで `/競馬` を実行すると発走します。",
-  "casino:home:ita": "📋 **板** — 議題を立てて何にでも賭けられる公開市場。\nチャンネルで `/板 立てる` を実行します。進行中は `/板 一覧`。",
-  "casino:home:vip": "💎 **VIP** — 月額で賭け上限が上がります。`/vip` で条件と期限を確認できます。",
-  "casino:home:hoshi": "✨ **流れ星** — 1日5回の占い（初回無料）。`/流れ星` で引けます。",
-};
-
 /**
  * 対人戦の案内。
  *
@@ -231,6 +241,78 @@ function renderGuide(services: Services) {
  * **この1枚は全員が見る**ので個人の残高・福分けの可否・稼働状態は出さない。
  * 状態は押した時点の {@link renderCasinoHome} が最新値を返す。
  */
+/**
+ * 常設パネルは「賭ける場所」と「それ以外の施設」で分ける。
+ *
+ * 玄関1枚だと結局そこから探す手数が増えるだけで、「目に入ってすぐ入れる」という
+ * 常設パネルの目的が半分しか達成されない。**#賭場 と #賭場施設 のように置き分けられる**
+ * ようにして、チャンネルの役割とパネルを一致させる。
+ *
+ * どちらも**全員が見る1枚**なので、個人の残高・福分けの可否・営業状態は載せない
+ * （常設パネルは再投稿時にしか描き直されないキャッシュ済みメッセージなので、
+ * 状態を載せると停止中でも「営業中」と出し続けてしまう）。
+ * ボタンは既存の `casino:home:*` をそのまま使うので、押した先の挙動は
+ * `/賭場` ハブと完全に同じ経路を通る。
+ */
+export function casinoGamesPanelMessage(_services: Services): MessageCreateOptions {
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: "マモンの賭場" })
+    .setTitle("🎲  遊ぶ")
+    .setColor(C_MAMMON)
+    .setDescription(
+      [
+        "Land を賭けて遊ぶ場所。**押すとあなたにだけ開きます。**",
+        "",
+        "🎲 **ひとり遊び** — スロット・丁半・クラッシュ・チンチロ・ルーレット・BJ・ポーカー",
+        "⚔ **みんなで勝負** — 相手を指名、または募集して対人戦",
+        "🏇 **競馬** — 冥馬6頭のレースをこのチャンネルに立てる（60秒受付）",
+        "📋 **板** — 議題を立てて何にでも賭けられる公開市場",
+        "",
+        "-# 賭けは任意参加です。引き際は自分で決めてください。",
+      ].join("\n"),
+    );
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("casino:home:games").setLabel("ひとり遊び").setEmoji("🎲").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("casino:home:pvp").setLabel("みんなで勝負").setEmoji("⚔").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("casino:home:keiba").setLabel("競馬").setEmoji("🏇").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("casino:home:ita").setLabel("板を立てる").setEmoji("📋").setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+/** 賭けない側。商店・通行証・番付・福分け・VIP・流れ星・引き出し */
+export function casinoFacilityPanelMessage(_services: Services): MessageCreateOptions {
+  const embed = new EmbedBuilder()
+    .setAuthor({ name: "マモンの賭場" })
+    .setTitle("🏛  賭場の施設")
+    .setColor(C_MAMMON)
+    .setDescription(
+      [
+        "遊ぶ以外の窓口。**押すとあなたにだけ開きます。**",
+        "",
+        "🛍 **商店** — お守りなどを Land で買う",
+        "🎫 **通行証** — 自分の戦績カード",
+        "🏅 **番付** — 賭場の順位",
+        "🎁 **福分け** — 24時間に1回受け取れる",
+        "💎 **VIP** — 月額で賭け上限が上がる",
+        "✨ **流れ星** — 1日5回の占い（初回無料）",
+        "🚪 **Landへ引き出す** — 賭場に置いている分を戻す",
+      ].join("\n"),
+    );
+  const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("casino:home:shop").setLabel("商店").setEmoji("🛍").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("casino:home:passport").setLabel("通行証").setEmoji("🎫").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("casino:home:banzuke").setLabel("番付").setEmoji("🏅").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("casino:daily:claim").setLabel("福分け").setEmoji("🎁").setStyle(ButtonStyle.Success),
+  );
+  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("casino:home:vip").setLabel("VIP").setEmoji("💎").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("casino:home:hoshi").setLabel("流れ星").setEmoji("✨").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("casino:home:leave").setLabel("Landへ引き出す").setEmoji("🚪").setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row1, row2] };
+}
+
 export function casinoPanelMessage(_services: Services): MessageCreateOptions {
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場" })
