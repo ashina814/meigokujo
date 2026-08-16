@@ -131,7 +131,12 @@ export async function acceptPvpChallenge(
   if (!started.ok) {
     // ここまで来たら参加席の所有権は collectStakes 側へ渡している。
     // 露出解除に失敗した場合は fail-closed で席を残す設計なので、外側から解放しない。
-    await closeQuietly(deps, interaction.message, `${stakeFailureText(started.stakes)}この募集は不成立です。`);
+    if (started.kind === "error") {
+      console.error(`[pvp] 賭け金の徴収処理に失敗 id=${challengeId}:`, started.error);
+      await closeQuietly(deps, interaction.message, "賭け金を確認できないため、この募集は不成立です。");
+    } else {
+      await closeQuietly(deps, interaction.message, `${stakeFailureText(started.stakes)}この募集は不成立です。`);
+    }
     return { ok: false, reason: "stakes_failed" };
   }
   await started.completion;
@@ -180,7 +185,8 @@ function releaseReservedSeats(session: string, challengerId: string, accepterId:
 }
 
 type StartFundedResult =
-  | { ok: false; stakes: ReturnType<typeof collectStakes> }
+  | { ok: false; kind: "rejected"; stakes: ReturnType<typeof collectStakes> }
+  | { ok: false; kind: "error"; error: unknown }
   | { ok: true; completion: Promise<void> };
 
 /**
@@ -201,15 +207,22 @@ function collectAndStartFunded(
   input: { session: string; challenge: PvpChallenge; challenger: User; interaction: ButtonInteraction },
 ): StartFundedResult {
   const { session, challenge, challenger, interaction } = input;
-  const stakes = (deps.collect ?? collectStakes)(
-    services,
-    [challenge.challengerId, interaction.user.id],
-    challenge.bet,
-    `${session}:collect`,
-    session,
-    riskGameOf(challenge.game),
-  );
-  if (!stakes.ok) return { ok: false, stakes };
+  let stakes: ReturnType<typeof collectStakes>;
+  try {
+    stakes = (deps.collect ?? collectStakes)(
+      services,
+      [challenge.challengerId, interaction.user.id],
+      challenge.bet,
+      `${session}:collect`,
+      session,
+      riskGameOf(challenge.game),
+    );
+  } catch (error) {
+    // collectStakes 本体は例外時にも自分の露出・参加席を rollback してから投げる。
+    // ここではカードを終端表示にするため、fund 前の技術例外だけ値へ変換する。
+    return { ok: false, kind: "error", error };
+  }
+  if (!stakes.ok) return { ok: false, kind: "rejected", stakes };
 
   // 徴収成功。ここから本体呼び出しまでの間に await を挟めない
   return {
