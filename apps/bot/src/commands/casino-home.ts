@@ -228,18 +228,16 @@ function renderGuide(services: Services) {
  *
  * `/賭場` はコマンドを知っている人しか辿り着けない。チャンネルに常駐する看板を置いて、
  * 目に入った人がそのまま入れるようにする。銀行・ショップ・ランクのパネルと同じ型で、
- * **この1枚は全員が見る**ので個人の残高・福分けの可否は出さない。
- * 押した人にだけエフェメラルで {@link renderCasinoHome} を返す。
+ * **この1枚は全員が見る**ので個人の残高・福分けの可否・稼働状態は出さない。
+ * 状態は押した時点の {@link renderCasinoHome} が最新値を返す。
  */
-export function casinoPanelMessage(services: Services): MessageCreateOptions {
+export function casinoPanelMessage(_services: Services): MessageCreateOptions {
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場" })
     .setTitle("🏛  マモンの賭場")
     .setColor(C_MAMMON)
     .setDescription(
       [
-        operatingLabel(services),
-        "",
         "Land を賭けて遊ぶ場所。**入口はここひとつ**。",
         "スロット・丁半・ポーカーなどのひとり遊びから、対人の勝負、競馬、板、商店まで、",
         "下のボタンを押すとあなたにだけ見える形で開きます。",
