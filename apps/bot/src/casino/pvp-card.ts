@@ -40,8 +40,8 @@ export function closedCard(text: string) {
   };
 }
 
-export async function closeChallengeCard(card: Message, text: string): Promise<unknown> {
-  return card.edit(closedCard(text));
+export async function closeChallengeCard(card: Message, text: string): Promise<void> {
+  await card.edit(closedCard(text));
 }
 
 /**
