@@ -13,6 +13,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
   type Message,
+  type MessageCreateOptions,
   type TextChannel,
   PermissionFlagsBits,
 } from "discord.js";
@@ -26,8 +27,42 @@ import { takutatePanelMessage } from "./takutate-panel.js";
 import { ticketPanelMessage } from "./tickets.js";
 import { confessionPanelMessage } from "./confession.js";
 import { roomPanelMessage } from "./rooms.js";
-import { deptAccount, LedgerError, type RoomKind } from "@meigokujo/core";
+import { deptAccount, LedgerError } from "@meigokujo/core";
+import {
+  PANEL_KINDS,
+  installablePanelChoices,
+  panelKindMeta,
+  panelLabel,
+  removablePanelChoices,
+  type PanelKind,
+} from "./panel-kinds.js";
 import type { Services } from "../services.js";
+
+/**
+ * 種別ごとのパネル本文。
+ *
+ * 「どの種別があるか」は {@link PANEL_KINDS}（`panel-kinds.ts`）が唯一の正本で、
+ * ここは**その全 key に対する描画**だけを持つ。`Record<PanelKind, ...>` にしてあるので、
+ * 表へ種別を足して描画を書き忘れると**型エラーになる**。
+ */
+const PANEL_MESSAGES: Record<PanelKind, (services: Services, channelId: string) => MessageCreateOptions> = {
+  bank: () => bankPanelMessage(),
+  entry: (s) => entryPanelMessage(s),
+  entry_flex: (s) => entryFlexPanelMessage(s),
+  rank: () => rankPanelMessage(),
+  shop: (s) => shopPanelMessage(s),
+  shop_admin: (s) => shopAdminPanelMessage(s),
+  takutate: () => takutatePanelMessage(),
+  ticket_return: (s) => ticketPanelMessage("return", s),
+  ticket_consult: (s) => ticketPanelMessage("consult", s),
+  confession: () => confessionPanelMessage(),
+  room_normal: (s) => roomPanelMessage("normal", s),
+  room_mitsugetsu: (s) => roomPanelMessage("mitsugetsu", s),
+  room_oborozuki: (s) => roomPanelMessage("oborozuki", s),
+  room_game: (s) => roomPanelMessage("game", s),
+  dept: (s, channelId) => deptPanelMessage(s, s.settings.getString(`dept_panel_channel:${channelId}`) ?? ""),
+};
+
 
 export const panelCommand = new SlashCommandBuilder()
   .setName("パネル設置")
@@ -35,24 +70,7 @@ export const panelCommand = new SlashCommandBuilder()
   .setDMPermission(false)
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addStringOption((o) =>
-    o
-      .setName("種別")
-      .setDescription("設置するパネル")
-      .setRequired(true)
-      .addChoices(
-        { name: "冥獄銀行", value: "bank" },
-        { name: "入城申請", value: "entry" },
-        { name: "ランク確認", value: "rank" },
-        { name: "公式ショップ", value: "shop" },
-        { name: "卓建て", value: "takutate" },
-        { name: "出戻り申請", value: "ticket_return" },
-        { name: "個別相談", value: "ticket_consult" },
-        { name: "宿", value: "room_normal" },
-        { name: "蜜月", value: "room_mitsugetsu" },
-        { name: "朧月", value: "room_oborozuki" },
-        { name: "ゲーム部屋", value: "room_game" },
-        { name: "部署運用（自分の残高と入れ替え）", value: "dept" },
-      ),
+    o.setName("種別").setDescription("設置するパネル").setRequired(true).addChoices(...installablePanelChoices()),
   )
   .addStringOption((o) =>
     o.setName("部署").setDescription("部署パネルの対象（種別=部署運用のとき必須）").setAutocomplete(true),
@@ -65,72 +83,8 @@ export const panelRemoveCommand = new SlashCommandBuilder()
   .setDMPermission(false)
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
   .addStringOption((o) =>
-    o
-      .setName("種別")
-      .setDescription("撤去するパネル")
-      .setRequired(true)
-      .addChoices(
-        { name: "冥獄銀行", value: "bank" },
-        { name: "入城申請", value: "entry" },
-        { name: "時間外希望受付（廃止・撤去用）", value: "entry_flex" },
-        { name: "ランク確認", value: "rank" },
-        { name: "公式ショップ", value: "shop" },
-        { name: "卓建て", value: "takutate" },
-        { name: "出戻り申請", value: "ticket_return" },
-        { name: "個別相談", value: "ticket_consult" },
-        { name: "宿", value: "room_normal" },
-        { name: "蜜月", value: "room_mitsugetsu" },
-        { name: "朧月", value: "room_oborozuki" },
-        { name: "ゲーム部屋", value: "room_game" },
-        { name: "部署運用（自分の残高と入れ替え）", value: "dept" },
-      ),
+    o.setName("種別").setDescription("撤去するパネル").setRequired(true).addChoices(...removablePanelChoices()),
   );
-
-// entry_flex は入城案内パネルへ統合済み。設置はできないが、既に設置してあるものを
-// 撤去する必要があるので種別としては残す。
-const PANEL_KINDS = [
-  "bank",
-  "entry",
-  "entry_flex",
-  "rank",
-  "shop",
-  "shop_admin",
-  "takutate",
-  "ticket_return",
-  "ticket_consult",
-  "confession",
-  "room_normal",
-  "room_mitsugetsu",
-  "room_oborozuki",
-  "room_game",
-  "dept",
-] as const;
-
-const PANEL_LABELS: Record<(typeof PANEL_KINDS)[number], string> = {
-  bank: "冥獄銀行",
-  entry: "入城申請",
-  entry_flex: "時間外希望受付",
-  rank: "ランク確認",
-  shop: "公式ショップ",
-  shop_admin: "冥界商館 管理",
-  takutate: "卓建て",
-  ticket_return: "出戻り申請",
-  ticket_consult: "個別相談",
-  confession: "トートの耳",
-  room_normal: "宿",
-  room_mitsugetsu: "蜜月",
-  room_oborozuki: "朧月",
-  room_game: "ゲーム部屋",
-  dept: "部署運用",
-};
-
-/** パネル種別 → 部屋種別 */
-const ROOM_PANEL_KIND: Record<string, RoomKind> = {
-  room_normal: "normal",
-  room_mitsugetsu: "mitsugetsu",
-  room_oborozuki: "oborozuki",
-  room_game: "game",
-};
 
 function bankPanelMessage() {
   const embed = new EmbedBuilder()
@@ -157,7 +111,7 @@ export async function handlePanelCommand(
   const channel = interaction.channel as TextChannel | null;
   if (!channel?.isTextBased()) return;
 
-  const kind = interaction.options.getString("種別", true) as (typeof PANEL_KINDS)[number];
+  const kind = interaction.options.getString("種別", true);
 
   // 部署パネルは対象部署の指定必須。チャンネルと部署の対応表を持たせる
   if (kind === "dept") {
@@ -179,7 +133,7 @@ export async function handlePanelCommand(
   if (kind === "ticket_return") services.tickets.setPanelMessage("return", channel.id, sent.id, `user:${interaction.user.id}`);
   if (kind === "ticket_consult") services.tickets.setPanelMessage("consult", channel.id, sent.id, `user:${interaction.user.id}`);
   await interaction.reply({
-    content: `✅ ${PANEL_LABELS[kind]}パネルを設置しました（会話で流れたら自動で貼り直します）。`,
+    content: `✅ ${panelLabel(kind)}パネルを設置しました（会話で流れたら自動で貼り直します）。`,
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -196,12 +150,12 @@ export async function handlePanelRemove(
   const channel = interaction.channel as TextChannel | null;
   if (!channel?.isTextBased()) return;
 
-  const kind = interaction.options.getString("種別", true) as (typeof PANEL_KINDS)[number];
+  const kind = interaction.options.getString("種別", true);
   const settingKey = `panel:${kind}:${channel.id}`;
   const panelMsgId = services.settings.getString(settingKey);
   if (!panelMsgId) {
     await interaction.reply({
-      content: `このチャンネルに ${PANEL_LABELS[kind]}パネルは設置されていません。`,
+      content: `このチャンネルに ${panelLabel(kind)}パネルは設置されていません。`,
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -217,14 +171,14 @@ export async function handlePanelRemove(
   if (kind === "dept") services.settings.delete(`dept_panel_channel:${channel.id}`, actor);
 
   await interaction.reply({
-    content: `✅ ${PANEL_LABELS[kind]}パネルを撤去しました${msg ? "" : "（メッセージは既に削除されていました）"}。`,
+    content: `✅ ${panelLabel(kind)}パネルを撤去しました${msg ? "" : "（メッセージは既に削除されていました）"}。`,
     flags: MessageFlags.Ephemeral,
   });
 }
 
 /** /管理 パネル サブパネルから使うヘルパ */
 export function panelMessageForExternal(kind: string, services: Services, channelId: string) {
-  return panelMessageFor(kind as (typeof PANEL_KINDS)[number], services, channelId);
+  return panelMessageFor(kind, services, channelId);
 }
 export function savePanelSettingExternal(services: Services, kind: string, channelId: string, msgId: string, actor: string): void {
   services.settings.set(`panel:${kind}:${channelId}`, msgId, `user:${actor}`);
@@ -232,23 +186,14 @@ export function savePanelSettingExternal(services: Services, kind: string, chann
   if (kind === "ticket_consult") services.tickets.setPanelMessage("consult", channelId, msgId, `user:${actor}`);
 }
 
-function panelMessageFor(kind: (typeof PANEL_KINDS)[number], services: Services, channelId: string) {
-  if (kind === "entry") return entryPanelMessage(services);
-  if (kind === "entry_flex") return entryFlexPanelMessage(services); // 廃止済み（撤去専用）
-  if (kind === "rank") return rankPanelMessage();
-  if (kind === "shop") return shopPanelMessage(services);
-  if (kind === "shop_admin") return shopAdminPanelMessage(services);
-  if (kind === "takutate") return takutatePanelMessage();
-  if (kind === "ticket_return") return ticketPanelMessage("return", services);
-  if (kind === "ticket_consult") return ticketPanelMessage("consult", services);
-  if (kind === "confession") return confessionPanelMessage();
-  if (kind === "dept") {
-    const deptKey = services.settings.getString(`dept_panel_channel:${channelId}`) ?? "";
-    return deptPanelMessage(services, deptKey);
-  }
-  const roomKind = ROOM_PANEL_KIND[kind];
-  if (roomKind) return roomPanelMessage(roomKind, services);
-  return bankPanelMessage();
+/**
+ * 種別からパネル本文を組み立てる。分岐は持たず {@link PANEL_KIND_DEFS} を引く。
+ * 未知の種別は銀行パネルへ落とさず**呼び出し側へ知らせる**（黙って別のパネルを貼らない）。
+ */
+function panelMessageFor(kind: string, services: Services, channelId: string) {
+  const render = PANEL_MESSAGES[kind as PanelKind];
+  if (!render) throw new Error(`unknown panel kind: ${kind}`);
+  return render(services, channelId);
 }
 
 /** /パネル設置 の「部署」オートコンプリート（種別=dept のとき） */
@@ -458,7 +403,7 @@ const REPOST_DEBOUNCE_MS = 30_000;
 
 export async function maybeRepostPanel(message: Message, services: Services): Promise<void> {
   if (message.author.bot) return;
-  for (const kind of PANEL_KINDS) {
+  for (const { key: kind } of PANEL_KINDS) {
     const panelMsgId = services.settings.getString(`panel:${kind}:${message.channelId}`);
     if (!panelMsgId) continue;
 
