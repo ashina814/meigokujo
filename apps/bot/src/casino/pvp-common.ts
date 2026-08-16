@@ -405,9 +405,12 @@ export async function runFundedSession(
     throw error;
   }
   if (resolved) return;
-  // 正常終了したのに精算も返金もしていない＝実装の穴。資金を残さず落とす
-  cleanupUnresolvedFundedSession(services, session, false, undefined);
-  throw new Error(`Funded PvP session ${session} exited without settlement or refund`);
+  // 正常終了したのに精算も返金もしていない＝実装の穴。資金を残さず落とす。
+  // 契約違反そのものを cause として渡すので、返金も失敗したときは
+  // AggregateError へ「契約違反」と「返金障害」の両方が載る
+  const unresolvedError = new Error(`Funded PvP session ${session} exited without settlement or refund`);
+  cleanupUnresolvedFundedSession(services, session, false, unresolvedError);
+  throw unresolvedError;
 }
 
 /**

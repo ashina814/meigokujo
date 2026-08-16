@@ -15,11 +15,13 @@ describe("fund済みセッションは資金を取り残さない", () => {
     const services = {
       chips: { runGroup: (_opts: unknown, fn: () => void) => fn() },
       escrow: {
+        // voidPvpTable は pvpParticipants() 経由でこれを引く。
+        // 持たせないと catch へ落ちて参加者列挙を素通りしてしまう
+        list: () => [],
         refund: (session: string) => {
           onRefund?.();
           calls.push(session);
         },
-        listParticipants: () => [],
       },
       dailyRisk: { releaseExposureScope: () => undefined },
       events: { log: () => undefined },
@@ -82,5 +84,30 @@ describe("fund済みセッションは資金を取り残さない", () => {
 
     expect(err).toBeInstanceOf(AggregateError);
     expect((err as AggregateError).errors).toEqual([boom, cleanupBoom]);
+  });
+});
+
+describe("二重障害はどちらの入口でも両方残す", () => {
+  it("markResolved 忘れと返金失敗が重なっても、契約違反が消えない", async () => {
+    const cleanupBoom = new Error("db unavailable");
+    const services = {
+      chips: { runGroup: (_opts: unknown, fn: () => void) => fn() },
+      escrow: {
+        list: () => [],
+        refund: () => {
+          throw cleanupBoom;
+        },
+      },
+      dailyRisk: { releaseExposureScope: () => undefined },
+      events: { log: () => undefined },
+    } as never;
+
+    const err = await runFundedSession(services, "s6", async () => undefined).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AggregateError);
+    const errors = (err as AggregateError).errors as Error[];
+    expect(errors).toHaveLength(2);
+    expect(errors[0]?.message, "契約違反そのものが消えている").toContain("exited without settlement or refund");
+    expect(errors[1]).toBe(cleanupBoom);
   });
 });
