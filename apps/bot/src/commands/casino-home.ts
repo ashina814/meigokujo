@@ -238,7 +238,7 @@ export function casinoPanelMessage(_services: Services): MessageCreateOptions {
     .setColor(C_MAMMON)
     .setDescription(
       [
-        "Land を賭けて遊ぶ場所。**入口はここひとつ**。",
+        "Land を賭けて遊ぶ場所。**ここから賭場へ入れます。**",
         "スロット・丁半・ポーカーなどのひとり遊びから、対人の勝負、競馬、板、商店まで、",
         "下のボタンを押すとあなたにだけ見える形で開きます。",
         "",
@@ -355,7 +355,6 @@ export function renderCasinoHome(userId: string, services: Services, serverName?
 
   return { embeds: [embed], components: [playRow, facilityRow, otherRow, guideRow] };
 }
-
 
 function casinoHomeWallet(userId: string, services: Services): { lines: string[]; footer: string } {
   const wallet = readAvailableWallet(services, userId);
