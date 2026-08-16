@@ -16,7 +16,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function services(opts: { balance?: number; riskMax?: number; status?: string } = {}) {
+function services(opts: { balance?: number; riskMax?: number; holdings?: number; status?: string } = {}) {
   const holdAll = vi.fn();
   return {
     holdAll,
@@ -24,7 +24,10 @@ function services(opts: { balance?: number; riskMax?: number; status?: string } 
       chipTx: { openingPhase: () => "formal" },
       casinoStatus: { current: () => ({ status: opts.status ?? "open", reason: "maintenance" }) },
       chips: { balanceOf: () => opts.balance ?? 20_000 },
-      dailyRisk: { maxBetForPlayerLoss: () => opts.riskMax ?? 20_000 },
+      dailyRisk: {
+        maxBetForPlayerLoss: () => opts.riskMax ?? 20_000,
+        holdings: () => opts.holdings ?? 40_000,
+      },
       escrow: { holdAll },
     } as never,
   };
@@ -77,6 +80,15 @@ describe("公開1v1のゲーム選択と金額picker", () => {
     expect(byId.get(`${PVP_POST_PREFIX}chinchiro:100`)).toBe(false);
     expect(byId.get(`${PVP_POST_PREFIX}chinchiro:500`)).toBe(false);
     expect(byId.get(`${PVP_POST_PREFIX}chinchiro:2000`)).toBe(true);
+    expect(byId.get(`${PVP_POST_PREFIX}chinchiro:10000`)).toBe(true);
+  });
+
+  it("所持50%を超える固定額も募集前にdisabledにする", () => {
+    const s = services({ balance: 20_000, riskMax: 20_000, holdings: 4_000 });
+    const buttons = allButtons(renderPvpOpenAmountPicker("alice", "chinchiro", s.value));
+    const byId = new Map(buttons.map((b) => [b.custom_id, b.disabled ?? false]));
+    expect(byId.get(`${PVP_POST_PREFIX}chinchiro:500`)).toBe(false);
+    expect(byId.get(`${PVP_POST_PREFIX}chinchiro:2000`)).toBe(false); // ちょうど50%は通る
     expect(byId.get(`${PVP_POST_PREFIX}chinchiro:10000`)).toBe(true);
   });
 
