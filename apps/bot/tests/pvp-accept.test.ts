@@ -18,12 +18,12 @@ afterEach(() => {
 /**
  * この機能で本当に壊したくないのは関数個々ではなく**順序**。
  *
- *   両者の参加席を同期確保 → claim → deferUpdate → 挑戦者解決 → collectStakes(1回) → runFundedX
+ *   資格事前確認 → 両者の参加席を同期確保 → claim → deferUpdate → 挑戦者解決 → collectStakes(1回) → runFundedX
  *
  * challenge を食う資格がない人は claim の前で止め、どこかで失敗しても
  * いったん claim した募集は復活させない。
  */
-function setup(opts: { stakesOk?: boolean; deferThrows?: boolean } = {}) {
+function setup(opts: { stakesOk?: boolean; deferThrows?: boolean; preflightDenyUser?: string } = {}) {
   const order: string[] = [];
   const collect = vi.fn(
     (
@@ -45,6 +45,9 @@ function setup(opts: { stakesOk?: boolean; deferThrows?: boolean } = {}) {
       }
       return { ok: true as const };
     },
+  ) as never;
+  const preflight = vi.fn((_services: unknown, userId: string) =>
+    userId === opts.preflightDenyUser ? "事前確認で参加不可" : null,
   ) as never;
 
   const run = vi.fn(async () => {
@@ -79,12 +82,13 @@ function setup(opts: { stakesOk?: boolean; deferThrows?: boolean } = {}) {
     runners: { chinchiro: run, bj: run, sashi: run, indian: run },
     closeCard,
     collect,
+    preflight,
   } as never;
 
-  return { interaction, deps, order, collect, run, closeCard };
+  return { interaction, deps, order, collect, preflight, run, closeCard };
 }
 
-function realCollectServices(opts: { holdThrows?: boolean } = {}) {
+function realCollectServices(opts: { holdThrows?: boolean; brokeUser?: string; riskMax?: number; holdings?: number } = {}) {
   const holdAll = vi.fn(() => {
     if (opts.holdThrows) throw new Error("escrow unavailable");
     return true;
@@ -92,19 +96,26 @@ function realCollectServices(opts: { holdThrows?: boolean } = {}) {
   const authorizeExposure = vi.fn(() => undefined);
   const revokeExposure = vi.fn(() => undefined);
   const exposureOf = vi.fn(() => null);
+  const balanceOf = vi.fn((userId: string) => (userId === opts.brokeUser ? 0 : 10_000));
+  const holdings = vi.fn(() => opts.holdings ?? 10_000);
+  const maxBetForPlayerLoss = vi.fn(() => opts.riskMax ?? 10_000);
   return {
     holdAll,
     authorizeExposure,
     revokeExposure,
     exposureOf,
+    balanceOf,
+    holdings,
+    maxBetForPlayerLoss,
     value: {
-      dailyRisk: { authorizeExposure, revokeExposure, exposureOf },
+      chips: { balanceOf },
+      dailyRisk: { authorizeExposure, revokeExposure, exposureOf, holdings, maxBetForPlayerLoss },
       escrow: { holdAll },
     } as never,
   };
 }
 
-describe("受諾は 席確保 → claim → defer → 徴収 → 本体 の順で進む", () => {
+describe("受諾は 資格確認 → 席確保 → claim → defer → 徴収 → 本体 の順で進む", () => {
   it("正常系の順序が固定される", async () => {
     const { interaction, deps, order, collect, run } = setup();
     const services = {} as never;
@@ -138,6 +149,30 @@ describe("受諾は 席確保 → claim → defer → 徴収 → 本体 の順�
 });
 
 describe("challenge を食う資格がない人は open を消費しない", () => {
+  it("事前確認で受諾者が参加不可なら募集を open のまま残す", async () => {
+    const { interaction, deps, collect, run } = setup({ preflightDenyUser: "bob" });
+
+    const result = await acceptPvpChallenge(interaction, {} as never, "c1", deps);
+
+    expect(result).toEqual({ ok: false, reason: "accepter_ineligible" });
+    expect(getChallenge("c1")?.state).toBe("open");
+    expect(hasTransientParticipation("alice")).toBe(false);
+    expect(hasTransientParticipation("bob")).toBe(false);
+    expect(collect).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("事前確認で挑戦者が参加不可でも募集を open のまま残し、受諾者に触れない", async () => {
+    const { interaction, deps, collect } = setup({ preflightDenyUser: "alice" });
+
+    const result = await acceptPvpChallenge(interaction, {} as never, "c1", deps);
+
+    expect(result).toEqual({ ok: false, reason: "challenger_ineligible" });
+    expect(getChallenge("c1")?.state).toBe("open");
+    expect(hasTransientParticipation("bob")).toBe(false);
+    expect(collect).not.toHaveBeenCalled();
+  });
+
   it("別卓にいる受諾者が押しても募集は open のまま残る", async () => {
     const { interaction, deps, collect, run } = setup();
     expect(acquireTransientParticipation("bob", "solo", "solo")).toBe(true);
@@ -237,9 +272,24 @@ describe("どこで失敗しても募集を復活させない", () => {
 });
 
 describe("本物の collectStakes と公開受諾の接続", () => {
+  it("本物の事前確認でも残高不足の受諾者は募集を食わない", async () => {
+    const { interaction, deps, run } = setup();
+    delete (deps as { collect?: unknown }).collect;
+    delete (deps as { preflight?: unknown }).preflight;
+    const services = realCollectServices({ brokeUser: "bob" });
+
+    const result = await acceptPvpChallenge(interaction, services.value, "c1", deps);
+
+    expect(result).toEqual({ ok: false, reason: "accepter_ineligible" });
+    expect(getChallenge("c1")?.state).toBe("open");
+    expect(services.holdAll).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it("claim 前に取った同じ scope の参加席へ reentrant し、holdAll を1回だけ呼ぶ", async () => {
     const { interaction, deps, run } = setup();
     delete (deps as { collect?: unknown }).collect;
+    delete (deps as { preflight?: unknown }).preflight;
     const services = realCollectServices();
 
     const result = await acceptPvpChallenge(interaction, services.value, "c1", deps);
@@ -260,6 +310,7 @@ describe("本物の collectStakes と公開受諾の接続", () => {
   it("本物の collectStakes が技術例外を投げても rollback 後にカードを閉じる", async () => {
     const { interaction, deps, run, closeCard } = setup();
     delete (deps as { collect?: unknown }).collect;
+    delete (deps as { preflight?: unknown }).preflight;
     const services = realCollectServices({ holdThrows: true });
     vi.spyOn(console, "error").mockImplementation(() => undefined);
 
