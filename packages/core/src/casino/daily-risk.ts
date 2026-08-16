@@ -61,20 +61,14 @@ export interface DailyRiskSoloStart {
   maxPlayerLoss: number;
 }
 
-export interface DailyRiskTableExposure {
-  userId: string;
-  dayKey: string;
-  maxPlayerLoss: number;
-}
-
 /**
  * 「1つの卓・1つの共有セッションで、その利用者が最大いくら失いうるか」を賭場の DB に
  * 残しておくための単位（PR23 追補）。
  *
- * 常設順位卓は参加者行そのものに risk 情報を持たせているが、ルーレットや `/勝負` の
- * 対人卓は**永続テーブルを持たない**（プロセス内の Map と `casino_escrow` だけ）。
- * それらも日次上限・所持50%・同時参加排他の対象なので、卓の識別子（`scopeKey`）
- * ごとに露出を1行として持つ。
+ * ルーレット・`/勝負` の対人ゲーム・競馬は**永続テーブルを持たない**
+ * （プロセス内の Map と `casino_escrow` だけ）。それでも日次上限・所持50%・
+ * 同時参加排他の対象なので、セッションの識別子（`scopeKey`）ごとに
+ * 露出を1行として持つ。
  *
  * - `replace`: ルーレットの張り直し（500 → 1000 は「1500」ではなく「1000」）
  * - `add`: 多人数丁半の増し賭けのように、同じ卓で積み増す徴収
@@ -422,38 +416,6 @@ export class DailyRisk {
     this.ensureSchema();
     this.db.prepare("DELETE FROM casino_risk_exposure_ops WHERE scope_key=?").run(safe);
     this.db.prepare("DELETE FROM casino_risk_exposures WHERE scope_key=?").run(safe);
-  }
-
-  authorizeTableJoin(input: {
-    userId: string;
-    operationId: string;
-    tableId: string;
-    baseAmount: number;
-    feePerUser: number;
-  }): DailyRiskTableExposure {
-    const userId = requiredString(input.userId, "userId");
-    const operationId = requiredString(input.operationId, "operationId");
-    const tableId = requiredString(input.tableId, "tableId");
-    const baseAmount = positiveInt(input.baseAmount, "baseAmount");
-    const feePerUser = nonnegativeInt(input.feePerUser, "feePerUser");
-    const maxPlayerLoss = checkedAdd(baseAmount, feePerUser, "tableMaxLoss");
-    const fingerprint = canonicalStringify({ userId, operationId, tableId, baseAmount, feePerUser, maxPlayerLoss });
-    const tx = this.db.transaction(() => {
-      this.assertFormal();
-      this.ensureSchema();
-      const day = this.dayFor(userId);
-      this.assertHoldingsCoverage(userId, maxPlayerLoss, 0, "ranked join requires at least 50% holdings coverage");
-      this.assertProspective(day, maxPlayerLoss);
-      const eventKey = `table_join_risk:${tableId}:${userId}:${operationId}`;
-      const existing = this.db
-        .prepare("SELECT payload_fingerprint FROM casino_daily_risk_events WHERE event_key=?")
-        .get(eventKey) as { payload_fingerprint: string } | undefined;
-      if (existing && existing.payload_fingerprint !== fingerprint) {
-        throw new DailyRiskError("ERR_DAILY_RISK_EVENT_CONFLICT", "table join risk replay conflict", { eventKey });
-      }
-      return { userId, dayKey: day.dayKey, maxPlayerLoss };
-    });
-    return tx.immediate();
   }
 
   recordEvent(input: {

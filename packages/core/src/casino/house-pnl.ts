@@ -3,10 +3,15 @@ import { HOUSE_HOLDER } from "./chip-ledger.js";
 /**
  * 胴元損益に算入する取引種別。
  *
- * 対人順位卓の `table_start` / `table_settle` / `table_fee_refund` は
- * 2026-08-16 の退役で削除した。万一これらの取引が現れたら
- * {@link classifyHousePnlTx} は `unclassified` を返す——退役した機能を
- * 「既知の営業収入」として黙って受け入れないための fail-closed。
+ * **`table_settle` / `table_refund` という group kind 自体は退役していない。**
+ * ルーレット・`/勝負` の対人ゲーム・競馬が現在も精算・返金に使っている。
+ * ただしそれらの経路で抜く場代は `jackpot` 行きで、`house` を動かさない
+ * （胴元損益の集計は `house` を触る取引だけを読むので、そもそも到達しない）。
+ *
+ * 退役したのは group kind ではなく、**`table_*` で `house` の収支を動かす経路**
+ * ——つまり対人順位卓の場代・精算だけ。これらがここに載っていないため、
+ * 万一 `table_*` の house 取引が現れたら {@link classifyHousePnlTx} は
+ * `unclassified` を返し、納付処理が fail-closed で止まる。
  */
 export const OPERATING_HOUSE_GROUPS = new Set([
   "solo_game",

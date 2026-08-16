@@ -329,7 +329,6 @@ export {
   type DailyRiskOptions,
   type DailyRiskSourceKind,
   type DailyRiskSoloStart,
-  type DailyRiskTableExposure,
 } from "./casino/daily-risk.js";
 export {
   CasinoMetrics,
