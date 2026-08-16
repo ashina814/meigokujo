@@ -1,4 +1,4 @@
-import type { ButtonInteraction, Message } from "discord.js";
+import type { ButtonInteraction, Message, User } from "discord.js";
 import type { Services } from "../services.js";
 import { claimChallenge, type PvpChallenge } from "./pvp-challenge.js";
 import { collectStakes, pvpViewFromMessage, stakeFailureText, type FundedPvpContext } from "./pvp-common.js";
@@ -34,7 +34,7 @@ export interface AcceptDeps {
    */
   collect?: typeof collectStakes;
   /** 挑戦者の解決。**徴収より前**に呼ぶ（fund 後の Discord API 失敗を作らないため） */
-  fetchUser?: (interaction: ButtonInteraction, userId: string) => Promise<{ id: string }>;
+  fetchUser?: (interaction: ButtonInteraction, userId: string) => Promise<User>;
   /** カードのボタンを外して文面を差し替える。失敗しても募集は戻さない */
   closeCard: (card: Message, text: string) => Promise<unknown>;
 }
@@ -70,7 +70,7 @@ export async function acceptPvpChallenge(
   // ── 3. 挑戦者を解決する。**徴収より前**であること ──
   // 徴収後にここを置くと、Discord API の失敗で runFundedX() へ到達できず、
   // runFundedSession() の保護区間にも入らないまま資金と露出が残る
-  let challenger: { id: string };
+  let challenger: User;
   try {
     challenger = await (deps.fetchUser ?? defaultFetchUser)(interaction, challenge.challengerId);
   } catch (e) {
@@ -79,8 +79,43 @@ export async function acceptPvpChallenge(
     return { ok: false, reason: "challenger_unresolved" };
   }
 
-  // ── 4. 両者を1回で徴収（誰か駄目なら資金は動かない）──
-  const session = `pvpopen:${challengeId}`;
+  // ── 4-5. 徴収と本体開始（下の non-async helper が両者を直結させる）──
+  const started = collectAndStartFunded(services, deps, {
+    session: `pvpopen:${challengeId}`,
+    challenge,
+    challenger,
+    interaction,
+  });
+  if (!started.ok) {
+    await closeQuietly(deps, interaction.message, `${stakeFailureText(started.stakes)}この募集は不成立です。`);
+    return { ok: false, reason: "stakes_failed" };
+  }
+  await started.completion;
+  return { ok: true };
+}
+
+type StartFundedResult =
+  | { ok: false; stakes: ReturnType<typeof collectStakes> }
+  | { ok: true; completion: Promise<void> };
+
+/**
+ * 徴収してから本体を起動するまでの critical section。
+ *
+ * **この関数は意図的に non-async。** 徴収が成功した時点で両者の資金と露出が確保され、
+ * そこから `runFundedX()`（＝`runFundedSession()` の保護区間）へ入るまでに
+ * 失敗しうる処理を挟むと、返金も精算もされないまま資金が残る。
+ *
+ * 実際にこの穴を2回作った（`view.message()` と `users.fetch()`）ので、
+ * 「fund 後に await を置かない」を人間が覚えるルールではなく、
+ * **コードが破れないルール**へ昇格させる。non-async なので、ここへ `await` を
+ * 書こうとすると typecheck が止める。
+ */
+function collectAndStartFunded(
+  services: Services,
+  deps: AcceptDeps,
+  input: { session: string; challenge: PvpChallenge; challenger: User; interaction: ButtonInteraction },
+): StartFundedResult {
+  const { session, challenge, challenger, interaction } = input;
   const stakes = (deps.collect ?? collectStakes)(
     services,
     [challenge.challengerId, interaction.user.id],
@@ -89,21 +124,20 @@ export async function acceptPvpChallenge(
     session,
     riskGameOf(challenge.game),
   );
-  if (!stakes.ok) {
-    await closeQuietly(deps, interaction.message, `${stakeFailureText(stakes)}この募集は不成立です。`);
-    return { ok: false, reason: "stakes_failed" };
-  }
+  if (!stakes.ok) return { ok: false, stakes };
 
-  // ── 5. 募集カードをそのまま対戦盤にして本体へ渡す ──
-  await deps.runners[challenge.game](services, {
-    challenger: challenger as never,
-    opponent: interaction.user,
-    bet: challenge.bet,
-    session,
-    view: pvpViewFromMessage(interaction.message),
-    rematchInteraction: interaction,
-  });
-  return { ok: true };
+  // 徴収成功。ここから本体呼び出しまでの間に await を挟めない
+  return {
+    ok: true,
+    completion: deps.runners[challenge.game](services, {
+      challenger,
+      opponent: interaction.user,
+      bet: challenge.bet,
+      session,
+      view: pvpViewFromMessage(interaction.message),
+      rematchInteraction: interaction,
+    }),
+  };
 }
 
 function claimFailureText(reason: "gone" | "self" | "bot"): string {
@@ -117,7 +151,7 @@ function riskGameOf(game: PvpGameKey): string {
   return pvpGame(game)?.riskGame ?? game;
 }
 
-async function defaultFetchUser(interaction: ButtonInteraction, userId: string): Promise<{ id: string }> {
+async function defaultFetchUser(interaction: ButtonInteraction, userId: string): Promise<User> {
   return interaction.client.users.fetch(userId);
 }
 
