@@ -145,7 +145,7 @@ const SIDE_GAME_GUIDE: Readonly<Record<string, string>> = {
  * 対人戦の案内。
  *
  * 以前は「永続卓と従業員導線は PR20 以降です」と書いたまま固定されていたが、
- * PR20〜24 で順位卓・従業員運営・異議処理まで入っている。現行の姿へ更新する。
+ * 順位卓・従業員運営・異議処理は 2026-08-16 に廃止した。
  */
 function renderPvpGuide(services: Services) {
   const phase = openingPhase(services);
