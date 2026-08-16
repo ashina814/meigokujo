@@ -18,7 +18,7 @@ import { C_MAMMON, C_WIN, diceInline } from "./ui.js";
 import {
   buildPvpAbort,
   buildPvpInvite,
-  viewFromInteraction,
+  pvpViewFromInteraction,
   type FundedPvpContext,
   collectStakes,
   offerRematch,
@@ -199,8 +199,8 @@ export async function playChinchiroDuel(
     opponent,
     bet,
     session,
-    view: viewFromInteraction(interaction),
-    rematchFrom: interaction,
+    view: pvpViewFromInteraction(interaction),
+    rematchInteraction: interaction,
   });
 }
 
@@ -213,7 +213,7 @@ export async function playChinchiroDuel(
  * 勝敗と配当だけが確定する。
  */
 export async function runFundedChinchiroDuel(services: Services, ctx: FundedPvpContext): Promise<void> {
-  const { challenger, opponent, bet, session, view, rematchFrom } = ctx;
+  const { challenger, opponent, bet, session, view, rematchInteraction } = ctx;
 
   // ── 両者振る（同一戦略・同役なら最大5回振り直し） ──
   let cResult = autoRollHand(services.rng);
@@ -281,8 +281,8 @@ export async function runFundedChinchiroDuel(services: Services, ctx: FundedPvpC
     });
   }
 
-  if (!rematchFrom) return;
-  await offerRematch(rematchFrom, {
+  if (!rematchInteraction) return;
+  await offerRematch(rematchInteraction, {
     aId: challenger.id,
     bId: opponent.id,
     bet,

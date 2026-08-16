@@ -30,6 +30,14 @@ export type PvpInteraction = ChatInputCommandInteraction | ButtonInteraction;
 export interface PvpView {
   edit: (payload: BaseMessageOptions) => Promise<unknown>;
   followUp: (payload: BaseMessageOptions) => Promise<unknown>;
+  /**
+   * 進行用ボタンを張る対象メッセージ（BJ・インディアンのような対話型だけが使う）。
+   *
+   * **不変条件: `edit()` と `message()` は必ず同じ Discord メッセージを指す。**
+   * ズレると「画面Aを編集しているのに collector は画面Bに張る」状態になる。
+   * この型を手で組み立てず、必ず下の factory を使うこと。
+   */
+  message: () => Promise<Message>;
 }
 
 /**
@@ -40,6 +48,25 @@ export interface PvpView {
  * 必ず指名招待の受諾処理か、公開募集の成立処理を経由する
  * ——さもないと、資金を確保しないまま勝敗と配当だけが確定する。
  */
+/**
+ * 資金ライフサイクルは入口ごとに違う。**本体は「両者 fund 済み」の後だけ動く。**
+ *
+ * ```text
+ * /勝負（指名）        公開募集
+ * ─────────────       ─────────────
+ * 入力検証             募集カード（資金を1 Ld も動かさない）
+ * 挑戦者を拘束    ←空手形の挑戦を出させない既存挙動。維持する
+ * 相手へ招待           最初の受諾者を同期 claim ＋ timeout 解除
+ * 相手を拘束           collectStakes([challenger, accepter]) ← 1回で両者
+ * ─────────────       ─────────────
+ *          → runFundedX()（共通）
+ * ```
+ *
+ * 公開募集で両者を1回にまとめるのは、`collectStakes()` が元々
+ * 参加者全員の排他・日次リスク・残高を見てから `holdAll()` で一括確保し、
+ * 誰か一人でも駄目なら資金を動かさず戻す設計だから。分けて呼ぶと
+ * 「挑戦者だけ一瞬徴収 → 受諾者失敗 → 返金」という中間状態を自分で作ることになる。
+ */
 export interface FundedPvpContext {
   challenger: User;
   opponent: User;
@@ -48,17 +75,39 @@ export interface FundedPvpContext {
   session: string;
   view: PvpView;
   /**
-   * 再戦オファーを出す元の interaction。指名招待なら挑戦者の、公開募集なら
-   * 受諾者のものが入る。省略すると再戦を出さない。
+   * 再戦UIを Discord へ返すための transport。**人物の正本ではない。**
+   *
+   * 公開募集では `rematchInteraction.user` は「受諾ボタンを押した人」であって
+   * 挑戦者ではない。対戦の参加者は常に上の `challenger` / `opponent` を正本にし、
+   * ここから身元を再推論しないこと。省略すると再戦を出さない。
    */
-  rematchFrom?: PvpInteraction;
+  rematchInteraction?: PvpInteraction;
 }
 
-/** 指名招待（`playX` 内）から本体へ渡す view */
-export function viewFromInteraction(interaction: PvpInteraction): PvpView {
+/** 指名招待（`playX` 内）から本体へ渡す view。編集も collector も招待メッセージへ向く */
+export function pvpViewFromInteraction(interaction: PvpInteraction): PvpView {
   return {
     edit: (payload) => interaction.editReply(payload),
     followUp: (payload) => interaction.followUp(payload),
+    message: async () => (await interaction.fetchReply()) as Message,
+  };
+}
+
+/**
+ * 公開募集から本体へ渡す view。編集も collector も**募集カードそのもの**へ向くので、
+ * カードがそのまま対戦盤になる。続報は同じチャンネルへ送る。
+ */
+export function pvpViewFromMessage(card: Message): PvpView {
+  return {
+    edit: (payload) => card.edit(payload),
+    followUp: async (payload) => {
+      const channel = card.channel;
+      // PartialGroupDMChannel だけ send を持たない。届けられないなら握り潰さず
+      // カード自身へ追記して、決着が消えないようにする
+      if (!("send" in channel)) return card.edit(payload);
+      return channel.send(payload);
+    },
+    message: async () => card,
   };
 }
 
