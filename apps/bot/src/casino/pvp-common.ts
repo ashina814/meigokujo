@@ -8,7 +8,9 @@ import {
   MessageFlags,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
+  type BaseMessageOptions,
   type Message,
+  type User,
 } from "discord.js";
 import { DailyRiskError, JACKPOT_HOLDER } from "@meigokujo/core";
 import type { Services } from "../services.js";
@@ -18,6 +20,47 @@ import { C_LOSE, C_MAMMON, C_WIN } from "./ui.js";
 
 /** 1v1 PvP ゲームが受け取る interaction（/勝負 直叩き or 再戦ボタン経由） */
 export type PvpInteraction = ChatInputCommandInteraction | ButtonInteraction;
+
+/**
+ * 対戦の**表示先**。本体に「どのメッセージを書き換えるか」を持たせないための窓。
+ *
+ * 指名招待なら招待メッセージ（`interaction.editReply` / `followUp`）、
+ * 公開募集なら募集カード（`message.edit` / `channel.send`）が入る。
+ */
+export interface PvpView {
+  edit: (payload: BaseMessageOptions) => Promise<unknown>;
+  followUp: (payload: BaseMessageOptions) => Promise<unknown>;
+}
+
+/**
+ * **両者の徴収が済んだ**対戦の実行文脈。
+ *
+ * ⚠️ `collectStakes()` が challenger・opponent の**両方について成功済み**であることを
+ * 前提とする。この型を取る `runFunded*` 系を新しい入口から直接呼ばないこと。
+ * 必ず指名招待の受諾処理か、公開募集の成立処理を経由する
+ * ——さもないと、資金を確保しないまま勝敗と配当だけが確定する。
+ */
+export interface FundedPvpContext {
+  challenger: User;
+  opponent: User;
+  bet: number;
+  /** 徴収・返金・精算で使う一意なセッション識別子 */
+  session: string;
+  view: PvpView;
+  /**
+   * 再戦オファーを出す元の interaction。指名招待なら挑戦者の、公開募集なら
+   * 受諾者のものが入る。省略すると再戦を出さない。
+   */
+  rematchFrom?: PvpInteraction;
+}
+
+/** 指名招待（`playX` 内）から本体へ渡す view */
+export function viewFromInteraction(interaction: PvpInteraction): PvpView {
+  return {
+    edit: (payload) => interaction.editReply(payload),
+    followUp: (payload) => interaction.followUp(payload),
+  };
+}
 
 /**
  * `/勝負` の対人卓のリスク枠の名前（PR23）。

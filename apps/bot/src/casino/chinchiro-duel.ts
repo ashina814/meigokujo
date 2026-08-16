@@ -18,6 +18,8 @@ import { C_MAMMON, C_WIN, diceInline } from "./ui.js";
 import {
   buildPvpAbort,
   buildPvpInvite,
+  viewFromInteraction,
+  type FundedPvpContext,
   collectStakes,
   offerRematch,
   refundAll,
@@ -192,6 +194,27 @@ export async function playChinchiroDuel(
     return;
   }
 
+  await runFundedChinchiroDuel(services, {
+    challenger,
+    opponent,
+    bet,
+    session,
+    view: viewFromInteraction(interaction),
+    rematchFrom: interaction,
+  });
+}
+
+/**
+ * 対戦チンチロの本体。
+ *
+ * ⚠️ **`collectStakes()` が両者について成功済みであることを前提とする。**
+ * 新規の入口から直接呼ばず、指名招待（{@link playChinchiroDuel}）または
+ * 公開募集の成立処理を経由すること。徴収前に呼ぶと、資金を確保しないまま
+ * 勝敗と配当だけが確定する。
+ */
+export async function runFundedChinchiroDuel(services: Services, ctx: FundedPvpContext): Promise<void> {
+  const { challenger, opponent, bet, session, view, rematchFrom } = ctx;
+
   // ── 両者振る（同一戦略・同役なら最大5回振り直し） ──
   let cResult = autoRollHand(services.rng);
   let oResult = autoRollHand(services.rng);
@@ -206,7 +229,7 @@ export async function playChinchiroDuel(
   const cRank = handRank(cResult.hand);
   const oRank = handRank(oResult.hand);
 
-  await interaction.editReply({
+  await view.edit({
     content: "",
     embeds: [
       new EmbedBuilder()
@@ -227,7 +250,7 @@ export async function playChinchiroDuel(
   if (cRank === oRank) {
     // 同役続き → 全額返金
     refundAll(services, [challenger.id, opponent.id], bet, `${session}:refund:draw`, session);
-    await interaction.followUp({
+    await view.followUp({
       embeds: [
         new EmbedBuilder()
           .setTitle("🎲 引き分け")
@@ -241,7 +264,7 @@ export async function playChinchiroDuel(
     const loserId = cRank > oRank ? opponent.id : challenger.id;
     const { payout, houseCut } = settlePvp(services, [winnerId], pot, `${session}:settle`, session);
 
-    await interaction.followUp({
+    await view.followUp({
       embeds: [
         new EmbedBuilder()
           .setTitle(`🎲 対戦チンチロ — 勝者 <@${winnerId}>`)
@@ -258,7 +281,8 @@ export async function playChinchiroDuel(
     });
   }
 
-  await offerRematch(interaction, {
+  if (!rematchFrom) return;
+  await offerRematch(rematchFrom, {
     aId: challenger.id,
     bId: opponent.id,
     bet,
