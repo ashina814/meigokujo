@@ -62,7 +62,7 @@ function fakeCasinoServices(opts: { phase?: "pre_reset" | "formal" | "unknown"; 
 }
 
 /**
- * パネル種別の選択肢が単一の表から生成されていることを、実際の SlashCommandBuilder 出力で固定する。
+ * パネル種別の選択肢が単一の表から生成されることを、実際の SlashCommandBuilder 出力で固定する。
  * `Record<PanelKind, ...>` の描画網羅は TypeScript の typecheck が担う。
  */
 describe("パネル種別は単一の表から生成される", () => {
@@ -89,6 +89,21 @@ describe("パネル種別は単一の表から生成される", () => {
     }
     expect(retiredPanelChoices().map((c) => c.value)).toEqual(["entry_flex"]);
   });
+
+  it("stale な外部設置経路でも廃止済み種別を新規設置できない", async () => {
+    const { panelMessageForExternal } = await import("../src/commands/bank-panel.js");
+    expect(() => panelMessageForExternal("entry_flex", {} as never, "channel-1")).toThrow(
+      "panel kind is not installable: entry_flex",
+    );
+  });
+
+  it("部署依存パネルは部署選択済みでなければ外部設置できない", async () => {
+    const { panelMessageForExternal } = await import("../src/commands/bank-panel.js");
+    const services = { settings: { getString: () => null } } as never;
+    expect(() => panelMessageForExternal("dept", services, "channel-1")).toThrow(
+      "panel kind requires department selection: dept",
+    );
+  });
 });
 
 describe("賭場の常設パネル", () => {
@@ -96,13 +111,20 @@ describe("賭場の常設パネル", () => {
     expect(installablePanelChoices().map((c) => c.value)).toContain("casino");
   });
 
-  it("入口ボタンを押すと既存の賭場ホームを本人だけに返す", async () => {
-    const { CASINO_PANEL_OPEN, handleCasinoHomeButton } = await import("../src/commands/casino-home.js");
+  it("実際の入口ボタンを押すと既存の賭場ホームを本人だけに返す", async () => {
+    const { CASINO_PANEL_OPEN, casinoPanelMessage, handleCasinoHomeButton } = await import("../src/commands/casino-home.js");
     const { services, metricRecord } = fakeCasinoServices();
+    const panel = casinoPanelMessage(services);
+    const row = panel.components?.[0];
+    if (!row || !("toJSON" in row)) throw new Error("casino panel action row is missing");
+    const rowJson = row.toJSON() as { components?: Array<{ custom_id?: string }> };
+    const actualCustomId = rowJson.components?.[0]?.custom_id;
+    expect(actualCustomId).toBe(CASINO_PANEL_OPEN);
+
     const reply = vi.fn().mockResolvedValue(undefined);
     const update = vi.fn().mockResolvedValue(undefined);
     const interaction = {
-      customId: CASINO_PANEL_OPEN,
+      customId: actualCustomId!,
       id: "panel-open-1",
       user: { id: "u1" },
       guild: { name: "冥獄城" },
