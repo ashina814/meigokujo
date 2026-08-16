@@ -4,8 +4,10 @@ import { createChallenge, getChallenge, resetChallengesForTesting } from "../src
 import {
   acquireTransientParticipation,
   hasTransientParticipation,
+  releaseTransientParticipation,
   resetTransientParticipationForTesting,
 } from "../src/casino/participation.js";
+import { pvpRiskScope } from "../src/casino/pvp-common.js";
 
 afterEach(() => {
   resetChallengesForTesting();
@@ -23,10 +25,27 @@ afterEach(() => {
  */
 function setup(opts: { stakesOk?: boolean; deferThrows?: boolean } = {}) {
   const order: string[] = [];
-  const collect = vi.fn(() => {
-    order.push("collectStakes");
-    return opts.stakesOk === false ? { ok: false as const, reason: "broke" as const } : { ok: true as const };
-  }) as never;
+  const collect = vi.fn(
+    (
+      _services: unknown,
+      userIds: string[],
+      _bet: number,
+      _operationId: string,
+      session: string,
+      _game: string,
+    ) => {
+      order.push("collectStakes");
+      if (opts.stakesOk === false) {
+        // 本番 collectStakes は失敗時に自分で参加席をロールバックする。
+        // 入口側から無条件に解くと、露出解除失敗時に fail-closed で残した席を壊すので、
+        // fake も同じ責務を持たせる。
+        const scope = pvpRiskScope(session);
+        for (const userId of userIds) releaseTransientParticipation(userId, "pvp", scope);
+        return { ok: false as const, reason: "broke" as const };
+      }
+      return { ok: true as const };
+    },
+  ) as never;
 
   const run = vi.fn(async () => {
     order.push("runFunded");
@@ -182,7 +201,7 @@ describe("どこで失敗しても募集を復活させない", () => {
     expect(getChallenge("c1")).toBeUndefined();
   });
 
-  it("徴収が成立しなければ本体へ進まず、仮確保した席も残さない", async () => {
+  it("徴収が成立しなければ本体へ進まず、collect 側のロールバックで席も残さない", async () => {
     const { interaction, deps, run } = setup({ stakesOk: false });
     const result = await acceptPvpChallenge(interaction, {} as never, "c1", deps);
 
