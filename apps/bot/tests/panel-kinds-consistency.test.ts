@@ -1,27 +1,71 @@
-import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { MessageFlags, type ButtonInteraction, type SlashCommandBuilder } from "discord.js";
 import {
-  PANEL_KINDS,
   installablePanelChoices,
   removablePanelChoices,
   retiredPanelChoices,
 } from "../src/commands/panel-kinds.js";
-import { panelCommand, panelRemoveCommand } from "../src/commands/bank-panel.js";
+
+let panelCommand: SlashCommandBuilder;
+let panelRemoveCommand: SlashCommandBuilder;
+
+beforeAll(async () => {
+  // bank-panel.ts は shokan -> permissions -> config を経由する。
+  // CI には本番用 Discord credentials が無いので、module load 前にテスト値を入れる。
+  vi.stubEnv("DISCORD_TOKEN", "test-token");
+  vi.stubEnv("CLIENT_ID", "test-client");
+  vi.stubEnv("OWNER_ID", "test-owner");
+  ({ panelCommand, panelRemoveCommand } = await import("../src/commands/bank-panel.js"));
+});
+
+afterAll(() => {
+  vi.unstubAllEnvs();
+});
+
+function choiceValues(cmd: SlashCommandBuilder): string[] {
+  const json = cmd.toJSON();
+  const opt = json.options?.find((o) => o.name === "種別") as { choices?: Array<{ value: string }> } | undefined;
+  return (opt?.choices ?? []).map((c) => c.value);
+}
+
+function fakeCasinoServices(opts: { phase?: "pre_reset" | "formal" | "unknown"; status?: string } = {}) {
+  const phase = opts.phase ?? "formal";
+  const status = opts.status ?? "open";
+  const metricRecord = vi.fn();
+  return {
+    services: {
+      casinoStatus: {
+        current: () => ({ status, reason: "点検中", changedBy: "test", changedAt: 1 }),
+      },
+      chipTx: { openingPhase: () => phase },
+      ledger: { balanceOf: () => 10_000 },
+      chipAssets: {
+        forUser: () => ({ userId: "u1", freeChips: 0, escrowed: 0, total: 0 }),
+        freeChips: () => 0,
+      },
+      casino: {
+        jackpotPool: () => 0,
+        stats: () => ({ current_win_streak: 0 }),
+        availableForLiability: () => 1_000_000,
+        homePreference: () => null,
+      },
+      daily: { nextClaimAt: () => 0 },
+      vip: { isVip: () => false, betCapMult: () => 2 },
+      items: { armedWinBonusCap: () => 0 },
+      dailyRisk: {
+        maxBetForPlayerLoss: (_userId: string, _lossPerBet: (bet: number) => number, cap: number) => cap,
+      },
+      casinoMetrics: { record: metricRecord },
+    } as never,
+    metricRecord,
+  };
+}
 
 /**
- * パネル種別の3経路（実装の描画 / `/パネル設置` / `/管理 → パネル`）が
- * 単一の表から生成されていることを固定する。
- *
- * かつて3箇所を手書きしていてドリフトし、`confession` が `/パネル設置` から選べず、
- * `shop_admin` はどの導線からも設置できないのに更新処理だけ生きていた。
+ * パネル種別の選択肢が単一の表から生成されていることを、実際の SlashCommandBuilder 出力で固定する。
+ * `Record<PanelKind, ...>` の描画網羅は TypeScript の typecheck が担う。
  */
 describe("パネル種別は単一の表から生成される", () => {
-  const choiceValues = (cmd: typeof panelCommand) => {
-    const json = cmd.toJSON();
-    const opt = json.options?.find((o) => o.name === "種別") as { choices?: Array<{ value: string }> } | undefined;
-    return (opt?.choices ?? []).map((c) => c.value);
-  };
-
   it("/パネル設置 の選択肢が installable と一致する", () => {
     expect(choiceValues(panelCommand)).toEqual(installablePanelChoices().map((c) => c.value));
   });
@@ -30,19 +74,9 @@ describe("パネル種別は単一の表から生成される", () => {
     expect(choiceValues(panelRemoveCommand)).toEqual(removablePanelChoices().map((c) => c.value));
   });
 
-  it("描画マップが表の全 key を網羅する", () => {
-    const source = readFileSync(new URL("../src/commands/bank-panel.ts", import.meta.url), "utf8");
-    const body = source.slice(source.indexOf("const PANEL_MESSAGES"), source.indexOf("export const panelCommand"));
-    for (const { key } of PANEL_KINDS) {
-      expect(body, `${key} の描画が無い`).toContain(`${key}:`);
-    }
-  });
-
   it("かつて落ちていた種別が設置経路に載っている", () => {
     const installable = installablePanelChoices().map((c) => c.value);
-    // confession は /パネル設置 から選べなかった
     expect(installable).toContain("confession");
-    // shop_admin はどの導線からも設置できなかった
     expect(installable).toContain("shop_admin");
   });
 
@@ -62,23 +96,46 @@ describe("賭場の常設パネル", () => {
     expect(installablePanelChoices().map((c) => c.value)).toContain("casino");
   });
 
-  it("入口ボタンが既存の賭場ハブ経路に乗る接頭辞を使う", async () => {
-    const { CASINO_PANEL_OPEN } = await import("../src/commands/casino-home.js");
-    // index.ts は customId.startsWith("casino:home:") で賭場ハブへ流す。
-    // 接頭辞が外れるとボタンが無反応になる（押しても何も起きない事故の再発防止）
-    expect(CASINO_PANEL_OPEN.startsWith("casino:home:")).toBe(true);
-    const indexSource = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
-    expect(indexSource).toContain('customId.startsWith("casino:home:")');
+  it("入口ボタンを押すと既存の賭場ホームを本人だけに返す", async () => {
+    const { CASINO_PANEL_OPEN, handleCasinoHomeButton } = await import("../src/commands/casino-home.js");
+    const { services, metricRecord } = fakeCasinoServices();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const update = vi.fn().mockResolvedValue(undefined);
+    const interaction = {
+      customId: CASINO_PANEL_OPEN,
+      id: "panel-open-1",
+      user: { id: "u1" },
+      guild: { name: "冥獄城" },
+      reply,
+      update,
+    } as unknown as ButtonInteraction;
+
+    await handleCasinoHomeButton(interaction, services);
+
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect(update).not.toHaveBeenCalled();
+    const payload = reply.mock.calls[0]![0] as {
+      flags?: number;
+      embeds?: Array<{ toJSON(): { author?: { name?: string } } }>;
+    };
+    expect(payload.flags).toBe(MessageFlags.Ephemeral);
+    expect(payload.embeds?.[0]?.toJSON().author?.name).toContain("マモンの賭場");
+    expect(metricRecord).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: "home_open",
+      payload: { source: "panel" },
+    }));
   });
 
-  it("全員が見る1枚なので個人の残高や福分けの可否を出さない", async () => {
+  it("全員が見る1枚なので個人情報を出さず、営業状態が変わっても看板本文は変わらない", async () => {
     const { casinoPanelMessage } = await import("../src/commands/casino-home.js");
-    const services = { settings: { getString: () => null, getNumber: () => 0 }, chipTx: { openingPhase: () => "formal" }, casinoStatus: { current: () => ({ status: "open", reason: "" }) } } as never;
-    const panel = casinoPanelMessage(services);
-    const json = JSON.stringify(panel);
-    for (const personal of ["福分け", "所持", "残高"]) {
+    const formal = casinoPanelMessage(fakeCasinoServices({ phase: "formal", status: "open" }).services);
+    const stopped = casinoPanelMessage(fakeCasinoServices({ phase: "pre_reset", status: "maintenance" }).services);
+    const json = JSON.stringify(formal);
+
+    for (const personal of ["福分け", "所持", "残高", "JP "]) {
       expect(json, `${personal} が常設パネルに出ている`).not.toContain(personal);
     }
-    expect(panel.components).toHaveLength(1);
+    expect(JSON.stringify(stopped)).toBe(json);
+    expect(formal.components).toHaveLength(1);
   });
 });
