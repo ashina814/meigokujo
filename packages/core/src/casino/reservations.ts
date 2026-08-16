@@ -21,7 +21,7 @@ export interface ReservationRow {
   game: string;
   userId: string;
   createdAt: number;
-  scope: ReservationScope;
+  scope: PersistedReservationScope;
 }
 
 export interface ReservationResult {
@@ -42,8 +42,22 @@ export interface ReservationResult {
   conflictWith?: ReservationRow;
 }
 
-export const RESERVATION_SCOPES = ["transient_game", "persistent_table_fee_refund"] as const;
+/**
+ * **現行**の予約スコープ。新しく予約を取れるのはこれだけ。
+ *
+ * `persistent_table_fee_refund` は退役した対人順位卓（2026-08-16 廃止）のもので、
+ * ここには載せない。DB の CHECK 制約には残っているが、それは既存行を読めるようにする
+ * ためだけの互換であって、**新規に書ける値ではない**。
+ */
+export const RESERVATION_SCOPES = ["transient_game"] as const;
 export type ReservationScope = (typeof RESERVATION_SCOPES)[number];
+
+/**
+ * DB に保存されうるスコープ（読み取り互換）。退役分を含む。
+ * 既存行の解釈にだけ使い、新規予約の入力型には使わないこと。
+ */
+export const PERSISTED_RESERVATION_SCOPES = [...RESERVATION_SCOPES, "persistent_table_fee_refund"] as const;
+export type PersistedReservationScope = (typeof PERSISTED_RESERVATION_SCOPES)[number];
 
 /**
  * 同じ鍵で内容の違う予約を取ろうとした（PR5 レビュー指摘）。
@@ -365,15 +379,19 @@ export class HouseReservations {
   }
 }
 
+/** 新規予約の入力検証。退役スコープはここで弾かれる */
 function assertScope(scope: string): asserts scope is ReservationScope {
   if (!RESERVATION_SCOPES.includes(scope as ReservationScope)) {
     throw new ReservationInputError("ERR_BAD_GAME", { field: "scope", scope });
   }
 }
 
-function parseScope(scope: string): ReservationScope {
-  assertScope(scope);
-  return scope;
+/** 既存行の読み取り。退役スコープも解釈できる（新規には使わない） */
+function parseScope(scope: string): PersistedReservationScope {
+  if (!PERSISTED_RESERVATION_SCOPES.includes(scope as PersistedReservationScope)) {
+    throw new ReservationInputError("ERR_BAD_GAME", { field: "scope", scope });
+  }
+  return scope as PersistedReservationScope;
 }
 
 function parseReservationRow(row: ReservationDbRow): ReservationRow {

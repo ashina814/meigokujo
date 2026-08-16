@@ -1,18 +1,22 @@
 import { HOUSE_HOLDER } from "./chip-ledger.js";
 
+/**
+ * 胴元損益に算入する取引種別。
+ *
+ * 対人順位卓の `table_start` / `table_settle` / `table_fee_refund` は
+ * 2026-08-16 の退役で削除した。万一これらの取引が現れたら
+ * {@link classifyHousePnlTx} は `unclassified` を返す——退役した機能を
+ * 「既知の営業収入」として黙って受け入れないための fail-closed。
+ */
 export const OPERATING_HOUSE_GROUPS = new Set([
   "solo_game",
   "daily",
   "vip",
   "shop",
-  "table_start",
-  "table_settle",
-  "table_fee_refund",
 ]);
 
 export const EXCLUDED_HOUSE_GROUPS = new Set([
   "refund",
-  "table_refund",
   "market_bet",
   "market_settle",
   "deposit",

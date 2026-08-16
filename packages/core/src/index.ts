@@ -620,12 +620,8 @@ export {
 export {
   RecoveryRegistry,
   recoverCasino,
-  recoverCasinoAsync,
   type RecoverySource,
   type RecoverCasinoDeps,
-  type RecoverCasinoAsyncDeps,
   type RecoverCasinoResult,
-  type PersistentTableRestoreResult,
-  type PersistentTableRestoreProvider,
 } from "./casino/recovery.js";
 export * from "./sub-account/service.js";

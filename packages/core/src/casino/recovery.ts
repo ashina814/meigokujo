@@ -93,22 +93,6 @@ export interface RecoverCasinoDeps {
   events: EventLog;
   /** PR10 S10. Required so startup can never silently skip free-chip redemption. */
   chipFlow: CasinoChipFlow;
-  /** PR20 S11. The bot restores durable table messages before S12 can reopen the casino. */
-  persistentTableRestore?: PersistentTableRestoreResult;
-}
-
-export interface PersistentTableRestoreResult {
-  restored: number;
-  replaced: number;
-  disputed: number;
-  failed: Array<{ tableId: string; error: string }>;
-}
-
-export type PersistentTableRestoreProvider = () => PersistentTableRestoreResult | Promise<PersistentTableRestoreResult>;
-
-export interface RecoverCasinoAsyncDeps extends Omit<RecoverCasinoDeps, "persistentTableRestore"> {
-  /** PR20 S11. Runs after S10 and before S12 while casino status remains startup_check. */
-  persistentTableRestore?: PersistentTableRestoreProvider;
 }
 
 export interface RecoverCasinoResult {
@@ -171,26 +155,14 @@ export interface RecoverCasinoResult {
  * S12 問題がなければ、元の状態が startup_check の場合だけ open へ戻す
  * ```
  *
- * **S10（自由チップの Land 返還）は PR10、S11（永続卓のメッセージ復旧）は PR20** の範囲なので
- * ここには入っていない。両方ともこの関数へ足す形で追加する。
+ * **S11（永続卓のメッセージ復旧）は存在しない。** 対人順位卓を 2026-08-16 に廃止し、
+ * 再起動をまたいで生存する卓が無くなったため、復旧は S1〜S10・S12 だけを同期で通す。
+ * 再起動をまたぐ所有元は `RecoveryRegistry` へ登録する（板など）。
  *
  * 「分からないときは動かさない」を全ステップで徹底する。自動返金は
  * 「所有元が確実に存在しない」と証明できた場合だけ。
  */
 export function recoverCasino(deps: RecoverCasinoDeps): RecoverCasinoResult {
-  const result = recoverCasinoCore(deps, deps.persistentTableRestore ? () => deps.persistentTableRestore! : undefined);
-  if (isPromiseLike(result)) throw new Error("recoverCasino received an async persistent table restore provider");
-  return result;
-}
-
-export async function recoverCasinoAsync(deps: RecoverCasinoAsyncDeps): Promise<RecoverCasinoResult> {
-  return await recoverCasinoCore(deps, deps.persistentTableRestore);
-}
-
-function recoverCasinoCore(
-  deps: Omit<RecoverCasinoDeps, "persistentTableRestore">,
-  persistentTableRestore?: PersistentTableRestoreProvider,
-): RecoverCasinoResult | Promise<RecoverCasinoResult> {
   const { status, integrity, chipTx, escrow, reservations, registry, events, chipFlow } = deps;
   const steps: string[] = [];
   const empty: Omit<RecoverCasinoResult, "outcome" | "steps" | "reason"> = {
@@ -358,82 +330,16 @@ function recoverCasinoCore(
       return { outcome: "source_failed", steps, ...summary, reason };
     }
 
-    const completeRecovery = () =>
-      completeRecoveryAfterPersistentTableRestore({
-        status,
-        integrity,
-        events,
-        steps,
-        summary,
-        result,
-        recoveringFromHalt,
-        heldReason: held.reason,
-      });
-
-    if (persistentTableRestore) {
-      steps.push("S11:persistent_table_restore");
-      try {
-        const restored = persistentTableRestore();
-        if (isPromiseLike(restored)) {
-          return restored.then((value) => {
-            const halted = haltForPersistentTableRestoreFailure({
-              status,
-              events,
-              steps,
-              summary,
-              recoveringFromHalt,
-              heldReason: held.reason,
-              persistentTableRestore: value,
-            });
-            return halted ?? completeRecovery();
-          }).catch((e) => {
-            const failed = {
-              restored: 0,
-              replaced: 0,
-              disputed: 0,
-              failed: [{ tableId: "*", error: e instanceof Error ? e.message : String(e) }],
-            };
-            return haltForPersistentTableRestoreFailure({
-              status,
-              events,
-              steps,
-              summary,
-              recoveringFromHalt,
-              heldReason: held.reason,
-              persistentTableRestore: failed,
-            })!;
-          });
-        }
-        const halted = haltForPersistentTableRestoreFailure({
-          status,
-          events,
-          steps,
-          summary,
-          recoveringFromHalt,
-          heldReason: held.reason,
-          persistentTableRestore: restored,
-        });
-        if (halted) return halted;
-      } catch (e) {
-        const failed = {
-          restored: 0,
-          replaced: 0,
-          disputed: 0,
-          failed: [{ tableId: "*", error: e instanceof Error ? e.message : String(e) }],
-        };
-        return haltForPersistentTableRestoreFailure({
-          status,
-          events,
-          steps,
-          summary,
-          recoveringFromHalt,
-          heldReason: held.reason,
-          persistentTableRestore: failed,
-        })!;
-      }
-    }
-
-    return completeRecovery();
+    return completeRecovery({
+      status,
+      integrity,
+      events,
+      steps,
+      summary,
+      result,
+      recoveringFromHalt,
+      heldReason: held.reason,
+    });
   } catch (e) {
     // S1〜S12 のどこかで予期しない例外。安全性を保証できないので必ず recovery_halt にする
     // （PR7監査・二次レビュー）。S5〜S8 まで確認できていれば、その結果だけは報告する。
@@ -473,29 +379,7 @@ type RecoverySummary = Pick<
   | "redeemedFreeChips"
 >;
 
-function haltForPersistentTableRestoreFailure(input: {
-  status: CasinoStatus;
-  events: EventLog;
-  steps: string[];
-  summary: RecoverySummary;
-  recoveringFromHalt: boolean;
-  heldReason: string;
-  persistentTableRestore: PersistentTableRestoreResult;
-}): RecoverCasinoResult | undefined {
-  const { status, events, steps, summary, recoveringFromHalt, heldReason, persistentTableRestore } = input;
-  if (persistentTableRestore.failed.length === 0) return undefined;
-  const reason =
-    `S11 persistent table restore failed: ${persistentTableRestore.failed.length} table(s): ` +
-    persistentTableRestore.failed.map((f) => `${f.tableId}: ${f.error}`).join(", ");
-  events.log("casino_recovery_halted", {
-    actor: "system:recovery",
-    payload: { steps, reason, persistentTableRestore },
-  });
-  status.haltForRecovery(recoveringFromHalt ? appendReason(heldReason, reason) : reason);
-  return { outcome: "source_failed", steps, ...summary, reason };
-}
-
-function completeRecoveryAfterPersistentTableRestore(input: {
+function completeRecovery(input: {
   status: CasinoStatus;
   integrity: CasinoIntegrity;
   events: EventLog;
@@ -591,10 +475,6 @@ function completeRecoveryAfterPersistentTableRestore(input: {
   steps.push("S12:再開");
   events.log("casino_recovered", { actor: "system:recovery", payload: { steps, ...summary } });
   return { outcome: "opened", steps, ...summary, reason: result.reason };
-}
-
-function isPromiseLike<T>(value: T | Promise<T>): value is Promise<T> {
-  return !!value && typeof (value as { then?: unknown }).then === "function";
 }
 
 function appendReason(base: string, addition: string): string {

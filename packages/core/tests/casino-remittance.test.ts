@@ -165,17 +165,30 @@ describe("PR14 clean remittance / bailout", () => {
     c.chips.runGroup({ groupKey: "daily:1", kind: "daily", actorId: "u1" }, () => {
       c.chips.transfer(HOUSE_HOLDER, "u1", 25, { reason: "whatever" });
     });
-    c.chips.runGroup({ groupKey: "ranked:fee-refund:1", kind: "table_fee_refund", actorId: "judge" }, () => {
-      c.chips.transfer(HOUSE_HOLDER, "u1", 15, { reason: "ranked fee refund" });
-    });
     c.chips.runGroup({ groupKey: "refund:1", kind: "refund", actorId: "system" }, () => {
       c.chips.transfer(HOUSE_HOLDER, "u1", 20, { reason: "not parsed" });
     });
 
-    expect(c.remit.syncRealized()).toBe(6);
+    expect(c.remit.syncRealized()).toBe(5);
     expect(c.remit.syncRealized()).toBe(0);
-    expect(c.remit.pnl().map((x) => x.amount)).toEqual([100, -30, -10, -5, -25, -15]);
-    expect(c.remit.cumulativeProfit()).toBe(15);
+    expect(c.remit.pnl().map((x) => x.amount)).toEqual([100, -30, -10, -5, -25]);
+    expect(c.remit.cumulativeProfit()).toBe(30);
+    c.db.close();
+  });
+
+  it("退役した順位卓のgroupは営業収入として黙って受け入れずfail-closedする", () => {
+    const c = setup();
+    configure(c);
+    fund(c, HOUSE_HOLDER, 1000, "seed:house");
+    fund(c, "u1", 100, "seed:u1");
+    // 2026-08-16 に対人順位卓を退役させたので、この kind はもう既知の営業収入ではない。
+    // 事故で復活したときに「既知です」と素通りさせないため unclassified で止める
+    c.chips.runGroup({ groupKey: "ranked:fee-refund:1", kind: "table_fee_refund", actorId: "judge" }, () => {
+      c.chips.transfer(HOUSE_HOLDER, "u1", 15, { reason: "ranked fee refund" });
+    });
+    expect(() => c.remit.syncRealized())
+      .toThrowError(expect.objectContaining({ code: "ERR_UNCLASSIFIED_HOUSE_TX" }));
+    expect(c.db.prepare("SELECT COUNT(*) AS n FROM casino_house_pnl").get()).toEqual({ n: 0 });
     c.db.close();
   });
 

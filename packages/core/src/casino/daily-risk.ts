@@ -4,13 +4,16 @@ import { canonicalStringify } from "./opening-canonical.js";
 import type { CasinoChipAssets } from "./chip-assets.js";
 import type { OpeningPhase } from "./chip-tx.js";
 
+/**
+ * 日次リスクの発生源。
+ *
+ * 対人順位卓の `table_fee` / `table_result` / `table_fee_refund` は
+ * 2026-08-16 の退役で削除した。これらを生む経路は存在しない。
+ */
 export type DailyRiskSourceKind =
   | "solo_result"
   | "solo_extra_loss"
   | "solo_bonus"
-  | "table_fee"
-  | "table_result"
-  | "table_fee_refund"
   | "exposure_result";
 
 export type DailyRiskErrorCode =
