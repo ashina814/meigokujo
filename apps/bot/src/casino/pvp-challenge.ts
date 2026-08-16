@@ -10,6 +10,8 @@
  *   返して終わり。ここで復旧できる募集を作り始めると、11,000行消した永続卓の世界へ戻る
  * - **`open` からの遷移は一度きり。** 受諾・取消・期限切れが競っても、
  *   最初の1つだけが通る
+ * - **1人が同時に出せる募集は1件。** 資金を拘束しないからこそ、同じ挑戦者が
+ *   公開カードを量産して「どれか1件だけ成立、残りは不成立」というゴミを作らない
  *
  * ## なぜ同期で確定させるか
  *
@@ -53,6 +55,11 @@ export function createChallenge(input: {
   // 同じ ID を二度使うと、古い timer が新しい challenge を expire させられる。
   // 実運用では randomUUID なので起きないが、状態機械の不変条件として塞ぐ
   if (challenges.has(input.id)) throw new Error(`Duplicate challenge id: ${input.id}`);
+  // 募集は資金も席も拘束しないため、ここを塞がないと1人で公開カードを量産できる。
+  // Map には open しか残らない（終端は finish/expiry で削除）ので、存在だけ見ればよい。
+  if (getOpenChallengeForChallenger(input.challengerId)) {
+    throw new Error(`Challenger already has an open challenge: ${input.challengerId}`);
+  }
   const challenge: PvpChallenge = {
     id: input.id,
     challengerId: input.challengerId,
@@ -111,6 +118,14 @@ export function cancelChallenge(id: string, actorId: string): PvpChallenge | nul
 
 export function getChallenge(id: string): PvpChallenge | undefined {
   return challenges.get(id);
+}
+
+/** 同じ挑戦者が同時に公開募集を量産しないための読み取り。 */
+export function getOpenChallengeForChallenger(challengerId: string): PvpChallenge | undefined {
+  for (const challenge of challenges.values()) {
+    if (challenge.challengerId === challengerId && challenge.state === "open") return challenge;
+  }
+  return undefined;
 }
 
 /** 状態を終端へ倒したら、必ず timer を解除して表から外す */

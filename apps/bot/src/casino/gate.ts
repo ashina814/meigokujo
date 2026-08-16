@@ -64,6 +64,8 @@ const GUARDED_PREFIXES = [
   "casino:exit:", // 結果画面の退場（自由チップをLandへ返還）
   "casino:daily:", // `/賭場` ホームの福分け受け取りボタン（既存Daily処理へ接続）
   "casino:home:pvpopen-accept:", // 公開1v1の受諾（この先で両者を一括徴収）
+  "casino:home:pvpopen-post:", // 公開1v1をチャンネルへ投稿する
+  "casino:home:pvpopen-custom:", // 公開1v1の自由入力モーダルを開く
 ];
 
 /**

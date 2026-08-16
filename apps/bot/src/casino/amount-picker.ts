@@ -1,4 +1,4 @@
-﻿import {
+import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -30,6 +30,7 @@ import { openingNotice, openingPhase } from "./opening.js";
 import { readAvailableWallet, type AvailableWalletSnapshot } from "./wallet.js";
 import { parseStrictPositiveInteger } from "./wager-input.js";
 import { startCasinoSoloGame } from "./play-route.js";
+import { handlePvpOpenAmountModal, PVP_AMOUNT_MODAL_PREFIX } from "./pvp-open-ui.js";
 import { recordCasinoMetricBestEffort } from "./metrics.js";
 
 export const CASINO_GAME_SELECT_CUSTOM_ID = "casino:home:game-select";
@@ -158,6 +159,13 @@ export async function handleCasinoAmountModal(
   interaction: ModalSubmitInteraction,
   services: Services,
 ): Promise<void> {
+  // PvP の自由入力も index.ts の既存 `casino:amount:modal:` 入口を共有する。
+  // 先に専用接頭辞を切り分けないと、"pvp:chinchiro" をソロゲーム名として弾いてしまう。
+  if (interaction.customId.startsWith(PVP_AMOUNT_MODAL_PREFIX)) {
+    await handlePvpOpenAmountModal(interaction, services);
+    return;
+  }
+
   const game = interaction.customId.slice(CASINO_AMOUNT_MODAL_PREFIX.length);
   if (!isCasinoSoloGame(game)) {
     await interaction.reply({ content: "❌ 不明な遊びです。", flags: MessageFlags.Ephemeral });

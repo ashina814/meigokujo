@@ -7,6 +7,7 @@ import { acceptPvpChallenge, type AcceptDeps, type FundedRunner } from "./pvp-ac
 import { PVP_ACCEPT, PVP_CANCEL, closeChallengeCard } from "./pvp-card.js";
 import { cancelChallenge, getChallenge } from "./pvp-challenge.js";
 import type { PvpGameKey } from "./pvp-games.js";
+import { handlePvpOpenSetupButton, isPvpOpenSetupButton, renderPvpOpenGameSelect } from "./pvp-open-ui.js";
 import { runFundedSashiDuel } from "./sashi.js";
 
 export const PVP_RUNNERS: Record<PvpGameKey, FundedRunner> = {
@@ -32,13 +33,21 @@ const DEFAULT_DEPS: PvpCardRouteDeps = {
   runners: PVP_RUNNERS,
 };
 
-/** `casino:home:` のうち、公開募集カード由来の操作だけを拾う。 */
+/**
+ * casino-home の先頭にある既存フック。名前は互換のため残すが、
+ * 募集カードだけでなく「みんなで勝負」のセットアップ画面もここで拾う。
+ */
 export function isPvpCardButton(customId: string): boolean {
-  return customId.startsWith(`${PVP_ACCEPT}:`) || customId.startsWith(`${PVP_CANCEL}:`);
+  return (
+    customId === "casino:home:pvp" ||
+    isPvpOpenSetupButton(customId) ||
+    customId.startsWith(`${PVP_ACCEPT}:`) ||
+    customId.startsWith(`${PVP_CANCEL}:`)
+  );
 }
 
 /**
- * 公開募集カードの受諾・取消を処理する。
+ * 公開1v1のセットアップ・受諾・取消を1本のルートへ閉じる。
  *
  * accept は {@link acceptPvpChallenge} の「最初の await より前に同期 claim」を壊さないため、
  * この関数でも呼び出し前に await を置かない。cancel も同じく、所有者確認から
@@ -49,6 +58,15 @@ export async function handlePvpCardButton(
   services: Services,
   deps: PvpCardRouteDeps = DEFAULT_DEPS,
 ): Promise<void> {
+  if (interaction.customId === "casino:home:pvp") {
+    await interaction.reply({ ...renderPvpOpenGameSelect(), flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (isPvpOpenSetupButton(interaction.customId)) {
+    await handlePvpOpenSetupButton(interaction, services);
+    return;
+  }
+
   const acceptId = actionId(interaction.customId, PVP_ACCEPT);
   if (acceptId !== null) {
     if (!acceptId) {
