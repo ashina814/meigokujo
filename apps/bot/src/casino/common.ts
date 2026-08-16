@@ -79,21 +79,19 @@ export function liabilityCtx(services: Services, userId: string): Omit<Liability
  * ソロゲームの席（同時プレイ防止・1人1卓）。
  *
  * 実体は {@link acquireTransientParticipation} の "solo" 種別で、ルーレット卓・
- * 対人卓と**同じ1枠**を奪い合う（正本 §15.1）。`services` を必ず要求するのは、
- * 生きている常設順位卓の確認を通さずに席を取れる型を残さないため
- * （PR23 レビュー BLOCKER D）。
+ * 対人卓・競馬と**同じ1枠**を奪い合う（正本 §15.1）。
  */
 const SOLO_PARTICIPATION_KEY = "solo";
 
-export function acquireSeat(services: Pick<Services, "persistentTables">, userId: string): boolean {
-  return acquireTransientParticipation(services, userId, "solo", SOLO_PARTICIPATION_KEY);
+export function acquireSeat(userId: string): boolean {
+  return acquireTransientParticipation(userId, "solo", SOLO_PARTICIPATION_KEY);
 }
 export function releaseSeat(userId: string): void {
   releaseTransientParticipation(userId, "solo", SOLO_PARTICIPATION_KEY);
 }
 /**
  * PR10 refund/confirmation safety gate.
- * ソロ席だけでなくルーレット・対人卓の一時参加も含む（どれもエスクローに資金がある）。
+ * ソロ席だけでなくルーレット・対人卓・競馬の一時参加も含む（どれもエスクローに資金がある）。
  */
 export function isSeatOccupied(userId: string): boolean {
   return hasTransientParticipation(userId);

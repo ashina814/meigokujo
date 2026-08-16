@@ -7,6 +7,14 @@
  * ここは `packages/core/src/db/bootstrap.ts` と各 `casino/*.ts` サービスの
  * `CREATE TABLE IF NOT EXISTS` を実地に読んで作った一覧である。
  *
+ * **2026-08-16: 対人順位卓の退役に伴い、`casino_tables` / `casino_table_participants` /
+ * `casino_table_disputes` / `casino_table_dispute_assignments` / `casino_table_evidence` /
+ * `casino_ranked_match_history` / `casino_table_message_sync_outbox` /
+ * `casino_ranked_profiles` / `casino_ranked_open_history` を一覧から削除した。**
+ * 生成元のサービスごと消えているので、これらが実在したら「知らないテーブル」＝ `unknown`
+ * ＝ blocker になる。退役した機能が事故で復活したときに既知として素通りさせないため、
+ * 意図的にこの扱いにしている。
+ *
  * kind:
  * - "core_ledger"      Land台帳の中核。PR12は一切変更しない
  * - "core_required"     現行mainの賭場機能に必須（存在しなければblocker）
@@ -387,90 +395,6 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "Daily aggregate analytics derived from raw/formal chip records. Old metrics are not carried across formal opening.",
   }),
   T({
-    table: "casino_tables",
-    purpose: "Formal-opening-era persistent PvP table state",
-    kind: "optional_feature",
-    archive: true,
-    resetOnApply: true,
-    resetPhase: "R6",
-    preserve: false,
-    blockerCondition: "none",
-    rationale:
-      "persistent-tables.ts creates this schema only when openingPhase is formal. If rows exist before formal opening, they are invalid pre-opening casino metadata and are archived/reset in R6 rather than preserved.",
-  }),
-  T({
-    table: "casino_table_participants",
-    purpose: "Formal-opening-era persistent PvP table participants",
-    kind: "optional_feature",
-    archive: true,
-    resetOnApply: true,
-    resetPhase: "R6",
-    preserve: false,
-    blockerCondition: "none",
-    rationale:
-      "persistent-tables.ts creates this schema only when openingPhase is formal. Participant rows are non-ledger table metadata and are archived/reset with casino_tables in R6.",
-  }),
-  T({
-    table: "casino_table_disputes",
-    purpose: "Persistent PvP dispute metadata and public resolution state",
-    kind: "optional_feature",
-    archive: true,
-    resetOnApply: true,
-    resetPhase: "R6",
-    preserve: false,
-    blockerCondition: "none",
-    rationale:
-      "ranked-disputes.ts lazily creates this formal-opening-era dispute workflow table. It contains non-financial table metadata and is reset in R6 before formal opening.",
-  }),
-  T({
-    table: "casino_table_dispute_assignments",
-    purpose: "Idempotent arbitrator assignment history for disputed persistent PvP tables",
-    kind: "optional_feature",
-    archive: true,
-    resetOnApply: true,
-    resetPhase: "R6",
-    preserve: false,
-    blockerCondition: "none",
-    rationale:
-      "ranked-disputes.ts stores append-only assignment operations here so old assignment replays cannot roll back the current arbitrator. Rows are non-financial metadata and are reset in R6.",
-  }),
-  T({
-    table: "casino_table_evidence",
-    purpose: "Private evidence references for disputed persistent PvP tables",
-    kind: "optional_feature",
-    archive: true,
-    resetOnApply: true,
-    resetPhase: "R6",
-    preserve: false,
-    blockerCondition: "none",
-    rationale:
-      "ranked-disputes.ts stores only private-channel evidence references and digests here. Pre-opening rows are non-financial metadata and are reset in R6.",
-  }),
-  T({
-    table: "casino_ranked_match_history",
-    purpose: "Ranked PvP match-history records separate from casino_stats",
-    kind: "optional_feature",
-    archive: true,
-    resetOnApply: true,
-    resetPhase: "R6",
-    preserve: false,
-    blockerCondition: "none",
-    rationale:
-      "ranked-disputes.ts records unanimous/arbitrated ranked match history without overloading casino_stats. Pre-opening rows are reset in R6.",
-  }),
-  T({
-    table: "casino_table_message_sync_outbox",
-    purpose: "Durable retry queue for canonical Discord ranked-table message synchronization",
-    kind: "optional_feature",
-    archive: true,
-    resetOnApply: true,
-    resetPhase: "R6",
-    preserve: false,
-    blockerCondition: "none",
-    rationale:
-      "ranked-disputes.ts records non-financial Discord message-sync work here in the same commit as dispute/public-state changes. It is formal-era transient metadata and is reset in R6.",
-  }),
-  T({
     table: "casino_daily_risk_days",
     purpose: "Per-user formal-day risk snapshots for casino loss-limit enforcement",
     kind: "optional_feature",
@@ -529,30 +453,6 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
     blockerCondition: "none",
     rationale:
       "daily-risk.ts records each exposure operation so replays are detected and a failed collection can be revoked exactly. Non-financial metadata that must not carry pre-opening bindings across formal opening.",
-  }),
-  T({
-    table: "casino_ranked_profiles",
-    purpose: "Operator-registered trusted rank-distribution profiles for generic ranked tables",
-    kind: "optional_feature",
-    archive: true,
-    resetOnApply: true,
-    resetPhase: "R6",
-    preserve: false,
-    blockerCondition: "none",
-    rationale:
-      "ranked-profiles.ts stores operator-approved zero-sum rank vectors so casino employees can open generic ranked tables without authoring a payout distribution. It holds no funds; a live table copies its profile into casino_tables at creation, so resetting pre-opening rows in R6 cannot affect any table.",
-  }),
-  T({
-    table: "casino_ranked_open_history",
-    purpose: "Append-only high-tier ranked-table open history for staged availability/cooldown",
-    kind: "optional_feature",
-    archive: true,
-    resetOnApply: true,
-    resetPhase: "R6",
-    preserve: false,
-    blockerCondition: "none",
-    rationale:
-      "ranked-tables.ts stores create-operation metadata for staged high-tier availability. Pre-opening rows are policy history only and are reset in R6.",
   }),
   T({
     table: "casino_items",

@@ -91,7 +91,7 @@ describe("solo game public entry seat ordering", () => {
       const { services, ensureFreeChips, availableForLiability, isVip } = fakeServices();
 
       releaseSeat(uid);
-      expect(acquireSeat(services, uid)).toBe(true);
+      expect(acquireSeat(uid)).toBe(true);
       try {
         await play(interaction, services, 500);
       } finally {

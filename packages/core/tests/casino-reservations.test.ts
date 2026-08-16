@@ -283,11 +283,25 @@ describe("起動時の全解放と漏れ検出", () => {
     c.db.close();
   });
 
-  it("releaseAll and stale sweep keep persistent table fee refund reservations", () => {
+  it("退役した順位卓スコープでは新規予約を取れない", () => {
+    const c = setup();
+    seed(c.db, HOUSE_HOLDER, 1_000_000);
+    // 現行APIの入力型からは外してあるので、実行時も弾けることを固定する
+    expect(() =>
+      c.reservations.reserve("fee", 20_000, "ranked_fee_refund", "table:t1", "persistent_table_fee_refund" as never),
+    ).toThrow();
+    expect(c.reservations.get("fee")).toBeUndefined();
+    c.db.close();
+  });
+
+  it("既存の順位卓スコープ行は読めて、releaseAll と stale sweep が触らない", () => {
     const c = setup();
     seed(c.db, HOUSE_HOLDER, 1_000_000);
     c.reservations.reserve("transient", 10_000, "slots", "u1");
-    c.reservations.reserve("fee", 20_000, "ranked_fee_refund", "table:t1", "persistent_table_fee_refund");
+    // 退役スコープの行は現行APIでは作れないので、legacy行として直接入れる
+    c.db
+      .prepare("INSERT INTO casino_house_reservations (key, amount, game, user_id, created_at, scope) VALUES (?,?,?,?,?,?)")
+      .run("fee", 20_000, "ranked_fee_refund", "table:t1", Math.floor(Date.now() / 1000), "persistent_table_fee_refund");
     c.db
       .prepare("UPDATE casino_house_reservations SET created_at = ?")
       .run(Math.floor(Date.now() / 1000) - RESERVATION_STALE_SEC - 3600);

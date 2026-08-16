@@ -125,7 +125,7 @@ interface KeibaBetFingerprint {
  *
  * 資金（エスクロー）へ触る**前**に
  *
- * 1. 一時参加の排他（順位卓 live / ソロ席 / 対人卓 / ルーレット卓）
+ * 1. 一時参加の排他（ソロ席 / 対人卓 / ルーレット卓）
  * 2. レース合計での所持50%
  * 3. レース合計での当日残り許容損失
  *
@@ -149,7 +149,7 @@ export function acceptKeibaBet(
   const riskScope = keibaRiskScope(session);
   const requested: KeibaBetFingerprint = { session, userId, horseId, type, amount };
   // 同じレースへの追加の賭けは同じ卓なので再取得を許す
-  if (!acquireTransientParticipation(services, userId, "keiba", riskScope, { reentrant: true })) {
+  if (!acquireTransientParticipation(userId, "keiba", riskScope, { reentrant: true })) {
     return { ok: false, reason: "risk", detail: "ほかの卓に着いている。そちらを終わらせてからだ。" };
   }
   let stored: KeibaBetFingerprint | undefined;

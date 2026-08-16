@@ -3,7 +3,6 @@ import {
   Casino,
   CasinoChipAssets,
   CasinoChipFlow,
-  CasinoMetrics,
   ChipLedger,
   ChipTx,
   DailyRisk,
@@ -13,10 +12,6 @@ import {
   HOUSE_HOLDER,
   HouseReservations,
   Ledger,
-  PersistentTables,
-  RankedDisputes,
-  RankedTableError,
-  RankedTables,
   TREASURY,
   openDb,
   registerDefaultTxTypes,
@@ -31,7 +26,6 @@ function setup(options: {
   now?: number;
   dailyLossLimitBps?: number;
   boundaryOffsetMinutes?: number;
-  unlockedTiers?: readonly string[];
 } = {}) {
   let now = options.now ?? DEFAULT_TEST_NOW;
   const db = openDb(":memory:");
@@ -52,21 +46,7 @@ function setup(options: {
   const reservations = new HouseReservations(db, chips, events);
   chips.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
   const escrow = new Escrow(db, chips, events, { onPlayerNet: (userId, net) => casino.recordGameNet(userId, net) });
-  const persistentTables = new PersistentTables(db, events, { openingPhase: () => chipTx.openingPhase(), now: () => now });
   const chipFlow = new CasinoChipFlow(db, chips, events, assets);
-  const disputes = new RankedDisputes(db, chips, escrow, persistentTables, reservations, events, {
-    now: () => now,
-    onPlayerNet: (userId, net) => casino.recordGameNet(userId, net),
-    dailyRisk,
-  });
-  const rankedTables = new RankedTables(db, chips, escrow, persistentTables, events, new CasinoMetrics(db, chipTx, () => now), {
-    now: () => now,
-    chipFlow,
-    reservations,
-    disputes,
-    dailyRisk,
-    tierUnlocked: (tierKey) => (options.unlockedTiers ?? []).includes(tierKey),
-  });
   return {
     db,
     ledger,
@@ -77,11 +57,8 @@ function setup(options: {
     dailyRisk,
     casino,
     escrow,
-    persistentTables,
     chipFlow,
     reservations,
-    disputes,
-    rankedTables,
     setNow: (value: number) => {
       now = value;
     },
@@ -97,10 +74,6 @@ function seedLand(ctx: ReturnType<typeof setup>, userId: string, amount: number,
 function seedChips(ctx: ReturnType<typeof setup>, userId: string, amount: number): void {
   seedLand(ctx, userId, amount);
   ctx.chips.deposit(userId, amount, `deposit:${userId}:${amount}`);
-}
-
-function createGf(ctx: ReturnType<typeof setup>, tableId = "t1", baseAmount = 5_000) {
-  return ctx.rankedTables.create({ tableId, gameKey: "gf", baseAmount, creatorId: "operator", operatorId: "operator", operationId: `create:${tableId}` });
 }
 
 function eventRows(ctx: ReturnType<typeof setup>) {
@@ -155,68 +128,5 @@ describe("casino daily risk limits", () => {
       ]),
     );
     expect(ctx.dailyRisk.dayFor("alice").netSigned).toBe(-2_000);
-  });
-});
-
-describe("ranked table risk gates", () => {
-  it("allows exact 50% holdings coverage and rejects one Land short without funds or participant rows", () => {
-    const ctx = setup({ dailyLossLimitBps: 10_000 });
-    createGf(ctx);
-    seedChips(ctx, "alice", 10_300);
-    expect(ctx.rankedTables.join({ tableId: "t1", userId: "alice", seat: 1, operationId: "join:alice" }).participants[0]?.riskMaxLoss).toBe(5_150);
-
-    seedChips(ctx, "bob", 10_299);
-    expect(() => ctx.rankedTables.join({ tableId: "t1", userId: "bob", seat: 2, operationId: "join:bob" })).toThrow(DailyRiskError);
-    expect(ctx.escrow.poolOf("t1")).toBe(5_150);
-    expect(ctx.persistentTables.participants("t1").map((p) => p.userId)).toEqual(["alice"]);
-  });
-
-  it("records table fees and ranked result nets on the participants original risk day", () => {
-    const ctx = setup({ dailyLossLimitBps: 10_000 });
-    createGf(ctx);
-    seedChips(ctx, "alice", 30_000);
-    seedChips(ctx, "bob", 30_000);
-    ctx.rankedTables.join({ tableId: "t1", userId: "alice", seat: 1, operationId: "join:alice" });
-    ctx.rankedTables.join({ tableId: "t1", userId: "bob", seat: 2, operationId: "join:bob" });
-    ctx.rankedTables.ready({ tableId: "t1", userId: "alice", operationId: "ready:alice" });
-    ctx.rankedTables.ready({ tableId: "t1", userId: "bob", operationId: "ready:bob" });
-    const submitted = ctx.rankedTables.submitResult({ tableId: "t1", userId: "alice", orderedUserIds: ["alice", "bob"], operationId: "result:t1" });
-    for (const userId of ["alice", "bob"]) {
-      ctx.rankedTables.approve({ tableId: "t1", userId, resultHash: submitted.result!.hash, operationId: `approve:${userId}` });
-    }
-
-    expect(eventRows(ctx)).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ event_key: "table_fee:t1:alice:ready:ready:bob", net_signed: -150 }),
-        expect.objectContaining({ event_key: "table_fee:t1:bob:ready:ready:bob", net_signed: -150 }),
-        expect.objectContaining({ event_key: `table_result:t1:alice:${submitted.result!.hash}`, net_signed: 5_000 }),
-        expect.objectContaining({ event_key: `table_result:t1:bob:${submitted.result!.hash}`, net_signed: -5_000 }),
-      ]),
-    );
-  });
-});
-
-describe("ranked tier availability", () => {
-  const create = (ctx: ReturnType<typeof setup>, tableId: string, baseAmount: number, authority: "employee" | "manager") =>
-    ctx.rankedTables.create({ tableId, gameKey: "gf", baseAmount, creatorId: "operator", operatorId: "operator", operationId: `create:${tableId}`, authority });
-
-  it("keeps create idempotent for high tiers across repeated calls", () => {
-    const ctx = setup({});
-    const first = create(ctx, "high1", 10_000, "employee");
-    expect(first.config.baseAmount).toBe(10_000);
-    ctx.setNow(1_700_000_100);
-    // 同じ operationId の再送は同じ卓を返す（クールダウン廃止後も冪等性は変わらない）
-    expect(create(ctx, "high1", 10_000, "employee").table.tableId).toBe("high1");
-    // 別の卓も続けて開ける。時間による締め出しは無い
-    expect(create(ctx, "high2", 10_000, "employee").config.baseAmount).toBe(10_000);
-  });
-
-  it("keeps extreme and meigoku closed by default for every authority", () => {
-    const ctx = setup({});
-    expect(() => create(ctx, "extreme1", 50_000, "manager")).toThrow(RankedTableError);
-    expect(() => create(ctx, "meigoku1", 100_000, "manager")).toThrow(RankedTableError);
-    // 解放しても従業員資格では開けない
-    const unlocked = setup({ unlockedTiers: ["extreme", "meigoku"] });
-    expect(() => create(unlocked, "extreme2", 50_000, "employee")).toThrow(RankedTableError);
   });
 });

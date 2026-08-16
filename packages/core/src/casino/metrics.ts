@@ -14,11 +14,6 @@ export const CASINO_METRIC_EVENT_TYPES = [
   "game_finish",
   "game_abandon",
   "replay",
-  "table_open",
-  "table_join",
-  "table_start",
-  "table_settle",
-  "table_dispute",
   "daily_only",
   "chip_deposit",
   "chip_redeem",
@@ -82,18 +77,25 @@ export interface CasinoMetricDailyRow {
   total_wager: number;
   total_payout: number;
   house_pnl: number;
-  table_fee_income: number;
   jackpot_delta: number;
   fuku_outflow: number;
-  table_open_count: number;
-  table_start_count: number;
-  table_dispute_count: number;
   replay_rate_bps: number | null;
   revisit_rate_bps: number | null;
   updated_at: number;
 }
 
+/**
+ * DB 上の保存形。
+ *
+ * `table_*` は**退役した対人順位卓（2026-08-16 廃止）の列**で、読み取り互換のためだけに
+ * ここへ残している。列を生む経路はもう無く、新規行では常に 0 が入る。
+ * 現行の集計・表示は {@link CasinoMetricDailyRow} を使い、これらを見ない。
+ */
 interface CasinoMetricDailyStorageRow extends CasinoMetricDailyRow {
+  table_fee_income: number;
+  table_open_count: number;
+  table_start_count: number;
+  table_dispute_count: number;
   revisit_cohort_json: string | null;
   revisit_finalized_at: number | null;
 }
@@ -253,12 +255,8 @@ function toPublicDaily(row: CasinoMetricDailyStorageRow): CasinoMetricDailyRow {
     total_wager: row.total_wager,
     total_payout: row.total_payout,
     house_pnl: row.house_pnl,
-    table_fee_income: row.table_fee_income,
     jackpot_delta: row.jackpot_delta,
     fuku_outflow: row.fuku_outflow,
-    table_open_count: row.table_open_count,
-    table_start_count: row.table_start_count,
-    table_dispute_count: row.table_dispute_count,
     replay_rate_bps: row.replay_rate_bps,
     revisit_rate_bps: row.revisit_rate_bps,
     updated_at: row.updated_at,
@@ -580,12 +578,8 @@ export class CasinoMetrics {
         total_wager: existing.total_wager,
         total_payout: existing.total_payout,
         house_pnl: existing.house_pnl,
-        table_fee_income: existing.table_fee_income,
         jackpot_delta: existing.jackpot_delta,
         fuku_outflow: existing.fuku_outflow,
-        table_open_count: existing.table_open_count,
-        table_start_count: existing.table_start_count,
-        table_dispute_count: existing.table_dispute_count,
         replay_rate_bps: existing.replay_rate_bps,
       };
     } else {
@@ -618,12 +612,8 @@ export class CasinoMetrics {
         total_wager: checkedAddAll(wagers, "total_wager"),
         total_payout: checkedAddAll(payouts, "total_payout"),
         house_pnl: this.housePnl(start, end),
-        table_fee_income: this.tableFeeIncome(start, end),
         jackpot_delta: this.jackpotDelta(start, end),
         fuku_outflow: this.fukuOutflow(start, end),
-        table_open_count: this.countEvents("table_open", start, end),
-        table_start_count: this.countEvents("table_start", start, end),
-        table_dispute_count: this.countEvents("table_dispute", start, end),
         replay_rate_bps: bps(replays, starts),
       };
     }
@@ -653,6 +643,11 @@ export class CasinoMetrics {
     const row: CasinoMetricDailyStorageRow = {
       date,
       ...base,
+      // 退役した対人順位卓の列。NOT NULL なので 0 を書くだけで、集計は一切しない
+      table_fee_income: 0,
+      table_open_count: 0,
+      table_start_count: 0,
+      table_dispute_count: 0,
       revisit_rate_bps: revisitRate,
       revisit_cohort_json: cohortJson,
       revisit_finalized_at: finalizedAt,
@@ -902,22 +897,6 @@ export class CasinoMetrics {
     return total;
   }
 
-  private tableFeeIncome(start: number, end: number): number {
-    const rows = this.db.prepare(`
-      SELECT amount
-      FROM casino_metric_events
-      WHERE event_type='table_start' AND occurred_at >= ? AND occurred_at < ?
-      ORDER BY id
-    `).all(start, end) as Array<{ amount: number | null }>;
-    let total = 0;
-    for (const row of rows) {
-      if (row.amount == null) throw new CasinoMetricsError("ERR_METRIC_BAD_RESULT", { field: "table_start.amount" });
-      assertNonNegative(row.amount, "table_start.amount");
-      total = checkedAdd(total, row.amount, "table_fee_income");
-    }
-    return total;
-  }
-
   private jackpotDelta(start: number, end: number): number {
     const rows = this.db.prepare(`
       SELECT from_holder, to_holder, amount
@@ -996,12 +975,8 @@ export class CasinoMetrics {
     assertNonNegative(row.total_wager, "daily.total_wager");
     assertNonNegative(row.total_payout, "daily.total_payout");
     assertSafeInteger(row.house_pnl, "daily.house_pnl");
-    assertNonNegative(row.table_fee_income, "daily.table_fee_income");
     assertSafeInteger(row.jackpot_delta, "daily.jackpot_delta");
     assertNonNegative(row.fuku_outflow, "daily.fuku_outflow");
-    assertNonNegative(row.table_open_count, "daily.table_open_count");
-    assertNonNegative(row.table_start_count, "daily.table_start_count");
-    assertNonNegative(row.table_dispute_count, "daily.table_dispute_count");
     if (row.replay_rate_bps != null) assertNonNegative(row.replay_rate_bps, "daily.replay_rate_bps");
     if (row.revisit_rate_bps != null) assertNonNegative(row.revisit_rate_bps, "daily.revisit_rate_bps");
     if (row.revisit_finalized_at != null) assertNonNegative(row.revisit_finalized_at, "daily.revisit_finalized_at");

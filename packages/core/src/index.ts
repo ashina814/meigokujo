@@ -329,7 +329,6 @@ export {
   type DailyRiskOptions,
   type DailyRiskSourceKind,
   type DailyRiskSoloStart,
-  type DailyRiskTableExposure,
 } from "./casino/daily-risk.js";
 export {
   CasinoMetrics,
@@ -378,82 +377,6 @@ export {
   type MarketsOptions,
   MARKET_LIVE_STATUSES,
 } from "./casino/market.js";
-export {
-  PersistentTables,
-  PersistentTableError,
-  PERSISTENT_TABLE_STATES,
-  PERSISTENT_TABLE_LIVE_STATES,
-  PERSISTENT_TABLE_TERMINAL_STATES,
-  ALLOWED_TABLE_TRANSITIONS,
-  type PersistentTableErrorCode,
-  type PersistentTableState,
-  type PersistentTableRow,
-  type PersistentTableParticipantRow,
-  type CreatePersistentTableInput,
-  type JoinPersistentTableInput,
-  type TransitionPersistentTableInput,
-  type PersistentTablesOptions,
-} from "./casino/persistent-tables.js";
-export {
-  RankedTables,
-  RankedTableError,
-  RANKED_PROFILES,
-  RANKED_TABLE_TIERS,
-  EMPLOYEE_OPERABLE_TIER_KEYS,
-  feeForBaseAmount,
-  rankedReceipts,
-  validateRankProfile,
-  rankedTableInternalsForTesting,
-  type GenericRankProfile,
-  type RankedTableConfig,
-  type RankedTableSnapshot,
-  type RankedResultSnapshot,
-  type RankedTableTier,
-  type RankedTableErrorCode,
-  type RankedTablesOptions,
-  type CreateRankedTableInput,
-  type JoinRankedTableInput,
-  type ReadyRankedTableInput,
-  type SubmitRankedResultInput,
-  type ApproveRankedResultInput,
-  type RankedCreateAuthority,
-  type RankedTierAvailability,
-} from "./casino/ranked-tables.js";
-export {
-  RankedProfiles,
-  RankedProfileError,
-  isGenericRankedGame,
-  type RankedProfileRow,
-  type RankedProfileErrorCode,
-  type RankedProfilesOptions,
-  type RegisterRankedProfileInput,
-} from "./casino/ranked-profiles.js";
-export {
-  rankedFeeReservationKey,
-  RANKED_FEE_RESERVATION_SCOPE,
-} from "./casino/ranked-fee-reservation.js";
-export {
-  RankedDisputes,
-  RankedDisputeError,
-  RANKED_EVIDENCE_WINDOW_SEC,
-  RANKED_MAIN_EVIDENCE_KINDS,
-  RANKED_SUPPORTING_EVIDENCE_KINDS,
-  type RankedDisputeErrorCode,
-  type RankedDisputePublicStatus,
-  type RankedEvidenceKind,
-  type RankedEvidenceClass,
-  type RankedEvidenceStorageStatus,
-  type RankedResolutionKind,
-  type RankedFeeOutcome,
-  type RankedDisputesOptions,
-  type SubmitRankedEvidenceInput,
-  type BeginRankedEvidenceSubmissionInput,
-  type FinalizeRankedEvidenceStoredInput,
-  type AssignRankedArbitratorInput,
-  type ResolveRankedResultInput,
-  type ResolveCollateralRefundInput,
-  type MarkRankedDisputedFromRecoveryInput,
-} from "./casino/ranked-disputes.js";
 export {
   CasinoStatus,
   CASINO_STATUSES,
@@ -696,12 +619,8 @@ export {
 export {
   RecoveryRegistry,
   recoverCasino,
-  recoverCasinoAsync,
   type RecoverySource,
   type RecoverCasinoDeps,
-  type RecoverCasinoAsyncDeps,
   type RecoverCasinoResult,
-  type PersistentTableRestoreResult,
-  type PersistentTableRestoreProvider,
 } from "./casino/recovery.js";
 export * from "./sub-account/service.js";

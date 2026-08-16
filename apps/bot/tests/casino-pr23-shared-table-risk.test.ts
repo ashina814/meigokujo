@@ -40,7 +40,6 @@ registerDefaultTxTypes();
  */
 
 /** 生きている常設順位卓の有無を差し替えられる最小スタブ */
-let liveRankedTableUsers = new Set<string>();
 
 /**
  * 当日枠の基準時刻。種まきの取引より**後**の日を「今日」にしておく。
@@ -85,7 +84,6 @@ function setup(rng: CasinoRng = scriptedRng([0.5]), options: { dailyLossLimitBps
     dailyRisk,
     freeSpins,
     rng,
-    persistentTables: { participantHasLiveTable: (userId: string) => liveRankedTableUsers.has(userId) },
   } as unknown as Services;
   // 翌日から同じ卓を触りにいくための窓（日界跨ぎの確認用）
   const tomorrowRisk = new DailyRisk(db, ledger, chipAssets, {
@@ -149,7 +147,6 @@ function exhaustDailyBudget(ctx: Ctx, userId: string): void {
 }
 
 beforeEach(() => {
-  liveRankedTableUsers = new Set<string>();
   resetTransientParticipationForTesting();
 });
 
@@ -416,27 +413,13 @@ describe("/勝負 legacy PvP goes through the PR23 risk gates", () => {
 });
 
 describe("simultaneous gambling is mutually exclusive in both directions", () => {
-  it("blocks solo, roulette and legacy PvP while a persistent ranked table is live", () => {
-    const ctx = setup(scriptedRng([0.5]), { dailyLossLimitBps: 10_000 });
-    fundHouse(ctx, 1_000_000);
-    seedChips(ctx, "alice", 40_000);
-    liveRankedTableUsers.add("alice");
-
-    expect(acquireSeat(ctx.services, "alice")).toBe(false);
-    const roulette = acceptRouletteBet(ctx.services, "roulette:s1", new Map(), "alice", "red", 1_000, "op1");
-    expect(roulette.ok).toBe(false);
-    expect(collectStakes(ctx.services, ["alice"], 1_000, "op:a", "sashi:1", "sashi").ok).toBe(false);
-    expect(ctx.escrow.poolOf("sashi:1")).toBe(0);
-    expect(ctx.escrow.poolOf("roulette:s1")).toBe(0);
-  });
-
   it("blocks roulette and legacy PvP while a solo seat is held, and releases on seat release", () => {
     const ctx = setup(scriptedRng([0.5]), { dailyLossLimitBps: 10_000 });
     fundHouse(ctx, 1_000_000);
     seedChips(ctx, "alice", 40_000);
 
-    expect(acquireSeat(ctx.services, "alice")).toBe(true);
-    expect(acquireSeat(ctx.services, "alice")).toBe(false);
+    expect(acquireSeat("alice")).toBe(true);
+    expect(acquireSeat("alice")).toBe(false);
     expect(acceptRouletteBet(ctx.services, "roulette:s1", new Map(), "alice", "red", 1_000, "op1").ok).toBe(false);
     expect(collectStakes(ctx.services, ["alice"], 1_000, "op:a", "sashi:1", "sashi").ok).toBe(false);
 
@@ -451,14 +434,14 @@ describe("simultaneous gambling is mutually exclusive in both directions", () =>
     const bets = new Map();
     expect(acceptRouletteBet(ctx.services, "roulette:s1", bets, "alice", "red", 1_000, "op1").ok).toBe(true);
 
-    expect(acquireSeat(ctx.services, "alice")).toBe(false);
+    expect(acquireSeat("alice")).toBe(false);
     expect(collectStakes(ctx.services, ["alice"], 1_000, "op:a", "sashi:1", "sashi").ok).toBe(false);
     // 順位卓側は `isSoloSeatOccupied` フックでこれを読む
     expect(hasTransientParticipation("alice")).toBe(true);
 
     voidRouletteTable(ctx.services, "roulette:s1", [...bets.keys()]);
     expect(hasTransientParticipation("alice")).toBe(false);
-    expect(acquireSeat(ctx.services, "alice")).toBe(true);
+    expect(acquireSeat("alice")).toBe(true);
   });
 
   it("blocks a solo seat and a ranked join while a legacy PvP stake is live", () => {
@@ -468,37 +451,12 @@ describe("simultaneous gambling is mutually exclusive in both directions", () =>
     expect(collectStakes(ctx.services, ["alice"], 5_000, "op:a", "sashi:1", "sashi").ok).toBe(true);
 
     expect(hasTransientParticipation("alice")).toBe(true);
-    expect(acquireSeat(ctx.services, "alice")).toBe(false);
+    expect(acquireSeat("alice")).toBe(false);
     expect(acceptRouletteBet(ctx.services, "roulette:s1", new Map(), "alice", "red", 1_000, "op1").ok).toBe(false);
 
     refundAll(ctx.services, ["alice"], 5_000, "sashi:1:refund", "sashi:1");
     expect(hasTransientParticipation("alice")).toBe(false);
-    expect(acquireSeat(ctx.services, "alice")).toBe(true);
-  });
-
-  it("lets a user gamble again once the ranked table is no longer live", () => {
-    const ctx = setup(scriptedRng([0.5]), { dailyLossLimitBps: 10_000 });
-    fundHouse(ctx, 1_000_000);
-    seedChips(ctx, "alice", 40_000);
-    liveRankedTableUsers.add("alice");
-    expect(acquireSeat(ctx.services, "alice")).toBe(false);
-
-    liveRankedTableUsers.delete("alice");
-    expect(acquireSeat(ctx.services, "alice")).toBe(true);
-  });
-
-  it("fails closed when the persistent ranked lookup itself is broken", () => {
-    const ctx = setup();
-    const broken = {
-      ...ctx.services,
-      persistentTables: {
-        participantHasLiveTable: () => {
-          throw new Error("db unavailable");
-        },
-      },
-    } as unknown as Services;
-    expect(acquireSeat(broken, "alice")).toBe(false);
-    expect(acceptRouletteBet(broken, "roulette:s1", new Map(), "alice", "red", 1_000, "op1").ok).toBe(false);
+    expect(acquireSeat("alice")).toBe(true);
   });
 });
 

@@ -117,41 +117,6 @@ describe("Scheduler実行済みマーカー", () => {
   });
 });
 
-describe("ranked table timeout scheduler", () => {
-  it("runs due processing only while formally open", async () => {
-    const { processRankedTableTimeoutsForScheduler } = await schedulerModule;
-    const open = makeRankedTimeoutServices();
-    processRankedTableTimeoutsForScheduler(open as any, 1_700_000_000);
-    expect(open.rankedTables.processDueTables).toHaveBeenCalledWith(1_700_000_000);
-    expect(open.rankedDisputes.processEvidenceDeadlines).toHaveBeenCalledWith(1_700_000_000);
-    expect(open.events.log).toHaveBeenCalledWith("casino_ranked_timeout_scan", expect.objectContaining({ payload: { processed: 1, refunded: 0, disputed: 0 } }));
-    expect(open.events.log).toHaveBeenCalledWith("casino_ranked_dispute_deadline_scan", expect.objectContaining({ payload: { closed: 1, autoRefunded: 0, failed: 0 } }));
-
-    const preReset = makeRankedTimeoutServices({ phase: "pre_reset" });
-    processRankedTableTimeoutsForScheduler(preReset as any, 1_700_000_000);
-    expect(preReset.rankedTables.processDueTables).not.toHaveBeenCalled();
-    expect(preReset.rankedDisputes.processEvidenceDeadlines).not.toHaveBeenCalled();
-
-    const halted = makeRankedTimeoutServices({ status: "recovery_halt" });
-    processRankedTableTimeoutsForScheduler(halted as any, 1_700_000_000);
-    expect(halted.rankedTables.processDueTables).not.toHaveBeenCalled();
-    expect(halted.rankedDisputes.processEvidenceDeadlines).not.toHaveBeenCalled();
-  });
-
-  it("logs scan failures without throwing", async () => {
-    const { processRankedTableTimeoutsForScheduler } = await schedulerModule;
-
-    const corruptState = makeRankedTimeoutServices({ stateThrows: new Error("phase corrupt") });
-    expect(() => processRankedTableTimeoutsForScheduler(corruptState as any, 1_700_000_000)).not.toThrow();
-    expect(corruptState.rankedTables.processDueTables).not.toHaveBeenCalled();
-    expect(corruptState.events.log).toHaveBeenCalledWith("casino_ranked_timeout_scan_failed", expect.objectContaining({ payload: { error: "phase corrupt" } }));
-
-    const processFailure = makeRankedTimeoutServices({ processThrows: new Error("one table failed") });
-    expect(() => processRankedTableTimeoutsForScheduler(processFailure as any, 1_700_000_000)).not.toThrow();
-    expect(processFailure.events.log).toHaveBeenCalledWith("casino_ranked_timeout_scan_failed", expect.objectContaining({ payload: { error: "one table failed" } }));
-  });
-});
-
 describe("sendChunkedLines", () => {
   it("指定されたロールだけをallowedMentionsに通し、ユーザーメンションは通知許可しない", async () => {
     const send = vi.fn(async () => undefined);
