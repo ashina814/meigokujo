@@ -65,7 +65,6 @@ const PANEL_MESSAGES: Record<PanelKind, (services: Services, channelId: string) 
   dept: (s, channelId) => deptPanelMessage(s, s.settings.getString(`dept_panel_channel:${channelId}`) ?? ""),
 };
 
-
 export const panelCommand = new SlashCommandBuilder()
   .setName("パネル設置")
   .setDescription("常設パネルをこのチャンネルに設置する（運営専用）")
@@ -114,12 +113,17 @@ export async function handlePanelCommand(
   if (!channel?.isTextBased()) return;
 
   const kind = interaction.options.getString("種別", true);
+  const meta = panelKindMeta(kind);
+  if (!meta?.installable) {
+    await interaction.reply({ content: "このパネル種別は新規設置できません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
 
-  // 部署パネルは対象部署の指定必須。チャンネルと部署の対応表を持たせる
-  if (kind === "dept") {
+  // 部署指定の要否は panel-kinds.ts を正本にする。チャンネルと部署の対応表を持たせる。
+  if (meta.needsDepartment) {
     const deptKey = interaction.options.getString("部署");
     if (!deptKey) {
-      await interaction.reply({ content: "部署運用パネルには「部署」の指定が必要です。", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: `${meta.label}パネルには「部署」の指定が必要です。`, flags: MessageFlags.Ephemeral });
       return;
     }
     if (!services.departments.get(deptKey)) {
@@ -167,10 +171,10 @@ export async function handlePanelRemove(
   const msg = await channel.messages.fetch(panelMsgId).catch(() => null);
   if (msg) await msg.delete().catch(() => undefined);
 
-  // 設定を消去。部署パネルはチャンネル→部署の紐付けも掃除
+  // 設定を消去。部署指定が必要なパネルはチャンネル→部署の紐付けも掃除する。
   const actor = `user:${interaction.user.id}`;
   services.settings.delete(settingKey, actor);
-  if (kind === "dept") services.settings.delete(`dept_panel_channel:${channel.id}`, actor);
+  if (panelKindMeta(kind)?.needsDepartment) services.settings.delete(`dept_panel_channel:${channel.id}`, actor);
 
   await interaction.reply({
     content: `✅ ${panelLabel(kind)}パネルを撤去しました${msg ? "" : "（メッセージは既に削除されていました）"}。`,
@@ -178,8 +182,16 @@ export async function handlePanelRemove(
   });
 }
 
-/** /管理 パネル サブパネルから使うヘルパ */
+/**
+ * `/管理 → パネル` の新規設置から使うヘルパ。
+ * stale なセレクトや別経路から直接呼ばれても、正本で新規設置不可なら fail-closed で拒否する。
+ */
 export function panelMessageForExternal(kind: string, services: Services, channelId: string) {
+  const meta = panelKindMeta(kind);
+  if (!meta?.installable) throw new Error(`panel kind is not installable: ${kind}`);
+  if (meta.needsDepartment && !services.settings.getString(`dept_panel_channel:${channelId}`)) {
+    throw new Error(`panel kind requires department selection: ${kind}`);
+  }
   return panelMessageFor(kind, services, channelId);
 }
 export function savePanelSettingExternal(services: Services, kind: string, channelId: string, msgId: string, actor: string): void {
@@ -189,7 +201,7 @@ export function savePanelSettingExternal(services: Services, kind: string, chann
 }
 
 /**
- * 種別からパネル本文を組み立てる。分岐は持たず {@link PANEL_KIND_DEFS} を引く。
+ * 種別からパネル本文を組み立てる。分岐は持たず {@link PANEL_MESSAGES} を引く。
  * 未知の種別は銀行パネルへ落とさず**呼び出し側へ知らせる**（黙って別のパネルを貼らない）。
  */
 function panelMessageFor(kind: string, services: Services, channelId: string) {
