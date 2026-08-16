@@ -252,15 +252,19 @@ function pvpAvailability(userId: string, services: Services): PvpAvailability {
 
   let balance: number;
   let riskMax: number;
+  let coverageMax: number;
   try {
     // 公開1v1の collectStakes は escrow.holdAll へ直行するので、ここでは「賭場に置いている分」を見る。
     // 手元のLandを含む available を使うと、表示上は押せるのに成立時は必ず残高不足になりうる。
     balance = services.chips.balanceOf(userId);
     riskMax = services.dailyRisk.maxBetForPlayerLoss(userId, (bet) => bet, MAX_BET);
+    // authorizeExposure と同じ「最大損失 <= 所持の50%」。これを表示上限へ入れないと、
+    // 押せる金額で募集を立てたのに、誰が受けても挑戦者側の事前確認で弾かれる死んだカードになる。
+    coverageMax = Math.floor(services.dailyRisk.holdings(userId) / 2);
   } catch {
     return { ok: false, balance: null, maxBet: null, reason: "残高または利用上限を確認できません" };
   }
-  const maxBet = Math.min(MAX_BET, balance, riskMax);
+  const maxBet = Math.min(MAX_BET, balance, riskMax, coverageMax);
   if (!Number.isSafeInteger(maxBet) || maxBet < MIN_BET) {
     return { ok: false, balance, maxBet: Math.max(0, Number.isFinite(maxBet) ? Math.floor(maxBet) : 0), reason: "いま出せる賭け金がありません" };
   }
