@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  Casino,
   CasinoChipAssets,
   CasinoChipFlow,
   CHIP_ESCROW,
@@ -136,5 +137,26 @@ describe("spendable wallet real DB integration", () => {
     expect(ctx.chips.balanceOf("alice")).toBe(100);
 
     ctx.db.close();
+  });
+
+  it("福の重みはLandと自由チップの置き場所ではなく総所持額で同じ税率になる", () => {
+    const landCtx = setup({ alice: 60_000 });
+    landCtx.chips.fundFromAccount(TREASURY, 100_000, HOUSE_HOLDER, "fuku-land-house");
+    const landCasino = new Casino(landCtx.db, landCtx.wallet, landCtx.events, { fukuScale: () => 1 });
+    const landResult = landCasino.settleSolo("alice", "test", 1_000, 2_000, { operationId: "fuku-land" });
+
+    const chipCtx = setup({ alice: 60_000 });
+    chipCtx.chips.fundFromAccount(TREASURY, 100_000, HOUSE_HOLDER, "fuku-chip-house");
+    chipCtx.chips.deposit("alice", 60_000, "fuku-chip-seed");
+    const chipCasino = new Casino(chipCtx.db, chipCtx.wallet, chipCtx.events, { fukuScale: () => 1 });
+    const chipResult = chipCasino.settleSolo("alice", "test", 1_000, 2_000, { operationId: "fuku-chip" });
+
+    expect(landResult.fukuRate).toBe(0.1);
+    expect(chipResult.fukuRate).toBe(0.1);
+    expect(landResult.fukuTax).toBe(100);
+    expect(chipResult.fukuTax).toBe(100);
+
+    landCtx.db.close();
+    chipCtx.db.close();
   });
 });
