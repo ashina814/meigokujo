@@ -15,7 +15,6 @@ import { asobuCommand } from "./commands/asobu.js";
 import { dailyCommand } from "./commands/daily.js";
 import { passportCommand } from "./commands/passport.js";
 import { banzukeCommand } from "./commands/banzuke.js";
-import { shobuCommand } from "./commands/shobu.js";
 import { bakutenCommand } from "./commands/bakuten.js";
 import { keibaCommand } from "./commands/keiba.js";
 import { annaiCommand } from "./commands/annai.js";
@@ -48,7 +47,6 @@ const commands = [
   dailyCommand.toJSON(),
   passportCommand.toJSON(),
   banzukeCommand.toJSON(),
-  shobuCommand.toJSON(),
   bakutenCommand.toJSON(),
   keibaCommand.toJSON(),
   annaiCommand.toJSON(),
