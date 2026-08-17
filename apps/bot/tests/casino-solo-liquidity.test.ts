@@ -100,7 +100,7 @@ describe("solo max-loss liquidity bridge", () => {
     expect(chipFlow.ensureFreeChips).not.toHaveBeenCalled();
   });
 
-  it("一度consumeした目標は同じoperationの後続ensureへ漏れない", () => {
+  it("一度consumeした目標は別operationの後続ensureへ漏れない", () => {
     const dailyRisk = { authorizeSoloStart: vi.fn(() => undefined) } as never;
     const chipFlow = {
       ensureFreeChips: vi.fn((_userId: string, required: number) => ({
@@ -120,9 +120,9 @@ describe("solo max-loss liquidity bridge", () => {
       maxPlayerLoss: 5_000,
     });
     views.chipFlow.ensureFreeChips("alice", 1_000, "once");
-    views.chipFlow.ensureFreeChips("alice", 500, "once");
+    views.chipFlow.ensureFreeChips("alice", 500, "later");
 
     expect(chipFlow.ensureFreeChips).toHaveBeenNthCalledWith(1, "alice", 5_000, "once");
-    expect(chipFlow.ensureFreeChips).toHaveBeenNthCalledWith(2, "alice", 500, "once");
+    expect(chipFlow.ensureFreeChips).toHaveBeenNthCalledWith(2, "alice", 500, "later");
   });
 });
