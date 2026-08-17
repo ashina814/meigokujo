@@ -5,6 +5,7 @@ import {
   Escrow,
   isPlayerHolder,
   type CasinoChipFlow,
+  type DailyRisk,
   type Ledger,
 } from "@meigokujo/core";
 
@@ -84,6 +85,97 @@ export function createSpendableChipLedger(
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+}
+
+/**
+ * ソロゲームは開始時の `bet` と、途中操作で増える「最大損失」が違うものがある。
+ *
+ * - ブラックジャック: ダブルで最大 2 × bet
+ * - ホールデム: 4回すべてコールすると最大 5 × ante
+ * - チンチロ: 既存仕様どおり最大損失 2 × bet
+ *
+ * 利用可能額の判定だけ通常Landまで広げ、途中操作の確定時までLandを手元に残すと、
+ * 別コマンドでLandを動かして最終精算を残高不足にできる。そこで `authorizeSoloStart()` が
+ * 既に計算した maxPlayerLoss を、**既存の validateBet が capacity 判定を通過したあとに呼ぶ
+ * ensureFreeChips() の瞬間だけ**引き上げる。これで optional wager の裏付けも開始時に自由チップへ
+ * 退避され、進行中に通常Landを動かして損失だけ回避する新しい窓を作らない。
+ *
+ * capacity rejection では ensureFreeChips() が呼ばれないためLandは動かない。未消費の候補は
+ * interaction ID に紐づく短命メモだけで、上限付きで掃除する。
+ */
+const SOLO_LIQUIDITY_TTL_MS = 5 * 60_000;
+const SOLO_LIQUIDITY_MAX_PENDING = 2_048;
+
+type PendingSoloLiquidity = { required: number; expiresAt: number };
+
+function soloLiquidityKey(userId: string, operationId: string): string {
+  return `${userId}\u0000${operationId}`;
+}
+
+export function createSoloLiquidityViews(
+  dailyRisk: DailyRisk,
+  chipFlow: CasinoChipFlow,
+): { dailyRisk: DailyRisk; chipFlow: CasinoChipFlow } {
+  const pending = new Map<string, PendingSoloLiquidity>();
+
+  const prune = (at = Date.now()): void => {
+    for (const [key, row] of pending) {
+      if (row.expiresAt <= at) pending.delete(key);
+    }
+    while (pending.size > SOLO_LIQUIDITY_MAX_PENDING) {
+      const oldest = pending.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      pending.delete(oldest);
+    }
+  };
+
+  const authorizeSoloStart = (
+    ...args: Parameters<DailyRisk["authorizeSoloStart"]>
+  ): ReturnType<DailyRisk["authorizeSoloStart"]> => {
+    const [input] = args;
+    const result = dailyRisk.authorizeSoloStart(...args);
+    prune();
+    if (Number.isSafeInteger(input.maxPlayerLoss) && input.maxPlayerLoss > 0) {
+      pending.set(soloLiquidityKey(input.userId, input.operationId), {
+        required: input.maxPlayerLoss,
+        expiresAt: Date.now() + SOLO_LIQUIDITY_TTL_MS,
+      });
+      prune();
+    }
+    return result;
+  };
+
+  const ensureFreeChips = (
+    ...args: Parameters<CasinoChipFlow["ensureFreeChips"]>
+  ): ReturnType<CasinoChipFlow["ensureFreeChips"]> => {
+    const [userId, required, operationId] = args;
+    prune();
+    const key = soloLiquidityKey(userId, operationId);
+    const target = pending.get(key);
+    const wanted = target ? Math.max(required, target.required) : required;
+    try {
+      return chipFlow.ensureFreeChips(userId, wanted, operationId);
+    } finally {
+      if (target) pending.delete(key);
+    }
+  };
+
+  const dailyRiskView = new Proxy(dailyRisk, {
+    get(target, prop) {
+      if (prop === "authorizeSoloStart") return authorizeSoloStart;
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const chipFlowView = new Proxy(chipFlow, {
+    get(target, prop) {
+      if (prop === "ensureFreeChips") return ensureFreeChips;
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+
+  return { dailyRisk: dailyRiskView, chipFlow: chipFlowView };
 }
 
 class WalletShortfall extends Error {
