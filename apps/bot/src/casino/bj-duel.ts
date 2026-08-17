@@ -17,6 +17,9 @@ import { C_MAMMON } from "./ui.js";
 import {
   buildPvpAbort,
   buildPvpInvite,
+  pvpViewFromInteraction,
+  runFundedSession,
+  type FundedPvpContext,
   buildPvpResult,
   collectStakes,
   offerRematch,
@@ -139,6 +142,33 @@ export async function playBjDuel(
     return;
   }
 
+  await runFundedBjDuel(services, {
+    challenger,
+    opponent,
+    bet,
+    session,
+    view: pvpViewFromInteraction(interaction, reply),
+    rematchInteraction: interaction,
+  });
+}
+
+/**
+ * BJデュエルの本体。
+ *
+ * ⚠️ **`collectStakes()` が両者について成功済みであることを前提とする。**
+ * 新規の入口から直接呼ばず、指名招待（{@link playBjDuel}）または公開募集の
+ * 成立処理を経由すること。
+ *
+ * 対戦中ずっと盤面を編集し、そこへ collector を張る。盤面メッセージは
+ * **開始時に一度だけ取得して使い回す**（ターンごとに取り直すと、collector が
+ * 監視する対象と編集対象がズレうる）。
+ */
+export async function runFundedBjDuel(services: Services, ctx: FundedPvpContext): Promise<void> {
+  const { challenger, opponent, bet, session, view, rematchInteraction } = ctx;
+
+  await runFundedSession(services, session, async (markResolved) => {
+  // fund 済みなので、盤面の取得で落ちてもこの保護区間の内側であること
+  const tableMessage = await view.message();
   const deck = newDeck(services.rng);
   const cHand: Card[] = [deck.pop()!, deck.pop()!];
   const oHand: Card[] = [deck.pop()!, deck.pop()!];
@@ -169,7 +199,8 @@ export async function playBjDuel(
   const finishGame = async (result: "challenger_win" | "opponent_win" | "push", note: string) => {
     if (result === "push") {
       refundAll(services, [challenger.id, opponent.id], bet, `${session}:refund:push`, session);
-      await interaction.editReply({
+      markResolved();
+      await view.edit({
         content: "",
         embeds: [
           new EmbedBuilder()
@@ -195,7 +226,8 @@ export async function playBjDuel(
       const winnerId = result === "challenger_win" ? challenger.id : opponent.id;
       const loserId = result === "challenger_win" ? opponent.id : challenger.id;
       const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2, `${session}:settle`, session);
-      await interaction.editReply({
+      markResolved();
+      await view.edit({
         content: "",
         embeds: [
           buildPvpResult({
@@ -220,13 +252,6 @@ export async function playBjDuel(
         allowedMentions: { users: [winnerId] },
       });
     }
-    await offerRematch(interaction, {
-      aId: challenger.id,
-      bId: opponent.id,
-      bet,
-      game: "BJデュエル",
-      replay: (btn) => playBjDuel(btn, services, btn.user.id === challenger.id ? opponent : challenger, bet),
-    });
   };
 
   // ── ターン制ループ ──
@@ -239,7 +264,7 @@ export async function playBjDuel(
       currentTurn = currentTurn === "c" ? "o" : "c";
       continue;
     }
-    await interaction.editReply({
+    await view.edit({
       content: "",
       embeds: [table(`<@${currentId}>`)],
       components: [btnRow],
@@ -247,7 +272,7 @@ export async function playBjDuel(
     });
     let action: "hit" | "stand";
     try {
-      const btn = await reply.awaitMessageComponent({
+      const btn = await tableMessage.awaitMessageComponent({
         componentType: ComponentType.Button,
         filter: (i) => i.user.id === currentId && (i.customId === "bjd:hit" || i.customId === "bjd:stand"),
         time: 45_000,
@@ -281,7 +306,17 @@ export async function playBjDuel(
   const cv = handValue(cHand);
   const ov = handValue(oHand);
   await sleep(600);
-  if (cv > ov) return void (await finishGame("challenger_win", `**${cv} 対 ${ov}**`));
-  if (cv < ov) return void (await finishGame("opponent_win", `**${cv} 対 ${ov}**`));
-  return void (await finishGame("push", `**${cv} 対 ${ov}** — 引き分け`));
+  if (cv > ov) await finishGame("challenger_win", `**${cv} 対 ${ov}**`);
+  else if (cv < ov) await finishGame("opponent_win", `**${cv} 対 ${ov}**`);
+  else await finishGame("push", `**${cv} 対 ${ov}** — 引き分け`);
+  });
+
+  if (!rematchInteraction) return;
+  await offerRematch(rematchInteraction, {
+    aId: challenger.id,
+    bId: opponent.id,
+    bet,
+    game: "BJデュエル",
+    replay: (btn) => playBjDuel(btn, services, btn.user.id === challenger.id ? opponent : challenger, bet),
+  });
 }

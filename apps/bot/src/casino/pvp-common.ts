@@ -8,7 +8,9 @@ import {
   MessageFlags,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
+  type BaseMessageOptions,
   type Message,
+  type User,
 } from "discord.js";
 import { DailyRiskError, JACKPOT_HOLDER } from "@meigokujo/core";
 import type { Services } from "../services.js";
@@ -18,6 +20,100 @@ import { C_LOSE, C_MAMMON, C_WIN } from "./ui.js";
 
 /** 1v1 PvP ゲームが受け取る interaction（/勝負 直叩き or 再戦ボタン経由） */
 export type PvpInteraction = ChatInputCommandInteraction | ButtonInteraction;
+
+/**
+ * 対戦の**表示先**。本体に「どのメッセージを書き換えるか」を持たせないための窓。
+ *
+ * 指名招待なら招待メッセージ（`interaction.editReply` / `followUp`）、
+ * 公開募集なら募集カード（`message.edit` / `channel.send`）が入る。
+ */
+export interface PvpView {
+  edit: (payload: BaseMessageOptions) => Promise<unknown>;
+  followUp: (payload: BaseMessageOptions) => Promise<unknown>;
+  /**
+   * 進行用ボタンを張る対象メッセージ（BJ・インディアンのような対話型だけが使う）。
+   *
+   * **不変条件: `edit()` と `message()` は必ず同じ Discord メッセージを指す。**
+   * ズレると「画面Aを編集しているのに collector は画面Bに張る」状態になる。
+   *
+   * これは**規約であって型強制ではない**（structural interface なので手でも作れる）。
+   * 新しい入口を足すときは必ず下の factory を使うこと。
+   */
+  message: () => Promise<Message>;
+}
+
+/**
+ * **両者の徴収が済んだ**対戦の実行文脈。資金ライフサイクルは入口ごとに違う。**本体は「両者 fund 済み」の後だけ動く。**
+ *
+ * ```text
+ * /勝負（指名）        公開募集
+ * ─────────────       ─────────────
+ * 入力検証             募集カード（資金を1 Ld も動かさない）
+ * 挑戦者を拘束    ←空手形の挑戦を出させない既存挙動。維持する
+ * 相手へ招待           最初の受諾者を同期 claim ＋ timeout 解除
+ * 相手を拘束           collectStakes([challenger, accepter]) ← 1回で両者
+ * ─────────────       ─────────────
+ *          → runFundedX()（共通）
+ * ```
+ *
+ * 公開募集で両者を1回にまとめるのは、`collectStakes()` が元々
+ * 参加者全員の排他・日次リスク・残高を見てから `holdAll()` で一括確保し、
+ * 誰か一人でも駄目なら資金を動かさず戻す設計だから。分けて呼ぶと
+ * 「挑戦者だけ一瞬徴収 → 受諾者失敗 → 返金」という中間状態を自分で作ることになる。
+ *
+ * ⚠️ **`collectStakes()` が challenger・opponent の両方について成功済みであることを前提とする。**
+ * この型を取る `runFunded*` 系を新しい入口から直接呼ばないこと。必ず指名招待の受諾処理か、
+ * 公開募集の成立処理を経由する——さもないと、資金を確保しないまま勝敗と配当だけが確定する。
+ */
+export interface FundedPvpContext {
+  challenger: User;
+  opponent: User;
+  bet: number;
+  /** 徴収・返金・精算で使う一意なセッション識別子 */
+  session: string;
+  view: PvpView;
+  /**
+   * 再戦UIを Discord へ返すための transport。**人物の正本ではない。**
+   *
+   * 公開募集では `rematchInteraction.user` は「受諾ボタンを押した人」であって
+   * 挑戦者ではない。対戦の参加者は常に上の `challenger` / `opponent` を正本にし、
+   * ここから身元を再推論しないこと。省略すると再戦を出さない。
+   */
+  rematchInteraction?: PvpInteraction;
+}
+
+/**
+ * 指名招待（`playX` 内）から本体へ渡す view。編集も collector も招待メッセージへ向く。
+ *
+ * BJ・インディアンは招待の受諾待ちで既に `fetchReply()` 済みなので、その Message を
+ * `knownMessage` へ渡す。fund 後に余計な Discord API を叩かずに済み、
+ * そこで落ちる窓もなくなる。
+ */
+export function pvpViewFromInteraction(interaction: PvpInteraction, knownMessage?: Message): PvpView {
+  return {
+    edit: (payload) => interaction.editReply(payload),
+    followUp: (payload) => interaction.followUp(payload),
+    message: async () => knownMessage ?? ((await interaction.fetchReply()) as Message),
+  };
+}
+
+/**
+ * 公開募集から本体へ渡す view。編集も collector も**募集カードそのもの**へ向くので、
+ * カードがそのまま対戦盤になる。続報は同じチャンネルへ送る。
+ */
+export function pvpViewFromMessage(card: Message): PvpView {
+  return {
+    edit: (payload) => card.edit(payload),
+    followUp: async (payload) => {
+      const channel = card.channel;
+      // PartialGroupDMChannel だけ send を持たない。届けられないなら握り潰さず
+      // カード自身を最終結果へ更新して、決着が消えないようにする
+      if (!("send" in channel)) return card.edit(payload);
+      return channel.send(payload);
+    },
+    message: async () => card,
+  };
+}
 
 /**
  * `/勝負` の対人卓のリスク枠の名前（PR23）。
@@ -274,6 +370,76 @@ function pvpRiskDetail(services: Services, userId: string, error: unknown): stri
     }
   }
   return "賭場の利用制限を確認できないため、いまは勝負できない。";
+}
+
+/**
+ * **両者 fund 済みの本体**を、資金を取り残さずに実行する。
+ *
+ * 本体は最初に `view.edit()` を呼ぶ。公開募集ではその瞬間に募集カードが削除・
+ * 権限変更されている可能性があり（3分間チャンネルに晒されるので面積が広い）、
+ * edit が throw すると勝敗にも返金にも精算にも到達しないまま、両者の預り金と
+ * 露出だけが残る。BJ・インディアンは対戦中ずっと edit と collector を使うので、
+ * 窓はさらに広い。
+ *
+ * そこで「**精算・返金が終わる前に落ちたら必ず void する**」を4ゲーム共通の
+ * 不変条件にする。逆に、`settlePvp()` / `refundAll()` が成功した後に Discord API
+ * だけ落ちた場合は**金銭処理を巻き戻さない**——表示できなかったことを理由に
+ * 確定済みの勝敗を消してはいけない。
+ *
+ * したがって `markResolved()` を呼ぶ位置は**精算・返金の直後**であって、
+ * 表示の成功ではない。
+ *
+ * ## 契約
+ *
+ * **callback は「`markResolved()` を呼ぶ」か「throw する」かのどちらかで終わること。**
+ * 途中の `return` で静かに抜けると資金が fund 済みのまま残るので、その場合も
+ * ここが強制返金したうえで異常終了させる。BJ・インディアンのように分岐が多い本体で
+ * `markResolved()` を書き損ねても、金だけ残るより返して落ちるほうが安全。
+ */
+export async function runFundedSession(
+  services: Services,
+  session: string,
+  run: (markResolved: () => void) => Promise<void>,
+): Promise<void> {
+  let resolved = false;
+  try {
+    await run(() => {
+      resolved = true;
+    });
+  } catch (error) {
+    cleanupUnresolvedFundedSession(services, session, resolved, error);
+    throw error;
+  }
+  if (resolved) return;
+  // 正常終了したのに精算も返金もしていない＝実装の穴。資金を残さず落とす。
+  // 契約違反そのものを cause として渡すので、返金も失敗したときは
+  // AggregateError へ「契約違反」と「返金障害」の両方が載る
+  const unresolvedError = new Error(`Funded PvP session ${session} exited without settlement or refund`);
+  cleanupUnresolvedFundedSession(services, session, false, unresolvedError);
+  throw unresolvedError;
+}
+
+/**
+ * 未解決の fund 済みセッションを片付ける。
+ *
+ * **返金自体が落ちたときに、元の障害を握り潰さない。** 「ゲームが落ちた」と
+ * 「返金にも失敗した」は両方とも運営が知る必要があるので、両方載せて投げる。
+ */
+function cleanupUnresolvedFundedSession(
+  services: Services,
+  session: string,
+  resolved: boolean,
+  cause: unknown,
+): void {
+  if (resolved) return;
+  try {
+    voidPvpTable(services, session);
+  } catch (cleanupError) {
+    throw new AggregateError(
+      cause === undefined ? [cleanupError] : [cause, cleanupError],
+      `Funded PvP session ${session} failed and cleanup also failed`,
+    );
+  }
 }
 
 /**

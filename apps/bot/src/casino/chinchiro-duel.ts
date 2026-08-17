@@ -18,6 +18,9 @@ import { C_MAMMON, C_WIN, diceInline } from "./ui.js";
 import {
   buildPvpAbort,
   buildPvpInvite,
+  pvpViewFromInteraction,
+  runFundedSession,
+  type FundedPvpContext,
   collectStakes,
   offerRematch,
   refundAll,
@@ -44,11 +47,13 @@ type Hand =
   | { type: "me"; score: number }
   | { type: "menashi" };
 
-const roll = (rng: CasinoRng): Dice => [rng.int(1, 6), rng.int(1, 6), rng.int(1, 6)] as const;
+const roll = (rng: CasinoRng): Dice =>
+  [rng.int(1, 6), rng.int(1, 6), rng.int(1, 6)] as const;
 
 function evaluate(dice: Dice): Hand {
   const [a, b, c] = [...dice].sort((x, y) => x - y) as [number, number, number];
-  if (a === b && b === c) return a === 1 ? { type: "pinzoro" } : { type: "zorome", value: a };
+  if (a === b && b === c)
+    return a === 1 ? { type: "pinzoro" } : { type: "zorome", value: a };
   if (a === 4 && b === 5 && c === 6) return { type: "shigoro" };
   if (a === 1 && b === 2 && c === 3) return { type: "hifumi" };
   if (a === b) return { type: "me", score: c };
@@ -58,12 +63,18 @@ function evaluate(dice: Dice): Hand {
 
 function handRank(h: Hand): number {
   switch (h.type) {
-    case "pinzoro": return 1000;
-    case "zorome": return 800 + h.value;
-    case "shigoro": return 700;
-    case "me": return 100 + h.score;
-    case "menashi": return 0;
-    case "hifumi": return -100;
+    case "pinzoro":
+      return 1000;
+    case "zorome":
+      return 800 + h.value;
+    case "shigoro":
+      return 700;
+    case "me":
+      return 100 + h.score;
+    case "menashi":
+      return 0;
+    case "hifumi":
+      return -100;
   }
 }
 
@@ -83,12 +94,18 @@ function autoRollHand(rng: CasinoRng): { hand: Hand; dice: Dice } {
 
 function describe(h: Hand): string {
   switch (h.type) {
-    case "pinzoro": return "🌟 ピンゾロ";
-    case "zorome": return `🎯 ゾロ目 ${h.value}${h.value}${h.value}`;
-    case "shigoro": return "🔥 シゴロ";
-    case "hifumi": return "💀 ヒフミ";
-    case "me": return `🎲 目 スコア ${h.score}`;
-    case "menashi": return "🌀 メナシ";
+    case "pinzoro":
+      return "🌟 ピンゾロ";
+    case "zorome":
+      return `🎯 ゾロ目 ${h.value}${h.value}${h.value}`;
+    case "shigoro":
+      return "🔥 シゴロ";
+    case "hifumi":
+      return "💀 ヒフミ";
+    case "me":
+      return `🎲 目 スコア ${h.score}`;
+    case "menashi":
+      return "🌀 メナシ";
   }
 }
 
@@ -105,37 +122,69 @@ export async function playChinchiroDuel(
 ): Promise<void> {
   const challenger = interaction.user;
   if (opponent.bot) {
-    await interaction.reply({ content: "ボットは対戦相手にできない。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({
+      content: "ボットは対戦相手にできない。",
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
   if (opponent.id === challenger.id) {
-    await interaction.reply({ content: "自分自身は挑戦できない。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({
+      content: "自分自身は挑戦できない。",
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
   if (!Number.isInteger(bet) || bet < MIN_BET || bet > MAX_BET) {
-    await interaction.reply({ content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} Ld で。`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({
+      content: `賭け額は ${MIN_BET}〜${MAX_BET.toLocaleString()} Ld で。`,
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
   if (services.chips.balanceOf(challenger.id) < bet) {
-    await interaction.reply({ content: "自分のLand残高が足りない。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({
+      content: "自分のLand残高が足りない。",
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
   if (services.chips.balanceOf(opponent.id) < bet) {
-    await interaction.reply({ content: `<@${opponent.id}> のLand残高が足りない。`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({
+      content: `<@${opponent.id}> のLand残高が足りない。`,
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
 
   // 挑戦者から先に徴収（受諾されなければ返金）
   const session = `ccduel:${interaction.id}`;
-  const challengerStake = collectStakes(services, [challenger.id], bet, `${session}:collect:challenger`, session, "chinchiro-duel");
+  const challengerStake = collectStakes(
+    services,
+    [challenger.id],
+    bet,
+    `${session}:collect:challenger`,
+    session,
+    "chinchiro-duel",
+  );
   if (!challengerStake.ok) {
-    await interaction.reply({ content: stakeFailureText(challengerStake), flags: MessageFlags.Ephemeral });
+    await interaction.reply({
+      content: stakeFailureText(challengerStake),
+      flags: MessageFlags.Ephemeral,
+    });
     return;
   }
 
   const inviteRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("ccd:accept").setLabel("受ける").setEmoji("🎲").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("ccd:decline").setLabel("断る").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId("ccd:accept")
+      .setLabel("受ける")
+      .setEmoji("🎲")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId("ccd:decline")
+      .setLabel("断る")
+      .setStyle(ButtonStyle.Danger),
   );
   await interaction.reply({
     content: `<@${opponent.id}>`,
@@ -162,7 +211,9 @@ export async function playChinchiroDuel(
   try {
     const btn = await reply.awaitMessageComponent({
       componentType: ComponentType.Button,
-      filter: (i) => i.user.id === opponent.id && (i.customId === "ccd:accept" || i.customId === "ccd:decline"),
+      filter: (i) =>
+        i.user.id === opponent.id &&
+        (i.customId === "ccd:accept" || i.customId === "ccd:decline"),
       time: 60_000,
     });
     accepted = btn.customId === "ccd:accept";
@@ -172,97 +223,178 @@ export async function playChinchiroDuel(
   }
 
   if (!accepted) {
-    refundAll(services, [challenger.id], bet, `${session}:refund:declined`, session);
+    refundAll(
+      services,
+      [challenger.id],
+      bet,
+      `${session}:refund:declined`,
+      session,
+    );
     await interaction.editReply({
       content: "",
-      embeds: [buildPvpAbort("対戦チンチロ", "🎲", `<@${opponent.id}> が受けなかった（時間切れ or 辞退）。挑戦者に全額返金。`)],
+      embeds: [
+        buildPvpAbort(
+          "対戦チンチロ",
+          "🎲",
+          `<@${opponent.id}> が受けなかった（時間切れ or 辞退）。挑戦者に全額返金。`,
+        ),
+      ],
       components: [],
     });
     return;
   }
   // 受諾: 対戦相手からも徴収
-  const opponentStake = collectStakes(services, [opponent.id], bet, `${session}:collect:opponent`, session, "chinchiro-duel");
+  const opponentStake = collectStakes(
+    services,
+    [opponent.id],
+    bet,
+    `${session}:collect:opponent`,
+    session,
+    "chinchiro-duel",
+  );
   if (!opponentStake.ok) {
-    refundAll(services, [challenger.id], bet, `${session}:refund:opponent_broke`, session);
+    refundAll(
+      services,
+      [challenger.id],
+      bet,
+      `${session}:refund:opponent_broke`,
+      session,
+    );
     await interaction.editReply({
       content: "",
-      embeds: [buildPvpAbort("対戦チンチロ", "🎲", `${stakeFailureText(opponentStake)}挑戦者に全額返金。`)],
+      embeds: [
+        buildPvpAbort(
+          "対戦チンチロ",
+          "🎲",
+          `${stakeFailureText(opponentStake)}挑戦者に全額返金。`,
+        ),
+      ],
       components: [],
     });
     return;
   }
 
-  // ── 両者振る（同一戦略・同役なら最大5回振り直し） ──
-  let cResult = autoRollHand(services.rng);
-  let oResult = autoRollHand(services.rng);
-  let ties = 0;
-  while (handRank(cResult.hand) === handRank(oResult.hand) && ties < REROLL_ON_TIE) {
-    ties++;
-    cResult = autoRollHand(services.rng);
-    oResult = autoRollHand(services.rng);
-  }
-
-  const pot = bet * 2;
-  const cRank = handRank(cResult.hand);
-  const oRank = handRank(oResult.hand);
-
-  await interaction.editReply({
-    content: "",
-    embeds: [
-      new EmbedBuilder()
-        .setTitle("🎲 対戦チンチロ — 決着")
-        .setColor(C_MAMMON)
-        .setDescription(
-          [
-            `<@${challenger.id}>: ${showDice(cResult.dice)} → ${describe(cResult.hand)}`,
-            `<@${opponent.id}>: ${showDice(oResult.dice)} → ${describe(oResult.hand)}`,
-          ].join("\n"),
-        ),
-    ],
-    components: [],
-    allowedMentions: { parse: [] },
+  await runFundedChinchiroDuel(services, {
+    challenger,
+    opponent,
+    bet,
+    session,
+    view: pvpViewFromInteraction(interaction),
+    rematchInteraction: interaction,
   });
-  await sleep(1200);
+}
 
-  if (cRank === oRank) {
-    // 同役続き → 全額返金
-    refundAll(services, [challenger.id, opponent.id], bet, `${session}:refund:draw`, session);
-    await interaction.followUp({
+/**
+ * 対戦チンチロの本体。
+ *
+ * ⚠️ **`collectStakes()` が両者について成功済みであることを前提とする。**
+ * 新規の入口から直接呼ばず、指名招待（{@link playChinchiroDuel}）または
+ * 公開募集の成立処理を経由すること。徴収前に呼ぶと、資金を確保しないまま
+ * 勝敗と配当だけが確定する。
+ */
+export async function runFundedChinchiroDuel(
+  services: Services,
+  ctx: FundedPvpContext,
+): Promise<void> {
+  const { challenger, opponent, bet, session, view, rematchInteraction } = ctx;
+
+  await runFundedSession(services, session, async (markResolved) => {
+    // ── 両者振る（同一戦略・同役なら最大5回振り直し） ──
+    let cResult = autoRollHand(services.rng);
+    let oResult = autoRollHand(services.rng);
+    let ties = 0;
+    while (
+      handRank(cResult.hand) === handRank(oResult.hand) &&
+      ties < REROLL_ON_TIE
+    ) {
+      ties++;
+      cResult = autoRollHand(services.rng);
+      oResult = autoRollHand(services.rng);
+    }
+
+    const pot = bet * 2;
+    const cRank = handRank(cResult.hand);
+    const oRank = handRank(oResult.hand);
+
+    await view.edit({
+      content: "",
       embeds: [
         new EmbedBuilder()
-          .setTitle("🎲 引き分け")
+          .setTitle("🎲 対戦チンチロ — 決着")
           .setColor(C_MAMMON)
-          .setDescription("何度振っても同役だった。全額返金。"),
-      ],
-      allowedMentions: { parse: [] },
-    });
-  } else {
-    const winnerId = cRank > oRank ? challenger.id : opponent.id;
-    const loserId = cRank > oRank ? opponent.id : challenger.id;
-    const { payout, houseCut } = settlePvp(services, [winnerId], pot, `${session}:settle`, session);
-
-    await interaction.followUp({
-      embeds: [
-        new EmbedBuilder()
-          .setTitle(`🎲 対戦チンチロ — 勝者 <@${winnerId}>`)
-          .setColor(C_WIN)
           .setDescription(
             [
-              `**勝ち** <@${winnerId}> +${fmtEther(payout - bet)}（受取 ${fmtEther(payout)}）`,
-              `**負け** <@${loserId}> -${fmtEther(bet)}`,
-              `場代 ${fmtEther(houseCut)} → JPプール`,
+              `<@${challenger.id}>: ${showDice(cResult.dice)} → ${describe(cResult.hand)}`,
+              `<@${opponent.id}>: ${showDice(oResult.dice)} → ${describe(oResult.hand)}`,
             ].join("\n"),
           ),
       ],
-      allowedMentions: { users: [winnerId] },
+      components: [],
+      allowedMentions: { parse: [] },
     });
-  }
+    await sleep(1200);
 
-  await offerRematch(interaction, {
+    if (cRank === oRank) {
+      // 同役続き → 全額返金
+      refundAll(
+        services,
+        [challenger.id, opponent.id],
+        bet,
+        `${session}:refund:draw`,
+        session,
+      );
+      markResolved();
+      await view.followUp({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("🎲 引き分け")
+            .setColor(C_MAMMON)
+            .setDescription("何度振っても同役だった。全額返金。"),
+        ],
+        allowedMentions: { parse: [] },
+      });
+    } else {
+      const winnerId = cRank > oRank ? challenger.id : opponent.id;
+      const loserId = cRank > oRank ? opponent.id : challenger.id;
+      const { payout, houseCut } = settlePvp(
+        services,
+        [winnerId],
+        pot,
+        `${session}:settle`,
+        session,
+      );
+      markResolved();
+
+      await view.followUp({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle(`🎲 対戦チンチロ — 勝者 <@${winnerId}>`)
+            .setColor(C_WIN)
+            .setDescription(
+              [
+                `**勝ち** <@${winnerId}> +${fmtEther(payout - bet)}（受取 ${fmtEther(payout)}）`,
+                `**負け** <@${loserId}> -${fmtEther(bet)}`,
+                `場代 ${fmtEther(houseCut)} → JPプール`,
+              ].join("\n"),
+            ),
+        ],
+        allowedMentions: { users: [winnerId] },
+      });
+    }
+  });
+
+  if (!rematchInteraction) return;
+  await offerRematch(rematchInteraction, {
     aId: challenger.id,
     bId: opponent.id,
     bet,
     game: "対戦チンチロ",
-    replay: (btn) => playChinchiroDuel(btn, services, btn.user.id === challenger.id ? opponent : challenger, bet),
+    replay: (btn) =>
+      playChinchiroDuel(
+        btn,
+        services,
+        btn.user.id === challenger.id ? opponent : challenger,
+        bet,
+      ),
   });
 }

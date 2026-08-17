@@ -19,6 +19,9 @@ import {
   buildPvpInvite,
   collectStakes,
   offerRematch,
+  pvpViewFromInteraction,
+  runFundedSession,
+  type FundedPvpContext,
   refundAll,
   settlePvp,
   stakeFailureText,
@@ -127,6 +130,35 @@ export async function playIndian(
     return;
   }
 
+  await runFundedIndian(services, {
+    challenger,
+    opponent,
+    bet: stake,
+    session,
+    view: pvpViewFromInteraction(interaction, reply),
+    rematchInteraction: interaction,
+  });
+}
+
+/**
+ * インディアンポーカーの本体。
+ *
+ * ⚠️ **`collectStakes()` が両者について成功済みであることを前提とする。**
+ * 新規の入口から直接呼ばず、指名招待（{@link playIndian}）または公開募集の
+ * 成立処理を経由すること。
+ *
+ * 盤面メッセージは**開始時に一度だけ取得して使い回す**（collector が監視する
+ * 対象と編集対象がズレないようにするため）。
+ */
+export async function runFundedIndian(services: Services, ctx: FundedPvpContext): Promise<void> {
+  const { challenger, opponent, bet: stake, session, view, rematchInteraction } = ctx;
+  // 金銭的に解決したことと、再戦を提案してよい正常終了かは別概念。
+  // DM が閉じていて対戦を流した場合は返金するが、再戦は出さない（切り出し前の挙動）
+  let rematchEligible = true;
+
+  await runFundedSession(services, session, async (markResolved) => {
+  // fund 済みなので、盤面の取得で落ちてもこの保護区間の内側であること
+  const tableMessage = await view.message();
   // 配札
   const cChallenger = draw(services.rng);
   const cOpponent = draw(services.rng);
@@ -148,8 +180,20 @@ export async function playIndian(
   }
   if (dmFailed) {
     refundAll(services, [challenger.id, opponent.id], stake, `${session}:refund:dm_failed`, session);
-    await interaction.followUp({
-      content: `<@${dmFailed}> DM が閉じていて相手のカードを送れなかった。この対戦は流す（両者返金）。`,
+    markResolved();
+    rematchEligible = false;
+    // 公開募集では view.followUp() は別メッセージを送るだけで、元カードの「受ける」が残る。
+    // DM失敗は正常に起こりうる終端なので、必ず元の盤面そのものを閉じる。
+    await view.edit({
+      content: "",
+      embeds: [
+        buildPvpAbort(
+          "インディアン",
+          "🃏",
+          `<@${dmFailed}> DM が閉じていて相手のカードを送れなかった。この対戦は流す（両者返金）。`,
+        ),
+      ],
+      components: [],
       allowedMentions: { users: [dmFailed] },
     });
     return;
@@ -160,7 +204,7 @@ export async function playIndian(
     new ButtonBuilder().setCustomId("ind:stay").setLabel("ステイ").setEmoji("✋").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("ind:fold").setLabel("フォールド").setEmoji("🏳").setStyle(ButtonStyle.Danger),
   );
-  await interaction.editReply({
+  await view.edit({
     content: `<@${challenger.id}> <@${opponent.id}>`,
     embeds: [
       new EmbedBuilder()
@@ -178,7 +222,7 @@ export async function playIndian(
   });
 
   const decisions = new Map<string, "stay" | "fold">();
-  const collector = reply.createMessageComponentCollector({
+  const collector = tableMessage.createMessageComponentCollector({
     componentType: ComponentType.Button,
     filter: (i) =>
       (i.user.id === challenger.id || i.user.id === opponent.id) && (i.customId === "ind:stay" || i.customId === "ind:fold"),
@@ -205,6 +249,7 @@ export async function playIndian(
   if (cDecision === "fold" && oDecision === "fold") {
     // 両者フォールド → 全額返金
     refundAll(services, [challenger.id, opponent.id], stake, `${session}:refund:both_fold`, session);
+    markResolved();
     title = "🃏 インディアン — 両者フォールド";
     note = "両者ともフォールド。全額返金。";
     winner = null;
@@ -225,10 +270,12 @@ export async function playIndian(
   if (winner === null && cDecision === "stay" && oDecision === "stay") {
     // 同値ドロー
     refundAll(services, [challenger.id, opponent.id], stake, `${session}:refund:draw`, session);
+    markResolved();
     title = "🃏 インディアン — 引き分け";
     note += "\n同値。全額返金。";
   } else if (winner !== null) {
     const { payout, houseCut } = settlePvp(services, [winner], pot, `${session}:settle`, session);
+    markResolved();
     const loser = winner === challenger.id ? opponent.id : challenger.id;
     title = `🃏 インディアン — 勝者 <@${winner}>`;
     note += `\n**勝ち** <@${winner}> +${fmtEther(payout - stake)}\n**負け** <@${loser}> -${fmtEther(stake)}\n場代 ${fmtEther(houseCut)} → JP`;
@@ -236,7 +283,7 @@ export async function playIndian(
     // すでに処理済み
   }
 
-  await interaction.editReply({
+  await view.edit({
     content: "",
     embeds: [
       new EmbedBuilder()
@@ -255,7 +302,10 @@ export async function playIndian(
     allowedMentions: winner ? { users: [winner] } : { parse: [] },
   });
 
-  await offerRematch(interaction, {
+  });
+
+  if (!rematchEligible || !rematchInteraction) return;
+  await offerRematch(rematchInteraction, {
     aId: challenger.id,
     bId: opponent.id,
     bet: stake,

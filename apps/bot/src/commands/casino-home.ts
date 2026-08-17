@@ -16,6 +16,7 @@ import { renderCasinoGameSelect } from "../casino/amount-picker.js";
 import { CASINO_SOLO_GAME_EMOJI, isCasinoSoloGame } from "../casino/games.js";
 import { recordCasinoMetricBestEffort } from "../casino/metrics.js";
 import { openingNotice, openingPhase, operatingLabel } from "../casino/opening.js";
+import { isPvpCardButton, handlePvpCardButton } from "../casino/pvp-route.js";
 import { readAvailableWallet } from "../casino/wallet.js";
 import { renderShop } from "./bakuten.js";
 import { itaCreateModal } from "./ita.js";
@@ -52,6 +53,12 @@ export async function handleCasinoHomeCommand(
 }
 
 export async function handleCasinoHomeButton(interaction: ButtonInteraction, services: Services): Promise<void> {
+  // 公開募集カードの accept/cancel は同じ casino:home: 配下だが、通常の本人限定ハブとは
+  // ライフサイクルが別。accept はこの先で同期 claim するので、ここでも呼び出し前に await を置かない。
+  if (isPvpCardButton(interaction.customId)) {
+    await handlePvpCardButton(interaction, services);
+    return;
+  }
   if (interaction.customId === CASINO_PANEL_OPEN) {
     await interaction.reply({
       ...renderCasinoHome(interaction.user.id, services, interaction.guild?.name),
@@ -79,10 +86,6 @@ export async function handleCasinoHomeButton(interaction: ButtonInteraction, ser
   }
   if (interaction.customId === "casino:home:back") {
     await respondWithHome(interaction, services);
-    return;
-  }
-  if (interaction.customId === "casino:home:pvp") {
-    await interaction.reply({ ...renderPvpGuide(services), flags: MessageFlags.Ephemeral });
     return;
   }
   // ハブから開いた子画面には戻る導線を足す。単体コマンド（/賭場商店 など）で
@@ -182,41 +185,6 @@ async function respondWithHome(interaction: ButtonInteraction, services: Service
     return;
   }
   await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
-}
-
-/**
- * チャンネルに公開の卓を立てる遊びは、本人にだけ見えるハブからは開けない。
- * ここは「何ができるか」と「どのコマンドか」を示すだけにする。
- */
-/**
- * 対人戦の案内。
- *
- * 以前は「永続卓と従業員導線は PR20 以降です」と書いたまま固定されていたが、
- * 順位卓・従業員運営・異議処理は 2026-08-16 に廃止した。
- */
-function renderPvpGuide(services: Services) {
-  const phase = openingPhase(services);
-  const status = services.casinoStatus.current();
-  const open = phase === "formal" && status.status === "open";
-  const embed = new EmbedBuilder()
-    .setAuthor({ name: "マモンの賭場 · みんなで勝負" })
-    .setColor(open ? C_MAMMON : 0x78716c)
-    .setTitle("⚔  みんなで勝負")
-    .setDescription(
-      [
-        "**その場で始める**（相手を指名、または募集）",
-        "`/勝負 チンチロ` `/勝負 bj` `/勝負 サシ` `/勝負 インディアン` `/勝負 ポーカー`",
-        "`/勝負 丁半` は多人数戦（60秒受付・両側そろえば成立）",
-      ].join("\n"),
-    );
-  if (!open) {
-    embed.addFields({
-      name: "▸ いまは受け付けていません",
-      value: phase !== "formal" ? openingNotice(services) : `賭場を停止中です（${status.reason}）`,
-      inline: false,
-    });
-  }
-  return { embeds: [embed], components: [casinoHomeBackRow()] };
 }
 
 /** 遊び方。旧「はじめて」を、賭場全体の地図として使えるところまで広げる */

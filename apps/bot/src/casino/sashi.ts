@@ -16,6 +16,9 @@ import { C_MAMMON } from "./ui.js";
 import {
   buildPvpAbort,
   buildPvpInvite,
+  pvpViewFromInteraction,
+  runFundedSession,
+  type FundedPvpContext,
   buildPvpResult,
   collectStakes,
   offerRematch,
@@ -109,8 +112,29 @@ export async function playSashi(
     return;
   }
 
+  await runFundedSashiDuel(services, {
+    challenger,
+    opponent,
+    bet,
+    session,
+    view: pvpViewFromInteraction(interaction),
+    rematchInteraction: interaction,
+  });
+}
+
+/**
+ * サシ勝負の本体。
+ *
+ * ⚠️ **`collectStakes()` が両者について成功済みであることを前提とする。**
+ * 新規の入口から直接呼ばず、指名招待（{@link playSashi}）または公開募集の
+ * 成立処理を経由すること。
+ */
+export async function runFundedSashiDuel(services: Services, ctx: FundedPvpContext): Promise<void> {
+  const { challenger, opponent, bet, session, view, rematchInteraction } = ctx;
+
+  await runFundedSession(services, session, async (markResolved) => {
   // 演出
-  await interaction.editReply({
+  await view.edit({
     content: "",
     embeds: [
       new EmbedBuilder()
@@ -127,15 +151,18 @@ export async function playSashi(
   const winnerId = challengerWins ? challenger.id : opponent.id;
   const loserId = challengerWins ? opponent.id : challenger.id;
   const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2, `${session}:settle`, session);
+  markResolved();
 
-  await interaction.editReply({
+  await view.edit({
     content: "",
     embeds: [buildPvpResult({ game: "サシ勝負", icon: "⚔", winnerId, loserId, bet, payout, houseCut })],
     components: [],
     allowedMentions: { users: [winnerId] },
   });
+  });
 
-  await offerRematch(interaction, {
+  if (!rematchInteraction) return;
+  await offerRematch(rematchInteraction, {
     aId: challenger.id,
     bId: opponent.id,
     bet,
