@@ -13,11 +13,20 @@ function makeWalletFixture(input: {
   const free = { ...(input.free ?? {}) };
   const land = { ...(input.land ?? {}) };
   const settledGroups = input.settledGroups ?? new Set<string>();
+  const txRows: Array<{
+    tx_kind: string;
+    from_holder: string;
+    to_holder: string;
+    amount: number;
+    game: string;
+    session_id: string;
+  }> = [];
 
   const chipTx = {
     openingPhase: vi.fn(() => (input.formal === false ? "pre_reset" : "formal")),
     isActive: vi.fn(() => active),
     hasGroup: vi.fn((key: string) => settledGroups.has(key)),
+    listByGroup: vi.fn(() => txRows),
   };
   const chips = {
     chipTx,
@@ -47,12 +56,39 @@ function makeWalletFixture(input: {
     }),
   } as never;
 
+  const makeRawEscrow = () => {
+    const holderId = (sessionId: string) => `escrow:${sessionId}`;
+    const record = (sessionId: string, userId: string, amount: number, game: string) => {
+      txRows.push({
+        tx_kind: "internal_transfer",
+        from_holder: userId,
+        to_holder: holderId(sessionId),
+        amount,
+        game,
+        session_id: sessionId,
+      });
+    };
+    return {
+      holderId: vi.fn(holderId),
+      hold: vi.fn((sessionId: string, userId: string, amount: number, game: string) => {
+        record(sessionId, userId, amount, game);
+        return true;
+      }),
+      holdAll: vi.fn((sessionId: string, userIds: readonly string[], amount: number, game: string) => {
+        for (const userId of userIds) record(sessionId, userId, amount, game);
+        return true;
+      }),
+    } as never;
+  };
+
   return {
     chips,
     ledger,
     chipFlow,
     free,
     land,
+    txRows,
+    makeRawEscrow,
     setActive(value: boolean) {
       active = value;
     },
@@ -94,6 +130,21 @@ describe("spendable casino wallet", () => {
     expect(f.chips.transfer).toHaveBeenCalledWith("alice", "house", 600, { reason: "test" });
   });
 
+  it("自動預入のoperation IDは再起動で巻き戻る単純連番ではなく十分大きい一意値を使う", () => {
+    const f = makeWalletFixture({ active: true, free: { alice: 0 }, land: { alice: 1_000 } });
+    const wallet = createSpendableChipLedger(f.chips, f.ledger, f.chipFlow);
+
+    wallet.transfer("alice", "house", 100, { reason: "first" });
+    f.free.alice = 0;
+    wallet.transfer("alice", "house", 100, { reason: "second" });
+
+    const ids = (f.chipFlow.ensureFreeChips as ReturnType<typeof vi.fn>).mock.calls.map((call) => String(call[2]));
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).not.toBe(ids[1]);
+    expect(ids[0]?.length).toBeGreaterThan(30);
+    expect(ids[1]?.length).toBeGreaterThan(30);
+  });
+
   it("group外ではLandだけ先に預けずraw transferへ任せる", () => {
     const f = makeWalletFixture({ active: false, free: { alice: 100 }, land: { alice: 900 } });
     const wallet = createSpendableChipLedger(f.chips, f.ledger, f.chipFlow);
@@ -121,7 +172,7 @@ describe("funded escrow", () => {
       free: { alice: 0, bob: 50 },
       land: { alice: 1_000, bob: 950 },
     });
-    const rawEscrow = { holdAll: vi.fn(() => true), hold: vi.fn(() => true) } as never;
+    const rawEscrow = f.makeRawEscrow();
     const escrow = createFundedEscrow(rawEscrow, f.chips, f.ledger, f.chipFlow);
 
     expect(escrow.holdAll("s1", ["alice", "bob"], 500, "pvp", "op1")).toBe(true);
@@ -130,6 +181,7 @@ describe("funded escrow", () => {
     expect(rawEscrow.holdAll).toHaveBeenCalledTimes(1);
     expect(rawEscrow.holdAll).toHaveBeenCalledWith("s1", ["alice", "bob"], 500, "pvp", "op1");
     expect(f.chips.runGroup).toHaveBeenCalledTimes(1);
+    expect(f.txRows).toHaveLength(2);
   });
 
   it("holdAllで1人でも総所持額不足なら誰のLandも動かさない", () => {
@@ -137,7 +189,7 @@ describe("funded escrow", () => {
       free: { alice: 0, bob: 0 },
       land: { alice: 1_000, bob: 100 },
     });
-    const rawEscrow = { holdAll: vi.fn(() => true), hold: vi.fn(() => true) } as never;
+    const rawEscrow = f.makeRawEscrow();
     const escrow = createFundedEscrow(rawEscrow, f.chips, f.ledger, f.chipFlow);
 
     expect(escrow.holdAll("s2", ["alice", "bob"], 500, "pvp", "op2")).toBe(false);
@@ -148,7 +200,7 @@ describe("funded escrow", () => {
 
   it("nestedの競馬/ルーレット型でも外側transactionの中でfundしてraw escrowへ渡す", () => {
     const f = makeWalletFixture({ active: true, free: { alice: 0 }, land: { alice: 1_000 } });
-    const rawEscrow = { holdAll: vi.fn(() => true), hold: vi.fn(() => true) } as never;
+    const rawEscrow = f.makeRawEscrow();
     const escrow = createFundedEscrow(rawEscrow, f.chips, f.ledger, f.chipFlow);
 
     expect(escrow.hold("race1", "alice", 500, "keiba", "op3")).toBe(true);
@@ -160,7 +212,7 @@ describe("funded escrow", () => {
   it("旧raw escrow groupが確定済みなら新wrapperで再徴収せずraw replayへ委譲する", () => {
     const legacy = new Set(["escrow:hold_all:old:op4"]);
     const f = makeWalletFixture({ settledGroups: legacy, land: { alice: 1_000, bob: 1_000 } });
-    const rawEscrow = { holdAll: vi.fn(() => true), hold: vi.fn(() => true) } as never;
+    const rawEscrow = f.makeRawEscrow();
     const escrow = createFundedEscrow(rawEscrow, f.chips, f.ledger, f.chipFlow);
 
     expect(escrow.holdAll("old", ["alice", "bob"], 500, "pvp", "op4")).toBe(true);
@@ -171,7 +223,7 @@ describe("funded escrow", () => {
 
   it("holdAllの重複参加者は資金へ触る前に拒否する", () => {
     const f = makeWalletFixture({ land: { alice: 1_000 } });
-    const rawEscrow = { holdAll: vi.fn(() => true), hold: vi.fn(() => true) } as never;
+    const rawEscrow = f.makeRawEscrow();
     const escrow = createFundedEscrow(rawEscrow, f.chips, f.ledger, f.chipFlow);
 
     expect(() => escrow.holdAll("s5", ["alice", "alice"], 500, "pvp", "op5")).toThrow("duplicate userId");
@@ -189,11 +241,32 @@ describe("funded escrow", () => {
       game: "pvp",
       ok: true,
     }));
-    const rawEscrow = { holdAll: vi.fn(() => true), hold: vi.fn(() => true) } as never;
+    const rawEscrow = f.makeRawEscrow();
     const escrow = createFundedEscrow(rawEscrow, f.chips, f.ledger, f.chipFlow);
 
     expect(() => escrow.hold("s6", "alice", 500, "pvp", "op6")).toThrow("funded escrow operation conflict");
     expect(rawEscrow.hold).not.toHaveBeenCalled();
+  });
+
+  it("wrapper ledgerのinternal_transferが要求と違えばcommit前にfail-closedする", () => {
+    const f = makeWalletFixture({ land: { alice: 1_000 } });
+    const rawEscrow = f.makeRawEscrow();
+    (rawEscrow.hold as ReturnType<typeof vi.fn>).mockImplementation(
+      (sessionId: string, userId: string, amount: number, game: string) => {
+        f.txRows.push({
+          tx_kind: "internal_transfer",
+          from_holder: userId,
+          to_holder: `escrow:${sessionId}`,
+          amount: amount + 1,
+          game,
+          session_id: sessionId,
+        });
+        return true;
+      },
+    );
+    const escrow = createFundedEscrow(rawEscrow, f.chips, f.ledger, f.chipFlow);
+
+    expect(() => escrow.hold("audit", "alice", 500, "pvp", "audit-op")).toThrow("funded escrow ledger mismatch");
   });
 });
 
