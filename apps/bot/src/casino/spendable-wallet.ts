@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   ChipLedger,
   ChipLedgerError,
@@ -14,13 +15,12 @@ import {
  * 従来どおり実チップだけを返し、利用者本人の `balanceOf()` と支払い元になった
  * `transfer()` だけを formal opening 中に拡張する。
  */
-let autoFundSequence = 0;
-
 function nextAutoFundOperationId(): string {
   // CasinoChipFlow.ensureFreeChips() の operationId は ':' 禁止。
-  // nested 呼び出しは外側 group が冪等性の正本なので、プロセス内で一意なら十分。
-  autoFundSequence += 1;
-  return `walletautofund${autoFundSequence}`;
+  // outer group の replay 時は body 自体が再実行されないため、fresh 実行ごとに世界で一意な値でよい。
+  // プロセス再起動で連番が巻き戻ると Ledger の冪等キーを再利用しうるので UUID を10進数化する。
+  const hex = randomUUID().replaceAll("-", "");
+  return `walletautofund${BigInt(`0x${hex}`).toString(10)}`;
 }
 
 function isFormal(chips: ChipLedger): boolean {
@@ -148,6 +148,40 @@ function assertNoDuplicateParticipants(userIds: readonly string[], context: stri
 }
 
 /**
+ * funding wrapper の outer group に、要求した預託だけが正しく記録されたことを確認する。
+ * auto-deposit の `deposit` 行は許すが、`internal_transfer` は参加者1人につき厳密に1件。
+ * fresh 実行では COMMIT 前に呼ぶので、不一致なら Land 預入を含めて全体を rollback できる。
+ */
+function assertFundedEscrowLedger(
+  chips: ChipLedger,
+  groupKey: string,
+  holderId: string,
+  sessionId: string,
+  participants: readonly string[],
+  amount: number,
+  game: string,
+): void {
+  const internal = chips.chipTx.listByGroup(groupKey).filter((row) => row.tx_kind === "internal_transfer");
+  if (internal.length !== participants.length) {
+    throw new Error(`funded escrow ledger mismatch: ${groupKey} expected ${participants.length} transfers, got ${internal.length}`);
+  }
+
+  for (const userId of participants) {
+    const matches = internal.filter(
+      (row) =>
+        row.from_holder === userId &&
+        row.to_holder === holderId &&
+        row.amount === amount &&
+        row.game === game &&
+        row.session_id === sessionId,
+    );
+    if (matches.length !== 1) {
+      throw new Error(`funded escrow ledger mismatch: ${groupKey} participant ${userId} has ${matches.length} matching transfers`);
+    }
+  }
+}
+
+/**
  * Escrow の hold/holdAll だけに「不足分の Land を同一 transaction 内で預入」を足す。
  *
  * Escrow 本体を spendable ChipLedger で直接構築しないのは、Escrow の非 nested hold が
@@ -197,19 +231,35 @@ export function createFundedEscrow(
     if (chips.chipTx.isActive()) return runFresh();
 
     const requested: FundedHoldStored = { kind: "hold", sessionId, userId, amount, game, ok: true };
+    const wrapperGroupKey = `wallet:escrow:hold:${sessionId}:${userId}:${operationId}`;
     try {
       const stored = chips.runGroup(
-        {
-          groupKey: `wallet:escrow:hold:${sessionId}:${userId}:${operationId}`,
-          kind: "table_hold",
-          actorId: userId,
-        },
+        { groupKey: wrapperGroupKey, kind: "table_hold", actorId: userId },
         (): FundedHoldStored => {
           if (!runFresh()) throw new WalletShortfall(userId);
+          assertFundedEscrowLedger(
+            chips,
+            wrapperGroupKey,
+            escrow.holderId(sessionId),
+            sessionId,
+            [userId],
+            amount,
+            game,
+          );
           return requested;
         },
       );
       assertHoldReplay(stored, requested);
+      // replay 時もDB上の実記録を照合し、result_json だけ正しい壊れ方をfail-closedする。
+      assertFundedEscrowLedger(
+        chips,
+        wrapperGroupKey,
+        escrow.holderId(sessionId),
+        sessionId,
+        [userId],
+        amount,
+        game,
+      );
       return true;
     } catch (error) {
       if (error instanceof WalletShortfall) return false;
@@ -261,22 +311,37 @@ export function createFundedEscrow(
       game,
       ok: true,
     };
+    const wrapperGroupKey = `wallet:escrow:hold_all:${sessionId}:${operationId}`;
     try {
       const stored = chips.runGroup(
-        {
-          groupKey: `wallet:escrow:hold_all:${sessionId}:${operationId}`,
-          kind: "table_hold",
-          actorId: "system:escrow",
-        },
+        { groupKey: wrapperGroupKey, kind: "table_hold", actorId: "system:escrow" },
         (): FundedHoldAllStored => {
           if (!runFresh()) {
             // false を group result として保存すると、Land を得た後も永久に false replay される。
             throw new WalletShortfall(participants.find((u) => spendableBalance(chips, ledger, u) < amount) ?? "unknown");
           }
+          assertFundedEscrowLedger(
+            chips,
+            wrapperGroupKey,
+            escrow.holderId(sessionId),
+            sessionId,
+            participants,
+            amount,
+            game,
+          );
           return requested;
         },
       );
       assertHoldAllReplay(stored, requested);
+      assertFundedEscrowLedger(
+        chips,
+        wrapperGroupKey,
+        escrow.holderId(sessionId),
+        sessionId,
+        participants,
+        amount,
+        game,
+      );
       return true;
     } catch (error) {
       if (error instanceof WalletShortfall) return false;
