@@ -254,8 +254,8 @@ function pvpAvailability(userId: string, services: Services): PvpAvailability {
   let riskMax: number;
   let coverageMax: number;
   try {
-    // 公開1v1の collectStakes は escrow.holdAll へ直行するので、ここでは「賭場に置いている分」を見る。
-    // 手元のLandを含む available を使うと、表示上は押せるのに成立時は必ず残高不足になりうる。
+    // formal opening 中の services.chips は「通常Land + 自由チップ」の利用可能額を返す。
+    // 成立時の funded escrow も同じ財布から不足分だけ自動預入するため、表示と実徴収が一致する。
     balance = services.chips.balanceOf(userId);
     riskMax = services.dailyRisk.maxBetForPlayerLoss(userId, (bet) => bet, MAX_BET);
     // authorizeExposure と同じ「最大損失 <= 所持の50%」。これを表示上限へ入れないと、
@@ -283,9 +283,9 @@ function pvpAmountDenial(amount: number, availability: PvpAvailability): string 
 }
 
 function pvpAvailabilityLabel(availability: PvpAvailability): string {
-  if (availability.balance === null) return "賭場残高・上限 確認停止";
+  if (availability.balance === null) return "利用可能Land・上限 確認停止";
   const max = availability.maxBet === null ? "確認停止" : fmtLd(availability.maxBet);
-  return `賭場に置いている分 ${fmtLd(availability.balance)} · 募集上限 ${max}`;
+  return `利用可能Land ${fmtLd(availability.balance)} · 募集上限 ${max}`;
 }
 
 function parseGameTail(customId: string, prefix: string): { matched: boolean; game: PvpGameKey | null } {
