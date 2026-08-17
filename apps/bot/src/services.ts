@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { isSeatOccupied } from "./casino/common.js";
-import { createFundedEscrow, createSpendableChipLedger } from "./casino/spendable-wallet.js";
+import { createFundedEscrow, createSoloLiquidityViews, createSpendableChipLedger } from "./casino/spendable-wallet.js";
 import {
   Departments,
   Entry,
@@ -171,11 +171,14 @@ export function buildServices() {
   const spendableChips = createSpendableChipLedger(chips, ledger, chipFlow);
 
   // DailyRisk は Land + 自由チップを自前で合算するため raw chipAssets を使い続ける。
-  const dailyRisk = new DailyRisk(db, ledger, chipAssets, {
+  const dailyRiskCore = new DailyRisk(db, ledger, chipAssets, {
     openingPhase: () => chipTx.openingPhase(),
     dailyLossLimitBps: () => settings.getNumber("casino_daily_loss_limit_bps"),
     boundaryOffsetMinutes: () => settings.getNumber("casino_daily_boundary_offset_minutes"),
   });
+  // validateBet の「maxPlayerLoss判定」と「capacity通過後のensureFreeChips」を橋渡しし、
+  // BJダブル/ホールデムコール等の途中増額も開始時に自由チップで裏付ける。
+  const soloLiquidity = createSoloLiquidityViews(dailyRiskCore, chipFlow);
 
   // 利用者が支払う core サービスには「通常Land + 自由チップ」の互換窓を渡す。
   // system holder は proxy 内で raw 残高のままなので、house / JP / relief の意味は変わらない。
@@ -183,7 +186,7 @@ export function buildServices() {
     fukuScale: () => settings.getNumber("ether_fuku_scale"),
     items,
     reservations,
-    dailyRisk,
+    dailyRisk: dailyRiskCore,
   });
   const casinoMetrics = new CasinoMetrics(db, chipTx);
   const daily = new Daily(db, spendableChips, events, {
@@ -285,8 +288,9 @@ export function buildServices() {
     // `ether` は監査・互換用の raw read-only view のまま。
     ether: chips as ChipReadonlyView,
     chipAssets,
-    chipFlow,
-    dailyRisk,
+    // ソロ開始だけmaxPlayerLossの流動性を確保し、それ以外のchipFlow/DailyRiskメソッドはrawへ委譲する。
+    chipFlow: soloLiquidity.chipFlow,
+    dailyRisk: soloLiquidity.dailyRisk,
     casino,
     casinoMetrics,
     casinoStatus,
