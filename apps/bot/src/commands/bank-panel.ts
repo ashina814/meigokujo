@@ -26,7 +26,13 @@ import { shopAdminPanelMessage } from "./shokan.js";
 import { takutatePanelMessage } from "./takutate-panel.js";
 import { ticketPanelMessage } from "./tickets.js";
 import { confessionPanelMessage } from "./confession.js";
-import { casinoFacilityPanelMessage, casinoGamesPanelMessage, casinoPanelMessage } from "./casino-home.js";
+import { casinoFacilityPanelMessage, casinoPanelMessage } from "./casino-home.js";
+import {
+  casinoItaPanelMessage,
+  casinoKeibaPanelMessage,
+  casinoPvpPanelMessage,
+  casinoSoloPanelMessage,
+} from "./casino-dedicated-panels.js";
 import { roomPanelMessage } from "./rooms.js";
 import { deptAccount, LedgerError } from "@meigokujo/core";
 import {
@@ -48,7 +54,10 @@ import type { Services } from "../services.js";
  */
 const PANEL_MESSAGES: Record<PanelKind, (services: Services, channelId: string) => MessageCreateOptions> = {
   casino: (s) => casinoPanelMessage(s),
-  casino_games: (s) => casinoGamesPanelMessage(s),
+  casino_games: (s) => casinoSoloPanelMessage(s),
+  casino_pvp: (s) => casinoPvpPanelMessage(s),
+  casino_keiba: (s) => casinoKeibaPanelMessage(s),
+  casino_ita: (s) => casinoItaPanelMessage(s),
   casino_facility: (s) => casinoFacilityPanelMessage(s),
   bank: () => bankPanelMessage(),
   entry: (s) => entryPanelMessage(s),
