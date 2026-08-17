@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { runFundedBjDuel } from "../src/casino/bj-duel.js";
+import { runFundedIndian } from "../src/casino/indian.js";
 import { runFundedSession } from "../src/casino/pvp-common.js";
 
 /**
@@ -162,8 +163,57 @@ describe("fund済み後の盤面取得は保護区間の内側にある", () => 
   });
 });
 
-describe("インディアンは DM 失敗で再戦を出さない", () => {
-  it("返金はするが、再戦オファーの手前で抜ける", () => {
+describe("インディアンのDM失敗は返金して元の盤面を終端化する", () => {
+  it("公開募集でも『受ける』を残さず、別投稿だけで済ませない", async () => {
+    const refundMany = vi.fn(() => 2);
+    const view = {
+      message: vi.fn(async () => ({ id: "card" })),
+      edit: vi.fn(async () => undefined),
+      followUp: vi.fn(async () => undefined),
+    } as never;
+    const challenger = {
+      id: "alice",
+      send: vi.fn(async () => {
+        throw new Error("Cannot send messages to this user");
+      }),
+    } as never;
+    const opponent = {
+      id: "bob",
+      send: vi.fn(async () => undefined),
+    } as never;
+    const services = {
+      rng: {
+        int: vi.fn(() => 7),
+        pick: vi.fn((items: readonly string[]) => items[0]),
+      },
+      escrow: {
+        refundMany,
+        list: vi.fn(() => []),
+      },
+      dailyRisk: {
+        releaseExposure: vi.fn(() => undefined),
+        exposureOf: vi.fn(() => null),
+      },
+    } as never;
+
+    await expect(
+      runFundedIndian(services, {
+        challenger,
+        opponent,
+        bet: 500,
+        session: "s8",
+        view,
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(refundMany).toHaveBeenCalledWith("s8", ["alice", "bob"], "s8:refund:dm_failed");
+    expect(view.edit).toHaveBeenCalledTimes(1);
+    expect(view.edit.mock.calls[0]?.[0]).toMatchObject({ content: "", components: [] });
+    expect(view.followUp, "公開募集の元カードを閉じず別投稿だけしている").not.toHaveBeenCalled();
+    expect(opponent.send, "1人目のDM失敗後に2人目へ送信している").not.toHaveBeenCalled();
+  });
+
+  it("返金後は再戦オファーを出さない契約も維持する", () => {
     const source = readFileSync(new URL("../src/casino/indian.ts", import.meta.url), "utf8");
     // 切り出し前は playIndian ごと return していたので offerRematch へ到達しなかった。
     // callback の return はセッションを抜けるだけなので、明示的に止める必要がある
