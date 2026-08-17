@@ -11,15 +11,7 @@ import { departmentCommand } from "./commands/department.js";
 import { tipCommand } from "./commands/tip.js";
 import { rankingCommand } from "./commands/ranking.js";
 import { helpCommand } from "./commands/help.js";
-import { asobuCommand } from "./commands/asobu.js";
-import { dailyCommand } from "./commands/daily.js";
 import { passportCommand } from "./commands/passport.js";
-import { banzukeCommand } from "./commands/banzuke.js";
-import { bakutenCommand } from "./commands/bakuten.js";
-import { keibaCommand } from "./commands/keiba.js";
-import { annaiCommand } from "./commands/annai.js";
-import { vipCommand } from "./commands/vip.js";
-import { nagareboshiCommand } from "./commands/nagareboshi.js";
 import { itaCommand } from "./commands/ita.js";
 import { casinoHomeCommand } from "./commands/casino-home.js";
 
@@ -43,15 +35,7 @@ const commands = [
   rankingCommand.toJSON(),
   helpCommand.toJSON(),
   casinoHomeCommand.toJSON(),
-  asobuCommand.toJSON(),
-  dailyCommand.toJSON(),
   passportCommand.toJSON(),
-  banzukeCommand.toJSON(),
-  bakutenCommand.toJSON(),
-  keibaCommand.toJSON(),
-  annaiCommand.toJSON(),
-  vipCommand.toJSON(),
-  nagareboshiCommand.toJSON(),
   itaCommand.toJSON(),
 ];
 
