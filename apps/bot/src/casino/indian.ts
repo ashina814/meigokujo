@@ -182,8 +182,18 @@ export async function runFundedIndian(services: Services, ctx: FundedPvpContext)
     refundAll(services, [challenger.id, opponent.id], stake, `${session}:refund:dm_failed`, session);
     markResolved();
     rematchEligible = false;
-    await view.followUp({
-      content: `<@${dmFailed}> DM が閉じていて相手のカードを送れなかった。この対戦は流す（両者返金）。`,
+    // 公開募集では view.followUp() は別メッセージを送るだけで、元カードの「受ける」が残る。
+    // DM失敗は正常に起こりうる終端なので、必ず元の盤面そのものを閉じる。
+    await view.edit({
+      content: "",
+      embeds: [
+        buildPvpAbort(
+          "インディアン",
+          "🃏",
+          `<@${dmFailed}> DM が閉じていて相手のカードを送れなかった。この対戦は流す（両者返金）。`,
+        ),
+      ],
+      components: [],
       allowedMentions: { users: [dmFailed] },
     });
     return;
