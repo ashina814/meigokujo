@@ -1,0 +1,75 @@
+import { existsSync, readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+
+/**
+ * 賭場の利用者向け入口は `/賭場` に集約する。
+ *
+ * 個別機能はハブから到達できるため、重複する slash command は登録しない。
+ * 実装本体・handler は既存メッセージや将来の再利用のため削除しない。
+ */
+describe("賭場の重複 shortcut slash commands を登録しない", () => {
+  const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
+
+  it("退役対象8コマンドを Discord command registration に含めない", () => {
+    const source = read("../src/register-commands.ts");
+    for (const symbol of [
+      "asobuCommand",
+      "dailyCommand",
+      "banzukeCommand",
+      "bakutenCommand",
+      "keibaCommand",
+      "annaiCommand",
+      "vipCommand",
+      "nagareboshiCommand",
+    ]) {
+      expect(source).not.toContain(`${symbol}.toJSON()`);
+    }
+
+    for (const file of ["asobu", "daily", "banzuke", "bakuten", "keiba", "annai", "vip", "nagareboshi"]) {
+      expect(source).not.toContain(`./commands/${file}.js`);
+    }
+  });
+
+  it("正本の /賭場 と残す /通行証・/板 は登録したまま", () => {
+    const source = read("../src/register-commands.ts");
+    expect(source).toContain("casinoHomeCommand.toJSON()");
+    expect(source).toContain("passportCommand.toJSON()");
+    expect(source).toContain("itaCommand.toJSON()");
+  });
+
+  it("退役した個別入口の機能は /賭場 ハブから到達できる", () => {
+    const home = read("../src/commands/casino-home.ts");
+    for (const customId of [
+      "casino:home:games",
+      "casino:daily:claim",
+      "casino:home:banzuke",
+      "casino:home:shop",
+      "casino:home:keiba",
+      "casino:home:vip",
+      "casino:home:hoshi",
+    ]) {
+      expect(home).toContain(customId);
+    }
+  });
+
+  it("内部実装は削除しない", () => {
+    for (const rel of [
+      "../src/commands/asobu.ts",
+      "../src/commands/daily.ts",
+      "../src/commands/banzuke.ts",
+      "../src/commands/bakuten.ts",
+      "../src/commands/keiba.ts",
+      "../src/commands/annai.ts",
+      "../src/commands/vip.ts",
+      "../src/commands/nagareboshi.ts",
+    ]) {
+      expect(existsSync(new URL(rel, import.meta.url)), `${rel} が削除されている`).toBe(true);
+    }
+  });
+
+  it("住人向け案内は旧 /案内 ではなく /賭場 を示す", () => {
+    const help = read("../src/commands/help.ts");
+    expect(help).toContain("マモンの賭場全体は `/賭場` から");
+    expect(help).not.toContain("マモンの賭場全体は `/案内` から");
+  });
+});
