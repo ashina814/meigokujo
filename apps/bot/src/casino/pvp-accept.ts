@@ -223,7 +223,7 @@ function reserveSeatsAndClaim(
 function preflightStake(services: Services, userId: string, bet: number): string | null {
   try {
     if (services.chips.balanceOf(userId) < bet) {
-      return "賭場に置いているLandが足りません。";
+      return "利用可能Landが足りません。";
     }
     if (bet > Math.floor(services.dailyRisk.holdings(userId) / 2)) {
       return "所持額に対して賭け金が大きすぎます。";

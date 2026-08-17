@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { isSeatOccupied } from "./casino/common.js";
+import { createFundedEscrow, createSoloLiquidityViews, createSpendableChipLedger } from "./casino/spendable-wallet.js";
 import {
   Departments,
   Entry,
@@ -67,8 +68,7 @@ import { seedSpecialProfiles } from "./special-profile.js";
  * 保護が食い違う。`deposit` / `redeem` / `fundFromAccount` / `redeemToAccount` /
  * `transfer` / `runGroup` / 旧 `buy` `sell` `quoteBuy` `quoteSell` を**型から落として**、
  * `services.ether` 経由では資金が動かせないことをコンパイル時に固定する。
- * 資金操作も残高の読み取りも、production は必ず `services.chips` を使う
- * （PR8監査の時点で `services.ether` の production 参照は 0 件）。
+ * 資金操作も残高の読み取りも、production は必ず `services.chips` を使う。
  */
 export interface ChipReadonlyView {
   balanceOf(holderId: string): number;
@@ -143,15 +143,10 @@ export function buildServices() {
     },
     departments,
   });
-  // 賭場の取引監査。全サービスで同じインスタンスを共有する（実行中グループを共有するため）
+
+  // 賭場の取引監査。全サービスで同じ raw ChipLedger / ChipTx を共有する。
   const chipTx = new ChipTx(db);
-  // 正式開業ロックは `ChipLedger` に組み込まれていて外せない（PR8監査・ブロッカーA）。
-  // 「ロックを解除するオプション」も「ロックなしの派生」も存在しないので、
-  // ここで有効化し忘れる／うっかり無効化する余地が構造的に無い。
   const chips = new ChipLedger(db, ledger, events, { chipTx });
-  // 監査の出発点。導入時のチップ残高と、Land 側の基準（準備プール残高＋境界取引ID）を
-  // 一度だけ記録する。ここで基準を持てるのは「まだ何も動いていない」新規DBだけで、
-  // すでに版がある既存DBは運営卓の「検算Bの基準を確定」から明示的に置く
   if (
     chipTx.captureLegacyOpening({
       poolLand: ledger.balanceOf(chips.reserveHolder()),
@@ -160,61 +155,59 @@ export function buildServices() {
   ) {
     console.log("[賭場] 取引監査の開始残高を記録しました（legacy_pre_reset）");
   }
-  // 賭場の稼働状態。open 以外では**資金グループそのものが作れない**ようにここで繋ぐ
-  // （Discord の入口ガードだけだと、進行中のゲーム・scheduler・運営卓を止められない）
+
+  // 賭場の稼働状態。open 以外では資金グループそのものを作らせない。
   const casinoStatus = new CasinoStatus(db);
   chipTx.setClosedReason(() => casinoStatus.denyMessage());
-  // お守りは精算と同じグループで消費する（Casino.settleSolo）。そのため casino より先に作る
+
   const items = new Items(db);
-  // 獲得済みフリースピンの保留台帳（PR3）。有料スピンの確定と同じトランザクションで積む
   const freeSpins = new FreeSpins(db);
-  // 胴元債務予約（PR5）。canAccept が見るのは house 残高ではなく「残高 − 予約合計」になる
   const reservations = new HouseReservations(db, chips, events);
-  // 売上精算（redeemFairToAccount）も予約分は出せないようにする。UI ではなく資金処理層で止める
   chips.setReservedProvider((holderId) => (holderId === HOUSE_HOLDER ? reservations.totalReserved() : 0));
+
+  // raw のチップ資産・入出金サービスを先に作る。自動預入はこの正本だけを使う。
   const chipAssets = new CasinoChipAssets(db, chips);
-  const dailyRisk = new DailyRisk(db, ledger, chipAssets, {
+  const chipFlow = new CasinoChipFlow(db, chips, events, chipAssets, { isSeatOccupied });
+  const spendableChips = createSpendableChipLedger(chips, ledger, chipFlow);
+
+  // DailyRisk は Land + 自由チップを自前で合算するため raw chipAssets を使い続ける。
+  const dailyRiskCore = new DailyRisk(db, ledger, chipAssets, {
     openingPhase: () => chipTx.openingPhase(),
     dailyLossLimitBps: () => settings.getNumber("casino_daily_loss_limit_bps"),
     boundaryOffsetMinutes: () => settings.getNumber("casino_daily_boundary_offset_minutes"),
   });
-  const casino = new Casino(db, chips, events, {
+  // validateBet の「maxPlayerLoss判定」と「capacity通過後のensureFreeChips」を橋渡しし、
+  // BJダブル/ホールデムコール等の途中増額も開始時に自由チップで裏付ける。
+  const soloLiquidity = createSoloLiquidityViews(dailyRiskCore, chipFlow);
+
+  // 利用者が支払う core サービスには「通常Land + 自由チップ」の互換窓を渡す。
+  // system holder は proxy 内で raw 残高のままなので、house / JP / relief の意味は変わらない。
+  const casino = new Casino(db, spendableChips, events, {
     fukuScale: () => settings.getNumber("ether_fuku_scale"),
     items,
     reservations,
-    dailyRisk,
+    dailyRisk: dailyRiskCore,
   });
   const casinoMetrics = new CasinoMetrics(db, chipTx);
-  const daily = new Daily(db, chips, events, {
+  const daily = new Daily(db, spendableChips, events, {
     base: () => settings.getNumber("daily_base"),
     reliefThreshold: () => settings.getNumber("daily_relief_threshold"),
     reliefMax: () => settings.getNumber("daily_relief_max"),
   });
-  // Stocks の価格ランダムウォークは共通RNGを使う（テスト時は決定的にできる）
-  const stocks = new Stocks(db, chips, events, { rng: defaultRng() });
-  const vip = new Vip(db, chips, events, {
+  const stocks = new Stocks(db, spendableChips, events, { rng: defaultRng() });
+  const vip = new Vip(db, spendableChips, events, {
     price: () => settings.getNumber("vip_price"),
     days: () => settings.getNumber("vip_days"),
     betCapMult: () => settings.getNumber("vip_bet_cap_mult"),
   });
-  // 通算損益は**確定精算のときだけ**記録する（PR3）。
-  // 板・競馬・対人卓は「預けた額」と「受け取った額」の差を、精算の資金グループの中で一度だけ足す。
-  // 預託中・返金・無効試合は 0（対局中に通算負けが増えたり、全額返金で両方が膨らんだりしない）
+
+  // 通算損益は確定精算のときだけ記録する。
   const recordPlayerNet = (userId: string, net: number) => {
     if (isPlayerHolder(userId)) casino.recordGameNet(userId, net);
   };
-  // イベントLand板（緊急イベント用 hotfix・PR12とは独立）は生の Ledger（landLedger）を直接使う。
-  // 通常板の資金経路（ChipLedger 経由の `ether`）とは完全に分離したまま渡す。
-  const markets = new Markets(db, chips, events, { onPlayerNet: recordPlayerNet, landLedger: ledger });
-  // 起動時: イベントLand板の未精算（open/closed）分を**監査するだけ**（資金は一切動かさない）。
-  // recoverCasino()（chip 経済専用）とは独立の監査経路。Land はカジノチップ経済と別レイヤーで、
-  // liveEscrowHolders() の孤児検出（chip 側）にも含めていないため、ここで明示的に呼ぶ必要がある。
-  //
-  // 監査指摘1（PR#94独立監査）: 以前はここで adminRefundAllPendingEventLand()（旧名
-  // refundAllPendingEventLand）を無条件に呼んでいたため、deploy・クラッシュ・自動再起動の
-  // たびに正常な進行中イベント板まで全額返金・void化されてしまっていた。通常のBot起動経路
-  // では資金を動かさない auditPendingEventLand() だけを呼ぶ。escrow残高とbet合計が一致する
-  // 健全な板は open/closed のまま継続し、不一致の板だけ資金移動なしで frozen にする。
+
+  // イベントLand板は landLedger を直接使う別経路。通常板だけ spendableChips 経由になる。
+  const markets = new Markets(db, spendableChips, events, { onPlayerNet: recordPlayerNet, landLedger: ledger });
   {
     const eventAudit = markets.auditPendingEventLand(MARKET_FINALIZER);
     if (eventAudit.total > 0) {
@@ -228,28 +221,94 @@ export function buildServices() {
       );
     }
   }
-  const escrow = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
-  // 所有判定の正本をここで一本化する。プロセス内の着席は DB のどの表にも
-  // 現れないので、渡さないとショップの域外確認票がゲーム中の自由チップを
-  // Land へ戻せてしまう（監査ブロッカー・項目11）
-  const chipFlow = new CasinoChipFlow(db, chips, events, chipAssets, { isSeatOccupied });
+
+  // Escrow 本体は raw chips で監査する。公開側だけ funded proxy を渡し、
+  // Land→chip と hold/holdAll を同一 transaction に包む。
+  const escrowCore = new Escrow(db, chips, events, { onPlayerNet: recordPlayerNet });
+  const escrow = createFundedEscrow(escrowCore, chips, ledger, chipFlow);
+
   const takutate = new Takutate(db, events);
-  const casinoIntegrity = new CasinoIntegrity(db, ledger, chips, escrow, chipAssets);
-  const openingPlanner = new OpeningPlanner({ db, ledger, chips, chipAssets, integrity: casinoIntegrity, status: casinoStatus, settings, departments });
-  const openingReset = new OpeningReset({ db, ledger, chips, chipAssets, integrity: casinoIntegrity, status: casinoStatus, settings, departments });
-  // 起動時: 全点検 → 通ったときだけ掃除 → 掃除後にもう一度全点検 → 開ける
-  // 起動・復旧（正本 §8.2 S1〜S9, S12）。**所有元が「生きている預託」を自分で申告する**。
-  // 板だけを登録し、競馬は登録しない（永続テーブルが無く、再起動でレースごと消えるので
-  // その預託は孤児として返金するのが正しい）。
+  // integrity / opening は帳簿の実体を監査するので raw chips / raw escrow を必ず使う。
+  const casinoIntegrity = new CasinoIntegrity(db, ledger, chips, escrowCore, chipAssets);
+  const openingPlanner = new OpeningPlanner({
+    db,
+    ledger,
+    chips,
+    chipAssets,
+    integrity: casinoIntegrity,
+    status: casinoStatus,
+    settings,
+    departments,
+  });
+  const openingReset = new OpeningReset({
+    db,
+    ledger,
+    chips,
+    chipAssets,
+    integrity: casinoIntegrity,
+    status: casinoStatus,
+    settings,
+    departments,
+  });
+
+  // 起動・復旧では、永続する通常板だけが生きている escrow を申告する。
   const recoveryRegistry = new RecoveryRegistry();
   recoveryRegistry.register({ type: "market", listLiveEscrowHolders: () => markets.liveEscrowHolders() });
-  // 賭博結果の乱数は crypto ベースを共通で使う。テスト時は上書き注入可能（services 型は同じ）。
   const rng = defaultRng();
-  // 資金を動かす経路は `chips` に一本化した（PR8監査・項目12）。`ether` は
-  // 旧名称で書かれた外部プラグイン・古い呼び出しが**読むだけ**なら壊れないように
-  // 残す互換窓で、型を `ChipReadonlyView` に狭めてある（下の注釈参照）。
-  const services = { db, settings, ledger, payroll, migration, events, entry, nicknames, originalRoles, originalRoleCases, subAccounts, returns, sessions, vc, tickets, chipTx, confessions, evaluation, vcRewards, rooms, titles, departments, fiscal, ranks, bumps, shop, chips, ether: chips as ChipReadonlyView, chipAssets, chipFlow, dailyRisk, casino, casinoMetrics, casinoStatus, casinoIntegrity, openingPlanner, openingReset, daily, items, stocks, vip, markets, escrow, takutate, freeSpins, reservations, recoveryRegistry, rng };
-  // 特別プロフィール（魔王など）の初期シード。未設定時のみ既定を投入し、以後は運営ボードで変更可
+
+  const services = {
+    db,
+    settings,
+    ledger,
+    payroll,
+    migration,
+    events,
+    entry,
+    nicknames,
+    originalRoles,
+    originalRoleCases,
+    subAccounts,
+    returns,
+    sessions,
+    vc,
+    tickets,
+    chipTx,
+    confessions,
+    evaluation,
+    vcRewards,
+    rooms,
+    titles,
+    departments,
+    fiscal,
+    ranks,
+    bumps,
+    shop,
+    // Discord/UI と支払い系には spendable view を公開する。
+    chips: spendableChips,
+    // `ether` は監査・互換用の raw read-only view のまま。
+    ether: chips as ChipReadonlyView,
+    chipAssets,
+    // ソロ開始だけmaxPlayerLossの流動性を確保し、それ以外のchipFlow/DailyRiskメソッドはrawへ委譲する。
+    chipFlow: soloLiquidity.chipFlow,
+    dailyRisk: soloLiquidity.dailyRisk,
+    casino,
+    casinoMetrics,
+    casinoStatus,
+    casinoIntegrity,
+    openingPlanner,
+    openingReset,
+    daily,
+    items,
+    stocks,
+    vip,
+    markets,
+    escrow,
+    takutate,
+    freeSpins,
+    reservations,
+    recoveryRegistry,
+    rng,
+  };
   seedSpecialProfiles(services);
   return services;
 }
