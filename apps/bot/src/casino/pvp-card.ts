@@ -57,11 +57,22 @@ export async function postChallenge(input: {
   challengerId: string;
   game: PvpGameKey;
   bet: number;
+  mentionRoleIds?: string[];
   onExpire: (challenge: PvpChallenge, card: Message) => void | Promise<void>;
 }): Promise<Message> {
   const id = randomUUID();
+  const mentionRoleIds = [...new Set(input.mentionRoleIds ?? [])].filter(Boolean);
+  const payload = challengeCard({ id, challengerId: input.challengerId, game: input.game, bet: input.bet });
   const card = await input.channel.send(
-    challengeCard({ id, challengerId: input.challengerId, game: input.game, bet: input.bet }) as never,
+    {
+      ...payload,
+      ...(mentionRoleIds.length > 0
+        ? {
+            content: mentionRoleIds.map((roleId) => `<@&${roleId}>`).join(" "),
+            allowedMentions: { roles: mentionRoleIds },
+          }
+        : {}),
+    } as never,
   );
   try {
     createChallenge({
