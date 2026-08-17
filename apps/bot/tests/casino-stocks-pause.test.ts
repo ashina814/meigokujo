@@ -35,9 +35,10 @@ describe("コマンド登録から外れている", () => {
   it("/株 が登録リストに無い", () => {
     const src = srcOf("../src/register-commands.ts");
     expect(src).not.toContain("stocksCommand");
-    // 他の賭場コマンドは残っている（株だけを止めた）
-    expect(src).toContain("asobuCommand");
-    expect(src).toContain("annaiCommand");
+    // 現行の賭場正本と、独立して残す入口は登録されている。
+    expect(src).toContain("casinoHomeCommand");
+    expect(src).toContain("passportCommand");
+    expect(src).toContain("itaCommand");
   });
 
   it("株の操作は全経路が停止案内へ向いている", () => {
