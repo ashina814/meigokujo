@@ -12,6 +12,7 @@ import {
   type ModalSubmitInteraction,
 } from "discord.js";
 import { fmtLd } from "../format.js";
+import { getRoleIds } from "../church-roles.js";
 import type { Services } from "../services.js";
 import { isSeatOccupied, MAX_BET, MIN_BET } from "./common.js";
 import { closeChallengeCard, postChallenge } from "./pvp-card.js";
@@ -212,6 +213,7 @@ async function postPvpChallenge(
       challengerId: interaction.user.id,
       game,
       bet: amount,
+      mentionRoleIds: getRoleIds(services, "casino_pvp_notify"),
       onExpire: (_challenge, expiredCard) =>
         closeChallengeCard(expiredCard, "⌛ 3分経過したため、この募集は締め切りました。"),
     });
