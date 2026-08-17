@@ -67,7 +67,7 @@ export async function handleHelpCommand(interaction: ChatInputCommandInteraction
         name: "🏆 ランキング・賭場",
         value: [
           "`/ランキング` — 自分のランク・発言・浮上・招待・Bumpなどの活動ランキングを見る入口。",
-          "マモンの賭場全体は `/案内` から。Landでスロット、勝負、競馬、板、市場、VIPなどへ進めます。",
+          "マモンの賭場全体は `/賭場` から。Landでスロット、勝負、競馬、板、市場、VIPなどへ進めます。",
           "賭場の詳しい使い方・注意は、賭場内の案内表示を優先してください。",
         ].join("\n"),
       },
@@ -79,6 +79,6 @@ export async function handleHelpCommand(interaction: ChatInputCommandInteraction
         ].join("\n"),
       },
     )
-    .setFooter({ text: "全部任意参加です。まずはプロフィール・通帳・案内から触るのがおすすめ。" });
+    .setFooter({ text: "全部任意参加です。まずはプロフィール・通帳・賭場から触るのがおすすめ。" });
   await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
