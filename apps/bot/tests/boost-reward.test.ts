@@ -10,6 +10,7 @@ import {
   boostRewardPaidCountThisMonth,
   handleBoostRewardMessage,
   initializeBoostRewardRecovery,
+  recordManualBoostCompensation,
 } from "../src/boost-reward.js";
 
 function services() {
@@ -105,6 +106,12 @@ describe("サーバーブースト自動報酬", () => {
       Math.floor(new Date("2026-08-01T00:00:00+09:00").getTime() / 1_000),
       "test",
     );
+    const eventAt = Math.floor(Date.now() / 1_000);
+    s.db.prepare(
+      `INSERT INTO boost_reward_events
+         (message_id, user_id, outcome, reward, event_at, month_key, created_at)
+       VALUES ('boost-1', 'user-1', 'capped', 0, ?, '2026-08', ?)`,
+    ).run(eventAt, eventAt);
     s.ledger.ensureAccount("user:user-1", "user");
     s.ledger.transfer({
       from: TREASURY,
@@ -117,6 +124,8 @@ describe("サーバーブースト自動報酬", () => {
       refId: "boost-1",
       idempotencyKey: "boost:boost-1",
     });
+    // draft途中の「送金だけ残り、event行が欠けた」状態を再現する。
+    s.db.prepare("DELETE FROM boost_reward_events WHERE message_id = 'boost-1'").run();
     const message = boostMessage("boost-1");
 
     await handleBoostRewardMessage(message.value, s);
@@ -168,46 +177,66 @@ describe("サーバーブースト自動報酬", () => {
     expect(boostRewardPaidCountThisMonth(s, "user-1", new Date("2026-09-01T00:00:01+09:00").getTime())).toBe(1);
   });
 
-  it("既存のreward_boost手動支給も月2回上限へ含める", async () => {
+  it("手動補償もDiscord Boost eventと同じmessage IDを使い、自動再処理で二重払いしない", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-18T20:00:00+09:00"));
     const s = services();
-    s.ledger.ensureAccount("user:user-1", "user");
-    s.ledger.transfer({
-      from: TREASURY,
-      to: "user:user-1",
-      amount: BOOST_REWARD_LD,
-      type: "reward_boost",
-      actor: "operator",
-      reason: "手動ブースト報酬",
-      idempotencyKey: "manual:boost:1",
-    });
+    s.settings.set(
+      BOOST_REWARD_STARTED_AT_SETTING,
+      Math.floor(new Date("2026-08-01T00:00:00+09:00").getTime() / 1_000),
+      "test",
+    );
+    const eventTimestampMs = new Date("2026-08-18T19:00:00+09:00").getTime();
 
-    await handleBoostRewardMessage(boostMessage("auto-1").value, s);
-    await handleBoostRewardMessage(boostMessage("auto-2").value, s);
+    expect(
+      recordManualBoostCompensation(
+        { messageId: "boost-manual", userId: "user-1", eventTimestampMs },
+        s,
+        "operator:1",
+      ),
+    ).toEqual({ kind: "paid", count: 1 });
 
-    expect(s.ledger.balanceOf("user:user-1")).toBe(BOOST_REWARD_LD * 2);
-    expect(boostRewardPaidCountThisMonth(s, "user-1")).toBe(2);
+    const automatic = boostMessage("boost-manual", { createdTimestamp: eventTimestampMs });
+    await handleBoostRewardMessage(automatic.value, s);
+
+    expect(s.ledger.balanceOf("user:user-1")).toBe(BOOST_REWARD_LD);
+    expect(automatic.send).not.toHaveBeenCalled();
+    expect(s.ledger.findByIdempotencyKey("boost:boost-manual")?.actor_id).toBe("operator:1");
   });
 
-  it("自動で月2回払った後の手動reward_boostもDB側で拒否する", async () => {
+  it("手動補償は自動化開始前のBoostを遡及支給しない", () => {
+    const s = services();
+    s.settings.set(
+      BOOST_REWARD_STARTED_AT_SETTING,
+      Math.floor(new Date("2026-08-18T20:00:00+09:00").getTime() / 1_000),
+      "test",
+    );
+    expect(() =>
+      recordManualBoostCompensation(
+        {
+          messageId: "old-boost",
+          userId: "user-1",
+          eventTimestampMs: new Date("2026-08-18T19:59:00+09:00").getTime(),
+        },
+        s,
+        "operator:1",
+      ),
+    ).toThrow(/ERR_BOOST_BEFORE_AUTOMATION/);
+  });
+
+  it("3回目を手動補償しようとしても月次上限で支給しない", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-18T20:00:00+09:00"));
     const s = services();
     await handleBoostRewardMessage(boostMessage("auto-1").value, s);
     await handleBoostRewardMessage(boostMessage("auto-2").value, s);
 
-    expect(() =>
-      s.ledger.transfer({
-        from: TREASURY,
-        to: "user:user-1",
-        amount: BOOST_REWARD_LD,
-        type: "reward_boost",
-        actor: "operator",
-        reason: "手動ブースト報酬",
-        idempotencyKey: "manual:boost:3",
-      }),
-    ).toThrow(/ERR_BOOST_MONTHLY_LIMIT/);
+    const result = recordManualBoostCompensation(
+      { messageId: "manual-3", userId: "user-1", eventTimestampMs: Date.now() },
+      s,
+      "operator:1",
+    );
+    expect(result).toEqual({ kind: "capped", count: 2 });
     expect(s.ledger.balanceOf("user:user-1")).toBe(BOOST_REWARD_LD * 2);
   });
 
@@ -238,10 +267,6 @@ describe("サーバーブースト自動報酬", () => {
     expect(fetchMessages).not.toHaveBeenCalled();
     expect(Number(s.settings.getString(BOOST_REWARD_STARTED_AT_SETTING))).toBe(Math.floor(Date.now() / 1_000));
     expect(Number(s.settings.getString(BOOST_REWARD_LAST_RECOVERY_AT_SETTING))).toBe(Math.floor(Date.now() / 1_000));
-    expect(
-      (s.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='boost_reward_events'").get() as { name: string })
-        .name,
-    ).toBe("boost_reward_events");
   });
 
   it("起動時に停止中の未処理Boostをsystem channel履歴から回収する", async () => {
@@ -269,6 +294,50 @@ describe("サーバーブースト自動報酬", () => {
     expect(s.ledger.balanceOf("user:user-1")).toBe(BOOST_REWARD_LD);
     expect(missed.send).toHaveBeenCalledOnce();
     expect(Number(s.settings.getString(BOOST_REWARD_LAST_RECOVERY_AT_SETTING))).toBe(Math.floor(Date.now() / 1_000));
+  });
+
+  it("復旧中の1件が失敗しても後続を処理し、watermarkは最古の失敗時刻に留める", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-18T20:00:00+09:00"));
+    const s = services();
+    s.settings.set(
+      BOOST_REWARD_STARTED_AT_SETTING,
+      Math.floor(new Date("2026-08-18T18:00:00+09:00").getTime() / 1_000),
+      "test",
+    );
+    s.settings.set(
+      BOOST_REWARD_LAST_RECOVERY_AT_SETTING,
+      Math.floor(new Date("2026-08-18T18:30:00+09:00").getTime() / 1_000),
+      "test",
+    );
+    s.ledger.ensureAccount("user:user-bad", "user");
+    s.ledger.setAccountStatus("user:user-bad", "frozen");
+
+    const failedAtMs = new Date("2026-08-18T19:00:00+09:00").getTime();
+    const failed = boostMessage("failed-boost", {
+      author: { id: "user-bad", bot: false },
+      createdTimestamp: failedAtMs,
+    });
+    const good = boostMessage("good-boost", {
+      author: { id: "user-good", bot: false },
+      createdTimestamp: new Date("2026-08-18T19:10:00+09:00").getTime(),
+    });
+    const fetchMessages = vi.fn(async () =>
+      new Map([
+        [failed.value.id, failed.value],
+        [good.value.id, good.value],
+      ]),
+    );
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await initializeBoostRewardRecovery(recoveryClient(fetchMessages), s);
+
+    expect(s.ledger.balanceOf("user:user-bad")).toBe(0);
+    expect(s.ledger.balanceOf("user:user-good")).toBe(BOOST_REWARD_LD);
+    expect(
+      (s.db.prepare("SELECT COUNT(*) AS c FROM boost_reward_events WHERE message_id = 'failed-boost'").get() as { c: number }).c,
+    ).toBe(0);
+    expect(Number(s.settings.getString(BOOST_REWARD_LAST_RECOVERY_AT_SETTING))).toBe(Math.floor(failedAtMs / 1_000));
   });
 
   it("Discord側でBoost通知が抑止されていれば起動時に警告する", async () => {
