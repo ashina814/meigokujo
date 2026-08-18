@@ -9,6 +9,13 @@ import { C_MAMMON } from "./ui.js";
 export const PVP_ACCEPT = "casino:home:pvpopen-accept";
 export const PVP_CANCEL = "casino:home:pvpopen-cancel";
 
+export type PvpRecruitmentNotification = "sent" | "cooldown" | "unconfigured";
+
+export type PvpChallengePostResult = {
+  card: Message;
+  notification: PvpRecruitmentNotification;
+};
+
 /** 公開募集カード。**この時点では資金を1 Ld も動かさない** */
 export function challengeCard(input: { id: string; challengerId: string; game: PvpGameKey; bet: number }) {
   const g = pvpGame(input.game);
@@ -60,11 +67,14 @@ export async function postChallenge(input: {
   bet: number;
   mentionRoleIds?: string[];
   onExpire: (challenge: PvpChallenge, card: Message) => void | Promise<void>;
-}): Promise<Message> {
+}): Promise<PvpChallengePostResult> {
   const id = randomUUID();
+  const configuredNotify = (input.mentionRoleIds ?? []).some(Boolean);
   // 募集そのものは止めず、通知だけを募集者単位で 3回 → 5分CD にする。
   // ここで同期的に枠を消費することで、同時投稿でも3回制限をすり抜けない。
   const mentionRoleIds = takePvpNotifyRoleIds(input.challengerId, input.mentionRoleIds ?? []);
+  const notification: PvpRecruitmentNotification =
+    mentionRoleIds.length > 0 ? "sent" : configuredNotify ? "cooldown" : "unconfigured";
   const payload = challengeCard({ id, challengerId: input.challengerId, game: input.game, bet: input.bet });
   const card = await input.channel.send(
     {
@@ -92,5 +102,5 @@ export async function postChallenge(input: {
     await closeChallengeCard(card, "募集を開始できませんでした。").catch(() => undefined);
     throw e;
   }
-  return card;
+  return { card, notification };
 }
