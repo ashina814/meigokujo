@@ -12,6 +12,7 @@ export const BOOST_REWARD_MONTHLY_LIMIT = 2;
  * - idempotency keyも `boost:<message id>` に固定する
  * - 支給元は国庫、金額は1回50,000Ldに固定する
  * - 同一ユーザーのJST暦月2回上限をDB triggerで最終保証する
+ * - 同一ユーザーに古い未解決Boostが残る間は、後続Boostの送金をDB triggerで拒否する
  * - 旧来の手動 `reward_boost` は履歴として残し、event行が無い場合は取引日時のJST月で数える
  * - 未解決のBoost eventは別tableへ永続化し、Bot再起動後も後続の先払いを防ぐ
  *
@@ -68,6 +69,7 @@ export function ensureBoostRewardLedgerSchema(db: Database.Database): void {
       DROP TRIGGER IF EXISTS trg_reward_boost_event_required_v3;
       DROP TRIGGER IF EXISTS trg_reward_boost_monthly_limit_v2;
       DROP TRIGGER IF EXISTS trg_reward_boost_monthly_limit_v3;
+      DROP TRIGGER IF EXISTS trg_reward_boost_pending_order_v1;
 
       CREATE TRIGGER trg_reward_boost_event_required_v3
       BEFORE INSERT ON transactions
@@ -88,6 +90,28 @@ export function ensureBoostRewardLedgerSchema(db: Database.Database): void {
                AND e.month_key IS NOT NULL
           )
         THEN RAISE(ABORT, 'ERR_BOOST_EVENT_REQUIRED') END;
+      END;
+
+      CREATE TRIGGER trg_reward_boost_pending_order_v1
+      BEFORE INSERT ON transactions
+      WHEN NEW.type = 'reward_boost' AND NEW.reversal_of IS NULL
+      BEGIN
+        SELECT CASE WHEN EXISTS (
+          SELECT 1
+            FROM boost_reward_pending current_pending
+            JOIN boost_reward_pending earlier
+              ON earlier.user_id = current_pending.user_id
+             AND earlier.message_id <> current_pending.message_id
+             AND (
+                  earlier.event_at_ms < current_pending.event_at_ms
+                  OR (
+                    earlier.event_at_ms = current_pending.event_at_ms
+                    AND earlier.message_id < current_pending.message_id
+                  )
+             )
+           WHERE current_pending.message_id = NEW.ref_id
+        )
+        THEN RAISE(ABORT, 'ERR_BOOST_EARLIER_PENDING') END;
       END;
 
       CREATE TRIGGER trg_reward_boost_monthly_limit_v3
