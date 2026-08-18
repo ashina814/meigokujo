@@ -62,9 +62,9 @@ export async function postChallenge(input: {
   onExpire: (challenge: PvpChallenge, card: Message) => void | Promise<void>;
 }): Promise<Message> {
   const id = randomUUID();
-  // 募集そのものは止めず、通知だけをロール単位で 3回 → 5分CD にする。
+  // 募集そのものは止めず、通知だけを募集者単位で 3回 → 5分CD にする。
   // ここで同期的に枠を消費することで、同時投稿でも3回制限をすり抜けない。
-  const mentionRoleIds = takePvpNotifyRoleIds(input.mentionRoleIds ?? []);
+  const mentionRoleIds = takePvpNotifyRoleIds(input.challengerId, input.mentionRoleIds ?? []);
   const payload = challengeCard({ id, challengerId: input.challengerId, game: input.game, bet: input.bet });
   const card = await input.channel.send(
     {
