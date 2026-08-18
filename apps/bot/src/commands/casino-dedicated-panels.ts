@@ -44,7 +44,7 @@ export function casinoPvpPanelMessage(services: Services): MessageCreateOptions 
   const roleIds = getRoleIds(services, "casino_pvp_notify");
   const notifyLine =
     roleIds.length > 0
-      ? `募集時は ${roleIds.map((id) => `<@&${id}>`).join(" ")} に通知します。各ロールは3回連続まで通知し、その後5分間だけCDに入ります。`
+      ? `募集時は ${roleIds.map((id) => `<@&${id}>`).join(" ")} に通知します。1人につき3募集連続まで通知し、その後5分間だけCDに入ります。`
       : "募集通知ロールは未設定です。運営は `/管理 → 設定 → ロール` から最大5ロールまで設定できます。";
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場" })
@@ -57,7 +57,7 @@ export function casinoPvpPanelMessage(services: Services): MessageCreateOptions 
         "最初に「受ける」を押した1人と勝負します。",
         "",
         notifyLine,
-        "-# 通知がCD中でも募集カード自体は通常どおり投稿されます。",
+        "-# 通知がCD中でも募集カード自体は通常どおり投稿されます。別の人の募集通知には影響しません。",
         "-# 募集中はLandを預かりません。成立した瞬間に双方を確認して預かります。",
       ].join("\n"),
     );
