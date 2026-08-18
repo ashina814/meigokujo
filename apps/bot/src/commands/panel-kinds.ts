@@ -25,7 +25,7 @@ export interface PanelKindMeta {
 
 export const PANEL_KINDS = [
   { key: "casino", label: "マモンの賭場（玄関）", installable: true },
-  { key: "casino_games", label: "賭場 · ひとり遊び", installable: true },
+  { key: "casino_games", label: "賭場 · 遊ぶ", installable: true },
   { key: "casino_pvp", label: "賭場 · みんなで勝負", installable: true },
   { key: "casino_keiba", label: "賭場 · 競馬", installable: true },
   { key: "casino_ita", label: "賭場 · 板", installable: true },
