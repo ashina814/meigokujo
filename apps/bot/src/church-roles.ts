@@ -44,7 +44,7 @@ export const ROLE_SLOT_META: Record<RoleSlot, { label: string; hint: string; mul
   },
   casino_pvp_notify: {
     label: "みんなで勝負 募集通知ロール",
-    hint: "公開1v1の募集カードを出したときにメンションするロール。複数選択可",
+    hint: "公開1v1の募集カードで通知するロール。最大5ロールまで設定可",
     multi: true,
   },
   // 諧和廷はトートの対応先から廃止（旧運用）。既存 roles:kaiwa の読み取り用に型としては残すが、UIには出さない
@@ -70,6 +70,13 @@ export const ROLE_SLOT_ORDER: RoleSlot[] = [
 ];
 
 const key = (slot: RoleSlot) => `roles:${slot}`;
+const roleLimit = (slot: RoleSlot): number | null => (slot === "casino_pvp_notify" ? 5 : null);
+
+function normalizeRoleIds(slot: RoleSlot, roleIds: string[]): string[] {
+  const unique = [...new Set(roleIds.filter(Boolean))];
+  const limit = roleLimit(slot);
+  return limit === null ? unique : unique.slice(0, limit);
+}
 
 /**
  * スロットに設定されたロールID一覧を返す。
@@ -77,7 +84,7 @@ const key = (slot: RoleSlot) => `roles:${slot}`;
  */
 export function getRoleIds(services: Services, slot: RoleSlot): string[] {
   const list = services.settings.getJson<string[]>(key(slot), []);
-  if (Array.isArray(list) && list.length > 0) return list.filter(Boolean);
+  if (Array.isArray(list) && list.length > 0) return normalizeRoleIds(slot, list);
   // ── フォールバック（新設定が未投入の間だけ）──
   if (slot === "admin") {
     const legacy = services.settings.getString("role:admin");
@@ -96,7 +103,7 @@ export function getRoleIds(services: Services, slot: RoleSlot): string[] {
 
 /** スロットのロールIDを保存（運営ボードから。空配列で解除） */
 export function setRoleIds(services: Services, slot: RoleSlot, roleIds: string[], actor: string): void {
-  services.settings.set(key(slot), roleIds, actor);
+  services.settings.set(key(slot), normalizeRoleIds(slot, roleIds), actor);
 }
 
 /** メンバーがそのスロットのいずれかのロールを持つか */
