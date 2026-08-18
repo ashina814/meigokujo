@@ -44,10 +44,11 @@ describe("賭場の常設パネルを用途別に分離する", () => {
 });
 
 describe("みんなで勝負の募集ロール通知", () => {
-  it("運営のロール設定に募集通知スロットを持ち、最大10ロールへ丸める", () => {
+  it("運営のロール設定に賭場専用の募集通知スロットを持ち、最大10ロールへ丸める", () => {
     const roles = srcOf("../src/church-roles.ts");
     expect(roles).toContain('| "casino_pvp_notify"');
-    expect(roles).toContain('label: "みんなで勝負 募集通知ロール"');
+    expect(roles).toContain('label: "賭場：みんなで勝負 募集通知ロール"');
+    expect(roles).toContain("トート・案件管理には使用しません");
     expect(roles).toContain("最大10ロールまで設定可");
     expect(roles).toContain('slot === "casino_pvp_notify" ? 10 : null');
     expect(roles).toContain('"casino_pvp_notify",');
