@@ -54,10 +54,11 @@ export function ensureBoostRewardLedgerSchema(db: Database.Database): void {
       DROP TRIGGER IF EXISTS trg_reward_boost_monthly_limit;
       DROP TRIGGER IF EXISTS trg_reward_boost_event_required_v1;
       DROP TRIGGER IF EXISTS trg_reward_boost_event_required_v2;
+      DROP TRIGGER IF EXISTS trg_reward_boost_event_required_v3;
       DROP TRIGGER IF EXISTS trg_reward_boost_monthly_limit_v2;
       DROP TRIGGER IF EXISTS trg_reward_boost_monthly_limit_v3;
 
-      CREATE TRIGGER trg_reward_boost_event_required_v2
+      CREATE TRIGGER trg_reward_boost_event_required_v3
       BEFORE INSERT ON transactions
       WHEN NEW.type = 'reward_boost' AND NEW.reversal_of IS NULL
       BEGIN
@@ -72,6 +73,8 @@ export function ensureBoostRewardLedgerSchema(db: Database.Database): void {
               FROM boost_reward_events e
              WHERE e.message_id = NEW.ref_id
                AND ('user:' || e.user_id) = NEW.to_account
+               AND e.event_at IS NOT NULL
+               AND e.month_key IS NOT NULL
           )
         THEN RAISE(ABORT, 'ERR_BOOST_EVENT_REQUIRED') END;
       END;
