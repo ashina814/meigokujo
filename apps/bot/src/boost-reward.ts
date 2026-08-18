@@ -10,7 +10,7 @@ import type { Services } from "./services.js";
 
 /** サーバーブースト1回あたりのLand報酬。 */
 export const BOOST_REWARD_LD = 50_000;
-/** 1ユーザーにつき1暦月（JST）に支払う最大回数。 */
+/** 1ユーザーにつき1暦月（JST）に支払う最大回数。core DB guardと同じ運用定数。 */
 export const BOOST_REWARD_MONTHLY_LIMIT = 2;
 
 export const BOOST_REWARD_STARTED_AT_SETTING = "boost_reward:auto_started_at";
@@ -18,7 +18,6 @@ export const BOOST_REWARD_LAST_RECOVERY_AT_SETTING = "boost_reward:last_recovery
 
 const JST_OFFSET_MS = 9 * 60 * 60 * 1_000;
 const RECOVERY_OVERLAP_SEC = 60;
-const schemaReady = new WeakSet<object>();
 
 type CountRow = { c: number };
 type EventRow = {
@@ -28,7 +27,15 @@ type EventRow = {
   month_key: string;
 };
 
-type ApplyResult =
+export interface BoostRewardEvent {
+  /** DiscordのGuildBoost system message ID。支払い冪等性の正本。 */
+  messageId: string;
+  userId: string;
+  /** Discord message.createdTimestamp。処理時刻ではなくBoost発生月を決める。 */
+  eventTimestampMs: number;
+}
+
+export type BoostRewardApplyResult =
   | { kind: "already" }
   | { kind: "paid"; count: number }
   | { kind: "recovered" }
@@ -56,79 +63,6 @@ export function boostRewardMonthRangeJst(nowMs = Date.now()): { start: number; e
   return { start: Math.floor(startMs / 1_000), end: Math.floor(endMs / 1_000) };
 }
 
-/**
- * Boost報酬用スキーマを起動時に準備する。
- *
- * `reward_boost` はこのBot以外の手動支給経路からも作れるため、月2回上限の最後の砦は
- * アプリのifではなくDB triggerに置く。Discord由来の自動支給は boost_reward_events.month_key、
- * 手動支給はtransactions.created_atのJST月で数える。
- */
-export function ensureBoostRewardSchema(services: Services): void {
-  if (schemaReady.has(services.db)) return;
-
-  // まず表だけを作る。#146初版の旧表が残っている場合、新列を足す前にindexを張ると失敗するため順序を固定する。
-  services.db.exec(`
-    CREATE TABLE IF NOT EXISTS boost_reward_events (
-      message_id TEXT PRIMARY KEY,
-      user_id    TEXT NOT NULL,
-      outcome    TEXT NOT NULL CHECK(outcome IN ('paid', 'capped')),
-      reward     INTEGER NOT NULL,
-      event_at   INTEGER,
-      month_key  TEXT,
-      created_at INTEGER NOT NULL
-    );
-  `);
-
-  // #146初版をローカルDBで一度動かしていても安全に新列へ収束させる。
-  const columns = services.db.prepare("PRAGMA table_info(boost_reward_events)").all() as Array<{ name: string }>;
-  if (!columns.some((c) => c.name === "event_at")) {
-    services.db.exec("ALTER TABLE boost_reward_events ADD COLUMN event_at INTEGER");
-  }
-  if (!columns.some((c) => c.name === "month_key")) {
-    services.db.exec("ALTER TABLE boost_reward_events ADD COLUMN month_key TEXT");
-  }
-  services.db.exec(`
-    UPDATE boost_reward_events
-       SET event_at = COALESCE(event_at, created_at),
-           month_key = COALESCE(month_key, strftime('%Y-%m', COALESCE(event_at, created_at), 'unixepoch', '+9 hours'))
-     WHERE event_at IS NULL OR month_key IS NULL;
-    CREATE INDEX IF NOT EXISTS idx_boost_reward_events_user_month
-      ON boost_reward_events(user_id, month_key, event_at);
-  `);
-
-  services.db.exec(`
-    CREATE TRIGGER IF NOT EXISTS trg_reward_boost_monthly_limit
-    BEFORE INSERT ON transactions
-    WHEN NEW.type = 'reward_boost' AND NEW.reversal_of IS NULL
-    BEGIN
-      SELECT CASE WHEN (
-        SELECT COUNT(*)
-          FROM transactions t
-          LEFT JOIN boost_reward_events e
-            ON t.ref_type = 'discord_boost' AND e.message_id = t.ref_id
-         WHERE t.type = 'reward_boost'
-           AND t.reversal_of IS NULL
-           AND t.to_account = NEW.to_account
-           AND COALESCE(
-                 e.month_key,
-                 strftime('%Y-%m', t.created_at, 'unixepoch', '+9 hours')
-               ) = COALESCE(
-                 (
-                   SELECT e2.month_key
-                     FROM boost_reward_events e2
-                    WHERE NEW.ref_type = 'discord_boost'
-                      AND e2.message_id = NEW.ref_id
-                 ),
-                 strftime('%Y-%m', NEW.created_at, 'unixepoch', '+9 hours')
-               )
-      ) >= ${BOOST_REWARD_MONTHLY_LIMIT}
-      THEN RAISE(ABORT, 'ERR_BOOST_MONTHLY_LIMIT') END;
-    END;
-  `);
-
-  schemaReady.add(services.db);
-}
-
 function paidCountForMonth(services: Services, userId: string, monthKey: string): number {
   const row = services.db
     .prepare(
@@ -154,7 +88,6 @@ export function boostRewardPaidCountThisMonth(
   userId: string,
   nowMs = Date.now(),
 ): number {
-  ensureBoostRewardSchema(services);
   return paidCountForMonth(services, userId, boostRewardMonthKeyJst(nowMs));
 }
 
@@ -174,6 +107,96 @@ function automationStartedAt(services: Services, nowMs = Date.now()): { startedA
   services.settings.set(BOOST_REWARD_LAST_RECOVERY_AT_SETTING, startedAt, "system:boost-init");
   console.info(`[boost] 自動支給を有効化しました start=${startedAt}（過去分は遡及しません）`);
   return { startedAt, created: true };
+}
+
+/**
+ * 1つのDiscord Boost eventをLand台帳へ適用する唯一の内部経路。
+ * event行の仮記録 → 月次判定 → 送金 → paid確定を同一IMMEDIATE transactionで閉じる。
+ */
+function applyBoostRewardEvent(
+  event: BoostRewardEvent,
+  services: Services,
+  actor: string,
+): BoostRewardApplyResult {
+  if (!event.messageId.trim() || !event.userId.trim()) throw new Error("ERR_BOOST_EVENT_INVALID");
+  if (!Number.isFinite(event.eventTimestampMs) || event.eventTimestampMs <= 0) {
+    throw new Error("ERR_BOOST_EVENT_INVALID");
+  }
+  if (!actor.trim()) throw new Error("ERR_BOOST_ACTOR_REQUIRED");
+
+  const eventAt = Math.floor(event.eventTimestampMs / 1_000);
+  const monthKey = boostRewardMonthKeyJst(event.eventTimestampMs);
+
+  const apply = services.db.transaction((): BoostRewardApplyResult => {
+    if (eventAlreadyHandled(services, event.messageId)) return { kind: "already" };
+
+    // DB triggerがDiscord eventとの結び付きを要求するため、送金より先にeventを仮記録する。
+    // transactionが失敗すればこの行もrollbackされる。
+    services.db
+      .prepare(
+        `INSERT INTO boost_reward_events
+           (message_id, user_id, outcome, reward, event_at, month_key, created_at)
+         VALUES (?, ?, 'capped', 0, ?, ?, ?)`,
+      )
+      .run(event.messageId, event.userId, eventAt, monthKey, Math.floor(Date.now() / 1_000));
+
+    // draft途中など「canonical keyで送金済み・event記録だけ欠落」の既存DBにも収束する。
+    const prior = services.ledger.findByIdempotencyKey(`boost:${event.messageId}`);
+    if (prior) {
+      services.db
+        .prepare("UPDATE boost_reward_events SET outcome = 'paid', reward = ? WHERE message_id = ?")
+        .run(prior.amount, event.messageId);
+      return { kind: "recovered" };
+    }
+
+    const paidCount = paidCountForMonth(services, event.userId, monthKey);
+    if (paidCount >= BOOST_REWARD_MONTHLY_LIMIT) {
+      return { kind: "capped", count: paidCount };
+    }
+
+    const accountId = `user:${event.userId}`;
+    services.ledger.ensureAccount(accountId, "user");
+    const result = services.ledger.transfer({
+      from: TREASURY,
+      to: accountId,
+      amount: BOOST_REWARD_LD,
+      type: "reward_boost",
+      actor,
+      reason: "サーバーブースト報酬",
+      refType: "discord_boost",
+      refId: event.messageId,
+      idempotencyKey: `boost:${event.messageId}`,
+    });
+
+    services.db
+      .prepare("UPDATE boost_reward_events SET outcome = 'paid', reward = ? WHERE message_id = ?")
+      .run(BOOST_REWARD_LD, event.messageId);
+
+    if (result.duplicate) return { kind: "recovered" };
+    return { kind: "paid", count: paidCount + 1 };
+  });
+
+  return apply.immediate();
+}
+
+/**
+ * 自動検知を取りこぼした場合の手動補償API。
+ *
+ * 汎用 `ledger.transfer(type='reward_boost')` はcore DB guardが拒否する。
+ * 補償する人はDiscordのGuildBoost message ID・実行者・発生時刻を確認してこの経路を使う。
+ * そのため後から自動復旧が同じmessageを拾っても `boost:<messageId>` / event PKで二重払いしない。
+ */
+export function recordManualBoostCompensation(
+  event: BoostRewardEvent,
+  services: Services,
+  actor: string,
+): BoostRewardApplyResult {
+  const startedAt = parseEpochSeconds(services.settings.getString(BOOST_REWARD_STARTED_AT_SETTING));
+  if (startedAt === null) throw new Error("ERR_BOOST_AUTOMATION_NOT_STARTED");
+  if (Math.floor(event.eventTimestampMs / 1_000) < startedAt) {
+    throw new Error("ERR_BOOST_BEFORE_AUTOMATION");
+  }
+  return applyBoostRewardEvent(event, services, actor);
 }
 
 async function notify(message: Message, content: string, userId: string): Promise<void> {
@@ -202,7 +225,6 @@ export async function handleBoostRewardMessage(message: Message, services: Servi
     return true;
   }
 
-  ensureBoostRewardSchema(services);
   // 通常はClientReady初期化で開始時刻が先に入る。もし初期化より先にBoostが届いた場合だけ、
   // そのBoost自身の発生時刻を開始点にして「最初の1回」を秒境界で落とさない。
   const { startedAt } = automationStartedAt(services, message.createdTimestamp);
@@ -211,58 +233,14 @@ export async function handleBoostRewardMessage(message: Message, services: Servi
     console.info(`[boost] 自動化開始前のイベントをスキップ message=${message.id} eventAt=${eventAt} start=${startedAt}`);
     return true;
   }
+
+  const result = applyBoostRewardEvent(
+    { messageId: message.id, userId, eventTimestampMs: message.createdTimestamp },
+    services,
+    "system:boost",
+  );
   const monthKey = boostRewardMonthKeyJst(message.createdTimestamp);
 
-  const apply = services.db.transaction((): ApplyResult => {
-    if (eventAlreadyHandled(services, message.id)) return { kind: "already" };
-
-    // 最初のwriteをイベント仮記録にしてIMMEDIATE transaction内で月次判定と送金を直列化する。
-    // cappedを仮値に使うが、このtransactionが失敗すれば丸ごとrollbackされる。
-    services.db
-      .prepare(
-        `INSERT INTO boost_reward_events
-           (message_id, user_id, outcome, reward, event_at, month_key, created_at)
-         VALUES (?, ?, 'capped', 0, ?, ?, ?)`,
-      )
-      .run(message.id, userId, eventAt, monthKey, Math.floor(Date.now() / 1_000));
-
-    // #146初版の「送金成功→イベント記録前クラッシュ」を模した既存データにも収束できる。
-    const prior = services.ledger.findByIdempotencyKey(`boost:${message.id}`);
-    if (prior) {
-      services.db
-        .prepare("UPDATE boost_reward_events SET outcome = 'paid', reward = ? WHERE message_id = ?")
-        .run(prior.amount, message.id);
-      return { kind: "recovered" };
-    }
-
-    const paidCount = paidCountForMonth(services, userId, monthKey);
-    if (paidCount >= BOOST_REWARD_MONTHLY_LIMIT) {
-      return { kind: "capped", count: paidCount };
-    }
-
-    const accountId = `user:${userId}`;
-    services.ledger.ensureAccount(accountId, "user");
-    const result = services.ledger.transfer({
-      from: TREASURY,
-      to: accountId,
-      amount: BOOST_REWARD_LD,
-      type: "reward_boost",
-      actor: "system:boost",
-      reason: "サーバーブースト報酬",
-      refType: "discord_boost",
-      refId: message.id,
-      idempotencyKey: `boost:${message.id}`,
-    });
-
-    services.db
-      .prepare("UPDATE boost_reward_events SET outcome = 'paid', reward = ? WHERE message_id = ?")
-      .run(BOOST_REWARD_LD, message.id);
-
-    if (result.duplicate) return { kind: "recovered" };
-    return { kind: "paid", count: paidCount + 1 };
-  });
-
-  const result = apply.immediate();
   if (result.kind === "already") {
     console.info(`[boost] 処理済みイベントをスキップ message=${message.id} user=${userId}`);
     return true;
@@ -299,8 +277,6 @@ export async function handleBoostRewardMessage(message: Message, services: Servi
  * 初回導入時はstarted_atを「今」に固定して走査しないため、既存ブースターへの遡及支給は起きない。
  */
 export async function initializeBoostRewardRecovery(client: Client, services: Services): Promise<void> {
-  ensureBoostRewardSchema(services);
-
   const mainGuildId = services.settings.getString("guild:main");
   if (!mainGuildId) {
     console.warn("[boost] guild:main が未設定のため自動支給を初期化できません");
@@ -351,16 +327,27 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
 
   candidates.sort((a, b) => a.createdTimestamp - b.createdTimestamp || a.id.localeCompare(b.id));
   let recovered = 0;
+  let failed = 0;
+  let earliestFailedAt: number | null = null;
   for (const message of candidates) {
-    const beforeCount = boostRewardPaidCountThisMonth(services, message.author.id, message.createdTimestamp);
-    await handleBoostRewardMessage(message, services);
-    const afterCount = boostRewardPaidCountThisMonth(services, message.author.id, message.createdTimestamp);
-    if (afterCount > beforeCount) recovered += 1;
+    try {
+      const beforeCount = boostRewardPaidCountThisMonth(services, message.author.id, message.createdTimestamp);
+      await handleBoostRewardMessage(message, services);
+      const afterCount = boostRewardPaidCountThisMonth(services, message.author.id, message.createdTimestamp);
+      if (afterCount > beforeCount) recovered += 1;
+    } catch (error) {
+      failed += 1;
+      const failedAt = Math.floor(message.createdTimestamp / 1_000);
+      earliestFailedAt = earliestFailedAt === null ? failedAt : Math.min(earliestFailedAt, failedAt);
+      console.error(`[boost] 起動時復旧の個別イベント処理に失敗 message=${message.id}:`, error);
+    }
   }
 
-  // 走査開始時刻までを確認済みにする。走査中に届いたMessageCreateを次回復旧から落とさない。
-  services.settings.set(BOOST_REWARD_LAST_RECOVERY_AT_SETTING, scanStartedAt, "system:boost-recovery");
+  // 全件成功なら走査開始時刻まで進める。個別失敗があれば最古の失敗時刻に留め、
+  // 次回は60秒overlap込みで再試行する。後続イベントは今回すでに処理済みなので冪等に吸収される。
+  const nextWatermark = earliestFailedAt ?? scanStartedAt;
+  services.settings.set(BOOST_REWARD_LAST_RECOVERY_AT_SETTING, nextWatermark, "system:boost-recovery");
   console.info(
-    `[boost] 起動時復旧完了 cutoff=${cutoff} candidates=${candidates.length} newlyPaid=${recovered} watermark=${scanStartedAt}`,
+    `[boost] 起動時復旧完了 cutoff=${cutoff} candidates=${candidates.length} newlyPaid=${recovered} failed=${failed} watermark=${nextWatermark}`,
   );
 }
