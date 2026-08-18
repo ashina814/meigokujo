@@ -159,6 +159,13 @@ function rememberPendingBoostEvent(event: BoostRewardEvent, services: Services):
     throw new Error("ERR_BOOST_EVENT_INVALID");
   }
 
+  const handled = eventAlreadyHandled(services, event.messageId);
+  if (handled) {
+    assertEventIdentity(handled, event);
+    refreshBlockedBoostUser(services, event.userId);
+    return;
+  }
+
   const existing = services.db
     .prepare("SELECT message_id, user_id, event_at_ms FROM boost_reward_pending WHERE message_id = ?")
     .get(event.messageId) as PendingRow | undefined;
@@ -413,7 +420,9 @@ export async function handleBoostRewardMessage(message: Message, services: Servi
   if (!isMainGuildBoost(message, services)) return false;
   const userId = message.author.id;
 
-  if (userId && !message.author.bot) {
+  const startedAt = parseEpochSeconds(services.settings.getString(BOOST_REWARD_STARTED_AT_SETTING));
+  const eventAt = Math.floor(message.createdTimestamp / 1_000);
+  if (userId && !message.author.bot && startedAt !== null && eventAt >= startedAt) {
     rememberPendingBoostEvent(
       { messageId: message.id, userId, eventTimestampMs: message.createdTimestamp },
       services,
@@ -564,7 +573,8 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
       if (!message) break;
 
       const userId = message.author.id;
-      if (userId && !message.author.bot) {
+      const messageEventAt = Math.floor(message.createdTimestamp / 1_000);
+      if (userId && !message.author.bot && messageEventAt >= start.startedAt) {
         rememberPendingBoostEvent(
           { messageId: message.id, userId, eventTimestampMs: message.createdTimestamp },
           services,
