@@ -1,6 +1,7 @@
 import {
   GuildSystemChannelFlags,
   MessageType,
+  PermissionFlagsBits,
   type Client,
   type Message,
 } from "discord.js";
@@ -17,11 +18,14 @@ const JST_OFFSET_MS = 9 * 60 * 60 * 1_000;
 const RECOVERY_OVERLAP_SEC = 60;
 
 type RecoveryState = "idle" | "recovering" | "blocked";
+type BlockedBoostUser = { messageId: string; eventTimestampMs: number };
 
 // 起動時backfill中・復旧失敗後に届いた新着Boostを先払いしないためのプロセス内barrier。
 // 履歴を安全に確認できるまでqueueへ保持し、Discord上の発生時刻順に処理する。
 let recoveryState: RecoveryState = "idle";
 const queuedLiveBoosts = new Map<string, Message>();
+// 個別イベント失敗はuser単位でも保持し、先行イベントが解決するまでそのuserのlive支給を止める。
+const blockedBoostUsers = new Map<string, BlockedBoostUser>();
 
 type CountRow = { c: number };
 type EventRow = {
@@ -323,10 +327,16 @@ async function processBoostRewardMessage(message: Message, services: Services): 
  */
 export async function handleBoostRewardMessage(message: Message, services: Services): Promise<boolean> {
   if (!isMainGuildBoost(message, services)) return false;
-  if (recoveryState !== "idle") {
+  const userId = message.author.id;
+  const userBlocked = Boolean(userId && blockedBoostUsers.has(userId));
+  if (recoveryState !== "idle" || userBlocked) {
     queuedLiveBoosts.set(message.id, message);
-    const reason = recoveryState === "blocked" ? "復旧停止中" : "起動時復旧中";
-    console.info(`[boost] ${reason}の新着イベントを待機 message=${message.id}`);
+    const reason = recoveryState === "blocked"
+      ? "復旧停止中"
+      : recoveryState === "recovering"
+        ? "起動時復旧中"
+        : "同一userの先行イベント未解決";
+    console.info(`[boost] ${reason}の新着イベントを待機 message=${message.id} user=${userId}`);
     return true;
   }
   return processBoostRewardMessage(message, services);
@@ -347,25 +357,36 @@ function takeOldestPending(pending: Map<string, Message>): Message | undefined {
   return oldest;
 }
 
+function isAfterBlocker(message: Message, blocker: BlockedBoostUser): boolean {
+  if (message.id === blocker.messageId) return false;
+  if (message.createdTimestamp !== blocker.eventTimestampMs) {
+    return message.createdTimestamp > blocker.eventTimestampMs;
+  }
+  return message.id.localeCompare(blocker.messageId) > 0;
+}
+
 /**
  * Bot停止中にsystem channelへ届いたBoostメッセージを起動時に回収する。
- * 初回導入時は履歴読取可否だけpreflightし、started_atより前は支払わない。
+ * 初回導入時は履歴読取権限とAPI利用可否をpreflightし、started_atより前は支払わない。
  * 履歴fetch自体が失敗した場合はfail-closedでblockedのままにし、新着もqueueへ保持する。
  */
 export async function initializeBoostRewardRecovery(client: Client, services: Services): Promise<void> {
   const mainGuildId = services.settings.getString("guild:main");
   if (!mainGuildId) {
+    recoveryState = "blocked";
     console.warn("[boost] guild:main が未設定のため自動支給を初期化できません");
     return;
   }
   const guild = client.guilds.cache.get(mainGuildId);
   if (!guild) {
+    recoveryState = "blocked";
     console.warn(`[boost] メインGuildがclient cacheにありません guild=${mainGuildId}`);
     return;
   }
 
   const suppressed = guild.systemChannelFlags.has(GuildSystemChannelFlags.SuppressPremiumSubscriptions);
   if (suppressed) {
+    recoveryState = "blocked";
     console.warn(
       "[boost] Discord側でサーバーブースト通知が抑止されています。自動支給の開始時刻は確定しません。Boost通知を有効にしてから再起動してください。",
     );
@@ -373,20 +394,39 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
   }
   const systemChannel = guild.systemChannel;
   if (!systemChannel) {
+    recoveryState = "blocked";
     console.warn(
       "[boost] Discordのsystem channelが未設定です。自動支給の開始時刻は確定しません。system channelを設定してから再起動してください。",
     );
     return;
   }
 
+  // Discord APIはReadMessageHistory不足時に空結果を返し得るため、fetch結果から権限を推測しない。
+  // 実オブジェクトではpermissionsForが必ず存在する。構造だけのunit-test mockでは未定義を許容する。
+  const permissionsFor = systemChannel.permissionsFor?.bind(systemChannel);
+  if (permissionsFor) {
+    const me = guild.members.me;
+    const permissions = me ? permissionsFor(me) : null;
+    const canView = permissions?.has(PermissionFlagsBits.ViewChannel) ?? false;
+    const canReadHistory = permissions?.has(PermissionFlagsBits.ReadMessageHistory) ?? false;
+    if (!canView || !canReadHistory) {
+      recoveryState = "blocked";
+      console.warn(
+        "[boost] system channelの ViewChannel / ReadMessageHistory 権限が不足しています。開始時刻やwatermarkは更新しません。権限を直してから再起動してください。",
+      );
+      return;
+    }
+  }
+
   const scanStartedAt = Math.floor(Date.now() / 1_000);
   const existingStartedAt = parseEpochSeconds(services.settings.getString(BOOST_REWARD_STARTED_AT_SETTING));
   const pending = new Map<string, Message>();
+  const deferredMessages = new Map<string, Message>();
   recoveryState = "recovering";
 
   try {
-    // 初回導入でも、将来の停止中backfillに必要な履歴読取権限を実際のAPIでpreflightする。
-    // ここで失敗した場合はstarted_at/watermarkを作らず、機能をfail-closedに保つ。
+    // 初回導入でも、将来の停止中backfillに必要な履歴APIが利用できることをpreflightする。
+    // 権限自体は上で明示確認済み。APIエラーならstarted_at/watermarkを作らずfail-closed。
     if (existingStartedAt === null) {
       await systemChannel.messages.fetch({ limit: 1, cache: false });
     }
@@ -419,8 +459,7 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
     let recovered = 0;
     let failed = 0;
     let deferred = 0;
-    let earliestFailedAt: number | null = null;
-    const blockedUsers = new Set<string>();
+    const failedThisPass = new Set<string>();
 
     // fetch中・処理中に届いた新着も毎周回pendingへ合流する。
     // 残り全体から毎回最古を選ぶため、liveイベントが履歴より先に月枠を消費しない。
@@ -433,10 +472,12 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
       if (!message) break;
 
       const userId = message.author.id;
-      if (blockedUsers.has(userId)) {
+      const blocker = blockedBoostUsers.get(userId);
+      if (failedThisPass.has(userId) || (blocker && isAfterBlocker(message, blocker))) {
         deferred += 1;
+        deferredMessages.set(message.id, message);
         console.warn(
-          `[boost] 同一userの先行イベント失敗により後続を次回へ繰越 message=${message.id} user=${userId}`,
+          `[boost] 同一userの先行イベント未解決により後続を次回へ繰越 message=${message.id} user=${userId}`,
         );
         continue;
       }
@@ -446,22 +487,35 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
         await processBoostRewardMessage(message, services);
         const afterCount = boostRewardPaidCountThisMonth(services, userId, message.createdTimestamp);
         if (afterCount > beforeCount) recovered += 1;
+        if (blocker?.messageId === message.id) {
+          blockedBoostUsers.delete(userId);
+          console.info(`[boost] user単位の支給停止を解除 message=${message.id} user=${userId}`);
+        }
       } catch (error) {
         failed += 1;
-        blockedUsers.add(userId);
-        const failedAt = Math.floor(message.createdTimestamp / 1_000);
-        earliestFailedAt = earliestFailedAt === null ? failedAt : Math.min(earliestFailedAt, failedAt);
+        failedThisPass.add(userId);
+        blockedBoostUsers.set(userId, {
+          messageId: message.id,
+          eventTimestampMs: message.createdTimestamp,
+        });
         console.error(`[boost] 起動時復旧の個別イベント処理に失敗 message=${message.id}:`, error);
       }
     }
 
-    // 全件成功なら走査開始時刻まで進める。個別失敗があれば最古の失敗時刻に留め、
-    // 次回は60秒overlap込みで再試行する。成功済み後続はmessage ID冪等性で安全に再確認できる。
-    const nextWatermark = earliestFailedAt ?? scanStartedAt;
+    for (const [id, message] of deferredMessages) queuedLiveBoosts.set(id, message);
+
+    // 未解決userが残る限り、その最古イベント時刻にwatermarkを留める。
+    // 全件解決なら走査開始時刻まで進める。
+    let earliestBlockedAt: number | null = null;
+    for (const blocker of blockedBoostUsers.values()) {
+      const blockedAt = Math.floor(blocker.eventTimestampMs / 1_000);
+      earliestBlockedAt = earliestBlockedAt === null ? blockedAt : Math.min(earliestBlockedAt, blockedAt);
+    }
+    const nextWatermark = earliestBlockedAt ?? scanStartedAt;
     services.settings.set(BOOST_REWARD_LAST_RECOVERY_AT_SETTING, nextWatermark, "system:boost-recovery");
     recoveryState = "idle";
     console.info(
-      `[boost] 起動時復旧完了 cutoff=${cutoff} newlyPaid=${recovered} failed=${failed} deferred=${deferred} watermark=${nextWatermark}`,
+      `[boost] 起動時復旧完了 cutoff=${cutoff} newlyPaid=${recovered} failed=${failed} deferred=${deferred} blockedUsers=${blockedBoostUsers.size} watermark=${nextWatermark}`,
     );
   } catch (error) {
     // 履歴取得・watermark保存など復旧全体の障害時に新着だけ払い始めると、月2回枠の順序が壊れる。
