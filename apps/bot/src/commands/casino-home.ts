@@ -226,43 +226,6 @@ function renderGuide(services: Services) {
   return { embeds: [embed], components: [casinoHomeBackRow()] };
 }
 
-/**
- * 賭場の常設パネル（`/管理 → パネル → マモンの賭場` で設置）。
- *
- * `/賭場` は個人用ホーム。チャンネルに常駐する看板は、基本ゲームや施設へ入る入口として使う。
- * **この1枚は全員が見る**ので個人の残高・福分けの可否・稼働状態は出さない。
- * 状態は押した時点の {@link renderCasinoHome} が最新値を返す。
- */
-/**
- * 常設パネルは「基本ゲーム」と「それ以外の施設」で分ける。
- * 公開1v1・競馬・板は専用パネルへ分離し、この汎用パネルからは開始させない。
- *
- * どちらも**全員が見る1枚**なので、個人の残高・福分けの可否・営業状態は載せない
- * （常設パネルは再投稿時にしか描き直されないキャッシュ済みメッセージなので、
- * 状態を載せると停止中でも「営業中」と出し続けてしまう）。
- */
-export function casinoGamesPanelMessage(_services: Services): MessageCreateOptions {
-  const embed = new EmbedBuilder()
-    .setAuthor({ name: "マモンの賭場" })
-    .setTitle("🎲  遊ぶ")
-    .setColor(C_MAMMON)
-    .setDescription(
-      [
-        "Land を賭けて基本ゲームを遊ぶ場所。",
-        "操作画面は基本的に本人だけに開きますが、**ルーレットだけは30秒間みんなが参加できる公開卓**です。",
-        "",
-        "🎰 スロット / 🎲 丁半 / 📈 クラッシュ / 🎲 チンチロ",
-        "🎡 ルーレット / 🃏 BJ / 🃏 ポーカー / 🃏 ホールデム",
-        "",
-        "-# 公開1v1・競馬・板は、それぞれの専用パネルから行います。",
-      ].join("\n"),
-    );
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId("casino:home:games").setLabel("遊びを選ぶ").setEmoji("🎲").setStyle(ButtonStyle.Primary),
-  );
-  return { embeds: [embed], components: [row] };
-}
-
 /** 賭けない側。商店・通行証・番付・福分け・VIP・流れ星・引き出し */
 export function casinoFacilityPanelMessage(_services: Services): MessageCreateOptions {
   const embed = new EmbedBuilder()
