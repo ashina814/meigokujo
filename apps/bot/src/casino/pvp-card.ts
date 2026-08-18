@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { fmtLd } from "../format.js";
 import { createChallenge, type PvpChallenge } from "./pvp-challenge.js";
 import { pvpGame, type PvpGameKey } from "./pvp-games.js";
+import { takePvpNotifyRoleIds } from "./pvp-notify-throttle.js";
 import { C_MAMMON } from "./ui.js";
 
 export const PVP_ACCEPT = "casino:home:pvpopen-accept";
@@ -61,7 +62,9 @@ export async function postChallenge(input: {
   onExpire: (challenge: PvpChallenge, card: Message) => void | Promise<void>;
 }): Promise<Message> {
   const id = randomUUID();
-  const mentionRoleIds = [...new Set(input.mentionRoleIds ?? [])].filter(Boolean);
+  // 募集そのものは止めず、通知だけをロール単位で 3回 → 5分CD にする。
+  // ここで同期的に枠を消費することで、同時投稿でも3回制限をすり抜けない。
+  const mentionRoleIds = takePvpNotifyRoleIds(input.mentionRoleIds ?? []);
   const payload = challengeCard({ id, challengerId: input.challengerId, game: input.game, bet: input.bet });
   const card = await input.channel.send(
     {
