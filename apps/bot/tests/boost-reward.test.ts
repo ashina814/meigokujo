@@ -256,7 +256,7 @@ describe("サーバーブースト自動報酬", () => {
     expect(s.ledger.balanceOf("user:user-1")).toBe(0);
   });
 
-  it("初回導入は開始時刻を保存し、過去メッセージを遡及走査しない", async () => {
+  it("初回導入は履歴読取だけpreflightし、開始時刻以前を遡及走査しない", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-18T20:00:00+09:00"));
     const s = services();
@@ -264,7 +264,8 @@ describe("サーバーブースト自動報酬", () => {
 
     await initializeBoostRewardRecovery(recoveryClient(fetchMessages), s);
 
-    expect(fetchMessages).not.toHaveBeenCalled();
+    expect(fetchMessages).toHaveBeenCalledOnce();
+    expect(fetchMessages).toHaveBeenCalledWith({ limit: 1, cache: false });
     expect(Number(s.settings.getString(BOOST_REWARD_STARTED_AT_SETTING))).toBe(Math.floor(Date.now() / 1_000));
     expect(Number(s.settings.getString(BOOST_REWARD_LAST_RECOVERY_AT_SETTING))).toBe(Math.floor(Date.now() / 1_000));
   });
@@ -296,7 +297,7 @@ describe("サーバーブースト自動報酬", () => {
     expect(Number(s.settings.getString(BOOST_REWARD_LAST_RECOVERY_AT_SETTING))).toBe(Math.floor(Date.now() / 1_000));
   });
 
-  it("復旧中の1件が失敗しても後続を処理し、watermarkは最古の失敗時刻に留める", async () => {
+  it("復旧中の1件が失敗しても別userの後続を処理し、watermarkは最古の失敗時刻に留める", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-18T20:00:00+09:00"));
     const s = services();
