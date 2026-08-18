@@ -45,7 +45,7 @@ export function casinoPvpPanelMessage(services: Services): MessageCreateOptions 
   const notifyLine =
     roleIds.length > 0
       ? `募集時は ${roleIds.map((id) => `<@&${id}>`).join(" ")} に通知します。1人につき3募集連続まで通知し、その後5分間だけCDに入ります。`
-      : "募集通知ロールは未設定です。運営は `/管理 → 設定 → ロール` から最大5ロールまで設定できます。";
+      : "募集通知ロールは未設定です。運営は `/管理 → 設定 → 機関ロール` から最大5ロールまで設定できます。";
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場" })
     .setTitle("⚔  みんなで勝負")
