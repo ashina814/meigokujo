@@ -5,13 +5,12 @@ import {
   EmbedBuilder,
   type MessageCreateOptions,
 } from "discord.js";
-import { getRoleIds } from "../church-roles.js";
 import { C_MAMMON } from "../casino/ui.js";
 import type { Services } from "../services.js";
 
 /**
  * 常設パネルは「そのチャンネルで何をするか」を一枚で伝える。
- * `/賭場` はどこからでも使える総合入口として残すが、カテゴリ内では用途ごとに分散する。
+ * `/賭場` はどこからでも使える個人用ホームとして残し、公開募集・競馬・板は専用パネルへ分離する。
  */
 export function casinoSoloPanelMessage(_services: Services): MessageCreateOptions {
   const embed = new EmbedBuilder()
@@ -40,12 +39,7 @@ export function casinoSoloPanelMessage(_services: Services): MessageCreateOption
   return { embeds: [embed], components: [row] };
 }
 
-export function casinoPvpPanelMessage(services: Services): MessageCreateOptions {
-  const roleIds = getRoleIds(services, "casino_pvp_notify");
-  const notifyLine =
-    roleIds.length > 0
-      ? `募集時は ${roleIds.map((id) => `<@&${id}>`).join(" ")} に通知します。1人につき3募集連続まで通知し、その後5分間だけCDに入ります。`
-      : "募集通知ロールは未設定です。運営は `/管理 → 設定 → 機関ロール` から最大5ロールまで設定できます。";
+export function casinoPvpPanelMessage(_services: Services): MessageCreateOptions {
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場" })
     .setTitle("⚔  みんなで勝負")
@@ -56,7 +50,7 @@ export function casinoPvpPanelMessage(services: Services): MessageCreateOptions 
         "ゲームと賭け金を決めると、このチャンネルに3分間の募集カードを出します。",
         "最初に「受ける」を押した1人と勝負します。",
         "",
-        notifyLine,
+        "募集時は、運営が設定した募集通知ロールへ通知します。1人につき短時間の3募集まで通知し、その後5分間だけCDに入ります。",
         "-# 通知がCD中でも募集カード自体は通常どおり投稿されます。別の人の募集通知には影響しません。",
         "-# 募集中はLandを預かりません。成立した瞬間に双方を確認して預かります。",
       ].join("\n"),
