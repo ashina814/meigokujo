@@ -66,6 +66,7 @@ export function boostRewardMonthRangeJst(nowMs = Date.now()): { start: number; e
 export function ensureBoostRewardSchema(services: Services): void {
   if (schemaReady.has(services.db)) return;
 
+  // まず表だけを作る。#146初版の旧表が残っている場合、新列を足す前にindexを張ると失敗するため順序を固定する。
   services.db.exec(`
     CREATE TABLE IF NOT EXISTS boost_reward_events (
       message_id TEXT PRIMARY KEY,
@@ -76,8 +77,6 @@ export function ensureBoostRewardSchema(services: Services): void {
       month_key  TEXT,
       created_at INTEGER NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_boost_reward_events_user_month
-      ON boost_reward_events(user_id, month_key, event_at);
   `);
 
   // #146初版をローカルDBで一度動かしていても安全に新列へ収束させる。
@@ -93,6 +92,8 @@ export function ensureBoostRewardSchema(services: Services): void {
        SET event_at = COALESCE(event_at, created_at),
            month_key = COALESCE(month_key, strftime('%Y-%m', COALESCE(event_at, created_at), 'unixepoch', '+9 hours'))
      WHERE event_at IS NULL OR month_key IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_boost_reward_events_user_month
+      ON boost_reward_events(user_id, month_key, event_at);
   `);
 
   services.db.exec(`
@@ -202,7 +203,9 @@ export async function handleBoostRewardMessage(message: Message, services: Servi
   }
 
   ensureBoostRewardSchema(services);
-  const { startedAt } = automationStartedAt(services);
+  // 通常はClientReady初期化で開始時刻が先に入る。もし初期化より先にBoostが届いた場合だけ、
+  // そのBoost自身の発生時刻を開始点にして「最初の1回」を秒境界で落とさない。
+  const { startedAt } = automationStartedAt(services, message.createdTimestamp);
   const eventAt = Math.floor(message.createdTimestamp / 1_000);
   if (eventAt < startedAt) {
     console.info(`[boost] 自動化開始前のイベントをスキップ message=${message.id} eventAt=${eventAt} start=${startedAt}`);
