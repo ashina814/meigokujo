@@ -10,8 +10,8 @@ const DISSOKU_DEFAULT_ID = "761562078095867916";
 const BUMP_CHANNEL_DEFAULT_ID = "1466310307994665000";
 /** 実運用では DISBOARD /bump・ディス速 /up ともに2時間 */
 const COOLDOWN_SEC = { disboard: 2 * 3600, dissoku: 2 * 3600 } as const;
-/** ディス速は応答投稿後にembedを完成させることがあるため、有限回だけ再取得する。 */
-const DISSOKU_RETRY_DELAYS_MS = [1_000, 3_000] as const;
+/** 掲示板Botは応答投稿後にembedを完成させることがあるため、有限回だけ再取得する。 */
+const BUMP_RETRY_DELAYS_MS = [1_000, 3_000, 7_000] as const;
 
 type BumpKind = keyof typeof COOLDOWN_SEC;
 type LegacyInteraction = {
@@ -65,16 +65,17 @@ function reject(message: Message, reason: string): void {
   );
 }
 
-function scheduleDissokuRetry(
+function scheduleBumpRetry(
   message: Message,
   services: Services,
+  kind: BumpKind,
   retryAttempt: number,
 ): void {
-  const delayMs = DISSOKU_RETRY_DELAYS_MS[retryAttempt];
+  const delayMs = BUMP_RETRY_DELAYS_MS[retryAttempt];
   if (delayMs === undefined) return;
 
   console.info(
-    `[bump] ディス速応答の完成待ち message=${message.id} attempt=${retryAttempt + 1} delayMs=${delayMs}`,
+    `[bump] 応答の完成待ち kind=${kind} message=${message.id} attempt=${retryAttempt + 1} delayMs=${delayMs}`,
   );
 
   const timer = setTimeout(() => {
@@ -83,7 +84,7 @@ function scheduleDissokuRetry(
       .then((fresh) => handleBumpMessage(fresh, services, { retryAttempt: retryAttempt + 1 }))
       .catch((error) =>
         console.warn(
-          `[bump] ディス速応答の再取得失敗 message=${message.id} attempt=${retryAttempt + 1}:`,
+          `[bump] 応答の再取得失敗 kind=${kind} message=${message.id} attempt=${retryAttempt + 1}:`,
           error,
         ),
       );
@@ -144,8 +145,8 @@ export async function handleBumpMessage(
     reject(message, explicitFailure ? "failure_response" : "success_text_missing");
 
     const retryAttempt = options.retryAttempt ?? 0;
-    if (isDissoku && !explicitFailure) {
-      scheduleDissokuRetry(message, services, retryAttempt);
+    if (!explicitFailure) {
+      scheduleBumpRetry(message, services, kind, retryAttempt);
     }
     return;
   }
