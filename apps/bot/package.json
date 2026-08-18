@@ -8,6 +8,7 @@
     "start": "tsx src/index.ts",
     "register": "tsx src/register-commands.ts",
     "migrate:timed-access-legacy": "tsx src/migrate-timed-access-legacy.ts",
+    "boost:resolve-pending": "tsx src/resolve-boost-pending.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

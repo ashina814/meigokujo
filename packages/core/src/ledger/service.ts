@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { ensureBoostRewardLedgerSchema } from "./boost-guard.js";
 import { LedgerError } from "./errors.js";
 import { getTxType, type AccountKind } from "./registry.js";
 
@@ -72,6 +73,9 @@ export class Ledger {
     private readonly db: Database.Database,
     options: LedgerOptions = {},
   ) {
+    // reward_boost の月次上限・Discord event紐付けはBot初期化ではなく、
+    // 資金を動かす正本であるLedger境界で必ず有効にする。
+    ensureBoostRewardLedgerSchema(this.db);
     this.approvalThresholdOpt = options.approvalThreshold ?? 1_000_000;
     this.maxAmount = options.maxAmount ?? 100_000_000;
     this.isMinor = options.isMinor ?? (() => false);
