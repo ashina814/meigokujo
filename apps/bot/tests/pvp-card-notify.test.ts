@@ -4,11 +4,13 @@ import {
   postChallenge,
   resetPvpChallengePostLocksForTesting,
 } from "../src/casino/pvp-card.js";
+import { createChallenge, resetChallengesForTesting } from "../src/casino/pvp-challenge.js";
 import { preparePvpNotify, resetPvpNotifyThrottleForTesting } from "../src/casino/pvp-notify-throttle.js";
 
 afterEach(() => {
   resetPvpChallengePostLocksForTesting();
   resetPvpNotifyThrottleForTesting();
+  resetChallengesForTesting();
 });
 
 describe("公開1v1募集の投稿と通知", () => {
@@ -73,5 +75,34 @@ describe("公開1v1募集の投稿と通知", () => {
 
     rejectFirst(new Error("finish test"));
     expect(await first).toBeInstanceOf(Error);
+  });
+
+  it("事前確認後に別募集が成立していても、カードもrole pingも送る前に止める", async () => {
+    createChallenge({
+      id: "existing",
+      challengerId: "alice",
+      game: "bj",
+      bet: 100,
+      channelId: "channel-1",
+      onExpire: () => undefined,
+    });
+    const channel = { send: vi.fn() };
+
+    await expect(
+      postChallenge({
+        channel: channel as never,
+        challengerId: "alice",
+        game: "sashi",
+        bet: 500,
+        mentionRoleIds: ["role-a"],
+        onExpire: () => undefined,
+      }),
+    ).rejects.toThrow("already has an open challenge");
+
+    expect(channel.send).not.toHaveBeenCalled();
+
+    // Discordへ何も送っていないので、通知枠も消費していない。
+    const notify = preparePvpNotify("alice", ["role-a"]);
+    expect(notify).toMatchObject({ roleIds: ["role-a"], status: "sent" });
   });
 });
