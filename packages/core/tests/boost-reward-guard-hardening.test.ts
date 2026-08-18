@@ -62,13 +62,36 @@ describe("reward_boost DB hardening", () => {
     ).toThrow(/ERR_BOOST_EVENT_REQUIRED/);
   });
 
+  it("event_atまたはmonth_keyが欠けたeventではreward_boostを通さない", () => {
+    const { db, ledger } = setup();
+    const now = Math.floor(Date.now() / 1_000);
+    db.prepare(
+      `INSERT INTO boost_reward_events
+         (message_id, user_id, outcome, reward, event_at, month_key, created_at)
+       VALUES ('boost-null-month', 'user-1', 'capped', 0, ?, NULL, ?)`,
+    ).run(now, now);
+
+    expect(() =>
+      ledger.transfer({
+        from: TREASURY,
+        to: "user:user-1",
+        amount: BOOST_REWARD_LD,
+        type: "reward_boost",
+        actor: "test",
+        refType: "discord_boost",
+        refId: "boost-null-month",
+        idempotencyKey: "boost:boost-null-month",
+      }),
+    ).toThrow(/ERR_BOOST_EVENT_REQUIRED/);
+  });
+
   it("triggerの現行versionだけが残る", () => {
     const { db } = setup();
     const triggers = db
       .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'trg_reward_boost_%' ORDER BY name")
       .all() as Array<{ name: string }>;
     expect(triggers.map((row) => row.name)).toEqual([
-      "trg_reward_boost_event_required_v2",
+      "trg_reward_boost_event_required_v3",
       "trg_reward_boost_monthly_limit_v3",
     ]);
   });
