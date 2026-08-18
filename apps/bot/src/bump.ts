@@ -1,5 +1,6 @@
 import type { Message } from "discord.js";
 import { TREASURY } from "@meigokujo/core";
+import { handleBoostRewardMessage } from "./boost-reward.js";
 import { fmtLd } from "./format.js";
 import type { Services } from "./services.js";
 
@@ -93,14 +94,15 @@ function scheduleBumpRetry(
 }
 
 /**
- * bump/up 報酬: 掲示板ボットの成功メッセージを検知して実行者に自動記帳。
- * Bot ID・Guild・Channel・取得可能な実行コマンド・成功文面を検証する。
+ * MessageCreateの経済報酬入口。
+ * 先にサーバーブーストを処理し、それ以外だけbump/up判定へ流す。
  */
 export async function handleBumpMessage(
   message: Message,
   services: Services,
   options: BumpHandleOptions = {},
 ): Promise<void> {
+  if (await handleBoostRewardMessage(message, services)) return;
   if (!message.author.bot) return;
 
   const dissokuId = services.settings.getString("bump_dissoku_bot_id") ?? DISSOKU_DEFAULT_ID;
