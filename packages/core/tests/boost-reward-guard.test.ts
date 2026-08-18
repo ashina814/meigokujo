@@ -54,7 +54,7 @@ describe("reward_boost core guard", () => {
       .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'trg_reward_boost_%' ORDER BY name")
       .all() as Array<{ name: string }>;
     expect(triggers.map((r) => r.name)).toEqual([
-      "trg_reward_boost_event_required_v2",
+      "trg_reward_boost_event_required_v3",
       "trg_reward_boost_monthly_limit_v3",
     ]);
   });
@@ -108,9 +108,9 @@ describe("reward_boost core guard", () => {
   it("旧来のevent無しreward_boost履歴は取引日時のJST月として上限に数える", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-18T20:00:00+09:00"));
-    const { db, ledger } = setup();
+    const { db } = setup();
     // 旧データはtrigger導入前に存在し得るので、履歴互換の状態をraw SQLで再現する。
-    db.exec("DROP TRIGGER trg_reward_boost_event_required_v2; DROP TRIGGER trg_reward_boost_monthly_limit_v3;");
+    db.exec("DROP TRIGGER trg_reward_boost_event_required_v3; DROP TRIGGER trg_reward_boost_monthly_limit_v3;");
     db.prepare(
       `INSERT INTO transactions
          (idempotency_key, from_account, to_account, amount, type, reason,
