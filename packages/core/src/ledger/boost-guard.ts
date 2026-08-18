@@ -13,6 +13,7 @@ export const BOOST_REWARD_MONTHLY_LIMIT = 2;
  * - 支給元は国庫、金額は1回50,000Ldに固定する
  * - 同一ユーザーのJST暦月2回上限をDB triggerで最終保証する
  * - 旧来の手動 `reward_boost` は履歴として残し、event行が無い場合は取引日時のJST月で数える
+ * - 未解決のBoost eventは別tableへ永続化し、Bot再起動後も後続の先払いを防ぐ
  *
  * Bot固有の初期化に依存させない。`Ledger` を使うmaintenance scriptでも、
  * `reward_boost` を発行する前にこのguardが必ず存在することが目的。
@@ -29,6 +30,16 @@ export function ensureBoostRewardLedgerSchema(db: Database.Database): void {
         month_key  TEXT,
         created_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS boost_reward_pending (
+        message_id  TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL,
+        event_at_ms INTEGER NOT NULL,
+        created_at  INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_boost_reward_pending_user_event
+        ON boost_reward_pending(user_id, event_at_ms, message_id);
     `);
 
     // #146のdraft途中をローカルDBで起動していても現行schemaへ収束させる。
