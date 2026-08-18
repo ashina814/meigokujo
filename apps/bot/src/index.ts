@@ -128,10 +128,12 @@ inviteTracker.wire();
 
 client.once(Events.ClientReady, async (ready) => {
   console.log(`⚔️ 冥獄城ボット 起動: ${ready.user.tag}`);
+  // 外部Discord APIへ触る復旧より先に、同期の賭場安全確認を必ず完了させる。
+  // 再起動直後にstatus=openのまま外部I/O待ちになるfail-open窓を作らない。
+  runCasinoRecovery(services);
   await initializeBoostRewardRecovery(ready, services).catch((e) =>
     console.error("[boost] 起動時復旧失敗:", e),
   );
-  runCasinoRecovery(services);
   // 前回のプロセスで払い切れなかった無料スピンを精算する（PR3）。
   // 出目は獲得時に確定・保存してあるので、再起動しても表示も配当も変わらない。
   // 賭場が停止中なら資金グループが作れず失敗するが、権利は pending のまま残る
@@ -270,7 +272,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       return;
     }
-    // 出戻り申請: 戻し先の選択 → 理由モーダル → 確定
     if (interaction.isStringSelectMenu() && interaction.customId === "ret:target") {
       await handleReturnTargetSelect(interaction, services);
       return;
@@ -356,7 +357,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleBakutenSelect(interaction, services);
       return;
     }
-    // 番付の種別切り替え（/賭場 ハブから開いたときも同じ画面で切り替えられる）
     if (interaction.isStringSelectMenu() && interaction.customId === BANZUKE_SELECT_ID) {
       await interaction.update(renderBanzuke(services, interaction.values[0] ?? "balance", interaction.user.id));
       return;
@@ -565,11 +565,9 @@ client.on(Events.MessageCreate, (message) => {
   void handleBoostRewardMessage(message, services).catch((err) => console.error("[boost] 処理失敗:", err));
   void handleBumpMessage(message, services).catch((err) => console.error("[bump] 処理失敗:", err));
   void handleMessageXp(message, services).catch((err) => console.error("[rank] 発言XP付与失敗:", err));
-  // トートの耳: 対応スレッドの運営メッセージを告発者DMへ匿名中継
   void relayStaffMessage(client, services, message).catch((err) => console.error("[mimi] 中継失敗:", err));
 });
 
-// 入城導線: 参加時のロール付与・案内・招待リンク自動検出 + 入退室ログ
 client.on(Events.GuildMemberAdd, (member) => {
   void (async () => {
     const detection = await inviteTracker.detectInvite(member.guild).catch(() => null);
@@ -585,10 +583,7 @@ client.on(Events.GuildMemberAdd, (member) => {
   })().catch((err) => console.error("[entry] 参加処理失敗:", err));
 });
 
-// 退城ログ
 client.on(Events.GuildMemberRemove, (member) => {
-  // 退出の記録。status は変えない（階級は退出で消える性質のものではない）。
-  // 再参加時に案内待ちへ戻すときの参考情報として残す
   if (!member.user?.bot) {
     try {
       services.returns.recordDeparture(member.id);
@@ -601,7 +596,6 @@ client.on(Events.GuildMemberRemove, (member) => {
   );
 });
 
-// 亡霊ロール手動付与検知・性別ロール後付けで招待延長
 client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
   if (oldMember.partial) return;
   void handleMemberRoleUpdate(oldMember, newMember, services).catch((err) =>
@@ -609,7 +603,6 @@ client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
   );
 });
 
-// VC計測（全VC）+ 入城導線の説明会出席記録
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   try {
     trackVoiceState(oldState, newState, services);
