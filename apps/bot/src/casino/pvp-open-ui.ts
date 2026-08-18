@@ -12,6 +12,7 @@ import {
   type ModalSubmitInteraction,
 } from "discord.js";
 import { fmtLd } from "../format.js";
+import { getRoleIds } from "../church-roles.js";
 import type { Services } from "../services.js";
 import { isSeatOccupied, MAX_BET, MIN_BET } from "./common.js";
 import { closeChallengeCard, postChallenge } from "./pvp-card.js";
@@ -205,13 +206,14 @@ async function postPvpChallenge(
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const g = pvpGame(game);
-  let card: Awaited<ReturnType<typeof postChallenge>>;
+  let result: Awaited<ReturnType<typeof postChallenge>>;
   try {
-    card = await postChallenge({
+    result = await postChallenge({
       channel: channel as Parameters<typeof postChallenge>[0]["channel"],
       challengerId: interaction.user.id,
       game,
       bet: amount,
+      mentionRoleIds: getRoleIds(services, "casino_pvp_notify"),
       onExpire: (_challenge, expiredCard) =>
         closeChallengeCard(expiredCard, "⌛ 3分経過したため、この募集は締め切りました。"),
     });
@@ -226,11 +228,18 @@ async function postPvpChallenge(
     return;
   }
 
+  const notifyLine =
+    result.notification === "sent"
+      ? "📣 募集通知を送信しました。"
+      : result.notification === "cooldown"
+        ? "🔕 募集通知は5分CD中です。募集カードのみ公開しました。"
+        : "🔕 募集通知ロールは未設定です。募集カードのみ公開しました。";
+
   // ここまで来たら公開カードと challenge は成立済み。確認用の ephemeral 表示だけが
   // 失敗しても、成功済みの募集を「既存募集エラー」へ誤分類したり閉じたりしない。
   try {
     await interaction.editReply({
-      content: `${g?.emoji ?? "⚔"} **${g?.label ?? game} / ${fmtLd(amount)}** で募集を出しました。3分以内に誰かが受ければ開始します。\n${card.url}`,
+      content: `${g?.emoji ?? "⚔"} **${g?.label ?? game} / ${fmtLd(amount)}** で募集を出しました。3分以内に誰かが受ければ開始します。\n${notifyLine}\n${result.card.url}`,
     });
   } catch (e) {
     console.error("[pvp] 募集開始後の確認表示に失敗:", e);

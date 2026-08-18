@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 /**
  * `/勝負` は 2026-08-17 に利用者向け slash command から退役。
  *
- * 現在の対人入口は `/賭場` → 「みんなで勝負」の公開募集を正本にする。
+ * 現在の公開対人入口は `賭場 · みんなで勝負` 常設パネルを正本にする。
  * 指名対戦を将来追加する可能性はあるため、対人ゲーム本体はこの退役で削除しない。
  */
 describe("退役した /勝負 を再登録しない", () => {
@@ -16,10 +16,10 @@ describe("退役した /勝負 を再登録しない", () => {
     expect(source).not.toContain("shobuCommand.toJSON()");
   });
 
-  it("現在の公開対人入口は /賭場 側に残る", () => {
-    const home = read("../src/commands/casino-home.ts");
-    expect(home).toContain('setCustomId("casino:home:pvp")');
-    expect(home).toContain("みんなで勝負");
+  it("現在の公開対人入口は専用常設パネルにある", () => {
+    const panel = read("../src/commands/casino-dedicated-panels.ts");
+    expect(panel).toContain('setCustomId("casino:home:pvp")');
+    expect(panel).toContain("みんなで勝負");
   });
 
   it("将来の指名対戦で再利用できる対人ゲーム本体は削除しない", () => {

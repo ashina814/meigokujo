@@ -3,7 +3,7 @@ import type { ConfessionType, Disposition } from "@meigokujo/core";
 import type { Services } from "./services.js";
 
 /**
- * 冥教会・他機関ロールの対応付け（運営ボードから設定）。
+ * 機能・機関ロールの対応付け（運営ボードから設定）。
  *
  * 設計方針:
  * - ロール名はコードに固定しない。運営ボードで選んだロールIDを Settings の
@@ -21,6 +21,7 @@ export type RoleSlot =
   | "church_manage" // 冥教会管理（大司教）
   | "normal_ops" // 通常運営（使令など）
   | "room_normal_free" // normal room paid actions become free for holders
+  | "casino_pvp_notify" // みんなで勝負の公開募集通知
   | "kaiwa" // 諧和廷担当
   | "court" // 冥府裁判所担当
   | "emergency" // 緊急対応担当
@@ -41,6 +42,11 @@ export const ROLE_SLOT_META: Record<RoleSlot, { label: string; hint: string; mul
     hint: "通常部屋の有料操作だけを無料にします。特殊部屋には適用しません。",
     multi: true,
   },
+  casino_pvp_notify: {
+    label: "賭場：みんなで勝負 募集通知ロール",
+    hint: "賭場の公開1v1募集専用の通知先。トート・案件管理には使用しません。最大10ロールまで設定可",
+    multi: true,
+  },
   // 諧和廷はトートの対応先から廃止（旧運用）。既存 roles:kaiwa の読み取り用に型としては残すが、UIには出さない
   kaiwa: { label: "諧和廷担当ロール（旧運用・非表示）", hint: "廃止済み", multi: true },
   court: { label: "冥府裁判所担当ロール", hint: "冥府裁判所への送致先", multi: true },
@@ -56,6 +62,7 @@ export const ROLE_SLOT_ORDER: RoleSlot[] = [
   "church_manage",
   "normal_ops",
   "room_normal_free",
+  "casino_pvp_notify",
   "court",
   "emergency",
   "opinion",
@@ -63,6 +70,13 @@ export const ROLE_SLOT_ORDER: RoleSlot[] = [
 ];
 
 const key = (slot: RoleSlot) => `roles:${slot}`;
+const roleLimit = (slot: RoleSlot): number | null => (slot === "casino_pvp_notify" ? 10 : null);
+
+function normalizeRoleIds(slot: RoleSlot, roleIds: string[]): string[] {
+  const unique = [...new Set(roleIds.filter(Boolean))];
+  const limit = roleLimit(slot);
+  return limit === null ? unique : unique.slice(0, limit);
+}
 
 /**
  * スロットに設定されたロールID一覧を返す。
@@ -70,7 +84,7 @@ const key = (slot: RoleSlot) => `roles:${slot}`;
  */
 export function getRoleIds(services: Services, slot: RoleSlot): string[] {
   const list = services.settings.getJson<string[]>(key(slot), []);
-  if (Array.isArray(list) && list.length > 0) return list.filter(Boolean);
+  if (Array.isArray(list) && list.length > 0) return normalizeRoleIds(slot, list);
   // ── フォールバック（新設定が未投入の間だけ）──
   if (slot === "admin") {
     const legacy = services.settings.getString("role:admin");
@@ -89,7 +103,7 @@ export function getRoleIds(services: Services, slot: RoleSlot): string[] {
 
 /** スロットのロールIDを保存（運営ボードから。空配列で解除） */
 export function setRoleIds(services: Services, slot: RoleSlot, roleIds: string[], actor: string): void {
-  services.settings.set(key(slot), roleIds, actor);
+  services.settings.set(key(slot), normalizeRoleIds(slot, roleIds), actor);
 }
 
 /** メンバーがそのスロットのいずれかのロールを持つか */

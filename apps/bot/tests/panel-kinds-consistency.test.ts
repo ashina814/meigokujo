@@ -155,7 +155,9 @@ describe("賭場の常設パネル", () => {
     const stopped = casinoPanelMessage(fakeCasinoServices({ phase: "pre_reset", status: "maintenance" }).services);
     const json = JSON.stringify(formal);
 
-    for (const personal of ["福分け", "所持", "残高", "JP "]) {
+    // 「福分け」は静的な機能名なので公開看板へ書いてよい。利用者ごとの可否・残高だけを出さない。
+    expect(json).toContain("福分け");
+    for (const personal of ["所持", "残高", "JP "]) {
       expect(json, `${personal} が常設パネルに出ている`).not.toContain(personal);
     }
     expect(JSON.stringify(stopped)).toBe(json);
@@ -171,8 +173,9 @@ describe("ゲームパネルと施設パネル", () => {
   });
 
   it("営業状態が変わっても看板本文は変わらない", async () => {
-    const { casinoGamesPanelMessage, casinoFacilityPanelMessage } = await import("../src/commands/casino-home.js");
-    for (const render of [casinoGamesPanelMessage, casinoFacilityPanelMessage]) {
+    const { casinoFacilityPanelMessage } = await import("../src/commands/casino-home.js");
+    const { casinoSoloPanelMessage } = await import("../src/commands/casino-dedicated-panels.js");
+    for (const render of [casinoSoloPanelMessage, casinoFacilityPanelMessage]) {
       const formal = render(fakeCasinoServices({ phase: "formal", status: "open" }).services);
       const stopped = render(fakeCasinoServices({ phase: "pre_reset", status: "maintenance" }).services);
       expect(JSON.stringify(stopped)).toBe(JSON.stringify(formal));
@@ -180,9 +183,10 @@ describe("ゲームパネルと施設パネル", () => {
   });
 
   it("全員が見る1枚なので個人情報を出さない", async () => {
-    const { casinoGamesPanelMessage, casinoFacilityPanelMessage } = await import("../src/commands/casino-home.js");
+    const { casinoFacilityPanelMessage } = await import("../src/commands/casino-home.js");
+    const { casinoSoloPanelMessage } = await import("../src/commands/casino-dedicated-panels.js");
     const { services } = fakeCasinoServices();
-    for (const render of [casinoGamesPanelMessage, casinoFacilityPanelMessage]) {
+    for (const render of [casinoSoloPanelMessage, casinoFacilityPanelMessage]) {
       const json = JSON.stringify(render(services));
       for (const personal of ["所持", "残高", "JP "]) {
         expect(json, personal + " が常設パネルに出ている").not.toContain(personal);
@@ -191,10 +195,11 @@ describe("ゲームパネルと施設パネル", () => {
   });
 
   it("ボタンはすべて賭場ハブへ流れる接頭辞を使う", async () => {
-    const { casinoGamesPanelMessage, casinoFacilityPanelMessage } = await import("../src/commands/casino-home.js");
+    const { casinoFacilityPanelMessage } = await import("../src/commands/casino-home.js");
+    const { casinoSoloPanelMessage } = await import("../src/commands/casino-dedicated-panels.js");
     const { services } = fakeCasinoServices();
     const ids: string[] = [];
-    for (const render of [casinoGamesPanelMessage, casinoFacilityPanelMessage]) {
+    for (const render of [casinoSoloPanelMessage, casinoFacilityPanelMessage]) {
       for (const row of render(services).components ?? []) {
         const json = (row as { toJSON(): { components?: Array<{ custom_id?: string }> } }).toJSON();
         for (const c of json.components ?? []) if (c.custom_id) ids.push(c.custom_id);
@@ -210,7 +215,7 @@ describe("ゲームパネルと施設パネル", () => {
 
   it("競馬・板・VIP・流れ星がコマンドへ突き返す行き止まりに戻っていない", () => {
     const source = readFileSync(new URL("../src/commands/casino-home.ts", import.meta.url), "utf8");
-    // かつては SIDE_GAME_GUIDE が「チャンネルで /競馬 を実行すると発走します」と返すだけだった
+    // かつては SIDE_GAME_GUIDE が「チャンネルで /競馬 を実行してください」と返すだけだった
     expect(source).not.toContain("SIDE_GAME_GUIDE");
     for (const nudge of ["チャンネルで `/競馬`", "チャンネルで `/板", "`/vip` で条件", "`/流れ星` で引けます"]) {
       expect(source, nudge + " という案内が復活している").not.toContain(nudge);

@@ -88,31 +88,30 @@ function component(customId: string): Interaction & { reply: ReturnType<typeof v
 }
 
 describe("/賭場 ホーム", () => {
-  it("賭場機能のすべてへ、ホームから1押しで届く", () => {
+  it("個人用機能へ1押しで届き、公開1v1・競馬・板は専用パネルへ分離する", () => {
     const { embed, rows, buttons } = homeJson(fakeServices());
     expect(embed.author?.name).toContain("冥獄城 · マモンの賭場");
+    expect(embed.description).toContain("公開1v1・競馬・板は専用パネルから");
     // 段は役割ごと。Discord の上限（5段・1段5個）に収まっていること
     expect(rows.length).toBeLessThanOrEqual(5);
     for (const row of rows) expect(row.components.length).toBeLessThanOrEqual(5);
 
-    // 「/賭場 だけ覚えていればいい」を守る。ここが欠けると利用者は
-    // どのコマンドを打てばいいか分からない状態へ戻る
     const ids = buttons.map((b) => b.custom_id);
     for (const required of [
       "casino:home:games",
-      "casino:home:pvp",
       "casino:home:shop",
       "casino:home:passport",
       "casino:home:banzuke",
       "casino:daily:claim",
       "casino:home:first",
       "casino:home:leave",
-      "casino:home:keiba",
-      "casino:home:ita",
       "casino:home:vip",
       "casino:home:hoshi",
     ]) {
       expect(ids).toContain(required);
+    }
+    for (const publicOnly of ["casino:home:pvp", "casino:home:keiba", "casino:home:ita"]) {
+      expect(ids).not.toContain(publicOnly);
     }
     // 同じ機能への入口が重複していないこと
     expect(new Set(ids).size).toBe(ids.length);
