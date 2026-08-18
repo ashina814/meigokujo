@@ -35,10 +35,18 @@ function boostMessage(id: string, timestamp: number, userId = "user-1") {
 }
 
 function recoveryClient(fetchMessages: ReturnType<typeof vi.fn>, options: { suppressed?: boolean; channel?: boolean } = {}) {
-  const systemChannel = options.channel === false ? null : { id: "system-channel", messages: { fetch: fetchMessages } };
+  const systemChannel =
+    options.channel === false
+      ? null
+      : {
+          id: "system-channel",
+          permissionsFor: vi.fn(() => ({ has: vi.fn(() => true) })),
+          messages: { fetch: fetchMessages },
+        };
   const guild = {
     systemChannel,
     systemChannelFlags: { has: vi.fn(() => options.suppressed ?? false) },
+    members: { me: { id: "bot-user" } },
   };
   return { guilds: { cache: new Map([["guild-main", guild]]) } } as any;
 }
