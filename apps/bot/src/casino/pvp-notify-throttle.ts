@@ -25,12 +25,10 @@ export function takePvpNotifyRoleIds(roleIds: string[], now = Date.now()): strin
   const allowed: string[] = [];
 
   for (const roleId of unique) {
-    const previous = states.get(roleId);
-    const current = !previous || now >= previous.cooldownUntil
-      ? { burstCount: 0, cooldownUntil: 0 }
-      : previous;
+    let current = states.get(roleId) ?? { burstCount: 0, cooldownUntil: 0 };
 
     if (current.cooldownUntil > now) continue;
+    if (current.cooldownUntil > 0) current = { burstCount: 0, cooldownUntil: 0 };
 
     allowed.push(roleId);
     const nextCount = current.burstCount + 1;
