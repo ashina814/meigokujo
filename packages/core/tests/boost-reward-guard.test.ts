@@ -56,6 +56,7 @@ describe("reward_boost core guard", () => {
     expect(triggers.map((r) => r.name)).toEqual([
       "trg_reward_boost_event_required_v3",
       "trg_reward_boost_monthly_limit_v3",
+      "trg_reward_boost_pending_order_v1",
     ]);
   });
 
