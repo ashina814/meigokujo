@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { fmtLd } from "../format.js";
 import { createChallenge, type PvpChallenge } from "./pvp-challenge.js";
 import { pvpGame, type PvpGameKey } from "./pvp-games.js";
-import { takePvpNotifyRoleIds } from "./pvp-notify-throttle.js";
+import { preparePvpNotify } from "./pvp-notify-throttle.js";
 import { C_MAMMON } from "./ui.js";
 
 export const PVP_ACCEPT = "casino:home:pvpopen-accept";
@@ -15,6 +15,15 @@ export type PvpChallengePostResult = {
   card: Message;
   notification: PvpRecruitmentNotification;
 };
+
+const activeRecruitmentPosts = new Set<string>();
+
+export class PvpChallengePostInProgressError extends Error {
+  constructor() {
+    super("recruitment post already in progress");
+    this.name = "PvpChallengePostInProgressError";
+  }
+}
 
 /** 公開募集カード。**この時点では資金を1 Ld も動かさない** */
 export function challengeCard(input: { id: string; challengerId: string; game: PvpGameKey; bet: number }) {
@@ -55,10 +64,13 @@ export async function closeChallengeCard(card: Message, text: string): Promise<v
 /**
  * 募集を1件立てる。
  *
- * **ID を先に作って customId へ入れ、`send()` 成功の直後に、次の await を挟まずに
- * `createChallenge()` する。** 逆順やあいだに await があると
- * 「送信に失敗したのに3分タイマーだけ生きている」ゴミや、
- * 「カードは出たが押しても gone」という窓ができる。
+ * **同じ募集者の投稿処理は1件だけ**にして、同時クリックでロール通知や公開カードが
+ * 二重に飛ぶことを防ぐ。ID を先に customId へ入れ、`send()` 成功後は次の await を
+ * 挟まずに通知枠確定 → `createChallenge()` まで進める。
+ *
+ * 通知枠は Discord への送信が成功した時点でのみ消費する。送信自体が失敗した場合は
+ * 3回枠を減らさない。一方、送信後に challenge 登録が失敗した場合は、実際に ping は
+ * 届いているため通知1回として扱う。
  */
 export async function postChallenge(input: {
   channel: TextBasedChannel & { send: (payload: never) => Promise<Message> };
@@ -68,39 +80,52 @@ export async function postChallenge(input: {
   mentionRoleIds?: string[];
   onExpire: (challenge: PvpChallenge, card: Message) => void | Promise<void>;
 }): Promise<PvpChallengePostResult> {
-  const id = randomUUID();
-  const configuredNotify = (input.mentionRoleIds ?? []).some(Boolean);
-  // 募集そのものは止めず、通知だけを募集者単位で 3回 → 5分CD にする。
-  // ここで同期的に枠を消費することで、同時投稿でも3回制限をすり抜けない。
-  const mentionRoleIds = takePvpNotifyRoleIds(input.challengerId, input.mentionRoleIds ?? []);
-  const notification: PvpRecruitmentNotification =
-    mentionRoleIds.length > 0 ? "sent" : configuredNotify ? "cooldown" : "unconfigured";
-  const payload = challengeCard({ id, challengerId: input.challengerId, game: input.game, bet: input.bet });
-  const card = await input.channel.send(
-    {
-      ...payload,
-      ...(mentionRoleIds.length > 0
-        ? {
-            content: mentionRoleIds.map((roleId) => `<@&${roleId}>`).join(" "),
-            allowedMentions: { roles: mentionRoleIds },
-          }
-        : {}),
-    } as never,
-  );
-  try {
-    createChallenge({
-      id,
-      challengerId: input.challengerId,
-      game: input.game,
-      bet: input.bet,
-      channelId: card.channelId,
-      onExpire: (challenge) => input.onExpire(challenge, card),
-    });
-  } catch (e) {
-    // 登録できなかったのにカードだけ公開されている状態を残さない
-    console.error("[pvp] 募集の登録に失敗:", e);
-    await closeChallengeCard(card, "募集を開始できませんでした。").catch(() => undefined);
-    throw e;
+  if (activeRecruitmentPosts.has(input.challengerId)) {
+    throw new PvpChallengePostInProgressError();
   }
-  return { card, notification };
+  activeRecruitmentPosts.add(input.challengerId);
+
+  try {
+    const id = randomUUID();
+    const notify = preparePvpNotify(input.challengerId, input.mentionRoleIds ?? []);
+    const payload = challengeCard({ id, challengerId: input.challengerId, game: input.game, bet: input.bet });
+    const card = await input.channel.send(
+      {
+        ...payload,
+        ...(notify.roleIds.length > 0
+          ? {
+              content: notify.roleIds.map((roleId) => `<@&${roleId}>`).join(" "),
+              allowedMentions: { roles: notify.roleIds },
+            }
+          : {}),
+      } as never,
+    );
+
+    // ここまで来たら通知は実際に Discord へ送られたので、3回枠を確定する。
+    notify.commit();
+
+    try {
+      createChallenge({
+        id,
+        challengerId: input.challengerId,
+        game: input.game,
+        bet: input.bet,
+        channelId: card.channelId,
+        onExpire: (challenge) => input.onExpire(challenge, card),
+      });
+    } catch (e) {
+      // 登録できなかったのにカードだけ公開されている状態を残さない
+      console.error("[pvp] 募集の登録に失敗:", e);
+      await closeChallengeCard(card, "募集を開始できませんでした。").catch(() => undefined);
+      throw e;
+    }
+    return { card, notification: notify.status };
+  } finally {
+    activeRecruitmentPosts.delete(input.challengerId);
+  }
+}
+
+/** テスト間で投稿中ロックを持ち越さないための明示リセット。 */
+export function resetPvpChallengePostLocksForTesting(): void {
+  activeRecruitmentPosts.clear();
 }
