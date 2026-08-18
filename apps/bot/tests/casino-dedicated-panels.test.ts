@@ -35,11 +35,11 @@ describe("賭場の常設パネルを用途別に分離する", () => {
     expect(panels).toContain('setCustomId("casino:home:ita")');
   });
 
-  it("みんなで勝負パネルは設定ロール名を常設メッセージへ焼き込まない", () => {
+  it("みんなで勝負パネルは設定ロール名を焼き込まず、未設定でも嘘にならない", () => {
     const panels = srcOf("../src/commands/casino-dedicated-panels.ts");
     expect(panels).not.toContain("getRoleIds");
     expect(panels).not.toContain("<@&");
-    expect(panels).toContain("運営が設定した募集通知ロールへ通知します");
+    expect(panels).toContain("募集通知ロールが設定されている場合、募集時に通知します");
   });
 });
 
@@ -53,14 +53,15 @@ describe("みんなで勝負の募集ロール通知", () => {
     expect(roles).toContain('"casino_pvp_notify",');
   });
 
-  it("公開募集時に設定ロールを取得し、募集者単位の通知CDを通したIDだけallowedMentionsへ渡す", () => {
+  it("公開募集時に設定ロールを取得し、送信成功時だけ通知枠を確定する", () => {
     const open = srcOf("../src/casino/pvp-open-ui.ts");
     const card = srcOf("../src/casino/pvp-card.ts");
     expect(open).toContain('mentionRoleIds: getRoleIds(services, "casino_pvp_notify")');
     expect(card).toContain("mentionRoleIds?: string[]");
-    expect(card).toContain("takePvpNotifyRoleIds(input.challengerId, input.mentionRoleIds ?? [])");
-    expect(card).toContain("allowedMentions: { roles: mentionRoleIds }");
-    expect(card).toContain('mentionRoleIds.map((roleId) => `<@&${roleId}>`).join(" ")');
+    expect(card).toContain("preparePvpNotify(input.challengerId, input.mentionRoleIds ?? [])");
+    expect(card).toContain("allowedMentions: { roles: notify.roleIds }");
+    expect(card).toContain('notify.roleIds.map((roleId) => `<@&${roleId}>`).join(" ")');
+    expect(card).toContain("notify.commit()");
   });
 
   it("募集者本人へ通知送信・CD・未設定を区別して返す", () => {
