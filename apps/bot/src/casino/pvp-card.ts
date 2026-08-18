@@ -1,7 +1,7 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, type Message, type TextBasedChannel } from "discord.js";
 import { randomUUID } from "node:crypto";
 import { fmtLd } from "../format.js";
-import { createChallenge, type PvpChallenge } from "./pvp-challenge.js";
+import { createChallenge, getOpenChallengeForChallenger, type PvpChallenge } from "./pvp-challenge.js";
 import { pvpGame, type PvpGameKey } from "./pvp-games.js";
 import { preparePvpNotify } from "./pvp-notify-throttle.js";
 import { C_MAMMON } from "./ui.js";
@@ -65,8 +65,12 @@ export async function closeChallengeCard(card: Message, text: string): Promise<v
  * 募集を1件立てる。
  *
  * **同じ募集者の投稿処理は1件だけ**にして、同時クリックでロール通知や公開カードが
- * 二重に飛ぶことを防ぐ。ID を先に customId へ入れ、`send()` 成功後は次の await を
- * 挟まずに通知枠確定 → `createChallenge()` まで進める。
+ * 二重に飛ぶことを防ぐ。さらにロック取得後に open challenge を再確認することで、
+ * 呼び出し側の事前確認後に別の募集が成立した stale race でも、Discord へカードや
+ * ロール通知を送る前に止める。
+ *
+ * ID を先に customId へ入れ、`send()` 成功後は次の await を挟まずに通知枠確定 →
+ * `createChallenge()` まで進める。
  *
  * 通知枠は Discord への送信が成功した時点でのみ消費する。送信自体が失敗した場合は
  * 3回枠を減らさない。一方、送信後に challenge 登録が失敗した場合は、実際に ping は
@@ -86,6 +90,13 @@ export async function postChallenge(input: {
   activeRecruitmentPosts.add(input.challengerId);
 
   try {
+    // 呼び出し側の pvpAvailability() 後には await があるため、その間に同じ利用者の
+    // 別募集が成立し得る。投稿ロックを取った「この瞬間」を正本にして再確認し、
+    // 無効になるカードや role ping を Discord へ一度でも出してから閉じる race を防ぐ。
+    if (getOpenChallengeForChallenger(input.challengerId)) {
+      throw new Error(`Challenger already has an open challenge: ${input.challengerId}`);
+    }
+
     const id = randomUUID();
     const notify = preparePvpNotify(input.challengerId, input.mentionRoleIds ?? []);
     const payload = challengeCard({ id, challengerId: input.challengerId, game: input.game, bet: input.bet });
