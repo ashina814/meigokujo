@@ -46,12 +46,12 @@ describe("みんなで勝負の募集ロール通知", () => {
     expect(roles).toContain('"casino_pvp_notify",');
   });
 
-  it("公開募集時に設定ロールを取得し、通知CDを通したIDだけallowedMentionsへ渡す", () => {
+  it("公開募集時に設定ロールを取得し、募集者単位の通知CDを通したIDだけallowedMentionsへ渡す", () => {
     const open = srcOf("../src/casino/pvp-open-ui.ts");
     const card = srcOf("../src/casino/pvp-card.ts");
     expect(open).toContain('mentionRoleIds: getRoleIds(services, "casino_pvp_notify")');
     expect(card).toContain("mentionRoleIds?: string[]");
-    expect(card).toContain("takePvpNotifyRoleIds(input.mentionRoleIds ?? [])");
+    expect(card).toContain("takePvpNotifyRoleIds(input.challengerId, input.mentionRoleIds ?? [])");
     expect(card).toContain("allowedMentions: { roles: mentionRoleIds }");
     expect(card).toContain('mentionRoleIds.map((roleId) => `<@&${roleId}>`).join(" ")');
   });
