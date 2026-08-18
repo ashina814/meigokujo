@@ -16,11 +16,12 @@ import type { Services } from "../services.js";
 export function casinoSoloPanelMessage(_services: Services): MessageCreateOptions {
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場" })
-    .setTitle("🎲  ひとり遊び")
+    .setTitle("🎲  遊ぶ")
     .setColor(C_MAMMON)
     .setDescription(
       [
-        "マモン相手のゲームを遊ぶ場所。**操作画面は本人だけに開きます。**",
+        "賭場の基本ゲームを遊ぶ場所です。",
+        "操作画面は基本的に本人だけに開きますが、**ルーレットだけは30秒間みんなが参加できる公開卓**です。",
         "",
         "🎰 スロット / 🎲 丁半 / 📈 クラッシュ / 🎲 チンチロ",
         "🎡 ルーレット / 🃏 BJ / 🃏 ポーカー / 🃏 ホールデム",
@@ -43,8 +44,8 @@ export function casinoPvpPanelMessage(services: Services): MessageCreateOptions 
   const roleIds = getRoleIds(services, "casino_pvp_notify");
   const notifyLine =
     roleIds.length > 0
-      ? `募集を出すと ${roleIds.map((id) => `<@&${id}>`).join(" ")} に通知します。`
-      : "募集通知ロールは未設定です。運営は `/管理 → 設定 → ロール` から設定できます。";
+      ? `募集時は ${roleIds.map((id) => `<@&${id}>`).join(" ")} に通知します。各ロールは3回連続まで通知し、その後5分間だけCDに入ります。`
+      : "募集通知ロールは未設定です。運営は `/管理 → 設定 → ロール` から最大5ロールまで設定できます。";
   const embed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場" })
     .setTitle("⚔  みんなで勝負")
@@ -56,6 +57,7 @@ export function casinoPvpPanelMessage(services: Services): MessageCreateOptions 
         "最初に「受ける」を押した1人と勝負します。",
         "",
         notifyLine,
+        "-# 通知がCD中でも募集カード自体は通常どおり投稿されます。",
         "-# 募集中はLandを預かりません。成立した瞬間に双方を確認して預かります。",
       ].join("\n"),
     );
