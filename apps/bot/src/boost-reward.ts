@@ -35,6 +35,11 @@ type EventRow = {
   event_at: number;
   month_key: string;
 };
+type PendingRow = {
+  message_id: string;
+  user_id: string;
+  event_at_ms: number;
+};
 
 export interface BoostRewardEvent {
   /** DiscordのGuildBoost system message ID。支払い冪等性の正本。 */
@@ -106,6 +111,75 @@ function eventAlreadyHandled(services: Services, messageId: string): EventRow | 
     .get(messageId) as EventRow | undefined;
 }
 
+function pendingEventForUser(services: Services, userId: string): PendingRow | undefined {
+  return services.db
+    .prepare(
+      `SELECT message_id, user_id, event_at_ms
+         FROM boost_reward_pending
+        WHERE user_id = ?
+        ORDER BY event_at_ms, message_id
+        LIMIT 1`,
+    )
+    .get(userId) as PendingRow | undefined;
+}
+
+function refreshBlockedBoostUser(services: Services, userId: string): void {
+  const pending = pendingEventForUser(services, userId);
+  if (!pending) {
+    blockedBoostUsers.delete(userId);
+    return;
+  }
+  blockedBoostUsers.set(userId, {
+    messageId: pending.message_id,
+    eventTimestampMs: pending.event_at_ms,
+  });
+}
+
+function restoreBlockedBoostUsers(services: Services): void {
+  blockedBoostUsers.clear();
+  const rows = services.db
+    .prepare(
+      `SELECT message_id, user_id, event_at_ms
+         FROM boost_reward_pending
+        ORDER BY user_id, event_at_ms, message_id`,
+    )
+    .all() as PendingRow[];
+  for (const row of rows) {
+    if (blockedBoostUsers.has(row.user_id)) continue;
+    blockedBoostUsers.set(row.user_id, {
+      messageId: row.message_id,
+      eventTimestampMs: row.event_at_ms,
+    });
+  }
+}
+
+function rememberPendingBoostEvent(event: BoostRewardEvent, services: Services): void {
+  if (!event.messageId.trim() || !event.userId.trim()) throw new Error("ERR_BOOST_EVENT_INVALID");
+  if (!Number.isSafeInteger(event.eventTimestampMs) || event.eventTimestampMs <= 0) {
+    throw new Error("ERR_BOOST_EVENT_INVALID");
+  }
+
+  const existing = services.db
+    .prepare("SELECT message_id, user_id, event_at_ms FROM boost_reward_pending WHERE message_id = ?")
+    .get(event.messageId) as PendingRow | undefined;
+  if (existing) {
+    if (existing.user_id !== event.userId || existing.event_at_ms !== event.eventTimestampMs) {
+      throw new Error(
+        `ERR_BOOST_PENDING_CONFLICT message=${event.messageId} ` +
+          `stored=${existing.user_id}/${existing.event_at_ms} incoming=${event.userId}/${event.eventTimestampMs}`,
+      );
+    }
+  } else {
+    services.db
+      .prepare(
+        `INSERT INTO boost_reward_pending (message_id, user_id, event_at_ms, created_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(event.messageId, event.userId, event.eventTimestampMs, Math.floor(Date.now() / 1_000));
+  }
+  refreshBlockedBoostUser(services, event.userId);
+}
+
 function assertEventIdentity(existing: EventRow, event: BoostRewardEvent): void {
   const eventAt = Math.floor(event.eventTimestampMs / 1_000);
   const monthKey = boostRewardMonthKeyJst(event.eventTimestampMs);
@@ -156,6 +230,7 @@ function assertPriorBoostTransaction(
 /**
  * 1つのDiscord Boost eventをLand台帳へ適用する唯一の内部経路。
  * event行の仮記録 → 月次判定 → 送金 → paid確定を同一IMMEDIATE transactionで閉じる。
+ * 成功時は同じtransactionでpendingも消し、再起動後のblockerを必ず解放する。
  */
 function applyBoostRewardEvent(
   event: BoostRewardEvent,
@@ -172,14 +247,19 @@ function applyBoostRewardEvent(
   const monthKey = boostRewardMonthKeyJst(event.eventTimestampMs);
 
   const apply = services.db.transaction((): BoostRewardApplyResult => {
+    const clearPending = (): void => {
+      services.db.prepare("DELETE FROM boost_reward_pending WHERE message_id = ?").run(event.messageId);
+    };
+
     const existing = eventAlreadyHandled(services, event.messageId);
     if (existing) {
       assertEventIdentity(existing, event);
+      clearPending();
       return { kind: "already" };
     }
 
     // DB triggerがDiscord eventとの結び付きを要求するため、送金より先にeventを仮記録する。
-    // transactionが失敗すればこの行もrollbackされる。
+    // transactionが失敗すればこの行もrollbackされるが、外側のpending行は残る。
     services.db
       .prepare(
         `INSERT INTO boost_reward_events
@@ -196,11 +276,13 @@ function applyBoostRewardEvent(
       services.db
         .prepare("UPDATE boost_reward_events SET outcome = 'paid', reward = ? WHERE message_id = ?")
         .run(prior.amount, event.messageId);
+      clearPending();
       return { kind: "recovered" };
     }
 
     const paidCount = paidCountForMonth(services, event.userId, monthKey);
     if (paidCount >= BOOST_REWARD_MONTHLY_LIMIT) {
+      clearPending();
       return { kind: "capped", count: paidCount };
     }
 
@@ -221,12 +303,15 @@ function applyBoostRewardEvent(
     services.db
       .prepare("UPDATE boost_reward_events SET outcome = 'paid', reward = ? WHERE message_id = ?")
       .run(BOOST_REWARD_LD, event.messageId);
+    clearPending();
 
     if (result.duplicate) return { kind: "recovered" };
     return { kind: "paid", count: paidCount + 1 };
   });
 
-  return apply.immediate();
+  const result = apply.immediate();
+  refreshBlockedBoostUser(services, event.userId);
+  return result;
 }
 
 /**
@@ -246,6 +331,7 @@ export function recordManualBoostCompensation(
   if (Math.floor(event.eventTimestampMs / 1_000) < startedAt) {
     throw new Error("ERR_BOOST_BEFORE_AUTOMATION");
   }
+  rememberPendingBoostEvent(event, services);
   return applyBoostRewardEvent(event, services, actor);
 }
 
@@ -283,11 +369,9 @@ async function processBoostRewardMessage(message: Message, services: Services): 
     return true;
   }
 
-  const result = applyBoostRewardEvent(
-    { messageId: message.id, userId, eventTimestampMs: message.createdTimestamp },
-    services,
-    "system:boost",
-  );
+  const event = { messageId: message.id, userId, eventTimestampMs: message.createdTimestamp };
+  rememberPendingBoostEvent(event, services);
+  const result = applyBoostRewardEvent(event, services, "system:boost");
   const monthKey = boostRewardMonthKeyJst(message.createdTimestamp);
 
   if (result.kind === "already") {
@@ -328,8 +412,17 @@ async function processBoostRewardMessage(message: Message, services: Services): 
 export async function handleBoostRewardMessage(message: Message, services: Services): Promise<boolean> {
   if (!isMainGuildBoost(message, services)) return false;
   const userId = message.author.id;
-  const userBlocked = Boolean(userId && blockedBoostUsers.has(userId));
-  if (recoveryState !== "idle" || userBlocked) {
+
+  if (userId && !message.author.bot) {
+    rememberPendingBoostEvent(
+      { messageId: message.id, userId, eventTimestampMs: message.createdTimestamp },
+      services,
+    );
+  }
+
+  const blocker = userId ? blockedBoostUsers.get(userId) : undefined;
+  const blockedByEarlier = Boolean(blocker && isAfterBlocker(message, blocker));
+  if (recoveryState !== "idle" || blockedByEarlier) {
     queuedLiveBoosts.set(message.id, message);
     const reason = recoveryState === "blocked"
       ? "復旧停止中"
@@ -371,6 +464,8 @@ function isAfterBlocker(message: Message, blocker: BlockedBoostUser): boolean {
  * 履歴fetch自体が失敗した場合はfail-closedでblockedのままにし、新着もqueueへ保持する。
  */
 export async function initializeBoostRewardRecovery(client: Client, services: Services): Promise<void> {
+  restoreBlockedBoostUsers(services);
+
   const mainGuildId = services.settings.getString("guild:main");
   if (!mainGuildId) {
     recoveryState = "blocked";
@@ -469,6 +564,13 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
       if (!message) break;
 
       const userId = message.author.id;
+      if (userId && !message.author.bot) {
+        rememberPendingBoostEvent(
+          { messageId: message.id, userId, eventTimestampMs: message.createdTimestamp },
+          services,
+        );
+      }
+
       const blocker = blockedBoostUsers.get(userId);
       if (failedThisPass.has(userId) || (blocker && isAfterBlocker(message, blocker))) {
         deferred += 1;
@@ -485,8 +587,10 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
         const afterCount = boostRewardPaidCountThisMonth(services, userId, message.createdTimestamp);
         if (afterCount > beforeCount) recovered += 1;
         if (blocker?.messageId === message.id) {
-          blockedBoostUsers.delete(userId);
-          console.info(`[boost] user単位の支給停止を解除 message=${message.id} user=${userId}`);
+          const nextBlocker = blockedBoostUsers.get(userId);
+          if (!nextBlocker || nextBlocker.messageId !== message.id) {
+            console.info(`[boost] user単位の支給停止を更新 message=${message.id} user=${userId}`);
+          }
         }
       } catch (error) {
         failed += 1;
