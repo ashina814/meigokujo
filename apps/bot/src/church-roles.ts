@@ -44,7 +44,7 @@ export const ROLE_SLOT_META: Record<RoleSlot, { label: string; hint: string; mul
   },
   casino_pvp_notify: {
     label: "みんなで勝負 募集通知ロール",
-    hint: "公開1v1の募集カードで通知するロール。最大5ロールまで設定可",
+    hint: "公開1v1の募集カードで通知するロール。最大10ロールまで設定可",
     multi: true,
   },
   // 諧和廷はトートの対応先から廃止（旧運用）。既存 roles:kaiwa の読み取り用に型としては残すが、UIには出さない
@@ -70,7 +70,7 @@ export const ROLE_SLOT_ORDER: RoleSlot[] = [
 ];
 
 const key = (slot: RoleSlot) => `roles:${slot}`;
-const roleLimit = (slot: RoleSlot): number | null => (slot === "casino_pvp_notify" ? 5 : null);
+const roleLimit = (slot: RoleSlot): number | null => (slot === "casino_pvp_notify" ? 10 : null);
 
 function normalizeRoleIds(slot: RoleSlot, roleIds: string[]): string[] {
   const unique = [...new Set(roleIds.filter(Boolean))];
