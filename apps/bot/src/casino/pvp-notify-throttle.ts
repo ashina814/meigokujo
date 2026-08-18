@@ -12,34 +12,31 @@ const states = new Map<string, NotifyState>();
 /**
  * 公開1v1募集で実際にメンションしてよいロールだけを返す。
  *
- * - 同一ロールは3回連続まで通知する。
- * - 3回目の通知後、そのロールだけ5分間CDに入る。
+ * - 通知回数は募集者ユーザー単位で数える。
+ * - 同一ユーザーは3募集連続まで通知する。
+ * - 3回目の通知後、そのユーザーだけ5分間CDに入る。
  * - CD中も募集カード自体は通常どおり投稿する。
- * - 複数ロールはロールごとに独立して数える。
+ * - 別ユーザーの募集通知は影響を受けない。
  * - 設定ミスや旧データがあっても、1募集あたり最大5ロールまでに制限する。
  *
  * 5分だけの荒らし抑止なので状態はプロセス内に持つ。再起動時にはリセットされる。
  */
-export function takePvpNotifyRoleIds(roleIds: string[], now = Date.now()): string[] {
+export function takePvpNotifyRoleIds(challengerId: string, roleIds: string[], now = Date.now()): string[] {
   const unique = [...new Set(roleIds.filter(Boolean))].slice(0, PVP_NOTIFY_MAX_ROLES);
-  const allowed: string[] = [];
+  if (unique.length === 0) return [];
 
-  for (const roleId of unique) {
-    let current = states.get(roleId) ?? { burstCount: 0, cooldownUntil: 0 };
+  let current = states.get(challengerId) ?? { burstCount: 0, cooldownUntil: 0 };
+  if (current.cooldownUntil > now) return [];
+  if (current.cooldownUntil > 0) current = { burstCount: 0, cooldownUntil: 0 };
 
-    if (current.cooldownUntil > now) continue;
-    if (current.cooldownUntil > 0) current = { burstCount: 0, cooldownUntil: 0 };
-
-    allowed.push(roleId);
-    const nextCount = current.burstCount + 1;
-    if (nextCount >= PVP_NOTIFY_BURST_LIMIT) {
-      states.set(roleId, { burstCount: 0, cooldownUntil: now + PVP_NOTIFY_COOLDOWN_MS });
-    } else {
-      states.set(roleId, { burstCount: nextCount, cooldownUntil: 0 });
-    }
+  const nextCount = current.burstCount + 1;
+  if (nextCount >= PVP_NOTIFY_BURST_LIMIT) {
+    states.set(challengerId, { burstCount: 0, cooldownUntil: now + PVP_NOTIFY_COOLDOWN_MS });
+  } else {
+    states.set(challengerId, { burstCount: nextCount, cooldownUntil: 0 });
   }
 
-  return allowed;
+  return unique;
 }
 
 /** テスト間でプロセス内CDを持ち越さないための明示リセット。 */
