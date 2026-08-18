@@ -3,7 +3,7 @@ import type { ConfessionType, Disposition } from "@meigokujo/core";
 import type { Services } from "./services.js";
 
 /**
- * 冥教会・他機関ロールの対応付け（運営ボードから設定）。
+ * 機能・機関ロールの対応付け（運営ボードから設定）。
  *
  * 設計方針:
  * - ロール名はコードに固定しない。運営ボードで選んだロールIDを Settings の
@@ -43,8 +43,8 @@ export const ROLE_SLOT_META: Record<RoleSlot, { label: string; hint: string; mul
     multi: true,
   },
   casino_pvp_notify: {
-    label: "みんなで勝負 募集通知ロール",
-    hint: "公開1v1の募集カードで通知するロール。最大10ロールまで設定可",
+    label: "賭場：みんなで勝負 募集通知ロール",
+    hint: "賭場の公開1v1募集専用の通知先。トート・案件管理には使用しません。最大10ロールまで設定可",
     multi: true,
   },
   // 諧和廷はトートの対応先から廃止（旧運用）。既存 roles:kaiwa の読み取り用に型としては残すが、UIには出さない
