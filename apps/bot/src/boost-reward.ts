@@ -16,9 +16,11 @@ export const BOOST_REWARD_LAST_RECOVERY_AT_SETTING = "boost_reward:last_recovery
 const JST_OFFSET_MS = 9 * 60 * 60 * 1_000;
 const RECOVERY_OVERLAP_SEC = 60;
 
-// 起動時backfill中に届いた新着Boostを先払いしないためのプロセス内barrier。
-// 履歴候補と合流させ、Discord上の発生時刻順に処理する。
-let recoveryInProgress = false;
+type RecoveryState = "idle" | "recovering" | "blocked";
+
+// 起動時backfill中・復旧失敗後に届いた新着Boostを先払いしないためのプロセス内barrier。
+// 履歴を安全に確認できるまでqueueへ保持し、Discord上の発生時刻順に処理する。
+let recoveryState: RecoveryState = "idle";
 const queuedLiveBoosts = new Map<string, Message>();
 
 type CountRow = { c: number };
@@ -317,13 +319,14 @@ async function processBoostRewardMessage(message: Message, services: Services): 
 
 /**
  * DiscordのGUILD_BOOSTシステムメッセージを正本として自動支給する。
- * 起動時復旧中の新着は即時支給せずqueueし、停止中の履歴と時系列順に合流させる。
+ * 起動時復旧中・復旧失敗後の新着は即時支給せずqueueし、履歴と時系列順に合流させる。
  */
 export async function handleBoostRewardMessage(message: Message, services: Services): Promise<boolean> {
   if (!isMainGuildBoost(message, services)) return false;
-  if (recoveryInProgress) {
+  if (recoveryState !== "idle") {
     queuedLiveBoosts.set(message.id, message);
-    console.info(`[boost] 起動時復旧中の新着イベントを待機 message=${message.id}`);
+    const reason = recoveryState === "blocked" ? "復旧停止中" : "起動時復旧中";
+    console.info(`[boost] ${reason}の新着イベントを待機 message=${message.id}`);
     return true;
   }
   return processBoostRewardMessage(message, services);
@@ -346,7 +349,8 @@ function takeOldestPending(pending: Map<string, Message>): Message | undefined {
 
 /**
  * Bot停止中にsystem channelへ届いたBoostメッセージを起動時に回収する。
- * 初回導入時はstarted_atを「今」に固定して走査しないため、既存ブースターへの遡及支給は起きない。
+ * 初回導入時は履歴読取可否だけpreflightし、started_atより前は支払わない。
+ * 履歴fetch自体が失敗した場合はfail-closedでblockedのままにし、新着もqueueへ保持する。
  */
 export async function initializeBoostRewardRecovery(client: Client, services: Services): Promise<void> {
   const mainGuildId = services.settings.getString("guild:main");
@@ -376,36 +380,47 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
   }
 
   const scanStartedAt = Math.floor(Date.now() / 1_000);
-  const start = automationStartedAt(services, scanStartedAt * 1_000);
-  if (start.created) return;
-
-  const lastRecoveryAt =
-    parseEpochSeconds(services.settings.getString(BOOST_REWARD_LAST_RECOVERY_AT_SETTING)) ?? start.startedAt;
-  const cutoff = Math.max(start.startedAt, lastRecoveryAt - RECOVERY_OVERLAP_SEC);
+  const existingStartedAt = parseEpochSeconds(services.settings.getString(BOOST_REWARD_STARTED_AT_SETTING));
   const pending = new Map<string, Message>();
+  recoveryState = "recovering";
 
-  recoveryInProgress = true;
   try {
-    let before: string | undefined;
-    for (;;) {
-      const batch = await systemChannel.messages.fetch({ limit: 100, before, cache: false });
-      if (batch.size === 0) break;
+    // 初回導入でも、将来の停止中backfillに必要な履歴読取権限を実際のAPIでpreflightする。
+    // ここで失敗した場合はstarted_at/watermarkを作らず、機能をfail-closedに保つ。
+    if (existingStartedAt === null) {
+      await systemChannel.messages.fetch({ limit: 1, cache: false });
+    }
 
-      let oldest: Message | undefined;
-      for (const message of batch.values()) {
-        if (!oldest || message.createdTimestamp < oldest.createdTimestamp) oldest = message;
-        const createdAt = Math.floor(message.createdTimestamp / 1_000);
-        if (createdAt < cutoff || createdAt < start.startedAt || createdAt > scanStartedAt) continue;
-        if (message.type === MessageType.GuildBoost) pending.set(message.id, message);
+    const start = automationStartedAt(services, scanStartedAt * 1_000);
+    const lastRecoveryAt =
+      parseEpochSeconds(services.settings.getString(BOOST_REWARD_LAST_RECOVERY_AT_SETTING)) ?? start.startedAt;
+    const cutoff = Math.max(start.startedAt, lastRecoveryAt - RECOVERY_OVERLAP_SEC);
+
+    // 初回は過去分を遡及走査しない。2回目以降のみwatermarkから履歴を回収する。
+    if (!start.created) {
+      let before: string | undefined;
+      for (;;) {
+        const batch = await systemChannel.messages.fetch({ limit: 100, before, cache: false });
+        if (batch.size === 0) break;
+
+        let oldest: Message | undefined;
+        for (const message of batch.values()) {
+          if (!oldest || message.createdTimestamp < oldest.createdTimestamp) oldest = message;
+          const createdAt = Math.floor(message.createdTimestamp / 1_000);
+          if (createdAt < cutoff || createdAt < start.startedAt || createdAt > scanStartedAt) continue;
+          if (message.type === MessageType.GuildBoost) pending.set(message.id, message);
+        }
+
+        if (!oldest || Math.floor(oldest.createdTimestamp / 1_000) < cutoff || batch.size < 100) break;
+        before = oldest.id;
       }
-
-      if (!oldest || Math.floor(oldest.createdTimestamp / 1_000) < cutoff || batch.size < 100) break;
-      before = oldest.id;
     }
 
     let recovered = 0;
     let failed = 0;
+    let deferred = 0;
     let earliestFailedAt: number | null = null;
+    const blockedUsers = new Set<string>();
 
     // fetch中・処理中に届いた新着も毎周回pendingへ合流する。
     // 残り全体から毎回最古を選ぶため、liveイベントが履歴より先に月枠を消費しない。
@@ -417,13 +432,23 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
       const message = takeOldestPending(pending);
       if (!message) break;
 
+      const userId = message.author.id;
+      if (blockedUsers.has(userId)) {
+        deferred += 1;
+        console.warn(
+          `[boost] 同一userの先行イベント失敗により後続を次回へ繰越 message=${message.id} user=${userId}`,
+        );
+        continue;
+      }
+
       try {
-        const beforeCount = boostRewardPaidCountThisMonth(services, message.author.id, message.createdTimestamp);
+        const beforeCount = boostRewardPaidCountThisMonth(services, userId, message.createdTimestamp);
         await processBoostRewardMessage(message, services);
-        const afterCount = boostRewardPaidCountThisMonth(services, message.author.id, message.createdTimestamp);
+        const afterCount = boostRewardPaidCountThisMonth(services, userId, message.createdTimestamp);
         if (afterCount > beforeCount) recovered += 1;
       } catch (error) {
         failed += 1;
+        blockedUsers.add(userId);
         const failedAt = Math.floor(message.createdTimestamp / 1_000);
         earliestFailedAt = earliestFailedAt === null ? failedAt : Math.min(earliestFailedAt, failedAt);
         console.error(`[boost] 起動時復旧の個別イベント処理に失敗 message=${message.id}:`, error);
@@ -431,13 +456,18 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
     }
 
     // 全件成功なら走査開始時刻まで進める。個別失敗があれば最古の失敗時刻に留め、
-    // 次回は60秒overlap込みで再試行する。scan開始後のlive分は次回も冪等に再確認できる。
+    // 次回は60秒overlap込みで再試行する。成功済み後続はmessage ID冪等性で安全に再確認できる。
     const nextWatermark = earliestFailedAt ?? scanStartedAt;
     services.settings.set(BOOST_REWARD_LAST_RECOVERY_AT_SETTING, nextWatermark, "system:boost-recovery");
+    recoveryState = "idle";
     console.info(
-      `[boost] 起動時復旧完了 cutoff=${cutoff} newlyPaid=${recovered} failed=${failed} watermark=${nextWatermark}`,
+      `[boost] 起動時復旧完了 cutoff=${cutoff} newlyPaid=${recovered} failed=${failed} deferred=${deferred} watermark=${nextWatermark}`,
     );
-  } finally {
-    recoveryInProgress = false;
+  } catch (error) {
+    // 履歴取得・watermark保存など復旧全体の障害時に新着だけ払い始めると、月2回枠の順序が壊れる。
+    // blockedのままqueueを保持し、再起動または明示的な再初期化で履歴確認が成功するまで支給しない。
+    recoveryState = "blocked";
+    console.error("[boost] 起動時復旧を安全停止しました。新着Boostはqueueへ保持します:", error);
+    throw error;
   }
 }
