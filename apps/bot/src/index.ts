@@ -90,6 +90,7 @@ import { handleFiscalButton } from "./commands/fiscal.js";
 import { handleHelpCommand } from "./commands/help.js";
 import { handleRoomButton, handleRecruitModal, handleRoomRenameModal, handleRoomVoiceUpdate } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
+import { handleBoostRewardMessage, initializeBoostRewardRecovery } from "./boost-reward.js";
 import { handleMessageXp, tickVoiceXp } from "./rank-tracker.js";
 import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
@@ -127,6 +128,9 @@ inviteTracker.wire();
 
 client.once(Events.ClientReady, async (ready) => {
   console.log(`⚔️ 冥獄城ボット 起動: ${ready.user.tag}`);
+  await initializeBoostRewardRecovery(ready, services).catch((e) =>
+    console.error("[boost] 起動時復旧失敗:", e),
+  );
   runCasinoRecovery(services);
   // 前回のプロセスで払い切れなかった無料スピンを精算する（PR3）。
   // 出目は獲得時に確定・保存してあるので、再起動しても表示も配当も変わらない。
@@ -553,11 +557,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// パネル自動再掲（UX原則8）+ bump/up 検知
+// パネル自動再掲（UX原則8）+ boost/bump/up 検知
 client.on(Events.MessageCreate, (message) => {
   void maybeRepostPanel(message, services).catch((err) =>
     console.error("[panel] 再掲失敗:", err),
   );
+  void handleBoostRewardMessage(message, services).catch((err) => console.error("[boost] 処理失敗:", err));
   void handleBumpMessage(message, services).catch((err) => console.error("[bump] 処理失敗:", err));
   void handleMessageXp(message, services).catch((err) => console.error("[rank] 発言XP付与失敗:", err));
   // トートの耳: 対応スレッドの運営メッセージを告発者DMへ匿名中継
