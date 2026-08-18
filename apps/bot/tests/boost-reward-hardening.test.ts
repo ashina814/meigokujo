@@ -75,6 +75,61 @@ describe("サーバーブースト報酬 hardening", () => {
     expect(s.settings.getString(BOOST_REWARD_LAST_RECOVERY_AT_SETTING)).toBeUndefined();
   });
 
+  it("初回の履歴preflightに失敗したら開始時刻を確定せず、成功した再初期化でだけ開始する", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-18T20:00:00+09:00"));
+    const s = services();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const failedFetch = vi.fn(async () => {
+      throw new Error("Missing Access");
+    });
+
+    await expect(initializeBoostRewardRecovery(recoveryClient(failedFetch), s)).rejects.toThrow(/Missing Access/);
+    expect(s.settings.getString(BOOST_REWARD_STARTED_AT_SETTING)).toBeUndefined();
+    expect(s.settings.getString(BOOST_REWARD_LAST_RECOVERY_AT_SETTING)).toBeUndefined();
+
+    const successfulFetch = vi.fn(async () => new Map());
+    await initializeBoostRewardRecovery(recoveryClient(successfulFetch), s);
+    expect(successfulFetch).toHaveBeenCalledOnce();
+    expect(Number(s.settings.getString(BOOST_REWARD_STARTED_AT_SETTING))).toBe(Math.floor(Date.now() / 1_000));
+    expect(Number(s.settings.getString(BOOST_REWARD_LAST_RECOVERY_AT_SETTING))).toBe(Math.floor(Date.now() / 1_000));
+  });
+
+  it("履歴fetch自体が失敗したらliveを先払いせずblockedでqueue保持し、再初期化成功後に処理する", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-18T20:00:00+09:00"));
+    const s = services();
+    const started = Math.floor(new Date("2026-08-18T18:00:00+09:00").getTime() / 1_000);
+    s.settings.set(BOOST_REWARD_STARTED_AT_SETTING, started, "test");
+    s.settings.set(BOOST_REWARD_LAST_RECOVERY_AT_SETTING, started, "test");
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    let rejectFetch!: (reason?: unknown) => void;
+    const firstFetch = new Promise<Map<string, any>>((_, reject) => {
+      rejectFetch = reject;
+    });
+    const fetchMessages = vi.fn(() => firstFetch);
+    const recovery = initializeBoostRewardRecovery(recoveryClient(fetchMessages), s);
+
+    const c = boostMessage("boost-c", new Date("2026-08-18T20:00:01+09:00").getTime());
+    expect(await handleBoostRewardMessage(c.value, s)).toBe(true);
+    expect(s.ledger.balanceOf("user:user-1")).toBe(0);
+
+    rejectFetch(new Error("temporary history failure"));
+    await expect(recovery).rejects.toThrow(/temporary history failure/);
+
+    const d = boostMessage("boost-d", new Date("2026-08-18T20:00:02+09:00").getTime());
+    expect(await handleBoostRewardMessage(d.value, s)).toBe(true);
+    expect(s.ledger.balanceOf("user:user-1")).toBe(0);
+
+    const retryFetch = vi.fn(async () => new Map());
+    await initializeBoostRewardRecovery(recoveryClient(retryFetch), s);
+
+    expect(s.ledger.balanceOf("user:user-1")).toBe(BOOST_REWARD_LD * 2);
+    expect(c.send).toHaveBeenCalledOnce();
+    expect(d.send).toHaveBeenCalledOnce();
+  });
+
   it("停止中A/Bのbackfill中に新着Cが来てもA/Bを先に支給してCを上限扱いにする", async () => {
     vi.useFakeTimers();
     const now = new Date("2026-08-18T20:00:00+09:00");
@@ -95,7 +150,6 @@ describe("サーバーブースト報酬 hardening", () => {
     const fetchMessages = vi.fn(() => firstFetch);
 
     const recovery = initializeBoostRewardRecovery(recoveryClient(fetchMessages), s);
-    // initializeBoostRewardRecoveryは最初のfetchでawaitしている。この間のlive Cはqueueへ入る。
     expect(await handleBoostRewardMessage(c.value, s)).toBe(true);
     expect(s.ledger.balanceOf("user:user-1")).toBe(0);
 
@@ -116,6 +170,40 @@ describe("サーバーブースト報酬 hardening", () => {
       { message_id: "boost-b", outcome: "paid" },
       { message_id: "boost-c", outcome: "capped" },
     ]);
+  });
+
+  it("同一userの先行Boostが失敗したらそのuserの後続だけ繰越し、別userは処理を続ける", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-18T20:00:00+09:00"));
+    const s = services();
+    const started = Math.floor(new Date("2026-08-18T18:00:00+09:00").getTime() / 1_000);
+    s.settings.set(BOOST_REWARD_STARTED_AT_SETTING, started, "test");
+    s.settings.set(BOOST_REWARD_LAST_RECOVERY_AT_SETTING, started, "test");
+    s.ledger.ensureAccount("user:user-bad", "user");
+    s.ledger.setAccountStatus("user:user-bad", "frozen");
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const failedAtMs = new Date("2026-08-18T19:00:00+09:00").getTime();
+    const firstBad = boostMessage("bad-a", failedAtMs, "user-bad");
+    const secondBad = boostMessage("bad-b", new Date("2026-08-18T19:05:00+09:00").getTime(), "user-bad");
+    const good = boostMessage("good-a", new Date("2026-08-18T19:10:00+09:00").getTime(), "user-good");
+    const fetchMessages = vi.fn(async () =>
+      new Map([
+        [good.value.id, good.value],
+        [secondBad.value.id, secondBad.value],
+        [firstBad.value.id, firstBad.value],
+      ]),
+    );
+
+    await initializeBoostRewardRecovery(recoveryClient(fetchMessages), s);
+
+    expect(s.ledger.balanceOf("user:user-bad")).toBe(0);
+    expect(s.ledger.balanceOf("user:user-good")).toBe(BOOST_REWARD_LD);
+    expect(
+      (s.db.prepare("SELECT COUNT(*) AS c FROM boost_reward_events WHERE message_id = 'bad-b'").get() as { c: number }).c,
+    ).toBe(0);
+    expect(Number(s.settings.getString(BOOST_REWARD_LAST_RECOVERY_AT_SETTING))).toBe(Math.floor(failedAtMs / 1_000));
   });
 
   it("同一message IDを別userとして再入力したらconflictで止める", async () => {
@@ -152,7 +240,7 @@ describe("サーバーブースト報酬 hardening", () => {
     s.ledger.ensureAccount("user:user-1", "user");
 
     // draft途中の壊れた既存行をraw SQLで再現する。
-    s.db.exec("DROP TRIGGER trg_reward_boost_event_required_v2; DROP TRIGGER trg_reward_boost_monthly_limit_v3;");
+    s.db.exec("DROP TRIGGER trg_reward_boost_event_required_v3; DROP TRIGGER trg_reward_boost_monthly_limit_v3;");
     s.db.prepare(
       `INSERT INTO transactions
          (idempotency_key, from_account, to_account, amount, type, reason,
