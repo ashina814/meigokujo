@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./casino/remittance": "./src/casino/remittance.ts",
-    "./evaluation/forum": "./src/evaluation/forum.ts"
+    "./evaluation/forum": "./src/evaluation/forum.ts",
+    "./ledger/boost-reward": "./src/ledger/boost-guard.ts"
   },
   "scripts": {
     "test": "vitest run && vitest run --config vitest.serial.config.ts",
