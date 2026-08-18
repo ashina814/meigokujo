@@ -29,6 +29,10 @@ function services(opts: { balance?: number; riskMax?: number; holdings?: number;
         holdings: () => opts.holdings ?? 40_000,
       },
       escrow: { holdAll },
+      settings: {
+        getJson: (_key: string, fallback: unknown) => fallback,
+        getString: () => undefined,
+      },
     } as never,
   };
 }
