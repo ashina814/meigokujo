@@ -402,20 +402,17 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
   }
 
   // Discord APIはReadMessageHistory不足時に空結果を返し得るため、fetch結果から権限を推測しない。
-  // 実オブジェクトではpermissionsForが必ず存在する。構造だけのunit-test mockでは未定義を許容する。
-  const permissionsFor = systemChannel.permissionsFor?.bind(systemChannel);
-  if (permissionsFor) {
-    const me = guild.members.me;
-    const permissions = me ? permissionsFor(me) : null;
-    const canView = permissions?.has(PermissionFlagsBits.ViewChannel) ?? false;
-    const canReadHistory = permissions?.has(PermissionFlagsBits.ReadMessageHistory) ?? false;
-    if (!canView || !canReadHistory) {
-      recoveryState = "blocked";
-      console.warn(
-        "[boost] system channelの ViewChannel / ReadMessageHistory 権限が不足しています。開始時刻やwatermarkは更新しません。権限を直してから再起動してください。",
-      );
-      return;
-    }
+  // 実運用ではpermissionsForとguild.members.meの両方が取れなければ安全側へ倒す。
+  const me = guild.members.me;
+  const permissions = me ? systemChannel.permissionsFor(me) : null;
+  const canView = permissions?.has(PermissionFlagsBits.ViewChannel) ?? false;
+  const canReadHistory = permissions?.has(PermissionFlagsBits.ReadMessageHistory) ?? false;
+  if (!me || !permissions || !canView || !canReadHistory) {
+    recoveryState = "blocked";
+    console.warn(
+      "[boost] system channelの ViewChannel / ReadMessageHistory 権限を確認できないか不足しています。開始時刻やwatermarkは更新しません。権限を直してから再起動してください。",
+    );
+    return;
   }
 
   const scanStartedAt = Math.floor(Date.now() / 1_000);
@@ -494,10 +491,18 @@ export async function initializeBoostRewardRecovery(client: Client, services: Se
       } catch (error) {
         failed += 1;
         failedThisPass.add(userId);
-        blockedBoostUsers.set(userId, {
-          messageId: message.id,
-          eventTimestampMs: message.createdTimestamp,
-        });
+        const previousBlocker = blockedBoostUsers.get(userId);
+        if (
+          !previousBlocker ||
+          message.createdTimestamp < previousBlocker.eventTimestampMs ||
+          (message.createdTimestamp === previousBlocker.eventTimestampMs &&
+            message.id.localeCompare(previousBlocker.messageId) < 0)
+        ) {
+          blockedBoostUsers.set(userId, {
+            messageId: message.id,
+            eventTimestampMs: message.createdTimestamp,
+          });
+        }
         console.error(`[boost] 起動時復旧の個別イベント処理に失敗 message=${message.id}:`, error);
       }
     }
