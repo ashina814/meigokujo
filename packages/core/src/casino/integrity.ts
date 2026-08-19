@@ -86,16 +86,20 @@ interface ChipPoolTxRule {
 /**
  * 内側から預入・返還を起こしてよい業務グループの種別。
  *
- * **call-site 監査の結果をそのまま写したもの**（2026-08-11）。ここに無い種別の中で
+ * **call-site 監査の結果をそのまま写したもの**。ここに無い種別の中で
  * Land が動いていたら、設計外の経路なので検算Bで止める。
  * - `shop` … 賭場商店の購入で不足分を自動預入（`shop:buy:*`）
- * - `table_hold` … ランク卓の着席で不足分を自動預入（`ranked:join:*`）
+ * - `table_hold` … 卓の着席・funded escrow で不足分を自動預入
+ * - `vip` … VIP加入・更新の支払いで不足分を自動預入
+ * - `market_bet` … 通常板の作成・賭けで不足分を自動預入
  * - `remittance` … 月次納付。胴元チップを精算してLandへ戻す
  * - `bailout` … 補填。Landを胴元チップへ replenish する
  *
+ * `table_hold` のうち複数人を一括徴収する funded holdAll は outer actor が
+ * `system:escrow` になるため、下の専用監査で正規 wrapper と参加者明細まで照合する。
  * 新しい入れ子を作るときは、ここへ足すことが設計判断の記録になる。
  */
-const NESTED_CHIP_GROUP_KINDS = new Set(["shop", "table_hold", "remittance", "bailout"]);
+const NESTED_CHIP_GROUP_KINDS = new Set(["shop", "table_hold", "vip", "market_bet", "remittance", "bailout"]);
 
 /** `user:123` と `123` を同じ人として比べる（グループの actor 表記が経路で揺れている） */
 function principalOf(actor: string): string {
@@ -450,10 +454,11 @@ export class CasinoIntegrity {
     const nested = detail.op_key !== detail.group_key;
     if (nested) {
       if (!NESTED_CHIP_GROUP_KINDS.has(group.kind)) return `group_kind_not_nestable:${group.kind}`;
-      // 利用者の資金は、その利用者の業務操作の中でしか動かせない
-      // （`user:` の有無は呼び出し側で揺れているため、principal を揃えて比べる）
+      // 利用者の資金は、その利用者の業務操作の中でしか動かせない。
+      // funded holdAll だけは複数人を一つの atomic group に包むため outer actor が system:escrow。
+      // その場合も wrapper 名だけでは信用せず、同じ group 内の正規預託明細まで照合する。
       if (rule.actor === "user" && principalOf(group.actor_id) !== principalOf(row.actor_id)) {
-        return "group_actor_mismatch";
+        if (!this.isFundedHoldAllAutoDeposit(row, detail, group, rule)) return "group_actor_mismatch";
       }
     } else {
       if (group.kind !== rule.groupKind) return "group_kind_mismatch";
@@ -464,6 +469,53 @@ export class CasinoIntegrity {
     // ここが崩れているなら、明細かグループのどちらかが後から書き換えられている
     if (detail.actor_id !== group.actor_id) return "chip_tx_actor_mismatch";
     return null;
+  }
+
+  /**
+   * funded escrow の holdAll で発生した自動預入だけを、system actor の例外として認める。
+   *
+   * `wallet:escrow:hold_all:*` は複数参加者を一つの SQLite transaction にまとめるため
+   * outer actor が `system:escrow`。一方、Land→chip の操作主体は各 user のままなので、
+   * 通常の「outer actor = user」規則だけでは正規取引を誤検知する。
+   *
+   * 例外は次をすべて満たす場合だけ:
+   * - user の chip_deposit
+   * - kind=table_hold / actor=system:escrow
+   * - 正式な funded holdAll wrapper key
+   * - 同じ group・同じ opening_version に、その user から `escrow:session:<session_id>` へ
+   *   「卓への預託」した internal_transfer が厳密に1件存在する
+   * - 預託額は自動預入額以上（不足分だけ Land から補うため）
+   *
+   * これにより `system:escrow` を名乗るだけの偽 group は通さない。
+   */
+  private isFundedHoldAllAutoDeposit(
+    row: PoolTxRow,
+    detail: ChipTxDetailRow,
+    group: ChipGroupAuditRow,
+    rule: ChipPoolTxRule,
+  ): boolean {
+    if (rule.actor !== "user" || row.type !== "chip_deposit") return false;
+    if (group.kind !== "table_hold" || group.actor_id !== "system:escrow") return false;
+    if (!detail.group_key.startsWith("wallet:escrow:hold_all:")) return false;
+    if (!row.ref_id) return false;
+
+    const witness = this.db
+      .prepare(
+        `SELECT COUNT(*) AS c
+           FROM casino_tx
+          WHERE group_key = ?
+            AND tx_kind = 'internal_transfer'
+            AND from_holder = ?
+            AND session_id IS NOT NULL
+            AND session_id != ''
+            AND to_holder = 'escrow:session:' || session_id
+            AND reason = '卓への預託'
+            AND opening_version = ?
+            AND amount >= ?
+            AND actor_id = ?`,
+      )
+      .get(detail.group_key, row.ref_id, detail.opening_version, row.amount, group.actor_id) as { c: number };
+    return witness.c === 1;
   }
 
   checkC(): CasinoCheckResult {
