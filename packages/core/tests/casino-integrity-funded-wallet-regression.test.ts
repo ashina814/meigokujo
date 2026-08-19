@@ -53,6 +53,17 @@ function fundSystem(ctx: Ctx, accountId: string, land: number, key: string): voi
   });
 }
 
+function fundedHoldAllResult(sessionId: string, participants: readonly string[], amount: number, game: string) {
+  return {
+    kind: "holdAll" as const,
+    sessionId,
+    participants: [...participants].sort(),
+    amount,
+    game,
+    ok: true as const,
+  };
+}
+
 const checkB = (ctx: Ctx) => ctx.integrity.checkB();
 const notes = (ctx: Ctx) => checkB(ctx).mismatches.map((m) => m.note);
 
@@ -80,16 +91,21 @@ describe("CasinoIntegrity funded wallet regression", () => {
     ctx.db.close();
   });
 
-  it("funded holdAll の system:escrow wrapper は参加者の正規預託明細があれば説明できる", () => {
+  it("funded holdAll の system:escrow wrapper は保存済み契約と参加者の正規預託明細があれば説明できる", () => {
     const ctx = setup();
     fundUser(ctx, "alice", 2_000);
     fundUser(ctx, "bob", 2_000);
 
-    const groupKey = "wallet:escrow:hold_all:pvpopen:test-session:collect";
+    const sessionId = "pvpopen:test-session";
+    const participants = ["alice", "bob"];
+    const amount = 2_000;
+    const game = "pvp";
+    const groupKey = `wallet:escrow:hold_all:${sessionId}:collect`;
     ctx.chips.runGroup({ groupKey, kind: "table_hold", actorId: "system:escrow" }, () => {
-      ctx.chipFlow.ensureFreeChips("alice", 2_000, "walletautofund1001");
-      ctx.chipFlow.ensureFreeChips("bob", 2_000, "walletautofund1002");
-      expect(ctx.escrow.holdAll("pvpopen:test-session", ["alice", "bob"], 2_000, "pvp", "collect")).toBe(true);
+      ctx.chipFlow.ensureFreeChips("alice", amount, "walletautofund1001");
+      ctx.chipFlow.ensureFreeChips("bob", amount, "walletautofund1002");
+      expect(ctx.escrow.holdAll(sessionId, participants, amount, game, "collect")).toBe(true);
+      return fundedHoldAllResult(sessionId, participants, amount, game);
     });
 
     expect(checkB(ctx).ok).toBe(true);
@@ -107,13 +123,14 @@ describe("CasinoIntegrity funded wallet regression", () => {
         game: "pvp",
         sessionId: "pvpopen:test-session",
       });
+      return fundedHoldAllResult("pvpopen:test-session", ["alice"], 2_000, "pvp");
     });
 
     expect(notes(ctx)).toContain("group_actor_mismatch");
     ctx.db.close();
   });
 
-  it("正しい holdAll prefix でも参加者の預託明細が無ければ許可しない", () => {
+  it("正しい holdAll prefix と契約があっても参加者の預託明細が無ければ許可しない", () => {
     const ctx = setup();
     fundUser(ctx, "alice", 2_000);
 
@@ -121,6 +138,7 @@ describe("CasinoIntegrity funded wallet regression", () => {
       { groupKey: "wallet:escrow:hold_all:pvpopen:test-session:collect", kind: "table_hold", actorId: "system:escrow" },
       () => {
         ctx.chipFlow.ensureFreeChips("alice", 2_000, "walletautofund3001");
+        return fundedHoldAllResult("pvpopen:test-session", ["alice"], 2_000, "pvp");
       },
     );
 
@@ -128,21 +146,19 @@ describe("CasinoIntegrity funded wallet regression", () => {
     ctx.db.close();
   });
 
-  it("holdAll wrapper の session と預託明細の session が違えば許可しない", () => {
+  it("同じ文字列の holdAll key を別の session/operation 分解に見せかけても許可しない", () => {
     const ctx = setup();
     fundUser(ctx, "alice", 2_000);
 
-    ctx.chips.runGroup(
-      { groupKey: "wallet:escrow:hold_all:pvpopen:session-a:collect", kind: "table_hold", actorId: "system:escrow" },
-      () => {
-        ctx.chipFlow.ensureFreeChips("alice", 2_000, "walletautofund4001");
-        ctx.chips.transfer("alice", "escrow:session:pvpopen:session-b", 2_000, {
-          reason: "卓への預託",
-          game: "pvp",
-          sessionId: "pvpopen:session-b",
-        });
-      },
-    );
+    // outer key は次の2通りに文字列上は分解できる:
+    // - session=pvpopen:session-a / operation=collect（保存済み契約が主張）
+    // - session=pvpopen / operation=session-a:collect（実際の内側 holdAll）
+    const groupKey = "wallet:escrow:hold_all:pvpopen:session-a:collect";
+    ctx.chips.runGroup({ groupKey, kind: "table_hold", actorId: "system:escrow" }, () => {
+      ctx.chipFlow.ensureFreeChips("alice", 2_000, "walletautofund4001");
+      expect(ctx.escrow.holdAll("pvpopen", ["alice"], 2_000, "pvp", "session-a:collect")).toBe(true);
+      return fundedHoldAllResult("pvpopen:session-a", ["alice"], 2_000, "pvp");
+    });
 
     expect(notes(ctx)).toContain("group_actor_mismatch");
     ctx.db.close();
