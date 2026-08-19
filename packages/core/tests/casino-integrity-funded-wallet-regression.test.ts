@@ -40,6 +40,19 @@ function fundUser(ctx: Ctx, userId: string, land: number): void {
   });
 }
 
+function fundSystem(ctx: Ctx, accountId: string, land: number, key: string): void {
+  ctx.ledger.ensureAccount(accountId, "system");
+  ctx.ledger.transfer({
+    from: TREASURY,
+    to: accountId,
+    amount: land,
+    type: "adjust",
+    actor: "test",
+    approvedBy: "test",
+    idempotencyKey: key,
+  });
+}
+
 const checkB = (ctx: Ctx) => ctx.integrity.checkB();
 const notes = (ctx: Ctx) => checkB(ctx).mismatches.map((m) => m.note);
 
@@ -124,6 +137,24 @@ describe("CasinoIntegrity funded wallet regression", () => {
     });
 
     expect(notes(ctx)).toContain("group_actor_mismatch");
+    ctx.db.close();
+  });
+
+  it("VIP / market_bet は user chip_deposit 以外の Land 経路を nested 許可しない", () => {
+    const ctx = setup();
+    fundSystem(ctx, "sys:test:casino", 2_000, "seed:sys:test:casino");
+
+    ctx.chips.runGroup({ groupKey: "vip:alice:system-fund", kind: "vip", actorId: "alice" }, () => {
+      ctx.chips.fundFromAccount("sys:test:casino", 1_000, HOUSE_HOLDER, "nested:vip:fund");
+    });
+    expect(notes(ctx)).toContain("group_kind_not_nestable:vip");
+
+    // market_bet でも system settlement を混ぜれば同様に拒否する。
+    ctx.chips.runGroup({ groupKey: "market:bet:1:bob:system-settle", kind: "market_bet", actorId: "bob" }, () => {
+      ctx.chips.redeemToAccount(HOUSE_HOLDER, 500, "sys:test:casino", "system:ether", "nested:market:settle");
+    });
+    expect(notes(ctx)).toContain("group_kind_not_nestable:market_bet");
+
     ctx.db.close();
   });
 });
