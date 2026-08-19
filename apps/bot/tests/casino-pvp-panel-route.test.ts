@@ -35,7 +35,7 @@ function customIds(payload: unknown): string[] {
 }
 
 describe("みんなで勝負 専用パネルの実ルート", () => {
-  it("専用パネル → ゲーム選択 → 賭け金選択まで同じhandlerで到達できる", async () => {
+  it("専用パネル → ゲーム選択 → 賭け金選択まで到達でき、個人ホームへ抜けない", async () => {
     const s = services();
     const first = interaction("casino:home:pvp");
 
@@ -44,7 +44,9 @@ describe("みんなで勝負 専用パネルの実ルート", () => {
     expect(first.reply).toHaveBeenCalledTimes(1);
     const firstPayload = first.reply.mock.calls[0]![0];
     expect((firstPayload as { flags?: number }).flags).toBe(MessageFlags.Ephemeral);
-    const gameId = customIds(firstPayload).find((id) => id.startsWith("casino:home:pvpopen-game:"));
+    const firstIds = customIds(firstPayload);
+    expect(firstIds).not.toContain("casino:home:back");
+    const gameId = firstIds.find((id) => id.startsWith("casino:home:pvpopen-game:"));
     expect(gameId).toBeTruthy();
 
     const second = interaction(gameId!);
@@ -54,5 +56,6 @@ describe("みんなで勝負 専用パネルの実ルート", () => {
     const amountIds = customIds(second.reply.mock.calls[0]![0]);
     expect(amountIds.some((id) => id.startsWith("casino:home:pvpopen-post:"))).toBe(true);
     expect(amountIds.some((id) => id.startsWith("casino:home:pvpopen-custom:"))).toBe(true);
+    expect(amountIds).not.toContain("casino:home:back");
   });
 });
