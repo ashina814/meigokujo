@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { PVP_ACCEPT, PVP_CANCEL } from "../src/casino/pvp-card.js";
-import { PVP_CUSTOM_PREFIX, PVP_GAME_PREFIX, PVP_POST_PREFIX } from "../src/casino/pvp-open-ui.js";
+import { PVP_BACK_CUSTOM_ID, PVP_CUSTOM_PREFIX, PVP_GAME_PREFIX, PVP_POST_PREFIX } from "../src/casino/pvp-open-ui.js";
 import { handlePvpCardButton, isPvpCardButton } from "../src/casino/pvp-route.js";
 import { isCasinoInteraction } from "../src/casino/gate.js";
 
@@ -51,8 +51,9 @@ function deps(overrides: Partial<Parameters<typeof handlePvpCardButton>[2]> = {}
 }
 
 describe("公開募集カードの route", () => {
-  it("ゲーム選択からaccept/cancelまでを同じ賭場ホーム経路で認識する", () => {
+  it("ゲーム選択から専用戻り・accept/cancelまでを同じ公開PvP routeで認識する", () => {
     expect(isPvpCardButton("casino:home:pvp")).toBe(true);
+    expect(isPvpCardButton(PVP_BACK_CUSTOM_ID)).toBe(true);
     expect(isPvpCardButton(`${PVP_GAME_PREFIX}chinchiro`)).toBe(true);
     expect(isPvpCardButton(`${PVP_POST_PREFIX}chinchiro:500`)).toBe(true);
     expect(isPvpCardButton(`${PVP_CUSTOM_PREFIX}chinchiro`)).toBe(true);
@@ -111,7 +112,7 @@ describe("公開募集カードの route", () => {
     expect(d.value.closeCard).toHaveBeenCalledTimes(1);
   });
 
-  it("停止中 gate は accept/post/custom を止めるが cancel と閲覧だけは通す", () => {
+  it("停止中 gate は accept/post/custom を止めるが cancel・閲覧・専用戻りは通す", () => {
     const guarded = [
       `${PVP_ACCEPT}:c1`,
       `${PVP_POST_PREFIX}chinchiro:500`,
@@ -120,6 +121,7 @@ describe("公開募集カードの route", () => {
     const unguarded = [
       `${PVP_CANCEL}:c1`,
       "casino:home:pvp",
+      PVP_BACK_CUSTOM_ID,
       `${PVP_GAME_PREFIX}chinchiro`,
     ].map((customId) => ({ isChatInputCommand: () => false, customId }) as never);
 
