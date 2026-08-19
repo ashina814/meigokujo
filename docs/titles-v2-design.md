@@ -41,8 +41,8 @@ OK: 誰もいない場所から始まる印があるらしい
 - `calledFrom`: 本番入口
 - `kind`: `history | counter`
 - `privacy`: `safe | restricted | forbidden`
-- `orderable`: 達成時刻を復元できるか
-- `epochPolicy`: カタログ施行境界の切り方
+- `orderable`: source全体で達成時刻を正確に復元できるか
+- `epochPolicy`: カタログ施行境界の切り方。counterはbaseline metric名もここで固定する
 - `rawUnit`: DBの1行が何を意味するか
 
 sourceは一気に登録せず、writer/caller/境界を実コードで検証できたものだけ追加する。
@@ -53,16 +53,32 @@ sourceは一気に登録せず、writer/caller/境界を実コードで検証で
 
 したがって `COUNT(vc_segments)` を「VC入室回数」と読んではいけない。raw unitは **voice state segment**。
 
+さらに `closeAllDangling()` はクラッシュ等で実退出時刻が分からないsegmentを「開始 + 上限（既定6時間）」で補正する。そのためraw `vc_segments` 全体は `orderable: false` とする。正確な時刻を保証できる行動は、後続のderived sourceで別契約にして `orderable: true` を持たせる。
+
 ## 4. SYSTEM_EPOCH / CATALOG_EPOCH
 
-- `SYSTEM_EPOCH`: v2称号世界そのものの開始点。一度だけ。
+- `SYSTEM_EPOCH`: v2称号世界そのものの開始点。一度だけ `title_system_state` に確定し、その後は動かさない。
 - `CATALOG_EPOCH`: 第I期・第II期など、その称号群を数え始める起点。
 
 counter sourceはカタログ施行時点の値をbaselineとして保存し、`現在値 - baseline` で判定する。
 
-baseline snapshotとcatalog epoch確定は**同じ `BEGIN IMMEDIATE` transaction**で行う。snapshot中にBUMP等が増えて境界がずれる窓を作らない。
+### baselineは呼び出し側に作らせない
 
-第II期を追加しても、第I期から継続する称号は第I期の起点を使い続け、累積をリセットしない。
+`applyCatalog()` の呼び出し側へ任意のbaseline配列を渡させない。Store自身が `TITLE_SOURCES` に登録された**すべての利用可能なcounter baseline source**を列挙し、sourceごとの正規snapshotterで全ユーザーを取得する。
+
+これにより、次をAPI上できなくする。
+
+- 一部ユーザーだけsnapshotし忘れる
+- `count` を `coutn` と書くなどmetric名を間違える
+- 0件だったのか、snapshot自体を忘れたのか分からなくなる
+
+`title_source_baseline_runs` に `(catalog, source, metric, row_count, captured_at)` を残し、0行でも「snapshotを実行した」という施行証跡を持つ。
+
+baseline snapshot・SYSTEM_EPOCH初回確定・CATALOG_EPOCH確定は**同じ `BEGIN IMMEDIATE` transaction**で行う。snapshot中にBUMP等が増えて境界がずれる窓を作らない。
+
+`applyCatalog()` は外側transaction内から呼ばせない。better-sqlite3のnested transactionでは内側がsavepointになり `BEGIN IMMEDIATE` の保証が弱まるため、`db.inTransaction` ならfail-closedする。
+
+CATALOG_EPOCHは過去方向へ巻き戻せない。第II期を追加しても、第I期から継続する称号は第I期の起点を使い続け、累積をリセットしない。
 
 ## 5. Award
 
@@ -88,6 +104,8 @@ catalog:v1
 
 reconcile時刻を `earned_at` として捏造しない。取得順は `earned_at` が正確に分かる称号だけ出す。
 
+`earned_at > awarded_at` は意味矛盾なので、runtimeとDB `CHECK` の両方で拒否する。
+
 ## 6. 即時判定 + reconcile
 
 - 行動直後の即時判定: トロフィー体験のための速い経路。
@@ -109,7 +127,7 @@ reconcile時刻を `earned_at` として捏造しない。取得順は `earned_a
 active    通常。取得可・装備可
 seasonal  期間限定。通常完遂の分母外
 retired   新規取得不可。既得者は保持・装備可
- disabled 秘匿事故等。強制非表示・装備不可
+disabled  秘匿事故等。強制非表示・装備不可
 ```
 
 - 全クリ称号は**カタログ版単位**にする。
@@ -165,7 +183,11 @@ v2カタログは `v2.*` 名前空間を使う。
 
 「日」「月」「夜」「日次」の意味づけは **Asia/Tokyo（JST）固定**。DBはunix秒で保存する。
 
-## 14. PR分割
+## 14. 公開API
+
+v2基盤は `@meigokujo/core/titles/v2` を公開入口にする。後続のBot実装がcore内部pathへ依存しないようにする。
+
+## 15. PR分割
 
 このPRは**基盤だけ**。
 
@@ -173,9 +195,11 @@ v2カタログは `v2.*` 名前空間を使う。
 
 - v2 source contract / registry
 - catalog epoch + baseline store
+- SYSTEM_EPOCH singleton
 - scoped award
 - 3枠equip store
 - 旧称号と分離したadditive schema
+- `@meigokujo/core/titles/v2` 公開入口
 - 基盤テスト
 
 まだ入れない:
