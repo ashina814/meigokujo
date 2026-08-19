@@ -325,7 +325,29 @@ export class TitleV2Store {
     return row.epoch;
   }
 
-  baseline(userId: string, source: TitleSourceKey, metric: string, catalogKey: string): number | null {
+  /**
+   * counter baselineはfail-closedで読む。
+   * 正常にsnapshot済みで、その時点にuser行が無かった場合だけ0を返す。
+   * source/metricの誤指定やsnapshot run欠損を0扱いしてはいけない。
+   */
+  baseline(userIdRaw: string, source: TitleSourceKey, metricRaw: string, catalogKeyRaw: string): number {
+    const userId = requireText(userIdRaw, "baseline.userId");
+    const metric = requireText(metricRaw, "baseline.metric");
+    const catalogKey = requireText(catalogKeyRaw, "baseline.catalogKey");
+    const sourceDefinition = (TITLE_SOURCES as Record<string, TitleSourceDefinition>)[source];
+    if (!sourceDefinition) throw new Error(`unknown title source: ${String(source)}`);
+    if (sourceDefinition.kind !== "counter" || sourceDefinition.epochPolicy.type !== "baseline") {
+      throw new Error(`title source does not use a counter baseline: ${String(source)}`);
+    }
+    if (!sourceDefinition.epochPolicy.metrics.includes(metric)) {
+      throw new Error(`unknown baseline metric for ${String(source)}: ${metric}`);
+    }
+
+    const run = this.baselineRun(catalogKey, source, metric);
+    if (!run) {
+      throw new Error(`missing baseline run: ${catalogKey}/${String(source)}/${metric}`);
+    }
+
     const row = this.db
       .prepare(
         `SELECT value
@@ -333,7 +355,7 @@ export class TitleV2Store {
           WHERE user_id = ? AND source = ? AND metric = ? AND catalog_key = ?`,
       )
       .get(userId, source, metric, catalogKey) as { value: number } | undefined;
-    return row?.value ?? null;
+    return row?.value ?? 0;
   }
 
   baselineRun(catalogKey: string, source: TitleSourceKey, metric: string): TitleBaselineRunRow | null {
