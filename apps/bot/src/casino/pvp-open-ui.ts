@@ -45,7 +45,7 @@ type PvpAvailability =
  * この画面は公開募集パネルの文脈に閉じる。個人用 `/賭場` ホームへの戻り導線を置くと、
  * 募集専用チャンネルからソロゲーム等へ潜れて専用パネルを分けた意味がなくなるため。
  */
-export function renderPvpOpenGameSelect(): InteractionReplyOptions {
+export function renderPvpOpenGameSelect() {
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     ...PVP_GAMES.map((game) =>
       new ButtonBuilder()
