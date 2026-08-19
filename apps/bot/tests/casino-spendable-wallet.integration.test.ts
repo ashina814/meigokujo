@@ -3,6 +3,7 @@ import {
   Casino,
   CasinoChipAssets,
   CasinoChipFlow,
+  CasinoIntegrity,
   CHIP_ESCROW,
   ChipLedger,
   Daily,
@@ -53,7 +54,7 @@ function setup(seed: Record<string, number>) {
 }
 
 describe("spendable wallet real DB integration", () => {
-  it("PvP holdAllは両者の通常Landを同一groupで自動預入してescrowへ移す", () => {
+  it("PvP holdAllは両者の通常Landを同一groupで自動預入してescrowへ移し、検算Bでも説明できる", () => {
     const ctx = setup({ alice: 1_000, bob: 1_000 });
     const rawEscrow = new Escrow(ctx.db, ctx.chips, ctx.events);
     const escrow = createFundedEscrow(rawEscrow, ctx.chips, ctx.ledger, ctx.chipFlow);
@@ -65,6 +66,9 @@ describe("spendable wallet real DB integration", () => {
     expect(ctx.chips.balanceOf("bob")).toBe(0);
     expect(rawEscrow.poolOf("pvp-real")).toBe(1_000);
     expect(ctx.chips.balanceOf(rawEscrow.holderId("pvp-real"))).toBe(1_000);
+
+    const integrity = new CasinoIntegrity(ctx.db, ctx.ledger, ctx.chips, rawEscrow);
+    expect(integrity.checkB().ok).toBe(true);
 
     ctx.db.close();
   });
