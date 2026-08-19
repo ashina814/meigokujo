@@ -22,7 +22,7 @@ export type TitleSourcePrivacy = "safe" | "restricted" | "forbidden";
 export type TitleEpochPolicy =
   | { type: "point"; at: string }
   | { type: "interval"; start: string; end: string; clip: true }
-  | { type: "baseline" };
+  | { type: "baseline"; metrics: readonly string[] };
 
 export interface TitleSourceCodeRef {
   /** repo rootからの相対パス。 */
@@ -38,7 +38,10 @@ export interface TitleSourceDefinition {
   calledFrom: TitleSourceCodeRef;
   kind: TitleSourceKind;
   privacy: TitleSourcePrivacy;
-  /** 達成時刻を履歴から正確に復元できるか。falseなら earned_at を捏造しない。 */
+  /**
+   * source全体について達成時刻を正確に復元できるか。
+   * raw sourceに推定時刻が混ざり得るならfalse。必要なら後続のderived sourceでtrueを取り戻す。
+   */
   orderable: boolean;
   /** カタログ施行時刻をまたぐ履歴をどう切るか。 */
   epochPolicy: TitleEpochPolicy;
@@ -64,7 +67,9 @@ export const TITLE_SOURCES = {
     },
     kind: "history",
     privacy: "safe",
-    orderable: true,
+    // closeAllDangling() はクラッシュ復旧時に ended_at を推定値で補う。
+    // raw vc_segments 全体としては達成時刻を完全には証明できない。
+    orderable: false,
     epochPolicy: {
       type: "interval",
       start: "started_at",
@@ -87,7 +92,8 @@ export const TITLE_SOURCES = {
     kind: "counter",
     privacy: "safe",
     orderable: false,
-    epochPolicy: { type: "baseline" },
+    // baselineで保存してよいmetric名もsource contract側で固定する。
+    epochPolicy: { type: "baseline", metrics: ["count"] },
     rawUnit: "cumulative_counter",
   },
 } as const satisfies Record<string, TitleSourceDefinition>;
