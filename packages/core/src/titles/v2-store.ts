@@ -1,5 +1,9 @@
 import type Database from "better-sqlite3";
-import { TITLE_SOURCES, type TitleSourceKey } from "./v2-contract.js";
+import {
+  TITLE_SOURCES,
+  type TitleSourceDefinition,
+  type TitleSourceKey,
+} from "./v2-contract.js";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -162,12 +166,15 @@ function requireV2Key(key: string): string {
   return normalized;
 }
 
-function baselineSourceEntries(): Array<[TitleSourceKey, (typeof TITLE_SOURCES)[TitleSourceKey]]> {
-  return (Object.keys(TITLE_SOURCES) as TitleSourceKey[])
-    .map((key) => [key, TITLE_SOURCES[key]] as [TitleSourceKey, (typeof TITLE_SOURCES)[TitleSourceKey]])
-    .filter(([, source]) =>
-      source.privacy !== "forbidden" && source.kind === "counter" && source.epochPolicy.type === "baseline",
-    );
+function baselineSourceEntries(): Array<[TitleSourceKey, TitleSourceDefinition]> {
+  const entries: Array<[TitleSourceKey, TitleSourceDefinition]> = [];
+  for (const key of Object.keys(TITLE_SOURCES) as TitleSourceKey[]) {
+    const source: TitleSourceDefinition = TITLE_SOURCES[key];
+    if (source.privacy === "forbidden") continue;
+    if (source.kind !== "counter" || source.epochPolicy.type !== "baseline") continue;
+    entries.push([key, source]);
+  }
+  return entries;
 }
 
 /** registryへbaseline sourceを足したらsnapshotterも同時に実装させる。 */
@@ -417,7 +424,6 @@ export class TitleV2Store {
     if (!awarded) throw new Error(`cannot equip unowned title: ${titleKey}/${scopeKey}`);
 
     const move = this.db.transaction(() => {
-      // 同じ印を別slotへ動かす場合も1操作で済ませる。
       this.db
         .prepare("DELETE FROM title_equips WHERE user_id = ? AND (slot = ? OR title_key = ?)")
         .run(userId, slot, titleKey);
