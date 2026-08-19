@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { BumpCounter } from "../src/rank/bump.js";
@@ -150,6 +151,16 @@ describe("称号v2 foundation", () => {
 
     expect(() => store.equip("alice", 1, "v2.unknown", "global")).toThrow(/unowned/);
     expect(() => store.equip("alice", 4, "v2.table", "global")).toThrow(/slot/);
+  });
+
+  it("source registryのwriter/callerは実ファイルに存在する", () => {
+    const readRepoFile = (path: string) =>
+      readFileSync(new URL(`../../../${path}`, import.meta.url), "utf8");
+
+    for (const [sourceKey, source] of Object.entries(TITLE_SOURCES)) {
+      expect(readRepoFile(source.writtenBy.file), `${sourceKey} writer`).toContain(source.writtenBy.needle);
+      expect(readRepoFile(source.calledFrom.file), `${sourceKey} caller`).toContain(source.calledFrom.needle);
+    }
   });
 
   it("source contractはVC生行を『入室回数』として扱わない", () => {
