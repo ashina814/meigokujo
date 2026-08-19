@@ -172,6 +172,57 @@ interface ChipGroupAuditRow {
   kind: string;
   actor_id: string;
   status: string;
+  result_json: string | null;
+}
+
+interface FundedHoldAllAuditResult {
+  kind: "holdAll";
+  sessionId: string;
+  participants: string[];
+  amount: number;
+  game: string;
+  ok: true;
+}
+
+interface FundedHoldAllWitnessRow {
+  from_holder: string | null;
+  to_holder: string | null;
+  amount: number;
+  reason: string;
+  game: string | null;
+  session_id: string | null;
+  opening_version: string;
+  actor_id: string;
+  op_key: string | null;
+  op_actor_id: string | null;
+}
+
+function parseFundedHoldAllAuditResult(value: string | null): FundedHoldAllAuditResult | null {
+  if (!value) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const row = parsed as Record<string, unknown>;
+  if (row.kind !== "holdAll" || row.ok !== true) return null;
+  if (typeof row.sessionId !== "string" || row.sessionId.length === 0) return null;
+  if (typeof row.game !== "string" || row.game.length === 0) return null;
+  if (typeof row.amount !== "number" || !Number.isSafeInteger(row.amount) || row.amount <= 0) return null;
+  if (!Array.isArray(row.participants) || row.participants.length === 0) return null;
+  if (!row.participants.every((participant) => typeof participant === "string" && participant.length > 0)) return null;
+  const participants = row.participants as string[];
+  if (new Set(participants).size !== participants.length) return null;
+  return {
+    kind: "holdAll",
+    sessionId: row.sessionId,
+    participants,
+    amount: row.amount,
+    game: row.game,
+    ok: true,
+  };
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -450,7 +501,7 @@ export class CasinoIntegrity {
    */
   private classifyChipGroup(row: PoolTxRow, detail: ChipTxDetailRow, rule: ChipPoolTxRule): string | null {
     const group = this.db
-      .prepare("SELECT group_key, kind, actor_id, status FROM casino_tx_groups WHERE group_key = ?")
+      .prepare("SELECT group_key, kind, actor_id, status, result_json FROM casino_tx_groups WHERE group_key = ?")
       .get(detail.group_key) as ChipGroupAuditRow | undefined;
     if (!group) return "no_chip_group";
     if (group.status !== "settled") return `group_not_settled:${group.status}`;
@@ -466,7 +517,7 @@ export class CasinoIntegrity {
       }
       // 利用者の資金は、その利用者の業務操作の中でしか動かせない。
       // funded holdAll だけは複数人を一つの atomic group に包むため outer actor が system:escrow。
-      // その場合も wrapper 名だけでは信用せず、同じ group 内の正規預託明細まで照合する。
+      // その場合も wrapper 名だけでは信用せず、保存済み契約と内側op_key・預託明細まで照合する。
       if (rule.actor === "user" && principalOf(group.actor_id) !== principalOf(row.actor_id)) {
         if (!this.isFundedHoldAllAutoDeposit(row, detail, group, rule)) return "group_actor_mismatch";
       }
@@ -488,16 +539,22 @@ export class CasinoIntegrity {
    * outer actor が `system:escrow`。一方、Land→chip の操作主体は各 user のままなので、
    * 通常の「outer actor = user」規則だけでは正規取引を誤検知する。
    *
+   * group key は sessionId と operationId の両方に `:` を含み得るため、文字列分割や prefix
+   * だけでは境界を一意に決められない。そこで outer group の `result_json` に保存された
+   * 構造化契約と、inner holdAll が各明細へ残した `op_key` / session_id を正本として突き合わせる。
+   *
    * 例外は次をすべて満たす場合だけ:
    * - user の chip_deposit
    * - kind=table_hold / actor=system:escrow
-   * - 正式な funded holdAll wrapper key
-   * - wrapper key に埋め込まれた session と預託明細の session_id が一致する
-   * - 同じ group・同じ opening_version に、その user から `escrow:session:<session_id>` へ
-   *   「卓への預託」した internal_transfer が厳密に1件存在する
-   * - 預託額は自動預入額以上（不足分だけ Land から補うため）
+   * - `wallet:escrow:hold_all:*` の outer wrapper
+   * - result_json が kind=holdAll / ok=true の正規契約で、参加者・session・amount・game が妥当
+   * - deposit user がその契約の参加者で、自動預入額 <= 契約の預託額
+   * - 同じ group・同じ opening_version の internal_transfer が契約参加者数と厳密一致
+   * - 各参加者から契約sessionの escrow へ、契約amount/game どおりの「卓への預託」が1件ずつ
+   * - inner op_key に `wallet:` を付けたものが outer group_key と完全一致
+   * - witness の outer/inner actor がともに system:escrow
    *
-   * これにより `system:escrow` を名乗るだけの偽 group は通さない。
+   * これにより session/operation の曖昧な文字列分解や、system:escrow を名乗るだけの偽 group は通さない。
    */
   private isFundedHoldAllAutoDeposit(
     row: PoolTxRow,
@@ -510,24 +567,41 @@ export class CasinoIntegrity {
     if (!detail.group_key.startsWith("wallet:escrow:hold_all:")) return false;
     if (!row.ref_id) return false;
 
-    const witness = this.db
+    const contract = parseFundedHoldAllAuditResult(group.result_json);
+    if (!contract) return false;
+    if (!contract.participants.includes(row.ref_id)) return false;
+    if (contract.amount < row.amount) return false;
+
+    const witnesses = this.db
       .prepare(
-        `SELECT COUNT(*) AS c
+        `SELECT from_holder, to_holder, amount, reason, game, session_id, opening_version,
+                actor_id, op_key, op_actor_id
            FROM casino_tx
           WHERE group_key = ?
             AND tx_kind = 'internal_transfer'
-            AND from_holder = ?
-            AND session_id IS NOT NULL
-            AND session_id != ''
-            AND instr(?, 'wallet:escrow:hold_all:' || session_id || ':') = 1
-            AND to_holder = 'escrow:session:' || session_id
-            AND reason = '卓への預託'
-            AND opening_version = ?
-            AND amount >= ?
-            AND actor_id = ?`,
+            AND opening_version = ?`,
       )
-      .get(detail.group_key, row.ref_id, detail.group_key, detail.opening_version, row.amount, group.actor_id) as { c: number };
-    return witness.c === 1;
+      .all(detail.group_key, detail.opening_version) as FundedHoldAllWitnessRow[];
+    if (witnesses.length !== contract.participants.length) return false;
+
+    const expectedHolder = `escrow:session:${contract.sessionId}`;
+    const seen = new Set<string>();
+    for (const witness of witnesses) {
+      if (!witness.from_holder) return false;
+      if (seen.has(witness.from_holder)) return false;
+      if (!contract.participants.includes(witness.from_holder)) return false;
+      if (witness.to_holder !== expectedHolder) return false;
+      if (witness.amount !== contract.amount) return false;
+      if (witness.reason !== "卓への預託") return false;
+      if (witness.game !== contract.game) return false;
+      if (witness.session_id !== contract.sessionId) return false;
+      if (witness.opening_version !== detail.opening_version) return false;
+      if (witness.actor_id !== group.actor_id) return false;
+      if (witness.op_actor_id !== group.actor_id) return false;
+      if (!witness.op_key || detail.group_key !== `wallet:${witness.op_key}`) return false;
+      seen.add(witness.from_holder);
+    }
+    return contract.participants.every((participant) => seen.has(participant));
   }
 
   checkC(): CasinoCheckResult {
