@@ -128,6 +128,26 @@ describe("CasinoIntegrity funded wallet regression", () => {
     ctx.db.close();
   });
 
+  it("holdAll wrapper の session と預託明細の session が違えば許可しない", () => {
+    const ctx = setup();
+    fundUser(ctx, "alice", 2_000);
+
+    ctx.chips.runGroup(
+      { groupKey: "wallet:escrow:hold_all:pvpopen:session-a:collect", kind: "table_hold", actorId: "system:escrow" },
+      () => {
+        ctx.chipFlow.ensureFreeChips("alice", 2_000, "walletautofund4001");
+        ctx.chips.transfer("alice", "escrow:session:pvpopen:session-b", 2_000, {
+          reason: "卓への預託",
+          game: "pvp",
+          sessionId: "pvpopen:session-b",
+        });
+      },
+    );
+
+    expect(notes(ctx)).toContain("group_actor_mismatch");
+    ctx.db.close();
+  });
+
   it("VIP の nested 自動預入でも outer actor が別人なら止める", () => {
     const ctx = setup();
     fundUser(ctx, "alice", 2_000);
