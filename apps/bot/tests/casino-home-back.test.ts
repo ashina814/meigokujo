@@ -4,11 +4,10 @@ import type { Services } from "../src/services.js";
 import { handleCasinoHomeButton } from "../src/commands/casino-home.js";
 
 /**
- * 「/賭場 から開いた子画面からは、必ず同じ場所へ帰れる」ことの検査。
+ * 「/賭場 から開く個人用の子画面からは、必ず同じ場所へ帰れる」ことの検査。
  *
- * ハブを正規の入口にした以上、子画面で行き止まりになると
- * 利用者はコマンドを打ち直すしかなくなる。入口を増やすたびに
- * 戻る導線を付け忘れる事故が起きやすいので、経路をまとめて押さえる。
+ * 公開1v1・競馬・板は専用パネルへ分離済みで、特に公開1v1は募集専用チャンネルから
+ * 個人ホームへ抜ける導線を持たせない。ここで守るのは個人ホーム配下の画面だけ。
  */
 
 function fakeServices(): Services {
@@ -49,8 +48,8 @@ function backButtonIds(payload: unknown): string[] {
   return rows.flatMap((row) => row.toJSON().components.map((c) => c.custom_id ?? ""));
 }
 
-describe("/賭場 の子画面はホームへ帰れる", () => {
-  for (const customId of ["casino:home:shop", "casino:home:banzuke", "casino:home:pvp", "casino:home:first"]) {
+describe("/賭場 の個人用子画面はホームへ帰れる", () => {
+  for (const customId of ["casino:home:shop", "casino:home:banzuke", "casino:home:first"]) {
     it(`${customId} にホームへ戻る導線がある`, async () => {
       const interaction = buttonFor(customId);
       await handleCasinoHomeButton(interaction, fakeServices());
