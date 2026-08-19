@@ -95,11 +95,15 @@ interface ChipPoolTxRule {
  * - `remittance` … 月次納付。胴元チップを精算してLandへ戻す
  * - `bailout` … 補填。Landを胴元チップへ replenish する
  *
+ * `vip` / `market_bet` で新たに許可するのは user の不足分自動預入だけ。
+ * system fund / settlement 等まで許可範囲を広げないよう専用ガードを置く。
+ *
  * `table_hold` のうち複数人を一括徴収する funded holdAll は outer actor が
  * `system:escrow` になるため、下の専用監査で正規 wrapper と参加者明細まで照合する。
  * 新しい入れ子を作るときは、ここへ足すことが設計判断の記録になる。
  */
 const NESTED_CHIP_GROUP_KINDS = new Set(["shop", "table_hold", "vip", "market_bet", "remittance", "bailout"]);
+const USER_AUTO_DEPOSIT_ONLY_NESTED_GROUP_KINDS = new Set(["vip", "market_bet"]);
 
 /** `user:123` と `123` を同じ人として比べる（グループの actor 表記が経路で揺れている） */
 function principalOf(actor: string): string {
@@ -454,6 +458,12 @@ export class CasinoIntegrity {
     const nested = detail.op_key !== detail.group_key;
     if (nested) {
       if (!NESTED_CHIP_GROUP_KINDS.has(group.kind)) return `group_kind_not_nestable:${group.kind}`;
+      if (
+        USER_AUTO_DEPOSIT_ONLY_NESTED_GROUP_KINDS.has(group.kind) &&
+        (rule.actor !== "user" || row.type !== "chip_deposit")
+      ) {
+        return `group_kind_not_nestable:${group.kind}`;
+      }
       // 利用者の資金は、その利用者の業務操作の中でしか動かせない。
       // funded holdAll だけは複数人を一つの atomic group に包むため outer actor が system:escrow。
       // その場合も wrapper 名だけでは信用せず、同じ group 内の正規預託明細まで照合する。
