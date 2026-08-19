@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CHALLENGE_WINDOW_MS, getOpenChallengeForChallenger, resetChallengesForTesting } from "../src/casino/pvp-challenge.js";
 import {
   PVP_AMOUNT_MODAL_PREFIX,
+  PVP_BACK_CUSTOM_ID,
   PVP_CUSTOM_PREFIX,
   PVP_GAME_PREFIX,
   PVP_POST_PREFIX,
@@ -58,6 +59,7 @@ function buttonInteraction(customId: string, userId = "alice") {
     user: { id: userId, bot: false },
     channel: { send },
     reply: vi.fn(async () => undefined),
+    update: vi.fn(async () => undefined),
     deferReply: vi.fn(async () => undefined),
     editReply: vi.fn(async () => undefined),
     showModal: vi.fn(async () => undefined),
@@ -66,14 +68,34 @@ function buttonInteraction(customId: string, userId = "alice") {
 }
 
 describe("公開1v1のゲーム選択と金額picker", () => {
-  it("公開募集対象の4ゲームだけを出す", () => {
+  it("公開募集対象の4ゲームだけを出し、個人用賭場ホームへの戻り口を置かない", () => {
     const ids = allButtons(renderPvpOpenGameSelect()).map((b) => b.custom_id);
     expect(ids).toEqual([
       `${PVP_GAME_PREFIX}chinchiro`,
       `${PVP_GAME_PREFIX}bj`,
       `${PVP_GAME_PREFIX}sashi`,
       `${PVP_GAME_PREFIX}indian`,
-      "casino:home:back",
+    ]);
+    expect(ids).not.toContain("casino:home:back");
+  });
+
+  it("金額pickerの戻るは募集ゲーム選択だけへ戻し、個人ホームへ抜けない", async () => {
+    const s = services();
+    const pickerIds = allButtons(renderPvpOpenAmountPicker("alice", "chinchiro", s.value)).map((b) => b.custom_id);
+    expect(pickerIds).toContain(PVP_BACK_CUSTOM_ID);
+    expect(pickerIds).not.toContain("casino:home:back");
+
+    const { interaction } = buttonInteraction(PVP_BACK_CUSTOM_ID);
+    await handlePvpOpenSetupButton(interaction, s.value);
+
+    expect(interaction.update).toHaveBeenCalledTimes(1);
+    const payload = (interaction as { update: ReturnType<typeof vi.fn> }).update.mock.calls[0]?.[0] as { components?: unknown[] };
+    const backIds = allButtons(payload).map((b) => b.custom_id);
+    expect(backIds).toEqual([
+      `${PVP_GAME_PREFIX}chinchiro`,
+      `${PVP_GAME_PREFIX}bj`,
+      `${PVP_GAME_PREFIX}sashi`,
+      `${PVP_GAME_PREFIX}indian`,
     ]);
   });
 

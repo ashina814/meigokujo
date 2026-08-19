@@ -285,6 +285,29 @@ export async function playChinchiroDuel(
 }
 
 /**
+ * Discord の Embed title は mention を展開しない。
+ * 勝者IDをタイトルへ入れず、実際に表示される本文だけへ mention を置く。
+ */
+export function buildChinchiroDuelResult(
+  winnerId: string,
+  loserId: string,
+  bet: number,
+  payout: number,
+  houseCut: number,
+): EmbedBuilder {
+  return new EmbedBuilder()
+    .setTitle("🎲 対戦チンチロ — 決着")
+    .setColor(C_WIN)
+    .setDescription(
+      [
+        `🏆 **勝者** <@${winnerId}> +${fmtEther(payout - bet)}（受取 ${fmtEther(payout)}）`,
+        `　**敗者** <@${loserId}> -${fmtEther(bet)}`,
+        `場代 ${fmtEther(houseCut)} → JPプール`,
+      ].join("\n"),
+    );
+}
+
+/**
  * 対戦チンチロの本体。
  *
  * ⚠️ **`collectStakes()` が両者について成功済みであることを前提とする。**
@@ -366,18 +389,7 @@ export async function runFundedChinchiroDuel(
       markResolved();
 
       await view.followUp({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle(`🎲 対戦チンチロ — 勝者 <@${winnerId}>`)
-            .setColor(C_WIN)
-            .setDescription(
-              [
-                `**勝ち** <@${winnerId}> +${fmtEther(payout - bet)}（受取 ${fmtEther(payout)}）`,
-                `**負け** <@${loserId}> -${fmtEther(bet)}`,
-                `場代 ${fmtEther(houseCut)} → JPプール`,
-              ].join("\n"),
-            ),
-        ],
+        embeds: [buildChinchiroDuelResult(winnerId, loserId, bet, payout, houseCut)],
         allowedMentions: { users: [winnerId] },
       });
     }

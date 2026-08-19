@@ -19,12 +19,14 @@ import { closeChallengeCard, postChallenge } from "./pvp-card.js";
 import { getOpenChallengeForChallenger } from "./pvp-challenge.js";
 import { PVP_GAMES, pvpGame, type PvpGameKey } from "./pvp-games.js";
 import { openingNotice, openingPhase } from "./opening.js";
-import { C_MAMMON, withCasinoHomeBack } from "./ui.js";
+import { C_MAMMON } from "./ui.js";
 import { parseStrictPositiveInteger } from "./wager-input.js";
 
 export const PVP_GAME_PREFIX = "casino:home:pvpopen-game:";
 export const PVP_POST_PREFIX = "casino:home:pvpopen-post:";
 export const PVP_CUSTOM_PREFIX = "casino:home:pvpopen-custom:";
+/** 公開募集の専用導線内だけで戻る。募集チャンネルから個人ホームへ抜けない。 */
+export const PVP_BACK_CUSTOM_ID = "casino:pvpopen:back";
 /** 既存の `casino:amount:modal:` ルートへ乗せる。amount-picker 側が先にこの接頭辞を委譲する。 */
 export const PVP_AMOUNT_MODAL_PREFIX = "casino:amount:modal:pvp:";
 
@@ -39,8 +41,11 @@ type PvpAvailability =
 /**
  * 「みんなで勝負」の実入口。旧 `/勝負` 一覧を見せるだけの画面ではなく、
  * ここからゲーム → 金額 → 公開募集まで完結させる。
+ *
+ * この画面は公開募集パネルの文脈に閉じる。個人用 `/賭場` ホームへの戻り導線を置くと、
+ * 募集専用チャンネルからソロゲーム等へ潜れて専用パネルを分けた意味がなくなるため。
  */
-export function renderPvpOpenGameSelect(): InteractionReplyOptions {
+export function renderPvpOpenGameSelect() {
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     ...PVP_GAMES.map((game) =>
       new ButtonBuilder()
@@ -63,7 +68,7 @@ export function renderPvpOpenGameSelect(): InteractionReplyOptions {
         "-# 丁半・ポーカーは既存の多人数受付を使うため、ここでは募集しません。",
       ].join("\n"),
     );
-  return withCasinoHomeBack({ embeds: [embed], components: [row] });
+  return { embeds: [embed], components: [row] };
 }
 
 /** 金額選択。表示は事前確認であり、相手を含む最終判定は受諾時の collectStakes が正本。 */
@@ -87,6 +92,10 @@ export function renderPvpOpenAmountPicker(
     .setLabel("自由入力")
     .setStyle(ButtonStyle.Secondary)
     .setDisabled(pvpAmountDenial(MIN_BET, availability) !== null);
+  const back = new ButtonBuilder()
+    .setCustomId(PVP_BACK_CUSTOM_ID)
+    .setLabel("← 募集ゲーム選択へ")
+    .setStyle(ButtonStyle.Secondary);
 
   const lines = [
     `${g?.emoji ?? "⚔"} **${g?.label ?? game}**`,
@@ -102,15 +111,19 @@ export function renderPvpOpenAmountPicker(
     .setTitle("賭け金を選ぶ")
     .setDescription(lines.join("\n"));
 
-  return withCasinoHomeBack({
+  return {
     embeds: [embed],
-    components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...fixed, custom)],
-  });
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(...fixed, custom),
+      new ActionRowBuilder<ButtonBuilder>().addComponents(back),
+    ],
+  };
 }
 
-/** `casino:home:` 配下の公開募集セットアップ操作だけを拾う。 */
+/** 公開募集セットアップ操作だけを拾う。個人ホームの戻るIDはここへ含めない。 */
 export function isPvpOpenSetupButton(customId: string): boolean {
   return (
+    customId === PVP_BACK_CUSTOM_ID ||
     customId.startsWith(PVP_GAME_PREFIX) ||
     customId.startsWith(PVP_POST_PREFIX) ||
     customId.startsWith(PVP_CUSTOM_PREFIX)
@@ -121,6 +134,11 @@ export async function handlePvpOpenSetupButton(
   interaction: ButtonInteraction,
   services: Services,
 ): Promise<void> {
+  if (interaction.customId === PVP_BACK_CUSTOM_ID) {
+    await interaction.update(renderPvpOpenGameSelect());
+    return;
+  }
+
   const gamePick = parseGameTail(interaction.customId, PVP_GAME_PREFIX);
   if (gamePick.matched) {
     if (!gamePick.game) return replyInvalid(interaction);

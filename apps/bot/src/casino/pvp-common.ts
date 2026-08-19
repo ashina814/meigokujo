@@ -207,7 +207,7 @@ export function buildPvpAbort(game: string, icon: string, reason: string): Embed
     .setDescription(reason);
 }
 
-/** PvP 勝敗確定時の共通embed */
+/** PvP 勝敗確定時の共通embed。title には mention を置かず、人物は本文だけで表示する。 */
 export function buildPvpResult(opts: {
   game: string;
   icon: string;
@@ -221,13 +221,13 @@ export function buildPvpResult(opts: {
   const embed = new EmbedBuilder()
     .setAuthor({ name: `マモンの賭場 · ${opts.game}` })
     .setColor(opts.winnerId ? C_WIN : 0x78716c)
-    .setTitle(opts.winnerId ? `${opts.icon}  勝者 <@${opts.winnerId}>` : `${opts.icon}  引き分け`)
+    .setTitle(opts.winnerId ? `${opts.icon}  ${opts.game} — 決着` : `${opts.icon}  ${opts.game} — 引き分け`)
     .setFooter({ text: `場代 ${fmtEther(opts.houseCut).replace(" Ld", "Ld")} → JPプール` });
 
   const lines: string[] = [];
   if (opts.winnerId) {
-    lines.push(`${opts.icon} **勝ち**  <@${opts.winnerId}>  +${fmtEther(opts.payout - opts.bet).replace(" Ld", "Ld")}`);
-    if (opts.loserId) lines.push(`　**負け**  <@${opts.loserId}>  −${fmtEther(opts.bet).replace(" Ld", "Ld")}`);
+    lines.push(`🏆 **勝者** <@${opts.winnerId}>  +${fmtEther(opts.payout - opts.bet).replace(" Ld", "Ld")}`);
+    if (opts.loserId) lines.push(`　**敗者** <@${opts.loserId}>  −${fmtEther(opts.bet).replace(" Ld", "Ld")}`);
   } else {
     lines.push("両者に返金。");
   }
