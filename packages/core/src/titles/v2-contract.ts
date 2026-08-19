@@ -24,11 +24,18 @@ export type TitleEpochPolicy =
   | { type: "interval"; start: string; end: string; clip: true }
   | { type: "baseline" };
 
+export interface TitleSourceCodeRef {
+  /** repo rootからの相対パス。 */
+  file: string;
+  /** そのファイルに必ず存在する、契約を示す最小文字列。 */
+  needle: string;
+}
+
 export interface TitleSourceDefinition {
-  /** 人が追える書き込み正本。存在だけでなく後続のsource contract testで入口まで検証する。 */
-  writtenBy: string;
+  /** 人が追えてテストでも検証できる書き込み正本。 */
+  writtenBy: TitleSourceCodeRef;
   /** 本番で writer を呼ぶ入口。 */
-  calledFrom: string;
+  calledFrom: TitleSourceCodeRef;
   kind: TitleSourceKind;
   privacy: TitleSourcePrivacy;
   /** 達成時刻を履歴から正確に復元できるか。falseなら earned_at を捏造しない。 */
@@ -47,8 +54,14 @@ export interface TitleSourceDefinition {
  */
 export const TITLE_SOURCES = {
   vc_segments: {
-    writtenBy: "packages/core/src/vc/service.ts VcTracker.open()/close()",
-    calledFrom: "apps/bot/src/vc-tracking.ts",
+    writtenBy: {
+      file: "packages/core/src/vc/service.ts",
+      needle: "INSERT INTO vc_segments",
+    },
+    calledFrom: {
+      file: "apps/bot/src/vc-tracking.ts",
+      needle: "services.vc.open(",
+    },
     kind: "history",
     privacy: "safe",
     orderable: true,
@@ -63,8 +76,14 @@ export const TITLE_SOURCES = {
     rawUnit: "voice_state_segment",
   },
   bump_counts: {
-    writtenBy: "packages/core/src/rank/bump.ts BumpCounter.addOnce()",
-    calledFrom: "apps/bot/src/bump.ts",
+    writtenBy: {
+      file: "packages/core/src/rank/bump.ts",
+      needle: "INSERT INTO bump_counts",
+    },
+    calledFrom: {
+      file: "apps/bot/src/bump.ts",
+      needle: "services.bumps.addOnce(",
+    },
     kind: "counter",
     privacy: "safe",
     orderable: false,
