@@ -48,6 +48,8 @@ describe("称号v2 foundation", () => {
     expect(store.systemEpoch()).toBe(100);
     expect(store.baseline("alice", "bump_counts", "count", "v1")).toBe(2);
     expect(store.baseline("bob", "bump_counts", "count", "v1")).toBe(1);
+    // snapshot自体が正常で、その時点にuser行が無かった場合だけ0。
+    expect(store.baseline("charlie", "bump_counts", "count", "v1")).toBe(0);
     expect(store.listBaselines("v1").map((r) => [r.user_id, r.source, r.metric, r.value])).toEqual([
       ["alice", "bump_counts", "count", 2],
       ["bob", "bump_counts", "count", 1],
@@ -65,6 +67,23 @@ describe("称号v2 foundation", () => {
     emptyStore.applyCatalog({ catalogKey: "empty", actor: "admin" });
     expect(emptyStore.listBaselines("empty")).toEqual([]);
     expect(emptyStore.baselineRun("empty", "bump_counts", "count")?.row_count).toBe(0);
+    expect(emptyStore.baseline("new-user", "bump_counts", "count", "empty")).toBe(0);
+  });
+
+  it("baseline読み取りはmetric typo・非counter source・run欠損を0扱いしない", () => {
+    const db = openDb(":memory:");
+    const bump = new BumpCounter(db);
+    bump.addOnce("msg-1", "alice");
+    const store = new TitleV2Store(db, () => 100);
+    store.applyCatalog({ catalogKey: "v1", actor: "admin" });
+
+    expect(() => store.baseline("alice", "bump_counts", "counts", "v1")).toThrow(/unknown baseline metric/);
+    expect(() => store.baseline("alice", "vc_segments", "seconds", "v1")).toThrow(/does not use a counter baseline/);
+
+    db.prepare(
+      "DELETE FROM title_source_baseline_runs WHERE catalog_key = ? AND source = ? AND metric = ?",
+    ).run("v1", "bump_counts", "count");
+    expect(() => store.baseline("alice", "bump_counts", "count", "v1")).toThrow(/missing baseline run/);
   });
 
   it("SYSTEM_EPOCHは最初の施行で固定し、CATALOG_EPOCHの巻き戻りを拒否する", () => {
