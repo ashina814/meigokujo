@@ -492,6 +492,7 @@ export class CasinoIntegrity {
    * - user の chip_deposit
    * - kind=table_hold / actor=system:escrow
    * - 正式な funded holdAll wrapper key
+   * - wrapper key に埋め込まれた session と預託明細の session_id が一致する
    * - 同じ group・同じ opening_version に、その user から `escrow:session:<session_id>` へ
    *   「卓への預託」した internal_transfer が厳密に1件存在する
    * - 預託額は自動預入額以上（不足分だけ Land から補うため）
@@ -518,13 +519,14 @@ export class CasinoIntegrity {
             AND from_holder = ?
             AND session_id IS NOT NULL
             AND session_id != ''
+            AND instr(?, 'wallet:escrow:hold_all:' || session_id || ':') = 1
             AND to_holder = 'escrow:session:' || session_id
             AND reason = '卓への預託'
             AND opening_version = ?
             AND amount >= ?
             AND actor_id = ?`,
       )
-      .get(detail.group_key, row.ref_id, detail.opening_version, row.amount, group.actor_id) as { c: number };
+      .get(detail.group_key, row.ref_id, detail.group_key, detail.opening_version, row.amount, group.actor_id) as { c: number };
     return witness.c === 1;
   }
 
