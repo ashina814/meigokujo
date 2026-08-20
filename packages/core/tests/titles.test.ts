@@ -65,7 +65,7 @@ describe("称号機関", () => {
   it("VC累計100時間で『不眠の魂』", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-01T00:00:00Z"));
-    ctx.vc.open("dave", "vc1", null, false, false);
+    ctx.vc.open("dave", "vc1", null, false, false, "join");
     vi.setSystemTime(new Date("2026-07-05T12:00:00Z")); // 108時間後
     ctx.vc.close("dave");
     expect(ctx.titles.evaluate("dave").map((t) => t.key)).toContain("nightwalker");

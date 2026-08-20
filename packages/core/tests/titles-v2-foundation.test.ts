@@ -212,11 +212,11 @@ describe("称号v2 foundation", () => {
 
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-20T01:00:00+09:00"));
-    vc.open("alice", "vc1", "cat1", false, false);
+    vc.open("alice", "vc1", "cat1", false, false, "join");
 
     vi.setSystemTime(new Date("2026-08-20T01:10:00+09:00"));
     // 同じVCでmute状態が変わるだけでもopen()は前segmentを閉じて新しい行を作る。
-    vc.open("alice", "vc1", "cat1", true, false);
+    vc.open("alice", "vc1", "cat1", true, false, "state_change");
 
     const rows = db.prepare("SELECT COUNT(*) AS n FROM vc_segments WHERE user_id = ?").get("alice") as { n: number };
     expect(rows.n).toBe(2);

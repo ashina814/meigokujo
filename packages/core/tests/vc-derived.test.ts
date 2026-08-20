@@ -25,13 +25,14 @@ function setup() {
     endedAt: number | null,
     endQuality: "observed" | "recovered_estimate" | null,
     parentId: string | null = null,
+    startReason: "join" | "move" | "state_change" | null = null,
   ) =>
     db
       .prepare(
-        `INSERT INTO vc_segments (user_id, channel_id, parent_id, started_at, ended_at, self_muted, self_deafened, end_quality)
-         VALUES (?, ?, ?, ?, ?, 0, 0, ?)`,
+        `INSERT INTO vc_segments (user_id, channel_id, parent_id, started_at, ended_at, self_muted, self_deafened, end_quality, start_reason)
+         VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)`,
       )
-      .run(userId, channelId, parentId, startedAt, endedAt, endQuality);
+      .run(userId, channelId, parentId, startedAt, endedAt, endQuality, startReason);
   return { db, insertRaw };
 }
 
@@ -41,11 +42,11 @@ describe("A. logical visit の合成", () => {
     const vc = new VcTracker(db);
     vi.useFakeTimers();
     vi.setSystemTime(new Date((BASE + 0) * 1000));
-    vc.open("alice", "vc1", "cat1", false, false);
+    vc.open("alice", "vc1", "cat1", false, false, "join");
     vi.setSystemTime(new Date((BASE + 10) * 1000));
-    vc.open("alice", "vc1", "cat1", true, false); // mute変更
+    vc.open("alice", "vc1", "cat1", true, false, "state_change"); // mute変更
     vi.setSystemTime(new Date((BASE + 20) * 1000));
-    vc.open("alice", "vc1", "cat1", true, true); // deafen変更
+    vc.open("alice", "vc1", "cat1", true, true, "state_change"); // deafen変更
     vi.setSystemTime(new Date((BASE + 30) * 1000));
     vc.close("alice");
 
@@ -95,7 +96,7 @@ describe("A. logical visit の合成", () => {
     const vc = new VcTracker(db);
     vi.useFakeTimers();
     vi.setSystemTime(new Date(BASE * 1000));
-    vc.open("alice", "vc1", null, false, false);
+    vc.open("alice", "vc1", null, false, false, "join");
     vi.setSystemTime(new Date((BASE + 10) * 1000));
     vc.close("alice");
     const row = db.prepare("SELECT end_quality FROM vc_segments WHERE user_id='alice'").get() as {
@@ -109,7 +110,7 @@ describe("A. logical visit の合成", () => {
     const vc = new VcTracker(db);
     vi.useFakeTimers();
     vi.setSystemTime(new Date(BASE * 1000));
-    vc.open("alice", "vc1", null, false, false);
+    vc.open("alice", "vc1", null, false, false, "join");
     vi.setSystemTime(new Date((BASE + 4 * 3600) * 1000)); // 4時間後、closeせずbotがクラッシュした想定
     vc.closeAllDangling();
     const row = db.prepare("SELECT ended_at, end_quality FROM vc_segments WHERE user_id='alice'").get() as {
@@ -126,6 +127,55 @@ describe("A. logical visit の合成", () => {
     const visits = computeLogicalVisits(db, { start: BASE, end: BASE + 100 });
     expect(visits[0]!.endQuality).toBe("unknown");
     expect(isTrustedVisitEnd(visits[0]!.endQuality)).toBe(false);
+  });
+
+  it("同一秒の退出→再入室は、reasonがjoinなら時刻が一致しても1 visitへ合成しない", () => {
+    const { db, insertRaw } = setup();
+    // aliceはBASE+10にvisit1をobservedで終え、全く同じ秒に再入室(join)している。
+    // 時刻だけを見るとmute変更による分割と区別がつかないが、start_reasonが'join'
+    // （切断を経た新規入室）なので継続とみなしてはいけない。
+    insertRaw("alice", "vc1", BASE, BASE + 10, "observed", null, "join");
+    insertRaw("alice", "vc1", BASE + 10, BASE + 20, "observed", null, "join");
+
+    const visits = computeLogicalVisits(db, { start: BASE, end: BASE + 100 });
+    expect(visits.map((v) => [v.startedAt, v.endedAt])).toEqual([
+      [BASE, BASE + 10],
+      [BASE + 10, BASE + 20],
+    ]);
+  });
+
+  it("直前segmentがrecovered_estimateで終わっている場合、次がstate_changeでも合成しない（推定区間の洗浄防止）", () => {
+    const { db, insertRaw } = setup();
+    // クラッシュ復旧の推定終了(recovered_estimate)の直後、mute変更(state_change)が
+    // 偶然同じ秒で起きた場合でも、推定区間を含んだままobservedへ格上げしてはいけない。
+    insertRaw("alice", "vc1", BASE, BASE + 10, "recovered_estimate", null, "join");
+    insertRaw("alice", "vc1", BASE + 10, BASE + 20, "observed", null, "state_change");
+
+    const visits = computeLogicalVisits(db, { start: BASE, end: BASE + 100 });
+    expect(visits.map((v) => [v.startedAt, v.endedAt, v.endQuality])).toEqual([
+      [BASE, BASE + 10, "recovered_estimate"],
+      [BASE + 10, BASE + 20, "observed"],
+    ]);
+  });
+
+  it("state_changeかつ直前がobservedのときだけ合成する（正常系の再確認）", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, BASE + 10, "observed", null, "join");
+    insertRaw("alice", "vc1", BASE + 10, BASE + 20, "observed", null, "state_change");
+
+    const visits = computeLogicalVisits(db, { start: BASE, end: BASE + 100 });
+    expect(visits).toEqual([
+      {
+        userId: "alice",
+        channelId: "vc1",
+        parentId: null,
+        startedAt: BASE,
+        endedAt: BASE + 20,
+        endQuality: "observed",
+        segmentCount: 2,
+        startClipped: false,
+      },
+    ]);
   });
 });
 
@@ -203,6 +253,18 @@ describe("C. empty-start → later joined", () => {
     const { db, insertRaw } = setup();
     insertRaw("alice", "vc1", BASE, BASE + 100, "recovered_estimate");
     insertRaw("bob", "vc1", BASE + 50, BASE + 80, "observed");
+
+    const facts = computeEmptyStartThenJoined(db, { start: BASE, end: BASE + 200 });
+    expect(facts).toEqual([]);
+  });
+
+  it("先行者の終了が信頼できない場合、記録上先に退出していても『空だった』と断定しない", () => {
+    const { db, insertRaw } = setup();
+    // bobは記録上BASE+10に退出しているが、終了がrecovered_estimateで不確か。
+    // aliceがBASE+30に入室した時点で、bobが本当にもう居なかったとは証明できない。
+    insertRaw("bob", "vc1", BASE - 100, BASE + 10, "recovered_estimate");
+    insertRaw("alice", "vc1", BASE + 30, BASE + 130, "observed");
+    insertRaw("carol", "vc1", BASE + 60, BASE + 90, "observed");
 
     const facts = computeEmptyStartThenJoined(db, { start: BASE, end: BASE + 200 });
     expect(facts).toEqual([]);
@@ -291,6 +353,70 @@ describe("E. group-size seconds", () => {
     const trustedTotal = Object.values(alice.trustedSecondsByBucket).reduce((a, b) => a + b, 0);
     expect(trustedTotal).toBe(30);
     expect(alice.untrustedSeconds).toBe(50);
+  });
+
+  it("同室者の終了が信頼できない場合、その時点以降はtrustedSecondsByBucketではなくuntrustedSecondsへ計上する", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed"); // aliceは0-100ずっと在室（終了は信頼できる）
+    // bobの退出(記録上40)はrecovered_estimateで不確か。本当は40より後まで居たかもしれない。
+    insertRaw("bob", "vc1", BASE + 10, BASE + 40, "recovered_estimate");
+
+    const result = computeGroupSizeSeconds(db, { start: BASE, end: BASE + 200 }, ["alice"]);
+    const alice = result.find((r) => r.userId === "alice")!;
+    // 0-10: alice単独。bobが現れる前なので人数帯は確実にsolo。
+    // 10以降: bobの本当の退出時刻が不明なので、以降ずっと「本当は何人だったか」を
+    // trustedとは主張できない。
+    expect(alice.trustedSecondsByBucket).toEqual({ solo: 10, oneToOne: 0, smallGroup: 0, largeGroup: 0 });
+    expect(alice.untrustedSeconds).toBe(90);
+  });
+});
+
+describe("userIds filterの契約: undefined=全員、[]=対象なし", () => {
+  it("userIds=[]（空配列）は『絞り込みなし』ではなく『対象なし』を意味する", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed");
+
+    const visits = computeLogicalVisits(db, { start: BASE, end: BASE + 200 }, []);
+    expect(visits).toEqual([]);
+  });
+
+  it("userIds未指定(undefined)は従来通り全員を対象にする", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed");
+
+    const visits = computeLogicalVisits(db, { start: BASE, end: BASE + 200 }, undefined);
+    expect(visits).toHaveLength(1);
+  });
+
+  it("computeSafeSocialAggregatesはuserIds指定時、指定ユーザー以外の不完全な行を返さない", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed");
+    insertRaw("bob", "vc1", BASE, BASE + 100, "observed");
+
+    // aliceだけを指定しても、内部的にはbobとの重なりが見つかるため touch() はbob側にも働く。
+    // しかしbobの集計はalice分しか反映していない不完全なものなので、返り値には含めない。
+    const aggregates = computeSafeSocialAggregates(db, { start: BASE, end: BASE + 200 }, ["alice"]);
+    expect(aggregates.map((a) => a.userId)).toEqual(["alice"]);
+  });
+
+  it("computeSafeSocialAggregatesにuserIds=[]を渡すと空配列を返す", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed");
+
+    const aggregates = computeSafeSocialAggregates(db, { start: BASE, end: BASE + 200 }, []);
+    expect(aggregates).toEqual([]);
+  });
+});
+
+describe("jstDatesInIntervalの安全策", () => {
+  it("非常に長い区間（100年超）は黙って打ち切らず例外にする", () => {
+    const { db, insertRaw } = setup();
+    const start = BASE;
+    const end = BASE + 200 * 365 * 86_400; // 約200年
+    insertRaw("alice", "vc1", start, end, "observed");
+    insertRaw("bob", "vc1", start, end, "observed");
+
+    expect(() => computeCoPresenceOverlaps(db, { start: start - 10, end: end + 10 })).toThrow(/more than/);
   });
 });
 

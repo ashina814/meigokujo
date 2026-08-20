@@ -18,6 +18,19 @@ import type Database from "better-sqlite3";
  */
 export type VcSegmentEndQuality = "observed" | "recovered_estimate" | null;
 
+/**
+ * この行が開いた理由。
+ *
+ * - null: この列を追加する前のlegacy行（理由不明）
+ * - 'join': 切断状態（どこにも接続していない）からの新規入室
+ * - 'move': 別チャンネルからの移動
+ * - 'state_change': 同一チャンネル内でのmute/deafen状態変化による分割
+ *
+ * derived layer（vc/derived.ts）が「退出→再入室」と「mute/deafen変化による分割」を
+ * 区別するために使う。前者は別visit、後者は同一visitの継続。
+ */
+export type VcSegmentStartReason = "join" | "move" | "state_change" | null;
+
 export interface VcSegment {
   id: number;
   user_id: string;
@@ -28,6 +41,7 @@ export interface VcSegment {
   self_muted: number;
   self_deafened: number;
   end_quality: VcSegmentEndQuality;
+  start_reason: VcSegmentStartReason;
 }
 
 export interface PresenceSummary {
@@ -42,17 +56,26 @@ export class VcTracker {
   constructor(private readonly db: Database.Database) {}
 
   /**
-   * 入室 or 状態変化: 開いているセグメントを閉じて新しく開く。
+   * 入室 or 移動 or 状態変化: 開いているセグメントを閉じて新しく開く。
    * @param parentId 親カテゴリID（浮上報酬のカテゴリ除外判定に使う）。不明なら null。
+   * @param reason この行が開いた理由（join/move/state_change）。derived layerの
+   *   coalesceが「退出→再入室」と「mute/deafen変化」を区別するために使う。
    */
-  open(userId: string, channelId: string, parentId: string | null, muted: boolean, deafened: boolean): void {
+  open(
+    userId: string,
+    channelId: string,
+    parentId: string | null,
+    muted: boolean,
+    deafened: boolean,
+    reason: VcSegmentStartReason,
+  ): void {
     const ts = now();
     this.closeAt(userId, ts);
     this.db
       .prepare(
-        "INSERT INTO vc_segments (user_id, channel_id, parent_id, started_at, self_muted, self_deafened) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO vc_segments (user_id, channel_id, parent_id, started_at, self_muted, self_deafened, start_reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(userId, channelId, parentId, ts, muted ? 1 : 0, deafened ? 1 : 0);
+      .run(userId, channelId, parentId, ts, muted ? 1 : 0, deafened ? 1 : 0, reason);
   }
 
   /** 退出 */

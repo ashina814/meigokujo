@@ -21,8 +21,9 @@ import type Database from "better-sqlite3";
  * 複数ユーザーの訪問を比較して「誰が先か」「誰がまだ居たか」を主張するfact
  * （empty-start-then-joined・last-occupant）は、比較に使う双方の境界が信頼できる場合
  * だけ成立させる。単独ユーザーの合計時間（group-size seconds）のように「主張」ではなく
- * 「計測」であるものは、本人の訪問の終了だけを信頼判定に使い、周囲の人数把握には
- * best-effortで他者の訪問も使ってよい（誰が・いつ、という個別の主張をしないため）。
+ * 「計測」であるものも、"trusted" を名乗る数字には信頼できない他者の境界を混ぜない
+ * ——他者の終了が信頼できず、記録上の退出時刻より後もまだ居た可能性を否定できない場合、
+ * それ以降は人数帯そのものが不確かになるため untrustedSeconds 側へ計上する。
  *
  * 同一秒のtieは「前後関係を証明できない」として安全側（factを作らない）へ倒す。
  */
@@ -74,25 +75,28 @@ interface RawSegmentRow {
   started_at: number;
   ended_at: number | null;
   end_quality: "observed" | "recovered_estimate" | null;
+  start_reason: "join" | "move" | "state_change" | null;
 }
 
 /**
- * windowと重なりうる全raw segmentsを一括で読む。ユーザーごとに何度もクエリを投げない。
- * 「windowより前から継続していた行」も拾うため startedAt に下限は掛けない。
+ * userIds引数の契約: `undefined` = 全ユーザー対象。`[]`（空配列）= 対象ユーザーなし
+ * （何も返さない）。空配列を「絞り込みなし」と誤解すると、呼び出し側が意図せず
+ * 全ユーザーのデータを受け取ってしまう事故になるため、明示的に空配列を弾く。
  */
 function loadRawSegments(
   db: Database.Database,
   window: TitleWindow,
   userIds?: readonly string[],
 ): RawSegmentRow[] {
+  if (userIds && userIds.length === 0) return [];
   const params: unknown[] = [window.end, window.start];
   let sql = `
-    SELECT id, user_id, channel_id, parent_id, started_at, ended_at, end_quality
+    SELECT id, user_id, channel_id, parent_id, started_at, ended_at, end_quality, start_reason
     FROM vc_segments
     WHERE started_at < ?
       AND (ended_at IS NULL OR ended_at > ?)
   `;
-  if (userIds && userIds.length > 0) {
+  if (userIds) {
     sql += ` AND user_id IN (${userIds.map(() => "?").join(",")})`;
     params.push(...userIds);
   }
@@ -107,7 +111,7 @@ function loadRawSegmentsForChannels(
 ): RawSegmentRow[] {
   if (channelIds.length === 0) return [];
   const sql = `
-    SELECT id, user_id, channel_id, parent_id, started_at, ended_at, end_quality
+    SELECT id, user_id, channel_id, parent_id, started_at, ended_at, end_quality, start_reason
     FROM vc_segments
     WHERE started_at < ? AND (ended_at IS NULL OR ended_at > ?)
       AND channel_id IN (${channelIds.map(() => "?").join(",")})
@@ -175,12 +179,23 @@ function coalesceVisits(rows: readonly RawSegmentRow[], window: TitleWindow): Lo
 
   for (const row of rows) {
     // 行は user_id → started_at → id の順に並んでいるので、同一userの行は必ず連続する。
+    //
+    // 合成してよいのは「同一チャンネル内のmute/deafen状態変化」だけ。時刻の一致だけでは
+    // 判定しない——同一秒での「退出→再入室」も前segmentの終了時刻と新segmentの開始時刻が
+    // 一致してしまい、時刻だけを見ると状態変化と区別がつかない。start_reasonという
+    // provenanceで区別する: 新しい行が 'state_change'（切断を経ていない）であり、かつ
+    // 直前segmentが 'observed' で閉じている場合だけ継続とみなす。
+    //
+    // 直前segmentが 'recovered_estimate'（クラッシュ補正の推定終了）のときは合成しない。
+    // 合成してしまうと、そのvisit全体の endQuality は最終segmentの品質だけで決まるため、
+    // 途中に挟まった推定区間が"洗浄"されてobservedへ格上げされてしまう。
     const continuesCurrent =
       current !== null &&
       current.userId === row.user_id &&
       current.channelId === row.channel_id &&
-      // 直前segmentの終了時刻と、この行の開始時刻が一致 = mute/deafen変化による分割
-      current.lastEndedAt === row.started_at;
+      current.lastEndedAt === row.started_at &&
+      row.start_reason === "state_change" &&
+      current.lastEndQuality === "observed";
 
     if (continuesCurrent && current) {
       current.lastEndedAt = row.ended_at;
@@ -267,8 +282,17 @@ export function computeEmptyStartThenJoined(
       (v) => !(v.userId === subject.userId && v.startedAt === subject.startedAt),
     );
 
-    const notEmptyAtStart = others.some((o) => o.startedAt <= subject.startedAt && o.endedAt > subject.startedAt);
-    if (notEmptyAtStart) continue;
+    // 「空だった」と主張するには、subjectの開始時点で在室していた可能性がある他者が
+    // 誰もいないと言い切れる必要がある。o.startedAt<=subject.startedAtの他者について：
+    // - o.endedAt > subject.startedAt なら記録上も明確に在室中（空ではない）
+    // - o.endedAt <= subject.startedAt でも、oの終了が信頼できない（recovered_estimate等）
+    //   なら「本当にその前に退出していた」とは証明できない。空だったと断定できない
+    const notEmptyOrAmbiguous = others.some((o) => {
+      if (o.startedAt > subject.startedAt) return false;
+      if (o.endedAt > subject.startedAt) return true;
+      return !isTrustedVisitEnd(o.endQuality);
+    });
+    if (notEmptyOrAmbiguous) continue;
 
     const laterJoin = others
       .filter((o) => o.startedAt > subject.startedAt && o.startedAt < subject.endedAt)
@@ -390,10 +414,12 @@ function bucketFor(occupancy: number): OccupancyBucket {
 /**
  * userごとに、人数帯（solo/1:1/小人数/大人数）ごとの滞在秒数を集計する。
  *
- * 「何人居たか」という周囲の人数把握は、他者の訪問の終了品質を問わずbest-effortで使う
- * （特定の誰かについての主張をしないため、named factより基準を緩めてよい）。
- * 一方、本人の滞在秒数として計上してよいかどうかは、本人の訪問の終了が信頼できるかだけで
- * 判定する（他者の情報の精度に関係なく、本人の実績を過大/過小に主張しないため）。
+ * 本人の滞在秒数として計上してよいかどうかは、まず本人の訪問の終了が信頼できるかで判定する。
+ * それに加えて、`trustedSecondsByBucket` を名乗る以上は**人数帯の判定そのもの**も信頼できな
+ * ければならない。他者の終了が信頼できない（recovered_estimate等）区間は、その他者が記録上
+ * 居なくなったように見える時刻以降も本当は居たかもしれず、occupancyの帯自体が不確かになる。
+ * そのため、そのような他者が現れて以降のsubject残り区間は bucket化せず untrustedSeconds へ
+ * 計上する（trustedと名乗る数字に、実は信頼できない他者由来の人数を混ぜない）。
  */
 export function computeGroupSizeSeconds(
   db: Database.Database,
@@ -431,10 +457,31 @@ export function computeGroupSizeSeconds(
     }
 
     const channelVisits = byChannel.get(subject.channelId) ?? [];
-    const boundaries = new Set<number>([subject.startedAt, subject.endedAt]);
+
+    // 「人数帯」そのものが不明になる境界を求める。他者(o)の終了が信頼できず、かつ
+    // oがsubjectの訪問が終わる前に始まっている場合、oの本当の退出時刻は分からない
+    // （記録上のendedAtより後だった可能性を否定できない）。その時点以降は
+    // subjectの残り区間すべてでoccupancyが不確かになる——記録上oが居なくなった
+    // ように見える区間でも、実際にはまだ居たかもしれないため。
+    // 複数の汚染源があれば、最も早いものが以降すべてを汚す。
+    let taintFrom: number | null = null;
     for (const v of channelVisits) {
-      if (v.startedAt > subject.startedAt && v.startedAt < subject.endedAt) boundaries.add(v.startedAt);
-      if (v.endedAt > subject.startedAt && v.endedAt < subject.endedAt) boundaries.add(v.endedAt);
+      if (v.userId === subject.userId) continue;
+      if (isTrustedVisitEnd(v.endQuality)) continue;
+      if (v.startedAt >= subject.endedAt) continue;
+      const start = Math.max(v.startedAt, subject.startedAt);
+      if (taintFrom === null || start < taintFrom) taintFrom = start;
+    }
+    const trustedUntil = taintFrom ?? subject.endedAt;
+
+    if (trustedUntil < subject.endedAt) {
+      r.untrustedSeconds += subject.endedAt - trustedUntil;
+    }
+
+    const boundaries = new Set<number>([subject.startedAt, trustedUntil]);
+    for (const v of channelVisits) {
+      if (v.startedAt > subject.startedAt && v.startedAt < trustedUntil) boundaries.add(v.startedAt);
+      if (v.endedAt > subject.startedAt && v.endedAt < trustedUntil) boundaries.add(v.endedAt);
     }
     const points = [...boundaries].sort((a, b) => a - b);
 
@@ -477,12 +524,26 @@ function jstDayStartUnix(dateStr: string): number {
   return Math.floor(new Date(`${dateStr}T00:00:00+09:00`).getTime() / 1000);
 }
 
-/** [startedAt, endedAt) が触れるdistinct JST暦日を列挙する。秒単位では舐めず、日境界だけ進む。 */
+/**
+ * [startedAt, endedAt) が触れるdistinct JST暦日を列挙する。秒単位では舐めず、日境界だけ進む。
+ *
+ * cursorはループのたびに厳密に翌日の00:00（JST）へ進むため、無限ループにはなり得ない
+ * （高々 ceil((endedAt-startedAt)/86400)+1 回で終端に達する）。全時代titleがwindowに
+ * 数年を渡すような場合でも黙って打ち切らない——`maxRepeatedDaysWithOneCounterpart` の
+ * ような集計を静かに過小評価すると、原因不明のまま称号判定がずれる。ここでは異常な
+ * 長さ（100年超）だけを実装バグの兆候として明示的に落とす。
+ */
 function jstDatesInInterval(startedAt: number, endedAt: number): string[] {
   const days: string[] = [];
   let cursor = startedAt;
   let guard = 0;
-  while (cursor < endedAt && guard < 400) {
+  const SANITY_LIMIT_DAYS = 365 * 100;
+  while (cursor < endedAt) {
+    if (guard >= SANITY_LIMIT_DAYS) {
+      throw new RangeError(
+        `jstDatesInInterval: interval [${startedAt}, ${endedAt}) spans more than ${SANITY_LIMIT_DAYS} days — likely a bug, not a legitimate title window`,
+      );
+    }
     const dateStr = jstDateOf(cursor);
     days.push(dateStr);
     cursor = jstDayStartUnix(dateStr) + 86_400;
@@ -567,12 +628,20 @@ export interface SafeSocialAggregate {
 /**
  * pair identityを一切外へ出さずに、社会的な広がりだけを安全に返す。
  * 称号定義は特定の相手のuserIdを渡さなくても、ここから判定できる。
+ *
+ * userIds指定時、返す行は指定したユーザーだけに絞る。computeCoPresenceOverlaps は
+ * 「少なくとも一方が指定ユーザー」であるpairを返すため、指定していない相手側
+ * （例: alice指定でbobとの重なりが見つかった場合のbob）にも touch() が働いてしまうが、
+ * そのbobの集計はaliceとの重なりしか反映しておらず、bobの channel全体を見た完全な集計
+ * ではない。不完全な行を「bobの集計」として返すと誤解を招くため、指定時は指定ユーザー
+ * の行だけを返す（指定ユーザー自身の集計は、本人の全channelを見ているため完全）。
  */
 export function computeSafeSocialAggregates(
   db: Database.Database,
   window: TitleWindow,
   userIds?: readonly string[],
 ): SafeSocialAggregate[] {
+  if (userIds && userIds.length === 0) return [];
   const overlaps = computeCoPresenceOverlaps(db, window, userIds);
   const byUser = new Map<string, { partners: Map<string, { seconds: number; days: number }> }>();
 
@@ -591,8 +660,10 @@ export function computeSafeSocialAggregates(
     touch(o.userB, o.userA, o.overlapSeconds, o.jstDays.length);
   }
 
+  const requestedSet = userIds ? new Set(userIds) : null;
   const results: SafeSocialAggregate[] = [];
   for (const [userId, { partners }] of byUser) {
+    if (requestedSet && !requestedSet.has(userId)) continue;
     let totalSeconds = 0;
     let maxDays = 0;
     for (const p of partners.values()) {

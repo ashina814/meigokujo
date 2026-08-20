@@ -18,7 +18,7 @@ describe("VC計測", () => {
     vi.useFakeTimers();
     const { vc } = setup();
     vi.setSystemTime(new Date("2026-07-04T12:00:00Z"));
-    vc.open("alice", "vc1", null, false, false);
+    vc.open("alice", "vc1", null, false, false, "join");
     vi.setSystemTime(new Date("2026-07-04T13:30:00Z"));
     vc.close("alice");
 
@@ -32,9 +32,9 @@ describe("VC計測", () => {
     vi.useFakeTimers();
     const { vc } = setup();
     vi.setSystemTime(new Date("2026-07-04T12:00:00Z"));
-    vc.open("alice", "vc1", null, false, false);
+    vc.open("alice", "vc1", null, false, false, "join");
     vi.setSystemTime(new Date("2026-07-04T12:10:00Z"));
-    vc.open("alice", "vc2", null, false, false); // 移動: vc1を閉じてvc2を開く
+    vc.open("alice", "vc2", null, false, false, "move"); // 移動: vc1を閉じてvc2を開く
     vi.setSystemTime(new Date("2026-07-04T12:40:00Z"));
     vc.close("alice");
 
@@ -48,7 +48,7 @@ describe("VC計測", () => {
     vi.useFakeTimers();
     const { vc } = setup();
     vi.setSystemTime(new Date("2026-07-04T00:00:00Z"));
-    vc.open("alice", "vc1", null, false, false);
+    vc.open("alice", "vc1", null, false, false, "join");
     // 2日後に再起動した想定 → 6時間で打ち切り
     vi.setSystemTime(new Date("2026-07-06T00:00:00Z"));
     expect(vc.closeAllDangling()).toBe(1);
@@ -59,8 +59,8 @@ describe("VC計測", () => {
     vi.useFakeTimers();
     const { vc } = setup();
     vi.setSystemTime(new Date("2026-07-04T12:00:00Z"));
-    vc.open("alice", "vc1", null, false, false);
-    vc.open("bob", "vc2", null, false, false);
+    vc.open("alice", "vc1", null, false, false, "join");
+    vc.open("bob", "vc2", null, false, false, "join");
     vi.setSystemTime(new Date("2026-07-04T12:30:00Z"));
     vc.close("bob"); // 30分
     vi.setSystemTime(new Date("2026-07-04T13:00:00Z"));
@@ -77,7 +77,7 @@ describe("VC計測", () => {
     const { vc } = setup();
     expect(vc.lastSeen("alice")).toBeNull();
     vi.setSystemTime(new Date("2026-07-04T12:00:00Z"));
-    vc.open("alice", "vc1", null, false, false);
+    vc.open("alice", "vc1", null, false, false, "join");
     vi.setSystemTime(new Date("2026-07-04T12:30:00Z"));
     vc.close("alice");
     expect(vc.lastSeen("alice")).toBe(Math.floor(new Date("2026-07-04T12:30:00Z").getTime() / 1000));

@@ -73,6 +73,13 @@ VoiceStateUpdate処理で閉じた、`recovered_estimate`=`closeAllDangling()` �
 `NULL`=まだ開いている、または列追加前のlegacy行（品質不明）。既存closed行を`observed`と
 推測して書き換えることはしない。
 
+`started_at` の出自は `start_reason` 列（additive migration）で区別する。`join`=切断状態
+からの新規入室、`move`=チャンネル移動、`state_change`=同一チャンネル内のmute/deafen変化、
+`NULL`=列追加前のlegacy行（理由不明）。derived layerのcoalesceは、次segmentが
+`state_change` かつ直前segmentが `observed` で閉じている場合だけ同一visitの継続とみなす。
+時刻の一致だけで判定すると、同一秒での「退出→再入室」がmute変更による分割と区別できず
+誤って1visitへ潰れてしまう（start_reasonは時刻に依存しないprovenanceとして必要）。
+
 ### VC derived source層（PR2）
 
 raw `vc_segments` は `titleUsable: false`。個々の称号は `packages/core/src/vc/derived.ts` の
@@ -92,13 +99,25 @@ derived sourceを使う。
 **信頼境界**: 開始時刻は常にDiscordイベントを観測した記録なので信頼できる。終了時刻は
 `observed`／訪問がまだ`window.end`で開いている場合のみ信頼できる（`isTrustedVisitEnd()`）。
 複数ユーザーを比較して「誰が先か」「誰がまだ居たか」を主張するfactは、比較に使う双方の
-境界が信頼できる場合だけ成立させる。単独ユーザーの計測（滞在秒数）は、本人の終了だけを
-信頼判定に使い、周囲の人数把握は他者の終了品質を問わずbest-effortで使ってよい
-（特定の誰かについての主張をしないため）。
+境界が信頼できる場合だけ成立させる。単独ユーザーの計測（滞在秒数）も、`trusted`と名乗る
+数字には信頼できない他者の境界を混ぜない——他者の終了が信頼できず、記録上の退出時刻より
+後もまだ居た可能性を否定できない場合、それ以降のsubject残り区間は人数帯そのものが
+不確かになるため`untrustedSeconds`側へ計上する。同様に empty-start-then-joined も、
+「先に居た他者はもう退出していた」と主張するには、その他者の終了が信頼できるか、記録上
+明確に在室していたことのどちらかが必要——終了が信頼できず退出時刻が不確かな他者を
+「もういなかった」と勝手に扱わない。
 
 window境界より前から継続していた訪問は、`startedAt` が境界でclipされているだけなので
 「開始イベント」として扱わない（`LogicalVisit.startClipped`）。同一秒のtieは前後関係を
 証明できないため、安全側（factを作らない）へ倒す。
+
+各derived関数の`userIds`引数の契約: `undefined`=全ユーザー対象、`[]`（空配列）=対象なし
+（何も返さない）。空配列を「絞り込みなし」と解釈すると、意図せず全ユーザーのデータを
+返してしまう事故になるため区別する。`computeSafeSocialAggregates`は`userIds`指定時、
+指定ユーザー以外の行を返さない——`computeCoPresenceOverlaps`は「少なくとも一方が指定
+ユーザー」であるpairを返す都合上、指定していない相手側にも部分的な重なりが乗るが、
+その相手の集計はchannel全体を見た完全なものではないため、指定時は指定ユーザー分だけを
+返す。
 
 ### BUMPの重要な契約
 
