@@ -5,6 +5,7 @@ import {
   type TitleSourceDefinition,
   type TitleSourceKey,
 } from "./v2-contract.js";
+import { assertSourceReaderCoverage } from "./v2-sources.js";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -208,6 +209,7 @@ export class TitleV2Store {
   ) {
     assertCounterBaselineSnapshotterCoverage();
     assertDerivedSourceDependenciesResolve();
+    assertSourceReaderCoverage();
     ensureTitleV2Schema(db);
   }
 
@@ -415,6 +417,20 @@ export class TitleV2Store {
       )
       .run(userId, titleKey, scopeKey, earnedAt, awardedAt);
     return result.changes === 1;
+  }
+
+  /**
+   * 既存awardの有無だけを確認する（副作用なし）。retired titleが新規awardを作らず、
+   * 既存awardだけ保持するかどうかの分岐に使う。
+   */
+  hasAward(userIdRaw: string, titleKeyRaw: string, scopeKeyRaw: string): boolean {
+    const userId = requireText(userIdRaw, "userId");
+    const titleKey = requireV2Key(titleKeyRaw);
+    const scopeKey = requireText(scopeKeyRaw, "scopeKey");
+    const row = this.db
+      .prepare(`SELECT 1 FROM title_awards WHERE user_id = ? AND title_key = ? AND scope_key = ?`)
+      .get(userId, titleKey, scopeKey);
+    return row !== undefined;
   }
 
   listAwards(userId: string): TitleAwardRow[] {
