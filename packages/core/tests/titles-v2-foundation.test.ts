@@ -37,9 +37,9 @@ describe("称号v2 foundation", () => {
   it("catalog施行は登録済みcounterを全件snapshotし、0件でも施行証跡を残す", () => {
     const db = openDb(":memory:");
     const bump = new BumpCounter(db);
-    bump.addOnce("msg-1", "alice");
-    bump.addOnce("msg-2", "alice");
-    bump.addOnce("msg-3", "bob");
+    bump.addOnce("msg-1", "alice", 10);
+    bump.addOnce("msg-2", "alice", 20);
+    bump.addOnce("msg-3", "bob", 30);
 
     const store = new TitleV2Store(db, () => 100);
     const applied = store.applyCatalog({ catalogKey: "v1", actor: "admin", note: "称号v2施行" });
@@ -73,7 +73,7 @@ describe("称号v2 foundation", () => {
   it("baseline読み取りはmetric typo・非counter source・run欠損を0扱いしない", () => {
     const db = openDb(":memory:");
     const bump = new BumpCounter(db);
-    bump.addOnce("msg-1", "alice");
+    bump.addOnce("msg-1", "alice", 10);
     const store = new TitleV2Store(db, () => 100);
     store.applyCatalog({ catalogKey: "v1", actor: "admin" });
 
