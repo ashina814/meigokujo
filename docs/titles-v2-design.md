@@ -38,14 +38,16 @@ OK: 誰もいない場所から始まる印があるらしい
 称号定義は必ず `TITLE_SOURCES` の登録済みsourceを宣言する。source contractは最低限、次を持つ。
 
 - `writtenBy`: 書き込み正本
-- `calledFrom`: 本番入口
+- `calledFrom`: writerを直接呼ぶ本番処理
+- `wiredFrom`: Discord event等から`calledFrom`までの最上流配線
 - `kind`: `history | counter`
 - `privacy`: `safe | restricted | forbidden`
 - `orderable`: source全体で達成時刻を正確に復元できるか
+- `titleUsable`: 個々の称号から直接参照してよいか
 - `epochPolicy`: カタログ施行境界の切り方。counterはbaseline metric名もここで固定する
 - `rawUnit`: DBの1行が何を意味するか
 
-sourceは一気に登録せず、writer/caller/境界を実コードで検証できたものだけ追加する。
+sourceは一気に登録せず、writer / caller / event wiring / 境界を実コードで検証できたものだけ追加する。
 
 ### VCの重要な契約
 
@@ -54,6 +56,15 @@ sourceは一気に登録せず、writer/caller/境界を実コードで検証で
 したがって `COUNT(vc_segments)` を「VC入室回数」と読んではいけない。raw unitは **voice state segment**。
 
 さらに `closeAllDangling()` はクラッシュ等で実退出時刻が分からないsegmentを「開始 + 上限（既定6時間）」で補正する。そのためraw `vc_segments` 全体は `orderable: false` とする。正確な時刻を保証できる行動は、後続のderived sourceで別契約にして `orderable: true` を持たせる。
+
+### BUMPの重要な契約
+
+BUMP / upの成功は既に `bump_events(message_id, user_id, created_at)` へ1件ずつ保存されている。称号では集計counterの `bump_counts` ではなく、この時刻付きhistoryを正本にする。
+
+- `bump_events`: `history / orderable:true / titleUsable:true`
+- `bump_counts`: ランキングとcounter baseline機構の監査用。`titleUsable:false`
+
+これにより、例えば「20回目の成功BUMP」をreconcileしても20件目の `created_at` から正確な `earned_at` を復元できる。既に持っている履歴を捨てて取得順を不明にしない。
 
 ## 4. SYSTEM_EPOCH / CATALOG_EPOCH
 

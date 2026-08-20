@@ -12,6 +12,7 @@ export {
   type TitleSourceKind,
   type TitleSourcePrivacy,
   type TitleTrigger,
+  type TitleUsableSourceKey,
 } from "./v2-contract.js";
 
 export {
