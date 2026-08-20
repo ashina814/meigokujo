@@ -182,6 +182,8 @@ award（TitleV2Store、matchedのときだけ）
 - `readTitleSource()` は、`sourceKey` がTypeScriptを迂回して（`as any`等で）titleUsable:falseや未登録の値を渡された場合でもruntimeでfail-closedする。
 - `assertSourceReaderCoverage()`（`TitleV2Store` construction時に自動実行）は、titleUsable:trueな全sourceに実際のreaderが存在することを検証する——「registryへ登録だけされているがreaderが無い」状態を黙って空データ扱いにしない。
 - `TitleSourceCache` が `(userId, sourceKey, scopeKey, start, end, observedAt)` 単位で1 evaluation batch内の重複読み込みを防ぐ。複数ruleが同じsourceを使っても、derived計算（PR2の一部はO(訪問数²)）をrule数だけ繰り返さない。永続cacheではない。
+- `bump_events` readerも `min(scope.end, scope.observedAt)` で読み込みを止める。VC readerは既にPR2のobservedAtをそのまま渡しているため、BUMP側だけscope.endまで無条件に読むと、同一evaluation内でsourceごとに時間軸がずれる（VCは観測時点まで、BUMPは未来まで、という不整合）。ただしBUMPはretryで後からcreated_atが過去のeventを挿入し得るため、「同じobservedAtなら永久にDB内容と一致する」とまでは言えない——observedAtは「event occurrenceの上限」として扱う。
+- `TitleRule` は公開structural interfaceなので、`defineTitleRule()` を経由せず手で組み立てたり構築後にdefinitionを書き換えたりできる。`evaluateTitle()` は入口で必ず `defineTitle(rule.definition)` を再度通す——さもないと `sources: []` のruleが「何も読まずに任意のearnedAtでaward」できてしまい、「source contractを条件実装から迂回させない」が破れる。
 
 `TitleEvaluationScope { scopeKey, start, end, observedAt }` はPR2の `TitleWindow` へそのまま渡せる形にしてある。scopeKeyの生成（global/month/event/catalog等）はこのPRの範囲外で、呼び出し側が解決済みのscopeを渡す。
 
@@ -326,6 +328,14 @@ v2カタログは `v2.*` 名前空間を使う。
 ## 14. 公開API
 
 v2基盤は `@meigokujo/core/titles/v2` を公開入口にする。後続のBot実装がcore内部pathへ依存しないようにする。
+
+root `packages/core/src/index.ts` からも、evaluator kernelの主要APIだけを最小限export する
+（`TitleV2Store` / `defineTitleRule` / `evaluateTitle` / `evaluateUser` / `evaluateBatch` /
+`TitleEvaluationScope` / `TitleEvaluationResult` / `TitleAwardOutcome` /
+`TitleRuleContext` / `TitleRuleResult`）。`readTitleSource()` 等の低レベルreader APIは
+rootへは出さない——称号条件作者が使うAPIと内部実装を区別する。旧v1にも `TitleRule` が
+存在するため、v2側は `TitleV2Rule` / `TitleV2RuleContext` / `TitleV2RuleResult` へalias
+する。
 
 ## 15. PR分割
 

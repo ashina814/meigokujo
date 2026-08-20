@@ -97,11 +97,20 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
   bump_events: (db, userId, scope) => {
     // 同秒tieはSQLの並びに任せる。「この人が何番目か」というcross-user順序は主張しない
     // ——このreaderが返すのは単一userのcreated_at列挙だけ。
+    //
+    // scope.observedAtより後のBUMPも読み込んではいけない——VC readerはPR2のwindowへ
+    // observedAtをそのまま渡して未来を計上しないのに、BUMP側だけscope.endまで無条件に
+    // 読むと、同一evaluation内でsourceごとに時間軸がずれてしまう（VCは観測時点まで、
+    // BUMPは未来まで、という不整合）。ただしこれは完全なDB snapshot再現ではない——
+    // BUMPはretryで後からcreated_atが過去のeventを挿入し得るため、「同じobservedAtなら
+    // 永久にDB内容と一致する」とまでは言えない。ここではobservedAtを
+    // 「event occurrenceの上限」として扱う。
+    const effectiveEnd = Math.min(scope.end, scope.observedAt);
     const rows = db
       .prepare(
         `SELECT created_at FROM bump_events WHERE user_id = ? AND created_at >= ? AND created_at < ? ORDER BY created_at ASC`,
       )
-      .all(userId, scope.start, scope.end) as Array<{ created_at: number }>;
+      .all(userId, scope.start, effectiveEnd) as Array<{ created_at: number }>;
     return { events: rows.map((r) => r.created_at) };
   },
   vc_empty_start_then_joined: (db, userId, scope) => {

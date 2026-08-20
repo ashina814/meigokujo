@@ -86,7 +86,13 @@ export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
   scope: TitleEvaluationScope,
   cache: TitleSourceCache = new TitleSourceCache(),
 ): TitleEvaluationResult {
-  const { definition } = rule;
+  // TitleRuleは公開structural interfaceなので、defineTitleRule()を経由せず手で組み立てた
+  // り、構築後にdefinitionを書き換えたりできてしまう（実際、このファイル自身のテストが
+  // defineTitleRuleを迂回したruleを作って検証している）。defineTitle()の検証
+  // （v2名前空間・source最低1件・登録済みsource・titleUsable・hidden/completion整合）を
+  // ここでも必ず通す——さもないと sources:[] のruleが「何も読まずに任意のearnedAtで
+  // award」を通せてしまい、「source contractを条件実装から迂回させない」が破れる。
+  const definition = defineTitle(rule.definition);
 
   if (definition.lifecycle === "disabled") {
     return { titleKey: definition.key, scopeKey: scope.scopeKey, outcome: "skipped", matched: false, earnedAt: null };

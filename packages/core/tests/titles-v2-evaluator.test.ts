@@ -300,6 +300,57 @@ describe("source reader completeness（§4, §8）", () => {
     evaluateTitle(db, store, rule, "alice", scope);
     expect(observedUndeclared).toBeUndefined();
   });
+
+  it("defineTitleRule()を迂回して手で組み立てたsources:[]のruleはevaluateTitle()でreject", () => {
+    const { db, store } = setup();
+    // defineTitleRule()を通さず直接TitleRuleを組み立てる。sources:[]はdefineTitle()なら
+    // 「at least one source is required」で拒否されるが、evaluateTitleが再検証しないと
+    // 「何も読まずに任意のearnedAtでaward」まで通ってしまう。
+    const forgedRule: TitleRule<never> = {
+      definition: {
+        key: "v2.test.forged",
+        catalog: "test",
+        name: "forged",
+        emoji: "x",
+        description: "source contractを迂回しようとする壊れたrule",
+        sources: [] as never,
+        trigger: "daily",
+        lifecycle: "active",
+        hidden: false,
+        countsForCompletion: false,
+        publicAnnounce: false,
+      },
+      evaluate: () => ({ matched: true, earnedAt: BASE }),
+    };
+
+    expect(() => evaluateTitle(db, store, forgedRule, "alice", scope)).toThrow(/at least one source/);
+    expect(store.listAwards("alice")).toEqual([]);
+  });
+
+  it("defineTitleRule()後にdefinitionをas anyで書き換えても、evaluateTitle()が再検証してreject", () => {
+    const { db, store } = setup();
+    const rule = defineTitleRule(
+      {
+        key: "v2.test.tampered",
+        catalog: "test",
+        name: "tampered",
+        emoji: "x",
+        description: "テスト用fixture",
+        sources: ["bump_events"] as const,
+        trigger: "bump_success",
+        lifecycle: "active",
+        hidden: false,
+        countsForCompletion: false,
+        publicAnnounce: false,
+      },
+      () => ({ matched: true, earnedAt: BASE }),
+    );
+    // construction後にdefinitionを直接書き換える（TypeScriptのreadonlyはruntimeを守らない）
+    (rule.definition as { sources: unknown }).sources = [];
+
+    expect(() => evaluateTitle(db, store, rule, "alice", scope)).toThrow(/at least one source/);
+    expect(store.listAwards("alice")).toEqual([]);
+  });
 });
 
 describe("bump_events reader（§15）", () => {
@@ -325,6 +376,21 @@ describe("bump_events reader（§15）", () => {
 
     const payload = readTitleSource(db, "bump_events", "alice", scope);
     expect(payload.events).toEqual([BASE, BASE + 10, BASE + 20]);
+  });
+
+  it("observedAtより後のBUMPは読まない（VC readerと同じ時間軸に揃える）", () => {
+    const { db } = setup();
+    const bump = new BumpCounter(db);
+    bump.addOnce("m1", "alice", BASE + 20);
+    bump.addOnce("m2", "alice", BASE + 80); // observedAtより後
+
+    const payload = readTitleSource(db, "bump_events", "alice", {
+      scopeKey: "s",
+      start: BASE,
+      end: BASE + 1000,
+      observedAt: BASE + 50,
+    });
+    expect(payload.events).toEqual([BASE + 20]);
   });
 });
 
@@ -549,5 +615,34 @@ describe("group-size ruleのpublicFacts経路", () => {
 
     const result = evaluateTitle(db, store, GROUP_SIZE_RULE, "alice", scope);
     expect(result.publicFacts).toMatchObject({ untrustedSeconds: 0 });
+  });
+});
+
+describe("root packages/core/src/index.ts からv2 evaluator APIを使える", () => {
+  it("TitleV2Store / defineTitleRule / evaluateTitle がroot importだけで動く", async () => {
+    const core = await import("../src/index.js");
+    const db = openDb(":memory:");
+    new BumpCounter(db);
+    const store = new core.TitleV2Store(db);
+
+    const rule = core.defineTitleRule(
+      {
+        key: "v2.test.root-export",
+        catalog: "test",
+        name: "test",
+        emoji: "x",
+        description: "root exportの疎通テスト",
+        sources: ["bump_events"] as const,
+        trigger: "bump_success",
+        lifecycle: "active",
+        hidden: false,
+        countsForCompletion: false,
+        publicAnnounce: false,
+      },
+      () => ({ matched: true, earnedAt: null }),
+    );
+
+    const result = core.evaluateTitle(db, store, rule, "alice", scope);
+    expect(result.outcome).toBe("awarded");
   });
 });

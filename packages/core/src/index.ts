@@ -264,6 +264,20 @@ export {
 } from "./rooms/service.js";
 export { TitleEngine, TitleHelper, TITLE_RULES, type TitleRule, type GrantedTitle } from "./titles/service.js";
 export {
+  TitleV2Store,
+  defineTitleRule,
+  evaluateBatch,
+  evaluateTitle,
+  evaluateUser,
+  type TitleAwardOutcome,
+  type TitleEvaluationResult,
+  type TitleEvaluationScope,
+  // 旧v1のTitleRuleと名前が衝突するためV2を付けてalias。
+  type TitleRule as TitleV2Rule,
+  type TitleRuleContext as TitleV2RuleContext,
+  type TitleRuleResult as TitleV2RuleResult,
+} from "./titles/v2.js";
+export {
   Departments,
   DepartmentError,
   deptAccount,
