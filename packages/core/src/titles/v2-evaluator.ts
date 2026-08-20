@@ -92,18 +92,35 @@ export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
   // （v2名前空間・source最低1件・登録済みsource・titleUsable・hidden/completion整合）を
   // ここでも必ず通す——さもないと sources:[] のruleが「何も読まずに任意のearnedAtで
   // award」を通せてしまい、「source contractを条件実装から迂回させない」が破れる。
-  const definition = defineTitle(rule.definition);
+  //
+  // ただし defineTitle() はdefinitionをcopyせず同じobjectを返すため、それだけでは
+  // 足りない——rule.evaluate() の実行中に rule.definition（同一参照）を書き換えられると、
+  // 評価後のorderable判定がその改竄後の値を見てしまう（入口の再検証をすり抜ける）。
+  // sourcesを含めて独立したcopyを作り、以降はこのcopyだけを使う。
+  const definition = defineTitle({ ...rule.definition, sources: [...rule.definition.sources] });
 
   if (definition.lifecycle === "disabled") {
     return { titleKey: definition.key, scopeKey: scope.scopeKey, outcome: "skipped", matched: false, earnedAt: null };
   }
 
+  // scopeも呼び出し側から渡されたobjectそのもの。ctx.scopeとして直接渡すと、rule内で
+  // scopeKey等を書き換えた場合、評価後にawardへ渡すscopeKeyまで変わってしまう
+  // （sourceの読み込みキャッシュとaward先のscopeがズレる）。値だけを取り出したcopyを
+  // evaluator側で保持し、ruleへは毎回さらに別のcopyを渡す——ruleが受け取ったcopyを
+  // どういじっても、evaluator側のresolvedScopeには一切影響しない。
+  const resolvedScope: TitleEvaluationScope = {
+    scopeKey: scope.scopeKey,
+    start: scope.start,
+    end: scope.end,
+    observedAt: scope.observedAt,
+  };
+
   const sources = {} as { [K in S[number]]: TitleSourcePayloads[K] };
   for (const sourceKey of definition.sources) {
-    (sources as Record<string, unknown>)[sourceKey] = cache.get(db, sourceKey, userId, scope);
+    (sources as Record<string, unknown>)[sourceKey] = cache.get(db, sourceKey, userId, resolvedScope);
   }
 
-  const result = rule.evaluate({ userId, scope, sources });
+  const result = rule.evaluate({ userId, scope: { ...resolvedScope }, sources });
 
   if (result.earnedAt !== null && !allSourcesOrderable(definition.sources)) {
     throw new Error(
@@ -115,7 +132,7 @@ export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
   if (!result.matched) {
     return {
       titleKey: definition.key,
-      scopeKey: scope.scopeKey,
+      scopeKey: resolvedScope.scopeKey,
       outcome: "not_matched",
       matched: false,
       earnedAt: null,
@@ -124,12 +141,12 @@ export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
   }
 
   if (definition.lifecycle === "retired") {
-    const outcome: TitleAwardOutcome = store.hasAward(userId, definition.key, scope.scopeKey)
+    const outcome: TitleAwardOutcome = store.hasAward(userId, definition.key, resolvedScope.scopeKey)
       ? "already_awarded"
       : "skipped";
     return {
       titleKey: definition.key,
-      scopeKey: scope.scopeKey,
+      scopeKey: resolvedScope.scopeKey,
       outcome,
       matched: true,
       earnedAt: result.earnedAt,
@@ -137,10 +154,15 @@ export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
     };
   }
 
-  const awarded = store.award({ userId, titleKey: definition.key, scopeKey: scope.scopeKey, earnedAt: result.earnedAt });
+  const awarded = store.award({
+    userId,
+    titleKey: definition.key,
+    scopeKey: resolvedScope.scopeKey,
+    earnedAt: result.earnedAt,
+  });
   return {
     titleKey: definition.key,
-    scopeKey: scope.scopeKey,
+    scopeKey: resolvedScope.scopeKey,
     outcome: awarded ? "awarded" : "already_awarded",
     matched: true,
     earnedAt: result.earnedAt,

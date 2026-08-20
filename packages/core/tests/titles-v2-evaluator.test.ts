@@ -581,6 +581,115 @@ describe("earnedAt contract（§11）", () => {
   });
 });
 
+describe("evaluator所有のsnapshot（rule実行中の契約object書き換え対策）", () => {
+  it("evaluate()実行中にrule.definition.sourcesを改竄しても、orderable判定は改竄前のsnapshotを使う", () => {
+    const { db, store } = setup();
+    insertVcSegment(db, "alice", "vc1", BASE, BASE + 100, "observed");
+    insertVcSegment(db, "bob", "vc1", BASE + 50, BASE + 80, "observed");
+
+    // eslint的には`const`にしたいところだが、evaluate()から自分自身(rule.definition)を
+    // 書き換えるにはrule変数を閉じ込める必要がある。
+    let selfMutatingRule!: TitleRule<readonly ["vc_empty_start_then_joined"]>;
+    selfMutatingRule = defineTitleRule(
+      {
+        key: "v2.test.self-mutating-sources",
+        catalog: "test",
+        name: "test",
+        emoji: "x",
+        description: "評価中に自分のdefinition.sourcesをorderable:trueなsourceへ改竄する",
+        sources: ["vc_empty_start_then_joined"] as const,
+        trigger: "vc_leave",
+        lifecycle: "active",
+        hidden: false,
+        countsForCompletion: false,
+        publicAnnounce: false,
+      },
+      () => {
+        // orderable:falseなVC sourceのruleのはずなのに、評価中にorderable:trueな
+        // bump_eventsへ差し替えて、直後のearnedAt検証をすり抜けようとする。
+        (selfMutatingRule.definition as { sources: unknown }).sources = ["bump_events"];
+        return { matched: true, earnedAt: BASE + 999 };
+      },
+    );
+
+    expect(() => evaluateTitle(db, store, selfMutatingRule, "alice", scope)).toThrow(/non-orderable/);
+    expect(store.listAwards("alice")).toEqual([]);
+  });
+
+  it("ruleがctx.scope.scopeKeyを改竄しても、awardは元のscopeKeyを使う", () => {
+    const { db, store } = setup();
+    const bump = new BumpCounter(db);
+    bump.addOnce("m1", "alice", BASE);
+
+    const scopeHijackRule = defineTitleRule(
+      {
+        key: "v2.test.scope-hijack",
+        catalog: "test",
+        name: "test",
+        emoji: "x",
+        description: "ctx.scopeを書き換えてaward先scopeをズラそうとする",
+        sources: ["bump_events"] as const,
+        trigger: "bump_success",
+        lifecycle: "active",
+        hidden: false,
+        countsForCompletion: false,
+        publicAnnounce: false,
+      },
+      (ctx) => {
+        (ctx.scope as { scopeKey: string }).scopeKey = "hijacked-scope";
+        return { matched: true, earnedAt: null };
+      },
+    );
+
+    const result = evaluateTitle(db, store, scopeHijackRule, "alice", scope);
+    expect(result.scopeKey).toBe(scope.scopeKey);
+
+    const awards = store.listAwards("alice");
+    expect(awards).toHaveLength(1);
+    expect(awards[0]!.scope_key).toBe(scope.scopeKey);
+  });
+
+  it("先行ruleがcached payloadを書き換えようとしても、後続ruleは汚染されていない値を見る", () => {
+    const { db, store } = setup();
+    const bump = new BumpCounter(db);
+    bump.addOnce("m1", "alice", BASE);
+    bump.addOnce("m2", "alice", BASE + 10);
+    bump.addOnce("m3", "alice", BASE + 20);
+
+    let mutationAttemptThrew = false;
+    const tamperingRule = defineTitleRule(
+      {
+        key: "v2.test.tamper-payload",
+        catalog: "test",
+        name: "test",
+        emoji: "x",
+        description: "cacheされたpayloadを直接書き換えようとする",
+        sources: ["bump_events"] as const,
+        trigger: "bump_success",
+        lifecycle: "active",
+        hidden: false,
+        countsForCompletion: false,
+        publicAnnounce: false,
+      },
+      (ctx) => {
+        try {
+          (ctx.sources.bump_events.events as number[]).push(999_999_999);
+        } catch {
+          mutationAttemptThrew = true;
+        }
+        return { matched: false, earnedAt: null };
+      },
+    );
+
+    // tamperingRuleとTHIRD_BUMP_RULEは同じuser/scope/bump_eventsを共有するので、
+    // cacheが1回だけ読んだ同じpayload objectをどちらも受け取る。
+    const [, thirdBumpResult] = evaluateUser(db, store, [tamperingRule, THIRD_BUMP_RULE], "alice", scope);
+
+    expect(mutationAttemptThrew).toBe(true); // freezeされているので書き込みは例外になる
+    expect(thirdBumpResult!.earnedAt).toBe(BASE + 20); // 汚染されず3件のまま読める
+  });
+});
+
 describe("publicFacts safety（§10）", () => {
   it("publicFactsへrestricted counterpart IDが出ない", () => {
     const { db, store } = setup();

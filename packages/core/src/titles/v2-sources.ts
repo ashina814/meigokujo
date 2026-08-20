@@ -189,7 +189,22 @@ export function readTitleSource<K extends TitleUsableSourceKey>(
   if (!reader) {
     throw new Error(`missing source reader for titleUsable source: ${String(sourceKey)}`);
   }
-  return reader(db, userId, scope) as TitleSourcePayloads[K];
+  // payloadはTitleSourceCache経由で複数ruleへ同じ参照が配られる。1つのruleが受け取った
+  // payloadを書き換えると、後続ruleが汚染された値を見てしまう——deep-freezeして、
+  // 書き換えようとしたら（strict modeで）例外にする。読み込みのたびに新しいobjectを
+  // 作るreader関数の性質上、freezeしても他の呼び出しへ影響しない。
+  return deepFreeze(reader(db, userId, scope)) as TitleSourcePayloads[K];
+}
+
+/** 配列・ネストしたobjectも含めて再帰的にfreezeする。payloadは循環参照を持たない前提。 */
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const key of Object.getOwnPropertyNames(value)) {
+      deepFreeze((value as Record<string, unknown>)[key]);
+    }
+  }
+  return value;
 }
 
 /**

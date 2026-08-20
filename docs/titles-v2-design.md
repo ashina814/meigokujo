@@ -184,6 +184,8 @@ award（TitleV2Store、matchedのときだけ）
 - `TitleSourceCache` が `(userId, sourceKey, scopeKey, start, end, observedAt)` 単位で1 evaluation batch内の重複読み込みを防ぐ。複数ruleが同じsourceを使っても、derived計算（PR2の一部はO(訪問数²)）をrule数だけ繰り返さない。永続cacheではない。
 - `bump_events` readerも `min(scope.end, scope.observedAt)` で読み込みを止める。VC readerは既にPR2のobservedAtをそのまま渡しているため、BUMP側だけscope.endまで無条件に読むと、同一evaluation内でsourceごとに時間軸がずれる（VCは観測時点まで、BUMPは未来まで、という不整合）。ただしBUMPはretryで後からcreated_atが過去のeventを挿入し得るため、「同じobservedAtなら永久にDB内容と一致する」とまでは言えない——observedAtは「event occurrenceの上限」として扱う。
 - `TitleRule` は公開structural interfaceなので、`defineTitleRule()` を経由せず手で組み立てたり構築後にdefinitionを書き換えたりできる。`evaluateTitle()` は入口で必ず `defineTitle(rule.definition)` を再度通す——さもないと `sources: []` のruleが「何も読まずに任意のearnedAtでaward」できてしまい、「source contractを条件実装から迂回させない」が破れる。
+- ただし `defineTitle()` はdefinitionをcopyせず同じobjectを返すため、それだけでは足りない。`rule.evaluate()` の実行**中**に `rule.definition`（同一参照）を書き換えられると、評価後のorderable判定がその改竄後の値を見てしまい、入口の再検証をすり抜けられる（VC専用ruleがevaluate()の中で自分のsourcesをorderable:trueな`bump_events`へ差し替え、非nullなearnedAtを通す、等）。`evaluateTitle()` は `sources` を含めて独立したcopyを作り、以降はそのcopyだけを使う。`scope` も同様に、ctx.scopeとして渡す前に値だけを取り出したcopyへ変換する——ruleがctx.scopeを書き換えても、award先のscopeKeyには影響しない。
+- source payloadはTitleSourceCache経由で複数ruleへ同じ参照が配られる。1つのruleが受け取ったpayloadを（配列への`push()`等で）書き換えると、後続ruleが汚染された値を見てしまう。`readTitleSource()` はpayloadを再帰的にdeep-freezeしてから返す——書き換えようとすると（strict modeで）例外になる。
 
 `TitleEvaluationScope { scopeKey, start, end, observedAt }` はPR2の `TitleWindow` へそのまま渡せる形にしてある。scopeKeyの生成（global/month/event/catalog等）はこのPRの範囲外で、呼び出し側が解決済みのscopeを渡す。
 
