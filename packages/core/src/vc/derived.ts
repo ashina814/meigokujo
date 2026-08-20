@@ -33,8 +33,12 @@ import type Database from "better-sqlite3";
  * 'partial_observation'——本人は既にそこにいて、単に状態変化を再観測しただけなので、
  * 「入室した」「後から来た」等のイベントを主張するfactには使えない。
  *
- * `TitleWindow.end` が未来を指していても、open visit（まだ退室記録の無い訪問）は
- * `observedAt`（省略時は現在時刻）より先までtrustedな継続として計上しない。
+ * `TitleWindow.end` が未来を指していても、evaluationは `observedAt`（省略時は現在時刻）
+ * より先までtrustedとして計上しない。これはopen visitの終了時刻だけの話ではない
+ * ——`observedAt` より後に作られた行（別ユーザーの新規入室・後から確定した退室時刻等）は
+ * クエリの読み込み段階からそもそも見ない。そうしないと「同じ `observedAt` で再評価すれば
+ * 常に同じ結果になる」というreconcileの再現性が壊れる（DBが後から進んでも、過去の
+ * `observedAt` 時点の評価結果は変わらないという前提）。
  */
 
 export interface TitleWindow {
@@ -43,12 +47,14 @@ export interface TitleWindow {
   /** exclusive */
   end: number;
   /**
-   * このwindowを評価する時刻（省略時は呼び出し時点の現在時刻）。
+   * このwindowを「実際に見ていた」時刻（省略時は呼び出し時点の現在時刻）。
    *
-   * open visit（まだ退室記録の無い訪問）は、window.endまでtrustedな継続として計上する。
-   * しかしwindow.endはカタログ施行境界（「今月」「今日」等）から機械的に作られることが
-   * 多く、未来を指し得る——その場合、まだ観測してすらいない未来時間まで在室したことに
-   * なってしまう。observedAtは「実際にはここまでしか見ていない」という上限を明示する。
+   * `effectiveEnd = min(end, observedAt)` が、クエリの読み込み境界・open visitの打ち切り・
+   * 全ての結果clippingに共通して使われる上限になる——`end` だけでなく `observedAt` も
+   * 一度resolveした上でクエリそのものに反映するのはこのため。`end` はカタログ施行境界
+   * （「今月」「今日」等）から機械的に作られることが多く、未来を指し得る。`observedAt` は
+   * 「実際にはここまでしか見ていない」という上限を明示し、同じ `observedAt` で再評価すれば
+   * DBが後から進んでも常に同じ結果になることを保証する。
    */
   observedAt?: number;
 }
@@ -110,6 +116,37 @@ function clampWindow(window: TitleWindow): void {
 
 const now = (): number => Math.floor(Date.now() / 1000);
 
+/**
+ * `observedAt`（省略時はnow()）を**1回だけ**解決し、そのeffectiveEndをクエリ・coalesce・
+ * clippingの全段で一貫して使う。呼び出しのたびにnow()を評価し直すと、大量のopen visitを
+ * 処理する間に秒境界をまたぎ、同じ1回の集計内でユーザーごとに違う打ち切り時刻を持って
+ * しまう（Aliceは14:00:00、Bobは14:00:01、など）。exported関数の入口で1回だけ呼ぶこと。
+ */
+interface ResolvedWindow {
+  start: number;
+  /** = min(元のwindow.end, 解決済みobservedAt) */
+  end: number;
+  /**
+   * trueなら、endを決めた側はobservedAt（＝ここから先はまだ観測していない未来かもしれない）。
+   * falseなら呼び出し側が明示的に選んだwindow.end側（データ自体は既知で、単なるscope制限）。
+   * coalesceVisits()が「実データの終了はendedAtだが観測境界より後」を'open'として扱うかの
+   * 判定に使う——観測境界による打ち切りなら'open'、単なるscope制限による打ち切りなら
+   * 元のend_qualityを保つ（既存のwindow.endクリッピングの意味を変えないため）。
+   */
+  observationLimited: boolean;
+}
+
+function resolveWindow(window: TitleWindow): ResolvedWindow {
+  clampWindow(window);
+  const resolvedObservedAt = window.observedAt ?? now();
+  return {
+    start: window.start,
+    end: Math.min(window.end, resolvedObservedAt),
+    // 同値ならobservedAt側とみなす（安全側）
+    observationLimited: resolvedObservedAt <= window.end,
+  };
+}
+
 interface RawSegmentRow {
   id: number;
   user_id: string;
@@ -128,7 +165,7 @@ interface RawSegmentRow {
  */
 function loadRawSegments(
   db: Database.Database,
-  window: TitleWindow,
+  window: ResolvedWindow,
   userIds?: readonly string[],
 ): RawSegmentRow[] {
   if (userIds && userIds.length === 0) return [];
@@ -153,7 +190,7 @@ function loadRawSegments(
 
 function loadRawSegmentsForChannels(
   db: Database.Database,
-  window: TitleWindow,
+  window: ResolvedWindow,
   channelIds: readonly string[],
 ): RawSegmentRow[] {
   if (channelIds.length === 0) return [];
@@ -171,9 +208,10 @@ function loadRawSegmentsForChannels(
 
 /**
  * rowから直接logical visitsを合成する。呼び出し側は既に必要な行をロード済みという前提。
- * 行は user_id, started_at, id 順（loadRawSegments系が保証する）。
+ * 行は user_id, started_at, id 順（loadRawSegments系が保証する）。windowは
+ * `resolveWindow()` 済みのものを渡すこと（呼び出しのたびにnow()を評価し直さないため）。
  */
-function coalesceVisits(rows: readonly RawSegmentRow[], window: TitleWindow): LogicalVisit[] {
+function coalesceVisits(rows: readonly RawSegmentRow[], window: ResolvedWindow): LogicalVisit[] {
   const visits: LogicalVisit[] = [];
 
   type Open = {
@@ -192,22 +230,25 @@ function coalesceVisits(rows: readonly RawSegmentRow[], window: TitleWindow): Lo
     if (!current) return;
     let endedAt: number;
     let endQuality: LogicalVisitEndQuality;
-    if (current.lastEndedAt === null) {
-      // まだ開いている（closeAllDanglingも未通過）。「今」より先は観測していないので、
-      // window.endが未来を指していても observedAt（省略時はDate.now()）までしか
-      // trustedな継続として計上しない——さもないと「今月」「今日」のような機械的な
-      // window.endを渡しただけで、現在時刻より先まで在室したことにできてしまう。
-      endedAt = Math.min(window.end, window.observedAt ?? now());
+    // まだ開いている、または実データの終了が観測境界（=resolved window.end）より後——
+    // どちらにせよ、これより先は「実際に観測できていない」ため、window.endで打ち切って
+    // trusted 'open' として扱う。window.endがscope制限（呼び出し側が明示的に選んだend）
+    // 側で決まっている場合は、実データの終了自体は既知なので元のend_qualityを保つ
+    // （既存の「windowでscopeを絞るとclipされる」挙動を変えないため）。
+    const truncatedByObservation =
+      current.lastEndedAt === null || (window.observationLimited && current.lastEndedAt > window.end);
+    if (truncatedByObservation) {
+      endedAt = window.end;
       endQuality = "open";
     } else if (current.lastEndQuality === "observed") {
-      endedAt = current.lastEndedAt;
+      endedAt = current.lastEndedAt!;
       endQuality = "observed";
     } else if (current.lastEndQuality === "recovered_estimate") {
-      endedAt = current.lastEndedAt;
+      endedAt = current.lastEndedAt!;
       endQuality = "recovered_estimate";
     } else {
       // legacy行（end_quality列追加前にclosedになった行）。品質不明のまま扱う。
-      endedAt = current.lastEndedAt;
+      endedAt = current.lastEndedAt!;
       endQuality = "unknown";
     }
 
@@ -293,14 +334,21 @@ function coalesceVisits(rows: readonly RawSegmentRow[], window: TitleWindow): Lo
  * 単純に user_id + channel_id で GROUP BY してはいけない
  * （退出→再入室が同じチャンネルなら誤って1訪問に潰れてしまう）。
  */
+function computeLogicalVisitsResolved(
+  db: Database.Database,
+  resolved: ResolvedWindow,
+  userIds?: readonly string[],
+): LogicalVisit[] {
+  const rows = loadRawSegments(db, resolved, userIds);
+  return coalesceVisits(rows, resolved);
+}
+
 export function computeLogicalVisits(
   db: Database.Database,
   window: TitleWindow,
   userIds?: readonly string[],
 ): LogicalVisit[] {
-  clampWindow(window);
-  const rows = loadRawSegments(db, window, userIds);
-  return coalesceVisits(rows, window);
+  return computeLogicalVisitsResolved(db, resolveWindow(window), userIds);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -335,13 +383,13 @@ export function computeEmptyStartThenJoined(
   window: TitleWindow,
   userIds?: readonly string[],
 ): EmptyStartThenJoinedFact[] {
-  clampWindow(window);
-  const subjectVisits = computeLogicalVisits(db, window, userIds);
+  const resolved = resolveWindow(window);
+  const subjectVisits = computeLogicalVisitsResolved(db, resolved, userIds);
   if (subjectVisits.length === 0) return [];
 
   const channelIds = [...new Set(subjectVisits.map((v) => v.channelId))];
-  const allRows = loadRawSegmentsForChannels(db, window, channelIds);
-  const allVisits = coalesceVisits(allRows, window);
+  const allRows = loadRawSegmentsForChannels(db, resolved, channelIds);
+  const allVisits = coalesceVisits(allRows, resolved);
   const byChannel = groupByChannel(allVisits);
 
   const facts: EmptyStartThenJoinedFact[] = [];
@@ -413,13 +461,13 @@ export function computeLastOccupant(
   window: TitleWindow,
   userIds?: readonly string[],
 ): LastOccupantFact[] {
-  clampWindow(window);
-  const subjectVisits = computeLogicalVisits(db, window, userIds);
+  const resolved = resolveWindow(window);
+  const subjectVisits = computeLogicalVisitsResolved(db, resolved, userIds);
   if (subjectVisits.length === 0) return [];
 
   const channelIds = [...new Set(subjectVisits.map((v) => v.channelId))];
-  const allRows = loadRawSegmentsForChannels(db, window, channelIds);
-  const allVisits = coalesceVisits(allRows, window);
+  const allRows = loadRawSegmentsForChannels(db, resolved, channelIds);
+  const allVisits = coalesceVisits(allRows, resolved);
   const byChannel = groupByChannel(allVisits);
 
   const facts: LastOccupantFact[] = [];
@@ -504,13 +552,13 @@ export function computeGroupSizeSeconds(
   window: TitleWindow,
   userIds?: readonly string[],
 ): GroupSizeSeconds[] {
-  clampWindow(window);
-  const subjectVisits = computeLogicalVisits(db, window, userIds);
+  const resolved = resolveWindow(window);
+  const subjectVisits = computeLogicalVisitsResolved(db, resolved, userIds);
   if (subjectVisits.length === 0) return [];
 
   const channelIds = [...new Set(subjectVisits.map((v) => v.channelId))];
-  const allRows = loadRawSegmentsForChannels(db, window, channelIds);
-  const allVisits = coalesceVisits(allRows, window);
+  const allRows = loadRawSegmentsForChannels(db, resolved, channelIds);
+  const allVisits = coalesceVisits(allRows, resolved);
   const byChannel = groupByChannel(allVisits);
 
   const results = new Map<string, GroupSizeSeconds>();
@@ -642,13 +690,13 @@ export function computeCoPresenceOverlaps(
   window: TitleWindow,
   userIds?: readonly string[],
 ): CoPresenceOverlap[] {
-  clampWindow(window);
-  const subjectVisits = computeLogicalVisits(db, window, userIds);
+  const resolved = resolveWindow(window);
+  const subjectVisits = computeLogicalVisitsResolved(db, resolved, userIds);
   if (subjectVisits.length === 0) return [];
 
   const channelIds = [...new Set(subjectVisits.map((v) => v.channelId))];
-  const allRows = loadRawSegmentsForChannels(db, window, channelIds);
-  const allVisits = coalesceVisits(allRows, window);
+  const allRows = loadRawSegmentsForChannels(db, resolved, channelIds);
+  const allVisits = coalesceVisits(allRows, resolved);
   const byChannel = groupByChannel(allVisits);
 
   const subjectSet = userIds ? new Set(userIds) : null;

@@ -124,8 +124,13 @@ tie判定から消さない）。
 （中間source）にした。称号は必ず `vc_visits` より下流のderived sourceを使う。
 
 `TitleWindow.end` が未来（「今月」「今日」等のカタログ境界から機械的に作られる）を指して
-いても、open visit（まだ退室記録の無い訪問）は `TitleWindow.observedAt`（省略時は現在
-時刻）より先までtrustedな継続として計上しない。
+いても、evaluationは `TitleWindow.observedAt`（省略時は現在時刻）より先までtrustedとして
+計上しない。`effectiveEnd = min(end, observedAt)` は1回のexported関数呼び出しにつき
+`resolveWindow()` で1回だけ解決し、クエリの読み込み境界・coalesce・clippingの全段で
+一貫して使う——open visitの終了時刻だけの話ではなく、`observedAt` より後に作られた行
+（別ユーザーの新規入室・後から確定した退室時刻等）はクエリの読み込み段階からそもそも
+見ない。そうしないと、同じ `observedAt` で再評価してもDBが後から進むと結果が変わって
+しまい、reconcileの再現性（「あの時点で何が分かっていたか」の再構築）が壊れる。
 
 各derived関数の`userIds`引数の契約: `undefined`=全ユーザー対象、`[]`（空配列）=対象なし
 （何も返さない）。空配列を「絞り込みなし」と解釈すると、意図せず全ユーザーのデータを

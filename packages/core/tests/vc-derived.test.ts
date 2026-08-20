@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { VcTracker } from "../src/vc/service.js";
 import {
@@ -11,10 +11,19 @@ import {
   isTrustedVisitEnd,
 } from "../src/vc/derived.js";
 
-afterEach(() => vi.useRealTimers());
-
 /** JST 2026-08-20 00:00:00 を秒0とする、テスト用の基準時刻。 */
 const BASE = Math.floor(Date.UTC(2026, 7, 19, 15, 0, 0) / 1000);
+
+// derived.ts の各exported関数はobservedAt省略時にDate.now()をデフォルトとして使う。
+// これがテスト実行時の実際の壁時計時刻へ依存すると、BASE（今日基準の定数）に近い
+// window.endを使うテストが実行タイミングによって化ける（flakeになる）。
+// ここでBASEより十分先（かつ後述の「100年超」テストの範囲よりは手前）へ固定し、
+// テストごとに個別のvi.setSystemTime()で上書きできるようにする。
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date((BASE + 500_000) * 1000));
+});
+afterEach(() => vi.useRealTimers());
 
 function setup() {
   const db = openDb(":memory:");
@@ -454,7 +463,11 @@ describe("jstDatesInIntervalの安全策", () => {
     insertRaw("alice", "vc1", start, end, "observed");
     insertRaw("bob", "vc1", start, end, "observed");
 
-    expect(() => computeCoPresenceOverlaps(db, { start: start - 10, end: end + 10 })).toThrow(/more than/);
+    // observedAtを明示してwindow.end全体を「実際に見た」ことにする——省略時はDate.now()が
+    // デフォルトになり、この200年区間全体を評価する前提が崩れてしまう。
+    expect(() =>
+      computeCoPresenceOverlaps(db, { start: start - 10, end: end + 10, observedAt: end + 10 }),
+    ).toThrow(/more than/);
   });
 });
 
@@ -496,6 +509,46 @@ describe("open visitの未来window clamp", () => {
 
     const overlaps = computeCoPresenceOverlaps(db, { start: BASE, end: BASE + 100_000 });
     expect(overlaps).toEqual([{ userA: "alice", userB: "bob", overlapSeconds: 300, jstDays: expect.any(Array) }]);
+  });
+
+  it("observedAtより後に開始した行は、クエリの読み込み段階から一切見えない", () => {
+    const { db, insertRaw } = setup();
+    const observedAt = BASE + 100;
+    insertRaw("alice", "vc1", BASE, BASE + 150, "observed", null, "join");
+    // bobの入室(120)はobservedAt(100)より後——12:00時点ではまだ起きていなかった出来事
+    insertRaw("bob", "vc1", BASE + 120, BASE + 140, "observed", null, "join");
+
+    const visits = computeLogicalVisits(db, { start: BASE, end: BASE + 1000, observedAt });
+    expect(visits).toEqual([
+      expect.objectContaining({ userId: "alice", startedAt: BASE, endedAt: observedAt, endQuality: "open" }),
+    ]);
+    // bobはalice側のfactからも見えない（empty-start-then-joinedのlaterJoin候補にもならない）
+    expect(visits.some((v) => v.userId === "bob")).toBe(false);
+  });
+
+  it("同じobservedAtで再評価すれば、後からDB状態が進んでも結果が変わらない（reconcileの再現性）", () => {
+    const { db, insertRaw } = setup();
+    const observedAt = BASE + 100;
+    const window = { start: BASE, end: BASE + 1000, observedAt };
+
+    // 12:00時点で評価: aliceはまだ開いている（実際にはこの後12:30に退出する）
+    insertRaw("alice", "vc1", BASE, null, null, null, "join");
+    const before = computeLogicalVisits(db, window);
+    expect(before).toEqual([
+      expect.objectContaining({ userId: "alice", startedAt: BASE, endedAt: observedAt, endQuality: "open" }),
+    ]);
+
+    // 後からDB状態が進む: aliceが実際にBASE+130で退出、bobがBASE+150で入室
+    db.prepare("UPDATE vc_segments SET ended_at = ?, end_quality = 'observed' WHERE user_id = 'alice'").run(
+      BASE + 130,
+    );
+    insertRaw("bob", "vc1", BASE + 150, BASE + 200, "observed", null, "join");
+
+    // 同じobservedAtで再評価すると、DBがどれだけ進んでいても「12:00時点で分かっていたこと」
+    // と同じ結果になる——実際の退出時刻(130)がobservedAt(100)より後でも、それを先取りして
+    // 見せない（endQualityも'open'のまま。'observed'へ格上げすると再現性が壊れる）。
+    const after = computeLogicalVisits(db, window);
+    expect(after).toEqual(before);
   });
 });
 
