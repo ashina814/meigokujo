@@ -3,6 +3,8 @@ import { bumpMessageText, checkBumpCooldowns, handleBumpMessage } from "../src/b
 
 const DISBOARD_ID = "302050872383242240";
 const DISSOKU_ID = "761562078095867916";
+const BUMP_MESSAGE_CREATED_AT_MS = new Date("2026-07-24T23:59:49+09:00").getTime();
+const BUMP_MESSAGE_CREATED_AT_SEC = Math.floor(BUMP_MESSAGE_CREATED_AT_MS / 1000);
 
 function services(overrides: Record<string, unknown> = {}) {
   const stringSettings: Record<string, string | undefined> = {
@@ -35,6 +37,7 @@ function message(kind: "disboard" | "dissoku", overrides: Record<string, unknown
   const send = vi.fn(async () => undefined);
   const base = {
     id: "message-1",
+    createdTimestamp: BUMP_MESSAGE_CREATED_AT_MS,
     author: { bot: true, id: isDisboard ? DISBOARD_ID : DISSOKU_ID },
     guildId: "guild-main",
     channelId: "channel-bump",
@@ -90,7 +93,7 @@ describe("bump/up メッセージ検知", () => {
         idempotencyKey: "bump:message-1",
       }),
     );
-    expect(s.bumps.addOnce).toHaveBeenCalledWith("message-1", "user-1");
+    expect(s.bumps.addOnce).toHaveBeenCalledWith("message-1", "user-1", BUMP_MESSAGE_CREATED_AT_SEC);
     expect(s.settings.set).toHaveBeenCalledWith(
       "bump:cooldown:dissoku",
       { until: Math.floor(Date.now() / 1000) + 7_200, channelId: "channel-bump" },
@@ -108,7 +111,7 @@ describe("bump/up メッセージ検知", () => {
     expect(s.ledger.transfer).toHaveBeenCalledWith(
       expect.objectContaining({ reason: "bump報酬", idempotencyKey: "bump:message-1" }),
     );
-    expect(s.bumps.addOnce).toHaveBeenCalledWith("message-1", "user-1");
+    expect(s.bumps.addOnce).toHaveBeenCalledWith("message-1", "user-1", BUMP_MESSAGE_CREATED_AT_SEC);
   });
 
   it("ディス速の失敗メッセージには支給しない", async () => {
@@ -165,7 +168,7 @@ describe("bump/up メッセージ検知", () => {
 
     await handleBumpMessage(m.value, s);
 
-    expect(s.bumps.addOnce).toHaveBeenCalledWith("message-1", "user-1");
+    expect(s.bumps.addOnce).toHaveBeenCalledWith("message-1", "user-1", BUMP_MESSAGE_CREATED_AT_SEC);
     expect(m.send).not.toHaveBeenCalled();
   });
 
@@ -177,7 +180,7 @@ describe("bump/up メッセージ検知", () => {
     await handleBumpMessage(m.value, s);
 
     expect(s.ledger.transfer).not.toHaveBeenCalled();
-    expect(s.bumps.addOnce).toHaveBeenCalledWith("message-1", "user-1");
+    expect(s.bumps.addOnce).toHaveBeenCalledWith("message-1", "user-1", BUMP_MESSAGE_CREATED_AT_SEC);
     expect(s.settings.set).toHaveBeenCalledWith(
       "bump:cooldown:dissoku",
       expect.any(Object),

@@ -7,7 +7,8 @@
     ".": "./src/index.ts",
     "./casino/remittance": "./src/casino/remittance.ts",
     "./evaluation/forum": "./src/evaluation/forum.ts",
-    "./ledger/boost-reward": "./src/ledger/boost-guard.ts"
+    "./ledger/boost-reward": "./src/ledger/boost-guard.ts",
+    "./titles/v2": "./src/titles/v2.ts"
   },
   "scripts": {
     "test": "vitest run && vitest run --config vitest.serial.config.ts",

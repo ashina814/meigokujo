@@ -16,17 +16,22 @@ export class BumpCounter {
 
   /**
    * 同じDiscordメッセージIDを二重加算しない形で成功実績を記録する。
+   * occurredAt はDiscord上の成功レスポンス作成時刻（unix秒）を渡す。
    * true = 今回初めて記録、false = 既に記録済み。
    */
-  addOnce(messageId: string, userId: string): boolean {
-    const ts = Math.floor(Date.now() / 1000);
+  addOnce(messageId: string, userId: string, occurredAt: number): boolean {
+    if (!Number.isSafeInteger(occurredAt) || occurredAt < 0) {
+      throw new RangeError(`occurredAt must be a non-negative unix second: ${occurredAt}`);
+    }
+
+    const processedAt = Math.floor(Date.now() / 1000);
     const run = this.db.transaction(() => {
       const inserted = this.db
         .prepare(
           `INSERT OR IGNORE INTO bump_events (message_id, user_id, created_at)
            VALUES (?, ?, ?)`,
         )
-        .run(messageId, userId, ts);
+        .run(messageId, userId, occurredAt);
 
       if (inserted.changes === 0) return false;
 
@@ -36,10 +41,14 @@ export class BumpCounter {
            VALUES (?, 1, ?, ?)
            ON CONFLICT(user_id) DO UPDATE SET
              count = bump_counts.count + 1,
-             last_at = excluded.last_at,
+             last_at = CASE
+               WHEN bump_counts.last_at IS NULL OR excluded.last_at > bump_counts.last_at
+                 THEN excluded.last_at
+               ELSE bump_counts.last_at
+             END,
              updated_at = excluded.updated_at`,
         )
-        .run(userId, ts, ts);
+        .run(userId, occurredAt, processedAt);
       return true;
     });
 
