@@ -24,6 +24,10 @@ export function trackVoiceState(oldState: VoiceState, newState: VoiceState, serv
     // 入室・移動・状態変化 → セグメント切替（open が既存を閉じる）
     // 親カテゴリを保持しておく（浮上報酬のカテゴリ除外判定に使う）
     const parentId = newState.channel?.parentId ?? null;
-    services.vc.open(userId, after, parentId, newState.selfMute ?? false, newState.selfDeaf ?? false);
+    // derived layer(vc/derived.ts)が「退出→再入室」と「mute/deafen変化」を区別するための理由。
+    // before===null: 切断状態からの新規入室。before!==after: チャンネル移動。
+    // それ以外（muteChangedのみ）: 同一チャンネル内の状態変化。
+    const reason = before === null ? "join" : before !== after ? "move" : "state_change";
+    services.vc.open(userId, after, parentId, newState.selfMute ?? false, newState.selfDeaf ?? false, reason);
   }
 }

@@ -193,12 +193,16 @@ describe("称号v2 foundation", () => {
     expect(() => store.equip("alice", 4, "v2.table", "global")).toThrow(/slot/);
   });
 
-  it("source registryのwriter/callerは実ファイルに存在する", () => {
+  it("source registryのwriter/caller、またはderivedByは実ファイルに存在する", () => {
     const readRepoFile = (path: string) => readFileSync(new URL(`../../../${path}`, import.meta.url), "utf8");
 
     for (const [sourceKey, source] of Object.entries(TITLE_SOURCES)) {
-      expect(readRepoFile(source.writtenBy.file), `${sourceKey} writer`).toContain(source.writtenBy.needle);
-      expect(readRepoFile(source.calledFrom.file), `${sourceKey} caller`).toContain(source.calledFrom.needle);
+      if (source.origin === "persisted") {
+        expect(readRepoFile(source.writtenBy.file), `${sourceKey} writer`).toContain(source.writtenBy.needle);
+        expect(readRepoFile(source.calledFrom.file), `${sourceKey} caller`).toContain(source.calledFrom.needle);
+      } else {
+        expect(readRepoFile(source.derivedBy.file), `${sourceKey} derivedBy`).toContain(source.derivedBy.needle);
+      }
     }
   });
 
@@ -208,11 +212,11 @@ describe("称号v2 foundation", () => {
 
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-20T01:00:00+09:00"));
-    vc.open("alice", "vc1", "cat1", false, false);
+    vc.open("alice", "vc1", "cat1", false, false, "join");
 
     vi.setSystemTime(new Date("2026-08-20T01:10:00+09:00"));
     // 同じVCでmute状態が変わるだけでもopen()は前segmentを閉じて新しい行を作る。
-    vc.open("alice", "vc1", "cat1", true, false);
+    vc.open("alice", "vc1", "cat1", true, false, "state_change");
 
     const rows = db.prepare("SELECT COUNT(*) AS n FROM vc_segments WHERE user_id = ?").get("alice") as { n: number };
     expect(rows.n).toBe(2);
@@ -233,6 +237,9 @@ describe("称号v2 foundation", () => {
 
   it("定義guardはv2名前空間・登録source・隠し完遂除外を守る", () => {
     expect(TITLE_TIME_ZONE).toBe("Asia/Tokyo");
+    // vc_segments・vc_visits はどちらもtitleUsable:falseのraw/中間source。
+    // vc_visitsのstartedAtはstate_changeの孤立観測を含み得るため「入室」を主張できない。
+    // 個々の称号は安全に畳み込まれた derived source（vc_social_safe 等）を使う。
     expect(
       defineTitle({
         key: "v2.sample",
@@ -240,7 +247,7 @@ describe("称号v2 foundation", () => {
         name: "サンプル",
         emoji: "🕯",
         description: "テスト",
-        sources: ["vc_segments"],
+        sources: ["vc_social_safe"],
         trigger: "vc_leave",
         lifecycle: "active",
         hidden: false,
@@ -256,7 +263,7 @@ describe("称号v2 foundation", () => {
         name: "???",
         emoji: "🔒",
         description: "hidden",
-        sources: ["vc_segments"],
+        sources: ["vc_social_safe"],
         trigger: "vc_leave",
         lifecycle: "active",
         hidden: true,

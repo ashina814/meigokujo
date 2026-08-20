@@ -243,7 +243,7 @@ describe("生成先カテゴリがXP除外へ繋がる", () => {
     );
 
     // この親カテゴリを xp_excluded_channels に入れれば、既存ロジックがそのまま外す
-    expect(open).toHaveBeenCalledWith("u1", "made-vc", CATEGORY_ID, false, false);
+    expect(open).toHaveBeenCalledWith("u1", "made-vc", CATEGORY_ID, false, false, "join");
   });
 
   it("カテゴリ外に作られたVCは親が無く、カテゴリ指定では除外できない", () => {
@@ -259,7 +259,7 @@ describe("生成先カテゴリがXP除外へ繋がる", () => {
 
     // これが修正前の朧月の状態。除外はチャンネルID直指定しか手が無く、
     // 毎回IDが変わる宿では事実上不可能だった
-    expect(open).toHaveBeenCalledWith("u1", "root-vc", null, false, false);
+    expect(open).toHaveBeenCalledWith("u1", "root-vc", null, false, false, "join");
   });
 });
 

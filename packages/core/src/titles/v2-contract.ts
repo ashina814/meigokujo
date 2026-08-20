@@ -32,13 +32,8 @@ export interface TitleSourceCodeRef {
   needle: string;
 }
 
-export interface TitleSourceDefinition {
-  /** 人が追えてテストでも検証できる書き込み正本。 */
-  writtenBy: TitleSourceCodeRef;
-  /** writerを直接呼ぶ本番処理。 */
-  calledFrom: TitleSourceCodeRef;
-  /** Discord event等からcalledFromまでの最上流配線。死んだcallerを検知する。 */
-  wiredFrom: TitleSourceCodeRef;
+/** 全sourceに共通するメタデータ。persisted/derivedのどちらでも同じ意味で使う。 */
+interface TitleSourceCommon {
   kind: TitleSourceKind;
   privacy: TitleSourcePrivacy;
   /**
@@ -50,9 +45,39 @@ export interface TitleSourceDefinition {
   titleUsable: boolean;
   /** カタログ施行時刻をまたぐ履歴をどう切るか。 */
   epochPolicy: TitleEpochPolicy;
-  /** SQLの1行が利用者行動の何を意味するか。row count の誤用を防ぐ。 */
+  /** SQLの1行（またはderived factの1件）が利用者行動の何を意味するか。誤用を防ぐ。 */
   rawUnit: string;
 }
+
+/** DBへ直接書き込まれる正本source。 */
+export interface PersistedTitleSourceDefinition extends TitleSourceCommon {
+  origin: "persisted";
+  /** 人が追えてテストでも検証できる書き込み正本。 */
+  writtenBy: TitleSourceCodeRef;
+  /** writerを直接呼ぶ本番処理。 */
+  calledFrom: TitleSourceCodeRef;
+  /** Discord event等からcalledFromまでの最上流配線。死んだcallerを検知する。 */
+  wiredFrom: TitleSourceCodeRef;
+}
+
+/**
+ * 他のsourceから読み出し専用で導出するsource。
+ *
+ * 「writerが存在するsource」と偽装しない——derivedはDBへ何も書かないので
+ * writtenBy/calledFrom/wiredFromを持たせず、代わりに実装ファイルと依存元を持つ。
+ */
+export interface DerivedTitleSourceDefinition extends TitleSourceCommon {
+  origin: "derived";
+  /** 導出ロジックを実装しているファイルと、その存在を示す最小文字列。 */
+  derivedBy: TitleSourceCodeRef;
+  /**
+   * 依存する登録済みsource（persisted/derived問わず）。
+   * dependency chainは最終的にlive persisted sourceへ到達しなければならない（v2-store.tsで検証）。
+   */
+  derivedFrom: readonly string[];
+}
+
+export type TitleSourceDefinition = PersistedTitleSourceDefinition | DerivedTitleSourceDefinition;
 
 /**
  * 最初のsource registry。
@@ -62,6 +87,7 @@ export interface TitleSourceDefinition {
  */
 export const TITLE_SOURCES = {
   vc_segments: {
+    origin: "persisted",
     writtenBy: {
       file: "packages/core/src/vc/service.ts",
       needle: "INSERT INTO vc_segments",
@@ -79,7 +105,9 @@ export const TITLE_SOURCES = {
     // closeAllDangling() はクラッシュ復旧時に ended_at を推定値で補う。
     // raw vc_segments 全体としては達成時刻を完全には証明できない。
     orderable: false,
-    titleUsable: true,
+    // 個々の称号からは直接使わせない。安全な derived source（vc_visits 以下）を使うこと。
+    // raw segment を将来の称号作者が直接 COUNT してしまう経路をここで閉じる。
+    titleUsable: false,
     epochPolicy: {
       type: "interval",
       start: "started_at",
@@ -91,6 +119,7 @@ export const TITLE_SOURCES = {
     rawUnit: "voice_state_segment",
   },
   bump_events: {
+    origin: "persisted",
     writtenBy: {
       file: "packages/core/src/rank/bump.ts",
       needle: "INSERT OR IGNORE INTO bump_events",
@@ -112,6 +141,7 @@ export const TITLE_SOURCES = {
     rawUnit: "successful_bump_event",
   },
   bump_counts: {
+    origin: "persisted",
     writtenBy: {
       file: "packages/core/src/rank/bump.ts",
       needle: "INSERT INTO bump_counts",
@@ -133,12 +163,153 @@ export const TITLE_SOURCES = {
     epochPolicy: { type: "baseline", metrics: ["count"] },
     rawUnit: "cumulative_counter",
   },
+
+  // ── VC derived source層（PR2）────────────────────────────────────
+  //
+  // raw vc_segments は state segment（mute/deafen変化でも切れる）で titleUsable:false。
+  // 個々の称号は必ずここから下のderived sourceを使う。
+  vc_visits: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/vc/derived.ts",
+      needle: "export function computeLogicalVisits(",
+    },
+    derivedFrom: ["vc_segments"],
+    kind: "history",
+    privacy: "safe",
+    // VoiceStateUpdateには強い正本時刻が無く、秒精度のtieも起こりうる。
+    // 「N人目」等を主張できるsourceへ安易に昇格させない（正本 §8）。
+    orderable: false,
+    // visit.startedAtは「入室した瞬間」とは限らない（LogicalVisit.startKind参照）。
+    // 孤立したstate_change（クラッシュ補正等で前segmentへcoalesceできなかったmute/deafen
+    // 変化）から始まった訪問はpartial_observationで、本人は既にそこにいただけ。
+    // これをそのまま称号からCOUNTすると「入室回数」を過大に主張してしまうため、
+    // vc_visits自体は中間source扱いとし、直接は使わせない。個々の称号は、
+    // startKindを踏まえて安全に畳み込まれた下流derived source（vc_social_safe等）を使うこと。
+    titleUsable: false,
+    epochPolicy: { type: "interval", start: "startedAt", end: "endedAt", clip: true },
+    // raw segment の隣接行を1回の訪問へ合成した単位。
+    rawUnit: "logical_vc_visit",
+  },
+  vc_empty_start_then_joined: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/vc/derived.ts",
+      needle: "export function computeEmptyStartThenJoined(",
+    },
+    derivedFrom: ["vc_visits"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "point", at: "joinedAt" },
+    // 「誰もいないVCから始まり、後から誰かが入った」という事実のみ。相手のidentityは含まない。
+    rawUnit: "empty_start_then_joined_fact",
+  },
+  vc_last_occupant: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/vc/derived.ts",
+      needle: "export function computeLastOccupant(",
+    },
+    derivedFrom: ["vc_visits"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "point", at: "becameLastAt" },
+    // 「他者が退出し、subjectだけが残った」瞬間。相手のidentityは含まない。
+    rawUnit: "last_occupant_fact",
+  },
+  vc_group_size_seconds: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/vc/derived.ts",
+      needle: "export function computeGroupSizeSeconds(",
+    },
+    derivedFrom: ["vc_visits"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    // 呼び出し側が渡すwindow境界そのものが切り口。行ごとのSQL列ではない。
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "group_size_seconds_measurement",
+  },
+  vc_co_presence: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/vc/derived.ts",
+      needle: "export function computeCoPresenceOverlaps(",
+    },
+    derivedFrom: ["vc_visits"],
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    // 生pairwiseは相手のuserIdを含むため称号から直接は使わせない。vc_social_safe を使うこと。
+    titleUsable: false,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "pairwise_overlap",
+  },
+  vc_social_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/vc/derived.ts",
+      needle: "export function computeSafeSocialAggregates(",
+    },
+    derivedFrom: ["vc_co_presence"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    // pair identityを畳み込んだ、本人単位の集計だけ。
+    rawUnit: "safe_social_aggregate",
+  },
 } as const satisfies Record<string, TitleSourceDefinition>;
 
 export type TitleSourceKey = keyof typeof TITLE_SOURCES;
 export type TitleUsableSourceKey = {
   [K in TitleSourceKey]: (typeof TITLE_SOURCES)[K]["titleUsable"] extends true ? K : never;
 }[TitleSourceKey];
+
+/**
+ * derived sourceのdependency chainが、最終的にlive persisted sourceへ到達することを検証する。
+ *
+ * 未登録keyへの参照・循環参照・persistedで終わらないchainを全部拒否する。
+ * パスと関数名の文字列が存在するだけでは「本番で実際に通る」ことの証明として弱い
+ * （evaluationsの変形版が再発しうる）ので、依存関係そのものの整合性もここで機械検証する。
+ */
+export function assertDerivedSourceDependenciesResolve(
+  sources: Record<string, TitleSourceDefinition> = TITLE_SOURCES,
+): void {
+  const resolving = new Set<string>();
+  const resolved = new Set<string>();
+
+  const resolve = (key: string, path: readonly string[]): void => {
+    if (resolved.has(key)) return;
+    const def = sources[key];
+    if (!def) {
+      throw new Error(`title source dependency references unknown source: ${[...path, key].join(" -> ")}`);
+    }
+    if (def.origin === "persisted") {
+      resolved.add(key);
+      return;
+    }
+    if (resolving.has(key)) {
+      throw new Error(`title source dependency cycle detected: ${[...path, key].join(" -> ")}`);
+    }
+    if (def.derivedFrom.length === 0) {
+      throw new Error(`derived title source must declare at least one dependency: ${key}`);
+    }
+    resolving.add(key);
+    for (const dep of def.derivedFrom) resolve(dep, [...path, key]);
+    resolving.delete(key);
+    resolved.add(key);
+  };
+
+  for (const key of Object.keys(sources)) resolve(key, []);
+}
 
 export interface TitleCheckResult {
   earned: boolean;

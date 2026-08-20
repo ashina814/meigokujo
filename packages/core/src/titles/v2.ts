@@ -1,7 +1,10 @@
 export {
   TITLE_SOURCES,
   TITLE_TIME_ZONE,
+  assertDerivedSourceDependenciesResolve,
   defineTitle,
+  type DerivedTitleSourceDefinition,
+  type PersistedTitleSourceDefinition,
   type TitleCheckResult,
   type TitleDefinition,
   type TitleEpochPolicy,
@@ -27,3 +30,23 @@ export {
   type TitleEquipRow,
   type TitleSystemStateRow,
 } from "./v2-store.js";
+
+export {
+  computeCoPresenceOverlaps,
+  computeEmptyStartThenJoined,
+  computeGroupSizeSeconds,
+  computeLastOccupant,
+  computeLogicalVisits,
+  computeSafeSocialAggregates,
+  isTrustedVisitEnd,
+  type CoPresenceOverlap,
+  type EmptyStartThenJoinedFact,
+  type GroupSizeSeconds,
+  type LastOccupantFact,
+  type LogicalVisit,
+  type LogicalVisitEndQuality,
+  type LogicalVisitStartKind,
+  type OccupancyBucket,
+  type SafeSocialAggregate,
+  type TitleWindow,
+} from "../vc/derived.js";
