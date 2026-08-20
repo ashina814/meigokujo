@@ -72,6 +72,28 @@ describe("称号v2 source contract", () => {
     expect(TITLE_SOURCES.vc_social_safe.privacy).toBe("safe");
   });
 
+  it("vc_visitsも称号から直接使えない。startedAtが入室イベントとは限らないため", () => {
+    // 孤立したstate_change（coalesceできなかったmute/deafen変化）から始まる訪問は
+    // startKind:'partial_observation' で、本人が「その瞬間に入室した」わけではない。
+    // これをそのままCOUNTさせないよう、vc_visits自体は中間source扱いにする。
+    expect(TITLE_SOURCES.vc_visits.titleUsable).toBe(false);
+    expect(() =>
+      defineTitle({
+        key: "v2.bad-vc-visits",
+        catalog: "v1",
+        name: "bad",
+        emoji: "x",
+        description: "vc_visitsを直接参照してはいけない",
+        sources: ["vc_visits"] as any,
+        trigger: "vc_leave",
+        lifecycle: "active",
+        hidden: false,
+        countsForCompletion: false,
+        publicAnnounce: false,
+      }),
+    ).toThrow(/source is not usable by titles/);
+  });
+
   it("BUMP称号は時刻付きbump_eventsを使い、bump_countsは直接参照させない", () => {
     expect(TITLE_SOURCES.bump_events).toMatchObject({
       kind: "history",

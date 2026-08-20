@@ -85,7 +85,10 @@ VoiceStateUpdate処理で閉じた、`recovered_estimate`=`closeAllDangling()` �
 raw `vc_segments` は `titleUsable: false`。個々の称号は `packages/core/src/vc/derived.ts` の
 derived sourceを使う。
 
-- `vc_visits`: 隣接segment（同一user・同一channel・時刻が連続）を1訪問へ合成した単位
+- `vc_visits`: 隣接segment（同一user・同一channel・時刻が連続、かつ次segmentの
+  `start_reason` が `'state_change'` で直前segmentが `'observed'` で閉じている場合のみ）
+  を1訪問へ合成した単位。`startedAt` が本物の入室かは `startKind` で別途区別する
+  （上記参照）ため、この source自体も `titleUsable: false`（中間source）
 - `vc_empty_start_then_joined`: 誰もいないVCへ入り、後から誰かが来た、という事実のみ
   （相手のidentityは含まない）
 - `vc_last_occupant`: occupancyが2以上から1に減り、subjectだけが残った瞬間
@@ -109,7 +112,20 @@ derived sourceを使う。
 
 window境界より前から継続していた訪問は、`startedAt` が境界でclipされているだけなので
 「開始イベント」として扱わない（`LogicalVisit.startClipped`）。同一秒のtieは前後関係を
-証明できないため、安全側（factを作らない）へ倒す。
+証明できないため、安全側（factを作らない）へ倒す（0秒segmentも証拠として保持し、
+tie判定から消さない）。
+
+`startedAt` が本物の入室イベントかは `LogicalVisit.startKind` で区別する
+（`'arrival'` / `'partial_observation'` / `'unknown'`）。前segmentへcoalesceできなかった
+孤立state_change（クラッシュ補正の推定終了後、しばらく経ってからのmute操作等）は
+`'partial_observation'`——本人は既にそこにいて状態変化を再観測しただけなので、
+「入室した」「後から来た」を主張するfact（empty-start-then-joinedのsubject・laterJoin）
+は `'arrival'` のときだけ使う。この区別のため `vc_visits` 自体は `titleUsable: false`
+（中間source）にした。称号は必ず `vc_visits` より下流のderived sourceを使う。
+
+`TitleWindow.end` が未来（「今月」「今日」等のカタログ境界から機械的に作られる）を指して
+いても、open visit（まだ退室記録の無い訪問）は `TitleWindow.observedAt`（省略時は現在
+時刻）より先までtrustedな継続として計上しない。
 
 各derived関数の`userIds`引数の契約: `undefined`=全ユーザー対象、`[]`（空配列）=対象なし
 （何も返さない）。空配列を「絞り込みなし」と解釈すると、意図せず全ユーザーのデータを

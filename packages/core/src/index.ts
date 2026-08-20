@@ -114,7 +114,13 @@ export {
   type SessionOverrideRow,
   type SessionCalendarErrorCode,
 } from "./entry/sessions.js";
-export { VcTracker, type VcSegment, type VcSegmentEndQuality, type PresenceSummary } from "./vc/service.js";
+export {
+  VcTracker,
+  type VcSegment,
+  type VcSegmentEndQuality,
+  type VcSegmentStartReason,
+  type PresenceSummary,
+} from "./vc/service.js";
 export {
   computeCoPresenceOverlaps,
   computeEmptyStartThenJoined,
@@ -129,6 +135,7 @@ export {
   type LastOccupantFact,
   type LogicalVisit,
   type LogicalVisitEndQuality,
+  type LogicalVisitStartKind,
   type OccupancyBucket,
   type SafeSocialAggregate,
   type TitleWindow,

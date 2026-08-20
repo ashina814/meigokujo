@@ -237,7 +237,9 @@ describe("称号v2 foundation", () => {
 
   it("定義guardはv2名前空間・登録source・隠し完遂除外を守る", () => {
     expect(TITLE_TIME_ZONE).toBe("Asia/Tokyo");
-    // vc_segments は raw source で titleUsable:false。derived の vc_visits を使う。
+    // vc_segments・vc_visits はどちらもtitleUsable:falseのraw/中間source。
+    // vc_visitsのstartedAtはstate_changeの孤立観測を含み得るため「入室」を主張できない。
+    // 個々の称号は安全に畳み込まれた derived source（vc_social_safe 等）を使う。
     expect(
       defineTitle({
         key: "v2.sample",
@@ -245,7 +247,7 @@ describe("称号v2 foundation", () => {
         name: "サンプル",
         emoji: "🕯",
         description: "テスト",
-        sources: ["vc_visits"],
+        sources: ["vc_social_safe"],
         trigger: "vc_leave",
         lifecycle: "active",
         hidden: false,
@@ -261,7 +263,7 @@ describe("称号v2 foundation", () => {
         name: "???",
         emoji: "🔒",
         description: "hidden",
-        sources: ["vc_visits"],
+        sources: ["vc_social_safe"],
         trigger: "vc_leave",
         lifecycle: "active",
         hidden: true,

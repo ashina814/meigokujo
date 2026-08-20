@@ -64,6 +64,7 @@ describe("A. logical visit の合成", () => {
         endQuality: "observed",
         segmentCount: 3,
         startClipped: false,
+        startKind: "arrival",
       },
     ]);
   });
@@ -174,6 +175,7 @@ describe("A. logical visit の合成", () => {
         endQuality: "observed",
         segmentCount: 2,
         startClipped: false,
+        startKind: "arrival",
       },
     ]);
   });
@@ -222,8 +224,8 @@ describe("B/F. co-presence", () => {
 describe("C. empty-start → later joined", () => {
   it("誰もいないVCへ入り、別の時刻に誰かが来たら成立する", () => {
     const { db, insertRaw } = setup();
-    insertRaw("alice", "vc1", BASE, BASE + 100, "observed");
-    insertRaw("bob", "vc1", BASE + 50, BASE + 80, "observed");
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed", null, "join");
+    insertRaw("bob", "vc1", BASE + 50, BASE + 80, "observed", null, "join");
 
     const facts = computeEmptyStartThenJoined(db, { start: BASE, end: BASE + 200 });
     expect(facts).toEqual([{ userId: "alice", channelId: "vc1", visitStartedAt: BASE, joinedAt: BASE + 50 }]);
@@ -231,8 +233,8 @@ describe("C. empty-start → later joined", () => {
 
   it("同一秒に2人がstartしたら、どちらにもfactを付けない", () => {
     const { db, insertRaw } = setup();
-    insertRaw("alice", "vc1", BASE, BASE + 100, "observed");
-    insertRaw("bob", "vc1", BASE, BASE + 100, "observed"); // 完全に同時start
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed", null, "join");
+    insertRaw("bob", "vc1", BASE, BASE + 100, "observed", null, "join"); // 完全に同時start
 
     const facts = computeEmptyStartThenJoined(db, { start: BASE, end: BASE + 200 });
     expect(facts).toEqual([]);
@@ -241,8 +243,8 @@ describe("C. empty-start → later joined", () => {
   it("window開始前から継続していた訪問は開始イベントとして扱わない", () => {
     const { db, insertRaw } = setup();
     // aliceの本当の入室はwindowの外（BASE-1000）。windowはBASEから。
-    insertRaw("alice", "vc1", BASE - 1000, BASE + 100, "observed");
-    insertRaw("bob", "vc1", BASE + 50, BASE + 80, "observed");
+    insertRaw("alice", "vc1", BASE - 1000, BASE + 100, "observed", null, "join");
+    insertRaw("bob", "vc1", BASE + 50, BASE + 80, "observed", null, "join");
 
     const facts = computeEmptyStartThenJoined(db, { start: BASE, end: BASE + 200 });
     // aliceの開始はclipされただけの偽イベントなので、bobが後から来てもfactにしない
@@ -251,8 +253,8 @@ describe("C. empty-start → later joined", () => {
 
   it("subjectの終了が信頼できない場合はfactにしない", () => {
     const { db, insertRaw } = setup();
-    insertRaw("alice", "vc1", BASE, BASE + 100, "recovered_estimate");
-    insertRaw("bob", "vc1", BASE + 50, BASE + 80, "observed");
+    insertRaw("alice", "vc1", BASE, BASE + 100, "recovered_estimate", null, "join");
+    insertRaw("bob", "vc1", BASE + 50, BASE + 80, "observed", null, "join");
 
     const facts = computeEmptyStartThenJoined(db, { start: BASE, end: BASE + 200 });
     expect(facts).toEqual([]);
@@ -263,8 +265,44 @@ describe("C. empty-start → later joined", () => {
     // bobは記録上BASE+10に退出しているが、終了がrecovered_estimateで不確か。
     // aliceがBASE+30に入室した時点で、bobが本当にもう居なかったとは証明できない。
     insertRaw("bob", "vc1", BASE - 100, BASE + 10, "recovered_estimate");
-    insertRaw("alice", "vc1", BASE + 30, BASE + 130, "observed");
-    insertRaw("carol", "vc1", BASE + 60, BASE + 90, "observed");
+    insertRaw("alice", "vc1", BASE + 30, BASE + 130, "observed", null, "join");
+    insertRaw("carol", "vc1", BASE + 60, BASE + 90, "observed", null, "join");
+
+    const facts = computeEmptyStartThenJoined(db, { start: BASE, end: BASE + 200 });
+    expect(facts).toEqual([]);
+  });
+
+  it("孤立したstate_change（既に在室していただけ）は入室イベントとして扱わない", () => {
+    const { db, insertRaw } = setup();
+    // aliceは本当は空VCへ入室(join)している。
+    insertRaw("alice", "vc1", BASE, BASE + 200, "observed", null, "join");
+    // bobは実は前からそこにいたが、記録上はクラッシュ補正で切れており、
+    // BASE+50時点のmute変更(state_change)がbobについて観測できた最初の行になっている。
+    // これは「BASE+50に入室してきた」わけではない——孤立state_changeなのでarrivalではない。
+    insertRaw("bob", "vc1", BASE + 50, BASE + 80, "observed", null, "state_change");
+
+    const facts = computeEmptyStartThenJoined(db, { start: BASE, end: BASE + 200 });
+    expect(facts).toEqual([]);
+  });
+
+  it("subject自身の開始が孤立state_changeの場合もfactにしない", () => {
+    const { db, insertRaw } = setup();
+    // aliceは本当は前からそこにいたが、観測できた最初の行がstate_change。
+    // 「BASEに空VCへ入室した」わけではないので、開始イベントとして使えない。
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed", null, "state_change");
+    insertRaw("bob", "vc1", BASE + 50, BASE + 80, "observed", null, "join");
+
+    const facts = computeEmptyStartThenJoined(db, { start: BASE, end: BASE + 200 });
+    expect(facts).toEqual([]);
+  });
+
+  it("0秒segmentもarrival証拠として保持し、同一秒tieを安全側へ倒す", () => {
+    const { db, insertRaw } = setup();
+    // bobはBASE時点に一瞬だけ現れて即退出（0秒）。aliceも同じBASEに入室。
+    // 順序を証明できないので、aliceの「空VCから始めた」は成立させない。
+    insertRaw("bob", "vc1", BASE, BASE, "observed", null, "join");
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed", null, "join");
+    insertRaw("carol", "vc1", BASE + 50, BASE + 80, "observed", null, "join");
 
     const facts = computeEmptyStartThenJoined(db, { start: BASE, end: BASE + 200 });
     expect(facts).toEqual([]);
@@ -417,6 +455,47 @@ describe("jstDatesInIntervalの安全策", () => {
     insertRaw("bob", "vc1", start, end, "observed");
 
     expect(() => computeCoPresenceOverlaps(db, { start: start - 10, end: end + 10 })).toThrow(/more than/);
+  });
+});
+
+describe("open visitの未来window clamp", () => {
+  it("window.endが未来でも、open visitはobservedAt（既定=現在時刻）より先までtrustedにしない", () => {
+    const db = openDb(":memory:");
+    const vc = new VcTracker(db);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(BASE * 1000));
+    vc.open("alice", "vc1", null, false, false, "join"); // 今もまだ在室中（未クローズ）
+
+    vi.setSystemTime(new Date((BASE + 500) * 1000)); // 「現在時刻」はBASE+500
+
+    // window.endはさらに先の未来（「今月」「今日」等のカタログ境界を模す）
+    const visits = computeLogicalVisits(db, { start: BASE, end: BASE + 100_000 });
+    expect(visits).toHaveLength(1);
+    expect(visits[0]!.endedAt).toBe(BASE + 500); // window.endではなく「今」で打ち切られる
+    expect(visits[0]!.endQuality).toBe("open");
+  });
+
+  it("observedAtを明示すれば、その時刻でクランプされる（reconcileの再現性）", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, null, null, null, "join"); // まだ開いている訪問
+
+    const visits = computeLogicalVisits(db, { start: BASE, end: BASE + 100_000, observedAt: BASE + 40 });
+    expect(visits).toHaveLength(1);
+    expect(visits[0]!.endedAt).toBe(BASE + 40);
+  });
+
+  it("2人ともopen visitでも、window.endの未来分をco-presenceの重なりとして数えない", () => {
+    const db = openDb(":memory:");
+    const vc = new VcTracker(db);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(BASE * 1000));
+    vc.open("alice", "vc1", null, false, false, "join");
+    vc.open("bob", "vc1", null, false, false, "join");
+
+    vi.setSystemTime(new Date((BASE + 300) * 1000)); // 「現在」はBASE+300
+
+    const overlaps = computeCoPresenceOverlaps(db, { start: BASE, end: BASE + 100_000 });
+    expect(overlaps).toEqual([{ userA: "alice", userB: "bob", overlapSeconds: 300, jstDays: expect.any(Array) }]);
   });
 });
 

@@ -26,6 +26,15 @@ import type Database from "better-sqlite3";
  * それ以降は人数帯そのものが不確かになるため untrustedSeconds 側へ計上する。
  *
  * 同一秒のtieは「前後関係を証明できない」として安全側（factを作らない）へ倒す。
+ * 0秒segment（同一秒での入室即退出等）もarrivalの証拠として保持し、tie判定から消さない。
+ *
+ * `startedAt` が本物の入室イベントかどうかは `LogicalVisit.startKind` で区別する。
+ * 前segmentへcoalesceできなかった孤立state_change（mute/deafen変化）から始まった訪問は
+ * 'partial_observation'——本人は既にそこにいて、単に状態変化を再観測しただけなので、
+ * 「入室した」「後から来た」等のイベントを主張するfactには使えない。
+ *
+ * `TitleWindow.end` が未来を指していても、open visit（まだ退室記録の無い訪問）は
+ * `observedAt`（省略時は現在時刻）より先までtrustedな継続として計上しない。
  */
 
 export interface TitleWindow {
@@ -33,9 +42,31 @@ export interface TitleWindow {
   start: number;
   /** exclusive */
   end: number;
+  /**
+   * このwindowを評価する時刻（省略時は呼び出し時点の現在時刻）。
+   *
+   * open visit（まだ退室記録の無い訪問）は、window.endまでtrustedな継続として計上する。
+   * しかしwindow.endはカタログ施行境界（「今月」「今日」等）から機械的に作られることが
+   * 多く、未来を指し得る——その場合、まだ観測してすらいない未来時間まで在室したことに
+   * なってしまう。observedAtは「実際にはここまでしか見ていない」という上限を明示する。
+   */
+  observedAt?: number;
 }
 
 export type LogicalVisitEndQuality = "observed" | "recovered_estimate" | "unknown" | "open";
+
+/**
+ * このvisitのstartedAtが「入室した瞬間」を意味するか。
+ *
+ * - 'arrival': 最初のraw segmentがjoin/moveで始まった。本物の入室（またはチャンネル移動）
+ * - 'partial_observation': 最初のraw segmentがstate_change（mute/deafen変化）で始まった
+ *   ——前のsegmentへcoalesceできなかった孤立state_change。本人は既にそこにいて、
+ *   単に状態変化を再観測しただけ。startedAtを「入室した瞬間」として扱ってはいけない
+ *   （典型例: クラッシュ復旧の推定終了(recovered_estimate)後、しばらく経ってから
+ *   mute操作があり、そこが新しいvisitの先頭になった場合）
+ * - 'unknown': 最初のraw segmentがstart_reason未設定（列追加前のlegacy行）
+ */
+export type LogicalVisitStartKind = "arrival" | "partial_observation" | "unknown";
 
 export interface LogicalVisit {
   userId: string;
@@ -54,6 +85,13 @@ export interface LogicalVisit {
    * 継続時間の計測（fact E）や「その時点で在室していたか」の下限（fact D）には使ってよい。
    */
   startClipped: boolean;
+  /**
+   * startedAtが本物の入室イベントか（`LogicalVisitStartKind`参照）。
+   * 「入室した」「空VCへ最初に来た」等のイベントを主張するfactは 'arrival' のときだけ
+   * 使ってよい。滞在時間の計測や「その時点で在室していたか」の確認には影響しない
+   * ——partial_observationでも、その時点に在室していたこと自体は事実のため。
+   */
+  startKind: LogicalVisitStartKind;
 }
 
 /** 終了時刻を「主張」の根拠として使ってよいか。'recovered_estimate' と 'unknown' は使えない。 */
@@ -65,7 +103,12 @@ function clampWindow(window: TitleWindow): void {
   if (!Number.isInteger(window.start) || !Number.isInteger(window.end) || window.start >= window.end) {
     throw new RangeError(`invalid title window: [${window.start}, ${window.end})`);
   }
+  if (window.observedAt !== undefined && !Number.isInteger(window.observedAt)) {
+    throw new RangeError(`invalid title window: observedAt must be an integer unix timestamp`);
+  }
 }
+
+const now = (): number => Math.floor(Date.now() / 1000);
 
 interface RawSegmentRow {
   id: number;
@@ -89,12 +132,16 @@ function loadRawSegments(
   userIds?: readonly string[],
 ): RawSegmentRow[] {
   if (userIds && userIds.length === 0) return [];
-  const params: unknown[] = [window.end, window.start];
+  const params: unknown[] = [window.end, window.start, window.start];
   let sql = `
     SELECT id, user_id, channel_id, parent_id, started_at, ended_at, end_quality, start_reason
     FROM vc_segments
     WHERE started_at < ?
-      AND (ended_at IS NULL OR ended_at > ?)
+      -- 通常の半開区間overlapは ended_at > window.start。ただし0秒segment
+      -- （started_at===ended_at、同一秒での入室即退出等）はこの式だとended_at>window.startが
+      -- 常に偽になり、window.startちょうどの0秒segmentが取り逃がされる。arrivalの証拠を
+      -- 消さないため、0秒segmentはstarted_atがwindow内なら明示的に拾う。
+      AND (ended_at IS NULL OR ended_at > ? OR (ended_at = started_at AND ended_at >= ?))
   `;
   if (userIds) {
     sql += ` AND user_id IN (${userIds.map(() => "?").join(",")})`;
@@ -113,11 +160,13 @@ function loadRawSegmentsForChannels(
   const sql = `
     SELECT id, user_id, channel_id, parent_id, started_at, ended_at, end_quality, start_reason
     FROM vc_segments
-    WHERE started_at < ? AND (ended_at IS NULL OR ended_at > ?)
+    WHERE started_at < ?
+      -- loadRawSegments()と同じ0秒segment救済（arrivalの証拠を取り逃がさないため）
+      AND (ended_at IS NULL OR ended_at > ? OR (ended_at = started_at AND ended_at >= ?))
       AND channel_id IN (${channelIds.map(() => "?").join(",")})
     ORDER BY user_id, started_at, id
   `;
-  return db.prepare(sql).all(window.end, window.start, ...channelIds) as RawSegmentRow[];
+  return db.prepare(sql).all(window.end, window.start, window.start, ...channelIds) as RawSegmentRow[];
 }
 
 /**
@@ -132,6 +181,7 @@ function coalesceVisits(rows: readonly RawSegmentRow[], window: TitleWindow): Lo
     channelId: string;
     parentId: string | null;
     startedAt: number;
+    startKind: LogicalVisitStartKind;
     lastEndedAt: number | null;
     lastEndQuality: RawSegmentRow["end_quality"];
     segmentCount: number;
@@ -143,9 +193,11 @@ function coalesceVisits(rows: readonly RawSegmentRow[], window: TitleWindow): Lo
     let endedAt: number;
     let endQuality: LogicalVisitEndQuality;
     if (current.lastEndedAt === null) {
-      // まだ開いている（closeAllDanglingも未通過）: windowの終端で打ち切る。
-      // これは推測ではなく、こちらが指定したクエリ境界そのものなので信頼できる。
-      endedAt = window.end;
+      // まだ開いている（closeAllDanglingも未通過）。「今」より先は観測していないので、
+      // window.endが未来を指していても observedAt（省略時はDate.now()）までしか
+      // trustedな継続として計上しない——さもないと「今月」「今日」のような機械的な
+      // window.endを渡しただけで、現在時刻より先まで在室したことにできてしまう。
+      endedAt = Math.min(window.end, window.observedAt ?? now());
       endQuality = "open";
     } else if (current.lastEndQuality === "observed") {
       endedAt = current.lastEndedAt;
@@ -162,7 +214,10 @@ function coalesceVisits(rows: readonly RawSegmentRow[], window: TitleWindow): Lo
     const startClipped = current.startedAt < window.start;
     const startedAt = Math.max(current.startedAt, window.start);
     const clippedEnded = Math.min(endedAt, window.end);
-    if (clippedEnded > startedAt) {
+    // 0秒segment（同一秒での入室即退出等）も捨てない。滞在時間としては無意味でも、
+    // 「その瞬間、確かにここにいた」というarrival証拠そのものは保持する——これを消すと、
+    // 同一秒に別の人が「空VCへ入った」と誤って主張できてしまう（fact C参照）。
+    if (clippedEnded >= startedAt) {
       visits.push({
         userId: current.userId,
         channelId: current.channelId,
@@ -172,6 +227,7 @@ function coalesceVisits(rows: readonly RawSegmentRow[], window: TitleWindow): Lo
         endQuality,
         segmentCount: current.segmentCount,
         startClipped,
+        startKind: current.startKind,
       });
     }
     current = null;
@@ -203,11 +259,23 @@ function coalesceVisits(rows: readonly RawSegmentRow[], window: TitleWindow): Lo
       current.segmentCount += 1;
     } else {
       flush();
+      // このrowが新しいvisitの先頭になる。start_reasonがjoin/moveなら本物の入室（arrival）。
+      // state_changeがここに来るのは「前segmentへcoalesceできなかった孤立state_change」の
+      // 場合だけ（continuesCurrentの条件を参照）——つまり本人は既にそこにいて、単に状態
+      // 変化を再観測しただけなので、startedAtを入室イベントとして扱ってはいけない
+      // （partial_observation）。legacy行（start_reason未設定）はunknown。
+      const startKind: LogicalVisitStartKind =
+        row.start_reason === "join" || row.start_reason === "move"
+          ? "arrival"
+          : row.start_reason === "state_change"
+            ? "partial_observation"
+            : "unknown";
       current = {
         userId: row.user_id,
         channelId: row.channel_id,
         parentId: row.parent_id,
         startedAt: row.started_at,
+        startKind,
         lastEndedAt: row.ended_at,
         lastEndQuality: row.end_quality,
         segmentCount: 1,
@@ -252,12 +320,15 @@ export interface EmptyStartThenJoinedFact {
  * 誰が来たか（identity）・因果（呼び込んだ、人気がある等）は一切主張しない。
  *
  * 成立条件:
- * - subjectの訪問**開始そのものがwindow内の本物の出来事**であること
- *   （window開始前から継続していた訪問をclipしただけのものは、開始イベントとして数えない）
+ * - subjectの訪問**開始そのものがwindow内の本物の入室イベント**であること
+ *   （window開始前から継続していた訪問をclipしただけのものは開始イベントとして数えない
+ *   `startClipped`。孤立したstate_changeから始まった訪問も本物の入室ではない
+ *   `startKind !== 'arrival'`）
  * - subjectの訪問開始時、他の誰の訪問もその瞬間を覆っていない（tie含めて厳密に除外）
  * - subjectの訪問の終了が信頼できる（'observed' または 'open'）
  *   → 信頼できない終了時刻を「まだ居た」の根拠にしない
- * - 他者の訪問開始が、subjectの開始より厳密に後、終了より前
+ * - 他者の訪問開始が、subjectの開始より厳密に後、終了より前、かつ**本物の入室イベント**
+ *   であること（孤立state_changeを「後から人が来た」と読まない）
  */
 export function computeEmptyStartThenJoined(
   db: Database.Database,
@@ -276,6 +347,7 @@ export function computeEmptyStartThenJoined(
   const facts: EmptyStartThenJoinedFact[] = [];
   for (const subject of subjectVisits) {
     if (subject.startClipped) continue;
+    if (subject.startKind !== "arrival") continue;
     if (!isTrustedVisitEnd(subject.endQuality)) continue;
 
     const others = (byChannel.get(subject.channelId) ?? []).filter(
@@ -283,19 +355,25 @@ export function computeEmptyStartThenJoined(
     );
 
     // 「空だった」と主張するには、subjectの開始時点で在室していた可能性がある他者が
-    // 誰もいないと言い切れる必要がある。o.startedAt<=subject.startedAtの他者について：
-    // - o.endedAt > subject.startedAt なら記録上も明確に在室中（空ではない）
+    // 誰もいないと言い切れる必要がある。
+    // - o.startedAt === subject.startedAt（同一秒tie）は前後関係を証明できない
+    //   （0秒segmentも含む——arrivalの証拠自体はcoalesceVisitsが保持している）
+    // - o.startedAt < subject.startedAt かつ o.endedAt > subject.startedAt なら
+    //   記録上も明確に在室中（空ではない）
     // - o.endedAt <= subject.startedAt でも、oの終了が信頼できない（recovered_estimate等）
     //   なら「本当にその前に退出していた」とは証明できない。空だったと断定できない
     const notEmptyOrAmbiguous = others.some((o) => {
+      if (o.startedAt === subject.startedAt) return true;
       if (o.startedAt > subject.startedAt) return false;
       if (o.endedAt > subject.startedAt) return true;
       return !isTrustedVisitEnd(o.endQuality);
     });
     if (notEmptyOrAmbiguous) continue;
 
+    // 「後から人が来た」と主張できるのは、その相手も本物の入室イベントのときだけ。
+    // 孤立state_change（既にそこにいた人を再観測しただけ）を「入ってきた」と読まない。
     const laterJoin = others
-      .filter((o) => o.startedAt > subject.startedAt && o.startedAt < subject.endedAt)
+      .filter((o) => o.startKind === "arrival" && o.startedAt > subject.startedAt && o.startedAt < subject.endedAt)
       .sort((a, b) => a.startedAt - b.startedAt)[0];
     if (!laterJoin) continue;
 

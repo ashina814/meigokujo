@@ -180,7 +180,13 @@ export const TITLE_SOURCES = {
     // VoiceStateUpdateには強い正本時刻が無く、秒精度のtieも起こりうる。
     // 「N人目」等を主張できるsourceへ安易に昇格させない（正本 §8）。
     orderable: false,
-    titleUsable: true,
+    // visit.startedAtは「入室した瞬間」とは限らない（LogicalVisit.startKind参照）。
+    // 孤立したstate_change（クラッシュ補正等で前segmentへcoalesceできなかったmute/deafen
+    // 変化）から始まった訪問はpartial_observationで、本人は既にそこにいただけ。
+    // これをそのまま称号からCOUNTすると「入室回数」を過大に主張してしまうため、
+    // vc_visits自体は中間source扱いとし、直接は使わせない。個々の称号は、
+    // startKindを踏まえて安全に畳み込まれた下流derived source（vc_social_safe等）を使うこと。
+    titleUsable: false,
     epochPolicy: { type: "interval", start: "startedAt", end: "endedAt", clip: true },
     // raw segment の隣接行を1回の訪問へ合成した単位。
     rawUnit: "logical_vc_visit",

@@ -45,6 +45,7 @@ export {
   type LastOccupantFact,
   type LogicalVisit,
   type LogicalVisitEndQuality,
+  type LogicalVisitStartKind,
   type OccupancyBucket,
   type SafeSocialAggregate,
   type TitleWindow,
