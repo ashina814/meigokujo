@@ -127,10 +127,20 @@ tie判定から消さない）。
 いても、evaluationは `TitleWindow.observedAt`（省略時は現在時刻）より先までtrustedとして
 計上しない。`effectiveEnd = min(end, observedAt)` は1回のexported関数呼び出しにつき
 `resolveWindow()` で1回だけ解決し、クエリの読み込み境界・coalesce・clippingの全段で
-一貫して使う——open visitの終了時刻だけの話ではなく、`observedAt` より後に作られた行
-（別ユーザーの新規入室・後から確定した退室時刻等）はクエリの読み込み段階からそもそも
-見ない。そうしないと、同じ `observedAt` で再評価してもDBが後から進むと結果が変わって
-しまい、reconcileの再現性（「あの時点で何が分かっていたか」の再構築）が壊れる。
+一貫して使う——open visitの終了時刻だけの話ではなく、`observedAt` より後に**開始した**行
+（別ユーザーの新規入室等）はクエリの読み込み段階からそもそも見ない。そうしないと、同じ
+`observedAt` で再評価してもDBが後から進むと結果が変わってしまい、reconcileの再現性
+（「あの時点で何が分かっていたか」の再構築）が壊れる。
+
+ただし、これは「同じ `observedAt` ならDBがどんな後更新を受けてもビット単位で永久に
+同じ結果になる」ことまでは保証しない。VCは完全なevent-sourcing DBではなく、
+`closeAllDangling()` は既存の（`observedAt` より前に開始済みの）dangling segmentへ、
+後から`recovered_estimate`という**過去時刻**を書き込む。この場合、その行は
+`observedAt`より前に開始しているため引き続き読み込まれるが、評価時点で「まだ開いていた
+（trusted `'open'`）」ものが、後日「推定値で閉じた（untrusted `'recovered_estimate'`）」
+へ変わり得る——`isTrustedVisitEnd()` は `'open'` を trusted、`'recovered_estimate'` を
+untrustedとするため、この変化は常に**より保守的な方向**（信頼できたものが信頼できなく
+なる）にしか動かない。late recoveryによって称号を誤って増やすことはなく、安全側へ倒れる。
 
 各derived関数の`userIds`引数の契約: `undefined`=全ユーザー対象、`[]`（空配列）=対象なし
 （何も返さない）。空配列を「絞り込みなし」と解釈すると、意図せず全ユーザーのデータを
@@ -148,6 +158,46 @@ BUMP / upの成功は既に `bump_events(message_id, user_id, created_at)` へ1�
 - `bump_counts`: ランキングとcounter baseline機構の監査用。`titleUsable:false`
 
 これにより、例えば「20回目の成功BUMP」をreconcileしても20件目の `created_at` から正確な `earned_at` を復元できる。既に持っている履歴を捨てて取得順を不明にしない。
+
+### 実行経路: source → evaluation rule → award（PR3）
+
+称号v2の実行は次の経路をたどる。
+
+```text
+行動（VC / BUMP等）
+  ↓
+persisted source（vc_segments / bump_events）
+  ↓
+derived source（vc_visits / vc_empty_start_then_joined / vc_social_safe 等）
+  ↓
+evaluation rule（TitleRule.evaluate）
+  ↓
+award（TitleV2Store、matchedのときだけ）
+  ↓
+（後続PRで） notification / equip
+```
+
+**ruleはDBを直接読まない。** `packages/core/src/titles/v2-sources.ts` が唯一の読み込み境界で、ruleへ渡されるのは `definition.sources` に宣言した `titleUsable: true` sourceの、sanitize済みpayloadだけ。`Database.Database` そのものやraw source（`vc_segments`・`vc_visits`・`vc_co_presence`・`bump_counts`）は一切渡さない——ruleが独自SQLを書ける設計にすると、privacy・provenance・trusted/untrustedの契約を全部迂回できてしまうため。
+
+- `readTitleSource()` は、`sourceKey` がTypeScriptを迂回して（`as any`等で）titleUsable:falseや未登録の値を渡された場合でもruntimeでfail-closedする。
+- `assertSourceReaderCoverage()`（`TitleV2Store` construction時に自動実行）は、titleUsable:trueな全sourceに実際のreaderが存在することを検証する——「registryへ登録だけされているがreaderが無い」状態を黙って空データ扱いにしない。
+- `TitleSourceCache` が `(userId, sourceKey, scopeKey, start, end, observedAt)` 単位で1 evaluation batch内の重複読み込みを防ぐ。複数ruleが同じsourceを使っても、derived計算（PR2の一部はO(訪問数²)）をrule数だけ繰り返さない。永続cacheではない。
+- `bump_events` readerも `min(scope.end, scope.observedAt)` で読み込みを止める。VC readerは既にPR2のobservedAtをそのまま渡しているため、BUMP側だけscope.endまで無条件に読むと、同一evaluation内でsourceごとに時間軸がずれる（VCは観測時点まで、BUMPは未来まで、という不整合）。ただしBUMPはretryで後からcreated_atが過去のeventを挿入し得るため、「同じobservedAtなら永久にDB内容と一致する」とまでは言えない——observedAtは「event occurrenceの上限」として扱う。
+- `TitleRule` は公開structural interfaceなので、`defineTitleRule()` を経由せず手で組み立てたり構築後にdefinitionを書き換えたりできる。`evaluateTitle()` は入口で必ず `defineTitle(rule.definition)` を再度通す——さもないと `sources: []` のruleが「何も読まずに任意のearnedAtでaward」できてしまい、「source contractを条件実装から迂回させない」が破れる。
+- ただし `defineTitle()` はdefinitionをcopyせず同じobjectを返すため、それだけでは足りない。`rule.evaluate()` の実行**中**に `rule.definition`（同一参照）を書き換えられると、評価後のorderable判定がその改竄後の値を見てしまい、入口の再検証をすり抜けられる（VC専用ruleがevaluate()の中で自分のsourcesをorderable:trueな`bump_events`へ差し替え、非nullなearnedAtを通す、等）。`evaluateTitle()` は `sources` を含めて独立したcopyを作り、以降はそのcopyだけを使う。`scope` も同様に、ctx.scopeとして渡す前に値だけを取り出したcopyへ変換する——ruleがctx.scopeを書き換えても、award先のscopeKeyには影響しない。
+- source payloadはTitleSourceCache経由で複数ruleへ同じ参照が配られる。1つのruleが受け取ったpayloadを（配列への`push()`等で）書き換えると、後続ruleが汚染された値を見てしまう。`readTitleSource()` はpayloadを再帰的にdeep-freezeしてから返す——書き換えようとすると（strict modeで）例外になる。
+
+`TitleEvaluationScope { scopeKey, start, end, observedAt }` はPR2の `TitleWindow` へそのまま渡せる形にしてある。scopeKeyの生成（global/month/event/catalog等）はこのPRの範囲外で、呼び出し側が解決済みのscopeを渡す。
+
+earnedAtは、ruleが宣言した**全source**が `orderable: true` のときだけ非nullを返してよい。1つでも `orderable: false` sourceに依存するruleが非nullを返すと `evaluateTitle()` がrejectする——「たぶんこの時刻だろう」を実時刻として保存させない。
+
+lifecycle:
+
+- `disabled`: 新規評価しない（sourceも読まず、ruleの `evaluate()` 自体を呼ばない）
+- `retired`: matchedでも新規awardしない。既存awardは保持する（消さないし増やさない）
+- `active`: 通常通り評価・award可能
+
+awardは `TitleV2Store.award()` の `(user_id, title_key, scope_key)` 冪等性にそのまま乗る。同じevaluationを何度reconcileしても二重awardしないし、既存awardをreconcile時刻等で上書きしない。
 
 ## 4. SYSTEM_EPOCH / CATALOG_EPOCH
 
@@ -280,6 +330,14 @@ v2カタログは `v2.*` 名前空間を使う。
 ## 14. 公開API
 
 v2基盤は `@meigokujo/core/titles/v2` を公開入口にする。後続のBot実装がcore内部pathへ依存しないようにする。
+
+root `packages/core/src/index.ts` からも、evaluator kernelの主要APIだけを最小限export する
+（`TitleV2Store` / `defineTitleRule` / `evaluateTitle` / `evaluateUser` / `evaluateBatch` /
+`TitleEvaluationScope` / `TitleEvaluationResult` / `TitleAwardOutcome` /
+`TitleRuleContext` / `TitleRuleResult`）。`readTitleSource()` 等の低レベルreader APIは
+rootへは出さない——称号条件作者が使うAPIと内部実装を区別する。旧v1にも `TitleRule` が
+存在するため、v2側は `TitleV2Rule` / `TitleV2RuleContext` / `TitleV2RuleResult` へalias
+する。
 
 ## 15. PR分割
 

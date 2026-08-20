@@ -50,3 +50,28 @@ export {
   type SafeSocialAggregate,
   type TitleWindow,
 } from "../vc/derived.js";
+
+export {
+  assertSourceReaderCoverage,
+  readTitleSource,
+  TitleSourceCache,
+  type BumpEventsSourcePayload,
+  type TitleEvaluationScope,
+  type TitleSourcePayloads,
+  type VcEmptyStartThenJoinedSourcePayload,
+  type VcGroupSizeSecondsSourcePayload,
+  type VcLastOccupantSourcePayload,
+  type VcSocialSafeSourcePayload,
+} from "./v2-sources.js";
+
+export {
+  defineTitleRule,
+  evaluateBatch,
+  evaluateTitle,
+  evaluateUser,
+  type TitleAwardOutcome,
+  type TitleEvaluationResult,
+  type TitleRule,
+  type TitleRuleContext,
+  type TitleRuleResult,
+} from "./v2-evaluator.js";
