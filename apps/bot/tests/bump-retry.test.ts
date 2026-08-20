@@ -3,6 +3,8 @@ import { handleBumpMessage } from "../src/bump.js";
 
 const DISBOARD_ID = "302050872383242240";
 const DISSOKU_ID = "761562078095867916";
+const BUMP_MESSAGE_CREATED_AT_MS = new Date("2026-08-20T11:00:00+09:00").getTime();
+const BUMP_MESSAGE_CREATED_AT_SEC = Math.floor(BUMP_MESSAGE_CREATED_AT_MS / 1000);
 type Kind = "disboard" | "dissoku";
 
 function services() {
@@ -32,6 +34,7 @@ function baseMessage(kind: Kind, completed = false) {
   const send = vi.fn(async () => undefined);
   return {
     id: `${kind}-message`,
+    createdTimestamp: BUMP_MESSAGE_CREATED_AT_MS,
     author: { bot: true, id: isDisboard ? DISBOARD_ID : DISSOKU_ID },
     guildId: "guild-main",
     channelId: "channel-bump",
@@ -72,6 +75,7 @@ afterEach(() => {
 describe("bump/up の遅延embed完成", () => {
   it("ディス速は作成直後に成功文面がなくても1秒後の再取得で支給する", async () => {
     vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T11:00:10+09:00"));
     const s = services();
     const initial = baseMessage("dissoku");
     const completed = baseMessage("dissoku", true);
@@ -89,11 +93,12 @@ describe("bump/up の遅延embed完成", () => {
         idempotencyKey: "bump:dissoku-message",
       }),
     );
-    expect(s.bumps.addOnce).toHaveBeenCalledWith("dissoku-message", "user-1");
+    expect(s.bumps.addOnce).toHaveBeenCalledWith("dissoku-message", "user-1", BUMP_MESSAGE_CREATED_AT_SEC);
   });
 
   it("DISBOARDも未完成embedを再取得してbump報酬を支給する", async () => {
     vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T11:00:10+09:00"));
     const s = services();
     const initial = baseMessage("disboard");
     const completed = baseMessage("disboard", true);
@@ -111,11 +116,12 @@ describe("bump/up の遅延embed完成", () => {
         idempotencyKey: "bump:disboard-message",
       }),
     );
-    expect(s.bumps.addOnce).toHaveBeenCalledWith("disboard-message", "user-1");
+    expect(s.bumps.addOnce).toHaveBeenCalledWith("disboard-message", "user-1", BUMP_MESSAGE_CREATED_AT_SEC);
   });
 
   it("1秒・3秒で未完成でも7秒後の最終再取得で支給できる", async () => {
     vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T11:00:10+09:00"));
     const s = services();
     const initial = baseMessage("dissoku");
     const completed = baseMessage("dissoku", true);
@@ -137,6 +143,7 @@ describe("bump/up の遅延embed完成", () => {
 
     expect(fetch).toHaveBeenCalledTimes(3);
     expect(s.ledger.transfer).toHaveBeenCalledOnce();
+    expect(s.bumps.addOnce).toHaveBeenCalledWith("dissoku-message", "user-1", BUMP_MESSAGE_CREATED_AT_SEC);
   });
 
   it("3回再取得しても成功文面がなければ有限回で停止する", async () => {

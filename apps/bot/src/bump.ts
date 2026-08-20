@@ -177,7 +177,9 @@ export async function handleBumpMessage(
 
   // 報酬0でも実績は記録する。同一メッセージIDは addOnce が二重加算を防ぐ。
   // 送金済み・回数未加算で止まった場合も、再処理時に回数だけ追いつける。
-  const counted = services.bumps.addOnce(message.id, runner.id);
+  // retryや通知待ちで処理が遅れても、実績時刻はDiscord成功レスポンスの作成時刻を使う。
+  const occurredAt = Math.floor(message.createdTimestamp / 1000);
+  const counted = services.bumps.addOnce(message.id, runner.id, occurredAt);
   if (!counted) return;
 
   services.settings.set(

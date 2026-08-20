@@ -44,19 +44,21 @@ describe("称号v2 source contract", () => {
     ).toThrow(/source is not usable by titles/);
   });
 
-  it("bump_eventsは成功BUMPのcreated_atを保存し、達成時刻の復元に使える", () => {
+  it("bump_eventsはDiscord成功レスポンスの時刻を保存し、処理遅延後も達成時刻を復元できる", () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-08-20T11:00:00+09:00"));
+    vi.setSystemTime(new Date("2026-08-20T11:00:11+09:00"));
 
     const db = openDb(":memory:");
     const bump = new BumpCounter(db);
-    expect(bump.addOnce("message-1", "alice")).toBe(true);
+    const occurredAt = Math.floor(new Date("2026-08-20T11:00:00+09:00").getTime() / 1000);
+    expect(bump.addOnce("message-1", "alice", occurredAt)).toBe(true);
 
     const row = db.prepare("SELECT user_id, created_at FROM bump_events WHERE message_id = ?").get("message-1") as {
       user_id: string;
       created_at: number;
     };
     expect(row.user_id).toBe("alice");
-    expect(row.created_at).toBe(Math.floor(Date.now() / 1000));
+    expect(row.created_at).toBe(occurredAt);
+    expect(row.created_at).not.toBe(Math.floor(Date.now() / 1000));
   });
 });
