@@ -193,12 +193,16 @@ describe("称号v2 foundation", () => {
     expect(() => store.equip("alice", 4, "v2.table", "global")).toThrow(/slot/);
   });
 
-  it("source registryのwriter/callerは実ファイルに存在する", () => {
+  it("source registryのwriter/caller、またはderivedByは実ファイルに存在する", () => {
     const readRepoFile = (path: string) => readFileSync(new URL(`../../../${path}`, import.meta.url), "utf8");
 
     for (const [sourceKey, source] of Object.entries(TITLE_SOURCES)) {
-      expect(readRepoFile(source.writtenBy.file), `${sourceKey} writer`).toContain(source.writtenBy.needle);
-      expect(readRepoFile(source.calledFrom.file), `${sourceKey} caller`).toContain(source.calledFrom.needle);
+      if (source.origin === "persisted") {
+        expect(readRepoFile(source.writtenBy.file), `${sourceKey} writer`).toContain(source.writtenBy.needle);
+        expect(readRepoFile(source.calledFrom.file), `${sourceKey} caller`).toContain(source.calledFrom.needle);
+      } else {
+        expect(readRepoFile(source.derivedBy.file), `${sourceKey} derivedBy`).toContain(source.derivedBy.needle);
+      }
     }
   });
 
@@ -233,6 +237,7 @@ describe("称号v2 foundation", () => {
 
   it("定義guardはv2名前空間・登録source・隠し完遂除外を守る", () => {
     expect(TITLE_TIME_ZONE).toBe("Asia/Tokyo");
+    // vc_segments は raw source で titleUsable:false。derived の vc_visits を使う。
     expect(
       defineTitle({
         key: "v2.sample",
@@ -240,7 +245,7 @@ describe("称号v2 foundation", () => {
         name: "サンプル",
         emoji: "🕯",
         description: "テスト",
-        sources: ["vc_segments"],
+        sources: ["vc_visits"],
         trigger: "vc_leave",
         lifecycle: "active",
         hidden: false,
@@ -256,7 +261,7 @@ describe("称号v2 foundation", () => {
         name: "???",
         emoji: "🔒",
         description: "hidden",
-        sources: ["vc_segments"],
+        sources: ["vc_visits"],
         trigger: "vc_leave",
         lifecycle: "active",
         hidden: true,

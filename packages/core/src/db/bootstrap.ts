@@ -255,7 +255,11 @@ CREATE TABLE IF NOT EXISTS vc_segments (
   started_at    INTEGER NOT NULL,
   ended_at      INTEGER,
   self_muted    INTEGER NOT NULL DEFAULT 0,
-  self_deafened INTEGER NOT NULL DEFAULT 0
+  self_deafened INTEGER NOT NULL DEFAULT 0,
+  -- ended_at の値の出自。NULL=まだ開いている、または本列追加前のlegacy行で品質不明。
+  -- 'observed'=通常のVoiceStateUpdateで閉じた。'recovered_estimate'=closeAllDangling()の推定値。
+  -- 既存closed行をobservedへ推測で埋めてはいけない（title称号の取得順証明に使うため）。
+  end_quality   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_vc_user ON vc_segments(user_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_vc_open ON vc_segments(ended_at) WHERE ended_at IS NULL;
@@ -1063,6 +1067,8 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "casino_chip_opening_versions", "pool_land", "INTEGER");
   ensureColumn(db, "casino_chip_opening_versions", "from_ledger_tx_id", "INTEGER");
   ensureColumn(db, "vc_segments", "parent_id", "TEXT");
+  // 既存本番行はNULL（品質不明）のまま残る。observedと推測して書き換えない。
+  ensureColumn(db, "vc_segments", "end_quality", "TEXT");
   ensureColumn(db, "marks", "weight", "INTEGER NOT NULL DEFAULT 1 CHECK (weight > 0)");
   ensureColumn(db, "evaluations", "mark_weight", "INTEGER NOT NULL DEFAULT 0 CHECK (mark_weight >= 0)");
   ensureColumn(db, "souls", "eval_started_at", "INTEGER");

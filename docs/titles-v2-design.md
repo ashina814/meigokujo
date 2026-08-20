@@ -35,19 +35,30 @@ OK: 誰もいない場所から始まる印があるらしい
 
 > **称号から書かない。データ源から書く。**
 
-称号定義は必ず `TITLE_SOURCES` の登録済みsourceを宣言する。source contractは最低限、次を持つ。
+称号定義は必ず `TITLE_SOURCES` の登録済みsourceを宣言する。sourceは `persisted`（DBへ直接書く）と
+`derived`（他sourceから読み出し専用で導出する）のdiscriminated unionで、共通して次を持つ。
 
-- `writtenBy`: 書き込み正本
-- `calledFrom`: writerを直接呼ぶ本番処理
-- `wiredFrom`: Discord event等から`calledFrom`までの最上流配線
 - `kind`: `history | counter`
 - `privacy`: `safe | restricted | forbidden`
 - `orderable`: source全体で達成時刻を正確に復元できるか
 - `titleUsable`: 個々の称号から直接参照してよいか
 - `epochPolicy`: カタログ施行境界の切り方。counterはbaseline metric名もここで固定する
-- `rawUnit`: DBの1行が何を意味するか
+- `rawUnit`: DBの1行（またはderived factの1件）が何を意味するか
+
+`persisted` はさらに次を持つ。
+
+- `writtenBy`: 書き込み正本
+- `calledFrom`: writerを直接呼ぶ本番処理
+- `wiredFrom`: Discord event等から`calledFrom`までの最上流配線
+
+`derived` は「writerが存在するsource」と偽装しない。代わりに次を持つ。
+
+- `derivedBy`: 導出ロジックを実装しているファイルと、その存在を示す最小文字列
+- `derivedFrom`: 依存する登録済みsource。dependency chainは最終的にlive persistedへ到達しなければ
+  ならない（`assertDerivedSourceDependenciesResolve()` が循環参照・未登録参照・非persisted終端を拒否する）
 
 sourceは一気に登録せず、writer / caller / event wiring / 境界を実コードで検証できたものだけ追加する。
+derivedも同様に、実装ファイルの存在とdependency chainの解決を機械テストで検証してから追加する。
 
 ### VCの重要な契約
 
@@ -56,6 +67,38 @@ sourceは一気に登録せず、writer / caller / event wiring / 境界を実�
 したがって `COUNT(vc_segments)` を「VC入室回数」と読んではいけない。raw unitは **voice state segment**。
 
 さらに `closeAllDangling()` はクラッシュ等で実退出時刻が分からないsegmentを「開始 + 上限（既定6時間）」で補正する。そのためraw `vc_segments` 全体は `orderable: false` とする。正確な時刻を保証できる行動は、後続のderived sourceで別契約にして `orderable: true` を持たせる。
+
+`ended_at` の出自は `end_quality` 列（additive migration）で区別する。`observed`=通常の
+VoiceStateUpdate処理で閉じた、`recovered_estimate`=`closeAllDangling()` の推定値、
+`NULL`=まだ開いている、または列追加前のlegacy行（品質不明）。既存closed行を`observed`と
+推測して書き換えることはしない。
+
+### VC derived source層（PR2）
+
+raw `vc_segments` は `titleUsable: false`。個々の称号は `packages/core/src/vc/derived.ts` の
+derived sourceを使う。
+
+- `vc_visits`: 隣接segment（同一user・同一channel・時刻が連続）を1訪問へ合成した単位
+- `vc_empty_start_then_joined`: 誰もいないVCへ入り、後から誰かが来た、という事実のみ
+  （相手のidentityは含まない）
+- `vc_last_occupant`: occupancyが2以上から1に減り、subjectだけが残った瞬間
+  （相手のidentityは含まない）
+- `vc_group_size_seconds`: solo/1:1/小人数/大人数の帯ごとの滞在秒数
+- `vc_co_presence`: pairwiseの重なり（`privacy: restricted`。相手のuserIdを含むため
+  称号から直接は使わせない）
+- `vc_social_safe`: `vc_co_presence` を畳み込んだ、本人単位の安全な集計（`vc_co_presence`
+  から派生する2段のdependency chain）
+
+**信頼境界**: 開始時刻は常にDiscordイベントを観測した記録なので信頼できる。終了時刻は
+`observed`／訪問がまだ`window.end`で開いている場合のみ信頼できる（`isTrustedVisitEnd()`）。
+複数ユーザーを比較して「誰が先か」「誰がまだ居たか」を主張するfactは、比較に使う双方の
+境界が信頼できる場合だけ成立させる。単独ユーザーの計測（滞在秒数）は、本人の終了だけを
+信頼判定に使い、周囲の人数把握は他者の終了品質を問わずbest-effortで使ってよい
+（特定の誰かについての主張をしないため）。
+
+window境界より前から継続していた訪問は、`startedAt` が境界でclipされているだけなので
+「開始イベント」として扱わない（`LogicalVisit.startClipped`）。同一秒のtieは前後関係を
+証明できないため、安全側（factを作らない）へ倒す。
 
 ### BUMPの重要な契約
 

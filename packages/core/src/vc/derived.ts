@@ -1,0 +1,610 @@
+import type Database from "better-sqlite3";
+
+/**
+ * raw vc_segments を、称号条件に安全に使える意味単位へ変換するderived layer。
+ *
+ * # なぜこの層が要るか
+ *
+ * raw vc_segments の1行は「1回のVC入室」ではない。VcTracker.open() は入室だけでなく
+ * mute/deafen変化やチャンネル移動でも前segmentを閉じて新しい行を作る（vc/service.ts）。
+ * したがって `COUNT(vc_segments)` を入室回数と読むと、頻繁にミュートを切り替える人ほど
+ * 多く数えてしまう。ここでは隣接segmentを1回の「訪問（logical visit）」へ合成してから
+ * 各種factを導出する。
+ *
+ * # 信頼境界（このファイル全体で守る唯一のルール）
+ *
+ * **開始時刻（startedAt）は常に信頼できる。** Botが実際にDiscordイベントを観測した瞬間の
+ * 記録だから。**終了時刻（endedAt）は `isTrustedVisitEnd()` が true のときだけ信頼できる。**
+ * closeAllDangling() の推定終了（'recovered_estimate'）は、Bot停止中に本人がとっくに
+ * 退出していた場合には過大評価にも過小評価にもなり得る。上限にも下限にも使えない。
+ *
+ * 複数ユーザーの訪問を比較して「誰が先か」「誰がまだ居たか」を主張するfact
+ * （empty-start-then-joined・last-occupant）は、比較に使う双方の境界が信頼できる場合
+ * だけ成立させる。単独ユーザーの合計時間（group-size seconds）のように「主張」ではなく
+ * 「計測」であるものは、本人の訪問の終了だけを信頼判定に使い、周囲の人数把握には
+ * best-effortで他者の訪問も使ってよい（誰が・いつ、という個別の主張をしないため）。
+ *
+ * 同一秒のtieは「前後関係を証明できない」として安全側（factを作らない）へ倒す。
+ */
+
+export interface TitleWindow {
+  /** inclusive */
+  start: number;
+  /** exclusive */
+  end: number;
+}
+
+export type LogicalVisitEndQuality = "observed" | "recovered_estimate" | "unknown" | "open";
+
+export interface LogicalVisit {
+  userId: string;
+  channelId: string;
+  parentId: string | null;
+  startedAt: number;
+  /** windowでclipされた値。open visitはwindow.endで打ち切られる。 */
+  endedAt: number;
+  endQuality: LogicalVisitEndQuality;
+  /** coalesceされたraw segment数（診断用）。 */
+  segmentCount: number;
+  /**
+   * trueなら、実際の開始はwindow.startより前で、startedAtはwindowの端で切っただけ。
+   * 「window内で入室した」「空VCへ最初に入った」等の**開始イベント**として扱ってはいけない
+   * ——window境界と一致しているだけで、本当にその瞬間に起きた出来事ではないため。
+   * 継続時間の計測（fact E）や「その時点で在室していたか」の下限（fact D）には使ってよい。
+   */
+  startClipped: boolean;
+}
+
+/** 終了時刻を「主張」の根拠として使ってよいか。'recovered_estimate' と 'unknown' は使えない。 */
+export function isTrustedVisitEnd(quality: LogicalVisitEndQuality): boolean {
+  return quality === "observed" || quality === "open";
+}
+
+function clampWindow(window: TitleWindow): void {
+  if (!Number.isInteger(window.start) || !Number.isInteger(window.end) || window.start >= window.end) {
+    throw new RangeError(`invalid title window: [${window.start}, ${window.end})`);
+  }
+}
+
+interface RawSegmentRow {
+  id: number;
+  user_id: string;
+  channel_id: string;
+  parent_id: string | null;
+  started_at: number;
+  ended_at: number | null;
+  end_quality: "observed" | "recovered_estimate" | null;
+}
+
+/**
+ * windowと重なりうる全raw segmentsを一括で読む。ユーザーごとに何度もクエリを投げない。
+ * 「windowより前から継続していた行」も拾うため startedAt に下限は掛けない。
+ */
+function loadRawSegments(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): RawSegmentRow[] {
+  const params: unknown[] = [window.end, window.start];
+  let sql = `
+    SELECT id, user_id, channel_id, parent_id, started_at, ended_at, end_quality
+    FROM vc_segments
+    WHERE started_at < ?
+      AND (ended_at IS NULL OR ended_at > ?)
+  `;
+  if (userIds && userIds.length > 0) {
+    sql += ` AND user_id IN (${userIds.map(() => "?").join(",")})`;
+    params.push(...userIds);
+  }
+  sql += " ORDER BY user_id, started_at, id";
+  return db.prepare(sql).all(...params) as RawSegmentRow[];
+}
+
+function loadRawSegmentsForChannels(
+  db: Database.Database,
+  window: TitleWindow,
+  channelIds: readonly string[],
+): RawSegmentRow[] {
+  if (channelIds.length === 0) return [];
+  const sql = `
+    SELECT id, user_id, channel_id, parent_id, started_at, ended_at, end_quality
+    FROM vc_segments
+    WHERE started_at < ? AND (ended_at IS NULL OR ended_at > ?)
+      AND channel_id IN (${channelIds.map(() => "?").join(",")})
+    ORDER BY user_id, started_at, id
+  `;
+  return db.prepare(sql).all(window.end, window.start, ...channelIds) as RawSegmentRow[];
+}
+
+/**
+ * rowから直接logical visitsを合成する。呼び出し側は既に必要な行をロード済みという前提。
+ * 行は user_id, started_at, id 順（loadRawSegments系が保証する）。
+ */
+function coalesceVisits(rows: readonly RawSegmentRow[], window: TitleWindow): LogicalVisit[] {
+  const visits: LogicalVisit[] = [];
+
+  type Open = {
+    userId: string;
+    channelId: string;
+    parentId: string | null;
+    startedAt: number;
+    lastEndedAt: number | null;
+    lastEndQuality: RawSegmentRow["end_quality"];
+    segmentCount: number;
+  };
+  let current: Open | null = null;
+
+  const flush = () => {
+    if (!current) return;
+    let endedAt: number;
+    let endQuality: LogicalVisitEndQuality;
+    if (current.lastEndedAt === null) {
+      // まだ開いている（closeAllDanglingも未通過）: windowの終端で打ち切る。
+      // これは推測ではなく、こちらが指定したクエリ境界そのものなので信頼できる。
+      endedAt = window.end;
+      endQuality = "open";
+    } else if (current.lastEndQuality === "observed") {
+      endedAt = current.lastEndedAt;
+      endQuality = "observed";
+    } else if (current.lastEndQuality === "recovered_estimate") {
+      endedAt = current.lastEndedAt;
+      endQuality = "recovered_estimate";
+    } else {
+      // legacy行（end_quality列追加前にclosedになった行）。品質不明のまま扱う。
+      endedAt = current.lastEndedAt;
+      endQuality = "unknown";
+    }
+
+    const startClipped = current.startedAt < window.start;
+    const startedAt = Math.max(current.startedAt, window.start);
+    const clippedEnded = Math.min(endedAt, window.end);
+    if (clippedEnded > startedAt) {
+      visits.push({
+        userId: current.userId,
+        channelId: current.channelId,
+        parentId: current.parentId,
+        startedAt,
+        endedAt: clippedEnded,
+        endQuality,
+        segmentCount: current.segmentCount,
+        startClipped,
+      });
+    }
+    current = null;
+  };
+
+  for (const row of rows) {
+    // 行は user_id → started_at → id の順に並んでいるので、同一userの行は必ず連続する。
+    const continuesCurrent =
+      current !== null &&
+      current.userId === row.user_id &&
+      current.channelId === row.channel_id &&
+      // 直前segmentの終了時刻と、この行の開始時刻が一致 = mute/deafen変化による分割
+      current.lastEndedAt === row.started_at;
+
+    if (continuesCurrent && current) {
+      current.lastEndedAt = row.ended_at;
+      current.lastEndQuality = row.end_quality;
+      current.segmentCount += 1;
+    } else {
+      flush();
+      current = {
+        userId: row.user_id,
+        channelId: row.channel_id,
+        parentId: row.parent_id,
+        startedAt: row.started_at,
+        lastEndedAt: row.ended_at,
+        lastEndQuality: row.end_quality,
+        segmentCount: 1,
+      };
+    }
+  }
+  flush();
+
+  return visits;
+}
+
+/**
+ * A. logical visits。
+ * raw vc_segments の隣接segment（同一user・同一channel・時刻が連続）を1訪問へ合成する。
+ * 単純に user_id + channel_id で GROUP BY してはいけない
+ * （退出→再入室が同じチャンネルなら誤って1訪問に潰れてしまう）。
+ */
+export function computeLogicalVisits(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): LogicalVisit[] {
+  clampWindow(window);
+  const rows = loadRawSegments(db, window, userIds);
+  return coalesceVisits(rows, window);
+}
+
+// ─────────────────────────────────────────────────────────────
+// C. empty-start → later joined
+// ─────────────────────────────────────────────────────────────
+
+export interface EmptyStartThenJoinedFact {
+  userId: string;
+  channelId: string;
+  visitStartedAt: number;
+  /** 別のuserが入室してきた時刻。 */
+  joinedAt: number;
+}
+
+/**
+ * 「誰もいないVCから始まり、その後別の誰かが入ってきた」という事実だけを返す。
+ * 誰が来たか（identity）・因果（呼び込んだ、人気がある等）は一切主張しない。
+ *
+ * 成立条件:
+ * - subjectの訪問**開始そのものがwindow内の本物の出来事**であること
+ *   （window開始前から継続していた訪問をclipしただけのものは、開始イベントとして数えない）
+ * - subjectの訪問開始時、他の誰の訪問もその瞬間を覆っていない（tie含めて厳密に除外）
+ * - subjectの訪問の終了が信頼できる（'observed' または 'open'）
+ *   → 信頼できない終了時刻を「まだ居た」の根拠にしない
+ * - 他者の訪問開始が、subjectの開始より厳密に後、終了より前
+ */
+export function computeEmptyStartThenJoined(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): EmptyStartThenJoinedFact[] {
+  clampWindow(window);
+  const subjectVisits = computeLogicalVisits(db, window, userIds);
+  if (subjectVisits.length === 0) return [];
+
+  const channelIds = [...new Set(subjectVisits.map((v) => v.channelId))];
+  const allRows = loadRawSegmentsForChannels(db, window, channelIds);
+  const allVisits = coalesceVisits(allRows, window);
+  const byChannel = groupByChannel(allVisits);
+
+  const facts: EmptyStartThenJoinedFact[] = [];
+  for (const subject of subjectVisits) {
+    if (subject.startClipped) continue;
+    if (!isTrustedVisitEnd(subject.endQuality)) continue;
+
+    const others = (byChannel.get(subject.channelId) ?? []).filter(
+      (v) => !(v.userId === subject.userId && v.startedAt === subject.startedAt),
+    );
+
+    const notEmptyAtStart = others.some((o) => o.startedAt <= subject.startedAt && o.endedAt > subject.startedAt);
+    if (notEmptyAtStart) continue;
+
+    const laterJoin = others
+      .filter((o) => o.startedAt > subject.startedAt && o.startedAt < subject.endedAt)
+      .sort((a, b) => a.startedAt - b.startedAt)[0];
+    if (!laterJoin) continue;
+
+    facts.push({
+      userId: subject.userId,
+      channelId: subject.channelId,
+      visitStartedAt: subject.startedAt,
+      joinedAt: laterJoin.startedAt,
+    });
+  }
+  return facts;
+}
+
+// ─────────────────────────────────────────────────────────────
+// D. last occupant
+// ─────────────────────────────────────────────────────────────
+
+export interface LastOccupantFact {
+  userId: string;
+  channelId: string;
+  /** 直前まで居た他者が退出し、subjectだけが残った時刻。 */
+  becameLastAt: number;
+}
+
+/**
+ * 「occupancyが2以上だったVCで、他者が退出し、subjectだけが残った」瞬間を返す。
+ *
+ * 成立条件:
+ * - 退出した他者の終了が信頼できる（そうでなければ「本当にその瞬間に退出した」と言えない）
+ * - subjectの開始がその瞬間以前、終了がその瞬間より後（subjectの終了も信頼できること）
+ * - 第三者がその瞬間を覆っていない。ただし第三者の終了が信頼できない場合、
+ *   「もう居なかった」と決めつけず、安全側に倒してfactを作らない
+ * - 最初から1人きりの訪問（元々occupancy 1）は対象外
+ */
+export function computeLastOccupant(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): LastOccupantFact[] {
+  clampWindow(window);
+  const subjectVisits = computeLogicalVisits(db, window, userIds);
+  if (subjectVisits.length === 0) return [];
+
+  const channelIds = [...new Set(subjectVisits.map((v) => v.channelId))];
+  const allRows = loadRawSegmentsForChannels(db, window, channelIds);
+  const allVisits = coalesceVisits(allRows, window);
+  const byChannel = groupByChannel(allVisits);
+
+  const facts: LastOccupantFact[] = [];
+  for (const subject of subjectVisits) {
+    if (!isTrustedVisitEnd(subject.endQuality)) continue;
+
+    const channelVisits = byChannel.get(subject.channelId) ?? [];
+    // channelVisits は別クエリ由来なのでsubjectとは別オブジェクト。userIdで自分自身を除く。
+    const others = channelVisits.filter((v) => v.userId !== subject.userId);
+
+    // subjectと重なった他者ごとに「退出時刻」を候補にする
+    const departureCandidates = others.filter(
+      (o) => isTrustedVisitEnd(o.endQuality) && o.startedAt < o.endedAt && o.endedAt > subject.startedAt && o.endedAt < subject.endedAt,
+    );
+
+    for (const departing of departureCandidates) {
+      const t = departing.endedAt;
+      // subjectがtの時点で在室していること（開始は常に信頼できるので startedAt<=t だけ見ればよい）
+      if (subject.startedAt > t) continue;
+
+      // tの瞬間、departing以外の第三者が覆っていないこと。
+      // 第三者の終了が信頼できず「まだ居たかもしれない」場合は安全側でfactを作らない。
+      const thirdPartyPresentOrAmbiguous = others.some((o) => {
+        if (o === departing) return false;
+        const coversInstant = o.startedAt <= t && o.endedAt > t;
+        if (coversInstant) return true;
+        // 終了が信頼できず、tより後で終わっていた可能性を否定できない
+        if (!isTrustedVisitEnd(o.endQuality) && o.startedAt <= t) return true;
+        return false;
+      });
+      if (thirdPartyPresentOrAmbiguous) continue;
+
+      facts.push({ userId: subject.userId, channelId: subject.channelId, becameLastAt: t });
+      break; // subjectごとに最初に見つかった遷移だけを1factとする
+    }
+  }
+  return facts;
+}
+
+function groupByChannel(visits: readonly LogicalVisit[]): Map<string, LogicalVisit[]> {
+  const map = new Map<string, LogicalVisit[]>();
+  for (const v of visits) {
+    const list = map.get(v.channelId);
+    if (list) list.push(v);
+    else map.set(v.channelId, [v]);
+  }
+  return map;
+}
+
+// ─────────────────────────────────────────────────────────────
+// E. group-size style（人数帯ごとの滞在秒数）
+// ─────────────────────────────────────────────────────────────
+
+export type OccupancyBucket = "solo" | "oneToOne" | "smallGroup" | "largeGroup";
+
+export interface GroupSizeSeconds {
+  userId: string;
+  trustedSecondsByBucket: Record<OccupancyBucket, number>;
+  /** 終了が信頼できない訪問の合計秒数。bucket化しない。 */
+  untrustedSeconds: number;
+}
+
+function bucketFor(occupancy: number): OccupancyBucket {
+  if (occupancy <= 1) return "solo";
+  if (occupancy === 2) return "oneToOne";
+  if (occupancy <= 4) return "smallGroup";
+  return "largeGroup";
+}
+
+/**
+ * userごとに、人数帯（solo/1:1/小人数/大人数）ごとの滞在秒数を集計する。
+ *
+ * 「何人居たか」という周囲の人数把握は、他者の訪問の終了品質を問わずbest-effortで使う
+ * （特定の誰かについての主張をしないため、named factより基準を緩めてよい）。
+ * 一方、本人の滞在秒数として計上してよいかどうかは、本人の訪問の終了が信頼できるかだけで
+ * 判定する（他者の情報の精度に関係なく、本人の実績を過大/過小に主張しないため）。
+ */
+export function computeGroupSizeSeconds(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): GroupSizeSeconds[] {
+  clampWindow(window);
+  const subjectVisits = computeLogicalVisits(db, window, userIds);
+  if (subjectVisits.length === 0) return [];
+
+  const channelIds = [...new Set(subjectVisits.map((v) => v.channelId))];
+  const allRows = loadRawSegmentsForChannels(db, window, channelIds);
+  const allVisits = coalesceVisits(allRows, window);
+  const byChannel = groupByChannel(allVisits);
+
+  const results = new Map<string, GroupSizeSeconds>();
+  const ensure = (userId: string): GroupSizeSeconds => {
+    let r = results.get(userId);
+    if (!r) {
+      r = {
+        userId,
+        trustedSecondsByBucket: { solo: 0, oneToOne: 0, smallGroup: 0, largeGroup: 0 },
+        untrustedSeconds: 0,
+      };
+      results.set(userId, r);
+    }
+    return r;
+  };
+
+  for (const subject of subjectVisits) {
+    const r = ensure(subject.userId);
+    if (!isTrustedVisitEnd(subject.endQuality)) {
+      r.untrustedSeconds += subject.endedAt - subject.startedAt;
+      continue;
+    }
+
+    const channelVisits = byChannel.get(subject.channelId) ?? [];
+    const boundaries = new Set<number>([subject.startedAt, subject.endedAt]);
+    for (const v of channelVisits) {
+      if (v.startedAt > subject.startedAt && v.startedAt < subject.endedAt) boundaries.add(v.startedAt);
+      if (v.endedAt > subject.startedAt && v.endedAt < subject.endedAt) boundaries.add(v.endedAt);
+    }
+    const points = [...boundaries].sort((a, b) => a - b);
+
+    for (let i = 0; i < points.length - 1; i++) {
+      const sliceStart = points[i]!;
+      const sliceEnd = points[i + 1]!;
+      if (sliceEnd <= sliceStart) continue;
+      // channelVisits は subject自身の写しも含む（同一channelの全visitを取得しているため）。
+      // subjectの訪問区間内なので occupancy は常に1以上になる。
+      const occupancy = channelVisits.filter((v) => v.startedAt <= sliceStart && v.endedAt > sliceStart).length;
+      r.trustedSecondsByBucket[bucketFor(occupancy)] += sliceEnd - sliceStart;
+    }
+  }
+
+  return [...results.values()];
+}
+
+// ─────────────────────────────────────────────────────────────
+// B / F. co-presence（生pairwiseはrestricted、集計だけsafe）
+// ─────────────────────────────────────────────────────────────
+
+export interface CoPresenceOverlap {
+  /** userA < userB に正規化する。生の相手identityを含むため privacy: restricted。 */
+  userA: string;
+  userB: string;
+  overlapSeconds: number;
+  /** 重なりが生じたdistinct JST日（Asia/Tokyo）。 */
+  jstDays: readonly string[];
+}
+
+const JST_OFFSET_SEC = 9 * 3600;
+
+/** unix秒 → JST暦日（YYYY-MM-DD）。entry/sessions.ts の jstDateStr と同じ考え方。 */
+function jstDateOf(ts: number): string {
+  return new Date((ts + JST_OFFSET_SEC) * 1000).toISOString().slice(0, 10);
+}
+
+/** JST暦日の 00:00 に対応するunix秒。 */
+function jstDayStartUnix(dateStr: string): number {
+  return Math.floor(new Date(`${dateStr}T00:00:00+09:00`).getTime() / 1000);
+}
+
+/** [startedAt, endedAt) が触れるdistinct JST暦日を列挙する。秒単位では舐めず、日境界だけ進む。 */
+function jstDatesInInterval(startedAt: number, endedAt: number): string[] {
+  const days: string[] = [];
+  let cursor = startedAt;
+  let guard = 0;
+  while (cursor < endedAt && guard < 400) {
+    const dateStr = jstDateOf(cursor);
+    days.push(dateStr);
+    cursor = jstDayStartUnix(dateStr) + 86_400;
+    guard += 1;
+  }
+  return days;
+}
+
+/**
+ * pairwiseの重なりを求める。**この結果を公開称号の説明文へそのまま出さない**
+ * （相手のuserIdが乗っているため privacy: restricted）。
+ *
+ * 重なり秒数は「主張」ではなく「計測」だが、どちらか一方の終了が信頼できない場合は
+ * 数えない（拘束境界が不確かな計測を安全側で除外する）。
+ */
+export function computeCoPresenceOverlaps(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): CoPresenceOverlap[] {
+  clampWindow(window);
+  const subjectVisits = computeLogicalVisits(db, window, userIds);
+  if (subjectVisits.length === 0) return [];
+
+  const channelIds = [...new Set(subjectVisits.map((v) => v.channelId))];
+  const allRows = loadRawSegmentsForChannels(db, window, channelIds);
+  const allVisits = coalesceVisits(allRows, window);
+  const byChannel = groupByChannel(allVisits);
+
+  const subjectSet = userIds ? new Set(userIds) : null;
+  const pairSeconds = new Map<string, { a: string; b: string; seconds: number; days: Set<string> }>();
+
+  for (const [, visits] of byChannel) {
+    for (let i = 0; i < visits.length; i++) {
+      for (let j = i + 1; j < visits.length; j++) {
+        const v1 = visits[i]!;
+        const v2 = visits[j]!;
+        if (v1.userId === v2.userId) continue;
+        // 少なくとも一方がリクエストされたuserであること（userIds指定時）
+        if (subjectSet && !subjectSet.has(v1.userId) && !subjectSet.has(v2.userId)) continue;
+        if (!isTrustedVisitEnd(v1.endQuality) || !isTrustedVisitEnd(v2.endQuality)) continue;
+
+        const start = Math.max(v1.startedAt, v2.startedAt);
+        const end = Math.min(v1.endedAt, v2.endedAt);
+        if (end <= start) continue;
+
+        const [a, b] = v1.userId < v2.userId ? [v1.userId, v2.userId] : [v2.userId, v1.userId];
+        const key = `${a} ${b}`;
+        let entry = pairSeconds.get(key);
+        if (!entry) {
+          entry = { a, b, seconds: 0, days: new Set() };
+          pairSeconds.set(key, entry);
+        }
+        entry.seconds += end - start;
+        for (const d of jstDatesInInterval(start, end)) entry.days.add(d);
+      }
+    }
+  }
+
+  return [...pairSeconds.values()].map((e) => ({
+    userA: e.a,
+    userB: e.b,
+    overlapSeconds: e.seconds,
+    jstDays: [...e.days].sort(),
+  }));
+}
+
+export interface SafeSocialAggregate {
+  userId: string;
+  /** 重なったdistinctな相手の人数。相手のidentityは含まない。 */
+  distinctCoPresentUsers: number;
+  /** 同じ一人と重なったdistinct JST日数の最大値。相手のidentityは含まない。 */
+  maxRepeatedDaysWithOneCounterpart: number;
+  /**
+   * 全pairの信頼できる重なり秒数の合計。
+   * 3人以上が同時に居た時間は相手ごとに重複して加算される
+   * （「時計上の総滞在時間」ではなく「延べ何秒、誰かと重なっていたか」の指標）。
+   */
+  trustedOverlapSeconds: number;
+}
+
+/**
+ * pair identityを一切外へ出さずに、社会的な広がりだけを安全に返す。
+ * 称号定義は特定の相手のuserIdを渡さなくても、ここから判定できる。
+ */
+export function computeSafeSocialAggregates(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): SafeSocialAggregate[] {
+  const overlaps = computeCoPresenceOverlaps(db, window, userIds);
+  const byUser = new Map<string, { partners: Map<string, { seconds: number; days: number }> }>();
+
+  const touch = (self: string, other: string, seconds: number, days: number) => {
+    let entry = byUser.get(self);
+    if (!entry) {
+      entry = { partners: new Map() };
+      byUser.set(self, entry);
+    }
+    const prev = entry.partners.get(other) ?? { seconds: 0, days: 0 };
+    entry.partners.set(other, { seconds: prev.seconds + seconds, days: prev.days + days });
+  };
+
+  for (const o of overlaps) {
+    touch(o.userA, o.userB, o.overlapSeconds, o.jstDays.length);
+    touch(o.userB, o.userA, o.overlapSeconds, o.jstDays.length);
+  }
+
+  const results: SafeSocialAggregate[] = [];
+  for (const [userId, { partners }] of byUser) {
+    let totalSeconds = 0;
+    let maxDays = 0;
+    for (const p of partners.values()) {
+      totalSeconds += p.seconds;
+      if (p.days > maxDays) maxDays = p.days;
+    }
+    results.push({
+      userId,
+      distinctCoPresentUsers: partners.size,
+      maxRepeatedDaysWithOneCounterpart: maxDays,
+      trustedOverlapSeconds: totalSeconds,
+    });
+  }
+  return results;
+}

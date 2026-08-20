@@ -6,6 +6,18 @@ import type Database from "better-sqlite3";
  * （誰が・どのVCに・いつからいつまで・ミュート状態）を追記し、
  * 報酬計算・浮上実績・死亡判定は全部この記録の読み出し方の違いで実現する。
  */
+/**
+ * ended_at の出自。
+ *
+ * - null: まだ開いている、またはこの列を追加する前のlegacy行（品質不明）
+ * - 'observed': 通常のVoiceStateUpdate処理（open/close）で閉じた
+ * - 'recovered_estimate': closeAllDangling() がクラッシュ復旧時に推定値で閉じた
+ *
+ * 既存のclosed行を 'observed' と推測してはいけない。称号の取得順証明（derived layer）が
+ * この区別に依存するため、不明なものは不明のまま残す。
+ */
+export type VcSegmentEndQuality = "observed" | "recovered_estimate" | null;
+
 export interface VcSegment {
   id: number;
   user_id: string;
@@ -15,6 +27,7 @@ export interface VcSegment {
   ended_at: number | null;
   self_muted: number;
   self_deafened: number;
+  end_quality: VcSegmentEndQuality;
 }
 
 export interface PresenceSummary {
@@ -47,22 +60,27 @@ export class VcTracker {
     this.closeAt(userId, now());
   }
 
+  /**
+   * 通常のVoiceStateUpdate処理（open()の前段・close()）による終了。
+   * 実際にDiscordのイベントを観測して閉じているので 'observed'。
+   */
   private closeAt(userId: string, ts: number): void {
     this.db
-      .prepare("UPDATE vc_segments SET ended_at = ? WHERE user_id = ? AND ended_at IS NULL")
+      .prepare("UPDATE vc_segments SET ended_at = ?, end_quality = 'observed' WHERE user_id = ? AND ended_at IS NULL")
       .run(ts, userId);
   }
 
   /**
    * 起動時の後始末: クラッシュ等で閉じ損ねたセグメントを閉じる。
    * 実際の退出時刻は分からないため、開始+上限（既定6時間）と現在時刻の早い方で打ち切る。
+   * 'observed' ではなく 'recovered_estimate' として記録し、正確な終了時刻を主張しない。
    */
   closeAllDangling(capSeconds = 6 * 3600): number {
     const ts = now();
     const result = this.db
       .prepare(
         `UPDATE vc_segments
-         SET ended_at = MIN(?, started_at + ?)
+         SET ended_at = MIN(?, started_at + ?), end_quality = 'recovered_estimate'
          WHERE ended_at IS NULL`,
       )
       .run(ts, capSeconds);

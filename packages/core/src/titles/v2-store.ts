@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import {
   TITLE_SOURCES,
+  assertDerivedSourceDependenciesResolve,
   type TitleSourceDefinition,
   type TitleSourceKey,
 } from "./v2-contract.js";
@@ -206,6 +207,7 @@ export class TitleV2Store {
     private readonly clock: () => number = now,
   ) {
     assertCounterBaselineSnapshotterCoverage();
+    assertDerivedSourceDependenciesResolve();
     ensureTitleV2Schema(db);
   }
 
