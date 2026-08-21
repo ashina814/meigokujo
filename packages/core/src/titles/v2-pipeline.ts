@@ -15,6 +15,11 @@ import {
 } from "./v2-evaluator.js";
 import { TitleSourceCache } from "./v2-sources.js";
 import { buildMetaSnapshot, evaluateMetaTitle, type MetaTitleEvaluationResult, type MetaTitleRule } from "./v2-meta.js";
+import {
+  evaluateRelationshipTitle,
+  type RelationshipTitleEvaluationResult,
+  type RelationshipTitleRule,
+} from "./v2-relationship.js";
 import type { ReconcileSeriesMasteriesResult } from "./v2-series-store.js";
 import type { TitleV2Store } from "./v2-store.js";
 
@@ -36,6 +41,12 @@ import type { TitleV2Store } from "./v2-store.js";
  * `evaluateUserPipeline()`/`evaluateBatchPipeline()` は必ずこのWeakMapから引いた
  * canonical compiled planだけを読む——callerへ渡す`TitleEvaluationPlan`（public plan）の
  * fieldsは実行時のtrigger filtering/behaviorOwnershipCount分類には一切使わない。
+ *
+ * PR C2: `relationshipRules`（`RelationshipTitleRule[]`）を追加。generic behavior
+ * ownershipとの区別なく、`behaviorOwnershipCount`（Meta snapshot）へは
+ * genericBehavior + relationshipBehaviorの両方を数える——meta ownershipだけを
+ * 数えない既存契約（C1）はそのまま維持する。plan provenanceの防御は
+ * relationshipRulesにも同じcanonicalize/freezeを適用する（既存防御を弱めない）。
  */
 
 /**
@@ -51,6 +62,7 @@ import type { TitleV2Store } from "./v2-store.js";
 export interface TitleEvaluationPlan {
   readonly behaviorRules: readonly TitleRule<any>[];
   readonly metaRules: readonly MetaTitleRule[];
+  readonly relationshipRules: readonly RelationshipTitleRule[];
 }
 
 /**
@@ -68,6 +80,7 @@ export interface TitleEvaluationPlan {
 interface CompiledTitleEvaluationPlan {
   readonly behaviorRules: readonly TitleRule<any>[];
   readonly metaRules: readonly MetaTitleRule[];
+  readonly relationshipRules: readonly RelationshipTitleRule[];
 }
 
 /**
@@ -98,6 +111,19 @@ function canonicalizeMetaDefinition(definition: MetaTitleDefinition): MetaTitleD
 }
 
 /**
+ * relationship definitionのcanonical snapshotを作る（PR C2）。`RelationshipTitleRule.
+ * definition`は`BehaviorTitleDefinition`（sources tupleが`["vc_social_safe"]`に narrow
+ * されているだけ）なので、`canonicalizeBehaviorDefinition()`をそのまま再利用する。
+ */
+function canonicalizeRelationshipDefinition(
+  definition: BehaviorTitleDefinition & { readonly sources: readonly ["vc_social_safe"] },
+): BehaviorTitleDefinition & { readonly sources: readonly ["vc_social_safe"] } {
+  return canonicalizeBehaviorDefinition(definition) as unknown as BehaviorTitleDefinition & {
+    readonly sources: readonly ["vc_social_safe"];
+  };
+}
+
+/**
  * `plan`が本当に`defineTitleEvaluationPlan()`の産物かをruntimeで確認し、
  * canonical compiled planを返す。`v2-scope.ts`の`assertResolvedTitleScope()`と同じ構造
  * ——正本はWeakMap identity。`plan`という**まさにそのobject参照**が登録されていなければ
@@ -122,19 +148,24 @@ function requirePlanProvenance(plan: TitleEvaluationPlan): CompiledTitleEvaluati
  * - behavior rule定義はkind:"behavior"であること（`defineBehaviorTitle()`のruntime
  *   guardを通す——手で組み立てた/kindを書き換えたforged ruleもここで弾く、§46, §47）
  * - meta rule定義はkind:"meta"であること（`defineMetaTitle()`のruntime guardを通す）
+ * - relationship rule定義はkind:"behavior"かつsourcesがexactly["vc_social_safe"]で
+ *   あること（PR C2 §43）
  * - awardFactsVersionが妥当であること
- * - behavior rule key同士の重複禁止、meta rule key同士の重複禁止、
- *   behavior/meta横断でのkey重複禁止（同じv2 keyをbehaviorとmeta両方には使えない）
+ * - behavior rule key・meta rule key・relationship rule key、全横断での重複禁止
+ *   （generic behavior + relationship behavior + meta、どの組でも同じv2 keyは使えない）
  *
  * 検証と同時にcanonical compiled planを構築し、`PLAN_PROVENANCE`へexact object identity
  * で登録する（round 2レビュー対応）。返す`TitleEvaluationPlan`はcallerが渡したrule
  * 参照をそのまま持つが、`Object.freeze()`する——構築後にcallerが配列へ要素をpush/splice
- * したり、`behaviorRules`/`metaRules`自体を差し替えたりできないようにする
- * （defense-in-depth。真の防御はWeakMap identityの方——下記`requirePlanProvenance()`参照）。
+ * したり、`behaviorRules`/`metaRules`/`relationshipRules`自体を差し替えたりできないように
+ * する（defense-in-depth。真の防御はWeakMap identityの方——下記`requirePlanProvenance()`参照）。
+ *
+ * `relationshipRules`は省略可（デフォルト`[]`）——既存の2引数呼び出しはそのまま動く（§42）。
  */
 export function defineTitleEvaluationPlan(
   behaviorRules: readonly TitleRule<any>[],
   metaRules: readonly MetaTitleRule[],
+  relationshipRules: readonly RelationshipTitleRule[] = [],
 ): TitleEvaluationPlan {
   const seenKeys = new Set<string>();
   const compiledBehaviorRules: TitleRule<any>[] = [];
@@ -192,14 +223,50 @@ export function defineTitleEvaluationPlan(
     });
   }
 
+  const compiledRelationshipRules: RelationshipTitleRule[] = [];
+  for (const rule of relationshipRules) {
+    // 同じ理由（kindが紛れ込んだ場合、sources/triggers展開が不親切なTypeErrorになる前に確認）。
+    if ((rule.definition as { kind?: string }).kind !== "behavior") {
+      throw new Error(
+        `evaluation plan: relationship rule ${String((rule.definition as { key?: string }).key)} must have kind:"behavior" ` +
+          `(got ${String((rule.definition as { kind?: string }).kind)})`,
+      );
+    }
+    const definition = defineBehaviorTitle({
+      ...rule.definition,
+      sources: [...rule.definition.sources],
+      triggers: [...rule.definition.triggers],
+    }) as unknown as BehaviorTitleDefinition & { readonly sources: readonly ["vc_social_safe"] };
+    // defineRelationshipTitleRule()を経由しない手書きruleでも、sources契約
+    // （exactly ["vc_social_safe"]、§6）をここで再検証する。
+    if (definition.sources.length !== 1 || definition.sources[0] !== "vc_social_safe") {
+      throw new Error(`evaluation plan: relationship rule ${definition.key} sources must be exactly ["vc_social_safe"]`);
+    }
+    assertValidFactsVersion(rule.awardFactsVersion, `evaluation plan: relationship rule ${definition.key} awardFactsVersion`);
+    if (seenKeys.has(definition.key)) {
+      throw new Error(
+        `evaluation plan: duplicate title key ${definition.key} (relationship rule collides with an existing behavior/meta/relationship key)`,
+      );
+    }
+    seenKeys.add(definition.key);
+
+    compiledRelationshipRules.push({
+      definition: canonicalizeRelationshipDefinition(definition),
+      awardFactsVersion: rule.awardFactsVersion,
+      evaluateCandidate: rule.evaluateCandidate,
+    });
+  }
+
   const compiled: CompiledTitleEvaluationPlan = Object.freeze({
     behaviorRules: Object.freeze(compiledBehaviorRules),
     metaRules: Object.freeze(compiledMetaRules),
+    relationshipRules: Object.freeze(compiledRelationshipRules),
   });
 
   const publicPlan: TitleEvaluationPlan = Object.freeze({
     behaviorRules: Object.freeze([...behaviorRules]),
     metaRules: Object.freeze([...metaRules]),
+    relationshipRules: Object.freeze([...relationshipRules]),
   });
 
   PLAN_PROVENANCE.set(publicPlan as unknown as object, compiled);
@@ -217,21 +284,28 @@ export interface TitleUserPipelineResult {
   readonly userId: string;
   readonly trigger: TitleTrigger;
   readonly behavior: readonly TitleEvaluationResult[];
+  /** counterpart identityは一切含まない（PR C2 §29, §47, §48）。 */
+  readonly relationship: readonly RelationshipTitleEvaluationResult[];
   readonly series: ReconcileSeriesMasteriesResult;
   readonly meta: readonly MetaTitleEvaluationResult[];
 }
 
 /**
- * 1人分の evaluation kernel の中心API（§21）。
+ * 1人分の evaluation kernel の中心API（§21、PR C2で§45へ拡張）。
  *
  * 順序を必ず固定する:
  *
- * 1. trigger対象のbehavior rules（`rule.definition.triggers.includes(trigger)`）だけを
- *    評価する——`daily` trigger等を「全ruleを無条件評価する」魔法triggerにしない（§19）。
- * 2. `store.reconcileSeriesMasteriesForUser(userId)` をbehavior stage完了後に1回だけ
- *    呼ぶ（§34）——behavior ruleがawardするたびに呼ばない。
- * 3. Meta snapshotを1回だけ構築する（§22, §35）——meta rule数だけDBを読み直さない。
- * 4. 全meta ruleを、その同一frozen snapshotで評価する。
+ * 1. trigger対象のgeneric behavior rules（`rule.definition.triggers.includes(trigger)`）
+ *    だけを評価する——`daily` trigger等を「全ruleを無条件評価する」魔法triggerにしない（§19）。
+ * 2. trigger対象のrelationship behavior rulesを評価する（PR C2 §45）。restricted
+ *    `vc_co_presence`を読むのはこのstageだけ——trigger対象外・disabled・retiredでは
+ *    読まない（§40, §68）。
+ * 3. `store.reconcileSeriesMasteriesForUser(userId)` をbehavior/relationship stage
+ *    完了後に1回だけ呼ぶ（§34）——ruleがawardするたびに呼ばない。
+ * 4. Meta snapshotを1回だけ構築する（§22, §35）——meta rule数だけDBを読み直さない。
+ *    `behaviorOwnershipCount`にはgeneric behavior + relationship behaviorの両方の
+ *    ownershipを数える（PR C2 §46）。
+ * 5. 全meta ruleを、その同一frozen snapshotで評価する。
  *
  * 例外はfail-fastで即座に呼び出し元へ伝播する（§33）——途中のruleがthrowしても
  * 残りのruleをcatchして続行しない。個々のStore mutationはそれぞれ独立にatomicだが、
@@ -262,12 +336,27 @@ export function evaluateUserPipeline(
     behavior.push(evaluateTitle(db, store, rule, userId, observedAt, { ...options, cache }));
   }
 
+  const relationship: RelationshipTitleEvaluationResult[] = [];
+  for (const rule of compiled.relationshipRules) {
+    if (!rule.definition.triggers.includes(trigger)) continue;
+    relationship.push(
+      evaluateRelationshipTitle(db, store, rule, userId, observedAt, {
+        eventProvider: options.eventProvider,
+        monthSelector: options.monthSelector,
+      }),
+    );
+  }
+
   const series = store.reconcileSeriesMasteriesForUser(userId);
 
   // behaviorTitleKeysはcompiled plan全体（retired/disabled含む、§18）から取る——
   // lifecycleで絞り込むと、過去に取得したretired behavior titleのownershipが
-  // behaviorOwnershipCountから抜け落ちてしまう。
-  const behaviorTitleKeys = new Set(compiled.behaviorRules.map((rule) => rule.definition.key));
+  // behaviorOwnershipCountから抜け落ちてしまう。generic behavior + relationship
+  // behaviorの両方を数える（meta ownershipは数えない、PR C2 §46）。
+  const behaviorTitleKeys = new Set([
+    ...compiled.behaviorRules.map((rule) => rule.definition.key),
+    ...compiled.relationshipRules.map((rule) => rule.definition.key),
+  ]);
   const snapshot = buildMetaSnapshot(store, userId, behaviorTitleKeys);
 
   const meta: MetaTitleEvaluationResult[] = [];
@@ -275,7 +364,7 @@ export function evaluateUserPipeline(
     meta.push(evaluateMetaTitle(store, rule, userId, observedAt, snapshot));
   }
 
-  return { userId, trigger, behavior, series, meta };
+  return { userId, trigger, behavior, relationship, series, meta };
 }
 
 /**

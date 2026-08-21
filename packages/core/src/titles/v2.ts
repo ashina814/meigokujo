@@ -2,6 +2,7 @@ export {
   TITLE_SOURCES,
   TITLE_TIME_ZONE,
   assertDerivedSourceDependenciesResolve,
+  assertRestrictedUseContract,
   assertSlug,
   defineBehaviorTitle,
   defineMetaTitle,
@@ -203,3 +204,27 @@ export {
   type TitlePipelineOptions,
   type TitleUserPipelineResult,
 } from "./v2-pipeline.js";
+
+// v2-relationship-evidence.ts の何もここではexportしない（PR C2 §16, §30, §62, §63）。
+// `resolveRelationshipCandidates()` / `resolveRelationshipPrivateEvidence()` /
+// `requireRelationshipEvidenceProvenance()` はcounterpart identityへ到達できるraw経路
+// であり、公開APIにしない——relationship private evidenceの構築はevaluation pipeline
+// （`v2-relationship.ts` の `evaluateRelationshipTitle()`、internal）の内部だけで行う。
+// `ResolvedRelationshipPrivateEvidence`（raw provenance type）もexportしない。
+//
+// `evaluateRelationshipTitle()`（`v2-relationship.ts`）自体もexportしない
+// ——meta evaluatorのevaluateMetaTitle()と同じ理由（PR C1 §16）。counterpart解決を
+// 伴う評価はpipeline（`evaluateUserPipeline()`/`evaluateBatchPipeline()`）経由だけに限定する。
+//
+// 公開してよいのは、counterpart identityを一切含まないcontract type・
+// `defineRelationshipTitleRule()`だけ（§62, §63）。
+export {
+  defineRelationshipTitleRule,
+  type RelationshipCandidateSnapshot,
+  type RelationshipTitleEvaluationOptions,
+  type RelationshipTitleEvaluationResult,
+  type RelationshipTitleRule,
+  type RelationshipTitleRuleContext,
+  type RelationshipTitleRuleImplementation,
+  type RelationshipTitleRuleResult,
+} from "./v2-relationship.js";

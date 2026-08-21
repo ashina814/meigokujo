@@ -117,6 +117,15 @@ interface TitleSourceCommon {
   epochPolicy: TitleEpochPolicy;
   /** SQLの1行（またはderived factの1件）が利用者行動の何を意味するか。誤用を防ぐ。 */
   rawUnit: string;
+  /**
+   * このsourceが、generic title conditionではなく特定の内部private-evidence resolverの
+   * 専用入力であることを明示する（PR C2）。値を持つsourceは`privacy==="restricted"`かつ
+   * `titleUsable===false`でなければならない——`assertRestrictedUseContract()`が
+   * runtimeで検証する。safe/forbidden sourceへ`restrictedUse`を付けることも禁止する
+   * （restrictedの意味を「titleUsable:falseだが実は内部specialized resolverが読める」
+   * へ拡張するのではなく、その用途自体を型として固定するためのラベル）。
+   */
+  restrictedUse?: "relationship_private_evidence";
 }
 
 /** DBへ直接書き込まれる正本source。 */
@@ -318,6 +327,10 @@ export const TITLE_SOURCES = {
     orderable: false,
     // 生pairwiseは相手のuserIdを含むため称号から直接は使わせない。vc_social_safe を使うこと。
     titleUsable: false,
+    // PR C2: relationship titleのprivate witness resolution専用（v2-relationship-evidence.ts
+    // の内部resolverだけが読む）。generic title ruleへ渡すsource境界（v2-sources.ts）は
+    // 一切拡張しない——titleUsableは引き続きfalseのまま。
+    restrictedUse: "relationship_private_evidence",
     epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
     rawUnit: "pairwise_overlap",
   },
@@ -379,6 +392,26 @@ export function assertDerivedSourceDependenciesResolve(
   };
 
   for (const key of Object.keys(sources)) resolve(key, []);
+}
+
+/**
+ * `restrictedUse`契約をfail-closedで検証する（PR C2）。`restrictedUse`を持つsourceは
+ * 必ず`privacy==="restricted"`かつ`titleUsable===false`でなければならない——
+ * safe/forbidden sourceへ`restrictedUse`を付けたり、generic title ruleから読めてしまう
+ * `titleUsable:true`のsourceを「実は内部専用」と偽装したりすることを防ぐ。
+ */
+export function assertRestrictedUseContract(
+  sources: Record<string, TitleSourceDefinition> = TITLE_SOURCES,
+): void {
+  for (const [key, source] of Object.entries(sources)) {
+    if (source.restrictedUse === undefined) continue;
+    if (source.privacy !== "restricted") {
+      throw new Error(`title source ${key}: restrictedUse requires privacy==="restricted" (got ${source.privacy})`);
+    }
+    if (source.titleUsable !== false) {
+      throw new Error(`title source ${key}: restrictedUse requires titleUsable===false`);
+    }
+  }
 }
 
 /**

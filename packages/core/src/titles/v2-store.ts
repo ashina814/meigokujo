@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import {
   TITLE_SOURCES,
   assertDerivedSourceDependenciesResolve,
+  assertRestrictedUseContract,
   type BehaviorTitleDefinition,
   type TitleDefinition,
   type TitleSourceDefinition,
@@ -65,8 +66,19 @@ import {
   type RankTitleUnlockResult,
   type RankTitleUnlockRow,
 } from "./v2-identity-store.js";
+import {
+  requireRelationshipEvidenceProvenance,
+  type ResolvedRelationshipPrivateEvidence,
+} from "./v2-relationship-evidence.js";
 
 const now = () => Math.floor(Date.now() / 1000);
+
+/**
+ * relationship private evidence rowのinternal schema version（PR C2）。awardFacts
+ * のようなuser-authored JSONの`facts_version`とは別軸——このtableのcolumn構成自体を
+ * 将来変える場合にだけ上げる、Store側で固定した定数。callerからは入力させない。
+ */
+const RELATIONSHIP_EVIDENCE_VERSION = 1;
 
 const V2_DDL = `
 CREATE TABLE IF NOT EXISTS title_system_state (
@@ -178,6 +190,28 @@ CREATE TABLE IF NOT EXISTS title_equips (
     REFERENCES title_awards(user_id, title_key, scope_key)
     ON DELETE CASCADE
 );
+
+-- relationship titleのprivate audit evidence（PR C2）。「実際には誰との関係を根拠に
+-- 成立したか」をDB上だけに保持する——awardFacts・title_ownerships・Meta snapshot・
+-- pipeline result等の通常経路へは一切流さない（docs「Relationship private evidence」
+-- 参照）。identityはaward occurrence単位（user,title,scope）——ownership単位ではない。
+-- counterpart_user_idへusers table相当のFKは張らない（historical evidenceであり、
+-- 相手が後にguildを抜けてもこのevidence自体は壊さない、§21）。
+CREATE TABLE IF NOT EXISTS title_relationship_private_evidence (
+  user_id                 TEXT NOT NULL,
+  title_key               TEXT NOT NULL,
+  scope_key               TEXT NOT NULL,
+  evidence_version        INTEGER NOT NULL CHECK (evidence_version >= 1),
+  counterpart_user_id     TEXT NOT NULL,
+  repeated_jst_days       INTEGER NOT NULL CHECK (repeated_jst_days >= 1),
+  trusted_overlap_seconds INTEGER NOT NULL CHECK (trusted_overlap_seconds >= 1),
+  captured_at             INTEGER NOT NULL CHECK (captured_at >= 0),
+  PRIMARY KEY (user_id, title_key, scope_key),
+  CHECK (user_id <> counterpart_user_id),
+  FOREIGN KEY (user_id, title_key, scope_key)
+    REFERENCES title_awards(user_id, title_key, scope_key)
+    ON DELETE CASCADE
+);
 `;
 
 export interface TitleSystemStateRow {
@@ -246,6 +280,21 @@ export interface TitleEquipRow {
   scope_key: string;
 }
 
+/**
+ * relationship private evidence rowのinternal shape。counterpart_user_idを含むため
+ * `v2.ts`からはexportしない——公開raw read APIを作らない契約（§30, §62, §63）。
+ */
+interface RelationshipEvidenceRow {
+  user_id: string;
+  title_key: string;
+  scope_key: string;
+  evidence_version: number;
+  counterpart_user_id: string;
+  repeated_jst_days: number;
+  trusted_overlap_seconds: number;
+  captured_at: number;
+}
+
 export interface ApplyCatalogInput {
   catalogKey: string;
   actor: string;
@@ -274,6 +323,22 @@ export interface AwardTitleInput {
    * discriminated unionと同じ契約）——「award rowはあるがfacts rowが無い」という
    * 状態を作らない。
    */
+  awardFacts: AwardFactsInput;
+}
+
+/**
+ * relationship title専用のaward input（PR C2）。`AwardTitleInput`とは意図的に別interface
+ * にする——`earnedAt`フィールドを持たせない（relationship awardのearnedAtは常にnull、
+ * §27）。`evidence`は`v2-relationship-evidence.ts`の`resolveRelationshipPrivateEvidence()`
+ * だけが作れるprivate evidence——callerが手書きの`{counterpartUserId:"...", ...}`の
+ * ようなraw fieldを渡すことはできない（`AwardTitleInput`へ`counterpartUserId?: string`の
+ * ような素のfieldを追加しない、§24, §18）。
+ */
+export interface AwardRelationshipInput {
+  userId: string;
+  titleKey: string;
+  scope: ResolvedTitleScope;
+  evidence: ResolvedRelationshipPrivateEvidence;
   awardFacts: AwardFactsInput;
 }
 
@@ -577,6 +642,74 @@ function assertAwardPersistenceIntegrity(db: Database.Database): void {
 }
 
 /**
+ * relationship private evidence 1行分の構造/semantic integrityを検証する（PR C2）。
+ * `hasRelationshipAward()`（読み取り境界）と`assertRelationshipEvidenceIntegrity()`
+ * （construction時の全体スキャン）の両方から使う共通ロジック——B1の
+ * `assertValidFactsRowContent()`と同じ構造。
+ *
+ * **error messageにcounterpart_user_idを含めない**（§36）——labelは`(user/title/scope)`
+ * までで、counterpartをログへ出さない。
+ */
+function assertValidRelationshipEvidenceRowContent(label: string, row: RelationshipEvidenceRow, expectedAwardedAt: number): void {
+  if (!Number.isInteger(row.evidence_version) || row.evidence_version < 1) {
+    throw new Error(`relationship private evidence integrity violation: invalid evidence_version for ${label}`);
+  }
+  if (!row.counterpart_user_id || row.counterpart_user_id.trim().length === 0) {
+    throw new Error(`relationship private evidence integrity violation: empty counterpart for ${label}`);
+  }
+  if (row.counterpart_user_id === row.user_id) {
+    throw new Error(`relationship private evidence integrity violation: counterpart equals subject for ${label}`);
+  }
+  if (!Number.isInteger(row.repeated_jst_days) || row.repeated_jst_days < 1) {
+    throw new Error(`relationship private evidence integrity violation: invalid repeated_jst_days for ${label}`);
+  }
+  if (!Number.isInteger(row.trusted_overlap_seconds) || row.trusted_overlap_seconds < 1) {
+    throw new Error(`relationship private evidence integrity violation: invalid trusted_overlap_seconds for ${label}`);
+  }
+  if (!Number.isInteger(row.captured_at) || row.captured_at < 0) {
+    throw new Error(`relationship private evidence integrity violation: invalid captured_at for ${label}`);
+  }
+  if (row.captured_at !== expectedAwardedAt) {
+    throw new Error(
+      `relationship private evidence integrity violation: captured_at (${row.captured_at}) does not match ` +
+        `the award's awarded_at (${expectedAwardedAt}) for ${label}`,
+    );
+  }
+}
+
+/**
+ * relationship private evidenceのsemantic integrityをfail-closedで検証する（PR C2、
+ * `TitleV2Store` construction時に呼ぶ）。
+ *
+ * Store constructionにはruntime evaluation planが無いため、「このtitleKeyはrelationship
+ * titleだからevidence必須」という判定はできない（§35）——偽registryを作らない。
+ * ここでは**既に存在するevidence行**についてだけ、内容の妥当性・award紐付けの
+ * chronology一致（`captured_at === award.awarded_at`）を検証する。award行があるのに
+ * evidenceが無いケースの検出は、`hasRelationshipAward()`（読み取り境界）と
+ * `TitleV2Store.awardRelationship()`（write境界）が個別にfail-closedする。
+ *
+ * `PRAGMA foreign_key_check`によるdangling ref検出は、`title_relationship_private_evidence`
+ * が`title_`prefixを持つため`assertAwardPersistenceIntegrity()`の既存スキャンで
+ * 既にカバーされている（B3の`rank_title_unlocks`等とは違いprefixの穴が無い）。
+ */
+function assertRelationshipEvidenceIntegrity(db: Database.Database): void {
+  const rows = db
+    .prepare(
+      `SELECT e.user_id, e.title_key, e.scope_key, e.evidence_version, e.counterpart_user_id,
+              e.repeated_jst_days, e.trusted_overlap_seconds, e.captured_at, a.awarded_at
+         FROM title_relationship_private_evidence e
+         JOIN title_awards a
+           ON a.user_id = e.user_id AND a.title_key = e.title_key AND a.scope_key = e.scope_key`,
+    )
+    .all() as Array<RelationshipEvidenceRow & { awarded_at: number }>;
+
+  for (const row of rows) {
+    const label = `${row.user_id}/${row.title_key}/${row.scope_key}`;
+    assertValidRelationshipEvidenceRowContent(label, row, row.awarded_at);
+  }
+}
+
+/**
  * v2称号の永続化だけを担当する。
  *
  * 旧 titles / TitleEngine は移行が終わるまで触らない。PR1ではこのStoreを本番経路へ
@@ -589,6 +722,7 @@ export class TitleV2Store {
   ) {
     assertCounterBaselineSnapshotterCoverage();
     assertDerivedSourceDependenciesResolve();
+    assertRestrictedUseContract();
     assertSourceReaderCoverage();
     ensureTitleV2Schema(db);
     assertAwardPersistenceIntegrity(db);
@@ -596,6 +730,7 @@ export class TitleV2Store {
     assertCollectionPersistenceIntegrity(db);
     assertRankTitleUnlockIntegrity(db);
     assertIdentityEquipIntegrity(db);
+    assertRelationshipEvidenceIntegrity(db);
   }
 
   /**
@@ -791,8 +926,63 @@ export class TitleV2Store {
    *
    * 冪等呼び出し（既にaward済みの(user,title,scope)への再award）は、facts・
    * ownership・rarity sequenceのいずれも一切変更しない——先に成立したsnapshotが勝つ。
+   *
+   * 実装は`performAward()`（private、PR C2で抽出）へ委譲する——`awardRelationship()`
+   * と同じtransaction本体を共有し、2つ目のtransaction実装をcopy-pasteしない。
    */
   award(input: AwardTitleInput): AwardResult {
+    return this.performAward(input);
+  }
+
+  /**
+   * relationship title専用のaward path（PR C2）。`award()`と同じ4要素
+   * （award/facts/ownership/rarity）に加えて、`title_relationship_private_evidence`を
+   * **同一transaction**でatomicに確定する（§25）——どれか1つ失敗すれば全部rollbackする。
+   *
+   * `input.evidence`は`v2-relationship-evidence.ts`の`resolveRelationshipPrivateEvidence()`
+   * だけが作れるprivate evidence。ここで`requireRelationshipEvidenceProvenance()`を
+   * 通し、`(userId, titleKey, scopeKey)`が実際にそのevidenceの解決対象と一致すること
+   * まで検証する——title Aのために解決したevidenceをtitle Bへ渡す・別userへ渡す・
+   * 別scopeへ渡す、いずれもここでreject（§18, §19）。
+   *
+   * earnedAtは常にnull固定（§27）——`AwardRelationshipInput`自体にearnedAtフィールドが
+   * 無いため、呼び出し側は任意のearnedAtを注入できない。
+   *
+   * 冪等呼び出し（既にaward済み）では、private evidenceもUPDATEしない
+   * ——既存evidence行が無ければ「award行はあるがevidenceが無い」integrity violation
+   * としてfail-closedする（§32, §33。現在のcandidateから自動backfillしない）。
+   */
+  awardRelationship(input: AwardRelationshipInput): AwardResult {
+    const userId = requireText(input.userId, "userId");
+    const titleKey = requireV2Key(input.titleKey);
+    const provenance = assertResolvedTitleScopeForTitle(input.scope, titleKey);
+    const evidenceProvenance = requireRelationshipEvidenceProvenance(input.evidence, userId, titleKey, provenance.scopeKey);
+
+    return this.performAward(
+      { userId, titleKey, scope: input.scope, earnedAt: null, awardFacts: input.awardFacts },
+      {
+        evidenceVersion: RELATIONSHIP_EVIDENCE_VERSION,
+        counterpartUserId: evidenceProvenance.counterpartUserId,
+        repeatedJstDays: evidenceProvenance.repeatedJstDays,
+        trustedOverlapSeconds: evidenceProvenance.trustedOverlapSeconds,
+      },
+    );
+  }
+
+  /**
+   * `award()`/`awardRelationship()`が共有するtransaction本体（PR C2で抽出）。
+   * `relationshipEvidence`が渡されたときだけ、同一transaction内で
+   * `title_relationship_private_evidence`を確定する——4-way atomicity（§25）。
+   */
+  private performAward(
+    input: AwardTitleInput,
+    relationshipEvidence?: {
+      readonly evidenceVersion: number;
+      readonly counterpartUserId: string;
+      readonly repeatedJstDays: number;
+      readonly trustedOverlapSeconds: number;
+    },
+  ): AwardResult {
     if (this.db.inTransaction) {
       throw new Error("title award must start outside an existing transaction");
     }
@@ -811,8 +1001,9 @@ export class TitleV2Store {
     const earnedAt = input.earnedAt === null ? null : requireUnix(input.earnedAt, "earnedAt");
     // awarded_at/captured_atはBotが実際に永続化を確定した時刻であり、caller入力では
     // ない——this.clock()を1回だけ呼び、そのsnapshotをawarded_at/captured_at/
-    // ownership.first_awarded_atすべてに一貫して使う。historical repairでも、
-    // 過去の時刻はearnedAt側に入れる。awardedAtは常に「repairを実行した今」になる。
+    // ownership.first_awarded_at/relationship evidence.captured_atすべてに一貫して
+    // 使う。historical repairでも、過去の時刻はearnedAt側に入れる。awardedAtは常に
+    // 「repairを実行した今」になる。
     const awardedAt = requireUnix(this.clock(), "awardedAt");
     if (earnedAt !== null && earnedAt > awardedAt) {
       throw new Error(`earnedAt cannot be after awardedAt: earnedAt=${earnedAt} awardedAt=${awardedAt}`);
@@ -907,6 +1098,41 @@ export class TitleV2Store {
       // isNewAward && ownershipRow already existed: 同じtitleの2つ目以降のscopeへの
       // award。ownership/rarity sequenceは一切変更しない（先に成立したfirst ownership
       // のsnapshotが勝つ）。
+
+      // relationship evidence（PR C2）。isNewAwardの分岐はfacts/ownershipと同じ規律
+      // ——新規awardならINSERT、既存awardなら「既存evidenceが本当に存在するか」だけ
+      // 確認し、より強いcandidateが後から現れてもUPDATEしない（first persisted
+      // witnessのimmutability、§32）。既存awardなのにevidenceが無ければ、現在の
+      // candidateから自動backfillせずintegrity violationとしてfail-closedする（§33）。
+      if (relationshipEvidence) {
+        if (isNewAward) {
+          this.db
+            .prepare(
+              `INSERT INTO title_relationship_private_evidence
+                 (user_id, title_key, scope_key, evidence_version, counterpart_user_id,
+                  repeated_jst_days, trusted_overlap_seconds, captured_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              userId,
+              titleKey,
+              scopeKey,
+              relationshipEvidence.evidenceVersion,
+              relationshipEvidence.counterpartUserId,
+              relationshipEvidence.repeatedJstDays,
+              relationshipEvidence.trustedOverlapSeconds,
+              awardedAt,
+            );
+        } else {
+          const existingEvidence = this.getRelationshipEvidenceRow(userId, titleKey, scopeKey);
+          if (!existingEvidence) {
+            throw new Error(
+              `relationship private evidence integrity violation: award row exists for (${userId}, ${titleKey}, ${scopeKey}) ` +
+                `without private evidence (evidence was deleted out of band, or missing from an earlier partial write)`,
+            );
+          }
+        }
+      }
 
       const awardRow = this.getAwardRow(userId, titleKey, scopeKey);
       if (!awardRow) throw new Error(`title award was not persisted: ${userId}/${titleKey}/${scopeKey}`);
@@ -1022,6 +1248,45 @@ export class TitleV2Store {
         `title ownership integrity violation: award row exists for (${userId}, ${titleKey}, ${scopeKey}) without an ownership row`,
       );
     }
+    return true;
+  }
+
+  private getRelationshipEvidenceRow(userId: string, titleKey: string, scopeKey: string): RelationshipEvidenceRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT user_id, title_key, scope_key, evidence_version, counterpart_user_id,
+                repeated_jst_days, trusted_overlap_seconds, captured_at
+           FROM title_relationship_private_evidence
+          WHERE user_id = ? AND title_key = ? AND scope_key = ?`,
+      )
+      .get(userId, titleKey, scopeKey) as RelationshipEvidenceRow | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * relationship titleの既存awardの有無をsafeに確認する（§31）。counterpartは返さない
+   * ——戻り値はboolean/throwのみ。
+   *
+   * - award無し → false
+   * - awardあり + private evidenceあり + valid → true
+   * - awardあり + private evidence欠損/破損 → throw（fail-closed。§33と同じく
+   *   現在のcandidateから自動backfillしない）
+   *
+   * error messageにcounterpart_user_idを含めない（§36）——`(user/title/scope)`までしか出さない。
+   */
+  hasRelationshipAward(userIdRaw: string, titleKeyRaw: string, scopeKeyRaw: string): boolean {
+    const userId = requireText(userIdRaw, "userId");
+    const titleKey = requireV2Key(titleKeyRaw);
+    const scopeKey = requireText(scopeKeyRaw, "scopeKey");
+    if (!this.hasAward(userId, titleKey, scopeKey)) return false;
+
+    const label = `${userId}/${titleKey}/${scopeKey}`;
+    const evidence = this.getRelationshipEvidenceRow(userId, titleKey, scopeKey);
+    if (!evidence) {
+      throw new Error(`relationship private evidence integrity violation: award row exists for ${label} without private evidence`);
+    }
+    const awardRow = this.getAwardRow(userId, titleKey, scopeKey)!;
+    assertValidRelationshipEvidenceRowContent(label, evidence, awardRow.awarded_at);
     return true;
   }
 
