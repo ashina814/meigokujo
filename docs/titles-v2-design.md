@@ -646,6 +646,139 @@ contract validator（`assertValidSeriesManifest()` 等）・semantic hash計算�
 clock契約に影響しないため。integrity helper（`assertSeriesPersistenceIntegrity()` 等）も、
 `TitleV2Store` construction時に内部で呼ぶだけで、それ単体を公開API化する必要は無い。
 
+### Meta評価 / Evaluation Orchestration Kernel（PR C1）
+
+behavior award → Series Mastery reconcile → Collection progress → meta title評価を、
+core内で1つの評価pipelineとして接続する（`packages/core/src/titles/v2-meta.ts` /
+`v2-pipeline.ts`）。まだBot本番経路へは接続しない——production catalog・Bot Services
+wiring・schedulerはこのPRの範囲外。
+
+**Evaluation order**:
+
+```text
+Behavior（trigger対象ruleだけ）
+  ↓
+Ownership（Store側で確定済み）
+  ↓
+Series Mastery reconcile（userごと1回）
+  ↓
+Meta snapshot構築（userごと1回）
+  ↓
+Meta Award
+```
+
+`evaluateUserPipeline(db, store, plan, userId, observedAt, trigger, options?)` がこの順序を
+固定する唯一のAPI。Behavior→Meta→Seriesの順にはしない——《一門皆伝》のようなmeta titleが、
+同じpass内で成立したばかりのSeries mastery/behavior awardを見られなくなるため。
+
+**MetaTitleRule契約**（`v2-meta.ts`）: behaviorのTitleRuleとは別contract。
+`defineMetaTitleRule(definition, impl)` が `defineMetaTitle()` のruntime検証を必ず通す
+——behavior definitionをmeta ruleへ、meta definitionをbehavior TitleRuleへ渡すことは
+（型でもruntimeでも）できない。
+
+- meta ruleへ `Database` / `TitleV2Store` / userIdを渡さない——ruleが独自SQLを書いたり、
+  特定userを名指しした special caseを書けたりする経路を作らない。ruleへ渡すのは
+  `{ scope, snapshot }` だけ。
+- `MetaTitleRuleResult` は `matched:false` / `matched:true & awardFacts` の
+  discriminated union。**earnedAtをruleに決めさせない**——meta titleはbehavior
+  award・Series Mastery・Collection Edition progress・historical repairという複数の
+  永続状態から導出され、その一部はnon-orderableであり得るため、「meta条件を歴史上
+  初めて満たしたexact時刻」を一般には証明できない。`evaluateMetaTitle()` はaward時に
+  常に `earnedAt: null` を固定する——recorded/awarded processing timeを achievement
+  timeへ偽装しない。
+- behavior evaluatorと同じ堅牢性: matched strict boolean・matched:falseへの
+  awardFacts混入拒否・matched:trueのawardFacts必須+`assertValidAwardFacts()`・
+  definitionの独立copyでの再検証（rule実装が評価中にdefinitionを書き換えても
+  以降の判定へ影響しない）。
+- lifecycleの意味はbehavior evaluatorと同じ: `disabled` はscopeも解決せず
+  `evaluate()` 自体を呼ばない、`retired` はmatchedでも新規awardしない
+  （既存awardの有無だけ見る）。
+
+**TitleMetaSnapshot**（`v2-meta.ts` の `buildMetaSnapshot()`、internal）: meta ruleへ
+渡す、sanitizeされたpersisted-state snapshot。
+
+- `behaviorOwnershipCount`: `store.listOwnerships(userId)` を、評価planのbehavior
+  rule定義key集合へ照合してカウントする。meta title自身のownership・rank title
+  unlock（別テーブルなので構造的にここへ混ざらない）は絶対に数えない——meta titleの
+  award自身がbehaviorOwnershipCountを増やす自己参照（Meta-to-Meta recursion）を
+  構造的に防ぐ。
+- `seriesMasteries`: `store.listSeriesMasteries(userId)` から `catalogKey`/`seriesKey`
+  だけを抜き出す。
+- `collectionEditions`: `store.listCollectionEditions()`（**active/closed両方**）+
+  各editionの `store.collectionEditionProgress()` をそのまま使う——current runtime
+  catalogを再計算したり、独自SQLで所有数を数え直したりしない。closed editionの
+  historical repair proof契約（B2 §16、`earned_at < closedAt` または
+  `awarded_at < closedAt`、same-second tieはfail-closed）を、meta snapshot側で
+  迂回できない設計にしている。
+- 絶対に含めない: userId・counterpart userId・member titleKey一覧・missing
+  titleKey・hidden title名/条件・raw award scope list・raw DB row・channel ID・
+  message ID・relationship pair identity・rank title unlock・profile equips・
+  edition運用metadata（activatedBy/closedBy/activationNote/closeNote）。
+- 構築後は配列・nested objectまで含めてdeep-freezeする——同じMeta evaluation pass内で
+  rule Aがsnapshotを書き換えてrule Bの判定へ影響することを防ぐ。
+- snapshotはMeta rule群を回す前に**1回だけ**構築し、Meta award後に再構築しない——
+  これによりMeta→Meta recursionを構造的に防ぐ。
+
+**forged snapshot経路を作らない**: `buildMetaSnapshot()` / `evaluateMetaTitle()` は
+internal関数で、`v2.ts`（`@meigokujo/core/titles/v2`）からはexportしない。callerが
+snapshotを自由に組み立ててaward()まで到達できる公開APIは存在しない——meta snapshot
+構築はevaluation pipeline内部だけで行う。
+
+**TitleEvaluationPlan**（`v2-pipeline.ts`）: `defineTitleEvaluationPlan(behaviorRules,
+metaRules)` がbehavior/meta ruleをまとめ、以下を検証する: behavior rule定義は
+kind:"behavior"であること・meta rule定義はkind:"meta"であること（手で組み立てた/kindを
+書き換えたforged ruleも `defineBehaviorTitle()`/`defineMetaTitle()` のruntime guardで
+弾く）・awardFactsVersionの妥当性・behavior/meta同士および横断でのkey重複禁止。
+返り値の配列はfreezeする。
+
+**released ruleをplanから消さない契約**: evaluation planは「今activeなtitleだけの
+一覧」ではなく、v2 runtimeが知っているreleased definitions/rulesのregistry。
+retired/disabledなruleも残す——lifecycleはrule/definition自身が制御する。これにより
+`behaviorOwnershipCount`等が、historical ownershipのkind判定（そのtitleKeyが
+「behavior title」だったか）を維持できる。
+
+**trigger-aware behavior selection**（§19）: `evaluateUserPipeline()` はbehavior
+stageで `rule.definition.triggers.includes(trigger)` のruleだけを評価する。
+`daily` trigger等を「無条件で全ruleを評価する」魔法triggerにはしない——
+`daily`を宣言したruleだけがdaily passで評価される。meta ruleはtriggerを持たない
+——metaはbehavior source actionの結果ではなくpersisted stateの結果として成立する
+ため、どのpipeline triggerであってもbehavior→series→meta snapshot→meta評価の順で
+確認してよい。
+
+**Pipeline result**: `TitleUserPipelineResult` は `{ userId, trigger, behavior,
+series, meta }` ——新規取得だけに絞らず各stage resultを返す（audit・通知判断が
+しやすいように）。
+
+**Pipelineはidempotent/resumable、atomic all-or-nothingではない**: Behavior
+award・Series reconcile・Meta awardの全体を1つの外側 `BEGIN IMMEDIATE`
+transactionへ包まない——既存Store mutationはそれぞれ独立にIMMEDIATE契約を持つ。
+外側transactionへ包むとnested savepoint化して保証が変わる。exceptionは
+fail-fastで即座に呼び出し元へ伝播する——途中のruleがthrowしても残りのruleを
+catchして続行するbest-effort evaluatorにはしない。例えばBehavior rule Aが
+award成功、Behavior rule Bがthrowした場合、Aはrollbackされない。次回pipelineを
+retryすればAは`already_awarded`、Bだけ再試行される。Series/Meta stageも同様
+——behavior成功・series成功・meta throwでも、次回metaだけretryできる。
+「半端に残るバグ」ではなく、各永続操作がatomicでpipeline全体はretriable、という
+設計。
+
+**Series reconcile / Meta snapshot構築はuserごと1回だけ**（§34, §35）:
+`reconcileSeriesMasteriesForUser()` はbehavior stage完了後に1回だけ呼ぶ
+——behavior ruleがawardするたびには呼ばない。Meta snapshotも同様、series
+reconcile後に1回だけ構築し、meta rule数だけDBを読み直さない（100前後のrule規模を
+前提にした性能設計）。
+
+**evaluateBatchPipeline**: 複数user向け。userごとに behavior→series→meta を
+完了させてから次userへ進む——全userのbehaviorを先に全部実行してから
+series/metaへ進む二段階方式にはしない（1人分のpipeline orderを常に保つ）。
+`TitleSourceCache` はbatch全体で共有してよい——cache keyにuserIdが含まれる
+既存契約はそのまま維持する。
+
+**follow-up（PR C1の範囲外）**: relationship private evidence・evaluator
+orchestrationのproduction wiring・bulk source planner・rank-title live
+wiring/daily reconcile・source expansion・production 99-title catalog・
+shadow evaluation/threshold calibration・production cutover
+（`/プロフィール` read-only化・《名乗り》UI・notification等）。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。
