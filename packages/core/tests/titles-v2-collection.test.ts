@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { defineBehaviorTitle, defineMetaTitle, type TitleDefinition } from "../src/titles/v2-contract.js";
+import { defineBehaviorTitle, defineMetaTitle, type TitleDefinition, type TitleLifecycle } from "../src/titles/v2-contract.js";
 import { assertValidCollectionEdition, type TitleCollectionEdition } from "../src/titles/v2-collection.js";
 
-function behavior(key: `v2.${string}`, themeKey: string): TitleDefinition {
+function behavior(key: `v2.${string}`, themeKey: string, lifecycle: TitleLifecycle = "active"): TitleDefinition {
   return defineBehaviorTitle({
     kind: "behavior",
     key,
@@ -12,7 +12,7 @@ function behavior(key: `v2.${string}`, themeKey: string): TitleDefinition {
     description: "テスト用",
     sources: ["bump_events"],
     triggers: ["daily"],
-    lifecycle: "active",
+    lifecycle,
     hidden: false,
     publicAnnounce: false,
     themeKey,
@@ -174,6 +174,50 @@ describe("collection edition validation（§10）", () => {
     expect(() => assertValidCollectionEdition(edition, definitionsMap([a]))).toThrow(/at least one fullClearRequired/);
   });
 
+  it("collectionCredit:falseかつfullClearRequired:falseのmemberをreject（editionのmemberとして意味が無い）", () => {
+    const a = behavior("v2.test.a", "theme-a");
+    const b = behavior("v2.test.b", "theme-a");
+    const edition: TitleCollectionEdition = {
+      editionKey: "v1-edition",
+      members: [
+        { titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true },
+        { titleKey: b.key, themeKey: "theme-a", collectionCredit: false, fullClearRequired: false },
+      ],
+      milestones: VALID_MILESTONES,
+    };
+    expect(() => assertValidCollectionEdition(edition, definitionsMap([a, b]))).toThrow(
+      /is neither collectionCredit nor fullClearRequired/,
+    );
+  });
+
+  it("fullClearRequired:trueのmemberがactiveでないとreject（最低限）", () => {
+    const a = behavior("v2.test.a", "theme-a", "retired");
+    const edition: TitleCollectionEdition = {
+      editionKey: "v1-edition",
+      members: [{ titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true }],
+      milestones: VALID_MILESTONES,
+    };
+    expect(() => assertValidCollectionEdition(edition, definitionsMap([a]))).toThrow(
+      /is not active \(lifecycle=retired\) but is collectionCredit\/fullClearRequired/,
+    );
+  });
+
+  it("collectionCreditのみのmemberでも、activeでなければreject（推奨要件）", () => {
+    const a = behavior("v2.test.a", "theme-a", "active"); // fullClearRequiredはこちらが担う
+    const b = behavior("v2.test.b", "theme-a", "disabled");
+    const edition: TitleCollectionEdition = {
+      editionKey: "v1-edition",
+      members: [
+        { titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true },
+        { titleKey: b.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: false },
+      ],
+      milestones: VALID_MILESTONES,
+    };
+    expect(() => assertValidCollectionEdition(edition, definitionsMap([a, b]))).toThrow(
+      /is not active \(lifecycle=disabled\) but is collectionCredit\/fullClearRequired/,
+    );
+  });
+
   it("milestone値の負数をreject", () => {
     const { defs, members } = fiveMemberFixture();
     const edition: TitleCollectionEdition = {
@@ -186,7 +230,9 @@ describe("collection edition validation（§10）", () => {
 
   it("collectionCredit:falseのmemberのthemeはcountableThemesに数えない", () => {
     // a/b/cはtheme-aでcollectionCredit:true（countableCount=3, countableThemes={theme-a}=1）。
-    // dはtheme-bだがcollectionCredit:falseなので、countableThemesにtheme-bは数えない。
+    // dはtheme-bだがcollectionCredit:falseなので、countableThemesにtheme-bは数えない
+    // （dはfullClearRequired:trueにしてedition memberとしての意味を持たせる——
+    // collectionCredit/fullClearRequiredが両方falseのmemberはそれ自体が別途禁止されている）。
     const a = behavior("v2.test.a", "theme-a");
     const b = behavior("v2.test.b", "theme-a");
     const c = behavior("v2.test.c", "theme-a");
@@ -197,7 +243,7 @@ describe("collection edition validation（§10）", () => {
         { titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true },
         { titleKey: b.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: false },
         { titleKey: c.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: false },
-        { titleKey: d.key, themeKey: "theme-b", collectionCredit: false, fullClearRequired: false },
+        { titleKey: d.key, themeKey: "theme-b", collectionCredit: false, fullClearRequired: true },
       ],
       milestones: {
         startedCollecting: 1,

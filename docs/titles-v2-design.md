@@ -232,6 +232,11 @@ scope policyの意味はreleased title semanticの一部——resolverのsemanti
 - `event` scopeはcanonical event infrastructureがまだ無いため、`TitleEventScopeProvider` の差し込みが無いと解決できずfail-closedする。`eventKey` はcallerが自由に渡せず、`definition.scope.eventKey` にpolicy自体として固定してある。provider が返す `{ start, completedAt }` は resolver が整数性・`start < completedAt`・CATALOG_EPOCHでclipした後も `start < completedAt` であること・`completedAt <= observedAt`（＝eventが観測時点までに完了していること）を検証する——**未完了のeventを部分windowでawardしない**。
 - `observedAt` がresolved scopeの `start` より前になることはfail-closedする（`resolveTitleScope` 内の共通チェック）。ただし `start === observedAt`（例: CATALOG_EPOCHちょうどの瞬間の評価）のようなzero-width windowはエラーにしない——「まだ何も観測していない」という正常な状態として扱い、VC derived source層（`vc/derived.ts`）の `clampWindow()` が `start>=end` でthrowしてしまう手前で、v2-sources.ts側が0件payloadを返す。
 - `month` scope policyは通常 `observedAt` が属するJST暦月をそのまま使う（`monthSelector` 省略時 = `{type:"current"}`）。日次reconcileが「月をまたいだ後に前月分を修復する」ような historical reconcile を行いたい場合は `{ monthSelector: { type: "specific", month: "YYYY-MM" } }` を渡す——`observedAt` の意味（実際の観測上限）自体は変えず、対象月だけを明示的に選べる。`month` labelは厳格に `/^\d{4}-(0[1-9]|1[0-2])$/` でvalidateし、対象月が丸ごとCATALOG_EPOCHより前ならreject、未来の月を指定すれば通常の `observedAt < start` fail-closedに引っかかる。
+- window境界の「開いている/閉じている」はscope種別と選び方で異なる。まとめると:
+  - `global` / `catalog`: open-ended（`endExclusive:null`）。実効的な終端は常に評価時の`observedAt`。
+  - `month`（`monthSelector:{type:"current"}`、省略時のデフォルト）: `endExclusive`（翌月初）は暦月としては固定値だが、`observedAt` は定義上その月の中に収まる（`jstMonthLabelOf(observedAt)`で選ぶ月だから）ため、`effectiveEnd`は常に`observedAt`と一致する——「まだ進行中の今月」を評価している状態。
+  - `month`（`monthSelector:{type:"specific", month}`、historical closed month）: 対象月が既に終わっている（`observedAt`が翌月初以降）場合、`endExclusive`（対象月の翌月初）は`observedAt`から独立した真に固定のendになる——閉じた月を後から修復評価しても、常に同じ`effectiveEnd`が得られる。
+  - `event`: `completedAt<=observedAt`をresolver側で要求するため、`endExclusive`（=`completedAt`）は`observedAt`から独立した真に固定のendになる。
 - scopeKeyはcanonical生成のみ: `global` / `catalog:<catalogKey>` / `month:<catalogKey>:<YYYY-MM>` / `event:<catalogKey>:<eventKey>`。`catalogKey`・`eventKey`・`themeKey`・`groupKey`・`progression.seriesKey` はすべて `assertSlug()`（lowercase英数字・`-`・`_`のみ）でvalidateし、`:`や空白を許可しない——scopeKeyの文字列結合が曖昧にならないようにするため。
 
 ### Theme / Group / Progression（PR A）
@@ -246,9 +251,9 @@ scope policyの意味はreleased title semanticの一部——resolverのsemanti
 
 ### Series Manifest（PR A）
 
-title definitionsを自動走査して「現在存在するstage全部」を一門皆伝（mastery）対象にする方式は禁止。`TitleSeriesManifest`（`packages/core/src/titles/v2-series.ts`）がimmutableなmember一覧を持つ——後からstage5を追加しても既存manifestのmembersは書き換えず、新しいmanifestを作る。
+title definitionsを自動走査して「現在存在するstage全部」を一門皆伝（mastery）対象にする方式は禁止。`TitleSeriesManifest`（`packages/core/src/titles/v2-series.ts`）が **released（一度公開した）series は永久にfreezeする** immutable契約を持つ——`members` の並びと内容そのものが《一門皆伝》条件の一部であるため、後からstageを追加しない。新しいladder（例: stage4を持つ版）が欲しい場合は、同じ `(catalog, seriesKey)` を使い回さず、新しいseriesKey + 新しいtitle key群を作る。既存の `(catalog, seriesKey)` を持つmanifestを「新しい内容へ置き換える」ことは正当な拡張手段ではない（runtimeでも `assertNoOverlappingSeriesMembership()` が同一identityの複数manifest存在そのものを拒否する）。時系列immutabilityを証明するDB（manifestのバージョン履歴テーブル等）はこのPRの範囲外——ここでは契約の意味とtestだけを固定する。
 
-`assertValidSeriesManifest()` が検証する内容: members>=2、member titleの実在、同一catalog/theme/group、全memberが対象seriesのprogressionを宣言していること、stageの重複・欠番禁止（1始まりの連番）。`assertNoOverlappingSeriesMembership()` が、manifest横断で(a) 1 titleが複数seriesへ所属していないか、(b) 同一 `(catalog, seriesKey)` を名乗るmanifestが複数存在しないか（後からstageを追加する場合は「新しいmanifest」を作る契約——旧manifestと新manifestが同じidentityのまま並存することを許さない）を検証する。
+`assertValidSeriesManifest()` が検証する内容: members>=2、member titleの実在、同一catalog/theme/group、全memberが対象seriesのprogressionを宣言していること、stageの重複・欠番禁止（1始まりの連番）。`assertNoOverlappingSeriesMembership()` が、manifest横断で(a) 1 titleが複数seriesへ所属していないか、(b) 同一 `(catalog, seriesKey)` を名乗るmanifestが複数存在しないかを検証する。
 
 ### Collection / Full-clear Manifest（PR A）
 
@@ -260,6 +265,8 @@ Collection Editionはtitle catalogとは別概念。`TitleCollectionEdition`（`
 
 - member重複禁止・member titleの実在・themeKeyの一致
 - **meta titleはcollectionCredit/fullClearRequiredのどちらにもできない**（meta titleはcollection/full-clearの分母・分子どちらへも入らない——meta title自体が「有効なcollection editionを満たしたか」を判定する側であり、判定対象の一部を兼ねると自己参照的になるため）
+- **collectionCredit/fullClearRequiredの少なくとも一方がtrueなmemberは、definition.lifecycleが`"active"`でなければならない**——retired/disabledなtitleをfull-clear必須・collection対象にすると、誰にも取得不能な条件を黙って課すことになる
+- **collectionCredit:falseかつfullClearRequired:falseのmemberは禁止**（editionのmemberとして何の意味も持たない）
 - fullClearRequired memberが最低1件
 - milestone値はすべて非負整数
 - `countableCount`（collectionCredit:trueなmember数）・`countableThemes`（collectionCredit:trueなmemberのdistinct themeKey数——collectionCredit:falseのmemberのthemeは数えない）を基準に: `startedCollecting>=1`、`startedCollecting < collectorHabit < stillCollecting`、`stillCollecting <= thousandMarks.count <= countableCount`、`thousandMarks.themes>=1`、`thousandMarks.themes <= countableThemes`、`thousandMarks.themes <= thousandMarks.count`、`almostComplete.remaining>=1`、`almostComplete.remaining < fullClearCount`（full-clear必須総数）

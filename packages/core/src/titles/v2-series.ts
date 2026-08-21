@@ -3,10 +3,21 @@ import { assertSlug, type BehaviorTitleDefinition } from "./v2-contract.js";
 /**
  * 連番progressionを持つtitle群を束ねる、immutableなmanifest契約。
  *
- * title definitionsを自動走査して「現在存在するstage全部」を一門皆伝（mastery）対象に
- * する方式は禁止——`members` そのものがimmutable manifestであり、後からstage5を追加
- * しても既存manifestのmembersは書き換えない（新しいmanifest行を別途作る）。DB
- * persistenceは後続PR。ここでは型とvalidationだけを固定する。
+ * **released（一度公開した）seriesのmembersは永久にfreezeする。** `members` の並びと
+ * 内容そのものが《一門皆伝》条件の一部であり、後からstageを追加すると、過去に
+ * 「一門皆伝」を達成した人の条件が事後的に変わってしまう。title definitionsを
+ * 自動走査して「現在存在するstage全部」を一門皆伝（mastery）対象にする方式は禁止。
+ *
+ * released seriesへ後からstageを追加しない。新しいladder（例: stage4を持つ版）が
+ * 欲しい場合は、**同じ (catalog, seriesKey) を使い回さず**、新しいseriesKey + 新しい
+ * title key群を作ること。既存の (catalog, seriesKey) を持つmanifestオブジェクトを
+ * 「新しい内容へ置き換える」ことは正当な拡張手段ではない——
+ * `assertNoOverlappingSeriesMembership()` が同一 (catalog, seriesKey) の複数manifest
+ * 存在そのものを拒否するため、そもそもruntime上も許されない。
+ *
+ * runtimeで時系列immutabilityそのものを証明するDB（例: manifestのバージョン履歴を
+ * 保存するテーブル）はこのPRの範囲外——ここでは契約の意味とtestだけを固定する。DB
+ * persistenceは後続PR。
  */
 export interface TitleSeriesManifest {
   readonly catalog: string;
@@ -94,11 +105,11 @@ export function assertValidSeriesManifest(
  *
  * - 「1 titleが複数seriesへ所属していないか」（単一manifest内の重複は
  *   assertValidSeriesManifest() が既に見ているので、これは別seriesどうしの重複だけを見る）
- * - 同一 (catalog, seriesKey) を名乗るmanifestが複数存在しないか——後からstageを
- *   追加する場合は「新しいmanifest」を作る契約（§9）なので、同じidentityの
- *   manifestが2つ同時に存在すること自体を許さない。既存manifestへ追加する場合は
- *   同じ (catalog, seriesKey) を持つ**単一の**新オブジェクトへ置き換えること
- *   （旧オブジェクトと新オブジェクトを両方とも「有効なmanifest」として登録しない）。
+ * - 同一 (catalog, seriesKey) を名乗るmanifestが複数存在しないか——released series
+ *   のmembersは永久にfreezeする契約（上のTitleSeriesManifestのdoc comment参照）なので、
+ *   同じidentityを持つmanifestを「新しい内容へ置き換える」ことは正当な拡張手段ではない。
+ *   新しいladderが欲しい場合は必ず新しい (catalog, seriesKey) を使うこと——このチェックは
+ *   その契約が破られていないことをruntimeでも確認する。
  */
 export function assertNoOverlappingSeriesMembership(manifests: readonly TitleSeriesManifest[]): void {
   const identitySeen = new Set<string>();

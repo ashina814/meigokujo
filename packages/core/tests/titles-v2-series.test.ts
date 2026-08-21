@@ -157,20 +157,33 @@ describe("series manifest validation（§9）", () => {
     );
   });
 
-  it("後からstage4を追加しても、既存manifestのmembersは変えない（immutable運用の確認）", () => {
-    const members = validLadder();
-    const originalManifest = manifestOf(members);
+  it("新しいladderが欲しい場合は新しいseriesKey + 新しいtitle key群を作る（released seriesのmembersは変えない）", () => {
+    const originalMembers = validLadder();
+    const originalManifest = manifestOf(originalMembers);
     const frozenMembers = [...originalManifest.members];
 
-    // 新stageを追加する場合は「新しいmanifest」を作る想定——既存オブジェクトを書き換えない。
-    const stage4 = stage("v2.test.ignite-4", { progression: { seriesKey: "vc_ignite_main", stage: 4 } });
-    const expandedManifest: TitleSeriesManifest = {
-      ...originalManifest,
-      members: [...originalManifest.members, stage4.key],
+    // 「stage4を追加する」場合でも、既存の(catalog, seriesKey)を使い回さない——
+    // 別のseriesKey配下に、新しいtitle key群（stage1-4）を作り直す。既存の
+    // 《一門皆伝》条件（vc_ignite_mainの3段）は事後的に変わらない。
+    const nextGenMembers = [
+      stage("v2.test.ignite-v2-1", { progression: { seriesKey: "vc_ignite_main_v2", stage: 1 } }),
+      stage("v2.test.ignite-v2-2", { progression: { seriesKey: "vc_ignite_main_v2", stage: 2 } }),
+      stage("v2.test.ignite-v2-3", { progression: { seriesKey: "vc_ignite_main_v2", stage: 3 } }),
+      stage("v2.test.ignite-v2-4", { progression: { seriesKey: "vc_ignite_main_v2", stage: 4 } }),
+    ];
+    const nextGenManifest: TitleSeriesManifest = {
+      catalog: "v1",
+      seriesKey: "vc_ignite_main_v2",
+      label: "場を起こす（4段版）",
+      masteryEligible: true,
+      members: nextGenMembers.map((d) => d.key),
     };
 
+    // 元のmanifestのmembersは一切変わっていない。
     expect(originalManifest.members).toEqual(frozenMembers);
-    expect(expandedManifest.members).not.toEqual(frozenMembers);
-    expect(() => assertValidSeriesManifest(expandedManifest, [...members, stage4])).not.toThrow();
+    // 新しいseriesKeyを使えば単独でvalidであり、既存manifestと(catalog, seriesKey)の
+    // identityが衝突しないため並存できる。
+    expect(() => assertValidSeriesManifest(nextGenManifest, nextGenMembers)).not.toThrow();
+    expect(() => assertNoOverlappingSeriesMembership([originalManifest, nextGenManifest])).not.toThrow();
   });
 });

@@ -53,6 +53,11 @@ export interface TitleCollectionEdition {
  *   「有効なcollection editionを満たしたか」を判定する側であり、判定対象の一部を
  *   兼ねると自己参照的になる）
  * - fullClearRequired titleが最低1件存在する
+ * - collectionCredit/fullClearRequiredのどちらか一方でもtrueなmemberは、
+ *   definition.lifecycleが"active"でなければならない（retired/disabledなtitleを
+ *   full-clear必須・collection対象にすると、誰にも取得不能な条件を課すことになる）
+ * - collectionCredit:falseかつfullClearRequired:falseのmemberは禁止
+ *   （editionのmemberとして何の意味も持たない）
  *
  * milestoneはcollectionCredit:trueのmemberだけから算出した
  * countableCount（collectionCredit:trueなmember数）・countableThemes
@@ -107,6 +112,23 @@ export function assertValidCollectionEdition(
           `collection edition ${edition.editionKey}: meta title cannot be fullClearRequired: ${member.titleKey}`,
         );
       }
+    }
+
+    if (!member.collectionCredit && !member.fullClearRequired) {
+      throw new Error(
+        `collection edition ${edition.editionKey}: member ${member.titleKey} is neither collectionCredit nor fullClearRequired (meaningless edition member)`,
+      );
+    }
+
+    // 取得不能な状態（retired/disabled）のtitleをcollection/full-clear対象にすると、
+    // 誰にも満たせない条件を課すことになる。lifecycleが変わったら（例: retireした）
+    // edition側のmember構成も見直すべきで、黙って「達成不能なfull-clear」を
+    // 放置しない。
+    if (def.lifecycle !== "active") {
+      throw new Error(
+        `collection edition ${edition.editionKey}: member ${member.titleKey} is not active ` +
+          `(lifecycle=${def.lifecycle}) but is collectionCredit/fullClearRequired`,
+      );
     }
 
     // collectionCredit:falseのmemberのthemeは、theme breadth集計の分母（countableThemes）
