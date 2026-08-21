@@ -345,9 +345,13 @@ reconcile時刻を `earned_at` として捏造しない。取得順は `earned_a
 
 `earned_at > awarded_at` は意味矛盾なので、runtimeとDB `CHECK` の両方で拒否する。加えて、`earned_at` が非nullなら、その値は該当awardの`ResolvedTitleScope`の窓 `[start, effectiveEnd)` に収まっていることをStoreでも検証する（`resolvedScopeEffectiveEnd()`）——zero-width scope（`start===effectiveEnd`）では、この条件を満たすearned_atが存在し得ないため、非nullなearned_atは常にrejectされる。
 
-### `Store.award()` はraw scopeKeyを受け取らない
+### `Store.award()` はraw scopeKeyを受け取らない、他titleのscopeも受け付けない
 
-`AwardTitleInput.scope` は `string` ではなく、`resolveTitleScope()` が作った branded `ResolvedTitleScope` を要求する。`award()` の入口で必ず `assertResolvedTitleScope()` を実行する——callerからscope構築権限を奪ったPR Aの境界を、Store側でも完成させる。手書きのplain objectを `as any` で渡してもruntimeでrejectされる。
+`AwardTitleInput.scope` は `string` ではなく、`resolveTitleScope()` が作った branded `ResolvedTitleScope` を要求する。`award()` の入口で必ず `assertResolvedTitleScopeForTitle(scope, titleKey)` を実行する——callerからscope構築権限を奪ったPR Aの境界を、Store側でも完成させる。手書きのplain objectを `as any` で渡してもruntimeでrejectされる。
+
+`ResolvedTitleScope` は、brand（forgery検知用symbol）に加えて**どのtitleKeyのために解決されたか**を示すprivate provenance（同じくmodule外へ公開しないsymbol）を持つ。`scopeKey` の文字列一致だけでは、「title Aのために正規resolveしたscopeを、title Bのawardへそのまま渡す」substitutionを検出できない——`global` や `catalog:v1` のようなscopeKeyは、そのpolicyを共有する全titleで同一文字列になり得るため。`assertResolvedTitleScopeForTitle()` はこのprovenanceまで検証することで、scopeKeyが同じでもtitleが違えばrejectする。
+
+このprovenanceはcallerへscopeKey/start/endの構築権限を戻すものではなく、`TitleRuleScope`（ruleのcontextへ渡す形、`toRuleScope()`）にも含めない——rule実装からは見えない。また、source読み込み境界（`readTitleSource()`・`TitleSourceCache`）はtitle単位のcacheを持たず `(userId, sourceKey, scopeKey, start, endExclusive, observedAt)` で共有し続ける——`assertResolvedTitleScope()`（brandだけを見る構造チェック）はそのまま維持し、title provenanceの強制はaward境界（`assertResolvedTitleScopeForTitle()`）だけで行う。これにより、複数titleが同じ`(source, window)`を読む際のcache共有性は壊れない。
 
 ### atomicity
 
@@ -358,6 +362,8 @@ reconcile時刻を `earned_at` として捏造しない。取得順は `earned_a
 3. そのtitleKeyの**first ownership**なら、rarity sequenceを1つ消費して `title_ownerships` をinsert
 
 冪等呼び出し（既にaward済みの`(user,title,scope)`への再award）は、facts・ownership・rarity sequenceのいずれも一切変更しない——先に成立したsnapshotが勝つ。`Store.award()` は外側transaction内から呼べない（`applyCatalog()` と同じ理由でfail-closedする）。
+
+`awardedAt` は、そのscopeを実際に観測した時刻（`scope.observedAt`）より前にはできない——さもないと「まだ観測していない未来のデータを使って過去にawardした」という矛盾した状態を作れてしまう。`title_award_facts.captured_at` はこの`awardedAt`と同じsnapshotを使う。
 
 ### Award Facts JSON validator（`v2-award-facts.ts`）
 
@@ -370,6 +376,8 @@ reconcile時刻を `earned_at` として捏造しない。取得順は `earned_a
 
 generic validatorだけでprivacyを完全保証できないことは明記しておく。`{ friend: "Alice" }` はJSONとして合法なので、validatorだけではidentity leakを完全には防げない。主防御はsafe source境界（`v2-sources.ts` の `titleUsable`/`privacy` 契約）・rule review・awardFactsを必要最小限へ翻訳することであり、validatorはその最後の砦にすぎない。
 
+**validationとJSON serializationは単一passで行う**（`serializeAwardFacts()`）。「`assertValidAwardFacts(data)` で検証した後に別途 `JSON.stringify(data)` を呼ぶ」という2段階構成だと、`data` がforged/accessor object（getterが呼び出しごとに異なる値を返す等）だった場合、検証時に読んだ値と実際にpersistされる値が一致する保証が無い（TOCTOU）。`Store.award()` はこの単一pass関数だけを使う——各値をちょうど1回だけ読み、読んだその場でJSON textへ書き出すため、検証結果と永続化される文字列が常に一致する。`assertValidAwardFacts()`（検証専用、シリアライズしない）は、evaluator側の早期fail-closedチェックやDB読み取り時の再検証など、書き込みを伴わない場面のために引き続き残している。
+
 `TitleRuleResult`（`v2-evaluator.ts`）はmatched:false / matched:trueのdiscriminated unionへ分離した。matched:trueは`awardFacts`が**必須**——取得理由が特に無い称号でも`awardFacts: {}`を明示的に返す。これにより「award rowはあるがfacts rowが無い」正常状態を型の上でも作れなくしている。
 
 facts JSONのschema変更（`facts_version`）は、title condition/source/threshold/scope変更（新title key）とは別軸で管理する。`TitleRule.awardFactsVersion`（`defineTitleRule()`の第2引数）に固定し、rule実装の戻り値ごとに付け忘れる事故を防ぐ。
@@ -380,9 +388,17 @@ facts JSONのschema変更（`facts_version`）は、title condition/source/thres
 
 `holder_count_at_acquisition` は「そのtransaction時点でDBに記録されていたtitle ownership数（今回のfirst ownershipを含む）」であり、current guild membershipを使った将来のactive population計算とは別概念——今回は勝手に実装しない。
 
+`title_ownerships` にはapplication層のチェックに加えてDB `CHECK`/`UNIQUE`を持たせる: `acquisition_sequence >= 1`、`holder_count_at_acquisition >= 1`、`first_earned_at IS NULL OR first_earned_at <= first_awarded_at`、そして `UNIQUE (title_key, acquisition_sequence)`——titleKeyごとに同じ刻印順を2人が名乗れない。
+
 ### Migration / Integrity
 
-v2はまだ本番wiringされていないため、過去のfoundation award（facts/ownershipテーブル導入前に作られたaward行）のfactsをでっち上げて自動backfillしない。`title_awards` にrowがあるのに対応する `title_award_facts` / `title_ownerships` が無い状態を検出したら、明示的なintegrity errorとしてfail-closedする——「本当の取得理由が無いのにあることにする」より安全という判断。旧foundation形式のaward rowが存在するDBでは、このmigration guardが発火する。
+v2はまだ本番wiringされていないため、過去のfoundation award（facts/ownershipテーブル導入前に作られたaward行）のfactsをでっち上げて自動backfillしない。`title_awards` にrowがあるのに対応する `title_award_facts` / `title_ownerships` が無い状態を検出したら、明示的なintegrity errorとしてfail-closedする——「本当の取得理由が無いのにあることにする」より安全という判断。
+
+この検証はlazyにしない。`TitleV2Store` の**construction時**に `assertAwardPersistenceIntegrity()` がDB全体（全 `title_awards` 行）を一度スキャンし、欠損があれば即座にfail-closedする——「同じawardを再award()した時だけ検出する」という後追い方式だと、construction後の任意のタイミングまで欠損facts/ownershipを抱えたaward行を正常データとして扱ってしまう（例: retired titleが`hasAward()`だけを見て「既にaward済み」と判定する経路）。旧foundation形式のaward rowが存在するDBでは、この**Store construction自体**がintegrity違反としてfail-closedする。
+
+加えて `hasAward()` 自身も、見つけたaward行についてfacts/ownershipの bundle integrityを確認してから`true`を返す——construction後にout-of-bandな行が挿入される可能性はゼロではないため、読み取り境界でも二重に守る。
+
+`awardFacts()`（read API）も、DB内の `facts_version`・`captured_at`・JSON本体のすべてをvalidateしてから返す——壊れたDB値を空object等で誤魔化さない。
 
 ## 6. 即時判定 + reconcile
 

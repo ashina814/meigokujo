@@ -814,6 +814,58 @@ describe("awardFacts safety（§10, §12）", () => {
   });
 });
 
+describe("runtime discriminated-union guard（TypeScriptを迂回したruleへの防御）", () => {
+  it("matched:falseなのにearnedAtが非nullなruleはruntimeでreject", () => {
+    const { db, store } = setup();
+    const badRule = defineTitleRule(
+      {
+        kind: "behavior",
+        key: "v2.test.false-with-earned-at",
+        name: "test",
+        description: "TypeScriptを迂回してmatched:false+非nullなearnedAtを返す壊れたrule",
+        sources: ["bump_events"] as const,
+        triggers: ["bump_success"],
+        lifecycle: "active",
+        ...COMMON_FIXTURE_FIELDS,
+      },
+      {
+        awardFactsVersion: 1,
+        evaluate: () => ({ matched: false, earnedAt: BASE } as never),
+      },
+    );
+
+    expect(() => evaluateTitle(db, store, badRule, "alice", OBSERVED_AT)).toThrow(
+      /matched:false with a non-null earnedAt/,
+    );
+    expect(store.listAwards("alice")).toEqual([]);
+  });
+
+  it("matched:falseなのにawardFactsを持つruleはruntimeでreject（明示的に拒否する。無視はしない）", () => {
+    const { db, store } = setup();
+    const badRule = defineTitleRule(
+      {
+        kind: "behavior",
+        key: "v2.test.false-with-facts",
+        name: "test",
+        description: "TypeScriptを迂回してmatched:falseなのにawardFactsを返す壊れたrule",
+        sources: ["bump_events"] as const,
+        triggers: ["bump_success"],
+        lifecycle: "active",
+        ...COMMON_FIXTURE_FIELDS,
+      },
+      {
+        awardFactsVersion: 1,
+        evaluate: () => ({ matched: false, earnedAt: null, awardFacts: {} } as never),
+      },
+    );
+
+    expect(() => evaluateTitle(db, store, badRule, "alice", OBSERVED_AT)).toThrow(
+      /matched:false with awardFacts set/,
+    );
+    expect(store.listAwards("alice")).toEqual([]);
+  });
+});
+
 describe("fail-closed on scope resolution / source reader failure（§24）", () => {
   it("catalog epochが未施行なら、evaluateTitle()は「条件未達」として握り潰さずthrowする", () => {
     const db = openDb(":memory:");

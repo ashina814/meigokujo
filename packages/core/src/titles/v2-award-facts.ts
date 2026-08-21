@@ -137,3 +137,100 @@ export function assertValidFactsVersion(value: number, label = "awardFactsVersio
     throw new Error(`${label} must be a positive integer: ${JSON.stringify(value)}`);
   }
 }
+
+/**
+ * validation と JSON serialization を単一passで行う。DBへ書き込む唯一の経路
+ * （`TitleV2Store.award()`）はこの関数だけを使うこと。
+ *
+ * `assertValidAwardFacts(data)` で検証した**後に**別途 `JSON.stringify(data)` を
+ * 呼ぶ2段階構成だと、`data` がforged/accessor object（getterが呼び出しごとに
+ * 異なる値を返す等）だった場合、検証時に読んだ値と実際にpersistされる値が
+ * 一致する保証が無い（TOCTOU）。この関数は各値をちょうど1回だけ読み、読んだ
+ * その場でJSON textへ書き出す——検証結果と永続化される文字列が常に一致する。
+ */
+export function serializeAwardFacts(value: unknown, label = "awardFacts"): string {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be a plain JSON object`);
+  }
+  assertPlainObjectPrototype(value, label, "$");
+
+  let nodeCount = 0;
+  const onStack = new Set<object>();
+  const out: string[] = [];
+
+  const emit = (node: unknown, depth: number, path: string): void => {
+    nodeCount += 1;
+    if (nodeCount > MAX_AWARD_FACTS_NODES) {
+      throw new Error(`${label}: exceeds max node count (${MAX_AWARD_FACTS_NODES}) at ${path}`);
+    }
+    if (depth > MAX_AWARD_FACTS_DEPTH) {
+      throw new Error(`${label}: exceeds max depth (${MAX_AWARD_FACTS_DEPTH}) at ${path}`);
+    }
+
+    if (node === null) {
+      out.push("null");
+      return;
+    }
+    const t = typeof node;
+    if (t === "boolean") {
+      out.push(node ? "true" : "false");
+      return;
+    }
+    if (t === "string") {
+      out.push(JSON.stringify(node));
+      return;
+    }
+    if (t === "number") {
+      if (!Number.isFinite(node as number)) {
+        throw new Error(`${label}: non-finite number (NaN/Infinity) is not allowed at ${path}`);
+      }
+      out.push(String(node));
+      return;
+    }
+    if (t === "undefined") throw new Error(`${label}: undefined is not allowed at ${path}`);
+    if (t === "function") throw new Error(`${label}: function is not allowed at ${path}`);
+    if (t === "symbol") throw new Error(`${label}: symbol is not allowed at ${path}`);
+    if (t === "bigint") throw new Error(`${label}: bigint is not allowed at ${path}`);
+    if (t !== "object") throw new Error(`${label}: unsupported type "${t}" at ${path}`);
+
+    if (node instanceof Date) throw new Error(`${label}: Date is not allowed at ${path}`);
+    const obj = node as object;
+    if (onStack.has(obj)) throw new Error(`${label}: circular reference at ${path}`);
+    onStack.add(obj);
+
+    if (Array.isArray(node)) {
+      out.push("[");
+      for (let i = 0; i < node.length; i++) {
+        if (i > 0) out.push(",");
+        emit(node[i], depth + 1, `${path}[${i}]`);
+      }
+      out.push("]");
+    } else {
+      assertPlainObjectPrototype(node, label, path);
+      out.push("{");
+      const keys = Object.keys(node as Record<string, unknown>);
+      keys.forEach((key, idx) => {
+        if (FORBIDDEN_KEYS.has(key)) {
+          throw new Error(`${label}: forbidden key "${key}" at ${path} (potential identity leak or prototype pollution)`);
+        }
+        if (idx > 0) out.push(",");
+        out.push(JSON.stringify(key));
+        out.push(":");
+        emit((node as Record<string, unknown>)[key], depth + 1, `${path}.${key}`);
+      });
+      out.push("}");
+    }
+
+    onStack.delete(obj);
+  };
+
+  emit(value, 0, "$");
+  const json = out.join("");
+
+  const size = Buffer.byteLength(json, "utf8");
+  if (size > MAX_AWARD_FACTS_BYTES) {
+    throw new Error(`${label}: serialized size (${size} bytes) exceeds limit (${MAX_AWARD_FACTS_BYTES} bytes)`);
+  }
+
+  return json;
+}

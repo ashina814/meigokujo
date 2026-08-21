@@ -186,6 +186,18 @@ export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
   }
 
   if (!result.matched) {
+    // TitleRuleは公開structural interfaceで、TitleRuleResultのdiscriminated union も
+    // TypeScriptの型検査を迂回されればruntimeでは強制されない。matched:falseなのに
+    // earnedAtが非nullなruleは契約違反としてfail-closedする——「マッチしていないのに
+    // 達成時刻がある」という矛盾を通さない。awardFactsが（本来型上は存在しないはずの）
+    // 値を持っている場合も同様に拒否する——黙って無視すると、ruleのロジックバグ
+    // （本来matched:trueで返すべきだった等）を見逃す。
+    if ((result as { earnedAt: unknown }).earnedAt !== null) {
+      throw new Error(`title rule ${definition.key} returned matched:false with a non-null earnedAt (contract violation)`);
+    }
+    if ((result as { awardFacts?: unknown }).awardFacts !== undefined) {
+      throw new Error(`title rule ${definition.key} returned matched:false with awardFacts set (contract violation)`);
+    }
     return { titleKey: definition.key, scopeKey: resolvedScope.scopeKey, outcome: "not_matched", matched: false, earnedAt: null };
   }
 

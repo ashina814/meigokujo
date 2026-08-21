@@ -12,6 +12,15 @@ import type { TitleV2Store } from "./v2-store.js";
  */
 
 const RESOLVED_SCOPE_BRAND: unique symbol = Symbol("ResolvedTitleScope");
+/**
+ * どのtitleのために解決されたscopeかを示すprivate provenance。`scopeKey` だけでは
+ * title間の取り違えを検出できない——`global` や `catalog:v1` のようなscopeKeyは
+ * その policy を使う全titleで文字列としては同一になり得るため、「title Aのために
+ * 正規resolveしたscopeを、title Bのawardへそのまま渡す」ことをscopeKeyの一致検査
+ * だけでは防げない。このsymbolはmodule外へ公開せず、`assertResolvedTitleScopeForTitle()`
+ * を通じてのみ検証させる——TitleRuleScope（ruleへ渡す形）には含めない。
+ */
+const RESOLVED_SCOPE_TITLE_KEY: unique symbol = Symbol("ResolvedTitleScopeTitleKey");
 
 /**
  * resolveTitleScope() だけが作れる、評価に使ってよいscope。
@@ -24,6 +33,7 @@ const RESOLVED_SCOPE_BRAND: unique symbol = Symbol("ResolvedTitleScope");
  */
 export interface ResolvedTitleScope {
   readonly [RESOLVED_SCOPE_BRAND]: true;
+  readonly [RESOLVED_SCOPE_TITLE_KEY]: string;
   /** `(user_id, title_key, scope_key)` のunique制約へそのまま使う。canonical生成のみ。 */
   readonly scopeKey: string;
   /** inclusive */
@@ -34,18 +44,27 @@ export interface ResolvedTitleScope {
   readonly observedAt: number;
 }
 
-function brand(scope: {
-  scopeKey: string;
-  start: number;
-  endExclusive: number | null;
-  observedAt: number;
-}): ResolvedTitleScope {
-  return { ...scope, [RESOLVED_SCOPE_BRAND]: true };
+function brand(
+  scope: {
+    scopeKey: string;
+    start: number;
+    endExclusive: number | null;
+    observedAt: number;
+  },
+  titleKey: string,
+): ResolvedTitleScope {
+  return { ...scope, [RESOLVED_SCOPE_BRAND]: true, [RESOLVED_SCOPE_TITLE_KEY]: titleKey };
 }
 
 /**
  * scopeが本当にresolveTitleScope()の産物かをruntimeで確認する。
  * sourceを読む前・awardする前、resolvedScopeを受け取る全ての境界で呼ぶこと。
+ *
+ * これはbrand（forgery）だけを見る構造チェックであり、「どのtitleのために解決
+ * されたか」までは見ない——読み込み境界（v2-sources.ts）はtitleごとのcacheを持たず
+ * `(userId, sourceKey, scopeKey, start, endExclusive, observedAt)` で共有するため、
+ * ここでtitle provenanceを強制すると意図的なcache共有が壊れる。title取り違えの
+ * 防止はaward境界（`assertResolvedTitleScopeForTitle()`）でだけ行う。
  */
 export function assertResolvedTitleScope(scope: ResolvedTitleScope): void {
   if (
@@ -66,6 +85,27 @@ export function assertResolvedTitleScope(scope: ResolvedTitleScope): void {
   }
   if (!Number.isInteger(scope.observedAt)) {
     throw new Error("resolved title scope has a non-integer observedAt");
+  }
+}
+
+/**
+ * award境界専用。brandに加えて、そのscopeが**指定したtitleKeyのために**
+ * resolveTitleScope()を通ったことまで検証する。`global` のようなscopeKeyは
+ * policyを共有する全titleで同一文字列になり得るため、「title Aのために正規
+ * resolveしたscopeをtitle Bへ渡す」substitutionはscopeKeyの一致だけでは
+ * 検出できない——このprovenance検査がその隙間を塞ぐ。
+ *
+ * callerへscopeKey/start/endの構築権限を戻すものではない（provenanceはこの
+ * モジュール外からは読めないsymbolのまま）。
+ */
+export function assertResolvedTitleScopeForTitle(scope: ResolvedTitleScope, titleKey: string): void {
+  assertResolvedTitleScope(scope);
+  const actual = (scope as unknown as Record<symbol, unknown>)[RESOLVED_SCOPE_TITLE_KEY];
+  if (actual !== titleKey) {
+    throw new Error(
+      `resolved title scope was resolved for a different title (expected ${titleKey}, got ${String(actual)}); ` +
+        `scopeKey=${scope.scopeKey}`,
+    );
   }
 }
 
@@ -187,7 +227,7 @@ function finalize(definitionKey: string, observedAt: number, candidate: ScopeCan
       `title ${definitionKey}: observedAt (${observedAt}) is before the resolved scope start (${candidate.start}); scope=${candidate.scopeKey}`,
     );
   }
-  return brand({ ...candidate, observedAt });
+  return brand({ ...candidate, observedAt }, definitionKey);
 }
 
 /**

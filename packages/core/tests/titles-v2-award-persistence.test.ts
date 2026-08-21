@@ -17,8 +17,14 @@ const NO_FACTS = { version: 1, data: {} };
 function setup() {
   const db = openDb(":memory:");
   new BumpCounter(db);
-  const store = new TitleV2Store(db, () => BASE);
+  // catalog epochはBASEで施行する（既存のscope期待値と揃える）。施行後、clockを
+  // BASE+1000へ進める——このファイルのシンプルなテストはobservedAt=BASE+100前後しか
+  // 使わないため、常にawardedAt(=clock())>=scope.observedAtを満たす。8月/9月の実日付を
+  // 使うテスト（同user・別scope、read API）だけは明示的にawardedAtを渡す。
+  let clock = BASE;
+  const store = new TitleV2Store(db, () => clock);
   store.applyCatalog({ catalogKey: "v1", actor: "test-setup" });
+  clock = BASE + 1000;
   return { db, store };
 }
 
@@ -129,6 +135,7 @@ describe("same user / same title / second scope（§25.D）", () => {
       titleKey: def.key,
       scope: augScope,
       earnedAt: null,
+      awardedAt: augObservedAt,
       awardFacts: { version: 1, data: { month: "aug" } },
     });
     const second = store.award({
@@ -136,6 +143,7 @@ describe("same user / same title / second scope（§25.D）", () => {
       titleKey: def.key,
       scope: sepScope,
       earnedAt: null,
+      awardedAt: sepObservedAt,
       awardFacts: { version: 1, data: { month: "sep" } },
     });
 
@@ -463,8 +471,22 @@ describe("ownership read API（§25.17）", () => {
     const sepScope = resolveTitleScope(store, monthDef, sepObservedAt);
 
     expect(store.hasOwnership("alice", monthDef.key)).toBe(false);
-    store.award({ userId: "alice", titleKey: monthDef.key, scope: augScope, earnedAt: null, awardFacts: NO_FACTS });
-    store.award({ userId: "alice", titleKey: monthDef.key, scope: sepScope, earnedAt: null, awardFacts: NO_FACTS });
+    store.award({
+      userId: "alice",
+      titleKey: monthDef.key,
+      scope: augScope,
+      earnedAt: null,
+      awardedAt: augObservedAt,
+      awardFacts: NO_FACTS,
+    });
+    store.award({
+      userId: "alice",
+      titleKey: monthDef.key,
+      scope: sepScope,
+      earnedAt: null,
+      awardedAt: sepObservedAt,
+      awardFacts: NO_FACTS,
+    });
 
     expect(store.hasOwnership("alice", monthDef.key)).toBe(true);
     expect(store.ownership("alice", monthDef.key)?.first_scope_key).toBe(augScope.scopeKey);
@@ -472,5 +494,253 @@ describe("ownership read API（§25.17）", () => {
     expect(store.listOwnerships("alice")).toHaveLength(1);
     // listAwardsはscope別のhistoryのまま2件。
     expect(store.listAwards("alice")).toHaveLength(2);
+  });
+});
+
+describe("scope title provenance（title substitution防止）", () => {
+  it("title Aで正規resolveしたscopeをtitle Bのawardへ渡すとreject（scopeKeyが同じ'global'でも）", () => {
+    const { store } = setup();
+    const defA = sampleDef("v2.test.title-a");
+    const defB = sampleDef("v2.test.title-b");
+    // どちらもscope:{type:"global"}なので、scopeKeyの文字列は両方とも"global"で
+    // 一致してしまう——scopeKeyの一致検査だけではsubstitutionを検出できない実例。
+    const scopeForA = resolveTitleScope(store, defA, BASE + 100);
+    expect(scopeForA.scopeKey).toBe("global");
+
+    expect(() =>
+      store.award({ userId: "alice", titleKey: defB.key, scope: scopeForA, earnedAt: null, awardFacts: NO_FACTS }),
+    ).toThrow(/resolved for a different title/);
+    expect(store.listAwards("alice")).toEqual([]);
+  });
+
+  it("同titleのために正規resolveしたscopeは通る", () => {
+    const { store } = setup();
+    const defA = sampleDef("v2.test.title-a2");
+    const scopeForA = resolveTitleScope(store, defA, BASE + 100);
+    expect(() =>
+      store.award({ userId: "alice", titleKey: defA.key, scope: scopeForA, earnedAt: null, awardFacts: NO_FACTS }),
+    ).not.toThrow();
+  });
+});
+
+describe("Store construction時の全体integrity検証（lazy checkにしない）", () => {
+  it("legacy award行だけ存在するDBへ新しいTitleV2Storeを構築すると、constructorでintegrity違反としてthrowする", () => {
+    const { db } = setup();
+    const def = sampleDef("v2.test.ctor-integrity");
+    // 旧foundation形式を模して、Store.award()を経由せず直接INSERT。
+    db.prepare(`INSERT INTO title_awards (user_id, title_key, scope_key, earned_at, awarded_at) VALUES (?, ?, ?, ?, ?)`).run(
+      "legacy-user",
+      def.key,
+      "global",
+      null,
+      BASE,
+    );
+    expect(() => new TitleV2Store(db, () => BASE + 1000)).toThrow(/persistence integrity violation/);
+  });
+
+  it("retired titleのlegacy awardは、hasAward()経由でもalready_awarded扱いせずfail-closedする", () => {
+    const { db, store } = setup();
+    const def = sampleDef("v2.test.retired-legacy");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    // 正規のaward()を経由せず、facts/ownershipを欠損させたaward行を直接作る
+    // （retired titleがhasAward()だけを見て既存award有無を判定する経路を想定）。
+    db.prepare(`INSERT INTO title_awards (user_id, title_key, scope_key, earned_at, awarded_at) VALUES (?, ?, ?, ?, ?)`).run(
+      "alice",
+      def.key,
+      scope.scopeKey,
+      null,
+      BASE + 200,
+    );
+    expect(() => store.hasAward("alice", def.key, scope.scopeKey)).toThrow(/without award facts/);
+  });
+});
+
+describe("awardedAt chronology（scope.observedAtとの整合、§3）", () => {
+  it("awardedAt < scope.observedAtならreject", () => {
+    const { store } = setup();
+    const def = sampleDef("v2.test.chrono-early");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    expect(() =>
+      store.award({
+        userId: "alice",
+        titleKey: def.key,
+        scope,
+        earnedAt: null,
+        awardedAt: BASE + 99,
+        awardFacts: NO_FACTS,
+      }),
+    ).toThrow(/cannot be before the scope's observedAt/);
+  });
+
+  it("awardedAt === scope.observedAtならpass", () => {
+    const { store } = setup();
+    const def = sampleDef("v2.test.chrono-equal");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    expect(() =>
+      store.award({
+        userId: "alice",
+        titleKey: def.key,
+        scope,
+        earnedAt: null,
+        awardedAt: BASE + 100,
+        awardFacts: NO_FACTS,
+      }),
+    ).not.toThrow();
+  });
+
+  it("historical scope（monthSelector:specific）でも、awardedAtがそのscopeのobservedAt以降ならpass", () => {
+    const { store } = setup();
+    const def = sampleDef("v2.test.chrono-historical", { type: "month" });
+    // 9月に評価しつつ、8月分のhistorical scopeを修復評価する。
+    const repairObservedAt = Math.floor(new Date("2026-09-05T00:00:00+09:00").getTime() / 1000);
+    const historicalScope = resolveTitleScope(store, def, repairObservedAt, {
+      monthSelector: { type: "specific", month: "2026-08" },
+    });
+    expect(() =>
+      store.award({
+        userId: "alice",
+        titleKey: def.key,
+        scope: historicalScope,
+        earnedAt: null,
+        awardedAt: repairObservedAt,
+        awardFacts: NO_FACTS,
+      }),
+    ).not.toThrow();
+  });
+});
+
+describe("title_ownerships DB constraints", () => {
+  it("UNIQUE(title_key, acquisition_sequence)を直接INSERTで破ろうとするとreject", () => {
+    const { db, store } = setup();
+    const def = sampleDef("v2.test.constraint-unique");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS }); // sequence=1
+
+    // carolのaward行だけ（FK満たすため）直接作り、aliceと同じsequence=1を主張しようとする。
+    db.prepare(`INSERT INTO title_awards (user_id, title_key, scope_key, earned_at, awarded_at) VALUES (?, ?, ?, ?, ?)`).run(
+      "carol",
+      def.key,
+      scope.scopeKey,
+      null,
+      BASE + 100,
+    );
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO title_ownerships
+             (user_id, title_key, first_scope_key, first_earned_at, first_awarded_at, acquisition_sequence, holder_count_at_acquisition)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("carol", def.key, scope.scopeKey, null, BASE + 100, 1, 2),
+    ).toThrow();
+  });
+
+  it("CHECK(acquisition_sequence >= 1)を直接INSERTで破ろうとするとreject", () => {
+    const { db, store } = setup();
+    const def = sampleDef("v2.test.constraint-seq");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS });
+    db.prepare(`DELETE FROM title_ownerships WHERE user_id = ? AND title_key = ?`).run("alice", def.key);
+
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO title_ownerships
+             (user_id, title_key, first_scope_key, first_earned_at, first_awarded_at, acquisition_sequence, holder_count_at_acquisition)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("alice", def.key, scope.scopeKey, null, BASE + 100, 0, 1),
+    ).toThrow();
+  });
+
+  it("CHECK(holder_count_at_acquisition >= 1)を直接INSERTで破ろうとするとreject", () => {
+    const { db, store } = setup();
+    const def = sampleDef("v2.test.constraint-holder");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS });
+    db.prepare(`DELETE FROM title_ownerships WHERE user_id = ? AND title_key = ?`).run("alice", def.key);
+
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO title_ownerships
+             (user_id, title_key, first_scope_key, first_earned_at, first_awarded_at, acquisition_sequence, holder_count_at_acquisition)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("alice", def.key, scope.scopeKey, null, BASE + 100, 1, 0),
+    ).toThrow();
+  });
+
+  it("CHECK(first_earned_at <= first_awarded_at)を直接INSERTで破ろうとするとreject", () => {
+    const { db, store } = setup();
+    const def = sampleDef("v2.test.constraint-earned");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS });
+    db.prepare(`DELETE FROM title_ownerships WHERE user_id = ? AND title_key = ?`).run("alice", def.key);
+
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO title_ownerships
+             (user_id, title_key, first_scope_key, first_earned_at, first_awarded_at, acquisition_sequence, holder_count_at_acquisition)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("alice", def.key, scope.scopeKey, BASE + 150, BASE + 100, 1, 1),
+    ).toThrow();
+  });
+});
+
+describe("Award Factsのvalidation/serialization単一pass化（TOCTOU防止）", () => {
+  it("getterを持つobjectのプロパティはちょうど1回だけ読まれ、その値がそのまま永続化される", () => {
+    const { store } = setup();
+    const def = sampleDef("v2.test.single-pass");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+
+    let reads = 0;
+    const data = {
+      get value() {
+        reads += 1;
+        return reads; // 呼び出しごとに違う値を返す、TOCTOUを狙った意地悪なgetter
+      },
+    };
+
+    const result = store.award({
+      userId: "alice",
+      titleKey: def.key,
+      scope,
+      earnedAt: null,
+      awardFacts: { version: 1, data: data as never },
+    });
+
+    // validationとserializationが別々のpassだと2回（またはそれ以上）読まれてしまうが、
+    // 単一passなら1回しか読まれない——読んだ値と永続化される値が必ず一致する。
+    expect(reads).toBe(1);
+    expect(result.status).toBe("awarded");
+    expect(store.awardFacts("alice", def.key, scope.scopeKey)?.data).toEqual({ value: 1 });
+  });
+});
+
+describe("awardFacts() read integrity（§18）", () => {
+  it("facts_versionがDB上で壊れているとintegrity error", () => {
+    const { db, store } = setup();
+    const def = sampleDef("v2.test.corrupt-version");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS });
+    // DBのCHECK(facts_version >= 1)は非整数までは弾かない（SQLiteは動的型付けのため
+    // 1.5 >= 1は真）——application層のassertValidFactsVersion()（整数チェック）が
+    // ここを塞ぐことを確認する。
+    db.prepare(`UPDATE title_award_facts SET facts_version = 1.5 WHERE user_id = ? AND title_key = ?`).run("alice", def.key);
+
+    expect(() => store.awardFacts("alice", def.key, scope.scopeKey)).toThrow(/integrity violation/);
+  });
+
+  it("captured_atがDB上で壊れているとintegrity error", () => {
+    const { db, store } = setup();
+    const def = sampleDef("v2.test.corrupt-captured");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS });
+    db.prepare(`UPDATE title_award_facts SET captured_at = -1 WHERE user_id = ? AND title_key = ?`).run("alice", def.key);
+
+    expect(() => store.awardFacts("alice", def.key, scope.scopeKey)).toThrow(/invalid captured_at/);
   });
 });

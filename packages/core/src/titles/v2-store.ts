@@ -6,8 +6,13 @@ import {
   type TitleSourceKey,
 } from "./v2-contract.js";
 import { assertSourceReaderCoverage } from "./v2-sources.js";
-import { assertResolvedTitleScope, resolvedScopeEffectiveEnd, type ResolvedTitleScope } from "./v2-scope.js";
-import { assertValidAwardFacts, assertValidFactsVersion, type TitleAwardFacts } from "./v2-award-facts.js";
+import { assertResolvedTitleScopeForTitle, resolvedScopeEffectiveEnd, type ResolvedTitleScope } from "./v2-scope.js";
+import {
+  assertValidAwardFacts,
+  assertValidFactsVersion,
+  serializeAwardFacts,
+  type TitleAwardFacts,
+} from "./v2-award-facts.js";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -99,9 +104,13 @@ CREATE TABLE IF NOT EXISTS title_ownerships (
   first_scope_key             TEXT NOT NULL,
   first_earned_at             INTEGER,
   first_awarded_at            INTEGER NOT NULL,
-  acquisition_sequence        INTEGER NOT NULL,
-  holder_count_at_acquisition INTEGER NOT NULL,
+  acquisition_sequence        INTEGER NOT NULL CHECK (acquisition_sequence >= 1),
+  holder_count_at_acquisition INTEGER NOT NULL CHECK (holder_count_at_acquisition >= 1),
+  CHECK (first_earned_at IS NULL OR first_earned_at <= first_awarded_at),
   PRIMARY KEY (user_id, title_key),
+  -- titleKeyごとにacquisition_sequenceは重複しない。title_key prefixのindexとしても
+  -- 使える（「あるtitleのN番目は誰か」のqueryに使う）。
+  UNIQUE (title_key, acquisition_sequence),
   FOREIGN KEY (user_id, title_key, first_scope_key)
     REFERENCES title_awards(user_id, title_key, scope_key)
 );
@@ -289,6 +298,54 @@ function assertCounterBaselineSnapshotterCoverage(): void {
 }
 
 /**
+ * award/facts/ownershipの全体整合性をfail-closedで検証する。同じ(user,title,scope)を
+ * 再award()した時だけ検出するlazy checkだと、Store constructionからそのタイミングまでの
+ * 間、欠損facts/ownershipを抱えたaward行を（例えばretired titleのhasAward()経由で）
+ * 正常データとして扱ってしまう。Store構築時に必ず一度、DB全体を見て検証する。
+ *
+ * 偽facts/ownershipを捏造してbackfillしない既存方針はここでも維持する——欠損が
+ * あればfail-closedするだけで、埋めない。
+ */
+function assertAwardPersistenceIntegrity(db: Database.Database): void {
+  const missingFacts = db
+    .prepare(
+      `SELECT a.user_id, a.title_key, a.scope_key
+         FROM title_awards a
+         LEFT JOIN title_award_facts f
+           ON f.user_id = a.user_id AND f.title_key = a.title_key AND f.scope_key = a.scope_key
+        WHERE f.user_id IS NULL
+        LIMIT 1`,
+    )
+    .get() as { user_id: string; title_key: string; scope_key: string } | undefined;
+  if (missingFacts) {
+    throw new Error(
+      `title award persistence integrity violation: award row exists for ` +
+        `(${missingFacts.user_id}, ${missingFacts.title_key}, ${missingFacts.scope_key}) without award facts ` +
+        `(legacy/foundation row, or facts were deleted out of band)`,
+    );
+  }
+
+  const missingOwnership = db
+    .prepare(
+      `SELECT a.user_id, a.title_key
+         FROM title_awards a
+         LEFT JOIN title_ownerships o
+           ON o.user_id = a.user_id AND o.title_key = a.title_key
+        WHERE o.user_id IS NULL
+        GROUP BY a.user_id, a.title_key
+        LIMIT 1`,
+    )
+    .get() as { user_id: string; title_key: string } | undefined;
+  if (missingOwnership) {
+    throw new Error(
+      `title ownership persistence integrity violation: award row(s) exist for ` +
+        `(${missingOwnership.user_id}, ${missingOwnership.title_key}) without an ownership row ` +
+        `(legacy/foundation row, or ownership was deleted out of band)`,
+    );
+  }
+}
+
+/**
  * v2称号の永続化だけを担当する。
  *
  * 旧 titles / TitleEngine は移行が終わるまで触らない。PR1ではこのStoreを本番経路へ
@@ -303,6 +360,7 @@ export class TitleV2Store {
     assertDerivedSourceDependenciesResolve();
     assertSourceReaderCoverage();
     ensureTitleV2Schema(db);
+    assertAwardPersistenceIntegrity(db);
   }
 
   /**
@@ -506,12 +564,25 @@ export class TitleV2Store {
 
     const userId = requireText(input.userId, "userId");
     const titleKey = requireV2Key(input.titleKey);
-    assertResolvedTitleScope(input.scope);
+    // brand（forgery）に加えて、このscopeが**このtitleKeyのために**resolveTitleScope()
+    // されたことまで検証する。`global`のようなscopeKeyはpolicyを共有する全titleで
+    // 同一文字列になり得るため、「title Aのために正規resolveしたscopeをtitle Bへ
+    // そのまま渡す」substitutionはscopeKeyの一致だけでは検出できない。
+    assertResolvedTitleScopeForTitle(input.scope, titleKey);
     const scopeKey = input.scope.scopeKey;
     const earnedAt = input.earnedAt === null ? null : requireUnix(input.earnedAt, "earnedAt");
     const awardedAt = requireUnix(input.awardedAt ?? this.clock(), "awardedAt");
     if (earnedAt !== null && earnedAt > awardedAt) {
       throw new Error(`earnedAt cannot be after awardedAt: earnedAt=${earnedAt} awardedAt=${awardedAt}`);
+    }
+    // awardedAtは、そのscopeを実際に観測した時刻（observedAt）より前にはできない
+    // ——さもないと「まだ観測していない未来のデータを使って過去にawardした」という
+    // 矛盾した状態を作れてしまう。captured_at（facts）もこのawardedAtと同じ
+    // snapshotを使う。
+    if (awardedAt < input.scope.observedAt) {
+      throw new Error(
+        `awardedAt (${awardedAt}) cannot be before the scope's observedAt (${input.scope.observedAt}) for scope=${scopeKey}`,
+      );
     }
     // earnedAtは、resolveTitleScope()が確定したそのscopeの窓の中に収まっていること
     // （§13）。zero-width scope（start===effectiveEnd）では、この条件を満たす
@@ -526,8 +597,10 @@ export class TitleV2Store {
     }
 
     assertValidFactsVersion(input.awardFacts.version, "awardFacts.version");
-    assertValidAwardFacts(input.awardFacts.data, `title ${titleKey} awardFacts`);
-    const factsJson = JSON.stringify(input.awardFacts.data);
+    // validationとJSON serializationを単一passで行う——検証後に別途JSON.stringify()を
+    // 呼ぶ2段階構成だと、forged/accessor objectで検証時と永続化時の値が食い違う
+    // TOCTOUを作り得る（v2-award-facts.tsのdoc comment参照）。
+    const factsJson = serializeAwardFacts(input.awardFacts.data, `title ${titleKey} awardFacts`);
 
     const tx = this.db.transaction((): AwardResult => {
       const insertResult = this.db
@@ -663,17 +736,34 @@ export class TitleV2Store {
   }
 
   /**
-   * 既存awardの有無だけを確認する（副作用なし）。retired titleが新規awardを作らず、
+   * 既存awardの有無を確認する（読み取り専用）。retired titleが新規awardを作らず、
    * 既存awardだけ保持するかどうかの分岐に使う。
+   *
+   * Store構築時に `assertAwardPersistenceIntegrity()` がDB全体を検証済みだが、
+   * construction後にout-of-bandな行が挿入される可能性もゼロではないため、
+   * ここでも見つけたaward bundle（facts/ownership）のintegrityを確認する——
+   * 欠損したfacts/ownershipを抱えたawardを黙って「あり」として返さない。
    */
   hasAward(userIdRaw: string, titleKeyRaw: string, scopeKeyRaw: string): boolean {
     const userId = requireText(userIdRaw, "userId");
     const titleKey = requireV2Key(titleKeyRaw);
     const scopeKey = requireText(scopeKeyRaw, "scopeKey");
-    const row = this.db
-      .prepare(`SELECT 1 FROM title_awards WHERE user_id = ? AND title_key = ? AND scope_key = ?`)
-      .get(userId, titleKey, scopeKey);
-    return row !== undefined;
+    const row = this.getAwardRow(userId, titleKey, scopeKey);
+    if (!row) return false;
+
+    const facts = this.getAwardFactsRow(userId, titleKey, scopeKey);
+    if (!facts) {
+      throw new Error(
+        `title award integrity violation: award row exists for (${userId}, ${titleKey}, ${scopeKey}) without award facts`,
+      );
+    }
+    const ownership = this.getOwnershipRow(userId, titleKey);
+    if (!ownership) {
+      throw new Error(
+        `title ownership integrity violation: award row exists for (${userId}, ${titleKey}, ${scopeKey}) without an ownership row`,
+      );
+    }
+    return true;
   }
 
   listAwards(userId: string): TitleAwardRow[] {
@@ -704,6 +794,19 @@ export class TitleV2Store {
       )
       .get(userId, titleKey, scopeKey) as { facts_version: number; facts_json: string; captured_at: number } | undefined;
     if (!row) return null;
+
+    // 壊れたDB値をそのまま型付きrowとして返さない——version・timestamp・JSON本体を
+    // すべてvalidateする。
+    try {
+      assertValidFactsVersion(row.facts_version, `award facts_version for ${userId}/${titleKey}/${scopeKey}`);
+    } catch (err) {
+      throw new Error(
+        `award facts integrity violation: invalid facts_version for ${userId}/${titleKey}/${scopeKey}: ${(err as Error).message}`,
+      );
+    }
+    if (!Number.isInteger(row.captured_at) || row.captured_at < 0) {
+      throw new Error(`award facts integrity violation: invalid captured_at for ${userId}/${titleKey}/${scopeKey}`);
+    }
 
     let parsed: unknown;
     try {
