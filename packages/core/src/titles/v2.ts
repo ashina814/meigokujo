@@ -177,3 +177,29 @@ export {
   type RankTitleKey,
   type RankTrack,
 } from "../rank/tiers.js";
+
+// v2-meta.ts の buildMetaSnapshot() / evaluateMetaTitle() はここではexportしない（PR C1
+// §16）。もし公開すると、callerがforgeしたsnapshot（例: behaviorOwnershipCount: 999）を
+// 直接meta ruleへ渡してaward()まで到達できてしまう——meta snapshotの構築はevaluation
+// pipeline（`v2-pipeline.ts` の `evaluateUserPipeline()`/`evaluateBatchPipeline()`）内部
+// だけで行う。contract type（`MetaTitleRule`等）・`defineMetaTitleRule()`はmutationを
+// 伴わないためexportして構わない。
+export {
+  defineMetaTitleRule,
+  type MetaCollectionEditionSnapshot,
+  type MetaTitleEvaluationResult,
+  type MetaTitleRule,
+  type MetaTitleRuleContext,
+  type MetaTitleRuleImplementation,
+  type MetaTitleRuleResult,
+  type TitleMetaSnapshot,
+} from "./v2-meta.js";
+
+export {
+  defineTitleEvaluationPlan,
+  evaluateBatchPipeline,
+  evaluateUserPipeline,
+  type TitleEvaluationPlan,
+  type TitlePipelineOptions,
+  type TitleUserPipelineResult,
+} from "./v2-pipeline.js";
