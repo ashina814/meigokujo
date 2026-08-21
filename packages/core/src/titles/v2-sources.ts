@@ -7,6 +7,7 @@ import {
   type OccupancyBucket,
 } from "../vc/derived.js";
 import { TITLE_SOURCES, type TitleSourceDefinition, type TitleUsableSourceKey } from "./v2-contract.js";
+import { assertResolvedTitleScope, resolvedScopeEffectiveEnd, type ResolvedTitleScope } from "./v2-scope.js";
 
 /**
  * 称号ruleがraw DBを直接触らないようにするための、source読み込み境界。
@@ -16,33 +17,10 @@ import { TITLE_SOURCES, type TitleSourceDefinition, type TitleUsableSourceKey } 
  * titleUsable:false sourceはruleへ一切渡さない——渡してしまうと、ruleが独自SQLを書ける
  * 設計になり、PR1/PR2で作ったprivacy/provenance/trusted-untrustedの契約を
  * 全部迂回できてしまう。
+ *
+ * scopeはcallerが自由に作れる `TitleEvaluationScope` ではなく、v2-scope.tsの
+ * resolveTitleScope() だけが作れる `ResolvedTitleScope`（branded）を受け取る。
  */
-export interface TitleEvaluationScope {
-  /** `(user_id, title_key, scope_key)` のunique制約へそのまま使う。 */
-  scopeKey: string;
-  /** inclusive */
-  start: number;
-  /** exclusive */
-  end: number;
-  /**
-   * このscopeを評価する時刻。呼び出し側が明示的に固定する（PR2のTitleWindow.observedAt
-   * と同じ意味）。1 evaluation batch内では必ず同じ値を使うこと——各sourceが別々に
-   * Date.now()を見る設計にしない。
-   */
-  observedAt: number;
-}
-
-function assertValidScope(scope: TitleEvaluationScope): void {
-  if (typeof scope.scopeKey !== "string" || !scope.scopeKey.trim()) {
-    throw new Error("title evaluation scope requires a non-empty scopeKey");
-  }
-  if (!Number.isInteger(scope.start) || !Number.isInteger(scope.end) || scope.start >= scope.end) {
-    throw new RangeError(`invalid title evaluation scope window: [${scope.start}, ${scope.end})`);
-  }
-  if (!Number.isInteger(scope.observedAt)) {
-    throw new RangeError("title evaluation scope requires an integer observedAt");
-  }
-}
 
 export interface BumpEventsSourcePayload {
   /** [start, end) 内の成功BUMPの created_at（unix秒）。created_at ASC。message_idは含まない。 */
@@ -84,7 +62,7 @@ export interface TitleSourcePayloads {
 type SourceReader<K extends TitleUsableSourceKey> = (
   db: Database.Database,
   userId: string,
-  scope: TitleEvaluationScope,
+  scope: ResolvedTitleScope,
 ) => TitleSourcePayloads[K];
 
 /**
@@ -99,13 +77,13 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
     // ——このreaderが返すのは単一userのcreated_at列挙だけ。
     //
     // scope.observedAtより後のBUMPも読み込んではいけない——VC readerはPR2のwindowへ
-    // observedAtをそのまま渡して未来を計上しないのに、BUMP側だけscope.endまで無条件に
-    // 読むと、同一evaluation内でsourceごとに時間軸がずれてしまう（VCは観測時点まで、
-    // BUMPは未来まで、という不整合）。ただしこれは完全なDB snapshot再現ではない——
-    // BUMPはretryで後からcreated_atが過去のeventを挿入し得るため、「同じobservedAtなら
-    // 永久にDB内容と一致する」とまでは言えない。ここではobservedAtを
-    // 「event occurrenceの上限」として扱う。
-    const effectiveEnd = Math.min(scope.end, scope.observedAt);
+    // observedAtをそのまま渡して未来を計上しないのに、BUMP側だけendExclusive(または
+    // open-endedならobservedAt)まで無条件に読むと、同一evaluation内でsourceごとに
+    // 時間軸がずれてしまう（VCは観測時点まで、BUMPは未来まで、という不整合）。ただし
+    // これは完全なDB snapshot再現ではない——BUMPはretryで後からcreated_atが過去の
+    // eventを挿入し得るため、「同じobservedAtなら永久にDB内容と一致する」とまでは
+    // 言えない。ここではobservedAtを「event occurrenceの上限」として扱う。
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
     const rows = db
       .prepare(
         `SELECT created_at FROM bump_events WHERE user_id = ? AND created_at >= ? AND created_at < ? ORDER BY created_at ASC`,
@@ -114,28 +92,42 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
     return { events: rows.map((r) => r.created_at) };
   },
   vc_empty_start_then_joined: (db, userId, scope) => {
-    const window = { start: scope.start, end: scope.end, observedAt: scope.observedAt };
+    // CATALOG_EPOCH===observedAt等、正常なzero-width window（start===effectiveEnd）は
+    // computeXxx()側のclampWindow()が`start>=end`としてRangeErrorを投げてしまう——
+    // これは「不正なwindow」ではなく「まだ何も観測していない」という正常な状態なので、
+    // vc/derived.tsへは触れず、ここで0件payloadとして扱う。
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return { facts: [] };
+    const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
     const facts = computeEmptyStartThenJoined(db, window, [userId]);
     return {
       facts: facts.map((f) => ({ visitStartedAt: f.visitStartedAt, joinedAt: f.joinedAt, channelId: f.channelId })),
     };
   },
   vc_last_occupant: (db, userId, scope) => {
-    const window = { start: scope.start, end: scope.end, observedAt: scope.observedAt };
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return { facts: [] };
+    const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
     const facts = computeLastOccupant(db, window, [userId]);
     return { facts: facts.map((f) => ({ becameLastAt: f.becameLastAt, channelId: f.channelId })) };
   },
   vc_group_size_seconds: (db, userId, scope) => {
-    const window = { start: scope.start, end: scope.end, observedAt: scope.observedAt };
+    const empty = { trustedSecondsByBucket: { solo: 0, oneToOne: 0, smallGroup: 0, largeGroup: 0 }, untrustedSeconds: 0 } as const;
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return empty;
+    const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
     const rows = computeGroupSizeSeconds(db, window, [userId]);
     const row = rows.find((r) => r.userId === userId);
     return {
-      trustedSecondsByBucket: row?.trustedSecondsByBucket ?? { solo: 0, oneToOne: 0, smallGroup: 0, largeGroup: 0 },
+      trustedSecondsByBucket: row?.trustedSecondsByBucket ?? empty.trustedSecondsByBucket,
       untrustedSeconds: row?.untrustedSeconds ?? 0,
     };
   },
   vc_social_safe: (db, userId, scope) => {
-    const window = { start: scope.start, end: scope.end, observedAt: scope.observedAt };
+    const empty = { distinctCoPresentUsers: 0, maxRepeatedDaysWithOneCounterpart: 0, trustedOverlapSeconds: 0 } as const;
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return empty;
+    const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
     const rows = computeSafeSocialAggregates(db, window, [userId]);
     const row = rows.find((r) => r.userId === userId);
     return {
@@ -167,15 +159,16 @@ export function assertSourceReaderCoverage(
  *
  * `sourceKey` がTypeScriptの型を迂回して（`as any`等で）titleUsable:falseや未登録の
  * 値を渡された場合でも、ここでfail-closedする——ruleがvc_segments等のraw sourceへ
- * 到達する経路をruntimeでも塞ぐ。
+ * 到達する経路をruntimeでも塞ぐ。`scope` もresolveTitleScope()の産物であることを
+ * runtimeで検証する——手書きのscopeオブジェクトをここへ通さない。
  */
 export function readTitleSource<K extends TitleUsableSourceKey>(
   db: Database.Database,
   sourceKey: K,
   userId: string,
-  scope: TitleEvaluationScope,
+  scope: ResolvedTitleScope,
 ): TitleSourcePayloads[K] {
-  assertValidScope(scope);
+  assertResolvedTitleScope(scope);
   const definition = (TITLE_SOURCES as Record<string, TitleSourceDefinition>)[sourceKey as string];
   if (!definition) {
     throw new Error(`unknown title source: ${String(sourceKey)}`);
@@ -220,9 +213,15 @@ export class TitleSourceCache {
     db: Database.Database,
     sourceKey: K,
     userId: string,
-    scope: TitleEvaluationScope,
+    scope: ResolvedTitleScope,
   ): TitleSourcePayloads[K] {
-    const key = [userId, sourceKey, scope.scopeKey, scope.start, scope.end, scope.observedAt].join(" ");
+    // cache hitはreadTitleSource()を経由しない——brand検証をcache miss側だけに任せると、
+    // 正規のscopeで一度cacheされたキーと同じ (userId, sourceKey, scopeKey, start,
+    // endExclusive, observedAt) を持つ「偽造scope」を渡した2回目の呼び出しが、
+    // assertResolvedTitleScope()を一度も通らずcacheの値をそのまま受け取れてしまう。
+    // hit/miss どちらの経路でも必ずbrandを検証する。
+    assertResolvedTitleScope(scope);
+    const key = [userId, sourceKey, scope.scopeKey, scope.start, scope.endExclusive, scope.observedAt].join(" ");
     if (this.cache.has(key)) return this.cache.get(key) as TitleSourcePayloads[K];
     const value = readTitleSource(db, sourceKey, userId, scope);
     this.cache.set(key, value);

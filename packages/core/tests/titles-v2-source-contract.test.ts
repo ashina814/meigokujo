@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { BumpCounter } from "../src/rank/bump.js";
-import { TITLE_SOURCES, assertDerivedSourceDependenciesResolve, defineTitle } from "../src/titles/v2-contract.js";
+import { TITLE_SOURCES, assertDerivedSourceDependenciesResolve, defineBehaviorTitle } from "../src/titles/v2-contract.js";
 
 afterEach(() => vi.useRealTimers());
 
@@ -49,18 +49,21 @@ describe("称号v2 source contract", () => {
   it("raw vc_segmentsは称号から直接使えない。安全なderived sourceを使うこと", () => {
     expect(TITLE_SOURCES.vc_segments.titleUsable).toBe(false);
     expect(() =>
-      defineTitle({
+      defineBehaviorTitle({
+        kind: "behavior",
         key: "v2.bad-raw-vc",
         catalog: "v1",
         name: "bad",
         emoji: "x",
         description: "raw vc_segmentsを直接参照してはいけない",
         sources: ["vc_segments"] as any,
-        trigger: "vc_leave",
+        triggers: ["vc_activity"],
         lifecycle: "active",
         hidden: false,
-        countsForCompletion: false,
         publicAnnounce: false,
+        themeKey: "bad",
+        groupKey: "bad",
+        scope: { type: "global" },
       }),
     ).toThrow(/source is not usable by titles/);
   });
@@ -78,18 +81,21 @@ describe("称号v2 source contract", () => {
     // これをそのままCOUNTさせないよう、vc_visits自体は中間source扱いにする。
     expect(TITLE_SOURCES.vc_visits.titleUsable).toBe(false);
     expect(() =>
-      defineTitle({
+      defineBehaviorTitle({
+        kind: "behavior",
         key: "v2.bad-vc-visits",
         catalog: "v1",
         name: "bad",
         emoji: "x",
         description: "vc_visitsを直接参照してはいけない",
         sources: ["vc_visits"] as any,
-        trigger: "vc_leave",
+        triggers: ["vc_activity"],
         lifecycle: "active",
         hidden: false,
-        countsForCompletion: false,
         publicAnnounce: false,
+        themeKey: "bad",
+        groupKey: "bad",
+        scope: { type: "global" },
       }),
     ).toThrow(/source is not usable by titles/);
   });
@@ -105,18 +111,21 @@ describe("称号v2 source contract", () => {
     expect(TITLE_SOURCES.bump_counts.titleUsable).toBe(false);
 
     expect(() =>
-      defineTitle({
+      defineBehaviorTitle({
+        kind: "behavior",
         key: "v2.bad-bump-counter",
         catalog: "v1",
         name: "bad",
         emoji: "x",
         description: "counterを直接参照してはいけない",
         sources: ["bump_counts"] as any,
-        trigger: "bump_success",
+        triggers: ["bump_success"],
         lifecycle: "active",
         hidden: false,
-        countsForCompletion: false,
         publicAnnounce: false,
+        themeKey: "bad",
+        groupKey: "bad",
+        scope: { type: "global" },
       }),
     ).toThrow(/source is not usable by titles/);
   });

@@ -265,13 +265,22 @@ export {
 export { TitleEngine, TitleHelper, TITLE_RULES, type TitleRule, type GrantedTitle } from "./titles/service.js";
 export {
   TitleV2Store,
+  defineBehaviorTitle,
+  defineMetaTitle,
   defineTitleRule,
   evaluateBatch,
   evaluateTitle,
   evaluateUser,
+  resolveTitleScope,
+  type BehaviorTitleDefinition,
+  type MetaTitleDefinition,
+  type ResolvedTitleScope,
   type TitleAwardOutcome,
+  type TitleEvaluationOptions,
   type TitleEvaluationResult,
-  type TitleEvaluationScope,
+  type TitleEventScopeProvider,
+  type TitleMonthSelector,
+  type TitleScopePolicy,
   // 旧v1のTitleRuleと名前が衝突するためV2を付けてalias。
   type TitleRule as TitleV2Rule,
   type TitleRuleContext as TitleV2RuleContext,

@@ -181,23 +181,106 @@ award（TitleV2Store、matchedのときだけ）
 
 - `readTitleSource()` は、`sourceKey` がTypeScriptを迂回して（`as any`等で）titleUsable:falseや未登録の値を渡された場合でもruntimeでfail-closedする。
 - `assertSourceReaderCoverage()`（`TitleV2Store` construction時に自動実行）は、titleUsable:trueな全sourceに実際のreaderが存在することを検証する——「registryへ登録だけされているがreaderが無い」状態を黙って空データ扱いにしない。
-- `TitleSourceCache` が `(userId, sourceKey, scopeKey, start, end, observedAt)` 単位で1 evaluation batch内の重複読み込みを防ぐ。複数ruleが同じsourceを使っても、derived計算（PR2の一部はO(訪問数²)）をrule数だけ繰り返さない。永続cacheではない。
-- `bump_events` readerも `min(scope.end, scope.observedAt)` で読み込みを止める。VC readerは既にPR2のobservedAtをそのまま渡しているため、BUMP側だけscope.endまで無条件に読むと、同一evaluation内でsourceごとに時間軸がずれる（VCは観測時点まで、BUMPは未来まで、という不整合）。ただしBUMPはretryで後からcreated_atが過去のeventを挿入し得るため、「同じobservedAtなら永久にDB内容と一致する」とまでは言えない——observedAtは「event occurrenceの上限」として扱う。
-- `TitleRule` は公開structural interfaceなので、`defineTitleRule()` を経由せず手で組み立てたり構築後にdefinitionを書き換えたりできる。`evaluateTitle()` は入口で必ず `defineTitle(rule.definition)` を再度通す——さもないと `sources: []` のruleが「何も読まずに任意のearnedAtでaward」できてしまい、「source contractを条件実装から迂回させない」が破れる。
-- ただし `defineTitle()` はdefinitionをcopyせず同じobjectを返すため、それだけでは足りない。`rule.evaluate()` の実行**中**に `rule.definition`（同一参照）を書き換えられると、評価後のorderable判定がその改竄後の値を見てしまい、入口の再検証をすり抜けられる（VC専用ruleがevaluate()の中で自分のsourcesをorderable:trueな`bump_events`へ差し替え、非nullなearnedAtを通す、等）。`evaluateTitle()` は `sources` を含めて独立したcopyを作り、以降はそのcopyだけを使う。`scope` も同様に、ctx.scopeとして渡す前に値だけを取り出したcopyへ変換する——ruleがctx.scopeを書き換えても、award先のscopeKeyには影響しない。
+- `TitleSourceCache` が `(userId, sourceKey, scopeKey, start, endExclusive, observedAt)` 単位で1 evaluation batch内の重複読み込みを防ぐ。複数ruleが同じsourceを使っても、derived計算（PR2の一部はO(訪問数²)）をrule数だけ繰り返さない。永続cacheではない。
+- `bump_events` readerも「observedAtより先を読まない」制約をPR2のVC readerと揃える（下記observedAt/effectiveEndの節を参照）。ただしBUMPはretryで後からcreated_atが過去のeventを挿入し得るため、「同じobservedAtなら永久にDB内容と一致する」とまでは言えない——observedAtは「event occurrenceの上限」として扱う。
+- `TitleRule` は公開structural interfaceなので、`defineTitleRule()` を経由せず手で組み立てたり構築後にdefinitionを書き換えたりできる。`evaluateTitle()` は入口で必ず `defineBehaviorTitle(rule.definition)` を再度通す——さもないと `sources: []` のruleが「何も読まずに任意のearnedAtでaward」できてしまい、「source contractを条件実装から迂回させない」が破れる。
+- ただし `defineBehaviorTitle()` はdefinitionをcopyせず同じobjectを返すため、それだけでは足りない。`rule.evaluate()` の実行**中**に `rule.definition`（同一参照）を書き換えられると、評価後のorderable判定がその改竄後の値を見てしまい、入口の再検証をすり抜けられる（VC専用ruleがevaluate()の中で自分のsourcesをorderable:trueな`bump_events`へ差し替え、非nullなearnedAtを通す、等）。`evaluateTitle()` は `sources`/`triggers` を含めて独立したcopyを作り、以降はそのcopyだけを使う。`scope` も同様に、ctx.scopeとして渡す前に値だけを取り出したcopyへ変換する——ruleがctx.scopeを書き換えても、award先のscopeKeyには影響しない。
 - source payloadはTitleSourceCache経由で複数ruleへ同じ参照が配られる。1つのruleが受け取ったpayloadを（配列への`push()`等で）書き換えると、後続ruleが汚染された値を見てしまう。`readTitleSource()` はpayloadを再帰的にdeep-freezeしてから返す——書き換えようとすると（strict modeで）例外になる。
-
-`TitleEvaluationScope { scopeKey, start, end, observedAt }` はPR2の `TitleWindow` へそのまま渡せる形にしてある。scopeKeyの生成（global/month/event/catalog等）はこのPRの範囲外で、呼び出し側が解決済みのscopeを渡す。
 
 earnedAtは、ruleが宣言した**全source**が `orderable: true` のときだけ非nullを返してよい。1つでも `orderable: false` sourceに依存するruleが非nullを返すと `evaluateTitle()` がrejectする——「たぶんこの時刻だろう」を実時刻として保存させない。
 
 lifecycle:
 
-- `disabled`: 新規評価しない（sourceも読まず、ruleの `evaluate()` 自体を呼ばない）
+- `disabled`: 新規評価しない（sourceも読まず、scopeも解決せず、ruleの `evaluate()` 自体を呼ばない）
 - `retired`: matchedでも新規awardしない。既存awardは保持する（消さないし増やさない）
 - `active`: 通常通り評価・award可能
 
 awardは `TitleV2Store.award()` の `(user_id, title_key, scope_key)` 冪等性にそのまま乗る。同じevaluationを何度reconcileしても二重awardしないし、既存awardをreconcile時刻等で上書きしない。
+
+### behavior / meta の分離（PR A、v2 contract v3）
+
+`TitleDefinition` は `kind` で discriminated union へ分離した。
+
+- `BehaviorTitleDefinition`（`kind: "behavior"`）: 通常のsource evaluatorを通す称号。`catalog` / `sources` / `triggers` / 任意の `progression` を持つ。`defineBehaviorTitle()` で構築する。
+- `MetaTitleDefinition`（`kind: "meta"`）: 他titleのaward状態やcollection/full-clear manifestを横断して判定する称号（千印万来・万印皆伝等）。`sources` / `triggers` / `catalog` / `progression` を持たない——meta titleは特定1catalogの監査対象という単位ではなく、有効な複数catalog/manifestを横断して判定するため。`defineMetaTitle()` で構築する。
+
+`TitleRule.definition` の型は `BehaviorTitleDefinition` に固定してあるため、meta titleを `evaluateTitle()` へ渡すことは**コンパイルエラーになる**（型で分離）。TypeScriptを迂回されても、`defineTitleRule()`/`evaluateTitle()` 内部の `defineBehaviorTitle()` が `kind` をruntimeでも検証する。
+
+`countsForCompletion` は廃止した。Collection Credit / Full-clear Requiredは、title definition自身のpropertyではなく、後続のimmutable collection manifest（下記）側が持つ。
+
+`trigger`（単数）は `triggers`（複数、最低1件・重複禁止）へ変更した——TC+VCの両方で完成し得る称号、複数featureに跨る称号を表現できるようにするため。`lifecycle` から `seasonal` を削除した——期間限定の意味は次のscope policyが持つため、両方に「期間」概念を持たせて意味が重複するのを避ける。
+
+### scope policy と中央resolver（PR A）
+
+`definition.scope: TitleScopePolicy` が「どうscopeを区切るか」を宣言する。
+
+```text
+{ type: "catalog" }              start = CATALOG_EPOCH、open-ended
+{ type: "global" }                start = SYSTEM_EPOCH、open-ended
+{ type: "month" }                 JST暦月。start = max(月初, CATALOG_EPOCH)、end = 翌月初
+{ type: "event"; eventKey }       event固有window。start = max(canonical開始, CATALOG_EPOCH)、
+                                   end = canonical completedAt
+```
+
+scope policyの意味はreleased title semanticの一部——resolverのsemanticを後から変えると、既存titleのaward境界が過去に遡って変わってしまうため変更しない。
+
+**callerは `TitleEvaluationScope` を自由に組み立てられない。** `packages/core/src/titles/v2-scope.ts` の `resolveTitleScope(store, definition, observedAt, options?)` だけが `ResolvedTitleScope` を作る唯一のAPI。callerが渡すのは `observedAt` と、必要なら `{ eventProvider?, monthSelector? }` だけで、scopeKey・window境界は必ずここで計算する。
+
+- `ResolvedTitleScope` は module-private な `unique symbol` でbrandされている。他コードが手書きした `{ scopeKey: "...", start: ... }` はこの型に**構造的に合致しない**（TypeScriptの型エラー）。`as unknown as ResolvedTitleScope` で型を迂回されても、実際のsymbol propertyは存在しないため、`assertResolvedTitleScope()`（`readTitleSource()` の入口、および `TitleSourceCache.get()` の入口——cache hit経由でも必ず検証する）がruntimeで検出する——型だけでなくruntimeでもscope forgeryをfail-closedにする。cache hitのときだけbrand検証を飛ばすと、legitimateなscopeと全く同じfields（scopeKey/start/endExclusive/observedAt）を持つ偽造scopeがcache keyだけで「なりすまして」通ってしまうため、hit/miss両方の経路で検証する。
+- `endExclusive: number | null` でopen-endedを明示する。`Number.MAX_SAFE_INTEGER` 等で偽装しない。sourceを読む実効的な終端は `effectiveEnd = min(endExclusive ?? observedAt, observedAt)`（`resolvedScopeEffectiveEnd()`）——open-endedなscopeは常に `observedAt` が上限になる。
+- `catalog` / `month` / `event` はCATALOG_EPOCHの解決が必要。meta titleは `catalog` を持たないため、`global` 以外のscope policyを解決しようとするとfail-closedする（`defineMetaTitle()` が構築時点で既に拒否する。resolver側も二重に守る）。
+- `event` scopeはcanonical event infrastructureがまだ無いため、`TitleEventScopeProvider` の差し込みが無いと解決できずfail-closedする。`eventKey` はcallerが自由に渡せず、`definition.scope.eventKey` にpolicy自体として固定してある。provider が返す `{ start, completedAt }` は resolver が整数性・`start < completedAt`・CATALOG_EPOCHでclipした後も `start < completedAt` であること・`completedAt <= observedAt`（＝eventが観測時点までに完了していること）を検証する——**未完了のeventを部分windowでawardしない**。
+- `observedAt` がresolved scopeの `start` より前になることはfail-closedする（`resolveTitleScope` 内の共通チェック）。ただし `start === observedAt`（例: CATALOG_EPOCHちょうどの瞬間の評価）のようなzero-width windowはエラーにしない——「まだ何も観測していない」という正常な状態として扱い、VC derived source層（`vc/derived.ts`）の `clampWindow()` が `start>=end` でthrowしてしまう手前で、v2-sources.ts側が0件payloadを返す。
+- `month` scope policyは通常 `observedAt` が属するJST暦月をそのまま使う（`monthSelector` 省略時 = `{type:"current"}`）。日次reconcileが「月をまたいだ後に前月分を修復する」ような historical reconcile を行いたい場合は `{ monthSelector: { type: "specific", month: "YYYY-MM" } }` を渡す——`observedAt` の意味（実際の観測上限）自体は変えず、対象月だけを明示的に選べる。`month` labelは厳格に `/^\d{4}-(0[1-9]|1[0-2])$/` でvalidateし、対象月が丸ごとCATALOG_EPOCHより前ならreject、未来の月を指定すれば通常の `observedAt < start` fail-closedに引っかかる。
+- window境界の「開いている/閉じている」はscope種別と選び方で異なる。まとめると:
+  - `global` / `catalog`: open-ended（`endExclusive:null`）。実効的な終端は常に評価時の`observedAt`。
+  - `month`（`monthSelector:{type:"current"}`、省略時のデフォルト）: `endExclusive`（翌月初）は暦月としては固定値だが、`observedAt` は定義上その月の中に収まる（`jstMonthLabelOf(observedAt)`で選ぶ月だから）ため、`effectiveEnd`は常に`observedAt`と一致する——「まだ進行中の今月」を評価している状態。
+  - `month`（`monthSelector:{type:"specific", month}`、historical closed month）: 対象月が既に終わっている（`observedAt`が翌月初以降）場合、`endExclusive`（対象月の翌月初）は`observedAt`から独立した真に固定のendになる——閉じた月を後から修復評価しても、常に同じ`effectiveEnd`が得られる。
+  - `event`: `completedAt<=observedAt`をresolver側で要求するため、`endExclusive`（=`completedAt`）は`observedAt`から独立した真に固定のendになる。
+- scopeKeyはcanonical生成のみ: `global` / `catalog:<catalogKey>` / `month:<catalogKey>:<YYYY-MM>` / `event:<catalogKey>:<eventKey>`。`catalogKey`・`eventKey`・`themeKey`・`groupKey`・`progression.seriesKey` はすべて `assertSlug()`（lowercase英数字・`-`・`_`のみ）でvalidateし、`:`や空白を許可しない——scopeKeyの文字列結合が曖昧にならないようにするため。
+
+### Theme / Group / Progression（PR A）
+
+`BehaviorTitleDefinition` は `themeKey` / `groupKey` / 任意の `progression` を持つ。意味は完全に分離する。
+
+- **Theme**: 「何の分野か」。将来のtheme breadth集計（千印万来等）に使う。
+- **Group**: 関連称号のまとまり。side titleも同じgroupに入れる。
+- **Progression** (`{ seriesKey, stage }`): 順番のあるcumulative ladder。《一門皆伝》の対象。`stage` は1始まりの正整数。
+
+`released title` の theme/group/series/stageはsemanticとしてimmutable想定。
+
+### Series Manifest（PR A）
+
+title definitionsを自動走査して「現在存在するstage全部」を一門皆伝（mastery）対象にする方式は禁止。`TitleSeriesManifest`（`packages/core/src/titles/v2-series.ts`）が **released（一度公開した）series は永久にfreezeする** immutable契約を持つ——`members` の並びと内容そのものが《一門皆伝》条件の一部であるため、後からstageを追加しない。新しいladder（例: stage4を持つ版）が欲しい場合は、同じ `(catalog, seriesKey)` を使い回さず、新しいseriesKey + 新しいtitle key群を作る。既存の `(catalog, seriesKey)` を持つmanifestを「新しい内容へ置き換える」ことは正当な拡張手段ではない（runtimeでも `assertNoOverlappingSeriesMembership()` が同一identityの複数manifest存在そのものを拒否する）。時系列immutabilityを証明するDB（manifestのバージョン履歴テーブル等）はこのPRの範囲外——ここでは契約の意味とtestだけを固定する。
+
+`assertValidSeriesManifest()` が検証する内容: members>=2、member titleの実在、同一catalog/theme/group、全memberが対象seriesのprogressionを宣言していること、stageの重複・欠番禁止（1始まりの連番）。`assertNoOverlappingSeriesMembership()` が、manifest横断で(a) 1 titleが複数seriesへ所属していないか、(b) 同一 `(catalog, seriesKey)` を名乗るmanifestが複数存在しないかを検証する。
+
+### Collection / Full-clear Manifest（PR A）
+
+Collection Editionはtitle catalogとは別概念。`TitleCollectionEdition`（`packages/core/src/titles/v2-collection.ts`）が `editionKey` と `members`（`titleKey` / `themeKey` / `collectionCredit` / `fullClearRequired`）、およびedition固有の `milestones`（`thousandMarks.count`/`themes` 等）を持つ。旧 `countsForCompletion` のようにtitle definition自身へCollection Credit / Full-clear Requiredを持たせない。**意図的に `catalog` フィールドを持たない**——collection editionは将来的に複数catalog（第I期・第II期等）由来のbehavior titleを1つのfull-clear editionへ束ねる必要があるため、editionそのものを単一catalogへ拘束しない（memberごとにtitleKeyからdefinitionを引いてthemeKey整合性等を検証すれば足りる）。
+
+《千印万来》《万印皆伝》のようなmeta titleのsemanticは、絶対的な閾値をmeta title自身に持たせず「有効なcollection/full-clear editionのmilestone policyを満たしたか」とする——catalog規模が変われば新しいeditionを作ればよく、meta title自体のkeyや判定ロジックを変えなくて済む。
+
+**collection editionもtitle catalogと同様immutable**——一度公開したら `members`/`milestones` を書き換えない。ある時点でrequired titleがretired/disabledになった場合でも、そのeditionが「当時は有効だった」という事実は変わらず、「当時editionをcomplete済みだったユーザー」を後から修復評価（historical repair）するには、そのeditionの構造そのものが引き続きvalidである必要がある。運用の想定手順は: (1) active editionのrequired/collection titleをretire/disableする必要が生じたら、まず**そのeditionをclose**する（このPRではclose自体の型・DBは作らない）、(2) old editionのmanifestは変更しない、(3) 次のeditionを新しいmember setで作る、(4) closed editionはhistorical repairのために保持し続ける。
+
+この「immutableな構造」と「今から新規activateしてよいか」は別の関心事なので、検証関数を分離した。
+
+- `assertValidCollectionEdition()`: 時間が経っても変わらない**構造契約**だけを検証する（member titleのlifecycleは見ない——historical closed editionもこれは通り続ける）。
+  - member重複禁止・member titleの実在・themeKeyの一致
+  - **meta titleはcollectionCredit/fullClearRequiredのどちらにもできない**（meta titleはcollection/full-clearの分母・分子どちらへも入らない——meta title自体が「有効なcollection editionを満たしたか」を判定する側であり、判定対象の一部を兼ねると自己参照的になるため）
+  - **collectionCredit:falseかつfullClearRequired:falseのmemberは禁止**（editionのmemberとして何の意味も持たない）
+  - fullClearRequired memberが最低1件
+  - milestone値はすべて非負整数
+- `assertCollectionEditionActivatable()`: `assertValidCollectionEdition()` を先に通した上で、**「今このeditionを新規activateしてよいか」**を追加で検証する——collectionCredit/fullClearRequiredの少なくとも一方がtrueなmemberは、definition.lifecycleが現在`"active"`であることを要求する。historical closed editionはこの関数を通す必要は無い。
+- `countableCount`（collectionCredit:trueなmember数）・`countableThemes`（collectionCredit:trueなmemberのdistinct themeKey数——collectionCredit:falseのmemberのthemeは数えない）を基準に: `startedCollecting>=1`、`startedCollecting < collectorHabit < stillCollecting`、`stillCollecting <= thousandMarks.count <= countableCount`、`thousandMarks.themes>=1`、`thousandMarks.themes <= countableThemes`、`thousandMarks.themes <= thousandMarks.count`、`almostComplete.remaining>=1`、`almostComplete.remaining < fullClearCount`（full-clear必須総数）
+
+### Rarity契約の最低限（PR A）
+
+`packages/core/src/titles/v2-rarity.ts` に型だけを置く（DB/計算本体は後続PR）。
+
+- **current rarity**: 現在の所持者状況から動的に変化する。永続化しない。titleKey単位——scopeKeyをidentityにしない。
+- **acquisition-time rarity**: award時点でsnapshotし、以後不変。**このtitleKeyを最初に獲得した（=最初のownership成立）ときのみ**作る——月/eventで同じtitleKeyを別scopeで繰り返しaward（再獲得）しても、`acquisitionSequence` は増やさない・snapshotを作り直さない。最初に獲得したscopeは `firstScopeKey` として証跡だけ保持する（rarityのidentityそのものではない）。
+- 非orderableなsourceに依存するtitleが存在するため「真のN人目」を断定できない。`acquisitionSequence` は「Botがtitleの最初のownershipを確定した処理順」（刻印順）であって、実際に条件を満たした時系列順の証明ではない。
 
 ## 4. SYSTEM_EPOCH / CATALOG_EPOCH
 
@@ -232,13 +315,13 @@ awardの一意性は次で持つ。
 (user_id, title_key, scope_key)
 ```
 
-scope例:
+scope例（`resolveTitleScope()` が生成するcanonical形。`catalogKey`はtitle definitionの `catalog` から取る。呼び出し側は組み立てられない）:
 
 ```text
 global
-month:2026-08
-event:72h-2026
 catalog:v1
+month:v1:2026-08
+event:v1:summer-2026
 ```
 
 時刻は分ける。
@@ -267,11 +350,12 @@ reconcile時刻を `earned_at` として捏造しない。取得順は `earned_a
 
 ## 8. ライフサイクルと収集
 
+期間限定の意味は `scope`（`TitleScopePolicy`）が持つ。`lifecycle` はそれとは独立な、称号自体の稼働状態を表す（v2 contract v3で `seasonal` を削除し、両者の意味の重複を解消した）。
+
 ```text
-active    通常。取得可・装備可
-seasonal  期間限定。通常完遂の分母外
-retired   新規取得不可。既得者は保持・装備可
-disabled  秘匿事故等。強制非表示・装備不可
+active    通常。新規評価・award可
+retired   新規award不可。既得者は保持（消さないし増やさない）
+disabled  秘匿事故等。sourceも読まずevaluate()自体を呼ばない強制停止。将来UIで非表示・装備解除もできる想定（このPRでは未実装）
 ```
 
 - 全クリ称号は**カタログ版単位**にする。
@@ -332,12 +416,14 @@ v2カタログは `v2.*` 名前空間を使う。
 v2基盤は `@meigokujo/core/titles/v2` を公開入口にする。後続のBot実装がcore内部pathへ依存しないようにする。
 
 root `packages/core/src/index.ts` からも、evaluator kernelの主要APIだけを最小限export する
-（`TitleV2Store` / `defineTitleRule` / `evaluateTitle` / `evaluateUser` / `evaluateBatch` /
-`TitleEvaluationScope` / `TitleEvaluationResult` / `TitleAwardOutcome` /
-`TitleRuleContext` / `TitleRuleResult`）。`readTitleSource()` 等の低レベルreader APIは
-rootへは出さない——称号条件作者が使うAPIと内部実装を区別する。旧v1にも `TitleRule` が
-存在するため、v2側は `TitleV2Rule` / `TitleV2RuleContext` / `TitleV2RuleResult` へalias
-する。
+（`TitleV2Store` / `defineBehaviorTitle` / `defineMetaTitle` / `defineTitleRule` /
+`evaluateTitle` / `evaluateUser` / `evaluateBatch` / `resolveTitleScope` /
+`TitleEvaluationOptions` / `TitleEventScopeProvider` / `ResolvedTitleScope` /
+`TitleScopePolicy` / `BehaviorTitleDefinition` / `MetaTitleDefinition` /
+`TitleEvaluationResult` / `TitleAwardOutcome` / `TitleRuleContext` / `TitleRuleResult`）。
+`readTitleSource()` 等の低レベルreader APIはrootへは出さない——称号条件作者が使うAPIと
+内部実装を区別する。旧v1にも `TitleRule` が存在するため、v2側は `TitleV2Rule` /
+`TitleV2RuleContext` / `TitleV2RuleResult` へaliasする。
 
 ## 15. PR分割
 

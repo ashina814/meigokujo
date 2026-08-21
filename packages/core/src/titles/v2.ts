@@ -2,13 +2,18 @@ export {
   TITLE_SOURCES,
   TITLE_TIME_ZONE,
   assertDerivedSourceDependenciesResolve,
-  defineTitle,
+  assertSlug,
+  defineBehaviorTitle,
+  defineMetaTitle,
+  type BehaviorTitleDefinition,
   type DerivedTitleSourceDefinition,
+  type MetaTitleDefinition,
   type PersistedTitleSourceDefinition,
-  type TitleCheckResult,
   type TitleDefinition,
   type TitleEpochPolicy,
   type TitleLifecycle,
+  type TitleProgression,
+  type TitleScopePolicy,
   type TitleSourceCodeRef,
   type TitleSourceDefinition,
   type TitleSourceKey,
@@ -52,11 +57,22 @@ export {
 } from "../vc/derived.js";
 
 export {
+  assertResolvedTitleScope,
+  resolveTitleScope,
+  resolvedScopeEffectiveEnd,
+  toRuleScope,
+  type ResolvedTitleScope,
+  type TitleEventScopeProvider,
+  type TitleMonthSelector,
+  type TitleRuleScope,
+  type TitleScopeResolutionOptions,
+} from "./v2-scope.js";
+
+export {
   assertSourceReaderCoverage,
   readTitleSource,
   TitleSourceCache,
   type BumpEventsSourcePayload,
-  type TitleEvaluationScope,
   type TitleSourcePayloads,
   type VcEmptyStartThenJoinedSourcePayload,
   type VcGroupSizeSecondsSourcePayload,
@@ -70,8 +86,28 @@ export {
   evaluateTitle,
   evaluateUser,
   type TitleAwardOutcome,
+  type TitleEvaluationOptions,
   type TitleEvaluationResult,
   type TitleRule,
   type TitleRuleContext,
   type TitleRuleResult,
 } from "./v2-evaluator.js";
+
+export {
+  assertValidSeriesManifest,
+  assertNoOverlappingSeriesMembership,
+  type TitleSeriesManifest,
+} from "./v2-series.js";
+
+export {
+  assertCollectionEditionActivatable,
+  assertValidCollectionEdition,
+  type TitleCollectionEdition,
+  type TitleCollectionMember,
+  type TitleCollectionMilestonePolicy,
+} from "./v2-collection.js";
+
+export {
+  type TitleAcquisitionRaritySnapshot,
+  type TitleCurrentRaritySnapshot,
+} from "./v2-rarity.js";
