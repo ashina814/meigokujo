@@ -13,11 +13,17 @@ import {
   buildMetaSnapshot,
   defineMetaTitleRule,
   evaluateMetaTitle,
+  type MetaCollectionEditionSnapshot,
   type MetaTitleRule,
   type MetaTitleRuleContext,
   type MetaTitleRuleResult,
 } from "../src/titles/v2-meta.js";
-import { defineTitleEvaluationPlan, evaluateBatchPipeline, evaluateUserPipeline } from "../src/titles/v2-pipeline.js";
+import {
+  defineTitleEvaluationPlan,
+  evaluateBatchPipeline,
+  evaluateUserPipeline,
+  type TitleEvaluationPlan,
+} from "../src/titles/v2-pipeline.js";
 import type { TitleCollectionEdition } from "../src/titles/v2-collection.js";
 import { TitleV2Store } from "../src/titles/v2-store.js";
 import * as v2Public from "../src/titles/v2.js";
@@ -660,5 +666,266 @@ describe("root packages/core/src/index.ts からpipeline/meta APIは意図的に
     const core = await import("../src/index.js");
     expect((core as Record<string, unknown>).evaluateUserPipeline).toBeUndefined();
     expect((core as Record<string, unknown>).defineMetaTitleRule).toBeUndefined();
+  });
+});
+
+describe("Evaluation Plan provenance / mutation resistance（PR #156 round 2レビュー §1-5）", () => {
+  it("defineTitleEvaluationPlan()を経由しない手書きplanはevaluateUserPipeline()でreject", () => {
+    const { db, store } = setup();
+    const forged = { behaviorRules: [], metaRules: [] } as unknown as TitleEvaluationPlan;
+    expect(() => evaluateUserPipeline(db, store, forged, "alice", OBSERVED_AT, "daily")).toThrow(
+      /not produced by defineTitleEvaluationPlan/,
+    );
+  });
+
+  it("正規planをshallow copy（{ ...realPlan }）してもreject（exact object identityで見ているため）", () => {
+    const { db, store } = setup();
+    const real = defineTitleEvaluationPlan([], [alwaysMatchMeta("v2.test.provenance.copy")]);
+    const copied = { ...real } as TitleEvaluationPlan;
+    expect(() => evaluateUserPipeline(db, store, copied, "alice", OBSERVED_AT, "daily")).toThrow(
+      /not produced by defineTitleEvaluationPlan/,
+    );
+  });
+
+  it("正規plan object自体のbehaviorRules/metaRulesフィールド差し替えはfreezeでthrowする", () => {
+    const real = defineTitleEvaluationPlan([behaviorRule("v2.test.provenance.frozen")], []);
+    expect(() => {
+      (real as { behaviorRules: unknown }).behaviorRules = [];
+    }).toThrow();
+    expect(() => {
+      (real as { metaRules: unknown }).metaRules = [];
+    }).toThrow();
+  });
+
+  it("plan構築後に元behavior ruleのtriggersを書き換えても、pipelineのtrigger selectionは変化しない", () => {
+    const { db, store, bump } = setup();
+    bump.addOnce("m1", "alice", BASE);
+    const rule = behaviorRule("v2.test.provenance.triggers", { triggers: ["vc_activity"] });
+    const plan = defineTitleEvaluationPlan([rule], []);
+
+    // TypeScriptを迂回して、plan構築後に元ruleのtriggersを書き換える。
+    (rule.definition as unknown as { triggers: string[] }).triggers = ["daily"];
+
+    // 書き換え前のtrigger("vc_activity")で評価してもcompiled plan側は元のtriggersを
+    // 保持しているので評価される。逆に書き換え後の値("daily")では評価されないはず。
+    const vcResult = evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT, "vc_activity");
+    expect(vcResult.behavior.map((r) => r.titleKey)).toEqual([rule.definition.key]);
+
+    const dailyResult = evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT + 10, "daily");
+    expect(dailyResult.behavior).toEqual([]);
+  });
+
+  it("plan構築後に元behavior ruleのkeyを書き換えても、award/behaviorOwnershipCount分類は元のkeyのまま", () => {
+    const { db, store, bump } = setup();
+    bump.addOnce("m1", "alice", BASE);
+    const rule = behaviorRule("v2.test.provenance.key-a");
+    const meta = metaRule("v2.test.provenance.key-meta", (ctx) =>
+      ctx.snapshot.behaviorOwnershipCount >= 1 ? { matched: true, awardFacts: {} } : { matched: false },
+    );
+    const plan = defineTitleEvaluationPlan([rule], [meta]);
+
+    // plan構築後に元ruleのkeyを書き換える。
+    (rule.definition as { key: string }).key = "v2.test.provenance.key-hacked";
+
+    const result = evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT, "bump_success");
+    // 実際にawardされたtitleKeyはcanonical snapshot時点のkeyのまま（書き換え後の値ではない）。
+    expect(result.behavior[0]!.titleKey).toBe("v2.test.provenance.key-a");
+    expect(store.hasOwnership("alice", "v2.test.provenance.key-a")).toBe(true);
+    expect(store.hasOwnership("alice", "v2.test.provenance.key-hacked")).toBe(false);
+    // behaviorOwnershipCountの分類も元keyベースで機能し続ける（meta ruleがmatchしている）。
+    expect(result.meta[0]!.outcome).toBe("awarded");
+  });
+
+  it("plan構築後に元meta ruleのkey/lifecycleを書き換えても、compiled planのsemanticsは変化しない", () => {
+    const { db, store } = setup();
+    const meta = metaRule("v2.test.provenance.meta-key", () => ({ matched: true, awardFacts: {} }));
+    const plan = defineTitleEvaluationPlan([], [meta]);
+
+    (meta.definition as { key: string }).key = "v2.test.provenance.meta-key-hacked";
+    (meta.definition as { lifecycle: string }).lifecycle = "disabled";
+
+    const result = evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT, "daily");
+    // lifecycle書き換えが反映されていれば"skipped"になるはずだが、canonical snapshotは
+    // activeのままなので"awarded"になる。titleKeyも書き換え前のまま。
+    expect(result.meta[0]!.outcome).toBe("awarded");
+    expect(result.meta[0]!.titleKey).toBe("v2.test.provenance.meta-key");
+  });
+
+  it("plan構築後のmutationでbehavior/meta間のkey collisionを作ろうとしても、compiled planへは反映されない", () => {
+    const { db, store, bump } = setup();
+    bump.addOnce("m1", "alice", BASE);
+    const behavior = behaviorRule("v2.test.provenance.collision-a");
+    const meta = alwaysMatchMeta("v2.test.provenance.collision-b");
+    const plan = defineTitleEvaluationPlan([behavior], [meta]);
+
+    // plan構築後にbehavior側のkeyをmeta側と衝突させようとする。
+    (behavior.definition as { key: string }).key = "v2.test.provenance.collision-b";
+
+    const result = evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT, "bump_success");
+    // compiled planは構築時点のcanonical keyを保持しているため、衝突は起きず、
+    // 両方とも元のkeyのまま個別にawardされる。
+    expect(result.behavior[0]!.titleKey).toBe("v2.test.provenance.collision-a");
+    expect(result.meta[0]!.titleKey).toBe("v2.test.provenance.collision-b");
+    expect(store.hasOwnership("alice", "v2.test.provenance.collision-a")).toBe(true);
+    expect(store.hasOwnership("alice", "v2.test.provenance.collision-b")).toBe(true);
+  });
+});
+
+describe("closed edition same-second tie（PR #156 round 2レビュー §6、B2 same-second fail-closed契約の直接固定）", () => {
+  function twoMemberClosedFixtureForTie() {
+    const a = behaviorRule("v2.test.tie.a", { collectionDomainKey: "domain" });
+    const b = behaviorRule("v2.test.tie.b", { collectionDomainKey: "domain" });
+    const c = behaviorRule("v2.test.tie.c", { collectionDomainKey: "domain" });
+    const definitionsMap: ReadonlyMap<string, TitleDefinition> = new Map([
+      [a.definition.key, a.definition],
+      [b.definition.key, b.definition],
+      [c.definition.key, c.definition],
+    ]);
+    const edition: TitleCollectionEdition = {
+      editionKey: "tie-edition",
+      members: [
+        { titleKey: a.definition.key, collectionDomainKey: "domain", collectionCredit: true, fullClearRequired: true },
+        { titleKey: b.definition.key, collectionDomainKey: "domain", collectionCredit: true, fullClearRequired: true },
+        { titleKey: c.definition.key, collectionDomainKey: "domain", collectionCredit: true, fullClearRequired: false },
+      ],
+      milestones: { startedCollecting: 1, collectorHabit: 2, stillCollecting: 3, thousandMarks: { count: 3, domains: 1 }, almostComplete: { remaining: 1 } },
+    };
+    return { a, b, definitionsMap, edition };
+  }
+
+  it("Case A: close後の通常award、DB秒精度でawardedAt===closedAt・earnedAt=NULLはcreditしない（fail-closed）", () => {
+    const { db, store, setClock } = setup();
+    const { a, definitionsMap, edition } = twoMemberClosedFixtureForTie();
+
+    setClock(BASE + 500);
+    store.activateCollectionEdition(edition, definitionsMap, "admin");
+    setClock(BASE + 1000);
+    store.closeCollectionEdition("tie-edition", "admin");
+    const closedAt = store.collectionEdition("tie-edition")!.closedAt!;
+
+    // 同秒tie: awardedAt===closedAtちょうど。observedAtも同じ秒に揃える。
+    setClock(closedAt);
+    directAward(store, "alice", a.definition, closedAt, null);
+
+    const meta = metaRule("v2.test.tie.meta-a", (ctx) => {
+      const target = ctx.snapshot.collectionEditions.find((x) => x.editionKey === "tie-edition");
+      return (target?.progress.collectionOwnedCount ?? 0) > 0 ? { matched: true, awardFacts: {} } : { matched: false };
+    });
+    const plan = defineTitleEvaluationPlan([], [meta]);
+    setClock(closedAt + 50);
+    const result = evaluateUserPipeline(db, store, plan, "alice", closedAt + 50, "daily");
+    expect(result.meta[0]!.outcome).toBe("not_matched");
+  });
+
+  it("Case B: historical repairでearnedAt===closedAtちょうど（<ではない）もcreditしない（fail-closed）", () => {
+    const { db, store, setClock } = setup();
+    const { a, b, definitionsMap, edition } = twoMemberClosedFixtureForTie();
+
+    setClock(BASE + 500);
+    store.activateCollectionEdition(edition, definitionsMap, "admin");
+    setClock(BASE + 1000);
+    store.closeCollectionEdition("tie-edition", "admin");
+    const closedAt = store.collectionEdition("tie-edition")!.closedAt!;
+
+    // bはclose前に取得済み。
+    setClock(BASE + 600);
+    directAward(store, "bob", b.definition, BASE + 600, null);
+
+    // aはhistorical repairだが、earnedAtがclosedAtと"ちょうど同じ"（<closedAtではない）。
+    // resolveTitleScope()のeffectiveEnd制約(earnedAt<effectiveEnd)を満たすため、
+    // observedAtをclosedAtより後にしてearnedAt=closedAtを許容させる。
+    setClock(closedAt + 500);
+    directAward(store, "bob", a.definition, closedAt + 500, closedAt);
+
+    const meta = metaRule("v2.test.tie.meta-b", (ctx) => {
+      const target = ctx.snapshot.collectionEditions.find((x) => x.editionKey === "tie-edition");
+      return target?.progress.fullClearComplete === true ? { matched: true, awardFacts: {} } : { matched: false };
+    });
+    const plan = defineTitleEvaluationPlan([], [meta]);
+    setClock(closedAt + 600);
+    const result = evaluateUserPipeline(db, store, plan, "bob", closedAt + 600, "daily");
+    // bは所持済みだがaはsame-second tieでcreditされないため、fullClearは未完了のまま。
+    expect(result.meta[0]!.outcome).toBe("not_matched");
+  });
+});
+
+describe("Collection milestone snapshotの将来実装可能性（PR #156 round 2レビュー §7、§37）", () => {
+  const milestones = {
+    startedCollecting: 1,
+    collectorHabit: 5,
+    stillCollecting: 10,
+    thousandMarks: { count: 20, domains: 3 },
+    almostComplete: { remaining: 2 },
+  };
+
+  function editionSnapshot(progress: Partial<MetaCollectionEditionSnapshot["progress"]>): MetaCollectionEditionSnapshot {
+    return {
+      editionKey: "contract-edition",
+      state: "active",
+      milestones,
+      progress: {
+        collectionOwnedCount: 0,
+        collectionTotalCount: 25,
+        collectionOwnedDomainCount: 0,
+        collectionTotalDomainCount: 5,
+        fullClearOwnedCount: 0,
+        fullClearRequiredCount: 5,
+        fullClearRemainingCount: 5,
+        fullClearComplete: false,
+        ...progress,
+      },
+    };
+  }
+
+  /** 将来のcollection meta ruleが実装するであろう、snapshotだけを見た純粋な閾値判定。 */
+  function computeMilestoneFlags(edition: MetaCollectionEditionSnapshot) {
+    const m = edition.milestones;
+    const p = edition.progress;
+    return {
+      startedCollecting: p.collectionOwnedCount >= m.startedCollecting,
+      collectorHabit: p.collectionOwnedCount >= m.collectorHabit,
+      stillCollecting: p.collectionOwnedCount >= m.stillCollecting,
+      thousandMarks: p.collectionOwnedCount >= m.thousandMarks.count && p.collectionOwnedDomainCount >= m.thousandMarks.domains,
+      almostComplete: p.fullClearRemainingCount > 0 && p.fullClearRemainingCount <= m.almostComplete.remaining,
+      fullClear: p.fullClearComplete,
+    };
+  }
+
+  it("startedCollecting: ownedCount>=milestoneでtrue、未満でfalse", () => {
+    expect(computeMilestoneFlags(editionSnapshot({ collectionOwnedCount: 0 })).startedCollecting).toBe(false);
+    expect(computeMilestoneFlags(editionSnapshot({ collectionOwnedCount: 1 })).startedCollecting).toBe(true);
+  });
+
+  it("collectorHabit: ownedCount>=milestoneでtrue", () => {
+    expect(computeMilestoneFlags(editionSnapshot({ collectionOwnedCount: 4 })).collectorHabit).toBe(false);
+    expect(computeMilestoneFlags(editionSnapshot({ collectionOwnedCount: 5 })).collectorHabit).toBe(true);
+  });
+
+  it("stillCollecting: ownedCount>=milestoneでtrue", () => {
+    expect(computeMilestoneFlags(editionSnapshot({ collectionOwnedCount: 9 })).stillCollecting).toBe(false);
+    expect(computeMilestoneFlags(editionSnapshot({ collectionOwnedCount: 10 })).stillCollecting).toBe(true);
+  });
+
+  it("thousandMarks: ownedCountとownedDomainCountの両方を満たして初めてtrue（AND条件）", () => {
+    expect(
+      computeMilestoneFlags(editionSnapshot({ collectionOwnedCount: 20, collectionOwnedDomainCount: 2 })).thousandMarks,
+    ).toBe(false); // domain不足
+    expect(
+      computeMilestoneFlags(editionSnapshot({ collectionOwnedCount: 19, collectionOwnedDomainCount: 3 })).thousandMarks,
+    ).toBe(false); // count不足
+    expect(
+      computeMilestoneFlags(editionSnapshot({ collectionOwnedCount: 20, collectionOwnedDomainCount: 3 })).thousandMarks,
+    ).toBe(true);
+  });
+
+  it("almostComplete: remaining>0かつremaining<=milestoneでtrue（fullClear達成済みはfalseになるguard込み）", () => {
+    expect(computeMilestoneFlags(editionSnapshot({ fullClearRemainingCount: 2 })).almostComplete).toBe(true);
+    expect(computeMilestoneFlags(editionSnapshot({ fullClearRemainingCount: 3 })).almostComplete).toBe(false); // 閾値超過
+    expect(computeMilestoneFlags(editionSnapshot({ fullClearRemainingCount: 0 })).almostComplete).toBe(false); // 既にfull clear済み
+  });
+
+  it("fullClear: fullClearCompleteをそのまま使える", () => {
+    expect(computeMilestoneFlags(editionSnapshot({ fullClearComplete: false })).fullClear).toBe(false);
+    expect(computeMilestoneFlags(editionSnapshot({ fullClearComplete: true })).fullClear).toBe(true);
   });
 });
