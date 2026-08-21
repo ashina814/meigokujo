@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { defineBehaviorTitle, defineMetaTitle, type TitleDefinition, type TitleLifecycle } from "../src/titles/v2-contract.js";
-import { assertValidCollectionEdition, type TitleCollectionEdition } from "../src/titles/v2-collection.js";
+import {
+  assertCollectionEditionActivatable,
+  assertValidCollectionEdition,
+  type TitleCollectionEdition,
+} from "../src/titles/v2-collection.js";
 
 function behavior(key: `v2.${string}`, themeKey: string, lifecycle: TitleLifecycle = "active"): TitleDefinition {
   return defineBehaviorTitle({
@@ -190,34 +194,6 @@ describe("collection edition validation（§10）", () => {
     );
   });
 
-  it("fullClearRequired:trueのmemberがactiveでないとreject（最低限）", () => {
-    const a = behavior("v2.test.a", "theme-a", "retired");
-    const edition: TitleCollectionEdition = {
-      editionKey: "v1-edition",
-      members: [{ titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true }],
-      milestones: VALID_MILESTONES,
-    };
-    expect(() => assertValidCollectionEdition(edition, definitionsMap([a]))).toThrow(
-      /is not active \(lifecycle=retired\) but is collectionCredit\/fullClearRequired/,
-    );
-  });
-
-  it("collectionCreditのみのmemberでも、activeでなければreject（推奨要件）", () => {
-    const a = behavior("v2.test.a", "theme-a", "active"); // fullClearRequiredはこちらが担う
-    const b = behavior("v2.test.b", "theme-a", "disabled");
-    const edition: TitleCollectionEdition = {
-      editionKey: "v1-edition",
-      members: [
-        { titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true },
-        { titleKey: b.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: false },
-      ],
-      milestones: VALID_MILESTONES,
-    };
-    expect(() => assertValidCollectionEdition(edition, definitionsMap([a, b]))).toThrow(
-      /is not active \(lifecycle=disabled\) but is collectionCredit\/fullClearRequired/,
-    );
-  });
-
   it("milestone値の負数をreject", () => {
     const { defs, members } = fiveMemberFixture();
     const edition: TitleCollectionEdition = {
@@ -385,5 +361,75 @@ describe("collection edition validation（§10）", () => {
     expect(() => assertValidCollectionEdition(edition, definitionsMap(defs))).toThrow(
       /must be less than the full-clear required count/,
     );
+  });
+});
+
+describe("構造契約とactivation eligibilityの分離（historical repairとの整合性）", () => {
+  it("全member activeなら構造validation・activation validationの両方を通る", () => {
+    const { defs, members } = fiveMemberFixture();
+    const edition: TitleCollectionEdition = {
+      editionKey: "v1-edition",
+      members,
+      milestones: VALID_MILESTONES,
+    };
+    const map = definitionsMap(defs);
+    expect(() => assertValidCollectionEdition(edition, map)).not.toThrow();
+    expect(() => assertCollectionEditionActivatable(edition, map)).not.toThrow();
+  });
+
+  it("retired memberを含むeditionは構造validationは通るがactivation validationはreject（最低限）", () => {
+    // historical closed editionの想定: fullClearRequired titleが後日retiredになっても、
+    // edition自体のmanifestは書き換えない——構造としては引き続き有効（repairに使える）。
+    // milestone連鎖を成立させるためfiveMemberFixture()を使い、fullClearRequired:trueな
+    // memberの1つ（a）だけをretiredへ差し替える。
+    const { defs, members } = fiveMemberFixture();
+    const retiredDefs = defs.map((d) => (d.key === "v2.test.a" ? behavior("v2.test.a", "theme-a", "retired") : d));
+    const edition: TitleCollectionEdition = { editionKey: "v1-edition", members, milestones: VALID_MILESTONES };
+    const map = definitionsMap(retiredDefs);
+    expect(() => assertValidCollectionEdition(edition, map)).not.toThrow();
+    expect(() => assertCollectionEditionActivatable(edition, map)).toThrow(
+      /cannot activate — member .* is not active \(lifecycle=retired\)/,
+    );
+  });
+
+  it("disabled memberを含むeditionは構造validationは通るがactivation validationはreject（collectionCreditのみでも同様）", () => {
+    // cはcollectionCredit:trueのみ（fullClearRequired:false）——fullClearRequiredで
+    // なくてもlifecycleチェックが効くことを確認する。
+    const { defs, members } = fiveMemberFixture();
+    const disabledDefs = defs.map((d) => (d.key === "v2.test.c" ? behavior("v2.test.c", "theme-a", "disabled") : d));
+    const edition: TitleCollectionEdition = { editionKey: "v1-edition", members, milestones: VALID_MILESTONES };
+    const map = definitionsMap(disabledDefs);
+    expect(() => assertValidCollectionEdition(edition, map)).not.toThrow();
+    expect(() => assertCollectionEditionActivatable(edition, map)).toThrow(
+      /cannot activate — member .* is not active \(lifecycle=disabled\)/,
+    );
+  });
+
+  it("collectionCredit/fullClearRequiredが両方falseのmemberは構造validationの時点でreject（activationまで進まない）", () => {
+    const a = behavior("v2.test.a", "theme-a");
+    const b = behavior("v2.test.b", "theme-a");
+    const edition: TitleCollectionEdition = {
+      editionKey: "v1-edition",
+      members: [
+        { titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true },
+        { titleKey: b.key, themeKey: "theme-a", collectionCredit: false, fullClearRequired: false },
+      ],
+      milestones: VALID_MILESTONES,
+    };
+    const map = definitionsMap([a, b]);
+    expect(() => assertValidCollectionEdition(edition, map)).toThrow(/is neither collectionCredit nor fullClearRequired/);
+    expect(() => assertCollectionEditionActivatable(edition, map)).toThrow(/is neither collectionCredit nor fullClearRequired/);
+  });
+
+  it("meta titleのfail-closedチェックは構造validation側に残っている（activation eligibilityへ移していない）", () => {
+    const m = meta("v2.test.meta-a", "theme-a");
+    const edition: TitleCollectionEdition = {
+      editionKey: "v1-edition",
+      members: [{ titleKey: m.key, themeKey: "theme-a", collectionCredit: false, fullClearRequired: true }],
+      milestones: VALID_MILESTONES,
+    };
+    const map = definitionsMap([m]);
+    expect(() => assertValidCollectionEdition(edition, map)).toThrow(/meta title cannot be fullClearRequired/);
+    expect(() => assertCollectionEditionActivatable(edition, map)).toThrow(/meta title cannot be fullClearRequired/);
   });
 });

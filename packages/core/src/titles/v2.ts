@@ -100,6 +100,7 @@ export {
 } from "./v2-series.js";
 
 export {
+  assertCollectionEditionActivatable,
   assertValidCollectionEdition,
   type TitleCollectionEdition,
   type TitleCollectionMember,

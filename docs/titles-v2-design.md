@@ -261,14 +261,17 @@ Collection Editionはtitle catalogとは別概念。`TitleCollectionEdition`（`
 
 《千印万来》《万印皆伝》のようなmeta titleのsemanticは、絶対的な閾値をmeta title自身に持たせず「有効なcollection/full-clear editionのmilestone policyを満たしたか」とする——catalog規模が変われば新しいeditionを作ればよく、meta title自体のkeyや判定ロジックを変えなくて済む。
 
-`assertValidCollectionEdition()` が検証する内容:
+**collection editionもtitle catalogと同様immutable**——一度公開したら `members`/`milestones` を書き換えない。ある時点でrequired titleがretired/disabledになった場合でも、そのeditionが「当時は有効だった」という事実は変わらず、「当時editionをcomplete済みだったユーザー」を後から修復評価（historical repair）するには、そのeditionの構造そのものが引き続きvalidである必要がある。運用の想定手順は: (1) active editionのrequired/collection titleをretire/disableする必要が生じたら、まず**そのeditionをclose**する（このPRではclose自体の型・DBは作らない）、(2) old editionのmanifestは変更しない、(3) 次のeditionを新しいmember setで作る、(4) closed editionはhistorical repairのために保持し続ける。
 
-- member重複禁止・member titleの実在・themeKeyの一致
-- **meta titleはcollectionCredit/fullClearRequiredのどちらにもできない**（meta titleはcollection/full-clearの分母・分子どちらへも入らない——meta title自体が「有効なcollection editionを満たしたか」を判定する側であり、判定対象の一部を兼ねると自己参照的になるため）
-- **collectionCredit/fullClearRequiredの少なくとも一方がtrueなmemberは、definition.lifecycleが`"active"`でなければならない**——retired/disabledなtitleをfull-clear必須・collection対象にすると、誰にも取得不能な条件を黙って課すことになる
-- **collectionCredit:falseかつfullClearRequired:falseのmemberは禁止**（editionのmemberとして何の意味も持たない）
-- fullClearRequired memberが最低1件
-- milestone値はすべて非負整数
+この「immutableな構造」と「今から新規activateしてよいか」は別の関心事なので、検証関数を分離した。
+
+- `assertValidCollectionEdition()`: 時間が経っても変わらない**構造契約**だけを検証する（member titleのlifecycleは見ない——historical closed editionもこれは通り続ける）。
+  - member重複禁止・member titleの実在・themeKeyの一致
+  - **meta titleはcollectionCredit/fullClearRequiredのどちらにもできない**（meta titleはcollection/full-clearの分母・分子どちらへも入らない——meta title自体が「有効なcollection editionを満たしたか」を判定する側であり、判定対象の一部を兼ねると自己参照的になるため）
+  - **collectionCredit:falseかつfullClearRequired:falseのmemberは禁止**（editionのmemberとして何の意味も持たない）
+  - fullClearRequired memberが最低1件
+  - milestone値はすべて非負整数
+- `assertCollectionEditionActivatable()`: `assertValidCollectionEdition()` を先に通した上で、**「今このeditionを新規activateしてよいか」**を追加で検証する——collectionCredit/fullClearRequiredの少なくとも一方がtrueなmemberは、definition.lifecycleが現在`"active"`であることを要求する。historical closed editionはこの関数を通す必要は無い。
 - `countableCount`（collectionCredit:trueなmember数）・`countableThemes`（collectionCredit:trueなmemberのdistinct themeKey数——collectionCredit:falseのmemberのthemeは数えない）を基準に: `startedCollecting>=1`、`startedCollecting < collectorHabit < stillCollecting`、`stillCollecting <= thousandMarks.count <= countableCount`、`thousandMarks.themes>=1`、`thousandMarks.themes <= countableThemes`、`thousandMarks.themes <= thousandMarks.count`、`almostComplete.remaining>=1`、`almostComplete.remaining < fullClearCount`（full-clear必須総数）
 
 ### Rarity契約の最低限（PR A）

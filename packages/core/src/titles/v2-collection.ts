@@ -18,6 +18,34 @@ import { assertSlug, type TitleDefinition } from "./v2-contract.js";
  * 自身に持たせず「有効なcollection/full-clear editionのmilestone policyを満たしたか」
  * とする——catalog規模が変われば新しいeditionを作ればよく、meta title自体のkeyや
  * 判定ロジックを変えなくて済む。
+ *
+ * ## 構造契約とactivation eligibilityの分離
+ *
+ * `assertValidCollectionEdition()` は時間が経っても変わらない**構造契約**だけを見る
+ * （member重複・title実在・themeKey一致・meta除外・milestone整合性等）。member titleの
+ * `lifecycle`（現在activeかどうか）は構造契約に含めない——これはeditionのimmutable契約
+ * （下記）と衝突するため。
+ *
+ * `assertCollectionEditionActivatable()` が構造契約に加えて「今このeditionを新規
+ * activateしてよいか」（＝required titleが現在も取得可能か）を見る。historical repair
+ * （後述）のために閉じたeditionを保持し続ける場合、この関数はもう通らなくてよい
+ * ——構造としては最後まで有効なmanifestのままでよい。
+ *
+ * ## historical repairとの整合性（collection editionもimmutable）
+ *
+ * collection editionはtitle catalogと同様、一度公開したら**members・milestoneを
+ * 書き換えない**。ある時点でrequired titleがretired/disabledになった場合でも、
+ * そのeditionが「当時は有効だった」という事実は変わらない——後日「当時edition Aを
+ * complete済みだったユーザー」を修復評価（historical repair）するには、edition A
+ * の構造そのものが引き続きvalidである必要がある。
+ *
+ * 運用の想定手順:
+ * 1. active editionのrequired/collection titleをretire/disableする必要が生じたら、
+ *    まず**そのeditionをclose**する（このPRではclose自体の型・DBは作らない）。
+ * 2. old editionのmanifest（members/milestones）は変更しない。
+ * 3. 次のeditionを、新しいmember set（retireしたtitleを含まない）で作る。
+ * 4. closed editionはhistorical repairのために保持し続ける——`assertValidCollectionEdition()`
+ *    は通り続けるが、`assertCollectionEditionActivatable()` は通らなくなる（それでよい）。
  */
 export interface TitleCollectionMember {
   readonly titleKey: `v2.${string}`;
@@ -45,6 +73,10 @@ export interface TitleCollectionEdition {
 }
 
 /**
+ * editionの**構造契約**だけを検証する（時間が経っても変わらない不変条件）。
+ * member titleの現在lifecycleは見ない——historical closed editionもこの検証は通り
+ * 続ける（上のmodule doc comment「構造契約とactivation eligibilityの分離」参照）。
+ *
  * - member重複禁止
  * - member titleが実在する（allDefinitionsに含まれる）
  * - member.themeKeyがdefinition.themeKeyと一致する
@@ -53,9 +85,6 @@ export interface TitleCollectionEdition {
  *   「有効なcollection editionを満たしたか」を判定する側であり、判定対象の一部を
  *   兼ねると自己参照的になる）
  * - fullClearRequired titleが最低1件存在する
- * - collectionCredit/fullClearRequiredのどちらか一方でもtrueなmemberは、
- *   definition.lifecycleが"active"でなければならない（retired/disabledなtitleを
- *   full-clear必須・collection対象にすると、誰にも取得不能な条件を課すことになる）
  * - collectionCredit:falseかつfullClearRequired:falseのmemberは禁止
  *   （editionのmemberとして何の意味も持たない）
  *
@@ -120,17 +149,6 @@ export function assertValidCollectionEdition(
       );
     }
 
-    // 取得不能な状態（retired/disabled）のtitleをcollection/full-clear対象にすると、
-    // 誰にも満たせない条件を課すことになる。lifecycleが変わったら（例: retireした）
-    // edition側のmember構成も見直すべきで、黙って「達成不能なfull-clear」を
-    // 放置しない。
-    if (def.lifecycle !== "active") {
-      throw new Error(
-        `collection edition ${edition.editionKey}: member ${member.titleKey} is not active ` +
-          `(lifecycle=${def.lifecycle}) but is collectionCredit/fullClearRequired`,
-      );
-    }
-
     // collectionCredit:falseのmemberのthemeは、theme breadth集計の分母（countableThemes）
     // へ数えない——「集めた/集めていない」の対象にしていないtitleのthemeを、
     // 千印万来のtheme breadth判定に混ぜると、実質未対象のthemeで達成扱いになってしまう。
@@ -189,5 +207,35 @@ export function assertValidCollectionEdition(
     fail(
       `almostComplete.remaining (${m.almostComplete.remaining}) must be less than the full-clear required count (${fullClearCount})`,
     );
+  }
+}
+
+/**
+ * editionを**今から新規activateしてよいか**（構造契約 + 現在時点のactivation
+ * eligibility）を検証する。`assertValidCollectionEdition()` を先に通した上で、
+ * collectionCredit/fullClearRequiredなmemberが現在すべて `lifecycle:"active"` である
+ * ことを追加で要求する——retired/disabledなtitleを新規にfull-clear必須・collection
+ * 対象として運用開始すると、誰にも取得不能な条件を課すことになる。
+ *
+ * historical closed edition（過去のユーザーをrepairするためだけに保持するedition）は、
+ * この関数を通す必要は無い——`assertValidCollectionEdition()` だけが通り続けていれば
+ * 構造としては引き続き有効で、repair用途には十分（module doc comment参照）。
+ */
+export function assertCollectionEditionActivatable(
+  edition: TitleCollectionEdition,
+  allDefinitions: ReadonlyMap<string, TitleDefinition>,
+): void {
+  assertValidCollectionEdition(edition, allDefinitions);
+
+  for (const member of edition.members) {
+    if (!member.collectionCredit && !member.fullClearRequired) continue; // 構造validationで既に弾かれているはず
+    const def = allDefinitions.get(member.titleKey);
+    if (!def) throw new Error(`collection edition ${edition.editionKey}: member title not found: ${member.titleKey}`);
+    if (def.lifecycle !== "active") {
+      throw new Error(
+        `collection edition ${edition.editionKey}: cannot activate — member ${member.titleKey} is not active ` +
+          `(lifecycle=${def.lifecycle}) but is collectionCredit/fullClearRequired`,
+      );
+    }
   }
 }
