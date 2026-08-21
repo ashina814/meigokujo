@@ -58,6 +58,14 @@ export const VOICE_TIERS: readonly RankTier[] = Object.freeze([
 ]);
 
 /**
+ * `RankTitleKey`はDB永続identity（`rank_title_unlocks`/`profile_identity_equips`）
+ * になるため、prefix一致だけでなく**key全体**の形式をfail-fastで固定する。
+ * `rank.text.`（suffix空）・`rank.text.foo bar`（空白）・`rank.text.foo:bar`（コロン）
+ * のような、prefixだけなら通ってしまう不正な値をここで弾く。
+ */
+const RANK_TITLE_KEY_PATTERN = /^rank\.(text|voice)\.[a-z0-9][a-z0-9_-]*$/;
+
+/**
  * registry contractをfail-fastで検証する。モジュール読み込み時に一度だけ実行する
  * ——typoやarray順の事故を、実際にDBへ書き込まれる前にimport時点で検出する。
  *
@@ -73,14 +81,20 @@ export function assertRankTierRegistry(entries: ReadonlyArray<readonly [RankTrac
     if (tiers[0]!.minLevel !== 0) {
       throw new Error(`rank tier registry: ${track} track's first tier must have minLevel=0 (got ${tiers[0]!.minLevel})`);
     }
-    const expectedPrefix = `rank.${track}.`;
     let prevMinLevel = -1;
     for (const t of tiers) {
       if (t.track !== track) {
         throw new Error(`rank tier registry: tier ${t.key} declares track=${t.track}, expected ${track}`);
       }
-      if (!t.key.startsWith(expectedPrefix)) {
-        throw new Error(`rank tier registry: key ${t.key} must start with "${expectedPrefix}"`);
+      const match = RANK_TITLE_KEY_PATTERN.exec(t.key);
+      if (!match) {
+        throw new Error(
+          `rank tier registry: key ${JSON.stringify(t.key)} does not match the required format ` +
+            `(/^rank\\.(text|voice)\\.[a-z0-9][a-z0-9_-]*$/)`,
+        );
+      }
+      if (match[1] !== track) {
+        throw new Error(`rank tier registry: key ${t.key} belongs to track "${match[1]}", expected "${track}"`);
       }
       if (!Number.isInteger(t.minLevel) || t.minLevel < 0) {
         throw new Error(`rank tier registry: ${t.key} minLevel must be a non-negative integer (got ${t.minLevel})`);
@@ -177,4 +191,16 @@ export function tierFor(level: number, tiers: readonly RankTier[]): RankTier {
 export function nextTier(level: number, tiers: readonly RankTier[]): RankTier | null {
   for (const t of tiers) if (t.minLevel > level) return t;
   return null;
+}
+
+/**
+ * tierが変わったか（＝称号アップ通知を出すべきか）を判定する、testable helper。
+ * **必ず`key`（stable identity）で比較する——`name`では比較しない。**
+ * `RankEngine.awardText()`/`awardVoice()`はこのhelper経由でのみtierUpを判定する。
+ * 直接`before.tier.key !== after.tier.key`をinlineで書くと、将来誰かが
+ * `RankEngine`側だけを`name`比較へ書き換えてもcontract testが検知できない
+ * ——このhelperを切り出すことで「name比較へ戻すとtestが落ちる」を保証する。
+ */
+export function didRankTierChange(before: RankTier, after: RankTier): boolean {
+  return before.key !== after.key;
 }

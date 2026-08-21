@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import {
   TEXT_TIERS,
   VOICE_TIERS,
+  didRankTierChange,
   tierFor,
   textLevel,
   textProgress,
@@ -59,7 +60,7 @@ export class RankEngine {
       )
       .run(userId, newXp, ts, tierIndex(textLevel(newXp), TEXT_TIERS), ts);
     const after = this.snapshotText(newXp);
-    return { awarded: xp, before, after, tierUp: before.tier.key !== after.tier.key };
+    return { awarded: xp, before, after, tierUp: didRankTierChange(before.tier, after.tier) };
   }
 
   /** 単に発言回数だけ増やしたい場合（クールダウン中でも記録したいなら別途） */
@@ -116,7 +117,7 @@ export class RankEngine {
       )
       .run(userId, newXp, minutes, ts, tierIndex(voiceLevel(newXp), VOICE_TIERS), ts, minutes);
     const after = this.snapshotVoice(newXp);
-    return { awarded: xp, before, after, tierUp: before.tier.key !== after.tier.key };
+    return { awarded: xp, before, after, tierUp: didRankTierChange(before.tier, after.tier) };
   }
 
   getVoice(userId: string): {
@@ -205,5 +206,15 @@ function tierIndex(level: number, tiers: readonly RankTier[]): number {
   return idx;
 }
 
-export { TEXT_TIERS, VOICE_TIERS, textLevel, voiceLevel, textProgress, voiceProgress, tierFor, _nextTier as nextTier };
+export {
+  TEXT_TIERS,
+  VOICE_TIERS,
+  didRankTierChange,
+  textLevel,
+  voiceLevel,
+  textProgress,
+  voiceProgress,
+  tierFor,
+  _nextTier as nextTier,
+};
 export type { RankTier };

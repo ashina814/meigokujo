@@ -144,6 +144,7 @@ export {
   RankEngine,
   TEXT_TIERS,
   VOICE_TIERS,
+  didRankTierChange,
   textLevel,
   voiceLevel,
   textProgress,

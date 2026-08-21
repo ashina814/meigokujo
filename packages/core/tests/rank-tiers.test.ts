@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { openDb } from "../src/db/bootstrap.js";
 import {
   TEXT_TIERS,
   VOICE_TIERS,
   assertRankTierRegistry,
+  didRankTierChange,
   nextTier,
   rankTierByKey,
   rankTiersForTrack,
@@ -10,6 +12,7 @@ import {
   type RankTier,
   type RankTitleKey,
 } from "../src/rank/tiers.js";
+import { RankEngine } from "../src/rank/service.js";
 
 function fixtureTier(key: string, track: "text" | "voice", minLevel: number, name: string): RankTier {
   return { key: key as RankTitleKey, track, minLevel, name };
@@ -124,9 +127,33 @@ describe("rank tier registry validation（不正な入力への耐性、§5）",
     expect(() => assertRankTierRegistry([["text", bad]])).toThrow(/duplicate key/);
   });
 
-  it("wrong track prefixをreject", () => {
+  it("wrong track prefixをreject（keyの形式自体はvalidだがtrackが不一致）", () => {
     const bad = [fixtureTier("rank.voice.lv000", "text", 0, "a")];
-    expect(() => assertRankTierRegistry([["text", bad]])).toThrow(/must start with/);
+    expect(() => assertRankTierRegistry([["text", bad]])).toThrow(/belongs to track "voice", expected "text"/);
+  });
+
+  it("key全体の形式チェック（suffix空・空白・コロン等、prefixだけでは弾けない不正値）をreject", () => {
+    // "rank.text."（suffix空）
+    expect(() => assertRankTierRegistry([["text", [fixtureTier("rank.text.", "text", 0, "a")]]])).toThrow(
+      /does not match the required format/,
+    );
+    // 空白を含む
+    expect(() =>
+      assertRankTierRegistry([["text", [fixtureTier("rank.text.foo bar", "text", 0, "a")]]]),
+    ).toThrow(/does not match the required format/);
+    // コロンを含む
+    expect(() =>
+      assertRankTierRegistry([["text", [fixtureTier("rank.text.foo:bar", "text", 0, "a")]]]),
+    ).toThrow(/does not match the required format/);
+  });
+
+  it("現在の18 literal keysは全部このvalidatorをpassする（実運用registryそのものが既にmodule loadで検証済みだが、明示的にも確認）", () => {
+    expect(() =>
+      assertRankTierRegistry([
+        ["text", TEXT_TIERS],
+        ["voice", VOICE_TIERS],
+      ]),
+    ).not.toThrow();
   });
 
   // 「keyは全track横断でunique」の裏付け: 各keyは自分のtrackのprefix（"rank.text."/
@@ -175,5 +202,33 @@ describe("rank tier registry validation（不正な入力への耐性、§5）",
     // 別tierとして区別できる。
     expect(fixtureA.name).toBe(fixtureB.name);
     expect(fixtureA.key).not.toBe(fixtureB.key);
+  });
+});
+
+describe("didRankTierChange()（実装経路のtestable helper、round 2レビュー対応）", () => {
+  it("同じname・別keyならtrue（name比較へ戻すとこのtestが落ちる契約）", () => {
+    const before = fixtureTier("rank.text.lv900", "text", 900, "同名テスト");
+    const after = fixtureTier("rank.text.lv901", "text", 901, "同名テスト");
+    expect(didRankTierChange(before, after)).toBe(true);
+  });
+
+  it("別name・同じkey相当のfixtureならfalse", () => {
+    const before = fixtureTier("rank.text.lv005", "text", 5, "旧名義");
+    const after = fixtureTier("rank.text.lv005", "text", 5, "新名義（typo修正等を想定）");
+    expect(didRankTierChange(before, after)).toBe(false);
+  });
+
+  it("同一tier（同じobject）ならfalse", () => {
+    const t = TEXT_TIERS[0]!;
+    expect(didRankTierChange(t, t)).toBe(false);
+  });
+
+  it("実際のRankEngine.awardText()経由でもkeyベースのtierUpが機能する（実装経路の直接確認）", () => {
+    const db = openDb(":memory:");
+    const engine = new RankEngine(db);
+    // Lv0→Lv5相当のXPを一気に付与してtierUpさせる。
+    const result = engine.awardText("alice", 1000, 0);
+    expect(result?.tierUp).toBe(true);
+    expect(result?.before.tier.key).not.toBe(result?.after.tier.key);
   });
 });
