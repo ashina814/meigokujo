@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { BumpCounter } from "../src/rank/bump.js";
-import { TITLE_SOURCES, TITLE_TIME_ZONE, defineTitle } from "../src/titles/v2-contract.js";
+import { TITLE_SOURCES, TITLE_TIME_ZONE, defineBehaviorTitle } from "../src/titles/v2-contract.js";
 import { TitleV2Store } from "../src/titles/v2-store.js";
 import { VcTracker } from "../src/vc/service.js";
 
@@ -235,41 +235,47 @@ describe("称号v2 foundation", () => {
     expect(TITLE_SOURCES.bump_counts.epochPolicy).toEqual({ type: "baseline", metrics: ["count"] });
   });
 
-  it("定義guardはv2名前空間・登録source・隠し完遂除外を守る", () => {
+  it("定義guardはv2名前空間・登録sourceを守る", () => {
     expect(TITLE_TIME_ZONE).toBe("Asia/Tokyo");
     // vc_segments・vc_visits はどちらもtitleUsable:falseのraw/中間source。
     // vc_visitsのstartedAtはstate_changeの孤立観測を含み得るため「入室」を主張できない。
     // 個々の称号は安全に畳み込まれた derived source（vc_social_safe 等）を使う。
     expect(
-      defineTitle({
+      defineBehaviorTitle({
+        kind: "behavior",
         key: "v2.sample",
         catalog: "v1",
         name: "サンプル",
         emoji: "🕯",
         description: "テスト",
         sources: ["vc_social_safe"],
-        trigger: "vc_leave",
+        triggers: ["vc_activity"],
         lifecycle: "active",
         hidden: false,
-        countsForCompletion: true,
         publicAnnounce: false,
+        themeKey: "sample",
+        groupKey: "sample",
+        scope: { type: "global" },
       }).key,
     ).toBe("v2.sample");
 
     expect(() =>
-      defineTitle({
-        key: "v2.secret",
+      defineBehaviorTitle({
+        kind: "behavior",
+        key: "v1.legacy" as never,
         catalog: "v1",
-        name: "???",
+        name: "旧key",
         emoji: "🔒",
-        description: "hidden",
+        description: "v2以外の名前空間",
         sources: ["vc_social_safe"],
-        trigger: "vc_leave",
+        triggers: ["vc_activity"],
         lifecycle: "active",
-        hidden: true,
-        countsForCompletion: true,
+        hidden: false,
         publicAnnounce: false,
+        themeKey: "sample",
+        groupKey: "sample",
+        scope: { type: "global" },
       }),
-    ).toThrow(/hidden titles cannot count/);
+    ).toThrow(/v2\.\* namespace/);
   });
 });

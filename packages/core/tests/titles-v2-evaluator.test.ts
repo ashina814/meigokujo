@@ -9,25 +9,21 @@ import {
   evaluateUser,
   type TitleRule,
 } from "../src/titles/v2-evaluator.js";
-import {
-  assertSourceReaderCoverage,
-  readTitleSource,
-  type TitleEvaluationScope,
-} from "../src/titles/v2-sources.js";
+import { assertSourceReaderCoverage, readTitleSource } from "../src/titles/v2-sources.js";
+import { resolveTitleScope, type TitleEventScopeProvider } from "../src/titles/v2-scope.js";
 import { TitleV2Store } from "../src/titles/v2-store.js";
 
 /** JST 2026-08-20 00:00:00 を秒0とする、テスト用の基準時刻。 */
 const BASE = Math.floor(Date.UTC(2026, 7, 19, 15, 0, 0) / 1000);
+const OBSERVED_AT = BASE + 1000;
 
-// derived.ts経由のVC sourceはobservedAt省略時にDate.now()を見る。BASEに近いwindowを
-// 使うテストが実行タイミングでflakeにならないよう、十分先へ固定する。
+// derived.ts経由のVC sourceはobservedAt省略時にDate.now()を見る（今回は明示的に渡すため
+// 直接は関係ないが、他のtitles-v2系テストとの一貫性のため固定しておく）。
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date((BASE + 500_000) * 1000));
 });
 afterEach(() => vi.useRealTimers());
-
-const scope: TitleEvaluationScope = { scopeKey: "test-scope", start: BASE, end: BASE + 1000, observedAt: BASE + 1000 };
 
 function setup() {
   const db = openDb(":memory:");
@@ -35,7 +31,17 @@ function setup() {
   // 主DDLには含まれない）。BumpCounterを直接使わないテストでもsource readerがこの表を
   // 読むため、setup()の時点で必ず存在させておく。
   new BumpCounter(db);
-  const store = new TitleV2Store(db);
+  // clockは可変にする: catalog施行時（SYSTEM_EPOCH/catalog epochになる）はテストデータ
+  // より十分前、施行後（award()のawardedAtに使われる）はテストで使うearnedAtより
+  // 十分後へ進める。固定clockだと「earnedAtがawardedAtより未来」でstore.award()自体が
+  // 落ちてしまう（BASEを起点にearnedAtを組み立てるfixtureが多いため）。
+  let clock = BASE - 100_000;
+  const store = new TitleV2Store(db, () => clock);
+  // scope:{type:"global"}はSYSTEM_EPOCHを、scope:{type:"catalog"|"month"|"event"}は
+  // catalog "test"のepochを要求する。resolveTitleScope()はfail-closedなので、
+  // evaluateTitle系のテストは先にcatalogを施行しておく。
+  store.applyCatalog({ catalogKey: "test", actor: "test-setup" });
+  clock = BASE + 10_000_000;
   return { db, store };
 }
 
@@ -58,20 +64,27 @@ function insertVcSegment(
 // テスト用fixture rule（production keyとして使わない。必ず v2.test.* 名前空間）
 // ─────────────────────────────────────────────────────────────
 
+const COMMON_FIXTURE_FIELDS = {
+  catalog: "test",
+  emoji: "x",
+  hidden: false,
+  publicAnnounce: false,
+  themeKey: "test-theme",
+  groupKey: "test-group",
+  scope: { type: "global" as const },
+};
+
 /** orderable:trueなbump_eventsだけを使う。3回目のBUMPの実時刻を正確にearnedAtとして返す。 */
 const THIRD_BUMP_RULE = defineTitleRule(
   {
+    kind: "behavior",
     key: "v2.test.third-bump",
-    catalog: "test",
     name: "test: 3rd bump",
-    emoji: "x",
     description: "テスト用fixture",
     sources: ["bump_events"] as const,
-    trigger: "bump_success",
+    triggers: ["bump_success"],
     lifecycle: "active",
-    hidden: false,
-    countsForCompletion: false,
-    publicAnnounce: false,
+    ...COMMON_FIXTURE_FIELDS,
   },
   (ctx) => {
     const events = ctx.sources.bump_events.events;
@@ -83,34 +96,28 @@ const THIRD_BUMP_RULE = defineTitleRule(
 /** 常にmatchedになるだけの最小fixture（award flowのテスト用）。 */
 const ALWAYS_MATCH_RULE = defineTitleRule(
   {
+    kind: "behavior",
     key: "v2.test.always-match",
-    catalog: "test",
     name: "test: always match",
-    emoji: "x",
     description: "テスト用fixture",
     sources: ["bump_events"] as const,
-    trigger: "bump_success",
+    triggers: ["bump_success"],
     lifecycle: "active",
-    hidden: false,
-    countsForCompletion: false,
-    publicAnnounce: false,
+    ...COMMON_FIXTURE_FIELDS,
   },
   () => ({ matched: true, earnedAt: null }),
 );
 
 const DISABLED_RULE = defineTitleRule(
   {
+    kind: "behavior",
     key: "v2.test.disabled",
-    catalog: "test",
     name: "test: disabled",
-    emoji: "x",
     description: "テスト用fixture",
     sources: ["bump_events"] as const,
-    trigger: "bump_success",
+    triggers: ["bump_success"],
     lifecycle: "disabled",
-    hidden: false,
-    countsForCompletion: false,
-    publicAnnounce: false,
+    ...COMMON_FIXTURE_FIELDS,
   },
   () => {
     throw new Error("disabled titleのevaluate()は呼ばれてはいけない");
@@ -119,17 +126,14 @@ const DISABLED_RULE = defineTitleRule(
 
 const RETIRED_RULE = defineTitleRule(
   {
+    kind: "behavior",
     key: "v2.test.retired",
-    catalog: "test",
     name: "test: retired",
-    emoji: "x",
     description: "テスト用fixture",
     sources: ["bump_events"] as const,
-    trigger: "bump_success",
+    triggers: ["bump_success"],
     lifecycle: "retired",
-    hidden: false,
-    countsForCompletion: false,
-    publicAnnounce: false,
+    ...COMMON_FIXTURE_FIELDS,
   },
   () => ({ matched: true, earnedAt: null }),
 );
@@ -137,17 +141,14 @@ const RETIRED_RULE = defineTitleRule(
 /** orderable:falseなVC sourceからearnedAtを主張しようとする、わざと壊れたfixture。 */
 const BAD_VC_EARNED_AT_RULE = defineTitleRule(
   {
+    kind: "behavior",
     key: "v2.test.bad-vc-earned-at",
-    catalog: "test",
     name: "test: bad earnedAt",
-    emoji: "x",
     description: "テスト用fixture",
     sources: ["vc_empty_start_then_joined"] as const,
-    trigger: "vc_leave",
+    triggers: ["vc_activity"],
     lifecycle: "active",
-    hidden: false,
-    countsForCompletion: false,
-    publicAnnounce: false,
+    ...COMMON_FIXTURE_FIELDS,
   },
   (ctx) => {
     const fact = ctx.sources.vc_empty_start_then_joined.facts[0];
@@ -158,17 +159,14 @@ const BAD_VC_EARNED_AT_RULE = defineTitleRule(
 
 const VC_EMPTY_START_RULE = defineTitleRule(
   {
+    kind: "behavior",
     key: "v2.test.empty-start",
-    catalog: "test",
     name: "test: empty start",
-    emoji: "x",
     description: "テスト用fixture",
     sources: ["vc_empty_start_then_joined"] as const,
-    trigger: "vc_leave",
+    triggers: ["vc_activity"],
     lifecycle: "active",
-    hidden: false,
-    countsForCompletion: false,
-    publicAnnounce: false,
+    ...COMMON_FIXTURE_FIELDS,
   },
   (ctx) => ({
     matched: ctx.sources.vc_empty_start_then_joined.facts.length > 0,
@@ -178,40 +176,66 @@ const VC_EMPTY_START_RULE = defineTitleRule(
 
 const SOCIAL_SAFE_RULE = defineTitleRule(
   {
+    kind: "behavior",
     key: "v2.test.social-safe",
-    catalog: "test",
     name: "test: social safe",
-    emoji: "x",
     description: "テスト用fixture",
     sources: ["vc_social_safe"] as const,
-    trigger: "vc_leave",
+    triggers: ["vc_activity"],
     lifecycle: "active",
-    hidden: false,
-    countsForCompletion: false,
-    publicAnnounce: false,
+    ...COMMON_FIXTURE_FIELDS,
   },
   (ctx) => ({
     matched: ctx.sources.vc_social_safe.distinctCoPresentUsers > 0,
     earnedAt: null,
-    publicFacts: { ...ctx.sources.vc_social_safe },
+    awardFacts: { ...ctx.sources.vc_social_safe },
   }),
 );
 
 const GROUP_SIZE_RULE = defineTitleRule(
   {
+    kind: "behavior",
     key: "v2.test.group-size",
-    catalog: "test",
     name: "test: group size",
-    emoji: "x",
     description: "テスト用fixture",
     sources: ["vc_group_size_seconds"] as const,
-    trigger: "vc_leave",
+    triggers: ["vc_activity"],
     lifecycle: "active",
-    hidden: false,
-    countsForCompletion: false,
-    publicAnnounce: false,
+    ...COMMON_FIXTURE_FIELDS,
   },
-  (ctx) => ({ matched: true, earnedAt: null, publicFacts: { ...ctx.sources.vc_group_size_seconds } }),
+  (ctx) => ({ matched: true, earnedAt: null, awardFacts: { ...ctx.sources.vc_group_size_seconds } }),
+);
+
+/** scope:{type:"month"}のrule。異なる月にobservedAtを渡すと別scopeKeyになることの確認用。 */
+const MONTHLY_RULE = defineTitleRule(
+  {
+    kind: "behavior",
+    key: "v2.test.monthly",
+    name: "test: monthly",
+    description: "テスト用fixture",
+    sources: ["bump_events"] as const,
+    triggers: ["bump_success"],
+    lifecycle: "active",
+    ...COMMON_FIXTURE_FIELDS,
+    scope: { type: "month" },
+  },
+  () => ({ matched: true, earnedAt: null }),
+);
+
+/** scope:{type:"event"}のrule。TitleEventScopeProviderが無いと解決できないことの確認用。 */
+const EVENT_RULE = defineTitleRule(
+  {
+    kind: "behavior",
+    key: "v2.test.event",
+    name: "test: event",
+    description: "テスト用fixture",
+    sources: ["bump_events"] as const,
+    triggers: ["event_completed"],
+    lifecycle: "active",
+    ...COMMON_FIXTURE_FIELDS,
+    scope: { type: "event", eventKey: "test-event" },
+  },
+  () => ({ matched: true, earnedAt: null }),
 );
 
 // ─────────────────────────────────────────────────────────────
@@ -230,22 +254,26 @@ describe("source reader completeness（§4, §8）", () => {
   });
 
   it("vc_segmentsをruleから読めない", () => {
-    const { db } = setup();
+    const { db, store } = setup();
+    const scope = resolveTitleScope(store, THIRD_BUMP_RULE.definition, OBSERVED_AT);
     expect(() => readTitleSource(db, "vc_segments" as never, "alice", scope)).toThrow(/not usable by titles/);
   });
 
   it("vc_visitsをruleから読めない", () => {
-    const { db } = setup();
+    const { db, store } = setup();
+    const scope = resolveTitleScope(store, THIRD_BUMP_RULE.definition, OBSERVED_AT);
     expect(() => readTitleSource(db, "vc_visits" as never, "alice", scope)).toThrow(/not usable by titles/);
   });
 
   it("vc_co_presenceをruleから読めない", () => {
-    const { db } = setup();
+    const { db, store } = setup();
+    const scope = resolveTitleScope(store, THIRD_BUMP_RULE.definition, OBSERVED_AT);
     expect(() => readTitleSource(db, "vc_co_presence" as never, "alice", scope)).toThrow(/not usable by titles/);
   });
 
   it("bump_countsをruleから読めない", () => {
-    const { db } = setup();
+    const { db, store } = setup();
+    const scope = resolveTitleScope(store, THIRD_BUMP_RULE.definition, OBSERVED_AT);
     expect(() => readTitleSource(db, "bump_counts" as never, "alice", scope)).toThrow(/not usable by titles/);
   });
 
@@ -253,21 +281,18 @@ describe("source reader completeness（§4, §8）", () => {
     const { db, store } = setup();
     const badRule: TitleRule<never> = {
       definition: {
+        kind: "behavior",
         key: "v2.test.bad-source",
-        catalog: "test",
         name: "bad",
-        emoji: "x",
         description: "raw sourceへ直接アクセスしようとする壊れたrule",
         sources: ["vc_segments"] as never,
-        trigger: "vc_leave",
+        triggers: ["vc_activity"],
         lifecycle: "active",
-        hidden: false,
-        countsForCompletion: false,
-        publicAnnounce: false,
+        ...COMMON_FIXTURE_FIELDS,
       },
       evaluate: () => ({ matched: true, earnedAt: null }),
     };
-    expect(() => evaluateTitle(db, store, badRule, "alice", scope)).toThrow(/not usable by titles/);
+    expect(() => evaluateTitle(db, store, badRule, "alice", OBSERVED_AT)).toThrow(/not usable by titles/);
   });
 
   it("ruleが宣言していないsourceへアクセスできない（contextに存在しない）", () => {
@@ -278,17 +303,14 @@ describe("source reader completeness（§4, §8）", () => {
     let observedUndeclared: unknown = "not-checked";
     const rule = defineTitleRule(
       {
+        kind: "behavior",
         key: "v2.test.undeclared-access",
-        catalog: "test",
         name: "test",
-        emoji: "x",
         description: "テスト用fixture",
         sources: ["bump_events"] as const,
-        trigger: "bump_success",
+        triggers: ["bump_success"],
         lifecycle: "active",
-        hidden: false,
-        countsForCompletion: false,
-        publicAnnounce: false,
+        ...COMMON_FIXTURE_FIELDS,
       },
       (ctx) => {
         // vc_social_safeは宣言していないので、contextに実体として存在しないはず
@@ -297,33 +319,30 @@ describe("source reader completeness（§4, §8）", () => {
       },
     );
 
-    evaluateTitle(db, store, rule, "alice", scope);
+    evaluateTitle(db, store, rule, "alice", OBSERVED_AT);
     expect(observedUndeclared).toBeUndefined();
   });
 
   it("defineTitleRule()を迂回して手で組み立てたsources:[]のruleはevaluateTitle()でreject", () => {
     const { db, store } = setup();
-    // defineTitleRule()を通さず直接TitleRuleを組み立てる。sources:[]はdefineTitle()なら
-    // 「at least one source is required」で拒否されるが、evaluateTitleが再検証しないと
+    // defineTitleRule()を通さず直接TitleRuleを組み立てる。sources:[]はdefineBehaviorTitle()
+    // なら「at least one source is required」で拒否されるが、evaluateTitleが再検証しないと
     // 「何も読まずに任意のearnedAtでaward」まで通ってしまう。
     const forgedRule: TitleRule<never> = {
       definition: {
+        kind: "behavior",
         key: "v2.test.forged",
-        catalog: "test",
         name: "forged",
-        emoji: "x",
         description: "source contractを迂回しようとする壊れたrule",
         sources: [] as never,
-        trigger: "daily",
+        triggers: ["daily"],
         lifecycle: "active",
-        hidden: false,
-        countsForCompletion: false,
-        publicAnnounce: false,
+        ...COMMON_FIXTURE_FIELDS,
       },
       evaluate: () => ({ matched: true, earnedAt: BASE }),
     };
 
-    expect(() => evaluateTitle(db, store, forgedRule, "alice", scope)).toThrow(/at least one source/);
+    expect(() => evaluateTitle(db, store, forgedRule, "alice", OBSERVED_AT)).toThrow(/at least one source/);
     expect(store.listAwards("alice")).toEqual([]);
   });
 
@@ -331,83 +350,85 @@ describe("source reader completeness（§4, §8）", () => {
     const { db, store } = setup();
     const rule = defineTitleRule(
       {
+        kind: "behavior",
         key: "v2.test.tampered",
-        catalog: "test",
         name: "tampered",
-        emoji: "x",
         description: "テスト用fixture",
         sources: ["bump_events"] as const,
-        trigger: "bump_success",
+        triggers: ["bump_success"],
         lifecycle: "active",
-        hidden: false,
-        countsForCompletion: false,
-        publicAnnounce: false,
+        ...COMMON_FIXTURE_FIELDS,
       },
       () => ({ matched: true, earnedAt: BASE }),
     );
     // construction後にdefinitionを直接書き換える（TypeScriptのreadonlyはruntimeを守らない）
     (rule.definition as { sources: unknown }).sources = [];
 
-    expect(() => evaluateTitle(db, store, rule, "alice", scope)).toThrow(/at least one source/);
+    expect(() => evaluateTitle(db, store, rule, "alice", OBSERVED_AT)).toThrow(/at least one source/);
     expect(store.listAwards("alice")).toEqual([]);
   });
 });
 
 describe("bump_events reader（§15）", () => {
-  it("[start, end) を守る", () => {
-    const { db } = setup();
+  it("event scopeのendExclusive(completedAt)を守る（observedAtより先の未来ではなく、windowそのものの終端で切る）", () => {
+    const { db, store } = setup();
     const bump = new BumpCounter(db);
-    bump.addOnce("m1", "alice", BASE - 10); // windowの外
-    bump.addOnce("m2", "alice", BASE); // inclusive start
-    bump.addOnce("m3", "alice", BASE + 50);
-    bump.addOnce("m4", "alice", BASE + 100); // exclusive end → 含まない
+    // global/catalog/monthはobservedAtより先を見ない設計上、必ずeffectiveEnd===observedAt
+    // になる（月の途中で評価する限りmonthのendExclusiveより先は見えない）。「window自体の
+    // 終端がobservedAtより手前にある」ケースを再現できるのはeventだけ——canonical
+    // completedAtは、ずっと後になってから評価してもそこで固定されたまま動かない。
+    const eventStart = BASE;
+    const eventEnd = BASE + 100;
+    bump.addOnce("m1", "alice", eventStart - 10); // イベント開始前 → windowの外
+    bump.addOnce("m2", "alice", eventStart); // inclusive start
+    bump.addOnce("m3", "alice", eventStart + 50);
+    bump.addOnce("m4", "alice", eventEnd); // exclusive end → 含まない
 
-    const payload = readTitleSource(db, "bump_events", "alice", { ...scope, start: BASE, end: BASE + 100 });
-    expect(payload.events).toEqual([BASE, BASE + 50]);
+    const provider: TitleEventScopeProvider = {
+      resolveEvent: () => ({ start: eventStart, completedAt: eventEnd }),
+    };
+    // イベント終了のずっと後に評価しても、windowはcompletedAtで打ち切られる。
+    const scope = resolveTitleScope(store, EVENT_RULE.definition, eventEnd + 10_000, provider);
+    const payload = readTitleSource(db, "bump_events", "alice", scope);
+    expect(payload.events).toEqual([eventStart, eventStart + 50]);
   });
 
   it("created_at ASC の順で返す", () => {
-    const { db } = setup();
+    const { db, store } = setup();
     const bump = new BumpCounter(db);
     // 挿入順をわざと逆にする
     bump.addOnce("m3", "alice", BASE + 20);
     bump.addOnce("m1", "alice", BASE);
     bump.addOnce("m2", "alice", BASE + 10);
 
+    const scope = resolveTitleScope(store, THIRD_BUMP_RULE.definition, OBSERVED_AT);
     const payload = readTitleSource(db, "bump_events", "alice", scope);
     expect(payload.events).toEqual([BASE, BASE + 10, BASE + 20]);
   });
 
   it("observedAtより後のBUMPは読まない（VC readerと同じ時間軸に揃える）", () => {
-    const { db } = setup();
+    const { db, store } = setup();
     const bump = new BumpCounter(db);
     bump.addOnce("m1", "alice", BASE + 20);
     bump.addOnce("m2", "alice", BASE + 80); // observedAtより後
 
-    const payload = readTitleSource(db, "bump_events", "alice", {
-      scopeKey: "s",
-      start: BASE,
-      end: BASE + 1000,
-      observedAt: BASE + 50,
-    });
+    // global scopeはopen-ended（endExclusive=null）なので、effectiveEndは常にobservedAt。
+    const scope = resolveTitleScope(store, THIRD_BUMP_RULE.definition, BASE + 50);
+    const payload = readTitleSource(db, "bump_events", "alice", scope);
     expect(payload.events).toEqual([BASE + 20]);
   });
 });
 
 describe("VC source reader はPR2 observedAt契約をそのまま使う（§16, §18）", () => {
   it("observedAtをPR2 APIへ渡し、まだ観測していない未来分を計上しない", () => {
-    const { db } = setup();
+    const { db, store } = setup();
     // aliceは開いたまま（未クローズ）。observedAt=BASE+50でしか観測していない。
     insertVcSegment(db, "alice", "vc1", BASE, null, null, "join");
 
-    const payload = readTitleSource(db, "vc_group_size_seconds", "alice", {
-      scopeKey: "s",
-      start: BASE,
-      end: BASE + 1000,
-      observedAt: BASE + 50,
-    });
+    const scope = resolveTitleScope(store, GROUP_SIZE_RULE.definition, BASE + 50);
+    const payload = readTitleSource(db, "vc_group_size_seconds", "alice", scope);
     const total = Object.values(payload.trustedSecondsByBucket).reduce((a, b) => a + b, 0);
-    expect(total).toBe(50); // window.end(+1000)ではなくobservedAt(+50)で打ち切られる
+    expect(total).toBe(50); // globalのendExclusive(null)ではなくobservedAt(+50)で打ち切られる
     expect(payload.untrustedSeconds).toBe(0);
   });
 });
@@ -423,7 +444,7 @@ describe("source cache（§9）", () => {
     const prepareSpy = vi.spyOn(db, "prepare");
     const countBefore = prepareSpy.mock.calls.filter((c) => String(c[0]).includes("FROM bump_events")).length;
 
-    evaluateUser(db, store, [THIRD_BUMP_RULE, ALWAYS_MATCH_RULE], "alice", scope);
+    evaluateUser(db, store, [THIRD_BUMP_RULE, ALWAYS_MATCH_RULE], "alice", OBSERVED_AT);
 
     const countAfter = prepareSpy.mock.calls.filter((c) => String(c[0]).includes("FROM bump_events")).length;
     expect(countAfter - countBefore).toBe(1);
@@ -438,7 +459,7 @@ describe("source cache（§9）", () => {
     const prepareSpy = vi.spyOn(db, "prepare");
     const countBefore = prepareSpy.mock.calls.filter((c) => String(c[0]).includes("FROM bump_events")).length;
 
-    evaluateBatch(db, store, [THIRD_BUMP_RULE, ALWAYS_MATCH_RULE], ["alice", "bob"], scope);
+    evaluateBatch(db, store, [THIRD_BUMP_RULE, ALWAYS_MATCH_RULE], ["alice", "bob"], OBSERVED_AT);
 
     const countAfter = prepareSpy.mock.calls.filter((c) => String(c[0]).includes("FROM bump_events")).length;
     // alice分1回 + bob分1回 = 2回（2 rule × 2 userでも4回にはならない）
@@ -449,7 +470,7 @@ describe("source cache（§9）", () => {
 describe("award flow（§12）", () => {
   it("matched=false → award無し", () => {
     const { db, store } = setup();
-    const result = evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", scope);
+    const result = evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
     expect(result.outcome).toBe("not_matched");
     expect(store.listAwards("alice")).toEqual([]);
   });
@@ -461,7 +482,7 @@ describe("award flow（§12）", () => {
     bump.addOnce("m2", "alice", BASE + 10);
     bump.addOnce("m3", "alice", BASE + 20);
 
-    const result = evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", scope);
+    const result = evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
     expect(result.outcome).toBe("awarded");
     expect(store.listAwards("alice")).toHaveLength(1);
   });
@@ -473,8 +494,8 @@ describe("award flow（§12）", () => {
     bump.addOnce("m2", "alice", BASE + 10);
     bump.addOnce("m3", "alice", BASE + 20);
 
-    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", scope);
-    const second = evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", scope);
+    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
+    const second = evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
     expect(second.outcome).toBe("already_awarded");
     expect(store.listAwards("alice")).toHaveLength(1);
   });
@@ -486,28 +507,30 @@ describe("award flow（§12）", () => {
     bump.addOnce("m2", "alice", BASE + 10);
     bump.addOnce("m3", "alice", BASE + 20);
 
-    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", scope);
+    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
     const before = store.listAwards("alice")[0];
-    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", scope);
+    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
     const after = store.listAwards("alice")[0];
     expect(after).toEqual(before);
   });
 
-  it("scopeKey違いなら別award可能", () => {
+  it("scopeKey違い（月をまたぐ）なら別award可能", () => {
     const { db, store } = setup();
     const bump = new BumpCounter(db);
     bump.addOnce("m1", "alice", BASE);
-    bump.addOnce("m2", "alice", BASE + 10);
-    bump.addOnce("m3", "alice", BASE + 20);
 
-    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", scope);
-    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", { ...scope, scopeKey: "other-scope" });
+    const augObservedAt = Math.floor(new Date("2026-08-15T00:00:00+09:00").getTime() / 1000);
+    const sepObservedAt = Math.floor(new Date("2026-09-15T00:00:00+09:00").getTime() / 1000);
+
+    const aug = evaluateTitle(db, store, MONTHLY_RULE, "alice", augObservedAt);
+    const sep = evaluateTitle(db, store, MONTHLY_RULE, "alice", sepObservedAt);
+    expect(aug.scopeKey).not.toBe(sep.scopeKey);
     expect(store.listAwards("alice")).toHaveLength(2);
   });
 
   it("disabled titleはawardしない（evaluate()自体を呼ばない）", () => {
     const { db, store } = setup();
-    const result = evaluateTitle(db, store, DISABLED_RULE, "alice", scope);
+    const result = evaluateTitle(db, store, DISABLED_RULE, "alice", OBSERVED_AT);
     expect(result.outcome).toBe("skipped");
     expect(result.matched).toBe(false);
     expect(store.listAwards("alice")).toEqual([]);
@@ -515,7 +538,7 @@ describe("award flow（§12）", () => {
 
   it("retired titleは新規awardしない", () => {
     const { db, store } = setup();
-    const result = evaluateTitle(db, store, RETIRED_RULE, "alice", scope);
+    const result = evaluateTitle(db, store, RETIRED_RULE, "alice", OBSERVED_AT);
     expect(result.outcome).toBe("skipped");
     expect(result.matched).toBe(true);
     expect(store.listAwards("alice")).toEqual([]);
@@ -523,9 +546,10 @@ describe("award flow（§12）", () => {
 
   it("retired titleの既存awardは保持される（消えないし増えない）", () => {
     const { db, store } = setup();
-    store.award({ userId: "alice", titleKey: "v2.test.retired", scopeKey: scope.scopeKey, earnedAt: null });
+    const preScope = resolveTitleScope(store, RETIRED_RULE.definition, OBSERVED_AT);
+    store.award({ userId: "alice", titleKey: "v2.test.retired", scopeKey: preScope.scopeKey, earnedAt: null });
 
-    const result = evaluateTitle(db, store, RETIRED_RULE, "alice", scope);
+    const result = evaluateTitle(db, store, RETIRED_RULE, "alice", OBSERVED_AT);
     expect(result.outcome).toBe("already_awarded");
     expect(store.listAwards("alice")).toHaveLength(1);
   });
@@ -539,7 +563,7 @@ describe("earnedAt contract（§11）", () => {
     bump.addOnce("m2", "alice", BASE + 10);
     bump.addOnce("m3", "alice", BASE + 20);
 
-    const result = evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", scope);
+    const result = evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
     expect(result.earnedAt).toBe(BASE + 20);
     expect(store.listAwards("alice")[0]!.earned_at).toBe(BASE + 20);
   });
@@ -549,7 +573,7 @@ describe("earnedAt contract（§11）", () => {
     insertVcSegment(db, "alice", "vc1", BASE, BASE + 100, "observed");
     insertVcSegment(db, "bob", "vc1", BASE + 50, BASE + 80, "observed");
 
-    expect(() => evaluateTitle(db, store, BAD_VC_EARNED_AT_RULE, "alice", scope)).toThrow(/non-orderable/);
+    expect(() => evaluateTitle(db, store, BAD_VC_EARNED_AT_RULE, "alice", OBSERVED_AT)).toThrow(/non-orderable/);
   });
 
   it("earnedAt unknownならNULLのまま保存する", () => {
@@ -557,7 +581,7 @@ describe("earnedAt contract（§11）", () => {
     insertVcSegment(db, "alice", "vc1", BASE, BASE + 100, "observed");
     insertVcSegment(db, "bob", "vc1", BASE + 50, BASE + 80, "observed");
 
-    const result = evaluateTitle(db, store, VC_EMPTY_START_RULE, "alice", scope);
+    const result = evaluateTitle(db, store, VC_EMPTY_START_RULE, "alice", OBSERVED_AT);
     expect(result.outcome).toBe("awarded");
     expect(result.earnedAt).toBeNull();
     expect(store.listAwards("alice")[0]!.earned_at).toBeNull();
@@ -570,12 +594,12 @@ describe("earnedAt contract（§11）", () => {
     bump.addOnce("m2", "alice", BASE + 10);
     bump.addOnce("m3", "alice", BASE + 20);
 
-    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", scope);
+    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
 
-    // 後日のreconcileを模す: 別のobservedAtで同じruleを再評価しても、
+    // 後日のreconcileを模す: THIRD_BUMP_RULEはglobal scopeなので、observedAtを
+    // ずらしてもscopeKeyは変わらない。同じscopeへ再評価しても、
     // 一度確定したearned_atをreconcileを走らせた時刻へ書き換えない。
-    const laterScope = { ...scope, observedAt: scope.observedAt + 100_000 };
-    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", laterScope);
+    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT + 100_000);
 
     expect(store.listAwards("alice")[0]!.earned_at).toBe(BASE + 20);
   });
@@ -592,17 +616,14 @@ describe("evaluator所有のsnapshot（rule実行中の契約object書き換え�
     let selfMutatingRule!: TitleRule<readonly ["vc_empty_start_then_joined"]>;
     selfMutatingRule = defineTitleRule(
       {
+        kind: "behavior",
         key: "v2.test.self-mutating-sources",
-        catalog: "test",
         name: "test",
-        emoji: "x",
         description: "評価中に自分のdefinition.sourcesをorderable:trueなsourceへ改竄する",
         sources: ["vc_empty_start_then_joined"] as const,
-        trigger: "vc_leave",
+        triggers: ["vc_activity"],
         lifecycle: "active",
-        hidden: false,
-        countsForCompletion: false,
-        publicAnnounce: false,
+        ...COMMON_FIXTURE_FIELDS,
       },
       () => {
         // orderable:falseなVC sourceのruleのはずなのに、評価中にorderable:trueな
@@ -612,7 +633,7 @@ describe("evaluator所有のsnapshot（rule実行中の契約object書き換え�
       },
     );
 
-    expect(() => evaluateTitle(db, store, selfMutatingRule, "alice", scope)).toThrow(/non-orderable/);
+    expect(() => evaluateTitle(db, store, selfMutatingRule, "alice", OBSERVED_AT)).toThrow(/non-orderable/);
     expect(store.listAwards("alice")).toEqual([]);
   });
 
@@ -623,17 +644,14 @@ describe("evaluator所有のsnapshot（rule実行中の契約object書き換え�
 
     const scopeHijackRule = defineTitleRule(
       {
+        kind: "behavior",
         key: "v2.test.scope-hijack",
-        catalog: "test",
         name: "test",
-        emoji: "x",
         description: "ctx.scopeを書き換えてaward先scopeをズラそうとする",
         sources: ["bump_events"] as const,
-        trigger: "bump_success",
+        triggers: ["bump_success"],
         lifecycle: "active",
-        hidden: false,
-        countsForCompletion: false,
-        publicAnnounce: false,
+        ...COMMON_FIXTURE_FIELDS,
       },
       (ctx) => {
         (ctx.scope as { scopeKey: string }).scopeKey = "hijacked-scope";
@@ -641,12 +659,13 @@ describe("evaluator所有のsnapshot（rule実行中の契約object書き換え�
       },
     );
 
-    const result = evaluateTitle(db, store, scopeHijackRule, "alice", scope);
-    expect(result.scopeKey).toBe(scope.scopeKey);
+    const expectedScopeKey = resolveTitleScope(store, scopeHijackRule.definition, OBSERVED_AT).scopeKey;
+    const result = evaluateTitle(db, store, scopeHijackRule, "alice", OBSERVED_AT);
+    expect(result.scopeKey).toBe(expectedScopeKey);
 
     const awards = store.listAwards("alice");
     expect(awards).toHaveLength(1);
-    expect(awards[0]!.scope_key).toBe(scope.scopeKey);
+    expect(awards[0]!.scope_key).toBe(expectedScopeKey);
   });
 
   it("先行ruleがcached payloadを書き換えようとしても、後続ruleは汚染されていない値を見る", () => {
@@ -659,17 +678,14 @@ describe("evaluator所有のsnapshot（rule実行中の契約object書き換え�
     let mutationAttemptThrew = false;
     const tamperingRule = defineTitleRule(
       {
+        kind: "behavior",
         key: "v2.test.tamper-payload",
-        catalog: "test",
         name: "test",
-        emoji: "x",
         description: "cacheされたpayloadを直接書き換えようとする",
         sources: ["bump_events"] as const,
-        trigger: "bump_success",
+        triggers: ["bump_success"],
         lifecycle: "active",
-        hidden: false,
-        countsForCompletion: false,
-        publicAnnounce: false,
+        ...COMMON_FIXTURE_FIELDS,
       },
       (ctx) => {
         try {
@@ -683,22 +699,22 @@ describe("evaluator所有のsnapshot（rule実行中の契約object書き換え�
 
     // tamperingRuleとTHIRD_BUMP_RULEは同じuser/scope/bump_eventsを共有するので、
     // cacheが1回だけ読んだ同じpayload objectをどちらも受け取る。
-    const [, thirdBumpResult] = evaluateUser(db, store, [tamperingRule, THIRD_BUMP_RULE], "alice", scope);
+    const [, thirdBumpResult] = evaluateUser(db, store, [tamperingRule, THIRD_BUMP_RULE], "alice", OBSERVED_AT);
 
     expect(mutationAttemptThrew).toBe(true); // freezeされているので書き込みは例外になる
     expect(thirdBumpResult!.earnedAt).toBe(BASE + 20); // 汚染されず3件のまま読める
   });
 });
 
-describe("publicFacts safety（§10）", () => {
-  it("publicFactsへrestricted counterpart IDが出ない", () => {
+describe("awardFacts safety（§10, §12）", () => {
+  it("awardFactsへrestricted counterpart IDが出ない", () => {
     const { db, store } = setup();
     insertVcSegment(db, "alice", "vc1", BASE, BASE + 100, "observed");
     insertVcSegment(db, "bob", "vc1", BASE, BASE + 100, "observed");
 
-    const result = evaluateTitle(db, store, SOCIAL_SAFE_RULE, "alice", scope);
-    expect(JSON.stringify(result.publicFacts)).not.toContain("bob");
-    expect(result.publicFacts).toEqual({
+    const result = evaluateTitle(db, store, SOCIAL_SAFE_RULE, "alice", OBSERVED_AT);
+    expect(JSON.stringify(result.awardFacts)).not.toContain("bob");
+    expect(result.awardFacts).toEqual({
       distinctCoPresentUsers: 1,
       maxRepeatedDaysWithOneCounterpart: expect.any(Number),
       trustedOverlapSeconds: 100,
@@ -706,24 +722,45 @@ describe("publicFacts safety（§10）", () => {
   });
 });
 
-describe("fail-closed on source reader failure（§24）", () => {
-  it("source読み込みの失敗を「条件未達」として握り潰さず、そのままthrowする", () => {
+describe("fail-closed on scope resolution / source reader failure（§24）", () => {
+  it("catalog epochが未施行なら、evaluateTitle()は「条件未達」として握り潰さずthrowする", () => {
+    const db = openDb(":memory:");
+    new BumpCounter(db);
+    // applyCatalog()を呼んでいない、まっさらなstore。
+    const store = new TitleV2Store(db, () => BASE);
+
+    expect(() => evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT)).toThrow(
+      /SYSTEM_EPOCH is not established/,
+    );
+  });
+
+  it("forgeされたscopeはreadTitleSource()でfail-closedする", () => {
+    const { db } = setup();
+    const forgedScope = { scopeKey: "global", start: BASE, endExclusive: null, observedAt: OBSERVED_AT };
+    expect(() => readTitleSource(db, "bump_events", "alice", forgedScope as never)).toThrow(
+      /not produced by resolveTitleScope/,
+    );
+  });
+
+  it("event scope providerが無いとevaluateTitle()はfail-closedする", () => {
     const { db, store } = setup();
-    const badScope = { ...scope, start: scope.end, end: scope.start }; // start>=endの壊れたscope
-    expect(() => evaluateTitle(db, store, VC_EMPTY_START_RULE, "alice", badScope)).toThrow();
+    expect(() => evaluateTitle(db, store, EVENT_RULE, "alice", OBSERVED_AT)).toThrow(
+      /requires a TitleEventScopeProvider/,
+    );
+    expect(store.listAwards("alice")).toEqual([]);
   });
 });
 
 // GROUP_SIZE_RULEはobservedAt伝播テストで型検査用に定義してあるが、
 // 上のdescribeブロックでは直接使っていない箇所があるため、未使用警告を避けるために
 // 最小限のsanityテストを1件だけ足しておく。
-describe("group-size ruleのpublicFacts経路", () => {
-  it("trustedSecondsByBucketとuntrustedSecondsをpublicFactsへそのまま渡せる", () => {
+describe("group-size ruleのawardFacts経路", () => {
+  it("trustedSecondsByBucketとuntrustedSecondsをawardFactsへそのまま渡せる", () => {
     const { db, store } = setup();
     insertVcSegment(db, "alice", "vc1", BASE, BASE + 100, "observed");
 
-    const result = evaluateTitle(db, store, GROUP_SIZE_RULE, "alice", scope);
-    expect(result.publicFacts).toMatchObject({ untrustedSeconds: 0 });
+    const result = evaluateTitle(db, store, GROUP_SIZE_RULE, "alice", OBSERVED_AT);
+    expect(result.awardFacts).toMatchObject({ untrustedSeconds: 0 });
   });
 });
 
@@ -733,25 +770,23 @@ describe("root packages/core/src/index.ts からv2 evaluator APIを使える", (
     const db = openDb(":memory:");
     new BumpCounter(db);
     const store = new core.TitleV2Store(db);
+    store.applyCatalog({ catalogKey: "test", actor: "test-setup" });
 
     const rule = core.defineTitleRule(
       {
+        kind: "behavior",
         key: "v2.test.root-export",
-        catalog: "test",
         name: "test",
-        emoji: "x",
         description: "root exportの疎通テスト",
         sources: ["bump_events"] as const,
-        trigger: "bump_success",
+        triggers: ["bump_success"],
         lifecycle: "active",
-        hidden: false,
-        countsForCompletion: false,
-        publicAnnounce: false,
+        ...COMMON_FIXTURE_FIELDS,
       },
       () => ({ matched: true, earnedAt: null }),
     );
 
-    const result = core.evaluateTitle(db, store, rule, "alice", scope);
+    const result = core.evaluateTitle(db, store, rule, "alice", Math.floor(Date.now() / 1000));
     expect(result.outcome).toBe("awarded");
   });
 });

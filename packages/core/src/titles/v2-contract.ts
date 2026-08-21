@@ -3,19 +3,76 @@
  *
  * このファイルはカタログを持たない。先に「何を材料にしてよいか」「どう公開するか」を
  * 型とレジストリで固定し、個々の称号は後続PRでこの契約へ乗せる。
+ *
+ * v3改修（PR A）: 100件規模の称号を安全に乗せるための契約整理。
+ * - TitleDefinitionを behavior（source評価を通す）/ meta（他titleのaward状態や
+ *   collection/full-clear manifestを横断して判定する）へ discriminated union で分離。
+ * - countsForCompletion を廃止。Collection Credit / Full-clear Required は
+ *   collection manifest（v2-collection.ts）側の責務にする。
+ * - trigger を単数から triggers（複数）へ変更。TC+VCの両方で完成し得る称号、
+ *   複数featureに跨る称号を表現できるようにする。
+ * - lifecycle から seasonal を削除（scopeと役割が重複するため）。
+ * - scope をcaller任意生成からdefinition宣言 + 中央resolver方式へ移行
+ *   （実際のresolverはv2-scope.ts）。
  */
 
 export const TITLE_TIME_ZONE = "Asia/Tokyo" as const;
 
-export type TitleLifecycle = "active" | "seasonal" | "retired" | "disabled";
+/**
+ * lifecycleの意味は永続契約の一部（released titleの意味は不変）。
+ *
+ * - active: 新規評価・新規award可
+ * - retired: 新規award不可。既存awardは保持する
+ * - disabled: 緊急停止用。evaluatorはsourceを読まずskipする。
+ *   後続UIでは公開・装備も停止できる意味を想定（本PRではUIまで実装しない）
+ *
+ * seasonalは削除した——期間限定の意味はscope policy（month/event）が既に持っており、
+ * lifecycleとscopeの両方に「期間」の概念を持たせると意味が重複し、
+ * どちらが優先されるか曖昧になるため。
+ */
+export type TitleLifecycle = "active" | "retired" | "disabled";
+
+/**
+ * 称号を評価すべき行動の種類。TC+VCの両方で完成し得る称号、複数featureに跨る称号を
+ * 表現できるよう、TitleDefinition側は複数triggerを持てる（`triggers`、下記参照）。
+ *
+ * 旧trigger値からの対応（今回のcontract整理で名前空間を広げた）:
+ * vc_leave → vc_activity / game_end → game_completed / room_closed → room_activity /
+ * transfer・market_created → economy_activity（Land・casino・shop・recruit等の経済行動を
+ * まとめて表現する）。まだDiscord eventへの本番fast-path wiringは無い
+ * （production wiringは範囲外）ため、この変更で実際の配線が壊れることはない。
+ */
 export type TitleTrigger =
-  | "vc_leave"
+  | "text_activity"
+  | "vc_activity"
   | "bump_success"
-  | "game_end"
-  | "room_closed"
-  | "transfer"
-  | "market_created"
+  | "game_completed"
+  | "room_activity"
+  | "economy_activity"
+  | "invite_confirmed"
+  | "event_completed"
+  | "role_changed"
   | "daily";
+
+/**
+ * definitionが宣言する「どうscopeを区切るか」の方針。実際のwindow解決は
+ * v2-scope.ts の resolveTitleScope() が担う（callerは任意のscope/scopeKeyを作れない）。
+ *
+ * - catalog: start = CATALOG_EPOCH、open-ended
+ * - global: start = SYSTEM_EPOCH、open-ended
+ * - month: Asia/Tokyo暦月。start = max(月初, CATALOG_EPOCH)、end = 翌月初
+ * - event: event固有window。start = max(canonical event開始, CATALOG_EPOCH)、
+ *   end = canonical completedAt。eventKeyはpolicy自体に固定し、callerが
+ *   好きなeventKeyを差し込めないようにする
+ *
+ * scope policyはreleased title semanticの一部——一度公開したtitleのscope policyを
+ * 意味が変わる形で書き換えない（key規約§12と同じ扱い）。
+ */
+export type TitleScopePolicy =
+  | { readonly type: "catalog" }
+  | { readonly type: "global" }
+  | { readonly type: "month" }
+  | { readonly type: "event"; readonly eventKey: string };
 
 export type TitleSourceKind = "history" | "counter";
 export type TitleSourcePrivacy = "safe" | "restricted" | "forbidden";
@@ -311,46 +368,112 @@ export function assertDerivedSourceDependenciesResolve(
   for (const key of Object.keys(sources)) resolve(key, []);
 }
 
-export interface TitleCheckResult {
-  earned: boolean;
-  /**
-   * 条件を満たした時刻。証明できないときは null。
-   * reconcile時刻や付与時刻で埋めてはいけない。
-   */
-  earnedAt: number | null;
+/**
+ * lowercase英数字・"-"・"_"だけのslug。scopeKeyの構成要素（catalogKey・eventKey）や
+ * themeKey/groupKey/seriesKey等、後から文字列結合でキーを合成する識別子に使う。
+ * ":" や空白を許可すると、`month:${catalogKey}:${label}` のようなscopeKey生成が
+ * 曖昧になる（catalogKeyの中に":"が混ざると別のscopeを指してしまう等）。
+ */
+const SLUG_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+
+export function assertSlug(value: string, label: string): void {
+  if (typeof value !== "string" || !SLUG_PATTERN.test(value)) {
+    throw new Error(`${label} must be a slug (lowercase alnum, "-", "_", no spaces/colons): ${JSON.stringify(value)}`);
+  }
 }
 
-export interface TitleDefinition {
-  key: `v2.${string}`;
-  /** 第I期、第II期など計測起点を共有するカタログ。 */
-  catalog: string;
-  name: string;
-  emoji: string;
-  description: string;
-  sources: readonly TitleUsableSourceKey[];
-  trigger: TitleTrigger;
-  lifecycle: TitleLifecycle;
+export interface TitleProgression {
+  /** 同じladderに属するmemberが共有する識別子。TitleSeriesManifest.seriesKeyと一致させる。 */
+  readonly seriesKey: string;
+  /** 1始まりの連番。TitleSeriesManifestの検証で重複・欠番を拒否する。 */
+  readonly stage: number;
+}
+
+interface TitleDefinitionCommon {
+  readonly key: `v2.${string}`;
+  readonly name: string;
+  readonly emoji: string;
+  readonly description: string;
+  readonly lifecycle: TitleLifecycle;
   /** 条件そのものを取得前に公開するのではなく、必要ならこのヒントだけを見せる。 */
-  hint?: string;
-  /** 条件・名前とも伏せる番外枠。隠し称号は通常カタログ完遂へ含めない。 */
-  hidden: boolean;
-  /** 通常カタログ完遂の分母へ入るか。 */
-  countsForCompletion: boolean;
+  readonly hint?: string;
+  /** 条件・名前とも伏せる番外枠。 */
+  readonly hidden: boolean;
   /** 高レアだから自動告知、にはしない。 */
-  publicAnnounce: boolean;
+  readonly publicAnnounce: boolean;
+  /** 「何の分野か」。将来のtheme breadth集計（千印万来等）に使う。 */
+  readonly themeKey: string;
+  /** 関連称号のまとまり。side titleも同じgroupに入れる。themeとは別概念。 */
+  readonly groupKey: string;
+  readonly scope: TitleScopePolicy;
+}
+
+/** 通常source evaluatorを通す称号。 */
+export interface BehaviorTitleDefinition extends TitleDefinitionCommon {
+  readonly kind: "behavior";
+  /** 第I期・第II期など計測起点を共有するカタログ。 */
+  readonly catalog: string;
+  readonly sources: readonly TitleUsableSourceKey[];
+  readonly triggers: readonly TitleTrigger[];
+  /** 連番ladderの1段であることを示す。無ければ単独称号。 */
+  readonly progression?: TitleProgression;
 }
 
 /**
- * カタログ定義の小さなruntime guard。
- * TypeScriptを迂回した動的入力でも、旧key・未登録source・監査専用source・隠し完遂混入を通さない。
+ * 他titleのaward状態やcollection/full-clear manifestを横断して判定する称号
+ * （千印万来・万印皆伝等）。通常のsource evaluatorは経由しない——そのため
+ * `sources` / `triggers` を持たない。型でbehavior evaluatorへ渡せないようにする
+ * （TitleRule.definitionはBehaviorTitleDefinitionしか受け付けない）。
+ *
+ * `catalog` も持たない。meta titleは特定1catalogの監査対象という単位ではなく、
+ * 有効な複数catalog/manifestを横断して判定する。scope.typeは実質globalのみ有効
+ * （defineMetaTitle()がruntimeで強制する。catalog/month/eventはcatalog参照が
+ * 無いと解決できないため）。
+ *
+ * `progression` は持たせない。meta titleは「ある条件を満たした/満たしていない」の
+ * 単発到達点であり、《一門皆伝》のような称号もそれ自体は連番ladderの1段ではなく、
+ * series完遂そのものを示すゴール。meta同士のladderが将来本当に必要になったら、
+ * その時点で別の型を起こす（先回りして型を膨らませない）。
  */
-export function defineTitle<T extends TitleDefinition>(definition: T): T {
+export interface MetaTitleDefinition extends TitleDefinitionCommon {
+  readonly kind: "meta";
+}
+
+export type TitleDefinition = BehaviorTitleDefinition | MetaTitleDefinition;
+
+const VALID_LIFECYCLES: ReadonlySet<TitleLifecycle> = new Set(["active", "retired", "disabled"]);
+const VALID_SCOPE_TYPES: ReadonlySet<TitleScopePolicy["type"]> = new Set(["catalog", "global", "month", "event"]);
+
+function assertCommonTitleDefinition(definition: TitleDefinitionCommon & { key: string }): void {
   if (!definition.key.startsWith("v2.") || definition.key.length <= 3) {
     throw new Error(`title key must use v2.* namespace: ${definition.key}`);
   }
-  if (!definition.catalog.trim()) throw new Error(`title ${definition.key}: catalog is required`);
-  if (definition.sources.length === 0) throw new Error(`title ${definition.key}: at least one source is required`);
+  // TypeScriptのunion型を迂回した動的入力（旧seasonal等）でもruntimeで拒否する。
+  if (!VALID_LIFECYCLES.has(definition.lifecycle)) {
+    throw new Error(`title ${definition.key}: invalid lifecycle ${String(definition.lifecycle)}`);
+  }
+  assertSlug(definition.themeKey, `title ${definition.key}: themeKey`);
+  assertSlug(definition.groupKey, `title ${definition.key}: groupKey`);
+  if (!VALID_SCOPE_TYPES.has(definition.scope?.type)) {
+    throw new Error(`title ${definition.key}: invalid scope.type ${String(definition.scope?.type)}`);
+  }
+  if (definition.scope.type === "event") {
+    assertSlug(definition.scope.eventKey, `title ${definition.key}: scope.eventKey`);
+  }
+}
 
+/**
+ * behavior titleのruntime guard。TypeScriptを迂回した動的入力でも、旧key・未登録
+ * source・監査専用source・sources/triggers空・重複triggerを通さない。
+ */
+export function defineBehaviorTitle<T extends BehaviorTitleDefinition>(definition: T): T {
+  if (definition.kind !== "behavior") {
+    throw new Error(`title ${definition.key}: defineBehaviorTitle() requires kind:"behavior"`);
+  }
+  assertCommonTitleDefinition(definition);
+  if (!definition.catalog.trim()) throw new Error(`title ${definition.key}: catalog is required`);
+
+  if (definition.sources.length === 0) throw new Error(`title ${definition.key}: at least one source is required`);
   for (const source of definition.sources as readonly TitleSourceKey[]) {
     if (!(source in TITLE_SOURCES)) {
       throw new Error(`title ${definition.key}: unregistered source ${String(source)}`);
@@ -364,11 +487,36 @@ export function defineTitle<T extends TitleDefinition>(definition: T): T {
     }
   }
 
-  if (definition.hidden && definition.countsForCompletion) {
-    throw new Error(`title ${definition.key}: hidden titles cannot count for catalog completion`);
+  if (definition.triggers.length === 0) throw new Error(`title ${definition.key}: at least one trigger is required`);
+  const seenTriggers = new Set<TitleTrigger>();
+  for (const trigger of definition.triggers) {
+    if (seenTriggers.has(trigger)) throw new Error(`title ${definition.key}: duplicate trigger ${trigger}`);
+    seenTriggers.add(trigger);
   }
-  if (definition.lifecycle !== "active" && definition.countsForCompletion) {
-    throw new Error(`title ${definition.key}: only active titles can count for catalog completion`);
+
+  if (definition.progression) {
+    assertSlug(definition.progression.seriesKey, `title ${definition.key}: progression.seriesKey`);
+    if (!Number.isInteger(definition.progression.stage) || definition.progression.stage < 1) {
+      throw new Error(`title ${definition.key}: progression.stage must be a positive integer`);
+    }
+  }
+
+  return definition;
+}
+
+/**
+ * meta titleのruntime guard。scope.typeはglobalのみ許可する
+ * （meta titleはcatalog参照を持たないため、catalog/month/eventのCATALOG_EPOCH解決ができない）。
+ */
+export function defineMetaTitle<T extends MetaTitleDefinition>(definition: T): T {
+  if (definition.kind !== "meta") {
+    throw new Error(`title ${definition.key}: defineMetaTitle() requires kind:"meta"`);
+  }
+  assertCommonTitleDefinition(definition);
+  if (definition.scope.type !== "global") {
+    throw new Error(
+      `title ${definition.key}: meta titles only support scope.type="global" (no catalog reference on meta titles)`,
+    );
   }
   return definition;
 }
