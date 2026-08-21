@@ -817,7 +817,58 @@ describe("assertAwardPersistenceIntegrity()のsemantic integrity検証（§3強�
     store.award({ userId: "bob", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS }); // sequence=2
     db.prepare(`UPDATE title_rarity_sequences SET last_sequence = 1 WHERE title_key = ?`).run(def.key);
 
-    expect(() => new TitleV2Store(db, () => BASE + 1000)).toThrow(/last_sequence .* less than/);
+    expect(() => new TitleV2Store(db, () => BASE + 1000)).toThrow(/last_sequence .* does not equal/);
+  });
+
+  it("rarity sequence.last_sequenceがmax(acquisition_sequence)を超えていても、constructorでintegrity違反", () => {
+    const { db, store, setClock } = setup();
+    const def = sampleDef("v2.test.high-sequence");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    setClock(BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS }); // sequence=1
+    store.award({ userId: "bob", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS }); // sequence=2
+    db.prepare(`UPDATE title_rarity_sequences SET last_sequence = 3 WHERE title_key = ?`).run(def.key);
+
+    expect(() => new TitleV2Store(db, () => BASE + 1000)).toThrow(/last_sequence .* does not equal/);
+  });
+
+  it("last_sequenceがmax(acquisition_sequence)と完全一致していれば、constructorでintegrity違反にならない", () => {
+    const { db, store, setClock } = setup();
+    const def = sampleDef("v2.test.exact-sequence");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    setClock(BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS }); // sequence=1
+    store.award({ userId: "bob", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS }); // sequence=2
+
+    expect(() => new TitleV2Store(db, () => BASE + 1000)).not.toThrow();
+  });
+
+  it("ownershipが0件のtitleにrarity sequence行だけ存在すると、constructorでintegrity違反", () => {
+    const { db } = setup();
+    // award/ownershipを一切経由せず、title_rarity_sequencesだけを直接INSERTする
+    // ——sequenceだけが消費されownershipが成立しなかった破損状態を単独で再現する
+    // （award行を経由すると先に「awardにownershipが無い」別の検証へ先に引っかかるため）。
+    db.prepare(`INSERT INTO title_rarity_sequences (title_key, last_sequence) VALUES (?, 1)`).run(
+      "v2.test.orphan-sequence-only",
+    );
+
+    expect(() => new TitleV2Store(db, () => BASE + 1000)).toThrow(/has a rarity sequence row but no ownership rows/);
+  });
+
+  it("holder_count_at_acquisitionがacquisition_sequenceと食い違うと、constructorでintegrity違反", () => {
+    const { db, store, setClock } = setup();
+    const def = sampleDef("v2.test.holder-count-mismatch");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    setClock(BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS }); // sequence=1
+    db.prepare(`UPDATE title_ownerships SET holder_count_at_acquisition = 99 WHERE user_id = ? AND title_key = ?`).run(
+      "alice",
+      def.key,
+    );
+
+    expect(() => new TitleV2Store(db, () => BASE + 1000)).toThrow(
+      /holder_count_at_acquisition .* does not equal acquisition_sequence/,
+    );
   });
 
   it("直接SQL操作で作られた孤立child行のFK違反を、targeted queryでは見えなくてもforeign_key_check経由で検出する", () => {

@@ -415,8 +415,12 @@ v2はまだ本番wiringされていないため、過去のfoundation award（fa
 5. `title_award_facts.captured_at` が、対応する `title_awards.awarded_at` と一致する
 6. `title_ownerships.first_scope_key` が指すaward行の `earned_at`/`awarded_at` と、`title_ownerships.first_earned_at`/`first_awarded_at` が一致する（＝ownership origin snapshotが実際に参照先awardと矛盾していない）
 7. ownershipが存在するtitleKeyには対応する `title_rarity_sequences` 行が存在する
-8. `title_rarity_sequences.last_sequence` が、そのtitleKeyの `title_ownerships.acquisition_sequence` の最大値以上である（単調性）
-9. `PRAGMA foreign_key_check` を `title_` prefixのtableへ絞り込んで実行し、違反があればfail-closedする——直接SQL操作や `foreign_keys=OFF` 下での削除等によって作られた孤立child行（親を指すFKが実在しない`title_award_facts`/`title_ownerships`行）は、INNER JOINベースのtargeted queryでは（親が無いので）そもそも結果に現れず検出できない。`PRAGMA foreign_key_check`はこの穴を埋める。他の無関係なアプリケーションテーブルのFK問題まで誤検出しないよう、`title_`prefixのtableだけに絞っている。
+8. `title_rarity_sequences.last_sequence` が、そのtitleKeyの `title_ownerships.acquisition_sequence` の最大値と**完全一致**する（単なる「以上」ではない）
+9. `title_rarity_sequences` に行が存在するのに、そのtitleKeyの `title_ownerships` が0件（orphan rarity sequence row）ではない
+10. 各 `title_ownerships` 行について `holder_count_at_acquisition === acquisition_sequence`
+11. `PRAGMA foreign_key_check` を `title_` prefixのtableへ絞り込んで実行し、違反があればfail-closedする——直接SQL操作や `foreign_keys=OFF` 下での削除等によって作られた孤立child行（親を指すFKが実在しない`title_award_facts`/`title_ownerships`行）は、INNER JOINベースのtargeted queryでは（親が無いので）そもそも結果に現れず検出できない。`PRAGMA foreign_key_check`はこの穴を埋める。他の無関係なアプリケーションテーブルのFK問題まで誤検出しないよう、`title_`prefixのtableだけに絞っている。
+
+8/9のrarity sequenceに関する2点は、`title_rarity_sequences.last_sequence`がfirst ownership時だけ1増え、そのallocationとownership INSERTが同じ`BEGIN IMMEDIATE` transaction内で確定し（rollback時はsequenceも一緒にrollbackする）、ownershipは永久保持で通常削除APIも無い、という契約から導かれる不変条件——normal stateでは常に `last_sequence === MAX(title_ownerships.acquisition_sequence)`（ownershipが1件も無いtitleKeyには`title_rarity_sequences`行自体が存在しない）。`last_sequence`が`MAX(...)`より大きい状態も小さい状態も、ownershipを伴わないsequence消費（またはその逆）が起きた破損を意味するため、両方向をrejectする。10.のholder_count整合は、`holder_count_at_acquisition`が「first ownership transaction時点のDB title ownership総数（今回分を含む）」であり、sequenceもfirst ownershipごとに1から連番で発番されるため、normal stateでは両者が常に一致するという契約から導かれる。
 
 加えて `hasAward()` 自身も、見つけたaward行についてfacts rowが「存在するだけ」でtrueにせず、`awardFacts()`相当の内容validation（version/captured_at/JSON body）を通した上でownershipのbundle integrityを確認してから`true`を返す——construction後にout-of-bandな行が挿入される可能性はゼロではないため、読み取り境界でも二重に守る。偽のrepair/backfillでintegrity違反を迂回することはできない。
 

@@ -442,6 +442,11 @@ function assertAwardPersistenceIntegrity(db: Database.Database): void {
     }
   }
 
+  // rarity sequenceはfirst ownership時だけ1増え、allocationとownership INSERTは
+  // 同じIMMEDIATE transaction（rollback時はsequenceも一緒にrollback）、ownershipは
+  // 永久保持で通常削除APIも無い。よってnormal stateでは常に
+  // last_sequence === MAX(acquisition_sequence) が成立する——`>`側の食い違いも、
+  // ownershipを伴わないsequence消費が起きた破損状態として検出する。
   const sequenceRows = db
     .prepare(
       `SELECT o.title_key, MAX(o.acquisition_sequence) AS max_sequence, r.last_sequence
@@ -456,10 +461,49 @@ function assertAwardPersistenceIntegrity(db: Database.Database): void {
         `title rarity sequence integrity violation: title ${row.title_key} has ownership rows but no rarity sequence row`,
       );
     }
-    if (row.last_sequence < row.max_sequence) {
+    if (row.last_sequence !== row.max_sequence) {
       throw new Error(
         `title rarity sequence integrity violation: title ${row.title_key} last_sequence (${row.last_sequence}) ` +
-          `is less than its max acquisition_sequence (${row.max_sequence})`,
+          `does not equal its max acquisition_sequence (${row.max_sequence})`,
+      );
+    }
+  }
+
+  // 逆方向: rarity sequence行が存在するのにそのtitleKeyのownershipが0件は、
+  // sequenceだけが消費されてownershipが成立しなかった（あるいはownershipだけが
+  // out-of-bandで削除された）破損状態。上のqueryはtitle_ownershipsを起点にした
+  // LEFT JOINのためこの向きの欠損は検出できない——別クエリで補う。
+  const orphanSequenceRows = db
+    .prepare(
+      `SELECT r.title_key
+         FROM title_rarity_sequences r
+         LEFT JOIN title_ownerships o ON o.title_key = r.title_key
+        WHERE o.title_key IS NULL`,
+    )
+    .all() as Array<{ title_key: string }>;
+  if (orphanSequenceRows.length > 0) {
+    throw new Error(
+      `title rarity sequence integrity violation: title ${orphanSequenceRows[0]!.title_key} has a rarity ` +
+        `sequence row but no ownership rows`,
+    );
+  }
+
+  // holder_count_at_acquisitionは「first ownership transaction時点のDB title
+  // ownership総数（今回分を含む）」であり、sequenceもfirst ownershipごとに1から
+  // 連番なので、normal stateでは常に holder_count_at_acquisition===acquisition_sequence。
+  const holderCountRows = db
+    .prepare(`SELECT user_id, title_key, acquisition_sequence, holder_count_at_acquisition FROM title_ownerships`)
+    .all() as Array<{
+    user_id: string;
+    title_key: string;
+    acquisition_sequence: number;
+    holder_count_at_acquisition: number;
+  }>;
+  for (const row of holderCountRows) {
+    if (row.holder_count_at_acquisition !== row.acquisition_sequence) {
+      throw new Error(
+        `title ownership integrity violation: holder_count_at_acquisition (${row.holder_count_at_acquisition}) ` +
+          `does not equal acquisition_sequence (${row.acquisition_sequence}) for ${row.user_id}/${row.title_key}`,
       );
     }
   }
