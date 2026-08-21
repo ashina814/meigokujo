@@ -6,7 +6,7 @@ import {
   type TitleCollectionEdition,
 } from "../src/titles/v2-collection.js";
 
-function behavior(key: `v2.${string}`, themeKey: string, lifecycle: TitleLifecycle = "active"): TitleDefinition {
+function behavior(key: `v2.${string}`, domainKey: string, lifecycle: TitleLifecycle = "active"): TitleDefinition {
   return defineBehaviorTitle({
     kind: "behavior",
     key,
@@ -19,13 +19,17 @@ function behavior(key: `v2.${string}`, themeKey: string, lifecycle: TitleLifecyc
     lifecycle,
     hidden: false,
     publicAnnounce: false,
-    themeKey,
-    groupKey: themeKey,
+    // themeKeyはeditorial表示専用でcollection logicに使わないため、あえて
+    // domainKeyとは別のダミー値にしてある——collection validationがthemeKeyを
+    // 見ていないことの間接確認にもなる。
+    themeKey: "unrelated-theme",
+    groupKey: domainKey,
+    collectionDomainKey: domainKey,
     scope: { type: "global" },
   });
 }
 
-function meta(key: `v2.${string}`, themeKey: string): TitleDefinition {
+function meta(key: `v2.${string}`, domainKey: string): TitleDefinition {
   return defineMetaTitle({
     kind: "meta",
     key,
@@ -35,8 +39,8 @@ function meta(key: `v2.${string}`, themeKey: string): TitleDefinition {
     lifecycle: "active",
     hidden: false,
     publicAnnounce: false,
-    themeKey,
-    groupKey: themeKey,
+    themeKey: domainKey,
+    groupKey: domainKey,
     scope: { type: "global" },
   });
 }
@@ -45,25 +49,25 @@ function definitionsMap(defs: readonly TitleDefinition[]): ReadonlyMap<string, T
   return new Map(defs.map((d) => [d.key, d]));
 }
 
-// countableCount=5（collectionCredit:trueが5件）、countableThemes=2（theme-a/theme-b）、
+// countableCount=5（collectionCredit:trueが5件）、countableDomains=2（domain-a/domain-b）、
 // fullClearCount=2（a, bがfullClearRequired）——このスケールなら
 // startedCollecting(1) < collectorHabit(2) < stillCollecting(3) <= thousandMarks.count(5)
 // <= countableCount(5) というmilestoneの連鎖が矛盾なく成立する。2title程度の小さい
 // fixtureだと連鎖する不等式を同時に満たせない（後述のテストで個別に確認する）。
 function fiveMemberFixture(): { defs: TitleDefinition[]; members: TitleCollectionEdition["members"] } {
-  const a = behavior("v2.test.a", "theme-a");
-  const b = behavior("v2.test.b", "theme-a");
-  const c = behavior("v2.test.c", "theme-a");
-  const d = behavior("v2.test.d", "theme-b");
-  const e = behavior("v2.test.e", "theme-b");
+  const a = behavior("v2.test.a", "domain-a");
+  const b = behavior("v2.test.b", "domain-a");
+  const c = behavior("v2.test.c", "domain-a");
+  const d = behavior("v2.test.d", "domain-b");
+  const e = behavior("v2.test.e", "domain-b");
   return {
     defs: [a, b, c, d, e],
     members: [
-      { titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true },
-      { titleKey: b.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true },
-      { titleKey: c.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: false },
-      { titleKey: d.key, themeKey: "theme-b", collectionCredit: true, fullClearRequired: false },
-      { titleKey: e.key, themeKey: "theme-b", collectionCredit: true, fullClearRequired: false },
+      { titleKey: a.key, collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: true },
+      { titleKey: b.key, collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: true },
+      { titleKey: c.key, collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: false },
+      { titleKey: d.key, collectionDomainKey: "domain-b", collectionCredit: true, fullClearRequired: false },
+      { titleKey: e.key, collectionDomainKey: "domain-b", collectionCredit: true, fullClearRequired: false },
     ],
   };
 }
@@ -72,7 +76,7 @@ const VALID_MILESTONES = {
   startedCollecting: 1,
   collectorHabit: 2,
   stillCollecting: 3,
-  thousandMarks: { count: 5, themes: 2 },
+  thousandMarks: { count: 5, domains: 2 },
   almostComplete: { remaining: 1 },
 };
 
@@ -103,12 +107,12 @@ describe("collection edition validation（§10）", () => {
   });
 
   it("member重複をreject", () => {
-    const a = behavior("v2.test.a", "theme-a");
+    const a = behavior("v2.test.a", "domain-a");
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
       members: [
-        { titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true },
-        { titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: false },
+        { titleKey: a.key, collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: true },
+        { titleKey: a.key, collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: false },
       ],
       milestones: VALID_MILESTONES,
     };
@@ -118,27 +122,40 @@ describe("collection edition validation（§10）", () => {
   it("member titleが存在しないとreject", () => {
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
-      members: [{ titleKey: "v2.test.ghost", themeKey: "theme-a", collectionCredit: true, fullClearRequired: true }],
+      members: [
+        { titleKey: "v2.test.ghost", collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: true },
+      ],
       milestones: VALID_MILESTONES,
     };
     expect(() => assertValidCollectionEdition(edition, definitionsMap([]))).toThrow(/member title not found/);
   });
 
-  it("themeKeyがdefinitionと不一致ならreject", () => {
-    const a = behavior("v2.test.a", "theme-a");
+  it("collectionDomainKeyがdefinitionと不一致ならreject", () => {
+    const a = behavior("v2.test.a", "domain-a");
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
-      members: [{ titleKey: a.key, themeKey: "wrong-theme", collectionCredit: true, fullClearRequired: true }],
+      members: [
+        { titleKey: a.key, collectionDomainKey: "wrong-domain", collectionCredit: true, fullClearRequired: true },
+      ],
       milestones: VALID_MILESTONES,
     };
-    expect(() => assertValidCollectionEdition(edition, definitionsMap([a]))).toThrow(/themeKey mismatch/);
+    expect(() => assertValidCollectionEdition(edition, definitionsMap([a]))).toThrow(/collectionDomainKey mismatch/);
+  });
+
+  it("themeKeyが違っていてもcollectionDomainKeyさえ一致していればreject理由にならない（theme/domain分離の直接確認）", () => {
+    // behavior()はthemeKeyを常に"unrelated-theme"固定にしている——それでもedition検証が
+    // 通ることは、collection edition検証がthemeKeyを一切見ていないことの証明になる。
+    const { defs, members } = fiveMemberFixture();
+    expect(defs.every((d) => d.kind === "behavior" && d.themeKey === "unrelated-theme")).toBe(true);
+    const edition: TitleCollectionEdition = { editionKey: "v1-edition", members, milestones: VALID_MILESTONES };
+    expect(() => assertValidCollectionEdition(edition, definitionsMap(defs))).not.toThrow();
   });
 
   it("meta titleをfullClearRequiredにできない", () => {
-    const m = meta("v2.test.meta-a", "theme-a");
+    const m = meta("v2.test.meta-a", "domain-a");
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
-      members: [{ titleKey: m.key, themeKey: "theme-a", collectionCredit: false, fullClearRequired: true }],
+      members: [{ titleKey: m.key, collectionDomainKey: "domain-a", collectionCredit: false, fullClearRequired: true }],
       milestones: VALID_MILESTONES,
     };
     expect(() => assertValidCollectionEdition(edition, definitionsMap([m]))).toThrow(
@@ -147,19 +164,19 @@ describe("collection edition validation（§10）", () => {
   });
 
   it("meta titleをcollectionCreditにもできない（meta titleはcollection/full-clearの分母・分子どちらへも入らない）", () => {
-    const m = meta("v2.test.meta-a", "theme-a");
-    const b = behavior("v2.test.b", "theme-b");
+    const m = meta("v2.test.meta-a", "domain-a");
+    const b = behavior("v2.test.b", "domain-b");
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
       members: [
-        { titleKey: m.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: false },
-        { titleKey: b.key, themeKey: "theme-b", collectionCredit: true, fullClearRequired: true },
+        { titleKey: m.key, collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: false },
+        { titleKey: b.key, collectionDomainKey: "domain-b", collectionCredit: true, fullClearRequired: true },
       ],
       milestones: {
         startedCollecting: 1,
         collectorHabit: 2,
         stillCollecting: 2,
-        thousandMarks: { count: 1, themes: 1 },
+        thousandMarks: { count: 1, domains: 1 },
         almostComplete: { remaining: 1 },
       },
     };
@@ -169,23 +186,23 @@ describe("collection edition validation（§10）", () => {
   });
 
   it("fullClearRequired memberが1件も無いとreject", () => {
-    const a = behavior("v2.test.a", "theme-a");
+    const a = behavior("v2.test.a", "domain-a");
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
-      members: [{ titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: false }],
+      members: [{ titleKey: a.key, collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: false }],
       milestones: VALID_MILESTONES,
     };
     expect(() => assertValidCollectionEdition(edition, definitionsMap([a]))).toThrow(/at least one fullClearRequired/);
   });
 
   it("collectionCredit:falseかつfullClearRequired:falseのmemberをreject（editionのmemberとして意味が無い）", () => {
-    const a = behavior("v2.test.a", "theme-a");
-    const b = behavior("v2.test.b", "theme-a");
+    const a = behavior("v2.test.a", "domain-a");
+    const b = behavior("v2.test.b", "domain-a");
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
       members: [
-        { titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true },
-        { titleKey: b.key, themeKey: "theme-a", collectionCredit: false, fullClearRequired: false },
+        { titleKey: a.key, collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: true },
+        { titleKey: b.key, collectionDomainKey: "domain-a", collectionCredit: false, fullClearRequired: false },
       ],
       milestones: VALID_MILESTONES,
     };
@@ -204,33 +221,33 @@ describe("collection edition validation（§10）", () => {
     expect(() => assertValidCollectionEdition(edition, definitionsMap(defs))).toThrow(/non-negative integer/);
   });
 
-  it("collectionCredit:falseのmemberのthemeはcountableThemesに数えない", () => {
-    // a/b/cはtheme-aでcollectionCredit:true（countableCount=3, countableThemes={theme-a}=1）。
-    // dはtheme-bだがcollectionCredit:falseなので、countableThemesにtheme-bは数えない
+  it("collectionCredit:falseのmemberのdomainはcountableDomainsに数えない", () => {
+    // a/b/cはdomain-aでcollectionCredit:true（countableCount=3, countableDomains={domain-a}=1）。
+    // dはdomain-bだがcollectionCredit:falseなので、countableDomainsにdomain-bは数えない
     // （dはfullClearRequired:trueにしてedition memberとしての意味を持たせる——
     // collectionCredit/fullClearRequiredが両方falseのmemberはそれ自体が別途禁止されている）。
-    const a = behavior("v2.test.a", "theme-a");
-    const b = behavior("v2.test.b", "theme-a");
-    const c = behavior("v2.test.c", "theme-a");
-    const d = behavior("v2.test.d", "theme-b");
+    const a = behavior("v2.test.a", "domain-a");
+    const b = behavior("v2.test.b", "domain-a");
+    const c = behavior("v2.test.c", "domain-a");
+    const d = behavior("v2.test.d", "domain-b");
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
       members: [
-        { titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true },
-        { titleKey: b.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: false },
-        { titleKey: c.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: false },
-        { titleKey: d.key, themeKey: "theme-b", collectionCredit: false, fullClearRequired: true },
+        { titleKey: a.key, collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: true },
+        { titleKey: b.key, collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: false },
+        { titleKey: c.key, collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: false },
+        { titleKey: d.key, collectionDomainKey: "domain-b", collectionCredit: false, fullClearRequired: true },
       ],
       milestones: {
         startedCollecting: 1,
         collectorHabit: 2,
         stillCollecting: 3,
-        thousandMarks: { count: 3, themes: 2 }, // themes=2はtheme-bも数えた場合の値。countableThemesは1のはず
+        thousandMarks: { count: 3, domains: 2 }, // domains=2はdomain-bも数えた場合の値。countableDomainsは1のはず
         almostComplete: { remaining: 1 },
       },
     };
     expect(() => assertValidCollectionEdition(edition, definitionsMap([a, b, c, d]))).toThrow(
-      /thousandMarks\.themes \(2\) exceeds countable theme count \(1\)/,
+      /thousandMarks\.domains \(2\) exceeds countable domain count \(1\)/,
     );
   });
 
@@ -273,7 +290,7 @@ describe("collection edition validation（§10）", () => {
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
       members,
-      milestones: { ...VALID_MILESTONES, stillCollecting: 5, thousandMarks: { count: 4, themes: 2 } },
+      milestones: { ...VALID_MILESTONES, stillCollecting: 5, thousandMarks: { count: 4, domains: 2 } },
     };
     expect(() => assertValidCollectionEdition(edition, definitionsMap(defs))).toThrow(
       /stillCollecting \(5\) must be <= thousandMarks\.count \(4\)/,
@@ -285,7 +302,7 @@ describe("collection edition validation（§10）", () => {
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
       members,
-      milestones: { ...VALID_MILESTONES, thousandMarks: { count: 1000, themes: 2 } },
+      milestones: { ...VALID_MILESTONES, thousandMarks: { count: 1000, domains: 2 } },
     };
     // 2タイトルしか無いfixtureではなく、5タイトルの現実的なfixtureでもcountableCount(5)を
     // 超えるthousandMarks.countは無効——「集める対象」の総数を超える閾値は意味を成さない。
@@ -294,48 +311,50 @@ describe("collection edition validation（§10）", () => {
     );
   });
 
-  it("thousandMarks.themes >= 1", () => {
+  it("thousandMarks.domains >= 1", () => {
     const { defs, members } = fiveMemberFixture();
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
       members,
-      milestones: { ...VALID_MILESTONES, thousandMarks: { count: 5, themes: 0 } },
+      milestones: { ...VALID_MILESTONES, thousandMarks: { count: 5, domains: 0 } },
     };
-    expect(() => assertValidCollectionEdition(edition, definitionsMap(defs))).toThrow(/thousandMarks\.themes \(0\) must be >= 1/);
+    expect(() => assertValidCollectionEdition(edition, definitionsMap(defs))).toThrow(
+      /thousandMarks\.domains \(0\) must be >= 1/,
+    );
   });
 
-  it("thousandMarks.themesが数えられるtheme数を超えるとreject", () => {
+  it("thousandMarks.domainsが数えられるdomain数を超えるとreject", () => {
     const { defs, members } = fiveMemberFixture();
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
       members,
-      milestones: { ...VALID_MILESTONES, thousandMarks: { count: 5, themes: 3 } }, // themeはtheme-a/theme-bの2種類しか無い
+      milestones: { ...VALID_MILESTONES, thousandMarks: { count: 5, domains: 3 } }, // domainはdomain-a/domain-bの2種類しか無い
     };
-    expect(() => assertValidCollectionEdition(edition, definitionsMap(defs))).toThrow(/exceeds countable theme count/);
+    expect(() => assertValidCollectionEdition(edition, definitionsMap(defs))).toThrow(/exceeds countable domain count/);
   });
 
-  it("thousandMarks.themes <= thousandMarks.count", () => {
-    // 5テーマ×5タイトル（1テーマ1タイトル）にして、countableThemes=5を確保する
-    // ——先に評価される「themes<=countableThemes」チェックに引っかからないようにする。
-    const a = behavior("v2.test.a", "theme-a");
-    const b = behavior("v2.test.b", "theme-b");
-    const c = behavior("v2.test.c", "theme-c");
-    const d = behavior("v2.test.d", "theme-d");
-    const e = behavior("v2.test.e", "theme-e");
+  it("thousandMarks.domains <= thousandMarks.count", () => {
+    // 5ドメイン×5タイトル（1ドメイン1タイトル）にして、countableDomains=5を確保する
+    // ——先に評価される「domains<=countableDomains」チェックに引っかからないようにする。
+    const a = behavior("v2.test.a", "domain-a");
+    const b = behavior("v2.test.b", "domain-b");
+    const c = behavior("v2.test.c", "domain-c");
+    const d = behavior("v2.test.d", "domain-d");
+    const e = behavior("v2.test.e", "domain-e");
     const defs = [a, b, c, d, e];
     const members: TitleCollectionEdition["members"] = defs.map((def, i) => ({
       titleKey: def.key,
-      themeKey: def.themeKey,
+      collectionDomainKey: def.kind === "behavior" ? def.collectionDomainKey : "",
       collectionCredit: true,
       fullClearRequired: i === 0,
     }));
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
       members,
-      milestones: { ...VALID_MILESTONES, thousandMarks: { count: 3, themes: 4 } },
+      milestones: { ...VALID_MILESTONES, thousandMarks: { count: 3, domains: 4 } },
     };
     expect(() => assertValidCollectionEdition(edition, definitionsMap(defs))).toThrow(
-      /thousandMarks\.themes \(4\) must be <= thousandMarks\.count \(3\)/,
+      /thousandMarks\.domains \(4\) must be <= thousandMarks\.count \(3\)/,
     );
   });
 
@@ -383,7 +402,7 @@ describe("構造契約とactivation eligibilityの分離（historical repairと�
     // milestone連鎖を成立させるためfiveMemberFixture()を使い、fullClearRequired:trueな
     // memberの1つ（a）だけをretiredへ差し替える。
     const { defs, members } = fiveMemberFixture();
-    const retiredDefs = defs.map((d) => (d.key === "v2.test.a" ? behavior("v2.test.a", "theme-a", "retired") : d));
+    const retiredDefs = defs.map((d) => (d.key === "v2.test.a" ? behavior("v2.test.a", "domain-a", "retired") : d));
     const edition: TitleCollectionEdition = { editionKey: "v1-edition", members, milestones: VALID_MILESTONES };
     const map = definitionsMap(retiredDefs);
     expect(() => assertValidCollectionEdition(edition, map)).not.toThrow();
@@ -396,7 +415,7 @@ describe("構造契約とactivation eligibilityの分離（historical repairと�
     // cはcollectionCredit:trueのみ（fullClearRequired:false）——fullClearRequiredで
     // なくてもlifecycleチェックが効くことを確認する。
     const { defs, members } = fiveMemberFixture();
-    const disabledDefs = defs.map((d) => (d.key === "v2.test.c" ? behavior("v2.test.c", "theme-a", "disabled") : d));
+    const disabledDefs = defs.map((d) => (d.key === "v2.test.c" ? behavior("v2.test.c", "domain-a", "disabled") : d));
     const edition: TitleCollectionEdition = { editionKey: "v1-edition", members, milestones: VALID_MILESTONES };
     const map = definitionsMap(disabledDefs);
     expect(() => assertValidCollectionEdition(edition, map)).not.toThrow();
@@ -406,13 +425,13 @@ describe("構造契約とactivation eligibilityの分離（historical repairと�
   });
 
   it("collectionCredit/fullClearRequiredが両方falseのmemberは構造validationの時点でreject（activationまで進まない）", () => {
-    const a = behavior("v2.test.a", "theme-a");
-    const b = behavior("v2.test.b", "theme-a");
+    const a = behavior("v2.test.a", "domain-a");
+    const b = behavior("v2.test.b", "domain-a");
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
       members: [
-        { titleKey: a.key, themeKey: "theme-a", collectionCredit: true, fullClearRequired: true },
-        { titleKey: b.key, themeKey: "theme-a", collectionCredit: false, fullClearRequired: false },
+        { titleKey: a.key, collectionDomainKey: "domain-a", collectionCredit: true, fullClearRequired: true },
+        { titleKey: b.key, collectionDomainKey: "domain-a", collectionCredit: false, fullClearRequired: false },
       ],
       milestones: VALID_MILESTONES,
     };
@@ -422,10 +441,10 @@ describe("構造契約とactivation eligibilityの分離（historical repairと�
   });
 
   it("meta titleのfail-closedチェックは構造validation側に残っている（activation eligibilityへ移していない）", () => {
-    const m = meta("v2.test.meta-a", "theme-a");
+    const m = meta("v2.test.meta-a", "domain-a");
     const edition: TitleCollectionEdition = {
       editionKey: "v1-edition",
-      members: [{ titleKey: m.key, themeKey: "theme-a", collectionCredit: false, fullClearRequired: true }],
+      members: [{ titleKey: m.key, collectionDomainKey: "domain-a", collectionCredit: false, fullClearRequired: true }],
       milestones: VALID_MILESTONES,
     };
     const map = definitionsMap([m]);

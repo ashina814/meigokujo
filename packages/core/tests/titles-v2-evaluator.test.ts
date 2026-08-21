@@ -71,6 +71,7 @@ const COMMON_FIXTURE_FIELDS = {
   publicAnnounce: false,
   themeKey: "test-theme",
   groupKey: "test-group",
+  collectionDomainKey: "test-domain",
   scope: { type: "global" as const },
 };
 

@@ -14,6 +14,7 @@ const BEHAVIOR_COMMON = {
   publicAnnounce: false,
   themeKey: "sample-theme",
   groupKey: "sample-group",
+  collectionDomainKey: "sample-domain",
   scope: { type: "global" as const },
 };
 
@@ -154,12 +155,31 @@ describe("scope policy validation（§5, §6）", () => {
     }
   });
 
-  it("themeKey/groupKey/catalog/eventKeyはslugでなければ拒否する（コロンや空白を許可しない）", () => {
+  it("themeKey/groupKey/catalog/eventKey/collectionDomainKeyはslugでなければ拒否する（コロンや空白を許可しない）", () => {
     expect(() => defineBehaviorTitle(validBehavior({ themeKey: "bad:theme" }))).toThrow(/must be a slug/);
     expect(() => defineBehaviorTitle(validBehavior({ groupKey: "bad group" }))).toThrow(/must be a slug/);
     expect(() => defineBehaviorTitle(validBehavior({ catalog: "bad:catalog" }))).toThrow(/must be a slug/);
+    expect(() => defineBehaviorTitle(validBehavior({ collectionDomainKey: "bad domain" }))).toThrow(/must be a slug/);
     expect(() => defineBehaviorTitle(validBehavior({ scope: { type: "event", eventKey: "bad:key" } }))).toThrow(
       /must be a slug/,
     );
+  });
+});
+
+describe("collectionDomainKey（PR B2契約correction A）", () => {
+  it("collectionDomainKeyは必須で、themeKeyとは独立して保持される", () => {
+    const def = defineBehaviorTitle(validBehavior({ themeKey: "theme-a", collectionDomainKey: "domain-a" }));
+    expect(def.themeKey).toBe("theme-a");
+    expect(def.collectionDomainKey).toBe("domain-a");
+  });
+
+  it("themeKeyを変えてもcollectionDomainKeyは変わらない（別概念であることの直接確認）", () => {
+    const def = defineBehaviorTitle(validBehavior({ themeKey: "renamed-theme", collectionDomainKey: "domain-a" }));
+    expect(def.collectionDomainKey).toBe("domain-a");
+  });
+
+  it("metaはcollectionDomainKeyを持たない（型レベルで存在しない）", () => {
+    const meta = defineMetaTitle(validMeta());
+    expect((meta as unknown as Record<string, unknown>).collectionDomainKey).toBeUndefined();
   });
 });

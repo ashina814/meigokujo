@@ -112,16 +112,51 @@ export {
 export {
   assertValidSeriesManifest,
   assertNoOverlappingSeriesMembership,
+  computeSeriesManifestHash,
+  type SeriesManifestHashInput,
   type TitleSeriesManifest,
 } from "./v2-series.js";
 
 export {
   assertCollectionEditionActivatable,
   assertValidCollectionEdition,
+  computeCollectionEditionHash,
   type TitleCollectionEdition,
   type TitleCollectionMember,
   type TitleCollectionMilestonePolicy,
 } from "./v2-collection.js";
+
+export {
+  registerSeriesManifests,
+  reconcileSeriesMasteriesForUser,
+  assertSeriesPersistenceIntegrity,
+  listSeriesManifests,
+  seriesManifest,
+  listSeriesMasteries,
+  hasSeriesMastery,
+  type NewlyMasteredSeries,
+  type ReconcileSeriesMasteriesResult,
+  type RegisterSeriesManifestsResult,
+  type TitleSeriesManifestSummary,
+  type TitleSeriesMasteryRow,
+} from "./v2-series-store.js";
+
+export {
+  activateCollectionEdition,
+  closeCollectionEdition,
+  assertActiveCollectionEditionMatchesRuntime,
+  assertCollectionPersistenceIntegrity,
+  collectionEditionProgress,
+  activeCollectionEdition,
+  collectionEdition,
+  listCollectionEditions,
+  type ActivateCollectionEditionResult,
+  type ActivateCollectionEditionStatus,
+  type CloseCollectionEditionResult,
+  type CloseCollectionEditionStatus,
+  type CollectionEditionProgress,
+  type TitleCollectionEditionRow,
+} from "./v2-collection-store.js";
 
 export {
   type TitleAcquisitionRaritySnapshot,

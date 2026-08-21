@@ -24,6 +24,7 @@ function stage(
     publicAnnounce: false,
     themeKey: "vc_ignite",
     groupKey: "vc_ignite",
+    collectionDomainKey: "vc_ignite",
     scope: { type: "global" },
     ...overrides,
   });
@@ -81,13 +82,13 @@ describe("series manifest validation（§9）", () => {
     expect(() => assertValidSeriesManifest(manifestOf(members), members)).toThrow(/contiguous sequence/);
   });
 
-  it("themeKeyが異なるmemberをreject", () => {
+  it("themeKeyが異なっていてもsame group/seriesならvalid（themeはlogicに使わない、契約correction B）", () => {
     const members = validLadder();
     members[1] = stage("v2.test.ignite-2", {
       progression: { seriesKey: "vc_ignite_main", stage: 2 },
       themeKey: "other-theme",
     });
-    expect(() => assertValidSeriesManifest(manifestOf(members), members)).toThrow(/different themeKey/);
+    expect(() => assertValidSeriesManifest(manifestOf(members), members)).not.toThrow();
   });
 
   it("groupKeyが異なるmemberをreject", () => {

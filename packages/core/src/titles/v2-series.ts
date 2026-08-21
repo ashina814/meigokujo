@@ -1,3 +1,4 @@
+import { canonicalHash } from "../casino/opening-canonical.js";
 import { assertSlug, type BehaviorTitleDefinition } from "./v2-contract.js";
 
 /**
@@ -15,9 +16,10 @@ import { assertSlug, type BehaviorTitleDefinition } from "./v2-contract.js";
  * `assertNoOverlappingSeriesMembership()` が同一 (catalog, seriesKey) の複数manifest
  * 存在そのものを拒否するため、そもそもruntime上も許されない。
  *
- * runtimeで時系列immutabilityそのものを証明するDB（例: manifestのバージョン履歴を
- * 保存するテーブル）はこのPRの範囲外——ここでは契約の意味とtestだけを固定する。DB
- * persistenceは後続PR。
+ * DB persistence（`title_series_manifests` / `title_series_members`）は
+ * `v2-series-store.ts`（PR B2）が担う——`registerSeriesManifests()` がこの検証を
+ * 通した上でatomicに保存し、`computeSeriesManifestHash()` が「後から書き換えられて
+ * いないか」を検出するsemantic hashを提供する。
  */
 export interface TitleSeriesManifest {
   readonly catalog: string;
@@ -34,11 +36,16 @@ export interface TitleSeriesManifest {
  * - members >= 2
  * - member titleが実在する（memberDefinitionsに含まれる）
  * - 全memberが同じcatalog
- * - 全memberが同じthemeKey
  * - 全memberが同じgroupKey（原則同じgroup）
  * - 全memberがprogressionを持ち、seriesKeyが一致する
  * - stageは重複禁止・1始まりの連番（欠番禁止）
  * - manifest内でのmember重複禁止
+ *
+ * `themeKey` はここでは検証しない——themeはeditorial/browsing/display専用の
+ * カテゴリであり（`v2-contract.ts` の `TitleDefinitionCommon.themeKey` 参照）、series
+ * logicに使わない。member同士のthemeKeyが異なっていても、released seriesの意味は
+ * 変わらない（theme変更で既存seriesが事後的にinvalidになるのは設計として不適切）。
+ * seriesのsemantic一致条件は catalog / groupKey / seriesKey / stage の連番性で十分。
  */
 export function assertValidSeriesManifest(
   manifest: TitleSeriesManifest,
@@ -58,7 +65,6 @@ export function assertValidSeriesManifest(
 
   const byKey = new Map(memberDefinitions.map((d) => [d.key, d]));
   const seenStages = new Set<number>();
-  let expectedTheme: string | null = null;
   let expectedGroup: string | null = null;
 
   for (const memberKey of manifest.members) {
@@ -67,12 +73,6 @@ export function assertValidSeriesManifest(
     if (def.catalog !== manifest.catalog) {
       throw new Error(
         `series ${manifest.seriesKey}: member ${memberKey} belongs to a different catalog (${def.catalog} != ${manifest.catalog})`,
-      );
-    }
-    if (expectedTheme === null) expectedTheme = def.themeKey;
-    else if (def.themeKey !== expectedTheme) {
-      throw new Error(
-        `series ${manifest.seriesKey}: member ${memberKey} has a different themeKey (${def.themeKey} != ${expectedTheme})`,
       );
     }
     if (expectedGroup === null) expectedGroup = def.groupKey;
@@ -133,4 +133,38 @@ export function assertNoOverlappingSeriesMembership(manifests: readonly TitleSer
       owner.set(key, manifest.seriesKey);
     }
   }
+}
+
+/** `computeSeriesManifestHash()` の入力。DB永続化されたmemberスナップショットから直接再構成できる形。 */
+export interface SeriesManifestHashInput {
+  readonly catalog: string;
+  readonly seriesKey: string;
+  readonly masteryEligible: boolean;
+  readonly members: readonly { readonly titleKey: string; readonly stage: number }[];
+}
+
+/**
+ * released seriesのmeaningが後から変わっていないことを検出するための、決定的な
+ * semantic hash（PR B2）。
+ *
+ * hash対象は catalog / seriesKey / masteryEligible / member (titleKey, stage) のみ——
+ * `label` はpresentation扱いなのでhashに含めない（label文言を後から調整しても
+ * semanticは変わらない）。member arrayは**入力順ではなくstage順へcanonicalize**
+ * してからhashする——DBからの読み取り順やcaller側の配列順に依存させないため。
+ *
+ * `members` は `{titleKey, stage}` のペアだけで構成する——DB上の `title_series_members`
+ * テーブルから直接再構成できる形にすることで、runtimeの `BehaviorTitleDefinition` map
+ * が無いconstruction-time integrity checkでも、DB snapshotだけからこの関数を
+ * 再計算できる（`v2-series-store.ts` の `assertSeriesPersistenceIntegrity()` 参照）。
+ */
+export function computeSeriesManifestHash(input: SeriesManifestHashInput): string {
+  const canonicalMembers = [...input.members]
+    .sort((a, b) => a.stage - b.stage)
+    .map((m) => [m.titleKey, m.stage] as const);
+  return canonicalHash({
+    catalog: input.catalog,
+    seriesKey: input.seriesKey,
+    masteryEligible: input.masteryEligible,
+    members: canonicalMembers,
+  });
 }

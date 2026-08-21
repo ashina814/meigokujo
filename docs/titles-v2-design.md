@@ -239,40 +239,49 @@ scope policyの意味はreleased title semanticの一部——resolverのsemanti
   - `event`: `completedAt<=observedAt`をresolver側で要求するため、`endExclusive`（=`completedAt`）は`observedAt`から独立した真に固定のendになる。
 - scopeKeyはcanonical生成のみ: `global` / `catalog:<catalogKey>` / `month:<catalogKey>:<YYYY-MM>` / `event:<catalogKey>:<eventKey>`。`catalogKey`・`eventKey`・`themeKey`・`groupKey`・`progression.seriesKey` はすべて `assertSlug()`（lowercase英数字・`-`・`_`のみ）でvalidateし、`:`や空白を許可しない——scopeKeyの文字列結合が曖昧にならないようにするため。
 
-### Theme / Group / Progression（PR A）
+### Theme / Group / Progression / Collection Domain（PR A・PR B2でtheme/domain分離）
 
-`BehaviorTitleDefinition` は `themeKey` / `groupKey` / 任意の `progression` を持つ。意味は完全に分離する。
+`BehaviorTitleDefinition` は `themeKey` / `groupKey` / `collectionDomainKey` / 任意の `progression` を持つ。意味は完全に分離する。
 
-- **Theme**: 「何の分野か」。将来のtheme breadth集計（千印万来等）に使う。
+- **Theme**: editorial/browsing/display専用のカテゴリ。表示の整理にのみ使い、series/collection logicには一切使わない。将来titleを別themeへ移動してよい（released後もimmutableではない）。
 - **Group**: 関連称号のまとまり。side titleも同じgroupに入れる。
 - **Progression** (`{ seriesKey, stage }`): 順番のあるcumulative ladder。《一門皆伝》の対象。`stage` は1始まりの正整数。
+- **Collection Domain** (`collectionDomainKey`): collection breadth判定（千印万来のtheme breadth集計等）用のsemantic identity。`v2-collection.ts` の `TitleCollectionMember.collectionDomainKey` が横断性判定の基準として直接参照する。
 
-`released title` の theme/group/series/stageはsemanticとしてimmutable想定。
+**PR B2契約correction A**: 当初 `themeKey` に「将来のtheme breadth集計に使う」という意味を持たせ、`TitleCollectionMember` も `themeKey` をimmutable manifestへ保存していたが、これは設計として誤りだった——themeはeditorial/display専用であるべきで、後からtitleのthemeを整理し直しただけでcollection breadthの意味が変わってしまうのは不適切。theme breadth用のsemantic identityを`collectionDomainKey`として分離し、`themeKey`はlogicから完全に切り離した。`released` behavior titleの`collectionDomainKey`はsemantic contractの一部——他のimmutableフィールド（catalog/scope policy/progression等）と同様、後から別domainへ付け替えない。
 
-### Series Manifest（PR A）
+`released title` の group/series/stage/collectionDomainKeyはsemanticとしてimmutable想定（themeKeyは除く）。
 
-title definitionsを自動走査して「現在存在するstage全部」を一門皆伝（mastery）対象にする方式は禁止。`TitleSeriesManifest`（`packages/core/src/titles/v2-series.ts`）が **released（一度公開した）series は永久にfreezeする** immutable契約を持つ——`members` の並びと内容そのものが《一門皆伝》条件の一部であるため、後からstageを追加しない。新しいladder（例: stage4を持つ版）が欲しい場合は、同じ `(catalog, seriesKey)` を使い回さず、新しいseriesKey + 新しいtitle key群を作る。既存の `(catalog, seriesKey)` を持つmanifestを「新しい内容へ置き換える」ことは正当な拡張手段ではない（runtimeでも `assertNoOverlappingSeriesMembership()` が同一identityの複数manifest存在そのものを拒否する）。時系列immutabilityを証明するDB（manifestのバージョン履歴テーブル等）はこのPRの範囲外——ここでは契約の意味とtestだけを固定する。
+### Series Manifest（PR A・DB永続化はPR B2）
 
-`assertValidSeriesManifest()` が検証する内容: members>=2、member titleの実在、同一catalog/theme/group、全memberが対象seriesのprogressionを宣言していること、stageの重複・欠番禁止（1始まりの連番）。`assertNoOverlappingSeriesMembership()` が、manifest横断で(a) 1 titleが複数seriesへ所属していないか、(b) 同一 `(catalog, seriesKey)` を名乗るmanifestが複数存在しないかを検証する。
+title definitionsを自動走査して「現在存在するstage全部」を一門皆伝（mastery）対象にする方式は禁止。`TitleSeriesManifest`（`packages/core/src/titles/v2-series.ts`）が **released（一度公開した）series は永久にfreezeする** immutable契約を持つ——`members` の並びと内容そのものが《一門皆伝》条件の一部であるため、後からstageを追加しない。新しいladder（例: stage4を持つ版）が欲しい場合は、同じ `(catalog, seriesKey)` を使い回さず、新しいseriesKey + 新しいtitle key群を作る。既存の `(catalog, seriesKey)` を持つmanifestを「新しい内容へ置き換える」ことは正当な拡張手段ではない（runtimeでも `assertNoOverlappingSeriesMembership()` が同一identityの複数manifest存在そのものを拒否する）。
 
-### Collection / Full-clear Manifest（PR A）
+`assertValidSeriesManifest()` が検証する内容: members>=2、member titleの実在、同一catalog/group、全memberが対象seriesのprogressionを宣言していること、stageの重複・欠番禁止（1始まりの連番）。`assertNoOverlappingSeriesMembership()` が、manifest横断で(a) 1 titleが複数seriesへ所属していないか、(b) 同一 `(catalog, seriesKey)` を名乗るmanifestが複数存在しないかを検証する。
 
-Collection Editionはtitle catalogとは別概念。`TitleCollectionEdition`（`packages/core/src/titles/v2-collection.ts`）が `editionKey` と `members`（`titleKey` / `themeKey` / `collectionCredit` / `fullClearRequired`）、およびedition固有の `milestones`（`thousandMarks.count`/`themes` 等）を持つ。旧 `countsForCompletion` のようにtitle definition自身へCollection Credit / Full-clear Requiredを持たせない。**意図的に `catalog` フィールドを持たない**——collection editionは将来的に複数catalog（第I期・第II期等）由来のbehavior titleを1つのfull-clear editionへ束ねる必要があるため、editionそのものを単一catalogへ拘束しない（memberごとにtitleKeyからdefinitionを引いてthemeKey整合性等を検証すれば足りる）。
+**PR B2契約correction B**: `assertValidSeriesManifest()` は当初、全memberの`themeKey`一致も要求していたが、これは削除した。themeはeditorial/display専用metadataであり、theme変更でreleased seriesがinvalidになってはいけない——seriesのsemantic一致条件は catalog / groupKey / seriesKey / stageの連番性で十分。`themeKey`はseries logicへ一切使わない。
+
+`runtimeで時系列immutabilityそのものを証明するDB persistence`（`title_series_manifests` / `title_series_members`）は`v2-series-store.ts`（PR B2）が担う。詳細は「Series Manifest / Series Mastery persistence（PR B2）」参照。
+
+### Collection / Full-clear Manifest（PR A・DB永続化はPR B2）
+
+Collection Editionはtitle catalogとは別概念。`TitleCollectionEdition`（`packages/core/src/titles/v2-collection.ts`）が `editionKey` と `members`（`titleKey` / `collectionDomainKey` / `collectionCredit` / `fullClearRequired`）、およびedition固有の `milestones`（`thousandMarks.count`/`domains` 等）を持つ。旧 `countsForCompletion` のようにtitle definition自身へCollection Credit / Full-clear Requiredを持たせない。**意図的に `catalog` フィールドを持たない**——collection editionは将来的に複数catalog（第I期・第II期等）由来のbehavior titleを1つのfull-clear editionへ束ねる必要があるため、editionそのものを単一catalogへ拘束しない（memberごとにtitleKeyからdefinitionを引いてcollectionDomainKey整合性等を検証すれば足りる）。
 
 《千印万来》《万印皆伝》のようなmeta titleのsemanticは、絶対的な閾値をmeta title自身に持たせず「有効なcollection/full-clear editionのmilestone policyを満たしたか」とする——catalog規模が変われば新しいeditionを作ればよく、meta title自体のkeyや判定ロジックを変えなくて済む。
 
-**collection editionもtitle catalogと同様immutable**——一度公開したら `members`/`milestones` を書き換えない。ある時点でrequired titleがretired/disabledになった場合でも、そのeditionが「当時は有効だった」という事実は変わらず、「当時editionをcomplete済みだったユーザー」を後から修復評価（historical repair）するには、そのeditionの構造そのものが引き続きvalidである必要がある。運用の想定手順は: (1) active editionのrequired/collection titleをretire/disableする必要が生じたら、まず**そのeditionをclose**する（このPRではclose自体の型・DBは作らない）、(2) old editionのmanifestは変更しない、(3) 次のeditionを新しいmember setで作る、(4) closed editionはhistorical repairのために保持し続ける。
+**collection editionもtitle catalogと同様immutable**——一度公開したら `members`/`milestones` を書き換えない。ある時点でrequired titleがretired/disabledになった場合でも、そのeditionが「当時は有効だった」という事実は変わらず、「当時editionをcomplete済みだったユーザー」を後から修復評価（historical repair）するには、そのeditionの構造そのものが引き続きvalidである必要がある。運用の想定手順は: (1) active editionのrequired/collection titleをretire/disableする必要が生じたら、まず**そのeditionをclose**する（`v2-collection-store.ts` の `closeCollectionEdition()`、PR B2）、(2) old editionのmanifestは変更しない、(3) 次のeditionを新しいmember setで作る、(4) closed editionはhistorical repairのために保持し続ける。
 
 この「immutableな構造」と「今から新規activateしてよいか」は別の関心事なので、検証関数を分離した。
 
 - `assertValidCollectionEdition()`: 時間が経っても変わらない**構造契約**だけを検証する（member titleのlifecycleは見ない——historical closed editionもこれは通り続ける）。
-  - member重複禁止・member titleの実在・themeKeyの一致
+  - member重複禁止・member titleの実在・collectionDomainKeyの一致
   - **meta titleはcollectionCredit/fullClearRequiredのどちらにもできない**（meta titleはcollection/full-clearの分母・分子どちらへも入らない——meta title自体が「有効なcollection editionを満たしたか」を判定する側であり、判定対象の一部を兼ねると自己参照的になるため）
   - **collectionCredit:falseかつfullClearRequired:falseのmemberは禁止**（editionのmemberとして何の意味も持たない）
   - fullClearRequired memberが最低1件
   - milestone値はすべて非負整数
 - `assertCollectionEditionActivatable()`: `assertValidCollectionEdition()` を先に通した上で、**「今このeditionを新規activateしてよいか」**を追加で検証する——collectionCredit/fullClearRequiredの少なくとも一方がtrueなmemberは、definition.lifecycleが現在`"active"`であることを要求する。historical closed editionはこの関数を通す必要は無い。
-- `countableCount`（collectionCredit:trueなmember数）・`countableThemes`（collectionCredit:trueなmemberのdistinct themeKey数——collectionCredit:falseのmemberのthemeは数えない）を基準に: `startedCollecting>=1`、`startedCollecting < collectorHabit < stillCollecting`、`stillCollecting <= thousandMarks.count <= countableCount`、`thousandMarks.themes>=1`、`thousandMarks.themes <= countableThemes`、`thousandMarks.themes <= thousandMarks.count`、`almostComplete.remaining>=1`、`almostComplete.remaining < fullClearCount`（full-clear必須総数）
+- `countableCount`（collectionCredit:trueなmember数）・`countableDomains`（collectionCredit:trueなmemberのdistinct collectionDomainKey数——collectionCredit:falseのmemberのdomainは数えない）を基準に: `startedCollecting>=1`、`startedCollecting < collectorHabit < stillCollecting`、`stillCollecting <= thousandMarks.count <= countableCount`、`thousandMarks.domains>=1`、`thousandMarks.domains <= countableDomains`、`thousandMarks.domains <= thousandMarks.count`、`almostComplete.remaining>=1`、`almostComplete.remaining < fullClearCount`（full-clear必須総数）
+
+DB persistence（`title_collection_editions` 等）は`v2-collection-store.ts`（PR B2）が担う。詳細は「Collection Edition lifecycle（PR B2）」参照。
 
 ### Rarity契約の最低限（PR A・DB永続化はPR B1）
 
@@ -425,6 +434,56 @@ v2はまだ本番wiringされていないため、過去のfoundation award（fa
 加えて `hasAward()` 自身も、見つけたaward行についてfacts rowが「存在するだけ」でtrueにせず、`awardFacts()`相当の内容validation（version/captured_at/JSON body）を通した上でownershipのbundle integrityを確認してから`true`を返す——construction後にout-of-bandな行が挿入される可能性はゼロではないため、読み取り境界でも二重に守る。偽のrepair/backfillでintegrity違反を迂回することはできない。
 
 `awardFacts()`（read API）も、DB内の `facts_version`・`captured_at`・JSON本体のすべてをvalidateしてから返す——壊れたDB値を空object等で誤魔化さない。
+
+### Series Manifest / Series Mastery persistence（PR B2）
+
+released progression seriesのimmutable manifest（`v2-series.ts`）を実際にDBへ保存し、userのseries mastery（一門完遂）をownershipから永続化する（`packages/core/src/titles/v2-series-store.ts`）。
+
+**永続化の正本は persisted manifest**——`title_series_manifests` / `title_series_members` はcatalog/seriesKey単位のimmutable snapshotであり、runtimeの `BehaviorTitleDefinition` mapではなく、この永続化されたsnapshotが historical な正本になる。`registerSeriesManifests(manifests, behaviorDefinitions)` が、`assertValidSeriesManifest()` / `assertNoOverlappingSeriesMembership()` をバッチ全体へ通した上で、以下をatomicに確定する。
+
+- 既にDBへ登録済みの `(catalog, seriesKey)` は、semantic hashが一致すればidempotent（何もしない）、不一致ならfail-closed（released seriesの内容は書き換えない）。
+- 新規登録の場合、渡された配列内だけでなく、**DBに既に登録済みの他series**とのtitle overlapも確認する——`assertNoOverlappingSeriesMembership()` はバッチ内の重複しか見ないため、別途DB上の既存`title_series_members`を検索して確認する（`title_series_members.title_key` のUNIQUE制約が最終防御）。
+- `registered_at` はStore clockの1回のsnapshot（呼び出しごとに1回だけ`clock()`を呼ぶ）。callerが任意timestampを注入できない。
+- manifest + 全memberは単一の `BEGIN IMMEDIATE` transaction内でatomicに確定する。
+
+**semantic hash**: released seriesの意味が後から変わっていないことを検出するため、`computeSeriesManifestHash()`（`v2-series.ts`）が catalog / seriesKey / masteryEligible / member (titleKey, stage) から決定的なhashを計算する（`label`はpresentation扱いなのでhashに含めない）。member arrayは入力順ではなく**stage順へcanonicalize**してからhashする。hash計算はDB member snapshot（`{titleKey, stage}` のペアだけ）から直接再構成できる形にしてある——construction-time integrity checkがruntimeの `BehaviorTitleDefinition` mapを使わず、DBの値だけから再計算できる。
+
+**Series Mastery**: `reconcileSeriesMasteriesForUser(userId)` が、まだmastery未成立な `mastery_eligible=true` series を対象に、全member titleのownership（`title_ownerships`、awardのscope historyではない）が揃っているかを確認し、揃っていれば `title_series_masteries` へ永続化する。既に成立済みのseriesは何もしない（idempotent）。ownershipは永久なのでmasteryも永久——title lifecycleが後からretiredになってもmasteryを消さない。新しくseries manifestを登録した時点で既に全member ownership済みのuserは、後日のreconcileでmastery可能になる。
+
+**`title_series_masteries.recorded_at` は達成時刻ではない**——「Botがseries mastery成立を初めて確認して永続化した時刻」でしかない。member titleの一部がnon-orderable（`earnedAt===null`）だったり、historical repairで後から追加された場合があるため、真の完遂時刻を安全に一意決定できない。将来《一門皆伝》meta titleのearnedAtが必要になった場合は、`title_awards`から別途proofを組み立てる（PR B2の範囲外）。
+
+**semantic integrity**（`assertSeriesPersistenceIntegrity()`、`TitleV2Store` construction時）: mastery行が参照するmanifestが存在し`mastery_eligible=1`であること、mastery userが実際にそのseriesの全member titleをownershipしていること、`recorded_at`が非負整数であること、同一titleが複数series memberになっていないこと（`UNIQUE(title_key)`のdefense-in-depth再確認）、各seriesのstageが1..N contiguousであること、保存済み`manifest_hash`がDB member snapshotから再計算したhashと一致すること。偽mastery/manifestを自動生成して修復しない——欠損・矛盾はfail-closedするだけ。
+
+### Collection Edition lifecycle（PR B2）
+
+activateされたCollection Editionのmanifest snapshotをimmutableにDB保存し、activeなeditionを最大1件に制限し、closeされたeditionをhistorical repairのために保持し続ける（`packages/core/src/titles/v2-collection-store.ts`）。
+
+**activation**: `activateCollectionEdition(edition, definitions, actor, note?)` が `assertCollectionEditionActivatable()`（構造契約 + 現在時点のactivation eligibility）を必ず先に通した上で、単一transaction内で以下を判定する。
+
+- activeなeditionが既に別に存在する → reject（`title_collection_state` のsingleton row `active_edition_key` が最大1件を保証する唯一の実効的な仕組み——これを迂回するDB制約は存在しないため、reject自体がこの契約の唯一の防衛線）
+- editionKey未登録 → edition + membersをatomic insert、active pointerを設定
+- 同editionKeyが既にactiveかつsemantic hash一致 → idempotentな`"already_active"`
+- 同editionKeyだがhash不一致 → reject（editionのmembers/milestonesは書き換えない）
+- 同editionKeyがclosed済み → reject（**reopen禁止**）
+
+`activatedAt` はStore clockのsnapshot。callerが任意timestampを注入できない。
+
+**close**: `closeCollectionEdition(editionKey, actor, note?)` が、現在activeなeditionだけをcloseできる。存在しないeditionKeyはthrow、既にclosed済みの同editionKeyはidempotentな`"already_closed"`（**close metadataは書き換えない**——2回目のcloseで別のactor/noteを渡しても、最初のclose時点のclosedBy/closeNoteのまま）、別editionがactiveなのに古いeditionをcloseしようとした場合はreject。`closed_at`/`active pointerのNULL化`は単一transaction内でatomicに確定する。一度closedになったeditionは`activateCollectionEdition()`側が再openを拒否する。
+
+**semantic hash**: Collection Editionもimmutable semantic hashを持つ（`computeCollectionEditionHash()`、`v2-collection.ts`）。hash対象は `editionKey` / `milestones`（全milestone値） / member（**titleKey順にsort**した上での titleKey・collectionDomainKey・collectionCredit・fullClearRequired）。`activatedAt`/`activatedBy`/`activationNote`/close metadataはhashから除外する——運用ログであり、editionの構造そのものではない。
+
+**historical repair proof契約（§16）**: closed editionのmemberを「close時点で持っていたと証明できる」とみなす条件は次のいずれか。
+
+- **A**: そのuser/titleのawardに `earned_at IS NOT NULL AND earned_at <= edition.closed_at` が1件以上ある（正確な達成時刻がclose以前だと証明できる——historical repairでも可）
+- **B**: そのuser/titleのawardに `awarded_at <= edition.closed_at` が1件以上ある（close前にBotが既にaward記録済み——earnedAtが不明でも、その時点でownership済みだったこと自体は証明できる）
+
+close後にhistorical repairされたawardは、earnedAtが正確にclose以前だと証明できる場合だけ（条件A）旧editionへcreditされる。close後に普通に取得した `awardedAt>closedAt` かつ `earnedAt=NULL` のtitleは、close以前に持っていた証明が無いため旧editionへは一切creditしない。domain breadthもこの同じ「owned扱いにできるtitle集合」から算出するため、closed proofと同時にfreezeされる。
+
+**`collectionEditionProgress(userId, editionKey)`**: active editionは現在の `title_ownerships` を使い、closed editionは上記proof契約だけをowned扱いする。返却値は `collectionOwnedCount`/`collectionTotalCount`/`collectionOwnedDomainCount`/`collectionTotalDomainCount`/`fullClearOwnedCount`/`fullClearRequiredCount`/`fullClearRemainingCount`/`fullClearComplete`/`state`/`editionKey`のみ——**member titleKey・hidden title名・未取得hidden条件は一切含まない**（hidden title leak防止）。meta evaluatorが必要とするのはこの集計値だけであり、このAPIをそのままユーザー向けprogress rendererへ渡してよい。一方、`collectionEdition(editionKey)`/`listCollectionEditions()`（管理用read API）はmember titleKeyを含む——**ユーザー向けprogress rendererへそのまま渡してよいAPIではない**ことをdoc commentで明示している。
+
+**runtime compatibility API**: PR #152で決めた「active editionのpersisted manifestとruntime contractがズレていたらfail-closed」を実行可能にするAPI `assertActiveCollectionEditionMatchesRuntime(runtimeEdition, definitions)` を用意した——runtime manifestのstructural/activatable validation、DB active editionの取得、editionKey一致、semantic hash一致を確認し、mismatchならthrowする。まだbot startupへwiringしない（PR B2の範囲外）——APIとtestsだけを用意する。
+
+**semantic integrity**（`assertCollectionPersistenceIntegrity()`、`TitleV2Store` construction時）: active pointerがNULLならunclosed editionは0件、active pointerが非NULLなら対応editionが存在し`closed_at IS NULL`、unclosed editionはexactly 1件、closed metadata chronology valid（`closed_at>=activated_at`、closed_by整合）、members/milestonesの構造整合（DB member snapshotから再計算した値がmilestoneの不等式契約を満たす）、保存済み`manifest_hash`がDB snapshotから再計算したhashと一致すること。construction時点ではruntimeの `TitleDefinition` mapが無いため、「現在title lifecycle=activeか」はここで判定しない——それは`assertActiveCollectionEditionMatchesRuntime()`の責務。
 
 ## 6. 即時判定 + reconcile
 
