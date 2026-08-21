@@ -46,6 +46,25 @@ import {
   type CollectionEditionProgress,
   type TitleCollectionEditionRow,
 } from "./v2-collection-store.js";
+import type { RankTrack } from "../rank/tiers.js";
+import {
+  IDENTITY_V2_DDL,
+  assertIdentityEquipIntegrity,
+  assertRankTitleUnlockIntegrity,
+  equipIdentity,
+  hasRankTitleUnlock,
+  identityEquip,
+  listIdentityEquips,
+  listRankTitleUnlocks,
+  rankTitleUnlock,
+  reconcileRankTitleUnlocks,
+  recordRankTitleTransition,
+  unequipIdentity,
+  type ProfileIdentity,
+  type ProfileIdentityEquip,
+  type RankTitleUnlockResult,
+  type RankTitleUnlockRow,
+} from "./v2-identity-store.js";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -575,6 +594,8 @@ export class TitleV2Store {
     assertAwardPersistenceIntegrity(db);
     assertSeriesPersistenceIntegrity(db);
     assertCollectionPersistenceIntegrity(db);
+    assertRankTitleUnlockIntegrity(db);
+    assertIdentityEquipIntegrity(db);
   }
 
   /**
@@ -1055,51 +1076,11 @@ export class TitleV2Store {
       .all(userId) as TitleOwnershipRow[];
   }
 
-  /**
-   * 公開するのは装備した0〜3印だけ。
-   * 同じtitle_keyの別scopeを複数枠へ並べることはできない。
-   */
-  equip(userIdRaw: string, slot: number, titleKeyRaw: string, scopeKeyRaw: string): void {
-    const userId = requireText(userIdRaw, "userId");
-    const titleKey = requireV2Key(titleKeyRaw);
-    const scopeKey = requireText(scopeKeyRaw, "scopeKey");
-    if (!Number.isInteger(slot) || slot < 1 || slot > 3) throw new Error(`slot must be 1..3: ${slot}`);
-
-    const awarded = this.db
-      .prepare(
-        `SELECT 1
-           FROM title_awards
-          WHERE user_id = ? AND title_key = ? AND scope_key = ?`,
-      )
-      .get(userId, titleKey, scopeKey);
-    if (!awarded) throw new Error(`cannot equip unowned title: ${titleKey}/${scopeKey}`);
-
-    const move = this.db.transaction(() => {
-      this.db
-        .prepare("DELETE FROM title_equips WHERE user_id = ? AND (slot = ? OR title_key = ?)")
-        .run(userId, slot, titleKey);
-      this.db
-        .prepare("INSERT INTO title_equips (user_id, slot, title_key, scope_key) VALUES (?, ?, ?, ?)")
-        .run(userId, slot, titleKey, scopeKey);
-    });
-    move();
-  }
-
-  unequip(userId: string, slot: number): void {
-    if (!Number.isInteger(slot) || slot < 1 || slot > 3) throw new Error(`slot must be 1..3: ${slot}`);
-    this.db.prepare("DELETE FROM title_equips WHERE user_id = ? AND slot = ?").run(userId, slot);
-  }
-
-  listEquips(userId: string): TitleEquipRow[] {
-    return this.db
-      .prepare(
-        `SELECT user_id, slot, title_key, scope_key
-           FROM title_equips
-          WHERE user_id = ?
-          ORDER BY slot`,
-      )
-      .all(userId) as TitleEquipRow[];
-  }
+  // title_equips（scope-bound、旧正本）への公開mutation/read API（equip()/unequip()/
+  // listEquips()）はPR B3で退役した。title_equipsのTABLE自体はDROPせず互換のため
+  // 残すが、新しいruntime codeは下記の identity equip API（`equipIdentity()`等）
+  // だけを使う——印のidentityはscopeKeyを含まないtitleKeyそのものであり、位名も
+  // 同じ3枠へ装備できる（旧APIにはその両方が無かった）。
 
   // ── Series Manifest / Series Mastery（PR B2、実装は v2-series-store.ts）────────
 
@@ -1167,10 +1148,56 @@ export class TitleV2Store {
   listCollectionEditions(): TitleCollectionEditionRow[] {
     return listCollectionEditions(this.db);
   }
+
+  // ── Rank Title Unlock（PR B3、実装は v2-identity-store.ts）─────────────────
+
+  recordRankTitleTransition(
+    userId: string,
+    track: RankTrack,
+    beforeLevel: number,
+    afterLevel: number,
+  ): RankTitleUnlockResult {
+    return recordRankTitleTransition(this.db, this.clock, userId, track, beforeLevel, afterLevel);
+  }
+
+  reconcileRankTitleUnlocks(userId: string, track: RankTrack, currentLevel: number): RankTitleUnlockResult {
+    return reconcileRankTitleUnlocks(this.db, this.clock, userId, track, currentLevel);
+  }
+
+  hasRankTitleUnlock(userId: string, rankTitleKey: string): boolean {
+    return hasRankTitleUnlock(this.db, userId, rankTitleKey);
+  }
+
+  rankTitleUnlock(userId: string, rankTitleKey: string): RankTitleUnlockRow | null {
+    return rankTitleUnlock(this.db, userId, rankTitleKey);
+  }
+
+  listRankTitleUnlocks(userId: string): RankTitleUnlockRow[] {
+    return listRankTitleUnlocks(this.db, userId);
+  }
+
+  // ── Profile Identity 3-slot equip（PR B3、実装は v2-identity-store.ts）──────
+
+  equipIdentity(userId: string, slot: number, identity: ProfileIdentity): ProfileIdentityEquip {
+    return equipIdentity(this.db, this.clock, userId, slot, identity);
+  }
+
+  unequipIdentity(userId: string, slot: number): void {
+    unequipIdentity(this.db, userId, slot);
+  }
+
+  identityEquip(userId: string, slot: number): ProfileIdentityEquip | null {
+    return identityEquip(this.db, userId, slot);
+  }
+
+  listIdentityEquips(userId: string): ProfileIdentityEquip[] {
+    return listIdentityEquips(this.db, userId);
+  }
 }
 
 export function ensureTitleV2Schema(db: Database.Database): void {
   db.exec(V2_DDL);
   db.exec(SERIES_V2_DDL);
   db.exec(COLLECTION_V2_DDL);
+  db.exec(IDENTITY_V2_DDL);
 }

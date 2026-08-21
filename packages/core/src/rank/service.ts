@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import {
   TEXT_TIERS,
   VOICE_TIERS,
+  didRankTierChange,
   tierFor,
   textLevel,
   textProgress,
@@ -59,7 +60,7 @@ export class RankEngine {
       )
       .run(userId, newXp, ts, tierIndex(textLevel(newXp), TEXT_TIERS), ts);
     const after = this.snapshotText(newXp);
-    return { awarded: xp, before, after, tierUp: before.tier.name !== after.tier.name };
+    return { awarded: xp, before, after, tierUp: didRankTierChange(before.tier, after.tier) };
   }
 
   /** 単に発言回数だけ増やしたい場合（クールダウン中でも記録したいなら別途） */
@@ -116,7 +117,7 @@ export class RankEngine {
       )
       .run(userId, newXp, minutes, ts, tierIndex(voiceLevel(newXp), VOICE_TIERS), ts, minutes);
     const after = this.snapshotVoice(newXp);
-    return { awarded: xp, before, after, tierUp: before.tier.name !== after.tier.name };
+    return { awarded: xp, before, after, tierUp: didRankTierChange(before.tier, after.tier) };
   }
 
   getVoice(userId: string): {
@@ -190,11 +191,30 @@ export class RankEngine {
   }
 }
 
-function tierIndex(level: number, tiers: RankTier[]): number {
+/**
+ * `rank_text.last_tier` / `rank_voice.last_tier` へ書き込むためのarray index。
+ *
+ * **このindexはrank title identityではない**（PR B3）。array順が変わる・tierが
+ * 追加/削除される等でindexの意味は簡単にずれる。legacy bookkeeping/cache
+ * （現在のtierをどこかに素早く引くための最適化）としてのみ残す——
+ * `rank_title_unlocks` / `profile_identity_equips` には絶対に使用しないこと。
+ * DB identityが必要な場面は必ず `RankTier.key`（stable literal）を使う。
+ */
+function tierIndex(level: number, tiers: readonly RankTier[]): number {
   let idx = 0;
   for (let i = 0; i < tiers.length; i++) if (level >= tiers[i]!.minLevel) idx = i;
   return idx;
 }
 
-export { TEXT_TIERS, VOICE_TIERS, textLevel, voiceLevel, textProgress, voiceProgress, tierFor, _nextTier as nextTier };
+export {
+  TEXT_TIERS,
+  VOICE_TIERS,
+  didRankTierChange,
+  textLevel,
+  voiceLevel,
+  textProgress,
+  voiceProgress,
+  tierFor,
+  _nextTier as nextTier,
+};
 export type { RankTier };
