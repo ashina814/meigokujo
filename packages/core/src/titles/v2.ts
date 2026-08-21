@@ -157,3 +157,23 @@ export {
   type TitleAcquisitionRaritySnapshot,
   type TitleCurrentRaritySnapshot,
 } from "./v2-rarity.js";
+
+// v2-identity-store.ts の関数（recordRankTitleTransition / reconcileRankTitleUnlocks /
+// equipIdentity / unequipIdentity 等）も、v2-series-store.ts / v2-collection-store.ts
+// と同じ理由（PR B2 §28）でここからはexportしない——callerがStore内部clockを迂回して
+// 任意timestampを注入できる余地を無くす。public mutation boundaryは`TitleV2Store`の
+// methodsだけに限定する。contract type（`ProfileIdentity`等）はexportして構わない。
+export {
+  type NewlyUnlockedRankTitle,
+  type ProfileIdentity,
+  type ProfileIdentityEquip,
+  type RankTitleUnlockResult,
+  type RankTitleUnlockRow,
+} from "./v2-identity-store.js";
+
+export {
+  rankTierByKey,
+  rankTiersForTrack,
+  type RankTitleKey,
+  type RankTrack,
+} from "../rank/tiers.js";

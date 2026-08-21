@@ -502,6 +502,45 @@ close後にhistorical repairされたawardは、earnedAtが正確にclose**よ�
 
 hashチェックとは**独立して**structural integrityも再検証する——`edition_key`がslug形式、member titleKeyがv2.\*namespace、member `collectionDomainKey`がslug形式、`collection_credit`/`full_clear_required`が0/1、両方falseのmemberが存在しない、milestone全値が非負整数、といった構造契約をDB snapshotだけから直接確認する。hash一致はstructural validationの代替にはならない——一方が迂回されても他方が独立して検出する設計（title existence・behavior/meta種別・definition側のcollectionDomainKey一致は、runtime definitionsが無いためここでは証明できない）。
 
+### Rank Title Unlock（PR B3）
+
+現在の文位・声位（`packages/core/src/rank/tiers.ts` の `RankTier`）は、rank quantity progression（XP/level）とは別の**identity display candidate**——一度到達した位名は、単なる「今のstatus」ではなく、《名乗り》として選べる永続的な所持物になる。
+
+`RankTier` は `key: RankTitleKey`（`` `rank.${track}.${string}` ``）というstable identity keyを持つ。DB identity（`rank_title_unlocks` / `profile_identity_equips`）は必ずこの`key`を正本にする——**display name・array index・`rank_text.last_tier`/`rank_voice.last_tier`のnumeric index・`minLevel`だけでは識別しない**。18件の`key`/`track`/`minLevel`/`name`は明示的literalとして固定し、`` `rank.${track}.lv${minLevel}` `` のようなruntime組み立てはしない——released後はこの組をkey/name/minLevelとも実質freezeとして扱う（display typo修正等を除く）。`rank_text.last_tier`/`rank_voice.last_tier`のarray indexは、`RankEngine`内部のlegacy bookkeeping/cache（現在のtierを素早く引くための最適化）としてのみ残し、`rank_title_unlocks`/`profile_identity_equips`へは絶対に使用しない。
+
+**一度到達した位名は永久unlock**（`rank_title_unlocks`、`packages/core/src/titles/v2-identity-store.ts`）。XP低下・rank計算変更等で削除しない——constructor integrityも、現在のrank XP/levelとunlock済みtierの整合性を要求しない（過去にLv100へ到達して現在Lv50相当へ下がっていても、Lv100位名unlockは正当）。
+
+**historical reconcile vs live observed transitionの区別**が核心の契約:
+
+- **live observed transition**（`recordRankTitleTransition(userId, track, beforeLevel, afterLevel)`）: 今まさに観測した`beforeLevel`→`afterLevel`のlevel変化。跨いだtier（`beforeLevel < minLevel <= afterLevel`）は`unlocked_at = Store clock`（正確な到達時刻として扱える）。downward transition（`afterLevel < beforeLevel`）はreject。
+- **historical reconcile / backfill**（`reconcileRankTitleUnlocks(userId, track, currentLevel)`）: 現在levelから逆算して「過去のいつか到達したはず」のtier（`minLevel <= currentLevel`）を補完する。`unlocked_at = NULL`——**「今Lv75だから過去のLv50到達時刻も今だったことにする」という捏造は絶対にしない**。
+
+`beforeLevel=50, afterLevel=75`のような観測で、DBに過去unlock（Lv0/5/15/30/50）が欠損している場合でも、それらのtierを「今回75になった時刻」にはしない——`minLevel<=beforeLevel`のtierはhistorical missingとして`unlocked_at=NULL`になる。**既存のunlock行（`unlocked_at`がNULLであれnon-nullであれ）は、後続のtransition/reconcileで一切UPDATEしない**——first persisted truthをimmutableに保つ。`recorded_at`はcaller入力ではなく、必ず`clock()`のsnapshot。
+
+将来live wiring時、rank XP更新成功→identity unlock write前にprocess crash、というケースが起こり得る。その場合はdaily reconcileによってmissing rank titleを後から`unlocked_at=NULL`として回収できる——「live writeを逃したから後から現在時刻をexact unlock時刻として捏造」しないための設計上、reconcile APIを observed transition APIから意図的に分離してある。
+
+### 《名乗り》— Profile Identity 3-slot（PR B3）
+
+印（title ownership）と位名（rank title unlock）を共通の3枠へ装備する（`profile_identity_equips`、`equipIdentity()`/`unequipIdentity()`/`listIdentityEquips()`）。`ProfileIdentity` はdiscriminated union（`{kind:"title", titleKey}` | `{kind:"rank_title", rankTitleKey}`）——DB raw shapeをそのままpublic APIへ漏らさない。
+
+- 初期0行。unlockやtitle ownership取得時に自動equipしない——unlockとequipは完全に別の関心事。
+- title equipは`title_ownerships`だけを見る。**scopeKeyは装備identityに含めない**——印のidentityはtitleKeyそのもの。retired titleでも既存holderは引き続きequip可能（構造上、runtime definitionのlifecycleに依存しない——`equipIdentity()`はdefinitions mapを一切受け取らない）。
+- rank title equipは`rank_title_unlocks`だけを見る。現在levelが`tier.minLevel`を満たしているかは要求しない。
+- 同じidentityを複数slotへ重複させない: target slotに別identityがあればreplace（既存occupantはunequip）、同identityが別slotにあればmove、同identityが既に同slotならidempotent no-op。単一transactionでatomic。partial unique index（`title_key IS NOT NULL`/`rank_title_key IS NOT NULL`でそれぞれ絞った`UNIQUE(user_id, title_key)`/`UNIQUE(user_id, rank_title_key)`）がDB層での最終防御。
+- 現在の文位・声位（statusとしての表示）と《名乗り》（slot I/II/III、過去にunlock済みの任意の位名を選べる）は別概念——現在文位が「冥獄の弁士」でも、《名乗り》には「囁く者」を選んでよい。B3ではUI実装しないが、data modelはこの意味を壊さない。
+
+**semantic integrity**（`assertRankTitleUnlockIntegrity()` / `assertIdentityEquipIntegrity()`、`TitleV2Store` construction時）: `rank_title_key`が現在のstable registryに存在すること、`unlocked_at`/`recorded_at`の型・chronology、`profile_identity_equips`のslot範囲・`identity_kind`の妥当性・discriminated columnsの排他性、title equipには対応する`title_ownerships`、rank title equipには対応する`rank_title_unlocks`が存在すること、同一identityのduplicate禁止。既存B1のPRAGMA foreign_key_checkは`title_`prefixのtableだけをfilterしていたため、`rank_title_unlocks`/`profile_identity_equips`（このprefixに当てはまらない）は明示的なJOIN check + `PRAGMA foreign_key_check(profile_identity_equips)`の両方でdangling refを検出する。
+
+### Legacy `title_equips`の退役準備（PR B3）
+
+旧`title_equips`（`user_id, slot, title_key, scope_key`）は最終architectureでは退役する——title award occurrenceへ直接boundされている、scopeKeyが装備identityへ混ざっている、rank titleを装備できない、という3つの理由から。
+
+PR B3では**tableそのものはDROPしない**（既存DB compatibility/rollback/inspectionのため）が、`TitleV2Store.equip()`/`unequip()`/`listEquips()` という旧scope-bound public mutation/read APIは退役した。新しいruntime codeは `equipIdentity()`/`unequipIdentity()`/`listIdentityEquips()` だけを使う。
+
+**old `title_equips`から`profile_identity_equips`への自動migrationはしない**——v2はまだproduction wiringされておらず、旧foundation期間のscope-bound equip rowが本当にユーザーの最終identity選択か保証できないため。旧rowは残してよく、新identity equipsが空でも正常。construction時に両者のmirror一致を要求しない。fresh v2 cutover時にどう扱うかはproduction migration PRで明示的に決める。
+
+**follow-up（production profile cutover、PR B3の範囲外）**: 現在の `/プロフィール` は `services.titles.evaluate(target.id)` を呼んでおり、「プロフィールを見るだけで旧v1称号を取得する」挙動が残っている。v2 cutover時には `/プロフィール` からこの`evaluate`呼び出しを除去し、プロフィール閲覧を完全read-onlyにする。同時に《名乗り》（slot I/II/III）の表示・現在の文位/声位の別枠表示・v2 identity equip UIへ切り替える。PR B3ではこの切り替えを一切行わない——`apps/bot` 配下は変更していない。
+
 ## 6. 即時判定 + reconcile
 
 - 行動直後の即時判定: トロフィー体験のための速い経路。

@@ -221,7 +221,7 @@ describe("称号v2 foundation", () => {
     ).toThrow();
   });
 
-  it("装備は0〜3枠を本人が選び、未所持は不可・同じ印は別scopeでも1枠だけ", () => {
+  it("identity equipは0〜3枠を本人が選び、未所持は不可・同じidentityは1枠だけ（PR B3: 旧title_equips API退役に伴う置き換え）", () => {
     const db = openDb(":memory:");
     let clock = AWARD_BASE;
     const store = new TitleV2Store(db, () => clock);
@@ -245,22 +245,31 @@ describe("称号v2 foundation", () => {
     clock = AWARD_BASE + 500_000;
     store.award({ userId: "alice", titleKey: "v2.table", scope: tableScope, earnedAt: null, awardFacts: NO_FACTS });
 
-    expect(store.listEquips("alice")).toEqual([]);
-    store.equip("alice", 1, "v2.moon", augScope.scopeKey);
-    store.equip("alice", 2, "v2.table", tableScope.scopeKey);
-    expect(store.listEquips("alice").map((r) => [r.slot, r.title_key, r.scope_key])).toEqual([
-      [1, "v2.moon", augScope.scopeKey],
-      [2, "v2.table", tableScope.scopeKey],
+    // 旧scope-bound title_equips API（equip()/unequip()/listEquips()）はPR B3で
+    // 退役し、新しいidentity equip API（equipIdentity()等）だけを使う——印の
+    // identityはscopeKeyを含まないtitleKeyそのものであり、月/eventで何度awardして
+    // いても関係ない（v2.moonは8月・9月の2 scopeへawardしたが、ownershipはtitleKey
+    // 単位で1つだけ）。
+    void augScope;
+    void sepScope;
+    void tableScope;
+    expect(store.listIdentityEquips("alice")).toEqual([]);
+    store.equipIdentity("alice", 1, { kind: "title", titleKey: "v2.moon" });
+    store.equipIdentity("alice", 2, { kind: "title", titleKey: "v2.table" });
+    expect(store.listIdentityEquips("alice")).toEqual([
+      { userId: "alice", slot: 1, identity: { kind: "title", titleKey: "v2.moon" } },
+      { userId: "alice", slot: 2, identity: { kind: "title", titleKey: "v2.table" } },
     ]);
 
-    store.equip("alice", 3, "v2.moon", sepScope.scopeKey);
-    expect(store.listEquips("alice").map((r) => [r.slot, r.title_key, r.scope_key])).toEqual([
-      [2, "v2.table", tableScope.scopeKey],
-      [3, "v2.moon", sepScope.scopeKey],
+    // 同じidentity（v2.moon）を別slotへ装備すると、元のslotからmoveする。
+    store.equipIdentity("alice", 3, { kind: "title", titleKey: "v2.moon" });
+    expect(store.listIdentityEquips("alice")).toEqual([
+      { userId: "alice", slot: 2, identity: { kind: "title", titleKey: "v2.table" } },
+      { userId: "alice", slot: 3, identity: { kind: "title", titleKey: "v2.moon" } },
     ]);
 
-    expect(() => store.equip("alice", 1, "v2.unknown", "global")).toThrow(/unowned/);
-    expect(() => store.equip("alice", 4, "v2.table", tableScope.scopeKey)).toThrow(/slot/);
+    expect(() => store.equipIdentity("alice", 1, { kind: "title", titleKey: "v2.unknown" })).toThrow(/unowned/);
+    expect(() => store.equipIdentity("alice", 4, { kind: "title", titleKey: "v2.table" })).toThrow(/slot/);
   });
 
   it("source registryのwriter/caller、またはderivedByは実ファイルに存在する", () => {
