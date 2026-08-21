@@ -6,6 +6,13 @@ import {
   type TitleSourceKey,
 } from "./v2-contract.js";
 import { assertSourceReaderCoverage } from "./v2-sources.js";
+import { assertResolvedTitleScopeForTitle, resolvedScopeEffectiveEnd, type ResolvedTitleScope } from "./v2-scope.js";
+import {
+  assertValidAwardFacts,
+  assertValidFactsVersion,
+  serializeAwardFacts,
+  type TitleAwardFacts,
+} from "./v2-award-facts.js";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -46,6 +53,8 @@ CREATE TABLE IF NOT EXISTS title_source_baseline_runs (
   PRIMARY KEY (catalog_key, source, metric)
 );
 
+-- 「このscopeでこのtitleを獲得した」という出来事の正本。scopeごとに複数行持てる
+-- （月次titleを毎月award等）。所持そのもの（title_ownerships）とは別概念（PR B1）。
 CREATE TABLE IF NOT EXISTS title_awards (
   user_id    TEXT NOT NULL,
   title_key  TEXT NOT NULL,
@@ -59,6 +68,52 @@ CREATE INDEX IF NOT EXISTS idx_title_awards_user
   ON title_awards(user_id, awarded_at);
 CREATE INDEX IF NOT EXISTS idx_title_awards_title_scope
   ON title_awards(title_key, scope_key);
+
+-- 「そのawardがなぜ成立したか」というaward時点のsafe snapshot（PR B1）。immutable
+-- ——一度INSERTしたfactsをUPDATEしない（同じawardの再評価はfactsを書き換えない、
+-- award()の冪等性の一部）。title_awardsの行が消えるならfactsも一緒に消えてよい
+-- （通常のaward削除APIは今回作らない）。
+CREATE TABLE IF NOT EXISTS title_award_facts (
+  user_id       TEXT NOT NULL,
+  title_key     TEXT NOT NULL,
+  scope_key     TEXT NOT NULL,
+  facts_version INTEGER NOT NULL CHECK (facts_version >= 1),
+  facts_json    TEXT NOT NULL,
+  captured_at   INTEGER NOT NULL,
+  PRIMARY KEY (user_id, title_key, scope_key),
+  FOREIGN KEY (user_id, title_key, scope_key)
+    REFERENCES title_awards(user_id, title_key, scope_key)
+    ON DELETE CASCADE
+);
+
+-- titleKeyごとにfirst ownershipを確定した「刻印順」を安全に発番するcounter（PR B1）。
+-- SELECT MAX(...)+1のような素朴な処理ではなく、単一rowをUPDATEすることでIMMEDIATE
+-- transaction下のシリアライズに乗せる。
+CREATE TABLE IF NOT EXISTS title_rarity_sequences (
+  title_key     TEXT PRIMARY KEY,
+  last_sequence INTEGER NOT NULL CHECK (last_sequence >= 1)
+);
+
+-- 「このuserはこのtitleそのものを持っている」という所持の正本（PR B1）。titleKeyが
+-- 複数scopeで繰り返しawardされても(user_id, title_key)は1行だけ——awardとownershipを
+-- 混同しない。acquisition_sequenceはBotがfirst ownershipを確定した処理順であって、
+-- 真の達成順の証明ではない（v2-rarity.ts参照）。
+CREATE TABLE IF NOT EXISTS title_ownerships (
+  user_id                     TEXT NOT NULL,
+  title_key                   TEXT NOT NULL,
+  first_scope_key             TEXT NOT NULL,
+  first_earned_at             INTEGER,
+  first_awarded_at            INTEGER NOT NULL,
+  acquisition_sequence        INTEGER NOT NULL CHECK (acquisition_sequence >= 1),
+  holder_count_at_acquisition INTEGER NOT NULL CHECK (holder_count_at_acquisition >= 1),
+  CHECK (first_earned_at IS NULL OR first_earned_at <= first_awarded_at),
+  PRIMARY KEY (user_id, title_key),
+  -- titleKeyごとにacquisition_sequenceは重複しない。title_key prefixのindexとしても
+  -- 使える（「あるtitleのN番目は誰か」のqueryに使う）。
+  UNIQUE (title_key, acquisition_sequence),
+  FOREIGN KEY (user_id, title_key, first_scope_key)
+    REFERENCES title_awards(user_id, title_key, scope_key)
+);
 
 CREATE TABLE IF NOT EXISTS title_equips (
   user_id   TEXT NOT NULL,
@@ -113,6 +168,25 @@ export interface TitleAwardRow {
   awarded_at: number;
 }
 
+export interface TitleAwardFactsRow {
+  user_id: string;
+  title_key: string;
+  scope_key: string;
+  facts_version: number;
+  data: TitleAwardFacts;
+  captured_at: number;
+}
+
+export interface TitleOwnershipRow {
+  user_id: string;
+  title_key: string;
+  first_scope_key: string;
+  first_earned_at: number | null;
+  first_awarded_at: number;
+  acquisition_sequence: number;
+  holder_count_at_acquisition: number;
+}
+
 export interface TitleEquipRow {
   user_id: string;
   slot: number;
@@ -126,13 +200,39 @@ export interface ApplyCatalogInput {
   note?: string;
 }
 
+export interface AwardFactsInput {
+  /** awardFacts JSONのschema version（TitleRule.awardFactsVersion）。 */
+  readonly version: number;
+  readonly data: TitleAwardFacts;
+}
+
 export interface AwardTitleInput {
   userId: string;
   titleKey: string;
-  scopeKey: string;
+  /**
+   * callerがscopeKeyを直接組み立てることを禁止する（PR A/§7の境界をStore側でも
+   * 完成させる）。resolveTitleScope()が作った branded ResolvedTitleScope だけを
+   * 受け取る——入口で assertResolvedTitleScope() を必ず実行する。
+   */
+  scope: ResolvedTitleScope;
   /** 正確に証明できない場合はnull。reconcile時刻で代用しない。 */
   earnedAt: number | null;
-  awardedAt?: number;
+  /**
+   * award時にpersistするsafe snapshot。matched awardでは必須（TitleRuleResultの
+   * discriminated unionと同じ契約）——「award rowはあるがfacts rowが無い」という
+   * 状態を作らない。
+   */
+  awardFacts: AwardFactsInput;
+}
+
+export type AwardResultStatus = "awarded" | "already_awarded";
+
+export interface AwardResult {
+  readonly status: AwardResultStatus;
+  /** このaward呼び出しでtitleKeyのownershipが初めて作られたか（＝rarity sequenceを消費したか）。 */
+  readonly ownershipCreated: boolean;
+  readonly award: TitleAwardRow;
+  readonly ownership: TitleOwnershipRow;
 }
 
 type CounterSnapshotRow = { user_id: string; value: number };
@@ -197,6 +297,234 @@ function assertCounterBaselineSnapshotterCoverage(): void {
 }
 
 /**
+ * facts_json 1行分の内容（version・captured_at・JSON本体）をvalidateする。
+ * `readValidatedAwardFactsRow()`（読み取りAPI境界）と `assertAwardPersistenceIntegrity()`
+ * （construction時の全体スキャン）の両方から使う共通ロジック。
+ */
+function assertValidFactsRowContent(
+  label: string,
+  row: { facts_version: number; facts_json: string; captured_at: number },
+): TitleAwardFacts {
+  try {
+    assertValidFactsVersion(row.facts_version, `facts_version for ${label}`);
+  } catch (err) {
+    throw new Error(`title award facts integrity violation: ${(err as Error).message}`);
+  }
+  if (!Number.isInteger(row.captured_at) || row.captured_at < 0) {
+    throw new Error(`title award facts integrity violation: invalid captured_at for ${label}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.facts_json);
+  } catch {
+    throw new Error(`title award facts integrity violation: invalid JSON for ${label}`);
+  }
+  assertValidAwardFacts(parsed, `award facts for ${label}`);
+  return parsed;
+}
+
+/**
+ * award/facts/ownership/rarity sequenceの全体整合性をfail-closedで検証する。同じ
+ * (user,title,scope)を再award()した時だけ検出するlazy checkだと、Store construction
+ * からそのタイミングまでの間、欠損facts/ownershipを抱えたaward行を（例えばretired
+ * titleのhasAward()経由で）正常データとして扱ってしまう。Store構築時に必ず一度、
+ * DB全体を見て検証する。
+ *
+ * 存在確認だけでなく、semantic integrityまで見る:
+ * - 全awardにfacts/ownershipが存在する
+ * - 全factsのfacts_version/captured_at/facts_jsonがvalid
+ * - facts.captured_at は対応するaward.awarded_atと一致する（同じsnapshotのはず）
+ * - ownership.first_scope_keyが指すaward行のearned_at/awarded_atと、
+ *   ownership.first_earned_at/first_awarded_atが一致する
+ * - ownershipが存在するtitleには必ずrarity sequence行があり、
+ *   last_sequence >= そのtitleのMAX(acquisition_sequence)
+ * - `PRAGMA foreign_key_check`のうちtitle_*テーブルに関する違反が無い
+ *   （他の非titleテーブルの既存問題まで巻き込まないよう、tableでfilterする）
+ *
+ * 偽facts/ownershipを捏造してbackfillしない既存方針はここでも維持する——欠損が
+ * あればfail-closedするだけで、埋めない。
+ */
+function assertAwardPersistenceIntegrity(db: Database.Database): void {
+  const missingFacts = db
+    .prepare(
+      `SELECT a.user_id, a.title_key, a.scope_key
+         FROM title_awards a
+         LEFT JOIN title_award_facts f
+           ON f.user_id = a.user_id AND f.title_key = a.title_key AND f.scope_key = a.scope_key
+        WHERE f.user_id IS NULL
+        LIMIT 1`,
+    )
+    .get() as { user_id: string; title_key: string; scope_key: string } | undefined;
+  if (missingFacts) {
+    throw new Error(
+      `title award persistence integrity violation: award row exists for ` +
+        `(${missingFacts.user_id}, ${missingFacts.title_key}, ${missingFacts.scope_key}) without award facts ` +
+        `(legacy/foundation row, or facts were deleted out of band)`,
+    );
+  }
+
+  const missingOwnership = db
+    .prepare(
+      `SELECT a.user_id, a.title_key
+         FROM title_awards a
+         LEFT JOIN title_ownerships o
+           ON o.user_id = a.user_id AND o.title_key = a.title_key
+        WHERE o.user_id IS NULL
+        GROUP BY a.user_id, a.title_key
+        LIMIT 1`,
+    )
+    .get() as { user_id: string; title_key: string } | undefined;
+  if (missingOwnership) {
+    throw new Error(
+      `title ownership persistence integrity violation: award row(s) exist for ` +
+        `(${missingOwnership.user_id}, ${missingOwnership.title_key}) without an ownership row ` +
+        `(legacy/foundation row, or ownership was deleted out of band)`,
+    );
+  }
+
+  const factsRows = db
+    .prepare(
+      `SELECT f.user_id, f.title_key, f.scope_key, f.facts_version, f.facts_json, f.captured_at, a.awarded_at
+         FROM title_award_facts f
+         JOIN title_awards a
+           ON a.user_id = f.user_id AND a.title_key = f.title_key AND a.scope_key = f.scope_key`,
+    )
+    .all() as Array<{
+    user_id: string;
+    title_key: string;
+    scope_key: string;
+    facts_version: number;
+    facts_json: string;
+    captured_at: number;
+    awarded_at: number;
+  }>;
+  for (const row of factsRows) {
+    const label = `${row.user_id}/${row.title_key}/${row.scope_key}`;
+    assertValidFactsRowContent(label, row);
+    if (row.captured_at !== row.awarded_at) {
+      throw new Error(
+        `title award facts integrity violation: captured_at (${row.captured_at}) does not match ` +
+          `the award's awarded_at (${row.awarded_at}) for ${label}`,
+      );
+    }
+  }
+
+  const ownershipRows = db
+    .prepare(
+      `SELECT o.user_id, o.title_key, o.first_scope_key, o.first_earned_at, o.first_awarded_at,
+              a.earned_at AS award_earned_at, a.awarded_at AS award_awarded_at
+         FROM title_ownerships o
+         JOIN title_awards a
+           ON a.user_id = o.user_id AND a.title_key = o.title_key AND a.scope_key = o.first_scope_key`,
+    )
+    .all() as Array<{
+    user_id: string;
+    title_key: string;
+    first_scope_key: string;
+    first_earned_at: number | null;
+    first_awarded_at: number;
+    award_earned_at: number | null;
+    award_awarded_at: number;
+  }>;
+  for (const row of ownershipRows) {
+    const label = `${row.user_id}/${row.title_key}`;
+    if (row.first_earned_at !== row.award_earned_at) {
+      throw new Error(
+        `title ownership integrity violation: first_earned_at does not match the referenced award ` +
+          `(first_scope_key=${row.first_scope_key}) for ${label}`,
+      );
+    }
+    if (row.first_awarded_at !== row.award_awarded_at) {
+      throw new Error(
+        `title ownership integrity violation: first_awarded_at does not match the referenced award ` +
+          `(first_scope_key=${row.first_scope_key}) for ${label}`,
+      );
+    }
+  }
+
+  // rarity sequenceはfirst ownership時だけ1増え、allocationとownership INSERTは
+  // 同じIMMEDIATE transaction（rollback時はsequenceも一緒にrollback）、ownershipは
+  // 永久保持で通常削除APIも無い。よってnormal stateでは常に
+  // last_sequence === MAX(acquisition_sequence) が成立する——`>`側の食い違いも、
+  // ownershipを伴わないsequence消費が起きた破損状態として検出する。
+  const sequenceRows = db
+    .prepare(
+      `SELECT o.title_key, MAX(o.acquisition_sequence) AS max_sequence, r.last_sequence
+         FROM title_ownerships o
+         LEFT JOIN title_rarity_sequences r ON r.title_key = o.title_key
+        GROUP BY o.title_key`,
+    )
+    .all() as Array<{ title_key: string; max_sequence: number; last_sequence: number | null }>;
+  for (const row of sequenceRows) {
+    if (row.last_sequence === null) {
+      throw new Error(
+        `title rarity sequence integrity violation: title ${row.title_key} has ownership rows but no rarity sequence row`,
+      );
+    }
+    if (row.last_sequence !== row.max_sequence) {
+      throw new Error(
+        `title rarity sequence integrity violation: title ${row.title_key} last_sequence (${row.last_sequence}) ` +
+          `does not equal its max acquisition_sequence (${row.max_sequence})`,
+      );
+    }
+  }
+
+  // 逆方向: rarity sequence行が存在するのにそのtitleKeyのownershipが0件は、
+  // sequenceだけが消費されてownershipが成立しなかった（あるいはownershipだけが
+  // out-of-bandで削除された）破損状態。上のqueryはtitle_ownershipsを起点にした
+  // LEFT JOINのためこの向きの欠損は検出できない——別クエリで補う。
+  const orphanSequenceRows = db
+    .prepare(
+      `SELECT r.title_key
+         FROM title_rarity_sequences r
+         LEFT JOIN title_ownerships o ON o.title_key = r.title_key
+        WHERE o.title_key IS NULL`,
+    )
+    .all() as Array<{ title_key: string }>;
+  if (orphanSequenceRows.length > 0) {
+    throw new Error(
+      `title rarity sequence integrity violation: title ${orphanSequenceRows[0]!.title_key} has a rarity ` +
+        `sequence row but no ownership rows`,
+    );
+  }
+
+  // holder_count_at_acquisitionは「first ownership transaction時点のDB title
+  // ownership総数（今回分を含む）」であり、sequenceもfirst ownershipごとに1から
+  // 連番なので、normal stateでは常に holder_count_at_acquisition===acquisition_sequence。
+  const holderCountRows = db
+    .prepare(`SELECT user_id, title_key, acquisition_sequence, holder_count_at_acquisition FROM title_ownerships`)
+    .all() as Array<{
+    user_id: string;
+    title_key: string;
+    acquisition_sequence: number;
+    holder_count_at_acquisition: number;
+  }>;
+  for (const row of holderCountRows) {
+    if (row.holder_count_at_acquisition !== row.acquisition_sequence) {
+      throw new Error(
+        `title ownership integrity violation: holder_count_at_acquisition (${row.holder_count_at_acquisition}) ` +
+          `does not equal acquisition_sequence (${row.acquisition_sequence}) for ${row.user_id}/${row.title_key}`,
+      );
+    }
+  }
+
+  const fkViolations = db.prepare(`PRAGMA foreign_key_check`).all() as Array<{
+    table: string;
+    rowid: number | null;
+    parent: string;
+    fkid: number;
+  }>;
+  const titleFkViolations = fkViolations.filter((v) => v.table.startsWith("title_"));
+  if (titleFkViolations.length > 0) {
+    const first = titleFkViolations[0]!;
+    throw new Error(
+      `title persistence integrity violation: foreign_key_check found ${titleFkViolations.length} violation(s) ` +
+        `on title_* tables, e.g. table=${first.table} parent=${first.parent}`,
+    );
+  }
+}
+
+/**
  * v2称号の永続化だけを担当する。
  *
  * 旧 titles / TitleEngine は移行が終わるまで触らない。PR1ではこのStoreを本番経路へ
@@ -211,6 +539,7 @@ export class TitleV2Store {
     assertDerivedSourceDependenciesResolve();
     assertSourceReaderCoverage();
     ensureTitleV2Schema(db);
+    assertAwardPersistenceIntegrity(db);
   }
 
   /**
@@ -396,41 +725,248 @@ export class TitleV2Store {
   }
 
   /**
-   * awardは(user,title,scope)で冪等。
-   * 即時判定と日次reconcileが同時に走っても1行だけ残る。
+   * awardは(user,title,scope)で冪等。即時判定と日次reconcileが同時に走っても1行だけ残る。
+   *
+   * PR B1: 1回のaward操作で、同一transaction内に以下を確定する。
+   *   1. title_awards（(user,title,scope)冪等insert）
+   *   2. 新規awardならtitle_award_facts（award facts snapshot、immutable）
+   *   3. titleKeyのownershipが初めてならtitle_ownerships + rarity sequence消費
+   * 途中で1つでも失敗したら全部rollbackする。
+   *
+   * 冪等呼び出し（既にaward済みの(user,title,scope)への再award）は、facts・
+   * ownership・rarity sequenceのいずれも一切変更しない——先に成立したsnapshotが勝つ。
    */
-  award(input: AwardTitleInput): boolean {
+  award(input: AwardTitleInput): AwardResult {
+    if (this.db.inTransaction) {
+      throw new Error("title award must start outside an existing transaction");
+    }
+
     const userId = requireText(input.userId, "userId");
     const titleKey = requireV2Key(input.titleKey);
-    const scopeKey = requireText(input.scopeKey, "scopeKey");
+    // brand（forgery）に加えて、このscopeが**このtitleKeyのために**resolveTitleScope()
+    // されたことまで検証する。`global`のようなscopeKeyはpolicyを共有する全titleで
+    // 同一文字列になり得るため、「title Aのために正規resolveしたscopeをtitle Bへ
+    // そのまま渡す」substitutionはscopeKeyの一致だけでは検出できない。戻り値の
+    // canonical snapshotをこの先ずっと使う——`input.scope`自身のfieldは直接読まない
+    // （belt-and-suspenders: freezeが何らかの形で迂回されても、実際にpersistする
+    // 値は常にresolveTitleScope()がWeakMapへ登録した値になる）。
+    const provenance = assertResolvedTitleScopeForTitle(input.scope, titleKey);
+    const scopeKey = provenance.scopeKey;
     const earnedAt = input.earnedAt === null ? null : requireUnix(input.earnedAt, "earnedAt");
-    const awardedAt = requireUnix(input.awardedAt ?? this.clock(), "awardedAt");
+    // awarded_at/captured_atはBotが実際に永続化を確定した時刻であり、caller入力では
+    // ない——this.clock()を1回だけ呼び、そのsnapshotをawarded_at/captured_at/
+    // ownership.first_awarded_atすべてに一貫して使う。historical repairでも、
+    // 過去の時刻はearnedAt側に入れる。awardedAtは常に「repairを実行した今」になる。
+    const awardedAt = requireUnix(this.clock(), "awardedAt");
     if (earnedAt !== null && earnedAt > awardedAt) {
       throw new Error(`earnedAt cannot be after awardedAt: earnedAt=${earnedAt} awardedAt=${awardedAt}`);
     }
+    // awardedAtは、そのscopeを実際に観測した時刻（observedAt）より前にはできない
+    // ——さもないと「まだ観測していない未来のデータを使って過去にawardした」という
+    // 矛盾した状態を作れてしまう。captured_at（facts）もこのawardedAtと同じ
+    // snapshotを使う。
+    if (awardedAt < provenance.observedAt) {
+      throw new Error(
+        `awardedAt (${awardedAt}) cannot be before the scope's observedAt (${provenance.observedAt}) for scope=${scopeKey}`,
+      );
+    }
+    // earnedAtは、resolveTitleScope()が確定したそのscopeの窓の中に収まっていること
+    // （§13）。zero-width scope（start===effectiveEnd）では、この条件を満たす
+    // earnedAtが存在しないため、常にrejectされる。
+    if (earnedAt !== null) {
+      const effectiveEnd = resolvedScopeEffectiveEnd(provenance);
+      if (earnedAt < provenance.start || earnedAt >= effectiveEnd) {
+        throw new Error(
+          `earnedAt (${earnedAt}) is outside the resolved scope window [${provenance.start}, ${effectiveEnd}) for scope=${scopeKey}`,
+        );
+      }
+    }
 
-    const result = this.db
+    assertValidFactsVersion(input.awardFacts.version, "awardFacts.version");
+    // validationとJSON serializationを単一passで行う——検証後に別途JSON.stringify()を
+    // 呼ぶ2段階構成だと、forged/accessor objectで検証時と永続化時の値が食い違う
+    // TOCTOUを作り得る（v2-award-facts.tsのdoc comment参照）。
+    const factsJson = serializeAwardFacts(input.awardFacts.data, `title ${titleKey} awardFacts`);
+
+    const tx = this.db.transaction((): AwardResult => {
+      const insertResult = this.db
+        .prepare(
+          `INSERT INTO title_awards (user_id, title_key, scope_key, earned_at, awarded_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, title_key, scope_key) DO NOTHING`,
+        )
+        .run(userId, titleKey, scopeKey, earnedAt, awardedAt);
+      const isNewAward = insertResult.changes === 1;
+
+      if (isNewAward) {
+        this.db
+          .prepare(
+            `INSERT INTO title_award_facts (user_id, title_key, scope_key, facts_version, facts_json, captured_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          )
+          .run(userId, titleKey, scopeKey, input.awardFacts.version, factsJson, awardedAt);
+      } else {
+        // 既存awardの再award（冪等呼び出し）。旧foundation形式のaward rowだけが
+        // 存在するDB（facts無しでtitle_awardsだけ直接INSERTされた行）を、ここで
+        // 偽のfactsを捏造してbackfillしない——明示的なintegrity errorとしてfail-closed
+        // する方が、「本当の取得理由が無いのにあることにする」より安全。
+        const existingFacts = this.readValidatedAwardFactsRow(userId, titleKey, scopeKey);
+        if (!existingFacts) {
+          throw new Error(
+            `title award integrity violation: award row exists for (${userId}, ${titleKey}, ${scopeKey}) ` +
+              `without award facts (legacy/foundation row, or facts were deleted out of band)`,
+          );
+        }
+      }
+
+      let ownershipCreated = false;
+      let ownershipRow = this.getOwnershipRow(userId, titleKey);
+      if (!ownershipRow) {
+        if (!isNewAward) {
+          // 既存awardがあるのにownershipが無い——本来award()が同一transaction内で
+          // 必ず両方作るため、このコード自身が作った状態ではあり得ない。旧形式データ
+          // か、out-of-bandな削除の痕跡として扱い、偽のownershipを捏造しない。
+          throw new Error(
+            `title ownership integrity violation: award row exists for (${userId}, ${titleKey}, ${scopeKey}) ` +
+              `without an ownership row (legacy/foundation row, or ownership was deleted out of band)`,
+          );
+        }
+        const sequence = this.allocateRaritySequence(titleKey);
+        // 「そのtransaction時点でDBに記録されていたtitle ownership数（今回のfirst
+        // ownershipを含む）」。current guild membership等を使ったfuture rarityとは
+        // 別概念——active populationを勝手に実装しない（§10）。
+        const holderCount = this.countOwnerships(titleKey) + 1;
+        this.db
+          .prepare(
+            `INSERT INTO title_ownerships
+               (user_id, title_key, first_scope_key, first_earned_at, first_awarded_at,
+                acquisition_sequence, holder_count_at_acquisition)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(userId, titleKey, scopeKey, earnedAt, awardedAt, sequence, holderCount);
+        ownershipCreated = true;
+        ownershipRow = this.getOwnershipRow(userId, titleKey);
+        if (!ownershipRow) throw new Error(`title ownership was not persisted: ${userId}/${titleKey}`);
+      }
+      // isNewAward && ownershipRow already existed: 同じtitleの2つ目以降のscopeへの
+      // award。ownership/rarity sequenceは一切変更しない（先に成立したfirst ownership
+      // のsnapshotが勝つ）。
+
+      const awardRow = this.getAwardRow(userId, titleKey, scopeKey);
+      if (!awardRow) throw new Error(`title award was not persisted: ${userId}/${titleKey}/${scopeKey}`);
+
+      return {
+        status: isNewAward ? "awarded" : "already_awarded",
+        ownershipCreated,
+        award: awardRow,
+        ownership: ownershipRow,
+      };
+    });
+
+    return tx.immediate();
+  }
+
+  private allocateRaritySequence(titleKey: string): number {
+    this.db
       .prepare(
-        `INSERT INTO title_awards (user_id, title_key, scope_key, earned_at, awarded_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(user_id, title_key, scope_key) DO NOTHING`,
+        `INSERT INTO title_rarity_sequences (title_key, last_sequence)
+         VALUES (?, 1)
+         ON CONFLICT(title_key) DO UPDATE SET last_sequence = last_sequence + 1`,
       )
-      .run(userId, titleKey, scopeKey, earnedAt, awardedAt);
-    return result.changes === 1;
+      .run(titleKey);
+    const row = this.db
+      .prepare(`SELECT last_sequence FROM title_rarity_sequences WHERE title_key = ?`)
+      .get(titleKey) as { last_sequence: number };
+    return row.last_sequence;
+  }
+
+  private countOwnerships(titleKey: string): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM title_ownerships WHERE title_key = ?`).get(titleKey) as {
+      n: number;
+    };
+    return row.n;
+  }
+
+  private getAwardRow(userId: string, titleKey: string, scopeKey: string): TitleAwardRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT user_id, title_key, scope_key, earned_at, awarded_at
+           FROM title_awards
+          WHERE user_id = ? AND title_key = ? AND scope_key = ?`,
+      )
+      .get(userId, titleKey, scopeKey) as TitleAwardRow | undefined;
+    return row ?? null;
   }
 
   /**
-   * 既存awardの有無だけを確認する（副作用なし）。retired titleが新規awardを作らず、
+   * facts行を読み、version・captured_at・JSON本体をvalidateしてから返す
+   * （`assertValidFactsRowContent()` と同じ検証を通す）。壊れたDB値をそのまま
+   * 型付きrowとして返さない——`hasAward()`・`awardFacts()`の両方がこれを使う。
+   */
+  private readValidatedAwardFactsRow(userId: string, titleKey: string, scopeKey: string): TitleAwardFactsRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT facts_version, facts_json, captured_at
+           FROM title_award_facts
+          WHERE user_id = ? AND title_key = ? AND scope_key = ?`,
+      )
+      .get(userId, titleKey, scopeKey) as { facts_version: number; facts_json: string; captured_at: number } | undefined;
+    if (!row) return null;
+
+    const data = assertValidFactsRowContent(`${userId}/${titleKey}/${scopeKey}`, row);
+    return {
+      user_id: userId,
+      title_key: titleKey,
+      scope_key: scopeKey,
+      facts_version: row.facts_version,
+      data,
+      captured_at: row.captured_at,
+    };
+  }
+
+  private getOwnershipRow(userId: string, titleKey: string): TitleOwnershipRow | null {
+    const row = this.db
+      .prepare(
+        `SELECT user_id, title_key, first_scope_key, first_earned_at, first_awarded_at,
+                acquisition_sequence, holder_count_at_acquisition
+           FROM title_ownerships
+          WHERE user_id = ? AND title_key = ?`,
+      )
+      .get(userId, titleKey) as TitleOwnershipRow | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * 既存awardの有無を確認する（読み取り専用）。retired titleが新規awardを作らず、
    * 既存awardだけ保持するかどうかの分岐に使う。
+   *
+   * Store構築時に `assertAwardPersistenceIntegrity()` がDB全体を検証済みだが、
+   * construction後にout-of-bandな行が挿入される可能性もゼロではないため、
+   * ここでも見つけたaward bundleのintegrityを確認する——facts行が「存在する
+   * だけ」でtrueにせず、`awardFacts()`相当の内容validation（version/captured_at/
+   * JSON本体）を通してからtrueにする。欠損・破損したfacts/ownershipを抱えた
+   * awardを黙って「あり」として返さない。
    */
   hasAward(userIdRaw: string, titleKeyRaw: string, scopeKeyRaw: string): boolean {
     const userId = requireText(userIdRaw, "userId");
     const titleKey = requireV2Key(titleKeyRaw);
     const scopeKey = requireText(scopeKeyRaw, "scopeKey");
-    const row = this.db
-      .prepare(`SELECT 1 FROM title_awards WHERE user_id = ? AND title_key = ? AND scope_key = ?`)
-      .get(userId, titleKey, scopeKey);
-    return row !== undefined;
+    const row = this.getAwardRow(userId, titleKey, scopeKey);
+    if (!row) return false;
+
+    const facts = this.readValidatedAwardFactsRow(userId, titleKey, scopeKey);
+    if (!facts) {
+      throw new Error(
+        `title award integrity violation: award row exists for (${userId}, ${titleKey}, ${scopeKey}) without award facts`,
+      );
+    }
+    const ownership = this.getOwnershipRow(userId, titleKey);
+    if (!ownership) {
+      throw new Error(
+        `title ownership integrity violation: award row exists for (${userId}, ${titleKey}, ${scopeKey}) without an ownership row`,
+      );
+    }
+    return true;
   }
 
   listAwards(userId: string): TitleAwardRow[] {
@@ -442,6 +978,46 @@ export class TitleV2Store {
           ORDER BY COALESCE(earned_at, awarded_at), awarded_at, title_key, scope_key`,
       )
       .all(userId) as TitleAwardRow[];
+  }
+
+  /**
+   * award時点のsafe snapshotを読む。本人の印録・将来の説明rendererで使う想定。
+   * DB内JSONが壊れている・awardFacts contract（v2-award-facts.ts）に違反している場合、
+   * 空object扱いで誤魔化さずintegrity errorとして投げる。
+   */
+  awardFacts(userIdRaw: string, titleKeyRaw: string, scopeKeyRaw: string): TitleAwardFactsRow | null {
+    const userId = requireText(userIdRaw, "userId");
+    const titleKey = requireV2Key(titleKeyRaw);
+    const scopeKey = requireText(scopeKeyRaw, "scopeKey");
+    return this.readValidatedAwardFactsRow(userId, titleKey, scopeKey);
+  }
+
+  /** titleKeyそのものを所持しているか（副作用なし）。scope単位のawardとは別の問い。 */
+  hasOwnership(userIdRaw: string, titleKeyRaw: string): boolean {
+    const userId = requireText(userIdRaw, "userId");
+    const titleKey = requireV2Key(titleKeyRaw);
+    const row = this.db.prepare(`SELECT 1 FROM title_ownerships WHERE user_id = ? AND title_key = ?`).get(userId, titleKey);
+    return row !== undefined;
+  }
+
+  /** titleKeyの所持情報（初回獲得scope・刻印順・獲得時点の所持者数）を読む。 */
+  ownership(userIdRaw: string, titleKeyRaw: string): TitleOwnershipRow | null {
+    const userId = requireText(userIdRaw, "userId");
+    const titleKey = requireV2Key(titleKeyRaw);
+    return this.getOwnershipRow(userId, titleKey);
+  }
+
+  /** 本人が所持する全titleのownership一覧（scope別のaward historyではない）。 */
+  listOwnerships(userId: string): TitleOwnershipRow[] {
+    return this.db
+      .prepare(
+        `SELECT user_id, title_key, first_scope_key, first_earned_at, first_awarded_at,
+                acquisition_sequence, holder_count_at_acquisition
+           FROM title_ownerships
+          WHERE user_id = ?
+          ORDER BY acquisition_sequence, title_key`,
+      )
+      .all(userId) as TitleOwnershipRow[];
   }
 
   /**

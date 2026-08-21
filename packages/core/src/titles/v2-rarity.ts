@@ -1,6 +1,12 @@
 /**
- * rarity契約の最低限の型（§13）。DB persistence・計算本体は後続PR。
- * ここでは後続実装が誤解しないよう、意味だけを型とdocで固定する。
+ * rarity契約の最低限の型（§13）。
+ *
+ * PR B1で `acquisitionSequence` / `holderCountAtAcquisition` / first ownership snapshot
+ * は `title_ownerships`（`packages/core/src/titles/v2-store.ts`、`TitleOwnershipRow`）
+ * として実際にDB永続化された。ここで固定した契約（identityはtitleKey単位、
+ * acquisitionSequenceは刻印順、firstScopeKeyは証跡）とsemanticを変えずに、
+ * DB row（snake_case）としての実体を持たせただけ——この型自体は概念的な参照として残す。
+ * current rarity（動的計算・guild membership等を使う版）は今回もDB化しない（後続PR）。
  *
  * - current rarity: 現在の所持者状況から動的に変化する。永続化しない
  *   （「今何人持っているか」を問い合わせ時点で数えるだけの値）。

@@ -86,10 +86,13 @@ const THIRD_BUMP_RULE = defineTitleRule(
     lifecycle: "active",
     ...COMMON_FIXTURE_FIELDS,
   },
-  (ctx) => {
-    const events = ctx.sources.bump_events.events;
-    if (events.length < 3) return { matched: false, earnedAt: null };
-    return { matched: true, earnedAt: events[2]! };
+  {
+    awardFactsVersion: 1,
+    evaluate: (ctx) => {
+      const events = ctx.sources.bump_events.events;
+      if (events.length < 3) return { matched: false, earnedAt: null };
+      return { matched: true, earnedAt: events[2]!, awardFacts: { bumpCount: events.length } };
+    },
   },
 );
 
@@ -105,7 +108,7 @@ const ALWAYS_MATCH_RULE = defineTitleRule(
     lifecycle: "active",
     ...COMMON_FIXTURE_FIELDS,
   },
-  () => ({ matched: true, earnedAt: null }),
+  { awardFactsVersion: 1, evaluate: () => ({ matched: true, earnedAt: null, awardFacts: {} }) },
 );
 
 const DISABLED_RULE = defineTitleRule(
@@ -119,8 +122,11 @@ const DISABLED_RULE = defineTitleRule(
     lifecycle: "disabled",
     ...COMMON_FIXTURE_FIELDS,
   },
-  () => {
-    throw new Error("disabled titleのevaluate()は呼ばれてはいけない");
+  {
+    awardFactsVersion: 1,
+    evaluate: () => {
+      throw new Error("disabled titleのevaluate()は呼ばれてはいけない");
+    },
   },
 );
 
@@ -135,7 +141,7 @@ const RETIRED_RULE = defineTitleRule(
     lifecycle: "retired",
     ...COMMON_FIXTURE_FIELDS,
   },
-  () => ({ matched: true, earnedAt: null }),
+  { awardFactsVersion: 1, evaluate: () => ({ matched: true, earnedAt: null, awardFacts: {} }) },
 );
 
 /** orderable:falseなVC sourceからearnedAtを主張しようとする、わざと壊れたfixture。 */
@@ -150,10 +156,13 @@ const BAD_VC_EARNED_AT_RULE = defineTitleRule(
     lifecycle: "active",
     ...COMMON_FIXTURE_FIELDS,
   },
-  (ctx) => {
-    const fact = ctx.sources.vc_empty_start_then_joined.facts[0];
-    if (!fact) return { matched: false, earnedAt: null };
-    return { matched: true, earnedAt: fact.joinedAt };
+  {
+    awardFactsVersion: 1,
+    evaluate: (ctx) => {
+      const fact = ctx.sources.vc_empty_start_then_joined.facts[0];
+      if (!fact) return { matched: false, earnedAt: null };
+      return { matched: true, earnedAt: fact.joinedAt, awardFacts: {} };
+    },
   },
 );
 
@@ -168,10 +177,13 @@ const VC_EMPTY_START_RULE = defineTitleRule(
     lifecycle: "active",
     ...COMMON_FIXTURE_FIELDS,
   },
-  (ctx) => ({
-    matched: ctx.sources.vc_empty_start_then_joined.facts.length > 0,
-    earnedAt: null,
-  }),
+  {
+    awardFactsVersion: 1,
+    evaluate: (ctx) => {
+      if (ctx.sources.vc_empty_start_then_joined.facts.length === 0) return { matched: false, earnedAt: null };
+      return { matched: true, earnedAt: null, awardFacts: {} };
+    },
+  },
 );
 
 const SOCIAL_SAFE_RULE = defineTitleRule(
@@ -185,11 +197,13 @@ const SOCIAL_SAFE_RULE = defineTitleRule(
     lifecycle: "active",
     ...COMMON_FIXTURE_FIELDS,
   },
-  (ctx) => ({
-    matched: ctx.sources.vc_social_safe.distinctCoPresentUsers > 0,
-    earnedAt: null,
-    awardFacts: { ...ctx.sources.vc_social_safe },
-  }),
+  {
+    awardFactsVersion: 1,
+    evaluate: (ctx) => {
+      if (ctx.sources.vc_social_safe.distinctCoPresentUsers === 0) return { matched: false, earnedAt: null };
+      return { matched: true, earnedAt: null, awardFacts: { ...ctx.sources.vc_social_safe } };
+    },
+  },
 );
 
 const GROUP_SIZE_RULE = defineTitleRule(
@@ -203,7 +217,10 @@ const GROUP_SIZE_RULE = defineTitleRule(
     lifecycle: "active",
     ...COMMON_FIXTURE_FIELDS,
   },
-  (ctx) => ({ matched: true, earnedAt: null, awardFacts: { ...ctx.sources.vc_group_size_seconds } }),
+  {
+    awardFactsVersion: 1,
+    evaluate: (ctx) => ({ matched: true, earnedAt: null, awardFacts: { ...ctx.sources.vc_group_size_seconds } }),
+  },
 );
 
 /** scope:{type:"month"}のrule。異なる月にobservedAtを渡すと別scopeKeyになることの確認用。 */
@@ -219,7 +236,7 @@ const MONTHLY_RULE = defineTitleRule(
     ...COMMON_FIXTURE_FIELDS,
     scope: { type: "month" },
   },
-  () => ({ matched: true, earnedAt: null }),
+  { awardFactsVersion: 1, evaluate: () => ({ matched: true, earnedAt: null, awardFacts: {} }) },
 );
 
 /** scope:{type:"event"}のrule。TitleEventScopeProviderが無いと解決できないことの確認用。 */
@@ -235,7 +252,7 @@ const EVENT_RULE = defineTitleRule(
     ...COMMON_FIXTURE_FIELDS,
     scope: { type: "event", eventKey: "test-event" },
   },
-  () => ({ matched: true, earnedAt: null }),
+  { awardFactsVersion: 1, evaluate: () => ({ matched: true, earnedAt: null, awardFacts: {} }) },
 );
 
 // ─────────────────────────────────────────────────────────────
@@ -290,7 +307,8 @@ describe("source reader completeness（§4, §8）", () => {
         lifecycle: "active",
         ...COMMON_FIXTURE_FIELDS,
       },
-      evaluate: () => ({ matched: true, earnedAt: null }),
+      awardFactsVersion: 1,
+      evaluate: () => ({ matched: true, earnedAt: null, awardFacts: {} }),
     };
     expect(() => evaluateTitle(db, store, badRule, "alice", OBSERVED_AT)).toThrow(/not usable by titles/);
   });
@@ -312,10 +330,13 @@ describe("source reader completeness（§4, §8）", () => {
         lifecycle: "active",
         ...COMMON_FIXTURE_FIELDS,
       },
-      (ctx) => {
-        // vc_social_safeは宣言していないので、contextに実体として存在しないはず
-        observedUndeclared = (ctx.sources as Record<string, unknown>).vc_social_safe;
-        return { matched: false, earnedAt: null };
+      {
+        awardFactsVersion: 1,
+        evaluate: (ctx) => {
+          // vc_social_safeは宣言していないので、contextに実体として存在しないはず
+          observedUndeclared = (ctx.sources as Record<string, unknown>).vc_social_safe;
+          return { matched: false, earnedAt: null };
+        },
       },
     );
 
@@ -339,7 +360,8 @@ describe("source reader completeness（§4, §8）", () => {
         lifecycle: "active",
         ...COMMON_FIXTURE_FIELDS,
       },
-      evaluate: () => ({ matched: true, earnedAt: BASE }),
+      awardFactsVersion: 1,
+      evaluate: () => ({ matched: true, earnedAt: BASE, awardFacts: {} }),
     };
 
     expect(() => evaluateTitle(db, store, forgedRule, "alice", OBSERVED_AT)).toThrow(/at least one source/);
@@ -359,7 +381,7 @@ describe("source reader completeness（§4, §8）", () => {
         lifecycle: "active",
         ...COMMON_FIXTURE_FIELDS,
       },
-      () => ({ matched: true, earnedAt: BASE }),
+      { awardFactsVersion: 1, evaluate: () => ({ matched: true, earnedAt: BASE, awardFacts: {} }) },
     );
     // construction後にdefinitionを直接書き換える（TypeScriptのreadonlyはruntimeを守らない）
     (rule.definition as { sources: unknown }).sources = [];
@@ -467,7 +489,7 @@ describe("source cache（§9）", () => {
   });
 });
 
-describe("award flow（§12）", () => {
+describe("award flow（§12、PR B1: facts/ownership込みのatomic award）", () => {
   it("matched=false → award無し", () => {
     const { db, store } = setup();
     const result = evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
@@ -475,7 +497,7 @@ describe("award flow（§12）", () => {
     expect(store.listAwards("alice")).toEqual([]);
   });
 
-  it("matched=true → award作成", () => {
+  it("matched=true → award・facts・ownershipがまとめて作成される", () => {
     const { db, store } = setup();
     const bump = new BumpCounter(db);
     bump.addOnce("m1", "alice", BASE);
@@ -484,20 +506,39 @@ describe("award flow（§12）", () => {
 
     const result = evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
     expect(result.outcome).toBe("awarded");
+    expect(result.ownershipCreated).toBe(true);
     expect(store.listAwards("alice")).toHaveLength(1);
+
+    const facts = store.awardFacts("alice", "v2.test.third-bump", result.scopeKey!);
+    expect(facts?.data).toEqual({ bumpCount: 3 });
+
+    const ownership = store.ownership("alice", "v2.test.third-bump");
+    expect(ownership).toMatchObject({
+      user_id: "alice",
+      title_key: "v2.test.third-bump",
+      first_scope_key: result.scopeKey,
+      acquisition_sequence: 1,
+      holder_count_at_acquisition: 1,
+    });
   });
 
-  it("同じevaluationを2回 → awardは1件だけ", () => {
+  it("同じevaluationを2回 → awardは1件だけ、factsもownershipも書き換わらない", () => {
     const { db, store } = setup();
     const bump = new BumpCounter(db);
     bump.addOnce("m1", "alice", BASE);
     bump.addOnce("m2", "alice", BASE + 10);
     bump.addOnce("m3", "alice", BASE + 20);
 
-    evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
+    const first = evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
+    const factsBefore = store.awardFacts("alice", "v2.test.third-bump", first.scopeKey!);
+    const ownershipBefore = store.ownership("alice", "v2.test.third-bump");
+
     const second = evaluateTitle(db, store, THIRD_BUMP_RULE, "alice", OBSERVED_AT);
     expect(second.outcome).toBe("already_awarded");
+    expect(second.ownershipCreated).toBe(false);
     expect(store.listAwards("alice")).toHaveLength(1);
+    expect(store.awardFacts("alice", "v2.test.third-bump", first.scopeKey!)).toEqual(factsBefore);
+    expect(store.ownership("alice", "v2.test.third-bump")).toEqual(ownershipBefore);
   });
 
   it("既存awardは上書きしない", () => {
@@ -514,7 +555,7 @@ describe("award flow（§12）", () => {
     expect(after).toEqual(before);
   });
 
-  it("scopeKey違い（月をまたぐ）なら別award可能", () => {
+  it("scopeKey違い（月をまたぐ）なら別award可能だが、titleKeyのownershipは1つのまま増えない", () => {
     const { db, store } = setup();
     const bump = new BumpCounter(db);
     bump.addOnce("m1", "alice", BASE);
@@ -530,6 +571,15 @@ describe("award flow（§12）", () => {
     const sep = evaluateTitle(db, store, MONTHLY_RULE, "alice", sepObservedAt);
     expect(aug.scopeKey).not.toBe(sep.scopeKey);
     expect(store.listAwards("alice")).toHaveLength(2);
+
+    // awardは2行、factsもscopeごと2行——だがownershipは(user,title)で1行だけで、
+    // 最初のscope(aug)をfirstとして持ち続ける。
+    expect(store.awardFacts("alice", "v2.test.monthly", aug.scopeKey!)).not.toBeNull();
+    expect(store.awardFacts("alice", "v2.test.monthly", sep.scopeKey!)).not.toBeNull();
+    const ownership = store.ownership("alice", "v2.test.monthly");
+    expect(ownership?.first_scope_key).toBe(aug.scopeKey);
+    expect(ownership?.acquisition_sequence).toBe(1);
+    expect(sep.ownershipCreated).toBe(false);
   });
 
   it("disabled titleはawardしない（evaluate()自体を呼ばない）", () => {
@@ -551,7 +601,13 @@ describe("award flow（§12）", () => {
   it("retired titleの既存awardは保持される（消えないし増えない）", () => {
     const { db, store } = setup();
     const preScope = resolveTitleScope(store, RETIRED_RULE.definition, OBSERVED_AT);
-    store.award({ userId: "alice", titleKey: "v2.test.retired", scopeKey: preScope.scopeKey, earnedAt: null });
+    store.award({
+      userId: "alice",
+      titleKey: "v2.test.retired",
+      scope: preScope,
+      earnedAt: null,
+      awardFacts: { version: 1, data: {} },
+    });
 
     const result = evaluateTitle(db, store, RETIRED_RULE, "alice", OBSERVED_AT);
     expect(result.outcome).toBe("already_awarded");
@@ -629,11 +685,14 @@ describe("evaluator所有のsnapshot（rule実行中の契約object書き換え�
         lifecycle: "active",
         ...COMMON_FIXTURE_FIELDS,
       },
-      () => {
-        // orderable:falseなVC sourceのruleのはずなのに、評価中にorderable:trueな
-        // bump_eventsへ差し替えて、直後のearnedAt検証をすり抜けようとする。
-        (selfMutatingRule.definition as { sources: unknown }).sources = ["bump_events"];
-        return { matched: true, earnedAt: BASE + 999 };
+      {
+        awardFactsVersion: 1,
+        evaluate: () => {
+          // orderable:falseなVC sourceのruleのはずなのに、評価中にorderable:trueな
+          // bump_eventsへ差し替えて、直後のearnedAt検証をすり抜けようとする。
+          (selfMutatingRule.definition as { sources: unknown }).sources = ["bump_events"];
+          return { matched: true, earnedAt: BASE + 999, awardFacts: {} };
+        },
       },
     );
 
@@ -657,9 +716,12 @@ describe("evaluator所有のsnapshot（rule実行中の契約object書き換え�
         lifecycle: "active",
         ...COMMON_FIXTURE_FIELDS,
       },
-      (ctx) => {
-        (ctx.scope as { scopeKey: string }).scopeKey = "hijacked-scope";
-        return { matched: true, earnedAt: null };
+      {
+        awardFactsVersion: 1,
+        evaluate: (ctx) => {
+          (ctx.scope as { scopeKey: string }).scopeKey = "hijacked-scope";
+          return { matched: true, earnedAt: null, awardFacts: {} };
+        },
       },
     );
 
@@ -691,13 +753,16 @@ describe("evaluator所有のsnapshot（rule実行中の契約object書き換え�
         lifecycle: "active",
         ...COMMON_FIXTURE_FIELDS,
       },
-      (ctx) => {
-        try {
-          (ctx.sources.bump_events.events as number[]).push(999_999_999);
-        } catch {
-          mutationAttemptThrew = true;
-        }
-        return { matched: false, earnedAt: null };
+      {
+        awardFactsVersion: 1,
+        evaluate: (ctx) => {
+          try {
+            (ctx.sources.bump_events.events as number[]).push(999_999_999);
+          } catch {
+            mutationAttemptThrew = true;
+          }
+          return { matched: false, earnedAt: null };
+        },
       },
     );
 
@@ -724,6 +789,109 @@ describe("awardFacts safety（§10, §12）", () => {
       trustedOverlapSeconds: 100,
     });
   });
+
+  it("matchedなのにawardFactsが契約違反な壊れたruleはfail-closedする（DBへは何も書かない）", () => {
+    const { db, store } = setup();
+    const badFactsRule = defineTitleRule(
+      {
+        kind: "behavior",
+        key: "v2.test.bad-facts",
+        name: "test",
+        description: "awardFactsに識別子を混入させる壊れたrule",
+        sources: ["bump_events"] as const,
+        triggers: ["bump_success"],
+        lifecycle: "active",
+        ...COMMON_FIXTURE_FIELDS,
+      },
+      {
+        awardFactsVersion: 1,
+        evaluate: () => ({ matched: true, earnedAt: null, awardFacts: { userId: "alice" } }),
+      },
+    );
+
+    expect(() => evaluateTitle(db, store, badFactsRule, "alice", OBSERVED_AT)).toThrow(/forbidden key/);
+    expect(store.listAwards("alice")).toEqual([]);
+  });
+});
+
+describe("runtime discriminated-union guard（TypeScriptを迂回したruleへの防御）", () => {
+  it("matched:falseなのにearnedAtが非nullなruleはruntimeでreject", () => {
+    const { db, store } = setup();
+    const badRule = defineTitleRule(
+      {
+        kind: "behavior",
+        key: "v2.test.false-with-earned-at",
+        name: "test",
+        description: "TypeScriptを迂回してmatched:false+非nullなearnedAtを返す壊れたrule",
+        sources: ["bump_events"] as const,
+        triggers: ["bump_success"],
+        lifecycle: "active",
+        ...COMMON_FIXTURE_FIELDS,
+      },
+      {
+        awardFactsVersion: 1,
+        evaluate: () => ({ matched: false, earnedAt: BASE } as never),
+      },
+    );
+
+    expect(() => evaluateTitle(db, store, badRule, "alice", OBSERVED_AT)).toThrow(
+      /matched:false with a non-null earnedAt/,
+    );
+    expect(store.listAwards("alice")).toEqual([]);
+  });
+
+  it("matched:falseなのにawardFactsを持つruleはruntimeでreject（明示的に拒否する。無視はしない）", () => {
+    const { db, store } = setup();
+    const badRule = defineTitleRule(
+      {
+        kind: "behavior",
+        key: "v2.test.false-with-facts",
+        name: "test",
+        description: "TypeScriptを迂回してmatched:falseなのにawardFactsを返す壊れたrule",
+        sources: ["bump_events"] as const,
+        triggers: ["bump_success"],
+        lifecycle: "active",
+        ...COMMON_FIXTURE_FIELDS,
+      },
+      {
+        awardFactsVersion: 1,
+        evaluate: () => ({ matched: false, earnedAt: null, awardFacts: {} } as never),
+      },
+    );
+
+    expect(() => evaluateTitle(db, store, badRule, "alice", OBSERVED_AT)).toThrow(
+      /matched:false with awardFacts set/,
+    );
+    expect(store.listAwards("alice")).toEqual([]);
+  });
+
+  it.each([["false" as never], [0 as never], [1 as never], [null as never]])(
+    "matchedが非boolean値（%j）ならruntimeでreject",
+    (badMatched) => {
+      const { db, store } = setup();
+      const badRule = defineTitleRule(
+        {
+          kind: "behavior",
+          key: `v2.test.non-boolean-matched-${String(badMatched)}`,
+          name: "test",
+          description: "TypeScriptを迂回してmatchedへ非boolean値を返す壊れたrule",
+          sources: ["bump_events"] as const,
+          triggers: ["bump_success"],
+          lifecycle: "active",
+          ...COMMON_FIXTURE_FIELDS,
+        },
+        {
+          awardFactsVersion: 1,
+          evaluate: () => ({ matched: badMatched, earnedAt: null } as never),
+        },
+      );
+
+      expect(() => evaluateTitle(db, store, badRule, "alice", OBSERVED_AT)).toThrow(
+        /non-boolean matched value/,
+      );
+      expect(store.listAwards("alice")).toEqual([]);
+    },
+  );
 });
 
 describe("fail-closed on scope resolution / source reader failure（§24）", () => {
@@ -787,7 +955,7 @@ describe("root packages/core/src/index.ts からv2 evaluator APIを使える", (
         lifecycle: "active",
         ...COMMON_FIXTURE_FIELDS,
       },
-      () => ({ matched: true, earnedAt: null }),
+      { awardFactsVersion: 1, evaluate: () => ({ matched: true, earnedAt: null, awardFacts: {} }) },
     );
 
     const result = core.evaluateTitle(db, store, rule, "alice", Math.floor(Date.now() / 1000));
