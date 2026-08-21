@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { BehaviorTitleDefinition } from "./v2-contract.js";
+import { assertSlug, type BehaviorTitleDefinition } from "./v2-contract.js";
 import {
   assertNoOverlappingSeriesMembership,
   assertValidSeriesManifest,
@@ -237,8 +237,9 @@ export function reconcileSeriesMasteriesForUser(
   const tx = db.transaction((): ReconcileSeriesMasteriesResult => {
     const candidates = db
       .prepare(
-        `SELECT m.catalog_key, m.series_key, COUNT(sm.title_key) AS member_count,
-                SUM(CASE WHEN o.title_key IS NOT NULL THEN 1 ELSE 0 END) AS owned_count
+        `SELECT m.catalog_key, m.series_key, m.registered_at, COUNT(sm.title_key) AS member_count,
+                SUM(CASE WHEN o.title_key IS NOT NULL THEN 1 ELSE 0 END) AS owned_count,
+                MAX(o.first_awarded_at) AS max_first_awarded_at
            FROM title_series_manifests m
            JOIN title_series_members sm ON sm.catalog_key = m.catalog_key AND sm.series_key = m.series_key
            LEFT JOIN title_ownerships o ON o.user_id = ? AND o.title_key = sm.title_key
@@ -250,14 +251,32 @@ export function reconcileSeriesMasteriesForUser(
       .all(userId, userId) as Array<{
       catalog_key: string;
       series_key: string;
+      registered_at: number;
       member_count: number;
       owned_count: number;
+      max_first_awarded_at: number | null;
     }>;
 
     const eligible = candidates.filter((c) => c.member_count > 0 && c.owned_count === c.member_count);
     if (eligible.length === 0) return { newlyMastered: [] };
 
+    // recorded_atはachievement timeではなく「Botがmasteryを初めてpersistした処理
+    // 時刻」——したがって正常状態では必ず、series manifestがregisterされた後、かつ
+    // 全member ownershipが成立した後になる。clock snapshotがこれより前なら
+    // （clockの逆行・誤ったclock注入等）fail-closedする——historical achievement
+    // time（earned_at）とは比較しない。既存の「達成時刻を推測しない」契約を維持する。
     const recordedAt = requireUnix(clock(), "recordedAt");
+    for (const c of eligible) {
+      const requiredMinAt = Math.max(c.registered_at, c.max_first_awarded_at ?? 0);
+      if (recordedAt < requiredMinAt) {
+        throw new Error(
+          `series mastery chronology violation: recordedAt (${recordedAt}) is before the required minimum ` +
+            `(${requiredMinAt} = max(manifest.registered_at=${c.registered_at}, ` +
+            `MAX(member ownership.first_awarded_at)=${c.max_first_awarded_at ?? "n/a"})) for ${c.catalog_key}/${c.series_key}`,
+        );
+      }
+    }
+
     const insert = db.prepare(
       `INSERT INTO title_series_masteries (user_id, catalog_key, series_key, recorded_at) VALUES (?, ?, ?, ?)`,
     );
@@ -340,6 +359,39 @@ export function assertSeriesPersistenceIntegrity(db: Database.Database): void {
     }
   }
 
+  // recorded_atは「Botがmasteryを初めてpersistした処理時刻」であり、正常状態では
+  // 必ずmanifest registrationの後・全member ownership成立の後になる。earned_atとは
+  // 比較しない——historical achievement timeを推測しない既存契約を維持する。
+  const chronologyRows = db
+    .prepare(
+      `SELECT tm.user_id, tm.catalog_key, tm.series_key, tm.recorded_at, m.registered_at,
+              MAX(o.first_awarded_at) AS max_first_awarded_at
+         FROM title_series_masteries tm
+         JOIN title_series_manifests m ON m.catalog_key = tm.catalog_key AND m.series_key = tm.series_key
+         JOIN title_series_members sm ON sm.catalog_key = tm.catalog_key AND sm.series_key = tm.series_key
+         LEFT JOIN title_ownerships o ON o.user_id = tm.user_id AND o.title_key = sm.title_key
+        GROUP BY tm.user_id, tm.catalog_key, tm.series_key`,
+    )
+    .all() as Array<{
+    user_id: string;
+    catalog_key: string;
+    series_key: string;
+    recorded_at: number;
+    registered_at: number;
+    max_first_awarded_at: number | null;
+  }>;
+  for (const row of chronologyRows) {
+    const requiredMinAt = Math.max(row.registered_at, row.max_first_awarded_at ?? 0);
+    if (row.recorded_at < requiredMinAt) {
+      throw new Error(
+        `series mastery integrity violation: recorded_at (${row.recorded_at}) for ` +
+          `(${row.user_id}, ${row.catalog_key}/${row.series_key}) is before the required minimum ` +
+          `(${requiredMinAt} = max(manifest.registered_at=${row.registered_at}, ` +
+          `MAX(member ownership.first_awarded_at)=${row.max_first_awarded_at ?? "n/a"}))`,
+      );
+    }
+  }
+
   const duplicateTitleOwners = db
     .prepare(`SELECT title_key, COUNT(*) AS n FROM title_series_members GROUP BY title_key HAVING COUNT(*) > 1 LIMIT 1`)
     .get() as { title_key: string; n: number } | undefined;
@@ -374,12 +426,58 @@ export function assertSeriesPersistenceIntegrity(db: Database.Database): void {
   }
 
   const manifestRows = db
-    .prepare(`SELECT catalog_key, series_key, mastery_eligible, manifest_hash FROM title_series_manifests`)
-    .all() as Array<{ catalog_key: string; series_key: string; mastery_eligible: number; manifest_hash: string }>;
+    .prepare(`SELECT catalog_key, series_key, mastery_eligible, manifest_hash, registered_at FROM title_series_manifests`)
+    .all() as Array<{
+    catalog_key: string;
+    series_key: string;
+    mastery_eligible: number;
+    manifest_hash: string;
+    registered_at: number;
+  }>;
   for (const m of manifestRows) {
+    const label = `${m.catalog_key}/${m.series_key}`;
+    const fail = (message: string): never => {
+      throw new Error(`series manifest integrity violation: ${label}: ${message}`);
+    };
+
+    // structural integrity（hashとは独立して再検証する）。runtime definitionsは
+    // ここには無いため、title existence / behavior-vs-meta種別 / lifecycle /
+    // definition側のcollectionDomainKey一致まではここで証明できない——それは
+    // registerSeriesManifests()呼び出し時の`assertValidSeriesManifest()`と
+    // `Store`外のcaller責務。
+    try {
+      assertSlug(m.catalog_key, "catalog_key");
+    } catch {
+      fail(`catalog_key is not a valid slug: ${JSON.stringify(m.catalog_key)}`);
+    }
+    try {
+      assertSlug(m.series_key, "series_key");
+    } catch {
+      fail(`series_key is not a valid slug: ${JSON.stringify(m.series_key)}`);
+    }
+    if (m.mastery_eligible !== 0 && m.mastery_eligible !== 1) {
+      fail(`mastery_eligible must be 0 or 1, got ${m.mastery_eligible}`);
+    }
+    if (!Number.isInteger(m.registered_at) || m.registered_at < 0) {
+      fail(`invalid registered_at (${m.registered_at})`);
+    }
+
     const members = db
       .prepare(`SELECT title_key, stage FROM title_series_members WHERE catalog_key = ? AND series_key = ?`)
       .all(m.catalog_key, m.series_key) as Array<{ title_key: string; stage: number }>;
+    if (members.length < 2) {
+      fail(`must have at least 2 members, has ${members.length}`);
+    }
+    for (const member of members) {
+      if (!member.title_key.startsWith("v2.") || member.title_key.length <= 3) {
+        fail(`member titleKey must use v2.* namespace: ${member.title_key}`);
+      }
+      if (!Number.isInteger(member.stage) || member.stage < 1) {
+        fail(`member ${member.title_key} has an invalid stage (${member.stage}; must be a positive integer)`);
+      }
+    }
+    // stageの連番性（1..N contiguous）は上のsequenceRows走査で既に別途検証済み。
+
     const recomputed = computeSeriesManifestHash({
       catalog: m.catalog_key,
       seriesKey: m.series_key,
@@ -387,10 +485,9 @@ export function assertSeriesPersistenceIntegrity(db: Database.Database): void {
       members: members.map((r) => ({ titleKey: r.title_key, stage: r.stage })),
     });
     if (recomputed !== m.manifest_hash) {
-      throw new Error(
-        `series manifest integrity violation: stored manifest_hash for ${m.catalog_key}/${m.series_key} does not ` +
-          `match the hash recomputed from its DB member snapshot (manifest may have been mutated out of band)`,
-      );
+      // manifest_hashの一致確認はstructural validationの代替ではない——上の
+      // structural checkを独立して先に通した上で、さらにhashの改竄も検出する。
+      fail(`stored manifest_hash does not match the hash recomputed from its DB member snapshot (mutated out of band)`);
     }
   }
 }

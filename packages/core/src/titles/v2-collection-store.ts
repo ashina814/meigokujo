@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { TitleDefinition } from "./v2-contract.js";
+import { assertSlug, type TitleDefinition } from "./v2-contract.js";
 import {
   assertCollectionEditionActivatable,
   computeCollectionEditionHash,
@@ -16,15 +16,23 @@ import {
  * **historical repair proof契約（§16）** — closed editionのmemberを「close時点で
  * 持っていたと証明できる」とみなす条件は次のいずれか:
  *
- * A. そのuser/titleのawardに `earned_at IS NOT NULL AND earned_at <= edition.closed_at`
+ * A. そのuser/titleのawardに `earned_at IS NOT NULL AND earned_at < edition.closed_at`
  *    が1件以上ある（正確な達成時刻がclose以前だと証明できる——historical repairでも可）
- * B. そのuser/titleのawardに `awarded_at <= edition.closed_at` が1件以上ある
+ * B. そのuser/titleのawardに `awarded_at < edition.closed_at` が1件以上ある
  *    （close前にBotが既にaward記録済み——earnedAtが不明でも、その時点でownership
  *    済みだったこと自体は証明できる）
  *
- * close後にhistorical repairされたawardは、earnedAtが正確にclose以前だと証明できる
- * 場合だけ（条件A）旧editionへcreditされる。close後に普通に取得した
- * awardedAt>closedAt かつ earnedAt=NULL のtitleは、close以前に持っていた証明が
+ * **`<` であって `<=` ではない**（same-second tieはfail-closed）。Store clockは
+ * Unix秒精度（`Math.floor(Date.now()/1000)`）のため、`close at T` と
+ * `close直後の通常award at T`（同じ秒に丸められる）は`awarded_at === closed_at`
+ * になり得る。秒精度のままでは同秒内の前後関係を証明できないため、
+ * `earned_at === closed_at` / `awarded_at === closed_at` はどちらも「close時点で
+ * 持っていた証明」として扱わず、保守的に対象外とする——`<=`のままだと、
+ * close直後（同じ秒内）の通常取得を誤って旧editionへcreditしてしまう。
+ *
+ * close後にhistorical repairされたawardは、earnedAtが正確にclose**より前**だと
+ * 証明できる場合だけ（条件A）旧editionへcreditされる。close後に普通に取得した
+ * `awardedAt>=closedAt` かつ `earnedAt=NULL` のtitleは、close以前に持っていた証明が
  * 無いため旧editionへは一切creditしない——`collectionEditionProgress()` がこの契約を
  * 直接実装する。
  */
@@ -150,11 +158,22 @@ interface MemberDbRow {
   full_clear_required: number;
 }
 
-function getState(db: Database.Database): { active_edition_key: string | null } {
+/**
+ * singleton state rowの欠損は「activeなeditionが無い」という正常状態ではなく、
+ * integrity violation——`ensureTitleV2Schema()`（`COLLECTION_V2_DDL`の
+ * `INSERT OR IGNORE`）が必ずid=1行を作るため、通常運用でこの行が消えることは
+ * あり得ない。欠損時に`{active_edition_key:null}`を返すfail-openにすると、
+ * 「out-of-bandにstate rowが削除された」状態を「activeなし」の正常状態と
+ * 区別できなくなる——fail-closedする。
+ */
+function requireState(db: Database.Database): { active_edition_key: string | null } {
   const row = db.prepare(`SELECT active_edition_key FROM title_collection_state WHERE id = 1`).get() as
     | { active_edition_key: string | null }
     | undefined;
-  return row ?? { active_edition_key: null };
+  if (!row) {
+    throw new Error("collection state integrity violation: title_collection_state singleton row (id=1) is missing");
+  }
+  return row;
 }
 
 function getEditionRow(db: Database.Database, editionKey: string): EditionDbRow | null {
@@ -231,7 +250,7 @@ export function activateCollectionEdition(
   const hash = computeCollectionEditionHash(edition);
 
   const tx = db.transaction((): ActivateCollectionEditionResult => {
-    const state = getState(db);
+    const state = requireState(db);
     const existing = getEditionRow(db, edition.editionKey);
 
     if (existing) {
@@ -297,7 +316,15 @@ export function activateCollectionEdition(
       );
     }
 
-    db.prepare(`UPDATE title_collection_state SET active_edition_key = ? WHERE id = 1`).run(edition.editionKey);
+    const pointerUpdate = db
+      .prepare(`UPDATE title_collection_state SET active_edition_key = ? WHERE id = 1`)
+      .run(edition.editionKey);
+    if (pointerUpdate.changes !== 1) {
+      throw new Error(
+        `collection state integrity violation: failed to set active pointer to ${edition.editionKey} ` +
+          `(expected exactly 1 row updated, got ${pointerUpdate.changes})`,
+      );
+    }
 
     const inserted = getEditionRow(db, edition.editionKey)!;
     return { status: "activated", edition: toPublicEdition(db, inserted) };
@@ -312,8 +339,13 @@ export function activateCollectionEdition(
  * repairのために保持し続ける。
  *
  * - 存在しないeditionKey → throw
- * - 既にclosed済みの同editionKey → idempotentな"already_closed"（metadataは書き換えない）
- * - 別editionがactiveなのに古いeditionをcloseしようとした → reject
+ * - 既にclosed済みで、かつ他に何もactiveでない → idempotentな"already_closed"
+ *   （metadataは書き換えない）
+ * - 既にclosed済みだが、別editionが現在active → reject（stale close request——
+ *   このeditionKey自体は正しくclosed済みでも、その後の状態遷移を踏まえると
+ *   今のこの呼び出しはもう意味を持たない、という区別をstateより先に確認する）
+ * - closed済みではないが、別editionが現在active（このeditionはそもそもactiveに
+ *   なったことが無い、等） → reject
  *
  * `closedAt` はStore clockのsnapshot。一度closedになったeditionは再open不可
  * （`activateCollectionEdition()` 側がreopenを拒否する）。
@@ -334,11 +366,25 @@ export function closeCollectionEdition(
   const tx = db.transaction((): CloseCollectionEditionResult => {
     const existing = getEditionRow(db, editionKey);
     if (!existing) throw new Error(`collection edition not found: ${editionKey}`);
+
+    // stateを先に確認する——closed判定をstateより先に行うと、「targetは既にclosed済み
+    // だが、別editionが現在active」というstale close requestを、単なる冪等な
+    // already_closedとして誤って受理してしまう（このeditionKeyへのcloseが今
+    // 意味を持つかどうかは、現在のactive pointerと合わせて見ないと判断できない）。
+    const state = requireState(db);
+
     if (existing.closed_at !== null) {
-      return { status: "already_closed", edition: toPublicEdition(db, existing) };
+      if (state.active_edition_key === null) {
+        // 既にclosed済みで、かつ他に何もactiveでない——素直な冪等呼び出し。
+        return { status: "already_closed", edition: toPublicEdition(db, existing) };
+      }
+      // 既にclosed済みだが、別editionが現在active——このclose要求はstale。
+      throw new Error(
+        `cannot close ${editionKey}: it is already closed and a different edition ` +
+          `(${state.active_edition_key}) is now active (stale close request)`,
+      );
     }
 
-    const state = getState(db);
     if (state.active_edition_key !== editionKey) {
       throw new Error(`cannot close ${editionKey}: it is not the active edition (active=${state.active_edition_key ?? "none"})`);
     }
@@ -350,9 +396,15 @@ export function closeCollectionEdition(
       note ?? null,
       editionKey,
     );
-    db.prepare(`UPDATE title_collection_state SET active_edition_key = NULL WHERE id = 1 AND active_edition_key = ?`).run(
-      editionKey,
-    );
+    const pointerClear = db
+      .prepare(`UPDATE title_collection_state SET active_edition_key = NULL WHERE id = 1 AND active_edition_key = ?`)
+      .run(editionKey);
+    if (pointerClear.changes !== 1) {
+      throw new Error(
+        `collection state integrity violation: failed to clear active pointer for ${editionKey} ` +
+          `(expected exactly 1 row updated, got ${pointerClear.changes})`,
+      );
+    }
 
     const closed = getEditionRow(db, editionKey)!;
     return { status: "closed", edition: toPublicEdition(db, closed) };
@@ -377,7 +429,7 @@ export function assertActiveCollectionEditionMatchesRuntime(
 ): void {
   assertCollectionEditionActivatable(runtimeEdition, definitions);
 
-  const state = getState(db);
+  const state = requireState(db);
   if (state.active_edition_key === null) {
     throw new Error(
       `no active collection edition persisted in DB, but runtime expects ${runtimeEdition.editionKey} to be active`,
@@ -435,7 +487,7 @@ export function collectionEditionProgress(
         .prepare(
           `SELECT title_key FROM title_awards
             WHERE user_id = ? AND title_key IN (${placeholders})
-              AND ((earned_at IS NOT NULL AND earned_at <= ?) OR awarded_at <= ?)
+              AND ((earned_at IS NOT NULL AND earned_at < ?) OR awarded_at < ?)
             GROUP BY title_key`,
         )
         .all(userId, ...members.map((m) => m.title_key), closedAt, closedAt) as Array<{ title_key: string }>;
@@ -480,10 +532,17 @@ export function collectionEditionProgress(
 }
 
 export function activeCollectionEdition(db: Database.Database): TitleCollectionEditionRow | null {
-  const state = getState(db);
+  const state = requireState(db);
   if (state.active_edition_key === null) return null;
   const row = getEditionRow(db, state.active_edition_key);
-  return row ? toPublicEdition(db, row) : null;
+  if (!row) {
+    // pointerが指すedition行が無い——「activeなeditionが無い」正常状態と混同しない。
+    // FK自体は満たしていても（例えば行が別途削除された等）integrity violation。
+    throw new Error(
+      `collection state integrity violation: active pointer (${state.active_edition_key}) references a missing edition row`,
+    );
+  }
+  return toPublicEdition(db, row);
 }
 
 /**
@@ -520,7 +579,7 @@ export function listCollectionEditions(db: Database.Database): TitleCollectionEd
  * - 保存済みmanifest_hashが、DB snapshotから再計算したhashと一致する
  */
 export function assertCollectionPersistenceIntegrity(db: Database.Database): void {
-  const state = getState(db);
+  const state = requireState(db);
   const unclosedEditions = db
     .prepare(`SELECT edition_key FROM title_collection_editions WHERE closed_at IS NULL`)
     .all() as Array<{ edition_key: string }>;
@@ -554,10 +613,23 @@ export function assertCollectionPersistenceIntegrity(db: Database.Database): voi
       throw new Error(`collection edition integrity violation: ${row.edition_key}: ${message}`);
     };
 
+    // structural integrity（manifest_hashとは独立して再検証する）。runtime
+    // definitionsはここには無いため、title existence / behavior-vs-meta種別 /
+    // lifecycle / definition側のcollectionDomainKey一致まではここで証明できない
+    // ——それはactivateCollectionEdition()呼び出し時の
+    // assertCollectionEditionActivatable()の責務。
+    try {
+      assertSlug(row.edition_key, "edition_key");
+    } catch {
+      fail(`edition_key is not a valid slug: ${JSON.stringify(row.edition_key)}`);
+    }
+
     if (!Number.isInteger(row.activated_at) || row.activated_at < 0) fail("invalid activated_at");
     if (row.closed_at !== null) {
       if (!Number.isInteger(row.closed_at) || row.closed_at < row.activated_at) fail("closed_at chronology invalid");
       if (row.closed_by === null) fail("closed_at set but closed_by is NULL");
+    } else if (row.closed_by !== null) {
+      fail("closed_by is set but closed_at is NULL");
     }
 
     const members = getMemberRows(db, row.edition_key);
@@ -567,6 +639,23 @@ export function assertCollectionPersistenceIntegrity(db: Database.Database): voi
     let fullClearCount = 0;
     const countableDomains = new Set<string>();
     for (const m of members) {
+      if (!m.title_key.startsWith("v2.") || m.title_key.length <= 3) {
+        fail(`member titleKey must use v2.* namespace: ${m.title_key}`);
+      }
+      try {
+        assertSlug(m.collection_domain_key, "collectionDomainKey");
+      } catch {
+        fail(`member ${m.title_key} has an invalid collectionDomainKey: ${JSON.stringify(m.collection_domain_key)}`);
+      }
+      if (m.collection_credit !== 0 && m.collection_credit !== 1) {
+        fail(`member ${m.title_key} has an invalid collection_credit (${m.collection_credit}; must be 0 or 1)`);
+      }
+      if (m.full_clear_required !== 0 && m.full_clear_required !== 1) {
+        fail(`member ${m.title_key} has an invalid full_clear_required (${m.full_clear_required}; must be 0 or 1)`);
+      }
+      if (m.collection_credit !== 1 && m.full_clear_required !== 1) {
+        fail(`member ${m.title_key} is neither collectionCredit nor fullClearRequired (meaningless edition member)`);
+      }
       if (m.collection_credit === 1) {
         countableCount += 1;
         countableDomains.add(m.collection_domain_key);
@@ -574,6 +663,19 @@ export function assertCollectionPersistenceIntegrity(db: Database.Database): voi
       if (m.full_clear_required === 1) fullClearCount += 1;
     }
     if (fullClearCount === 0) fail("no fullClearRequired member");
+
+    const milestoneEntries: ReadonlyArray<readonly [string, number]> = [
+      ["startedCollecting", row.started_collecting],
+      ["collectorHabit", row.collector_habit],
+      ["stillCollecting", row.still_collecting],
+      ["thousandMarks.count", row.thousand_marks_count],
+      ["thousandMarks.domains", row.thousand_marks_domains],
+      ["almostComplete.remaining", row.almost_complete_remaining],
+    ];
+    for (const [label, value] of milestoneEntries) {
+      if (!Number.isInteger(value) || value < 0) fail(`milestone ${label} must be a non-negative integer, got ${value}`);
+    }
+
     if (!(row.started_collecting >= 1)) fail("startedCollecting must be >= 1");
     if (!(row.started_collecting < row.collector_habit)) fail("startedCollecting must be < collectorHabit");
     if (!(row.collector_habit < row.still_collecting)) fail("collectorHabit must be < stillCollecting");

@@ -254,12 +254,24 @@ export function assertCollectionEditionActivatable(
 }
 
 /**
+ * 文字列を単純なUTF-16 code unit順で比較する、locale/ICUに依存しない決定的な
+ * order。`String.prototype.localeCompare()` はロケール・ICUバージョン・実行環境に
+ * よって順序が変わり得るため、semantic hashのcanonical orderへは使わない
+ * （同じ入力でも環境が違うとhashが変わってしまう不安定さを避ける）。
+ */
+function compareCodeUnit(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
  * Collection Editionもimmutable semantic hashを持つ（PR B2）——activation後に
  * members/milestoneが書き換えられていないかをconstruction-time integrityで検出する。
  *
  * hash対象: `editionKey` / `milestones`（全milestone値） / member（titleKey順に
  * sortした上での titleKey・collectionDomainKey・collectionCredit・fullClearRequired）。
- * member入力順はsemanticではないため、titleKey順へcanonicalizeしてからhashする。
+ * member入力順はsemanticではないため、titleKey順へcanonicalizeしてからhashする——
+ * `canonicalHash()`（`casino/opening-canonical.ts`）は配列順をそのまま保存するため、
+ * ここでのsortはlocale非依存で完全に決定的でなければならない（`compareCodeUnit()`）。
  *
  * hashから除外: `activatedAt` / `activatedBy`（actor） / `activationNote` / close
  * metadata——これらはeditionの構造そのものではなく運用ログであり、後から変わっても
@@ -267,7 +279,7 @@ export function assertCollectionEditionActivatable(
  */
 export function computeCollectionEditionHash(edition: TitleCollectionEdition): string {
   const canonicalMembers = [...edition.members]
-    .sort((a, b) => a.titleKey.localeCompare(b.titleKey))
+    .sort((a, b) => compareCodeUnit(a.titleKey, b.titleKey))
     .map((m) => [m.titleKey, m.collectionDomainKey, m.collectionCredit, m.fullClearRequired] as const);
   return canonicalHash({
     editionKey: edition.editionKey,

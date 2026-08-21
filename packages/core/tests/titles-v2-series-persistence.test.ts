@@ -315,6 +315,112 @@ describe("assertSeriesPersistenceIntegrity() semantic integrity検証（§9, §2
   });
 });
 
+describe("series mastery processing chronology（レビュー追加分・§8相当）", () => {
+  it("recordedAtがmanifest.registered_atより前ならreconcileはfail-closed", () => {
+    const { store, setClock } = setup();
+    const members = ladder("ignite", 2);
+    setClock(BASE + 5000);
+    store.registerSeriesManifests([manifestOf("ignite", members)], members);
+
+    // clockを登録時刻より前へ巻き戻してからaward+reconcileを試みる
+    // （通常運用では起こらないが、誤ったclock注入やclock逆行を想定）。
+    setClock(BASE + 1000);
+    awardAll(store, "alice", members, BASE + 1000);
+
+    expect(() => store.reconcileSeriesMasteriesForUser("alice")).toThrow(/chronology violation/);
+    expect(store.hasSeriesMastery("alice", "v1", "ignite")).toBe(false);
+  });
+
+  it("recordedAtが最後のmember first_awarded_atより前ならreconcileはfail-closed", () => {
+    const { store, setClock } = setup();
+    const members = ladder("ignite", 2);
+    setClock(BASE + 1000);
+    store.registerSeriesManifests([manifestOf("ignite", members)], members);
+
+    setClock(BASE + 9000);
+    awardAll(store, "bob", members, BASE + 9000);
+
+    // このreconcile呼び出し自体のclockを、直前のawardedAtより前へ巻き戻す。
+    setClock(BASE + 2000);
+    expect(() => store.reconcileSeriesMasteriesForUser("bob")).toThrow(/chronology violation/);
+    expect(store.hasSeriesMastery("bob", "v1", "ignite")).toBe(false);
+  });
+
+  it("正常なchronology（registered_at/ownership.first_awarded_atの後）ならmastery成立", () => {
+    const { store, setClock } = setup();
+    const members = ladder("ignite", 2);
+    setClock(BASE + 1000);
+    store.registerSeriesManifests([manifestOf("ignite", members)], members);
+
+    setClock(BASE + 2000);
+    awardAll(store, "carol", members, BASE + 2000);
+
+    setClock(BASE + 3000);
+    const result = store.reconcileSeriesMasteriesForUser("carol");
+    expect(result.newlyMastered.length).toBe(1);
+    expect(result.newlyMastered[0]!.recordedAt).toBe(BASE + 3000);
+  });
+
+  it("constructor integrityでも同じchronology契約を再検証する（直接SQL改竄）", () => {
+    const { db, store, setClock } = setup();
+    const members = ladder("ignite", 2);
+    setClock(BASE + 5000);
+    store.registerSeriesManifests([manifestOf("ignite", members)], members);
+    setClock(BASE + 6000);
+    awardAll(store, "dave", members, BASE + 6000);
+    setClock(BASE + 7000);
+    store.reconcileSeriesMasteriesForUser("dave");
+
+    // recorded_atを、manifest.registered_at(5000)より前の値へ直接改竄する。
+    db.prepare(`UPDATE title_series_masteries SET recorded_at = ? WHERE user_id = 'dave'`).run(BASE + 100);
+
+    expect(() => new TitleV2Store(db, () => BASE + 8000)).toThrow(/is before the required minimum/);
+  });
+});
+
+describe("structural integrity（manifest_hashとは独立、レビュー追加分・§5相当）", () => {
+  it("member titleKeyがv2.*namespaceでない状態（直接SQL改竄）→ constructor reject", () => {
+    const { db, store } = setup();
+    const members = ladder("ignite", 2);
+    store.registerSeriesManifests([manifestOf("ignite", members)], members);
+
+    db.pragma("foreign_keys = OFF");
+    db.prepare(`UPDATE title_series_members SET title_key = 'not-v2-namespaced' WHERE catalog_key = 'v1' AND series_key = 'ignite' AND stage = 1`).run();
+    db.pragma("foreign_keys = ON");
+
+    expect(() => new TitleV2Store(db, () => BASE + 3000)).toThrow(/member titleKey must use v2\.\* namespace/);
+  });
+
+  it("members < 2（直接SQL削除）→ constructor reject", () => {
+    const { db, store } = setup();
+    const members = ladder("ignite", 2);
+    store.registerSeriesManifests([manifestOf("ignite", members)], members);
+
+    db.pragma("foreign_keys = OFF");
+    db.prepare(`DELETE FROM title_series_members WHERE catalog_key = 'v1' AND series_key = 'ignite' AND stage = 2`).run();
+    db.pragma("foreign_keys = ON");
+
+    expect(() => new TitleV2Store(db, () => BASE + 3000)).toThrow(/must have at least 2 members/);
+  });
+
+  it("catalog_keyがslugでない（直接SQL改竄。DB層にslug形式のCHECKは無いため、app-level structural checkだけが検出する）→ constructor reject", () => {
+    const { db, store } = setup();
+    const members = ladder("ignite", 2);
+    store.registerSeriesManifests([manifestOf("ignite", members)], members);
+
+    // title_series_membersのcatalog_keyも一緒に書き換え、FK参照整合を保ったまま
+    // catalog_key自体を不正なslugへ改竄する（片方だけ変えるとFK孤立child行として
+    // 別のfail-closed経路（foreign_key_check）で先に検出されてしまうため）。PKを
+    // またぐ更新なのでforeign_keysを一時的に無効化する。
+    db.pragma("foreign_keys = OFF");
+    db.prepare(`UPDATE title_series_manifests SET catalog_key = 'bad catalog' WHERE series_key = 'ignite'`).run();
+    db.prepare(`UPDATE title_series_members SET catalog_key = 'bad catalog' WHERE series_key = 'ignite'`).run();
+    db.pragma("foreign_keys = ON");
+
+    expect(() => new TitleV2Store(db, () => BASE + 3000)).toThrow(/catalog_key is not a valid slug/);
+  });
+});
+
 describe("atomicity（§21）", () => {
   it("series registration: manifest insert成功 → member insert失敗 → manifestもrollback", () => {
     const { db, store } = setup();

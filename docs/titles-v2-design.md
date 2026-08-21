@@ -452,7 +452,11 @@ released progression seriesのimmutable manifest（`v2-series.ts`）を実際に
 
 **`title_series_masteries.recorded_at` は達成時刻ではない**——「Botがseries mastery成立を初めて確認して永続化した時刻」でしかない。member titleの一部がnon-orderable（`earnedAt===null`）だったり、historical repairで後から追加された場合があるため、真の完遂時刻を安全に一意決定できない。将来《一門皆伝》meta titleのearnedAtが必要になった場合は、`title_awards`から別途proofを組み立てる（PR B2の範囲外）。
 
-**semantic integrity**（`assertSeriesPersistenceIntegrity()`、`TitleV2Store` construction時）: mastery行が参照するmanifestが存在し`mastery_eligible=1`であること、mastery userが実際にそのseriesの全member titleをownershipしていること、`recorded_at`が非負整数であること、同一titleが複数series memberになっていないこと（`UNIQUE(title_key)`のdefense-in-depth再確認）、各seriesのstageが1..N contiguousであること、保存済み`manifest_hash`がDB member snapshotから再計算したhashと一致すること。偽mastery/manifestを自動生成して修復しない——欠損・矛盾はfail-closedするだけ。
+**processing chronology**: `recorded_at` は達成時刻ではないが、それでも正常状態では最低限 `recorded_at >= manifest.registered_at` かつ `recorded_at >= MAX(member ownership.first_awarded_at)` が成立する——series manifestが登録される前、または全member ownershipが成立する前にmasteryが処理されることは無いはずだからである。`reconcileSeriesMasteriesForUser()` はclock snapshotがこの最低条件を満たさない場合（clockの逆行・誤った注入等）fail-closedする。`earned_at`（historical achievement time）とは比較しない——達成時刻を推測しない既存契約を維持する。
+
+**semantic integrity**（`assertSeriesPersistenceIntegrity()`、`TitleV2Store` construction時）: mastery行が参照するmanifestが存在し`mastery_eligible=1`であること、mastery userが実際にそのseriesの全member titleをownershipしていること、`recorded_at`が非負整数であること、上記processing chronology契約（`recorded_at >= registered_at` かつ `>= MAX(member ownership.first_awarded_at)`）を満たすこと、同一titleが複数series memberになっていないこと（`UNIQUE(title_key)`のdefense-in-depth再確認）、各seriesのstageが1..N contiguousであること、保存済み`manifest_hash`がDB member snapshotから再計算したhashと一致すること。
+
+さらに、hashチェックとは**独立して**structural integrityも再検証する——manifestごとのmembers>=2・catalog/series_keyがslug形式・member titleKeyがv2.\*namespace・stageが正整数、といった構造契約をDB snapshotだけから直接確認する（runtime definitionsが無いため、title existence・behavior/meta種別・definition側のcollectionDomainKey一致まではここで証明できない）。hash一致はstructural validationの代替にはならない——一方が迂回されても他方が独立して検出する設計。偽mastery/manifestを自動生成して修復しない——欠損・矛盾はfail-closedするだけ。
 
 ### Collection Edition lifecycle（PR B2）
 
@@ -466,24 +470,37 @@ activateされたCollection Editionのmanifest snapshotをimmutableにDB保存�
 - 同editionKeyだがhash不一致 → reject（editionのmembers/milestonesは書き換えない）
 - 同editionKeyがclosed済み → reject（**reopen禁止**）
 
-`activatedAt` はStore clockのsnapshot。callerが任意timestampを注入できない。
+`activatedAt` はStore clockのsnapshot。callerが任意timestampを注入できない。active pointerを設定するUPDATE文は`changes===1`を要求する——`WHERE`句が意図せず0行しか更新しなかった（stateの整合が崩れている等）場合、静かに成功したふりをせずfail-closedする。
 
-**close**: `closeCollectionEdition(editionKey, actor, note?)` が、現在activeなeditionだけをcloseできる。存在しないeditionKeyはthrow、既にclosed済みの同editionKeyはidempotentな`"already_closed"`（**close metadataは書き換えない**——2回目のcloseで別のactor/noteを渡しても、最初のclose時点のclosedBy/closeNoteのまま）、別editionがactiveなのに古いeditionをcloseしようとした場合はreject。`closed_at`/`active pointerのNULL化`は単一transaction内でatomicに確定する。一度closedになったeditionは`activateCollectionEdition()`側が再openを拒否する。
+**`title_collection_state` singleton rowはfail-closed**——rowの欠損は「activeなeditionが無い」正常状態ではなくintegrity violationとして扱う。`ensureTitleV2Schema()`（`INSERT OR IGNORE`）が必ずid=1行を作るため、通常運用でこの行が消えることは無い。欠損時に`{active_edition_key:null}`を返すfail-openな実装だと、「out-of-bandにstate rowが削除された」破損状態を正常状態と区別できなくなる。同様に、`activeCollectionEdition()`もactive pointerが指すedition行が実際には存在しない場合、`null`を返さずthrowする——「activeなし」と「pointerが壊れている」を混同しない。
 
-**semantic hash**: Collection Editionもimmutable semantic hashを持つ（`computeCollectionEditionHash()`、`v2-collection.ts`）。hash対象は `editionKey` / `milestones`（全milestone値） / member（**titleKey順にsort**した上での titleKey・collectionDomainKey・collectionCredit・fullClearRequired）。`activatedAt`/`activatedBy`/`activationNote`/close metadataはhashから除外する——運用ログであり、editionの構造そのものではない。
+**close**: `closeCollectionEdition(editionKey, actor, note?)` が、現在activeなeditionだけをcloseできる。契約は以下の通り——**stateを先に確認してから**closed判定を行う（順序が重要。後述）。
+
+- 存在しないeditionKey → throw
+- 既にclosed済みで、かつ他に何もactiveでない → idempotentな`"already_closed"`（**close metadataは書き換えない**——2回目のcloseで別のactor/noteを渡しても、最初のclose時点のclosedBy/closeNoteのまま）
+- 既にclosed済みだが、**別のeditionが現在active** → reject（**stale close request**）。このeditionKey自体は正しくclosed済みでも、その後に別editionが activate→close の運用サイクルを経て今activeになっている状況で、古いeditionKeyへのclose要求は「今」意味を持たない——closed判定をstateより先に行うと、このケースまで単なる冪等な`already_closed`として誤って受理してしまう
+- closed済みではないが、別editionが現在active（このeditionはそもそもactiveになったことが無い等） → reject
+
+`closed_at`/`active pointerのNULL化`は単一transaction内でatomicに確定する（state clearのUPDATEも`changes===1`を要求する）。一度closedになったeditionは`activateCollectionEdition()`側が再openを拒否する。
+
+**semantic hash**: Collection Editionもimmutable semantic hashを持つ（`computeCollectionEditionHash()`、`v2-collection.ts`）。hash対象は `editionKey` / `milestones`（全milestone値） / member（**titleKey順にsort**した上での titleKey・collectionDomainKey・collectionCredit・fullClearRequired）。`activatedAt`/`activatedBy`/`activationNote`/close metadataはhashから除外する——運用ログであり、editionの構造そのものではない。canonical order計算には`String.prototype.localeCompare()`ではなく、locale/ICUに依存しないUTF-16 code unit比較（`compareCodeUnit()`）を使う——`canonicalHash()`は配列順をそのまま保存するため、実行環境（ロケール・ICUバージョン）が変わっても同じ入力からは常に同じhashが得られる必要がある。
 
 **historical repair proof契約（§16）**: closed editionのmemberを「close時点で持っていたと証明できる」とみなす条件は次のいずれか。
 
-- **A**: そのuser/titleのawardに `earned_at IS NOT NULL AND earned_at <= edition.closed_at` が1件以上ある（正確な達成時刻がclose以前だと証明できる——historical repairでも可）
-- **B**: そのuser/titleのawardに `awarded_at <= edition.closed_at` が1件以上ある（close前にBotが既にaward記録済み——earnedAtが不明でも、その時点でownership済みだったこと自体は証明できる）
+- **A**: そのuser/titleのawardに `earned_at IS NOT NULL AND earned_at < edition.closed_at` が1件以上ある（正確な達成時刻がclose以前だと証明できる——historical repairでも可）
+- **B**: そのuser/titleのawardに `awarded_at < edition.closed_at` が1件以上ある（close前にBotが既にaward記録済み——earnedAtが不明でも、その時点でownership済みだったこと自体は証明できる）
 
-close後にhistorical repairされたawardは、earnedAtが正確にclose以前だと証明できる場合だけ（条件A）旧editionへcreditされる。close後に普通に取得した `awardedAt>closedAt` かつ `earnedAt=NULL` のtitleは、close以前に持っていた証明が無いため旧editionへは一切creditしない。domain breadthもこの同じ「owned扱いにできるtitle集合」から算出するため、closed proofと同時にfreezeされる。
+**`<` であって `<=` ではない**（same-second tieはfail-closed）。Store clockはUnix秒精度（`Math.floor(Date.now()/1000)`）のため、`close at T` と `close直後の通常award at T`（同じ秒に丸められる）は`awarded_at === closed_at`になり得る——秒精度のままでは同秒内の前後関係を証明できないため、同秒tieは保守的に対象外とする。`<=`のままだと、close直後（同じ秒内）の通常取得を誤って旧editionへcreditしてしまう。
+
+close後にhistorical repairされたawardは、earnedAtが正確にclose**より前**だと証明できる場合だけ（条件A）旧editionへcreditされる。close後に普通に取得した `awardedAt>=closedAt` かつ `earnedAt=NULL` のtitleは、close以前に持っていた証明が無いため旧editionへは一切creditしない。domain breadthもこの同じ「owned扱いにできるtitle集合」から算出するため、closed proofと同時にfreezeされる。
 
 **`collectionEditionProgress(userId, editionKey)`**: active editionは現在の `title_ownerships` を使い、closed editionは上記proof契約だけをowned扱いする。返却値は `collectionOwnedCount`/`collectionTotalCount`/`collectionOwnedDomainCount`/`collectionTotalDomainCount`/`fullClearOwnedCount`/`fullClearRequiredCount`/`fullClearRemainingCount`/`fullClearComplete`/`state`/`editionKey`のみ——**member titleKey・hidden title名・未取得hidden条件は一切含まない**（hidden title leak防止）。meta evaluatorが必要とするのはこの集計値だけであり、このAPIをそのままユーザー向けprogress rendererへ渡してよい。一方、`collectionEdition(editionKey)`/`listCollectionEditions()`（管理用read API）はmember titleKeyを含む——**ユーザー向けprogress rendererへそのまま渡してよいAPIではない**ことをdoc commentで明示している。
 
 **runtime compatibility API**: PR #152で決めた「active editionのpersisted manifestとruntime contractがズレていたらfail-closed」を実行可能にするAPI `assertActiveCollectionEditionMatchesRuntime(runtimeEdition, definitions)` を用意した——runtime manifestのstructural/activatable validation、DB active editionの取得、editionKey一致、semantic hash一致を確認し、mismatchならthrowする。まだbot startupへwiringしない（PR B2の範囲外）——APIとtestsだけを用意する。
 
-**semantic integrity**（`assertCollectionPersistenceIntegrity()`、`TitleV2Store` construction時）: active pointerがNULLならunclosed editionは0件、active pointerが非NULLなら対応editionが存在し`closed_at IS NULL`、unclosed editionはexactly 1件、closed metadata chronology valid（`closed_at>=activated_at`、closed_by整合）、members/milestonesの構造整合（DB member snapshotから再計算した値がmilestoneの不等式契約を満たす）、保存済み`manifest_hash`がDB snapshotから再計算したhashと一致すること。construction時点ではruntimeの `TitleDefinition` mapが無いため、「現在title lifecycle=activeか」はここで判定しない——それは`assertActiveCollectionEditionMatchesRuntime()`の責務。
+**semantic integrity**（`assertCollectionPersistenceIntegrity()`、`TitleV2Store` construction時）: active pointerがNULLならunclosed editionは0件、active pointerが非NULLなら対応editionが存在し`closed_at IS NULL`、unclosed editionはexactly 1件、closed metadata chronology valid（`closed_at>=activated_at`、`closed_at IS NULL`と`closed_by IS NULL`の同値性）、members/milestonesの構造整合（DB member snapshotから再計算した値がmilestoneの不等式契約を満たす）、保存済み`manifest_hash`がDB snapshotから再計算したhashと一致すること。construction時点ではruntimeの `TitleDefinition` mapが無いため、「現在title lifecycle=activeか」はここで判定しない——それは`assertActiveCollectionEditionMatchesRuntime()`の責務。
+
+hashチェックとは**独立して**structural integrityも再検証する——`edition_key`がslug形式、member titleKeyがv2.\*namespace、member `collectionDomainKey`がslug形式、`collection_credit`/`full_clear_required`が0/1、両方falseのmemberが存在しない、milestone全値が非負整数、といった構造契約をDB snapshotだけから直接確認する。hash一致はstructural validationの代替にはならない——一方が迂回されても他方が独立して検出する設計（title existence・behavior/meta種別・definition側のcollectionDomainKey一致は、runtime definitionsが無いためここでは証明できない）。
 
 ## 6. 即時判定 + reconcile
 
@@ -576,6 +593,19 @@ root `packages/core/src/index.ts` からも、evaluator kernelの主要APIだけ
 `readTitleSource()` 等の低レベルreader APIはrootへは出さない——称号条件作者が使うAPIと
 内部実装を区別する。旧v1にも `TitleRule` が存在するため、v2側は `TitleV2Rule` /
 `TitleV2RuleContext` / `TitleV2RuleResult` へaliasする。
+
+**persistenceのpublic mutation boundaryは `TitleV2Store` のmethodsだけに限定する**（PR B2）。
+`v2-series-store.ts` / `v2-collection-store.ts` の関数（`registerSeriesManifests` /
+`reconcileSeriesMasteriesForUser` / `activateCollectionEdition` / `closeCollectionEdition`
+等）は `Database` + `clock` を直接受け取るraw persistence APIであり、`@meigokujo/core/titles/v2`
+からはexportしない。これらを公開すると、callerが `TitleV2Store` の内部clockを経由せず任意の
+clockを注入でき、「`registered_at`/`recorded_at`/`activated_at`/`closed_at`はStore clock」
+という契約（callerが任意timestampを注入できない）を迂回できてしまう。これらの関数は
+`v2-store.ts` が内部でimportして `TitleV2Store` のmethodsとして再公開するためだけに使う。
+contract validator（`assertValidSeriesManifest()` 等）・semantic hash計算関数
+（`computeSeriesManifestHash()` 等）・公開type はexportして構わない——mutationを伴わず、
+clock契約に影響しないため。integrity helper（`assertSeriesPersistenceIntegrity()` 等）も、
+`TitleV2Store` construction時に内部で呼ぶだけで、それ単体を公開API化する必要は無い。
 
 ## 15. PR分割
 

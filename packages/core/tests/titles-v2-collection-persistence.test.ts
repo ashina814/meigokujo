@@ -337,7 +337,7 @@ describe("runtime compatibility API（§15）", () => {
 });
 
 describe("historical repair proof（§16, §27）", () => {
-  it("closedAt以前にawarded_atがある（earned_atはNULL）→ old editionでowned扱い", () => {
+  it("closedAtより前にawarded_atがある（earned_atはNULL）→ old editionでowned扱い", () => {
     const { store, setClock } = setup();
     const { edition, definitionsMap, a } = fiveMemberEdition("v1-edition");
     setClock(BASE + 2000);
@@ -354,7 +354,7 @@ describe("historical repair proof（§16, §27）", () => {
     expect(progress.collectionOwnedCount).toBe(1);
   });
 
-  it("close後award・earned_atがclosedAt以前 → historical repairとしてowned扱い", () => {
+  it("close後award・earned_atがclosedAtより前 → historical repairとしてowned扱い", () => {
     const { store, setClock } = setup();
     const { edition, definitionsMap, b } = fiveMemberEdition("v1-edition");
     setClock(BASE + 2000);
@@ -363,7 +363,7 @@ describe("historical repair proof（§16, §27）", () => {
     store.closeCollectionEdition("v1-edition", "admin");
 
     setClock(BASE + 6000); // awarded_at > closedAt
-    award(store, "bob", b, BASE + 6000, BASE + 2500); // earned_at <= closedAt
+    award(store, "bob", b, BASE + 6000, BASE + 4999); // earned_at(4999) < closedAt(5000)
 
     const progress = store.collectionEditionProgress("bob", "v1-edition");
     expect(progress.collectionOwnedCount).toBe(1);
@@ -399,6 +399,75 @@ describe("historical repair proof（§16, §27）", () => {
 
     const progress = store.collectionEditionProgress("dave", "v1-edition");
     expect(progress.collectionOwnedCount).toBe(0);
+  });
+
+  it("same-second tie: close at T、同じclock Tのまま通常award（earned_at=NULL）→ credit 0（fail-closed）", () => {
+    const { store, setClock } = setup();
+    const { edition, definitionsMap, c } = fiveMemberEdition("v1-edition");
+    setClock(BASE + 2000);
+    store.activateCollectionEdition(edition, definitionsMap, "admin");
+
+    const T = BASE + 5000;
+    setClock(T);
+    store.closeCollectionEdition("v1-edition", "admin");
+
+    // close (T) と同じ秒のまま、通常取得（awarded_at===T、earned_at=NULL）。
+    // 秒精度では「close前/close後」の前後関係を証明できないため、保守的に対象外。
+    award(store, "erin", c, T, null);
+
+    const progress = store.collectionEditionProgress("erin", "v1-edition");
+    expect(progress.collectionOwnedCount).toBe(0);
+  });
+
+  it("same-second tie: close at T、同じclock Tのまま historical repair（earned_at=T）→ credit 0（fail-closed）", () => {
+    const { store, setClock } = setup();
+    const { edition, definitionsMap, d } = fiveMemberEdition("v1-edition");
+    setClock(BASE + 2000);
+    store.activateCollectionEdition(edition, definitionsMap, "admin");
+
+    const T = BASE + 5000;
+    setClock(T);
+    store.closeCollectionEdition("v1-edition", "admin");
+
+    setClock(T + 1000); // awarded_atはclose後
+    award(store, "frank", d, T + 1000, T); // earned_at === closedAt（同秒tie）
+
+    const progress = store.collectionEditionProgress("frank", "v1-edition");
+    expect(progress.collectionOwnedCount).toBe(0);
+  });
+
+  it("earnedAt=T-1（closedAt未満）→ credit", () => {
+    const { store, setClock } = setup();
+    const { edition, definitionsMap, e } = fiveMemberEdition("v1-edition");
+    setClock(BASE + 2000);
+    store.activateCollectionEdition(edition, definitionsMap, "admin");
+
+    const T = BASE + 5000;
+    setClock(T);
+    store.closeCollectionEdition("v1-edition", "admin");
+
+    setClock(T + 1000);
+    award(store, "grace", e, T + 1000, T - 1); // earned_at(T-1) < closedAt(T)
+
+    const progress = store.collectionEditionProgress("grace", "v1-edition");
+    expect(progress.collectionOwnedCount).toBe(1);
+  });
+
+  it("awardedAt=T-1・earnedAt=NULL（closedAt未満）→ credit", () => {
+    const { store, setClock } = setup();
+    const { edition, definitionsMap, a } = fiveMemberEdition("v1-edition");
+    setClock(BASE + 2000);
+    store.activateCollectionEdition(edition, definitionsMap, "admin");
+
+    const T = BASE + 5000;
+    setClock(T - 1); // awarded_at(T-1) < closedAt(T)
+    award(store, "henry", a, T - 1, null);
+
+    setClock(T);
+    store.closeCollectionEdition("v1-edition", "admin");
+
+    const progress = store.collectionEditionProgress("henry", "v1-edition");
+    expect(progress.collectionOwnedCount).toBe(1);
   });
 
   it("close後の通常取得はold edition collection/full-clear countを増やさない（§5相当）", () => {
@@ -487,6 +556,176 @@ describe("collectionEditionProgress の hidden title leak防止（§18）", () =
       ].sort(),
     );
     expect(JSON.stringify(progress)).not.toMatch(/v2\.test\./);
+  });
+});
+
+describe("title_collection_stateのfail-closed化（レビュー追加分）", () => {
+  it("state singleton rowが直接DELETEされていると、activateはreject", () => {
+    const { db, store, setClock } = setup();
+    db.pragma("foreign_keys = OFF");
+    db.prepare(`DELETE FROM title_collection_state WHERE id = 1`).run();
+    db.pragma("foreign_keys = ON");
+
+    const { edition, definitionsMap } = fiveMemberEdition("v1-edition");
+    setClock(BASE + 2000);
+    expect(() => store.activateCollectionEdition(edition, definitionsMap, "admin")).toThrow(
+      /title_collection_state singleton row \(id=1\) is missing/,
+    );
+  });
+
+  it("state singleton rowが直接DELETEされていると、closeはreject", () => {
+    const { db, store, setClock } = setup();
+    const { edition, definitionsMap } = fiveMemberEdition("v1-edition");
+    setClock(BASE + 2000);
+    store.activateCollectionEdition(edition, definitionsMap, "admin");
+
+    db.pragma("foreign_keys = OFF");
+    db.prepare(`DELETE FROM title_collection_state WHERE id = 1`).run();
+    db.pragma("foreign_keys = ON");
+
+    setClock(BASE + 5000);
+    expect(() => store.closeCollectionEdition("v1-edition", "admin")).toThrow(
+      /title_collection_state singleton row \(id=1\) is missing/,
+    );
+  });
+
+  it("pointer先edition行が欠損していると、activeCollectionEdition()はnullではなくreject", () => {
+    const { db, store, setClock } = setup();
+    const { edition, definitionsMap } = fiveMemberEdition("v1-edition");
+    setClock(BASE + 2000);
+    store.activateCollectionEdition(edition, definitionsMap, "admin");
+
+    db.pragma("foreign_keys = OFF");
+    db.prepare(`DELETE FROM title_collection_members WHERE edition_key = 'v1-edition'`).run();
+    db.prepare(`DELETE FROM title_collection_editions WHERE edition_key = 'v1-edition'`).run();
+    db.pragma("foreign_keys = ON");
+
+    expect(() => store.activeCollectionEdition()).toThrow(
+      /active pointer \(v1-edition\) references a missing edition row/,
+    );
+  });
+
+  it("state update（active pointer設定）がchanges=0になるsabotageで、activate transactionがrollbackされる", () => {
+    const { db, store, setClock } = setup();
+    // id=1以外の行を挿入させることはできない（CHECK(id=1)）ため、代わりにUPDATE直前で
+    // state行自体を削除するtriggerを仕掛け、「UPDATE...WHERE id=1」がchanges=0になる
+    // 状況を再現する。
+    db.exec(`
+      CREATE TRIGGER sabotage_collection_state_pointer_set
+      BEFORE UPDATE ON title_collection_state
+      WHEN NEW.active_edition_key = 'v1-edition'
+      BEGIN
+        SELECT RAISE(ABORT, 'sabotaged for state pointer set atomicity test');
+      END;
+    `);
+
+    const { edition, definitionsMap } = fiveMemberEdition("v1-edition");
+    setClock(BASE + 2000);
+    expect(() => store.activateCollectionEdition(edition, definitionsMap, "admin")).toThrow(
+      /sabotaged for state pointer set atomicity test/,
+    );
+    expect(store.collectionEdition("v1-edition")).toBeNull();
+    expect(store.activeCollectionEdition()).toBeNull();
+  });
+});
+
+describe("stale close request（レビュー追加分・§6相当）", () => {
+  it("A activate→close→B activate→close(A) → reject（Aは既にclosedだが、別のBがactiveなためstale）", () => {
+    const { store, setClock } = setup();
+    const editionA = fiveMemberEdition("edition-a");
+    setClock(BASE + 2000);
+    store.activateCollectionEdition(editionA.edition, editionA.definitionsMap, "admin");
+    setClock(BASE + 3000);
+    store.closeCollectionEdition("edition-a", "admin");
+
+    const editionB = fiveMemberEdition("edition-b");
+    setClock(BASE + 4000);
+    store.activateCollectionEdition(editionB.edition, editionB.definitionsMap, "admin");
+
+    setClock(BASE + 5000);
+    expect(() => store.closeCollectionEdition("edition-a", "admin")).toThrow(/stale close request/);
+
+    // Aのclose metadataは最初のclose時点のまま変わらない。
+    expect(store.collectionEdition("edition-a")?.closedAt).toBe(BASE + 3000);
+    // Bは引き続きactiveのまま。
+    expect(store.activeCollectionEdition()?.editionKey).toBe("edition-b");
+  });
+
+  it("closed済みで他に何もactiveでない場合は、素直にalready_closedを返す（stale扱いしない）", () => {
+    const { store, setClock } = setup();
+    const editionA = fiveMemberEdition("edition-a");
+    setClock(BASE + 2000);
+    store.activateCollectionEdition(editionA.edition, editionA.definitionsMap, "admin");
+    setClock(BASE + 3000);
+    store.closeCollectionEdition("edition-a", "admin");
+
+    setClock(BASE + 4000);
+    const result = store.closeCollectionEdition("edition-a", "admin");
+    expect(result.status).toBe("already_closed");
+  });
+});
+
+describe("structural integrity（manifest_hashとは独立、レビュー追加分・§5相当）", () => {
+  it("member titleKeyがv2.*namespaceでない状態（直接SQL改竄）→ constructor reject", () => {
+    const { db, store, setClock } = setup();
+    const { edition, definitionsMap } = fiveMemberEdition("v1-edition");
+    setClock(BASE + 2000);
+    store.activateCollectionEdition(edition, definitionsMap, "admin");
+
+    db.pragma("foreign_keys = OFF");
+    db.prepare(`UPDATE title_collection_members SET title_key = 'not-v2-namespaced' WHERE edition_key = 'v1-edition' AND title_key = 'v2.test.a'`).run();
+    db.pragma("foreign_keys = ON");
+
+    expect(() => new TitleV2Store(db, () => BASE + 3000)).toThrow(/member titleKey must use v2\.\* namespace/);
+  });
+
+  it("collection_creditが0/1以外（直接SQL改竄、CHECK制約を一時的に迂回）→ constructor reject", () => {
+    const { db, store, setClock } = setup();
+    const { edition, definitionsMap } = fiveMemberEdition("v1-edition");
+    setClock(BASE + 2000);
+    store.activateCollectionEdition(edition, definitionsMap, "admin");
+
+    // CHECK(collection_credit IN (0,1))を迂回するため、一度テーブルをrenameして
+    // CHECK無しの同名テーブルへ差し替える簡易sabotage。
+    db.exec(`
+      ALTER TABLE title_collection_members RENAME TO title_collection_members_orig;
+      CREATE TABLE title_collection_members (
+        edition_key TEXT NOT NULL, title_key TEXT NOT NULL, collection_domain_key TEXT NOT NULL,
+        collection_credit INTEGER NOT NULL, full_clear_required INTEGER NOT NULL,
+        PRIMARY KEY (edition_key, title_key)
+      );
+      INSERT INTO title_collection_members SELECT * FROM title_collection_members_orig;
+      DROP TABLE title_collection_members_orig;
+    `);
+    db.prepare(`UPDATE title_collection_members SET collection_credit = 2 WHERE edition_key = 'v1-edition' AND title_key = 'v2.test.a'`).run();
+
+    expect(() => new TitleV2Store(db, () => BASE + 3000)).toThrow(/invalid collection_credit \(2; must be 0 or 1\)/);
+  });
+
+  it("milestone値が非整数（facts_versionと同様のfloatパターン）→ constructor reject", () => {
+    const { db, store, setClock } = setup();
+    const { edition, definitionsMap } = fiveMemberEdition("v1-edition");
+    setClock(BASE + 2000);
+    store.activateCollectionEdition(edition, definitionsMap, "admin");
+
+    db.prepare(`UPDATE title_collection_editions SET started_collecting = 1.5 WHERE edition_key = 'v1-edition'`).run();
+
+    expect(() => new TitleV2Store(db, () => BASE + 3000)).toThrow(/milestone startedCollecting must be a non-negative integer/);
+  });
+
+  it("closed_byだけが設定されclosed_atがNULLの状態は、DB CHECK制約自体が既に拒否する（app-level checkはCHECKが迂回された場合の defense-in-depth）", () => {
+    const { db, store, setClock } = setup();
+    const { edition, definitionsMap } = fiveMemberEdition("v1-edition");
+    setClock(BASE + 2000);
+    store.activateCollectionEdition(edition, definitionsMap, "admin");
+
+    // CHECK((closed_at IS NULL) = (closed_by IS NULL))がこの状態を直接SQLでも
+    // 作らせない——DB制約自体がこの矛盾を防いでいることを確認する
+    // （assertCollectionPersistenceIntegrity()側の同等チェックは、CHECK制約が
+    // 何らかの理由で迂回された場合のための独立した再検証）。
+    expect(() =>
+      db.prepare(`UPDATE title_collection_editions SET closed_by = 'ghost' WHERE edition_key = 'v1-edition'`).run(),
+    ).toThrow(/CHECK constraint failed/);
   });
 });
 

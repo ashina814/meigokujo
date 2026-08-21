@@ -143,6 +143,34 @@ describe("series manifest validation（§9）", () => {
     expect(() => assertNoOverlappingSeriesMembership([seriesA, seriesB])).toThrow(/belongs to multiple series/);
   });
 
+  it("同じseriesKey文字列でもcatalogが異なれば別identityとして扱い、overlapを見逃さない", () => {
+    // owner mapがcatalogを見ずseriesKeyだけで比較していると、
+    // 「catalog-a/foo」と「catalog-b/foo」を同一seriesとみなしてoverlapを
+    // 見逃してしまうバグを再現する回帰テスト。
+    const sharedTitle = stage("v2.test.shared", { catalog: "catalog-a", progression: { seriesKey: "foo", stage: 1 } });
+    const restOfA = stage("v2.test.rest-a", { catalog: "catalog-a", progression: { seriesKey: "foo", stage: 2 } });
+    const seriesA: TitleSeriesManifest = {
+      catalog: "catalog-a",
+      seriesKey: "foo",
+      label: "A",
+      masteryEligible: true,
+      members: [sharedTitle.key, restOfA.key],
+    };
+    const restOfB = stage("v2.test.rest-b", { catalog: "catalog-b", progression: { seriesKey: "foo", stage: 2 } });
+    const seriesB: TitleSeriesManifest = {
+      catalog: "catalog-b",
+      seriesKey: "foo",
+      label: "B",
+      masteryEligible: true,
+      // sharedTitleのkeyを誤って別catalogのseriesへも混ぜてしまった想定
+      // （sharedTitle自体はcatalog-a/foo向けのprogressionしか持たない）。
+      members: [sharedTitle.key, restOfB.key],
+    };
+    expect(() => assertNoOverlappingSeriesMembership([seriesA, seriesB])).toThrow(
+      /belongs to multiple series: catalog-a\/foo, catalog-b\/foo/,
+    );
+  });
+
   it("同一(catalog, seriesKey)を名乗るmanifestが複数存在することをreject（memberが重複していなくても）", () => {
     const members = validLadder();
     const original: TitleSeriesManifest = manifestOf(members);

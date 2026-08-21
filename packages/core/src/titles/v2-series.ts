@@ -123,14 +123,20 @@ export function assertNoOverlappingSeriesMembership(manifests: readonly TitleSer
     identitySeen.add(identity);
   }
 
-  const owner = new Map<string, string>();
+  // ownerのidentityはseriesKey単体ではなく (catalog, seriesKey) の組で持つ——
+  // 異なるcatalogが同じseriesKey文字列を使い回すケース（catalog-a/foo と
+  // catalog-b/foo）で、seriesKeyだけを比較すると別catalogのseriesを同一視して
+  // overlapを見逃してしまう（"foo" !== "foo" が常にfalseになるバグ）。
+  const owner = new Map<string, { catalog: string; seriesKey: string }>();
   for (const manifest of manifests) {
     for (const key of manifest.members) {
       const existing = owner.get(key);
-      if (existing && existing !== manifest.seriesKey) {
-        throw new Error(`title ${key} belongs to multiple series: ${existing}, ${manifest.seriesKey}`);
+      if (existing && (existing.catalog !== manifest.catalog || existing.seriesKey !== manifest.seriesKey)) {
+        throw new Error(
+          `title ${key} belongs to multiple series: ${existing.catalog}/${existing.seriesKey}, ${manifest.catalog}/${manifest.seriesKey}`,
+        );
       }
-      owner.set(key, manifest.seriesKey);
+      owner.set(key, { catalog: manifest.catalog, seriesKey: manifest.seriesKey });
     }
   }
 }
