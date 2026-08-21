@@ -63,6 +63,7 @@ describe("称号v2 source contract", () => {
         publicAnnounce: false,
         themeKey: "bad",
         groupKey: "bad",
+        collectionDomainKey: "bad",
         scope: { type: "global" },
       }),
     ).toThrow(/source is not usable by titles/);
@@ -95,6 +96,7 @@ describe("称号v2 source contract", () => {
         publicAnnounce: false,
         themeKey: "bad",
         groupKey: "bad",
+        collectionDomainKey: "bad",
         scope: { type: "global" },
       }),
     ).toThrow(/source is not usable by titles/);
@@ -125,6 +127,7 @@ describe("称号v2 source contract", () => {
         publicAnnounce: false,
         themeKey: "bad",
         groupKey: "bad",
+        collectionDomainKey: "bad",
         scope: { type: "global" },
       }),
     ).toThrow(/source is not usable by titles/);

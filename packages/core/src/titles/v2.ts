@@ -112,16 +112,46 @@ export {
 export {
   assertValidSeriesManifest,
   assertNoOverlappingSeriesMembership,
+  computeSeriesManifestHash,
+  type SeriesManifestHashInput,
   type TitleSeriesManifest,
 } from "./v2-series.js";
 
 export {
   assertCollectionEditionActivatable,
   assertValidCollectionEdition,
+  computeCollectionEditionHash,
   type TitleCollectionEdition,
   type TitleCollectionMember,
   type TitleCollectionMilestonePolicy,
 } from "./v2-collection.js";
+
+// v2-series-store.ts / v2-collection-store.ts の関数（registerSeriesManifests /
+// reconcileSeriesMasteriesForUser / activateCollectionEdition / closeCollectionEdition
+// 等）はDatabase + clockを直接受け取るraw persistence APIであり、ここではexportしない。
+// これらを公開すると、callerが `TitleV2Store` の内部clockを経由せず任意のclockを注入
+// でき、「registered_at/recorded_at/activated_at/closed_atはStore clock」という契約
+// （callerが任意timestampを注入できない）を迂回できてしまう。persistenceのpublic
+// mutation boundaryは `TitleV2Store` のmethodsだけに限定する——これらのraw関数は
+// `v2-store.ts` が内部でimportして`TitleV2Store`のmethodsとして再公開するのに使う
+// （現状のまま）。integrity helper（assertSeriesPersistenceIntegrity等）も、
+// `TitleV2Store` construction時に内部で呼ぶだけで、それ単体を公開API化する必要は無い。
+export {
+  type NewlyMasteredSeries,
+  type ReconcileSeriesMasteriesResult,
+  type RegisterSeriesManifestsResult,
+  type TitleSeriesManifestSummary,
+  type TitleSeriesMasteryRow,
+} from "./v2-series-store.js";
+
+export {
+  type ActivateCollectionEditionResult,
+  type ActivateCollectionEditionStatus,
+  type CloseCollectionEditionResult,
+  type CloseCollectionEditionStatus,
+  type CollectionEditionProgress,
+  type TitleCollectionEditionRow,
+} from "./v2-collection-store.js";
 
 export {
   type TitleAcquisitionRaritySnapshot,

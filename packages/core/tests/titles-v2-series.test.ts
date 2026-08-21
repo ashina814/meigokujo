@@ -24,6 +24,7 @@ function stage(
     publicAnnounce: false,
     themeKey: "vc_ignite",
     groupKey: "vc_ignite",
+    collectionDomainKey: "vc_ignite",
     scope: { type: "global" },
     ...overrides,
   });
@@ -81,13 +82,13 @@ describe("series manifest validation（§9）", () => {
     expect(() => assertValidSeriesManifest(manifestOf(members), members)).toThrow(/contiguous sequence/);
   });
 
-  it("themeKeyが異なるmemberをreject", () => {
+  it("themeKeyが異なっていてもsame group/seriesならvalid（themeはlogicに使わない、契約correction B）", () => {
     const members = validLadder();
     members[1] = stage("v2.test.ignite-2", {
       progression: { seriesKey: "vc_ignite_main", stage: 2 },
       themeKey: "other-theme",
     });
-    expect(() => assertValidSeriesManifest(manifestOf(members), members)).toThrow(/different themeKey/);
+    expect(() => assertValidSeriesManifest(manifestOf(members), members)).not.toThrow();
   });
 
   it("groupKeyが異なるmemberをreject", () => {
@@ -140,6 +141,34 @@ describe("series manifest validation（§9）", () => {
       members: [...manifestOf(otherLadder).members, members[0]!.key],
     };
     expect(() => assertNoOverlappingSeriesMembership([seriesA, seriesB])).toThrow(/belongs to multiple series/);
+  });
+
+  it("同じseriesKey文字列でもcatalogが異なれば別identityとして扱い、overlapを見逃さない", () => {
+    // owner mapがcatalogを見ずseriesKeyだけで比較していると、
+    // 「catalog-a/foo」と「catalog-b/foo」を同一seriesとみなしてoverlapを
+    // 見逃してしまうバグを再現する回帰テスト。
+    const sharedTitle = stage("v2.test.shared", { catalog: "catalog-a", progression: { seriesKey: "foo", stage: 1 } });
+    const restOfA = stage("v2.test.rest-a", { catalog: "catalog-a", progression: { seriesKey: "foo", stage: 2 } });
+    const seriesA: TitleSeriesManifest = {
+      catalog: "catalog-a",
+      seriesKey: "foo",
+      label: "A",
+      masteryEligible: true,
+      members: [sharedTitle.key, restOfA.key],
+    };
+    const restOfB = stage("v2.test.rest-b", { catalog: "catalog-b", progression: { seriesKey: "foo", stage: 2 } });
+    const seriesB: TitleSeriesManifest = {
+      catalog: "catalog-b",
+      seriesKey: "foo",
+      label: "B",
+      masteryEligible: true,
+      // sharedTitleのkeyを誤って別catalogのseriesへも混ぜてしまった想定
+      // （sharedTitle自体はcatalog-a/foo向けのprogressionしか持たない）。
+      members: [sharedTitle.key, restOfB.key],
+    };
+    expect(() => assertNoOverlappingSeriesMembership([seriesA, seriesB])).toThrow(
+      /belongs to multiple series: catalog-a\/foo, catalog-b\/foo/,
+    );
   });
 
   it("同一(catalog, seriesKey)を名乗るmanifestが複数存在することをreject（memberが重複していなくても）", () => {

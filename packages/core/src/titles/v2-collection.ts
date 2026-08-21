@@ -1,3 +1,4 @@
+import { canonicalHash } from "../casino/opening-canonical.js";
 import { assertSlug, type TitleDefinition } from "./v2-contract.js";
 
 /**
@@ -6,13 +7,14 @@ import { assertSlug, type TitleDefinition } from "./v2-contract.js";
  * Collection Editionはtitle catalogとは別概念——「このtitleを集める対象とするか」を
  * 独立したimmutable manifestとして持つ。旧countsForCompletionのようにtitle definition
  * 自身へCollection Credit / Full-clear Requiredを持たせない（廃止済み。§2参照）。
- * DB persistenceは後続PR、ここでは型とvalidationだけを固定する。
+ * DB persistence（`title_collection_editions` 等）は `v2-collection-store.ts`（PR B2）
+ * が担う。ここでは型とvalidationを固定する。
  *
  * 意図的に `catalog` フィールドを持たせない: collection editionは将来的に複数catalog
  * （第I期・第II期等）由来のbehavior titleを1つのfull-clear edition（例: 全期間通しての
  * 万印皆伝）へ束ねる必要がある。単一catalogへ拘束する設計上の根拠が無いため、
- * memberごとのtitleKeyから実際のdefinitionを引いてthemeKey等を検証すれば足り、
- * edition自体がcatalogを名乗る必要は無い。
+ * memberごとのtitleKeyから実際のdefinitionを引いてcollectionDomainKey等を検証すれば
+ * 足り、edition自体がcatalogを名乗る必要は無い。
  *
  * 《千印万来》《万印皆伝》のようなmeta titleのsemanticは、絶対的な閾値をmeta title
  * 自身に持たせず「有効なcollection/full-clear editionのmilestone policyを満たしたか」
@@ -22,7 +24,7 @@ import { assertSlug, type TitleDefinition } from "./v2-contract.js";
  * ## 構造契約とactivation eligibilityの分離
  *
  * `assertValidCollectionEdition()` は時間が経っても変わらない**構造契約**だけを見る
- * （member重複・title実在・themeKey一致・meta除外・milestone整合性等）。member titleの
+ * （member重複・title実在・collectionDomainKey一致・meta除外・milestone整合性等）。member titleの
  * `lifecycle`（現在activeかどうか）は構造契約に含めない——これはeditionのimmutable契約
  * （下記）と衝突するため。
  *
@@ -41,15 +43,22 @@ import { assertSlug, type TitleDefinition } from "./v2-contract.js";
  *
  * 運用の想定手順:
  * 1. active editionのrequired/collection titleをretire/disableする必要が生じたら、
- *    まず**そのeditionをclose**する（このPRではclose自体の型・DBは作らない）。
+ *    まず**そのeditionをclose**する（`v2-collection-store.ts` の `closeCollectionEdition()`）。
  * 2. old editionのmanifest（members/milestones）は変更しない。
  * 3. 次のeditionを、新しいmember set（retireしたtitleを含まない）で作る。
  * 4. closed editionはhistorical repairのために保持し続ける——`assertValidCollectionEdition()`
  *    は通り続けるが、`assertCollectionEditionActivatable()` は通らなくなる（それでよい）。
+ *    close以降にpost-close acquisitionされたtitleは旧editionのprogressへcreditしない
+ *    （`v2-collection-store.ts` の historical repair proof契約参照）。
  */
 export interface TitleCollectionMember {
   readonly titleKey: `v2.${string}`;
-  readonly themeKey: string;
+  /**
+   * collection breadth判定用のsemantic identity（`BehaviorTitleDefinition.collectionDomainKey`
+   * と一致させる）。`themeKey` ではない——themeはeditorial/display専用で、collection
+   * breadth集計には使わない（`v2-contract.ts` の `TitleDefinitionCommon.themeKey` 参照）。
+   */
+  readonly collectionDomainKey: string;
   readonly collectionCredit: boolean;
   readonly fullClearRequired: boolean;
 }
@@ -62,7 +71,7 @@ export interface TitleCollectionMilestonePolicy {
   readonly startedCollecting: number;
   readonly collectorHabit: number;
   readonly stillCollecting: number;
-  readonly thousandMarks: { readonly count: number; readonly themes: number };
+  readonly thousandMarks: { readonly count: number; readonly domains: number };
   readonly almostComplete: { readonly remaining: number };
 }
 
@@ -79,7 +88,10 @@ export interface TitleCollectionEdition {
  *
  * - member重複禁止
  * - member titleが実在する（allDefinitionsに含まれる）
- * - member.themeKeyがdefinition.themeKeyと一致する
+ * - member.collectionDomainKeyがdefinition.collectionDomainKeyと一致する
+ *   （meta titleはcollectionDomainKeyを持たないため、meta memberはこの検証を通らない
+ *   ——後続のmeta title除外チェックで先に弾かれる想定だが、万一定義順が変わっても
+ *   安全なようmeta判定を先に行う）
  * - meta titleをcollectionCredit/fullClearRequiredのどちらにもしない
  *   （meta titleはcollection/full-clearの分母・分子どちらへも入らない——meta title自体が
  *   「有効なcollection editionを満たしたか」を判定する側であり、判定対象の一部を
@@ -89,16 +101,16 @@ export interface TitleCollectionEdition {
  *   （editionのmemberとして何の意味も持たない）
  *
  * milestoneはcollectionCredit:trueのmemberだけから算出した
- * countableCount（collectionCredit:trueなmember数）・countableThemes
- * （collectionCredit:trueなmemberのdistinct themeKey数）を基準に、以下を検証する。
+ * countableCount（collectionCredit:trueなmember数）・countableDomains
+ * （collectionCredit:trueなmemberのdistinct collectionDomainKey数）を基準に、以下を検証する。
  *
  * - milestone値はいずれも非負整数
  * - startedCollecting >= 1
  * - startedCollecting < collectorHabit < stillCollecting
  * - stillCollecting <= thousandMarks.count <= countableCount
- * - thousandMarks.themes >= 1
- * - thousandMarks.themes <= countableThemes
- * - thousandMarks.themes <= thousandMarks.count
+ * - thousandMarks.domains >= 1
+ * - thousandMarks.domains <= countableDomains
+ * - thousandMarks.domains <= thousandMarks.count
  * - almostComplete.remaining >= 1
  * - almostComplete.remaining < fullClearCount（full-clear required総数）
  */
@@ -112,7 +124,7 @@ export function assertValidCollectionEdition(
   }
 
   const seen = new Set<string>();
-  const countableThemes = new Set<string>();
+  const countableDomains = new Set<string>();
   let countableCount = 0;
   let fullClearCount = 0;
 
@@ -124,10 +136,10 @@ export function assertValidCollectionEdition(
 
     const def = allDefinitions.get(member.titleKey);
     if (!def) throw new Error(`collection edition ${edition.editionKey}: member title not found: ${member.titleKey}`);
-    if (def.themeKey !== member.themeKey) {
+    if (def.kind === "behavior" && def.collectionDomainKey !== member.collectionDomainKey) {
       throw new Error(
-        `collection edition ${edition.editionKey}: member ${member.titleKey} themeKey mismatch ` +
-          `(definition=${def.themeKey}, manifest=${member.themeKey})`,
+        `collection edition ${edition.editionKey}: member ${member.titleKey} collectionDomainKey mismatch ` +
+          `(definition=${def.collectionDomainKey}, manifest=${member.collectionDomainKey})`,
       );
     }
     if (def.kind === "meta") {
@@ -149,12 +161,13 @@ export function assertValidCollectionEdition(
       );
     }
 
-    // collectionCredit:falseのmemberのthemeは、theme breadth集計の分母（countableThemes）
-    // へ数えない——「集めた/集めていない」の対象にしていないtitleのthemeを、
-    // 千印万来のtheme breadth判定に混ぜると、実質未対象のthemeで達成扱いになってしまう。
+    // collectionCredit:falseのmemberのdomainは、domain breadth集計の分母
+    // （countableDomains）へ数えない——「集めた/集めていない」の対象にしていない
+    // titleのdomainを、千印万来のdomain breadth判定に混ぜると、実質未対象のdomainで
+    // 達成扱いになってしまう。
     if (member.collectionCredit) {
       countableCount += 1;
-      countableThemes.add(member.themeKey);
+      countableDomains.add(member.collectionDomainKey);
     }
     if (member.fullClearRequired) fullClearCount += 1;
   }
@@ -169,7 +182,7 @@ export function assertValidCollectionEdition(
     ["collectorHabit", m.collectorHabit],
     ["stillCollecting", m.stillCollecting],
     ["thousandMarks.count", m.thousandMarks.count],
-    ["thousandMarks.themes", m.thousandMarks.themes],
+    ["thousandMarks.domains", m.thousandMarks.domains],
     ["almostComplete.remaining", m.almostComplete.remaining],
   ];
   for (const [label, value] of milestoneEntries) {
@@ -195,12 +208,12 @@ export function assertValidCollectionEdition(
   if (!(m.thousandMarks.count <= countableCount)) {
     fail(`thousandMarks.count (${m.thousandMarks.count}) exceeds countable collection count (${countableCount})`);
   }
-  if (m.thousandMarks.themes < 1) fail(`thousandMarks.themes (${m.thousandMarks.themes}) must be >= 1`);
-  if (!(m.thousandMarks.themes <= countableThemes.size)) {
-    fail(`thousandMarks.themes (${m.thousandMarks.themes}) exceeds countable theme count (${countableThemes.size})`);
+  if (m.thousandMarks.domains < 1) fail(`thousandMarks.domains (${m.thousandMarks.domains}) must be >= 1`);
+  if (!(m.thousandMarks.domains <= countableDomains.size)) {
+    fail(`thousandMarks.domains (${m.thousandMarks.domains}) exceeds countable domain count (${countableDomains.size})`);
   }
-  if (!(m.thousandMarks.themes <= m.thousandMarks.count)) {
-    fail(`thousandMarks.themes (${m.thousandMarks.themes}) must be <= thousandMarks.count (${m.thousandMarks.count})`);
+  if (!(m.thousandMarks.domains <= m.thousandMarks.count)) {
+    fail(`thousandMarks.domains (${m.thousandMarks.domains}) must be <= thousandMarks.count (${m.thousandMarks.count})`);
   }
   if (m.almostComplete.remaining < 1) fail(`almostComplete.remaining (${m.almostComplete.remaining}) must be >= 1`);
   if (!(m.almostComplete.remaining < fullClearCount)) {
@@ -238,4 +251,39 @@ export function assertCollectionEditionActivatable(
       );
     }
   }
+}
+
+/**
+ * 文字列を単純なUTF-16 code unit順で比較する、locale/ICUに依存しない決定的な
+ * order。`String.prototype.localeCompare()` はロケール・ICUバージョン・実行環境に
+ * よって順序が変わり得るため、semantic hashのcanonical orderへは使わない
+ * （同じ入力でも環境が違うとhashが変わってしまう不安定さを避ける）。
+ */
+function compareCodeUnit(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Collection Editionもimmutable semantic hashを持つ（PR B2）——activation後に
+ * members/milestoneが書き換えられていないかをconstruction-time integrityで検出する。
+ *
+ * hash対象: `editionKey` / `milestones`（全milestone値） / member（titleKey順に
+ * sortした上での titleKey・collectionDomainKey・collectionCredit・fullClearRequired）。
+ * member入力順はsemanticではないため、titleKey順へcanonicalizeしてからhashする——
+ * `canonicalHash()`（`casino/opening-canonical.ts`）は配列順をそのまま保存するため、
+ * ここでのsortはlocale非依存で完全に決定的でなければならない（`compareCodeUnit()`）。
+ *
+ * hashから除外: `activatedAt` / `activatedBy`（actor） / `activationNote` / close
+ * metadata——これらはeditionの構造そのものではなく運用ログであり、後から変わっても
+ * editionのsemanticは変わらない。
+ */
+export function computeCollectionEditionHash(edition: TitleCollectionEdition): string {
+  const canonicalMembers = [...edition.members]
+    .sort((a, b) => compareCodeUnit(a.titleKey, b.titleKey))
+    .map((m) => [m.titleKey, m.collectionDomainKey, m.collectionCredit, m.fullClearRequired] as const);
+  return canonicalHash({
+    editionKey: edition.editionKey,
+    milestones: edition.milestones,
+    members: canonicalMembers,
+  });
 }

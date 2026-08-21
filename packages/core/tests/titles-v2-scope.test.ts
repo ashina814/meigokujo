@@ -24,6 +24,7 @@ function titleWith(overrides: Partial<BehaviorTitleDefinition>): BehaviorTitleDe
     publicAnnounce: false,
     themeKey: "sample",
     groupKey: "sample",
+    collectionDomainKey: "sample",
     scope: { type: "global" },
     ...overrides,
   });

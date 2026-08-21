@@ -47,6 +47,7 @@ function sampleDef(key: `v2.${string}`, scope: TitleScopePolicy = { type: "globa
     publicAnnounce: false,
     themeKey: "t",
     groupKey: "t",
+    collectionDomainKey: "t",
     scope,
   });
 }

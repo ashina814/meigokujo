@@ -414,7 +414,12 @@ interface TitleDefinitionCommon {
   readonly hidden: boolean;
   /** 高レアだから自動告知、にはしない。 */
   readonly publicAnnounce: boolean;
-  /** 「何の分野か」。将来のtheme breadth集計（千印万来等）に使う。 */
+  /**
+   * 「何の分野か」の編集上・閲覧上のカテゴリ（editorial/browsing/display category）。
+   * 表示の整理にのみ使う——theme breadth集計・collection/series判定等のlogicには
+   * 一切使わない。将来titleを別themeへ移動してよい（released後もimmutableではない）。
+   * theme breadth集計が必要な場合は `collectionDomainKey`（BehaviorTitleDefinition）を使うこと。
+   */
   readonly themeKey: string;
   /** 関連称号のまとまり。side titleも同じgroupに入れる。themeとは別概念。 */
   readonly groupKey: string;
@@ -430,6 +435,17 @@ export interface BehaviorTitleDefinition extends TitleDefinitionCommon {
   readonly triggers: readonly TitleTrigger[];
   /** 連番ladderの1段であることを示す。無ければ単独称号。 */
   readonly progression?: TitleProgression;
+  /**
+   * collection breadth判定（千印万来のtheme breadth集計等）用のsemantic identity。
+   * `themeKey` とは別概念——`themeKey` はeditorial/display専用でlogicに使わないが、
+   * `collectionDomainKey` はcollection edition manifest（`v2-collection.ts` の
+   * `TitleCollectionMember.collectionDomainKey`）が横断性判定の基準として直接参照する。
+   *
+   * **released behavior titleの`collectionDomainKey`はsemantic contractの一部——
+   * 後から別domainへ付け替えない。** themeKeyのように自由に編集し直してよいフィールド
+   * ではない（released title semanticの他の不変フィールドと同じ扱い）。
+   */
+  readonly collectionDomainKey: string;
 }
 
 /**
@@ -485,6 +501,7 @@ export function defineBehaviorTitle<T extends BehaviorTitleDefinition>(definitio
   }
   assertCommonTitleDefinition(definition);
   assertSlug(definition.catalog, `title ${definition.key}: catalog`);
+  assertSlug(definition.collectionDomainKey, `title ${definition.key}: collectionDomainKey`);
 
   if (definition.sources.length === 0) throw new Error(`title ${definition.key}: at least one source is required`);
   for (const source of definition.sources as readonly TitleSourceKey[]) {

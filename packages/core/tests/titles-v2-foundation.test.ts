@@ -28,6 +28,7 @@ function sampleTitle(key: `v2.${string}`, scope: TitleScopePolicy) {
     publicAnnounce: false,
     themeKey: "t",
     groupKey: "t",
+    collectionDomainKey: "t",
     scope,
   });
 }
@@ -324,6 +325,7 @@ describe("称号v2 foundation", () => {
         publicAnnounce: false,
         themeKey: "sample",
         groupKey: "sample",
+        collectionDomainKey: "sample",
         scope: { type: "global" },
       }).key,
     ).toBe("v2.sample");
@@ -343,6 +345,7 @@ describe("称号v2 foundation", () => {
         publicAnnounce: false,
         themeKey: "sample",
         groupKey: "sample",
+        collectionDomainKey: "sample",
         scope: { type: "global" },
       }),
     ).toThrow(/v2\.\* namespace/);

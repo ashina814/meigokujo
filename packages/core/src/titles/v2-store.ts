@@ -2,6 +2,8 @@ import type Database from "better-sqlite3";
 import {
   TITLE_SOURCES,
   assertDerivedSourceDependenciesResolve,
+  type BehaviorTitleDefinition,
+  type TitleDefinition,
   type TitleSourceDefinition,
   type TitleSourceKey,
 } from "./v2-contract.js";
@@ -13,6 +15,37 @@ import {
   serializeAwardFacts,
   type TitleAwardFacts,
 } from "./v2-award-facts.js";
+import type { TitleCollectionEdition } from "./v2-collection.js";
+import type { TitleSeriesManifest } from "./v2-series.js";
+import {
+  SERIES_V2_DDL,
+  assertSeriesPersistenceIntegrity,
+  hasSeriesMastery,
+  listSeriesManifests,
+  listSeriesMasteries,
+  reconcileSeriesMasteriesForUser,
+  registerSeriesManifests,
+  seriesManifest,
+  type ReconcileSeriesMasteriesResult,
+  type RegisterSeriesManifestsResult,
+  type TitleSeriesManifestSummary,
+  type TitleSeriesMasteryRow,
+} from "./v2-series-store.js";
+import {
+  COLLECTION_V2_DDL,
+  activateCollectionEdition,
+  activeCollectionEdition,
+  assertActiveCollectionEditionMatchesRuntime,
+  assertCollectionPersistenceIntegrity,
+  closeCollectionEdition,
+  collectionEdition,
+  collectionEditionProgress,
+  listCollectionEditions,
+  type ActivateCollectionEditionResult,
+  type CloseCollectionEditionResult,
+  type CollectionEditionProgress,
+  type TitleCollectionEditionRow,
+} from "./v2-collection-store.js";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -337,7 +370,7 @@ function assertValidFactsRowContent(
  * - ownership.first_scope_keyが指すaward行のearned_at/awarded_atと、
  *   ownership.first_earned_at/first_awarded_atが一致する
  * - ownershipが存在するtitleには必ずrarity sequence行があり、
- *   last_sequence >= そのtitleのMAX(acquisition_sequence)
+ *   last_sequence === そのtitleのMAX(acquisition_sequence)（完全一致）
  * - `PRAGMA foreign_key_check`のうちtitle_*テーブルに関する違反が無い
  *   （他の非titleテーブルの既存問題まで巻き込まないよう、tableでfilterする）
  *
@@ -540,6 +573,8 @@ export class TitleV2Store {
     assertSourceReaderCoverage();
     ensureTitleV2Schema(db);
     assertAwardPersistenceIntegrity(db);
+    assertSeriesPersistenceIntegrity(db);
+    assertCollectionPersistenceIntegrity(db);
   }
 
   /**
@@ -1065,8 +1100,77 @@ export class TitleV2Store {
       )
       .all(userId) as TitleEquipRow[];
   }
+
+  // ── Series Manifest / Series Mastery（PR B2、実装は v2-series-store.ts）────────
+
+  registerSeriesManifests(
+    manifests: readonly TitleSeriesManifest[],
+    behaviorDefinitions: readonly BehaviorTitleDefinition[],
+  ): RegisterSeriesManifestsResult {
+    return registerSeriesManifests(this.db, this.clock, manifests, behaviorDefinitions);
+  }
+
+  reconcileSeriesMasteriesForUser(userId: string): ReconcileSeriesMasteriesResult {
+    return reconcileSeriesMasteriesForUser(this.db, this.clock, userId);
+  }
+
+  listSeriesManifests(): TitleSeriesManifestSummary[] {
+    return listSeriesManifests(this.db);
+  }
+
+  seriesManifest(catalogKey: string, seriesKey: string): TitleSeriesManifestSummary | null {
+    return seriesManifest(this.db, catalogKey, seriesKey);
+  }
+
+  listSeriesMasteries(userId: string): TitleSeriesMasteryRow[] {
+    return listSeriesMasteries(this.db, userId);
+  }
+
+  hasSeriesMastery(userId: string, catalogKey: string, seriesKey: string): boolean {
+    return hasSeriesMastery(this.db, userId, catalogKey, seriesKey);
+  }
+
+  // ── Collection Edition lifecycle（PR B2、実装は v2-collection-store.ts）───────
+
+  activateCollectionEdition(
+    edition: TitleCollectionEdition,
+    definitions: ReadonlyMap<string, TitleDefinition>,
+    actor: string,
+    note?: string,
+  ): ActivateCollectionEditionResult {
+    return activateCollectionEdition(this.db, this.clock, edition, definitions, actor, note);
+  }
+
+  closeCollectionEdition(editionKey: string, actor: string, note?: string): CloseCollectionEditionResult {
+    return closeCollectionEdition(this.db, this.clock, editionKey, actor, note);
+  }
+
+  assertActiveCollectionEditionMatchesRuntime(
+    runtimeEdition: TitleCollectionEdition,
+    definitions: ReadonlyMap<string, TitleDefinition>,
+  ): void {
+    assertActiveCollectionEditionMatchesRuntime(this.db, runtimeEdition, definitions);
+  }
+
+  collectionEditionProgress(userId: string, editionKey: string): CollectionEditionProgress {
+    return collectionEditionProgress(this.db, userId, editionKey);
+  }
+
+  activeCollectionEdition(): TitleCollectionEditionRow | null {
+    return activeCollectionEdition(this.db);
+  }
+
+  collectionEdition(editionKey: string): TitleCollectionEditionRow | null {
+    return collectionEdition(this.db, editionKey);
+  }
+
+  listCollectionEditions(): TitleCollectionEditionRow[] {
+    return listCollectionEditions(this.db);
+  }
 }
 
 export function ensureTitleV2Schema(db: Database.Database): void {
   db.exec(V2_DDL);
+  db.exec(SERIES_V2_DDL);
+  db.exec(COLLECTION_V2_DDL);
 }
