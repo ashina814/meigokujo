@@ -217,7 +217,6 @@ export interface AwardTitleInput {
   scope: ResolvedTitleScope;
   /** 正確に証明できない場合はnull。reconcile時刻で代用しない。 */
   earnedAt: number | null;
-  awardedAt?: number;
   /**
    * award時にpersistするsafe snapshot。matched awardでは必須（TitleRuleResultの
    * discriminated unionと同じ契約）——「award rowはあるがfacts rowが無い」という
@@ -298,10 +297,49 @@ function assertCounterBaselineSnapshotterCoverage(): void {
 }
 
 /**
- * award/facts/ownershipの全体整合性をfail-closedで検証する。同じ(user,title,scope)を
- * 再award()した時だけ検出するlazy checkだと、Store constructionからそのタイミングまでの
- * 間、欠損facts/ownershipを抱えたaward行を（例えばretired titleのhasAward()経由で）
- * 正常データとして扱ってしまう。Store構築時に必ず一度、DB全体を見て検証する。
+ * facts_json 1行分の内容（version・captured_at・JSON本体）をvalidateする。
+ * `readValidatedAwardFactsRow()`（読み取りAPI境界）と `assertAwardPersistenceIntegrity()`
+ * （construction時の全体スキャン）の両方から使う共通ロジック。
+ */
+function assertValidFactsRowContent(
+  label: string,
+  row: { facts_version: number; facts_json: string; captured_at: number },
+): TitleAwardFacts {
+  try {
+    assertValidFactsVersion(row.facts_version, `facts_version for ${label}`);
+  } catch (err) {
+    throw new Error(`title award facts integrity violation: ${(err as Error).message}`);
+  }
+  if (!Number.isInteger(row.captured_at) || row.captured_at < 0) {
+    throw new Error(`title award facts integrity violation: invalid captured_at for ${label}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.facts_json);
+  } catch {
+    throw new Error(`title award facts integrity violation: invalid JSON for ${label}`);
+  }
+  assertValidAwardFacts(parsed, `award facts for ${label}`);
+  return parsed;
+}
+
+/**
+ * award/facts/ownership/rarity sequenceの全体整合性をfail-closedで検証する。同じ
+ * (user,title,scope)を再award()した時だけ検出するlazy checkだと、Store construction
+ * からそのタイミングまでの間、欠損facts/ownershipを抱えたaward行を（例えばretired
+ * titleのhasAward()経由で）正常データとして扱ってしまう。Store構築時に必ず一度、
+ * DB全体を見て検証する。
+ *
+ * 存在確認だけでなく、semantic integrityまで見る:
+ * - 全awardにfacts/ownershipが存在する
+ * - 全factsのfacts_version/captured_at/facts_jsonがvalid
+ * - facts.captured_at は対応するaward.awarded_atと一致する（同じsnapshotのはず）
+ * - ownership.first_scope_keyが指すaward行のearned_at/awarded_atと、
+ *   ownership.first_earned_at/first_awarded_atが一致する
+ * - ownershipが存在するtitleには必ずrarity sequence行があり、
+ *   last_sequence >= そのtitleのMAX(acquisition_sequence)
+ * - `PRAGMA foreign_key_check`のうちtitle_*テーブルに関する違反が無い
+ *   （他の非titleテーブルの既存問題まで巻き込まないよう、tableでfilterする）
  *
  * 偽facts/ownershipを捏造してbackfillしない既存方針はここでも維持する——欠損が
  * あればfail-closedするだけで、埋めない。
@@ -341,6 +379,103 @@ function assertAwardPersistenceIntegrity(db: Database.Database): void {
       `title ownership persistence integrity violation: award row(s) exist for ` +
         `(${missingOwnership.user_id}, ${missingOwnership.title_key}) without an ownership row ` +
         `(legacy/foundation row, or ownership was deleted out of band)`,
+    );
+  }
+
+  const factsRows = db
+    .prepare(
+      `SELECT f.user_id, f.title_key, f.scope_key, f.facts_version, f.facts_json, f.captured_at, a.awarded_at
+         FROM title_award_facts f
+         JOIN title_awards a
+           ON a.user_id = f.user_id AND a.title_key = f.title_key AND a.scope_key = f.scope_key`,
+    )
+    .all() as Array<{
+    user_id: string;
+    title_key: string;
+    scope_key: string;
+    facts_version: number;
+    facts_json: string;
+    captured_at: number;
+    awarded_at: number;
+  }>;
+  for (const row of factsRows) {
+    const label = `${row.user_id}/${row.title_key}/${row.scope_key}`;
+    assertValidFactsRowContent(label, row);
+    if (row.captured_at !== row.awarded_at) {
+      throw new Error(
+        `title award facts integrity violation: captured_at (${row.captured_at}) does not match ` +
+          `the award's awarded_at (${row.awarded_at}) for ${label}`,
+      );
+    }
+  }
+
+  const ownershipRows = db
+    .prepare(
+      `SELECT o.user_id, o.title_key, o.first_scope_key, o.first_earned_at, o.first_awarded_at,
+              a.earned_at AS award_earned_at, a.awarded_at AS award_awarded_at
+         FROM title_ownerships o
+         JOIN title_awards a
+           ON a.user_id = o.user_id AND a.title_key = o.title_key AND a.scope_key = o.first_scope_key`,
+    )
+    .all() as Array<{
+    user_id: string;
+    title_key: string;
+    first_scope_key: string;
+    first_earned_at: number | null;
+    first_awarded_at: number;
+    award_earned_at: number | null;
+    award_awarded_at: number;
+  }>;
+  for (const row of ownershipRows) {
+    const label = `${row.user_id}/${row.title_key}`;
+    if (row.first_earned_at !== row.award_earned_at) {
+      throw new Error(
+        `title ownership integrity violation: first_earned_at does not match the referenced award ` +
+          `(first_scope_key=${row.first_scope_key}) for ${label}`,
+      );
+    }
+    if (row.first_awarded_at !== row.award_awarded_at) {
+      throw new Error(
+        `title ownership integrity violation: first_awarded_at does not match the referenced award ` +
+          `(first_scope_key=${row.first_scope_key}) for ${label}`,
+      );
+    }
+  }
+
+  const sequenceRows = db
+    .prepare(
+      `SELECT o.title_key, MAX(o.acquisition_sequence) AS max_sequence, r.last_sequence
+         FROM title_ownerships o
+         LEFT JOIN title_rarity_sequences r ON r.title_key = o.title_key
+        GROUP BY o.title_key`,
+    )
+    .all() as Array<{ title_key: string; max_sequence: number; last_sequence: number | null }>;
+  for (const row of sequenceRows) {
+    if (row.last_sequence === null) {
+      throw new Error(
+        `title rarity sequence integrity violation: title ${row.title_key} has ownership rows but no rarity sequence row`,
+      );
+    }
+    if (row.last_sequence < row.max_sequence) {
+      throw new Error(
+        `title rarity sequence integrity violation: title ${row.title_key} last_sequence (${row.last_sequence}) ` +
+          `is less than its max acquisition_sequence (${row.max_sequence})`,
+      );
+    }
+  }
+
+  const fkViolations = db.prepare(`PRAGMA foreign_key_check`).all() as Array<{
+    table: string;
+    rowid: number | null;
+    parent: string;
+    fkid: number;
+  }>;
+  const titleFkViolations = fkViolations.filter((v) => v.table.startsWith("title_"));
+  if (titleFkViolations.length > 0) {
+    const first = titleFkViolations[0]!;
+    throw new Error(
+      `title persistence integrity violation: foreign_key_check found ${titleFkViolations.length} violation(s) ` +
+        `on title_* tables, e.g. table=${first.table} parent=${first.parent}`,
     );
   }
 }
@@ -567,11 +702,18 @@ export class TitleV2Store {
     // brand（forgery）に加えて、このscopeが**このtitleKeyのために**resolveTitleScope()
     // されたことまで検証する。`global`のようなscopeKeyはpolicyを共有する全titleで
     // 同一文字列になり得るため、「title Aのために正規resolveしたscopeをtitle Bへ
-    // そのまま渡す」substitutionはscopeKeyの一致だけでは検出できない。
-    assertResolvedTitleScopeForTitle(input.scope, titleKey);
-    const scopeKey = input.scope.scopeKey;
+    // そのまま渡す」substitutionはscopeKeyの一致だけでは検出できない。戻り値の
+    // canonical snapshotをこの先ずっと使う——`input.scope`自身のfieldは直接読まない
+    // （belt-and-suspenders: freezeが何らかの形で迂回されても、実際にpersistする
+    // 値は常にresolveTitleScope()がWeakMapへ登録した値になる）。
+    const provenance = assertResolvedTitleScopeForTitle(input.scope, titleKey);
+    const scopeKey = provenance.scopeKey;
     const earnedAt = input.earnedAt === null ? null : requireUnix(input.earnedAt, "earnedAt");
-    const awardedAt = requireUnix(input.awardedAt ?? this.clock(), "awardedAt");
+    // awarded_at/captured_atはBotが実際に永続化を確定した時刻であり、caller入力では
+    // ない——this.clock()を1回だけ呼び、そのsnapshotをawarded_at/captured_at/
+    // ownership.first_awarded_atすべてに一貫して使う。historical repairでも、
+    // 過去の時刻はearnedAt側に入れる。awardedAtは常に「repairを実行した今」になる。
+    const awardedAt = requireUnix(this.clock(), "awardedAt");
     if (earnedAt !== null && earnedAt > awardedAt) {
       throw new Error(`earnedAt cannot be after awardedAt: earnedAt=${earnedAt} awardedAt=${awardedAt}`);
     }
@@ -579,19 +721,19 @@ export class TitleV2Store {
     // ——さもないと「まだ観測していない未来のデータを使って過去にawardした」という
     // 矛盾した状態を作れてしまう。captured_at（facts）もこのawardedAtと同じ
     // snapshotを使う。
-    if (awardedAt < input.scope.observedAt) {
+    if (awardedAt < provenance.observedAt) {
       throw new Error(
-        `awardedAt (${awardedAt}) cannot be before the scope's observedAt (${input.scope.observedAt}) for scope=${scopeKey}`,
+        `awardedAt (${awardedAt}) cannot be before the scope's observedAt (${provenance.observedAt}) for scope=${scopeKey}`,
       );
     }
     // earnedAtは、resolveTitleScope()が確定したそのscopeの窓の中に収まっていること
     // （§13）。zero-width scope（start===effectiveEnd）では、この条件を満たす
     // earnedAtが存在しないため、常にrejectされる。
     if (earnedAt !== null) {
-      const effectiveEnd = resolvedScopeEffectiveEnd(input.scope);
-      if (earnedAt < input.scope.start || earnedAt >= effectiveEnd) {
+      const effectiveEnd = resolvedScopeEffectiveEnd(provenance);
+      if (earnedAt < provenance.start || earnedAt >= effectiveEnd) {
         throw new Error(
-          `earnedAt (${earnedAt}) is outside the resolved scope window [${input.scope.start}, ${effectiveEnd}) for scope=${scopeKey}`,
+          `earnedAt (${earnedAt}) is outside the resolved scope window [${provenance.start}, ${effectiveEnd}) for scope=${scopeKey}`,
         );
       }
     }
@@ -624,7 +766,7 @@ export class TitleV2Store {
         // 存在するDB（facts無しでtitle_awardsだけ直接INSERTされた行）を、ここで
         // 偽のfactsを捏造してbackfillしない——明示的なintegrity errorとしてfail-closed
         // する方が、「本当の取得理由が無いのにあることにする」より安全。
-        const existingFacts = this.getAwardFactsRow(userId, titleKey, scopeKey);
+        const existingFacts = this.readValidatedAwardFactsRow(userId, titleKey, scopeKey);
         if (!existingFacts) {
           throw new Error(
             `title award integrity violation: award row exists for (${userId}, ${titleKey}, ${scopeKey}) ` +
@@ -712,15 +854,30 @@ export class TitleV2Store {
     return row ?? null;
   }
 
-  private getAwardFactsRow(userId: string, titleKey: string, scopeKey: string): { facts_version: number; facts_json: string } | null {
+  /**
+   * facts行を読み、version・captured_at・JSON本体をvalidateしてから返す
+   * （`assertValidFactsRowContent()` と同じ検証を通す）。壊れたDB値をそのまま
+   * 型付きrowとして返さない——`hasAward()`・`awardFacts()`の両方がこれを使う。
+   */
+  private readValidatedAwardFactsRow(userId: string, titleKey: string, scopeKey: string): TitleAwardFactsRow | null {
     const row = this.db
       .prepare(
-        `SELECT facts_version, facts_json
+        `SELECT facts_version, facts_json, captured_at
            FROM title_award_facts
           WHERE user_id = ? AND title_key = ? AND scope_key = ?`,
       )
-      .get(userId, titleKey, scopeKey) as { facts_version: number; facts_json: string } | undefined;
-    return row ?? null;
+      .get(userId, titleKey, scopeKey) as { facts_version: number; facts_json: string; captured_at: number } | undefined;
+    if (!row) return null;
+
+    const data = assertValidFactsRowContent(`${userId}/${titleKey}/${scopeKey}`, row);
+    return {
+      user_id: userId,
+      title_key: titleKey,
+      scope_key: scopeKey,
+      facts_version: row.facts_version,
+      data,
+      captured_at: row.captured_at,
+    };
   }
 
   private getOwnershipRow(userId: string, titleKey: string): TitleOwnershipRow | null {
@@ -741,8 +898,10 @@ export class TitleV2Store {
    *
    * Store構築時に `assertAwardPersistenceIntegrity()` がDB全体を検証済みだが、
    * construction後にout-of-bandな行が挿入される可能性もゼロではないため、
-   * ここでも見つけたaward bundle（facts/ownership）のintegrityを確認する——
-   * 欠損したfacts/ownershipを抱えたawardを黙って「あり」として返さない。
+   * ここでも見つけたaward bundleのintegrityを確認する——facts行が「存在する
+   * だけ」でtrueにせず、`awardFacts()`相当の内容validation（version/captured_at/
+   * JSON本体）を通してからtrueにする。欠損・破損したfacts/ownershipを抱えた
+   * awardを黙って「あり」として返さない。
    */
   hasAward(userIdRaw: string, titleKeyRaw: string, scopeKeyRaw: string): boolean {
     const userId = requireText(userIdRaw, "userId");
@@ -751,7 +910,7 @@ export class TitleV2Store {
     const row = this.getAwardRow(userId, titleKey, scopeKey);
     if (!row) return false;
 
-    const facts = this.getAwardFactsRow(userId, titleKey, scopeKey);
+    const facts = this.readValidatedAwardFactsRow(userId, titleKey, scopeKey);
     if (!facts) {
       throw new Error(
         `title award integrity violation: award row exists for (${userId}, ${titleKey}, ${scopeKey}) without award facts`,
@@ -786,44 +945,7 @@ export class TitleV2Store {
     const userId = requireText(userIdRaw, "userId");
     const titleKey = requireV2Key(titleKeyRaw);
     const scopeKey = requireText(scopeKeyRaw, "scopeKey");
-    const row = this.db
-      .prepare(
-        `SELECT facts_version, facts_json, captured_at
-           FROM title_award_facts
-          WHERE user_id = ? AND title_key = ? AND scope_key = ?`,
-      )
-      .get(userId, titleKey, scopeKey) as { facts_version: number; facts_json: string; captured_at: number } | undefined;
-    if (!row) return null;
-
-    // 壊れたDB値をそのまま型付きrowとして返さない——version・timestamp・JSON本体を
-    // すべてvalidateする。
-    try {
-      assertValidFactsVersion(row.facts_version, `award facts_version for ${userId}/${titleKey}/${scopeKey}`);
-    } catch (err) {
-      throw new Error(
-        `award facts integrity violation: invalid facts_version for ${userId}/${titleKey}/${scopeKey}: ${(err as Error).message}`,
-      );
-    }
-    if (!Number.isInteger(row.captured_at) || row.captured_at < 0) {
-      throw new Error(`award facts integrity violation: invalid captured_at for ${userId}/${titleKey}/${scopeKey}`);
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(row.facts_json);
-    } catch {
-      throw new Error(`award facts integrity violation: invalid JSON for ${userId}/${titleKey}/${scopeKey}`);
-    }
-    assertValidAwardFacts(parsed, `award facts for ${userId}/${titleKey}/${scopeKey}`);
-
-    return {
-      user_id: userId,
-      title_key: titleKey,
-      scope_key: scopeKey,
-      facts_version: row.facts_version,
-      data: parsed,
-      captured_at: row.captured_at,
-    };
+    return this.readValidatedAwardFactsRow(userId, titleKey, scopeKey);
   }
 
   /** titleKeyそのものを所持しているか（副作用なし）。scope単位のawardとは別の問い。 */

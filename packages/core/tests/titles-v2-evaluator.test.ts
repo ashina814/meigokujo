@@ -864,6 +864,34 @@ describe("runtime discriminated-union guard（TypeScriptを迂回したruleへ�
     );
     expect(store.listAwards("alice")).toEqual([]);
   });
+
+  it.each([["false" as never], [0 as never], [1 as never], [null as never]])(
+    "matchedが非boolean値（%j）ならruntimeでreject",
+    (badMatched) => {
+      const { db, store } = setup();
+      const badRule = defineTitleRule(
+        {
+          kind: "behavior",
+          key: `v2.test.non-boolean-matched-${String(badMatched)}`,
+          name: "test",
+          description: "TypeScriptを迂回してmatchedへ非boolean値を返す壊れたrule",
+          sources: ["bump_events"] as const,
+          triggers: ["bump_success"],
+          lifecycle: "active",
+          ...COMMON_FIXTURE_FIELDS,
+        },
+        {
+          awardFactsVersion: 1,
+          evaluate: () => ({ matched: badMatched, earnedAt: null } as never),
+        },
+      );
+
+      expect(() => evaluateTitle(db, store, badRule, "alice", OBSERVED_AT)).toThrow(
+        /non-boolean matched value/,
+      );
+      expect(store.listAwards("alice")).toEqual([]);
+    },
+  );
 });
 
 describe("fail-closed on scope resolution / source reader failure（§24）", () => {

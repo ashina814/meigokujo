@@ -235,22 +235,13 @@ describe("称号v2 foundation", () => {
     const sepScope = resolveTitleScope(store, moonDef, sepObservedAt);
     const tableScope = resolveTitleScope(store, tableDef, clock);
 
-    store.award({
-      userId: "alice",
-      titleKey: "v2.moon",
-      scope: augScope,
-      earnedAt: null,
-      awardedAt: augObservedAt,
-      awardFacts: NO_FACTS,
-    });
-    store.award({
-      userId: "alice",
-      titleKey: "v2.moon",
-      scope: sepScope,
-      earnedAt: null,
-      awardedAt: sepObservedAt,
-      awardFacts: NO_FACTS,
-    });
+    // awardedAtはcaller入力ではなくclock()のsnapshot——各awardの直前でclockを
+    // そのscopeのobservedAt以降へ進めてから呼ぶ。
+    clock = augObservedAt;
+    store.award({ userId: "alice", titleKey: "v2.moon", scope: augScope, earnedAt: null, awardFacts: NO_FACTS });
+    clock = sepObservedAt;
+    store.award({ userId: "alice", titleKey: "v2.moon", scope: sepScope, earnedAt: null, awardFacts: NO_FACTS });
+    clock = AWARD_BASE + 500_000;
     store.award({ userId: "alice", titleKey: "v2.table", scope: tableScope, earnedAt: null, awardFacts: NO_FACTS });
 
     expect(store.listEquips("alice")).toEqual([]);

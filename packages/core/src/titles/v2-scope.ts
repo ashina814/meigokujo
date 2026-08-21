@@ -11,29 +11,54 @@ import type { TitleV2Store } from "./v2-store.js";
  * award境界が過去に遡って変わってしまう。
  */
 
-const RESOLVED_SCOPE_BRAND: unique symbol = Symbol("ResolvedTitleScope");
 /**
- * どのtitleのために解決されたscopeかを示すprivate provenance。`scopeKey` だけでは
- * title間の取り違えを検出できない——`global` や `catalog:v1` のようなscopeKeyは
- * その policy を使う全titleで文字列としては同一になり得るため、「title Aのために
- * 正規resolveしたscopeを、title Bのawardへそのまま渡す」ことをscopeKeyの一致検査
- * だけでは防げない。このsymbolはmodule外へ公開せず、`assertResolvedTitleScopeForTitle()`
- * を通じてのみ検証させる——TitleRuleScope（ruleへ渡す形）には含めない。
+ * 型レベルのnominal branding。TypeScriptの構造的型付けを迂回して、手書きの
+ * plain objectを `ResolvedTitleScope` として直接代入できないようにする
+ * （`@ts-expect-error` で証明できる）。ただし**runtimeのforgery検知の正本ではない**
+ * ——`unique symbol` はobjectのown propertyとして存在する以上、
+ * `Object.getOwnPropertySymbols()` で列挙してコピーできてしまう
+ * （legitimateなscopeから盗んだsymbolを別objectへ移植すれば、この時点の
+ * チェックだけは通ってしまう）。runtimeの正本は下の `RESOLVED_SCOPE_PROVENANCE`
+ * WeakMap——object identity（参照そのもの）でしか引けないため、property単位の
+ * コピーやProxyでのラップでは迂回できない。
  */
-const RESOLVED_SCOPE_TITLE_KEY: unique symbol = Symbol("ResolvedTitleScopeTitleKey");
+const RESOLVED_SCOPE_BRAND: unique symbol = Symbol("ResolvedTitleScope");
+
+/** resolveTitleScope()が確定した値のcanonical snapshot。 */
+interface ScopeProvenance {
+  readonly titleKey: string;
+  readonly scopeKey: string;
+  readonly start: number;
+  readonly endExclusive: number | null;
+  readonly observedAt: number;
+}
+
+/**
+ * runtimeのforgery検知・title provenance検証の正本。
+ *
+ * keyは`ResolvedTitleScope`のexact object identityそのもの——WeakMapの検索は
+ * SameValueZeroによる参照比較なので、以下のいずれもここには載らない。
+ * - legitimateなscopeのsymbol propertiesを別objectへコピーしたもの
+ * - legitimateなscopeをラップした`Proxy`（targetへ委譲していても、Proxy自体は
+ *   別のobject identityを持つ）
+ * - legitimateなscopeをspreadした`{ ...scope }`のコピー
+ *
+ * 値は`resolveTitleScope()`が確定した時点のsnapshotで、`brand()`の中でしか
+ * `.set()`しない。
+ */
+const RESOLVED_SCOPE_PROVENANCE = new WeakMap<object, ScopeProvenance>();
 
 /**
  * resolveTitleScope() だけが作れる、評価に使ってよいscope。
  *
- * `[RESOLVED_SCOPE_BRAND]` はこのモジュール外からは参照できないsymbolなので、
- * 他コードが手書きで `{ scopeKey: "...", start: ... }` を作ってもこの型には
- * 構造的に合致しない（TypeScript）。`as unknown as ResolvedTitleScope` で型を
- * 迂回されても、実際のsymbol propertyは存在しないため、`assertResolvedTitleScope()`
- * のruntimechekで検出できる——型だけでなくruntimeでもforgeryをfail-closedにする。
+ * 返されたobjectは`Object.freeze()`済み——`scope.scopeKey = "x"`のような
+ * 直接改変はstrict modeでTypeErrorになる（このリポジトリはESモジュールなので
+ * 常にstrict mode）。ただしfreezeだけでは「別objectへのコピー」や「Proxyでの
+ * ラップ」は防げないため、runtimeの真の防御はWeakMap identityの方にある
+ * （`RESOLVED_SCOPE_PROVENANCE`参照）。
  */
 export interface ResolvedTitleScope {
   readonly [RESOLVED_SCOPE_BRAND]: true;
-  readonly [RESOLVED_SCOPE_TITLE_KEY]: string;
   /** `(user_id, title_key, scope_key)` のunique制約へそのまま使う。canonical生成のみ。 */
   readonly scopeKey: string;
   /** inclusive */
@@ -53,26 +78,46 @@ function brand(
   },
   titleKey: string,
 ): ResolvedTitleScope {
-  return { ...scope, [RESOLVED_SCOPE_BRAND]: true, [RESOLVED_SCOPE_TITLE_KEY]: titleKey };
+  const branded = Object.freeze({ ...scope, [RESOLVED_SCOPE_BRAND]: true }) as ResolvedTitleScope;
+  RESOLVED_SCOPE_PROVENANCE.set(
+    branded as unknown as object,
+    Object.freeze({ titleKey, scopeKey: scope.scopeKey, start: scope.start, endExclusive: scope.endExclusive, observedAt: scope.observedAt }),
+  );
+  return branded;
 }
 
 /**
  * scopeが本当にresolveTitleScope()の産物かをruntimeで確認する。
  * sourceを読む前・awardする前、resolvedScopeを受け取る全ての境界で呼ぶこと。
  *
- * これはbrand（forgery）だけを見る構造チェックであり、「どのtitleのために解決
- * されたか」までは見ない——読み込み境界（v2-sources.ts）はtitleごとのcacheを持たず
- * `(userId, sourceKey, scopeKey, start, endExclusive, observedAt)` で共有するため、
- * ここでtitle provenanceを強制すると意図的なcache共有が壊れる。title取り違えの
- * 防止はaward境界（`assertResolvedTitleScopeForTitle()`）でだけ行う。
+ * 正本はWeakMap identity——`scope`という**まさにそのobject参照**が
+ * `RESOLVED_SCOPE_PROVENANCE`に登録されていなければforgeryとして拒否する。
+ * 登録が見つかった場合も、objectのfield値がsnapshot時点のcanonical値と
+ * 一致することを二重に確認する（freezeされているため通常は不変のはずだが、
+ * 念のための構造チェック）。
+ *
+ * title provenanceまでは見ない——読み込み境界（v2-sources.ts）はtitleごとの
+ * cacheを持たず `(userId, sourceKey, scopeKey, start, endExclusive, observedAt)`
+ * で共有するため、ここでtitle provenanceを強制すると意図的なcache共有が壊れる。
+ * title取り違えの防止はaward境界（`assertResolvedTitleScopeForTitle()`）でだけ行う。
  */
 export function assertResolvedTitleScope(scope: ResolvedTitleScope): void {
-  if (
-    scope === null ||
-    typeof scope !== "object" ||
-    (scope as unknown as Record<symbol, unknown>)[RESOLVED_SCOPE_BRAND] !== true
-  ) {
+  if (scope === null || typeof scope !== "object") {
     throw new Error("scope was not produced by resolveTitleScope() (forged or hand-built ResolvedTitleScope)");
+  }
+  const provenance = RESOLVED_SCOPE_PROVENANCE.get(scope as unknown as object);
+  if (!provenance) {
+    throw new Error(
+      "scope was not produced by resolveTitleScope() (forged, hand-built, cloned, or proxied ResolvedTitleScope)",
+    );
+  }
+  if (
+    scope.scopeKey !== provenance.scopeKey ||
+    scope.start !== provenance.start ||
+    scope.endExclusive !== provenance.endExclusive ||
+    scope.observedAt !== provenance.observedAt
+  ) {
+    throw new Error("resolved title scope fields do not match the canonical snapshot recorded at resolution time");
   }
   if (typeof scope.scopeKey !== "string" || !scope.scopeKey.trim()) {
     throw new Error("resolved title scope has an empty scopeKey");
@@ -95,18 +140,22 @@ export function assertResolvedTitleScope(scope: ResolvedTitleScope): void {
  * resolveしたscopeをtitle Bへ渡す」substitutionはscopeKeyの一致だけでは
  * 検出できない——このprovenance検査がその隙間を塞ぐ。
  *
- * callerへscopeKey/start/endの構築権限を戻すものではない（provenanceはこの
- * モジュール外からは読めないsymbolのまま）。
+ * callerへscopeKey/start/endの構築権限を戻すものではない（provenanceは
+ * このモジュール外からは読めないWeakMapのまま）。呼び出し側（Store.award()）は
+ * 戻り値のcanonical snapshotをそのままpersistに使うこと——`scope`オブジェクト
+ * 自身のfieldを直接読まない（belt-and-suspenders: freezeが何らかの形で
+ * 迂回されたとしても、実際にpersistされる値は常にWeakMap登録時点の値になる）。
  */
-export function assertResolvedTitleScopeForTitle(scope: ResolvedTitleScope, titleKey: string): void {
+export function assertResolvedTitleScopeForTitle(scope: ResolvedTitleScope, titleKey: string): ScopeProvenance {
   assertResolvedTitleScope(scope);
-  const actual = (scope as unknown as Record<symbol, unknown>)[RESOLVED_SCOPE_TITLE_KEY];
-  if (actual !== titleKey) {
+  const provenance = RESOLVED_SCOPE_PROVENANCE.get(scope as unknown as object)!;
+  if (provenance.titleKey !== titleKey) {
     throw new Error(
-      `resolved title scope was resolved for a different title (expected ${titleKey}, got ${String(actual)}); ` +
+      `resolved title scope was resolved for a different title (expected ${titleKey}, got ${provenance.titleKey}); ` +
         `scopeKey=${scope.scopeKey}`,
     );
   }
+  return provenance;
 }
 
 /**
@@ -118,7 +167,7 @@ export function assertResolvedTitleScopeForTitle(scope: ResolvedTitleScope, titl
  * 意味で、呼び出し側（v2-sources.ts）は0件のpayloadを返すこと。resolveTitleScope()
  * がobservedAt<startをfail-closedしているため、effectiveEnd<startにはならない。
  */
-export function resolvedScopeEffectiveEnd(scope: ResolvedTitleScope): number {
+export function resolvedScopeEffectiveEnd(scope: { readonly endExclusive: number | null; readonly observedAt: number }): number {
   return scope.endExclusive === null ? scope.observedAt : Math.min(scope.endExclusive, scope.observedAt);
 }
 

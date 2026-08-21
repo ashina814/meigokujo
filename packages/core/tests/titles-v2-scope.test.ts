@@ -410,6 +410,67 @@ describe("callerがscopeを偽造できない（§7）", () => {
   });
 });
 
+describe("runtimeのforgery検知はWeakMap identity（symbol property盗用への対策）", () => {
+  it("Object.getOwnPropertySymbols()でlegitimate scopeのsymbolsをコピーしたcloneはreject", () => {
+    const db = openDb(":memory:");
+    new BumpCounter(db);
+    const store = new TitleV2Store(db, () => BASE);
+    store.applyCatalog({ catalogKey: "v1", actor: "test" });
+    const legit = resolveTitleScope(store, titleWith({ scope: { type: "global" } }), BASE + 10);
+
+    // module-privateなsymbolでも、objectのown propertyである以上
+    // Object.getOwnPropertySymbols()で列挙してコピーできてしまう——単なるsymbol
+    // brandingだけではforgeryを防げないことの直接的な証明。scopeKeyだけ攻撃者の
+    // 望む値へ差し替える。
+    const clone: Record<PropertyKey, unknown> = {
+      scopeKey: "forged-scope",
+      start: legit.start,
+      endExclusive: legit.endExclusive,
+      observedAt: legit.observedAt,
+    };
+    for (const sym of Object.getOwnPropertySymbols(legit)) {
+      clone[sym] = (legit as unknown as Record<symbol, unknown>)[sym];
+    }
+
+    expect(() => readTitleSource(db, "bump_events", "alice", clone as unknown as ResolvedTitleScope)).toThrow(
+      /not produced by resolveTitleScope/,
+    );
+  });
+
+  it("legitimate scopeはObject.freeze()済みでfield書き換えができない", () => {
+    const db = openDb(":memory:");
+    const store = new TitleV2Store(db, () => BASE);
+    store.applyCatalog({ catalogKey: "v1", actor: "test" });
+    const legit = resolveTitleScope(store, titleWith({ scope: { type: "global" } }), BASE + 10);
+
+    expect(() => {
+      (legit as { scopeKey: string }).scopeKey = "hijacked";
+    }).toThrow(TypeError); // ESモジュールは常にstrict mode——frozen objectへの代入はTypeError
+    expect(legit.scopeKey).toBe("global");
+  });
+
+  it("Proxyでlegitimate scopeを包んでもreject（Proxy自体は別object identityを持つ）", () => {
+    const db = openDb(":memory:");
+    new BumpCounter(db);
+    const store = new TitleV2Store(db, () => BASE);
+    store.applyCatalog({ catalogKey: "v1", actor: "test" });
+    const legit = resolveTitleScope(store, titleWith({ scope: { type: "global" } }), BASE + 10);
+
+    const proxied = new Proxy(legit, {});
+    expect(() => readTitleSource(db, "bump_events", "alice", proxied)).toThrow(/not produced by resolveTitleScope/);
+  });
+
+  it("resolveTitleScope()が返した、まさにそのobjectはそのまま通る", () => {
+    const db = openDb(":memory:");
+    new BumpCounter(db);
+    const store = new TitleV2Store(db, () => BASE);
+    store.applyCatalog({ catalogKey: "v1", actor: "test" });
+    const legit = resolveTitleScope(store, titleWith({ scope: { type: "global" } }), BASE + 10);
+
+    expect(() => readTitleSource(db, "bump_events", "alice", legit)).not.toThrow();
+  });
+});
+
 describe("zero-width windowはVC readerでエラーにならない（§6）", () => {
   it("CATALOG_EPOCH===observedAtのvc_empty_start_then_joinedは0件を返す（例外にならない）", () => {
     const db = openDb(":memory:");

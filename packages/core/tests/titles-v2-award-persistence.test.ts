@@ -19,13 +19,17 @@ function setup() {
   new BumpCounter(db);
   // catalog epochはBASEで施行する（既存のscope期待値と揃える）。施行後、clockを
   // BASE+1000へ進める——このファイルのシンプルなテストはobservedAt=BASE+100前後しか
-  // 使わないため、常にawardedAt(=clock())>=scope.observedAtを満たす。8月/9月の実日付を
-  // 使うテスト（同user・別scope、read API）だけは明示的にawardedAtを渡す。
+  // 使わないため、常にawardedAt(=clock())>=scope.observedAtを満たす。awardedAtは
+  // caller入力ではなくStore.award()内でclock()を読んだsnapshotなので、8月/9月の
+  // 実日付を使うテストではawardの直前に`setClock()`でclockを進めてから呼ぶ。
   let clock = BASE;
   const store = new TitleV2Store(db, () => clock);
   store.applyCatalog({ catalogKey: "v1", actor: "test-setup" });
   clock = BASE + 1000;
-  return { db, store };
+  const setClock = (value: number) => {
+    clock = value;
+  };
+  return { db, store, setClock };
 }
 
 function sampleDef(key: `v2.${string}`, scope: TitleScopePolicy = { type: "global" }) {
@@ -68,16 +72,16 @@ describe("schema（§25.A）: award/facts/ownership/rarity sequenceはadditive",
 
 describe("first award（§25.B）", () => {
   it("award/facts/ownership rowが作られ、sequence=1・holderCount=1になる", () => {
-    const { store } = setup();
+    const { store, setClock } = setup();
     const def = sampleDef("v2.test.first");
     const scope = resolveTitleScope(store, def, BASE + 100);
 
+    setClock(BASE + 100);
     const result = store.award({
       userId: "alice",
       titleKey: def.key,
       scope,
       earnedAt: BASE + 50,
-      awardedAt: BASE + 100,
       awardFacts: { version: 1, data: { note: "first" } },
     });
 
@@ -121,7 +125,7 @@ describe("second user same title（§25.C）", () => {
 
 describe("same user / same title / second scope（§25.D）", () => {
   it("awardは2行、factsもscope別2行、ownershipは1行のまま、acquisitionSequenceは変わらない", () => {
-    const { store } = setup();
+    const { store, setClock } = setup();
     const def = sampleDef("v2.test.repeat", { type: "month" });
     // catalog epochはBASE（2026-08-20 JST）。8月・9月どちらも施行後の時刻を使う。
     const augObservedAt = Math.floor(new Date("2026-08-25T00:00:00+09:00").getTime() / 1000);
@@ -130,20 +134,20 @@ describe("same user / same title / second scope（§25.D）", () => {
     const sepScope = resolveTitleScope(store, def, sepObservedAt);
     expect(augScope.scopeKey).not.toBe(sepScope.scopeKey);
 
+    setClock(augObservedAt);
     const first = store.award({
       userId: "alice",
       titleKey: def.key,
       scope: augScope,
       earnedAt: null,
-      awardedAt: augObservedAt,
       awardFacts: { version: 1, data: { month: "aug" } },
     });
+    setClock(sepObservedAt);
     const second = store.award({
       userId: "alice",
       titleKey: def.key,
       scope: sepScope,
       earnedAt: null,
-      awardedAt: sepObservedAt,
       awardFacts: { version: 1, data: { month: "sep" } },
     });
 
@@ -348,16 +352,16 @@ describe("scope guard（§25.G）", () => {
   });
 
   it("earnedAtがeffectiveEnd以降（境界含む）ならreject", () => {
-    const { store } = setup();
+    const { store, setClock } = setup();
     const def = sampleDef("v2.test.late-earned");
     const scope = resolveTitleScope(store, def, BASE + 100); // global: effectiveEnd === observedAt === BASE+100
+    setClock(BASE + 200);
     expect(() =>
       store.award({
         userId: "alice",
         titleKey: def.key,
         scope,
         earnedAt: BASE + 100,
-        awardedAt: BASE + 200,
         awardFacts: NO_FACTS,
       }),
     ).toThrow(/outside the resolved scope window/);
@@ -463,7 +467,7 @@ describe("migration / integrity（§25.I）", () => {
 
 describe("ownership read API（§25.17）", () => {
   it("hasOwnership/ownership/listOwnershipsはscope別historyと混ざらない", () => {
-    const { store } = setup();
+    const { store, setClock } = setup();
     const monthDef = sampleDef("v2.test.read-api", { type: "month" });
     const augObservedAt = Math.floor(new Date("2026-08-25T00:00:00+09:00").getTime() / 1000);
     const sepObservedAt = Math.floor(new Date("2026-09-15T00:00:00+09:00").getTime() / 1000);
@@ -471,22 +475,10 @@ describe("ownership read API（§25.17）", () => {
     const sepScope = resolveTitleScope(store, monthDef, sepObservedAt);
 
     expect(store.hasOwnership("alice", monthDef.key)).toBe(false);
-    store.award({
-      userId: "alice",
-      titleKey: monthDef.key,
-      scope: augScope,
-      earnedAt: null,
-      awardedAt: augObservedAt,
-      awardFacts: NO_FACTS,
-    });
-    store.award({
-      userId: "alice",
-      titleKey: monthDef.key,
-      scope: sepScope,
-      earnedAt: null,
-      awardedAt: sepObservedAt,
-      awardFacts: NO_FACTS,
-    });
+    setClock(augObservedAt);
+    store.award({ userId: "alice", titleKey: monthDef.key, scope: augScope, earnedAt: null, awardFacts: NO_FACTS });
+    setClock(sepObservedAt);
+    store.award({ userId: "alice", titleKey: monthDef.key, scope: sepScope, earnedAt: null, awardFacts: NO_FACTS });
 
     expect(store.hasOwnership("alice", monthDef.key)).toBe(true);
     expect(store.ownership("alice", monthDef.key)?.first_scope_key).toBe(augScope.scopeKey);
@@ -557,54 +549,37 @@ describe("Store construction時の全体integrity検証（lazy checkにしない
 
 describe("awardedAt chronology（scope.observedAtとの整合、§3）", () => {
   it("awardedAt < scope.observedAtならreject", () => {
-    const { store } = setup();
+    const { store, setClock } = setup();
     const def = sampleDef("v2.test.chrono-early");
     const scope = resolveTitleScope(store, def, BASE + 100);
+    setClock(BASE + 99); // awardedAt(=clock())をscope.observedAt(BASE+100)より前にする
     expect(() =>
-      store.award({
-        userId: "alice",
-        titleKey: def.key,
-        scope,
-        earnedAt: null,
-        awardedAt: BASE + 99,
-        awardFacts: NO_FACTS,
-      }),
+      store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS }),
     ).toThrow(/cannot be before the scope's observedAt/);
   });
 
   it("awardedAt === scope.observedAtならpass", () => {
-    const { store } = setup();
+    const { store, setClock } = setup();
     const def = sampleDef("v2.test.chrono-equal");
     const scope = resolveTitleScope(store, def, BASE + 100);
+    setClock(BASE + 100);
     expect(() =>
-      store.award({
-        userId: "alice",
-        titleKey: def.key,
-        scope,
-        earnedAt: null,
-        awardedAt: BASE + 100,
-        awardFacts: NO_FACTS,
-      }),
+      store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS }),
     ).not.toThrow();
   });
 
-  it("historical scope（monthSelector:specific）でも、awardedAtがそのscopeのobservedAt以降ならpass", () => {
-    const { store } = setup();
+  it("historical scope（monthSelector:specific）でも、awardedAt（=repair実行時刻）がそのscopeのobservedAt以降ならpass", () => {
+    const { store, setClock } = setup();
     const def = sampleDef("v2.test.chrono-historical", { type: "month" });
-    // 9月に評価しつつ、8月分のhistorical scopeを修復評価する。
+    // 9月に評価しつつ、8月分のhistorical scopeを修復評価する。repair jobの
+    // 「今」＝repairObservedAtなので、awardedAt（=clock()）も同じ値にする。
     const repairObservedAt = Math.floor(new Date("2026-09-05T00:00:00+09:00").getTime() / 1000);
     const historicalScope = resolveTitleScope(store, def, repairObservedAt, {
       monthSelector: { type: "specific", month: "2026-08" },
     });
+    setClock(repairObservedAt);
     expect(() =>
-      store.award({
-        userId: "alice",
-        titleKey: def.key,
-        scope: historicalScope,
-        earnedAt: null,
-        awardedAt: repairObservedAt,
-        awardFacts: NO_FACTS,
-      }),
+      store.award({ userId: "alice", titleKey: def.key, scope: historicalScope, earnedAt: null, awardFacts: NO_FACTS }),
     ).not.toThrow();
   });
 });
@@ -742,5 +717,129 @@ describe("awardFacts() read integrity（§18）", () => {
     db.prepare(`UPDATE title_award_facts SET captured_at = -1 WHERE user_id = ? AND title_key = ?`).run("alice", def.key);
 
     expect(() => store.awardFacts("alice", def.key, scope.scopeKey)).toThrow(/invalid captured_at/);
+  });
+});
+
+describe("historical repair後もownership origin snapshotを巻き戻さない（§5）", () => {
+  it("Septemberでfirst ownership成立後、Augustのhistorical repairをawardしてもownership.first_*は変わらない", () => {
+    // title_ownerships.first_*は「歴史上最古のaward」ではなく「Botが最初に
+    // ownershipを成立させたaward」のsnapshot。Septemberが先に処理され、
+    // Augustは後日historical repairで発見される、という順序を再現する。
+    const { store, setClock } = setup();
+    const def = sampleDef("v2.test.repair-immutable", { type: "month" });
+    const sepObservedAt = Math.floor(new Date("2026-09-15T00:00:00+09:00").getTime() / 1000);
+    const repairObservedAt = sepObservedAt + 1000;
+
+    const sepScope = resolveTitleScope(store, def, sepObservedAt);
+    setClock(sepObservedAt);
+    const sepResult = store.award({
+      userId: "alice",
+      titleKey: def.key,
+      scope: sepScope,
+      earnedAt: null,
+      awardFacts: { version: 1, data: { month: "sep" } },
+    });
+    expect(sepResult.ownershipCreated).toBe(true);
+    expect(sepResult.ownership.first_scope_key).toBe(sepScope.scopeKey);
+
+    // 後日、8月分をhistorical repairで発見してaward（歴史上はSeptemberより前の
+    // 出来事だが、Botが処理した順序としてはSeptemberより後）。
+    const augScope = resolveTitleScope(store, def, repairObservedAt, {
+      monthSelector: { type: "specific", month: "2026-08" },
+    });
+    setClock(repairObservedAt);
+    const augResult = store.award({
+      userId: "alice",
+      titleKey: def.key,
+      scope: augScope,
+      earnedAt: null,
+      awardFacts: { version: 1, data: { month: "aug-repair" } },
+    });
+    expect(augResult.status).toBe("awarded"); // 新しいscopeへのawardとしては成立する
+    expect(augResult.ownershipCreated).toBe(false); // ownershipは増えない
+
+    // ownership.first_*は依然としてSeptemberのまま——「歴史上最古のaward」への
+    // 巻き戻しは起きない。
+    const finalOwnership = store.ownership("alice", def.key);
+    expect(finalOwnership?.first_scope_key).toBe(sepScope.scopeKey);
+    expect(finalOwnership?.acquisition_sequence).toBe(sepResult.ownership.acquisition_sequence);
+    expect(finalOwnership?.holder_count_at_acquisition).toBe(sepResult.ownership.holder_count_at_acquisition);
+  });
+});
+
+describe("assertAwardPersistenceIntegrity()のsemantic integrity検証（§3強化分）", () => {
+  it("facts.captured_atが対応award.awarded_atと食い違うと、constructorでintegrity違反", () => {
+    const { db, store, setClock } = setup();
+    const def = sampleDef("v2.test.captured-mismatch");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    setClock(BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS });
+    db.prepare(`UPDATE title_award_facts SET captured_at = captured_at + 1 WHERE user_id = ? AND title_key = ?`).run(
+      "alice",
+      def.key,
+    );
+
+    expect(() => new TitleV2Store(db, () => BASE + 1000)).toThrow(/captured_at .* does not match/);
+  });
+
+  it("ownership.first_earned_atが参照先awardのearned_atと食い違うと、constructorでintegrity違反", () => {
+    const { db, store, setClock } = setup();
+    const def = sampleDef("v2.test.ownership-mismatch");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    setClock(BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS });
+    db.prepare(`UPDATE title_ownerships SET first_earned_at = ? WHERE user_id = ? AND title_key = ?`).run(
+      BASE + 50,
+      "alice",
+      def.key,
+    );
+
+    expect(() => new TitleV2Store(db, () => BASE + 1000)).toThrow(/first_earned_at does not match/);
+  });
+
+  it("ownershipが存在するtitleにrarity sequence行が無いと、constructorでintegrity違反", () => {
+    const { db, store, setClock } = setup();
+    const def = sampleDef("v2.test.missing-sequence");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    setClock(BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS });
+    db.prepare(`DELETE FROM title_rarity_sequences WHERE title_key = ?`).run(def.key);
+
+    expect(() => new TitleV2Store(db, () => BASE + 1000)).toThrow(/no rarity sequence row/);
+  });
+
+  it("rarity sequence.last_sequenceがmax(acquisition_sequence)未満だと、constructorでintegrity違反", () => {
+    const { db, store, setClock } = setup();
+    const def = sampleDef("v2.test.low-sequence");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    setClock(BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS }); // sequence=1
+    store.award({ userId: "bob", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS }); // sequence=2
+    db.prepare(`UPDATE title_rarity_sequences SET last_sequence = 1 WHERE title_key = ?`).run(def.key);
+
+    expect(() => new TitleV2Store(db, () => BASE + 1000)).toThrow(/last_sequence .* less than/);
+  });
+
+  it("直接SQL操作で作られた孤立child行のFK違反を、targeted queryでは見えなくてもforeign_key_check経由で検出する", () => {
+    const { db, store, setClock } = setup();
+    const def = sampleDef("v2.test.fk-violation");
+    const scope = resolveTitleScope(store, def, BASE + 100);
+    setClock(BASE + 100);
+    store.award({ userId: "alice", titleKey: def.key, scope, earnedAt: null, awardFacts: NO_FACTS });
+
+    // title_awards行だけを、FK enforcementを一時的に無効化して削除する
+    // （通常のDELETEはFKで拒否されるため、migration事故等のout-of-bandな操作を模す）。
+    // title_award_facts/title_ownershipsの検証queryはtitle_awardsをINNER JOINするため、
+    // 「参照先が消えた孤立child行」はそちらのtargeted queryでは検出できない——
+    // foreign_key_checkだけがこの種の破損を拾う。
+    db.pragma("foreign_keys = OFF");
+    db.prepare(`DELETE FROM title_awards WHERE user_id = ? AND title_key = ? AND scope_key = ?`).run(
+      "alice",
+      def.key,
+      scope.scopeKey,
+    );
+    db.pragma("foreign_keys = ON");
+
+    expect(() => new TitleV2Store(db, () => BASE + 1000)).toThrow(/foreign_key_check/);
   });
 });

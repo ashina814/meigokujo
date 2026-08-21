@@ -178,6 +178,18 @@ export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
 
   const result = rule.evaluate({ userId, scope: toRuleScope(resolvedScope), sources });
 
+  // TypeScriptを迂回したruleが`matched: "false"`や`matched: 0`のような非boolean値を
+  // 返すと、直後の`if (!result.matched)`がJSの truthy/falsy 変換に頼ることになり、
+  // discriminated unionのnarrowingが実際のfield構成と食い違ったまま先へ進んでしまう
+  // （例: `matched: "false"`は文字列として truthy なので matched:true 分岐へ入るが、
+  // 型上は`{matched:true; awardFacts: TitleAwardFacts}`のはずのresultに実際は
+  // awardFactsが無い、といった矛盾）。ここで明示的にboolean型であることを強制する。
+  if (result.matched !== true && result.matched !== false) {
+    throw new Error(
+      `title rule ${definition.key} returned a non-boolean matched value (contract violation): ${JSON.stringify((result as { matched: unknown }).matched)}`,
+    );
+  }
+
   if (result.earnedAt !== null && !allSourcesOrderable(definition.sources)) {
     throw new Error(
       `title rule ${definition.key} returned a non-null earnedAt but depends on a non-orderable source; ` +
