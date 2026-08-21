@@ -2,11 +2,35 @@ import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { BumpCounter } from "../src/rank/bump.js";
-import { TITLE_SOURCES, TITLE_TIME_ZONE, defineBehaviorTitle } from "../src/titles/v2-contract.js";
+import { TITLE_SOURCES, TITLE_TIME_ZONE, defineBehaviorTitle, type TitleScopePolicy } from "../src/titles/v2-contract.js";
+import { resolveTitleScope } from "../src/titles/v2-scope.js";
 import { TitleV2Store } from "../src/titles/v2-store.js";
 import { VcTracker } from "../src/vc/service.js";
 
 afterEach(() => vi.useRealTimers());
+
+/** JST 2026-08-20 00:00:00 を秒0とする、award系テスト用の基準時刻。 */
+const AWARD_BASE = Math.floor(Date.UTC(2026, 7, 19, 15, 0, 0) / 1000);
+const NO_FACTS = { version: 1, data: {} };
+
+function sampleTitle(key: `v2.${string}`, scope: TitleScopePolicy) {
+  return defineBehaviorTitle({
+    kind: "behavior",
+    key,
+    catalog: "v1",
+    name: key,
+    emoji: "x",
+    description: "テスト用",
+    sources: ["bump_events"],
+    triggers: ["daily"],
+    lifecycle: "active",
+    hidden: false,
+    publicAnnounce: false,
+    themeKey: "t",
+    groupKey: "t",
+    scope,
+  });
+}
 
 describe("称号v2 foundation", () => {
   it("旧titlesとは別のadditive schemaを作り、earned_atはNULLを許す", () => {
@@ -19,6 +43,9 @@ describe("称号v2 foundation", () => {
       "title_source_baselines",
       "title_source_baseline_runs",
       "title_awards",
+      "title_award_facts",
+      "title_rarity_sequences",
+      "title_ownerships",
       "title_equips",
     ]) {
       const row = db
@@ -124,38 +151,64 @@ describe("称号v2 foundation", () => {
 
   it("awardはscope単位で冪等、達成時刻不明はNULLのまま保存する", () => {
     const db = openDb(":memory:");
-    const store = new TitleV2Store(db, () => 200);
+    let clock = AWARD_BASE;
+    const store = new TitleV2Store(db, () => clock);
+    store.applyCatalog({ catalogKey: "v1", actor: "admin" }); // SYSTEM_EPOCH/CATALOG_EPOCH=AWARD_BASE
+    clock = AWARD_BASE + 200;
 
-    expect(store.award({ userId: "alice", titleKey: "v2.example", scopeKey: "global", earnedAt: null })).toBe(true);
-    expect(store.award({ userId: "alice", titleKey: "v2.example", scopeKey: "global", earnedAt: 100 })).toBe(false);
+    const globalDef = sampleTitle("v2.example", { type: "global" });
+    const monthDef = sampleTitle("v2.example-monthly", { type: "month" });
+    const globalScope = resolveTitleScope(store, globalDef, clock);
+    const monthScope = resolveTitleScope(store, monthDef, clock);
+
     expect(
-      store.award({ userId: "alice", titleKey: "v2.example", scopeKey: "month:2026-08", earnedAt: 150 }),
-    ).toBe(true);
+      store.award({ userId: "alice", titleKey: "v2.example", scope: globalScope, earnedAt: null, awardFacts: NO_FACTS })
+        .status,
+    ).toBe("awarded");
+    expect(
+      store.award({ userId: "alice", titleKey: "v2.example", scope: globalScope, earnedAt: AWARD_BASE + 100, awardFacts: NO_FACTS })
+        .status,
+    ).toBe("already_awarded");
+    expect(
+      store.award({
+        userId: "alice",
+        titleKey: "v2.example-monthly",
+        scope: monthScope,
+        earnedAt: AWARD_BASE + 150,
+        awardFacts: NO_FACTS,
+      }).status,
+    ).toBe("awarded");
 
     expect(store.listAwards("alice")).toEqual([
       {
         user_id: "alice",
-        title_key: "v2.example",
-        scope_key: "month:2026-08",
-        earned_at: 150,
-        awarded_at: 200,
+        title_key: "v2.example-monthly",
+        scope_key: monthScope.scopeKey,
+        earned_at: AWARD_BASE + 150,
+        awarded_at: clock,
       },
       {
         user_id: "alice",
         title_key: "v2.example",
         scope_key: "global",
         earned_at: null,
-        awarded_at: 200,
+        awarded_at: clock,
       },
     ]);
   });
 
   it("earned_atはawarded_atより未来にできない（runtime / DB双方）", () => {
     const db = openDb(":memory:");
-    const store = new TitleV2Store(db, () => 200);
+    let clock = AWARD_BASE;
+    const store = new TitleV2Store(db, () => clock);
+    store.applyCatalog({ catalogKey: "v1", actor: "admin" });
+    clock = AWARD_BASE + 200;
+
+    const def = sampleTitle("v2.future", { type: "global" });
+    const scope = resolveTitleScope(store, def, clock);
 
     expect(() =>
-      store.award({ userId: "alice", titleKey: "v2.future", scopeKey: "global", earnedAt: 201 }),
+      store.award({ userId: "alice", titleKey: "v2.future", scope, earnedAt: clock + 1, awardFacts: NO_FACTS }),
     ).toThrow(/cannot be after awardedAt/);
 
     expect(() =>
@@ -163,34 +216,45 @@ describe("称号v2 foundation", () => {
         .prepare(
           "INSERT INTO title_awards (user_id, title_key, scope_key, earned_at, awarded_at) VALUES (?, ?, ?, ?, ?)",
         )
-        .run("alice", "v2.direct", "global", 201, 200),
+        .run("alice", "v2.direct", "global", clock + 1, clock),
     ).toThrow();
   });
 
   it("装備は0〜3枠を本人が選び、未所持は不可・同じ印は別scopeでも1枠だけ", () => {
     const db = openDb(":memory:");
-    const store = new TitleV2Store(db, () => 100);
+    let clock = AWARD_BASE;
+    const store = new TitleV2Store(db, () => clock);
+    store.applyCatalog({ catalogKey: "v1", actor: "admin" });
+    clock = AWARD_BASE + 500_000; // catalog epochよりだいぶ後（8月・9月どちらも施行後）
 
-    store.award({ userId: "alice", titleKey: "v2.moon", scopeKey: "month:2026-08", earnedAt: 90 });
-    store.award({ userId: "alice", titleKey: "v2.moon", scopeKey: "month:2026-09", earnedAt: 95 });
-    store.award({ userId: "alice", titleKey: "v2.table", scopeKey: "global", earnedAt: 96 });
+    const moonDef = sampleTitle("v2.moon", { type: "month" });
+    const tableDef = sampleTitle("v2.table", { type: "global" });
+    const augObservedAt = Math.floor(new Date("2026-08-25T00:00:00+09:00").getTime() / 1000);
+    const sepObservedAt = Math.floor(new Date("2026-09-15T00:00:00+09:00").getTime() / 1000);
+    const augScope = resolveTitleScope(store, moonDef, augObservedAt);
+    const sepScope = resolveTitleScope(store, moonDef, sepObservedAt);
+    const tableScope = resolveTitleScope(store, tableDef, clock);
+
+    store.award({ userId: "alice", titleKey: "v2.moon", scope: augScope, earnedAt: null, awardFacts: NO_FACTS });
+    store.award({ userId: "alice", titleKey: "v2.moon", scope: sepScope, earnedAt: null, awardFacts: NO_FACTS });
+    store.award({ userId: "alice", titleKey: "v2.table", scope: tableScope, earnedAt: null, awardFacts: NO_FACTS });
 
     expect(store.listEquips("alice")).toEqual([]);
-    store.equip("alice", 1, "v2.moon", "month:2026-08");
-    store.equip("alice", 2, "v2.table", "global");
+    store.equip("alice", 1, "v2.moon", augScope.scopeKey);
+    store.equip("alice", 2, "v2.table", tableScope.scopeKey);
     expect(store.listEquips("alice").map((r) => [r.slot, r.title_key, r.scope_key])).toEqual([
-      [1, "v2.moon", "month:2026-08"],
-      [2, "v2.table", "global"],
+      [1, "v2.moon", augScope.scopeKey],
+      [2, "v2.table", tableScope.scopeKey],
     ]);
 
-    store.equip("alice", 3, "v2.moon", "month:2026-09");
+    store.equip("alice", 3, "v2.moon", sepScope.scopeKey);
     expect(store.listEquips("alice").map((r) => [r.slot, r.title_key, r.scope_key])).toEqual([
-      [2, "v2.table", "global"],
-      [3, "v2.moon", "month:2026-09"],
+      [2, "v2.table", tableScope.scopeKey],
+      [3, "v2.moon", sepScope.scopeKey],
     ]);
 
     expect(() => store.equip("alice", 1, "v2.unknown", "global")).toThrow(/unowned/);
-    expect(() => store.equip("alice", 4, "v2.table", "global")).toThrow(/slot/);
+    expect(() => store.equip("alice", 4, "v2.table", tableScope.scopeKey)).toThrow(/slot/);
   });
 
   it("source registryのwriter/caller、またはderivedByは実ファイルに存在する", () => {

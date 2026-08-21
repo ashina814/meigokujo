@@ -27,14 +27,29 @@ export {
   TitleV2Store,
   ensureTitleV2Schema,
   type ApplyCatalogInput,
+  type AwardFactsInput,
+  type AwardResult,
+  type AwardResultStatus,
   type AwardTitleInput,
+  type TitleAwardFactsRow,
   type TitleAwardRow,
   type TitleBaselineRow,
   type TitleBaselineRunRow,
   type TitleCatalogEpochRow,
   type TitleEquipRow,
+  type TitleOwnershipRow,
   type TitleSystemStateRow,
 } from "./v2-store.js";
+
+export {
+  assertValidAwardFacts,
+  assertValidFactsVersion,
+  MAX_AWARD_FACTS_BYTES,
+  MAX_AWARD_FACTS_DEPTH,
+  MAX_AWARD_FACTS_NODES,
+  type JsonValue,
+  type TitleAwardFacts,
+} from "./v2-award-facts.js";
 
 export {
   computeCoPresenceOverlaps,
@@ -90,6 +105,7 @@ export {
   type TitleEvaluationResult,
   type TitleRule,
   type TitleRuleContext,
+  type TitleRuleImplementation,
   type TitleRuleResult,
 } from "./v2-evaluator.js";
 

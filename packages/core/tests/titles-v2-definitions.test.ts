@@ -76,7 +76,10 @@ describe("behavior/meta discriminator（§1）", () => {
       // 「meta titleをevaluateTitle()へ渡せないよう型で分離する」の直接的な証明。
       // TypeScriptを迂回されても、defineTitleRule()内部のdefineBehaviorTitle()が
       // kindを見てruntimeでも拒否する（型だけに依存しない）。
-      const badRule: TitleRule<any> = defineTitleRule(meta, () => ({ matched: true, earnedAt: null }));
+      const badRule: TitleRule<any> = defineTitleRule(meta, {
+        awardFactsVersion: 1,
+        evaluate: () => ({ matched: true, earnedAt: null, awardFacts: {} }),
+      });
       return badRule;
     }).toThrow(/requires kind:"behavior"/);
   });

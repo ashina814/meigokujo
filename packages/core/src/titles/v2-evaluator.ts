@@ -14,6 +14,7 @@ import {
   type TitleMonthSelector,
   type TitleRuleScope,
 } from "./v2-scope.js";
+import { assertValidAwardFacts, assertValidFactsVersion, type TitleAwardFacts } from "./v2-award-facts.js";
 import type { TitleV2Store } from "./v2-store.js";
 
 /**
@@ -28,27 +29,37 @@ export interface TitleRuleContext<S extends readonly TitleUsableSourceKey[]> {
   readonly sources: { readonly [K in S[number]]: TitleSourcePayloads[K] };
 }
 
-export interface TitleRuleResult {
-  readonly matched: boolean;
-  /**
-   * 条件を満たした実時刻。証明できないなら null。
-   * ruleが宣言する全sourceがorderable:trueでない限り、non-nullを返してもevaluateTitle()
-   * がrejectする（§11）。
-   */
-  readonly earnedAt: number | null;
-  /**
-   * award時にpersistする予定の、安全な事実だけ。counterpartのuserId・raw Discord
-   * message ID・channel ID・restricted sourceのidentity・内部SQL rowを入れてはいけない。
-   * sourceのpayload自体は既にsanitize済みだが、payloadを丸ごとcopyしない
-   * ——channelId等、条件判定には要るが公開説明には要らないフィールドをそのまま流さない。
-   * ruleが本当に必要な値だけを組み立てて返すこと。DB永続化は後続PR。
-   */
-  readonly awardFacts?: Readonly<Record<string, unknown>>;
-}
+/**
+ * PR B1: matched:falseとmatched:trueをdiscriminated unionへ分離した。
+ *
+ * - matched:false: earnedAtは常にnull。awardFactsは持たない（＝そもそも「award rowは
+ *   あるがfacts rowが無い」という状態を型の上で作れない）。
+ * - matched:true: earnedAtはorderable契約に従う（§11、evaluateTitle()参照）。
+ *   awardFactsは**必須**——取得理由が特に無い称号でも `awardFacts: {}` を明示的に
+ *   返すこと。counterpartのuserId・raw Discord message ID・channel ID・restricted
+ *   sourceのidentity・内部SQL row・sourceのpayload丸ごとを入れてはいけない
+ *   （v2-award-facts.tsのban listとdoc comment参照）。
+ */
+export type TitleRuleResult =
+  | { readonly matched: false; readonly earnedAt: null }
+  | { readonly matched: true; readonly earnedAt: number | null; readonly awardFacts: TitleAwardFacts };
 
 /** カタログ作者が実装する称号1つぶんの判定ロジック。raw DBへは触れない。 */
 export interface TitleRule<S extends readonly TitleUsableSourceKey[] = readonly TitleUsableSourceKey[]> {
   readonly definition: BehaviorTitleDefinition & { readonly sources: S };
+  /**
+   * awardFacts JSONのschema version。title condition/source/threshold/scopeの変更は
+   * 新title keyで表現するのに対し、awardFacts JSONの**形式だけ**変更したい場合は
+   * このversionを上げる——rule実装側に固定することで、rule.evaluate()の戻り値ごとに
+   * versionを付け忘れる事故を防ぐ。
+   */
+  readonly awardFactsVersion: number;
+  evaluate(context: TitleRuleContext<S>): TitleRuleResult;
+}
+
+/** defineTitleRule()の第2引数。 */
+export interface TitleRuleImplementation<S extends readonly TitleUsableSourceKey[]> {
+  readonly awardFactsVersion: number;
   evaluate(context: TitleRuleContext<S>): TitleRuleResult;
 }
 
@@ -61,10 +72,15 @@ export interface TitleRule<S extends readonly TitleUsableSourceKey[] = readonly 
  */
 export function defineTitleRule<S extends readonly TitleUsableSourceKey[]>(
   definition: BehaviorTitleDefinition & { readonly sources: S },
-  evaluate: (context: TitleRuleContext<S>) => TitleRuleResult,
+  impl: TitleRuleImplementation<S>,
 ): TitleRule<S> {
   const validated = defineBehaviorTitle(definition);
-  return { definition: validated as BehaviorTitleDefinition & { readonly sources: S }, evaluate };
+  assertValidFactsVersion(impl.awardFactsVersion, `title ${definition.key}: awardFactsVersion`);
+  return {
+    definition: validated as BehaviorTitleDefinition & { readonly sources: S },
+    awardFactsVersion: impl.awardFactsVersion,
+    evaluate: impl.evaluate,
+  };
 }
 
 function sourceDefinitionOf(key: TitleUsableSourceKey): TitleSourceDefinition {
@@ -87,7 +103,10 @@ export interface TitleEvaluationResult {
   readonly outcome: TitleAwardOutcome;
   readonly matched: boolean;
   readonly earnedAt: number | null;
-  readonly awardFacts?: Readonly<Record<string, unknown>>;
+  /** matchedのときだけ存在する（TitleRuleResultのdiscriminated unionと同じ形）。 */
+  readonly awardFacts?: TitleAwardFacts;
+  /** outcome==="awarded"のときだけ意味を持つ。そのawardでtitleKeyのownershipが初めて作られたか。 */
+  readonly ownershipCreated?: boolean;
 }
 
 export interface TitleEvaluationOptions {
@@ -110,6 +129,8 @@ export interface TitleEvaluationOptions {
  *   'already_awarded'（保持したまま）、無ければ'skipped'。
  * - source読み込みで例外が起きたら、ここで握り潰さずそのまま呼び出し側へ伝播する
  *   （「条件未達」として誤魔化さない。fail-closed）。
+ * - matchedのawardFactsは、実際にstoreへ書き込むかどうかに関わらずここで検証する
+ *   （retired titleのようにDBへ書かないpathでも、rule実装の不備をfail-closedで検出する）。
  */
 export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
   db: Database.Database,
@@ -135,6 +156,7 @@ export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
     sources: [...rule.definition.sources],
     triggers: [...rule.definition.triggers],
   });
+  assertValidFactsVersion(rule.awardFactsVersion, `title ${definition.key}: awardFactsVersion`);
 
   if (definition.lifecycle === "disabled") {
     // scopeKeyはscope解決前なので不明。disabledは新規評価しない契約のため、
@@ -164,15 +186,12 @@ export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
   }
 
   if (!result.matched) {
-    return {
-      titleKey: definition.key,
-      scopeKey: resolvedScope.scopeKey,
-      outcome: "not_matched",
-      matched: false,
-      earnedAt: null,
-      awardFacts: result.awardFacts,
-    };
+    return { titleKey: definition.key, scopeKey: resolvedScope.scopeKey, outcome: "not_matched", matched: false, earnedAt: null };
   }
+
+  // 「award rowはあるがfacts rowが無い」という状態を作らないため、DBへ書くかどうかに
+  // 関わらずここで必ず検証する（retired titleのpathでもrule実装の不備を検出する）。
+  assertValidAwardFacts(result.awardFacts, `title ${definition.key} awardFacts`);
 
   if (definition.lifecycle === "retired") {
     const outcome: TitleAwardOutcome = store.hasAward(userId, definition.key, resolvedScope.scopeKey)
@@ -188,19 +207,21 @@ export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
     };
   }
 
-  const awarded = store.award({
+  const awardResult = store.award({
     userId,
     titleKey: definition.key,
-    scopeKey: resolvedScope.scopeKey,
+    scope: resolvedScope,
     earnedAt: result.earnedAt,
+    awardFacts: { version: rule.awardFactsVersion, data: result.awardFacts },
   });
   return {
     titleKey: definition.key,
     scopeKey: resolvedScope.scopeKey,
-    outcome: awarded ? "awarded" : "already_awarded",
+    outcome: awardResult.status,
     matched: true,
     earnedAt: result.earnedAt,
     awardFacts: result.awardFacts,
+    ownershipCreated: awardResult.ownershipCreated,
   };
 }
 

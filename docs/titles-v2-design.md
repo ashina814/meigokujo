@@ -195,7 +195,7 @@ lifecycle:
 - `retired`: matchedでも新規awardしない。既存awardは保持する（消さないし増やさない）
 - `active`: 通常通り評価・award可能
 
-awardは `TitleV2Store.award()` の `(user_id, title_key, scope_key)` 冪等性にそのまま乗る。同じevaluationを何度reconcileしても二重awardしないし、既存awardをreconcile時刻等で上書きしない。
+awardは `TitleV2Store.award()` の `(user_id, title_key, scope_key)` 冪等性にそのまま乗る。同じevaluationを何度reconcileしても二重awardしないし、既存awardをreconcile時刻等で上書きしない。matchedの`TitleRuleResult`は`awardFacts`が必須（discriminated union、§5参照）——`evaluateTitle()`はDBへ書くかどうかに関わらずこれを検証する。実際のaward/facts/ownershipの原子的な永続化はPR B1で完成した（§5参照）。
 
 ### behavior / meta の分離（PR A、v2 contract v3）
 
@@ -274,12 +274,12 @@ Collection Editionはtitle catalogとは別概念。`TitleCollectionEdition`（`
 - `assertCollectionEditionActivatable()`: `assertValidCollectionEdition()` を先に通した上で、**「今このeditionを新規activateしてよいか」**を追加で検証する——collectionCredit/fullClearRequiredの少なくとも一方がtrueなmemberは、definition.lifecycleが現在`"active"`であることを要求する。historical closed editionはこの関数を通す必要は無い。
 - `countableCount`（collectionCredit:trueなmember数）・`countableThemes`（collectionCredit:trueなmemberのdistinct themeKey数——collectionCredit:falseのmemberのthemeは数えない）を基準に: `startedCollecting>=1`、`startedCollecting < collectorHabit < stillCollecting`、`stillCollecting <= thousandMarks.count <= countableCount`、`thousandMarks.themes>=1`、`thousandMarks.themes <= countableThemes`、`thousandMarks.themes <= thousandMarks.count`、`almostComplete.remaining>=1`、`almostComplete.remaining < fullClearCount`（full-clear必須総数）
 
-### Rarity契約の最低限（PR A）
+### Rarity契約の最低限（PR A・DB永続化はPR B1）
 
-`packages/core/src/titles/v2-rarity.ts` に型だけを置く（DB/計算本体は後続PR）。
+`packages/core/src/titles/v2-rarity.ts` に契約の型を置く（current rarityの計算本体・UI表示は後続PR）。
 
-- **current rarity**: 現在の所持者状況から動的に変化する。永続化しない。titleKey単位——scopeKeyをidentityにしない。
-- **acquisition-time rarity**: award時点でsnapshotし、以後不変。**このtitleKeyを最初に獲得した（=最初のownership成立）ときのみ**作る——月/eventで同じtitleKeyを別scopeで繰り返しaward（再獲得）しても、`acquisitionSequence` は増やさない・snapshotを作り直さない。最初に獲得したscopeは `firstScopeKey` として証跡だけ保持する（rarityのidentityそのものではない）。
+- **current rarity**: 現在の所持者状況から動的に変化する。永続化しない。titleKey単位——scopeKeyをidentityにしない。current guild membershipを使った計算は今回もしない。
+- **acquisition-time rarity**: award時点でsnapshotし、以後不変。**このtitleKeyを最初に獲得した（=最初のownership成立）ときのみ**作る——月/eventで同じtitleKeyを別scopeで繰り返しaward（再獲得）しても、`acquisitionSequence` は増やさない・snapshotを作り直さない。最初に獲得したscopeは `firstScopeKey` として証跡だけ保持する（rarityのidentityそのものではない）。PR B1でこの契約を `title_ownerships`（`acquisition_sequence` / `holder_count_at_acquisition`）として実際にDB永続化した（§5参照）。
 - 非orderableなsourceに依存するtitleが存在するため「真のN人目」を断定できない。`acquisitionSequence` は「Botがtitleの最初のownershipを確定した処理順」（刻印順）であって、実際に条件を満たした時系列順の証明ではない。
 
 ## 4. SYSTEM_EPOCH / CATALOG_EPOCH
@@ -307,12 +307,24 @@ baseline snapshot・SYSTEM_EPOCH初回確定・CATALOG_EPOCH確定は**同じ `B
 
 CATALOG_EPOCHは過去方向へ巻き戻せない。第II期を追加しても、第I期から継続する称号は第I期の起点を使い続け、累積をリセットしない。
 
-## 5. Award
+## 5. Award / Ownership / Award Facts（PR B1）
 
-awardの一意性は次で持つ。
+「称号を一度獲得した事実」「所持そのもの」「取得時の理由」を、3つの別テーブルへ分離して永続化する（`packages/core/src/titles/v2-store.ts`）。この3つを混同しない。
+
+- **award**（`title_awards`）: scopeごとの取得出来事。同じtitleが月次/eventで何度もawardされ得る——`(user_id, title_key, scope_key)` の一意性を持つ。
+- **award facts**（`title_award_facts`）: 取得時点のsafe snapshot。award 1行につき1行、immutable——一度INSERTしたら書き換えない。「award rowはあるがfacts rowが無い」状態を正常とみなさない（後述のintegrity）。
+- **ownership**（`title_ownerships`）: titleKeyそのものの永久所持。`(user_id, title_key)` で1行だけ——同じtitleを別scopeで何度再獲得してもownershipは増えない。award行から見て、そのuserがそのtitleKeyを**最初に**獲得したawardだけがownershipの`first_scope_key`になる。
+
+award一意性:
 
 ```text
 (user_id, title_key, scope_key)
+```
+
+ownership一意性:
+
+```text
+(user_id, title_key)
 ```
 
 scope例（`resolveTitleScope()` が生成するcanonical形。`catalogKey`はtitle definitionの `catalog` から取る。呼び出し側は組み立てられない）:
@@ -331,7 +343,46 @@ event:v1:summer-2026
 
 reconcile時刻を `earned_at` として捏造しない。取得順は `earned_at` が正確に分かる称号だけ出す。
 
-`earned_at > awarded_at` は意味矛盾なので、runtimeとDB `CHECK` の両方で拒否する。
+`earned_at > awarded_at` は意味矛盾なので、runtimeとDB `CHECK` の両方で拒否する。加えて、`earned_at` が非nullなら、その値は該当awardの`ResolvedTitleScope`の窓 `[start, effectiveEnd)` に収まっていることをStoreでも検証する（`resolvedScopeEffectiveEnd()`）——zero-width scope（`start===effectiveEnd`）では、この条件を満たすearned_atが存在し得ないため、非nullなearned_atは常にrejectされる。
+
+### `Store.award()` はraw scopeKeyを受け取らない
+
+`AwardTitleInput.scope` は `string` ではなく、`resolveTitleScope()` が作った branded `ResolvedTitleScope` を要求する。`award()` の入口で必ず `assertResolvedTitleScope()` を実行する——callerからscope構築権限を奪ったPR Aの境界を、Store側でも完成させる。手書きのplain objectを `as any` で渡してもruntimeでrejectされる。
+
+### atomicity
+
+`Store.award()` は1回の呼び出しで、単一の `BEGIN IMMEDIATE` transaction内に以下を確定する（途中で1つでも失敗したら全部rollback）。
+
+1. `title_awards` へ `(user_id, title_key, scope_key)` 冪等insert
+2. **新規award**なら `title_award_facts` へsnapshotをinsert
+3. そのtitleKeyの**first ownership**なら、rarity sequenceを1つ消費して `title_ownerships` をinsert
+
+冪等呼び出し（既にaward済みの`(user,title,scope)`への再award）は、facts・ownership・rarity sequenceのいずれも一切変更しない——先に成立したsnapshotが勝つ。`Store.award()` は外側transaction内から呼べない（`applyCatalog()` と同じ理由でfail-closedする）。
+
+### Award Facts JSON validator（`v2-award-facts.ts`）
+
+`facts_json` はそのまま `JSON.stringify()` するだけでなく、award時にruntime validationを行う。
+
+- 許可: `null` / `boolean` / finite number / string / array / plain JSON object
+- 拒否: `undefined` / function / symbol / bigint / `NaN` / `Infinity` / `-Infinity` / `Date` / class instance / circular reference
+- 上限: シリアライズ後 <= 4096 bytes、深さ <= 4、node数 <= 256
+- defense-in-depthとして、明白なidentity-bearing key（`userId` / `user_id` / `counterpartUserId` / `counterpart_user_id` / `channelId` / `channel_id` / `messageId` / `message_id`）と、prototype pollution系key（`__proto__` / `prototype` / `constructor`）をexact matchで拒否する
+
+generic validatorだけでprivacyを完全保証できないことは明記しておく。`{ friend: "Alice" }` はJSONとして合法なので、validatorだけではidentity leakを完全には防げない。主防御はsafe source境界（`v2-sources.ts` の `titleUsable`/`privacy` 契約）・rule review・awardFactsを必要最小限へ翻訳することであり、validatorはその最後の砦にすぎない。
+
+`TitleRuleResult`（`v2-evaluator.ts`）はmatched:false / matched:trueのdiscriminated unionへ分離した。matched:trueは`awardFacts`が**必須**——取得理由が特に無い称号でも`awardFacts: {}`を明示的に返す。これにより「award rowはあるがfacts rowが無い」正常状態を型の上でも作れなくしている。
+
+facts JSONのschema変更（`facts_version`）は、title condition/source/threshold/scope変更（新title key）とは別軸で管理する。`TitleRule.awardFactsVersion`（`defineTitleRule()`の第2引数）に固定し、rule実装の戻り値ごとに付け忘れる事故を防ぐ。
+
+### Rarity sequence
+
+`title_rarity_sequences`（`title_key` PRIMARY KEY、`last_sequence`）が、titleKeyごとのfirst ownership発番counterを持つ。`SELECT MAX(...)+1` のような素朴な処理ではなく、単一rowをUPDATEすることでIMMEDIATE transactionのシリアライズに乗せる。first ownershipを作るときだけsequenceを消費する——同じuserが同titleを別scopeで再awardしても増えない。
+
+`holder_count_at_acquisition` は「そのtransaction時点でDBに記録されていたtitle ownership数（今回のfirst ownershipを含む）」であり、current guild membershipを使った将来のactive population計算とは別概念——今回は勝手に実装しない。
+
+### Migration / Integrity
+
+v2はまだ本番wiringされていないため、過去のfoundation award（facts/ownershipテーブル導入前に作られたaward行）のfactsをでっち上げて自動backfillしない。`title_awards` にrowがあるのに対応する `title_award_facts` / `title_ownerships` が無い状態を検出したら、明示的なintegrity errorとしてfail-closedする——「本当の取得理由が無いのにあることにする」より安全という判断。旧foundation形式のaward rowが存在するDBでは、このmigration guardが発火する。
 
 ## 6. 即時判定 + reconcile
 
