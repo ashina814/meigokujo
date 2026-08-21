@@ -279,6 +279,7 @@ export {
   type TitleEvaluationOptions,
   type TitleEvaluationResult,
   type TitleEventScopeProvider,
+  type TitleMonthSelector,
   type TitleScopePolicy,
   // 旧v1のTitleRuleと名前が衝突するためV2を付けてalias。
   type TitleRule as TitleV2Rule,

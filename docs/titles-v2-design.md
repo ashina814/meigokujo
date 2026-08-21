@@ -224,12 +224,14 @@ awardは `TitleV2Store.award()` の `(user_id, title_key, scope_key)` 冪等性�
 
 scope policyの意味はreleased title semanticの一部——resolverのsemanticを後から変えると、既存titleのaward境界が過去に遡って変わってしまうため変更しない。
 
-**callerは `TitleEvaluationScope` を自由に組み立てられない。** `packages/core/src/titles/v2-scope.ts` の `resolveTitleScope(store, definition, observedAt, eventProvider?)` だけが `ResolvedTitleScope` を作る唯一のAPI。callerが渡すのは `observedAt` だけで、scopeKey・window境界は必ずここで計算する。
+**callerは `TitleEvaluationScope` を自由に組み立てられない。** `packages/core/src/titles/v2-scope.ts` の `resolveTitleScope(store, definition, observedAt, options?)` だけが `ResolvedTitleScope` を作る唯一のAPI。callerが渡すのは `observedAt` と、必要なら `{ eventProvider?, monthSelector? }` だけで、scopeKey・window境界は必ずここで計算する。
 
-- `ResolvedTitleScope` は module-private な `unique symbol` でbrandされている。他コードが手書きした `{ scopeKey: "...", start: ... }` はこの型に**構造的に合致しない**（TypeScriptの型エラー）。`as unknown as ResolvedTitleScope` で型を迂回されても、実際のsymbol propertyは存在しないため、`assertResolvedTitleScope()`（`readTitleSource()` の入口で必ず呼ばれる）がruntimeで検出する——型だけでなくruntimeでもscope forgeryをfail-closedにする。
+- `ResolvedTitleScope` は module-private な `unique symbol` でbrandされている。他コードが手書きした `{ scopeKey: "...", start: ... }` はこの型に**構造的に合致しない**（TypeScriptの型エラー）。`as unknown as ResolvedTitleScope` で型を迂回されても、実際のsymbol propertyは存在しないため、`assertResolvedTitleScope()`（`readTitleSource()` の入口、および `TitleSourceCache.get()` の入口——cache hit経由でも必ず検証する）がruntimeで検出する——型だけでなくruntimeでもscope forgeryをfail-closedにする。cache hitのときだけbrand検証を飛ばすと、legitimateなscopeと全く同じfields（scopeKey/start/endExclusive/observedAt）を持つ偽造scopeがcache keyだけで「なりすまして」通ってしまうため、hit/miss両方の経路で検証する。
 - `endExclusive: number | null` でopen-endedを明示する。`Number.MAX_SAFE_INTEGER` 等で偽装しない。sourceを読む実効的な終端は `effectiveEnd = min(endExclusive ?? observedAt, observedAt)`（`resolvedScopeEffectiveEnd()`）——open-endedなscopeは常に `observedAt` が上限になる。
 - `catalog` / `month` / `event` はCATALOG_EPOCHの解決が必要。meta titleは `catalog` を持たないため、`global` 以外のscope policyを解決しようとするとfail-closedする（`defineMetaTitle()` が構築時点で既に拒否する。resolver側も二重に守る）。
-- `event` scopeはcanonical event infrastructureがまだ無いため、`TitleEventScopeProvider` の差し込みが無いと解決できずfail-closedする。`eventKey` はcallerが自由に渡せず、`definition.scope.eventKey` にpolicy自体として固定してある。
+- `event` scopeはcanonical event infrastructureがまだ無いため、`TitleEventScopeProvider` の差し込みが無いと解決できずfail-closedする。`eventKey` はcallerが自由に渡せず、`definition.scope.eventKey` にpolicy自体として固定してある。provider が返す `{ start, completedAt }` は resolver が整数性・`start < completedAt`・CATALOG_EPOCHでclipした後も `start < completedAt` であること・`completedAt <= observedAt`（＝eventが観測時点までに完了していること）を検証する——**未完了のeventを部分windowでawardしない**。
+- `observedAt` がresolved scopeの `start` より前になることはfail-closedする（`resolveTitleScope` 内の共通チェック）。ただし `start === observedAt`（例: CATALOG_EPOCHちょうどの瞬間の評価）のようなzero-width windowはエラーにしない——「まだ何も観測していない」という正常な状態として扱い、VC derived source層（`vc/derived.ts`）の `clampWindow()` が `start>=end` でthrowしてしまう手前で、v2-sources.ts側が0件payloadを返す。
+- `month` scope policyは通常 `observedAt` が属するJST暦月をそのまま使う（`monthSelector` 省略時 = `{type:"current"}`）。日次reconcileが「月をまたいだ後に前月分を修復する」ような historical reconcile を行いたい場合は `{ monthSelector: { type: "specific", month: "YYYY-MM" } }` を渡す——`observedAt` の意味（実際の観測上限）自体は変えず、対象月だけを明示的に選べる。`month` labelは厳格に `/^\d{4}-(0[1-9]|1[0-2])$/` でvalidateし、対象月が丸ごとCATALOG_EPOCHより前ならreject、未来の月を指定すれば通常の `observedAt < start` fail-closedに引っかかる。
 - scopeKeyはcanonical生成のみ: `global` / `catalog:<catalogKey>` / `month:<catalogKey>:<YYYY-MM>` / `event:<catalogKey>:<eventKey>`。`catalogKey`・`eventKey`・`themeKey`・`groupKey`・`progression.seriesKey` はすべて `assertSlug()`（lowercase英数字・`-`・`_`のみ）でvalidateし、`:`や空白を許可しない——scopeKeyの文字列結合が曖昧にならないようにするため。
 
 ### Theme / Group / Progression（PR A）
@@ -246,23 +248,29 @@ scope policyの意味はreleased title semanticの一部——resolverのsemanti
 
 title definitionsを自動走査して「現在存在するstage全部」を一門皆伝（mastery）対象にする方式は禁止。`TitleSeriesManifest`（`packages/core/src/titles/v2-series.ts`）がimmutableなmember一覧を持つ——後からstage5を追加しても既存manifestのmembersは書き換えず、新しいmanifestを作る。
 
-`assertValidSeriesManifest()` が検証する内容: members>=2、member titleの実在、同一catalog/theme/group、全memberが対象seriesのprogressionを宣言していること、stageの重複・欠番禁止（1始まりの連番）。`assertNoOverlappingSeriesMembership()` が、1 titleが複数seriesへ所属していないかをmanifest横断で検証する。
+`assertValidSeriesManifest()` が検証する内容: members>=2、member titleの実在、同一catalog/theme/group、全memberが対象seriesのprogressionを宣言していること、stageの重複・欠番禁止（1始まりの連番）。`assertNoOverlappingSeriesMembership()` が、manifest横断で(a) 1 titleが複数seriesへ所属していないか、(b) 同一 `(catalog, seriesKey)` を名乗るmanifestが複数存在しないか（後からstageを追加する場合は「新しいmanifest」を作る契約——旧manifestと新manifestが同じidentityのまま並存することを許さない）を検証する。
 
 ### Collection / Full-clear Manifest（PR A）
 
-Collection Editionはtitle catalogとは別概念。`TitleCollectionEdition`（`packages/core/src/titles/v2-collection.ts`）が `editionKey` と `members`（`titleKey` / `themeKey` / `collectionCredit` / `fullClearRequired`）、およびedition固有の `milestones`（`thousandMarks.count`/`themes` 等）を持つ。旧 `countsForCompletion` のようにtitle definition自身へCollection Credit / Full-clear Requiredを持たせない。
+Collection Editionはtitle catalogとは別概念。`TitleCollectionEdition`（`packages/core/src/titles/v2-collection.ts`）が `editionKey` と `members`（`titleKey` / `themeKey` / `collectionCredit` / `fullClearRequired`）、およびedition固有の `milestones`（`thousandMarks.count`/`themes` 等）を持つ。旧 `countsForCompletion` のようにtitle definition自身へCollection Credit / Full-clear Requiredを持たせない。**意図的に `catalog` フィールドを持たない**——collection editionは将来的に複数catalog（第I期・第II期等）由来のbehavior titleを1つのfull-clear editionへ束ねる必要があるため、editionそのものを単一catalogへ拘束しない（memberごとにtitleKeyからdefinitionを引いてthemeKey整合性等を検証すれば足りる）。
 
 《千印万来》《万印皆伝》のようなmeta titleのsemanticは、絶対的な閾値をmeta title自身に持たせず「有効なcollection/full-clear editionのmilestone policyを満たしたか」とする——catalog規模が変われば新しいeditionを作ればよく、meta title自体のkeyや判定ロジックを変えなくて済む。
 
-`assertValidCollectionEdition()` が検証する内容: member重複禁止、member titleの実在、themeKeyの一致、meta titleをfullClearRequiredにできない、fullClearRequired memberが最低1件、milestone値の非負整数チェック、`thousandMarks.themes` が数えられるtheme数を超えない、`almostComplete.remaining` がfull-clear必須総数未満であること。
+`assertValidCollectionEdition()` が検証する内容:
+
+- member重複禁止・member titleの実在・themeKeyの一致
+- **meta titleはcollectionCredit/fullClearRequiredのどちらにもできない**（meta titleはcollection/full-clearの分母・分子どちらへも入らない——meta title自体が「有効なcollection editionを満たしたか」を判定する側であり、判定対象の一部を兼ねると自己参照的になるため）
+- fullClearRequired memberが最低1件
+- milestone値はすべて非負整数
+- `countableCount`（collectionCredit:trueなmember数）・`countableThemes`（collectionCredit:trueなmemberのdistinct themeKey数——collectionCredit:falseのmemberのthemeは数えない）を基準に: `startedCollecting>=1`、`startedCollecting < collectorHabit < stillCollecting`、`stillCollecting <= thousandMarks.count <= countableCount`、`thousandMarks.themes>=1`、`thousandMarks.themes <= countableThemes`、`thousandMarks.themes <= thousandMarks.count`、`almostComplete.remaining>=1`、`almostComplete.remaining < fullClearCount`（full-clear必須総数）
 
 ### Rarity契約の最低限（PR A）
 
 `packages/core/src/titles/v2-rarity.ts` に型だけを置く（DB/計算本体は後続PR）。
 
-- **current rarity**: 現在の所持者状況から動的に変化する。永続化しない。
-- **acquisition-time rarity**: award時点でsnapshotし、以後不変。
-- 非orderableなsourceに依存するtitleが存在するため「真のN人目」を断定できない。`acquisitionSequence` は「Botがownershipを確定した処理順」（刻印順）であって、実際に条件を満たした時系列順の証明ではない。
+- **current rarity**: 現在の所持者状況から動的に変化する。永続化しない。titleKey単位——scopeKeyをidentityにしない。
+- **acquisition-time rarity**: award時点でsnapshotし、以後不変。**このtitleKeyを最初に獲得した（=最初のownership成立）ときのみ**作る——月/eventで同じtitleKeyを別scopeで繰り返しaward（再獲得）しても、`acquisitionSequence` は増やさない・snapshotを作り直さない。最初に獲得したscopeは `firstScopeKey` として証跡だけ保持する（rarityのidentityそのものではない）。
+- 非orderableなsourceに依存するtitleが存在するため「真のN人目」を断定できない。`acquisitionSequence` は「Botがtitleの最初のownershipを確定した処理順」（刻印順）であって、実際に条件を満たした時系列順の証明ではない。
 
 ## 4. SYSTEM_EPOCH / CATALOG_EPOCH
 

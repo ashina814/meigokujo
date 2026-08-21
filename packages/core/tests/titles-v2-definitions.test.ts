@@ -105,6 +105,12 @@ describe("behavior title guard（§3, §6）", () => {
     expect(() => defineBehaviorTitle(validBehavior({ triggers: ["daily", "daily"] }))).toThrow(/duplicate trigger/);
   });
 
+  it("TypeScriptを迂回した未知のtriggerをruntimeで拒否する", () => {
+    expect(() =>
+      defineBehaviorTitle(validBehavior({ triggers: ["totally_unknown_trigger" as never] })),
+    ).toThrow(/invalid trigger/);
+  });
+
   it("progressionのseriesKeyはslug、stageは1始まりの正整数", () => {
     expect(() =>
       defineBehaviorTitle(validBehavior({ progression: { seriesKey: "bad key", stage: 1 } })),
@@ -148,6 +154,7 @@ describe("scope policy validation（§5, §6）", () => {
   it("themeKey/groupKey/catalog/eventKeyはslugでなければ拒否する（コロンや空白を許可しない）", () => {
     expect(() => defineBehaviorTitle(validBehavior({ themeKey: "bad:theme" }))).toThrow(/must be a slug/);
     expect(() => defineBehaviorTitle(validBehavior({ groupKey: "bad group" }))).toThrow(/must be a slug/);
+    expect(() => defineBehaviorTitle(validBehavior({ catalog: "bad:catalog" }))).toThrow(/must be a slug/);
     expect(() => defineBehaviorTitle(validBehavior({ scope: { type: "event", eventKey: "bad:key" } }))).toThrow(
       /must be a slug/,
     );

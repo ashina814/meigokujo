@@ -99,6 +99,12 @@ describe("series manifest validation（§9）", () => {
     expect(() => assertValidSeriesManifest(manifestOf(members), members)).toThrow(/different groupKey/);
   });
 
+  it("manifest.catalogはslugでなければ拒否する", () => {
+    const members = validLadder();
+    const manifest = { ...manifestOf(members), catalog: "bad:catalog" };
+    expect(() => assertValidSeriesManifest(manifest, members)).toThrow(/must be a slug/);
+  });
+
   it("catalogが異なるmemberをreject", () => {
     const members = validLadder();
     members[1] = stage("v2.test.ignite-2", {
@@ -134,6 +140,21 @@ describe("series manifest validation（§9）", () => {
       members: [...manifestOf(otherLadder).members, members[0]!.key],
     };
     expect(() => assertNoOverlappingSeriesMembership([seriesA, seriesB])).toThrow(/belongs to multiple series/);
+  });
+
+  it("同一(catalog, seriesKey)を名乗るmanifestが複数存在することをreject（memberが重複していなくても）", () => {
+    const members = validLadder();
+    const original: TitleSeriesManifest = manifestOf(members);
+    // stage4を追加した「新しい」manifestのつもりで作ったが、同じ(catalog, seriesKey)を
+    // 名乗ったまま元のmanifestと並存させてしまった——想定される事故パターン。
+    const stage4 = stage("v2.test.ignite-4", { progression: { seriesKey: "vc_ignite_main", stage: 4 } });
+    const wronglyCoexisting: TitleSeriesManifest = {
+      ...original,
+      members: [...original.members, stage4.key],
+    };
+    expect(() => assertNoOverlappingSeriesMembership([original, wronglyCoexisting])).toThrow(
+      /series identity \(catalog, seriesKey\) is used by multiple manifests/,
+    );
   });
 
   it("後からstage4を追加しても、既存manifestのmembersは変えない（immutable運用の確認）", () => {

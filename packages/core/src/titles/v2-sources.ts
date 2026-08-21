@@ -92,28 +92,42 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
     return { events: rows.map((r) => r.created_at) };
   },
   vc_empty_start_then_joined: (db, userId, scope) => {
-    const window = { start: scope.start, end: resolvedScopeEffectiveEnd(scope), observedAt: scope.observedAt };
+    // CATALOG_EPOCH===observedAt等、正常なzero-width window（start===effectiveEnd）は
+    // computeXxx()側のclampWindow()が`start>=end`としてRangeErrorを投げてしまう——
+    // これは「不正なwindow」ではなく「まだ何も観測していない」という正常な状態なので、
+    // vc/derived.tsへは触れず、ここで0件payloadとして扱う。
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return { facts: [] };
+    const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
     const facts = computeEmptyStartThenJoined(db, window, [userId]);
     return {
       facts: facts.map((f) => ({ visitStartedAt: f.visitStartedAt, joinedAt: f.joinedAt, channelId: f.channelId })),
     };
   },
   vc_last_occupant: (db, userId, scope) => {
-    const window = { start: scope.start, end: resolvedScopeEffectiveEnd(scope), observedAt: scope.observedAt };
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return { facts: [] };
+    const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
     const facts = computeLastOccupant(db, window, [userId]);
     return { facts: facts.map((f) => ({ becameLastAt: f.becameLastAt, channelId: f.channelId })) };
   },
   vc_group_size_seconds: (db, userId, scope) => {
-    const window = { start: scope.start, end: resolvedScopeEffectiveEnd(scope), observedAt: scope.observedAt };
+    const empty = { trustedSecondsByBucket: { solo: 0, oneToOne: 0, smallGroup: 0, largeGroup: 0 }, untrustedSeconds: 0 } as const;
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return empty;
+    const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
     const rows = computeGroupSizeSeconds(db, window, [userId]);
     const row = rows.find((r) => r.userId === userId);
     return {
-      trustedSecondsByBucket: row?.trustedSecondsByBucket ?? { solo: 0, oneToOne: 0, smallGroup: 0, largeGroup: 0 },
+      trustedSecondsByBucket: row?.trustedSecondsByBucket ?? empty.trustedSecondsByBucket,
       untrustedSeconds: row?.untrustedSeconds ?? 0,
     };
   },
   vc_social_safe: (db, userId, scope) => {
-    const window = { start: scope.start, end: resolvedScopeEffectiveEnd(scope), observedAt: scope.observedAt };
+    const empty = { distinctCoPresentUsers: 0, maxRepeatedDaysWithOneCounterpart: 0, trustedOverlapSeconds: 0 } as const;
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return empty;
+    const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
     const rows = computeSafeSocialAggregates(db, window, [userId]);
     const row = rows.find((r) => r.userId === userId);
     return {
@@ -201,6 +215,12 @@ export class TitleSourceCache {
     userId: string,
     scope: ResolvedTitleScope,
   ): TitleSourcePayloads[K] {
+    // cache hitはreadTitleSource()を経由しない——brand検証をcache miss側だけに任せると、
+    // 正規のscopeで一度cacheされたキーと同じ (userId, sourceKey, scopeKey, start,
+    // endExclusive, observedAt) を持つ「偽造scope」を渡した2回目の呼び出しが、
+    // assertResolvedTitleScope()を一度も通らずcacheの値をそのまま受け取れてしまう。
+    // hit/miss どちらの経路でも必ずbrandを検証する。
+    assertResolvedTitleScope(scope);
     const key = [userId, sourceKey, scope.scopeKey, scope.start, scope.endExclusive, scope.observedAt].join(" ");
     if (this.cache.has(key)) return this.cache.get(key) as TitleSourcePayloads[K];
     const value = readTitleSource(db, sourceKey, userId, scope);

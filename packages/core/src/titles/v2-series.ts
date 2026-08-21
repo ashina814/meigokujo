@@ -34,7 +34,7 @@ export function assertValidSeriesManifest(
   memberDefinitions: readonly BehaviorTitleDefinition[],
 ): void {
   assertSlug(manifest.seriesKey, `series manifest seriesKey`);
-  if (!manifest.catalog.trim()) throw new Error(`series ${manifest.seriesKey}: catalog is required`);
+  assertSlug(manifest.catalog, `series ${manifest.seriesKey}: catalog`);
   if (manifest.members.length < 2) {
     throw new Error(`series ${manifest.seriesKey}: must have at least 2 members`);
   }
@@ -90,11 +90,28 @@ export function assertValidSeriesManifest(
 }
 
 /**
- * 複数manifestを横断して「1 titleが複数seriesへ所属していないか」を検証する。
- * 単一manifest内の重複は assertValidSeriesManifest() が既に見ているので、
- * これは別seriesどうしの重複だけを見る。
+ * 複数manifestを横断して以下を検証する。
+ *
+ * - 「1 titleが複数seriesへ所属していないか」（単一manifest内の重複は
+ *   assertValidSeriesManifest() が既に見ているので、これは別seriesどうしの重複だけを見る）
+ * - 同一 (catalog, seriesKey) を名乗るmanifestが複数存在しないか——後からstageを
+ *   追加する場合は「新しいmanifest」を作る契約（§9）なので、同じidentityの
+ *   manifestが2つ同時に存在すること自体を許さない。既存manifestへ追加する場合は
+ *   同じ (catalog, seriesKey) を持つ**単一の**新オブジェクトへ置き換えること
+ *   （旧オブジェクトと新オブジェクトを両方とも「有効なmanifest」として登録しない）。
  */
 export function assertNoOverlappingSeriesMembership(manifests: readonly TitleSeriesManifest[]): void {
+  const identitySeen = new Set<string>();
+  for (const manifest of manifests) {
+    const identity = `${manifest.catalog} ${manifest.seriesKey}`;
+    if (identitySeen.has(identity)) {
+      throw new Error(
+        `series identity (catalog, seriesKey) is used by multiple manifests: ${manifest.catalog}/${manifest.seriesKey}`,
+      );
+    }
+    identitySeen.add(identity);
+  }
+
   const owner = new Map<string, string>();
   for (const manifest of manifests) {
     for (const key of manifest.members) {

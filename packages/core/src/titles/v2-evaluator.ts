@@ -7,7 +7,13 @@ import {
   type TitleUsableSourceKey,
 } from "./v2-contract.js";
 import { TitleSourceCache, type TitleSourcePayloads } from "./v2-sources.js";
-import { resolveTitleScope, toRuleScope, type TitleEventScopeProvider, type TitleRuleScope } from "./v2-scope.js";
+import {
+  resolveTitleScope,
+  toRuleScope,
+  type TitleEventScopeProvider,
+  type TitleMonthSelector,
+  type TitleRuleScope,
+} from "./v2-scope.js";
 import type { TitleV2Store } from "./v2-store.js";
 
 /**
@@ -76,8 +82,8 @@ export type TitleAwardOutcome = "awarded" | "already_awarded" | "not_matched" | 
 
 export interface TitleEvaluationResult {
   readonly titleKey: string;
-  /** disabled titleはscopeを解決しないため空文字列。それ以外は必ずresolveTitleScope()由来。 */
-  readonly scopeKey: string;
+  /** disabled titleはscopeを解決しないためnull。それ以外は必ずresolveTitleScope()由来。 */
+  readonly scopeKey: string | null;
   readonly outcome: TitleAwardOutcome;
   readonly matched: boolean;
   readonly earnedAt: number | null;
@@ -88,6 +94,8 @@ export interface TitleEvaluationOptions {
   readonly cache?: TitleSourceCache;
   /** event scope policyを使うruleを評価する場合に必須。無ければfail-closedする。 */
   readonly eventProvider?: TitleEventScopeProvider;
+  /** month scope policyの対象月。省略時は`{type:"current"}`（observedAtが属する月）。 */
+  readonly monthSelector?: TitleMonthSelector;
 }
 
 /**
@@ -130,11 +138,15 @@ export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
 
   if (definition.lifecycle === "disabled") {
     // scopeKeyはscope解決前なので不明。disabledは新規評価しない契約のため、
-    // scopeKeyを持たない'skipped'として返す（storeへは一切触れない）。
-    return { titleKey: definition.key, scopeKey: "", outcome: "skipped", matched: false, earnedAt: null };
+    // scopeKeyを持たない'skipped'として返す（storeへは一切触れない）。空文字列は
+    // 「globalなど何らかのscopeKeyが空である」と誤読され得るため、明示的にnullにする。
+    return { titleKey: definition.key, scopeKey: null, outcome: "skipped", matched: false, earnedAt: null };
   }
 
-  const resolvedScope = resolveTitleScope(store, definition, observedAt, options.eventProvider);
+  const resolvedScope = resolveTitleScope(store, definition, observedAt, {
+    eventProvider: options.eventProvider,
+    monthSelector: options.monthSelector,
+  });
   const cache = options.cache ?? new TitleSourceCache();
 
   const sources = {} as { [K in S[number]]: TitleSourcePayloads[K] };

@@ -72,6 +72,11 @@ export function assertResolvedTitleScope(scope: ResolvedTitleScope): void {
 /**
  * sourceの読み込み境界（v2-sources.ts）で使う実効的な終端。open-endedなscopeは
  * observedAtまでしか見ていないため、そこが上限になる。
+ *
+ * CATALOG_EPOCH===observedAt（施行直後の瞬間評価）のように、start===effectiveEndの
+ * zero-width windowは正常に起こり得る——その場合は「まだ何も観測していない」という
+ * 意味で、呼び出し側（v2-sources.ts）は0件のpayloadを返すこと。resolveTitleScope()
+ * がobservedAt<startをfail-closedしているため、effectiveEnd<startにはならない。
  */
 export function resolvedScopeEffectiveEnd(scope: ResolvedTitleScope): number {
   return scope.endExclusive === null ? scope.observedAt : Math.min(scope.endExclusive, scope.observedAt);
@@ -103,20 +108,53 @@ export interface TitleEventScopeProvider {
   resolveEvent(catalogKey: string, eventKey: string): { readonly start: number; readonly completedAt: number } | null;
 }
 
+/**
+ * `scope.type==="month"` を解決するとき、どの暦月を対象にするかを指定する。
+ *
+ * デフォルト（省略時）は `{ type: "current" }`——observedAtが属する暦月をそのまま使う、
+ * これまでの挙動。`{ type: "specific"; month }` は日次reconcile等が「9月になってから
+ * 8月分を修復する」ような historical reconcile を行うための入口——observedAtの意味
+ * （実際の観測上限）自体は変えない。callerが渡せるのは対象月のlabelだけで、
+ * scopeKey/start/endExclusiveそのものは相変わらずresolverだけが計算する。
+ */
+export type TitleMonthSelector = { readonly type: "current" } | { readonly type: "specific"; readonly month: string };
+
+const MONTH_LABEL_PATTERN = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+function assertMonthLabel(value: string, label: string): void {
+  if (typeof value !== "string" || !MONTH_LABEL_PATTERN.test(value)) {
+    throw new Error(`${label} must be a "YYYY-MM" month label: ${JSON.stringify(value)}`);
+  }
+}
+
+export interface TitleScopeResolutionOptions {
+  /** event scope policyを使うruleを評価する場合に必須。無ければfail-closedする。 */
+  readonly eventProvider?: TitleEventScopeProvider;
+  /** month scope policyの対象月。省略時は`{type:"current"}`（observedAtが属する月）。 */
+  readonly monthSelector?: TitleMonthSelector;
+}
+
 const JST_OFFSET_SEC = 9 * 3600;
 
-/** 与えたunix秒が属するJST暦月の [開始, 翌月開始) と "YYYY-MM" ラベルを返す。 */
-function jstMonthBounds(ts: number): { monthStart: number; nextMonthStart: number; label: string } {
+/** 与えたunix秒が属するJST暦月の "YYYY-MM" ラベル。 */
+function jstMonthLabelOf(ts: number): string {
   const jst = new Date((ts + JST_OFFSET_SEC) * 1000);
   const year = jst.getUTCFullYear();
   const month = jst.getUTCMonth(); // 0-11, JST-local
-  const label = `${year}-${String(month + 1).padStart(2, "0")}`;
+  return `${year}-${String(month + 1).padStart(2, "0")}`;
+}
+
+/** "YYYY-MM" labelが指すJST暦月の [開始, 翌月開始) を返す。labelは事前にvalidate済みであること。 */
+function jstMonthBoundsForLabel(label: string): { monthStart: number; nextMonthStart: number } {
+  const [yearStr, monthStr] = label.split("-");
+  const year = Number(yearStr);
+  const month = Number(monthStr); // 1-12
   const monthStart = Math.floor(new Date(`${label}-01T00:00:00+09:00`).getTime() / 1000);
-  const nextYear = month === 11 ? year + 1 : year;
-  const nextMonth = month === 11 ? 1 : month + 2;
+  const nextYear = month === 12 ? year + 1 : year;
+  const nextMonth = month === 12 ? 1 : month + 1;
   const nextLabel = `${nextYear}-${String(nextMonth).padStart(2, "0")}`;
   const nextMonthStart = Math.floor(new Date(`${nextLabel}-01T00:00:00+09:00`).getTime() / 1000);
-  return { monthStart, nextMonthStart, label };
+  return { monthStart, nextMonthStart };
 }
 
 function requireCatalogEpoch(store: TitleV2Store, catalogKey: string): number {
@@ -131,6 +169,27 @@ function requireSystemEpoch(store: TitleV2Store): number {
   return epoch;
 }
 
+interface ScopeCandidate {
+  readonly scopeKey: string;
+  readonly start: number;
+  readonly endExclusive: number | null;
+}
+
+/**
+ * 全branch共通のfail-closedチェックを通してからbrandする。
+ * observedAtがscope.startより前になることは正常には起こり得ない
+ * （historical repairでも、修復対象の月は必ず既に始まっている）。これを許すと
+ * 「まだ始まっていない未来のscopeを今評価する」という無意味な状態を作れてしまう。
+ */
+function finalize(definitionKey: string, observedAt: number, candidate: ScopeCandidate): ResolvedTitleScope {
+  if (observedAt < candidate.start) {
+    throw new Error(
+      `title ${definitionKey}: observedAt (${observedAt}) is before the resolved scope start (${candidate.start}); scope=${candidate.scopeKey}`,
+    );
+  }
+  return brand({ ...candidate, observedAt });
+}
+
 /**
  * definition.scope + store（system/catalog epoch）+ observedAt からResolvedTitleScopeを
  * 作る唯一のAPI。callerはobservedAtだけを渡す——scopeKey・window境界はここでしか作らない。
@@ -143,7 +202,7 @@ export function resolveTitleScope(
   store: TitleV2Store,
   definition: TitleDefinition,
   observedAt: number,
-  eventProvider?: TitleEventScopeProvider,
+  options: TitleScopeResolutionOptions = {},
 ): ResolvedTitleScope {
   if (!Number.isInteger(observedAt)) {
     throw new RangeError("resolveTitleScope: observedAt must be an integer unix timestamp");
@@ -160,36 +219,66 @@ export function resolveTitleScope(
   switch (policy.type) {
     case "global": {
       const start = requireSystemEpoch(store);
-      return brand({ scopeKey: "global", start, endExclusive: null, observedAt });
+      return finalize(definition.key, observedAt, { scopeKey: "global", start, endExclusive: null });
     }
     case "catalog": {
       const start = requireCatalogEpoch(store, catalogKey!);
-      return brand({ scopeKey: `catalog:${catalogKey}`, start, endExclusive: null, observedAt });
+      return finalize(definition.key, observedAt, { scopeKey: `catalog:${catalogKey}`, start, endExclusive: null });
     }
     case "month": {
       const epoch = requireCatalogEpoch(store, catalogKey!);
-      const { monthStart, nextMonthStart, label } = jstMonthBounds(observedAt);
+      const selector = options.monthSelector ?? { type: "current" as const };
+      const label =
+        selector.type === "current"
+          ? jstMonthLabelOf(observedAt)
+          : (assertMonthLabel(selector.month, `title ${definition.key}: monthSelector.month`), selector.month);
+      const { monthStart, nextMonthStart } = jstMonthBoundsForLabel(label);
+      if (nextMonthStart <= epoch) {
+        throw new Error(
+          `title ${definition.key}: target month ${label} entirely precedes CATALOG_EPOCH (catalog=${catalogKey})`,
+        );
+      }
       const start = Math.max(monthStart, epoch);
-      return brand({ scopeKey: `month:${catalogKey}:${label}`, start, endExclusive: nextMonthStart, observedAt });
+      return finalize(definition.key, observedAt, { scopeKey: `month:${catalogKey}:${label}`, start, endExclusive: nextMonthStart });
     }
     case "event": {
       assertSlug(policy.eventKey, `title ${definition.key}: scope.eventKey`);
-      if (!eventProvider) {
+      if (!options.eventProvider) {
         throw new Error(
           `title ${definition.key}: scope.type="event" requires a TitleEventScopeProvider (catalog=${catalogKey}, eventKey=${policy.eventKey})`,
         );
       }
       const epoch = requireCatalogEpoch(store, catalogKey!);
-      const canonical = eventProvider.resolveEvent(catalogKey!, policy.eventKey);
+      const canonical = options.eventProvider.resolveEvent(catalogKey!, policy.eventKey);
       if (!canonical) {
         throw new Error(`title ${definition.key}: unknown event ${catalogKey}/${policy.eventKey}`);
       }
+      if (!Number.isInteger(canonical.start) || !Number.isInteger(canonical.completedAt)) {
+        throw new Error(`title ${definition.key}: event provider returned non-integer timestamps for ${catalogKey}/${policy.eventKey}`);
+      }
+      if (canonical.start >= canonical.completedAt) {
+        throw new Error(
+          `title ${definition.key}: event provider returned start >= completedAt for ${catalogKey}/${policy.eventKey}`,
+        );
+      }
       const start = Math.max(canonical.start, epoch);
-      return brand({
+      if (start >= canonical.completedAt) {
+        throw new Error(
+          `title ${definition.key}: event window is empty after CATALOG_EPOCH clip (start=${start} >= completedAt=${canonical.completedAt})`,
+        );
+      }
+      // 未完了のeventを部分windowでawardしない——completedAtが確定していない
+      // （＝まだobservedAtの時点で終わっていない）eventは、評価そのものをfail-closedする。
+      if (canonical.completedAt > observedAt) {
+        throw new Error(
+          `title ${definition.key}: event ${catalogKey}/${policy.eventKey} has not completed as of observedAt ` +
+            `(completedAt=${canonical.completedAt} > observedAt=${observedAt})`,
+        );
+      }
+      return finalize(definition.key, observedAt, {
         scopeKey: `event:${catalogKey}:${policy.eventKey}`,
         start,
         endExclusive: canonical.completedAt,
-        observedAt,
       });
     }
     default:

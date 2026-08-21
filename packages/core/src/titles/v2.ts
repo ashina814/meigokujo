@@ -63,7 +63,9 @@ export {
   toRuleScope,
   type ResolvedTitleScope,
   type TitleEventScopeProvider,
+  type TitleMonthSelector,
   type TitleRuleScope,
+  type TitleScopeResolutionOptions,
 } from "./v2-scope.js";
 
 export {

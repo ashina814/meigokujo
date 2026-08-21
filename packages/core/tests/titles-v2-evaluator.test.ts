@@ -388,7 +388,7 @@ describe("bump_events reader（§15）", () => {
       resolveEvent: () => ({ start: eventStart, completedAt: eventEnd }),
     };
     // イベント終了のずっと後に評価しても、windowはcompletedAtで打ち切られる。
-    const scope = resolveTitleScope(store, EVENT_RULE.definition, eventEnd + 10_000, provider);
+    const scope = resolveTitleScope(store, EVENT_RULE.definition, eventEnd + 10_000, { eventProvider: provider });
     const payload = readTitleSource(db, "bump_events", "alice", scope);
     expect(payload.events).toEqual([eventStart, eventStart + 50]);
   });
@@ -519,7 +519,11 @@ describe("award flow（§12）", () => {
     const bump = new BumpCounter(db);
     bump.addOnce("m1", "alice", BASE);
 
-    const augObservedAt = Math.floor(new Date("2026-08-15T00:00:00+09:00").getTime() / 1000);
+    // setup()のcatalog epochはBASE-100_000（BASE=2026-08-20T00:00 JST）——8/19夕方頃。
+    // observedAtがcatalog epochより前だと「まだcatalogが施行されていない時点を評価する」
+    // 無意味な状態になり、resolveTitleScope()のobservedAt<start fail-closedに引っかかる
+    // ため、epoch施行後の8月内の時刻を使う。
+    const augObservedAt = Math.floor(new Date("2026-08-25T00:00:00+09:00").getTime() / 1000);
     const sepObservedAt = Math.floor(new Date("2026-09-15T00:00:00+09:00").getTime() / 1000);
 
     const aug = evaluateTitle(db, store, MONTHLY_RULE, "alice", augObservedAt);

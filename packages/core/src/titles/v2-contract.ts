@@ -54,6 +54,19 @@ export type TitleTrigger =
   | "role_changed"
   | "daily";
 
+const VALID_TRIGGERS: ReadonlySet<TitleTrigger> = new Set([
+  "text_activity",
+  "vc_activity",
+  "bump_success",
+  "game_completed",
+  "room_activity",
+  "economy_activity",
+  "invite_confirmed",
+  "event_completed",
+  "role_changed",
+  "daily",
+]);
+
 /**
  * definitionが宣言する「どうscopeを区切るか」の方針。実際のwindow解決は
  * v2-scope.ts の resolveTitleScope() が担う（callerは任意のscope/scopeKeyを作れない）。
@@ -471,7 +484,7 @@ export function defineBehaviorTitle<T extends BehaviorTitleDefinition>(definitio
     throw new Error(`title ${definition.key}: defineBehaviorTitle() requires kind:"behavior"`);
   }
   assertCommonTitleDefinition(definition);
-  if (!definition.catalog.trim()) throw new Error(`title ${definition.key}: catalog is required`);
+  assertSlug(definition.catalog, `title ${definition.key}: catalog`);
 
   if (definition.sources.length === 0) throw new Error(`title ${definition.key}: at least one source is required`);
   for (const source of definition.sources as readonly TitleSourceKey[]) {
@@ -490,6 +503,10 @@ export function defineBehaviorTitle<T extends BehaviorTitleDefinition>(definitio
   if (definition.triggers.length === 0) throw new Error(`title ${definition.key}: at least one trigger is required`);
   const seenTriggers = new Set<TitleTrigger>();
   for (const trigger of definition.triggers) {
+    // TypeScriptを迂回した動的入力（as any等）で未知のtrigger文字列が来てもruntimeで拒否する。
+    if (!VALID_TRIGGERS.has(trigger)) {
+      throw new Error(`title ${definition.key}: invalid trigger ${String(trigger)}`);
+    }
     if (seenTriggers.has(trigger)) throw new Error(`title ${definition.key}: duplicate trigger ${trigger}`);
     seenTriggers.add(trigger);
   }
