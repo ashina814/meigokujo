@@ -1091,7 +1091,7 @@ describe("Plan provenance: relationshipRulesも既存防御を維持する（§4
   });
 });
 
-describe("no public raw evidence API（§30, §62, §63）", () => {
+describe("no public raw evidence API（§30, §62, §63、round 3レビュー）", () => {
   it("v2.ts はrelationship counterpart raw read APIを一切exportしない", () => {
     const forbidden = [
       "readRelationshipEvidence",
@@ -1103,6 +1103,10 @@ describe("no public raw evidence API（§30, §62, §63）", () => {
       "requireRelationshipEvidenceProvenance",
       "evaluateRelationshipTitle",
       "selectPrimaryWitness",
+      // computeCoPresenceOverlaps()はuserA/userBを含む生pairwise relationship dataを
+      // 返すため、relationship raw resolver APIを非公開にしても、この別経路で
+      // counterpart identityへ到達できてしまう（round 3レビューで指摘）。
+      "computeCoPresenceOverlaps",
     ];
     for (const name of forbidden) {
       expect((v2Public as Record<string, unknown>)[name]).toBeUndefined();
@@ -1113,10 +1117,25 @@ describe("no public raw evidence API（§30, §62, §63）", () => {
     expect(typeof (v2Public as Record<string, unknown>).defineRelationshipTitleRule).toBe("function");
   });
 
+  it("v2.ts はcomputeSafeSocialAggregates（counterpart identityを含まないsafe aggregate）は引き続きexportする", () => {
+    expect(typeof (v2Public as Record<string, unknown>).computeSafeSocialAggregates).toBe("function");
+  });
+
   it("root packages/core/src/index.ts からもrelationship内部APIは未export", async () => {
     const core = await import("../src/index.js");
     expect((core as Record<string, unknown>).evaluateRelationshipTitle).toBeUndefined();
     expect((core as Record<string, unknown>).resolveRelationshipCandidates).toBeUndefined();
+  });
+
+  it("root packages/core/src/index.ts からもcomputeCoPresenceOverlapsは未export（package public API全体から到達不能）", async () => {
+    const core = await import("../src/index.js");
+    expect((core as Record<string, unknown>).computeCoPresenceOverlaps).toBeUndefined();
+    expect((core as Record<string, unknown>).CoPresenceOverlap).toBeUndefined();
+  });
+
+  it("root packages/core/src/index.ts はcomputeSafeSocialAggregatesは引き続きexportする", async () => {
+    const core = await import("../src/index.js");
+    expect(typeof (core as Record<string, unknown>).computeSafeSocialAggregates).toBe("function");
   });
 });
 

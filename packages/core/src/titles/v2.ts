@@ -52,15 +52,24 @@ export {
   type TitleAwardFacts,
 } from "./v2-award-facts.js";
 
+// computeCoPresenceOverlaps() / CoPresenceOverlap はここからexportしない（PR C2 round 3
+// レビュー）。computeCoPresenceOverlaps()はuserA/userBを含む生pairwise relationship data
+// を返す——vc_co_presence（TITLE_SOURCESでprivacy:"restricted", titleUsable:false,
+// restrictedUse:"relationship_private_evidence"）と同じ制約対象であり、relationship
+// raw resolver API（v2-relationship-evidence.tsのresolveRelationshipCandidates()等）を
+// 非公開にしても、この経由で`@meigokujo/core/titles/v2`からcounterpart identityへ
+// 到達できてしまっては「generic TitleRuleからcounterpart identityへ到達させない」
+// 「public raw counterpart APIを作らない」というC2の契約と矛盾する。v2-relationship-
+// evidence.tsは`../vc/derived.js`への相対importでこの関数を直接使い続ける——ここでの
+// 非公開化はrelationship evaluator自体には影響しない。`computeSafeSocialAggregates()`
+// はcounterpart identityを含まないsafe aggregateなので引き続き公開する。
 export {
-  computeCoPresenceOverlaps,
   computeEmptyStartThenJoined,
   computeGroupSizeSeconds,
   computeLastOccupant,
   computeLogicalVisits,
   computeSafeSocialAggregates,
   isTrustedVisitEnd,
-  type CoPresenceOverlap,
   type EmptyStartThenJoinedFact,
   type GroupSizeSeconds,
   type LastOccupantFact,
