@@ -374,11 +374,18 @@ export const TITLE_SOURCES = {
     // 1 user × 1 JST dayにつき最大1行、observed_atはその日最初に永続化された
     // qualifying event time——N active days目をobserved_at ASCで順序付けられる。
     // ただしこれはN messages/N sessionsを意味しない（rawUnit参照）。
+    //
+    // 「qualifying」の意味（PR #160レビュー §7）: DM・thread（forum post含む）・
+    // private/role-gated channel（@everyoneがViewChannelできないchannel）は対象外
+    // ——`isSafeTitleTextActivityMessage()`（apps/bot/src/rank-tracker.ts）が
+    // fail-closedで判定する。この判定はtext_active_days記録の可否だけに使い、
+    // 既存Rank XP eligibility（xp_excluded_channels等）は変更しない。
     orderable: true,
     titleUsable: true,
     epochPolicy: { type: "point", at: "observed_at" },
-    // 「ある1つのJST日にTC活動が観測された」という事実1件。message数・session数ではない。
-    rawUnit: "unique_jst_text_active_day",
+    // 「ある1つのJST日に、public/non-thread guild channelでのTC活動が観測された」
+    // という事実1件。message数・session数ではなく、private/thread conversationも含まない。
+    rawUnit: "unique_jst_public_text_active_day",
   },
 
   // ── Confirmed Invites（PR E1）────────────────────────────────────

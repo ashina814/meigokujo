@@ -1,5 +1,5 @@
 import type { Client, Message, VoiceChannel } from "discord.js";
-import { AttachmentBuilder, ChannelType } from "discord.js";
+import { AttachmentBuilder, ChannelType, PermissionFlagsBits } from "discord.js";
 import type { Services } from "./services.js";
 import { renderRankUpCard } from "./render/rank-up-card.js";
 import { recordLiveRankTitleUnlock } from "./rank-title-wiring.js";
@@ -28,6 +28,45 @@ function isExcluded(services: Services, channelId: string, parentId: string | nu
   return false;
 }
 
+/**
+ * TC安全source（`text_active_days`、PR E1）専用のeligibility——既存Rank XP eligibility
+ * （`isExcluded()`）より厳格な、追加のprivacy guard（PR #160レビュー対応）。
+ *
+ * DM・thread（forum post含む）・private/role-gated channelは対象外——fail-closed。
+ * `xp_excluded_channels`に個別設定されていなくても、@everyoneがViewChannelできない
+ * channelでの発言は「一般guild memberに公開された会話」ではないため記録しない。
+ *
+ * **このguardはRank XP eligibilityを変更しない**——`handleMessageXp()`側で、この判定を
+ * `services.textActivity.recordActiveDay(...)`の呼び出し可否だけに使い、
+ * `RankEngine.awardText()`の実行有無には一切影響させない（既存Rank XP production
+ * behaviorを維持する）。
+ *
+ * channel typeは`GuildText`/`GuildAnnouncement`だけに限定する——VC内テキスト・
+ * forum/thread等を暗黙に「普通のTC」へ含めない。
+ *
+ * @everyone visibilityを正本にする——「Botがそのchannelを見られるか」ではない
+ * （BotはSTAFF/ticket/private roomも見える可能性がある）。判定したいのは
+ * 「一般guild memberに公開された会話か」なので、`guild.roles.everyone`に対する
+ * `ViewChannel`だけを見る。role-gated channelは安全側に倒して対象外にする
+ * （将来allowlistが必要になれば別PRで設計する）。permission解決が失敗/nullの
+ * 場合もfail-closedで対象外にする。
+ */
+const TITLE_SAFE_TEXT_CHANNEL_TYPES: ReadonlySet<ChannelType> = new Set([
+  ChannelType.GuildText,
+  ChannelType.GuildAnnouncement,
+]);
+
+export function isSafeTitleTextActivityMessage(message: Message<true>): boolean {
+  const channel = message.channel;
+  if (channel.isThread()) return false;
+  if (!TITLE_SAFE_TEXT_CHANNEL_TYPES.has(channel.type)) return false;
+
+  const everyone = message.guild.roles.everyone;
+  const permissions = channel.permissionsFor(everyone);
+  if (!permissions) return false; // 解決できない場合もfail-closed
+  return permissions.has(PermissionFlagsBits.ViewChannel);
+}
+
 /** 発言XPの獲得＋称号変化の通知。DMや#集令は本文外で処理 */
 export async function handleMessageXp(message: Message, services: Services): Promise<void> {
   if (message.author.bot) return;
@@ -40,9 +79,14 @@ export async function handleMessageXp(message: Message, services: Services): Pro
   // TC安全source（PR E1）。rank XP cooldownとは独立——同日最初のqualifying messageが
   // cooldown中でも、その日はTC活動日として記録する（§13）。message.createdTimestampは
   // ミリ秒なので秒へ正規化する（Date.now()でevent timeを捏造しない、§16）。
-  // v2 source persistenceの失敗で既存Rank XP処理を止めない（§18、sidecarと同じ思想）。
+  // private/role-gated channel・threadは対象外（isSafeTitleTextActivityMessage、
+  // PR #160レビュー）——この追加判定はtext_active_days記録の可否だけに使い、
+  // 以降のRank XP処理には一切影響させない。v2 source persistenceの失敗（safety
+  // check自体の例外も含む）で既存Rank XP処理を止めない（§18、sidecarと同じ思想）。
   try {
-    services.textActivity.recordActiveDay(message.author.id, Math.floor(message.createdTimestamp / 1000));
+    if (isSafeTitleTextActivityMessage(message)) {
+      services.textActivity.recordActiveDay(message.author.id, Math.floor(message.createdTimestamp / 1000));
+    }
   } catch (e) {
     console.error(`[text-activity] persistence failed userId=${message.author.id}`, e);
   }

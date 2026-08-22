@@ -1231,8 +1231,29 @@ cutover・旧TitleEngine削除・旧profile migration。
   `award.before`/`award.after`/`tierUp`/XP/`rank_title_unlock`のいずれも
   使わない。同日最初のqualifying messageがrank XP cooldown中でも、
   その日はTC活動日として記録される——`handleMessageXp()`内の呼び出し順序は
-  「basic eligibility → `textActivity.recordActiveDay()` →
-  `RankEngine.awardText()` → rank-title sidecar → rank-up通知」。
+  「basic eligibility → `isSafeTitleTextActivityMessage()`判定 →
+  （trueなら）`textActivity.recordActiveDay()` → `RankEngine.awardText()` →
+  rank-title sidecar → rank-up通知」。
+- **public non-thread guild TCだけを対象にする**（PR #160レビュー対応）:
+  既存Rank XP eligibility（bot除外・guild外除外・空message除外・
+  `xp_excluded_channels`除外）だけでは、DM・private/staff-only/ticket/
+  role限定channel・thread・forum postを構造的に除外できない。
+  `isSafeTitleTextActivityMessage()`（`apps/bot/src/rank-tracker.ts`）が
+  追加のfail-closed判定を行う:
+  - thread（forum post含む）は`channel.isThread()`で除外。
+  - channel typeは`GuildText`/`GuildAnnouncement`だけに限定
+    （VC内テキスト等を暗黙に「普通のTC」へ含めない）。
+  - `channel.permissionsFor(guild.roles.everyone)`で**@everyoneの
+    ViewChannel**を確認する——「Botがそのchannelを見られるか」ではない
+    （Botはstaff/ticket/private roomも見える可能性がある）。判定したいのは
+    「一般guild memberに公開された会話か」なので@everyone visibilityを正本に
+    する。role-gated channelは安全側に倒して対象外（allowlistが必要なら
+    別PRで設計する）。permission解決が失敗/nullの場合もfail-closedで対象外。
+  - **この判定はtext_active_days記録の可否だけに使い、`RankEngine.
+    awardText()`の実行有無には一切影響させない**——既存Rank XP production
+    behaviorはprivate channelでも従来通り動く。`xp_excluded_channels`も
+    引き続き効く（public channelでも運営上XP除外ならtext_active_daysも除外、
+    既存契約通り）。
 - **first observation immutable**: 同じuser×同じJST日の2回目以降の呼び出しは
   `INSERT ... ON CONFLICT(user_id, activity_date) DO NOTHING`——
   `observed_at`をUPDATEしない。後から古いtimestampのevent（遅延配送等）が
@@ -1248,9 +1269,10 @@ cutover・旧TitleEngine削除・旧profile migration。
 - payload（`TextActiveDaysSourcePayload`）は`{ days: [{ date, observedAt }] }`
   だけ——message数・channel・message idは一切含まない。JST dateは safe
   なので含めてよい（将来、連続日/週末/特定イベント日を安全に評価できる
-  ようにする）。ただし`rawUnit: "unique_jst_text_active_day"`が示す通り、
-  これは「ある1つのJST日に活動が観測された」という事実1件——N messages/
-  N sessionsを意味しない。
+  ようにする）。ただし`rawUnit: "unique_jst_public_text_active_day"`が示す
+  通り、これは「ある1つのJST日に、public/non-thread guild channelでのTC
+  活動が観測された」という事実1件——N messages/N sessionsを意味せず、
+  private/thread conversationも含まない。
 
 **`confirmed_invites`**:
 
