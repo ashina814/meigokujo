@@ -1680,7 +1680,13 @@ catalog_99_fullclear.xlsx`（正本sheet: `Catalog_99_FINAL` / `Summary` /
   `docs/titles-v2-catalog-readiness.md`。
 - **no fake sources**: READY判定の根拠は必ず既存`titleUsable:true`の
   source keyまたは実在するspecialized resolver——「似たsourceがある」
-  だけではREADYにしない。
+  だけではREADYにしない。「sourceは存在する」と「sourceがcatalogの
+  意味仕様を落とさず証明する」は別の質問——レビューで、casino
+  participation（successful funded participation commitment ≠
+  completed game）・economy reversal semantics・VC social breadthの
+  時間的分布欠如という3クラスのsemantic false-positiveが見つかり修正した
+  （`docs/titles-v2-catalog-readiness.md`§12）。counterexampleを1つ
+  構成できるかどうかを、READY判定の実質的なテストにする。
 - **no threshold guessing**: 分布TBDの候補に仮の数値（「とりあえず3日」等）
   を一切入れない。`thresholdCategory: THRESHOLD_PENDING`として明示する。
 - **no full-clear activation yet**: 現時点で未実装titleが多数あるため、

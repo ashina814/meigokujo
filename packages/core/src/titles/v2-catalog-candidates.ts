@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * PR F1 — Title v2 99 Catalog Convergence / Readiness Registry.
  *
@@ -2239,3 +2241,66 @@ export const TITLE_V2_CATALOG_CANDIDATES: readonly TitleV2CatalogCandidate[] = [
     fullClear: "EXEMPT_META",
   },
 ];
+
+// ─────────────────────────────────────────────────────────────
+// xlsx exact-drift regression guard（PR #164レビュー§5）
+// ─────────────────────────────────────────────────────────────
+
+const CANONICAL_FIELD_ORDER = [
+  "no",
+  "themeNo",
+  "theme",
+  "displayName",
+  "provisionalKey",
+  "kind",
+  "groupKey",
+  "seriesKey",
+  "stage",
+  "semanticSpec",
+  "scopeIntent",
+  "primarySourceIntent",
+  "sourceStatusOriginal",
+  "collectionCredit",
+  "hidden",
+  "roleDependency",
+  "thresholdIntent",
+  "productionReadinessOriginal",
+  "blockerNotes",
+  "fullClear",
+] as const satisfies readonly (keyof TitleV2CatalogCandidate)[];
+
+const CANONICAL_FIELD_SEP = "\u0001";
+const CANONICAL_ROW_SEP = "\n";
+const CANONICAL_NULL_TOKEN = "NULL";
+
+function canonicalField(value: TitleV2CatalogCandidate[(typeof CANONICAL_FIELD_ORDER)[number]]): string {
+  if (value === null) return CANONICAL_NULL_TOKEN;
+  if (typeof value === "boolean") return value ? "true" : "false";
+  return String(value);
+}
+
+/**
+ * xlsx `Catalog_99_FINAL` から一度だけ独立に（Python/openpyxlで、TypeScript側の
+ * このロジックとは別実装で）計算したcanonical SHA-256——`FROZEN_CATALOG_99_FINAL_SHA256`
+ * と一致することを`titles-v2-catalog-candidates.test.ts`が固定する。semanticSpec・
+ * blockerNotes・displayName等、どのfieldであっても値が1文字でもxlsx原文から
+ * ずれればこのhashが変わる（構造invariantだけを見る既存testでは検出できない
+ * driftのregression guard）。
+ *
+ * fieldはCANONICAL_FIELD_ORDER固定順・``区切りで1行にjoinし、行同士は
+ * `\n`区切り。nullは予約token`"NULL"`（xlsx側にこの文字列そのものを持つ列は
+ * 存在しない）。
+ */
+export function canonicalCatalogHash(candidates: readonly TitleV2CatalogCandidate[]): string {
+  const lines = candidates.map((c) => CANONICAL_FIELD_ORDER.map((field) => canonicalField(c[field])).join(CANONICAL_FIELD_SEP));
+  return createHash("sha256").update(lines.join(CANONICAL_ROW_SEP), "utf8").digest("hex");
+}
+
+/**
+ * `meigoku_title_v2_catalog_99_fullclear.xlsx`（sheet: `Catalog_99_FINAL`）から
+ * 2026-08-22に一度だけ生成した固定値。手打ちで決めていない——xlsxを直接読む
+ * Pythonスクリプトで独立に計算し、`canonicalCatalogHash(TITLE_V2_CATALOG_CANDIDATES)`
+ * と一致することを確認済み。xlsxの内容が変わったら、このPRの生成手順を再実行して
+ * 意図的に更新する（docs/titles-v2-catalog-readiness.mdに手順を記載）。
+ */
+export const FROZEN_CATALOG_99_FINAL_SHA256 = "2d790dcb675751da8ab721691f3545882223f82587ea92c8cc5398f9ed66245c";

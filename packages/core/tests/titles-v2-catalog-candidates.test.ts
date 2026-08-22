@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { TITLE_V2_CATALOG_CANDIDATES } from "../src/titles/v2-catalog-candidates.js";
+import {
+  canonicalCatalogHash,
+  FROZEN_CATALOG_99_FINAL_SHA256,
+  TITLE_V2_CATALOG_CANDIDATES,
+} from "../src/titles/v2-catalog-candidates.js";
 
 /**
  * PR F1: xlsx `Catalog_99_FINAL`（正本）を機械転記した
@@ -12,6 +16,18 @@ import { TITLE_V2_CATALOG_CANDIDATES } from "../src/titles/v2-catalog-candidates
 describe("A. 99 candidates exact", () => {
   it("TITLE_V2_CATALOG_CANDIDATESはちょうど99件", () => {
     expect(TITLE_V2_CATALOG_CANDIDATES).toHaveLength(99);
+  });
+});
+
+describe("xlsx canonical catalog hash exact match（PR #164レビュー§5）", () => {
+  it("全99件・全semantic fieldのcanonical SHA-256が、xlsxから独立に生成したFROZEN_CATALOG_99_FINAL_SHA256と一致する", () => {
+    // semanticSpec/blockerNotes/displayNameのどれか1文字でもxlsx原文からズレれば
+    // このtestが落ちる——count/91-8/43-56等の構造invariantだけでは検出できない
+    // driftのregression guard。期待hashは
+    // meigoku_title_v2_catalog_99_fullclear.xlsx（Catalog_99_FINALシート）を
+    // 直接読むPythonスクリプトで、このTypeScript実装とは独立に一度だけ計算した
+    // （docs/titles-v2-catalog-readiness.md参照）。
+    expect(canonicalCatalogHash(TITLE_V2_CATALOG_CANDIDATES)).toBe(FROZEN_CATALOG_99_FINAL_SHA256);
   });
 });
 

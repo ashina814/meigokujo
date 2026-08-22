@@ -209,3 +209,102 @@ describe("readiness registryはcandidatesと1:1対応する", () => {
     }
   });
 });
+
+/**
+ * PR #164レビュー: semantic false-positiveの再発防止テスト。
+ *
+ * counterexample: casino_activity_daysが証明するのは「successful funded
+ * participation commitment」であって「completed game」ではない——PVP経路
+ * （pvp-accept.ts等）はrunner実行前にwriterが発火するため、写像を誤ると
+ * 参加しただけの未精算roundを「初勝負」READYとして扱ってしまう。同様に
+ * economy_safe_peer_actionsのreversal非除外、vc_social_safeの時間的分布
+ * 欠如も、「似たsourceがある」だけでREADYへ倒す典型的な失敗パターン。
+ * このdescribeは、その3クラスのfalse-positiveが再発したら機械的に検出する。
+ */
+function readinessFor(no: number) {
+  const entry = TITLE_V2_CATALOG_READINESS.find((r) => r.no === no);
+  if (!entry) throw new Error(`no readiness entry for candidate #${no}`);
+  return entry;
+}
+
+describe("semantic false-positive再監査（casino participation vs completion）", () => {
+  it("No.58「ほんの気持ち」はreversal semanticsが現sourceと食い違うためREADYではない", () => {
+    // xlsx Blocker欄「reversal済取引は無効」に対し、computeSafeEconomyPeerActions()は
+    // reversalされた後もoriginal tipのfactを消さない（reversal_of IS NULLは
+    // reversal行自身を除外するだけ）。
+    const entry = readinessFor(58);
+    expect(entry.status).not.toBe("READY");
+    expect(entry.status).toBe("PARTIAL");
+    expect(entry.blockerKinds).toContain("source_semantic_mismatch");
+  });
+
+  it("No.66「初勝負」はsourceがparticipationしか証明せずcompletionを証明しないためREADYではない", () => {
+    // counterexample: PVP経路（pvp-accept.ts collectAndStartFunded）はcollectStakes
+    // 成功直後・deps.runners[game](...)実行前にwriterが発火する。runnerが例外/中断
+    // しても書き込み済みのcasino_activity_days factは残る（chohan-multi.tsの
+    // 「🎴 中断」embedが実際に中断ケースを持つことを示す）。
+    const entry = readinessFor(66);
+    expect(entry.status).not.toBe("READY");
+    expect(entry.status).toBe("PARTIAL");
+    expect(entry.blockerKinds).toContain("source_semantic_mismatch");
+  });
+
+  it("No.67「つまみ食い」も同じparticipation-not-completion理由でREADYではない", () => {
+    const entry = readinessFor(67);
+    expect(entry.status).not.toBe("READY");
+    expect(entry.status).toBe("PARTIAL");
+    expect(entry.blockerKinds).toContain("source_semantic_mismatch");
+  });
+
+  it("No.68「賭場通」はsemanticSpecが「利用する」でありcompletion保証を要求しないためREADYのまま", () => {
+    // No.66/67と一括変更しない——semanticSpec文言が「正常完了する」ではなく
+    // 「複数日に利用する」なので、casino_activity_daysのparticipation commitment
+    // 保証のままで意味を満たせる。
+    const entry = readinessFor(68);
+    expect(entry.status).toBe("READY");
+  });
+
+  it("No.69「何でもござれ」のblockerはmissing_manifestとsource_semantic_mismatchの両方を含む", () => {
+    // manifestが後日完成しても、completion proof不足（No.66/67と同根）は
+    // 別に残るため、missing_manifest単独では不十分。
+    const entry = readinessFor(69);
+    expect(entry.status).toBe("BLOCKED");
+    expect(entry.blockerKinds).toContain("missing_manifest");
+    expect(entry.blockerKinds).toContain("source_semantic_mismatch");
+  });
+});
+
+describe("semantic false-positive再監査（VC social breadthの時間的分布）", () => {
+  it("No.22「顔馴染み」はdistinctCoPresentUsersだけで意味を満たすためREADYのまま", () => {
+    // semanticSpecが時間的な広がりを要求しない（「成立する」であって
+    // 「複数日に広がる」ではない）ため、単一windowの累積distinct数で十分。
+    const entry = readinessFor(22);
+    expect(entry.status).toBe("READY");
+  });
+
+  it("No.23-25はいずれも「複数日/十分な期間/長期」という時間的持続性を要求するがsourceは単一累積値しか無いためREADYではない", () => {
+    // counterexample: day1に100人と会い、day2〜30はAlice1人だけの場合でも
+    // distinctCoPresentUsers/maxRepeatedDaysWithOneCounterpartは大きいままにでき、
+    // 「複数日に広がる/続く/長期にわたる」という時間分布を証明できない。
+    for (const no of [23, 24, 25]) {
+      const entry = readinessFor(no);
+      expect(entry.status, `candidate #${no}`).not.toBe("READY");
+      expect(entry.status, `candidate #${no}`).toBe("PARTIAL");
+      expect(entry.blockerKinds, `candidate #${no}`).toContain("source_semantic_mismatch");
+    }
+  });
+});
+
+describe("semantic false-positive再監査（public event completion保証）", () => {
+  it("No.80/81はpublic_eventsにstatus/lifecycle列が無くevent completedを保証できないためREADYではない", () => {
+    // public_eventsテーブルはevent_key/name/event_date/recorded_by/recorded_atのみ
+    // ——status・state・phase・completed_at等のlifecycle列は存在しない。event_dateも
+    // 「今」と比較されず、recordFinalizedEvent()呼び出しはstaffの手動判断のみに依存する。
+    for (const no of [80, 81]) {
+      const entry = readinessFor(no);
+      expect(entry.status, `candidate #${no}`).not.toBe("READY");
+      expect(entry.status, `candidate #${no}`).toBe("PARTIAL");
+      expect(entry.blockerKinds, `candidate #${no}`).toContain("source_semantic_mismatch");
+    }
+  });
+});
