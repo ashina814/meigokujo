@@ -119,11 +119,6 @@ async function runRoundInner(
     wager: bet,
     source: playContext.source,
   });
-  recordCasinoParticipationBestEffort(services, {
-    participationKey: `solo:chohan:${interaction.id}`,
-    activityKey: "chohan",
-    participantUserIds: [uid],
-  });
 
   const bettingEmbed = new EmbedBuilder()
     .setAuthor({ name: "マモンの賭場 · 丁半" })
@@ -200,6 +195,14 @@ async function runRoundInner(
   // 連鎖有効時は実効 RTP が 106% を超える回帰が実測レポートで確認された（クラッシュと同構造）。
   // お守りの消費も賭け・配当と同じグループの中（settleSolo）
   const settled = services.casino.settleSolo(uid, "丁半", bet, rawPayout, { chain: false, operationId: interaction.id, reservationKey });
+  // settleSolo()が実際にダイス目・賭け・配当を単一atomic transactionで確定させた
+  // 正本——ここへ到達した時点で初めて「実際のroundが成立した」と言える。丁選択の
+  // 15秒timeoutはここへ到達せず早期returnするので参加記録されない（PR #163レビュー§3）。
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `solo:chohan:${interaction.id}`,
+    activityKey: "chohan",
+    participantUserIds: [uid],
+  });
   recordCasinoGameFinishBestEffort(services, {
     userId: uid,
     game: "丁半",

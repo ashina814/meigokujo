@@ -285,31 +285,9 @@ function readSource(file: string): string {
   return readFileSync(new URL(`../src/casino/${file}.ts`, import.meta.url), "utf8");
 }
 
-describe("solo games: recordCasinoParticipationBestEffort は house reservation成立後、round開始前", () => {
-  const cases: Array<{ file: string; startNeedle: string; gameLabel: string }> = [
-    { file: "slots", startNeedle: "game: \"スロット\"", gameLabel: "スロット" },
-    { file: "chohan", startNeedle: "game: \"丁半\"", gameLabel: "丁半" },
-    { file: "crash", startNeedle: "game: \"クラッシュ\"", gameLabel: "クラッシュ" },
-    { file: "chinchiro", startNeedle: "game: \"チンチロ\"", gameLabel: "チンチロ" },
-    { file: "poker", startNeedle: "game: \"ポーカー\"", gameLabel: "ポーカー" },
-    { file: "holdem", startNeedle: "game: \"ホールデム\"", gameLabel: "ホールデム" },
-    { file: "blackjack", startNeedle: "game: \"ブラックジャック\"", gameLabel: "ブラックジャック" },
-  ];
-
-  for (const { file, startNeedle } of cases) {
-    it(`${file}.ts: recordCasinoGameStartBestEffort直後にrecordCasinoParticipationBestEffortが続く`, () => {
-      const source = readSource(file);
-      const startCallAt = source.indexOf("recordCasinoGameStartBestEffort(services, {");
-      expect(startCallAt, `${file}: recordCasinoGameStartBestEffort呼び出しが無い`).toBeGreaterThanOrEqual(0);
-      expect(source.slice(startCallAt, startCallAt + 400), `${file}: startNeedle不一致`).toContain(startNeedle);
-      const participationAt = source.indexOf("recordCasinoParticipationBestEffort(services, {", startCallAt);
-      expect(participationAt, `${file}: recordCasinoParticipationBestEffort呼び出しが無い`).toBeGreaterThan(startCallAt);
-      // その間に実ゲーム処理（newDeck/spinPaid/generateCrashPoint等）が挟まっていない
-      const between = source.slice(startCallAt, participationAt);
-      expect(between.match(/recordCasinoGameStartBestEffort/g)?.length).toBe(1);
-    });
-  }
-});
+// solo 7ゲームのcommit boundary検証は casino-participation-solo-boundary.test.ts
+// （PR #163レビュー対応: house reservation成立後ではなく、各ゲームの実際のsettle
+// primitiveより後であることを機能fixture/source-order両方で検証する）。
 
 describe("PVP named-invite duels: recordCasinoParticipationBestEffort は両者collectStakes成功後、runFunded*前", () => {
   const cases = [

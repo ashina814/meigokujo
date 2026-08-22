@@ -152,6 +152,19 @@ export class CasinoParticipationHistory {
     if (existingRows.length > 0) {
       const existingUserIds = existingRows.map((r) => r.user_id);
       const existingActivityKey = existingRows[0]!.activity_key;
+      const existingOccurredAt = existingRows[0]!.occurred_at;
+      // 同一participation_key内でactivity_key/occurred_atが割れていたらDB corruption
+      // ——先頭行だけを代表値として信用せずfail-closedする（immutable evidence storeの
+      // 堅牢性、PR #163レビュー§7）。
+      const rowsConsistent = existingRows.every(
+        (r) => r.activity_key === existingActivityKey && r.occurred_at === existingOccurredAt,
+      );
+      if (!rowsConsistent) {
+        throw new CasinoParticipationError(
+          "conflict",
+          `participation ${participationKey} has inconsistent stored rows (mixed activity_key/occurred_at) — refusing to treat as idempotent`,
+        );
+      }
       const identical =
         existingActivityKey === activityKey && sameParticipantSet(existingUserIds, participantUserIds);
 

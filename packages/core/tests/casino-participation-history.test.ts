@@ -208,3 +208,49 @@ describe("L. stored columnsにwager/payout/net/result/opponent等が存在しな
     expect(columns.sort()).toEqual(["activity_key", "occurred_at", "participation_key", "user_id"]);
   });
 });
+
+describe("M. 既存rowsのactivity_key/occurred_atが割れている場合はfail-closed（PR #163レビュー§7）", () => {
+  it("同一participation_key内でactivity_keyが割れている(DB corruption想定)→先頭行を代表値として信用せずconflictでthrow", () => {
+    const { db, history } = setup();
+    // recordCommittedParticipation()のAPIを経由せず直接INSERTしてDB corruptionを再現する
+    // ——通常の書き込み経路では発生し得ない状態（single participationKeyは常に単一
+    // activityKeyでしか書かれない）。
+    db.prepare(
+      `INSERT INTO casino_participations (participation_key, user_id, activity_key, occurred_at) VALUES (?, ?, ?, ?)`,
+    ).run("solo:blackjack:op-corrupt", "alice", "blackjack", BASE);
+    db.prepare(
+      `INSERT INTO casino_participations (participation_key, user_id, activity_key, occurred_at) VALUES (?, ?, ?, ?)`,
+    ).run("solo:blackjack:op-corrupt", "bob", "poker", BASE);
+
+    expect(() =>
+      history.recordCommittedParticipation(
+        baseInput({ participationKey: "solo:blackjack:op-corrupt", activityKey: "blackjack", participantUserIds: ["alice"] }),
+      ),
+    ).toThrow(/inconsistent stored rows/);
+  });
+
+  it("同一participation_key内でoccurred_atが割れている(DB corruption想定)→先頭行を代表値として信用せずconflictでthrow", () => {
+    const { db, history } = setup();
+    db.prepare(
+      `INSERT INTO casino_participations (participation_key, user_id, activity_key, occurred_at) VALUES (?, ?, ?, ?)`,
+    ).run("pvp:sess-corrupt", "alice", "sashi", BASE);
+    db.prepare(
+      `INSERT INTO casino_participations (participation_key, user_id, activity_key, occurred_at) VALUES (?, ?, ?, ?)`,
+    ).run("pvp:sess-corrupt", "bob", "sashi", BASE + 999);
+
+    expect(() =>
+      history.recordCommittedParticipation(
+        baseInput({ participationKey: "pvp:sess-corrupt", activityKey: "sashi", participantUserIds: ["alice", "bob"] }),
+      ),
+    ).toThrow(/inconsistent stored rows/);
+  });
+
+  it("rowsが一致していれば通常通り冪等成功する(regression: falseポジティブでconflictにならない)", () => {
+    const { history } = setup();
+    history.recordCommittedParticipation(baseInput({ participationKey: "pvp:sess-consistent", activityKey: "sashi", participantUserIds: ["alice", "bob"] }));
+    const result = history.recordCommittedParticipation(
+      baseInput({ participationKey: "pvp:sess-consistent", activityKey: "sashi", participantUserIds: ["alice", "bob"] }),
+    );
+    expect(result.alreadyRecorded).toBe(true);
+  });
+});

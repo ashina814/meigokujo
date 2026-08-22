@@ -392,11 +392,6 @@ async function runRoundInner(
     wager: bet,
     source: playContext.source,
   });
-  recordCasinoParticipationBestEffort(services, {
-    participationKey: `solo:chinchiro:${interaction.id}`,
-    activityKey: "chinchiro",
-    participantUserIds: [uid],
-  });
   const startEmbed = new EmbedBuilder()
     .setTitle("🎲 チンチロ")
     .setColor(C_MAMMON)
@@ -587,6 +582,14 @@ async function runRoundInner(
   const cmp = compare(playerHand, dealerHand);
   const mul = cmp.mul;
   const round = settleChinchiroRound(services, uid, bet, mul, interaction.id, reservationKey);
+  // settleChinchiroRound()は内部でsettleSolo()を呼び、役判定・賭け・配当を単一atomic
+  // transactionで確定させる正本——ここへ到達した時点で初めて「実際のroundが成立した」
+  // と言える（PR #163レビュー§3）。
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `solo:chinchiro:${interaction.id}`,
+    activityKey: "chinchiro",
+    participantUserIds: [uid],
+  });
 
   let payoutText = "";
   const title = "🎲 チンチロ — 対 マモン";
