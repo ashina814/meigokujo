@@ -365,6 +365,71 @@ describe("D. last occupant", () => {
     const facts = computeLastOccupant(db, { start: BASE, end: BASE + 200 });
     expect(facts).toEqual([]);
   });
+
+  // PR F2a: same-second / 0-second visit tie bug（computeLastOccupant()）。
+  it("A. exact bug reproduction: bobの退出と同秒のcarol 0秒visitはambiguousとして断定しない", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed");
+    insertRaw("bob", "vc1", BASE + 10, BASE + 50, "observed"); // bobが50で退出
+    insertRaw("carol", "vc1", BASE + 50, BASE + 50, "observed"); // 同じ秒にcarolが0秒visit
+
+    const facts = computeLastOccupant(db, { start: BASE, end: BASE + 200 });
+    expect(facts).toEqual([]);
+  });
+
+  it("B. subject filterを指定してもchannel contextとして第三者(carol)を読み、Aと同じ結果になる", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed");
+    insertRaw("bob", "vc1", BASE + 10, BASE + 50, "observed");
+    insertRaw("carol", "vc1", BASE + 50, BASE + 50, "observed");
+
+    // Title source bulk readerはsubjectだけを指定しても、比較対象のchannel全体は
+    // 別クエリで読む設計——userIds指定でcarolがcontextから落ちてはいけない。
+    const facts = computeLastOccupant(db, { start: BASE, end: BASE + 200 }, ["alice"]);
+    expect(facts).toEqual([]);
+  });
+
+  it("C. 0秒visitがstart_reason=state_change(partial_observation)由来でも同様にambiguous", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed");
+    insertRaw("bob", "vc1", BASE + 10, BASE + 50, "observed");
+    // carolのarrivalはpartial_observation由来（前segmentへcoalesceできなかった孤立
+    // state_change）——「arrivalだけtie扱い」という誤修正ではブロックされない
+    // ケースを確認する。
+    insertRaw("carol", "vc1", BASE + 50, BASE + 50, "observed", null, "state_change");
+
+    const facts = computeLastOccupant(db, { start: BASE, end: BASE + 200 });
+    expect(facts).toEqual([]);
+  });
+
+  it("D. 1秒後の0秒visitはブロックしない（過剰ブロック防止）", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed");
+    insertRaw("bob", "vc1", BASE + 10, BASE + 50, "observed");
+    insertRaw("carol", "vc1", BASE + 51, BASE + 51, "observed"); // bobの退出より1秒後
+
+    const facts = computeLastOccupant(db, { start: BASE, end: BASE + 200 });
+    expect(facts).toEqual([{ userId: "alice", channelId: "vc1", becameLastAt: BASE + 50 }]);
+  });
+
+  it("E. 別channelの0秒visitはブロックしない", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed");
+    insertRaw("bob", "vc1", BASE + 10, BASE + 50, "observed");
+    insertRaw("carol", "vc2", BASE + 50, BASE + 50, "observed"); // vc1ではなくvc2
+
+    const facts = computeLastOccupant(db, { start: BASE, end: BASE + 200 });
+    expect(facts).toEqual([{ userId: "alice", channelId: "vc1", becameLastAt: BASE + 50 }]);
+  });
+
+  it("F. 通常系（tieなし）は引き続き成立する", () => {
+    const { db, insertRaw } = setup();
+    insertRaw("alice", "vc1", BASE, BASE + 100, "observed");
+    insertRaw("bob", "vc1", BASE + 10, BASE + 50, "observed");
+
+    const facts = computeLastOccupant(db, { start: BASE, end: BASE + 200 });
+    expect(facts).toEqual([{ userId: "alice", channelId: "vc1", becameLastAt: BASE + 50 }]);
+  });
 });
 
 describe("E. group-size seconds", () => {

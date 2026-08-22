@@ -1693,6 +1693,20 @@ catalog_99_fullclear.xlsx`（正本sheet: `Catalog_99_FINAL` / `Summary` /
   production Collection Editionをこのpr で作成・activateしない——91件を
   今activeなeditionへ登録すると、取得不能なfull-clearを作ってしまう。
 
+### F2a — vc_last_occupant same-second / 0-second visit tie bug修正
+
+`packages/core/src/vc/derived.ts`の`computeLastOccupant()`にあった、
+F1 readiness auditで`known_bug`として記録していた既存の正確性バグを
+修正した——新機能ではなくcorrectness fix。departing userの終了時刻`t`と
+同一秒に開始した第三者（0秒visitを含む）を、前後関係を秒精度では証明
+できないambiguousケースとして安全側（factを作らない）へ倒す分岐を追加した。
+0秒visit自体は削除せず、arrival/observationの証拠として保持したまま
+判定対象にする。`vc_last_occupant`のpayload contractは変更していない。
+readiness registry（No.6,7,9: PARTIAL→READY、No.8: area taxonomy不足で
+BLOCKEDのまま）とtests（`vc-derived.test.ts`のA-F、`titles-v2-catalog-
+readiness.test.ts`の追従guard）を更新した。詳細は`docs/titles-v2-catalog-
+readiness.md`§13参照。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

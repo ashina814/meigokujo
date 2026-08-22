@@ -308,3 +308,32 @@ describe("semantic false-positive再監査（public event completion保証）", 
     }
   });
 });
+
+/**
+ * PR F2a: computeLastOccupant()のsame-second/0-second visit tie bug修正
+ * （packages/core/src/vc/derived.ts）に伴うreadiness registryの追従を固定する。
+ */
+describe("PR F2a: vc_last_occupant tie bug修正後のreadiness", () => {
+  it("No.6/7/9はtie bug修正によりREADY・blockerKinds:[\"none\"]", () => {
+    for (const no of [6, 7, 9]) {
+      const entry = readinessFor(no);
+      expect(entry.status, `candidate #${no}`).toBe("READY");
+      expect(entry.blockerKinds, `candidate #${no}`).toEqual(["none"]);
+      expect(entry.blockerKinds, `candidate #${no}`).not.toContain("known_bug");
+    }
+  });
+
+  it("No.8はarea/categoryタクソノミー不足が別の理由で残るためBLOCKEDのまま（tie bug修正だけではREADY化しない）", () => {
+    const entry = readinessFor(8);
+    expect(entry.status).toBe("BLOCKED");
+    expect(entry.blockerKinds).toContain("missing_derived_source");
+    expect(entry.blockerKinds).not.toContain("known_bug");
+  });
+
+  it("known_bugを持つBehavior候補はrepo全体で0件（tie bug修正によりcatalog全体から消えている）", () => {
+    const knownBugEntries = TITLE_V2_CATALOG_READINESS.filter(
+      (r) => r.status !== "META" && r.blockerKinds.includes("known_bug"),
+    );
+    expect(knownBugEntries).toEqual([]);
+  });
+});
