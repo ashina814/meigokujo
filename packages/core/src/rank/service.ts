@@ -10,6 +10,7 @@ import {
   voiceProgress,
   nextTier as _nextTier,
   type RankTier,
+  type RankTrack,
 } from "./tiers.js";
 
 /**
@@ -31,6 +32,13 @@ export interface RankAward {
   before: RankSnapshot;
   after: RankSnapshot;
   tierUp: boolean;                       // 称号が変わったか
+}
+
+/** `RankEngine.listTrackedLevels()`が返す、rank title historical reconcile用のlevel（PR D2）。 */
+export interface TrackedRankLevels {
+  readonly userId: string;
+  readonly textLevel: number;
+  readonly voiceLevel: number;
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -149,6 +157,39 @@ export class RankEngine {
     return { text: t, voice: v, total: t + v };
   }
 
+  /**
+   * rank_title historical reconcile用のread-only API（PR D2）。
+   *
+   * 対象userは`rank_text.user_id UNION rank_voice.user_id`——「何らかのrank活動を
+   * 一度でも持つuser」全員。片方のtrackにしかrowが無いuser（例: 発言だけ、VCだけ）も、
+   * 無い方のtrackはXP=0として両方のlevelを返す——Discord guild.membersはこのAPIの
+   * 正本にしない（外部Discord APIへ一切依存しない）。
+   *
+   * levelは必ず`textLevel(xp)`/`voiceLevel(xp)`でXPから再計算する——
+   * `rank_text.last_tier`/`rank_voice.last_tier`（array indexのlegacy cache、
+   * identityではない）を逆算に使わない。
+   *
+   * 1 queryでuser union + LEFT JOINしてまとめて取得する——userごとに`getText()`/
+   * `getVoice()`を呼ぶN+1 queryは避ける。順序は`user_id ASC`——locale-independentで
+   * 実行ごとに揺れないdeterministic order。
+   */
+  listTrackedLevels(): readonly TrackedRankLevels[] {
+    const rows = this.db
+      .prepare(
+        `SELECT u.user_id AS user_id, t.xp AS text_xp, v.xp AS voice_xp
+           FROM (SELECT user_id FROM rank_text UNION SELECT user_id FROM rank_voice) u
+           LEFT JOIN rank_text t ON t.user_id = u.user_id
+           LEFT JOIN rank_voice v ON v.user_id = u.user_id
+          ORDER BY u.user_id ASC`,
+      )
+      .all() as Array<{ user_id: string; text_xp: number | null; voice_xp: number | null }>;
+    return rows.map((r) => ({
+      userId: r.user_id,
+      textLevel: textLevel(r.text_xp ?? 0),
+      voiceLevel: voiceLevel(r.voice_xp ?? 0),
+    }));
+  }
+
   // ---- ランキング用 ----
 
   topByText(limit = 10): Array<{ user_id: string; xp: number; messages: number }> {
@@ -217,4 +258,4 @@ export {
   tierFor,
   _nextTier as nextTier,
 };
-export type { RankTier };
+export type { RankTier, RankTrack };

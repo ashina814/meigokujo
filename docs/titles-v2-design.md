@@ -1090,6 +1090,127 @@ catalog + Series manifests + Collection Edition・shadow evaluation/threshold
 calibration・production cutover（epoch/baseline・evaluator配線・rank-title
 配線・profile read-only化・《名乗り》3枠・notification）。
 
+### Rank-title Live Wiring / Historical Reconcile（PR D2）
+
+PR B3で完成していた`rank_title_unlocks`永続層（stable `RankTitleKey`・
+`recordRankTitleTransition()`・`reconcileRankTitleUnlocks()`・permanent
+unlock・historical `unlocked_at=NULL`・live crossingは`unlocked_at=Store
+clock`・Profile Identity 3-slot）を、実際のBot本番経路（発言XP/Voice XP）へ
+初めて接続する。称号v2 Behavior evaluator/production catalogはまだ起動しない
+——このPRの対象は`rank_title_unlocks`だけ。
+
+**RankEngine XPがlive observation source**: `apps/bot/src/rank-tracker.ts`の
+`handleMessageXp()`/`tickVoiceXp()`が、既存の`services.ranks.awardText()`/
+`awardVoice()`呼び出しの直後（rank-up通知より前）に、共通helper
+`recordLiveRankTitleUnlock()`（`apps/bot/src/rank-title-wiring.ts`）を呼ぶ。
+Text/Voiceで別実装をコピペしない。
+
+**stable `RankTier.key`がidentity、`last_tier`はauthorityではない**:
+`recordLiveRankTitleUnlock()`/`RankEngine.listTrackedLevels()`のいずれも、
+`rank_text.last_tier`/`rank_voice.last_tier`（array indexのlegacy
+cache/bookkeeping）を一切読まない。`listTrackedLevels()`は必ず
+`textLevel(xp)`/`voiceLevel(xp)`でXPからlevelを再計算する。
+
+**live sync条件（不要writeを避ける）**:
+
+```ts
+if (award.tierUp || !services.titleV2.hasRankTitleUnlock(userId, award.after.tier.key)) {
+  services.titleV2.recordRankTitleTransition(userId, track, award.before.level, award.after.level);
+}
+```
+
+- 普通の同tier内XP増加 → no-op（`recordRankTitleTransition()`を呼ばない）。
+- 実際のtier crossing（`tierUp`）→ live record。
+- pre-v2 user（既存Lv75だが`rank_title_unlocks`が空）が同tier内で次のXPを
+  得た場合（`tierUp=false`）→ current tier unlock missingを検出してself-heal。
+- 新規userの最初の成功XP → 同じself-heal経路でLv0から補完される。
+
+`tierUp`だけで判定しない——v2導入前から一定levelだったuserの、次のXP
+（`tierUp=false`になり得る）を取りこぼさない。
+
+**live crossing semantics**: `unlockedAt`の正本は常にTitleV2Store clock
+——Bot側から`rank_text.last_award_at`/`Date.now()`/message timestamp/VC
+tick timestampを`unlockedAt`として渡す新APIは作らない。複数tierを同時に
+跨いでも、Bot側でtierごとにループしてINSERTしない——既存
+`recordRankTitleTransition()`の契約（`v2-identity-store.ts`の
+`applyRankTitleTierUnlocks()`）にすべて任せる。**existing unlockは
+immutable**——後から同じtierへ再度tierUpが来ても、既存行の
+`unlocked_at`/`recorded_at`は一切UPDATEしない（B3のfirst persisted truth
+契約をそのまま維持）。
+
+**live persistenceはexisting rank機能を壊さないsidecar**:
+`recordLiveRankTitleUnlock()`は自身の中で`try { ... } catch (e) {
+console.error(...) }`する——XP付与自体（既存production機能）のrollbackも、
+既存rank-up通知の停止もしない。TitleV2Store側の例外がmessage
+handler全体を落とさない。RankEngineのXP付与とTitleV2Storeのunlock
+persistenceは1つの外側transactionへ結合しない——**live best-effort +
+historical reconcileによる自己修復**というモデル。failureは
+`console.error("[rank-title-v2] live unlock persistence failed track=... userId=...", e)`
+の形でtrackとuserIdだけをlogする（counterpart等は無関係、そもそも登場しない）。
+
+**failureはdaily reconcileでrepair、現在時刻を捏造しない**: live
+persistenceが失敗した場合、その日はunlockされないまま残る。後続の
+historical reconcile（startup/daily）が`unlocked_at=NULL`で補完する
+——「本当はlive crossingだったはずだから」と現在時刻をunlockedAtへ
+入れることは絶対にしない。exact live observationを永続化できなかった
+以上、historical unknownへ安全側に倒す。
+
+**tracked populationはrank DB union**: historical reconcileの対象userは
+`RankEngine.listTrackedLevels()`が返す「`rank_text`/`rank_voice`いずれかに
+1行でも持つuser」全員——`rank_text.user_id UNION rank_voice.user_id`を
+1 queryで解決する（userごとのN+1 queryにしない）。Discord
+`guild.members`はreconcileの正本にしない——外部Discord APIへ一切
+依存しない。片方のtrackにしかrowが無いuserも、無い方のtrackはXP=0
+として両方のlevelを返す。順序は`user_id ASC`——locale-independentな
+deterministic order。
+
+**Historical reconcile runner**（`reconcileTrackedRankTitles()`、
+`apps/bot/src/rank-title-wiring.ts`）: `listTrackedLevels()`の結果を
+1人ずつ、`TitleV2Store.reconcileRankTitleUnlocks(userId, "text", ...)` /
+`(userId, "voice", ...)`へ渡すだけ。identity-freeな要約統計
+`{usersScanned, tracksReconciled, newlyUnlocked}`を返す——PR D1の
+`TitlePrefetchSummary`と同じ思想（userId/titleKey一覧は含まない）。
+
+**no auto-equip / no notification from reconcile**: historical
+reconcileで新規unlockが何百件できても、DM・rank通知channel・イベント
+通知は一切送らない（silent persistence + summary logのみ）。
+`profile_identity_equips`への自動装備もしない——3枠は後続UIでuser自身が
+選ぶ。既存unlock（現在levelより高いものも含む）を削除・downgradeする
+ロジックも一切存在しない——永久unlock契約のまま。
+
+**startup + daily reconcile**: `apps/bot/src/index.ts`のClientReadyで、
+外部Discord APIを一切使わず`startupReconcileRankTitles(services)`を
+同期的に呼ぶ（casino recoveryの直後、他の非同期Discord I/Oより前）。
+失敗しても`console.error`するだけでBot起動は継続する（内部でcatch済み、
+呼び出し側でtry/catchを書く必要が無い）。startup成功はdaily reconcileの
+markerを立てない——別概念。daily reconcileは`apps/bot/src/scheduler.ts`の
+tickへ、JST 04:30〜04:32の3分retry windowで追加した
+（`runDailyRankTitleReconcile()`、marker:
+`rank_title_v2:reconciled:${dateStr}`、既存`runSchedulerTaskOnce()`の
+marker/retry契約——成功時だけmarkerを立て、途中失敗した日は次tickで
+自然にretryする）。全user×2trackを1つの外側DB transactionへは包まない
+——`reconcileRankTitleUnlocks()`自体が各mutationのtransaction境界を持つ。
+
+**no catalog epoch dependency**: `TitleV2Store(db)`（Bot側の
+`services.titleV2`、production clockはdefault Store clock、Bot側から
+timestampをinjectしない）は、`applySystemEpoch()`/`applyCatalog()`/
+baseline captureのいずれもstartupで実行しない——production 99-title
+catalogを施行しない。rank title identityはbehavior title catalogとは
+別のidentity subsystemであり、`recordRankTitleTransition()`/
+`reconcileRankTitleUnlocks()`自体がcatalog epochを一切参照しないため、
+SYSTEM_EPOCH/CATALOG_EPOCH未施行のDBでも成立する。
+
+**old TitleEngine remains active**: `apps/bot/src/services.ts`の
+`services.titles`（旧`TitleEngine`、production正本）は一切変更しない
+——`services.titleV2`（`TitleV2Store`）を明確に別名で追加するだけ。
+旧callerは何も変わらない。
+
+**follow-up（D2の範囲外）**: Behavior/Meta evaluator live wiring・
+production 99-title catalog・source拡張・`/プロフィール`のv2表示・
+《名乗り》3枠UI・equip command・title notification・relationship
+disclosure・shadow evaluation/threshold calibration・production
+cutover・旧TitleEngine削除・旧profile migration。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。
