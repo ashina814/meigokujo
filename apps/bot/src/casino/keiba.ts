@@ -18,7 +18,7 @@ import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
 import { acquireTransientParticipation, releaseTransientParticipation } from "./participation.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 import { C_LOSE, C_MAMMON, C_WIN, E, buildLobbyEmbed } from "./ui.js";
 
 /**
@@ -672,6 +672,16 @@ async function runSession(interaction: KeibaStarter, services: import("../servic
   // 原子的精算（合計 !== プールなら例外・途中失敗も全ロールバック）。
   // PR23: 参加者ごとの実純損益（受取 − 出した総額）を同じトランザクションで当日枠へ記録する
   settleKeibaRace(services, session, distributions);
+  // settleKeibaRace()がレース全体を単一atomic transactionで精算する正本——ここへ
+  // 到達した時点で初めて全参加者のroundが成立したと言える。失敗時はまるごと
+  // 巻き戻ってvoidKeibaRaceへ落ちるため、completion 0のまま（PR F2b）。
+  for (const userId of new Set(allBets.map((b) => b.userId))) {
+    recordCasinoCompletionBestEffort(services, {
+      participationKey: `keiba:${session}:${userId}`,
+      activityKey: "keiba",
+      participantUserIds: [userId],
+    });
+  }
 
   const winnerHorse = HORSES.find((h) => h.id === winnerId)!;
   const top3 = finished.slice(0, 3).map((id, i) => {

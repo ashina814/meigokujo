@@ -33,7 +33,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🃏 ブラックジャック（対マモン・ソロ）。
@@ -227,6 +227,13 @@ async function runRoundInner(
     // 決着経路（ナチュラル・バースト・スタンド・ダブル・timeout強制スタンド）は
     // 必ずこのfinish()を経由する（PR #163レビュー§3）。
     recordCasinoParticipationBestEffort(services, {
+      participationKey: `solo:blackjack:${interaction.id}`,
+      activityKey: "blackjack",
+      participantUserIds: [uid],
+    });
+    // settleSolo()自体が単一atomic transactionでの正常精算——soloではcommitmentと
+    // completionが同じ境界（PR F2b）。
+    recordCasinoCompletionBestEffort(services, {
       participationKey: `solo:blackjack:${interaction.id}`,
       activityKey: "blackjack",
       participantUserIds: [uid],

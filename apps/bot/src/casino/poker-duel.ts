@@ -16,7 +16,7 @@ import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET } from "./common.js";
 import { collectStakes, refundAll, settlePvp, settleProportional, stakeFailureText, voidPvpTable } from "./pvp-common.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 import { C_JACKPOT, C_LOSE, C_MAMMON, C_WIN } from "./ui.js";
 
 /**
@@ -497,6 +497,18 @@ function recordPokerDuelParticipation(services: Services, s: Session): void {
   });
 }
 
+/**
+ * 実際のshowdown/settlement（settlePvp/settleProportional）成功directly後だけ
+ * 呼ぶ——配牌時点（recordPokerDuelParticipation）とは別のcompletion境界（PR F2b）。
+ */
+function recordPokerDuelCompletion(services: Services, s: Session): void {
+  recordCasinoCompletionBestEffort(services, {
+    participationKey: `pvp:${s.id}`,
+    activityKey: "poker",
+    participantUserIds: [...s.players.keys()],
+  });
+}
+
 async function dealHands(interaction: ButtonInteraction, s: Session, services: Services): Promise<void> {
   recordPokerDuelParticipation(services, s);
   const deck = newDeck(services.rng);
@@ -673,6 +685,9 @@ async function settleGame(client: import("discord.js").Client, s: Session, servi
   if (winners.length === 1 && losers.length === 1) {
     const w = winners[0]!;
     const { houseCut } = settlePvp(services, [w.userId], s.bet * entries.length, `${s.id}:settle`, s.id);
+    // settlePvp()が実際に単一atomic transactionでの正常精算を確定させた正本
+    // ——postResult()（Discord最終表示）より前（PR F2b）。
+    recordPokerDuelCompletion(services, s);
     await postResult(client, s, entries, winners, houseCut);
     sessions.delete(s.id);
     return;
@@ -684,6 +699,7 @@ async function settleGame(client: import("discord.js").Client, s: Session, servi
     `${s.id}:settle`,
     s.id,
   );
+  recordPokerDuelCompletion(services, s);
   await postResult(client, s, entries, winners, totalHouseCut);
   sessions.delete(s.id);
 }

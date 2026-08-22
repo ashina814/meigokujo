@@ -24,7 +24,7 @@ import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
 import { acquireTransientParticipation, releaseTransientParticipation } from "./participation.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 import { C_LOSE, C_MAMMON, C_WIN, E, fmtBigDelta } from "./ui.js";
 
 /**
@@ -558,6 +558,16 @@ export async function playRoulette(
     const participants = [...bets.keys()];
     try {
       spin = settleRoulette(services, session, [...bets.values()]);
+      // settleRoulette()は卓全体を単一atomic transactionで精算する正本——ここへ
+      // 到達した時点で初めて全参加者のroundが成立したと言える。失敗時はまるごと
+      // 巻き戻ってvoidRouletteTableへ落ちるため、completion 0のまま（PR F2b）。
+      for (const userId of participants) {
+        recordCasinoCompletionBestEffort(services, {
+          participationKey: `roulette:${session}:${userId}`,
+          activityKey: "roulette",
+          participantUserIds: [userId],
+        });
+      }
     } catch (e) {
       console.error(`[roulette] 卓 ${session} の精算に失敗。全額返金します`, e);
       // 精算はまるごと巻き戻っているので、預り金・卓予約・露出はそのまま残っている。

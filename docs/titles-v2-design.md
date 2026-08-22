@@ -1707,6 +1707,34 @@ BLOCKEDのまま）とtests（`vc-derived.test.ts`のA-F、`titles-v2-catalog-
 readiness.test.ts`の追従guard）を更新した。詳細は`docs/titles-v2-catalog-
 readiness.md`§13参照。
 
+### F2b — Casino Completed Participation Safe Signal
+
+`casino_activity_days`（PR E4）が証明する「successful funded
+participation commitment」と、「ゲームが正常精算まで完了した」ことは
+別事実——PR #164レビューで確定したsemantic mismatch（No.66/67/69）を、
+新機能として解消した。既存`casino_activity_days`の意味・schema・writerは
+一切変更していない。
+
+新規source: そのparticipationについて、ゲーム固有のcanonical financial
+resolution primitive（settlement、またはゲームルール上の正常な
+draw/push等の解決）が成功したことだけを表すimmutable正本
+`casino_participation_completions`（`CasinoParticipationHistory.
+recordCompletedParticipation()`——親commitment行と`activityKey`/
+participant setの一致を必ず照合し、commitment無しのcompletionは
+`missing_commitment`でfail-closed reject）と、`user × activityKey ×
+JST day`でcollapseするsafe derived source `casino_completed_activity_
+days`を追加した。Discordの最終結果表示成功はcompletion条件ではない
+——settlement成功後にUI editが失敗してもcompletionは成立し、逆に
+`voidPvpTable`/`voidRouletteTable`/`voidKeibaRace`等の異常系cleanupは
+completionと解釈しない。全11 activityKey（solo 7種目・PVP named-invite
+4種目・poker-duel・多人数丁半・roulette・keiba）のproduction callsiteを
+監査し、各ゲームの実settlement primitive成功直後へwriterを配線した。
+
+readiness registry（No.66,67: PARTIAL→READY、No.68: `casino_activity_
+days`のまま変更なし、No.69: `source_semantic_mismatch`が外れ
+`missing_manifest`のみ残る）を更新した。詳細は`docs/titles-v2-catalog-
+readiness.md`§14参照。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

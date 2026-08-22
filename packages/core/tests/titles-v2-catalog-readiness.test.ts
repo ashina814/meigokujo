@@ -120,11 +120,34 @@ describe("M. READY candidateが参照するsourceは実際にTITLE_SOURCESへ存
 });
 
 describe("N. BLOCKED/PARTIAL candidateにfake placeholder sourceが入っていない", () => {
-  it("status:BLOCKEDの全候補はusableSources空", () => {
+  it("status:BLOCKEDの全候補は、usableSourcesが空か、非source系blocker（manifest/role-history）だけが理由のときに限り登録済みsourceを持つ", () => {
+    // PR F2b: No.69のように「completion sourceは十分だがmanifestが無い」という
+    // 部分的readyのBLOCKED候補が正当に存在する——その場合はusableSourcesを
+    // 空にせず記録してよい（reviewの明示指示）。ただしfake placeholderを防ぐため、
+    // 非空にできるのはsource capability自体を疑う理由
+    // （missing_persisted_source/missing_derived_source/source_semantic_mismatch/
+    // missing_event_protocol/known_bug）が一切blockerKindsに含まれない場合だけに限る。
+    const SOURCE_CAPABILITY_BLOCKERS = new Set([
+      "missing_persisted_source",
+      "missing_derived_source",
+      "source_semantic_mismatch",
+      "missing_event_protocol",
+      "known_bug",
+    ]);
     const blocked = TITLE_V2_CATALOG_READINESS.filter((r) => r.status === "BLOCKED");
     expect(blocked.length).toBeGreaterThan(0);
     for (const entry of blocked) {
-      expect(entry.usableSources, `BLOCKED candidate #${entry.no} has non-empty usableSources`).toEqual([]);
+      if (entry.usableSources.length === 0) continue;
+      const hasSourceCapabilityBlocker = entry.blockerKinds.some((k) => SOURCE_CAPABILITY_BLOCKERS.has(k));
+      expect(
+        hasSourceCapabilityBlocker,
+        `BLOCKED candidate #${entry.no} has non-empty usableSources but also a source-capability blocker (${entry.blockerKinds.join(",")}) — this looks like a fake placeholder`,
+      ).toBe(false);
+      for (const key of entry.usableSources) {
+        const def = (TITLE_SOURCES as Record<string, { titleUsable: boolean } | undefined>)[key];
+        expect(def, `BLOCKED candidate #${entry.no} references unknown source "${key}"`).toBeDefined();
+        expect(def?.titleUsable, `BLOCKED candidate #${entry.no} references non-titleUsable source "${key}"`).toBe(true);
+      }
     }
   });
 
@@ -238,39 +261,40 @@ describe("semantic false-positive再監査（casino participation vs completion�
     expect(entry.blockerKinds).toContain("source_semantic_mismatch");
   });
 
-  it("No.66「初勝負」はsourceがparticipationしか証明せずcompletionを証明しないためREADYではない", () => {
-    // counterexample: PVP経路（pvp-accept.ts collectAndStartFunded）はcollectStakes
-    // 成功直後・deps.runners[game](...)実行前にwriterが発火する。runnerが例外/中断
-    // しても書き込み済みのcasino_activity_days factは残る（chohan-multi.tsの
-    // 「🎴 中断」embedが実際に中断ケースを持つことを示す）。
+  it("No.66「初勝負」: PR F2bでcasino_completed_activity_days（真のcompletion正本）が追加されREADYになった", () => {
+    // 元counterexample（PVP経路がcollectStakes成功直後・runner実行前にwriterが発火し、
+    // runnerが例外/中断しても書き込み済みfactが残る問題）はcasino_activity_days
+    // （commitmentのみ）に対して今も成立するが、No.66/67はPR F2bでcasino_completed_
+    // activity_days（settlePvp/settleProportional/正常branchのrefundAll成功後にのみ
+    // 書かれる別source）へ切り替えたため解消した——source_semantic_mismatchガードは
+    // 下のPR F2b describeブロックで固定する。
     const entry = readinessFor(66);
-    expect(entry.status).not.toBe("READY");
-    expect(entry.status).toBe("PARTIAL");
-    expect(entry.blockerKinds).toContain("source_semantic_mismatch");
+    expect(entry.status).toBe("READY");
+    expect(entry.usableSources).toContain("casino_completed_activity_days");
   });
 
-  it("No.67「つまみ食い」も同じparticipation-not-completion理由でREADYではない", () => {
+  it("No.67「つまみ食い」も同じ理由でREADYになった（PR F2b）", () => {
     const entry = readinessFor(67);
-    expect(entry.status).not.toBe("READY");
-    expect(entry.status).toBe("PARTIAL");
-    expect(entry.blockerKinds).toContain("source_semantic_mismatch");
+    expect(entry.status).toBe("READY");
+    expect(entry.usableSources).toContain("casino_completed_activity_days");
   });
 
   it("No.68「賭場通」はsemanticSpecが「利用する」でありcompletion保証を要求しないためREADYのまま", () => {
     // No.66/67と一括変更しない——semanticSpec文言が「正常完了する」ではなく
     // 「複数日に利用する」なので、casino_activity_daysのparticipation commitment
-    // 保証のままで意味を満たせる。
+    // 保証のままで意味を満たせる。PR F2bでもcompletion sourceへ切り替えない。
     const entry = readinessFor(68);
     expect(entry.status).toBe("READY");
+    expect(entry.usableSources).toEqual(["casino_activity_days"]);
   });
 
-  it("No.69「何でもござれ」のblockerはmissing_manifestとsource_semantic_mismatchの両方を含む", () => {
-    // manifestが後日完成しても、completion proof不足（No.66/67と同根）は
-    // 別に残るため、missing_manifest単独では不十分。
+  it("No.69「何でもござれ」: completion proof不足はPR F2bで解消し、missing_manifestのみ残る", () => {
+    // manifestが未定義であることだけが残るblocker——completion半分（No.66/67と同根）は
+    // casino_completed_activity_daysの追加で解消した。
     const entry = readinessFor(69);
     expect(entry.status).toBe("BLOCKED");
-    expect(entry.blockerKinds).toContain("missing_manifest");
-    expect(entry.blockerKinds).toContain("source_semantic_mismatch");
+    expect(entry.blockerKinds).toEqual(["missing_manifest"]);
+    expect(entry.blockerKinds).not.toContain("source_semantic_mismatch");
   });
 });
 
@@ -335,5 +359,44 @@ describe("PR F2a: vc_last_occupant tie bug修正後のreadiness", () => {
       (r) => r.status !== "META" && r.blockerKinds.includes("known_bug"),
     );
     expect(knownBugEntries).toEqual([]);
+  });
+});
+
+/**
+ * PR F2b: casino completed-participation safe signal（casino_completed_activity_days）
+ * 追加に伴うreadiness registryの追従を固定する。casino_activity_days（commitment
+ * ベース、E4）の意味は変更していない——No.68は引き続きそちらを使う。
+ */
+describe("PR F2b: casino completion source追加後のreadiness", () => {
+  it("No.66/67はcasino_completed_activity_daysでREADY・blockerKinds:[\"none\"]", () => {
+    for (const no of [66, 67]) {
+      const entry = readinessFor(no);
+      expect(entry.status, `candidate #${no}`).toBe("READY");
+      expect(entry.blockerKinds, `candidate #${no}`).toEqual(["none"]);
+      expect(entry.usableSources, `candidate #${no}`).toContain("casino_completed_activity_days");
+    }
+  });
+
+  it("No.68はcasino_activity_days（commitmentベース）のままREADY——completion sourceへ切り替えない", () => {
+    const entry = readinessFor(68);
+    expect(entry.status).toBe("READY");
+    expect(entry.usableSources).toEqual(["casino_activity_days"]);
+    expect(entry.usableSources).not.toContain("casino_completed_activity_days");
+  });
+
+  it("No.69はmissing_manifestのみ残りBLOCKEDのまま——source_semantic_mismatchは解消済み", () => {
+    const entry = readinessFor(69);
+    expect(entry.status).toBe("BLOCKED");
+    expect(entry.blockerKinds).toEqual(["missing_manifest"]);
+    expect(entry.blockerKinds).not.toContain("source_semantic_mismatch");
+  });
+
+  it("source_semantic_mismatch blockerはNo.66/67/69から外れ、依然残る候補（No.23-25,29,30,58,80,81,82）にはそのまま残る", () => {
+    for (const no of [66, 67]) {
+      expect(readinessFor(no).blockerKinds, `candidate #${no}`).not.toContain("source_semantic_mismatch");
+    }
+    for (const no of [23, 24, 25, 58, 80, 81]) {
+      expect(readinessFor(no).blockerKinds, `candidate #${no}`).toContain("source_semantic_mismatch");
+    }
   });
 });

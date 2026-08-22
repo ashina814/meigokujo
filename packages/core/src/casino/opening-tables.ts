@@ -407,6 +407,18 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "packages/core/src/casino/participation-history.ts. Non-financial neutral participation history (same category as casino_metric_events/casino_stats). Old pre-formal-opening participation facts are not carried across formal opening.",
   }),
   T({
+    table: "casino_participation_completions",
+    purpose: "PR F2b: neutral casino completed-participation facts for the safe completion title source (no wager/payout/result/winner/loser)",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "packages/core/src/casino/participation-history.ts. Same category as casino_participations — non-financial neutral completion history. Old pre-formal-opening completion facts are not carried across formal opening.",
+  }),
+  T({
     table: "casino_daily_risk_days",
     purpose: "Per-user formal-day risk snapshots for casino loss-limit enforcement",
     kind: "optional_feature",

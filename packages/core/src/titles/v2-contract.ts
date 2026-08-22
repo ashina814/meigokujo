@@ -117,6 +117,7 @@ const TITLE_RESTRICTED_USES = [
   "relationship_private_evidence",
   "economy_safe_classification",
   "casino_safe_participation_classification",
+  "casino_safe_completion_classification",
 ] as const;
 export type TitleRestrictedUse = (typeof TITLE_RESTRICTED_USES)[number];
 const VALID_TITLE_RESTRICTED_USES: ReadonlySet<string> = new Set(TITLE_RESTRICTED_USES);
@@ -566,6 +567,60 @@ export const TITLE_SOURCES = {
     titleUsable: true,
     epochPolicy: { type: "point", at: "occurredAt" },
     rawUnit: "unique_jst_casino_activity_day",
+  },
+
+  // ── Casino Safe Completion Source（PR F2b）──────────────────────────────────
+  //
+  // casino_participationsが証明する「successful funded participation
+  // commitment」とは別の、immutableな正本。「そのparticipationについて、
+  // ゲーム固有のcanonical financial resolution primitive（settlement、または
+  // ゲームルール上の正常なdraw/push等の解決）が成功したことを直接観測した」
+  // という事実だけを保存する——PVP経路はgame runner実行前にwriterが発火する
+  // ためcommitmentとcompletionを区別できない、というPR #164レビューで確定した
+  // semantic mismatchを解消する。casino_activity_daysの意味は一切変更しない。
+  casino_participation_completions: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/casino/participation-history.ts",
+      needle: "INSERT INTO casino_participation_completions",
+    },
+    calledFrom: {
+      file: "apps/bot/src/casino/blackjack.ts",
+      needle: "recordCasinoCompletionBestEffort(services, {",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "await handleAsobuCommand(interaction, services);",
+    },
+    kind: "history",
+    privacy: "restricted",
+    // completed_atはcanonical settlement成功をservice clockが直接観測した時刻
+    // ——raw単体としては順序付け可能だが、個々の称号からは直接使わせない。
+    orderable: true,
+    titleUsable: false,
+    restrictedUse: "casino_safe_completion_classification",
+    epochPolicy: { type: "point", at: "completed_at" },
+    rawUnit: "casino_settlement_completion",
+  },
+  casino_completed_activity_days: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-casino.ts",
+      needle: "export function computeCasinoCompletedActivityDays(",
+    },
+    // completion tableはactivity_keyを複製しない——JOINでcasino_participationsの
+    // activity_keyを読むため、両方のsourceがdependencyになる。
+    derivedFrom: ["casino_participation_completions", "casino_participations"],
+    kind: "history",
+    privacy: "safe",
+    // rawは1 completion=1 rowだが、称号sourceとしてはuser×activityKey×JST dayで
+    // 最大1 factへcollapseする——同日100回完了しても1件。completedAtはそのscope内で
+    // 最初に観測したsettlement成功のtimestamp（commit時に直接観測した値）なので、
+    // orderable:trueにできる。
+    orderable: true,
+    titleUsable: true,
+    epochPolicy: { type: "point", at: "completedAt" },
+    rawUnit: "unique_jst_casino_completed_activity_day",
   },
 } as const satisfies Record<string, TitleSourceDefinition>;
 

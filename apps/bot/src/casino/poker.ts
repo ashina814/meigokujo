@@ -30,7 +30,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🃏 ドローポーカー（Jacks or Better・ソロ）。対胴元の簡易版。
@@ -315,6 +315,13 @@ async function runRoundInner(
   // settleSolo()が実際に役判定・賭け・配当を単一atomic transactionで確定させた
   // 正本——ここへ到達した時点で初めて「実際のroundが成立した」と言える（PR #163レビュー§3）。
   recordCasinoParticipationBestEffort(services, {
+    participationKey: `solo:poker:${interaction.id}`,
+    activityKey: "poker",
+    participantUserIds: [uid],
+  });
+  // settleSolo()自体が単一atomic transactionでの正常精算——soloではcommitmentと
+  // completionが同じ境界（PR F2b）。
+  recordCasinoCompletionBestEffort(services, {
     participationKey: `solo:poker:${interaction.id}`,
     activityKey: "poker",
     participantUserIds: [uid],

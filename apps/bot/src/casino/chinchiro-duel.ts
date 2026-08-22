@@ -28,7 +28,7 @@ import {
   stakeFailureText,
   type PvpInteraction,
 } from "./pvp-common.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🎲 対戦チンチロ（casino-bot /チンチロ対戦 準拠・1v1 PvP）。
@@ -365,7 +365,7 @@ export async function runFundedChinchiroDuel(
     await sleep(1200);
 
     if (cRank === oRank) {
-      // 同役続き → 全額返金
+      // 同役続き → 全額返金（ゲームルール上正常な引き分け解決、異常系voidPvpTableとは別、PR F2b）
       refundAll(
         services,
         [challenger.id, opponent.id],
@@ -373,6 +373,11 @@ export async function runFundedChinchiroDuel(
         `${session}:refund:draw`,
         session,
       );
+      recordCasinoCompletionBestEffort(services, {
+        participationKey: `pvp:${session}`,
+        activityKey: "chinchiro",
+        participantUserIds: [challenger.id, opponent.id],
+      });
       markResolved();
       await view.followUp({
         embeds: [
@@ -393,6 +398,13 @@ export async function runFundedChinchiroDuel(
         `${session}:settle`,
         session,
       );
+      // settlePvp()が実際に単一atomic transactionでの正常精算を確定させた正本
+      // （PR F2b）。
+      recordCasinoCompletionBestEffort(services, {
+        participationKey: `pvp:${session}`,
+        activityKey: "chinchiro",
+        participantUserIds: [challenger.id, opponent.id],
+      });
       markResolved();
 
       await view.followUp({

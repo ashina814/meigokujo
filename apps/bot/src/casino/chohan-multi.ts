@@ -16,7 +16,7 @@ import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
 import { collectStakes, settleProportional, stakeFailureText, voidPvpTable } from "./pvp-common.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 import { C_LOSE, C_MAMMON, C_WIN, E, buildLobbyEmbed, diceBlock, diceInline, fmtBigDelta } from "./ui.js";
 
 /**
@@ -249,6 +249,14 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
     `${session}:settle`,
     session,
   );
+  // settleProportional()が実際に単一atomic transactionでの正常精算を確定させた
+  // 正本——結果embed編集より前。settlement前の例外は「中断」経路（voidPvpTable）へ
+  // 落ち、ここへは到達しないためcompletion 0のまま（PR F2b）。
+  recordCasinoCompletionBestEffort(services, {
+    participationKey: `pvp:${session}`,
+    activityKey: "chohan",
+    participantUserIds: [...bets.keys()],
+  });
 
   const resultLabel = isCho ? "丁（偶数）" : "半（奇数）";
   const winTotal = winners.reduce((s, w) => s + w.amount, 0);

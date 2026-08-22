@@ -135,6 +135,20 @@ function rows(db: ReturnType<typeof openDb>) {
   return db.prepare(`SELECT activity_key FROM casino_participations`).all() as Array<{ activity_key: string }>;
 }
 
+/**
+ * PR F2b: casino_participation_completionsの行を、親casino_participationsと
+ * JOINしてactivity_keyつきで返す（completion table自体はactivity_keyを持たない）。
+ */
+function completionRows(db: ReturnType<typeof openDb>) {
+  return db
+    .prepare(
+      `SELECT p.activity_key AS activity_key FROM casino_participation_completions c
+         JOIN casino_participations p
+           ON p.participation_key = c.participation_key AND p.user_id = c.user_id`,
+    )
+    .all() as Array<{ activity_key: string }>;
+}
+
 describe("chohan: participation commit boundary", () => {
   it("A. 選択timeout（pre-commit failure）→ participation 0、settleSoloも呼ばれない", async () => {
     const { interaction } = fakeInteraction({ reject: timeoutError() });
@@ -146,7 +160,7 @@ describe("chohan: participation commit boundary", () => {
     expect(rows(db)).toHaveLength(0);
   });
 
-  it("B. 選択成功→settleSolo成功 → participation 1", async () => {
+  it("B. 選択成功→settleSolo成功 → participation 1・completion 1（PR F2b）", async () => {
     const { interaction } = fakeInteraction({ resolve: fakeButton("chohan:cho") });
     const { services, settleSolo, db } = fakeServices();
 
@@ -154,6 +168,7 @@ describe("chohan: participation commit boundary", () => {
 
     expect(settleSolo).toHaveBeenCalledOnce();
     expect(rows(db)).toEqual([{ activity_key: "chohan" }]);
+    expect(completionRows(db)).toEqual([{ activity_key: "chohan" }]);
   });
 
   it("C. writer failure → gameplayは継続する（best-effort contract）", async () => {
@@ -164,7 +179,7 @@ describe("chohan: participation commit boundary", () => {
     expect(settleSolo).toHaveBeenCalledOnce();
   });
 
-  it("D. 選択成功後settleSoloが失敗（pre-commit failure）→ participation 0", async () => {
+  it("D. 選択成功後settleSoloが失敗（pre-commit failure）→ participation 0・completion 0（PR F2b）", async () => {
     const { interaction } = fakeInteraction({ resolve: fakeButton("chohan:cho") });
     const { services, settleSolo, db } = fakeServices({ settleSoloThrows: true });
 
@@ -173,6 +188,7 @@ describe("chohan: participation commit boundary", () => {
     );
     expect(settleSolo).toHaveBeenCalledOnce();
     expect(rows(db)).toHaveLength(0);
+    expect(completionRows(db)).toHaveLength(0);
   });
 });
 
@@ -188,7 +204,7 @@ describe("blackjack: participation commit boundary", () => {
     expect(rows(db)).toHaveLength(0);
   });
 
-  it("B. timeout（強制スタンド）でもfinish()まで到達しsettleSolo成功 → participation 1", async () => {
+  it("B. timeout（強制スタンド）でもfinish()まで到達しsettleSolo成功 → participation 1・completion 1（PR F2b、正常なtimeout強制行動でもcompletion成立を証明）", async () => {
     const { interaction } = fakeInteraction({ reject: timeoutError() });
     const { services, settleSolo, db } = fakeServices();
 
@@ -196,6 +212,19 @@ describe("blackjack: participation commit boundary", () => {
 
     expect(settleSolo).toHaveBeenCalledOnce();
     expect(rows(db)).toEqual([{ activity_key: "blackjack" }]);
+    expect(completionRows(db)).toEqual([{ activity_key: "blackjack" }]);
+  });
+
+  it("B2. settleSolo成功後、その後のDiscord最終UI edit失敗でもcompletionは既に記録済み（presentation successをcompletion条件にしない、PR F2b）", async () => {
+    const { interaction, message } = fakeInteraction({ reject: timeoutError() });
+    message.edit.mockRejectedValue(new Error("simulated Discord edit failure"));
+    const { services, settleSolo, db } = fakeServices();
+
+    // finish()内のsettleSolo→completion writeの後、最終結果embed edit（message.edit）が
+    // 失敗しても、gameplayのbest-effort契約により例外はpropagateしないはず。
+    await expect(playBlackjack(interaction as never, services, 100, { source: "amount" })).resolves.toBeUndefined();
+    expect(settleSolo).toHaveBeenCalledOnce();
+    expect(completionRows(db)).toEqual([{ activity_key: "blackjack" }]);
   });
 
   it("C. writer failure → gameplayは継続する（best-effort contract）", async () => {
@@ -206,7 +235,7 @@ describe("blackjack: participation commit boundary", () => {
     expect(settleSolo).toHaveBeenCalledOnce();
   });
 
-  it("D. timeout強制スタンド後settleSoloが失敗（pre-commit failure）→ participation 0", async () => {
+  it("D. timeout強制スタンド後settleSoloが失敗（pre-commit failure）→ participation 0・completion 0（PR F2b）", async () => {
     const { interaction } = fakeInteraction({ reject: timeoutError() });
     const { services, settleSolo, db } = fakeServices({ settleSoloThrows: true });
 
@@ -215,6 +244,7 @@ describe("blackjack: participation commit boundary", () => {
     );
     expect(settleSolo).toHaveBeenCalledOnce();
     expect(rows(db)).toHaveLength(0);
+    expect(completionRows(db)).toHaveLength(0);
   });
 });
 
@@ -230,7 +260,7 @@ describe("holdem: participation commit boundary", () => {
     expect(rows(db)).toHaveLength(0);
   });
 
-  it("B. timeout（強制check連鎖）でもshowdownまで到達しsettleSolo成功 → participation 1", async () => {
+  it("B. timeout（強制check連鎖）でもshowdownまで到達しsettleSolo成功 → participation 1・completion 1（PR F2b）", async () => {
     const { interaction } = fakeInteraction({ reject: timeoutError() });
     const { services, settleSolo, db } = fakeServices();
 
@@ -238,6 +268,7 @@ describe("holdem: participation commit boundary", () => {
 
     expect(settleSolo).toHaveBeenCalledOnce();
     expect(rows(db)).toEqual([{ activity_key: "holdem" }]);
+    expect(completionRows(db)).toEqual([{ activity_key: "holdem" }]);
   });
 
   it("C. writer failure → gameplayは継続する（best-effort contract）", async () => {
@@ -248,7 +279,7 @@ describe("holdem: participation commit boundary", () => {
     expect(settleSolo).toHaveBeenCalledOnce();
   });
 
-  it("D. timeout強制check連鎖後settleSoloが失敗（pre-commit failure）→ participation 0", async () => {
+  it("D. timeout強制check連鎖後settleSoloが失敗（pre-commit failure）→ participation 0・completion 0（PR F2b）", async () => {
     const { interaction } = fakeInteraction({ reject: timeoutError() });
     const { services, settleSolo, db } = fakeServices({ settleSoloThrows: true });
 
@@ -257,11 +288,12 @@ describe("holdem: participation commit boundary", () => {
     );
     expect(settleSolo).toHaveBeenCalledOnce();
     expect(rows(db)).toHaveLength(0);
+    expect(completionRows(db)).toHaveLength(0);
   });
 });
 
 describe("slots: participation commit boundary", () => {
-  it("A. spinPaid失敗（settleSolo同等のprimitive）→ participation 0", async () => {
+  it("A. spinPaid失敗（settleSolo同等のprimitive）→ participation 0・completion 0（PR F2b）", async () => {
     // slotsはspinPaid()内部でservices.casino.settleSoloを呼ぶ。settleSoloが投げれば
     // spinPaid()も投げ、その後段のwriterへは到達しない。
     const { interaction } = fakeInteraction({});
@@ -270,9 +302,10 @@ describe("slots: participation commit boundary", () => {
     await expect(playSlots(interaction as never, services, 100)).rejects.toThrow("simulated settle failure");
     expect(settleSolo).toHaveBeenCalledOnce();
     expect(rows(db)).toHaveLength(0);
+    expect(completionRows(db)).toHaveLength(0);
   });
 
-  it("B. spinPaid成功 → participation 1", async () => {
+  it("B. spinPaid成功 → participation 1・completion 1（PR F2b）", async () => {
     const { interaction } = fakeInteraction({});
     const { services, settleSolo, db } = fakeServices();
 
@@ -280,6 +313,7 @@ describe("slots: participation commit boundary", () => {
 
     expect(settleSolo).toHaveBeenCalledOnce();
     expect(rows(db)).toEqual([{ activity_key: "slots" }]);
+    expect(completionRows(db)).toEqual([{ activity_key: "slots" }]);
   });
 
   it("C. writer failure → gameplayは継続する（best-effort contract）", async () => {
@@ -331,6 +365,22 @@ describe("crash: recordCasinoParticipationBestEffortはsettleSolo成功後（両
     const between = source.slice(startAt, generateAt);
     expect(between).not.toContain("recordCasinoParticipationBestEffort(");
   });
+
+  it("win分岐: settleSolo → recordCasinoCompletionBestEffort の順（PR F2b）", () => {
+    const source = readSource("crash");
+    const winSettleAt = source.indexOf('settleSolo(uid, "クラッシュ", bet, rawPayout,');
+    const elseAt = source.indexOf("} else {", winSettleAt);
+    const winCompleteAt = source.indexOf("recordCasinoCompletionBestEffort(services, {", winSettleAt);
+    expect(winCompleteAt).toBeGreaterThan(winSettleAt);
+    expect(winCompleteAt).toBeLessThan(elseAt);
+  });
+
+  it("loss分岐: settleSolo → recordCasinoCompletionBestEffort の順（PR F2b）", () => {
+    const source = readSource("crash");
+    const lossSettleAt = source.indexOf('settleSolo(uid, "クラッシュ", bet, 0,');
+    const lossCompleteAt = source.indexOf("recordCasinoCompletionBestEffort(services, {", lossSettleAt);
+    expect(lossCompleteAt).toBeGreaterThan(lossSettleAt);
+  });
 });
 
 describe("chinchiro（solo）: recordCasinoParticipationBestEffortはsettleChinchiroRound成功後", () => {
@@ -349,6 +399,13 @@ describe("chinchiro（solo）: recordCasinoParticipationBestEffortはsettleChinc
     const between = source.slice(startAt, settleAt);
     expect(between).not.toContain("recordCasinoParticipationBestEffort(");
   });
+
+  it("settleChinchiroRound → recordCasinoCompletionBestEffort の順（PR F2b）", () => {
+    const source = readSource("chinchiro");
+    const settleAt = source.indexOf("const round = settleChinchiroRound(");
+    const completeAt = source.indexOf("recordCasinoCompletionBestEffort(services, {", settleAt);
+    expect(completeAt).toBeGreaterThan(settleAt);
+  });
 });
 
 describe("poker（solo）: recordCasinoParticipationBestEffortはsettleSolo成功後", () => {
@@ -366,5 +423,12 @@ describe("poker（solo）: recordCasinoParticipationBestEffortはsettleSolo成�
     const settleAt = source.indexOf('settleSolo(uid, "ポーカー", bet, rawPayout,');
     const between = source.slice(startAt, settleAt);
     expect(between).not.toContain("recordCasinoParticipationBestEffort(");
+  });
+
+  it("settleSolo → recordCasinoCompletionBestEffort の順（PR F2b）", () => {
+    const source = readSource("poker");
+    const settleAt = source.indexOf('settleSolo(uid, "ポーカー", bet, rawPayout,');
+    const completeAt = source.indexOf("recordCasinoCompletionBestEffort(services, {", settleAt);
+    expect(completeAt).toBeGreaterThan(settleAt);
   });
 });
