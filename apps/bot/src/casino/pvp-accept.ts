@@ -1,6 +1,8 @@
 import type { ButtonInteraction, Message, User } from "discord.js";
+import type { CasinoActivityKey } from "@meigokujo/core";
 import type { Services } from "../services.js";
 import { acquireTransientParticipation, releaseTransientParticipation } from "./participation.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 import { claimChallenge, getChallenge, type PvpChallenge } from "./pvp-challenge.js";
 import {
   collectStakes,
@@ -10,6 +12,14 @@ import {
   type FundedPvpContext,
 } from "./pvp-common.js";
 import { pvpGame, type PvpGameKey } from "./pvp-games.js";
+
+/** 公開募集PVP(PVP_GAMES)のkey → E4 activityKeyの正規化。表示名・modeはsourceへ漏らさない。 */
+const PVP_GAME_ACTIVITY_KEYS: Record<PvpGameKey, CasinoActivityKey> = {
+  chinchiro: "chinchiro",
+  bj: "blackjack",
+  sashi: "sashi",
+  indian: "indian",
+};
 
 /**
  * 公開募集の受諾。**順序そのものがこの機能の本体**なので、経路を1本に閉じる。
@@ -283,6 +293,14 @@ function collectAndStartFunded(
     return { ok: false, kind: "error", error };
   }
   if (!stakes.ok) return { ok: false, kind: "rejected", stakes };
+
+  // 両者のcollectStakesが1回でatomicに成功し、funded gameとして開始可能になった時点(§2)。
+  // best-effort writerは同期関数（await を挟まない contract を壊さない）。
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `pvp:${session}`,
+    activityKey: PVP_GAME_ACTIVITY_KEYS[challenge.game],
+    participantUserIds: [challenge.challengerId, interaction.user.id],
+  });
 
   // 徴収成功。ここから本体呼び出しまでの間に await を挟めない
   return {

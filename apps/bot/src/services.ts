@@ -29,6 +29,7 @@ import {
   BumpCounter,
   TextActivity,
   PublicEvents,
+  CasinoParticipationHistory,
   Shop,
   ChipLedger,
   ETHER_ESCROW,
@@ -142,6 +143,9 @@ export function buildServices() {
   // 公開イベント運営ドメイン（PR E3）。称号v2専用ログではない——運営が確定した公開
   // イベントrosterの正本。generic EventLog（events）は置換しない。
   const publicEvents = new PublicEvents(db);
+  // 賭場のneutral participation正本（PR E4）。CasinoMetrics（後述、wager/payout/net
+  // を持つanalytics正本）とは完全に別module——「どの遊戯へ参加したか」だけを持つ。
+  const casinoParticipation = new CasinoParticipationHistory(db);
   // 階級要件は「〇〇以上」判定（亡霊 < 魔人 < 魔族。上位階級は下位要件の商品を買える）
   const shop = new Shop(db, ledger, events, {
     roleCheck: (memberRoleIds, requireRoleId) => meetsRoleRequirement(settings, memberRoleIds, requireRoleId),
@@ -300,6 +304,7 @@ export function buildServices() {
     bumps,
     textActivity,
     publicEvents,
+    casinoParticipation,
     shop,
     // Discord/UI と支払い系には spendable view を公開する。
     chips: spendableChips,

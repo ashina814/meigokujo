@@ -1520,6 +1520,107 @@ catalogは未施行のまま——E3はsource正本の追加までで、`/プロ
 production 99-title catalog・Series manifests・Collection Edition・shadow
 evaluation・threshold calibration・production cutoverへ進む。
 
+### Casino Safe Participation Source — E4
+
+賭場（マモンの賭場）へ、「ユーザーがどのgame familyへ参加したか」という
+neutral participation factだけを称号v2へ持ち込む。「何回賭けたか」
+「いくら賭けたか」「勝ったか負けたか」は一切source化しない——城で遊んだ
+結果として後から称号になるのであって、称号を取るために賭場で危険な行動を
+させない。
+
+**なぜTransientParticipationを使わないか**: `apps/bot/src/casino/
+participation.ts`はsolo/roulette/pvp/keibaの「現在参加中」を排他制御する
+だけのprocess-memory Map（Bot再起動で消える）——履歴ではない。ここから
+historical participationを作らない。
+
+**なぜCasinoMetricsをtitle sourceにしないか**: `CasinoMetrics`
+（`casino_metric_events`等）はwager・payout・net・amount・payloadを持つ
+analytics正本であり、raw retention policyを持つ——titleの永久証拠として
+安定した正本ではない。`game_start`だけをSELECTして安全扱いにする、
+という実装も採らない。`CasinoMetrics`はanalytics専用のまま一切変更しない。
+
+**dedicated `CasinoParticipationHistory`ドメイン**: 新規module
+`packages/core/src/casino/participation-history.ts`（`CasinoMetrics`とは
+完全に別module）が`casino_participations`テーブルを持つ。列は
+`participation_key`/`user_id`/`activity_key`/`occurred_at`だけ——wager・
+amount・payout・net・result・opponent_id・counterparty・horse・bet_type・
+roulette_number・score・rank・reason・source payloadのいずれも保存しない。
+
+**successful participation commitmentの定義**: 「賭金検証だけ」
+「seat取得だけ」「house reservationだけ」「challenge作成」「acceptボタンを
+押しただけ」は参加ではない。実際のゲームroundの資金処理/round作成が
+成功した後（solo: house reservation成立後の実round作成、roulette/keiba:
+escrow/risk/reservationを含む業務groupの成功、PVP: 両者のcollectStakesが
+成功しfunded gameとして開始可能になった時点）に参加factを記録する——
+completed game/win/lossではなく、successful funded participation。
+後からsystem error等でvoid/refundになっても、その時点で実際にfunded
+participationまで到達していたならfact自体は消さない。
+
+**production callsite audit**: solo 7種目（スロット・丁半・クラッシュ・
+チンチロ・ブラックジャック・ポーカー・ホールデム、既存の
+`recordCasinoGameStartBestEffort()`と同じhouse reservation成立直後）・
+ルーレット/競馬（`acceptRouletteBet()`/`acceptKeibaBet()`の実bet受理成功時、
+`bets.set(...)`直前）・PVP named-invite 4種目（bj-duel/chinchiro-duel/
+sashi/indian、両者のcollectStakes成功後・`runFundedX()`呼び出し前）・
+PVP公開募集（`pvp-accept.ts`の`collectAndStartFunded()`、`collectStakes()`
+1回成功後）・poker-duel（`dealHands()`/`dealHandsFromClient()`の配布直前、
+sashi/openどちらのmodeも実際に配牌が始まる瞬間）・多人数丁半
+（両側に張り手が揃った時点、`revealAndSettle()`直前）を全て監査し、
+各entrypointへ書き込みを配線した。validation失敗・reservation失敗・
+escrow不足・conflict・capacity reject・challenge作成のみ・claimだけ・
+timeoutでは一切書き込まない。
+
+**activity key mapping**: 表示名やmode文字列をそのまま保存せず、
+`packages/core/src/casino/participation-history.ts`の
+`CASINO_ACTIVITY_KEYS`（`slots`/`chohan`/`crash`/`chinchiro`/`blackjack`/
+`poker`/`holdem`/`roulette`/`keiba`/`sashi`/`indian`)を単一の真実源にする
+——writer/reader両方がこの同じallowlistを参照する（E2の
+`SAFE_PEER_ECONOMY_TYPES`と同じ考え方）。solo blackjackとPVP BJは同じ
+`"blackjack"`へ、PVP chinchiroも`"chinchiro"`へ正規化する——同じgame
+familyを「別のゲームを2個遊んだ」扱いにしない。unknown activity keyは
+writer側もreader側もfail-closedで拒否する。
+
+**gameplay failure isolation**: 称号用safe historyの書き込み失敗で
+casino gameplay自体を失敗させない。Bot側の`recordCasinoParticipationBestEffort()`
+はtry/catchで囲み、失敗してもwarning logだけに留めてgame成立処理を継続する。
+
+**daily collapse — raw play countをsourceにしない**: raw
+`casino_participations`の1行1playをそのままTitle evaluatorへ渡さない。
+新Title source`casino_activity_days`は`user × activityKey × JST calendar
+day`につき最大1 safe factへ畳み込む——同じ日にblackjackを1回遊んでも
+100回遊んでも、Title source上は`blackjack / 2026-08-22`の1件だけ。これに
+より将来のTitle ruleがraw gambling volumeを報酬化できないようにする
+（Goodhart対策）。
+
+**source contract**: `casino_participations`を`origin:"persisted"`,
+`privacy:"restricted"`, `titleUsable:false`,
+`restrictedUse:"casino_safe_participation_classification"`で登録する
+（E2の`ledger_transactions`と同じ二層構造）。`casino_activity_days`は
+`origin:"derived"`, `privacy:"safe"`, `titleUsable:true`,
+`derivedFrom:["casino_participations"]`で登録し、payload
+（`CasinoActivityDaysSourcePayload`）は`{ activityDays: [{ activityKey,
+activityDate, occurredAt }] }`だけ——participationKey・operationId・
+session・counterpart/opponent・wager・payout・net・result・betType・
+horse・roulette選択・raw play countは一切含めない。
+
+**timestamp/orderability**: `occurred_at`は「successful participation
+commitmentをこのsafe serviceへ記録した時刻」——service自身のclockが正本で、
+callerからtimestampを渡させない。同一`recordCommittedParticipation()`内の
+全participantは1 clock snapshot。E3の`recorded_at`（staffが後から入力した
+確定時刻）とは異なり、これはcommit時に直接観測した値なので、
+`casino_participations`・`casino_activity_days`とも`orderable:true`で
+登録できる——「N件目の参加を達成したexact time」としてearnedAtへ使える。
+
+**no automatic historical backfill**: 既存の`casino_metric_events`や
+Ledgerから過去のcasino participationを推測して埋めない。明示的に
+successful funded participationへ到達した瞬間だけを記録する。
+
+**明示的にスコープ外**: production 99-title catalog・casino title
+definitions・Series manifest・Collection Edition activation・shadow
+evaluation・threshold calibration・Behavior evaluatorのproduction
+wiring・profile UI・title通知・auto equip・既存`CasinoMetrics`の再設計・
+casino payout/risk/game ruleの変更。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

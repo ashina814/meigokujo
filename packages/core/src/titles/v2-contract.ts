@@ -105,14 +105,19 @@ export interface TitleSourceCodeRef {
 /**
  * `restrictedUse`が取り得る値。特定の内部専用resolverの入力としてのみ許可された
  * sourceを型として固定する（PR C2で`relationship_private_evidence`、PR E2で
- * `economy_safe_classification`を追加）。値を追加するときは対応する内部resolver
- * （`v2-relationship-evidence.ts`/`v2-economy.ts`等）を必ず作ること。
+ * `economy_safe_classification`、PR E4で`casino_safe_participation_classification`を
+ * 追加）。値を追加するときは対応する内部resolver
+ * （`v2-relationship-evidence.ts`/`v2-economy.ts`/`v2-casino.ts`等）を必ず作ること。
  *
  * 型unionとruntime allowlist（`assertRestrictedUseContract()`が使う）を別々に
  * 保守すると更新忘れが起きる——`TITLE_RESTRICTED_USES`を正本にして型を導出する
  * （PR #161レビュー）。
  */
-const TITLE_RESTRICTED_USES = ["relationship_private_evidence", "economy_safe_classification"] as const;
+const TITLE_RESTRICTED_USES = [
+  "relationship_private_evidence",
+  "economy_safe_classification",
+  "casino_safe_participation_classification",
+] as const;
 export type TitleRestrictedUse = (typeof TITLE_RESTRICTED_USES)[number];
 const VALID_TITLE_RESTRICTED_USES: ReadonlySet<string> = new Set(TITLE_RESTRICTED_USES);
 
@@ -510,6 +515,57 @@ export const TITLE_SOURCES = {
     titleUsable: true,
     epochPolicy: { type: "point", at: "recorded_at" },
     rawUnit: "staff_confirmed_public_event_participation",
+  },
+
+  // ── Casino Safe Participation Source（PR E4）────────────────────────────────
+  //
+  // 正本は`packages/core/src/casino/participation-history.ts`のCasinoParticipationHistory
+  // ——`CasinoMetrics`（wager/payout/net/resultを持つanalytics正本）は一切参照しない。
+  // raw casino_participationsは1 play=1 rowのまま（Goodhart対策のday collapseを
+  // 持たない）ので、個々の称号へ直接使わせず、
+  // restrictedUse:"casino_safe_participation_classification"経由でのみ、
+  // v2-casino.tsの内部classifierだけが読む。
+  casino_participations: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/casino/participation-history.ts",
+      needle: "INSERT INTO casino_participations",
+    },
+    calledFrom: {
+      file: "apps/bot/src/casino/blackjack.ts",
+      needle: "recordCasinoParticipationBestEffort(services, {",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "await handleAsobuCommand(interaction, services);",
+    },
+    kind: "history",
+    privacy: "restricted",
+    // occurred_atはsuccessful funded participation commit時にservice clockが直接
+    // 観測した時刻——raw単体としては順序付け可能だが、個々の称号からは直接使わせない。
+    orderable: true,
+    titleUsable: false,
+    restrictedUse: "casino_safe_participation_classification",
+    epochPolicy: { type: "point", at: "occurred_at" },
+    rawUnit: "casino_committed_participation",
+  },
+  casino_activity_days: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-casino.ts",
+      needle: "export function computeCasinoActivityDays(",
+    },
+    derivedFrom: ["casino_participations"],
+    kind: "history",
+    privacy: "safe",
+    // raw participationは1 play=1 rowだが、称号sourceとしては
+    // user×activityKey×JST dayで最大1 factへcollapseする——同日100回遊んでも1件。
+    // occurredAtはそのscope内で最初に観測したsuccessful participationのtimestamp
+    // （staffの後入力ではなく、commit時に直接観測した値）なので、orderable:trueにできる。
+    orderable: true,
+    titleUsable: true,
+    epochPolicy: { type: "point", at: "occurredAt" },
+    rawUnit: "unique_jst_casino_activity_day",
   },
 } as const satisfies Record<string, TitleSourceDefinition>;
 

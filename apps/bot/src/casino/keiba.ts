@@ -18,6 +18,7 @@ import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
 import { acquireTransientParticipation, releaseTransientParticipation } from "./participation.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 import { C_LOSE, C_MAMMON, C_WIN, E, buildLobbyEmbed } from "./ui.js";
 
 /**
@@ -206,6 +207,13 @@ export function acceptKeibaBet(
     arr.push({ userId, horseId, type, amount, operationId });
     bets.set(userId, arr);
   }
+  // 実際にbetが受理され、escrow/risk groupが成功した時点(§2)。participationKeyは
+  // session(race)+userId——同じレースへの複数口は同じidempotency identityへ収束する(§5)。
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `keiba:${session}:${userId}`,
+    activityKey: "keiba",
+    participantUserIds: [userId],
+  });
   return { ok: true };
 }
 

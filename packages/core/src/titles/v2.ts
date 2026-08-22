@@ -102,6 +102,7 @@ export {
   type ConfirmedInvitesSourcePayload,
   type EconomySafePeerActionsSourcePayload,
   type PublicEventParticipationsSourcePayload,
+  type CasinoActivityDaysSourcePayload,
   type TextActiveDaysSourcePayload,
   type TitleSourcePayloads,
   type VcEmptyStartThenJoinedSourcePayload,
@@ -115,6 +116,14 @@ export {
 // ruleへ注入できる経路を作らない。SAFE_PEER_ECONOMY_TYPES allowlistもinternalのまま。
 // 公開してよいのはpayload型と、その`kind`フィールドの型だけ。
 export { type SafePeerEconomyActionKind } from "./v2-economy.js";
+
+// v2-casino.ts の computeCasinoActivityDays()（PR E4の内部classifier正本）はここでは
+// exportしない——callerがraw casino_participations由来のfactを直接組み立ててruleへ
+// 注入できる経路を作らない。CASINO_ACTIVITY_KEYS allowlist・CasinoParticipationHistory
+// もここからは公開しない（`../casino/participation-history.js`から直接importして構わない
+// が、v2 title barrel経由の公開APIには含めない）。公開してよいのはpayload型と、
+// その`activityKey`フィールドの型だけ。
+export { type CasinoActivityKey } from "../casino/participation-history.js";
 
 export {
   defineTitleRule,

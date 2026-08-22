@@ -33,6 +33,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🃏 ブラックジャック（対マモン・ソロ）。
@@ -177,6 +178,11 @@ async function runRoundInner(
     operationId: interaction.id,
     wager: bet,
     source: playContext.source,
+  });
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `solo:blackjack:${interaction.id}`,
+    activityKey: "blackjack",
+    participantUserIds: [uid],
   });
   const deck = newDeck(services.rng);
   const player: Card[] = [deck.pop()!, deck.pop()!];

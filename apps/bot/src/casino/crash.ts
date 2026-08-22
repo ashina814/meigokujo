@@ -34,6 +34,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 📈 クラッシュ。casino-bot 準拠の忠実移植。
@@ -158,6 +159,11 @@ async function runRoundInner(
     operationId: interaction.id,
     wager: bet,
     source: playContext.source,
+  });
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `solo:crash:${interaction.id}`,
+    activityKey: "crash",
+    participantUserIds: [uid],
   });
   const crashPoint = generateCrashPoint(services.rng);
 

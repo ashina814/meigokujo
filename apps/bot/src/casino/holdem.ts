@@ -31,6 +31,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🃏 テキサスホールデム（対マモン簡易版・ソロ）。
@@ -248,6 +249,11 @@ async function runRoundInner(
     operationId: interaction.id,
     wager: ante,
     source: playContext.source,
+  });
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `solo:holdem:${interaction.id}`,
+    activityKey: "holdem",
+    participantUserIds: [uid],
   });
   const deck = newDeck(services.rng);
   const pHand: [Card, Card] = [deck.pop()!, deck.pop()!];

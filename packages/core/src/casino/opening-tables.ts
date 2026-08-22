@@ -395,6 +395,18 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "Daily aggregate analytics derived from raw/formal chip records. Old metrics are not carried across formal opening.",
   }),
   T({
+    table: "casino_participations",
+    purpose: "PR E4: neutral casino activity-participation facts for the safe title source (no wager/payout/result)",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "packages/core/src/casino/participation-history.ts. Non-financial neutral participation history (same category as casino_metric_events/casino_stats). Old pre-formal-opening participation facts are not carried across formal opening.",
+  }),
+  T({
     table: "casino_daily_risk_days",
     purpose: "Per-user formal-day risk snapshots for casino loss-limit enforcement",
     kind: "optional_feature",

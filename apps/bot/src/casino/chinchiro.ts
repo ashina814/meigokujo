@@ -49,6 +49,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🎲 チンチロ（対マモン・casino-bot 準拠の忠実移植）。
@@ -390,6 +391,11 @@ async function runRoundInner(
     operationId: interaction.id,
     wager: bet,
     source: playContext.source,
+  });
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `solo:chinchiro:${interaction.id}`,
+    activityKey: "chinchiro",
+    participantUserIds: [uid],
   });
   const startEmbed = new EmbedBuilder()
     .setTitle("🎲 チンチロ")

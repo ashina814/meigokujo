@@ -31,6 +31,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🎴 丁半（ソロ・casino-bot 準拠）。
@@ -117,6 +118,11 @@ async function runRoundInner(
     operationId: interaction.id,
     wager: bet,
     source: playContext.source,
+  });
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `solo:chohan:${interaction.id}`,
+    activityKey: "chohan",
+    participantUserIds: [uid],
   });
 
   const bettingEmbed = new EmbedBuilder()

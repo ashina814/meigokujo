@@ -16,6 +16,7 @@ import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET } from "./common.js";
 import { collectStakes, refundAll, settlePvp, settleProportional, stakeFailureText, voidPvpTable } from "./pvp-common.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 import { C_JACKPOT, C_LOSE, C_MAMMON, C_WIN } from "./ui.js";
 
 /**
@@ -481,7 +482,23 @@ async function autoDeal(client: import("discord.js").Client, s: Session, service
 }
 
 // ─── 配布 ────────────────────────────────────────
+
+/**
+ * sashi/openどちらのmodeでも、実際に配牌が始まる = 現在の`s.players`全員のcollectStakes
+ * が既に成功しfunded gameとして開始可能になった瞬間（§2）。open modeは参加者ごとに
+ * 個別にcollectStakesが成立するが、実際に遊べる牌が配られるのはここだけなので、
+ * 「開いただけで最低人数に届かず不成立」のhostを参加者扱いしない。
+ */
+function recordPokerDuelParticipation(services: Services, s: Session): void {
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `pvp:${s.id}`,
+    activityKey: "poker",
+    participantUserIds: [...s.players.keys()],
+  });
+}
+
 async function dealHands(interaction: ButtonInteraction, s: Session, services: Services): Promise<void> {
+  recordPokerDuelParticipation(services, s);
   const deck = newDeck(services.rng);
   for (const p of s.players.values()) {
     p.hand = [deck.pop()!, deck.pop()!, deck.pop()!, deck.pop()!, deck.pop()!];
@@ -494,6 +511,7 @@ async function dealHands(interaction: ButtonInteraction, s: Session, services: S
 }
 
 async function dealHandsFromClient(client: import("discord.js").Client, s: Session, services: Services): Promise<void> {
+  recordPokerDuelParticipation(services, s);
   const deck = newDeck(services.rng);
   for (const p of s.players.values()) {
     p.hand = [deck.pop()!, deck.pop()!, deck.pop()!, deck.pop()!, deck.pop()!];

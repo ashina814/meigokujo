@@ -46,6 +46,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🎰 スロット。casino-bot 準拠。数値モデルは core/casino/slots-model へ委譲。
@@ -191,6 +192,11 @@ async function runPaidSpin(
         operationId: interaction.id,
         wager: bet,
         source: playContext.source,
+      });
+      recordCasinoParticipationBestEffort(services, {
+        participationKey: `solo:slots:${interaction.id}`,
+        activityKey: "slots",
+        participantUserIds: [interaction.user.id],
       });
       const record = spinPaid(services, interaction.user.id, bet, interaction.id);
       reconcileSlotsGameFinishBestEffort(services, interaction.user.id, interaction.id);

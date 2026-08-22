@@ -30,6 +30,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🃏 ドローポーカー（Jacks or Better・ソロ）。対胴元の簡易版。
@@ -200,6 +201,11 @@ async function runRoundInner(
     operationId: interaction.id,
     wager: bet,
     source: playContext.source,
+  });
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `solo:poker:${interaction.id}`,
+    activityKey: "poker",
+    participantUserIds: [uid],
   });
   const deck = newDeck(services.rng);
   const hand: Card[] = [];
