@@ -107,8 +107,14 @@ export interface TitleSourceCodeRef {
  * sourceを型として固定する（PR C2で`relationship_private_evidence`、PR E2で
  * `economy_safe_classification`を追加）。値を追加するときは対応する内部resolver
  * （`v2-relationship-evidence.ts`/`v2-economy.ts`等）を必ず作ること。
+ *
+ * 型unionとruntime allowlist（`assertRestrictedUseContract()`が使う）を別々に
+ * 保守すると更新忘れが起きる——`TITLE_RESTRICTED_USES`を正本にして型を導出する
+ * （PR #161レビュー）。
  */
-export type TitleRestrictedUse = "relationship_private_evidence" | "economy_safe_classification";
+const TITLE_RESTRICTED_USES = ["relationship_private_evidence", "economy_safe_classification"] as const;
+export type TitleRestrictedUse = (typeof TITLE_RESTRICTED_USES)[number];
+const VALID_TITLE_RESTRICTED_USES: ReadonlySet<string> = new Set(TITLE_RESTRICTED_USES);
 
 /** 全sourceに共通するメタデータ。persisted/derivedのどちらでも同じ意味で使う。 */
 interface TitleSourceCommon {
@@ -521,16 +527,24 @@ export function assertDerivedSourceDependenciesResolve(
 }
 
 /**
- * `restrictedUse`契約をfail-closedで検証する（PR C2）。`restrictedUse`を持つsourceは
- * 必ず`privacy==="restricted"`かつ`titleUsable===false`でなければならない——
- * safe/forbidden sourceへ`restrictedUse`を付けたり、generic title ruleから読めてしまう
- * `titleUsable:true`のsourceを「実は内部専用」と偽装したりすることを防ぐ。
+ * `restrictedUse`契約をfail-closedで検証する（PR C2、PR #161レビューで未知値
+ * validationを追加）。`restrictedUse`を持つsourceは:
+ * - 既知の`TitleRestrictedUse`値でなければならない——TypeScriptを迂回して
+ *   （`as any`等で）未登録の文字列を渡された場合でもruntimeで拒否する。
+ * - 必ず`privacy==="restricted"`かつ`titleUsable===false`でなければならない——
+ *   safe/forbidden sourceへ`restrictedUse`を付けたり、generic title ruleから
+ *   読めてしまう`titleUsable:true`のsourceを「実は内部専用」と偽装したりする
+ *   ことを防ぐ。
  */
 export function assertRestrictedUseContract(
   sources: Record<string, TitleSourceDefinition> = TITLE_SOURCES,
 ): void {
   for (const [key, source] of Object.entries(sources)) {
-    if (source.restrictedUse === undefined) continue;
+    const restrictedUse = (source as { restrictedUse?: unknown }).restrictedUse;
+    if (restrictedUse === undefined) continue;
+    if (typeof restrictedUse !== "string" || !VALID_TITLE_RESTRICTED_USES.has(restrictedUse)) {
+      throw new Error(`title source ${key}: unknown restrictedUse`);
+    }
     if (source.privacy !== "restricted") {
       throw new Error(`title source ${key}: restrictedUse requires privacy==="restricted" (got ${source.privacy})`);
     }
