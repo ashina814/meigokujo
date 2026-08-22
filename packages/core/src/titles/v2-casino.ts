@@ -113,6 +113,16 @@ export interface CasinoCompletedActivityDayFact {
  *
  * 相手（counterpart）userIdはgroup検証のために内部で読むが、safe payloadには
  * 一切出さない——requestされた`userIds`に含まれる参加者の分だけfactを返す。
+ *
+ * PR #166レビューBLOCKER3: candidate participationKeyの集合をSQL host parameter
+ * （`IN (?,?,...)`）へ展開してはならない——D1が`userIds`を`BULK_USER_CHUNK_SIZE`で
+ * chunkしているのはSQLiteのbind変数上限を守るためであり、historicalに無制限へ
+ * 増え得るparticipationKey数をそのままbind変数へ展開すると同じ上限へ再度衝突する
+ * （global scopeでは1 userチャンクでも累積completion件数はいくらでも増え得る）。
+ * そのためcandidate keyの算出はCTE（`candidate_keys`）で行い、commitment/completion
+ * どちらのfull group取得もそのCTEへJOINする形にする——bind変数は常に「requested
+ * userIds（既に上限済み）+ window境界2個」だけに保たれ、candidate key数には
+ * 一切依存しない。
  */
 export function computeCasinoCompletedActivityDays(
   db: Database.Database,
@@ -123,34 +133,37 @@ export function computeCasinoCompletedActivityDays(
 
   const requestedUserIds = new Set(userIds);
   const userPlaceholders = userIds.map(() => "?").join(",");
+  const candidateKeysCte = `
+    WITH candidate_keys AS (
+      SELECT DISTINCT participation_key FROM casino_participation_completions
+       WHERE user_id IN (${userPlaceholders}) AND completed_at >= ? AND completed_at < ?
+    )`;
+  const bindParams = [...userIds, window.start, window.end];
 
-  const candidateKeyRows = db
+  const completionRows = db
     .prepare(
-      `SELECT DISTINCT participation_key FROM casino_participation_completions
-        WHERE user_id IN (${userPlaceholders}) AND completed_at >= ? AND completed_at < ?`,
+      `${candidateKeysCte}
+       SELECT c.participation_key AS participation_key, c.user_id AS user_id, c.completed_at AS completed_at
+         FROM casino_participation_completions c
+         JOIN candidate_keys k ON k.participation_key = c.participation_key`,
     )
-    .all(...userIds, window.start, window.end) as Array<{ participation_key: string }>;
-  if (candidateKeyRows.length === 0) return [];
-  const candidateKeys = candidateKeyRows.map((r) => r.participation_key);
-  const keyPlaceholders = candidateKeys.map(() => "?").join(",");
+    .all(...bindParams) as Array<{ participation_key: string; user_id: string; completed_at: number }>;
+  if (completionRows.length === 0) return [];
 
   const commitmentRows = db
     .prepare(
-      `SELECT participation_key, user_id, activity_key, occurred_at FROM casino_participations
-        WHERE participation_key IN (${keyPlaceholders})`,
+      `${candidateKeysCte}
+       SELECT p.participation_key AS participation_key, p.user_id AS user_id,
+              p.activity_key AS activity_key, p.occurred_at AS occurred_at
+         FROM casino_participations p
+         JOIN candidate_keys k ON k.participation_key = p.participation_key`,
     )
-    .all(...candidateKeys) as Array<{
+    .all(...bindParams) as Array<{
     participation_key: string;
     user_id: string;
     activity_key: string;
     occurred_at: number;
   }>;
-  const completionRows = db
-    .prepare(
-      `SELECT participation_key, user_id, completed_at FROM casino_participation_completions
-        WHERE participation_key IN (${keyPlaceholders})`,
-    )
-    .all(...candidateKeys) as Array<{ participation_key: string; user_id: string; completed_at: number }>;
 
   const commitmentsByKey = new Map<string, typeof commitmentRows>();
   for (const row of commitmentRows) {
@@ -164,6 +177,7 @@ export function computeCasinoCompletedActivityDays(
     if (group) group.push(row);
     else completionsByKey.set(row.participation_key, [row]);
   }
+  const candidateKeys = [...completionsByKey.keys()];
 
   const seen = new Set<string>();
   const facts: CasinoCompletedActivityDayFact[] = [];

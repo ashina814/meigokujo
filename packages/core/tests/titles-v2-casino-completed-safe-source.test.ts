@@ -493,6 +493,97 @@ describe("R. corrupt completed_at < occurred_at（BLOCKER1-E / 条件6）", () =
   });
 });
 
+/**
+ * PR #166レビューBLOCKER3: `computeCasinoCompletedActivityDays()`はcandidate
+ * participationKeyの集合をSQL host parameterへ展開してはならない——D1が
+ * `userIds`を`BULK_USER_CHUNK_SIZE`でchunkしているのはSQLiteのbind変数上限
+ * を守るためであり、historicalに無制限へ増え得るparticipationKey数をそのまま
+ * bind変数へ展開すると同じ上限へ再度衝突する。CTEベースの実装は、bind変数を
+ * 「requested userIds（既に上限済み）+ window境界2個」だけに保つ。
+ */
+describe("T. BLOCKER3: bind parameter数はcandidate participationKey数に依存しない（構造test）", () => {
+  it("2000件のdistinct participationKeyが存在しても、実行されるSQLのbind parameter数はrequested userIds+window境界の範囲に収まる", () => {
+    const { db, store, casino, setCasinoClock } = setup();
+    setCasinoClock(BASE - 50_000);
+    const KEY_COUNT = 2000;
+    for (let i = 0; i < KEY_COUNT; i++) {
+      recordCompleted(casino, {
+        activityKey: "slots",
+        participantUserIds: ["alice"],
+        participationKey: `solo:slots:op-${i}`,
+      });
+    }
+    const scope = resolveTitleScope(store, CASINO_COMPLETED_ACTIVITY_DAYS_RULE.definition, OBSERVED_AT);
+
+    const originalPrepare = db.prepare.bind(db);
+    const capturedSql: string[] = [];
+    const spiedDb = db as unknown as { prepare: (sql: string) => ReturnType<typeof db.prepare> };
+    spiedDb.prepare = (sql: string) => {
+      capturedSql.push(sql);
+      return originalPrepare(sql);
+    };
+    let payload: ReturnType<typeof readTitleSource>;
+    try {
+      payload = readTitleSource(db, "casino_completed_activity_days", "alice", scope);
+    } finally {
+      spiedDb.prepare = originalPrepare;
+    }
+
+    // day collapse: 2000回同日slotsをcompletionしても1件のまま(正しさも一緒に確認する)
+    expect(payload.activityDays).toHaveLength(1);
+
+    const relevantSql = capturedSql.filter((sql) => sql.includes("casino_participation"));
+    expect(relevantSql.length).toBeGreaterThan(0);
+    for (const sql of relevantSql) {
+      const bindCount = (sql.match(/\?/g) ?? []).length;
+      // requested userIds(1件) + window境界(start/end=2個) = 高々数個。
+      // KEY_COUNT(2000)に比例して増えていないことがこのassertionの本体——
+      // `candidateKeys.map(() => "?")`のような実装へ回帰すると、このSQLの
+      // bind数がKEY_COUNTへ比例増加し、このassertionが実際にfailする。
+      expect(bindCount).toBeLessThan(KEY_COUNT);
+      expect(bindCount).toBeLessThanOrEqual(10);
+    }
+  });
+});
+
+describe("U. BLOCKER3: 大量のdistinct participationKeyでも正しく動作する（correctness at scale）", () => {
+  it("2000件のPVP completion(alice×別counterpart)があってもreaderは成功し、day collapse・counterpart非漏洩・single/bulk一致を保つ", () => {
+    const { db, store, casino, setCasinoClock } = setup();
+    setCasinoClock(BASE - 50_000);
+    const KEY_COUNT = 2000;
+    for (let i = 0; i < KEY_COUNT; i++) {
+      recordCompleted(casino, {
+        activityKey: "sashi",
+        participantUserIds: ["alice", `counterpart-${i}`],
+        participationKey: `pvp:scale:${i}`,
+      });
+    }
+    const scope = resolveTitleScope(store, CASINO_COMPLETED_ACTIVITY_DAYS_RULE.definition, OBSERVED_AT);
+
+    // reader成功 + day collapse: 2000件とも同日同activityKeyなので1件へ畳み込まれる
+    let alicePayload!: ReturnType<typeof readTitleSource<"casino_completed_activity_days">>;
+    expect(() => {
+      alicePayload = readTitleSource(db, "casino_completed_activity_days", "alice", scope);
+    }).not.toThrow();
+    expect(alicePayload!.activityDays).toHaveLength(1);
+
+    // counterpart identityの非漏洩(2000人分のcounterpart-*が一切出ない)
+    const serialized = JSON.stringify(alicePayload!);
+    expect(serialized).not.toContain("counterpart-");
+    expect(serialized).not.toContain("pvp:scale:");
+
+    // single/bulk equivalence: 大量candidate下でも一致する
+    const single = new TitleSourceCache();
+    const bulk = new TitleSourceCache();
+    bulk.prefetch(db, "casino_completed_activity_days", ["alice", "counterpart-0", "counterpart-1999"], scope);
+    for (const userId of ["alice", "counterpart-0", "counterpart-1999"]) {
+      expect(bulk.get(db, "casino_completed_activity_days", userId, scope)).toEqual(
+        single.get(db, "casino_completed_activity_days", userId, scope),
+      );
+    }
+  });
+});
+
 describe("S. positive control（BLOCKER1-F）: 有効なPVP 2人completionは正しくemitされる", () => {
   it("alice/bobとも同一activityKey/activityDate/completedAtの正しい1 factを受け取る（他条件が壊れていないことの対照実験）", () => {
     const { db, store, casino, setCasinoClock } = setup();
