@@ -121,15 +121,18 @@ export {
   type VcSegmentStartReason,
   type PresenceSummary,
 } from "./vc/service.js";
+// computeCoPresenceOverlaps() / CoPresenceOverlap はrootからもexportしない（PR C2
+// round 3レビュー）。生pairwise relationship data（userA/userB含む）を返すため、
+// package public API全体からrestricted pairwise dataへ到達できないようにする——
+// packages/core/src/titles/v2.tsと同じ理由。repo内に外部callsiteが無いことを確認済み
+// （vc/service.tsのVcTracker等、他の本番経路はこの関数を使わない）。
 export {
-  computeCoPresenceOverlaps,
   computeEmptyStartThenJoined,
   computeGroupSizeSeconds,
   computeLastOccupant,
   computeLogicalVisits,
   computeSafeSocialAggregates,
   isTrustedVisitEnd,
-  type CoPresenceOverlap,
   type EmptyStartThenJoinedFact,
   type GroupSizeSeconds,
   type LastOccupantFact,

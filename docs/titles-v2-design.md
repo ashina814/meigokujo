@@ -779,6 +779,132 @@ wiring/daily reconcile・source expansion・production 99-title catalog・
 shadow evaluation/threshold calibration・production cutover
 （`/プロフィール` read-only化・《名乗り》UI・notification等）。
 
+### Relationship private evidence（PR C2）
+
+「特定の同じ相手との関係が積み重なった」ことを表すbehavior title（将来の再縁・深縁・
+腐れ縁・宿縁等）のための、private witness resolution境界と非開示契約。
+
+**Public semantic / Private witnessの分離**:
+
+- `vc_social_safe`（`privacy: safe`, `titleUsable: true`）: 公開semanticとして
+  relationship titleが依存を宣言するsource。counterpart identityを含まない集計値
+  （`distinctCoPresentUsers`/`maxRepeatedDaysWithOneCounterpart`/
+  `trustedOverlapSeconds`）だけを持つ——B/C1から変更していない。
+- `vc_co_presence`（`privacy: restricted`, `titleUsable: false`,
+  `restrictedUse: "relationship_private_evidence"`）: 生pairwise data
+  （counterpart identityを含む）。**この用途のためにtitleUsableをtrueへ緩めていない**
+  ——`restrictedUse`は「特定の内部private-evidence resolverだけが読んでよい」という
+  用途を型として固定するラベルであり、`assertRestrictedUseContract()`が
+  `privacy==="restricted"` かつ `titleUsable===false` を強制する（safe/forbidden
+  sourceへ`restrictedUse`を付けることも禁止）。generic source reader coverage
+  （`v2-sources.ts`の`SOURCE_READERS`）には引き続き追加しない——`readTitleSource()`
+  経由でruleから読むことはできないまま。
+
+**generic ruleはrestricted sourceを読めない**: `vc_co_presence`は
+`v2-relationship-evidence.ts`（internal、`v2.ts`から一切exportしない）だけが
+`computeCoPresenceOverlaps()`を呼んで読む。generic `TitleRule`/`MetaTitleRule`へ
+counterpart identity・raw pair row・Database・Storeを渡す経路は無い。
+
+**relationship ruleはanonymous candidateだけ見る**: `RelationshipTitleRule`
+（`v2-relationship.ts`）はgeneric `TitleRule`とは別contract。`evaluateCandidate()`
+へ渡す`RelationshipTitleRuleContext`は`{ scope, candidate }`のみ——`candidate`
+（`RelationshipCandidateSnapshot`）は`{ repeatedJstDays, trustedOverlapSeconds }`
+だけを持ち、counterpartUserId・userA/userB・channelId・jstDays[]の実日付等は一切
+含まない。userId・Database・Store・source cache・全candidate一覧もcontextへ渡さない
+——1candidateずつ評価する。`sources`はVC co-presence専用に限定し、exactly
+`["vc_social_safe"]`を要求する（`defineBehaviorTitle()`の既存registry検証を
+再利用するための宣言であり、実際の候補解決は`vc_social_safe`を`readTitleSource()`
+経由で読むわけではなく、restricted resolverが直接`vc_co_presence`から解決する）。
+
+**候補の全件評価とdeterministic witness選択**: subjectと重なった各counterpartについて、
+匿名candidateを1件ずつruleへ渡す（呼び出し順はcounterpartUserId code-unit ASCで
+決定的、localeCompareは使わない）。1件でもmatchedならtitleはmatched。複数candidateが
+matchedした場合、private evidenceとして保存するprimary witnessを決定的に1人選ぶ
+（`selectPrimaryWitness()`、優先順: repeatedJstDays DESC → trustedOverlapSeconds DESC
+→ counterpartUserId code-unit ASC、内部tie-breakのみ）。
+
+**earnedAtは常にnull**: `vc_co_presence`は`orderable: false`であり秒精度tieや
+trust境界もあるため、「N日目を達成した正確な時刻」をprocessing timeから捏造しない。
+`RelationshipTitleRuleResult`はearnedAtを持たない——`evaluateRelationshipTitle()`が
+award時に常に`earnedAt: null`を固定する（B2の通常ルールに従い、closed Collection
+Editionでpost-close awardされたrelationship titleは旧editionへcreditされない。
+historical exact achievement timeを主張しない）。
+
+**private evidence provenance**: `v2-relationship-evidence.ts`の
+`resolveRelationshipPrivateEvidence()`だけが`ResolvedRelationshipPrivateEvidence`を
+作れる（`v2-scope.ts`の`ResolvedTitleScope`・`v2-pipeline.ts`のEvaluation Plan
+provenanceと同じWeakMap identity方式）。callerが手書きの
+`{counterpartUserId:"...", repeatedJstDays:999}`のようなobjectを
+`TitleV2Store.awardRelationship()`へ渡すことはできない。canonical provenanceは
+`(subjectUserId, titleKey, scopeKey, observedAt, counterpartUserId,
+repeatedJstDays, trustedOverlapSeconds)`を保持し、`requireRelationshipEvidenceProvenance()`
+がtitle A用に解決したevidenceをtitle Bへ・別userへ・別scopeへsubstituteすることを拒否する。
+
+**DB private evidence**: `title_relationship_private_evidence`
+（`user_id, title_key, scope_key`をPKに、`counterpart_user_id`/`repeated_jst_days`/
+`trusted_overlap_seconds`/`evidence_version`/`captured_at`を持つ）に、
+counterpart identityを含むaudit evidenceを保持するが**一切非公開**。identityは
+award occurrence単位（`user_id, title_key, scope_key`）——ownership単位ではない
+（同じrelationship titleを月ごとに複数scope awardすれば、各scopeで別private witness
+を持ち得る）。`title_ownerships`へcounterpartを追加しない——「このtitleはBobとの
+titleだからownership identityもBob込み」にはしない。counterpart_user_idへ
+users table相当のFKは張らない——historical evidenceであり、相手が後にguildを
+抜けても過去のtitle evidenceを壊さない。
+
+**award bundle（4-way atomicity）**: `TitleV2Store.awardRelationship()`が、
+既存の`award()`と共有する`performAward()`（private）を通じて、単一
+`BEGIN IMMEDIATE` transaction内で `title_awards` / `title_award_facts` /
+`title_ownerships`+rarity sequence（first ownership時だけ） / private evidence
+を確定する。どれか1つ失敗すれば全部rollbackする。冪等呼び出し（既にaward済みの
+`(user,title,scope)`への再評価）は、facts・ownership・**private evidenceも**
+一切変更しない——後からより強いcandidateが現れてもfirst persisted witnessを
+上書きしない。award行があるのにevidenceが無い状態を発見したら、現在の候補から
+自動backfillせずintegrity violationとしてfail-closedする（B1のfacts/ownership方針と
+同じ）。Store constructionにはruntime evaluation planが無いため「このtitleKeyは
+relationship titleだからevidence必須」という判定はできない——`assertRelationshipEvidenceIntegrity()`
+は既に存在するevidence行の内容・chronology一致（`captured_at===award.awarded_at`）
+だけを検証し、missing evidenceの検出は`hasRelationshipAward()`（読み取り境界）と
+`awardRelationship()`（書き込み境界）が個別にfail-closedする。error messageに
+counterpart_user_idを含めない。
+
+**non-disclosure**: counterpart_user_idは以下へ一切流さない——awardFacts・
+title ownership・profile・Meta snapshot・pipeline result（`RelationshipTitleEvaluationResult`
+にcounterpart fieldは無い）・notification・generic title source・analytics export・
+public API。`@meigokujo/core/titles/v2`は`defineRelationshipTitleRule()`と
+counterpart identityを含まないcontract type（`RelationshipCandidateSnapshot`/
+`RelationshipTitleRuleContext`/`RelationshipTitleRuleResult`/
+`RelationshipTitleEvaluationResult`）だけを公開する。`resolveRelationshipCandidates()`/
+`resolveRelationshipPrivateEvidence()`/`requireRelationshipEvidenceProvenance()`/
+`evaluateRelationshipTitle()`はexportしない——counterpartをpublicに読める
+raw read API（`listRelationshipEvidence()`等）は今回作らない。
+
+**lifecycle / read minimization**: `active`はcandidate matchでaward。`retired`は
+新規awardしない——既存awardの有無を`hasRelationshipAward()`（safe existence check、
+counterpartを返さない）だけで確認し、**restricted candidateを解決しに行かない**
+（privacy minimization）。`disabled`はscopeも解決せず、restricted sourceも読まず、
+ruleの`evaluateCandidate()`も呼ばない。restricted `vc_co_presence`を読むのは、
+active relationship ruleが実際にtrigger対象になったpassだけ——trigger対象外・
+disabled・retired・generic title evaluation・Meta evaluation・collection
+progress等では読まない。
+
+**Evaluation Plan / Pipeline統合**: `defineTitleEvaluationPlan(behaviorRules,
+metaRules, relationshipRules = [])`——3引数目は省略可で既存2引数呼び出しはそのまま
+動く。key uniquenessはgeneric behavior / relationship behavior / metaの全横断
+——どの組で同じv2 keyを使ってもreject。relationshipRulesもPR #156のcanonical
+compiled plan（WeakMap provenance）へ同じcanonicalize/freezeを適用する——plan
+構築後に元ruleのdefinitionを書き換えてもpipeline semanticsは変わらない。
+pipeline順序は: generic Behavior rules → Relationship Behavior rules →
+Series Mastery reconcile → Meta snapshot構築 → Meta rules。Meta snapshotの
+`behaviorOwnershipCount`にはgeneric behavior + relationship behaviorの両方の
+ownershipを数える（meta ownership・rank title unlockは数えない、既存契約を維持）。
+`TitleUserPipelineResult`に`relationship: RelationshipTitleEvaluationResult[]`を
+追加——counterpart identityは含まない。
+
+**follow-up（C2の範囲外）**: counterpartを本人へ開示する機能は今回実装しない
+——将来別PRで、caller authorization・disclosure policy・必要ならmutual consent・
+audit・output minimizationを設計する。「DBにあるからそのまま返す」は禁止。
+今回はprivate evidence persistence + non-disclosure boundaryまで。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。
