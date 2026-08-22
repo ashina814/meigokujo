@@ -1648,6 +1648,45 @@ evaluation・threshold calibration・Behavior evaluatorのproduction
 wiring・profile UI・title通知・auto equip・既存`CasinoMetrics`の再設計・
 casino payout/risk/game ruleの変更。
 
+### F1 — Catalog Convergence
+
+E4までで基盤（source contract / catalog epoch / award ownership /
+series・collection engine / meta pipeline）が揃った後、`meigoku_title_v2_
+catalog_99_fullclear.xlsx`（正本sheet: `Catalog_99_FINAL` / `Summary` /
+`Source_Map` / `Collection_Review` / `FullClear_Manifest`）で確定した
+99概念の候補カタログと、現repoの実装状況を機械的に突き合わせる
+**convergence PR**。「99個を今すぐaward可能にする」PRではない。
+
+- **xlsx `Catalog_99_FINAL` がconcept正本**。`packages/core/src/titles/
+  v2-catalog-candidates.ts`が原文を機械転記する（言い換えない、planning専用、
+  production runtime pathから完全に切り離す）。
+- **provisional keyはまだproduction immutable keyではない**。xlsxの「仮key」を
+  `provisionalKey`としてそのまま保持するが、source・threshold・scopeが
+  確定してから正式key化する（xlsx Summaryの契約と同じ）。
+- **99 = 91 behavior + 8 meta**。Collection Credit COUNTABLE 43 /
+  NONCOUNT 56、Full-clear REQUIRED 91 / EXEMPT_META 8。Collection Credit
+  とFull Clearは別概念——NONCOUNTでもbehavior 91件全件がFull-clear
+  REQUIRED候補（NONCOUNT ≠ Full Clear不要）。
+- **readinessとreleaseは別**。`packages/core/src/titles/
+  v2-catalog-readiness.ts`が現repoとの突き合わせ監査（READY/PARTIAL/
+  BLOCKED/META、blockerKinds、thresholdCategory、evidence）を持つ——
+  READYは「今すぐreleaseしてよい」ではなく「sourceが意味を落とさず
+  表現できる」だけの意味。thresholdの実数値・Series/Collection Edition
+  activation・production評価配線は別途。
+- **current source reconciliation方式**: xlsx作成時点のSource_Mapを
+  そのままコピーせず、PR #149〜#163後の現repoを実際に読んで再判定する
+  （E2 economy safe classification・E3 public event participation・
+  E4 casino safe activity-dayはxlsx作成後に実装が進んでいるため）。詳細は
+  `docs/titles-v2-catalog-readiness.md`。
+- **no fake sources**: READY判定の根拠は必ず既存`titleUsable:true`の
+  source keyまたは実在するspecialized resolver——「似たsourceがある」
+  だけではREADYにしない。
+- **no threshold guessing**: 分布TBDの候補に仮の数値（「とりあえず3日」等）
+  を一切入れない。`thresholdCategory: THRESHOLD_PENDING`として明示する。
+- **no full-clear activation yet**: 現時点で未実装titleが多数あるため、
+  production Collection Editionをこのpr で作成・activateしない——91件を
+  今activeなeditionへ登録すると、取得不能なfull-clearを作ってしまう。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。
