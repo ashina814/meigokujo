@@ -34,6 +34,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 📈 クラッシュ。casino-bot 準拠の忠実移植。
@@ -267,6 +268,13 @@ async function runRoundInner(
     // 福の重みは維持（低残高帯では 0% なので影響なし・高残高帯ではプレイヤーから JP/救済へ流す）。
     // お守りの消費も賭け・配当と同じグループの中（settleSolo）
     const settled = services.casino.settleSolo(uid, "クラッシュ", bet, rawPayout, { chain: false, operationId: interaction.id, reservationKey });
+    // settleSolo()が実際に降車倍率・賭け・配当を単一atomic transactionで確定させた
+    // 正本——ここへ到達した時点で初めて「実際のroundが成立した」と言える（PR #163レビュー§3）。
+    recordCasinoParticipationBestEffort(services, {
+      participationKey: `solo:crash:${interaction.id}`,
+      activityKey: "crash",
+      participantUserIds: [uid],
+    });
     recordCasinoGameFinishBestEffort(services, {
       userId: uid,
       game: "クラッシュ",
@@ -301,6 +309,11 @@ async function runRoundInner(
     const lossSettled = services.casino.settleSolo(uid, "クラッシュ", bet, 0, {
       chain: false,
       operationId: interaction.id, reservationKey,
+    });
+    recordCasinoParticipationBestEffort(services, {
+      participationKey: `solo:crash:${interaction.id}`,
+      activityKey: "crash",
+      participantUserIds: [uid],
     });
     recordCasinoGameFinishBestEffort(services, {
       userId: uid,

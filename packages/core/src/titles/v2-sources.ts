@@ -9,6 +9,8 @@ import {
 import { TITLE_SOURCES, type TitleSourceDefinition, type TitleUsableSourceKey } from "./v2-contract.js";
 import { assertResolvedTitleScope, resolvedScopeEffectiveEnd, type ResolvedTitleScope } from "./v2-scope.js";
 import { computeSafeEconomyPeerActions, type SafePeerEconomyActionKind } from "./v2-economy.js";
+import { computeCasinoActivityDays } from "./v2-casino.js";
+import type { CasinoActivityKey } from "../casino/participation-history.js";
 
 /**
  * 称号ruleがraw DBを直接触らないようにするための、source読み込み境界。
@@ -93,6 +95,19 @@ export interface PublicEventParticipationsSourcePayload {
   }>;
 }
 
+/**
+ * PR E4: activityKey・activityDate・occurredAtだけを公開する。participationKey・
+ * operationId・session・counterpart/opponent・wager・payout・net・result・betType・
+ * horse・roulette選択・raw play countは一切含めない。
+ */
+export interface CasinoActivityDaysSourcePayload {
+  readonly activityDays: ReadonlyArray<{
+    readonly activityKey: CasinoActivityKey;
+    readonly activityDate: string;
+    readonly occurredAt: number;
+  }>;
+}
+
 /** sourceKeyごとのsanitized payload型。相手のuserId・raw message ID等は一切含めない。 */
 export interface TitleSourcePayloads {
   bump_events: BumpEventsSourcePayload;
@@ -104,6 +119,7 @@ export interface TitleSourcePayloads {
   confirmed_invites: ConfirmedInvitesSourcePayload;
   economy_safe_peer_actions: EconomySafePeerActionsSourcePayload;
   public_event_participations: PublicEventParticipationsSourcePayload;
+  casino_activity_days: CasinoActivityDaysSourcePayload;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -426,6 +442,30 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
     }
     return { payloads, readCalls };
   },
+
+  casino_activity_days: (db, userIds, scope) => {
+    const payloads = new Map<string, CasinoActivityDaysSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { activityDays: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      // 実際のallowlist検証・day collapse dedupeはv2-casino.tsのcomputeCasinoActivityDays()
+      // だけが持つ（正本を二重実装しない）。
+      const facts = computeCasinoActivityDays(db, { start: scope.start, end: effectiveEnd }, chunk);
+      const byUser = new Map<string, Array<{ activityKey: CasinoActivityKey; activityDate: string; occurredAt: number }>>();
+      for (const f of facts) {
+        const entry = { activityKey: f.activityKey, activityDate: f.activityDate, occurredAt: f.occurredAt };
+        const list = byUser.get(f.userId);
+        if (list) list.push(entry);
+        else byUser.set(f.userId, [entry]);
+      }
+      for (const [userId, list] of byUser) payloads.set(userId, { activityDays: list });
+    }
+    return { payloads, readCalls };
+  },
 };
 
 /**
@@ -468,6 +508,8 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
     BULK_SOURCE_READERS.economy_safe_peer_actions(db, [userId], scope).payloads.get(userId)!,
   public_event_participations: (db, userId, scope) =>
     BULK_SOURCE_READERS.public_event_participations(db, [userId], scope).payloads.get(userId)!,
+  casino_activity_days: (db, userId, scope) =>
+    BULK_SOURCE_READERS.casino_activity_days(db, [userId], scope).payloads.get(userId)!,
 };
 
 /**

@@ -27,6 +27,7 @@ import {
   stakeFailureText,
   type PvpInteraction,
 } from "./pvp-common.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * ⚔ サシ勝負（casino-bot /サシ 準拠・1v1 コイントス的簡易勝負）。
@@ -111,6 +112,12 @@ export async function playSashi(
     });
     return;
   }
+
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `pvp:${session}`,
+    activityKey: "sashi",
+    participantUserIds: [challenger.id, opponent.id],
+  });
 
   await runFundedSashiDuel(services, {
     challenger,

@@ -24,6 +24,7 @@ import { Mammon } from "../mammon.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
 import { acquireTransientParticipation, releaseTransientParticipation } from "./participation.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 import { C_LOSE, C_MAMMON, C_WIN, E, fmtBigDelta } from "./ui.js";
 
 /**
@@ -218,6 +219,14 @@ export function acceptRouletteBet(
     return { ok: false, reason: "conflict" };
   }
   bets.set(userId, { userId, type, amount });
+  // 実際にbetが受理され、escrow/risk/reservationを含む業務groupが成功した時点(§2)。
+  // participationKeyはsession+userId——同じ卓での張り直し(rebet)は同じidempotency
+  // identityへ収束し、raw participation行を増やさない(§5)。
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `roulette:${session}:${userId}`,
+    activityKey: "roulette",
+    participantUserIds: [userId],
+  });
   return { ok: true };
 }
 

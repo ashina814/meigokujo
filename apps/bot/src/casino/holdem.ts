@@ -31,6 +31,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🃏 テキサスホールデム（対マモン簡易版・ソロ）。
@@ -383,6 +384,14 @@ async function runRoundInner(
   // お守りの消費も賭け・配当と同じグループの中（settleSolo）
   const settled = services.casino.settleSolo(uid, "ホールデム", playerBet, rawPayout, {
     operationId: interaction.id, reservationKey,
+  });
+  // settleSolo()が実際にshowdown/fold結果・賭け・配当を単一atomic transactionで確定
+  // させた正本——ここへ到達した時点で初めて「実際のroundが成立した」と言える。
+  // foldもshowdownも必ずこの単一settle呼び出しへ合流する（PR #163レビュー§3）。
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `solo:holdem:${interaction.id}`,
+    activityKey: "holdem",
+    participantUserIds: [uid],
   });
   recordCasinoGameFinishBestEffort(services, {
     userId: uid,

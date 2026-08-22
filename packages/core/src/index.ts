@@ -171,6 +171,16 @@ export {
   type RecordFinalizedEventResult,
 } from "./public-events/service.js";
 export {
+  CASINO_ACTIVITY_KEYS,
+  CasinoParticipationError,
+  CasinoParticipationHistory,
+  isCasinoActivityKey,
+  type CasinoActivityKey,
+  type CasinoParticipationErrorCode,
+  type RecordCommittedParticipationInput,
+  type RecordCommittedParticipationResult,
+} from "./casino/participation-history.js";
+export {
   MEIREI_ROLE_SETTING_KEY,
   RANK_LADDER,
   RANK_ROLE_SETTING_KEYS,

@@ -33,6 +33,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🃏 ブラックジャック（対マモン・ソロ）。
@@ -220,6 +221,15 @@ async function runRoundInner(
     // お守りの消費も賭け・配当と同じグループの中（settleSolo）。外で消すと精算が落ちたときお守りだけ消える
     const settled = services.casino.settleSolo(uid, "ブラックジャック", totalBet, rawPayout, {
       operationId: interaction.id, reservationKey,
+    });
+    // settleSolo()が実際にhand結果・賭け・配当を単一atomic transactionで確定させた
+    // 正本——ここへ到達した時点で初めて「実際のroundが成立した」と言える。全ての
+    // 決着経路（ナチュラル・バースト・スタンド・ダブル・timeout強制スタンド）は
+    // 必ずこのfinish()を経由する（PR #163レビュー§3）。
+    recordCasinoParticipationBestEffort(services, {
+      participationKey: `solo:blackjack:${interaction.id}`,
+      activityKey: "blackjack",
+      participantUserIds: [uid],
     });
     recordCasinoGameFinishBestEffort(services, {
       userId: uid,

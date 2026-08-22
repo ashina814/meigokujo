@@ -16,6 +16,7 @@ import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 import { MAX_BET, MIN_BET, sleep } from "./common.js";
 import { collectStakes, settleProportional, stakeFailureText, voidPvpTable } from "./pvp-common.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 import { C_LOSE, C_MAMMON, C_WIN, E, buildLobbyEmbed, diceBlock, diceInline, fmtBigDelta } from "./ui.js";
 
 /**
@@ -185,6 +186,14 @@ async function runSession(interaction: ChatInputCommandInteraction, services: Se
     });
     return;
   }
+
+  // 両側に張り手が揃い、実際に精算処理へ進める時点で初めてfunded participation
+  // として確定する（§2）——片側だけで不成立になったbettorは参加者扱いしない。
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `pvp:${session}`,
+    activityKey: "chohan",
+    participantUserIds: [...bets.keys()],
+  });
 
   // 異常終了時は全額返金（エスクロー済みの賭け金を守る）
   try {

@@ -28,6 +28,7 @@ import {
   stakeFailureText,
   type PvpInteraction,
 } from "./pvp-common.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🃏 BJデュエル（casino-bot /BJ対戦 準拠・1v1 PvP）。
@@ -141,6 +142,15 @@ export async function playBjDuel(
     });
     return;
   }
+
+  // 両者のcollectStakesが成功し、funded gameとして開始可能になった時点(§2)。
+  // challenger・accepterを1 callでatomicに記録する（§18）——対戦相手identityは
+  // Title payloadへ出ない（participantUserIdsはinternal writerだけが持つ）。
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `pvp:${session}`,
+    activityKey: "blackjack",
+    participantUserIds: [challenger.id, opponent.id],
+  });
 
   await runFundedBjDuel(services, {
     challenger,

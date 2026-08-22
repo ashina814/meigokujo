@@ -28,6 +28,7 @@ import {
   stakeFailureText,
   type PvpInteraction,
 } from "./pvp-common.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🎲 対戦チンチロ（casino-bot /チンチロ対戦 準拠・1v1 PvP）。
@@ -273,6 +274,12 @@ export async function playChinchiroDuel(
     });
     return;
   }
+
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `pvp:${session}`,
+    activityKey: "chinchiro",
+    participantUserIds: [challenger.id, opponent.id],
+  });
 
   await runFundedChinchiroDuel(services, {
     challenger,

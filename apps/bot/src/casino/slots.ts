@@ -46,6 +46,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🎰 スロット。casino-bot 準拠。数値モデルは core/casino/slots-model へ委譲。
@@ -193,6 +194,14 @@ async function runPaidSpin(
         source: playContext.source,
       });
       const record = spinPaid(services, interaction.user.id, bet, interaction.id);
+      // spinPaid()はrunGroup内で抽選・賭け・配当・JP積立を単一atomic transactionで
+      // 行う正本——ここへ到達した時点で初めて「実際のpaid spinが成立した」と言える
+      // （PR #163レビュー§2）。spinPaid()が投げたらwriterへ到達しない。
+      recordCasinoParticipationBestEffort(services, {
+        participationKey: `solo:slots:${interaction.id}`,
+        activityKey: "slots",
+        participantUserIds: [interaction.user.id],
+      });
       reconcileSlotsGameFinishBestEffort(services, interaction.user.id, interaction.id);
       let immediateFree: SpinRecord | undefined;
       if (record.pendingFreeSpin) {

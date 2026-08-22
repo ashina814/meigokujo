@@ -27,6 +27,7 @@ import {
   stakeFailureText,
   type PvpInteraction,
 } from "./pvp-common.js";
+import { recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🃏 インディアンポーカー（1v1心理戦）。casino-bot 準拠。
@@ -129,6 +130,12 @@ export async function playIndian(
     });
     return;
   }
+
+  recordCasinoParticipationBestEffort(services, {
+    participationKey: `pvp:${session}`,
+    activityKey: "indian",
+    participantUserIds: [challenger.id, opponent.id],
+  });
 
   await runFundedIndian(services, {
     challenger,
