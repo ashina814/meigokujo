@@ -127,7 +127,7 @@ timestampリストを持つため）。TC交流・公開部屋・城横断は0% 
 
 ## 5. source別に残る実装（READYを支えるsource／PARTIALの制約／BLOCKEDが必要とするもの）
 
-READYを支えている既存`titleUsable:true` source（7種、14件）:
+READYを支えている既存`titleUsable:true` source（6種、14件）:
 
 - `vc_empty_start_then_joined`（No.1-2）
 - `vc_last_occupant`（No.6, 7, 9——PR F2aでsame-second/0-second visit tie bugを修正済み、§13参照）
@@ -298,8 +298,9 @@ co-presenceが成立し、day2〜30はAlice1人だけと会った場合でも、
 （「成立する」であって「広がる/続く」ではない）ためREADYのまま維持した。
 
 すべてのfollow-up（§8クラスタ1〜5）はPR #164では実施しない——記録のみ。
-このうちクラスタ1（`vc_last_occupant`のtie bug）はその後PR F2aで解消した
-（§13）。
+PR #164時点で記録していたfollow-upのうち、旧§8クラスタ1（`vc_last_
+occupant`のtie bug——現在の§8はcasino completed-participationをクラスタ1
+としており番号が異なる）は、その後PR F2aで解消した（§13）。
 
 ## 13. PR F2a: `vc_last_occupant` same-second / 0-second visit tie bug修正
 
