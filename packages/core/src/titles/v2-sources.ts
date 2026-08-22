@@ -101,11 +101,6 @@ export function sourceScopeGroupKeyFor(sourceKey: string, scope: ResolvedTitleSc
  */
 const BULK_USER_CHUNK_SIZE = 300;
 
-/** internal——`v2.ts`からはexportしない。plannerの`bulkReadCalls`統計計算にだけ使う。 */
-export function bulkReadCallsFor(userCount: number): number {
-  return userCount === 0 ? 0 : Math.ceil(userCount / BULK_USER_CHUNK_SIZE);
-}
-
 function chunkUserIds(userIds: readonly string[]): string[][] {
   const chunks: string[][] = [];
   for (let i = 0; i < userIds.length; i += BULK_USER_CHUNK_SIZE) {
@@ -114,11 +109,22 @@ function chunkUserIds(userIds: readonly string[]): string[][] {
   return chunks;
 }
 
+/**
+ * bulk readerの戻り値。`readCalls`は実際に発行したDB/derived関数呼び出しの回数
+ * ——zero-width scopeの早期returnではchunkループ自体を回さないため0のまま。
+ * `userIds.length`からの見積もり（`Math.ceil(userIds.length/CHUNK_SIZE)`）ではなく、
+ * 各readerが実際に実行した回数をそのまま返す（PR #158レビュー§8）。
+ */
+interface BulkSourceReaderResult<K extends TitleUsableSourceKey> {
+  readonly payloads: ReadonlyMap<string, TitleSourcePayloads[K]>;
+  readonly readCalls: number;
+}
+
 type BulkSourceReader<K extends TitleUsableSourceKey> = (
   db: Database.Database,
   userIds: readonly string[],
   scope: ResolvedTitleScope,
-) => ReadonlyMap<string, TitleSourcePayloads[K]>;
+) => BulkSourceReaderResult<K>;
 
 const EMPTY_GROUP_SIZE_PAYLOAD: VcGroupSizeSecondsSourcePayload = {
   trustedSecondsByBucket: { solo: 0, oneToOne: 0, smallGroup: 0, largeGroup: 0 },
@@ -146,12 +152,14 @@ const EMPTY_SOCIAL_SAFE_PAYLOAD: VcSocialSafeSourcePayload = {
  */
 const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } = {
   bump_events: (db, userIds, scope) => {
-    const result = new Map<string, BumpEventsSourcePayload>();
-    for (const userId of userIds) result.set(userId, { events: [] });
-    if (userIds.length === 0) return result;
+    const payloads = new Map<string, BumpEventsSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { events: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
 
     const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
     for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
       const placeholders = chunk.map(() => "?").join(",");
       const rows = db
         .prepare(
@@ -166,21 +174,23 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
         if (list) list.push(row.created_at);
         else byUser.set(row.user_id, [row.created_at]);
       }
-      for (const [userId, events] of byUser) result.set(userId, { events });
+      for (const [userId, events] of byUser) payloads.set(userId, { events });
     }
-    return result;
+    return { payloads, readCalls };
   },
 
   vc_empty_start_then_joined: (db, userIds, scope) => {
-    const result = new Map<string, VcEmptyStartThenJoinedSourcePayload>();
-    for (const userId of userIds) result.set(userId, { facts: [] });
-    if (userIds.length === 0) return result;
+    const payloads = new Map<string, VcEmptyStartThenJoinedSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { facts: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
 
     const effectiveEnd = resolvedScopeEffectiveEnd(scope);
-    if (effectiveEnd <= scope.start) return result;
+    if (effectiveEnd <= scope.start) return { payloads, readCalls: 0 };
     const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
 
+    let readCalls = 0;
     for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
       const facts = computeEmptyStartThenJoined(db, window, chunk);
       const byUser = new Map<string, Array<{ visitStartedAt: number; joinedAt: number; channelId: string }>>();
       for (const f of facts) {
@@ -189,21 +199,23 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
         if (list) list.push(entry);
         else byUser.set(f.userId, [entry]);
       }
-      for (const [userId, list] of byUser) result.set(userId, { facts: list });
+      for (const [userId, list] of byUser) payloads.set(userId, { facts: list });
     }
-    return result;
+    return { payloads, readCalls };
   },
 
   vc_last_occupant: (db, userIds, scope) => {
-    const result = new Map<string, VcLastOccupantSourcePayload>();
-    for (const userId of userIds) result.set(userId, { facts: [] });
-    if (userIds.length === 0) return result;
+    const payloads = new Map<string, VcLastOccupantSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { facts: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
 
     const effectiveEnd = resolvedScopeEffectiveEnd(scope);
-    if (effectiveEnd <= scope.start) return result;
+    if (effectiveEnd <= scope.start) return { payloads, readCalls: 0 };
     const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
 
+    let readCalls = 0;
     for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
       const facts = computeLastOccupant(db, window, chunk);
       const byUser = new Map<string, Array<{ becameLastAt: number; channelId: string }>>();
       for (const f of facts) {
@@ -212,49 +224,53 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
         if (list) list.push(entry);
         else byUser.set(f.userId, [entry]);
       }
-      for (const [userId, list] of byUser) result.set(userId, { facts: list });
+      for (const [userId, list] of byUser) payloads.set(userId, { facts: list });
     }
-    return result;
+    return { payloads, readCalls };
   },
 
   vc_group_size_seconds: (db, userIds, scope) => {
-    const result = new Map<string, VcGroupSizeSecondsSourcePayload>();
-    for (const userId of userIds) result.set(userId, EMPTY_GROUP_SIZE_PAYLOAD);
-    if (userIds.length === 0) return result;
+    const payloads = new Map<string, VcGroupSizeSecondsSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, EMPTY_GROUP_SIZE_PAYLOAD);
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
 
     const effectiveEnd = resolvedScopeEffectiveEnd(scope);
-    if (effectiveEnd <= scope.start) return result;
+    if (effectiveEnd <= scope.start) return { payloads, readCalls: 0 };
     const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
 
+    let readCalls = 0;
     for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
       const rows = computeGroupSizeSeconds(db, window, chunk);
       for (const row of rows) {
-        result.set(row.userId, { trustedSecondsByBucket: row.trustedSecondsByBucket, untrustedSeconds: row.untrustedSeconds });
+        payloads.set(row.userId, { trustedSecondsByBucket: row.trustedSecondsByBucket, untrustedSeconds: row.untrustedSeconds });
       }
     }
-    return result;
+    return { payloads, readCalls };
   },
 
   vc_social_safe: (db, userIds, scope) => {
-    const result = new Map<string, VcSocialSafeSourcePayload>();
-    for (const userId of userIds) result.set(userId, EMPTY_SOCIAL_SAFE_PAYLOAD);
-    if (userIds.length === 0) return result;
+    const payloads = new Map<string, VcSocialSafeSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, EMPTY_SOCIAL_SAFE_PAYLOAD);
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
 
     const effectiveEnd = resolvedScopeEffectiveEnd(scope);
-    if (effectiveEnd <= scope.start) return result;
+    if (effectiveEnd <= scope.start) return { payloads, readCalls: 0 };
     const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
 
+    let readCalls = 0;
     for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
       const rows = computeSafeSocialAggregates(db, window, chunk);
       for (const row of rows) {
-        result.set(row.userId, {
+        payloads.set(row.userId, {
           distinctCoPresentUsers: row.distinctCoPresentUsers,
           maxRepeatedDaysWithOneCounterpart: row.maxRepeatedDaysWithOneCounterpart,
           trustedOverlapSeconds: row.trustedOverlapSeconds,
         });
       }
     }
-    return result;
+    return { payloads, readCalls };
   },
 };
 
@@ -282,15 +298,16 @@ type SourceReader<K extends TitleUsableSourceKey> = (
 /**
  * single-user readerはbulk readerへ`[userId]`で委譲する薄いwrapper（§19）——
  * 独立した実装を持たせない。bulk readerが要求した全userIds分のentryを必ず返す契約
- * （上記doc comment参照）なので、`.get(userId)!`は安全。
+ * （上記doc comment参照）なので、`.payloads.get(userId)!`は安全。
  */
 const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
-  bump_events: (db, userId, scope) => BULK_SOURCE_READERS.bump_events(db, [userId], scope).get(userId)!,
+  bump_events: (db, userId, scope) => BULK_SOURCE_READERS.bump_events(db, [userId], scope).payloads.get(userId)!,
   vc_empty_start_then_joined: (db, userId, scope) =>
-    BULK_SOURCE_READERS.vc_empty_start_then_joined(db, [userId], scope).get(userId)!,
-  vc_last_occupant: (db, userId, scope) => BULK_SOURCE_READERS.vc_last_occupant(db, [userId], scope).get(userId)!,
-  vc_group_size_seconds: (db, userId, scope) => BULK_SOURCE_READERS.vc_group_size_seconds(db, [userId], scope).get(userId)!,
-  vc_social_safe: (db, userId, scope) => BULK_SOURCE_READERS.vc_social_safe(db, [userId], scope).get(userId)!,
+    BULK_SOURCE_READERS.vc_empty_start_then_joined(db, [userId], scope).payloads.get(userId)!,
+  vc_last_occupant: (db, userId, scope) => BULK_SOURCE_READERS.vc_last_occupant(db, [userId], scope).payloads.get(userId)!,
+  vc_group_size_seconds: (db, userId, scope) =>
+    BULK_SOURCE_READERS.vc_group_size_seconds(db, [userId], scope).payloads.get(userId)!,
+  vc_social_safe: (db, userId, scope) => BULK_SOURCE_READERS.vc_social_safe(db, [userId], scope).payloads.get(userId)!,
 };
 
 /**
@@ -355,19 +372,185 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
+// ─────────────────────────────────────────────────────────────
+// TitleSourceCache runtime provenance（PR #158レビュー: private fieldはruntimeを守らない）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * `TitleSourceCache`のbacking stateの正本。`v2-scope.ts`の`RESOLVED_SCOPE_PROVENANCE`・
+ * `v2-pipeline.ts`の`PLAN_PROVENANCE`と同じ思想——TypeScriptの`private`はruntimeでは
+ * 単なる`this.cache`という通常のown propertyでしかなく、`(cache as any).cache`で
+ * 素通しで読めてしまう。より重大なのは、`{ get() {...}, prefetch() {...} }`という
+ * structural fakeを`TitleEvaluationOptions.cache`/`TitlePrefetchOptions.cache`へ渡し、
+ * それを呼び出し側が`cache.get(...)`のようにdynamic dispatchで呼ぶと、`readTitleSource()`
+ * /`BULK_SOURCE_READERS`/DBを一切経由せず、forgeされたsafe payloadをruleへ渡せてしまう
+ * ——source trust boundary全体の迂回になる。
+ *
+ * 対策は二段構え:
+ * 1. backing Mapをinstanceのown propertyに置かず、この`WeakMap<object, Map<...>>`
+ *    （exact object identityでしか引けない）へ移す。`{ ...realCache }`のcopy・
+ *    `Object.create(TitleSourceCache.prototype)`・`new Proxy(realCache, {})`は
+ *    いずれもこのWeakMapに載っていないためfail-closedする。
+ * 2. `TitleSourceCache`のconstructorで`Object.freeze(this)`する——instance own
+ *    propertyの追加/上書き（例: `instance.get = fakeFn`によるmethod shadowing）を
+ *    strict modeで例外にする。
+ *
+ * さらに、**evaluator/planner側がcaller供給のcacheに対して`cache.get(...)`/
+ * `cache.prefetch(...)`というdynamic dispatchを直接呼ばない**——freezeで守れるのは
+ * genuine instanceへのshadowingだけで、caller が最初から渡してきた structural fake
+ * object自体（`{get(){...}}`）にはfreezeが及ばない。true trust boundaryは
+ * `getFromTitleSourceCache()`/`prefetchIntoTitleSourceCache()`という、`cache`を
+ * 単にWeakMap lookupのkeyとしてしか使わない自由関数——`cache`のどのメソッドも
+ * 一切呼び出さないため、`cache`が何のmethodを持っていようと影響を受けない。
+ */
+const TITLE_SOURCE_CACHE_STATE = new WeakMap<object, Map<string, unknown>>();
+
+function requireTitleSourceCache(cache: TitleSourceCache): Map<string, unknown> {
+  if (cache === null || typeof cache !== "object") {
+    throw new Error(
+      "cache was not produced by `new TitleSourceCache()` (forged or hand-built TitleSourceCache) — " +
+        "evaluation source trust boundary requires a genuine cache instance",
+    );
+  }
+  const state = TITLE_SOURCE_CACHE_STATE.get(cache as unknown as object);
+  if (!state) {
+    throw new Error(
+      "cache was not produced by `new TitleSourceCache()` (forged, hand-built, cloned, or proxied TitleSourceCache) — " +
+        "evaluation source trust boundary requires a genuine cache instance",
+    );
+  }
+  return state;
+}
+
+/**
+ * `options.cache`をevaluator/plannerが受け取った直後に呼ぶ、入口での早期検証
+ * （PR #158レビュー§2）。実際の読み込み境界は`getFromTitleSourceCache()`/
+ * `prefetchIntoTitleSourceCache()`が呼び出しのたびに再検証するため、これは
+ * defense-in-depthで必須ではないが、forgeされたcacheをruleが1件でも評価される前に
+ * 早期にfail-closedする。
+ */
+export function assertGenuineTitleSourceCache(cache: TitleSourceCache): void {
+  requireTitleSourceCache(cache);
+}
+
+/**
+ * `TitleSourceCache`の唯一の信頼された読み込み経路（freestanding function）。
+ * `cache`は単にWeakMap lookupのkeyとしてのみ使う——`cache.get(...)`のような
+ * dynamic dispatchを一切行わないため、`cache`が偽造されたstructural fake
+ * （`{get(){return forged}}`のようなobject）であっても、そのfakeの`get`メソッドが
+ * 実行されることはない。evaluator（v2-evaluator.ts）はこの関数だけを使い、
+ * `cache.get(...)`という形の呼び出しは一切しない。
+ */
+export function getFromTitleSourceCache<K extends TitleUsableSourceKey>(
+  cache: TitleSourceCache,
+  db: Database.Database,
+  sourceKey: K,
+  userId: string,
+  scope: ResolvedTitleScope,
+): TitleSourcePayloads[K] {
+  // cache hitはreadTitleSource()を経由しない——brand検証をcache miss側だけに任せると、
+  // 正規のscopeで一度cacheされたキーと同じ (userId, sourceKey, scopeKey, start,
+  // endExclusive, observedAt) を持つ「偽造scope」を渡した2回目の呼び出しが、
+  // assertResolvedTitleScope()を一度も通らずcacheの値をそのまま受け取れてしまう。
+  // hit/miss どちらの経路でも必ずbrandを検証する。
+  assertResolvedTitleScope(scope);
+  const state = requireTitleSourceCache(cache);
+  const key = cacheKeyFor(userId, sourceKey, scope);
+  if (state.has(key)) return state.get(key) as TitleSourcePayloads[K];
+  const value = readTitleSource(db, sourceKey, userId, scope);
+  state.set(key, value);
+  return value;
+}
+
+/**
+ * `TitleSourceCache`の唯一の信頼されたbulk書き込み経路（freestanding function、PR D1）。
+ * `getFromTitleSourceCache()`と同じ理由で、`cache`のmethodを一切呼ばずWeakMap lookupの
+ * keyとしてのみ使う。planner（v2-prefetch.ts）はこの関数だけを使う。
+ *
+ * - scope forgeryはuserIds=[]でも必ずreject（§16, §49）——空usersだから
+ *   validationをskipする、にはしない。
+ * - **first-read-wins**（§14）: 既にcache済みの`(user, source, scope)`entryは
+ *   上書きしない——`userIds`のうち未cacheのuserだけをbulk readerへ渡す（§15）。
+ * - `userIds`は内部でdedupeする（§25）——重複があってもbulk readerへは去重後の
+ *   listを渡す。
+ * - bulk readerの戻り値を先に完全に受け取ってから（＝失敗すれば何もcommitされない）
+ *   cacheへ書き込む——複数chunk中に例外が起きても、既存cache entryはもちろん、
+ *   今回のprefetch分も一切cacheへ反映されない（§34、JSの呼び出し-返却-mutation
+ *   という構造そのものでstaging/commitを実現している）。
+ * - cacheした値はsingleと同じくdeep-freezeする（§27）。
+ *
+ * 戻り値の`loaded`は実際に新規cacheされたuser数、`readCalls`はbulk readerが実際に
+ * 発行したDB/derived関数呼び出しの回数（zero-width scopeの早期returnでは0、PR #158
+ * レビュー§8）。
+ */
+export function prefetchIntoTitleSourceCache<K extends TitleUsableSourceKey>(
+  cache: TitleSourceCache,
+  db: Database.Database,
+  sourceKey: K,
+  userIds: readonly string[],
+  scope: ResolvedTitleScope,
+): { readonly loaded: number; readonly readCalls: number } {
+  assertResolvedTitleScope(scope);
+  const state = requireTitleSourceCache(cache);
+  const definition = (TITLE_SOURCES as Record<string, TitleSourceDefinition>)[sourceKey as string];
+  if (!definition) {
+    throw new Error(`unknown title source: ${String(sourceKey)}`);
+  }
+  if (!definition.titleUsable) {
+    throw new Error(`title source is not usable by titles: ${String(sourceKey)}`);
+  }
+  const reader = (BULK_SOURCE_READERS as Record<string, BulkSourceReader<TitleUsableSourceKey> | undefined>)[
+    sourceKey as string
+  ];
+  if (!reader) {
+    throw new Error(`missing bulk source reader for titleUsable source: ${String(sourceKey)}`);
+  }
+
+  const missing: string[] = [];
+  const seen = new Set<string>();
+  for (const userId of userIds) {
+    if (seen.has(userId)) continue;
+    seen.add(userId);
+    if (!state.has(cacheKeyFor(userId, sourceKey, scope))) missing.push(userId);
+  }
+  if (missing.length === 0) return { loaded: 0, readCalls: 0 };
+
+  const { payloads, readCalls } = reader(db, missing, scope);
+  for (const userId of missing) {
+    const payload = payloads.get(userId);
+    if (payload === undefined) {
+      throw new Error(`bulk source reader for ${String(sourceKey)} did not return a payload for requested user`);
+    }
+    state.set(cacheKeyFor(userId, sourceKey, scope), deepFreeze(payload));
+  }
+  return { loaded: missing.length, readCalls };
+}
+
 /**
  * 同一 (userId, sourceKey, scope) の重複読み込みを1 evaluation batch内で共有する。
  *
  * 複数のtitle ruleが同じsourceを使っても、derived計算（PR2の一部はO(訪問数²)）を
  * ruleの数だけ繰り返さない。永続cacheではなく、1回の評価呼び出し内だけのmemory cache。
  *
- * PR D1: `prefetch()`を追加した——複数userをまとめてbulk readerで読み、結果だけを
- * cacheへ入れる（§12）。callerが任意payloadをcacheへ注入できるAPI（`set`/`seed`等）は
- * 意図的に存在しない（§13, §51）——cache mutationは`get()`（trusted single reader）と
- * `prefetch()`（trusted bulk reader）の結果だけを経由する。
+ * backing stateはinstanceのown propertyではなく`TITLE_SOURCE_CACHE_STATE`
+ * （module-private WeakMap）にある——`(cache as any).cache`は常に`undefined`。
+ * constructorで`Object.freeze(this)`するため、`instance.get = fakeFn`のような
+ * method shadowingもstrict modeで例外になる（PR #158レビュー§1）。
+ *
+ * `get()`/`prefetch()`はこのクラスの外部利用者（テスト・ドキュメント例）向けの
+ * 薄いpublic wrapper——実体は`getFromTitleSourceCache()`/`prefetchIntoTitleSourceCache()`
+ * （freestanding function）。evaluator/planner自身はこれらのinstance methodではなく
+ * freestanding functionを直接呼ぶ（dynamic dispatchを信用しない、PR #158レビュー§3）。
+ *
+ * callerが任意payloadをcacheへ注入できるAPI（`set`/`seed`等）は意図的に存在しない
+ * （§13, §51）——cache mutationは`get()`（trusted single reader）と`prefetch()`
+ * （trusted bulk reader）の結果だけを経由する。
  */
 export class TitleSourceCache {
-  private readonly cache = new Map<string, unknown>();
+  constructor() {
+    TITLE_SOURCE_CACHE_STATE.set(this, new Map());
+    Object.freeze(this);
+  }
 
   get<K extends TitleUsableSourceKey>(
     db: Database.Database,
@@ -375,75 +558,15 @@ export class TitleSourceCache {
     userId: string,
     scope: ResolvedTitleScope,
   ): TitleSourcePayloads[K] {
-    // cache hitはreadTitleSource()を経由しない——brand検証をcache miss側だけに任せると、
-    // 正規のscopeで一度cacheされたキーと同じ (userId, sourceKey, scopeKey, start,
-    // endExclusive, observedAt) を持つ「偽造scope」を渡した2回目の呼び出しが、
-    // assertResolvedTitleScope()を一度も通らずcacheの値をそのまま受け取れてしまう。
-    // hit/miss どちらの経路でも必ずbrandを検証する。
-    assertResolvedTitleScope(scope);
-    const key = cacheKeyFor(userId, sourceKey, scope);
-    if (this.cache.has(key)) return this.cache.get(key) as TitleSourcePayloads[K];
-    const value = readTitleSource(db, sourceKey, userId, scope);
-    this.cache.set(key, value);
-    return value;
+    return getFromTitleSourceCache(this, db, sourceKey, userId, scope);
   }
 
-  /**
-   * 複数userぶんのsource payloadを、1回（またはchunk分割された数回）のbulk readerで
-   * まとめて読み、結果だけをcacheへ入れる（PR D1）。
-   *
-   * - scope forgeryはuserIds=[]でも必ずreject（§16, §49）——空usersだから
-   *   validationをskipする、にはしない。
-   * - **first-read-wins**（§14）: 既にcache済みの`(user, source, scope)`entryは
-   *   上書きしない——`userIds`のうち未cacheのuserだけをbulk readerへ渡す（§15）。
-   * - `userIds`は内部でdedupeする（§25）——重複があってもbulk readerへは去重後の
-   *   listを渡す。
-   * - bulk readerの戻り値を先に完全に受け取ってから（＝失敗すれば何もcommitされない）
-   *   cacheへ書き込む——複数chunk中に例外が起きても、既存cache entryはもちろん、
-   *   今回のprefetch分も一切cacheへ反映されない（§34、JSの呼び出し-返却-mutation
-   *   という構造そのものでstaging/commitを実現している）。
-   * - cacheした値はsingleと同じくdeep-freezeする（§27）。
-   *
-   * 戻り値の`loaded`は、実際に新規cacheされたuser数（既にcache済みだったuserを含まない）。
-   */
   prefetch<K extends TitleUsableSourceKey>(
     db: Database.Database,
     sourceKey: K,
     userIds: readonly string[],
     scope: ResolvedTitleScope,
-  ): { readonly loaded: number } {
-    assertResolvedTitleScope(scope);
-    const definition = (TITLE_SOURCES as Record<string, TitleSourceDefinition>)[sourceKey as string];
-    if (!definition) {
-      throw new Error(`unknown title source: ${String(sourceKey)}`);
-    }
-    if (!definition.titleUsable) {
-      throw new Error(`title source is not usable by titles: ${String(sourceKey)}`);
-    }
-    const reader = (BULK_SOURCE_READERS as Record<string, BulkSourceReader<TitleUsableSourceKey> | undefined>)[
-      sourceKey as string
-    ];
-    if (!reader) {
-      throw new Error(`missing bulk source reader for titleUsable source: ${String(sourceKey)}`);
-    }
-
-    const missing: string[] = [];
-    const seen = new Set<string>();
-    for (const userId of userIds) {
-      if (seen.has(userId)) continue;
-      seen.add(userId);
-      if (!this.cache.has(cacheKeyFor(userId, sourceKey, scope))) missing.push(userId);
-    }
-    if (missing.length === 0) return { loaded: 0 };
-
-    const results = reader(db, missing, scope);
-    for (const userId of missing) {
-      const payload = results.get(userId);
-      if (payload === undefined) {
-        throw new Error(`bulk source reader for ${String(sourceKey)} did not return a payload for requested user`);
-      }
-      this.cache.set(cacheKeyFor(userId, sourceKey, scope), deepFreeze(payload));
-    }
-    return { loaded: missing.length };
+  ): { readonly loaded: number; readonly readCalls: number } {
+    return prefetchIntoTitleSourceCache(this, db, sourceKey, userIds, scope);
   }
 }

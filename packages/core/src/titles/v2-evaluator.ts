@@ -6,7 +6,12 @@ import {
   type TitleSourceDefinition,
   type TitleUsableSourceKey,
 } from "./v2-contract.js";
-import { TitleSourceCache, type TitleSourcePayloads } from "./v2-sources.js";
+import {
+  assertGenuineTitleSourceCache,
+  getFromTitleSourceCache,
+  TitleSourceCache,
+  type TitleSourcePayloads,
+} from "./v2-sources.js";
 import {
   resolveTitleScope,
   toRuleScope,
@@ -170,10 +175,18 @@ export function evaluateTitle<S extends readonly TitleUsableSourceKey[]>(
     monthSelector: options.monthSelector,
   });
   const cache = options.cache ?? new TitleSourceCache();
+  // options.cacheはcaller供給のstructural TitleSourceCache型——TypeScriptの型は
+  // runtimeを守らないため、`{ get(){ return forgedPayload } }`のようなforgeされた
+  // objectが渡されていないことをここで検証する（PR #158レビュー§1, §2）。
+  assertGenuineTitleSourceCache(cache);
 
   const sources = {} as { [K in S[number]]: TitleSourcePayloads[K] };
   for (const sourceKey of definition.sources) {
-    (sources as Record<string, unknown>)[sourceKey] = cache.get(db, sourceKey, userId, resolvedScope);
+    // cache.get(...)というdynamic dispatchは使わない——forgeされたcacheが独自の
+    // `get`メソッドを持っていた場合、それを実行してしまう。getFromTitleSourceCache()は
+    // cacheをWeakMap lookupのkeyとしてしか使わないtrusted freestanding function
+    // （PR #158レビュー§3）。
+    (sources as Record<string, unknown>)[sourceKey] = getFromTitleSourceCache(cache, db, sourceKey, userId, resolvedScope);
   }
 
   const result = rule.evaluate({ userId, scope: toRuleScope(resolvedScope), sources });

@@ -2,7 +2,12 @@ import type Database from "better-sqlite3";
 import type { TitleTrigger } from "./v2-contract.js";
 import { requirePlanProvenance, type TitleEvaluationPlan } from "./v2-pipeline.js";
 import { resolveTitleScope, type TitleScopeResolutionOptions, type ResolvedTitleScope } from "./v2-scope.js";
-import { bulkReadCallsFor, sourceScopeGroupKeyFor, TitleSourceCache } from "./v2-sources.js";
+import {
+  assertGenuineTitleSourceCache,
+  prefetchIntoTitleSourceCache,
+  sourceScopeGroupKeyFor,
+  TitleSourceCache,
+} from "./v2-sources.js";
 import type { TitleUsableSourceKey } from "./v2-contract.js";
 import type { TitleV2Store } from "./v2-store.js";
 
@@ -40,7 +45,11 @@ export interface TitlePrefetchSummary {
   readonly requestedUniqueUsers: number;
   /** 新規にcacheへ書き込まれたentry数の合計。 */
   readonly cacheEntriesLoaded: number;
-  /** 内部chunking込みで実際に発行されたbulk読み込み回数の合計。 */
+  /**
+   * 内部chunking込みで実際に発行されたDB/derived関数呼び出し回数の合計
+   * （`Math.ceil(userIds/chunkSize)`による見積もりではなく、各bulk readerが実際に
+   * 実行した回数——zero-width scopeの早期returnは0のまま、PR #158レビュー§8）。
+   */
   readonly bulkReadCalls: number;
 }
 
@@ -78,8 +87,11 @@ interface SourceScopeGroup {
  * - `userIds`はplanner内部でdedupeする（先出順を保持、§25）。これは純粋に読み込み
  *   最適化であり、`evaluateBatchPipeline()`自身の重複user処理semanticsは変えない。
  * - 実際の読み込み・first-read-wins・forged scope拒否・chunkingは
- *   `TitleSourceCache.prefetch()`（v2-sources.ts）が行う——plannerはgroup化と
- *   呼び出しの整理だけを担当する。
+ *   `prefetchIntoTitleSourceCache()`（v2-sources.ts、trusted freestanding function）
+ *   が行う——plannerはgroup化と呼び出しの整理だけを担当する。`cache.prefetch(...)`
+ *   というdynamic dispatchは使わない——`options.cache`はcaller供給のため、forgeされた
+ *   structural fakeが独自の`prefetch`methodを持っていた場合にそれを実行してしまう
+ *   （PR #158レビュー§3）。
  */
 export function prefetchBatchPipelineSources(
   db: Database.Database,
@@ -92,6 +104,9 @@ export function prefetchBatchPipelineSources(
 ): TitlePrefetchResult {
   const compiled = requirePlanProvenance(plan);
   const cache = options.cache ?? new TitleSourceCache();
+  // options.cacheはcaller供給——forgeされたstructural fakeでないことをここで検証する
+  // （PR #158レビュー§2）。
+  assertGenuineTitleSourceCache(cache);
 
   const uniqueUserIds: string[] = [];
   const seenUsers = new Set<string>();
@@ -126,12 +141,15 @@ export function prefetchBatchPipelineSources(
   let bulkReadCalls = 0;
 
   for (const group of groups.values()) {
-    const { loaded } = cache.prefetch(db, group.sourceKey, uniqueUserIds, group.scope);
+    // cache.prefetch(...)というdynamic dispatchは使わない——evaluatorと同じ理由
+    // （PR #158レビュー§3）。prefetchIntoTitleSourceCache()はcacheをWeakMap lookupの
+    // keyとしてしか使わないtrusted freestanding function。
+    const { loaded, readCalls } = prefetchIntoTitleSourceCache(cache, db, group.sourceKey, uniqueUserIds, group.scope);
     if (loaded > 0) {
       executedGroups += 1;
       cacheEntriesLoaded += loaded;
-      bulkReadCalls += bulkReadCallsFor(loaded);
     }
+    bulkReadCalls += readCalls;
   }
 
   return {

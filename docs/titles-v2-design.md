@@ -973,6 +973,49 @@ scope.start`）はVC derived関数（`clampWindow()`が`RangeError`を投げる�
   そのまま残ってよい——group横断のatomicityまでは要求しない）。
 - cacheした値は既存single readerと同じくdeep-freezeする。
 
+**`TitleSourceCache`のruntime provenance（PR #158レビュー対応）**: TypeScriptの
+`private`はruntimeを守らない——`private readonly cache = new Map(...)`という
+素朴な実装では、`(cache as any).cache`でbacking Mapへ直接到達できてしまい、
+さらに深刻なのは、`{ get(){ return forgedPayload } }`のようなstructural fake
+objectを`TitleEvaluationOptions.cache`/`TitlePrefetchOptions.cache`へ渡し、
+呼び出し側がそれを`cache.get(...)`のようなdynamic dispatchで呼ぶと、
+`readTitleSource()`/`BULK_SOURCE_READERS`/DBを一切経由せずforgeされたsafe
+payloadをruleへ渡せてしまう——source trust boundary全体の迂回になる。
+
+対策は`v2-scope.ts`の`RESOLVED_SCOPE_PROVENANCE`・`v2-pipeline.ts`の
+`PLAN_PROVENANCE`と同じ思想:
+
+- backing stateをinstanceのown propertyに置かず、module-private
+  `TITLE_SOURCE_CACHE_STATE: WeakMap<object, Map<string, unknown>>`
+  （exact object identityでしか引けない）へ移す。`{ ...realCache }`の
+  shallow copy・`Object.create(TitleSourceCache.prototype)`・
+  `new Proxy(realCache, {})`はいずれもこのWeakMapに載っていないため
+  fail-closedする。
+- constructorで`Object.freeze(this)`する——`instance.get = fakeFn`のような
+  instance own propertyによるmethod shadowingをstrict modeで例外にする。
+- **evaluator（`v2-evaluator.ts`）・planner（`v2-prefetch.ts`）は
+  `cache.get(...)`/`cache.prefetch(...)`というdynamic dispatchを一切呼ばない**
+  ——freezeで守れるのはgenuine instanceへのshadowingだけで、callerが最初から
+  渡してきたstructural fake object自体にはfreezeが及ばない。true trust
+  boundaryは`getFromTitleSourceCache()`/`prefetchIntoTitleSourceCache()`という
+  freestanding function（`v2.ts`からは再exportしない、internal cross-module
+  export）——`cache`を単にWeakMap lookupのkeyとしてしか使わず、`cache`の
+  どのmethodも一切呼び出さないため、`cache`が何のmethodを持っていようと
+  影響を受けない。`TitleSourceCache.get()`/`.prefetch()`はこの2関数への
+  薄いpublic wrapper（外部利用者向け）。
+- `options.cache`が指定された場合、`evaluateTitle()`/`prefetchBatchPipelineSources()`
+  は入口で`assertGenuineTitleSourceCache()`による早期検証も行う
+  （defense-in-depth——実際の読み書きは上記freestanding functionが呼ばれる
+  たびに再検証するため必須ではないが、forgeされたcacheをruleが1件でも
+  評価される前にfail-closedする）。
+
+**`bulkReadCalls`は実測値**: 各bulk readerが実際に発行したDB/derived関数
+呼び出し回数（内部chunkingの実行回数）をそのまま合算する——`userIds.length`
+からの見積もり（`Math.ceil(userIds.length / CHUNK_SIZE)`）ではない。
+zero-width scopeの早期returnではchunkループ自体を回さないため、
+`cacheEntriesLoaded`（payloadがcacheされたuser数）が正でも`bulkReadCalls`は
+0のままになり得る——両者は別の意味を持つ統計であり、混同しない。
+
 **`prefetchBatchPipelineSources(db, store, plan, userIds, observedAt, trigger,
 options?)`**（`v2-prefetch.ts`、公開API）: 高レベルplanner。
 

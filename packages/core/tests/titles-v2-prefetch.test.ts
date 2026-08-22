@@ -2,12 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { BumpCounter } from "../src/rank/bump.js";
 import type { BehaviorTitleDefinition, TitleTrigger } from "../src/titles/v2-contract.js";
-import { defineTitleRule, type TitleRule } from "../src/titles/v2-evaluator.js";
+import { defineTitleRule, evaluateTitle, type TitleRule } from "../src/titles/v2-evaluator.js";
 import { defineMetaTitleRule, type MetaTitleRule } from "../src/titles/v2-meta.js";
-import { defineTitleEvaluationPlan, type TitleEvaluationPlan } from "../src/titles/v2-pipeline.js";
+import { defineTitleEvaluationPlan, evaluateBatchPipeline, type TitleEvaluationPlan } from "../src/titles/v2-pipeline.js";
 import { defineRelationshipTitleRule, type RelationshipTitleRule } from "../src/titles/v2-relationship.js";
 import { resolveTitleScope } from "../src/titles/v2-scope.js";
-import { bulkReadCallsFor, TitleSourceCache } from "../src/titles/v2-sources.js";
+import { TitleSourceCache } from "../src/titles/v2-sources.js";
 import { TitleV2Store } from "../src/titles/v2-store.js";
 import { prefetchBatchPipelineSources } from "../src/titles/v2-prefetch.js";
 
@@ -233,7 +233,7 @@ describe("TitleSourceCache.prefetch()", () => {
     expect(() => cache.prefetch(db, "made_up_source" as never, [], scope)).toThrow(/unknown title source/);
   });
 
-  it("1000+userIdsでもchunkingされ、summary相当のbulkReadCalls計算(bulkReadCallsFor)が2回以上になる", () => {
+  it("1000+userIdsでもchunkingされ、実際に発行されたreadCallsが2回以上になる", () => {
     const { db, store } = setup();
     const userIds: string[] = [];
     const insert = db.prepare(`INSERT INTO bump_events (message_id, user_id, created_at) VALUES (?, ?, ?)`);
@@ -245,13 +245,25 @@ describe("TitleSourceCache.prefetch()", () => {
     const scope = resolveTitleScope(store, behaviorRule("v2.test.chunk").definition, OBSERVED_AT);
 
     const cache = new TitleSourceCache();
-    const { loaded } = cache.prefetch(db, "bump_events", userIds, scope);
+    const { loaded, readCalls } = cache.prefetch(db, "bump_events", userIds, scope);
     expect(loaded).toBe(1000);
-    expect(bulkReadCallsFor(loaded)).toBeGreaterThan(1);
+    expect(readCalls).toBeGreaterThan(1); // 300-user chunkingで最低4回
 
     // 全userが正しくcacheされている（chunk境界を跨いでも欠落しない）
     expect(cache.get(db, "bump_events", "user-0", scope).events).toEqual([BASE]);
     expect(cache.get(db, "bump_events", "user-999", scope).events).toEqual([BASE]);
+  });
+
+  it("zero-width scopeのVC sourceはpayloadをcacheしつつ、実際のderived呼び出し(readCalls)は0のまま", () => {
+    const { db, store } = setup();
+    const rule = behaviorRule("v2.test.zerowidth-readcalls", { sources: ["vc_group_size_seconds"] });
+    const epochRow = store.systemEpoch()!;
+    const scope = resolveTitleScope(store, rule.definition, epochRow);
+
+    const cache = new TitleSourceCache();
+    const { loaded, readCalls } = cache.prefetch(db, "vc_group_size_seconds", ["alice"], scope);
+    expect(loaded).toBe(1);
+    expect(readCalls).toBe(0);
   });
 
   it("group内のchunk読み込みが途中失敗したら、そのgroupは何もcacheへ反映しない（all-or-nothing per group）", () => {
@@ -601,5 +613,173 @@ describe("prefetchBatchPipelineSources() — plan provenance", () => {
     // 書き換え後のtrigger("daily")では、compiled planは元のtriggersのままなので何も評価されない。
     const dailyResult = prefetchBatchPipelineSources(db, store, plan, ["alice"], OBSERVED_AT + 10, "daily");
     expect(dailyResult.summary.plannedGroups).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// TitleSourceCache runtime provenance / trust boundary（PR #158レビュー）
+// ─────────────────────────────────────────────────────────────
+
+function fakeStructuralCache(): TitleSourceCache {
+  return {
+    get() {
+      return { events: [1234567890] };
+    },
+    prefetch() {
+      return { loaded: 1, readCalls: 0 };
+    },
+  } as unknown as TitleSourceCache;
+}
+
+describe("TitleSourceCache provenance / trust boundary", () => {
+  it("A. structural fake cacheをevaluateTitle()へ渡すとreject——rule.evaluate()に到達しない、award/ownershipも作らない", () => {
+    const { db, store } = setup();
+    let evaluateCalled = false;
+    const rule = defineTitleRule(
+      {
+        kind: "behavior",
+        key: "v2.test.cache-forge-evaluator",
+        name: "test",
+        description: "cache trust boundary迂回対策のテスト用fixture",
+        sources: ["bump_events"] as const,
+        triggers: ["bump_success"],
+        lifecycle: "active",
+        ...COMMON_FIXTURE_FIELDS,
+      },
+      {
+        awardFactsVersion: 1,
+        evaluate: (ctx) => {
+          evaluateCalled = true;
+          return ctx.sources.bump_events.events.length >= 1
+            ? { matched: true, earnedAt: null, awardFacts: {} }
+            : { matched: false, earnedAt: null };
+        },
+      },
+    );
+
+    expect(() => evaluateTitle(db, store, rule, "alice", OBSERVED_AT, { cache: fakeStructuralCache() })).toThrow(
+      /not produced by `new TitleSourceCache\(\)`/,
+    );
+    expect(evaluateCalled).toBe(false);
+    expect(store.listAwards("alice")).toEqual([]);
+  });
+
+  it("B. 同じstructural fake cacheをprefetchBatchPipelineSources()へ渡すとreject", () => {
+    const { db, store, bump } = setup();
+    bump.addOnce("m1", "alice", BASE);
+    const rule = behaviorRule("v2.test.cache-forge-prefetch");
+    const plan = defineTitleEvaluationPlan([rule], []);
+
+    expect(() =>
+      prefetchBatchPipelineSources(db, store, plan, ["alice"], OBSERVED_AT, "bump_success", {
+        cache: fakeStructuralCache(),
+      }),
+    ).toThrow(/not produced by `new TitleSourceCache\(\)`/);
+  });
+
+  it("C. 正規cacheの(cache as any).cacheからbacking stateへ到達できない", () => {
+    const cache = new TitleSourceCache() as unknown as Record<string, unknown>;
+    expect(cache.cache).toBeUndefined();
+  });
+
+  it("D. shallow copy({ ...realCache })はreject", () => {
+    const { db, store } = setup();
+    const real = new TitleSourceCache();
+    const copied = { ...real } as unknown as TitleSourceCache;
+    const rule = behaviorRule("v2.test.cache-copy");
+    expect(() => evaluateTitle(db, store, rule, "alice", OBSERVED_AT, { cache: copied })).toThrow(
+      /not produced by `new TitleSourceCache\(\)`/,
+    );
+  });
+
+  it("E. Proxy(realCache, {})はreject", () => {
+    const { db, store } = setup();
+    const real = new TitleSourceCache();
+    const proxied = new Proxy(real, {}) as TitleSourceCache;
+    const rule = behaviorRule("v2.test.cache-proxy");
+    expect(() => evaluateTitle(db, store, rule, "alice", OBSERVED_AT, { cache: proxied })).toThrow(
+      /not produced by `new TitleSourceCache\(\)`/,
+    );
+  });
+
+  it("F. Object.create(TitleSourceCache.prototype)はreject", () => {
+    const { db, store } = setup();
+    const fake = Object.create(TitleSourceCache.prototype) as TitleSourceCache;
+    const rule = behaviorRule("v2.test.cache-object-create");
+    expect(() => evaluateTitle(db, store, rule, "alice", OBSERVED_AT, { cache: fake })).toThrow(
+      /not produced by `new TitleSourceCache\(\)`/,
+    );
+  });
+
+  it("G. 正常経路: prefetchBatchPipelineSources()が返したcacheをevaluateBatchPipeline()へ渡すとgreen", () => {
+    const { db, store, bump } = setup();
+    bump.addOnce("m1", "alice", BASE);
+    const matchRule = defineTitleRule(
+      {
+        kind: "behavior",
+        key: "v2.test.cache-happy-path",
+        name: "test",
+        description: "テスト用fixture",
+        sources: ["bump_events"] as const,
+        triggers: ["bump_success"],
+        lifecycle: "active",
+        ...COMMON_FIXTURE_FIELDS,
+      },
+      {
+        awardFactsVersion: 1,
+        evaluate: (ctx) =>
+          ctx.sources.bump_events.events.length >= 1
+            ? { matched: true, earnedAt: null, awardFacts: {} }
+            : { matched: false, earnedAt: null },
+      },
+    );
+    const plan = defineTitleEvaluationPlan([matchRule], []);
+
+    const prepared = prefetchBatchPipelineSources(db, store, plan, ["alice"], OBSERVED_AT, "bump_success");
+    expect(prepared.summary.cacheEntriesLoaded).toBe(1);
+
+    const results = evaluateBatchPipeline(db, store, plan, ["alice"], OBSERVED_AT, "bump_success", {
+      cache: prepared.cache,
+    });
+    expect(results[0]!.behavior[0]!.outcome).toBe("awarded");
+    expect(store.hasOwnership("alice", "v2.test.cache-happy-path")).toBe(true);
+  });
+});
+
+describe("Exploit regression: forged cacheはDBを一切通らずにaward payloadを注入できない", () => {
+  it("bump_events 0件でも、forged cacheが返すevents:[123]はevaluation前にrejectされ、award無し", () => {
+    const { db, store } = setup(); // bump_eventsは何も挿入していない = 0件
+
+    const rule = defineTitleRule(
+      {
+        kind: "behavior",
+        key: "v2.test.exploit-regression",
+        name: "test",
+        description: "cache trust boundary迂回のexploit regression test",
+        sources: ["bump_events"] as const,
+        triggers: ["bump_success"],
+        lifecycle: "active",
+        ...COMMON_FIXTURE_FIELDS,
+      },
+      {
+        awardFactsVersion: 1,
+        evaluate: (ctx) =>
+          ctx.sources.bump_events.events.length >= 1
+            ? { matched: true, earnedAt: null, awardFacts: {} }
+            : { matched: false, earnedAt: null },
+      },
+    );
+
+    const forgedCache = {
+      get() {
+        return { events: [123] };
+      },
+    } as unknown as TitleSourceCache;
+
+    expect(() => evaluateTitle(db, store, rule, "alice", OBSERVED_AT, { cache: forgedCache })).toThrow(
+      /not produced by `new TitleSourceCache\(\)`/,
+    );
+    expect(store.listAwards("alice")).toEqual([]);
+    expect(store.hasOwnership("alice", "v2.test.exploit-regression")).toBe(false);
   });
 });
