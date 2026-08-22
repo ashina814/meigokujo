@@ -1,17 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ButtonInteraction, ChatInputCommandInteraction } from "discord.js";
-import { openDb, PublicEvents } from "@meigokujo/core";
+import { openDb, PublicEvents, Settings } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 import { handlePublicEventRecordButton, handlePublicEventRecordCommand } from "../src/commands/public-event-record.js";
+
+const ADMIN_ROLE_ID = "admin-role-id";
 
 function fakeServices() {
   const db = openDb(":memory:");
   const publicEvents = new PublicEvents(db);
-  return { db, services: { publicEvents } as unknown as Services };
+  const settings = new Settings(db);
+  settings.set("role:admin", ADMIN_ROLE_ID, "test-setup");
+  return { db, settings, services: { publicEvents, settings } as unknown as Services };
+}
+
+/** roles.cache.has()で判定できる最小限のfake GuildMember。admin roleの有無を後から切り替えられる。 */
+function fakeMember(userId: string, roleIds: readonly string[]) {
+  return { id: userId, roles: { cache: new Map(roleIds.map((id) => [id, {}])) } };
 }
 
 function fakeChatInput(opts: {
   userId: string;
+  member?: ReturnType<typeof fakeMember> | null;
   eventKey?: string;
   name?: string;
   eventDate?: string;
@@ -26,17 +36,18 @@ function fakeChatInput(opts: {
   return {
     id: `cmd-${Math.random()}`,
     user: { id: opts.userId },
-    member: opts.userId === "test-owner" ? null : null,
+    member: opts.member ?? null,
     options: { getString: (name: string) => optionValues[name] ?? null },
     reply: vi.fn().mockResolvedValue(undefined),
   } as unknown as ChatInputCommandInteraction & { reply: ReturnType<typeof vi.fn> };
 }
 
-function fakeButton(customId: string, userId: string) {
+function fakeButton(customId: string, userId: string, member?: ReturnType<typeof fakeMember> | null) {
   return {
     customId,
     id: `btn-${Math.random()}`,
     user: { id: userId },
+    member: member ?? null,
     update: vi.fn().mockResolvedValue(undefined),
   } as unknown as ButtonInteraction & { update: ReturnType<typeof vi.fn> };
 }
@@ -185,5 +196,84 @@ describe("§65 customId leak test", () => {
       expect(id).not.toContain("gf-2026-08-22");
       expect(id).not.toContain("God");
     }
+  });
+});
+
+describe("PR #162レビュー BLOCKER 1: unknown pev actionのfail-close", () => {
+  it("有効なpending tokenでも未知actionはDB 0・recordFinalizedEvent到達0", async () => {
+    const { db, services } = fakeServices();
+    const interaction = fakeChatInput({ userId: "test-owner" });
+    await handlePublicEventRecordCommand(interaction, services);
+    const okCustomId = extractCustomIds(interaction.reply.mock.calls[0]![0]).find((id) => id.startsWith("pev:ok:"))!;
+    const token = okCustomId.split(":")[2]!;
+
+    const spy = vi.spyOn(services.publicEvents, "recordFinalizedEvent");
+    const button = fakeButton(`pev:future_unknown:${token}`, "test-owner");
+    await handlePublicEventRecordButton(button, services);
+
+    expect(spy).not.toHaveBeenCalled();
+    expect(button.update).not.toHaveBeenCalled();
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM public_events`).get()).toEqual({ c: 0 });
+  });
+
+  it("有効tokenでも malformed customId（actionもtokenも無い）はDB 0", async () => {
+    const { db, services } = fakeServices();
+    const button = fakeButton("pev:", "test-owner");
+    await handlePublicEventRecordButton(button, services);
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM public_events`).get()).toEqual({ c: 0 });
+  });
+});
+
+describe("PR #162レビュー BLOCKER 2: confirm時のadmin権限再検証", () => {
+  it("admin Aがpreview、confirm前にA本人のadmin権限を外す → A本人のConfirmでもDB 0", async () => {
+    const { db, services } = fakeServices();
+    // OWNERは常にadminなので、role保持だけでadminになる非OWNER identityを使う。
+    const adminMember = fakeMember("non-owner-admin", [ADMIN_ROLE_ID]);
+    const interaction = fakeChatInput({ userId: "non-owner-admin", member: adminMember });
+    await handlePublicEventRecordCommand(interaction, services);
+    const customId = extractCustomIds(interaction.reply.mock.calls[0]![0]).find((id) => id.startsWith("pev:ok:"))!;
+
+    // confirm前にA本人からadmin roleを外す（同じuserIdだが、role非保持のmemberでconfirm）。
+    const demotedMember = fakeMember("non-owner-admin", []);
+    const button = fakeButton(customId, "non-owner-admin", demotedMember);
+    await handlePublicEventRecordButton(button, services);
+
+    expect(String(button.update.mock.calls[0]![0].content)).toContain("運営権限");
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM public_events`).get()).toEqual({ c: 0 });
+  });
+
+  it("admin権限を保持したままのconfirmは通常通り成功する（回帰確認）", async () => {
+    const { db, services } = fakeServices();
+    const adminMember = fakeMember("non-owner-admin", [ADMIN_ROLE_ID]);
+    const interaction = fakeChatInput({ userId: "non-owner-admin", member: adminMember });
+    await handlePublicEventRecordCommand(interaction, services);
+    const customId = extractCustomIds(interaction.reply.mock.calls[0]![0]).find((id) => id.startsWith("pev:ok:"))!;
+
+    const button = fakeButton(customId, "non-owner-admin", adminMember);
+    await handlePublicEventRecordButton(button, services);
+
+    expect(String(button.update.mock.calls[0]![0].content)).toContain("✅");
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM public_events`).get()).toEqual({ c: 1 });
+  });
+});
+
+describe("PR #162レビュー BLOCKER 3: preview participant countはdedupe後の値と一致する", () => {
+  it("111, 222, <@111> → preview 2人 → confirm result 2人 → DB 2 rows", async () => {
+    const { db, services } = fakeServices();
+    const interaction = fakeChatInput({
+      userId: "test-owner",
+      participants: "111111111111111111 222222222222222222 <@111111111111111111>",
+    });
+    await handlePublicEventRecordCommand(interaction, services);
+    const payload = interaction.reply.mock.calls[0]![0];
+    const embedJson = (payload.embeds[0] as { toJSON(): { description?: string } }).toJSON();
+    expect(String(embedJson.description)).toContain("参加者: **2人**");
+
+    const customId = extractCustomIds(payload).find((id) => id.startsWith("pev:ok:"))!;
+    const button = fakeButton(customId, "test-owner");
+    await handlePublicEventRecordButton(button, services);
+
+    expect(String(button.update.mock.calls[0]![0].content)).toContain("参加者: 2人");
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM public_event_participations`).get()).toEqual({ c: 2 });
   });
 });

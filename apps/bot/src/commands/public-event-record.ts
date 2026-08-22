@@ -69,6 +69,11 @@ const RAW_ID_PATTERN = /^\d{15,25}$/;
  * Discord user identityとして明確にparseできるtokenだけを受け付ける（§30-31）。
  * usernameやdisplay nameからの推測は一切しない。1 tokenでも不正なら全体をrejectし、
  * partial rosterを保存しない——nullを返す。
+ *
+ * previewはimmutable write前の唯一の確認画面なので、表示する人数と実際にcommitされる
+ * roster数を一致させる——ここで最初のappearance順のdedupeまで行い、dedupe済みの
+ * participantUserIdsをpendingへ保存する（PR #162レビュー§3）。core側
+ * （`PublicEvents.recordFinalizedEvent()`）のdedupeはdefense-in-depthとして残る。
  */
 function parseParticipantTokens(raw: string): readonly string[] | null {
   const tokens = raw
@@ -77,18 +82,15 @@ function parseParticipantTokens(raw: string): readonly string[] | null {
     .filter((t) => t.length > 0);
   if (tokens.length === 0) return null;
 
+  const seen = new Set<string>();
   const ids: string[] = [];
   for (const token of tokens) {
     const mentionMatch = MENTION_PATTERN.exec(token);
-    if (mentionMatch?.[1]) {
-      ids.push(mentionMatch[1]);
-      continue;
-    }
-    if (RAW_ID_PATTERN.test(token)) {
-      ids.push(token);
-      continue;
-    }
-    return null; // 1つでも不正なtokenがあれば全体reject（partial保存しない）
+    const id = mentionMatch?.[1] ?? (RAW_ID_PATTERN.test(token) ? token : null);
+    if (id === null) return null; // 1つでも不正なtokenがあれば全体reject（partial保存しない）
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
   }
   return ids;
 }
@@ -154,7 +156,10 @@ export async function handlePublicEventRecordButton(
   services: Services,
 ): Promise<void> {
   const [, action, token] = interaction.customId.split(":");
-  if (!action || !token) return;
+  // allowed actionをexactに"ok"/"no"だけへ限定する（PR #162レビュー§1）——
+  // customIdは実質caller側で自由に組み立てられる入力なので、未知/malformedな
+  // actionは即fail-closedし、confirmロジックへ一切到達させない。
+  if (!token || (action !== "ok" && action !== "no")) return;
 
   const p = pending.get(token);
   if (!p || p.expiresAt < Date.now()) {
@@ -169,6 +174,18 @@ export async function handlePublicEventRecordButton(
   // previewを出した運営本人だけがConfirm/Cancelできる（§35）。ephemeral messageなので
   // 通常は他人からは見えないが、defense-in-depthとして明示的に検証する。
   if (interaction.user.id !== p.initiatingAdminId) return;
+  // previewから確定まで最大5分空く——previewの時点でadminだった本人が、その間に
+  // admin権限を失っていてもConfirmだけで書き込めてしまわないよう、実際のDB
+  // mutation直前にも現在のadmin権限を再検証する（PR #162レビュー§2）。
+  if (!isAdmin(interaction, services)) {
+    pending.delete(token);
+    await interaction.update({
+      content: "❌ 運営権限が確認できませんでした。もう一度 `/イベント参加記録` からどうぞ。",
+      embeds: [],
+      components: [],
+    });
+    return;
+  }
 
   if (action === "no") {
     pending.delete(token);
