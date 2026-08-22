@@ -1314,6 +1314,120 @@ E4 Casino Safe Participation Source（neutral participationだけの安全な
 Collection Edition・shadow evaluation・threshold calibration・production
 cutoverへ進む。
 
+### Economy Safe Classification — E2
+
+raw `transactions`（Ledgerの全取引正本）にはsalary/pension/fine/tax/bet/
+prize/casino chip/departmentといった、意味も安全性も全く異なる多数の
+domainが同居し、amount・counterparty・reason・ref・approved_by等の
+機微データも含む——`transactions`自体を`titleUsable:true`にはしない。
+このPRでは、identity-minimized + amount-minimized + count-minimizedな
+**安全な対人経済行動**だけを、厳密なallowlistで切り出して称号sourceへ
+昇格する。
+
+**`transactions`は`titleUsable:false`のまま**:
+
+- `TITLE_SOURCES`へ`ledger_transactions`（`origin:"persisted"`、
+  `privacy:"restricted"`、`titleUsable:false`、`epochPolicy:{type:"point",
+  at:"created_at"}`）を登録する。`writtenBy`はLedger本体の
+  `INSERT INTO transactions`（`packages/core/src/ledger/service.ts`）、
+  `calledFrom`/`wiredFrom`は`/送金`の実production呼び出し経路
+  （`apps/bot/src/commands/transfer.ts`の`services.ledger.transfer({`→
+  `apps/bot/src/index.ts`の`handleTransfer`dispatch）。
+- `restrictedUse`型をPR C2の`"relationship_private_evidence"`から
+  `"relationship_private_evidence" | "economy_safe_classification"`へ
+  拡張し、`ledger_transactions`だけが後者を宣言する。C2で確立した
+  contract（`privacy==="restricted"`かつ`titleUsable===false`必須、
+  `safe`/`forbidden`のsourceは`restrictedUse`を宣言できない、未知の
+  `restrictedUse`値は拒否）は`assertRestrictedUseContract()`側を一切
+  変更せず、値の型を広げるだけで自動的に新しい値へも適用される。
+
+**exact allowlist（内部のみ）**: `transfer`/`tip`の2種類だけ。`registry.ts`の
+`knownTxTypes()`や`publicLog:true`フラグから動的にtype集合を採用しない
+——将来型が追加されても、`packages/core/src/titles/v2-economy.ts`の
+`SAFE_PEER_ECONOMY_TYPES`定数を明示的に変更・レビューしない限りsafe
+boundaryは広がらない。`registerTxType()`で新規登録したtypeが
+`publicLog:true`かつ`user→user`であっても、`economy_safe_peer_actions`
+へは自動で入らない（テストで固定）。
+
+**`tip_burn`は今回除外する**: 表面上は同じ「投げ銭」だが、実際は
+(A) Bot宛投げ銭 (B) 公式ショップ購入 (C) ショップ延長 (D) オリジナル
+ロール請求、と複数domainがこの1つのtxtypeを共有しており、type単体では
+意味を一意に特定できない。`ref_type`やidempotency prefixによる
+事後的な意味の切り分けもしない——将来、domain固有のsourceとして
+別途設計する。`to_account LIKE 'user:%'`フィルタにより、
+`tip_burn`（to=`sys:treasury`）は構造的にも二重に排除される
+——allowlistへ`"tip_burn"`を誤って追加してしまっても、このto_account
+フィルタが最後の砦として機能する（mutation testingで検証済み）。
+
+**除外理由の全体像**:
+
+| カテゴリ | 例 | 除外理由 |
+| --- | --- | --- |
+| 発行/自動/管理者操作 | opening/initial/salary/pension/vc_reward/reward_boost/event_prize/harvest/insurance_payout/room_refund/adjust | 本人の対人行動ではない |
+| ショップ/機微 | shop_personal/shop_official/fanclub/inheritance | ショップ紐付き・私的文脈 |
+| 部署/役割 | dept_in/dept_out/commission | role/business state隣接 |
+| 逆風/行政 | fine/tax/event_fee/insurance_premium/room_fee | 懲罰的・行政的・private room文脈 |
+| ギャンブル/損益 | bet/prize/market_house_fee/ether_*/chip_*/casino_* | PnL系、E4で別途設計 |
+| 投げ銭(overloaded) | tip_burn | 複数domain共有で意味が一意でない（上記） |
+
+**subject semantics（誰の行動として数えるか）**:
+
+- `from_account = user:<subjectUserId>`側だけを見る——受け取った側の
+  行動としては数えない（incoming exclusion）。
+- `actor_id = from_account`を要求し、staff/system代行を除外する。
+  高額送金の運営承認フロー（`/送金`の`handleApprovalButton`）でも、
+  `actor`は常に元の送信者のまま（`approvedBy`は別フィールド）——
+  承認の有無をactor identityと混同しない。実装前にproduction
+  callsite（`transfer.ts`/`tip.ts`）を直接読み、この前提を確認した。
+- `to_account LIKE 'user:%'`を要求し、system口座宛（`tip_burn`等）を
+  除外する。
+- `reversal_of IS NOT NULL`の行自体はfactを作らない。ただし**元の
+  transactionのfactは、後からreversalされてもretroactivelyには
+  消えない**——称号は永続的な事実であり、「まだreversalされていない」
+  というmutableな定義にしない。
+
+**identity/amount minimization**: payload
+（`EconomySafePeerActionsSourcePayload`）は
+`{ facts: [{ kind: "transfer"|"tip", date, occurredAt }] }`だけ。
+amount・counterparty（from/to account）・reason・ref・approved_by・
+idempotency_key・transaction idは一切含めない。SQL側も
+`SELECT from_account, type, created_at`だけを取得し、JS側で読み捨てる
+のではなくSELECT文自体を最小化する。
+
+**JST day×kind dedupe**: `user × JST date × kind`で最大1 fact。同日に
+`transfer`を10回しても1 fact、`tip`を20回しても1 fact——生の取引件数を
+1:1でfactにしない（1 Land spamでfactを量産できない）。`occurredAt`は
+その(user, date, kind)で最初にqualifyした取引の`created_at`
+（first-qualifying-observation-immutable）。JST変換はE1と同じ
+`entry/sessions.ts`の`jstDateStr()`を再利用する。
+
+**永続化なし**: `title_economy_events`のような新規tableは作らない。
+`packages/core/src/titles/v2-economy.ts`の`computeSafeEconomyPeerActions()`
+は`transactions`からのread-only derivationであり、`transactions`/
+`balances`/`outbox`等のLedger stateを一切mutateしない。
+
+**Bulk source integration**: D1契約にそのまま乗る（bulk readerが正本、
+single readerは`[userId]`委譲、chunking共有、deep freeze、forged
+scope/cache provenance維持）。
+
+**公開境界**: `v2.ts`からexportしてよいのは
+`EconomySafePeerActionsSourcePayload`と`SafePeerEconomyActionKind`だけ。
+raw ledger transaction reader・`SAFE_PEER_ECONOMY_TYPES`allowlist・
+`computeSafeEconomyPeerActions()`自体はexportしない——callerがraw
+`transactions`由来のfactを直接組み立ててruleへ注入できる経路を作らない。
+
+**明示的にスコープ外**: Behavior evaluatorのproduction wiring
+（`/送金`/`/投げ銭`成功時に`evaluateUserPipeline(trigger:"economy_activity")`
+を呼ぶこと）・新規Discord通知・`Ledger.transfer()`/Shop/Fiscal/Casino
+の既存経済的振る舞いの変更・`/プロフィール`表示や称号装備への影響。
+このPRはsource収集基盤の追加だけ。
+
+**follow-up（E2の範囲外）**: E3 Public Event Participation Source・
+E4 Casino Safe Participation Source（neutral participationだけ、
+win/loss/PnL/all-inを使わない）。その後、production 99-title catalog・
+Series manifests・Collection Edition・shadow evaluation・threshold
+calibration・production cutoverへ進む。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

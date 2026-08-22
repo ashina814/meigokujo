@@ -17,6 +17,7 @@ export {
   type TitleScopePolicy,
   type TitleSourceCodeRef,
   type TitleSourceDefinition,
+  type TitleRestrictedUse,
   type TitleSourceKey,
   type TitleSourceKind,
   type TitleSourcePrivacy,
@@ -99,6 +100,7 @@ export {
   TitleSourceCache,
   type BumpEventsSourcePayload,
   type ConfirmedInvitesSourcePayload,
+  type EconomySafePeerActionsSourcePayload,
   type TextActiveDaysSourcePayload,
   type TitleSourcePayloads,
   type VcEmptyStartThenJoinedSourcePayload,
@@ -106,6 +108,12 @@ export {
   type VcLastOccupantSourcePayload,
   type VcSocialSafeSourcePayload,
 } from "./v2-sources.js";
+
+// v2-economy.ts の computeSafeEconomyPeerActions()（PR E2の内部classifier正本）は
+// ここではexportしない——callerがraw transactions由来のfactを直接組み立てて
+// ruleへ注入できる経路を作らない。SAFE_PEER_ECONOMY_TYPES allowlistもinternalのまま。
+// 公開してよいのはpayload型と、その`kind`フィールドの型だけ。
+export { type SafePeerEconomyActionKind } from "./v2-economy.js";
 
 export {
   defineTitleRule,

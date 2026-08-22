@@ -8,6 +8,7 @@ import {
 } from "../vc/derived.js";
 import { TITLE_SOURCES, type TitleSourceDefinition, type TitleUsableSourceKey } from "./v2-contract.js";
 import { assertResolvedTitleScope, resolvedScopeEffectiveEnd, type ResolvedTitleScope } from "./v2-scope.js";
+import { computeSafeEconomyPeerActions, type SafePeerEconomyActionKind } from "./v2-economy.js";
 
 /**
  * 称号ruleがraw DBを直接触らないようにするための、source読み込み境界。
@@ -68,6 +69,19 @@ export interface ConfirmedInvitesSourcePayload {
   readonly creditedAt: readonly number[];
 }
 
+/**
+ * PR E2: amount・counterparty（from/to account）・reason・ref・approved_by・
+ * idempotency_key・transaction idは一切含めない。kind（"transfer"|"tip"）とJST date・
+ * occurredAtだけ。
+ */
+export interface EconomySafePeerActionsSourcePayload {
+  readonly facts: ReadonlyArray<{
+    readonly kind: SafePeerEconomyActionKind;
+    readonly date: string;
+    readonly occurredAt: number;
+  }>;
+}
+
 /** sourceKeyごとのsanitized payload型。相手のuserId・raw message ID等は一切含めない。 */
 export interface TitleSourcePayloads {
   bump_events: BumpEventsSourcePayload;
@@ -77,6 +91,7 @@ export interface TitleSourcePayloads {
   vc_social_safe: VcSocialSafeSourcePayload;
   text_active_days: TextActiveDaysSourcePayload;
   confirmed_invites: ConfirmedInvitesSourcePayload;
+  economy_safe_peer_actions: EconomySafePeerActionsSourcePayload;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -345,6 +360,30 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
     }
     return { payloads, readCalls };
   },
+
+  economy_safe_peer_actions: (db, userIds, scope) => {
+    const payloads = new Map<string, EconomySafePeerActionsSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { facts: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      // 実際のsafe allowlist・actor binding・reversal除外・JST day×kind dedupeは
+      // v2-economy.tsのcomputeSafeEconomyPeerActions()だけが持つ（正本を二重実装しない）。
+      const facts = computeSafeEconomyPeerActions(db, { start: scope.start, end: effectiveEnd }, chunk);
+      const byUser = new Map<string, Array<{ kind: SafePeerEconomyActionKind; date: string; occurredAt: number }>>();
+      for (const f of facts) {
+        const entry = { kind: f.kind, date: f.date, occurredAt: f.occurredAt };
+        const list = byUser.get(f.userId);
+        if (list) list.push(entry);
+        else byUser.set(f.userId, [entry]);
+      }
+      for (const [userId, list] of byUser) payloads.set(userId, { facts: list });
+    }
+    return { payloads, readCalls };
+  },
 };
 
 /**
@@ -383,6 +422,8 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
   vc_social_safe: (db, userId, scope) => BULK_SOURCE_READERS.vc_social_safe(db, [userId], scope).payloads.get(userId)!,
   text_active_days: (db, userId, scope) => BULK_SOURCE_READERS.text_active_days(db, [userId], scope).payloads.get(userId)!,
   confirmed_invites: (db, userId, scope) => BULK_SOURCE_READERS.confirmed_invites(db, [userId], scope).payloads.get(userId)!,
+  economy_safe_peer_actions: (db, userId, scope) =>
+    BULK_SOURCE_READERS.economy_safe_peer_actions(db, [userId], scope).payloads.get(userId)!,
 };
 
 /**
