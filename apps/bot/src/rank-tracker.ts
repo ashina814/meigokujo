@@ -37,6 +37,16 @@ export async function handleMessageXp(message: Message, services: Services): Pro
   const parentId = "parentId" in ch ? (ch.parentId ?? null) : null;
   if (isExcluded(services, message.channelId, parentId)) return;
 
+  // TC安全source（PR E1）。rank XP cooldownとは独立——同日最初のqualifying messageが
+  // cooldown中でも、その日はTC活動日として記録する（§13）。message.createdTimestampは
+  // ミリ秒なので秒へ正規化する（Date.now()でevent timeを捏造しない、§16）。
+  // v2 source persistenceの失敗で既存Rank XP処理を止めない（§18、sidecarと同じ思想）。
+  try {
+    services.textActivity.recordActiveDay(message.author.id, Math.floor(message.createdTimestamp / 1000));
+  } catch (e) {
+    console.error(`[text-activity] persistence failed userId=${message.author.id}`, e);
+  }
+
   const xp = rand(TEXT_XP_MIN, TEXT_XP_MAX);
   const award = services.ranks.awardText(message.author.id, xp, TEXT_COOLDOWN_SEC);
   if (!award) return; // クールダウン中

@@ -55,6 +55,19 @@ export interface VcSocialSafeSourcePayload {
   readonly trustedOverlapSeconds: number;
 }
 
+/**
+ * PR E1: raw message数・message内容・channel・message idは一切含めない。JST dateだけは
+ * safeなので含めてよい（将来、連続日/週末/特定イベント日を安全に評価できるようにする）。
+ */
+export interface TextActiveDaysSourcePayload {
+  readonly days: ReadonlyArray<{ readonly date: string; readonly observedAt: number }>;
+}
+
+/** PR E1: invitee identity・inviter identity（自分自身のuserIdはcaller側で既知）は含めない。 */
+export interface ConfirmedInvitesSourcePayload {
+  readonly creditedAt: readonly number[];
+}
+
 /** sourceKeyごとのsanitized payload型。相手のuserId・raw message ID等は一切含めない。 */
 export interface TitleSourcePayloads {
   bump_events: BumpEventsSourcePayload;
@@ -62,6 +75,8 @@ export interface TitleSourcePayloads {
   vc_last_occupant: VcLastOccupantSourcePayload;
   vc_group_size_seconds: VcGroupSizeSecondsSourcePayload;
   vc_social_safe: VcSocialSafeSourcePayload;
+  text_active_days: TextActiveDaysSourcePayload;
+  confirmed_invites: ConfirmedInvitesSourcePayload;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -272,6 +287,64 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
     }
     return { payloads, readCalls };
   },
+
+  text_active_days: (db, userIds, scope) => {
+    const payloads = new Map<string, TextActiveDaysSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { days: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      const placeholders = chunk.map(() => "?").join(",");
+      const rows = db
+        .prepare(
+          `SELECT user_id, activity_date, observed_at FROM text_active_days
+            WHERE user_id IN (${placeholders}) AND observed_at >= ? AND observed_at < ?
+            ORDER BY user_id ASC, observed_at ASC`,
+        )
+        .all(...chunk, scope.start, effectiveEnd) as Array<{ user_id: string; activity_date: string; observed_at: number }>;
+      const byUser = new Map<string, Array<{ date: string; observedAt: number }>>();
+      for (const row of rows) {
+        const entry = { date: row.activity_date, observedAt: row.observed_at };
+        const list = byUser.get(row.user_id);
+        if (list) list.push(entry);
+        else byUser.set(row.user_id, [entry]);
+      }
+      for (const [userId, days] of byUser) payloads.set(userId, { days });
+    }
+    return { payloads, readCalls };
+  },
+
+  confirmed_invites: (db, userIds, scope) => {
+    const payloads = new Map<string, ConfirmedInvitesSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { creditedAt: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      const placeholders = chunk.map(() => "?").join(",");
+      // invitee_idはSELECTしない——招待された側のidentityをruleへ一切渡さない（§26, §33）。
+      const rows = db
+        .prepare(
+          `SELECT inviter_id, credited_at FROM invites
+            WHERE inviter_id IN (${placeholders}) AND credited_at >= ? AND credited_at < ?
+            ORDER BY inviter_id ASC, credited_at ASC`,
+        )
+        .all(...chunk, scope.start, effectiveEnd) as Array<{ inviter_id: string; credited_at: number }>;
+      const byUser = new Map<string, number[]>();
+      for (const row of rows) {
+        const list = byUser.get(row.inviter_id);
+        if (list) list.push(row.credited_at);
+        else byUser.set(row.inviter_id, [row.credited_at]);
+      }
+      for (const [userId, creditedAt] of byUser) payloads.set(userId, { creditedAt });
+    }
+    return { payloads, readCalls };
+  },
 };
 
 /**
@@ -308,6 +381,8 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
   vc_group_size_seconds: (db, userId, scope) =>
     BULK_SOURCE_READERS.vc_group_size_seconds(db, [userId], scope).payloads.get(userId)!,
   vc_social_safe: (db, userId, scope) => BULK_SOURCE_READERS.vc_social_safe(db, [userId], scope).payloads.get(userId)!,
+  text_active_days: (db, userId, scope) => BULK_SOURCE_READERS.text_active_days(db, [userId], scope).payloads.get(userId)!,
+  confirmed_invites: (db, userId, scope) => BULK_SOURCE_READERS.confirmed_invites(db, [userId], scope).payloads.get(userId)!,
 };
 
 /**

@@ -161,6 +161,7 @@ export {
   type TrackedRankLevels,
 } from "./rank/service.js";
 export { BumpCounter } from "./rank/bump.js";
+export { TextActivity } from "./text-activity/service.js";
 export {
   MEIREI_ROLE_SETTING_KEY,
   RANK_LADDER,

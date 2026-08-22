@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { RankEngine, TitleEngine, TitleV2Store } from "@meigokujo/core";
+import { RankEngine, TextActivity, TitleEngine, TitleV2Store } from "@meigokujo/core";
 
 process.env.DISCORD_TOKEN = process.env.DISCORD_TOKEN ?? "test-token";
 process.env.CLIENT_ID = process.env.CLIENT_ID ?? "test-client";
@@ -18,6 +18,8 @@ describe("buildServices() — rank-title v2 wiring regression", () => {
       expect(services.titles).toBeInstanceOf(TitleEngine);
       expect(services.titleV2).toBeInstanceOf(TitleV2Store);
       expect(services.ranks).toBeInstanceOf(RankEngine);
+      // PR E1 §15: services.textActivityを既存servicesの置換なしで追加する。
+      expect(services.textActivity).toBeInstanceOf(TextActivity);
     } finally {
       services.db.close();
     }

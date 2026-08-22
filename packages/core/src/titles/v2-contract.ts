@@ -349,6 +349,67 @@ export const TITLE_SOURCES = {
     // pair identityを畳み込んだ、本人単位の集計だけ。
     rawUnit: "safe_social_aggregate",
   },
+
+  // ── Safe Activity Sources（PR E1）────────────────────────────────────
+  //
+  // rank_text XPを称号sourceとして流用しない（位名と印を再び混ぜない）。raw message数も
+  // 保存しない。「そのJST日に少なくとも1回、称号対象として安全なTC活動が観測された」
+  // という事実だけを、1 user × 1 JST day最大1行で保存する。
+  text_active_days: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/text-activity/service.ts",
+      needle: "INSERT INTO text_active_days",
+    },
+    calledFrom: {
+      file: "apps/bot/src/rank-tracker.ts",
+      needle: "services.textActivity.recordActiveDay(",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "handleMessageXp(message, services)",
+    },
+    kind: "history",
+    privacy: "safe",
+    // 1 user × 1 JST dayにつき最大1行、observed_atはその日最初に永続化された
+    // qualifying event time——N active days目をobserved_at ASCで順序付けられる。
+    // ただしこれはN messages/N sessionsを意味しない（rawUnit参照）。
+    orderable: true,
+    titleUsable: true,
+    epochPolicy: { type: "point", at: "observed_at" },
+    // 「ある1つのJST日にTC活動が観測された」という事実1件。message数・session数ではない。
+    rawUnit: "unique_jst_text_active_day",
+  },
+
+  // ── Confirmed Invites（PR E1）────────────────────────────────────
+  //
+  // 正本はinvitesテーブルだけ——souls.inviter_hint_*やentry_bookings.inviter_*
+  // （検出・hintの段階）はconfirmedではない。Entry.creditInvite()が実際にINSERTした
+  // 行だけを数える。invitee identityはpayloadへ一切出さない。
+  confirmed_invites: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/entry/service.ts",
+      needle:
+        "INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?, ?, ?) ON CONFLICT(invitee_id) DO NOTHING",
+    },
+    calledFrom: {
+      file: "apps/bot/src/commands/entry.ts",
+      needle: "services.entry.ghostify(userId, actor, { inviteeGender: gender })",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "handleMemberRoleUpdate(oldMember, newMember, services)",
+    },
+    kind: "history",
+    privacy: "safe",
+    // invites.credited_atは実際に確定した瞬間の時刻——N件目の確定招待をcredited_at ASCで
+    // 順序付けられる。
+    orderable: true,
+    titleUsable: true,
+    epochPolicy: { type: "point", at: "credited_at" },
+    rawUnit: "confirmed_invite_credit",
+  },
 } as const satisfies Record<string, TitleSourceDefinition>;
 
 export type TitleSourceKey = keyof typeof TITLE_SOURCES;
