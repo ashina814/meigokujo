@@ -385,3 +385,127 @@ describe("forged scope reject", () => {
     );
   });
 });
+
+/**
+ * PR #166レビューBLOCKER1: `computeCasinoCompletedActivityDays()`は
+ * `recordCompletedParticipation()`のwriter-side guardと同じ7条件を、DB corruption
+ * （直接SQL・マイグレーションミス等、writer APIを経由しない不整合）に対しても
+ * reader側で独立に再検証しなければならない。1条件でも満たさないgroupは、その
+ * participationKeyの行をまとめて（1人分だけでも）一切emitしない——ここではすべて
+ * writer APIをbypassした直接SQLで不整合を再現する。
+ */
+describe("N. corrupt partial completion group（BLOCKER1-A / 条件4）", () => {
+  it("PVP commitment 2人(alice,bob)に対しcompletion行を直接INSERTでaliceだけ挿入 → alice/bob両方とも0件", () => {
+    const { db, store, casino, setCasinoClock } = setup();
+    setCasinoClock(BASE - 50_000);
+    const key = commitOnly(casino, { activityKey: "sashi", participantUserIds: ["alice", "bob"] });
+    // recordCompletedParticipation()は全参加者分を同一transactionで書くため、
+    // 「bobの行だけ欠落」という部分corruptionはwriter APIでは作れない——直接SQLで再現する。
+    db.prepare(
+      `INSERT INTO casino_participation_completions (participation_key, user_id, completed_at) VALUES (?, ?, ?)`,
+    ).run(key.participationKey, "alice", BASE - 40_000);
+
+    const scope = resolveTitleScope(store, CASINO_COMPLETED_ACTIVITY_DAYS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "casino_completed_activity_days", "alice", scope)).toEqual({ activityDays: [] });
+    expect(readTitleSource(db, "casino_completed_activity_days", "bob", scope)).toEqual({ activityDays: [] });
+  });
+});
+
+describe("O. corrupt mixed completed_at（BLOCKER1-B / 条件5）", () => {
+  it("同一participation_keyのcompletion行でcompleted_atが食い違う → 全員0件", () => {
+    const { db, store, casino, setCasinoClock } = setup();
+    setCasinoClock(BASE - 50_000);
+    const key = commitOnly(casino, { activityKey: "sashi", participantUserIds: ["alice", "bob"] });
+    db.prepare(
+      `INSERT INTO casino_participation_completions (participation_key, user_id, completed_at) VALUES (?, ?, ?)`,
+    ).run(key.participationKey, "alice", BASE - 40_000);
+    db.prepare(
+      `INSERT INTO casino_participation_completions (participation_key, user_id, completed_at) VALUES (?, ?, ?)`,
+    ).run(key.participationKey, "bob", BASE - 30_000);
+
+    const scope = resolveTitleScope(store, CASINO_COMPLETED_ACTIVITY_DAYS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "casino_completed_activity_days", "alice", scope)).toEqual({ activityDays: [] });
+    expect(readTitleSource(db, "casino_completed_activity_days", "bob", scope)).toEqual({ activityDays: [] });
+  });
+});
+
+describe("P. corrupt mixed commitment activity_key（BLOCKER1-C / 条件2）", () => {
+  it("同一participation_keyのcommitment行でactivity_keyが食い違う → 全員0件", () => {
+    const { db, store } = setup();
+    db.prepare(
+      `INSERT INTO casino_participations (participation_key, user_id, activity_key, occurred_at) VALUES (?, ?, ?, ?)`,
+    ).run("corrupt-mixed-activity", "alice", "sashi", BASE - 50_000);
+    db.prepare(
+      `INSERT INTO casino_participations (participation_key, user_id, activity_key, occurred_at) VALUES (?, ?, ?, ?)`,
+    ).run("corrupt-mixed-activity", "bob", "blackjack", BASE - 50_000);
+    db.prepare(
+      `INSERT INTO casino_participation_completions (participation_key, user_id, completed_at) VALUES (?, ?, ?)`,
+    ).run("corrupt-mixed-activity", "alice", BASE - 40_000);
+    db.prepare(
+      `INSERT INTO casino_participation_completions (participation_key, user_id, completed_at) VALUES (?, ?, ?)`,
+    ).run("corrupt-mixed-activity", "bob", BASE - 40_000);
+
+    const scope = resolveTitleScope(store, CASINO_COMPLETED_ACTIVITY_DAYS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "casino_completed_activity_days", "alice", scope)).toEqual({ activityDays: [] });
+    expect(readTitleSource(db, "casino_completed_activity_days", "bob", scope)).toEqual({ activityDays: [] });
+  });
+});
+
+describe("Q. corrupt mixed commitment occurred_at（BLOCKER1-D / 条件3）", () => {
+  it("同一participation_keyのcommitment行でoccurred_atが食い違う → 全員0件", () => {
+    const { db, store } = setup();
+    db.prepare(
+      `INSERT INTO casino_participations (participation_key, user_id, activity_key, occurred_at) VALUES (?, ?, ?, ?)`,
+    ).run("corrupt-mixed-occurred", "alice", "sashi", BASE - 50_000);
+    db.prepare(
+      `INSERT INTO casino_participations (participation_key, user_id, activity_key, occurred_at) VALUES (?, ?, ?, ?)`,
+    ).run("corrupt-mixed-occurred", "bob", "sashi", BASE - 45_000);
+    db.prepare(
+      `INSERT INTO casino_participation_completions (participation_key, user_id, completed_at) VALUES (?, ?, ?)`,
+    ).run("corrupt-mixed-occurred", "alice", BASE - 40_000);
+    db.prepare(
+      `INSERT INTO casino_participation_completions (participation_key, user_id, completed_at) VALUES (?, ?, ?)`,
+    ).run("corrupt-mixed-occurred", "bob", BASE - 40_000);
+
+    const scope = resolveTitleScope(store, CASINO_COMPLETED_ACTIVITY_DAYS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "casino_completed_activity_days", "alice", scope)).toEqual({ activityDays: [] });
+    expect(readTitleSource(db, "casino_completed_activity_days", "bob", scope)).toEqual({ activityDays: [] });
+  });
+});
+
+describe("R. corrupt completed_at < occurred_at（BLOCKER1-E / 条件6）", () => {
+  it("completed_atがoccurred_atより前 → 全員0件", () => {
+    const { db, store, casino, setCasinoClock } = setup();
+    setCasinoClock(BASE - 40_000);
+    const key = commitOnly(casino, { activityKey: "sashi", participantUserIds: ["alice", "bob"] });
+    // writer APIはcompletedAt<occurredAtをfail-closedでrejectするため、writer APIを
+    // bypassした直接SQLでcompletion行を挿入して不整合を再現する。
+    db.prepare(
+      `INSERT INTO casino_participation_completions (participation_key, user_id, completed_at) VALUES (?, ?, ?)`,
+    ).run(key.participationKey, "alice", BASE - 50_000);
+    db.prepare(
+      `INSERT INTO casino_participation_completions (participation_key, user_id, completed_at) VALUES (?, ?, ?)`,
+    ).run(key.participationKey, "bob", BASE - 50_000);
+
+    const scope = resolveTitleScope(store, CASINO_COMPLETED_ACTIVITY_DAYS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "casino_completed_activity_days", "alice", scope)).toEqual({ activityDays: [] });
+    expect(readTitleSource(db, "casino_completed_activity_days", "bob", scope)).toEqual({ activityDays: [] });
+  });
+});
+
+describe("S. positive control（BLOCKER1-F）: 有効なPVP 2人completionは正しくemitされる", () => {
+  it("alice/bobとも同一activityKey/activityDate/completedAtの正しい1 factを受け取る（他条件が壊れていないことの対照実験）", () => {
+    const { db, store, casino, setCasinoClock } = setup();
+    setCasinoClock(BASE + 1000);
+    recordCompleted(casino, { activityKey: "sashi", participantUserIds: ["alice", "bob"] });
+    const scope = resolveTitleScope(store, CASINO_COMPLETED_ACTIVITY_DAYS_RULE.definition, OBSERVED_AT);
+    const alicePayload = readTitleSource(db, "casino_completed_activity_days", "alice", scope);
+    const bobPayload = readTitleSource(db, "casino_completed_activity_days", "bob", scope);
+    expect(alicePayload.activityDays).toEqual([
+      { activityKey: "sashi", activityDate: "2026-08-20", completedAt: BASE + 1000 },
+    ]);
+    expect(bobPayload.activityDays).toEqual([
+      { activityKey: "sashi", activityDate: "2026-08-20", completedAt: BASE + 1000 },
+    ]);
+  });
+});

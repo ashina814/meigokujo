@@ -306,6 +306,12 @@ export class CasinoParticipationHistory {
           `completion ${participationKey} has inconsistent or partial stored rows — refusing to treat as idempotent`,
         );
       }
+      if (existingCompletedAt < commitmentOccurredAt) {
+        throw new CasinoParticipationError(
+          "completed_before_committed",
+          `stored completedAt (${existingCompletedAt}) precedes commitment occurredAt (${commitmentOccurredAt}) for ${participationKey} — refusing to treat as idempotent`,
+        );
+      }
       return {
         participationKey,
         activityKey,

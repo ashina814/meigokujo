@@ -210,6 +210,36 @@ describe("H. completed_at < occurred_at reject", () => {
   });
 });
 
+describe("L. 既存completion行が全員分揃っているがchronology破損(idempotent retry path)（PR #166レビューBLOCKER1-G）", () => {
+  it("既存completion行はpartialではない(全参加者分揃っている)がcompleted_at<occurred_atへ直接SQL破損 → idempotent successを返さずfail-closed", () => {
+    const { db, history } = setup();
+    history.recordCommittedParticipation(
+      commitInput({ participationKey: "pvp:sess-5", activityKey: "sashi", participantUserIds: ["alice", "bob"] }),
+    );
+    // 既存H.のケースはfresh insert pathのchronology guardを検証するが、これは別path:
+    // 「completion行はすでに(partialでなく)全員分揃っている」が「その既存completed_atが
+    // commitment occurred_atより前」という状態——recordCompletedParticipation()のAPIを
+    // 経由せず直接SQLで再現する(通常のwriter経路では発生し得ない状態)。
+    db.prepare(
+      `INSERT INTO casino_participation_completions (participation_key, user_id, completed_at) VALUES (?, ?, ?)`,
+    ).run("pvp:sess-5", "alice", BASE - 999);
+    db.prepare(
+      `INSERT INTO casino_participation_completions (participation_key, user_id, completed_at) VALUES (?, ?, ?)`,
+    ).run("pvp:sess-5", "bob", BASE - 999);
+
+    let caught: unknown;
+    try {
+      history.recordCompletedParticipation(
+        completeInput({ participationKey: "pvp:sess-5", activityKey: "sashi", participantUserIds: ["alice", "bob"] }),
+      );
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(CasinoParticipationError);
+    expect((caught as CasinoParticipationError).code).toBe("completed_before_committed");
+  });
+});
+
 describe("I. caller timestamp注入不可", () => {
   it("service clockのみが正本——RecordCompletedParticipationInputにcompletedAt等のtimestampフィールドが存在しない", () => {
     const { history, setClock } = setup();
