@@ -77,7 +77,10 @@ export interface TitleEvaluationPlan {
  * `evaluate`は元のfunction参照をそのまま保持してよい（function自体の同一性は
  * plan semanticsに影響しない）。
  */
-interface CompiledTitleEvaluationPlan {
+// PR D1: bulk prefetch planner（v2-prefetch.ts）が、compiled behaviorRulesを
+// trigger filtering/lifecycle判定のためだけに読む必要がある。`v2.ts`の公開barrelからは
+// 再exportしない（package内部のcross-module importのみ、§6, §52）。
+export interface CompiledTitleEvaluationPlan {
   readonly behaviorRules: readonly TitleRule<any>[];
   readonly metaRules: readonly MetaTitleRule[];
   readonly relationshipRules: readonly RelationshipTitleRule[];
@@ -129,7 +132,7 @@ function canonicalizeRelationshipDefinition(
  * ——正本はWeakMap identity。`plan`という**まさにそのobject参照**が登録されていなければ
  * forgeryとして拒否する（手書きplan・shallow copy・Proxy包みのいずれも）。
  */
-function requirePlanProvenance(plan: TitleEvaluationPlan): CompiledTitleEvaluationPlan {
+export function requirePlanProvenance(plan: TitleEvaluationPlan): CompiledTitleEvaluationPlan {
   if (plan === null || typeof plan !== "object") {
     throw new Error("evaluation plan was not produced by defineTitleEvaluationPlan() (forged or hand-built TitleEvaluationPlan)");
   }
