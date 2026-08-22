@@ -102,6 +102,20 @@ export interface TitleSourceCodeRef {
   needle: string;
 }
 
+/**
+ * `restrictedUse`が取り得る値。特定の内部専用resolverの入力としてのみ許可された
+ * sourceを型として固定する（PR C2で`relationship_private_evidence`、PR E2で
+ * `economy_safe_classification`を追加）。値を追加するときは対応する内部resolver
+ * （`v2-relationship-evidence.ts`/`v2-economy.ts`等）を必ず作ること。
+ *
+ * 型unionとruntime allowlist（`assertRestrictedUseContract()`が使う）を別々に
+ * 保守すると更新忘れが起きる——`TITLE_RESTRICTED_USES`を正本にして型を導出する
+ * （PR #161レビュー）。
+ */
+const TITLE_RESTRICTED_USES = ["relationship_private_evidence", "economy_safe_classification"] as const;
+export type TitleRestrictedUse = (typeof TITLE_RESTRICTED_USES)[number];
+const VALID_TITLE_RESTRICTED_USES: ReadonlySet<string> = new Set(TITLE_RESTRICTED_USES);
+
 /** 全sourceに共通するメタデータ。persisted/derivedのどちらでも同じ意味で使う。 */
 interface TitleSourceCommon {
   kind: TitleSourceKind;
@@ -125,7 +139,7 @@ interface TitleSourceCommon {
    * （restrictedの意味を「titleUsable:falseだが実は内部specialized resolverが読める」
    * へ拡張するのではなく、その用途自体を型として固定するためのラベル）。
    */
-  restrictedUse?: "relationship_private_evidence";
+  restrictedUse?: TitleRestrictedUse;
 }
 
 /** DBへ直接書き込まれる正本source。 */
@@ -417,6 +431,56 @@ export const TITLE_SOURCES = {
     epochPolicy: { type: "point", at: "credited_at" },
     rawUnit: "confirmed_invite_credit",
   },
+
+  // ── Economy Safe Classification（PR E2）────────────────────────────────────
+  //
+  // raw transactionsにはsalary/fine/tax/bet/prize/casino chip/departmentが同居し、
+  // amount・counterparty・reason・ref・approved_by等の機微データも含む。個々の称号へ
+  // 直接使わせず、restrictedUse:"economy_safe_classification"経由でのみ、
+  // v2-economy.tsの内部classifierだけが読む。
+  ledger_transactions: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/ledger/service.ts",
+      needle: "INSERT INTO transactions",
+    },
+    calledFrom: {
+      file: "apps/bot/src/commands/transfer.ts",
+      needle: "services.ledger.transfer({",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "await handleTransfer(interaction, services);",
+    },
+    kind: "history",
+    privacy: "restricted",
+    // created_atはLedger.transfer()が単一transaction内で確定させる観測時刻。
+    orderable: true,
+    // 個々の称号からは直接使わせない。安全なderived source（economy_safe_peer_actions）
+    // を使うこと——raw amount/counterparty/reason/ref/approved_by等を称号ruleへ晒さない。
+    titleUsable: false,
+    restrictedUse: "economy_safe_classification",
+    epochPolicy: { type: "point", at: "created_at" },
+    rawUnit: "land_ledger_transaction",
+  },
+  economy_safe_peer_actions: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-economy.ts",
+      needle: "export function computeSafeEconomyPeerActions(",
+    },
+    derivedFrom: ["ledger_transactions"],
+    kind: "history",
+    privacy: "safe",
+    // 同一(user, JST date, kind)内では常に最初にcommitされたqualifying transactionの
+    // created_atをoccurredAtにする——first qualifying observation immutable。
+    orderable: true,
+    titleUsable: true,
+    epochPolicy: { type: "point", at: "occurredAt" },
+    // 「ある1つのJST日に、本人が実行したtransfer/tip系の対人経済行動が観測された」
+    // という事実1件（kindごと）。amount・件数・counterpartyは一切含まない。
+    rawUnit: "unique_jst_safe_peer_economy_action_kind",
+  },
 } as const satisfies Record<string, TitleSourceDefinition>;
 
 export type TitleSourceKey = keyof typeof TITLE_SOURCES;
@@ -463,16 +527,24 @@ export function assertDerivedSourceDependenciesResolve(
 }
 
 /**
- * `restrictedUse`契約をfail-closedで検証する（PR C2）。`restrictedUse`を持つsourceは
- * 必ず`privacy==="restricted"`かつ`titleUsable===false`でなければならない——
- * safe/forbidden sourceへ`restrictedUse`を付けたり、generic title ruleから読めてしまう
- * `titleUsable:true`のsourceを「実は内部専用」と偽装したりすることを防ぐ。
+ * `restrictedUse`契約をfail-closedで検証する（PR C2、PR #161レビューで未知値
+ * validationを追加）。`restrictedUse`を持つsourceは:
+ * - 既知の`TitleRestrictedUse`値でなければならない——TypeScriptを迂回して
+ *   （`as any`等で）未登録の文字列を渡された場合でもruntimeで拒否する。
+ * - 必ず`privacy==="restricted"`かつ`titleUsable===false`でなければならない——
+ *   safe/forbidden sourceへ`restrictedUse`を付けたり、generic title ruleから
+ *   読めてしまう`titleUsable:true`のsourceを「実は内部専用」と偽装したりする
+ *   ことを防ぐ。
  */
 export function assertRestrictedUseContract(
   sources: Record<string, TitleSourceDefinition> = TITLE_SOURCES,
 ): void {
   for (const [key, source] of Object.entries(sources)) {
-    if (source.restrictedUse === undefined) continue;
+    const restrictedUse = (source as { restrictedUse?: unknown }).restrictedUse;
+    if (restrictedUse === undefined) continue;
+    if (typeof restrictedUse !== "string" || !VALID_TITLE_RESTRICTED_USES.has(restrictedUse)) {
+      throw new Error(`title source ${key}: unknown restrictedUse`);
+    }
     if (source.privacy !== "restricted") {
       throw new Error(`title source ${key}: restrictedUse requires privacy==="restricted" (got ${source.privacy})`);
     }

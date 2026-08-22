@@ -7,6 +7,7 @@ import {
   defineBehaviorTitle,
   type BehaviorTitleDefinition,
   type TitleDefinition,
+  type TitleRestrictedUse,
   type TitleSourceDefinition,
 } from "../src/titles/v2-contract.js";
 import { assertSourceReaderCoverage, readTitleSource } from "../src/titles/v2-sources.js";
@@ -173,6 +174,53 @@ describe("TITLE_SOURCES: vc_co_presence の restrictedUse 契約（§4, §61）"
     });
     const scope = resolveTitleScope(store, dummy, OBSERVED_AT);
     expect(() => readTitleSource(db, "vc_co_presence" as never, "alice", scope)).toThrow(/not usable by titles/);
+  });
+});
+
+describe("assertRestrictedUseContract(): unknown restrictedUse値のfail-closed検証（PR #161レビュー）", () => {
+  const RESTRICTED_BASE = { privacy: "restricted" as const, titleUsable: false as const };
+
+  it("A. relationship_private_evidence + restricted + titleUsable:false → pass", () => {
+    const sources: Record<string, TitleSourceDefinition> = {
+      probe: { ...TITLE_SOURCES.vc_co_presence, ...RESTRICTED_BASE, restrictedUse: "relationship_private_evidence" },
+    };
+    expect(() => assertRestrictedUseContract(sources)).not.toThrow();
+  });
+
+  it("B. economy_safe_classification + restricted + titleUsable:false → pass", () => {
+    const sources: Record<string, TitleSourceDefinition> = {
+      probe: { ...TITLE_SOURCES.ledger_transactions, ...RESTRICTED_BASE, restrictedUse: "economy_safe_classification" },
+    };
+    expect(() => assertRestrictedUseContract(sources)).not.toThrow();
+  });
+
+  it("C. 未知のrestrictedUse値（'future_unknown_use' as any）+ restricted + titleUsable:false → reject（privacy/titleUsableが正しくてもunknown値だけでreject）", () => {
+    const sources: Record<string, TitleSourceDefinition> = {
+      probe: {
+        ...TITLE_SOURCES.vc_co_presence,
+        ...RESTRICTED_BASE,
+        restrictedUse: "future_unknown_use" as unknown as TitleRestrictedUse,
+      },
+    };
+    expect(() => assertRestrictedUseContract(sources)).toThrow(/unknown restrictedUse/);
+  });
+
+  it("D. known value + privacy:safe → reject（既存contractの回帰確認）", () => {
+    const sources: Record<string, TitleSourceDefinition> = {
+      probe: { ...TITLE_SOURCES.vc_co_presence, privacy: "safe", titleUsable: false, restrictedUse: "relationship_private_evidence" },
+    };
+    expect(() => assertRestrictedUseContract(sources)).toThrow(/requires privacy==="restricted"/);
+  });
+
+  it("E. known value + titleUsable:true → reject（既存contractの回帰確認）", () => {
+    const sources: Record<string, TitleSourceDefinition> = {
+      probe: { ...TITLE_SOURCES.vc_co_presence, ...RESTRICTED_BASE, titleUsable: true, restrictedUse: "relationship_private_evidence" },
+    };
+    expect(() => assertRestrictedUseContract(sources)).toThrow(/requires titleUsable===false/);
+  });
+
+  it("既存registry（vc_co_presence・ledger_transactions含む）は変わらずpassする", () => {
+    expect(() => assertRestrictedUseContract()).not.toThrow();
   });
 });
 
