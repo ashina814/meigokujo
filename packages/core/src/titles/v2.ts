@@ -98,6 +98,8 @@ export {
   readTitleSource,
   TitleSourceCache,
   type BumpEventsSourcePayload,
+  type ConfirmedInvitesSourcePayload,
+  type TextActiveDaysSourcePayload,
   type TitleSourcePayloads,
   type VcEmptyStartThenJoinedSourcePayload,
   type VcGroupSizeSecondsSourcePayload,

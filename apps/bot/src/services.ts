@@ -27,6 +27,7 @@ import {
   VcTracker,
   RankEngine,
   BumpCounter,
+  TextActivity,
   Shop,
   ChipLedger,
   ETHER_ESCROW,
@@ -134,6 +135,9 @@ export function buildServices() {
   const fiscal = new Fiscal(db, ledger);
   const ranks = new RankEngine(db);
   const bumps = new BumpCounter(db);
+  // TC安全source（PR E1）。rank_text（XP/level/cooldown）とは独立したsubsystem——
+  // raw message数もmessage内容も保存しない。既存servicesを置換しない。
+  const textActivity = new TextActivity(db);
   // 階級要件は「〇〇以上」判定（亡霊 < 魔人 < 魔族。上位階級は下位要件の商品を買える）
   const shop = new Shop(db, ledger, events, {
     roleCheck: (memberRoleIds, requireRoleId) => meetsRoleRequirement(settings, memberRoleIds, requireRoleId),
@@ -290,6 +294,7 @@ export function buildServices() {
     fiscal,
     ranks,
     bumps,
+    textActivity,
     shop,
     // Discord/UI と支払い系には spendable view を公開する。
     chips: spendableChips,

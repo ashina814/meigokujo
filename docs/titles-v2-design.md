@@ -1211,6 +1211,109 @@ production 99-title catalog・source拡張・`/プロフィール`のv2表示・
 disclosure・shadow evaluation/threshold calibration・production
 cutover・旧TitleEngine削除・旧profile migration。
 
+### Safe Activity Source Expansion — E1
+
+称号v2のproduction catalogへ進む前に、現在不足している安全な一次sourceを
+2つだけ追加する: `text_active_days`（TC安全source）・`confirmed_invites`
+（確定招待source）。Behavior evaluatorのproduction wiringはまだ行わない
+——このPRはsource収集基盤まで。
+
+**`text_active_days`**:
+
+- **raw message数を一切保存しない**: `text_active_days`テーブルは
+  `user_id × activity_date`（Asia/Tokyo日）で最大1行。1message=1rowの
+  raw message tableは作らない。rank_text（発言XP・level・30秒cooldown）は
+  称号sourceとして流用しない——位名(rank)と印を再び混ぜないため。
+- JST日への変換は`TextActivity`service（`packages/core/src/text-activity/
+  service.ts`）内で一元化する。既存のJST utility（`entry/sessions.ts`の
+  `jstDateStr()`）を再利用し、timezone hardcodeを複数実装しない。
+- **XP cooldownとは完全に独立**: `recordActiveDay()`の判定に
+  `award.before`/`award.after`/`tierUp`/XP/`rank_title_unlock`のいずれも
+  使わない。同日最初のqualifying messageがrank XP cooldown中でも、
+  その日はTC活動日として記録される——`handleMessageXp()`内の呼び出し順序は
+  「basic eligibility → `isSafeTitleTextActivityMessage()`判定 →
+  （trueなら）`textActivity.recordActiveDay()` → `RankEngine.awardText()` →
+  rank-title sidecar → rank-up通知」。
+- **public non-thread guild TCだけを対象にする**（PR #160レビュー対応）:
+  既存Rank XP eligibility（bot除外・guild外除外・空message除外・
+  `xp_excluded_channels`除外）だけでは、DM・private/staff-only/ticket/
+  role限定channel・thread・forum postを構造的に除外できない。
+  `isSafeTitleTextActivityMessage()`（`apps/bot/src/rank-tracker.ts`）が
+  追加のfail-closed判定を行う:
+  - thread（forum post含む）は`channel.isThread()`で除外。
+  - channel typeは`GuildText`/`GuildAnnouncement`だけに限定
+    （VC内テキスト等を暗黙に「普通のTC」へ含めない）。
+  - `channel.permissionsFor(guild.roles.everyone)`で**@everyoneの
+    ViewChannel**を確認する——「Botがそのchannelを見られるか」ではない
+    （Botはstaff/ticket/private roomも見える可能性がある）。判定したいのは
+    「一般guild memberに公開された会話か」なので@everyone visibilityを正本に
+    する。role-gated channelは安全側に倒して対象外（allowlistが必要なら
+    別PRで設計する）。permission解決が失敗/nullの場合もfail-closedで対象外。
+  - **この判定はtext_active_days記録の可否だけに使い、`RankEngine.
+    awardText()`の実行有無には一切影響させない**——既存Rank XP production
+    behaviorはprivate channelでも従来通り動く。`xp_excluded_channels`も
+    引き続き効く（public channelでも運営上XP除外ならtext_active_daysも除外、
+    既存契約通り）。
+- **first observation immutable**: 同じuser×同じJST日の2回目以降の呼び出しは
+  `INSERT ... ON CONFLICT(user_id, activity_date) DO NOTHING`——
+  `observed_at`をUPDATEしない。後から古いtimestampのevent（遅延配送等）が
+  届いても、first persisted observationを保持する。
+- **live-only、historical inferenceをしない**: rank_text XP・Discord
+  search・EventLog・ログ推定から過去の`text_active_days`を生成しない。
+  E1導入前の活動日は永久にunknownのまま——「たぶんその日は喋っていた」と
+  捏造しない。
+- **writer failureで既存Rank XPを壊さない**: `handleMessageXp()`内で
+  `textActivity.recordActiveDay(...)`を`try/catch`し、失敗しても
+  `console.error("[text-activity] persistence failed ...")`してRank XP
+  処理（cooldown付与・rank-title sidecar・rank-up通知）を継続する。
+- payload（`TextActiveDaysSourcePayload`）は`{ days: [{ date, observedAt }] }`
+  だけ——message数・channel・message idは一切含まない。JST dateは safe
+  なので含めてよい（将来、連続日/週末/特定イベント日を安全に評価できる
+  ようにする）。ただし`rawUnit: "unique_jst_public_text_active_day"`が示す
+  通り、これは「ある1つのJST日に、public/non-thread guild channelでのTC
+  活動が観測された」という事実1件——N messages/N sessionsを意味せず、
+  private/thread conversationも含まない。
+
+**`confirmed_invites`**:
+
+- 正本は`invites`テーブルだけ——`souls.inviter_hint_*`/`entry_bookings.
+  inviter_*`（検出・hintの段階、まだconfirmedではない）をJOINしない。
+  `Entry.creditInvite()`が実際に`INSERT INTO invites`した行だけを数える。
+- **invitee identityを一切開示しない**: payload
+  （`ConfirmedInvitesSourcePayload`）は`{ creditedAt: number[] }`だけ——
+  `invitee_id`はreaderのSELECT文にすら含めない。inviter自身のuserIdも
+  含めない（subject userIdはcaller側で既知）。
+- revoked/cancelled invite semanticsは現行`invites`テーブルに存在しない
+  ——E1で「このinviteは無効そう」と独自に推測しない。既存Entry contractの
+  confirmed invite rowをそのまま正本とする（将来取消制度を作るならsource
+  semantic変更として別PR）。
+
+**Bulk source integration**: 両sourceともD1契約（bulk readerが正本、
+single readerはbulkへ`[userId]`委譲、`BULK_SOURCE_READERS`型coverage、
+first-read-wins cache、chunking共有、deep freeze、forged scope/cache
+provenance維持）にそのまま乗る——`prefetchBatchPipelineSources()`側への
+source固有special-caseは一切追加していない。`text_active_days`は
+`bump_events`と同じ「point epochPolicy・chunked `IN (...)` SQL」パターン、
+`confirmed_invites`も同型（`invitee_id`をSELECTしない点だけが違う）。
+
+**Deferred unsafe sources（今回入れない）**: economy（`transactions`は
+salary/fine/tax/bet/prize/casino chip等が同居しており、type allowlist設計が
+必要——生のまま`titleUsable`化しない）・generic `EventLog`（confession/
+evaluation/entry/shop等、意味の異なる多数domainが共有する汎用tableであり、
+public event participationは専用sourceとして別途設計する）・casino
+（win/loss/PnL/all-in等のadverse metricsを普通の印へ使わない既存契約を
+維持、参加した事実だけを畳む安全な設計は別PR）・private rooms/recruits
+（private/social contextを含むため、`room_activity` triggerの存在だけを
+理由にraw tableを公開しない）。
+
+**follow-up（E1の範囲外）**: E2 Economy Safe Classification（safe
+allowlist + identity-minimized aggregates）・E3 Public Event Participation
+Source（generic EventLogと分離した明示的event participation truth）・
+E4 Casino Safe Participation Source（neutral participationだけの安全な
+畳み込み）。その後、production 99-title catalog・Series manifests・
+Collection Edition・shadow evaluation・threshold calibration・production
+cutoverへ進む。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。
