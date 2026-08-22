@@ -179,6 +179,8 @@ export {
   type CasinoParticipationErrorCode,
   type RecordCommittedParticipationInput,
   type RecordCommittedParticipationResult,
+  type RecordCompletedParticipationInput,
+  type RecordCompletedParticipationResult,
 } from "./casino/participation-history.js";
 export {
   MEIREI_ROLE_SETTING_KEY,

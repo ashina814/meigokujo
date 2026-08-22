@@ -103,6 +103,7 @@ export {
   type EconomySafePeerActionsSourcePayload,
   type PublicEventParticipationsSourcePayload,
   type CasinoActivityDaysSourcePayload,
+  type CasinoCompletedActivityDaysSourcePayload,
   type TextActiveDaysSourcePayload,
   type TitleSourcePayloads,
   type VcEmptyStartThenJoinedSourcePayload,
@@ -117,12 +118,13 @@ export {
 // 公開してよいのはpayload型と、その`kind`フィールドの型だけ。
 export { type SafePeerEconomyActionKind } from "./v2-economy.js";
 
-// v2-casino.ts の computeCasinoActivityDays()（PR E4の内部classifier正本）はここでは
-// exportしない——callerがraw casino_participations由来のfactを直接組み立ててruleへ
-// 注入できる経路を作らない。CASINO_ACTIVITY_KEYS allowlist・CasinoParticipationHistory
-// もここからは公開しない（`../casino/participation-history.js`から直接importして構わない
-// が、v2 title barrel経由の公開APIには含めない）。公開してよいのはpayload型と、
-// その`activityKey`フィールドの型だけ。
+// v2-casino.ts の computeCasinoActivityDays()/computeCasinoCompletedActivityDays()
+// （PR E4/F2bの内部classifier正本）はここではexportしない——callerがraw
+// casino_participations/casino_participation_completions由来のfactを直接組み立てて
+// ruleへ注入できる経路を作らない。CASINO_ACTIVITY_KEYS allowlist・
+// CasinoParticipationHistory もここからは公開しない（`../casino/participation-history.js`
+// から直接importして構わないが、v2 title barrel経由の公開APIには含めない）。
+// 公開してよいのはpayload型と、その`activityKey`フィールドの型だけ。
 export { type CasinoActivityKey } from "../casino/participation-history.js";
 
 export {

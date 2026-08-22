@@ -28,7 +28,7 @@ import {
   stakeFailureText,
   type PvpInteraction,
 } from "./pvp-common.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🃏 BJデュエル（casino-bot /BJ対戦 準拠・1v1 PvP）。
@@ -208,7 +208,13 @@ export async function runFundedBjDuel(services: Services, ctx: FundedPvpContext)
 
   const finishGame = async (result: "challenger_win" | "opponent_win" | "push", note: string) => {
     if (result === "push") {
+      // refundAll()はゲームルール上正常なpush解決（異常系voidPvpTableとは別、PR F2b）。
       refundAll(services, [challenger.id, opponent.id], bet, `${session}:refund:push`, session);
+      recordCasinoCompletionBestEffort(services, {
+        participationKey: `pvp:${session}`,
+        activityKey: "blackjack",
+        participantUserIds: [challenger.id, opponent.id],
+      });
       markResolved();
       await view.edit({
         content: "",
@@ -236,6 +242,13 @@ export async function runFundedBjDuel(services: Services, ctx: FundedPvpContext)
       const winnerId = result === "challenger_win" ? challenger.id : opponent.id;
       const loserId = result === "challenger_win" ? opponent.id : challenger.id;
       const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2, `${session}:settle`, session);
+      // settlePvp()が実際に単一atomic transactionでの正常精算を確定させた正本
+      // （PR F2b）。
+      recordCasinoCompletionBestEffort(services, {
+        participationKey: `pvp:${session}`,
+        activityKey: "blackjack",
+        participantUserIds: [challenger.id, opponent.id],
+      });
       markResolved();
       await view.edit({
         content: "",

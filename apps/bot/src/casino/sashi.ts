@@ -27,7 +27,7 @@ import {
   stakeFailureText,
   type PvpInteraction,
 } from "./pvp-common.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * ⚔ サシ勝負（casino-bot /サシ 準拠・1v1 コイントス的簡易勝負）。
@@ -158,6 +158,12 @@ export async function runFundedSashiDuel(services: Services, ctx: FundedPvpConte
   const winnerId = challengerWins ? challenger.id : opponent.id;
   const loserId = challengerWins ? opponent.id : challenger.id;
   const { payout, houseCut } = settlePvp(services, [winnerId], bet * 2, `${session}:settle`, session);
+  // settlePvp()が実際に単一atomic transactionでの正常精算を確定させた正本（PR F2b）。
+  recordCasinoCompletionBestEffort(services, {
+    participationKey: `pvp:${session}`,
+    activityKey: "sashi",
+    participantUserIds: [challenger.id, opponent.id],
+  });
   markResolved();
 
   await view.edit({

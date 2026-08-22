@@ -31,7 +31,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🎴 丁半（ソロ・casino-bot 準拠）。
@@ -199,6 +199,13 @@ async function runRoundInner(
   // 正本——ここへ到達した時点で初めて「実際のroundが成立した」と言える。丁選択の
   // 15秒timeoutはここへ到達せず早期returnするので参加記録されない（PR #163レビュー§3）。
   recordCasinoParticipationBestEffort(services, {
+    participationKey: `solo:chohan:${interaction.id}`,
+    activityKey: "chohan",
+    participantUserIds: [uid],
+  });
+  // settleSolo()自体が単一atomic transactionでの正常精算——soloでは
+  // commitmentとcompletionが同じ境界（PR F2b）。
+  recordCasinoCompletionBestEffort(services, {
     participationKey: `solo:chohan:${interaction.id}`,
     activityKey: "chohan",
     participantUserIds: [uid],

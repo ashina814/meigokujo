@@ -64,3 +64,72 @@ export function computeCasinoActivityDays(
   }
   return facts;
 }
+
+/**
+ * Casino Safe Completion Source（PR F2b）。
+ *
+ * `casino_activity_days`が証明するのは「successful funded participation
+ * commitment」であって「ゲームが正常精算まで完了した」ではない——PVP経路は
+ * game runner実行前にwriterが発火するため、参加commitmentと実際のgame
+ * settlementを区別できない（PR #164レビューで確定したsemantic mismatch）。
+ * この関数は別のimmutable正本`casino_participation_completions`（そのゲーム
+ * 固有のcanonical financial resolution primitiveが成功したことだけを表す）を
+ * 読み、`casino_activity_days`と同じday-collapse契約でneutral factへ変換する。
+ *
+ * `casino_participation_completions`はactivity_keyを保持しない——activity
+ * identityは常にparent `casino_participations`行を正本にする。そのため
+ * このクエリはJOINで両テーブルを結び、commitment側のactivity_keyを使う。
+ */
+export interface CasinoCompletedActivityDayFact {
+  readonly userId: string;
+  readonly activityKey: CasinoActivityKey;
+  readonly activityDate: string;
+  readonly completedAt: number;
+}
+
+/**
+ * `userIds`について、`[window.start, window.end)`の間に観測されたcanonical
+ * settlement成功（completion）を、`user × activityKey × JST day`で最大1 fact
+ * へ畳み込んで返す。`activityDate`は`completed_at`をJST変換して求める——
+ * commitmentの`occurred_at`の日ではない。
+ *
+ * - windowは`completed_at`（completionが実際に観測された時刻）でフィルタする
+ *   ——commitmentのoccurred_atではない。
+ * - `ORDER BY user_id, completed_at`で読み、`(userId, activityKey, date)`
+ *   ごとの最初の行だけを採用する——同日に同じactivityを1回完了しても100回
+ *   完了してもfactは1件のまま。
+ * - allowlist外の`activity_key`（DB corruption・writerバグ）はfail-closedで
+ *   その行をskipする——`computeCasinoActivityDays()`と同じ考え方。
+ */
+export function computeCasinoCompletedActivityDays(
+  db: Database.Database,
+  window: { readonly start: number; readonly end: number },
+  userIds: readonly string[],
+): readonly CasinoCompletedActivityDayFact[] {
+  if (userIds.length === 0) return [];
+
+  const placeholders = userIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `SELECT c.user_id AS user_id, p.activity_key AS activity_key, c.completed_at AS completed_at
+         FROM casino_participation_completions c
+         JOIN casino_participations p
+           ON p.participation_key = c.participation_key AND p.user_id = c.user_id
+        WHERE c.user_id IN (${placeholders}) AND c.completed_at >= ? AND c.completed_at < ?
+        ORDER BY c.user_id ASC, c.completed_at ASC, p.activity_key ASC`,
+    )
+    .all(...userIds, window.start, window.end) as Array<{ user_id: string; activity_key: string; completed_at: number }>;
+
+  const seen = new Set<string>();
+  const facts: CasinoCompletedActivityDayFact[] = [];
+  for (const row of rows) {
+    if (!isCasinoActivityKey(row.activity_key)) continue; // 未知/corrupt activity_keyはfail-closedでignore
+    const activityKey = row.activity_key;
+    const activityDate = jstDateStr(new Date(row.completed_at * 1000));
+    const dedupeKey = `${row.user_id} ${activityKey} ${activityDate}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    facts.push({ userId: row.user_id, activityKey, activityDate, completedAt: row.completed_at });
+  }
+  return facts;
+}
