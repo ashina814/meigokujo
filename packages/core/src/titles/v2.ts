@@ -101,6 +101,7 @@ export {
   type BumpEventsSourcePayload,
   type ConfirmedInvitesSourcePayload,
   type EconomySafePeerActionsSourcePayload,
+  type PublicEventParticipationsSourcePayload,
   type TextActiveDaysSourcePayload,
   type TitleSourcePayloads,
   type VcEmptyStartThenJoinedSourcePayload,

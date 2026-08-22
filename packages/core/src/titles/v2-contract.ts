@@ -481,6 +481,36 @@ export const TITLE_SOURCES = {
     // という事実1件（kindごと）。amount・件数・counterpartyは一切含まない。
     rawUnit: "unique_jst_safe_peer_economy_action_kind",
   },
+
+  // ── Public Event Participation Source（PR E3）──────────────────────────────
+  //
+  // 正本は`packages/core/src/public-events/service.ts`のPublicEvents——generic
+  // EventLog（events）は一切参照しない。運営が確定した公開イベントrosterだけを
+  // safe sourceとして公開する。recorded_atは「rosterがBotへ確定保存された時刻」
+  // であって参加の実時刻ではないため、orderable:falseにする（§11-12）。
+  public_event_participations: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/public-events/service.ts",
+      needle: "INSERT INTO public_event_participations",
+    },
+    calledFrom: {
+      file: "apps/bot/src/commands/public-event-record.ts",
+      needle: "services.publicEvents.recordFinalizedEvent({",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "await handlePublicEventRecordButton(interaction, services);",
+    },
+    kind: "history",
+    privacy: "safe",
+    // recorded_atはstaffがrosterを確定保存した時刻であり、参加者が入室した瞬間や
+    // イベント開始時刻ではない——「N件目の参加を達成したexact time」として使わせない。
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "point", at: "recorded_at" },
+    rawUnit: "staff_confirmed_public_event_participation",
+  },
 } as const satisfies Record<string, TitleSourceDefinition>;
 
 export type TitleSourceKey = keyof typeof TITLE_SOURCES;

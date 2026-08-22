@@ -6,6 +6,7 @@ import { handleAdminCommand, handleAdminButton, handleAdminSelect, handleAdminMo
 import { handleShopButton, handleShopModal, handleShopSelect } from "./commands/shop-panel.js";
 import { handleShokanCommand, handleShokanButton, handleShokanSelect, handleShokanModal } from "./commands/shokan.js";
 import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
+import { handlePublicEventRecordButton, handlePublicEventRecordCommand } from "./commands/public-event-record.js";
 import { handleTip } from "./commands/tip.js";
 import { handleRankingCommand } from "./commands/ranking.js";
 import { handleRankPanelButton } from "./commands/rank-panel.js";
@@ -205,6 +206,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         case "投げ銭":
           await handleTip(interaction, services);
+          return;
+        case "イベント参加記録":
+          await handlePublicEventRecordCommand(interaction, services);
           return;
         case "審判":
           if (interaction.options.getSubcommand() === "昇格") await handlePromote(interaction, services);
@@ -549,6 +553,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await handleTransferButton(interaction, services);
       } else if (interaction.customId.startsWith("apv:")) {
         await handleApprovalButton(interaction, services);
+      } else if (interaction.customId.startsWith("pev:")) {
+        await handlePublicEventRecordButton(interaction, services);
       } else if (interaction.customId.startsWith("bank:")) {
         await handleBankButton(interaction, services);
       } else if (interaction.customId.startsWith("pay:")) {

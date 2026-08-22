@@ -82,6 +82,17 @@ export interface EconomySafePeerActionsSourcePayload {
   }>;
 }
 
+/**
+ * PR E3: eventKeyだけを公開する（公開イベントの機械identity）。event name・event date・
+ * recordedBy・他参加者identityは一切含めない。
+ */
+export interface PublicEventParticipationsSourcePayload {
+  readonly participations: ReadonlyArray<{
+    readonly eventKey: string;
+    readonly recordedAt: number;
+  }>;
+}
+
 /** sourceKeyごとのsanitized payload型。相手のuserId・raw message ID等は一切含めない。 */
 export interface TitleSourcePayloads {
   bump_events: BumpEventsSourcePayload;
@@ -92,6 +103,7 @@ export interface TitleSourcePayloads {
   text_active_days: TextActiveDaysSourcePayload;
   confirmed_invites: ConfirmedInvitesSourcePayload;
   economy_safe_peer_actions: EconomySafePeerActionsSourcePayload;
+  public_event_participations: PublicEventParticipationsSourcePayload;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -384,6 +396,36 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
     }
     return { payloads, readCalls };
   },
+
+  public_event_participations: (db, userIds, scope) => {
+    const payloads = new Map<string, PublicEventParticipationsSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { participations: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      const placeholders = chunk.map(() => "?").join(",");
+      // recorded_by・name・event_dateはSELECTしない——公開してよいのはeventKey/recordedAtだけ。
+      const rows = db
+        .prepare(
+          `SELECT user_id, event_key, recorded_at FROM public_event_participations
+            WHERE user_id IN (${placeholders}) AND recorded_at >= ? AND recorded_at < ?
+            ORDER BY user_id ASC, recorded_at ASC, event_key ASC`,
+        )
+        .all(...chunk, scope.start, effectiveEnd) as Array<{ user_id: string; event_key: string; recorded_at: number }>;
+      const byUser = new Map<string, Array<{ eventKey: string; recordedAt: number }>>();
+      for (const row of rows) {
+        const entry = { eventKey: row.event_key, recordedAt: row.recorded_at };
+        const list = byUser.get(row.user_id);
+        if (list) list.push(entry);
+        else byUser.set(row.user_id, [entry]);
+      }
+      for (const [userId, list] of byUser) payloads.set(userId, { participations: list });
+    }
+    return { payloads, readCalls };
+  },
 };
 
 /**
@@ -424,6 +466,8 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
   confirmed_invites: (db, userId, scope) => BULK_SOURCE_READERS.confirmed_invites(db, [userId], scope).payloads.get(userId)!,
   economy_safe_peer_actions: (db, userId, scope) =>
     BULK_SOURCE_READERS.economy_safe_peer_actions(db, [userId], scope).payloads.get(userId)!,
+  public_event_participations: (db, userId, scope) =>
+    BULK_SOURCE_READERS.public_event_participations(db, [userId], scope).payloads.get(userId)!,
 };
 
 /**
