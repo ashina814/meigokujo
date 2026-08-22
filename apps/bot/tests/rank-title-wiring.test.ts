@@ -166,6 +166,20 @@ describe("recordLiveRankTitleUnlock() — live crossing", () => {
     expect(consoleErrorSpy).toHaveBeenCalled();
     consoleErrorSpy.mockRestore();
   });
+
+  it("track/award整合性guard: text awardなのに\"voice\"を渡すと、wrong-track unlockを作らずerror logして既存Rank機能は壊さない（PR #159レビュー§4）", () => {
+    const { titleV2 } = setup();
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    // text tierを持つawardを、誤って"voice"として渡す（将来のwiring typoを想定）。
+    expect(() => recordLiveRankTitleUnlock({ titleV2 }, "typo-user", "voice", fakeAward(0, 50))).not.toThrow();
+
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("track mismatch"));
+    // どちらのtrackにもwrong-track unlockが作られていない。
+    expect(titleV2.hasRankTitleUnlock("typo-user", "rank.text.lv050")).toBe(false);
+    expect(titleV2.hasRankTitleUnlock("typo-user", "rank.voice.lv050")).toBe(false);
+    consoleErrorSpy.mockRestore();
+  });
 });
 
 describe("reconcileTrackedRankTitles()", () => {

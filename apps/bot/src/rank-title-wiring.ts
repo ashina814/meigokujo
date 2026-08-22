@@ -25,6 +25,13 @@ import { runSchedulerTaskOnce } from "./scheduler-utils.js";
  * 既存XP付与・rank-up通知処理を継続させる（v2 sidecar failureで本体機能を壊さない）。
  * 失敗した分は後続のhistorical reconcile（daily/startup）が`unlockedAt=NULL`で
  * 自己修復する——「本当はlive crossingだったはず」と現在時刻を捏造しない。
+ *
+ * **track/award整合性guard**（PR #159レビュー§4）: `track`と`award`は呼び出し側が
+ * 別々に渡す2引数——将来のwiring typo（例: text awardなのに`"voice"`を渡す）で、
+ * text levelの数値をvoice tierとして誤unlockしてしまう事故を防ぐ。`award.before.tier.track`
+ * /`award.after.tier.track`が指定`track`と一致しない場合は、wrong-track unlockを
+ * 一切作らずerror logだけしてreturnする——現在のproduction callsite（text/text・
+ * voice/voiceで一致）では発火しない、将来のtypo防止のためのfail-closed guard。
  */
 export function recordLiveRankTitleUnlock(
   services: Pick<Services, "titleV2">,
@@ -33,6 +40,13 @@ export function recordLiveRankTitleUnlock(
   award: RankAward,
 ): void {
   try {
+    if (award.before.tier.track !== track || award.after.tier.track !== track) {
+      console.error(
+        `[rank-title-v2] track mismatch: called with track=${track} but award tiers are ` +
+          `before=${award.before.tier.track} after=${award.after.tier.track} userId=${userId}`,
+      );
+      return;
+    }
     const currentTierKey = award.after.tier.key;
     if (award.tierUp || !services.titleV2.hasRankTitleUnlock(userId, currentTierKey)) {
       services.titleV2.recordRankTitleTransition(userId, track, award.before.level, award.after.level);
