@@ -92,6 +92,7 @@ import { handleRoomButton, handleRecruitModal, handleRoomRenameModal, handleRoom
 import { handleBumpMessage } from "./bump.js";
 import { handleBoostRewardMessage, initializeBoostRewardRecovery } from "./boost-reward.js";
 import { handleMessageXp, tickVoiceXp } from "./rank-tracker.js";
+import { startupReconcileRankTitles } from "./rank-title-wiring.js";
 import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
 import { handlePaydayButton } from "./payday.js";
@@ -131,6 +132,11 @@ client.once(Events.ClientReady, async (ready) => {
   // 外部Discord APIへ触る復旧より先に、同期の賭場安全確認を必ず完了させる。
   // 再起動直後にstatus=openのまま外部I/O待ちになるfail-open窓を作らない。
   runCasinoRecovery(services);
+  // 位名(rank title) live wiringの取りこぼしをローカルDBだけで自己修復する（PR D2）。
+  // 外部Discord APIは使わない・失敗してもBot起動は継続する（内部でcatch済み）。
+  // startup成功はdaily reconcileのmarkerを立てない——別概念（startup repair と
+  // daily scheduled repair は独立、その日のdaily reconcileは別途動く）。
+  startupReconcileRankTitles(services);
   await initializeBoostRewardRecovery(ready, services).catch((e) =>
     console.error("[boost] 起動時復旧失敗:", e),
   );

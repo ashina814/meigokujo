@@ -2,6 +2,7 @@ import type { Client, Message, VoiceChannel } from "discord.js";
 import { AttachmentBuilder, ChannelType } from "discord.js";
 import type { Services } from "./services.js";
 import { renderRankUpCard } from "./render/rank-up-card.js";
+import { recordLiveRankTitleUnlock } from "./rank-title-wiring.js";
 
 /**
  * 発言XP・ボイスXPの獲得ロジックと称号アップの通知。
@@ -39,6 +40,7 @@ export async function handleMessageXp(message: Message, services: Services): Pro
   const xp = rand(TEXT_XP_MIN, TEXT_XP_MAX);
   const award = services.ranks.awardText(message.author.id, xp, TEXT_COOLDOWN_SEC);
   if (!award) return; // クールダウン中
+  recordLiveRankTitleUnlock(services, message.author.id, "text", award);
   if (award.tierUp) {
     await notifyRankUp(message.client, services, {
       userId: message.author.id,
@@ -63,6 +65,7 @@ export async function tickVoiceXp(client: Client, services: Services): Promise<v
     if (humans.size < 2) continue; // 1人だけのVCは加算しない
     for (const [, m] of humans) {
       const award = services.ranks.awardVoice(m.id, VOICE_XP_PER_TICK, VOICE_TICK_MINUTES);
+      recordLiveRankTitleUnlock(services, m.id, "voice", award);
       if (award.tierUp) {
         await notifyRankUp(client, services, {
           userId: m.id,

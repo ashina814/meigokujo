@@ -157,6 +157,8 @@ export {
   type RankSnapshot,
   type RankAward,
   type RankTier,
+  type RankTrack,
+  type TrackedRankLevels,
 } from "./rank/service.js";
 export { BumpCounter } from "./rank/bump.js";
 export {

@@ -9,6 +9,7 @@ import { refreshEvaluationForums } from "./evaluation-forum-daily.js";
 import { updateDashboard } from "./dashboard.js";
 import { updateWaitersBoard } from "./waiters-board.js";
 import { tickVoiceXp } from "./rank-tracker.js";
+import { runDailyRankTitleReconcile } from "./rank-title-wiring.js";
 import { fmtLd } from "./format.js";
 import { entryOpsChannelId } from "./entry-channels.js";
 import { cancelUnpaidOriginalRoles, expireOriginalRoles, notifyExpiringOriginalRoles } from "./original-role-jobs.js";
@@ -206,6 +207,16 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
 
     // ── bump/up クールタイム終了通知 ──
     await checkBumpCooldowns(client, services);
+
+    // ── 位名(rank title) live wiringの取りこぼしを自己修復（毎日 04:30〜04:32）──
+    // rank_title_unlocksのhistorical reconcile。3分のretry windowで、失敗時は
+    // markerを立てず次tickでretryする（既存daily task群と同じ`runSchedulerTaskOnce`
+    // marker/retry semantics）。
+    if (now.hour === 4 && now.minute >= 30 && now.minute < 33) {
+      await runDailyRankTitleReconcile(services, now.dateStr).catch((e) =>
+        console.error("[rank-title-v2] daily reconcile failed", e),
+      );
+    }
 
     // ── VC浮上報酬: 毎日 05:00 台に前日分を支給 ──
     if (now.hour === 5) {

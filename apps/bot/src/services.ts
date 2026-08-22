@@ -22,6 +22,7 @@ import {
   Tickets,
   Confessions,
   TitleEngine,
+  TitleV2Store,
   VcRewards,
   VcTracker,
   RankEngine,
@@ -123,6 +124,12 @@ export function buildServices() {
   const dangling = vc.closeAllDangling();
   if (dangling > 0) console.warn(`[vc] 閉じ損ねセグメントを ${dangling} 件補正しました`);
   const titles = new TitleEngine(db, vc);
+  // v2称号基盤（PR A〜C2）の新規service。旧`titles`（TitleEngine）は置換しない——
+  // 既存productionの正本はそのまま`titles`が持ち続ける。PR D2時点ではrank_title_unlocks
+  // のlive/reconcile wiringだけがこれを使う。SYSTEM_EPOCH/CATALOG_EPOCHは未施行のままで
+  // よい（rank title identityはbehavior title catalogとは別のsubsystem、clockはdefault
+  // Store clockのままでBot側からtimestampをinjectしない）。
+  const titleV2 = new TitleV2Store(db);
   const departments = new Departments(db, ledger);
   const fiscal = new Fiscal(db, ledger);
   const ranks = new RankEngine(db);
@@ -278,6 +285,7 @@ export function buildServices() {
     vcRewards,
     rooms,
     titles,
+    titleV2,
     departments,
     fiscal,
     ranks,
