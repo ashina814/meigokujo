@@ -1549,26 +1549,48 @@ roulette_number・score・rank・reason・source payloadのいずれも保存し
 **successful participation commitmentの定義**: 「賭金検証だけ」
 「seat取得だけ」「house reservationだけ」「challenge作成」「acceptボタンを
 押しただけ」は参加ではない。実際のゲームroundの資金処理/round作成が
-成功した後（solo: house reservation成立後の実round作成、roulette/keiba:
-escrow/risk/reservationを含む業務groupの成功、PVP: 両者のcollectStakesが
-成功しfunded gameとして開始可能になった時点）に参加factを記録する——
-completed game/win/lossではなく、successful funded participation。
-後からsystem error等でvoid/refundになっても、その時点で実際にfunded
-participationまで到達していたならfact自体は消さない。
+成功した後（solo: 各ゲームの真のcommit primitive——slots は
+`spinPaid()`、chohan/poker/holdem は `settleSolo()`、crash は win/loss
+各分岐の `settleSolo()`、chinchiro は `settleChinchiroRound()`、
+blackjack は共有 `finish()` 内の `settleSolo()`——が成功した時点。
+house reservation成立だけでは参加と見なさない（house reservationは
+HOUSE側の引受余力確保にすぎず、プレイヤー資金の実際の増減は伴わない）。
+roulette/keiba: escrow/risk/reservationを含む業務groupの成功、PVP:
+両者のcollectStakesが成功しfunded gameとして開始可能になった時点）に
+参加factを記録する——completed game/win/lossではなく、successful
+funded participation。後からsystem error等でvoid/refundになっても、
+その時点で実際にfunded participationまで到達していたならfact自体は
+消さない。
 
 **production callsite audit**: solo 7種目（スロット・丁半・クラッシュ・
-チンチロ・ブラックジャック・ポーカー・ホールデム、既存の
-`recordCasinoGameStartBestEffort()`と同じhouse reservation成立直後）・
-ルーレット/競馬（`acceptRouletteBet()`/`acceptKeibaBet()`の実bet受理成功時、
-`bets.set(...)`直前）・PVP named-invite 4種目（bj-duel/chinchiro-duel/
-sashi/indian、両者のcollectStakes成功後・`runFundedX()`呼び出し前）・
-PVP公開募集（`pvp-accept.ts`の`collectAndStartFunded()`、`collectStakes()`
-1回成功後）・poker-duel（`dealHands()`/`dealHandsFromClient()`の配布直前、
-sashi/openどちらのmodeも実際に配牌が始まる瞬間）・多人数丁半
-（両側に張り手が揃った時点、`revealAndSettle()`直前）を全て監査し、
-各entrypointへ書き込みを配線した。validation失敗・reservation失敗・
-escrow不足・conflict・capacity reject・challenge作成のみ・claimだけ・
-timeoutでは一切書き込まない。
+チンチロ・ブラックジャック・ポーカー・ホールデム）は、house reservation
+成立ではなく、各ゲームで実際に資金移動・round結果が確定するprimitiveを
+個別に監査して配線した——slots: `spinPaid()`（`runGroup`内で抽選・賭け・
+配当・JP積立を単一atomic transactionにまとめる正本、唯一のcall site）
+成功後。chohan/poker/holdem: `settleSolo()`成功後（holdemはfold/
+showdown両経路が同じ`settleSolo()`呼び出しへ合流、foldは`rawPayout=0`で
+同じsettleへ入る）。crash: win分岐・loss分岐それぞれ独立した
+`settleSolo()`成功後（同じ`participationKey`へ収束するため二重書き込み
+なし）。chinchiro: `settleChinchiroRound()`（内部でescrow事前預託pool
+残高の不変条件をチェックした上で`settleSolo()`を呼ぶ正本、唯一の
+call site）成功後。blackjack: ナチュラル・バースト・スタンド・ダブル・
+timeout強制スタンドなど全9決着経路が合流する共有`finish()`closure内の
+`settleSolo()`成功後。ルーレット/競馬（`acceptRouletteBet()`/
+`acceptKeibaBet()`の実bet受理成功時、`bets.set(...)`直前）・PVP
+named-invite 4種目（bj-duel/chinchiro-duel/sashi/indian、両者の
+collectStakes成功後・`runFundedX()`呼び出し前）・PVP公開募集
+（`pvp-accept.ts`の`collectAndStartFunded()`、`collectStakes()`1回成功後）・
+poker-duel（`dealHands()`/`dealHandsFromClient()`の配布直前、sashi/open
+どちらのmodeも実際に配牌が始まる瞬間）・多人数丁半（両側に張り手が
+揃った時点、`revealAndSettle()`直前）を全て監査し、各entrypointへ
+書き込みを配線した。validation失敗・reservation失敗・escrow不足・
+conflict・capacity reject・challenge作成のみ・claimだけでは一切
+書き込まない。timeout/cancelは「timeoutそのもの」で判断せず、実際に
+commit primitiveへ到達したかで判断する——丁半の丁/半選択timeoutは
+`settleSolo()`到達前に早期returnするため書き込まないが、blackjack/
+holdemのアクションtimeoutはproduction game semantics上、強制スタンド
+（blackjack）・強制check（holdem）という正常なround決着へ変換されて
+`settleSolo()`まで到達するため書き込む。
 
 **activity key mapping**: 表示名やmode文字列をそのまま保存せず、
 `packages/core/src/casino/participation-history.ts`の
@@ -1609,7 +1631,12 @@ callerからtimestampを渡させない。同一`recordCommittedParticipation()`
 全participantは1 clock snapshot。E3の`recorded_at`（staffが後から入力した
 確定時刻）とは異なり、これはcommit時に直接観測した値なので、
 `casino_participations`・`casino_activity_days`とも`orderable:true`で
-登録できる——「N件目の参加を達成したexact time」としてearnedAtへ使える。
+登録できる。ただし`casino_activity_days`はraw play countをTitle
+evaluatorへ一切公開しない（daily collapseで畳み込み済み）——orderableで
+使えるのは、そのactivity-day factの最初のqualifying participation
+timestampをearnedAtの順序付けに利用できる、という範囲にとどまる。
+将来のTitle ruleがraw casino play countを参照できるかのように読める
+表現は用いない。
 
 **no automatic historical backfill**: 既存の`casino_metric_events`や
 Ledgerから過去のcasino participationを推測して埋めない。明示的に
