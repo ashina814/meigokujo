@@ -1428,6 +1428,98 @@ win/loss/PnL/all-inを使わない）。その後、production 99-title catalog�
 Series manifests・Collection Edition・shadow evaluation・threshold
 calibration・production cutoverへ進む。
 
+### Public Event Participation Source — E3
+
+God Field大会・ビンゴ・ファッションショー等、冥獄城の公開イベントへの参加実績を、
+identity-minimized truthとして称号v2へ持ち込む。
+
+**generic EventLogは参加者正本ではない**: `events`（`events.actor_id`/
+`target_id`/`payload_json`/`type`）はconfession/evaluation/entry/shop/rooms/
+casino等が共用する汎用事件録であり、公開イベント参加者をこれらの列から推測しない
+——`EventLog.listByType()`/`listByTarget()`も使わない。`events`テーブルを
+`titleUsable:true`にすることは絶対にしない。
+
+**dedicated `PublicEvents`ドメイン**: 新規moduleを`packages/core/src/titles/`
+配下ではなく`packages/core/src/public-events/service.ts`に置く——これは
+称号を取るための監視ログではなく、**public event operations / attendance
+history**という独立したevent-ops正本（将来のevent history/UI等にも使える）。
+称号v2は、この確定rosterをsafe sourceとして読む1 consumerに過ぎない。
+
+**staff-confirmed public roster**: `public_events`（1開催instance = 1
+`event_key`）と`public_event_participations`の2 tableだけを持つ。draft/
+participant add-remove/event finalizeという複雑なstate machineはDBへ作らない
+——Bot UI側でpreview→confirmし、`PublicEvents.recordFinalizedEvent()`という
+単一atomic writeだけを呼ぶ。confirm前はDB mutationが0件。
+
+**event instance keyはimmutable**: `event_key`は公開イベント1開催につき1つの
+immutableなslug（例: `gf-2026-08-22`）。シリーズ名ではなく開催instanceの
+identity。
+
+**atomic finalize**: `public_events` INSERTと全participant INSERTは単一
+transaction——途中のparticipant INSERT失敗は、event row・先行participant行を
+含めて丸ごとrollbackする。
+
+**roster immutable / exact idempotency / conflicting re-record reject**:
+一度確定したevent_key/participantsをUPDATEしない（edit/delete/participant
+add-remove/void APIは今回作らない）。同一event_keyの再送は、name/eventDate/
+participant set（比較は入力順に依存しない集合比較）が完全一致すれば
+`alreadyRecorded:true`の冪等成功——recorded_at/recorded_byは既存値を維持する。
+1件でも違えばconflict error——「新しい入力の方が正しそうだから上書き」はしない。
+
+**participant dedupeとfail-closedなidentity解決**: 参加者リストは最初の
+appearance順でdedupeする（`alice,bob,alice` → alice,bob）。空participant
+リストはreject。Bot側の入力parserは、メンション（`<@id>`/`<@!id>`）または
+生のDiscord IDとして明確にparseできるtokenだけを受け付け、username/表示名
+からの推測はしない——1 tokenでも不正なら全体をrejectし、partial rosterを
+保存しない。
+
+**no participant-derived self-service progress**: `event_key`はstaff-
+confirmedの1開催1keyであり、同一eventでは1 participant 1 rowまで——button連打
+やmessage連打、1 Land送金等でparticipant自身がevent countを増やす経路は無い。
+raw participant countの累積counter tableも作らない（history rowsから必要時
+に数える）。
+
+**no result/score/prize/bet**: E3 sourceにwinner/placement/score/prize/bet/
+predictionやhost/organizer情報を含めない——「参加した」というneutral truthの
+みを記録する。event_fee支払い・event_prize受取・event market賭けからも
+rosterを自動生成しない（賞金を受け取っていない参加者もいるし、賭けただけの
+人は参加者ではない）。
+
+**source payload minimization**: `TITLE_SOURCES`へ`public_event_participations`
+を`origin:"persisted"`, `privacy:"safe"`, `titleUsable:true`で登録する。
+payload（`PublicEventParticipationsSourcePayload`）は
+`{ participations: [{ eventKey, recordedAt }] }`だけ——event name・event
+date・recorded_by・他参加者identityは一切含めない。reader SQLも
+`recorded_by`/`name`/`event_date`をSELECTしない。
+
+**recordedAtはpersistence confirmationであって出席の瞬間ではない**:
+`recorded_at`は「運営がこの公開イベントrosterをBotへ確定保存した時刻」で
+あり、イベント開始時刻・参加者が入室した瞬間・実際の参加開始時刻ではない。
+`PublicEvents`自身のclockだけが正本——Discord message timestamp・event
+date・operator入力timestampから作らない。過去イベントを後から登録しても、
+`event_date`を使ってcatalog epoch以前へbackdateしない。
+
+**`orderable:false`**: 上記の理由により、`public_event_participations`は
+`orderable:false`で登録する——「N件目のイベント参加を達成したexact time」
+としてrecorded_atを使わせない。orderable:falseなsourceに依存するruleが
+`earnedAt`に非nullを主張すると、既存のv2 orderability contract
+（`v2-evaluator.ts`の`assertOnlyOrderableSourcesClaimEarnedAt`相当）が
+fail-closedする。
+
+**no automatic historical inference**: `events`/`transactions`/VC/Discord
+historyから過去rosterを自動backfillしない。明示的に運営がauthoritative
+rosterを入力したものだけを記録する。
+
+**no evaluator wiring**: event roster確定後に
+`evaluateUserPipeline(trigger:"event_completed")`を呼ばない。production
+catalogは未施行のまま——E3はsource正本の追加までで、`/プロフィール`・
+イベント履歴閲覧・Title UIも今回は追加しない。
+
+**follow-up（E3の範囲外）**: E4 Casino Safe Participation Source
+（win/loss/PnL/all-inを使わない、neutralな参加factだけの畳み込み）。その後、
+production 99-title catalog・Series manifests・Collection Edition・shadow
+evaluation・threshold calibration・production cutoverへ進む。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

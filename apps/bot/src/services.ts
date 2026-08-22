@@ -28,6 +28,7 @@ import {
   RankEngine,
   BumpCounter,
   TextActivity,
+  PublicEvents,
   Shop,
   ChipLedger,
   ETHER_ESCROW,
@@ -138,6 +139,9 @@ export function buildServices() {
   // TC安全source（PR E1）。rank_text（XP/level/cooldown）とは独立したsubsystem——
   // raw message数もmessage内容も保存しない。既存servicesを置換しない。
   const textActivity = new TextActivity(db);
+  // 公開イベント運営ドメイン（PR E3）。称号v2専用ログではない——運営が確定した公開
+  // イベントrosterの正本。generic EventLog（events）は置換しない。
+  const publicEvents = new PublicEvents(db);
   // 階級要件は「〇〇以上」判定（亡霊 < 魔人 < 魔族。上位階級は下位要件の商品を買える）
   const shop = new Shop(db, ledger, events, {
     roleCheck: (memberRoleIds, requireRoleId) => meetsRoleRequirement(settings, memberRoleIds, requireRoleId),
@@ -295,6 +299,7 @@ export function buildServices() {
     ranks,
     bumps,
     textActivity,
+    publicEvents,
     shop,
     // Discord/UI と支払い系には spendable view を公開する。
     chips: spendableChips,
