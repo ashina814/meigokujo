@@ -377,26 +377,37 @@ describe("候補の全件評価とdeterministic witness選択（§15, §16, §17
     expect(row?.counterpart_user_id).toBe("aaa");
   });
 
-  it("rule evaluate呼び出し順もcounterpart ID code-unit ASCで決定的（§17）", () => {
+  it("rule evaluate呼び出し順はcounterpart ID code-unit ASCで決定的——各counterpartに別metricsを持たせてexact orderを直接証明する（round 2レビュー §4）", () => {
+    const { db, store } = setup();
+    // aaa/mmm/zzzへそれぞれ異なるrepeatedJstDaysを持たせ、observed順から
+    // どのcounterpart由来かを一意に特定できるようにする（1日=aaa, 2日=mmm, 3日=zzz）。
+    insertOverlapDays(db, "alice", "zzz", "vc-z", [0, 1, 2], 100);
+    insertOverlapDays(db, "alice", "aaa", "vc-a", [0], 100);
+    insertOverlapDays(db, "alice", "mmm", "vc-m", [0, 1], 100);
+
+    const observedDays: number[] = [];
+    const rule = relationshipRule("v2.test.order.deterministic", (ctx) => {
+      observedDays.push(ctx.candidate.repeatedJstDays);
+      return { matched: false };
+    });
+    const plan = defineTitleEvaluationPlan([], [], [rule]);
+    evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT, "vc_activity");
+
+    // aaa(1日) → mmm(2日) → zzz(3日) の順（code-unit ASC）で呼ばれたことを直接確認する。
+    expect(observedDays).toEqual([1, 2, 3]);
+  });
+
+  it("resolveRelationshipCandidates()はcounterpartUserIdをcode-unit ASCでsortして返す（internal importで直接確認）", () => {
     const { db, store } = setup();
     insertOverlapDays(db, "alice", "zzz", "vc-z", [0], 100);
     insertOverlapDays(db, "alice", "aaa", "vc-a", [0], 100);
     insertOverlapDays(db, "alice", "mmm", "vc-m", [0], 100);
 
-    const callOrder: string[] = [];
-    const rule = relationshipRule("v2.test.order.deterministic", (ctx) => {
-      // candidateにidentityは無いが、metricsの一意な組み合わせで呼び出し順を推測できる
-      // ようにする必要はない——このテストは「同じdaysセットでも常に同じ順で呼ばれるか」
-      // を2回実行して比較することで確認する。
-      callOrder.push(JSON.stringify(ctx.candidate));
-      return { matched: false };
-    });
-    const plan = defineTitleEvaluationPlan([], [], [rule]);
-    evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT, "vc_activity");
-    const firstOrder = [...callOrder];
-    callOrder.length = 0;
-    evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT + 1, "vc_activity");
-    expect(callOrder).toEqual(firstOrder);
+    const scope = resolveTitleScope(store, alwaysMatchRelationship("v2.test.order.sort-check").definition, OBSERVED_AT);
+    const candidates = resolveRelationshipCandidates(db, "alice", scope);
+    // candidateにcounterpart identityは公開されていないため、内部importで直接確認する
+    // （このテストファイルはcore package内なのでinternal moduleへ直接アクセスできる）。
+    expect(candidates.map((c) => c.counterpartUserId)).toEqual(["aaa", "mmm", "zzz"]);
   });
 
   it("1件でもmatchedならtitleはmatched（複数candidate中1件だけmatch）", () => {
@@ -465,7 +476,7 @@ describe("private evidence provenance（§18, §19, §29, §49）", () => {
     const scopeA = resolveTitleScope(store, ruleA.definition, OBSERVED_AT);
     const scopeB = resolveTitleScope(store, ruleB.definition, OBSERVED_AT);
     const candidates = resolveRelationshipCandidates(db, "alice", scopeA);
-    const evidenceForA = resolveRelationshipPrivateEvidence(candidates[0]!, "alice", ruleA.definition.key, scopeA.scopeKey, OBSERVED_AT);
+    const evidenceForA = resolveRelationshipPrivateEvidence(candidates[0]!, "alice", ruleA.definition.key, scopeA);
 
     // titleA向けに解決したevidenceを、titleBのaward()へそのまま渡そうとする。
     expect(() =>
@@ -485,7 +496,7 @@ describe("private evidence provenance（§18, §19, §29, §49）", () => {
     const rule = alwaysMatchRelationship("v2.test.evidence.user-substitution");
     const scope = resolveTitleScope(store, rule.definition, OBSERVED_AT);
     const candidates = resolveRelationshipCandidates(db, "alice", scope);
-    const evidenceForAlice = resolveRelationshipPrivateEvidence(candidates[0]!, "alice", rule.definition.key, scope.scopeKey, OBSERVED_AT);
+    const evidenceForAlice = resolveRelationshipPrivateEvidence(candidates[0]!, "alice", rule.definition.key, scope);
 
     expect(() =>
       store.awardRelationship({
@@ -504,7 +515,7 @@ describe("private evidence provenance（§18, §19, §29, §49）", () => {
     const rule = alwaysMatchRelationship("v2.test.evidence.positive-path");
     const scope = resolveTitleScope(store, rule.definition, OBSERVED_AT);
     const candidates = resolveRelationshipCandidates(db, "alice", scope);
-    const evidence = resolveRelationshipPrivateEvidence(candidates[0]!, "alice", rule.definition.key, scope.scopeKey, OBSERVED_AT);
+    const evidence = resolveRelationshipPrivateEvidence(candidates[0]!, "alice", rule.definition.key, scope);
 
     const result = store.awardRelationship({
       userId: "alice",
@@ -514,6 +525,117 @@ describe("private evidence provenance（§18, §19, §29, §49）", () => {
       awardFacts: { version: 1, data: {} },
     });
     expect(result.status).toBe("awarded");
+  });
+});
+
+describe("temporal substitution: 同じscopeKeyでもobservedAtが異なる別scopeへのevidence substitutionはreject（round 2レビュー §1 BLOCKER）", () => {
+  it("A/B: observedAt=200のscopeで解決したevidence と observedAt=100の別scope は、scopeKeyが同じでも別object", () => {
+    const { db, store } = setup();
+    insertOverlapDays(db, "alice", "bob", "vc-early", [0], 100);
+    const rule = alwaysMatchRelationship("v2.test.temporal.identity");
+
+    const earlyObservedAt = jstDayStart(0) + 50_000;
+    const lateObservedAt = jstDayStart(10);
+    const scopeEarly = resolveTitleScope(store, rule.definition, earlyObservedAt);
+    const scopeLate = resolveTitleScope(store, rule.definition, lateObservedAt);
+
+    // globalスコープなのでscopeKeyは同じ文字列だが、object identityは別。
+    expect(scopeEarly.scopeKey).toBe(scopeLate.scopeKey);
+    expect(scopeEarly).not.toBe(scopeLate);
+  });
+
+  it("C: T2まで見て作ったevidenceを、T1<T2の古いscopeへsubstituteするとreject", () => {
+    const { db, store, setClock } = setup();
+    insertOverlapDays(db, "alice", "bob", "vc-early", [0], 100);
+    const rule = alwaysMatchRelationship("v2.test.temporal.late-to-early");
+
+    const earlyObservedAt = jstDayStart(0) + 50_000;
+    const scopeEarly = resolveTitleScope(store, rule.definition, earlyObservedAt);
+
+    // T2時点でcharlieとの新しい関係が育っている——T2までのcandidateを見て作ったevidence。
+    insertOverlapDays(db, "alice", "charlie", "vc-late", [5, 6], 500);
+    const lateObservedAt = jstDayStart(10);
+    const scopeLate = resolveTitleScope(store, rule.definition, lateObservedAt);
+    const lateCandidates = resolveRelationshipCandidates(db, "alice", scopeLate);
+    const lateEvidence = resolveRelationshipPrivateEvidence(lateCandidates[0]!, "alice", rule.definition.key, scopeLate);
+
+    // T2 evidenceを、T1（observedAt=earlyObservedAt）までしか見ていない古いscopeへ
+    // substituteしようとする——「T1までしか観測していない評価へfuture evidenceを
+    // 混入させる」攻撃で、rejectされなければならない。
+    setClock(lateObservedAt + 1000);
+    expect(() =>
+      store.awardRelationship({
+        userId: "alice",
+        titleKey: rule.definition.key,
+        scope: scopeEarly,
+        evidence: lateEvidence,
+        awardFacts: { version: 1, data: {} },
+      }),
+    ).toThrow(/different \(user, title, scope\) binding/);
+  });
+
+  it("逆方向: T1までのevidenceをT2の新しいscopeへ渡すのも別object identityなのでreject", () => {
+    const { db, store, setClock } = setup();
+    insertOverlapDays(db, "alice", "bob", "vc-early", [0], 100);
+    const rule = alwaysMatchRelationship("v2.test.temporal.early-to-late");
+
+    const earlyObservedAt = jstDayStart(0) + 50_000;
+    const scopeEarly = resolveTitleScope(store, rule.definition, earlyObservedAt);
+    const earlyCandidates = resolveRelationshipCandidates(db, "alice", scopeEarly);
+    const earlyEvidence = resolveRelationshipPrivateEvidence(earlyCandidates[0]!, "alice", rule.definition.key, scopeEarly);
+
+    const lateObservedAt = jstDayStart(10);
+    const scopeLate = resolveTitleScope(store, rule.definition, lateObservedAt);
+
+    setClock(lateObservedAt + 1000);
+    expect(() =>
+      store.awardRelationship({
+        userId: "alice",
+        titleKey: rule.definition.key,
+        scope: scopeLate,
+        evidence: earlyEvidence,
+        awardFacts: { version: 1, data: {} },
+      }),
+    ).toThrow(/different \(user, title, scope\) binding/);
+  });
+
+  it("同じexact scope objectを使えば正常award（陽性経路）", () => {
+    const { db, store } = setup();
+    insertOverlapDays(db, "alice", "bob", "vc1", [0, 1], 1000);
+    const rule = alwaysMatchRelationship("v2.test.temporal.exact-match");
+    const scope = resolveTitleScope(store, rule.definition, OBSERVED_AT);
+    const candidates = resolveRelationshipCandidates(db, "alice", scope);
+    const evidence = resolveRelationshipPrivateEvidence(candidates[0]!, "alice", rule.definition.key, scope);
+
+    const result = store.awardRelationship({
+      userId: "alice",
+      titleKey: rule.definition.key,
+      scope,
+      evidence,
+      awardFacts: { version: 1, data: {} },
+    });
+    expect(result.status).toBe("awarded");
+  });
+});
+
+describe("candidate issuer hardening（round 2レビュー §3）", () => {
+  it("手書きcandidate objectをresolveRelationshipPrivateEvidence()へ渡すとreject", () => {
+    const { store } = setup();
+    const rule = alwaysMatchRelationship("v2.test.forged.candidate");
+    const scope = resolveTitleScope(store, rule.definition, OBSERVED_AT);
+    const forgedCandidate = { counterpartUserId: "bob", repeatedJstDays: 999, trustedOverlapSeconds: 999_999 };
+    expect(() => resolveRelationshipPrivateEvidence(forgedCandidate, "alice", rule.definition.key, scope)).toThrow(
+      /was not produced by resolveRelationshipCandidates/,
+    );
+  });
+
+  it("resolveRelationshipCandidates()が返したcandidateはそのまま使える（陽性経路）", () => {
+    const { db, store } = setup();
+    insertOverlapDays(db, "alice", "bob", "vc1", [0, 1], 1000);
+    const rule = alwaysMatchRelationship("v2.test.legit.candidate");
+    const scope = resolveTitleScope(store, rule.definition, OBSERVED_AT);
+    const candidates = resolveRelationshipCandidates(db, "alice", scope);
+    expect(() => resolveRelationshipPrivateEvidence(candidates[0]!, "alice", rule.definition.key, scope)).not.toThrow();
   });
 });
 
@@ -633,6 +755,54 @@ describe("missing evidence fail-closed（§33, §35, §58）", () => {
     expect(() => store.hasRelationshipAward("alice", "v2.test.corruption.has-award-check", "global")).toThrow(
       /without private evidence/,
     );
+  });
+});
+
+describe("既存evidenceのsemantic re-validation（idempotent re-award時、round 2レビュー §2）", () => {
+  it("captured_atをtamperした状態で同じactive ruleを再評価すると、Store再構築なしでもawardRelationship()経路でfail-closed", () => {
+    const { db, store } = setup();
+    insertOverlapDays(db, "alice", "bob", "vc-bob", [0], 100);
+    const rule = alwaysMatchRelationship("v2.test.reaward.captured-at-tamper");
+    const plan = defineTitleEvaluationPlan([], [], [rule]);
+    evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT, "vc_activity");
+
+    // Storeを再構築せず、DBだけを直接tamperする（construction-time integrityは経由しない）。
+    db.prepare(`UPDATE title_relationship_private_evidence SET captured_at = captured_at + 1 WHERE user_id = ? AND title_key = ?`).run(
+      "alice",
+      "v2.test.reaward.captured-at-tamper",
+    );
+
+    // candidateは引き続きmatchする状態のまま、同じruleを再評価する
+    // （awardRelationship()のisNewAward=false分岐を通る）。
+    expect(() => evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT + 100, "vc_activity")).toThrow(
+      /does not match.*awarded_at|captured_at/,
+    );
+  });
+
+  it("counterpart_user_idを空白のみへtamperした状態で再評価するとfail-closed", () => {
+    const { db, store } = setup();
+    insertOverlapDays(db, "alice", "bob", "vc-bob", [0], 100);
+    const rule = alwaysMatchRelationship("v2.test.reaward.whitespace-counterpart");
+    const plan = defineTitleEvaluationPlan([], [], [rule]);
+    evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT, "vc_activity");
+
+    db.prepare(`UPDATE title_relationship_private_evidence SET counterpart_user_id = '   ' WHERE user_id = ? AND title_key = ?`).run(
+      "alice",
+      "v2.test.reaward.whitespace-counterpart",
+    );
+
+    expect(() => evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT + 100, "vc_activity")).toThrow(/empty counterpart/);
+  });
+
+  it("正常な既存evidenceに対する再評価はalready_awardedのまま成功する（回帰確認）", () => {
+    const { db, store } = setup();
+    insertOverlapDays(db, "alice", "bob", "vc-bob", [0], 100);
+    const rule = alwaysMatchRelationship("v2.test.reaward.healthy");
+    const plan = defineTitleEvaluationPlan([], [], [rule]);
+    evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT, "vc_activity");
+
+    const result = evaluateUserPipeline(db, store, plan, "alice", OBSERVED_AT + 100, "vc_activity");
+    expect(result.relationship[0]!.outcome).toBe("already_awarded");
   });
 });
 

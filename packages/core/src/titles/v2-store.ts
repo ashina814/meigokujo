@@ -955,8 +955,13 @@ export class TitleV2Store {
   awardRelationship(input: AwardRelationshipInput): AwardResult {
     const userId = requireText(input.userId, "userId");
     const titleKey = requireV2Key(input.titleKey);
-    const provenance = assertResolvedTitleScopeForTitle(input.scope, titleKey);
-    const evidenceProvenance = requireRelationshipEvidenceProvenance(input.evidence, userId, titleKey, provenance.scopeKey);
+    // scope forgeryをここでも早期に確認する（performAward()内でも再検証されるが、
+    // evidence provenance比較の前に明確なエラーを出すため）。evidenceのbinding検証は
+    // 必ず`input.scope`という**まさにそのobject参照**で行う——scopeKey文字列だけの
+    // 比較だと、同じscopeKey（例: "global"）でobservedAtだけが違う別scopeへのevidence
+    // substitutionを検出できない（round 2レビュー §1）。
+    assertResolvedTitleScopeForTitle(input.scope, titleKey);
+    const evidenceProvenance = requireRelationshipEvidenceProvenance(input.evidence, userId, titleKey, input.scope);
 
     return this.performAward(
       { userId, titleKey, scope: input.scope, earnedAt: null, awardFacts: input.awardFacts },
@@ -1099,11 +1104,15 @@ export class TitleV2Store {
       // award。ownership/rarity sequenceは一切変更しない（先に成立したfirst ownership
       // のsnapshotが勝つ）。
 
+      const awardRow = this.getAwardRow(userId, titleKey, scopeKey);
+      if (!awardRow) throw new Error(`title award was not persisted: ${userId}/${titleKey}/${scopeKey}`);
+
       // relationship evidence（PR C2）。isNewAwardの分岐はfacts/ownershipと同じ規律
-      // ——新規awardならINSERT、既存awardなら「既存evidenceが本当に存在するか」だけ
-      // 確認し、より強いcandidateが後から現れてもUPDATEしない（first persisted
-      // witnessのimmutability、§32）。既存awardなのにevidenceが無ければ、現在の
-      // candidateから自動backfillせずintegrity violationとしてfail-closedする（§33）。
+      // ——新規awardならINSERT、既存awardなら「既存evidenceが本当に存在するか」だけでなく
+      // その内容自体もB1のawardFacts再award時と同じ強度でvalidateする（round 2レビュー
+      // §2）。より強いcandidateが後から現れてもUPDATEしない（first persisted witnessの
+      // immutability、§32）。既存awardなのにevidenceが無ければ、現在のcandidateから
+      // 自動backfillせずintegrity violationとしてfail-closedする（§33）。
       if (relationshipEvidence) {
         if (isNewAward) {
           this.db
@@ -1131,11 +1140,12 @@ export class TitleV2Store {
                 `without private evidence (evidence was deleted out of band, or missing from an earlier partial write)`,
             );
           }
+          // 「存在するだけ」でidempotentにOKとせず、B1のawardFacts再award時と同じ強度で
+          // 内容をvalidateする——out-of-band corruptionをalready_awardedとして黙って
+          // 受理しない（round 2レビュー §2）。
+          assertValidRelationshipEvidenceRowContent(`${userId}/${titleKey}/${scopeKey}`, existingEvidence, awardRow.awarded_at);
         }
       }
-
-      const awardRow = this.getAwardRow(userId, titleKey, scopeKey);
-      if (!awardRow) throw new Error(`title award was not persisted: ${userId}/${titleKey}/${scopeKey}`);
 
       return {
         status: isNewAward ? "awarded" : "already_awarded",

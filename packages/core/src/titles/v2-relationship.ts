@@ -211,13 +211,7 @@ export function evaluateRelationshipTitle(
   const primary = selectPrimaryWitness(matchedEntries.map((e) => e.candidate))!;
   const primaryEntry = matchedEntries.find((e) => e.candidate.counterpartUserId === primary.counterpartUserId)!;
 
-  const evidence = resolveRelationshipPrivateEvidence(
-    primaryEntry.candidate,
-    userId,
-    definition.key,
-    resolvedScope.scopeKey,
-    resolvedScope.observedAt,
-  );
+  const evidence = resolveRelationshipPrivateEvidence(primaryEntry.candidate, userId, definition.key, resolvedScope);
 
   const awardResult = store.awardRelationship({
     userId,

@@ -1,6 +1,11 @@
 import type Database from "better-sqlite3";
 import { computeCoPresenceOverlaps } from "../vc/derived.js";
-import { assertResolvedTitleScope, resolvedScopeEffectiveEnd, type ResolvedTitleScope } from "./v2-scope.js";
+import {
+  assertResolvedTitleScope,
+  assertResolvedTitleScopeForTitle,
+  resolvedScopeEffectiveEnd,
+  type ResolvedTitleScope,
+} from "./v2-scope.js";
 
 /**
  * Relationship titleのprivate witness resolution境界（PR C2）。
@@ -77,8 +82,20 @@ export function resolveRelationshipCandidates(
   }
 
   candidates.sort((a, b) => compareCodeUnit(a.counterpartUserId, b.counterpartUserId));
+  for (const candidate of candidates) ISSUED_CANDIDATES.add(candidate as unknown as object);
   return candidates;
 }
+
+/**
+ * `resolveRelationshipCandidates()`が実際に発行したcandidate objectだけを認識する
+ * WeakSet（round 2レビュー §3、candidate issuer hardening）。手書きの
+ * `{counterpartUserId:"bob", repeatedJstDays:999, trustedOverlapSeconds:999999}`の
+ * ようなstructural objectを`resolveRelationshipPrivateEvidence()`へ直接渡しても、
+ * ここで弾かれてbrandを発行できない——`InternalRelationshipCandidate`は単なる
+ * structural interfaceであり、WeakMap/WeakSetのidentity check無しには
+ * 「本当にresolverが返したcandidateか」を区別できないため。
+ */
+const ISSUED_CANDIDATES = new WeakSet<object>();
 
 /**
  * matchedしたcandidateの中から、private evidenceとして保存するprimary witnessを
@@ -110,12 +127,22 @@ export function selectPrimaryWitness(
  */
 const EVIDENCE_BRAND: unique symbol = Symbol("ResolvedRelationshipPrivateEvidence");
 
-/** `resolveRelationshipPrivateEvidence()`が確定した値のcanonical snapshot。counterpartを含む。 */
+/**
+ * `resolveRelationshipPrivateEvidence()`が確定した値のcanonical snapshot。counterpartを含む。
+ *
+ * `scope`は文字列化した`scopeKey`/`observedAt`ではなく、**exact `ResolvedTitleScope`
+ * object reference**をそのまま保持する（round 2レビュー §1）。同じ`scopeKey`
+ * （例えば`global`）でも、`observedAt`が異なれば別のevaluation windowを表す
+ * ——scopeKey/observedAtを別々の文字列/数値として比較すると、「T2以降のデータまで
+ * 見て作ったevidence」を「T1までしか見ていない古いResolvedTitleScope」へ
+ * substituteできてしまう（scopeKey/subjectUserId/titleKeyだけが一致していれば
+ * 通ってしまうため）。exact object identityで比較することで、scopeKey
+ * substitution・observedAt substitution・title scope substitutionをまとめて閉じる。
+ */
 interface RelationshipEvidenceProvenance {
   readonly subjectUserId: string;
   readonly titleKey: string;
-  readonly scopeKey: string;
-  readonly observedAt: number;
+  readonly scope: ResolvedTitleScope;
   readonly counterpartUserId: string;
   readonly repeatedJstDays: number;
   readonly trustedOverlapSeconds: number;
@@ -145,16 +172,29 @@ export interface ResolvedRelationshipPrivateEvidence {
 
 /**
  * `resolveRelationshipCandidates()`が返したcandidateから、
- * `(subjectUserId, titleKey, scopeKey)`へbindしたcanonical private evidenceを作る
+ * `(subjectUserId, titleKey, scope)`へbindしたcanonical private evidenceを作る
  * （internal——`v2.ts`からはexportしない）。
+ *
+ * - `candidate`は`ISSUED_CANDIDATES`（`resolveRelationshipCandidates()`が発行した
+ *   candidateだけを認識するWeakSet）に含まれることを要求する——手書きcandidateから
+ *   evidenceを発行できない（round 2レビュー §3）。
+ * - `scope`は`ResolvedTitleScope`そのものを受け取り、`assertResolvedTitleScopeForTitle()`
+ *   をここでも通す（round 2レビュー §1）——`titleKey`向けに正規resolveされたscopeで
+ *   あることをresolver側でも確認してから、そのexact object referenceをprovenanceへbindする。
  */
 export function resolveRelationshipPrivateEvidence(
   candidate: InternalRelationshipCandidate,
   subjectUserId: string,
   titleKey: string,
-  scopeKey: string,
-  observedAt: number,
+  scope: ResolvedTitleScope,
 ): ResolvedRelationshipPrivateEvidence {
+  if (!ISSUED_CANDIDATES.has(candidate as unknown as object)) {
+    throw new Error(
+      "relationship candidate was not produced by resolveRelationshipCandidates() (forged or hand-built InternalRelationshipCandidate)",
+    );
+  }
+  assertResolvedTitleScopeForTitle(scope, titleKey);
+
   const branded = Object.freeze({
     [EVIDENCE_BRAND]: true,
     repeatedJstDays: candidate.repeatedJstDays,
@@ -165,8 +205,7 @@ export function resolveRelationshipPrivateEvidence(
     Object.freeze({
       subjectUserId,
       titleKey,
-      scopeKey,
-      observedAt,
+      scope,
       counterpartUserId: candidate.counterpartUserId,
       repeatedJstDays: candidate.repeatedJstDays,
       trustedOverlapSeconds: candidate.trustedOverlapSeconds,
@@ -177,17 +216,26 @@ export function resolveRelationshipPrivateEvidence(
 
 /**
  * `evidence`が本当に`resolveRelationshipPrivateEvidence()`の産物で、指定した
- * `(subjectUserId, titleKey, scopeKey)`向けに作られたことを検証し、counterpartUserIdを
+ * `(subjectUserId, titleKey, scope)`向けに作られたことを検証し、counterpartUserIdを
  * 含むcanonical provenanceを返す。`TitleV2Store.awardRelationship()`の入口専用
  * ——callerが手書きの`{counterpartUserId:"...", repeatedJstDays:999}`のようなobjectを
- * 渡してもここでreject（§18）。title Aのために解決したevidenceをtitle Bへ、
- * 別scopeへ、別userへsubstituteすることも拒否する（§19）。
+ * 渡してもここでreject（§18）。
+ *
+ * `scope`は`awardRelationship()`へ渡された**まさにそのResolvedTitleScope object**を
+ * 受け取り、evidence解決時に使われたscopeとexact object identityで比較する
+ * （round 2レビュー §1）。これにより:
+ * - title Aのために解決したevidenceをtitle Bへsubstitute
+ * - 別userへsubstitute
+ * - 同じscopeKeyだが別observedAt（例: T2まで見て作ったevidenceをT1までしか見ていない
+ *   古いscopeへsubstitute）
+ * のいずれも一括して拒否できる——scopeKeyを文字列として比較するだけでは
+ * observedAtの違いを検出できないため、exact object identityを正本にする。
  */
 export function requireRelationshipEvidenceProvenance(
   evidence: ResolvedRelationshipPrivateEvidence,
   subjectUserId: string,
   titleKey: string,
-  scopeKey: string,
+  scope: ResolvedTitleScope,
 ): RelationshipEvidenceProvenance {
   if (evidence === null || typeof evidence !== "object") {
     throw new Error(
@@ -206,10 +254,10 @@ export function requireRelationshipEvidenceProvenance(
   ) {
     throw new Error("relationship private evidence fields do not match the canonical snapshot recorded at resolution time");
   }
-  if (provenance.subjectUserId !== subjectUserId || provenance.titleKey !== titleKey || provenance.scopeKey !== scopeKey) {
+  if (provenance.subjectUserId !== subjectUserId || provenance.titleKey !== titleKey || provenance.scope !== scope) {
     throw new Error(
       `relationship private evidence was resolved for a different (user, title, scope) binding ` +
-        `(expected ${subjectUserId}/${titleKey}/${scopeKey})`,
+        `(expected ${subjectUserId}/${titleKey}, exact scope identity mismatch)`,
     );
   }
   return provenance;
