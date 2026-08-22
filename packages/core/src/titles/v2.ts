@@ -214,6 +214,17 @@ export {
   type TitleUserPipelineResult,
 } from "./v2-pipeline.js";
 
+// PR D1: Bulk Source Prefetch Planner。`BULK_SOURCE_READERS`・生のbulk reader関数・
+// cacheの内側の`Map`・group-key構築関数・payload-seeding手段はここではexportしない
+// （§52）——公開してよいのは、read-onlyな最適化APIである`prefetchBatchPipelineSources()`
+// と、identity-freeな要約統計型・既存の`TitleSourceCache`だけ。
+export {
+  prefetchBatchPipelineSources,
+  type TitlePrefetchOptions,
+  type TitlePrefetchResult,
+  type TitlePrefetchSummary,
+} from "./v2-prefetch.js";
+
 // v2-relationship-evidence.ts の何もここではexportしない（PR C2 §16, §30, §62, §63）。
 // `resolveRelationshipCandidates()` / `resolveRelationshipPrivateEvidence()` /
 // `requireRelationshipEvidenceProvenance()` はcounterpart identityへ到達できるraw経路

@@ -905,6 +905,191 @@ ownershipを数える（meta ownership・rank title unlockは数えない、既�
 audit・output minimizationを設計する。「DBにあるからそのまま返す」は禁止。
 今回はprivate evidence persistence + non-disclosure boundaryまで。
 
+### Bulk Source Prefetch Planner（PR D1）
+
+`TitleSourceCache`はuserごとのcache（key: `(userId, sourceKey, scopeKey, start,
+endExclusive, observedAt)`）——N人 × M ruleが同じ(source, semantic scope)を
+共有していても、そのままではN回derived計算が走る。VC derived関数
+（`computeEmptyStartThenJoined`/`computeLastOccupant`/`computeGroupSizeSeconds`/
+`computeSafeSocialAggregates`）は元々`userIds?: readonly string[]`でbulk計算
+できる——このPRは、その既存能力をcache層まで持ち上げる**読み取り専用の最適化
+plannerを追加するだけ**。Bot/scheduler配線・production catalog・新source・
+rank-title live wiring・profile/notification・relationship-disclosure等は
+このPRの範囲外。
+
+**cache/group key生成の一元化**: `v2-sources.ts`に`scopeIdentityFor(scope)`
+（`[scopeKey, start, endExclusive, observedAt]`）を土台とし、`cacheKeyFor(userId,
+sourceKey, scope)`（既存`TitleSourceCache`のcache key）と`sourceScopeGroupKeyFor(
+sourceKey, scope)`（bulk group key、internal export）の両方がこれを共有する
+——key生成ロジックを2箇所へコピペしない。groupのidentityは`(sourceKey,
+scope.scopeKey, scope.start, scope.endExclusive, scope.observedAt)`——**`titleKey`
+はgroup identityに含めない**（既存cacheのscope-based共有philosophyと同じ）。
+複数title/ruleが同じ(source, scope)を宣言していれば1 groupへmergeする。同じ
+windowでも`scopeKey`が違う（例: 別々のevent）場合は別group扱いのまま。
+
+**bulk source readers（正本）**: `v2-sources.ts`に`BULK_SOURCE_READERS: {
+[K in TitleUsableSourceKey]: BulkSourceReader<K> }`を追加。型レベルの
+exhaustiveness（新しいtitleUsable sourceを追加してbulk readerを足し忘れると
+コンパイルエラー）に加え、`assertBulkSourceReaderCoverage()`が既存
+`assertSourceReaderCoverage()`と同じ理由でruntime側も守る。**bulk readerが
+正本**——単一user向けの既存`SOURCE_READERS`は`BULK_SOURCE_READERS[key](db,
+[userId], scope).get(userId)!`へ委譲する薄いwrapperに書き換えた。single/bulkの
+semanticsを別々に実装して片方だけ将来修正される事故を、実装を1本化することで
+構造的に防ぐ。`bump_events`は`WHERE user_id IN (...) AND created_at >= ? AND
+created_at < ? ORDER BY user_id, created_at`のchunked SQLで直接読む。4つのVC
+sourceは既存derived関数のbulk引数へそのまま委譲する——第三者/相手ユーザーの
+context読み込み（occupancy/co-presence計算に必要）はderived関数内部で行われ
+続けるが、**cacheへ書き込むのは明示的に要求したsubject userのentryだけ**
+——context userがそれ自身のcache entryとして紛れ込むことはない。
+
+すべてのbulk readerは要求した`userIds`**全員分**のentryを返す契約
+——0件のuserも「未読み込み」ではなく明示的な空payload（既存single readerの
+空defaultと同じ形）として含める。zero-width scope（`effectiveEnd <=
+scope.start`）はVC derived関数（`clampWindow()`が`RangeError`を投げる）を
+一切呼ばず、空payloadだけを返す。
+
+**SQLite variable limit対策のchunking**: `userIds`を内部定数
+`BULK_USER_CHUNK_SIZE`（300）単位でchunkし、1000人以上のuserでも単一の巨大
+`IN (...)`を作らない。chunkは`prefetch()`側からは見えない実装詳細
+——呼び出し側は「1回のbulk読み込み」として扱ってよい。
+
+**`TitleSourceCache.prefetch(db, sourceKey, userIds, scope)`**: 唯一の書き込み
+経路。callerが任意payloadをcacheへ注入できるAPI（`set`/`seed`/
+`primeWithPayload`等）は意図的に存在しない——cache mutationは`get()`
+（trusted single reader）と`prefetch()`（trusted bulk reader）の結果だけを
+経由する。契約:
+
+- scope brand検証は`userIds`が空でも必ず行う——「読むuserがいないから
+  validationを省略する」はしない。source未登録・非titleUsable（`vc_co_presence`
+  等のrestricted sourceを含む）もscope検証の直後、`userIds`の長さに関わらず
+  runtime rejectする。
+- **first-read-wins**: 既にcache済みの`(user, source, scope)`は上書きしない
+  ——bulk readerへ渡す前に、既cache済みuserを「missing」集合から除外する
+  （書き込み側だけでなく、読み込みの発行自体を省く）。
+- `userIds`は内部でdedupe（初出順維持）——bulk readerへは重複の無いlistを渡す。
+- bulk readerの戻り値を完全に受け取ってから（＝例外が起きれば何もcommitしない）
+  cacheへ書き込む——1 groupの内部chunkingが途中で失敗しても、そのgroup分の
+  部分的な結果がcacheへ混入することはない（他の既に完了したgroupの書き込みは
+  そのまま残ってよい——group横断のatomicityまでは要求しない）。
+- cacheした値は既存single readerと同じくdeep-freezeする。
+
+**`TitleSourceCache`のruntime provenance（PR #158レビュー対応）**: TypeScriptの
+`private`はruntimeを守らない——`private readonly cache = new Map(...)`という
+素朴な実装では、`(cache as any).cache`でbacking Mapへ直接到達できてしまい、
+さらに深刻なのは、`{ get(){ return forgedPayload } }`のようなstructural fake
+objectを`TitleEvaluationOptions.cache`/`TitlePrefetchOptions.cache`へ渡し、
+呼び出し側がそれを`cache.get(...)`のようなdynamic dispatchで呼ぶと、
+`readTitleSource()`/`BULK_SOURCE_READERS`/DBを一切経由せずforgeされたsafe
+payloadをruleへ渡せてしまう——source trust boundary全体の迂回になる。
+
+対策は`v2-scope.ts`の`RESOLVED_SCOPE_PROVENANCE`・`v2-pipeline.ts`の
+`PLAN_PROVENANCE`と同じ思想:
+
+- backing stateをinstanceのown propertyに置かず、module-private
+  `TITLE_SOURCE_CACHE_STATE: WeakMap<object, Map<string, unknown>>`
+  （exact object identityでしか引けない）へ移す。`{ ...realCache }`の
+  shallow copy・`Object.create(TitleSourceCache.prototype)`・
+  `new Proxy(realCache, {})`はいずれもこのWeakMapに載っていないため
+  fail-closedする。
+- constructorで`Object.freeze(this)`する——`instance.get = fakeFn`のような
+  instance own propertyによるmethod shadowingをstrict modeで例外にする。
+- **evaluator（`v2-evaluator.ts`）・planner（`v2-prefetch.ts`）は
+  `cache.get(...)`/`cache.prefetch(...)`というdynamic dispatchを一切呼ばない**
+  ——freezeで守れるのはgenuine instanceへのshadowingだけで、callerが最初から
+  渡してきたstructural fake object自体にはfreezeが及ばない。true trust
+  boundaryは`getFromTitleSourceCache()`/`prefetchIntoTitleSourceCache()`という
+  freestanding function（`v2.ts`からは再exportしない、internal cross-module
+  export）——`cache`を単にWeakMap lookupのkeyとしてしか使わず、`cache`の
+  どのmethodも一切呼び出さないため、`cache`が何のmethodを持っていようと
+  影響を受けない。`TitleSourceCache.get()`/`.prefetch()`はこの2関数への
+  薄いpublic wrapper（外部利用者向け）。
+- `options.cache`が指定された場合、`evaluateTitle()`/`prefetchBatchPipelineSources()`
+  は入口で`assertGenuineTitleSourceCache()`による早期検証も行う
+  （defense-in-depth——実際の読み書きは上記freestanding functionが呼ばれる
+  たびに再検証するため必須ではないが、forgeされたcacheをruleが1件でも
+  評価される前にfail-closedする）。
+
+**`bulkReadCalls`は実測値**: 各bulk readerが実際に発行したDB/derived関数
+呼び出し回数（内部chunkingの実行回数）をそのまま合算する——`userIds.length`
+からの見積もり（`Math.ceil(userIds.length / CHUNK_SIZE)`）ではない。
+zero-width scopeの早期returnではchunkループ自体を回さないため、
+`cacheEntriesLoaded`（payloadがcacheされたuser数）が正でも`bulkReadCalls`は
+0のままになり得る——両者は別の意味を持つ統計であり、混同しない。
+
+**`prefetchBatchPipelineSources(db, store, plan, userIds, observedAt, trigger,
+options?)`**（`v2-prefetch.ts`、公開API）: 高レベルplanner。
+
+- `plan`は`requirePlanProvenance()`（`v2-pipeline.ts`、PR C1のWeakMap
+  provenance機構を内部reuse——`v2.ts`からは再exportしない）でruntime検証
+  する。手書きplan・shallow copy・plan構築後のrule定義書き換えは、canonical
+  compiled planを経由しないため一切影響しない。
+- 対象は**compiled planのbehaviorRulesだけ**。`relationshipRules`は
+  `definition.sources`が`["vc_social_safe"]`であっても対象外——relationship
+  evaluatorはこの汎用source cacheを一切読まず、`v2-relationship-evidence.ts`
+  のprivate restricted resolverだけを使うため。`metaRules`はsourceを持たず
+  対象外。
+- lifecycle:`disabled`はscope解決も含め完全にskip。`active`/`retired`は
+  両方とも対象（`evaluateTitle()`の既存契約——retired titleも新規awardしない
+  だけでsource読み込み自体は行う——に合わせる）。
+- `trigger`でfilterする（`rule.definition.triggers.includes(trigger)`）
+  ——`daily`等を「全rule評価」の魔法triggerにしない。
+- scopeは**rule単位で1回だけ**解決する（user単位でもsource単位でもない）
+  ——100人のuserに対して100回`resolveTitleScope()`を呼ばない。
+- 実際の先読みは`TitleSourceCache.prefetch()`へ委譲するだけ——planner自身は
+  ruleの`evaluate()`/`evaluateCandidate()`、meta `evaluate()`、Store mutation
+  method（award系）を一切呼ばない。外側transactionで包んでpoint-in-time
+  snapshot保証を偽装することもしない（既存source契約が持つ以上の一貫性を
+  主張しない）。
+
+戻り値は`{ cache, summary }`。`summary`（`TitlePrefetchSummary`）は
+identity-freeな要約統計だけ——`{ plannedGroups, executedGroups,
+requestedUniqueUsers, cacheEntriesLoaded, bulkReadCalls }`。userId・
+titleKey・counterpart・raw payload・source別内訳は一切含まない
+——実行infrastructureの統計であり、catalog introspection APIではない。
+
+**`evaluateBatchPipeline()`のデフォルト挙動は変えない**: `prefetchBatchPipelineSources()`
+は完全にopt-in。既存の`evaluateUserPipeline()`/`evaluateBatchPipeline()`/
+`readTitleSource()`/`TitleSourceCache.get()`は、呼び出し側が明示的に
+prefetch結果のcacheを渡さない限り、挙動もパフォーマンス特性も変わらない。
+呼び出しパターンは:
+
+```ts
+const prepared = prefetchBatchPipelineSources(db, store, plan, userIds, observedAt, trigger);
+const results = evaluateBatchPipeline(db, store, plan, userIds, observedAt, trigger, {
+  ...options,
+  cache: prepared.cache,
+});
+```
+
+**failure semanticsはpipelineと別**: `prefetchBatchPipelineSources()`は
+`evaluateBatchPipeline()`本体より**前に**呼ぶ、独立したoptional最適化
+ステップであり、そのエラーはpipeline自体のfail-fast/resumable契約より前に
+表面化し得る——これは意図的な設計であり、pipeline側のresumable semanticsと
+無理に一致させない。scope providerの非決定性（例えばevent scopeが後から
+別の値へ解決される等）でplannerが使ったscopeと、後の`evaluateTitle()`内での
+再解決scopeが食い違った場合も、cache key検証を緩めて無理にhitさせることは
+しない——単なるcache missとしてsingle readerへ自然にfallbackする。
+
+**私cy**: `computeCoPresenceOverlaps()`/`CoPresenceOverlap`はPR C2 round 3の
+lockdownのまま——`v2.ts`/root `index.ts`のどちらからも再exportしない。
+`vc_co_presence.titleUsable`は`false`のまま——bulk readerも追加しない。
+restricted relationship candidateがbulk cacheへ混入する経路は無い
+（そもそもrelationship rulesをplanner対象から除外しているため）。
+
+**公開境界**: `@meigokujo/core/titles/v2`は`prefetchBatchPipelineSources`・
+`TitlePrefetchOptions`/`TitlePrefetchResult`/`TitlePrefetchSummary`・既存の
+`TitleSourceCache`だけを公開する。`BULK_SOURCE_READERS`・生のbulk reader
+関数・`TitleSourceCache`の内側の`Map`・`sourceScopeGroupKeyFor()`・
+payload-seeding手段はexportしない。root `index.ts`は既存pipeline API
+（`evaluateBatchPipeline`等）自体を再exportしていない前例に合わせ、
+`prefetchBatchPipelineSources`もrootへは追加しない。
+
+**follow-up（D1の範囲外）**: rank-title live wiring/daily reconcile・
+source拡張（TC/Land/economy/casino/invites/events）・production 99-title
+catalog + Series manifests + Collection Edition・shadow evaluation/threshold
+calibration・production cutover（epoch/baseline・evaluator配線・rank-title
+配線・profile read-only化・《名乗り》3枠・notification）。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。
