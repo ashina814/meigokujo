@@ -191,7 +191,7 @@ sourceReadinessとthresholdは別軸——READY 11件のうち、STRUCTURAL_FIXE
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
 | 1 | `vc_last_occupant`の同秒0秒visit tie bug修正 | 3件を PARTIAL→READY化（No.6,7,9） | 新規開発ではなく**既存の正確性バグ修正**。最小コストで最初にやるべき土台整備（Summary判断#9でも「production前提」と明記済み） |
-| 2 | casino participation writerに「実際にsettled/completedしたか」を安全に伝える仕組み（solo/PVP区別のsafe flag等） | 3件をPARTIAL→READY化（No.66,67）＋No.69のblockerを一部解消 | PVP経路（pvp-accept.ts等）がrunner実行前にwriterを発火する既存設計上の制約——E4のsemantics自体を変えず、「funded」と「completed」を区別できるsafe signalを追加するだけで動く |
+| 2 | casino completed-participation safe signal / source semantics（そのparticipationが実際にsettled/completedしたことを安全に証明できるimmutable signal——例: committed-participationとcompleted-participationを別factに分ける、成功完了後にのみ書くimmutable completion marker、または同等のsafe derived completion source） | 2件をPARTIAL→READY化（No.66,67）＋No.69のcompletion blockerを解消 | 現在のmismatchが特に目立つのはsolo/PVPで異なるwriter位置を持つため——solo 7種目は`settleSolo()`成功後に書くためcompletion=participationが成立するが、PVP経路（pvp-accept.ts等）はrunner実行前にwriterが発火する。ただし**solo/PVPのmode区別そのものは修正にならない**——両モードとも安全に「completed」を証明できるsignal/semantics自体が無いことが本質的な欠如であり、単にどちらの経路で書かれたかを区別するflagを足すだけでは、PVP側が引き続き未完了のfactを生成し得る問題は解決しない |
 | 3 | `economy_safe_peer_actions`にreversed-original除外ロジックを追加 | 1件をPARTIAL→READY化（No.58） | reversal_of追跡だけの小さい拡張——既存E2の安全設計は変えない |
 | 4 | `public_events`へのevent completion保証（status列 or 運用contractの明文化＋evidence） | 2件をPARTIAL→READY化（No.80,81） | コード変更が最小で済む可能性がある（例えば「recordFinalizedEventは必ずevent終了後に呼ぶ」という運用contractをdocs化しevidenceとして採用する設計判断でも解決し得る） |
 | 5 | VC group-size拡張（day/share/span） | 12件（No.10-21） | 既存`vc_group_size_seconds`の上に集計を足すだけ——新規persisted source不要、単一derived拡張で最大クラスタが動く |
