@@ -492,6 +492,12 @@ export function computeLastOccupant(
       // 第三者の終了が信頼できず「まだ居たかもしれない」場合は安全側でfactを作らない。
       const thirdPartyPresentOrAmbiguous = others.some((o) => {
         if (o === departing) return false;
+        // 同一秒tie: oのstartedAtがdepartingのendedAtと同じ秒なら、「departingが抜けた後に
+        // oが来た」のか「oが来た後にdepartingが抜けた」のか秒精度では前後関係を証明できない
+        // ——0秒visit（o.startedAt===o.endedAt）でもarrival/observationの証拠として保持した
+        // まま、ambiguousとして安全側でfactを作らない。startKindによらずブロックする
+        // （partial_observationも「その人が既に居た可能性」を否定できないため対象）。
+        if (o.startedAt === t) return true;
         const coversInstant = o.startedAt <= t && o.endedAt > t;
         if (coversInstant) return true;
         // 終了が信頼できず、tより後で終わっていた可能性を否定できない

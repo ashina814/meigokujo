@@ -20,6 +20,13 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > PARTIAL 5→13に変わっている——**readiness countを特定の値に固定することを
 > 目的にしない**。監査の結果として出た実数がそのまま正本。
 
+> **PR F2a反映（2026-08-23）**: `computeLastOccupant()`（`packages/core/src/
+> vc/derived.ts`）のsame-second/0-second visit tie bugを修正した——旧版
+> §8クラスタ1として記録していた既存の正確性バグ。No.6/7/9がPARTIAL→READY、
+> known_bug blockerはcatalog全体から0件になった。詳細は§13参照。
+> READY 11→14、PARTIAL 13→10。No.8はarea/categoryタクソノミー不足という
+> **別のBLOCKER**が残るため、このfixだけではREADY化しない。
+
 ## 0. xlsx canonical hash（exact drift guard）
 
 | 項目 | 値 |
@@ -67,13 +74,13 @@ full-clear editionに登録されたREQUIRED印100%——NONCOUNTの91 behavior�
 
 | status | 件数 | 意味 |
 | --- | --- | --- |
-| READY | 11 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
-| PARTIAL | 13 | 近い意味のsourceはあるが、意味を落とす／広げるか、既知バグ／semantic mismatchが安全な有効化を妨げている |
+| READY | 14 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
+| PARTIAL | 10 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
 | BLOCKED | 67 | 意味的に近いものが repo に一切存在しない |
 | META | 8 | kind:meta（別bucket、§7参照） |
 
 **READY = 今すぐreleaseしてよい、ではない**。sourceReadinessとthreshold決定は
-別軸（§10参照）——READY 11件も、production threshold値（分布TBD等）が
+別軸（§10参照）——READY 14件も、production threshold値（分布TBD等）が
 決まるまではrelease対象にならない。またSeries manifest／Collection Edition／
 Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）。
 
@@ -85,19 +92,19 @@ Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）�
 | missing_derived_source | 24 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
 | missing_manifest | 9 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
 | missing_role_history | 7 | role-at-time（過去のある時点でどのroleを保持していたか）がrepo全体で未実装 |
-| known_bug | 4 | source自体は意味的に十分だが、既知の正確性バグ（同秒0秒visit tie等）が未修正 |
 | source_semantic_mismatch | 12 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（§12参照） |
 | missing_event_protocol | 2 | イベントデータモデル自体にorganizer/staff区別が存在しない |
+| known_bug | 0 | PR F2aで`computeLastOccupant()`のsame-second/0-second visit tie bugを修正——catalog全体から解消済み（§13参照） |
 
-（`none`のBehavior候補は11件——ちょうどREADY件数と一致。PARTIAL 13件は
-`known_bug`または`source_semantic_mismatch`のいずれかを持つ。）
+（`none`のBehavior候補は14件——ちょうどREADY件数と一致。PARTIAL 10件は
+すべて`source_semantic_mismatch`を持つ。）
 
 ## 4. Theme別 readiness
 
 | Theme No | Theme | 総数 | READY | PARTIAL | BLOCKED |
 | --- | --- | --- | --- | --- | --- |
 | 1 | 場を起こす | 5 | 2 | 0 | 3 |
-| 2 | 場を締める | 4 | 0 | 3 | 1 |
+| 2 | 場を締める | 4 | 3 | 0 | 1 |
 | 3 | 一対一型 | 3 | 0 | 0 | 3 |
 | 4 | 少人数型 | 3 | 0 | 0 | 3 |
 | 5 | 大人数型 | 3 | 0 | 0 | 3 |
@@ -120,17 +127,14 @@ timestampリストを持つため）。TC交流・公開部屋・城横断は0% 
 
 ## 5. source別に残る実装（READYを支えるsource／PARTIALの制約／BLOCKEDが必要とするもの）
 
-READYを支えている既存`titleUsable:true` source（6種、11件）:
+READYを支えている既存`titleUsable:true` source（6種、14件）:
 
 - `vc_empty_start_then_joined`（No.1-2）
+- `vc_last_occupant`（No.6, 7, 9——PR F2aでsame-second/0-second visit tie bugを修正済み、§13参照）
 - `vc_social_safe`（No.22, 28 — `distinctCoPresentUsers`/`maxRepeatedDaysWithOneCounterpart`が直接使える。No.23-25は§12参照）
 - `bump_events`（No.38-41、全件READY）
 - `casino_activity_days`（No.68 のみ——「利用する」semanticsに限りcompletion保証不要。No.66/67は§12参照）
 - `confirmed_invites`（No.74-75 のみ——`invitee_id UNIQUE`によりdistinct数が保証される）
-
-PARTIALを止めているもの（known_bug）:
-
-- `vc_last_occupant`のsame-second/0-second visit tie bug（No.6, 7, 9——xlsx Blocker欄の記載どおり、未修正）
 
 PARTIALを止めているもの（source_semantic_mismatch、§12で今回のレビューにより新規判定）:
 
@@ -177,7 +181,7 @@ sourceReadinessとthresholdは別軸——READY 11件のうち、STRUCTURAL_FIXE
 | role-at-time依存（`roleDependency !== "none"`） | 10 | うちrole-history欠如**単独**が原因なのは3件（No.27, 64, 73）、残りは他blockerと複合 |
 | イベントtheme（Theme No.16） | 5 | 全件PARTIAL/BLOCKED——No.80/81はcompletion保証欠如でPARTIAL、No.82-84は依然BLOCKED |
 | manifest依存（thresholdCategory: MANIFEST_DEPENDENT） | 6 | 賭場core family一覧・城横断family一覧・series一覧が未定義 |
-| known bug依存 | 4 | `computeLastOccupant`の同秒0秒visit tie bug（本PRでは修正しない、production前提として記録のみ） |
+| known bug依存 | 0 | PR F2aで`computeLastOccupant`の同秒0秒visit tie bugを修正——catalog全体から解消（§13参照） |
 | source_semantic_mismatch依存 | 12 | §12参照。今回のレビューで新規に確定 |
 
 ## 8. 次に何を実装すれば最も多くのcandidateがunblockされるか
@@ -188,29 +192,32 @@ sourceReadinessとthresholdは別軸——READY 11件のうち、STRUCTURAL_FIXE
 または既存sourceのsemanticsを正すごとに複数candidateが同時に動く
 「クラスタ」が明確に存在する。
 
+> `vc_last_occupant`の同秒0秒visit tie bug修正（旧クラスタ1）は**PR F2aで
+> 解消済み**（§13参照）——No.6,7,9がPARTIAL→READY。以下は残っている
+> クラスタのみを優先度順に並べ直したもの。
+
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
-| 1 | `vc_last_occupant`の同秒0秒visit tie bug修正 | 3件を PARTIAL→READY化（No.6,7,9） | 新規開発ではなく**既存の正確性バグ修正**。最小コストで最初にやるべき土台整備（Summary判断#9でも「production前提」と明記済み） |
-| 2 | casino completed-participation safe signal / source semantics（そのparticipationが実際にsettled/completedしたことを安全に証明できるimmutable signal——例: committed-participationとcompleted-participationを別factに分ける、成功完了後にのみ書くimmutable completion marker、または同等のsafe derived completion source） | 2件をPARTIAL→READY化（No.66,67）＋No.69のcompletion blockerを解消 | 現在のmismatchが特に目立つのはsolo/PVPで異なるwriter位置を持つため——solo 7種目は`settleSolo()`成功後に書くためcompletion=participationが成立するが、PVP経路（pvp-accept.ts等）はrunner実行前にwriterが発火する。ただし**solo/PVPのmode区別そのものは修正にならない**——両モードとも安全に「completed」を証明できるsignal/semantics自体が無いことが本質的な欠如であり、単にどちらの経路で書かれたかを区別するflagを足すだけでは、PVP側が引き続き未完了のfactを生成し得る問題は解決しない |
-| 3 | `economy_safe_peer_actions`にreversed-original除外ロジックを追加 | 1件をPARTIAL→READY化（No.58） | reversal_of追跡だけの小さい拡張——既存E2の安全設計は変えない |
-| 4 | `public_events`へのevent completion保証（status列 or 運用contractの明文化＋evidence） | 2件をPARTIAL→READY化（No.80,81） | コード変更が最小で済む可能性がある（例えば「recordFinalizedEventは必ずevent終了後に呼ぶ」という運用contractをdocs化しevidenceとして採用する設計判断でも解決し得る） |
-| 5 | VC group-size拡張（day/share/span） | 12件（No.10-21） | 既存`vc_group_size_seconds`の上に集計を足すだけ——新規persisted source不要、単一derived拡張で最大クラスタが動く |
-| 6 | `vc_social_safe`にper-day counterpart breadth集計を追加 | 3件をPARTIAL→READY化（No.23,24,25）＋No.29,30の一部も前進 | クラスタ5と同じVC derived層の拡張——日別counterpart distinct集計を追加すれば複数候補が同時に前進する |
-| 7 | `public_room_activity_safe`新設 | 7-8件（No.50-57） | 生データ（Rooms）は既にrich——titles層への昇格だけで完結し、他ドメインへの依存が無い独立クラスタ |
-| 8 | `tc_conversation_safe`/`tc_reaction_safe`新設 | 8件（No.42-49） | TC側の会話構造化は`social_activity_time_safe`（クラスタ9）とも土台を共有するため、先に着手すると時間帯クラスタの半分も前進する |
-| 9 | `social_activity_time_safe`(TC+VC)新設 | 6件（No.32-37） | クラスタ8のTC構造化と共通基盤——健康/FOMO対策でCOUNTABLE 0のまま据え置く前提は維持 |
-| 10 | `invite_retention_safe`新設 | 4件（No.76-79） | 外部勧誘圧のリスクが高いドメイン（optimizationRisk: HIGH）——実装優先度はunblock数以上に安全設計のレビュー時間を要する |
-| 11 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
-| 12 | casino table/market source新設 | 3件（No.70-72） | E4の土台（casino_activity_days）はあるが、host/guestとmarketは別データモデルの新設が必要 |
-| 13 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
-| 14 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
-| 15 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
+| 1 | casino completed-participation safe signal / source semantics（そのparticipationが実際にsettled/completedしたことを安全に証明できるimmutable signal——例: committed-participationとcompleted-participationを別factに分ける、成功完了後にのみ書くimmutable completion marker、または同等のsafe derived completion source） | 2件をPARTIAL→READY化（No.66,67）＋No.69のcompletion blockerを解消 | 現在のmismatchが特に目立つのはsolo/PVPで異なるwriter位置を持つため——solo 7種目は`settleSolo()`成功後に書くためcompletion=participationが成立するが、PVP経路（pvp-accept.ts等）はrunner実行前にwriterが発火する。ただし**solo/PVPのmode区別そのものは修正にならない**——両モードとも安全に「completed」を証明できるsignal/semantics自体が無いことが本質的な欠如であり、単にどちらの経路で書かれたかを区別するflagを足すだけでは、PVP側が引き続き未完了のfactを生成し得る問題は解決しない。**現時点での次の未解決優先度トップ** |
+| 2 | `economy_safe_peer_actions`にreversed-original除外ロジックを追加 | 1件をPARTIAL→READY化（No.58） | reversal_of追跡だけの小さい拡張——既存E2の安全設計は変えない |
+| 3 | `public_events`へのevent completion保証（status列 or 運用contractの明文化＋evidence） | 2件をPARTIAL→READY化（No.80,81） | コード変更が最小で済む可能性がある（例えば「recordFinalizedEventは必ずevent終了後に呼ぶ」という運用contractをdocs化しevidenceとして採用する設計判断でも解決し得る） |
+| 4 | VC group-size拡張（day/share/span） | 12件（No.10-21） | 既存`vc_group_size_seconds`の上に集計を足すだけ——新規persisted source不要、単一derived拡張で最大クラスタが動く |
+| 5 | `vc_social_safe`にper-day counterpart breadth集計を追加 | 3件をPARTIAL→READY化（No.23,24,25）＋No.29,30の一部も前進 | クラスタ4と同じVC derived層の拡張——日別counterpart distinct集計を追加すれば複数候補が同時に前進する |
+| 6 | `public_room_activity_safe`新設 | 7-8件（No.50-57） | 生データ（Rooms）は既にrich——titles層への昇格だけで完結し、他ドメインへの依存が無い独立クラスタ |
+| 7 | `tc_conversation_safe`/`tc_reaction_safe`新設 | 8件（No.42-49） | TC側の会話構造化は`social_activity_time_safe`（クラスタ8）とも土台を共有するため、先に着手すると時間帯クラスタの半分も前進する |
+| 8 | `social_activity_time_safe`(TC+VC)新設 | 6件（No.32-37） | クラスタ7のTC構造化と共通基盤——健康/FOMO対策でCOUNTABLE 0のまま据え置く前提は維持 |
+| 9 | `invite_retention_safe`新設 | 4件（No.76-79） | 外部勧誘圧のリスクが高いドメイン（optimizationRisk: HIGH）——実装優先度はunblock数以上に安全設計のレビュー時間を要する |
+| 10 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
+| 11 | casino table/market source新設 | 3件（No.70-72） | E4の土台（casino_activity_days）はあるが、host/guestとmarketは別データモデルの新設が必要 |
+| 12 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
+| 13 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
+| 14 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
 
-クラスタ2〜4（casino/economy/eventのsemantic mismatch解消）は、新規source
+クラスタ1〜3（casino/economy/eventのsemantic mismatch解消）は、新規source
 追加ではなく既存sourceへの**小さな追加保証**で済む可能性が高いため、
-unblock件数自体は小さくてもコストは低い——クラスタ1と合わせて「まず正確性・
-semantics面の負債を解消してから、次に大きいVC/TC/roomクラスタへ進む」
-という順序が合理的。
+unblock件数自体は小さくてもコストは低い——PR F2aで解消したtie bugと合わせて
+「まず正確性・semantics面の負債を解消してから、次に大きいVC/TC/roomクラスタへ
+進む」という順序が合理的。
 
 ## 9. editorial intent → runtime resolution（契約の食い違いの明示）
 
@@ -223,8 +230,8 @@ xlsx上の記述と、現在のruntime契約が食い違う箇所——本PRで�
 | Meta（No.92-99）のScope列: `catalog` | `MetaTitleDefinition`はruntimeでは常にglobal scope（catalogスコープの概念を持たない） | このPRでは変更しない。将来Meta titleを実際に登録する際に解決する |
 | Meta（No.92-99）のSeries/Stage: `collection_meta` stage 1..7 | `MetaTitleDefinition`はprogressionを持たない（`v2-contract.ts`の型契約） | xlsx上のstageは**editorial orderingとしてのみ**候補データに保持する（`v2-catalog-candidates.ts`の`stage`フィールド）。Meta titleをBehavior progressionへ無理に押し込まない |
 | 賭場・招待・時間帯・role-aware・generic eventも「REQUIRED」（Full-clear Manifest Contract） | 本PRではfull-clear editionそのものを一切activateしない | REQUIRED表記はcandidate上の**将来の意図**の記録であり、今すぐeditionに組み込まれるという意味ではない（§13参照） |
-| casino No.66/67/69の「正常完了する」 | `casino_activity_days`はsuccessful funded participation commitmentまでしか証明しない（§12） | catalog側semanticsは変更しない。source側にcompletion保証を追加する（follow-up、§8クラスタ2）か、catalog側の意味を正式に見直すかは将来判断 |
-| economy No.58の「reversal済取引は無効」 | `economy_safe_peer_actions`はreversalされたoriginal factを消さない（§12） | catalog側semanticsは変更しない。sourceへreversed-original除外を追加する（follow-up、§8クラスタ3） |
+| casino No.66/67/69の「正常完了する」 | `casino_activity_days`はsuccessful funded participation commitmentまでしか証明しない（§12） | catalog側semanticsは変更しない。source側にcompletion保証を追加する（follow-up、§8クラスタ1）か、catalog側の意味を正式に見直すかは将来判断 |
+| economy No.58の「reversal済取引は無効」 | `economy_safe_peer_actions`はreversalされたoriginal factを消さない（§12） | catalog側semanticsは変更しない。sourceへreversed-original除外を追加する（follow-up、§8クラスタ2） |
 | event No.80/81の「completed公式イベント」 | `public_events`にlifecycle/status列が無く、コードレベルでcompletion保証を持たない（§12） | catalog側semanticsは変更しない。運用contract（staffは必ず終了後に記録する）の明文化＋evidence追加、またはstatus列追加のどちらで解決するかは将来判断 |
 
 ## 10. Production runtimeへの非影響（固定済み）
@@ -241,8 +248,9 @@ xlsx上の記述と、現在のruntime契約が食い違う箇所——本PRで�
 - Collection Editionのactivate
 - production threshold値の決定
 - role-at-time・TC canonical conversation・public room safe source・castle_experience・invite retention・casino table/market・economy classifier・event dual-role protocol・completion保証追加等の新規実装
-- `vc_last_occupant`の同秒0秒visit tie bug修正
 - Behavior evaluatorのproduction wiring
+
+（`vc_last_occupant`の同秒0秒visit tie bug修正はPR F2aで実施済み——§13参照。）
 
 ## 12. semantic false-positive 修正記録（PR #164レビュー対応）
 
@@ -289,4 +297,76 @@ co-presenceが成立し、day2〜30はAlice1人だけと会った場合でも、
 証明できない。No.22「顔馴染み」は時間的な広がりを要求しない
 （「成立する」であって「広がる/続く」ではない）ためREADYのまま維持した。
 
-すべてのfollow-up（§8クラスタ2〜6）は本PRでは実施しない——記録のみ。
+すべてのfollow-up（§8クラスタ1〜5）はPR #164では実施しない——記録のみ。
+PR #164時点で記録していたfollow-upのうち、旧§8クラスタ1（`vc_last_
+occupant`のtie bug——現在の§8はcasino completed-participationをクラスタ1
+としており番号が異なる）は、その後PR F2aで解消した（§13）。
+
+## 13. PR F2a: `vc_last_occupant` same-second / 0-second visit tie bug修正
+
+`packages/core/src/vc/derived.ts`の`computeLastOccupant()`にあった既存の
+正確性バグを修正した——**新機能ではなくcorrectness fix**。production
+title定義・threshold・catalog activationはまだ行わない。
+
+### 13.1 バグの内容
+
+departing userの終了時刻`t`について、第三者`o`が「`t`の瞬間に在室していた
+か」を`o.startedAt <= t && o.endedAt > t`で判定していた。0秒visit
+（`o.startedAt === o.endedAt === t`）はこの条件で`false`になる——
+`endedAt > t`が`t > t`で成立しないため。
+
+counterexample:
+
+```
+Alice: [0, 100]
+Bob:   [10, 50]  observed exit
+Carol: [50, 50]  observed zero-duration visit（Bobの退出と同じ秒）
+```
+
+Carolがthird-party-presentと判定されず、Aliceに`becameLastAt=50`という
+factが成立し得た。しかし秒精度では「Bobが退出した後にCarolが来た」のか
+「Carolが来た後にBobが退出した」のか前後関係を証明できない。
+
+### 13.2 修正内容
+
+`thirdPartyPresentOrAmbiguous`判定へ、`o.startedAt === t`（departingの
+終了時刻とoの開始時刻が同一秒）の場合は無条件でambiguousとしてブロックする
+分岐を追加した。0秒visitを削除・無視するのではなく、判定対象として保持した
+まま安全側（factを作らない）へ倒す——`LogicalVisit.startKind`
+（arrival/partial_observation/unknown）によらずブロックする。
+partial_observation由来（前segmentへcoalesceできなかった孤立state_change）
+でも「その人が既に居た可能性」を否定できないため。
+
+過剰ブロックを防ぐガード: `o.startedAt === t`が成立するのは同一秒だけ——
+1秒後の0秒visit（`o.startedAt = t+1`）や別channelの0秒visitはブロック
+対象にならない（`packages/core/tests/vc-derived.test.ts`のD/Eで確認）。
+
+### 13.3 Title source boundaryへの影響
+
+`vc_last_occupant`のpayload contract（`{ facts: [{ becameLastAt,
+channelId }] }`）は変更していない。`v2-sources.ts`も変更不要——derived層
+のfixだけでreaderへ正しく反映される。
+
+### 13.4 readiness registryへの反映
+
+| No | 候補 | before | after |
+| --- | --- | --- | --- |
+| 6 | 残り火 | PARTIAL（known_bug） | READY（none） |
+| 7 | まだいる | PARTIAL（known_bug） | READY（none） |
+| 8 | 見届け人 | BLOCKED（missing_derived_source + known_bug） | BLOCKED（missing_derived_source のみ——VC channel area/categoryタクソノミー不足は別のBLOCKERとして残る） |
+| 9 | 戸締まりよろしく | PARTIAL（known_bug） | READY（none） |
+
+READY 11→14、PARTIAL 13→10、BLOCKED/META不変。known_bug blockerは
+catalog全体（Behavior 91件）から0件になった。Theme 2（場を締める）は
+READY 3・PARTIAL 0・BLOCKED 1（No.8のみ）。
+
+### 13.5 mutation self-verification
+
+- `computeLastOccupant()`の`o.startedAt === t`ガードを一時的に無効化
+  → `vc-derived.test.ts`のtest A/B/C（exact bug reproduction / subject
+  filter / partial_observation tie）が実際にfail、D/E/F（過剰ブロック
+  防止・別channel・通常系）はfailしないことを確認 → restore。
+- readiness registryのNo.6をPARTIALへ戻す → `titles-v2-catalog-readiness.
+  test.ts`の新規guardがfail → restore。
+- readiness registryのNo.8をREADYへ変える → 同guardがfail → restore。
+- すべて`git diff`クリーンな状態まで復元済み。
