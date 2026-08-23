@@ -105,8 +105,8 @@ export interface TitleSourceCodeRef {
 /**
  * `restrictedUse`が取り得る値。特定の内部専用resolverの入力としてのみ許可された
  * sourceを型として固定する（PR C2で`relationship_private_evidence`、PR E2で
- * `economy_safe_classification`、PR E4で`casino_safe_participation_classification`を
- * 追加）。値を追加するときは対応する内部resolver
+ * `economy_safe_classification`、PR E4/F2bでcasino classification、PR F2dで
+ * `public_event_safe_completion_classification`を追加）。値を追加するときは対応する内部resolver
  * （`v2-relationship-evidence.ts`/`v2-economy.ts`/`v2-casino.ts`等）を必ず作ること。
  *
  * 型unionとruntime allowlist（`assertRestrictedUseContract()`が使う）を別々に
@@ -118,6 +118,7 @@ const TITLE_RESTRICTED_USES = [
   "economy_safe_classification",
   "casino_safe_participation_classification",
   "casino_safe_completion_classification",
+  "public_event_safe_completion_classification",
 ] as const;
 export type TitleRestrictedUse = (typeof TITLE_RESTRICTED_USES)[number];
 const VALID_TITLE_RESTRICTED_USES: ReadonlySet<string> = new Set(TITLE_RESTRICTED_USES);
@@ -516,6 +517,42 @@ export const TITLE_SOURCES = {
     titleUsable: true,
     epochPolicy: { type: "point", at: "recorded_at" },
     rawUnit: "staff_confirmed_public_event_participation",
+  },
+  public_event_completions: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/public-events/service.ts",
+      needle: "INSERT INTO public_event_completions",
+    },
+    calledFrom: {
+      file: "apps/bot/src/commands/public-event-complete.ts",
+      needle: "services.publicEvents.recordCompletedEvent({",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "await handlePublicEventCompleteButton(interaction, services);",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "public_event_safe_completion_classification",
+    epochPolicy: { type: "point", at: "completed_at" },
+    rawUnit: "staff_attested_public_event_completion",
+  },
+  public_event_completed_participations: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-public-events.ts",
+      needle: "export function computeCompletedPublicEventParticipations(",
+    },
+    derivedFrom: ["public_event_participations", "public_event_completions"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "point", at: "completedAt" },
+    rawUnit: "staff_attested_completed_public_event_participation",
   },
 
   // ── Casino Safe Participation Source（PR E4）────────────────────────────────

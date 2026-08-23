@@ -715,37 +715,36 @@ const THEME_15: ManualReadinessEntry[] = [
 ];
 
 // ─────────────────────────────────────────────────────────────
-// Theme 16: イベント (No.80-84) — source: public_event_participations
+// Theme 16: イベント (No.80-84)
 // ─────────────────────────────────────────────────────────────
 const THEME_16: ManualReadinessEntry[] = [
   {
     no: 80,
-    status: "PARTIAL",
-    usableSources: ["public_event_participations"],
-    specializedResolvers: [],
-    missingCapabilities: ["event completed状態を検証するsource側の保証"],
+    status: "READY",
+    usableSources: ["public_event_completed_participations"],
+    specializedResolvers: ["computeCompletedPublicEventParticipations"],
+    missingCapabilities: [],
     evidence: [
-      { file: VC_SOURCES_FILE, symbol: "PublicEventParticipationsSourcePayload.participations" },
-      { file: EVENT_SERVICE_FILE, symbol: "public_events (no status/lifecycle column; event_date is free-text, never compared to \"now\")" },
-      { file: "apps/bot/src/commands/public-event-record.ts", symbol: "handlePublicEventRecordButton (admin-role gate only, no event-completion check)" },
+      { file: VC_SOURCES_FILE, symbol: "PublicEventCompletedParticipationsSourcePayload.participations" },
+      { file: "packages/core/src/titles/v2-public-events.ts", symbol: "computeCompletedPublicEventParticipations" },
+      { file: EVENT_SERVICE_FILE, symbol: "PublicEvents.recordCompletedEvent" },
     ],
-    notes:
-      "PR #164レビュー§4で修正: semanticSpec「completed公式イベントへ...一般参加する」はevent自体がcompleted状態にあることを要求するが、public_eventsテーブルにstatus/lifecycle列が一切無く、recordFinalizedEvent()もevent_dateを「今」と比較しない——「確定＝completed」は運営の手動判断のみに依存する運用contractであり、コードレベルの保証は無い（v2-sources.tsのbulk readerもrecorded_by/event_dateを一切読まない）。存在判定自体（participations配列に1件あるか）は変わらず機械的に正しいが、「completed」という語の保証が無いためPARTIALへ落とす。",
-    blockerKinds: ["source_semantic_mismatch"],
+    notes: "明示的なstaff completion正本と同一roster revisionへJOINされた参加factがあるかを機械判定できる。",
+    blockerKinds: ["none"],
     optimizationRisk: "MANAGED",
   },
   {
     no: 81,
-    status: "PARTIAL",
-    usableSources: ["public_event_participations"],
-    specializedResolvers: [],
-    missingCapabilities: ["event completed状態を検証するsource側の保証"],
+    status: "READY",
+    usableSources: ["public_event_completed_participations"],
+    specializedResolvers: ["computeCompletedPublicEventParticipations"],
+    missingCapabilities: [],
     evidence: [
-      { file: VC_SOURCES_FILE, symbol: "PublicEventParticipationsSourcePayload.participations" },
-      { file: EVENT_SERVICE_FILE, symbol: "public_events (no status/lifecycle column)" },
+      { file: VC_SOURCES_FILE, symbol: "PublicEventCompletedParticipationsSourcePayload.participations" },
+      { file: "packages/core/src/titles/v2-public-events.ts", symbol: "computeCompletedPublicEventParticipations" },
     ],
-    notes: "No.80と同じ理由——distinct event数自体はeventKeyから数えられるが、各eventが実際にcompletedだったことの保証が無い。",
-    blockerKinds: ["source_semantic_mismatch"],
+    notes: "completed参加factのeventKeyがimmutableな開催instance identityなのでdistinct event数を機械判定できる。",
+    blockerKinds: ["none"],
     optimizationRisk: "MANAGED",
   },
   {
@@ -753,10 +752,10 @@ const THEME_16: ManualReadinessEntry[] = [
     status: "BLOCKED",
     usableSources: [],
     specializedResolvers: [],
-    missingCapabilities: ["実event_dateのsafe payload露出", "event completed状態を検証するsource側の保証"],
+    missingCapabilities: ["実event_dateのsafe title exposure / span source"],
     evidence: [{ file: EVENT_SERVICE_FILE, symbol: "public_events.event_date (excluded from safe payload)" }],
-    notes: "recordedAtはroster確定時刻であって実event日ではない——「離れた暦期間」の判定に使うと不正確。event_date自体は正本にあるがtitle payloadへ渡していない。No.80/81と同じcompletion保証の欠如も継承する。",
-    blockerKinds: ["missing_persisted_source", "source_semantic_mismatch"],
+    notes: "completion保証は解消したが、completedAtはstaff attestation時刻で実event日ではない。「長期/離れた暦期間」にはevent_dateのsafe span sourceが必要。",
+    blockerKinds: ["missing_persisted_source"],
     optimizationRisk: "MANAGED",
   },
   {

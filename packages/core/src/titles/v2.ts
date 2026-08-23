@@ -102,6 +102,7 @@ export {
   type ConfirmedInvitesSourcePayload,
   type EconomySafePeerActionsSourcePayload,
   type PublicEventParticipationsSourcePayload,
+  type PublicEventCompletedParticipationsSourcePayload,
   type CasinoActivityDaysSourcePayload,
   type CasinoCompletedActivityDaysSourcePayload,
   type TextActiveDaysSourcePayload,

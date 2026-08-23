@@ -166,7 +166,10 @@ export {
   PublicEvents,
   PublicEventsError,
   type PublicEventRow,
+  type PublicEventCompletionSummary,
   type PublicEventsErrorCode,
+  type RecordCompletedEventInput,
+  type RecordCompletedEventResult,
   type RecordFinalizedEventInput,
   type RecordFinalizedEventResult,
 } from "./public-events/service.js";

@@ -1455,8 +1455,9 @@ casino等が共用する汎用事件録であり、公開イベント参加者�
 history**という独立したevent-ops正本（将来のevent history/UI等にも使える）。
 称号v2は、この確定rosterをsafe sourceとして読む1 consumerに過ぎない。
 
-**staff-confirmed public roster**: `public_events`（1開催instance = 1
-`event_key`）と`public_event_participations`の2 tableだけを持つ。draft/
+**staff-confirmed public roster**: E3のroster正本は`public_events`（1開催instance = 1
+`event_key`）と`public_event_participations`の2 tableだけを持つ。F2dの
+`public_event_completions`はrosterと意味を混ぜない別のcompletion正本。draft/
 participant add-remove/event finalizeという複雑なstate machineはDBへ作らない
 ——Bot UI側でpreview→confirmし、`PublicEvents.recordFinalizedEvent()`という
 単一atomic writeだけを呼ぶ。confirm前はDB mutationが0件。
@@ -1759,6 +1760,28 @@ No.58「ほんの気持ち」はsource readiness上PARTIAL→READY。ただしpo
 reversalとimmutable ownershipの整合はproduction release gateとして未決定。
 production BehaviorTitleDefinition/Bot award wiring/revocation/finality policyは
 このPRに含めない。詳細は`docs/titles-v2-catalog-readiness.md`§15参照。
+
+### F2d — Public Event Completed Participation Safe Signal
+
+E3の`recordFinalizedEvent()`と`public_event_participations`は、rosterの確定を
+表すだけでevent completionを表さない。この意味を読み替えず、別のimmutable
+`public_event_completions`正本と`PublicEvents.recordCompletedEvent()`を追加した。
+completionは`/イベント完了記録`の運営限定preview→confirmで明示attestされ、
+caller timestamp、自動historical backfill、event_dateへのbackdate、update/delete
+APIを持たない。retryは最初のaudit actor/timeを保持し、未来event date・roster無し・
+timestamp不整合・corrupt既存rowはfail-closed。
+
+Title側はraw completionをrestricted internal classificationに閉じ、同一eventKey・
+同一roster timestampでparticipantとJOINしたsafe derived source
+`public_event_completed_participations`だけをgeneric ruleへ公開する。payloadは
+`{ participations: [{ eventKey, completedAt }] }`のみ。`completedAt`はstaffが
+evidenceを確定した時刻でactual event endではないため`orderable:false`とし、
+earnedAtを主張できない。
+
+readinessはNo.80/81だけPARTIAL→READY。No.82は実event_dateのsafe span sourceが
+無いためBLOCKED、No.83/84はorganizer/staff role protocolが無いためBLOCKEDのまま。
+production title定義・threshold・award/notification配線は追加しない。詳細は
+`docs/titles-v2-catalog-readiness.md`§16参照。
 
 ## 15. PR分割
 

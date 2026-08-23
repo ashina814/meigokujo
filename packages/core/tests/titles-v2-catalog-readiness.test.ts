@@ -323,15 +323,28 @@ describe("semantic false-positive再監査（VC social breadthの時間的分布
 });
 
 describe("semantic false-positive再監査（public event completion保証）", () => {
-  it("No.80/81はpublic_eventsにstatus/lifecycle列が無くevent completedを保証できないためREADYではない", () => {
-    // public_eventsテーブルはevent_key/name/event_date/recorded_by/recorded_atのみ
-    // ——status・state・phase・completed_at等のlifecycle列は存在しない。event_dateも
-    // 「今」と比較されず、recordFinalizedEvent()呼び出しはstaffの手動判断のみに依存する。
+  it("No.80/81は明示completion正本とrosterのsafe JOINによりREADY", () => {
     for (const no of [80, 81]) {
       const entry = readinessFor(no);
-      expect(entry.status, `candidate #${no}`).not.toBe("READY");
-      expect(entry.status, `candidate #${no}`).toBe("PARTIAL");
-      expect(entry.blockerKinds, `candidate #${no}`).toContain("source_semantic_mismatch");
+      expect(entry.status, `candidate #${no}`).toBe("READY");
+      expect(entry.usableSources, `candidate #${no}`).toEqual(["public_event_completed_participations"]);
+      expect(entry.specializedResolvers, `candidate #${no}`).toEqual(["computeCompletedPublicEventParticipations"]);
+      expect(entry.missingCapabilities, `candidate #${no}`).toEqual([]);
+      expect(entry.blockerKinds, `candidate #${no}`).toEqual(["none"]);
+    }
+  });
+
+  it("No.82はcompletion mismatchだけ解消し、実event_date span source不足でBLOCKEDのまま", () => {
+    const entry = readinessFor(82);
+    expect(entry.status).toBe("BLOCKED");
+    expect(entry.usableSources).toEqual([]);
+    expect(entry.missingCapabilities).toEqual(["実event_dateのsafe title exposure / span source"]);
+    expect(entry.blockerKinds).toEqual(["missing_persisted_source"]);
+  });
+
+  it("No.83/84はorganizer/staff protocol不足のまま変更しない", () => {
+    for (const no of [83, 84]) {
+      expect(readinessFor(no)).toMatchObject({ status: "BLOCKED", blockerKinds: ["missing_event_protocol"] });
     }
   });
 });
@@ -395,10 +408,10 @@ describe("PR F2b: casino completion source追加後のreadiness", () => {
   });
 
   it("source_semantic_mismatch blockerはNo.58/66/67/69から外れ、依然残る候補にはそのまま残る", () => {
-    for (const no of [58, 66, 67]) {
+    for (const no of [58, 66, 67, 80, 81, 82]) {
       expect(readinessFor(no).blockerKinds, `candidate #${no}`).not.toContain("source_semantic_mismatch");
     }
-    for (const no of [23, 24, 25, 29, 30, 80, 81, 82]) {
+    for (const no of [23, 24, 25, 29, 30]) {
       expect(readinessFor(no).blockerKinds, `candidate #${no}`).toContain("source_semantic_mismatch");
     }
   });

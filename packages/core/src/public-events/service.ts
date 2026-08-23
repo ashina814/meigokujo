@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { jstDateStr } from "../entry/sessions.js";
 
 /**
  * 公開イベント運営ドメイン（PR E3）。
@@ -47,13 +48,41 @@ export interface RecordFinalizedEventResult {
   readonly alreadyRecorded: boolean;
 }
 
+export interface RecordCompletedEventInput {
+  readonly eventKey: string;
+  /** completionを明示確認した運営userId。audit専用でsafe source/resultへは出さない。 */
+  readonly completedBy: string;
+}
+
+export interface RecordCompletedEventResult {
+  readonly eventKey: string;
+  readonly participantCount: number;
+  readonly completedAt: number;
+  readonly alreadyRecorded: boolean;
+}
+
+/** 運営向けpreviewだけが使うread model。Title safe sourceへは接続しない。 */
+export interface PublicEventCompletionSummary {
+  readonly eventKey: string;
+  readonly name: string;
+  readonly eventDate: string;
+  readonly participantCount: number;
+}
+
 export type PublicEventsErrorCode =
   | "invalid_event_key"
   | "invalid_name"
   | "invalid_event_date"
   | "invalid_participant"
   | "empty_participants"
-  | "conflict";
+  | "conflict"
+  | "invalid_completed_by"
+  | "invalid_completion_time"
+  | "missing_event"
+  | "missing_roster"
+  | "completion_before_roster"
+  | "future_event_date"
+  | "corrupt_completion";
 
 export class PublicEventsError extends Error {
   constructor(
@@ -107,6 +136,12 @@ function assertRecordedBy(value: string): string {
   return trimmed;
 }
 
+function assertCompletedBy(value: string): string {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed) throw new PublicEventsError("invalid_completed_by", "completedBy must be a non-empty string");
+  return trimmed;
+}
+
 /** 最初の出現順を保ったままdedupeする（§17）。空/非string idはfail-closedでreject。 */
 function dedupeParticipants(userIds: readonly string[]): string[] {
   const seen = new Set<string>();
@@ -152,6 +187,17 @@ export class PublicEvents {
       );
       CREATE INDEX IF NOT EXISTS idx_public_event_participations_user
         ON public_event_participations(user_id, recorded_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_public_events_key_recorded_at
+        ON public_events(event_key, recorded_at);
+      CREATE TABLE IF NOT EXISTS public_event_completions (
+        event_key           TEXT PRIMARY KEY,
+        roster_recorded_at  INTEGER NOT NULL,
+        completed_by        TEXT NOT NULL,
+        completed_at        INTEGER NOT NULL,
+        CHECK(completed_at >= roster_recorded_at),
+        FOREIGN KEY(event_key, roster_recorded_at)
+          REFERENCES public_events(event_key, recorded_at)
+      );
     `);
   }
 
@@ -222,5 +268,85 @@ export class PublicEvents {
     run();
 
     return { eventKey, participantCount: participantUserIds.length, recordedAt, alreadyRecorded: false };
+  }
+
+  /** 保存済み正本からcompletion previewを作る。roster無しeventはfail-closed。 */
+  getEventCompletionSummary(eventKeyInput: string): PublicEventCompletionSummary {
+    const eventKey = assertEventKey(eventKeyInput);
+    const row = this.db
+      .prepare(
+        `SELECT e.name, e.event_date, COUNT(p.user_id) AS participant_count
+           FROM public_events e
+           LEFT JOIN public_event_participations p ON p.event_key = e.event_key
+          WHERE e.event_key = ?
+          GROUP BY e.event_key, e.name, e.event_date`,
+      )
+      .get(eventKey) as { name: string; event_date: string; participant_count: number } | undefined;
+    if (!row) throw new PublicEventsError("missing_event", `public event ${eventKey} does not exist`);
+    if (row.participant_count < 1) {
+      throw new PublicEventsError("missing_roster", `public event ${eventKey} has no participant roster`);
+    }
+    return { eventKey, name: row.name, eventDate: row.event_date, participantCount: row.participant_count };
+  }
+
+  /**
+   * 運営がevent終了を明示確認した時点を、rosterとは別のimmutable正本へ追記する。
+   * caller timestampは受け取らず、過去eventもevent_dateへbackdateしない。
+   */
+  recordCompletedEvent(input: RecordCompletedEventInput): RecordCompletedEventResult {
+    const eventKey = assertEventKey(input.eventKey);
+    const completedBy = assertCompletedBy(input.completedBy);
+    const event = this.db
+      .prepare(`SELECT event_date, recorded_at FROM public_events WHERE event_key = ?`)
+      .get(eventKey) as { event_date: string; recorded_at: number } | undefined;
+    if (!event) throw new PublicEventsError("missing_event", `public event ${eventKey} does not exist`);
+
+    const participantCount = (
+      this.db.prepare(`SELECT COUNT(*) AS count FROM public_event_participations WHERE event_key = ?`).get(eventKey) as {
+        count: number;
+      }
+    ).count;
+    if (participantCount < 1) {
+      throw new PublicEventsError("missing_roster", `public event ${eventKey} has no participant roster`);
+    }
+
+    const existing = this.db
+      .prepare(
+        `SELECT roster_recorded_at, completed_by, completed_at
+           FROM public_event_completions WHERE event_key = ?`,
+      )
+      .get(eventKey) as { roster_recorded_at: number; completed_by: string; completed_at: number } | undefined;
+    if (existing) {
+      if (
+        existing.roster_recorded_at !== event.recorded_at ||
+        existing.completed_at < existing.roster_recorded_at ||
+        !existing.completed_by
+      ) {
+        throw new PublicEventsError("corrupt_completion", `public event ${eventKey} has an inconsistent completion row`);
+      }
+      return { eventKey, participantCount, completedAt: existing.completed_at, alreadyRecorded: true };
+    }
+
+    const completedAt = this.clock();
+    if (!Number.isSafeInteger(completedAt) || completedAt < 0) {
+      throw new PublicEventsError("invalid_completion_time", "service clock returned an invalid completion timestamp");
+    }
+    if (completedAt < event.recorded_at) {
+      throw new PublicEventsError(
+        "completion_before_roster",
+        `public event ${eventKey} cannot be completed before its roster was recorded`,
+      );
+    }
+    if (event.event_date > jstDateStr(new Date(completedAt * 1000))) {
+      throw new PublicEventsError("future_event_date", `public event ${eventKey} has a future JST event date`);
+    }
+
+    this.db
+      .prepare(
+        `INSERT INTO public_event_completions (event_key, roster_recorded_at, completed_by, completed_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(eventKey, event.recorded_at, completedBy, completedAt);
+    return { eventKey, participantCount, completedAt, alreadyRecorded: false };
   }
 }

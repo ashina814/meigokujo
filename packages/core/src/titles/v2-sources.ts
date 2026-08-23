@@ -11,6 +11,7 @@ import { assertResolvedTitleScope, resolvedScopeEffectiveEnd, type ResolvedTitle
 import { computeSafeEconomyPeerActions, type SafePeerEconomyActionKind } from "./v2-economy.js";
 import { computeCasinoActivityDays, computeCasinoCompletedActivityDays } from "./v2-casino.js";
 import type { CasinoActivityKey } from "../casino/participation-history.js";
+import { computeCompletedPublicEventParticipations } from "./v2-public-events.js";
 
 /**
  * 称号ruleがraw DBを直接触らないようにするための、source読み込み境界。
@@ -95,6 +96,13 @@ export interface PublicEventParticipationsSourcePayload {
   }>;
 }
 
+export interface PublicEventCompletedParticipationsSourcePayload {
+  readonly participations: ReadonlyArray<{
+    readonly eventKey: string;
+    readonly completedAt: number;
+  }>;
+}
+
 /**
  * PR E4: activityKey・activityDate・occurredAtだけを公開する。participationKey・
  * operationId・session・counterpart/opponent・wager・payout・net・result・betType・
@@ -134,6 +142,7 @@ export interface TitleSourcePayloads {
   confirmed_invites: ConfirmedInvitesSourcePayload;
   economy_safe_peer_actions: EconomySafePeerActionsSourcePayload;
   public_event_participations: PublicEventParticipationsSourcePayload;
+  public_event_completed_participations: PublicEventCompletedParticipationsSourcePayload;
   casino_activity_days: CasinoActivityDaysSourcePayload;
   casino_completed_activity_days: CasinoCompletedActivityDaysSourcePayload;
 }
@@ -459,6 +468,32 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
     return { payloads, readCalls };
   },
 
+  public_event_completed_participations: (db, userIds, scope) => {
+    const payloads = new Map<string, PublicEventCompletedParticipationsSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { participations: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      const facts = computeCompletedPublicEventParticipations(
+        db,
+        { start: scope.start, end: effectiveEnd },
+        chunk,
+      );
+      const byUser = new Map<string, Array<{ eventKey: string; completedAt: number }>>();
+      for (const fact of facts) {
+        const entry = { eventKey: fact.eventKey, completedAt: fact.completedAt };
+        const list = byUser.get(fact.userId);
+        if (list) list.push(entry);
+        else byUser.set(fact.userId, [entry]);
+      }
+      for (const [userId, participations] of byUser) payloads.set(userId, { participations });
+    }
+    return { payloads, readCalls };
+  },
+
   casino_activity_days: (db, userIds, scope) => {
     const payloads = new Map<string, CasinoActivityDaysSourcePayload>();
     for (const userId of userIds) payloads.set(userId, { activityDays: [] });
@@ -548,6 +583,8 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
     BULK_SOURCE_READERS.economy_safe_peer_actions(db, [userId], scope).payloads.get(userId)!,
   public_event_participations: (db, userId, scope) =>
     BULK_SOURCE_READERS.public_event_participations(db, [userId], scope).payloads.get(userId)!,
+  public_event_completed_participations: (db, userId, scope) =>
+    BULK_SOURCE_READERS.public_event_completed_participations(db, [userId], scope).payloads.get(userId)!,
   casino_activity_days: (db, userId, scope) =>
     BULK_SOURCE_READERS.casino_activity_days(db, [userId], scope).payloads.get(userId)!,
   casino_completed_activity_days: (db, userId, scope) =>
