@@ -336,6 +336,20 @@ export const TITLE_SOURCES = {
     epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
     rawUnit: "group_size_seconds_measurement",
   },
+  vc_group_size_daily_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/vc/derived.ts",
+      needle: "export function computeGroupSizeDailySeconds(",
+    },
+    derivedFrom: ["vc_visits"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "unique_jst_group_size_trusted_seconds_measurement",
+  },
   vc_co_presence: {
     origin: "derived",
     derivedBy: {

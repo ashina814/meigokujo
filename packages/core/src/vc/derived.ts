@@ -194,17 +194,34 @@ function loadRawSegmentsForChannels(
   channelIds: readonly string[],
 ): RawSegmentRow[] {
   if (channelIds.length === 0) return [];
-  const sql = `
-    SELECT id, user_id, channel_id, parent_id, started_at, ended_at, end_quality, start_reason
-    FROM vc_segments
-    WHERE started_at < ?
-      -- loadRawSegments()と同じ0秒segment救済（arrivalの証拠を取り逃がさないため）
-      AND (ended_at IS NULL OR ended_at > ? OR (ended_at = started_at AND ended_at >= ?))
-      AND channel_id IN (${channelIds.map(() => "?").join(",")})
-    ORDER BY user_id, started_at, id
-  `;
-  return db.prepare(sql).all(window.end, window.start, window.start, ...channelIds) as RawSegmentRow[];
+  const uniqueChannelIds = [...new Set(channelIds)];
+  const rows: RawSegmentRow[] = [];
+  for (let i = 0; i < uniqueChannelIds.length; i += VC_CHANNEL_QUERY_CHUNK_SIZE) {
+    const chunk = uniqueChannelIds.slice(i, i + VC_CHANNEL_QUERY_CHUNK_SIZE);
+    const sql = `
+      SELECT id, user_id, channel_id, parent_id, started_at, ended_at, end_quality, start_reason
+      FROM vc_segments
+      WHERE started_at < ?
+        -- loadRawSegments()と同じ0秒segment救済（arrivalの証拠を取り逃がさないため）
+        AND (ended_at IS NULL OR ended_at > ? OR (ended_at = started_at AND ended_at >= ?))
+        AND channel_id IN (${chunk.map(() => "?").join(",")})
+      ORDER BY user_id, started_at, id
+    `;
+    rows.push(...(db.prepare(sql).all(window.end, window.start, window.start, ...chunk) as RawSegmentRow[]));
+  }
+
+  // chunkごとのORDER BYだけではcoalesceVisits()の前提を満たさない。全chunkをmergeした後に
+  // user_id → started_at → idのcode-unit/数値順へ戻し、非chunk版と同じ意味を保つ。
+  rows.sort((a, b) => {
+    if (a.user_id < b.user_id) return -1;
+    if (a.user_id > b.user_id) return 1;
+    return a.started_at - b.started_at || a.id - b.id;
+  });
+  return rows;
 }
+
+/** SQLite bind上限へ近づく巨大なchannel IN句を作らない。 */
+const VC_CHANNEL_QUERY_CHUNK_SIZE = 300;
 
 /**
  * rowから直接logical visitsを合成する。呼び出し側は既に必要な行をロード済みという前提。
@@ -536,6 +553,27 @@ export interface GroupSizeSeconds {
   untrustedSeconds: number;
 }
 
+export interface GroupSizeDailySeconds {
+  userId: string;
+  days: Array<{
+    /** JST暦日（YYYY-MM-DD）。 */
+    date: string;
+    trustedSecondsByBucket: Record<OccupancyBucket, number>;
+  }>;
+}
+
+interface TrustedGroupSizeSlice {
+  start: number;
+  end: number;
+  bucket: OccupancyBucket;
+}
+
+interface GroupSizeTimeline {
+  userId: string;
+  trustedSlices: TrustedGroupSizeSlice[];
+  untrustedSeconds: number;
+}
+
 function bucketFor(occupancy: number): OccupancyBucket {
   if (occupancy <= 1) return "solo";
   if (occupancy === 2) return "oneToOne";
@@ -553,12 +591,11 @@ function bucketFor(occupancy: number): OccupancyBucket {
  * そのため、そのような他者が現れて以降のsubject残り区間は bucket化せず untrustedSeconds へ
  * 計上する（trustedと名乗る数字に、実は信頼できない他者由来の人数を混ぜない）。
  */
-export function computeGroupSizeSeconds(
+function computeGroupSizeTimelineResolved(
   db: Database.Database,
-  window: TitleWindow,
+  resolved: ResolvedWindow,
   userIds?: readonly string[],
-): GroupSizeSeconds[] {
-  const resolved = resolveWindow(window);
+): GroupSizeTimeline[] {
   const subjectVisits = computeLogicalVisitsResolved(db, resolved, userIds);
   if (subjectVisits.length === 0) return [];
 
@@ -567,13 +604,13 @@ export function computeGroupSizeSeconds(
   const allVisits = coalesceVisits(allRows, resolved);
   const byChannel = groupByChannel(allVisits);
 
-  const results = new Map<string, GroupSizeSeconds>();
-  const ensure = (userId: string): GroupSizeSeconds => {
+  const results = new Map<string, GroupSizeTimeline>();
+  const ensure = (userId: string): GroupSizeTimeline => {
     let r = results.get(userId);
     if (!r) {
       r = {
         userId,
-        trustedSecondsByBucket: { solo: 0, oneToOne: 0, smallGroup: 0, largeGroup: 0 },
+        trustedSlices: [],
         untrustedSeconds: 0,
       };
       results.set(userId, r);
@@ -624,11 +661,61 @@ export function computeGroupSizeSeconds(
       // channelVisits は subject自身の写しも含む（同一channelの全visitを取得しているため）。
       // subjectの訪問区間内なので occupancy は常に1以上になる。
       const occupancy = channelVisits.filter((v) => v.startedAt <= sliceStart && v.endedAt > sliceStart).length;
-      r.trustedSecondsByBucket[bucketFor(occupancy)] += sliceEnd - sliceStart;
+      r.trustedSlices.push({ start: sliceStart, end: sliceEnd, bucket: bucketFor(occupancy) });
     }
   }
 
   return [...results.values()];
+}
+
+export function computeGroupSizeSeconds(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): GroupSizeSeconds[] {
+  return computeGroupSizeTimelineResolved(db, resolveWindow(window), userIds).map((timeline) => {
+    const trustedSecondsByBucket: Record<OccupancyBucket, number> = {
+      solo: 0,
+      oneToOne: 0,
+      smallGroup: 0,
+      largeGroup: 0,
+    };
+    for (const slice of timeline.trustedSlices) {
+      trustedSecondsByBucket[slice.bucket] += slice.end - slice.start;
+    }
+    return { userId: timeline.userId, trustedSecondsByBucket, untrustedSeconds: timeline.untrustedSeconds };
+  });
+}
+
+/**
+ * canonical trusted group-size sliceをJST暦日へだけ分割するthreshold-neutral source。
+ * active-day/share/span/streak等の判定値はここでは選ばず、日付と4bucket秒だけを返す。
+ */
+export function computeGroupSizeDailySeconds(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): GroupSizeDailySeconds[] {
+  return computeGroupSizeTimelineResolved(db, resolveWindow(window), userIds).map((timeline) => {
+    const byDate = new Map<string, Record<OccupancyBucket, number>>();
+    for (const slice of timeline.trustedSlices) {
+      for (const part of splitIntervalByJstDay(slice.start, slice.end)) {
+        let buckets = byDate.get(part.date);
+        if (!buckets) {
+          buckets = { solo: 0, oneToOne: 0, smallGroup: 0, largeGroup: 0 };
+          byDate.set(part.date, buckets);
+        }
+        buckets[slice.bucket] += part.seconds;
+      }
+    }
+    return {
+      userId: timeline.userId,
+      days: [...byDate].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([date, trustedSecondsByBucket]) => ({
+        date,
+        trustedSecondsByBucket,
+      })),
+    };
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -656,6 +743,26 @@ function jstDayStartUnix(dateStr: string): number {
   return Math.floor(new Date(`${dateStr}T00:00:00+09:00`).getTime() / 1000);
 }
 
+function splitIntervalByJstDay(startedAt: number, endedAt: number): Array<{ date: string; seconds: number }> {
+  const parts: Array<{ date: string; seconds: number }> = [];
+  let cursor = startedAt;
+  let guard = 0;
+  const SANITY_LIMIT_DAYS = 365 * 100;
+  while (cursor < endedAt) {
+    if (guard >= SANITY_LIMIT_DAYS) {
+      throw new RangeError(
+        `splitIntervalByJstDay: interval [${startedAt}, ${endedAt}) spans more than ${SANITY_LIMIT_DAYS} days — likely a bug, not a legitimate title window`,
+      );
+    }
+    const date = jstDateOf(cursor);
+    const partEnd = Math.min(endedAt, jstDayStartUnix(date) + 86_400);
+    parts.push({ date, seconds: partEnd - cursor });
+    cursor = partEnd;
+    guard += 1;
+  }
+  return parts;
+}
+
 /**
  * [startedAt, endedAt) が触れるdistinct JST暦日を列挙する。秒単位では舐めず、日境界だけ進む。
  *
@@ -666,22 +773,7 @@ function jstDayStartUnix(dateStr: string): number {
  * 長さ（100年超）だけを実装バグの兆候として明示的に落とす。
  */
 function jstDatesInInterval(startedAt: number, endedAt: number): string[] {
-  const days: string[] = [];
-  let cursor = startedAt;
-  let guard = 0;
-  const SANITY_LIMIT_DAYS = 365 * 100;
-  while (cursor < endedAt) {
-    if (guard >= SANITY_LIMIT_DAYS) {
-      throw new RangeError(
-        `jstDatesInInterval: interval [${startedAt}, ${endedAt}) spans more than ${SANITY_LIMIT_DAYS} days — likely a bug, not a legitimate title window`,
-      );
-    }
-    const dateStr = jstDateOf(cursor);
-    days.push(dateStr);
-    cursor = jstDayStartUnix(dateStr) + 86_400;
-    guard += 1;
-  }
-  return days;
+  return splitIntervalByJstDay(startedAt, endedAt).map((part) => part.date);
 }
 
 /**

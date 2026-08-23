@@ -66,12 +66,14 @@ export {
 // はcounterpart identityを含まないsafe aggregateなので引き続き公開する。
 export {
   computeEmptyStartThenJoined,
+  computeGroupSizeDailySeconds,
   computeGroupSizeSeconds,
   computeLastOccupant,
   computeLogicalVisits,
   computeSafeSocialAggregates,
   isTrustedVisitEnd,
   type EmptyStartThenJoinedFact,
+  type GroupSizeDailySeconds,
   type GroupSizeSeconds,
   type LastOccupantFact,
   type LogicalVisit,
@@ -108,6 +110,7 @@ export {
   type TextActiveDaysSourcePayload,
   type TitleSourcePayloads,
   type VcEmptyStartThenJoinedSourcePayload,
+  type VcGroupSizeDailySafeSourcePayload,
   type VcGroupSizeSecondsSourcePayload,
   type VcLastOccupantSourcePayload,
   type VcSocialSafeSourcePayload,

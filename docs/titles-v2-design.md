@@ -94,6 +94,9 @@ derived sourceを使う。
 - `vc_last_occupant`: occupancyが2以上から1に減り、subjectだけが残った瞬間
   （相手のidentityは含まない）
 - `vc_group_size_seconds`: solo/1:1/小人数/大人数の帯ごとの滞在秒数
+- `vc_group_size_daily_safe`: 同じcanonical trusted sliceをJST暦日ごとに分割した
+  solo/1:1/小人数/大人数のaggregate秒数。threshold/share denominatorは含めず、
+  counterpart/channel/個別visit境界/exact occupancyを公開しない
 - `vc_co_presence`: pairwiseの重なり（`privacy: restricted`。相手のuserIdを含むため
   称号から直接は使わせない）
 - `vc_social_safe`: `vc_co_presence` を畳み込んだ、本人単位の安全な集計（`vc_co_presence`
@@ -911,6 +914,7 @@ audit・output minimizationを設計する。「DBにあるからそのまま返
 endExclusive, observedAt)`）——N人 × M ruleが同じ(source, semantic scope)を
 共有していても、そのままではN回derived計算が走る。VC derived関数
 （`computeEmptyStartThenJoined`/`computeLastOccupant`/`computeGroupSizeSeconds`/
+`computeGroupSizeDailySeconds`/
 `computeSafeSocialAggregates`）は元々`userIds?: readonly string[]`でbulk計算
 できる——このPRは、その既存能力をcache層まで持ち上げる**読み取り専用の最適化
 plannerを追加するだけ**。Bot/scheduler配線・production catalog・新source・
@@ -936,7 +940,7 @@ exhaustiveness（新しいtitleUsable sourceを追加してbulk readerを足し�
 [userId], scope).get(userId)!`へ委譲する薄いwrapperに書き換えた。single/bulkの
 semanticsを別々に実装して片方だけ将来修正される事故を、実装を1本化することで
 構造的に防ぐ。`bump_events`は`WHERE user_id IN (...) AND created_at >= ? AND
-created_at < ? ORDER BY user_id, created_at`のchunked SQLで直接読む。4つのVC
+created_at < ? ORDER BY user_id, created_at`のchunked SQLで直接読む。VC
 sourceは既存derived関数のbulk引数へそのまま委譲する——第三者/相手ユーザーの
 context読み込み（occupancy/co-presence計算に必要）はderived関数内部で行われ
 続けるが、**cacheへ書き込むのは明示的に要求したsubject userのentryだけ**
@@ -952,6 +956,12 @@ scope.start`）はVC derived関数（`clampWindow()`が`RangeError`を投げる�
 `BULK_USER_CHUNK_SIZE`（300）単位でchunkし、1000人以上のuserでも単一の巨大
 `IN (...)`を作らない。chunkは`prefetch()`側からは見えない実装詳細
 ——呼び出し側は「1回のbulk読み込み」として扱ってよい。
+
+VC derivedがsubjectのhistorical channel群から同室者contextを読む経路も同様に
+boundedでなければならない。`loadRawSegmentsForChannels()`はdistinct channel IDを
+`VC_CHANNEL_QUERY_CHUNK_SIZE`（300）でchunkし、各queryをwindow 3 bind＋channel
+最大300 bindへ制限する。chunk結果は必ず`user_id ASC, started_at ASC, id ASC`へ
+global sortしてからcoalesceする——queryごとの局所`ORDER BY`だけでは不十分。
 
 **`TitleSourceCache.prefetch(db, sourceKey, userIds, scope)`**: 唯一の書き込み
 経路。callerが任意payloadをcacheへ注入できるAPI（`set`/`seed`/
@@ -1782,6 +1792,24 @@ readinessはNo.80/81だけPARTIAL→READY。No.82は実event_dateのsafe span so
 無いためBLOCKED、No.83/84はorganizer/staff role protocolが無いためBLOCKEDのまま。
 production title定義・threshold・award/notification配線は追加しない。詳細は
 `docs/titles-v2-catalog-readiness.md`§16参照。
+
+### F2e — VC Group-Size Daily Safe Aggregates
+
+`computeGroupSizeSeconds()`のtrust/occupancyロジックをmodule-privateなcanonical
+timelineへ切り出し、既存whole-window resolverと新しい
+`computeGroupSizeDailySeconds()`が同じtrusted `{start,end,bucket}` sliceを消費する。
+daily resolverはsliceをJST 00:00でだけ分割し、date昇順の
+`{ date, trustedSecondsByBucket: { solo, oneToOne, smallGroup, largeGroup } }`
+を返す。daily合計と既存whole-window trusted合計の保存則を全bucketで固定し、
+既存`vc_group_size_seconds` payload/untrusted semanticsは変更していない。
+
+`vc_group_size_daily_safe`は`privacy:"safe"`, `titleUsable:true`,
+`orderable:false`。untrusted-only dayやcounterpart/channel/raw visit情報を公開せず、
+active-day/share/sample/span/streak/skewのthresholdもshare denominatorも決めない。
+No.10-21はこの日別4bucketから必要な分布を後段評価できるためSOURCE READYへ更新したが、
+production BehaviorTitleDefinition、threshold、Bot award wiringは追加しない。
+historical channel context queryも300-ID chunk＋merge後global sortへ変更し、長期catalog
+windowで単一巨大`IN`句を作らない。詳細は`docs/titles-v2-catalog-readiness.md`§17参照。
 
 ## 15. PR分割
 

@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import {
   computeEmptyStartThenJoined,
+  computeGroupSizeDailySeconds,
   computeGroupSizeSeconds,
   computeLastOccupant,
   computeSafeSocialAggregates,
@@ -51,6 +52,13 @@ export interface VcLastOccupantSourcePayload {
 export interface VcGroupSizeSecondsSourcePayload {
   readonly trustedSecondsByBucket: Readonly<Record<OccupancyBucket, number>>;
   readonly untrustedSeconds: number;
+}
+
+export interface VcGroupSizeDailySafeSourcePayload {
+  readonly days: ReadonlyArray<{
+    readonly date: string;
+    readonly trustedSecondsByBucket: Readonly<Record<OccupancyBucket, number>>;
+  }>;
 }
 
 export interface VcSocialSafeSourcePayload {
@@ -137,6 +145,7 @@ export interface TitleSourcePayloads {
   vc_empty_start_then_joined: VcEmptyStartThenJoinedSourcePayload;
   vc_last_occupant: VcLastOccupantSourcePayload;
   vc_group_size_seconds: VcGroupSizeSecondsSourcePayload;
+  vc_group_size_daily_safe: VcGroupSizeDailySafeSourcePayload;
   vc_social_safe: VcSocialSafeSourcePayload;
   text_active_days: TextActiveDaysSourcePayload;
   confirmed_invites: ConfirmedInvitesSourcePayload;
@@ -213,6 +222,7 @@ const EMPTY_GROUP_SIZE_PAYLOAD: VcGroupSizeSecondsSourcePayload = {
   trustedSecondsByBucket: { solo: 0, oneToOne: 0, smallGroup: 0, largeGroup: 0 },
   untrustedSeconds: 0,
 };
+const EMPTY_GROUP_SIZE_DAILY_PAYLOAD: VcGroupSizeDailySafeSourcePayload = { days: [] };
 const EMPTY_SOCIAL_SAFE_PAYLOAD: VcSocialSafeSourcePayload = {
   distinctCoPresentUsers: 0,
   maxRepeatedDaysWithOneCounterpart: 0,
@@ -328,6 +338,24 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
       for (const row of rows) {
         payloads.set(row.userId, { trustedSecondsByBucket: row.trustedSecondsByBucket, untrustedSeconds: row.untrustedSeconds });
       }
+    }
+    return { payloads, readCalls };
+  },
+
+  vc_group_size_daily_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, VcGroupSizeDailySafeSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, EMPTY_GROUP_SIZE_DAILY_PAYLOAD);
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return { payloads, readCalls: 0 };
+    const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
+
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      const rows = computeGroupSizeDailySeconds(db, window, chunk);
+      for (const row of rows) payloads.set(row.userId, { days: row.days });
     }
     return { payloads, readCalls };
   },
@@ -576,6 +604,8 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
   vc_last_occupant: (db, userId, scope) => BULK_SOURCE_READERS.vc_last_occupant(db, [userId], scope).payloads.get(userId)!,
   vc_group_size_seconds: (db, userId, scope) =>
     BULK_SOURCE_READERS.vc_group_size_seconds(db, [userId], scope).payloads.get(userId)!,
+  vc_group_size_daily_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.vc_group_size_daily_safe(db, [userId], scope).payloads.get(userId)!,
   vc_social_safe: (db, userId, scope) => BULK_SOURCE_READERS.vc_social_safe(db, [userId], scope).payloads.get(userId)!,
   text_active_days: (db, userId, scope) => BULK_SOURCE_READERS.text_active_days(db, [userId], scope).payloads.get(userId)!,
   confirmed_invites: (db, userId, scope) => BULK_SOURCE_READERS.confirmed_invites(db, [userId], scope).payloads.get(userId)!,

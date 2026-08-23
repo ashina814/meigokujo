@@ -322,6 +322,40 @@ describe("semantic false-positive再監査（VC social breadthの時間的分布
   });
 });
 
+describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
+  it("No.10-21は全件daily 4bucketから日数/share/span/streakを後段評価できるためREADY", () => {
+    for (let no = 10; no <= 21; no++) {
+      const entry = readinessFor(no);
+      expect(entry.status, `candidate #${no}`).toBe("READY");
+      expect(entry.usableSources, `candidate #${no}`).toEqual(["vc_group_size_daily_safe"]);
+      expect(entry.specializedResolvers, `candidate #${no}`).toEqual(["computeGroupSizeDailySeconds"]);
+      expect(entry.missingCapabilities, `candidate #${no}`).toEqual([]);
+      expect(entry.blockerKinds, `candidate #${no}`).toEqual(["none"]);
+      expect(entry.thresholdCategory, `candidate #${no}`).toBe("THRESHOLD_PENDING");
+    }
+  });
+
+  it("registry実集計はREADY 31 / PARTIAL 5 / BLOCKED 55 / META 8", () => {
+    const counts = new Map<string, number>();
+    for (const entry of TITLE_V2_CATALOG_READINESS) counts.set(entry.status, (counts.get(entry.status) ?? 0) + 1);
+    expect(Object.fromEntries(counts)).toEqual({ READY: 31, BLOCKED: 55, PARTIAL: 5, META: 8 });
+  });
+
+  it("missing_derived_sourceはNo.10-21の解消で24から12へ減る", () => {
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(12);
+  });
+
+  it("Theme 3-6は各3件すべてREADY", () => {
+    for (const [start, end] of [[10, 12], [13, 15], [16, 18], [19, 21]] as const) {
+      expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.no >= start && entry.no <= end).map((entry) => entry.status)).toEqual([
+        "READY",
+        "READY",
+        "READY",
+      ]);
+    }
+  });
+});
+
 describe("semantic false-positive再監査（public event completion保証）", () => {
   it("No.80/81は明示completion正本とrosterのsafe JOINによりREADY", () => {
     for (const no of [80, 81]) {
