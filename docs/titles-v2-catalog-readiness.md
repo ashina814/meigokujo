@@ -242,13 +242,14 @@ sourceReadinessとthresholdは別軸——READY 17件のうち、STRUCTURAL_FIXE
 | 10 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
 | 11 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
 | 12 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
-| 14 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
+| 13 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
 
-クラスタ1〜2（economy/eventのsemantic mismatch解消）は、新規source
-追加ではなく既存sourceへの**小さな追加保証**で済む可能性が高いため、
-unblock件数自体は小さくてもコストは低い——PR F2a/F2bで解消したtie bugと
-casino completion mismatchと合わせて「まず正確性・semantics面の負債を
-解消してから、次に大きいVC/TC/roomクラスタへ進む」という順序が合理的。
+クラスタ1のevent completion保証は、既存event sourceへの追加保証で済む
+可能性が高いため、まず残るsemantic mismatchを解消する。その後は、
+単一derived拡張で最大12件を動かせるクラスタ2のVC group-size
+day/share/span拡張へ進むのが自然。F2a/F2b/F2cで既存sourceの
+正確性・semantic debtを先に減らしてきた方針を維持しつつ、
+ここから大きいVC/TC/roomクラスタへ移る。
 
 ## 9. editorial intent → runtime resolution（契約の食い違いの明示）
 
