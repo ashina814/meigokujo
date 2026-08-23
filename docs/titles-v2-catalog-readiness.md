@@ -71,6 +71,13 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > No.31のpair persistence不足は解消していない。threshold・production title・
 > Bot wiringも追加していない。詳細は§18参照。
 
+> **PR F2g反映（2026-08-23）**: `rooms` lifecycle metadataとcanonical
+> `vc_visits`を交差する`public_room_activity_safe`を追加した。公開kindは
+> `normal`/`game`だけで、privateな`mitsugetsu`/`oborozuki`は除外する。
+> No.50-56がBLOCKED→READY、READY 34→41、BLOCKED 55→48。No.57はroom
+> activity側だけ解消し、role-at-timeとtemporal cross-reference待ちでBLOCKEDを
+> 維持する。threshold・production title・Bot wiringは追加していない。§19参照。
+
 ## 0. xlsx canonical hash（exact drift guard）
 
 | 項目 | 値 |
@@ -118,13 +125,13 @@ full-clear editionに登録されたREQUIRED印100%——NONCOUNTの91 behavior�
 
 | status | 件数 | 意味 |
 | --- | --- | --- |
-| READY | 34 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
+| READY | 41 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
 | PARTIAL | 2 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
-| BLOCKED | 55 | 意味的に近いものが repo に一切存在しない |
+| BLOCKED | 48 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
 | META | 8 | kind:meta（別bucket、§7参照） |
 
 **READY = 今すぐreleaseしてよい、ではない**。sourceReadinessとthreshold決定は
-別軸（§10参照）——READY 34件も、production threshold値（分布TBD等）が
+別軸（§10参照）——READY 41件も、production threshold値（分布TBD等）が
 決まるまではrelease対象にならない。またSeries manifest／Collection Edition／
 Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）。No.58はさらに、
 award後のreversalを既存immutable ownershipへどう反映するかが未決定であるため、
@@ -134,7 +141,7 @@ source-readyでもproduction release不可（§15）。
 
 | blockerKind | 件数 | 意味 |
 | --- | --- | --- |
-| missing_persisted_source | 32 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
+| missing_persisted_source | 24 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
 | missing_derived_source | 12 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
 | missing_manifest | 9 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
 | missing_role_history | 7 | role-at-time（過去のある時点でどのroleを保持していたか）がrepo全体で未実装 |
@@ -142,7 +149,7 @@ source-readyでもproduction release不可（§15）。
 | missing_event_protocol | 2 | イベントデータモデル自体にorganizer/staff区別が存在しない |
 | known_bug | 0 | PR F2aで`computeLastOccupant()`のsame-second/0-second visit tie bugを修正——catalog全体から解消済み（§13参照） |
 
-（`none`のBehavior候補は34件——ちょうどREADY件数と一致。PARTIAL 2件は
+（`none`のBehavior候補は41件——ちょうどREADY件数と一致。PARTIAL 2件は
 すべて`source_semantic_mismatch`を持つ。）
 
 ## 4. Theme別 readiness
@@ -160,7 +167,7 @@ source-readyでもproduction release不可（§15）。
 | 9 | 時間帯・生活痕 | 6 | 0 | 0 | 6 |
 | 10 | BUMP / 鐘 | 4 | 4 | 0 | 0 |
 | 11 | TC交流 | 8 | 0 | 0 | 8 |
-| 12 | 公開部屋 | 8 | 0 | 0 | 8 |
+| 12 | 公開部屋 | 8 | 7 | 0 | 1 |
 | 13 | Land・経済 | 8 | 1 | 0 | 7 |
 | 14 | 賭場 | 8 | 3 | 0 | 5 |
 | 15 | 招待 | 6 | 2 | 0 | 4 |
@@ -168,12 +175,13 @@ source-readyでもproduction release不可（§15）。
 | 17 | 城横断 | 7 | 0 | 0 | 7 |
 
 BUMP/鐘とVC人数帯Theme 3-6が100% READY（後者はPR F2eのJST日別4bucket
-trusted secondsで日数/share/span/streakを後段評価できるため）。TC交流・公開部屋・城横断は0% READY——
+trusted secondsで日数/share/span/streakを後段評価できるため）。公開部屋はF2gで
+7/8件がSOURCE READYとなり、No.57だけrole-at-time待ち。TC交流・城横断は0% READY——
 いずれも「titles層に一切source registrationが無い」ドメイン。
 
 ## 5. source別に残る実装（READYを支えるsource／PARTIALの制約／BLOCKEDが必要とするもの）
 
-READYを支えている既存`titleUsable:true` source（10種、34件）:
+READYを支えている既存`titleUsable:true` source（11種、41件）:
 
 - `vc_empty_start_then_joined`（No.1-2）
 - `vc_last_occupant`（No.6, 7, 9——PR F2aでsame-second/0-second visit tie bugを修正済み、§13参照）
@@ -185,6 +193,7 @@ READYを支えている既存`titleUsable:true` source（10種、34件）:
 - `confirmed_invites`（No.74-75 のみ——`invitee_id UNIQUE`によりdistinct数が保証される）
 - `economy_safe_peer_actions`（No.58——snapshot時点でreverse済みoriginalを除外、§15参照）
 - `public_event_completed_participations`（No.80-81——明示staff completion正本と同一roster revisionへJOIN、§16参照）
+- `public_room_activity_safe`（No.50-56——room lifecycleとtrusted logical VC visitの交差をidentityなしでhosted/guest/ownUseへ集計、§19参照）
 
 PARTIALを止めているもの（source_semantic_mismatch、§12/§14で今回のレビューにより判定）:
 
@@ -198,7 +207,6 @@ No.80/81はREADY、No.82はevent-date span source不足のみ残る。§14-16参
 BLOCKEDが新たに必要とするもの（xlsxのSource_Map original「未実装」から、
 E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 
-- **`public_room_activity_safe`新設**—— No.50-57（8件、うちNo.57はrole-at-timeも必要）。Rooms自体の生データ（`rooms`/`recruits`/`oborozuki_invites`）はrichだが、titles層への昇格作業が0
 - **`tc_conversation_safe`/`tc_reaction_safe`新設**—— No.42-49（8件）。`text_active_days`は「その日1回でも投稿があったか」の二値のみで、会話単位・沈黙復活・reactionのいずれも構造化されていない
 - **`social_activity_time_safe`(TC+VC daypart)新設**—— No.32-37（6件）
 - **`invite_retention_safe`新設**—— No.76-79（4件、うち2件はさらにnetwork-graph derivedも必要）。retentionは repo全体でgrep 0件——スタブすら無い
@@ -221,7 +229,7 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 | STRUCTURAL_PLUS_DISTRIBUTION | 1 | 構造は決まるが、一部の値は分布依存 |
 | META_NOT_APPLICABLE | 8 | meta（別contract、§10適用外） |
 
-sourceReadinessとthresholdは別軸——READY 34件のうち、STRUCTURAL_FIXEDなのは
+sourceReadinessとthresholdは別軸——READY 41件のうち、STRUCTURAL_FIXEDなのは
 一部（初回系）のみで、残りはTHRESHOLD_PENDINGのままREADYになっている
 （sourceは十分だが実数値は分布を見てから決める）。
 
@@ -238,7 +246,7 @@ sourceReadinessとthresholdは別軸——READY 34件のうち、STRUCTURAL_FIXE
 ## 8. 次に何を実装すれば最も多くのcandidateがunblockされるか
 
 単純なunblock件数だけでなく、安全性・基盤依存・実装順序も考慮した優先順位。
-`missing_persisted_source`単独が理由の候補が28件、`missing_derived_source`
+`missing_persisted_source`単独が理由の候補が21件、`missing_derived_source`
 単独が9件、`source_semantic_mismatch`単独が2件——新規sourceを1つ作る、
 または既存sourceのsemanticsを正すごとに複数candidateが同時に動く
 「クラスタ」が明確に存在する。
@@ -253,27 +261,26 @@ sourceReadinessとthresholdは別軸——READY 34件のうち、STRUCTURAL_FIXE
 > event-date span blockerのみ残る。VC group-size day/share/span拡張も
 > **PR F2eで解消済み**（§17参照）——No.10-21がBLOCKED→READY。
 > VC social breadthのJST日次分布も**PR F2fで解消済み**（§18参照）——
-> No.23-25がPARTIAL→READY。
+> No.23-25がPARTIAL→READY。公開部屋の実利用safe aggregateも**PR F2gで
+> 解消済み**（§19参照）——No.50-56がBLOCKED→READY、No.57はrole-at-time
+> blockerのみ残る。
 > 以下は残っているクラスタのみを優先度順に並べ直したもの。
 
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
-| 1 | `public_room_activity_safe`新設 | 7-8件（No.50-57） | 生データ（Rooms）は既にrich——titles層への昇格だけで完結し、他ドメインへの依存が無い独立クラスタ |
-| 2 | `tc_conversation_safe`/`tc_reaction_safe`新設 | 8件（No.42-49） | TC側の会話構造化は`social_activity_time_safe`（クラスタ3）とも土台を共有するため、先に着手すると時間帯クラスタの半分も前進する |
-| 3 | `social_activity_time_safe`(TC+VC)新設 | 6件（No.32-37） | クラスタ2のTC構造化と共通基盤——健康/FOMO対策でCOUNTABLE 0のまま据え置く前提は維持 |
-| 4 | `invite_retention_safe`新設 | 4件（No.76-79） | 外部勧誘圧のリスクが高いドメイン（optimizationRisk: HIGH）——実装優先度はunblock数以上に安全設計のレビュー時間を要する |
-| 5 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
-| 6 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
-| 7 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
-| 8 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
-| 9 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
-| 10 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
+| 1 | `tc_conversation_safe`/`tc_reaction_safe`新設 | 8件（No.42-49） | TC側の会話構造化は`social_activity_time_safe`（クラスタ2）とも土台を共有するため、先に着手すると時間帯クラスタの半分も前進する |
+| 2 | `social_activity_time_safe`(TC+VC)新設 | 6件（No.32-37） | クラスタ1のTC構造化と共通基盤——健康/FOMO対策でCOUNTABLE 0のまま据え置く前提は維持 |
+| 3 | `invite_retention_safe`新設 | 4件（No.76-79） | 外部勧誘圧のリスクが高いドメイン（optimizationRisk: HIGH）——実装優先度はunblock数以上に安全設計のレビュー時間を要する |
+| 4 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
+| 5 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
+| 6 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
+| 7 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
+| 8 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
+| 9 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
 
-VC group-size clusterはF2e、VC social breadth clusterはF2fで解消した。
-次は、生データが既にrichでtitles層への安全な昇格が中心となるクラスタ1の
-`public_room_activity_safe`へ進むのが自然。その後は共通基盤を持つ大きい
-TC/時間帯クラスタへ移り、F2a-F2fでsourceの正確性・semantic debtを先に
-減らしてきた方針を維持する。
+VC group-size clusterはF2e、VC social breadth clusterはF2f、公開部屋clusterは
+F2gで解消した。次は、共通基盤を持つ大きいTC/時間帯クラスタへ移るのが自然。
+F2a-F2gでsourceの正確性・semantic debtを先に減らしてきた方針を維持する。
 
 ## 9. editorial intent → runtime resolution（契約の食い違いの明示）
 
@@ -806,3 +813,52 @@ No.31はpair persistence source不足でBLOCKEDのまま。missingCapabilities�
 META 8は不変。`source_semantic_mismatch`は5→2、`missing_derived_source`は12のまま。
 Theme 7はREADY 4 / PARTIAL 0 / BLOCKED 2、Theme 8はREADY 1 / PARTIAL 2 /
 BLOCKED 1。
+
+## 19. PR F2g: Public Room Activity Safe Source
+
+### 19.1 source境界と実利用
+
+`rooms`単体はroom session metadata/lifecycleの正本であり、一般guest履歴は持たない。
+`recruits.matched_user_id`と`oborozuki_invites`はprivate機能固有で、公開部屋guestの
+推論には使わない。F2gは新しい監視・writer・tableを追加せず、raw restricted source
+`rooms`と既存canonical `vc_visits`を`computePublicRoomActivitySafe()`で交差する。
+
+eligible kindは`normal`/`game`のexact allowlist。`mitsugetsu`/`oborozuki`はprivate
+permission semanticsのため完全除外する。有効利用はroom intervalとtrusted positive
+logical visitの交差だけで、room作成・`activated_at`・0秒intersection・
+`recovered_estimate`はevidenceにならない。untrusted visitや重複room attributionの
+曖昧時間帯だけを局所的に除外し、同日・同roomの別trusted activityは保持する。
+
+room intervalは`created_at`から、`effectiveEnd`、snapshot内のcanonical `closed_at`、
+gameのpaid validity上限`expires_at`の最小まで。`closed_at > observedAt`はhistorical
+snapshotではまだopenとして扱う。ownerがその瞬間VCにいることはhosted/guest双方の
+追加条件にしない。ownUseだけはowner本人のtrusted visitを必須とする。
+
+### 19.2 safe payloadとprivacy
+
+payloadは`hosted`（distinct guest/session、room-session内最大同時guest、JST日別分布、
+`maxRepeatGuestDepth`）、`guest`（distinct owner/sessionとJST日別分布）、`ownUse`
+（本人利用sessionとJST日別分布）だけ。guest/owner/room/channel/parent ID、capacity、
+close actor/reason、raw visit時刻は公開しない。`maxRepeatGuestDepth`は各guestごとの
+`min(distinct JST days, distinct room sessions)`の最大であり、別guestのday最大と
+session最大を合成しない。同時人数は`[start,end)`でendをstartより先に処理し、
+room capacityは使わない。
+
+raw `rooms`は`privacy:"restricted"`, `titleUsable:false`, `orderable:false`,
+`restrictedUse:"public_room_safe_activity_classification"`。derived
+`public_room_activity_safe`は`derivedFrom:["rooms","vc_visits"]`, `privacy:"safe"`,
+`titleUsable:true`, `orderable:false`。300-user bulk chunkとcanonical 300-channel
+chunkを維持し、1200 historical room/channelでもroom/guest/day単位のN+1を作らない。
+channel lookupは既存global UNIQUE indexを使う。一方、owner open-slot partial indexは
+closed historyを含むexact queryには使えず`SCAN rooms`になるため、実query planに基づき
+`idx_rooms_owner_history(owner_id, kind, created_at)`を追加した。migration testで同じ
+owner-history queryがこのindexを使うことを固定する。
+
+### 19.3 readiness delta
+
+No.50-56は`public_room_activity_safe`/`computePublicRoomActivitySafe`でSOURCE READY。
+No.57は普通のguest activity側だけ解消したが、宿屋系role-at-timeとvisit時点のtemporal
+cross-referenceが無いためBLOCKEDを維持する。registry実集計はREADY 34→41、
+PARTIAL 2（不変）、BLOCKED 55→48、META 8（不変）。Theme 12は0/0/8→7/0/1。
+`missing_persisted_source`は32→24、`missing_role_history`は既にNo.57へ付いていたため
+7のまま。production threshold、BehaviorTitleDefinition、Bot award wiringは追加していない。

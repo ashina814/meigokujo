@@ -108,7 +108,7 @@ const VC_DERIVED_FILE = "packages/core/src/vc/derived.ts";
 const ECON_FILE = "packages/core/src/titles/v2-economy.ts";
 const CASINO_FILE = "packages/core/src/titles/v2-casino.ts";
 const EVENT_SERVICE_FILE = "packages/core/src/public-events/service.ts";
-const ROOMS_SERVICE_FILE = "packages/core/src/rooms/service.ts";
+const ROOMS_DERIVED_FILE = "packages/core/src/rooms/derived.ts";
 
 // ─────────────────────────────────────────────────────────────
 // Theme 1: 場を起こす (vc_ignite, No.1-5) — source: vc_empty_start_then_joined
@@ -425,17 +425,36 @@ const THEME_11: ManualReadinessEntry[] = [42, 43, 44, 45, 46, 47, 48, 49].map((n
 // ─────────────────────────────────────────────────────────────
 // Theme 12: 公開部屋 (No.50-57)
 // ─────────────────────────────────────────────────────────────
-const THEME_12: ManualReadinessEntry[] = [50, 51, 52, 53, 54, 55, 56, 57].map((no) => ({
-  no,
-  status: "BLOCKED" as const,
-  usableSources: [],
-  specializedResolvers: [],
-  missingCapabilities: ["public_room_activity_safe（TITLE_SOURCESに一切未登録）"],
-  evidence: [{ file: ROOMS_SERVICE_FILE, symbol: "Rooms (raw data model exists, no title source wraps it)" }],
-  notes: "rooms/recruits/oborozuki_invitesの生データは豊富に存在するが、v2-sources.tsに部屋関連のsource keyが1つも無い——titles層への昇格作業自体が未着手。",
-  blockerKinds: no === 57 ? (["missing_persisted_source", "missing_role_history"] as const) : (["missing_persisted_source"] as const),
-  optimizationRisk: "LOW" as const,
-}));
+const PUBLIC_ROOM_SOURCE_EVIDENCE = [
+  { file: ROOMS_DERIVED_FILE, symbol: "computePublicRoomActivitySafe" },
+  { file: VC_SOURCES_FILE, symbol: "PublicRoomActivitySafeSourcePayload" },
+];
+const THEME_12: ManualReadinessEntry[] = [
+  ...[50, 51, 52, 53, 54, 55, 56].map((no) => ({
+    no,
+    status: "READY" as const,
+    usableSources: ["public_room_activity_safe"] as const,
+    specializedResolvers: ["computePublicRoomActivitySafe"],
+    missingCapabilities: [],
+    evidence: PUBLIC_ROOM_SOURCE_EVIDENCE,
+    notes:
+      "PR F2g: normal/game部屋のlifecycle intervalとtrusted positive logical VC visitを交差し、hosted/guest/ownUseをJST日別・session別にidentityなしで集計する。owner不在でもguest実利用を数え、activated_atやroom作成だけは数えない。",
+    blockerKinds: ["none"] as const,
+    optimizationRisk: "LOW" as const,
+  })),
+  {
+    no: 57,
+    status: "BLOCKED",
+    usableSources: ["public_room_activity_safe"],
+    specializedResolvers: ["computePublicRoomActivitySafe"],
+    missingCapabilities: ["宿屋系role-at-timeとguest visit時点のtemporal cross-reference"],
+    evidence: PUBLIC_ROOM_SOURCE_EVIDENCE,
+    notes:
+      "PR F2gで普通のguestとしての有効来訪は証明可能になったが、visit当時に宿屋系roleを保持していたかを照合するrole historyがrepo全体で未実装。現在roleの参照では代用しない。",
+    blockerKinds: ["missing_role_history"],
+    optimizationRisk: "LOW",
+  },
+];
 
 // ─────────────────────────────────────────────────────────────
 // Theme 13: Land・経済 (No.58-65)

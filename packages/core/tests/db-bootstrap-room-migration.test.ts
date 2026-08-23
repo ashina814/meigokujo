@@ -15,7 +15,12 @@ const ROOM_MIGRATION_COLUMNS = [
   "unused_refund_tx_id",
 ];
 
-const ROOM_INDEXES = ["idx_rooms_owner_normal_open", "idx_rooms_owner_special_open", "idx_rooms_pending_delete"];
+const ROOM_INDEXES = [
+  "idx_rooms_owner_normal_open",
+  "idx_rooms_owner_special_open",
+  "idx_rooms_pending_delete",
+  "idx_rooms_owner_history",
+];
 
 let tempDirs: string[] = [];
 
@@ -100,6 +105,19 @@ describe("rooms schema migration", () => {
     expect(roomColumns(reopened)).toEqual(expect.arrayContaining(ROOM_MIGRATION_COLUMNS));
     expect(indexNames(reopened)).toEqual(expect.arrayContaining(ROOM_INDEXES));
     reopened.close();
+  });
+
+  it("public room historical owner lookupはowner history indexを使う", () => {
+    const db = openDb(":memory:");
+    const plan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT id, kind, channel_id, owner_id, expires_at, closed_at, created_at
+           FROM rooms
+          WHERE kind IN ('normal', 'game') AND created_at < ? AND owner_id IN (?, ?)`,
+      )
+      .all(1_000, "owner-a", "owner-b") as Array<{ detail: string }>;
+    expect(plan.map((row) => row.detail).join("\n")).toContain("idx_rooms_owner_history");
   });
 
   it("既存DBに同一ownerのopen部屋重複がある場合はownerと枠種別が分かるエラーで止める", () => {

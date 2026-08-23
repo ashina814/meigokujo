@@ -368,6 +368,20 @@ export function computeLogicalVisits(
   return computeLogicalVisitsResolved(db, resolveWindow(window), userIds);
 }
 
+/**
+ * 指定channel群のlogical visitをまとめて読む、他domainのderived source向けmodule helper。
+ * raw segmentの再実装を防ぎ、通常のlogical visitと同じcoalesce・observedAt・300-channel
+ * chunk契約を共有する。公開title payloadへchannel/user identityをそのまま出してはならない。
+ */
+export function computeLogicalVisitsForChannels(
+  db: Database.Database,
+  window: TitleWindow,
+  channelIds: readonly string[],
+): LogicalVisit[] {
+  const resolved = resolveWindow(window);
+  return coalesceVisits(loadRawSegmentsForChannels(db, resolved, channelIds), resolved);
+}
+
 // ─────────────────────────────────────────────────────────────
 // C. empty-start → later joined
 // ─────────────────────────────────────────────────────────────
@@ -743,7 +757,7 @@ function jstDayStartUnix(dateStr: string): number {
   return Math.floor(new Date(`${dateStr}T00:00:00+09:00`).getTime() / 1000);
 }
 
-function splitIntervalByJstDay(startedAt: number, endedAt: number): Array<{ date: string; seconds: number }> {
+export function splitIntervalByJstDay(startedAt: number, endedAt: number): Array<{ date: string; seconds: number }> {
   const parts: Array<{ date: string; seconds: number }> = [];
   let cursor = startedAt;
   let guard = 0;

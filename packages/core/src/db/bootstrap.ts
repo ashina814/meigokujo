@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS rooms (
   updated_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rooms_open ON rooms(status) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_rooms_owner_history ON rooms(owner_id, kind, created_at);
 
 CREATE TABLE IF NOT EXISTS recruits (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1136,6 +1137,8 @@ export function openDb(path: string): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_rooms_pending_delete
       ON rooms(status, pending_delete, next_delete_retry_at)
       WHERE status = 'open' AND pending_delete = 1;
+    CREATE INDEX IF NOT EXISTS idx_rooms_owner_history
+      ON rooms(owner_id, kind, created_at);
   `);
   backfillEvaluationMarkWeights(db);
   backfillEvaluationPolicySnapshots(db);
