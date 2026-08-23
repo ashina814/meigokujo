@@ -847,6 +847,14 @@ export interface SafeSocialAggregate {
    * （「時計上の総滞在時間」ではなく「延べ何秒、誰かと重なっていたか」の指標）。
    */
   trustedOverlapSeconds: number;
+  /**
+   * JST日ごとのdistinctな相手人数。相手のidentity・pair・channel・timestampは含めない。
+   * interactionが無い日は行自体を作らない。
+   */
+  dailyBreadth: ReadonlyArray<{
+    date: string;
+    distinctCoPresentUsers: number;
+  }>;
 }
 
 /**
@@ -867,26 +875,40 @@ export function computeSafeSocialAggregates(
 ): SafeSocialAggregate[] {
   if (userIds && userIds.length === 0) return [];
   const overlaps = computeCoPresenceOverlaps(db, window, userIds);
-  const byUser = new Map<string, { partners: Map<string, { seconds: number; days: number }> }>();
+  const byUser = new Map<
+    string,
+    {
+      partners: Map<string, { seconds: number; days: number }>;
+      counterpartsByDate: Map<string, Set<string>>;
+    }
+  >();
 
-  const touch = (self: string, other: string, seconds: number, days: number) => {
+  const touch = (self: string, other: string, seconds: number, jstDays: readonly string[]) => {
     let entry = byUser.get(self);
     if (!entry) {
-      entry = { partners: new Map() };
+      entry = { partners: new Map(), counterpartsByDate: new Map() };
       byUser.set(self, entry);
     }
     const prev = entry.partners.get(other) ?? { seconds: 0, days: 0 };
-    entry.partners.set(other, { seconds: prev.seconds + seconds, days: prev.days + days });
+    entry.partners.set(other, { seconds: prev.seconds + seconds, days: prev.days + jstDays.length });
+    for (const date of jstDays) {
+      let counterparts = entry.counterpartsByDate.get(date);
+      if (!counterparts) {
+        counterparts = new Set();
+        entry.counterpartsByDate.set(date, counterparts);
+      }
+      counterparts.add(other);
+    }
   };
 
   for (const o of overlaps) {
-    touch(o.userA, o.userB, o.overlapSeconds, o.jstDays.length);
-    touch(o.userB, o.userA, o.overlapSeconds, o.jstDays.length);
+    touch(o.userA, o.userB, o.overlapSeconds, o.jstDays);
+    touch(o.userB, o.userA, o.overlapSeconds, o.jstDays);
   }
 
   const requestedSet = userIds ? new Set(userIds) : null;
   const results: SafeSocialAggregate[] = [];
-  for (const [userId, { partners }] of byUser) {
+  for (const [userId, { partners, counterpartsByDate }] of byUser) {
     if (requestedSet && !requestedSet.has(userId)) continue;
     let totalSeconds = 0;
     let maxDays = 0;
@@ -899,6 +921,9 @@ export function computeSafeSocialAggregates(
       distinctCoPresentUsers: partners.size,
       maxRepeatedDaysWithOneCounterpart: maxDays,
       trustedOverlapSeconds: totalSeconds,
+      dailyBreadth: [...counterpartsByDate]
+        .sort(([dateA], [dateB]) => (dateA < dateB ? -1 : dateA > dateB ? 1 : 0))
+        .map(([date, counterparts]) => ({ date, distinctCoPresentUsers: counterparts.size })),
     });
   }
   return results;

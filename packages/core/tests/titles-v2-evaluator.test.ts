@@ -788,6 +788,7 @@ describe("awardFacts safety（§10, §12）", () => {
       distinctCoPresentUsers: 1,
       maxRepeatedDaysWithOneCounterpart: expect.any(Number),
       trustedOverlapSeconds: 100,
+      dailyBreadth: [{ date: "2026-08-20", distinctCoPresentUsers: 1 }],
     });
   });
 

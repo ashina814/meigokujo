@@ -63,6 +63,14 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > 24→12。PARTIAL 5・META 8は不変。threshold/share denominatorは決めず、
 > production title/Bot wiringも追加していない。詳細は§17参照。
 
+> **PR F2f反映（2026-08-23）**: 既存`vc_social_safe`へ、JST日ごとの
+> distinct trusted counterpart数だけを返す`dailyBreadth`を加算的に追加した。
+> No.23-25がPARTIAL→READY、READY 31→34、PARTIAL 5→2、
+> `source_semantic_mismatch` 5→2。BLOCKED 55・META 8・
+> `missing_derived_source` 12は不変。No.29/30のpair-specific overlap不足と
+> No.31のpair persistence不足は解消していない。threshold・production title・
+> Bot wiringも追加していない。詳細は§18参照。
+
 ## 0. xlsx canonical hash（exact drift guard）
 
 | 項目 | 値 |
@@ -110,13 +118,13 @@ full-clear editionに登録されたREQUIRED印100%——NONCOUNTの91 behavior�
 
 | status | 件数 | 意味 |
 | --- | --- | --- |
-| READY | 31 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
-| PARTIAL | 5 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
+| READY | 34 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
+| PARTIAL | 2 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
 | BLOCKED | 55 | 意味的に近いものが repo に一切存在しない |
 | META | 8 | kind:meta（別bucket、§7参照） |
 
 **READY = 今すぐreleaseしてよい、ではない**。sourceReadinessとthreshold決定は
-別軸（§10参照）——READY 31件も、production threshold値（分布TBD等）が
+別軸（§10参照）——READY 34件も、production threshold値（分布TBD等）が
 決まるまではrelease対象にならない。またSeries manifest／Collection Edition／
 Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）。No.58はさらに、
 award後のreversalを既存immutable ownershipへどう反映するかが未決定であるため、
@@ -130,11 +138,11 @@ source-readyでもproduction release不可（§15）。
 | missing_derived_source | 12 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
 | missing_manifest | 9 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
 | missing_role_history | 7 | role-at-time（過去のある時点でどのroleを保持していたか）がrepo全体で未実装 |
-| source_semantic_mismatch | 5 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（casino分は§14、economy分は§15、event completion分は§16で解消済み） |
+| source_semantic_mismatch | 2 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（No.29/30のpair-specific overlapのみ。VC breadth分は§18で解消済み） |
 | missing_event_protocol | 2 | イベントデータモデル自体にorganizer/staff区別が存在しない |
 | known_bug | 0 | PR F2aで`computeLastOccupant()`のsame-second/0-second visit tie bugを修正——catalog全体から解消済み（§13参照） |
 
-（`none`のBehavior候補は31件——ちょうどREADY件数と一致。PARTIAL 5件は
+（`none`のBehavior候補は34件——ちょうどREADY件数と一致。PARTIAL 2件は
 すべて`source_semantic_mismatch`を持つ。）
 
 ## 4. Theme別 readiness
@@ -147,7 +155,7 @@ source-readyでもproduction release不可（§15）。
 | 4 | 少人数型 | 3 | 3 | 0 | 0 |
 | 5 | 大人数型 | 3 | 3 | 0 | 0 |
 | 6 | 万能型 | 3 | 3 | 0 | 0 |
-| 7 | 広い交友 | 6 | 1 | 3 | 2 |
+| 7 | 広い交友 | 6 | 4 | 0 | 2 |
 | 8 | 深い交友 | 4 | 1 | 2 | 1 |
 | 9 | 時間帯・生活痕 | 6 | 0 | 0 | 6 |
 | 10 | BUMP / 鐘 | 4 | 4 | 0 | 0 |
@@ -165,12 +173,12 @@ trusted secondsで日数/share/span/streakを後段評価できるため）。TC
 
 ## 5. source別に残る実装（READYを支えるsource／PARTIALの制約／BLOCKEDが必要とするもの）
 
-READYを支えている既存`titleUsable:true` source（10種、31件）:
+READYを支えている既存`titleUsable:true` source（10種、34件）:
 
 - `vc_empty_start_then_joined`（No.1-2）
 - `vc_last_occupant`（No.6, 7, 9——PR F2aでsame-second/0-second visit tie bugを修正済み、§13参照）
 - `vc_group_size_daily_safe`（No.10-21——JST date×4bucketのtrusted seconds。threshold/share denominatorは未固定、§17参照）
-- `vc_social_safe`（No.22, 28 — `distinctCoPresentUsers`/`maxRepeatedDaysWithOneCounterpart`が直接使える。No.23-25は§12参照）
+- `vc_social_safe`（No.22-25, 28 — scope全体の`distinctCoPresentUsers`、JST日別`dailyBreadth`、`maxRepeatedDaysWithOneCounterpart`を後段評価に使える。§12/§18参照）
 - `bump_events`（No.38-41、全件READY）
 - `casino_activity_days`（No.68 のみ——「利用する」semanticsに限りcompletion保証不要。commitmentベースのまま維持）
 - `casino_completed_activity_days`（No.66, 67——PR F2bで追加したcompletion正本、§14参照）
@@ -181,7 +189,6 @@ READYを支えている既存`titleUsable:true` source（10種、31件）:
 PARTIALを止めているもの（source_semantic_mismatch、§12/§14で今回のレビューにより判定）:
 
 - `vc_social_safe.trustedOverlapSeconds`が全counterpart合算で、特定counterpartに紐づけられない（No.29, 30）
-- `vc_social_safe`が単一累積値のみで時間的分布を持たない（No.23-25）
 
 （casino participation-vs-completion mismatchはPR F2bで解消済み——No.66/67は
 READY化、No.69はmissing_manifestのみ残る。economy reversal mismatchも
@@ -214,7 +221,7 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 | STRUCTURAL_PLUS_DISTRIBUTION | 1 | 構造は決まるが、一部の値は分布依存 |
 | META_NOT_APPLICABLE | 8 | meta（別contract、§10適用外） |
 
-sourceReadinessとthresholdは別軸——READY 31件のうち、STRUCTURAL_FIXEDなのは
+sourceReadinessとthresholdは別軸——READY 34件のうち、STRUCTURAL_FIXEDなのは
 一部（初回系）のみで、残りはTHRESHOLD_PENDINGのままREADYになっている
 （sourceは十分だが実数値は分布を見てから決める）。
 
@@ -226,13 +233,13 @@ sourceReadinessとthresholdは別軸——READY 31件のうち、STRUCTURAL_FIXE
 | イベントtheme（Theme No.16） | 5 | No.80/81はcompletion sourceでREADY、No.82-84は依然BLOCKED |
 | manifest依存（thresholdCategory: MANIFEST_DEPENDENT） | 6 | 賭場core family一覧・城横断family一覧・series一覧が未定義 |
 | known bug依存 | 0 | PR F2aで`computeLastOccupant`の同秒0秒visit tie bugを修正——catalog全体から解消（§13参照） |
-| source_semantic_mismatch依存 | 5 | casino分はPR F2b、economy reversalはPR F2c、event completion分（No.80-82）はPR F2dで解消——残るのはVC social breadth（No.23-25,29,30）のみ（§14-16参照） |
+| source_semantic_mismatch依存 | 2 | casino分はPR F2b、economy reversalはPR F2c、event completion分（No.80-82）はPR F2d、VC breadth分（No.23-25）はPR F2fで解消——残るのはNo.29/30のみ（§14-16/§18参照） |
 
 ## 8. 次に何を実装すれば最も多くのcandidateがunblockされるか
 
 単純なunblock件数だけでなく、安全性・基盤依存・実装順序も考慮した優先順位。
 `missing_persisted_source`単独が理由の候補が28件、`missing_derived_source`
-単独が9件、`source_semantic_mismatch`単独が5件——新規sourceを1つ作る、
+単独が9件、`source_semantic_mismatch`単独が2件——新規sourceを1つ作る、
 または既存sourceのsemanticsを正すごとに複数candidateが同時に動く
 「クラスタ」が明確に存在する。
 
@@ -245,26 +252,28 @@ sourceReadinessとthresholdは別軸——READY 31件のうち、STRUCTURAL_FIXE
 > **PR F2dで解消済み**（§16参照）——No.80/81がPARTIAL→READY、No.82は
 > event-date span blockerのみ残る。VC group-size day/share/span拡張も
 > **PR F2eで解消済み**（§17参照）——No.10-21がBLOCKED→READY。
+> VC social breadthのJST日次分布も**PR F2fで解消済み**（§18参照）——
+> No.23-25がPARTIAL→READY。
 > 以下は残っているクラスタのみを優先度順に並べ直したもの。
 
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
-| 1 | `vc_social_safe`にper-day counterpart breadth集計を追加 | 3件をPARTIAL→READY化（No.23,24,25）＋No.29,30の一部も前進 | F2eと同じVC derived層の拡張——日別counterpart distinct集計を追加すれば残るsemantic mismatchをまとめて減らせる |
-| 2 | `public_room_activity_safe`新設 | 7-8件（No.50-57） | 生データ（Rooms）は既にrich——titles層への昇格だけで完結し、他ドメインへの依存が無い独立クラスタ |
-| 3 | `tc_conversation_safe`/`tc_reaction_safe`新設 | 8件（No.42-49） | TC側の会話構造化は`social_activity_time_safe`（クラスタ4）とも土台を共有するため、先に着手すると時間帯クラスタの半分も前進する |
-| 4 | `social_activity_time_safe`(TC+VC)新設 | 6件（No.32-37） | クラスタ3のTC構造化と共通基盤——健康/FOMO対策でCOUNTABLE 0のまま据え置く前提は維持 |
-| 5 | `invite_retention_safe`新設 | 4件（No.76-79） | 外部勧誘圧のリスクが高いドメイン（optimizationRisk: HIGH）——実装優先度はunblock数以上に安全設計のレビュー時間を要する |
-| 6 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
-| 7 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
-| 8 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
-| 9 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
-| 10 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
-| 11 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
+| 1 | `public_room_activity_safe`新設 | 7-8件（No.50-57） | 生データ（Rooms）は既にrich——titles層への昇格だけで完結し、他ドメインへの依存が無い独立クラスタ |
+| 2 | `tc_conversation_safe`/`tc_reaction_safe`新設 | 8件（No.42-49） | TC側の会話構造化は`social_activity_time_safe`（クラスタ3）とも土台を共有するため、先に着手すると時間帯クラスタの半分も前進する |
+| 3 | `social_activity_time_safe`(TC+VC)新設 | 6件（No.32-37） | クラスタ2のTC構造化と共通基盤——健康/FOMO対策でCOUNTABLE 0のまま据え置く前提は維持 |
+| 4 | `invite_retention_safe`新設 | 4件（No.76-79） | 外部勧誘圧のリスクが高いドメイン（optimizationRisk: HIGH）——実装優先度はunblock数以上に安全設計のレビュー時間を要する |
+| 5 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
+| 6 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
+| 7 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
+| 8 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
+| 9 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
+| 10 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
 
-VC group-size clusterはF2eで解消した。次は、残るsemantic mismatch 5件を
-まとめて減らせるクラスタ1の`vc_social_safe` per-day counterpart breadth拡張へ
-進むのが自然。その後は大きいroom/TCクラスタへ移り、F2a-F2eでsourceの
-正確性・semantic debtを先に減らしてきた方針を維持する。
+VC group-size clusterはF2e、VC social breadth clusterはF2fで解消した。
+次は、生データが既にrichでtitles層への安全な昇格が中心となるクラスタ1の
+`public_room_activity_safe`へ進むのが自然。その後は共通基盤を持つ大きい
+TC/時間帯クラスタへ移り、F2a-F2fでsourceの正確性・semantic debtを先に
+減らしてきた方針を維持する。
 
 ## 9. editorial intent → runtime resolution（契約の食い違いの明示）
 
@@ -345,24 +354,32 @@ reversalされたtipでも「初回tip」factは残ったまま。catalog側sema
 > SOURCE READINESS上PARTIAL→READYへ戻したが、production award-finality gateは
 > 別問題として§15に残す。
 
-### 12.3 VC social breadthの時間的分布欠如（No.23, 24, 25: READY → PARTIAL）
+### 12.3 VC social breadthの時間的分布欠如（No.23, 24, 25: PR F2fで解消）
 
-`vc_social_safe`のpayloadは`distinctCoPresentUsers`/
+PR #164レビュー時点の`vc_social_safe` payloadは`distinctCoPresentUsers`/
 `maxRepeatedDaysWithOneCounterpart`/`trustedOverlapSeconds`という
 scope window全体の**単一累積値**のみ。counterexample: day1に100人と
 co-presenceが成立し、day2〜30はAlice1人だけと会った場合でも、
 `distinctCoPresentUsers`は大きいまま計算できる——しかし「より広い異なる
 相手との交流が、複数日に広がる」（No.23）「十分な期間にわたり...続く」
 （No.24）「長期・多数日にわたり」（No.25）という**時間的持続性**は
-証明できない。No.22「顔馴染み」は時間的な広がりを要求しない
+証明できなかった。No.22「顔馴染み」は時間的な広がりを要求しない
 （「成立する」であって「広がる/続く」ではない）ためREADYのまま維持した。
+
+> **PR F2fでsource mismatchを解消**: 同じ`vc_social_safe`へ
+> `dailyBreadth: [{ date, distinctCoPresentUsers }]`を追加した。dateはJST昇順、
+> countはその日のtrusted counterpart集合のsizeで、interactionが無い日は行を
+> 作らない。scope全体のglobal distinctとの併用により、上記day1 spikeと
+> uniform breadthを区別し、日数・各日breadth・first→last spanを後段評価できる。
+> No.23-25はPARTIAL→READY。No.29/30のpair-specific overlapとNo.31の
+> pair persistenceは意図的に解消していない（§18）。
 
 PR #164時点でのfollow-up（casino participation-vs-completion・economy
 reversal・VC social breadth per-day・`vc_last_occupant` tie bug・VC
 group-size拡張）はPR #164自体では実施しない——記録のみ。このうち
 `vc_last_occupant`のtie bugはその後PR F2aで（§13）、casino
 participation-vs-completionはPR F2bで（§14）、economy reversalはPR F2cで
-（§15）解消した——残りは§8の
+（§15）、VC social breadth per-dayはPR F2fで（§18）解消した——残りは§8の
 現在の優先度表を参照（クラスタ番号はPRを重ねるたびに再割当てされるため、
 特定の番号ではなくトピック名で参照すること）。
 
@@ -739,3 +756,53 @@ D1経路を再監査した結果、subjectのhistorical distinct channel IDsを�
 chunk結果はmerge後に`user_id ASC, started_at ASC, id ASC`へglobal sortしてから
 coalesceするため、chunk境界でlogical visit semanticsは変わらない。1200 distinct
 historical channel fixtureでSQL placeholder最大303・結果保存をregression testに固定した。
+
+## 18. PR F2f: VC Social Breadth Daily Distribution
+
+### 18.1 additive safe payloadと集約意味論
+
+新規sourceは作らず、既存`vc_social_safe`と`computeSafeSocialAggregates()`だけを
+加算的に拡張した。既存3指標は変更せず、payloadへ次を追加する。
+
+```ts
+{
+  distinctCoPresentUsers,
+  maxRepeatedDaysWithOneCounterpart,
+  trustedOverlapSeconds,
+  dailyBreadth: [{ date: "YYYY-MM-DD", distinctCoPresentUsers }]
+}
+```
+
+`computeCoPresenceOverlaps()`が返すrestrictedな
+`{ userA, userB, overlapSeconds, jstDays }`だけを1 passで畳み込み、本人ごとの
+global counterpart union、pairごとのJST日数、pair-seconds、
+`Map<date, Set<counterpart>>`を同時に構築する。同じ相手との同日複数visit・
+複数channelは1人、異なる日は各日の集合へ1人ずつ数える。`dailyBreadth`はJST date
+昇順で、interactionの無い日は0行を補わない。各日のcount合計は同じ相手を日ごとに
+再計上するため、scope全体の`distinctCoPresentUsers`と一致する保存則ではない。
+
+公開payloadはdate/countだけで、counterpart ID/hash/stable index、pair、channel、
+timestamp、visit count、pair overlap、per-partner timelineを含まない。
+`readTitleSource()`/`TitleSourceCache`の既存generic deep-freezeがpayload、配列、entryを
+再帰的にfreezeする。zero-resultは既存zero metricsに`dailyBreadth: []`を加える。
+
+source contractは`derivedFrom:["vc_co_presence"]`, `privacy:"safe"`,
+`titleUsable:true`, `orderable:false`, `rawUnit:"safe_social_aggregate"`のまま。
+監視・永続化・SQL・production BehaviorTitleDefinition・threshold・Bot award wiringは
+追加していない。既存の300-user bulk chunkと300-channel query chunkも維持する。
+
+### 18.2 threshold-neutralとreadiness
+
+active day、minimum per-day breadth、必要日数、span等の具体値はsourceへ置かない。
+No.23-25はscope全体のglobal distinct、JST日次分布、date spanを後段で組み合わせて
+意味を落とさず表現できるため、`usableSources:["vc_social_safe"]`、
+`specializedResolvers:["computeSafeSocialAggregates"]`、`missingCapabilities:[]`、
+`blockerKinds:["none"]`としてPARTIAL→READYへ変更した。いずれも
+`thresholdCategory:THRESHOLD_PENDING`のまま。
+
+No.29/30は特定counterpartに紐づいたoverlapをpublic sourceが返さないためPARTIAL、
+No.31はpair persistence source不足でBLOCKEDのまま。missingCapabilities・blockerKinds
+も変更していない。registry実集計はREADY 31→34、PARTIAL 5→2、BLOCKED 55・
+META 8は不変。`source_semantic_mismatch`は5→2、`missing_derived_source`は12のまま。
+Theme 7はREADY 4 / PARTIAL 0 / BLOCKED 2、Theme 8はREADY 1 / PARTIAL 2 /
+BLOCKED 1。
