@@ -77,6 +77,25 @@ describe("starts — quiet/free-flow/explicit continuation", () => {
     message(observations, "self-next", "subject", BASE_MS + 120_000);
     expect(conversation(db).starts[0]).toMatchObject({ nextOtherGapMs: null, explicitContinuation: false });
   });
+
+  it("既存public threadの通常messageはrevivalになってもstartsへ入れない", () => {
+    const { db, observations } = setup();
+    const thread = {
+      surfaceId: "thread-a",
+      areaId: "forum-parent",
+      surfaceKind: "forum_post" as const,
+      threadOwnerId: "other",
+      threadCreatedAt: BASE_MS,
+    };
+    message(observations, "thread-old", "other", BASE_MS + 10_000, thread);
+    message(observations, "thread-resume", "subject", BASE_MS + DAY + 10_000, thread);
+    message(observations, "thread-continued", "other", BASE_MS + DAY + 20_000, thread);
+    const payload = conversation(db);
+    expect(payload.starts).toEqual([]);
+    expect(payload.revivalConversations).toEqual([
+      { revivals: [{ date: "2026-08-21", dormantBeforeMs: DAY, continuationGapMs: 10_000 }] },
+    ]);
+  });
 });
 
 describe("revival explicit conversations", () => {
@@ -144,6 +163,67 @@ describe("logical areas and third-party joins", () => {
       });
     }
     expect(conversation(db).areas).toHaveLength(1);
+  });
+
+  it("同じforum parentでも別threadのtemporal adjacencyをexchangeにしない", () => {
+    const { db, observations } = setup();
+    message(observations, "subject-a", "subject", BASE_MS + 100_000, {
+      surfaceId: "thread-a",
+      areaId: "forum-parent",
+      surfaceKind: "forum_post",
+    });
+    message(observations, "other-b", "other", BASE_MS + 101_000, {
+      surfaceId: "thread-b",
+      areaId: "forum-parent",
+      surfaceKind: "forum_post",
+    });
+    const payload = conversation(db);
+    expect(payload.areas).toEqual([{ socialDays: [{ date: "2026-08-20", bestOtherGapMs: null }] }]);
+    expect(payload.socialDays).toEqual([]);
+  });
+
+  it("forum parentは1 areaのまま、同一thread内のotherだけをexchangeに使う", () => {
+    const { db, observations } = setup();
+    message(observations, "subject-a", "subject", BASE_MS + 100_000, {
+      surfaceId: "thread-a",
+      areaId: "forum-parent",
+      surfaceKind: "forum_post",
+    });
+    message(observations, "other-b", "other", BASE_MS + 101_000, {
+      surfaceId: "thread-b",
+      areaId: "forum-parent",
+      surfaceKind: "forum_post",
+    });
+    message(observations, "other-a", "other-2", BASE_MS + 110_000, {
+      surfaceId: "thread-a",
+      areaId: "forum-parent",
+      surfaceKind: "forum_post",
+    });
+    const payload = conversation(db);
+    expect(payload.areas).toEqual([{ socialDays: [{ date: "2026-08-20", bestOtherGapMs: 10_000 }] }]);
+    expect(payload.socialDays).toEqual([{ date: "2026-08-20", bestOtherGapMs: 10_000 }]);
+  });
+
+  it("subject-only threadsと別threadの大量other投稿をsocial evidenceへ変換しない", () => {
+    const { db, observations } = setup();
+    for (const surfaceId of ["thread-a", "thread-b", "thread-c"]) {
+      message(observations, `subject-${surfaceId}`, "subject", BASE_MS + 100_000, {
+        surfaceId,
+        areaId: "forum-parent",
+        surfaceKind: "forum_post",
+      });
+    }
+    for (let index = 0; index < 20; index += 1) {
+      message(observations, `other-${index}`, `other-${index}`, BASE_MS + 100_001 + index, {
+        surfaceId: "thread-d",
+        areaId: "forum-parent",
+        surfaceKind: "forum_post",
+      });
+    }
+    const payload = conversation(db);
+    expect(payload.areas).toHaveLength(1);
+    expect(payload.areas[0]?.socialDays).toEqual([{ date: "2026-08-20", bestOtherGapMs: null }]);
+    expect(payload.socialDays).toEqual([]);
   });
 
   it("prior authorをidentity distinctにし、priorSelfとnextOtherのgapを保持する", () => {

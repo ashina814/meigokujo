@@ -372,7 +372,6 @@ function buildConversationPayload(
 ): TcConversationSafePayload {
   if (subjectRows.length === 0) return EMPTY_CONVERSATION;
   const surfaces = groupRows(contextRows, (row) => row.surfaceId);
-  const areas = groupRows(contextRows, (row) => row.areaId);
   const explicit = explicitConversationKeys(contextRows);
   const indexes = new Map<readonly MessageRow[], ReadonlyMap<string, number>>();
   const nextGapCache = new Map<readonly MessageRow[], ReadonlyMap<string, number | null>>();
@@ -407,7 +406,9 @@ function buildConversationPayload(
   };
 
   const starts = subjectRows
-    .filter((row) => row.replyToMessageId === null)
+    // 既存thread内のreply指定なしmessageはconversation内部の通常messageであり、
+    // 「新しいtop-level発言」をexactに証明しない。normal channelのtop-levelだけを採る。
+    .filter((row) => row.surfaceKind === "channel" && row.replyToMessageId === null)
     .map((row) => {
       const surfaceRows = surfaces.get(row.surfaceId) ?? [];
       const index = indexFor(surfaceRows, row.messageId);
@@ -454,9 +455,15 @@ function buildConversationPayload(
     socialDays: Array<{ date: string; bestOtherGapMs: number | null }>;
   }> = [];
   const subjectByArea = groupRows(subjectRows, (row) => row.areaId);
-  for (const [areaId, ownRows] of subjectByArea) {
-    const allRows = areas.get(areaId) ?? [];
-    const nearestByMessage = nearestOtherGapByMessage(ownRows, allRows, subjectId);
+  for (const ownRows of subjectByArea.values()) {
+    // areaはbreadth taxonomy、surfaceはinteraction locality。forum parent配下の
+    // 別thread同士を時間的に近いだけでexchangeへ結び付けない。
+    const ownBySurface = groupRows(ownRows, (row) => row.surfaceId);
+    const nearestByMessage = new Map<string, number | null>();
+    for (const [surfaceId, surfaceOwnRows] of ownBySurface) {
+      const local = nearestOtherGapByMessage(surfaceOwnRows, surfaces.get(surfaceId) ?? [], subjectId);
+      for (const [messageId, gap] of local) nearestByMessage.set(messageId, gap);
+    }
     const bestByDate = new Map<string, number | null>();
     for (const own of ownRows) {
       const best = nearestByMessage.get(own.messageId) ?? null;

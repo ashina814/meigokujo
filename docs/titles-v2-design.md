@@ -1865,6 +1865,10 @@ future parentはそのlinkだけfail-closed。free-flow TCはtopicを推測せ�
 other/prior self/next other/area exchange gapをthreshold-neutralに公開する。safe payloadは
 anonymous `starts`、`revivalConversations`、`areas`、`thirdPartyJoins`、exact explicit
 `startedConversations`、TC `socialDays`のみ。raw message count/identity/timestamp listは出さない。
+`starts`はnormal channelのtop-level messageだけで、既存thread/forum内のreply指定なしmessageを
+startへ昇格しない。threadはparentへlogical area集約するが、exchange gapは同一surface内だけで
+計算してからarea×JST日へ畳む。area=breadth taxonomy、surface=interaction localityであり、
+cross-thread temporal adjacencyをsocial activityとして扱わない。
 
 `computeTcReactionSafe()`はglobal distinct human reactors、anonymous postごとのreaction
 observation days/reactor数、dayごとのdistinct post/reactor数だけを返す。両safe sourceは

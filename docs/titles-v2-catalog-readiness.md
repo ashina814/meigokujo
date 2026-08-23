@@ -915,8 +915,10 @@ content similarityや固定15/30分windowでtopicを推測しない。
 
 payloadは次のidentity-free sufficient statisticsのみ:
 
-- `starts[]`: JST date、scope内の直前surface messageからの`quietBeforeMs`（不明は`null`）、
-  `nextOtherGapMs`、reply/thread上の`explicitContinuation`
+- `starts[]`: normal channelのtop-level messageだけについて、JST date、scope内の直前surface
+  messageからの`quietBeforeMs`（不明は`null`）、`nextOtherGapMs`、reply上の
+  `explicitContinuation`。既存public thread/forum内の通常messageはreply指定が無くても
+  conversation内部のmessageであり、thread starterをexactに証明できないため`starts`へ入れない
 - `revivalConversations[]`: anonymous explicit conversation groupごとのrevival date、
   `dormantBeforeMs`、`continuationGapMs`
 - `areas[]`: anonymous logical areaごとのJST `socialDays`と`bestOtherGapMs`
@@ -928,6 +930,9 @@ payloadは次のidentity-free sufficient statisticsのみ:
 
 message/post count、message/channel/thread/area/counterpart ID、content/raw timestamp listは出さない。
 quiet/dormant/continuation/exchange/longlifeの具体値は一切固定せずF5/F6 calibrationへ送る。
+logical area groupingとinteraction localityは分離する。public thread/forumはparent channel/forumへ
+area集約する一方、`bestOtherGapMs`とglobal `socialDays`のexchangeは同一`surface_id`内だけで
+成立させる。同じforum parent配下でもcross-thread temporal adjacencyはsocial activityにしない。
 
 ### 20.3 reaction safe payload・SQL
 
