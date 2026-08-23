@@ -13,6 +13,7 @@ import { computeSafeEconomyPeerActions, type SafePeerEconomyActionKind } from ".
 import { computeCasinoActivityDays, computeCasinoCompletedActivityDays } from "./v2-casino.js";
 import type { CasinoActivityKey } from "../casino/participation-history.js";
 import { computeCompletedPublicEventParticipations } from "./v2-public-events.js";
+import { computePublicRoomActivitySafe } from "../rooms/derived.js";
 
 /**
  * 称号ruleがraw DBを直接触らないようにするための、source読み込み境界。
@@ -143,6 +144,25 @@ export interface CasinoCompletedActivityDaysSourcePayload {
   }>;
 }
 
+export interface PublicRoomActivitySafeSourcePayload {
+  readonly hosted: {
+    readonly distinctGuests: number;
+    readonly sessionCount: number;
+    readonly maxConcurrentGuests: number;
+    readonly maxRepeatGuestDepth: number;
+    readonly days: ReadonlyArray<{ readonly date: string; readonly distinctGuests: number; readonly sessionsWithGuests: number }>;
+  };
+  readonly guest: {
+    readonly distinctOwners: number;
+    readonly sessionCount: number;
+    readonly days: ReadonlyArray<{ readonly date: string; readonly distinctOwners: number; readonly sessionsVisited: number }>;
+  };
+  readonly ownUse: {
+    readonly sessionCount: number;
+    readonly days: ReadonlyArray<{ readonly date: string; readonly sessionsUsed: number }>;
+  };
+}
+
 /** sourceKeyごとのsanitized payload型。相手のuserId・raw message ID等は一切含めない。 */
 export interface TitleSourcePayloads {
   bump_events: BumpEventsSourcePayload;
@@ -158,6 +178,7 @@ export interface TitleSourcePayloads {
   public_event_completed_participations: PublicEventCompletedParticipationsSourcePayload;
   casino_activity_days: CasinoActivityDaysSourcePayload;
   casino_completed_activity_days: CasinoCompletedActivityDaysSourcePayload;
+  public_room_activity_safe: PublicRoomActivitySafeSourcePayload;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -232,6 +253,11 @@ const EMPTY_SOCIAL_SAFE_PAYLOAD: VcSocialSafeSourcePayload = {
   maxRepeatedDaysWithOneCounterpart: 0,
   trustedOverlapSeconds: 0,
   dailyBreadth: [],
+};
+const EMPTY_PUBLIC_ROOM_ACTIVITY_SAFE_PAYLOAD: PublicRoomActivitySafeSourcePayload = {
+  hosted: { distinctGuests: 0, sessionCount: 0, maxConcurrentGuests: 0, maxRepeatGuestDepth: 0, days: [] },
+  guest: { distinctOwners: 0, sessionCount: 0, days: [] },
+  ownUse: { sessionCount: 0, days: [] },
 };
 
 /**
@@ -385,6 +411,24 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
           trustedOverlapSeconds: row.trustedOverlapSeconds,
           dailyBreadth: row.dailyBreadth,
         });
+      }
+    }
+    return { payloads, readCalls };
+  },
+
+  public_room_activity_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, PublicRoomActivitySafeSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, EMPTY_PUBLIC_ROOM_ACTIVITY_SAFE_PAYLOAD);
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return { payloads, readCalls: 0 };
+    const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      for (const row of computePublicRoomActivitySafe(db, window, chunk)) {
+        payloads.set(row.userId, { hosted: row.hosted, guest: row.guest, ownUse: row.ownUse });
       }
     }
     return { payloads, readCalls };
@@ -613,6 +657,8 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
   vc_group_size_daily_safe: (db, userId, scope) =>
     BULK_SOURCE_READERS.vc_group_size_daily_safe(db, [userId], scope).payloads.get(userId)!,
   vc_social_safe: (db, userId, scope) => BULK_SOURCE_READERS.vc_social_safe(db, [userId], scope).payloads.get(userId)!,
+  public_room_activity_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.public_room_activity_safe(db, [userId], scope).payloads.get(userId)!,
   text_active_days: (db, userId, scope) => BULK_SOURCE_READERS.text_active_days(db, [userId], scope).payloads.get(userId)!,
   confirmed_invites: (db, userId, scope) => BULK_SOURCE_READERS.confirmed_invites(db, [userId], scope).payloads.get(userId)!,
   economy_safe_peer_actions: (db, userId, scope) =>

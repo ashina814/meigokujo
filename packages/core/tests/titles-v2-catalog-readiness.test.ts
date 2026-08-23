@@ -367,10 +367,10 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
     }
   });
 
-  it("registry実集計はREADY 34 / PARTIAL 2 / BLOCKED 55 / META 8", () => {
+  it("registry実集計はF2g後も含めREADY 41 / PARTIAL 2 / BLOCKED 48 / META 8", () => {
     const counts = new Map<string, number>();
     for (const entry of TITLE_V2_CATALOG_READINESS) counts.set(entry.status, (counts.get(entry.status) ?? 0) + 1);
-    expect(Object.fromEntries(counts)).toEqual({ READY: 34, BLOCKED: 55, PARTIAL: 2, META: 8 });
+    expect(Object.fromEntries(counts)).toEqual({ READY: 41, BLOCKED: 48, PARTIAL: 2, META: 8 });
   });
 
   it("source_semantic_mismatchはNo.29/30の2件だけ、missing_derived_sourceは12件のまま", () => {
@@ -393,6 +393,41 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
         "READY",
       ]);
     }
+  });
+});
+
+describe("PR F2g: public room activity safe source追加後のreadiness", () => {
+  it("No.50-56はhosted/guest/ownUse aggregateでSOURCE READY", () => {
+    for (let no = 50; no <= 56; no++) {
+      const entry = readinessFor(no);
+      expect(entry.status, `candidate #${no}`).toBe("READY");
+      expect(entry.usableSources, `candidate #${no}`).toEqual(["public_room_activity_safe"]);
+      expect(entry.specializedResolvers, `candidate #${no}`).toEqual(["computePublicRoomActivitySafe"]);
+      expect(entry.missingCapabilities, `candidate #${no}`).toEqual([]);
+      expect(entry.blockerKinds, `candidate #${no}`).toEqual(["none"]);
+    }
+  });
+
+  it("No.57はroom activity側だけ解消しrole-at-time temporal cross-reference待ち", () => {
+    const entry = readinessFor(57);
+    expect(entry.status).toBe("BLOCKED");
+    expect(entry.usableSources).toEqual(["public_room_activity_safe"]);
+    expect(entry.specializedResolvers).toEqual(["computePublicRoomActivitySafe"]);
+    expect(entry.missingCapabilities).toEqual(["宿屋系role-at-timeとguest visit時点のtemporal cross-reference"]);
+    expect(entry.blockerKinds).toEqual(["missing_role_history"]);
+    expect(entry.notes).toContain("普通のguestとしての有効来訪は証明可能");
+  });
+
+  it("Theme 12はREADY 7 / PARTIAL 0 / BLOCKED 1", () => {
+    const entries = TITLE_V2_CATALOG_READINESS.filter((entry) => entry.no >= 50 && entry.no <= 57);
+    expect(entries.filter((entry) => entry.status === "READY")).toHaveLength(7);
+    expect(entries.filter((entry) => entry.status === "PARTIAL")).toHaveLength(0);
+    expect(entries.filter((entry) => entry.status === "BLOCKED")).toHaveLength(1);
+  });
+
+  it("blocker実集計はmissing_persisted_source 32→24、missing_role_history 7のまま", () => {
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(24);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_role_history"))).toHaveLength(7);
   });
 });
 

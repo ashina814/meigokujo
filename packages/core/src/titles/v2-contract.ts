@@ -119,6 +119,7 @@ const TITLE_RESTRICTED_USES = [
   "casino_safe_participation_classification",
   "casino_safe_completion_classification",
   "public_event_safe_completion_classification",
+  "public_room_safe_activity_classification",
 ] as const;
 export type TitleRestrictedUse = (typeof TITLE_RESTRICTED_USES)[number];
 const VALID_TITLE_RESTRICTED_USES: ReadonlySet<string> = new Set(TITLE_RESTRICTED_USES);
@@ -451,6 +452,47 @@ export const TITLE_SOURCES = {
     titleUsable: true,
     epochPolicy: { type: "point", at: "credited_at" },
     rawUnit: "confirmed_invite_credit",
+  },
+
+  // ── Public Room Safe Activity Source（PR F2g）──────────────────────────────
+  //
+  // roomsにはowner/channel/private room kind/lifecycle情報が含まれるためgeneric ruleへ
+  // 直接渡さない。normal/gameだけをVC logical visitと交差させる専用classifierが読む。
+  rooms: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/rooms/service.ts",
+      needle: "INSERT INTO rooms (kind, channel_id, owner_id, capacity, expires_at, status, created_at, updated_at)",
+    },
+    calledFrom: {
+      file: "apps/bot/src/commands/rooms.ts",
+      needle: "services.rooms.register({ kind, channelId: channel.id, ownerId: owner.id, hours: opts.hours })",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "await handleRoomButton(interaction, services);",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "public_room_safe_activity_classification",
+    epochPolicy: { type: "interval", start: "created_at", end: "closed_at", clip: true },
+    rawUnit: "room_lifecycle_session_record",
+  },
+  public_room_activity_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/rooms/derived.ts",
+      needle: "export function computePublicRoomActivitySafe(",
+    },
+    derivedFrom: ["rooms", "vc_visits"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "public_room_safe_activity_aggregate",
   },
 
   // ── Economy Safe Classification（PR E2）────────────────────────────────────

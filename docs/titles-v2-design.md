@@ -1817,6 +1817,28 @@ production BehaviorTitleDefinition、threshold、Bot award wiringは追加しな
 historical channel context queryも300-ID chunk＋merge後global sortへ変更し、長期catalog
 windowで単一巨大`IN`句を作らない。詳細は`docs/titles-v2-catalog-readiness.md`§17参照。
 
+### F2g — Public Room Activity Safe Source
+
+`rooms`はroom session metadata/lifecycleの正本だが一般guest履歴を持たないため、
+既存canonical logical VC visitsと交差して`public_room_activity_safe`を導出する。
+新しいVoiceStateUpdate監視・room monitoring・DB writer/tableは追加しない。eligible
+public kindは`normal`/`game`だけで、privateな`mitsugetsu`/`oborozuki`、recruit match、
+oborozuki inviteをguest inferenceへ使わない。
+
+有効利用はtrusted positive visitと`[created_at, min(effectiveEnd, canonical closed_at,
+game expires_at))`の交差。room作成や`activated_at`だけでは利用にならず、ownUseには
+owner本人のvisitが必要。hosted来客とguest利用はownerの同時presenceを要求しない。
+payloadはidentityを捨てた`hosted`/`guest`/`ownUse`のsession・distinct・JST日別集計。
+同時guestは半開区間で数える。repeat guestは各guestについて、JST dateを左、room
+sessionを右、そのguestがその日・sessionで有効利用したことをedgeとする二部グラフの
+maximum matching sizeを求め、そのguest間最大を`maxRepeatGuestDepth`とする。これにより
+depth Nは互いに異なるN日と互いに異なるN sessionへの有効来訪対応をexactに表す。
+raw `rooms`はrestricted、derivedはsafeかつorderable:false。
+
+No.50-56はSOURCE READYへ更新するがthresholdは未決定。No.57はrole-at-timeとguest
+activityのtemporal cross-reference待ちでBLOCKEDのまま。production title定義・award
+wiring・room UXは変更しない。詳細は`docs/titles-v2-catalog-readiness.md`§19参照。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。
