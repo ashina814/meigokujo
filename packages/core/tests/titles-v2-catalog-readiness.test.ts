@@ -251,14 +251,17 @@ function readinessFor(no: number) {
 }
 
 describe("semantic false-positive再監査（casino participation vs completion）", () => {
-  it("No.58「ほんの気持ち」はreversal semanticsが現sourceと食い違うためREADYではない", () => {
-    // xlsx Blocker欄「reversal済取引は無効」に対し、computeSafeEconomyPeerActions()は
-    // reversalされた後もoriginal tipのfactを消さない（reversal_of IS NULLは
-    // reversal行自身を除外するだけ）。
+  it("No.58「ほんの気持ち」はsnapshot-bounded reversal除外によりsource-ready", () => {
     const entry = readinessFor(58);
-    expect(entry.status).not.toBe("READY");
-    expect(entry.status).toBe("PARTIAL");
-    expect(entry.blockerKinds).toContain("source_semantic_mismatch");
+    expect(entry.status).toBe("READY");
+    expect(entry.usableSources).toEqual(["economy_safe_peer_actions"]);
+    expect(entry.specializedResolvers).toEqual(["computeSafeEconomyPeerActions"]);
+    expect(entry.missingCapabilities).toEqual([]);
+    expect(entry.blockerKinds).toEqual(["none"]);
+    expect(entry.notes).toContain("evaluation snapshot時点で除外");
+    expect(entry.notes).toContain("reversal transaction自身も従来どおり除外");
+    expect(entry.notes).toContain("最初のvalid qualifying tip");
+    expect(entry.notes).toContain("production release gate");
   });
 
   it("No.66「初勝負」: PR F2bでcasino_completed_activity_days（真のcompletion正本）が追加されREADYになった", () => {
@@ -391,11 +394,11 @@ describe("PR F2b: casino completion source追加後のreadiness", () => {
     expect(entry.blockerKinds).not.toContain("source_semantic_mismatch");
   });
 
-  it("source_semantic_mismatch blockerはNo.66/67/69から外れ、依然残る候補（No.23-25,29,30,58,80,81,82）にはそのまま残る", () => {
-    for (const no of [66, 67]) {
+  it("source_semantic_mismatch blockerはNo.58/66/67/69から外れ、依然残る候補にはそのまま残る", () => {
+    for (const no of [58, 66, 67]) {
       expect(readinessFor(no).blockerKinds, `candidate #${no}`).not.toContain("source_semantic_mismatch");
     }
-    for (const no of [23, 24, 25, 58, 80, 81]) {
+    for (const no of [23, 24, 25, 29, 30, 80, 81, 82]) {
       expect(readinessFor(no).blockerKinds, `candidate #${no}`).toContain("source_semantic_mismatch");
     }
   });

@@ -443,17 +443,17 @@ const THEME_12: ManualReadinessEntry[] = [50, 51, 52, 53, 54, 55, 56, 57].map((n
 const THEME_13: ManualReadinessEntry[] = [
   {
     no: 58,
-    status: "PARTIAL",
+    status: "READY",
     usableSources: ["economy_safe_peer_actions"],
     specializedResolvers: ["computeSafeEconomyPeerActions"],
-    missingCapabilities: ["reversed originalを除外できるsafe validity classification（またはcatalog側semanticを将来正式に変更する意思決定）"],
+    missingCapabilities: [],
     evidence: [
       { file: ECON_FILE, symbol: "computeSafeEconomyPeerActions" },
-      { file: ECON_FILE, symbol: "reversal_of IS NULL (excludes the reversal row itself, not the original action's fact)" },
+      { file: ECON_FILE, symbol: "t.reversal_of IS NULL + snapshot-bounded NOT EXISTS reversal filter" },
     ],
     notes:
-      "PR #164レビュー§BLOCKER2で修正: xlsx Blocker欄「reversal済取引は無効」に対し、現E2契約はcomputeSafeEconomyPeerActions()のコード自身のコメント（§18-19）で明示するとおり「reversal transaction自体はfactを作らない——元actionのfactはreversalの有無に関わらず消えない」——つまり後からreversalされたtipでも初回tip factは残る。xlsx semanticを勝手に変更せず、現sourceでは表現しきれないことを明示する。",
-    blockerKinds: ["source_semantic_mismatch"],
+      "PR F2c: reversed originalをevaluation snapshot時点で除外するようになった。reversal transaction自身も従来どおり除外し、snapshot内で最初のvalid qualifying tipを表現可能。SOURCE READINESSはREADYだが、post-award reversal semanticsはproduction release gateとして未決定（docs/titles-v2-catalog-readiness.md §15）。",
+    blockerKinds: ["none"],
     optimizationRisk: "MANAGED",
   },
   {

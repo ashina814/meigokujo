@@ -237,6 +237,122 @@ describe("scope filtering: [start, end) exclusive end（§31, §54）", () => {
   });
 });
 
+describe("reversal-safe snapshot semantics（PR F2c）", () => {
+  it("A. unreversed user→user tipは1 fact", () => {
+    const { db, store, ledger } = setup();
+    vi.setSystemTime(new Date((BASE + 100) * 1000));
+    makeTransfer(ledger, { from: "user:alice", to: "user:bob", type: "tip" });
+
+    const scope = resolveTitleScope(store, ECONOMY_SAFE_PEER_ACTIONS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "economy_safe_peer_actions", "alice", scope).facts).toHaveLength(1);
+  });
+
+  it("B. Ledger.reverse()済みtipはoriginal factを作らない", () => {
+    const { db, store, ledger } = setup();
+    vi.setSystemTime(new Date((BASE + 100) * 1000));
+    const original = makeTransfer(ledger, { from: "user:alice", to: "user:bob", type: "tip" });
+    vi.setSystemTime(new Date((BASE + 200) * 1000));
+    ledger.reverse(original.tx.id, "staff:bank", "test reversal");
+
+    const scope = resolveTitleScope(store, ECONOMY_SAFE_PEER_ACTIONS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "economy_safe_peer_actions", "alice", scope)).toEqual({ facts: [] });
+  });
+
+  it("C. Ledger.reverse()済みtransferはoriginal factを作らない", () => {
+    const { db, store, ledger } = setup();
+    vi.setSystemTime(new Date((BASE + 100) * 1000));
+    const original = makeTransfer(ledger, { from: "user:alice", to: "user:bob", type: "transfer" });
+    vi.setSystemTime(new Date((BASE + 200) * 1000));
+    ledger.reverse(original.tx.id, "staff:bank", "test reversal");
+
+    const scope = resolveTitleScope(store, ECONOMY_SAFE_PEER_ACTIONS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "economy_safe_peer_actions", "alice", scope)).toEqual({ facts: [] });
+  });
+
+  it("D. reversal transaction自身はactor=from_accountでもfactを作らない", () => {
+    const { db, store, ledger } = setup();
+    vi.setSystemTime(new Date((BASE + 100) * 1000));
+    const original = makeTransfer(ledger, { from: "user:alice", to: "user:bob", type: "transfer" });
+    vi.setSystemTime(new Date((BASE + 200) * 1000));
+    ledger.reverse(original.tx.id, "user:bob", "test reversal");
+
+    const scope = resolveTitleScope(store, ECONOMY_SAFE_PEER_ACTIONS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "economy_safe_peer_actions", "bob", scope)).toEqual({ facts: [] });
+  });
+
+  it("E. 同日のreversed first tipを除外し、valid second tipをoccurredAtに使う", () => {
+    const { db, store, ledger } = setup();
+    const firstAt = BASE + 100;
+    const secondAt = BASE + 300;
+    vi.setSystemTime(new Date(firstAt * 1000));
+    const first = makeTransfer(ledger, { from: "user:alice", to: "user:bob", type: "tip" });
+    vi.setSystemTime(new Date((BASE + 200) * 1000));
+    ledger.reverse(first.tx.id, "staff:bank", "test reversal");
+    vi.setSystemTime(new Date(secondAt * 1000));
+    makeTransfer(ledger, { from: "user:alice", to: "user:carol", type: "tip" });
+
+    const scope = resolveTitleScope(store, ECONOMY_SAFE_PEER_ACTIONS_RULE.definition, OBSERVED_AT);
+    const payload = readTitleSource(db, "economy_safe_peer_actions", "alice", scope);
+    expect(payload.facts).toHaveLength(1);
+    expect(payload.facts[0]).toMatchObject({ kind: "tip", occurredAt: secondAt });
+  });
+
+  it("F. 別transactionのreversalは対象originalへ影響しない", () => {
+    const { db, store, ledger } = setup();
+    const validAt = BASE + 100;
+    vi.setSystemTime(new Date(validAt * 1000));
+    makeTransfer(ledger, { from: "user:alice", to: "user:bob", type: "tip" });
+    vi.setSystemTime(new Date((BASE + 200) * 1000));
+    const other = makeTransfer(ledger, { from: "user:carol", to: "user:dave", type: "transfer" });
+    vi.setSystemTime(new Date((BASE + 300) * 1000));
+    ledger.reverse(other.tx.id, "staff:bank", "unrelated reversal");
+
+    const scope = resolveTitleScope(store, ECONOMY_SAFE_PEER_ACTIONS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "economy_safe_peer_actions", "alice", scope).facts).toEqual([
+      { kind: "tip", date: "2026-08-20", occurredAt: validAt },
+    ]);
+  });
+
+  it("G. future reversalはhistorical snapshotのoriginalを無効化しない", () => {
+    const { db, store, ledger } = setup();
+    const originalAt = BASE + 100;
+    vi.setSystemTime(new Date(originalAt * 1000));
+    const original = makeTransfer(ledger, { from: "user:alice", to: "user:bob", type: "tip" });
+    vi.setSystemTime(new Date((OBSERVED_AT + 100) * 1000));
+    ledger.reverse(original.tx.id, "staff:bank", "future reversal");
+
+    const scope = resolveTitleScope(store, ECONOMY_SAFE_PEER_ACTIONS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "economy_safe_peer_actions", "alice", scope).facts).toEqual([
+      { kind: "tip", date: "2026-08-20", occurredAt: originalAt },
+    ]);
+  });
+
+  it("H. effectiveEndより前のreversalはoriginalを無効化する", () => {
+    const { db, store, ledger } = setup();
+    vi.setSystemTime(new Date((BASE + 100) * 1000));
+    const original = makeTransfer(ledger, { from: "user:alice", to: "user:bob", type: "tip" });
+    vi.setSystemTime(new Date((OBSERVED_AT - 1) * 1000));
+    ledger.reverse(original.tx.id, "staff:bank", "past reversal");
+
+    const scope = resolveTitleScope(store, ECONOMY_SAFE_PEER_ACTIONS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "economy_safe_peer_actions", "alice", scope)).toEqual({ facts: [] });
+  });
+
+  it("I. reversal.created_at === effectiveEndなら[start,end)上originalはまだ有効", () => {
+    const { db, store, ledger } = setup();
+    const originalAt = BASE + 100;
+    vi.setSystemTime(new Date(originalAt * 1000));
+    const original = makeTransfer(ledger, { from: "user:alice", to: "user:bob", type: "tip" });
+    vi.setSystemTime(new Date(OBSERVED_AT * 1000));
+    ledger.reverse(original.tx.id, "staff:bank", "boundary reversal");
+
+    const scope = resolveTitleScope(store, ECONOMY_SAFE_PEER_ACTIONS_RULE.definition, OBSERVED_AT);
+    expect(readTitleSource(db, "economy_safe_peer_actions", "alice", scope).facts).toEqual([
+      { kind: "tip", date: "2026-08-20", occurredAt: originalAt },
+    ]);
+  });
+});
+
 describe("single-vs-bulk equivalence（D1と同じ方式）", () => {
   it("fresh single get == bulk prefetch → get（複数user）", () => {
     const { db, store, ledger } = setup();
