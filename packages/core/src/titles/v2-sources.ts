@@ -65,6 +65,10 @@ export interface VcSocialSafeSourcePayload {
   readonly distinctCoPresentUsers: number;
   readonly maxRepeatedDaysWithOneCounterpart: number;
   readonly trustedOverlapSeconds: number;
+  readonly dailyBreadth: ReadonlyArray<{
+    readonly date: string;
+    readonly distinctCoPresentUsers: number;
+  }>;
 }
 
 /**
@@ -227,6 +231,7 @@ const EMPTY_SOCIAL_SAFE_PAYLOAD: VcSocialSafeSourcePayload = {
   distinctCoPresentUsers: 0,
   maxRepeatedDaysWithOneCounterpart: 0,
   trustedOverlapSeconds: 0,
+  dailyBreadth: [],
 };
 
 /**
@@ -378,6 +383,7 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
           distinctCoPresentUsers: row.distinctCoPresentUsers,
           maxRepeatedDaysWithOneCounterpart: row.maxRepeatedDaysWithOneCounterpart,
           trustedOverlapSeconds: row.trustedOverlapSeconds,
+          dailyBreadth: row.dailyBreadth,
         });
       }
     }

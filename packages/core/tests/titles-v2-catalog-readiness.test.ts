@@ -301,7 +301,7 @@ describe("semantic false-positive再監査（casino participation vs completion�
   });
 });
 
-describe("semantic false-positive再監査（VC social breadthの時間的分布）", () => {
+describe("PR F2f: VC social breadthのJST日次分布追加後のreadiness", () => {
   it("No.22「顔馴染み」はdistinctCoPresentUsersだけで意味を満たすためREADYのまま", () => {
     // semanticSpecが時間的な広がりを要求しない（「成立する」であって
     // 「複数日に広がる」ではない）ため、単一windowの累積distinct数で十分。
@@ -309,16 +309,48 @@ describe("semantic false-positive再監査（VC social breadthの時間的分布
     expect(entry.status).toBe("READY");
   });
 
-  it("No.23-25はいずれも「複数日/十分な期間/長期」という時間的持続性を要求するがsourceは単一累積値しか無いためREADYではない", () => {
-    // counterexample: day1に100人と会い、day2〜30はAlice1人だけの場合でも
-    // distinctCoPresentUsers/maxRepeatedDaysWithOneCounterpartは大きいままにでき、
-    // 「複数日に広がる/続く/長期にわたる」という時間分布を証明できない。
+  it("No.23-25はglobal distinct + dailyBreadth + date spanで時間的持続性を表現できるためREADY", () => {
+    // counterexample: day1に100人と会い、day2〜30はBob1人だけの場合も
+    // dailyBreadth=[100,1,...]として見えるため、uniformな分布と区別できる。
     for (const no of [23, 24, 25]) {
       const entry = readinessFor(no);
-      expect(entry.status, `candidate #${no}`).not.toBe("READY");
-      expect(entry.status, `candidate #${no}`).toBe("PARTIAL");
-      expect(entry.blockerKinds, `candidate #${no}`).toContain("source_semantic_mismatch");
+      expect(entry.status, `candidate #${no}`).toBe("READY");
+      expect(entry.usableSources, `candidate #${no}`).toEqual(["vc_social_safe"]);
+      expect(entry.specializedResolvers, `candidate #${no}`).toEqual(["computeSafeSocialAggregates"]);
+      expect(entry.missingCapabilities, `candidate #${no}`).toEqual([]);
+      expect(entry.blockerKinds, `candidate #${no}`).toEqual(["none"]);
+      expect(entry.thresholdCategory, `candidate #${no}`).toBe("THRESHOLD_PENDING");
     }
+  });
+
+  it("No.29/30はpair-specific overlap不足のためPARTIAL、No.31はpair persistence不足でBLOCKEDのまま", () => {
+    expect(readinessFor(29)).toMatchObject({
+      status: "PARTIAL",
+      missingCapabilities: ["特定counterpart（day-repeat最大の相手）に紐づくtrusted overlap秒数"],
+      blockerKinds: ["source_semantic_mismatch"],
+    });
+    expect(readinessFor(30)).toMatchObject({
+      status: "PARTIAL",
+      missingCapabilities: ["特定counterpartの生timestamp配列（離れた期間かどうかの判定）"],
+      blockerKinds: ["source_semantic_mismatch"],
+    });
+    expect(readinessFor(31)).toMatchObject({
+      status: "BLOCKED",
+      missingCapabilities: ["特定counterpartのfirst→last span・複数期間・多数日の複合derived"],
+      blockerKinds: ["missing_derived_source"],
+    });
+  });
+
+  it("Theme 7はREADY 4 / PARTIAL 0 / BLOCKED 2、Theme 8はREADY 1 / PARTIAL 2 / BLOCKED 1", () => {
+    const counts = (start: number, end: number) => {
+      const result = { READY: 0, PARTIAL: 0, BLOCKED: 0 };
+      for (const entry of TITLE_V2_CATALOG_READINESS.filter((candidate) => candidate.no >= start && candidate.no <= end)) {
+        if (entry.status !== "META") result[entry.status] += 1;
+      }
+      return result;
+    };
+    expect(counts(22, 27)).toEqual({ READY: 4, PARTIAL: 0, BLOCKED: 2 });
+    expect(counts(28, 31)).toEqual({ READY: 1, PARTIAL: 2, BLOCKED: 1 });
   });
 });
 
@@ -335,10 +367,18 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
     }
   });
 
-  it("registry実集計はREADY 31 / PARTIAL 5 / BLOCKED 55 / META 8", () => {
+  it("registry実集計はREADY 34 / PARTIAL 2 / BLOCKED 55 / META 8", () => {
     const counts = new Map<string, number>();
     for (const entry of TITLE_V2_CATALOG_READINESS) counts.set(entry.status, (counts.get(entry.status) ?? 0) + 1);
-    expect(Object.fromEntries(counts)).toEqual({ READY: 31, BLOCKED: 55, PARTIAL: 5, META: 8 });
+    expect(Object.fromEntries(counts)).toEqual({ READY: 34, BLOCKED: 55, PARTIAL: 2, META: 8 });
+  });
+
+  it("source_semantic_mismatchはNo.29/30の2件だけ、missing_derived_sourceは12件のまま", () => {
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("source_semantic_mismatch")).map((entry) => entry.no)).toEqual([
+      29,
+      30,
+    ]);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(12);
   });
 
   it("missing_derived_sourceはNo.10-21の解消で24から12へ減る", () => {
@@ -445,8 +485,11 @@ describe("PR F2b: casino completion source追加後のreadiness", () => {
     for (const no of [58, 66, 67, 80, 81, 82]) {
       expect(readinessFor(no).blockerKinds, `candidate #${no}`).not.toContain("source_semantic_mismatch");
     }
-    for (const no of [23, 24, 25, 29, 30]) {
+    for (const no of [29, 30]) {
       expect(readinessFor(no).blockerKinds, `candidate #${no}`).toContain("source_semantic_mismatch");
+    }
+    for (const no of [23, 24, 25]) {
+      expect(readinessFor(no).blockerKinds, `candidate #${no}`).not.toContain("source_semantic_mismatch");
     }
   });
 });

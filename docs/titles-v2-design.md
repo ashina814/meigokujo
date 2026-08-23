@@ -100,7 +100,10 @@ derived sourceを使う。
 - `vc_co_presence`: pairwiseの重なり（`privacy: restricted`。相手のuserIdを含むため
   称号から直接は使わせない）
 - `vc_social_safe`: `vc_co_presence` を畳み込んだ、本人単位の安全な集計（`vc_co_presence`
-  から派生する2段のdependency chain）
+  から派生する2段のdependency chain）。scope全体のdistinct人数・同一相手との最大
+  JST日数・総pair-secondsに加え、PR F2fでJST日ごとのdistinct counterpart数
+  `dailyBreadth: [{ date, distinctCoPresentUsers }]`を追加した。日次entryにidentity、
+  pair、channel、timestamp、visit count、pair overlapは含めない
 
 **信頼境界**: 開始時刻は常にDiscordイベントを観測した記録なので信頼できる。終了時刻は
 `observed`／訪問がまだ`window.end`で開いている場合のみ信頼できる（`isTrustedVisitEnd()`）。
@@ -792,7 +795,10 @@ shadow evaluation/threshold calibration・production cutover
 - `vc_social_safe`（`privacy: safe`, `titleUsable: true`）: 公開semanticとして
   relationship titleが依存を宣言するsource。counterpart identityを含まない集計値
   （`distinctCoPresentUsers`/`maxRepeatedDaysWithOneCounterpart`/
-  `trustedOverlapSeconds`）だけを持つ——B/C1から変更していない。
+  `trustedOverlapSeconds`）と、JST日別のidentity-freeな
+  `dailyBreadth: [{ date, distinctCoPresentUsers }]`だけを持つ。PR F2fはこのsafe
+  aggregateへ日次分布を加えただけで、private witnessやpair-specific timelineを
+  public sourceへ昇格していない。
 - `vc_co_presence`（`privacy: restricted`, `titleUsable: false`,
   `restrictedUse: "relationship_private_evidence"`）: 生pairwise data
   （counterpart identityを含む）。**この用途のためにtitleUsableをtrueへ緩めていない**
