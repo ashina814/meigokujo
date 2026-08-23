@@ -4,6 +4,7 @@ import { adminCommand } from "./commands/admin-hub.js";
 import { shokanCommand } from "./commands/shokan.js";
 import { transferCommand } from "./commands/transfer.js";
 import { publicEventRecordCommand } from "./commands/public-event-record.js";
+import { publicEventCompleteCommand } from "./commands/public-event-complete.js";
 import { sessionCommand } from "./commands/entry.js";
 import { sessionScheduleCommand } from "./commands/session-schedule.js";
 import { evaluationCommand } from "./commands/evaluation.js";
@@ -29,6 +30,7 @@ const commands = [
   sessionScheduleCommand.toJSON(),
   evaluationCommand.toJSON(),
   publicEventRecordCommand.toJSON(),
+  publicEventCompleteCommand.toJSON(),
   // 全員
   transferCommand.toJSON(),
   profileCommand.toJSON(),

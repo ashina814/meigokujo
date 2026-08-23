@@ -48,6 +48,14 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > 別途残る——SOURCE READINESSのREADYをproduction release可と解釈しない
 > （§15参照）。
 
+> **PR F2d反映（2026-08-23）**: roster finalizationとは別のimmutable正本
+> `public_event_completions`とsafe JOIN source
+> `public_event_completed_participations`を追加した。既存E3 roster semanticsは
+> 変更せず、明示的なstaff completion attestationだけを採用し、自動backfillは
+> 行わない。No.80/81がPARTIAL→READY、No.82はcompletion不足だけ解消して
+> event-date span source不足でBLOCKEDのまま。READY 17→19、PARTIAL 7→5、
+> `source_semantic_mismatch` 8→5。詳細は§16参照。
+
 ## 0. xlsx canonical hash（exact drift guard）
 
 | 項目 | 値 |
@@ -95,13 +103,13 @@ full-clear editionに登録されたREQUIRED印100%——NONCOUNTの91 behavior�
 
 | status | 件数 | 意味 |
 | --- | --- | --- |
-| READY | 17 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
-| PARTIAL | 7 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
+| READY | 19 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
+| PARTIAL | 5 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
 | BLOCKED | 67 | 意味的に近いものが repo に一切存在しない |
 | META | 8 | kind:meta（別bucket、§7参照） |
 
 **READY = 今すぐreleaseしてよい、ではない**。sourceReadinessとthreshold決定は
-別軸（§10参照）——READY 17件も、production threshold値（分布TBD等）が
+別軸（§10参照）——READY 19件も、production threshold値（分布TBD等）が
 決まるまではrelease対象にならない。またSeries manifest／Collection Edition／
 Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）。No.58はさらに、
 award後のreversalを既存immutable ownershipへどう反映するかが未決定であるため、
@@ -115,11 +123,11 @@ source-readyでもproduction release不可（§15）。
 | missing_derived_source | 24 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
 | missing_manifest | 9 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
 | missing_role_history | 7 | role-at-time（過去のある時点でどのroleを保持していたか）がrepo全体で未実装 |
-| source_semantic_mismatch | 8 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（§12参照。casino分は§14、economy No.58は§15で解消済み） |
+| source_semantic_mismatch | 5 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（casino分は§14、economy分は§15、event completion分は§16で解消済み） |
 | missing_event_protocol | 2 | イベントデータモデル自体にorganizer/staff区別が存在しない |
 | known_bug | 0 | PR F2aで`computeLastOccupant()`のsame-second/0-second visit tie bugを修正——catalog全体から解消済み（§13参照） |
 
-（`none`のBehavior候補は17件——ちょうどREADY件数と一致。PARTIAL 7件は
+（`none`のBehavior候補は19件——ちょうどREADY件数と一致。PARTIAL 5件は
 すべて`source_semantic_mismatch`を持つ。）
 
 ## 4. Theme別 readiness
@@ -141,7 +149,7 @@ source-readyでもproduction release不可（§15）。
 | 13 | Land・経済 | 8 | 1 | 0 | 7 |
 | 14 | 賭場 | 8 | 3 | 0 | 5 |
 | 15 | 招待 | 6 | 2 | 0 | 4 |
-| 16 | イベント | 5 | 0 | 2 | 3 |
+| 16 | イベント | 5 | 2 | 0 | 3 |
 | 17 | 城横断 | 7 | 0 | 0 | 7 |
 
 BUMP/鐘だけが100% READY（既存`bump_events`がそのまま第一級の
@@ -150,7 +158,7 @@ timestampリストを持つため）。TC交流・公開部屋・城横断は0% 
 
 ## 5. source別に残る実装（READYを支えるsource／PARTIALの制約／BLOCKEDが必要とするもの）
 
-READYを支えている既存`titleUsable:true` source（8種、17件）:
+READYを支えている既存`titleUsable:true` source（9種、19件）:
 
 - `vc_empty_start_then_joined`（No.1-2）
 - `vc_last_occupant`（No.6, 7, 9——PR F2aでsame-second/0-second visit tie bugを修正済み、§13参照）
@@ -160,16 +168,17 @@ READYを支えている既存`titleUsable:true` source（8種、17件）:
 - `casino_completed_activity_days`（No.66, 67——PR F2bで追加したcompletion正本、§14参照）
 - `confirmed_invites`（No.74-75 のみ——`invitee_id UNIQUE`によりdistinct数が保証される）
 - `economy_safe_peer_actions`（No.58——snapshot時点でreverse済みoriginalを除外、§15参照）
+- `public_event_completed_participations`（No.80-81——明示staff completion正本と同一roster revisionへJOIN、§16参照）
 
 PARTIALを止めているもの（source_semantic_mismatch、§12/§14で今回のレビューにより判定）:
 
 - `vc_social_safe.trustedOverlapSeconds`が全counterpart合算で、特定counterpartに紐づけられない（No.29, 30）
 - `vc_social_safe`が単一累積値のみで時間的分布を持たない（No.23-25）
-- `public_events`にstatus/lifecycle列が無くevent completedを保証できない（No.80, 81, 82）
 
 （casino participation-vs-completion mismatchはPR F2bで解消済み——No.66/67は
 READY化、No.69はmissing_manifestのみ残る。economy reversal mismatchも
-PR F2cで解消済み——No.58はSOURCE READINESSのみREADY化。§14-15参照。）
+PR F2cで解消済み。public event completion mismatchもPR F2dで解消済み——
+No.80/81はREADY、No.82はevent-date span source不足のみ残る。§14-16参照。）
 
 BLOCKEDが新たに必要とするもの（xlsxのSource_Map original「未実装」から、
 E2/E3/E4/F2b実装後の現repoで再監査した差分）:
@@ -184,7 +193,7 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 - **economy機能family classifier拡張**—— No.61, 63（2件）
 - **shop purchase safe source新設**—— No.62, 65（2件）
 - **event dual-role（organizer/staff）protocol拡張**—— No.83-84（2件）。`public_events`のデータモデル自体にorganizer概念が無い
-- **event_dateのsafe payload露出**—— No.82（1件、completion保証欠如とも複合）
+- **event_dateのsafe span source新設**—— No.82（1件）。`completedAt`はstaff attestation時刻であり実event日/spanの代用不可
 - **`castle_experience_safe`新設 + 城横断manifest**—— No.85-91（7件）。grep 0件で、E3のevent infra完成待ちでもある
 - **第I期core game family一覧manifest**—— No.69（1件）。completion半分はPR F2bで解消済み——残るのはmanifest未定義のみ
 
@@ -198,7 +207,7 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 | STRUCTURAL_PLUS_DISTRIBUTION | 1 | 構造は決まるが、一部の値は分布依存 |
 | META_NOT_APPLICABLE | 8 | meta（別contract、§10適用外） |
 
-sourceReadinessとthresholdは別軸——READY 17件のうち、STRUCTURAL_FIXEDなのは
+sourceReadinessとthresholdは別軸——READY 19件のうち、STRUCTURAL_FIXEDなのは
 一部（初回系）のみで、残りはTHRESHOLD_PENDINGのままREADYになっている
 （sourceは十分だが実数値は分布を見てから決める）。
 
@@ -207,16 +216,16 @@ sourceReadinessとthresholdは別軸——READY 17件のうち、STRUCTURAL_FIXE
 | 依存軸 | 件数 | 備考 |
 | --- | --- | --- |
 | role-at-time依存（`roleDependency !== "none"`） | 10 | うちrole-history欠如**単独**が原因なのは3件（No.27, 64, 73）、残りは他blockerと複合 |
-| イベントtheme（Theme No.16） | 5 | 全件PARTIAL/BLOCKED——No.80/81はcompletion保証欠如でPARTIAL、No.82-84は依然BLOCKED |
+| イベントtheme（Theme No.16） | 5 | No.80/81はcompletion sourceでREADY、No.82-84は依然BLOCKED |
 | manifest依存（thresholdCategory: MANIFEST_DEPENDENT） | 6 | 賭場core family一覧・城横断family一覧・series一覧が未定義 |
 | known bug依存 | 0 | PR F2aで`computeLastOccupant`の同秒0秒visit tie bugを修正——catalog全体から解消（§13参照） |
-| source_semantic_mismatch依存 | 8 | §12参照。casino分（No.66,67,69）はPR F2b、economy reversal（No.58）はPR F2cで解消——残るのはVC social breadth（No.23-25,29,30）・event completion（No.80-82）（§14-15参照） |
+| source_semantic_mismatch依存 | 5 | casino分はPR F2b、economy reversalはPR F2c、event completion分（No.80-82）はPR F2dで解消——残るのはVC social breadth（No.23-25,29,30）のみ（§14-16参照） |
 
 ## 8. 次に何を実装すれば最も多くのcandidateがunblockされるか
 
 単純なunblock件数だけでなく、安全性・基盤依存・実装順序も考慮した優先順位。
 `missing_persisted_source`単独が理由の候補が27件、`missing_derived_source`
-単独が21件、`source_semantic_mismatch`単独が7件——新規sourceを1つ作る、
+単独が21件、`source_semantic_mismatch`単独が5件——新規sourceを1つ作る、
 または既存sourceのsemanticsを正すごとに複数candidateが同時に動く
 「クラスタ」が明確に存在する。
 
@@ -225,31 +234,30 @@ sourceReadinessとthresholdは別軸——READY 17件のうち、STRUCTURAL_FIXE
 > participation safe signal（旧クラスタ1、F2a後の番号）も**PR F2bで
 > 解消済み**（§14参照）——No.66,67がPARTIAL→READY、No.69のcompletion
 > blockerも解消。economy reversed-original除外も**PR F2cで解消済み**
-> （§15参照）——No.58がPARTIAL→READY。以下は残っているクラスタのみを
+> （§15参照）——No.58がPARTIAL→READY。public event completion保証も
+> **PR F2dで解消済み**（§16参照）——No.80/81がPARTIAL→READY、No.82は
+> event-date span blockerのみ残る。以下は残っているクラスタのみを
 > 優先度順に並べ直したもの。
 
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
-| 1 | `public_events`へのevent completion保証（status列 or 運用contractの明文化＋evidence） | 2件をPARTIAL→READY化（No.80,81） | コード変更が最小で済む可能性がある（例えば「recordFinalizedEventは必ずevent終了後に呼ぶ」という運用contractをdocs化しevidenceとして採用する設計判断でも解決し得る） |
-| 2 | VC group-size拡張（day/share/span） | 12件（No.10-21） | 既存`vc_group_size_seconds`の上に集計を足すだけ——新規persisted source不要、単一derived拡張で最大クラスタが動く |
-| 3 | `vc_social_safe`にper-day counterpart breadth集計を追加 | 3件をPARTIAL→READY化（No.23,24,25）＋No.29,30の一部も前進 | クラスタ2と同じVC derived層の拡張——日別counterpart distinct集計を追加すれば複数候補が同時に前進する |
-| 4 | `public_room_activity_safe`新設 | 7-8件（No.50-57） | 生データ（Rooms）は既にrich——titles層への昇格だけで完結し、他ドメインへの依存が無い独立クラスタ |
-| 5 | `tc_conversation_safe`/`tc_reaction_safe`新設 | 8件（No.42-49） | TC側の会話構造化は`social_activity_time_safe`（クラスタ6）とも土台を共有するため、先に着手すると時間帯クラスタの半分も前進する |
-| 6 | `social_activity_time_safe`(TC+VC)新設 | 6件（No.32-37） | クラスタ5のTC構造化と共通基盤——健康/FOMO対策でCOUNTABLE 0のまま据え置く前提は維持 |
-| 7 | `invite_retention_safe`新設 | 4件（No.76-79） | 外部勧誘圧のリスクが高いドメイン（optimizationRisk: HIGH）——実装優先度はunblock数以上に安全設計のレビュー時間を要する |
-| 8 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
-| 9 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
-| 10 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
-| 11 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
-| 12 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
-| 13 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
+| 1 | VC group-size拡張（day/share/span） | 12件（No.10-21） | 既存`vc_group_size_seconds`の上に集計を足すだけ——新規persisted source不要、単一derived拡張で最大クラスタが動く |
+| 2 | `vc_social_safe`にper-day counterpart breadth集計を追加 | 3件をPARTIAL→READY化（No.23,24,25）＋No.29,30の一部も前進 | クラスタ1と同じVC derived層の拡張——日別counterpart distinct集計を追加すれば複数候補が同時に前進する |
+| 3 | `public_room_activity_safe`新設 | 7-8件（No.50-57） | 生データ（Rooms）は既にrich——titles層への昇格だけで完結し、他ドメインへの依存が無い独立クラスタ |
+| 4 | `tc_conversation_safe`/`tc_reaction_safe`新設 | 8件（No.42-49） | TC側の会話構造化は`social_activity_time_safe`（クラスタ5）とも土台を共有するため、先に着手すると時間帯クラスタの半分も前進する |
+| 5 | `social_activity_time_safe`(TC+VC)新設 | 6件（No.32-37） | クラスタ4のTC構造化と共通基盤——健康/FOMO対策でCOUNTABLE 0のまま据え置く前提は維持 |
+| 6 | `invite_retention_safe`新設 | 4件（No.76-79） | 外部勧誘圧のリスクが高いドメイン（optimizationRisk: HIGH）——実装優先度はunblock数以上に安全設計のレビュー時間を要する |
+| 7 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
+| 8 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
+| 9 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
+| 10 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
+| 11 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
+| 12 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
 
-クラスタ1のevent completion保証は、既存event sourceへの追加保証で済む
-可能性が高いため、まず残るsemantic mismatchを解消する。その後は、
-単一derived拡張で最大12件を動かせるクラスタ2のVC group-size
-day/share/span拡張へ進むのが自然。F2a/F2b/F2cで既存sourceの
-正確性・semantic debtを先に減らしてきた方針を維持しつつ、
-ここから大きいVC/TC/roomクラスタへ移る。
+event completion mismatchはF2dで解消した。次は、単一derived拡張で
+最大12件を動かせるクラスタ1のVC group-size day/share/span拡張へ
+進むのが自然。F2a/F2b/F2c/F2dで既存sourceの正確性・semantic debtを
+先に減らしてきた方針を維持しつつ、ここから大きいVC/TC/roomクラスタへ移る。
 
 ## 9. editorial intent → runtime resolution（契約の食い違いの明示）
 
@@ -264,7 +272,7 @@ xlsx上の記述と、現在のruntime契約が食い違う箇所——本PRで�
 | 賭場・招待・時間帯・role-aware・generic eventも「REQUIRED」（Full-clear Manifest Contract） | 本PRではfull-clear editionそのものを一切activateしない | REQUIRED表記はcandidate上の**将来の意図**の記録であり、今すぐeditionに組み込まれるという意味ではない（§13参照） |
 | casino No.66/67/69の「正常完了する」 | ~~`casino_activity_days`はsuccessful funded participation commitmentまでしか証明しない~~ → **PR F2bで解消**: `casino_completed_activity_days`がcanonical financial resolution primitive成功後にのみ書かれるcompletion正本として追加された（§14） | catalog側semanticsは変更していない——source側にcompletion保証を追加する形で解決した。No.69はmanifest未定義のみ残る |
 | economy No.58の「reversal済取引は無効」 | **PR F2cで解消**: `economy_safe_peer_actions`はevaluation snapshot時点でreversal済みのoriginalを除外する（future reversalは過去を変更しない、§15） | catalog/xlsx semanticは変更していない。source readinessはREADY。ただしpost-award reversalは別のproduction release gateとして残る |
-| event No.80/81の「completed公式イベント」 | `public_events`にlifecycle/status列が無く、コードレベルでcompletion保証を持たない（§12） | catalog側semanticsは変更しない。運用contract（staffは必ず終了後に記録する）の明文化＋evidence追加、またはstatus列追加のどちらで解決するかは将来判断 |
+| event No.80/81の「completed公式イベント」 | **PR F2dで解消**: immutable `public_event_completions`へstaffが明示attestし、safe sourceがroster revisionとJOINする（§16） | catalog側semanticsと既存E3 roster sourceは変更していない。No.82は実event-date span source不足だけ残る |
 
 ## 10. Production runtimeへの非影響（固定済み）
 
@@ -635,3 +643,43 @@ revoke機構、reversal期限、economy policy変更を実装しない。
   → Eだけをfocus実行し、expected tip #2に対してtip #1の`occurredAt`を返してfail
   （1 failure）→ restore。
 - restore後に対象テストを再実行し、意図した実装へ完全復元されていることを確認した。
+
+## 16. PR F2d: Public Event Completed Participation Safe Signal
+
+### 16.1 rosterとcompletionの分離
+
+既存E3の`public_event_participations`は「運営が確定したrosterにuserが含まれた」
+事実のまま変更していない。`recorded_at`もroster保存時刻であり、event終了時刻では
+ない。別のappend-only正本`public_event_completions`へ、`/イベント完了記録`の
+preview→confirmを通じてstaffが終了済みと明示attestしたeventだけを記録する。
+既存rosterからの自動backfillやevent_dateへのbackdateは行わない。
+
+completion rowは`event_key`をprimary keyとし、`(event_key,
+roster_recorded_at)`で`public_events`へFK接続する。`completed_at >=
+roster_recorded_at`をCHECKし、timestampはservice clockだけが決める。retryは
+最初の`completed_at`/`completed_by`を保持する。event_dateがcompletion時点のJST
+dateより未来ならrejectする。
+
+### 16.2 raw/safe source
+
+raw `public_event_completions`は`privacy:"restricted"`, `titleUsable:false`,
+`restrictedUse:"public_event_safe_completion_classification"`。derived
+`public_event_completed_participations`は、participant rowとcompletion rowの
+event key・roster timestampが一致し、completion timestampがscope内にある場合だけ
+`{ eventKey, completedAt }`を返す。name/date/recordedBy/completedBy/count/他参加者は
+公開しない。`completedAt`はstaff attestation時刻でactual event end timestampでは
+ないため、raw/safeとも`orderable:false`であり、earnedAtの根拠にはできない。
+
+### 16.3 readiness delta
+
+| No | before | after |
+| --- | --- | --- |
+| 80 | PARTIAL（completion mismatch） | READY（`public_event_completed_participations`） |
+| 81 | PARTIAL（completion mismatch） | READY（`public_event_completed_participations`） |
+| 82 | BLOCKED（event-date + completion） | BLOCKED（実event-date safe span source不足のみ） |
+| 83/84 | BLOCKED（role protocol） | 変更なし |
+
+registry実集計はREADY 17→19、PARTIAL 7→5、BLOCKED 67・META 8は不変。
+`source_semantic_mismatch`は8→5、Theme 16はREADY 2 / PARTIAL 0 /
+BLOCKED 3。production BehaviorTitleDefinition、threshold、Bot award wiringは
+追加していない。

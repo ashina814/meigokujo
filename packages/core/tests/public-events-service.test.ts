@@ -207,9 +207,117 @@ describe("§21 recordedByはpayloadへ出さない（service層の最小確認�
 });
 
 describe("§22 immutability", () => {
-  it("recordFinalizedEvent()以外にUPDATE/DELETE APIが存在しない（型レベルで確認: publicメソッドはrecordFinalizedEventのみ）", () => {
+  it("公開APIにUPDATE/DELETEが存在しない", () => {
     const { events } = setup();
     const methods = Object.getOwnPropertyNames(Object.getPrototypeOf(events)).filter((m) => m !== "constructor");
-    expect(methods).toEqual(["recordFinalizedEvent"]);
+    expect(methods).toEqual(["recordFinalizedEvent", "getEventCompletionSummary", "recordCompletedEvent"]);
+  });
+});
+
+function recordRoster(events: PublicEvents, overrides: Partial<Parameters<PublicEvents["recordFinalizedEvent"]>[0]> = {}) {
+  return events.recordFinalizedEvent(baseInput({ eventDate: "2026-08-20", ...overrides }));
+}
+
+describe("recordCompletedEvent() — explicit immutable completion", () => {
+  it("existing rosterへcompletionを1 rowだけ記録し、resultへcompletedByを出さない", () => {
+    const { events, db } = setup();
+    recordRoster(events);
+    const result = events.recordCompletedEvent({ eventKey: "gf-2026-08-22", completedBy: "staff-completer" });
+    expect(result).toEqual({ eventKey: "gf-2026-08-22", participantCount: 3, completedAt: BASE, alreadyRecorded: false });
+    expect(Object.keys(result).sort()).toEqual(["alreadyRecorded", "completedAt", "eventKey", "participantCount"]);
+    expect(db.prepare(`SELECT * FROM public_event_completions`).all()).toEqual([
+      { event_key: "gf-2026-08-22", roster_recorded_at: BASE, completed_by: "staff-completer", completed_at: BASE },
+    ]);
+  });
+
+  it("missing event / rosterはfail-closed", () => {
+    const { events, db } = setup();
+    expect(() => events.recordCompletedEvent({ eventKey: "missing-event", completedBy: "staff" })).toThrow(/does not exist/);
+    db.prepare(`INSERT INTO public_events (event_key, name, event_date, recorded_by, recorded_at) VALUES (?, ?, ?, ?, ?)`).run(
+      "rosterless", "Rosterless", "2026-08-20", "staff", BASE,
+    );
+    expect(() => events.recordCompletedEvent({ eventKey: "rosterless", completedBy: "staff" })).toThrow(/no participant roster/);
+  });
+
+  it("clockがrosterより前ならreject、同時刻ならsuccess", () => {
+    const db = openDb(":memory:");
+    let now = BASE;
+    const events = new PublicEvents(db, () => now);
+    recordRoster(events);
+    now = BASE - 1;
+    expect(() => events.recordCompletedEvent({ eventKey: "gf-2026-08-22", completedBy: "staff" })).toThrow(
+      /before its roster/,
+    );
+    now = BASE;
+    expect(events.recordCompletedEvent({ eventKey: "gf-2026-08-22", completedBy: "staff" }).completedAt).toBe(BASE);
+  });
+
+  it("completion JST dateより未来のevent_dateはreject、同じJST dateは許可", () => {
+    const db = openDb(":memory:");
+    const sameDayAtJstMidnight = Math.floor(Date.UTC(2026, 7, 19, 15, 0, 0) / 1000); // JST 2026-08-20 00:00
+    const events = new PublicEvents(db, () => sameDayAtJstMidnight);
+    recordRoster(events, { eventKey: "same-day", eventDate: "2026-08-20" });
+    expect(() => events.recordCompletedEvent({ eventKey: "same-day", completedBy: "staff" })).not.toThrow();
+
+    recordRoster(events, { eventKey: "future-day", eventDate: "2026-08-21" });
+    expect(() => events.recordCompletedEvent({ eventKey: "future-day", completedBy: "staff" })).toThrow(/future JST event date/);
+  });
+
+  it("retryは時刻・最初のcompleted_byを保持し、別staffでもrowを増やさない", () => {
+    const db = openDb(":memory:");
+    let now = BASE;
+    const events = new PublicEvents(db, () => now);
+    recordRoster(events);
+    const first = events.recordCompletedEvent({ eventKey: "gf-2026-08-22", completedBy: "staff-1" });
+    now += 3600;
+    const retry = events.recordCompletedEvent({ eventKey: "gf-2026-08-22", completedBy: "staff-2" });
+    expect(retry).toEqual({ ...first, alreadyRecorded: true });
+    expect(db.prepare(`SELECT completed_by, completed_at FROM public_event_completions`).all()).toEqual([
+      { completed_by: "staff-1", completed_at: BASE },
+    ]);
+  });
+
+  it("callerのcompletedAt injectionを無視し、service clockだけを使う", () => {
+    const { events } = setup();
+    recordRoster(events);
+    const result = events.recordCompletedEvent({
+      eventKey: "gf-2026-08-22",
+      completedBy: "staff",
+      completedAt: 1,
+    } as Parameters<PublicEvents["recordCompletedEvent"]>[0]);
+    expect(result.completedAt).toBe(BASE);
+  });
+
+  it("FK/CHECKを実DB constraintで拒否し、roster既存行を変更しない", () => {
+    const { events, db } = setup();
+    recordRoster(events);
+    const rosterBefore = db.prepare(`SELECT * FROM public_event_participations ORDER BY user_id`).all();
+    expect(() =>
+      db.prepare(
+        `INSERT INTO public_event_completions (event_key, roster_recorded_at, completed_by, completed_at) VALUES (?, ?, ?, ?)`,
+      ).run("missing", BASE, "staff", BASE),
+    ).toThrow();
+    expect(() =>
+      db.prepare(
+        `INSERT INTO public_event_completions (event_key, roster_recorded_at, completed_by, completed_at) VALUES (?, ?, ?, ?)`,
+      ).run("gf-2026-08-22", BASE + 1, "staff", BASE + 1),
+    ).toThrow();
+    expect(() =>
+      db.prepare(
+        `INSERT INTO public_event_completions (event_key, roster_recorded_at, completed_by, completed_at) VALUES (?, ?, ?, ?)`,
+      ).run("gf-2026-08-22", BASE, "staff", BASE - 1),
+    ).toThrow();
+    expect(db.prepare(`SELECT * FROM public_event_participations ORDER BY user_id`).all()).toEqual(rosterBefore);
+  });
+
+  it("preview summaryはDB正本値だけを返す", () => {
+    const { events } = setup();
+    recordRoster(events);
+    expect(events.getEventCompletionSummary("gf-2026-08-22")).toEqual({
+      eventKey: "gf-2026-08-22",
+      name: "God Field大会",
+      eventDate: "2026-08-20",
+      participantCount: 3,
+    });
   });
 });
