@@ -778,6 +778,100 @@ export function splitIntervalByJstDay(startedAt: number, endedAt: number): Array
 }
 
 /**
+ * canonical [start,end) intervalをJSTの暦日×hourへ分割する。24 hour binは称号threshold
+ * ではなくprivacy-safeなmeasurement resolutionであり、秒ごとのloopは行わない。
+ */
+export function splitIntervalByJstHour(
+  startedAt: number,
+  endedAt: number,
+): Array<{ date: string; hour: number; seconds: number }> {
+  const parts: Array<{ date: string; hour: number; seconds: number }> = [];
+  let cursor = startedAt;
+  let guard = 0;
+  const SANITY_LIMIT_HOURS = 24 * 365 * 100;
+  while (cursor < endedAt) {
+    if (guard >= SANITY_LIMIT_HOURS) {
+      throw new RangeError(
+        `splitIntervalByJstHour: interval [${startedAt}, ${endedAt}) spans more than ${SANITY_LIMIT_HOURS} hours — likely a bug, not a legitimate title window`,
+      );
+    }
+    const shifted = cursor + JST_OFFSET_SEC;
+    const hourStart = Math.floor(shifted / 3600) * 3600 - JST_OFFSET_SEC;
+    const iso = new Date(shifted * 1000).toISOString();
+    const partEnd = Math.min(endedAt, hourStart + 3600);
+    parts.push({ date: iso.slice(0, 10), hour: Number(iso.slice(11, 13)), seconds: partEnd - cursor });
+    cursor = partEnd;
+    guard += 1;
+  }
+  return parts;
+}
+
+export interface TrustedSocialPresenceIntervals {
+  readonly userId: string;
+  /** identity/channelを除いたsubject-global wall-clock union。[start,end)、start ASC。 */
+  readonly intervals: ReadonlyArray<{ readonly start: number; readonly end: number }>;
+}
+
+function unionIntervals(
+  intervals: ReadonlyArray<{ readonly start: number; readonly end: number }>,
+): Array<{ start: number; end: number }> {
+  const ordered = intervals.filter((value) => value.end > value.start).slice().sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged: Array<{ start: number; end: number }> = [];
+  for (const interval of ordered) {
+    const previous = merged[merged.length - 1];
+    if (!previous || interval.start > previous.end) {
+      merged.push({ start: interval.start, end: interval.end });
+    } else if (interval.end > previous.end) {
+      // touching [a,b) + [b,c) とoverlapを同じwall-clock unionへ畳む。
+      previous.end = interval.end;
+    }
+  }
+  return merged;
+}
+
+/**
+ * subjectと少なくとも1人のother humanがtrustedに同時在室したwall-clock intervalの正本。
+ * pair secondsは合算せず、全counterpart・全channelをsubject単位でglobal unionする。
+ * partial_observationはpresence measurementとして使用できるためstartKindでは除外しない。
+ * untrusted visitはそのvisit/pairだけ局所除外し、trusted siblingを巻き込まない。
+ */
+export function computeTrustedSocialPresenceIntervals(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): TrustedSocialPresenceIntervals[] {
+  const requested = userIds ? [...new Set(userIds)] : undefined;
+  if (requested && requested.length === 0) return [];
+  const resolved = resolveWindow(window);
+  const subjectVisits = computeLogicalVisitsResolved(db, resolved, requested);
+  const targetIds = requested ?? [...new Set(subjectVisits.map((visit) => visit.userId))].sort();
+  if (subjectVisits.length === 0) return targetIds.map((userId) => ({ userId, intervals: [] }));
+
+  const channelIds = [...new Set(subjectVisits.map((visit) => visit.channelId))];
+  const allVisits = coalesceVisits(loadRawSegmentsForChannels(db, resolved, channelIds), resolved);
+  const byChannel = groupByChannel(allVisits);
+  const intervalsByUser = new Map<string, Array<{ start: number; end: number }>>();
+  for (const userId of targetIds) intervalsByUser.set(userId, []);
+
+  for (const subject of subjectVisits) {
+    if (!isTrustedVisitEnd(subject.endQuality) || subject.endedAt <= subject.startedAt) continue;
+    const intervals = intervalsByUser.get(subject.userId);
+    if (!intervals) continue;
+    for (const other of byChannel.get(subject.channelId) ?? []) {
+      if (other.userId === subject.userId || !isTrustedVisitEnd(other.endQuality)) continue;
+      const start = Math.max(subject.startedAt, other.startedAt);
+      const end = Math.min(subject.endedAt, other.endedAt);
+      if (end > start) intervals.push({ start, end });
+    }
+  }
+
+  return targetIds.map((userId) => ({
+    userId,
+    intervals: unionIntervals(intervalsByUser.get(userId) ?? []),
+  }));
+}
+
+/**
  * [startedAt, endedAt) が触れるdistinct JST暦日を列挙する。秒単位では舐めず、日境界だけ進む。
  *
  * cursorはループのたびに厳密に翌日の00:00（JST）へ進むため、無限ループにはなり得ない

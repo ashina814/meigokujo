@@ -109,6 +109,7 @@ const ECON_FILE = "packages/core/src/titles/v2-economy.ts";
 const CASINO_FILE = "packages/core/src/titles/v2-casino.ts";
 const EVENT_SERVICE_FILE = "packages/core/src/public-events/service.ts";
 const ROOMS_DERIVED_FILE = "packages/core/src/rooms/derived.ts";
+const SOCIAL_ACTIVITY_TIME_FILE = "packages/core/src/social-activity-time/derived.ts";
 
 // ─────────────────────────────────────────────────────────────
 // Theme 1: 場を起こす (vc_ignite, No.1-5) — source: vc_empty_start_then_joined
@@ -379,13 +380,17 @@ const THEME_08: ManualReadinessEntry[] = [
 // ─────────────────────────────────────────────────────────────
 const THEME_09: ManualReadinessEntry[] = [32, 33, 34, 35, 36, 37].map((no) => ({
   no,
-  status: "BLOCKED" as const,
-  usableSources: [],
-  specializedResolvers: [],
-  missingCapabilities: ["TC+VC統合のJST daypart safe aggregate"],
-  evidence: [{ file: "packages/core/src/text-activity/service.ts", symbol: "text_active_days (day-collapsed, no daypart distribution)" }],
-  notes: "text_active_daysは日単位で最初の1件だけを保持し、日内の時間分布を失う。VC側にも汎用presenceのdaypart sourceが無い。social_activity_time_safe (TC+VC) は未実装のまま（xlsx判断と現repoで一致）。",
-  blockerKinds: ["missing_persisted_source"] as const,
+  status: "READY" as const,
+  usableSources: ["social_activity_time_safe"] as const,
+  specializedResolvers: ["computeSocialActivityTimeSafe"],
+  missingCapabilities: [],
+  evidence: [
+    { file: VC_SOURCES_FILE, symbol: "SocialActivityTimeSafeSourcePayload" },
+    { file: SOCIAL_ACTIVITY_TIME_FILE, symbol: "computeSocialActivityTimeSafe" },
+  ],
+  notes:
+    "PR F2i: canonical same-surface TC exchange候補とtrusted VC social-presence wall-clock unionをJST date×24hour sparse分布へ統合した。hourはprivacy-safe measurement resolutionであり、daypart境界・TC gap・VC meaningful seconds・share/concentration・必要日数はproduction calibrationへ残す。日付構造により一晩だけの多hourと多数日への分散を区別できる。全件NONCOUNTで、streakや夜更かし量rewardは作らない。",
+  blockerKinds: ["none"] as const,
   optimizationRisk: "HIGH" as const,
 }));
 

@@ -1881,6 +1881,33 @@ exactに証明できるが、通常free-flowの同一topic継続をcontent無し
 強制するsemantic縮小を避けてPARTIAL。production threshold・BehaviorTitleDefinition・award/
 notification・catalog activationは追加しない。詳細はreadiness §20参照。
 
+### F2i — Public Social Activity Time Safe
+
+F2hで利用可能になったcanonical public TC metadataと既存canonical logical VC visitsを、
+read-only derived `social_activity_time_safe`へ統合する。payloadはJST date×hour 0..23の
+sparse distributionで、各hourに`tcBestOtherGapMs`と`vcTrustedSocialSeconds`だけを持つ。
+24hour binはprivacy-safe measurement resolutionであり、morning/afternoon/evening/
+late-night境界ではない。TC gap、VC meaningful seconds、share/concentration/必要日数の
+production thresholdはF5/F6 calibrationへ残す。
+
+TCはstandalone投稿をsocial activityにせず、F2hと共有する
+`computeTcSocialExchangeCandidates()`でsubject messageと同一surface内other humanのnearest
+gapだけを採る。normal channelはchannel、thread/forumはthreadがinteraction locality。
+forum parentへのlogical area集約はbreadth taxonomyに限り、cross-thread adjacencyをexchangeへ
+使わない。source側で15分等のcutoffやmessage countを置かない。
+
+VCはpair-summedな`vc_social_safe.trustedOverlapSeconds`を流用しない。canonical logical visitの
+trusted subject×trusted other positive intersectionを全counterpart・全channelでsubject-global
+wall-clock unionし、union後にJST hourへ半開区間でsplitする。3人同時10秒は10秒であり20秒に
+しない。`partial_observation`はpresence measurementとして使用できる。untrusted visitは局所
+fail-closedし、trusted siblingを残す。multi-channel corruptionでも各hourは最大3600秒。
+
+payloadへmessage/user/counterpart/channel/surface/area identity、exact timestamp、minute/second、
+raw countを出さない。`orderable:false`でexact earnedAtを主張しない。No.32-37はSOURCE READY・
+NONCOUNT・THRESHOLD_PENDING、No.48はPARTIALのまま。streak、深夜量ranking、「あと何時間」の
+progress、production BehaviorTitleDefinition、award/notification、Bot writer、historical
+backfillを追加しない。詳細はreadiness §21参照。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

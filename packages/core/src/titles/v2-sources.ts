@@ -20,6 +20,10 @@ import {
   type TcConversationSafePayload,
   type TcReactionSafePayload,
 } from "../tc-social/derived.js";
+import {
+  computeSocialActivityTimeSafe,
+  type SocialActivityTimeSafePayload,
+} from "../social-activity-time/derived.js";
 
 /**
  * 称号ruleがraw DBを直接触らないようにするための、source読み込み境界。
@@ -152,6 +156,7 @@ export interface CasinoCompletedActivityDaysSourcePayload {
 
 export type TcConversationSafeSourcePayload = TcConversationSafePayload;
 export type TcReactionSafeSourcePayload = TcReactionSafePayload;
+export type SocialActivityTimeSafeSourcePayload = SocialActivityTimeSafePayload;
 
 export interface PublicRoomActivitySafeSourcePayload {
   readonly hosted: {
@@ -182,6 +187,7 @@ export interface TitleSourcePayloads {
   vc_social_safe: VcSocialSafeSourcePayload;
   tc_conversation_safe: TcConversationSafeSourcePayload;
   tc_reaction_safe: TcReactionSafeSourcePayload;
+  social_activity_time_safe: SocialActivityTimeSafeSourcePayload;
   text_active_days: TextActiveDaysSourcePayload;
   confirmed_invites: ConfirmedInvitesSourcePayload;
   economy_safe_peer_actions: EconomySafePeerActionsSourcePayload;
@@ -274,6 +280,7 @@ const EMPTY_TC_CONVERSATION_SAFE_PAYLOAD: TcConversationSafeSourcePayload = {
   socialDays: [],
 };
 const EMPTY_TC_REACTION_SAFE_PAYLOAD: TcReactionSafeSourcePayload = { distinctReactors: 0, posts: [], days: [] };
+const EMPTY_SOCIAL_ACTIVITY_TIME_SAFE_PAYLOAD: SocialActivityTimeSafeSourcePayload = { days: [] };
 const EMPTY_PUBLIC_ROOM_ACTIVITY_SAFE_PAYLOAD: PublicRoomActivitySafeSourcePayload = {
   hosted: { distinctGuests: 0, sessionCount: 0, maxConcurrentGuests: 0, maxRepeatGuestDepth: 0, days: [] },
   guest: { distinctOwners: 0, sessionCount: 0, days: [] },
@@ -480,6 +487,21 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
     for (const chunk of chunkUserIds(userIds)) {
       readCalls += 1;
       for (const row of computeTcReactionSafe(db, window, chunk)) payloads.set(row.userId, row.payload);
+    }
+    return { payloads, readCalls };
+  },
+
+  social_activity_time_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, SocialActivityTimeSafeSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, EMPTY_SOCIAL_ACTIVITY_TIME_SAFE_PAYLOAD);
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return { payloads, readCalls: 0 };
+    const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      for (const row of computeSocialActivityTimeSafe(db, window, chunk)) payloads.set(row.userId, row.payload);
     }
     return { payloads, readCalls };
   },
@@ -713,6 +735,8 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
     BULK_SOURCE_READERS.tc_conversation_safe(db, [userId], scope).payloads.get(userId)!,
   tc_reaction_safe: (db, userId, scope) =>
     BULK_SOURCE_READERS.tc_reaction_safe(db, [userId], scope).payloads.get(userId)!,
+  social_activity_time_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.social_activity_time_safe(db, [userId], scope).payloads.get(userId)!,
   text_active_days: (db, userId, scope) => BULK_SOURCE_READERS.text_active_days(db, [userId], scope).payloads.get(userId)!,
   confirmed_invites: (db, userId, scope) => BULK_SOURCE_READERS.confirmed_invites(db, [userId], scope).payloads.get(userId)!,
   economy_safe_peer_actions: (db, userId, scope) =>

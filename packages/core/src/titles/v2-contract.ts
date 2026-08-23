@@ -461,6 +461,20 @@ export const TITLE_SOURCES = {
     epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
     rawUnit: "safe_tc_reaction_distribution",
   },
+  social_activity_time_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/social-activity-time/derived.ts",
+      needle: "export function computeSocialActivityTimeSafe(",
+    },
+    derivedFrom: ["tc_message_observations", "vc_visits"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "safe_public_social_activity_hour_distribution",
+  },
   // rank_text XPを称号sourceとして流用しない（位名と印を再び混ぜない）。raw message数も
   // 保存しない。「そのJST日に少なくとも1回、称号対象として安全なTC活動が観測された」
   // という事実だけを、1 user × 1 JST day最大1行で保存する。
