@@ -839,9 +839,11 @@ snapshotではまだopenとして扱う。ownerがその瞬間VCにいること�
 payloadは`hosted`（distinct guest/session、room-session内最大同時guest、JST日別分布、
 `maxRepeatGuestDepth`）、`guest`（distinct owner/sessionとJST日別分布）、`ownUse`
 （本人利用sessionとJST日別分布）だけ。guest/owner/room/channel/parent ID、capacity、
-close actor/reason、raw visit時刻は公開しない。`maxRepeatGuestDepth`は各guestごとの
-`min(distinct JST days, distinct room sessions)`の最大であり、別guestのday最大と
-session最大を合成しない。同時人数は`[start,end)`でendをstartより先に処理し、
+close actor/reason、raw visit時刻は公開しない。`maxRepeatGuestDepth`は、各guestについて
+distinct JST dateを左、distinct room sessionを右、そのguestがその日・sessionで有効利用
+したことをedgeとする二部グラフのmaximum matching sizeを求め、そのguest間最大を取る。
+したがって別guestの相関を合成せず、depth Nは互いに異なるN日と互いに異なるN sessionの
+有効来訪対応を正確に証明する。同時人数は`[start,end)`でendをstartより先に処理し、
 room capacityは使わない。
 
 raw `rooms`は`privacy:"restricted"`, `titleUsable:false`, `orderable:false`,

@@ -60,8 +60,7 @@ interface MutableAggregate {
   hostedGuests: Set<string>;
   hostedSessions: Set<number>;
   hostedDays: Map<string, MutableDay>;
-  repeatGuestDays: Map<string, Set<string>>;
-  repeatGuestSessions: Map<string, Set<number>>;
+  repeatGuestDaySessions: Map<string, Map<string, Set<number>>>;
   guestOwners: Set<string>;
   guestSessions: Set<number>;
   guestDays: Map<string, MutableDay>;
@@ -74,8 +73,7 @@ function emptyMutable(): MutableAggregate {
     hostedGuests: new Set(),
     hostedSessions: new Set(),
     hostedDays: new Map(),
-    repeatGuestDays: new Map(),
-    repeatGuestSessions: new Map(),
+    repeatGuestDaySessions: new Map(),
     guestOwners: new Set(),
     guestSessions: new Set(),
     guestDays: new Map(),
@@ -230,6 +228,68 @@ function addDay(map: Map<string, MutableDay>, date: string, id: string, session:
   }
 }
 
+function addGuestDaySession(
+  map: Map<string, Map<string, Set<number>>>,
+  guestId: string,
+  date: string,
+  sessionId: number,
+): void {
+  let daySessions = map.get(guestId);
+  if (!daySessions) {
+    daySessions = new Map();
+    map.set(guestId, daySessions);
+  }
+  addSetValue(daySessions, date, sessionId);
+}
+
+/**
+ * 日付とroom sessionの二部グラフに対するmaximum matching size。
+ * 各未match日からalternating pathを幅優先探索し、見つけた増加路を反転する。
+ */
+function maximumDaySessionMatchingSize(daySessions: ReadonlyMap<string, ReadonlySet<number>>): number {
+  const matchedSessionByDate = new Map<string, number>();
+  const matchedDateBySession = new Map<number, string>();
+
+  for (const startDate of [...daySessions.keys()].sort()) {
+    if (matchedSessionByDate.has(startDate)) continue;
+
+    const queue = [startDate];
+    const visitedDates = new Set([startDate]);
+    const precedingDateBySession = new Map<number, string>();
+    let freeSession: number | undefined;
+
+    for (let cursor = 0; cursor < queue.length && freeSession === undefined; cursor += 1) {
+      const date = queue[cursor]!;
+      const sessions = [...(daySessions.get(date) ?? [])].sort((a, b) => a - b);
+      for (const sessionId of sessions) {
+        if (precedingDateBySession.has(sessionId)) continue;
+        precedingDateBySession.set(sessionId, date);
+        const matchedDate = matchedDateBySession.get(sessionId);
+        if (matchedDate === undefined) {
+          freeSession = sessionId;
+          break;
+        }
+        if (!visitedDates.has(matchedDate)) {
+          visitedDates.add(matchedDate);
+          queue.push(matchedDate);
+        }
+      }
+    }
+
+    if (freeSession === undefined) continue;
+    let sessionToAssign: number | undefined = freeSession;
+    while (sessionToAssign !== undefined) {
+      const date = precedingDateBySession.get(sessionToAssign)!;
+      const previouslyMatchedSession = matchedSessionByDate.get(date);
+      matchedSessionByDate.set(date, sessionToAssign);
+      matchedDateBySession.set(sessionToAssign, date);
+      sessionToAssign = previouslyMatchedSession;
+    }
+  }
+
+  return matchedSessionByDate.size;
+}
+
 function maxConcurrentGuestsByOwner(slices: readonly ActivitySlice[]): Map<string, number> {
   const bySession = new Map<number, ActivitySlice[]>();
   for (const slice of slices) {
@@ -310,10 +370,9 @@ export function computePublicRoomActivitySafe(
       const state = mutable.get(slice.ownerId)!;
       state.hostedGuests.add(slice.visitorId);
       state.hostedSessions.add(slice.roomId);
-      addSetValue(state.repeatGuestSessions, slice.visitorId, slice.roomId);
       for (const date of dates) {
         addDay(state.hostedDays, date, slice.visitorId, slice.roomId);
-        addSetValue(state.repeatGuestDays, slice.visitorId, date);
+        addGuestDaySession(state.repeatGuestDaySessions, slice.visitorId, date, slice.roomId);
       }
     }
     if (targetSet.has(slice.visitorId)) {
@@ -331,7 +390,7 @@ export function computePublicRoomActivitySafe(
     for (const guestId of state.hostedGuests) {
       maxRepeatGuestDepth = Math.max(
         maxRepeatGuestDepth,
-        Math.min(state.repeatGuestDays.get(guestId)?.size ?? 0, state.repeatGuestSessions.get(guestId)?.size ?? 0),
+        maximumDaySessionMatchingSize(state.repeatGuestDaySessions.get(guestId) ?? new Map()),
       );
     }
     return {

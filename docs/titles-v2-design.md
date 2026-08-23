@@ -1829,9 +1829,11 @@ oborozuki inviteをguest inferenceへ使わない。
 game expires_at))`の交差。room作成や`activated_at`だけでは利用にならず、ownUseには
 owner本人のvisitが必要。hosted来客とguest利用はownerの同時presenceを要求しない。
 payloadはidentityを捨てた`hosted`/`guest`/`ownUse`のsession・distinct・JST日別集計。
-同時guestは半開区間で数え、repeat guestは各guestについて
-`min(distinct days, distinct sessions)`を取った最大値`maxRepeatGuestDepth`でjoint
-correlationを保つ。raw `rooms`はrestricted、derivedはsafeかつorderable:false。
+同時guestは半開区間で数える。repeat guestは各guestについて、JST dateを左、room
+sessionを右、そのguestがその日・sessionで有効利用したことをedgeとする二部グラフの
+maximum matching sizeを求め、そのguest間最大を`maxRepeatGuestDepth`とする。これにより
+depth Nは互いに異なるN日と互いに異なるN sessionへの有効来訪対応をexactに表す。
+raw `rooms`はrestricted、derivedはsafeかつorderable:false。
 
 No.50-56はSOURCE READYへ更新するがthresholdは未決定。No.57はrole-at-timeとguest
 activityのtemporal cross-reference待ちでBLOCKEDのまま。production title定義・award

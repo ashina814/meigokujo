@@ -226,14 +226,44 @@ describe("P-T repeat guest joint correlation", () => {
     expect(aggregate(db, "owner").hosted.maxRepeatGuestDepth).toBe(1);
   });
 
-  it("Q/R/T. session/dayの同一guest joint depthを返す", () => {
+  it("Q. 同一guestの別日・別sessionでdepth 2", () => {
+    const { db } = setup();
+    room(db, "owner", "day-1");
+    room(db, "owner", "day-2", { createdAt: BASE + 86_400 });
+    visit(db, "bob", "day-1", BASE + 10, BASE + 20);
+    visit(db, "bob", "day-2", BASE + 86_400 + 10, BASE + 86_400 + 20);
+    expect(aggregate(db, "owner").hosted.maxRepeatGuestDepth).toBe(2);
+  });
+
+  it("R. distinct day/sessionの各3でもjoint matchingが2ならdepth 2", () => {
+    const { db } = setup();
+    for (const channel of ["a", "b", "c"]) room(db, "owner", channel);
+    for (let day = 0; day < 3; day++) {
+      visit(db, "bob", "a", BASE + day * 86_400 + 10, BASE + day * 86_400 + 20);
+    }
+    visit(db, "bob", "b", BASE + 30, BASE + 40);
+    visit(db, "bob", "c", BASE + 50, BASE + 60);
+    expect(aggregate(db, "owner").hosted.maxRepeatGuestDepth).toBe(2);
+    expect(aggregate(db, "owner").hosted.maxRepeatGuestDepth).not.toBe(3);
+  });
+
+  it("T. 別日・別sessionを3組対応付けられるとdepth 3", () => {
     const { db } = setup();
     for (let day = 0; day < 3; day++) {
-      room(db, "owner", `bob-${day}`, { createdAt: BASE + day * 86_400 });
-      visit(db, "bob", `bob-${day}`, BASE + day * 86_400 + 10, BASE + day * 86_400 + 20);
+      room(db, "owner", `session-${day}`, { createdAt: BASE + day * 86_400 });
+      visit(db, "bob", `session-${day}`, BASE + day * 86_400 + 10, BASE + day * 86_400 + 20);
     }
-    room(db, "owner", "same-day-extra");
-    visit(db, "bob", "same-day-extra", BASE + 100, BASE + 110);
+    expect(aggregate(db, "owner").hosted.maxRepeatGuestDepth).toBe(3);
+  });
+
+  it("maximum matchingはalternating pathで既存matchを選び替える", () => {
+    const { db } = setup();
+    for (const channel of ["a", "b", "c"]) room(db, "owner", channel);
+    visit(db, "bob", "a", BASE + 10, BASE + 20);
+    visit(db, "bob", "b", BASE + 30, BASE + 40);
+    visit(db, "bob", "a", BASE + 86_400 + 10, BASE + 86_400 + 20);
+    visit(db, "bob", "c", BASE + 86_400 + 30, BASE + 86_400 + 40);
+    visit(db, "bob", "c", BASE + 2 * 86_400 + 10, BASE + 2 * 86_400 + 20);
     expect(aggregate(db, "owner").hosted.maxRepeatGuestDepth).toBe(3);
   });
 
