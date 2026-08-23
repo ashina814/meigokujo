@@ -78,6 +78,14 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > activity側だけ解消し、role-at-timeとtemporal cross-reference待ちでBLOCKEDを
 > 維持する。threshold・production title・Bot wiringは追加していない。§19参照。
 
+> **PR F2h反映（2026-08-23）**: message本文・emojiを保存しないrestricted
+> `tc_message_observations`/`tc_reaction_observations`と、identity-freeなsafe derived
+> `tc_conversation_safe`/`tc_reaction_safe`を追加した。No.42-47/49が
+> BLOCKED→READY、No.48はexplicit reply/threadならexactだが通常free-flowの同一topic
+> correlationを証明できないためPARTIAL。READY 41→48、PARTIAL 2→3、BLOCKED
+> 48→40、`missing_persisted_source` 24→16。Theme 11は0/0/8→7/1/0。
+> threshold・production title・award wiring・historical backfillは追加していない。§20参照。
+
 ## 0. xlsx canonical hash（exact drift guard）
 
 | 項目 | 値 |
@@ -125,13 +133,13 @@ full-clear editionに登録されたREQUIRED印100%——NONCOUNTの91 behavior�
 
 | status | 件数 | 意味 |
 | --- | --- | --- |
-| READY | 41 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
-| PARTIAL | 2 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
-| BLOCKED | 48 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
+| READY | 48 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
+| PARTIAL | 3 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
+| BLOCKED | 40 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
 | META | 8 | kind:meta（別bucket、§7参照） |
 
 **READY = 今すぐreleaseしてよい、ではない**。sourceReadinessとthreshold決定は
-別軸（§10参照）——READY 41件も、production threshold値（分布TBD等）が
+別軸（§10参照）——READY 48件も、production threshold値（分布TBD等）が
 決まるまではrelease対象にならない。またSeries manifest／Collection Edition／
 Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）。No.58はさらに、
 award後のreversalを既存immutable ownershipへどう反映するかが未決定であるため、
@@ -141,15 +149,15 @@ source-readyでもproduction release不可（§15）。
 
 | blockerKind | 件数 | 意味 |
 | --- | --- | --- |
-| missing_persisted_source | 24 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
+| missing_persisted_source | 16 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
 | missing_derived_source | 12 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
 | missing_manifest | 9 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
 | missing_role_history | 7 | role-at-time（過去のある時点でどのroleを保持していたか）がrepo全体で未実装 |
-| source_semantic_mismatch | 2 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（No.29/30のpair-specific overlapのみ。VC breadth分は§18で解消済み） |
+| source_semantic_mismatch | 3 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（No.29/30のpair-specific overlapとNo.48のfree-flow同一topic correlation） |
 | missing_event_protocol | 2 | イベントデータモデル自体にorganizer/staff区別が存在しない |
 | known_bug | 0 | PR F2aで`computeLastOccupant()`のsame-second/0-second visit tie bugを修正——catalog全体から解消済み（§13参照） |
 
-（`none`のBehavior候補は41件——ちょうどREADY件数と一致。PARTIAL 2件は
+（`none`のBehavior候補は48件——ちょうどREADY件数と一致。PARTIAL 3件は
 すべて`source_semantic_mismatch`を持つ。）
 
 ## 4. Theme別 readiness
@@ -166,7 +174,7 @@ source-readyでもproduction release不可（§15）。
 | 8 | 深い交友 | 4 | 1 | 2 | 1 |
 | 9 | 時間帯・生活痕 | 6 | 0 | 0 | 6 |
 | 10 | BUMP / 鐘 | 4 | 4 | 0 | 0 |
-| 11 | TC交流 | 8 | 0 | 0 | 8 |
+| 11 | TC交流 | 8 | 7 | 1 | 0 |
 | 12 | 公開部屋 | 8 | 7 | 0 | 1 |
 | 13 | Land・経済 | 8 | 1 | 0 | 7 |
 | 14 | 賭場 | 8 | 3 | 0 | 5 |
@@ -176,12 +184,13 @@ source-readyでもproduction release不可（§15）。
 
 BUMP/鐘とVC人数帯Theme 3-6が100% READY（後者はPR F2eのJST日別4bucket
 trusted secondsで日数/share/span/streakを後段評価できるため）。公開部屋はF2gで
-7/8件がSOURCE READYとなり、No.57だけrole-at-time待ち。TC交流・城横断は0% READY——
-いずれも「titles層に一切source registrationが無い」ドメイン。
+7/8件がSOURCE READYとなり、No.57だけrole-at-time待ち。TC交流はF2hで7/8件が
+SOURCE READYとなり、No.48だけfree-flow同一topic correlationのsemantic mismatchが残る。
+城横断は引き続き0% READY。
 
 ## 5. source別に残る実装（READYを支えるsource／PARTIALの制約／BLOCKEDが必要とするもの）
 
-READYを支えている既存`titleUsable:true` source（11種、41件）:
+READYを支えている既存`titleUsable:true` source（13種、48件）:
 
 - `vc_empty_start_then_joined`（No.1-2）
 - `vc_last_occupant`（No.6, 7, 9——PR F2aでsame-second/0-second visit tie bugを修正済み、§13参照）
@@ -194,10 +203,13 @@ READYを支えている既存`titleUsable:true` source（11種、41件）:
 - `economy_safe_peer_actions`（No.58——snapshot時点でreverse済みoriginalを除外、§15参照）
 - `public_event_completed_participations`（No.80-81——明示staff completion正本と同一roster revisionへJOIN、§16参照）
 - `public_room_activity_safe`（No.50-56——room lifecycleとtrusted logical VC visitの交差をidentityなしでhosted/guest/ownUseへ集計、§19参照）
+- `tc_conversation_safe`（No.42-45, 47, 49——quiet/continuation/dormant/area/join/social-dayのthreshold-neutral stats、§20参照）
+- `tc_reaction_safe`（No.46——anonymous post/JST observation day/distinct human reactor分布、§20参照）
 
 PARTIALを止めているもの（source_semantic_mismatch、§12/§14で今回のレビューにより判定）:
 
 - `vc_social_safe.trustedOverlapSeconds`が全counterpart合算で、特定counterpartに紐づけられない（No.29, 30）
+- `tc_conversation_safe.startedConversations`はexplicit reply/threadだけを同一conversationとexactに証明でき、通常free-flowの同一topic長期継続をcanonicalに証明できない（No.48）
 
 （casino participation-vs-completion mismatchはPR F2bで解消済み——No.66/67は
 READY化、No.69はmissing_manifestのみ残る。economy reversal mismatchも
@@ -207,7 +219,6 @@ No.80/81はREADY、No.82はevent-date span source不足のみ残る。§14-16参
 BLOCKEDが新たに必要とするもの（xlsxのSource_Map original「未実装」から、
 E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 
-- **`tc_conversation_safe`/`tc_reaction_safe`新設**—— No.42-49（8件）。`text_active_days`は「その日1回でも投稿があったか」の二値のみで、会話単位・沈黙復活・reactionのいずれも構造化されていない
 - **`social_activity_time_safe`(TC+VC daypart)新設**—— No.32-37（6件）
 - **`invite_retention_safe`新設**—— No.76-79（4件、うち2件はさらにnetwork-graph derivedも必要）。retentionは repo全体でgrep 0件——スタブすら無い
 - **`casino_table_activity_safe`(host/guest区別)新設**—— No.70-71（2件）。casino_participationsは全参加者を対称記録——host/guest概念自体が現データモデルに存在しない
@@ -229,7 +240,7 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 | STRUCTURAL_PLUS_DISTRIBUTION | 1 | 構造は決まるが、一部の値は分布依存 |
 | META_NOT_APPLICABLE | 8 | meta（別contract、§10適用外） |
 
-sourceReadinessとthresholdは別軸——READY 41件のうち、STRUCTURAL_FIXEDなのは
+sourceReadinessとthresholdは別軸——READY 48件のうち、STRUCTURAL_FIXEDなのは
 一部（初回系）のみで、残りはTHRESHOLD_PENDINGのままREADYになっている
 （sourceは十分だが実数値は分布を見てから決める）。
 
@@ -241,13 +252,13 @@ sourceReadinessとthresholdは別軸——READY 41件のうち、STRUCTURAL_FIXE
 | イベントtheme（Theme No.16） | 5 | No.80/81はcompletion sourceでREADY、No.82-84は依然BLOCKED |
 | manifest依存（thresholdCategory: MANIFEST_DEPENDENT） | 6 | 賭場core family一覧・城横断family一覧・series一覧が未定義 |
 | known bug依存 | 0 | PR F2aで`computeLastOccupant`の同秒0秒visit tie bugを修正——catalog全体から解消（§13参照） |
-| source_semantic_mismatch依存 | 2 | casino分はPR F2b、economy reversalはPR F2c、event completion分（No.80-82）はPR F2d、VC breadth分（No.23-25）はPR F2fで解消——残るのはNo.29/30のみ（§14-16/§18参照） |
+| source_semantic_mismatch依存 | 3 | casino/economy/event/VC breadth分はF2b-F2fで解消——残るのはNo.29/30とNo.48（free-flow同一topic）のみ（§14-16/§18/§20参照） |
 
 ## 8. 次に何を実装すれば最も多くのcandidateがunblockされるか
 
 単純なunblock件数だけでなく、安全性・基盤依存・実装順序も考慮した優先順位。
-`missing_persisted_source`単独が理由の候補が21件、`missing_derived_source`
-単独が9件、`source_semantic_mismatch`単独が2件——新規sourceを1つ作る、
+`missing_persisted_source`単独が理由の候補が13件、`missing_derived_source`
+単独が9件、`source_semantic_mismatch`単独が3件——新規sourceを1つ作る、
 または既存sourceのsemanticsを正すごとに複数candidateが同時に動く
 「クラスタ」が明確に存在する。
 
@@ -268,8 +279,8 @@ sourceReadinessとthresholdは別軸——READY 41件のうち、STRUCTURAL_FIXE
 
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
-| 1 | `tc_conversation_safe`/`tc_reaction_safe`新設 | 8件（No.42-49） | TC側の会話構造化は`social_activity_time_safe`（クラスタ2）とも土台を共有するため、先に着手すると時間帯クラスタの半分も前進する |
-| 2 | `social_activity_time_safe`(TC+VC)新設 | 6件（No.32-37） | クラスタ1のTC構造化と共通基盤——健康/FOMO対策でCOUNTABLE 0のまま据え置く前提は維持 |
+| 1 | `social_activity_time_safe`(TC+VC)新設 | 6件（No.32-37） | F2hのcanonical TC timestamp metadataと既存VC timelineを共通土台にできる——健康/FOMO対策でCOUNTABLE 0のまま据え置く前提は維持 |
+| 2 | No.48 free-flow continuity protocol / semantic decision | 1件 | F2hでreply/threadはexactになったが、通常TCの同一topicをcontent無しで証明するcanonical protocolが無い。特殊操作を強制しないUX判断が先に必要 |
 | 3 | `invite_retention_safe`新設 | 4件（No.76-79） | 外部勧誘圧のリスクが高いドメイン（optimizationRisk: HIGH）——実装優先度はunblock数以上に安全設計のレビュー時間を要する |
 | 4 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
 | 5 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
@@ -279,8 +290,10 @@ sourceReadinessとthresholdは別軸——READY 41件のうち、STRUCTURAL_FIXE
 | 9 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
 
 VC group-size clusterはF2e、VC social breadth clusterはF2f、公開部屋clusterは
-F2gで解消した。次は、共通基盤を持つ大きいTC/時間帯クラスタへ移るのが自然。
-F2a-F2gでsourceの正確性・semantic debtを先に減らしてきた方針を維持する。
+F2g、TC conversation/reactionの7件はF2hで解消した。次はF2hのcanonical TC timestamp
+metadataを再利用できるTC+VC時間帯clusterへ進むのが自然。No.48の残件は
+`social_activity_time_safe`の技術依存ではなく、content無しでfree-flow同一topicを
+どうcanonicalに証明するかという別のproduct/UX判断である。
 
 ## 9. editorial intent → runtime resolution（契約の食い違いの明示）
 
@@ -864,3 +877,85 @@ cross-referenceが無いためBLOCKEDを維持する。registry実集計はREADY
 PARTIAL 2（不変）、BLOCKED 55→48、META 8（不変）。Theme 12は0/0/8→7/0/1。
 `missing_persisted_source`は32→24、`missing_role_history`は既にNo.57へ付いていたため
 7のまま。production threshold、BehaviorTitleDefinition、Bot award wiringは追加していない。
+
+## 20. PR F2h: Canonical TC Social Observation + Safe Conversation / Reaction Sources
+
+### 20.1 persistence・eligibility・snapshot
+
+既存`text_active_days`はpublic non-thread TCの1 user×1 JST day binary sourceのまま変更しない。
+F2hは別policyのsidecarとして、main guildのhuman `GuildText`/`GuildAnnouncement`と、
+@everyoneが閲覧できる`PublicThread`/`AnnouncementThread`/public forum postだけを観測する。
+DM、bot、webhook、system message、PrivateThread、role-gated/permission unknown、
+`xp_excluded_channels`対象をfail-closedで除外する。normal channelは
+`area_id=surface_id=channel ID`、public thread/forumは`surface_id=thread ID`,
+`area_id=public parent ID`——thread本数でarea breadthを水増ししない。
+
+`tc_message_observations`はmessage/author/surface/area/reply identity、surface kind、
+Discord `created_at_ms`、Bot first `observed_at_ms`と、exactに得られるthread owner/create
+provenanceだけをrestrictedに保存する。content、attachment、embed、sticker、mention、
+username、message length、AI/NLP結果はschemaにもwriter APIにも無い。MessageCreate replayは
+`ON CONFLICT DO NOTHING`でfirst observationを保持し、edit/deleteでも更新・削除しない。
+resolverはevent occurrence=`created_at_ms`とknowledge cutoff=`observed_at_ms`を両方使い、
+future observationをhistorical snapshotへ混ぜない。Discord履歴のREST backfillは行わない。
+
+`tc_reaction_observations`は`(message_id, reactor_id)`をPRIMARY KEYとし、既存eligible
+messageへのother human reactionのfirst `observed_at_ms`だけを保存する。emoji、author、
+channelは重複保存しない。self/bot reactionを除外し、multi-emoji・remove→re-addでも
+1 reactor×1 post=最大1 fact。ReactionAddにはcanonical occurrence timestampが無いため、
+JST dayは**Bot reaction observation day**であり真のreaction発生日ではない。
+`GuildMessageReactions` intentとuncached event用partialsを追加し、fetch/writer failureは
+sidecar logだけで通常Bot処理・user reactionへ伝播しない。
+
+### 20.2 conversation safe payload
+
+`tc_conversation_safe`はraw identityを取得済みJS Map内だけで使い、reply parentを同じ
+surfaceのrootまで解決する。parent missing/別surface/snapshot未来/cycleはそのlinkだけを
+除外し、unrelated interactionは残す。public threadはsurface自体を1 explicit conversation。
+content similarityや固定15/30分windowでtopicを推測しない。
+
+payloadは次のidentity-free sufficient statisticsのみ:
+
+- `starts[]`: normal channelのtop-level messageだけについて、JST date、scope内の直前surface
+  messageからの`quietBeforeMs`（不明は`null`）、`nextOtherGapMs`、reply上の
+  `explicitContinuation`。既存public thread/forum内の通常messageはreply指定が無くても
+  conversation内部のmessageであり、thread starterをexactに証明できないため`starts`へ入れない
+- `revivalConversations[]`: anonymous explicit conversation groupごとのrevival date、
+  `dormantBeforeMs`、`continuationGapMs`
+- `areas[]`: anonymous logical areaごとのJST `socialDays`と`bestOtherGapMs`
+- `thirdPartyJoins[]`: distinct prior other authors最大2人のgap、`priorSelfGapMs`、
+  `nextOtherGapMs`
+- `startedConversations[]`: exact reply-root/thread starterに限るdistinct other participants、
+  active dates、span、max inter-activity gap
+- `socialDays[]`: 別humanとのexchangeが存在するJST日と最小gap（No.49 TC側）
+
+message/post count、message/channel/thread/area/counterpart ID、content/raw timestamp listは出さない。
+quiet/dormant/continuation/exchange/longlifeの具体値は一切固定せずF5/F6 calibrationへ送る。
+logical area groupingとinteraction localityは分離する。public thread/forumはparent channel/forumへ
+area集約する一方、`bestOtherGapMs`とglobal `socialDays`のexchangeは同一`surface_id`内だけで
+成立させる。同じforum parent配下でもcross-thread temporal adjacencyはsocial activityにしない。
+
+### 20.3 reaction safe payload・SQL
+
+`tc_reaction_safe`は`distinctReactors`、anonymous `posts[{reactionDays,
+distinctReactors}]`、`days[{date,distinctPosts,distinctReactors}]`だけ。global reactorは同一人が
+10 postへ付けても1人、同一postへ3 emojiでも1人。message/reactor/post/channel/emoji identityは
+公開しない。両safe sourceはcanonical event occurrence/earnedAtを完全には主張できないため
+`orderable:false`。
+
+live writerはO(1)。evaluationはrequested author 300-ID chunk、subjectから得たarea 300-ID
+chunk、reaction JOINをbulkで読む。reply rootは取得済みMapで解決し、message/reply/reaction/
+area単位の再帰SQLを発行しない。1200 messages/surfaces/reactions testでSQLite variable上限を
+超えず、author/area/surface/reply/reaction query planは用途に対応するindexを使う。
+
+### 20.4 readiness delta
+
+No.42-45/47はquiet・explicit revival grouping・logical area・distinct prior others/
+continuation、No.46はanonymous post/day/reactor分布、No.49はTC `socialDays`とF2f
+`vc_social_safe.dailyBreadth`でSOURCE READY。No.48はreply-root/public threadならexactだが、
+通常free-flow TCの「同じ話題」をcontent無しでcanonicalに証明できない。reply/threadを使う人
+だけへcatalog semanticを縮めないためPARTIALとする。
+
+結果はREADY 41→48、PARTIAL 2→3、BLOCKED 48→40、META 8（不変）。Theme 11は
+0/0/8→7/1/0、`missing_persisted_source` 24→16、`source_semantic_mismatch` 2→3。
+production threshold、BehaviorTitleDefinition、award/notification、catalog activation、
+historical backfillは追加しない。

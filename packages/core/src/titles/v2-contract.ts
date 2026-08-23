@@ -120,6 +120,7 @@ const TITLE_RESTRICTED_USES = [
   "casino_safe_completion_classification",
   "public_event_safe_completion_classification",
   "public_room_safe_activity_classification",
+  "tc_safe_social_classification",
 ] as const;
 export type TitleRestrictedUse = (typeof TITLE_RESTRICTED_USES)[number];
 const VALID_TITLE_RESTRICTED_USES: ReadonlySet<string> = new Set(TITLE_RESTRICTED_USES);
@@ -388,6 +389,78 @@ export const TITLE_SOURCES = {
 
   // ── Safe Activity Sources（PR E1）────────────────────────────────────
   //
+  tc_message_observations: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/tc-social/service.ts",
+      needle: "INSERT INTO tc_message_observations",
+    },
+    calledFrom: {
+      file: "apps/bot/src/tc-social-tracking.ts",
+      needle: "services.tcSocial.recordMessage({",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "trackTitleTcMessage(message, services)",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: true,
+    titleUsable: false,
+    restrictedUse: "tc_safe_social_classification",
+    epochPolicy: { type: "point", at: "created_at_ms" },
+    rawUnit: "public_tc_message_observation",
+  },
+  tc_reaction_observations: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/tc-social/service.ts",
+      needle: "INSERT INTO tc_reaction_observations",
+    },
+    calledFrom: {
+      file: "apps/bot/src/tc-social-tracking.ts",
+      needle: "services.tcSocial.recordReaction(",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "trackTitleTcReaction(reaction, user, services)",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "tc_safe_social_classification",
+    epochPolicy: { type: "point", at: "observed_at_ms" },
+    rawUnit: "public_tc_reaction_observation",
+  },
+  tc_conversation_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/tc-social/derived.ts",
+      needle: "export function computeTcConversationSafe(",
+    },
+    derivedFrom: ["tc_message_observations"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "safe_tc_conversation_structure",
+  },
+  tc_reaction_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/tc-social/derived.ts",
+      needle: "export function computeTcReactionSafe(",
+    },
+    derivedFrom: ["tc_message_observations", "tc_reaction_observations"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "safe_tc_reaction_distribution",
+  },
   // rank_text XPを称号sourceとして流用しない（位名と印を再び混ぜない）。raw message数も
   // 保存しない。「そのJST日に少なくとも1回、称号対象として安全なTC活動が観測された」
   // という事実だけを、1 user × 1 JST day最大1行で保存する。

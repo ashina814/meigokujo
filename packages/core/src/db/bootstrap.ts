@@ -271,6 +271,41 @@ CREATE INDEX IF NOT EXISTS idx_vc_user ON vc_segments(user_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_vc_open ON vc_segments(ended_at) WHERE ended_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_vc_channel ON vc_segments(channel_id, started_at);
 
+-- 公開TCの会話構造を後から安全に分類するためのrestricted metadata正本。
+-- message本文・attachment・embed・mention・emoji等はschema自体に持たない。
+CREATE TABLE IF NOT EXISTS tc_message_observations (
+  message_id          TEXT PRIMARY KEY,
+  author_id           TEXT NOT NULL,
+  surface_id          TEXT NOT NULL,
+  area_id             TEXT NOT NULL,
+  surface_kind        TEXT NOT NULL CHECK (surface_kind IN ('channel','public_thread','announcement_thread','forum_post')),
+  reply_to_message_id TEXT,
+  created_at_ms       INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  observed_at_ms      INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+  thread_owner_id     TEXT,
+  thread_created_at_ms INTEGER CHECK (thread_created_at_ms IS NULL OR thread_created_at_ms >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_tc_message_author_created
+  ON tc_message_observations(author_id, created_at_ms, message_id);
+CREATE INDEX IF NOT EXISTS idx_tc_message_area_created
+  ON tc_message_observations(area_id, created_at_ms, message_id);
+CREATE INDEX IF NOT EXISTS idx_tc_message_surface_created
+  ON tc_message_observations(surface_id, created_at_ms, message_id);
+CREATE INDEX IF NOT EXISTS idx_tc_message_reply
+  ON tc_message_observations(reply_to_message_id)
+  WHERE reply_to_message_id IS NOT NULL;
+
+-- Discord reaction addにはcanonical occurrence timestampが無いため、Botが初めて
+-- 観測した時刻だけを保存する。emojiは保存せず、1 post × 1 reactorを最大1 factにする。
+CREATE TABLE IF NOT EXISTS tc_reaction_observations (
+  message_id     TEXT NOT NULL REFERENCES tc_message_observations(message_id),
+  reactor_id     TEXT NOT NULL,
+  observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+  PRIMARY KEY (message_id, reactor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tc_reaction_observed_message
+  ON tc_reaction_observations(observed_at_ms, message_id);
+
 CREATE TABLE IF NOT EXISTS tickets (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   thread_id   TEXT NOT NULL UNIQUE,

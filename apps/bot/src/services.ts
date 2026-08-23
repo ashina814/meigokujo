@@ -28,6 +28,7 @@ import {
   RankEngine,
   BumpCounter,
   TextActivity,
+  TcSocialObservations,
   PublicEvents,
   CasinoParticipationHistory,
   Shop,
@@ -140,6 +141,9 @@ export function buildServices() {
   // TC安全source（PR E1）。rank_text（XP/level/cooldown）とは独立したsubsystem——
   // raw message数もmessage内容も保存しない。既存servicesを置換しない。
   const textActivity = new TextActivity(db);
+  // TC会話・reaction称号用のrestricted metadata sidecar。既存text_active_daysと
+  // Rank XPの意味・writer・eligibilityは変更しない。
+  const tcSocial = new TcSocialObservations(db);
   // 公開イベント運営ドメイン（PR E3）。称号v2専用ログではない——運営が確定した公開
   // イベントrosterの正本。generic EventLog（events）は置換しない。
   const publicEvents = new PublicEvents(db);
@@ -303,6 +307,7 @@ export function buildServices() {
     ranks,
     bumps,
     textActivity,
+    tcSocial,
     publicEvents,
     casinoParticipation,
     shop,

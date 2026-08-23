@@ -165,6 +165,12 @@ export {
 export { BumpCounter } from "./rank/bump.js";
 export { TextActivity } from "./text-activity/service.js";
 export {
+  TcSocialObservations,
+  TC_SURFACE_KINDS,
+  type TcSurfaceKind,
+  type RecordTcMessageObservationInput,
+} from "./tc-social/service.js";
+export {
   PublicEvents,
   PublicEventsError,
   type PublicEventRow,
