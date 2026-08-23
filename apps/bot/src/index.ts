@@ -1,4 +1,4 @@
-import { Client, Events, GatewayIntentBits } from "discord.js";
+import { Client, Events, GatewayIntentBits, Partials } from "discord.js";
 import { InviteTracker } from "./invite-tracker.js";
 import { config } from "./config.js";
 import { buildServices } from "./services.js";
@@ -113,17 +113,20 @@ import {
   handleOriginalRoleTicketRoleSelect,
   handleOriginalRoleTicketSelect,
 } from "./commands/original-role-ticket.js";
+import { trackTitleTcMessage, trackTitleTcReaction } from "./tc-social-tracking.js";
 
 const services = buildServices();
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.MessageContent, // bump検知（掲示板ボットのembed読取に必要）
     GatewayIntentBits.GuildInvites, // 招待リンクトラッキング
   ],
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User],
 });
 
 const inviteTracker = new InviteTracker(client);
@@ -577,6 +580,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 // パネル自動再掲（UX原則8）+ boost/bump/up 検知
 client.on(Events.MessageCreate, (message) => {
+  void trackTitleTcMessage(message, services).catch((err) =>
+    console.error("[tc-social] message observation failed", err),
+  );
   void maybeRepostPanel(message, services).catch((err) =>
     console.error("[panel] 再掲失敗:", err),
   );
@@ -584,6 +590,12 @@ client.on(Events.MessageCreate, (message) => {
   void handleBumpMessage(message, services).catch((err) => console.error("[bump] 処理失敗:", err));
   void handleMessageXp(message, services).catch((err) => console.error("[rank] 発言XP付与失敗:", err));
   void relayStaffMessage(client, services, message).catch((err) => console.error("[mimi] 中継失敗:", err));
+});
+
+client.on(Events.MessageReactionAdd, (reaction, user) => {
+  void trackTitleTcReaction(reaction, user, services).catch((err) =>
+    console.error("[tc-social] reaction sidecar failed", err),
+  );
 });
 
 client.on(Events.GuildMemberAdd, (member) => {

@@ -410,17 +410,64 @@ const THEME_10: ManualReadinessEntry[] = [38, 39, 40, 41].map((no, i) => ({
 // ─────────────────────────────────────────────────────────────
 // Theme 11: TC交流 (No.42-49)
 // ─────────────────────────────────────────────────────────────
-const THEME_11: ManualReadinessEntry[] = [42, 43, 44, 45, 46, 47, 48, 49].map((no) => ({
-  no,
-  status: "BLOCKED" as const,
-  usableSources: [],
-  specializedResolvers: [],
-  missingCapabilities: ["tc_conversation_safe（会話単位の構造化source）", "tc_reaction_safe（自然reaction集計）"],
-  evidence: [{ file: "packages/core/src/text-activity/service.ts", symbol: "text_active_days (binary day flag only)" }],
-  notes: "text_active_daysは「その日1回でも投稿があったか」の二値のみ——会話・沈黙復活・reaction・areaのいずれも構造化されていない。No.49の VC側半分も汎用presence day sourceが無いため同様に不可。",
-  blockerKinds: ["missing_persisted_source"] as const,
-  optimizationRisk: "HIGH" as const,
-}));
+const TC_CONVERSATION_EVIDENCE = [
+  { file: "packages/core/src/tc-social/derived.ts", symbol: "computeTcConversationSafe" },
+  { file: VC_SOURCES_FILE, symbol: "TcConversationSafeSourcePayload" },
+];
+const TC_REACTION_EVIDENCE = [
+  { file: "packages/core/src/tc-social/derived.ts", symbol: "computeTcReactionSafe" },
+  { file: VC_SOURCES_FILE, symbol: "TcReactionSafeSourcePayload" },
+];
+const THEME_11: ManualReadinessEntry[] = [
+  ...[42, 43, 44, 45, 47].map((no) => ({
+    no,
+    status: "READY" as const,
+    usableSources: ["tc_conversation_safe"] as const,
+    specializedResolvers: ["computeTcConversationSafe"],
+    missingCapabilities: [],
+    evidence: TC_CONVERSATION_EVIDENCE,
+    notes:
+      "PR F2h: content非保存のcanonical public TC metadataから、quiet/continuation/dormant/area/prior distinct other/next-other gapとexplicit reply/thread conversation groupをidentityなしで導出する。具体thresholdは未決定。",
+    blockerKinds: ["none"] as const,
+    optimizationRisk: "MANAGED" as const,
+  })),
+  {
+    no: 46,
+    status: "READY",
+    usableSources: ["tc_reaction_safe"],
+    specializedResolvers: ["computeTcReactionSafe"],
+    missingCapabilities: [],
+    evidence: TC_REACTION_EVIDENCE,
+    notes:
+      "PR F2h: 1 post×1 human reactorのfirst observationをemoji非保存でdedupeし、anonymous post/JST observation day/global distinct reactor分布を公開する。reaction occurrence timeは主張しない。",
+    blockerKinds: ["none"],
+    optimizationRisk: "MANAGED",
+  },
+  {
+    no: 48,
+    status: "PARTIAL",
+    usableSources: ["tc_conversation_safe"],
+    specializedResolvers: ["computeTcConversationSafe"],
+    missingCapabilities: ["normal free-flow会話の同一topic long-life correlation（reply/thread非依存）"],
+    evidence: TC_CONVERSATION_EVIDENCE,
+    notes:
+      "PR F2h: public thread owner / persisted reply rootならstarter・distinct participants・active dates・span・max gapをexactに証明できる。一方、replyを使わない通常TCで同じ話題かをmetadataだけからcanonicalに確定できず、reply/thread利用者だけへsemanticを狭めないためREADYにはしない。",
+    blockerKinds: ["source_semantic_mismatch"],
+    optimizationRisk: "HIGH",
+  },
+  {
+    no: 49,
+    status: "READY",
+    usableSources: ["tc_conversation_safe", "vc_social_safe"],
+    specializedResolvers: ["computeTcConversationSafe", "computeSafeSocialAggregates"],
+    missingCapabilities: [],
+    evidence: [...TC_CONVERSATION_EVIDENCE, { file: "packages/core/src/vc/derived.ts", symbol: "computeSafeSocialAggregates.dailyBreadth" }],
+    notes:
+      "PR F2h: TCは別humanとの最小exchange gapを持つsocialDays、VCはF2fのdailyBreadthを持つため、双方の複数JST日social activityをthreshold-neutralに後段評価できる。旧noteの『VC day source無し』は解消済み。",
+    blockerKinds: ["none"],
+    optimizationRisk: "MANAGED",
+  },
+];
 
 // ─────────────────────────────────────────────────────────────
 // Theme 12: 公開部屋 (No.50-57)

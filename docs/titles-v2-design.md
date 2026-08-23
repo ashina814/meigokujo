@@ -1839,6 +1839,44 @@ No.50-56はSOURCE READYへ更新するがthresholdは未決定。No.57はrole-at
 activityのtemporal cross-reference待ちでBLOCKEDのまま。production title定義・award
 wiring・room UXは変更しない。詳細は`docs/titles-v2-catalog-readiness.md`§19参照。
 
+### F2h — Canonical TC Social Observation + Safe Conversation / Reaction Sources
+
+`text_active_days`とRank XPのeligibility/日次binary semanticsは変更せず、別sidecarとして
+main guildの公開human TC metadataだけを`tc_message_observations`へ保存する。normal
+`GuildText`/`GuildAnnouncement`に加え、@everyoneが閲覧可能なPublicThread/
+AnnouncementThread/public forum postを許可し、PrivateThread・role-gated・DM・bot・webhook・
+system・title/XP excluded channelを除外する。threadはsurface=thread、logical area=public
+parentとしてarea breadthを水増ししない。
+
+message sourceはDiscord `created_at_ms`（event occurrence）とBot first `observed_at_ms`
+（knowledge time）を分離し、replay/edit/deleteでfirst observationを書き換えない。reply edgeと
+exact thread owner/create provenance以外に、content、attachment、embed、mention、emoji、
+length、sentiment、AI/NLP結果をschema/APIへ持たない。historical REST backfillも行わない。
+
+reaction sourceは既にmessage observationがあるpostへのother human first reactionだけ。
+`(message_id,reactor_id)`でmulti-emoji/remove-readdをdedupeし、emojiを保存しない。
+ReactionAddにはtrue occurrence timestampが無いため`observed_at_ms`だけを保存し、safe JST dayも
+reaction observation dayと明示する。partial fetch/writer failureはsidecar logだけでuser UXへ
+伝播しない。
+
+`computeTcConversationSafe()`はpublic threadを1 conversation、normal reply edgeを同一surfaceの
+rootまで辿ったexplicit conversationとして、取得済みMap内で解決する。missing/cross-surface/
+future parentはそのlinkだけfail-closed。free-flow TCはtopicを推測せず、quiet/previous distinct
+other/prior self/next other/area exchange gapをthreshold-neutralに公開する。safe payloadは
+anonymous `starts`、`revivalConversations`、`areas`、`thirdPartyJoins`、exact explicit
+`startedConversations`、TC `socialDays`のみ。raw message count/identity/timestamp listは出さない。
+
+`computeTcReactionSafe()`はglobal distinct human reactors、anonymous postごとのreaction
+observation days/reactor数、dayごとのdistinct post/reactor数だけを返す。両safe sourceは
+`privacy:"safe"`, `titleUsable:true`, `orderable:false`。raw sourcesはrestricted
+`tc_safe_social_classification`専用。300-ID chunkとauthor→area bulk context query、JS reply Mapで
+N+1を避ける。
+
+No.42-47/49はSOURCE READY。No.48はreply/threadならstarter/participants/day/span/gapを
+exactに証明できるが、通常free-flowの同一topic継続をcontent無しで証明できず、特殊操作を
+強制するsemantic縮小を避けてPARTIAL。production threshold・BehaviorTitleDefinition・award/
+notification・catalog activationは追加しない。詳細はreadiness §20参照。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

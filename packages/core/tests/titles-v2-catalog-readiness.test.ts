@@ -367,16 +367,17 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
     }
   });
 
-  it("registry実集計はF2g後も含めREADY 41 / PARTIAL 2 / BLOCKED 48 / META 8", () => {
+  it("registry実集計はF2h後READY 48 / PARTIAL 3 / BLOCKED 40 / META 8", () => {
     const counts = new Map<string, number>();
     for (const entry of TITLE_V2_CATALOG_READINESS) counts.set(entry.status, (counts.get(entry.status) ?? 0) + 1);
-    expect(Object.fromEntries(counts)).toEqual({ READY: 41, BLOCKED: 48, PARTIAL: 2, META: 8 });
+    expect(Object.fromEntries(counts)).toEqual({ READY: 48, BLOCKED: 40, PARTIAL: 3, META: 8 });
   });
 
-  it("source_semantic_mismatchはNo.29/30の2件だけ、missing_derived_sourceは12件のまま", () => {
+  it("source_semantic_mismatchはNo.29/30/48、missing_derived_sourceは12件のまま", () => {
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("source_semantic_mismatch")).map((entry) => entry.no)).toEqual([
       29,
       30,
+      48,
     ]);
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(12);
   });
@@ -425,9 +426,48 @@ describe("PR F2g: public room activity safe source追加後のreadiness", () => 
     expect(entries.filter((entry) => entry.status === "BLOCKED")).toHaveLength(1);
   });
 
-  it("blocker実集計はmissing_persisted_source 32→24、missing_role_history 7のまま", () => {
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(24);
+  it("blocker実集計はF2h後missing_persisted_source 16、missing_role_history 7のまま", () => {
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(16);
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_role_history"))).toHaveLength(7);
+  });
+});
+
+describe("PR F2h: canonical TC conversation/reaction safe source追加後のreadiness", () => {
+  it("No.42-47（No.46 reaction含む）は必要なdistributionを表現できるためREADY", () => {
+    for (const no of [42, 43, 44, 45, 46, 47]) {
+      const entry = readinessFor(no);
+      expect(entry.status, `candidate #${no}`).toBe("READY");
+      expect(entry.missingCapabilities, `candidate #${no}`).toEqual([]);
+      expect(entry.blockerKinds, `candidate #${no}`).toEqual(["none"]);
+      expect(entry.thresholdCategory, `candidate #${no}`).toBe("THRESHOLD_PENDING");
+    }
+    expect(readinessFor(46).usableSources).toEqual(["tc_reaction_safe"]);
+  });
+
+  it("No.48はexplicit reply/threadだけならexactだがfree-flow同一topicを証明できずPARTIAL", () => {
+    expect(readinessFor(48)).toMatchObject({
+      status: "PARTIAL",
+      usableSources: ["tc_conversation_safe"],
+      missingCapabilities: ["normal free-flow会話の同一topic long-life correlation（reply/thread非依存）"],
+      blockerKinds: ["source_semantic_mismatch"],
+    });
+  });
+
+  it("No.49はTC socialDays + F2f vc_social_safe.dailyBreadthでREADY", () => {
+    expect(readinessFor(49)).toMatchObject({
+      status: "READY",
+      usableSources: ["tc_conversation_safe", "vc_social_safe"],
+      specializedResolvers: ["computeTcConversationSafe", "computeSafeSocialAggregates"],
+      missingCapabilities: [],
+      blockerKinds: ["none"],
+    });
+  });
+
+  it("Theme 11はREADY 7 / PARTIAL 1 / BLOCKED 0", () => {
+    const entries = TITLE_V2_CATALOG_READINESS.filter((entry) => entry.no >= 42 && entry.no <= 49);
+    expect(entries.filter((entry) => entry.status === "READY")).toHaveLength(7);
+    expect(entries.filter((entry) => entry.status === "PARTIAL")).toHaveLength(1);
+    expect(entries.filter((entry) => entry.status === "BLOCKED")).toHaveLength(0);
   });
 });
 
