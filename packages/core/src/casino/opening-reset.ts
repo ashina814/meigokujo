@@ -48,16 +48,25 @@ import type { OpeningExternalAdapter } from "./opening-external.js";
  */
 const R6_MIXED_MARKET_TABLES = ["casino_market_approvals", "casino_market_bets", "casino_markets"] as const;
 
-/** R6でDELETEする対象（分類表からresetPhase='R6'だけを抽出。mixed market tableは別扱い） */
+/**
+ * R6でDELETEする対象（分類表からresetPhase='R6'だけを抽出。mixed market tableは別扱い）。
+ * FK制約を持つ子テーブルは、分類表side（opening-tables.ts）の並び順に依存せず、ここで
+ * 明示的に親より先に列挙する（child-first dependency）。既存の`casino_chip_refund_saga_targets`
+ * と同じ考え方——`casino_participation_completions`は`casino_participations`のFK子
+ * （`FOREIGN KEY(participation_key, user_id) REFERENCES casino_participations(...)`、
+ * `openDb()`で`PRAGMA foreign_keys = ON`）なので、親を先に消すとFK違反でR6全体がrollbackする。
+ */
 const R6_DELETE_ORDER = [
   // 子（FK先）を先に消す
   "casino_chip_refund_saga_targets",
+  "casino_participation_completions",
   // 残りは順不同で構わない（mixed market tableは除外。下のR6_MIXED_MARKET_TABLESで個別処理する）
   ...CASINO_TABLE_CLASSIFICATION.filter(
     (t) =>
       t.resetOnApply &&
       t.resetPhase === "R6" &&
       t.table !== "casino_chip_refund_saga_targets" &&
+      t.table !== "casino_participation_completions" &&
       !(R6_MIXED_MARKET_TABLES as readonly string[]).includes(t.table),
   ).map((t) => t.table),
 ];

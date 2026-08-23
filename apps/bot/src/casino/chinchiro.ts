@@ -49,7 +49,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🎲 チンチロ（対マモン・casino-bot 準拠の忠実移植）。
@@ -586,6 +586,13 @@ async function runRoundInner(
   // transactionで確定させる正本——ここへ到達した時点で初めて「実際のroundが成立した」
   // と言える（PR #163レビュー§3）。
   recordCasinoParticipationBestEffort(services, {
+    participationKey: `solo:chinchiro:${interaction.id}`,
+    activityKey: "chinchiro",
+    participantUserIds: [uid],
+  });
+  // settleChinchiroRound()自体が単一atomic transactionでの正常精算——soloでは
+  // commitmentとcompletionが同じ境界（PR F2b）。
+  recordCasinoCompletionBestEffort(services, {
     participationKey: `solo:chinchiro:${interaction.id}`,
     activityKey: "chinchiro",
     participantUserIds: [uid],

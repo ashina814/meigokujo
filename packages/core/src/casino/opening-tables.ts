@@ -395,6 +395,18 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
       "Daily aggregate analytics derived from raw/formal chip records. Old metrics are not carried across formal opening.",
   }),
   T({
+    table: "casino_participation_completions",
+    purpose: "PR F2b: neutral casino completed-participation facts for the safe completion title source (no wager/payout/result/winner/loser)",
+    kind: "optional_feature",
+    archive: true,
+    resetOnApply: true,
+    resetPhase: "R6",
+    preserve: false,
+    blockerCondition: "none",
+    rationale:
+      "packages/core/src/casino/participation-history.ts. Same category as casino_participations — non-financial neutral completion history. Old pre-formal-opening completion facts are not carried across formal opening. FK child of casino_participations (participation_key, user_id) — must be classified/deleted before its parent in R6 (see opening-reset.ts R6_DELETE_ORDER, which also pins this explicitly as a child-first dependency).",
+  }),
+  T({
     table: "casino_participations",
     purpose: "PR E4: neutral casino activity-participation facts for the safe title source (no wager/payout/result)",
     kind: "optional_feature",
@@ -404,7 +416,7 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
     preserve: false,
     blockerCondition: "none",
     rationale:
-      "packages/core/src/casino/participation-history.ts. Non-financial neutral participation history (same category as casino_metric_events/casino_stats). Old pre-formal-opening participation facts are not carried across formal opening.",
+      "packages/core/src/casino/participation-history.ts. Non-financial neutral participation history (same category as casino_metric_events/casino_stats). Old pre-formal-opening participation facts are not carried across formal opening. FK parent of casino_participation_completions — must be deleted after its child in R6.",
   }),
   T({
     table: "casino_daily_risk_days",

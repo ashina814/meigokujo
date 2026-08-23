@@ -34,7 +34,7 @@ import {
   recordCasinoGameStartBestEffort,
   type CasinoPlayContext,
 } from "./metrics.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 📈 クラッシュ。casino-bot 準拠の忠実移植。
@@ -275,6 +275,13 @@ async function runRoundInner(
       activityKey: "crash",
       participantUserIds: [uid],
     });
+    // settleSolo()自体が単一atomic transactionでの正常精算——soloではcommitmentと
+    // completionが同じ境界（PR F2b）。
+    recordCasinoCompletionBestEffort(services, {
+      participationKey: `solo:crash:${interaction.id}`,
+      activityKey: "crash",
+      participantUserIds: [uid],
+    });
     recordCasinoGameFinishBestEffort(services, {
       userId: uid,
       game: "クラッシュ",
@@ -311,6 +318,11 @@ async function runRoundInner(
       operationId: interaction.id, reservationKey,
     });
     recordCasinoParticipationBestEffort(services, {
+      participationKey: `solo:crash:${interaction.id}`,
+      activityKey: "crash",
+      participantUserIds: [uid],
+    });
+    recordCasinoCompletionBestEffort(services, {
       participationKey: `solo:crash:${interaction.id}`,
       activityKey: "crash",
       participantUserIds: [uid],

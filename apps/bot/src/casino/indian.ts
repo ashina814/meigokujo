@@ -27,7 +27,7 @@ import {
   stakeFailureText,
   type PvpInteraction,
 } from "./pvp-common.js";
-import { recordCasinoParticipationBestEffort } from "./participation-history.js";
+import { recordCasinoCompletionBestEffort, recordCasinoParticipationBestEffort } from "./participation-history.js";
 
 /**
  * 🃏 インディアンポーカー（1v1心理戦）。casino-bot 準拠。
@@ -186,6 +186,8 @@ export async function runFundedIndian(services: Services, ctx: FundedPvpContext)
       });
   }
   if (dmFailed) {
+    // DM送信失敗はゲームルールの解決ではなく、実際のstay/fold判断（ゲーム本体）へ
+    // 到達する前のinfrastructure abort——completionは記録しない（PR F2b）。
     refundAll(services, [challenger.id, opponent.id], stake, `${session}:refund:dm_failed`, session);
     markResolved();
     rematchEligible = false;
@@ -254,8 +256,14 @@ export async function runFundedIndian(services: Services, ctx: FundedPvpContext)
   let winner: string | null = null;
   let note = "";
   if (cDecision === "fold" && oDecision === "fold") {
-    // 両者フォールド → 全額返金
+    // 両者フォールド → 全額返金（両者の実際のstay/fold判断を経た、ゲームルール上
+    // 正常な結果——DM失敗と異なりゲーム本体を経由しているためcompletion対象、PR F2b）
     refundAll(services, [challenger.id, opponent.id], stake, `${session}:refund:both_fold`, session);
+    recordCasinoCompletionBestEffort(services, {
+      participationKey: `pvp:${session}`,
+      activityKey: "indian",
+      participantUserIds: [challenger.id, opponent.id],
+    });
     markResolved();
     title = "🃏 インディアン — 両者フォールド";
     note = "両者ともフォールド。全額返金。";
@@ -275,13 +283,24 @@ export async function runFundedIndian(services: Services, ctx: FundedPvpContext)
   }
 
   if (winner === null && cDecision === "stay" && oDecision === "stay") {
-    // 同値ドロー
+    // 同値ドロー（ゲームルール上正常な解決、PR F2b）
     refundAll(services, [challenger.id, opponent.id], stake, `${session}:refund:draw`, session);
+    recordCasinoCompletionBestEffort(services, {
+      participationKey: `pvp:${session}`,
+      activityKey: "indian",
+      participantUserIds: [challenger.id, opponent.id],
+    });
     markResolved();
     title = "🃏 インディアン — 引き分け";
     note += "\n同値。全額返金。";
   } else if (winner !== null) {
     const { payout, houseCut } = settlePvp(services, [winner], pot, `${session}:settle`, session);
+    // settlePvp()が実際に単一atomic transactionでの正常精算を確定させた正本（PR F2b）。
+    recordCasinoCompletionBestEffort(services, {
+      participationKey: `pvp:${session}`,
+      activityKey: "indian",
+      participantUserIds: [challenger.id, opponent.id],
+    });
     markResolved();
     const loser = winner === challenger.id ? opponent.id : challenger.id;
     title = `🃏 インディアン — 勝者 <@${winner}>`;

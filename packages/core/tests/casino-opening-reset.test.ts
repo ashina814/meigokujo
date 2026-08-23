@@ -22,7 +22,9 @@ import {
   OpeningApplyManualReviewError,
   OpeningApplyRolledBackError,
   OpeningReset,
+  R6_ALL_DELETE_TABLES,
 } from "../src/casino/opening-reset.js";
+import { CasinoParticipationHistory } from "../src/casino/participation-history.js";
 import {
   FakeOpeningBackupAdapter,
   TestFilesystemOpeningBackupAdapter,
@@ -801,5 +803,48 @@ describe("OpeningReset.apply — 資金合算のchecked add化(監査ブロッ�
     const planner = new OpeningPlanner({ ...ctx, chips: ctx.ether });
     const plan = planner.dryRun();
     expect(plan.blockers.some((b) => b.category === "arithmetic")).toBe(true);
+  });
+});
+
+describe("OpeningReset.apply — R6: casino_participation_completionsのFK削除順(PR #166レビューBLOCKER2)", () => {
+  it("structure: R6_ALL_DELETE_TABLESでcasino_participation_completionsがcasino_participationsより前に列挙される", () => {
+    const completionsIdx = R6_ALL_DELETE_TABLES.indexOf("casino_participation_completions");
+    const participationsIdx = R6_ALL_DELETE_TABLES.indexOf("casino_participations");
+    expect(completionsIdx).toBeGreaterThanOrEqual(0);
+    expect(participationsIdx).toBeGreaterThanOrEqual(0);
+    expect(completionsIdx).toBeLessThan(participationsIdx);
+  });
+
+  it("実DELETE: commitment+completion行が存在する状態でR6を実行してもFK違反なく完了し、両テーブルとも0件になる（foreign_keys=ON）", async () => {
+    const ctx = setup();
+    expect(ctx.db.pragma("foreign_keys", { simple: true })).toBe(1);
+    seedLegacy(ctx);
+
+    const history = new CasinoParticipationHistory(ctx.db);
+    history.recordCommittedParticipation({
+      participationKey: "sashi:table1",
+      activityKey: "sashi",
+      participantUserIds: ["alice", "bob"],
+    });
+    history.recordCompletedParticipation({
+      participationKey: "sashi:table1",
+      activityKey: "sashi",
+      participantUserIds: ["alice", "bob"],
+    });
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_participations").get() as { n: number }).n).toBe(2);
+    expect(
+      (ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_participation_completions").get() as { n: number }).n,
+    ).toBe(2);
+
+    configureAndOpenReset(ctx);
+    const { backup, external } = adapters();
+
+    const result = await ctx.reset.apply({ actorId: "admin", backup, external });
+
+    expect(result.status).toBe("completed");
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_participation_completions").get() as { n: number }).n).toBe(
+      0,
+    );
+    expect((ctx.db.prepare("SELECT COUNT(*) AS n FROM casino_participations").get() as { n: number }).n).toBe(0);
   });
 });
