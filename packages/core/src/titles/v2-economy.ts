@@ -44,14 +44,18 @@ function extractUserId(fromAccount: string): string | null {
  * SELECTする列自体を最小化する、§25, §40）:
  * - `type IN ('transfer', 'tip')`——exact allowlistだけ。
  * - `actor_id = from_account`——本人が実行した取引だけ（staff/system代行を除外、§16）。
- * - `reversal_of IS NULL`——reversal transaction自体はfactを作らない（元actionのfactは
- *   reversalの有無に関わらず消えない、§18-19）。
+ * - `t.reversal_of IS NULL`——reversal transaction自体はfactを作らない。
+ * - `NOT EXISTS (... r.reversal_of = t.id AND r.created_at < window.end)`——
+ *   evaluation snapshot時点ですでにreverse済みのoriginal transactionもfactを作らない。
+ *   future reversalはhistorical snapshotを書き換えず、`window.end`ちょうどのreversalも
+ *   `[start, end)`契約上はまだ成立していないものとして扱う。
  * - `to_account LIKE 'user:%'`——相手も利用者口座（system口座宛のtip_burn等を除外）。
  *
  * dedupeは`ORDER BY from_account, created_at, id`で読み、`(userId, date, kind)`ごとの
- * 最初の行だけを採用する——同日に同じkindを何度実行してもfactは1件のまま（§21-22）。
- * `occurredAt`はその最初のqualifying transactionの`created_at`——first qualifying
- * observation immutableな導出（§23）。
+ * 最初の行だけを採用する——invalid originalをSQLで先に除外するため、同日の最初の
+ * transactionがreverse済みでも、後続のvalid transactionがfactを作る。同日に同じkindを
+ * 何度実行してもfactは1件のまま（§21-22）。`occurredAt`はsnapshot内で最初のvalid
+ * qualifying transactionの`created_at`——first valid qualifying observation（§23）。
  */
 export function computeSafeEconomyPeerActions(
   db: Database.Database,
@@ -68,16 +72,22 @@ export function computeSafeEconomyPeerActions(
   // approved_by・idempotency_key・reversal_ofはSELECT文自体に含めない。
   const rows = db
     .prepare(
-      `SELECT from_account, type, created_at FROM transactions
-        WHERE from_account IN (${fromPlaceholders})
-          AND type IN (${typePlaceholders})
-          AND actor_id = from_account
-          AND reversal_of IS NULL
-          AND to_account LIKE 'user:%'
-          AND created_at >= ? AND created_at < ?
-        ORDER BY from_account ASC, created_at ASC, id ASC`,
+      `SELECT from_account, type, created_at FROM transactions AS t
+        WHERE t.from_account IN (${fromPlaceholders})
+          AND t.type IN (${typePlaceholders})
+          AND t.actor_id = t.from_account
+          AND t.reversal_of IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+              FROM transactions AS r
+             WHERE r.reversal_of = t.id
+               AND r.created_at < ?
+          )
+          AND t.to_account LIKE 'user:%'
+          AND t.created_at >= ? AND t.created_at < ?
+        ORDER BY t.from_account ASC, t.created_at ASC, t.id ASC`,
     )
-    .all(...fromAccounts, ...SAFE_PEER_ECONOMY_TYPES, window.start, window.end) as Array<{
+    .all(...fromAccounts, ...SAFE_PEER_ECONOMY_TYPES, window.end, window.start, window.end) as Array<{
     from_account: string;
     type: string;
     created_at: number;

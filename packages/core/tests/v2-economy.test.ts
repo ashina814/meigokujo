@@ -169,7 +169,7 @@ describe("computeSafeEconomyPeerActions() — actor / direction binding", () => 
 });
 
 describe("computeSafeEconomyPeerActions() — reversal semantics", () => {
-  it("§47 reversal row自体は新しいfactを作らない。同日なら元action factは1のまま", () => {
+  it("§47 snapshot時点でreverse済みのoriginalとreversal row自身はfactを作らない", () => {
     const { db, ledger } = setup();
     const result = makeTransfer(ledger, { from: "user:alice", to: "user:bob" });
     // reverseのfrom=元のto(bob)になる——actor=bobにして「actor===from_account」を
@@ -177,8 +177,7 @@ describe("computeSafeEconomyPeerActions() — reversal semantics", () => {
     ledger.reverse(result.tx.id, "user:bob", "test reversal");
 
     const facts = computeSafeEconomyPeerActions(db, WIDE_WINDOW, ["alice"]);
-    expect(facts).toHaveLength(1); // 元のtransfer行だけ
-    expect(facts[0]!.kind).toBe("transfer");
+    expect(facts).toHaveLength(0);
   });
 
   it("reversalの受け手側(bob)にもreversal行由来のfactは作られない", () => {

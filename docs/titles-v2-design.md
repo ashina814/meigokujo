@@ -1381,10 +1381,11 @@ boundaryは広がらない。`registerTxType()`で新規登録したtypeが
   callsite（`transfer.ts`/`tip.ts`）を直接読み、この前提を確認した。
 - `to_account LIKE 'user:%'`を要求し、system口座宛（`tip_burn`等）を
   除外する。
-- `reversal_of IS NOT NULL`の行自体はfactを作らない。ただし**元の
-  transactionのfactは、後からreversalされてもretroactivelyには
-  消えない**——称号は永続的な事実であり、「まだreversalされていない」
-  というmutableな定義にしない。
+- `reversal_of IS NOT NULL`の行自体はfactを作らない。さらにoriginalを`t`、
+  reversalを`r`として、`r.reversal_of = t.id AND r.created_at <
+  effectiveEnd`が存在するoriginalも除外する。`effectiveEnd`はsource readerの
+  正本`resolvedScopeEffectiveEnd(scope)`——future reversalでhistorical snapshotを
+  書き換えず、endちょうどのreversalは`[start,end)`上まだ未成立と扱う。
 
 **identity/amount minimization**: payload
 （`EconomySafePeerActionsSourcePayload`）は
@@ -1397,9 +1398,18 @@ idempotency_key・transaction idは一切含めない。SQL側も
 **JST day×kind dedupe**: `user × JST date × kind`で最大1 fact。同日に
 `transfer`を10回しても1 fact、`tip`を20回しても1 fact——生の取引件数を
 1:1でfactにしない（1 Land spamでfactを量産できない）。`occurredAt`は
-その(user, date, kind)で最初にqualifyした取引の`created_at`
-（first-qualifying-observation-immutable）。JST変換はE1と同じ
+そのsnapshotでinvalid originalを除外した後の、(user, date, kind)で最初に
+qualifyした取引の`created_at`（first valid qualifying observation）。JST変換はE1と同じ
 `entry/sessions.ts`の`jstDateStr()`を再利用する。
+
+**No.58 production release gate**: 上記はSOURCE READINESSだけを解決する。
+Title v2のaward/ownership/award factsはimmutable前提のため、valid tipの直後に
+awardし、その後staffがtipをreverseしても、既存awardは自動で消えない。
+production化前に (A) 成立時validなら後日reversal後も獲得維持するsemanticへ
+正式変更、(B) transaction finality後だけaward、(C) safeなinvalidated/revocation
+lifecycle、のいずれかを正式決定する。PR F2cではどれも決めず、No.58の
+production Behavior rule/Bot wiring/revoke機構を作らない。SOURCE READINESSの
+READYをproduction release可と解釈しない。
 
 **永続化なし**: `title_economy_events`のような新規tableは作らない。
 `packages/core/src/titles/v2-economy.ts`の`computeSafeEconomyPeerActions()`
@@ -1734,6 +1744,21 @@ readiness registry（No.66,67: PARTIAL→READY、No.68: `casino_activity_
 days`のまま変更なし、No.69: `source_semantic_mismatch`が外れ
 `missing_manifest`のみ残る）を更新した。詳細は`docs/titles-v2-catalog-
 readiness.md`§14参照。
+
+### F2c — Economy Reversal-Safe Peer Actions
+
+`economy_safe_peer_actions`のoriginal queryへ、evaluation snapshotの
+effective endより前に`reversal_of = original.id`を持つtransactionが存在する
+場合だけoriginalを除外する`NOT EXISTS` classificationを追加した。reversal
+transaction自身の除外、`transfer`/`tip` exact allowlist、actor/from binding、
+user→user限定、payload minimization、JST day×kind collapseは維持する。
+invalid originalをcollapse前に除くため、同日のreversed first tip + valid second
+tipではsecondの`created_at`が`occurredAt`になる。
+
+No.58「ほんの気持ち」はsource readiness上PARTIAL→READY。ただしpost-award
+reversalとimmutable ownershipの整合はproduction release gateとして未決定。
+production BehaviorTitleDefinition/Bot award wiring/revocation/finality policyは
+このPRに含めない。詳細は`docs/titles-v2-catalog-readiness.md`§15参照。
 
 ## 15. PR分割
 
