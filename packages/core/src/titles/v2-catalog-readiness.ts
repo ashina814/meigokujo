@@ -228,22 +228,22 @@ const THEME_02: ManualReadinessEntry[] = [
 
 // ─────────────────────────────────────────────────────────────
 // Theme 3-6: VCスタイル系 (一対一/少人数/大人数/万能, No.10-21)
-// source候補: vc_group_size_seconds（秒だけ・day/share/span集計なし）
+// source: vc_group_size_daily_safe（日別4bucket trusted seconds）
 // ─────────────────────────────────────────────────────────────
 const VC_STYLE_NOTE =
-  "vc_group_size_secondsはscope window全体の合計秒数のみ——day単位のbucket分布・share%・streak/spanが一切ない。xlsx「既存sourceの拡張必要」は現repoでも未着手のまま。";
+  "PR F2eのvc_group_size_daily_safeはJST dateごとにsolo/oneToOne/smallGroup/largeGroupのtrusted secondsを欠落なく返す。ruleはthresholdやshare denominatorをsourceへ固定せず、qualifying days・trusted sample総量・bucket share・per-day share・first/last date・span・streak・bucket coverage・social三帯の網羅・skewをcatalog semanticsに沿って後から評価できる。";
 const THEME_03_06: ManualReadinessEntry[] = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21].map((no) => ({
   no,
-  status: "BLOCKED" as const,
-  usableSources: [],
-  specializedResolvers: [],
-  missingCapabilities: ["group-size bucketのactive-day集計", "同bucketのtime-share正規化", "streak/span集計"],
+  status: "READY" as const,
+  usableSources: ["vc_group_size_daily_safe"] as const,
+  specializedResolvers: ["computeGroupSizeDailySeconds"],
+  missingCapabilities: [],
   evidence: [
-    { file: VC_SOURCES_FILE, symbol: "VcGroupSizeSecondsSourcePayload" },
-    { file: VC_DERIVED_FILE, symbol: "computeGroupSizeSeconds" },
+    { file: VC_SOURCES_FILE, symbol: "VcGroupSizeDailySafeSourcePayload" },
+    { file: VC_DERIVED_FILE, symbol: "computeGroupSizeDailySeconds" },
   ],
   notes: VC_STYLE_NOTE,
-  blockerKinds: ["missing_derived_source"] as const,
+  blockerKinds: ["none"] as const,
   optimizationRisk: "LOW" as const,
 }));
 

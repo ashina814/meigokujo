@@ -128,12 +128,14 @@ export {
 // （vc/service.tsのVcTracker等、他の本番経路はこの関数を使わない）。
 export {
   computeEmptyStartThenJoined,
+  computeGroupSizeDailySeconds,
   computeGroupSizeSeconds,
   computeLastOccupant,
   computeLogicalVisits,
   computeSafeSocialAggregates,
   isTrustedVisitEnd,
   type EmptyStartThenJoinedFact,
+  type GroupSizeDailySeconds,
   type GroupSizeSeconds,
   type LastOccupantFact,
   type LogicalVisit,
