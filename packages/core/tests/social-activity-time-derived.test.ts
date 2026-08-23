@@ -4,9 +4,9 @@ import { computeSocialActivityTimeSafe } from "../src/social-activity-time/deriv
 import { computeTcConversationSafe } from "../src/tc-social/derived.js";
 import { TcSocialObservations, type TcSurfaceKind } from "../src/tc-social/service.js";
 import {
-  computeTrustedSocialPresenceIntervals,
   splitIntervalByJstHour,
 } from "../src/vc/derived.js";
+import { computePublicSocialPresenceIntervals } from "../src/vc/public-social-derived.js";
 
 const BASE = Math.floor(new Date("2026-08-20T00:00:00+09:00").getTime() / 1000);
 const DAY = 86_400;
@@ -44,15 +44,15 @@ function setup(windowStart = BASE, windowEnd = BASE + 20 * DAY) {
     start: number,
     end: number | null,
     quality: "observed" | "recovered_estimate" | null = "observed",
-    startReason: "join" | "move" | "state_change" | null = "join",
+    _startReason: "join" | "move" | "state_change" | null = "join",
   ) =>
     db
       .prepare(
-        `INSERT INTO vc_segments
-          (user_id, channel_id, parent_id, started_at, ended_at, self_muted, self_deafened, end_quality, start_reason)
-         VALUES (?, ?, 'parent-secret-marker', ?, ?, 0, 0, ?, ?)`,
+        `INSERT INTO vc_public_social_presence
+          (user_id, guild_id, channel_id, started_at, ended_at, end_quality)
+         VALUES (?, 'guild-secret-marker', ?, ?, ?, ?)`,
       )
-      .run(userId, channelId, start, end, quality, startReason);
+      .run(userId, channelId, start, end, quality);
   const payload = (userId = "subject") => computeSocialActivityTimeSafe(db, window, [userId])[0]!.payload;
   return { db, window, message, visit, payload };
 }
@@ -158,14 +158,13 @@ describe("VC trusted social-presence wall-clock union", () => {
     visit("bob", "vc", BASE, BASE + 10);
     visit("carol", "vc", BASE + 5, BASE + 15);
     expect(payload().days[0]!.hours[0]!.vcTrustedSocialSeconds).toBe(15);
-    expect(computeTrustedSocialPresenceIntervals(db, window, ["subject"])[0]!.intervals).toEqual([{ start: BASE, end: BASE + 15 }]);
+    expect(computePublicSocialPresenceIntervals(db, window, ["subject"])[0]!.intervals).toEqual([{ start: BASE, end: BASE + 15 }]);
   });
 
   it("M. Bob 00-10 + Carol 20-30を20秒として保持する", () => {
     const { visit, payload } = setup();
-    visit("subject", "vc", BASE, BASE + 30);
-    visit("bob", "vc", BASE, BASE + 10);
-    visit("carol", "vc", BASE + 20, BASE + 30);
+    visit("subject", "vc-a", BASE, BASE + 10);
+    visit("subject", "vc-b", BASE + 20, BASE + 30);
     expect(payload().days[0]!.hours[0]!.vcTrustedSocialSeconds).toBe(20);
   });
 
@@ -176,19 +175,17 @@ describe("VC trusted social-presence wall-clock union", () => {
     visit("carol", "vc", BASE + 10, BASE + 20);
     visit("zero", "vc", BASE + 20, BASE + 30);
     expect(payload().days[0]!.hours[0]!.vcTrustedSocialSeconds).toBe(20);
-    expect(computeTrustedSocialPresenceIntervals(db, window, ["subject"])[0]!.intervals).toEqual([{ start: BASE, end: BASE + 20 }]);
+    expect(computePublicSocialPresenceIntervals(db, window, ["subject"])[0]!.intervals).toEqual([{ start: BASE, end: BASE + 20 }]);
   });
 
-  it("O/P. untrusted counterpartだけを局所除外しtrusted siblingを残す", () => {
+  it("O/P. untrusted intervalだけを局所除外しtrusted siblingを残す", () => {
     const onlyUntrusted = setup();
-    onlyUntrusted.visit("subject", "vc", BASE, BASE + 20);
-    onlyUntrusted.visit("carol", "vc", BASE, BASE + 20, "recovered_estimate");
+    onlyUntrusted.visit("subject", "vc", BASE, BASE + 20, "recovered_estimate");
     expect(onlyUntrusted.payload()).toEqual({ days: [] });
 
     const { visit, payload } = setup();
-    visit("subject", "vc", BASE, BASE + 20);
-    visit("bob", "vc", BASE, BASE + 10, "observed");
-    visit("carol", "vc", BASE, BASE + 20, "recovered_estimate");
+    visit("subject", "vc-a", BASE, BASE + 10, "observed");
+    visit("subject", "vc-b", BASE + 10, BASE + 20, "recovered_estimate");
     expect(payload().days[0]!.hours[0]!.vcTrustedSocialSeconds).toBe(10);
   });
 
@@ -206,7 +203,7 @@ describe("VC trusted social-presence wall-clock union", () => {
     expect(payload().days[0]!.hours[0]!.vcTrustedSocialSeconds).toBe(10);
   });
 
-  it("S. partial_observation subjectをpresence measurementとして数える", () => {
+  it("S. canonical public presence intervalをmeasurementとして数える", () => {
     const { visit, payload } = setup();
     visit("subject", "vc", BASE, BASE + 10, "observed", "state_change");
     visit("bob", "vc", BASE, BASE + 10);
@@ -215,8 +212,7 @@ describe("VC trusted social-presence wall-clock union", () => {
 
   it("T/snapshot. open visitをobservedAtでclipし、未来row追加でもfixed snapshotを変えない", () => {
     const { db, visit } = setup(BASE, BASE + 100);
-    visit("subject", "vc", BASE, null, null);
-    visit("bob", "vc", BASE + 10, null, null);
+    visit("subject", "vc", BASE + 10, null, null);
     const fixed = { start: BASE, end: BASE + 100, observedAt: BASE + 40 };
     const before = computeSocialActivityTimeSafe(db, fixed, ["subject"])[0]!.payload;
     expect(before.days[0]!.hours[0]!.vcTrustedSocialSeconds).toBe(30);

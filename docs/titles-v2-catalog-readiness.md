@@ -87,7 +87,8 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > threshold・production title・award wiring・historical backfillは追加していない。§20参照。
 
 > **PR F2i反映（2026-08-23）**: F2hのcanonical same-surface TC exchange候補と、
-> canonical logical VC visitsから求めるtrusted social-presence wall-clock unionを共有し、
+> main guild/public GuildVoice/human occupancyをliveに証明するcanonical
+> `vc_public_social_presence`を共有し、
 > `social_activity_time_safe`へJST date×24hour sparse分布として統合した。
 > No.32-37がBLOCKED→READY、READY 48→54、BLOCKED 40→34、PARTIAL 3・META 8は
 > 不変。`missing_persisted_source` 16→10、Theme 9は0/0/6→6/0/0。24hour binは
@@ -970,7 +971,7 @@ historical backfillは追加しない。
 ### 21.1 exact source contract / payload
 
 `social_activity_time_safe`は`origin:"derived"`、`derivedFrom:["tc_message_observations",
-"vc_visits"]`、`privacy:"safe"`、`titleUsable:true`、`orderable:false`、interval
+"vc_public_social_presence"]`、`privacy:"safe"`、`titleUsable:true`、`orderable:false`、interval
 `windowStart→windowEnd`（clip:true）。raw unitは
 `safe_public_social_activity_hour_distribution`。payloadは次のsparse shapeだけ:
 
@@ -999,32 +1000,54 @@ surface=interaction localityを混ぜず、同じforum parent配下のcross-thre
 social evidenceへ変換しない。source内でgap cutoffを置かず、6時間gapも値として保持する。
 message ID/author/counterpart/surface/area/exact time/minute/second/count/contentはpayloadへ出さない。
 
-### 21.3 VC trusted wall-clock union
+### 21.3 canonical public VC social presence
 
 `vc_social_safe.trustedOverlapSeconds`はpair-summedなので時間帯durationへ流用しない。
-canonical `computeLogicalVisits()`と300-channel bulk/coalesce/snapshot semanticsを共有し、
-subjectと少なくとも1人のother humanの双方がtrusted endを持つpositive intersectionだけを作る。
-intersectionは全counterpart・全channelでsubject-global unionしてからJST hourへsplitするため、
-3人同時10秒は10秒、Bob 0-10 + Carol 5-15は15秒であり20秒/1200秒へ膨らまない。
-同時複数channelのcorrupt visitも同じwall-clock secondを二重計上せず、各hourは0..3600秒。
+raw `vc_segments`/`vc_visits`はmain guild/public visibilityを証明しないためF2iの依存から外す。
+代わりにrestricted persisted source `vc_public_social_presence`を追加する。eligibleは
+`settings["guild:main"]`の`GuildVoice`かつ@everyoneの`ViewChannel`/`Connect`双方がtrueの場合だけ。
+role-gated、permission unknown/failure、Stage、other guild、botはfail-closedで除外する。
 
-`partial_observation`は入室eventではないがpresence measurementなので、trusted endとpositive
-overlapがあれば採用する。`recovered_estimate`等のuntrusted subject/counterpart visitはその
-visit/pairだけ局所除外し、trusted siblingまで捨てない。open visitは`observedAt`でclipし、
-半開区間`[start,end)`とJST hour/day boundaryを維持する。
+human occupancyが1→2になったlive observationで在室human全員を同時openし、2→1で全員を
+同時closeする。3 humansを3 pairへ展開せず各user 1 intervalなので、3人同時10秒は各user 10秒。
+VoiceStateUpdateはaffected old/new channelの全human member cacheを収束する。voice自身・親categoryの
+ChannelUpdateとmain guild @everyone RoleUpdateでもpublic/private transitionを再評価する。
+derivedはtrusted observed user intervalsをsubject-global unionしてからJST hourへsplitし、
+同時複数channel corruptionも二重計上せず各hourを0..3600秒に保つ。
+
+dangling intervalはrestart時に`recovered_estimate`で閉じ、現在snapshotでは行ごと除外する。
+起動時刻までobservedとして延長せず、ready時点のmain guild cacheから新intervalを開始するだけで、
+Discord history fetch/backfillを行わない。fixed historical `observedAt`がrecoveryより前なら、当時openと
+観測済みだった範囲だけをそのcutoffへclipし、後発recovery mutationでsnapshotを変えない。
 
 ### 21.4 snapshot / SQL / privacy / health guard
 
-TCは`created_at_ms`をevent time、`observed_at_ms`をknowledge cutoffとして扱い、VCは既存
-`resolveWindow` semanticsをそのまま使う。fixed observedAt未来のrowを除外し、後からDBへ
-追加しても同じsnapshot結果を変えない。requested userは300-ID、TC areaとVC channelも
-300-ID chunk。message/surface/channel/hourごとのSQLは発行せず、1200 user/area/surface/
-channel fixtureでSQLite bind上限とN+1不在を固定した。
+TCは`created_at_ms`をevent time、`observed_at_ms`をknowledge cutoffとして扱い、VC sidecarは
+handler entryのunix secondsをlive occurrence/knowledge timeとして1回だけ固定する。fixed
+observedAt未来のrowを除外し、後からDBへ追加しても同じsnapshot結果を変えない。requested userと
+TC areaは300-ID chunk。VC sourceはrequested-user bulk 1 queryで、message/surface/channel/hour
+ごとのSQLを発行しない。1200 user/area/surface/presence fixtureでSQLite bind上限とN+1不在を固定した。
+
+sidecarのpermission解決・DB writer・startup scan失敗はcatch/logだけで、既存`trackVoiceState`、
+voice attendance、rooms、XP、その他VoiceStateUpdate consumerへ伝播しない。全判定はDiscord cacheで
+完結し、追加fetch/N+1はない。safe payloadにはguild/channel/user/permission identityを出さない。
 
 No.32-37は全件SOURCE READY、NONCOUNT、`THRESHOLD_PENDING`。結果はREADY 48→54、
 PARTIAL 3（不変）、BLOCKED 40→34、META 8（不変）。Theme 9は0/0/6→6/0/0、
 `missing_persisted_source`は16→10。No.48は時間帯aggregateではfree-flow同一topicを
 証明できないためPARTIALを維持する。streak、連続日、深夜量ranking、raw message/VC visit
 count、「あと何時間」のprogress barは作らず、夜更かし/FOMOをrewardしない。production
-BehaviorTitleDefinition、award/notification/catalog activation、historical backfill、Bot writer、
+BehaviorTitleDefinition、award/notification/catalog activation、historical backfill、
 daypart/thresholdは追加しない。
+
+### 21.5 既存VC READY candidate public-semantics監査（報告のみ）
+
+F2i以外も監査した結果、現readinessでREADYかつ候補原文が明示的にpublicを要求する一方、
+公開分類のない`vc_visits`系derivedを使う候補は次の3件だった。今回のreadiness/countは変更せず、
+将来それぞれをpublic-classified sourceへ移すまでsemantic riskとして報告する。
+
+| candidate | current source chain | impact |
+| --- | --- | --- |
+| No.1 火種 | `vc_empty_start_then_joined` → `vc_visits` | private/role-gated/other-guild VCが「空の公開VC」証拠になり得る |
+| No.6 残り火 | `vc_last_occupant` → `vc_visits` | private/role-gated/other-guild VCが「複数人の公開VC」証拠になり得る |
+| No.22 顔馴染み | `vc_social_safe` → `vc_co_presence` → `vc_visits` | private/role-gated/other-guild co-presenceが「公開の有効共在」breadthへ入り得る |

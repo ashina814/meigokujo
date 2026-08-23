@@ -4,9 +4,9 @@ import {
   type TcSafeWindow,
 } from "../tc-social/derived.js";
 import {
-  computeTrustedSocialPresenceIntervals,
   splitIntervalByJstHour,
 } from "../vc/derived.js";
+import { computePublicSocialPresenceIntervals } from "../vc/public-social-derived.js";
 
 const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
 
@@ -85,7 +85,7 @@ export function computeSocialActivityTimeSafe(
   if (requested && requested.length === 0) return [];
 
   const tcRows = computeTcSocialExchangeCandidates(db, window, requested);
-  const vcRows = computeTrustedSocialPresenceIntervals(db, window, requested);
+  const vcRows = computePublicSocialPresenceIntervals(db, window, requested);
   const targetIds = requested ?? [...new Set([...tcRows.map((row) => row.userId), ...vcRows.map((row) => row.userId)])].sort();
   const daysByUser = new Map<string, Map<string, Map<number, MutableHour>>>();
   for (const userId of targetIds) daysByUser.set(userId, new Map());

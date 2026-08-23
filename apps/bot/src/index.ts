@@ -114,6 +114,12 @@ import {
   handleOriginalRoleTicketSelect,
 } from "./commands/original-role-ticket.js";
 import { trackTitleTcMessage, trackTitleTcReaction } from "./tc-social-tracking.js";
+import {
+  initializeVcPublicSocialPresence,
+  trackVcPublicSocialChannelUpdate,
+  trackVcPublicSocialEveryoneRoleUpdate,
+  trackVcPublicSocialPresence,
+} from "./vc-public-social-tracking.js";
 
 const services = buildServices();
 const client = new Client({
@@ -134,6 +140,7 @@ inviteTracker.wire();
 
 client.once(Events.ClientReady, async (ready) => {
   console.log(`⚔️ 冥獄城ボット 起動: ${ready.user.tag}`);
+  initializeVcPublicSocialPresence(ready, services);
   // 外部Discord APIへ触る復旧より先に、同期の賭場安全確認を必ず完了させる。
   // 再起動直後にstatus=openのまま外部I/O待ちになるfail-open窓を作らない。
   runCasinoRecovery(services);
@@ -634,6 +641,7 @@ client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
 });
 
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  trackVcPublicSocialPresence(oldState, newState, services);
   try {
     trackVoiceState(oldState, newState, services);
     handleVoiceAttendance(oldState, newState, services);
@@ -648,8 +656,22 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   }
 });
 
+client.on(Events.ChannelUpdate, (_oldChannel, newChannel) => {
+  if (newChannel.isDMBased()) return;
+  trackVcPublicSocialChannelUpdate(newChannel, services);
+});
+
+client.on(Events.GuildRoleUpdate, (_oldRole, newRole) => {
+  trackVcPublicSocialEveryoneRoleUpdate(newRole, services);
+});
+
 function shutdown(): void {
   console.log("冥獄城ボットを停止します…");
+  try {
+    services.vcPublicSocial.closeAllObserved(Math.floor(Date.now() / 1000));
+  } catch (error) {
+    console.error("[vc-public-social] graceful close failed", error);
+  }
   client.destroy();
   services.db.close();
   process.exit(0);

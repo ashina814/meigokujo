@@ -121,6 +121,12 @@ export {
   type VcSegmentStartReason,
   type PresenceSummary,
 } from "./vc/service.js";
+export {
+  VcPublicSocialPresence,
+  type ReconcileVcPublicSocialChannelInput,
+  type VcPublicSocialPresenceEndQuality,
+  type VcPublicSocialPresenceReconcileResult,
+} from "./vc/public-social-presence.js";
 // computeCoPresenceOverlaps() / CoPresenceOverlap はrootからもexportしない（PR C2
 // round 3レビュー）。生pairwise relationship data（userA/userB含む）を返すため、
 // package public API全体からrestricted pairwise dataへ到達できないようにする——

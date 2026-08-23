@@ -389,7 +389,7 @@ const THEME_09: ManualReadinessEntry[] = [32, 33, 34, 35, 36, 37].map((no) => ({
     { file: SOCIAL_ACTIVITY_TIME_FILE, symbol: "computeSocialActivityTimeSafe" },
   ],
   notes:
-    "PR F2i: canonical same-surface TC exchange候補とtrusted VC social-presence wall-clock unionをJST date×24hour sparse分布へ統合した。hourはprivacy-safe measurement resolutionであり、daypart境界・TC gap・VC meaningful seconds・share/concentration・必要日数はproduction calibrationへ残す。日付構造により一晩だけの多hourと多数日への分散を区別できる。全件NONCOUNTで、streakや夜更かし量rewardは作らない。",
+    "PR F2i: canonical same-surface TC exchange候補と、main guild/public GuildVoice/human occupancyをliveに証明するvc_public_social_presenceのtrusted wall-clock unionをJST date×24hour sparse分布へ統合した。hourはprivacy-safe measurement resolutionであり、daypart境界・TC gap・VC meaningful seconds・share/concentration・必要日数はproduction calibrationへ残す。日付構造により一晩だけの多hourと多数日への分散を区別できる。全件NONCOUNTで、streakや夜更かし量rewardは作らない。",
   blockerKinds: ["none"] as const,
   optimizationRisk: "HIGH" as const,
 }));

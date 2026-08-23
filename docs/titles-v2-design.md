@@ -1883,8 +1883,9 @@ notification・catalog activationは追加しない。詳細はreadiness §20参
 
 ### F2i — Public Social Activity Time Safe
 
-F2hで利用可能になったcanonical public TC metadataと既存canonical logical VC visitsを、
-read-only derived `social_activity_time_safe`へ統合する。payloadはJST date×hour 0..23の
+F2hで利用可能になったcanonical public TC metadataと、専用canonical persisted source
+`vc_public_social_presence`を、read-only derived `social_activity_time_safe`へ統合する。
+payloadはJST date×hour 0..23の
 sparse distributionで、各hourに`tcBestOtherGapMs`と`vcTrustedSocialSeconds`だけを持つ。
 24hour binはprivacy-safe measurement resolutionであり、morning/afternoon/evening/
 late-night境界ではない。TC gap、VC meaningful seconds、share/concentration/必要日数の
@@ -1896,16 +1897,24 @@ gapだけを採る。normal channelはchannel、thread/forumはthreadがinteract
 forum parentへのlogical area集約はbreadth taxonomyに限り、cross-thread adjacencyをexchangeへ
 使わない。source側で15分等のcutoffやmessage countを置かない。
 
-VCはpair-summedな`vc_social_safe.trustedOverlapSeconds`を流用しない。canonical logical visitの
-trusted subject×trusted other positive intersectionを全counterpart・全channelでsubject-global
-wall-clock unionし、union後にJST hourへ半開区間でsplitする。3人同時10秒は10秒であり20秒に
-しない。`partial_observation`はpresence measurementとして使用できる。untrusted visitは局所
-fail-closedし、trusted siblingを残す。multi-channel corruptionでも各hourは最大3600秒。
+VCはpair-summedな`vc_social_safe.trustedOverlapSeconds`も、公開可視性を持たないraw
+`vc_segments`/`vc_visits`も流用しない。main guildの`GuildVoice`で、@everyoneに
+`ViewChannel`と`Connect`が共にある場合だけeligibleとし、permission解決不能はfail-closed。
+human occupancyが2人以上になった観測時刻に全humanのuser-level intervalを同時にopenし、
+1人以下またはineligibleになった観測時刻に同時closeする。3人同時10秒も各user 10秒で、
+pair-sumしない。VoiceStateUpdateはold/new channelを全human snapshotで収束し、voice/category
+ChannelUpdateとmain guild @everyone RoleUpdateでもpermission transitionを収束する。
+
+restart時のdangling intervalは`recovered_estimate`としてuntrustedに閉じ、downtimeをobservedと
+して伸ばさない。ready時点のcacheから新観測だけを開始し、history fetch/backfillはしない。
+writer/permission failureは専用sidecar内でcatch/logし、既存VC tracker・XP・rooms・handlerを
+止めない。derivedはtrusted observed intervalをsubject-global unionしてからJST hourへ半開区間で
+splitし、corrupt overlapでも各hour最大3600秒を維持する。
 
 payloadへmessage/user/counterpart/channel/surface/area identity、exact timestamp、minute/second、
 raw countを出さない。`orderable:false`でexact earnedAtを主張しない。No.32-37はSOURCE READY・
 NONCOUNT・THRESHOLD_PENDING、No.48はPARTIALのまま。streak、深夜量ranking、「あと何時間」の
-progress、production BehaviorTitleDefinition、award/notification、Bot writer、historical
+progress、production BehaviorTitleDefinition、award/notification、historical
 backfillを追加しない。詳細はreadiness §21参照。
 
 ## 15. PR分割

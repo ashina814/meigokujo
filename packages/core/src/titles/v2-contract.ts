@@ -121,6 +121,7 @@ const TITLE_RESTRICTED_USES = [
   "public_event_safe_completion_classification",
   "public_room_safe_activity_classification",
   "tc_safe_social_classification",
+  "public_social_presence_classification",
 ] as const;
 export type TitleRestrictedUse = (typeof TITLE_RESTRICTED_USES)[number];
 const VALID_TITLE_RESTRICTED_USES: ReadonlySet<string> = new Set(TITLE_RESTRICTED_USES);
@@ -461,13 +462,35 @@ export const TITLE_SOURCES = {
     epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
     rawUnit: "safe_tc_reaction_distribution",
   },
+  vc_public_social_presence: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/vc/public-social-presence.ts",
+      needle: "INSERT INTO vc_public_social_presence",
+    },
+    calledFrom: {
+      file: "apps/bot/src/vc-public-social-tracking.ts",
+      needle: "services.vcPublicSocial.reconcileChannel({",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "trackVcPublicSocialPresence(oldState, newState, services)",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "public_social_presence_classification",
+    epochPolicy: { type: "interval", start: "started_at", end: "ended_at", clip: true },
+    rawUnit: "public_human_social_presence_interval_with_internal_surface_identity",
+  },
   social_activity_time_safe: {
     origin: "derived",
     derivedBy: {
       file: "packages/core/src/social-activity-time/derived.ts",
       needle: "export function computeSocialActivityTimeSafe(",
     },
-    derivedFrom: ["tc_message_observations", "vc_visits"],
+    derivedFrom: ["tc_message_observations", "vc_public_social_presence"],
     kind: "history",
     privacy: "safe",
     orderable: false,

@@ -25,6 +25,7 @@ import {
   TitleV2Store,
   VcRewards,
   VcTracker,
+  VcPublicSocialPresence,
   RankEngine,
   BumpCounter,
   TextActivity,
@@ -116,6 +117,7 @@ export function buildServices() {
   // 説明会の開催予定（通常枠 × 日付ごとの例外）。案内・通知・ボードは全部ここを見る
   const sessions = new SessionCalendar(db, settings, events);
   const vc = new VcTracker(db);
+  const vcPublicSocial = new VcPublicSocialPresence(db);
   const tickets = new Tickets(db, events);
   if (tickets.migrationResult.deletedLegacyTickets > 0) {
     console.warn(`[ticket] 旧式チケットを ${tickets.migrationResult.deletedLegacyTickets} 件削除しました（受付パネル設定は保持）`);
@@ -127,6 +129,14 @@ export function buildServices() {
   // クラッシュで閉じ損ねたVCセグメントの後始末
   const dangling = vc.closeAllDangling();
   if (dangling > 0) console.warn(`[vc] 閉じ損ねセグメントを ${dangling} 件補正しました`);
+  try {
+    const publicSocialDangling = vcPublicSocial.recoverDangling(Math.floor(Date.now() / 1000));
+    if (publicSocialDangling > 0) {
+      console.warn(`[vc-public-social] dangling interval ${publicSocialDangling} 件をuntrustedで閉じました`);
+    }
+  } catch (error) {
+    console.error("[vc-public-social] dangling recovery failed", error);
+  }
   const titles = new TitleEngine(db, vc);
   // v2称号基盤（PR A〜C2）の新規service。旧`titles`（TitleEngine）は置換しない——
   // 既存productionの正本はそのまま`titles`が持ち続ける。PR D2時点ではrank_title_unlocks
@@ -294,6 +304,7 @@ export function buildServices() {
     returns,
     sessions,
     vc,
+    vcPublicSocial,
     tickets,
     chipTx,
     confessions,

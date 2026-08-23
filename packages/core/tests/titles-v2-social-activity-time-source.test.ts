@@ -52,9 +52,9 @@ function setup() {
   const visit = (user: string, channel: string, start: number, end: number) =>
     db
       .prepare(
-        `INSERT INTO vc_segments
-           (user_id, channel_id, parent_id, started_at, ended_at, self_muted, self_deafened, end_quality, start_reason)
-         VALUES (?, ?, 'parent-secret-marker', ?, ?, 0, 0, 'observed', 'join')`,
+        `INSERT INTO vc_public_social_presence
+           (user_id, guild_id, channel_id, started_at, ended_at, end_quality)
+         VALUES (?, 'guild-secret-marker', ?, ?, ?, 'observed')`,
       )
       .run(user, channel, start, end);
   const scope = () => resolveTitleScope(store, RULE.definition, END);
@@ -86,7 +86,7 @@ describe("social_activity_time_safe source runtime", () => {
     expect(cache.get(db, "social_activity_time_safe", "user-1199", scope())).toEqual({ days: [] });
   });
 
-  it("1200 TC surfaces/areas + VC channelsを300 chunkし、surface/channel/message/hour N+1を作らない", () => {
+  it("1200 TC surfaces/areas + public VC presence rowsをboundedに読み、surface/message/hour N+1を作らない", () => {
     const { db, message, visit, scope } = setup();
     db.transaction(() => {
       for (let index = 0; index < 1200; index += 1) {
@@ -103,13 +103,13 @@ describe("social_activity_time_safe source runtime", () => {
     expect(payload.days[0]!.hours).toHaveLength(1);
     const sql = spy.mock.calls.map(([text]) => String(text));
     const areaQueries = sql.filter((text) => text.includes("area_id IN"));
-    const channelQueries = sql.filter((text) => text.includes("channel_id IN"));
+    const presenceQueries = sql.filter((text) => text.includes("FROM vc_public_social_presence"));
     expect(areaQueries).toHaveLength(4);
-    expect(channelQueries).toHaveLength(4);
-    expect(Math.max(...[...areaQueries, ...channelQueries].map((text) => text.match(/\?/g)?.length ?? 0))).toBeLessThanOrEqual(303);
+    expect(presenceQueries).toHaveLength(1);
+    expect(Math.max(...[...areaQueries, ...presenceQueries].map((text) => text.match(/\?/g)?.length ?? 0))).toBeLessThanOrEqual(303);
     expect(sql.filter((text) => /surface_id\s*=\s*\?/.test(text))).toHaveLength(0);
     expect(sql.filter((text) => /message_id\s*=\s*\?/.test(text))).toHaveLength(0);
-    expect(sql.length).toBeLessThanOrEqual(11);
+    expect(sql.length).toBeLessThanOrEqual(8);
   });
 
   it("payload/day/hourの全階層をdeep-freezeする", () => {
@@ -131,7 +131,7 @@ describe("social_activity_time_safe source runtime", () => {
         file: "packages/core/src/social-activity-time/derived.ts",
         needle: "export function computeSocialActivityTimeSafe(",
       },
-      derivedFrom: ["tc_message_observations", "vc_visits"],
+      derivedFrom: ["tc_message_observations", "vc_public_social_presence"],
       kind: "history",
       privacy: "safe",
       orderable: false,
@@ -139,7 +139,30 @@ describe("social_activity_time_safe source runtime", () => {
       epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
       rawUnit: "safe_public_social_activity_hour_distribution",
     });
+    expect(TITLE_SOURCES.vc_public_social_presence).toEqual({
+      origin: "persisted",
+      writtenBy: {
+        file: "packages/core/src/vc/public-social-presence.ts",
+        needle: "INSERT INTO vc_public_social_presence",
+      },
+      calledFrom: {
+        file: "apps/bot/src/vc-public-social-tracking.ts",
+        needle: "services.vcPublicSocial.reconcileChannel({",
+      },
+      wiredFrom: {
+        file: "apps/bot/src/index.ts",
+        needle: "trackVcPublicSocialPresence(oldState, newState, services)",
+      },
+      kind: "history",
+      privacy: "restricted",
+      orderable: false,
+      titleUsable: false,
+      restrictedUse: "public_social_presence_classification",
+      epochPolicy: { type: "interval", start: "started_at", end: "ended_at", clip: true },
+      rawUnit: "public_human_social_presence_interval_with_internal_surface_identity",
+    });
     expect(() => readTitleSource(db, "tc_message_observations" as never, "subject", scope())).toThrow(/not usable/);
+    expect(() => readTitleSource(db, "vc_public_social_presence" as never, "subject", scope())).toThrow(/not usable/);
     expect(() => readTitleSource(db, "vc_visits" as never, "subject", scope())).toThrow(/not usable/);
     const badRule = defineTitleRule(
       { ...RULE.definition, key: "v2.test.bad-social-time-earned-at" },
@@ -160,13 +183,14 @@ describe("social_activity_time_safe source runtime", () => {
       "author-secret-marker",
       "counterpart-secret-marker",
       "channel-secret-marker",
+      "guild-secret-marker",
       "surface-secret-marker",
       "area-secret-marker",
       "parent-secret-marker",
     ]) expect(json).not.toContain(marker);
     for (const forbidden of [
       "userId", "messageId", "authorId", "counterpart", "channelId", "surfaceId", "areaId", "threadId",
-      "createdAt", "startedAt", "endedAt", "timestamp", "minute", "second", "messageCount", "postCount", "pairCount",
+      "createdAt", "startedAt", "endedAt", "timestamp", "minute", "second", "messageCount", "postCount", "pairCount", "permission", "role",
       "morning", "afternoon", "evening", "lateNight", "daypart", "Share",
     ]) expect(json).not.toContain(forbidden);
   });
