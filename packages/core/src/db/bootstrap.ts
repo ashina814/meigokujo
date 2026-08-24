@@ -722,6 +722,70 @@ CREATE TABLE IF NOT EXISTS shop_purchases (
 CREATE INDEX IF NOT EXISTS idx_shop_purchases_user ON shop_purchases(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_shop_purchases_expiry ON shop_purchases(status, expires_at);
 
+-- Titles v2 F2k: shop_purchases は通常商館・特別service・legacy移行を同じ表へ持つため、
+-- purchase時点のcanonical origin/product identityを別のappend-only provenanceへ凍結する。
+-- 既存rowをcurrent shop_items/request/reasonから推測してbackfillしない。
+CREATE TABLE IF NOT EXISTS shop_purchase_title_provenance (
+  purchase_id       INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
+  user_id           TEXT NOT NULL,
+  product_key       TEXT NOT NULL,
+  purchased_at      INTEGER NOT NULL,
+  origin            TEXT NOT NULL CHECK (origin IN (
+    'storefront',
+    'original_role_application',
+    'original_role_invoice',
+    'evaluation_extension',
+    'reevaluation',
+    'legacy_timed_access_import'
+  )),
+  title_eligible    INTEGER NOT NULL CHECK (title_eligible IN (0,1))
+);
+CREATE INDEX IF NOT EXISTS idx_shop_purchase_title_provenance_user_time
+  ON shop_purchase_title_provenance(user_id, purchased_at, purchase_id);
+
+-- status current-stateだけではfixed observedAtを再現できない。refund/cancel occurrenceを
+-- purchaseごとに一度だけappendし、historical snapshotは occurred_at で切る。
+CREATE TABLE IF NOT EXISTS shop_purchase_status_history (
+  purchase_id  INTEGER NOT NULL REFERENCES shop_purchases(id),
+  status       TEXT NOT NULL CHECK (status IN ('refunded','cancelled')),
+  occurred_at  INTEGER NOT NULL,
+  PRIMARY KEY (purchase_id, status)
+);
+CREATE INDEX IF NOT EXISTS idx_shop_purchase_status_history_snapshot
+  ON shop_purchase_status_history(purchase_id, occurred_at, status);
+
+CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_title_provenance_no_update
+BEFORE UPDATE ON shop_purchase_title_provenance
+BEGIN
+  SELECT RAISE(ABORT, 'shop purchase title provenance is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_title_provenance_no_delete
+BEFORE DELETE ON shop_purchase_title_provenance
+BEGIN
+  SELECT RAISE(ABORT, 'shop purchase title provenance is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_status_history_no_update
+BEFORE UPDATE ON shop_purchase_status_history
+BEGIN
+  SELECT RAISE(ABORT, 'shop purchase status history is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_status_history_no_delete
+BEFORE DELETE ON shop_purchase_status_history
+BEGIN
+  SELECT RAISE(ABORT, 'shop purchase status history is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_status_history_capture
+AFTER UPDATE OF status ON shop_purchases
+WHEN OLD.status <> NEW.status AND NEW.status IN ('refunded','cancelled')
+BEGIN
+  INSERT OR IGNORE INTO shop_purchase_status_history (purchase_id, status, occurred_at)
+  VALUES (
+    NEW.id,
+    NEW.status,
+    unixepoch()
+  );
+END;
+
 CREATE TABLE IF NOT EXISTS shop_timed_access_legacy_runs (
   migration_key TEXT PRIMARY KEY,
   plan_json     TEXT NOT NULL,

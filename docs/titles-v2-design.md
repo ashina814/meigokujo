@@ -1949,6 +1949,29 @@ No.76-79をSOURCE READYへ再監査した。
 新persisted table、historical backfill、production threshold、award/notification/leaderboard/progress、
 Bot wiringは無い。
 
+### F2k — Economy Semantic Family + Shop Purchase Safe
+
+`ECONOMY_FEATURE_FAMILY_MANIFEST`をstable正本とし、normal human peer transfer、normal tip、
+canonical storefront shop purchaseだけを`peer_transfer`/`tip`/`shop`へ分類する。
+`knownTxTypes()`、publicLog、reason/ref、商品名・現在設定から自動推定しない。給与・報酬・
+罰金・税・admin・casino/chip/ether・system bookkeeping・overloaded `tip_burn`は除外する。
+Ledger reversalはfixed snapshot end、shop refund/cancelは別domainのappend-only occurrenceで切る。
+
+shop writerはnormal/special/legacyのoriginと購入時product keyをappend-only provenanceへ凍結する。
+No.62 eligibleはgeneric `Shop.purchase()`の`storefront`だけ。original-role、reevaluation、
+evaluation extension、legacy timed-access import、provenance無しsynthetic rowは除外する。
+delivery pending/failedはpurchase成立と独立、expiredもhistorical purchaseとして残す。itemの後日
+rename/update/disableで過去identityを変えない。既存rowをcurrent stateからbackfillしない。
+
+`shop_purchase_safe`はJST日別/global distinct eligible product countだけ、
+`economy_semantic_safe`はJST day×overall family×direction×human breadth、global overall family/counterpart
+breadth、natural in/out、outgoing tip限定recipient/day breadthに加え、subject自身がoutflowとして
+正常利用したfamilyだけのJST日別/global breadthを公開する。incoming-only familyはNo.61の
+overall breadthには寄与するが、No.63のsubject-used breadthを増やさない。identity/amount/price/raw count/
+transaction/purchase ID/exact timestampは出さない。No.59/61/62/63をSOURCE READY、No.60はpair
+chronology、No.64/65はrole-at-time待ち。実集計はREADY 59 / PARTIAL 6 / BLOCKED 26 / META 8。
+production threshold、award/notification、ranking、historical inferred backfill、merge/deployは無い。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

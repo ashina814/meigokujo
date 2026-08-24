@@ -104,6 +104,8 @@ export {
   type ConfirmedInvitesSourcePayload,
   type InviteRootedSafeSourcePayload,
   type EconomySafePeerActionsSourcePayload,
+  type EconomySemanticSafeSourcePayload,
+  type ShopPurchaseSafeSourcePayload,
   type PublicEventParticipationsSourcePayload,
   type PublicEventCompletedParticipationsSourcePayload,
   type SocialActivityTimeSafeSourcePayload,
@@ -122,7 +124,12 @@ export {
 // ここではexportしない——callerがraw transactions由来のfactを直接組み立てて
 // ruleへ注入できる経路を作らない。SAFE_PEER_ECONOMY_TYPES allowlistもinternalのまま。
 // 公開してよいのはpayload型と、その`kind`フィールドの型だけ。
-export { type SafePeerEconomyActionKind } from "./v2-economy.js";
+export {
+  ECONOMY_FEATURE_FAMILY_MANIFEST,
+  type EconomyFeatureFamily,
+  type NaturalEconomyDirection,
+  type SafePeerEconomyActionKind,
+} from "./v2-economy.js";
 
 // v2-casino.ts の computeCasinoActivityDays()/computeCasinoCompletedActivityDays()
 // （PR E4/F2bの内部classifier正本）はここではexportしない——callerがraw

@@ -20,6 +20,13 @@ export type DeliveryKind =
   | "revoke_meirei"
   | null;
 export type PurchaseStatus = "active" | "expired" | "refunded" | "cancelled";
+export type ShopPurchaseTitleOrigin =
+  | "storefront"
+  | "original_role_application"
+  | "original_role_invoice"
+  | "evaluation_extension"
+  | "reevaluation"
+  | "legacy_timed_access_import";
 
 export interface ShopItemInput {
   name: string;
@@ -423,6 +430,26 @@ export class Shop {
     this.ensureSchema();
   }
 
+  /**
+   * Titles v2へ渡すpurchase origin/product identityを購入時点で凍結する。
+   * item名・現在設定・request/reasonから後で推測しない。通常の`purchase()`だけが
+   * eligible storefrontで、special serviceとlegacy importはprovenanceを残しつつ除外する。
+   */
+  private recordTitlePurchaseProvenance(purchase: PurchaseRow, origin: ShopPurchaseTitleOrigin): void {
+    this.db.prepare(
+      `INSERT INTO shop_purchase_title_provenance
+         (purchase_id,user_id,product_key,purchased_at,origin,title_eligible)
+       VALUES (?,?,?,?,?,?)`,
+    ).run(
+      purchase.id,
+      purchase.user_id,
+      `shop-item:${purchase.item_id}`,
+      purchase.purchased_at,
+      origin,
+      origin === "storefront" ? 1 : 0,
+    );
+  }
+
   private ensureSchema(): void {
     this.ensureColumn("shop_purchases", "delivery_snapshot_json", "TEXT");
     this.db.exec(`
@@ -722,7 +749,8 @@ export class Shop {
     if (item && isEvaluationExtensionItem(item)) {
       throw new ShopError("ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
     }
-    return this.purchaseInternal(input);
+    const run = () => this.purchaseInternal({ ...input, titleOrigin: "storefront" });
+    return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
   }
 
   /**
@@ -764,6 +792,7 @@ export class Shop {
         memberRoleIds: input.memberRoleIds,
         request: { applicationId: input.applicationId },
         idempotencyKey: input.idempotencyKey,
+        titleOrigin: "original_role_application",
       });
     };
     return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
@@ -857,6 +886,7 @@ export class Shop {
         this.db.prepare("UPDATE shop_items SET stock = stock - 1, updated_at = ? WHERE id = ?").run(ts, item.id);
       }
       const purchase = this.getPurchase(Number(info.lastInsertRowid))!;
+      this.recordTitlePurchaseProvenance(purchase, "original_role_invoice");
       const changed = this.db.prepare(
         `UPDATE original_role_invoices
             SET status='paid', paid_by=?, paid_at=?, purchase_id=?, transaction_id=?
@@ -925,6 +955,7 @@ export class Shop {
     payAlt?: boolean;
     request?: Record<string, unknown>;
     idempotencyKey?: string;
+    titleOrigin: Exclude<ShopPurchaseTitleOrigin, "original_role_invoice" | "legacy_timed_access_import">;
   }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
     const item = this.getItem(input.itemId);
     if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: input.itemId });
@@ -1003,6 +1034,7 @@ export class Shop {
       this.db.prepare("UPDATE shop_items SET stock = stock - 1, updated_at = ? WHERE id = ?").run(ts, item.id);
     }
     const purchase = this.getPurchase(Number(info.lastInsertRowid))!;
+    this.recordTitlePurchaseProvenance(purchase, input.titleOrigin);
     this.events.log("shop_purchased", {
       actor: input.userId,
       payload: { itemId: item.id, purchaseId: purchase.id, paidLand, paidAltKind, paidAltAmount, expiresAt },
@@ -1131,6 +1163,7 @@ export class Shop {
           },
         },
         idempotencyKey: input.idempotencyKey,
+        titleOrigin: "evaluation_extension",
       });
       const ts = now();
       const changed = this.db
@@ -1307,6 +1340,7 @@ export class Shop {
         payAlt: input.mode === "invite",
         request: input.request,
         idempotencyKey: input.idempotencyKey,
+        titleOrigin: "reevaluation",
       });
       if (input.mode === "invite") {
         const insert = this.db.prepare(
@@ -1583,13 +1617,18 @@ export class Shop {
           idempotencyKey: `shop:refund:${purchase.id}`,
         });
       }
+      const statusChangedAt = now();
+      this.db.prepare(
+        `INSERT OR IGNORE INTO shop_purchase_status_history (purchase_id,status,occurred_at)
+         VALUES (?,'refunded',?)`,
+      ).run(purchase.id, statusChangedAt);
       const updated = this.db
         .prepare(
           `UPDATE shop_purchases
               SET status = 'refunded', delivery_state = 'failed', delivery_error = ?, delivery_updated_at = ?
             WHERE id = ? AND status = 'active'`,
         )
-        .run(`refunded:${reason}`.slice(0, 500), now(), purchase.id).changes;
+        .run(`refunded:${reason}`.slice(0, 500), statusChangedAt, purchase.id).changes;
       if (updated !== 1) throw new ShopError("ERR_REFUND_RACE", { purchaseId });
       this.events.log("shop_refunded", {
         actor,
@@ -2068,6 +2107,7 @@ export class Shop {
             startedAt,
           );
           const purchaseId = Number(purchaseInfo.lastInsertRowid);
+          this.recordTitlePurchaseProvenance(this.getPurchase(purchaseId)!, "legacy_timed_access_import");
           insertImport.run(
             purchaseId,
             migrationKey,

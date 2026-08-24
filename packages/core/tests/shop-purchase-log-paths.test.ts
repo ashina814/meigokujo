@@ -10,5 +10,17 @@ describe("shop purchase log creation paths", () => {
     const source = readFileSync(new URL("../src/shop/service.ts", import.meta.url), "utf8");
     expect(source.match(/INSERT INTO shop_purchases/g) ?? []).toHaveLength(3);
     expect(source.match(/this\.enqueueShopPurchaseLog\(/g) ?? []).toHaveLength(3);
+    // 通常/special/legacyの全writerはpurchase時originも同じflowで凍結する。
+    expect(source.match(/this\.recordTitlePurchaseProvenance\(/g) ?? []).toHaveLength(3);
+    for (const origin of [
+      "storefront",
+      "original_role_application",
+      "original_role_invoice",
+      "evaluation_extension",
+      "reevaluation",
+      "legacy_timed_access_import",
+    ]) {
+      expect(source).toContain(`\"${origin}\"`);
+    }
   });
 });

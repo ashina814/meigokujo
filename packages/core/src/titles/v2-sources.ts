@@ -9,7 +9,13 @@ import {
 } from "../vc/derived.js";
 import { TITLE_SOURCES, type TitleSourceDefinition, type TitleUsableSourceKey } from "./v2-contract.js";
 import { assertResolvedTitleScope, resolvedScopeEffectiveEnd, type ResolvedTitleScope } from "./v2-scope.js";
-import { computeSafeEconomyPeerActions, type SafePeerEconomyActionKind } from "./v2-economy.js";
+import {
+  computeEconomySemanticSafe,
+  computeSafeEconomyPeerActions,
+  type EconomySemanticSafePayload,
+  type SafePeerEconomyActionKind,
+} from "./v2-economy.js";
+import { computeShopPurchaseSafe, type ShopPurchaseSafePayload } from "./v2-shop-purchases.js";
 import { computeCasinoActivityDays, computeCasinoCompletedActivityDays } from "./v2-casino.js";
 import type { CasinoActivityKey } from "../casino/participation-history.js";
 import { computeCompletedPublicEventParticipations } from "./v2-public-events.js";
@@ -160,6 +166,9 @@ export interface CasinoCompletedActivityDaysSourcePayload {
   }>;
 }
 
+export type EconomySemanticSafeSourcePayload = EconomySemanticSafePayload;
+export type ShopPurchaseSafeSourcePayload = ShopPurchaseSafePayload;
+
 export type TcConversationSafeSourcePayload = TcConversationSafePayload;
 export type TcReactionSafeSourcePayload = TcReactionSafePayload;
 export type SocialActivityTimeSafeSourcePayload = SocialActivityTimeSafePayload;
@@ -198,6 +207,8 @@ export interface TitleSourcePayloads {
   confirmed_invites: ConfirmedInvitesSourcePayload;
   invite_rooted_safe: InviteRootedSafeSourcePayload;
   economy_safe_peer_actions: EconomySafePeerActionsSourcePayload;
+  economy_semantic_safe: EconomySemanticSafeSourcePayload;
+  shop_purchase_safe: ShopPurchaseSafeSourcePayload;
   public_event_participations: PublicEventParticipationsSourcePayload;
   public_event_completed_participations: PublicEventCompletedParticipationsSourcePayload;
   casino_activity_days: CasinoActivityDaysSourcePayload;
@@ -610,6 +621,34 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
     return { payloads, readCalls };
   },
 
+  economy_semantic_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, EconomySemanticSafeSourcePayload>();
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      for (const row of computeEconomySemanticSafe(db, { start: scope.start, end: effectiveEnd }, chunk)) {
+        payloads.set(row.userId, row.payload);
+      }
+    }
+    return { payloads, readCalls };
+  },
+
+  shop_purchase_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, ShopPurchaseSafeSourcePayload>();
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      for (const row of computeShopPurchaseSafe(db, { start: scope.start, end: effectiveEnd }, chunk)) {
+        payloads.set(row.userId, row.payload);
+      }
+    }
+    return { payloads, readCalls };
+  },
+
   public_event_participations: (db, userIds, scope) => {
     const payloads = new Map<string, PublicEventParticipationsSourcePayload>();
     for (const userId of userIds) payloads.set(userId, { participations: [] });
@@ -764,6 +803,10 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
   invite_rooted_safe: (db, userId, scope) => BULK_SOURCE_READERS.invite_rooted_safe(db, [userId], scope).payloads.get(userId)!,
   economy_safe_peer_actions: (db, userId, scope) =>
     BULK_SOURCE_READERS.economy_safe_peer_actions(db, [userId], scope).payloads.get(userId)!,
+  economy_semantic_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.economy_semantic_safe(db, [userId], scope).payloads.get(userId)!,
+  shop_purchase_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.shop_purchase_safe(db, [userId], scope).payloads.get(userId)!,
   public_event_participations: (db, userId, scope) =>
     BULK_SOURCE_READERS.public_event_participations(db, [userId], scope).payloads.get(userId)!,
   public_event_completed_participations: (db, userId, scope) =>
