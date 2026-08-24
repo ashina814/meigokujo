@@ -580,7 +580,20 @@ export {
 } from "./casino/opening-backup.js";
 // FakeOpeningBackupAdapter / TestFilesystemOpeningBackupAdapter はテスト専用（CLAUDE.md監査
 // ブロッカー5.4）。本番向けpublic indexからは再エクスポートせず、テストは内部pathから直接importする。
-export { Takutate, TABLE_TYPES, type TableTypeDef, type TempVc } from "./casino/takutate.js";
+export {
+  Takutate,
+  TABLE_TYPES,
+  TITLE_ELIGIBLE_CASINO_TABLE_TYPES,
+  type TableTypeDef,
+  type TempVc,
+  type TakuGuestObservation,
+  type TitleEligibleCasinoTableType,
+} from "./casino/takutate.js";
+export {
+  CASINO_EDITION_I_MANIFEST,
+  casinoEditionIFamilyFor,
+  type CasinoEditionIFamily,
+} from "./casino/edition-i-manifest.js";
 export {
   Escrow,
   escrowHolderFor,

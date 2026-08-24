@@ -120,6 +120,14 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > `missing_derived_source` 10→7、`missing_persisted_source` 6→4、`missing_manifest` 9→8。
 > No.60はpair chronology、No.64/65はrole-at-time待ちでBLOCKEDを維持する。§23参照。
 
+> **PR F2l反映（2026-08-24）**: 常設パネル仕様の「基本ゲーム入口」を根拠に
+> version固定のEdition-I 8-family manifestを追加し、official Takutateのappend-only
+> table instance/known-human guest presenceと、standard market funded commitmentの
+> append-only historyをsafe source化した。No.69-72がBLOCKED→READY、READY 59→63、
+> BLOCKED 26→22。No.73はcore game/standard market evidenceが揃ったがrole-at-time
+> 待ちでBLOCKEDを維持する。`missing_persisted_source` 4→1、`missing_manifest` 8→7。
+> threshold・award・notification・historical inferred backfillは追加していない。§24参照。
+
 ## 0. xlsx canonical hash（exact drift guard）
 
 | 項目 | 値 |
@@ -167,13 +175,13 @@ full-clear editionに登録されたREQUIRED印100%——NONCOUNTの91 behavior�
 
 | status | 件数 | 意味 |
 | --- | --- | --- |
-| READY | 59 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
+| READY | 63 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
 | PARTIAL | 6 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
-| BLOCKED | 26 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
+| BLOCKED | 22 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
 | META | 8 | kind:meta（別bucket、§7参照） |
 
 **READY = 今すぐreleaseしてよい、ではない**。sourceReadinessとthreshold決定は
-別軸（§10参照）——READY 59件も、production threshold値（分布TBD等）が
+別軸（§10参照）——READY 63件も、production threshold値（分布TBD等）が
 決まるまではrelease対象にならない。またSeries manifest／Collection Edition／
 Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）。No.58はさらに、
 award後のreversalを既存immutable ownershipへどう反映するかが未決定であるため、
@@ -183,15 +191,15 @@ source-readyでもproduction release不可（§15）。
 
 | blockerKind | 件数 | 意味 |
 | --- | --- | --- |
-| missing_persisted_source | 4 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
+| missing_persisted_source | 1 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
 | missing_derived_source | 7 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
-| missing_manifest | 8 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
+| missing_manifest | 7 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
 | missing_role_history | 7 | role-at-time（過去のある時点でどのroleを保持していたか）がrepo全体で未実装 |
 | source_semantic_mismatch | 6 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（No.1/6/22のpublic VC provenance、No.29/30のpair-specific overlap、No.48のfree-flow同一topic correlation） |
 | missing_event_protocol | 2 | イベントデータモデル自体にorganizer/staff区別が存在しない |
 | known_bug | 0 | PR F2aで`computeLastOccupant()`のsame-second/0-second visit tie bugを修正——catalog全体から解消済み（§13参照） |
 
-（`none`のBehavior候補は59件——ちょうどREADY件数と一致。PARTIAL 6件は
+（`none`のBehavior候補は63件——ちょうどREADY件数と一致。PARTIAL 6件は
 すべて`source_semantic_mismatch`を持つ。）
 
 ## 4. Theme別 readiness
@@ -211,7 +219,7 @@ source-readyでもproduction release不可（§15）。
 | 11 | TC交流 | 8 | 7 | 1 | 0 |
 | 12 | 公開部屋 | 8 | 7 | 0 | 1 |
 | 13 | Land・経済 | 8 | 5 | 0 | 3 |
-| 14 | 賭場 | 8 | 3 | 0 | 5 |
+| 14 | 賭場 | 8 | 7 | 0 | 1 |
 | 15 | 招待 | 6 | 6 | 0 | 0 |
 | 16 | イベント | 5 | 2 | 0 | 3 |
 | 17 | 城横断 | 7 | 0 | 0 | 7 |
@@ -221,11 +229,12 @@ trusted secondsで日数/share/span/streakを後段評価できるため）。�
 7/8件がSOURCE READYとなり、No.57だけrole-at-time待ち。時間帯・生活痕はF2iで6/6件が
 SOURCE READYとなった。TC交流はF2hで7/8件がSOURCE READYとなり、No.48だけfree-flow同一topic correlationのsemantic mismatchが残る。
 招待はF2jで6/6件がSOURCE READYとなった。Land・経済はF2kで5/8件がREADYとなり、
-No.60はpair chronology、No.64/65はrole-at-time待ち。城横断は引き続き0% READY。
+No.60はpair chronology、No.64/65はrole-at-time待ち。賭場はF2lで7/8件がREADYとなり、
+No.73だけrole-at-time待ち。城横断は引き続き0% READY。
 
 ## 5. source別に残る実装（READYを支えるsource／PARTIALの制約／BLOCKEDが必要とするもの）
 
-READYを支えている既存`titleUsable:true` source（17種、59件）:
+READYを支えている既存`titleUsable:true` source（20種、63件）:
 
 - `vc_empty_start_then_joined`（No.2。No.1はpublic provenance不足でPARTIAL）
 - `vc_last_occupant`（No.7, 9。No.6はtie bug解消済みだがpublic provenance不足でPARTIAL）
@@ -234,6 +243,9 @@ READYを支えている既存`titleUsable:true` source（17種、59件）:
 - `bump_events`（No.38-41、全件READY）
 - `casino_activity_days`（No.68 のみ——「利用する」semanticsに限りcompletion保証不要。commitmentベースのまま維持）
 - `casino_completed_activity_days`（No.66, 67——PR F2bで追加したcompletion正本、§14参照）
+- `casino_edition_i_completion_safe`（No.69——version固定8-family manifestとcompletionだけを集約、§24参照）
+- `casino_table_activity_safe`（No.70-71——official卓×anonymous guest profile×JST日×trusted seconds、§24参照）
+- `casino_market_activity_safe`（No.72——other standard boardのsuccessful funded commitmentをmarket×JST日collapse、§24参照）
 - `confirmed_invites`（No.74-75 のみ——`invitee_id UNIQUE`によりdistinct数が保証される）
 - `invite_rooted_safe`（No.76-79——confirmed direct relation、immutable entry anchor、canonical public activity/network/pair reunionをanonymous direct-branch profileへ統合、§22参照）
 - `economy_safe_peer_actions`（No.58——snapshot時点でreverse済みoriginalを除外、§15参照）
@@ -252,19 +264,16 @@ PARTIALを止めているもの（source_semantic_mismatch、§12/§14で今回�
 - `tc_conversation_safe.startedConversations`はexplicit reply/threadだけを同一conversationとexactに証明でき、通常free-flowの同一topic長期継続をcanonicalに証明できない（No.48）
 
 （casino participation-vs-completion mismatchはPR F2bで解消済み——No.66/67は
-READY化、No.69はmissing_manifestのみ残る。economy reversal mismatchも
+READY化し、No.69のmanifest blockerもF2lで解消した。economy reversal mismatchも
 PR F2cで解消済み。public event completion mismatchもPR F2dで解消済み——
 No.80/81はREADY、No.82はevent-date span source不足のみ残る。§14-16参照。）
 
 BLOCKEDが新たに必要とするもの（xlsxのSource_Map original「未実装」から、
 E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 
-- **`casino_table_activity_safe`(host/guest区別)新設**—— No.70-71（2件）。casino_participationsは全参加者を対称記録——host/guest概念自体が現データモデルに存在しない
-- **market/betting safe source新設**—— No.72（1件）。market/stocks系は`CASINO_ACTIVITY_KEYS`の対象外
 - **event dual-role（organizer/staff）protocol拡張**—— No.83-84（2件）。`public_events`のデータモデル自体にorganizer概念が無い
 - **event_dateのsafe span source新設**—— No.82（1件）。`completedAt`はstaff attestation時刻であり実event日/spanの代用不可
 - **`castle_experience_safe`新設 + 城横断manifest**—— No.85-91（7件）。grep 0件で、E3のevent infra完成待ちでもある
-- **第I期core game family一覧manifest**—— No.69（1件）。completion半分はPR F2bで解消済み——残るのはmanifest未定義のみ
 
 ## 6. threshold pending
 
@@ -276,7 +285,7 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 | STRUCTURAL_PLUS_DISTRIBUTION | 1 | 構造は決まるが、一部の値は分布依存 |
 | META_NOT_APPLICABLE | 8 | meta（別contract、§10適用外） |
 
-sourceReadinessとthresholdは別軸——READY 59件のうち、STRUCTURAL_FIXEDなのは
+sourceReadinessとthresholdは別軸——READY 63件のうち、STRUCTURAL_FIXEDなのは
 一部（初回系）のみで、残りはTHRESHOLD_PENDINGのままREADYになっている
 （sourceは十分だが実数値は分布を見てから決める）。
 
@@ -286,7 +295,7 @@ sourceReadinessとthresholdは別軸——READY 59件のうち、STRUCTURAL_FIXE
 | --- | --- | --- |
 | role-at-time依存（`roleDependency !== "none"`） | 10 | readiness blockerとして`missing_role_history`が残るのは7件。No.65はF2kでshop側だけ解消しrole-at-time単独待ちになった |
 | イベントtheme（Theme No.16） | 5 | No.80/81はcompletion sourceでREADY、No.82-84は依然BLOCKED |
-| manifest依存（thresholdCategory: MANIFEST_DEPENDENT） | 6 | 賭場core family一覧・城横断family一覧・series一覧が未定義 |
+| manifest依存（thresholdCategory: MANIFEST_DEPENDENT） | 6 | No.69の賭場Edition-I manifestはF2lで確定。残る城横断family一覧・series一覧等は未定義 |
 | known bug依存 | 0 | PR F2aで`computeLastOccupant`の同秒0秒visit tie bugを修正——catalog全体から解消（§13参照） |
 | source_semantic_mismatch依存 | 6 | No.1/6/22のpublic VC provenance、No.29/30のpair-specific overlap、No.48のfree-flow同一topic（§14-16/§18/§20/§21.5参照） |
 
@@ -311,20 +320,21 @@ sourceReadinessとthresholdは別軸——READY 59件のうち、STRUCTURAL_FIXE
 > blockerのみ残る。TC+VC時間帯clusterも**PR F2iで解消済み**（§21参照）——
 > No.32-37がBLOCKED→READY。economy semantic family/shop purchase clusterも
 > **PR F2kで解消済み**（§23参照）——No.59/61/62/63がBLOCKED→READY、
-> No.65はshop側だけ解消してrole-at-time待ち。
+> No.65はshop側だけ解消してrole-at-time待ち。casino Edition-I manifest / official
+> table / standard market clusterも**PR F2lで解消済み**（§24参照）——No.69-72が
+> BLOCKED→READY、No.73はrole-at-timeだけが残る。
 > 以下は残っているクラスタのみを優先度順に並べ直したもの。
 
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
-| 1 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
-| 2 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
-| 3 | role-at-time基盤 | role依存最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
-| 4 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
-| 5 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
+| 1 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
+| 2 | role-at-time基盤 | role依存最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
+| 3 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
 
 VC group-size clusterはF2e、VC social breadth clusterはF2f、公開部屋clusterは
 F2g、TC conversation/reactionの7件はF2h、TC+VC時間帯clusterはF2iで解消した。
 招待clusterはF2jの`invite_rooted_safe`、economy/shop clusterはF2kで解消した。
+casino Edition-I/table/market clusterはF2lで解消した。
 No.48の残件は次のsource実装ではなく、
 content無しでfree-flow同一topicをどうcanonicalに証明するかという別枠のproduct/UX
 semantic decisionであり、特殊操作をユーザーへ強制してREADY化しない。
@@ -340,7 +350,7 @@ xlsx上の記述と、現在のruntime契約が食い違う箇所——本PRで�
 | Meta（No.92-99）のScope列: `catalog` | `MetaTitleDefinition`はruntimeでは常にglobal scope（catalogスコープの概念を持たない） | このPRでは変更しない。将来Meta titleを実際に登録する際に解決する |
 | Meta（No.92-99）のSeries/Stage: `collection_meta` stage 1..7 | `MetaTitleDefinition`はprogressionを持たない（`v2-contract.ts`の型契約） | xlsx上のstageは**editorial orderingとしてのみ**候補データに保持する（`v2-catalog-candidates.ts`の`stage`フィールド）。Meta titleをBehavior progressionへ無理に押し込まない |
 | 賭場・招待・時間帯・role-aware・generic eventも「REQUIRED」（Full-clear Manifest Contract） | 本PRではfull-clear editionそのものを一切activateしない | REQUIRED表記はcandidate上の**将来の意図**の記録であり、今すぐeditionに組み込まれるという意味ではない（§13参照） |
-| casino No.66/67/69の「正常完了する」 | ~~`casino_activity_days`はsuccessful funded participation commitmentまでしか証明しない~~ → **PR F2bで解消**: `casino_completed_activity_days`がcanonical financial resolution primitive成功後にのみ書かれるcompletion正本として追加された（§14） | catalog側semanticsは変更していない——source側にcompletion保証を追加する形で解決した。No.69はmanifest未定義のみ残る |
+| casino No.66/67/69の「正常完了する」 | **PR F2b**でcompletion正本を追加し、**PR F2l**でversion固定Edition-I 8-family manifestを追加した（§14/§24） | catalog側semanticsは変更していない。No.69もcommitmentではなくcompletionだけを用い、将来gameは旧editionへ自動加入しない |
 | economy No.58の「reversal済取引は無効」 | **PR F2cで解消**: `economy_safe_peer_actions`はevaluation snapshot時点でreversal済みのoriginalを除外する（future reversalは過去を変更しない、§15） | catalog/xlsx semanticは変更していない。source readinessはREADY。ただしpost-award reversalは別のproduction release gateとして残る |
 | event No.80/81の「completed公式イベント」 | **PR F2dで解消**: immutable `public_event_completions`へstaffが明示attestし、safe sourceがroster revisionとJOINする（§16） | catalog側semanticsと既存E3 roster sourceは変更していない。No.82は実event-date span source不足だけ残る |
 
@@ -357,8 +367,7 @@ xlsx上の記述と、現在のruntime契約が食い違う箇所——本PRで�
 - Series manifestの登録（`registerSeriesManifests()`呼び出し）
 - Collection Editionのactivate
 - production threshold値の決定
-- role-at-time・castle_experience・casino table/market・event dual-role protocol等、優先度表に残る基盤の新規実装
-- 第I期casino core-family manifestの策定・No.69のREADY化
+- role-at-time・castle_experience・event dual-role protocol等、優先度表に残る基盤の新規実装
 - Behavior evaluatorのproduction wiring
 
 （`vc_last_occupant`の同秒0秒visit tie bug修正はPR F2aで実施済み——§13参照。
@@ -1339,3 +1348,69 @@ BLOCKED 26 / META 8。priority tableから完了済みeconomy/shop clusterを外
 連番化した。production threshold、BehaviorTitleDefinition、award/notification、leaderboard、
 progress UI、amount/wealth/spend/purchase-count ranking、Series/Collection/Meta activation、
 historical inferred backfill、merge/deployは行わない。
+
+## 24. PR F2l: Casino Edition-I Manifest + Table / Standard Market Safe Sources
+
+### 24.1 Edition-I completion
+
+`CASINO_EDITION_I_MANIFEST`はversion=1の明示manifestで、常設パネル仕様の「基本ゲーム入口」
+（スロット・丁半・クラッシュ・チンチロ・ルーレット・BJ・ポーカー・ホールデム）を根拠に、
+`slots`/`chohan`/`crash`/`chinchiro`/`roulette`/`blackjack`/`poker`/`holdem`の8 familyへ固定した。
+運用allowlist `CASINO_ACTIVITY_KEYS`は11種だが、keiba/sashi/indianはEdition-I外。allowlistへ
+future gameを足してもmanifestを明示改訂しない限り旧editionへ加入しない。No.69 derivedは
+`casino_completed_activity_days`だけをfamilyへ写し、全8 familyのcanonical completionを要求する。
+commitment、勝敗、利益、賭け額、raw回数は使わない。
+
+### 24.2 official table provenance / trust / privacy
+
+eligible typeは`TITLE_ELIGIBLE_CASINO_TABLE_TYPES`へsashi/mahjong/duel/watch/zatsuを明示固定し、
+`TABLE_TYPES`へ将来追加しただけでは称号対象にならない。公式panelのDiscord VC作成後、
+`Takutate.track()`がcurrent row、append-only instance anchor、eventを同一DB transactionで保存する。
+tracking失敗時は作成済みVCを削除してsplit-brainを残さない。channel名/category/reason/manual VCは分類しない。
+
+guest observationはDiscord memberのcanonical bot flagが明示falseのuserだけを開き、owner自身は除外する。
+mute/deafen等のsame-channel state changeでは分割しない。known join/leave、ChannelDelete、untrack、graceful
+observation endだけをclose境界にする。restart時のdangling intervalは`recovered_unknown`として開始時刻で
+閉じ、gap全体を0 trusted secondsにする。startup current cacheからはその観測時刻でfresh intervalを開き、
+history backfillをしない。guest writer failureは専用try/catchで既存VC/room/卓削除を止めない。
+
+safe payloadは次のidentity-free shapeである。
+
+```ts
+{
+  tables: [{ createdDate, guestStays: [{ guestProfileIndex, date, trustedSeconds }] }],
+  guests: [{ stays: [{ tableProfileIndex, date, trustedSeconds }] }]
+}
+```
+
+restricted owner/guest/channel/guild identityだけでcorrelationしてからanonymous indexへ落とす。空卓、ownerのみ、
+botのみ、unknown/recovered-only卓はsafe table profile自体を作らない。同一guest再訪は同profile、別guestは別profile。
+deleted/untrack後もinstance/historyは残る。一卓の日跨ぎは1 table profileの複数day staysであり独立2卓にしない。
+instance作成はscope前でもcontextとして使えるが、guest secondsは`[start,effectiveEnd)`へclipする。
+
+### 24.3 standard market successful commitment
+
+current `casino_market_bets`は張り直しでDELETE/置換されるためhistorical sourceには使わない。また既存rowから
+inferred backfillもしない。`Markets.bet()`のfund transfer/current betと同じidempotent `runGroup`
+transaction内で`casino_market_participation_history`へimmutable rowを追加する。同じoperation retryはcallbackが
+再実行されずduplicate 0、validation/deadline/funding failureはtransaction全体がrollbackしてhistory 0。
+commit時のmarket id/creator/mode/create/deadline/occurredAtをrestricted snapshotへ凍結する。
+
+safe readerは`market_mode='standard'`、creator != participant、`created_at <= occurred_at < deadline_at`だけを
+採用する。event Land market、stocks、self board、system/admin bookkeepingを除外。market title/options/channel/
+message、amount、option、win/loss/result/profitは読まない。`user × market × JST day`でcollapseするため同日100回
+rebetも1、同じboardの別日は別day、別board同日はday breadth 2。settlement/refund/voidやcurrent market削除は、
+過去のsuccessful funded commitmentをretroactively消さない。payloadは
+`{ days:[{date,distinctOtherStandardBoards}], distinctOtherStandardBoards }`だけ。
+
+### 24.4 fixed snapshot / bulk / readiness
+
+全derivedは`[start,resolvedScopeEffectiveEnd(scope))`を守る。300-user chunkでtable guest JOINとmarket historyを
+bulk読みし、user/table/guest/marketごとのN+1を作らない。601 subjects（300/300/1）でsingle/bulk payload一致を
+固定した。A–AM regressionsはmanifest固定、completion-only、owner/bot/fake/restart/cross-midnight/pre-scope/
+deletion、standard/self/event/stocks/failure/idempotency/rebet/refund/corruption/privacyを覆う。
+
+No.66/67 completion、No.68 commitmentは既存semanticを維持。No.69/70/71/72をREADYへ更新し、No.73は
+`casino_activity_days`と`casino_market_activity_safe`が利用可能になってもrole-at-time不足でBLOCKED。
+overallはREADY 63 / PARTIAL 6 / BLOCKED 22 / META 8。production threshold、BehaviorTitleDefinition、award/
+notification/leaderboard/progress、historical inferred backfill、Series/Collection/Meta activation、merge/deployは行わない。

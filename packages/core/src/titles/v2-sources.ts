@@ -18,6 +18,14 @@ import {
 import { computeShopPurchaseSafe, type ShopPurchaseSafePayload } from "./v2-shop-purchases.js";
 import { computeCasinoActivityDays, computeCasinoCompletedActivityDays } from "./v2-casino.js";
 import type { CasinoActivityKey } from "../casino/participation-history.js";
+import {
+  computeCasinoEditionICompletionSafe,
+  computeCasinoMarketActivitySafe,
+  computeCasinoTableActivitySafe,
+  type CasinoEditionICompletionPayload,
+  type CasinoMarketActivitySafePayload,
+  type CasinoTableActivitySafePayload,
+} from "./v2-casino-edition-table-market.js";
 import { computeCompletedPublicEventParticipations } from "./v2-public-events.js";
 import { computePublicRoomActivitySafe } from "../rooms/derived.js";
 import {
@@ -166,6 +174,10 @@ export interface CasinoCompletedActivityDaysSourcePayload {
   }>;
 }
 
+export type CasinoEditionICompletionSafeSourcePayload = CasinoEditionICompletionPayload;
+export type CasinoTableActivitySafeSourcePayload = CasinoTableActivitySafePayload;
+export type CasinoMarketActivitySafeSourcePayload = CasinoMarketActivitySafePayload;
+
 export type EconomySemanticSafeSourcePayload = EconomySemanticSafePayload;
 export type ShopPurchaseSafeSourcePayload = ShopPurchaseSafePayload;
 
@@ -213,6 +225,9 @@ export interface TitleSourcePayloads {
   public_event_completed_participations: PublicEventCompletedParticipationsSourcePayload;
   casino_activity_days: CasinoActivityDaysSourcePayload;
   casino_completed_activity_days: CasinoCompletedActivityDaysSourcePayload;
+  casino_edition_i_completion_safe: CasinoEditionICompletionSafeSourcePayload;
+  casino_table_activity_safe: CasinoTableActivitySafeSourcePayload;
+  casino_market_activity_safe: CasinoMarketActivitySafeSourcePayload;
   public_room_activity_safe: PublicRoomActivitySafeSourcePayload;
 }
 
@@ -752,6 +767,47 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
     }
     return { payloads, readCalls };
   },
+  casino_edition_i_completion_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, CasinoEditionICompletionSafeSourcePayload>();
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      for (const [userId, payload] of computeCasinoEditionICompletionSafe(
+        db, { start: scope.start, end: effectiveEnd }, chunk,
+      )) payloads.set(userId, payload);
+    }
+    return { payloads, readCalls };
+  },
+  casino_table_activity_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, CasinoTableActivitySafeSourcePayload>();
+    for (const id of userIds) payloads.set(id, { tables: [], guests: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      for (const [userId, payload] of computeCasinoTableActivitySafe(
+        db, { start: scope.start, end: effectiveEnd }, chunk,
+      )) payloads.set(userId, payload);
+    }
+    return { payloads, readCalls };
+  },
+  casino_market_activity_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, CasinoMarketActivitySafeSourcePayload>();
+    for (const id of userIds) payloads.set(id, { days: [], distinctOtherStandardBoards: 0 });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      for (const [userId, payload] of computeCasinoMarketActivitySafe(
+        db, { start: scope.start, end: effectiveEnd }, chunk,
+      )) payloads.set(userId, payload);
+    }
+    return { payloads, readCalls };
+  },
 };
 
 /**
@@ -815,6 +871,12 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
     BULK_SOURCE_READERS.casino_activity_days(db, [userId], scope).payloads.get(userId)!,
   casino_completed_activity_days: (db, userId, scope) =>
     BULK_SOURCE_READERS.casino_completed_activity_days(db, [userId], scope).payloads.get(userId)!,
+  casino_edition_i_completion_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.casino_edition_i_completion_safe(db, [userId], scope).payloads.get(userId)!,
+  casino_table_activity_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.casino_table_activity_safe(db, [userId], scope).payloads.get(userId)!,
+  casino_market_activity_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.casino_market_activity_safe(db, [userId], scope).payloads.get(userId)!,
 };
 
 /**

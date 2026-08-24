@@ -33,7 +33,13 @@ import {
   handleItaModal,
   handleItaSelect,
 } from "./commands/ita.js";
-import { handleTakuButton, handleTakuVoiceUpdate, sweepStaleTables } from "./commands/takutate-panel.js";
+import {
+  handleTakuButton,
+  handleTakuVoiceUpdate,
+  sweepStaleTables,
+  trackTakuChannelDelete,
+  trackTakuGuestPresence,
+} from "./commands/takutate-panel.js";
 import { handlePokerDuelButton, handlePokerDuelSelect } from "./casino/poker-duel.js";
 import { denyIfCasinoClosed } from "./casino/gate.js";
 import { handleCasinoPlayButton, handleCasinoPrimaryButton, isCasinoPlayButton, isCasinoPrimaryButton } from "./casino/play-route.js";
@@ -677,6 +683,11 @@ client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   trackVcPublicSocialPresence(oldState, newState, services);
   try {
+    trackTakuGuestPresence(oldState, newState, services);
+  } catch (err) {
+    console.error("[taku] guest observation失敗:", err);
+  }
+  try {
     trackVoiceState(oldState, newState, services);
     handleVoiceAttendance(oldState, newState, services);
     handleRoomVoiceUpdate(oldState, newState, services);
@@ -698,6 +709,11 @@ client.on(Events.ChannelUpdate, (_oldChannel, newChannel) => {
 client.on(Events.ChannelDelete, (deletedChannel) => {
   if (deletedChannel.isDMBased()) return;
   trackVcPublicSocialChannelDelete(deletedChannel, services);
+  try {
+    trackTakuChannelDelete(deletedChannel, services);
+  } catch (err) {
+    console.error("[taku] channel delete observation失敗:", err);
+  }
 });
 
 client.on(Events.GuildRoleUpdate, (_oldRole, newRole) => {
@@ -710,6 +726,11 @@ function shutdown(): void {
     services.vcPublicSocial.closeAllObserved(Math.floor(Date.now() / 1000));
   } catch (error) {
     console.error("[vc-public-social] graceful close failed", error);
+  }
+  try {
+    services.takutate.closeAllGuestObservations(Math.floor(Date.now() / 1000));
+  } catch (error) {
+    console.error("[taku] graceful close failed", error);
   }
   client.destroy();
   services.db.close();

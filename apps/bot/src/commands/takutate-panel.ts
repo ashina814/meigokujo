@@ -72,6 +72,7 @@ export async function handleTakuButton(interaction: ButtonInteraction, services:
   const parent = panelChannel.parent;
   // VC作成は遅く3秒を超えることがあるので先に defer（以降 editReply）
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  let createdVc: import("discord.js").VoiceChannel | undefined;
   try {
     const uid = interaction.user.id;
     const name = `${def.emoji} ${def.name}・${interaction.user.username.slice(0, 12)}`;
@@ -82,14 +83,42 @@ export async function handleTakuButton(interaction: ButtonInteraction, services:
       userLimit: def.userLimit,
       reason: `卓建て by ${uid}`,
     });
+    createdVc = vc;
     services.takutate.track(vc.id, guild.id, uid, def.key);
     await interaction.editReply({
       content: `✅ ${def.emoji} **${def.name}** を立てた: <#${vc.id}>（最後の1人が退出で自動削除）`,
     });
   } catch (e) {
+    // Discord creationだけ成功してimmutable instance writerが失敗したsplit-brainを残さない。
+    if (createdVc && !services.takutate.isTracked(createdVc.id)) {
+      await createdVc.delete("卓建て: tracking write failure rollback").catch(() => undefined);
+    }
     console.error("[卓建て] VC 作成に失敗:", e);
     await interaction.editReply({ content: `❌ VC 作成に失敗した（Botの権限不足?）` });
   }
+}
+
+/** Human/bot provenanceをDiscord memberから直接取り、owner除外はcore正本で行う。 */
+export function trackTakuGuestPresence(
+  oldState: import("discord.js").VoiceState,
+  newState: import("discord.js").VoiceState,
+  services: Services,
+): void {
+  services.takutate.observeGuestTransition({
+    userId: newState.id,
+    isBot: newState.member?.user.bot ?? oldState.member?.user.bot,
+    oldChannelId: oldState.channelId,
+    newChannelId: newState.channelId,
+  });
+}
+
+/** ChannelDelete packetをterminal observationとして閉じる。VoiceStateUpdateへ依存しない。 */
+export function trackTakuChannelDelete(
+  channel: import("discord.js").GuildBasedChannel,
+  services: Services,
+): void {
+  if (channel.type !== ChannelType.GuildVoice || !services.takutate.isTracked(channel.id)) return;
+  services.takutate.untrack(channel.id);
 }
 
 /** VoiceStateUpdate ハンドラ: 追跡中の卓VCが空になったら削除 */
@@ -132,6 +161,13 @@ export async function sweepStaleTables(client: import("discord.js").Client, serv
           await ch.delete("卓建て: 起動時 sweep").catch(() => undefined);
           services.takutate.untrack(t.channel_id);
           removed++;
+        } else {
+          // Fetch完了後のchannel snapshotを観測した時刻からだけ開始する。
+          // sweep入口時刻や別channelの観測時刻を共有してrestart gapをbackfillしない。
+          const observedAt = Math.floor(Date.now() / 1000);
+          for (const [, member] of ch.members) {
+            services.takutate.observeCurrentGuest(ch.id, member.id, member.user.bot, observedAt);
+          }
         }
       }
     } catch {

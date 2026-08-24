@@ -272,6 +272,27 @@ export class Markets {
         created_at   INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_event_market_ops_market ON event_market_ops(market_id, kind);
+
+      -- Current casino_market_bets is intentionally overwritten by re-bets. Titles need an
+      -- immutable successful-commitment fact that settlement/void/refund cannot erase.
+      CREATE TABLE IF NOT EXISTS casino_market_participation_history (
+        participation_key TEXT PRIMARY KEY,
+        market_id         INTEGER NOT NULL,
+        market_creator_id TEXT NOT NULL,
+        participant_id    TEXT NOT NULL,
+        market_mode       TEXT NOT NULL,
+        market_created_at INTEGER NOT NULL,
+        market_deadline_at INTEGER NOT NULL,
+        occurred_at       INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_casino_market_participant_time
+        ON casino_market_participation_history(participant_id, occurred_at);
+      CREATE TRIGGER IF NOT EXISTS casino_market_participation_no_update
+      BEFORE UPDATE ON casino_market_participation_history
+      BEGIN SELECT RAISE(ABORT, 'casino_market_participation_history is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS casino_market_participation_no_delete
+      BEFORE DELETE ON casino_market_participation_history
+      BEGIN SELECT RAISE(ABORT, 'casino_market_participation_history is append-only'); END;
     `);
   }
 
@@ -542,7 +563,8 @@ export class Markets {
       const m = this.get(marketId);
       if (!m) throw new MarketError("ERR_UNKNOWN_MARKET", { marketId });
       if (m.status !== "open") throw new MarketError("ERR_NOT_OPEN", { marketId, status: m.status });
-      if (m.deadline_at <= now()) throw new MarketError("ERR_NOT_OPEN", { marketId, deadline: m.deadline_at });
+      const occurredAt = now();
+      if (m.deadline_at <= occurredAt) throw new MarketError("ERR_NOT_OPEN", { marketId, deadline: m.deadline_at });
       // 旧方式（legacy_house）や未知の fund_mode には新規ベットを受け付けない（escrow のみ）
       if (m.fund_mode !== "escrow") throw new MarketError("ERR_LEGACY_BET_FORBIDDEN", { marketId, mode: m.fund_mode });
       const options = JSON.parse(m.options_json) as string[];
@@ -585,7 +607,24 @@ export class Markets {
       this.ether.transfer(userId, escHolder, amount, { reason: "板への賭け", game: "market", sessionId: `market:${marketId}` });
       this.db
         .prepare("INSERT INTO casino_market_bets (market_id, user_id, option_index, amount, created_at) VALUES (?, ?, ?, ?, ?)")
-        .run(marketId, userId, optionIndex, amount, now());
+        .run(marketId, userId, optionIndex, amount, occurredAt);
+      // Fund transfer + current bet + immutable title fact are in the same runGroup transaction.
+      // Store mode/context at commitment time so later mutable market state is never inferred.
+      this.db.prepare(
+        `INSERT INTO casino_market_participation_history
+          (participation_key, market_id, market_creator_id, participant_id, market_mode,
+           market_created_at, market_deadline_at, occurred_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        `market:bet:${marketId}:${userId}:${operationId}`,
+        marketId,
+        m.creator_id,
+        userId,
+        m.market_mode,
+        m.created_at,
+        m.deadline_at,
+        occurredAt,
+      );
       this.events.log("market_bet", {
         actor: userId,
         payload: { marketId, optionIndex, amount, previous: existingTotal > 0 ? existingTotal : null },
