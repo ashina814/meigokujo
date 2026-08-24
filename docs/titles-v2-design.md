@@ -1909,8 +1909,11 @@ restart時のdangling intervalは`recovered_estimate`としてuntrustedに閉じ
 して伸ばさない。ready時点のcacheから新観測だけを開始し、history fetch/backfillはしない。
 Gateway lossでは影響shardのmain guildだけをloss時刻でsuspendする。Resume中のreplayed
 VoiceStateUpdateは真のoccurrence timestampを持たないためsourceへ書かず、`ShardResume`の
-replay完了後、fresh `ShardReady`、または`GuildAvailable`のcurrent cache観測時点から再開する。
-disconnect/unavailable中のhistoryはbackfillしない。
+replay完了後にshard suspensionだけを解除する。fresh `ShardReady`でもmain guildがunavailableなら
+guild suspensionを維持し、`GuildAvailable`のfull current cache観測時点から再開する。cold startupも
+unavailable cacheを開始snapshotに使わない。`ChannelDelete`は対象voiceをdelete観測時刻でcloseし、
+main `GuildDelete`はguild全体をcloseして`GuildCreate`のcurrent cacheまで再開しない。
+disconnect/unavailable/delete中のhistoryはbackfillしない。
 
 writer/permission failureは専用sidecar内でcatch/logし、既存VC tracker・XP・rooms・handlerを
 止めない。writer failureではchannel-local trust fenceで失敗以降を直ちにclipし、Gateway healthy中に

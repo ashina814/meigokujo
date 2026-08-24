@@ -199,13 +199,14 @@ export class VcPublicSocialPresence {
     const channelId = requireText(channelIdValue, "channelId");
     const observedAt = requireTimestamp(observedAtValue);
     setEarlierFence(fencesFor(this.db).channels, channelKey(guildId, channelId), observedAt);
+    const effectiveAt = getVcPublicSocialTrustFence(this.db, guildId, channelId) ?? observedAt;
     return this.db
       .prepare(
         `UPDATE vc_public_social_presence
             SET ended_at = ?, end_quality = 'observed'
           WHERE guild_id = ? AND channel_id = ? AND ended_at IS NULL`,
       )
-      .run(observedAt, guildId, channelId).changes;
+      .run(effectiveAt, guildId, channelId).changes;
   }
 
   /** shard/guild observation lossをmain-guild単位で閉じ、他guildへ波及させない。 */
@@ -213,13 +214,29 @@ export class VcPublicSocialPresence {
     const guildId = requireText(guildIdValue, "guildId");
     const observedAt = requireTimestamp(observedAtValue);
     setEarlierFence(fencesFor(this.db).guilds, guildId, observedAt);
-    return this.db
+    return this.db.transaction(() => this.closeGuildOpenRows(guildId, observedAt))();
+  }
+
+  /** channel-local writer fenceがguild lossより早い場合、その早い境界をdurable closeにも保持する。 */
+  private closeGuildOpenRows(guildId: string, observedAt: number): number {
+    const channels = this.db
       .prepare(
-        `UPDATE vc_public_social_presence
-            SET ended_at = ?, end_quality = 'observed'
+        `SELECT DISTINCT channel_id
+           FROM vc_public_social_presence
           WHERE guild_id = ? AND ended_at IS NULL`,
       )
-      .run(observedAt, guildId).changes;
+      .all(guildId) as Array<{ channel_id: string }>;
+    const statement = this.db.prepare(
+      `UPDATE vc_public_social_presence
+          SET ended_at = ?, end_quality = 'observed'
+        WHERE guild_id = ? AND channel_id = ? AND ended_at IS NULL`,
+    );
+    let closed = 0;
+    for (const { channel_id: channelId } of channels) {
+      const effectiveAt = getVcPublicSocialTrustFence(this.db, guildId, channelId) ?? observedAt;
+      closed += statement.run(Math.min(observedAt, effectiveAt), guildId, channelId).changes;
+    }
+    return closed;
   }
 
   /**
@@ -235,13 +252,7 @@ export class VcPublicSocialPresence {
     );
     try {
       const result = this.db.transaction(() => {
-        this.db
-          .prepare(
-            `UPDATE vc_public_social_presence
-                SET ended_at = ?, end_quality = 'observed'
-              WHERE guild_id = ? AND ended_at IS NULL`,
-          )
-          .run(suspendedAt, guildId);
+        this.closeGuildOpenRows(guildId, suspendedAt);
         let opened = 0;
         let closed = 0;
         for (const channel of normalized) {

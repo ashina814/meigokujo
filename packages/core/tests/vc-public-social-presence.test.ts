@@ -80,4 +80,16 @@ describe("VcPublicSocialPresence canonical writer", () => {
     expect(computePublicSocialPresenceIntervals(db, { start: 0, end: 30, observedAt: 30 }, ["alice"])[0]!.intervals)
       .toEqual([{ start: 10, end: 20 }]);
   });
+
+  it("後続GuildDelete/suspendでも先行channel writer fenceを遅い時刻へ延ばさない", () => {
+    const db = openDb(":memory:");
+    const source = new VcPublicSocialPresence(db);
+    const humans = ["alice", "bob"];
+    source.reconcileChannel({ guildId: "main", channelId: "vc", eligible: true, humanUserIds: humans, observedAt: 10 });
+    vi.spyOn(db, "transaction").mockImplementationOnce(() => (() => { throw new Error("write failed"); }) as never);
+    expect(() => source.reconcileChannel({ guildId: "main", channelId: "vc", eligible: false, humanUserIds: humans, observedAt: 20 }))
+      .toThrow("write failed");
+    expect(source.suspendGuild("main", 30)).toBe(2);
+    expect(rows(db).filter((row) => row.user_id === "alice")[0]!.ended_at).toBe(20);
+  });
 });

@@ -1032,9 +1032,13 @@ Gatewayのrealtime observationを失った時点で、影響shardのmain guild�
 そのloss boundaryで閉じる。通常のrecoverable closeはDiscord.jsの`ShardReconnecting`、再接続不能は
 `ShardDisconnect`を境界にする。suspend中にResumeでreplayされるVoiceStateUpdateはpayloadに真の
 occurrence timeが無いためsourceへ書かない。replay完了後の`ShardResume`、fresh Identify後の
-`ShardReady`、または`GuildAvailable`でcurrent cacheを観測した時点からだけ新規openする。
-disconnect→resume間をhandler受信時刻でbackfillしない。guild unavailableも同じguild-local境界で、
-無関係なguild/shardは停止しない。
+`ShardReady`でshard suspensionを解除するが、main guildの`available === false`または
+`unavailableGuilds`残存時はguild suspensionを解除しない。cold startupもunavailable cacheからは
+0 rowのまま待ち、`GuildAvailable`のfull current cacheを観測した時点からだけ新規openする。
+main-guild `GuildVoice`の`ChannelDelete`はVoiceStateUpdateを仮定せずdelete観測時刻で対象open rowを
+closeする。main `GuildDelete`はguild内open rowを全てcloseし、`GuildAvailable`では再開せず、再join時の
+`GuildCreate` full current cacheから新規観測する。disconnect/unavailable/delete区間をhandler受信時刻で
+backfillせず、無関係なguild/shard/channelは停止しない。
 
 ### 21.4 snapshot / SQL / privacy / health guard
 

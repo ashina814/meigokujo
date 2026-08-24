@@ -8,10 +8,13 @@ import {
   isEligiblePublicSocialVoiceChannel,
   resumeVcPublicSocialGuild,
   resumeVcPublicSocialShard,
+  startVcPublicSocialGuild,
   suspendVcPublicSocialGuild,
   suspendVcPublicSocialShard,
+  trackVcPublicSocialChannelDelete,
   trackVcPublicSocialChannelUpdate,
   trackVcPublicSocialEveryoneRoleUpdate,
+  trackVcPublicSocialGuildDelete,
   trackVcPublicSocialPresence,
 } from "../src/vc-public-social-tracking.js";
 
@@ -24,10 +27,11 @@ function setup() {
   return { db, settings, vcPublicSocial, services };
 }
 
-function guild(id = "guild-main") {
+function guild(id = "guild-main", available = true) {
   const everyone = { id: `${id}-everyone` };
   return {
     id,
+    available,
     shardId: 0,
     roles: { everyone },
     channels: { cache: new Collection<string, never>() },
@@ -225,6 +229,9 @@ describe("Gateway observation trust boundary", () => {
       "Events.ShardReady",
       "Events.GuildUnavailable",
       "Events.GuildAvailable",
+      "Events.ChannelDelete",
+      "Events.GuildDelete",
+      "Events.GuildCreate",
     ]) expect(source).toContain(needle);
   });
 
@@ -288,6 +295,93 @@ describe("Gateway observation trust boundary", () => {
     expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
       { user_id: "alice", channel_id: "voice-public", started_at: 10, ended_at: 20, end_quality: "observed" },
       { user_id: "alice", channel_id: "voice-public", started_at: 50, ended_at: null, end_quality: null },
+    ]);
+  });
+
+  it("ShardReady timeoutでmain guild unavailableならstale cacheをtrustせずGuildAvailable時点からだけopenする", () => {
+    const { db, services } = setup();
+    const owner = guild();
+    const voice = channel({ guild: owner, humans: ["alice", "bob"] });
+    const client = clientWith(owner);
+    trackVcPublicSocialPresence(state(null), state(voice), services, () => 10);
+    suspendVcPublicSocialShard(client as never, 0, services, () => 20);
+    owner.available = false;
+    expect(resumeVcPublicSocialShard(client as never, 0, services, () => 40, new Set([owner.id]))).toBe(false);
+    expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 10, ended_at: 20, end_quality: "observed" },
+    ]);
+    owner.available = true;
+    expect(resumeVcPublicSocialGuild(owner as never, services, () => 50)).toBe(true);
+    expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 10, ended_at: 20, end_quality: "observed" },
+      { user_id: "alice", channel_id: "voice-public", started_at: 50, ended_at: null, end_quality: null },
+    ]);
+  });
+
+  it("cold startupでmain guild unavailableなら0 rowのまま待ち、GuildAvailable current cacheから初回観測する", () => {
+    const { db, services } = setup();
+    const owner = guild("guild-main", false);
+    channel({ guild: owner, humans: ["alice", "bob"] });
+    expect(initializeVcPublicSocialPresence(clientWith(owner) as never, services, () => 100)).toBe(true);
+    expect(rows(db)).toEqual([]);
+    owner.available = true;
+    expect(resumeVcPublicSocialGuild(owner as never, services, () => 120)).toBe(true);
+    expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 120, ended_at: null, end_quality: null },
+    ]);
+  });
+});
+
+describe("channel/guild removal trust boundary", () => {
+  it("active main-guild public VCをChannelDelete observedAtでcloseする", () => {
+    const { db, services } = setup();
+    const voice = channel({ humans: ["alice", "bob"] });
+    trackVcPublicSocialPresence(state(null), state(voice), services, () => 10);
+    expect(trackVcPublicSocialChannelDelete(voice as never, services, () => 20)).toBe(true);
+    expect(rows(db)).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 10, ended_at: 20, end_quality: "observed" },
+      { user_id: "bob", channel_id: "voice-public", started_at: 10, ended_at: 20, end_quality: "observed" },
+    ]);
+  });
+
+  it("main GuildDeleteで全open rowをcloseし、GuildAvailableでは再開せずGuildCreate current cacheから新規openする", () => {
+    const { db, services } = setup();
+    const owner = guild();
+    channel({ id: "one", guild: owner, humans: ["alice", "bob"] });
+    channel({ id: "two", guild: owner, humans: ["carol", "dave"] });
+    initializeVcPublicSocialPresence(clientWith(owner) as never, services, () => 10);
+    expect(trackVcPublicSocialGuildDelete(owner as never, services, () => 20)).toBe(true);
+    expect(rows(db).every((row) => row.ended_at === 20)).toBe(true);
+    expect(resumeVcPublicSocialGuild(owner as never, services, () => 30)).toBe(false);
+    expect(rows(db)).toHaveLength(4);
+    expect(startVcPublicSocialGuild(owner as never, services, () => 40)).toBe(true);
+    expect(rows(db).filter((row) => row.started_at === 40)).toHaveLength(4);
+  });
+
+  it("unrelated guild/channel deleteはmain guildのopen rowへ影響しない", () => {
+    const { db, services } = setup();
+    const main = channel({ humans: ["alice", "bob"] });
+    trackVcPublicSocialPresence(state(null), state(main), services, () => 10);
+    const otherOwner = guild("other");
+    const other = channel({ guild: otherOwner, humans: ["carol", "dave"] });
+    expect(trackVcPublicSocialChannelDelete(other as never, services, () => 20)).toBe(false);
+    expect(trackVcPublicSocialGuildDelete(otherOwner as never, services, () => 20)).toBe(false);
+    expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 10, ended_at: null, end_quality: null },
+    ]);
+  });
+
+  it("ChannelDeleteはwriter failure中のlive observationを保存してdelete時刻までcloseする", () => {
+    const { db, services } = setup();
+    const voice = channel({ humans: ["alice", "bob"] });
+    const original = services.vcPublicSocial.reconcileChannel.bind(services.vcPublicSocial);
+    vi.spyOn(services.vcPublicSocial, "reconcileChannel")
+      .mockImplementationOnce(() => { throw new Error("transient write failure"); })
+      .mockImplementation(original);
+    expect(trackVcPublicSocialPresence(state(null), state(voice), services, () => 10)).toBe(false);
+    expect(trackVcPublicSocialChannelDelete(voice as never, services, () => 20)).toBe(true);
+    expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 10, ended_at: 20, end_quality: "observed" },
     ]);
   });
 });

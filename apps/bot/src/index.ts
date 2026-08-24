@@ -118,10 +118,13 @@ import {
   initializeVcPublicSocialPresence,
   resumeVcPublicSocialGuild,
   resumeVcPublicSocialShard,
+  startVcPublicSocialGuild,
   suspendVcPublicSocialGuild,
   suspendVcPublicSocialShard,
+  trackVcPublicSocialChannelDelete,
   trackVcPublicSocialChannelUpdate,
   trackVcPublicSocialEveryoneRoleUpdate,
+  trackVcPublicSocialGuildDelete,
   trackVcPublicSocialPresence,
 } from "./vc-public-social-tracking.js";
 
@@ -614,14 +617,20 @@ client.on(Events.ShardDisconnect, (_event, shardId) => {
 client.on(Events.ShardResume, (shardId) => {
   resumeVcPublicSocialShard(client, shardId, services);
 });
-client.on(Events.ShardReady, (shardId) => {
-  resumeVcPublicSocialShard(client, shardId, services);
+client.on(Events.ShardReady, (shardId, unavailableGuilds) => {
+  resumeVcPublicSocialShard(client, shardId, services, undefined, unavailableGuilds);
 });
 client.on(Events.GuildUnavailable, (guild) => {
   suspendVcPublicSocialGuild(guild, services);
 });
 client.on(Events.GuildAvailable, (guild) => {
   resumeVcPublicSocialGuild(guild, services);
+});
+client.on(Events.GuildDelete, (guild) => {
+  trackVcPublicSocialGuildDelete(guild, services);
+});
+client.on(Events.GuildCreate, (guild) => {
+  startVcPublicSocialGuild(guild, services);
 });
 
 client.on(Events.MessageReactionAdd, (reaction, user) => {
@@ -684,6 +693,11 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 client.on(Events.ChannelUpdate, (_oldChannel, newChannel) => {
   if (newChannel.isDMBased()) return;
   trackVcPublicSocialChannelUpdate(newChannel, services);
+});
+
+client.on(Events.ChannelDelete, (deletedChannel) => {
+  if (deletedChannel.isDMBased()) return;
+  trackVcPublicSocialChannelDelete(deletedChannel, services);
 });
 
 client.on(Events.GuildRoleUpdate, (_oldRole, newRole) => {
