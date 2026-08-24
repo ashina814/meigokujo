@@ -146,7 +146,6 @@ export async function handleTakuVoiceUpdate(
 /** 起動時に空になっている追跡中卓VCを sweep */
 export async function sweepStaleTables(client: import("discord.js").Client, services: Services): Promise<number> {
   let removed = 0;
-  const observedAt = Math.floor(Date.now() / 1000);
   for (const t of services.takutate.list()) {
     try {
       const guild = await client.guilds.fetch(t.guild_id).catch(() => null);
@@ -163,7 +162,9 @@ export async function sweepStaleTables(client: import("discord.js").Client, serv
           services.takutate.untrack(t.channel_id);
           removed++;
         } else {
-          // Restart gap is not backfilled. Current cache begins a new observation now.
+          // Fetch完了後のchannel snapshotを観測した時刻からだけ開始する。
+          // sweep入口時刻や別channelの観測時刻を共有してrestart gapをbackfillしない。
+          const observedAt = Math.floor(Date.now() / 1000);
           for (const [, member] of ch.members) {
             services.takutate.observeCurrentGuest(ch.id, member.id, member.user.bot, observedAt);
           }
