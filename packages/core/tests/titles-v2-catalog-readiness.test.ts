@@ -369,13 +369,13 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
     }
   });
 
-  it("public provenance再監査後の実集計はREADY 51 / PARTIAL 6 / BLOCKED 34 / META 8", () => {
+  it("F2j後の実集計はREADY 55 / PARTIAL 6 / BLOCKED 30 / META 8", () => {
     const counts = new Map<string, number>();
     for (const entry of TITLE_V2_CATALOG_READINESS) counts.set(entry.status, (counts.get(entry.status) ?? 0) + 1);
-    expect(Object.fromEntries(counts)).toEqual({ READY: 51, BLOCKED: 34, PARTIAL: 6, META: 8 });
+    expect(Object.fromEntries(counts)).toEqual({ READY: 55, BLOCKED: 30, PARTIAL: 6, META: 8 });
   });
 
-  it("source_semantic_mismatchはpublic provenance 3件を含む6件、missing_derived_sourceは12件", () => {
+  it("source_semantic_mismatchはpublic provenance 3件を含む6件、missing_derived_sourceは10件", () => {
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("source_semantic_mismatch")).map((entry) => entry.no)).toEqual([
       1,
       6,
@@ -384,11 +384,11 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
       30,
       48,
     ]);
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(12);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(10);
   });
 
-  it("missing_derived_sourceはNo.10-21の解消で24から12へ減る", () => {
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(12);
+  it("missing_derived_sourceはNo.77/78のnetwork構造解消で12から10へ減る", () => {
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(10);
   });
 
   it("Theme 3-6は各3件すべてREADY", () => {
@@ -431,8 +431,8 @@ describe("PR F2g: public room activity safe source追加後のreadiness", () => 
     expect(entries.filter((entry) => entry.status === "BLOCKED")).toHaveLength(1);
   });
 
-  it("blocker実集計はF2i後missing_persisted_source 10、missing_role_history 7", () => {
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(10);
+  it("blocker実集計はF2j後missing_persisted_source 6、missing_role_history 7", () => {
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(6);
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_role_history"))).toHaveLength(7);
   });
 });
@@ -607,5 +607,45 @@ describe("PR F2b: casino completion source追加後のreadiness", () => {
     for (const no of [23, 24, 25]) {
       expect(readinessFor(no).blockerKinds, `candidate #${no}`).not.toContain("source_semantic_mismatch");
     }
+  });
+});
+
+describe("PR F2j: exact invite-rooted safe source追加後のreadiness", () => {
+  it("No.76-79はanonymous direct-branch profileで各semanticをexactに表現できるためREADY", () => {
+    for (let no = 76; no <= 79; no += 1) {
+      expect(readinessFor(no)).toMatchObject({
+        status: "READY",
+        usableSources: ["invite_rooted_safe"],
+        specializedResolvers: ["computeInviteRootedSafe"],
+        missingCapabilities: [],
+        blockerKinds: ["none"],
+        optimizationRisk: "HIGH",
+      });
+    }
+  });
+
+  it("No.74/75はconfirmed_invitesの意味を変えずREADYを維持する", () => {
+    for (const no of [74, 75]) {
+      expect(readinessFor(no)).toMatchObject({
+        status: "READY",
+        usableSources: ["confirmed_invites"],
+        specializedResolvers: [],
+        blockerKinds: ["none"],
+        optimizationRisk: "HIGH",
+      });
+    }
+  });
+
+  it("Theme 15は6/6 READY、persisted/derived blockerは実集計6/10", () => {
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.no >= 74 && entry.no <= 79).map((entry) => entry.status)).toEqual([
+      "READY",
+      "READY",
+      "READY",
+      "READY",
+      "READY",
+      "READY",
+    ]);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(6);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(10);
   });
 });

@@ -102,6 +102,7 @@ export {
   TitleSourceCache,
   type BumpEventsSourcePayload,
   type ConfirmedInvitesSourcePayload,
+  type InviteRootedSafeSourcePayload,
   type EconomySafePeerActionsSourcePayload,
   type PublicEventParticipationsSourcePayload,
   type PublicEventCompletedParticipationsSourcePayload,

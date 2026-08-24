@@ -102,6 +102,15 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > `vc_public_social_presence`はNo.32-37のmain/public/human/trusted timeをexactに
 > 支えるが、empty-start/last-occupant/counterpart breadthの代替sourceではない。§21.5参照。
 
+> **PR F2j反映（2026-08-24）**: confirmed `invites`、append-only `ghosted`
+> event、canonical public TC/VCをinternal JOINする`invite_rooted_safe`を追加した。
+> profile 1件をanonymous direct branch 1本として、entry翌日以降のpublic activity
+> JST日分布、同branchのconfirmed next generation数、inviter↔inviteeだけのlater-day
+> reunion分布を同じprofileに保持する。membership survivalや`credited_at`をentry anchorに
+> 使わず、legacyでimmutable entry eventが無いrelationはunknownとする。No.76-79が
+> BLOCKED→READY、READY 51→55、BLOCKED 34→30。`missing_persisted_source` 10→6、
+> `missing_derived_source` 12→10、PARTIAL 6・META 8は不変。§22参照。
+
 ## 0. xlsx canonical hash（exact drift guard）
 
 | 項目 | 値 |
@@ -149,13 +158,13 @@ full-clear editionに登録されたREQUIRED印100%——NONCOUNTの91 behavior�
 
 | status | 件数 | 意味 |
 | --- | --- | --- |
-| READY | 51 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
+| READY | 55 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
 | PARTIAL | 6 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
-| BLOCKED | 34 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
+| BLOCKED | 30 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
 | META | 8 | kind:meta（別bucket、§7参照） |
 
 **READY = 今すぐreleaseしてよい、ではない**。sourceReadinessとthreshold決定は
-別軸（§10参照）——READY 51件も、production threshold値（分布TBD等）が
+別軸（§10参照）——READY 55件も、production threshold値（分布TBD等）が
 決まるまではrelease対象にならない。またSeries manifest／Collection Edition／
 Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）。No.58はさらに、
 award後のreversalを既存immutable ownershipへどう反映するかが未決定であるため、
@@ -165,15 +174,15 @@ source-readyでもproduction release不可（§15）。
 
 | blockerKind | 件数 | 意味 |
 | --- | --- | --- |
-| missing_persisted_source | 10 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
-| missing_derived_source | 12 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
+| missing_persisted_source | 6 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
+| missing_derived_source | 10 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
 | missing_manifest | 9 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
 | missing_role_history | 7 | role-at-time（過去のある時点でどのroleを保持していたか）がrepo全体で未実装 |
 | source_semantic_mismatch | 6 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（No.1/6/22のpublic VC provenance、No.29/30のpair-specific overlap、No.48のfree-flow同一topic correlation） |
 | missing_event_protocol | 2 | イベントデータモデル自体にorganizer/staff区別が存在しない |
 | known_bug | 0 | PR F2aで`computeLastOccupant()`のsame-second/0-second visit tie bugを修正——catalog全体から解消済み（§13参照） |
 
-（`none`のBehavior候補は51件——ちょうどREADY件数と一致。PARTIAL 6件は
+（`none`のBehavior候補は55件——ちょうどREADY件数と一致。PARTIAL 6件は
 すべて`source_semantic_mismatch`を持つ。）
 
 ## 4. Theme別 readiness
@@ -194,7 +203,7 @@ source-readyでもproduction release不可（§15）。
 | 12 | 公開部屋 | 8 | 7 | 0 | 1 |
 | 13 | Land・経済 | 8 | 1 | 0 | 7 |
 | 14 | 賭場 | 8 | 3 | 0 | 5 |
-| 15 | 招待 | 6 | 2 | 0 | 4 |
+| 15 | 招待 | 6 | 6 | 0 | 0 |
 | 16 | イベント | 5 | 2 | 0 | 3 |
 | 17 | 城横断 | 7 | 0 | 0 | 7 |
 
@@ -202,11 +211,11 @@ BUMP/鐘とVC人数帯Theme 3-6が100% READY（後者はPR F2eのJST日別4bucke
 trusted secondsで日数/share/span/streakを後段評価できるため）。公開部屋はF2gで
 7/8件がSOURCE READYとなり、No.57だけrole-at-time待ち。時間帯・生活痕はF2iで6/6件が
 SOURCE READYとなった。TC交流はF2hで7/8件がSOURCE READYとなり、No.48だけfree-flow同一topic correlationのsemantic mismatchが残る。
-城横断は引き続き0% READY。
+招待はF2jで6/6件がSOURCE READYとなった。城横断は引き続き0% READY。
 
 ## 5. source別に残る実装（READYを支えるsource／PARTIALの制約／BLOCKEDが必要とするもの）
 
-READYを支えている既存`titleUsable:true` source（14種、51件）:
+READYを支えている既存`titleUsable:true` source（15種、55件）:
 
 - `vc_empty_start_then_joined`（No.2。No.1はpublic provenance不足でPARTIAL）
 - `vc_last_occupant`（No.7, 9。No.6はtie bug解消済みだがpublic provenance不足でPARTIAL）
@@ -216,6 +225,7 @@ READYを支えている既存`titleUsable:true` source（14種、51件）:
 - `casino_activity_days`（No.68 のみ——「利用する」semanticsに限りcompletion保証不要。commitmentベースのまま維持）
 - `casino_completed_activity_days`（No.66, 67——PR F2bで追加したcompletion正本、§14参照）
 - `confirmed_invites`（No.74-75 のみ——`invitee_id UNIQUE`によりdistinct数が保証される）
+- `invite_rooted_safe`（No.76-79——confirmed direct relation、immutable entry anchor、canonical public activity/network/pair reunionをanonymous direct-branch profileへ統合、§22参照）
 - `economy_safe_peer_actions`（No.58——snapshot時点でreverse済みoriginalを除外、§15参照）
 - `public_event_completed_participations`（No.80-81——明示staff completion正本と同一roster revisionへJOIN、§16参照）
 - `public_room_activity_safe`（No.50-56——room lifecycleとtrusted logical VC visitの交差をidentityなしでhosted/guest/ownUseへ集計、§19参照）
@@ -237,7 +247,6 @@ No.80/81はREADY、No.82はevent-date span source不足のみ残る。§14-16参
 BLOCKEDが新たに必要とするもの（xlsxのSource_Map original「未実装」から、
 E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 
-- **`invite_retention_safe`新設**—— No.76-79（4件、うち2件はさらにnetwork-graph derivedも必要）。retentionは repo全体でgrep 0件——スタブすら無い
 - **`casino_table_activity_safe`(host/guest区別)新設**—— No.70-71（2件）。casino_participationsは全参加者を対称記録——host/guest概念自体が現データモデルに存在しない
 - **market/betting safe source新設**—— No.72（1件）。market/stocks系は`CASINO_ACTIVITY_KEYS`の対象外
 - **economy機能family classifier拡張**—— No.61, 63（2件）
@@ -257,7 +266,7 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 | STRUCTURAL_PLUS_DISTRIBUTION | 1 | 構造は決まるが、一部の値は分布依存 |
 | META_NOT_APPLICABLE | 8 | meta（別contract、§10適用外） |
 
-sourceReadinessとthresholdは別軸——READY 51件のうち、STRUCTURAL_FIXEDなのは
+sourceReadinessとthresholdは別軸——READY 55件のうち、STRUCTURAL_FIXEDなのは
 一部（初回系）のみで、残りはTHRESHOLD_PENDINGのままREADYになっている
 （sourceは十分だが実数値は分布を見てから決める）。
 
@@ -295,17 +304,17 @@ sourceReadinessとthresholdは別軸——READY 51件のうち、STRUCTURAL_FIXE
 
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
-| 1 | `invite_retention_safe`新設 | 4件（No.76-79） | 次のengineering cluster。外部勧誘圧のリスクが高いドメイン（optimizationRisk: HIGH）なので、retentionのexact semanticとanti-Goodhart設計を先に固める |
-| 2 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
-| 3 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
-| 4 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
-| 5 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
-| 6 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
-| 7 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
+| 1 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
+| 2 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
+| 3 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
+| 4 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
+| 5 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
+| 6 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
 
 VC group-size clusterはF2e、VC social breadth clusterはF2f、公開部屋clusterは
 F2g、TC conversation/reactionの7件はF2h、TC+VC時間帯clusterはF2iで解消した。
-次のengineering clusterは`invite_retention_safe`。No.48の残件は次のsource実装ではなく、
+招待clusterはF2jの`invite_rooted_safe`で解消した。次のengineering clusterは既存E2を
+拡張できるeconomy classifier/shop purchase。No.48の残件は次のsource実装ではなく、
 content無しでfree-flow同一topicをどうcanonicalに証明するかという別枠のproduct/UX
 semantic decisionであり、特殊操作をユーザーへ強制してREADY化しない。
 
@@ -1082,3 +1091,83 @@ user-level intervalであり、empty-start/last-occupant/counterpart identity br
 実集計はREADY 51 / PARTIAL 6 / BLOCKED 34 / META 8。No.32-37は専用sourceが
 main guild + public GuildVoice + human occupancy + Gateway/writer trust boundaryを証明するため
 READYを維持する。threshold/award/production definitionはこの補正では追加しない。
+
+## 22. PR F2j — Invite Rooted Safe
+
+### 22.1 canonical provenanceとentry anchor
+
+direct relationの正本は既存`invites`だけ。identityを必要とするJOINはrestricted
+`confirmed_invite_relations` viewとしてcontract登録し、No.74/75用のidentity-free
+`confirmed_invites` payloadとは分離する。`invitee_id UNIQUE`、Entryのself拒否、
+亡霊化時または門番の後追い登録時に同じ`creditInvite()`が確定する境界を維持し、
+`souls.inviter_hint_*`や`entry_bookings.inviter_*`は一切読まない。No.74/75の
+`confirmed_invites` sourceも変更しない。
+
+`invites.credited_at`はrelation確定時刻でありentry時刻ではない。canonical entry anchorは
+Entryが最初の亡霊化時にappend-only EventLogへ書く最古の`events(type='ghosted',
+target_id=invitee)`。`souls.ghost_at`、`joined_at`、current status/member stateからは推測しない。
+従ってlate creditでも実entry dayへ正しくanchorし、immutable eventの無いlegacy relationは
+`unknownEntryAnchorCount`へ畳んでprofileを生成しない。sidecar/tableもhistorical inferred
+backfillも追加していない。
+
+### 22.2 exact public activity / rooted semantics
+
+「rooted」はmembership survivalではない。confirmed direct inviteeについて、exact entry
+timestamp以後かつentry JST dayより後の各日に、次のいずれかのcanonical public evidenceが
+あることを、anonymous direct-branch profile内の分布として保持する。
+
+- canonical public TC observationのsame-surface other-human exchange候補。message本文、
+  private/unclassified message、cross-surface adjacencyは使わず、その日の最小gap msだけを保持。
+- `vc_public_social_presence`のtrusted public-social interval。main guild/public GuildVoice/
+  human occupancy/Gateway-writer trust boundaryは既存canonical writer/derivedと共有し、JST日別の
+  wall-clock union秒だけを保持。
+
+sourceはqualifying日数、TC gap、VC meaningful secondsを決めない。`activityDays`の
+`dayOffset`、`tcBestOtherGapMs`、`vcTrustedSocialSeconds`を返し、分布TBDのproduction
+calibrationを可能にする。同日大量活動は1 day profileのままで、entry前・entry dayは除外する。
+
+### 22.3 network branchとpair-specific reunion
+
+profile 1件はconfirmed direct invitee 1人に対応するanonymous branch 1本であり、その同じ
+profileにrooted activity分布と`nextGenerationConfirmedCount`を持つ。従ってNo.77は後段で
+「rootedを満たすprofileかつnext generation > 0」をexactに判定できる。No.78も
+qualifying profile数を数えるため、A→X,Y,Z,Qは1 branch、A→X / B→Yは2 branchesとなる。
+child relationは`invites`のunique confirmed edgeだけを使い、self/cycleを除外する。
+branch自身のcanonical entryより前にcreditedされたedgeもnext generationには使わない。
+
+No.79の`reunionDays`はinviterとそのconfirmed direct inviteeのidentityをrestricted derived
+内部でだけJOINする。TCは両者のsame-surface message間の最小gap、VCは両者の同一canonical
+public channel内trusted interval overlapをJST dayへunionし、entry dayを除外する。第三者との
+交流、cross-surface/cross-channel、private/unclassified activity、単なるcurrent membershipは
+pair interactionへ変換しない。
+
+### 22.4 safe payload / snapshot / runtime boundary
+
+safe payloadは次のidentity-free shapeだけを返す。
+
+```ts
+{
+  profiles: Array<{
+    activityDays: Array<{ dayOffset; tcBestOtherGapMs; vcTrustedSocialSeconds }>;
+    nextGenerationConfirmedCount;
+    reunionDays: Array<{ dayOffset; tcBestPairGapMs; vcTrustedPairSeconds }>;
+  }>;
+  unknownEntryAnchorCount;
+}
+```
+
+invitee/child/counterpart/message/surface/channel/guild identity、exact date/timestamp、invite code、
+raw permission/member stateは出さない。profilesはsanitized内容のcanonical順にsortする。
+fixed `observedAt`ではrelation/event/TC observationとVC trusted intervalをそのsnapshotの
+effective endでclipし、後のcurrent soul/member変更で過去payloadを書き換えない。
+
+新persisted source・write path・Bot/onboarding wiringは無い。derived read failureが
+Entry/`creditInvite()`を止める経路は存在せず、bulk readerは300 subjectごと、internal
+participantsも300 IDごとにchunkする。historical backfill、production threshold、award、
+notification、leaderboard、progress UIは追加しない。Theme 15はoptimizationRisk: HIGHを
+維持する。
+
+No.74/75は既存`confirmed_invites`のままREADY。No.76はlater-day public activity分布、No.77は
+同じrooted branchとnext-generation edgeのjoint profile、No.78はdistinct qualifying profile
+breadth、No.79はlater-day pair-specific public reunionをexactに表現できるためREADY。
+実集計はREADY 55 / PARTIAL 6 / BLOCKED 30 / META 8。
