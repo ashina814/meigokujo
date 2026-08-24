@@ -1142,13 +1142,19 @@ immutable `ghosted` eventとする。staffの後追い`credited_at`はrelation�
 決め、childの実entry historyを後ろへ移動させない。child anchorが無いrelationは
 `unknownNextGenerationEntryAnchorCount`へ畳み、current stateやcredit時刻から補完しない。
 
-同じprofileにrooted activity分布と、branch entry JST dateを0とした各child entryの
-`nextGenerationEntryDayOffsets`を保持する。将来のthreshold ruleは、あるchild offset `N`に対し
-`activityDays.dayOffset < N`の分布だけでrooted条件を評価する。このstrict inequalityにより
-root-before-childをthreshold固定なしで証明し、same-day内の順序はfail-closedに不採用とする。
-negative/zero offsetも落とさないため、child-before-rootとroot-before-childをsafe payload上で
-区別できる。No.78はこの条件を満たすprofile数を数えるため、A→X,Y,Z,Qは1 branch、
-A→X / B→Yは2 branchesとなる。self/cycleは除外する。
+同じprofileにrooted activity分布と、confirmed childごとのanonymous
+`nextGenerationOccurrences`を保持する。各occurrenceはbranch entry JST dateを0とした
+`entryDayOffset`に加え、canonical child entry timestamp直前までのchild-day public activityを
+`sameDayBeforeEntry`として持つ。TCはsubject messageとnearest other-human messageの両端が
+child entryより前のexchangeだけを採り、VCはtrusted subject-global unionを
+`[day start, child entry)`でclipした秒数だけを採る。exact timestampやidentityは公開しない。
+
+将来のthreshold ruleは、あるoccurrence `N`に対し`activityDays.dayOffset < N.entryDayOffset`の
+完全な過去日分布と`N.sameDayBeforeEntry`を合わせてrooted条件を評価する。これによりthresholdを
+固定せず、同じchild JST dayでもactivity-before-childとactivity-after-childを区別できる。
+同日複数childもoccurrenceをcollapseせず、それぞれ異なるprefixを保持する。negative/zero offsetも
+落とさないため、child-before-rootも誤ってcascadeにしない。No.78はこの条件を満たすprofile数を
+数えるため、A→X,Y,Z,Qは1 branch、A→X / B→Yは2 branchesとなる。self/cycleは除外する。
 
 No.79の`reunionDays`はinviterとそのconfirmed direct inviteeのidentityをrestricted derived
 内部でだけJOINする。TCは両者のsame-surface message間の最小gap、VCは両者の同一canonical
@@ -1164,7 +1170,10 @@ safe payloadは次のidentity-free shapeだけを返す。
 {
   profiles: Array<{
     activityDays: Array<{ dayOffset; tcBestOtherGapMs; vcTrustedSocialSeconds }>;
-    nextGenerationEntryDayOffsets: number[];
+    nextGenerationOccurrences: Array<{
+      entryDayOffset: number;
+      sameDayBeforeEntry: { tcBestOtherGapMs; vcTrustedSocialSeconds };
+    }>;
     unknownNextGenerationEntryAnchorCount: number;
     reunionDays: Array<{ dayOffset; tcBestPairGapMs; vcTrustedPairSeconds }>;
   }>;
@@ -1185,7 +1194,7 @@ notification、leaderboard、progress UIは追加しない。Theme 15はoptimiza
 維持する。
 
 No.74/75は既存`confirmed_invites`のままREADY。No.76はpre-scope relation contextとscope内
-later-day public activity分布、No.77は同じrooted branch内のactivityとcanonical child entryの
-chronology、No.78はroot-before-childを満たすdistinct profile breadth、No.79はscope内later-day
-pair-specific public reunionをexactに表現できるためREADY。
+later-day public activity分布、No.77は完全な過去日分布とchild entry時点のsame-day prefix、
+No.78は同日複数childを含めroot-before-childを満たすdistinct profile breadth、No.79はscope内
+later-day pair-specific public reunionをexactに表現できるためREADY。
 実集計はREADY 55 / PARTIAL 6 / BLOCKED 30 / META 8。

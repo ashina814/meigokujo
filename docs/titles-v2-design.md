@@ -1941,8 +1941,11 @@ scope内later-JST-day activity分布、canonical child entryのbranch-relative J
 inviter↔inviteeだけのscope内later-day TC/VC reunion分布をjoint保持する。direct relation/entryは
 scope前でもhistorical contextとして使うが、fixed observedAtより後のconfirmation/eventは読まない。
 next-generationの`credited_at`はrelation visibilityだけに使い、late staff creditでchild historyを
-移動させない。後段はactivity day offset < child entry offsetだけを使うため、threshold未固定のまま
-root-before-childをfail-closedに判定できる。これによりNo.76-79をSOURCE READYへ再監査した。
+移動させない。各anonymous child occurrenceはentry day offsetに加え、entry timestampまででclipした
+same-day TC exchange / trusted VC union prefixを持つ。後段は完全な過去日activityとこのprefixを
+合わせるため、threshold未固定のままsame-JST-dayを含むroot-before-childをexactに判定できる。
+TCはexchange両端、VCは半開intervalをclipし、timestamp/identityは公開しない。これにより
+No.76-79をSOURCE READYへ再監査した。
 新persisted table、historical backfill、production threshold、award/notification/leaderboard/progress、
 Bot wiringは無い。
 

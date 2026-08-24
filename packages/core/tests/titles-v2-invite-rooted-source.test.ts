@@ -17,6 +17,7 @@ import { TitleV2Store } from "../src/titles/v2-store.js";
 registerDefaultTxTypes();
 
 const DAY = 86_400;
+const HOUR = 3_600;
 const ENTRY = Math.floor(new Date("2026-08-01T12:00:00+09:00").getTime() / 1_000);
 const START = ENTRY - 10 * DAY;
 const END = ENTRY + 40 * DAY;
@@ -144,7 +145,9 @@ describe("invite_rooted_safe exact semantics", () => {
     rooted.invite("branch", "child", ENTRY + 4 * DAY + 1);
     const rootedProfile = rooted.read().profiles[0]!;
     expect(rootedProfile.activityDays).toHaveLength(2);
-    expect(rootedProfile.nextGenerationEntryDayOffsets).toEqual([4]);
+    expect(rootedProfile.nextGenerationOccurrences).toEqual([
+      { entryDayOffset: 4, sameDayBeforeEntry: { tcBestOtherGapMs: null, vcTrustedSocialSeconds: 0 } },
+    ]);
     expect(rootedProfile.unknownNextGenerationEntryAnchorCount).toBe(0);
 
     const inactive = setup();
@@ -153,12 +156,14 @@ describe("invite_rooted_safe exact semantics", () => {
     inactive.ghosted("child", ENTRY + 4 * DAY);
     inactive.invite("branch", "child", ENTRY + 4 * DAY + 1);
     const inactiveProfile = inactive.read().profiles[0]!;
-    expect(inactiveProfile.nextGenerationEntryDayOffsets).toEqual([4]);
+    expect(inactiveProfile.nextGenerationOccurrences).toEqual([
+      { entryDayOffset: 4, sameDayBeforeEntry: { tcBestOtherGapMs: null, vcTrustedSocialSeconds: 0 } },
+    ]);
     expect(inactiveProfile.activityDays).toEqual([]);
     expect(
       inactive.read().profiles.filter((profile) =>
-        profile.nextGenerationEntryDayOffsets.some(
-          (childOffset) => profile.activityDays.filter((day) => day.dayOffset < childOffset).length >= 2,
+        profile.nextGenerationOccurrences.some(
+          (occurrence) => profile.activityDays.filter((day) => day.dayOffset < occurrence.entryDayOffset).length >= 2,
         ),
       ),
     ).toEqual([]);
@@ -174,7 +179,7 @@ describe("invite_rooted_safe exact semantics", () => {
       one.invite("branch", child, ENTRY + day * DAY + 1);
     }
     expect(one.read().profiles).toHaveLength(1);
-    expect(one.read().profiles[0]!.nextGenerationEntryDayOffsets).toEqual([2, 3, 4]);
+    expect(one.read().profiles[0]!.nextGenerationOccurrences.map((occurrence) => occurrence.entryDayOffset)).toEqual([2, 3, 4]);
 
     const many = setup();
     for (const [branch, child, day] of [
@@ -188,7 +193,10 @@ describe("invite_rooted_safe exact semantics", () => {
       many.invite(branch, child, ENTRY + day * DAY + 1);
     }
     expect(many.read().profiles).toHaveLength(2);
-    expect(many.read().profiles.map((profile) => profile.nextGenerationEntryDayOffsets)).toEqual([[2], [3]]);
+    expect(many.read().profiles.map((profile) => profile.nextGenerationOccurrences.map((occurrence) => occurrence.entryDayOffset))).toEqual([
+      [2],
+      [3],
+    ]);
   });
 
   it("M: cycle/selfをnext generationへ数えず、DBのconfirmed relation uniquenessを維持する", () => {
@@ -198,7 +206,9 @@ describe("invite_rooted_safe exact semantics", () => {
     ghosted("pre-entry-child", ENTRY - DAY);
     invite("branch", "pre-entry-child", ENTRY - 1);
     invite("branch", "subject", ENTRY + DAY);
-    expect(read().profiles[0]!.nextGenerationEntryDayOffsets).toEqual([-1]);
+    expect(read().profiles[0]!.nextGenerationOccurrences).toEqual([
+      { entryDayOffset: -1, sameDayBeforeEntry: { tcBestOtherGapMs: null, vcTrustedSocialSeconds: 0 } },
+    ]);
     expect(() => invite("someone-else", "branch", ENTRY + 2 * DAY)).toThrow(/UNIQUE/);
     db.prepare("INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES ('self', 'self', ?)").run(ENTRY + 3 * DAY);
     expect(read("self")).toEqual({ profiles: [], unknownEntryAnchorCount: 0 });
@@ -319,9 +329,9 @@ describe("invite_rooted_safe exact semantics", () => {
     invite("branch", "child", ENTRY + 8 * DAY);
 
     const profile = read().profiles[0]!;
-    expect(profile.nextGenerationEntryDayOffsets).toEqual([2]);
+    expect(profile.nextGenerationOccurrences.map((occurrence) => occurrence.entryDayOffset)).toEqual([2]);
     expect(profile.activityDays.map((day) => day.dayOffset)).toEqual([4, 6]);
-    expect(profile.activityDays.filter((day) => day.dayOffset < profile.nextGenerationEntryDayOffsets[0]!).length).toBe(0);
+    expect(profile.activityDays.filter((day) => day.dayOffset < profile.nextGenerationOccurrences[0]!.entryDayOffset).length).toBe(0);
   });
 
   it("Z: branchが先にrootedし、その後にcanonical child entryがあるchronologyを表現する", () => {
@@ -334,7 +344,7 @@ describe("invite_rooted_safe exact semantics", () => {
     invite("branch", "child", ENTRY + 7 * DAY);
 
     const profile = read().profiles[0]!;
-    expect(profile.nextGenerationEntryDayOffsets).toEqual([5]);
+    expect(profile.nextGenerationOccurrences.map((occurrence) => occurrence.entryDayOffset)).toEqual([5]);
     expect(profile.activityDays.map((day) => day.dayOffset)).toEqual([1, 3]);
   });
 
@@ -354,7 +364,7 @@ describe("invite_rooted_safe exact semantics", () => {
     expect(
       read().profiles.map((profile) => ({
         activity: profile.activityDays.map((day) => day.dayOffset),
-        children: profile.nextGenerationEntryDayOffsets,
+        children: profile.nextGenerationOccurrences.map((occurrence) => occurrence.entryDayOffset),
       })),
     ).toEqual([
       { activity: [1], children: [3] },
@@ -379,12 +389,12 @@ describe("invite_rooted_safe exact semantics", () => {
 
     // 2日はfixture上のcalibration例。source自身は閾値を固定しない。
     const qualifying = read().profiles.filter((profile) =>
-      profile.nextGenerationEntryDayOffsets.some(
-        (childOffset) => profile.activityDays.filter((day) => day.dayOffset < childOffset).length >= 2,
+      profile.nextGenerationOccurrences.some(
+        (occurrence) => profile.activityDays.filter((day) => day.dayOffset < occurrence.entryDayOffset).length >= 2,
       ),
     );
     expect(qualifying).toHaveLength(1);
-    expect(qualifying[0]!.nextGenerationEntryDayOffsets).toEqual([4]);
+    expect(qualifying[0]!.nextGenerationOccurrences.map((occurrence) => occurrence.entryDayOffset)).toEqual([4]);
   });
 
   it("AC: child immutable entry event欠如をcredited_at/current soulから推測しない", () => {
@@ -399,7 +409,7 @@ describe("invite_rooted_safe exact semantics", () => {
     );
 
     expect(read().profiles[0]).toMatchObject({
-      nextGenerationEntryDayOffsets: [],
+      nextGenerationOccurrences: [],
       unknownNextGenerationEntryAnchorCount: 1,
     });
   });
@@ -423,14 +433,113 @@ describe("invite_rooted_safe exact semantics", () => {
     expect(readTitleSource(db, "confirmed_invites", "subject", scope()).creditedAt).toEqual([ENTRY + 12 * DAY]);
   });
 
+  it("AF: earlier day + child-day entry前activityをfuture 2-day rooted条件へ使える", () => {
+    const { invite, ghosted, exchange, read } = setup();
+    const childEntryAt = ENTRY + 3 * DAY + 8 * HOUR;
+    ghosted("branch", ENTRY);
+    invite("subject", "branch", ENTRY + 1);
+    exchange("root-day1", "branch", ENTRY + DAY);
+    exchange("root-child-day-before", "branch", childEntryAt - HOUR);
+    ghosted("child", childEntryAt);
+    invite("branch", "child", childEntryAt + 1);
+
+    const profile = read().profiles[0]!;
+    const occurrence = profile.nextGenerationOccurrences[0]!;
+    const earlierDays = profile.activityDays.filter((day) => day.dayOffset < occurrence.entryDayOffset);
+    expect(earlierDays.map((day) => day.dayOffset)).toEqual([1]);
+    expect(occurrence).toEqual({
+      entryDayOffset: 3,
+      sameDayBeforeEntry: { tcBestOtherGapMs: 10_000, vcTrustedSocialSeconds: 0 },
+    });
+    expect(earlierDays.length + (occurrence.sameDayBeforeEntry.tcBestOtherGapMs === null ? 0 : 1)).toBe(2);
+  });
+
+  it("AG: child-day activityがentry後だけならroot-before-child prefixへ入れない", () => {
+    const { invite, ghosted, exchange, read } = setup();
+    const childEntryAt = ENTRY + 3 * DAY + 8 * HOUR;
+    ghosted("branch", ENTRY);
+    invite("subject", "branch", ENTRY + 1);
+    exchange("root-day1", "branch", ENTRY + DAY);
+    ghosted("child", childEntryAt);
+    invite("branch", "child", childEntryAt + 1);
+    exchange("root-child-day-after", "branch", childEntryAt + HOUR);
+
+    const profile = read().profiles[0]!;
+    expect(profile.activityDays.map((day) => day.dayOffset)).toEqual([1, 3]);
+    expect(profile.nextGenerationOccurrences[0]).toEqual({
+      entryDayOffset: 3,
+      sameDayBeforeEntry: { tcBestOtherGapMs: null, vcTrustedSocialSeconds: 0 },
+    });
+  });
+
+  it("AH: same JST dayの2 childをactivity前後のanonymous occurrencesとして区別する", () => {
+    const { invite, ghosted, exchange, read } = setup();
+    const activityAt = ENTRY + 3 * DAY + 5 * HOUR;
+    ghosted("branch", ENTRY);
+    invite("subject", "branch", ENTRY + 1);
+    ghosted("child-before-activity", activityAt - 2 * HOUR);
+    exchange("between-children", "branch", activityAt);
+    ghosted("child-after-activity", activityAt + 2 * HOUR);
+    invite("branch", "child-before-activity", activityAt + 3 * HOUR);
+    invite("branch", "child-after-activity", activityAt + 3 * HOUR + 1);
+
+    expect(read().profiles[0]!.nextGenerationOccurrences).toEqual([
+      { entryDayOffset: 3, sameDayBeforeEntry: { tcBestOtherGapMs: 10_000, vcTrustedSocialSeconds: 0 } },
+      { entryDayOffset: 3, sameDayBeforeEntry: { tcBestOtherGapMs: null, vcTrustedSocialSeconds: 0 } },
+    ]);
+  });
+
+  it("AI: TC exchangeのsubject/other両端をchild entryで正確にclipする", () => {
+    const { invite, ghosted, message, read } = setup();
+    const childEntryAt = ENTRY + 3 * DAY + 8 * HOUR;
+    ghosted("branch", ENTRY);
+    invite("subject", "branch", ENTRY + 1);
+    message("eligible-subject", "branch", childEntryAt - 2_000, "eligible-surface");
+    message("eligible-other", "eligible-other", childEntryAt - 1_000, "eligible-surface");
+    message("crossing-subject", "branch", childEntryAt - 10, "crossing-surface");
+    message("crossing-other", "crossing-other", childEntryAt + 10, "crossing-surface");
+    ghosted("child", childEntryAt);
+    invite("branch", "child", childEntryAt + 20);
+
+    const profile = read().profiles[0]!;
+    expect(profile.activityDays[0]).toMatchObject({ dayOffset: 3, tcBestOtherGapMs: 20_000 });
+    expect(profile.nextGenerationOccurrences[0]!.sameDayBeforeEntry.tcBestOtherGapMs).toBe(1_000_000);
+  });
+
+  it("AJ: child entryを跨ぐVC intervalはentryまでのtrusted secondsだけをprefixへ入れる", () => {
+    const { invite, ghosted, presence, read } = setup();
+    const childEntryAt = ENTRY + 3 * DAY + 8 * HOUR;
+    ghosted("branch", ENTRY);
+    invite("subject", "branch", ENTRY + 1);
+    presence("branch", "crossing-vc", childEntryAt - 600, childEntryAt + 600);
+    ghosted("child", childEntryAt);
+    invite("branch", "child", childEntryAt + 1_200);
+
+    const profile = read().profiles[0]!;
+    expect(profile.activityDays[0]).toMatchObject({ dayOffset: 3, vcTrustedSocialSeconds: 1_200 });
+    expect(profile.nextGenerationOccurrences[0]).toEqual({
+      entryDayOffset: 3,
+      sameDayBeforeEntry: { tcBestOtherGapMs: null, vcTrustedSocialSeconds: 600 },
+    });
+  });
+
   it("S: safe payloadはidentity/exact date/timestampを出さず全階層をdeep-freezeする", () => {
     const { invite, ghosted, exchange, read } = setup();
     invite("subject-secret-marker", "branch-secret-marker");
     ghosted("branch-secret-marker");
     exchange("message-secret-marker", "branch-secret-marker", ENTRY + DAY, "surface-secret-marker");
+    ghosted("child-secret-marker", ENTRY + 2 * DAY);
+    invite("branch-secret-marker", "child-secret-marker", ENTRY + 2 * DAY + 1);
     const payload = read("subject-secret-marker");
     const json = JSON.stringify(payload);
-    for (const marker of ["subject-secret-marker", "branch-secret-marker", "surface-secret-marker", "message-secret-marker", "2026-"]) {
+    for (const marker of [
+      "subject-secret-marker",
+      "branch-secret-marker",
+      "child-secret-marker",
+      "surface-secret-marker",
+      "message-secret-marker",
+      "2026-",
+    ]) {
       expect(json).not.toContain(marker);
     }
     expect(json).not.toMatch(/user_?id|invitee|inviter|surface|channel|guild|created_at|credited_at|entry_at/i);
@@ -440,7 +549,9 @@ describe("invite_rooted_safe exact semantics", () => {
       payload.profiles[0],
       payload.profiles[0]!.activityDays,
       payload.profiles[0]!.activityDays[0],
-      payload.profiles[0]!.nextGenerationEntryDayOffsets,
+      payload.profiles[0]!.nextGenerationOccurrences,
+      payload.profiles[0]!.nextGenerationOccurrences[0],
+      payload.profiles[0]!.nextGenerationOccurrences[0]!.sameDayBeforeEntry,
     ]) {
       expect(Object.isFrozen(value)).toBe(true);
     }

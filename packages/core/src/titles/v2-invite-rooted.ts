@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { jstDateStr } from "../entry/sessions.js";
-import { computeTcSocialExchangeCandidates } from "../tc-social/derived.js";
+import { computeTcSocialExchangeCandidates, type TcSocialExchangeCandidate } from "../tc-social/derived.js";
 import { computePublicSocialPresenceIntervals } from "../vc/public-social-derived.js";
 import { getVcPublicSocialTrustFence } from "../vc/public-social-presence.js";
 
@@ -25,13 +25,25 @@ export interface InviteRootedSafeReunionDay {
   readonly vcTrustedPairSeconds: number;
 }
 
+export interface InviteRootedSafeSameDayActivity {
+  readonly tcBestOtherGapMs: number | null;
+  readonly vcTrustedSocialSeconds: number;
+}
+
+export interface InviteRootedSafeNextGenerationOccurrence {
+  /** branch entry JST dateを0としたchild immutable entry暦日差。 */
+  readonly entryDayOffset: number;
+  /** child entry timestampで半開区間clipした、そのJST日内のpublic activity prefix。 */
+  readonly sameDayBeforeEntry: InviteRootedSafeSameDayActivity;
+}
+
 export interface InviteRootedSafeProfile {
   readonly activityDays: readonly InviteRootedSafeActivityDay[];
   /**
-   * branch entry JST dateを0とした、confirmed next-generation childのimmutable entry日差。
-   * rooted activityが先行したことは activity dayOffset < child offset だけでfail-closedに証明する。
+   * confirmed next-generation childごとのanonymous occurrence。
+   * earlier activityDaysとchild-day prefixを合わせ、threshold未固定のroot-before-childを証明する。
    */
-  readonly nextGenerationEntryDayOffsets: readonly number[];
+  readonly nextGenerationOccurrences: readonly InviteRootedSafeNextGenerationOccurrence[];
   /** confirmed child relationはあるがimmutable entry eventが無い件数。credited_at等では補わない。 */
   readonly unknownNextGenerationEntryAnchorCount: number;
   readonly reunionDays: readonly InviteRootedSafeReunionDay[];
@@ -79,6 +91,12 @@ interface PresenceRow {
 interface Interval {
   readonly start: number;
   readonly end: number;
+}
+
+interface InviteRootedActivityEvidence {
+  readonly daysByUser: ReadonlyMap<string, readonly InviteRootedSafeActivityDay[]>;
+  readonly tcCandidatesByUser: ReadonlyMap<string, readonly TcSocialExchangeCandidate[]>;
+  readonly vcIntervalsByUser: ReadonlyMap<string, readonly Interval[]>;
 }
 
 function chunks<T>(values: readonly T[]): T[][] {
@@ -236,19 +254,21 @@ function loadNextGenerationRelations(
   return result;
 }
 
-function computeActivityDays(
+function computeActivityEvidence(
   db: Database.Database,
   inviteeIds: readonly string[],
   anchors: ReadonlyMap<string, number>,
   window: { start: number; effectiveEnd: number; observedAt: number },
-): Map<string, InviteRootedSafeActivityDay[]> {
+): InviteRootedActivityEvidence {
   const tcByUserDay = new Map<string, Map<number, number>>();
+  const tcCandidatesByUser = new Map<string, readonly TcSocialExchangeCandidate[]>();
   for (const chunk of chunks(inviteeIds)) {
     for (const result of computeTcSocialExchangeCandidates(
       db,
       { start: window.start, end: window.effectiveEnd, observedAt: window.observedAt },
       chunk,
     )) {
+      tcCandidatesByUser.set(result.userId, result.candidates);
       const entryAt = anchors.get(result.userId);
       if (entryAt === undefined) continue;
       const byDay = new Map<number, number>();
@@ -263,12 +283,14 @@ function computeActivityDays(
   }
 
   const vcByUserDay = new Map<string, Map<number, number>>();
+  const vcIntervalsByUser = new Map<string, readonly Interval[]>();
   for (const chunk of chunks(inviteeIds)) {
     for (const result of computePublicSocialPresenceIntervals(
       db,
       { start: window.start, end: window.effectiveEnd, observedAt: window.observedAt },
       chunk,
     )) {
+      vcIntervalsByUser.set(result.userId, result.intervals);
       const entryAt = anchors.get(result.userId);
       if (entryAt !== undefined) vcByUserDay.set(result.userId, splitSecondsByOffset(result.intervals, entryAt));
     }
@@ -288,7 +310,45 @@ function computeActivityDays(
       })),
     );
   }
-  return result;
+  return { daysByUser: result, tcCandidatesByUser, vcIntervalsByUser };
+}
+
+function sameDayActivityBeforeEntry(
+  branchId: string,
+  branchEntryAt: number,
+  childEntryAt: number,
+  evidence: InviteRootedActivityEvidence,
+): InviteRootedSafeSameDayActivity {
+  const entryDayOffset = dayOffset(branchEntryAt, childEntryAt);
+  if (entryDayOffset < 1) return { tcBestOtherGapMs: null, vcTrustedSocialSeconds: 0 };
+
+  const childEntryAtMs = childEntryAt * 1_000;
+  let tcBestOtherGapMs: number | null = null;
+  for (const candidate of evidence.tcCandidatesByUser.get(branchId) ?? []) {
+    if (
+      candidate.createdAtMs < branchEntryAt * 1_000 ||
+      candidate.createdAtMs >= childEntryAtMs ||
+      dayOffset(branchEntryAt, Math.floor(candidate.createdAtMs / 1_000)) !== entryDayOffset
+    ) {
+      continue;
+    }
+    let prefixGap = candidate.priorOtherGapMs;
+    if (
+      candidate.nextOtherGapMs !== null &&
+      candidate.createdAtMs + candidate.nextOtherGapMs < childEntryAtMs
+    ) {
+      prefixGap = prefixGap === null ? candidate.nextOtherGapMs : Math.min(prefixGap, candidate.nextOtherGapMs);
+    }
+    if (prefixGap !== null) {
+      tcBestOtherGapMs = tcBestOtherGapMs === null ? prefixGap : Math.min(tcBestOtherGapMs, prefixGap);
+    }
+  }
+
+  const clippedVc = (evidence.vcIntervalsByUser.get(branchId) ?? [])
+    .map((interval) => ({ start: interval.start, end: Math.min(interval.end, childEntryAt) }))
+    .filter((interval) => interval.end > interval.start);
+  const vcTrustedSocialSeconds = splitSecondsByOffset(clippedVc, branchEntryAt).get(entryDayOffset) ?? 0;
+  return { tcBestOtherGapMs, vcTrustedSocialSeconds };
 }
 
 function loadTcMessages(
@@ -444,23 +504,44 @@ export function computeInviteRootedSafe(
   const nextGenerationRelations = loadNextGenerationRelations(db, relations, window.effectiveEnd);
   const childIds = unique(nextGenerationRelations.map((relation) => relation.childId));
   const anchors = loadEntryAnchors(db, unique([...inviteeIds, ...childIds]), window.effectiveEnd);
-  const activity = computeActivityDays(db, inviteeIds, anchors, window);
+  const activity = computeActivityEvidence(db, inviteeIds, anchors, window);
   const reunions = computeReunionDays(db, relations, anchors, window);
 
-  const nextGenerationByBranch = new Map<string, Map<string, { offsets: number[]; unknownCount: number }>>();
+  const nextGenerationByBranch = new Map<
+    string,
+    Map<string, { occurrences: InviteRootedSafeNextGenerationOccurrence[]; unknownCount: number }>
+  >();
   for (const relation of nextGenerationRelations) {
     const branchEntryAt = anchors.get(relation.branchId);
     if (branchEntryAt === undefined) continue;
     const byBranch = nextGenerationByBranch.get(relation.subjectId) ?? new Map();
-    const aggregate = byBranch.get(relation.branchId) ?? { offsets: [], unknownCount: 0 };
+    const aggregate = byBranch.get(relation.branchId) ?? { occurrences: [], unknownCount: 0 };
     const childEntryAt = anchors.get(relation.childId);
     if (childEntryAt === undefined) aggregate.unknownCount += 1;
-    else aggregate.offsets.push(dayOffset(branchEntryAt, childEntryAt));
+    else {
+      aggregate.occurrences.push({
+        entryDayOffset: dayOffset(branchEntryAt, childEntryAt),
+        sameDayBeforeEntry: sameDayActivityBeforeEntry(
+          relation.branchId,
+          branchEntryAt,
+          childEntryAt,
+          activity,
+        ),
+      });
+    }
     byBranch.set(relation.branchId, aggregate);
     nextGenerationByBranch.set(relation.subjectId, byBranch);
   }
   for (const byBranch of nextGenerationByBranch.values()) {
-    for (const aggregate of byBranch.values()) aggregate.offsets.sort((a, b) => a - b);
+    for (const aggregate of byBranch.values()) {
+      aggregate.occurrences.sort(
+        (a, b) =>
+          a.entryDayOffset - b.entryDayOffset ||
+          (a.sameDayBeforeEntry.tcBestOtherGapMs ?? Number.POSITIVE_INFINITY) -
+            (b.sameDayBeforeEntry.tcBestOtherGapMs ?? Number.POSITIVE_INFINITY) ||
+          a.sameDayBeforeEntry.vcTrustedSocialSeconds - b.sameDayBeforeEntry.vcTrustedSocialSeconds,
+      );
+    }
   }
 
   const profilesBySubject = new Map<string, InviteRootedSafeProfile[]>();
@@ -471,9 +552,9 @@ export function computeInviteRootedSafe(
       continue;
     }
     const profile: InviteRootedSafeProfile = {
-      activityDays: activity.get(relation.inviteeId) ?? [],
-      nextGenerationEntryDayOffsets:
-        nextGenerationByBranch.get(relation.subjectId)?.get(relation.inviteeId)?.offsets ?? [],
+      activityDays: activity.daysByUser.get(relation.inviteeId) ?? [],
+      nextGenerationOccurrences:
+        nextGenerationByBranch.get(relation.subjectId)?.get(relation.inviteeId)?.occurrences ?? [],
       unknownNextGenerationEntryAnchorCount:
         nextGenerationByBranch.get(relation.subjectId)?.get(relation.inviteeId)?.unknownCount ?? 0,
       reunionDays: reunions.get(relation.subjectId)?.get(relation.inviteeId) ?? [],
