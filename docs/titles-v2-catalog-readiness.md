@@ -111,6 +111,15 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > BLOCKED→READY、READY 51→55、BLOCKED 34→30。`missing_persisted_source` 10→6、
 > `missing_derived_source` 12→10、PARTIAL 6・META 8は不変。§22参照。
 
+> **PR F2k反映（2026-08-24）**: normal peer transfer/tipとcanonical storefront
+> purchaseだけをstable semantic familyへ写す`economy_semantic_safe`、および
+> eligible productのJST日別/global breadthだけを返す`shop_purchase_safe`を追加した。
+> purchase origin/productは購入時append-only provenanceへ凍結し、refund/cancel occurrenceも
+> fixed observedAtで切る。current item/status/reasonからのbackfill推測はしない。
+> No.59/61/62/63がBLOCKED→READY、READY 55→59、BLOCKED 30→26。
+> `missing_derived_source` 10→7、`missing_persisted_source` 6→4、`missing_manifest` 9→8。
+> No.60はpair chronology、No.64/65はrole-at-time待ちでBLOCKEDを維持する。§23参照。
+
 ## 0. xlsx canonical hash（exact drift guard）
 
 | 項目 | 値 |
@@ -158,13 +167,13 @@ full-clear editionに登録されたREQUIRED印100%——NONCOUNTの91 behavior�
 
 | status | 件数 | 意味 |
 | --- | --- | --- |
-| READY | 55 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
+| READY | 59 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
 | PARTIAL | 6 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
-| BLOCKED | 30 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
+| BLOCKED | 26 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
 | META | 8 | kind:meta（別bucket、§7参照） |
 
 **READY = 今すぐreleaseしてよい、ではない**。sourceReadinessとthreshold決定は
-別軸（§10参照）——READY 55件も、production threshold値（分布TBD等）が
+別軸（§10参照）——READY 59件も、production threshold値（分布TBD等）が
 決まるまではrelease対象にならない。またSeries manifest／Collection Edition／
 Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）。No.58はさらに、
 award後のreversalを既存immutable ownershipへどう反映するかが未決定であるため、
@@ -174,15 +183,15 @@ source-readyでもproduction release不可（§15）。
 
 | blockerKind | 件数 | 意味 |
 | --- | --- | --- |
-| missing_persisted_source | 6 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
-| missing_derived_source | 10 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
-| missing_manifest | 9 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
+| missing_persisted_source | 4 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
+| missing_derived_source | 7 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
+| missing_manifest | 8 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
 | missing_role_history | 7 | role-at-time（過去のある時点でどのroleを保持していたか）がrepo全体で未実装 |
 | source_semantic_mismatch | 6 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（No.1/6/22のpublic VC provenance、No.29/30のpair-specific overlap、No.48のfree-flow同一topic correlation） |
 | missing_event_protocol | 2 | イベントデータモデル自体にorganizer/staff区別が存在しない |
 | known_bug | 0 | PR F2aで`computeLastOccupant()`のsame-second/0-second visit tie bugを修正——catalog全体から解消済み（§13参照） |
 
-（`none`のBehavior候補は55件——ちょうどREADY件数と一致。PARTIAL 6件は
+（`none`のBehavior候補は59件——ちょうどREADY件数と一致。PARTIAL 6件は
 すべて`source_semantic_mismatch`を持つ。）
 
 ## 4. Theme別 readiness
@@ -201,7 +210,7 @@ source-readyでもproduction release不可（§15）。
 | 10 | BUMP / 鐘 | 4 | 4 | 0 | 0 |
 | 11 | TC交流 | 8 | 7 | 1 | 0 |
 | 12 | 公開部屋 | 8 | 7 | 0 | 1 |
-| 13 | Land・経済 | 8 | 1 | 0 | 7 |
+| 13 | Land・経済 | 8 | 5 | 0 | 3 |
 | 14 | 賭場 | 8 | 3 | 0 | 5 |
 | 15 | 招待 | 6 | 6 | 0 | 0 |
 | 16 | イベント | 5 | 2 | 0 | 3 |
@@ -211,11 +220,12 @@ BUMP/鐘とVC人数帯Theme 3-6が100% READY（後者はPR F2eのJST日別4bucke
 trusted secondsで日数/share/span/streakを後段評価できるため）。公開部屋はF2gで
 7/8件がSOURCE READYとなり、No.57だけrole-at-time待ち。時間帯・生活痕はF2iで6/6件が
 SOURCE READYとなった。TC交流はF2hで7/8件がSOURCE READYとなり、No.48だけfree-flow同一topic correlationのsemantic mismatchが残る。
-招待はF2jで6/6件がSOURCE READYとなった。城横断は引き続き0% READY。
+招待はF2jで6/6件がSOURCE READYとなった。Land・経済はF2kで5/8件がREADYとなり、
+No.60はpair chronology、No.64/65はrole-at-time待ち。城横断は引き続き0% READY。
 
 ## 5. source別に残る実装（READYを支えるsource／PARTIALの制約／BLOCKEDが必要とするもの）
 
-READYを支えている既存`titleUsable:true` source（15種、55件）:
+READYを支えている既存`titleUsable:true` source（17種、59件）:
 
 - `vc_empty_start_then_joined`（No.2。No.1はpublic provenance不足でPARTIAL）
 - `vc_last_occupant`（No.7, 9。No.6はtie bug解消済みだがpublic provenance不足でPARTIAL）
@@ -227,6 +237,8 @@ READYを支えている既存`titleUsable:true` source（15種、55件）:
 - `confirmed_invites`（No.74-75 のみ——`invitee_id UNIQUE`によりdistinct数が保証される）
 - `invite_rooted_safe`（No.76-79——confirmed direct relation、immutable entry anchor、canonical public activity/network/pair reunionをanonymous direct-branch profileへ統合、§22参照）
 - `economy_safe_peer_actions`（No.58——snapshot時点でreverse済みoriginalを除外、§15参照）
+- `economy_semantic_safe`（No.59/61/63——explicit semantic family、natural in/out、human counterpart/day breadth、§23参照）
+- `shop_purchase_safe`（No.62——immutable storefront origin/productとsnapshot-bounded refund/cancel、§23参照）
 - `public_event_completed_participations`（No.80-81——明示staff completion正本と同一roster revisionへJOIN、§16参照）
 - `public_room_activity_safe`（No.50-56——room lifecycleとtrusted logical VC visitの交差をidentityなしでhosted/guest/ownUseへ集計、§19参照）
 - `tc_conversation_safe`（No.42-45, 47, 49——quiet/continuation/dormant/area/join/social-dayのthreshold-neutral stats、§20参照）
@@ -249,8 +261,6 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 
 - **`casino_table_activity_safe`(host/guest区別)新設**—— No.70-71（2件）。casino_participationsは全参加者を対称記録——host/guest概念自体が現データモデルに存在しない
 - **market/betting safe source新設**—— No.72（1件）。market/stocks系は`CASINO_ACTIVITY_KEYS`の対象外
-- **economy機能family classifier拡張**—— No.61, 63（2件）
-- **shop purchase safe source新設**—— No.62, 65（2件）
 - **event dual-role（organizer/staff）protocol拡張**—— No.83-84（2件）。`public_events`のデータモデル自体にorganizer概念が無い
 - **event_dateのsafe span source新設**—— No.82（1件）。`completedAt`はstaff attestation時刻であり実event日/spanの代用不可
 - **`castle_experience_safe`新設 + 城横断manifest**—— No.85-91（7件）。grep 0件で、E3のevent infra完成待ちでもある
@@ -266,7 +276,7 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 | STRUCTURAL_PLUS_DISTRIBUTION | 1 | 構造は決まるが、一部の値は分布依存 |
 | META_NOT_APPLICABLE | 8 | meta（別contract、§10適用外） |
 
-sourceReadinessとthresholdは別軸——READY 55件のうち、STRUCTURAL_FIXEDなのは
+sourceReadinessとthresholdは別軸——READY 59件のうち、STRUCTURAL_FIXEDなのは
 一部（初回系）のみで、残りはTHRESHOLD_PENDINGのままREADYになっている
 （sourceは十分だが実数値は分布を見てから決める）。
 
@@ -274,7 +284,7 @@ sourceReadinessとthresholdは別軸——READY 55件のうち、STRUCTURAL_FIXE
 
 | 依存軸 | 件数 | 備考 |
 | --- | --- | --- |
-| role-at-time依存（`roleDependency !== "none"`） | 10 | うちrole-history欠如**単独**が原因なのは3件（No.27, 64, 73）、残りは他blockerと複合 |
+| role-at-time依存（`roleDependency !== "none"`） | 10 | readiness blockerとして`missing_role_history`が残るのは7件。No.65はF2kでshop側だけ解消しrole-at-time単独待ちになった |
 | イベントtheme（Theme No.16） | 5 | No.80/81はcompletion sourceでREADY、No.82-84は依然BLOCKED |
 | manifest依存（thresholdCategory: MANIFEST_DEPENDENT） | 6 | 賭場core family一覧・城横断family一覧・series一覧が未定義 |
 | known bug依存 | 0 | PR F2aで`computeLastOccupant`の同秒0秒visit tie bugを修正——catalog全体から解消（§13参照） |
@@ -299,22 +309,23 @@ sourceReadinessとthresholdは別軸——READY 55件のうち、STRUCTURAL_FIXE
 > No.23-25がPARTIAL→READY。公開部屋の実利用safe aggregateも**PR F2gで
 > 解消済み**（§19参照）——No.50-56がBLOCKED→READY、No.57はrole-at-time
 > blockerのみ残る。TC+VC時間帯clusterも**PR F2iで解消済み**（§21参照）——
-> No.32-37がBLOCKED→READY。
+> No.32-37がBLOCKED→READY。economy semantic family/shop purchase clusterも
+> **PR F2kで解消済み**（§23参照）——No.59/61/62/63がBLOCKED→READY、
+> No.65はshop側だけ解消してrole-at-time待ち。
 > 以下は残っているクラスタのみを優先度順に並べ直したもの。
 
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
-| 1 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
-| 2 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
-| 3 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
-| 4 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
-| 5 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
-| 6 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
+| 1 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
+| 2 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
+| 3 | role-at-time基盤 | role依存最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
+| 4 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
+| 5 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
 
 VC group-size clusterはF2e、VC social breadth clusterはF2f、公開部屋clusterは
 F2g、TC conversation/reactionの7件はF2h、TC+VC時間帯clusterはF2iで解消した。
-招待clusterはF2jの`invite_rooted_safe`で解消した。次のengineering clusterは既存E2を
-拡張できるeconomy classifier/shop purchase。No.48の残件は次のsource実装ではなく、
+招待clusterはF2jの`invite_rooted_safe`、economy/shop clusterはF2kで解消した。
+No.48の残件は次のsource実装ではなく、
 content無しでfree-flow同一topicをどうcanonicalに証明するかという別枠のproduct/UX
 semantic decisionであり、特殊操作をユーザーへ強制してREADY化しない。
 
@@ -346,7 +357,7 @@ xlsx上の記述と、現在のruntime契約が食い違う箇所——本PRで�
 - Series manifestの登録（`registerSeriesManifests()`呼び出し）
 - Collection Editionのactivate
 - production threshold値の決定
-- role-at-time・TC canonical conversation・public room safe source・castle_experience・invite retention・casino table/market・economy classifier・event dual-role protocol等の新規実装
+- role-at-time・castle_experience・casino table/market・event dual-role protocol等、優先度表に残る基盤の新規実装
 - 第I期casino core-family manifestの策定・No.69のREADY化
 - Behavior evaluatorのproduction wiring
 
@@ -1198,3 +1209,127 @@ later-day public activity分布、No.77は完全な過去日分布とchild entry
 No.78は同日複数childを含めroot-before-childを満たすdistinct profile breadth、No.79はscope内
 later-day pair-specific public reunionをexactに表現できるためREADY。
 実集計はREADY 55 / PARTIAL 6 / BLOCKED 30 / META 8。
+
+## 23. PR F2k — Economy Semantic Family + Shop Purchase Safe
+
+### 23.1 production callsite / purchase origin audit
+
+`shop_purchases`の3つのINSERT pathと、それらへ到達する全Shop APIを監査した。
+originは購入commit時に`shop_purchase_title_provenance`へ凍結し、現在の商品名・設定・
+`request_json`・ledger reason/refから後で推測しない。既存rowのinferred backfillも行わない。
+
+| purchase flow | canonical writer | frozen origin | No.62 eligible | 理由 |
+| --- | --- | --- | --- | --- |
+| normal Land / alternative storefront | `Shop.purchase()` → `purchaseInternal()` | `storefront` | yes | 普通の客としてitem validationとpaymentを通過した通常商館購入 |
+| approved original-role application | `purchaseOriginalRole()` → `purchaseInternal()` | `original_role_application` | no | special application service |
+| original-role invoice | `purchaseOriginalRoleInvoice()` direct INSERT | `original_role_invoice` | no | staff-issued invoice payment |
+| evaluation deadline extension | `purchaseEvaluationExtension()` → `purchaseInternal()` | `evaluation_extension` | no | evaluation lifecycle special service |
+| reevaluation right (Land/invite) | `purchaseReevaluation()` → `purchaseInternal()` | `reevaluation` | no | evaluation special service |
+| timed-access legacy role import | `migrateTimedAccessLegacy()` direct INSERT | `legacy_timed_access_import` | no | 無償migration entitlement |
+
+新しいdirect INSERTがprovenanceを作らなければsafe sourceには入らない。全3 INSERT pathが
+`recordTitlePurchaseProvenance()`を通ることをsource-order testで固定し、unknown/synthetic/
+operator-created rowを自動採用しない。
+
+### 23.2 eligible product / lifecycle snapshot semantics
+
+eligible contractは`TITLE_ELIGIBLE_SHOP_ORIGINS = ["storefront"]`。generic
+`Shop.purchase()`はconfigured original-role/reevaluation/evaluation-extension itemを先に拒否するため、
+このoriginはnormal customer storefrontに限定される。product identityは購入時item IDから作る
+restricted `product_key`を凍結するがsafe payloadには出さない。同じeligible商品を何回買っても
+global distinctは1、別商品は同じdelivery familyでも別productとして数える。後のrename、price/
+delivery更新、disableで過去purchaseのidentity/eligibilityは変わらない。
+
+購入成立と配送は独立。canonical purchase row + storefront provenanceがcommitされた時点を
+purchase boundaryとし、`delivery_state=pending/failed`、`delivered_at IS NULL`でもpurchaseを保持する。
+`status=expired`も正当な過去購入として残す。購入validation失敗はpurchase/provenanceが無いため0。
+
+refund/cancelはcurrent statusではなくappend-only `shop_purchase_status_history`のoccurrenceを使う。
+`Shop.refund()`はstatus updateと同じtransactionでexact application timestampを先にappendする。
+current repoにproduction cancel commandは無いが、今後の`status -> cancelled`をDB triggerがtransition
+時刻でappendする。sourceは`occurred_at < effectiveEnd`だけを除外するため、future refund/cancelは
+fixed historical snapshotを遡及変更しない。legacyの現状態だけがrefunded/cancelledでもpurchase時
+provenance自体が無いためfail-closedであり、時刻をcurrent stateからbackfillしない。
+
+safe payloadは次だけ。
+
+```ts
+{
+  days: [{ date: "YYYY-MM-DD", distinctEligibleProducts: number }],
+  distinctEligibleProducts: number
+}
+```
+
+item/purchase/user ID、name、price、paid kind/amount、transaction/request/delivery/invoice/staff dataは
+公開しない。raw count rankingではなく、JST日別とscope-globalのdistinct product breadthだけ。
+
+### 23.3 explicit economy semantic family manifest
+
+`ECONOMY_FEATURE_FAMILY_MANIFEST`は`knownTxTypes()`/`publicLog`を走査せず、次の3 familyだけを
+明示する。future tx type/shop workflowはmanifestとregressionのreview無しに自動追加されない。
+
+| family | canonical provenance | direction | human counterpart | completion / reversal |
+| --- | --- | --- | --- | --- |
+| `peer_transfer` | `commands/transfer.ts`の`Ledger.transfer(type='transfer')` | in/out | yes | actor=from、human↔human、snapshot-bounded Ledger reversal |
+| `tip` | `commands/tip.ts`の`Ledger.transfer(type='tip')` | in/out | yes | actor=from、human↔human、snapshot-bounded Ledger reversal |
+| `shop` | immutable `origin='storefront'` purchase provenance | out | no | canonical purchase、snapshot-bounded shop refund/cancel |
+
+ledger queryはfrom/to/type/created_atだけを読み、reason/ref/UI文言をSELECTしない。公式shop支払いの
+`tip_burn`はledger familyへ入れず、同じ意味行動をcanonical `shop` 1 familyとしてだけ採る。
+Land/alternative payment、複数underlying purchase rowがあってもshop family breadthは1。
+
+明示除外はopening/initial、salary/pension/commission、`reward_*`/vc_reward/event_prize、
+fine/tax/admin adjust、migration/recovery/compensation/refund、casino bet/prize/chip/remittance/bailout、
+legacy ether、department/system bookkeeping、shop_personal/fanclub/inheritance、overloaded `tip_burn`。
+reversal transaction自身とsnapshot時点でreversed originalも除外し、future reversalは過去snapshotへ
+影響しない。shop refundをledger `adjust` reversalとして分類せずdomainを分離する。
+
+### 23.4 natural circulation / safe aggregate / privacy
+
+natural inflowは、manifest対象human→human transactionでsubjectが受取側、かつgiver本人が
+`actor_id=from_account`としてcommitしたもの。natural outflowはsubject本人が実行したmanifest対象
+human→human transaction、またはcanonical eligible storefront purchase。shop/system treasuryは
+human counterpartへ数えない。
+
+restricted内部でcounterpart identityをglobal/day distinct集合へ畳み、safe payloadは次だけを返す。
+
+```ts
+{
+  days: [{ date, families, directions, distinctHumanCounterparts }],
+  distinctFamilies,
+  distinctHumanCounterparts,
+  hasNaturalInflow,
+  hasNaturalOutflow,
+  outgoingTip: {
+    days: [{ date, distinctRecipients }],
+    distinctRecipients
+  }
+}
+```
+
+No.61は複数日・family・human counterpart・inflow・outflowを同じwindowでthreshold未固定のまま
+同時評価できる。No.59はoutgoing normal tipだけのrecipient union/day分布を使い、transfer recipientを
+混ぜない。user/account/counterpart identity、amount、transaction/purchase ID、exact timestamp、reason/refは
+公開しない。No.60の同一pair inflow→別機会outflow chronologyは意図的に公開せずBLOCKEDを維持する。
+
+bulk readerは300 userごとにSQLを発行し、transaction/purchase/counterpart/itemごとのN+1を作らない。
+fixed observedAtではfuture transaction/purchase/refund/cancelを混ぜない。
+
+### 23.5 No.58–65 reaudit / readiness delta
+
+| No. | status | 根拠 / 残blocker |
+| --- | --- | --- |
+| 58 | READY維持 | 専用`economy_safe_peer_actions`の最初のvalid normal tip + snapshot reversal semanticsを変更しない |
+| 59 | READY | outgoing tip限定recipient breadth + JST day分布 |
+| 60 | BLOCKED | 同一counterpartのpair chronology不足 |
+| 61 | READY | natural in/out + human breadth + explicit family + JST days |
+| 62 | READY | immutable eligible product breadth + snapshot refund/cancel |
+| 63 | READY | tx type数ではなくstable semantic family manifest数 |
+| 64 | BLOCKED | normal economy sourceは揃ったが経済role-at-time不足 |
+| 65 | BLOCKED | normal eligible storefront purchaseは揃ったが商館role-at-time不足 |
+
+Theme 13はREADY 1→5 / BLOCKED 7→3。overallはREADY 59 / PARTIAL 6 /
+BLOCKED 26 / META 8。priority tableから完了済みeconomy/shop clusterを外し、残りを1–5へ
+連番化した。production threshold、BehaviorTitleDefinition、award/notification、leaderboard、
+progress UI、amount/wealth/spend/purchase-count ranking、Series/Collection/Meta activation、
+historical inferred backfill、merge/deployは行わない。

@@ -252,6 +252,7 @@ export {
   type DeliveryMode,
   type DeliveryKind,
   type PurchaseStatus,
+  type ShopPurchaseTitleOrigin,
   type ShopErrorCode,
   type ShopRoleRevocationRow,
   type ReevalInviteUseRow,

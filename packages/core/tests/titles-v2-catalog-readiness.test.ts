@@ -369,13 +369,13 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
     }
   });
 
-  it("F2j後の実集計はREADY 55 / PARTIAL 6 / BLOCKED 30 / META 8", () => {
+  it("F2k後の実集計はREADY 59 / PARTIAL 6 / BLOCKED 26 / META 8", () => {
     const counts = new Map<string, number>();
     for (const entry of TITLE_V2_CATALOG_READINESS) counts.set(entry.status, (counts.get(entry.status) ?? 0) + 1);
-    expect(Object.fromEntries(counts)).toEqual({ READY: 55, BLOCKED: 30, PARTIAL: 6, META: 8 });
+    expect(Object.fromEntries(counts)).toEqual({ READY: 59, BLOCKED: 26, PARTIAL: 6, META: 8 });
   });
 
-  it("source_semantic_mismatchはpublic provenance 3件を含む6件、missing_derived_sourceは10件", () => {
+  it("source_semantic_mismatchはpublic provenance 3件を含む6件、missing_derived_sourceは7件", () => {
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("source_semantic_mismatch")).map((entry) => entry.no)).toEqual([
       1,
       6,
@@ -384,11 +384,11 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
       30,
       48,
     ]);
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(10);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(7);
   });
 
-  it("missing_derived_sourceはNo.77/78のnetwork構造解消で12から10へ減る", () => {
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(10);
+  it("missing_derived_sourceはF2kのNo.59/61/63解消で10から7へ減る", () => {
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(7);
   });
 
   it("Theme 3-6は各3件すべてREADY", () => {
@@ -399,6 +399,56 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
         "READY",
       ]);
     }
+  });
+});
+
+describe("PR F2k: economy semantic family + shop purchase safe readiness", () => {
+  it("No.58は専用reversal-safe peer sourceを維持し、No.59/61/63だけeconomy semantic sourceでREADY", () => {
+    expect(readinessFor(58).usableSources).toEqual(["economy_safe_peer_actions"]);
+    for (const no of [59, 61, 63]) {
+      expect(readinessFor(no)).toMatchObject({
+        status: "READY",
+        usableSources: ["economy_semantic_safe"],
+        specializedResolvers: ["computeEconomySemanticSafe"],
+        missingCapabilities: [],
+        blockerKinds: ["none"],
+      });
+    }
+  });
+
+  it("No.62はshop sourceでREADY、No.60/64/65は残るexact blockerだけを保持", () => {
+    expect(readinessFor(62)).toMatchObject({
+      status: "READY",
+      usableSources: ["shop_purchase_safe"],
+      specializedResolvers: ["computeShopPurchaseSafe"],
+      missingCapabilities: [],
+      blockerKinds: ["none"],
+    });
+    expect(readinessFor(60)).toMatchObject({
+      status: "BLOCKED",
+      usableSources: [],
+      missingCapabilities: ["pair単位のsafe aggregate（「以前くれた相手」判定）"],
+      blockerKinds: ["missing_derived_source"],
+    });
+    expect(readinessFor(64)).toMatchObject({
+      status: "BLOCKED",
+      usableSources: ["economy_semantic_safe"],
+      missingCapabilities: ["role-at-time"],
+      blockerKinds: ["missing_role_history"],
+    });
+    expect(readinessFor(65)).toMatchObject({
+      status: "BLOCKED",
+      usableSources: ["shop_purchase_safe"],
+      missingCapabilities: ["role-at-time"],
+      blockerKinds: ["missing_role_history"],
+    });
+  });
+
+  it("Theme 13はREADY 5 / PARTIAL 0 / BLOCKED 3", () => {
+    const entries = TITLE_V2_CATALOG_READINESS.filter((entry) => entry.no >= 58 && entry.no <= 65);
+    expect(entries.filter((entry) => entry.status === "READY")).toHaveLength(5);
+    expect(entries.filter((entry) => entry.status === "PARTIAL")).toHaveLength(0);
+    expect(entries.filter((entry) => entry.status === "BLOCKED")).toHaveLength(3);
   });
 });
 
@@ -431,8 +481,8 @@ describe("PR F2g: public room activity safe source追加後のreadiness", () => 
     expect(entries.filter((entry) => entry.status === "BLOCKED")).toHaveLength(1);
   });
 
-  it("blocker実集計はF2j後missing_persisted_source 6、missing_role_history 7", () => {
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(6);
+  it("blocker実集計はF2k後missing_persisted_source 4、missing_role_history 7", () => {
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(4);
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_role_history"))).toHaveLength(7);
   });
 });
@@ -636,7 +686,7 @@ describe("PR F2j: exact invite-rooted safe source追加後のreadiness", () => {
     }
   });
 
-  it("Theme 15は6/6 READY、persisted/derived blockerは実集計6/10", () => {
+  it("Theme 15は6/6 READY、F2k後のpersisted/derived blockerは実集計4/7", () => {
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.no >= 74 && entry.no <= 79).map((entry) => entry.status)).toEqual([
       "READY",
       "READY",
@@ -645,7 +695,7 @@ describe("PR F2j: exact invite-rooted safe source追加後のreadiness", () => {
       "READY",
       "READY",
     ]);
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(6);
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(10);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(4);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(7);
   });
 });

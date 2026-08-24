@@ -726,6 +726,56 @@ export const TITLE_SOURCES = {
     // という事実1件（kindごと）。amount・件数・counterpartyは一切含まない。
     rawUnit: "unique_jst_safe_peer_economy_action_kind",
   },
+  shop_purchase_title_records: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/shop/service.ts",
+      needle: "recordTitlePurchaseProvenance",
+    },
+    calledFrom: {
+      file: "apps/bot/src/commands/shop-panel.ts",
+      needle: "services.shop.purchase({",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "await handleShopButton(interaction, services);",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: true,
+    titleUsable: false,
+    restrictedUse: "economy_safe_classification",
+    epochPolicy: { type: "point", at: "purchased_at" },
+    rawUnit: "immutable_shop_purchase_title_provenance_and_status_history",
+  },
+  shop_purchase_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-shop-purchases.ts",
+      needle: "export function computeShopPurchaseSafe(",
+    },
+    derivedFrom: ["shop_purchase_title_records"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "eligible_shop_product_breadth_by_jst_day",
+  },
+  economy_semantic_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-economy.ts",
+      needle: "export function computeEconomySemanticSafe(",
+    },
+    derivedFrom: ["ledger_transactions", "shop_purchase_title_records"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "natural_economy_family_direction_counterpart_day_aggregate",
+  },
 
   // ── Public Event Participation Source（PR E3）──────────────────────────────
   //
