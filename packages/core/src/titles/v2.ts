@@ -111,6 +111,9 @@ export {
   type SocialActivityTimeSafeSourcePayload,
   type CasinoActivityDaysSourcePayload,
   type CasinoCompletedActivityDaysSourcePayload,
+  type CasinoEditionICompletionSafeSourcePayload,
+  type CasinoTableActivitySafeSourcePayload,
+  type CasinoMarketActivitySafeSourcePayload,
   type TextActiveDaysSourcePayload,
   type TitleSourcePayloads,
   type VcEmptyStartThenJoinedSourcePayload,
@@ -139,6 +142,10 @@ export {
 // から直接importして構わないが、v2 title barrel経由の公開APIには含めない）。
 // 公開してよいのはpayload型と、その`activityKey`フィールドの型だけ。
 export { type CasinoActivityKey } from "../casino/participation-history.js";
+export {
+  CASINO_EDITION_I_MANIFEST,
+  type CasinoEditionIFamily,
+} from "../casino/edition-i-manifest.js";
 
 export {
   defineTitleRule,

@@ -123,6 +123,8 @@ const TITLE_RESTRICTED_USES = [
   "tc_safe_social_classification",
   "public_social_presence_classification",
   "invite_rooted_safe_classification",
+  "casino_table_safe_classification",
+  "casino_market_safe_classification",
 ] as const;
 export type TitleRestrictedUse = (typeof TITLE_RESTRICTED_USES)[number];
 const VALID_TITLE_RESTRICTED_USES: ReadonlySet<string> = new Set(TITLE_RESTRICTED_USES);
@@ -946,6 +948,70 @@ export const TITLE_SOURCES = {
     titleUsable: true,
     epochPolicy: { type: "point", at: "completedAt" },
     rawUnit: "unique_jst_casino_completed_activity_day",
+  },
+  casino_edition_i_completion_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-casino-edition-table-market.ts",
+      needle: "export function computeCasinoEditionICompletionSafe(",
+    },
+    derivedFrom: ["casino_completed_activity_days"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "versioned_edition_i_completed_family_aggregate",
+  },
+  casino_table_instances: {
+    origin: "persisted",
+    writtenBy: { file: "packages/core/src/casino/takutate.ts", needle: "INSERT INTO casino_table_instances" },
+    calledFrom: { file: "apps/bot/src/commands/takutate-panel.ts", needle: "services.takutate.track(" },
+    wiredFrom: { file: "apps/bot/src/index.ts", needle: "await handleTakuButton(interaction, services);" },
+    kind: "history", privacy: "restricted", orderable: true, titleUsable: false,
+    restrictedUse: "casino_table_safe_classification",
+    epochPolicy: { type: "point", at: "created_at" }, rawUnit: "official_casino_table_instance",
+  },
+  casino_table_guest_presence: {
+    origin: "persisted",
+    writtenBy: { file: "packages/core/src/casino/takutate.ts", needle: "INSERT OR IGNORE INTO casino_table_guest_presence" },
+    calledFrom: { file: "apps/bot/src/commands/takutate-panel.ts", needle: "services.takutate.observeGuestTransition(" },
+    wiredFrom: { file: "apps/bot/src/index.ts", needle: "trackTakuGuestPresence(oldState, newState, services);" },
+    kind: "history", privacy: "restricted", orderable: true, titleUsable: false,
+    restrictedUse: "casino_table_safe_classification",
+    epochPolicy: { type: "interval", start: "started_at", end: "ended_at", clip: true },
+    rawUnit: "known_human_casino_table_guest_presence",
+  },
+  casino_table_activity_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-casino-edition-table-market.ts",
+      needle: "export function computeCasinoTableActivitySafe(",
+    },
+    derivedFrom: ["casino_table_instances", "casino_table_guest_presence"],
+    kind: "history", privacy: "safe", orderable: false, titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "anonymous_table_guest_jst_day_trusted_seconds",
+  },
+  casino_market_participation_records: {
+    origin: "persisted",
+    writtenBy: { file: "packages/core/src/casino/market.ts", needle: "INSERT INTO casino_market_participation_history" },
+    calledFrom: { file: "apps/bot/src/commands/ita.ts", needle: "services.markets.bet(" },
+    wiredFrom: { file: "apps/bot/src/index.ts", needle: "await handleItaButton(interaction, services);" },
+    kind: "history", privacy: "restricted", orderable: true, titleUsable: false,
+    restrictedUse: "casino_market_safe_classification",
+    epochPolicy: { type: "point", at: "occurred_at" }, rawUnit: "successful_funded_market_commitment",
+  },
+  casino_market_activity_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-casino-edition-table-market.ts",
+      needle: "export function computeCasinoMarketActivitySafe(",
+    },
+    derivedFrom: ["casino_market_participation_records"],
+    kind: "history", privacy: "safe", orderable: false, titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "unique_other_standard_market_jst_day_commitment",
   },
 } as const satisfies Record<string, TitleSourceDefinition>;
 

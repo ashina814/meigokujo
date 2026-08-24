@@ -1972,6 +1972,30 @@ transaction/purchase ID/exact timestampは出さない。No.59/61/62/63をSOURCE
 chronology、No.64/65はrole-at-time待ち。実集計はREADY 59 / PARTIAL 6 / BLOCKED 26 / META 8。
 production threshold、award/notification、ranking、historical inferred backfill、merge/deployは無い。
 
+### F2l — Casino Edition-I / Official Table / Standard Market Safe Sources
+
+Edition-Iは`CASINO_ACTIVITY_KEYS`の自動列挙ではなく、常設パネル仕様の「基本ゲーム入口」
+8種をversion=1へ明示固定する。slots/chohan/crash/chinchiro/roulette/blackjack/poker/holdemの
+各activityを同名familyへ写し、keiba/sashi/indianと将来gameは旧editionへ自動加入しない。
+No.69は`casino_completed_activity_days`だけをfamily集約するため、commitmentのみでは成立しない。
+
+official Takutate作成時にcurrent `casino_temp_vcs`とappend-only `casino_table_instances`を同じ
+transactionで保存する。guest presenceはDiscord memberの`user.bot === false`だけをhumanとし、ownerを
+除外する。intervalは一度だけcloseでき、restart dangling行は`recovered_unknown`としてstarted_atで
+閉じて0 trusted secondsとする。startup current cacheは観測時刻からfresh rowを開き、gap/backfillを
+発明しない。ChannelDelete/untrack/graceful shutdownも明示closeする。safe payloadはanonymous table/
+guest profilesとJST日別trusted secondsだけ。table instanceとdayを別軸にするため、一卓の日跨ぎは
+独立卓2件にならない。scope前のinstance contextは使うがstayは`[start,effectiveEnd)`へclipする。
+
+standard marketの`Markets.bet()`はfund transfer、current bet、append-only participation historyを
+同じidempotent `runGroup` transactionでcommitする。履歴はcommit時のcreator/mode/create/deadlineを
+凍結し、other creatorかつstandard、canonical deadline内の成功commitmentだけをsafe分類する。
+event Land market、stocks、自作板、validation/funding failureは除外する。同じmarketの同じJST日での
+張り直しは1 fact、別日は別day evidence。settlement/refund/voidやmutable title/options/channelの後日変更は
+成功済み参加を消さない。safe payloadは日ごとのdistinct board数とglobal board breadthだけで、amount/
+option/result/identity/exact timestampを出さない。No.69-72をSOURCE READY、No.73はrole-at-time待ちで
+BLOCKED。overallはREADY 63 / PARTIAL 6 / BLOCKED 22 / META 8。threshold/award/notification/backfillは無い。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

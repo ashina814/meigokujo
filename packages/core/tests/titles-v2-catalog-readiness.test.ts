@@ -291,13 +291,11 @@ describe("semantic false-positive再監査（casino participation vs completion�
     expect(entry.usableSources).toEqual(["casino_activity_days"]);
   });
 
-  it("No.69「何でもござれ」: completion proof不足はPR F2bで解消し、missing_manifestのみ残る", () => {
-    // manifestが未定義であることだけが残るblocker——completion半分（No.66/67と同根）は
-    // casino_completed_activity_daysの追加で解消した。
+  it("No.69「何でもござれ」: F2lのexplicit Edition-I manifestとcompletion sourceでREADY", () => {
     const entry = readinessFor(69);
-    expect(entry.status).toBe("BLOCKED");
-    expect(entry.blockerKinds).toEqual(["missing_manifest"]);
-    expect(entry.blockerKinds).not.toContain("source_semantic_mismatch");
+    expect(entry.status).toBe("READY");
+    expect(entry.usableSources).toEqual(["casino_edition_i_completion_safe"]);
+    expect(entry.blockerKinds).toEqual(["none"]);
   });
 });
 
@@ -369,10 +367,10 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
     }
   });
 
-  it("F2k後の実集計はREADY 59 / PARTIAL 6 / BLOCKED 26 / META 8", () => {
+  it("F2l後の実集計はREADY 63 / PARTIAL 6 / BLOCKED 22 / META 8", () => {
     const counts = new Map<string, number>();
     for (const entry of TITLE_V2_CATALOG_READINESS) counts.set(entry.status, (counts.get(entry.status) ?? 0) + 1);
-    expect(Object.fromEntries(counts)).toEqual({ READY: 59, BLOCKED: 26, PARTIAL: 6, META: 8 });
+    expect(Object.fromEntries(counts)).toEqual({ READY: 63, BLOCKED: 22, PARTIAL: 6, META: 8 });
   });
 
   it("source_semantic_mismatchはpublic provenance 3件を含む6件、missing_derived_sourceは7件", () => {
@@ -483,8 +481,8 @@ describe("PR F2g: public room activity safe source追加後のreadiness", () => 
     expect(entries.filter((entry) => entry.status === "BLOCKED")).toHaveLength(1);
   });
 
-  it("blocker実集計はF2k後missing_persisted_source 4、missing_role_history 7", () => {
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(4);
+  it("blocker実集計はF2l後missing_persisted_source 1、missing_role_history 7", () => {
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(1);
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_role_history"))).toHaveLength(7);
   });
 });
@@ -642,11 +640,10 @@ describe("PR F2b: casino completion source追加後のreadiness", () => {
     expect(entry.usableSources).not.toContain("casino_completed_activity_days");
   });
 
-  it("No.69はmissing_manifestのみ残りBLOCKEDのまま——source_semantic_mismatchは解消済み", () => {
+  it("No.69はF2lでmissing_manifestを解消しREADY", () => {
     const entry = readinessFor(69);
-    expect(entry.status).toBe("BLOCKED");
-    expect(entry.blockerKinds).toEqual(["missing_manifest"]);
-    expect(entry.blockerKinds).not.toContain("source_semantic_mismatch");
+    expect(entry.status).toBe("READY");
+    expect(entry.blockerKinds).toEqual(["none"]);
   });
 
   it("source_semantic_mismatch blockerはNo.58/66/67/69から外れ、依然残る候補にはそのまま残る", () => {
@@ -688,7 +685,7 @@ describe("PR F2j: exact invite-rooted safe source追加後のreadiness", () => {
     }
   });
 
-  it("Theme 15は6/6 READY、F2k後のpersisted/derived blockerは実集計4/7", () => {
+  it("Theme 15は6/6 READY、F2l後のpersisted/derived blockerは実集計1/7", () => {
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.no >= 74 && entry.no <= 79).map((entry) => entry.status)).toEqual([
       "READY",
       "READY",
@@ -697,7 +694,22 @@ describe("PR F2j: exact invite-rooted safe source追加後のreadiness", () => {
       "READY",
       "READY",
     ]);
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(4);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(1);
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(7);
+  });
+});
+
+describe("PR F2l: Edition-I / official table / standard market readiness", () => {
+  it("No.66–72は各canonical sourceでREADY、No.73だけrole-at-time待ち", () => {
+    for (let no = 66; no <= 72; no++) expect(readinessFor(no).status, `candidate #${no}`).toBe("READY");
+    expect(readinessFor(69).usableSources).toEqual(["casino_edition_i_completion_safe"]);
+    expect(readinessFor(70).usableSources).toEqual(["casino_table_activity_safe"]);
+    expect(readinessFor(71).usableSources).toEqual(["casino_table_activity_safe"]);
+    expect(readinessFor(72).usableSources).toEqual(["casino_market_activity_safe"]);
+    expect(readinessFor(73)).toMatchObject({
+      status: "BLOCKED",
+      usableSources: ["casino_activity_days", "casino_market_activity_safe"],
+      blockerKinds: ["missing_role_history"],
+    });
   });
 });

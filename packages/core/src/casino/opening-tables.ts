@@ -580,6 +580,13 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
     includeInPlanHash: false,
   }),
   T({
+    table: "casino_market_participation_history",
+    purpose: "Titles v2: immutable successful market participation commitments",
+    kind: "optional_feature", archive: false, resetOnApply: false, preserve: true,
+    blockerCondition: "none",
+    rationale: "market.ts. Formal-era neutral title history; settlement/refund/reset must not erase successful participation facts.",
+  }),
+  T({
     table: "casino_temp_vcs",
     purpose: "一時VC追跡（非資金）",
     kind: "optional_feature",
@@ -589,6 +596,20 @@ export const CASINO_TABLE_CLASSIFICATION: readonly CasinoTableClassification[] =
     preserve: false,
     blockerCondition: "該当なし（Discord実削除はR3相当・本PRはfake interfaceのみで実施しない）",
     rationale: "takutate.ts。行の初期化はDB内のみ。実際のDiscord VC削除は本PR範囲外",
+  }),
+  T({
+    table: "casino_table_instances",
+    purpose: "Titles v2: append-only official Takutate instance anchors",
+    kind: "optional_feature", archive: false, resetOnApply: false, preserve: true,
+    blockerCondition: "none",
+    rationale: "takutate.ts. Formal-era neutral title history; casino_temp_vcs deletion must not erase it.",
+  }),
+  T({
+    table: "casino_table_guest_presence",
+    purpose: "Titles v2: known-human official-table guest observation intervals",
+    kind: "optional_feature", archive: false, resetOnApply: false, preserve: true,
+    blockerCondition: "none",
+    rationale: "takutate.ts. Formal-era neutral title history with restart-unknown intervals excluded by the safe reader.",
   }),
   T({
     table: "casino_house_pnl",
