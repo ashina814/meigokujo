@@ -1930,7 +1930,24 @@ backfillを追加しない。詳細はreadiness §21参照。
 既存No.1/6/22は候補原文がpublic VCを要求するが、依存する`vc_visits`系sourceにpublic/private
 provenanceがない。F2iのuser-level time intervalでは各候補固有のempty-start/last-occupant/
 counterpart breadthを代替できないため、独立再監査でREADY→PARTIALへ補正する。現在の実集計は
-READY 51 / PARTIAL 6 / BLOCKED 34 / META 8。No.32-37は上記exact contractによりREADYを維持する。
+READY 55 / PARTIAL 6 / BLOCKED 30 / META 8。No.32-37は上記exact contractによりREADYを維持する。
+
+F2jは`invite_rooted_safe`を追加する。confirmed direct relationは既存`invites`、entry anchorは
+最古のappend-only `ghosted` event、public activityはcanonical TC same-surface exchange候補と
+trusted `vc_public_social_presence`だけを使う。`credited_at`、current `souls.ghost_at`、membership
+survival、hintからentry/activityを推測しない。immutable entry eventの無いlegacy relationはunknown。
+safe payloadはidentity/exact dateを落としたanonymous direct-branch profilesであり、各profile内に
+scope内later-JST-day activity分布、canonical child entryのbranch-relative JST day offsets、
+inviter↔inviteeだけのscope内later-day TC/VC reunion分布をjoint保持する。direct relation/entryは
+scope前でもhistorical contextとして使うが、fixed observedAtより後のconfirmation/eventは読まない。
+next-generationの`credited_at`はrelation visibilityだけに使い、late staff creditでchild historyを
+移動させない。各anonymous child occurrenceはentry day offsetに加え、entry timestampまででclipした
+same-day TC exchange / trusted VC union prefixを持つ。後段は完全な過去日activityとこのprefixを
+合わせるため、threshold未固定のままsame-JST-dayを含むroot-before-childをexactに判定できる。
+TCはexchange両端、VCは半開intervalをclipし、timestamp/identityは公開しない。これにより
+No.76-79をSOURCE READYへ再監査した。
+新persisted table、historical backfill、production threshold、award/notification/leaderboard/progress、
+Bot wiringは無い。
 
 ## 15. PR分割
 

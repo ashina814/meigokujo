@@ -24,6 +24,10 @@ import {
   computeSocialActivityTimeSafe,
   type SocialActivityTimeSafePayload,
 } from "../social-activity-time/derived.js";
+import {
+  computeInviteRootedSafe,
+  type InviteRootedSafePayload,
+} from "./v2-invite-rooted.js";
 
 /**
  * 称号ruleがraw DBを直接触らないようにするための、source読み込み境界。
@@ -94,6 +98,8 @@ export interface TextActiveDaysSourcePayload {
 export interface ConfirmedInvitesSourcePayload {
   readonly creditedAt: readonly number[];
 }
+
+export type InviteRootedSafeSourcePayload = InviteRootedSafePayload;
 
 /**
  * PR E2: amount・counterparty（from/to account）・reason・ref・approved_by・
@@ -190,6 +196,7 @@ export interface TitleSourcePayloads {
   social_activity_time_safe: SocialActivityTimeSafeSourcePayload;
   text_active_days: TextActiveDaysSourcePayload;
   confirmed_invites: ConfirmedInvitesSourcePayload;
+  invite_rooted_safe: InviteRootedSafeSourcePayload;
   economy_safe_peer_actions: EconomySafePeerActionsSourcePayload;
   public_event_participations: PublicEventParticipationsSourcePayload;
   public_event_completed_participations: PublicEventCompletedParticipationsSourcePayload;
@@ -564,6 +571,21 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
     return { payloads, readCalls };
   },
 
+  invite_rooted_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, InviteRootedSafeSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { profiles: [], unknownEntryAnchorCount: 0 });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return { payloads, readCalls: 0 };
+    const window = { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt };
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      for (const row of computeInviteRootedSafe(db, window, chunk)) payloads.set(row.userId, row.payload);
+    }
+    return { payloads, readCalls };
+  },
+
   economy_safe_peer_actions: (db, userIds, scope) => {
     const payloads = new Map<string, EconomySafePeerActionsSourcePayload>();
     for (const userId of userIds) payloads.set(userId, { facts: [] });
@@ -739,6 +761,7 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
     BULK_SOURCE_READERS.social_activity_time_safe(db, [userId], scope).payloads.get(userId)!,
   text_active_days: (db, userId, scope) => BULK_SOURCE_READERS.text_active_days(db, [userId], scope).payloads.get(userId)!,
   confirmed_invites: (db, userId, scope) => BULK_SOURCE_READERS.confirmed_invites(db, [userId], scope).payloads.get(userId)!,
+  invite_rooted_safe: (db, userId, scope) => BULK_SOURCE_READERS.invite_rooted_safe(db, [userId], scope).payloads.get(userId)!,
   economy_safe_peer_actions: (db, userId, scope) =>
     BULK_SOURCE_READERS.economy_safe_peer_actions(db, [userId], scope).payloads.get(userId)!,
   public_event_participations: (db, userId, scope) =>

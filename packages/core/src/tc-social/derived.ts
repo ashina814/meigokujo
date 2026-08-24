@@ -63,6 +63,16 @@ export interface TcSafeWindow {
  */
 export interface TcSocialExchangeCandidate {
   readonly createdAtMs: number;
+  /** subject messageより前のnearest other-human gap。prefix consumerが両端の成立時刻を証明するためのrestricted fact。 */
+  readonly priorOtherGapMs: number | null;
+  /** subject message以後のnearest other-human gap。同上。 */
+  readonly nextOtherGapMs: number | null;
+  readonly bestOtherGapMs: number | null;
+}
+
+interface TcSocialExchangeGapFact {
+  readonly priorOtherGapMs: number | null;
+  readonly nextOtherGapMs: number | null;
   readonly bestOtherGapMs: number | null;
 }
 
@@ -320,23 +330,27 @@ function nextOtherGaps(rows: readonly MessageRow[], authorId: string): ReadonlyM
   return result;
 }
 
-function nearestOtherGapByMessage(
+function nearestOtherGapsByMessage(
   ownRows: readonly MessageRow[],
   allRows: readonly MessageRow[],
   subjectId: string,
-): ReadonlyMap<string, number | null> {
-  const result = new Map<string, number | null>();
+): ReadonlyMap<string, TcSocialExchangeGapFact> {
+  const result = new Map<string, TcSocialExchangeGapFact>();
   const others = allRows.filter((row) => row.authorId !== subjectId);
   let cursor = 0;
   for (const own of ownRows) {
-    while (cursor + 1 < others.length && others[cursor + 1]!.createdAtMs <= own.createdAtMs) cursor += 1;
-    let best: number | null = null;
-    for (const candidate of [others[cursor], others[cursor + 1]]) {
-      if (!candidate) continue;
-      const gap = Math.abs(candidate.createdAtMs - own.createdAtMs);
-      best = best === null ? gap : Math.min(best, gap);
-    }
-    result.set(own.messageId, best);
+    while (cursor < others.length && others[cursor]!.createdAtMs < own.createdAtMs) cursor += 1;
+    const prior = cursor > 0 ? others[cursor - 1]! : null;
+    const next = cursor < others.length ? others[cursor]! : null;
+    const priorOtherGapMs = prior ? own.createdAtMs - prior.createdAtMs : null;
+    const nextOtherGapMs = next ? next.createdAtMs - own.createdAtMs : null;
+    const bestOtherGapMs =
+      priorOtherGapMs === null
+        ? nextOtherGapMs
+        : nextOtherGapMs === null
+          ? priorOtherGapMs
+          : Math.min(priorOtherGapMs, nextOtherGapMs);
+    result.set(own.messageId, { priorOtherGapMs, nextOtherGapMs, bestOtherGapMs });
   }
   return result;
 }
@@ -349,12 +363,12 @@ function socialExchangeGapsByMessage(
   ownRows: readonly MessageRow[],
   surfaces: ReadonlyMap<string, readonly MessageRow[]>,
   subjectId: string,
-): ReadonlyMap<string, number | null> {
-  const nearestByMessage = new Map<string, number | null>();
+): ReadonlyMap<string, TcSocialExchangeGapFact> {
+  const nearestByMessage = new Map<string, TcSocialExchangeGapFact>();
   const ownBySurface = groupRows(ownRows, (row) => row.surfaceId);
   for (const [surfaceId, surfaceOwnRows] of ownBySurface) {
-    const local = nearestOtherGapByMessage(surfaceOwnRows, surfaces.get(surfaceId) ?? [], subjectId);
-    for (const [messageId, gap] of local) nearestByMessage.set(messageId, gap);
+    const local = nearestOtherGapsByMessage(surfaceOwnRows, surfaces.get(surfaceId) ?? [], subjectId);
+    for (const [messageId, gaps] of local) nearestByMessage.set(messageId, gaps);
   }
   return nearestByMessage;
 }
@@ -488,7 +502,7 @@ function buildConversationPayload(
     // 別thread同士を時間的に近いだけでexchangeへ結び付けない。
     const bestByDate = new Map<string, number | null>();
     for (const own of ownRows) {
-      const best = socialExchangeGaps.get(own.messageId) ?? null;
+      const best = socialExchangeGaps.get(own.messageId)?.bestOtherGapMs ?? null;
       const date = dateFor(own.createdAtMs);
       const existing = bestByDate.get(date);
       if (existing === undefined || (best !== null && (existing === null || best < existing))) bestByDate.set(date, best);
@@ -607,7 +621,9 @@ export function computeTcSocialExchangeCandidates(
       userId,
       candidates: ownRows.map((row) => ({
         createdAtMs: row.createdAtMs,
-        bestOtherGapMs: gaps.get(row.messageId) ?? null,
+        priorOtherGapMs: gaps.get(row.messageId)?.priorOtherGapMs ?? null,
+        nextOtherGapMs: gaps.get(row.messageId)?.nextOtherGapMs ?? null,
+        bestOtherGapMs: gaps.get(row.messageId)?.bestOtherGapMs ?? null,
       })),
     };
   });

@@ -122,6 +122,7 @@ const TITLE_RESTRICTED_USES = [
   "public_room_safe_activity_classification",
   "tc_safe_social_classification",
   "public_social_presence_classification",
+  "invite_rooted_safe_classification",
 ] as const;
 export type TitleRestrictedUse = (typeof TITLE_RESTRICTED_USES)[number];
 const VALID_TITLE_RESTRICTED_USES: ReadonlySet<string> = new Set(TITLE_RESTRICTED_USES);
@@ -562,6 +563,77 @@ export const TITLE_SOURCES = {
     titleUsable: true,
     epochPolicy: { type: "point", at: "credited_at" },
     rawUnit: "confirmed_invite_credit",
+  },
+
+  // 同じconfirmed invites正本のinternal relation view。No.74/75用safe payloadとは分け、
+  // inviter↔invitee identityをinvite-rooted classifierのJOIN外へ出さない。
+  confirmed_invite_relations: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/entry/service.ts",
+      needle:
+        "INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES (?, ?, ?) ON CONFLICT(invitee_id) DO NOTHING",
+    },
+    calledFrom: {
+      file: "apps/bot/src/commands/entry.ts",
+      needle: "services.entry.ghostify(userId, actor, { inviteeGender: gender })",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "handleMemberRoleUpdate(oldMember, newMember, services)",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: true,
+    titleUsable: false,
+    restrictedUse: "invite_rooted_safe_classification",
+    epochPolicy: { type: "point", at: "credited_at" },
+    rawUnit: "confirmed_invite_relation_with_internal_inviter_invitee_identity",
+  },
+
+  // Entry.ghostify()がappend-only EventLogへ残したimmutable entry anchor。
+  // generic events rowはactor/target/payloadを含むため、safe ruleへ直接渡さない。
+  entry_ghosted_events: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/events/service.ts",
+      needle: "INSERT INTO events (type, actor_id, target_id, payload_json, created_at)",
+    },
+    calledFrom: {
+      file: "packages/core/src/entry/service.ts",
+      needle: 'this.events.log("ghosted", {',
+    },
+    wiredFrom: {
+      file: "apps/bot/src/commands/entry.ts",
+      needle: "services.entry.ghostify(userId, actor, { inviteeGender: gender })",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: true,
+    titleUsable: false,
+    restrictedUse: "invite_rooted_safe_classification",
+    epochPolicy: { type: "point", at: "created_at" },
+    rawUnit: "append_only_ghosted_entry_event_with_internal_target_identity",
+  },
+
+  invite_rooted_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-invite-rooted.ts",
+      needle: "export function computeInviteRootedSafe(",
+    },
+    derivedFrom: [
+      "confirmed_invite_relations",
+      "entry_ghosted_events",
+      "tc_message_observations",
+      "vc_public_social_presence",
+    ],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "anonymous_confirmed_direct_invite_rooted_network_reunion_distribution",
   },
 
   // ── Public Room Safe Activity Source（PR F2g）──────────────────────────────
