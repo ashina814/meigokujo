@@ -27,8 +27,13 @@ export interface InviteRootedSafeReunionDay {
 
 export interface InviteRootedSafeProfile {
   readonly activityDays: readonly InviteRootedSafeActivityDay[];
-  /** 同じanonymous direct branchから生まれたdistinct confirmed next-generation relation数。 */
-  readonly nextGenerationConfirmedCount: number;
+  /**
+   * branch entry JST dateを0とした、confirmed next-generation childのimmutable entry日差。
+   * rooted activityが先行したことは activity dayOffset < child offset だけでfail-closedに証明する。
+   */
+  readonly nextGenerationEntryDayOffsets: readonly number[];
+  /** confirmed child relationはあるがimmutable entry eventが無い件数。credited_at等では補わない。 */
+  readonly unknownNextGenerationEntryAnchorCount: number;
   readonly reunionDays: readonly InviteRootedSafeReunionDay[];
 }
 
@@ -48,6 +53,12 @@ export interface InviteRootedSafeWindow {
 interface DirectRelation {
   readonly subjectId: string;
   readonly inviteeId: string;
+}
+
+interface NextGenerationRelation {
+  readonly subjectId: string;
+  readonly branchId: string;
+  readonly childId: string;
 }
 
 interface TcMessageRow {
@@ -143,7 +154,6 @@ function intersectIntervals(left: readonly Interval[], right: readonly Interval[
 function loadDirectRelations(
   db: Database.Database,
   subjectIds: readonly string[],
-  start: number,
   effectiveEnd: number,
 ): DirectRelation[] {
   const relations: DirectRelation[] = [];
@@ -153,10 +163,10 @@ function loadDirectRelations(
       .prepare(
         `SELECT inviter_id, invitee_id FROM invites
           WHERE inviter_id IN (${placeholders})
-            AND credited_at >= ? AND credited_at < ?
+            AND credited_at < ?
           ORDER BY inviter_id, invitee_id`,
       )
-      .all(...chunk, start, effectiveEnd) as Array<{ inviter_id: string; invitee_id: string }>;
+      .all(...chunk, effectiveEnd) as Array<{ inviter_id: string; invitee_id: string }>;
     for (const row of rows) {
       if (!row.inviter_id || !row.invitee_id || row.inviter_id === row.invitee_id) continue;
       relations.push({ subjectId: row.inviter_id, inviteeId: row.invitee_id });
@@ -188,46 +198,40 @@ function loadEntryAnchors(
   return anchors;
 }
 
-function loadNextGenerationCounts(
+function loadNextGenerationRelations(
   db: Database.Database,
   relations: readonly DirectRelation[],
-  anchors: ReadonlyMap<string, number>,
-  start: number,
   effectiveEnd: number,
-): Map<string, Map<string, number>> {
+): NextGenerationRelation[] {
   const inviteeIds = unique(relations.map((relation) => relation.inviteeId));
   const childrenByInviter = new Map<string, Set<string>>();
   for (const chunk of chunks(inviteeIds)) {
     const placeholders = chunk.map(() => "?").join(",");
     const rows = db
       .prepare(
-        `SELECT inviter_id, invitee_id, credited_at FROM invites
+        `SELECT inviter_id, invitee_id FROM invites
           WHERE inviter_id IN (${placeholders})
-            AND credited_at >= ? AND credited_at < ?
+            AND credited_at < ?
           ORDER BY inviter_id, invitee_id`,
       )
-      .all(...chunk, start, effectiveEnd) as Array<{ inviter_id: string; invitee_id: string; credited_at: number }>;
+      .all(...chunk, effectiveEnd) as Array<{ inviter_id: string; invitee_id: string }>;
     for (const row of rows) {
       if (!row.inviter_id || !row.invitee_id || row.inviter_id === row.invitee_id) continue;
-      const inviterEntryAt = anchors.get(row.inviter_id);
-      if (inviterEntryAt === undefined || row.credited_at < inviterEntryAt) continue;
       const children = childrenByInviter.get(row.inviter_id) ?? new Set<string>();
       children.add(row.invitee_id);
       childrenByInviter.set(row.inviter_id, children);
     }
   }
 
-  const result = new Map<string, Map<string, number>>();
+  const result: NextGenerationRelation[] = [];
   for (const relation of relations) {
     const children = childrenByInviter.get(relation.inviteeId) ?? new Set<string>();
-    let count = 0;
     for (const childId of children) {
       // A→subjectはcycleでありnext generationではない。A→Aも上で除外済み。
-      if (childId !== relation.subjectId) count += 1;
+      if (childId !== relation.subjectId) {
+        result.push({ subjectId: relation.subjectId, branchId: relation.inviteeId, childId });
+      }
     }
-    const byInvitee = result.get(relation.subjectId) ?? new Map<string, number>();
-    byInvitee.set(relation.inviteeId, count);
-    result.set(relation.subjectId, byInvitee);
   }
   return result;
 }
@@ -435,12 +439,29 @@ export function computeInviteRootedSafe(
     return requested.map((userId) => ({ userId, payload: empty.get(userId)! }));
   }
 
-  const relations = loadDirectRelations(db, requested, window.start, window.effectiveEnd);
+  const relations = loadDirectRelations(db, requested, window.effectiveEnd);
   const inviteeIds = unique(relations.map((relation) => relation.inviteeId));
-  const anchors = loadEntryAnchors(db, inviteeIds, window.effectiveEnd);
+  const nextGenerationRelations = loadNextGenerationRelations(db, relations, window.effectiveEnd);
+  const childIds = unique(nextGenerationRelations.map((relation) => relation.childId));
+  const anchors = loadEntryAnchors(db, unique([...inviteeIds, ...childIds]), window.effectiveEnd);
   const activity = computeActivityDays(db, inviteeIds, anchors, window);
-  const nextGeneration = loadNextGenerationCounts(db, relations, anchors, window.start, window.effectiveEnd);
   const reunions = computeReunionDays(db, relations, anchors, window);
+
+  const nextGenerationByBranch = new Map<string, Map<string, { offsets: number[]; unknownCount: number }>>();
+  for (const relation of nextGenerationRelations) {
+    const branchEntryAt = anchors.get(relation.branchId);
+    if (branchEntryAt === undefined) continue;
+    const byBranch = nextGenerationByBranch.get(relation.subjectId) ?? new Map();
+    const aggregate = byBranch.get(relation.branchId) ?? { offsets: [], unknownCount: 0 };
+    const childEntryAt = anchors.get(relation.childId);
+    if (childEntryAt === undefined) aggregate.unknownCount += 1;
+    else aggregate.offsets.push(dayOffset(branchEntryAt, childEntryAt));
+    byBranch.set(relation.branchId, aggregate);
+    nextGenerationByBranch.set(relation.subjectId, byBranch);
+  }
+  for (const byBranch of nextGenerationByBranch.values()) {
+    for (const aggregate of byBranch.values()) aggregate.offsets.sort((a, b) => a - b);
+  }
 
   const profilesBySubject = new Map<string, InviteRootedSafeProfile[]>();
   const unknownBySubject = new Map<string, number>();
@@ -451,7 +472,10 @@ export function computeInviteRootedSafe(
     }
     const profile: InviteRootedSafeProfile = {
       activityDays: activity.get(relation.inviteeId) ?? [],
-      nextGenerationConfirmedCount: nextGeneration.get(relation.subjectId)?.get(relation.inviteeId) ?? 0,
+      nextGenerationEntryDayOffsets:
+        nextGenerationByBranch.get(relation.subjectId)?.get(relation.inviteeId)?.offsets ?? [],
+      unknownNextGenerationEntryAnchorCount:
+        nextGenerationByBranch.get(relation.subjectId)?.get(relation.inviteeId)?.unknownCount ?? 0,
       reunionDays: reunions.get(relation.subjectId)?.get(relation.inviteeId) ?? [],
     };
     const profiles = profilesBySubject.get(relation.subjectId) ?? [];

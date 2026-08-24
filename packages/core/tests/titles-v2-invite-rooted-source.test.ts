@@ -42,10 +42,10 @@ const RULE = defineTitleRule(
   { awardFactsVersion: 1, evaluate: () => ({ matched: false, earnedAt: null }) },
 );
 
-function setup() {
+function setup(systemEpoch = START) {
   const db = openDb(":memory:");
   const tc = new TcSocialObservations(db);
-  let clock = START;
+  let clock = systemEpoch;
   const store = new TitleV2Store(db, () => clock);
   store.applyCatalog({ catalogKey: "test", actor: "setup" });
   clock = END;
@@ -140,19 +140,28 @@ describe("invite_rooted_safe exact semantics", () => {
     rooted.ghosted("branch");
     rooted.exchange("root-day1", "branch", ENTRY + DAY);
     rooted.exchange("root-day3", "branch", ENTRY + 3 * DAY);
-    rooted.invite("branch", "child", ENTRY + 4 * DAY);
+    rooted.ghosted("child", ENTRY + 4 * DAY);
+    rooted.invite("branch", "child", ENTRY + 4 * DAY + 1);
     const rootedProfile = rooted.read().profiles[0]!;
     expect(rootedProfile.activityDays).toHaveLength(2);
-    expect(rootedProfile.nextGenerationConfirmedCount).toBe(1);
+    expect(rootedProfile.nextGenerationEntryDayOffsets).toEqual([4]);
+    expect(rootedProfile.unknownNextGenerationEntryAnchorCount).toBe(0);
 
     const inactive = setup();
     inactive.invite("subject", "branch");
     inactive.ghosted("branch");
-    inactive.invite("branch", "child", ENTRY + 4 * DAY);
+    inactive.ghosted("child", ENTRY + 4 * DAY);
+    inactive.invite("branch", "child", ENTRY + 4 * DAY + 1);
     const inactiveProfile = inactive.read().profiles[0]!;
-    expect(inactiveProfile.nextGenerationConfirmedCount).toBe(1);
+    expect(inactiveProfile.nextGenerationEntryDayOffsets).toEqual([4]);
     expect(inactiveProfile.activityDays).toEqual([]);
-    expect(inactive.read().profiles.filter((profile) => profile.activityDays.length >= 2 && profile.nextGenerationConfirmedCount > 0)).toEqual([]);
+    expect(
+      inactive.read().profiles.filter((profile) =>
+        profile.nextGenerationEntryDayOffsets.some(
+          (childOffset) => profile.activityDays.filter((day) => day.dayOffset < childOffset).length >= 2,
+        ),
+      ),
+    ).toEqual([]);
   });
 
   it("K–L: 子の多さはone branchのまま、別々のdirect branchesだけbreadthを増やす", () => {
@@ -160,11 +169,12 @@ describe("invite_rooted_safe exact semantics", () => {
     one.invite("subject", "branch");
     one.ghosted("branch");
     one.exchange("one-root", "branch", ENTRY + DAY);
-    one.invite("branch", "child-1", ENTRY + 2 * DAY);
-    one.invite("branch", "child-2", ENTRY + 3 * DAY);
-    one.invite("branch", "child-3", ENTRY + 4 * DAY);
+    for (const [child, day] of [["child-1", 2], ["child-2", 3], ["child-3", 4]] as const) {
+      one.ghosted(child, ENTRY + day * DAY);
+      one.invite("branch", child, ENTRY + day * DAY + 1);
+    }
     expect(one.read().profiles).toHaveLength(1);
-    expect(one.read().profiles[0]!.nextGenerationConfirmedCount).toBe(3);
+    expect(one.read().profiles[0]!.nextGenerationEntryDayOffsets).toEqual([2, 3, 4]);
 
     const many = setup();
     for (const [branch, child, day] of [
@@ -174,19 +184,21 @@ describe("invite_rooted_safe exact semantics", () => {
       many.invite("subject", branch);
       many.ghosted(branch);
       many.exchange(`root-${branch}`, branch, ENTRY + DAY);
-      many.invite(branch, child, ENTRY + day * DAY);
+      many.ghosted(child, ENTRY + day * DAY);
+      many.invite(branch, child, ENTRY + day * DAY + 1);
     }
     expect(many.read().profiles).toHaveLength(2);
-    expect(many.read().profiles.map((profile) => profile.nextGenerationConfirmedCount)).toEqual([1, 1]);
+    expect(many.read().profiles.map((profile) => profile.nextGenerationEntryDayOffsets)).toEqual([[2], [3]]);
   });
 
   it("M: cycle/selfをnext generationへ数えず、DBのconfirmed relation uniquenessを維持する", () => {
     const { db, invite, ghosted, read } = setup();
     invite("subject", "branch");
     ghosted("branch");
+    ghosted("pre-entry-child", ENTRY - DAY);
     invite("branch", "pre-entry-child", ENTRY - 1);
     invite("branch", "subject", ENTRY + DAY);
-    expect(read().profiles[0]!.nextGenerationConfirmedCount).toBe(0);
+    expect(read().profiles[0]!.nextGenerationEntryDayOffsets).toEqual([-1]);
     expect(() => invite("someone-else", "branch", ENTRY + 2 * DAY)).toThrow(/UNIQUE/);
     db.prepare("INSERT INTO invites (inviter_id, invitee_id, credited_at) VALUES ('self', 'self', ?)").run(ENTRY + 3 * DAY);
     expect(read("self")).toEqual({ profiles: [], unknownEntryAnchorCount: 0 });
@@ -264,6 +276,153 @@ describe("invite_rooted_safe exact semantics", () => {
     expect(read("subject", snapshot + 2).profiles).toHaveLength(2);
   });
 
+  it("V: pre-scope direct relation/entryをcontextとして保持し、scope内activityだけをprofile化する", () => {
+    const { invite, ghosted, exchange, read } = setup(ENTRY + 10 * DAY);
+    ghosted("branch", ENTRY);
+    invite("subject", "branch", ENTRY + 1);
+    exchange("scope-day12", "branch", ENTRY + 12 * DAY);
+    exchange("scope-day15", "branch", ENTRY + 15 * DAY);
+
+    expect(read().profiles[0]!.activityDays.map((day) => day.dayOffset)).toEqual([12, 15]);
+  });
+
+  it("W: pre-scope direct relation/entryでもscope内pair reunionを保持する", () => {
+    const { invite, ghosted, message, read } = setup(ENTRY + 10 * DAY);
+    ghosted("branch", ENTRY);
+    invite("subject", "branch", ENTRY + 1);
+    message("reunion-subject", "subject", ENTRY + 12 * DAY, "shared-surface");
+    message("reunion-branch", "branch", ENTRY + 12 * DAY + 7, "shared-surface");
+
+    expect(read().profiles[0]!.reunionDays).toEqual([
+      { dayOffset: 12, tcBestPairGapMs: 7_000, vcTrustedPairSeconds: 0 },
+    ]);
+  });
+
+  it("X: relation contextがpre-scopeでもactivity/reunion evidence自体はscope startでclipする", () => {
+    const { invite, ghosted, exchange, message, read } = setup(ENTRY + 10 * DAY);
+    ghosted("branch", ENTRY);
+    invite("subject", "branch", ENTRY + 1);
+    exchange("before-scope", "branch", ENTRY + 2 * DAY);
+    message("before-reunion-subject", "subject", ENTRY + 3 * DAY, "shared-surface");
+    message("before-reunion-branch", "branch", ENTRY + 3 * DAY + 5, "shared-surface");
+
+    expect(read().profiles[0]).toMatchObject({ activityDays: [], reunionDays: [] });
+  });
+
+  it("Y: childの実entryがrooted activityより先ならlate staff creditでcascadeへ反転しない", () => {
+    const { invite, ghosted, exchange, read } = setup();
+    ghosted("branch", ENTRY);
+    invite("subject", "branch", ENTRY + 1);
+    ghosted("child", ENTRY + 2 * DAY);
+    exchange("root-day4", "branch", ENTRY + 4 * DAY);
+    exchange("root-day6", "branch", ENTRY + 6 * DAY);
+    invite("branch", "child", ENTRY + 8 * DAY);
+
+    const profile = read().profiles[0]!;
+    expect(profile.nextGenerationEntryDayOffsets).toEqual([2]);
+    expect(profile.activityDays.map((day) => day.dayOffset)).toEqual([4, 6]);
+    expect(profile.activityDays.filter((day) => day.dayOffset < profile.nextGenerationEntryDayOffsets[0]!).length).toBe(0);
+  });
+
+  it("Z: branchが先にrootedし、その後にcanonical child entryがあるchronologyを表現する", () => {
+    const { invite, ghosted, exchange, read } = setup();
+    ghosted("branch", ENTRY);
+    invite("subject", "branch", ENTRY + 1);
+    exchange("root-day1", "branch", ENTRY + DAY);
+    exchange("root-day3", "branch", ENTRY + 3 * DAY);
+    ghosted("child", ENTRY + 5 * DAY);
+    invite("branch", "child", ENTRY + 7 * DAY);
+
+    const profile = read().profiles[0]!;
+    expect(profile.nextGenerationEntryDayOffsets).toEqual([5]);
+    expect(profile.activityDays.map((day) => day.dayOffset)).toEqual([1, 3]);
+  });
+
+  it("AA: child-before-rootとroot-before-childをsafe payloadだけで区別できる", () => {
+    const { invite, ghosted, exchange, read } = setup();
+    for (const branch of ["child-first", "root-first"]) {
+      ghosted(branch, ENTRY);
+      invite("subject", branch, ENTRY + 1);
+    }
+    ghosted("early-child", ENTRY + DAY);
+    invite("child-first", "early-child", ENTRY + 4 * DAY);
+    exchange("child-first-root", "child-first", ENTRY + 3 * DAY);
+    exchange("root-first-root", "root-first", ENTRY + DAY);
+    ghosted("later-child", ENTRY + 3 * DAY);
+    invite("root-first", "later-child", ENTRY + 4 * DAY);
+
+    expect(
+      read().profiles.map((profile) => ({
+        activity: profile.activityDays.map((day) => day.dayOffset),
+        children: profile.nextGenerationEntryDayOffsets,
+      })),
+    ).toEqual([
+      { activity: [1], children: [3] },
+      { activity: [3], children: [1] },
+    ]);
+  });
+
+  it("AB: future thresholdはnext-generation entryより前のrooted daysだけでqualifying branchを数えられる", () => {
+    const { invite, ghosted, exchange, read } = setup();
+    for (const branch of ["qualifying", "too-late"]) {
+      ghosted(branch, ENTRY);
+      invite("subject", branch, ENTRY + 1);
+    }
+    exchange("qualifying-day1", "qualifying", ENTRY + DAY);
+    exchange("qualifying-day2", "qualifying", ENTRY + 2 * DAY);
+    ghosted("qualifying-child", ENTRY + 4 * DAY);
+    invite("qualifying", "qualifying-child", ENTRY + 5 * DAY);
+    ghosted("too-late-child", ENTRY + DAY);
+    invite("too-late", "too-late-child", ENTRY + 5 * DAY);
+    exchange("too-late-day2", "too-late", ENTRY + 2 * DAY);
+    exchange("too-late-day3", "too-late", ENTRY + 3 * DAY);
+
+    // 2日はfixture上のcalibration例。source自身は閾値を固定しない。
+    const qualifying = read().profiles.filter((profile) =>
+      profile.nextGenerationEntryDayOffsets.some(
+        (childOffset) => profile.activityDays.filter((day) => day.dayOffset < childOffset).length >= 2,
+      ),
+    );
+    expect(qualifying).toHaveLength(1);
+    expect(qualifying[0]!.nextGenerationEntryDayOffsets).toEqual([4]);
+  });
+
+  it("AC: child immutable entry event欠如をcredited_at/current soulから推測しない", () => {
+    const { db, invite, ghosted, read } = setup();
+    ghosted("branch", ENTRY);
+    invite("subject", "branch", ENTRY + 1);
+    invite("branch", "legacy-child", ENTRY + 4 * DAY);
+    db.prepare("INSERT INTO souls (user_id, status, joined_at, ghost_at, updated_at) VALUES ('legacy-child', 'ghost', ?, ?, ?)").run(
+      ENTRY + 2 * DAY,
+      ENTRY + 3 * DAY,
+      ENTRY + 4 * DAY,
+    );
+
+    expect(read().profiles[0]).toMatchObject({
+      nextGenerationEntryDayOffsets: [],
+      unknownNextGenerationEntryAnchorCount: 1,
+    });
+  });
+
+  it("AD: fixed observedAtより後にconfirmされたdirect relationはそのsnapshotへ出さない", () => {
+    const { invite, ghosted, exchange, read } = setup();
+    const snapshot = ENTRY + 2 * DAY;
+    ghosted("branch", ENTRY);
+    exchange("known-activity", "branch", ENTRY + DAY);
+    invite("subject", "branch", snapshot + 1);
+
+    expect(read("subject", snapshot)).toEqual({ profiles: [], unknownEntryAnchorCount: 0 });
+    expect(read("subject", snapshot + 2).profiles[0]!.activityDays.map((day) => day.dayOffset)).toEqual([1]);
+  });
+
+  it("AE: No.74/75 confirmed_invitesはpre-scope relationを引き続き除外する", () => {
+    const { db, invite, scope } = setup(ENTRY + 10 * DAY);
+    invite("subject", "before-scope", ENTRY + 1);
+    invite("subject", "inside-scope", ENTRY + 12 * DAY);
+
+    expect(readTitleSource(db, "confirmed_invites", "subject", scope()).creditedAt).toEqual([ENTRY + 12 * DAY]);
+  });
+
   it("S: safe payloadはidentity/exact date/timestampを出さず全階層をdeep-freezeする", () => {
     const { invite, ghosted, exchange, read } = setup();
     invite("subject-secret-marker", "branch-secret-marker");
@@ -275,7 +434,14 @@ describe("invite_rooted_safe exact semantics", () => {
       expect(json).not.toContain(marker);
     }
     expect(json).not.toMatch(/user_?id|invitee|inviter|surface|channel|guild|created_at|credited_at|entry_at/i);
-    for (const value of [payload, payload.profiles, payload.profiles[0], payload.profiles[0]!.activityDays, payload.profiles[0]!.activityDays[0]]) {
+    for (const value of [
+      payload,
+      payload.profiles,
+      payload.profiles[0],
+      payload.profiles[0]!.activityDays,
+      payload.profiles[0]!.activityDays[0],
+      payload.profiles[0]!.nextGenerationEntryDayOffsets,
+    ]) {
       expect(Object.isFrozen(value)).toBe(true);
     }
     expect(() => ((payload.profiles[0]!.activityDays[0] as { dayOffset: number }).dayOffset = 99)).toThrow();

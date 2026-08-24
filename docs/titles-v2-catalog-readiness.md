@@ -1110,6 +1110,14 @@ target_id=invitee)`。`souls.ghost_at`、`joined_at`、current status/member sta
 `unknownEntryAnchorCount`へ畳んでprofileを生成しない。sidecar/tableもhistorical inferred
 backfillも追加していない。
 
+F2jではdirect relationはscope内behaviorを分類するhistorical contextであるため、
+`credited_at < effectiveEnd`ならscope startより前のrelationも読む。entry anchorも同様に
+pre-scopeでよい。一方、TC/VC activityとpair reunionそのものは常に
+`[scope.start, effectiveEnd)`へclipする。fixed `observedAt`より後のcreditは見えず、creditが
+snapshot内へ入った後はstaffがhistorically正しいとconfirmしたrelationとして、既に観測済みの
+scope内activityへ結び付ける。これはinvite成立自体を数えるNo.74/75の`confirmed_invites`
+（`credited_at >= scope.start`）とは意図的に別のsource semanticsである。
+
 ### 22.2 exact public activity / rooted semantics
 
 「rooted」はmembership survivalではない。confirmed direct inviteeについて、exact entry
@@ -1128,12 +1136,19 @@ calibrationを可能にする。同日大量活動は1 day profileのままで�
 
 ### 22.3 network branchとpair-specific reunion
 
-profile 1件はconfirmed direct invitee 1人に対応するanonymous branch 1本であり、その同じ
-profileにrooted activity分布と`nextGenerationConfirmedCount`を持つ。従ってNo.77は後段で
-「rootedを満たすprofileかつnext generation > 0」をexactに判定できる。No.78も
-qualifying profile数を数えるため、A→X,Y,Z,Qは1 branch、A→X / B→Yは2 branchesとなる。
-child relationは`invites`のunique confirmed edgeだけを使い、self/cycleを除外する。
-branch自身のcanonical entryより前にcreditedされたedgeもnext generationには使わない。
+profile 1件はconfirmed direct invitee 1人に対応するanonymous branch 1本である。child relationの
+正本は`invites`のunique confirmed edgeだが、next-generation occurrenceはchild自身の最古の
+immutable `ghosted` eventとする。staffの後追い`credited_at`はrelationがsnapshotで可視かだけを
+決め、childの実entry historyを後ろへ移動させない。child anchorが無いrelationは
+`unknownNextGenerationEntryAnchorCount`へ畳み、current stateやcredit時刻から補完しない。
+
+同じprofileにrooted activity分布と、branch entry JST dateを0とした各child entryの
+`nextGenerationEntryDayOffsets`を保持する。将来のthreshold ruleは、あるchild offset `N`に対し
+`activityDays.dayOffset < N`の分布だけでrooted条件を評価する。このstrict inequalityにより
+root-before-childをthreshold固定なしで証明し、same-day内の順序はfail-closedに不採用とする。
+negative/zero offsetも落とさないため、child-before-rootとroot-before-childをsafe payload上で
+区別できる。No.78はこの条件を満たすprofile数を数えるため、A→X,Y,Z,Qは1 branch、
+A→X / B→Yは2 branchesとなる。self/cycleは除外する。
 
 No.79の`reunionDays`はinviterとそのconfirmed direct inviteeのidentityをrestricted derived
 内部でだけJOINする。TCは両者のsame-surface message間の最小gap、VCは両者の同一canonical
@@ -1149,7 +1164,8 @@ safe payloadは次のidentity-free shapeだけを返す。
 {
   profiles: Array<{
     activityDays: Array<{ dayOffset; tcBestOtherGapMs; vcTrustedSocialSeconds }>;
-    nextGenerationConfirmedCount;
+    nextGenerationEntryDayOffsets: number[];
+    unknownNextGenerationEntryAnchorCount: number;
     reunionDays: Array<{ dayOffset; tcBestPairGapMs; vcTrustedPairSeconds }>;
   }>;
   unknownEntryAnchorCount;
@@ -1158,8 +1174,9 @@ safe payloadは次のidentity-free shapeだけを返す。
 
 invitee/child/counterpart/message/surface/channel/guild identity、exact date/timestamp、invite code、
 raw permission/member stateは出さない。profilesはsanitized内容のcanonical順にsortする。
-fixed `observedAt`ではrelation/event/TC observationとVC trusted intervalをそのsnapshotの
-effective endでclipし、後のcurrent soul/member変更で過去payloadを書き換えない。
+fixed `observedAt`ではrelation confirmationとentry eventをそのsnapshotより前だけから読み、
+TC observationとVC trusted intervalはさらにscope startでもclipする。後のcurrent soul/member
+変更で過去payloadを書き換えない。
 
 新persisted source・write path・Bot/onboarding wiringは無い。derived read failureが
 Entry/`creditInvite()`を止める経路は存在せず、bulk readerは300 subjectごと、internal
@@ -1167,7 +1184,8 @@ participantsも300 IDごとにchunkする。historical backfill、production thr
 notification、leaderboard、progress UIは追加しない。Theme 15はoptimizationRisk: HIGHを
 維持する。
 
-No.74/75は既存`confirmed_invites`のままREADY。No.76はlater-day public activity分布、No.77は
-同じrooted branchとnext-generation edgeのjoint profile、No.78はdistinct qualifying profile
-breadth、No.79はlater-day pair-specific public reunionをexactに表現できるためREADY。
+No.74/75は既存`confirmed_invites`のままREADY。No.76はpre-scope relation contextとscope内
+later-day public activity分布、No.77は同じrooted branch内のactivityとcanonical child entryの
+chronology、No.78はroot-before-childを満たすdistinct profile breadth、No.79はscope内later-day
+pair-specific public reunionをexactに表現できるためREADY。
 実集計はREADY 55 / PARTIAL 6 / BLOCKED 30 / META 8。

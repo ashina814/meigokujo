@@ -1937,9 +1937,14 @@ F2jは`invite_rooted_safe`を追加する。confirmed direct relationは既存`i
 trusted `vc_public_social_presence`だけを使う。`credited_at`、current `souls.ghost_at`、membership
 survival、hintからentry/activityを推測しない。immutable entry eventの無いlegacy relationはunknown。
 safe payloadはidentity/exact dateを落としたanonymous direct-branch profilesであり、各profile内に
-later-JST-day activity分布、confirmed next-generation数、inviter↔inviteeだけのlater-day TC/VC
-reunion分布をjoint保持する。これによりNo.76-79をSOURCE READYへ再監査した。新persisted table、
-historical backfill、production threshold、award/notification/leaderboard/progress、Bot wiringは無い。
+scope内later-JST-day activity分布、canonical child entryのbranch-relative JST day offsets、
+inviter↔inviteeだけのscope内later-day TC/VC reunion分布をjoint保持する。direct relation/entryは
+scope前でもhistorical contextとして使うが、fixed observedAtより後のconfirmation/eventは読まない。
+next-generationの`credited_at`はrelation visibilityだけに使い、late staff creditでchild historyを
+移動させない。後段はactivity day offset < child entry offsetだけを使うため、threshold未固定のまま
+root-before-childをfail-closedに判定できる。これによりNo.76-79をSOURCE READYへ再監査した。
+新persisted table、historical backfill、production threshold、award/notification/leaderboard/progress、
+Bot wiringは無い。
 
 ## 15. PR分割
 
