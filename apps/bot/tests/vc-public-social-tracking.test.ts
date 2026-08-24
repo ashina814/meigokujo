@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { Collection, ChannelType, PermissionFlagsBits, PermissionsBitField } from "discord.js";
 import { describe, expect, it, vi } from "vitest";
 import { openDb, Settings, VcPublicSocialPresence } from "@meigokujo/core";
@@ -5,6 +6,10 @@ import type { Services } from "../src/services.js";
 import {
   initializeVcPublicSocialPresence,
   isEligiblePublicSocialVoiceChannel,
+  resumeVcPublicSocialGuild,
+  resumeVcPublicSocialShard,
+  suspendVcPublicSocialGuild,
+  suspendVcPublicSocialShard,
   trackVcPublicSocialChannelUpdate,
   trackVcPublicSocialEveryoneRoleUpdate,
   trackVcPublicSocialPresence,
@@ -23,6 +28,7 @@ function guild(id = "guild-main") {
   const everyone = { id: `${id}-everyone` };
   return {
     id,
+    shardId: 0,
     roles: { everyone },
     channels: { cache: new Collection<string, never>() },
   };
@@ -69,6 +75,10 @@ function state(value: ReturnType<typeof channel> | null) {
 
 function rows(db: ReturnType<typeof openDb>) {
   return db.prepare("SELECT user_id, channel_id, started_at, ended_at, end_quality FROM vc_public_social_presence ORDER BY id").all() as Array<Record<string, unknown>>;
+}
+
+function clientWith(owner: ReturnType<typeof guild>) {
+  return { guilds: { cache: new Collection([[owner.id, owner]]), fetch: vi.fn() } };
 }
 
 describe("public VC eligibility", () => {
@@ -186,15 +196,148 @@ describe("permission transitions / restart / isolation", () => {
     expect(rows(db)).toHaveLength(2);
   });
 
-  it("sidecar writer failureをcatchし既存voice処理へthrowしない", () => {
+  it("T: sidecar writer failureをcatchしvc_segments/XP/rooms相当の既存consumerへthrowしない", () => {
     const { services } = setup();
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const legacy = vi.fn();
+    const legacyVcSegments = vi.fn();
+    const rankXp = vi.fn();
+    const rooms = vi.fn();
     vi.spyOn(services.vcPublicSocial, "reconcileChannel").mockImplementation(() => { throw new Error("disk failed"); });
     expect(trackVcPublicSocialPresence(state(null), state(channel({ humans: ["alice", "bob"] })), services, () => 10)).toBe(false);
-    legacy();
-    expect(legacy).toHaveBeenCalledOnce();
-    expect(error).toHaveBeenCalledWith("[vc-public-social] voice observation failed", expect.any(Error));
+    legacyVcSegments();
+    rankXp();
+    rooms();
+    expect(legacyVcSegments).toHaveBeenCalledOnce();
+    expect(rankXp).toHaveBeenCalledOnce();
+    expect(rooms).toHaveBeenCalledOnce();
+    expect(error).toHaveBeenCalledWith("[vc-public-social] channel observation write failed", expect.any(Error));
     error.mockRestore();
+  });
+});
+
+describe("Gateway observation trust boundary", () => {
+  it("recoverable/unrecoverable/fresh-ready/guild availability eventを全てlive wiringする", () => {
+    const source = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+    for (const needle of [
+      "Events.ShardReconnecting",
+      "Events.ShardDisconnect",
+      "Events.ShardResume",
+      "Events.ShardReady",
+      "Events.GuildUnavailable",
+      "Events.GuildAvailable",
+    ]) expect(source).toContain(needle);
+  });
+
+  it("P: disconnect中のVoiceState replayを無視し、disconnect〜resumeをtrustedにしない", () => {
+    const { db, services } = setup();
+    const owner = guild();
+    const voice = channel({ guild: owner, humans: ["alice", "bob"] });
+    const client = clientWith(owner);
+    trackVcPublicSocialPresence(state(null), state(voice), services, () => 10);
+    expect(suspendVcPublicSocialShard(client as never, 0, services, () => 20)).toBe(true);
+    voice.members.delete("bob");
+    expect(trackVcPublicSocialPresence(state(voice), state(null), services, () => 30)).toBe(false);
+    expect(resumeVcPublicSocialShard(client as never, 0, services, () => 40)).toBe(true);
+    expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 10, ended_at: 20, end_quality: "observed" },
+    ]);
+  });
+
+  it("Q: resume時にhuman 2人ならresume observationからだけ新規openする", () => {
+    const { db, services } = setup();
+    const owner = guild();
+    const voice = channel({ guild: owner, humans: ["alice"] });
+    const client = clientWith(owner);
+    trackVcPublicSocialPresence(state(null), state(voice), services, () => 10);
+    suspendVcPublicSocialShard(client as never, 0, services, () => 20);
+    voice.members.set("bob", { id: "bob", user: { bot: false } });
+    trackVcPublicSocialPresence(state(voice), state(voice), services, () => 30);
+    resumeVcPublicSocialShard(client as never, 0, services, () => 40);
+    expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 40, ended_at: null, end_quality: null },
+    ]);
+  });
+
+  it("R: resume時にhuman 1人ならstale intervalを継続しない", () => {
+    const { db, services } = setup();
+    const owner = guild();
+    const voice = channel({ guild: owner, humans: ["alice", "bob"] });
+    const client = clientWith(owner);
+    trackVcPublicSocialPresence(state(null), state(voice), services, () => 10);
+    suspendVcPublicSocialShard(client as never, 0, services, () => 20);
+    voice.members.delete("bob");
+    resumeVcPublicSocialShard(client as never, 0, services, () => 40);
+    expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 10, ended_at: 20, end_quality: "observed" },
+    ]);
+  });
+
+  it("fresh readyとguild unavailable→availableもcurrent cache時点からだけ再開する", () => {
+    const { db, services } = setup();
+    const owner = guild();
+    const voice = channel({ guild: owner, humans: ["alice", "bob"] });
+    const client = clientWith(owner);
+    trackVcPublicSocialPresence(state(null), state(voice), services, () => 10);
+    suspendVcPublicSocialGuild(owner as never, services, () => 20);
+    voice.members.clear();
+    resumeVcPublicSocialGuild(owner as never, services, () => 30);
+    suspendVcPublicSocialShard(client as never, 0, services, () => 40);
+    voice.members.set("alice", { id: "alice", user: { bot: false } });
+    voice.members.set("bob", { id: "bob", user: { bot: false } });
+    resumeVcPublicSocialShard(client as never, 0, services, () => 50);
+    expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 10, ended_at: 20, end_quality: "observed" },
+      { user_id: "alice", channel_id: "voice-public", started_at: 50, ended_at: null, end_quality: null },
+    ]);
+  });
+});
+
+describe("writer failure trust boundary", () => {
+  it("S: close write failure中は次の正常reconcileまでopen rowをtrustedに伸ばさない", () => {
+    const { db, services } = setup();
+    const voice = channel({ humans: ["alice", "bob"] });
+    trackVcPublicSocialPresence(state(null), state(voice), services, () => 10);
+    voice.members.delete("bob");
+    vi.spyOn(services.vcPublicSocial, "reconcileChannel").mockImplementationOnce(() => {
+      throw new Error("transient write failure");
+    });
+    expect(trackVcPublicSocialPresence(state(voice), state(null), services, () => 20)).toBe(false);
+    expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 10, ended_at: 20, end_quality: "observed" },
+    ]);
+    expect(trackVcPublicSocialPresence(state(voice), state(null), services, () => 30)).toBe(true);
+    expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 10, ended_at: 20, end_quality: "observed" },
+    ]);
+  });
+
+  it("pending live observationを次の成功時にatomic replayし、確実な活動を不要に捨てない", () => {
+    const { db, services } = setup();
+    const voice = channel({ humans: ["alice", "bob"] });
+    const original = services.vcPublicSocial.reconcileChannel.bind(services.vcPublicSocial);
+    vi.spyOn(services.vcPublicSocial, "reconcileChannel")
+      .mockImplementationOnce(() => { throw new Error("transient write failure"); })
+      .mockImplementation(original);
+    trackVcPublicSocialPresence(state(null), state(voice), services, () => 10);
+    expect(rows(db)).toEqual([]);
+    expect(trackVcPublicSocialPresence(state(voice), state(voice), services, () => 20)).toBe(true);
+    expect(rows(db).filter((row) => row.user_id === "alice")).toEqual([
+      { user_id: "alice", channel_id: "voice-public", started_at: 10, ended_at: null, end_quality: null },
+    ]);
+  });
+
+  it("U: 一つのchannel failureでも無関係なpublic VCは正常に記録する", () => {
+    const { db, services } = setup();
+    const owner = guild();
+    const broken = channel({ id: "broken", guild: owner, humans: ["alice", "bob"] });
+    const healthy = channel({ id: "healthy", guild: owner, humans: ["carol", "dave"] });
+    const original = services.vcPublicSocial.reconcileChannel.bind(services.vcPublicSocial);
+    vi.spyOn(services.vcPublicSocial, "reconcileChannel").mockImplementation((input) => {
+      if (input.channelId === "broken") throw new Error("broken source");
+      return original(input);
+    });
+    expect(trackVcPublicSocialChannelUpdate(broken as never, services, () => 10)).toBe(false);
+    expect(trackVcPublicSocialChannelUpdate(healthy as never, services, () => 10)).toBe(true);
+    expect(rows(db).map((row) => row.channel_id)).toEqual(["healthy", "healthy"]);
   });
 });

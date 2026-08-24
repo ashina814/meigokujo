@@ -302,11 +302,13 @@ describe("semantic false-positive再監査（casino participation vs completion�
 });
 
 describe("PR F2f: VC social breadthのJST日次分布追加後のreadiness", () => {
-  it("No.22「顔馴染み」はdistinctCoPresentUsersだけで意味を満たすためREADYのまま", () => {
-    // semanticSpecが時間的な広がりを要求しない（「成立する」であって
-    // 「複数日に広がる」ではない）ため、単一windowの累積distinct数で十分。
+  it("No.22はbreadthを持つがpublic provenanceがないためPARTIAL", () => {
     const entry = readinessFor(22);
-    expect(entry.status).toBe("READY");
+    expect(entry).toMatchObject({
+      status: "PARTIAL",
+      usableSources: ["vc_social_safe"],
+      blockerKinds: ["source_semantic_mismatch"],
+    });
   });
 
   it("No.23-25はglobal distinct + dailyBreadth + date spanで時間的持続性を表現できるためREADY", () => {
@@ -341,7 +343,7 @@ describe("PR F2f: VC social breadthのJST日次分布追加後のreadiness", () 
     });
   });
 
-  it("Theme 7はREADY 4 / PARTIAL 0 / BLOCKED 2、Theme 8はREADY 1 / PARTIAL 2 / BLOCKED 1", () => {
+  it("Theme 7はREADY 3 / PARTIAL 1 / BLOCKED 2、Theme 8はREADY 1 / PARTIAL 2 / BLOCKED 1", () => {
     const counts = (start: number, end: number) => {
       const result = { READY: 0, PARTIAL: 0, BLOCKED: 0 };
       for (const entry of TITLE_V2_CATALOG_READINESS.filter((candidate) => candidate.no >= start && candidate.no <= end)) {
@@ -349,7 +351,7 @@ describe("PR F2f: VC social breadthのJST日次分布追加後のreadiness", () 
       }
       return result;
     };
-    expect(counts(22, 27)).toEqual({ READY: 4, PARTIAL: 0, BLOCKED: 2 });
+    expect(counts(22, 27)).toEqual({ READY: 3, PARTIAL: 1, BLOCKED: 2 });
     expect(counts(28, 31)).toEqual({ READY: 1, PARTIAL: 2, BLOCKED: 1 });
   });
 });
@@ -367,14 +369,17 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
     }
   });
 
-  it("registry実集計はF2i後READY 54 / PARTIAL 3 / BLOCKED 34 / META 8", () => {
+  it("public provenance再監査後の実集計はREADY 51 / PARTIAL 6 / BLOCKED 34 / META 8", () => {
     const counts = new Map<string, number>();
     for (const entry of TITLE_V2_CATALOG_READINESS) counts.set(entry.status, (counts.get(entry.status) ?? 0) + 1);
-    expect(Object.fromEntries(counts)).toEqual({ READY: 54, BLOCKED: 34, PARTIAL: 3, META: 8 });
+    expect(Object.fromEntries(counts)).toEqual({ READY: 51, BLOCKED: 34, PARTIAL: 6, META: 8 });
   });
 
-  it("source_semantic_mismatchはNo.29/30/48、missing_derived_sourceは12件のまま", () => {
+  it("source_semantic_mismatchはpublic provenance 3件を含む6件、missing_derived_sourceは12件", () => {
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("source_semantic_mismatch")).map((entry) => entry.no)).toEqual([
+      1,
+      6,
+      22,
       29,
       30,
       48,
@@ -534,13 +539,18 @@ describe("semantic false-positive再監査（public event completion保証）", 
  * （packages/core/src/vc/derived.ts）に伴うreadiness registryの追従を固定する。
  */
 describe("PR F2a: vc_last_occupant tie bug修正後のreadiness", () => {
-  it("No.6/7/9はtie bug修正によりREADY・blockerKinds:[\"none\"]", () => {
-    for (const no of [6, 7, 9]) {
+  it("No.7/9はtie bug修正によりREADY、No.6はknown bug解消後もpublic provenance不足でPARTIAL", () => {
+    for (const no of [7, 9]) {
       const entry = readinessFor(no);
       expect(entry.status, `candidate #${no}`).toBe("READY");
       expect(entry.blockerKinds, `candidate #${no}`).toEqual(["none"]);
       expect(entry.blockerKinds, `candidate #${no}`).not.toContain("known_bug");
     }
+    expect(readinessFor(6)).toMatchObject({
+      status: "PARTIAL",
+      blockerKinds: ["source_semantic_mismatch"],
+    });
+    expect(readinessFor(6).blockerKinds).not.toContain("known_bug");
   });
 
   it("No.8はarea/categoryタクソノミー不足が別の理由で残るためBLOCKEDのまま（tie bug修正だけではREADY化しない）", () => {

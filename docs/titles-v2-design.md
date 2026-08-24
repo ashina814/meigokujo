@@ -1907,15 +1907,27 @@ ChannelUpdateとmain guild @everyone RoleUpdateでもpermission transitionを収
 
 restart時のdangling intervalは`recovered_estimate`としてuntrustedに閉じ、downtimeをobservedと
 して伸ばさない。ready時点のcacheから新観測だけを開始し、history fetch/backfillはしない。
+Gateway lossでは影響shardのmain guildだけをloss時刻でsuspendする。Resume中のreplayed
+VoiceStateUpdateは真のoccurrence timestampを持たないためsourceへ書かず、`ShardResume`の
+replay完了後、fresh `ShardReady`、または`GuildAvailable`のcurrent cache観測時点から再開する。
+disconnect/unavailable中のhistoryはbackfillしない。
+
 writer/permission failureは専用sidecar内でcatch/logし、既存VC tracker・XP・rooms・handlerを
-止めない。derivedはtrusted observed intervalをsubject-global unionしてからJST hourへ半開区間で
-splitし、corrupt overlapでも各hour最大3600秒を維持する。
+止めない。writer failureではchannel-local trust fenceで失敗以降を直ちにclipし、Gateway healthy中に
+実受信したsnapshotだけをmemoryへ保留して次の正常writeでatomicに収束する。current stateから過去を
+推測せず、別channelへfailureを波及させない。derivedはtrusted observed intervalをsubject-global union
+してからJST hourへ半開区間でsplitし、corrupt overlapでも各hour最大3600秒を維持する。
 
 payloadへmessage/user/counterpart/channel/surface/area identity、exact timestamp、minute/second、
 raw countを出さない。`orderable:false`でexact earnedAtを主張しない。No.32-37はSOURCE READY・
 NONCOUNT・THRESHOLD_PENDING、No.48はPARTIALのまま。streak、深夜量ranking、「あと何時間」の
 progress、production BehaviorTitleDefinition、award/notification、historical
 backfillを追加しない。詳細はreadiness §21参照。
+
+既存No.1/6/22は候補原文がpublic VCを要求するが、依存する`vc_visits`系sourceにpublic/private
+provenanceがない。F2iのuser-level time intervalでは各候補固有のempty-start/last-occupant/
+counterpart breadthを代替できないため、独立再監査でREADY→PARTIALへ補正する。現在の実集計は
+READY 51 / PARTIAL 6 / BLOCKED 34 / META 8。No.32-37は上記exact contractによりREADYを維持する。
 
 ## 15. PR分割
 

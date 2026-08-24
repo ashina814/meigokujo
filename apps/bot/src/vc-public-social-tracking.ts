@@ -8,6 +8,7 @@ import {
   type VoiceChannel,
   type VoiceState,
 } from "discord.js";
+import type { ReconcileVcPublicSocialChannelInput } from "@meigokujo/core";
 import type { Services } from "./services.js";
 
 function nowSeconds(): number {
@@ -36,31 +37,175 @@ export function isEligiblePublicSocialVoiceChannel(
   }
 }
 
-function reconcileChannel(channel: GuildBasedChannel, services: Services, observedAt: number): void {
+function mainGuild(services: Services, guild: Guild): boolean {
+  try {
+    const mainGuildId = services.settings.getString("guild:main");
+    return Boolean(mainGuildId && guild.id === mainGuildId);
+  } catch {
+    return false;
+  }
+}
+
+function snapshotChannel(
+  channel: GuildBasedChannel,
+  services: Services,
+  observedAt: number,
+): ReconcileVcPublicSocialChannelInput {
   const eligible = isEligiblePublicSocialVoiceChannel(channel, services);
   const humanUserIds =
     channel.type === ChannelType.GuildVoice
       ? [...channel.members.values()].filter((member) => !member.user.bot).map((member) => member.id)
       : [];
-  services.vcPublicSocial.reconcileChannel({
-    guildId: channel.guildId,
-    channelId: channel.id,
-    eligible,
-    humanUserIds,
-    observedAt,
-  });
+  return { guildId: channel.guildId, channelId: channel.id, eligible, humanUserIds, observedAt };
 }
 
-function mainGuild(services: Services, guild: Guild): boolean {
-  const mainGuildId = services.settings.getString("guild:main");
-  return Boolean(mainGuildId && guild.id === mainGuildId);
+interface PendingChannel {
+  readonly suspendedAt: number;
+  readonly observations: ReconcileVcPublicSocialChannelInput[];
 }
 
-function reconcileGuildVoiceChannels(guild: Guild, services: Services, observedAt: number): void {
-  if (!mainGuild(services, guild)) return;
-  for (const channel of guild.channels.cache.values()) {
-    if (channel.type === ChannelType.GuildVoice) reconcileChannel(channel, services, observedAt);
+/**
+ * Gateway/guild lossとwriter failureをsource-localに隔離するstate。
+ * Gateway suspended中のreplayは捨て、writer failure中のlive observationだけはmemoryへ保留して
+ * 次の正常writeで順序どおりatomic replayする。process restart後の推測やfetchは行わない。
+ */
+class VcPublicSocialTrackingState {
+  readonly suspendedShards = new Set<number>();
+  readonly suspendedGuilds = new Map<string, number>();
+  readonly pendingChannels = new Map<string, PendingChannel>();
+
+  constructor(private readonly services: Services) {}
+
+  private channelKey(guildId: string, channelId: string): string {
+    return `${guildId}\u0000${channelId}`;
   }
+
+  reconcile(channel: GuildBasedChannel, observedAt: number): boolean {
+    try {
+      return this.reconcileObservedChannel(channel, observedAt);
+    } catch (error) {
+      console.error("[vc-public-social] channel snapshot failed", error);
+      return false;
+    }
+  }
+
+  private reconcileObservedChannel(channel: GuildBasedChannel, observedAt: number): boolean {
+    if (this.suspendedGuilds.has(channel.guildId)) return false;
+    const input = snapshotChannel(channel, this.services, observedAt);
+    const key = this.channelKey(input.guildId, input.channelId);
+    const pending = this.pendingChannels.get(key);
+    if (pending) {
+      pending.observations.push(input);
+      try {
+        this.services.vcPublicSocial.reconcileChannelBatch(pending.observations);
+        this.pendingChannels.delete(key);
+        return true;
+      } catch (error) {
+        this.closeChannelAtTrustLoss(input.guildId, input.channelId, pending.suspendedAt);
+        console.error("[vc-public-social] pending observation reconciliation failed", error);
+        return false;
+      }
+    }
+
+    try {
+      // Keep this exact call shape in the restricted-source contract audit.
+      this.services.vcPublicSocial.reconcileChannel({
+        guildId: input.guildId,
+        channelId: input.channelId,
+        eligible: input.eligible,
+        humanUserIds: input.humanUserIds,
+        observedAt: input.observedAt,
+      });
+      return true;
+    } catch (error) {
+      this.pendingChannels.set(key, { suspendedAt: observedAt, observations: [input] });
+      this.closeChannelAtTrustLoss(input.guildId, input.channelId, observedAt);
+      console.error("[vc-public-social] channel observation write failed", error);
+      return false;
+    }
+  }
+
+  private closeChannelAtTrustLoss(guildId: string, channelId: string, suspendedAt: number): void {
+    try {
+      this.services.vcPublicSocial.suspendChannel(guildId, channelId, suspendedAt);
+    } catch (error) {
+      // Coreのin-process fenceはこのwriteも失敗した場合にopen rowをclipする。
+      console.error("[vc-public-social] channel trust-boundary write failed", error);
+    }
+  }
+
+  suspendGuild(guild: Guild, observedAt: number): boolean {
+    if (!mainGuild(this.services, guild)) return false;
+    const current = this.suspendedGuilds.get(guild.id);
+    const suspendedAt = current === undefined ? observedAt : Math.min(current, observedAt);
+    this.suspendedGuilds.set(guild.id, suspendedAt);
+    try {
+      this.services.vcPublicSocial.suspendGuild(guild.id, suspendedAt);
+      return true;
+    } catch (error) {
+      console.error("[vc-public-social] guild trust-boundary write failed", error);
+      return false;
+    }
+  }
+
+  resumeGuild(guild: Guild, observedAt: number): boolean {
+    if (!mainGuild(this.services, guild) || this.suspendedShards.has(guild.shardId)) return false;
+    const suspendedAt = this.suspendedGuilds.get(guild.id);
+    if (suspendedAt === undefined) return false;
+    try {
+      const channels = [...guild.channels.cache.values()]
+        .filter((channel): channel is VoiceChannel => channel.type === ChannelType.GuildVoice)
+        .map((channel) => {
+          const snapshot = snapshotChannel(channel, this.services, observedAt);
+          return {
+            channelId: snapshot.channelId,
+            eligible: snapshot.eligible,
+            humanUserIds: snapshot.humanUserIds,
+          };
+        });
+      this.services.vcPublicSocial.resumeGuild({ guildId: guild.id, suspendedAt, observedAt, channels });
+      this.suspendedGuilds.delete(guild.id);
+      for (const key of this.pendingChannels.keys()) {
+        if (key.startsWith(`${guild.id}\u0000`)) this.pendingChannels.delete(key);
+      }
+      return true;
+    } catch (error) {
+      console.error("[vc-public-social] current guild observation recovery failed", error);
+      return false;
+    }
+  }
+}
+
+const trackingStates = new WeakMap<Services, VcPublicSocialTrackingState>();
+
+function trackingState(services: Services): VcPublicSocialTrackingState {
+  let state = trackingStates.get(services);
+  if (!state) {
+    state = new VcPublicSocialTrackingState(services);
+    trackingStates.set(services, state);
+  }
+  return state;
+}
+
+function findMainGuild(client: Client, services: Services): Guild | undefined {
+  try {
+    const mainGuildId = services.settings.getString("guild:main");
+    return mainGuildId ? client.guilds.cache.get(mainGuildId) : undefined;
+  } catch (error) {
+    console.error("[vc-public-social] main guild lookup failed", error);
+    return undefined;
+  }
+}
+
+function reconcileGuildVoiceChannels(guild: Guild, services: Services, observedAt: number): boolean {
+  if (!mainGuild(services, guild)) return false;
+  let ok = true;
+  for (const channel of guild.channels.cache.values()) {
+    if (channel.type === ChannelType.GuildVoice) {
+      ok = trackingState(services).reconcile(channel, observedAt) && ok;
+    }
+  }
+  return ok;
 }
 
 /** VoiceStateUpdate後のcache snapshotでold/new両channelを全human分収束させる。 */
@@ -71,16 +216,12 @@ export function trackVcPublicSocialPresence(
   now: () => number = nowSeconds,
 ): boolean {
   const observedAt = now();
-  try {
-    const channels = new Map<string, GuildBasedChannel>();
-    if (oldState.channel) channels.set(oldState.channel.id, oldState.channel);
-    if (newState.channel) channels.set(newState.channel.id, newState.channel);
-    for (const channel of channels.values()) reconcileChannel(channel, services, observedAt);
-    return channels.size > 0;
-  } catch (error) {
-    console.error("[vc-public-social] voice observation failed", error);
-    return false;
-  }
+  const channels = new Map<string, GuildBasedChannel>();
+  if (oldState.channel) channels.set(oldState.channel.id, oldState.channel);
+  if (newState.channel) channels.set(newState.channel.id, newState.channel);
+  let ok = channels.size > 0;
+  for (const channel of channels.values()) ok = trackingState(services).reconcile(channel, observedAt) && ok;
+  return ok;
 }
 
 /** Voice channel自身またはcategoryのpermission transitionをcacheだけで再収束する。 */
@@ -90,23 +231,16 @@ export function trackVcPublicSocialChannelUpdate(
   now: () => number = nowSeconds,
 ): boolean {
   const observedAt = now();
-  try {
-    if (!mainGuild(services, channel.guild)) return false;
-    if (channel.type === ChannelType.GuildVoice) {
-      reconcileChannel(channel, services, observedAt);
-      return true;
+  if (!mainGuild(services, channel.guild)) return false;
+  if (channel.type === ChannelType.GuildVoice) return trackingState(services).reconcile(channel, observedAt);
+  if (channel.type !== ChannelType.GuildCategory) return false;
+  let ok = true;
+  for (const child of channel.guild.channels.cache.values()) {
+    if (child.type === ChannelType.GuildVoice && child.parentId === channel.id) {
+      ok = trackingState(services).reconcile(child, observedAt) && ok;
     }
-    if (channel.type !== ChannelType.GuildCategory) return false;
-    for (const child of channel.guild.channels.cache.values()) {
-      if (child.type === ChannelType.GuildVoice && child.parentId === channel.id) {
-        reconcileChannel(child, services, observedAt);
-      }
-    }
-    return true;
-  } catch (error) {
-    console.error("[vc-public-social] channel permission reconciliation failed", error);
-    return false;
   }
+  return ok;
 }
 
 /** main guild @everyone role transitionだけが全voice visibilityを変え得る正本。 */
@@ -116,14 +250,8 @@ export function trackVcPublicSocialEveryoneRoleUpdate(
   now: () => number = nowSeconds,
 ): boolean {
   const observedAt = now();
-  try {
-    if (!mainGuild(services, role.guild) || role.id !== role.guild.roles.everyone.id) return false;
-    reconcileGuildVoiceChannels(role.guild, services, observedAt);
-    return true;
-  } catch (error) {
-    console.error("[vc-public-social] everyone permission reconciliation failed", error);
-    return false;
-  }
+  if (!mainGuild(services, role.guild) || role.id !== role.guild.roles.everyone.id) return false;
+  return reconcileGuildVoiceChannels(role.guild, services, observedAt);
 }
 
 /** restart後は履歴をfetchせず、ready時点のmain guild cacheから新しい観測だけを開始する。 */
@@ -132,16 +260,51 @@ export function initializeVcPublicSocialPresence(
   services: Services,
   now: () => number = nowSeconds,
 ): boolean {
-  const observedAt = now();
-  try {
-    const mainGuildId = services.settings.getString("guild:main");
-    if (!mainGuildId) return false;
-    const guild = client.guilds.cache.get(mainGuildId);
-    if (!guild) return false;
-    reconcileGuildVoiceChannels(guild, services, observedAt);
-    return true;
-  } catch (error) {
-    console.error("[vc-public-social] startup observation failed", error);
-    return false;
-  }
+  const guild = findMainGuild(client, services);
+  if (!guild) return false;
+  return reconcileGuildVoiceChannels(guild, services, now());
+}
+
+/** recoverable closeはShardDisconnectではなくShardReconnectingにも来るため両eventから呼ぶ。 */
+export function suspendVcPublicSocialShard(
+  client: Client,
+  shardId: number,
+  services: Services,
+  now: () => number = nowSeconds,
+): boolean {
+  const state = trackingState(services);
+  state.suspendedShards.add(shardId);
+  const guild = findMainGuild(client, services);
+  if (!guild || guild.shardId !== shardId) return false;
+  return state.suspendGuild(guild, now());
+}
+
+/** shardResumeはreplay dispatch完了後、ShardReadyはfresh Identifyのguild cache収束後。 */
+export function resumeVcPublicSocialShard(
+  client: Client,
+  shardId: number,
+  services: Services,
+  now: () => number = nowSeconds,
+): boolean {
+  const state = trackingState(services);
+  state.suspendedShards.delete(shardId);
+  const guild = findMainGuild(client, services);
+  if (!guild || guild.shardId !== shardId) return false;
+  return state.resumeGuild(guild, now());
+}
+
+export function suspendVcPublicSocialGuild(
+  guild: Guild,
+  services: Services,
+  now: () => number = nowSeconds,
+): boolean {
+  return trackingState(services).suspendGuild(guild, now());
+}
+
+export function resumeVcPublicSocialGuild(
+  guild: Guild,
+  services: Services,
+  now: () => number = nowSeconds,
+): boolean {
+  return trackingState(services).resumeGuild(guild, now());
 }

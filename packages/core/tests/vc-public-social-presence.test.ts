@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { computePublicSocialPresenceIntervals } from "../src/vc/public-social-derived.js";
 import { VcPublicSocialPresence } from "../src/vc/public-social-presence.js";
@@ -66,5 +66,18 @@ describe("VcPublicSocialPresence canonical writer", () => {
     source.recoverDangling(100);
     expect(computePublicSocialPresenceIntervals(db, fixed, ["alice"])).toEqual(before);
     expect(before[0]!.intervals).toEqual([{ start: 10, end: 50 }]);
+  });
+
+  it("writer transaction失敗直後もin-process fenceでpersisted open rowを失敗時刻までにclipする", () => {
+    const db = openDb(":memory:");
+    const source = new VcPublicSocialPresence(db);
+    const humans = ["alice", "bob"];
+    source.reconcileChannel({ guildId: "main", channelId: "vc", eligible: true, humanUserIds: humans, observedAt: 10 });
+    vi.spyOn(db, "transaction").mockImplementationOnce(() => (() => { throw new Error("write failed"); }) as never);
+    expect(() => source.reconcileChannel({ guildId: "main", channelId: "vc", eligible: false, humanUserIds: humans, observedAt: 20 }))
+      .toThrow("write failed");
+    expect(rows(db).filter((row) => row.user_id === "alice")[0]!.ended_at).toBeNull();
+    expect(computePublicSocialPresenceIntervals(db, { start: 0, end: 30, observedAt: 30 }, ["alice"])[0]!.intervals)
+      .toEqual([{ start: 10, end: 20 }]);
   });
 });

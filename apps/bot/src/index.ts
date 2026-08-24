@@ -116,6 +116,10 @@ import {
 import { trackTitleTcMessage, trackTitleTcReaction } from "./tc-social-tracking.js";
 import {
   initializeVcPublicSocialPresence,
+  resumeVcPublicSocialGuild,
+  resumeVcPublicSocialShard,
+  suspendVcPublicSocialGuild,
+  suspendVcPublicSocialShard,
   trackVcPublicSocialChannelUpdate,
   trackVcPublicSocialEveryoneRoleUpdate,
   trackVcPublicSocialPresence,
@@ -597,6 +601,27 @@ client.on(Events.MessageCreate, (message) => {
   void handleBumpMessage(message, services).catch((err) => console.error("[bump] 処理失敗:", err));
   void handleMessageXp(message, services).catch((err) => console.error("[rank] 発言XP付与失敗:", err));
   void relayStaffMessage(client, services, message).catch((err) => console.error("[mimi] 中継失敗:", err));
+});
+
+// Recoverable gateway closeはShardReconnecting、unrecoverable closeはShardDisconnect。
+// どちらもmain guildをshard-localにsuspendし、replay完了/新session ready後のcacheからだけ再開する。
+client.on(Events.ShardReconnecting, (shardId) => {
+  suspendVcPublicSocialShard(client, shardId, services);
+});
+client.on(Events.ShardDisconnect, (_event, shardId) => {
+  suspendVcPublicSocialShard(client, shardId, services);
+});
+client.on(Events.ShardResume, (shardId) => {
+  resumeVcPublicSocialShard(client, shardId, services);
+});
+client.on(Events.ShardReady, (shardId) => {
+  resumeVcPublicSocialShard(client, shardId, services);
+});
+client.on(Events.GuildUnavailable, (guild) => {
+  suspendVcPublicSocialGuild(guild, services);
+});
+client.on(Events.GuildAvailable, (guild) => {
+  resumeVcPublicSocialGuild(guild, services);
 });
 
 client.on(Events.MessageReactionAdd, (reaction, user) => {

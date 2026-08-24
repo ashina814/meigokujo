@@ -273,8 +273,9 @@ CREATE INDEX IF NOT EXISTS idx_vc_channel ON vc_segments(channel_id, started_at)
 
 -- main guildのpublic GuildVoiceで、human occupancy >= 2だったことをlive eventで
 -- 観測したuser-level interval。guild/channel identityはpublic判定の再収束にだけ使い、
--- title safe payloadへは出さない。recovered_estimateはクラッシュ時の終了境界が
--- 不明なのでderived readerが信頼せず、起動時刻までのdowntimeをbackfillしない。
+-- title safe payloadへは出さない。observed endは通常transitionまたはGateway/writerの
+-- exact trust-loss boundary。recovered_estimateはクラッシュ時の終了境界が不明なので
+-- derived readerが信頼せず、起動時刻までのdowntimeをbackfillしない。
 CREATE TABLE IF NOT EXISTS vc_public_social_presence (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id     TEXT NOT NULL,

@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import type { TitleWindow } from "./derived.js";
+import { getVcPublicSocialTrustFence } from "./public-social-presence.js";
 
 export interface PublicSocialPresenceIntervals {
   readonly userId: string;
@@ -9,6 +10,8 @@ export interface PublicSocialPresenceIntervals {
 
 interface PresenceRow {
   readonly user_id: string;
+  readonly guild_id: string;
+  readonly channel_id: string;
   readonly started_at: number;
   readonly ended_at: number | null;
   readonly end_quality: "observed" | "recovered_estimate" | null;
@@ -51,7 +54,7 @@ export function computePublicSocialPresenceIntervals(
   const userFilter = requested ? ` AND user_id IN (${requested.map(() => "?").join(",")})` : "";
   const rows = db
     .prepare(
-      `SELECT user_id, started_at, ended_at, end_quality
+      `SELECT user_id, guild_id, channel_id, started_at, ended_at, end_quality
          FROM vc_public_social_presence
         WHERE started_at < ?
           AND (ended_at IS NULL OR ended_at > ?)
@@ -65,10 +68,14 @@ export function computePublicSocialPresenceIntervals(
     intervalsByUser.set(userId, []);
   }
   for (const row of rows) {
-    const endIsAfterSnapshot = row.ended_at === null || row.ended_at > effectiveEnd;
-    if (!endIsAfterSnapshot && row.end_quality !== "observed") continue;
+    const fence = getVcPublicSocialTrustFence(db, row.guild_id, row.channel_id);
+    const persistedEnd = row.ended_at ?? Number.POSITIVE_INFINITY;
+    const fencedEnd = Math.min(persistedEnd, fence ?? Number.POSITIVE_INFINITY);
+    const endIsAfterSnapshot = fencedEnd > effectiveEnd;
+    const hasObservedTrustBoundary = row.end_quality === "observed" || (fence !== undefined && fence <= persistedEnd);
+    if (!endIsAfterSnapshot && !hasObservedTrustBoundary) continue;
     const start = Math.max(row.started_at, window.start);
-    const end = Math.min(row.ended_at ?? effectiveEnd, effectiveEnd);
+    const end = Math.min(fencedEnd, effectiveEnd);
     if (end > start) intervalsByUser.get(row.user_id)?.push({ start, end });
   }
 

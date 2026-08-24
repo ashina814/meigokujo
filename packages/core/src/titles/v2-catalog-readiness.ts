@@ -117,16 +117,17 @@ const SOCIAL_ACTIVITY_TIME_FILE = "packages/core/src/social-activity-time/derive
 const THEME_01: ManualReadinessEntry[] = [
   {
     no: 1,
-    status: "READY",
+    status: "PARTIAL",
     usableSources: ["vc_empty_start_then_joined"],
     specializedResolvers: ["computeEmptyStartThenJoined"],
-    missingCapabilities: [],
+    missingCapabilities: ["main guildかつpublic VCだったことを証明するprovenance"],
     evidence: [
       { file: VC_SOURCES_FILE, symbol: "vc_empty_start_then_joined" },
       { file: VC_DERIVED_FILE, symbol: "computeEmptyStartThenJoined" },
     ],
-    notes: "facts配列の初回出現＝初回成立。追加dimension不要。",
-    blockerKinds: ["none"],
+    notes:
+      "初回成立構造は表現できるが、vc_empty_start_then_joinedは公開分類のないvc_visits由来。private/role-gated/other-guild VCを候補原文の「静かな公開VC」から除外できないためpublic-classified sourceへの移行が必要。",
+    blockerKinds: ["source_semantic_mismatch"],
     optimizationRisk: "LOW",
   },
   {
@@ -181,14 +182,14 @@ const THEME_01: ManualReadinessEntry[] = [
 const THEME_02: ManualReadinessEntry[] = [
   {
     no: 6,
-    status: "READY",
+    status: "PARTIAL",
     usableSources: ["vc_last_occupant"],
     specializedResolvers: ["computeLastOccupant"],
-    missingCapabilities: [],
+    missingCapabilities: ["main guildかつpublic VCだったことを証明するprovenance"],
     evidence: [{ file: VC_DERIVED_FILE, symbol: "computeLastOccupant" }],
     notes:
-      "PR F2aで修正: computeLastOccupant()のsame-second/0-second visit tie bug（xlsx Blocker記載）を解消済み——departingと同秒にstartする第三者（0秒visitを含む）をambiguousとしてblockする分岐を追加し、mutation self-verifyで確認済み。意味自体を表現するのに追加のsourceは不要。",
-    blockerKinds: ["none"],
+      "PR F2aでsame-second/0-second tie bugは解消済み。ただしvc_last_occupantは公開分類のないvc_visits由来で、private/role-gated/other-guild VCを候補原文の「複数人の公開VC」から除外できない。public provenanceを持つsourceへの移行が必要。",
+    blockerKinds: ["source_semantic_mismatch"],
     optimizationRisk: "LOW",
   },
   {
@@ -254,14 +255,14 @@ const THEME_03_06: ManualReadinessEntry[] = [10, 11, 12, 13, 14, 15, 16, 17, 18,
 const THEME_07: ManualReadinessEntry[] = [
   {
     no: 22,
-    status: "READY",
+    status: "PARTIAL",
     usableSources: ["vc_social_safe"],
     specializedResolvers: ["computeSafeSocialAggregates"],
-    missingCapabilities: [],
+    missingCapabilities: ["main guildかつpublic VCのcounterpart breadth provenance"],
     evidence: [{ file: VC_SOURCES_FILE, symbol: "VcSocialSafeSourcePayload.distinctCoPresentUsers" }],
     notes:
-      "distinctCoPresentUsersが直接この意味を表現する。semanticSpec「複数の異なる相手と、公開の有効共在が成立する」は時間的な広がりを要求しない——1 windowの累積distinct数だけで満たせる（PR #164レビュー§BLOCKER3で再確認、READY維持）。",
-    blockerKinds: ["none"],
+      "distinctCoPresentUsersは時間的広がりを要求しないbreadth自体は表現するが、vc_social_safe→vc_co_presence→vc_visitsはpublic/private provenanceを持たない。private/role-gated/other-guild共在を候補原文の「公開の有効共在」から除外できない。",
+    blockerKinds: ["source_semantic_mismatch"],
     optimizationRisk: "LOW",
   },
   {

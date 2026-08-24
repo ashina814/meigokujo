@@ -123,6 +123,7 @@ export {
 } from "./vc/service.js";
 export {
   VcPublicSocialPresence,
+  type ResumeVcPublicSocialGuildInput,
   type ReconcileVcPublicSocialChannelInput,
   type VcPublicSocialPresenceEndQuality,
   type VcPublicSocialPresenceReconcileResult,
