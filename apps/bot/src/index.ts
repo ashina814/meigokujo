@@ -114,6 +114,19 @@ import {
   handleOriginalRoleTicketSelect,
 } from "./commands/original-role-ticket.js";
 import { trackTitleTcMessage, trackTitleTcReaction } from "./tc-social-tracking.js";
+import {
+  initializeVcPublicSocialPresence,
+  resumeVcPublicSocialGuild,
+  resumeVcPublicSocialShard,
+  startVcPublicSocialGuild,
+  suspendVcPublicSocialGuild,
+  suspendVcPublicSocialShard,
+  trackVcPublicSocialChannelDelete,
+  trackVcPublicSocialChannelUpdate,
+  trackVcPublicSocialEveryoneRoleUpdate,
+  trackVcPublicSocialGuildDelete,
+  trackVcPublicSocialPresence,
+} from "./vc-public-social-tracking.js";
 
 const services = buildServices();
 const client = new Client({
@@ -134,6 +147,7 @@ inviteTracker.wire();
 
 client.once(Events.ClientReady, async (ready) => {
   console.log(`⚔️ 冥獄城ボット 起動: ${ready.user.tag}`);
+  initializeVcPublicSocialPresence(ready, services);
   // 外部Discord APIへ触る復旧より先に、同期の賭場安全確認を必ず完了させる。
   // 再起動直後にstatus=openのまま外部I/O待ちになるfail-open窓を作らない。
   runCasinoRecovery(services);
@@ -592,6 +606,33 @@ client.on(Events.MessageCreate, (message) => {
   void relayStaffMessage(client, services, message).catch((err) => console.error("[mimi] 中継失敗:", err));
 });
 
+// Recoverable gateway closeはShardReconnecting、unrecoverable closeはShardDisconnect。
+// どちらもmain guildをshard-localにsuspendし、replay完了/新session ready後のcacheからだけ再開する。
+client.on(Events.ShardReconnecting, (shardId) => {
+  suspendVcPublicSocialShard(client, shardId, services);
+});
+client.on(Events.ShardDisconnect, (_event, shardId) => {
+  suspendVcPublicSocialShard(client, shardId, services);
+});
+client.on(Events.ShardResume, (shardId) => {
+  resumeVcPublicSocialShard(client, shardId, services);
+});
+client.on(Events.ShardReady, (shardId, unavailableGuilds) => {
+  resumeVcPublicSocialShard(client, shardId, services, undefined, unavailableGuilds);
+});
+client.on(Events.GuildUnavailable, (guild) => {
+  suspendVcPublicSocialGuild(guild, services);
+});
+client.on(Events.GuildAvailable, (guild) => {
+  resumeVcPublicSocialGuild(guild, services);
+});
+client.on(Events.GuildDelete, (guild) => {
+  trackVcPublicSocialGuildDelete(guild, services);
+});
+client.on(Events.GuildCreate, (guild) => {
+  startVcPublicSocialGuild(guild, services);
+});
+
 client.on(Events.MessageReactionAdd, (reaction, user) => {
   void trackTitleTcReaction(reaction, user, services).catch((err) =>
     console.error("[tc-social] reaction sidecar failed", err),
@@ -634,6 +675,7 @@ client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
 });
 
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  trackVcPublicSocialPresence(oldState, newState, services);
   try {
     trackVoiceState(oldState, newState, services);
     handleVoiceAttendance(oldState, newState, services);
@@ -648,8 +690,27 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   }
 });
 
+client.on(Events.ChannelUpdate, (_oldChannel, newChannel) => {
+  if (newChannel.isDMBased()) return;
+  trackVcPublicSocialChannelUpdate(newChannel, services);
+});
+
+client.on(Events.ChannelDelete, (deletedChannel) => {
+  if (deletedChannel.isDMBased()) return;
+  trackVcPublicSocialChannelDelete(deletedChannel, services);
+});
+
+client.on(Events.GuildRoleUpdate, (_oldRole, newRole) => {
+  trackVcPublicSocialEveryoneRoleUpdate(newRole, services);
+});
+
 function shutdown(): void {
   console.log("冥獄城ボットを停止します…");
+  try {
+    services.vcPublicSocial.closeAllObserved(Math.floor(Date.now() / 1000));
+  } catch (error) {
+    console.error("[vc-public-social] graceful close failed", error);
+  }
   client.destroy();
   services.db.close();
   process.exit(0);

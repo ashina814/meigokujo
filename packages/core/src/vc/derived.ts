@@ -778,6 +778,35 @@ export function splitIntervalByJstDay(startedAt: number, endedAt: number): Array
 }
 
 /**
+ * canonical [start,end) intervalをJSTの暦日×hourへ分割する。24 hour binは称号threshold
+ * ではなくprivacy-safeなmeasurement resolutionであり、秒ごとのloopは行わない。
+ */
+export function splitIntervalByJstHour(
+  startedAt: number,
+  endedAt: number,
+): Array<{ date: string; hour: number; seconds: number }> {
+  const parts: Array<{ date: string; hour: number; seconds: number }> = [];
+  let cursor = startedAt;
+  let guard = 0;
+  const SANITY_LIMIT_HOURS = 24 * 365 * 100;
+  while (cursor < endedAt) {
+    if (guard >= SANITY_LIMIT_HOURS) {
+      throw new RangeError(
+        `splitIntervalByJstHour: interval [${startedAt}, ${endedAt}) spans more than ${SANITY_LIMIT_HOURS} hours — likely a bug, not a legitimate title window`,
+      );
+    }
+    const shifted = cursor + JST_OFFSET_SEC;
+    const hourStart = Math.floor(shifted / 3600) * 3600 - JST_OFFSET_SEC;
+    const iso = new Date(shifted * 1000).toISOString();
+    const partEnd = Math.min(endedAt, hourStart + 3600);
+    parts.push({ date: iso.slice(0, 10), hour: Number(iso.slice(11, 13)), seconds: partEnd - cursor });
+    cursor = partEnd;
+    guard += 1;
+  }
+  return parts;
+}
+
+/**
  * [startedAt, endedAt) が触れるdistinct JST暦日を列挙する。秒単位では舐めず、日境界だけ進む。
  *
  * cursorはループのたびに厳密に翌日の00:00（JST）へ進むため、無限ループにはなり得ない

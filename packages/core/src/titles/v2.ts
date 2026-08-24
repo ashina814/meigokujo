@@ -105,6 +105,7 @@ export {
   type EconomySafePeerActionsSourcePayload,
   type PublicEventParticipationsSourcePayload,
   type PublicEventCompletedParticipationsSourcePayload,
+  type SocialActivityTimeSafeSourcePayload,
   type CasinoActivityDaysSourcePayload,
   type CasinoCompletedActivityDaysSourcePayload,
   type TextActiveDaysSourcePayload,

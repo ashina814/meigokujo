@@ -271,6 +271,28 @@ CREATE INDEX IF NOT EXISTS idx_vc_user ON vc_segments(user_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_vc_open ON vc_segments(ended_at) WHERE ended_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_vc_channel ON vc_segments(channel_id, started_at);
 
+-- main guildのpublic GuildVoiceで、human occupancy >= 2だったことをlive eventで
+-- 観測したuser-level interval。guild/channel identityはpublic判定の再収束にだけ使い、
+-- title safe payloadへは出さない。observed endは通常transitionまたはGateway/writerの
+-- exact trust-loss boundary。recovered_estimateはクラッシュ時の終了境界が不明なので
+-- derived readerが信頼せず、起動時刻までのdowntimeをbackfillしない。
+CREATE TABLE IF NOT EXISTS vc_public_social_presence (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     TEXT NOT NULL,
+  guild_id    TEXT NOT NULL,
+  channel_id  TEXT NOT NULL,
+  started_at  INTEGER NOT NULL CHECK (started_at >= 0),
+  ended_at    INTEGER CHECK (ended_at IS NULL OR ended_at >= 0),
+  end_quality TEXT CHECK (end_quality IS NULL OR end_quality IN ('observed','recovered_estimate'))
+);
+CREATE INDEX IF NOT EXISTS idx_vc_public_social_user
+  ON vc_public_social_presence(user_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_vc_public_social_channel
+  ON vc_public_social_presence(guild_id, channel_id, started_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vc_public_social_open_user_channel
+  ON vc_public_social_presence(user_id, guild_id, channel_id)
+  WHERE ended_at IS NULL;
+
 -- 公開TCの会話構造を後から安全に分類するためのrestricted metadata正本。
 -- message本文・attachment・embed・mention・emoji等はschema自体に持たない。
 CREATE TABLE IF NOT EXISTS tc_message_observations (

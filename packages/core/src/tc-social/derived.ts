@@ -57,6 +57,15 @@ export interface TcSafeWindow {
   readonly observedAt?: number;
 }
 
+/**
+ * canonical public TC exchange候補。message/surface/counterpart identityはinternal loader内だけで
+ * 使用し、共有consumerへはsubject messageの時刻とsame-surface nearest-other gapだけを渡す。
+ */
+export interface TcSocialExchangeCandidate {
+  readonly createdAtMs: number;
+  readonly bestOtherGapMs: number | null;
+}
+
 interface MessageRow {
   messageId: string;
   authorId: string;
@@ -332,6 +341,24 @@ function nearestOtherGapByMessage(
   return result;
 }
 
+/**
+ * F2h/F2iが共有するinteraction-localityの正本。areaはbreadth taxonomyにすぎず、
+ * exchange候補は必ず同一surface内のother humanだけから求める。
+ */
+function socialExchangeGapsByMessage(
+  ownRows: readonly MessageRow[],
+  surfaces: ReadonlyMap<string, readonly MessageRow[]>,
+  subjectId: string,
+): ReadonlyMap<string, number | null> {
+  const nearestByMessage = new Map<string, number | null>();
+  const ownBySurface = groupRows(ownRows, (row) => row.surfaceId);
+  for (const [surfaceId, surfaceOwnRows] of ownBySurface) {
+    const local = nearestOtherGapByMessage(surfaceOwnRows, surfaces.get(surfaceId) ?? [], subjectId);
+    for (const [messageId, gap] of local) nearestByMessage.set(messageId, gap);
+  }
+  return nearestByMessage;
+}
+
 interface JoinFact {
   readonly priorDistinctOtherGapMs: readonly number[];
   readonly priorSelfGapMs: number | null;
@@ -372,6 +399,7 @@ function buildConversationPayload(
 ): TcConversationSafePayload {
   if (subjectRows.length === 0) return EMPTY_CONVERSATION;
   const surfaces = groupRows(contextRows, (row) => row.surfaceId);
+  const socialExchangeGaps = socialExchangeGapsByMessage(subjectRows, surfaces, subjectId);
   const explicit = explicitConversationKeys(contextRows);
   const indexes = new Map<readonly MessageRow[], ReadonlyMap<string, number>>();
   const nextGapCache = new Map<readonly MessageRow[], ReadonlyMap<string, number | null>>();
@@ -458,15 +486,9 @@ function buildConversationPayload(
   for (const ownRows of subjectByArea.values()) {
     // areaはbreadth taxonomy、surfaceはinteraction locality。forum parent配下の
     // 別thread同士を時間的に近いだけでexchangeへ結び付けない。
-    const ownBySurface = groupRows(ownRows, (row) => row.surfaceId);
-    const nearestByMessage = new Map<string, number | null>();
-    for (const [surfaceId, surfaceOwnRows] of ownBySurface) {
-      const local = nearestOtherGapByMessage(surfaceOwnRows, surfaces.get(surfaceId) ?? [], subjectId);
-      for (const [messageId, gap] of local) nearestByMessage.set(messageId, gap);
-    }
     const bestByDate = new Map<string, number | null>();
     for (const own of ownRows) {
-      const best = nearestByMessage.get(own.messageId) ?? null;
+      const best = socialExchangeGaps.get(own.messageId) ?? null;
       const date = dateFor(own.createdAtMs);
       const existing = bestByDate.get(date);
       if (existing === undefined || (best !== null && (existing === null || best < existing))) bestByDate.set(date, best);
@@ -548,6 +570,47 @@ function buildConversationPayload(
     startedConversations: startedConversations.map(({ sortAt: _sortAt, ...value }) => value),
     socialDays: [...globalSocial].sort(([a], [b]) => a.localeCompare(b)).map(([date, bestOtherGapMs]) => ({ date, bestOtherGapMs })),
   };
+}
+
+/**
+ * `tc_conversation_safe`と`social_activity_time_safe`が共有するcanonical exchange候補。
+ * bulk subject/context loading、observedAt snapshot、surface-local matchingを一か所に保つ。
+ * payload-safe sourceはcreatedAtMsをそのまま公開せず、JST date/hourへ必ず畳むこと。
+ */
+export function computeTcSocialExchangeCandidates(
+  db: Database.Database,
+  window: TcSafeWindow,
+  userIds?: readonly string[],
+): ReadonlyArray<{ readonly userId: string; readonly candidates: readonly TcSocialExchangeCandidate[] }> {
+  const { startMs, endMs, observedCutoffMs } = requireWindow(window);
+  const requested = userIds ? [...new Set(userIds)] : undefined;
+  if (requested && requested.length === 0) return [];
+  if (endMs <= startMs) return (requested ?? []).map((userId) => ({ userId, candidates: [] }));
+  const targetIds =
+    requested ??
+    (db
+      .prepare(
+        `SELECT DISTINCT author_id FROM tc_message_observations
+          WHERE created_at_ms >= ? AND created_at_ms < ? AND observed_at_ms < ?
+          ORDER BY author_id`,
+      )
+      .all(startMs, endMs, observedCutoffMs) as Array<{ author_id: string }>).map((row) => row.author_id);
+  const subjectRows = loadSubjectRows(db, targetIds, startMs, endMs, observedCutoffMs);
+  const areaIds = [...new Set(subjectRows.map((row) => row.areaId))];
+  const contextRows = loadAreaContext(db, areaIds, startMs, endMs, observedCutoffMs);
+  const surfaces = groupRows(contextRows, (row) => row.surfaceId);
+  const bySubject = groupRows(subjectRows, (row) => row.authorId);
+  return targetIds.map((userId) => {
+    const ownRows = bySubject.get(userId) ?? [];
+    const gaps = socialExchangeGapsByMessage(ownRows, surfaces, userId);
+    return {
+      userId,
+      candidates: ownRows.map((row) => ({
+        createdAtMs: row.createdAtMs,
+        bestOtherGapMs: gaps.get(row.messageId) ?? null,
+      })),
+    };
+  });
 }
 
 /** restricted message identityをinternal graphだけで使い、identity-freeな会話統計へ畳む。 */

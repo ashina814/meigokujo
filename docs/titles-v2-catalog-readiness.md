@@ -86,6 +86,22 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > 48→40、`missing_persisted_source` 24→16。Theme 11は0/0/8→7/1/0。
 > threshold・production title・award wiring・historical backfillは追加していない。§20参照。
 
+> **PR F2i反映（2026-08-23）**: F2hのcanonical same-surface TC exchange候補と、
+> main guild/public GuildVoice/human occupancyをliveに証明するcanonical
+> `vc_public_social_presence`を共有し、
+> `social_activity_time_safe`へJST date×24hour sparse分布として統合した。
+> No.32-37がBLOCKED→READY、READY 48→54、BLOCKED 40→34、PARTIAL 3・META 8は
+> 不変。`missing_persisted_source` 16→10、Theme 9は0/0/6→6/0/0。24hour binは
+> measurement resolutionであり、daypart/gap/meaningful-seconds/share/concentrationの
+> production thresholdは未決定。全6件NONCOUNT、No.48はPARTIALを維持する。§21参照。
+
+> **PR #173追加監査反映（2026-08-24）**: 既存READYのうちNo.1/6/22は候補原文が
+> public VCを要求する一方、実dependencyがpublic/private provenanceを持たない
+> `vc_visits`系だったためPARTIALへ補正した。READY 54→51、PARTIAL 3→6、
+> `source_semantic_mismatch` 3→6。BLOCKED 34・META 8は不変。F2iの
+> `vc_public_social_presence`はNo.32-37のmain/public/human/trusted timeをexactに
+> 支えるが、empty-start/last-occupant/counterpart breadthの代替sourceではない。§21.5参照。
+
 ## 0. xlsx canonical hash（exact drift guard）
 
 | 項目 | 値 |
@@ -133,13 +149,13 @@ full-clear editionに登録されたREQUIRED印100%——NONCOUNTの91 behavior�
 
 | status | 件数 | 意味 |
 | --- | --- | --- |
-| READY | 48 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
-| PARTIAL | 3 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
-| BLOCKED | 40 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
+| READY | 51 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
+| PARTIAL | 6 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
+| BLOCKED | 34 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
 | META | 8 | kind:meta（別bucket、§7参照） |
 
 **READY = 今すぐreleaseしてよい、ではない**。sourceReadinessとthreshold決定は
-別軸（§10参照）——READY 48件も、production threshold値（分布TBD等）が
+別軸（§10参照）——READY 51件も、production threshold値（分布TBD等）が
 決まるまではrelease対象にならない。またSeries manifest／Collection Edition／
 Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）。No.58はさらに、
 award後のreversalを既存immutable ownershipへどう反映するかが未決定であるため、
@@ -149,30 +165,30 @@ source-readyでもproduction release不可（§15）。
 
 | blockerKind | 件数 | 意味 |
 | --- | --- | --- |
-| missing_persisted_source | 16 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
+| missing_persisted_source | 10 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
 | missing_derived_source | 12 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
 | missing_manifest | 9 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
 | missing_role_history | 7 | role-at-time（過去のある時点でどのroleを保持していたか）がrepo全体で未実装 |
-| source_semantic_mismatch | 3 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（No.29/30のpair-specific overlapとNo.48のfree-flow同一topic correlation） |
+| source_semantic_mismatch | 6 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（No.1/6/22のpublic VC provenance、No.29/30のpair-specific overlap、No.48のfree-flow同一topic correlation） |
 | missing_event_protocol | 2 | イベントデータモデル自体にorganizer/staff区別が存在しない |
 | known_bug | 0 | PR F2aで`computeLastOccupant()`のsame-second/0-second visit tie bugを修正——catalog全体から解消済み（§13参照） |
 
-（`none`のBehavior候補は48件——ちょうどREADY件数と一致。PARTIAL 3件は
+（`none`のBehavior候補は51件——ちょうどREADY件数と一致。PARTIAL 6件は
 すべて`source_semantic_mismatch`を持つ。）
 
 ## 4. Theme別 readiness
 
 | Theme No | Theme | 総数 | READY | PARTIAL | BLOCKED |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 場を起こす | 5 | 2 | 0 | 3 |
-| 2 | 場を締める | 4 | 3 | 0 | 1 |
+| 1 | 場を起こす | 5 | 1 | 1 | 3 |
+| 2 | 場を締める | 4 | 2 | 1 | 1 |
 | 3 | 一対一型 | 3 | 3 | 0 | 0 |
 | 4 | 少人数型 | 3 | 3 | 0 | 0 |
 | 5 | 大人数型 | 3 | 3 | 0 | 0 |
 | 6 | 万能型 | 3 | 3 | 0 | 0 |
-| 7 | 広い交友 | 6 | 4 | 0 | 2 |
+| 7 | 広い交友 | 6 | 3 | 1 | 2 |
 | 8 | 深い交友 | 4 | 1 | 2 | 1 |
-| 9 | 時間帯・生活痕 | 6 | 0 | 0 | 6 |
+| 9 | 時間帯・生活痕 | 6 | 6 | 0 | 0 |
 | 10 | BUMP / 鐘 | 4 | 4 | 0 | 0 |
 | 11 | TC交流 | 8 | 7 | 1 | 0 |
 | 12 | 公開部屋 | 8 | 7 | 0 | 1 |
@@ -184,18 +200,18 @@ source-readyでもproduction release不可（§15）。
 
 BUMP/鐘とVC人数帯Theme 3-6が100% READY（後者はPR F2eのJST日別4bucket
 trusted secondsで日数/share/span/streakを後段評価できるため）。公開部屋はF2gで
-7/8件がSOURCE READYとなり、No.57だけrole-at-time待ち。TC交流はF2hで7/8件が
-SOURCE READYとなり、No.48だけfree-flow同一topic correlationのsemantic mismatchが残る。
+7/8件がSOURCE READYとなり、No.57だけrole-at-time待ち。時間帯・生活痕はF2iで6/6件が
+SOURCE READYとなった。TC交流はF2hで7/8件がSOURCE READYとなり、No.48だけfree-flow同一topic correlationのsemantic mismatchが残る。
 城横断は引き続き0% READY。
 
 ## 5. source別に残る実装（READYを支えるsource／PARTIALの制約／BLOCKEDが必要とするもの）
 
-READYを支えている既存`titleUsable:true` source（13種、48件）:
+READYを支えている既存`titleUsable:true` source（14種、51件）:
 
-- `vc_empty_start_then_joined`（No.1-2）
-- `vc_last_occupant`（No.6, 7, 9——PR F2aでsame-second/0-second visit tie bugを修正済み、§13参照）
+- `vc_empty_start_then_joined`（No.2。No.1はpublic provenance不足でPARTIAL）
+- `vc_last_occupant`（No.7, 9。No.6はtie bug解消済みだがpublic provenance不足でPARTIAL）
 - `vc_group_size_daily_safe`（No.10-21——JST date×4bucketのtrusted seconds。threshold/share denominatorは未固定、§17参照）
-- `vc_social_safe`（No.22-25, 28 — scope全体の`distinctCoPresentUsers`、JST日別`dailyBreadth`、`maxRepeatedDaysWithOneCounterpart`を後段評価に使える。§12/§18参照）
+- `vc_social_safe`（No.23-25, 28。No.22はbreadth自体はあるがpublic provenance不足でPARTIAL）
 - `bump_events`（No.38-41、全件READY）
 - `casino_activity_days`（No.68 のみ——「利用する」semanticsに限りcompletion保証不要。commitmentベースのまま維持）
 - `casino_completed_activity_days`（No.66, 67——PR F2bで追加したcompletion正本、§14参照）
@@ -205,9 +221,11 @@ READYを支えている既存`titleUsable:true` source（13種、48件）:
 - `public_room_activity_safe`（No.50-56——room lifecycleとtrusted logical VC visitの交差をidentityなしでhosted/guest/ownUseへ集計、§19参照）
 - `tc_conversation_safe`（No.42-45, 47, 49——quiet/continuation/dormant/area/join/social-dayのthreshold-neutral stats、§20参照）
 - `tc_reaction_safe`（No.46——anonymous post/JST observation day/distinct human reactor分布、§20参照）
+- `social_activity_time_safe`（No.32-37——same-surface TC exchange候補とtrusted VC wall-clock unionのJST date×24hour sparse分布。daypart/thresholdは未固定、§21参照）
 
 PARTIALを止めているもの（source_semantic_mismatch、§12/§14で今回のレビューにより判定）:
 
+- `vc_empty_start_then_joined` / `vc_last_occupant` / `vc_social_safe`がpublic/private provenanceを持たず、No.1/6/22の明示public semanticsを証明できない
 - `vc_social_safe.trustedOverlapSeconds`が全counterpart合算で、特定counterpartに紐づけられない（No.29, 30）
 - `tc_conversation_safe.startedConversations`はexplicit reply/threadだけを同一conversationとexactに証明でき、通常free-flowの同一topic長期継続をcanonicalに証明できない（No.48）
 
@@ -219,7 +237,6 @@ No.80/81はREADY、No.82はevent-date span source不足のみ残る。§14-16参
 BLOCKEDが新たに必要とするもの（xlsxのSource_Map original「未実装」から、
 E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 
-- **`social_activity_time_safe`(TC+VC daypart)新設**—— No.32-37（6件）
 - **`invite_retention_safe`新設**—— No.76-79（4件、うち2件はさらにnetwork-graph derivedも必要）。retentionは repo全体でgrep 0件——スタブすら無い
 - **`casino_table_activity_safe`(host/guest区別)新設**—— No.70-71（2件）。casino_participationsは全参加者を対称記録——host/guest概念自体が現データモデルに存在しない
 - **market/betting safe source新設**—— No.72（1件）。market/stocks系は`CASINO_ACTIVITY_KEYS`の対象外
@@ -240,7 +257,7 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 | STRUCTURAL_PLUS_DISTRIBUTION | 1 | 構造は決まるが、一部の値は分布依存 |
 | META_NOT_APPLICABLE | 8 | meta（別contract、§10適用外） |
 
-sourceReadinessとthresholdは別軸——READY 48件のうち、STRUCTURAL_FIXEDなのは
+sourceReadinessとthresholdは別軸——READY 51件のうち、STRUCTURAL_FIXEDなのは
 一部（初回系）のみで、残りはTHRESHOLD_PENDINGのままREADYになっている
 （sourceは十分だが実数値は分布を見てから決める）。
 
@@ -252,15 +269,13 @@ sourceReadinessとthresholdは別軸——READY 48件のうち、STRUCTURAL_FIXE
 | イベントtheme（Theme No.16） | 5 | No.80/81はcompletion sourceでREADY、No.82-84は依然BLOCKED |
 | manifest依存（thresholdCategory: MANIFEST_DEPENDENT） | 6 | 賭場core family一覧・城横断family一覧・series一覧が未定義 |
 | known bug依存 | 0 | PR F2aで`computeLastOccupant`の同秒0秒visit tie bugを修正——catalog全体から解消（§13参照） |
-| source_semantic_mismatch依存 | 3 | casino/economy/event/VC breadth分はF2b-F2fで解消——残るのはNo.29/30とNo.48（free-flow同一topic）のみ（§14-16/§18/§20参照） |
+| source_semantic_mismatch依存 | 6 | No.1/6/22のpublic VC provenance、No.29/30のpair-specific overlap、No.48のfree-flow同一topic（§14-16/§18/§20/§21.5参照） |
 
 ## 8. 次に何を実装すれば最も多くのcandidateがunblockされるか
 
 単純なunblock件数だけでなく、安全性・基盤依存・実装順序も考慮した優先順位。
-`missing_persisted_source`単独が理由の候補が13件、`missing_derived_source`
-単独が9件、`source_semantic_mismatch`単独が3件——新規sourceを1つ作る、
-または既存sourceのsemanticsを正すごとに複数candidateが同時に動く
-「クラスタ」が明確に存在する。
+新規sourceを1つ作る、または既存sourceのsemanticsを正すごとに複数candidateが
+同時に動く「クラスタ」が明確に存在する。
 
 > `vc_last_occupant`の同秒0秒visit tie bug修正（旧クラスタ1）は**PR F2aで
 > 解消済み**（§13参照）——No.6,7,9がPARTIAL→READY。casino completed-
@@ -274,26 +289,25 @@ sourceReadinessとthresholdは別軸——READY 48件のうち、STRUCTURAL_FIXE
 > VC social breadthのJST日次分布も**PR F2fで解消済み**（§18参照）——
 > No.23-25がPARTIAL→READY。公開部屋の実利用safe aggregateも**PR F2gで
 > 解消済み**（§19参照）——No.50-56がBLOCKED→READY、No.57はrole-at-time
-> blockerのみ残る。
+> blockerのみ残る。TC+VC時間帯clusterも**PR F2iで解消済み**（§21参照）——
+> No.32-37がBLOCKED→READY。
 > 以下は残っているクラスタのみを優先度順に並べ直したもの。
 
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
-| 1 | `social_activity_time_safe`(TC+VC)新設 | 6件（No.32-37） | F2hのcanonical TC timestamp metadataと既存VC timelineを共通土台にできる——健康/FOMO対策でCOUNTABLE 0のまま据え置く前提は維持 |
-| 2 | No.48 free-flow continuity protocol / semantic decision | 1件 | F2hでreply/threadはexactになったが、通常TCの同一topicをcontent無しで証明するcanonical protocolが無い。特殊操作を強制しないUX判断が先に必要 |
-| 3 | `invite_retention_safe`新設 | 4件（No.76-79） | 外部勧誘圧のリスクが高いドメイン（optimizationRisk: HIGH）——実装優先度はunblock数以上に安全設計のレビュー時間を要する |
-| 4 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
-| 5 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
-| 6 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
-| 7 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
-| 8 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
-| 9 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
+| 1 | `invite_retention_safe`新設 | 4件（No.76-79） | 次のengineering cluster。外部勧誘圧のリスクが高いドメイン（optimizationRisk: HIGH）なので、retentionのexact semanticとanti-Goodhart設計を先に固める |
+| 2 | economy classifier拡張 + shop purchase source | 4件（No.61,62,63,65） | Land経済は既にE2の土台があるため増分コストが低い |
+| 3 | casino table/market source新設 | 3件（No.70-72） | completion正本（F2b）はあるが、host/guestとmarketは別データモデルの新設が必要 |
+| 4 | event dual-role protocol + event_date露出 | 3件（No.82-84） | `public_events`データモデル自体の拡張が必要——E3の上に直接積めない |
+| 5 | role-at-time基盤 | 単独3件＋複合7件＝最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い——単純unblock数で最優先にしない |
+| 6 | 第I期core game family一覧manifest | 1件（No.69） | completion半分はPR F2bで解消済み——残るのはmanifest策定のみ。他の賭場manifest系（castle_experience等）と合わせて検討してよい |
+| 7 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然（event infra完成待ちでもある、Summary判断#8） |
 
 VC group-size clusterはF2e、VC social breadth clusterはF2f、公開部屋clusterは
-F2g、TC conversation/reactionの7件はF2hで解消した。次はF2hのcanonical TC timestamp
-metadataを再利用できるTC+VC時間帯clusterへ進むのが自然。No.48の残件は
-`social_activity_time_safe`の技術依存ではなく、content無しでfree-flow同一topicを
-どうcanonicalに証明するかという別のproduct/UX判断である。
+F2g、TC conversation/reactionの7件はF2h、TC+VC時間帯clusterはF2iで解消した。
+次のengineering clusterは`invite_retention_safe`。No.48の残件は次のsource実装ではなく、
+content無しでfree-flow同一topicをどうcanonicalに証明するかという別枠のproduct/UX
+semantic decisionであり、特殊操作をユーザーへ強制してREADY化しない。
 
 ## 9. editorial intent → runtime resolution（契約の食い違いの明示）
 
@@ -824,7 +838,7 @@ No.29/30は特定counterpartに紐づいたoverlapをpublic sourceが返さな�
 No.31はpair persistence source不足でBLOCKEDのまま。missingCapabilities・blockerKinds
 も変更していない。registry実集計はREADY 31→34、PARTIAL 5→2、BLOCKED 55・
 META 8は不変。`source_semantic_mismatch`は5→2、`missing_derived_source`は12のまま。
-Theme 7はREADY 4 / PARTIAL 0 / BLOCKED 2、Theme 8はREADY 1 / PARTIAL 2 /
+F2f時点のTheme 7はREADY 4 / PARTIAL 0 / BLOCKED 2、Theme 8はREADY 1 / PARTIAL 2 /
 BLOCKED 1。
 
 ## 19. PR F2g: Public Room Activity Safe Source
@@ -959,3 +973,112 @@ continuation、No.46はanonymous post/day/reactor分布、No.49はTC `socialDays
 0/0/8→7/1/0、`missing_persisted_source` 24→16、`source_semantic_mismatch` 2→3。
 production threshold、BehaviorTitleDefinition、award/notification、catalog activation、
 historical backfillは追加しない。
+
+## 21. PR F2i — Public Social Activity Time Safe
+
+### 21.1 exact source contract / payload
+
+`social_activity_time_safe`は`origin:"derived"`、`derivedFrom:["tc_message_observations",
+"vc_public_social_presence"]`、`privacy:"safe"`、`titleUsable:true`、`orderable:false`、interval
+`windowStart→windowEnd`（clip:true）。raw unitは
+`safe_public_social_activity_hour_distribution`。payloadは次のsparse shapeだけ:
+
+```ts
+{
+  days: [{
+    date: "YYYY-MM-DD",
+    hours: [{ hour: 0..23, tcBestOtherGapMs: number | null,
+              vcTrustedSocialSeconds: number }]
+  }]
+}
+```
+
+days/date ASC、hours/hour ASC。TC gapがnon-nullまたはVC secondsがpositiveなhourだけを出し、
+完全inactive dayは出さない。24hour binはprivacy-safe measurement resolutionであってdaypart
+thresholdではない。morning/afternoon/evening/late-night境界、TC social gap、VC meaningful
+seconds、share/concentration/必要日数は未決定。
+
+### 21.2 TC canonical semantic共有
+
+F2hのbulk subject/area context loaderとsurface-local nearest-other logicを
+`computeTcSocialExchangeCandidates()`へ共有した。standalone投稿はsocial activityにせず、
+subject messageと同一surface内other human messageのnearest gapだけを候補にする。normal
+channelはsurface=channel、thread/forumはsurface=thread。area=parent breadth taxonomyと
+surface=interaction localityを混ぜず、同じforum parent配下のcross-thread temporal adjacencyを
+social evidenceへ変換しない。source内でgap cutoffを置かず、6時間gapも値として保持する。
+message ID/author/counterpart/surface/area/exact time/minute/second/count/contentはpayloadへ出さない。
+
+### 21.3 canonical public VC social presence
+
+`vc_social_safe.trustedOverlapSeconds`はpair-summedなので時間帯durationへ流用しない。
+raw `vc_segments`/`vc_visits`はmain guild/public visibilityを証明しないためF2iの依存から外す。
+代わりにrestricted persisted source `vc_public_social_presence`を追加する。eligibleは
+`settings["guild:main"]`の`GuildVoice`かつ@everyoneの`ViewChannel`/`Connect`双方がtrueの場合だけ。
+role-gated、permission unknown/failure、Stage、other guild、botはfail-closedで除外する。
+
+human occupancyが1→2になったlive observationで在室human全員を同時openし、2→1で全員を
+同時closeする。3 humansを3 pairへ展開せず各user 1 intervalなので、3人同時10秒は各user 10秒。
+VoiceStateUpdateはaffected old/new channelの全human member cacheを収束する。voice自身・親categoryの
+ChannelUpdateとmain guild @everyone RoleUpdateでもpublic/private transitionを再評価する。
+derivedはtrusted observed user intervalsをsubject-global unionしてからJST hourへsplitし、
+同時複数channel corruptionも二重計上せず各hourを0..3600秒に保つ。
+
+dangling intervalはrestart時に`recovered_estimate`で閉じ、現在snapshotでは行ごと除外する。
+起動時刻までobservedとして延長せず、ready時点のmain guild cacheから新intervalを開始するだけで、
+Discord history fetch/backfillを行わない。fixed historical `observedAt`がrecoveryより前なら、当時openと
+観測済みだった範囲だけをそのcutoffへclipし、後発recovery mutationでsnapshotを変えない。
+
+Gatewayのrealtime observationを失った時点で、影響shardのmain guildだけをsuspendし、open rowを
+そのloss boundaryで閉じる。通常のrecoverable closeはDiscord.jsの`ShardReconnecting`、再接続不能は
+`ShardDisconnect`を境界にする。suspend中にResumeでreplayされるVoiceStateUpdateはpayloadに真の
+occurrence timeが無いためsourceへ書かない。replay完了後の`ShardResume`、fresh Identify後の
+`ShardReady`でshard suspensionを解除するが、main guildの`available === false`または
+`unavailableGuilds`残存時はguild suspensionを解除しない。cold startupもunavailable cacheからは
+0 rowのまま待ち、`GuildAvailable`のfull current cacheを観測した時点からだけ新規openする。
+main-guild `GuildVoice`の`ChannelDelete`はVoiceStateUpdateを仮定せずdelete観測時刻で対象open rowを
+closeする。main `GuildDelete`はguild内open rowを全てcloseし、`GuildAvailable`では再開せず、再join時の
+`GuildCreate` full current cacheから新規観測する。disconnect/unavailable/delete区間をhandler受信時刻で
+backfillせず、無関係なguild/shard/channelは停止しない。
+
+### 21.4 snapshot / SQL / privacy / health guard
+
+TCは`created_at_ms`をevent time、`observed_at_ms`をknowledge cutoffとして扱い、VC sidecarは
+Gateway healthy中のhandler entry unix secondsをlive occurrence/knowledge timeとして1回だけ固定する。fixed
+observedAt未来のrowを除外し、後からDBへ追加しても同じsnapshot結果を変えない。requested userと
+TC areaは300-ID chunk。VC sourceはrequested-user bulk 1 queryで、message/surface/channel/hour
+ごとのSQLを発行しない。1200 user/area/surface/presence fixtureでSQLite bind上限とN+1不在を固定した。
+
+sidecarのpermission解決・DB writer・startup scan失敗はcatch/logだけで、既存`trackVoiceState`、
+voice attendance、rooms、XP、その他VoiceStateUpdate consumerへ伝播しない。全判定はDiscord cacheで
+完結し、追加fetch/N+1はない。writer transaction失敗時はchannel-local trust fenceと可能なら同時刻の
+durable closeでopen rowを失敗時刻までにclipする。Gatewayはhealthyなので受信済みchannel snapshotは
+memoryへ順序付きで保留し、次の正常writeで1 transactionに再適用する。これによりfailure→recoveryを
+推測で在室扱いせず、同時に確実に受信したtransitionを不要に捨てない。process restart後のmemory推測は
+行わず、残ったdangling rowは従来どおりuntrusted recoveryにする。1 channelのfailureは他channelへ
+波及しない。safe payloadにはguild/channel/user/permission identityを出さない。
+
+No.32-37は全件SOURCE READY、NONCOUNT、`THRESHOLD_PENDING`。結果はREADY 48→54、
+PARTIAL 3（不変）、BLOCKED 40→34、META 8（不変）。Theme 9は0/0/6→6/0/0、
+`missing_persisted_source`は16→10。No.48は時間帯aggregateではfree-flow同一topicを
+証明できないためPARTIALを維持する。streak、連続日、深夜量ranking、raw message/VC visit
+count、「あと何時間」のprogress barは作らず、夜更かし/FOMOをrewardしない。production
+BehaviorTitleDefinition、award/notification/catalog activation、historical backfill、
+daypart/thresholdは追加しない。
+
+### 21.5 既存VC candidate public-semantics再監査（readiness補正）
+
+F2i以外も独立再監査した結果、候補原文が明示的にpublicを要求する一方、公開分類のない
+`vc_visits`系derivedを使う候補は次の3件だった。`vc_public_social_presence`は時間帯用の
+user-level intervalであり、empty-start/last-occupant/counterpart identity breadthを代替しない。
+他にmain/public provenanceをexactに証明するsourceもないため、3件をREADY→PARTIAL、
+`blockerKinds:["source_semantic_mismatch"]`へ補正した。
+
+| candidate | current source chain | impact |
+| --- | --- | --- |
+| No.1 火種 | `vc_empty_start_then_joined` → `vc_visits` | private/role-gated/other-guild VCが「空の公開VC」証拠になり得る |
+| No.6 残り火 | `vc_last_occupant` → `vc_visits` | private/role-gated/other-guild VCが「複数人の公開VC」証拠になり得る |
+| No.22 顔馴染み | `vc_social_safe` → `vc_co_presence` → `vc_visits` | private/role-gated/other-guild co-presenceが「公開の有効共在」breadthへ入り得る |
+
+実集計はREADY 51 / PARTIAL 6 / BLOCKED 34 / META 8。No.32-37は専用sourceが
+main guild + public GuildVoice + human occupancy + Gateway/writer trust boundaryを証明するため
+READYを維持する。threshold/award/production definitionはこの補正では追加しない。

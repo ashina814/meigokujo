@@ -109,6 +109,7 @@ const ECON_FILE = "packages/core/src/titles/v2-economy.ts";
 const CASINO_FILE = "packages/core/src/titles/v2-casino.ts";
 const EVENT_SERVICE_FILE = "packages/core/src/public-events/service.ts";
 const ROOMS_DERIVED_FILE = "packages/core/src/rooms/derived.ts";
+const SOCIAL_ACTIVITY_TIME_FILE = "packages/core/src/social-activity-time/derived.ts";
 
 // ─────────────────────────────────────────────────────────────
 // Theme 1: 場を起こす (vc_ignite, No.1-5) — source: vc_empty_start_then_joined
@@ -116,16 +117,17 @@ const ROOMS_DERIVED_FILE = "packages/core/src/rooms/derived.ts";
 const THEME_01: ManualReadinessEntry[] = [
   {
     no: 1,
-    status: "READY",
+    status: "PARTIAL",
     usableSources: ["vc_empty_start_then_joined"],
     specializedResolvers: ["computeEmptyStartThenJoined"],
-    missingCapabilities: [],
+    missingCapabilities: ["main guildかつpublic VCだったことを証明するprovenance"],
     evidence: [
       { file: VC_SOURCES_FILE, symbol: "vc_empty_start_then_joined" },
       { file: VC_DERIVED_FILE, symbol: "computeEmptyStartThenJoined" },
     ],
-    notes: "facts配列の初回出現＝初回成立。追加dimension不要。",
-    blockerKinds: ["none"],
+    notes:
+      "初回成立構造は表現できるが、vc_empty_start_then_joinedは公開分類のないvc_visits由来。private/role-gated/other-guild VCを候補原文の「静かな公開VC」から除外できないためpublic-classified sourceへの移行が必要。",
+    blockerKinds: ["source_semantic_mismatch"],
     optimizationRisk: "LOW",
   },
   {
@@ -180,14 +182,14 @@ const THEME_01: ManualReadinessEntry[] = [
 const THEME_02: ManualReadinessEntry[] = [
   {
     no: 6,
-    status: "READY",
+    status: "PARTIAL",
     usableSources: ["vc_last_occupant"],
     specializedResolvers: ["computeLastOccupant"],
-    missingCapabilities: [],
+    missingCapabilities: ["main guildかつpublic VCだったことを証明するprovenance"],
     evidence: [{ file: VC_DERIVED_FILE, symbol: "computeLastOccupant" }],
     notes:
-      "PR F2aで修正: computeLastOccupant()のsame-second/0-second visit tie bug（xlsx Blocker記載）を解消済み——departingと同秒にstartする第三者（0秒visitを含む）をambiguousとしてblockする分岐を追加し、mutation self-verifyで確認済み。意味自体を表現するのに追加のsourceは不要。",
-    blockerKinds: ["none"],
+      "PR F2aでsame-second/0-second tie bugは解消済み。ただしvc_last_occupantは公開分類のないvc_visits由来で、private/role-gated/other-guild VCを候補原文の「複数人の公開VC」から除外できない。public provenanceを持つsourceへの移行が必要。",
+    blockerKinds: ["source_semantic_mismatch"],
     optimizationRisk: "LOW",
   },
   {
@@ -253,14 +255,14 @@ const THEME_03_06: ManualReadinessEntry[] = [10, 11, 12, 13, 14, 15, 16, 17, 18,
 const THEME_07: ManualReadinessEntry[] = [
   {
     no: 22,
-    status: "READY",
+    status: "PARTIAL",
     usableSources: ["vc_social_safe"],
     specializedResolvers: ["computeSafeSocialAggregates"],
-    missingCapabilities: [],
+    missingCapabilities: ["main guildかつpublic VCのcounterpart breadth provenance"],
     evidence: [{ file: VC_SOURCES_FILE, symbol: "VcSocialSafeSourcePayload.distinctCoPresentUsers" }],
     notes:
-      "distinctCoPresentUsersが直接この意味を表現する。semanticSpec「複数の異なる相手と、公開の有効共在が成立する」は時間的な広がりを要求しない——1 windowの累積distinct数だけで満たせる（PR #164レビュー§BLOCKER3で再確認、READY維持）。",
-    blockerKinds: ["none"],
+      "distinctCoPresentUsersは時間的広がりを要求しないbreadth自体は表現するが、vc_social_safe→vc_co_presence→vc_visitsはpublic/private provenanceを持たない。private/role-gated/other-guild共在を候補原文の「公開の有効共在」から除外できない。",
+    blockerKinds: ["source_semantic_mismatch"],
     optimizationRisk: "LOW",
   },
   {
@@ -379,13 +381,17 @@ const THEME_08: ManualReadinessEntry[] = [
 // ─────────────────────────────────────────────────────────────
 const THEME_09: ManualReadinessEntry[] = [32, 33, 34, 35, 36, 37].map((no) => ({
   no,
-  status: "BLOCKED" as const,
-  usableSources: [],
-  specializedResolvers: [],
-  missingCapabilities: ["TC+VC統合のJST daypart safe aggregate"],
-  evidence: [{ file: "packages/core/src/text-activity/service.ts", symbol: "text_active_days (day-collapsed, no daypart distribution)" }],
-  notes: "text_active_daysは日単位で最初の1件だけを保持し、日内の時間分布を失う。VC側にも汎用presenceのdaypart sourceが無い。social_activity_time_safe (TC+VC) は未実装のまま（xlsx判断と現repoで一致）。",
-  blockerKinds: ["missing_persisted_source"] as const,
+  status: "READY" as const,
+  usableSources: ["social_activity_time_safe"] as const,
+  specializedResolvers: ["computeSocialActivityTimeSafe"],
+  missingCapabilities: [],
+  evidence: [
+    { file: VC_SOURCES_FILE, symbol: "SocialActivityTimeSafeSourcePayload" },
+    { file: SOCIAL_ACTIVITY_TIME_FILE, symbol: "computeSocialActivityTimeSafe" },
+  ],
+  notes:
+    "PR F2i: canonical same-surface TC exchange候補と、main guild/public GuildVoice/human occupancyをliveに証明するvc_public_social_presenceのtrusted wall-clock unionをJST date×24hour sparse分布へ統合した。hourはprivacy-safe measurement resolutionであり、daypart境界・TC gap・VC meaningful seconds・share/concentration・必要日数はproduction calibrationへ残す。日付構造により一晩だけの多hourと多数日への分散を区別できる。全件NONCOUNTで、streakや夜更かし量rewardは作らない。",
+  blockerKinds: ["none"] as const,
   optimizationRisk: "HIGH" as const,
 }));
 
