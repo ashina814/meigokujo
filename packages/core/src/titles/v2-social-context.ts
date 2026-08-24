@@ -5,6 +5,7 @@ import {
   type TitleWindow,
   type TrustedCoPresenceSlice,
 } from "../vc/derived.js";
+import { loadTrustedRoleFamilyIntervals } from "../role-family/domain-temporal.js";
 
 export interface SocialClassContextSafePayload {
   readonly counterparts: ReadonlyArray<{
@@ -122,98 +123,20 @@ function roleFamilyIntervals(
   end: number,
   relevantUsers: ReadonlySet<string>,
 ): Map<string, KnownInterval[]> {
-  const roleRows = db.prepare(
-    `SELECT r.id AS revision_id, mr.role_id, mr.family_key
-       FROM role_family_manifest_revisions r
-       JOIN role_family_manifest_roles mr ON mr.revision_id = r.id
-      WHERE r.activated_at < ?
-      ORDER BY r.id, mr.role_id, mr.family_key`,
-  ).all(end) as Array<{ revision_id: number; role_id: unknown; family_key: unknown }>;
-  const invalidRevisions = new Set<number>();
-  const ownerByRevisionRole = new Map<string, string>();
-  for (const row of roleRows) {
-    if (!safeInteger(row.revision_id) || !nonEmpty(row.role_id) || !nonEmpty(row.family_key)) {
-      if (safeInteger(row.revision_id)) invalidRevisions.add(row.revision_id);
-      continue;
-    }
-    const key = `${row.revision_id}\u0000${row.role_id}`;
-    const owner = ownerByRevisionRole.get(key);
-    if (owner && owner !== row.family_key) invalidRevisions.add(row.revision_id);
-    ownerByRevisionRole.set(key, row.family_key);
-  }
-
-  const rows = db.prepare(
-    `SELECT p.id, p.guild_id, p.session_id, p.manifest_revision_id, p.user_id,
-            p.family_key, p.started_at, p.ended_at, p.end_reason,
-            s.guild_id AS session_guild_id, s.manifest_revision_id AS session_revision_id,
-            s.started_at AS session_started_at, s.last_checkpoint_at, s.ended_at AS session_ended_at,
-            s.end_quality, r.guild_id AS revision_guild_id, r.activated_at,
-            (SELECT COUNT(*) FROM role_family_manifest_roles mr
-              WHERE mr.revision_id = p.manifest_revision_id AND mr.family_key = p.family_key) AS mapped_roles
-       FROM role_family_member_presence p
-       JOIN role_observation_sessions s ON s.id = p.session_id
-       JOIN role_family_manifest_revisions r ON r.id = p.manifest_revision_id
-       JOIN role_family_manifest_family_tags tag
-         ON tag.revision_id = p.manifest_revision_id
-        AND tag.family_key = p.family_key
-        AND tag.tag = 'public_department'
-      WHERE p.started_at < ?
-      ORDER BY p.user_id, p.started_at, p.id`,
-  ).all(end) as Array<Record<string, unknown>>;
-  const rawByUser = new Map<string, KnownInterval[]>();
-  const corruptUsers = new Set<string>();
-  for (const row of rows) {
-    const userId = row.user_id;
-    if (!nonEmpty(userId) || !relevantUsers.has(userId)) continue;
-    const revisionId = row.manifest_revision_id;
-    const startedAt = row.started_at;
-    const endedAt = row.ended_at;
-    const coverageEnd = row.session_ended_at ?? row.last_checkpoint_at;
-    const valid =
-      safeInteger(row.id) && safeInteger(row.session_id) && safeInteger(revisionId)
-      && !invalidRevisions.has(revisionId)
-      && nonEmpty(row.guild_id) && row.guild_id === row.session_guild_id && row.guild_id === row.revision_guild_id
-      && row.session_revision_id === revisionId && nonEmpty(row.family_key)
-      && safeInteger(startedAt) && safeInteger(row.session_started_at) && safeInteger(row.activated_at)
-      && startedAt >= (row.session_started_at as number) && startedAt >= (row.activated_at as number)
-      && safeInteger(row.last_checkpoint_at) && safeInteger(coverageEnd)
-      && (endedAt === null || safeInteger(endedAt))
-      && (row.mapped_roles as number) > 0
-      && (coverageEnd as number) >= startedAt
-      && (endedAt === null || (endedAt as number) <= (coverageEnd as number));
-    if (!valid) {
-      corruptUsers.add(userId);
-      continue;
-    }
-    const knownStart = (startedAt as number) + 1;
-    const knownEnd = Math.min((endedAt ?? coverageEnd) as number, end);
-    if (knownEnd <= knownStart) continue;
-    const interval = { category: row.family_key as string, start: knownStart, end: knownEnd };
-    const list = rawByUser.get(userId);
-    if (list) list.push(interval);
-    else rawByUser.set(userId, [interval]);
-  }
-
   const result = new Map<string, KnownInterval[]>();
-  for (const [userId, intervals] of rawByUser) {
-    if (corruptUsers.has(userId)) continue;
-    const byFamily = new Map<string, KnownInterval[]>();
-    for (const interval of intervals) {
-      const list = byFamily.get(interval.category);
-      if (list) list.push(interval);
-      else byFamily.set(interval.category, [interval]);
+  for (const [userId, intervals] of loadTrustedRoleFamilyIntervals(
+    db,
+    [...relevantUsers],
+    "public_department",
+    { start: 0, end },
+  )) {
+    if (intervals.length > 0) {
+      result.set(userId, intervals.map((interval) => ({
+        category: interval.familyKey,
+        start: interval.start,
+        end: interval.end,
+      })));
     }
-    const merged: KnownInterval[] = [];
-    for (const [category, familyIntervals] of byFamily) {
-      familyIntervals.sort((a, b) => a.start - b.start || a.end - b.end);
-      for (const interval of familyIntervals) {
-        const previous = merged.at(-1);
-        if (previous?.category === category && interval.start <= previous.end) {
-          merged[merged.length - 1] = { ...previous, end: Math.max(previous.end, interval.end) };
-        } else merged.push(interval);
-      }
-    }
-    result.set(userId, merged);
   }
   return result;
 }

@@ -16,6 +16,7 @@ import {
   type SafePeerEconomyActionKind,
 } from "./v2-economy.js";
 import { computeShopPurchaseSafe, type ShopPurchaseSafePayload } from "./v2-shop-purchases.js";
+import { computeShopRolePurchaseSafe, type ShopRolePurchaseSafePayload } from "./v2-domain-role.js";
 import { computeCasinoActivityDays, computeCasinoCompletedActivityDays } from "./v2-casino.js";
 import type { CasinoActivityKey } from "../casino/participation-history.js";
 import {
@@ -196,6 +197,7 @@ export type CasinoMarketActivitySafeSourcePayload = CasinoMarketActivitySafePayl
 
 export type EconomySemanticSafeSourcePayload = EconomySemanticSafePayload;
 export type ShopPurchaseSafeSourcePayload = ShopPurchaseSafePayload;
+export type ShopRolePurchaseSafeSourcePayload = ShopRolePurchaseSafePayload;
 
 export type TcConversationSafeSourcePayload = TcConversationSafePayload;
 export type TcReactionSafeSourcePayload = TcReactionSafePayload;
@@ -239,6 +241,7 @@ export interface TitleSourcePayloads {
   economy_safe_peer_actions: EconomySafePeerActionsSourcePayload;
   economy_semantic_safe: EconomySemanticSafeSourcePayload;
   shop_purchase_safe: ShopPurchaseSafeSourcePayload;
+  shop_role_purchase_safe: ShopRolePurchaseSafeSourcePayload;
   public_event_participations: PublicEventParticipationsSourcePayload;
   public_event_completed_participations: PublicEventCompletedParticipationsSourcePayload;
   public_event_calendar_involvement_safe: PublicEventCalendarInvolvementSafeSourcePayload;
@@ -719,6 +722,24 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
     return { payloads, readCalls };
   },
 
+  shop_role_purchase_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, ShopRolePurchaseSafeSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { days: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return { payloads, readCalls: 0 };
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      for (const row of computeShopRolePurchaseSafe(
+        db,
+        { start: scope.start, end: effectiveEnd },
+        chunk,
+      )) payloads.set(row.userId, row.payload);
+    }
+    return { payloads, readCalls };
+  },
+
   public_event_participations: (db, userIds, scope) => {
     const payloads = new Map<string, PublicEventParticipationsSourcePayload>();
     for (const userId of userIds) payloads.set(userId, { participations: [] });
@@ -940,6 +961,8 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
     BULK_SOURCE_READERS.economy_semantic_safe(db, [userId], scope).payloads.get(userId)!,
   shop_purchase_safe: (db, userId, scope) =>
     BULK_SOURCE_READERS.shop_purchase_safe(db, [userId], scope).payloads.get(userId)!,
+  shop_role_purchase_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.shop_role_purchase_safe(db, [userId], scope).payloads.get(userId)!,
   public_event_participations: (db, userId, scope) =>
     BULK_SOURCE_READERS.public_event_participations(db, [userId], scope).payloads.get(userId)!,
   public_event_completed_participations: (db, userId, scope) =>

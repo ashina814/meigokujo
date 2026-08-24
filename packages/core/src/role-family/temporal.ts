@@ -21,6 +21,17 @@ export interface RoleFamilyObservedMember {
   readonly bot: boolean;
 }
 
+/**
+ * Domain tags backed by actual production authorization checks.
+ *
+ * `冥界商館` is the exact department key used by `/商館`'s canOperate() permission
+ * boundary. No inn/economy/casino mapping is inferred from department/role names or
+ * notification/benefit role slots.
+ */
+export const CANONICAL_DEPARTMENT_DOMAIN_TAGS: Readonly<Record<string, readonly RoleFamilyTag[]>> = Object.freeze({
+  "冥界商館": Object.freeze(["shop"] as const),
+});
+
 export type RoleObservationEndQuality =
   | "disconnect"
   | "guild_unavailable"
@@ -86,8 +97,8 @@ function canonicalManifest(input: RoleFamilyManifest): CanonicalManifest {
 
 /**
  * `departments` is the existing canonical department↔Discord-role mapping. F3a snapshots that
- * mapping without inferring anything from department names. Domain tags remain absent until an
- * explicit future manifest supplies them; every row is only tagged `public_department` here.
+ * mapping without inferring anything from department names. Only mappings backed by an actual
+ * production authorization boundary receive a domain tag; all rows remain public departments.
  */
 export function buildPublicDepartmentRoleFamilyManifest(db: Database.Database): RoleFamilyManifest {
   const rows = db.prepare(
@@ -100,7 +111,7 @@ export function buildPublicDepartmentRoleFamilyManifest(db: Database.Database): 
     families: rows.map((row) => ({
       familyKey: `department:${requireId(row.key, "department key")}`,
       roleIds: [requireId(row.role_id, "department roleId")],
-      tags: ["public_department"],
+      tags: ["public_department", ...(CANONICAL_DEPARTMENT_DOMAIN_TAGS[row.key] ?? [])],
     })),
   };
 }
