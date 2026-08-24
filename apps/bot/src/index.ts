@@ -144,6 +144,7 @@ import {
   trackRoleFamilyMemberRemove,
   trackRoleFamilyMemberUpdate,
 } from "./role-family-tracking.js";
+import { runCasinoRecoveryBeforeRoleFamilyTracking } from "./startup-safety.js";
 
 const services = buildServices();
 const client = new Client({
@@ -165,12 +166,14 @@ inviteTracker.wire();
 client.once(Events.ClientReady, async (ready) => {
   console.log(`⚔️ 冥獄城ボット 起動: ${ready.user.tag}`);
   initializeVcPublicSocialPresence(ready, services);
-  await initializeRoleFamilyTracking(ready, services).catch((error) =>
-    console.error("[role-family] startup observation failed", error),
-  );
   // 外部Discord APIへ触る復旧より先に、同期の賭場安全確認を必ず完了させる。
   // 再起動直後にstatus=openのまま外部I/O待ちになるfail-open窓を作らない。
-  runCasinoRecovery(services);
+  await runCasinoRecoveryBeforeRoleFamilyTracking(
+    () => { runCasinoRecovery(services); },
+    () => initializeRoleFamilyTracking(ready, services).then(() => undefined).catch((error) =>
+      console.error("[role-family] startup observation failed", error),
+    ),
+  );
   // 位名(rank title) live wiringの取りこぼしをローカルDBだけで自己修復する（PR D2）。
   // 外部Discord APIは使わない・失敗してもBot起動は継続する（内部でcatch済み）。
   // startup成功はdaily reconcileのmarkerを立てない——別概念（startup repair と
