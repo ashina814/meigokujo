@@ -414,6 +414,8 @@ describe("PR F2k: economy semantic family + shop purchase safe readiness", () =>
         blockerKinds: ["none"],
       });
     }
+    expect(readinessFor(63).notes).toContain("subjectUsedFamilies");
+    expect(readinessFor(63).notes).toContain("incoming-only family");
   });
 
   it("No.62はshop sourceでREADY、No.60/64/65は残るexact blockerだけを保持", () => {

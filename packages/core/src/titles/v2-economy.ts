@@ -77,10 +77,16 @@ export interface EconomySemanticSafePayload {
   readonly days: ReadonlyArray<{
     readonly date: string;
     readonly families: readonly EconomyFeatureFamily[];
+    /** subject自身がこの日にoutflowとして利用したfamily。incomingは含めない。 */
+    readonly subjectUsedFamilies: readonly EconomyFeatureFamily[];
     readonly directions: readonly NaturalEconomyDirection[];
     readonly distinctHumanCounterparts: number;
   }>;
+  /** No.61用: inflow/outflow双方で観測したeconomy family全体。 */
   readonly distinctFamilies: number;
+  /** No.63用: subject自身がoutflowとして正常利用したfamilyだけ。 */
+  readonly subjectUsedFamilies: readonly EconomyFeatureFamily[];
+  readonly distinctSubjectUsedFamilies: number;
   readonly distinctHumanCounterparts: number;
   readonly hasNaturalInflow: boolean;
   readonly hasNaturalOutflow: boolean;
@@ -279,12 +285,14 @@ export function computeEconomySemanticSafe(
 
   interface DayAggregate {
     families: Set<EconomyFeatureFamily>;
+    subjectUsedFamilies: Set<EconomyFeatureFamily>;
     directions: Set<NaturalEconomyDirection>;
     counterparts: Set<string>;
   }
   interface UserAggregate {
     days: Map<string, DayAggregate>;
     families: Set<EconomyFeatureFamily>;
+    subjectUsedFamilies: Set<EconomyFeatureFamily>;
     counterparts: Set<string>;
     tipDays: Map<string, Set<string>>;
     tipRecipients: Set<string>;
@@ -295,6 +303,7 @@ export function computeEconomySemanticSafe(
     byUser.set(userId, {
       days: new Map(),
       families: new Set(),
+      subjectUsedFamilies: new Set(),
       counterparts: new Set(),
       tipDays: new Map(),
       tipRecipients: new Set(),
@@ -308,11 +317,16 @@ export function computeEconomySemanticSafe(
     aggregate.directions.add(activity.direction);
     const day = aggregate.days.get(activity.date) ?? {
       families: new Set<EconomyFeatureFamily>(),
+      subjectUsedFamilies: new Set<EconomyFeatureFamily>(),
       directions: new Set<NaturalEconomyDirection>(),
       counterparts: new Set<string>(),
     };
     day.families.add(activity.family);
     day.directions.add(activity.direction);
+    if (activity.direction === "outflow") {
+      aggregate.subjectUsedFamilies.add(activity.family);
+      day.subjectUsedFamilies.add(activity.family);
+    }
     if (activity.humanCounterpartId !== null) {
       aggregate.counterparts.add(activity.humanCounterpartId);
       day.counterparts.add(activity.humanCounterpartId);
@@ -336,10 +350,13 @@ export function computeEconomySemanticSafe(
           .map(([date, day]) => ({
             date,
             families: FAMILY_ORDER.filter((family) => day.families.has(family)),
+            subjectUsedFamilies: FAMILY_ORDER.filter((family) => day.subjectUsedFamilies.has(family)),
             directions: DIRECTION_ORDER.filter((direction) => day.directions.has(direction)),
             distinctHumanCounterparts: day.counterparts.size,
           })),
         distinctFamilies: aggregate.families.size,
+        subjectUsedFamilies: FAMILY_ORDER.filter((family) => aggregate.subjectUsedFamilies.has(family)),
+        distinctSubjectUsedFamilies: aggregate.subjectUsedFamilies.size,
         distinctHumanCounterparts: aggregate.counterparts.size,
         hasNaturalInflow: aggregate.directions.has("inflow"),
         hasNaturalOutflow: aggregate.directions.has("outflow"),

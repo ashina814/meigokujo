@@ -256,6 +256,59 @@ describe("Economy regressions A–P", () => {
   });
 });
 
+describe("No.63 subject-initiated semantic family breadth", () => {
+  it("incoming transfer + incoming tip onlyはoverall 2 familyだがsubject-used breadth 0", () => {
+    const ctx = setup();
+    peer(ctx.ledger, "bob", "alice", "transfer", BASE + DAY);
+    peer(ctx.ledger, "carol", "alice", "tip", BASE + 2 * DAY);
+
+    const payload = readTitleSource(ctx.db, "economy_semantic_safe", "alice", scope(ctx, BASE + 3 * DAY));
+    expect(payload.distinctFamilies).toBe(2);
+    expect(payload.subjectUsedFamilies).toEqual([]);
+    expect(payload.distinctSubjectUsedFamilies).toBe(0);
+    expect(payload.days.every((day) => day.subjectUsedFamilies.length === 0)).toBe(true);
+  });
+
+  it("outgoing transfer onlyはsubject-used peer_transfer 1", () => {
+    const ctx = setup();
+    peer(ctx.ledger, "alice", "bob", "transfer", BASE + DAY);
+
+    const payload = readTitleSource(ctx.db, "economy_semantic_safe", "alice", scope(ctx, BASE + 2 * DAY));
+    expect(payload.subjectUsedFamilies).toEqual(["peer_transfer"]);
+    expect(payload.distinctSubjectUsedFamilies).toBe(1);
+  });
+
+  it("outgoing tip + storefront shopはsubject-used family breadth 2", () => {
+    const ctx = setup();
+    peer(ctx.ledger, "alice", "bob", "tip", BASE + DAY);
+    const item = normalItem(ctx, "subject-used-shop");
+    buy(ctx, "alice", item.id, BASE + 2 * DAY);
+
+    const payload = readTitleSource(ctx.db, "economy_semantic_safe", "alice", scope(ctx, BASE + 3 * DAY));
+    expect(payload.subjectUsedFamilies).toEqual(["tip", "shop"]);
+    expect(payload.distinctSubjectUsedFamilies).toBe(2);
+  });
+
+  it("same JST dayのincoming transferとoutgoing tipでfamilyごとのdirectionを取り違えない", () => {
+    const ctx = setup();
+    peer(ctx.ledger, "bob", "alice", "transfer", BASE + DAY + 10);
+    peer(ctx.ledger, "alice", "carol", "tip", BASE + DAY + 20);
+
+    const payload = readTitleSource(ctx.db, "economy_semantic_safe", "alice", scope(ctx, BASE + 2 * DAY));
+    expect(payload.days).toEqual([
+      {
+        date: "2026-08-02",
+        families: ["peer_transfer", "tip"],
+        subjectUsedFamilies: ["tip"],
+        directions: ["inflow", "outflow"],
+        distinctHumanCounterparts: 2,
+      },
+    ]);
+    expect(payload.subjectUsedFamilies).toEqual(["tip"]);
+    expect(payload.distinctSubjectUsedFamilies).toBe(1);
+  });
+});
+
 describe("Shop regressions Q–AG", () => {
   it("Q/R: normal Land/alternative storefront purchaseはeligible fact", () => {
     const ctx = setup();

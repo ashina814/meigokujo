@@ -237,7 +237,7 @@ READYを支えている既存`titleUsable:true` source（17種、59件）:
 - `confirmed_invites`（No.74-75 のみ——`invitee_id UNIQUE`によりdistinct数が保証される）
 - `invite_rooted_safe`（No.76-79——confirmed direct relation、immutable entry anchor、canonical public activity/network/pair reunionをanonymous direct-branch profileへ統合、§22参照）
 - `economy_safe_peer_actions`（No.58——snapshot時点でreverse済みoriginalを除外、§15参照）
-- `economy_semantic_safe`（No.59/61/63——explicit semantic family、natural in/out、human counterpart/day breadth、§23参照）
+- `economy_semantic_safe`（No.59/61/63——explicit semantic family、natural in/out、human counterpart/day breadth、subject-initiated family breadth、§23参照）
 - `shop_purchase_safe`（No.62——immutable storefront origin/productとsnapshot-bounded refund/cancel、§23参照）
 - `public_event_completed_participations`（No.80-81——明示staff completion正本と同一roster revisionへJOIN、§16参照）
 - `public_room_activity_safe`（No.50-56——room lifecycleとtrusted logical VC visitの交差をidentityなしでhosted/guest/ownUseへ集計、§19参照）
@@ -1295,8 +1295,10 @@ restricted内部でcounterpart identityをglobal/day distinct集合へ畳み、s
 
 ```ts
 {
-  days: [{ date, families, directions, distinctHumanCounterparts }],
+  days: [{ date, families, subjectUsedFamilies, directions, distinctHumanCounterparts }],
   distinctFamilies,
+  subjectUsedFamilies,
+  distinctSubjectUsedFamilies,
   distinctHumanCounterparts,
   hasNaturalInflow,
   hasNaturalOutflow,
@@ -1307,9 +1309,13 @@ restricted内部でcounterpart identityをglobal/day distinct集合へ畳み、s
 }
 ```
 
-No.61は複数日・family・human counterpart・inflow・outflowを同じwindowでthreshold未固定のまま
-同時評価できる。No.59はoutgoing normal tipだけのrecipient union/day分布を使い、transfer recipientを
-混ぜない。user/account/counterpart identity、amount、transaction/purchase ID、exact timestamp、reason/refは
+No.61は複数日・overall family・human counterpart・inflow・outflowを同じwindowでthreshold未固定のまま
+同時評価できる。overall `families`/`distinctFamilies`はinflow/outflow双方を含む。一方No.63は、
+subject自身がoutflowとして正常利用したfamilyだけをJST日別/global
+`subjectUsedFamilies`/`distinctSubjectUsedFamilies`で評価する。incoming-only transfer/tipはこの
+breadthを増やさず、同日のincoming transfer + outgoing tipもsubject-usedは`tip`だけとなる。
+No.59はoutgoing normal tipだけのrecipient union/day分布を使い、transfer recipientを混ぜない。
+user/account/counterpart identity、amount、transaction/purchase ID、exact timestamp、reason/refは
 公開しない。No.60の同一pair inflow→別機会outflow chronologyは意図的に公開せずBLOCKEDを維持する。
 
 bulk readerは300 userごとにSQLを発行し、transaction/purchase/counterpart/itemごとのN+1を作らない。
@@ -1324,7 +1330,7 @@ fixed observedAtではfuture transaction/purchase/refund/cancelを混ぜない�
 | 60 | BLOCKED | 同一counterpartのpair chronology不足 |
 | 61 | READY | natural in/out + human breadth + explicit family + JST days |
 | 62 | READY | immutable eligible product breadth + snapshot refund/cancel |
-| 63 | READY | tx type数ではなくstable semantic family manifest数 |
+| 63 | READY | tx type数ではなく、subject自身がoutflowとして正常利用したstable semantic family breadth |
 | 64 | BLOCKED | normal economy sourceは揃ったが経済role-at-time不足 |
 | 65 | BLOCKED | normal eligible storefront purchaseは揃ったが商館role-at-time不足 |
 

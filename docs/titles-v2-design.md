@@ -1964,8 +1964,10 @@ delivery pending/failedはpurchase成立と独立、expiredもhistorical purchas
 rename/update/disableで過去identityを変えない。既存rowをcurrent stateからbackfillしない。
 
 `shop_purchase_safe`はJST日別/global distinct eligible product countだけ、
-`economy_semantic_safe`はJST day×family×direction×human breadth、global family/counterpart breadth、
-natural in/out、outgoing tip限定recipient/day breadthだけを公開する。identity/amount/price/raw count/
+`economy_semantic_safe`はJST day×overall family×direction×human breadth、global overall family/counterpart
+breadth、natural in/out、outgoing tip限定recipient/day breadthに加え、subject自身がoutflowとして
+正常利用したfamilyだけのJST日別/global breadthを公開する。incoming-only familyはNo.61の
+overall breadthには寄与するが、No.63のsubject-used breadthを増やさない。identity/amount/price/raw count/
 transaction/purchase ID/exact timestampは出さない。No.59/61/62/63をSOURCE READY、No.60はpair
 chronology、No.64/65はrole-at-time待ち。実集計はREADY 59 / PARTIAL 6 / BLOCKED 26 / META 8。
 production threshold、award/notification、ranking、historical inferred backfill、merge/deployは無い。
