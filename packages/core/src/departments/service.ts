@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { Ledger, type TransferResult } from "../ledger/service.js";
+import { invalidateRoleObservationCoverageForManifestChange } from "../role-family/temporal.js";
 
 /**
  * 部署口座（経済設計.md §5）。旧「業務用」残高の後継。
@@ -54,11 +55,29 @@ export interface DeptTxArgs {
   refId?: string;
 }
 
+export interface DepartmentRoleMappingChange {
+  readonly key: string;
+  readonly previousRoleId: string | null;
+  readonly nextRoleId: string | null;
+  readonly observedAt: number;
+}
+
 export class Departments {
+  private readonly roleMappingListeners = new Set<(change: DepartmentRoleMappingChange) => void>();
+
   constructor(
     private readonly db: Database.Database,
     private readonly ledger: Ledger,
   ) {}
+
+  onRoleMappingChanged(listener: (change: DepartmentRoleMappingChange) => void): () => void {
+    this.roleMappingListeners.add(listener);
+    return () => this.roleMappingListeners.delete(listener);
+  }
+
+  private notifyRoleMappingChanged(change: DepartmentRoleMappingChange): void {
+    for (const listener of this.roleMappingListeners) listener(change);
+  }
 
   /** 部署を登録／更新（同じキーなら名前・ロールを差し替え）。口座も同時に用意する */
   upsert(key: string, name: string, roleId: string | null): DepartmentRow {
@@ -67,15 +86,23 @@ export class Departments {
     if (!k || k.includes(":") || k.length > 40) {
       throw new DepartmentError("ERR_DEPT_BAD_KEY", { key });
     }
+    const previousRoleId = this.get(k)?.role_id ?? null;
+    const nextRoleId = roleId?.trim() || null;
     this.ledger.ensureAccount(deptAccount(k), "system");
     const ts = now();
-    this.db
-      .prepare(
+    const write = this.db.transaction(() => {
+      this.db.prepare(
         `INSERT INTO departments (key, name, role_id, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(key) DO UPDATE SET name = excluded.name, role_id = excluded.role_id, updated_at = excluded.updated_at`,
       )
-      .run(k, name.trim() || k, roleId, ts, ts);
+      .run(k, name.trim() || k, nextRoleId, ts, ts);
+      if (previousRoleId !== nextRoleId) invalidateRoleObservationCoverageForManifestChange(this.db, ts);
+    });
+    write.immediate();
+    if (previousRoleId !== nextRoleId) {
+      this.notifyRoleMappingChanged({ key: k, previousRoleId, nextRoleId, observedAt: ts });
+    }
     return this.get(k)!;
   }
 
@@ -109,11 +136,19 @@ export class Departments {
 
   /** 部署を削除。残高が残っていると消せない（先に出金・回収させる） */
   remove(key: string): void {
-    this.require(key);
+    const previous = this.require(key);
     if (this.balanceOf(key) !== 0) {
       throw new DepartmentError("ERR_DEPT_HAS_BALANCE", { key, balance: this.balanceOf(key) });
     }
-    this.db.prepare("DELETE FROM departments WHERE key = ?").run(key);
+    const ts = now();
+    const remove = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM departments WHERE key = ?").run(key);
+      if (previous.role_id) invalidateRoleObservationCoverageForManifestChange(this.db, ts);
+    });
+    remove.immediate();
+    if (previous.role_id) {
+      this.notifyRoleMappingChanged({ key, previousRoleId: previous.role_id, nextRoleId: null, observedAt: ts });
+    }
   }
 
   /** そのユーザーがこの部署を操作できるか（担当ロール保持者。運営判定はbot側で別途） */

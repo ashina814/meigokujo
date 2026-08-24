@@ -2020,6 +2020,34 @@ invalid role/user/date、future date、completion chronology corruptionはreader
 1 SQL、601 subjectsは300/300/1の3 reads。No.80/81は既存contractを維持し、No.82-84をSOURCE READYへ更新。
 overallはREADY 66 / PARTIAL 6 / BLOCKED 19 / META 8。threshold/award/notification/backfillは無い。
 
+### F3a — Trusted Class / Role-Family Temporal Provenance + Social Context
+
+class-at-timeはDiscord rank roleの途中状態ではなくcanonical `souls.status`を使う。
+`soul_status_history`はsoul INSERTとsemantic status changeをDB triggerでtransactional appendし、
+既存soul baselineは導入観測時刻からだけ有効にする。joined/ghost/current-role evidenceから過去を
+補完しない。ghost/majin/kenma/mazoku/meireiだけがpublic classで、waiting/departedは除外する。
+second-resolutionのtransition秒は前後不明なので、その秒をknown-positive intervalへ含めない。
+
+role-familyはimmutable versioned manifest、trusted gateway observation session、member family presenceへ
+分離する。F3aで根拠を確認できたmappingはcanonical `departments.key ↔ role_id`だけなので、各departmentを
+stable familyとして`public_department` tagへ明示snapshotする。role/department名からinn/economy/shop/casinoを
+推測しない。manifest変更は過去を再分類せず、変更観測後のfresh full snapshotから新revisionを使う。
+startup/resumeのmember fetch完了前、crashのlast checkpoint以後、disconnect、partial-old updateのfresh fetch前は
+UNKNOWN。bot/main guild外は証拠にしない。rank-syncのwaiting→ghost recovery pathは変更しない。
+
+restricted co-presence primitiveは既存`computeCoPresenceOverlaps`と同じlogical VC/trusted-end semanticsで
+pair×positive trusted sliceを返す。class/family safe readersは固定observedAt内でtemporal intervalをsliceへexact
+JOINしてからJST日分割し、anonymous counterpartごとのclass/family touch relationを返す。同一人物が複数categoryを
+経験してもprofileは1つなのでperson breadthを重複計上せず、異なるperson×category maximum matchingを後段で
+threshold-neutralに判定できる。class sourceとdepartment sourceは共通stable anonymous IDを持たない。
+raw counterpart/role/guild/channel/status/family key/exact timestampはsafe payloadへ出さない。
+
+300-user chunkを維持し、601 subjectsはsourceごとに300/300/1の3 logical reads。singleとprefetchedは一致し、
+counterpart/class/familyごとのN+1は無い。No.26/27をSOURCE READYへ更新し、overallは
+READY 68 / PARTIAL 6 / BLOCKED 17 / META 8。No.57/64/65/73はF3b domain-specific temporal safe JOIN待ち、
+No.90/91はcastle manifest/cross-domain source待ちでBLOCKEDを維持する。production threshold、award、notification、
+BehaviorTitleDefinition、historical inferred backfill、F3b/F4、merge/deployは無い。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

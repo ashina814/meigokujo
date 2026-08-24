@@ -285,6 +285,18 @@ CREATE TABLE IF NOT EXISTS vc_public_social_presence (
   ended_at    INTEGER CHECK (ended_at IS NULL OR ended_at >= 0),
   end_quality TEXT CHECK (end_quality IS NULL OR end_quality IN ('observed','recovered_estimate'))
 );
+
+-- Titles v2 F3a: souls.status のcanonical append-only temporal provenance。
+-- baseline/transitionのcapture triggerはsouls CHECK migration後にinstallする。
+CREATE TABLE IF NOT EXISTS soul_status_history (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     TEXT NOT NULL,
+  status      TEXT NOT NULL CHECK (status IN ('waiting','ghost','majin','kenma','mazoku','meirei','departed')),
+  observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
+  provenance  TEXT NOT NULL CHECK (provenance IN ('f3a_baseline','soul_insert','status_transition'))
+);
+CREATE INDEX IF NOT EXISTS idx_soul_status_history_user_time
+  ON soul_status_history(user_id, observed_at, id);
 CREATE INDEX IF NOT EXISTS idx_vc_public_social_user
   ON vc_public_social_presence(user_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_vc_public_social_channel
@@ -397,6 +409,113 @@ CREATE TABLE IF NOT EXISTS departments (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+-- Titles v2 F3a: explicit versioned role-family manifest。current departments.role_idを
+-- 過去へJOINせず、観測したrevisionへ凍結する。
+CREATE TABLE IF NOT EXISTS role_family_manifest_revisions (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id     TEXT NOT NULL,
+  activated_at INTEGER NOT NULL CHECK (activated_at >= 0),
+  fingerprint  TEXT NOT NULL,
+  provenance   TEXT NOT NULL CHECK (provenance IN ('departments_snapshot','explicit_manifest'))
+);
+CREATE INDEX IF NOT EXISTS idx_role_family_manifest_revision_guild_time
+  ON role_family_manifest_revisions(guild_id, activated_at, id);
+CREATE TABLE IF NOT EXISTS role_family_manifest_families (
+  revision_id INTEGER NOT NULL REFERENCES role_family_manifest_revisions(id),
+  family_key  TEXT NOT NULL,
+  PRIMARY KEY (revision_id, family_key)
+);
+CREATE TABLE IF NOT EXISTS role_family_manifest_family_tags (
+  revision_id INTEGER NOT NULL,
+  family_key  TEXT NOT NULL,
+  tag         TEXT NOT NULL CHECK (tag IN ('public_department','inn','economy','shop','casino')),
+  PRIMARY KEY (revision_id, family_key, tag),
+  FOREIGN KEY (revision_id, family_key)
+    REFERENCES role_family_manifest_families(revision_id, family_key)
+);
+CREATE TABLE IF NOT EXISTS role_family_manifest_roles (
+  revision_id INTEGER NOT NULL,
+  family_key  TEXT NOT NULL,
+  role_id     TEXT NOT NULL,
+  PRIMARY KEY (revision_id, family_key, role_id),
+  FOREIGN KEY (revision_id, family_key)
+    REFERENCES role_family_manifest_families(revision_id, family_key)
+);
+CREATE INDEX IF NOT EXISTS idx_role_family_manifest_roles_lookup
+  ON role_family_manifest_roles(revision_id, role_id, family_key);
+
+CREATE TABLE IF NOT EXISTS role_observation_sessions (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id           TEXT NOT NULL,
+  manifest_revision_id INTEGER NOT NULL REFERENCES role_family_manifest_revisions(id),
+  started_at         INTEGER NOT NULL CHECK (started_at >= 0),
+  last_checkpoint_at INTEGER NOT NULL CHECK (last_checkpoint_at >= started_at),
+  ended_at           INTEGER,
+  end_quality        TEXT CHECK (end_quality IS NULL OR end_quality IN (
+    'disconnect','guild_unavailable','guild_delete','manifest_change','shutdown','crash_recovered'
+  )),
+  CHECK ((ended_at IS NULL AND end_quality IS NULL)
+      OR (ended_at IS NOT NULL AND ended_at >= started_at AND end_quality IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_role_observation_one_open_session
+  ON role_observation_sessions(guild_id) WHERE ended_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS role_family_member_presence (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id             TEXT NOT NULL,
+  session_id           INTEGER NOT NULL REFERENCES role_observation_sessions(id),
+  manifest_revision_id INTEGER NOT NULL REFERENCES role_family_manifest_revisions(id),
+  user_id              TEXT NOT NULL,
+  family_key           TEXT NOT NULL,
+  started_at           INTEGER NOT NULL CHECK (started_at >= 0),
+  ended_at             INTEGER,
+  end_reason           TEXT CHECK (end_reason IS NULL OR end_reason IN (
+    'role_removed','member_unknown','member_left','disconnect','guild_unavailable',
+    'guild_delete','manifest_change','shutdown','crash_recovered','session_replaced'
+  )),
+  FOREIGN KEY (manifest_revision_id, family_key)
+    REFERENCES role_family_manifest_families(revision_id, family_key),
+  CHECK ((ended_at IS NULL AND end_reason IS NULL)
+      OR (ended_at IS NOT NULL AND ended_at >= started_at AND end_reason IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_role_family_member_one_open
+  ON role_family_member_presence(guild_id, user_id, family_key) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_role_family_member_presence_user_time
+  ON role_family_member_presence(user_id, started_at, ended_at);
+
+CREATE TRIGGER IF NOT EXISTS trg_role_manifest_revision_no_update
+BEFORE UPDATE ON role_family_manifest_revisions BEGIN
+  SELECT RAISE(ABORT, 'role family manifest revisions are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_role_manifest_revision_no_delete
+BEFORE DELETE ON role_family_manifest_revisions BEGIN
+  SELECT RAISE(ABORT, 'role family manifest revisions are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_role_manifest_family_no_update
+BEFORE UPDATE ON role_family_manifest_families BEGIN
+  SELECT RAISE(ABORT, 'role family manifest families are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_role_manifest_family_no_delete
+BEFORE DELETE ON role_family_manifest_families BEGIN
+  SELECT RAISE(ABORT, 'role family manifest families are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_role_manifest_tag_no_update
+BEFORE UPDATE ON role_family_manifest_family_tags BEGIN
+  SELECT RAISE(ABORT, 'role family manifest tags are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_role_manifest_tag_no_delete
+BEFORE DELETE ON role_family_manifest_family_tags BEGIN
+  SELECT RAISE(ABORT, 'role family manifest tags are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_role_manifest_role_no_update
+BEFORE UPDATE ON role_family_manifest_roles BEGIN
+  SELECT RAISE(ABORT, 'role family manifest roles are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_role_manifest_role_no_delete
+BEFORE DELETE ON role_family_manifest_roles BEGIN
+  SELECT RAISE(ABORT, 'role family manifest roles are append-only');
+END;
 
 CREATE TABLE IF NOT EXISTS auctions (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1125,6 +1244,52 @@ CREATE TABLE IF NOT EXISTS nickname_denylist (
 );
 `;
 
+/**
+ * Titles v2 F3a: every souls.status writerをDB boundaryで捕捉する。
+ *
+ * 既存rowはこのmigrationを実際に観測したDB時刻からbaseline化し、joined_at/ghost_at/
+ * updated_atへbackdateしない。triggerはstatusがsemanticに変化したUPDATEだけをappendするため、
+ * repo内のservice writer・rank-sync・直SQL writerを個別に列挙して取りこぼす余地がない。
+ */
+function ensureSoulStatusHistory(db: Database.Database): void {
+  const install = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO soul_status_history (user_id, status, observed_at, provenance)
+       SELECT s.user_id, s.status, unixepoch(), 'f3a_baseline'
+         FROM souls s
+        WHERE NOT EXISTS (
+          SELECT 1 FROM soul_status_history h WHERE h.user_id = s.user_id
+        )`,
+    ).run();
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_soul_status_history_insert
+      AFTER INSERT ON souls
+      BEGIN
+        INSERT INTO soul_status_history (user_id, status, observed_at, provenance)
+        VALUES (NEW.user_id, NEW.status, unixepoch(), 'soul_insert');
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_soul_status_history_transition
+      AFTER UPDATE OF status ON souls
+      WHEN OLD.status IS NOT NEW.status
+      BEGIN
+        INSERT INTO soul_status_history (user_id, status, observed_at, provenance)
+        VALUES (NEW.user_id, NEW.status, unixepoch(), 'status_transition');
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_soul_status_history_no_update
+      BEFORE UPDATE ON soul_status_history
+      BEGIN
+        SELECT RAISE(ABORT, 'soul status history is append-only');
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_soul_status_history_no_delete
+      BEFORE DELETE ON soul_status_history
+      BEGIN
+        SELECT RAISE(ABORT, 'soul status history is append-only');
+      END;
+    `);
+  });
+  install.immediate();
+}
+
 export function openDb(path: string): Database.Database {
   // 複数接続（別プロセス・別スレッド）から同じDBを触ったとき、ロック待ちで即失敗せず
   // 待ってから再試行できるようにする。賭場の業務グループは書き込みが衝突しうる。
@@ -1266,6 +1431,7 @@ export function openDb(path: string): Database.Database {
   backfillShopDeliveryState(db);
   backfillEverMeirei(db);
   backfillInviteThresholdSnapshot(db);
+  ensureSoulStatusHistory(db);
   return db;
 }
 

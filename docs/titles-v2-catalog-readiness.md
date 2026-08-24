@@ -137,6 +137,18 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > `missing_persisted_source` 1→0、`missing_event_protocol` 2→0。threshold・award・
 > notification・historical role backfillは追加していない。§25参照。
 
+> **PR F3a反映（2026-08-25）**: canonical `souls.status`のappend-only
+> temporal history、明示versioned role-family manifest、trusted gateway
+> observation sessions、restricted temporal VC co-presence slicesを追加した。
+> class/role-familyをinteraction時点でexactにJOINし、identity-freeな
+> `social_class_context_safe` / `social_department_family_context_safe`へ
+> anonymous counterpart×category relationを保持する。No.26/27が
+> BLOCKED→READY、READY 66→68、BLOCKED 19→17。PARTIAL 6・META 8は不変。
+> No.57/64/65/73はgeneric role historyだけでは成立しないため、F3bの
+> domain-specific temporal safe JOIN待ちでBLOCKEDを維持する。No.90/91は
+> `missing_role_history`だけを解消したがcastle manifest/cross-domain source待ち。
+> threshold・award・notification・historical inferred backfillは追加していない。§26参照。
+
 ## 0. xlsx canonical hash（exact drift guard）
 
 | 項目 | 値 |
@@ -184,13 +196,13 @@ full-clear editionに登録されたREQUIRED印100%——NONCOUNTの91 behavior�
 
 | status | 件数 | 意味 |
 | --- | --- | --- |
-| READY | 66 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
+| READY | 68 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
 | PARTIAL | 6 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
-| BLOCKED | 19 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
+| BLOCKED | 17 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
 | META | 8 | kind:meta（別bucket、§7参照） |
 
 **READY = 今すぐreleaseしてよい、ではない**。sourceReadinessとthreshold決定は
-別軸（§10参照）——READY 66件も、production threshold値（分布TBD等）が
+別軸（§10参照）——READY 68件も、production threshold値（分布TBD等）が
 決まるまではrelease対象にならない。またSeries manifest／Collection Edition／
 Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）。No.58はさらに、
 award後のreversalを既存immutable ownershipへどう反映するかが未決定であるため、
@@ -201,14 +213,15 @@ source-readyでもproduction release不可（§15）。
 | blockerKind | 件数 | 意味 |
 | --- | --- | --- |
 | missing_persisted_source | 0 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
-| missing_derived_source | 7 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
+| missing_derived_source | 6 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
 | missing_manifest | 7 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
-| missing_role_history | 7 | role-at-time（過去のある時点でどのroleを保持していたか）がrepo全体で未実装 |
+| missing_role_history | 0 | F3aでgeneric role-family-at-time基盤を実装 |
+| missing_domain_temporal_join | 4 | No.57/64/65/73。domain tag mappingと各activity時点を結ぶF3b safe source待ち |
 | source_semantic_mismatch | 6 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（No.1/6/22のpublic VC provenance、No.29/30のpair-specific overlap、No.48のfree-flow同一topic correlation） |
 | missing_event_protocol | 0 | F2mでevent involvement protocolを追加し解消 |
 | known_bug | 0 | PR F2aで`computeLastOccupant()`のsame-second/0-second visit tie bugを修正——catalog全体から解消済み（§13参照） |
 
-（`none`のBehavior候補は66件——ちょうどREADY件数と一致。PARTIAL 6件は
+（`none`のBehavior候補は68件——ちょうどREADY件数と一致。PARTIAL 6件は
 すべて`source_semantic_mismatch`を持つ。）
 
 ## 4. Theme別 readiness
@@ -221,7 +234,7 @@ source-readyでもproduction release不可（§15）。
 | 4 | 少人数型 | 3 | 3 | 0 | 0 |
 | 5 | 大人数型 | 3 | 3 | 0 | 0 |
 | 6 | 万能型 | 3 | 3 | 0 | 0 |
-| 7 | 広い交友 | 6 | 3 | 1 | 2 |
+| 7 | 広い交友 | 6 | 5 | 1 | 0 |
 | 8 | 深い交友 | 4 | 1 | 2 | 1 |
 | 9 | 時間帯・生活痕 | 6 | 6 | 0 | 0 |
 | 10 | BUMP / 鐘 | 4 | 4 | 0 | 0 |
@@ -233,22 +246,24 @@ source-readyでもproduction release不可（§15）。
 | 16 | イベント | 5 | 5 | 0 | 0 |
 | 17 | 城横断 | 7 | 0 | 0 | 7 |
 
-BUMP/鐘とVC人数帯Theme 3-6が100% READY（後者はPR F2eのJST日別4bucket
+BUMP/鐘とVC人数帯Theme 3-6が100% READY。広い交友Theme 7はF3aでNo.26/27がREADYとなり、5 READY / 1 PARTIAL（No.22）になった。人数帯はPR F2eのJST日別4bucket
 trusted secondsで日数/share/span/streakを後段評価できるため）。公開部屋はF2gで
-7/8件がSOURCE READYとなり、No.57だけrole-at-time待ち。時間帯・生活痕はF2iで6/6件が
+7/8件がSOURCE READYとなり、No.57だけF3b domain temporal JOIN待ち。時間帯・生活痕はF2iで6/6件が
 SOURCE READYとなった。TC交流はF2hで7/8件がSOURCE READYとなり、No.48だけfree-flow同一topic correlationのsemantic mismatchが残る。
 招待はF2jで6/6件がSOURCE READYとなった。Land・経済はF2kで5/8件がREADYとなり、
-No.60はpair chronology、No.64/65はrole-at-time待ち。賭場はF2lで7/8件がREADYとなり、
-No.73だけrole-at-time待ち。イベントはF2mで5/5件がSOURCE READY。城横断は引き続き0% READY。
+No.60はpair chronology、No.64/65はF3b domain temporal JOIN待ち。賭場はF2lで7/8件がREADYとなり、
+No.73だけF3b domain temporal JOIN待ち。No.26/27はF3aでinteraction時点のclass/public-department family relationがexactになった。イベントはF2mで5/5件がSOURCE READY。城横断は引き続き0% READY。
 
 ## 5. source別に残る実装（READYを支えるsource／PARTIALの制約／BLOCKEDが必要とするもの）
 
-READYを支えている既存`titleUsable:true` source（21種、66件）:
+READYを支えている既存`titleUsable:true` source（23種、68件）:
 
 - `vc_empty_start_then_joined`（No.2。No.1はpublic provenance不足でPARTIAL）
 - `vc_last_occupant`（No.7, 9。No.6はtie bug解消済みだがpublic provenance不足でPARTIAL）
 - `vc_group_size_daily_safe`（No.10-21——JST date×4bucketのtrusted seconds。threshold/share denominatorは未固定、§17参照）
 - `vc_social_safe`（No.23-25, 28。No.22はbreadth自体はあるがpublic provenance不足でPARTIAL）
+- `social_class_context_safe`（No.26——interaction時点のcanonical public class×anonymous counterpart relation、§26参照）
+- `social_department_family_context_safe`（No.27——trusted public-department family presence×anonymous counterpart relation、§26参照）
 - `bump_events`（No.38-41、全件READY）
 - `casino_activity_days`（No.68 のみ——「利用する」semanticsに限りcompletion保証不要。commitmentベースのまま維持）
 - `casino_completed_activity_days`（No.66, 67——PR F2bで追加したcompletion正本、§14参照）
@@ -293,7 +308,7 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 | STRUCTURAL_PLUS_DISTRIBUTION | 1 | 構造は決まるが、一部の値は分布依存 |
 | META_NOT_APPLICABLE | 8 | meta（別contract、§10適用外） |
 
-sourceReadinessとthresholdは別軸——READY 66件のうち、STRUCTURAL_FIXEDなのは
+sourceReadinessとthresholdは別軸——READY 68件のうち、STRUCTURAL_FIXEDなのは
 一部（初回系）のみで、残りはTHRESHOLD_PENDINGのままREADYになっている
 （sourceは十分だが実数値は分布を見てから決める）。
 
@@ -337,7 +352,7 @@ sourceReadinessとthresholdは別軸——READY 66件のうち、STRUCTURAL_FIXE
 
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
-| 1 | role-at-time基盤 | role依存最大10件 | 波及範囲は大きいが、role権限・処罰系roleを含むため設計難度と慎重さが最も高い |
+| 1 | F3b domain-specific temporal JOIN | 4件（No.57/64/65/73） | F3aのgeneric role-family-at-time基盤へinn/economy/shop/casinoの明示tag mappingと各activity sourceをexact JOINする |
 | 2 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然 |
 
 VC group-size clusterはF2e、VC social breadth clusterはF2f、公開部屋clusterは
@@ -1485,3 +1500,66 @@ No.80/81の`public_event_completed_participations` contractは変更しない。
 overallはREADY 66 / PARTIAL 6 / BLOCKED 19 / META 8。production threshold、
 BehaviorTitleDefinition、award、notification、leaderboard/progress、inferred historical role backfill、
 Series/Collection/Meta activation、merge/deployは行わない。
+
+## 26. PR F3a: Trusted Class / Role-Family Temporal Provenance + Social Context
+
+### 26.1 canonical class history
+
+`soul_status_history`は`souls` INSERTと、実際に`status`が変わるUPDATEだけをDB triggerで
+同じtransaction内にappendする。したがってservice外の直接SQL writerも含め、rollback時にhistoryだけが
+残らない。同status UPDATEはsemantic eventを増やさない。導入済みsoulのbaselineはmigrationを開いた
+実時刻の`unixepoch()`で`f3a_baseline`として記録し、`joined_at` / `ghost_at` / current roleから
+過去へbackdateしない。公開classはghost/majin/kenma/mazoku/meireiだけで、waiting/departedは除外する。
+
+second-resolutionのtransition時刻そのものは前後関係を証明できないため、known-positive class intervalは
+観測秒の次秒から開始する。同一秒に複数status rowがあればrow ID順で解決せず、次の非曖昧な観測まで
+UNKNOWNとして捨てる。後日のstatus変更は過去interactionを新classへ再分類しない。
+
+### 26.2 versioned role-family manifest / observation coverage
+
+repo監査で確認できたcanonical public-department mappingは`departments.key ↔ departments.role_id`である。
+F3a manifest v1はrole/name substringを使わず、role_idを持つ各department keyをstable
+`department:<key>` familyへsnapshotし、明示tagは`public_department`だけとする。inn/economy/shop/casinoは
+F3bのreview対象であり、名前から推測して付けない。1 familyへ複数roleを許容し、同semantic family内の
+role交換や複数保持はfamily breadthを増やさない。manifest revisionは内容hashとactivated timeを持つ
+immutable snapshotで、変更前のpresenceを新mappingへrewriteしない。`departments.role_id`変更時は既存coverageを
+実観測時刻で切り、fresh full member fetch完了までUNKNOWNにする。
+
+`role_observation_sessions`はmain guildのgatewayを信用できる期間、checkpoint、終了qualityを記録する。
+startup/resumeはfull member fetchの**完了後**にそのchannel-independent snapshot時刻から開始し、起動前や
+disconnect gapをbackfillしない。crashで残ったsessionはstartup時刻まで延長せず、最後のpersisted checkpointで
+保守的に閉じる。disconnect/unavailable/delete/manifest changeは即suspendし、fresh snapshotまで再開しない。
+通常GuildMemberUpdateはsemantic family set差分を記録する。partial oldMemberは旧stateを推測せずcurrent memberを
+fetchし、成功時刻からfresh anchorを作る。MemberRemoveはclose、rejoinは新interval、botとmain guild外は0 evidence。
+
+### 26.3 temporal social JOIN / safe relation
+
+restricted `computeTrustedCoPresenceSlices()`は既存`computeCoPresenceOverlaps()`と同じcanonical logical VC、
+trusted-end、requested-subject semanticsを使い、pair×positive trusted overlap sliceだけを保持する。
+recovered estimate、zero-duration sliceは採用しない。safe readerは固定した
+`effectiveEnd = min(scope.end, observedAt)`内で、このsliceへclass intervalまたはtrusted family presenceを
+exact timestamp JOINし、JST日ごとのtrusted secondsへ分割する。day aggregate同士やcurrent roleとのJOINはしない。
+
+safe payloadはsourceごとに独立匿名化した次のrelationで、raw counterpart/user、role、guild、channel、
+status/family key、history ID、exact timestampを含まない。
+
+```ts
+{
+  counterparts: [{
+    classTouches: [{ classIndex, days: [{ date, trustedSeconds }] }]
+    // または familyTouches: [{ familyIndex, days: [...] }]
+  }]
+}
+```
+
+同一人物が後日複数class/familyをtouchしてもcounterpart profileは1つなので、その1人だけでbreadth 2を
+満たせない。異なるcounterpart×categoryの二部グラフは保持するため、後段はproduction thresholdを決めずに
+maximum matchingをexactに計算できる。class sourceとdepartment sourceのanonymous順序はsource-specificで、
+cross-source stable identityを作らない。readerは300-user chunkでbulk queryし、601 subjectsは300/300/1の
+3 logical reads。counterpart/class/familyごとのN+1はなく、single readerとprefetched readerは一致する。
+
+No.26/27はSOURCE READY。overallはREADY 68 / PARTIAL 6 / BLOCKED 17 / META 8。
+No.57/64/65/73はgeneric historyだけではdomain activityとのexact temporal correlationにならないため、
+`missing_domain_temporal_join`でBLOCKEDを維持する。No.90/91はgeneric role-history blockerを外すが、
+castle experience manifest/cross-domain source待ちでBLOCKED。production threshold、BehaviorTitleDefinition、
+award、notification、historical inferred backfill、F3b/F4、merge/deployは行わない。
