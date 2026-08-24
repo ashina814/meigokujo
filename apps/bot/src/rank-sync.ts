@@ -72,10 +72,43 @@ export interface ReconcileOutcome {
 }
 
 /**
+ * `/管理 → 階級の再同期` でだけ使う、取りこぼした「亡霊ロール付与」の再実行。
+ *
+ * 対象は **既に魂台帳に waiting として存在する人だけ**。
+ * waiting → ghost は status を直接書くだけでは不十分で、評価サイクル開始・名前固定・
+ * 初期発行など通常の入城処理を通す必要がある。そのため、GuildMemberUpdate を取りこぼした
+ * ときだけ既存のロール付与ハンドラへ「亡霊ロールが今追加された」形を再現して委譲する。
+ *
+ * `no_soul` はここで復旧しない。古い移行漏れなのか本当に新規入城イベントを取りこぼしたのか
+ * 判別できず、通常の ghostify を流すと joined_at / ghost_at / 評価サイクルや旧方式の初期発行まで
+ * 「いま新規入城した」意味で作り直す可能性があるため、明示的なlegacy復旧へ分離する。
+ * 自動同期からも呼ばない。
+ */
+async function recoverMissedGhostRoleAdd(member: GuildMember, services: Services): Promise<boolean> {
+  const soul = services.entry.getSoul(member.id);
+  if (soul?.status !== "waiting") return false;
+
+  const ghostRoleId = services.settings.getString("role:ghost");
+  if (!ghostRoleId || !member.roles.cache.has(ghostRoleId)) return false;
+
+  // 「Discord上の階級が亡霊だけ」のときに限定し、上位階級・迷霊を亡霊へ巻き戻さない。
+  const snapshot = snapshotOf(member, services);
+  if (snapshot.meirei || snapshot.ladder.length !== 1 || snapshot.ladder[0] !== "ghost") return false;
+
+  const beforeRoles = member.roles.cache.filter((role) => role.id !== ghostRoleId);
+  const syntheticBefore = { roles: { cache: beforeRoles } } as unknown as GuildMember;
+  const { handleMemberRoleUpdate } = await import("./commands/entry.js");
+  await handleMemberRoleUpdate(syntheticBefore, member, services);
+  return services.entry.getSoul(member.id)?.status === "ghost";
+}
+
+/**
  * 1人ぶんの再判定を**いま**実行する。
  *
  * 自動同期（debounce の後）と、運営の明示同期の両方がここを通る。
- * 明示同期を「強制的に任意 status を書く」機能にしないため、判定は共通にしてある。
+ * 明示同期を「強制的に任意 status を書く」機能にはしないため、判定は共通にしてある。
+ * ただし、明示同期で waiting + 亡霊ロールの取りこぼしを見つけた場合だけは、
+ * status の直書きではなく通常の亡霊化フローを再実行して復旧する。
  */
 export async function reconcileMemberRank(
   guild: Guild,
@@ -89,7 +122,8 @@ export async function reconcileMemberRank(
 
   const soul = services.entry.getSoul(userId);
   if (!soul) {
-    // 台帳に居ない人へロールだけで階級を作らない（入城処理の迂回になる）
+    // 台帳に居ない人へロールだけで階級を作らない（入城処理の迂回になる）。
+    // Discord上で亡霊に見えても、legacy移行漏れと新規イベント取りこぼしをここでは推測しない。
     services.events.log("rank_sync_ambiguous", { actor, target: userId, payload: { reason: "no_soul_row" } });
     return { kind: "no_soul", detail: "no_soul_row" };
   }
@@ -112,6 +146,45 @@ export async function reconcileMemberRank(
   if (decision.kind === "noop") return { kind: "noop", detail: decision.reason, anomalies: decision.anomalies };
 
   if (decision.kind === "ambiguous") {
+    // `/管理 → 階級の再同期` は actor=user:<id> で来る。自動同期(system:*)では
+    // waiting → ghost を勝手に入城扱いにせず、運営が明示した時だけ取りこぼしを回収する。
+    if (actor.startsWith("user:") && decision.from === "waiting" && decision.desired === "ghost") {
+      const recovered = await recoverMissedGhostRoleAdd(member, services);
+      if (recovered) {
+        services.events.log("rank_sync_entry_recovered", {
+          actor,
+          target: userId,
+          payload: { from: decision.from, desired: decision.desired, reason: "missed_ghost_role_add" },
+        });
+        return {
+          kind: "update",
+          detail: "entry_recovered",
+          from: decision.from,
+          to: "ghost",
+          anomalies: decision.anomalies,
+        };
+      }
+      // 名前ゲート・出戻り・Discord API 失敗などで通常入城処理が成立しなかった。
+      // status を直書きして迂回せず、そのまま曖昧として残す。
+      services.events.log("rank_sync_ambiguous", {
+        actor,
+        target: userId,
+        payload: {
+          reason: "entry_recovery_blocked",
+          from: decision.from,
+          desired: decision.desired,
+          anomalies: decision.anomalies,
+        },
+      });
+      return {
+        kind: "ambiguous",
+        detail: "entry_recovery_blocked",
+        from: decision.from,
+        to: decision.desired ?? undefined,
+        anomalies: decision.anomalies,
+      };
+    }
+
     // 階級ロールが無い・自動で越えてはいけない遷移。DBは触らず記録だけ残す
     services.events.log("rank_sync_ambiguous", {
       actor,
@@ -137,7 +210,7 @@ export async function reconcileMemberRank(
 
 /**
  * ロール変更を受けて再判定を予約する。
- * 同じ人の連続変更は最後の1回にまとめる。
+ * 同じ人の連続したロール変更は最後の1回にまとめる。
  */
 export function scheduleRankReconcile(guild: Guild, services: Services, userId: string, actor: string): void {
   const existing = pending.get(userId);
