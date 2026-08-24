@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ButtonInteraction, ChatInputCommandInteraction } from "discord.js";
 import { openDb, PublicEvents, Settings } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
-import { handlePublicEventRecordButton, handlePublicEventRecordCommand } from "../src/commands/public-event-record.js";
+import {
+  handlePublicEventRecordButton,
+  handlePublicEventRecordCommand,
+  publicEventRecordCommand,
+} from "../src/commands/public-event-record.js";
 
 const ADMIN_ROLE_ID = "admin-role-id";
 
@@ -26,12 +30,18 @@ function fakeChatInput(opts: {
   name?: string;
   eventDate?: string;
   participants?: string;
+  primaryOrganizer?: string;
+  organizers?: string;
+  staff?: string;
 }) {
   const optionValues: Record<string, string> = {
     イベントキー: opts.eventKey ?? "gf-2026-08-22",
     イベント名: opts.name ?? "God Field大会",
     開催日: opts.eventDate ?? "2026-08-22",
     参加者: opts.participants ?? "111111111111111111 222222222222222222",
+    主催責任者: opts.primaryOrganizer ?? "333333333333333333",
+    共同主催: opts.organizers ?? "444444444444444444",
+    スタッフ: opts.staff ?? "555555555555555555",
   };
   return {
     id: `cmd-${Math.random()}`,
@@ -77,6 +87,19 @@ describe("運営限定ゲート", () => {
 });
 
 describe("§61 preview → confirm / cancel flow", () => {
+  it("commandはparticipantを維持し、primary organizer必須・共同organizer/staff任意をevent opsへ統合する", () => {
+    const options = publicEventRecordCommand.toJSON().options ?? [];
+    expect(options.map((option) => [option.name, option.required])).toEqual([
+      ["イベントキー", true],
+      ["イベント名", true],
+      ["開催日", true],
+      ["参加者", true],
+      ["主催責任者", true],
+      ["共同主催", false],
+      ["スタッフ", false],
+    ]);
+  });
+
   it("slash実行 → previewのみ、DB 0 rows", async () => {
     const { db, services } = fakeServices();
     const interaction = fakeChatInput({ userId: "test-owner" });
@@ -102,6 +125,36 @@ describe("§61 preview → confirm / cancel flow", () => {
     expect(String(button.update.mock.calls[0]![0].content)).toContain("✅");
     expect(db.prepare(`SELECT COUNT(*) AS c FROM public_events`).get()).toEqual({ c: 1 });
     expect(db.prepare(`SELECT COUNT(*) AS c FROM public_event_participations`).get()).toEqual({ c: 2 });
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM public_event_involvement_revisions`).get()).toEqual({ c: 1 });
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM public_event_involvements`).get()).toEqual({ c: 3 });
+  });
+
+  it("previewはparticipant/organizer/staff件数とprimary organizerを明示し、confirm内容と一致する", async () => {
+    const { db, services } = fakeServices();
+    const interaction = fakeChatInput({
+      userId: "test-owner",
+      participants: "111111111111111111 222222222222222222",
+      primaryOrganizer: "333333333333333333",
+      organizers: "444444444444444444 333333333333333333",
+      staff: "555555555555555555 666666666666666666",
+    });
+    await handlePublicEventRecordCommand(interaction, services);
+    const preview = (interaction.reply.mock.calls[0]![0].embeds[0] as { toJSON(): { description?: string } }).toJSON();
+    expect(preview.description).toContain("参加者: **2人**");
+    expect(preview.description).toContain("主催: **2人**（primary含む）");
+    expect(preview.description).toContain("スタッフ: **2人**");
+    expect(preview.description).toContain("主催責任者: <@333333333333333333>");
+
+    const customId = extractCustomIds(interaction.reply.mock.calls[0]![0]).find((id) => id.startsWith("pev:ok:"))!;
+    const button = fakeButton(customId, "test-owner");
+    await handlePublicEventRecordButton(button, services);
+    expect(String(button.update.mock.calls[0]![0].content)).toContain("参加者: 2人 / 主催: 2人 / スタッフ: 2人");
+    expect(db.prepare(`SELECT user_id, role FROM public_event_involvements ORDER BY role, user_id`).all()).toEqual([
+      { user_id: "444444444444444444", role: "organizer" },
+      { user_id: "333333333333333333", role: "primary_organizer" },
+      { user_id: "555555555555555555", role: "staff" },
+      { user_id: "666666666666666666", role: "staff" },
+    ]);
   });
 
   it("cancel → DB 0のまま", async () => {
@@ -142,6 +195,28 @@ describe("§62 invalid participant token → entire request reject", () => {
     await handlePublicEventRecordCommand(interaction, services);
     const payload = interaction.reply.mock.calls[0]![0];
     expect(String(payload.description ?? JSON.stringify(payload))).not.toContain("認識できない");
+  });
+});
+
+describe("involvement input fail-close", () => {
+  it("primary organizerが0人/複数/invalidならpreviewもDB mutationも行わない", async () => {
+    for (const primaryOrganizer of ["", "333333333333333333 444444444444444444", "not-an-id"]) {
+      const { db, services } = fakeServices();
+      const interaction = fakeChatInput({ userId: "test-owner", primaryOrganizer });
+      await handlePublicEventRecordCommand(interaction, services);
+      expect(String(interaction.reply.mock.calls[0]![0].content)).toContain("主催責任者");
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM public_events`).get()).toEqual({ c: 0 });
+    }
+  });
+
+  it("共同主催/staffの一部invalidでもpartial保存しない", async () => {
+    for (const changed of [{ organizers: "444444444444444444 invalid" }, { staff: "555555555555555555 invalid" }]) {
+      const { db, services } = fakeServices();
+      const interaction = fakeChatInput({ userId: "test-owner", ...changed });
+      await handlePublicEventRecordCommand(interaction, services);
+      expect(String(interaction.reply.mock.calls[0]![0].content)).toContain("認識できないID");
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM public_events`).get()).toEqual({ c: 0 });
+    }
   });
 });
 

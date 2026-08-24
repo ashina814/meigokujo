@@ -108,6 +108,7 @@ export {
   type ShopPurchaseSafeSourcePayload,
   type PublicEventParticipationsSourcePayload,
   type PublicEventCompletedParticipationsSourcePayload,
+  type PublicEventCalendarInvolvementSafeSourcePayload,
   type SocialActivityTimeSafeSourcePayload,
   type CasinoActivityDaysSourcePayload,
   type CasinoCompletedActivityDaysSourcePayload,

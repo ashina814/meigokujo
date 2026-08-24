@@ -42,6 +42,27 @@ export const publicEventRecordCommand = new SlashCommandBuilder()
       .setDescription("参加者のメンション/DiscordIDを空白・改行・カンマ区切りで貼り付け")
       .setRequired(true)
       .setMaxLength(4000),
+  )
+  .addStringOption((o) =>
+    o
+      .setName("主催責任者")
+      .setDescription("primary organizer 1名のメンションまたはDiscord ID")
+      .setRequired(true)
+      .setMaxLength(30),
+  )
+  .addStringOption((o) =>
+    o
+      .setName("共同主催")
+      .setDescription("共同organizerのメンション/Discord ID（任意、複数可）")
+      .setRequired(false)
+      .setMaxLength(4000),
+  )
+  .addStringOption((o) =>
+    o
+      .setName("スタッフ")
+      .setDescription("staffのメンション/Discord ID（任意、複数可）")
+      .setRequired(false)
+      .setMaxLength(4000),
   );
 
 interface PendingPublicEventRecord {
@@ -50,6 +71,9 @@ interface PendingPublicEventRecord {
   readonly name: string;
   readonly eventDate: string;
   readonly participantUserIds: readonly string[];
+  readonly organizerUserIds: readonly string[];
+  readonly staffUserIds: readonly string[];
+  readonly primaryOrganizerUserId: string;
   readonly expiresAt: number;
 }
 
@@ -109,6 +133,9 @@ export async function handlePublicEventRecordCommand(
   const name = interaction.options.getString("イベント名", true).trim();
   const eventDate = interaction.options.getString("開催日", true).trim();
   const participantsRaw = interaction.options.getString("参加者", true);
+  const primaryOrganizerRaw = interaction.options.getString("主催責任者", true);
+  const organizersRaw = interaction.options.getString("共同主催") ?? "";
+  const staffRaw = interaction.options.getString("スタッフ") ?? "";
 
   const participantUserIds = parseParticipantTokens(participantsRaw);
   if (!participantUserIds) {
@@ -119,6 +146,25 @@ export async function handlePublicEventRecordCommand(
     });
     return;
   }
+  const primaryOrganizerIds = parseParticipantTokens(primaryOrganizerRaw);
+  if (!primaryOrganizerIds || primaryOrganizerIds.length !== 1) {
+    await interaction.reply({
+      content: "主催責任者は、1名分のメンション（`<@...>`）または生のDiscord IDを指定してください。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  const organizerUserIds = organizersRaw.trim() ? parseParticipantTokens(organizersRaw) : [];
+  const staffUserIds = staffRaw.trim() ? parseParticipantTokens(staffRaw) : [];
+  if (!organizerUserIds || !staffUserIds) {
+    await interaction.reply({
+      content: "共同主催またはスタッフに認識できないIDがあります。メンションまたは生のDiscord IDだけを指定してください。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  const primaryOrganizerUserId = primaryOrganizerIds[0]!;
+  const coOrganizerUserIds = organizerUserIds.filter((id) => id !== primaryOrganizerUserId);
 
   const token = interaction.id;
   pending.set(token, {
@@ -127,6 +173,9 @@ export async function handlePublicEventRecordCommand(
     name,
     eventDate,
     participantUserIds,
+    organizerUserIds: coOrganizerUserIds,
+    staffUserIds,
+    primaryOrganizerUserId,
     expiresAt: Date.now() + CONFIRM_TTL_MS,
   });
 
@@ -138,6 +187,9 @@ export async function handlePublicEventRecordCommand(
         `イベント名: ${name}`,
         `開催日: ${eventDate}`,
         `参加者: **${participantUserIds.length}人**`,
+        `主催: **${coOrganizerUserIds.length + 1}人**（primary含む）`,
+        `スタッフ: **${staffUserIds.length}人**`,
+        `主催責任者: <@${primaryOrganizerUserId}>`,
         "",
         "⚠️ **公開イベント参加履歴として確定します。将来、称号・プロフィール等の公開identityに利用される可能性があります。**",
         "確定後は編集・削除できません。",
@@ -200,11 +252,14 @@ export async function handlePublicEventRecordButton(
       name: p.name,
       eventDate: p.eventDate,
       participantUserIds: p.participantUserIds,
+      organizerUserIds: p.organizerUserIds,
+      staffUserIds: p.staffUserIds,
+      primaryOrganizerUserId: p.primaryOrganizerUserId,
       recordedBy: p.initiatingAdminId,
     });
     const suffix = result.alreadyRecorded ? "（既に同内容で記録済みでした）" : "";
     await interaction.update({
-      content: `✅ 公開イベント \`${result.eventKey}\` の参加記録を保存しました${suffix}。参加者: ${result.participantCount}人`,
+      content: `✅ 公開イベント \`${result.eventKey}\` を保存しました${suffix}。参加者: ${result.participantCount}人 / 主催: ${result.organizerCount}人 / スタッフ: ${result.staffCount}人`,
       embeds: [],
       components: [],
     });
@@ -212,7 +267,7 @@ export async function handlePublicEventRecordButton(
     const message =
       e instanceof PublicEventsError
         ? e.code === "conflict"
-          ? "このイベントキーは既に別の内容（名前/開催日/参加者）で記録済みです。上書きはできません。"
+          ? "このイベントキーは既に別の内容（名前/開催日/参加者/主催/スタッフ）で記録済みです。上書きはできません。"
           : `入力エラー: ${e.message}`
         : "記録に失敗しました。時間をおいて再度お試しください。";
     await interaction.update({ content: `❌ ${message}`, embeds: [], components: [] });

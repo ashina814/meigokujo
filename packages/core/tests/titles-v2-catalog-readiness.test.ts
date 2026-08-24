@@ -367,10 +367,10 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
     }
   });
 
-  it("F2l後の実集計はREADY 63 / PARTIAL 6 / BLOCKED 22 / META 8", () => {
+  it("F2m後の実集計はREADY 66 / PARTIAL 6 / BLOCKED 19 / META 8", () => {
     const counts = new Map<string, number>();
     for (const entry of TITLE_V2_CATALOG_READINESS) counts.set(entry.status, (counts.get(entry.status) ?? 0) + 1);
-    expect(Object.fromEntries(counts)).toEqual({ READY: 63, BLOCKED: 22, PARTIAL: 6, META: 8 });
+    expect(Object.fromEntries(counts)).toEqual({ READY: 66, BLOCKED: 19, PARTIAL: 6, META: 8 });
   });
 
   it("source_semantic_mismatchはpublic provenance 3件を含む6件、missing_derived_sourceは7件", () => {
@@ -481,8 +481,8 @@ describe("PR F2g: public room activity safe source追加後のreadiness", () => 
     expect(entries.filter((entry) => entry.status === "BLOCKED")).toHaveLength(1);
   });
 
-  it("blocker実集計はF2l後missing_persisted_source 1、missing_role_history 7", () => {
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(1);
+  it("blocker実集計はF2m後missing_persisted_source 0、missing_role_history 7", () => {
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(0);
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_role_history"))).toHaveLength(7);
   });
 });
@@ -569,18 +569,18 @@ describe("semantic false-positive再監査（public event completion保証）", 
     }
   });
 
-  it("No.82はcompletion mismatchだけ解消し、実event_date span source不足でBLOCKEDのまま", () => {
-    const entry = readinessFor(82);
-    expect(entry.status).toBe("BLOCKED");
-    expect(entry.usableSources).toEqual([]);
-    expect(entry.missingCapabilities).toEqual(["実event_dateのsafe title exposure / span source"]);
-    expect(entry.blockerKinds).toEqual(["missing_persisted_source"]);
-  });
-
-  it("No.83/84はorganizer/staff protocol不足のまま変更しない", () => {
-    for (const no of [83, 84]) {
-      expect(readinessFor(no)).toMatchObject({ status: "BLOCKED", blockerKinds: ["missing_event_protocol"] });
+  it("No.82-84はjoint completed-event calendar/involvement profileでREADY", () => {
+    for (const no of [82, 83, 84]) {
+      expect(readinessFor(no)).toMatchObject({
+        status: "READY",
+        usableSources: ["public_event_calendar_involvement_safe"],
+        specializedResolvers: ["computePublicEventCalendarInvolvementSafe"],
+        missingCapabilities: [],
+        blockerKinds: ["none"],
+      });
     }
+    expect(readinessFor(83).notes).toContain("別event");
+    expect(readinessFor(84).notes).toContain("exactly-one primary");
   });
 });
 
@@ -647,7 +647,7 @@ describe("PR F2b: casino completion source追加後のreadiness", () => {
   });
 
   it("source_semantic_mismatch blockerはNo.58/66/67/69から外れ、依然残る候補にはそのまま残る", () => {
-    for (const no of [58, 66, 67, 80, 81, 82]) {
+    for (const no of [58, 66, 67, 80, 81, 82, 83, 84]) {
       expect(readinessFor(no).blockerKinds, `candidate #${no}`).not.toContain("source_semantic_mismatch");
     }
     for (const no of [29, 30]) {
@@ -685,7 +685,7 @@ describe("PR F2j: exact invite-rooted safe source追加後のreadiness", () => {
     }
   });
 
-  it("Theme 15は6/6 READY、F2l後のpersisted/derived blockerは実集計1/7", () => {
+  it("Theme 15は6/6 READY、F2m後のpersisted/derived blockerは実集計0/7", () => {
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.no >= 74 && entry.no <= 79).map((entry) => entry.status)).toEqual([
       "READY",
       "READY",
@@ -694,7 +694,7 @@ describe("PR F2j: exact invite-rooted safe source追加後のreadiness", () => {
       "READY",
       "READY",
     ]);
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(1);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(0);
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(7);
   });
 });

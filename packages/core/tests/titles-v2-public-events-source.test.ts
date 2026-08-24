@@ -67,6 +67,9 @@ function recordEvent(
     name: opts.name ?? "テストイベント",
     eventDate: opts.eventDate ?? "2026-08-20",
     participantUserIds: opts.participantUserIds,
+    organizerUserIds: [],
+    staffUserIds: [],
+    primaryOrganizerUserId: "primary-organizer",
     recordedBy: opts.recordedBy ?? "staff-1",
   });
 }

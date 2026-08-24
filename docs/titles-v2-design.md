@@ -1996,6 +1996,30 @@ event Land market、stocks、自作板、validation/funding failureは除外す�
 option/result/identity/exact timestampを出さない。No.69-72をSOURCE READY、No.73はrole-at-time待ちで
 BLOCKED。overallはREADY 63 / PARTIAL 6 / BLOCKED 22 / META 8。threshold/award/notification/backfillは無い。
 
+### F2m — Public Event Calendar + Involvement Roles Safe Source
+
+公開イベント運営domainへ称号専用ではないneutral involvement protocolを追加する。general participantは
+既存`public_event_participations`だけを正本とし、`public_event_involvement_revisions`が同じ
+`event_key + roster_recorded_at` revisionでrole metadataをfinalizeしたことを示す。
+`public_event_involvements`はstaff / organizer / primary organizerを保持し、writerとpartial unique
+indexでprimaryをeventごとにexactly oneにする。event/participants/revision/rolesは
+`recordFinalizedEvent()`の単一transactionで確定し、exact retryだけ冪等、どのset/primary差分もconflict。
+Botは既存`/イベント参加記録`のpreview→confirmへrole入力・件数・primary表示を統合し、confirm直前admin
+再検証を維持する。
+
+derived `public_event_calendar_involvement_safe`はcanonical completionを同一roster revisionへJOINする。
+`completed_at`はsnapshot visibility fence、immutable JST `event_date`はactual calendar dimensionであり、
+title occurrenceを開催日へbackdateしない。payloadはsubject自身についてのanonymous distinct completed-event
+profiles `{ eventDate, generalParticipant, staff, organizer, primaryOrganizer }`だけ。event/user identity、name、
+audit actors、exact timestamps、channel/messageは出さない。profile 1件=event 1件なのでNo.83は別profile間の
+participant↔staff/organizerを要求でき、No.84は同一completed profileのprimary flagだけを用いる。
+
+legacy eventにrevision markerが無ければrole unknownのparticipant-only profileとし、recorded_by/completed_by/
+Discord role/EventLogからbackfill推測しない。new-protocol eventのmissing/mismatched revision、multiple primary、
+invalid role/user/date、future date、completion chronology corruptionはreaderでfail closed。300-user chunkごとに
+1 SQL、601 subjectsは300/300/1の3 reads。No.80/81は既存contractを維持し、No.82-84をSOURCE READYへ更新。
+overallはREADY 66 / PARTIAL 6 / BLOCKED 19 / META 8。threshold/award/notification/backfillは無い。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

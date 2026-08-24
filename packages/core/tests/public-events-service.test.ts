@@ -22,6 +22,9 @@ function baseInput(overrides: Partial<Parameters<PublicEvents["recordFinalizedEv
     name: "God Field大会",
     eventDate: "2026-08-22",
     participantUserIds: ["alice", "bob", "carol"],
+    organizerUserIds: ["organizer-2"],
+    staffUserIds: ["staff-2", "alice"],
+    primaryOrganizerUserId: "organizer-1",
     recordedBy: "staff-1",
     ...overrides,
   };
@@ -34,6 +37,8 @@ describe("recordFinalizedEvent() — positive / atomicity", () => {
     expect(result).toEqual({
       eventKey: "gf-2026-08-22",
       participantCount: 3,
+      organizerCount: 2,
+      staffCount: 2,
       recordedAt: BASE,
       alreadyRecorded: false,
     });
@@ -41,6 +46,12 @@ describe("recordFinalizedEvent() — positive / atomicity", () => {
     expect(eventRow).toMatchObject({ name: "God Field大会", event_date: "2026-08-22", recorded_by: "staff-1", recorded_at: BASE });
     const rows = db.prepare(`SELECT user_id FROM public_event_participations WHERE event_key = ? ORDER BY user_id`).all("gf-2026-08-22");
     expect(rows).toEqual([{ user_id: "alice" }, { user_id: "bob" }, { user_id: "carol" }]);
+    expect(db.prepare(`SELECT user_id, role FROM public_event_involvements ORDER BY role, user_id`).all()).toEqual([
+      { user_id: "organizer-2", role: "organizer" },
+      { user_id: "organizer-1", role: "primary_organizer" },
+      { user_id: "alice", role: "staff" },
+      { user_id: "staff-2", role: "staff" },
+    ]);
   });
 
   it("§56 atomicity: 2人目のparticipant INSERTがtriggerで失敗するとevent row・先行participant行ごとrollbackされる", () => {
@@ -56,6 +67,20 @@ describe("recordFinalizedEvent() — positive / atomicity", () => {
     expect(() => events.recordFinalizedEvent(baseInput())).toThrow(/simulated failure for bob/);
     expect(db.prepare(`SELECT COUNT(*) AS c FROM public_events`).get()).toEqual({ c: 0 });
     expect(db.prepare(`SELECT COUNT(*) AS c FROM public_event_participations`).get()).toEqual({ c: 0 });
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM public_event_involvement_revisions`).get()).toEqual({ c: 0 });
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM public_event_involvements`).get()).toEqual({ c: 0 });
+  });
+
+  it("role writer failureでもevent/participant/revision/先行roleをwhole finalize rollbackする", () => {
+    const { db, events } = setup();
+    db.exec(`
+      CREATE TRIGGER block_staff_role BEFORE INSERT ON public_event_involvements
+      WHEN NEW.role = 'staff' BEGIN SELECT RAISE(ABORT, 'simulated role writer failure'); END;
+    `);
+    expect(() => events.recordFinalizedEvent(baseInput())).toThrow(/simulated role writer failure/);
+    for (const table of [
+      "public_events", "public_event_participations", "public_event_involvement_revisions", "public_event_involvements",
+    ]) expect(db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get(), table).toEqual({ c: 0 });
   });
 });
 
@@ -99,6 +124,15 @@ describe("§57 exact idempotency / conflict", () => {
     expect(result.alreadyRecorded).toBe(true);
   });
 
+  it("role setの順序・primaryの共同organizer重複だけならexact retry", () => {
+    const { events } = setup();
+    events.recordFinalizedEvent(baseInput({ organizerUserIds: ["co-a", "co-b"], staffUserIds: ["s-a", "s-b"] }));
+    expect(events.recordFinalizedEvent(baseInput({
+      organizerUserIds: ["co-b", "organizer-1", "co-a"],
+      staffUserIds: ["s-b", "s-a"],
+    }))).toMatchObject({ alreadyRecorded: true, organizerCount: 3, staffCount: 2 });
+  });
+
   it("C. 1人増える → conflict", () => {
     const { events } = setup();
     events.recordFinalizedEvent(baseInput());
@@ -117,6 +151,16 @@ describe("§57 exact idempotency / conflict", () => {
     const { events } = setup();
     events.recordFinalizedEvent(baseInput());
     expect(() => events.recordFinalizedEvent(baseInput({ eventDate: "2026-08-23" }))).toThrow(/already recorded with a different/);
+  });
+
+  it.each([
+    ["staff set", { staffUserIds: ["different-staff"] }],
+    ["organizer set", { organizerUserIds: ["different-organizer"] }],
+    ["primary organizer", { primaryOrganizerUserId: "different-primary" }],
+  ])("%sが異なるretryはconflict", (_label, changed) => {
+    const { events } = setup();
+    events.recordFinalizedEvent(baseInput());
+    expect(() => events.recordFinalizedEvent(baseInput(changed))).toThrow(/different name\/date\/participants\/involvements/);
   });
 
   it("conflictでは既存rowを上書きしない", () => {
@@ -184,6 +228,38 @@ describe("§20 name validation", () => {
   });
 });
 
+describe("event involvement protocol validation", () => {
+  it("primary organizerはexactに1人必要", () => {
+    const { events } = setup();
+    expect(() => events.recordFinalizedEvent(baseInput({ primaryOrganizerUserId: "  " }))).toThrow(/primaryOrganizerUserId/);
+  });
+
+  it("同一人物のparticipant/staff/organizer重複は保持できる", () => {
+    const { events, db } = setup();
+    events.recordFinalizedEvent(baseInput({
+      participantUserIds: ["multi"],
+      primaryOrganizerUserId: "multi",
+      organizerUserIds: [],
+      staffUserIds: ["multi"],
+    }));
+    expect(db.prepare(`SELECT role FROM public_event_involvements WHERE user_id = 'multi' ORDER BY role`).all()).toEqual([
+      { role: "primary_organizer" }, { role: "staff" },
+    ]);
+  });
+
+  it("legacy eventへretryでrole provenanceを推測追記せずconflictにする", () => {
+    const { events, db } = setup();
+    db.prepare(`INSERT INTO public_events VALUES (?, ?, ?, ?, ?)`).run(
+      "gf-2026-08-22", "God Field大会", "2026-08-22", "legacy-recorder", BASE,
+    );
+    for (const userId of ["alice", "bob", "carol"]) {
+      db.prepare(`INSERT INTO public_event_participations VALUES (?, ?, ?)`).run("gf-2026-08-22", userId, BASE);
+    }
+    expect(() => events.recordFinalizedEvent(baseInput())).toThrow(/involvements/);
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM public_event_involvements`).get()).toEqual({ c: 0 });
+  });
+});
+
 describe("§60 eventDate strict validation", () => {
   it("valid: 2026-08-22", () => {
     const { events } = setup();
@@ -202,7 +278,9 @@ describe("§21 recordedByはpayloadへ出さない（service層の最小確認�
   it("recordFinalizedEvent()の戻り値にrecordedByが含まれない", () => {
     const { events } = setup();
     const result = events.recordFinalizedEvent(baseInput());
-    expect(Object.keys(result).sort()).toEqual(["alreadyRecorded", "eventKey", "participantCount", "recordedAt"]);
+    expect(Object.keys(result).sort()).toEqual([
+      "alreadyRecorded", "eventKey", "organizerCount", "participantCount", "recordedAt", "staffCount",
+    ]);
   });
 });
 

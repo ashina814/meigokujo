@@ -64,6 +64,9 @@ function roster(
     name: extras.name ?? "テスト公開イベント",
     eventDate: extras.eventDate ?? "2026-08-20",
     participantUserIds: users,
+    organizerUserIds: [],
+    staffUserIds: [],
+    primaryOrganizerUserId: "primary-organizer",
     recordedBy: extras.recordedBy ?? "staff-recorder",
   });
 }

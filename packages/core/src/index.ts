@@ -181,6 +181,7 @@ export {
   PublicEvents,
   PublicEventsError,
   type PublicEventRow,
+  type PublicEventInvolvementRole,
   type PublicEventCompletionSummary,
   type PublicEventsErrorCode,
   type RecordCompletedEventInput,
