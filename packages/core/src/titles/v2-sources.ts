@@ -26,7 +26,11 @@ import {
   type CasinoMarketActivitySafePayload,
   type CasinoTableActivitySafePayload,
 } from "./v2-casino-edition-table-market.js";
-import { computeCompletedPublicEventParticipations } from "./v2-public-events.js";
+import {
+  computeCompletedPublicEventParticipations,
+  computePublicEventCalendarInvolvementSafe,
+  type PublicEventCalendarInvolvementSafePayload,
+} from "./v2-public-events.js";
 import { computePublicRoomActivitySafe } from "../rooms/derived.js";
 import {
   computeTcConversationSafe,
@@ -174,6 +178,9 @@ export interface CasinoCompletedActivityDaysSourcePayload {
   }>;
 }
 
+/** event identity・audit actors・exact completion timestampを除いたjoint distinct-event profile。 */
+export type PublicEventCalendarInvolvementSafeSourcePayload = PublicEventCalendarInvolvementSafePayload;
+
 export type CasinoEditionICompletionSafeSourcePayload = CasinoEditionICompletionPayload;
 export type CasinoTableActivitySafeSourcePayload = CasinoTableActivitySafePayload;
 export type CasinoMarketActivitySafeSourcePayload = CasinoMarketActivitySafePayload;
@@ -223,6 +230,7 @@ export interface TitleSourcePayloads {
   shop_purchase_safe: ShopPurchaseSafeSourcePayload;
   public_event_participations: PublicEventParticipationsSourcePayload;
   public_event_completed_participations: PublicEventCompletedParticipationsSourcePayload;
+  public_event_calendar_involvement_safe: PublicEventCalendarInvolvementSafeSourcePayload;
   casino_activity_days: CasinoActivityDaysSourcePayload;
   casino_completed_activity_days: CasinoCompletedActivityDaysSourcePayload;
   casino_edition_i_completion_safe: CasinoEditionICompletionSafeSourcePayload;
@@ -767,6 +775,24 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
     }
     return { payloads, readCalls };
   },
+
+  public_event_calendar_involvement_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, PublicEventCalendarInvolvementSafeSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { events: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      for (const row of computePublicEventCalendarInvolvementSafe(
+        db,
+        { start: scope.start, end: effectiveEnd },
+        chunk,
+      )) payloads.set(row.userId, row.payload);
+    }
+    return { payloads, readCalls };
+  },
   casino_edition_i_completion_safe: (db, userIds, scope) => {
     const payloads = new Map<string, CasinoEditionICompletionSafeSourcePayload>();
     if (userIds.length === 0) return { payloads, readCalls: 0 };
@@ -867,6 +893,8 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
     BULK_SOURCE_READERS.public_event_participations(db, [userId], scope).payloads.get(userId)!,
   public_event_completed_participations: (db, userId, scope) =>
     BULK_SOURCE_READERS.public_event_completed_participations(db, [userId], scope).payloads.get(userId)!,
+  public_event_calendar_involvement_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.public_event_calendar_involvement_safe(db, [userId], scope).payloads.get(userId)!,
   casino_activity_days: (db, userId, scope) =>
     BULK_SOURCE_READERS.casino_activity_days(db, [userId], scope).payloads.get(userId)!,
   casino_completed_activity_days: (db, userId, scope) =>

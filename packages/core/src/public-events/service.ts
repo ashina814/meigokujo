@@ -18,7 +18,7 @@ import { jstDateStr } from "../entry/sessions.js";
  * `recordFinalizedEvent()`という単一atomic writeだけをこのserviceへ渡す。
  * confirm前はDB mutationが0件——このserviceはpreview状態を一切知らない。
  *
- * finalized rosterはimmutable（§22）: 一度確定したevent_key/participantsをUPDATEしない。
+ * finalized eventはimmutable（§22）: 一度確定したevent_key/participants/involvementsをUPDATEしない。
  * 同一event_keyの再送は、内容が完全一致すれば冪等成功（§23）、一部でも違えばconflict
  * error（§24）——「新しい入力の方が正しそうだから上書き」は行わない。
  */
@@ -34,9 +34,15 @@ export interface PublicEventRow {
 export interface RecordFinalizedEventInput {
   readonly eventKey: string;
   readonly name: string;
-  /** JSTのイベント開催日 'YYYY-MM-DD'。Title source timingには使わない（recordedAtだけを使う）。 */
+  /** JSTのイベント開催日 'YYYY-MM-DD'。calendar dimensionには使うがtitle occurrenceをbackdateしない。 */
   readonly eventDate: string;
   readonly participantUserIds: readonly string[];
+  /** event-ops上の共同organizer。primary organizerは別fieldでexactに1人指定する。 */
+  readonly organizerUserIds: readonly string[];
+  /** event-ops上のstaff。participant/organizerとの重複は許可する。 */
+  readonly staffUserIds: readonly string[];
+  /** eventごとにexactに1人のprimary organizer。 */
+  readonly primaryOrganizerUserId: string;
   /** 記録した運営userId。audit用——safe source payloadへは絶対に出さない。 */
   readonly recordedBy: string;
 }
@@ -44,6 +50,9 @@ export interface RecordFinalizedEventInput {
 export interface RecordFinalizedEventResult {
   readonly eventKey: string;
   readonly participantCount: number;
+  /** primary organizerを含むsemantic organizer総数。 */
+  readonly organizerCount: number;
+  readonly staffCount: number;
   readonly recordedAt: number;
   readonly alreadyRecorded: boolean;
 }
@@ -74,6 +83,8 @@ export type PublicEventsErrorCode =
   | "invalid_name"
   | "invalid_event_date"
   | "invalid_participant"
+  | "invalid_involvement"
+  | "missing_primary_organizer"
   | "empty_participants"
   | "conflict"
   | "invalid_completed_by"
@@ -156,6 +167,29 @@ function dedupeParticipants(userIds: readonly string[]): string[] {
   return out;
 }
 
+export type PublicEventInvolvementRole = "staff" | "organizer" | "primary_organizer";
+
+function dedupeInvolvements(userIds: readonly string[], label: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of userIds) {
+    const id = typeof raw === "string" ? raw.trim() : "";
+    if (!id) throw new PublicEventsError("invalid_involvement", `${label} userId must be a non-empty string`);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+function assertPrimaryOrganizer(value: string): string {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed) {
+    throw new PublicEventsError("missing_primary_organizer", "primaryOrganizerUserId must be a non-empty string");
+  }
+  return trimmed;
+}
+
 /** 入力順をsemanticにしない同値比較（§25）: sortしてから比較する。 */
 function sameParticipantSet(a: readonly string[], b: readonly string[]): boolean {
   if (a.length !== b.length) return false;
@@ -198,6 +232,26 @@ export class PublicEvents {
         FOREIGN KEY(event_key, roster_recorded_at)
           REFERENCES public_events(event_key, recorded_at)
       );
+      CREATE TABLE IF NOT EXISTS public_event_involvement_revisions (
+        event_key           TEXT PRIMARY KEY,
+        roster_recorded_at  INTEGER NOT NULL,
+        UNIQUE(event_key, roster_recorded_at),
+        FOREIGN KEY(event_key, roster_recorded_at)
+          REFERENCES public_events(event_key, recorded_at)
+      );
+      CREATE TABLE IF NOT EXISTS public_event_involvements (
+        event_key           TEXT NOT NULL,
+        user_id             TEXT NOT NULL,
+        role                TEXT NOT NULL CHECK(role IN ('staff', 'organizer', 'primary_organizer')),
+        roster_recorded_at  INTEGER NOT NULL,
+        PRIMARY KEY(event_key, user_id, role),
+        FOREIGN KEY(event_key, roster_recorded_at)
+          REFERENCES public_event_involvement_revisions(event_key, roster_recorded_at)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_public_event_exactly_one_primary
+        ON public_event_involvements(event_key) WHERE role = 'primary_organizer';
+      CREATE INDEX IF NOT EXISTS idx_public_event_involvements_user
+        ON public_event_involvements(user_id, roster_recorded_at);
     `);
   }
 
@@ -207,11 +261,11 @@ export class PublicEvents {
    * - `recordedAt`はこのservice自身のclockが正本（§10）——callerが渡すtimestampは
    *   一切受け取らない。過去イベントを後から登録しても、eventDateを使って
    *   backdateしない（§13）。
-   * - 同一event_keyの再送で、name/eventDate/participant setが完全一致するときだけ
+   * - 同一event_keyの再送で、name/eventDate/participant/involvement setが完全一致するときだけ
    *   `alreadyRecorded:true`の冪等成功を返す。recorded_at/recorded_byは既存値を維持し
    *   再実行しない（§23）。1件でも違えばconflict error——既存rowを上書きしない（§24）。
-   * - `public_events` INSERTと全participant INSERTは単一transaction——
-   *   途中のparticipant INSERT失敗はevent row・先行participant行も含めて丸ごとrollback
+   * - event/participant/involvement revision/role INSERTは単一transaction——
+   *   途中のINSERT失敗は先行rowも含めて丸ごとrollback
    *   する（§16）。
    */
   recordFinalizedEvent(input: RecordFinalizedEventInput): RecordFinalizedEventResult {
@@ -223,34 +277,62 @@ export class PublicEvents {
     if (participantUserIds.length === 0) {
       throw new PublicEventsError("empty_participants", "participantUserIds must contain at least one participant");
     }
+    const primaryOrganizerUserId = assertPrimaryOrganizer(input.primaryOrganizerUserId);
+    const organizerUserIds = dedupeInvolvements(input.organizerUserIds, "organizer")
+      .filter((id) => id !== primaryOrganizerUserId);
+    const staffUserIds = dedupeInvolvements(input.staffUserIds, "staff");
 
     const existingEvent = this.db
       .prepare(`SELECT name, event_date, recorded_by, recorded_at FROM public_events WHERE event_key = ?`)
       .get(eventKey) as { name: string; event_date: string; recorded_by: string; recorded_at: number } | undefined;
 
     if (existingEvent) {
-      const existingParticipants = (
-        this.db
-          .prepare(`SELECT user_id FROM public_event_participations WHERE event_key = ?`)
-          .all(eventKey) as Array<{ user_id: string }>
-      ).map((r) => r.user_id);
+      const existingParticipantRows = this.db
+        .prepare(`SELECT user_id, recorded_at FROM public_event_participations WHERE event_key = ?`)
+        .all(eventKey) as Array<{ user_id: string; recorded_at: number }>;
+      const existingParticipants = existingParticipantRows.map((r) => r.user_id);
+      const participantIntegrity = existingParticipantRows.every((r) =>
+        typeof r.user_id === "string" && r.user_id.trim().length > 0 && r.recorded_at === existingEvent.recorded_at);
+      const existingRevision = this.db
+        .prepare(`SELECT roster_recorded_at FROM public_event_involvement_revisions WHERE event_key = ?`)
+        .get(eventKey) as { roster_recorded_at: number } | undefined;
+      const existingInvolvements = this.db
+        .prepare(`SELECT user_id, role, roster_recorded_at FROM public_event_involvements WHERE event_key = ?`)
+        .all(eventKey) as Array<{ user_id: string; role: string; roster_recorded_at: number }>;
+      const existingPrimary = existingInvolvements.filter((r) => r.role === "primary_organizer");
+      const existingOrganizers = existingInvolvements.filter((r) => r.role === "organizer").map((r) => r.user_id);
+      const existingStaff = existingInvolvements.filter((r) => r.role === "staff").map((r) => r.user_id);
+      const involvementIntegrity =
+        existingRevision?.roster_recorded_at === existingEvent.recorded_at &&
+        existingInvolvements.every((r) =>
+          r.roster_recorded_at === existingEvent.recorded_at &&
+          typeof r.user_id === "string" && r.user_id.trim().length > 0 &&
+          (r.role === "staff" || r.role === "organizer" || r.role === "primary_organizer")) &&
+        existingPrimary.length === 1;
 
       const identical =
         existingEvent.name === name &&
         existingEvent.event_date === eventDate &&
-        sameParticipantSet(existingParticipants, participantUserIds);
+        participantIntegrity &&
+        sameParticipantSet(existingParticipants, participantUserIds) &&
+        involvementIntegrity &&
+        existingPrimary[0]!.user_id === primaryOrganizerUserId &&
+        sameParticipantSet(existingOrganizers, organizerUserIds) &&
+        sameParticipantSet(existingStaff, staffUserIds);
 
       if (identical) {
         return {
           eventKey,
           participantCount: existingParticipants.length,
+          organizerCount: existingOrganizers.length + 1,
+          staffCount: existingStaff.length,
           recordedAt: existingEvent.recorded_at,
           alreadyRecorded: true,
         };
       }
       throw new PublicEventsError(
         "conflict",
-        `public event ${eventKey} was already recorded with a different name/date/roster — finalized rosters are immutable`,
+        `public event ${eventKey} was already recorded with a different name/date/participants/involvements — finalized events are immutable`,
       );
     }
 
@@ -261,13 +343,30 @@ export class PublicEvents {
     const insertParticipant = this.db.prepare(
       `INSERT INTO public_event_participations (event_key, user_id, recorded_at) VALUES (?, ?, ?)`,
     );
+    const insertRevision = this.db.prepare(
+      `INSERT INTO public_event_involvement_revisions (event_key, roster_recorded_at) VALUES (?, ?)`,
+    );
+    const insertInvolvement = this.db.prepare(
+      `INSERT INTO public_event_involvements (event_key, user_id, role, roster_recorded_at) VALUES (?, ?, ?, ?)`,
+    );
     const run = this.db.transaction(() => {
       insertEvent.run(eventKey, name, eventDate, recordedBy, recordedAt);
       for (const userId of participantUserIds) insertParticipant.run(eventKey, userId, recordedAt);
+      insertRevision.run(eventKey, recordedAt);
+      insertInvolvement.run(eventKey, primaryOrganizerUserId, "primary_organizer", recordedAt);
+      for (const userId of organizerUserIds) insertInvolvement.run(eventKey, userId, "organizer", recordedAt);
+      for (const userId of staffUserIds) insertInvolvement.run(eventKey, userId, "staff", recordedAt);
     });
     run();
 
-    return { eventKey, participantCount: participantUserIds.length, recordedAt, alreadyRecorded: false };
+    return {
+      eventKey,
+      participantCount: participantUserIds.length,
+      organizerCount: organizerUserIds.length + 1,
+      staffCount: staffUserIds.length,
+      recordedAt,
+      alreadyRecorded: false,
+    };
   }
 
   /** 保存済み正本からcompletion previewを作る。roster無しeventはfail-closed。 */

@@ -119,6 +119,7 @@ const TITLE_RESTRICTED_USES = [
   "casino_safe_participation_classification",
   "casino_safe_completion_classification",
   "public_event_safe_completion_classification",
+  "public_event_safe_involvement_classification",
   "public_room_safe_activity_classification",
   "tc_safe_social_classification",
   "public_social_presence_classification",
@@ -785,6 +786,28 @@ export const TITLE_SOURCES = {
   // EventLog（events）は一切参照しない。運営が確定した公開イベントrosterだけを
   // safe sourceとして公開する。recorded_atは「rosterがBotへ確定保存された時刻」
   // であって参加の実時刻ではないため、orderable:falseにする（§11-12）。
+  public_event_records: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/public-events/service.ts",
+      needle: "INSERT INTO public_events",
+    },
+    calledFrom: {
+      file: "apps/bot/src/commands/public-event-record.ts",
+      needle: "services.publicEvents.recordFinalizedEvent({",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "await handlePublicEventRecordButton(interaction, services);",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "public_event_safe_involvement_classification",
+    epochPolicy: { type: "point", at: "recorded_at" },
+    rawUnit: "immutable_public_event_editorial_record",
+  },
   public_event_participations: {
     origin: "persisted",
     writtenBy: {
@@ -830,6 +853,50 @@ export const TITLE_SOURCES = {
     epochPolicy: { type: "point", at: "completed_at" },
     rawUnit: "staff_attested_public_event_completion",
   },
+  public_event_involvement_revisions: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/public-events/service.ts",
+      needle: "INSERT INTO public_event_involvement_revisions",
+    },
+    calledFrom: {
+      file: "apps/bot/src/commands/public-event-record.ts",
+      needle: "services.publicEvents.recordFinalizedEvent({",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "await handlePublicEventRecordButton(interaction, services);",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "public_event_safe_involvement_classification",
+    epochPolicy: { type: "point", at: "roster_recorded_at" },
+    rawUnit: "public_event_involvement_protocol_revision",
+  },
+  public_event_involvements: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/public-events/service.ts",
+      needle: "INSERT INTO public_event_involvements",
+    },
+    calledFrom: {
+      file: "apps/bot/src/commands/public-event-record.ts",
+      needle: "services.publicEvents.recordFinalizedEvent({",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "await handlePublicEventRecordButton(interaction, services);",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "public_event_safe_involvement_classification",
+    epochPolicy: { type: "point", at: "roster_recorded_at" },
+    rawUnit: "public_event_subject_involvement_role",
+  },
   public_event_completed_participations: {
     origin: "derived",
     derivedBy: {
@@ -843,6 +910,26 @@ export const TITLE_SOURCES = {
     titleUsable: true,
     epochPolicy: { type: "point", at: "completedAt" },
     rawUnit: "staff_attested_completed_public_event_participation",
+  },
+  public_event_calendar_involvement_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-public-events.ts",
+      needle: "export function computePublicEventCalendarInvolvementSafe(",
+    },
+    derivedFrom: [
+      "public_event_records",
+      "public_event_participations",
+      "public_event_completions",
+      "public_event_involvement_revisions",
+      "public_event_involvements",
+    ],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "point", at: "completedAt" },
+    rawUnit: "anonymous_completed_public_event_calendar_involvement_profile",
   },
 
   // ── Casino Safe Participation Source（PR E4）────────────────────────────────

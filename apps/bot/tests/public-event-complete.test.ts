@@ -14,6 +14,9 @@ function fakeServices() {
     name: "DB正本イベント名",
     eventDate: "2026-08-20",
     participantUserIds: ["alice", "bob"],
+    organizerUserIds: [],
+    staffUserIds: [],
+    primaryOrganizerUserId: "primary-organizer",
     recordedBy: "roster-staff",
   });
   const settings = new Settings(db);
