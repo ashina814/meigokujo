@@ -62,6 +62,7 @@ import {
   defaultRng,
   openDb,
   registerDefaultTxTypes,
+  RoleFamilyTemporal,
 } from "@meigokujo/core";
 import { config } from "./config.js";
 import { meetsRoleRequirement } from "./rank-requirement.js";
@@ -145,6 +146,7 @@ export function buildServices() {
   // Store clockのままでBot側からtimestampをinjectしない）。
   const titleV2 = new TitleV2Store(db);
   const departments = new Departments(db, ledger);
+  const roleFamilyTemporal = new RoleFamilyTemporal(db);
   const fiscal = new Fiscal(db, ledger);
   const ranks = new RankEngine(db);
   const bumps = new BumpCounter(db);
@@ -314,6 +316,7 @@ export function buildServices() {
     titles,
     titleV2,
     departments,
+    roleFamilyTemporal,
     fiscal,
     ranks,
     bumps,

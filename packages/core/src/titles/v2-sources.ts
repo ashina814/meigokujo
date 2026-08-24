@@ -46,6 +46,12 @@ import {
   computeInviteRootedSafe,
   type InviteRootedSafePayload,
 } from "./v2-invite-rooted.js";
+import {
+  computeSocialClassContextSafe,
+  computeSocialDepartmentFamilyContextSafe,
+  type SocialClassContextSafePayload,
+  type SocialDepartmentFamilyContextSafePayload,
+} from "./v2-social-context.js";
 
 /**
  * 称号ruleがraw DBを直接触らないようにするための、source読み込み境界。
@@ -116,6 +122,9 @@ export interface TextActiveDaysSourcePayload {
 export interface ConfirmedInvitesSourcePayload {
   readonly creditedAt: readonly number[];
 }
+
+export type SocialClassContextSafeSourcePayload = SocialClassContextSafePayload;
+export type SocialDepartmentFamilyContextSafeSourcePayload = SocialDepartmentFamilyContextSafePayload;
 
 export type InviteRootedSafeSourcePayload = InviteRootedSafePayload;
 
@@ -219,6 +228,8 @@ export interface TitleSourcePayloads {
   vc_group_size_seconds: VcGroupSizeSecondsSourcePayload;
   vc_group_size_daily_safe: VcGroupSizeDailySafeSourcePayload;
   vc_social_safe: VcSocialSafeSourcePayload;
+  social_class_context_safe: SocialClassContextSafeSourcePayload;
+  social_department_family_context_safe: SocialDepartmentFamilyContextSafeSourcePayload;
   tc_conversation_safe: TcConversationSafeSourcePayload;
   tc_reaction_safe: TcReactionSafeSourcePayload;
   social_activity_time_safe: SocialActivityTimeSafeSourcePayload;
@@ -480,6 +491,42 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
           dailyBreadth: row.dailyBreadth,
         });
       }
+    }
+    return { payloads, readCalls };
+  },
+
+  social_class_context_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, SocialClassContextSafeSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { counterparts: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+    const end = resolvedScopeEffectiveEnd(scope);
+    if (end <= scope.start) return { payloads, readCalls: 0 };
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      for (const row of computeSocialClassContextSafe(
+        db,
+        { start: scope.start, end, observedAt: scope.observedAt },
+        chunk,
+      )) payloads.set(row.userId, row.payload);
+    }
+    return { payloads, readCalls };
+  },
+
+  social_department_family_context_safe: (db, userIds, scope) => {
+    const payloads = new Map<string, SocialDepartmentFamilyContextSafeSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, { counterparts: [] });
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+    const end = resolvedScopeEffectiveEnd(scope);
+    if (end <= scope.start) return { payloads, readCalls: 0 };
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += 1;
+      for (const row of computeSocialDepartmentFamilyContextSafe(
+        db,
+        { start: scope.start, end, observedAt: scope.observedAt },
+        chunk,
+      )) payloads.set(row.userId, row.payload);
     }
     return { payloads, readCalls };
   },
@@ -872,6 +919,10 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
   vc_group_size_daily_safe: (db, userId, scope) =>
     BULK_SOURCE_READERS.vc_group_size_daily_safe(db, [userId], scope).payloads.get(userId)!,
   vc_social_safe: (db, userId, scope) => BULK_SOURCE_READERS.vc_social_safe(db, [userId], scope).payloads.get(userId)!,
+  social_class_context_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.social_class_context_safe(db, [userId], scope).payloads.get(userId)!,
+  social_department_family_context_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.social_department_family_context_safe(db, [userId], scope).payloads.get(userId)!,
   public_room_activity_safe: (db, userId, scope) =>
     BULK_SOURCE_READERS.public_room_activity_safe(db, [userId], scope).payloads.get(userId)!,
   tc_conversation_safe: (db, userId, scope) =>

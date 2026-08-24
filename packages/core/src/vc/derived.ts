@@ -736,6 +736,15 @@ export function computeGroupSizeDailySeconds(
 // B / F. co-presence（生pairwiseはrestricted、集計だけsafe）
 // ─────────────────────────────────────────────────────────────
 
+export interface TrustedCoPresenceSlice {
+  /** userA < userB。raw counterpart identityを含むrestricted internal primitive。 */
+  readonly userA: string;
+  readonly userB: string;
+  /** canonical logical visit同士がpositive durationで重なるtrusted [startedAt, endedAt)。 */
+  readonly startedAt: number;
+  readonly endedAt: number;
+}
+
 export interface CoPresenceOverlap {
   /** userA < userB に正規化する。生の相手identityを含むため privacy: restricted。 */
   userA: string;
@@ -817,6 +826,51 @@ export function splitIntervalByJstHour(
  */
 function jstDatesInInterval(startedAt: number, endedAt: number): string[] {
   return splitIntervalByJstDay(startedAt, endedAt).map((part) => part.date);
+}
+
+/**
+ * canonical logical VC visitからtemporal JOIN可能なrestricted pair sliceを作る。
+ * 両側のtrusted end、positive duration、requested subject filteringは
+ * computeCoPresenceOverlapsと同じ不変条件を使う。
+ */
+export function computeTrustedCoPresenceSlices(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): TrustedCoPresenceSlice[] {
+  const resolved = resolveWindow(window);
+  const subjectVisits = computeLogicalVisitsResolved(db, resolved, userIds);
+  if (subjectVisits.length === 0) return [];
+  const channelIds = [...new Set(subjectVisits.map((visit) => visit.channelId))];
+  const allRows = loadRawSegmentsForChannels(db, resolved, channelIds);
+  const allVisits = coalesceVisits(allRows, resolved);
+  const byChannel = groupByChannel(allVisits);
+  const subjectSet = userIds ? new Set(userIds) : null;
+  const slices: TrustedCoPresenceSlice[] = [];
+
+  for (const visits of byChannel.values()) {
+    for (let i = 0; i < visits.length; i++) {
+      for (let j = i + 1; j < visits.length; j++) {
+        const first = visits[i]!;
+        const second = visits[j]!;
+        if (first.userId === second.userId) continue;
+        if (subjectSet && !subjectSet.has(first.userId) && !subjectSet.has(second.userId)) continue;
+        if (!isTrustedVisitEnd(first.endQuality) || !isTrustedVisitEnd(second.endQuality)) continue;
+        const startedAt = Math.max(first.startedAt, second.startedAt);
+        const endedAt = Math.min(first.endedAt, second.endedAt);
+        if (endedAt <= startedAt) continue;
+        const [userA, userB] = first.userId < second.userId
+          ? [first.userId, second.userId]
+          : [second.userId, first.userId];
+        slices.push({ userA, userB, startedAt, endedAt });
+      }
+    }
+  }
+  return slices.sort((a, b) =>
+    a.userA.localeCompare(b.userA)
+    || a.userB.localeCompare(b.userB)
+    || a.startedAt - b.startedAt
+    || a.endedAt - b.endedAt);
 }
 
 /**

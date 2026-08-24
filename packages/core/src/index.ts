@@ -343,6 +343,16 @@ export {
   type DeptTxArgs,
 } from "./departments/service.js";
 export {
+  RoleFamilyTemporal,
+  ROLE_FAMILY_TAGS,
+  buildPublicDepartmentRoleFamilyManifest,
+  type RoleFamilyManifest,
+  type RoleFamilyManifestFamily,
+  type RoleFamilyObservedMember,
+  type RoleFamilyTag,
+  type RoleObservationEndQuality,
+} from "./role-family/temporal.js";
+export {
   Fiscal,
   FiscalError,
   type FiscalRunRow,

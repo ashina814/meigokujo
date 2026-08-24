@@ -341,7 +341,7 @@ describe("PR F2f: VC social breadthのJST日次分布追加後のreadiness", () 
     });
   });
 
-  it("Theme 7はREADY 3 / PARTIAL 1 / BLOCKED 2、Theme 8はREADY 1 / PARTIAL 2 / BLOCKED 1", () => {
+  it("F3a後Theme 7はREADY 5 / PARTIAL 1 / BLOCKED 0、Theme 8はREADY 1 / PARTIAL 2 / BLOCKED 1", () => {
     const counts = (start: number, end: number) => {
       const result = { READY: 0, PARTIAL: 0, BLOCKED: 0 };
       for (const entry of TITLE_V2_CATALOG_READINESS.filter((candidate) => candidate.no >= start && candidate.no <= end)) {
@@ -349,7 +349,7 @@ describe("PR F2f: VC social breadthのJST日次分布追加後のreadiness", () 
       }
       return result;
     };
-    expect(counts(22, 27)).toEqual({ READY: 3, PARTIAL: 1, BLOCKED: 2 });
+    expect(counts(22, 27)).toEqual({ READY: 5, PARTIAL: 1, BLOCKED: 0 });
     expect(counts(28, 31)).toEqual({ READY: 1, PARTIAL: 2, BLOCKED: 1 });
   });
 });
@@ -367,13 +367,13 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
     }
   });
 
-  it("F2m後の実集計はREADY 66 / PARTIAL 6 / BLOCKED 19 / META 8", () => {
+  it("F3a後の実集計はREADY 68 / PARTIAL 6 / BLOCKED 17 / META 8", () => {
     const counts = new Map<string, number>();
     for (const entry of TITLE_V2_CATALOG_READINESS) counts.set(entry.status, (counts.get(entry.status) ?? 0) + 1);
-    expect(Object.fromEntries(counts)).toEqual({ READY: 66, BLOCKED: 19, PARTIAL: 6, META: 8 });
+    expect(Object.fromEntries(counts)).toEqual({ READY: 68, PARTIAL: 6, BLOCKED: 17, META: 8 });
   });
 
-  it("source_semantic_mismatchはpublic provenance 3件を含む6件、missing_derived_sourceは7件", () => {
+  it("source_semantic_mismatchはpublic provenance 3件を含む6件、missing_derived_sourceは6件", () => {
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("source_semantic_mismatch")).map((entry) => entry.no)).toEqual([
       1,
       6,
@@ -382,11 +382,11 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
       30,
       48,
     ]);
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(7);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(6);
   });
 
-  it("missing_derived_sourceはF2kのNo.59/61/63解消で10から7へ減る", () => {
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(7);
+  it("missing_derived_sourceはF2k後7、F3aのNo.26解消後6へ減る", () => {
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(6);
   });
 
   it("Theme 3-6は各3件すべてREADY", () => {
@@ -433,14 +433,12 @@ describe("PR F2k: economy semantic family + shop purchase safe readiness", () =>
     expect(readinessFor(64)).toMatchObject({
       status: "BLOCKED",
       usableSources: ["economy_semantic_safe"],
-      missingCapabilities: ["role-at-time"],
-      blockerKinds: ["missing_role_history"],
+      blockerKinds: ["missing_domain_temporal_join"],
     });
     expect(readinessFor(65)).toMatchObject({
       status: "BLOCKED",
       usableSources: ["shop_purchase_safe"],
-      missingCapabilities: ["role-at-time"],
-      blockerKinds: ["missing_role_history"],
+      blockerKinds: ["missing_domain_temporal_join"],
     });
   });
 
@@ -464,14 +462,14 @@ describe("PR F2g: public room activity safe source追加後のreadiness", () => 
     }
   });
 
-  it("No.57はroom activity側だけ解消しrole-at-time temporal cross-reference待ち", () => {
+  it("No.57はroom activityとgeneric role historyが揃いdomain-specific temporal JOIN待ち", () => {
     const entry = readinessFor(57);
     expect(entry.status).toBe("BLOCKED");
     expect(entry.usableSources).toEqual(["public_room_activity_safe"]);
     expect(entry.specializedResolvers).toEqual(["computePublicRoomActivitySafe"]);
-    expect(entry.missingCapabilities).toEqual(["宿屋系role-at-timeとguest visit時点のtemporal cross-reference"]);
-    expect(entry.blockerKinds).toEqual(["missing_role_history"]);
-    expect(entry.notes).toContain("普通のguestとしての有効来訪は証明可能");
+    expect(entry.missingCapabilities).toEqual(["inn tag付きfamily presenceとguest visitのdomain-specific temporal safe JOIN"]);
+    expect(entry.blockerKinds).toEqual(["missing_domain_temporal_join"]);
+    expect(entry.notes).toContain("generic role-family-at-time基盤は成立");
   });
 
   it("Theme 12はREADY 7 / PARTIAL 0 / BLOCKED 1", () => {
@@ -481,9 +479,10 @@ describe("PR F2g: public room activity safe source追加後のreadiness", () => 
     expect(entries.filter((entry) => entry.status === "BLOCKED")).toHaveLength(1);
   });
 
-  it("blocker実集計はF2m後missing_persisted_source 0、missing_role_history 7", () => {
+  it("F3a後missing_role_historyは0、F3b待ちdomain temporal joinは4", () => {
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(0);
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_role_history"))).toHaveLength(7);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_role_history"))).toHaveLength(0);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_domain_temporal_join"))).toHaveLength(4);
   });
 });
 
@@ -695,12 +694,12 @@ describe("PR F2j: exact invite-rooted safe source追加後のreadiness", () => {
       "READY",
     ]);
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(0);
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(7);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_derived_source"))).toHaveLength(6);
   });
 });
 
 describe("PR F2l: Edition-I / official table / standard market readiness", () => {
-  it("No.66–72は各canonical sourceでREADY、No.73だけrole-at-time待ち", () => {
+  it("No.66–72は各canonical sourceでREADY、No.73だけdomain temporal JOIN待ち", () => {
     for (let no = 66; no <= 72; no++) expect(readinessFor(no).status, `candidate #${no}`).toBe("READY");
     expect(readinessFor(69).usableSources).toEqual(["casino_edition_i_completion_safe"]);
     expect(readinessFor(70).usableSources).toEqual(["casino_table_activity_safe"]);
@@ -709,7 +708,45 @@ describe("PR F2l: Edition-I / official table / standard market readiness", () =>
     expect(readinessFor(73)).toMatchObject({
       status: "BLOCKED",
       usableSources: ["casino_activity_days", "casino_market_activity_safe"],
-      blockerKinds: ["missing_role_history"],
+      blockerKinds: ["missing_domain_temporal_join"],
     });
+  });
+});
+
+describe("PR F3a: trusted class / role-family temporal provenance readiness", () => {
+  it("No.26/27はidentityを出さないtemporal social context sourceでREADY", () => {
+    expect(readinessFor(26)).toMatchObject({
+      status: "READY",
+      usableSources: ["social_class_context_safe"],
+      specializedResolvers: ["computeSocialClassContextSafe"],
+      missingCapabilities: [],
+      blockerKinds: ["none"],
+    });
+    expect(readinessFor(27)).toMatchObject({
+      status: "READY",
+      usableSources: ["social_department_family_context_safe"],
+      specializedResolvers: ["computeSocialDepartmentFamilyContextSafe"],
+      missingCapabilities: [],
+      blockerKinds: ["none"],
+    });
+  });
+
+  it("No.57/64/65/73はgeneric role historyではREADYにせずF3b domain JOIN待ち", () => {
+    for (const no of [57, 64, 65, 73]) {
+      const entry = readinessFor(no);
+      expect(entry.status, `candidate #${no}`).toBe("BLOCKED");
+      expect(entry.blockerKinds, `candidate #${no}`).toEqual(["missing_domain_temporal_join"]);
+      expect(entry.missingCapabilities.join(" "), `candidate #${no}`).toContain("domain-specific temporal safe JOIN");
+    }
+  });
+
+  it("No.90/91はgeneric role-history blockerだけを外しcastle manifest blockerを維持", () => {
+    for (const no of [90, 91]) {
+      expect(readinessFor(no)).toMatchObject({
+        status: "BLOCKED",
+        blockerKinds: ["missing_manifest"],
+      });
+      expect(readinessFor(no).notes).toContain("generic role-family-at-time基盤は成立");
+    }
   });
 });

@@ -133,6 +133,18 @@ import {
   trackVcPublicSocialGuildDelete,
   trackVcPublicSocialPresence,
 } from "./vc-public-social-tracking.js";
+import {
+  initializeRoleFamilyTracking,
+  refreshRoleFamilyGuildSnapshot,
+  resumeRoleFamilyGuild,
+  resumeRoleFamilyShard,
+  suspendRoleFamilyGuild,
+  suspendRoleFamilyShard,
+  trackRoleFamilyMemberAdd,
+  trackRoleFamilyMemberRemove,
+  trackRoleFamilyMemberUpdate,
+} from "./role-family-tracking.js";
+import { runCasinoRecoveryBeforeRoleFamilyTracking } from "./startup-safety.js";
 
 const services = buildServices();
 const client = new Client({
@@ -156,7 +168,12 @@ client.once(Events.ClientReady, async (ready) => {
   initializeVcPublicSocialPresence(ready, services);
   // 外部Discord APIへ触る復旧より先に、同期の賭場安全確認を必ず完了させる。
   // 再起動直後にstatus=openのまま外部I/O待ちになるfail-open窓を作らない。
-  runCasinoRecovery(services);
+  await runCasinoRecoveryBeforeRoleFamilyTracking(
+    () => { runCasinoRecovery(services); },
+    () => initializeRoleFamilyTracking(ready, services).then(() => undefined).catch((error) =>
+      console.error("[role-family] startup observation failed", error),
+    ),
+  );
   // 位名(rank title) live wiringの取りこぼしをローカルDBだけで自己修復する（PR D2）。
   // 外部Discord APIは使わない・失敗してもBot起動は継続する（内部でcatch済み）。
   // startup成功はdaily reconcileのmarkerを立てない——別概念（startup repair と
@@ -616,27 +633,43 @@ client.on(Events.MessageCreate, (message) => {
 // どちらもmain guildをshard-localにsuspendし、replay完了/新session ready後のcacheからだけ再開する。
 client.on(Events.ShardReconnecting, (shardId) => {
   suspendVcPublicSocialShard(client, shardId, services);
+  suspendRoleFamilyShard(client, shardId, services);
 });
 client.on(Events.ShardDisconnect, (_event, shardId) => {
   suspendVcPublicSocialShard(client, shardId, services);
+  suspendRoleFamilyShard(client, shardId, services);
 });
 client.on(Events.ShardResume, (shardId) => {
   resumeVcPublicSocialShard(client, shardId, services);
+  void resumeRoleFamilyShard(client, shardId, services).catch((error) =>
+    console.error("[role-family] shard resume snapshot failed", error),
+  );
 });
 client.on(Events.ShardReady, (shardId, unavailableGuilds) => {
   resumeVcPublicSocialShard(client, shardId, services, undefined, unavailableGuilds);
+  void resumeRoleFamilyShard(client, shardId, services, unavailableGuilds).catch((error) =>
+    console.error("[role-family] shard ready snapshot failed", error),
+  );
 });
 client.on(Events.GuildUnavailable, (guild) => {
   suspendVcPublicSocialGuild(guild, services);
+  suspendRoleFamilyGuild(guild, services, "guild_unavailable");
 });
 client.on(Events.GuildAvailable, (guild) => {
   resumeVcPublicSocialGuild(guild, services);
+  void resumeRoleFamilyGuild(guild, services).catch((error) =>
+    console.error("[role-family] guild available snapshot failed", error),
+  );
 });
 client.on(Events.GuildDelete, (guild) => {
   trackVcPublicSocialGuildDelete(guild, services);
+  suspendRoleFamilyGuild(guild, services, "guild_delete");
 });
 client.on(Events.GuildCreate, (guild) => {
   startVcPublicSocialGuild(guild, services);
+  void refreshRoleFamilyGuildSnapshot(guild, services).catch((error) =>
+    console.error("[role-family] guild create snapshot failed", error),
+  );
 });
 
 client.on(Events.MessageReactionAdd, (reaction, user) => {
@@ -646,6 +679,7 @@ client.on(Events.MessageReactionAdd, (reaction, user) => {
 });
 
 client.on(Events.GuildMemberAdd, (member) => {
+  trackRoleFamilyMemberAdd(member, services);
   void (async () => {
     const detection = await inviteTracker.detectInvite(member.guild).catch(() => null);
     await handleMemberJoin(member, services, detection?.inviterId ?? null).catch((err) =>
@@ -661,6 +695,7 @@ client.on(Events.GuildMemberAdd, (member) => {
 });
 
 client.on(Events.GuildMemberRemove, (member) => {
+  trackRoleFamilyMemberRemove(member, services);
   if (!member.user?.bot) {
     try {
       services.returns.recordDeparture(member.id);
@@ -674,6 +709,9 @@ client.on(Events.GuildMemberRemove, (member) => {
 });
 
 client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
+  void trackRoleFamilyMemberUpdate(oldMember, newMember, services).catch((err) =>
+    console.error("[role-family] member observation failed", err),
+  );
   if (oldMember.partial) return;
   void handleMemberRoleUpdate(oldMember, newMember, services).catch((err) =>
     console.error("[entry] ロール変更処理失敗:", err),

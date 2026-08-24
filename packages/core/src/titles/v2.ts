@@ -122,6 +122,8 @@ export {
   type VcGroupSizeSecondsSourcePayload,
   type VcLastOccupantSourcePayload,
   type VcSocialSafeSourcePayload,
+  type SocialClassContextSafeSourcePayload,
+  type SocialDepartmentFamilyContextSafeSourcePayload,
 } from "./v2-sources.js";
 
 // v2-economy.ts の computeSafeEconomyPeerActions()（PR E2の内部classifier正本）は

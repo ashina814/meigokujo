@@ -39,6 +39,7 @@ export type CandidateBlockerKind =
   | "missing_persisted_source"
   | "missing_derived_source"
   | "missing_role_history"
+  | "missing_domain_temporal_join"
   | "missing_event_protocol"
   | "missing_manifest"
   | "missing_threshold"
@@ -304,24 +305,33 @@ const THEME_07: ManualReadinessEntry[] = [
   },
   {
     no: 26,
-    status: "BLOCKED",
-    usableSources: [],
-    specializedResolvers: [],
-    missingCapabilities: ["公開階級カテゴリ×interaction時点のsafe cross-reference"],
-    evidence: [{ file: VC_SOURCES_FILE, symbol: "VcSocialSafeSourcePayload" }],
-    notes: "class-at-interaction履歴が一切存在しない（xlsx「class履歴/source不足」は現repoでも未解消）。",
-    blockerKinds: ["missing_derived_source"],
+    status: "READY",
+    usableSources: ["social_class_context_safe"],
+    specializedResolvers: ["computeSocialClassContextSafe"],
+    missingCapabilities: [],
+    evidence: [
+      { file: "packages/core/src/titles/v2-social-context.ts", symbol: "computeSocialClassContextSafe" },
+      { file: "packages/core/src/db/bootstrap.ts", symbol: "soul_status_history" },
+    ],
+    notes:
+      "F3a: canonical souls.statusのappend-only temporal historyをtrusted co-presence sliceへexact JOINし、公開class×anonymous counterpart relationを返す。同一人物が複数classへ遷移してもcounterpartは1つなので、後段のperson×class maximum matchingをthreshold-neutralに評価できる。同秒transition、baseline以前、waiting/departedはfail closed。",
+    blockerKinds: ["none"],
     optimizationRisk: "LOW",
   },
   {
     no: 27,
-    status: "BLOCKED",
-    usableSources: [],
-    specializedResolvers: [],
-    missingCapabilities: ["role-family-at-interaction履歴"],
-    evidence: [{ file: VC_SOURCES_FILE, symbol: "VcSocialSafeSourcePayload" }],
-    notes: "role-at-time（§9調査）が repo全体で未実装のため成立不可。",
-    blockerKinds: ["missing_role_history"],
+    status: "READY",
+    usableSources: ["social_department_family_context_safe"],
+    specializedResolvers: ["computeSocialDepartmentFamilyContextSafe"],
+    missingCapabilities: [],
+    evidence: [
+      { file: "packages/core/src/titles/v2-social-context.ts", symbol: "computeSocialDepartmentFamilyContextSafe" },
+      { file: "packages/core/src/role-family/temporal.ts", symbol: "buildPublicDepartmentRoleFamilyManifest" },
+      { file: "packages/core/src/departments/service.ts", symbol: "departments.role_id" },
+    ],
+    notes:
+      "F3a: canonical departments.key↔role_idを明示versioned public_department family manifestへsnapshotし、trusted gateway observation coverage内のfamily presenceだけをco-presence sliceへexact JOINする。名前推測なし。同一人物・同一semantic familyを重複させず、後段のperson×family maximum matchingを表現できる。",
+    blockerKinds: ["none"],
     optimizationRisk: "LOW",
   },
 ];
@@ -501,11 +511,11 @@ const THEME_12: ManualReadinessEntry[] = [
     status: "BLOCKED",
     usableSources: ["public_room_activity_safe"],
     specializedResolvers: ["computePublicRoomActivitySafe"],
-    missingCapabilities: ["宿屋系role-at-timeとguest visit時点のtemporal cross-reference"],
+    missingCapabilities: ["inn tag付きfamily presenceとguest visitのdomain-specific temporal safe JOIN"],
     evidence: PUBLIC_ROOM_SOURCE_EVIDENCE,
     notes:
-      "PR F2gで普通のguestとしての有効来訪は証明可能になったが、visit当時に宿屋系roleを保持していたかを照合するrole historyがrepo全体で未実装。現在roleの参照では代用しない。",
-    blockerKinds: ["missing_role_history"],
+      "F3aでgeneric role-family-at-time基盤は成立したが、inn tag mappingとguest visit時点を結ぶdomain-specific safe sourceはF3b待ち。現在roleの参照では代用しない。",
+    blockerKinds: ["missing_domain_temporal_join"],
     optimizationRisk: "LOW",
   },
 ];
@@ -595,10 +605,10 @@ const THEME_13: ManualReadinessEntry[] = [
     status: "BLOCKED",
     usableSources: ["economy_semantic_safe"],
     specializedResolvers: ["computeEconomySemanticSafe"],
-    missingCapabilities: ["role-at-time"],
+    missingCapabilities: ["economy tag付きfamily presenceとnormal economy useのdomain-specific temporal safe JOIN"],
     evidence: [{ file: ECON_FILE, symbol: "computeEconomySemanticSafe" }],
-    notes: "管理取引ではない通常経済利用sourceは揃ったが、利用時点の経済系role保持を照合するrole-at-timeがrepo全体で未実装。",
-    blockerKinds: ["missing_role_history"],
+    notes: "管理取引ではない通常経済利用sourceとgeneric role-family-at-time基盤は揃ったが、economy tag mappingと利用時点を結ぶdomain-specific safe sourceはF3b待ち。",
+    blockerKinds: ["missing_domain_temporal_join"],
     optimizationRisk: "LOW",
   },
   {
@@ -606,10 +616,10 @@ const THEME_13: ManualReadinessEntry[] = [
     status: "BLOCKED",
     usableSources: ["shop_purchase_safe"],
     specializedResolvers: ["computeShopPurchaseSafe"],
-    missingCapabilities: ["role-at-time"],
+    missingCapabilities: ["shop tag付きfamily presenceとeligible storefront purchaseのdomain-specific temporal safe JOIN"],
     evidence: [{ file: "packages/core/src/titles/v2-shop-purchases.ts", symbol: "TITLE_ELIGIBLE_SHOP_ORIGINS" }],
-    notes: "本人のnormal storefront eligible purchaseはexactになった。残るblockerは購入時点の商館系role保持を照合するrole-at-timeのみで、current roleから過去を推測しない。",
-    blockerKinds: ["missing_role_history"],
+    notes: "本人のnormal storefront eligible purchaseとgeneric role-family-at-time基盤は揃った。残るblockerはshop tag mappingと購入時点を結ぶdomain-specific safe sourceで、F3b待ち。",
+    blockerKinds: ["missing_domain_temporal_join"],
     optimizationRisk: "LOW",
   },
 ];
@@ -713,13 +723,13 @@ const THEME_14: ManualReadinessEntry[] = [
     status: "BLOCKED",
     usableSources: ["casino_activity_days", "casino_market_activity_safe"],
     specializedResolvers: [],
-    missingCapabilities: ["role-at-time"],
+    missingCapabilities: ["casino tag付きfamily presenceとcasino participationのdomain-specific temporal safe JOIN"],
     evidence: [
       { file: CASINO_FILE, symbol: "computeCasinoActivityDays" },
       { file: "packages/core/src/titles/v2-casino-edition-table-market.ts", symbol: "computeCasinoMarketActivitySafe" },
     ],
-    notes: "core game commitmentと他人のstandard板参加sourceは揃った。残るblockerは参加時点の賭場系role保持を照合するrole-at-timeのみ。current roleから過去を推測しない。",
-    blockerKinds: ["missing_role_history"],
+    notes: "core game commitment・他人のstandard板参加・generic role-family-at-time基盤は揃った。残るblockerはcasino tag mappingと参加時点を結ぶdomain-specific safe sourceで、F3b待ち。",
+    blockerKinds: ["missing_domain_temporal_join"],
     optimizationRisk: "LOW",
   },
 ];
@@ -882,9 +892,9 @@ const THEME_17: ManualReadinessEntry[] = [85, 86, 87, 88, 89, 90, 91].map((no) =
   evidence: [{ file: VC_SOURCES_FILE, symbol: "TITLE_SOURCES (no castle_experience_* key registered)" }],
   notes:
     no >= 90
-      ? "castle_experience_safe欠如に加えrole-at-time欠如も重なる。"
+      ? "F3aでgeneric role-family-at-time基盤は成立したが、castle_experience_safeと第I期城横断manifest/cross-domain sourceは未実装。"
       : "castle_experienceという横断集約自体がrepoに存在しない（grep 0件）。第I期はevent familyを含むためevent infra未完成の影響も受ける（Summary判断#7,#8）。",
-  blockerKinds: no >= 90 ? (["missing_manifest", "missing_role_history"] as const) : (["missing_manifest"] as const),
+  blockerKinds: ["missing_manifest"] as const,
   optimizationRisk: "LOW" as const,
 }));
 

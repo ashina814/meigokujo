@@ -126,6 +126,7 @@ const TITLE_RESTRICTED_USES = [
   "invite_rooted_safe_classification",
   "casino_table_safe_classification",
   "casino_market_safe_classification",
+  "social_context_safe_classification",
 ] as const;
 export type TitleRestrictedUse = (typeof TITLE_RESTRICTED_USES)[number];
 const VALID_TITLE_RESTRICTED_USES: ReadonlySet<string> = new Set(TITLE_RESTRICTED_USES);
@@ -390,6 +391,142 @@ export const TITLE_SOURCES = {
     epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
     // pair identityを畳み込んだ、本人単位の集計だけ。
     rawUnit: "safe_social_aggregate",
+  },
+  vc_temporal_co_presence_slices: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/vc/derived.ts",
+      needle: "export function computeTrustedCoPresenceSlices(",
+    },
+    derivedFrom: ["vc_visits"],
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "social_context_safe_classification",
+    epochPolicy: { type: "interval", start: "startedAt", end: "endedAt", clip: true },
+    rawUnit: "trusted_pairwise_temporal_co_presence_slice",
+  },
+  soul_status_history: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/db/bootstrap.ts",
+      needle: "CREATE TRIGGER IF NOT EXISTS trg_soul_status_history_transition",
+    },
+    calledFrom: {
+      file: "packages/core/src/evaluation/service.ts",
+      needle: "UPDATE souls SET status",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/rank-sync.ts",
+      needle: "services.evaluation.syncStatusFromRoles(",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "social_context_safe_classification",
+    epochPolicy: { type: "point", at: "observed_at" },
+    rawUnit: "append_only_canonical_soul_status_observation",
+  },
+  role_family_manifest_history: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/role-family/temporal.ts",
+      needle: "INSERT INTO role_family_manifest_revisions",
+    },
+    calledFrom: {
+      file: "apps/bot/src/role-family-tracking.ts",
+      needle: "services.roleFamilyTemporal.startObservationSession(",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "initializeRoleFamilyTracking(ready, services)",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "social_context_safe_classification",
+    epochPolicy: { type: "point", at: "activated_at" },
+    rawUnit: "immutable_explicit_role_family_manifest_revision",
+  },
+  role_observation_sessions: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/role-family/temporal.ts",
+      needle: "INSERT INTO role_observation_sessions",
+    },
+    calledFrom: {
+      file: "apps/bot/src/role-family-tracking.ts",
+      needle: "services.roleFamilyTemporal.startObservationSession(",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "initializeRoleFamilyTracking(ready, services)",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "social_context_safe_classification",
+    epochPolicy: { type: "interval", start: "started_at", end: "last_checkpoint_at", clip: true },
+    rawUnit: "trusted_gateway_role_observation_coverage",
+  },
+  role_family_member_presence: {
+    origin: "persisted",
+    writtenBy: {
+      file: "packages/core/src/role-family/temporal.ts",
+      needle: "INSERT INTO role_family_member_presence",
+    },
+    calledFrom: {
+      file: "apps/bot/src/role-family-tracking.ts",
+      needle: "services.roleFamilyTemporal.observeMemberSnapshot(",
+    },
+    wiredFrom: {
+      file: "apps/bot/src/index.ts",
+      needle: "trackRoleFamilyMemberUpdate(oldMember, newMember, services)",
+    },
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "social_context_safe_classification",
+    epochPolicy: { type: "interval", start: "started_at", end: "ended_at", clip: true },
+    rawUnit: "trusted_member_semantic_role_family_presence",
+  },
+  social_class_context_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-social-context.ts",
+      needle: "export function computeSocialClassContextSafe(",
+    },
+    derivedFrom: ["vc_temporal_co_presence_slices", "soul_status_history"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "anonymous_counterpart_by_local_public_class_touch_distribution",
+  },
+  social_department_family_context_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-social-context.ts",
+      needle: "export function computeSocialDepartmentFamilyContextSafe(",
+    },
+    derivedFrom: [
+      "vc_temporal_co_presence_slices",
+      "role_family_manifest_history",
+      "role_observation_sessions",
+      "role_family_member_presence",
+    ],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "anonymous_counterpart_by_local_public_department_family_touch_distribution",
   },
 
   // ── Safe Activity Sources（PR E1）────────────────────────────────────
