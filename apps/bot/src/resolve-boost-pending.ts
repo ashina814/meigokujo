@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { resolveDbPath } from "./env-contract.js";
 import { Ledger, Settings, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import { recordManualBoostCompensation } from "./boost-reward.js";
 import type { Services } from "./services.js";
@@ -42,7 +43,7 @@ function parseArgs(argv: string[]): { messageId: string; actorUserId: string; ex
 }
 
 const args = parseArgs(process.argv.slice(2));
-const dbPath = process.env.DB_PATH ?? "./data/bot.db";
+const dbPath = resolveDbPath(process.env);
 registerDefaultTxTypes();
 const db = openDb(dbPath);
 const ledger = new Ledger(db);

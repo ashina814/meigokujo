@@ -64,6 +64,11 @@ import { isAdmin } from "../permissions.js";
 // パネル種別の正本は panel-kinds.ts（データだけの葉モジュール）。
 // 描画を持つ bank-panel.ts を静的 import すると循環するので、選択肢はこちらから作る
 import { installablePanelChoices, removablePanelChoices } from "./panel-kinds.js";
+import {
+  operatorNumberKeysWith,
+  operatorSettingChoices,
+  operatorSettingForUi,
+} from "./operator-setting-kinds.js";
 import { ROLE_SLOT_META, ROLE_SLOT_ORDER, getRoleIds, setRoleIds, type RoleSlot } from "../church-roles.js";
 import {
   getSpecialProfiles,
@@ -441,31 +446,42 @@ export async function handleAdminSelect(
     return void (await handleDenywordRemove(interaction, services));
   }
   if (section === "setting" && action === "channel-key" && interaction.isStringSelectMenu()) {
-    return void (await interaction.update(await settingChannelPicker(interaction.values[0]!)));
+    const setting = operatorSettingForUi("channel", interaction.values[0]!);
+    if (!setting) return void (await interaction.update(unknownOperatorSettingPayload()));
+    return void (await interaction.update(await settingChannelPicker(setting.uiKey)));
   }
   if (section === "setting" && action === "category-key" && interaction.isStringSelectMenu()) {
-    return void (await interaction.update(await settingCategoryPicker(interaction.values[0]!)));
+    const setting = operatorSettingForUi("category", interaction.values[0]!);
+    if (!setting) return void (await interaction.update(unknownOperatorSettingPayload()));
+    return void (await interaction.update(await settingCategoryPicker(setting.uiKey)));
   }
   if (section === "setting" && action === "category-pick" && interaction.isChannelSelectMenu()) {
-    const key = parts[3]!;
-    services.settings.set(`category:${key}`, interaction.values[0]!, `user:${interaction.user.id}`);
-    return void (await interaction.update({ content: `✅ **category:${key}** に <#${interaction.values[0]}> を設定しました。`, embeds: [], components: [backButton()] }));
+    const setting = operatorSettingForUi("category", parts[3]!);
+    if (!setting) return void (await interaction.update(unknownOperatorSettingPayload()));
+    services.settings.set(setting.key, interaction.values[0]!, `user:${interaction.user.id}`);
+    return void (await interaction.update({ content: `✅ **${setting.key}** に <#${interaction.values[0]}> を設定しました。`, embeds: [], components: [backButton()] }));
   }
   if (section === "setting" && action === "channel-pick" && interaction.isChannelSelectMenu()) {
-    const key = parts[3]!;
-    services.settings.set(`channel:${key}`, interaction.values[0]!, `user:${interaction.user.id}`);
-    return void (await interaction.update({ content: `✅ **${key}** に <#${interaction.values[0]}> を設定しました。`, embeds: [], components: [backButton()] }));
+    const setting = operatorSettingForUi("channel", parts[3]!);
+    if (!setting) return void (await interaction.update(unknownOperatorSettingPayload()));
+    services.settings.set(setting.key, interaction.values[0]!, `user:${interaction.user.id}`);
+    return void (await interaction.update({ content: `✅ **${setting.uiKey}** に <#${interaction.values[0]}> を設定しました。`, embeds: [], components: [backButton()] }));
   }
   if (section === "setting" && action === "role-key" && interaction.isStringSelectMenu()) {
-    return void (await interaction.update(await settingRolePicker(interaction.values[0]!)));
+    const setting = operatorSettingForUi("role", interaction.values[0]!);
+    if (!setting) return void (await interaction.update(unknownOperatorSettingPayload()));
+    return void (await interaction.update(await settingRolePicker(setting.uiKey)));
   }
   if (section === "setting" && action === "role-pick" && interaction.isRoleSelectMenu()) {
-    const key = parts[3]!;
-    services.settings.set(`role:${key}`, interaction.values[0]!, `user:${interaction.user.id}`);
-    return void (await interaction.update({ content: `✅ **${key}** に <@&${interaction.values[0]}> を設定しました。`, embeds: [], components: [backButton()] }));
+    const setting = operatorSettingForUi("role", parts[3]!);
+    if (!setting) return void (await interaction.update(unknownOperatorSettingPayload()));
+    services.settings.set(setting.key, interaction.values[0]!, `user:${interaction.user.id}`);
+    return void (await interaction.update({ content: `✅ **${setting.uiKey}** に <@&${interaction.values[0]}> を設定しました。`, embeds: [], components: [backButton()] }));
   }
   if (section === "setting" && action === "number-key" && interaction.isStringSelectMenu()) {
-    return void (await interaction.showModal(numberSetModal(interaction.values[0]!)));
+    const setting = operatorSettingForUi("number", interaction.values[0]!);
+    if (!setting) return void (await interaction.update(unknownOperatorSettingPayload()));
+    return void (await interaction.showModal(numberSetModal(setting.uiKey)));
   }
   if (section === "setting" && action === "eval-cap-pick" && interaction.isRoleSelectMenu()) {
     return void (await interaction.showModal(evaluationCapModal(services, interaction.values[0]!)));
@@ -721,7 +737,12 @@ export async function handleAdminModal(interaction: ModalSubmitInteraction, serv
   }
 
   if (section === "setting" && action === "number") {
-    const key = parts[3]!;
+    const setting = operatorSettingForUi("number", parts[3]!);
+    if (!setting) {
+      await interaction.reply({ content: "この設定項目は現在の運営設定registryにありません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const key = setting.key;
     const raw = interaction.fields.getTextInputValue("value").replaceAll(",", "").trim();
     const n = Number(raw);
     if (!Number.isFinite(n)) {
@@ -1035,6 +1056,14 @@ async function settingHome(_services: Services) {
   return { embeds: [embed], components: [row, row2, backButton()] };
 }
 
+function unknownOperatorSettingPayload() {
+  return {
+    content: "この設定項目は現在の運営設定registryにありません。設定画面を開き直してください。",
+    embeds: [],
+    components: [backButton()],
+  };
+}
+
 function evalMarkCapsByRole(services: Services): Record<string, number> {
   const raw = services.settings.getJson<Record<string, unknown>>("eval_mark_caps_by_role", {});
   return Object.fromEntries(
@@ -1085,31 +1114,7 @@ function evaluationCapModal(services: Services, roleId: string) {
     );
 }
 
-const CHANNEL_KEYS: Array<[string, string]> = [
-  ["public_log", "公開取引ログ"],
-  ["kessai", "#決裁"],
-  ["keikiban", "#城の計器盤"],
-  ["audit_log", "監査ログ"],
-  ["entry_guide", "入城案内（パネル・DMの案内先）"],
-  ["entry_ops", "入城の運用（説明会お知らせ・時間外希望スレッド／未設定なら入城案内と同じ）"],
-  ["waiters_board", "門番用の待ち人ボード"],
-  ["session_vc", "説明会場VC"],
-  ["session_vc2", "説明会場VC（2つ目）"],
-  ["shokan", "冥界商館（ショップ配送通知）"],
-  ["promotion_call", "昇格面談呼び出し"],
-  ["rank_notify", "称号レベルアップ通知"],
-  ["eval_forum", "評価フォーラム"],
-  ["shurei", "集令"],
-  ["announce", "昇格のお知らせ"],
-  ["recruit", "蜜月の募集掲示"],
-  ["charon_notify", "カロン通知"],
-  ["bigwin", "大勝ち速報"],
-  ["member_log", "入退室ログ"],
-  ["confession", "トートの耳（匿名タレコミ）"],
-  ["court_forum", "冥府裁判所フォーラム（送致先）"],
-  ["emergency_reports", "緊急対応の通知先"],
-  ["handoff_notify", "対応先変更・大司教呼出の通知先（省略時はトートの耳）"],
-];
+const CHANNEL_KEYS = operatorSettingChoices("channel");
 
 /**
  * カテゴリ設定。**チャンネルとは別扱いにする**。
@@ -1121,15 +1126,7 @@ const CHANNEL_KEYS: Array<[string, string]> = [
  * `category:eval_den` は以前から読まれていたのに設定する導線が無く、
  * 実質いつも未設定だった。同じ仕組みなのでここへまとめる。
  */
-const CATEGORY_KEYS: Array<[string, string]> = [
-  ["conversation_court_core_block", "会話廷コアタイムVC制限カテゴリ"],
-  ["rooms", "宿ぜんぶの既定カテゴリ（種別ごとの指定が無いとき）"],
-  ["room_normal", "通常宿の生成先"],
-  ["room_mitsugetsu", "蜜月の生成先"],
-  ["room_oborozuki", "朧月（秘密の宿）の生成先"],
-  ["room_game", "ゲーム部屋の生成先"],
-  ["eval_den", "巣穴（評価VC）の生成先"],
-];
+const CATEGORY_KEYS = operatorSettingChoices("category");
 
 /**
  * 階級の再同期。
@@ -1214,32 +1211,13 @@ async function settingChannelPicker(key: string) {
   };
 }
 
-const ROLE_KEYS: Array<[string, string]> = [
-  ["admin", "運営（管理ロール）"],
-  ["queue_wait", "入城案内待ち"],
-  ["ghost", "亡霊"],
-  ["meirei", "迷霊"],
-  ["majin", "魔人"],
-  ["kenma", "眷魔"],
-  ["mazoku", "魔族"],
-  ["judge", "門番"],
-  ["judge_lead", "門番統括"],
-  ["judge_extra", "門番（予備）"],
-  ["shin", "審"],
-  ["mendan", "面談待ち"],
-  ["ticket_staff", "チケット対応"],
-  ["male", "男性属性"],
-  ["female", "女性属性"],
-  ["bump_notify", "紹介協力者"],
-  ["casino_vip", "賭場VIP"],
-  ["emergency_staff", "緊急対応担当"],
-];
+const ROLE_KEYS = operatorSettingChoices("role");
 
 async function openRoleSetup(interaction: ButtonInteraction, _services: Services) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId("mgmt:setting:role-key")
     .setPlaceholder("設定するロール種別を選ぶ")
-    .addOptions(ROLE_KEYS.slice(0, 25).map(([v, name]) => ({ label: name, value: v })));
+    .addOptions(ROLE_KEYS.map(([v, name]) => ({ label: name, value: v })));
   await interaction.update({
     embeds: [new EmbedBuilder().setTitle("⚙️ ロール設定").setDescription("種別を選んでからロールを指定します。")],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu), backButton()],
@@ -1254,45 +1232,18 @@ async function settingRolePicker(key: string) {
   };
 }
 
-const NUMBER_KEYS: Array<[string, string]> = [
-  ["initial_grant", "亡霊化時の初期発行"],
-  ["salary_period_days", "給与支給間隔（日）"],
-  ["eval_base_period_days", "評価期限（日）"],
-  ["invite_extend_days_male", "招待延長：男（日）"],
-  ["invite_extend_days_female", "招待延長：女（日）"],
-  ["invite_extend_cap_days", "招待延長 上限（日）"],
-  ["invite_mark_per_person", "招待→昇格印（人あたり）"],
-  ["invite_mark_cap", "招待→昇格印 上限"],
-  ["promotion_marks_required", "昇格印 必要数"],
-  ["demotion_marks_threshold", "低評価印 閾値"],
-  ["approval_threshold", "承認閾値（Land）"],
-  ["room_slot_price", "宿の枠+1価格"],
-  ["room_mitsugetsu_price", "蜜月価格"],
-  ["room_oborozuki_price", "朧月価格"],
-  ["room_empty_grace_min", "空室からの削除猶予（分）"],
-  ["room_recruit_expire_hours", "蜜月募集の失効（時間）"],
-  ["room_recruit_refund", "蜜月失効の返金"],
-  ["bump_reward", "bump報酬（Land）"],
-  ["ether_rate_base", "旧制度の固定比率（互換設定）"],
-  ["ether_fuku_scale", "福の重みスケール"],
-  ["vip_price", "VIP月会費（Land）"],
-  ["vip_days", "VIP日数"],
-  ["vip_bet_cap_mult", "VIP賭け上限倍率"],
-  ["confession_body_retention_days", "トート本文の保持日数"],
-  ["confession_court_retention_days", "トート送致案件の本文保持日数"],
-  ["entry_require_name", "入城に名前の登録を必須にする（1でON・既定0）"],
-];
+const NUMBER_KEYS = operatorSettingChoices("number");
 
-const POSITIVE_INTEGER_NUMBER_KEYS = new Set(["promotion_marks_required", "demotion_marks_threshold"]);
+const POSITIVE_INTEGER_NUMBER_KEYS = operatorNumberKeysWith("positive-integer");
 /** 0か1しか受けない設定（段階有効化のフラグ） */
-const FLAG_NUMBER_KEYS = new Set(["entry_require_name"]);
-const NON_NEGATIVE_NUMBER_KEYS = new Set(["invite_mark_per_person", "invite_mark_cap"]);
+const FLAG_NUMBER_KEYS = operatorNumberKeysWith("flag");
+const NON_NEGATIVE_NUMBER_KEYS = operatorNumberKeysWith("non-negative");
 
 async function openNumberSetup(interaction: ButtonInteraction, _services: Services) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId("mgmt:setting:number-key")
     .setPlaceholder("変更する数値項目を選ぶ")
-    .addOptions(NUMBER_KEYS.slice(0, 25).map(([v, name]) => ({ label: name, value: v })));
+    .addOptions(NUMBER_KEYS.map(([v, name]) => ({ label: name, value: v })));
   await interaction.update({
     embeds: [new EmbedBuilder().setTitle("⚙️ 数値設定").setDescription("項目を選ぶとモーダルが開きます。")],
     components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu), backButton()],

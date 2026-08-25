@@ -36,6 +36,7 @@ import {
 import { ChannelType, RESTJSONErrorCodes } from "discord.js";
 import { fmtLd } from "../format.js";
 import type { Services } from "../services.js";
+import { config } from "../config.js";
 
 const OPS_PREFIX = "mgmt:casino:opening";
 const CONFIRM_WORD = "FORMAL-OPENING";
@@ -341,11 +342,11 @@ function ensureOwner(interaction: ButtonInteraction | ModalSubmitInteraction): b
 }
 
 function openingOwnerId(): string {
-  return process.env.OWNER_ID ?? "";
+  return config.ownerId;
 }
 
-function openingBackupDir(): string {
-  return process.env.CASINO_OPENING_BACKUP_DIR ?? "";
+function openingBackupDir(): string | undefined {
+  return config.openingBackupDir;
 }
 
 function settingsEditBlockedReason(services: Services): string | null {

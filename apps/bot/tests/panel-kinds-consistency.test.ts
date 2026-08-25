@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MessageFlags, type ButtonInteraction, type SlashCommandBuilder } from "discord.js";
 import {
+  PANEL_KINDS,
   installablePanelChoices,
   removablePanelChoices,
   retiredPanelChoices,
@@ -9,6 +10,7 @@ import {
 
 let panelCommand: SlashCommandBuilder;
 let panelRemoveCommand: SlashCommandBuilder;
+let panelRendererKeys: string[];
 
 beforeAll(async () => {
   // bank-panel.ts は shokan -> permissions -> config を経由する。
@@ -16,7 +18,9 @@ beforeAll(async () => {
   vi.stubEnv("DISCORD_TOKEN", "test-token");
   vi.stubEnv("CLIENT_ID", "test-client");
   vi.stubEnv("OWNER_ID", "test-owner");
-  ({ panelCommand, panelRemoveCommand } = await import("../src/commands/bank-panel.js"));
+  const bankPanel = await import("../src/commands/bank-panel.js");
+  ({ panelCommand, panelRemoveCommand } = bankPanel);
+  panelRendererKeys = Object.keys(bankPanel.PANEL_MESSAGES);
 });
 
 afterAll(() => {
@@ -67,6 +71,12 @@ function fakeCasinoServices(opts: { phase?: "pre_reset" | "formal" | "unknown"; 
  * `Record<PanelKind, ...>` の描画網羅は TypeScript の typecheck が担う。
  */
 describe("パネル種別は単一の表から生成される", () => {
+  it("registryにduplicateがなく、renderer mapと完全一致する", () => {
+    const registryKeys = PANEL_KINDS.map((entry) => entry.key);
+    expect(new Set(registryKeys).size).toBe(registryKeys.length);
+    expect(panelRendererKeys.sort()).toEqual([...registryKeys].sort());
+  });
+
   it("/パネル設置 の選択肢が installable と一致する", () => {
     expect(choiceValues(panelCommand)).toEqual(installablePanelChoices().map((c) => c.value));
   });
@@ -89,6 +99,13 @@ describe("パネル種別は単一の表から生成される", () => {
       expect(removable, `${value} が撤去できない`).toContain(value);
     }
     expect(retiredPanelChoices().map((c) => c.value)).toEqual(["entry_flex"]);
+  });
+
+  it("pure registryが両方のproduction install boundaryへmountされている", () => {
+    const commandBoundary = readFileSync(new URL("../src/commands/bank-panel.ts", import.meta.url), "utf8");
+    const adminBoundary = readFileSync(new URL("../src/commands/admin-hub.ts", import.meta.url), "utf8");
+    expect(commandBoundary).toContain("installablePanelChoices()");
+    expect(adminBoundary).toContain("installablePanelChoices()");
   });
 
   it("stale な外部設置経路でも廃止済み種別を新規設置できない", async () => {

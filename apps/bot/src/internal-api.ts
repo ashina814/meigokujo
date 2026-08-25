@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import type { Services } from "./services.js";
+import { resolveInternalApiEnv } from "./env-contract.js";
 
 /**
  * 内部専用・読み取り専用の経済API（ログBotの観測用）。
@@ -178,20 +179,15 @@ function handleHealth(services: Services, url: URL, res: ServerResponse): void {
 }
 
 export function startInternalApi(services: Services): void {
-  const token = process.env.ECONOMY_API_TOKEN;
-  if (!token) {
+  const runtime = resolveInternalApiEnv(process.env);
+  if (!runtime) {
     console.warn(`${LOG} ECONOMY_API_TOKEN が未設定のため内部APIを起動しません（無認証公開を避けるため）`);
     return;
   }
+  const { token, hosts, port } = runtime;
   // 待受アドレスはカンマ区切りで複数指定できる。
   // ログBotは独自のcomposeネットワーク上にいるため、docker0(172.17.0.1)だけでは
   // Dockerのネットワーク間分離により到達できない。各ブリッジのゲートウェイを列挙する。
-  const hosts = (process.env.ECONOMY_API_HOST ?? "172.17.0.1")
-    .split(",")
-    .map((h) => h.trim())
-    .filter(Boolean);
-  const port = Number(process.env.ECONOMY_API_PORT ?? 8787);
-
   const handler = (req: IncomingMessage, res: ServerResponse) => {
     try {
       // 読み取り専用APIなので GET 以外は受け付けない
