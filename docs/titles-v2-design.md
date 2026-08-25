@@ -2044,9 +2044,30 @@ raw counterpart/role/guild/channel/status/family key/exact timestampはsafe payl
 
 300-user chunkを維持し、601 subjectsはsourceごとに300/300/1の3 logical reads。singleとprefetchedは一致し、
 counterpart/class/familyごとのN+1は無い。No.26/27をSOURCE READYへ更新し、overallは
-READY 68 / PARTIAL 6 / BLOCKED 17 / META 8。No.57/64/65/73はF3b domain-specific temporal safe JOIN待ち、
+F3a時点ではREADY 68 / PARTIAL 6 / BLOCKED 17 / META 8。No.57/64/65/73はF3b domain-specific temporal safe JOIN待ち、
 No.90/91はcastle manifest/cross-domain source待ちでBLOCKEDを維持する。production threshold、award、notification、
-BehaviorTitleDefinition、historical inferred backfill、F3b/F4、merge/deployは無い。
+BehaviorTitleDefinition、historical inferred backfill、F4、merge/deployは無い。
+
+### F3b — Domain Role-at-Time × Activity Temporal Safe Joins
+
+domain role truthをactual permission codeから再監査した結果、canonical mappingが成立するのは
+`/商館`のexact `冥界商館` department roleだけだった。これだけをimmutable manifest revisionの
+`shop` tagへ接続する。`room_normal_free`は宿benefit、`casino_pvp_notify`は通知、賭場運営卓は
+global admin permission、generic department roleは任意部署の口座権限なので、inn/economy/casino
+staffへ流用しない。role/department名substringからの推測も行わない。
+
+`loadTrustedRoleFamilyIntervals()`をdomain共通restricted boundaryとする。manifest/session/presenceの
+revision・guild・chronologyを検証し、current role/current departmentsへhistorical lookupしない。
+same-second transitionはF3aと同じknown-start fenceを使い、pointは`start <= t < end`、intervalは
+positive overlapだけを採る。restart/disconnect/manifest refresh/fetch gapはUNKNOWN。F3a department
+social sourceも同helperへ統合し、temporal trust検証を二重実装しない。
+
+No.65は既存shop eligibility/refund classifierが返すrestricted `purchasedAt` occurrenceをtrusted
+shop-role intervalへ先にJOINし、safe `{ days: [{ date, eligiblePurchaseCount }] }`へ落とす。
+exact timestamp、user/role/family/department/item/purchase identity、amountは出さない。No.65だけ
+SOURCE READYとなり、overallはREADY 69 / PARTIAL 6 / BLOCKED 16 / META 8。No.57/64/73は
+canonical mapping不足、No.90/91はcastle manifest/cross-domain source不足でBLOCKEDを維持する。
+threshold/award/notification/backfillは追加しない。
 
 ## 15. PR分割
 

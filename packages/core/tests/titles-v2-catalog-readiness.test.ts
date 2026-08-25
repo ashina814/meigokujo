@@ -367,10 +367,10 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
     }
   });
 
-  it("F3a後の実集計はREADY 68 / PARTIAL 6 / BLOCKED 17 / META 8", () => {
+  it("F3b shop mapping後の実集計はREADY 69 / PARTIAL 6 / BLOCKED 16 / META 8", () => {
     const counts = new Map<string, number>();
     for (const entry of TITLE_V2_CATALOG_READINESS) counts.set(entry.status, (counts.get(entry.status) ?? 0) + 1);
-    expect(Object.fromEntries(counts)).toEqual({ READY: 68, PARTIAL: 6, BLOCKED: 17, META: 8 });
+    expect(Object.fromEntries(counts)).toEqual({ READY: 69, PARTIAL: 6, BLOCKED: 16, META: 8 });
   });
 
   it("source_semantic_mismatchはpublic provenance 3件を含む6件、missing_derived_sourceは6件", () => {
@@ -416,7 +416,7 @@ describe("PR F2k: economy semantic family + shop purchase safe readiness", () =>
     expect(readinessFor(63).notes).toContain("incoming-only family");
   });
 
-  it("No.62はshop sourceでREADY、No.60/64/65は残るexact blockerだけを保持", () => {
+  it("No.62/65はshop sourcesでREADY、No.60/64は残るexact blockerだけを保持", () => {
     expect(readinessFor(62)).toMatchObject({
       status: "READY",
       usableSources: ["shop_purchase_safe"],
@@ -436,17 +436,19 @@ describe("PR F2k: economy semantic family + shop purchase safe readiness", () =>
       blockerKinds: ["missing_domain_temporal_join"],
     });
     expect(readinessFor(65)).toMatchObject({
-      status: "BLOCKED",
-      usableSources: ["shop_purchase_safe"],
-      blockerKinds: ["missing_domain_temporal_join"],
+      status: "READY",
+      usableSources: ["shop_role_purchase_safe"],
+      specializedResolvers: ["computeShopRolePurchaseSafe"],
+      missingCapabilities: [],
+      blockerKinds: ["none"],
     });
   });
 
-  it("Theme 13はREADY 5 / PARTIAL 0 / BLOCKED 3", () => {
+  it("Theme 13はREADY 6 / PARTIAL 0 / BLOCKED 2", () => {
     const entries = TITLE_V2_CATALOG_READINESS.filter((entry) => entry.no >= 58 && entry.no <= 65);
-    expect(entries.filter((entry) => entry.status === "READY")).toHaveLength(5);
+    expect(entries.filter((entry) => entry.status === "READY")).toHaveLength(6);
     expect(entries.filter((entry) => entry.status === "PARTIAL")).toHaveLength(0);
-    expect(entries.filter((entry) => entry.status === "BLOCKED")).toHaveLength(3);
+    expect(entries.filter((entry) => entry.status === "BLOCKED")).toHaveLength(2);
   });
 });
 
@@ -479,10 +481,10 @@ describe("PR F2g: public room activity safe source追加後のreadiness", () => 
     expect(entries.filter((entry) => entry.status === "BLOCKED")).toHaveLength(1);
   });
 
-  it("F3a後missing_role_historyは0、F3b待ちdomain temporal joinは4", () => {
+  it("F3b後missing_role_historyは0、未解決domain temporal joinは3", () => {
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_persisted_source"))).toHaveLength(0);
     expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_role_history"))).toHaveLength(0);
-    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_domain_temporal_join"))).toHaveLength(4);
+    expect(TITLE_V2_CATALOG_READINESS.filter((entry) => entry.blockerKinds.includes("missing_domain_temporal_join"))).toHaveLength(3);
   });
 });
 
@@ -731,13 +733,18 @@ describe("PR F3a: trusted class / role-family temporal provenance readiness", ()
     });
   });
 
-  it("No.57/64/65/73はgeneric role historyではREADYにせずF3b domain JOIN待ち", () => {
-    for (const no of [57, 64, 65, 73]) {
+  it("No.57/64/73はcanonical domain mapping不足でBLOCKED、No.65だけF3bでREADY", () => {
+    for (const no of [57, 64, 73]) {
       const entry = readinessFor(no);
       expect(entry.status, `candidate #${no}`).toBe("BLOCKED");
       expect(entry.blockerKinds, `candidate #${no}`).toEqual(["missing_domain_temporal_join"]);
       expect(entry.missingCapabilities.join(" "), `candidate #${no}`).toContain("domain-specific temporal safe JOIN");
     }
+    expect(readinessFor(65)).toMatchObject({
+      status: "READY",
+      usableSources: ["shop_role_purchase_safe"],
+      blockerKinds: ["none"],
+    });
   });
 
   it("No.90/91はgeneric role-history blockerだけを外しcastle manifest blockerを維持", () => {

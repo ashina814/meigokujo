@@ -87,7 +87,7 @@ describe("A-D canonical soul class history", () => {
 });
 
 describe("J-U role-family manifest and trusted observation coverage", () => {
-  it("canonical departments mappingだけをpublic_department manifestへsnapshotし、名前heuristicでdomain tagを足さない", () => {
+  it("canonical departments mappingをsnapshotし、actual /商館 authorization keyだけshop tagへ接続する", () => {
     const db = openDb(":memory:");
     const departments = new Departments(db, new Ledger(db));
     departments.upsert("冥界商館", "商館っぽい名前", "role-shop");
@@ -97,7 +97,7 @@ describe("J-U role-family manifest and trusted observation coverage", () => {
       families: [{
         familyKey: "department:冥界商館",
         roleIds: ["role-shop"],
-        tags: ["public_department"],
+        tags: ["public_department", "shop"],
       }],
     });
   });

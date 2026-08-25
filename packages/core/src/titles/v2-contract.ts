@@ -127,6 +127,7 @@ const TITLE_RESTRICTED_USES = [
   "casino_table_safe_classification",
   "casino_market_safe_classification",
   "social_context_safe_classification",
+  "role_domain_temporal_classification",
 ] as const;
 export type TitleRestrictedUse = (typeof TITLE_RESTRICTED_USES)[number];
 const VALID_TITLE_RESTRICTED_USES: ReadonlySet<string> = new Set(TITLE_RESTRICTED_USES);
@@ -494,6 +495,25 @@ export const TITLE_SOURCES = {
     restrictedUse: "social_context_safe_classification",
     epochPolicy: { type: "interval", start: "started_at", end: "ended_at", clip: true },
     rawUnit: "trusted_member_semantic_role_family_presence",
+  },
+  role_family_domain_intervals: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/role-family/domain-temporal.ts",
+      needle: "export function loadTrustedRoleFamilyIntervals(",
+    },
+    derivedFrom: [
+      "role_family_manifest_history",
+      "role_observation_sessions",
+      "role_family_member_presence",
+    ],
+    kind: "history",
+    privacy: "restricted",
+    orderable: false,
+    titleUsable: false,
+    restrictedUse: "role_domain_temporal_classification",
+    epochPolicy: { type: "interval", start: "knownStart", end: "knownEnd", clip: true },
+    rawUnit: "trusted_domain_family_presence_interval_with_transition_second_fence",
   },
   social_class_context_safe: {
     origin: "derived",
@@ -901,6 +921,20 @@ export const TITLE_SOURCES = {
     titleUsable: true,
     epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
     rawUnit: "eligible_shop_product_breadth_by_jst_day",
+  },
+  shop_role_purchase_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-domain-role.ts",
+      needle: "export function computeShopRolePurchaseSafe(",
+    },
+    derivedFrom: ["shop_purchase_title_records", "role_family_domain_intervals"],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "eligible_shop_purchase_count_by_jst_day_while_trusted_shop_role_present",
   },
   economy_semantic_safe: {
     origin: "derived",

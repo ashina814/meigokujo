@@ -23,6 +23,8 @@ export interface EligibleShopPurchaseFact {
   readonly userId: string;
   readonly productKey: string;
   readonly date: string;
+  /** Restricted point occurrence used by F3b role-at-purchase JOIN. */
+  readonly purchasedAt: number;
 }
 
 /**
@@ -61,6 +63,7 @@ export function loadEligibleShopPurchaseFacts(
     userId: row.user_id,
     productKey: row.product_key,
     date: jstDateStr(new Date(row.purchased_at * 1_000)),
+    purchasedAt: row.purchased_at,
   }));
 }
 

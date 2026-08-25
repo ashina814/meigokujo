@@ -106,6 +106,7 @@ export {
   type EconomySafePeerActionsSourcePayload,
   type EconomySemanticSafeSourcePayload,
   type ShopPurchaseSafeSourcePayload,
+  type ShopRolePurchaseSafeSourcePayload,
   type PublicEventParticipationsSourcePayload,
   type PublicEventCompletedParticipationsSourcePayload,
   type PublicEventCalendarInvolvementSafeSourcePayload,
