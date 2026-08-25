@@ -87,7 +87,8 @@ export interface ChipReadonlyView {
 }
 
 /**
- * コアサービスの組み立て。アプリ層は薄く、ロジックは全て core 側（システム設計.md の原則）。
+ * Bot runtimeで利用するdomain service / persistenceと
+ * Discord側adapterを組み立てるcomposition root。
  */
 export function buildServices() {
   if (config.dbPath !== ":memory:") {

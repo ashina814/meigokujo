@@ -131,6 +131,7 @@ cat <<'DONE'
       journalctl -u meigokujo-bot.service -n 20 --no-pager -o cat
       # 「⚔️ 冥獄城ボット 起動」と「📗 検算OK」が出れば成功
 
- 起動後は 復旧手順書（新VPS復旧手順.md）の設定チェックリストへ。
+ 以後のdeploy・backup運用は
+ /home/kabu/meigokujo/deploy/DEPLOY.md を参照。
 ============================================================
 DONE
