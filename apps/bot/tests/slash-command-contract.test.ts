@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { STOCKS_PAUSE_REASON, replyStocksPaused } from "../src/casino/stocks-pause.js";
 import { ACTIVE_SLASH_COMMAND_ROUTES } from "../src/commands/active-slash-command-routes.js";
@@ -14,6 +15,7 @@ import {
   RETIRED_SLASH_COMMAND_NAMES,
 } from "../src/commands/slash-command-kinds.js";
 import { buildRegistrationPayload, resolveRegistrationTarget } from "../src/commands/slash-command-registration.js";
+import { handleTransfer } from "../src/commands/transfer.js";
 
 const RETIRED_CASINO_NAMES = [
   "遊ぶ",
@@ -80,6 +82,30 @@ describe("ACTIVE runtime route completeness", () => {
     const routeNames = Object.keys(ACTIVE_SLASH_COMMAND_ROUTES);
     expect(routeNames).toEqual(ACTIVE_SLASH_COMMAND_NAMES);
     expect(new Set(routeNames)).toEqual(new Set(payloadNames()));
+  });
+
+  it("送金routeはcanonical handleTransferへ直接接続する", () => {
+    expect(ACTIVE_SLASH_COMMAND_ROUTES.送金).toBe(handleTransfer);
+  });
+});
+
+describe("pure command contractのproduction mount", () => {
+  const readSource = (relativePath: string) =>
+    readFileSync(new URL(`../src/${relativePath}`, import.meta.url), "utf8");
+
+  it("registration CLIはpure payload builderとtarget resolverを使用する", () => {
+    const source = readSource("register-commands.ts");
+    expect(source).toContain("const commands = buildRegistrationPayload();");
+    expect(source).toContain("const target = resolveRegistrationTarget(");
+  });
+
+  it("InteractionCreateはACTIVEからLEGACYの順でroute boundaryをmountする", () => {
+    const source = readSource("index.ts");
+    const activeMount = "getActiveSlashCommandRoute(interaction.commandName)";
+    const legacyMount = "getLegacyCompatSlashCommandRoute(interaction.commandName)";
+    expect(source).toContain(activeMount);
+    expect(source).toContain(legacyMount);
+    expect(source.indexOf(activeMount)).toBeLessThan(source.indexOf(legacyMount));
   });
 });
 

@@ -18,6 +18,15 @@ describe("称号v2 source contract", () => {
     }
   });
 
+  it("production wiredFromは退役slashのlegacy compatibility routeを生存証明にしない", () => {
+    for (const [sourceKey, source] of Object.entries(TITLE_SOURCES)) {
+      if (source.origin !== "persisted") continue;
+      expect(source.wiredFrom.file, `${sourceKey} wiring`).not.toBe(
+        "apps/bot/src/commands/legacy-compat-slash-command-routes.ts",
+      );
+    }
+  });
+
   it("derived sourceは実装ファイルが実在し、依存先が全て登録済みsourceを指す", () => {
     const readRepoFile = (path: string) => readFileSync(new URL(`../../../${path}`, import.meta.url), "utf8");
 

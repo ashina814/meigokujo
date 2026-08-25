@@ -854,8 +854,8 @@ export const TITLE_SOURCES = {
       needle: "services.ledger.transfer({",
     },
     wiredFrom: {
-      file: "apps/bot/src/commands/active-slash-command-routes.ts",
-      needle: "送金: handleTransfer,",
+      file: "apps/bot/src/index.ts",
+      needle: "getActiveSlashCommandRoute(interaction.commandName)",
     },
     kind: "history",
     privacy: "restricted",
@@ -1122,8 +1122,8 @@ export const TITLE_SOURCES = {
       needle: "recordCasinoParticipationBestEffort(services, {",
     },
     wiredFrom: {
-      file: "apps/bot/src/commands/legacy-compat-slash-command-routes.ts",
-      needle: "遊ぶ: handleAsobuCommand,",
+      file: "apps/bot/src/index.ts",
+      needle: "await handleCasinoAmountPickButton(interaction, services);",
     },
     kind: "history",
     privacy: "restricted",
@@ -1174,8 +1174,8 @@ export const TITLE_SOURCES = {
       needle: "recordCasinoCompletionBestEffort(services, {",
     },
     wiredFrom: {
-      file: "apps/bot/src/commands/legacy-compat-slash-command-routes.ts",
-      needle: "遊ぶ: handleAsobuCommand,",
+      file: "apps/bot/src/index.ts",
+      needle: "await handleCasinoAmountPickButton(interaction, services);",
     },
     kind: "history",
     privacy: "restricted",
