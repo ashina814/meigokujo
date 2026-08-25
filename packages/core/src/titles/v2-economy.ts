@@ -125,13 +125,11 @@ function extractUserId(fromAccount: string): string | null {
  *   `[start, end)`契約上はまだ成立していないものとして扱う。
  * - `to_account LIKE 'user:%'`——相手も利用者口座（system口座宛のtip_burn等を除外）。
  *
- * dedupeは`ORDER BY from_account, created_at, id`で読み、`(userId, date, kind)`ごとの
- * 最初の行だけを採用する——invalid originalをSQLで先に除外するため、同日の最初の
- * transactionがreverse済みでも、後続のvalid transactionがfactを作る。同日に同じkindを
- * 何度実行してもfactは1件のまま（§21-22）。`occurredAt`はsnapshot内で最初のvalid
- * qualifying transactionの`created_at`——first valid qualifying observation（§23）。
+ * restricted loaderは全qualifying occurrenceを順序付きで返す。role-at-action JOINは
+ * day collapse前にこれを使うため、同日の最初がrole外でも後続role内actionを失わない。
+ * 既存safe sourceは下のwrapperで`(userId,date,kind)`ごとの先頭へcollapseする。
  */
-export function computeSafeEconomyPeerActions(
+export function loadSafeEconomyPeerActionOccurrences(
   db: Database.Database,
   window: { readonly start: number; readonly end: number },
   userIds: readonly string[],
@@ -167,19 +165,29 @@ export function computeSafeEconomyPeerActions(
     created_at: number;
   }>;
 
-  const seen = new Set<string>();
   const facts: SafeEconomyPeerActionFact[] = [];
   for (const row of rows) {
     const userId = extractUserId(row.from_account);
     if (!userId) continue; // 不正/corrupt account文字列はfail-closedでignore（§26）
     const kind = row.type as SafePeerEconomyActionKind;
     const date = jstDateStr(new Date(row.created_at * 1000));
-    const dedupeKey = `${userId} ${date} ${kind}`;
-    if (seen.has(dedupeKey)) continue;
-    seen.add(dedupeKey);
     facts.push({ userId, kind, date, occurredAt: row.created_at });
   }
   return facts;
+}
+
+export function computeSafeEconomyPeerActions(
+  db: Database.Database,
+  window: { readonly start: number; readonly end: number },
+  userIds: readonly string[],
+): readonly SafeEconomyPeerActionFact[] {
+  const seen = new Set<string>();
+  return loadSafeEconomyPeerActionOccurrences(db, window, userIds).filter((fact) => {
+    const key = `${fact.userId} ${fact.date} ${fact.kind}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 const LEDGER_FAMILY_BY_TYPE: ReadonlyMap<string, EconomyFeatureFamily> = new Map([

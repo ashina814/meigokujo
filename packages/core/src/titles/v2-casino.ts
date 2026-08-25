@@ -89,9 +89,10 @@ export interface CasinoCompletedActivityDayFact {
 
 /**
  * `userIds`について、`[window.start, window.end)`の間に観測されたcanonical
- * settlement成功（completion）を、`user × activityKey × JST day`で最大1 fact
- * へ畳み込んで返す。`activityDate`は`completed_at`をJST変換して求める——
- * commitmentの`occurred_at`の日ではない。
+ * settlement成功（completion）の全qualifying occurrenceを返す。role-at-action JOINは
+ * day collapse前にこれを使う。`activityDate`は`completed_at`をJST変換して求める——
+ * commitmentの`occurred_at`の日ではない。既存safe sourceは下のwrapperで
+ * `user × activityKey × JST day`へcollapseする。
  *
  * PR #166レビューBLOCKER1: `recordCompletedParticipation()`はwriter時点で
  * commitment/participant set不一致・partial completion行・mixed completed_at・
@@ -124,7 +125,7 @@ export interface CasinoCompletedActivityDayFact {
  * userIds（既に上限済み）+ window境界2個」だけに保たれ、candidate key数には
  * 一切依存しない。
  */
-export function computeCasinoCompletedActivityDays(
+export function loadCasinoCompletedActivityOccurrences(
   db: Database.Database,
   window: { readonly start: number; readonly end: number },
   userIds: readonly string[],
@@ -179,7 +180,6 @@ export function computeCasinoCompletedActivityDays(
   }
   const candidateKeys = [...completionsByKey.keys()];
 
-  const seen = new Set<string>();
   const facts: CasinoCompletedActivityDayFact[] = [];
   for (const participationKey of candidateKeys) {
     const commitment = commitmentsByKey.get(participationKey);
@@ -215,9 +215,6 @@ export function computeCasinoCompletedActivityDays(
     const activityDate = jstDateStr(new Date(completedAt * 1000));
     for (const userId of completionUserIds) {
       if (!requestedUserIds.has(userId)) continue; // 相手(counterpart)のuserIdはpayloadへ出さない
-      const dedupeKey = `${userId} ${activityKey} ${activityDate}`;
-      if (seen.has(dedupeKey)) continue;
-      seen.add(dedupeKey);
       facts.push({ userId, activityKey, activityDate, completedAt });
     }
   }
@@ -229,4 +226,18 @@ export function computeCasinoCompletedActivityDays(
     return a.activityKey < b.activityKey ? -1 : a.activityKey > b.activityKey ? 1 : 0;
   });
   return facts;
+}
+
+export function computeCasinoCompletedActivityDays(
+  db: Database.Database,
+  window: { readonly start: number; readonly end: number },
+  userIds: readonly string[],
+): readonly CasinoCompletedActivityDayFact[] {
+  const seen = new Set<string>();
+  return loadCasinoCompletedActivityOccurrences(db, window, userIds).filter((fact) => {
+    const key = `${fact.userId} ${fact.activityKey} ${fact.activityDate}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
