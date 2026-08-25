@@ -191,17 +191,27 @@ export interface CasinoTableParticipationDaysPayload {
   readonly days: ReadonlyArray<{ readonly date: string; readonly trustedSeconds: number }>;
 }
 
+/** Castle内部のownership JOINだけで使うrestricted companion。 */
+export interface CasinoTableParticipationEvidencePayload extends CasinoTableParticipationDaysPayload {
+  readonly guestIntervals: ReadonlyArray<{
+    readonly channelId: string;
+    readonly start: number;
+    readonly end: number;
+  }>;
+}
+
 /**
- * Castle casino adapter用。official eligible table内のsubject自身のknown-human guest
- * positive presenceを読む。table作成/owner identityだけ・bot・recovered gapは数えない。
+ * Castle casino adapter用restricted evidence。official eligible table内のsubject自身の
+ * known-human guest positive presenceを読む。channel identityはpublic VCとのexact ownership
+ * JOINにだけ使い、safe payloadへは出さない。table作成/owner identityだけ・bot・recovered gapは数えない。
  */
-export function computeCasinoTableParticipationDaysSafe(
+export function computeCasinoTableParticipationEvidence(
   db: Database.Database,
   window: { readonly start: number; readonly end: number },
   userIds: readonly string[],
-): ReadonlyMap<string, CasinoTableParticipationDaysPayload> {
-  const result = new Map<string, CasinoTableParticipationDaysPayload>();
-  for (const userId of userIds) result.set(userId, { days: [] });
+): ReadonlyMap<string, CasinoTableParticipationEvidencePayload> {
+  const result = new Map<string, CasinoTableParticipationEvidencePayload>();
+  for (const userId of userIds) result.set(userId, { days: [], guestIntervals: [] });
   if (userIds.length === 0 || window.end <= window.start) return result;
   const placeholders = userIds.map(() => "?").join(",");
   const rows = db.prepare(
@@ -225,7 +235,7 @@ export function computeCasinoTableParticipationDaysSafe(
   }>;
   const requested = new Set(userIds);
   const eligible = new Set<string>(TITLE_ELIGIBLE_CASINO_TABLE_TYPES);
-  const intervalsByUser = new Map<string, Array<{ start: number; end: number }>>();
+  const intervalsByUser = new Map<string, Array<{ channelId: string; start: number; end: number }>>();
   for (const userId of userIds) intervalsByUser.set(userId, []);
   for (const row of rows) {
     const validIdentity =
@@ -243,11 +253,29 @@ export function computeCasinoTableParticipationDaysSafe(
     if (!validIdentity || row.is_human !== 1 || !validTime || !validEnd) continue;
     const start = Math.max(window.start, row.started_at as number);
     const end = Math.min(window.end, (row.ended_at ?? window.end) as number);
-    if (end > start) intervalsByUser.get(row.user_id as string)!.push({ start, end });
+    if (end > start) intervalsByUser.get(row.user_id as string)!.push({
+      channelId: row.channel_id as string,
+      start,
+      end,
+    });
   }
 
   for (const userId of userIds) {
-    const ordered = intervalsByUser.get(userId)!.sort((a, b) => a.start - b.start || a.end - b.end);
+    const raw = intervalsByUser.get(userId)!;
+    const channelOrdered = raw.slice().sort((a, b) =>
+      a.channelId.localeCompare(b.channelId) || a.start - b.start || a.end - b.end);
+    const guestIntervals: Array<{ channelId: string; start: number; end: number }> = [];
+    for (const interval of channelOrdered) {
+      const previous = guestIntervals.at(-1);
+      if (previous && previous.channelId === interval.channelId && interval.start <= previous.end) {
+        previous.end = Math.max(previous.end, interval.end);
+      } else {
+        guestIntervals.push({ ...interval });
+      }
+    }
+
+    // safe wall-clock aggregateはchannelを跨いでもsubject-global unionにして二重秒を作らない。
+    const ordered = raw.slice().sort((a, b) => a.start - b.start || a.end - b.end);
     const union: Array<{ start: number; end: number }> = [];
     for (const interval of ordered) {
       const previous = union.at(-1);
@@ -263,9 +291,20 @@ export function computeCasinoTableParticipationDaysSafe(
     result.set(userId, {
       days: [...byDate].sort(([a], [b]) => a.localeCompare(b))
         .map(([date, trustedSeconds]) => ({ date, trustedSeconds })),
+      guestIntervals,
     });
   }
   return result;
+}
+
+/** 既存safe contractはrestricted channel intervalを必ず落とす。 */
+export function computeCasinoTableParticipationDaysSafe(
+  db: Database.Database,
+  window: { readonly start: number; readonly end: number },
+  userIds: readonly string[],
+): ReadonlyMap<string, CasinoTableParticipationDaysPayload> {
+  return new Map([...computeCasinoTableParticipationEvidence(db, window, userIds)]
+    .map(([userId, payload]) => [userId, { days: payload.days }]));
 }
 
 export interface CasinoMarketActivitySafePayload {

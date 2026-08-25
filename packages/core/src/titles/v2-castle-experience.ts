@@ -13,7 +13,7 @@ import {
 import {
   computeCasinoEditionICompletionSafe,
   computeCasinoMarketActivitySafe,
-  computeCasinoTableParticipationDaysSafe,
+  computeCasinoTableParticipationEvidence,
 } from "./v2-casino-edition-table-market.js";
 import { computeSafeEconomyPeerActions } from "./v2-economy.js";
 import { computePublicEventCalendarInvolvementSafe } from "./v2-public-events.js";
@@ -63,10 +63,10 @@ function assertEditionIManifest(): void {
 
 function subtractIntervals(
   source: readonly { readonly channelId: string; readonly start: number; readonly end: number }[],
-  ownedByRoom: readonly { readonly channelId: string; readonly start: number; readonly end: number }[],
+  ownedIntervals: readonly { readonly channelId: string; readonly start: number; readonly end: number }[],
 ): Array<{ start: number; end: number }> {
   let remaining = source.map((interval) => ({ ...interval }));
-  for (const excluded of ownedByRoom) {
+  for (const excluded of ownedIntervals) {
     const next: Array<{ channelId: string; start: number; end: number }> = [];
     for (const interval of remaining) {
       if (excluded.channelId !== interval.channelId || excluded.end <= interval.start || excluded.start >= interval.end) {
@@ -99,7 +99,8 @@ function activeRoomDays(activity: Awaited<ReturnType<typeof computePublicRoomAct
 
 /**
  * Edition-Iの7 domain adaptersを同じfixed snapshotで読み、family/dayだけへsanitizeする。
- * public-room visitor intervalとpublic-social VCが重なる秒はpublic_roomへ単一帰属させる。
+ * public-room visitor / official-table guest intervalとpublic-social VCが同一channelで
+ * 重なる秒は、それぞれpublic_room / casinoへ単一帰属させる。
  */
 export function computeCastleExperienceSafe(
   db: Database.Database,
@@ -134,12 +135,17 @@ export function computeCastleExperienceSafe(
     families.set(familyKey, days);
   };
 
-  // social/public room adapters. Exact room visitor intervals own overlapping physical VC seconds.
+  // Exact room/table intervals own same-channel overlapping physical public-VC seconds.
   const roomRows = computePublicRoomActivityEvidence(db, fixedWindow, requested);
   const roomByUser = new Map(roomRows.map((row) => [row.userId, row]));
+  const tableByUser = computeCasinoTableParticipationEvidence(db, fixedWindow, requested);
   for (const row of roomRows) for (const date of activeRoomDays(row.activity)) addDay(row.userId, "public_room", date);
   for (const row of computePublicSocialPresenceChannelIntervals(db, fixedWindow, requested)) {
-    const remainder = subtractIntervals(row.intervals, roomByUser.get(row.userId)?.visitorIntervals ?? []);
+    const ownedIntervals = [
+      ...(roomByUser.get(row.userId)?.visitorIntervals ?? []),
+      ...(tableByUser.get(row.userId)?.guestIntervals ?? []),
+    ];
+    const remainder = subtractIntervals(row.intervals, ownedIntervals);
     const seconds = vcSecondsByUser.get(row.userId)!;
     for (const interval of remainder) {
       for (const part of splitIntervalByJstDay(interval.start, interval.end)) {
@@ -167,7 +173,7 @@ export function computeCastleExperienceSafe(
       for (const date of family.completionDays) addDay(userId, "casino", date);
     }
   }
-  for (const [userId, payload] of computeCasinoTableParticipationDaysSafe(db, fixedWindow, requested)) {
+  for (const [userId, payload] of tableByUser) {
     for (const day of payload.days) addDay(userId, "casino", day.date);
   }
   for (const [userId, payload] of computeCasinoMarketActivitySafe(db, fixedWindow, requested)) {

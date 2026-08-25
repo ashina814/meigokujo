@@ -2084,9 +2084,10 @@ completed core game・official table actual participation・other standard marke
 general participantだけを採用する。shop/casinoをeconomyへ、casinoの3入口を3 familyへ、staff/audit actorをeventへ
 重複・推測creditしない。
 
-public room visitor intervalとcanonical public-social VC intervalが同じ物理滞在を指す秒はpublic_roomへ単一帰属し、
-exact overlapを引いた残りだけがpublic_vcになる。別channelのpublic VCは維持する。payloadはedition/version、family、
-JST day、public VCの日別trusted seconds、super-domain coverageだけで、identity、exact timestamp、amountを出さない。
+public room visitor intervalはpublic_room、official casino tableのknown-human guest intervalはcasinoへ単一帰属し、
+同一channelでcanonical public-social VCと重なるexact overlapを引いた残りだけがpublic_vcになる。同時刻でも別channelの
+public VCは維持する。payloadはedition/version、family、JST day、public VCの日別trusted seconds、super-domain
+coverageだけで、identity、exact timestamp、amountを出さない。
 300-user chunkごとに9 bulk adapter invocationを行うため601 usersのreadCallsは27と定義し、user×family N+1は作らない。
 
 No.85-89をSOURCE READYへ更新し、overallはREADY 74 / PARTIAL 6 / BLOCKED 11 / META 8。No.90/91はeligible public

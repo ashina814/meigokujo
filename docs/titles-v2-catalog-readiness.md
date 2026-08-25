@@ -1668,9 +1668,10 @@ participantだけで、staff/organizer/audit actorから推測しない。
 refund/reversal/completionはhistorical snapshotへ漏らさない。family adapterのcorrupt rowはそのfamilyだけを
 fail closedにし、他familyのvalid evidenceは維持する。manifest corruptionだけはsource全体をrejectする。
 
-public roomの物理visitor intervalとpublic-social VC intervalが重なる秒は`public_room`へ単一帰属し、exact interval
-差分だけを`public_vc`へ残す。room ownerが不在のhosted evidenceはownerのVCを差し引かず、別channelの通常public VCも
-維持する。day-levelの粗い抑制ではない。
+public roomの物理visitor intervalは`public_room`、official casino tableのknown-human guest intervalは`casino`へ
+単一帰属し、それぞれと同一channelで重なる秒をpublic-social VCから引いたexact remainderだけを`public_vc`へ残す。
+room ownerが不在のhosted evidenceはownerのVCを差し引かず、同時刻でも別channelの通常public VCは維持する。
+day-levelの粗い抑制ではない。
 
 safe payloadはedition/version、family key、JST date、public_vcの日別trusted seconds、covered super-domainだけ。
 user/counterpart/channel/room/event/market/item/transaction/role identity、exact timestamp、amountは公開しない。

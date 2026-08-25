@@ -14,6 +14,10 @@ import {
   defineCastleExperienceManifest,
 } from "../src/titles/v2-castle-experience-manifest.js";
 import { computeCastleExperienceSafe } from "../src/titles/v2-castle-experience.js";
+import {
+  computeCasinoTableParticipationDaysSafe,
+  computeCasinoTableParticipationEvidence,
+} from "../src/titles/v2-casino-edition-table-market.js";
 import { TITLE_SOURCES } from "../src/titles/v2-contract.js";
 import { defineTitleRule } from "../src/titles/v2-evaluator.js";
 import { readTitleSource, TitleSourceCache } from "../src/titles/v2-sources.js";
@@ -360,6 +364,70 @@ describe("AS-AV cross-family semantics and safe source contract", () => {
       humanUserIds: [], observedAt: BASE + 40,
     });
     expect(keys(castle(crossChannel.db))).toEqual(["public_room", "public_vc"]);
+  });
+
+  it("official table guest overlap belongs to casino; only same-channel public VC seconds are removed", () => {
+    const sameChannel = setup();
+    sameChannel.taku.track("secret-official-table", "main", "owner", "sashi");
+    sameChannel.taku.observeGuestTransition({
+      userId: "subject", isBot: false, oldChannelId: null,
+      newChannelId: "secret-official-table", observedAt: BASE + 10,
+    });
+    sameChannel.taku.observeGuestTransition({
+      userId: "subject", isBot: false, oldChannelId: "secret-official-table",
+      newChannelId: null, observedAt: BASE + 40,
+    });
+    sameChannel.vc.reconcileChannel({
+      guildId: "main", channelId: "secret-official-table", eligible: true,
+      humanUserIds: ["subject", "human"], observedAt: BASE + 10,
+    });
+    sameChannel.vc.reconcileChannel({
+      guildId: "main", channelId: "secret-official-table", eligible: false,
+      humanUserIds: [], observedAt: BASE + 40,
+    });
+    expect(keys(castle(sameChannel.db))).toEqual(["casino"]);
+
+    sameChannel.vc.reconcileChannel({
+      guildId: "main", channelId: "ordinary-public-vc", eligible: true,
+      humanUserIds: ["subject", "human"], observedAt: BASE + 50,
+    });
+    sameChannel.vc.reconcileChannel({
+      guildId: "main", channelId: "ordinary-public-vc", eligible: false,
+      humanUserIds: [], observedAt: BASE + 70,
+    });
+    expect(keys(castle(sameChannel.db))).toEqual(["casino", "public_vc"]);
+    expect(family(castle(sameChannel.db), "public_vc")!.dailyTrustedSeconds)
+      .toEqual([{ date: "2026-08-20", trustedSeconds: 20 }]);
+
+    const evidence = computeCasinoTableParticipationEvidence(
+      sameChannel.db, { start: BASE, end: END }, ["subject"],
+    ).get("subject")!;
+    const safe = computeCasinoTableParticipationDaysSafe(
+      sameChannel.db, { start: BASE, end: END }, ["subject"],
+    ).get("subject")!;
+    expect(safe).toEqual({ days: evidence.days });
+    expect(JSON.stringify(safe)).not.toMatch(/secret-official-table|channelId|startedAt|endedAt/);
+    expect(JSON.stringify(castle(sameChannel.db))).not.toMatch(/secret-official-table|ordinary-public-vc/);
+
+    const differentChannel = setup();
+    differentChannel.taku.track("official-a", "main", "owner", "sashi");
+    differentChannel.taku.observeGuestTransition({
+      userId: "subject", isBot: false, oldChannelId: null, newChannelId: "official-a", observedAt: BASE + 10,
+    });
+    differentChannel.taku.observeGuestTransition({
+      userId: "subject", isBot: false, oldChannelId: "official-a", newChannelId: null, observedAt: BASE + 40,
+    });
+    differentChannel.vc.reconcileChannel({
+      guildId: "main", channelId: "ordinary-b", eligible: true,
+      humanUserIds: ["subject", "human"], observedAt: BASE + 10,
+    });
+    differentChannel.vc.reconcileChannel({
+      guildId: "main", channelId: "ordinary-b", eligible: false,
+      humanUserIds: [], observedAt: BASE + 40,
+    });
+    expect(keys(castle(differentChannel.db))).toEqual(["casino", "public_vc"]);
+    expect(family(castle(differentChannel.db), "public_vc")!.dailyTrustedSeconds)
+      .toEqual([{ date: "2026-08-20", trustedSeconds: 30 }]);
   });
 
   it("registers a privacy-safe derived contract and 300/300/1 cache chunks with explicit adapter readCalls", () => {
