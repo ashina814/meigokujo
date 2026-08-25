@@ -2154,18 +2154,59 @@ F5aの実packは次の2つだけ。
 - Activity-Time（No.32–37）は`social_activity_time_safe`のJST 0..23 hourをそのまま保ち、VC hour seconds/positive daysと
   VC-only dominant/top2/top3 concentrationを測る。TCはsafe payloadのbest same-surface exchange gapをglobal/hour別
   distributionとして保持し、meaningful gap boolean/countへ変換しない。TCとVCを任意weightでcombined scoreにせず、
-  朝・昼・宵・深夜の境界も固定しない。
+  朝・昼・宵・深夜の境界も固定しない。planning-internalには`dayOffset × hour × tcBestOtherGapMs ×
+  vcTrustedSocialSeconds`のsparse matrixを残し、hour marginalが同じでもsame-dayか別日かをF5cで再計算できるようにする。
+  serialized F5a snapshotは従来どおり24hour aggregateだけで、day rowsは出さない。
 
 両safe sourceはunknown/untrusted intervalをpayloadから除外するため、0 activityと未観測を完全には区別できない。
 snapshotは`coverageKnown=false`とrollout/coverage limitation warningを必ず持つ。callerはpersisted source導入前を0として
 混ぜないwindowを選ぶ必要がある。runnerは既存`TitleSourceCache`の300-user bulk prefetchをsource×cohort/windowごとに
 一度だけ使い、user×metric/candidate queryやDB writeを行わない。
 
-follow-upのF5bはTC/social breadth、room、invite、economy/shop、casino、event、castle/castle-roleのmeasurement packs、
+follow-upはF5b1（VC ignite/closer、social breadth/context、relationship No.28、BUMP、TC conversation/reaction、TC×VC）と
+F5b2（public room、invite、economy/shop、casino、public event、castle/castle-role）のmeasurement packsへ分割する。
 F5cはsame cohort/window/observedAtのdeterministic measurement engineをplanning-internalに再利用してsubject correlationを
 保ったthreshold/boundary candidate sweepとshadow prevalence/overlap analysisを行い、aggregate sweep結果だけを出力する。
 serialized F5a snapshot単独やuser-level rowsをF5cの入力・出力にはしない。F6は採択thresholdのstable production rule化を
 担う。F5a時点のreadinessはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8のまま。
+
+## 14.7 F5b1 Shared Calibration Engine + Social / Contribution Packs
+
+F5b1は`CalibrationProbe<S>`をtyped source tupleへ一般化する。`CalibrationPayloadBundle<S>`はtupleに含まれるsource keyだけを
+対応する`TitleSourcePayloads[K]`型で渡し、`any`/`unknown`やraw safe payload stashをplanning APIへ作らない。1 runのprefetchは
+probe単位ではなくunique `(source, cohort, scope)`単位で、同じ`vc_social_safe`をsocial breadth・relationship・cross-modalが
+共有しても一度だけ読む。601 usersは各sourceが300/300/1のactual 3 read callsで、No.49はTC/VCそれぞれ3 callsとなる。
+
+planning-internal collectionはsubject IDによるcross-metric joinをF5aどおりrestricted memory内で維持し、さらにprobeごとの
+tagged joint evidenceを持つ。joint evidenceはdayOffset/hour/count/duration/gap/booleanとanonymous local ordinal/semantic index
+だけで、channel/counterpart/message/surface/role/department identityやexact date/timestampをコピーしない。serialized snapshotは
+schema v1のaggregate-only shapeを維持し、subject/ordinal/index/day row/raw payloadを一切出さない。
+
+F5b1のpackは次のとおり。
+
+- `vc-ignite-v1`（No.2、`vc_empty_start_then_joined`）はjoinedAt基準のoccurrence count、distinct days、first/last offset、span。
+  No.1/3/4/5はdescriptorへ含めない。
+- `vc-closer-v1`（No.7/9、`vc_last_occupant`）はbecameLastAt基準のoccurrence/day/rangeとdistinct channel count。
+  channel identityは保持せず、No.6/8を含めない。
+- `social-breadth-v1`（No.23–25、`vc_social_safe`）はscope breadth/overlap、positive days/range、日別breadth
+  p25/median/p75/p90/max。internalには`dayOffset × distinctCoPresentUsers`を残す。No.22はPARTIALのまま。
+- `relationship-depth-v1`（No.28、`vc_social_safe`）は`maxRepeatedDaysWithOneCounterpart`とscope breadth/overlap diagnosticだけ。
+  overlap最大相手との相関を推定せず、No.29/30 PARTIAL、No.31 BLOCKEDを広げない。
+- `social-class-context-v1`（No.26）と`social-department-context-v1`（No.27）はanonymous counterpart×semantic index×
+  dayOffset×trusted seconds graphを保持し、counterpart/semantic breadth、edge、seconds、union days、positive-edge structural maximum
+  matchingを測る。precomputed matchingだけに依存せず、F5cがedge seconds/days thresholdごとにmatchingを再計算できる。
+- `bump-contribution-v1`（No.38–41、`bump_events`）はevent/distinct days/range、same-day excess、max events/dayとinternal dayOffset list。
+  streakやspamをproduction条件化しない。
+- `tc-conversation-v1`（No.42/43/44/45/47、`tc_conversation_safe`）はstartのquiet/next/explicit pairing、conversation単位のrevival
+  grouping、anonymous area day/gap、third-party prior-others/self/next pairingを保つ。gap thresholdは固定せず、No.48はPARTIAL維持。
+- `tc-reaction-v1`（No.46、`tc_reaction_safe`）はglobal/post/day totalsとper-post reactor/day分布を測り、internal post profileは
+  post ordinal・reaction day offsets・distinct reactor countだけ。emoji/reactor/post identityは保持しない。
+- `cross-modal-v1`（No.49、`tc_conversation_safe + vc_social_safe`）はTC gap-bearing daysとVC breadth-bearing daysを別々に保ち、
+  union/overlapとmodality別rangeをdiagnostic化する。同日overlapやTC meaningful gapを称号条件として固定しない。
+
+F5cはsame cohort/window/observedAt/catalogHash/readinessHashでこのjoint measurement engineを再実行し、candidate sweep prevalence、
+overlap、sensitivity、boundary comparisonだけをaggregate出力する。threshold、provisional threshold、`matched`、definition、award、
+notification、activation、UI、backfill、自動cohort探索はF5b1に含めない。readinessはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8のまま。
 
 ## 15. PR分割
 

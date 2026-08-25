@@ -6,9 +6,17 @@ import {
   getFromTitleSourceCache,
   prefetchIntoTitleSourceCache,
   TitleSourceCache,
+  type BumpEventsSourcePayload,
+  type SocialClassContextSafeSourcePayload,
+  type SocialDepartmentFamilyContextSafeSourcePayload,
   type SocialActivityTimeSafeSourcePayload,
+  type TcConversationSafeSourcePayload,
+  type TcReactionSafeSourcePayload,
   type TitleSourcePayloads,
+  type VcEmptyStartThenJoinedSourcePayload,
   type VcGroupSizeDailySafeSourcePayload,
+  type VcLastOccupantSourcePayload,
+  type VcSocialSafeSourcePayload,
 } from "./v2-sources.js";
 import { TITLE_V2_CATALOG_CANDIDATES, canonicalCatalogHash } from "./v2-catalog-candidates.js";
 import {
@@ -23,6 +31,20 @@ export const CALIBRATION_PERCENTILE_METHOD = "nearest-rank" as const;
 
 const VC_BUCKETS = ["solo", "oneToOne", "smallGroup", "largeGroup"] as const satisfies readonly OccupancyBucket[];
 const SOCIAL_BUCKETS = ["oneToOne", "smallGroup", "largeGroup"] as const satisfies readonly OccupancyBucket[];
+
+export type CalibrationProbeKey =
+  | "vc-style-v1"
+  | "activity-time-v1"
+  | "vc-ignite-v1"
+  | "vc-closer-v1"
+  | "social-breadth-v1"
+  | "relationship-depth-v1"
+  | "social-class-context-v1"
+  | "social-department-context-v1"
+  | "bump-contribution-v1"
+  | "tc-conversation-v1"
+  | "tc-reaction-v1"
+  | "cross-modal-v1";
 
 export interface QuantileSummary {
   readonly sampleCount: number;
@@ -62,7 +84,7 @@ export interface CalibrationCandidateDescriptor {
 }
 
 export interface CalibrationPackSnapshot {
-  readonly probeKey: "vc-style-v1" | "activity-time-v1";
+  readonly probeKey: CalibrationProbeKey;
   readonly calibrationMode: "DISTRIBUTION_CALIBRATION";
   readonly candidateNos: readonly number[];
   readonly candidates: readonly CalibrationCandidateDescriptor[];
@@ -120,7 +142,76 @@ export interface PlanningCalibrationPackMeasurement {
     readonly hour: number;
     readonly values: readonly number[];
   }[];
+  readonly jointEvidence: PlanningCalibrationJointEvidence;
 }
+
+export type PlanningCalibrationJointEvidence =
+  | { readonly kind: "none" }
+  | {
+      readonly kind: "activity-time-day-hour-v1";
+      readonly rows: readonly {
+        readonly dayOffset: number;
+        readonly hour: number;
+        readonly tcBestOtherGapMs: number | null;
+        readonly vcTrustedSocialSeconds: number;
+      }[];
+    }
+  | { readonly kind: "day-occurrences-v1"; readonly dayOffsets: readonly number[] }
+  | {
+      readonly kind: "social-breadth-days-v1";
+      readonly days: readonly { readonly dayOffset: number; readonly distinctCoPresentUsers: number }[];
+    }
+  | {
+      readonly kind: "social-context-graph-v1";
+      readonly dimension: "class" | "department-family";
+      readonly counterparts: readonly {
+        readonly counterpartOrdinal: number;
+        readonly touches: readonly {
+          readonly semanticIndex: number;
+          readonly days: readonly { readonly dayOffset: number; readonly trustedSeconds: number }[];
+        }[];
+      }[];
+    }
+  | {
+      readonly kind: "tc-conversation-v1";
+      readonly starts: readonly {
+        readonly dayOffset: number;
+        readonly quietBeforeMs: number | null;
+        readonly nextOtherGapMs: number | null;
+        readonly explicitContinuation: boolean;
+      }[];
+      readonly revivalConversations: readonly {
+        readonly conversationOrdinal: number;
+        readonly revivals: readonly {
+          readonly dayOffset: number;
+          readonly dormantBeforeMs: number;
+          readonly continuationGapMs: number | null;
+        }[];
+      }[];
+      readonly areas: readonly {
+        readonly areaOrdinal: number;
+        readonly socialDays: readonly { readonly dayOffset: number; readonly bestOtherGapMs: number | null }[];
+      }[];
+      readonly thirdPartyJoins: readonly {
+        readonly dayOffset: number;
+        readonly priorDistinctOtherGapMs: readonly number[];
+        readonly priorSelfGapMs: number | null;
+        readonly nextOtherGapMs: number | null;
+      }[];
+    }
+  | {
+      readonly kind: "tc-reaction-posts-v1";
+      readonly posts: readonly {
+        readonly postOrdinal: number;
+        readonly reactionDayOffsets: readonly number[];
+        readonly distinctReactors: number;
+      }[];
+    }
+  | {
+      readonly kind: "cross-modal-days-v1";
+      readonly tcDays: readonly { readonly dayOffset: number; readonly bestOtherGapMs: number }[];
+      readonly vcDays: readonly { readonly dayOffset: number; readonly distinctCoPresentUsers: number }[];
+    };
 
 export interface PlanningCalibrationSubjectMeasurement {
   readonly subjectUserId: string;
@@ -143,21 +234,58 @@ export interface PlanningCalibrationMeasurementCollection {
     readonly probeKey: CalibrationPackSnapshot["probeKey"];
     readonly readCalls: number;
   }[];
+  readonly sourceReadCalls: readonly {
+    readonly source: TitleUsableSourceKey;
+    readonly readCalls: number;
+  }[];
   readonly subjects: readonly PlanningCalibrationSubjectMeasurement[];
 }
 
 interface SubjectMeasurement {
   readonly metrics: ReadonlyMap<string, number | null>;
   readonly tcGapsByHour?: ReadonlyMap<number, readonly number[]>;
+  readonly jointEvidence?: PlanningCalibrationJointEvidence;
 }
 
-interface CalibrationProbe<K extends TitleUsableSourceKey> {
+export type CalibrationPayloadBundle<S extends readonly TitleUsableSourceKey[]> = {
+  readonly [K in S[number]]: TitleSourcePayloads[K];
+};
+
+interface CalibrationProbe<S extends readonly TitleUsableSourceKey[]> {
   readonly candidateNos: readonly number[];
   readonly probeKey: CalibrationPackSnapshot["probeKey"];
-  readonly sources: readonly [K];
-  readonly emptyPayload: TitleSourcePayloads[K];
+  readonly sources: S;
+  readonly emptyPayloads: CalibrationPayloadBundle<S>;
   readonly coverageLimitations: readonly string[];
-  measure(payload: TitleSourcePayloads[K], context: { readonly windowStart: number }): SubjectMeasurement;
+  measure(payloads: CalibrationPayloadBundle<S>, context: { readonly windowStart: number }): SubjectMeasurement;
+}
+
+interface CalibrationProbeRuntime {
+  readonly candidateNos: readonly number[];
+  readonly probeKey: CalibrationProbeKey;
+  readonly sources: readonly TitleUsableSourceKey[];
+  readonly coverageLimitations: readonly string[];
+  measureFrom(
+    readPayload: <K extends TitleUsableSourceKey>(source: K) => TitleSourcePayloads[K],
+    context: { readonly windowStart: number },
+  ): SubjectMeasurement;
+  measureEmpty(context: { readonly windowStart: number }): SubjectMeasurement;
+}
+
+function runtimeProbe<S extends readonly TitleUsableSourceKey[]>(probe: CalibrationProbe<S>): CalibrationProbeRuntime {
+  // Fail at module/probe construction, before any cohort read, if readiness/source integrity drifts.
+  descriptorFor(probe.candidateNos, probe.sources);
+  return {
+    candidateNos: probe.candidateNos,
+    probeKey: probe.probeKey,
+    sources: probe.sources,
+    coverageLimitations: probe.coverageLimitations,
+    measureFrom: (readPayload, context) => {
+      const payloads = Object.fromEntries(probe.sources.map((source) => [source, readPayload(source)])) as CalibrationPayloadBundle<S>;
+      return probe.measure(payloads, context);
+    },
+    measureEmpty: (context) => probe.measure(probe.emptyPayloads, context),
+  };
 }
 
 function requireFinite(value: number): number {
@@ -282,7 +410,10 @@ function measureVcStyle(
   return { metrics };
 }
 
-function measureActivityTime(payload: SocialActivityTimeSafeSourcePayload): SubjectMeasurement {
+function measureActivityTime(
+  payload: SocialActivityTimeSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
   const vcSeconds = Array.from({ length: 24 }, () => 0);
   const vcPositiveDays = Array.from({ length: 24 }, () => 0);
   const tcGaps = new Map<number, number[]>(Array.from({ length: 24 }, (_, hour) => [hour, []]));
@@ -315,35 +446,493 @@ function measureActivityTime(payload: SocialActivityTimeSafeSourcePayload): Subj
     metrics.set(`hourlyVcPositiveDays.${hour}`, vcPositiveDays[hour]!);
     metrics.set(`hourlyTcGapSampleCount.${hour}`, tcGaps.get(hour)!.length);
   }
-  return { metrics, tcGapsByHour: tcGaps };
+  const startDay = Math.floor((context.windowStart + 9 * 3_600) / 86_400);
+  return {
+    metrics,
+    tcGapsByHour: tcGaps,
+    jointEvidence: {
+      kind: "activity-time-day-hour-v1",
+      rows: payload.days.flatMap((day) => day.hours.map((hour) => ({
+        dayOffset: dateOrdinal(day.date) - startDay,
+        hour: hour.hour,
+        tcBestOtherGapMs: hour.tcBestOtherGapMs,
+        vcTrustedSocialSeconds: hour.vcTrustedSocialSeconds,
+      }))),
+    },
+  };
 }
 
-const VC_STYLE_PROBE: CalibrationProbe<"vc_group_size_daily_safe"> = {
+const VC_STYLE_PROBE: CalibrationProbe<readonly ["vc_group_size_daily_safe"]> = {
   candidateNos: Object.freeze(Array.from({ length: 12 }, (_, index) => index + 10)),
   probeKey: "vc-style-v1",
   sources: ["vc_group_size_daily_safe"],
-  emptyPayload: Object.freeze({ days: [] }),
+  emptyPayloads: Object.freeze({ vc_group_size_daily_safe: Object.freeze({ days: [] }) }),
   coverageLimitations: Object.freeze([
     "The safe source omits unknown/untrusted VC intervals; zero cannot distinguish observed inactivity from absent coverage.",
     "Choose a window after source rollout; no historical inference or backfill is performed.",
   ]),
-  measure: measureVcStyle,
+  measure: (payloads, context) => measureVcStyle(payloads.vc_group_size_daily_safe, context),
 };
 
-const ACTIVITY_TIME_PROBE: CalibrationProbe<"social_activity_time_safe"> = {
+const ACTIVITY_TIME_PROBE: CalibrationProbe<readonly ["social_activity_time_safe"]> = {
   candidateNos: Object.freeze([32, 33, 34, 35, 36, 37]),
   probeKey: "activity-time-v1",
   sources: ["social_activity_time_safe"],
-  emptyPayload: Object.freeze({ days: [] }),
+  emptyPayloads: Object.freeze({ social_activity_time_safe: Object.freeze({ days: [] }) }),
   coverageLimitations: Object.freeze([
     "TC stores the best same-surface exchange gap per JST date/hour, not a thresholded meaningful-activity boolean or raw message count.",
     "VC and TC omit unknown/untrusted coverage; zero cannot distinguish observed inactivity from absent coverage.",
     "The 24 JST hour bins are measurement resolution only; no morning/afternoon/evening/night boundary is selected.",
   ]),
-  measure: measureActivityTime,
+  measure: (payloads, context) => measureActivityTime(payloads.social_activity_time_safe, context),
 };
 
-export const F5A_CALIBRATION_PROBES = Object.freeze([VC_STYLE_PROBE, ACTIVITY_TIME_PROBE]);
+function timestampDayOffset(timestamp: number, windowStart: number): number {
+  return Math.floor((timestamp + 9 * 3_600) / 86_400) - Math.floor((windowStart + 9 * 3_600) / 86_400);
+}
+
+function dateDayOffset(date: string, windowStart: number): number {
+  return dateOrdinal(date) - Math.floor((windowStart + 9 * 3_600) / 86_400);
+}
+
+function sortedDistinct(values: readonly number[]): number[] {
+  return [...new Set(values)].sort((a, b) => a - b);
+}
+
+function setSampleMetrics(
+  metrics: Map<string, number | null>,
+  prefix: string,
+  values: readonly number[],
+  options: { readonly p90?: boolean } = {},
+): void {
+  metrics.set(`${prefix}P25`, nearestRankPercentile(values, 25));
+  metrics.set(`${prefix}Median`, nearestRankPercentile(values, 50));
+  metrics.set(`${prefix}P75`, nearestRankPercentile(values, 75));
+  if (options.p90) metrics.set(`${prefix}P90`, nearestRankPercentile(values, 90));
+  metrics.set(`${prefix}Max`, values.length === 0 ? null : Math.max(...values));
+}
+
+function maximumBipartiteMatching(adjacency: readonly (readonly number[])[]): number {
+  const leftByRight = new Map<number, number>();
+  const augment = (left: number, seen: Set<number>): boolean => {
+    for (const right of adjacency[left] ?? []) {
+      if (seen.has(right)) continue;
+      seen.add(right);
+      const previousLeft = leftByRight.get(right);
+      if (previousLeft === undefined || augment(previousLeft, seen)) {
+        leftByRight.set(right, left);
+        return true;
+      }
+    }
+    return false;
+  };
+  let size = 0;
+  for (let left = 0; left < adjacency.length; left += 1) {
+    if (augment(left, new Set())) size += 1;
+  }
+  return size;
+}
+
+function measureVcIgnite(
+  payload: VcEmptyStartThenJoinedSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const dayOffsets = payload.facts.map((fact) => timestampDayOffset(fact.joinedAt, context.windowStart));
+  const days = sortedDistinct(dayOffsets);
+  const metrics = new Map<string, number | null>([
+    ["occurrenceCount", payload.facts.length],
+    ["distinctOccurrenceDays", days.length],
+    ["firstOccurrenceDayOffset", days[0] ?? null],
+    ["lastOccurrenceDayOffset", days.at(-1) ?? null],
+    ["occurrenceSpanDays", days.length === 0 ? 0 : days.at(-1)! - days[0]! + 1],
+  ]);
+  return { metrics, jointEvidence: { kind: "day-occurrences-v1", dayOffsets } };
+}
+
+function measureVcCloser(
+  payload: VcLastOccupantSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const dayOffsets = payload.facts.map((fact) => timestampDayOffset(fact.becameLastAt, context.windowStart));
+  const days = sortedDistinct(dayOffsets);
+  const metrics = new Map<string, number | null>([
+    ["occurrenceCount", payload.facts.length],
+    ["distinctOccurrenceDays", days.length],
+    ["distinctChannels", new Set(payload.facts.map((fact) => fact.channelId)).size],
+    ["firstOccurrenceDayOffset", days[0] ?? null],
+    ["lastOccurrenceDayOffset", days.at(-1) ?? null],
+    ["occurrenceSpanDays", days.length === 0 ? 0 : days.at(-1)! - days[0]! + 1],
+  ]);
+  return { metrics, jointEvidence: { kind: "day-occurrences-v1", dayOffsets } };
+}
+
+function measureSocialBreadth(
+  payload: VcSocialSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const days = payload.dailyBreadth.map((day) => ({
+    dayOffset: dateDayOffset(day.date, context.windowStart),
+    distinctCoPresentUsers: day.distinctCoPresentUsers,
+  }));
+  const metrics = new Map<string, number | null>([
+    ["distinctCoPresentUsers", payload.distinctCoPresentUsers],
+    ["trustedOverlapSeconds", payload.trustedOverlapSeconds],
+  ]);
+  const dayOffsets = sortedDistinct(days.map(({ dayOffset }) => dayOffset));
+  metrics.set("breadthPositiveDays", dayOffsets.length);
+  metrics.set("firstBreadthDayOffset", dayOffsets[0] ?? null);
+  metrics.set("lastBreadthDayOffset", dayOffsets.at(-1) ?? null);
+  metrics.set("breadthSpanDays", dayOffsets.length === 0 ? 0 : dayOffsets.at(-1)! - dayOffsets[0]! + 1);
+  setSampleMetrics(metrics, "dailyBreadth", days.map(({ distinctCoPresentUsers }) => distinctCoPresentUsers), { p90: true });
+  return { metrics, jointEvidence: { kind: "social-breadth-days-v1", days } };
+}
+
+function measureRelationshipDepth(payload: VcSocialSafeSourcePayload): SubjectMeasurement {
+  return {
+    metrics: new Map([
+      ["maxRepeatedDaysWithOneCounterpart", payload.maxRepeatedDaysWithOneCounterpart],
+      ["distinctCoPresentUsers", payload.distinctCoPresentUsers],
+      ["trustedOverlapSeconds", payload.trustedOverlapSeconds],
+    ]),
+  };
+}
+
+interface NormalizedContextTouch {
+  readonly semanticIndex: number;
+  readonly days: readonly { readonly date: string; readonly trustedSeconds: number }[];
+}
+
+function measureSocialContext(
+  counterparts: readonly (readonly NormalizedContextTouch[])[],
+  dimension: "class" | "department-family",
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const graph = counterparts.map((touches, counterpartOrdinal) => ({
+    counterpartOrdinal,
+    touches: touches.map((touch) => ({
+      semanticIndex: touch.semanticIndex,
+      days: touch.days.map((day) => ({
+        dayOffset: dateDayOffset(day.date, context.windowStart),
+        trustedSeconds: day.trustedSeconds,
+      })),
+    })),
+  }));
+  const allTouches = graph.flatMap((counterpart) => counterpart.touches);
+  const allDays = allTouches.flatMap((touch) => touch.days.map(({ dayOffset }) => dayOffset));
+  const adjacency = graph.map((counterpart) => sortedDistinct(counterpart.touches
+    .filter((touch) => touch.days.some(({ trustedSeconds }) => trustedSeconds > 0))
+    .map(({ semanticIndex }) => semanticIndex)));
+  const semanticLabel = dimension === "class" ? "Class" : "Family";
+  return {
+    metrics: new Map([
+      ["counterpartProfileCount", graph.length],
+      [`distinct${semanticLabel}IndexCount`, new Set(allTouches.map(({ semanticIndex }) => semanticIndex)).size],
+      ["touchEdgeCount", allTouches.length],
+      ["totalTrustedSeconds", allTouches.flatMap(({ days }) => days).reduce((sum, day) => sum + day.trustedSeconds, 0)],
+      ["unionTouchDays", new Set(allDays).size],
+      [`structuralMaxPerson${semanticLabel}Matching`, maximumBipartiteMatching(adjacency)],
+    ]),
+    jointEvidence: { kind: "social-context-graph-v1", dimension, counterparts: graph },
+  };
+}
+
+function measureClassContext(
+  payload: SocialClassContextSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  return measureSocialContext(
+    payload.counterparts.map((counterpart) => counterpart.classTouches.map((touch) => ({
+      semanticIndex: touch.classIndex,
+      days: touch.days,
+    }))),
+    "class",
+    context,
+  );
+}
+
+function measureDepartmentContext(
+  payload: SocialDepartmentFamilyContextSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  return measureSocialContext(
+    payload.counterparts.map((counterpart) => counterpart.familyTouches.map((touch) => ({
+      semanticIndex: touch.familyIndex,
+      days: touch.days,
+    }))),
+    "department-family",
+    context,
+  );
+}
+
+function measureBump(
+  payload: BumpEventsSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const dayOffsets = payload.events.map((event) => timestampDayOffset(event, context.windowStart));
+  const counts = new Map<number, number>();
+  for (const dayOffset of dayOffsets) counts.set(dayOffset, (counts.get(dayOffset) ?? 0) + 1);
+  const metrics = new Map<string, number | null>([
+    ["eventCount", payload.events.length],
+    ["distinctActiveDays", counts.size],
+    ["firstActiveDayOffset", sortedDistinct(dayOffsets)[0] ?? null],
+    ["lastActiveDayOffset", sortedDistinct(dayOffsets).at(-1) ?? null],
+    ["activeSpanDays", counts.size === 0 ? 0 : Math.max(...counts.keys()) - Math.min(...counts.keys()) + 1],
+    ["sameDayExcessCount", [...counts.values()].reduce((sum, count) => sum + Math.max(0, count - 1), 0)],
+    ["maxEventsPerDay", counts.size === 0 ? 0 : Math.max(...counts.values())],
+  ]);
+  return { metrics, jointEvidence: { kind: "day-occurrences-v1", dayOffsets } };
+}
+
+function measureTcConversation(
+  payload: TcConversationSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const starts = payload.starts.map((start) => ({
+    dayOffset: dateDayOffset(start.date, context.windowStart),
+    quietBeforeMs: start.quietBeforeMs,
+    nextOtherGapMs: start.nextOtherGapMs,
+    explicitContinuation: start.explicitContinuation,
+  }));
+  const revivalConversations = payload.revivalConversations.map((conversation, conversationOrdinal) => ({
+    conversationOrdinal,
+    revivals: conversation.revivals.map((revival) => ({
+      dayOffset: dateDayOffset(revival.date, context.windowStart),
+      dormantBeforeMs: revival.dormantBeforeMs,
+      continuationGapMs: revival.continuationGapMs,
+    })),
+  }));
+  const areas = payload.areas.map((area, areaOrdinal) => ({
+    areaOrdinal,
+    socialDays: area.socialDays.map((day) => ({
+      dayOffset: dateDayOffset(day.date, context.windowStart),
+      bestOtherGapMs: day.bestOtherGapMs,
+    })),
+  }));
+  const thirdPartyJoins = payload.thirdPartyJoins.map((join) => ({
+    dayOffset: dateDayOffset(join.date, context.windowStart),
+    priorDistinctOtherGapMs: [...join.priorDistinctOtherGapMs],
+    priorSelfGapMs: join.priorSelfGapMs,
+    nextOtherGapMs: join.nextOtherGapMs,
+  }));
+  const metrics = new Map<string, number | null>([
+    ["startCount", starts.length],
+    ["startDistinctDays", new Set(starts.map(({ dayOffset }) => dayOffset)).size],
+    ["explicitContinuationCount", starts.filter(({ explicitContinuation }) => explicitContinuation).length],
+    ["explicitContinuationShare", ratio(starts.filter(({ explicitContinuation }) => explicitContinuation).length, starts.length)],
+  ]);
+  setSampleMetrics(metrics, "quietBeforeMs", starts.flatMap(({ quietBeforeMs }) => quietBeforeMs === null ? [] : [quietBeforeMs]));
+  const nextOtherGaps = starts.flatMap(({ nextOtherGapMs }) => nextOtherGapMs === null ? [] : [nextOtherGapMs]);
+  setSampleMetrics(metrics, "nextOtherGapMs", nextOtherGaps);
+  metrics.set("nextOtherGapMissingCount", starts.length - nextOtherGaps.length);
+
+  const revivals = revivalConversations.flatMap(({ revivals: rows }) => rows);
+  metrics.set("revivalConversationCount", revivalConversations.length);
+  metrics.set("revivalOccurrenceCount", revivals.length);
+  metrics.set("revivalDistinctDays", new Set(revivals.map(({ dayOffset }) => dayOffset)).size);
+  metrics.set("maxRevivalsPerConversation", revivalConversations.length === 0
+    ? 0
+    : Math.max(...revivalConversations.map(({ revivals: rows }) => rows.length)));
+  setSampleMetrics(metrics, "dormantBeforeMs", revivals.map(({ dormantBeforeMs }) => dormantBeforeMs));
+  const continuationGaps = revivals.flatMap(({ continuationGapMs }) => continuationGapMs === null ? [] : [continuationGapMs]);
+  setSampleMetrics(metrics, "continuationGapMs", continuationGaps);
+  metrics.set("continuationGapMissingCount", revivals.length - continuationGaps.length);
+
+  const areaSocialDays = areas.map((area) => area.socialDays.filter(({ bestOtherGapMs }) => bestOtherGapMs !== null));
+  const areaDays = areaSocialDays.flatMap((socialDays) => socialDays.map(({ dayOffset }) => dayOffset));
+  metrics.set("socialAreaCount", areaSocialDays.filter((socialDays) => socialDays.length > 0).length);
+  metrics.set("socialAreaUnionDays", new Set(areaDays).size);
+  metrics.set("maxSocialDaysPerArea", areaSocialDays.length === 0 ? 0 : Math.max(...areaSocialDays.map((socialDays) => socialDays.length)));
+  const distinctAreaDays = sortedDistinct(areaDays);
+  metrics.set("socialAreaSpanDays", distinctAreaDays.length === 0 ? 0 : distinctAreaDays.at(-1)! - distinctAreaDays[0]! + 1);
+
+  metrics.set("thirdPartyJoinCount", thirdPartyJoins.length);
+  metrics.set("thirdPartyJoinDistinctDays", new Set(thirdPartyJoins.map(({ dayOffset }) => dayOffset)).size);
+  setSampleMetrics(metrics, "priorDistinctOtherCount", thirdPartyJoins.map((join) => join.priorDistinctOtherGapMs.length));
+  setSampleMetrics(metrics, "thirdPartyNextOtherGapMs", thirdPartyJoins.flatMap(({ nextOtherGapMs }) => nextOtherGapMs === null ? [] : [nextOtherGapMs]));
+  setSampleMetrics(metrics, "priorSelfGapMs", thirdPartyJoins.flatMap(({ priorSelfGapMs }) => priorSelfGapMs === null ? [] : [priorSelfGapMs]));
+  return {
+    metrics,
+    jointEvidence: { kind: "tc-conversation-v1", starts, revivalConversations, areas, thirdPartyJoins },
+  };
+}
+
+function measureTcReaction(
+  payload: TcReactionSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const posts = payload.posts.map((post, postOrdinal) => ({
+    postOrdinal,
+    reactionDayOffsets: post.reactionDays.map((date) => dateDayOffset(date, context.windowStart)),
+    distinctReactors: post.distinctReactors,
+  }));
+  const metrics = new Map<string, number | null>([
+    ["distinctReactors", payload.distinctReactors],
+    ["postCount", posts.length],
+    ["reactionPositiveDays", new Set(posts.flatMap(({ reactionDayOffsets }) => reactionDayOffsets)).size],
+    ["totalPostDayTouches", posts.reduce((sum, post) => sum + post.reactionDayOffsets.length, 0)],
+    ["maxReactionDaysOnOnePost", posts.length === 0 ? 0 : Math.max(...posts.map((post) => post.reactionDayOffsets.length))],
+  ]);
+  setSampleMetrics(metrics, "perPostDistinctReactors", posts.map(({ distinctReactors }) => distinctReactors));
+  setSampleMetrics(metrics, "perPostReactionDayCount", posts.map(({ reactionDayOffsets }) => reactionDayOffsets.length));
+  return { metrics, jointEvidence: { kind: "tc-reaction-posts-v1", posts } };
+}
+
+function measureCrossModal(
+  tc: TcConversationSafeSourcePayload,
+  vc: VcSocialSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const tcDays = tc.socialDays.map((day) => ({
+    dayOffset: dateDayOffset(day.date, context.windowStart),
+    bestOtherGapMs: day.bestOtherGapMs,
+  }));
+  const vcDays = vc.dailyBreadth
+    .filter(({ distinctCoPresentUsers }) => distinctCoPresentUsers > 0)
+    .map((day) => ({
+      dayOffset: dateDayOffset(day.date, context.windowStart),
+      distinctCoPresentUsers: day.distinctCoPresentUsers,
+    }));
+  const tcOffsets = sortedDistinct(tcDays.map(({ dayOffset }) => dayOffset));
+  const vcOffsets = sortedDistinct(vcDays.map(({ dayOffset }) => dayOffset));
+  const tcSet = new Set(tcOffsets);
+  const vcSet = new Set(vcOffsets);
+  const metrics = new Map<string, number | null>([
+    ["tcCandidateSocialDays", tcOffsets.length],
+    ["vcSocialDays", vcOffsets.length],
+    ["unionModalityDays", new Set([...tcOffsets, ...vcOffsets]).size],
+    ["overlappingCalendarDays", tcOffsets.filter((day) => vcSet.has(day)).length],
+  ]);
+  metrics.set("tcFirstDayOffset", tcOffsets[0] ?? null);
+  metrics.set("tcLastDayOffset", tcOffsets.at(-1) ?? null);
+  metrics.set("tcSpanDays", tcOffsets.length === 0 ? 0 : tcOffsets.at(-1)! - tcOffsets[0]! + 1);
+  metrics.set("vcFirstDayOffset", vcOffsets[0] ?? null);
+  metrics.set("vcLastDayOffset", vcOffsets.at(-1) ?? null);
+  metrics.set("vcSpanDays", vcOffsets.length === 0 ? 0 : vcOffsets.at(-1)! - vcOffsets[0]! + 1);
+  return { metrics, jointEvidence: { kind: "cross-modal-days-v1", tcDays, vcDays } };
+}
+
+const VC_COVERAGE_LIMITATIONS = Object.freeze([
+  "The VC source omits unknown/untrusted intervals; zero cannot distinguish observed inactivity from absent coverage.",
+  "Choose a window after source rollout; no historical inference or backfill is performed.",
+]);
+const TC_COVERAGE_LIMITATIONS = Object.freeze([
+  "The TC safe source omits unavailable/untrusted observations; zero cannot distinguish inactivity from absent coverage.",
+  "Gap values remain unthresholded calibration scalars; no meaningful-conversation boundary is selected.",
+]);
+
+const VC_IGNITE_PROBE: CalibrationProbe<readonly ["vc_empty_start_then_joined"]> = {
+  candidateNos: Object.freeze([2]),
+  probeKey: "vc-ignite-v1",
+  sources: ["vc_empty_start_then_joined"],
+  emptyPayloads: Object.freeze({ vc_empty_start_then_joined: Object.freeze({ facts: [] }) }),
+  coverageLimitations: VC_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureVcIgnite(payloads.vc_empty_start_then_joined, context),
+};
+
+const VC_CLOSER_PROBE: CalibrationProbe<readonly ["vc_last_occupant"]> = {
+  candidateNos: Object.freeze([7, 9]),
+  probeKey: "vc-closer-v1",
+  sources: ["vc_last_occupant"],
+  emptyPayloads: Object.freeze({ vc_last_occupant: Object.freeze({ facts: [] }) }),
+  coverageLimitations: VC_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureVcCloser(payloads.vc_last_occupant, context),
+};
+
+const SOCIAL_BREADTH_PROBE: CalibrationProbe<readonly ["vc_social_safe"]> = {
+  candidateNos: Object.freeze([23, 24, 25]),
+  probeKey: "social-breadth-v1",
+  sources: ["vc_social_safe"],
+  emptyPayloads: Object.freeze({
+    vc_social_safe: Object.freeze({ distinctCoPresentUsers: 0, maxRepeatedDaysWithOneCounterpart: 0, trustedOverlapSeconds: 0, dailyBreadth: [] }),
+  }),
+  coverageLimitations: VC_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureSocialBreadth(payloads.vc_social_safe, context),
+};
+
+const RELATIONSHIP_DEPTH_PROBE: CalibrationProbe<readonly ["vc_social_safe"]> = {
+  candidateNos: Object.freeze([28]),
+  probeKey: "relationship-depth-v1",
+  sources: ["vc_social_safe"],
+  emptyPayloads: SOCIAL_BREADTH_PROBE.emptyPayloads,
+  coverageLimitations: VC_COVERAGE_LIMITATIONS,
+  measure: (payloads) => measureRelationshipDepth(payloads.vc_social_safe),
+};
+
+const SOCIAL_CLASS_CONTEXT_PROBE: CalibrationProbe<readonly ["social_class_context_safe"]> = {
+  candidateNos: Object.freeze([26]),
+  probeKey: "social-class-context-v1",
+  sources: ["social_class_context_safe"],
+  emptyPayloads: Object.freeze({ social_class_context_safe: Object.freeze({ counterparts: [] }) }),
+  coverageLimitations: VC_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureClassContext(payloads.social_class_context_safe, context),
+};
+
+const SOCIAL_DEPARTMENT_CONTEXT_PROBE: CalibrationProbe<readonly ["social_department_family_context_safe"]> = {
+  candidateNos: Object.freeze([27]),
+  probeKey: "social-department-context-v1",
+  sources: ["social_department_family_context_safe"],
+  emptyPayloads: Object.freeze({ social_department_family_context_safe: Object.freeze({ counterparts: [] }) }),
+  coverageLimitations: VC_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureDepartmentContext(payloads.social_department_family_context_safe, context),
+};
+
+const BUMP_PROBE: CalibrationProbe<readonly ["bump_events"]> = {
+  candidateNos: Object.freeze([38, 39, 40, 41]),
+  probeKey: "bump-contribution-v1",
+  sources: ["bump_events"],
+  emptyPayloads: Object.freeze({ bump_events: Object.freeze({ events: [] }) }),
+  coverageLimitations: Object.freeze([
+    "BUMP occurrence time is bounded by observedAt, but a later retry may insert an older occurrence; no historical backfill is inferred.",
+  ]),
+  measure: (payloads, context) => measureBump(payloads.bump_events, context),
+};
+
+const EMPTY_TC_CONVERSATION = Object.freeze({
+  starts: [], revivalConversations: [], areas: [], thirdPartyJoins: [], startedConversations: [], socialDays: [],
+});
+const TC_CONVERSATION_PROBE: CalibrationProbe<readonly ["tc_conversation_safe"]> = {
+  candidateNos: Object.freeze([42, 43, 44, 45, 47]),
+  probeKey: "tc-conversation-v1",
+  sources: ["tc_conversation_safe"],
+  emptyPayloads: Object.freeze({ tc_conversation_safe: EMPTY_TC_CONVERSATION }),
+  coverageLimitations: TC_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureTcConversation(payloads.tc_conversation_safe, context),
+};
+
+const TC_REACTION_PROBE: CalibrationProbe<readonly ["tc_reaction_safe"]> = {
+  candidateNos: Object.freeze([46]),
+  probeKey: "tc-reaction-v1",
+  sources: ["tc_reaction_safe"],
+  emptyPayloads: Object.freeze({ tc_reaction_safe: Object.freeze({ distinctReactors: 0, posts: [], days: [] }) }),
+  coverageLimitations: TC_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureTcReaction(payloads.tc_reaction_safe, context),
+};
+
+const CROSS_MODAL_PROBE: CalibrationProbe<readonly ["tc_conversation_safe", "vc_social_safe"]> = {
+  candidateNos: Object.freeze([49]),
+  probeKey: "cross-modal-v1",
+  sources: ["tc_conversation_safe", "vc_social_safe"],
+  emptyPayloads: Object.freeze({
+    tc_conversation_safe: EMPTY_TC_CONVERSATION,
+    vc_social_safe: SOCIAL_BREADTH_PROBE.emptyPayloads.vc_social_safe,
+  }),
+  coverageLimitations: Object.freeze([...TC_COVERAGE_LIMITATIONS, ...VC_COVERAGE_LIMITATIONS]),
+  measure: (payloads, context) => measureCrossModal(payloads.tc_conversation_safe, payloads.vc_social_safe, context),
+};
+
+export const F5A_CALIBRATION_PROBES = Object.freeze([runtimeProbe(VC_STYLE_PROBE), runtimeProbe(ACTIVITY_TIME_PROBE)]);
+export const F5B1_CALIBRATION_PROBES = Object.freeze([
+  runtimeProbe(VC_IGNITE_PROBE),
+  runtimeProbe(VC_CLOSER_PROBE),
+  runtimeProbe(SOCIAL_BREADTH_PROBE),
+  runtimeProbe(RELATIONSHIP_DEPTH_PROBE),
+  runtimeProbe(SOCIAL_CLASS_CONTEXT_PROBE),
+  runtimeProbe(SOCIAL_DEPARTMENT_CONTEXT_PROBE),
+  runtimeProbe(BUMP_PROBE),
+  runtimeProbe(TC_CONVERSATION_PROBE),
+  runtimeProbe(TC_REACTION_PROBE),
+  runtimeProbe(CROSS_MODAL_PROBE),
+]);
 
 export function canonicalReadinessHash(readiness: readonly CandidateReadinessAudit[]): string {
   const canonical = readiness.slice().sort((a, b) => a.no - b.no).map((entry) => JSON.stringify({
@@ -356,26 +945,29 @@ export function canonicalReadinessHash(readiness: readonly CandidateReadinessAud
   return createHash("sha256").update(canonical, "utf8").digest("hex");
 }
 
-function descriptorFor(candidateNos: readonly number[], source: TitleUsableSourceKey): CalibrationCandidateDescriptor[] {
+function descriptorFor(
+  candidateNos: readonly number[],
+  sources: readonly TitleUsableSourceKey[],
+): CalibrationCandidateDescriptor[] {
   return candidateNos.slice().sort((a, b) => a - b).map((no) => {
     const candidate = TITLE_V2_CATALOG_CANDIDATES.find((entry) => entry.no === no);
     const readiness = TITLE_V2_CATALOG_READINESS.find((entry) => entry.no === no);
     if (!candidate || !readiness) throw new Error(`unknown calibration candidate #${no}`);
-    if (readiness.status !== "READY" || !readiness.usableSources.includes(source)) {
+    if (readiness.status !== "READY" || readiness.usableSources.some((source) => !sources.includes(source))) {
       throw new Error(`calibration probe source/readiness mismatch for candidate #${no}`);
     }
     return { no, provisionalKey: candidate.provisionalKey, readiness: readiness.status, thresholdCategory: readiness.thresholdCategory };
   });
 }
 
-function packSnapshot<K extends TitleUsableSourceKey>(
-  probe: CalibrationProbe<K>,
+function packSnapshot(
+  probe: CalibrationProbeRuntime,
   measurements: readonly PlanningCalibrationPackMeasurement[],
   readCalls: number,
   windowStart: number,
 ): CalibrationPackSnapshot {
   // Empty cohortでもpack schemaを省略しない。全source payloadのcanonical zero shapeは{days:[]}。
-  const zeroMeasurement = probe.measure(probe.emptyPayload, { windowStart });
+  const zeroMeasurement = probe.measureEmpty({ windowStart });
   const metricKeys = [...new Set([
     ...zeroMeasurement.metrics.keys(),
     ...measurements.flatMap((measurement) => Object.keys(measurement.metrics)),
@@ -396,7 +988,7 @@ function packSnapshot<K extends TitleUsableSourceKey>(
     probeKey: probe.probeKey,
     calibrationMode: "DISTRIBUTION_CALIBRATION",
     candidateNos: probe.candidateNos,
-    candidates: descriptorFor(probe.candidateNos, probe.sources[0]),
+    candidates: descriptorFor(probe.candidateNos, probe.sources),
     sources: probe.sources,
     readCalls,
     metrics,
@@ -427,7 +1019,7 @@ export function runF5aCalibrationSnapshot(
   db: Database.Database,
   input: F5aCalibrationInput,
 ): CalibrationSnapshot {
-  return snapshotFromMeasurementCollection(collectF5aCalibrationMeasurements(db, input));
+  return snapshotFromMeasurementCollection(collectF5aCalibrationMeasurements(db, input), F5A_CALIBRATION_PROBES);
 }
 
 /** Restricted planning API: callers may inspect subject correlations in memory but must emit aggregates only. */
@@ -435,26 +1027,62 @@ export function collectF5aCalibrationMeasurements(
   db: Database.Database,
   input: F5aCalibrationInput,
 ): PlanningCalibrationMeasurementCollection {
+  return collectCalibrationMeasurements(db, input, F5A_CALIBRATION_PROBES);
+}
+
+export function runF5b1CalibrationSnapshot(
+  db: Database.Database,
+  input: F5aCalibrationInput,
+): CalibrationSnapshot {
+  return snapshotFromMeasurementCollection(collectF5b1CalibrationMeasurements(db, input), F5B1_CALIBRATION_PROBES);
+}
+
+/** Restricted planning API for F5b1. Joint evidence is identity-minimized and never serialized. */
+export function collectF5b1CalibrationMeasurements(
+  db: Database.Database,
+  input: F5aCalibrationInput,
+): PlanningCalibrationMeasurementCollection {
+  return collectCalibrationMeasurements(db, input, F5B1_CALIBRATION_PROBES);
+}
+
+function collectCalibrationMeasurements(
+  db: Database.Database,
+  input: F5aCalibrationInput,
+  probes: readonly CalibrationProbeRuntime[],
+): PlanningCalibrationMeasurementCollection {
   const scope = resolvePlanningCalibrationScope(input.window);
   const cohortKey = requireCohortKey(input.cohortKey);
   const subjectUserIds = [...new Set(input.subjectUserIds)].sort();
   const cache = new TitleSourceCache();
   const packsBySubject = new Map(subjectUserIds.map((subjectUserId) => [subjectUserId, [] as PlanningCalibrationPackMeasurement[]]));
-  const packReadCalls = F5A_CALIBRATION_PROBES.map((probe) => {
-    const source = probe.sources[0];
-    const typedProbe = probe as CalibrationProbe<typeof source>;
+  const uniqueSources = [...new Set(probes.flatMap(({ sources }) => sources))].sort();
+  const sourceReadCalls = uniqueSources.map((source) => {
     const prefetched = prefetchIntoTitleSourceCache(cache, db, source, subjectUserIds, scope);
+    return { source, readCalls: prefetched.readCalls };
+  });
+  const sourceReadCallMap = new Map(sourceReadCalls.map(({ source, readCalls }) => [source, readCalls]));
+  for (const probe of probes) {
     for (const subjectUserId of subjectUserIds) {
-      const payload = getFromTitleSourceCache(cache, db, source, subjectUserId, scope);
-      const measurement = typedProbe.measure(payload, { windowStart: scope.start });
+      const measurement = probe.measureFrom(
+        (source) => getFromTitleSourceCache(cache, db, source, subjectUserId, scope),
+        { windowStart: scope.start },
+      );
       const metrics = Object.fromEntries([...measurement.metrics].sort(([a], [b]) => a.localeCompare(b)));
       const tcGapsByHour = [...(measurement.tcGapsByHour ?? [])]
         .sort(([a], [b]) => a - b)
         .map(([hour, values]) => ({ hour, values: [...values] }));
-      packsBySubject.get(subjectUserId)!.push({ probeKey: probe.probeKey, metrics, tcGapsByHour });
+      packsBySubject.get(subjectUserId)!.push({
+        probeKey: probe.probeKey,
+        metrics,
+        tcGapsByHour,
+        jointEvidence: measurement.jointEvidence ?? { kind: "none" },
+      });
     }
-    return { probeKey: probe.probeKey, readCalls: prefetched.readCalls };
-  }).sort((a, b) => a.probeKey.localeCompare(b.probeKey));
+  }
+  const packReadCalls = probes.map((probe) => ({
+    probeKey: probe.probeKey,
+    readCalls: probe.sources.reduce((sum, source) => sum + (sourceReadCallMap.get(source) ?? 0), 0),
+  })).sort((a, b) => a.probeKey.localeCompare(b.probeKey));
   return deepFreeze({
     schemaVersion: CALIBRATION_SCHEMA_VERSION,
     percentileMethod: CALIBRATION_PERCENTILE_METHOD,
@@ -469,6 +1097,7 @@ export function collectF5aCalibrationMeasurements(
       effectiveEnd: resolvedScopeEffectiveEnd(scope),
     },
     packReadCalls,
+    sourceReadCalls,
     subjects: subjectUserIds.map((subjectUserId) => ({
       subjectUserId,
       packs: packsBySubject.get(subjectUserId)!.sort((a, b) => a.probeKey.localeCompare(b.probeKey)),
@@ -476,8 +1105,11 @@ export function collectF5aCalibrationMeasurements(
   });
 }
 
-function snapshotFromMeasurementCollection(collection: PlanningCalibrationMeasurementCollection): CalibrationSnapshot {
-  const packs = F5A_CALIBRATION_PROBES.map((probe) => {
+function snapshotFromMeasurementCollection(
+  collection: PlanningCalibrationMeasurementCollection,
+  probes: readonly CalibrationProbeRuntime[],
+): CalibrationSnapshot {
+  const packs = probes.map((probe) => {
     const measurements = collection.subjects.map((subject) => subject.packs.find(({ probeKey }) => probeKey === probe.probeKey)!);
     const readCalls = collection.packReadCalls.find(({ probeKey }) => probeKey === probe.probeKey)!.readCalls;
     return packSnapshot(probe, measurements, readCalls, collection.window.start);
