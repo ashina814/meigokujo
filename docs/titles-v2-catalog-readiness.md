@@ -157,6 +157,15 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > inn/economy/casinoはcanonical domain staff roleがrepoに無いため推測せず、
 > No.57/64/73をBLOCKED維持する。§27参照。
 
+> **PR F4a反映（2026-08-25）**: 明示固定したEdition-I 7-family manifest
+> （public_vc/public_tc/public_room、economy/shop/casino、public_event）と、
+> canonical persisted/derived evidenceをfixed snapshotで束ねる
+> `castle_experience_safe`を追加した。family別JST日、public VC trusted seconds、
+> super-domain coverageをidentity-freeに保持し、No.85-89をBLOCKED→READYへ更新。
+> READY 69→74、BLOCKED 16→11、PARTIAL 6・META 8は不変。No.90/91は
+> eligible public role、assignedDomains manifest、担当内外temporal JOINが必要なため
+> F4bまでBLOCKEDを維持する。§28参照。
+
 ## 0. xlsx canonical hash（exact drift guard）
 
 | 項目 | 値 |
@@ -204,13 +213,13 @@ full-clear editionに登録されたREQUIRED印100%——NONCOUNTの91 behavior�
 
 | status | 件数 | 意味 |
 | --- | --- | --- |
-| READY | 69 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
+| READY | 74 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
 | PARTIAL | 6 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
-| BLOCKED | 16 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
+| BLOCKED | 11 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
 | META | 8 | kind:meta（別bucket、§7参照） |
 
 **READY = 今すぐreleaseしてよい、ではない**。sourceReadinessとthreshold決定は
-別軸（§10参照）——READY 69件も、production threshold値（分布TBD等）が
+別軸（§10参照）——READY 74件も、production threshold値（分布TBD等）が
 決まるまではrelease対象にならない。またSeries manifest／Collection Edition／
 Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）。No.58はさらに、
 award後のreversalを既存immutable ownershipへどう反映するかが未決定であるため、
@@ -222,7 +231,7 @@ source-readyでもproduction release不可（§15）。
 | --- | --- | --- |
 | missing_persisted_source | 0 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
 | missing_derived_source | 6 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
-| missing_manifest | 7 | 「どのfamilyを対象とするか」を定義するmanifestそのものが未定義 |
+| missing_manifest | 2 | No.90/91のeligible public role / assignedDomains manifestが未定義 |
 | missing_role_history | 0 | F3aでgeneric role-family-at-time基盤を実装 |
 | missing_domain_temporal_join | 3 | No.57/64/73。canonical domain role mappingと各activity時点を結ぶsafe source待ち |
 | source_semantic_mismatch | 6 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（No.1/6/22のpublic VC provenance、No.29/30のpair-specific overlap、No.48のfree-flow同一topic correlation） |
@@ -307,7 +316,7 @@ BLOCKEDが新たに必要とするもの（xlsxのSource_Map original「未実�
 E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 
 - **canonical domain role mapping + temporal safe JOIN**—— No.57/64/73（3件）。inn/economy/casinoのactual staff/operator authorization mappingがrepoに無いため、名称や通知/benefit roleから推測しない
-- **`castle_experience_safe`新設 + 城横断manifest**—— No.85-91（7件）。grep 0件で、E3のevent infra完成待ちでもある
+- **eligible public role + assignedDomains manifest + temporal safe JOIN**—— No.90/91（2件）。castle activity自体はF4aで成立したが、担当内外分類はF4b待ち
 
 ## 6. threshold pending
 
@@ -319,7 +328,7 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 | STRUCTURAL_PLUS_DISTRIBUTION | 1 | 構造は決まるが、一部の値は分布依存 |
 | META_NOT_APPLICABLE | 8 | meta（別contract、§10適用外） |
 
-sourceReadinessとthresholdは別軸——READY 69件のうち、STRUCTURAL_FIXEDなのは
+sourceReadinessとthresholdは別軸——READY 74件のうち、STRUCTURAL_FIXEDなのは
 一部（初回系）のみで、残りはTHRESHOLD_PENDINGのままREADYになっている
 （sourceは十分だが実数値は分布を見てから決める）。
 
@@ -329,7 +338,7 @@ sourceReadinessとthresholdは別軸——READY 69件のうち、STRUCTURAL_FIXE
 | --- | --- | --- |
 | role-at-time依存（`roleDependency !== "none"`） | 10 | generic `missing_role_history`は0件。No.65はF3bでREADY、No.57/64/73はcanonical domain mapping + temporal JOIN待ち |
 | イベントtheme（Theme No.16） | 5 | No.80/81はcompletion source、No.82-84はF2m joint calendar/involvement sourceで全件READY |
-| manifest依存（thresholdCategory: MANIFEST_DEPENDENT） | 6 | No.69の賭場Edition-I manifestはF2lで確定。残る城横断family一覧・series一覧等は未定義 |
+| manifest依存（thresholdCategory: MANIFEST_DEPENDENT） | 6 | No.69の賭場Edition-IとNo.85-89の城横断Edition-I manifestは確定。production threshold/edition運用は別途決定する |
 | known bug依存 | 0 | PR F2aで`computeLastOccupant`の同秒0秒visit tie bugを修正——catalog全体から解消（§13参照） |
 | source_semantic_mismatch依存 | 6 | No.1/6/22のpublic VC provenance、No.29/30のpair-specific overlap、No.48のfree-flow同一topic（§14-16/§18/§20/§21.5参照） |
 
@@ -360,12 +369,14 @@ sourceReadinessとthresholdは別軸——READY 69件のうち、STRUCTURAL_FIXE
 > BLOCKED→READY、No.73はrole-at-timeだけが残る。
 > event dual-role protocol + event_date露出も**PR F2mで解消済み**（§25参照）——
 > No.82-84がBLOCKED→READY。
+> Castle Experience Edition-Iも**PR F4aで解消済み**（§28参照）——No.85-89が
+> BLOCKED→READY。No.90/91はexperience sourceではなくassignedDomains/F4bだけが残る。
 > 以下は残っているクラスタのみを優先度順に並べ直したもの。
 
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
 | 1 | 残るdomain-specific temporal JOIN | 3件（No.57/64/73） | inn/economy/casinoのcanonical staff/operator role truthをまず明示し、activity occurrenceへexact JOINする。名称heuristicは禁止 |
-| 2 | `castle_experience_safe` + 城横断manifest | 7件（No.85-91） | 他の**すべてのドメインsourceが先に揃っている必要がある**——最後に着手するのが自然 |
+| 2 | F4b assignedDomains + castle role temporal JOIN | 2件（No.90/91） | eligible public roleと複数roleの担当domain unionを明示し、担当内外をactivity時点でexact JOINする |
 
 VC group-size clusterはF2e、VC social breadth clusterはF2f、公開部屋clusterは
 F2g、TC conversation/reactionの7件はF2h、TC+VC時間帯clusterはF2iで解消した。
@@ -1633,3 +1644,46 @@ No.65はSOURCE READY。No.57/64/73はそれぞれinn/economy/casinoのcanonical 
 BLOCKEDを維持する。No.90/91はF4 castle experience manifest/cross-domain safe source待ちでBLOCKEDのまま。
 overallはREADY 69 / PARTIAL 6 / BLOCKED 16 / META 8。production threshold、BehaviorTitleDefinition、award、
 notification、historical role backfillは追加しない。
+
+## 28. PR F4a: Castle Experience Edition-I Manifest + Cross-Domain Safe Source
+
+### 28.1 immutable taxonomy / canonical adapters
+
+Edition-Iは`TITLE_SOURCES`や将来featureを列挙せず、`castle-experience-edition-i` version 1へ次の7 familyを
+明示固定する。socialは`public_vc` / `public_tc` / `public_room`、economy_playは`economy` / `shop` /
+`casino`、castle_wideは`public_event`。invite、role、rank/class、evaluationはmanifest外である。
+duplicate family、unknown super-domain、invalid versionはmanifest全体をrejectし、入力順を変えてもcanonical
+semantic identityは変わらない。
+
+各familyは既存の自然なcanonical evidenceだけを読む。public_vcはmain guild/public GuildVoice/humanのpositive
+trusted social presence、public_tcはsame-surface human exchange、public_roomはnormal/gameのactual trusted use。
+economyはsubject自身が実行したnormal peer transfer/tipだけ、shopはeligible storefront purchaseだけ。
+casinoはEdition-I core game completion、official tableでのactual positive trusted presence、other standard marketの
+successful participationをORするがcastle familyは1つ。public_eventはcanonical completed eventのconfirmed general
+participantだけで、staff/organizer/audit actorから推測しない。
+
+### 28.2 fixed snapshot / overlap / safe payload
+
+全adapterへ同じ`effectiveEnd = min(scope.end, observedAt)`を渡し、sourceごとにclockを取り直さない。future
+refund/reversal/completionはhistorical snapshotへ漏らさない。family adapterのcorrupt rowはそのfamilyだけを
+fail closedにし、他familyのvalid evidenceは維持する。manifest corruptionだけはsource全体をrejectする。
+
+public roomの物理visitor intervalとpublic-social VC intervalが重なる秒は`public_room`へ単一帰属し、exact interval
+差分だけを`public_vc`へ残す。room ownerが不在のhosted evidenceはownerのVCを差し引かず、別channelの通常public VCも
+維持する。day-levelの粗い抑制ではない。
+
+safe payloadはedition/version、family key、JST date、public_vcの日別trusted seconds、covered super-domainだけ。
+user/counterpart/channel/room/event/market/item/transaction/role identity、exact timestamp、amountは公開しない。
+No.85の同日2-familyも表現でき、No.86-89向けのbreadth/super-domain/almost-all/all判定をproduction threshold未固定で
+後段へ残す。
+
+### 28.3 bulk / readiness
+
+300-user chunkごとに9 canonical adapter invocation（room、VC、TC、economy、shop、casino core/table/market、event）を
+行う。このlogical adapter invocation数を`readCalls`と定義するため、601 subjectsは300/300/1 chunk × 9 = 27。
+各adapterはsubject/familyごとのN+1ではなくbulk queryを使い、single readerとprefetched readerは一致する。
+
+No.85-89はSOURCE READY。overallはREADY 74 / PARTIAL 6 / BLOCKED 11 / META 8。No.90/91はcastle sourceが
+利用可能になったが、eligible public role definition、roleごとのassignedDomains manifest、複数role union、担当内外の
+temporal safe JOINが無いためF4bまでBLOCKED。threshold、BehaviorTitleDefinition、award、notification、completion、
+activation、merge/deployは行わない。

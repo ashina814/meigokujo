@@ -8,6 +8,17 @@ export interface PublicSocialPresenceIntervals {
   readonly intervals: ReadonlyArray<{ readonly start: number; readonly end: number }>;
 }
 
+/** restricted cross-source ownership JOIN用。safe payloadへguild/channel identityを出さない。 */
+export interface PublicSocialPresenceChannelIntervals {
+  readonly userId: string;
+  readonly intervals: ReadonlyArray<{
+    readonly guildId: string;
+    readonly channelId: string;
+    readonly start: number;
+    readonly end: number;
+  }>;
+}
+
 interface PresenceRow {
   readonly user_id: string;
   readonly guild_id: string;
@@ -27,7 +38,7 @@ function unionIntervals(
   const merged: Array<{ start: number; end: number }> = [];
   for (const interval of ordered) {
     const previous = merged[merged.length - 1];
-    if (!previous || interval.start > previous.end) merged.push({ ...interval });
+    if (!previous || interval.start > previous.end) merged.push({ start: interval.start, end: interval.end });
     else if (interval.end > previous.end) previous.end = interval.end;
   }
   return merged;
@@ -40,11 +51,11 @@ function unionIntervals(
  * live-open observationだったためeffectiveEndまでclipする。現在snapshotではrecovered rowを
  * 行ごと除外し、downtimeも推定終了も数えない。
  */
-export function computePublicSocialPresenceIntervals(
+export function computePublicSocialPresenceChannelIntervals(
   db: Database.Database,
   window: TitleWindow,
   userIds?: readonly string[],
-): PublicSocialPresenceIntervals[] {
+): PublicSocialPresenceChannelIntervals[] {
   const requested = userIds ? [...new Set(userIds)] : undefined;
   if (requested && requested.length === 0) return [];
   const effectiveEnd = Math.min(window.end, window.observedAt ?? window.end);
@@ -63,7 +74,9 @@ export function computePublicSocialPresenceIntervals(
     )
     .all(effectiveEnd, window.start, ...(requested ?? [])) as PresenceRow[];
 
-  const intervalsByUser = new Map<string, Array<{ start: number; end: number }>>();
+  const intervalsByUser = new Map<string, Array<{
+    guildId: string; channelId: string; start: number; end: number;
+  }>>();
   for (const userId of requested ?? [...new Set(rows.map((row) => row.user_id))].sort()) {
     intervalsByUser.set(userId, []);
   }
@@ -76,10 +89,23 @@ export function computePublicSocialPresenceIntervals(
     if (!endIsAfterSnapshot && !hasObservedTrustBoundary) continue;
     const start = Math.max(row.started_at, window.start);
     const end = Math.min(fencedEnd, effectiveEnd);
-    if (end > start) intervalsByUser.get(row.user_id)?.push({ start, end });
+    if (end > start) intervalsByUser.get(row.user_id)?.push({
+      guildId: row.guild_id,
+      channelId: row.channel_id,
+      start,
+      end,
+    });
   }
 
-  return [...intervalsByUser].map(([userId, intervals]) => ({
+  return [...intervalsByUser].map(([userId, intervals]) => ({ userId, intervals }));
+}
+
+export function computePublicSocialPresenceIntervals(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): PublicSocialPresenceIntervals[] {
+  return computePublicSocialPresenceChannelIntervals(db, window, userIds).map(({ userId, intervals }) => ({
     userId,
     intervals: unionIntervals(intervals),
   }));

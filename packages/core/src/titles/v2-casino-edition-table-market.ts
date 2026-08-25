@@ -187,6 +187,87 @@ export function computeCasinoTableActivitySafe(
   return result;
 }
 
+export interface CasinoTableParticipationDaysPayload {
+  readonly days: ReadonlyArray<{ readonly date: string; readonly trustedSeconds: number }>;
+}
+
+/**
+ * Castle casino adapter用。official eligible table内のsubject自身のknown-human guest
+ * positive presenceを読む。table作成/owner identityだけ・bot・recovered gapは数えない。
+ */
+export function computeCasinoTableParticipationDaysSafe(
+  db: Database.Database,
+  window: { readonly start: number; readonly end: number },
+  userIds: readonly string[],
+): ReadonlyMap<string, CasinoTableParticipationDaysPayload> {
+  const result = new Map<string, CasinoTableParticipationDaysPayload>();
+  for (const userId of userIds) result.set(userId, { days: [] });
+  if (userIds.length === 0 || window.end <= window.start) return result;
+  const placeholders = userIds.map(() => "?").join(",");
+  const rows = db.prepare(
+    `SELECT p.user_id, p.is_human, p.started_at, p.ended_at, p.end_quality,
+            i.channel_id, i.table_type, i.created_at
+       FROM casino_table_guest_presence p
+       JOIN casino_table_instances i ON i.channel_id = p.channel_id
+      WHERE p.user_id IN (${placeholders})
+        AND i.created_at < ? AND p.started_at < ?
+        AND (p.ended_at IS NULL OR p.ended_at > ?)
+      ORDER BY p.user_id, p.started_at, p.id`,
+  ).all(...userIds, window.end, window.end, window.start) as Array<{
+    user_id: unknown;
+    is_human: unknown;
+    started_at: unknown;
+    ended_at: unknown;
+    end_quality: unknown;
+    channel_id: unknown;
+    table_type: unknown;
+    created_at: unknown;
+  }>;
+  const requested = new Set(userIds);
+  const eligible = new Set<string>(TITLE_ELIGIBLE_CASINO_TABLE_TYPES);
+  const intervalsByUser = new Map<string, Array<{ start: number; end: number }>>();
+  for (const userId of userIds) intervalsByUser.set(userId, []);
+  for (const row of rows) {
+    const validIdentity =
+      typeof row.user_id === "string" && row.user_id.trim().length > 0 && requested.has(row.user_id) &&
+      typeof row.channel_id === "string" && row.channel_id.trim().length > 0 &&
+      typeof row.table_type === "string" && eligible.has(row.table_type);
+    const validTime =
+      Number.isSafeInteger(row.created_at) && (row.created_at as number) >= 0 &&
+      Number.isSafeInteger(row.started_at) && (row.started_at as number) >= (row.created_at as number) &&
+      (row.ended_at === null ||
+        (Number.isSafeInteger(row.ended_at) && (row.ended_at as number) >= (row.started_at as number)));
+    const validEnd =
+      (row.ended_at === null && row.end_quality === null) ||
+      (row.ended_at !== null && (row.end_quality === "observed" || row.end_quality === "observation_ended"));
+    if (!validIdentity || row.is_human !== 1 || !validTime || !validEnd) continue;
+    const start = Math.max(window.start, row.started_at as number);
+    const end = Math.min(window.end, (row.ended_at ?? window.end) as number);
+    if (end > start) intervalsByUser.get(row.user_id as string)!.push({ start, end });
+  }
+
+  for (const userId of userIds) {
+    const ordered = intervalsByUser.get(userId)!.sort((a, b) => a.start - b.start || a.end - b.end);
+    const union: Array<{ start: number; end: number }> = [];
+    for (const interval of ordered) {
+      const previous = union.at(-1);
+      if (previous && interval.start <= previous.end) previous.end = Math.max(previous.end, interval.end);
+      else union.push({ ...interval });
+    }
+    const byDate = new Map<string, number>();
+    for (const interval of union) {
+      for (const part of splitByJstDay(interval.start, interval.end)) {
+        byDate.set(part.date, (byDate.get(part.date) ?? 0) + part.seconds);
+      }
+    }
+    result.set(userId, {
+      days: [...byDate].sort(([a], [b]) => a.localeCompare(b))
+        .map(([date, trustedSeconds]) => ({ date, trustedSeconds })),
+    });
+  }
+  return result;
+}
+
 export interface CasinoMarketActivitySafePayload {
   readonly days: ReadonlyArray<{ readonly date: string; readonly distinctOtherStandardBoards: number }>;
   readonly distinctOtherStandardBoards: number;

@@ -112,6 +112,8 @@ const EVENT_SERVICE_FILE = "packages/core/src/public-events/service.ts";
 const ROOMS_DERIVED_FILE = "packages/core/src/rooms/derived.ts";
 const SOCIAL_ACTIVITY_TIME_FILE = "packages/core/src/social-activity-time/derived.ts";
 const INVITE_ROOTED_FILE = "packages/core/src/titles/v2-invite-rooted.ts";
+const CASTLE_EXPERIENCE_FILE = "packages/core/src/titles/v2-castle-experience.ts";
+const CASTLE_MANIFEST_FILE = "packages/core/src/titles/v2-castle-experience-manifest.ts";
 
 // ─────────────────────────────────────────────────────────────
 // Theme 1: 場を起こす (vc_ignite, No.1-5) — source: vc_empty_start_then_joined
@@ -885,23 +887,63 @@ const THEME_16: ManualReadinessEntry[] = [
 // ─────────────────────────────────────────────────────────────
 // Theme 17: 城横断 (No.85-91)
 // ─────────────────────────────────────────────────────────────
-const THEME_17: ManualReadinessEntry[] = [85, 86, 87, 88, 89, 90, 91].map((no) => ({
-  no,
-  status: "BLOCKED" as const,
-  usableSources: [],
-  specializedResolvers: [],
-  missingCapabilities: [
-    "castle_experience_safe（各domain safe sourceを束ねるderived）",
-    "第I期城横断manifest（対象family一覧）",
-  ],
-  evidence: [{ file: VC_SOURCES_FILE, symbol: "TITLE_SOURCES (no castle_experience_* key registered)" }],
-  notes:
-    no >= 90
-      ? "F3aでgeneric role-family-at-time基盤は成立したが、castle_experience_safeと第I期城横断manifest/cross-domain sourceは未実装。"
-      : "castle_experienceという横断集約自体がrepoに存在しない（grep 0件）。第I期はevent familyを含むためevent infra未完成の影響も受ける（Summary判断#7,#8）。",
-  blockerKinds: ["missing_manifest"] as const,
-  optimizationRisk: "LOW" as const,
-}));
+const THEME_17: ManualReadinessEntry[] = [
+  ...[85, 86, 87, 88, 89].map((no): ManualReadinessEntry => ({
+    no,
+    status: "READY",
+    usableSources: ["castle_experience_safe"],
+    specializedResolvers: ["computeCastleExperienceSafe"],
+    missingCapabilities: [],
+    evidence: [
+      { file: CASTLE_MANIFEST_FILE, symbol: "CASTLE_EXPERIENCE_EDITION_I_MANIFEST" },
+      { file: CASTLE_EXPERIENCE_FILE, symbol: "computeCastleExperienceSafe" },
+      { file: VC_SOURCES_FILE, symbol: "CastleExperienceSafeSourcePayload" },
+    ],
+    notes:
+      "明示固定したEdition-I 7-family manifestと、family別JST日・public VC trusted seconds・super-domain coverageを持つthreshold-neutral safe sourceでbreadth/almost-all/allを表現できる。production threshold値は未決定。",
+    blockerKinds: ["none"],
+    optimizationRisk: "MANAGED",
+  })),
+  {
+    no: 90,
+    status: "BLOCKED",
+    usableSources: ["castle_experience_safe"],
+    specializedResolvers: [],
+    missingCapabilities: [
+      "eligible public roleの明示定義",
+      "roleごとのassignedDomains manifest",
+      "role interval × castle experience family activity temporal safe JOIN",
+    ],
+    evidence: [
+      { file: CASTLE_EXPERIENCE_FILE, symbol: "computeCastleExperienceSafe" },
+      { file: "packages/core/src/role-family/domain-temporal.ts", symbol: "loadTrustedRoleFamilyIntervals" },
+    ],
+    notes:
+      "castle experienceとgeneric role-family-at-timeは成立済みだが、eligible public role/assignedDomains正本と担当内外を結ぶtemporal safe JOINがない。F4b対象。",
+    blockerKinds: ["missing_manifest"],
+    optimizationRisk: "MANAGED",
+  },
+  {
+    no: 91,
+    status: "BLOCKED",
+    usableSources: ["castle_experience_safe"],
+    specializedResolvers: [],
+    missingCapabilities: [
+      "eligible public roleの明示定義",
+      "roleごとのassignedDomains manifest",
+      "複数role assignedDomains unionとoutside-domain分類",
+      "role interval × outside-domain castle activityの複数日temporal safe JOIN",
+    ],
+    evidence: [
+      { file: CASTLE_EXPERIENCE_FILE, symbol: "computeCastleExperienceSafe" },
+      { file: "packages/core/src/role-family/domain-temporal.ts", symbol: "loadTrustedRoleFamilyIntervals" },
+    ],
+    notes:
+      "castle familyの日付軸とgeneric role-family-at-timeは成立済みだが、複数roleのassignedDomains union/outside-domain分類と複数日反復JOINがない。F4b対象。",
+    blockerKinds: ["missing_manifest"],
+    optimizationRisk: "MANAGED",
+  },
+];
 
 // ─────────────────────────────────────────────────────────────
 // Theme 18: 収集・極め (meta, No.92-99)

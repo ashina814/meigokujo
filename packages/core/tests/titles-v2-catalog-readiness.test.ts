@@ -367,10 +367,10 @@ describe("PR F2e: VC group-size daily safe source追加後のreadiness", () => {
     }
   });
 
-  it("F3b shop mapping後の実集計はREADY 69 / PARTIAL 6 / BLOCKED 16 / META 8", () => {
+  it("F4a城横断source後の実集計はREADY 74 / PARTIAL 6 / BLOCKED 11 / META 8", () => {
     const counts = new Map<string, number>();
     for (const entry of TITLE_V2_CATALOG_READINESS) counts.set(entry.status, (counts.get(entry.status) ?? 0) + 1);
-    expect(Object.fromEntries(counts)).toEqual({ READY: 69, PARTIAL: 6, BLOCKED: 16, META: 8 });
+    expect(Object.fromEntries(counts)).toEqual({ READY: 74, PARTIAL: 6, BLOCKED: 11, META: 8 });
   });
 
   it("source_semantic_mismatchはpublic provenance 3件を含む6件、missing_derived_sourceは6件", () => {
@@ -747,13 +747,23 @@ describe("PR F3a: trusted class / role-family temporal provenance readiness", ()
     });
   });
 
-  it("No.90/91はgeneric role-history blockerだけを外しcastle manifest blockerを維持", () => {
+  it("No.85-89はEdition-I sourceでREADY、No.90/91はassignedDomains/F4b blockerを維持", () => {
+    for (let no = 85; no <= 89; no++) {
+      expect(readinessFor(no)).toMatchObject({
+        status: "READY",
+        usableSources: ["castle_experience_safe"],
+        specializedResolvers: ["computeCastleExperienceSafe"],
+        missingCapabilities: [],
+        blockerKinds: ["none"],
+      });
+    }
     for (const no of [90, 91]) {
       expect(readinessFor(no)).toMatchObject({
         status: "BLOCKED",
+        usableSources: ["castle_experience_safe"],
         blockerKinds: ["missing_manifest"],
       });
-      expect(readinessFor(no).notes).toContain("generic role-family-at-time基盤は成立");
+      expect(readinessFor(no).missingCapabilities.join(" ")).toContain("assignedDomains");
     }
   });
 });
