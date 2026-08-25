@@ -89,10 +89,15 @@ describe("L. production evaluator/import graphからcandidate registryが参照�
     expect(offenders, `files referencing candidate/readiness registry: ${offenders.join(", ")}`).toEqual([]);
   });
 
-  it("packages/core/src 配下、titles-catalog-*自身を除く全ファイルに言及が無い", () => {
+  it("packages/core/src 配下、明示planning modules以外の全ファイルに言及が無い", () => {
     const coreSrcDir = new URL("../src", import.meta.url).pathname.replace(/^\/([a-zA-Z]):/, "$1:");
     const files = listTsFilesRecursive(coreSrcDir).filter(
-      (f) => !f.includes("v2-catalog-candidates.ts") && !f.includes("v2-catalog-readiness.ts"),
+      (f) =>
+        !f.includes("v2-catalog-candidates.ts") &&
+        !f.includes("v2-catalog-readiness.ts") &&
+        // F5a calibrationはcatalog/readiness identityをsnapshotへ固定するplanning/operator layer。
+        // evaluator/pipeline/Bot/public barrelからは別testで引き続き禁止する。
+        !f.includes("v2-calibration.ts"),
     );
     expect(files.length).toBeGreaterThan(0);
     const offenders: string[] = [];

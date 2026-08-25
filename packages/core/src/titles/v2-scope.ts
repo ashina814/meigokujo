@@ -171,6 +171,40 @@ export function resolvedScopeEffectiveEnd(scope: { readonly endExclusive: number
   return scope.endExclusive === null ? scope.observedAt : Math.min(scope.endExclusive, scope.observedAt);
 }
 
+/**
+ * Planning/operator calibration専用の固定window resolver。
+ *
+ * production titleのscope policyを迂回する入口ではない。このscopeのprovenance title keyは
+ * 実在しないplanning sentinelへ固定するため、`assertResolvedTitleScopeForTitle()`を通る
+ * awardには絶対に使えない。一方、safe source read境界は通常どおりWeakMap provenanceを
+ * 検証できるので、calibration側がhand-built scopeやraw SQLへ逃げる必要もない。
+ * public v2 barrelからはexportしないこと。
+ */
+export function resolvePlanningCalibrationScope(window: {
+  readonly start: number;
+  readonly end: number;
+  readonly observedAt: number;
+}): ResolvedTitleScope {
+  if (![window.start, window.end, window.observedAt].every(Number.isInteger)) {
+    throw new RangeError("planning calibration window fields must be integer unix timestamps");
+  }
+  if (window.start >= window.end) {
+    throw new RangeError(`invalid planning calibration window: [${window.start}, ${window.end})`);
+  }
+  if (window.observedAt < window.start) {
+    throw new RangeError("planning calibration observedAt must be at or after window start");
+  }
+  return brand(
+    {
+      scopeKey: `planning-calibration:${window.start}:${window.end}:${window.observedAt}`,
+      start: window.start,
+      endExclusive: window.end,
+      observedAt: window.observedAt,
+    },
+    "__planning_calibration_only__",
+  );
+}
+
 /** ruleのcontextへ渡す、brand無しの公開scope形。ruleはbrand付き実体を直接受け取らない。 */
 export interface TitleRuleScope {
   readonly scopeKey: string;

@@ -2116,6 +2116,49 @@ No.90/91をSOURCE READYへ更新し、overallはREADY 76 / PARTIAL 6 / BLOCKED 9
 inn/economy/casino mapping不足のためBLOCKED維持。threshold、BehaviorTitleDefinition、award、notification、activation、
 backfillは追加しない。
 
+## 14.6 F5a Calibration Architecture
+
+SOURCE READYはsource semanticsが称号候補を正確に表現できるという意味であり、production thresholdが決定済みという
+意味ではない。F5aはplanning/operator analysis専用の`CalibrationProbe`→`CalibrationSnapshot` layerを追加するが、
+`evaluateTitle()`、pipeline、Bot、award path、production v2 barrelからは参照しない。snapshotはmeasurement distributionを
+返すだけで、threshold、`matched`、BehaviorTitleDefinition、award、ownership、progress、notificationを作らない。
+
+callerはcohort key、subject user ID集合、`start/end/observedAt`を明示する。planning専用resolverはawardに使えない
+sentinel provenance付きscopeへ固定し、既存safe source read boundaryだけを通す。runnerはDBから活動者を探索せず、IDを
+dedupe/sortした後も0活動subjectをfull-population denominatorに残す。current role/status/rank/guild membershipを見て
+cohortを変更しない。snapshotへ残すcohort情報はkeyとsubject countだけで、user ID、pseudonym、name、role、raw payload、
+counterpart/surface identity、exact activity timestampは出さない。
+
+全probeは同一の`start/end/observedAt/effectiveEnd`を使い、`effectiveEnd=min(end, observedAt)`より先を読まない。
+`Date.now()`、random sampling、historical inference/backfillは使わない。同じDB state・subject set・scope・catalog/readiness・
+schema versionなら、candidate/probe/metric/hourを固定順へ並べたbyte-equivalent JSONになる。snapshotはdeep-freezeし、
+catalog hashは既存canonical hash、readiness hashはno/status/sorted usableSources/thresholdCategory/optimizationRiskの固定順から
+作る。比較helperはschema/catalog/readiness/cohort/window incompatibilityだけを検出し、threshold評価はしない。
+
+numeric metricはfull populationとnonzero-onlyの双方についてnearest-rank percentile（sorted `x`、
+`rank=max(1,ceil(p*n))`、`x[rank-1]`）を使い、population/nonzero/zero/missing countと
+min/p25/p50/p75/p90/p95/p99/maxを返す。比率は分子・分母の基礎量もmetricとして保持し、subject denominatorが0なら
+0%へ変換せずnull/missingにする。NaN/Infinity/-0はcanonical JSONへ入れない。
+
+F5aの実packは次の2つだけ。
+
+- VC Style（No.10–21）は`vc_group_size_daily_safe`だけを正本とし、trusted/social seconds、4 bucket totals/positive days、
+  active/social days、first/last positive day offset、span、overall/social-only shares、日別shareのp25/median/p75/IQR/max、
+  positive social bucket breadthを測る。数秒の100% shareも標本量と一緒に残すが、guard thresholdやcandidate別matchは作らない。
+- Activity-Time（No.32–37）は`social_activity_time_safe`のJST 0..23 hourをそのまま保ち、VC hour seconds/positive daysと
+  VC-only dominant/top2/top3 concentrationを測る。TCはsafe payloadのbest same-surface exchange gapをglobal/hour別
+  distributionとして保持し、meaningful gap boolean/countへ変換しない。TCとVCを任意weightでcombined scoreにせず、
+  朝・昼・宵・深夜の境界も固定しない。
+
+両safe sourceはunknown/untrusted intervalをpayloadから除外するため、0 activityと未観測を完全には区別できない。
+snapshotは`coverageKnown=false`とrollout/coverage limitation warningを必ず持つ。callerはpersisted source導入前を0として
+混ぜないwindowを選ぶ必要がある。runnerは既存`TitleSourceCache`の300-user bulk prefetchをsource×cohort/windowごとに
+一度だけ使い、user×metric/candidate queryやDB writeを行わない。
+
+follow-upのF5bはTC/social breadth、room、invite、economy/shop、casino、event、castle/castle-roleのmeasurement packs、
+F5cは明示snapshotによるthreshold/boundary candidate sweepとshadow prevalence/overlap analysis、F6は採択thresholdの
+stable production rule化を担う。F5a時点のreadinessはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8のまま。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。
