@@ -6,6 +6,7 @@ import { TcSocialObservations } from "../src/tc-social/service.js";
 import { TITLE_V2_CATALOG_CANDIDATES } from "../src/titles/v2-catalog-candidates.js";
 import { TITLE_V2_CATALOG_READINESS } from "../src/titles/v2-catalog-readiness.js";
 import {
+  collectF5aCalibrationMeasurements,
   compareCalibrationSnapshots,
   nearestRankPercentile,
   runF5aCalibrationSnapshot,
@@ -153,6 +154,48 @@ describe("F5a deterministic calibration framework A-S", () => {
     expect(() => ((snapshot.cohort as { key: string }).key = "changed")).toThrow();
   });
 
+  it("AR/AS. planning-internal measurementはjoint correlationを保ち、serialized snapshotはaggregate-only", () => {
+    const ctx = setup();
+    const ids = [
+      "joint-secret-a",
+      "joint-secret-b",
+      "joint-secret-c",
+      "joint-secret-d",
+    ] as const;
+    const oneToOne = (subject: string, channel: string, start: number, seconds: number) => {
+      ctx.segment(subject, channel, start, start + seconds);
+      ctx.segment(`peer-${channel}`, channel, start, start + seconds);
+    };
+    oneToOne(ids[0], "joint-a", BASE + 100, 100);
+    ctx.segment(ids[1], "joint-b", BASE + 300, BASE + 500);
+    ctx.segment(ids[2], "joint-c", BASE + 600, BASE + 700);
+    oneToOne(ids[3], "joint-d", BASE + 800, 200);
+
+    const collection = collectF5aCalibrationMeasurements(ctx.db, {
+      cohortKey: "joint-correlation-fixture",
+      subjectUserIds: ids,
+      window: ctx.window,
+    });
+    const vcMetrics = (subjectUserId: string) => collection.subjects
+      .find((subject) => subject.subjectUserId === subjectUserId)!
+      .packs.find(({ probeKey }) => probeKey === "vc-style-v1")!.metrics;
+    const pair = (subjectUserId: string) => [
+      vcMetrics(subjectUserId)["totalTrustedSeconds"],
+      vcMetrics(subjectUserId)["overallBucketShare.oneToOne"],
+    ];
+    const firstMarginals = [ids[0], ids[1]].map(pair);
+    const secondMarginals = [ids[2], ids[3]].map(pair);
+    expect(firstMarginals.map(([total]) => total).sort()).toEqual(secondMarginals.map(([total]) => total).sort());
+    expect(firstMarginals.map(([, share]) => share).sort()).toEqual(secondMarginals.map(([, share]) => share).sort());
+    expect(firstMarginals).toEqual([[100, 1], [200, 0]]);
+    expect(secondMarginals).toEqual([[100, 0], [200, 1]]);
+    expect(Object.isFrozen(collection.subjects[0]!.packs[0]!.metrics)).toBe(true);
+
+    const json = serializeCalibrationSnapshot(ctx.run(ids));
+    expect(json).not.toContain("subjects");
+    for (const id of ids) expect(json).not.toContain(id);
+  });
+
   it("L/M/R/S. full/nonzero distributionsがzero inflation・all-zero・singleを区別する", () => {
     const mixed = summarizeNumericDistribution([0, 0, 0, 10]);
     expect(mixed).toMatchObject({ populationCount: 4, nonZeroCount: 1, zeroCount: 3, missingCount: 0, p50: 0 });
@@ -200,6 +243,9 @@ describe("F5a VC Style distribution pack T-AB", () => {
     expect(metric(snapshot, "vc-style-v1", "socialOnlyShare.oneToOne")).toMatchObject({
       populationCount: 1, missingCount: 1, sampleCount: 0, p50: null,
     });
+    expect(metric(snapshot, "vc-style-v1", "dailySocialOnlyShareMedian.oneToOne")).toMatchObject({
+      populationCount: 1, missingCount: 1, sampleCount: 0, p50: null,
+    });
     expect(serializeCalibrationSnapshot(snapshot)).not.toContain("matched");
   });
 
@@ -213,6 +259,25 @@ describe("F5a VC Style distribution pack T-AB", () => {
     expect(metric(snapshot, "vc-style-v1", "positiveSocialBucketCount").p50).toBe(3);
     expect(pack(snapshot, "vc-style-v1").candidateNos).toEqual(Array.from({ length: 12 }, (_, i) => i + 10));
     expect(pack(snapshot, "vc-style-v1").readCalls).toBe(1);
+  });
+
+  it("AT/AU. daily social-only shareはsocial denominatorを使い、solo-only dayをmissingとして除外する", () => {
+    const tenHour = setup();
+    tenHour.segment("subject", "solo-nine-hours", BASE + 60, BASE + 9 * 3_600 + 60);
+    tenHour.segment("subject", "social-one-hour", BASE + 9 * 3_600 + 60, BASE + 10 * 3_600 + 60);
+    tenHour.segment("peer", "social-one-hour", BASE + 9 * 3_600 + 60, BASE + 10 * 3_600 + 60);
+    const tenHourSnapshot = tenHour.run(["subject"]);
+    expect(metric(tenHourSnapshot, "vc-style-v1", "dailyBucketShareMedian.oneToOne").p50).toBeCloseTo(0.1);
+    expect(metric(tenHourSnapshot, "vc-style-v1", "dailySocialOnlyShareMedian.oneToOne").p50).toBe(1);
+
+    const twoDays = setup();
+    twoDays.segment("subject", "solo-day", BASE + 60, BASE + 3_660);
+    twoDays.segment("subject", "social-day", BASE + DAY + 60, BASE + DAY + 3_660);
+    twoDays.segment("peer", "social-day", BASE + DAY + 60, BASE + DAY + 3_660);
+    const twoDaySnapshot = twoDays.run(["subject"]);
+    expect(metric(twoDaySnapshot, "vc-style-v1", "dailyBucketShareP25.oneToOne").p50).toBe(0);
+    expect(metric(twoDaySnapshot, "vc-style-v1", "dailySocialOnlyShareP25.oneToOne").p50).toBe(1);
+    expect(metric(twoDaySnapshot, "vc-style-v1", "dailySocialOnlyShareMax.oneToOne").p50).toBe(1);
   });
 });
 

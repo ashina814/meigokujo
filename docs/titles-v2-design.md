@@ -2129,6 +2129,10 @@ dedupe/sortした後も0活動subjectをfull-population denominatorに残す。c
 cohortを変更しない。snapshotへ残すcohort情報はkeyとsubject countだけで、user ID、pseudonym、name、role、raw payload、
 counterpart/surface identity、exact activity timestampは出さない。
 
+同じdeterministic subject measurement collectionはplanning-internal boundaryとして切り出し、subject単位のmetric相関を
+memory上で維持する。このrestricted collectionはF5cのmulti-metric sweepで再利用できるが、serialize/log/persistせず、
+production v2 barrelにも公開しない。F5aのserialized snapshotは引き続きaggregate-onlyとする。
+
 全probeは同一の`start/end/observedAt/effectiveEnd`を使い、`effectiveEnd=min(end, observedAt)`より先を読まない。
 `Date.now()`、random sampling、historical inference/backfillは使わない。同じDB state・subject set・scope・catalog/readiness・
 schema versionなら、candidate/probe/metric/hourを固定順へ並べたbyte-equivalent JSONになる。snapshotはdeep-freezeし、
@@ -2143,8 +2147,10 @@ min/p25/p50/p75/p90/p95/p99/maxを返す。比率は分子・分母の基礎量�
 F5aの実packは次の2つだけ。
 
 - VC Style（No.10–21）は`vc_group_size_daily_safe`だけを正本とし、trusted/social seconds、4 bucket totals/positive days、
-  active/social days、first/last positive day offset、span、overall/social-only shares、日別shareのp25/median/p75/IQR/max、
-  positive social bucket breadthを測る。数秒の100% shareも標本量と一緒に残すが、guard thresholdやcandidate別matchは作らない。
+  active/social days、first/last positive day offset、span、overall/social-only shares、overall denominatorによる日別shareと
+  social denominatorによる日別social bucket shareのp25/median/p75/IQR/max、positive social bucket breadthを測る。
+  日別social denominatorが0の日は0%にせずmissingとして除外する。数秒の100% shareも標本量と一緒に残すが、guard
+  thresholdやcandidate別matchは作らない。
 - Activity-Time（No.32–37）は`social_activity_time_safe`のJST 0..23 hourをそのまま保ち、VC hour seconds/positive daysと
   VC-only dominant/top2/top3 concentrationを測る。TCはsafe payloadのbest same-surface exchange gapをglobal/hour別
   distributionとして保持し、meaningful gap boolean/countへ変換しない。TCとVCを任意weightでcombined scoreにせず、
@@ -2156,8 +2162,10 @@ snapshotは`coverageKnown=false`とrollout/coverage limitation warningを必ず�
 一度だけ使い、user×metric/candidate queryやDB writeを行わない。
 
 follow-upのF5bはTC/social breadth、room、invite、economy/shop、casino、event、castle/castle-roleのmeasurement packs、
-F5cは明示snapshotによるthreshold/boundary candidate sweepとshadow prevalence/overlap analysis、F6は採択thresholdの
-stable production rule化を担う。F5a時点のreadinessはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8のまま。
+F5cはsame cohort/window/observedAtのdeterministic measurement engineをplanning-internalに再利用してsubject correlationを
+保ったthreshold/boundary candidate sweepとshadow prevalence/overlap analysisを行い、aggregate sweep結果だけを出力する。
+serialized F5a snapshot単独やuser-level rowsをF5cの入力・出力にはしない。F6は採択thresholdのstable production rule化を
+担う。F5a時点のreadinessはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8のまま。
 
 ## 15. PR分割
 

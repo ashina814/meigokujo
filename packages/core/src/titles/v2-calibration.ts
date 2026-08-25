@@ -103,6 +103,49 @@ export interface CalibrationSnapshotComparison {
   )[];
 }
 
+export interface F5aCalibrationInput {
+  readonly cohortKey: string;
+  readonly subjectUserIds: readonly string[];
+  readonly window: {
+    readonly start: number;
+    readonly end: number;
+    readonly observedAt: number;
+  };
+}
+
+export interface PlanningCalibrationPackMeasurement {
+  readonly probeKey: CalibrationPackSnapshot["probeKey"];
+  readonly metrics: Readonly<Record<string, number | null>>;
+  readonly tcGapsByHour: readonly {
+    readonly hour: number;
+    readonly values: readonly number[];
+  }[];
+}
+
+export interface PlanningCalibrationSubjectMeasurement {
+  readonly subjectUserId: string;
+  readonly packs: readonly PlanningCalibrationPackMeasurement[];
+}
+
+/**
+ * Planning-internal correlation boundary for F5c-style sweeps. It contains restricted subject IDs,
+ * must never be serialized/logged, and is intentionally absent from the production v2 barrel.
+ */
+export interface PlanningCalibrationMeasurementCollection {
+  readonly schemaVersion: typeof CALIBRATION_SCHEMA_VERSION;
+  readonly percentileMethod: typeof CALIBRATION_PERCENTILE_METHOD;
+  readonly catalogHash: string;
+  readonly readinessHash: string;
+  readonly catalogCandidateCount: number;
+  readonly cohort: { readonly key: string; readonly subjectCount: number };
+  readonly window: CalibrationSnapshot["window"];
+  readonly packReadCalls: readonly {
+    readonly probeKey: CalibrationPackSnapshot["probeKey"];
+    readonly readCalls: number;
+  }[];
+  readonly subjects: readonly PlanningCalibrationSubjectMeasurement[];
+}
+
 interface SubjectMeasurement {
   readonly metrics: ReadonlyMap<string, number | null>;
   readonly tcGapsByHour?: ReadonlyMap<number, readonly number[]>;
@@ -185,15 +228,22 @@ function measureVcStyle(
   const totals = Object.fromEntries(VC_BUCKETS.map((bucket) => [bucket, 0])) as Record<OccupancyBucket, number>;
   const positiveDays = Object.fromEntries(VC_BUCKETS.map((bucket) => [bucket, 0])) as Record<OccupancyBucket, number>;
   const dailyShares = new Map<OccupancyBucket, number[]>(VC_BUCKETS.map((bucket) => [bucket, []]));
+  const dailySocialOnlyShares = new Map<OccupancyBucket, number[]>(SOCIAL_BUCKETS.map((bucket) => [bucket, []]));
   const positiveDates: string[] = [];
   for (const day of payload.days) {
     const dailyTotal = VC_BUCKETS.reduce((sum, bucket) => sum + day.trustedSecondsByBucket[bucket], 0);
+    const dailySocialTotal = SOCIAL_BUCKETS.reduce((sum, bucket) => sum + day.trustedSecondsByBucket[bucket], 0);
     if (dailyTotal > 0) positiveDates.push(day.date);
     for (const bucket of VC_BUCKETS) {
       const seconds = day.trustedSecondsByBucket[bucket];
       totals[bucket] += seconds;
       if (seconds > 0) positiveDays[bucket] += 1;
       if (dailyTotal > 0) dailyShares.get(bucket)!.push(seconds / dailyTotal);
+    }
+    if (dailySocialTotal > 0) {
+      for (const bucket of SOCIAL_BUCKETS) {
+        dailySocialOnlyShares.get(bucket)!.push(day.trustedSecondsByBucket[bucket] / dailySocialTotal);
+      }
     }
   }
   const totalTrustedSeconds = VC_BUCKETS.reduce((sum, bucket) => sum + totals[bucket], 0);
@@ -220,7 +270,15 @@ function measureVcStyle(
     metrics.set(`dailyBucketShareIqr.${bucket}`, stats.iqr);
     metrics.set(`dailyBucketShareMax.${bucket}`, stats.max);
   }
-  for (const bucket of SOCIAL_BUCKETS) metrics.set(`socialOnlyShare.${bucket}`, ratio(totals[bucket], totalSocialSeconds));
+  for (const bucket of SOCIAL_BUCKETS) {
+    metrics.set(`socialOnlyShare.${bucket}`, ratio(totals[bucket], totalSocialSeconds));
+    const stats = dailyShareStats(dailySocialOnlyShares.get(bucket)!);
+    metrics.set(`dailySocialOnlyShareP25.${bucket}`, stats.p25);
+    metrics.set(`dailySocialOnlyShareMedian.${bucket}`, stats.median);
+    metrics.set(`dailySocialOnlyShareP75.${bucket}`, stats.p75);
+    metrics.set(`dailySocialOnlyShareIqr.${bucket}`, stats.iqr);
+    metrics.set(`dailySocialOnlyShareMax.${bucket}`, stats.max);
+  }
   return { metrics };
 }
 
@@ -312,27 +370,26 @@ function descriptorFor(candidateNos: readonly number[], source: TitleUsableSourc
 
 function packSnapshot<K extends TitleUsableSourceKey>(
   probe: CalibrationProbe<K>,
-  payloads: readonly TitleSourcePayloads[K][],
+  measurements: readonly PlanningCalibrationPackMeasurement[],
   readCalls: number,
   windowStart: number,
 ): CalibrationPackSnapshot {
-  const measurements = payloads.map((payload) => probe.measure(payload, { windowStart }));
   // Empty cohortでもpack schemaを省略しない。全source payloadのcanonical zero shapeは{days:[]}。
   const zeroMeasurement = probe.measure(probe.emptyPayload, { windowStart });
   const metricKeys = [...new Set([
     ...zeroMeasurement.metrics.keys(),
-    ...measurements.flatMap((measurement) => [...measurement.metrics.keys()]),
+    ...measurements.flatMap((measurement) => Object.keys(measurement.metrics)),
   ])].sort();
   const metrics = metricKeys.map((metricKey) => ({
     metricKey,
-    distribution: summarizeNumericDistribution(measurements.map((measurement) => measurement.metrics.get(metricKey) ?? null)),
+    distribution: summarizeNumericDistribution(measurements.map((measurement) => measurement.metrics[metricKey] ?? null)),
   }));
   const gapsByHour = new Map<number, number[]>(Array.from({ length: 24 }, (_, hour) => [hour, []]));
   for (const measurement of measurements) {
-    for (const [hour, gaps] of measurement.tcGapsByHour ?? []) gapsByHour.get(hour)!.push(...gaps);
+    for (const { hour, values } of measurement.tcGapsByHour) gapsByHour.get(hour)!.push(...values);
   }
   const allGaps = [...gapsByHour.values()].flat();
-  const warnings: CalibrationPackSnapshot["warnings"] = payloads.length === 0
+  const warnings: CalibrationPackSnapshot["warnings"] = measurements.length === 0
     ? ["NO_SUBJECTS", "SOURCE_OMITS_UNKNOWN_COVERAGE"]
     : ["SOURCE_OMITS_UNKNOWN_COVERAGE"];
   return {
@@ -368,25 +425,35 @@ function deepFreeze<T>(value: T): T {
 
 export function runF5aCalibrationSnapshot(
   db: Database.Database,
-  input: {
-    readonly cohortKey: string;
-    readonly subjectUserIds: readonly string[];
-    readonly window: {
-      readonly start: number;
-      readonly end: number;
-      readonly observedAt: number;
-    };
-  },
+  input: F5aCalibrationInput,
 ): CalibrationSnapshot {
+  return snapshotFromMeasurementCollection(collectF5aCalibrationMeasurements(db, input));
+}
+
+/** Restricted planning API: callers may inspect subject correlations in memory but must emit aggregates only. */
+export function collectF5aCalibrationMeasurements(
+  db: Database.Database,
+  input: F5aCalibrationInput,
+): PlanningCalibrationMeasurementCollection {
   const scope = resolvePlanningCalibrationScope(input.window);
   const cohortKey = requireCohortKey(input.cohortKey);
   const subjectUserIds = [...new Set(input.subjectUserIds)].sort();
   const cache = new TitleSourceCache();
-  const packs = F5A_CALIBRATION_PROBES.map((probe) => {
+  const packsBySubject = new Map(subjectUserIds.map((subjectUserId) => [subjectUserId, [] as PlanningCalibrationPackMeasurement[]]));
+  const packReadCalls = F5A_CALIBRATION_PROBES.map((probe) => {
     const source = probe.sources[0];
+    const typedProbe = probe as CalibrationProbe<typeof source>;
     const prefetched = prefetchIntoTitleSourceCache(cache, db, source, subjectUserIds, scope);
-    const payloads = subjectUserIds.map((userId) => getFromTitleSourceCache(cache, db, source, userId, scope));
-    return packSnapshot(probe as CalibrationProbe<typeof source>, payloads, prefetched.readCalls, scope.start);
+    for (const subjectUserId of subjectUserIds) {
+      const payload = getFromTitleSourceCache(cache, db, source, subjectUserId, scope);
+      const measurement = typedProbe.measure(payload, { windowStart: scope.start });
+      const metrics = Object.fromEntries([...measurement.metrics].sort(([a], [b]) => a.localeCompare(b)));
+      const tcGapsByHour = [...(measurement.tcGapsByHour ?? [])]
+        .sort(([a], [b]) => a - b)
+        .map(([hour, values]) => ({ hour, values: [...values] }));
+      packsBySubject.get(subjectUserId)!.push({ probeKey: probe.probeKey, metrics, tcGapsByHour });
+    }
+    return { probeKey: probe.probeKey, readCalls: prefetched.readCalls };
   }).sort((a, b) => a.probeKey.localeCompare(b.probeKey));
   return deepFreeze({
     schemaVersion: CALIBRATION_SCHEMA_VERSION,
@@ -401,6 +468,28 @@ export function runF5aCalibrationSnapshot(
       observedAt: scope.observedAt,
       effectiveEnd: resolvedScopeEffectiveEnd(scope),
     },
+    packReadCalls,
+    subjects: subjectUserIds.map((subjectUserId) => ({
+      subjectUserId,
+      packs: packsBySubject.get(subjectUserId)!.sort((a, b) => a.probeKey.localeCompare(b.probeKey)),
+    })),
+  });
+}
+
+function snapshotFromMeasurementCollection(collection: PlanningCalibrationMeasurementCollection): CalibrationSnapshot {
+  const packs = F5A_CALIBRATION_PROBES.map((probe) => {
+    const measurements = collection.subjects.map((subject) => subject.packs.find(({ probeKey }) => probeKey === probe.probeKey)!);
+    const readCalls = collection.packReadCalls.find(({ probeKey }) => probeKey === probe.probeKey)!.readCalls;
+    return packSnapshot(probe, measurements, readCalls, collection.window.start);
+  }).sort((a, b) => a.probeKey.localeCompare(b.probeKey));
+  return deepFreeze({
+    schemaVersion: collection.schemaVersion,
+    percentileMethod: collection.percentileMethod,
+    catalogHash: collection.catalogHash,
+    readinessHash: collection.readinessHash,
+    catalogCandidateCount: collection.catalogCandidateCount,
+    cohort: collection.cohort,
+    window: collection.window,
     packs,
   });
 }
