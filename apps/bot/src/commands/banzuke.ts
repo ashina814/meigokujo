@@ -11,6 +11,7 @@ import { C_JACKPOT, C_MAMMON, E, HR_THIN } from "../casino/ui.js";
 import type { Services } from "../services.js";
 
 /**
+ * @deprecated slash registrationから退役済み。番付は`/賭場` のhome/panelから利用する。
  * /賭場番付 — マモンの賭場の番付（casino-bot /番付 相当）。
  * ephemeral（本人にだけ見える）。
  */

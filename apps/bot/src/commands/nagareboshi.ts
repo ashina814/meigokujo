@@ -11,6 +11,7 @@ import { fmtEther } from "../format.js";
 import type { Services } from "../services.js";
 
 /**
+ * @deprecated slash registrationから退役済み。流れ星は`/賭場` のhome/panelから利用する。
  * /流れ星 — 賭場占い（casino-bot /流れ星 準拠）。
  * 1日5回まで（初回無料、2〜5回目は 1,000 Ld を胴元へ）。
  * 報酬は基本ナシ（フレーバー）、稀に「流れ星」結果で JP プールから 10,000 Ld 支給。

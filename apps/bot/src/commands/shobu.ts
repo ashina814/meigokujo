@@ -9,8 +9,8 @@ import { playIndian } from "../casino/indian.js";
 import { playPokerDuel } from "../casino/poker-duel.js";
 
 /**
- * /勝負 — マモンの賭場の対人ゲーム集約コマンド。
- * ソロは /遊ぶ、対人は /勝負 の2本立て（casino-bot の方針を踏襲）。
+ * @deprecated `/勝負` slashは退役済み。公開対人入口は専用常設パネルへ集約した。
+ * game runner本体は将来再利用できるよう残すが、このbuilderをregistrationへ戻さない。
  *
  * `setMaxValue` を付けない理由は /遊ぶ と同じ（PR3）。上限は `validateBet()` が
  * 利用者ごとに判定する（VIP は ×2）。

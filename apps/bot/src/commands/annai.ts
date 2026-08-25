@@ -13,16 +13,9 @@ import { renderCasinoHome } from "./casino-home.js";
 import type { Services } from "../services.js";
 
 /**
- * /案内 — 旧・賭場ホーム。
- *
- * 賭場のホーム画面が `/賭場` と `/案内` の2つあり、しかも商店・番付・通行証・
- * 競馬・板への導線は `/案内` 側にしか無かった。利用者が `/賭場` を覚えると
- * そこから半分の機能へ辿り着けず、逆に `/案内` を覚えると遊ぶ導線が弱い、
- * という分断が起きていた。入口は `/賭場` へ一本化する。
- *
- * コマンド自体は消さない。覚えている人が打ったときに「存在しないコマンド」に
- * なるより、新しい入口へ案内するほうが親切なため。中身の描画は
- * `renderCasinoHome` を呼ぶだけにして、二重に育てない。
+ * @deprecated `/案内` はslash registrationから退役済みで、正規入口は `/賭場`。
+ * Discord側に残る旧interactionとの互換handlerだけを維持し、ボタン遷移では
+ * `renderCasinoHome` を再利用する。新しい公開入口として登録しない。
  */
 export const annaiCommand = new SlashCommandBuilder()
   .setName("案内")

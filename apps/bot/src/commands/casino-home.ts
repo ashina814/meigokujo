@@ -30,6 +30,9 @@ import type { Services } from "../services.js";
 const DEFAULT_GAME = "スロット";
 const DEFAULT_BET = 100;
 
+export const CASINO_STOCKS_PAUSED_GUIDANCE =
+  "**株式市場は現在 停止中** です。新規購入も売却もできません。持っている株はそのままで、勝手に処理しません。";
+
 export const casinoHomeCommand = new SlashCommandBuilder()
   .setName("賭場")
   .setDescription("🏛 マモンの賭場ホーム")
@@ -218,7 +221,7 @@ function renderGuide(services: Services) {
         "",
         // 株は導線から外しているが、建玉を持っている人が「消えた」と誤解しないよう
         // 停止していることだけは必ず残す（旧 /案内 から引き継いだ告知）
-        "**株式市場は現在 停止中** です。持っている株はそのままで、購入も売却もできません。`/株` で詳細を出せます。",
+        CASINO_STOCKS_PAUSED_GUIDANCE,
         "",
         "-# 停止中や正式開業前は、押しても資金は動きません。現在の状態と理由はホームの先頭に出ています。",
       ].join("\n"),

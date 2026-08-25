@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { buildRegistrationPayload } from "../src/commands/slash-command-registration.js";
 
 /**
  * 賭場の利用者向け入口は `/賭場` に集約する。
@@ -9,32 +10,15 @@ import { describe, expect, it } from "vitest";
  */
 describe("賭場の重複 shortcut slash commands を登録しない", () => {
   const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
+  const registrationNames = () => buildRegistrationPayload().map(({ name }) => name);
 
   it("退役対象8コマンドを Discord command registration に含めない", () => {
-    const source = read("../src/register-commands.ts");
-    for (const symbol of [
-      "asobuCommand",
-      "dailyCommand",
-      "banzukeCommand",
-      "bakutenCommand",
-      "keibaCommand",
-      "annaiCommand",
-      "vipCommand",
-      "nagareboshiCommand",
-    ]) {
-      expect(source).not.toContain(`${symbol}.toJSON()`);
-    }
-
-    for (const file of ["asobu", "daily", "banzuke", "bakuten", "keiba", "annai", "vip", "nagareboshi"]) {
-      expect(source).not.toContain(`./commands/${file}.js`);
-    }
+    for (const name of ["遊ぶ", "福分け", "賭場番付", "賭場商店", "競馬", "案内", "vip", "流れ星"])
+      expect(registrationNames()).not.toContain(name);
   });
 
   it("正本の /賭場 と残す /通行証・/板 は登録したまま", () => {
-    const source = read("../src/register-commands.ts");
-    expect(source).toContain("casinoHomeCommand.toJSON()");
-    expect(source).toContain("passportCommand.toJSON()");
-    expect(source).toContain("itaCommand.toJSON()");
+    expect(registrationNames()).toEqual(expect.arrayContaining(["賭場", "通行証", "板"]));
   });
 
   it("退役した個別入口の機能は /賭場 ハブから到達できる", () => {

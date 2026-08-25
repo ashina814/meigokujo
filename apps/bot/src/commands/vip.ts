@@ -13,6 +13,7 @@ import { C_JACKPOT, C_MAMMON, E, bar } from "../casino/ui.js";
 import type { Services } from "../services.js";
 
 /**
+ * @deprecated slash registrationから退役済み。VIPは`/賭場` のhome/panelから利用する。
  * /vip — マモンの賭場のVIP会員（月額Land）。casino-bot 準拠。
  */
 export const vipCommand = new SlashCommandBuilder()

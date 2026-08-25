@@ -855,7 +855,7 @@ export const TITLE_SOURCES = {
     },
     wiredFrom: {
       file: "apps/bot/src/index.ts",
-      needle: "await handleTransfer(interaction, services);",
+      needle: "getActiveSlashCommandRoute(interaction.commandName)",
     },
     kind: "history",
     privacy: "restricted",
@@ -1123,7 +1123,7 @@ export const TITLE_SOURCES = {
     },
     wiredFrom: {
       file: "apps/bot/src/index.ts",
-      needle: "await handleAsobuCommand(interaction, services);",
+      needle: "await handleCasinoAmountPickButton(interaction, services);",
     },
     kind: "history",
     privacy: "restricted",
@@ -1175,7 +1175,7 @@ export const TITLE_SOURCES = {
     },
     wiredFrom: {
       file: "apps/bot/src/index.ts",
-      needle: "await handleAsobuCommand(interaction, services);",
+      needle: "await handleCasinoAmountPickButton(interaction, services);",
     },
     kind: "history",
     privacy: "restricted",
