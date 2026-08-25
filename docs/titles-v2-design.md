@@ -2090,9 +2090,31 @@ public VCは維持する。payloadはedition/version、family、JST day、public
 coverageだけで、identity、exact timestamp、amountを出さない。
 300-user chunkごとに9 bulk adapter invocationを行うため601 usersのreadCallsは27と定義し、user×family N+1は作らない。
 
-No.85-89をSOURCE READYへ更新し、overallはREADY 74 / PARTIAL 6 / BLOCKED 11 / META 8。No.90/91はeligible public
-role、assignedDomains manifest、role interval×activity temporal JOINが必要なF4b対象としてBLOCKEDを維持する。
-production threshold、BehaviorTitleDefinition、award、notification、completion/activationは追加しない。
+No.85-89をSOURCE READYへ更新し、F4a時点のoverallはREADY 74 / PARTIAL 6 / BLOCKED 11 / META 8。No.90/91の
+role-contextは次節F4bで解消する。
+
+## 14.5 F4b: eligible public role × assigned domains × normal activity
+
+immutable `castle-role-domain-edition-i` version 1はF3a semantic tagを
+`inn→public_room`、`economy→economy`、`shop→shop`、`casino→casino`へbridgeする。
+同一manifest revision・同一role familyに`public_department`とassignment tagが共存する場合だけeligible。
+current productionで実際に成立するmappingは冥界商館→shopだけで、role/department名やnotification roleから補完しない。
+
+F4b normal activityはF4aのうちpublic_eventを除く6 family。eventDate/recorded_at/completed_atをsubject activity instantへ
+代用しない。`castle_experience_safe`の日付とrole-active日をJOINせず、restricted exact subject occurrence/intervalを
+trusted role intervalへJOINしてからsanitizeする。VCはroom/table ownership後remainder、TCはsame-surface exchange subject
+message、roomはsubject visitor/own-useだけ、economyはsubject-initiated peer transfer/tip、shopはeligible purchased_at、casinoは
+core completion/table guest/standard-market occurrence。passive room ownerはrole-held activityにしない。
+
+pointはactivity instant、intervalはrole/assignment boundaryでsliceし、activeな全eligible roleのassigned family unionで
+inside/outsideを分類する。F3aのstart+1/end-exclusive、restart/disconnect/unavailable/manifest-change UNKNOWNを継承する。
+`castle_role_context_safe`はinside/outside/role-held family×JST day、trusted seconds、occurrence count、outside daysだけを公開し、
+role/revision/guild/channel/counterpart/transaction/product/market identityとexact timestamp/amountを出さない。601 usersは
+300/300/1×9 logical adapter reads = 27で、single/prefetched payloadは一致する。
+
+No.90/91をSOURCE READYへ更新し、overallはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8。No.57/64/73はactual
+inn/economy/casino mapping不足のためBLOCKED維持。threshold、BehaviorTitleDefinition、award、notification、activation、
+backfillは追加しない。
 
 ## 15. PR分割
 

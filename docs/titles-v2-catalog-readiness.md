@@ -166,6 +166,16 @@ repo実装を突き合わせて、production catalogへ昇格できるもの／�
 > eligible public role、assignedDomains manifest、担当内外temporal JOINが必要なため
 > F4bまでBLOCKEDを維持する。§28参照。
 
+> **PR F4b反映（2026-08-25）**: immutable `castle-role-domain-edition-i`
+> bridgeと、同一role-family revision上の`public_department + assignment tag`だけを
+> eligibleにするrestricted loaderを追加した。public_eventを除く6 normal familyの
+> subject-active exact occurrence/intervalをtrusted role coverageへ先にJOINし、activity
+> 時点の複数role assigned-family unionでinside/outsideを分類する
+> `castle_role_context_safe`を追加。No.90/91をBLOCKED→READYへ更新し、READY 74→76、
+> BLOCKED 11→9、PARTIAL 6・META 8は不変。current production mappingは冥界商館→shop
+> だけで、inn/economy/casinoはfuture bridge先を定義してもhistorical tagが無ければ
+> eligibleにならない。threshold・award・activation・backfillは追加していない。§29参照。
+
 ## 0. xlsx canonical hash（exact drift guard）
 
 | 項目 | 値 |
@@ -213,13 +223,13 @@ full-clear editionに登録されたREQUIRED印100%——NONCOUNTの91 behavior�
 
 | status | 件数 | 意味 |
 | --- | --- | --- |
-| READY | 74 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
+| READY | 76 | 現在`titleUsable:true`のsource／specialized resolverだけで、意味を落とさず表現できる |
 | PARTIAL | 6 | 近い意味のsourceはあるが、意味を落とす／広げるか、semantic mismatchが安全な有効化を妨げている |
-| BLOCKED | 11 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
+| BLOCKED | 9 | 意味的に近いものが repo に一切存在しない、または複合条件の残りの基盤が無い |
 | META | 8 | kind:meta（別bucket、§7参照） |
 
 **READY = 今すぐreleaseしてよい、ではない**。sourceReadinessとthreshold決定は
-別軸（§10参照）——READY 74件も、production threshold値（分布TBD等）が
+別軸（§10参照）——READY 76件も、production threshold値（分布TBD等）が
 決まるまではrelease対象にならない。またSeries manifest／Collection Edition／
 Meta pipelineの本番登録もこのPRでは一切行わない（§9参照）。No.58はさらに、
 award後のreversalを既存immutable ownershipへどう反映するかが未決定であるため、
@@ -231,14 +241,14 @@ source-readyでもproduction release不可（§15）。
 | --- | --- | --- |
 | missing_persisted_source | 0 | titles層へ一切昇格されていない生データ／新規persisted sourceが必要 |
 | missing_derived_source | 6 | 既存safe sourceの上に新しいderived aggregate（day/share/span/distinct等）が必要 |
-| missing_manifest | 2 | No.90/91のeligible public role / assignedDomains manifestが未定義 |
+| missing_manifest | 0 | F4bでNo.90/91のeligible public role / assignedDomains bridgeを明示 |
 | missing_role_history | 0 | F3aでgeneric role-family-at-time基盤を実装 |
 | missing_domain_temporal_join | 3 | No.57/64/73。canonical domain role mappingと各activity時点を結ぶsafe source待ち |
 | source_semantic_mismatch | 6 | sourceが証明する事実がcatalogの意味仕様より弱い／異なる（No.1/6/22のpublic VC provenance、No.29/30のpair-specific overlap、No.48のfree-flow同一topic correlation） |
 | missing_event_protocol | 0 | F2mでevent involvement protocolを追加し解消 |
 | known_bug | 0 | PR F2aで`computeLastOccupant()`のsame-second/0-second visit tie bugを修正——catalog全体から解消済み（§13参照） |
 
-（`none`のBehavior候補は69件——ちょうどREADY件数と一致。PARTIAL 6件は
+（`none`のBehavior候補は76件——ちょうどREADY件数と一致。PARTIAL 6件は
 すべて`source_semantic_mismatch`を持つ。）
 
 ## 4. Theme別 readiness
@@ -261,7 +271,7 @@ source-readyでもproduction release不可（§15）。
 | 14 | 賭場 | 8 | 7 | 0 | 1 |
 | 15 | 招待 | 6 | 6 | 0 | 0 |
 | 16 | イベント | 5 | 5 | 0 | 0 |
-| 17 | 城横断 | 7 | 0 | 0 | 7 |
+| 17 | 城横断 | 7 | 7 | 0 | 0 |
 
 BUMP/鐘とVC人数帯Theme 3-6が100% READY。広い交友Theme 7はF3aでNo.26/27がREADYとなり、5 READY / 1 PARTIAL（No.22）になった。人数帯はPR F2eのJST日別4bucket
 trusted secondsで日数/share/span/streakを後段評価できるため）。公開部屋はF2gで
@@ -270,11 +280,11 @@ SOURCE READYとなった。TC交流はF2hで7/8件がSOURCE READYとなり、No.
 招待はF2jで6/6件がSOURCE READYとなった。Land・経済はF3bで6/8件がREADYとなり、
 No.60はpair chronology、No.64はcanonical economy role mapping待ち。No.65はactual商館staff authorizationへ
 購入時点でJOINしてREADY。賭場はF2lで7/8件がREADYとなり、
-No.73だけF3b domain temporal JOIN待ち。No.26/27はF3aでinteraction時点のclass/public-department family relationがexactになった。イベントはF2mで5/5件がSOURCE READY。城横断は引き続き0% READY。
+No.73だけF3b domain temporal JOIN待ち。No.26/27はF3aでinteraction時点のclass/public-department family relationがexactになった。イベントはF2mで5/5件がSOURCE READY。城横断はF4a/F4bで7/7件がSOURCE READY。
 
 ## 5. source別に残る実装（READYを支えるsource／PARTIALの制約／BLOCKEDが必要とするもの）
 
-READYを支えている既存`titleUsable:true` source（24種、69件）:
+READYを支えている既存`titleUsable:true` source（25種、76件）:
 
 - `vc_empty_start_then_joined`（No.2。No.1はpublic provenance不足でPARTIAL）
 - `vc_last_occupant`（No.7, 9。No.6はtie bug解消済みだがpublic provenance不足でPARTIAL）
@@ -300,6 +310,8 @@ READYを支えている既存`titleUsable:true` source（24種、69件）:
 - `tc_conversation_safe`（No.42-45, 47, 49——quiet/continuation/dormant/area/join/social-dayのthreshold-neutral stats、§20参照）
 - `tc_reaction_safe`（No.46——anonymous post/JST observation day/distinct human reactor分布、§20参照）
 - `social_activity_time_safe`（No.32-37——same-surface TC exchange候補とtrusted VC wall-clock unionのJST date×24hour sparse分布。daypart/thresholdは未固定、§21参照）
+- `castle_experience_safe`（No.85-89——Edition-I 7-familyのJST日/breadth/super-domain profile、§28参照）
+- `castle_role_context_safe`（No.90/91——eligible public role保持中の6 normal familyをexact occurrence時点でinside/outside分類、§29参照）
 
 PARTIALを止めているもの（source_semantic_mismatch、§12/§14で今回のレビューにより判定）:
 
@@ -316,7 +328,6 @@ BLOCKEDが新たに必要とするもの（xlsxのSource_Map original「未実�
 E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 
 - **canonical domain role mapping + temporal safe JOIN**—— No.57/64/73（3件）。inn/economy/casinoのactual staff/operator authorization mappingがrepoに無いため、名称や通知/benefit roleから推測しない
-- **eligible public role + assignedDomains manifest + temporal safe JOIN**—— No.90/91（2件）。castle activity自体はF4aで成立したが、担当内外分類はF4b待ち
 
 ## 6. threshold pending
 
@@ -328,7 +339,7 @@ E2/E3/E4/F2b実装後の現repoで再監査した差分）:
 | STRUCTURAL_PLUS_DISTRIBUTION | 1 | 構造は決まるが、一部の値は分布依存 |
 | META_NOT_APPLICABLE | 8 | meta（別contract、§10適用外） |
 
-sourceReadinessとthresholdは別軸——READY 74件のうち、STRUCTURAL_FIXEDなのは
+sourceReadinessとthresholdは別軸——READY 76件のうち、STRUCTURAL_FIXEDなのは
 一部（初回系）のみで、残りはTHRESHOLD_PENDINGのままREADYになっている
 （sourceは十分だが実数値は分布を見てから決める）。
 
@@ -336,7 +347,7 @@ sourceReadinessとthresholdは別軸——READY 74件のうち、STRUCTURAL_FIXE
 
 | 依存軸 | 件数 | 備考 |
 | --- | --- | --- |
-| role-at-time依存（`roleDependency !== "none"`） | 10 | generic `missing_role_history`は0件。No.65はF3bでREADY、No.57/64/73はcanonical domain mapping + temporal JOIN待ち |
+| role-at-time依存（`roleDependency !== "none"`） | 10 | generic `missing_role_history`は0件。No.65はF3b、No.90/91はF4bでREADY。No.57/64/73はcanonical domain mapping + temporal JOIN待ち |
 | イベントtheme（Theme No.16） | 5 | No.80/81はcompletion source、No.82-84はF2m joint calendar/involvement sourceで全件READY |
 | manifest依存（thresholdCategory: MANIFEST_DEPENDENT） | 6 | No.69の賭場Edition-IとNo.85-89の城横断Edition-I manifestは確定。production threshold/edition運用は別途決定する |
 | known bug依存 | 0 | PR F2aで`computeLastOccupant`の同秒0秒visit tie bugを修正——catalog全体から解消（§13参照） |
@@ -370,13 +381,12 @@ sourceReadinessとthresholdは別軸——READY 74件のうち、STRUCTURAL_FIXE
 > event dual-role protocol + event_date露出も**PR F2mで解消済み**（§25参照）——
 > No.82-84がBLOCKED→READY。
 > Castle Experience Edition-Iも**PR F4aで解消済み**（§28参照）——No.85-89が
-> BLOCKED→READY。No.90/91はexperience sourceではなくassignedDomains/F4bだけが残る。
+> BLOCKED→READY。No.90/91のassignedDomains/F4bも§29で解消した。
 > 以下は残っているクラスタのみを優先度順に並べ直したもの。
 
 | 優先度 | クラスタ | 解放されるcandidate数 | 理由 |
 | --- | --- | --- | --- |
 | 1 | 残るdomain-specific temporal JOIN | 3件（No.57/64/73） | inn/economy/casinoのcanonical staff/operator role truthをまず明示し、activity occurrenceへexact JOINする。名称heuristicは禁止 |
-| 2 | F4b assignedDomains + castle role temporal JOIN | 2件（No.90/91） | eligible public roleと複数roleの担当domain unionを明示し、担当内外をactivity時点でexact JOINする |
 
 VC group-size clusterはF2e、VC social breadth clusterはF2f、公開部屋clusterは
 F2g、TC conversation/reactionの7件はF2h、TC+VC時間帯clusterはF2iで解消した。
@@ -1684,7 +1694,49 @@ No.85の同日2-familyも表現でき、No.86-89向けのbreadth/super-domain/al
 行う。このlogical adapter invocation数を`readCalls`と定義するため、601 subjectsは300/300/1 chunk × 9 = 27。
 各adapterはsubject/familyごとのN+1ではなくbulk queryを使い、single readerとprefetched readerは一致する。
 
-No.85-89はSOURCE READY。overallはREADY 74 / PARTIAL 6 / BLOCKED 11 / META 8。No.90/91はcastle sourceが
-利用可能になったが、eligible public role definition、roleごとのassignedDomains manifest、複数role union、担当内外の
-temporal safe JOINが無いためF4bまでBLOCKED。threshold、BehaviorTitleDefinition、award、notification、completion、
-activation、merge/deployは行わない。
+No.85-89はSOURCE READY。F4a時点のoverallはREADY 74 / PARTIAL 6 / BLOCKED 11 / META 8。No.90/91の
+eligible public role definition、assignedDomains bridge、複数role union、担当内外temporal JOINは§29のF4bで解消した。
+
+## 29. PR F4b — eligible public role × assigned domains × exact normal activity
+
+### 29.1 semantic boundary
+
+F4aの7-family taxonomy自体は変更しない。No.90/91の「通常領域」は常設利用を表す
+`public_vc` / `public_tc` / `public_room` / `economy` / `shop` / `casino`の6 familyに固定し、
+episodicな`public_event`は除外する。event date、roster記録時刻、completion時刻をsubjectの
+参加instantとしてrole intervalへproxy JOINしない。
+
+`castle-role-domain-edition-i` version 1はF3a tagを`inn→public_room`、`economy→economy`、
+`shop→shop`、`casino→casino`へ明示bridgeする。eligible role contextは同じimmutable manifest
+revision・同じrole familyに`public_department`とbridge可能tagが共存するknown-positive intervalだけ。
+role名・department名・notification/benefit roleから推測しない。現production truthで実際にtagが付くのは
+`冥界商館→shop`だけであり、他3 mappingはhistorical revision側にcanonical tagが無ければ出現しない。
+
+### 29.2 exact temporal classification
+
+`castle_experience_safe.days × role active days`は禁止。restricted exact evidenceを共通
+`effectiveEnd=min(scope.end, observedAt)`で読み、F3aのalready-fenced `[knownStart,knownEnd)`へ先にJOINする。
+role add secondは`knownStart=observed+1`、removal secondはend-exclusive。restart/disconnect/guild unavailable/
+manifest change/fresh snapshot前はUNKNOWNで、current role/current departmentsをhistorical evaluationに使わない。
+
+point occurrenceではactivity時点、intervalではrole start/endと複数role overlapの全boundaryでsliceし、その瞬間に
+activeなeligible roleすべてのassigned familyをunionする。familyがunion内ならinside、そうでなければoutside、eligible
+roleが無ければ0。同一family・同一日にinside/outside双方があれば両方を保持する。
+
+subject-active evidenceだけを採用する。VCはF4a ownership後のremainder、TCはsame-surface human exchangeのsubject message、
+roomはsubject自身のguest/own-use visitor interval、economyはsubject-initiated peer transfer/tip、shopはeligible storefront
+purchase、casinoはcompleted core occurrence・official table guest interval・other standard market successful occurrenceのOR。
+不在ownerのpassive hosted room evidenceは除外する。room/tableのsame-channel overlapはpublic_room/casinoへ単一帰属し、
+different-channel simultaneous public VCは維持する。
+
+### 29.3 safe payload / readiness
+
+`castle_role_context_safe`はedition/versionとinside/outside/role-held別のCastle family×JST dayだけを公開し、日ごとの
+trusted interval secondsとpoint occurrence countをthreshold-neutralに保持する。outside distinct daysも公開する。
+role ID/family key、department、revision、guild/channel/room/event/market/transaction/product/counterpart identity、exact timestamp、
+amountは出さない。300-user chunkごとに9 logical adapter reads、601 usersで27 readCalls。single readerとprefetched readerは一致する。
+
+No.90はinside family有無・outside family有無・role-held family breadthを別々に判定できるためREADY。insideだけ/outsideだけへ
+縮小しない。No.91は同じoutside familyでもよいdistinct JST daysを判定できるためREADY。overallはREADY 76 / PARTIAL 6 /
+BLOCKED 9 / META 8。No.57/64/73はactual inn/economy/casino role mapping不足のため変更しない。threshold、award、notification、
+BehaviorTitleDefinition、activation、historical backfillは追加しない。

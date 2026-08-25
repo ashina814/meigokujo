@@ -1297,6 +1297,34 @@ export const TITLE_SOURCES = {
     epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
     rawUnit: "versioned_castle_experience_family_jst_day_profile",
   },
+  castle_role_context_safe: {
+    origin: "derived",
+    derivedBy: {
+      file: "packages/core/src/titles/v2-castle-role-context.ts",
+      needle: "export function computeCastleRoleContextSafe(",
+    },
+    derivedFrom: [
+      "role_family_manifest_history",
+      "role_observation_sessions",
+      "role_family_member_presence",
+      "vc_public_social_presence",
+      "tc_message_observations",
+      "rooms",
+      "vc_visits",
+      "economy_safe_peer_actions",
+      "shop_purchase_safe",
+      "casino_edition_i_completion_safe",
+      "casino_table_instances",
+      "casino_table_guest_presence",
+      "casino_market_participation_records",
+    ],
+    kind: "history",
+    privacy: "safe",
+    orderable: false,
+    titleUsable: true,
+    epochPolicy: { type: "interval", start: "windowStart", end: "windowEnd", clip: true },
+    rawUnit: "versioned_role_held_castle_normal_family_inside_outside_jst_profile",
+  },
 } as const satisfies Record<string, TitleSourceDefinition>;
 
 export type TitleSourceKey = keyof typeof TITLE_SOURCES;

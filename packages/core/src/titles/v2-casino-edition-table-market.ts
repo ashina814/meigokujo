@@ -312,15 +312,19 @@ export interface CasinoMarketActivitySafePayload {
   readonly distinctOtherStandardBoards: number;
 }
 
-/** successful funded standard-board commitments only; amount/result/options/identity are discarded. */
-export function computeCasinoMarketActivitySafe(
+export interface CasinoMarketParticipationEvidence {
+  readonly userId: string;
+  readonly marketId: number;
+  readonly occurredAt: number;
+}
+
+/** Restricted exact successful standard-market occurrences; market identity never enters safe payloads. */
+export function loadCasinoMarketParticipationEvidence(
   db: Database.Database,
   window: { readonly start: number; readonly end: number },
   userIds: readonly string[],
-): ReadonlyMap<string, CasinoMarketActivitySafePayload> {
-  const result = new Map<string, CasinoMarketActivitySafePayload>();
-  for (const id of userIds) result.set(id, { days: [], distinctOtherStandardBoards: 0 });
-  if (userIds.length === 0 || window.end <= window.start) return result;
+): readonly CasinoMarketParticipationEvidence[] {
+  if (userIds.length === 0 || window.end <= window.start) return [];
   const placeholders = userIds.map(() => "?").join(",");
   const rows = db.prepare(
     `SELECT participant_id, market_id, market_creator_id, market_mode,
@@ -332,19 +336,34 @@ export function computeCasinoMarketActivitySafe(
     participant_id: string; market_id: number; market_creator_id: string; market_mode: string;
     market_created_at: number; market_deadline_at: number; occurred_at: number;
   }>;
+  return rows.filter((row) => row.market_mode === "standard"
+    && row.participant_id.trim().length > 0 && row.market_creator_id.trim().length > 0
+    && row.market_creator_id !== row.participant_id
+    && Number.isSafeInteger(row.market_id) && row.market_id > 0
+    && Number.isSafeInteger(row.market_created_at) && Number.isSafeInteger(row.market_deadline_at)
+    && Number.isSafeInteger(row.occurred_at) && row.market_created_at < row.market_deadline_at
+    && row.market_created_at <= row.occurred_at && row.occurred_at < row.market_deadline_at)
+    .map((row) => ({ userId: row.participant_id, marketId: row.market_id, occurredAt: row.occurred_at }));
+}
+
+/** successful funded standard-board commitments only; amount/result/options/identity are discarded. */
+export function computeCasinoMarketActivitySafe(
+  db: Database.Database,
+  window: { readonly start: number; readonly end: number },
+  userIds: readonly string[],
+): ReadonlyMap<string, CasinoMarketActivitySafePayload> {
+  const result = new Map<string, CasinoMarketActivitySafePayload>();
+  for (const id of userIds) result.set(id, { days: [], distinctOtherStandardBoards: 0 });
+  if (userIds.length === 0 || window.end <= window.start) return result;
+  const rows = loadCasinoMarketParticipationEvidence(db, window, userIds);
   for (const userId of userIds) {
-    const valid = rows.filter((r) => r.participant_id === userId && r.market_mode === "standard" &&
-      r.participant_id.trim().length > 0 && r.market_creator_id.trim().length > 0 && r.market_creator_id !== userId &&
-      Number.isSafeInteger(r.market_id) && r.market_id > 0 &&
-      Number.isSafeInteger(r.market_created_at) && Number.isSafeInteger(r.market_deadline_at) &&
-      Number.isSafeInteger(r.occurred_at) && r.market_created_at < r.market_deadline_at &&
-      r.market_created_at <= r.occurred_at && r.occurred_at < r.market_deadline_at);
-    const boards = new Set(valid.map((r) => r.market_id));
+    const valid = rows.filter((row) => row.userId === userId);
+    const boards = new Set(valid.map((row) => row.marketId));
     const byDay = new Map<string, Set<number>>();
     for (const row of valid) {
-      const date = jstDateStr(new Date(row.occurred_at * 1000));
+      const date = jstDateStr(new Date(row.occurredAt * 1000));
       const set = byDay.get(date) ?? new Set<number>();
-      set.add(row.market_id);
+      set.add(row.marketId);
       byDay.set(date, set);
     }
     result.set(userId, {
