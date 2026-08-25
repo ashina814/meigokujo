@@ -11,6 +11,7 @@ import { playPoker } from "../casino/poker.js";
 import { playHoldem } from "../casino/holdem.js";
 
 /**
+ * @deprecated slash registrationから退役済み。`/賭場` のhome/panelからrunnerを再利用する。
  * /遊ぶ — マモンの賭場の全ソロゲーム集約コマンド（casino-bot の /遊ぶ 方式）。
  * 賭けはすべてLand建て。入退場はゲーム開始時の自動預入・「賭場を出る」ボタンで。
  *

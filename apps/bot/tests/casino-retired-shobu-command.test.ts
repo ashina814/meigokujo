@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { buildRegistrationPayload } from "../src/commands/slash-command-registration.js";
 
 /**
  * `/勝負` は 2026-08-17 に利用者向け slash command から退役。
@@ -11,9 +12,7 @@ describe("退役した /勝負 を再登録しない", () => {
   const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
 
   it("Discord command registration に /勝負 を含めない", () => {
-    const source = read("../src/register-commands.ts");
-    expect(source).not.toContain('from "./commands/shobu.js"');
-    expect(source).not.toContain("shobuCommand.toJSON()");
+    expect(buildRegistrationPayload().map(({ name }) => name)).not.toContain("勝負");
   });
 
   it("現在の公開対人入口は専用常設パネルにある", () => {

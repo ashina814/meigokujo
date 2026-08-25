@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { ROLE_SLOT_META, ROLE_SLOT_ORDER } from "../src/church-roles.js";
+import { buildRegistrationPayload } from "../src/commands/slash-command-registration.js";
 
 /**
  * 対人順位卓・賭博場従業員の**利用者から見える面**が復活していないことを固定する。
@@ -10,9 +11,9 @@ describe("退役した順位卓の入口が戻っていない", () => {
   const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
 
   it("退役コマンドを登録しない", () => {
-    const source = read("../src/register-commands.ts");
+    const names = buildRegistrationPayload().map(({ name }) => name);
     for (const retired of ["casino-employee", "casino-evidence", "casino-arbitration"]) {
-      expect(source, `${retired} が再登録されている`).not.toContain(retired);
+      expect(names, `${retired} が再登録されている`).not.toContain(retired);
     }
   });
 

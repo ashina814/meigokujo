@@ -9,6 +9,7 @@ import { C_JACKPOT, C_MAMMON, E, bar } from "../casino/ui.js";
 import type { Services } from "../services.js";
 
 /**
+ * @deprecated slash registrationから退役済み。福分けは`/賭場` のhome/panelから利用する。
  * /福分け — マモンの賭場のデイリーボーナス（casino-bot /daily 相当）。
  * 24時間に1回。連続日数ボーナス（7日毎に+50、最大+200）＋残高が少なければ救済プールから追加支給。
  */

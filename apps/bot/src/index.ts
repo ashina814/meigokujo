@@ -2,31 +2,22 @@ import { Client, Events, GatewayIntentBits, Partials } from "discord.js";
 import { InviteTracker } from "./invite-tracker.js";
 import { config } from "./config.js";
 import { buildServices } from "./services.js";
-import { handleAdminCommand, handleAdminButton, handleAdminSelect, handleAdminModal } from "./commands/admin-payroll-recovery.js";
+import { handleAdminButton, handleAdminSelect, handleAdminModal } from "./commands/admin-payroll-recovery.js";
 import { handleShopButton, handleShopModal, handleShopSelect } from "./commands/shop-panel.js";
-import { handleShokanCommand, handleShokanButton, handleShokanSelect, handleShokanModal } from "./commands/shokan.js";
-import { handleApprovalButton, handleTransfer, handleTransferButton } from "./commands/transfer.js";
-import { handlePublicEventRecordButton, handlePublicEventRecordCommand } from "./commands/public-event-record.js";
-import { handlePublicEventCompleteButton, handlePublicEventCompleteCommand } from "./commands/public-event-complete.js";
-import { handleTip } from "./commands/tip.js";
-import { handleRankingCommand } from "./commands/ranking.js";
+import { handleShokanButton, handleShokanSelect, handleShokanModal } from "./commands/shokan.js";
+import { handleApprovalButton, handleTransferButton } from "./commands/transfer.js";
+import { handlePublicEventRecordButton } from "./commands/public-event-record.js";
+import { handlePublicEventCompleteButton } from "./commands/public-event-complete.js";
 import { handleRankPanelButton } from "./commands/rank-panel.js";
 import { handleEtherButton, handleEtherModal } from "./commands/exchange-panel.js";
-import { handleAsobuCommand } from "./commands/asobu.js";
-import { handleDailyCommand } from "./commands/daily.js";
-import { handlePassportCommand } from "./commands/passport.js";
-import { BANZUKE_SELECT_ID, handleBanzukeCommand, renderBanzuke } from "./commands/banzuke.js";
-import { handleShobuCommand } from "./commands/shobu.js";
-import { handleBakutenButton, handleBakutenCommand, handleBakutenSelect } from "./commands/bakuten.js";
+import { BANZUKE_SELECT_ID, renderBanzuke } from "./commands/banzuke.js";
+import { handleBakutenButton, handleBakutenSelect } from "./commands/bakuten.js";
 import { replyStocksPaused } from "./casino/stocks-pause.js";
-import { handleKeibaCommand } from "./commands/keiba.js";
-import { handleAnnaiButton, handleAnnaiCommand } from "./commands/annai.js";
-import { handleCasinoHomeButton, handleCasinoHomeCommand } from "./commands/casino-home.js";
-import { handleVipButton, handleVipCommand } from "./commands/vip.js";
-import { handleNagareboshiCommand } from "./commands/nagareboshi.js";
+import { handleAnnaiButton } from "./commands/annai.js";
+import { handleCasinoHomeButton } from "./commands/casino-home.js";
+import { handleVipButton } from "./commands/vip.js";
 import {
   handleItaButton,
-  handleItaCommand,
   handleItaEventButton,
   handleItaEventModal,
   handleItaEventSelect,
@@ -65,12 +56,10 @@ import {
   handleEntryModal,
   handleMemberJoin,
   handleMemberRoleUpdate,
-  handleSessionCommand,
   handleVoiceAttendance,
 } from "./commands/entry.js";
 import {
   handleSessionScheduleAutocomplete,
-  handleSessionScheduleCommand,
 } from "./commands/session-schedule.js";
 import { refreshWaitersBoard } from "./waiters-board.js";
 import { handleTicketButton } from "./commands/ticket-handler-safe.js";
@@ -87,15 +76,14 @@ import {
 import {
   handleCharonButton,
   handleEvaluationButton,
-  handleEvaluationCommand,
   handleEvaluationModal,
   handleEvaluationSelect,
 } from "./commands/evaluation.js";
-import { handlePromote } from "./commands/promote.js";
-import { handleProfile, handleProfileButton } from "./commands/profile.js";
-import { handleDepartment, handleDepartmentAutocomplete } from "./commands/department.js";
+import { handleProfileButton } from "./commands/profile.js";
+import { handleDepartmentAutocomplete } from "./commands/department.js";
 import { handleFiscalButton } from "./commands/fiscal.js";
-import { handleHelpCommand } from "./commands/help.js";
+import { getActiveSlashCommandRoute } from "./commands/active-slash-command-routes.js";
+import { getLegacyCompatSlashCommandRoute } from "./commands/legacy-compat-slash-command-routes.js";
 import { handleRoomButton, handleRecruitModal, handleRoomRenameModal, handleRoomVoiceUpdate } from "./commands/rooms.js";
 import { handleBumpMessage } from "./bump.js";
 import { handleBoostRewardMessage, initializeBoostRewardRecovery } from "./boost-reward.js";
@@ -235,87 +223,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // 賭場が停止していれば、チップを動かしうる操作はここで全部止める（理由付きで返す）
     if (await denyIfCasinoClosed(interaction, services)) return;
     if (interaction.isChatInputCommand()) {
-      switch (interaction.commandName) {
-        case "管理":
-          await handleAdminCommand(interaction, services);
-          return;
-        case "商館":
-          await handleShokanCommand(interaction, services);
-          return;
-        case "送金":
-          await handleTransfer(interaction, services);
-          return;
-        case "投げ銭":
-          await handleTip(interaction, services);
-          return;
-        case "イベント参加記録":
-          await handlePublicEventRecordCommand(interaction, services);
-          return;
-        case "イベント完了記録":
-          await handlePublicEventCompleteCommand(interaction, services);
-          return;
-        case "審判":
-          if (interaction.options.getSubcommand() === "昇格") await handlePromote(interaction, services);
-          else await handleSessionCommand(interaction, services);
-          return;
-        case "説明会":
-          await handleSessionScheduleCommand(interaction, services);
-          return;
-        case "評価":
-          await handleEvaluationCommand(interaction, services);
-          return;
-        case "プロフィール":
-          await handleProfile(interaction, services);
-          return;
-        case "部署":
-          await handleDepartment(interaction, services);
-          return;
-        case "ランキング":
-          await handleRankingCommand(interaction, services);
-          return;
-        case "あそびかた":
-          await handleHelpCommand(interaction, services);
-          return;
-        case "賭場":
-          await handleCasinoHomeCommand(interaction, services);
-          return;
-        case "遊ぶ":
-          await handleAsobuCommand(interaction, services);
-          return;
-        case "福分け":
-          await handleDailyCommand(interaction, services);
-          return;
-        case "通行証":
-          await handlePassportCommand(interaction, services);
-          return;
-        case "賭場番付":
-          await handleBanzukeCommand(interaction, services);
-          return;
-        case "勝負":
-          await handleShobuCommand(interaction, services);
-          return;
-        case "賭場商店":
-          await handleBakutenCommand(interaction, services);
-          return;
-        case "株":
-          await replyStocksPaused(interaction);
-          return;
-        case "競馬":
-          await handleKeibaCommand(interaction, services);
-          return;
-        case "案内":
-          await handleAnnaiCommand(interaction, services);
-          return;
-        case "vip":
-          await handleVipCommand(interaction, services);
-          return;
-        case "流れ星":
-          await handleNagareboshiCommand(interaction, services);
-          return;
-        case "板":
-          await handleItaCommand(interaction, services);
-          return;
-      }
+      const route = getActiveSlashCommandRoute(interaction.commandName)
+        ?? getLegacyCompatSlashCommandRoute(interaction.commandName);
+      if (route) await route(interaction, services);
       return;
     }
     if (interaction.isAutocomplete()) {

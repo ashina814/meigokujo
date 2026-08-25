@@ -14,6 +14,8 @@ import {
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { STOCKS_PAUSED, STOCKS_PAUSE_REASON, replyStocksPaused } from "../src/casino/stocks-pause.js";
+import { LEGACY_COMPAT_SLASH_ROUTES } from "../src/commands/legacy-compat-slash-command-routes.js";
+import { buildRegistrationPayload } from "../src/commands/slash-command-registration.js";
 
 registerDefaultTxTypes();
 
@@ -25,20 +27,14 @@ registerDefaultTxTypes();
  * 清算は PR12 の正式開業初期化まで行わない。
  */
 
-/**
- * `register-commands.ts` は読み込むと即 REST 登録に走るスクリプトなので、
- * import ではなくソースを読んで確認する。
- */
 const srcOf = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
 
 describe("コマンド登録から外れている", () => {
   it("/株 が登録リストに無い", () => {
-    const src = srcOf("../src/register-commands.ts");
-    expect(src).not.toContain("stocksCommand");
+    const names = buildRegistrationPayload().map(({ name }) => name);
+    expect(names).not.toContain("株");
     // 現行の賭場正本と、独立して残す入口は登録されている。
-    expect(src).toContain("casinoHomeCommand");
-    expect(src).toContain("passportCommand");
-    expect(src).toContain("itaCommand");
+    expect(names).toEqual(expect.arrayContaining(["賭場", "通行証", "板"]));
   });
 
   it("株の操作は全経路が停止案内へ向いている", () => {
@@ -49,7 +45,7 @@ describe("コマンド登録から外れている", () => {
     expect(src).not.toContain("handleStocksModal");
     expect(src).not.toContain("commands/stocks.js");
     expect(src).not.toContain("commands/stocks.ts");
-    expect(src).toContain("replyStocksPaused");
+    expect(LEGACY_COMPAT_SLASH_ROUTES.株).toBe(replyStocksPaused);
   });
 
   it("直接 services.stocks.buy/sell を呼ぶ旧UIファイルが存在しない（死んだ導入経路を残さない）", () => {
