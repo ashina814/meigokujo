@@ -2069,6 +2069,31 @@ SOURCE READYとなり、overallはREADY 69 / PARTIAL 6 / BLOCKED 16 / META 8。N
 canonical mapping不足、No.90/91はcastle manifest/cross-domain source不足でBLOCKEDを維持する。
 threshold/award/notification/backfillは追加しない。
 
+### F4a — Castle Experience Edition-I / Cross-Domain Safe Source
+
+Castle experienceはrole/department taxonomyではなく、通常利用領域のexplicit immutable taxonomyとする。
+Edition-I version 1はsocial=`public_vc`/`public_tc`/`public_room`、economy_play=`economy`/`shop`/`casino`、
+castle_wide=`public_event`の7 familyだけ。`TITLE_SOURCES`からdynamic生成せず、invite/role/rank/class/evaluationや
+将来sourceを自動加入させない。duplicate/conflicting family、unknown super-domain、invalid versionはmanifest全体を
+fail closedにする。
+
+`castle_experience_safe`は全adapterへ一度固定した`effectiveEnd = min(scope.end, observedAt)`を渡す。
+public VCはmain/public/human positive trusted social presence、TCはsame-surface human exchange、roomはnormal/gameの
+actual trusted use、economyはsubject-initiated peer transfer/tip、shopはeligible storefront purchase、casinoは
+completed core game・official table actual participation・other standard market participationのOR、eventはcompleted
+general participantだけを採用する。shop/casinoをeconomyへ、casinoの3入口を3 familyへ、staff/audit actorをeventへ
+重複・推測creditしない。
+
+public room visitor intervalはpublic_room、official casino tableのknown-human guest intervalはcasinoへ単一帰属し、
+同一channelでcanonical public-social VCと重なるexact overlapを引いた残りだけがpublic_vcになる。同時刻でも別channelの
+public VCは維持する。payloadはedition/version、family、JST day、public VCの日別trusted seconds、super-domain
+coverageだけで、identity、exact timestamp、amountを出さない。
+300-user chunkごとに9 bulk adapter invocationを行うため601 usersのreadCallsは27と定義し、user×family N+1は作らない。
+
+No.85-89をSOURCE READYへ更新し、overallはREADY 74 / PARTIAL 6 / BLOCKED 11 / META 8。No.90/91はeligible public
+role、assignedDomains manifest、role interval×activity temporal JOINが必要なF4b対象としてBLOCKEDを維持する。
+production threshold、BehaviorTitleDefinition、award、notification、completion/activationは追加しない。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

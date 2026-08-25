@@ -28,6 +28,7 @@ interface RoomInterval extends RoomSourceRow {
 
 interface ActivitySlice {
   roomId: number;
+  channelId: string;
   ownerId: string;
   visitorId: string;
   start: number;
@@ -52,6 +53,21 @@ export interface PublicRoomActivitySafeAggregate {
     readonly sessionCount: number;
     readonly days: ReadonlyArray<{ readonly date: string; readonly sessionsUsed: number }>;
   };
+}
+
+/**
+ * Castle composition向けrestricted companion。safe aggregateと同じclassifier passから、
+ * subject自身がvisitorだったexact intervalsだけを返す。channel identityはrestrictedな
+ * cross-source ownership JOINだけに使い、safe aggregateへは返さない。
+ */
+export interface PublicRoomActivityEvidence {
+  readonly userId: string;
+  readonly activity: Omit<PublicRoomActivitySafeAggregate, "userId">;
+  readonly visitorIntervals: ReadonlyArray<{
+    readonly channelId: string;
+    readonly start: number;
+    readonly end: number;
+  }>;
 }
 
 type MutableDay = { ids: Set<string>; sessions: Set<number> };
@@ -205,7 +221,13 @@ function activitySlices(db: Database.Database, window: TitleWindow, rooms: reado
       const end = Math.min(visit.endedAt, room.end);
       if (end <= start) continue;
       for (const part of subtractRanges(start, end, ambiguous.get(visit.channelId) ?? [])) {
-        slices.push({ roomId: room.id, ownerId: room.owner_id, visitorId: visit.userId, ...part });
+        slices.push({
+          roomId: room.id,
+          channelId: room.channel_id,
+          ownerId: room.owner_id,
+          visitorId: visit.userId,
+          ...part,
+        });
       }
     }
   }
@@ -323,15 +345,12 @@ function maxConcurrentGuestsByOwner(slices: readonly ActivitySlice[]): Map<strin
   return result;
 }
 
-/**
- * 公開normal/game部屋の実利用を、identityを含まない本人単位aggregateへ畳み込む。
- * ownerの在室やrooms.activated_atは前提にせず、trusted positive logical visitだけを使う。
- */
-export function computePublicRoomActivitySafe(
+/** safe aggregateとcastle overlap ownership用intervalを同じcanonical passから作る。 */
+export function computePublicRoomActivityEvidence(
   db: Database.Database,
   window: TitleWindow,
   userIds?: readonly string[],
-): PublicRoomActivitySafeAggregate[] {
+): PublicRoomActivityEvidence[] {
   if (userIds && userIds.length === 0) return [];
   if (!Number.isInteger(window.start) || !Number.isInteger(window.end) || window.start >= window.end) {
     throw new RangeError(`invalid title window: [${window.start}, ${window.end})`);
@@ -393,30 +412,60 @@ export function computePublicRoomActivitySafe(
         maximumDaySessionMatchingSize(state.repeatGuestDaySessions.get(guestId) ?? new Map()),
       );
     }
+    const rawVisitorIntervals = slices
+      .filter((slice) => slice.visitorId === userId)
+      .map((slice) => ({ channelId: slice.channelId, start: slice.start, end: slice.end }))
+      .sort((a, b) => a.channelId.localeCompare(b.channelId) || a.start - b.start || a.end - b.end);
+    const visitorIntervals: Array<{ channelId: string; start: number; end: number }> = [];
+    for (const interval of rawVisitorIntervals) {
+      const previous = visitorIntervals.at(-1);
+      if (previous && previous.channelId === interval.channelId && interval.start <= previous.end) {
+        previous.end = Math.max(previous.end, interval.end);
+      }
+      else visitorIntervals.push({ ...interval });
+    }
     return {
       userId,
-      hosted: {
-        distinctGuests: state.hostedGuests.size,
-        sessionCount: state.hostedSessions.size,
-        maxConcurrentGuests: concurrency.get(userId) ?? 0,
-        maxRepeatGuestDepth,
-        days: [...state.hostedDays]
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([date, day]) => ({ date, distinctGuests: day.ids.size, sessionsWithGuests: day.sessions.size })),
+      activity: {
+        hosted: {
+          distinctGuests: state.hostedGuests.size,
+          sessionCount: state.hostedSessions.size,
+          maxConcurrentGuests: concurrency.get(userId) ?? 0,
+          maxRepeatGuestDepth,
+          days: [...state.hostedDays]
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([date, day]) => ({ date, distinctGuests: day.ids.size, sessionsWithGuests: day.sessions.size })),
+        },
+        guest: {
+          distinctOwners: state.guestOwners.size,
+          sessionCount: state.guestSessions.size,
+          days: [...state.guestDays]
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([date, day]) => ({ date, distinctOwners: day.ids.size, sessionsVisited: day.sessions.size })),
+        },
+        ownUse: {
+          sessionCount: state.ownSessions.size,
+          days: [...state.ownDays]
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([date, sessions]) => ({ date, sessionsUsed: sessions.size })),
+        },
       },
-      guest: {
-        distinctOwners: state.guestOwners.size,
-        sessionCount: state.guestSessions.size,
-        days: [...state.guestDays]
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([date, day]) => ({ date, distinctOwners: day.ids.size, sessionsVisited: day.sessions.size })),
-      },
-      ownUse: {
-        sessionCount: state.ownSessions.size,
-        days: [...state.ownDays]
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([date, sessions]) => ({ date, sessionsUsed: sessions.size })),
-      },
+      visitorIntervals,
     };
   });
+}
+
+/**
+ * 公開normal/game部屋の実利用を、identityを含まない本人単位aggregateへ畳み込む。
+ * ownerの在室やrooms.activated_atは前提にせず、trusted positive logical visitだけを使う。
+ */
+export function computePublicRoomActivitySafe(
+  db: Database.Database,
+  window: TitleWindow,
+  userIds?: readonly string[],
+): PublicRoomActivitySafeAggregate[] {
+  return computePublicRoomActivityEvidence(db, window, userIds).map(({ userId, activity }) => ({
+    userId,
+    ...activity,
+  }));
 }

@@ -53,6 +53,11 @@ import {
   type SocialClassContextSafePayload,
   type SocialDepartmentFamilyContextSafePayload,
 } from "./v2-social-context.js";
+import {
+  CASTLE_EXPERIENCE_ADAPTER_READS_PER_CHUNK,
+  computeCastleExperienceSafe,
+  type CastleExperienceSafePayload,
+} from "./v2-castle-experience.js";
 
 /**
  * 称号ruleがraw DBを直接触らないようにするための、source読み込み境界。
@@ -202,6 +207,7 @@ export type ShopRolePurchaseSafeSourcePayload = ShopRolePurchaseSafePayload;
 export type TcConversationSafeSourcePayload = TcConversationSafePayload;
 export type TcReactionSafeSourcePayload = TcReactionSafePayload;
 export type SocialActivityTimeSafeSourcePayload = SocialActivityTimeSafePayload;
+export type CastleExperienceSafeSourcePayload = CastleExperienceSafePayload;
 
 export interface PublicRoomActivitySafeSourcePayload {
   readonly hosted: {
@@ -251,6 +257,7 @@ export interface TitleSourcePayloads {
   casino_table_activity_safe: CasinoTableActivitySafeSourcePayload;
   casino_market_activity_safe: CasinoMarketActivitySafeSourcePayload;
   public_room_activity_safe: PublicRoomActivitySafeSourcePayload;
+  castle_experience_safe: CastleExperienceSafeSourcePayload;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -902,6 +909,29 @@ const BULK_SOURCE_READERS: { [K in TitleUsableSourceKey]: BulkSourceReader<K> } 
     }
     return { payloads, readCalls };
   },
+  castle_experience_safe: (db, userIds, scope) => {
+    const empty = (): CastleExperienceSafeSourcePayload => ({
+      editionKey: "castle-experience-edition-i",
+      version: 1,
+      families: [],
+      coveredSuperDomains: [],
+    });
+    const payloads = new Map<string, CastleExperienceSafeSourcePayload>();
+    for (const userId of userIds) payloads.set(userId, empty());
+    if (userIds.length === 0) return { payloads, readCalls: 0 };
+    const effectiveEnd = resolvedScopeEffectiveEnd(scope);
+    if (effectiveEnd <= scope.start) return { payloads, readCalls: 0 };
+    let readCalls = 0;
+    for (const chunk of chunkUserIds(userIds)) {
+      readCalls += CASTLE_EXPERIENCE_ADAPTER_READS_PER_CHUNK;
+      for (const row of computeCastleExperienceSafe(
+        db,
+        { start: scope.start, end: effectiveEnd, observedAt: scope.observedAt },
+        chunk,
+      )) payloads.set(row.userId, row.payload);
+    }
+    return { payloads, readCalls };
+  },
 };
 
 /**
@@ -979,6 +1009,8 @@ const SOURCE_READERS: { [K in TitleUsableSourceKey]: SourceReader<K> } = {
     BULK_SOURCE_READERS.casino_table_activity_safe(db, [userId], scope).payloads.get(userId)!,
   casino_market_activity_safe: (db, userId, scope) =>
     BULK_SOURCE_READERS.casino_market_activity_safe(db, [userId], scope).payloads.get(userId)!,
+  castle_experience_safe: (db, userId, scope) =>
+    BULK_SOURCE_READERS.castle_experience_safe(db, [userId], scope).payloads.get(userId)!,
 };
 
 /**

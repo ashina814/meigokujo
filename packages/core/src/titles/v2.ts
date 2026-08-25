@@ -111,6 +111,7 @@ export {
   type PublicEventCompletedParticipationsSourcePayload,
   type PublicEventCalendarInvolvementSafeSourcePayload,
   type SocialActivityTimeSafeSourcePayload,
+  type CastleExperienceSafeSourcePayload,
   type CasinoActivityDaysSourcePayload,
   type CasinoCompletedActivityDaysSourcePayload,
   type CasinoEditionICompletionSafeSourcePayload,
@@ -126,6 +127,17 @@ export {
   type SocialClassContextSafeSourcePayload,
   type SocialDepartmentFamilyContextSafeSourcePayload,
 } from "./v2-sources.js";
+
+export {
+  CASTLE_EXPERIENCE_EDITION_I_MANIFEST,
+  CASTLE_EXPERIENCE_SUPER_DOMAINS,
+  castleExperienceManifestSemanticIdentity,
+  defineCastleExperienceManifest,
+  type CastleExperienceFamilyDefinition,
+  type CastleExperienceFamilyKey,
+  type CastleExperienceManifest,
+  type CastleExperienceSuperDomain,
+} from "./v2-castle-experience-manifest.js";
 
 // v2-economy.ts の computeSafeEconomyPeerActions()（PR E2の内部classifier正本）は
 // ここではexportしない——callerがraw transactions由来のfactを直接組み立てて
