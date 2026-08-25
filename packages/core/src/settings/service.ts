@@ -39,8 +39,7 @@ export const SETTING_DEFAULTS = {
   room_normal_max_capacity: 99, // 通常宿の最大定員（既存運用を壊さない広めの安全上限）
   // bump/up 報酬
   bump_reward: 0, // 金額は運営が設定パネルで決める（0 = 支給しない）
-  // マモンの賭場（エテル為替）
-  ether_rate_base: 10, // 準備プールが空のときの初期レート（1 Land = 何エテル）
+  // マモンの賭場
   ether_fuku_scale: 10, // 福の重み（勝ち分の累進奉納）しきい値のスケール
   // 福分け（デイリー）
   daily_base: 1_000,

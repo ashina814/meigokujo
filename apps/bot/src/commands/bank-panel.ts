@@ -52,7 +52,7 @@ import type { Services } from "../services.js";
  * ここは**その全 key に対する描画**だけを持つ。`Record<PanelKind, ...>` にしてあるので、
  * 表へ種別を足して描画を書き忘れると**型エラーになる**。
  */
-const PANEL_MESSAGES: Record<PanelKind, (services: Services, channelId: string) => MessageCreateOptions> = {
+export const PANEL_MESSAGES: Record<PanelKind, (services: Services, channelId: string) => MessageCreateOptions> = {
   casino: (s) => casinoPanelMessage(s),
   casino_games: (s) => casinoSoloPanelMessage(s),
   casino_pvp: (s) => casinoPvpPanelMessage(s),
