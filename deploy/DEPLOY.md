@@ -2,22 +2,11 @@
 
 冥獄城Botの本番反映は、`main`へマージ済みの変更だけを対象にします。
 
-## 初回設置
+## Initial provisioning
 
-PRをmainへマージした直後は、本番に`deploy/deploy.sh`がまだ存在しないため、最初の1回だけ手動でリポジトリを更新します。
+新しいVPSの初期構築は[`bootstrap.sh`](bootstrap.sh)を正本とします。必要package、`kabu` user、Node.js / pnpm、repository clone、`.env`雛形、systemd unit、backup scriptとcronを設置します。bootstrap後は表示される案内に従ってsecretを入力し、slash command登録と初回起動を人が行います。
 
-本番に未コミット差分がある場合は、先に内容を確認して正式反映または意図的な復元を行ってください。勝手な`reset --hard`やcheckoutによる破棄は禁止です。
-
-```bash
-cd /home/kabu/meigokujo
-sudo -u kabu git status --short
-sudo -u kabu git fetch origin
-sudo -u kabu git checkout main
-sudo -u kabu git pull --ff-only origin main
-bash -n deploy/deploy.sh deploy/backup.sh
-```
-
-その後、実行用wrapperを一度だけ設置します。
+通常deployで使うroot-owned wrapperは、初期構築時に一度だけ設置します。
 
 ```bash
 cat >/home/kabu/deploy.sh <<'EOF'
@@ -28,7 +17,7 @@ chmod 0755 /home/kabu/deploy.sh
 chown root:root /home/kabu/deploy.sh
 ```
 
-最初にdry-runで環境確認を行います。
+設置後はdry-runで環境確認を行います。
 
 ```bash
 /home/kabu/deploy.sh --dry-run
@@ -40,7 +29,16 @@ chown root:root /home/kabu/deploy.sh
 /home/kabu/deploy.sh
 ```
 
-以後の本番反映は、通常実行の一コマンドだけで行います。
+## Normal deploy
+
+初期構築済みの環境では、`main`へmerge済みの変更だけを次の順で反映します。
+
+```bash
+/home/kabu/deploy.sh --dry-run
+/home/kabu/deploy.sh
+```
+
+本番に未コミット差分がある場合は停止します。内容を確認して正式反映または意図的な復元を行い、勝手な`reset --hard`やcheckoutで破棄しないでください。
 
 ## 実行内容
 
@@ -101,7 +99,7 @@ Discord上の計器盤や変更箇所の実表示確認は、自動化せず最�
 正本は`deploy/backup.sh`です。本番実行用ファイルは次のコマンドで設置します。
 
 ```bash
-install -o root -g kabu -m 0750 \
+install -o kabu -g kabu -m 0750 \
   /home/kabu/meigokujo/deploy/backup.sh \
   /home/kabu/backup.sh
 ```
@@ -123,10 +121,11 @@ sudo -u kabu /home/kabu/backup.sh
 - バックアップとログを所有者のみ読み書きできる権限で作成
 - 失敗時に未完成ファイルを削除
 
-毎日04:00 JSTの自動実行は`/etc/cron.d/meigokujo-backup`で管理します。
+毎日04:00 JSTの自動実行は`/etc/cron.d/meigokujo-backup`で管理します。現行`bootstrap.sh`はtimezoneと出力先を含む次のentryを設置します。
 
 ```cron
-0 4 * * * kabu /home/kabu/backup.sh
+CRON_TZ=Asia/Tokyo
+0 4 * * * kabu /home/kabu/backup.sh >> /home/kabu/backups/backup.log 2>&1
 ```
 
-cronの標準出力・標準エラーを別途同じログへリダイレクトする必要はありません。スクリプト自身が`backup.log`へ記録します。
+backup script自身も`backup.log`へ記録します。cron entryはscript起動前に発生するshell-level errorも同じログへ残します。
