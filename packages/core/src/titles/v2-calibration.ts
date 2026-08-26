@@ -7,6 +7,22 @@ import {
   prefetchIntoTitleSourceCache,
   TitleSourceCache,
   type BumpEventsSourcePayload,
+  type CasinoActivityDaysSourcePayload,
+  type CasinoCompletedActivityDaysSourcePayload,
+  type CasinoEditionICompletionSafeSourcePayload,
+  type CasinoMarketActivitySafeSourcePayload,
+  type CasinoTableActivitySafeSourcePayload,
+  type CastleExperienceSafeSourcePayload,
+  type CastleRoleContextSafeSourcePayload,
+  type ConfirmedInvitesSourcePayload,
+  type EconomySafePeerActionsSourcePayload,
+  type EconomySemanticSafeSourcePayload,
+  type InviteRootedSafeSourcePayload,
+  type PublicEventCalendarInvolvementSafeSourcePayload,
+  type PublicEventCompletedParticipationsSourcePayload,
+  type PublicRoomActivitySafeSourcePayload,
+  type ShopPurchaseSafeSourcePayload,
+  type ShopRolePurchaseSafeSourcePayload,
   type SocialClassContextSafeSourcePayload,
   type SocialDepartmentFamilyContextSafeSourcePayload,
   type SocialActivityTimeSafeSourcePayload,
@@ -31,6 +47,10 @@ export const CALIBRATION_PERCENTILE_METHOD = "nearest-rank" as const;
 
 const VC_BUCKETS = ["solo", "oneToOne", "smallGroup", "largeGroup"] as const satisfies readonly OccupancyBucket[];
 const SOCIAL_BUCKETS = ["oneToOne", "smallGroup", "largeGroup"] as const satisfies readonly OccupancyBucket[];
+const ECONOMY_FAMILY_ORDER = ["peer_transfer", "tip", "shop"] as const;
+const CASINO_EDITION_I_FAMILY_ORDER = ["slots", "chohan", "crash", "chinchiro", "roulette", "blackjack", "poker", "holdem"] as const;
+const CASTLE_FAMILY_ORDER = ["public_vc", "public_tc", "public_room", "economy", "shop", "casino", "public_event"] as const;
+const CASTLE_ROLE_FAMILY_ORDER = CASTLE_FAMILY_ORDER.filter((family) => family !== "public_event");
 
 export type CalibrationProbeKey =
   | "vc-style-v1"
@@ -44,7 +64,25 @@ export type CalibrationProbeKey =
   | "bump-contribution-v1"
   | "tc-conversation-v1"
   | "tc-reaction-v1"
-  | "cross-modal-v1";
+  | "cross-modal-v1"
+  | "public-room-activity-v1"
+  | "public-room-social-time-v1"
+  | "economy-peer-actions-v1"
+  | "economy-semantic-v1"
+  | "shop-purchase-v1"
+  | "casino-completed-activity-v1"
+  | "casino-activity-v1"
+  | "casino-edition-completion-v1"
+  | "casino-table-activity-v1"
+  | "casino-table-participation-v1"
+  | "casino-market-activity-v1"
+  | "confirmed-invites-v1"
+  | "invite-rooted-v1"
+  | "public-event-completion-v1"
+  | "public-event-calendar-v1"
+  | "castle-experience-v1"
+  | "castle-social-time-v1"
+  | "castle-role-context-v1";
 
 export interface QuantileSummary {
   readonly sampleCount: number;
@@ -211,6 +249,62 @@ export type PlanningCalibrationJointEvidence =
       readonly kind: "cross-modal-days-v1";
       readonly tcDays: readonly { readonly dayOffset: number; readonly bestOtherGapMs: number }[];
       readonly vcDays: readonly { readonly dayOffset: number; readonly distinctCoPresentUsers: number }[];
+    }
+  | {
+      readonly kind: "domain-social-time-v1";
+      readonly domain: "public-room" | "castle";
+      readonly domainDays: readonly {
+        readonly dayOffset: number;
+        readonly semanticIndex: number;
+        readonly magnitude: number;
+      }[];
+      readonly socialHours: readonly {
+        readonly dayOffset: number;
+        readonly hour: number;
+        readonly tcBestOtherGapMs: number | null;
+        readonly vcTrustedSocialSeconds: number;
+      }[];
+    }
+  | {
+      readonly kind: "economy-actions-v1";
+      readonly actions: readonly {
+        readonly dayOffset: number;
+        readonly kind: "transfer" | "tip";
+      }[];
+    }
+  | {
+      readonly kind: "invite-rooted-v1";
+      readonly profiles: readonly {
+        readonly profileOrdinal: number;
+        readonly activityDays: readonly {
+          readonly dayOffset: number;
+          readonly tcBestOtherGapMs: number | null;
+          readonly vcTrustedSocialSeconds: number;
+        }[];
+        readonly nextGenerationOccurrences: readonly {
+          readonly occurrenceOrdinal: number;
+          readonly entryDayOffset: number;
+          readonly tcBestOtherGapMs: number | null;
+          readonly vcTrustedSocialSeconds: number;
+        }[];
+        readonly unknownNextGenerationEntryAnchorCount: number;
+        readonly reunionDays: readonly {
+          readonly dayOffset: number;
+          readonly tcBestPairGapMs: number | null;
+          readonly vcTrustedPairSeconds: number;
+        }[];
+      }[];
+      readonly unknownEntryAnchorCount: number;
+    }
+  | {
+      readonly kind: "castle-role-context-v1";
+      readonly families: readonly {
+        readonly semanticIndex: number;
+        readonly castleDayOffsets: readonly number[];
+        readonly roleHeldDays: readonly { readonly dayOffset: number; readonly trustedSeconds: number; readonly occurrenceCount: number }[];
+        readonly insideDays: readonly { readonly dayOffset: number; readonly trustedSeconds: number; readonly occurrenceCount: number }[];
+        readonly outsideDays: readonly { readonly dayOffset: number; readonly trustedSeconds: number; readonly occurrenceCount: number }[];
+      }[];
     };
 
 export interface PlanningCalibrationSubjectMeasurement {
@@ -811,6 +905,403 @@ function measureCrossModal(
   return { metrics, jointEvidence: { kind: "cross-modal-days-v1", tcDays, vcDays } };
 }
 
+function setDayRangeMetrics(
+  metrics: Map<string, number | null>,
+  prefix: string,
+  dayOffsets: readonly number[],
+): number[] {
+  const days = sortedDistinct(dayOffsets);
+  metrics.set(`${prefix}Days`, days.length);
+  metrics.set(`${prefix}FirstDayOffset`, days[0] ?? null);
+  metrics.set(`${prefix}LastDayOffset`, days.at(-1) ?? null);
+  metrics.set(`${prefix}SpanDays`, days.length === 0 ? null : days.at(-1)! - days[0]! + 1);
+  return days;
+}
+
+function socialHourEvidence(
+  payload: SocialActivityTimeSafeSourcePayload,
+  windowStart: number,
+): Array<{ dayOffset: number; hour: number; tcBestOtherGapMs: number | null; vcTrustedSocialSeconds: number }> {
+  return payload.days.flatMap((day) => day.hours.map((hour) => ({
+    dayOffset: dateDayOffset(day.date, windowStart),
+    hour: hour.hour,
+    tcBestOtherGapMs: hour.tcBestOtherGapMs,
+    vcTrustedSocialSeconds: hour.vcTrustedSocialSeconds,
+  }))).sort((a, b) => a.dayOffset - b.dayOffset || a.hour - b.hour);
+}
+
+function measurePublicRoomActivity(
+  payload: PublicRoomActivitySafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const hosted = payload.hosted.days.map(({ date }) => dateDayOffset(date, context.windowStart));
+  const guest = payload.guest.days.map(({ date }) => dateDayOffset(date, context.windowStart));
+  const ownUse = payload.ownUse.days.map(({ date }) => dateDayOffset(date, context.windowStart));
+  const metrics = new Map<string, number | null>([
+    ["hostedSessionCount", payload.hosted.sessionCount],
+    ["hostedDistinctGuests", payload.hosted.distinctGuests],
+    ["hostedMaxConcurrentGuests", payload.hosted.maxConcurrentGuests],
+    ["hostedMaxRepeatGuestDepth", payload.hosted.maxRepeatGuestDepth],
+    ["guestSessionCount", payload.guest.sessionCount],
+    ["guestDistinctOwners", payload.guest.distinctOwners],
+    ["ownUseSessionCount", payload.ownUse.sessionCount],
+    ["totalSessionCount", payload.hosted.sessionCount + payload.guest.sessionCount + payload.ownUse.sessionCount],
+  ]);
+  setDayRangeMetrics(metrics, "active", [...hosted, ...guest, ...ownUse]);
+  setDayRangeMetrics(metrics, "hostedActive", hosted);
+  setDayRangeMetrics(metrics, "guestActive", guest);
+  setDayRangeMetrics(metrics, "ownUseActive", ownUse);
+  setSampleMetrics(metrics, "hostedDailyDistinctGuests", payload.hosted.days.map(({ distinctGuests }) => distinctGuests));
+  setSampleMetrics(metrics, "hostedDailySessions", payload.hosted.days.map(({ sessionsWithGuests }) => sessionsWithGuests));
+  setSampleMetrics(metrics, "guestDailyDistinctOwners", payload.guest.days.map(({ distinctOwners }) => distinctOwners));
+  setSampleMetrics(metrics, "guestDailySessions", payload.guest.days.map(({ sessionsVisited }) => sessionsVisited));
+  setSampleMetrics(metrics, "ownUseDailySessions", payload.ownUse.days.map(({ sessionsUsed }) => sessionsUsed));
+  return { metrics };
+}
+
+function measureDomainSocialTime(
+  domain: "public-room" | "castle",
+  domainDays: readonly { readonly dayOffset: number; readonly semanticIndex: number; readonly magnitude: number }[],
+  social: SocialActivityTimeSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const socialHours = socialHourEvidence(social, context.windowStart);
+  const domainOffsets = sortedDistinct(domainDays.map(({ dayOffset }) => dayOffset));
+  const socialOffsets = sortedDistinct(socialHours
+    .filter(({ tcBestOtherGapMs, vcTrustedSocialSeconds }) => tcBestOtherGapMs !== null || vcTrustedSocialSeconds > 0)
+    .map(({ dayOffset }) => dayOffset));
+  const socialSet = new Set(socialOffsets);
+  const metrics = new Map<string, number | null>([
+    ["domainSemanticBreadth", new Set(domainDays.map(({ semanticIndex }) => semanticIndex)).size],
+    ["domainDayTouches", domainDays.length],
+    ["socialTcGapSampleCount", socialHours.filter(({ tcBestOtherGapMs }) => tcBestOtherGapMs !== null).length],
+    ["socialVcTrustedSeconds", socialHours.reduce((sum, row) => sum + row.vcTrustedSocialSeconds, 0)],
+    ["overlappingCalendarDays", domainOffsets.filter((day) => socialSet.has(day)).length],
+    ["unionCalendarDays", new Set([...domainOffsets, ...socialOffsets]).size],
+  ]);
+  setDayRangeMetrics(metrics, "domainActive", domainOffsets);
+  setDayRangeMetrics(metrics, "socialActive", socialOffsets);
+  return {
+    metrics,
+    jointEvidence: {
+      kind: "domain-social-time-v1",
+      domain,
+      domainDays: [...domainDays].sort((a, b) => a.dayOffset - b.dayOffset || a.semanticIndex - b.semanticIndex),
+      socialHours,
+    },
+  };
+}
+
+function measureEconomyPeerActions(
+  payload: EconomySafePeerActionsSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const actions = payload.facts.map(({ date, kind }) => ({ dayOffset: dateDayOffset(date, context.windowStart), kind }))
+    .sort((a, b) => a.dayOffset - b.dayOffset || a.kind.localeCompare(b.kind));
+  const transfers = actions.filter(({ kind }) => kind === "transfer");
+  const tips = actions.filter(({ kind }) => kind === "tip");
+  const metrics = new Map<string, number | null>([
+    ["peerActionCount", actions.length],
+    ["transferCount", transfers.length],
+    ["tipCount", tips.length],
+  ]);
+  setDayRangeMetrics(metrics, "peerActionActive", actions.map(({ dayOffset }) => dayOffset));
+  setDayRangeMetrics(metrics, "transferActive", transfers.map(({ dayOffset }) => dayOffset));
+  setDayRangeMetrics(metrics, "tipActive", tips.map(({ dayOffset }) => dayOffset));
+  return { metrics, jointEvidence: { kind: "economy-actions-v1", actions } };
+}
+
+function measureEconomySemantic(
+  payload: EconomySemanticSafeSourcePayload,
+  shopRole: ShopRolePurchaseSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const dayOffsets = payload.days.map(({ date }) => dateDayOffset(date, context.windowStart));
+  const tipOffsets = payload.outgoingTip.days.map(({ date }) => dateDayOffset(date, context.windowStart));
+  const shopRoleOffsets = shopRole.days.map(({ date }) => dateDayOffset(date, context.windowStart));
+  const metrics = new Map<string, number | null>([
+    ["distinctFamilies", payload.distinctFamilies],
+    ["distinctSubjectUsedFamilies", payload.distinctSubjectUsedFamilies],
+    ["distinctHumanCounterparts", payload.distinctHumanCounterparts],
+    ["hasNaturalInflow", payload.hasNaturalInflow ? 1 : 0],
+    ["hasNaturalOutflow", payload.hasNaturalOutflow ? 1 : 0],
+    ["outgoingTipDistinctRecipients", payload.outgoingTip.distinctRecipients],
+    ["shopRoleEligiblePurchaseCount", shopRole.days.reduce((sum, day) => sum + day.eligiblePurchaseCount, 0)],
+  ]);
+  setDayRangeMetrics(metrics, "economyActive", dayOffsets);
+  setDayRangeMetrics(metrics, "outgoingTipActive", tipOffsets);
+  setDayRangeMetrics(metrics, "shopRolePurchaseActive", shopRoleOffsets);
+  setSampleMetrics(metrics, "dailyDistinctHumanCounterparts", payload.days.map(({ distinctHumanCounterparts }) => distinctHumanCounterparts));
+  setSampleMetrics(metrics, "dailyOutgoingTipDistinctRecipients", payload.outgoingTip.days.map(({ distinctRecipients }) => distinctRecipients));
+  setSampleMetrics(metrics, "dailyShopRoleEligiblePurchases", shopRole.days.map(({ eligiblePurchaseCount }) => eligiblePurchaseCount));
+  for (const family of ECONOMY_FAMILY_ORDER) {
+    metrics.set(`familyObserved.${family}`, payload.days.some((day) => day.families.includes(family)) ? 1 : 0);
+    metrics.set(`familySubjectUsed.${family}`, payload.subjectUsedFamilies.includes(family) ? 1 : 0);
+  }
+  return { metrics };
+}
+
+function measureShopPurchases(
+  payload: ShopPurchaseSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const offsets = payload.days.map(({ date }) => dateDayOffset(date, context.windowStart));
+  const metrics = new Map<string, number | null>([
+    ["distinctEligibleProducts", payload.distinctEligibleProducts],
+    ["sumDailyDistinctEligibleProducts", payload.days.reduce((sum, day) => sum + day.distinctEligibleProducts, 0)],
+  ]);
+  setDayRangeMetrics(metrics, "purchaseActive", offsets);
+  setSampleMetrics(metrics, "dailyDistinctEligibleProducts", payload.days.map(({ distinctEligibleProducts }) => distinctEligibleProducts));
+  return { metrics };
+}
+
+function measureCasinoActivity(
+  payload: CasinoActivityDaysSourcePayload | CasinoCompletedActivityDaysSourcePayload,
+  context: { readonly windowStart: number },
+  prefix: "activity" | "completedActivity",
+): SubjectMeasurement {
+  const offsets = payload.activityDays.map(({ activityDate }) => dateDayOffset(activityDate, context.windowStart)).sort((a, b) => a - b);
+  const metrics = new Map<string, number | null>([
+    [`${prefix}Count`, payload.activityDays.length],
+    [`${prefix}DistinctFamilies`, new Set(payload.activityDays.map(({ activityKey }) => activityKey)).size],
+  ]);
+  setDayRangeMetrics(metrics, prefix, offsets);
+  return { metrics, jointEvidence: { kind: "day-occurrences-v1", dayOffsets: offsets } };
+}
+
+function measureCasinoEdition(
+  payload: CasinoEditionICompletionSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const offsets = payload.completedFamilies.flatMap(({ completionDays }) => completionDays.map((date) => dateDayOffset(date, context.windowStart)));
+  const metrics = new Map<string, number | null>([
+    ["distinctCompletedFamilies", payload.distinctCompletedFamilies],
+    ["allFamiliesCompleted", payload.allFamiliesCompleted ? 1 : 0],
+    ["totalFamilyCompletionDays", payload.completedFamilies.reduce((sum, family) => sum + family.completionDays.length, 0)],
+  ]);
+  setDayRangeMetrics(metrics, "completionActive", offsets);
+  const completedByFamily = new Map(payload.completedFamilies.map((family) => [family.familyKey, family.completionDays.length]));
+  for (const family of CASINO_EDITION_I_FAMILY_ORDER) metrics.set(`familyCompletionDays.${family}`, completedByFamily.get(family) ?? 0);
+  return { metrics };
+}
+
+function measureCasinoTableHosted(payload: CasinoTableActivitySafeSourcePayload): SubjectMeasurement {
+  const guestStays = payload.tables.flatMap(({ guestStays: stays }) => stays);
+  const perTableSeconds = payload.tables.map((table) => table.guestStays.reduce((sum, stay) => sum + stay.trustedSeconds, 0));
+  const perGuestSeconds = payload.guests.map((guest) => guest.stays.reduce((sum, stay) => sum + stay.trustedSeconds, 0));
+  const metrics = new Map<string, number | null>([
+    ["tableCount", payload.tables.length],
+    ["guestProfileCount", payload.guests.length],
+    ["guestStayRowCount", guestStays.length],
+    ["guestActiveDays", new Set(guestStays.map(({ date }) => date)).size],
+    ["totalTrustedGuestSeconds", guestStays.reduce((sum, stay) => sum + stay.trustedSeconds, 0)],
+  ]);
+  setSampleMetrics(metrics, "trustedSecondsPerTable", perTableSeconds);
+  setSampleMetrics(metrics, "trustedSecondsPerGuest", perGuestSeconds);
+  return { metrics };
+}
+
+function measureCasinoTableParticipation(
+  payload: CasinoTableActivitySafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const stays = payload.guests.flatMap(({ stays: rows }) => rows);
+  const offsets = stays.map(({ date }) => dateDayOffset(date, context.windowStart));
+  const byDay = new Map<number, number>();
+  for (const stay of stays) byDay.set(dateDayOffset(stay.date, context.windowStart), (byDay.get(dateDayOffset(stay.date, context.windowStart)) ?? 0) + stay.trustedSeconds);
+  const metrics = new Map<string, number | null>([
+    ["guestProfileCount", payload.guests.length],
+    ["stayRowCount", stays.length],
+    ["distinctTableProfilesVisited", new Set(stays.map(({ tableProfileIndex }) => tableProfileIndex)).size],
+    ["totalTrustedSeconds", stays.reduce((sum, stay) => sum + stay.trustedSeconds, 0)],
+  ]);
+  setDayRangeMetrics(metrics, "participationActive", offsets);
+  setSampleMetrics(metrics, "dailyTrustedSeconds", [...byDay.values()]);
+  setSampleMetrics(metrics, "trustedSecondsPerGuestProfile", payload.guests.map((guest) => guest.stays.reduce((sum, stay) => sum + stay.trustedSeconds, 0)));
+  return { metrics };
+}
+
+function measureCasinoMarket(
+  payload: CasinoMarketActivitySafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const offsets = payload.days.map(({ date }) => dateDayOffset(date, context.windowStart));
+  const metrics = new Map<string, number | null>([
+    ["distinctOtherStandardBoards", payload.distinctOtherStandardBoards],
+    ["sumDailyDistinctOtherStandardBoards", payload.days.reduce((sum, day) => sum + day.distinctOtherStandardBoards, 0)],
+  ]);
+  setDayRangeMetrics(metrics, "marketActive", offsets);
+  setSampleMetrics(metrics, "dailyDistinctOtherStandardBoards", payload.days.map(({ distinctOtherStandardBoards }) => distinctOtherStandardBoards));
+  return { metrics };
+}
+
+function measureConfirmedInvites(
+  payload: ConfirmedInvitesSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const offsets = payload.creditedAt.map((at) => timestampDayOffset(at, context.windowStart)).sort((a, b) => a - b);
+  const metrics = new Map<string, number | null>([["confirmedInviteCount", payload.creditedAt.length]]);
+  setDayRangeMetrics(metrics, "confirmationActive", offsets);
+  return { metrics, jointEvidence: { kind: "day-occurrences-v1", dayOffsets: offsets } };
+}
+
+function measureInviteRooted(payload: InviteRootedSafeSourcePayload): SubjectMeasurement {
+  const profiles = payload.profiles.map((profile, profileOrdinal) => ({
+    profileOrdinal,
+    activityDays: profile.activityDays.map((day) => ({ ...day })),
+    nextGenerationOccurrences: profile.nextGenerationOccurrences.map((occurrence, occurrenceOrdinal) => ({
+      occurrenceOrdinal,
+      entryDayOffset: occurrence.entryDayOffset,
+      tcBestOtherGapMs: occurrence.sameDayBeforeEntry.tcBestOtherGapMs,
+      vcTrustedSocialSeconds: occurrence.sameDayBeforeEntry.vcTrustedSocialSeconds,
+    })),
+    unknownNextGenerationEntryAnchorCount: profile.unknownNextGenerationEntryAnchorCount,
+    reunionDays: profile.reunionDays.map((day) => ({ ...day })),
+  }));
+  const activityDays = profiles.flatMap(({ activityDays: days }) => days);
+  const occurrences = profiles.flatMap(({ nextGenerationOccurrences }) => nextGenerationOccurrences);
+  const reunionDays = profiles.flatMap(({ reunionDays: days }) => days);
+  const metrics = new Map<string, number | null>([
+    ["directBranchProfileCount", profiles.length],
+    ["branchActivityDayCount", activityDays.length],
+    ["branchActivityVcTrustedSocialSeconds", activityDays.reduce((sum, day) => sum + day.vcTrustedSocialSeconds, 0)],
+    ["branchActivityTcGapSampleCount", activityDays.filter(({ tcBestOtherGapMs }) => tcBestOtherGapMs !== null).length],
+    ["nextGenerationOccurrenceCount", occurrences.length],
+    ["nextGenerationSameDayVcTrustedSocialSeconds", occurrences.reduce((sum, occurrence) => sum + occurrence.vcTrustedSocialSeconds, 0)],
+    ["nextGenerationSameDayTcGapSampleCount", occurrences.filter(({ tcBestOtherGapMs }) => tcBestOtherGapMs !== null).length],
+    ["unknownEntryAnchorCount", payload.unknownEntryAnchorCount],
+    ["unknownNextGenerationEntryAnchorCount", profiles.reduce((sum, profile) => sum + profile.unknownNextGenerationEntryAnchorCount, 0)],
+    ["reunionDayCount", reunionDays.length],
+    ["reunionVcTrustedPairSeconds", reunionDays.reduce((sum, day) => sum + day.vcTrustedPairSeconds, 0)],
+    ["reunionTcGapSampleCount", reunionDays.filter(({ tcBestPairGapMs }) => tcBestPairGapMs !== null).length],
+  ]);
+  setSampleMetrics(metrics, "activityDaysPerBranch", profiles.map(({ activityDays: days }) => days.length));
+  setSampleMetrics(metrics, "nextGenerationOccurrencesPerBranch", profiles.map(({ nextGenerationOccurrences }) => nextGenerationOccurrences.length));
+  setSampleMetrics(metrics, "reunionDaysPerBranch", profiles.map(({ reunionDays: days }) => days.length));
+  return { metrics, jointEvidence: { kind: "invite-rooted-v1", profiles, unknownEntryAnchorCount: payload.unknownEntryAnchorCount } };
+}
+
+function measurePublicEventCompletion(
+  payload: PublicEventCompletedParticipationsSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const offsets = payload.participations.map(({ completedAt }) => timestampDayOffset(completedAt, context.windowStart)).sort((a, b) => a - b);
+  const metrics = new Map<string, number | null>([["completedParticipationCount", payload.participations.length]]);
+  setDayRangeMetrics(metrics, "completionActive", offsets);
+  return { metrics, jointEvidence: { kind: "day-occurrences-v1", dayOffsets: offsets } };
+}
+
+function measurePublicEventCalendar(
+  completed: PublicEventCompletedParticipationsSourcePayload,
+  calendar: PublicEventCalendarInvolvementSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const offsets = calendar.events.map(({ eventDate }) => dateDayOffset(eventDate, context.windowStart));
+  const metrics = new Map<string, number | null>([
+    ["completedDistinctEventCount", completed.participations.length],
+    ["totalEventInvolvementCount", calendar.events.length],
+    ["generalParticipantCount", calendar.events.filter(({ generalParticipant }) => generalParticipant).length],
+    ["staffCount", calendar.events.filter(({ staff }) => staff).length],
+    ["organizerCount", calendar.events.filter(({ organizer }) => organizer).length],
+    ["primaryOrganizerCount", calendar.events.filter(({ primaryOrganizer }) => primaryOrganizer).length],
+    ["participantOnlyCount", calendar.events.filter((event) => event.generalParticipant && !event.staff && !event.organizer && !event.primaryOrganizer).length],
+    ["multiRoleInvolvementCount", calendar.events.filter((event) => [event.generalParticipant, event.staff, event.organizer].filter(Boolean).length > 1).length],
+  ]);
+  setDayRangeMetrics(metrics, "event", offsets);
+  return { metrics };
+}
+
+function castleFamilyDayRows(payload: CastleExperienceSafeSourcePayload, windowStart: number) {
+  return payload.families.flatMap((family) => family.days.map((date) => ({
+    dayOffset: dateDayOffset(date, windowStart), semanticIndex: CASTLE_FAMILY_ORDER.indexOf(family.familyKey), magnitude: 1,
+  })));
+}
+
+function measureCastleExperience(
+  payload: CastleExperienceSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const rows = castleFamilyDayRows(payload, context.windowStart);
+  const offsets = rows.map(({ dayOffset }) => dayOffset);
+  const familiesPerDay = new Map<number, Set<number>>();
+  for (const row of rows) {
+    const families = familiesPerDay.get(row.dayOffset) ?? new Set<number>();
+    families.add(row.semanticIndex);
+    familiesPerDay.set(row.dayOffset, families);
+  }
+  const vcDaily = payload.families.find(({ familyKey }) => familyKey === "public_vc")?.dailyTrustedSeconds ?? [];
+  const metrics = new Map<string, number | null>([
+    ["activeFamilyCount", payload.families.length],
+    ["coveredSuperDomainCount", payload.coveredSuperDomains.length],
+    ["sumFamilyActiveDays", rows.length],
+    ["multiFamilyActiveDays", [...familiesPerDay.values()].filter((families) => families.size > 1).length],
+    ["publicVcTrustedSeconds", vcDaily.reduce((sum, day) => sum + day.trustedSeconds, 0)],
+  ]);
+  setDayRangeMetrics(metrics, "castleActive", offsets);
+  setSampleMetrics(metrics, "familiesPerActiveDay", [...familiesPerDay.values()].map((families) => families.size));
+  setSampleMetrics(metrics, "publicVcDailyTrustedSeconds", vcDaily.map(({ trustedSeconds }) => trustedSeconds));
+  const familyActiveDays = new Map(payload.families.map((family) => [family.familyKey, family.days.length]));
+  for (const family of CASTLE_FAMILY_ORDER) metrics.set(`familyActiveDays.${family}`, familyActiveDays.get(family) ?? 0);
+  return { metrics };
+}
+
+function measureCastleRoleContext(
+  castle: CastleExperienceSafeSourcePayload,
+  role: CastleRoleContextSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const familyKeys = CASTLE_ROLE_FAMILY_ORDER;
+  const byKey = <T extends { readonly familyKey: string }>(rows: readonly T[]) => new Map(rows.map((row) => [row.familyKey, row]));
+  const castleByKey = byKey(castle.families);
+  const heldByKey = byKey(role.roleHeldFamilies);
+  const insideByKey = byKey(role.insideFamilies);
+  const outsideByKey = byKey(role.outsideFamilies);
+  const convertDays = (days: readonly { date: string; trustedSeconds: number; occurrenceCount: number }[]) => days.map((day) => ({
+    dayOffset: dateDayOffset(day.date, context.windowStart), trustedSeconds: day.trustedSeconds, occurrenceCount: day.occurrenceCount,
+  }));
+  const families = familyKeys.map((familyKey, semanticIndex) => ({
+    semanticIndex,
+    castleDayOffsets: (castleByKey.get(familyKey)?.days ?? []).map((date) => dateDayOffset(date, context.windowStart)),
+    roleHeldDays: convertDays(heldByKey.get(familyKey)?.days ?? []),
+    insideDays: convertDays(insideByKey.get(familyKey)?.days ?? []),
+    outsideDays: convertDays(outsideByKey.get(familyKey)?.days ?? []),
+  }));
+  const insideDays = role.insideFamilies.flatMap(({ days }) => days);
+  const outsideDays = role.outsideFamilies.flatMap(({ days }) => days);
+  const insideSeconds = insideDays.reduce((sum, day) => sum + day.trustedSeconds, 0);
+  const outsideSeconds = outsideDays.reduce((sum, day) => sum + day.trustedSeconds, 0);
+  const insideOccurrences = insideDays.reduce((sum, day) => sum + day.occurrenceCount, 0);
+  const outsideOccurrences = outsideDays.reduce((sum, day) => sum + day.occurrenceCount, 0);
+  const metrics = new Map<string, number | null>([
+    ["castleActiveFamilyCount", castle.families.length],
+    ["roleHeldFamilyCount", role.roleHeldFamilies.length],
+    ["insideActiveFamilyCount", role.insideFamilies.length],
+    ["outsideActiveFamilyCount", role.outsideFamilies.length],
+    ["insideDayUnion", new Set(insideDays.map(({ date }) => date)).size],
+    ["outsideDayUnion", new Set(outsideDays.map(({ date }) => date)).size],
+    ["outsideDaysCount", role.outsideDays.length],
+    ["insideTrustedSeconds", insideSeconds],
+    ["outsideTrustedSeconds", outsideSeconds],
+    ["totalClassifiedTrustedSeconds", insideSeconds + outsideSeconds],
+    ["insideOccurrenceCount", insideOccurrences],
+    ["outsideOccurrenceCount", outsideOccurrences],
+    ["totalOccurrenceCount", insideOccurrences + outsideOccurrences],
+    ["outsideSecondsRatio", ratio(outsideSeconds, insideSeconds + outsideSeconds)],
+    ["outsideOccurrenceRatio", ratio(outsideOccurrences, insideOccurrences + outsideOccurrences)],
+  ]);
+  for (const familyKey of familyKeys) {
+    const inside = insideByKey.get(familyKey)?.days ?? [];
+    const outside = outsideByKey.get(familyKey)?.days ?? [];
+    metrics.set(`insideDays.${familyKey}`, inside.length);
+    metrics.set(`outsideDays.${familyKey}`, outside.length);
+    metrics.set(`insideTrustedSeconds.${familyKey}`, inside.reduce((sum, day) => sum + day.trustedSeconds, 0));
+    metrics.set(`outsideTrustedSeconds.${familyKey}`, outside.reduce((sum, day) => sum + day.trustedSeconds, 0));
+    metrics.set(`insideOccurrences.${familyKey}`, inside.reduce((sum, day) => sum + day.occurrenceCount, 0));
+    metrics.set(`outsideOccurrences.${familyKey}`, outside.reduce((sum, day) => sum + day.occurrenceCount, 0));
+  }
+  return { metrics, jointEvidence: { kind: "castle-role-context-v1", families } };
+}
+
 const VC_COVERAGE_LIMITATIONS = Object.freeze([
   "The VC source omits unknown/untrusted intervals; zero cannot distinguish observed inactivity from absent coverage.",
   "Choose a window after source rollout; no historical inference or backfill is performed.",
@@ -920,6 +1411,212 @@ const CROSS_MODAL_PROBE: CalibrationProbe<readonly ["tc_conversation_safe", "vc_
   measure: (payloads, context) => measureCrossModal(payloads.tc_conversation_safe, payloads.vc_social_safe, context),
 };
 
+const DOMAIN_COVERAGE_LIMITATIONS = Object.freeze([
+  "Safe sources omit unknown/untrusted intervals and pre-rollout history; zero cannot prove complete observed inactivity.",
+  "No historical inference or backfill is performed; choose a window after every source used by the pack was deployed.",
+]);
+const ROLE_COVERAGE_LIMITATIONS = Object.freeze([
+  ...DOMAIN_COVERAGE_LIMITATIONS,
+  "Unknown role-history coverage is not inferred from current roles or current departments.",
+]);
+const EVENT_COVERAGE_LIMITATIONS = Object.freeze([
+  ...DOMAIN_COVERAGE_LIMITATIONS,
+  "Legacy events without canonical role provenance remain participant-only; staff or organizer roles are never inferred.",
+]);
+
+const EMPTY_PUBLIC_ROOM = Object.freeze({
+  hosted: Object.freeze({ distinctGuests: 0, sessionCount: 0, maxConcurrentGuests: 0, maxRepeatGuestDepth: 0, days: [] }),
+  guest: Object.freeze({ distinctOwners: 0, sessionCount: 0, days: [] }),
+  ownUse: Object.freeze({ sessionCount: 0, days: [] }),
+});
+const EMPTY_SOCIAL_TIME = Object.freeze({ days: [] });
+const PUBLIC_ROOM_ACTIVITY_PROBE: CalibrationProbe<readonly ["public_room_activity_safe"]> = {
+  candidateNos: Object.freeze([50, 51, 52, 53, 54, 55]),
+  probeKey: "public-room-activity-v1",
+  sources: ["public_room_activity_safe"],
+  emptyPayloads: Object.freeze({ public_room_activity_safe: EMPTY_PUBLIC_ROOM }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measurePublicRoomActivity(payloads.public_room_activity_safe, context),
+};
+const PUBLIC_ROOM_SOCIAL_TIME_PROBE: CalibrationProbe<readonly ["public_room_activity_safe", "social_activity_time_safe"]> = {
+  candidateNos: Object.freeze([56]),
+  probeKey: "public-room-social-time-v1",
+  sources: ["public_room_activity_safe", "social_activity_time_safe"],
+  emptyPayloads: Object.freeze({ public_room_activity_safe: EMPTY_PUBLIC_ROOM, social_activity_time_safe: EMPTY_SOCIAL_TIME }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureDomainSocialTime(
+    "public-room",
+    [
+      ...payloads.public_room_activity_safe.hosted.days.map((day) => ({ dayOffset: dateDayOffset(day.date, context.windowStart), semanticIndex: 0, magnitude: day.sessionsWithGuests })),
+      ...payloads.public_room_activity_safe.guest.days.map((day) => ({ dayOffset: dateDayOffset(day.date, context.windowStart), semanticIndex: 1, magnitude: day.sessionsVisited })),
+      ...payloads.public_room_activity_safe.ownUse.days.map((day) => ({ dayOffset: dateDayOffset(day.date, context.windowStart), semanticIndex: 2, magnitude: day.sessionsUsed })),
+    ],
+    payloads.social_activity_time_safe,
+    context,
+  ),
+};
+
+const ECONOMY_PEER_ACTIONS_PROBE: CalibrationProbe<readonly ["economy_safe_peer_actions"]> = {
+  candidateNos: Object.freeze([58]),
+  probeKey: "economy-peer-actions-v1",
+  sources: ["economy_safe_peer_actions"],
+  emptyPayloads: Object.freeze({ economy_safe_peer_actions: Object.freeze({ facts: [] }) }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureEconomyPeerActions(payloads.economy_safe_peer_actions, context),
+};
+const EMPTY_ECONOMY_SEMANTIC = Object.freeze({
+  days: [], distinctFamilies: 0, subjectUsedFamilies: [], distinctSubjectUsedFamilies: 0,
+  distinctHumanCounterparts: 0, hasNaturalInflow: false, hasNaturalOutflow: false,
+  outgoingTip: Object.freeze({ days: [], distinctRecipients: 0 }),
+});
+const ECONOMY_SEMANTIC_PROBE: CalibrationProbe<readonly ["economy_semantic_safe", "shop_role_purchase_safe"]> = {
+  candidateNos: Object.freeze([59, 61, 63, 65]),
+  probeKey: "economy-semantic-v1",
+  sources: ["economy_semantic_safe", "shop_role_purchase_safe"],
+  emptyPayloads: Object.freeze({
+    economy_semantic_safe: EMPTY_ECONOMY_SEMANTIC,
+    shop_role_purchase_safe: Object.freeze({ days: [] }),
+  }),
+  coverageLimitations: ROLE_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureEconomySemantic(payloads.economy_semantic_safe, payloads.shop_role_purchase_safe, context),
+};
+const SHOP_PURCHASE_PROBE: CalibrationProbe<readonly ["shop_purchase_safe"]> = {
+  candidateNos: Object.freeze([62]),
+  probeKey: "shop-purchase-v1",
+  sources: ["shop_purchase_safe"],
+  emptyPayloads: Object.freeze({ shop_purchase_safe: Object.freeze({ days: [], distinctEligibleProducts: 0 }) }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureShopPurchases(payloads.shop_purchase_safe, context),
+};
+
+const CASINO_COMPLETED_ACTIVITY_PROBE: CalibrationProbe<readonly ["casino_completed_activity_days"]> = {
+  candidateNos: Object.freeze([66, 67]),
+  probeKey: "casino-completed-activity-v1",
+  sources: ["casino_completed_activity_days"],
+  emptyPayloads: Object.freeze({ casino_completed_activity_days: Object.freeze({ activityDays: [] }) }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureCasinoActivity(payloads.casino_completed_activity_days, context, "completedActivity"),
+};
+const CASINO_ACTIVITY_PROBE: CalibrationProbe<readonly ["casino_activity_days"]> = {
+  candidateNos: Object.freeze([68]),
+  probeKey: "casino-activity-v1",
+  sources: ["casino_activity_days"],
+  emptyPayloads: Object.freeze({ casino_activity_days: Object.freeze({ activityDays: [] }) }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureCasinoActivity(payloads.casino_activity_days, context, "activity"),
+};
+const CASINO_EDITION_COMPLETION_PROBE: CalibrationProbe<readonly ["casino_edition_i_completion_safe"]> = {
+  candidateNos: Object.freeze([69]),
+  probeKey: "casino-edition-completion-v1",
+  sources: ["casino_edition_i_completion_safe"],
+  emptyPayloads: Object.freeze({
+    casino_edition_i_completion_safe: Object.freeze({ editionKey: "casino-edition-i", version: 1, completedFamilies: [], distinctCompletedFamilies: 0, allFamiliesCompleted: false }),
+  }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureCasinoEdition(payloads.casino_edition_i_completion_safe, context),
+};
+const EMPTY_CASINO_TABLE = Object.freeze({ tables: [], guests: [] });
+const CASINO_TABLE_ACTIVITY_PROBE: CalibrationProbe<readonly ["casino_table_activity_safe"]> = {
+  candidateNos: Object.freeze([70]),
+  probeKey: "casino-table-activity-v1",
+  sources: ["casino_table_activity_safe"],
+  emptyPayloads: Object.freeze({ casino_table_activity_safe: EMPTY_CASINO_TABLE }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads) => measureCasinoTableHosted(payloads.casino_table_activity_safe),
+};
+const CASINO_TABLE_PARTICIPATION_PROBE: CalibrationProbe<readonly ["casino_table_activity_safe"]> = {
+  candidateNos: Object.freeze([71]),
+  probeKey: "casino-table-participation-v1",
+  sources: ["casino_table_activity_safe"],
+  emptyPayloads: Object.freeze({ casino_table_activity_safe: EMPTY_CASINO_TABLE }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureCasinoTableParticipation(payloads.casino_table_activity_safe, context),
+};
+const CASINO_MARKET_ACTIVITY_PROBE: CalibrationProbe<readonly ["casino_market_activity_safe"]> = {
+  candidateNos: Object.freeze([72]),
+  probeKey: "casino-market-activity-v1",
+  sources: ["casino_market_activity_safe"],
+  emptyPayloads: Object.freeze({ casino_market_activity_safe: Object.freeze({ days: [], distinctOtherStandardBoards: 0 }) }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureCasinoMarket(payloads.casino_market_activity_safe, context),
+};
+
+const CONFIRMED_INVITES_PROBE: CalibrationProbe<readonly ["confirmed_invites"]> = {
+  candidateNos: Object.freeze([74, 75]),
+  probeKey: "confirmed-invites-v1",
+  sources: ["confirmed_invites"],
+  emptyPayloads: Object.freeze({ confirmed_invites: Object.freeze({ creditedAt: [] }) }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureConfirmedInvites(payloads.confirmed_invites, context),
+};
+const INVITE_ROOTED_PROBE: CalibrationProbe<readonly ["invite_rooted_safe"]> = {
+  candidateNos: Object.freeze([76, 77, 78, 79]),
+  probeKey: "invite-rooted-v1",
+  sources: ["invite_rooted_safe"],
+  emptyPayloads: Object.freeze({ invite_rooted_safe: Object.freeze({ profiles: [], unknownEntryAnchorCount: 0 }) }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads) => measureInviteRooted(payloads.invite_rooted_safe),
+};
+
+const PUBLIC_EVENT_COMPLETION_PROBE: CalibrationProbe<readonly ["public_event_completed_participations"]> = {
+  candidateNos: Object.freeze([80]),
+  probeKey: "public-event-completion-v1",
+  sources: ["public_event_completed_participations"],
+  emptyPayloads: Object.freeze({ public_event_completed_participations: Object.freeze({ participations: [] }) }),
+  coverageLimitations: EVENT_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measurePublicEventCompletion(payloads.public_event_completed_participations, context),
+};
+const PUBLIC_EVENT_CALENDAR_PROBE: CalibrationProbe<readonly ["public_event_completed_participations", "public_event_calendar_involvement_safe"]> = {
+  candidateNos: Object.freeze([81, 82, 83, 84]),
+  probeKey: "public-event-calendar-v1",
+  sources: ["public_event_completed_participations", "public_event_calendar_involvement_safe"],
+  emptyPayloads: Object.freeze({
+    public_event_completed_participations: Object.freeze({ participations: [] }),
+    public_event_calendar_involvement_safe: Object.freeze({ events: [] }),
+  }),
+  coverageLimitations: EVENT_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measurePublicEventCalendar(
+    payloads.public_event_completed_participations,
+    payloads.public_event_calendar_involvement_safe,
+    context,
+  ),
+};
+
+const EMPTY_CASTLE_EXPERIENCE = Object.freeze({ editionKey: "castle-experience-edition-i", version: 1, families: [], coveredSuperDomains: [] });
+const CASTLE_EXPERIENCE_PROBE: CalibrationProbe<readonly ["castle_experience_safe"]> = {
+  candidateNos: Object.freeze([85, 86, 89]),
+  probeKey: "castle-experience-v1",
+  sources: ["castle_experience_safe"],
+  emptyPayloads: Object.freeze({ castle_experience_safe: EMPTY_CASTLE_EXPERIENCE }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureCastleExperience(payloads.castle_experience_safe, context),
+};
+const CASTLE_SOCIAL_TIME_PROBE: CalibrationProbe<readonly ["castle_experience_safe", "social_activity_time_safe"]> = {
+  candidateNos: Object.freeze([87, 88]),
+  probeKey: "castle-social-time-v1",
+  sources: ["castle_experience_safe", "social_activity_time_safe"],
+  emptyPayloads: Object.freeze({ castle_experience_safe: EMPTY_CASTLE_EXPERIENCE, social_activity_time_safe: EMPTY_SOCIAL_TIME }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureDomainSocialTime(
+    "castle",
+    castleFamilyDayRows(payloads.castle_experience_safe, context.windowStart),
+    payloads.social_activity_time_safe,
+    context,
+  ),
+};
+const EMPTY_CASTLE_ROLE_CONTEXT = Object.freeze({
+  editionKey: "castle-role-domain-edition-i", version: 1,
+  insideFamilies: [], outsideFamilies: [], roleHeldFamilies: [], outsideDays: [],
+});
+const CASTLE_ROLE_CONTEXT_PROBE: CalibrationProbe<readonly ["castle_experience_safe", "castle_role_context_safe"]> = {
+  candidateNos: Object.freeze([90, 91]),
+  probeKey: "castle-role-context-v1",
+  sources: ["castle_experience_safe", "castle_role_context_safe"],
+  emptyPayloads: Object.freeze({ castle_experience_safe: EMPTY_CASTLE_EXPERIENCE, castle_role_context_safe: EMPTY_CASTLE_ROLE_CONTEXT }),
+  coverageLimitations: ROLE_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureCastleRoleContext(payloads.castle_experience_safe, payloads.castle_role_context_safe, context),
+};
+
 export const F5A_CALIBRATION_PROBES = Object.freeze([runtimeProbe(VC_STYLE_PROBE), runtimeProbe(ACTIVITY_TIME_PROBE)]);
 export const F5B1_CALIBRATION_PROBES = Object.freeze([
   runtimeProbe(VC_IGNITE_PROBE),
@@ -932,6 +1629,26 @@ export const F5B1_CALIBRATION_PROBES = Object.freeze([
   runtimeProbe(TC_CONVERSATION_PROBE),
   runtimeProbe(TC_REACTION_PROBE),
   runtimeProbe(CROSS_MODAL_PROBE),
+]);
+export const F5B2_CALIBRATION_PROBES = Object.freeze([
+  runtimeProbe(PUBLIC_ROOM_ACTIVITY_PROBE),
+  runtimeProbe(PUBLIC_ROOM_SOCIAL_TIME_PROBE),
+  runtimeProbe(ECONOMY_PEER_ACTIONS_PROBE),
+  runtimeProbe(ECONOMY_SEMANTIC_PROBE),
+  runtimeProbe(SHOP_PURCHASE_PROBE),
+  runtimeProbe(CASINO_COMPLETED_ACTIVITY_PROBE),
+  runtimeProbe(CASINO_ACTIVITY_PROBE),
+  runtimeProbe(CASINO_EDITION_COMPLETION_PROBE),
+  runtimeProbe(CASINO_TABLE_ACTIVITY_PROBE),
+  runtimeProbe(CASINO_TABLE_PARTICIPATION_PROBE),
+  runtimeProbe(CASINO_MARKET_ACTIVITY_PROBE),
+  runtimeProbe(CONFIRMED_INVITES_PROBE),
+  runtimeProbe(INVITE_ROOTED_PROBE),
+  runtimeProbe(PUBLIC_EVENT_COMPLETION_PROBE),
+  runtimeProbe(PUBLIC_EVENT_CALENDAR_PROBE),
+  runtimeProbe(CASTLE_EXPERIENCE_PROBE),
+  runtimeProbe(CASTLE_SOCIAL_TIME_PROBE),
+  runtimeProbe(CASTLE_ROLE_CONTEXT_PROBE),
 ]);
 
 export function canonicalReadinessHash(readiness: readonly CandidateReadinessAudit[]): string {
@@ -1043,6 +1760,21 @@ export function collectF5b1CalibrationMeasurements(
   input: F5aCalibrationInput,
 ): PlanningCalibrationMeasurementCollection {
   return collectCalibrationMeasurements(db, input, F5B1_CALIBRATION_PROBES);
+}
+
+export function runF5b2CalibrationSnapshot(
+  db: Database.Database,
+  input: F5aCalibrationInput,
+): CalibrationSnapshot {
+  return snapshotFromMeasurementCollection(collectF5b2CalibrationMeasurements(db, input), F5B2_CALIBRATION_PROBES);
+}
+
+/** Restricted planning API for F5b2. Identity-minimized joint evidence is never serialized. */
+export function collectF5b2CalibrationMeasurements(
+  db: Database.Database,
+  input: F5aCalibrationInput,
+): PlanningCalibrationMeasurementCollection {
+  return collectCalibrationMeasurements(db, input, F5B2_CALIBRATION_PROBES);
 }
 
 function collectCalibrationMeasurements(
