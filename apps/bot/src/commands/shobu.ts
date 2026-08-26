@@ -1,6 +1,5 @@
-import { SlashCommandBuilder, type ChatInputCommandInteraction } from "discord.js";
+import type { ChatInputCommandInteraction } from "discord.js";
 import type { Services } from "../services.js";
-import { MIN_BET } from "../casino/common.js";
 import { playChohanMulti } from "../casino/chohan-multi.js";
 import { playChinchiroDuel } from "../casino/chinchiro-duel.js";
 import { playBjDuel } from "../casino/bj-duel.js";
@@ -10,64 +9,8 @@ import { playPokerDuel } from "../casino/poker-duel.js";
 
 /**
  * @deprecated `/勝負` slashは退役済み。公開対人入口は専用常設パネルへ集約した。
- * game runner本体は将来再利用できるよう残すが、このbuilderをregistrationへ戻さない。
- *
- * `setMaxValue` を付けない理由は /遊ぶ と同じ（PR3）。上限は `validateBet()` が
- * 利用者ごとに判定する（VIP は ×2）。
+ * Discord側に残る旧interactionとの互換handlerとgame runnerを維持する。
  */
-export const shobuCommand = new SlashCommandBuilder()
-  .setName("勝負")
-  .setDescription("⚔ マモンの賭場の対人ゲーム")
-  .setDMPermission(false)
-  .addSubcommand((sub) =>
-    sub.setName("丁半").setDescription("🎴 多人数丁半（60秒受付・両側揃えば成立）"),
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("チンチロ")
-      .setDescription("🎲 対戦チンチロ（1v1・両者振って自動判定）")
-      .addUserOption((o) => o.setName("相手").setDescription("挑戦相手").setRequired(true))
-      .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるLand（同額）").setRequired(true).setMinValue(MIN_BET),
-      ),
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("bj")
-      .setDescription("🃏 BJデュエル（1v1・交互ヒットで21勝負）")
-      .addUserOption((o) => o.setName("相手").setDescription("挑戦相手").setRequired(true))
-      .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるLand（同額）").setRequired(true).setMinValue(MIN_BET),
-      ),
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("サシ")
-      .setDescription("⚔ サシ勝負（1v1・50/50 の一発勝負）")
-      .addUserOption((o) => o.setName("相手").setDescription("挑戦相手").setRequired(true))
-      .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるLand（同額）").setRequired(true).setMinValue(MIN_BET),
-      ),
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("インディアン")
-      .setDescription("🃏 インディアンポーカー（1v1・自分の手だけ見えない心理戦）")
-      .addUserOption((o) => o.setName("相手").setDescription("挑戦相手").setRequired(true))
-      .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるLand（同額）").setRequired(true).setMinValue(MIN_BET),
-      ),
-  )
-  .addSubcommand((sub) =>
-    sub
-      .setName("ポーカー")
-      .setDescription("🃏 5枚交換ポーカー（相手指定でサシ・未指定でオープン募集）")
-      .addIntegerOption((o) =>
-        o.setName("賭け").setDescription("賭けるLand（参加者全員同額）").setRequired(true).setMinValue(MIN_BET),
-      )
-      .addUserOption((o) => o.setName("相手").setDescription("相手指定でサシ（未指定なら誰でも参加できるオープン）").setRequired(false)),
-  );
-
 export async function handleShobuCommand(
   interaction: ChatInputCommandInteraction,
   services: Services,

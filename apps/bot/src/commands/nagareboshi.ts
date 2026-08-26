@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import {
   EmbedBuilder,
   MessageFlags,
-  SlashCommandBuilder,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
 } from "discord.js";
@@ -181,11 +180,6 @@ export function drawNagareboshi(services: Services, uid: string, day: string, op
     },
   );
 }
-
-export const nagareboshiCommand = new SlashCommandBuilder()
-  .setName("流れ星")
-  .setDescription("✨ マモンの賭場占い（1日5回・初回無料）")
-  .setDMPermission(false);
 
 export async function handleNagareboshiCommand(
   interaction: ChatInputCommandInteraction | ButtonInteraction,

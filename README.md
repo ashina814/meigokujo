@@ -176,6 +176,7 @@ deploy flowは取得先SHAを一時worktreeで検証し、反映前にSQLite bac
 
 - [Titles v2 design](docs/titles-v2-design.md) — 称号のUX、privacy、source-first設計の正本
 - [Titles v2 catalog readiness](docs/titles-v2-catalog-readiness.md) — candidate catalogと現在の実装可能性の監査。変動するstatusはここを参照
+- [Legacy / maintenance asset inventory](docs/legacy-assets.md) — retired・compatibility・migration・maintenance資産を残す理由と削除条件
 - [マモンの賭場 大型アップデート 最終実装仕様書](docs/casino/マモンの賭場_大型アップデート_最終実装仕様書_v1.0.md) — 賭場の安全不変条件と実装基準
 - [マモンの賭場 常設パネル仕様](docs/casino/マモンの賭場_常設パネル仕様_2026-08-18.md) — 現行の入口・常設panel仕様。基準書§12と矛盾する場合はこちらを優先
 - [Production deploy](deploy/DEPLOY.md) — bootstrap後の通常deploy、backup、systemd運用の正本

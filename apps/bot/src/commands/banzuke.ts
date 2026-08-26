@@ -2,7 +2,6 @@ import {
   ActionRowBuilder,
   EmbedBuilder,
   MessageFlags,
-  SlashCommandBuilder,
   StringSelectMenuBuilder,
   type ChatInputCommandInteraction,
 } from "discord.js";
@@ -15,25 +14,6 @@ import type { Services } from "../services.js";
  * /賭場番付 — マモンの賭場の番付（casino-bot /番付 相当）。
  * ephemeral（本人にだけ見える）。
  */
-export const banzukeCommand = new SlashCommandBuilder()
-  .setName("賭場番付")
-  .setDescription("🏅 マモンの賭場の番付を見る")
-  .setDMPermission(false)
-  .addStringOption((o) =>
-    o
-      .setName("種別")
-      .setDescription("見る番付")
-      .setRequired(true)
-      .addChoices(
-        { name: "賭場利用可能額", value: "balance" },
-        { name: "勝率（10戦以上）", value: "win_rate" },
-        { name: "最大単勝", value: "biggest_win" },
-        { name: "総獲得", value: "total_earned" },
-        { name: "総ベット", value: "total_wagered" },
-        { name: "最長連勝", value: "best_win_streak" },
-      ),
-  );
-
 export type BanzukeKind = "balance" | "win_rate" | "biggest_win" | "total_earned" | "total_wagered" | "best_win_streak";
 
 const LABELS: Record<BanzukeKind, { title: string; icon: string; color: number }> = {

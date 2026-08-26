@@ -116,6 +116,13 @@ describe("operator Settings registry", () => {
     expect(source("packages/core/src/settings/service.ts")).not.toContain("ether_rate_base:");
   });
 
+  it("does not retain proven-dead legacy setting metadata or defaults", () => {
+    for (const key of ["migration_cap", "roles:kaiwa", "vc_whitelist"]) {
+      expect(LEGACY_SETTING_KEYS as readonly string[]).not.toContain(key);
+    }
+    expect(SETTING_DEFAULTS).not.toHaveProperty("migration_cap");
+  });
+
   it("keeps every Discord select group within the 25-option boundary", () => {
     for (const kind of ["channel", "category", "role", "number"] as const) {
       expect(operatorSettingChoices(kind).length, kind).toBeLessThanOrEqual(25);

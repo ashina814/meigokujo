@@ -4,7 +4,6 @@ import {
   ButtonStyle,
   EmbedBuilder,
   MessageFlags,
-  SlashCommandBuilder,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
 } from "discord.js";
@@ -17,11 +16,6 @@ import type { Services } from "../services.js";
  * Discord側に残る旧interactionとの互換handlerだけを維持し、ボタン遷移では
  * `renderCasinoHome` を再利用する。新しい公開入口として登録しない。
  */
-export const annaiCommand = new SlashCommandBuilder()
-  .setName("案内")
-  .setDescription("🏛 マモンの賭場の入口（/賭場 へ案内します）")
-  .setDMPermission(false);
-
 const MOVED_NOTICE = "賭場の入口は `/賭場` にまとまりました。次からは `/賭場` を使ってください。";
 
 export async function handleAnnaiCommand(

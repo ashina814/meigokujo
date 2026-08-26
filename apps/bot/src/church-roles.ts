@@ -47,7 +47,7 @@ export const ROLE_SLOT_META: Record<RoleSlot, { label: string; hint: string; mul
     hint: "賭場の公開1v1募集専用の通知先。トート・案件管理には使用しません。最大10ロールまで設定可",
     multi: true,
   },
-  // 諧和廷はトートの対応先から廃止（旧運用）。既存 roles:kaiwa の読み取り用に型としては残すが、UIには出さない
+  // 諧和廷はトートの対応先から廃止（旧運用）。既存案件の表示互換のため型だけ残し、UIには出さない
   kaiwa: { label: "諧和廷担当ロール（旧運用・非表示）", hint: "廃止済み", multi: true },
   court: { label: "冥府裁判所担当ロール", hint: "冥府裁判所への送致先", multi: true },
   emergency: { label: "緊急対応担当ロール", hint: "🚨緊急の安全問題の通知先", multi: true },
