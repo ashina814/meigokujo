@@ -7,7 +7,6 @@ import {
   ComponentType,
   EmbedBuilder,
   MessageFlags,
-  SlashCommandBuilder,
   StringSelectMenuBuilder,
   StringSelectMenuInteraction,
   type ChatInputCommandInteraction,
@@ -25,11 +24,6 @@ import type { Services } from "../services.js";
  * casino-bot /商店 準拠。Land表示の価格で消耗品を買う → 「装備」→ 発動条件で自動消費。
  * 冥獄城の /商館（Land建てショップ）とは経済圏が分離されている（賭場内で完結）。
  */
-export const bakutenCommand = new SlashCommandBuilder()
-  .setName("賭場商店")
-  .setDescription("🛍 マモンの賭場のお守り商店（Land建て）")
-  .setDMPermission(false);
-
 /**
  * 商店の描画。legacy `/賭場商店` interactionと `/賭場` ハブの両方から使う。
  * 入口が増えても中身が食い違わないよう、描画は必ずここを通す。

@@ -6,8 +6,8 @@ import type { Services } from "./services.js";
  * - 巣穴大: 全員・報酬対象
  * - 巣穴中/小: 魔剣士・審のみ・報酬対象
  * - 応接室: 魔剣士・審のみ・3人まで・報酬対象外
- * 複製VC（報酬対象のもの）は生成時に vc_whitelist_den へ自動登録するので、動的に生まれた
- * 巣穴でも VC浮上報酬(Land)が付く。空になったら自動撤収、報酬登録は2日後に掃除。
+ * VC浮上報酬はブラックリスト方式なので、報酬対象の複製VCは追加登録なしで対象になる。
+ * 報酬対象外の応接室だけ共用除外リストへ登録し、空になったら自動撤収する。
  */
 interface DenSpec {
   settingKey: string; // トリガーVCの設定キー
@@ -24,7 +24,7 @@ const DENS: Record<string, DenSpec> = {
 };
 
 const DEN_GRACE_S = 0; // 猶予なし: 無人になったら次のスキャンで即撤収
-const DEN_WHITELIST_KEEP_S = 2 * 86_400; // 前日分の報酬計算まで報酬対象に残す
+const DEN_TRACKING_KEEP_S = 2 * 86_400; // 前日分の報酬計算後に追跡行・応接室の除外IDを掃除する
 
 function triggerKind(services: Services, channelId: string): keyof typeof DENS | null {
   for (const [kind, spec] of Object.entries(DENS)) {
@@ -118,7 +118,7 @@ export async function scanDens(client: Client, services: Services): Promise<void
     }
     // 追跡登録の掃除は前日分の報酬計算後（2日）に。
     // 応接室(reception)は除外リストに載せているので、掃除時に外す（除外リストに死にIDを残さない）。
-    if (now - row.created_at > DEN_WHITELIST_KEEP_S) {
+    if (now - row.created_at > DEN_TRACKING_KEEP_S) {
       services.db.prepare("DELETE FROM den_vcs WHERE channel_id = ?").run(row.channel_id);
       if (row.kind === "reception" && excl.delete(row.channel_id)) exclChanged = true;
     }

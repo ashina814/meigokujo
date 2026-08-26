@@ -1,7 +1,6 @@
 import {
   EmbedBuilder,
   MessageFlags,
-  SlashCommandBuilder,
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { fmtEther } from "../format.js";
@@ -13,11 +12,6 @@ import type { Services } from "../services.js";
  * /福分け — マモンの賭場のデイリーボーナス（casino-bot /daily 相当）。
  * 24時間に1回。連続日数ボーナス（7日毎に+50、最大+200）＋残高が少なければ救済プールから追加支給。
  */
-export const dailyCommand = new SlashCommandBuilder()
-  .setName("福分け")
-  .setDescription("📅 マモンの福分けを受け取る（24時間に1回）")
-  .setDMPermission(false);
-
 export async function handleDailyCommand(
   interaction: ChatInputCommandInteraction,
   services: Services,

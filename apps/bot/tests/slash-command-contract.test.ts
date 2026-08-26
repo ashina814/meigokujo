@@ -32,6 +32,18 @@ const RETIRED_CASINO_NAMES = [
 
 const payloadNames = () => buildRegistrationPayload().map(({ name }) => name);
 
+const RETIRED_HANDLER_FILES = [
+  "asobu.ts",
+  "daily.ts",
+  "banzuke.ts",
+  "bakuten.ts",
+  "keiba.ts",
+  "annai.ts",
+  "vip.ts",
+  "nagareboshi.ts",
+  "shobu.ts",
+] as const;
+
 describe("slash command classification SSOT", () => {
   it("A/B: ACTIVEとRETIREDの各nameにduplicateがない", () => {
     expect(new Set(ACTIVE_SLASH_COMMAND_NAMES).size).toBe(ACTIVE_SLASH_COMMAND_NAMES.length);
@@ -120,6 +132,14 @@ describe("retired legacy compatibility boundary", () => {
 
   it("legacy route mapはlegacy compatibility nameだけを完全に持つ", () => {
     expect(Object.keys(LEGACY_COMPAT_SLASH_ROUTES)).toEqual(LEGACY_COMPAT_SLASH_NAMES);
+  });
+
+  it("retired handler fileには再登録可能なSlashCommandBuilderを残さない", () => {
+    for (const file of RETIRED_HANDLER_FILES) {
+      const source = readFileSync(new URL(`../src/commands/${file}`, import.meta.url), "utf8");
+      expect(source, file).not.toContain("SlashCommandBuilder");
+      expect(source, file).not.toMatch(/export const \w+Command\s*=/u);
+    }
   });
 
   it("R: legacy /株はreplyStocksPausedへ到達する", async () => {

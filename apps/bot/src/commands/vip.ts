@@ -5,7 +5,6 @@ import {
   ButtonStyle,
   EmbedBuilder,
   MessageFlags,
-  SlashCommandBuilder,
   type ChatInputCommandInteraction,
 } from "discord.js";
 import { fmtEther } from "../format.js";
@@ -16,11 +15,6 @@ import type { Services } from "../services.js";
  * @deprecated slash registrationから退役済み。VIPは`/賭場` のhome/panelから利用する。
  * /vip — マモンの賭場のVIP会員（月額Land）。casino-bot 準拠。
  */
-export const vipCommand = new SlashCommandBuilder()
-  .setName("vip")
-  .setDescription("💎 マモンの賭場のVIP会員（月額Land）")
-  .setDMPermission(false);
-
 export async function handleVipCommand(
   interaction: ChatInputCommandInteraction,
   services: Services,

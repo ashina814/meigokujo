@@ -171,11 +171,8 @@ export const INTERNAL_SETTING_KEY_FAMILIES = [
 ] as const;
 
 export const LEGACY_SETTING_KEYS = [
-  "migration_cap",
-  "roles:kaiwa",
   "shop:original_role_legacy_item_id",
   "shop:sub_account_legacy_item_id",
-  "vc_whitelist",
 ] as const;
 
 export function operatorSettingsFor(kind: OperatorSettingKind): OperatorSettingMeta[] {

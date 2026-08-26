@@ -39,11 +39,11 @@ describe("設定基盤", () => {
     expect(settings.getNumber("approval_threshold")).toBe(2_000_000);
   });
 
-  it("JSON設定（VCホワイトリスト等）と文字列設定を扱える", () => {
+  it("JSON設定（共用除外リスト等）と文字列設定を扱える", () => {
     const { settings } = setup();
-    expect(settings.getJson<string[]>("vc_whitelist", [])).toEqual([]);
-    settings.set("vc_whitelist", ["vc:100", "vc:200"], STAFF);
-    expect(settings.getJson<string[]>("vc_whitelist", [])).toEqual(["vc:100", "vc:200"]);
+    expect(settings.getJson<string[]>("xp_excluded_channels", [])).toEqual([]);
+    settings.set("xp_excluded_channels", ["vc:100", "vc:200"], STAFF);
+    expect(settings.getJson<string[]>("xp_excluded_channels", [])).toEqual(["vc:100", "vc:200"]);
     settings.set("channel:public_log", "123456789", STAFF);
     expect(settings.getString("channel:public_log")).toBe("123456789");
   });

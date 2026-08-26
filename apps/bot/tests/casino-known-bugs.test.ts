@@ -51,8 +51,6 @@ import {
 import { buyConsumable } from "../src/commands/bakuten.js";
 import { collectStakes, refundAll, settlePvp } from "../src/casino/pvp-common.js";
 import { resetTransientParticipationForTesting } from "../src/casino/participation.js";
-import { asobuCommand } from "../src/commands/asobu.js";
-import { shobuCommand } from "../src/commands/shobu.js";
 
 registerDefaultTxTypes();
 
@@ -165,22 +163,6 @@ describe("① クラッシュの払戻が上限でクランプされる", () => 
 });
 
 describe("② VIP の賭け上限が到達可能", () => {
-  it("/遊ぶ・/勝負 の賭けオプションに max_value が焼き込まれていない", () => {
-    // 上限は利用者ごとに違うので、全員共通のコマンド定義に入れてはいけない
-    const betOptions = [asobuCommand, shobuCommand].flatMap((cmd) =>
-      (cmd.toJSON().options ?? []).flatMap((sub) =>
-        ((sub as { options?: Array<{ name: string; max_value?: number; min_value?: number }> }).options ?? []).filter(
-          (o) => o.name === "賭け" || o.name === "アンティ",
-        ),
-      ),
-    );
-    expect(betOptions.length).toBeGreaterThan(0);
-    for (const o of betOptions) {
-      expect(o.max_value).toBeUndefined();
-      expect(o.min_value).toBe(MIN_BET);
-    }
-  });
-
   it("VIP は MAX_BET を超える額で「もう一回」が通り、非VIPは断られる", () => {
     const ctx = setup();
     const over = MAX_BET + 1;
