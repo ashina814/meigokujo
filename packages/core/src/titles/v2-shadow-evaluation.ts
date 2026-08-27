@@ -820,11 +820,32 @@ function rowPredicateFor(plan: F5cCandidateSweepPlan, rowGroupKey: string): F5cR
   return plan.rowGroupCompositions.find((c) => c.rowGroupKey === rowGroupKey)?.rowPredicate ?? null;
 }
 
+/**
+ * F5c3 (task #192) §1/§2: which percentile each *decision dimension* of the candidate is held at.
+ * F5c2's own representative execution holds every dimension at `F5C2_REPRESENTATIVE_PERCENTILE`;
+ * F5c3's one-axis-at-a-time sensitivity overrides exactly one dimension and leaves the rest
+ * representative. Routing both through the same selection function is what guarantees a candidate
+ * cannot acquire subtly different semantics in F5c2 representative execution vs F5c3 OAT vs F5c3
+ * overlap — there is only one evaluator.
+ *
+ * A dimension key is the axis's own `axisKey`, except the manifest cardinality sweep, which is
+ * keyed `manifest:<countMetricKey>` (matching the axisKey F5c2 already reports for it).
+ */
+export type F5cDimensionSelection = (dimensionKey: string) => F5cBoundaryPercentile;
+
+const REPRESENTATIVE_SELECTION: F5cDimensionSelection = () => F5C2_REPRESENTATIVE_PERCENTILE;
+
+/** The dimension key F5c2/F5c3 use for a manifest cardinality sweep criterion. */
+export function manifestDimensionKey(countMetricKey: string): string {
+  return `manifest:${countMetricKey}`;
+}
+
 interface AxisEvalContext {
   readonly plan: F5cCandidateSweepPlan;
   readonly probeKey: string;
   readonly subjects: readonly PlanningCalibrationSubjectMeasurement[];
   readonly coverageWindowValidated: boolean;
+  readonly percentileFor: F5cDimensionSelection;
 }
 
 function metricSamplesFor(ctx: AxisEvalContext, metricKey: string): { readonly bySubject: ReadonlyMap<string, number | null>; readonly samples: readonly number[] } {
@@ -869,7 +890,7 @@ function evaluateMetricAxis(ctx: AxisEvalContext, axis: F5cSweepAxis & { source:
       marginalPassRate: knownSubjects.length === 0 ? null : passingCount / knownSubjects.length,
     };
   });
-  const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+  const representativeBoundary = boundaries.get(ctx.percentileFor(axis.axisKey));
   const outcomeBySubject = new Map<string, F5cShadowOutcome>();
   for (const [subjectId, value] of bySubject) {
     if (value === null || representativeBoundary === undefined) { outcomeBySubject.set(subjectId, "UNKNOWN"); continue; }
@@ -978,7 +999,7 @@ function evaluateDaypartTargetAxis(
     const passingCount = samples.filter((s) => s >= boundaryValue).length;
     return { percentile, boundaryValue, knownCount: samples.length, passingCount, marginalPassRate: samples.length === 0 ? null : passingCount / samples.length };
   });
-  const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+  const representativeBoundary = boundaries.get(ctx.percentileFor(axis.axisKey));
 
   const outcomeBySubject = new Map<string, F5cShadowOutcome>();
   for (const subject of ctx.subjects) {
@@ -1044,7 +1065,7 @@ function evaluatePersonalStabilityAxis(
     const passingCount = samples.filter((s) => s >= boundaryValue).length;
     return { percentile, boundaryValue, knownCount: samples.length, passingCount, marginalPassRate: samples.length === 0 ? null : passingCount / samples.length };
   });
-  const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+  const representativeBoundary = boundaries.get(ctx.percentileFor(axis.axisKey));
 
   const outcomeBySubject = new Map<string, F5cShadowOutcome>();
   for (const subject of ctx.subjects) {
@@ -1107,7 +1128,7 @@ function evaluateMultiDaypartBreadthAxis(
     const passingCount = samples.filter((s) => s >= boundaryValue).length;
     return { percentile, boundaryValue, knownCount: samples.length, passingCount, marginalPassRate: samples.length === 0 ? null : passingCount / samples.length };
   });
-  const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+  const representativeBoundary = boundaries.get(ctx.percentileFor(axis.axisKey));
 
   const outcomeBySubject = new Map<string, F5cShadowOutcome>();
   for (const subject of ctx.subjects) {
@@ -1162,9 +1183,16 @@ function evaluatePostFilterMatchingAxis(
   ctx: AxisEvalContext,
   axis: F5cSweepAxis & { reducerKind: "POST_FILTER_MATCHING_SIZE" },
   edgeSampleBoundaries: ReadonlyMap<F5cBoundaryPercentile, number>,
+  edgeAxisKey: string | null,
 ): { readonly sweep: F5cAxisSweepResult; readonly outcomeAtRepresentative: ReadonlyMap<string, F5cShadowOutcome> } {
   const rawRowsBySubject = rowGroupRawRowsFor(ctx, axis);
-  const representativeEdgeBoundary = edgeSampleBoundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+  // F5c3 §2: the edge threshold is the SIBLING filter axis's own decision dimension, so it moves
+  // when that dimension is the one under OAT — not when the matching-size dimension is. Keeping
+  // the two keyed separately is what preserves the real F5c1/F5c2 execution dependency instead of
+  // pretending matching size is an independent scalar comparison.
+  const representativeEdgeBoundary = edgeSampleBoundaries.get(
+    edgeAxisKey === null ? F5C2_REPRESENTATIVE_PERCENTILE : ctx.percentileFor(edgeAxisKey),
+  );
   const matchingSizeBySubject = new Map<string, number>();
   const knownSubjectIds: string[] = [];
   for (const subject of ctx.subjects) {
@@ -1193,7 +1221,7 @@ function evaluatePostFilterMatchingAxis(
       marginalPassRate: matchingSizeSamples.length === 0 ? null : passingCount / matchingSizeSamples.length,
     };
   });
-  const representativeMatchingBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE) ?? 0;
+  const representativeMatchingBoundary = boundaries.get(ctx.percentileFor(axis.axisKey)) ?? 0;
 
   const observed = [...rawRowsBySubject.values()].reduce((sum, rows) => sum + rows.length, 0);
   const outcomeAtRepresentative = new Map<string, F5cShadowOutcome>();
@@ -1260,7 +1288,7 @@ function evaluateRowGroup(
     const edgeSamples = filterAxis ? rowGroupRawRowsFor(ctx, filterAxis) : new Map<string, readonly RawRow[]>();
     const allEdgeSamples = [...edgeSamples.values()].flat().map((r) => r.sampleValue).filter((v): v is number => v !== null);
     const boundaries = boundaryValuesFor(allEdgeSamples);
-    const result = evaluatePostFilterMatchingAxis(ctx, matchingAxis, boundaries);
+    const result = evaluatePostFilterMatchingAxis(ctx, matchingAxis, boundaries, filterAxis?.axisKey ?? null);
     sweeps.push(result.sweep);
     for (const [subjectId, outcome] of result.outcomeAtRepresentative) {
       outcomeBySubject.set(subjectId, combineOutcomes([outcomeBySubject.get(subjectId) ?? "MATCHED", outcome]));
@@ -1295,7 +1323,7 @@ function evaluateRowGroup(
    */
   const qualifyingFilterSetsFor = (subjectId: string): readonly (readonly RawRow[])[] =>
     group.filterAxes.map((filterAxis, i) => {
-      const boundary = filterBoundaries[i]!.get(F5C2_REPRESENTATIVE_PERCENTILE);
+      const boundary = filterBoundaries[i]!.get(ctx.percentileFor(filterAxis.axisKey));
       const raw = filterRawBySubject[i]!.get(subjectId) ?? [];
       return boundary === undefined ? [] : filterRows(raw, filterAxis.operator, boundary);
     });
@@ -1378,7 +1406,7 @@ function evaluateRowGroup(
     });
     sweeps.push({ axisKey: reductionAxis.axisKey, reducerKind: reductionAxis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, boundaryReliability: boundaryReliabilityFor(ctx, reductionReliability(reductionAxis.reducerKind, group.filterAxes.length > 0)) });
 
-    const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+    const representativeBoundary = boundaries.get(ctx.percentileFor(reductionAxis.axisKey));
     for (const subject of ctx.subjects) {
       const result = reducedBySubject.get(subject.subjectUserId)!;
       const prior = outcomeBySubject.get(subject.subjectUserId);
@@ -1513,12 +1541,24 @@ export function auditF5c2SelectorSupport(
   return gaps;
 }
 
-function executeCandidate(
+/**
+ * F5c3 (task #192) §1: the single candidate evaluator. `outcomeBySubject` is transient in-memory
+ * state for aggregate computation only (F5c3 overlap needs per-subject outcomes to intersect two
+ * candidates) — it is NEVER serialized. `executeF5cShadowCalibration` drops it; F5c3 consumes it
+ * to build counts and drops it too.
+ */
+export interface F5cCandidateExecution {
+  readonly result: F5cCandidateShadowResult;
+  readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome>;
+}
+
+export function executeCandidateAtSelection(
   plan: F5cCandidateSweepPlan,
   subjects: readonly PlanningCalibrationSubjectMeasurement[],
   coverageWindowValidated: boolean,
-): F5cCandidateShadowResult {
-  const ctx: AxisEvalContext = { plan, probeKey: plan.probeKey, subjects, coverageWindowValidated };
+  percentileFor: F5cDimensionSelection = REPRESENTATIVE_SELECTION,
+): F5cCandidateExecution {
+  const ctx: AxisEvalContext = { plan, probeKey: plan.probeKey, subjects, coverageWindowValidated, percentileFor };
   const axisSweeps: F5cAxisSweepResult[] = [];
   const outcomeBySubject = new Map<string, F5cShadowOutcome[]>();
   const pushOutcome = (subjectId: string, outcome: F5cShadowOutcome) => {
@@ -1551,7 +1591,7 @@ function executeCandidate(
       // 計算し、各subjectをそれに対して実際に判定する。No.87/88のprevalenceはこの
       // 次元を無視してはならない。
       const cardinalitySweepBoundary = criterion.kind === "MANIFEST_CARDINALITY_SWEEP"
-        ? boundaryValuesFor(metricSamplesFor(ctx, criterion.countMetricKey).samples).get(F5C2_REPRESENTATIVE_PERCENTILE) ?? null
+        ? boundaryValuesFor(metricSamplesFor(ctx, criterion.countMetricKey).samples).get(ctx.percentileFor(manifestDimensionKey(criterion.countMetricKey))) ?? null
         : null;
       for (const subject of subjects) {
         pushOutcome(subject.subjectUserId, evaluateManifestCriterion(criterion, subject, plan.probeKey, pinnedForCriterion, cardinalitySweepBoundary, coverageWindowValidated));
@@ -1611,9 +1651,11 @@ function executeCandidate(
   let matchedCount = 0;
   let notMatchedCount = 0;
   let unknownCount = 0;
+  const finalBySubject = new Map<string, F5cShadowOutcome>();
   for (const subject of subjects) {
     const outcomes = outcomeBySubject.get(subject.subjectUserId) ?? [];
     const combined = combineOutcomes(outcomes);
+    finalBySubject.set(subject.subjectUserId, combined);
     if (combined === "MATCHED") matchedCount += 1;
     else if (combined === "NOT_MATCHED") notMatchedCount += 1;
     else unknownCount += 1;
@@ -1621,19 +1663,22 @@ function executeCandidate(
   const knownCount = matchedCount + notMatchedCount;
 
   return {
-    candidateNo: plan.candidateNo,
-    provisionalKey: plan.provisionalKey,
-    evaluationShape: plan.evaluationShape,
-    thresholdCategory: plan.thresholdCategory,
-    executionStrategy,
-    populationCount: subjects.length,
-    knownCount,
-    unknownCount,
-    matchedCount,
-    notMatchedCount,
-    prevalence: knownCount === 0 ? null : matchedCount / knownCount,
-    axisSweeps,
-    unsupportedReason,
+    result: {
+      candidateNo: plan.candidateNo,
+      provisionalKey: plan.provisionalKey,
+      evaluationShape: plan.evaluationShape,
+      thresholdCategory: plan.thresholdCategory,
+      executionStrategy,
+      populationCount: subjects.length,
+      knownCount,
+      unknownCount,
+      matchedCount,
+      notMatchedCount,
+      prevalence: knownCount === 0 ? null : matchedCount / knownCount,
+      axisSweeps,
+      unsupportedReason,
+    },
+    outcomeBySubject: finalBySubject,
   };
 }
 
@@ -1658,7 +1703,9 @@ export function executeF5cShadowCalibration(
   collection: PlanningCalibrationMeasurementCollection,
   coverageWindowValidated: boolean,
 ): F5cShadowCalibrationReport {
-  const results = F5C_CANDIDATE_SWEEP_PLANS.map((plan) => executeCandidate(plan, collection.subjects, coverageWindowValidated));
+  // aggregate-only: the per-subject outcomes the shared evaluator produces are dropped here and
+  // never reach the returned report.
+  const results = F5C_CANDIDATE_SWEEP_PLANS.map((plan) => executeCandidateAtSelection(plan, collection.subjects, coverageWindowValidated).result);
   const unsupportedCandidateCount = results.filter((r) => r.executionStrategy === "UNSUPPORTED_GAP").length;
   return deepFreeze({
     contractVersion: F5C2_SHADOW_CONTRACT_VERSION,
