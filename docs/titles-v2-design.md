@@ -2306,6 +2306,46 @@ F5c1自身はprevalence/Jaccard/recommendationを計算しない。F6だけが�
 readinessはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8のままで、plan coverage 76/76はsource readinessやrelease可否の変更を
 意味しない。
 
+### 14.9.1 Contract executability follow-up（PR #190レビュー対応）
+
+初版のF5c1は、structuralRequirementsがstring[]のみ・JOINT_EVIDENCE axisにsubject-level
+reduction semanticsが無い・measurementStatusが暗黙にMEASUREDへdefaultするという3点で
+「F5c2がre-interpretation無しに実行できる」水準に届いていなかった。以下を追加した
+（production threshold・汎用rule DSLは追加していない）。
+
+- **`F5cFixedCriterion`**（`METRIC_COMPARE` / `METRIC_BOOLEAN_TRUE` / `ANY_METRIC_POSITIVE` /
+  `JOINT_STRUCTURAL_FACT`）: catalog意味論そのものが固定するsemantic constant
+  （例: `eventCount >= 1`、`activeFamilyCount >= 2`、participant-onlyとstaff-or-organizerの
+  AND+OR）を型で持つ。全fixedCriteriaはANDされ、`ANY_METRIC_POSITIVE`だけが明示的なOR。
+  THRESHOLD_PENDINGのdistribution boundaryとは別物——`numericThresholdValueCount`は
+  依然axesだけを見る（fixedCriteriaのfixedValueは数えない）。
+- **`F5cManifestRef`**（`ECONOMY_SEMANTIC_FAMILIES` / `CASINO_EDITION` / `CASTLE_EDITION`）:
+  MANIFEST_DEPENDENT planは、`ECONOMY_FEATURE_FAMILY_MANIFEST_VERSION`・
+  `CASINO_EDITION_I_MANIFEST`・`CASTLE_EXPERIENCE_EDITION_I_MANIFEST`という実在のcanonical
+  versioned定数を直接参照する。auditは毎回同じbuilderを再実行して構造比較し、値を
+  複製せず、manifestが改訂されても古いsweep contractが気づかず変わらないことを保証する。
+- **axis reducer kind**: `F5cAxisReducerKind`（`SCALAR_METRIC` / `SCALAR_SAMPLE` /
+  `FILTER_THEN_COUNT` / `FILTER_THEN_DISTINCT_DAYS` / `FILTER_THEN_SHARE` /
+  `GROUP_FILTER_THEN_MAX` / `MATCHING_AFTER_EDGE_FILTER` / `CIRCULAR_HOUR_WINDOW` /
+  `SET_BREADTH` / `REPEAT_PERIOD`）をREADY-76の実際のpatternから列挙した（汎用DSLでは
+  ない）。同じ生row集合から複数axisが導出される場合は`rowGroupKey`で明示する
+  （No.42のTC start例: quiet-before/continuation-gap filterとqualifying distinct daysが
+  同じstart rowから導出されることを明示）。graph matching（No.26/27）はedge filter適用後の
+  再計算専用variantへ分離し、24 JST hour（No.32-37）は循環windowの専用variantへ分離した
+  ——どちらもoperatorを持たず、`OBSERVED_NEAREST_RANK`を直接割り当てない。No.77/78の
+  root-before-child/same-day-before-entry chronologyは、AT_LEAST axisとして誤って
+  sweepable扱いされていたのを`JOINT_STRUCTURAL_FACT` fixedCriteriaへ移し、No.77には
+  正規のdistribution axis（same-day gap/seconds、qualifying count、いずれも
+  `next-gen-rows`で同一row group）を追加した。
+- **measurementStatusの明示化**: `measuredPlan()`/`gapPlan()`のみがconstructorを呼べる。
+  `gapPlan()`は空でない`gapReason`を要求し、型レベルでも`axes`を受け付けない
+  （実行時にも同じ条件をfail-closedで再確認する）。暗黙のdefaultは廃止した。
+- **audit**: `auditF5cCandidateSweepPlans()`は`declaredMeasurementGapCount`（明示的に
+  MEASUREMENT_GAPと宣言したplan数）と`unexecutablePlanCount`（構造上実行不能な
+  plan数——fixedCriteria/manifestRef欠落、JOINT_CORRELATIONなのにaxisが無い、
+  manifestRefが現行canonical定数と食い違う等）を分けて報告する。現行READY-76は
+  両方とも0。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

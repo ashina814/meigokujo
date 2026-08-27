@@ -12,6 +12,7 @@ import { TITLE_V2_CATALOG_READINESS } from "../src/titles/v2-catalog-readiness.j
 import {
   auditF5cCandidateSweepPlans,
   F5C_CANDIDATE_SWEEP_PLANS,
+  __internal as f5cInternal,
 } from "../src/titles/v2-calibration-sweep.js";
 import {
   collectF5cCalibrationMeasurements,
@@ -70,7 +71,8 @@ describe("F5c1 READY-76 sweep contract", () => {
         STRUCTURAL_PLUS_DISTRIBUTION: 1,
       },
       optimizationRiskCounts: { LOW: 37, MANAGED: 27, HIGH: 12 },
-      measurementGapCount: 0,
+      declaredMeasurementGapCount: 0,
+      unexecutablePlanCount: 0,
       duplicateCount: 0,
       nonReadyCandidateCount: 0,
       exactReadySet: true,
@@ -83,6 +85,8 @@ describe("F5c1 READY-76 sweep contract", () => {
     expect(audit.optimizationRiskMismatches).toEqual([]);
     expect(audit.unknownMetricSelectors).toEqual([]);
     expect(audit.unknownJointEvidenceSelectors).toEqual([]);
+    expect(audit.manifestRefMismatches).toEqual([]);
+    expect(audit.unexecutablePlanCandidateNos).toEqual([]);
     expect(Object.isFrozen(audit)).toBe(true);
     expect(Object.isFrozen(audit.thresholdCategoryCounts)).toBe(true);
   });
@@ -99,7 +103,15 @@ describe("F5c1 READY-76 sweep contract", () => {
         expect(candidatePlan.axes.length).toBeGreaterThan(0);
       }
       for (const axis of candidatePlan.axes) {
-        expect(axis.boundaryMethod).toBe("OBSERVED_NEAREST_RANK");
+        if (axis.reducerKind === "MATCHING_AFTER_EDGE_FILTER") {
+          expect(axis.boundaryMethod).toBe("RECOMPUTED_AFTER_EDGE_FILTER");
+          expect("operator" in axis).toBe(false);
+        } else if (axis.reducerKind === "CIRCULAR_HOUR_WINDOW") {
+          expect(axis.boundaryMethod).toBe("CIRCULAR_CANDIDATE_ENUMERATION");
+          expect("operator" in axis).toBe(false);
+        } else {
+          expect(axis.boundaryMethod).toBe("OBSERVED_NEAREST_RANK");
+        }
         expect(Object.values(axis).some((value) => typeof value === "number")).toBe(false);
         expect("value" in axis).toBe(false);
       }
@@ -176,5 +188,170 @@ describe("F5c1 READY-76 sweep contract", () => {
       expect(readFileSync(new URL(`../src/titles/${file}`, import.meta.url), "utf8")).not.toContain("v2-calibration-sweep");
     }
     expect(readFileSync(new URL("../../../apps/bot/src/index.ts", import.meta.url), "utf8")).not.toContain("v2-calibration-sweep");
+  });
+});
+
+/**
+ * PR #190レビュー: F5c1 contract executability follow-up。BLOCKER1(structuralRequirements
+ * がstring[]のみ)/BLOCKER2(joint axisにsubject-level reduction semanticsが無い)/
+ * BLOCKER3(measurementStatusが暗黙にMEASUREDへdefaultしていた)を解消したことを検証する。
+ */
+describe("F5c1 contract executability (PR #190 review follow-up)", () => {
+  const byNo = (no: number) => F5C_CANDIDATE_SWEEP_PLANS.find(({ candidateNo }) => candidateNo === no)!;
+
+  it("A. all 11 READY STRUCTURAL_FIXED plans have executable fixedCriteria", () => {
+    const structuralFixed = F5C_CANDIDATE_SWEEP_PLANS.filter(({ thresholdCategory }) => thresholdCategory === "STRUCTURAL_FIXED");
+    expect(structuralFixed).toHaveLength(11);
+    expect(structuralFixed.map(({ candidateNo }) => candidateNo)).toEqual([38, 50, 58, 65, 66, 70, 74, 80, 83, 84, 85]);
+    for (const candidatePlan of structuralFixed) {
+      expect(candidatePlan.fixedCriteria.length).toBeGreaterThan(0);
+      expect(candidatePlan.axes).toEqual([]);
+      for (const criterion of candidatePlan.fixedCriteria) {
+        expect(["METRIC_COMPARE", "METRIC_BOOLEAN_TRUE", "ANY_METRIC_POSITIVE", "JOINT_STRUCTURAL_FACT"]).toContain(criterion.kind);
+      }
+    }
+  });
+
+  it("B. all 6 READY MANIFEST_DEPENDENT plans have canonical manifestRef", () => {
+    const manifestDependent = F5C_CANDIDATE_SWEEP_PLANS.filter(({ thresholdCategory }) => thresholdCategory === "MANIFEST_DEPENDENT");
+    expect(manifestDependent).toHaveLength(6);
+    expect(manifestDependent.map(({ candidateNo }) => candidateNo)).toEqual([63, 69, 86, 87, 88, 89]);
+    for (const candidatePlan of manifestDependent) {
+      expect(candidatePlan.manifestRef).not.toBeNull();
+      expect(["ECONOMY_SEMANTIC_FAMILIES", "CASINO_EDITION", "CASTLE_EDITION"]).toContain(candidatePlan.manifestRef!.kind);
+    }
+    expect(byNo(63).manifestRef).toEqual({ kind: "ECONOMY_SEMANTIC_FAMILIES", version: 1 });
+    expect(byNo(69).manifestRef).toEqual({ kind: "CASINO_EDITION", editionKey: "casino-edition-i", version: 1 });
+    for (const no of [86, 87, 88, 89]) {
+      expect(byNo(no).manifestRef).toEqual({ kind: "CASTLE_EDITION", editionKey: "castle-experience-edition-i", version: 1 });
+    }
+  });
+
+  it("C. No.61 has machine-readable natural inflow + outflow fixed criteria", () => {
+    const plan61 = byNo(61);
+    expect(plan61.fixedCriteria).toEqual([
+      { kind: "METRIC_BOOLEAN_TRUE", metricKey: "hasNaturalInflow" },
+      { kind: "METRIC_BOOLEAN_TRUE", metricKey: "hasNaturalOutflow" },
+    ]);
+    expect(plan61.axes.length).toBeGreaterThan(0);
+  });
+
+  it("D. No.77 has a machine-readable structural chronology requirement", () => {
+    const plan77 = byNo(77);
+    expect(plan77.thresholdCategory).toBe("STRUCTURAL_PLUS_DISTRIBUTION");
+    const chronologyFacts = plan77.fixedCriteria.filter((c) => c.kind === "JOINT_STRUCTURAL_FACT");
+    expect(chronologyFacts.map((c) => (c as { selector: string }).selector).sort()).toEqual([
+      "profiles.root-before-child",
+      "profiles.same-day-before-entry",
+    ]);
+    expect(plan77.fixedCriteria.some((c) => c.kind === "METRIC_COMPARE")).toBe(true);
+    // chronologyはfixedCriteriaへ移動済み——axes側にはboolean chronologyのAT_LEASTが残っていない
+    expect(plan77.axes.every((axis) => axis.source !== "JOINT_EVIDENCE" || (axis.selector !== "profiles.root-before-child" && axis.selector !== "profiles.same-day-before-entry"))).toBe(true);
+    expect(plan77.axes.length).toBeGreaterThan(0);
+  });
+
+  it("E. No.83 encodes participant-only AND staff-or-organizer without prose parsing", () => {
+    const plan83 = byNo(83);
+    expect(plan83.fixedCriteria).toEqual([
+      { kind: "METRIC_COMPARE", metricKey: "participantOnlyCount", operator: "GTE", fixedValue: 1 },
+      { kind: "ANY_METRIC_POSITIVE", metricKeys: ["staffCount", "organizerCount"] },
+    ]);
+  });
+
+  it("F. No.85 encodes exact structural family breadth", () => {
+    expect(byNo(85).fixedCriteria).toEqual([{ kind: "METRIC_COMPARE", metricKey: "activeFamilyCount", operator: "GTE", fixedValue: 2 }]);
+  });
+
+  it("G. No.32-35 use circular time-window axis semantics, not scalar AT_LEAST hour boundary", () => {
+    for (const no of [32, 33, 34, 35]) {
+      const boundaryAxis = byNo(no).axes.find((axis) => axis.axisKey === `candidate-${no}-daypart-boundary`)!;
+      expect(boundaryAxis.reducerKind).toBe("CIRCULAR_HOUR_WINDOW");
+      expect(boundaryAxis.boundaryMethod).toBe("CIRCULAR_CANDIDATE_ENUMERATION");
+      expect("operator" in boundaryAxis).toBe(false);
+    }
+  });
+
+  it("H. No.42 proves same-row TC filtering/reduction is represented", () => {
+    const axes = byNo(42).axes;
+    const rowGroupKeys = new Set(axes.map((axis) => (axis.source === "JOINT_EVIDENCE" ? axis.rowGroupKey : null)));
+    expect(rowGroupKeys.size).toBe(1);
+    expect(axes.some((axis) => axis.reducerKind === "SCALAR_SAMPLE")).toBe(true);
+    expect(axes.some((axis) => axis.reducerKind === "FILTER_THEN_DISTINCT_DAYS")).toBe(true);
+  });
+
+  it("I. No.26/27 represent matching-after-edge-filter", () => {
+    for (const no of [26, 27]) {
+      const matchingAxis = byNo(no).axes.find((axis) => axis.reducerKind === "MATCHING_AFTER_EDGE_FILTER")!;
+      expect(matchingAxis).toBeDefined();
+      expect(matchingAxis.boundaryMethod).toBe("RECOMPUTED_AFTER_EDGE_FILTER");
+      expect("operator" in matchingAxis).toBe(false);
+      const filterAxis = byNo(no).axes.find((axis) => axis.reducerKind === "SCALAR_SAMPLE")!;
+      expect(filterAxis).toBeDefined();
+      expect(filterAxis.source === "JOINT_EVIDENCE" && filterAxis.rowGroupKey).toBe(
+        matchingAxis.source === "JOINT_EVIDENCE" ? matchingAxis.rowGroupKey : undefined,
+      );
+    }
+  });
+
+  it("J. all JOINT_CORRELATION plans have an executable reducer shape", () => {
+    const jointCorrelationPlans = F5C_CANDIDATE_SWEEP_PLANS.filter(({ evaluationShape }) => evaluationShape === "JOINT_CORRELATION");
+    expect(jointCorrelationPlans.length).toBeGreaterThan(0);
+    for (const candidatePlan of jointCorrelationPlans) {
+      expect(candidatePlan.requiredJointEvidence.kind).not.toBe("none");
+      expect(candidatePlan.axes.length).toBeGreaterThan(0);
+      for (const axis of candidatePlan.axes) {
+        if (axis.source !== "JOINT_EVIDENCE") continue;
+        expect(axis.rowGroupKey.length).toBeGreaterThan(0);
+        expect([
+          "SCALAR_SAMPLE", "FILTER_THEN_COUNT", "FILTER_THEN_DISTINCT_DAYS", "FILTER_THEN_SHARE",
+          "GROUP_FILTER_THEN_MAX", "MATCHING_AFTER_EDGE_FILTER", "CIRCULAR_HOUR_WINDOW", "SET_BREADTH", "REPEAT_PERIOD",
+        ]).toContain(axis.reducerKind);
+      }
+    }
+  });
+
+  it("K. THRESHOLD_PENDING numeric selected values remain zero", () => {
+    const audit = auditF5cCandidateSweepPlans();
+    expect(audit.numericThresholdValueCount).toBe(0);
+    const thresholdPending = F5C_CANDIDATE_SWEEP_PLANS.filter(({ thresholdCategory }) => thresholdCategory === "THRESHOLD_PENDING");
+    expect(thresholdPending).toHaveLength(58);
+    for (const candidatePlan of thresholdPending) expect(candidatePlan.axes.length).toBeGreaterThan(0);
+  });
+
+  it("L. measurementStatus has no implicit default", () => {
+    expect(() => f5cInternal.plan(2, "STRUCTURAL_PRESENCE", ["eventCount"], undefined as never, {})).not.toThrow();
+    expect(() => f5cInternal.materializePlan(f5cInternal.plan(2, "STRUCTURAL_PRESENCE", ["eventCount"], undefined as never, {}))).toThrow(
+      /measurementStatus must be explicit/,
+    );
+    // measuredPlan()は常に明示的にMEASUREDを設定する
+    const measured = f5cInternal.measuredPlan(2, "STRUCTURAL_PRESENCE", ["eventCount"], {});
+    expect(measured.measurementStatus).toBe("MEASURED");
+    expect(f5cInternal.materializePlan(measured).measurementStatus).toBe("MEASURED");
+    // gapPlan()はgapReason必須・axes禁止
+    expect(() => f5cInternal.gapPlan(2, "STRUCTURAL_PRESENCE", ["eventCount"], "")).toThrow(/gapReason/);
+    const gap = f5cInternal.gapPlan(2, "STRUCTURAL_PRESENCE", ["eventCount"], "source not yet wired");
+    expect(gap.measurementStatus).toBe("MEASUREMENT_GAP");
+    const materializedGap = f5cInternal.materializePlan(gap);
+    expect(materializedGap.measurementStatus).toBe("MEASUREMENT_GAP");
+    expect(materializedGap.gapReason).toBe("source not yet wired");
+    expect(materializedGap.axes).toEqual([]);
+    // TypeScriptレベルでもgapPlan()にaxesは渡せない（コンパイルできない）ため、
+    // 実行時にも直接plan()経由でMEASUREMENT_GAP+axesを組むとfail-closedでrejectされることを確認する
+    expect(() =>
+      f5cInternal.materializePlan(
+        f5cInternal.plan(2, "STRUCTURAL_PRESENCE", ["eventCount"], "MEASUREMENT_GAP", {
+          gapReason: "source not yet wired",
+          axes: [{ axisKey: "x", source: "METRIC", metricKey: "eventCount", operator: "AT_LEAST", boundaryMethod: "OBSERVED_NEAREST_RANK", reducerKind: "SCALAR_METRIC" }],
+        }),
+      ),
+    ).toThrow(/must not declare sweep axes/);
+  });
+
+  it("M. audit returns unexecutablePlanCount = 0", () => {
+    const audit = auditF5cCandidateSweepPlans();
+    expect(audit.unexecutablePlanCount).toBe(0);
+    expect(audit.unexecutablePlanCandidateNos).toEqual([]);
+    expect(audit.declaredMeasurementGapCount).toBe(0);
+    expect(audit.manifestRefMismatches).toEqual([]);
   });
 });

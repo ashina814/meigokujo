@@ -37,6 +37,16 @@ const EXCLUDED_ECONOMY_TRANSACTION_TYPES = [
  * Titles v2のstable economy semantic family manifest。knownTxTypes()やpublicLogから
  * 自動拡張しない。新機能を称号familyへ入れるには、このmanifestとregressionの明示reviewが必要。
  */
+/**
+ * F5c1レビュー§5: economy semantic family manifestには`CASINO_EDITION_I_MANIFEST`/
+ * `CASTLE_EXPERIENCE_EDITION_I_MANIFEST`のような`version`fieldが無かった。familyの集合
+ * （`ECONOMY_FEATURE_FAMILY_MANIFEST`のkey set）自体は`Object.keys()`で列挙されるため、
+ * その中へversionを混ぜるとfamily集合が汚染される——別の定数として置く。将来この
+ * manifestの意味（family追加・削除・semantics変更）が変わったら、この値を明示的に
+ * 上げる。F5c1 sweep planの`F5cManifestRef`はこの定数を直接参照し、値を複製しない。
+ */
+export const ECONOMY_FEATURE_FAMILY_MANIFEST_VERSION = 1 as const;
+
 export const ECONOMY_FEATURE_FAMILY_MANIFEST = {
   peer_transfer: {
     canonicalSource: "ledger_transactions",
