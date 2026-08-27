@@ -104,7 +104,7 @@ describe("F5c1 READY-76 sweep contract", () => {
       }
       for (const axis of candidatePlan.axes) {
         if (axis.reducerKind === "CIRCULAR_HOUR_WINDOW") {
-          expect(axis.boundaryMethod).toBe("CIRCULAR_CANDIDATE_ENUMERATION");
+          expect(axis.boundaryMethod).toBe("CIRCULAR_ANALYSIS");
           expect("operator" in axis).toBe(false);
         } else {
           expect(axis.boundaryMethod).toBe("OBSERVED_NEAREST_RANK");
@@ -263,7 +263,7 @@ describe("F5c1 contract executability (PR #190 review follow-up)", () => {
     for (const no of [32, 33, 34, 35]) {
       const boundaryAxis = byNo(no).axes.find((axis) => axis.axisKey === `candidate-${no}-daypart-boundary`)!;
       expect(boundaryAxis.reducerKind).toBe("CIRCULAR_HOUR_WINDOW");
-      expect(boundaryAxis.boundaryMethod).toBe("CIRCULAR_CANDIDATE_ENUMERATION");
+      expect(boundaryAxis.boundaryMethod).toBe("CIRCULAR_ANALYSIS");
       expect("operator" in boundaryAxis).toBe(false);
     }
   });
@@ -454,10 +454,17 @@ describe("F5c1 contract executability round 3 (manifest pin drift / typed confor
     }
     const audit = auditF5cCandidateSweepPlans();
     expect(audit.rowGroupsMissingComposition).toEqual([]);
-    // A. No.42 TC start: quiet-before + continuation-gap qualify the SAME row conjunctively
-    expect(byNo(42).rowGroupCompositions).toEqual([{ rowGroupKey: "tc-start-rows", composition: "ALL_FILTERS" }]);
+    // A. No.42 TC start: quiet-before + continuation-gap qualify the SAME row conjunctively,
+    // with no structural row predicate (that dimension is specific to the daypart candidates)
+    expect(byNo(42).rowGroupCompositions).toEqual([{ rowGroupKey: "tc-start-rows", composition: "ALL_FILTERS", rowPredicate: null }]);
     // B. No.32-37 TC/VC multimodal social evidence: either modality qualifies (not AND)
     expect(byNo(32).rowGroupCompositions[0]!.composition).toBe("ANY_FILTER");
+    // C. PR #191レビュー第6ラウンド§1: No.32-35 additionally scope the whole row group to their
+    // own target quadrant, independently of the TC/VC modality composition above.
+    expect(byNo(32).rowGroupCompositions[0]!.rowPredicate).toEqual({ kind: "HOUR_IN_QUADRANT", quadrant: "QUADRANT_1" });
+    expect(byNo(35).rowGroupCompositions[0]!.rowPredicate).toEqual({ kind: "HOUR_IN_QUADRANT", quadrant: "QUADRANT_0" });
+    // No.37 (multi-daypart spread) must NOT be quadrant-scoped — that would destroy its semantic.
+    expect(byNo(37).rowGroupCompositions[0]!.rowPredicate).toBeNull();
   });
 });
 
