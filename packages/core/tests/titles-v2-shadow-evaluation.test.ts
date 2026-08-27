@@ -10,7 +10,8 @@ import { TcSocialObservations } from "../src/tc-social/service.js";
 import { VcPublicSocialPresence } from "../src/vc/public-social-presence.js";
 import {
   F5C_CANDIDATE_SWEEP_PLANS, F5C_SWEEP_CONTRACT_VERSION, F5C1_MANIFEST_PINS,
-  CIRCULAR_QUADRANT_HOUR_RANGES, MULTI_DAYPART_RECURRENCE_MIN_DAYS,
+  CIRCULAR_QUADRANT_HOUR_RANGES, MULTI_DAYPART_RECURRENCE_MIN_DAYS, PERSONAL_STABILITY_WINDOW_HOURS,
+  auditF5cCandidateSweepPlans, countSuspectedThresholdValues,
   type F5cCandidateSweepPlan,
 } from "../src/titles/v2-calibration-sweep.js";
 import { CALIBRATION_SCHEMA_VERSION, CALIBRATION_PERCENTILE_METHOD, canonicalReadinessHash } from "../src/titles/v2-calibration.js";
@@ -255,6 +256,68 @@ describe("F5c2 shadow-calibration executor", () => {
     expect(sweep.hourHistogram![15]).toBe(0);
   });
 
+  it("No.32-35: 1 target-daypart day + 9 non-target days does NOT become 10 target-daypart qualifying days, nor 100% target prominence (PR #191レビュー第6ラウンド§1 counterexample)", () => {
+    // alice: exactly 1 morning (Q1) day + 9 evening (Q3) days. EVERY row passes the TC/VC social
+    // filters, so before the row-group structural predicate the qualifying-days reduction saw all
+    // 10 days and the share reduction saw 10/10 — reading a mostly-evening subject as a perfect
+    // "morning" candidate. With the predicate, No.32 (morning) must see 1 day and 1/10 share.
+    const probeKey = probeKeyFor(32);
+    const rows = [
+      { dayOffset: 1, hour: 8, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 500 },
+      ...Array.from({ length: 9 }, (_, i) => ({ dayOffset: i + 2, hour: 20, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 500 })),
+    ];
+    const report = executeF5cShadowCalibration(collection([
+      subject("alice", [{ probeKey, jointEvidence: { kind: "activity-time-day-hour-v1", rows } }]),
+    ]), true);
+    const plan32 = byNo(report, 32);
+    const days = plan32.axisSweeps.find((s) => s.axisKey === "candidate-32-qualifying-days")!;
+    const share = plan32.axisSweeps.find((s) => s.axisKey === "candidate-32-activity-share")!;
+    // single-subject population -> the p50 boundary IS alice's own reduced value.
+    expect(days.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue).toBe(1);
+    expect(share.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue).toBeCloseTo(0.1, 10);
+
+    // ...and the mirror candidate targeting the daypart she actually lives in sees 9 / 0.9.
+    const plan34 = byNo(report, 34);
+    const days34 = plan34.axisSweeps.find((s) => s.axisKey === "candidate-34-qualifying-days")!;
+    const share34 = plan34.axisSweeps.find((s) => s.axisKey === "candidate-34-activity-share")!;
+    expect(days34.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue).toBe(9);
+    expect(share34.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue).toBeCloseTo(0.9, 10);
+  });
+
+  it("No.32-35 target-daypart evidence stays representable through BOTH modalities — TC-only and VC-only subjects each reach the same in-target day count (PR #191レビュー第6ラウンド§1/§8)", () => {
+    const probeKey = probeKeyFor(32);
+    // tcOnly qualifies purely through the TC gap filter (VC seconds pinned at 0); vcOnly purely
+    // through VC seconds (TC gap absent). Both have the same 2 morning days.
+    const tcOnly = subject("tcOnly", [{
+      probeKey,
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: [
+          { dayOffset: 1, hour: 8, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 0 },
+          { dayOffset: 2, hour: 9, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 0 },
+        ],
+      },
+    }]);
+    const vcOnly = subject("vcOnly", [{
+      probeKey,
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: [
+          { dayOffset: 1, hour: 8, tcBestOtherGapMs: null, vcTrustedSocialSeconds: 500 },
+          { dayOffset: 2, hour: 9, tcBestOtherGapMs: null, vcTrustedSocialSeconds: 500 },
+        ],
+      },
+    }]);
+    const report = executeF5cShadowCalibration(collection([tcOnly, vcOnly]), true);
+    const days = byNo(report, 32).axisSweeps.find((s) => s.axisKey === "candidate-32-qualifying-days")!;
+    const share = byNo(report, 32).axisSweeps.find((s) => s.axisKey === "candidate-32-activity-share")!;
+    // both subjects reduce to the same value, so every percentile of the 2-sample pool is 2 / 1.0
+    // — neither modality is silently excluded from the target-daypart day count or prominence.
+    for (const point of days.boundaryPoints) expect(point.boundaryValue).toBe(2);
+    for (const point of share.boundaryPoints) expect(point.boundaryValue).toBeCloseTo(1, 10);
+    expect(days.boundaryPoints.find((p) => p.percentile === 50)!.knownCount).toBe(2);
+  });
+
   it("No.32/34 DAYPART_TARGET candidates target disjoint quadrants matching the catalog semantic and can diverge on the identical population (PR #191レビュー第4ラウンド§2/§3 counterexample)", () => {
     // No.32 (朝番/morning) targets QUADRANT_1=[6,12); No.34 (宵っ張り/evening~pre-midnight)
     // targets QUADRANT_3=[18,24) — the catalog-correct mapping (not the candidate-ordinal-based
@@ -456,14 +519,57 @@ describe("F5c2 shadow-calibration executor", () => {
     // the boundary VALUE computed is identical either way — only its labeled trustworthiness changes.
     expect(metricUnvalidated.boundaryPoints).toEqual(metricValidated.boundaryPoints);
 
-    // No.32's daypart-boundary axis (DAYPART_TARGET, a plain in-quadrant row count with no
-    // sibling filter) is a genuine monotonic-lower-bound reduction -> OBSERVED_LOWER_BOUND.
+    // No.36's usual-time-qualifying-days (FILTER_THEN_DISTINCT_DAYS whose row group has NO
+    // SCALAR_SAMPLE filter sibling) is a genuine monotonic-lower-bound reduction across the whole
+    // pipeline -> OBSERVED_LOWER_BOUND.
+    const probeKey36 = probeKeyFor(36);
+    const unfiltered = executeF5cShadowCalibration(collection([
+      subject("alice", [{
+        probeKey: probeKey36,
+        metrics: { vcTop3HoursShare: 1, vcTotalTrustedSeconds: 1000 },
+        jointEvidence: { kind: "activity-time-day-hour-v1", rows: [{ dayOffset: 1, hour: 8, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 500 }] },
+      }]),
+    ]), false);
+    const daysSweep = byNo(unfiltered, 36).axisSweeps.find((s) => s.axisKey === "usual-time-qualifying-days")!;
+    expect(daysSweep.boundaryReliability).toBe("OBSERVED_LOWER_BOUND");
+  });
+
+  it("special circular execution paths do NOT self-certify as OBSERVED_LOWER_BOUND when their rows already passed sibling SCALAR_SAMPLE filters (PR #191レビュー第6ラウンド§2 counterexample)", () => {
+    // No.32's DAYPART_TARGET axis reduces to an in-quadrant row COUNT — monotonic in isolation —
+    // but it consumes rows that already passed the tc-gap/vc-seconds filters, whose own behavior
+    // under undercounting is unproven. The whole pipeline therefore proves no direction.
     const probeKey32 = probeKeyFor(32);
-    const withCountAxis = (validatedFlag: boolean) => executeF5cShadowCalibration(collection([
+    const report32 = executeF5cShadowCalibration(collection([
       subject("alice", [{ probeKey: probeKey32, jointEvidence: { kind: "activity-time-day-hour-v1", rows: [{ dayOffset: 1, hour: 8, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 500 }] } }]),
-    ]), validatedFlag);
-    const countUnvalidated = byNo(withCountAxis(false), 32).axisSweeps.find((s) => s.axisKey === "candidate-32-daypart-boundary")!;
-    expect(countUnvalidated.boundaryReliability).toBe("OBSERVED_LOWER_BOUND");
+    ]), false);
+    const daypartSweep = byNo(report32, 32).axisSweeps.find((s) => s.axisKey === "candidate-32-daypart-boundary")!;
+    expect(daypartSweep.boundaryReliability).toBe("OBSERVED_DIRECTION_UNKNOWN");
+
+    // No.37's MULTI_DAYPART_BREADTH is the same story (a recurring-quadrant breadth count behind
+    // the same TC/VC filters).
+    const probeKey37 = probeKeyFor(37);
+    const report37 = executeF5cShadowCalibration(collection([
+      subject("alice", [{ probeKey: probeKey37, jointEvidence: { kind: "activity-time-day-hour-v1", rows: [{ dayOffset: 1, hour: 8, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 500 }] } }]),
+    ]), false);
+    const breadthSweep = byNo(report37, 37).axisSweeps.find((s) => s.axisKey === "multi-daypart-boundaries")!;
+    expect(breadthSweep.boundaryReliability).toBe("OBSERVED_DIRECTION_UNKNOWN");
+  });
+
+  it("POST_FILTER_MATCHING_SIZE does not claim OBSERVED_LOWER_BOUND — its graph-theoretic monotonicity holds only for a FIXED edge threshold, and its edge threshold is itself an observed percentile (PR #191レビュー第6ラウンド§2 counterexample)", () => {
+    const evidence: PlanningCalibrationJointEvidence = {
+      kind: "social-context-graph-v1",
+      dimension: "class",
+      counterparts: [
+        { counterpartOrdinal: 0, touches: [{ semanticIndex: 0, days: [{ dayOffset: 1, trustedSeconds: 100 }] }, { semanticIndex: 1, days: [{ dayOffset: 1, trustedSeconds: 90 }] }] },
+        { counterpartOrdinal: 1, touches: [{ semanticIndex: 1, days: [{ dayOffset: 1, trustedSeconds: 80 }] }] },
+      ],
+    };
+    const report = executeF5cShadowCalibration(collection([
+      subject("alice", [{ probeKey: "social-class-context-v1", jointEvidence: evidence }]),
+    ]), false);
+    const matchingSweep = byNo(report, 26).axisSweeps.find((s) => s.axisKey === "class-person-matching")!;
+    expect(matchingSweep.reducerKind).toBe("POST_FILTER_MATCHING_SIZE");
+    expect(matchingSweep.boundaryReliability).toBe("OBSERVED_DIRECTION_UNKNOWN");
   });
 
   it("No.36 PERSONAL_STABILITY (a non-monotonic share statistic) also collapses to UNKNOWN when unvalidated, not just monotonic count axes (PR #191レビュー第5ラウンド§1/§8)", () => {
@@ -536,6 +642,140 @@ describe("F5c2 shadow-calibration executor", () => {
       const inQuadrantCount = sweep.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue;
       expect(inQuadrantCount).toBe(quadrant === "QUADRANT_1" ? 1 : 0);
     }
+  });
+
+  it("No.36's PERSONAL_STABILITY analysis window width is a shared F5c1 contract constant, not a private F5c2 literal (PR #191レビュー第6ラウンド§3)", () => {
+    const plan36 = F5C_CANDIDATE_SWEEP_PLANS.find((p) => p.candidateNo === 36)!;
+    const circularAxis = plan36.axes.find((a) => a.reducerKind === "CIRCULAR_HOUR_WINDOW") as { readonly circularIntent: { readonly kind: string; readonly windowLengthHours?: number } };
+    expect(circularAxis.circularIntent.kind).toBe("PERSONAL_STABILITY");
+    expect(circularAxis.circularIntent.windowLengthHours).toBe(PERSONAL_STABILITY_WINDOW_HOURS);
+    // F5c2 must consume it, not keep its own copy of the number.
+    const source = require("node:fs").readFileSync(new URL("../src/titles/v2-shadow-evaluation.ts", import.meta.url), "utf8") as string;
+    expect(source).toContain("windowLengthHours");
+    expect(source).not.toContain("CIRCULAR_WINDOW_LENGTH_HOURS");
+
+    // functional drift proof: a subject whose activity spans exactly the contract width has a
+    // perfect stability share; one spanning strictly wider than it does not.
+    const probeKey = probeKeyFor(36);
+    const daily = (id: string, hours: readonly number[]) => subject(id, [{
+      probeKey,
+      metrics: { vcTop3HoursShare: 1, vcTotalTrustedSeconds: 1000 },
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: hours.map((hour, i) => ({ dayOffset: i + 1, hour, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 })),
+      },
+    }]);
+    const width = PERSONAL_STABILITY_WINDOW_HOURS;
+    const insideWindow = Array.from({ length: width }, (_, i) => i); // hours 0..width-1 — one window covers all
+    const strictlyWider = [...insideWindow, width]; // one extra hour that no single window can also cover
+    const report = executeF5cShadowCalibration(collection([daily("tight", insideWindow), daily("wide", strictlyWider)]), true);
+    const sweep = byNo(report, 36).axisSweeps.find((s) => s.axisKey === "usual-time-start-hour-stability")!;
+    // shares are 1.0 (tight) and width/(width+1) (wide) -> the p50 of a 2-sample pool is the lower.
+    expect(sweep.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue).toBeCloseTo(width / (width + 1), 10);
+    expect(sweep.boundaryPoints.find((p) => p.percentile === 99)!.boundaryValue).toBeCloseTo(1, 10);
+  });
+
+  it("docs/titles-v2-design.md §14.11 describes the CURRENT F5c2 contract — live version numbers, and no removed field/strategy names outside the clearly-marked historical block (PR #191レビュー第6ラウンド§6)", () => {
+    const doc = require("node:fs").readFileSync(new URL("../../../docs/titles-v2-design.md", import.meta.url), "utf8") as string;
+    const start = doc.indexOf("## 14.11 F5c2");
+    const historyStart = doc.indexOf("### 14.11.1 レビュー往復の履歴");
+    const nextSection = doc.indexOf("\n## 15.");
+    expect(start).toBeGreaterThan(-1);
+    expect(historyStart).toBeGreaterThan(start);
+    expect(nextSection).toBeGreaterThan(historyStart);
+
+    // (a) the canonical part states the live contract versions, read from the code constants.
+    const canonical = doc.slice(start, historyStart);
+    expect(canonical).toContain(`F5C_SWEEP_CONTRACT_VERSION = ${F5C_SWEEP_CONTRACT_VERSION}`);
+    expect(canonical).toContain(`F5C2_SHADOW_CONTRACT_VERSION = ${F5C2_SHADOW_CONTRACT_VERSION}`);
+
+    // (b) no removed field/strategy name may appear in the canonical part. (They may appear in
+    // the history block, which explicitly says they no longer exist.)
+    for (const removed of [
+      "circularWindowPoints", "OBSERVED_COMPLETE", "OBSERVED_LOWER_BOUND_ONLY",
+      "zeroSensitiveOutcome", "CIRCULAR_CANDIDATE_ENUMERATION", "CIRCULAR_WINDOW_LENGTH_HOURS",
+      "SUPPORTED_JOINT_SELECTORS",
+    ]) {
+      expect(canonical).not.toContain(removed);
+    }
+
+    // (c) the canonical part names what actually exists now.
+    for (const current of [
+      "MARGINAL_AXIS_ONLY", "JOINT_ROW_RESOLVERS", "CIRCULAR_QUADRANT_HOUR_RANGES",
+      "PERSONAL_STABILITY_WINDOW_HOURS", "MULTI_DAYPART_RECURRENCE_MIN_DAYS",
+      "percentileBoundaryOutcome", "COVERAGE_ATTESTED", "OBSERVED_DIRECTION_UNKNOWN",
+      "rowPredicate", "CIRCULAR_ANALYSIS",
+    ]) {
+      expect(canonical).toContain(current);
+    }
+
+    // (d) the history block is explicitly labelled as not-current.
+    expect(doc.slice(historyStart, nextSection)).toContain("既に存在");
+  });
+
+  it("the production-threshold audit exempts only the named calibration-analysis fields under circularIntent — an unexpected numeric field there still fails closed (PR #191レビュー第6ラウンド§5)", () => {
+    // baseline: the real READY-76 set has zero suspected production thresholds, and the two
+    // legitimate analysis constants (recurrence min-days, stability window width) are actually
+    // present in the plans — i.e. the exemption is doing real work, not vacuous.
+    expect(auditF5cCandidateSweepPlans().numericThresholdValueCount).toBe(0);
+    const intents = F5C_CANDIDATE_SWEEP_PLANS.flatMap((p) => p.axes)
+      .filter((a) => a.reducerKind === "CIRCULAR_HOUR_WINDOW")
+      .map((a) => (a as { readonly circularIntent: Record<string, unknown> }).circularIntent);
+    expect(intents.some((i) => i.minDistinctDaysPerQuadrant === MULTI_DAYPART_RECURRENCE_MIN_DAYS)).toBe(true);
+    expect(intents.some((i) => i.windowLengthHours === PERSONAL_STABILITY_WINDOW_HOURS)).toBe(true);
+
+    // the real circular axes read as zero through the shared counting seam...
+    const realCircularAxes = F5C_CANDIDATE_SWEEP_PLANS.flatMap((p) => p.axes).filter((a) => a.reducerKind === "CIRCULAR_HOUR_WINDOW");
+    expect(countSuspectedThresholdValues(realCircularAxes)).toBe(0);
+
+    // ...but a NEW numeric field smuggled onto a circular intent is still counted, so
+    // `circularIntent` cannot become a permanent hiding place for a production threshold.
+    const smuggled = realCircularAxes.map((axis) => ({
+      ...axis,
+      circularIntent: { ...(axis as { readonly circularIntent: object }).circularIntent, sneakyProductionCutoff: 7 },
+    }));
+    expect(countSuspectedThresholdValues(smuggled)).toBe(realCircularAxes.length);
+
+    // nor can nesting under a circularIntent inherit the allowlist.
+    const nested = [{ circularIntent: { kind: "DAYPART_TARGET", nested: { windowLengthHours: 8 } } }];
+    expect(countSuspectedThresholdValues(nested)).toBe(1);
+  });
+
+  it("No.56 FILTER_THEN_SPAN_DAYS over an empty qualifying set is null (not-computable), never an observed numeric zero, and never enters the percentile pool (PR #191レビュー第6ラウンド§4)", () => {
+    const probeKey = probeKeyFor(56);
+    // alice: a known evidence pack whose own-use day set is genuinely empty (only hosted rows,
+    // semanticIndex 0) -> span is not computable. bob/carol have real own-use spans.
+    const alice = subject("alice", [{
+      probeKey,
+      jointEvidence: {
+        kind: "domain-social-time-v1",
+        domain: "public-room",
+        domainDays: [{ dayOffset: 5, semanticIndex: 0, magnitude: 99 }],
+        socialHours: [],
+      },
+    }]);
+    const withOwnUse = (id: string, dayOffsets: readonly number[]) => subject(id, [{
+      probeKey,
+      jointEvidence: {
+        kind: "domain-social-time-v1",
+        domain: "public-room",
+        domainDays: dayOffsets.map((dayOffset) => ({ dayOffset, semanticIndex: 2, magnitude: 1 })),
+        socialHours: [],
+      },
+    }]);
+    const report = executeF5cShadowCalibration(collection([alice, withOwnUse("bob", [1, 4]), withOwnUse("carol", [1, 10])]), true);
+    const spanSweep = byNo(report, 56).axisSweeps.find((s) => s.axisKey === "own-room-use-span")!;
+    expect(spanSweep.reducerKind).toBe("FILTER_THEN_SPAN_DAYS");
+    // only bob (span 4) and carol (span 10) are computable — alice contributes NO sample at all.
+    // A buggy `0` would have made the pool [0,4,10] with a p50 of 4 and knownCount 3.
+    expect(spanSweep.observedSampleCount).toBe(2);
+    expect(spanSweep.boundaryPoints.find((p) => p.percentile === 50)!.knownCount).toBe(2);
+    expect(spanSweep.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue).toBe(4);
+    expect(spanSweep.boundaryPoints.every((p) => p.boundaryValue !== 0)).toBe(true);
+    // At candidate level alice is NOT_MATCHED — but that verdict comes from the sibling
+    // own-room-use-days axis (a genuine observed zero distinct days), not from the span axis
+    // inventing a zero: Kleene AND lets that definite false dominate the span's UNKNOWN.
+    expect(byNo(report, 56).notMatchedCount).toBe(1);
   });
 
   it("No.37's recurrence requirement (>=N distinct days per quadrant) is a shared F5c1 contract constant, not a private F5c2 executor literal (PR #191レビュー第5ラウンド§5)", () => {

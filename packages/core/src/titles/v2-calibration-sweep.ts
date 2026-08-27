@@ -12,7 +12,7 @@ import {
 } from "./v2-calibration.js";
 
 /** Planning-only contract. Never import from evaluator, pipeline, Bot, or the public v2 barrel. */
-export const F5C_SWEEP_CONTRACT_VERSION = 7 as const;
+export const F5C_SWEEP_CONTRACT_VERSION = 8 as const;
 
 /**
  * PR #190レビュー第3ラウンド§1: 「manifestが将来改訂されても、古いF5c sweep
@@ -285,9 +285,20 @@ export const CIRCULAR_QUADRANT_HOUR_RANGES: Readonly<Record<F5cCircularQuadrant,
  */
 export const MULTI_DAYPART_RECURRENCE_MIN_DAYS = 2 as const;
 
+/**
+ * PR #191レビュー第6ラウンド§3: PERSONAL_STABILITY（No.36）が「本人にとって最良の
+ * 連続window」を測るときのwindow幅。これはF5c2が発明してよい数値ではなく——
+ * quadrant latticeと同じく——F5c1が確定させるcalibration-analysis解像度である
+ * （production titleのstability bandでもdaypart境界でもない: F5c1はそれらを
+ * 依然として選ばない）。1日の1/3という中立的な幅を、quadrant latticeの6時間とは
+ * 独立に置く——quadrantは「どのdaypartか」の分類解像度、こちらは「連続した活動
+ * 時間帯の広がり」の分析解像度であり、別の目的を持つ。
+ */
+export const PERSONAL_STABILITY_WINDOW_HOURS = 8 as const;
+
 export type F5cCircularIntent =
   | { readonly kind: "DAYPART_TARGET"; readonly quadrant: F5cCircularQuadrant }
-  | { readonly kind: "PERSONAL_STABILITY" }
+  | { readonly kind: "PERSONAL_STABILITY"; readonly windowLengthHours: typeof PERSONAL_STABILITY_WINDOW_HOURS }
   | { readonly kind: "MULTI_DAYPART_BREADTH"; readonly minDistinctDaysPerQuadrant: typeof MULTI_DAYPART_RECURRENCE_MIN_DAYS };
 
 interface F5cJointCircularHourAxis {
@@ -321,12 +332,36 @@ export interface F5cRequiredJointEvidence {
  * mode（ALL_FILTERS/ANY_FILTER）だけを許可する——汎用boolean DSLは作らない。
  */
 export type F5cRowGroupCompositionMode = "ALL_FILTERS" | "ANY_FILTER";
+
+/**
+ * PR #191レビュー第6ラウンド§1: No.32-35のcatalog意味論は「**対象daypartの**活動が
+ * 複数日に現れ、本人の活動分布でも際立つ」であって、「（どこかの時間帯の）活動が
+ * 複数日あり、かつ対象daypartにも何か活動がある」ではない。しかしrow groupの
+ * SCALAR_SAMPLE filter（TC gap / VC seconds）はmodalityの十分性しか見ないため、
+ * `qualifying-days`や`activity-share`のreductionは対象quadrant外の行でも通って
+ * しまい、「朝1日 + 夕方9日」を「朝10日」「朝100%」と誤読しうる。
+ *
+ * `rowPredicate`は、そのrow group内の**全**reduction（qualifying-days /
+ * activity-share / circular axis）に対して、SCALAR_SAMPLE filterのcomposition
+ * （ANY_FILTER/ALL_FILTERS——modalityの話）とは独立にANDされる構造述語である。
+ * これによりTC-only/VC-onlyのどちらの経路でqualifyしたrowも等しく対象daypartへ
+ * 絞られる（modality中立性は保たれる）。有限のkindだけを許可する——汎用の
+ * row-filter DSLは作らない。
+ */
+export type F5cRowStructuralPredicate = { readonly kind: "HOUR_IN_QUADRANT"; readonly quadrant: F5cCircularQuadrant };
+
 export interface F5cRowGroupComposition {
   readonly rowGroupKey: string;
   readonly composition: F5cRowGroupCompositionMode;
+  /** Structural AND applied to every reduction in this row group; see `F5cRowStructuralPredicate`. */
+  readonly rowPredicate: F5cRowStructuralPredicate | null;
 }
-function rowGroupComposition(rowGroupKey: string, composition: F5cRowGroupCompositionMode): F5cRowGroupComposition {
-  return { rowGroupKey, composition };
+function rowGroupComposition(
+  rowGroupKey: string,
+  composition: F5cRowGroupCompositionMode,
+  rowPredicate: F5cRowStructuralPredicate | null = null,
+): F5cRowGroupComposition {
+  return { rowGroupKey, composition, rowPredicate };
 }
 
 /**
@@ -706,7 +741,11 @@ const PLAN_INPUTS: readonly PlanInput[] = [
     requiredJointEvidence: activityJoint,
     axes: activityDayHourAxes(no, `candidate-${no}-activity-day-hour-rows`, quadrant),
     // TC/VCどちらか一方のmodalityが十分であれば行が対象になる(片方だけの必須化を避ける、§5-B)。
-    rowGroupCompositions: [rowGroupComposition(`candidate-${no}-activity-day-hour-rows`, "ANY_FILTER")],
+    // PR #191レビュー第6ラウンド§1: 加えて、このrow groupの全reduction（qualifying-days /
+    // activity-share / circular axis）は対象quadrant内のrowだけを見る——modalityの
+    // 十分性(ANY_FILTER)とは独立にANDされる構造述語。これが無いと「朝1日+夕方9日」が
+    // 「朝10日」「朝100%」に化ける。
+    rowGroupCompositions: [rowGroupComposition(`candidate-${no}-activity-day-hour-rows`, "ANY_FILTER", { kind: "HOUR_IN_QUADRANT", quadrant })],
     // PR #191レビュー第5ラウンド§4: 「daypart境界を選ばない」はproduction titleの
     // threshold選定を指す——CIRCULAR_QUADRANT_HOUR_RANGESの4等分はF5c2 shadow探索
     // 専用の中立的calibration-analysis lattice であり、これと矛盾しない。
@@ -715,7 +754,7 @@ const PLAN_INPUTS: readonly PlanInput[] = [
   measuredPlan(36, "JOINT_CORRELATION", activityMetrics, {
     requiredJointEvidence: joint("activity-time-day-hour-v1", "rows.activity-start-hour", "rows.day-hour-social-evidence", "rows.tc-gap", "rows.vc-seconds"),
     axes: [
-      circularHourAxis("usual-time-start-hour-stability", "rows.activity-start-hour", "usual-time-rows", { kind: "PERSONAL_STABILITY" }),
+      circularHourAxis("usual-time-start-hour-stability", "rows.activity-start-hour", "usual-time-rows", { kind: "PERSONAL_STABILITY", windowLengthHours: PERSONAL_STABILITY_WINDOW_HOURS }),
       jointThresholdAxis("usual-time-qualifying-days", "rows.day-hour-social-evidence", "FILTER_THEN_DISTINCT_DAYS", "usual-time-rows"),
       metricAxis("usual-time-concentration", "vcTop3HoursShare"),
       metricAxis("usual-time-sample-seconds", "vcTotalTrustedSeconds"),
@@ -1146,22 +1185,45 @@ export interface F5cCandidateSweepPlanAudit {
 }
 
 /**
- * PR #191レビュー第5ラウンド§4/§5: `entry.axes`へ埋め込まれた数値literalを、production
- * distribution boundaryが紛れ込んでいる疑いとして数える。`circularIntent`が運ぶ
- * `minDistinctDaysPerQuadrant`（No.37、`MULTI_DAYPART_RECURRENCE_MIN_DAYS`参照）は
- * production threshold ではなく、F5c1自身がこのmoduleでSSOTとして確定させた構造的
- * semantic constant（quadrant token自体——`CIRCULAR_QUADRANT_HOUR_RANGES`が運ぶ実際の
- * hour範囲——はそもそも文字列tokenとしてのみ`axes`へ現れ、対応する数値はこのmoduleの
- * 別のtop-level constantにしかない）——この監査が対象にするのはaxisへ直接埋め込まれた
- * threshold値であり、`circularIntent`はその対象から明示的に除外する（文字列へ隠して
- * 回避しているのではなく、監査の対象範囲を型で正確にする）。
+ * PR #191レビュー第5ラウンド§4/§5・第6ラウンド§5: `entry.axes`へ埋め込まれた数値
+ * literalを、production distribution boundaryが紛れ込んでいる疑いとして数える。
+ *
+ * `circularIntent`が運ぶ数値のうち、以下だけはproduction thresholdではなく、F5c1が
+ * このmoduleでSSOTとして確定させたcalibration-analysis解像度/構造的semantic constant
+ * である（それぞれの定数のdoc参照）:
+ * - `minDistinctDaysPerQuadrant` — `MULTI_DAYPART_RECURRENCE_MIN_DAYS`（No.37の
+ *   recurrence構造要件）
+ * - `windowLengthHours` — `PERSONAL_STABILITY_WINDOW_HOURS`（No.36の分析window幅）
+ *
+ * **`circularIntent`全体をblanket除外しない**（第6ラウンド§5）——将来うっかり
+ * distribution thresholdをcircular intentへ足しても、この有限allowlistに載っていない
+ * 数値fieldは従来どおり検出される（fail-closed）。allowlistに載せる=「これは分析
+ * 解像度であってthresholdではない」という明示的な宣言であり、レビュー可能な差分になる。
  */
-function countNumbers(value: unknown, key?: string): number {
-  if (key === "circularIntent") return 0;
-  if (typeof value === "number") return 1;
-  if (Array.isArray(value)) return value.reduce((sum, item) => sum + countNumbers(item), 0);
+const CIRCULAR_INTENT_ANALYSIS_FIELDS: ReadonlySet<string> = new Set([
+  "minDistinctDaysPerQuadrant",
+  "windowLengthHours",
+]);
+
+/**
+ * Exported seam so the exemption's fail-closed behavior can be exercised directly on synthetic
+ * axes (PR #191レビュー第6ラウンド§5) — `auditF5cCandidateSweepPlans()` itself is tied to the
+ * global READY-76 set and cannot be pointed at a hypothetical plan.
+ */
+export function countSuspectedThresholdValues(axes: readonly unknown[]): number {
+  return axes.reduce<number>((sum, axis) => sum + countNumbers(axis), 0);
+}
+
+function countNumbers(value: unknown, key?: string, insideCircularIntent = false): number {
+  if (typeof value === "number") {
+    return insideCircularIntent && key !== undefined && CIRCULAR_INTENT_ANALYSIS_FIELDS.has(key) ? 0 : 1;
+  }
+  if (Array.isArray(value)) return value.reduce((sum, item) => sum + countNumbers(item, undefined, insideCircularIntent), 0);
   if (value !== null && typeof value === "object") {
-    return Object.entries(value).reduce((sum, [entryKey, item]) => sum + countNumbers(item, entryKey), 0);
+    // the exemption applies only to fields directly on a circularIntent object — a nested object
+    // under it does not inherit the allowlist.
+    const childInsideIntent = key === "circularIntent";
+    return Object.entries(value).reduce((sum, [entryKey, item]) => sum + countNumbers(item, entryKey, childInsideIntent), 0);
   }
   return 0;
 }
@@ -1306,7 +1368,7 @@ export function auditF5cCandidateSweepPlans(): F5cCandidateSweepPlanAudit {
   const missingReadyCandidateNos = ready.filter(({ no }) => !planSet.has(no)).map(({ no }) => no);
   const unexpectedPlanCandidateNos = planNos.filter((no) => !readySet.has(no));
   const duplicateCount = planNos.length - planSet.size + measurementNos.length - new Set(measurementNos).size;
-  const numericThresholdValueCount = F5C_CANDIDATE_SWEEP_PLANS.reduce((sum, entry) => sum + countNumbers(entry.axes), 0);
+  const numericThresholdValueCount = F5C_CANDIDATE_SWEEP_PLANS.reduce((sum, entry) => sum + countSuspectedThresholdValues(entry.axes), 0);
   return deepFreeze({
     contractVersion: F5C_SWEEP_CONTRACT_VERSION,
     probeCount: F5C_CALIBRATION_PROBES.length,

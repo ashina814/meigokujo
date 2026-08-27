@@ -2427,498 +2427,270 @@ hosted/guest的な日オフセットが混入した場合との対比計算）�
 76/76 plan coverage・declared measurement gaps 0・unexecutable plans 0・
 numeric pending thresholds 0は不変。
 
-## 14.11 F5c2 — shadow-calibration executor
+## 14.11 F5c2 — shadow-calibration executor（現行仕様）
+
+> このセクションが F5c2 の**現行の正本**である。過去のレビュー往復で
+> 何がなぜ変わったかの経緯は §14.11.1（履歴）にまとめてあり、そちらは
+> 現行契約としては読まないこと。
 
 F5c2（`packages/core/src/titles/v2-shadow-evaluation.ts`）は、F5c1が固定した
-sweep contract（`F5C_CANDIDATE_SWEEP_PLANS`）と既存の決定的measurement
-collection（`collectF5cCalibrationMeasurements()`）を、実際に実行可能な
-shadow-calibration層へ変換する。F5c1のtyped semantics（axes/operator/
-reducerKind/rowGroupKey/rowGroupCompositions/fixedCriteria/manifestCriteria/
-manifestRef/F5C1_MANIFEST_PINS/measurementStatus）は、それ自体を再解釈せず
-そのまま実行する——production threshold・生成物としてのBehaviorTitleDefinition・
-評価器/award/通知/UIへの接続は一切追加しない。
+sweep contract（`F5C_CANDIDATE_SWEEP_PLANS`、`v2-calibration-sweep.ts`）と
+既存の決定的measurement collection（`collectF5cCalibrationMeasurements()`）を、
+実際に実行可能なshadow-calibration層へ変換する。F5c1のtyped semanticsは
+それ自体を再解釈せずそのまま実行する——production threshold・
+BehaviorTitleDefinition・評価器/award/通知/UIへの接続は一切追加しない。
+
+**契約version**: F5c1 `F5C_SWEEP_CONTRACT_VERSION = 8` /
+F5c2 `F5C2_SHADOW_CONTRACT_VERSION = 4`。どちらもreportへ転記され、
+`titles-v2-shadow-evaluation.test.ts`がversionとreportのtop-level key集合を
+直接pinしている（無言のdriftを防ぐ）。
 
 ### 実行対象
 
 READY-76全76 planを対象にする。skipは無い——`F5cCandidateShadowResult`が
-必ず76件（`F5C_CANDIDATE_SWEEP_PLANS`と同じcandidateNo集合）返り、
-`unsupportedCandidateCount`は「本当に実行できなかった」件数を明示的に
-報告する（現行READY-76では0）。候補ごとのexecution strategyは意味論に
-応じて分岐する（1つの汎用抽象へ強制しない）:
+必ず76件返り、`unsupportedCandidateCount`は「本当に実行できなかった」件数を
+明示する（現行READY-76では0）。候補ごとのexecution strategyは意味論に
+応じて分岐する:
 
-- `FIXED_CRITERIA`（11件、STRUCTURAL_FIXED）: `fixedCriteria`をmetric/joint
-  evidenceへ対して直接評価する。boundary gridは不要。
-- `MANIFEST_CRITERIA`（6件、MANIFEST_DEPENDENT）: `manifestCriteria`を
-  `F5C1_MANIFEST_PINS`由来のpinned cardinality（economy family数、
-  casino edition family数、castle edition family数/super-domain数——
-  いずれもF5c2側にliteralとして複製せず、F5c1の`F5C1_MANIFEST_PINS`を
-  直接読む）へ対して評価する。`MANIFEST_CARDINALITY_SWEEP`は本番の
-  cardinality値を選ばないが、observed母集団のrepresentative（p50）
-  boundaryに対して実際にMATCHED/NOT_MATCHEDを判定する——No.87/88の
-  prevalenceはこの次元を無視しない（PR #191レビュー§6、14.11.1参照）。
-- `METRIC_AXIS_SWEEP`（35件）: METRIC axisの観測分布からnearest-rank
-  percentile boundaryを掃引する。
-- `JOINT_EVIDENCE_SWEEP`（23件）+ `STRUCTURAL_PLUS_DISTRIBUTION`（1件、
-  No.77）: joint evidence row-levelの実データを解決し、row group単位で
-  filter/reduction/compositionを実行する（下記）。
+- `FIXED_CRITERIA`（STRUCTURAL_FIXED）: `fixedCriteria`をmetric/joint evidence
+  へ直接評価する。boundary gridは不要。
+- `MANIFEST_CRITERIA`（MANIFEST_DEPENDENT）: `manifestCriteria`を
+  `F5C1_MANIFEST_PINS`由来のpinned cardinalityへ対して評価する
+  （F5c2側にfamily数のliteralを複製しない）。`MANIFEST_CARDINALITY_SWEEP`は
+  本番値を選ばないが、観測母集団のrepresentative(p50)境界に対して実際に
+  MATCHED/NOT_MATCHEDを判定する（No.87/88のprevalenceはこの次元を無視しない）。
+- `METRIC_AXIS_SWEEP`: METRIC axisの観測分布からnearest-rank percentile
+  boundaryを掃引する。
+- `JOINT_EVIDENCE_SWEEP` + `STRUCTURAL_PLUS_DISTRIBUTION`（No.77）:
+  joint evidence row-levelの実データを解決し、row group単位で
+  filter/composition/predicate/reductionを実行する（下記）。
+- `UNSUPPORTED_GAP`: 静的auditに落ちたplan（下記「実行可能性の静的audit」）。
 
-### joint evidence row-levelの解決
+### joint evidence row-levelの解決（selector SSOT）
 
-`resolveJointRows(evidence, selector)`が、F5c1が実際に使った
-selector文字列一つ一つを、その候補の joint evidence kind の生row配列
-（`activity-time-day-hour-v1`のrows、`tc-conversation-v1`のstarts/
-revivalConversations/areas/thirdPartyJoins等）へ machine-readable に
-対応づける——F5c1のaxis定義と1:1で、この関数がF5c1のselector文字列の
-「正式な意味」を初めて機械的に確定させる。
+`JOINT_ROW_RESOLVERS`（kind → selector → resolver関数のmap）が唯一の正本で、
+「どのselectorを支持しているか」の判定と「実際にどうrowへ解決するか」を
+**同じmapから**読む——支持リストとresolver実装が別々に手で同期される
+状態を作らない。未知の`(kind, selector)`は`[]`ではなく
+`UnsupportedSelectorError`をthrowする（「有効なselectorでrow 0件」とは別状態）。
 
 各axisのreducerKindに応じて:
 
-- `SCALAR_SAMPLE`: row1件ごとの生数値をpercentile grid化する。
-- `FILTER_THEN_COUNT`/`FILTER_THEN_DISTINCT_DAYS`/`FILTER_THEN_SPAN_DAYS`/
-  `FILTER_THEN_SHARE`/`SET_BREADTH`/`REPEAT_PERIOD`/`GROUP_FILTER_THEN_MAX`:
-  同じrow groupのSCALAR_SAMPLE filter群を、`rowGroupCompositions`が
-  宣言したALL_FILTERS/ANY_FILTERで合成した後のqualifying row集合へ還元
-  し、還元結果自体の観測分布もpercentile掃引する。
-- `CIRCULAR_HOUR_WINDOW`: 24 JST hour binのqualifying-row histogramを
-  診断情報として返しつつ、固定幅（`CIRCULAR_WINDOW_LENGTH_HOURS`=8、
-  1日の1/3）のcandidate windowを開始hour 0-23で有限に列挙し
-  （`circularWindowPoints`、24点）、observed母集団のqualifying件数が
-  最大となるwindow（同数ならより小さい開始hour）を代表windowとして
-  決定論的に選び、実際にMATCHED/NOT_MATCHED合成へ寄与させる——本番の
-  window選定ではなく、観測分布がどこに集中しているかを示す診断的選択
-  （PR #191レビュー§5、14.11.1参照）。
-- `POST_FILTER_MATCHING_SIZE`: edge filter axisのrepresentative（p50）
-  boundaryにmatching computationを固定し、そのmatching-size分布自体の
-  percentile gridを報告する（pre-filterのstructuralMax metricを流用
-  しない・2つの異なる次元をpercentileラベル1つへ混在させない、PR #191
-  レビュー§7）。edge filter自身の境界sensitivityは、隣接するSCALAR_SAMPLE
-  軸として別途独立に報告される。
+- `SCALAR_SAMPLE`: row 1件ごとの生数値をpercentile grid化する。
+- `FILTER_THEN_COUNT` / `FILTER_THEN_DISTINCT_DAYS` / `FILTER_THEN_SHARE` /
+  `SET_BREADTH` / `REPEAT_PERIOD` / `GROUP_FILTER_THEN_MAX`: 同じrow groupの
+  SCALAR_SAMPLE filter群を`rowGroupCompositions`が宣言した
+  ALL_FILTERS/ANY_FILTERで合成した後のqualifying row集合へ還元する。
+- `FILTER_THEN_SPAN_DAYS`: `max(day)-min(day)+1`。**空集合はnull**（=計算不能）
+  ——observed numeric zeroとは別物として扱い、percentile poolへ入らず、
+  そのsubjectのそのaxis上のoutcomeはUNKNOWNになる。
+- `POST_FILTER_MATCHING_SIZE`: edge filter axisのrepresentative(p50)境界に
+  matching計算を固定し、そのmatching-size分布自体のpercentile gridを報告する
+  （pre-filterのstructuralMax metricを流用しない・edge-filter percentileと
+  matching-size percentileを1つのラベルへ混在させない）。edge filter自身の
+  境界sensitivityは隣接するSCALAR_SAMPLE軸として独立に報告される。
+- `CIRCULAR_HOUR_WINDOW`: 下記「circular analysis」参照。
 
-複数のSCALAR_SAMPLE filterが同じrowGroupKeyを共有する場合、どのrowが
-どのfilterへ対応するかを`RawRow.rowIndex`（selectorごとの抽出順序）で
-突き合わせる——object参照やdayOffsetでは同一dayに複数rowがあるケースを
-誤って混同する。
+複数のSCALAR_SAMPLE filterが同じrowGroupKeyを共有する場合、どのrowがどの
+filterへ対応するかを`RawRow.rowIndex`（selectorごとの抽出順序）で突き合わせる
+——object参照やdayOffsetでは同一dayに複数rowがあるケースを誤って混同する。
 
-### UNKNOWNの扱い
+#### row group構造述語（`rowPredicate`）
+
+`F5cRowGroupComposition.rowPredicate`は、そのrow group内の**全**reductionへ、
+SCALAR_SAMPLE filterのcomposition（modalityの話）とは独立にANDされる有限型の
+構造述語である。現行の唯一のkindは`HOUR_IN_QUADRANT`で、No.32-35が自分の
+対象quadrantを宣言するために使う——これが無いと「朝1日+夕方9日」が
+qualifying-days=10・prominence=100%として読めてしまう。`RawRow.hour`は
+`sampleValue`とは独立に運ばれる（`sampleValue`はselectorごとに意味が違うため
+述語がそれを読んではならない）。
+
+### circular analysis（No.32-37）
+
+同じ`CIRCULAR_HOUR_WINDOW` axis shapeは3つの構造的に異なる意味論を表し、
+`axis.circularIntent`（F5c1）がどれかを宣言する。`boundaryMethod`は
+intent非依存の`"CIRCULAR_ANALYSIS"`。
+
+- `DAYPART_TARGET`（No.32-35）: 対象quadrant**内**のqualifying row数へ還元し、
+  通常のpercentile機構で掃引する。windowの探索はしない（quadrant境界の外へ
+  はみ出す余地を構造的に無くしてある）。catalog意味論との対応は
+  No.32(朝番)→QUADRANT_1、No.33(昼下がり)→QUADRANT_2、No.34(宵っ張り)→
+  QUADRANT_3、No.35(深夜営業)→QUADRANT_0。
+- `PERSONAL_STABILITY`（No.36）: 母集団共通のwindowを選ばず、各subject自身の
+  rowだけから「自分にとって最良のwindowの占有率」を求めてpercentile軸として
+  扱う——「母集団で人気の時間帯か」ではなく「本人がどれだけ安定しているか」。
+  window幅はF5c1の`PERSONAL_STABILITY_WINDOW_HOURS`（intentの
+  `windowLengthHours`として運ばれる）。
+- `MULTI_DAYPART_BREADTH`（No.37）: `minDistinctDaysPerQuadrant`
+  （F5c1の`MULTI_DAYPART_RECURRENCE_MIN_DAYS`）日以上qualifying rowを持つ
+  distinct quadrant数へ還元する。1回の連続した徹夜セッションは、跨いだ
+  どのquadrantに対しても高々1日しか寄与できないため単独ではrecurringに
+  ならない。**安全なevidenceが証明するのは「同じquadrant内での複数日に
+  わたる再来」であって、セッション連続性そのものではない。**
+
+**quadrant latticeのSSOT**: quadrant tokenが指す実際のJST hour範囲は
+F5c1の`CIRCULAR_QUADRANT_HOUR_RANGES`が確定させる（F5c2は独自解釈しない）。
+4等分（各6時間）は**production titleのdaypart境界ではなく**、shadow探索の
+ための中立的なcalibration-analysis解像度（lattice）である——F5c1が
+「daypart境界を選ばない」と言うのはproduction threshold選定の話であり、
+両者は矛盾しない。`PERSONAL_STABILITY_WINDOW_HOURS`も同じ位置づけ。
+`auditF5cCandidateSweepPlans()`の`numericThresholdValueCount`は、この2つの
+分析定数field（`minDistinctDaysPerQuadrant`/`windowLengthHours`）だけを
+明示的allowlistで除外し、`circularIntent`配下の**それ以外の**数値は
+従来どおり検出する（fail-closed——circular intentがproduction threshold
+の隠れ場所にならない）。
+
+`hourHistogram`はrow group全体のqualifying rowの24-bin診断であり、
+circular intentのquadrant制限は掛けない（読み手が「どこに活動があるか」を
+見るための文脈）。
+
+### coverage / UNKNOWN の扱い
 
 `F5cShadowOutcome = "MATCHED" | "NOT_MATCHED" | "UNKNOWN"`。三値AND
-（`combineOutcomes`）はKleene logicに従う——1つでもNOT_MATCHEDがあれば
-残りがUNKNOWNでも全体はNOT_MATCHED（NOT_MATCHEDが最優先で dominate
-する）。NOT_MATCHEDが無く1つでもUNKNOWNがあれば全体はUNKNOWN。全て
-MATCHEDのときだけ全体がMATCHED。`ANY_METRIC_POSITIVE`は対称な三値OR
-（`combineOutcomesOr`）——1つでもMATCHEDがあれば全体MATCHED、無くても
-1つでもUNKNOWNがあれば全体UNKNOWN、それ以外はNOT_MATCHED（詳細は
-14.11.1）。
+（`combineOutcomes`）はKleene logic——NOT_MATCHEDがdominate、次にUNKNOWN、
+全部MATCHEDのときだけMATCHED。`ANY_METRIC_POSITIVE`は対称な三値OR
+（`combineOutcomesOr`）。
 
-UNKNOWNは「metricがnull/undefined」または「subjectがそのjoint evidence
-kindで一度も観測されていない（packが無い、またはpackのjointEvidence.kind
-が要求されたkindと一致しない）」場合に限って発生する。**行が0件である
-ことそれ自体はUNKNOWNの理由にならない**——probeが実際に走り、evidence
-kindが一致し、qualifying rowが本当に0件だったなら、それは観測された
-実際のゼロであり、境界に対して通常どおり比較される（多くの場合
-NOT_MATCHED）。No.49のTC=0日/VC=多数日は、TC要件について確定した
-NOT_MATCHEDであり、自動的にUNKNOWNへ倒れない（PR #191レビュー§1）。
+UNKNOWNは「metricがnull/undefined」「subjectがそのjoint evidence kindで
+一度も観測されていない」、および下記のcoverage起因の場合に発生する。
+**行が0件であることそれ自体はUNKNOWNの理由にならない**——probeが走り
+evidence kindが一致してqualifying rowが0件なら、それは観測された実際の
+ゼロであり境界に対して通常どおり比較される。
 
-### 境界探索: 固定・有限・再現可能なpercentile grid
+coverage不完全性の扱いは、比較対象のboundaryの性質で二分される:
 
-`F5C2_BOUNDARY_PERCENTILES = [10, 25, 50, 75, 90, 95, 99]`——F5a-cが
-既に使っている`nearestRankPercentile()`と同じ手法を再利用する。p95/p99を
-追加したのは、粗いcalibration passがrare/aspirational候補に必要なtail
-情報を捨てないようにするため（PR #191レビュー§8）——adaptive samplingに
-よるさらなる精密化は、product intentがどの候補を優先するか定まった後の
-後続phaseへ明示的に持ち越す。production threshold・巨大なCartesian
-search・恣意的なwindow長は一切選ばない。plan-level の MATCHED/NOT_MATCHED
-判定は、中央値（p50）の代表境界の組み合わせ1点だけを使う——複数axisの
-全組み合わせをCartesian展開しない（現実的な計算量に収める）代わりに、
-axisごとの独立したsensitivity curve（7点のpercentile×boundary×
-passRate）を必ず返す。
+- **固定boundary**（`criterion.fixedValue`、literal 0、`F5C1_MANIFEST_PINS`
+  由来のpinned total）: `coverageSensitiveOutcome()`の非対称ルール。観測値は
+  真値の下限であるため、monotonic lower-bound reducerに限り、AT_LEASTでは
+  MATCHEDが常に信頼でき、AT_MOSTではNOT_MATCHEDが常に信頼できる。
+  反対方向・EQ比較・non-monotonic統計は`coverageWindowValidated=false`の
+  ときUNKNOWNへ倒す。
+- **percentile由来boundary**（`plan.axes`は例外なくこちら）:
+  `percentileBoundaryOutcome()`が**両方向とも**UNKNOWNへ倒す。boundary自体が
+  同じ未検証母集団から計算される以上、値がmonotonic lower boundであっても
+  「観測MATCHED⇒真のMATCHED」は言えない（観測[2,1,0]のp50=1に対する
+  観測MATCHEDは、真値[2,100,100]・真p50=100なら真のNOT_MATCHEDになりうる）。
 
-### 集約出力
+`coverageWindowValidated`は**呼び出し側の未検証attestation**であり、F5c2が
+証明した事実ではない——`executeF5cShadowCalibration()`/
+`runF5cShadowCalibration()`の必須引数で、reportへそのまま転記される。
+`true`は「windowが全sourceのrolloutより後であり、safe sourceが通常運用中に
+省略しうるuntracked gapの残存リスクも許容する」という主張である。
 
-`F5cCandidateShadowResult`は、populationCount/knownCount/unknownCount/
-matchedCount/notMatchedCount/prevalence（=matchedCount/knownCount）と、
-axisごとの`F5cAxisSweepResult`（boundary点・観測sample数・
-CIRCULAR_HOUR_WINDOW用のhour histogramとwindow enumeration点）だけを
-持つ——subject IDやraw evidenceは一切含まない。`executeF5cShadowCalibration()`
-はdeep-freezeされたaggregate-onlyの`F5cShadowCalibrationReport`を返す。
-restricted subject IDはmemory内で一時的にしか使わない
-（`PlanningCalibrationMeasurementCollection`から受け取り、集約後は破棄
-する）。`contractVersion`（F5c2自身のreport shape）は2、
-`sweepContractVersion`（F5c1のcontract、`F5C_SWEEP_CONTRACT_VERSION`を
-そのまま転記）は4——いずれもF5c2側にliteralとして再定義しない。
+### boundary reliability（診断ラベル）
 
-### 14.11.1 意味論的実行可能性フォローアップ（PR #191レビュー対応）
+各axisの`boundaryReliability`は、報告されたboundary/percentile数値自体に
+ついて何が言えるかを表す:
 
-初回実装（上記）はREADY-76全76 planを「例外を投げずに」実行していたが、
-複数の箇所で「実際に正しい意味論で実行できる」水準に届いていなかった。
-以下を修正した:
+- `COVERAGE_ATTESTED`: `coverageWindowValidated=true`のとき（attestationの
+  結果であり、完全観測の証明ではない）。
+- `OBSERVED_LOWER_BOUND`: count/breadth系で、かつpipeline全体が単調性を
+  保つ場合——順序統計量の単調性により、報告されたpercentile自体も真の
+  percentileの下限になる。
+- `OBSERVED_DIRECTION_UNKNOWN`: ratio/share/gap/median/opaque METRIC scalar、
+  **または** その還元がSCALAR_SAMPLE filterを経由している場合
+  （filterの土台となる生値がundercountでどちらへ動くか証明できないため）。
+  `POST_FILTER_MATCHING_SIZE`もここに入る——「辺を間引けば最大matchingは
+  縮む」はedge閾値が**固定**のときの性質であり、現行のedge閾値自体が観測
+  percentileである以上、方向は証明できない。
 
-1. **三値論理の修正**（§1）: `combineOutcomes`（AND）はNOT_MATCHEDを
-   最優先でdominateさせ、UNKNOWNをその次に置く——修正前は逆順で、
-   UNKNOWNが常にNOT_MATCHEDより優先されてしまっていた。
-   `ANY_METRIC_POSITIVE`は新設の`combineOutcomesOr`（三値OR）を使う
-   ——修正前は「1つでも値がnull/undefinedでなければUNKNOWNを返さない」
-   という誤ったロジックで、`[0, null]`（1つはfalse、1つは未測定）を
-   誤ってNOT_MATCHEDと判定していた（正しくはUNKNOWN）。
-2. **evidence-known vs observed-empty の区別**（§1）: `evidenceIsKnown()`
-   ヘルパーを新設し、「subjectがそのjoint evidence kindで観測された
-   か」（pack存在 + kind一致）と「rowが0件か」を明確に分離した。
-   `evaluateFixedCriterion`のJOINT_STRUCTURAL_FACT分岐、row-group
-   reduction axisの`hasEvidence`判定、`evaluateJointFilterAxis`の
-   known判定、`evaluatePostFilterMatchingAxis`のUNKNOWN判定、全てで
-   `rows.length > 0`を「evidence既知」の代理として使っていたバグを
-   修正した——No.49のTC=0日/VC=多数日のようなケースで、観測された
-   本当のゼロが誤ってUNKNOWNへ収束していた。
-3. **No.46をF5c1契約レベルで修正**（§2）: `posts.reactor-breadth`
-   （単一postの最大distinct reactor数という不正確な下限proxy）を
-   削除し、probeが既に計算している厳密なsubject-level metric
-   `distinctReactors`を`metricAxis`として直接使うよう修正した。
-   `F5C_SWEEP_CONTRACT_VERSION`を3→4へbump。
-4. **F5c1 SSOTの重複排除**（§3）: `F5C1_MANIFEST_PINS`と
-   `F5C_SWEEP_CONTRACT_VERSION`をF5c1側からexportし、F5c2は
-   economy/casino/castle family数やsuper-domain数、sweep contract
-   versionをliteralとして複製せず、F5c1のpinから直接導出する。
-5. **selector実行のfail-closed化**（§4）: `resolveJointRows()`が
-   認識しない`(kind, selector)`の組に対して`[]`を返す代わりに
-   `UnsupportedSelectorError`をthrowするよう修正——「有効なselectorで
-   row 0件」と「未知のselector」を区別する。`SUPPORTED_JOINT_SELECTORS`
-   registryと、READY-76の全plan が実際に参照するJOINT_EVIDENCE軸/
-   JOINT_STRUCTURAL_FACT selectorを実行前に静的に検証する
-   `auditF5c2SelectorSupport()`（export済、テスト可能）を追加した。
-   `unsupportedCandidateCount === 0`は「例外が飛ばなかった」だけの
-   消極的な主張ではなく、静的な実行可能性claimになった。
-6. **CIRCULAR_HOUR_WINDOWの実executor化**（§5）: 24-bin histogramは
-   診断情報として残しつつ、固定幅8時間のcandidate windowを開始hour
-   0-23で列挙し（`circularWindowPoints`）、観測母集団のqualifying件数
-   最大のwindowを代表として選び、実際にMATCHED/NOT_MATCHED合成へ
-   寄与させるようにした。
-7. **MANIFEST_CARDINALITY_SWEEPの実gate化**（§6）: 常にMATCHEDを返す
-   stubを、観測母集団のrepresentative（p50）cardinality boundaryに
-   対する実際の判定へ置き換えた。No.87/88のprevalenceはこの次元を
-   無視しなくなった。
-8. **POST_FILTER_MATCHING_SIZEの代表閾値修正**（§7）: 代表outcomeの
-   判定を、契約に無い`size >= 1`というhardcoded値から、matching-size
-   分布自体のrepresentative（p50）boundaryへ置き換えた。boundaryPoints
-   も、edge-filter percentile とmatching-size percentileという2つの
-   異なる次元を1つの`percentile`ラベルへ混在させていた旧実装を修正し、
-   edge filterをrepresentativeに固定した状態でのmatching-size分布の
-   percentile gridという単一の意味に統一した。
-9. **boundary gridのtail拡張**（§8）: `F5C2_BOUNDARY_PERCENTILES`を
-   `[10,25,50,75,90]`から`[10,25,50,75,90,95,99]`へ拡張した。
+### 境界探索とsensitivity
 
-`packages/core/tests/titles-v2-shadow-evaluation.test.ts`に、上記全ての
-反例テストを追加した（FALSE AND UNKNOWN⇒FALSE、FALSE OR UNKNOWN⇒UNKNOWN、
-No.49 TC=0/VC=多数の反例、No.78の観測ゼロ vs 未測定の反例、未知selectorの
-fail-closed、F5c1 contract-version/pin driftの露出、circular windowが
-実際にoutcomeを変える反例、No.88のcardinality sweepがrepresentative
-evaluationへ実際に影響する反例、No.26の代表matching閾値がhardcoded 1
-ではないことの反例）。全ての新guardをmutation-verify済み。
+`F5C2_BOUNDARY_PERCENTILES = [10, 25, 50, 75, 90, 95, 99]`——F5a-cが既に
+使っている`nearestRankPercentile()`と同じ手法。p95/p99はrare/aspirational
+候補のtail情報を捨てないため。production threshold・巨大なCartesian search・
+恣意的なwindow長は一切選ばない。plan-levelのMATCHED/NOT_MATCHED判定は
+representative(p50)境界の組み合わせ1点だけを使う。
 
-### 14.11.2 意味論的実行可能性フォローアップ第2ラウンド（PR #191レビュー第3ラウンド対応）
+`boundaryPoints`は**そのaxis単体のmarginal pass rate**であって、他のaxisを
+representativeへ固定しつつcandidate全体のprevalenceを一軸ずつ再計算する
+「候補レベルのsensitivity」ではない。フィールド名（`marginalPassRate`）と
+reportのtyped marker（`sensitivityModel: "MARGINAL_AXIS_ONLY"`）の両方で
+これを明示している。
 
-第1ラウンド（14.11.1）は受理されたが、さらに5点の指摘があった。
+### 実行可能性の静的audit
 
-1. **coverageのUNKNOWN判定を実際のsource契約から導く**（§1）:
-   `evidenceIsKnown()`（pack存在+kind一致）だけでは「完全な観測coverage」
-   を主張できない——このcodebaseの全probeが`coverageLimitations`で
-   「safe sourceはunknown/untrusted intervalを省略するため、zeroは
-   観測された不在と欠落したcoverageを区別できない」ことを明記している
-   （F5a-c全体に共通する構造的事実であり、特定のprobeだけの限定では
-   ない）。一方、safe sourceの性質上、正の証拠（何か見つかった）は
-   ねつ造されない——coverage gapはfalse negativeしか生まない。
-   よって、`executeF5cShadowCalibration()`/`runF5cShadowCalibration()`
-   に`coverageWindowValidated: boolean`という**必須**（defaultなし）
-   引数を追加した——呼び出し側が「このcalibration windowは関与する
-   全sourceのrolloutより後で、通常運用中のuntracked gapについても
-   許容できる」と明示的にattestする。`zeroSensitiveOutcome()`が、
-   絶対的なゼロ（`isAbsoluteZero`）が原因のNOT_MATCHEDだけを
-   `coverageWindowValidated=false`のときUNKNOWNへ倒す——MATCHED
-   （正の証拠）や、相対的な境界比較によるNOT_MATCHED（値>0だが
-   母集団のrepresentative境界未満、absence-of-evidenceの主張では
-   ない）には一切影響しない。この値は`F5cShadowCalibrationReport.
-   coverageWindowValidated`としてreportへそのまま転記される
-   ——reportの読み手がどの信頼水準で生成されたかを判断できる
-   （coverage provenanceの伝播）。
-2. **F5c1の circular contract に有限型のintentを追加**（§2）:
-   No.32-35（各daypart target）・No.36（personal time stability）・
-   No.37（multi-daypart breadth）は、旧`F5cJointCircularHourAxis`
-   では同じaxis shapeで区別できず、F5c2の「母集団全体でのbest
-   8-hour window」戦略が全員を同じwindowへ収束させ得た。新設の
-   `F5cCircularIntent`（`DAYPART_TARGET`+`quadrant`／
-   `PERSONAL_STABILITY`／`MULTI_DAYPART_BREADTH`）で構造的パターン
-   だけを宣言する——本番のhour境界は依然として選ばない。
-   `F5C_SWEEP_CONTRACT_VERSION`を4→5へbump。
-   - `DAYPART_TARGET`: 24時間を4等分した中立的quadrant
-     （`QUADRANT_0`=[0,6)〜`QUADRANT_3`=[18,24)、文字列labelにして
-     いるのは`auditF5cCandidateSweepPlans()`の
-     `numericThresholdValueCount`guardが誤ってthreshold値として
-     検出しないようにするため）のうち1つの中でのみ代表windowを
-     探索する。24点の診断的enumerationは変わらず全て返すが、
-     MATCHED/NOT_MATCHEDを決める代表windowの選定だけがquadrantへ
-     制限される。
-   - `PERSONAL_STABILITY`: 母集団共通のwindowを選ばず、各subject
-     自身のrowだけから求めた「自分にとって最良のwindowの占有率」を
-     percentile軸として扱う——異なる（だが同じくらい安定した）
-     usual timeを持つ2人を、母集団内でどちらが人気の時間帯かでは
-     なく、各人の安定度で判定する。
-   - `MULTI_DAYPART_BREADTH`: 同じ4 quadrantのうち、subjectが
-     qualifying rowを持つdistinct quadrant数をpercentile軸として
-     扱う——1つの連続windowに収まる集中とは構造的に区別される。
-3. **No.36 `rows.activity-start-hour`を実際に"start"へ**（§3）:
-   旧実装はdaypart-boundaryと同じ「記録された全hour」を返しており、
-   selector名と実際の意味が食い違っていた。既存evidenceから導出
-   できる最小の修正として、日ごとの最小hour（その日の最初の活動
-   hour）を1件だけ返すよう修正した——新しい測定契約は追加せず、
-   既存の`rows`配列から導出する。
-4. **sensitivity modelを型で明示**（§4）: `axisSweeps[].boundaryPoints`/
-   `circularWindowPoints`はaxis単体のmarginal pass rateであって、
-   他のaxisをrepresentativeへ固定しつつcandidate全体のprevalenceを
-   一軸ずつ再計算する「候補レベルのsensitivity」ではない——実装複雑度と
-   reviewabilityを考慮し、後者は意図的に見送る（次段階で明確な設計を
-   経てから実装する）。`passRate`/`qualifyingRate`フィールドを
-   `marginalPassRate`/`marginalQualifyingRate`へrenameし、
-   report自体に`sensitivityModel: "MARGINAL_AXIS_ONLY"`という
-   typed markerを追加した——後続の製品判断がmarginalな数値を
-   candidate sensitivityと取り違えることを防ぐ。
-5. **selector支持のSSOTを実行可能mappingへ統合**（§5）: 旧実装は
-   `SUPPORTED_JOINT_SELECTORS`（手書きSet）と`resolveJointRows()`の
-   switch文という2つの並行リストを持っており、resolver caseを削除/
-   変更してもregistry側が古いまま残り得た。`JOINT_ROW_RESOLVERS`
-   という1つのnested mapだけを正本にし、`isSupportedJointSelector`
-   と`resolveJointRows`はどちらもこの同じmapを読むだけにした——
-   selectorの「支持」は、実際にそのselectorを解決するresolver関数が
-   同じobjectのkeyとして存在することそのものであり、2つ目の並行
-   リストは存在しない。
+`auditF5c2SelectorSupport()`が、subjectデータを評価する**前**に、全planの
+(a) 実際に参照されるJOINT_EVIDENCE軸/JOINT_STRUCTURAL_FACT selectorが
+`JOINT_ROW_RESOLVERS`に実行可能なmappingとして存在するか、(b) 宣言された
+`rowPredicate`がそのplanのevidence shapeに対して実行可能か（hour述語なら
+hour-bearingなevidence kindか、対象row groupが実在するか）を検証する。
+落ちたplanは`UNSUPPORTED_GAP`になる——`unsupportedCandidateCount === 0`は
+「例外が飛ばなかった」ではなく静的な実行可能性claimである。
 
-`packages/core/tests/titles-v2-shadow-evaluation.test.ts`に、上記全ての
-反例テストを追加した（coverageWindowValidated=falseが絶対ゼロによる
-NOT_MATCHEDだけをUNKNOWNへ倒しMATCHEDには影響しない反例、No.36が
-人気の時間帯ではなく各人の安定度で判定する反例、No.36
-`rows.activity-start-hour`が実際に"start"であることの反例、No.32/34
-のdaypart target候補が同一母集団で異なる判定を返せる反例、No.37の
-multi-daypart breadthが単一quadrant濃縮と区別される反例、sensitivity
-modelがmarginal-axis-onlyとして型で露出していることの確認、selector
-supportの並行リストが再導入されていないことのsource-level確認）。
-全ての新guardをmutation-verify済み。
+### 集約出力とprivacy境界
 
-### 今回のPRで意図的に含めていないもの（次段階）
+`F5cShadowCalibrationReport`のtop-level: `contractVersion` /
+`sweepContractVersion` / `sensitivityModel` / `coverageWindowValidated` /
+`cohort` / `window` / `readyCandidateCount` / `executedCandidateCount` /
+`unsupportedCandidateCount` / `results`。
 
-- 候補間のoverlap/containment/sensitivity比較（pairwise Jaccard等）は
-  設計上の判断（どのペアを比較するか、どう正規化するか）が別途必要な
-  ため、次のF5c段階へ明示的に持ち越す。
-- one-axis-at-a-time candidate-level sensitivity（他axisをrepresentative
-  へ固定しつつcandidate全体のprevalenceを再計算すること）は、実装複雑度
-  とreviewabilityを考慮し意図的に見送る——`sensitivityModel:
-  "MARGINAL_AXIS_ONLY"`が現状を型で明示する。
-- production threshold選定・BehaviorTitleDefinition・award/evaluator/
-  通知/UI/スケジューラ/Discordコマンドへの接続は一切無い。
+`F5cCandidateShadowResult`は populationCount / knownCount / unknownCount /
+matchedCount / notMatchedCount / prevalence（=matchedCount/knownCount）と、
+axisごとの`F5cAxisSweepResult`（axisKey / reducerKind / observedSampleCount /
+boundaryPoints / boundaryReliability / hourHistogram）と unsupportedReason
+だけを持つ——subject IDやraw evidenceは一切含まない。返り値はdeep-freeze
+される。restricted subject IDはmemory内で一時的にしか使わない
+（`PlanningCalibrationMeasurementCollection`から受け取り、集約後は破棄）。
+専用testが、seedしたsubject IDがserialized reportへ現れないこと、および
+このmoduleがevaluator/pipeline/prefetch/public barrel/Botから
+importされていないことを検証する。
 
-### 14.11.3 意味論的実行可能性フォローアップ第3ラウンド（PR #191レビュー第4ラウンド対応）
+production `BehaviorTitleDefinition`・threshold・matched状態・award/revoke・
+通知・profile UI・Discord UI・スケジューラ・catalog有効化は一切無い。
+DB/schema変更も無い。
 
-第2ラウンド（14.11.2）の architecture は受理されたが、さらに5点の指摘が
-あった。
+### 意図的に含めていないもの（次段階）
 
-1. **coverage semanticsを絶対ゼロ以外にも一般化**（§1）:
-   `zeroSensitiveOutcome()`（絶対ゼロだけを特別扱い）は狭すぎた——safe
-   sourceの欠落は非ゼロ値も低く見せうる（真値10・観測3・AT_LEAST境界5
-   なら観測NOT_MATCHEDは真のNOT_MATCHEDとは限らない。AT_MOST境界5なら
-   観測MATCHEDは真のMATCHEDとは限らない）。一般化した原理: 観測値は
-   常に真値の**下限**である（safe sourceはfalse negativeしか生まず、
-   false positiveを生まない）。これは**monotonic lower-bound reducer**
-   （行/日数/breadth/matching sizeの単純count系）に限って成り立つ——
-   個々のrowの生値比較や比率/share/opaqueなMETRIC scalarのような
-   non-monotonicな導出値には適用できない（undercountでどちらの方向にも
-   動きうる）。新設の`coverageSensitiveOutcome(outcome, direction,
-   reliability, coverageWindowValidated)`が両方を統一的に扱う:
-   - `MONOTONIC_LOWER_BOUND` + `AT_LEAST`: MATCHEDは常に信頼できる、
-     NOT_MATCHEDだけがuncertain。
-   - `MONOTONIC_LOWER_BOUND` + `AT_MOST`: NOT_MATCHEDは常に信頼できる、
-     MATCHEDだけがuncertain。
-   - `NON_MONOTONIC`（FILTER_THEN_SHARE、opaqueなMETRIC axis/
-     METRIC_COMPAREのscalar）: 両方向ともuncertain。
-   - `EQ`演算子: reliabilityに関わらず両方向ともuncertain（下限だけ
-     からは等号を証明できない）。
-   `reductionReliability(reducerKind)`がJOINT_EVIDENCE reducerを
-   分類する。旧`zeroSensitiveOutcome`の全呼び出し箇所を置き換えた。
+- 候補間のoverlap/containment比較（pairwise Jaccard等）: どのペアを比較する
+  か・どう正規化するかの設計判断が別途必要なため、次のF5c段階へ持ち越す。
+- one-axis-at-a-time candidate-level sensitivity（他axisをrepresentativeへ
+  固定しつつcandidate全体のprevalenceを再計算すること）: 実装複雑度と
+  reviewabilityを考慮し見送る——`sensitivityModel: "MARGINAL_AXIS_ONLY"`が
+  現状を型で明示する。
 
-   また、`coverageWindowValidated=false`のとき、boundary/percentile
-   計算自体が「観測できた分だけの下限」でしかないという事実を
-   report自体へ明示するため、`F5cAxisSweepResult.boundaryReliability:
-   "OBSERVED_COMPLETE" | "OBSERVED_LOWER_BOUND_ONLY"`を新設した
-   ——sample poolから値を除外するのではなく（実際の情報を失う）、
-   計算結果の信頼性ラベルを分離する（「observed/lower-bound
-   diagnosticsとdefinitive shadow outcomeを分離する」という
-   レビュー自身が提示した方針の1つ）。`coverageWindowValidated`は
-   F5c2が自動的に証明した事実ではなく、呼び出し側の**未検証の
-   attestation**であることをdoc commentで明記した——`true`は
-   「安全である」という主張であって、F5c2が検証できるものではない。
+### 14.11.1 レビュー往復の履歴（**現行契約ではない**）
 
-2. **No.32-35のquadrant割当をcatalog意味論から修正**（§2）:
-   旧mapping（32→Q0、33→Q1、34→Q2、35→Q3、candidate番号の登場順を
-   単純にquadrant indexへ割り当てただけ）はcatalogの
-   displayName/semanticSpecと噛み合っていなかった。正しい対応: No.32
-   （朝番/morning）→QUADRANT_1=[6,12)、No.33（昼下がり/afternoon）→
-   QUADRANT_2=[12,18)、No.34（宵っ張り/evening~日付変更前）→
-   QUADRANT_3=[18,24)、No.35（深夜営業/日付変更後~早朝）→
-   QUADRANT_0=[0,6)。`F5C_SWEEP_CONTRACT_VERSION`を5→6へbump。
+> 以下はPR #191のレビュー往復で何がなぜ変わったかの記録であり、現行仕様は
+> 上の§14.11本文が正本。ここに出てくる旧API名・旧戦略（24×8時間の母集団
+> window列挙、`circularWindowPoints`、`zeroSensitiveOutcome`、
+> `OBSERVED_COMPLETE`、`CIRCULAR_CANDIDATE_ENUMERATION`等）は**既に存在
+> しない**。
 
-3. **DAYPART_TARGETのwindow anchoringを修正**（§3）:
-   第3ラウンドの実装は「windowの開始hourをquadrant内に制限する」
-   だけで、window長8時間・quadrant幅6時間という不一致により、
-   quadrant終盤から始まるwindowが隣接quadrantへ最大2時間はみ出し
-   得た——ある候補が別のdaypartに明確に属する活動から代表意味を
-   導出できてしまう。修正: window探索を完全に廃止し、各subjectを
-   「自分自身のrowのうち、対象quadrant内に収まる件数」という単純な
-   countへ還元し、通常のpercentile sweep機構（PERSONAL_STABILITY/
-   MULTI_DAYPART_BREADTHと同じ形）へ統一した——quadrant境界の外への
-   overreachが構造的に不可能になった。この結果、`circularWindowPoints`
-   /`F5cCircularWindowPoint`はどのintentからも使われなくなったため
-   完全に削除した（`hourHistogram`による24-bin診断は維持）。
-
-4. **No.37に「一晩の徹夜」除外意味論を追加**（§4）:
-   旧MULTI_DAYPART_BREADTHは「distinct quadrantに1件でも該当rowが
-   あれば touched」というcountだった——日付変更を跨ぐ1回の連続
-   セッション（例: 22時〜翌4時）だけでQ3とQ0の2 quadrantを（長い
-   セッションなら3-4 quadrantすら）"touch"でき、catalog意味論
-   「複数のdaypartに活動痕が多数日に分散し、一晩の徹夜では説明
-   できない」に反し得た。修正: quadrantは、そのquadrant内で
-   qualifying rowが存在するdistinct日数が2日以上のときだけ
-   breadthへ数える——1回の連続セッションはどのquadrantに対しても
-   高々1日しか寄与できないため、単独では絶対にrecurringにならない。
-   既存のjoint evidence（`rows.daypart-boundary`のdayOffset+hour）
-   だけから計算可能なため、F5c1のselector追加は不要だった。
-
-5. **F5C2_SHADOW_CONTRACT_VERSIONの report shape 不一致を修正**（§5）:
-   第3ラウンドのreport実装（`coverageWindowValidated`/
-   `sensitivityModel`フィールド追加）は完了していたが、定数
-   `F5C2_SHADOW_CONTRACT_VERSION`自体が2のまま更新されていなかった
-   ——報告した「2→3」と実装が食い違っていた。3へ修正し、
-   `titles-v2-shadow-evaluation.test.ts`に、`contractVersion`の値と
-   reportの top-level key集合を直接pinする regression test を追加
-   した（`Object.keys(report).sort()`を既知の集合と比較）——今後
-   report shapeが変わってもこのテストが即座に検出する。
-
-保持事項（第1-3ラウンドで受理済みの作業）: 修正した Kleene AND/OR、
-No.46の`distinctReactors`契約、F5c1 manifest/version SSOT消費、
-`POST_FILTER_MATCHING_SIZE`の代表閾値修正、p95/p99 tail grid、
-`marginalPassRate`/`marginalQualifyingRate`命名、
-`sensitivityModel=MARGINAL_AXIS_ONLY`、No.36の「母集団ではなく個人」
-の安定性、No.36の「1日1 start-hour sample」、aggregate-only出力、
-production threshold/evaluator/award/UI/deployへの接続無し——全て
-そのまま維持した。`JOINT_ROW_RESOLVERS`（selector support SSOT）も
-無変更で維持した。
-
-`packages/core/tests/titles-v2-shadow-evaluation.test.ts`に、
-`coverageSensitiveOutcome`のAT_LEAST/AT_MOST非対称性を直接unit test
-する新設`describe`ブロック（レビュー自身の数値例: 真値10・観測3・
-境界5）、`boundaryReliability`のend-to-endテスト、
-`F5C2_SHADOW_CONTRACT_VERSION`/report shapeのregression test、
-No.32/34の再設計されたcounterexample、No.37の「1回の徹夜では
-満たせない」counterexampleを追加した。全ての新guardを
-mutation-verify済み。
-
-### 14.11.4 意味論的実行可能性フォローアップ第4ラウンド（PR #191レビュー第5ラウンド対応）
-
-第3ラウンド（14.11.3）は受理されたが、さらに6点の指摘があった。
-
-1. **fixed-boundary certainty と percentile-boundary certainty を分離**（§1）:
-   `coverageSensitiveOutcome()`の非対称ルールは、比較対象のboundary自体が
-   固定・信頼できる値（`criterion.fixedValue`・literal 0・
-   `F5C1_MANIFEST_PINS`由来のpinned total）のときにしか健全ではなかった。
-   反例（レビュー自身のもの）: 観測[2,1,0]のp50=1に対しaliceの観測値
-   2は「observed MATCHED」だが、真値が[2,100,100]ならp50=100で
-   aliceの真値は（undercountされていなければ）2のままかもしれず、
-   真のNOT_MATCHEDになりうる——alice自身の値が真値の下限であっても、
-   boundary自体がどれだけ動くか分からない以上、一方向だけの信頼性
-   主張は成立しない。`plan.axes`（METRIC/JOINT_EVIDENCE/
-   CIRCULAR_HOUR_WINDOW）は例外なくOBSERVED_NEAREST_RANKの
-   representative(p50)boundaryと比較するため、新設
-   `percentileBoundaryOutcome()`が、`coverageWindowValidated=false`の
-   ときこれらの結果を**方向に関わらず一律UNKNOWNへ**倒す
-   ——`coverageSensitiveOutcome()`はfixedCriteria/manifestCriteriaの
-   固定boundary比較専用として維持した（interval/rank proofのような
-   追加統計は導入しない）。
-2. **boundary reliability label をnon-monotonic統計と区別**（§2）:
-   `F5cBoundaryReliability`を`"COVERAGE_ATTESTED" | "OBSERVED_LOWER_BOUND"
-   | "OBSERVED_DIRECTION_UNKNOWN"`へ改称した（旧
-   `"OBSERVED_COMPLETE"`は「証明された事実」に読めてしまうため、
-   実際に分かっていること——呼び出し側の未検証attestationの結果で
-   あること——を表す名前へ改めた）。count/breadth/matching sizeの
-   ような値は、順序統計量の単調性により、観測percentile自体も真の
-   percentileの下限になり得る（`"OBSERVED_LOWER_BOUND"`）。ratio/
-   share/gap/median/IQR/concentration・opaqueなMETRIC scalarは
-   どちらの方向にも動きうるため`"OBSERVED_DIRECTION_UNKNOWN"`とする。
-3. **reliabilityをpipeline全体の性質として扱う**（§3）:
-   `reductionReliability(reducerKind)`はreducerKindだけでなく、その
-   還元がSCALAR_SAMPLE filterを1つ以上経由しているかどうかも見る
-   ——filterの土台となる生値（gap等）自体がundercountの下でどちらの
-   方向に動くか個別に証明しない限り、filter後のqualifying row集合が
-   完全データ下の部分集合であることは主張できない。filterがあれば
-   保守的にNON_MONOTONICへ倒す（汎用のfilter-semantics証明機構は
-   作らない）。POST_FILTER_MATCHING_SIZEは、辺を間引いても最大
-   matching sizeは単調非増加という純粋にグラフ理論的な事実により、
-   専用関数（`evaluatePostFilterMatchingAxis`）で独立に
-   MONOTONIC_LOWER_BOUNDを維持した（§1の一般化により、この分類は
-   もはやoutcome判定を直接gateしない——boundaryReliability labelの
-   決定にのみ使う）。
-4. **circular analysis semanticsをSSOTへ**（§4）:
-   quadrant token（`QUADRANT_0`等）が実際に指すJST hour範囲は、
-   以前はF5c2側のprivate constantにしかなく、F5c2がF5c1のtokenの
-   意味を独自解釈していた。F5c1（`v2-calibration-sweep.ts`）に
-   `CIRCULAR_QUADRANT_HOUR_RANGES`（quadrant→{startHour,
-   lengthHours}）をSSOTとして新設し、F5c2の`quadrantOfHour()`は
-   これを直接読むだけになった（`CIRCULAR_QUADRANT_INDEX`等の
-   private mappingは削除）。「F5c1はdaypart境界を選ばない」という
-   coverageNotesの文言を「PRODUCTION daypart境界を選ばない」へ
-   明確化した——4等分はproduction title semanticではなく、shadow
-   探索専用の中立的calibration-analysis解像度（lattice）である。
-   `numericThresholdValueCount`監査（`entry.axes`内の数値literalを
-   production thresholdの疑いとして数える）は、`circularIntent`
-   sub-objectを対象外にするよう改善した——文字列へ隠して回避するので
-   はなく、監査の対象範囲（axisへ直接埋め込まれたthreshold値）を型で
-   正確にした。`boundaryMethod: "CIRCULAR_CANDIDATE_ENUMERATION"`は、
-   DAYPART_TARGET/MULTI_DAYPART_BREADTHがもうwindow候補を列挙しない
-   （直接quadrant/recurrenceへreductionする）ため、intentに依らない
-   `"CIRCULAR_ANALYSIS"`へ改称した。
-5. **No.37のrecurrence semanticsを契約へ**（§5）: `>=2 distinct日`
-   というNo.37のrecurrence要件を、F5c2の実行時literalではなく
-   F5c1の`MULTI_DAYPART_RECURRENCE_MIN_DAYS`（=2）として確定させ、
-   `F5cCircularIntent`のMULTI_DAYPART_BREADTH variantへ
-   `minDistinctDaysPerQuadrant`フィールドを追加した。coverageNotesも、
-   safe evidenceが実際に証明できるのは「同じquadrant内での複数日
-   にわたる再来」だけであり、セッションの連続性そのものではない
-   ことを明記するよう修正した。
-6. **No.32-35のTC/VC中立性を再確認**（§6）: `rows.daypart-share`
-   （FILTER_THEN_SHAREのshare大きさ）が`vcTrustedSocialSeconds`
-   のみを使っており、row group全体はANY_FILTERでTC/VCどちらの
-   modalityでもqualifyできるのに、TC-onlyで活動するsubjectのshare
-   を常に0（0/0）にしていた。TC gapとVC秒数は方向・単位が異なり
-   単純合算できないため、row 1件ごとに均等な重み(1)を使う修正へ
-   変更した——「このdaypartの全rowのうちqualifyした割合」という
-   modality中立なprominence尺度になる。
-
-`F5C_SWEEP_CONTRACT_VERSION`を6→7へbump（circular analysis SSOT・
-recurrence契約化）。`F5C2_SHADOW_CONTRACT_VERSION`を3→4へbump
-（`boundaryReliability`のenum値変更）。
-
-保持事項（第1-3ラウンドで受理済みの作業）: 修正した Kleene AND/OR、
-No.46の`distinctReactors`契約、F5c1 manifest/version SSOT消費、
-catalog-correct No.32-35 mapping、DAYPART_TARGETのwindow spill除去、
-No.36 personal stabilityモデル、marginal sensitivity naming/model
-marker、`JOINT_ROW_RESOLVERS`（selector support SSOT）、matching
-recomputationとmatching-size boundary semantics、p95/p99 coarse
-grid、aggregate-only出力、production threshold不採用、evaluator/
-award/UI/deployへの接続無し——全てそのまま維持した。
-
-`packages/core/tests/titles-v2-shadow-evaluation.test.ts`に、
-レビュー自身の数値例による「observed MATCH against untrusted
-percentile boundary」counterexample（No.49再設計）、non-monotonic
-統計（No.36 PERSONAL_STABILITY）のUNKNOWN collapse、filter siblingの
-有無によるboundaryReliability labelの変化、
-`CIRCULAR_QUADRANT_HOUR_RANGES`のSSOT検証、No.37 recurrence契約の
-plan-level検証、TC-only prominence counterexampleを追加した。
-`numericThresholdValueCount`監査の改善も専用テストで確認した。
-全ての新guardをmutation-verify済み。
+- **初回実装**: READY-76全76 planを実行するF5c2を新設。aggregate-only・
+  deep-frozen・planning専用。
+- **第1ラウンド**: 三値AND/ORをKleene logicへ修正（NOT_MATCHEDのdominate
+  順序、`ANY_METRIC_POSITIVE`の真のOR）。「evidence既知」と「row 0件」を
+  `evidenceIsKnown()`で分離。No.46を厳密な`distinctReactors` metricへ修正。
+  F5c1 manifest pin/versionのSSOT消費。selector解決をfail-closed化。
+  CIRCULAR_HOUR_WINDOW・MANIFEST_CARDINALITY_SWEEPを実際にgateさせる。
+  POST_FILTER_MATCHING_SIZEの代表閾値をhardcoded 1から実分布p50へ。
+  boundary gridへp95/p99を追加。
+- **第2ラウンド**: coverage不完全性を初めてoutcomeへ反映
+  （`coverageWindowValidated`引数の新設）。circular contractを3つのtyped
+  intentへ分割（No.32-35/36/37が同じwindow戦略へ収束する問題）。No.36の
+  `activity-start-hour`を「その日の最初のhour」へ修正。sensitivityが
+  marginalであることを型で明示。selector supportを単一のexecutable SSOTへ
+  統合（`JOINT_ROW_RESOLVERS`）。
+- **第3ラウンド**: coverage判定を絶対ゼロ以外へ一般化
+  （`coverageSensitiveOutcome`のAT_LEAST/AT_MOST非対称ルール）。
+  No.32-35のquadrant割当をcatalog意味論へ修正。DAYPART_TARGETのwindow
+  はみ出しを除去（window探索そのものを廃止）。No.37に
+  「>=2 distinct日」のrecurrence要件を導入。F5c2 contract versionの
+  実装/報告の不一致を修正。
+- **第4ラウンド**: 固定boundaryとpercentile由来boundaryのcertaintyを分離
+  （`percentileBoundaryOutcome`）。boundary reliabilityを3値へ
+  （monotonic統計とnon-monotonic統計の区別、`OBSERVED_COMPLETE`の改称）。
+  reliabilityをreducerKind単独ではなくfilter pipelineから導出。circular
+  quadrant latticeとNo.37 recurrence定数をF5c1 SSOTへ移動。
+  `rows.daypart-share`をTC/VC中立へ（VC秒数のみからrow均等重みへ）。
+- **第5ラウンド（本ラウンド）**: No.32-35の対象daypartをdays/prominence
+  reductionへ束縛（`rowPredicate`の新設）。特殊実行path
+  （DAYPART_TARGET / MULTI_DAYPART_BREADTH / POST_FILTER_MATCHING_SIZE）の
+  boundary reliabilityもpipeline全体から導出。No.36のwindow幅をF5c1 SSOTへ。
+  `FILTER_THEN_SPAN_DAYS`の空集合をnullへ（契約との一致）。
+  threshold audit除外を明示allowlist化（fail-closed）。本ドキュメントの
+  §14.11を現行仕様として書き直し。
 
 ## 15. PR分割
 

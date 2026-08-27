@@ -11,6 +11,7 @@ import {
   type F5cManifestCriterion,
   type F5cManifestRef,
   type F5cRowGroupCompositionMode,
+  type F5cRowStructuralPredicate,
   type F5cSweepAxis,
 } from "./v2-calibration-sweep.js";
 import {
@@ -374,6 +375,16 @@ interface RawRow {
   readonly edgeLeftKey: string | null;
   readonly edgeRightKey: string | null;
   /**
+   * PR #191レビュー第6ラウンド§1: the row's own JST hour, carried independently of `sampleValue`
+   * so an `F5cRowStructuralPredicate` (HOUR_IN_QUADRANT) can be evaluated uniformly across every
+   * selector in a row group — `sampleValue` means something different per selector (a gap in ms,
+   * trusted seconds, a share weight), so the predicate must never read it. Only the
+   * `activity-time-day-hour-v1` selectors carry an hour; everything else leaves it null (and a
+   * plan declaring an hour predicate over an hourless row group fails the audit — see
+   * `auditPlanRowPredicateSupport`).
+   */
+  readonly hour: number | null;
+  /**
    * Position within THIS selector's own extraction, stamped by `rowGroupRawRowsFor()`. Every
    * selector within one row group maps 1:1, same order, over the same underlying joint-evidence
    * array (see `resolveJointRows()`), so `rowIndex` is the correct cross-selector correspondence
@@ -392,6 +403,7 @@ function row(partial: Partial<RawRow>): RawRow {
     groupKey: partial.groupKey ?? null,
     edgeLeftKey: partial.edgeLeftKey ?? null,
     edgeRightKey: partial.edgeRightKey ?? null,
+    hour: partial.hour ?? null,
     rowIndex: -1, // stamped by rowGroupRawRowsFor(); see RawRow.rowIndex doc.
   };
 }
@@ -424,9 +436,11 @@ function jointResolverGroup<K extends PlanningCalibrationJointEvidence["kind"]>(
 
 const JOINT_ROW_RESOLVERS: ReadonlyMap<string, Record<string, AnyJointRowResolver>> = new Map([
   jointResolverGroup("activity-time-day-hour-v1", {
-    "rows.tc-gap": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, sampleValue: r.tcBestOtherGapMs })),
-    "rows.vc-seconds": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, sampleValue: r.vcTrustedSocialSeconds })),
-    "rows.day-hour-social-evidence": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset })),
+    // every activity-time selector carries `hour` so an HOUR_IN_QUADRANT row predicate applies
+    // uniformly across the row group regardless of which selector a reduction reads (§1).
+    "rows.tc-gap": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, hour: r.hour, sampleValue: r.tcBestOtherGapMs })),
+    "rows.vc-seconds": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, hour: r.hour, sampleValue: r.vcTrustedSocialSeconds })),
+    "rows.day-hour-social-evidence": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, hour: r.hour })),
     // PR #191レビュー第5ラウンド§6: 旧実装はvcTrustedSocialSecondsのみをshareの大きさに
     // 使っており、row group全体はANY_FILTERでTC/VCどちらのmodalityでもqualifyできるのに、
     // TC-onlyで活動するsubjectのshareを常に0（0/0）にしていた——No.32-35の「この
@@ -434,8 +448,8 @@ const JOINT_ROW_RESOLVERS: ReadonlyMap<string, Record<string, AnyJointRowResolve
     // 活発、ms単位）とVC秒数（大きいほど活発、秒単位）は方向も単位も異なり単純合算
     // できないため、row 1件ごとに均等な重み(1)を使う——「このdaypartの全rowのうち
     // qualifyしたrowの割合」というmodality中立なprominence尺度になる。
-    "rows.daypart-share": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, sampleValue: 1 })),
-    "rows.daypart-boundary": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, sampleValue: r.hour })),
+    "rows.daypart-share": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, hour: r.hour, sampleValue: 1 })),
+    "rows.daypart-boundary": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, hour: r.hour, sampleValue: r.hour })),
     // PR #191レビュー第3ラウンド§3: "start hour"は「その日に記録された最初のhour」であって
     // 「記録された全hour」ではない——旧実装はdaypart-boundaryと同じ全hour rowを返しており、
     // selector名（activity-start-hour）と実際の意味が食い違っていた。既存evidenceから導出
@@ -446,7 +460,7 @@ const JOINT_ROW_RESOLVERS: ReadonlyMap<string, Record<string, AnyJointRowResolve
         const current = minHourByDay.get(r.dayOffset);
         if (current === undefined || r.hour < current) minHourByDay.set(r.dayOffset, r.hour);
       }
-      return [...minHourByDay.entries()].map(([dayOffset, hour]) => row({ dayOffset, sampleValue: hour }));
+      return [...minHourByDay.entries()].map(([dayOffset, hour]) => row({ dayOffset, hour, sampleValue: hour }));
     },
   }),
   jointResolverGroup("day-occurrences-v1", {
@@ -715,7 +729,30 @@ function applyQualifyingIndices(ownRows: readonly RawRow[], indices: ReadonlySet
   return indices === null ? ownRows : ownRows.filter((r) => indices.has(r.rowIndex));
 }
 
-function reduceRows(rows: readonly RawRow[], allRows: readonly RawRow[], reducerKind: F5cSweepAxis["reducerKind"]): number {
+/**
+ * PR #191レビュー第6ラウンド§1: the row group's declared structural predicate, ANDed on top of
+ * whatever the SCALAR_SAMPLE filters' composition mode admitted. A row whose `hour` is null can
+ * never satisfy an HOUR_IN_QUADRANT predicate — but a plan that declares such a predicate over an
+ * hourless row group is rejected up front by `auditPlanRowPredicateSupport()`, so this is a
+ * defensive fallback rather than a silent semantic.
+ */
+function rowSatisfiesPredicate(r: RawRow, predicate: F5cRowStructuralPredicate | null): boolean {
+  if (predicate === null) return true;
+  return r.hour !== null && quadrantOfHour(r.hour) === predicate.quadrant;
+}
+
+function applyRowPredicate(rows: readonly RawRow[], predicate: F5cRowStructuralPredicate | null): readonly RawRow[] {
+  return predicate === null ? rows : rows.filter((r) => rowSatisfiesPredicate(r, predicate));
+}
+
+/**
+ * PR #191レビュー第6ラウンド§4: F5c1 defines FILTER_THEN_SPAN_DAYS as `max-min+1`, **empty set
+ * => null** — a subject with a known evidence pack but zero qualifying days has no computable
+ * span, which is not the same claim as "span 0" (nor "span 1", which `max-min+1` would give for a
+ * single day). `null` propagates as not-computable: it never enters the percentile sample pool and
+ * the subject's own outcome on that axis becomes UNKNOWN.
+ */
+function reduceRows(rows: readonly RawRow[], allRows: readonly RawRow[], reducerKind: F5cSweepAxis["reducerKind"]): number | null {
   switch (reducerKind) {
     case "FILTER_THEN_COUNT":
       return rows.length;
@@ -725,7 +762,7 @@ function reduceRows(rows: readonly RawRow[], allRows: readonly RawRow[], reducer
     }
     case "FILTER_THEN_SPAN_DAYS": {
       const days = [...new Set(rows.map((r) => r.dayOffset).filter((d): d is number => d !== null))];
-      return days.length === 0 ? 0 : Math.max(...days) - Math.min(...days) + 1;
+      return days.length === 0 ? null : Math.max(...days) - Math.min(...days) + 1;
     }
     case "FILTER_THEN_SHARE": {
       const numerator = rows.reduce((sum, r) => sum + (r.sampleValue ?? 0), 0);
@@ -776,6 +813,11 @@ function maximumBipartiteMatching(adjacency: ReadonlyMap<string, ReadonlySet<str
 /** rowGroupKey -> its declared composition mode, defaulting to ALL_FILTERS when only one filter exists (moot). */
 function compositionModeFor(plan: F5cCandidateSweepPlan, rowGroupKey: string): F5cRowGroupCompositionMode {
   return plan.rowGroupCompositions.find((c) => c.rowGroupKey === rowGroupKey)?.composition ?? "ALL_FILTERS";
+}
+
+/** rowGroupKey -> its declared structural row predicate (PR #191レビュー第6ラウンド§1), or null. */
+function rowPredicateFor(plan: F5cCandidateSweepPlan, rowGroupKey: string): F5cRowStructuralPredicate | null {
+  return plan.rowGroupCompositions.find((c) => c.rowGroupKey === rowGroupKey)?.rowPredicate ?? null;
 }
 
 interface AxisEvalContext {
@@ -843,20 +885,19 @@ function evaluateMetricAxis(ctx: AxisEvalContext, axis: F5cSweepAxis & { source:
 }
 
 /**
- * PR #191レビュー第2ラウンド§5 / 第3ラウンド§2 / 第4ラウンド§3・§4 / 第5ラウンド§4:
- * F5c1はどのPRODUCTION daypart/window境界も選んでいない——F5c2はuser-facingな
- * label（"morning"等）を発明せず、本番のwindowも選ばない。だが、同じ
+ * PR #191レビュー第2ラウンド§5 / 第3ラウンド§2 / 第4ラウンド§3・§4 / 第5ラウンド§4 /
+ * 第6ラウンド§3: F5c1はどのPRODUCTION daypart/window境界も選んでいない——F5c2は
+ * user-facingなlabel（"morning"等）を発明せず、本番のwindowも選ばない。だが、同じ
  * CIRCULAR_HOUR_WINDOW axis shapeは3つの構造的に異なる意味論（`F5cCircularIntent`
  * 参照）を表す。以下は`axis.circularIntent.kind`で分岐する3つの実行戦略——
  * DAYPART_TARGET/MULTI_DAYPART_BREADTHは、F5c1が`CIRCULAR_QUADRANT_HOUR_RANGES`
- * として確定させた共通の中立的4分割quadrant（F5c2はここでtokenの意味を独自解釈
- * しない——F5c1のSSOTをそのまま読む）を使い、PERSONAL_STABILITYだけが固定幅
- * （1日の1/3=`CIRCULAR_WINDOW_LENGTH_HOURS`）のsliding windowを各subject自身の
- * rowに対して探索する——母集団共通のwindow探索はもう存在しない（第4ラウンド§3で
- * DAYPART_TARGETから除去した）。
+ * として確定させた共通の中立的4分割quadrantを使い、PERSONAL_STABILITYだけが
+ * F5c1の`PERSONAL_STABILITY_WINDOW_HOURS`（axisの`circularIntent.windowLengthHours`
+ * として運ばれる）幅のsliding windowを各subject自身のrowに対して探索する——
+ * **どちらの解像度もF5c2側のprivate constantではない**（第6ラウンド§3で、最後に
+ * 残っていたwindow幅のprivate定数をF5c1へ移した）。母集団共通のwindow探索は
+ * もう存在しない（第4ラウンド§3でDAYPART_TARGETから除去した）。
  */
-const CIRCULAR_WINDOW_LENGTH_HOURS = 8;
-
 function hourInWindow(hour: number, windowStartHour: number, windowLengthHours: number): boolean {
   const offset = (hour - windowStartHour + 24) % 24;
   return offset < windowLengthHours;
@@ -919,6 +960,7 @@ function evaluateDaypartTargetAxis(
   quadrant: F5cCircularQuadrant,
   siblingFilteredRows: ReadonlyMap<string, readonly RawRow[]>,
   evidenceKnownBySubject: ReadonlyMap<string, boolean>,
+  hasFilterSiblings: boolean,
 ): { readonly sweep: F5cAxisSweepResult; readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome> } {
   const { hourCounts, observed, knownSubjectIds } = prepareCircularAxis(ctx, siblingFilteredRows, evidenceKnownBySubject);
 
@@ -952,7 +994,10 @@ function evaluateDaypartTargetAxis(
   }
 
   return {
-    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: hourCounts, boundaryReliability: boundaryReliabilityFor(ctx, "MONOTONIC_LOWER_BOUND") },
+    // PR #191レビュー第6ラウンド§2: an in-quadrant COUNT is monotonic on its own, but these rows
+    // already passed the sibling SCALAR_SAMPLE filters — the same pipeline caveat that makes an
+    // ordinary filtered reduction conservative applies here too.
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: hourCounts, boundaryReliability: boundaryReliabilityFor(ctx, reductionReliability("FILTER_THEN_COUNT", hasFilterSiblings)) },
     outcomeBySubject,
   };
 }
@@ -961,9 +1006,11 @@ function evaluateDaypartTargetAxis(
  * No.36: a population-wide "best window" is the wrong question — "two users with equally stable
  * but different personal usual times must not be judged solely by which time is more popular in
  * the cohort" (PR #191レビュー第3ラウンド§7). Instead, reduce each subject to their OWN best
- * personal 8-hour window's share of their OWN total rows (a stability/concentration ratio, not a
- * shared window), then sweep that per-subject scalar with the standard percentile mechanism —
- * exactly like a reduction axis, reusing `boundaryPoints` rather than a global window enumeration.
+ * personal window's share of their OWN total rows (a stability/concentration ratio, not a shared
+ * window), then sweep that per-subject scalar with the standard percentile mechanism — exactly
+ * like a reduction axis, reusing `boundaryPoints` rather than a global window enumeration.
+ * The window width comes from F5c1's `PERSONAL_STABILITY_WINDOW_HOURS` via the axis's own
+ * `circularIntent.windowLengthHours` (PR #191レビュー第6ラウンド§3) — F5c2 no longer invents it.
  * This share is a ratio, not a literal count — PR #191レビュー第4ラウンド§1: dropping rows
  * outside the subject's best window while keeping rows inside it can only *inflate* the share, so
  * it is not a monotonic lower bound; treated conservatively (both directions coverage-sensitive).
@@ -971,6 +1018,7 @@ function evaluateDaypartTargetAxis(
 function evaluatePersonalStabilityAxis(
   ctx: AxisEvalContext,
   axis: F5cSweepAxis & { reducerKind: "CIRCULAR_HOUR_WINDOW" },
+  windowLengthHours: number,
   siblingFilteredRows: ReadonlyMap<string, readonly RawRow[]>,
   evidenceKnownBySubject: ReadonlyMap<string, boolean>,
 ): { readonly sweep: F5cAxisSweepResult; readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome> } {
@@ -982,7 +1030,7 @@ function evaluatePersonalStabilityAxis(
     if (rows.length === 0) { shareBySubject.set(subjectId, 0); continue; }
     let bestOwnCount = 0;
     for (let windowStartHour = 0; windowStartHour < 24; windowStartHour += 1) {
-      const count = rows.filter((r) => hourInWindow(r.sampleValue!, windowStartHour, CIRCULAR_WINDOW_LENGTH_HOURS)).length;
+      const count = rows.filter((r) => hourInWindow(r.sampleValue!, windowStartHour, windowLengthHours)).length;
       if (count > bestOwnCount) bestOwnCount = count;
     }
     shareBySubject.set(subjectId, bestOwnCount / rows.length);
@@ -1032,6 +1080,7 @@ function evaluateMultiDaypartBreadthAxis(
   minDistinctDaysPerQuadrant: number,
   siblingFilteredRows: ReadonlyMap<string, readonly RawRow[]>,
   evidenceKnownBySubject: ReadonlyMap<string, boolean>,
+  hasFilterSiblings: boolean,
 ): { readonly sweep: F5cAxisSweepResult; readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome> } {
   const { hourCounts, observed, knownSubjectIds } = prepareCircularAxis(ctx, siblingFilteredRows, evidenceKnownBySubject);
 
@@ -1074,7 +1123,8 @@ function evaluateMultiDaypartBreadthAxis(
   }
 
   return {
-    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: hourCounts, boundaryReliability: boundaryReliabilityFor(ctx, "MONOTONIC_LOWER_BOUND") },
+    // Same pipeline caveat as DAYPART_TARGET (PR #191レビュー第6ラウンド§2).
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: hourCounts, boundaryReliability: boundaryReliabilityFor(ctx, reductionReliability("SET_BREADTH", hasFilterSiblings)) },
     outcomeBySubject,
   };
 }
@@ -1084,13 +1134,15 @@ function evaluateCircularHourAxis(
   axis: F5cSweepAxis & { reducerKind: "CIRCULAR_HOUR_WINDOW" },
   siblingFilteredRows: ReadonlyMap<string, readonly RawRow[]>,
   evidenceKnownBySubject: ReadonlyMap<string, boolean>,
+  hasFilterSiblings: boolean,
 ): { readonly sweep: F5cAxisSweepResult; readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome> } {
   const intent = axis.circularIntent;
-  if (intent.kind === "DAYPART_TARGET") return evaluateDaypartTargetAxis(ctx, axis, intent.quadrant, siblingFilteredRows, evidenceKnownBySubject);
-  if (intent.kind === "PERSONAL_STABILITY") return evaluatePersonalStabilityAxis(ctx, axis, siblingFilteredRows, evidenceKnownBySubject);
+  if (intent.kind === "DAYPART_TARGET") return evaluateDaypartTargetAxis(ctx, axis, intent.quadrant, siblingFilteredRows, evidenceKnownBySubject, hasFilterSiblings);
+  // PR #191レビュー第6ラウンド§3: analysis window幅もF5c1側のcircularIntentから読む。
+  if (intent.kind === "PERSONAL_STABILITY") return evaluatePersonalStabilityAxis(ctx, axis, intent.windowLengthHours, siblingFilteredRows, evidenceKnownBySubject);
   // PR #191レビュー第5ラウンド§5: recurrence閾値はF5c1側のcircularIntentから読む
   // ——F5c2独自にhardcodeしない。
-  return evaluateMultiDaypartBreadthAxis(ctx, axis, intent.minDistinctDaysPerQuadrant, siblingFilteredRows, evidenceKnownBySubject);
+  return evaluateMultiDaypartBreadthAxis(ctx, axis, intent.minDistinctDaysPerQuadrant, siblingFilteredRows, evidenceKnownBySubject, hasFilterSiblings);
 }
 
 /**
@@ -1149,15 +1201,19 @@ function evaluatePostFilterMatchingAxis(
     if (!evidenceIsKnown(subject, ctx.probeKey, ctx.plan.requiredJointEvidence.kind)) { outcomeAtRepresentative.set(subject.subjectUserId, "UNKNOWN"); continue; }
     const size = matchingSizeBySubject.get(subject.subjectUserId) ?? 0;
     const outcome = size >= representativeMatchingBoundary ? "MATCHED" : "NOT_MATCHED";
-    // representativeMatchingBoundary is percentile-derived — even though the underlying matching
-    // size is a genuine monotonic lower bound (removing edges can only shrink the maximum
-    // matching — a graph-theoretic fact, preserved for the boundaryReliability label below), the
-    // BOUNDARY compared against is itself uncertain, so both directions collapse (PR #191レビュー
-    // 第5ラウンド§1/§3).
+    // representativeMatchingBoundary is percentile-derived — the BOUNDARY compared against is
+    // itself uncertain, so both directions collapse (PR #191レビュー第5ラウンド§1/§3).
     outcomeAtRepresentative.set(subject.subjectUserId, percentileBoundaryOutcome(outcome, ctx.coverageWindowValidated));
   }
   return {
-    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: null, boundaryReliability: boundaryReliabilityFor(ctx, "MONOTONIC_LOWER_BOUND") },
+    // PR #191レビュー第6ラウンド§2: "removing edges can only shrink the maximum matching" is a
+    // genuine graph-theoretic fact, but it only makes the RESULT a lower bound when the edge
+    // threshold is FIXED. Here the edge threshold is itself an observed percentile of the same
+    // incomplete edge-value population: restoring missing evidence can move that threshold in
+    // either direction, and a *higher* restored threshold admits fewer edges — so the observed
+    // matching size at observed-p50 is not provably ≤ the true matching size at true-p50. The
+    // full pipeline does not prove a direction, so the diagnostic label stays conservative.
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: null, boundaryReliability: boundaryReliabilityFor(ctx, "NON_MONOTONIC") },
     outcomeAtRepresentative,
   };
 }
@@ -1194,6 +1250,7 @@ function evaluateRowGroup(
   group: RowGroupPlan,
 ): { readonly sweeps: readonly F5cAxisSweepResult[]; readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome> } {
   const composition = compositionModeFor(ctx.plan, group.rowGroupKey);
+  const rowPredicate = rowPredicateFor(ctx.plan, group.rowGroupKey);
   const sweeps: F5cAxisSweepResult[] = [];
   const outcomeBySubject = new Map<string, F5cShadowOutcome>();
 
@@ -1243,9 +1300,19 @@ function evaluateRowGroup(
         });
         const own = rawBySubject.get(subject.subjectUserId) ?? [];
         const indices = qualifyingIndices(qualifyingFilterSets, composition);
+        // NOTE: the row group's structural predicate is deliberately NOT applied here. Each
+        // circular intent already encodes its own hour semantic (DAYPART_TARGET counts in-quadrant
+        // rows itself; MULTI_DAYPART_BREADTH is about spread ACROSS quadrants and would be
+        // destroyed by a single-quadrant restriction), and leaving these rows unrestricted keeps
+        // `hourHistogram` a full 24-bin diagnostic of where the subject's qualifying activity
+        // actually falls — which is exactly the context a reader needs to interpret the
+        // predicate-restricted reductions below.
         qualifyingBySubject.set(subject.subjectUserId, applyQualifyingIndices(own, indices));
       }
-      const result = evaluateCircularHourAxis(ctx, circularAxis, qualifyingBySubject, evidenceKnownBySubject);
+      // PR #191レビュー第6ラウンド§2: these rows already passed the sibling SCALAR_SAMPLE filters,
+      // so the special paths' boundary-reliability claim inherits that uncertainty — pass it down
+      // rather than letting a count/breadth result self-certify as a lower bound.
+      const result = evaluateCircularHourAxis(ctx, circularAxis, qualifyingBySubject, evidenceKnownBySubject, group.filterAxes.length > 0);
       sweeps.push(result.sweep);
       for (const [subjectId, outcome] of result.outcomeBySubject) {
         outcomeBySubject.set(subjectId, combineOutcomes([outcomeBySubject.get(subjectId) ?? "MATCHED", outcome]));
@@ -1264,7 +1331,9 @@ function evaluateRowGroup(
   // boundary combination, then sweep the reduction's OWN resulting distribution.
   for (const reductionAxis of group.reductionAxes) {
     const rawBySubject = rowGroupRawRowsFor(ctx, reductionAxis);
-    const reducedBySubject = new Map<string, { readonly value: number; readonly hasEvidence: boolean }>();
+    // `value: null` = the reduction is not computable for this subject (FILTER_THEN_SPAN_DAYS over
+    // an empty qualifying set, per the F5c1 contract) — distinct from a computable numeric zero.
+    const reducedBySubject = new Map<string, { readonly value: number | null; readonly hasEvidence: boolean }>();
     for (const subject of ctx.subjects) {
       // PR #191レビュー§1: "hasEvidence"はrowが0件かどうかではなく、subjectがこの
       // joint-evidence kindで実際に観測されたかどうか——No.49のTC=0件/VC=多数件のように、
@@ -1272,7 +1341,9 @@ function evaluateRowGroup(
       const hasEvidence = evidenceIsKnown(subject, ctx.probeKey, ctx.plan.requiredJointEvidence.kind);
       const own = rawBySubject.get(subject.subjectUserId) ?? [];
       if (group.filterAxes.length === 0) {
-        reducedBySubject.set(subject.subjectUserId, { value: reduceRows(own, own, reductionAxis.reducerKind), hasEvidence });
+        // the structural predicate still applies with no SCALAR_SAMPLE filters present (§1).
+        const qualifying = applyRowPredicate(own, rowPredicate);
+        reducedBySubject.set(subject.subjectUserId, { value: reduceRows(qualifying, own, reductionAxis.reducerKind), hasEvidence });
         continue;
       }
       const qualifyingFilterSets = group.filterAxes.map((filterAxis, i) => {
@@ -1281,16 +1352,20 @@ function evaluateRowGroup(
         return boundary === undefined ? [] : filterRows(raw, filterAxis.operator, boundary);
       });
       const indices = qualifyingIndices(qualifyingFilterSets, composition);
-      const qualifying = applyQualifyingIndices(own, indices);
+      // PR #191レビュー第6ラウンド§1: modality composition(ANY/ALL)の結果へ、row groupの
+      // 構造述語(target daypart等)をANDする——`own`(denominator)は絞らないので、
+      // FILTER_THEN_SHAREは「対象daypartのqualifying row / 全活動row」= prominenceになる。
+      const qualifying = applyRowPredicate(applyQualifyingIndices(own, indices), rowPredicate);
       reducedBySubject.set(subject.subjectUserId, { value: reduceRows(qualifying, own, reductionAxis.reducerKind), hasEvidence });
     }
-    const samples = [...reducedBySubject.values()].filter((r) => r.hasEvidence).map((r) => r.value);
+    const computable = [...reducedBySubject.values()].filter((r) => r.hasEvidence && r.value !== null);
+    const samples = computable.map((r) => r.value!);
     const boundaries = boundaryValuesFor(samples);
-    const knownCount = [...reducedBySubject.values()].filter((r) => r.hasEvidence).length;
+    const knownCount = computable.length;
     const boundaryPoints: F5cBoundarySweepPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
       const boundaryValue = boundaries.get(percentile);
       if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, marginalPassRate: null };
-      const passingCount = [...reducedBySubject.values()].filter((r) => r.hasEvidence && passes(reductionAxis.operator, r.value, boundaryValue)).length;
+      const passingCount = computable.filter((r) => passes(reductionAxis.operator, r.value!, boundaryValue)).length;
       return { percentile, boundaryValue, knownCount, passingCount, marginalPassRate: knownCount === 0 ? null : passingCount / knownCount };
     });
     sweeps.push({ axisKey: reductionAxis.axisKey, reducerKind: reductionAxis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, boundaryReliability: boundaryReliabilityFor(ctx, reductionReliability(reductionAxis.reducerKind, group.filterAxes.length > 0)) });
@@ -1300,7 +1375,9 @@ function evaluateRowGroup(
       const result = reducedBySubject.get(subject.subjectUserId)!;
       const prior = outcomeBySubject.get(subject.subjectUserId);
       let outcome: F5cShadowOutcome;
-      if (!result.hasEvidence || representativeBoundary === undefined) outcome = "UNKNOWN";
+      // `result.value === null` = not computable for this subject (F5c1's empty-set span
+      // semantic, §4) — UNKNOWN, never folded into a numeric zero comparison.
+      if (!result.hasEvidence || result.value === null || representativeBoundary === undefined) outcome = "UNKNOWN";
       else {
         // representativeBoundary is percentile-derived — collapses regardless of reducerKind
         // monotonicity (PR #191レビュー第5ラウンド§1); reductionReliability() only still governs
@@ -1385,17 +1462,44 @@ function auditPlanSelectorSupport(plan: F5cCandidateSweepPlan): string | null {
 }
 
 /**
+ * PR #191レビュー第6ラウンド§1: joint-evidence kinds whose rows carry a JST hour, and therefore
+ * can satisfy an `HOUR_IN_QUADRANT` row predicate. This is a different fact from
+ * `JOINT_ROW_RESOLVERS` (which says how a selector resolves) — it says which evidence shapes have
+ * an hour concept at all — so it is not a parallel copy of the resolver SSOT. A plan declaring an
+ * hour predicate over any other evidence kind fails the audit rather than silently matching zero
+ * rows forever.
+ */
+const HOUR_BEARING_JOINT_EVIDENCE_KINDS: ReadonlySet<string> = new Set(["activity-time-day-hour-v1"]);
+
+function auditPlanRowPredicateSupport(plan: F5cCandidateSweepPlan): string | null {
+  const declaredRowGroups = new Set<string>();
+  for (const axis of plan.axes) if (axis.source === "JOINT_EVIDENCE") declaredRowGroups.add(axis.rowGroupKey);
+  for (const composition of plan.rowGroupCompositions) {
+    const predicate = composition.rowPredicate;
+    if (predicate === null) continue;
+    if (!declaredRowGroups.has(composition.rowGroupKey)) {
+      return `row predicate declared for unknown row group: ${composition.rowGroupKey}`;
+    }
+    if (!HOUR_BEARING_JOINT_EVIDENCE_KINDS.has(plan.requiredJointEvidence.kind)) {
+      return `row predicate ${predicate.kind} needs hour-bearing joint evidence, but this plan requires ${plan.requiredJointEvidence.kind}`;
+    }
+  }
+  return null;
+}
+
+/**
  * Static, subject-data-independent audit across every plan — every actively-referenced JOINT_EVIDENCE
- * axis / JOINT_STRUCTURAL_FACT selector in `plans` must resolve against `JOINT_ROW_RESOLVERS`.
+ * axis / JOINT_STRUCTURAL_FACT selector in `plans` must resolve against `JOINT_ROW_RESOLVERS`, and
+ * every declared row predicate must be executable against that plan's evidence shape.
  * Exported so a dedicated test can assert READY-76 has zero gaps directly, without needing to
- * fabricate subject data to exercise every code path (PR #191レビュー§4).
+ * fabricate subject data to exercise every code path (PR #191レビュー§4 / 第6ラウンド§1).
  */
 export function auditF5c2SelectorSupport(
   plans: readonly F5cCandidateSweepPlan[] = F5C_CANDIDATE_SWEEP_PLANS,
 ): readonly { readonly candidateNo: number; readonly reason: string }[] {
   const gaps: { readonly candidateNo: number; readonly reason: string }[] = [];
   for (const plan of plans) {
-    const reason = auditPlanSelectorSupport(plan);
+    const reason = auditPlanSelectorSupport(plan) ?? auditPlanRowPredicateSupport(plan);
     if (reason !== null) gaps.push({ candidateNo: plan.candidateNo, reason });
   }
   return gaps;
@@ -1415,7 +1519,7 @@ function executeCandidate(
     outcomeBySubject.set(subjectId, list);
   };
 
-  const staticAuditReason = auditPlanSelectorSupport(plan);
+  const staticAuditReason = auditPlanSelectorSupport(plan) ?? auditPlanRowPredicateSupport(plan);
   let unsupportedReason: string | null = staticAuditReason;
 
   if (unsupportedReason === null) {
