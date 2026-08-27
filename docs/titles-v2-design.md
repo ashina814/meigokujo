@@ -2265,6 +2265,47 @@ sweep、percentile boundary、prevalence、overlap、sensitivity、continuous/cu
 比較してaggregate結果だけを出す。F5b2はproduction threshold、`matched`、BehaviorTitleDefinition、award/evaluator、UI、通知、
 自動cohort、backfillを追加しない。readinessはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8のまま。
 
+## 14.9 F5c1 READY-76 Sweep Contract
+
+F5c1はthresholdを選ぶphaseではなく、SOURCE READY 76件を将来どのmeasurement軸でsweepするかを固定するplanning-only
+contractである。`F5C_CALIBRATION_PROBES`はF5a 2件、F5b1 10件、F5b2 19件のexact 31 probeを一度に実行し、
+`collectF5cCalibrationMeasurements()`はsame cohort/window/observedAtの全unique safe sourceを一つの`TitleSourceCache`へ
+prefetchする。phaseを跨いで`vc_social_safe`、`social_activity_time_safe`、`casino_table_activity_safe`等を再読しない。
+probe candidate unionはreadiness SSOTのREADY集合とexact一致する76件で、PARTIAL/BLOCKED/METAを含まない。
+
+`F5C_CANDIDATE_SWEEP_PLANS`はcandidate no順の76 planで、各planはprovisional key、owner probe、readiness由来の
+threshold category / optimization risk、finiteなevaluation shape、actual probe metric selector、必要なtagged joint evidence、
+sweep axis、semantic structural requirement、coverage/release noteを持つ。shapeはstructural presence、manifest conformance、
+distribution threshold、multi-metric conjunction、joint correlation、structural+distributionに限定し、汎用rule DSLや
+production evaluatorを作らない。plan auditは31 probe / READY 76 / plan 76、candidate ownership、category、risk、actual zero-payload
+metric/joint output、duplicate、非READY混入を機械検証する。現contractのmeasurement gapは0件である。
+
+`THRESHOLD_PENDING`のaxisはmetricまたはidentity-minimized joint evidence selector、operator、
+`OBSERVED_NEAREST_RANK` boundary methodだけを持つ。数値value fieldは型に存在せず、F5c1は仮threshold、hour/daypart境界、
+TC meaningful gap、VC meaningful seconds、share、日数、spanを一切決めない。No.32–37のJST 24hourはmeasurement resolutionの
+ままで、朝/昼/夕方/深夜境界を固定しない。VC Style No.10–21はcandidate semantics別にvolume/day/span、overallとsocial-onlyの
+share/stability、bucket breadth/skewを分け、少量100% shareを単独条件へしない。
+
+`STRUCTURAL_FIXED`はsemanticSpecから一意な事実だけを`structuralRequirements`へ置き、distribution axisを持たない。
+`MANIFEST_DEPENDENT`は現行versioned economy/Casino/Castle manifestの意味を維持し、percentileへ変換しない。
+`STRUCTURAL_PLUS_DISTRIBUTION`のNo.77はcanonical next-generation/entry chronologyをstructural側へ、branch activityとsame-day
+pre-entry evidenceの未決定境界をaxis側へ分離する。No.26/27のperson×semantic-family matching、No.42–47のTC conversation、
+No.49 cross-modal、No.56/87/88 domain social-time、No.76–79 invite branch、No.90/91 Castle role contextは、aggregate marginalだけで
+相関を再構成せず、既存planning-internal tagged joint evidenceを明示して使う。
+
+safe sourceでsemanticSpecをproxyなしにsweepできない候補が将来現れた場合は`MEASUREMENT_GAP`とし、別candidateやraw DB、raw
+Discord/ledger、current role、identityを代用しない。既存safe payloadにすでに含まれる情報をidentity-minimized reducerへ追加する
+範囲を超えるならF5c1でsource/schema/readinessを広げない。unknown/untrusted/pre-rollout coverageは観測済み0と区別し、coverage
+limitationを残す。restricted collectionのsubject IDとjoint rowsはmemory内だけで、serialize/log/persistしない。plan/auditは
+deep-freezeし、public `v2.ts`、evaluator、pipeline、prefetch、Botからimportしない。
+
+F5c2はこのexact contractとsame deterministic measurement engineを使い、観測distributionとnearest-rankからbounded gridを作る。
+shadow prevalence、candidate overlap、sensitivity等を行う場合も出力はaggregateだけで、subject rowやmatch一覧を出さない。
+F5c1自身はprevalence/Jaccard/recommendationを計算しない。F6だけが、別レビューで採択されたthresholdをstable production ruleへ
+変換し、evaluator/award/release gateを扱う。No.58はplan coverageへ含むが、post-award reversal未解決のrelease gateを維持する。
+readinessはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8のままで、plan coverage 76/76はsource readinessやrelease可否の変更を
+意味しない。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

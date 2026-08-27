@@ -367,6 +367,13 @@ interface CalibrationProbeRuntime {
   measureEmpty(context: { readonly windowStart: number }): SubjectMeasurement;
 }
 
+export interface CalibrationProbeMeasurementContract {
+  readonly probeKey: CalibrationProbeKey;
+  readonly candidateNos: readonly number[];
+  readonly metricKeys: readonly string[];
+  readonly jointEvidenceKind: PlanningCalibrationJointEvidence["kind"];
+}
+
 function runtimeProbe<S extends readonly TitleUsableSourceKey[]>(probe: CalibrationProbe<S>): CalibrationProbeRuntime {
   // Fail at module/probe construction, before any cohort read, if readiness/source integrity drifts.
   descriptorFor(probe.candidateNos, probe.sources);
@@ -1656,6 +1663,13 @@ export const F5B2_CALIBRATION_PROBES = Object.freeze([
   runtimeProbe(CASTLE_ROLE_CONTEXT_PROBE),
 ]);
 
+/** All SOURCE READY measurement probes, for planning-only F5c analysis. */
+export const F5C_CALIBRATION_PROBES = Object.freeze([
+  ...F5A_CALIBRATION_PROBES,
+  ...F5B1_CALIBRATION_PROBES,
+  ...F5B2_CALIBRATION_PROBES,
+]);
+
 export function canonicalReadinessHash(readiness: readonly CandidateReadinessAudit[]): string {
   const canonical = readiness.slice().sort((a, b) => a.no - b.no).map((entry) => JSON.stringify({
     no: entry.no,
@@ -1780,6 +1794,32 @@ export function collectF5b2CalibrationMeasurements(
   input: F5aCalibrationInput,
 ): PlanningCalibrationMeasurementCollection {
   return collectCalibrationMeasurements(db, input, F5B2_CALIBRATION_PROBES);
+}
+
+/**
+ * Restricted planning API for F5c. All 31 probes share one source cache and one
+ * deterministic cohort/window/observedAt boundary. Never serialize this result.
+ */
+export function collectF5cCalibrationMeasurements(
+  db: Database.Database,
+  input: F5aCalibrationInput,
+): PlanningCalibrationMeasurementCollection {
+  return collectCalibrationMeasurements(db, input, F5C_CALIBRATION_PROBES);
+}
+
+/** Actual zero-payload output contract used to audit F5c metric/joint selectors. */
+export function describeF5cCalibrationProbeContracts(
+  windowStart = 0,
+): readonly CalibrationProbeMeasurementContract[] {
+  return deepFreeze(F5C_CALIBRATION_PROBES.map((probe) => {
+    const measurement = probe.measureEmpty({ windowStart });
+    return {
+      probeKey: probe.probeKey,
+      candidateNos: [...probe.candidateNos].sort((a, b) => a - b),
+      metricKeys: [...measurement.metrics.keys()].sort(),
+      jointEvidenceKind: measurement.jointEvidence?.kind ?? "none",
+    };
+  }).sort((a, b) => a.probeKey.localeCompare(b.probeKey)));
 }
 
 function collectCalibrationMeasurements(
