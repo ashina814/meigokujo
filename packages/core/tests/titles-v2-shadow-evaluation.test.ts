@@ -16,8 +16,10 @@ import {
   executeF5cShadowCalibration,
   runF5cShadowCalibration,
   auditF5c2SelectorSupport,
+  coverageSensitiveOutcome,
   F5C2_BOUNDARY_PERCENTILES,
   F5C2_SENSITIVITY_MODEL,
+  F5C2_SHADOW_CONTRACT_VERSION,
   type F5cShadowCalibrationReport,
 } from "../src/titles/v2-shadow-evaluation.js";
 import type { PlanningCalibrationJointEvidence, PlanningCalibrationMeasurementCollection, PlanningCalibrationSubjectMeasurement } from "../src/titles/v2-calibration.js";
@@ -162,32 +164,39 @@ describe("F5c2 shadow-calibration executor", () => {
     expect(qualifyingDays.observedSampleCount).toBeGreaterThan(0);
   });
 
-  it("F. CIRCULAR_HOUR_WINDOW reports a bounded 24-bin hour histogram, never a selected window", () => {
-    const evidence: PlanningCalibrationJointEvidence = {
+  it("F. CIRCULAR_HOUR_WINDOW (DAYPART_TARGET) reports a bounded 24-bin hour histogram and judges each subject by their own in-quadrant row count, never a selected window", () => {
+    // No.32 targets QUADRANT_1 = [6,12) (朝番/morning). Every subject has exactly 2 rows with
+    // IDENTICAL tcBestOtherGapMs/vcTrustedSocialSeconds, so the row group's other 4 sibling axes
+    // (qualifying-days/tc-gap-ceiling/vc-seconds/activity-share) trivially agree MATCHED for
+    // everyone — isolating the circular axis as the only source of divergence. alice has 2 in-Q1
+    // rows (hour 8), carol has 1 (hour 9, plus 1 outside in Q2), bob has 0 (both rows in Q3,
+    // evening hour 20) -> population representative (p50) in-quadrant count = 1.
+    const evidenceFor = (hours: readonly number[]): PlanningCalibrationJointEvidence => ({
       kind: "activity-time-day-hour-v1",
-      rows: [
-        { dayOffset: 1, hour: 3, tcBestOtherGapMs: null, vcTrustedSocialSeconds: 500 },
-        { dayOffset: 2, hour: 3, tcBestOtherGapMs: null, vcTrustedSocialSeconds: 500 },
-        { dayOffset: 3, hour: 20, tcBestOtherGapMs: null, vcTrustedSocialSeconds: 500 },
-      ],
-    };
-    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "activity-time-v1", jointEvidence: evidence }])]), true);
+      rows: hours.map((hour, i) => ({ dayOffset: i + 1, hour, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 500 })),
+    });
+    const report = executeF5cShadowCalibration(collection([
+      subject("alice", [{ probeKey: "activity-time-v1", jointEvidence: evidenceFor([8, 8]) }]),
+      subject("bob", [{ probeKey: "activity-time-v1", jointEvidence: evidenceFor([20, 20]) }]),
+      subject("carol", [{ probeKey: "activity-time-v1", jointEvidence: evidenceFor([9, 15]) }]),
+    ]), true);
     const plan32 = byNo(report, 32);
     const boundary = plan32.axisSweeps.find((s) => s.axisKey === "candidate-32-daypart-boundary")!;
     expect(boundary.hourHistogram).not.toBeNull();
     expect(boundary.hourHistogram).toHaveLength(24);
-    expect(boundary.hourHistogram![3]).toBe(2);
-    expect(boundary.hourHistogram![20]).toBe(1);
-    expect(boundary.boundaryPoints).toEqual([]); // no operator/boundary is ever selected for this axis
-    // PR #191レビュー§5: the histogram is diagnostic, but the axis must also participate — a
-    // bounded 24-point window enumeration is always reported, one point per candidate start hour.
-    expect(boundary.circularWindowPoints).not.toBeNull();
-    expect(boundary.circularWindowPoints).toHaveLength(24);
-    expect(boundary.circularWindowPoints!.map((p) => p.windowStartHour)).toEqual([...Array(24).keys()]);
-    for (const point of boundary.circularWindowPoints!) expect(point.windowLengthHours).toBe(8);
-    // hour 3 has the only subject's rows -> every window covering hour 3 has qualifyingCount 1.
-    const windowCoveringHour3 = boundary.circularWindowPoints!.find((p) => p.windowStartHour === 0)!;
-    expect(windowCoveringHour3.qualifyingCount).toBe(1);
+    expect(boundary.hourHistogram![8]).toBe(2);
+    expect(boundary.hourHistogram![9]).toBe(1);
+    expect(boundary.hourHistogram![15]).toBe(1);
+    expect(boundary.hourHistogram![20]).toBe(2);
+    // PR #191レビュー第4ラウンド§3: no window search — the axis reduces each subject to a plain
+    // in-quadrant row count and sweeps it via the standard percentile mechanism, exactly like any
+    // other reduction axis; boundaryPoints is populated, not the empty array a window-search axis
+    // with no chosen operator would have produced.
+    expect(boundary.boundaryPoints.length).toBeGreaterThan(0);
+    expect(boundary.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue).toBe(1);
+    expect(boundary.boundaryReliability).toBe("OBSERVED_COMPLETE");
+    expect(plan32.matchedCount).toBe(2); // alice (2 in-Q1), carol (1 in-Q1)
+    expect(plan32.notMatchedCount).toBe(1); // bob (0 in-Q1)
   });
 
   it("No.36 PERSONAL_STABILITY judges each subject by their OWN concentration, not by which time is popular in the cohort (PR #191レビュー第3ラウンド§2/§7)", () => {
@@ -212,8 +221,7 @@ describe("F5c2 shadow-calibration executor", () => {
     const plan36 = byNo(report, 36);
     const sweep = plan36.axisSweeps.find((s) => s.axisKey === "usual-time-start-hour-stability")!;
     // PERSONAL_STABILITY has no single shared window — it sweeps a per-subject concentration
-    // scalar via the standard percentile mechanism, not the population-wide window enumeration.
-    expect(sweep.circularWindowPoints).toBeNull();
+    // scalar via the standard percentile mechanism, not a population-wide window enumeration.
     expect(sweep.boundaryPoints.length).toBeGreaterThan(0);
     expect(plan36.matchedCount).toBe(2); // alice, bob — different usual times, equally stable
     expect(plan36.notMatchedCount).toBe(1); // carol — scattered, not personally stable
@@ -243,51 +251,116 @@ describe("F5c2 shadow-calibration executor", () => {
     expect(sweep.hourHistogram![15]).toBe(0);
   });
 
-  it("No.32/34 DAYPART_TARGET candidates search disjoint quadrants and can diverge on the identical population (PR #191レビュー第3ラウンド§2 counterexample)", () => {
-    // A single subject active only at hour 14 (deep in quadrant 2 = [12,18), unreachable by any
-    // window whose start is restricted to quadrant 0 = [0,6)'s allowed starts). No.32 targets
-    // quadrant 0 and must NOT_MATCH; No.34 targets quadrant 2 and must MATCH — on the SAME shared
-    // activity-time-v1 pack, proving the two daypart-target candidates no longer collapse onto a
-    // single population-wide "best window."
+  it("No.32/34 DAYPART_TARGET candidates target disjoint quadrants matching the catalog semantic and can diverge on the identical population (PR #191レビュー第4ラウンド§2/§3 counterexample)", () => {
+    // No.32 (朝番/morning) targets QUADRANT_1=[6,12); No.34 (宵っ張り/evening~pre-midnight)
+    // targets QUADRANT_3=[18,24) — the catalog-correct mapping (not the candidate-ordinal-based
+    // Q0/Q2 mapping from the prior round, under which hour 14 — squarely in [12,18) — would have
+    // wrongly satisfied No.34's "evening" semantic). Every subject has exactly 3 rows with
+    // IDENTICAL tcBestOtherGapMs/vcTrustedSocialSeconds (so the row group's other sibling axes
+    // trivially agree MATCHED for everyone, isolating the circular axis): 1 morning row (hour 8,
+    // shared by all 3) plus 2 more — bob/carol's are genuine evening (Q3) activity, alice's are
+    // afternoon (Q2, neither target quadrant). Both candidates see the SAME morning row count
+    // (1 each -> No.32 matches everyone); only No.34 diverges, since alice alone has zero Q3 rows.
     const probeKey = probeKeyFor(32);
-    const s = subject("alice", [{
+    const threeRows = (id: string, hour2: number, hour3: number) => subject(id, [{
       probeKey,
       jointEvidence: {
         kind: "activity-time-day-hour-v1",
-        rows: [{ dayOffset: 1, hour: 14, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 }],
-      },
-    }]);
-    const report = executeF5cShadowCalibration(collection([s]), true);
-    const plan32 = byNo(report, 32);
-    const plan34 = byNo(report, 34);
-    expect(plan32.matchedCount).toBe(0);
-    expect(plan32.notMatchedCount).toBe(1);
-    expect(plan34.matchedCount).toBe(1);
-    expect(plan34.notMatchedCount).toBe(0);
-  });
-
-  it("No.37 MULTI_DAYPART_BREADTH rewards spread across quadrants, not concentration in one (PR #191レビュー第3ラウンド§2/§7)", () => {
-    // 4 subjects with breadth 1/2/3/4 distinct quadrants touched -> population representative
-    // (p50) boundary = 2 -> the single-quadrant subject (breadth 1, all days at the same hour)
-    // fails while every subject reaching 2+ quadrants passes.
-    const probeKey = probeKeyFor(37);
-    const spread = (id: string, hours: readonly number[]) => subject(id, [{
-      probeKey,
-      jointEvidence: {
-        kind: "activity-time-day-hour-v1",
-        rows: hours.map((hour, i) => ({ dayOffset: i + 1, hour, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 })),
+        rows: [
+          { dayOffset: 1, hour: 8, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 500 },
+          { dayOffset: 2, hour: hour2, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 500 },
+          { dayOffset: 3, hour: hour3, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 500 },
+        ],
       },
     }]);
     const report = executeF5cShadowCalibration(collection([
-      spread("breadth1", [2, 2, 2, 2]),
-      spread("breadth2", [2, 8, 2, 8]),
-      spread("breadth3", [2, 8, 14, 2]),
-      spread("breadth4", [2, 8, 14, 20]),
+      threeRows("alice", 14, 14), // afternoon (Q2) padding, no evening activity
+      threeRows("bob", 20, 20), // genuine evening (Q3)
+      threeRows("carol", 21, 21), // genuine evening (Q3)
+    ]), true);
+    const plan32 = byNo(report, 32);
+    const plan34 = byNo(report, 34);
+    expect(plan32.matchedCount).toBe(3); // everyone has the same 1 Q1 (morning) row
+    expect(plan32.notMatchedCount).toBe(0);
+    expect(plan34.matchedCount).toBe(2); // bob, carol — real Q3 (evening) activity
+    expect(plan34.notMatchedCount).toBe(1); // alice — no evening activity at all
+  });
+
+  it("No.37 MULTI_DAYPART_BREADTH rewards recurring spread across quadrants on distinct days, not mere presence (PR #191レビュー第3ラウンド§2/§7, 第4ラウンド§4)", () => {
+    // PR #191レビュー第4ラウンド§4: a quadrant only counts toward breadth once a subject has
+    // qualifying rows in it on at least 2 DISTINCT days — a single occurrence in a quadrant (as a
+    // one-night cross-midnight block would produce, one day per touched quadrant) cannot alone
+    // make that quadrant count. Each subject below touches quadrants Q0/Q1/Q2/Q3 exactly twice
+    // (2 distinct days each) to isolate breadth 1/2/3/4 -> population representative (p50)
+    // boundary = 2 recurring quadrants -> breadth1 fails, breadth2-4 all pass.
+    const probeKey = probeKeyFor(37);
+    const spread = (id: string, hourDayPairs: ReadonlyArray<readonly [dayOffset: number, hour: number]>) => subject(id, [{
+      probeKey,
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: hourDayPairs.map(([dayOffset, hour]) => ({ dayOffset, hour, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 })),
+      },
+    }]);
+    const report = executeF5cShadowCalibration(collection([
+      spread("breadth1", [[1, 2], [2, 2]]), // Q0 only, 2 distinct days
+      spread("breadth2", [[1, 2], [2, 2], [3, 8], [4, 8]]), // Q0 + Q1, 2 days each
+      spread("breadth3", [[1, 2], [2, 2], [3, 8], [4, 8], [5, 14], [6, 14]]), // Q0 + Q1 + Q2
+      spread("breadth4", [[1, 2], [2, 2], [3, 8], [4, 8], [5, 14], [6, 14], [7, 20], [8, 20]]), // all 4
     ]), true);
     const plan37 = byNo(report, 37);
     expect(plan37.notMatchedCount).toBe(1);
     expect(plan37.matchedCount).toBe(3);
     expect(plan37.unknownCount).toBe(0);
+  });
+
+  it("No.37: a single continuous cross-midnight block (one all-nighter) does not satisfy MULTI_DAYPART_BREADTH, even though genuinely recurring activity does (PR #191レビュー第4ラウンド§4 counterexample)", () => {
+    // The all-nighter subject has ONE session spanning hour 22 (day 1, Q3) through hour 4 (day 2,
+    // Q0) — it touches 2 quadrants but only 1 distinct day in EACH, so neither quadrant clears the
+    // >=2-distinct-days bar: 0 recurring quadrants. The recurring subject has genuine activity in
+    // Q0 and Q3 across 2 SEPARATE days each (not one continuous block) and must be recognized. A
+    // third, moderate subject (recurring in exactly 1 quadrant) establishes a nonzero population
+    // boundary so allNighter's rejection is a real AT_LEAST comparison, not a vacuous 0-vs-0 tie.
+    const probeKey = probeKeyFor(37);
+    const allNighter = subject("allNighter", [{
+      probeKey,
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: [
+          { dayOffset: 1, hour: 22, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 },
+          { dayOffset: 1, hour: 23, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 },
+          { dayOffset: 2, hour: 0, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 },
+          { dayOffset: 2, hour: 4, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 },
+        ],
+      },
+    }]);
+    const moderate = subject("moderate", [{
+      probeKey,
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: [
+          { dayOffset: 1, hour: 8, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 },
+          { dayOffset: 2, hour: 8, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 },
+        ],
+      },
+    }]);
+    const recurring = subject("recurring", [{
+      probeKey,
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: [
+          { dayOffset: 10, hour: 22, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 },
+          { dayOffset: 11, hour: 22, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 },
+          { dayOffset: 12, hour: 2, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 },
+          { dayOffset: 13, hour: 2, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 },
+        ],
+      },
+    }]);
+    const report = executeF5cShadowCalibration(collection([allNighter, moderate, recurring]), true);
+    const plan37 = byNo(report, 37);
+    const sweep = plan37.axisSweeps.find((s) => s.axisKey === "multi-daypart-boundaries")!;
+    expect(sweep.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue).toBe(1); // p50 of [0,1,2]
+    expect(plan37.notMatchedCount).toBe(1); // allNighter: 0 recurring quadrants
+    expect(plan37.matchedCount).toBe(2); // moderate (1 recurring quadrant), recurring (2)
   });
 
   it("coverageWindowValidated=false downgrades an absolute-zero NOT_MATCHED to UNKNOWN, but never touches a real MATCHED (PR #191レビュー第3ラウンド§1 counterexample)", () => {
@@ -317,6 +390,68 @@ describe("F5c2 shadow-calibration executor", () => {
     expect(plan49.unknownCount).toBe(1); // alice: TC=0 (absolute zero) is no longer trusted as a real NOT_MATCHED
     expect(plan49.matchedCount).toBe(2); // bob, carol: positive TC evidence remains trusted regardless
     expect(plan49.notMatchedCount).toBe(0);
+  });
+
+  describe("coverageSensitiveOutcome — the general AT_LEAST/AT_MOST asymmetric reliability rule (PR #191レビュー第4ラウンド§1)", () => {
+    // The review's own numeric examples: true=10, observed=3.
+    it("AT_LEAST + boundary=5: observed NOT_MATCHED (3<5) is not necessarily a true NOT_MATCHED (true=10>=5) -> downgraded to UNKNOWN when unvalidated", () => {
+      expect(coverageSensitiveOutcome("NOT_MATCHED", "AT_LEAST", "MONOTONIC_LOWER_BOUND", false)).toBe("UNKNOWN");
+    });
+    it("AT_LEAST: observed MATCHED is always reliable regardless of validation (a safe source cannot fabricate a positive)", () => {
+      expect(coverageSensitiveOutcome("MATCHED", "AT_LEAST", "MONOTONIC_LOWER_BOUND", false)).toBe("MATCHED");
+    });
+    it("AT_MOST + ceiling=5: observed MATCHED (3<=5) is not necessarily a true MATCHED (true=10>5) -> downgraded to UNKNOWN when unvalidated", () => {
+      expect(coverageSensitiveOutcome("MATCHED", "AT_MOST", "MONOTONIC_LOWER_BOUND", false)).toBe("UNKNOWN");
+    });
+    it("AT_MOST: observed NOT_MATCHED is always reliable regardless of validation (undercount cannot inflate an observed value past the true one)", () => {
+      expect(coverageSensitiveOutcome("NOT_MATCHED", "AT_MOST", "MONOTONIC_LOWER_BOUND", false)).toBe("NOT_MATCHED");
+    });
+    it("NON_MONOTONIC (ratios/shares/opaque METRIC scalars): both directions are coverage-sensitive, not just NOT_MATCHED", () => {
+      expect(coverageSensitiveOutcome("MATCHED", "AT_LEAST", "NON_MONOTONIC", false)).toBe("UNKNOWN");
+      expect(coverageSensitiveOutcome("NOT_MATCHED", "AT_LEAST", "NON_MONOTONIC", false)).toBe("UNKNOWN");
+      expect(coverageSensitiveOutcome("MATCHED", "AT_MOST", "NON_MONOTONIC", false)).toBe("UNKNOWN");
+    });
+    it("EQ: neither direction is provably reliable from a lower bound alone, regardless of reliability class", () => {
+      expect(coverageSensitiveOutcome("MATCHED", "EQ", "MONOTONIC_LOWER_BOUND", false)).toBe("UNKNOWN");
+      expect(coverageSensitiveOutcome("NOT_MATCHED", "EQ", "MONOTONIC_LOWER_BOUND", false)).toBe("UNKNOWN");
+    });
+    it("when coverageWindowValidated=true, every combination passes through unchanged", () => {
+      for (const outcome of ["MATCHED", "NOT_MATCHED"] as const) {
+        for (const direction of ["AT_LEAST", "AT_MOST", "EQ"] as const) {
+          for (const reliability of ["MONOTONIC_LOWER_BOUND", "NON_MONOTONIC"] as const) {
+            expect(coverageSensitiveOutcome(outcome, direction, reliability, true)).toBe(outcome);
+          }
+        }
+      }
+    });
+    it("UNKNOWN is always idempotent", () => {
+      expect(coverageSensitiveOutcome("UNKNOWN", "AT_LEAST", "MONOTONIC_LOWER_BOUND", false)).toBe("UNKNOWN");
+    });
+  });
+
+  it("coverageWindowValidated=false marks every axis's boundary values as an observed lower bound, not a trustworthy population statistic, shifting nothing about the boundary computation itself (PR #191レビュー第4ラウンド§1)", () => {
+    const probeKey81 = probeKeyFor(81);
+    const withAxis = (validatedFlag: boolean) => executeF5cShadowCalibration(collection([
+      subject("alice", [{ probeKey: probeKey81, metrics: { completedParticipationCount: 3 } }]),
+      subject("bob", [{ probeKey: probeKey81, metrics: { completedParticipationCount: 5 } }]),
+    ]), validatedFlag);
+    const sweepValidated = byNo(withAxis(true), 81).axisSweeps[0]!;
+    const sweepUnvalidated = byNo(withAxis(false), 81).axisSweeps[0]!;
+    expect(sweepValidated.boundaryReliability).toBe("OBSERVED_COMPLETE");
+    expect(sweepUnvalidated.boundaryReliability).toBe("OBSERVED_LOWER_BOUND_ONLY");
+    // the boundary VALUE computed is identical either way — only its labeled trustworthiness changes.
+    expect(sweepUnvalidated.boundaryPoints).toEqual(sweepValidated.boundaryPoints);
+  });
+
+  it("F5C2_SHADOW_CONTRACT_VERSION and the report's top-level shape are pinned by a direct regression assertion, so a shape change cannot silently drift undetected (PR #191レビュー第4ラウンド§5)", () => {
+    expect(F5C2_SHADOW_CONTRACT_VERSION).toBe(3);
+    const report = executeF5cShadowCalibration(collection([]), true);
+    expect(report.contractVersion).toBe(3);
+    expect(Object.keys(report).sort()).toEqual([
+      "cohort", "contractVersion", "coverageWindowValidated", "executedCandidateCount",
+      "readyCandidateCount", "results", "sensitivityModel", "sweepContractVersion",
+      "unsupportedCandidateCount", "window",
+    ].sort());
   });
 
   it("sensitivity model is explicitly typed as marginal-axis-only, not candidate-level sensitivity (PR #191レビュー第3ラウンド§4)", () => {

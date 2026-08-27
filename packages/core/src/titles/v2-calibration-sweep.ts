@@ -12,7 +12,7 @@ import {
 } from "./v2-calibration.js";
 
 /** Planning-only contract. Never import from evaluator, pipeline, Bot, or the public v2 barrel. */
-export const F5C_SWEEP_CONTRACT_VERSION = 5 as const;
+export const F5C_SWEEP_CONTRACT_VERSION = 6 as const;
 
 /**
  * PR #190レビュー第3ラウンド§1: 「manifestが将来改訂されても、古いF5c sweep
@@ -238,8 +238,10 @@ interface F5cJointThresholdAxis {
  *   いるのは、`auditF5cCandidateSweepPlans()`の`numericThresholdValueCount`
  *   （axes内の数値literalは production threshold の疑いとして数える既存guard）が
  *   これを誤ってthreshold値として検出しないようにするため——実際には閾値では
- *   なく、単なる分類indexである）のうち1つを対象に、そのquadrant内でのみ
- *   代表windowを探索する。
+ *   なく、単なる分類indexである。PR #191レビュー第4ラウンド§3: F5c2はsubjectを
+ *   このquadrant「ちょうど」に対して評価する（windowをquadrant境界の外まで
+ *   探索しない）——ある候補が別のdaypartに明確に属する活動から代表意味を
+ *   導出できないようにするため。
  * - `PERSONAL_STABILITY`: 母集団共通のwindowを選ばず、各subject自身のrowだけ
  *   から求めた「自分にとって最良のwindowの占有率」を求め、percentile軸として
  *   扱う——「母集団で人気の時間帯かどうか」ではなく「本人がどれだけ安定して
@@ -656,7 +658,12 @@ const PLAN_INPUTS: readonly PlanInput[] = [
   // PR #191レビュー第3ラウンド§2: No.32=朝番/33=昼下がり/34=宵っ張り/35=深夜営業は、
   // 24時間を4等分した互いに素なquadrantへ1:1で対応させる——実際の本番hour境界は
   // 依然として選ばない(quadrantは単なる中立的なsearch領域分離)。
-  ...([[32, "QUADRANT_0"], [33, "QUADRANT_1"], [34, "QUADRANT_2"], [35, "QUADRANT_3"]] as const).map(([no, quadrant]) => measuredPlan(no, "JOINT_CORRELATION", activityMetrics, {
+  // PR #191レビュー第4ラウンド§2: quadrant=[0,6)/[6,12)/[12,18)/[18,24)はJST時計の
+  // 深夜/朝/昼/夕方に対応する——No.32(朝番/morning)はQUADRANT_1、No.33(昼下がり/
+  // afternoon)はQUADRANT_2、No.34(宵っ張り/evening~日付変更前)はQUADRANT_3、
+  // No.35(深夜営業/日付変更後~早朝)はQUADRANT_0。旧mapping(32→Q0等)はcatalogの
+  // displayName/semanticSpecと噛み合っていなかった。
+  ...([[32, "QUADRANT_1"], [33, "QUADRANT_2"], [34, "QUADRANT_3"], [35, "QUADRANT_0"]] as const).map(([no, quadrant]) => measuredPlan(no, "JOINT_CORRELATION", activityMetrics, {
     requiredJointEvidence: activityJoint,
     axes: activityDayHourAxes(no, `candidate-${no}-activity-day-hour-rows`, quadrant),
     // TC/VCどちらか一方のmodalityが十分であれば行が対象になる(片方だけの必須化を避ける、§5-B)。

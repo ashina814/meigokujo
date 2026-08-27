@@ -2713,6 +2713,110 @@ supportの並行リストが再導入されていないことのsource-level確�
 - production threshold選定・BehaviorTitleDefinition・award/evaluator/
   通知/UI/スケジューラ/Discordコマンドへの接続は一切無い。
 
+### 14.11.3 意味論的実行可能性フォローアップ第3ラウンド（PR #191レビュー第4ラウンド対応）
+
+第2ラウンド（14.11.2）の architecture は受理されたが、さらに5点の指摘が
+あった。
+
+1. **coverage semanticsを絶対ゼロ以外にも一般化**（§1）:
+   `zeroSensitiveOutcome()`（絶対ゼロだけを特別扱い）は狭すぎた——safe
+   sourceの欠落は非ゼロ値も低く見せうる（真値10・観測3・AT_LEAST境界5
+   なら観測NOT_MATCHEDは真のNOT_MATCHEDとは限らない。AT_MOST境界5なら
+   観測MATCHEDは真のMATCHEDとは限らない）。一般化した原理: 観測値は
+   常に真値の**下限**である（safe sourceはfalse negativeしか生まず、
+   false positiveを生まない）。これは**monotonic lower-bound reducer**
+   （行/日数/breadth/matching sizeの単純count系）に限って成り立つ——
+   個々のrowの生値比較や比率/share/opaqueなMETRIC scalarのような
+   non-monotonicな導出値には適用できない（undercountでどちらの方向にも
+   動きうる）。新設の`coverageSensitiveOutcome(outcome, direction,
+   reliability, coverageWindowValidated)`が両方を統一的に扱う:
+   - `MONOTONIC_LOWER_BOUND` + `AT_LEAST`: MATCHEDは常に信頼できる、
+     NOT_MATCHEDだけがuncertain。
+   - `MONOTONIC_LOWER_BOUND` + `AT_MOST`: NOT_MATCHEDは常に信頼できる、
+     MATCHEDだけがuncertain。
+   - `NON_MONOTONIC`（FILTER_THEN_SHARE、opaqueなMETRIC axis/
+     METRIC_COMPAREのscalar）: 両方向ともuncertain。
+   - `EQ`演算子: reliabilityに関わらず両方向ともuncertain（下限だけ
+     からは等号を証明できない）。
+   `reductionReliability(reducerKind)`がJOINT_EVIDENCE reducerを
+   分類する。旧`zeroSensitiveOutcome`の全呼び出し箇所を置き換えた。
+
+   また、`coverageWindowValidated=false`のとき、boundary/percentile
+   計算自体が「観測できた分だけの下限」でしかないという事実を
+   report自体へ明示するため、`F5cAxisSweepResult.boundaryReliability:
+   "OBSERVED_COMPLETE" | "OBSERVED_LOWER_BOUND_ONLY"`を新設した
+   ——sample poolから値を除外するのではなく（実際の情報を失う）、
+   計算結果の信頼性ラベルを分離する（「observed/lower-bound
+   diagnosticsとdefinitive shadow outcomeを分離する」という
+   レビュー自身が提示した方針の1つ）。`coverageWindowValidated`は
+   F5c2が自動的に証明した事実ではなく、呼び出し側の**未検証の
+   attestation**であることをdoc commentで明記した——`true`は
+   「安全である」という主張であって、F5c2が検証できるものではない。
+
+2. **No.32-35のquadrant割当をcatalog意味論から修正**（§2）:
+   旧mapping（32→Q0、33→Q1、34→Q2、35→Q3、candidate番号の登場順を
+   単純にquadrant indexへ割り当てただけ）はcatalogの
+   displayName/semanticSpecと噛み合っていなかった。正しい対応: No.32
+   （朝番/morning）→QUADRANT_1=[6,12)、No.33（昼下がり/afternoon）→
+   QUADRANT_2=[12,18)、No.34（宵っ張り/evening~日付変更前）→
+   QUADRANT_3=[18,24)、No.35（深夜営業/日付変更後~早朝）→
+   QUADRANT_0=[0,6)。`F5C_SWEEP_CONTRACT_VERSION`を5→6へbump。
+
+3. **DAYPART_TARGETのwindow anchoringを修正**（§3）:
+   第3ラウンドの実装は「windowの開始hourをquadrant内に制限する」
+   だけで、window長8時間・quadrant幅6時間という不一致により、
+   quadrant終盤から始まるwindowが隣接quadrantへ最大2時間はみ出し
+   得た——ある候補が別のdaypartに明確に属する活動から代表意味を
+   導出できてしまう。修正: window探索を完全に廃止し、各subjectを
+   「自分自身のrowのうち、対象quadrant内に収まる件数」という単純な
+   countへ還元し、通常のpercentile sweep機構（PERSONAL_STABILITY/
+   MULTI_DAYPART_BREADTHと同じ形）へ統一した——quadrant境界の外への
+   overreachが構造的に不可能になった。この結果、`circularWindowPoints`
+   /`F5cCircularWindowPoint`はどのintentからも使われなくなったため
+   完全に削除した（`hourHistogram`による24-bin診断は維持）。
+
+4. **No.37に「一晩の徹夜」除外意味論を追加**（§4）:
+   旧MULTI_DAYPART_BREADTHは「distinct quadrantに1件でも該当rowが
+   あれば touched」というcountだった——日付変更を跨ぐ1回の連続
+   セッション（例: 22時〜翌4時）だけでQ3とQ0の2 quadrantを（長い
+   セッションなら3-4 quadrantすら）"touch"でき、catalog意味論
+   「複数のdaypartに活動痕が多数日に分散し、一晩の徹夜では説明
+   できない」に反し得た。修正: quadrantは、そのquadrant内で
+   qualifying rowが存在するdistinct日数が2日以上のときだけ
+   breadthへ数える——1回の連続セッションはどのquadrantに対しても
+   高々1日しか寄与できないため、単独では絶対にrecurringにならない。
+   既存のjoint evidence（`rows.daypart-boundary`のdayOffset+hour）
+   だけから計算可能なため、F5c1のselector追加は不要だった。
+
+5. **F5C2_SHADOW_CONTRACT_VERSIONの report shape 不一致を修正**（§5）:
+   第3ラウンドのreport実装（`coverageWindowValidated`/
+   `sensitivityModel`フィールド追加）は完了していたが、定数
+   `F5C2_SHADOW_CONTRACT_VERSION`自体が2のまま更新されていなかった
+   ——報告した「2→3」と実装が食い違っていた。3へ修正し、
+   `titles-v2-shadow-evaluation.test.ts`に、`contractVersion`の値と
+   reportの top-level key集合を直接pinする regression test を追加
+   した（`Object.keys(report).sort()`を既知の集合と比較）——今後
+   report shapeが変わってもこのテストが即座に検出する。
+
+保持事項（第1-3ラウンドで受理済みの作業）: 修正した Kleene AND/OR、
+No.46の`distinctReactors`契約、F5c1 manifest/version SSOT消費、
+`POST_FILTER_MATCHING_SIZE`の代表閾値修正、p95/p99 tail grid、
+`marginalPassRate`/`marginalQualifyingRate`命名、
+`sensitivityModel=MARGINAL_AXIS_ONLY`、No.36の「母集団ではなく個人」
+の安定性、No.36の「1日1 start-hour sample」、aggregate-only出力、
+production threshold/evaluator/award/UI/deployへの接続無し——全て
+そのまま維持した。`JOINT_ROW_RESOLVERS`（selector support SSOT）も
+無変更で維持した。
+
+`packages/core/tests/titles-v2-shadow-evaluation.test.ts`に、
+`coverageSensitiveOutcome`のAT_LEAST/AT_MOST非対称性を直接unit test
+する新設`describe`ブロック（レビュー自身の数値例: 真値10・観測3・
+境界5）、`boundaryReliability`のend-to-endテスト、
+`F5C2_SHADOW_CONTRACT_VERSION`/report shapeのregression test、
+No.32/34の再設計されたcounterexample、No.37の「1回の徹夜では
+満たせない」counterexampleを追加した。全ての新guardを
+mutation-verify済み。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

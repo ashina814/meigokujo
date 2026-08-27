@@ -38,7 +38,7 @@ import type { CandidateReadinessAudit } from "./v2-catalog-readiness.js";
  * (`CALIBRATION_PERCENTILE_METHOD`). No subject identity or raw restricted evidence is ever
  * included in the returned report — only aggregate counts/rates.
  */
-export const F5C2_SHADOW_CONTRACT_VERSION = 2 as const;
+export const F5C2_SHADOW_CONTRACT_VERSION = 3 as const;
 
 /**
  * Finite, bounded, reproducible, auditable — not a production threshold grid. Extended with
@@ -87,25 +87,83 @@ function combineOutcomesOr(outcomes: readonly F5cShadowOutcome[]): F5cShadowOutc
 }
 
 /**
- * PR #191レビュー第3ラウンド§1: `evidenceIsKnown()`（pack存在+kind一致）は「完全な
- * 観測coverage」を意味しない——このcodebaseの全probeが`coverageLimitations`で明記する
- * 通り、safe sourceはunknown/untrusted intervalを省略するため、絶対的なゼロ（該当
- * 証拠が1件も無いという観測）はcoverageの欠落と観測された不在を区別できない。
- * 一方、正の証拠（何か見つかった）はsafe sourceの性質上ねつ造されない——coverage gap
- * はfalse negativeしか生まず、false positiveは生まない。よって:
- * - MATCHED（正の証拠が見つかった）は`coverageWindowValidated`に関わらず常に信頼できる
- *   ——ここでは絶対に変更しない。
- * - 絶対ゼロ（`isAbsoluteZero`）によるNOT_MATCHEDだけは、呼び出し側が
- *   `coverageWindowValidated=true`で「このcalibration windowは関与する全sourceの
- *   rolloutより後で、safe sourceが通常運用中に省略しうるuntracked gapについても
- *   許容できる」と明示的にattestしない限りUNKNOWNへ倒す
- *   （`executeF5cShadowCalibration`/`runF5cShadowCalibration`の必須引数）。
- * - 相対的な境界比較（値>0だが母集団のrepresentative境界未満）はabsence-of-evidenceの
- *   主張ではないため対象外——このflagの影響を受けない。
+ * PR #191レビュー第4ラウンド§1: 絶対ゼロだけを特別扱いした`zeroSensitiveOutcome()`
+ * （旧実装）は狭すぎた。safe sourceの欠落は非ゼロ値も低く見せうる——真値10・観測3・
+ * AT_LEAST境界5なら、観測はNOT_MATCHEDだが真値はMATCHEDだったかもしれない
+ * （false AT_LEAST failure）。逆にAT_MOST境界5なら、観測はMATCHEDだが真値は
+ * NOT_MATCHEDだったかもしれない（false AT_MOST match）。一般化した原理:
+ *
+ * 観測値は常に真値の**下限**である（safe sourceはfalse negativeしか生まず、
+ * false positiveを生まない——unknown/untrusted intervalは省略されるだけで、
+ * 起きていない活動が捏造されることは無い）。よって、observed <= true が
+ * 常に成り立つmonotonic lower-bound reducer（行/日数/breadth/matching sizeの
+ * 単純count系。個々のrowの生値比較やopaqueなMETRIC scalar、比率/share/gapの
+ * ようなnon-monotonicな導出値は対象外——undercountでどちらの方向にも動きうる）
+ * に限って:
+ * - AT_LEAST比較: MATCHED（observed>=boundary）は真値でも必ずMATCHED——常に信頼できる。
+ *   NOT_MATCHED（observed<boundary）は真値がMATCHEDだった可能性を否定できない。
+ * - AT_MOST比較: NOT_MATCHED（observed>ceiling）は真値でも必ずNOT_MATCHED——常に
+ *   信頼できる。MATCHED（observed<=ceiling）は真値がNOT_MATCHEDだった可能性を
+ *   否定できない。
+ * - EQ比較は下限だけからどちらの方向も証明できないため、reliabilityに関わらず
+ *   常にuncertain扱いとする。
+ *
+ * non-monotonicなreducer（FILTER_THEN_SHARE、METRIC axis/METRIC_COMPAREの
+ * opaqueなscalar——F5c2はそれが count なのか share/gap/median なのか型からは
+ * 判別できない）は、どちらの方向も信頼できないため両方uncertain扱いにする。
+ *
+ * `coverageWindowValidated=true`はF5c2が自動的に証明した事実ではなく、呼び出し側
+ * （operator）の未検証の主張にすぎない——「関与する全sourceのrolloutより後の
+ * windowで、safe sourceが通常運用中に省略しうるuntracked gapについても残存
+ * リスクとして許容する」という宣言であり、F5c2はこれを検証できない
+ * （`executeF5cShadowCalibration`/`runF5cShadowCalibration`のdoc参照）。
  */
-function zeroSensitiveOutcome(outcome: F5cShadowOutcome, isAbsoluteZero: boolean, coverageWindowValidated: boolean): F5cShadowOutcome {
-  if (outcome === "NOT_MATCHED" && isAbsoluteZero && !coverageWindowValidated) return "UNKNOWN";
-  return outcome;
+export type F5cCoverageDirection = "AT_LEAST" | "AT_MOST" | "EQ";
+export type F5cCoverageReliability = "MONOTONIC_LOWER_BOUND" | "NON_MONOTONIC";
+
+/**
+ * Exported so the asymmetric AT_LEAST/AT_MOST reliability rule can be unit-tested directly with
+ * the review's own numeric examples (PR #191レビュー第4ラウンド§1) — no READY-76 candidate
+ * currently puts an AT_MOST operator on a monotonic-lower-bound JOINT_EVIDENCE reduction axis
+ * (every AT_MOST-operator reduction in the catalog is a METRIC axis, hence NON_MONOTONIC), so the
+ * "false AT_MOST match" case cannot be exercised end-to-end through `executeF5cShadowCalibration`
+ * today; testing the shared function directly is the honest way to prove that branch is correct.
+ */
+export function coverageSensitiveOutcome(
+  outcome: F5cShadowOutcome,
+  direction: F5cCoverageDirection,
+  reliability: F5cCoverageReliability,
+  coverageWindowValidated: boolean,
+): F5cShadowOutcome {
+  if (coverageWindowValidated || outcome === "UNKNOWN") return outcome;
+  if (reliability === "NON_MONOTONIC" || direction === "EQ") return "UNKNOWN";
+  const reliableOutcome = direction === "AT_LEAST" ? "MATCHED" : "NOT_MATCHED";
+  return outcome === reliableOutcome ? outcome : "UNKNOWN";
+}
+
+/**
+ * Reliability classification for JOINT_EVIDENCE reduction results — see the doc above
+ * `coverageSensitiveOutcome`. Only reductions that are provably a monotonic lower bound under
+ * row-level undercounting (a literal count of qualifying rows/days/members, never a raw per-row
+ * VALUE comparison which could represent a non-monotonic derived quantity like a gap) are treated
+ * as reliable in the AT_LEAST/AT_MOST-asymmetric sense.
+ */
+function reductionReliability(reducerKind: F5cSweepAxis["reducerKind"]): F5cCoverageReliability {
+  switch (reducerKind) {
+    case "FILTER_THEN_COUNT":
+    case "FILTER_THEN_DISTINCT_DAYS":
+    case "FILTER_THEN_SPAN_DAYS":
+    case "SET_BREADTH":
+    case "REPEAT_PERIOD":
+    case "GROUP_FILTER_THEN_MAX":
+    case "POST_FILTER_MATCHING_SIZE":
+      return "MONOTONIC_LOWER_BOUND";
+    default:
+      // SCALAR_SAMPLE (a raw per-row value — could be a gap/duration, not provably monotonic),
+      // FILTER_THEN_SHARE (a ratio, explicitly non-monotonic), SCALAR_METRIC (an opaque
+      // probe-computed scalar F5c2 cannot introspect) — all conservative.
+      return "NON_MONOTONIC";
+  }
 }
 
 /**
@@ -125,21 +183,14 @@ export interface F5cBoundarySweepPoint {
 }
 
 /**
- * PR #191レビュー§5: CIRCULAR_HOUR_WINDOWは24 JST hour binの循環軸で、単一の
- * AT_LEAST/AT_MOST境界では表現できない——F5c2は`CIRCULAR_WINDOW_LENGTH_HOURS`幅の
- * candidate windowを開始hour 0-23で有限に列挙し、各windowについて母集団の
- * qualifying件数を報告する。どのwindowも「本番の選択」ではない——単に観測分布が
- * どこに集中しているかを示す診断点であり、実際にshadow評価のMATCHED/NOT_MATCHED
- * 合成にも寄与する（`evaluateCircularHourAxis`のrepresentative window選択を参照）。
+ * PR #191レビュー第4ラウンド§1: `boundaryValue`/`marginalPassRate`は`coverageWindowValidated`
+ * が`false`のとき、真の母集団の値そのものではなく観測できた分だけからの計算になる
+ * ——safe sourceの欠落は観測値を実際より低く見せうるため（false negativeのみ、
+ * false positiveは無い）、この値は「真の分布のある percentile」の**下限**でしか
+ * ない。`"OBSERVED_LOWER_BOUND_ONLY"`はこの事実をreport自体に明示する
+ * ——`coverageWindowValidated=true`のときだけ`"OBSERVED_COMPLETE"`になる。
  */
-export interface F5cCircularWindowPoint {
-  readonly windowStartHour: number;
-  readonly windowLengthHours: number;
-  readonly knownCount: number;
-  readonly qualifyingCount: number;
-  /** Marginal, not candidate-level sensitivity — see `F5cBoundarySweepPoint.marginalPassRate`. */
-  readonly marginalQualifyingRate: number | null;
-}
+export type F5cBoundaryReliability = "OBSERVED_COMPLETE" | "OBSERVED_LOWER_BOUND_ONLY";
 
 export interface F5cAxisSweepResult {
   readonly axisKey: string;
@@ -147,10 +198,9 @@ export interface F5cAxisSweepResult {
   /** Underlying observed sample count the percentile grid was derived from (rows or subjects). */
   readonly observedSampleCount: number;
   readonly boundaryPoints: readonly F5cBoundarySweepPoint[];
+  readonly boundaryReliability: F5cBoundaryReliability;
   /** Only for CIRCULAR_HOUR_WINDOW axes: qualifying-row count per JST hour bin (0-23), no window chosen. */
   readonly hourHistogram: readonly number[] | null;
-  /** Only for CIRCULAR_HOUR_WINDOW axes: the bounded window-start enumeration (see doc above). */
-  readonly circularWindowPoints: readonly F5cCircularWindowPoint[] | null;
 }
 
 export type F5cExecutionStrategy =
@@ -179,7 +229,7 @@ export interface F5cCandidateShadowResult {
 }
 
 /**
- * PR #191レビュー第3ラウンド§4: `axisSweeps[].boundaryPoints`/`circularWindowPoints`は
+ * PR #191レビュー第3ラウンド§4: `axisSweeps[].boundaryPoints`は
  * axis単体のmarginal pass rateであって、他のaxisをrepresentativeへ固定しつつcandidate
  * 全体のprevalenceを一軸ずつ再計算する「候補レベルのsensitivity」ではない——実装複雑度
  * とreviewabilityを考慮し、後者はこのPRでは意図的に見送る（Option B、次段階で明確な
@@ -193,10 +243,12 @@ export interface F5cShadowCalibrationReport {
   readonly sweepContractVersion: number;
   readonly sensitivityModel: typeof F5C2_SENSITIVITY_MODEL;
   /**
-   * The caller's explicit attestation, threaded straight through — PR #191レビュー第3
-   * ラウンド§1: this is the report's coverage provenance. `false` means every absolute-zero
-   * NOT_MATCHED outcome in `results` was downgraded to UNKNOWN (see `zeroSensitiveOutcome`);
-   * `true` means the caller attested the window is safe and real observed zeros stand.
+   * The caller's unverified attestation, threaded straight through as the report's coverage
+   * provenance (PR #191レビュー第3/第4ラウンド§1) — F5c2 never proves this itself. `false` means
+   * every coverage-sensitive comparison in `results` was made conservative and every axis's
+   * boundary values are `"OBSERVED_LOWER_BOUND_ONLY"` (see `coverageSensitiveOutcome` /
+   * `F5cBoundaryReliability`); `true` means the caller claimed the window is safe and observed
+   * values were trusted as complete — a claim, not a fact this report independently establishes.
    */
   readonly coverageWindowValidated: boolean;
   readonly cohort: { readonly key: string; readonly subjectCount: number };
@@ -226,6 +278,10 @@ function boundaryValuesFor(samples: readonly number[]): ReadonlyMap<F5cBoundaryP
 
 function passes(operator: "AT_LEAST" | "AT_MOST", value: number, boundary: number): boolean {
   return operator === "AT_LEAST" ? value >= boundary : value <= boundary;
+}
+
+function boundaryReliabilityFor(ctx: AxisEvalContext): F5cBoundaryReliability {
+  return ctx.coverageWindowValidated ? "OBSERVED_COMPLETE" : "OBSERVED_LOWER_BOUND_ONLY";
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -473,16 +529,24 @@ function evaluateFixedCriterion(
     const value = metricForProbe(subject, probeKey, criterion.metricKey);
     if (value === undefined) return "UNKNOWN";
     if (value === null) return "UNKNOWN";
+    // GT/GTE share the same "MATCHED is reliable" direction (both are ascending comparisons); EQ
+    // cannot be proven reliable in either direction from a lower bound alone. metricKey is an
+    // opaque probe-computed scalar F5c2 cannot introspect (could be a count or a ratio) — NON_MONOTONIC.
+    const direction: F5cCoverageDirection = criterion.operator === "EQ" ? "EQ" : "AT_LEAST";
     const outcome =
       criterion.operator === "GTE" ? (value >= criterion.fixedValue ? "MATCHED" : "NOT_MATCHED") :
       criterion.operator === "GT" ? (value > criterion.fixedValue ? "MATCHED" : "NOT_MATCHED") :
       value === criterion.fixedValue ? "MATCHED" : "NOT_MATCHED";
-    return zeroSensitiveOutcome(outcome, value === 0, coverageWindowValidated);
+    return coverageSensitiveOutcome(outcome, direction, "NON_MONOTONIC", coverageWindowValidated);
   }
   if (criterion.kind === "METRIC_BOOLEAN_TRUE") {
     const value = metricForProbe(subject, probeKey, criterion.metricKey);
     if (value === undefined || value === null) return "UNKNOWN";
-    return zeroSensitiveOutcome(value !== 0 ? "MATCHED" : "NOT_MATCHED", value === 0, coverageWindowValidated);
+    // a pure presence check (!==0) is reliable regardless of what the metric represents — a safe
+    // source cannot fabricate a nonzero reading from true zero, only suppress a true positive
+    // toward zero (unlike METRIC_COMPARE's arbitrary fixedValue, which could cross a ratio).
+    const outcome = value !== 0 ? "MATCHED" : "NOT_MATCHED";
+    return coverageSensitiveOutcome(outcome, "AT_LEAST", "MONOTONIC_LOWER_BOUND", coverageWindowValidated);
   }
   if (criterion.kind === "ANY_METRIC_POSITIVE") {
     // PR #191レビュー§1: 真の3値OR——1つでもpositiveならMATCHED、positiveが無くても
@@ -492,9 +556,8 @@ function evaluateFixedCriterion(
       if (value === undefined || value === null) return "UNKNOWN";
       return value > 0 ? "MATCHED" : "NOT_MATCHED";
     });
-    // NOT_MATCHED from combineOutcomesOr only happens when every defined metric was <=0 (an
-    // absolute zero across the board) — no MATCHED and no UNKNOWN present.
-    return zeroSensitiveOutcome(combineOutcomesOr(perMetric), true, coverageWindowValidated);
+    // Same presence-check reasoning as METRIC_BOOLEAN_TRUE — reliable regardless of metric shape.
+    return coverageSensitiveOutcome(combineOutcomesOr(perMetric), "AT_LEAST", "MONOTONIC_LOWER_BOUND", coverageWindowValidated);
   }
   // JOINT_STRUCTURAL_FACT: presence of at least one row for this selector IS the fact — but only
   // once evidence is confirmed known; an unmeasured subject is UNKNOWN, never a false NOT_MATCHED
@@ -502,7 +565,8 @@ function evaluateFixedCriterion(
   if (!evidenceIsKnown(subject, probeKey, requiredJointEvidenceKind)) return "UNKNOWN";
   const evidence = packForProbe(subject, probeKey)!;
   const rows = resolveJointRows(evidence, criterion.selector);
-  return zeroSensitiveOutcome(rows.length > 0 ? "MATCHED" : "NOT_MATCHED", rows.length === 0, coverageWindowValidated);
+  const outcome = rows.length > 0 ? "MATCHED" : "NOT_MATCHED";
+  return coverageSensitiveOutcome(outcome, "AT_LEAST", "MONOTONIC_LOWER_BOUND", coverageWindowValidated);
 }
 
 function evaluateManifestCriterion(
@@ -515,8 +579,13 @@ function evaluateManifestCriterion(
 ): F5cShadowOutcome {
   const value = metricForProbe(subject, probeKey, criterion.countMetricKey);
   if (value === undefined || value === null) return "UNKNOWN";
+  // Manifest criteria compare a distinct-member COUNT (the F5c1 construct's own kind names —
+  // AT_LEAST_FIXED_DISTINCT_MEMBERS/ALL_MANIFEST_MEMBERS — structurally guarantee this, unlike a
+  // generic METRIC_COMPARE's opaque metricKey) against a fixed/pinned/observed total: a monotonic
+  // lower bound under coverage gaps.
   if (criterion.kind === "AT_LEAST_FIXED_DISTINCT_MEMBERS") {
-    return zeroSensitiveOutcome(value >= criterion.fixedValue ? "MATCHED" : "NOT_MATCHED", value === 0, coverageWindowValidated);
+    const outcome = value >= criterion.fixedValue ? "MATCHED" : "NOT_MATCHED";
+    return coverageSensitiveOutcome(outcome, "AT_LEAST", "MONOTONIC_LOWER_BOUND", coverageWindowValidated);
   }
   if (criterion.kind === "MANIFEST_CARDINALITY_SWEEP") {
     // PR #191レビュー§6: 本番の数値は選ばれていないが、それは「常にMATCHED」を意味しない
@@ -524,11 +593,13 @@ function evaluateManifestCriterion(
     // のprevalenceはこの次元を無視してはならない。boundaryが定義できない(母集団0件)場合のみ
     // UNKNOWNへ倒す。
     if (cardinalitySweepBoundary === null) return "UNKNOWN";
-    return zeroSensitiveOutcome(value >= cardinalitySweepBoundary ? "MATCHED" : "NOT_MATCHED", value === 0, coverageWindowValidated);
+    const outcome = value >= cardinalitySweepBoundary ? "MATCHED" : "NOT_MATCHED";
+    return coverageSensitiveOutcome(outcome, "AT_LEAST", "MONOTONIC_LOWER_BOUND", coverageWindowValidated);
   }
   // ALL_MANIFEST_MEMBERS / ALL_REQUIRED_SUPERDOMAINS: value must equal the pinned cardinality.
   if (pinnedTotal === null) return "UNKNOWN";
-  return zeroSensitiveOutcome(value >= pinnedTotal ? "MATCHED" : "NOT_MATCHED", value === 0, coverageWindowValidated);
+  const outcome = value >= pinnedTotal ? "MATCHED" : "NOT_MATCHED";
+  return coverageSensitiveOutcome(outcome, "AT_LEAST", "MONOTONIC_LOWER_BOUND", coverageWindowValidated);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -679,23 +750,26 @@ function evaluateMetricAxis(ctx: AxisEvalContext, axis: F5cSweepAxis & { source:
   for (const [subjectId, value] of bySubject) {
     if (value === null || representativeBoundary === undefined) { outcomeBySubject.set(subjectId, "UNKNOWN"); continue; }
     const outcome = passes(axis.operator, value, representativeBoundary) ? "MATCHED" : "NOT_MATCHED";
-    outcomeBySubject.set(subjectId, zeroSensitiveOutcome(outcome, value === 0, ctx.coverageWindowValidated));
+    // an opaque probe-computed METRIC scalar — F5c2 cannot introspect whether it is a count or a
+    // ratio, so it is treated conservatively (NON_MONOTONIC) regardless of the observed value.
+    outcomeBySubject.set(subjectId, coverageSensitiveOutcome(outcome, axis.operator, "NON_MONOTONIC", ctx.coverageWindowValidated));
   }
   return {
-    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, circularWindowPoints: null },
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, boundaryReliability: boundaryReliabilityFor(ctx) },
     outcomeBySubject,
   };
 }
 
 /**
- * PR #191レビュー第2ラウンド§5 / 第3ラウンド§2: F5c1はどのdaypart/window境界も選んで
- * いない——F5c2はuser-facingなlabel（"morning"等）を発明せず、本番のwindowも選ばない。
- * だが、同じCIRCULAR_HOUR_WINDOW axis shapeは3つの構造的に異なる意味論
- * （`F5cCircularIntent`参照）を表しており、全てを「母集団全体でのbest 8-hour
- * window」戦略へ強制すると、No.32-35が同じwindowへ収束しかねない。以下は
- * `axis.circularIntent.kind`で分岐する3つの実行戦略——固定幅（1日の1/3=
- * `CIRCULAR_WINDOW_LENGTH_HOURS`）のwindow長は共通だが、探索領域・reduction・
- * sensitivity表現がそれぞれ異なる。
+ * PR #191レビュー第2ラウンド§5 / 第3ラウンド§2 / 第4ラウンド§3・§4: F5c1はどの
+ * daypart/window境界も選んでいない——F5c2はuser-facingなlabel（"morning"等）を
+ * 発明せず、本番のwindowも選ばない。だが、同じCIRCULAR_HOUR_WINDOW axis shapeは
+ * 3つの構造的に異なる意味論（`F5cCircularIntent`参照）を表す。以下は
+ * `axis.circularIntent.kind`で分岐する3つの実行戦略——DAYPART_TARGET/
+ * MULTI_DAYPART_BREADTHは共通の中立的4分割quadrant（`CIRCULAR_QUADRANT_*`）を
+ * 使い、PERSONAL_STABILITYだけが固定幅（1日の1/3=`CIRCULAR_WINDOW_LENGTH_HOURS`）
+ * のsliding windowを各subject自身のrowに対して探索する——母集団共通の
+ * window探索はもう存在しない（第4ラウンド§3でDAYPART_TARGETから除去した）。
  */
 const CIRCULAR_WINDOW_LENGTH_HOURS = 8;
 /** No.32-35 / No.37共通の中立的quadrant分割 — 本番のdaypart境界ではない（型doc参照）。 */
@@ -742,12 +816,15 @@ function prepareCircularAxis(
 }
 
 /**
- * No.32-35: search only within the candidate's own quadrant (a fixed, neutral 6-hour arc — not
- * a production daypart cutoff) so the 4 daypart-target candidates cannot collapse onto the same
- * representative window. The full 24-point enumeration is still reported for transparency; only
- * the *representative* pick (the one MATCHED/NOT_MATCHED is computed against) is quadrant-scoped.
- * A subject's own evidence not falling in the representative window is a positional fact, not an
- * absence of evidence — `zeroSensitiveOutcome` does not apply here.
+ * No.32-35: judge each subject by their own qualifying-row count strictly *within* the
+ * candidate's assigned quadrant (a fixed, neutral 6-hour arc — not a production daypart cutoff),
+ * never a window that can spill past it. PR #191レビュー第4ラウンド§3: the round-3 design
+ * enumerated an 8-hour sliding window whose *start* was restricted to the quadrant, but an
+ * 8-hour window starting near the end of a 6-hour quadrant still extends up to 2 hours into the
+ * next one — a candidate could derive its representative meaning primarily from a neighboring
+ * daypart. Reducing to a per-subject in-quadrant row count (exactly the same shape as
+ * PERSONAL_STABILITY/MULTI_DAYPART_BREADTH below) removes window search — and the overreach it
+ * enabled — entirely.
  */
 function evaluateDaypartTargetAxis(
   ctx: AxisEvalContext,
@@ -757,40 +834,38 @@ function evaluateDaypartTargetAxis(
   evidenceKnownBySubject: ReadonlyMap<string, boolean>,
 ): { readonly sweep: F5cAxisSweepResult; readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome> } {
   const { hourCounts, observed, knownSubjectIds } = prepareCircularAxis(ctx, siblingFilteredRows, evidenceKnownBySubject);
-  const quadrantIndex = CIRCULAR_QUADRANT_INDEX[quadrant];
-  const allowedStarts = new Set(
-    Array.from({ length: CIRCULAR_QUADRANT_WIDTH_HOURS }, (_, i) => (quadrantIndex * CIRCULAR_QUADRANT_WIDTH_HOURS + i) % 24),
-  );
+  const targetQuadrantIndex = CIRCULAR_QUADRANT_INDEX[quadrant];
 
-  const circularWindowPoints: F5cCircularWindowPoint[] = [];
-  let representativeStartHour = quadrantIndex * CIRCULAR_QUADRANT_WIDTH_HOURS;
-  let bestQualifyingCount = -1;
-  for (let windowStartHour = 0; windowStartHour < 24; windowStartHour += 1) {
-    let qualifying = 0;
-    for (const subjectId of knownSubjectIds) {
-      const rows = siblingFilteredRows.get(subjectId) ?? [];
-      if (rows.some((r) => r.sampleValue !== null && hourInWindow(r.sampleValue, windowStartHour, CIRCULAR_WINDOW_LENGTH_HOURS))) qualifying += 1;
-    }
-    circularWindowPoints.push({
-      windowStartHour,
-      windowLengthHours: CIRCULAR_WINDOW_LENGTH_HOURS,
-      knownCount: knownSubjectIds.length,
-      qualifyingCount: qualifying,
-      marginalQualifyingRate: knownSubjectIds.length === 0 ? null : qualifying / knownSubjectIds.length,
-    });
-    if (allowedStarts.has(windowStartHour) && qualifying > bestQualifyingCount) { bestQualifyingCount = qualifying; representativeStartHour = windowStartHour; }
+  const countBySubject = new Map<string, number>();
+  for (const subjectId of knownSubjectIds) {
+    const rows = (siblingFilteredRows.get(subjectId) ?? []).filter((r) => r.sampleValue !== null);
+    countBySubject.set(subjectId, rows.filter((r) => quadrantOfHour(r.sampleValue!) === targetQuadrantIndex).length);
   }
+
+  const samples = knownSubjectIds.map((id) => countBySubject.get(id)!);
+  const boundaries = boundaryValuesFor(samples);
+  const boundaryPoints: F5cBoundarySweepPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
+    const boundaryValue = boundaries.get(percentile);
+    if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, marginalPassRate: null };
+    const passingCount = samples.filter((s) => s >= boundaryValue).length;
+    return { percentile, boundaryValue, knownCount: samples.length, passingCount, marginalPassRate: samples.length === 0 ? null : passingCount / samples.length };
+  });
+  const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
 
   const outcomeBySubject = new Map<string, F5cShadowOutcome>();
   for (const subject of ctx.subjects) {
-    if (evidenceKnownBySubject.get(subject.subjectUserId) !== true) { outcomeBySubject.set(subject.subjectUserId, "UNKNOWN"); continue; }
-    const rows = siblingFilteredRows.get(subject.subjectUserId) ?? [];
-    const inWindow = rows.some((r) => r.sampleValue !== null && hourInWindow(r.sampleValue, representativeStartHour, CIRCULAR_WINDOW_LENGTH_HOURS));
-    outcomeBySubject.set(subject.subjectUserId, inWindow ? "MATCHED" : "NOT_MATCHED");
+    if (evidenceKnownBySubject.get(subject.subjectUserId) !== true || representativeBoundary === undefined) {
+      outcomeBySubject.set(subject.subjectUserId, "UNKNOWN");
+      continue;
+    }
+    const count = countBySubject.get(subject.subjectUserId) ?? 0;
+    const outcome = count >= representativeBoundary ? "MATCHED" : "NOT_MATCHED";
+    // a literal count of qualifying rows is a monotonic lower bound under coverage gaps.
+    outcomeBySubject.set(subject.subjectUserId, coverageSensitiveOutcome(outcome, "AT_LEAST", "MONOTONIC_LOWER_BOUND", ctx.coverageWindowValidated));
   }
 
   return {
-    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints: [], hourHistogram: hourCounts, circularWindowPoints },
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: hourCounts, boundaryReliability: boundaryReliabilityFor(ctx) },
     outcomeBySubject,
   };
 }
@@ -802,6 +877,9 @@ function evaluateDaypartTargetAxis(
  * personal 8-hour window's share of their OWN total rows (a stability/concentration ratio, not a
  * shared window), then sweep that per-subject scalar with the standard percentile mechanism —
  * exactly like a reduction axis, reusing `boundaryPoints` rather than a global window enumeration.
+ * This share is a ratio, not a literal count — PR #191レビュー第4ラウンド§1: dropping rows
+ * outside the subject's best window while keeping rows inside it can only *inflate* the share, so
+ * it is not a monotonic lower bound; treated conservatively (both directions coverage-sensitive).
  */
 function evaluatePersonalStabilityAxis(
   ctx: AxisEvalContext,
@@ -841,22 +919,25 @@ function evaluatePersonalStabilityAxis(
     }
     const share = shareBySubject.get(subject.subjectUserId) ?? 0;
     const outcome = share >= representativeBoundary ? "MATCHED" : "NOT_MATCHED";
-    outcomeBySubject.set(subject.subjectUserId, zeroSensitiveOutcome(outcome, share === 0, ctx.coverageWindowValidated));
+    outcomeBySubject.set(subject.subjectUserId, coverageSensitiveOutcome(outcome, "AT_LEAST", "NON_MONOTONIC", ctx.coverageWindowValidated));
   }
 
   return {
-    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: hourCounts, circularWindowPoints: null },
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: hourCounts, boundaryReliability: boundaryReliabilityFor(ctx) },
     outcomeBySubject,
   };
 }
 
 /**
- * No.37: the opposite of daypart-target — reward spread, not concentration. Reduce each subject
- * to the count of distinct quadrants (out of the same 4 neutral quadrants `DAYPART_TARGET`
- * uses) containing at least one of their own qualifying rows, then sweep that per-subject
- * breadth scalar the same way a reduction axis would. A single concentrated block (e.g. one
- * all-nighter) can touch at most 2 of the 4 quadrants; genuine round-the-clock spread touches
- * 3-4 — structurally distinct from `DAYPART_TARGET`'s single-window concentration measure.
+ * No.37: the opposite of daypart-target — reward spread, not concentration. PR #191レビュー
+ * 第4ラウンド§4: counting merely *any* qualifying row per quadrant is not enough — a single
+ * continuous session crossing midnight (e.g. 22:00-04:00) touches 2 quadrants (and up to 3-4 for
+ * a sufficiently long one) from ONE occurrence, so "distinct quadrants touched" alone could be
+ * satisfied by exactly the one-night session the catalog semantic excludes ("複数のdaypartに
+ * 活動痕が多数日に分散し、一晩の徹夜では説明できない"). A quadrant only counts toward breadth
+ * when the subject has qualifying rows in it on at least 2 *distinct* JST days — a single
+ * overnight block can only ever contribute 1 day to each quadrant it touches, so it can never
+ * make a quadrant "recurring" on its own; genuine multi-day activity in that quadrant can.
  */
 function evaluateMultiDaypartBreadthAxis(
   ctx: AxisEvalContext,
@@ -869,8 +950,16 @@ function evaluateMultiDaypartBreadthAxis(
   const breadthBySubject = new Map<string, number>();
   for (const subjectId of knownSubjectIds) {
     const rows = (siblingFilteredRows.get(subjectId) ?? []).filter((r) => r.sampleValue !== null);
-    const quadrants = new Set(rows.map((r) => quadrantOfHour(r.sampleValue!)));
-    breadthBySubject.set(subjectId, quadrants.size);
+    const dayOffsetsByQuadrant = new Map<number, Set<number>>();
+    for (const r of rows) {
+      const q = quadrantOfHour(r.sampleValue!);
+      const days = dayOffsetsByQuadrant.get(q) ?? new Set<number>();
+      if (r.dayOffset !== null) days.add(r.dayOffset);
+      dayOffsetsByQuadrant.set(q, days);
+    }
+    let recurringQuadrants = 0;
+    for (const days of dayOffsetsByQuadrant.values()) if (days.size >= 2) recurringQuadrants += 1;
+    breadthBySubject.set(subjectId, recurringQuadrants);
   }
 
   const samples = knownSubjectIds.map((id) => breadthBySubject.get(id)!);
@@ -891,11 +980,13 @@ function evaluateMultiDaypartBreadthAxis(
     }
     const breadth = breadthBySubject.get(subject.subjectUserId) ?? 0;
     const outcome = breadth >= representativeBoundary ? "MATCHED" : "NOT_MATCHED";
-    outcomeBySubject.set(subject.subjectUserId, zeroSensitiveOutcome(outcome, breadth === 0, ctx.coverageWindowValidated));
+    // a count of quadrants meeting a >=2-distinct-day bar is a monotonic lower bound: dropped
+    // rows can only reduce a quadrant's own day count, never fabricate a recurrence.
+    outcomeBySubject.set(subject.subjectUserId, coverageSensitiveOutcome(outcome, "AT_LEAST", "MONOTONIC_LOWER_BOUND", ctx.coverageWindowValidated));
   }
 
   return {
-    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: hourCounts, circularWindowPoints: null },
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: hourCounts, boundaryReliability: boundaryReliabilityFor(ctx) },
     outcomeBySubject,
   };
 }
@@ -968,10 +1059,12 @@ function evaluatePostFilterMatchingAxis(
     if (!evidenceIsKnown(subject, ctx.probeKey, ctx.plan.requiredJointEvidence.kind)) { outcomeAtRepresentative.set(subject.subjectUserId, "UNKNOWN"); continue; }
     const size = matchingSizeBySubject.get(subject.subjectUserId) ?? 0;
     const outcome = size >= representativeMatchingBoundary ? "MATCHED" : "NOT_MATCHED";
-    outcomeAtRepresentative.set(subject.subjectUserId, zeroSensitiveOutcome(outcome, size === 0, ctx.coverageWindowValidated));
+    // maximum bipartite matching size over a possibly-incomplete edge set is a monotonic lower
+    // bound: removing edges can only shrink (never grow) the maximum matching.
+    outcomeAtRepresentative.set(subject.subjectUserId, coverageSensitiveOutcome(outcome, "AT_LEAST", "MONOTONIC_LOWER_BOUND", ctx.coverageWindowValidated));
   }
   return {
-    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: null, circularWindowPoints: null },
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: null, boundaryReliability: boundaryReliabilityFor(ctx) },
     outcomeAtRepresentative,
   };
 }
@@ -1107,7 +1200,7 @@ function evaluateRowGroup(
       const passingCount = [...reducedBySubject.values()].filter((r) => r.hasEvidence && passes(reductionAxis.operator, r.value, boundaryValue)).length;
       return { percentile, boundaryValue, knownCount, passingCount, marginalPassRate: knownCount === 0 ? null : passingCount / knownCount };
     });
-    sweeps.push({ axisKey: reductionAxis.axisKey, reducerKind: reductionAxis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, circularWindowPoints: null });
+    sweeps.push({ axisKey: reductionAxis.axisKey, reducerKind: reductionAxis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, boundaryReliability: boundaryReliabilityFor(ctx) });
 
     const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
     for (const subject of ctx.subjects) {
@@ -1117,7 +1210,7 @@ function evaluateRowGroup(
       if (!result.hasEvidence || representativeBoundary === undefined) outcome = "UNKNOWN";
       else {
         const raw = passes(reductionAxis.operator, result.value, representativeBoundary) ? "MATCHED" : "NOT_MATCHED";
-        outcome = zeroSensitiveOutcome(raw, result.value === 0, ctx.coverageWindowValidated);
+        outcome = coverageSensitiveOutcome(raw, reductionAxis.operator, reductionReliability(reductionAxis.reducerKind), ctx.coverageWindowValidated);
       }
       outcomeBySubject.set(subject.subjectUserId, prior === undefined ? outcome : combineOutcomes([prior, outcome]));
     }
@@ -1146,7 +1239,7 @@ function evaluateJointFilterAxis(
     }
     return { percentile, boundaryValue, knownCount: known, passingCount: passing, marginalPassRate: known === 0 ? null : passing / known };
   });
-  return { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: allSamples.length, boundaryPoints, hourHistogram: null, circularWindowPoints: null };
+  return { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: allSamples.length, boundaryPoints, hourHistogram: null, boundaryReliability: boundaryReliabilityFor(ctx) };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1263,7 +1356,7 @@ function executeCandidate(
           const passing = samples.filter((v) => v >= boundaryValue).length;
           return { percentile, boundaryValue, knownCount: known, passingCount: passing, marginalPassRate: known === 0 ? null : passing / known };
         });
-        axisSweeps.push({ axisKey: `manifest:${criterion.countMetricKey}`, reducerKind: "SCALAR_METRIC", observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, circularWindowPoints: null });
+        axisSweeps.push({ axisKey: `manifest:${criterion.countMetricKey}`, reducerKind: "SCALAR_METRIC", observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, boundaryReliability: boundaryReliabilityFor(ctx) });
       }
     }
   }
@@ -1337,12 +1430,17 @@ function executeCandidate(
  * Restricted subject IDs are used transiently in-memory only — the returned report is
  * aggregate-only (counts/rates/boundary values), never subject identities or raw evidence.
  *
- * `coverageWindowValidated` is required, not defaulted (PR #191レビュー第3ラウンド§1): the
- * caller must explicitly attest that `collection.window` starts after every source used by
- * READY-76's probes was rolled out AND that the operator accepts the residual untracked-gap risk
- * every safe source's `coverageLimitations` documents. Passing `false` is always safe (it only
- * downgrades absolute-zero NOT_MATCHED outcomes to UNKNOWN — see `zeroSensitiveOutcome`); passing
- * `true` is a real claim about the window's provenance, not a default to reach for casually.
+ * `coverageWindowValidated` is required, not defaulted (PR #191レビュー第3/第4ラウンド§1).
+ * **This is an unverified operator attestation, not a fact F5c2 proves or can prove** — nothing
+ * in the safe-source layer exposes a per-window "coverage was complete" signal for F5c2 to check.
+ * Passing `true` is a real claim by the caller that `collection.window` starts after every source
+ * used by READY-76's probes was rolled out, *and* that the operator knowingly accepts the residual
+ * untracked-gap risk every safe source's `coverageLimitations` documents (bot restarts, migration
+ * windows, and other gaps that persist even after rollout) — it is not a default to reach for
+ * casually, and F5c2 has no way to reject a `true` that turns out to be wrong. Passing `false` is
+ * always safe: it makes every coverage-sensitive comparison conservative (see
+ * `coverageSensitiveOutcome`) and marks every axis's `boundaryPoints`/`boundaryValue` as
+ * `"OBSERVED_LOWER_BOUND_ONLY"` rather than a trustworthy population statistic.
  */
 export function executeF5cShadowCalibration(
   collection: PlanningCalibrationMeasurementCollection,
