@@ -971,6 +971,13 @@ function measureDomainSocialTime(
   domainDays: readonly { readonly dayOffset: number; readonly semanticIndex: number; readonly magnitude: number }[],
   social: SocialActivityTimeSafeSourcePayload,
   context: { readonly windowStart: number },
+  /**
+   * F5c1レビュー(PR #190)§2: No.87の「social/economy-play/castle-wide super-domain
+   * coverage」はfamily breadth（domainSemanticBreadth）とは別概念——`castle_experience_safe`
+   * payloadが既に持つ`coveredSuperDomains`をそのまま公開する。"public-room"呼び出しには
+   * super-domainの概念が無いためundefinedのまま（metricを出さない）。
+   */
+  castleCoveredSuperDomainCount?: number,
 ): SubjectMeasurement {
   const socialHours = socialHourEvidence(social, context.windowStart);
   const domainOffsets = sortedDistinct(domainDays.map(({ dayOffset }) => dayOffset));
@@ -986,6 +993,7 @@ function measureDomainSocialTime(
     ["overlappingCalendarDays", domainOffsets.filter((day) => socialSet.has(day)).length],
     ["unionCalendarDays", new Set([...domainOffsets, ...socialOffsets]).size],
   ]);
+  if (castleCoveredSuperDomainCount !== undefined) metrics.set("coveredSuperDomainCount", castleCoveredSuperDomainCount);
   setDayRangeMetrics(metrics, "domainActive", domainOffsets);
   setDayRangeMetrics(metrics, "socialActive", socialOffsets);
   return {
@@ -1613,6 +1621,7 @@ const CASTLE_SOCIAL_TIME_PROBE: CalibrationProbe<readonly ["castle_experience_sa
     castleFamilyDayRows(payloads.castle_experience_safe, context.windowStart),
     payloads.social_activity_time_safe,
     context,
+    payloads.castle_experience_safe.coveredSuperDomains.length,
   ),
 };
 const EMPTY_CASTLE_ROLE_CONTEXT = Object.freeze({

@@ -1,8 +1,9 @@
+import { createHash } from "node:crypto";
 import { CASINO_EDITION_I_MANIFEST } from "../casino/edition-i-manifest.js";
 import { TITLE_V2_CATALOG_CANDIDATES } from "./v2-catalog-candidates.js";
 import { TITLE_V2_CATALOG_READINESS, type CandidateReadinessAudit } from "./v2-catalog-readiness.js";
 import { CASTLE_EXPERIENCE_EDITION_I_MANIFEST } from "./v2-castle-experience-manifest.js";
-import { ECONOMY_FEATURE_FAMILY_MANIFEST_VERSION } from "./v2-economy.js";
+import { ECONOMY_FEATURE_FAMILY_MANIFEST, ECONOMY_FEATURE_FAMILY_MANIFEST_VERSION } from "./v2-economy.js";
 import {
   describeF5cCalibrationProbeContracts,
   F5C_CALIBRATION_PROBES,
@@ -11,7 +12,131 @@ import {
 } from "./v2-calibration.js";
 
 /** Planning-only contract. Never import from evaluator, pipeline, Bot, or the public v2 barrel. */
-export const F5C_SWEEP_CONTRACT_VERSION = 2 as const;
+export const F5C_SWEEP_CONTRACT_VERSION = 3 as const;
+
+/**
+ * PR #190レビュー第3ラウンド§1: 「manifestが将来改訂されても、古いF5c sweep
+ * contractは気づかず追従しない」を実際に保証するには、pinされた値と現行canonical
+ * 定数を**独立に**表現し、両方が一致することを毎回再検証しなければならない。
+ * 以前の実装は`economyManifestRef()`等がその場でcurrent constantを読んで
+ * planへ埋め込み、auditも同じbuilderを再実行して比較していたため、manifestが
+ * 変わればplan側とaudit側が同時に追従してしまい、drift検出が機能しなかった
+ * （self-comparison）。
+ *
+ * `canonicalManifestFingerprint()`はJSON.stringifyのkey順依存を避けるための
+ * 決定的serializer——object key はsort、arrayは要素順を保持する。
+ */
+function canonicalize(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const keys = Object.keys(value as Record<string, unknown>).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalize((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+function canonicalManifestFingerprint(value: unknown): string {
+  return createHash("sha256").update(canonicalize(value), "utf8").digest("hex");
+}
+
+interface F5cManifestPinEconomy {
+  readonly kind: "ECONOMY_SEMANTIC_FAMILIES";
+  readonly version: number;
+  readonly familyKeys: readonly string[];
+  readonly fingerprint: string;
+}
+interface F5cManifestPinCasinoEdition {
+  readonly kind: "CASINO_EDITION";
+  readonly editionKey: string;
+  readonly version: number;
+  readonly families: readonly { readonly familyKey: string; readonly activityKeys: readonly string[] }[];
+  readonly fingerprint: string;
+}
+interface F5cManifestPinCastleEdition {
+  readonly kind: "CASTLE_EDITION";
+  readonly editionKey: string;
+  readonly version: number;
+  readonly families: readonly { readonly familyKey: string; readonly superDomain: string }[];
+  readonly fingerprint: string;
+}
+type F5cManifestPin = F5cManifestPinEconomy | F5cManifestPinCasinoEdition | F5cManifestPinCastleEdition;
+
+function economyFingerprintPayload() {
+  return { version: ECONOMY_FEATURE_FAMILY_MANIFEST_VERSION, familyKeys: [...Object.keys(ECONOMY_FEATURE_FAMILY_MANIFEST)].sort() };
+}
+function casinoEditionFingerprintPayload() {
+  return {
+    editionKey: CASINO_EDITION_I_MANIFEST.editionKey,
+    version: CASINO_EDITION_I_MANIFEST.version,
+    families: CASINO_EDITION_I_MANIFEST.families.map((f) => ({ familyKey: f.familyKey, activityKeys: [...f.activityKeys] })),
+  };
+}
+function castleEditionFingerprintPayload() {
+  return {
+    editionKey: CASTLE_EXPERIENCE_EDITION_I_MANIFEST.editionKey,
+    version: CASTLE_EXPERIENCE_EDITION_I_MANIFEST.version,
+    families: CASTLE_EXPERIENCE_EDITION_I_MANIFEST.families.map((f) => ({ familyKey: f.familyKey, superDomain: f.superDomain })),
+  };
+}
+
+/**
+ * F5c1が最初にsweep contractへ固定した時点(contract version 3)のmanifest snapshot。
+ * ここは**現行constantを呼び出して生成しない**——手で書いた/一度だけ生成して
+ * 固定したliteral値であること自体が、drift guardの前提。`docs/titles-v2-design.md`
+ * の`FROZEN_CATALOG_99_FINAL_SHA256`と同じ考え方——値が変わったら、このPRの
+ * 生成手順を再実行して意図的に更新する。fingerprintは`canonicalManifestFingerprint()`
+ * で独立に再計算し、`liveManifestFingerprint()`（現行constantを読む側）と
+ * 一致するかをauditが毎回検証する。
+ */
+const F5C1_MANIFEST_PINS: {
+  readonly ECONOMY_SEMANTIC_FAMILIES: F5cManifestPinEconomy;
+  readonly CASINO_EDITION: F5cManifestPinCasinoEdition;
+  readonly CASTLE_EDITION: F5cManifestPinCastleEdition;
+} = Object.freeze({
+  ECONOMY_SEMANTIC_FAMILIES: Object.freeze({
+    kind: "ECONOMY_SEMANTIC_FAMILIES",
+    version: 1,
+    familyKeys: Object.freeze(["peer_transfer", "shop", "tip"]),
+    fingerprint: "e5c8ddef21dd8718344b1dd6f4304b533e5d2c44c4a3a972843eeed6de94cd11",
+  }),
+  CASINO_EDITION: Object.freeze({
+    kind: "CASINO_EDITION",
+    editionKey: "casino-edition-i",
+    version: 1,
+    families: Object.freeze([
+      Object.freeze({ familyKey: "slots", activityKeys: Object.freeze(["slots"]) }),
+      Object.freeze({ familyKey: "chohan", activityKeys: Object.freeze(["chohan"]) }),
+      Object.freeze({ familyKey: "crash", activityKeys: Object.freeze(["crash"]) }),
+      Object.freeze({ familyKey: "chinchiro", activityKeys: Object.freeze(["chinchiro"]) }),
+      Object.freeze({ familyKey: "roulette", activityKeys: Object.freeze(["roulette"]) }),
+      Object.freeze({ familyKey: "blackjack", activityKeys: Object.freeze(["blackjack"]) }),
+      Object.freeze({ familyKey: "poker", activityKeys: Object.freeze(["poker"]) }),
+      Object.freeze({ familyKey: "holdem", activityKeys: Object.freeze(["holdem"]) }),
+    ]),
+    fingerprint: "75c514ce7b5560e1aa315cd8234a2b2465c32c9a55c3dc4bb4f041a7eeba9ea2",
+  }),
+  CASTLE_EDITION: Object.freeze({
+    kind: "CASTLE_EDITION",
+    editionKey: "castle-experience-edition-i",
+    version: 1,
+    families: Object.freeze([
+      Object.freeze({ familyKey: "public_vc", superDomain: "social" }),
+      Object.freeze({ familyKey: "public_tc", superDomain: "social" }),
+      Object.freeze({ familyKey: "public_room", superDomain: "social" }),
+      Object.freeze({ familyKey: "economy", superDomain: "economy_play" }),
+      Object.freeze({ familyKey: "shop", superDomain: "economy_play" }),
+      Object.freeze({ familyKey: "casino", superDomain: "economy_play" }),
+      Object.freeze({ familyKey: "public_event", superDomain: "castle_wide" }),
+    ]),
+    fingerprint: "84ca499223dc4aaf680498c0f8f50f358757a65e3109a98aa04355b01b4e0e1e",
+  }),
+});
+
+/** auditだけが呼ぶ——現行constantを毎回そのまま読んで再計算する側。pin側とは独立。 */
+function liveManifestFingerprint(kind: F5cManifestRef["kind"]): string {
+  if (kind === "ECONOMY_SEMANTIC_FAMILIES") return canonicalManifestFingerprint(economyFingerprintPayload());
+  if (kind === "CASINO_EDITION") return canonicalManifestFingerprint(casinoEditionFingerprintPayload());
+  return canonicalManifestFingerprint(castleEditionFingerprintPayload());
+}
 
 export type F5cEvaluationShape =
   | "STRUCTURAL_PRESENCE"
@@ -41,9 +166,11 @@ export type F5cSweepOperator = "AT_LEAST" | "AT_MOST";
  *   総量に対するshare（比率）。
  * - GROUP_FILTER_THEN_MAX: 同じrow groupをsub-groupへ分け、filter後のsub-group内
  *   最大値を取る（例: 同一counterpartとの最大反復日数）。
- * - MATCHING_AFTER_EDGE_FILTER: edgeをSCALAR_SAMPLE filterで絞った後、
- *   maximum bipartite matchingを絞り込み後のedge集合から再計算する
- *   （filter前のstructuralMaxを流用しない）。
+ * - POST_FILTER_MATCHING_SIZE: edgeをSCALAR_SAMPLE filterで絞った後、
+ *   maximum bipartite matchingを絞り込み後のedge集合から再計算した
+ *   matching sizeというsubject-level整数（filter前のstructuralMaxを流用しない）。
+ *   edge閾値を固定すればsubjectごとに1個の整数になる正当なsample集合なので、
+ *   通常のOBSERVED_NEAREST_RANK sweepの対象になる——PR #190レビュー第3ラウンド§3。
  * - CIRCULAR_HOUR_WINDOW: 24 JST hour binは循環しており、単一のAT_LEAST/AT_MOST
  *   hour boundaryでは表現できない。F5c2が後で24 binの中からbounded windowを
  *   列挙する——F5c1はどのwindowも選ばない。
@@ -51,6 +178,9 @@ export type F5cSweepOperator = "AT_LEAST" | "AT_MOST";
  *   reactor等）の breadth（要素数）。
  * - REPEAT_PERIOD: 同一counterpart/branch/familyに対する反復qualifying period
  *   （day等）の数。
+ * - FILTER_THEN_SPAN_DAYS: 同じrow groupでfilterを満たしたrowのdayOffset集合から
+ *   span（max-min+1）を求める。空集合はnull。FILTER_THEN_DISTINCT_DAYS（件数）とは
+ *   別概念——PR #190レビュー第3ラウンド§4。
  */
 export type F5cAxisReducerKind =
   | "SCALAR_METRIC"
@@ -58,8 +188,9 @@ export type F5cAxisReducerKind =
   | "FILTER_THEN_COUNT"
   | "FILTER_THEN_DISTINCT_DAYS"
   | "FILTER_THEN_SHARE"
+  | "FILTER_THEN_SPAN_DAYS"
   | "GROUP_FILTER_THEN_MAX"
-  | "MATCHING_AFTER_EDGE_FILTER"
+  | "POST_FILTER_MATCHING_SIZE"
   | "CIRCULAR_HOUR_WINDOW"
   | "SET_BREADTH"
   | "REPEAT_PERIOD";
@@ -74,7 +205,7 @@ interface F5cMetricAxis {
 }
 
 /** genuinely sweepable numeric per-row/per-subject sample; nearest-rank boundary selection applies. */
-type F5cJointSweepableReducerKind = Exclude<F5cAxisReducerKind, "SCALAR_METRIC" | "MATCHING_AFTER_EDGE_FILTER" | "CIRCULAR_HOUR_WINDOW">;
+type F5cJointSweepableReducerKind = Exclude<F5cAxisReducerKind, "SCALAR_METRIC" | "CIRCULAR_HOUR_WINDOW">;
 
 interface F5cJointThresholdAxis {
   readonly axisKey: string;
@@ -85,20 +216,6 @@ interface F5cJointThresholdAxis {
   readonly operator: F5cSweepOperator;
   readonly boundaryMethod: "OBSERVED_NEAREST_RANK";
   readonly reducerKind: F5cJointSweepableReducerKind;
-}
-
-/**
- * PR #190レビュー§8/§11: graph matchingの結果はedge filter適用後に再計算される
- * 派生値であり、それ自体を独立にnearest-rank sweepしない——operator/boundaryMethod
- * ともに持たない専用variant。
- */
-interface F5cJointMatchingAxis {
-  readonly axisKey: string;
-  readonly source: "JOINT_EVIDENCE";
-  readonly selector: string;
-  readonly rowGroupKey: string;
-  readonly reducerKind: "MATCHING_AFTER_EDGE_FILTER";
-  readonly boundaryMethod: "RECOMPUTED_AFTER_EDGE_FILTER";
 }
 
 /**
@@ -114,11 +231,28 @@ interface F5cJointCircularHourAxis {
   readonly boundaryMethod: "CIRCULAR_CANDIDATE_ENUMERATION";
 }
 
-export type F5cSweepAxis = F5cMetricAxis | F5cJointThresholdAxis | F5cJointMatchingAxis | F5cJointCircularHourAxis;
+export type F5cSweepAxis = F5cMetricAxis | F5cJointThresholdAxis | F5cJointCircularHourAxis;
 
 export interface F5cRequiredJointEvidence {
   readonly kind: PlanningCalibrationJointEvidence["kind"];
   readonly selectors: readonly string[];
+}
+
+/**
+ * PR #190レビュー第3ラウンド§5: `rowGroupKey`だけでは「同じrowから導出される」
+ * ことしか示さず、複数のSCALAR_SAMPLE filter axisが同じrow groupを共有する場合に
+ * それらがconjunctive（同一rowが全filterを満たす必要がある、No.42のTC start）
+ * なのかdisjunctive（いずれかのfilterを満たせばよい、No.32-37のTC/VC
+ * multimodal social evidence）なのかをF5c2が推測してはならない。有限のcomposition
+ * mode（ALL_FILTERS/ANY_FILTER）だけを許可する——汎用boolean DSLは作らない。
+ */
+export type F5cRowGroupCompositionMode = "ALL_FILTERS" | "ANY_FILTER";
+export interface F5cRowGroupComposition {
+  readonly rowGroupKey: string;
+  readonly composition: F5cRowGroupCompositionMode;
+}
+function rowGroupComposition(rowGroupKey: string, composition: F5cRowGroupCompositionMode): F5cRowGroupComposition {
+  return { rowGroupKey, composition };
 }
 
 /**
@@ -141,30 +275,56 @@ export type F5cFixedCriterion =
  * 気づかず変えないようにするため。
  */
 export type F5cManifestRef =
-  | { readonly kind: "ECONOMY_SEMANTIC_FAMILIES"; readonly version: typeof ECONOMY_FEATURE_FAMILY_MANIFEST_VERSION }
-  | {
-      readonly kind: "CASINO_EDITION";
-      readonly editionKey: typeof CASINO_EDITION_I_MANIFEST.editionKey;
-      readonly version: typeof CASINO_EDITION_I_MANIFEST.version;
-    }
-  | {
-      readonly kind: "CASTLE_EDITION";
-      readonly editionKey: typeof CASTLE_EXPERIENCE_EDITION_I_MANIFEST.editionKey;
-      readonly version: typeof CASTLE_EXPERIENCE_EDITION_I_MANIFEST.version;
-    };
+  | { readonly kind: "ECONOMY_SEMANTIC_FAMILIES"; readonly version: number }
+  | { readonly kind: "CASINO_EDITION"; readonly editionKey: string; readonly version: number }
+  | { readonly kind: "CASTLE_EDITION"; readonly editionKey: string; readonly version: number };
 
+/**
+ * PR #190レビュー第3ラウンド§2: manifestRefは「どの universe を見るか」だけを
+ * 特定し、「その universe に対して候補が何を要求するか」は特定しない。
+ * MANIFEST_DEPENDENTの6候補それぞれの意味（複数family、ALL family完了、
+ * super-domain coverage、almost-all breadth等）を型で持つ。数はcatalog意味論
+ * 自体が固定する場合だけ埋める（"multiple"=2等）——productionのTHRESHOLD_PENDING
+ * distribution boundaryではない。"almost all"のような未決定cardinalityは
+ * `MANIFEST_CARDINALITY_SWEEP`で「まだ値を選んでいない」ことを明示するだけに
+ * とどめ、production numberを発明しない。
+ */
+export type F5cManifestCriterion =
+  | { readonly kind: "ALL_MANIFEST_MEMBERS"; readonly countMetricKey: string }
+  | { readonly kind: "AT_LEAST_FIXED_DISTINCT_MEMBERS"; readonly countMetricKey: string; readonly fixedValue: number }
+  | { readonly kind: "ALL_REQUIRED_SUPERDOMAINS"; readonly countMetricKey: string }
+  | { readonly kind: "MANIFEST_CARDINALITY_SWEEP"; readonly countMetricKey: string };
+
+function allManifestMembers(countMetricKey: string): F5cManifestCriterion {
+  return { kind: "ALL_MANIFEST_MEMBERS", countMetricKey };
+}
+function atLeastFixedDistinctMembers(countMetricKey: string, fixedValue: number): F5cManifestCriterion {
+  return { kind: "AT_LEAST_FIXED_DISTINCT_MEMBERS", countMetricKey, fixedValue };
+}
+function allRequiredSuperdomains(countMetricKey: string): F5cManifestCriterion {
+  return { kind: "ALL_REQUIRED_SUPERDOMAINS", countMetricKey };
+}
+function manifestCardinalitySweep(countMetricKey: string): F5cManifestCriterion {
+  return { kind: "MANIFEST_CARDINALITY_SWEEP", countMetricKey };
+}
+
+/**
+ * PR #190レビュー第3ラウンド§1: このplanへ埋め込むmanifestRefは、pinされた
+ * `F5C1_MANIFEST_PINS`だけから作る——`CASINO_EDITION_I_MANIFEST`等の現行constantを
+ * ここで直接読まない。現行constantを読むのは`liveManifestFingerprint()`（audit専用）
+ * だけであり、この2つの経路が独立していることがdrift guardの前提。
+ */
 function economyManifestRef(): F5cManifestRef {
-  return { kind: "ECONOMY_SEMANTIC_FAMILIES", version: ECONOMY_FEATURE_FAMILY_MANIFEST_VERSION };
+  const pin = F5C1_MANIFEST_PINS.ECONOMY_SEMANTIC_FAMILIES;
+  return { kind: "ECONOMY_SEMANTIC_FAMILIES", version: pin.version };
 }
 function casinoEditionManifestRef(): F5cManifestRef {
-  return { kind: "CASINO_EDITION", editionKey: CASINO_EDITION_I_MANIFEST.editionKey, version: CASINO_EDITION_I_MANIFEST.version };
+  const pin = F5C1_MANIFEST_PINS.CASINO_EDITION;
+  return { kind: "CASINO_EDITION", editionKey: pin.editionKey, version: pin.version };
 }
 function castleEditionManifestRef(): F5cManifestRef {
-  return {
-    kind: "CASTLE_EDITION",
-    editionKey: CASTLE_EXPERIENCE_EDITION_I_MANIFEST.editionKey,
-    version: CASTLE_EXPERIENCE_EDITION_I_MANIFEST.version,
-  };
+  const pin = F5C1_MANIFEST_PINS.CASTLE_EDITION;
+  return { kind: "CASTLE_EDITION", editionKey: pin.editionKey, version: pin.version };
 }
 
 export interface F5cCandidateSweepPlan {
@@ -181,6 +341,8 @@ export interface F5cCandidateSweepPlan {
   readonly axes: readonly F5cSweepAxis[];
   readonly fixedCriteria: readonly F5cFixedCriterion[];
   readonly manifestRef: F5cManifestRef | null;
+  readonly manifestCriteria: readonly F5cManifestCriterion[];
+  readonly rowGroupCompositions: readonly F5cRowGroupComposition[];
   readonly structuralRequirements: readonly string[];
   readonly coverageNotes: readonly string[];
   readonly releaseGateNotes: readonly string[];
@@ -194,6 +356,8 @@ interface PlanInput {
   readonly axes?: readonly F5cSweepAxis[];
   readonly fixedCriteria?: readonly F5cFixedCriterion[];
   readonly manifestRef?: F5cManifestRef;
+  readonly manifestCriteria?: readonly F5cManifestCriterion[];
+  readonly rowGroupCompositions?: readonly F5cRowGroupComposition[];
   readonly structuralRequirements?: readonly string[];
   readonly coverageNotes?: readonly string[];
   readonly releaseGateNotes?: readonly string[];
@@ -217,10 +381,6 @@ function jointThresholdAxis(
   operator: F5cSweepOperator = "AT_LEAST",
 ): F5cJointThresholdAxis {
   return { axisKey, source: "JOINT_EVIDENCE", selector, rowGroupKey, operator, boundaryMethod: "OBSERVED_NEAREST_RANK", reducerKind };
-}
-
-function jointMatchingAxis(axisKey: string, selector: string, rowGroupKey: string): F5cJointMatchingAxis {
-  return { axisKey, source: "JOINT_EVIDENCE", selector, rowGroupKey, reducerKind: "MATCHING_AFTER_EDGE_FILTER", boundaryMethod: "RECOMPUTED_AFTER_EDGE_FILTER" };
 }
 
 function circularHourAxis(axisKey: string, selector: string, rowGroupKey: string): F5cJointCircularHourAxis {
@@ -434,14 +594,14 @@ const PLAN_INPUTS: readonly PlanInput[] = [
     requiredJointEvidence: joint("social-context-graph-v1", "counterparts.semantic-touch-days-seconds", "counterparts.maximum-matching"),
     axes: [
       jointThresholdAxis("class-edge-trusted-seconds", "counterparts.semantic-touch-days-seconds", "SCALAR_SAMPLE", "class-edges"),
-      jointMatchingAxis("class-person-matching", "counterparts.maximum-matching", "class-edges"),
+      jointThresholdAxis("class-person-matching", "counterparts.maximum-matching", "POST_FILTER_MATCHING_SIZE", "class-edges"),
     ],
   }),
   measuredPlan(27, "JOINT_CORRELATION", ["counterpartProfileCount", "distinctFamilyIndexCount", "touchEdgeCount", "totalTrustedSeconds", "unionTouchDays", "structuralMaxPersonFamilyMatching"], {
     requiredJointEvidence: joint("social-context-graph-v1", "counterparts.semantic-touch-days-seconds", "counterparts.maximum-matching"),
     axes: [
       jointThresholdAxis("department-edge-trusted-seconds", "counterparts.semantic-touch-days-seconds", "SCALAR_SAMPLE", "family-edges"),
-      jointMatchingAxis("department-person-matching", "counterparts.maximum-matching", "family-edges"),
+      jointThresholdAxis("department-person-matching", "counterparts.maximum-matching", "POST_FILTER_MATCHING_SIZE", "family-edges"),
     ],
   }),
   measuredPlan(28, "DISTRIBUTION_THRESHOLD", ["maxRepeatedDaysWithOneCounterpart", "distinctCoPresentUsers", "trustedOverlapSeconds"], {
@@ -451,6 +611,8 @@ const PLAN_INPUTS: readonly PlanInput[] = [
   ...([32, 33, 34, 35] as const).map((no) => measuredPlan(no, "JOINT_CORRELATION", activityMetrics, {
     requiredJointEvidence: activityJoint,
     axes: activityDayHourAxes(no, `candidate-${no}-activity-day-hour-rows`),
+    // TC/VCどちらか一方のmodalityが十分であれば行が対象になる(片方だけの必須化を避ける、§5-B)。
+    rowGroupCompositions: [rowGroupComposition(`candidate-${no}-activity-day-hour-rows`, "ANY_FILTER")],
     coverageNotes: ["JST hour bins are measurement resolution; F5c1 fixes no daypart boundary."],
   })),
   measuredPlan(36, "JOINT_CORRELATION", activityMetrics, {
@@ -471,6 +633,7 @@ const PLAN_INPUTS: readonly PlanInput[] = [
       jointThresholdAxis("multi-daypart-tc-gap-ceiling", "rows.tc-gap", "SCALAR_SAMPLE", "multi-daypart-rows", "AT_MOST"),
       jointThresholdAxis("multi-daypart-vc-seconds", "rows.vc-seconds", "SCALAR_SAMPLE", "multi-daypart-rows"),
     ],
+    rowGroupCompositions: [rowGroupComposition("multi-daypart-rows", "ANY_FILTER")],
     coverageNotes: ["JST hour bins are measurement resolution; F5c1 fixes no daypart boundary and does not reward a single all-night session."],
   }),
 
@@ -504,6 +667,8 @@ const PLAN_INPUTS: readonly PlanInput[] = [
       jointThresholdAxis("start-continuation-gap", "starts.next-other-gap", "SCALAR_SAMPLE", "tc-start-rows", "AT_MOST"),
       jointThresholdAxis("start-days", "starts.day-offset", "FILTER_THEN_DISTINCT_DAYS", "tc-start-rows"),
     ],
+    // quiet-beforeとcontinuation-gapは同じstart rowが両方を満たす必要がある(§5-A)。
+    rowGroupCompositions: [rowGroupComposition("tc-start-rows", "ALL_FILTERS")],
   }),
   measuredPlan(43, "JOINT_CORRELATION", ["revivalConversationCount", "revivalOccurrenceCount", "revivalDistinctDays", "dormantBeforeMsMedian", "continuationGapMsMedian"], {
     requiredJointEvidence: joint("tc-conversation-v1", "revivals.conversation-group", "revivals.dormant-before", "revivals.continuation-gap"),
@@ -512,6 +677,8 @@ const PLAN_INPUTS: readonly PlanInput[] = [
       jointThresholdAxis("revival-continuation-gap", "revivals.continuation-gap", "SCALAR_SAMPLE", "tc-revival-rows", "AT_MOST"),
       jointThresholdAxis("revival-qualifying-conversation-breadth", "revivals.conversation-group", "SET_BREADTH", "tc-revival-rows"),
     ],
+    // dormancy floorとcontinuation-gap ceilingの両方を満たすrevivalだけが対象(conjunctive)。
+    rowGroupCompositions: [rowGroupComposition("tc-revival-rows", "ALL_FILTERS")],
   }),
   measuredPlan(44, "JOINT_CORRELATION", ["revivalConversationCount", "revivalOccurrenceCount", "revivalDistinctDays", "maxRevivalsPerConversation"], {
     requiredJointEvidence: joint("tc-conversation-v1", "revivals.conversation-group", "revivals.day-offset"),
@@ -542,6 +709,8 @@ const PLAN_INPUTS: readonly PlanInput[] = [
       jointThresholdAxis("join-continuation-gap", "third-party.next-other-gap", "SCALAR_SAMPLE", "tc-third-party-rows", "AT_MOST"),
       jointThresholdAxis("join-day-breadth", "third-party.day-offset", "FILTER_THEN_DISTINCT_DAYS", "tc-third-party-rows"),
     ],
+    // 十分なprior distinct othersとcontinuation-gap ceilingの両方を満たすjoinだけが対象。
+    rowGroupCompositions: [rowGroupComposition("tc-third-party-rows", "ALL_FILTERS")],
   }),
   measuredPlan(49, "JOINT_CORRELATION", ["tcCandidateSocialDays", "vcSocialDays", "unionModalityDays", "overlappingCalendarDays", "tcSpanDays", "vcSpanDays"], {
     requiredJointEvidence: joint("cross-modal-days-v1", "tc-days.gap", "vc-days.breadth", "modality-day-sets"),
@@ -571,7 +740,7 @@ const PLAN_INPUTS: readonly PlanInput[] = [
     requiredJointEvidence: joint("domain-social-time-v1", "domainDays.public-room-own-use", "domainDays.day-offset"),
     axes: [
       jointThresholdAxis("own-room-use-days", "domainDays.public-room-own-use", "FILTER_THEN_DISTINCT_DAYS", "domain-day-rows"),
-      jointThresholdAxis("own-room-use-span", "domainDays.day-offset", "FILTER_THEN_DISTINCT_DAYS", "domain-day-rows"),
+      jointThresholdAxis("own-room-use-span", "domainDays.day-offset", "FILTER_THEN_SPAN_DAYS", "domain-day-rows"),
     ],
   }),
 
@@ -592,8 +761,9 @@ const PLAN_INPUTS: readonly PlanInput[] = [
     axes: [metricAxis("eligible-product-breadth", "distinctEligibleProducts"), metricAxis("purchase-day-breadth", "purchaseActiveDays")],
   }),
   measuredPlan(63, "MANIFEST_CONFORMANCE", ["distinctSubjectUsedFamilies", "familySubjectUsed.peer_transfer", "familySubjectUsed.tip", "familySubjectUsed.shop"], {
-    structuralRequirements: ["Breadth is evaluated only against the current explicit economy semantic-family manifest and subject-initiated outflow use."],
+    structuralRequirements: ["Breadth is evaluated only against the current explicit economy semantic-family manifest and subject-initiated outflow use, requiring multiple distinct families."],
     manifestRef: economyManifestRef(),
+    manifestCriteria: [atLeastFixedDistinctMembers("distinctSubjectUsedFamilies", 2)],
   }),
   measuredPlan(65, "STRUCTURAL_PRESENCE", ["shopRoleEligiblePurchaseCount", "shopRolePurchaseActiveDays"], {
     structuralRequirements: ["An eligible storefront purchase occurs inside a trusted canonical shop-role interval."],
@@ -609,6 +779,7 @@ const PLAN_INPUTS: readonly PlanInput[] = [
   measuredPlan(69, "MANIFEST_CONFORMANCE", ["distinctCompletedFamilies", "allFamiliesCompleted", "totalFamilyCompletionDays"], {
     structuralRequirements: ["Every family in the current Casino Edition-I manifest has canonical completion evidence."],
     manifestRef: casinoEditionManifestRef(),
+    manifestCriteria: [allManifestMembers("allFamiliesCompleted")],
   }),
   measuredPlan(70, "STRUCTURAL_PRESENCE", ["tableCount", "guestProfileCount", "guestStayRowCount", "guestActiveDays", "totalTrustedGuestSeconds"], {
     structuralRequirements: ["A subject-hosted official table has at least one valid non-owner human guest interval."],
@@ -647,6 +818,8 @@ const PLAN_INPUTS: readonly PlanInput[] = [
       jointThresholdAxis("next-generation-same-day-seconds", "profiles.next-generation-same-day-seconds", "SCALAR_SAMPLE", "next-gen-rows"),
       jointThresholdAxis("next-generation-qualifying-count", "profiles.next-generation-occurrence", "FILTER_THEN_COUNT", "next-gen-rows"),
     ],
+    // TC/VCどちらか一方のsame-day evidenceが十分であれば対象になる(§5-B、32-37と同じ考え方)。
+    rowGroupCompositions: [rowGroupComposition("next-gen-rows", "ANY_FILTER")],
     fixedCriteria: [
       jointStructuralFact("profiles.root-before-child"),
       jointStructuralFact("profiles.same-day-before-entry"),
@@ -688,22 +861,26 @@ const PLAN_INPUTS: readonly PlanInput[] = [
     fixedCriteria: [metricAtLeast("activeFamilyCount", 2)],
   }),
   measuredPlan(86, "MANIFEST_CONFORMANCE", ["activeFamilyCount", "sumFamilyActiveDays", "castleActiveDays", "familiesPerActiveDayMedian"], {
-    structuralRequirements: ["Breadth is interpreted only against the current Castle Edition-I family manifest."],
+    structuralRequirements: ["Breadth is interpreted only against the current Castle Edition-I family manifest, requiring multiple distinct families."],
     manifestRef: castleEditionManifestRef(),
+    manifestCriteria: [atLeastFixedDistinctMembers("activeFamilyCount", 2)],
   }),
-  measuredPlan(87, "MANIFEST_CONFORMANCE", ["domainSemanticBreadth", "domainDayTouches", "domainActiveDays", "socialActiveDays", "socialTcGapSampleCount", "socialVcTrustedSeconds"], {
+  measuredPlan(87, "MANIFEST_CONFORMANCE", ["domainSemanticBreadth", "domainDayTouches", "domainActiveDays", "socialActiveDays", "socialTcGapSampleCount", "socialVcTrustedSeconds", "coveredSuperDomainCount"], {
     requiredJointEvidence: joint("domain-social-time-v1", "domainDays.castle-family-superdomain", "socialHours.day-hour-evidence"),
-    structuralRequirements: ["The current Castle Edition-I family-to-super-domain manifest supplies social, economy/play, and castle-wide domain coverage."],
+    structuralRequirements: ["The current Castle Edition-I family-to-super-domain manifest supplies social, economy/play, and castle-wide domain coverage, with a sufficient family-breadth boundary left unselected."],
     manifestRef: castleEditionManifestRef(),
+    manifestCriteria: [allRequiredSuperdomains("coveredSuperDomainCount"), manifestCardinalitySweep("domainSemanticBreadth")],
   }),
   measuredPlan(88, "MANIFEST_CONFORMANCE", ["domainSemanticBreadth", "domainDayTouches", "domainActiveDays", "domainActiveSpanDays"], {
     requiredJointEvidence: joint("domain-social-time-v1", "domainDays.castle-family-breadth"),
-    structuralRequirements: ["Almost-all breadth is interpreted only against the current Castle Edition-I family manifest."],
+    structuralRequirements: ["Almost-all breadth is interpreted only against the current Castle Edition-I family manifest, as an unselected manifest-relative cardinality sweep."],
     manifestRef: castleEditionManifestRef(),
+    manifestCriteria: [manifestCardinalitySweep("domainSemanticBreadth")],
   }),
   measuredPlan(89, "MANIFEST_CONFORMANCE", ["activeFamilyCount", "sumFamilyActiveDays", "castleActiveDays"], {
     structuralRequirements: ["Every family in the current Castle Edition-I manifest has meaningful-use evidence."],
     manifestRef: castleEditionManifestRef(),
+    manifestCriteria: [allManifestMembers("activeFamilyCount")],
   }),
   measuredPlan(90, "JOINT_CORRELATION", ["roleHeldFamilyCount", "insideActiveFamilyCount", "outsideActiveFamilyCount", "insideDayUnion", "outsideDayUnion", "insideOccurrenceCount", "outsideOccurrenceCount", "insideTrustedSeconds", "outsideTrustedSeconds"], {
     requiredJointEvidence: joint("castle-role-context-v1", "families.role-held-days", "families.inside-days", "families.outside-days"),
@@ -784,8 +961,17 @@ function materializePlan(input: PlanInput): F5cCandidateSweepPlan {
   const structuralRequirements = [...(input.structuralRequirements ?? [])].sort();
   const fixedCriteria = [...(input.fixedCriteria ?? [])];
   const manifestRef = input.manifestRef ?? null;
-  if (structuralRequirements.length > 0 && fixedCriteria.length === 0 && manifestRef === null) {
-    throw new Error(`#${input.no}: structuralRequirements is prose-only — a typed fixedCriteria or manifestRef is required`);
+  const manifestCriteria = [...(input.manifestCriteria ?? [])];
+  if (structuralRequirements.length > 0 && fixedCriteria.length === 0 && manifestCriteria.length === 0) {
+    throw new Error(`#${input.no}: structuralRequirements is prose-only — a typed fixedCriteria or manifestCriteria is required`);
+  }
+  // PR #190レビュー第3ラウンド§2: manifestRefだけでは「universeに対して何を要求するか」を
+  // 特定しない——manifestRefを持つplanは必ずmanifestCriteriaも持つ。
+  if (manifestRef !== null && manifestCriteria.length === 0) {
+    throw new Error(`#${input.no}: manifestRef alone does not specify executable semantics — manifestCriteria is required`);
+  }
+  if (manifestCriteria.length > 0 && manifestRef === null) {
+    throw new Error(`#${input.no}: manifestCriteria requires a manifestRef`);
   }
   return {
     candidateNo: input.no,
@@ -801,6 +987,8 @@ function materializePlan(input: PlanInput): F5cCandidateSweepPlan {
     axes: [...(input.axes ?? [])].sort((a, b) => a.axisKey.localeCompare(b.axisKey)),
     fixedCriteria,
     manifestRef,
+    manifestCriteria,
+    rowGroupCompositions: [...(input.rowGroupCompositions ?? [])].sort((a, b) => a.rowGroupKey.localeCompare(b.rowGroupKey)),
     structuralRequirements,
     coverageNotes: [...new Set([...probe.coverageLimitations, COVERAGE_NOTE, ...(input.coverageNotes ?? [])])].sort(),
     releaseGateNotes: [...(input.releaseGateNotes ?? [])].sort(),
@@ -832,6 +1020,9 @@ export interface F5cCandidateSweepPlanAudit {
   readonly unknownMetricSelectors: readonly string[];
   readonly unknownJointEvidenceSelectors: readonly string[];
   readonly manifestRefMismatches: readonly number[];
+  readonly manifestFingerprintDrift: readonly F5cManifestRef["kind"][];
+  readonly rowGroupsMissingComposition: readonly string[];
+  readonly unusedRequiredJointSelectors: readonly string[];
   readonly numericThresholdValueCount: number;
   readonly exactReadySet: boolean;
 }
@@ -850,6 +1041,13 @@ const CANONICAL_MANIFEST_REF_BUILDERS: Readonly<Record<F5cManifestRef["kind"], (
 };
 
 export function auditF5cCandidateSweepPlans(): F5cCandidateSweepPlanAudit {
+  // PR #190レビュー第3ラウンド§1: pin(F5C1_MANIFEST_PINS、hardcoded literal)と
+  // 現行constant(liveManifestFingerprint、CASINO_EDITION_I_MANIFEST等を直接読む)を
+  // 完全に独立な経路で比較する。plan.manifestRefがbuilder経由でpinから複製されている
+  // ことも別途確認する(手編集での値ズレを検出する二重チェック)。
+  const manifestFingerprintDrift = (Object.keys(F5C1_MANIFEST_PINS) as (keyof typeof F5C1_MANIFEST_PINS)[]).filter(
+    (kind) => F5C1_MANIFEST_PINS[kind].fingerprint !== liveManifestFingerprint(kind),
+  );
   const ready = TITLE_V2_CATALOG_READINESS.filter(({ status }) => status === "READY").sort((a, b) => a.no - b.no);
   const readySet = new Set(ready.map(({ no }) => no));
   const planNos = F5C_CANDIDATE_SWEEP_PLANS.map(({ candidateNo }) => candidateNo);
@@ -863,6 +1061,8 @@ export function auditF5cCandidateSweepPlans(): F5cCandidateSweepPlanAudit {
   const optimizationRiskMismatches: number[] = [];
   const manifestRefMismatches: number[] = [];
   const unexecutablePlanCandidateNos: number[] = [];
+  const rowGroupsMissingComposition: string[] = [];
+  const unusedRequiredJointSelectors: string[] = [];
 
   for (const candidatePlan of F5C_CANDIDATE_SWEEP_PLANS) {
     const contract = contracts.get(candidatePlan.probeKey);
@@ -887,6 +1087,9 @@ export function auditF5cCandidateSweepPlans(): F5cCandidateSweepPlanAudit {
         }
       }
     }
+    for (const criterion of candidatePlan.manifestCriteria) {
+      if (!knownMetrics.has(criterion.countMetricKey)) unknownMetricSelectors.push(`#${candidatePlan.candidateNo}:${criterion.countMetricKey}`);
+    }
     const requiredJoint = candidatePlan.requiredJointEvidence;
     if (requiredJoint.kind !== "none" && contract?.jointEvidenceKind !== requiredJoint.kind) {
       unknownJointEvidenceSelectors.push(`#${candidatePlan.candidateNo}:kind:${requiredJoint.kind}`);
@@ -905,22 +1108,60 @@ export function auditF5cCandidateSweepPlans(): F5cCandidateSweepPlanAudit {
         unknownJointEvidenceSelectors.push(`#${candidatePlan.candidateNo}:${requiredJoint.kind}:${criterion.selector}`);
       }
     }
+    // PR #190レビュー第3ラウンド§3 mutation D: social-context-graph-v1（No.26/27）は
+    // maximum-matching selectorをrequiredJointEvidenceへ宣言する以上、必ずそれを
+    // 消費するPOST_FILTER_MATCHING_SIZE axisを持たなければならない——edge filter axis
+    // だけが残ってmatching size boundary axisが消えた状態をfail-closedで検出する
+    // （kind単位の一般化はしない——他のjoint kindでは「宣言されているが未使用」の
+    // 具体的な設計判断が候補ごとに異なるため、汎用の「全selector必須使用」ruleは
+    // 既存の正しい候補まで誤検出させてしまう）。
+    if (requiredJoint.kind === "social-context-graph-v1" && requiredJoint.selectors.includes("counterparts.maximum-matching")) {
+      const hasMatchingAxis = candidatePlan.axes.some((axis) => axis.source === "JOINT_EVIDENCE" && axis.reducerKind === "POST_FILTER_MATCHING_SIZE");
+      if (!hasMatchingAxis) {
+        unusedRequiredJointSelectors.push(`#${candidatePlan.candidateNo}:${requiredJoint.kind}:counterparts.maximum-matching`);
+      }
+    }
 
     let unexecutable = false;
     if (candidatePlan.thresholdCategory === "STRUCTURAL_FIXED" && candidatePlan.fixedCriteria.length === 0) unexecutable = true;
-    if (candidatePlan.thresholdCategory === "MANIFEST_DEPENDENT" && candidatePlan.manifestRef === null) unexecutable = true;
+    if (candidatePlan.thresholdCategory === "MANIFEST_DEPENDENT" && (candidatePlan.manifestRef === null || candidatePlan.manifestCriteria.length === 0)) unexecutable = true;
+    if (candidatePlan.manifestRef !== null && candidatePlan.manifestCriteria.length === 0) unexecutable = true;
     if (candidatePlan.thresholdCategory === "STRUCTURAL_PLUS_DISTRIBUTION" && (candidatePlan.fixedCriteria.length === 0 || candidatePlan.axes.length === 0)) unexecutable = true;
-    if (candidatePlan.structuralRequirements.length > 0 && candidatePlan.fixedCriteria.length === 0 && candidatePlan.manifestRef === null) unexecutable = true;
+    if (candidatePlan.structuralRequirements.length > 0 && candidatePlan.fixedCriteria.length === 0 && candidatePlan.manifestCriteria.length === 0) unexecutable = true;
     if (candidatePlan.evaluationShape === "JOINT_CORRELATION" && (candidatePlan.requiredJointEvidence.kind === "none" || candidatePlan.axes.length === 0)) unexecutable = true;
     if (candidatePlan.thresholdCategory === "THRESHOLD_PENDING" && candidatePlan.axes.length === 0 && candidatePlan.fixedCriteria.length === 0) unexecutable = true;
     if (candidatePlan.measurementStatus === "MEASUREMENT_GAP" && (candidatePlan.axes.length > 0 || !candidatePlan.gapReason)) unexecutable = true;
     if (candidatePlan.manifestRef) {
-      const canonical = CANONICAL_MANIFEST_REF_BUILDERS[candidatePlan.manifestRef.kind]();
-      if (JSON.stringify(canonical) !== JSON.stringify(candidatePlan.manifestRef)) {
+      // plan.manifestRefが実際にpinから複製されていることの整合性チェック(手編集検出)。
+      const pinned = CANONICAL_MANIFEST_REF_BUILDERS[candidatePlan.manifestRef.kind]();
+      if (JSON.stringify(pinned) !== JSON.stringify(candidatePlan.manifestRef)) {
+        manifestRefMismatches.push(candidatePlan.candidateNo);
+        unexecutable = true;
+      }
+      // pin自体が現行canonical manifestからdriftしていないかの独立チェック
+      // (§1のcore fix——builderの自己参照ではなく、pin vs liveの別経路比較)。
+      if (manifestFingerprintDrift.includes(candidatePlan.manifestRef.kind)) {
         manifestRefMismatches.push(candidatePlan.candidateNo);
         unexecutable = true;
       }
     }
+    // PR #190レビュー第3ラウンド§5: 同じrowGroupKeyを共有するSCALAR_SAMPLE filter axisが
+    // 2件以上あるのに、composition mode(ALL_FILTERS/ANY_FILTER)が宣言されていなければ、
+    // F5c2はrow predicateの合成方法を推測することになる——fail-closedでunexecutable。
+    const filterCountByRowGroup = new Map<string, number>();
+    for (const axis of candidatePlan.axes) {
+      if (axis.source === "JOINT_EVIDENCE" && axis.reducerKind === "SCALAR_SAMPLE") {
+        filterCountByRowGroup.set(axis.rowGroupKey, (filterCountByRowGroup.get(axis.rowGroupKey) ?? 0) + 1);
+      }
+    }
+    const declaredCompositionRowGroups = new Set(candidatePlan.rowGroupCompositions.map((c) => c.rowGroupKey));
+    for (const [rowGroupKey, filterCount] of filterCountByRowGroup) {
+      if (filterCount >= 2 && !declaredCompositionRowGroups.has(rowGroupKey)) {
+        rowGroupsMissingComposition.push(`#${candidatePlan.candidateNo}:${rowGroupKey}`);
+        unexecutable = true;
+      }
+    }
+    if (unusedRequiredJointSelectors.some((entry) => entry.startsWith(`#${candidatePlan.candidateNo}:`))) unexecutable = true;
     if (unexecutable) unexecutablePlanCandidateNos.push(candidatePlan.candidateNo);
   }
 
@@ -955,6 +1196,9 @@ export function auditF5cCandidateSweepPlans(): F5cCandidateSweepPlanAudit {
     unknownMetricSelectors: [...new Set(unknownMetricSelectors)].sort(),
     unknownJointEvidenceSelectors: [...new Set(unknownJointEvidenceSelectors)].sort(),
     manifestRefMismatches: [...new Set(manifestRefMismatches)].sort((a, b) => a - b),
+    manifestFingerprintDrift,
+    rowGroupsMissingComposition: [...new Set(rowGroupsMissingComposition)].sort(),
+    unusedRequiredJointSelectors: [...new Set(unusedRequiredJointSelectors)].sort(),
     numericThresholdValueCount,
     exactReadySet: missingReadyCandidateNos.length === 0 && unexpectedPlanCandidateNos.length === 0,
   });

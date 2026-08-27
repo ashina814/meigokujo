@@ -103,10 +103,7 @@ describe("F5c1 READY-76 sweep contract", () => {
         expect(candidatePlan.axes.length).toBeGreaterThan(0);
       }
       for (const axis of candidatePlan.axes) {
-        if (axis.reducerKind === "MATCHING_AFTER_EDGE_FILTER") {
-          expect(axis.boundaryMethod).toBe("RECOMPUTED_AFTER_EDGE_FILTER");
-          expect("operator" in axis).toBe(false);
-        } else if (axis.reducerKind === "CIRCULAR_HOUR_WINDOW") {
+        if (axis.reducerKind === "CIRCULAR_HOUR_WINDOW") {
           expect(axis.boundaryMethod).toBe("CIRCULAR_CANDIDATE_ENUMERATION");
           expect("operator" in axis).toBe(false);
         } else {
@@ -279,12 +276,15 @@ describe("F5c1 contract executability (PR #190 review follow-up)", () => {
     expect(axes.some((axis) => axis.reducerKind === "FILTER_THEN_DISTINCT_DAYS")).toBe(true);
   });
 
-  it("I. No.26/27 represent matching-after-edge-filter", () => {
+  it("I. No.26/27 represent a post-filter matching-size sweep boundary", () => {
     for (const no of [26, 27]) {
-      const matchingAxis = byNo(no).axes.find((axis) => axis.reducerKind === "MATCHING_AFTER_EDGE_FILTER")!;
+      const matchingAxis = byNo(no).axes.find((axis) => axis.reducerKind === "POST_FILTER_MATCHING_SIZE")!;
       expect(matchingAxis).toBeDefined();
-      expect(matchingAxis.boundaryMethod).toBe("RECOMPUTED_AFTER_EDGE_FILTER");
-      expect("operator" in matchingAxis).toBe(false);
+      // §3: matching sizeはedge filter適用後に再計算される派生値だが、それ自体が
+      // subject-level整数のsample集合なので通常のAT_LEAST + nearest-rankでsweepできる
+      // ——pre-filterのstructuralMax metricを流用しない、独立した軸であること。
+      expect(matchingAxis.boundaryMethod).toBe("OBSERVED_NEAREST_RANK");
+      expect("operator" in matchingAxis ? matchingAxis.operator : undefined).toBe("AT_LEAST");
       const filterAxis = byNo(no).axes.find((axis) => axis.reducerKind === "SCALAR_SAMPLE")!;
       expect(filterAxis).toBeDefined();
       expect(filterAxis.source === "JOINT_EVIDENCE" && filterAxis.rowGroupKey).toBe(
@@ -303,8 +303,8 @@ describe("F5c1 contract executability (PR #190 review follow-up)", () => {
         if (axis.source !== "JOINT_EVIDENCE") continue;
         expect(axis.rowGroupKey.length).toBeGreaterThan(0);
         expect([
-          "SCALAR_SAMPLE", "FILTER_THEN_COUNT", "FILTER_THEN_DISTINCT_DAYS", "FILTER_THEN_SHARE",
-          "GROUP_FILTER_THEN_MAX", "MATCHING_AFTER_EDGE_FILTER", "CIRCULAR_HOUR_WINDOW", "SET_BREADTH", "REPEAT_PERIOD",
+          "SCALAR_SAMPLE", "FILTER_THEN_COUNT", "FILTER_THEN_DISTINCT_DAYS", "FILTER_THEN_SHARE", "FILTER_THEN_SPAN_DAYS",
+          "GROUP_FILTER_THEN_MAX", "POST_FILTER_MATCHING_SIZE", "CIRCULAR_HOUR_WINDOW", "SET_BREADTH", "REPEAT_PERIOD",
         ]).toContain(axis.reducerKind);
       }
     }
@@ -353,5 +353,110 @@ describe("F5c1 contract executability (PR #190 review follow-up)", () => {
     expect(audit.unexecutablePlanCandidateNos).toEqual([]);
     expect(audit.declaredMeasurementGapCount).toBe(0);
     expect(audit.manifestRefMismatches).toEqual([]);
+    expect(audit.manifestFingerprintDrift).toEqual([]);
+    expect(audit.rowGroupsMissingComposition).toEqual([]);
+  });
+});
+
+/**
+ * PR #190レビュー第3ラウンド: manifest pin drift detectionのself-comparison修正、
+ * MANIFEST_DEPENDENT candidateへのtyped executable semantics追加、No.26/27の
+ * post-filter matching-size boundary、No.56のspan reducer修正、row-group filter
+ * composition明示化を検証する。
+ */
+describe("F5c1 contract executability round 3 (manifest pin drift / typed conformance / matching / span / composition)", () => {
+  const byNo = (no: number) => F5C_CANDIDATE_SWEEP_PLANS.find(({ candidateNo }) => candidateNo === no)!;
+
+  it("1. manifest pin drift guard: pin and live manifest fingerprints are computed independently and currently agree", () => {
+    const audit = auditF5cCandidateSweepPlans();
+    expect(audit.manifestFingerprintDrift).toEqual([]);
+    // すべてのMANIFEST_DEPENDENT candidateがpinへ一致していることも間接的に確認する
+    const manifestDependent = F5C_CANDIDATE_SWEEP_PLANS.filter(({ thresholdCategory }) => thresholdCategory === "MANIFEST_DEPENDENT");
+    for (const candidatePlan of manifestDependent) expect(audit.manifestRefMismatches).not.toContain(candidatePlan.candidateNo);
+  });
+
+  it("2. all 6 MANIFEST_DEPENDENT plans have executable manifestCriteria (not manifestRef alone)", () => {
+    const manifestDependent = F5C_CANDIDATE_SWEEP_PLANS.filter(({ thresholdCategory }) => thresholdCategory === "MANIFEST_DEPENDENT");
+    expect(manifestDependent).toHaveLength(6);
+    for (const candidatePlan of manifestDependent) {
+      expect(candidatePlan.manifestRef).not.toBeNull();
+      expect(candidatePlan.manifestCriteria.length).toBeGreaterThan(0);
+      for (const criterion of candidatePlan.manifestCriteria) {
+        expect(["ALL_MANIFEST_MEMBERS", "AT_LEAST_FIXED_DISTINCT_MEMBERS", "ALL_REQUIRED_SUPERDOMAINS", "MANIFEST_CARDINALITY_SWEEP"]).toContain(criterion.kind);
+      }
+    }
+    // No.63: multiple distinct families (fixed "multiple" = 2, not a production threshold)
+    expect(byNo(63).manifestCriteria).toEqual([{ kind: "AT_LEAST_FIXED_DISTINCT_MEMBERS", countMetricKey: "distinctSubjectUsedFamilies", fixedValue: 2 }]);
+    // No.69: ALL Casino Edition-I families completed
+    expect(byNo(69).manifestCriteria).toEqual([{ kind: "ALL_MANIFEST_MEMBERS", countMetricKey: "allFamiliesCompleted" }]);
+    // No.86: multiple Castle families
+    expect(byNo(86).manifestCriteria).toEqual([{ kind: "AT_LEAST_FIXED_DISTINCT_MEMBERS", countMetricKey: "activeFamilyCount", fixedValue: 2 }]);
+    // No.87: super-domain coverage is typed; the "sufficient family count" part stays an unselected sweep
+    expect(byNo(87).manifestCriteria).toEqual([
+      { kind: "ALL_REQUIRED_SUPERDOMAINS", countMetricKey: "coveredSuperDomainCount" },
+      { kind: "MANIFEST_CARDINALITY_SWEEP", countMetricKey: "domainSemanticBreadth" },
+    ]);
+    expect(byNo(87).requiredMetrics).toContain("coveredSuperDomainCount");
+    // No.88: "almost all" stays an unselected manifest-relative cardinality sweep — no production number invented
+    expect(byNo(88).manifestCriteria).toEqual([{ kind: "MANIFEST_CARDINALITY_SWEEP", countMetricKey: "domainSemanticBreadth" }]);
+    // No.89: ALL Castle families
+    expect(byNo(89).manifestCriteria).toEqual([{ kind: "ALL_MANIFEST_MEMBERS", countMetricKey: "activeFamilyCount" }]);
+  });
+
+  it("3. No.26/27 have an executable post-filter matching-size boundary, not a bare recompute step", () => {
+    for (const no of [26, 27]) {
+      const matchingAxis = byNo(no).axes.find((axis) => axis.reducerKind === "POST_FILTER_MATCHING_SIZE")!;
+      expect(matchingAxis).toBeDefined();
+      expect("operator" in matchingAxis && matchingAxis.operator).toBe("AT_LEAST");
+      expect(matchingAxis.boundaryMethod).toBe("OBSERVED_NEAREST_RANK");
+      // structuralMax(pre-filter)ではなく、edge filterと同じrow groupから再計算される値であること
+      const edgeFilterAxis = byNo(no).axes.find((axis) => axis.reducerKind === "SCALAR_SAMPLE")!;
+      expect("rowGroupKey" in matchingAxis && "rowGroupKey" in edgeFilterAxis && matchingAxis.rowGroupKey).toBe(
+        "rowGroupKey" in edgeFilterAxis ? edgeFilterAxis.rowGroupKey : undefined,
+      );
+    }
+  });
+
+  it("4. No.56 own-room-use-days (distinct-days) and own-room-use-span (span) use different reducers and are not the same value in general", () => {
+    const daysAxis = byNo(56).axes.find((axis) => axis.axisKey === "own-room-use-days")!;
+    const spanAxis = byNo(56).axes.find((axis) => axis.axisKey === "own-room-use-span")!;
+    expect(daysAxis.reducerKind).toBe("FILTER_THEN_DISTINCT_DAYS");
+    expect(spanAxis.reducerKind).toBe("FILTER_THEN_SPAN_DAYS");
+    expect(daysAxis.reducerKind).not.toBe(spanAxis.reducerKind);
+    // 実際のreducer semanticsをこのテスト自身で計算し、3件・spanは10であることを確認する
+    // (day offsets: 1, 2, 10 → distinct days = 3, span = 10 - 1 + 1 = 10)
+    const dayOffsets = [1, 2, 10];
+    const distinctDays = new Set(dayOffsets).size;
+    const span = dayOffsets.length === 0 ? null : Math.max(...dayOffsets) - Math.min(...dayOffsets) + 1;
+    expect(distinctDays).toBe(3);
+    expect(span).toBe(10);
+    expect(distinctDays).not.toBe(span);
+  });
+
+  it("5. explicit multi-filter row-group composition is declared for every relevant group", () => {
+    const relevantGroups: { readonly candidateNo: number; readonly rowGroupKey: string }[] = [];
+    for (const candidatePlan of F5C_CANDIDATE_SWEEP_PLANS) {
+      const filterCountByRowGroup = new Map<string, number>();
+      for (const axis of candidatePlan.axes) {
+        if (axis.source === "JOINT_EVIDENCE" && axis.reducerKind === "SCALAR_SAMPLE") {
+          filterCountByRowGroup.set(axis.rowGroupKey, (filterCountByRowGroup.get(axis.rowGroupKey) ?? 0) + 1);
+        }
+      }
+      for (const [rowGroupKey, count] of filterCountByRowGroup) {
+        if (count >= 2) relevantGroups.push({ candidateNo: candidatePlan.candidateNo, rowGroupKey });
+      }
+    }
+    expect(relevantGroups.length).toBeGreaterThan(0);
+    for (const { candidateNo, rowGroupKey } of relevantGroups) {
+      const declared = byNo(candidateNo).rowGroupCompositions.find((c) => c.rowGroupKey === rowGroupKey);
+      expect(declared).toBeDefined();
+      expect(["ALL_FILTERS", "ANY_FILTER"]).toContain(declared!.composition);
+    }
+    const audit = auditF5cCandidateSweepPlans();
+    expect(audit.rowGroupsMissingComposition).toEqual([]);
+    // A. No.42 TC start: quiet-before + continuation-gap qualify the SAME row conjunctively
+    expect(byNo(42).rowGroupCompositions).toEqual([{ rowGroupKey: "tc-start-rows", composition: "ALL_FILTERS" }]);
+    // B. No.32-37 TC/VC multimodal social evidence: either modality qualifies (not AND)
+    expect(byNo(32).rowGroupCompositions[0]!.composition).toBe("ANY_FILTER");
   });
 });

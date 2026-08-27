@@ -2326,15 +2326,15 @@ reduction semanticsが無い・measurementStatusが暗黙にMEASUREDへdefault�
   複製せず、manifestが改訂されても古いsweep contractが気づかず変わらないことを保証する。
 - **axis reducer kind**: `F5cAxisReducerKind`（`SCALAR_METRIC` / `SCALAR_SAMPLE` /
   `FILTER_THEN_COUNT` / `FILTER_THEN_DISTINCT_DAYS` / `FILTER_THEN_SHARE` /
-  `GROUP_FILTER_THEN_MAX` / `MATCHING_AFTER_EDGE_FILTER` / `CIRCULAR_HOUR_WINDOW` /
-  `SET_BREADTH` / `REPEAT_PERIOD`）をREADY-76の実際のpatternから列挙した（汎用DSLでは
-  ない）。同じ生row集合から複数axisが導出される場合は`rowGroupKey`で明示する
+  `FILTER_THEN_SPAN_DAYS` / `GROUP_FILTER_THEN_MAX` / `POST_FILTER_MATCHING_SIZE` /
+  `CIRCULAR_HOUR_WINDOW` / `SET_BREADTH` / `REPEAT_PERIOD`）をREADY-76の実際のpatternから
+  列挙した（汎用DSLではない、§14.9.2で`POST_FILTER_MATCHING_SIZE`/`FILTER_THEN_SPAN_DAYS`
+  を追加）。同じ生row集合から複数axisが導出される場合は`rowGroupKey`で明示する
   （No.42のTC start例: quiet-before/continuation-gap filterとqualifying distinct daysが
-  同じstart rowから導出されることを明示）。graph matching（No.26/27）はedge filter適用後の
-  再計算専用variantへ分離し、24 JST hour（No.32-37）は循環windowの専用variantへ分離した
-  ——どちらもoperatorを持たず、`OBSERVED_NEAREST_RANK`を直接割り当てない。No.77/78の
-  root-before-child/same-day-before-entry chronologyは、AT_LEAST axisとして誤って
-  sweepable扱いされていたのを`JOINT_STRUCTURAL_FACT` fixedCriteriaへ移し、No.77には
+  同じstart rowから導出されることを明示）。24 JST hour（No.32-37）は循環windowの専用
+  variantへ分離した——operatorを持たず、`OBSERVED_NEAREST_RANK`を直接割り当てない。
+  No.77/78のroot-before-child/same-day-before-entry chronologyは、AT_LEAST axisとして
+  誤ってsweepable扱いされていたのを`JOINT_STRUCTURAL_FACT` fixedCriteriaへ移し、No.77には
   正規のdistribution axis（same-day gap/seconds、qualifying count、いずれも
   `next-gen-rows`で同一row group）を追加した。
 - **measurementStatusの明示化**: `measuredPlan()`/`gapPlan()`のみがconstructorを呼べる。
@@ -2345,6 +2345,53 @@ reduction semanticsが無い・measurementStatusが暗黙にMEASUREDへdefault�
   plan数——fixedCriteria/manifestRef欠落、JOINT_CORRELATIONなのにaxisが無い、
   manifestRefが現行canonical定数と食い違う等）を分けて報告する。現行READY-76は
   両方とも0。
+
+### 14.9.2 Manifest pin drift / typed manifest conformance / matching / span / row-group composition（PR #190レビュー第3ラウンド対応）
+
+第2ラウンドの`F5cManifestRef` builderは、その場で現行canonical定数（
+`CASINO_EDITION_I_MANIFEST`等）を読んでplanへ埋め込み、auditも同じbuilderを再実行して
+比較していたため、manifestが将来改訂されてもplan側とaudit側が同時に追従してしまい、
+drift検出が機能しない自己参照バグだった。以下を追加で修正した。
+
+- **`F5C1_MANIFEST_PINS`**: economy/casino edition/castle editionそれぞれについて、
+  editionKey・version・family一覧（casino editionはactivityKeys、castle editionは
+  superDomainまで含む）と、それを`canonicalManifestFingerprint()`（key順sort済み
+  canonical serialization + sha256）で固定したhardcoded literal fingerprintを持つ。
+  `docs`側の`FROZEN_CATALOG_99_FINAL_SHA256`と同じ考え方——現行constantを呼び出して
+  生成しない。`economyManifestRef()`等のbuilderは、このpinだけからplanへ埋め込む値を
+  作る。`liveManifestFingerprint()`だけが現行constant（`CASINO_EDITION_I_MANIFEST`等）を
+  直接読み、auditがpinとliveを独立に比較する——一方が変わっても他方が追従しない。
+- **`F5cManifestCriterion`**（`ALL_MANIFEST_MEMBERS` / `AT_LEAST_FIXED_DISTINCT_MEMBERS` /
+  `ALL_REQUIRED_SUPERDOMAINS` / `MANIFEST_CARDINALITY_SWEEP`）: `manifestRef`は
+  「どのuniverseを見るか」だけを特定し「そのuniverseに対して何を要求するか」は特定
+  しない——MANIFEST_DEPENDENTの6候補全員（No.63/69/86/87/88/89）へ追加した。No.63/86は
+  「multiple」を固定2としたbreadth要求、No.69/89はALL family conformance、No.87は
+  super-domain coverage（`ALL_REQUIRED_SUPERDOMAINS`）とfamily breadthの両方——後者は
+  値を選ばない`MANIFEST_CARDINALITY_SWEEP`のまま、No.88は「almost all」を同じく
+  未選択のcardinality sweepとして表現する（production numberは発明しない）。No.87向けに
+  `castle_experience_safe`が既に持つ`coveredSuperDomains`を`castle-social-time-v1`
+  probeの`coveredSuperDomainCount`metricとして新規公開した（`measureDomainSocialTime()`
+  の追加引数）。
+- **`POST_FILTER_MATCHING_SIZE`**: No.26/27のgraph matching sizeは、edge filter適用後に
+  再計算される派生値だが、edge閾値を固定すればsubjectごとに1個の整数になる正当な
+  sample集合であるため、通常のAT_LEAST + `OBSERVED_NEAREST_RANK`でsweepできる——
+  第2ラウンドで「operatorを持たない」としたのは誤りだった。pre-filterの
+  `structuralMax*Matching`metricを流用せず、edge filter axisと同じ`rowGroupKey`から
+  再計算する契約であることは変わらない。
+- **`FILTER_THEN_SPAN_DAYS`**: No.56の`own-room-use-span`が`own-room-use-days`
+  （`FILTER_THEN_DISTINCT_DAYS`、件数）と同じreducerを誤って共有していた。span
+  （`max(dayOffset) - min(dayOffset) + 1`、空集合はnull）を独立したreducer kindへ分離した。
+- **`F5cRowGroupComposition`**（`ALL_FILTERS` / `ANY_FILTER`）: 同じ`rowGroupKey`を
+  共有するSCALAR_SAMPLE filter axisが2件以上ある場合、それらがconjunctive（No.42の
+  TC start: quiet-beforeとcontinuation-gapは同じstart rowが両方を満たす）なのか
+  disjunctive（No.32-37/No.77のTC/VC multimodal social evidence: いずれかのmodalityが
+  十分であればよい）なのかを明示する。auditは該当row groupにcomposition宣言が
+  無ければunexecutableとして検出する。
+- **audit拡張**: `manifestFingerprintDrift`（pin vs live fingerprintの不一致kind一覧）、
+  `rowGroupsMissingComposition`、`unusedRequiredJointSelectors`（No.26/27で
+  `counterparts.maximum-matching`をrequiredJointEvidenceへ宣言していながら
+  `POST_FILTER_MATCHING_SIZE` axisが無い場合を検出）を追加した。現行READY-76は
+  すべて0/空のまま。
 
 ## 15. PR分割
 
