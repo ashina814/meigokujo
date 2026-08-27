@@ -2219,7 +2219,8 @@ F5b2はF5a/F5b1と同じ`CalibrationProbe<S>`、typed `CalibrationPayloadBundle<
 | `public-room-activity-v1` | 50–55 | `public_room_activity_safe` |
 | `public-room-social-time-v1` | 56 | `public_room_activity_safe`, `social_activity_time_safe` |
 | `economy-peer-actions-v1` | 58 | `economy_safe_peer_actions` |
-| `economy-semantic-v1` | 59, 61, 63, 65 | `economy_semantic_safe`, `shop_role_purchase_safe` |
+| `economy-semantic-v1` | 59, 61, 63 | `economy_semantic_safe` |
+| `shop-role-purchase-v1` | 65 | `shop_role_purchase_safe` |
 | `shop-purchase-v1` | 62 | `shop_purchase_safe` |
 | `casino-completed-activity-v1` | 66, 67 | `casino_completed_activity_days` |
 | `casino-activity-v1` | 68 | `casino_activity_days` |
@@ -2229,13 +2230,13 @@ F5b2はF5a/F5b1と同じ`CalibrationProbe<S>`、typed `CalibrationPayloadBundle<
 | `casino-market-activity-v1` | 72 | `casino_market_activity_safe` |
 | `confirmed-invites-v1` | 74, 75 | `confirmed_invites` |
 | `invite-rooted-v1` | 76–79 | `invite_rooted_safe` |
-| `public-event-completion-v1` | 80 | `public_event_completed_participations` |
-| `public-event-calendar-v1` | 81–84 | `public_event_completed_participations`, `public_event_calendar_involvement_safe` |
+| `public-event-completion-v1` | 80, 81 | `public_event_completed_participations` |
+| `public-event-calendar-v1` | 82–84 | `public_event_calendar_involvement_safe` |
 | `castle-experience-v1` | 85, 86, 89 | `castle_experience_safe` |
 | `castle-social-time-v1` | 87, 88 | `castle_experience_safe`, `social_activity_time_safe` |
 | `castle-role-context-v1` | 90, 91 | `castle_experience_safe`, `castle_role_context_safe` |
 
-No.65は購入時role-family JOIN済みの`shop_role_purchase_safe`、No.81はcanonical completion instanceの
+No.65は独立したrole coverage packとして購入時role-family JOIN済みの`shop_role_purchase_safe`、No.81はcompletion-only packでcanonical completion instanceの
 `public_event_completed_participations`を正本にする。No.71用に未登録の別sourceを新設せず、現行readiness contractどおり
 `casino_table_activity_safe`のanonymous guest profile側をparticipation measurementとして使う。
 
@@ -2253,8 +2254,9 @@ Castle role-contextのfixed semantic index別inside/outside/role-held day/second
 room/table/event/product/counterpart identity、eventKey、exact date/timestamp、raw payloadは保持しない。serialized
 `CalibrationSnapshot`はschema v1のaggregate-only shapeのままで、subject row、ordinal、day/hour row、joint evidenceを出さない。
 
-全packはunknown/untrusted interval、source rollout前、historical backfill不在をcoverage limitationとして扱う。event legacy roleは
-participant-onlyのままでstaff/organizerを推測せず、role-contextのUNKNOWN historyをcurrent assignmentでinside/outsideへ分類しない。
+全packはunknown/untrusted interval、source rollout前、historical backfill不在をcoverage limitationとして扱う。event completion packには
+無関係なlegacy role limitationを付けず、calendar-role packだけがlegacy participant-onlyのままでstaff/organizerを推測しない。
+role-contextのUNKNOWN historyをcurrent assignmentでinside/outsideへ分類しない。
 unique sourceはcohort/scopeごとに一度だけbulk prefetchし、601 subjectsは通常300/300/1の3 calls、Castle 9-adapter sourceは
 27 actual adapter readsとなる。同一sourceを複数probeが使っても再読しない。
 

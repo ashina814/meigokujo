@@ -69,6 +69,7 @@ export type CalibrationProbeKey =
   | "public-room-social-time-v1"
   | "economy-peer-actions-v1"
   | "economy-semantic-v1"
+  | "shop-role-purchase-v1"
   | "shop-purchase-v1"
   | "casino-completed-activity-v1"
   | "casino-activity-v1"
@@ -945,7 +946,6 @@ function measurePublicRoomActivity(
     ["guestSessionCount", payload.guest.sessionCount],
     ["guestDistinctOwners", payload.guest.distinctOwners],
     ["ownUseSessionCount", payload.ownUse.sessionCount],
-    ["totalSessionCount", payload.hosted.sessionCount + payload.guest.sessionCount + payload.ownUse.sessionCount],
   ]);
   setDayRangeMetrics(metrics, "active", [...hosted, ...guest, ...ownUse]);
   setDayRangeMetrics(metrics, "hostedActive", hosted);
@@ -1013,12 +1013,10 @@ function measureEconomyPeerActions(
 
 function measureEconomySemantic(
   payload: EconomySemanticSafeSourcePayload,
-  shopRole: ShopRolePurchaseSafeSourcePayload,
   context: { readonly windowStart: number },
 ): SubjectMeasurement {
   const dayOffsets = payload.days.map(({ date }) => dateDayOffset(date, context.windowStart));
   const tipOffsets = payload.outgoingTip.days.map(({ date }) => dateDayOffset(date, context.windowStart));
-  const shopRoleOffsets = shopRole.days.map(({ date }) => dateDayOffset(date, context.windowStart));
   const metrics = new Map<string, number | null>([
     ["distinctFamilies", payload.distinctFamilies],
     ["distinctSubjectUsedFamilies", payload.distinctSubjectUsedFamilies],
@@ -1026,18 +1024,28 @@ function measureEconomySemantic(
     ["hasNaturalInflow", payload.hasNaturalInflow ? 1 : 0],
     ["hasNaturalOutflow", payload.hasNaturalOutflow ? 1 : 0],
     ["outgoingTipDistinctRecipients", payload.outgoingTip.distinctRecipients],
-    ["shopRoleEligiblePurchaseCount", shopRole.days.reduce((sum, day) => sum + day.eligiblePurchaseCount, 0)],
   ]);
   setDayRangeMetrics(metrics, "economyActive", dayOffsets);
   setDayRangeMetrics(metrics, "outgoingTipActive", tipOffsets);
-  setDayRangeMetrics(metrics, "shopRolePurchaseActive", shopRoleOffsets);
   setSampleMetrics(metrics, "dailyDistinctHumanCounterparts", payload.days.map(({ distinctHumanCounterparts }) => distinctHumanCounterparts));
   setSampleMetrics(metrics, "dailyOutgoingTipDistinctRecipients", payload.outgoingTip.days.map(({ distinctRecipients }) => distinctRecipients));
-  setSampleMetrics(metrics, "dailyShopRoleEligiblePurchases", shopRole.days.map(({ eligiblePurchaseCount }) => eligiblePurchaseCount));
   for (const family of ECONOMY_FAMILY_ORDER) {
     metrics.set(`familyObserved.${family}`, payload.days.some((day) => day.families.includes(family)) ? 1 : 0);
     metrics.set(`familySubjectUsed.${family}`, payload.subjectUsedFamilies.includes(family) ? 1 : 0);
   }
+  return { metrics };
+}
+
+function measureShopRolePurchases(
+  payload: ShopRolePurchaseSafeSourcePayload,
+  context: { readonly windowStart: number },
+): SubjectMeasurement {
+  const offsets = payload.days.map(({ date }) => dateDayOffset(date, context.windowStart));
+  const metrics = new Map<string, number | null>([
+    ["shopRoleEligiblePurchaseCount", payload.days.reduce((sum, day) => sum + day.eligiblePurchaseCount, 0)],
+  ]);
+  setDayRangeMetrics(metrics, "shopRolePurchaseActive", offsets);
+  setSampleMetrics(metrics, "dailyShopRoleEligiblePurchases", payload.days.map(({ eligiblePurchaseCount }) => eligiblePurchaseCount));
   return { metrics };
 }
 
@@ -1192,13 +1200,11 @@ function measurePublicEventCompletion(
 }
 
 function measurePublicEventCalendar(
-  completed: PublicEventCompletedParticipationsSourcePayload,
   calendar: PublicEventCalendarInvolvementSafeSourcePayload,
   context: { readonly windowStart: number },
 ): SubjectMeasurement {
   const offsets = calendar.events.map(({ eventDate }) => dateDayOffset(eventDate, context.windowStart));
   const metrics = new Map<string, number | null>([
-    ["completedDistinctEventCount", completed.participations.length],
     ["totalEventInvolvementCount", calendar.events.length],
     ["generalParticipantCount", calendar.events.filter(({ generalParticipant }) => generalParticipant).length],
     ["staffCount", calendar.events.filter(({ staff }) => staff).length],
@@ -1469,16 +1475,21 @@ const EMPTY_ECONOMY_SEMANTIC = Object.freeze({
   distinctHumanCounterparts: 0, hasNaturalInflow: false, hasNaturalOutflow: false,
   outgoingTip: Object.freeze({ days: [], distinctRecipients: 0 }),
 });
-const ECONOMY_SEMANTIC_PROBE: CalibrationProbe<readonly ["economy_semantic_safe", "shop_role_purchase_safe"]> = {
-  candidateNos: Object.freeze([59, 61, 63, 65]),
+const ECONOMY_SEMANTIC_PROBE: CalibrationProbe<readonly ["economy_semantic_safe"]> = {
+  candidateNos: Object.freeze([59, 61, 63]),
   probeKey: "economy-semantic-v1",
-  sources: ["economy_semantic_safe", "shop_role_purchase_safe"],
-  emptyPayloads: Object.freeze({
-    economy_semantic_safe: EMPTY_ECONOMY_SEMANTIC,
-    shop_role_purchase_safe: Object.freeze({ days: [] }),
-  }),
+  sources: ["economy_semantic_safe"],
+  emptyPayloads: Object.freeze({ economy_semantic_safe: EMPTY_ECONOMY_SEMANTIC }),
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
+  measure: (payloads, context) => measureEconomySemantic(payloads.economy_semantic_safe, context),
+};
+const SHOP_ROLE_PURCHASE_PROBE: CalibrationProbe<readonly ["shop_role_purchase_safe"]> = {
+  candidateNos: Object.freeze([65]),
+  probeKey: "shop-role-purchase-v1",
+  sources: ["shop_role_purchase_safe"],
+  emptyPayloads: Object.freeze({ shop_role_purchase_safe: Object.freeze({ days: [] }) }),
   coverageLimitations: ROLE_COVERAGE_LIMITATIONS,
-  measure: (payloads, context) => measureEconomySemantic(payloads.economy_semantic_safe, payloads.shop_role_purchase_safe, context),
+  measure: (payloads, context) => measureShopRolePurchases(payloads.shop_role_purchase_safe, context),
 };
 const SHOP_PURCHASE_PROBE: CalibrationProbe<readonly ["shop_purchase_safe"]> = {
   candidateNos: Object.freeze([62]),
@@ -1559,27 +1570,20 @@ const INVITE_ROOTED_PROBE: CalibrationProbe<readonly ["invite_rooted_safe"]> = {
 };
 
 const PUBLIC_EVENT_COMPLETION_PROBE: CalibrationProbe<readonly ["public_event_completed_participations"]> = {
-  candidateNos: Object.freeze([80]),
+  candidateNos: Object.freeze([80, 81]),
   probeKey: "public-event-completion-v1",
   sources: ["public_event_completed_participations"],
   emptyPayloads: Object.freeze({ public_event_completed_participations: Object.freeze({ participations: [] }) }),
-  coverageLimitations: EVENT_COVERAGE_LIMITATIONS,
+  coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
   measure: (payloads, context) => measurePublicEventCompletion(payloads.public_event_completed_participations, context),
 };
-const PUBLIC_EVENT_CALENDAR_PROBE: CalibrationProbe<readonly ["public_event_completed_participations", "public_event_calendar_involvement_safe"]> = {
-  candidateNos: Object.freeze([81, 82, 83, 84]),
+const PUBLIC_EVENT_CALENDAR_PROBE: CalibrationProbe<readonly ["public_event_calendar_involvement_safe"]> = {
+  candidateNos: Object.freeze([82, 83, 84]),
   probeKey: "public-event-calendar-v1",
-  sources: ["public_event_completed_participations", "public_event_calendar_involvement_safe"],
-  emptyPayloads: Object.freeze({
-    public_event_completed_participations: Object.freeze({ participations: [] }),
-    public_event_calendar_involvement_safe: Object.freeze({ events: [] }),
-  }),
+  sources: ["public_event_calendar_involvement_safe"],
+  emptyPayloads: Object.freeze({ public_event_calendar_involvement_safe: Object.freeze({ events: [] }) }),
   coverageLimitations: EVENT_COVERAGE_LIMITATIONS,
-  measure: (payloads, context) => measurePublicEventCalendar(
-    payloads.public_event_completed_participations,
-    payloads.public_event_calendar_involvement_safe,
-    context,
-  ),
+  measure: (payloads, context) => measurePublicEventCalendar(payloads.public_event_calendar_involvement_safe, context),
 };
 
 const EMPTY_CASTLE_EXPERIENCE = Object.freeze({ editionKey: "castle-experience-edition-i", version: 1, families: [], coveredSuperDomains: [] });
@@ -1635,6 +1639,7 @@ export const F5B2_CALIBRATION_PROBES = Object.freeze([
   runtimeProbe(PUBLIC_ROOM_SOCIAL_TIME_PROBE),
   runtimeProbe(ECONOMY_PEER_ACTIONS_PROBE),
   runtimeProbe(ECONOMY_SEMANTIC_PROBE),
+  runtimeProbe(SHOP_ROLE_PURCHASE_PROBE),
   runtimeProbe(SHOP_PURCHASE_PROBE),
   runtimeProbe(CASINO_COMPLETED_ACTIVITY_PROBE),
   runtimeProbe(CASINO_ACTIVITY_PROBE),
