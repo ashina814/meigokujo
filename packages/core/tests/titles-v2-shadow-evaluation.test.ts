@@ -380,6 +380,51 @@ describe("F5c2 shadow-calibration executor", () => {
     expect(plan37.unknownCount).toBe(0);
   });
 
+  it("No.37: a SCALAR_SAMPLE filter with NO representative boundary contributes the empty qualifying set, never the raw set — below-VC-threshold rows are not resurrected through an absent TC filter under ANY_FILTER (PR #191レビュー第7ラウンド§1/§2 counterexample)", () => {
+    // Every subject's TC gap is null, so the tc-gap-ceiling filter has no population boundary at
+    // all. VC has a real one. Under the old circular-path behavior (`boundary === undefined ? raw`)
+    // the absent TC filter behaved as "admit every row", and ANY_FILTER unioned that raw set in —
+    // silently bypassing the VC threshold for the CIRCULAR_HOUR_WINDOW axis only.
+    const probeKey = probeKeyFor(37);
+    const HIGH_VC = 1000; // clears the representative VC boundary
+    const LOW_VC = 10; // does not
+    const at = (dayOffset: number, hour: number, vcTrustedSocialSeconds: number) =>
+      ({ dayOffset, hour, tcBestOtherGapMs: null, vcTrustedSocialSeconds });
+    const withRows = (id: string, rows: ReadonlyArray<ReturnType<typeof at>>) =>
+      subject(id, [{ probeKey, jointEvidence: { kind: "activity-time-day-hour-v1", rows } }]);
+
+    // alice: 4 qualifying days in ONE quadrant (Q0, hour 2), plus BELOW-boundary VC activity in
+    // two further quadrants (Q1 hour 8, Q2 hour 14) on 2 days each. Genuine breadth = 1.
+    const alice = withRows("alice", [
+      at(1, 2, HIGH_VC), at(2, 2, HIGH_VC), at(3, 2, HIGH_VC), at(4, 2, HIGH_VC),
+      at(5, 8, LOW_VC), at(6, 8, LOW_VC),
+      at(7, 14, LOW_VC), at(8, 14, LOW_VC),
+    ]);
+    // bob / carol: genuinely recurring in TWO quadrants. Genuine breadth = 2.
+    const bob = withRows("bob", [at(1, 2, HIGH_VC), at(2, 2, HIGH_VC), at(3, 8, HIGH_VC), at(4, 8, HIGH_VC)]);
+    const carol = withRows("carol", [at(1, 2, HIGH_VC), at(2, 2, HIGH_VC), at(3, 20, HIGH_VC), at(4, 20, HIGH_VC)]);
+
+    const report = executeF5cShadowCalibration(collection([alice, bob, carol]), true);
+    const plan37 = byNo(report, 37);
+    const breadth = plan37.axisSweeps.find((s) => s.axisKey === "multi-daypart-boundaries")!;
+
+    // breadth samples are [1, 2, 2] -> p10 (nearest-rank) is alice's 1. Under the resurrection bug
+    // alice's below-threshold Q1/Q2 rows would have counted too, making the samples [3, 2, 2] and
+    // this p10 a 2 — so this single assertion pins the invariant directly.
+    expect(breadth.boundaryPoints.find((p) => p.percentile === 10)!.boundaryValue).toBe(1);
+    // ...and p50 = 2 is the representative breadth boundary alice must fail.
+    expect(breadth.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue).toBe(2);
+
+    // alice PASSES the sibling distributed-days reduction (4 distinct qualifying days, same as
+    // bob/carol), so her verdict turns purely on breadth — not on running out of evidence.
+    const days = plan37.axisSweeps.find((s) => s.axisKey === "multi-daypart-distributed-days")!;
+    for (const point of days.boundaryPoints) expect(point.boundaryValue).toBe(4);
+
+    expect(plan37.notMatchedCount).toBe(1); // alice — one real recurring quadrant, not three
+    expect(plan37.matchedCount).toBe(2); // bob, carol
+    expect(plan37.unknownCount).toBe(0);
+  });
+
   it("No.37: a single continuous cross-midnight block (one all-nighter) does not satisfy MULTI_DAYPART_BREADTH, even though genuinely recurring activity does (PR #191レビュー第4ラウンド§4 counterexample)", () => {
     // The all-nighter subject has ONE session spanning hour 22 (day 1, Q3) through hour 4 (day 2,
     // Q0) — it touches 2 quadrants but only 1 distinct day in EACH, so neither quadrant clears the

@@ -307,11 +307,9 @@ interface F5cJointCircularHourAxis {
   readonly selector: string;
   readonly rowGroupKey: string;
   readonly reducerKind: "CIRCULAR_HOUR_WINDOW";
-  // PR #191レビュー第5ラウンド§4: "CIRCULAR_CANDIDATE_ENUMERATION"は、3つのintent全てが
-  // window候補を列挙するという旧設計を前提にした名前だった——DAYPART_TARGET/
-  // MULTI_DAYPART_BREADTHはもう列挙しない（quadrant/recurrenceへの直接reduction）。
-  // PERSONAL_STABILITYだけが実際にwindow候補を列挙する。intentに依らない中立的な
-  // 名前へ改めた。
+  // intentに依らない中立的な名前——実際の探索の有無はintentごとに違う
+  // （DAYPART_TARGET/MULTI_DAYPART_BREADTHはquadrant/recurrenceへ直接reduceし、
+  // window候補を列挙するのはPERSONAL_STABILITYだけ）。
   readonly boundaryMethod: "CIRCULAR_ANALYSIS";
   readonly circularIntent: F5cCircularIntent;
 }

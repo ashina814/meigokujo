@@ -89,11 +89,10 @@ function combineOutcomesOr(outcomes: readonly F5cShadowOutcome[]): F5cShadowOutc
 }
 
 /**
- * PR #191レビュー第4ラウンド§1: 絶対ゼロだけを特別扱いした`zeroSensitiveOutcome()`
- * （旧実装）は狭すぎた。safe sourceの欠落は非ゼロ値も低く見せうる——真値10・観測3・
- * AT_LEAST境界5なら、観測はNOT_MATCHEDだが真値はMATCHEDだったかもしれない
- * （false AT_LEAST failure）。逆にAT_MOST境界5なら、観測はMATCHEDだが真値は
- * NOT_MATCHEDだったかもしれない（false AT_MOST match）。一般化した原理:
+ * coverage不完全性の下での**固定boundary**比較の扱い。safe sourceの欠落は
+ * 非ゼロ値も低く見せうる——真値10・観測3・AT_LEAST境界5なら、観測はNOT_MATCHEDだが
+ * 真値はMATCHEDだったかもしれない（false AT_LEAST failure）。逆にAT_MOST境界5なら、
+ * 観測はMATCHEDだが真値はNOT_MATCHEDだったかもしれない（false AT_MOST match）。原理:
  *
  * 観測値は常に真値の**下限**である（safe sourceはfalse negativeしか生まず、
  * false positiveを生まない——unknown/untrusted intervalは省略されるだけで、
@@ -318,11 +317,12 @@ export interface F5cShadowCalibrationReport {
   readonly sensitivityModel: typeof F5C2_SENSITIVITY_MODEL;
   /**
    * The caller's unverified attestation, threaded straight through as the report's coverage
-   * provenance (PR #191レビュー第3/第4ラウンド§1) — F5c2 never proves this itself. `false` means
-   * every coverage-sensitive comparison in `results` was made conservative and every axis's
-   * boundary values are `"OBSERVED_LOWER_BOUND_ONLY"` (see `coverageSensitiveOutcome` /
-   * `F5cBoundaryReliability`); `true` means the caller claimed the window is safe and observed
-   * values were trusted as complete — a claim, not a fact this report independently establishes.
+   * provenance — F5c2 never proves this itself. `false` means every coverage-sensitive comparison
+   * in `results` was made conservative and each axis's `boundaryReliability` reports what its
+   * boundary values can actually support (`OBSERVED_LOWER_BOUND` or `OBSERVED_DIRECTION_UNKNOWN`);
+   * `true` means the caller *claimed* the window is safe, and each axis is labelled
+   * `COVERAGE_ATTESTED` — an attestation, not a fact this report independently establishes.
+   * See `coverageSensitiveOutcome` / `percentileBoundaryOutcome` / `F5cBoundaryReliability`.
    */
   readonly coverageWindowValidated: boolean;
   readonly cohort: { readonly key: string; readonly subjectCount: number };
@@ -1283,9 +1283,27 @@ function evaluateRowGroup(
     return boundaryValuesFor(allSamples);
   });
 
-  // Circular-hour axes: qualifying rows after sibling filters at the representative boundary,
-  // then a bounded 24-window enumeration decides a representative window (PR #191レビュー§5) —
-  // its outcome genuinely joins the row group's AND combination, not just a diagnostic histogram.
+  /**
+   * PR #191レビュー第7ラウンド§1: 「このfilterには representative boundary が無い」
+   * （そのfilter selectorの観測sampleが母集団全体で1件も無い）の意味は、row group内の
+   * **全ての**実行path（circular / ordinary reduction）で1つでなければならない。
+   * 答えはfail-closed——そのfilterのqualifying集合は**空**であり、「全rowを通す」では
+   * ない。特にANY_FILTERでは致命的で、旧circular pathの`? raw :`は「TC gapが母集団で
+   * 全てnull」というだけでVC閾値を迂回して全rowをunionへ流し込んでいた
+   * （TC filterが存在しないのと同じ扱いになっていた）。両pathがこの1つのclosureを
+   * 使うことで、二度と分岐しない。
+   */
+  const qualifyingFilterSetsFor = (subjectId: string): readonly (readonly RawRow[])[] =>
+    group.filterAxes.map((filterAxis, i) => {
+      const boundary = filterBoundaries[i]!.get(F5C2_REPRESENTATIVE_PERCENTILE);
+      const raw = filterRawBySubject[i]!.get(subjectId) ?? [];
+      return boundary === undefined ? [] : filterRows(raw, filterAxis.operator, boundary);
+    });
+
+  // Circular-hour axes: the row group's sibling SCALAR_SAMPLE filters are applied at their
+  // representative boundary, then each circular intent reduces the surviving rows its own way
+  // (see `evaluateCircularHourAxis`). The result joins the row group's AND combination — it is
+  // not merely a diagnostic.
   if (group.circularAxes.length > 0) {
     const evidenceKnownBySubject = new Map<string, boolean>();
     for (const subject of ctx.subjects) evidenceKnownBySubject.set(subject.subjectUserId, evidenceIsKnown(subject, ctx.probeKey, ctx.plan.requiredJointEvidence.kind));
@@ -1293,13 +1311,8 @@ function evaluateRowGroup(
       const rawBySubject = rowGroupRawRowsFor(ctx, circularAxis);
       const qualifyingBySubject = new Map<string, readonly RawRow[]>();
       for (const subject of ctx.subjects) {
-        const qualifyingFilterSets = group.filterAxes.map((filterAxis, i) => {
-          const boundary = filterBoundaries[i]!.get(F5C2_REPRESENTATIVE_PERCENTILE);
-          const raw = filterRawBySubject[i]!.get(subject.subjectUserId) ?? [];
-          return boundary === undefined ? raw : filterRows(raw, filterAxis.operator, boundary);
-        });
         const own = rawBySubject.get(subject.subjectUserId) ?? [];
-        const indices = qualifyingIndices(qualifyingFilterSets, composition);
+        const indices = qualifyingIndices(qualifyingFilterSetsFor(subject.subjectUserId), composition);
         // NOTE: the row group's structural predicate is deliberately NOT applied here. Each
         // circular intent already encodes its own hour semantic (DAYPART_TARGET counts in-quadrant
         // rows itself; MULTI_DAYPART_BREADTH is about spread ACROSS quadrants and would be
@@ -1346,12 +1359,7 @@ function evaluateRowGroup(
         reducedBySubject.set(subject.subjectUserId, { value: reduceRows(qualifying, own, reductionAxis.reducerKind), hasEvidence });
         continue;
       }
-      const qualifyingFilterSets = group.filterAxes.map((filterAxis, i) => {
-        const boundary = filterBoundaries[i]!.get(F5C2_REPRESENTATIVE_PERCENTILE);
-        const raw = filterRawBySubject[i]!.get(subject.subjectUserId) ?? [];
-        return boundary === undefined ? [] : filterRows(raw, filterAxis.operator, boundary);
-      });
-      const indices = qualifyingIndices(qualifyingFilterSets, composition);
+      const indices = qualifyingIndices(qualifyingFilterSetsFor(subject.subjectUserId), composition);
       // PR #191レビュー第6ラウンド§1: modality composition(ANY/ALL)の結果へ、row groupの
       // 構造述語(target daypart等)をANDする——`own`(denominator)は絞らないので、
       // FILTER_THEN_SHAREは「対象daypartのqualifying row / 全活動row」= prominenceになる。
@@ -1634,7 +1642,7 @@ function executeCandidate(
  * Restricted subject IDs are used transiently in-memory only — the returned report is
  * aggregate-only (counts/rates/boundary values), never subject identities or raw evidence.
  *
- * `coverageWindowValidated` is required, not defaulted (PR #191レビュー第3/第4ラウンド§1).
+ * `coverageWindowValidated` is required, not defaulted.
  * **This is an unverified operator attestation, not a fact F5c2 proves or can prove** — nothing
  * in the safe-source layer exposes a per-window "coverage was complete" signal for F5c2 to check.
  * Passing `true` is a real claim by the caller that `collection.window` starts after every source
@@ -1643,8 +1651,8 @@ function executeCandidate(
  * windows, and other gaps that persist even after rollout) — it is not a default to reach for
  * casually, and F5c2 has no way to reject a `true` that turns out to be wrong. Passing `false` is
  * always safe: it makes every coverage-sensitive comparison conservative (see
- * `coverageSensitiveOutcome`) and marks every axis's `boundaryPoints`/`boundaryValue` as
- * `"OBSERVED_LOWER_BOUND_ONLY"` rather than a trustworthy population statistic.
+ * `coverageSensitiveOutcome` / `percentileBoundaryOutcome`) and labels each axis's boundary values
+ * with what they can actually support (`F5cBoundaryReliability`) instead of `COVERAGE_ATTESTED`.
  */
 export function executeF5cShadowCalibration(
   collection: PlanningCalibrationMeasurementCollection,
