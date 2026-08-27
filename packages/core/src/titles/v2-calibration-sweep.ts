@@ -12,7 +12,7 @@ import {
 } from "./v2-calibration.js";
 
 /** Planning-only contract. Never import from evaluator, pipeline, Bot, or the public v2 barrel. */
-export const F5C_SWEEP_CONTRACT_VERSION = 3 as const;
+export const F5C_SWEEP_CONTRACT_VERSION = 4 as const;
 
 /**
  * PR #190レビュー第3ラウンド§1: 「manifestが将来改訂されても、古いF5c sweep
@@ -38,27 +38,27 @@ function canonicalManifestFingerprint(value: unknown): string {
   return createHash("sha256").update(canonicalize(value), "utf8").digest("hex");
 }
 
-interface F5cManifestPinEconomy {
+export interface F5cManifestPinEconomy {
   readonly kind: "ECONOMY_SEMANTIC_FAMILIES";
   readonly version: number;
   readonly familyKeys: readonly string[];
   readonly fingerprint: string;
 }
-interface F5cManifestPinCasinoEdition {
+export interface F5cManifestPinCasinoEdition {
   readonly kind: "CASINO_EDITION";
   readonly editionKey: string;
   readonly version: number;
   readonly families: readonly { readonly familyKey: string; readonly activityKeys: readonly string[] }[];
   readonly fingerprint: string;
 }
-interface F5cManifestPinCastleEdition {
+export interface F5cManifestPinCastleEdition {
   readonly kind: "CASTLE_EDITION";
   readonly editionKey: string;
   readonly version: number;
   readonly families: readonly { readonly familyKey: string; readonly superDomain: string }[];
   readonly fingerprint: string;
 }
-type F5cManifestPin = F5cManifestPinEconomy | F5cManifestPinCasinoEdition | F5cManifestPinCastleEdition;
+export type F5cManifestPin = F5cManifestPinEconomy | F5cManifestPinCasinoEdition | F5cManifestPinCastleEdition;
 
 function economyFingerprintPayload() {
   return { version: ECONOMY_FEATURE_FAMILY_MANIFEST_VERSION, familyKeys: [...Object.keys(ECONOMY_FEATURE_FAMILY_MANIFEST)].sort() };
@@ -87,7 +87,13 @@ function castleEditionFingerprintPayload() {
  * で独立に再計算し、`liveManifestFingerprint()`（現行constantを読む側）と
  * 一致するかをauditが毎回検証する。
  */
-const F5C1_MANIFEST_PINS: {
+/**
+ * PR #191レビュー第2ラウンド§3: F5c2はこのpinを直接参照する——family/super-domain
+ * cardinality（economy=3、casino edition=8、castle edition=7 family/3 super-domain）を
+ * F5c2側で再度hardcodeしない。F5c1のpinned contractが変わればF5c2も自動的に追従する
+ * （F5c2側は独自のfingerprint再計算をしない——それはこのfileのaudit専用）。
+ */
+export const F5C1_MANIFEST_PINS: {
   readonly ECONOMY_SEMANTIC_FAMILIES: F5cManifestPinEconomy;
   readonly CASINO_EDITION: F5cManifestPinCasinoEdition;
   readonly CASTLE_EDITION: F5cManifestPinCastleEdition;
@@ -706,12 +712,17 @@ const PLAN_INPUTS: readonly PlanInput[] = [
       jointThresholdAxis("tc-area-gap-ceiling", "areas.best-other-gap", "SCALAR_SAMPLE", "tc-area-rows", "AT_MOST"),
     ],
   }),
+  // PR #191レビュー§2: posts.reactor-breadth(SET_BREADTH)はcross-post reactor identityを
+  // safe joint evidenceが持たないため、実際には単一postの最大distinctReactorsしか表現
+  // できない不正確なproxyだった。probeが既に計算しているsubject-level exact metric
+  // `distinctReactors`（cross-post distinct reactor数そのもの）をMETRIC axisとして直接
+  // 使う——joint selectorへ迂回する理由が無い。
   measuredPlan(46, "JOINT_CORRELATION", ["distinctReactors", "postCount", "reactionPositiveDays", "totalPostDayTouches", "perPostDistinctReactorsMedian", "perPostReactionDayCountMedian"], {
-    requiredJointEvidence: joint("tc-reaction-posts-v1", "posts.post-breadth", "posts.day-breadth", "posts.reactor-breadth"),
+    requiredJointEvidence: joint("tc-reaction-posts-v1", "posts.post-breadth", "posts.day-breadth"),
     axes: [
       jointThresholdAxis("reaction-post-breadth", "posts.post-breadth", "SET_BREADTH", "reaction-post-rows"),
       jointThresholdAxis("reaction-day-breadth", "posts.day-breadth", "FILTER_THEN_DISTINCT_DAYS", "reaction-post-rows"),
-      jointThresholdAxis("reaction-person-breadth", "posts.reactor-breadth", "SET_BREADTH", "reaction-post-rows"),
+      metricAxis("reaction-person-breadth", "distinctReactors"),
     ],
   }),
   measuredPlan(47, "JOINT_CORRELATION", ["thirdPartyJoinCount", "thirdPartyJoinDistinctDays", "priorDistinctOtherCountMedian", "thirdPartyNextOtherGapMsMedian", "priorSelfGapMsMedian"], {
@@ -939,7 +950,7 @@ const JOINT_SELECTOR_ALLOWLIST = Object.freeze({
     "areas.surface-local-social-days", "areas.best-other-gap",
     "third-party.prior-distinct-others", "third-party.next-other-gap", "third-party.prior-self-gap", "third-party.day-offset",
   ],
-  "tc-reaction-posts-v1": ["posts.post-breadth", "posts.day-breadth", "posts.reactor-breadth"],
+  "tc-reaction-posts-v1": ["posts.post-breadth", "posts.day-breadth"],
   "cross-modal-days-v1": ["tc-days.gap", "tc-days.day-offset", "vc-days.breadth", "vc-days.day-offset"],
   "domain-social-time-v1": [
     "domainDays.public-room-own-use", "domainDays.castle-family-superdomain",

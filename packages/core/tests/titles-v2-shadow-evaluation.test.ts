@@ -8,13 +8,14 @@ import { BumpCounter } from "../src/rank/bump.js";
 import { RoleFamilyTemporal } from "../src/role-family/temporal.js";
 import { TcSocialObservations } from "../src/tc-social/service.js";
 import { VcPublicSocialPresence } from "../src/vc/public-social-presence.js";
-import { F5C_CANDIDATE_SWEEP_PLANS } from "../src/titles/v2-calibration-sweep.js";
+import { F5C_CANDIDATE_SWEEP_PLANS, F5C_SWEEP_CONTRACT_VERSION, F5C1_MANIFEST_PINS, type F5cCandidateSweepPlan } from "../src/titles/v2-calibration-sweep.js";
 import { CALIBRATION_SCHEMA_VERSION, CALIBRATION_PERCENTILE_METHOD, canonicalReadinessHash } from "../src/titles/v2-calibration.js";
 import { TITLE_V2_CATALOG_READINESS } from "../src/titles/v2-catalog-readiness.js";
 import { canonicalCatalogHash, TITLE_V2_CATALOG_CANDIDATES } from "../src/titles/v2-catalog-candidates.js";
 import {
   executeF5cShadowCalibration,
   runF5cShadowCalibration,
+  auditF5c2SelectorSupport,
   F5C2_BOUNDARY_PERCENTILES,
   type F5cShadowCalibrationReport,
 } from "../src/titles/v2-shadow-evaluation.js";
@@ -63,6 +64,11 @@ function subject(
 
 function byNo(report: F5cShadowCalibrationReport, no: number) {
   return report.results.find((r) => r.candidateNo === no)!;
+}
+
+/** Reads the real F5c1-assigned probeKey for a candidate rather than hardcoding a guessed string. */
+function probeKeyFor(no: number): string {
+  return F5C_CANDIDATE_SWEEP_PLANS.find((p) => p.candidateNo === no)!.probeKey;
 }
 
 describe("F5c2 shadow-calibration executor", () => {
@@ -172,31 +178,106 @@ describe("F5c2 shadow-calibration executor", () => {
     expect(boundary.hourHistogram![3]).toBe(2);
     expect(boundary.hourHistogram![20]).toBe(1);
     expect(boundary.boundaryPoints).toEqual([]); // no operator/boundary is ever selected for this axis
+    // PR #191レビュー§5: the histogram is diagnostic, but the axis must also participate — a
+    // bounded 24-point window enumeration is always reported, one point per candidate start hour.
+    expect(boundary.circularWindowPoints).not.toBeNull();
+    expect(boundary.circularWindowPoints).toHaveLength(24);
+    expect(boundary.circularWindowPoints!.map((p) => p.windowStartHour)).toEqual([...Array(24).keys()]);
+    for (const point of boundary.circularWindowPoints!) expect(point.windowLengthHours).toBe(8);
+    // hour 3 has the only subject's rows -> every window covering hour 3 has qualifyingCount 1.
+    const windowCoveringHour3 = boundary.circularWindowPoints!.find((p) => p.windowStartHour === 0)!;
+    expect(windowCoveringHour3.qualifyingCount).toBe(1);
+  });
+
+  it("circular window enumeration actually changes the shadow MATCHED/NOT_MATCHED outcome (No.36)", () => {
+    // 2 subjects clustered at hour 2 (majority) and 1 subject isolated at hour 14 (12 hours away
+    // circularly, outside any 8-hour window that also covers hour 2) — the population-optimal
+    // window must land on the majority cluster, leaving the isolated subject NOT_MATCHED on the
+    // circular criterion specifically because of which window was chosen (PR #191レビュー§5/§10).
+    const probeKey = probeKeyFor(36);
+    const clustered = (id: string, hour: number) => subject(id, [{
+      probeKey,
+      metrics: { vcTop3HoursShare: 1, vcTotalTrustedSeconds: 1000 },
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: [{ dayOffset: 1, hour, tcBestOtherGapMs: null, vcTrustedSocialSeconds: 100 }],
+      },
+    }]);
+    const report = executeF5cShadowCalibration(collection([
+      clustered("majorityA", 2), clustered("majorityB", 2), clustered("minority", 14),
+    ]));
+    const plan36 = byNo(report, 36);
+    const boundarySweep = plan36.axisSweeps.find((s) => s.axisKey === "usual-time-start-hour-stability")!;
+    const bestWindow = [...boundarySweep.circularWindowPoints!].sort((a, b) => b.qualifyingCount - a.qualifyingCount)[0]!;
+    expect(bestWindow.qualifyingCount).toBe(2); // the two hour-2 subjects, not the isolated one
+    expect(plan36.matchedCount).toBe(2);
+    expect(plan36.notMatchedCount).toBe(1);
+    expect(plan36.unknownCount).toBe(0);
   });
 
   it("G. POST_FILTER_MATCHING_SIZE recomputes matching after the edge filter — it does not reuse the pre-filter structural max", () => {
-    // 3 counterparts, each touching 2 distinct semantic classes -> unfiltered max matching = 3.
-    // Two of the six edges have very low trusted seconds; a stricter edge-seconds boundary must
-    // shrink the recomputed matching below the unfiltered maximum.
+    // Edges: c0-s0(100), c0-s1(90), c1-s1(80), c1-s2(20), c2-s2(10) -> unfiltered max matching = 3
+    // (c0-s0, c1-s1, c2-s2 or equivalent). At the representative (p50) edge-seconds boundary (80),
+    // only the 3 edges with seconds>=80 remain (c0-s0, c0-s1, c1-s1) whose max matching is 2
+    // (c0 and c1 both need s1) — strictly below the unfiltered 3, proving genuine post-filter
+    // recomputation rather than a reused pre-filter structural value.
     const evidence: PlanningCalibrationJointEvidence = {
       kind: "social-context-graph-v1",
       dimension: "class",
       counterparts: [
-        { counterpartOrdinal: 0, touches: [{ semanticIndex: 0, days: [{ dayOffset: 1, trustedSeconds: 10_000 }] }, { semanticIndex: 1, days: [{ dayOffset: 1, trustedSeconds: 1 }] }] },
-        { counterpartOrdinal: 1, touches: [{ semanticIndex: 1, days: [{ dayOffset: 1, trustedSeconds: 10_000 }] }, { semanticIndex: 2, days: [{ dayOffset: 1, trustedSeconds: 1 }] }] },
-        { counterpartOrdinal: 2, touches: [{ semanticIndex: 2, days: [{ dayOffset: 1, trustedSeconds: 10_000 }] }] },
+        { counterpartOrdinal: 0, touches: [{ semanticIndex: 0, days: [{ dayOffset: 1, trustedSeconds: 100 }] }, { semanticIndex: 1, days: [{ dayOffset: 1, trustedSeconds: 90 }] }] },
+        { counterpartOrdinal: 1, touches: [{ semanticIndex: 1, days: [{ dayOffset: 1, trustedSeconds: 80 }] }, { semanticIndex: 2, days: [{ dayOffset: 1, trustedSeconds: 20 }] }] },
+        { counterpartOrdinal: 2, touches: [{ semanticIndex: 2, days: [{ dayOffset: 1, trustedSeconds: 10 }] }] },
       ],
     };
     const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "social-class-context-v1", jointEvidence: evidence }])]));
     const plan26 = byNo(report, 26);
     const matchingSweep = plan26.axisSweeps.find((s) => s.axisKey === "class-person-matching")!;
     expect(matchingSweep.reducerKind).toBe("POST_FILTER_MATCHING_SIZE");
-    const atLowestPercentile = matchingSweep.boundaryPoints.find((p) => p.percentile === 10)!;
-    const atHighestPercentile = matchingSweep.boundaryPoints.find((p) => p.percentile === 90)!;
-    // stricter edge threshold (higher percentile) must never produce a LARGER recomputed
-    // matching size than a looser one — proving it is actually recomputed per boundary, not a
-    // single reused precomputed value.
-    expect(atHighestPercentile.boundaryValue).toBeLessThanOrEqual(atLowestPercentile.boundaryValue);
+    // PR #191レビュー§7: boundaryPoints now sweeps the matching-size distribution itself (edge
+    // filter held fixed at its own representative boundary) — a single, unambiguous dimension.
+    // Percentile is non-decreasing over one subject's fixed matching-size value, so all points
+    // share the same boundaryValue here; the edge filter's own sensitivity is reported separately
+    // on the sibling SCALAR_SAMPLE axis below.
+    for (const point of matchingSweep.boundaryPoints) expect(point.boundaryValue).toBe(2);
+    const edgeFilterSweep = plan26.axisSweeps.find((s) => s.axisKey === "class-edge-trusted-seconds")!;
+    expect(edgeFilterSweep).toBeDefined();
+    const edgeLowest = edgeFilterSweep.boundaryPoints.find((p) => p.percentile === 10)!;
+    const edgeHighest = edgeFilterSweep.boundaryPoints.find((p) => p.percentile === 90)!;
+    expect(edgeHighest.boundaryValue).toBeGreaterThanOrEqual(edgeLowest.boundaryValue);
+  });
+
+  it("No.26 representative matching outcome uses the population's real matching-size boundary, not a hardcoded >=1 (PR #191レビュー§7)", () => {
+    // alice & carol: same rich graph as test G -> matching size 2 at the shared representative
+    // edge boundary (50). bob: a single edge just barely clearing that same edge boundary ->
+    // matching size exactly 1. Population matching-size samples [2,1,2] -> representative (p50)
+    // boundary = 2. Under the old hardcoded `size >= 1` gate, bob would incorrectly MATCH; the
+    // real boundary correctly fails him.
+    const richGraph = (): PlanningCalibrationJointEvidence => ({
+      kind: "social-context-graph-v1",
+      dimension: "class",
+      counterparts: [
+        { counterpartOrdinal: 0, touches: [{ semanticIndex: 0, days: [{ dayOffset: 1, trustedSeconds: 100 }] }, { semanticIndex: 1, days: [{ dayOffset: 1, trustedSeconds: 90 }] }] },
+        { counterpartOrdinal: 1, touches: [{ semanticIndex: 1, days: [{ dayOffset: 1, trustedSeconds: 80 }] }, { semanticIndex: 2, days: [{ dayOffset: 1, trustedSeconds: 20 }] }] },
+        { counterpartOrdinal: 2, touches: [{ semanticIndex: 2, days: [{ dayOffset: 1, trustedSeconds: 10 }] }] },
+      ],
+    });
+    const sparseGraph: PlanningCalibrationJointEvidence = {
+      kind: "social-context-graph-v1",
+      dimension: "class",
+      counterparts: [
+        { counterpartOrdinal: 0, touches: [{ semanticIndex: 0, days: [{ dayOffset: 1, trustedSeconds: 50 }] }, { semanticIndex: 1, days: [{ dayOffset: 1, trustedSeconds: 3 }] }] },
+      ],
+    };
+    const report = executeF5cShadowCalibration(collection([
+      subject("alice", [{ probeKey: "social-class-context-v1", jointEvidence: richGraph() }]),
+      subject("bob", [{ probeKey: "social-class-context-v1", jointEvidence: sparseGraph }]),
+      subject("carol", [{ probeKey: "social-class-context-v1", jointEvidence: richGraph() }]),
+    ]));
+    const plan26 = byNo(report, 26);
+    expect(plan26.matchedCount).toBe(2); // alice, carol
+    expect(plan26.notMatchedCount).toBe(1); // bob
+    expect(plan26.unknownCount).toBe(0);
   });
 
   it("H. No.56 own-room-use-days (distinct-days) and own-room-use-span differ on a real fixture, and hosted/guest-style rows outside the selector cannot leak into either", () => {
@@ -247,6 +328,128 @@ describe("F5c2 shadow-calibration executor", () => {
     expect(plan49.axisSweeps.some((s) => s.axisKey.includes("union") || s.axisKey.includes("modality-day-breadth"))).toBe(false);
   });
 
+  it("I2. No.49 TC=0 observed qualifying days is a definite NOT_MATCHED, not UNKNOWN, even with VC's many days present (PR #191レビュー§1 counterexample)", () => {
+    const probeKey = probeKeyFor(49);
+    // alice: TC=0 (observed empty, real zero) but VC=4 days (plenty). bob/carol supply nonzero TC
+    // so the population's representative TC boundary sits above zero — alice must fail it for
+    // real, not be swept into UNKNOWN because her own row set happened to be empty.
+    const alice = subject("alice", [{
+      probeKey,
+      jointEvidence: { kind: "cross-modal-days-v1", tcDays: [], vcDays: [
+        { dayOffset: 1, distinctCoPresentUsers: 5 }, { dayOffset: 2, distinctCoPresentUsers: 5 },
+        { dayOffset: 3, distinctCoPresentUsers: 5 }, { dayOffset: 4, distinctCoPresentUsers: 5 },
+      ] },
+    }]);
+    const bob = subject("bob", [{
+      probeKey,
+      jointEvidence: { kind: "cross-modal-days-v1", tcDays: [
+        { dayOffset: 1, bestOtherGapMs: 100 }, { dayOffset: 2, bestOtherGapMs: 100 },
+      ], vcDays: [{ dayOffset: 1, distinctCoPresentUsers: 5 }] },
+    }]);
+    const carol = subject("carol", [{
+      probeKey,
+      jointEvidence: { kind: "cross-modal-days-v1", tcDays: [
+        { dayOffset: 1, bestOtherGapMs: 100 }, { dayOffset: 2, bestOtherGapMs: 100 }, { dayOffset: 3, bestOtherGapMs: 100 },
+      ], vcDays: [{ dayOffset: 1, distinctCoPresentUsers: 5 }] },
+    }]);
+    const report = executeF5cShadowCalibration(collection([alice, bob, carol]));
+    const plan49 = byNo(report, 49);
+    expect(plan49.unknownCount).toBe(0);
+    expect(plan49.notMatchedCount).toBe(1); // alice: TC=0 fails the population's TC boundary for real
+    expect(plan49.matchedCount).toBe(2); // bob, carol
+  });
+
+  it("I3. observed empty joint rows (NOT_MATCHED) vs unavailable measurement (UNKNOWN) are distinct states (No.78 JOINT_STRUCTURAL_FACT)", () => {
+    const probeKey = probeKeyFor(78);
+    // subjectA: pack present, probe ran, kind matches — but genuinely found zero qualifying
+    // next-generation occurrences. This is knowledge, not UNKNOWN: NOT_MATCHED.
+    const observedEmpty = subject("subjectA", [{
+      probeKey,
+      jointEvidence: {
+        kind: "invite-rooted-v1",
+        profiles: [{ profileOrdinal: 0, activityDays: [], nextGenerationOccurrences: [], unknownNextGenerationEntryAnchorCount: 0, reunionDays: [] }],
+        unknownEntryAnchorCount: 0,
+      },
+    }]);
+    // subjectB: never measured by this probe at all (no pack for probeKey) — genuinely UNKNOWN.
+    const neverMeasured = subject("subjectB", []);
+    const report = executeF5cShadowCalibration(collection([observedEmpty, neverMeasured]));
+    const plan78 = byNo(report, 78);
+    expect(plan78.notMatchedCount).toBe(1); // subjectA: observed, empty, real zero
+    expect(plan78.unknownCount).toBe(1); // subjectB: never measured
+    expect(plan78.matchedCount).toBe(0);
+  });
+
+  it("three-valued AND: FALSE dominates UNKNOWN (No.61 fixedCriteria conjunction)", () => {
+    const probeKey = probeKeyFor(61);
+    // hasNaturalOutflow=0 is a definite NOT_MATCHED; the axis metrics (distinctFamilies etc.) are
+    // entirely absent (UNKNOWN) — the combined outcome must be NOT_MATCHED, not UNKNOWN.
+    const s = subject("alice", [{ probeKey, metrics: { hasNaturalInflow: 1, hasNaturalOutflow: 0 } }]);
+    const report = executeF5cShadowCalibration(collection([s]));
+    const plan61 = byNo(report, 61);
+    expect(plan61.notMatchedCount).toBe(1);
+    expect(plan61.unknownCount).toBe(0);
+  });
+
+  it("three-valued AND: no FALSE present but an UNKNOWN input keeps the whole candidate UNKNOWN, never silently MATCHED (No.61)", () => {
+    const probeKey = probeKeyFor(61);
+    const s = subject("alice", [{ probeKey, metrics: { hasNaturalInflow: 1, hasNaturalOutflow: 1 } }]);
+    const report = executeF5cShadowCalibration(collection([s]));
+    const plan61 = byNo(report, 61);
+    expect(plan61.unknownCount).toBe(1);
+    expect(plan61.matchedCount).toBe(0);
+    expect(plan61.notMatchedCount).toBe(0);
+  });
+
+  it("three-valued OR (ANY_METRIC_POSITIVE): FALSE OR UNKNOWN => UNKNOWN, never a false NOT_MATCHED (No.83, PR #191レビュー§1 counterexample)", () => {
+    const probeKey = probeKeyFor(83);
+    // participantOnlyCount=1 -> MATCHED on the first fixedCriteria. staffCount=0 (definite false)
+    // and organizerCount entirely absent (UNKNOWN) on the ANY_METRIC_POSITIVE criterion — the old
+    // buggy `values.some(v => v>0)` read this as NOT_MATCHED; the correct 3-valued OR is UNKNOWN.
+    const s = subject("alice", [{ probeKey, metrics: { participantOnlyCount: 1, staffCount: 0 } }]);
+    const report = executeF5cShadowCalibration(collection([s]));
+    const plan83 = byNo(report, 83);
+    expect(plan83.unknownCount).toBe(1);
+    expect(plan83.notMatchedCount).toBe(0);
+    expect(plan83.matchedCount).toBe(0);
+  });
+
+  it("unknown joint selector fails closed via the static selector-support audit — READY-76 itself has zero gaps", () => {
+    expect(auditF5c2SelectorSupport()).toEqual([]);
+    const bogusPlan = {
+      candidateNo: 999999,
+      probeKey: probeKeyFor(32),
+      requiredJointEvidence: { kind: "activity-time-day-hour-v1", selectors: ["rows.nonexistent-selector"] },
+      axes: [{
+        axisKey: "bogus-axis", source: "JOINT_EVIDENCE", selector: "rows.nonexistent-selector",
+        rowGroupKey: "bogus-rows", operator: "AT_LEAST", boundaryMethod: "OBSERVED_NEAREST_RANK", reducerKind: "SCALAR_SAMPLE",
+      }],
+      fixedCriteria: [],
+      manifestRef: null,
+      manifestCriteria: [],
+      rowGroupCompositions: [],
+      structuralRequirements: [],
+    } as unknown as F5cCandidateSweepPlan; // minimal synthetic plan; only the audited fields matter
+    const gaps = auditF5c2SelectorSupport([bogusPlan]);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]!.candidateNo).toBe(999999);
+    expect(gaps[0]!.reason).toContain("rows.nonexistent-selector");
+  });
+
+  it("F5c1 contract-version and manifest pin drift cannot be hidden by F5c2 literals", () => {
+    const report = executeF5cShadowCalibration(collection([]));
+    // Read from the SAME F5c1 export F5c2 itself consumes — if F5c2 regressed to a hardcoded
+    // literal, this would still pass today but silently drift the next time F5c1 bumps its
+    // contract version, which is exactly the failure mode PR #191レビュー§3 forbids.
+    expect(report.sweepContractVersion).toBe(F5C_SWEEP_CONTRACT_VERSION);
+    const partial = subject("alice", [{ probeKey: "casino-edition-completion-v1", metrics: { distinctCompletedFamilies: F5C1_MANIFEST_PINS.CASINO_EDITION.families.length - 1, allFamiliesCompleted: 0, totalFamilyCompletionDays: 1 } }]);
+    const all = subject("bob", [{ probeKey: "casino-edition-completion-v1", metrics: { distinctCompletedFamilies: F5C1_MANIFEST_PINS.CASINO_EDITION.families.length, allFamiliesCompleted: 1, totalFamilyCompletionDays: 1 } }]);
+    const report69 = executeF5cShadowCalibration(collection([partial, all]));
+    const plan69 = byNo(report69, 69);
+    expect(plan69.matchedCount).toBe(1);
+    expect(plan69.notMatchedCount).toBe(1);
+  });
+
   it("J. manifest ALL_MANIFEST_MEMBERS (No.69) requires the pinned family cardinality, not just >0", () => {
     const partial = subject("alice", [{ probeKey: "casino-edition-completion-v1", metrics: { distinctCompletedFamilies: 3, allFamiliesCompleted: 0, totalFamilyCompletionDays: 3 } }]);
     const all = subject("bob", [{ probeKey: "casino-edition-completion-v1", metrics: { distinctCompletedFamilies: 8, allFamiliesCompleted: 1, totalFamilyCompletionDays: 8 } }]);
@@ -258,15 +461,20 @@ describe("F5c2 shadow-calibration executor", () => {
     expect(plan69.knownCount).toBe(2);
   });
 
-  it("K. MANIFEST_CARDINALITY_SWEEP (No.88 'almost all') never selects a production number — it only sweeps the observed distribution", () => {
+  it("K. MANIFEST_CARDINALITY_SWEEP (No.88 'almost all') gates on the observed-population representative boundary, not a hardcoded production number", () => {
+    // samples=[3,5,6,7]; p50 nearest-rank boundary = 5 -> subjects with breadth>=5 (5,6,7) MATCHED,
+    // breadth=3 NOT_MATCHED (PR #191レビュー§6: this dimension must actually affect prevalence).
     const subjects = [3, 5, 6, 7].map((n, i) => subject(`s${i}`, [{ probeKey: "castle-social-time-v1", metrics: { domainSemanticBreadth: n, domainDayTouches: n, domainActiveDays: n, domainActiveSpanDays: n } }]));
     const report = executeF5cShadowCalibration(collection(subjects));
     const plan88 = byNo(report, 88);
     const sweep = plan88.axisSweeps.find((s) => s.axisKey === "manifest:domainSemanticBreadth")!;
     expect(sweep).toBeDefined();
     expect(sweep.boundaryPoints.map((p) => p.percentile)).toEqual([...F5C2_BOUNDARY_PERCENTILES]);
-    // MANIFEST_CARDINALITY_SWEEP never gates MATCHED/NOT_MATCHED on its own (no value selected).
-    expect(plan88.knownCount + plan88.unknownCount).toBe(subjects.length);
+    expect(sweep.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue).toBe(5);
+    expect(plan88.matchedCount).toBe(3);
+    expect(plan88.notMatchedCount).toBe(1);
+    expect(plan88.unknownCount).toBe(0);
+    expect(plan88.prevalence).toBe(0.75);
   });
 
   it("L. no restricted subject identity or raw evidence appears in the serialized report", () => {

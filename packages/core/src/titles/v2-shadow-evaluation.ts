@@ -1,10 +1,13 @@
 import type Database from "better-sqlite3";
 import {
+  F5C1_MANIFEST_PINS,
   F5C_CANDIDATE_SWEEP_PLANS,
+  F5C_SWEEP_CONTRACT_VERSION,
   type F5cCandidateSweepPlan,
   type F5cEvaluationShape,
   type F5cFixedCriterion,
   type F5cManifestCriterion,
+  type F5cManifestRef,
   type F5cRowGroupCompositionMode,
   type F5cSweepAxis,
 } from "./v2-calibration-sweep.js";
@@ -34,10 +37,16 @@ import type { CandidateReadinessAudit } from "./v2-catalog-readiness.js";
  * (`CALIBRATION_PERCENTILE_METHOD`). No subject identity or raw restricted evidence is ever
  * included in the returned report — only aggregate counts/rates.
  */
-export const F5C2_SHADOW_CONTRACT_VERSION = 1 as const;
+export const F5C2_SHADOW_CONTRACT_VERSION = 2 as const;
 
-/** Finite, bounded, reproducible, auditable — not a production threshold grid. */
-export const F5C2_BOUNDARY_PERCENTILES = [10, 25, 50, 75, 90] as const;
+/**
+ * Finite, bounded, reproducible, auditable — not a production threshold grid. Extended with
+ * p95/p99 (PR #191 review §8) so a coarse calibration pass does not discard tail information
+ * that a rare/aspirational candidate needs — refining the search further (adaptive sampling
+ * near a chosen boundary) is left to a later calibration-refinement phase once product intent
+ * narrows which candidates matter.
+ */
+export const F5C2_BOUNDARY_PERCENTILES = [10, 25, 50, 75, 90, 95, 99] as const;
 export type F5cBoundaryPercentile = (typeof F5C2_BOUNDARY_PERCENTILES)[number];
 /** The single illustrative combination used for the plan-level MATCHED/NOT_MATCHED call. */
 const F5C2_REPRESENTATIVE_PERCENTILE: F5cBoundaryPercentile = 50;
@@ -46,15 +55,34 @@ const F5C2_REPRESENTATIVE_PERCENTILE: F5cBoundaryPercentile = 50;
  * UNKNOWN is never collapsed into false/zero. A criterion/axis is UNKNOWN for a subject when
  * the underlying metric is `null` (this codebase's existing convention for "structurally not
  * computable for this subject", e.g. no positive days exist so a day-offset stat is undefined)
- * or when a joint-evidence row group has zero raw rows for that subject (no evidence to
- * evaluate at all, as opposed to evidence that was evaluated and did not qualify).
+ * or when the subject was never measured by the owning probe at all (no pack, or a joint
+ * evidence pack whose `kind` does not match what the plan actually requires). An *observed*
+ * empty row set — the probe ran, the evidence kind matches, and it legitimately found zero
+ * qualifying rows — is knowledge, not UNKNOWN: it reduces to a real zero and is compared
+ * against the boundary like any other value (PR #191 review §1: "No.49 TC=0 qualifying days,
+ * VC=many is a definite NOT_MATCHED on the TC requirement, not automatically UNKNOWN").
  */
 export type F5cShadowOutcome = "MATCHED" | "NOT_MATCHED" | "UNKNOWN";
 
+/**
+ * Three-valued AND (Kleene logic): any NOT_MATCHED dominates (the conjunction can never be
+ * satisfied regardless of what the unknowns turn out to be); only once no input is definitely
+ * false does an UNKNOWN block a definite MATCHED; only when every input is definitely true is
+ * the conjunction MATCHED.
+ */
 function combineOutcomes(outcomes: readonly F5cShadowOutcome[]): F5cShadowOutcome {
   if (outcomes.length === 0) return "UNKNOWN";
+  if (outcomes.some((o) => o === "NOT_MATCHED")) return "NOT_MATCHED";
   if (outcomes.some((o) => o === "UNKNOWN")) return "UNKNOWN";
-  return outcomes.every((o) => o === "MATCHED") ? "MATCHED" : "NOT_MATCHED";
+  return "MATCHED";
+}
+
+/** Three-valued OR (Kleene logic) — the ANY_METRIC_POSITIVE case: any MATCHED dominates. */
+function combineOutcomesOr(outcomes: readonly F5cShadowOutcome[]): F5cShadowOutcome {
+  if (outcomes.length === 0) return "UNKNOWN";
+  if (outcomes.some((o) => o === "MATCHED")) return "MATCHED";
+  if (outcomes.some((o) => o === "UNKNOWN")) return "UNKNOWN";
+  return "NOT_MATCHED";
 }
 
 export interface F5cBoundarySweepPoint {
@@ -65,6 +93,22 @@ export interface F5cBoundarySweepPoint {
   readonly passRate: number | null;
 }
 
+/**
+ * PR #191レビュー§5: CIRCULAR_HOUR_WINDOWは24 JST hour binの循環軸で、単一の
+ * AT_LEAST/AT_MOST境界では表現できない——F5c2は`CIRCULAR_WINDOW_LENGTH_HOURS`幅の
+ * candidate windowを開始hour 0-23で有限に列挙し、各windowについて母集団の
+ * qualifying件数を報告する。どのwindowも「本番の選択」ではない——単に観測分布が
+ * どこに集中しているかを示す診断点であり、実際にshadow評価のMATCHED/NOT_MATCHED
+ * 合成にも寄与する（`evaluateCircularHourAxis`のrepresentative window選択を参照）。
+ */
+export interface F5cCircularWindowPoint {
+  readonly windowStartHour: number;
+  readonly windowLengthHours: number;
+  readonly knownCount: number;
+  readonly qualifyingCount: number;
+  readonly qualifyingRate: number | null;
+}
+
 export interface F5cAxisSweepResult {
   readonly axisKey: string;
   readonly reducerKind: F5cSweepAxis["reducerKind"];
@@ -73,6 +117,8 @@ export interface F5cAxisSweepResult {
   readonly boundaryPoints: readonly F5cBoundarySweepPoint[];
   /** Only for CIRCULAR_HOUR_WINDOW axes: qualifying-row count per JST hour bin (0-23), no window chosen. */
   readonly hourHistogram: readonly number[] | null;
+  /** Only for CIRCULAR_HOUR_WINDOW axes: the bounded window-start enumeration (see doc above). */
+  readonly circularWindowPoints: readonly F5cCircularWindowPoint[] | null;
 }
 
 export type F5cExecutionStrategy =
@@ -171,13 +217,79 @@ function row(partial: Partial<RawRow>): RawRow {
 }
 
 /**
+ * PR #191レビュー§4: `resolveJointRows()`は「認識しているselectorでrowが0件」と
+ * 「認識していないselector」を区別しなければならない——どちらも`[]`を返すと、
+ * unsupportedな契約変更（F5c1側でselector名が変わった等）を静かに「0件のevidence」
+ * として飲み込んでしまう。ここに列挙した(kind, selector)の組だけが「認識している」
+ * ——`resolveJointRows()`の各switch caseと1:1で保守する。
+ */
+const SUPPORTED_JOINT_SELECTORS: ReadonlySet<string> = new Set([
+  "activity-time-day-hour-v1::rows.tc-gap",
+  "activity-time-day-hour-v1::rows.vc-seconds",
+  "activity-time-day-hour-v1::rows.day-hour-social-evidence",
+  "activity-time-day-hour-v1::rows.daypart-share",
+  "activity-time-day-hour-v1::rows.daypart-boundary",
+  "activity-time-day-hour-v1::rows.activity-start-hour",
+  "day-occurrences-v1::dayOffsets.calendar-periods",
+  "social-context-graph-v1::counterparts.semantic-touch-days-seconds",
+  "social-context-graph-v1::counterparts.maximum-matching",
+  "tc-conversation-v1::starts.quiet-before",
+  "tc-conversation-v1::starts.next-other-gap",
+  "tc-conversation-v1::starts.day-offset",
+  "tc-conversation-v1::revivals.dormant-before",
+  "tc-conversation-v1::revivals.continuation-gap",
+  "tc-conversation-v1::revivals.conversation-group",
+  "tc-conversation-v1::revivals.day-offset",
+  "tc-conversation-v1::areas.surface-local-social-days",
+  "tc-conversation-v1::areas.best-other-gap",
+  "tc-conversation-v1::third-party.prior-distinct-others",
+  "tc-conversation-v1::third-party.next-other-gap",
+  "tc-conversation-v1::third-party.day-offset",
+  "tc-reaction-posts-v1::posts.post-breadth",
+  "tc-reaction-posts-v1::posts.day-breadth",
+  "cross-modal-days-v1::tc-days.gap",
+  "cross-modal-days-v1::tc-days.day-offset",
+  "cross-modal-days-v1::vc-days.breadth",
+  "cross-modal-days-v1::vc-days.day-offset",
+  "domain-social-time-v1::domainDays.public-room-own-use",
+  "invite-rooted-v1::profiles.branch-activity-days",
+  "invite-rooted-v1::profiles.branch-social-evidence",
+  "invite-rooted-v1::profiles.next-generation-same-day-gap",
+  "invite-rooted-v1::profiles.next-generation-same-day-seconds",
+  "invite-rooted-v1::profiles.next-generation-occurrence",
+  "invite-rooted-v1::profiles.root-before-child",
+  "invite-rooted-v1::profiles.same-day-before-entry",
+  "invite-rooted-v1::profiles.independent-rooted-branches",
+  "invite-rooted-v1::profiles.reunion-days",
+  "invite-rooted-v1::profiles.reunion-pair-social-evidence",
+  "castle-role-context-v1::families.role-held-days",
+  "castle-role-context-v1::families.inside-days",
+  "castle-role-context-v1::families.outside-days",
+  "castle-role-context-v1::families.outside-repeat-days",
+]);
+
+function isSupportedJointSelector(kind: string, selector: string): boolean {
+  return SUPPORTED_JOINT_SELECTORS.has(`${kind}::${selector}`);
+}
+
+/** Thrown by `resolveJointRows()` for a (kind, selector) pair outside `SUPPORTED_JOINT_SELECTORS`. */
+class UnsupportedSelectorError extends Error {
+  constructor(kind: string, selector: string) {
+    super(`unsupported joint selector for F5c2 execution: ${kind}::${selector}`);
+    this.name = "UnsupportedSelectorError";
+  }
+}
+
+/**
  * Maps (jointEvidenceKind, selector) to the subject's raw row set for that selector, entirely
  * unfiltered. This is the ONLY place F5c2 interprets what an F5c1 selector string means
  * structurally — every mapping here corresponds 1:1 to how `v2-calibration-sweep.ts` actually
- * authored that selector's axis (row group, reducer kind, operator). Selectors not reachable
- * by any READY-76 axis/fixedCriteria are intentionally absent.
+ * authored that selector's axis (row group, reducer kind, operator). An unrecognized selector
+ * throws `UnsupportedSelectorError` rather than silently returning `[]` — a recognized selector
+ * legitimately observing zero rows is a completely different state (see `SUPPORTED_JOINT_SELECTORS`).
  */
 function resolveJointRows(evidence: PlanningCalibrationJointEvidence, selector: string): readonly RawRow[] {
+  if (!isSupportedJointSelector(evidence.kind, selector)) throw new UnsupportedSelectorError(evidence.kind, selector);
   switch (evidence.kind) {
     case "activity-time-day-hour-v1":
       switch (selector) {
@@ -264,12 +376,6 @@ function resolveJointRows(evidence: PlanningCalibrationJointEvidence, selector: 
           return evidence.posts.map((p) => row({ memberKey: `post:${p.postOrdinal}` }));
         case "posts.day-breadth":
           return evidence.posts.flatMap((p) => p.reactionDayOffsets.map((offset) => row({ dayOffset: offset, memberKey: `post:${p.postOrdinal}` })));
-        case "posts.reactor-breadth":
-          // Cross-post reactor identity is not present in the safe joint evidence (only a
-          // per-post count) — a genuine data-model limit, not an F5c2 shortcut. We treat each
-          // post's distinctReactors as a group's member count and report the single largest
-          // post as a defensible lower-bound breadth indicator (see docs §14.10).
-          return evidence.posts.map((p) => row({ groupKey: `post:${p.postOrdinal}`, sampleValue: p.distinctReactors }));
         default:
           return [];
       }
@@ -363,6 +469,19 @@ function metricForProbe(subject: PlanningCalibrationSubjectMeasurement, probeKey
   return pack.metrics[metricKey];
 }
 
+/**
+ * PR #191レビュー§1: 「evidenceが既知」と「行が0件」は別の状態——subjectのpackが
+ * 存在し、そのjointEvidence.kindがplanの要求するkindと一致していれば、そのsubject
+ * は実際に観測されている。行が0件でもそれは観測されたゼロであり、UNKNOWNではない。
+ * `requiredKind === "none"`（joint evidenceを要求しないplan）はここでは常にfalse
+ * ——呼び出し側はJOINT_STRUCTURAL_FACT/JOINT_EVIDENCE軸を持つplanでのみ呼ぶ。
+ */
+function evidenceIsKnown(subject: PlanningCalibrationSubjectMeasurement, probeKey: string, requiredKind: PlanningCalibrationJointEvidence["kind"]): boolean {
+  if (requiredKind === "none") return false;
+  const evidence = packForProbe(subject, probeKey);
+  return evidence !== null && evidence.kind === requiredKind;
+}
+
 // ─────────────────────────────────────────────────────────────
 // fixed / manifest criteria evaluation (deterministic, no boundary grid)
 // ─────────────────────────────────────────────────────────────
@@ -371,7 +490,7 @@ function evaluateFixedCriterion(
   criterion: F5cFixedCriterion,
   subject: PlanningCalibrationSubjectMeasurement,
   probeKey: string,
-  jointRowsFor: (selector: string) => readonly RawRow[],
+  requiredJointEvidenceKind: PlanningCalibrationJointEvidence["kind"],
 ): F5cShadowOutcome {
   if (criterion.kind === "METRIC_COMPARE") {
     const value = metricForProbe(subject, probeKey, criterion.metricKey);
@@ -387,19 +506,22 @@ function evaluateFixedCriterion(
     return value !== 0 ? "MATCHED" : "NOT_MATCHED";
   }
   if (criterion.kind === "ANY_METRIC_POSITIVE") {
-    const values = criterion.metricKeys.map((key) => metricForProbe(subject, probeKey, key));
-    if (values.every((v) => v === undefined || v === null)) return "UNKNOWN";
-    return values.some((v) => v !== undefined && v !== null && v > 0) ? "MATCHED" : "NOT_MATCHED";
+    // PR #191レビュー§1: 真の3値OR——1つでもpositiveならMATCHED、positiveが無くても
+    // 1つでもUNKNOWNならUNKNOWN（全部null/undefinedの場合だけでなく）、それ以外はNOT_MATCHED。
+    const perMetric: F5cShadowOutcome[] = criterion.metricKeys.map((key) => {
+      const value = metricForProbe(subject, probeKey, key);
+      if (value === undefined || value === null) return "UNKNOWN";
+      return value > 0 ? "MATCHED" : "NOT_MATCHED";
+    });
+    return combineOutcomesOr(perMetric);
   }
-  // JOINT_STRUCTURAL_FACT: presence of at least one row for this selector IS the fact.
-  const rows = jointRowsFor(criterion.selector);
+  // JOINT_STRUCTURAL_FACT: presence of at least one row for this selector IS the fact — but only
+  // once evidence is confirmed known; an unmeasured subject is UNKNOWN, never a false NOT_MATCHED
+  // (PR #191レビュー§1).
+  if (!evidenceIsKnown(subject, probeKey, requiredJointEvidenceKind)) return "UNKNOWN";
+  const evidence = packForProbe(subject, probeKey)!;
+  const rows = resolveJointRows(evidence, criterion.selector);
   return rows.length > 0 ? "MATCHED" : "NOT_MATCHED";
-}
-
-interface ManifestCardinality {
-  readonly kind: F5cManifestCriterion["kind"];
-  /** total pinned member/family count this criterion's countMetricKey is compared against. */
-  readonly pinnedTotal: number | null;
 }
 
 function evaluateManifestCriterion(
@@ -407,20 +529,24 @@ function evaluateManifestCriterion(
   subject: PlanningCalibrationSubjectMeasurement,
   probeKey: string,
   pinnedTotal: number | null,
-): { readonly outcome: F5cShadowOutcome; readonly sweepable: boolean } {
+  cardinalitySweepBoundary: number | null,
+): F5cShadowOutcome {
   const value = metricForProbe(subject, probeKey, criterion.countMetricKey);
-  if (value === undefined || value === null) return { outcome: "UNKNOWN", sweepable: false };
+  if (value === undefined || value === null) return "UNKNOWN";
   if (criterion.kind === "AT_LEAST_FIXED_DISTINCT_MEMBERS") {
-    return { outcome: value >= criterion.fixedValue ? "MATCHED" : "NOT_MATCHED", sweepable: false };
+    return value >= criterion.fixedValue ? "MATCHED" : "NOT_MATCHED";
   }
   if (criterion.kind === "MANIFEST_CARDINALITY_SWEEP") {
-    // No production number selected — this criterion is illustrative-only at the
-    // representative percentile; it never gates a candidate's final MATCHED/NOT_MATCHED alone.
-    return { outcome: "MATCHED", sweepable: true };
+    // PR #191レビュー§6: 本番の数値は選ばれていないが、それは「常にMATCHED」を意味しない
+    // ——観測母集団のrepresentative(p50)cardinality boundaryに対して実際に判定する。No.87/88
+    // のprevalenceはこの次元を無視してはならない。boundaryが定義できない(母集団0件)場合のみ
+    // UNKNOWNへ倒す。
+    if (cardinalitySweepBoundary === null) return "UNKNOWN";
+    return value >= cardinalitySweepBoundary ? "MATCHED" : "NOT_MATCHED";
   }
   // ALL_MANIFEST_MEMBERS / ALL_REQUIRED_SUPERDOMAINS: value must equal the pinned cardinality.
-  if (pinnedTotal === null) return { outcome: "UNKNOWN", sweepable: false };
-  return { outcome: value >= pinnedTotal ? "MATCHED" : "NOT_MATCHED", sweepable: false };
+  if (pinnedTotal === null) return "UNKNOWN";
+  return value >= pinnedTotal ? "MATCHED" : "NOT_MATCHED";
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -572,16 +698,33 @@ function evaluateMetricAxis(ctx: AxisEvalContext, axis: F5cSweepAxis & { source:
     outcomeBySubject.set(subjectId, passes(axis.operator, value, representativeBoundary) ? "MATCHED" : "NOT_MATCHED");
   }
   return {
-    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null },
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, circularWindowPoints: null },
     outcomeBySubject,
   };
+}
+
+/**
+ * PR #191レビュー§5: F5c1はどのdaypart/window境界も選んでいない——F5c2は
+ * user-facingなlabel（"morning"等）を発明せず、本番のwindowも選ばない。代わりに
+ * 固定幅（1日の1/3）のwindowを開始hour 0-23で有限に列挙し、observed母集団の
+ * qualifying件数が最大となるwindow（tie-break: 最小の開始hour）を
+ * 「このshadow実行の代表window」として決定論的に選び、MATCHED/NOT_MATCHED合成へ
+ * 実際に寄与させる。これは本番の選択ではなく、単に観測分布がどこに集中しているかを
+ * 示す診断的選択であり、24点全てのsensitivityが`circularWindowPoints`に残る。
+ */
+const CIRCULAR_WINDOW_LENGTH_HOURS = 8;
+
+function hourInWindow(hour: number, windowStartHour: number, windowLengthHours: number): boolean {
+  const offset = (hour - windowStartHour + 24) % 24;
+  return offset < windowLengthHours;
 }
 
 function evaluateCircularHourAxis(
   ctx: AxisEvalContext,
   axis: F5cSweepAxis & { reducerKind: "CIRCULAR_HOUR_WINDOW" },
   siblingFilteredRows: ReadonlyMap<string, readonly RawRow[]>,
-): F5cAxisSweepResult {
+  evidenceKnownBySubject: ReadonlyMap<string, boolean>,
+): { readonly sweep: F5cAxisSweepResult; readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome> } {
   const hourCounts = Array.from({ length: 24 }, () => 0);
   let observed = 0;
   for (const subject of ctx.subjects) {
@@ -592,51 +735,100 @@ function evaluateCircularHourAxis(
       }
     }
   }
-  return { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints: [], hourHistogram: hourCounts };
+
+  const knownSubjectIds = ctx.subjects.filter((s) => evidenceKnownBySubject.get(s.subjectUserId) === true).map((s) => s.subjectUserId);
+  const circularWindowPoints: F5cCircularWindowPoint[] = [];
+  let representativeStartHour = 0;
+  let bestQualifyingCount = -1;
+  for (let windowStartHour = 0; windowStartHour < 24; windowStartHour += 1) {
+    let qualifying = 0;
+    for (const subjectId of knownSubjectIds) {
+      const rows = siblingFilteredRows.get(subjectId) ?? [];
+      if (rows.some((r) => r.sampleValue !== null && hourInWindow(r.sampleValue, windowStartHour, CIRCULAR_WINDOW_LENGTH_HOURS))) qualifying += 1;
+    }
+    circularWindowPoints.push({
+      windowStartHour,
+      windowLengthHours: CIRCULAR_WINDOW_LENGTH_HOURS,
+      knownCount: knownSubjectIds.length,
+      qualifyingCount: qualifying,
+      qualifyingRate: knownSubjectIds.length === 0 ? null : qualifying / knownSubjectIds.length,
+    });
+    if (qualifying > bestQualifyingCount) { bestQualifyingCount = qualifying; representativeStartHour = windowStartHour; }
+  }
+
+  const outcomeBySubject = new Map<string, F5cShadowOutcome>();
+  for (const subject of ctx.subjects) {
+    if (evidenceKnownBySubject.get(subject.subjectUserId) !== true) { outcomeBySubject.set(subject.subjectUserId, "UNKNOWN"); continue; }
+    const rows = siblingFilteredRows.get(subject.subjectUserId) ?? [];
+    const inWindow = rows.some((r) => r.sampleValue !== null && hourInWindow(r.sampleValue, representativeStartHour, CIRCULAR_WINDOW_LENGTH_HOURS));
+    outcomeBySubject.set(subject.subjectUserId, inWindow ? "MATCHED" : "NOT_MATCHED");
+  }
+
+  return {
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints: [], hourHistogram: hourCounts, circularWindowPoints },
+    outcomeBySubject,
+  };
 }
 
+/**
+ * PR #191レビュー§7: matching-size axisのboundaryPointsは「1つの明確な意味」を持たな
+ * ければならない。edge-filter境界を毎percentileごとに変えながらmatching-size分布の
+ * p50を報告する旧実装は、2つの異なる次元（edge-filter percentile / matching-size
+ * percentile）を1つの`percentile`ラベルへ混在させていた。ここではedge-filter境界を
+ * それ自身のrepresentative(p50)値に固定し、matching-size分布そのものに対して通常の
+ * percentile gridをsweepする——「edge filterをrepresentativeに固定した状態での
+ * matching-size境界sensitivity」という単一の意味になる。edge-filter自身の境界
+ * sensitivityは、隣接するSCALAR_SAMPLE軸（`evaluateJointFilterAxis`が呼び出し元で
+ * 別のaxisKeyとして push する）で独立して報告される——2軸に分かれているので
+ * Cartesian積は不要。plan-level representative outcomeもmatching-size分布の
+ * 同じp50境界を使う（`size >= 1`のような契約に無い固定値は使わない）。
+ */
 function evaluatePostFilterMatchingAxis(
   ctx: AxisEvalContext,
   axis: F5cSweepAxis & { reducerKind: "POST_FILTER_MATCHING_SIZE" },
   edgeSampleBoundaries: ReadonlyMap<F5cBoundaryPercentile, number>,
 ): { readonly sweep: F5cAxisSweepResult; readonly outcomeAtRepresentative: ReadonlyMap<string, F5cShadowOutcome> } {
   const rawRowsBySubject = rowGroupRawRowsFor(ctx, axis);
-  const matchingSizeAtRepresentative = new Map<string, number>();
-  const boundaryPoints: F5cBoundarySweepPoint[] = [];
-  for (const percentile of F5C2_BOUNDARY_PERCENTILES) {
-    const boundary = edgeSampleBoundaries.get(percentile);
-    if (boundary === undefined) { boundaryPoints.push({ percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, passRate: null }); continue; }
-    const sizes: number[] = [];
-    for (const subject of ctx.subjects) {
-      const rows = rawRowsBySubject.get(subject.subjectUserId) ?? [];
-      const qualifying = rows.filter((r) => r.sampleValue !== null && r.sampleValue >= boundary && r.edgeLeftKey !== null && r.edgeRightKey !== null);
-      const adjacency = new Map<string, Set<string>>();
-      for (const r of qualifying) {
-        const set = adjacency.get(r.edgeLeftKey!) ?? new Set<string>();
-        set.add(r.edgeRightKey!);
-        adjacency.set(r.edgeLeftKey!, set);
-      }
-      const size = maximumBipartiteMatching(adjacency);
-      if (rows.length > 0) sizes.push(size);
-      if (percentile === F5C2_REPRESENTATIVE_PERCENTILE) matchingSizeAtRepresentative.set(subject.subjectUserId, size);
+  const representativeEdgeBoundary = edgeSampleBoundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+  const matchingSizeBySubject = new Map<string, number>();
+  const knownSubjectIds: string[] = [];
+  for (const subject of ctx.subjects) {
+    const rows = rawRowsBySubject.get(subject.subjectUserId) ?? [];
+    const qualifying = representativeEdgeBoundary === undefined
+      ? []
+      : rows.filter((r) => r.sampleValue !== null && r.sampleValue >= representativeEdgeBoundary && r.edgeLeftKey !== null && r.edgeRightKey !== null);
+    const adjacency = new Map<string, Set<string>>();
+    for (const r of qualifying) {
+      const set = adjacency.get(r.edgeLeftKey!) ?? new Set<string>();
+      set.add(r.edgeRightKey!);
+      adjacency.set(r.edgeLeftKey!, set);
     }
-    const matchingBoundary = nearestRankPercentile(sizes, 50) ?? 0;
-    const passingCount = sizes.filter((s) => s >= matchingBoundary).length;
-    boundaryPoints.push({
-      percentile, boundaryValue: matchingBoundary, knownCount: sizes.length, passingCount,
-      passRate: sizes.length === 0 ? null : passingCount / sizes.length,
-    });
+    matchingSizeBySubject.set(subject.subjectUserId, maximumBipartiteMatching(adjacency));
+    if (evidenceIsKnown(subject, ctx.probeKey, ctx.plan.requiredJointEvidence.kind)) knownSubjectIds.push(subject.subjectUserId);
   }
+
+  const matchingSizeSamples = knownSubjectIds.map((id) => matchingSizeBySubject.get(id)!);
+  const boundaries = boundaryValuesFor(matchingSizeSamples);
+  const boundaryPoints: F5cBoundarySweepPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
+    const boundaryValue = boundaries.get(percentile);
+    if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, passRate: null };
+    const passingCount = matchingSizeSamples.filter((s) => s >= boundaryValue).length;
+    return {
+      percentile, boundaryValue, knownCount: matchingSizeSamples.length, passingCount,
+      passRate: matchingSizeSamples.length === 0 ? null : passingCount / matchingSizeSamples.length,
+    };
+  });
+  const representativeMatchingBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE) ?? 0;
+
   const observed = [...rawRowsBySubject.values()].reduce((sum, rows) => sum + rows.length, 0);
   const outcomeAtRepresentative = new Map<string, F5cShadowOutcome>();
   for (const subject of ctx.subjects) {
-    const rows = rawRowsBySubject.get(subject.subjectUserId) ?? [];
-    if (rows.length === 0) { outcomeAtRepresentative.set(subject.subjectUserId, "UNKNOWN"); continue; }
-    const size = matchingSizeAtRepresentative.get(subject.subjectUserId) ?? 0;
-    outcomeAtRepresentative.set(subject.subjectUserId, size >= 1 ? "MATCHED" : "NOT_MATCHED");
+    if (!evidenceIsKnown(subject, ctx.probeKey, ctx.plan.requiredJointEvidence.kind)) { outcomeAtRepresentative.set(subject.subjectUserId, "UNKNOWN"); continue; }
+    const size = matchingSizeBySubject.get(subject.subjectUserId) ?? 0;
+    outcomeAtRepresentative.set(subject.subjectUserId, size >= representativeMatchingBoundary ? "MATCHED" : "NOT_MATCHED");
   }
   return {
-    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: null },
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: null, circularWindowPoints: null },
     outcomeAtRepresentative,
   };
 }
@@ -705,21 +897,31 @@ function evaluateRowGroup(
     return boundaryValuesFor(allSamples);
   });
 
-  // Circular-hour axes: qualifying rows after sibling filters at the representative boundary.
-  for (const circularAxis of group.circularAxes) {
-    const rawBySubject = rowGroupRawRowsFor(ctx, circularAxis);
-    const qualifyingBySubject = new Map<string, readonly RawRow[]>();
-    for (const subject of ctx.subjects) {
-      const qualifyingFilterSets = group.filterAxes.map((filterAxis, i) => {
-        const boundary = filterBoundaries[i]!.get(F5C2_REPRESENTATIVE_PERCENTILE);
-        const raw = filterRawBySubject[i]!.get(subject.subjectUserId) ?? [];
-        return boundary === undefined ? raw : filterRows(raw, filterAxis.operator, boundary);
-      });
-      const own = rawBySubject.get(subject.subjectUserId) ?? [];
-      const indices = qualifyingIndices(qualifyingFilterSets, composition);
-      qualifyingBySubject.set(subject.subjectUserId, applyQualifyingIndices(own, indices));
+  // Circular-hour axes: qualifying rows after sibling filters at the representative boundary,
+  // then a bounded 24-window enumeration decides a representative window (PR #191レビュー§5) —
+  // its outcome genuinely joins the row group's AND combination, not just a diagnostic histogram.
+  if (group.circularAxes.length > 0) {
+    const evidenceKnownBySubject = new Map<string, boolean>();
+    for (const subject of ctx.subjects) evidenceKnownBySubject.set(subject.subjectUserId, evidenceIsKnown(subject, ctx.probeKey, ctx.plan.requiredJointEvidence.kind));
+    for (const circularAxis of group.circularAxes) {
+      const rawBySubject = rowGroupRawRowsFor(ctx, circularAxis);
+      const qualifyingBySubject = new Map<string, readonly RawRow[]>();
+      for (const subject of ctx.subjects) {
+        const qualifyingFilterSets = group.filterAxes.map((filterAxis, i) => {
+          const boundary = filterBoundaries[i]!.get(F5C2_REPRESENTATIVE_PERCENTILE);
+          const raw = filterRawBySubject[i]!.get(subject.subjectUserId) ?? [];
+          return boundary === undefined ? raw : filterRows(raw, filterAxis.operator, boundary);
+        });
+        const own = rawBySubject.get(subject.subjectUserId) ?? [];
+        const indices = qualifyingIndices(qualifyingFilterSets, composition);
+        qualifyingBySubject.set(subject.subjectUserId, applyQualifyingIndices(own, indices));
+      }
+      const result = evaluateCircularHourAxis(ctx, circularAxis, qualifyingBySubject, evidenceKnownBySubject);
+      sweeps.push(result.sweep);
+      for (const [subjectId, outcome] of result.outcomeBySubject) {
+        outcomeBySubject.set(subjectId, combineOutcomes([outcomeBySubject.get(subjectId) ?? "MATCHED", outcome]));
+      }
     }
-    sweeps.push(evaluateCircularHourAxis(ctx, circularAxis, qualifyingBySubject));
   }
 
   // Filter axes: report each axis's own independent sensitivity (varying just that axis,
@@ -735,9 +937,13 @@ function evaluateRowGroup(
     const rawBySubject = rowGroupRawRowsFor(ctx, reductionAxis);
     const reducedBySubject = new Map<string, { readonly value: number; readonly hasEvidence: boolean }>();
     for (const subject of ctx.subjects) {
+      // PR #191レビュー§1: "hasEvidence"はrowが0件かどうかではなく、subjectがこの
+      // joint-evidence kindで実際に観測されたかどうか——No.49のTC=0件/VC=多数件のように、
+      // 観測された本当のゼロをUNKNOWNへ倒してはならない。
+      const hasEvidence = evidenceIsKnown(subject, ctx.probeKey, ctx.plan.requiredJointEvidence.kind);
       const own = rawBySubject.get(subject.subjectUserId) ?? [];
       if (group.filterAxes.length === 0) {
-        reducedBySubject.set(subject.subjectUserId, { value: reduceRows(own, own, reductionAxis.reducerKind), hasEvidence: own.length > 0 });
+        reducedBySubject.set(subject.subjectUserId, { value: reduceRows(own, own, reductionAxis.reducerKind), hasEvidence });
         continue;
       }
       const qualifyingFilterSets = group.filterAxes.map((filterAxis, i) => {
@@ -747,7 +953,7 @@ function evaluateRowGroup(
       });
       const indices = qualifyingIndices(qualifyingFilterSets, composition);
       const qualifying = applyQualifyingIndices(own, indices);
-      reducedBySubject.set(subject.subjectUserId, { value: reduceRows(qualifying, own, reductionAxis.reducerKind), hasEvidence: own.length > 0 });
+      reducedBySubject.set(subject.subjectUserId, { value: reduceRows(qualifying, own, reductionAxis.reducerKind), hasEvidence });
     }
     const samples = [...reducedBySubject.values()].filter((r) => r.hasEvidence).map((r) => r.value);
     const boundaries = boundaryValuesFor(samples);
@@ -758,7 +964,7 @@ function evaluateRowGroup(
       const passingCount = [...reducedBySubject.values()].filter((r) => r.hasEvidence && passes(reductionAxis.operator, r.value, boundaryValue)).length;
       return { percentile, boundaryValue, knownCount, passingCount, passRate: knownCount === 0 ? null : passingCount / knownCount };
     });
-    sweeps.push({ axisKey: reductionAxis.axisKey, reducerKind: reductionAxis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null });
+    sweeps.push({ axisKey: reductionAxis.axisKey, reducerKind: reductionAxis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, circularWindowPoints: null });
 
     const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
     for (const subject of ctx.subjects) {
@@ -786,25 +992,76 @@ function evaluateJointFilterAxis(
     if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, passRate: null };
     let known = 0;
     let passing = 0;
-    for (const rows of rawBySubject.values()) {
-      if (rows.length === 0) continue;
+    for (const subject of ctx.subjects) {
+      if (!evidenceIsKnown(subject, ctx.probeKey, ctx.plan.requiredJointEvidence.kind)) continue;
       known += 1;
+      const rows = rawBySubject.get(subject.subjectUserId) ?? [];
       if (rows.some((r) => r.sampleValue !== null && passes(axis.operator, r.sampleValue, boundaryValue))) passing += 1;
     }
     return { percentile, boundaryValue, knownCount: known, passingCount: passing, passRate: known === 0 ? null : passing / known };
   });
-  return { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: allSamples.length, boundaryPoints, hourHistogram: null };
+  return { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: allSamples.length, boundaryPoints, hourHistogram: null, circularWindowPoints: null };
 }
 
 // ─────────────────────────────────────────────────────────────
 // per-candidate + top-level execution
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * PR #191レビュー第2ラウンド§3: family/super-domain cardinalityはF5c1の
+ * `F5C1_MANIFEST_PINS`から直接読む——F5c2側にeconomy=3/casino=8/castle=7の
+ * ようなliteralを複製しない。F5c1のpinが改訂されればF5c2は自動的に追従する。
+ */
+function pinnedFamilyCount(kind: F5cManifestRef["kind"]): number {
+  if (kind === "ECONOMY_SEMANTIC_FAMILIES") return F5C1_MANIFEST_PINS.ECONOMY_SEMANTIC_FAMILIES.familyKeys.length;
+  if (kind === "CASINO_EDITION") return F5C1_MANIFEST_PINS.CASINO_EDITION.families.length;
+  return F5C1_MANIFEST_PINS.CASTLE_EDITION.families.length;
+}
+function pinnedSuperDomainCount(): number {
+  return new Set(F5C1_MANIFEST_PINS.CASTLE_EDITION.families.map((f) => f.superDomain)).size;
+}
 function pinnedManifestTotal(plan: F5cCandidateSweepPlan): number | null {
   if (!plan.manifestRef) return null;
-  if (plan.manifestRef.kind === "ECONOMY_SEMANTIC_FAMILIES") return 3; // peer_transfer, tip, shop
-  if (plan.manifestRef.kind === "CASINO_EDITION") return 8; // Edition-I 8 target game families
-  return 7; // CASTLE_EDITION: 7 families (or 3 super-domains for ALL_REQUIRED_SUPERDOMAINS, handled below)
+  return pinnedFamilyCount(plan.manifestRef.kind);
+}
+
+/**
+ * PR #191レビュー§4: `unsupportedCandidateCount === 0`は「例外が飛ばなかった」だけの
+ * 消極的な主張であってはならない——実際に実行可能であるという積極的な静的claimに
+ * ならなければならない。plan単位で、実際に使われるJOINT_EVIDENCE軸/JOINT_STRUCTURAL_FACT
+ * selectorが全て`SUPPORTED_JOINT_SELECTORS`に登録されているかを、subjectデータを
+ * 評価する前にチェックする。`requiredJointEvidence`が宣言するがどのaxis/criterionからも
+ * 実際に参照されないselector（例: No.87/88のmanifest-onlyな宣言）は対象外——実行時に
+ * `resolveJointRows`へ絶対に渡らないため、audit対象にする意味が無い。
+ */
+function auditPlanSelectorSupport(plan: F5cCandidateSweepPlan): string | null {
+  const kind = plan.requiredJointEvidence.kind;
+  const selectors = new Set<string>();
+  for (const axis of plan.axes) if (axis.source === "JOINT_EVIDENCE") selectors.add(axis.selector);
+  for (const criterion of plan.fixedCriteria) if (criterion.kind === "JOINT_STRUCTURAL_FACT") selectors.add(criterion.selector);
+  if (selectors.size === 0) return null;
+  if (kind === "none") return `plan references joint selectors [${[...selectors].join(", ")}] but requiredJointEvidence.kind is "none"`;
+  for (const selector of selectors) {
+    if (!isSupportedJointSelector(kind, selector)) return `unsupported joint selector for F5c2 execution: ${kind}::${selector}`;
+  }
+  return null;
+}
+
+/**
+ * Static, subject-data-independent audit across every plan — every actively-referenced JOINT_EVIDENCE
+ * axis / JOINT_STRUCTURAL_FACT selector in `plans` must resolve against `SUPPORTED_JOINT_SELECTORS`.
+ * Exported so a dedicated test can assert READY-76 has zero gaps directly, without needing to
+ * fabricate subject data to exercise every code path (PR #191レビュー§4).
+ */
+export function auditF5c2SelectorSupport(
+  plans: readonly F5cCandidateSweepPlan[] = F5C_CANDIDATE_SWEEP_PLANS,
+): readonly { readonly candidateNo: number; readonly reason: string }[] {
+  const gaps: { readonly candidateNo: number; readonly reason: string }[] = [];
+  for (const plan of plans) {
+    const reason = auditPlanSelectorSupport(plan);
+    if (reason !== null) gaps.push({ candidateNo: plan.candidateNo, reason });
+  }
+  return gaps;
 }
 
 function executeCandidate(
@@ -812,11 +1069,6 @@ function executeCandidate(
   subjects: readonly PlanningCalibrationSubjectMeasurement[],
 ): F5cCandidateShadowResult {
   const ctx: AxisEvalContext = { plan, probeKey: plan.probeKey, subjects };
-  const jointRowsFor = (selector: string) => (subject: PlanningCalibrationSubjectMeasurement): readonly RawRow[] => {
-    const evidence = packForProbe(subject, plan.probeKey);
-    return evidence ? resolveJointRows(evidence, selector) : [];
-  };
-
   const axisSweeps: F5cAxisSweepResult[] = [];
   const outcomeBySubject = new Map<string, F5cShadowOutcome[]>();
   const pushOutcome = (subjectId: string, outcome: F5cShadowOutcome) => {
@@ -825,49 +1077,69 @@ function executeCandidate(
     outcomeBySubject.set(subjectId, list);
   };
 
-  for (const subject of subjects) {
-    for (const criterion of plan.fixedCriteria) {
-      pushOutcome(subject.subjectUserId, evaluateFixedCriterion(criterion, subject, plan.probeKey, (selector) => jointRowsFor(selector)(subject)));
-    }
-  }
+  const staticAuditReason = auditPlanSelectorSupport(plan);
+  let unsupportedReason: string | null = staticAuditReason;
 
-  const pinnedTotal = pinnedManifestTotal(plan);
-  for (const criterion of plan.manifestCriteria) {
-    const pinnedForCriterion = criterion.kind === "ALL_REQUIRED_SUPERDOMAINS" ? 3 : pinnedTotal;
-    for (const subject of subjects) {
-      const result = evaluateManifestCriterion(criterion, subject, plan.probeKey, pinnedForCriterion);
-      if (!result.sweepable) pushOutcome(subject.subjectUserId, result.outcome);
-    }
-    if (criterion.kind === "MANIFEST_CARDINALITY_SWEEP") {
-      const { samples } = metricSamplesFor(ctx, criterion.countMetricKey);
-      const boundaries = boundaryValuesFor(samples);
-      const boundaryPoints: F5cBoundarySweepPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
-        const boundaryValue = boundaries.get(percentile);
-        if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, passRate: null };
-        const known = samples.length;
-        const passing = samples.filter((v) => v >= boundaryValue).length;
-        return { percentile, boundaryValue, knownCount: known, passingCount: passing, passRate: known === 0 ? null : passing / known };
-      });
-      axisSweeps.push({ axisKey: `manifest:${criterion.countMetricKey}`, reducerKind: "SCALAR_METRIC", observedSampleCount: samples.length, boundaryPoints, hourHistogram: null });
-    }
-  }
-
-  const metricAxes = plan.axes.filter((a): a is F5cSweepAxis & { source: "METRIC" } => a.source === "METRIC");
-  for (const axis of metricAxes) {
-    const { sweep, outcomeBySubject: axisOutcomes } = evaluateMetricAxis(ctx, axis);
-    axisSweeps.push(sweep);
-    for (const [subjectId, outcome] of axisOutcomes) pushOutcome(subjectId, outcome);
-  }
-
-  const rowGroups = groupAxesByRowGroup(plan.axes);
-  let unsupportedReason: string | null = null;
-  for (const group of rowGroups) {
+  if (unsupportedReason === null) {
     try {
-      const { sweeps, outcomeBySubject: groupOutcomes } = evaluateRowGroup(ctx, group);
-      axisSweeps.push(...sweeps);
-      for (const [subjectId, outcome] of groupOutcomes) pushOutcome(subjectId, outcome);
+      for (const subject of subjects) {
+        for (const criterion of plan.fixedCriteria) {
+          pushOutcome(subject.subjectUserId, evaluateFixedCriterion(criterion, subject, plan.probeKey, plan.requiredJointEvidence.kind));
+        }
+      }
     } catch (error) {
-      unsupportedReason = `row group ${group.rowGroupKey}: ${error instanceof Error ? error.message : String(error)}`;
+      unsupportedReason = `fixed criteria: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  if (unsupportedReason === null) {
+    const pinnedTotal = pinnedManifestTotal(plan);
+    for (const criterion of plan.manifestCriteria) {
+      const pinnedForCriterion = criterion.kind === "ALL_REQUIRED_SUPERDOMAINS" ? pinnedSuperDomainCount() : pinnedTotal;
+      // PR #191レビュー§6: MANIFEST_CARDINALITY_SWEEPは「本番値未選択」であって
+      // 「常にMATCHED」ではない——観測母集団のrepresentative(p50)cardinalityを先に
+      // 計算し、各subjectをそれに対して実際に判定する。No.87/88のprevalenceはこの
+      // 次元を無視してはならない。
+      const cardinalitySweepBoundary = criterion.kind === "MANIFEST_CARDINALITY_SWEEP"
+        ? boundaryValuesFor(metricSamplesFor(ctx, criterion.countMetricKey).samples).get(F5C2_REPRESENTATIVE_PERCENTILE) ?? null
+        : null;
+      for (const subject of subjects) {
+        pushOutcome(subject.subjectUserId, evaluateManifestCriterion(criterion, subject, plan.probeKey, pinnedForCriterion, cardinalitySweepBoundary));
+      }
+      if (criterion.kind === "MANIFEST_CARDINALITY_SWEEP") {
+        const { samples } = metricSamplesFor(ctx, criterion.countMetricKey);
+        const boundaries = boundaryValuesFor(samples);
+        const boundaryPoints: F5cBoundarySweepPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
+          const boundaryValue = boundaries.get(percentile);
+          if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, passRate: null };
+          const known = samples.length;
+          const passing = samples.filter((v) => v >= boundaryValue).length;
+          return { percentile, boundaryValue, knownCount: known, passingCount: passing, passRate: known === 0 ? null : passing / known };
+        });
+        axisSweeps.push({ axisKey: `manifest:${criterion.countMetricKey}`, reducerKind: "SCALAR_METRIC", observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, circularWindowPoints: null });
+      }
+    }
+  }
+
+  if (unsupportedReason === null) {
+    const metricAxes = plan.axes.filter((a): a is F5cSweepAxis & { source: "METRIC" } => a.source === "METRIC");
+    for (const axis of metricAxes) {
+      const { sweep, outcomeBySubject: axisOutcomes } = evaluateMetricAxis(ctx, axis);
+      axisSweeps.push(sweep);
+      for (const [subjectId, outcome] of axisOutcomes) pushOutcome(subjectId, outcome);
+    }
+  }
+
+  if (unsupportedReason === null) {
+    const rowGroups = groupAxesByRowGroup(plan.axes);
+    for (const group of rowGroups) {
+      try {
+        const { sweeps, outcomeBySubject: groupOutcomes } = evaluateRowGroup(ctx, group);
+        axisSweeps.push(...sweeps);
+        for (const [subjectId, outcome] of groupOutcomes) pushOutcome(subjectId, outcome);
+      } catch (error) {
+        unsupportedReason = `row group ${group.rowGroupKey}: ${error instanceof Error ? error.message : String(error)}`;
+      }
     }
   }
 
@@ -923,7 +1195,7 @@ export function executeF5cShadowCalibration(collection: PlanningCalibrationMeasu
   const unsupportedCandidateCount = results.filter((r) => r.executionStrategy === "UNSUPPORTED_GAP").length;
   return deepFreeze({
     contractVersion: F5C2_SHADOW_CONTRACT_VERSION,
-    sweepContractVersion: F5C_CANDIDATE_SWEEP_PLANS.length > 0 ? 3 : 0,
+    sweepContractVersion: F5C_SWEEP_CONTRACT_VERSION,
     cohort: collection.cohort,
     window: collection.window,
     readyCandidateCount: F5C_CANDIDATE_SWEEP_PLANS.length,
