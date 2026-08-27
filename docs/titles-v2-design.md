@@ -2226,7 +2226,7 @@ F5b2はF5a/F5b1と同じ`CalibrationProbe<S>`、typed `CalibrationPayloadBundle<
 | `casino-activity-v1` | 68 | `casino_activity_days` |
 | `casino-edition-completion-v1` | 69 | `casino_edition_i_completion_safe` |
 | `casino-table-activity-v1` | 70 | `casino_table_activity_safe` |
-| `casino-table-participation-v1` | 71 | `casino_table_activity_safe` |
+| `casino-table-busy-v1` | 71 | `casino_table_activity_safe` |
 | `casino-market-activity-v1` | 72 | `casino_market_activity_safe` |
 | `confirmed-invites-v1` | 74, 75 | `confirmed_invites` |
 | `invite-rooted-v1` | 76–79 | `invite_rooted_safe` |
@@ -2238,7 +2238,7 @@ F5b2はF5a/F5b1と同じ`CalibrationProbe<S>`、typed `CalibrationPayloadBundle<
 
 No.65は独立したrole coverage packとして購入時role-family JOIN済みの`shop_role_purchase_safe`、No.81はcompletion-only packでcanonical completion instanceの
 `public_event_completed_participations`を正本にする。No.71用に未登録の別sourceを新設せず、現行readiness contractどおり
-`casino_table_activity_safe`のanonymous guest profile側をparticipation measurementとして使う。
+`casino_table_activity_safe`のowner/host側anonymous guest profileを、来客のあるhosted tableのbusy measurementとして使う。
 
 測定するのはsafe payloadが直接持つcount、distinct breadth、JST active day/range、trusted seconds、gap sample、ratio、stable
 semantic family breadthだけである。public roomはhosted/guest/own-use session/day/breadth、economyはsafe peer day-kind factと

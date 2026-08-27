@@ -75,7 +75,7 @@ export type CalibrationProbeKey =
   | "casino-activity-v1"
   | "casino-edition-completion-v1"
   | "casino-table-activity-v1"
-  | "casino-table-participation-v1"
+  | "casino-table-busy-v1"
   | "casino-market-activity-v1"
   | "confirmed-invites-v1"
   | "invite-rooted-v1"
@@ -1109,7 +1109,7 @@ function measureCasinoTableHosted(payload: CasinoTableActivitySafeSourcePayload)
   return { metrics };
 }
 
-function measureCasinoTableParticipation(
+function measureCasinoTableBusy(
   payload: CasinoTableActivitySafeSourcePayload,
   context: { readonly windowStart: number },
 ): SubjectMeasurement {
@@ -1120,11 +1120,11 @@ function measureCasinoTableParticipation(
   const metrics = new Map<string, number | null>([
     ["guestProfileCount", payload.guests.length],
     ["stayRowCount", stays.length],
-    ["distinctTableProfilesVisited", new Set(stays.map(({ tableProfileIndex }) => tableProfileIndex)).size],
-    ["totalTrustedSeconds", stays.reduce((sum, stay) => sum + stay.trustedSeconds, 0)],
+    ["distinctHostedTableProfilesWithGuests", new Set(stays.map(({ tableProfileIndex }) => tableProfileIndex)).size],
+    ["hostedGuestTrustedSeconds", stays.reduce((sum, stay) => sum + stay.trustedSeconds, 0)],
   ]);
-  setDayRangeMetrics(metrics, "participationActive", offsets);
-  setSampleMetrics(metrics, "dailyTrustedSeconds", [...byDay.values()]);
+  setDayRangeMetrics(metrics, "busyTableActive", offsets);
+  setSampleMetrics(metrics, "dailyHostedGuestTrustedSeconds", [...byDay.values()]);
   setSampleMetrics(metrics, "trustedSecondsPerGuestProfile", payload.guests.map((guest) => guest.stays.reduce((sum, stay) => sum + stay.trustedSeconds, 0)));
   return { metrics };
 }
@@ -1535,13 +1535,13 @@ const CASINO_TABLE_ACTIVITY_PROBE: CalibrationProbe<readonly ["casino_table_acti
   coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
   measure: (payloads) => measureCasinoTableHosted(payloads.casino_table_activity_safe),
 };
-const CASINO_TABLE_PARTICIPATION_PROBE: CalibrationProbe<readonly ["casino_table_activity_safe"]> = {
+const CASINO_TABLE_BUSY_PROBE: CalibrationProbe<readonly ["casino_table_activity_safe"]> = {
   candidateNos: Object.freeze([71]),
-  probeKey: "casino-table-participation-v1",
+  probeKey: "casino-table-busy-v1",
   sources: ["casino_table_activity_safe"],
   emptyPayloads: Object.freeze({ casino_table_activity_safe: EMPTY_CASINO_TABLE }),
   coverageLimitations: DOMAIN_COVERAGE_LIMITATIONS,
-  measure: (payloads, context) => measureCasinoTableParticipation(payloads.casino_table_activity_safe, context),
+  measure: (payloads, context) => measureCasinoTableBusy(payloads.casino_table_activity_safe, context),
 };
 const CASINO_MARKET_ACTIVITY_PROBE: CalibrationProbe<readonly ["casino_market_activity_safe"]> = {
   candidateNos: Object.freeze([72]),
@@ -1645,7 +1645,7 @@ export const F5B2_CALIBRATION_PROBES = Object.freeze([
   runtimeProbe(CASINO_ACTIVITY_PROBE),
   runtimeProbe(CASINO_EDITION_COMPLETION_PROBE),
   runtimeProbe(CASINO_TABLE_ACTIVITY_PROBE),
-  runtimeProbe(CASINO_TABLE_PARTICIPATION_PROBE),
+  runtimeProbe(CASINO_TABLE_BUSY_PROBE),
   runtimeProbe(CASINO_MARKET_ACTIVITY_PROBE),
   runtimeProbe(CONFIRMED_INVITES_PROBE),
   runtimeProbe(INVITE_ROOTED_PROBE),

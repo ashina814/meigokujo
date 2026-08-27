@@ -133,7 +133,7 @@ const EXPECTED_MATRIX = [
   ["casino-activity-v1", [68], ["casino_activity_days"]],
   ["casino-edition-completion-v1", [69], ["casino_edition_i_completion_safe"]],
   ["casino-table-activity-v1", [70], ["casino_table_activity_safe"]],
-  ["casino-table-participation-v1", [71], ["casino_table_activity_safe"]],
+  ["casino-table-busy-v1", [71], ["casino_table_activity_safe"]],
   ["casino-market-activity-v1", [72], ["casino_market_activity_safe"]],
   ["confirmed-invites-v1", [74, 75], ["confirmed_invites"]],
   ["invite-rooted-v1", [76, 77, 78, 79], ["invite_rooted_safe"]],
@@ -190,7 +190,7 @@ describe("F5b2 domain calibration packs A-H", () => {
     expect(collection.packReadCalls.find(({ probeKey }) => probeKey === "economy-semantic-v1")?.readCalls).toBe(3);
     expect(collection.packReadCalls.find(({ probeKey }) => probeKey === "shop-role-purchase-v1")?.readCalls).toBe(3);
     expect(collection.packReadCalls.find(({ probeKey }) => probeKey === "casino-table-activity-v1")?.readCalls).toBe(3);
-    expect(collection.packReadCalls.find(({ probeKey }) => probeKey === "casino-table-participation-v1")?.readCalls).toBe(3);
+    expect(collection.packReadCalls.find(({ probeKey }) => probeKey === "casino-table-busy-v1")?.readCalls).toBe(3);
     expect(collection.packReadCalls.find(({ probeKey }) => probeKey === "public-event-completion-v1")?.readCalls).toBe(3);
     expect(collection.packReadCalls.find(({ probeKey }) => probeKey === "public-event-calendar-v1")?.readCalls).toBe(3);
     expect(collection.packReadCalls.find(({ probeKey }) => probeKey === "castle-social-time-v1")?.readCalls).toBe(30);
@@ -352,10 +352,23 @@ describe("F5b2 domain calibration packs A-H", () => {
     });
     const hosted = internalPack(collection, "subject", "casino-table-activity-v1").metrics;
     expect(hosted).toMatchObject({ tableCount: 2, guestProfileCount: 2, guestActiveDays: 3, totalTrustedGuestSeconds: 90 });
-    const participation = internalPack(collection, "subject", "casino-table-participation-v1").metrics;
-    expect(participation).toMatchObject({ guestProfileCount: 2, distinctTableProfilesVisited: 2, participationActiveDays: 3, totalTrustedSeconds: 90 });
+    const busy = internalPack(collection, "subject", "casino-table-busy-v1").metrics;
+    expect(busy).toMatchObject({
+      guestProfileCount: 2,
+      stayRowCount: 4,
+      distinctHostedTableProfilesWithGuests: 2,
+      hostedGuestTrustedSeconds: 90,
+      busyTableActiveDays: 3,
+      busyTableActiveFirstDayOffset: 0,
+      busyTableActiveLastDayOffset: 2,
+      busyTableActiveSpanDays: 3,
+    });
+    expect(busy.dailyHostedGuestTrustedSecondsMedian).toBe(10);
+    expect(busy.dailyHostedGuestTrustedSecondsMax).toBe(70);
+    expect(busy.trustedSecondsPerGuestProfileMedian).toBe(40);
+    expect(busy.trustedSecondsPerGuestProfileMax).toBe(50);
     expect(internalPack(collection, "guest-a", "casino-table-activity-v1").metrics.tableCount).toBe(0);
-    expect(internalPack(collection, "guest-a", "casino-table-participation-v1").metrics.guestProfileCount).toBe(0);
+    expect(internalPack(collection, "guest-a", "casino-table-busy-v1").metrics.guestProfileCount).toBe(0);
     expect(internalPack(collection, "subject", "casino-market-activity-v1").metrics).toMatchObject({
       distinctOtherStandardBoards: 2,
       sumDailyDistinctOtherStandardBoards: 3,
