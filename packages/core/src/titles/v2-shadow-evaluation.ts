@@ -4,6 +4,7 @@ import {
   F5C_CANDIDATE_SWEEP_PLANS,
   F5C_SWEEP_CONTRACT_VERSION,
   type F5cCandidateSweepPlan,
+  type F5cCircularQuadrant,
   type F5cEvaluationShape,
   type F5cFixedCriterion,
   type F5cManifestCriterion,
@@ -85,12 +86,42 @@ function combineOutcomesOr(outcomes: readonly F5cShadowOutcome[]): F5cShadowOutc
   return "NOT_MATCHED";
 }
 
+/**
+ * PR #191レビュー第3ラウンド§1: `evidenceIsKnown()`（pack存在+kind一致）は「完全な
+ * 観測coverage」を意味しない——このcodebaseの全probeが`coverageLimitations`で明記する
+ * 通り、safe sourceはunknown/untrusted intervalを省略するため、絶対的なゼロ（該当
+ * 証拠が1件も無いという観測）はcoverageの欠落と観測された不在を区別できない。
+ * 一方、正の証拠（何か見つかった）はsafe sourceの性質上ねつ造されない——coverage gap
+ * はfalse negativeしか生まず、false positiveは生まない。よって:
+ * - MATCHED（正の証拠が見つかった）は`coverageWindowValidated`に関わらず常に信頼できる
+ *   ——ここでは絶対に変更しない。
+ * - 絶対ゼロ（`isAbsoluteZero`）によるNOT_MATCHEDだけは、呼び出し側が
+ *   `coverageWindowValidated=true`で「このcalibration windowは関与する全sourceの
+ *   rolloutより後で、safe sourceが通常運用中に省略しうるuntracked gapについても
+ *   許容できる」と明示的にattestしない限りUNKNOWNへ倒す
+ *   （`executeF5cShadowCalibration`/`runF5cShadowCalibration`の必須引数）。
+ * - 相対的な境界比較（値>0だが母集団のrepresentative境界未満）はabsence-of-evidenceの
+ *   主張ではないため対象外——このflagの影響を受けない。
+ */
+function zeroSensitiveOutcome(outcome: F5cShadowOutcome, isAbsoluteZero: boolean, coverageWindowValidated: boolean): F5cShadowOutcome {
+  if (outcome === "NOT_MATCHED" && isAbsoluteZero && !coverageWindowValidated) return "UNKNOWN";
+  return outcome;
+}
+
+/**
+ * PR #191レビュー第3ラウンド§4: `marginalPassRate`はこのaxis/filter単体の観測分布に
+ * 対するpass率であって、他のaxisをrepresentative境界に固定した状態でcandidate全体を
+ * 再判定した「候補レベルのsensitivity」ではない——F5c2は現時点でone-axis-at-a-time
+ * candidate-level sensitivity（他境界を固定しつつ候補全体のprevalenceを再計算する
+ * こと）を実装していない（`F5C2_SENSITIVITY_MODEL`参照）。フィールド名自体に
+ * "marginal"を含めることで、後工程がこれをcandidate sensitivityと取り違えることを防ぐ。
+ */
 export interface F5cBoundarySweepPoint {
   readonly percentile: F5cBoundaryPercentile;
   readonly boundaryValue: number;
   readonly knownCount: number;
   readonly passingCount: number;
-  readonly passRate: number | null;
+  readonly marginalPassRate: number | null;
 }
 
 /**
@@ -106,7 +137,8 @@ export interface F5cCircularWindowPoint {
   readonly windowLengthHours: number;
   readonly knownCount: number;
   readonly qualifyingCount: number;
-  readonly qualifyingRate: number | null;
+  /** Marginal, not candidate-level sensitivity — see `F5cBoundarySweepPoint.marginalPassRate`. */
+  readonly marginalQualifyingRate: number | null;
 }
 
 export interface F5cAxisSweepResult {
@@ -146,9 +178,27 @@ export interface F5cCandidateShadowResult {
   readonly unsupportedReason: string | null;
 }
 
+/**
+ * PR #191レビュー第3ラウンド§4: `axisSweeps[].boundaryPoints`/`circularWindowPoints`は
+ * axis単体のmarginal pass rateであって、他のaxisをrepresentativeへ固定しつつcandidate
+ * 全体のprevalenceを一軸ずつ再計算する「候補レベルのsensitivity」ではない——実装複雑度
+ * とreviewabilityを考慮し、後者はこのPRでは意図的に見送る（Option B、次段階で明確な
+ * 設計を経てから実装する）。このtyped markerを実際のreportへ載せることで、後続の
+ * 製品判断がmarginalな数値をcandidate sensitivityと取り違えることを防ぐ。
+ */
+export const F5C2_SENSITIVITY_MODEL = "MARGINAL_AXIS_ONLY" as const;
+
 export interface F5cShadowCalibrationReport {
   readonly contractVersion: typeof F5C2_SHADOW_CONTRACT_VERSION;
   readonly sweepContractVersion: number;
+  readonly sensitivityModel: typeof F5C2_SENSITIVITY_MODEL;
+  /**
+   * The caller's explicit attestation, threaded straight through — PR #191レビュー第3
+   * ラウンド§1: this is the report's coverage provenance. `false` means every absolute-zero
+   * NOT_MATCHED outcome in `results` was downgraded to UNKNOWN (see `zeroSensitiveOutcome`);
+   * `true` means the caller attested the window is safe and real observed zeros stand.
+   */
+  readonly coverageWindowValidated: boolean;
   readonly cohort: { readonly key: string; readonly subjectCount: number };
   readonly window: PlanningCalibrationMeasurementCollection["window"];
   readonly readyCandidateCount: number;
@@ -216,63 +266,7 @@ function row(partial: Partial<RawRow>): RawRow {
   };
 }
 
-/**
- * PR #191レビュー§4: `resolveJointRows()`は「認識しているselectorでrowが0件」と
- * 「認識していないselector」を区別しなければならない——どちらも`[]`を返すと、
- * unsupportedな契約変更（F5c1側でselector名が変わった等）を静かに「0件のevidence」
- * として飲み込んでしまう。ここに列挙した(kind, selector)の組だけが「認識している」
- * ——`resolveJointRows()`の各switch caseと1:1で保守する。
- */
-const SUPPORTED_JOINT_SELECTORS: ReadonlySet<string> = new Set([
-  "activity-time-day-hour-v1::rows.tc-gap",
-  "activity-time-day-hour-v1::rows.vc-seconds",
-  "activity-time-day-hour-v1::rows.day-hour-social-evidence",
-  "activity-time-day-hour-v1::rows.daypart-share",
-  "activity-time-day-hour-v1::rows.daypart-boundary",
-  "activity-time-day-hour-v1::rows.activity-start-hour",
-  "day-occurrences-v1::dayOffsets.calendar-periods",
-  "social-context-graph-v1::counterparts.semantic-touch-days-seconds",
-  "social-context-graph-v1::counterparts.maximum-matching",
-  "tc-conversation-v1::starts.quiet-before",
-  "tc-conversation-v1::starts.next-other-gap",
-  "tc-conversation-v1::starts.day-offset",
-  "tc-conversation-v1::revivals.dormant-before",
-  "tc-conversation-v1::revivals.continuation-gap",
-  "tc-conversation-v1::revivals.conversation-group",
-  "tc-conversation-v1::revivals.day-offset",
-  "tc-conversation-v1::areas.surface-local-social-days",
-  "tc-conversation-v1::areas.best-other-gap",
-  "tc-conversation-v1::third-party.prior-distinct-others",
-  "tc-conversation-v1::third-party.next-other-gap",
-  "tc-conversation-v1::third-party.day-offset",
-  "tc-reaction-posts-v1::posts.post-breadth",
-  "tc-reaction-posts-v1::posts.day-breadth",
-  "cross-modal-days-v1::tc-days.gap",
-  "cross-modal-days-v1::tc-days.day-offset",
-  "cross-modal-days-v1::vc-days.breadth",
-  "cross-modal-days-v1::vc-days.day-offset",
-  "domain-social-time-v1::domainDays.public-room-own-use",
-  "invite-rooted-v1::profiles.branch-activity-days",
-  "invite-rooted-v1::profiles.branch-social-evidence",
-  "invite-rooted-v1::profiles.next-generation-same-day-gap",
-  "invite-rooted-v1::profiles.next-generation-same-day-seconds",
-  "invite-rooted-v1::profiles.next-generation-occurrence",
-  "invite-rooted-v1::profiles.root-before-child",
-  "invite-rooted-v1::profiles.same-day-before-entry",
-  "invite-rooted-v1::profiles.independent-rooted-branches",
-  "invite-rooted-v1::profiles.reunion-days",
-  "invite-rooted-v1::profiles.reunion-pair-social-evidence",
-  "castle-role-context-v1::families.role-held-days",
-  "castle-role-context-v1::families.inside-days",
-  "castle-role-context-v1::families.outside-days",
-  "castle-role-context-v1::families.outside-repeat-days",
-]);
-
-function isSupportedJointSelector(kind: string, selector: string): boolean {
-  return SUPPORTED_JOINT_SELECTORS.has(`${kind}::${selector}`);
-}
-
-/** Thrown by `resolveJointRows()` for a (kind, selector) pair outside `SUPPORTED_JOINT_SELECTORS`. */
+/** Thrown by `resolveJointRows()` for a (kind, selector) pair outside `JOINT_ROW_RESOLVERS`. */
 class UnsupportedSelectorError extends Error {
   constructor(kind: string, selector: string) {
     super(`unsupported joint selector for F5c2 execution: ${kind}::${selector}`);
@@ -280,182 +274,164 @@ class UnsupportedSelectorError extends Error {
   }
 }
 
+type JointEvidenceOfKind<K extends PlanningCalibrationJointEvidence["kind"]> = Extract<PlanningCalibrationJointEvidence, { kind: K }>;
+type AnyJointRowResolver = (evidence: PlanningCalibrationJointEvidence) => readonly RawRow[];
+
+/**
+ * PR #191レビュー第3ラウンド§5: selector支持の判定(`isSupportedJointSelector`)と実際の
+ * 解決(`resolveJointRows`)が別々に手で同期される2つのSSOTだと、resolver caseを削除/変更
+ * してもregistry側が古いまま残り、audit だけが「支持している」と誤答できてしまう。
+ * ここでは1つの実行可能なmapだけを正本にする——kindごとのselector文字列は、実際の
+ * resolver関数と同じobjectのkeyとしてしか存在しない。`isSupportedJointSelector`と
+ * `resolveJointRows`はどちらもこの同じmapを読むだけで、2つ目の並行リストを持たない。
+ */
+function jointResolverGroup<K extends PlanningCalibrationJointEvidence["kind"]>(
+  kind: K,
+  map: Record<string, (evidence: JointEvidenceOfKind<K>) => readonly RawRow[]>,
+): readonly [K, Record<string, AnyJointRowResolver>] {
+  return [kind, map as Record<string, AnyJointRowResolver>];
+}
+
+const JOINT_ROW_RESOLVERS: ReadonlyMap<string, Record<string, AnyJointRowResolver>> = new Map([
+  jointResolverGroup("activity-time-day-hour-v1", {
+    "rows.tc-gap": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, sampleValue: r.tcBestOtherGapMs })),
+    "rows.vc-seconds": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, sampleValue: r.vcTrustedSocialSeconds })),
+    "rows.day-hour-social-evidence": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset })),
+    // share denominator/numerator both use vcTrustedSocialSeconds magnitude.
+    "rows.daypart-share": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, sampleValue: r.vcTrustedSocialSeconds })),
+    "rows.daypart-boundary": (e) => e.rows.map((r) => row({ dayOffset: r.dayOffset, sampleValue: r.hour })),
+    // PR #191レビュー第3ラウンド§3: "start hour"は「その日に記録された最初のhour」であって
+    // 「記録された全hour」ではない——旧実装はdaypart-boundaryと同じ全hour rowを返しており、
+    // selector名（activity-start-hour）と実際の意味が食い違っていた。既存evidenceから導出
+    // できる最小の修正として、日ごとの最小hourを1件だけ返す（No.36専用selector）。
+    "rows.activity-start-hour": (e) => {
+      const minHourByDay = new Map<number, number>();
+      for (const r of e.rows) {
+        const current = minHourByDay.get(r.dayOffset);
+        if (current === undefined || r.hour < current) minHourByDay.set(r.dayOffset, r.hour);
+      }
+      return [...minHourByDay.entries()].map(([dayOffset, hour]) => row({ dayOffset, sampleValue: hour }));
+    },
+  }),
+  jointResolverGroup("day-occurrences-v1", {
+    // Bounded, deterministic period grouping: 7-day buckets relative to window start.
+    "dayOffsets.calendar-periods": (e) => e.dayOffsets.map((offset) => row({ dayOffset: offset, memberKey: `period:${Math.floor(offset / 7)}` })),
+  }),
+  jointResolverGroup("social-context-graph-v1", (() => {
+    const edgesOf = (e: JointEvidenceOfKind<"social-context-graph-v1">) => e.counterparts.flatMap((counterpart) =>
+      counterpart.touches.map((touch) => ({
+        left: `counterpart:${counterpart.counterpartOrdinal}`,
+        right: `semantic:${touch.semanticIndex}`,
+        seconds: touch.days.reduce((sum, day) => sum + day.trustedSeconds, 0),
+        dayOffset: touch.days.length > 0 ? touch.days[0]!.dayOffset : null,
+      })),
+    );
+    const edgeRows = (e: JointEvidenceOfKind<"social-context-graph-v1">) => edgesOf(e).map((edge) => row({
+      dayOffset: edge.dayOffset, sampleValue: edge.seconds, edgeLeftKey: edge.left, edgeRightKey: edge.right,
+    }));
+    return {
+      "counterparts.semantic-touch-days-seconds": edgeRows,
+      "counterparts.maximum-matching": edgeRows,
+    };
+  })()),
+  jointResolverGroup("tc-conversation-v1", {
+    "starts.quiet-before": (e) => e.starts.map((s) => row({ dayOffset: s.dayOffset, sampleValue: s.quietBeforeMs })),
+    "starts.next-other-gap": (e) => e.starts.map((s) => row({ dayOffset: s.dayOffset, sampleValue: s.nextOtherGapMs })),
+    "starts.day-offset": (e) => e.starts.map((s) => row({ dayOffset: s.dayOffset })),
+    "revivals.dormant-before": (e) => e.revivalConversations.flatMap((c) => c.revivals.map((r) => row({
+      dayOffset: r.dayOffset, sampleValue: r.dormantBeforeMs, memberKey: `conversation:${c.conversationOrdinal}`,
+    }))),
+    "revivals.continuation-gap": (e) => e.revivalConversations.flatMap((c) => c.revivals.map((r) => row({
+      dayOffset: r.dayOffset, sampleValue: r.continuationGapMs, memberKey: `conversation:${c.conversationOrdinal}`,
+    }))),
+    "revivals.conversation-group": (e) => e.revivalConversations.flatMap((c) => c.revivals.map((r) => row({
+      dayOffset: r.dayOffset, memberKey: `conversation:${c.conversationOrdinal}`,
+    }))),
+    "revivals.day-offset": (e) => e.revivalConversations.flatMap((c) => c.revivals.map((r) => row({ dayOffset: r.dayOffset }))),
+    "areas.surface-local-social-days": (e) => e.areas.flatMap((a) => a.socialDays.map((d) => row({
+      dayOffset: d.dayOffset, memberKey: `area:${a.areaOrdinal}`,
+    }))),
+    "areas.best-other-gap": (e) => e.areas.flatMap((a) => a.socialDays.map((d) => row({
+      dayOffset: d.dayOffset, sampleValue: d.bestOtherGapMs, memberKey: `area:${a.areaOrdinal}`,
+    }))),
+    "third-party.prior-distinct-others": (e) => e.thirdPartyJoins.map((j) => row({ dayOffset: j.dayOffset, sampleValue: j.priorDistinctOtherGapMs.length })),
+    "third-party.next-other-gap": (e) => e.thirdPartyJoins.map((j) => row({ dayOffset: j.dayOffset, sampleValue: j.nextOtherGapMs })),
+    "third-party.day-offset": (e) => e.thirdPartyJoins.map((j) => row({ dayOffset: j.dayOffset })),
+  }),
+  jointResolverGroup("tc-reaction-posts-v1", {
+    "posts.post-breadth": (e) => e.posts.map((p) => row({ memberKey: `post:${p.postOrdinal}` })),
+    "posts.day-breadth": (e) => e.posts.flatMap((p) => p.reactionDayOffsets.map((offset) => row({ dayOffset: offset, memberKey: `post:${p.postOrdinal}` }))),
+  }),
+  jointResolverGroup("cross-modal-days-v1", {
+    "tc-days.gap": (e) => e.tcDays.map((d) => row({ dayOffset: d.dayOffset, sampleValue: d.bestOtherGapMs })),
+    "tc-days.day-offset": (e) => e.tcDays.map((d) => row({ dayOffset: d.dayOffset })),
+    "vc-days.breadth": (e) => e.vcDays.map((d) => row({ dayOffset: d.dayOffset, sampleValue: d.distinctCoPresentUsers })),
+    "vc-days.day-offset": (e) => e.vcDays.map((d) => row({ dayOffset: d.dayOffset })),
+  }),
+  jointResolverGroup("domain-social-time-v1", {
+    // semanticIndex 2 = ownUse for the public-room-social-time-v1 probe (see v2-calibration.ts).
+    "domainDays.public-room-own-use": (e) => e.domainDays.filter((d) => d.semanticIndex === 2).map((d) => row({ dayOffset: d.dayOffset, sampleValue: d.magnitude })),
+  }),
+  jointResolverGroup("invite-rooted-v1", {
+    "profiles.branch-activity-days": (e) => e.profiles.flatMap((p) => p.activityDays.map((d) => row({
+      dayOffset: d.dayOffset, memberKey: `profile:${p.profileOrdinal}`,
+    }))),
+    "profiles.branch-social-evidence": (e) => e.profiles.flatMap((p) => p.activityDays.map((d) => row({
+      dayOffset: d.dayOffset, sampleValue: d.vcTrustedSocialSeconds, memberKey: `profile:${p.profileOrdinal}`,
+    }))),
+    "profiles.next-generation-same-day-gap": (e) => e.profiles.flatMap((p) => p.nextGenerationOccurrences.map((o) => row({
+      dayOffset: o.entryDayOffset, sampleValue: o.tcBestOtherGapMs, memberKey: `profile:${p.profileOrdinal}`,
+    }))),
+    "profiles.next-generation-same-day-seconds": (e) => e.profiles.flatMap((p) => p.nextGenerationOccurrences.map((o) => row({
+      dayOffset: o.entryDayOffset, sampleValue: o.vcTrustedSocialSeconds, memberKey: `profile:${p.profileOrdinal}`,
+    }))),
+    // Each entry in nextGenerationOccurrences[] is only ever populated by the probe for
+    // occurrences that already satisfy root-before-child + same-day-before-entry chronology —
+    // presence of a row IS the structural fact, by construction.
+    "profiles.next-generation-occurrence": (e) => e.profiles.flatMap((p) => p.nextGenerationOccurrences.map((o) => row({
+      dayOffset: o.entryDayOffset, memberKey: `profile:${p.profileOrdinal}`,
+    }))),
+    "profiles.root-before-child": (e) => e.profiles.flatMap((p) => p.nextGenerationOccurrences.map((o) => row({
+      dayOffset: o.entryDayOffset, memberKey: `profile:${p.profileOrdinal}`,
+    }))),
+    "profiles.same-day-before-entry": (e) => e.profiles.flatMap((p) => p.nextGenerationOccurrences.map((o) => row({
+      dayOffset: o.entryDayOffset, memberKey: `profile:${p.profileOrdinal}`,
+    }))),
+    "profiles.independent-rooted-branches": (e) => e.profiles.map((p) => row({ memberKey: `profile:${p.profileOrdinal}` })),
+    "profiles.reunion-days": (e) => e.profiles.flatMap((p) => p.reunionDays.map((d) => row({
+      dayOffset: d.dayOffset, memberKey: `profile:${p.profileOrdinal}`,
+    }))),
+    "profiles.reunion-pair-social-evidence": (e) => e.profiles.flatMap((p) => p.reunionDays.map((d) => row({
+      dayOffset: d.dayOffset, sampleValue: d.vcTrustedPairSeconds, memberKey: `profile:${p.profileOrdinal}`,
+    }))),
+  }),
+  jointResolverGroup("castle-role-context-v1", {
+    "families.role-held-days": (e) => e.families.filter((f) => f.roleHeldDays.length > 0).map((f) => row({ memberKey: `family:${f.semanticIndex}` })),
+    "families.inside-days": (e) => e.families.filter((f) => f.insideDays.length > 0).map((f) => row({ memberKey: `family:${f.semanticIndex}` })),
+    "families.outside-days": (e) => e.families.flatMap((f) => f.outsideDays.map((d) => row({
+      dayOffset: d.dayOffset, sampleValue: d.trustedSeconds, groupKey: `family:${f.semanticIndex}`,
+    }))),
+    "families.outside-repeat-days": (e) => e.families.flatMap((f) => f.outsideDays.map((d) => row({
+      dayOffset: d.dayOffset, groupKey: `family:${f.semanticIndex}`,
+    }))),
+  }),
+]);
+
+function isSupportedJointSelector(kind: string, selector: string): boolean {
+  return Boolean(JOINT_ROW_RESOLVERS.get(kind)?.[selector]);
+}
+
 /**
  * Maps (jointEvidenceKind, selector) to the subject's raw row set for that selector, entirely
- * unfiltered. This is the ONLY place F5c2 interprets what an F5c1 selector string means
- * structurally — every mapping here corresponds 1:1 to how `v2-calibration-sweep.ts` actually
- * authored that selector's axis (row group, reducer kind, operator). An unrecognized selector
- * throws `UnsupportedSelectorError` rather than silently returning `[]` — a recognized selector
- * legitimately observing zero rows is a completely different state (see `SUPPORTED_JOINT_SELECTORS`).
+ * unfiltered — the single executable SSOT for what an F5c1 selector string means structurally
+ * (see `JOINT_ROW_RESOLVERS` / PR #191レビュー第3ラウンド§5). An unrecognized selector throws
+ * `UnsupportedSelectorError` rather than silently returning `[]` — a recognized selector
+ * legitimately observing zero rows is a completely different state.
  */
 function resolveJointRows(evidence: PlanningCalibrationJointEvidence, selector: string): readonly RawRow[] {
-  if (!isSupportedJointSelector(evidence.kind, selector)) throw new UnsupportedSelectorError(evidence.kind, selector);
-  switch (evidence.kind) {
-    case "activity-time-day-hour-v1":
-      switch (selector) {
-        case "rows.tc-gap":
-          return evidence.rows.map((r) => row({ dayOffset: r.dayOffset, sampleValue: r.tcBestOtherGapMs }));
-        case "rows.vc-seconds":
-          return evidence.rows.map((r) => row({ dayOffset: r.dayOffset, sampleValue: r.vcTrustedSocialSeconds }));
-        case "rows.day-hour-social-evidence":
-          return evidence.rows.map((r) => row({ dayOffset: r.dayOffset }));
-        case "rows.daypart-share":
-          // share denominator/numerator both use vcTrustedSocialSeconds magnitude.
-          return evidence.rows.map((r) => row({ dayOffset: r.dayOffset, sampleValue: r.vcTrustedSocialSeconds }));
-        case "rows.daypart-boundary":
-        case "rows.activity-start-hour":
-          return evidence.rows.map((r) => row({ dayOffset: r.dayOffset, sampleValue: r.hour }));
-        default:
-          return [];
-      }
-    case "day-occurrences-v1":
-      if (selector !== "dayOffsets.calendar-periods") return [];
-      // Bounded, deterministic period grouping: 7-day buckets relative to window start.
-      return evidence.dayOffsets.map((offset) => row({ dayOffset: offset, memberKey: `period:${Math.floor(offset / 7)}` }));
-    case "social-context-graph-v1": {
-      const edges = evidence.counterparts.flatMap((counterpart) =>
-        counterpart.touches.map((touch) => ({
-          left: `counterpart:${counterpart.counterpartOrdinal}`,
-          right: `semantic:${touch.semanticIndex}`,
-          seconds: touch.days.reduce((sum, day) => sum + day.trustedSeconds, 0),
-          dayOffset: touch.days.length > 0 ? touch.days[0]!.dayOffset : null,
-        })),
-      );
-      if (selector === "counterparts.semantic-touch-days-seconds" || selector === "counterparts.maximum-matching") {
-        return edges.map((edge) => row({
-          dayOffset: edge.dayOffset,
-          sampleValue: edge.seconds,
-          edgeLeftKey: edge.left,
-          edgeRightKey: edge.right,
-        }));
-      }
-      return [];
-    }
-    case "tc-conversation-v1":
-      switch (selector) {
-        case "starts.quiet-before":
-          return evidence.starts.map((s) => row({ dayOffset: s.dayOffset, sampleValue: s.quietBeforeMs }));
-        case "starts.next-other-gap":
-          return evidence.starts.map((s) => row({ dayOffset: s.dayOffset, sampleValue: s.nextOtherGapMs }));
-        case "starts.day-offset":
-          return evidence.starts.map((s) => row({ dayOffset: s.dayOffset }));
-        case "revivals.dormant-before":
-          return evidence.revivalConversations.flatMap((c) => c.revivals.map((r) => row({
-            dayOffset: r.dayOffset, sampleValue: r.dormantBeforeMs, memberKey: `conversation:${c.conversationOrdinal}`,
-          })));
-        case "revivals.continuation-gap":
-          return evidence.revivalConversations.flatMap((c) => c.revivals.map((r) => row({
-            dayOffset: r.dayOffset, sampleValue: r.continuationGapMs, memberKey: `conversation:${c.conversationOrdinal}`,
-          })));
-        case "revivals.conversation-group":
-          return evidence.revivalConversations.flatMap((c) => c.revivals.map((r) => row({
-            dayOffset: r.dayOffset, memberKey: `conversation:${c.conversationOrdinal}`,
-          })));
-        case "revivals.day-offset":
-          return evidence.revivalConversations.flatMap((c) => c.revivals.map((r) => row({ dayOffset: r.dayOffset })));
-        case "areas.surface-local-social-days":
-          return evidence.areas.flatMap((a) => a.socialDays.map((d) => row({
-            dayOffset: d.dayOffset, memberKey: `area:${a.areaOrdinal}`,
-          })));
-        case "areas.best-other-gap":
-          return evidence.areas.flatMap((a) => a.socialDays.map((d) => row({
-            dayOffset: d.dayOffset, sampleValue: d.bestOtherGapMs, memberKey: `area:${a.areaOrdinal}`,
-          })));
-        case "third-party.prior-distinct-others":
-          return evidence.thirdPartyJoins.map((j) => row({ dayOffset: j.dayOffset, sampleValue: j.priorDistinctOtherGapMs.length }));
-        case "third-party.next-other-gap":
-          return evidence.thirdPartyJoins.map((j) => row({ dayOffset: j.dayOffset, sampleValue: j.nextOtherGapMs }));
-        case "third-party.day-offset":
-          return evidence.thirdPartyJoins.map((j) => row({ dayOffset: j.dayOffset }));
-        default:
-          return [];
-      }
-    case "tc-reaction-posts-v1":
-      switch (selector) {
-        case "posts.post-breadth":
-          return evidence.posts.map((p) => row({ memberKey: `post:${p.postOrdinal}` }));
-        case "posts.day-breadth":
-          return evidence.posts.flatMap((p) => p.reactionDayOffsets.map((offset) => row({ dayOffset: offset, memberKey: `post:${p.postOrdinal}` })));
-        default:
-          return [];
-      }
-    case "cross-modal-days-v1":
-      switch (selector) {
-        case "tc-days.gap":
-          return evidence.tcDays.map((d) => row({ dayOffset: d.dayOffset, sampleValue: d.bestOtherGapMs }));
-        case "tc-days.day-offset":
-          return evidence.tcDays.map((d) => row({ dayOffset: d.dayOffset }));
-        case "vc-days.breadth":
-          return evidence.vcDays.map((d) => row({ dayOffset: d.dayOffset, sampleValue: d.distinctCoPresentUsers }));
-        case "vc-days.day-offset":
-          return evidence.vcDays.map((d) => row({ dayOffset: d.dayOffset }));
-        default:
-          return [];
-      }
-    case "domain-social-time-v1":
-      if (selector !== "domainDays.public-room-own-use") return [];
-      // semanticIndex 2 = ownUse for the public-room-social-time-v1 probe (see v2-calibration.ts).
-      return evidence.domainDays.filter((d) => d.semanticIndex === 2).map((d) => row({ dayOffset: d.dayOffset, sampleValue: d.magnitude }));
-    case "invite-rooted-v1":
-      switch (selector) {
-        case "profiles.branch-activity-days":
-          return evidence.profiles.flatMap((p) => p.activityDays.map((d) => row({
-            dayOffset: d.dayOffset, memberKey: `profile:${p.profileOrdinal}`,
-          })));
-        case "profiles.branch-social-evidence":
-          return evidence.profiles.flatMap((p) => p.activityDays.map((d) => row({
-            dayOffset: d.dayOffset, sampleValue: d.vcTrustedSocialSeconds, memberKey: `profile:${p.profileOrdinal}`,
-          })));
-        case "profiles.next-generation-same-day-gap":
-          return evidence.profiles.flatMap((p) => p.nextGenerationOccurrences.map((o) => row({
-            dayOffset: o.entryDayOffset, sampleValue: o.tcBestOtherGapMs, memberKey: `profile:${p.profileOrdinal}`,
-          })));
-        case "profiles.next-generation-same-day-seconds":
-          return evidence.profiles.flatMap((p) => p.nextGenerationOccurrences.map((o) => row({
-            dayOffset: o.entryDayOffset, sampleValue: o.vcTrustedSocialSeconds, memberKey: `profile:${p.profileOrdinal}`,
-          })));
-        case "profiles.next-generation-occurrence":
-        case "profiles.root-before-child":
-        case "profiles.same-day-before-entry":
-          // Each entry in nextGenerationOccurrences[] is only ever populated by the probe for
-          // occurrences that already satisfy root-before-child + same-day-before-entry
-          // chronology — presence of a row IS the structural fact, by construction.
-          return evidence.profiles.flatMap((p) => p.nextGenerationOccurrences.map((o) => row({
-            dayOffset: o.entryDayOffset, memberKey: `profile:${p.profileOrdinal}`,
-          })));
-        case "profiles.independent-rooted-branches":
-          return evidence.profiles.map((p) => row({ memberKey: `profile:${p.profileOrdinal}` }));
-        case "profiles.reunion-days":
-          return evidence.profiles.flatMap((p) => p.reunionDays.map((d) => row({
-            dayOffset: d.dayOffset, memberKey: `profile:${p.profileOrdinal}`,
-          })));
-        case "profiles.reunion-pair-social-evidence":
-          return evidence.profiles.flatMap((p) => p.reunionDays.map((d) => row({
-            dayOffset: d.dayOffset, sampleValue: d.vcTrustedPairSeconds, memberKey: `profile:${p.profileOrdinal}`,
-          })));
-        default:
-          return [];
-      }
-    case "castle-role-context-v1":
-      switch (selector) {
-        case "families.role-held-days":
-          return evidence.families.filter((f) => f.roleHeldDays.length > 0).map((f) => row({ memberKey: `family:${f.semanticIndex}` }));
-        case "families.inside-days":
-          return evidence.families.filter((f) => f.insideDays.length > 0).map((f) => row({ memberKey: `family:${f.semanticIndex}` }));
-        case "families.outside-days":
-          return evidence.families.flatMap((f) => f.outsideDays.map((d) => row({
-            dayOffset: d.dayOffset, sampleValue: d.trustedSeconds, groupKey: `family:${f.semanticIndex}`,
-          })));
-        case "families.outside-repeat-days":
-          return evidence.families.flatMap((f) => f.outsideDays.map((d) => row({
-            dayOffset: d.dayOffset, groupKey: `family:${f.semanticIndex}`,
-          })));
-        default:
-          return [];
-      }
-    default:
-      return [];
-  }
+  const resolver = JOINT_ROW_RESOLVERS.get(evidence.kind)?.[selector];
+  if (!resolver) throw new UnsupportedSelectorError(evidence.kind, selector);
+  return resolver(evidence);
 }
 
 function packForProbe(subject: PlanningCalibrationSubjectMeasurement, probeKey: string): PlanningCalibrationJointEvidence | null {
@@ -491,19 +467,22 @@ function evaluateFixedCriterion(
   subject: PlanningCalibrationSubjectMeasurement,
   probeKey: string,
   requiredJointEvidenceKind: PlanningCalibrationJointEvidence["kind"],
+  coverageWindowValidated: boolean,
 ): F5cShadowOutcome {
   if (criterion.kind === "METRIC_COMPARE") {
     const value = metricForProbe(subject, probeKey, criterion.metricKey);
     if (value === undefined) return "UNKNOWN";
     if (value === null) return "UNKNOWN";
-    if (criterion.operator === "GTE") return value >= criterion.fixedValue ? "MATCHED" : "NOT_MATCHED";
-    if (criterion.operator === "GT") return value > criterion.fixedValue ? "MATCHED" : "NOT_MATCHED";
-    return value === criterion.fixedValue ? "MATCHED" : "NOT_MATCHED";
+    const outcome =
+      criterion.operator === "GTE" ? (value >= criterion.fixedValue ? "MATCHED" : "NOT_MATCHED") :
+      criterion.operator === "GT" ? (value > criterion.fixedValue ? "MATCHED" : "NOT_MATCHED") :
+      value === criterion.fixedValue ? "MATCHED" : "NOT_MATCHED";
+    return zeroSensitiveOutcome(outcome, value === 0, coverageWindowValidated);
   }
   if (criterion.kind === "METRIC_BOOLEAN_TRUE") {
     const value = metricForProbe(subject, probeKey, criterion.metricKey);
     if (value === undefined || value === null) return "UNKNOWN";
-    return value !== 0 ? "MATCHED" : "NOT_MATCHED";
+    return zeroSensitiveOutcome(value !== 0 ? "MATCHED" : "NOT_MATCHED", value === 0, coverageWindowValidated);
   }
   if (criterion.kind === "ANY_METRIC_POSITIVE") {
     // PR #191レビュー§1: 真の3値OR——1つでもpositiveならMATCHED、positiveが無くても
@@ -513,7 +492,9 @@ function evaluateFixedCriterion(
       if (value === undefined || value === null) return "UNKNOWN";
       return value > 0 ? "MATCHED" : "NOT_MATCHED";
     });
-    return combineOutcomesOr(perMetric);
+    // NOT_MATCHED from combineOutcomesOr only happens when every defined metric was <=0 (an
+    // absolute zero across the board) — no MATCHED and no UNKNOWN present.
+    return zeroSensitiveOutcome(combineOutcomesOr(perMetric), true, coverageWindowValidated);
   }
   // JOINT_STRUCTURAL_FACT: presence of at least one row for this selector IS the fact — but only
   // once evidence is confirmed known; an unmeasured subject is UNKNOWN, never a false NOT_MATCHED
@@ -521,7 +502,7 @@ function evaluateFixedCriterion(
   if (!evidenceIsKnown(subject, probeKey, requiredJointEvidenceKind)) return "UNKNOWN";
   const evidence = packForProbe(subject, probeKey)!;
   const rows = resolveJointRows(evidence, criterion.selector);
-  return rows.length > 0 ? "MATCHED" : "NOT_MATCHED";
+  return zeroSensitiveOutcome(rows.length > 0 ? "MATCHED" : "NOT_MATCHED", rows.length === 0, coverageWindowValidated);
 }
 
 function evaluateManifestCriterion(
@@ -530,11 +511,12 @@ function evaluateManifestCriterion(
   probeKey: string,
   pinnedTotal: number | null,
   cardinalitySweepBoundary: number | null,
+  coverageWindowValidated: boolean,
 ): F5cShadowOutcome {
   const value = metricForProbe(subject, probeKey, criterion.countMetricKey);
   if (value === undefined || value === null) return "UNKNOWN";
   if (criterion.kind === "AT_LEAST_FIXED_DISTINCT_MEMBERS") {
-    return value >= criterion.fixedValue ? "MATCHED" : "NOT_MATCHED";
+    return zeroSensitiveOutcome(value >= criterion.fixedValue ? "MATCHED" : "NOT_MATCHED", value === 0, coverageWindowValidated);
   }
   if (criterion.kind === "MANIFEST_CARDINALITY_SWEEP") {
     // PR #191レビュー§6: 本番の数値は選ばれていないが、それは「常にMATCHED」を意味しない
@@ -542,11 +524,11 @@ function evaluateManifestCriterion(
     // のprevalenceはこの次元を無視してはならない。boundaryが定義できない(母集団0件)場合のみ
     // UNKNOWNへ倒す。
     if (cardinalitySweepBoundary === null) return "UNKNOWN";
-    return value >= cardinalitySweepBoundary ? "MATCHED" : "NOT_MATCHED";
+    return zeroSensitiveOutcome(value >= cardinalitySweepBoundary ? "MATCHED" : "NOT_MATCHED", value === 0, coverageWindowValidated);
   }
   // ALL_MANIFEST_MEMBERS / ALL_REQUIRED_SUPERDOMAINS: value must equal the pinned cardinality.
   if (pinnedTotal === null) return "UNKNOWN";
-  return value >= pinnedTotal ? "MATCHED" : "NOT_MATCHED";
+  return zeroSensitiveOutcome(value >= pinnedTotal ? "MATCHED" : "NOT_MATCHED", value === 0, coverageWindowValidated);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -647,6 +629,7 @@ interface AxisEvalContext {
   readonly plan: F5cCandidateSweepPlan;
   readonly probeKey: string;
   readonly subjects: readonly PlanningCalibrationSubjectMeasurement[];
+  readonly coverageWindowValidated: boolean;
 }
 
 function metricSamplesFor(ctx: AxisEvalContext, metricKey: string): { readonly bySubject: ReadonlyMap<string, number | null>; readonly samples: readonly number[] } {
@@ -684,18 +667,19 @@ function evaluateMetricAxis(ctx: AxisEvalContext, axis: F5cSweepAxis & { source:
   const knownSubjects = [...bySubject.entries()].filter(([, v]) => v !== null);
   const boundaryPoints: F5cBoundarySweepPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
     const boundaryValue = boundaries.get(percentile);
-    if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, passRate: null };
+    if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, marginalPassRate: null };
     const passingCount = knownSubjects.filter(([, v]) => passes(axis.operator, v!, boundaryValue)).length;
     return {
       percentile, boundaryValue, knownCount: knownSubjects.length, passingCount,
-      passRate: knownSubjects.length === 0 ? null : passingCount / knownSubjects.length,
+      marginalPassRate: knownSubjects.length === 0 ? null : passingCount / knownSubjects.length,
     };
   });
   const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
   const outcomeBySubject = new Map<string, F5cShadowOutcome>();
   for (const [subjectId, value] of bySubject) {
     if (value === null || representativeBoundary === undefined) { outcomeBySubject.set(subjectId, "UNKNOWN"); continue; }
-    outcomeBySubject.set(subjectId, passes(axis.operator, value, representativeBoundary) ? "MATCHED" : "NOT_MATCHED");
+    const outcome = passes(axis.operator, value, representativeBoundary) ? "MATCHED" : "NOT_MATCHED";
+    outcomeBySubject.set(subjectId, zeroSensitiveOutcome(outcome, value === 0, ctx.coverageWindowValidated));
   }
   return {
     sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, circularWindowPoints: null },
@@ -704,27 +688,45 @@ function evaluateMetricAxis(ctx: AxisEvalContext, axis: F5cSweepAxis & { source:
 }
 
 /**
- * PR #191レビュー§5: F5c1はどのdaypart/window境界も選んでいない——F5c2は
- * user-facingなlabel（"morning"等）を発明せず、本番のwindowも選ばない。代わりに
- * 固定幅（1日の1/3）のwindowを開始hour 0-23で有限に列挙し、observed母集団の
- * qualifying件数が最大となるwindow（tie-break: 最小の開始hour）を
- * 「このshadow実行の代表window」として決定論的に選び、MATCHED/NOT_MATCHED合成へ
- * 実際に寄与させる。これは本番の選択ではなく、単に観測分布がどこに集中しているかを
- * 示す診断的選択であり、24点全てのsensitivityが`circularWindowPoints`に残る。
+ * PR #191レビュー第2ラウンド§5 / 第3ラウンド§2: F5c1はどのdaypart/window境界も選んで
+ * いない——F5c2はuser-facingなlabel（"morning"等）を発明せず、本番のwindowも選ばない。
+ * だが、同じCIRCULAR_HOUR_WINDOW axis shapeは3つの構造的に異なる意味論
+ * （`F5cCircularIntent`参照）を表しており、全てを「母集団全体でのbest 8-hour
+ * window」戦略へ強制すると、No.32-35が同じwindowへ収束しかねない。以下は
+ * `axis.circularIntent.kind`で分岐する3つの実行戦略——固定幅（1日の1/3=
+ * `CIRCULAR_WINDOW_LENGTH_HOURS`）のwindow長は共通だが、探索領域・reduction・
+ * sensitivity表現がそれぞれ異なる。
  */
 const CIRCULAR_WINDOW_LENGTH_HOURS = 8;
+/** No.32-35 / No.37共通の中立的quadrant分割 — 本番のdaypart境界ではない（型doc参照）。 */
+const CIRCULAR_QUADRANT_COUNT = 4;
+const CIRCULAR_QUADRANT_WIDTH_HOURS = 24 / CIRCULAR_QUADRANT_COUNT;
 
 function hourInWindow(hour: number, windowStartHour: number, windowLengthHours: number): boolean {
   const offset = (hour - windowStartHour + 24) % 24;
   return offset < windowLengthHours;
 }
 
-function evaluateCircularHourAxis(
+const CIRCULAR_QUADRANT_INDEX: Readonly<Record<F5cCircularQuadrant, number>> = {
+  QUADRANT_0: 0, QUADRANT_1: 1, QUADRANT_2: 2, QUADRANT_3: 3,
+};
+
+function quadrantOfHour(hour: number): number {
+  return Math.floor(hour / CIRCULAR_QUADRANT_WIDTH_HOURS);
+}
+
+interface CircularAxisPrep {
+  readonly hourCounts: number[];
+  readonly observed: number;
+  readonly knownSubjectIds: readonly string[];
+}
+
+/** Shared prep every circular-intent strategy needs: the diagnostic histogram + who is known. */
+function prepareCircularAxis(
   ctx: AxisEvalContext,
-  axis: F5cSweepAxis & { reducerKind: "CIRCULAR_HOUR_WINDOW" },
   siblingFilteredRows: ReadonlyMap<string, readonly RawRow[]>,
   evidenceKnownBySubject: ReadonlyMap<string, boolean>,
-): { readonly sweep: F5cAxisSweepResult; readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome> } {
+): CircularAxisPrep {
   const hourCounts = Array.from({ length: 24 }, () => 0);
   let observed = 0;
   for (const subject of ctx.subjects) {
@@ -735,10 +737,33 @@ function evaluateCircularHourAxis(
       }
     }
   }
-
   const knownSubjectIds = ctx.subjects.filter((s) => evidenceKnownBySubject.get(s.subjectUserId) === true).map((s) => s.subjectUserId);
+  return { hourCounts, observed, knownSubjectIds };
+}
+
+/**
+ * No.32-35: search only within the candidate's own quadrant (a fixed, neutral 6-hour arc — not
+ * a production daypart cutoff) so the 4 daypart-target candidates cannot collapse onto the same
+ * representative window. The full 24-point enumeration is still reported for transparency; only
+ * the *representative* pick (the one MATCHED/NOT_MATCHED is computed against) is quadrant-scoped.
+ * A subject's own evidence not falling in the representative window is a positional fact, not an
+ * absence of evidence — `zeroSensitiveOutcome` does not apply here.
+ */
+function evaluateDaypartTargetAxis(
+  ctx: AxisEvalContext,
+  axis: F5cSweepAxis & { reducerKind: "CIRCULAR_HOUR_WINDOW" },
+  quadrant: F5cCircularQuadrant,
+  siblingFilteredRows: ReadonlyMap<string, readonly RawRow[]>,
+  evidenceKnownBySubject: ReadonlyMap<string, boolean>,
+): { readonly sweep: F5cAxisSweepResult; readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome> } {
+  const { hourCounts, observed, knownSubjectIds } = prepareCircularAxis(ctx, siblingFilteredRows, evidenceKnownBySubject);
+  const quadrantIndex = CIRCULAR_QUADRANT_INDEX[quadrant];
+  const allowedStarts = new Set(
+    Array.from({ length: CIRCULAR_QUADRANT_WIDTH_HOURS }, (_, i) => (quadrantIndex * CIRCULAR_QUADRANT_WIDTH_HOURS + i) % 24),
+  );
+
   const circularWindowPoints: F5cCircularWindowPoint[] = [];
-  let representativeStartHour = 0;
+  let representativeStartHour = quadrantIndex * CIRCULAR_QUADRANT_WIDTH_HOURS;
   let bestQualifyingCount = -1;
   for (let windowStartHour = 0; windowStartHour < 24; windowStartHour += 1) {
     let qualifying = 0;
@@ -751,9 +776,9 @@ function evaluateCircularHourAxis(
       windowLengthHours: CIRCULAR_WINDOW_LENGTH_HOURS,
       knownCount: knownSubjectIds.length,
       qualifyingCount: qualifying,
-      qualifyingRate: knownSubjectIds.length === 0 ? null : qualifying / knownSubjectIds.length,
+      marginalQualifyingRate: knownSubjectIds.length === 0 ? null : qualifying / knownSubjectIds.length,
     });
-    if (qualifying > bestQualifyingCount) { bestQualifyingCount = qualifying; representativeStartHour = windowStartHour; }
+    if (allowedStarts.has(windowStartHour) && qualifying > bestQualifyingCount) { bestQualifyingCount = qualifying; representativeStartHour = windowStartHour; }
   }
 
   const outcomeBySubject = new Map<string, F5cShadowOutcome>();
@@ -768,6 +793,123 @@ function evaluateCircularHourAxis(
     sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints: [], hourHistogram: hourCounts, circularWindowPoints },
     outcomeBySubject,
   };
+}
+
+/**
+ * No.36: a population-wide "best window" is the wrong question — "two users with equally stable
+ * but different personal usual times must not be judged solely by which time is more popular in
+ * the cohort" (PR #191レビュー第3ラウンド§7). Instead, reduce each subject to their OWN best
+ * personal 8-hour window's share of their OWN total rows (a stability/concentration ratio, not a
+ * shared window), then sweep that per-subject scalar with the standard percentile mechanism —
+ * exactly like a reduction axis, reusing `boundaryPoints` rather than a global window enumeration.
+ */
+function evaluatePersonalStabilityAxis(
+  ctx: AxisEvalContext,
+  axis: F5cSweepAxis & { reducerKind: "CIRCULAR_HOUR_WINDOW" },
+  siblingFilteredRows: ReadonlyMap<string, readonly RawRow[]>,
+  evidenceKnownBySubject: ReadonlyMap<string, boolean>,
+): { readonly sweep: F5cAxisSweepResult; readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome> } {
+  const { hourCounts, observed, knownSubjectIds } = prepareCircularAxis(ctx, siblingFilteredRows, evidenceKnownBySubject);
+
+  const shareBySubject = new Map<string, number>();
+  for (const subjectId of knownSubjectIds) {
+    const rows = (siblingFilteredRows.get(subjectId) ?? []).filter((r) => r.sampleValue !== null);
+    if (rows.length === 0) { shareBySubject.set(subjectId, 0); continue; }
+    let bestOwnCount = 0;
+    for (let windowStartHour = 0; windowStartHour < 24; windowStartHour += 1) {
+      const count = rows.filter((r) => hourInWindow(r.sampleValue!, windowStartHour, CIRCULAR_WINDOW_LENGTH_HOURS)).length;
+      if (count > bestOwnCount) bestOwnCount = count;
+    }
+    shareBySubject.set(subjectId, bestOwnCount / rows.length);
+  }
+
+  const samples = knownSubjectIds.map((id) => shareBySubject.get(id)!);
+  const boundaries = boundaryValuesFor(samples);
+  const boundaryPoints: F5cBoundarySweepPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
+    const boundaryValue = boundaries.get(percentile);
+    if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, marginalPassRate: null };
+    const passingCount = samples.filter((s) => s >= boundaryValue).length;
+    return { percentile, boundaryValue, knownCount: samples.length, passingCount, marginalPassRate: samples.length === 0 ? null : passingCount / samples.length };
+  });
+  const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+
+  const outcomeBySubject = new Map<string, F5cShadowOutcome>();
+  for (const subject of ctx.subjects) {
+    if (evidenceKnownBySubject.get(subject.subjectUserId) !== true || representativeBoundary === undefined) {
+      outcomeBySubject.set(subject.subjectUserId, "UNKNOWN");
+      continue;
+    }
+    const share = shareBySubject.get(subject.subjectUserId) ?? 0;
+    const outcome = share >= representativeBoundary ? "MATCHED" : "NOT_MATCHED";
+    outcomeBySubject.set(subject.subjectUserId, zeroSensitiveOutcome(outcome, share === 0, ctx.coverageWindowValidated));
+  }
+
+  return {
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: hourCounts, circularWindowPoints: null },
+    outcomeBySubject,
+  };
+}
+
+/**
+ * No.37: the opposite of daypart-target — reward spread, not concentration. Reduce each subject
+ * to the count of distinct quadrants (out of the same 4 neutral quadrants `DAYPART_TARGET`
+ * uses) containing at least one of their own qualifying rows, then sweep that per-subject
+ * breadth scalar the same way a reduction axis would. A single concentrated block (e.g. one
+ * all-nighter) can touch at most 2 of the 4 quadrants; genuine round-the-clock spread touches
+ * 3-4 — structurally distinct from `DAYPART_TARGET`'s single-window concentration measure.
+ */
+function evaluateMultiDaypartBreadthAxis(
+  ctx: AxisEvalContext,
+  axis: F5cSweepAxis & { reducerKind: "CIRCULAR_HOUR_WINDOW" },
+  siblingFilteredRows: ReadonlyMap<string, readonly RawRow[]>,
+  evidenceKnownBySubject: ReadonlyMap<string, boolean>,
+): { readonly sweep: F5cAxisSweepResult; readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome> } {
+  const { hourCounts, observed, knownSubjectIds } = prepareCircularAxis(ctx, siblingFilteredRows, evidenceKnownBySubject);
+
+  const breadthBySubject = new Map<string, number>();
+  for (const subjectId of knownSubjectIds) {
+    const rows = (siblingFilteredRows.get(subjectId) ?? []).filter((r) => r.sampleValue !== null);
+    const quadrants = new Set(rows.map((r) => quadrantOfHour(r.sampleValue!)));
+    breadthBySubject.set(subjectId, quadrants.size);
+  }
+
+  const samples = knownSubjectIds.map((id) => breadthBySubject.get(id)!);
+  const boundaries = boundaryValuesFor(samples);
+  const boundaryPoints: F5cBoundarySweepPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
+    const boundaryValue = boundaries.get(percentile);
+    if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, marginalPassRate: null };
+    const passingCount = samples.filter((s) => s >= boundaryValue).length;
+    return { percentile, boundaryValue, knownCount: samples.length, passingCount, marginalPassRate: samples.length === 0 ? null : passingCount / samples.length };
+  });
+  const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+
+  const outcomeBySubject = new Map<string, F5cShadowOutcome>();
+  for (const subject of ctx.subjects) {
+    if (evidenceKnownBySubject.get(subject.subjectUserId) !== true || representativeBoundary === undefined) {
+      outcomeBySubject.set(subject.subjectUserId, "UNKNOWN");
+      continue;
+    }
+    const breadth = breadthBySubject.get(subject.subjectUserId) ?? 0;
+    const outcome = breadth >= representativeBoundary ? "MATCHED" : "NOT_MATCHED";
+    outcomeBySubject.set(subject.subjectUserId, zeroSensitiveOutcome(outcome, breadth === 0, ctx.coverageWindowValidated));
+  }
+
+  return {
+    sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: hourCounts, circularWindowPoints: null },
+    outcomeBySubject,
+  };
+}
+
+function evaluateCircularHourAxis(
+  ctx: AxisEvalContext,
+  axis: F5cSweepAxis & { reducerKind: "CIRCULAR_HOUR_WINDOW" },
+  siblingFilteredRows: ReadonlyMap<string, readonly RawRow[]>,
+  evidenceKnownBySubject: ReadonlyMap<string, boolean>,
+): { readonly sweep: F5cAxisSweepResult; readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome> } {
+  const intent = axis.circularIntent;
+  if (intent.kind === "DAYPART_TARGET") return evaluateDaypartTargetAxis(ctx, axis, intent.quadrant, siblingFilteredRows, evidenceKnownBySubject);
+  if (intent.kind === "PERSONAL_STABILITY") return evaluatePersonalStabilityAxis(ctx, axis, siblingFilteredRows, evidenceKnownBySubject);
+  return evaluateMultiDaypartBreadthAxis(ctx, axis, siblingFilteredRows, evidenceKnownBySubject);
 }
 
 /**
@@ -811,11 +953,11 @@ function evaluatePostFilterMatchingAxis(
   const boundaries = boundaryValuesFor(matchingSizeSamples);
   const boundaryPoints: F5cBoundarySweepPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
     const boundaryValue = boundaries.get(percentile);
-    if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, passRate: null };
+    if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, marginalPassRate: null };
     const passingCount = matchingSizeSamples.filter((s) => s >= boundaryValue).length;
     return {
       percentile, boundaryValue, knownCount: matchingSizeSamples.length, passingCount,
-      passRate: matchingSizeSamples.length === 0 ? null : passingCount / matchingSizeSamples.length,
+      marginalPassRate: matchingSizeSamples.length === 0 ? null : passingCount / matchingSizeSamples.length,
     };
   });
   const representativeMatchingBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE) ?? 0;
@@ -825,7 +967,8 @@ function evaluatePostFilterMatchingAxis(
   for (const subject of ctx.subjects) {
     if (!evidenceIsKnown(subject, ctx.probeKey, ctx.plan.requiredJointEvidence.kind)) { outcomeAtRepresentative.set(subject.subjectUserId, "UNKNOWN"); continue; }
     const size = matchingSizeBySubject.get(subject.subjectUserId) ?? 0;
-    outcomeAtRepresentative.set(subject.subjectUserId, size >= representativeMatchingBoundary ? "MATCHED" : "NOT_MATCHED");
+    const outcome = size >= representativeMatchingBoundary ? "MATCHED" : "NOT_MATCHED";
+    outcomeAtRepresentative.set(subject.subjectUserId, zeroSensitiveOutcome(outcome, size === 0, ctx.coverageWindowValidated));
   }
   return {
     sweep: { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: observed, boundaryPoints, hourHistogram: null, circularWindowPoints: null },
@@ -960,9 +1103,9 @@ function evaluateRowGroup(
     const knownCount = [...reducedBySubject.values()].filter((r) => r.hasEvidence).length;
     const boundaryPoints: F5cBoundarySweepPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
       const boundaryValue = boundaries.get(percentile);
-      if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, passRate: null };
+      if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, marginalPassRate: null };
       const passingCount = [...reducedBySubject.values()].filter((r) => r.hasEvidence && passes(reductionAxis.operator, r.value, boundaryValue)).length;
-      return { percentile, boundaryValue, knownCount, passingCount, passRate: knownCount === 0 ? null : passingCount / knownCount };
+      return { percentile, boundaryValue, knownCount, passingCount, marginalPassRate: knownCount === 0 ? null : passingCount / knownCount };
     });
     sweeps.push({ axisKey: reductionAxis.axisKey, reducerKind: reductionAxis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, circularWindowPoints: null });
 
@@ -972,7 +1115,10 @@ function evaluateRowGroup(
       const prior = outcomeBySubject.get(subject.subjectUserId);
       let outcome: F5cShadowOutcome;
       if (!result.hasEvidence || representativeBoundary === undefined) outcome = "UNKNOWN";
-      else outcome = passes(reductionAxis.operator, result.value, representativeBoundary) ? "MATCHED" : "NOT_MATCHED";
+      else {
+        const raw = passes(reductionAxis.operator, result.value, representativeBoundary) ? "MATCHED" : "NOT_MATCHED";
+        outcome = zeroSensitiveOutcome(raw, result.value === 0, ctx.coverageWindowValidated);
+      }
       outcomeBySubject.set(subject.subjectUserId, prior === undefined ? outcome : combineOutcomes([prior, outcome]));
     }
   }
@@ -989,7 +1135,7 @@ function evaluateJointFilterAxis(
   const boundaries = boundaryValuesFor(allSamples);
   const boundaryPoints: F5cBoundarySweepPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
     const boundaryValue = boundaries.get(percentile);
-    if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, passRate: null };
+    if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, marginalPassRate: null };
     let known = 0;
     let passing = 0;
     for (const subject of ctx.subjects) {
@@ -998,7 +1144,7 @@ function evaluateJointFilterAxis(
       const rows = rawBySubject.get(subject.subjectUserId) ?? [];
       if (rows.some((r) => r.sampleValue !== null && passes(axis.operator, r.sampleValue, boundaryValue))) passing += 1;
     }
-    return { percentile, boundaryValue, knownCount: known, passingCount: passing, passRate: known === 0 ? null : passing / known };
+    return { percentile, boundaryValue, knownCount: known, passingCount: passing, marginalPassRate: known === 0 ? null : passing / known };
   });
   return { axisKey: axis.axisKey, reducerKind: axis.reducerKind, observedSampleCount: allSamples.length, boundaryPoints, hourHistogram: null, circularWindowPoints: null };
 }
@@ -1029,7 +1175,7 @@ function pinnedManifestTotal(plan: F5cCandidateSweepPlan): number | null {
  * PR #191レビュー§4: `unsupportedCandidateCount === 0`は「例外が飛ばなかった」だけの
  * 消極的な主張であってはならない——実際に実行可能であるという積極的な静的claimに
  * ならなければならない。plan単位で、実際に使われるJOINT_EVIDENCE軸/JOINT_STRUCTURAL_FACT
- * selectorが全て`SUPPORTED_JOINT_SELECTORS`に登録されているかを、subjectデータを
+ * selectorが全て`JOINT_ROW_RESOLVERS`に実行可能なmappingとして存在するかを、subjectデータを
  * 評価する前にチェックする。`requiredJointEvidence`が宣言するがどのaxis/criterionからも
  * 実際に参照されないselector（例: No.87/88のmanifest-onlyな宣言）は対象外——実行時に
  * `resolveJointRows`へ絶対に渡らないため、audit対象にする意味が無い。
@@ -1049,7 +1195,7 @@ function auditPlanSelectorSupport(plan: F5cCandidateSweepPlan): string | null {
 
 /**
  * Static, subject-data-independent audit across every plan — every actively-referenced JOINT_EVIDENCE
- * axis / JOINT_STRUCTURAL_FACT selector in `plans` must resolve against `SUPPORTED_JOINT_SELECTORS`.
+ * axis / JOINT_STRUCTURAL_FACT selector in `plans` must resolve against `JOINT_ROW_RESOLVERS`.
  * Exported so a dedicated test can assert READY-76 has zero gaps directly, without needing to
  * fabricate subject data to exercise every code path (PR #191レビュー§4).
  */
@@ -1067,8 +1213,9 @@ export function auditF5c2SelectorSupport(
 function executeCandidate(
   plan: F5cCandidateSweepPlan,
   subjects: readonly PlanningCalibrationSubjectMeasurement[],
+  coverageWindowValidated: boolean,
 ): F5cCandidateShadowResult {
-  const ctx: AxisEvalContext = { plan, probeKey: plan.probeKey, subjects };
+  const ctx: AxisEvalContext = { plan, probeKey: plan.probeKey, subjects, coverageWindowValidated };
   const axisSweeps: F5cAxisSweepResult[] = [];
   const outcomeBySubject = new Map<string, F5cShadowOutcome[]>();
   const pushOutcome = (subjectId: string, outcome: F5cShadowOutcome) => {
@@ -1084,7 +1231,7 @@ function executeCandidate(
     try {
       for (const subject of subjects) {
         for (const criterion of plan.fixedCriteria) {
-          pushOutcome(subject.subjectUserId, evaluateFixedCriterion(criterion, subject, plan.probeKey, plan.requiredJointEvidence.kind));
+          pushOutcome(subject.subjectUserId, evaluateFixedCriterion(criterion, subject, plan.probeKey, plan.requiredJointEvidence.kind, coverageWindowValidated));
         }
       }
     } catch (error) {
@@ -1104,17 +1251,17 @@ function executeCandidate(
         ? boundaryValuesFor(metricSamplesFor(ctx, criterion.countMetricKey).samples).get(F5C2_REPRESENTATIVE_PERCENTILE) ?? null
         : null;
       for (const subject of subjects) {
-        pushOutcome(subject.subjectUserId, evaluateManifestCriterion(criterion, subject, plan.probeKey, pinnedForCriterion, cardinalitySweepBoundary));
+        pushOutcome(subject.subjectUserId, evaluateManifestCriterion(criterion, subject, plan.probeKey, pinnedForCriterion, cardinalitySweepBoundary, coverageWindowValidated));
       }
       if (criterion.kind === "MANIFEST_CARDINALITY_SWEEP") {
         const { samples } = metricSamplesFor(ctx, criterion.countMetricKey);
         const boundaries = boundaryValuesFor(samples);
         const boundaryPoints: F5cBoundarySweepPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
           const boundaryValue = boundaries.get(percentile);
-          if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, passRate: null };
+          if (boundaryValue === undefined) return { percentile, boundaryValue: 0, knownCount: 0, passingCount: 0, marginalPassRate: null };
           const known = samples.length;
           const passing = samples.filter((v) => v >= boundaryValue).length;
-          return { percentile, boundaryValue, knownCount: known, passingCount: passing, passRate: known === 0 ? null : passing / known };
+          return { percentile, boundaryValue, knownCount: known, passingCount: passing, marginalPassRate: known === 0 ? null : passing / known };
         });
         axisSweeps.push({ axisKey: `manifest:${criterion.countMetricKey}`, reducerKind: "SCALAR_METRIC", observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, circularWindowPoints: null });
       }
@@ -1189,13 +1336,25 @@ function executeCandidate(
  * Executes every READY-76 F5c1 plan against a deterministic F5c calibration collection.
  * Restricted subject IDs are used transiently in-memory only — the returned report is
  * aggregate-only (counts/rates/boundary values), never subject identities or raw evidence.
+ *
+ * `coverageWindowValidated` is required, not defaulted (PR #191レビュー第3ラウンド§1): the
+ * caller must explicitly attest that `collection.window` starts after every source used by
+ * READY-76's probes was rolled out AND that the operator accepts the residual untracked-gap risk
+ * every safe source's `coverageLimitations` documents. Passing `false` is always safe (it only
+ * downgrades absolute-zero NOT_MATCHED outcomes to UNKNOWN — see `zeroSensitiveOutcome`); passing
+ * `true` is a real claim about the window's provenance, not a default to reach for casually.
  */
-export function executeF5cShadowCalibration(collection: PlanningCalibrationMeasurementCollection): F5cShadowCalibrationReport {
-  const results = F5C_CANDIDATE_SWEEP_PLANS.map((plan) => executeCandidate(plan, collection.subjects));
+export function executeF5cShadowCalibration(
+  collection: PlanningCalibrationMeasurementCollection,
+  coverageWindowValidated: boolean,
+): F5cShadowCalibrationReport {
+  const results = F5C_CANDIDATE_SWEEP_PLANS.map((plan) => executeCandidate(plan, collection.subjects, coverageWindowValidated));
   const unsupportedCandidateCount = results.filter((r) => r.executionStrategy === "UNSUPPORTED_GAP").length;
   return deepFreeze({
     contractVersion: F5C2_SHADOW_CONTRACT_VERSION,
     sweepContractVersion: F5C_SWEEP_CONTRACT_VERSION,
+    sensitivityModel: F5C2_SENSITIVITY_MODEL,
+    coverageWindowValidated,
     cohort: collection.cohort,
     window: collection.window,
     readyCandidateCount: F5C_CANDIDATE_SWEEP_PLANS.length,
@@ -1205,7 +1364,14 @@ export function executeF5cShadowCalibration(collection: PlanningCalibrationMeasu
   });
 }
 
-/** Convenience wrapper: collect + execute in one call. Never persists/logs subject identity. */
-export function runF5cShadowCalibration(db: Database.Database, input: F5aCalibrationInput): F5cShadowCalibrationReport {
-  return executeF5cShadowCalibration(collectF5cCalibrationMeasurements(db, input));
+/**
+ * Convenience wrapper: collect + execute in one call. Never persists/logs subject identity.
+ * See `executeF5cShadowCalibration` for what `coverageWindowValidated` actually attests.
+ */
+export function runF5cShadowCalibration(
+  db: Database.Database,
+  input: F5aCalibrationInput,
+  coverageWindowValidated: boolean,
+): F5cShadowCalibrationReport {
+  return executeF5cShadowCalibration(collectF5cCalibrationMeasurements(db, input), coverageWindowValidated);
 }

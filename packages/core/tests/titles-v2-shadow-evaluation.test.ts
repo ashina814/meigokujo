@@ -17,6 +17,7 @@ import {
   runF5cShadowCalibration,
   auditF5c2SelectorSupport,
   F5C2_BOUNDARY_PERCENTILES,
+  F5C2_SENSITIVITY_MODEL,
   type F5cShadowCalibrationReport,
 } from "../src/titles/v2-shadow-evaluation.js";
 import type { PlanningCalibrationJointEvidence, PlanningCalibrationMeasurementCollection, PlanningCalibrationSubjectMeasurement } from "../src/titles/v2-calibration.js";
@@ -73,7 +74,7 @@ function probeKeyFor(no: number): string {
 
 describe("F5c2 shadow-calibration executor", () => {
   it("A. every READY-76 candidate is accounted for with an empty population — no silent skip", () => {
-    const report = executeF5cShadowCalibration(collection([]));
+    const report = executeF5cShadowCalibration(collection([]), true);
     expect(report.readyCandidateCount).toBe(76);
     expect(report.results).toHaveLength(76);
     expect(report.results.map((r) => r.candidateNo)).toEqual(F5C_CANDIDATE_SWEEP_PLANS.map((p) => p.candidateNo));
@@ -90,7 +91,7 @@ describe("F5c2 shadow-calibration executor", () => {
   });
 
   it("B. no production threshold is selected — boundary percentiles are exactly the fixed finite grid", () => {
-    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "bump-contribution-v1", metrics: { eventCount: 3 } }])]));
+    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "bump-contribution-v1", metrics: { eventCount: 3 } }])]), true);
     const plan38 = byNo(report, 38);
     expect(plan38.axisSweeps).toEqual([]); // STRUCTURAL_FIXED: no axes at all
     for (const result of report.results) {
@@ -103,7 +104,7 @@ describe("F5c2 shadow-calibration executor", () => {
   it("C. UNKNOWN is distinguished from observed zero/false (fixed criteria)", () => {
     const withEvidence = subject("alice", [{ probeKey: "bump-contribution-v1", metrics: { eventCount: 0 } }]);
     const noEvidence = subject("bob", [{ probeKey: "bump-contribution-v1", metrics: {} }]);
-    const report = executeF5cShadowCalibration(collection([withEvidence, noEvidence]));
+    const report = executeF5cShadowCalibration(collection([withEvidence, noEvidence]), true);
     const plan38 = byNo(report, 38); // fixedCriteria: eventCount >= 1
     expect(plan38.matchedCount).toBe(0);
     expect(plan38.notMatchedCount).toBe(1); // alice: eventCount=0, observed and evaluated -> NOT_MATCHED
@@ -133,7 +134,7 @@ describe("F5c2 shadow-calibration executor", () => {
     const report = executeF5cShadowCalibration(collection([
       subject("subjectA", [{ probeKey: "tc-conversation-v1", jointEvidence: evidenceA }]),
       subject("subjectB", [{ probeKey: "tc-conversation-v1", jointEvidence: evidenceB }]),
-    ]));
+    ]), true);
     const plan42 = byNo(report, 42);
     expect(plan42.executionStrategy).toBe("JOINT_EVIDENCE_SWEEP");
     const startDays = plan42.axisSweeps.find((s) => s.axisKey === "start-days")!;
@@ -152,7 +153,7 @@ describe("F5c2 shadow-calibration executor", () => {
         { dayOffset: 2, hour: 14, tcBestOtherGapMs: 1, vcTrustedSocialSeconds: 0 }, // qualifies via TC only
       ],
     };
-    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "activity-time-v1", jointEvidence: evidence }])]));
+    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "activity-time-v1", jointEvidence: evidence }])]), true);
     const plan32 = byNo(report, 32);
     const qualifyingDays = plan32.axisSweeps.find((s) => s.axisKey === "candidate-32-qualifying-days")!;
     // both day-1 (VC-only) and day-2 (TC-only) rows must be able to qualify under ANY_FILTER —
@@ -170,7 +171,7 @@ describe("F5c2 shadow-calibration executor", () => {
         { dayOffset: 3, hour: 20, tcBestOtherGapMs: null, vcTrustedSocialSeconds: 500 },
       ],
     };
-    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "activity-time-v1", jointEvidence: evidence }])]));
+    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "activity-time-v1", jointEvidence: evidence }])]), true);
     const plan32 = byNo(report, 32);
     const boundary = plan32.axisSweeps.find((s) => s.axisKey === "candidate-32-daypart-boundary")!;
     expect(boundary.hourHistogram).not.toBeNull();
@@ -189,30 +190,144 @@ describe("F5c2 shadow-calibration executor", () => {
     expect(windowCoveringHour3.qualifyingCount).toBe(1);
   });
 
-  it("circular window enumeration actually changes the shadow MATCHED/NOT_MATCHED outcome (No.36)", () => {
-    // 2 subjects clustered at hour 2 (majority) and 1 subject isolated at hour 14 (12 hours away
-    // circularly, outside any 8-hour window that also covers hour 2) — the population-optimal
-    // window must land on the majority cluster, leaving the isolated subject NOT_MATCHED on the
-    // circular criterion specifically because of which window was chosen (PR #191レビュー§5/§10).
+  it("No.36 PERSONAL_STABILITY judges each subject by their OWN concentration, not by which time is popular in the cohort (PR #191レビュー第3ラウンド§2/§7)", () => {
+    // alice's usual time is hour 8 every day; bob's is hour 20 every day (a DIFFERENT, minority
+    // time) — both are perfectly, equally stable and must both MATCH despite bob's time never
+    // being the cohort's most popular. carol is scattered across 4 widely-spaced hours (no single
+    // 8-hour window can catch more than 2 of her 4 days) and must NOT_MATCH.
     const probeKey = probeKeyFor(36);
-    const clustered = (id: string, hour: number) => subject(id, [{
+    const daily = (id: string, hours: readonly number[]) => subject(id, [{
       probeKey,
       metrics: { vcTop3HoursShare: 1, vcTotalTrustedSeconds: 1000 },
       jointEvidence: {
         kind: "activity-time-day-hour-v1",
-        rows: [{ dayOffset: 1, hour, tcBestOtherGapMs: null, vcTrustedSocialSeconds: 100 }],
+        rows: hours.map((hour, i) => ({ dayOffset: i + 1, hour, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 })),
       },
     }]);
     const report = executeF5cShadowCalibration(collection([
-      clustered("majorityA", 2), clustered("majorityB", 2), clustered("minority", 14),
-    ]));
+      daily("alice", [8, 8, 8, 8]),
+      daily("bob", [20, 20, 20, 20]),
+      daily("carol", [2, 8, 14, 20]),
+    ]), true);
     const plan36 = byNo(report, 36);
-    const boundarySweep = plan36.axisSweeps.find((s) => s.axisKey === "usual-time-start-hour-stability")!;
-    const bestWindow = [...boundarySweep.circularWindowPoints!].sort((a, b) => b.qualifyingCount - a.qualifyingCount)[0]!;
-    expect(bestWindow.qualifyingCount).toBe(2); // the two hour-2 subjects, not the isolated one
-    expect(plan36.matchedCount).toBe(2);
-    expect(plan36.notMatchedCount).toBe(1);
+    const sweep = plan36.axisSweeps.find((s) => s.axisKey === "usual-time-start-hour-stability")!;
+    // PERSONAL_STABILITY has no single shared window — it sweeps a per-subject concentration
+    // scalar via the standard percentile mechanism, not the population-wide window enumeration.
+    expect(sweep.circularWindowPoints).toBeNull();
+    expect(sweep.boundaryPoints.length).toBeGreaterThan(0);
+    expect(plan36.matchedCount).toBe(2); // alice, bob — different usual times, equally stable
+    expect(plan36.notMatchedCount).toBe(1); // carol — scattered, not personally stable
     expect(plan36.unknownCount).toBe(0);
+  });
+
+  it("No.36 rows.activity-start-hour is the day's earliest recorded hour, not every hourly row (PR #191レビュー第3ラウンド§3)", () => {
+    const probeKey = probeKeyFor(36);
+    const s = subject("alice", [{
+      probeKey,
+      metrics: { vcTop3HoursShare: 1, vcTotalTrustedSeconds: 1000 },
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: [
+          { dayOffset: 1, hour: 15, tcBestOtherGapMs: null, vcTrustedSocialSeconds: 100 },
+          { dayOffset: 1, hour: 5, tcBestOtherGapMs: null, vcTrustedSocialSeconds: 100 }, // same day, earlier hour
+        ],
+      },
+    }]);
+    const report = executeF5cShadowCalibration(collection([s]), true);
+    const plan36 = byNo(report, 36);
+    const sweep = plan36.axisSweeps.find((s) => s.axisKey === "usual-time-start-hour-stability")!;
+    // "start hour" is one value per day (the earliest) — 2 rows on the same day must still
+    // resolve to exactly 1 start-hour sample, at the earlier of the two hours.
+    expect(sweep.observedSampleCount).toBe(1);
+    expect(sweep.hourHistogram![5]).toBe(1);
+    expect(sweep.hourHistogram![15]).toBe(0);
+  });
+
+  it("No.32/34 DAYPART_TARGET candidates search disjoint quadrants and can diverge on the identical population (PR #191レビュー第3ラウンド§2 counterexample)", () => {
+    // A single subject active only at hour 14 (deep in quadrant 2 = [12,18), unreachable by any
+    // window whose start is restricted to quadrant 0 = [0,6)'s allowed starts). No.32 targets
+    // quadrant 0 and must NOT_MATCH; No.34 targets quadrant 2 and must MATCH — on the SAME shared
+    // activity-time-v1 pack, proving the two daypart-target candidates no longer collapse onto a
+    // single population-wide "best window."
+    const probeKey = probeKeyFor(32);
+    const s = subject("alice", [{
+      probeKey,
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: [{ dayOffset: 1, hour: 14, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 }],
+      },
+    }]);
+    const report = executeF5cShadowCalibration(collection([s]), true);
+    const plan32 = byNo(report, 32);
+    const plan34 = byNo(report, 34);
+    expect(plan32.matchedCount).toBe(0);
+    expect(plan32.notMatchedCount).toBe(1);
+    expect(plan34.matchedCount).toBe(1);
+    expect(plan34.notMatchedCount).toBe(0);
+  });
+
+  it("No.37 MULTI_DAYPART_BREADTH rewards spread across quadrants, not concentration in one (PR #191レビュー第3ラウンド§2/§7)", () => {
+    // 4 subjects with breadth 1/2/3/4 distinct quadrants touched -> population representative
+    // (p50) boundary = 2 -> the single-quadrant subject (breadth 1, all days at the same hour)
+    // fails while every subject reaching 2+ quadrants passes.
+    const probeKey = probeKeyFor(37);
+    const spread = (id: string, hours: readonly number[]) => subject(id, [{
+      probeKey,
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: hours.map((hour, i) => ({ dayOffset: i + 1, hour, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 })),
+      },
+    }]);
+    const report = executeF5cShadowCalibration(collection([
+      spread("breadth1", [2, 2, 2, 2]),
+      spread("breadth2", [2, 8, 2, 8]),
+      spread("breadth3", [2, 8, 14, 2]),
+      spread("breadth4", [2, 8, 14, 20]),
+    ]), true);
+    const plan37 = byNo(report, 37);
+    expect(plan37.notMatchedCount).toBe(1);
+    expect(plan37.matchedCount).toBe(3);
+    expect(plan37.unknownCount).toBe(0);
+  });
+
+  it("coverageWindowValidated=false downgrades an absolute-zero NOT_MATCHED to UNKNOWN, but never touches a real MATCHED (PR #191レビュー第3ラウンド§1 counterexample)", () => {
+    const probeKey = probeKeyFor(49);
+    const alice = subject("alice", [{
+      probeKey,
+      jointEvidence: { kind: "cross-modal-days-v1", tcDays: [], vcDays: [
+        { dayOffset: 1, distinctCoPresentUsers: 5 }, { dayOffset: 2, distinctCoPresentUsers: 5 },
+        { dayOffset: 3, distinctCoPresentUsers: 5 }, { dayOffset: 4, distinctCoPresentUsers: 5 },
+      ] },
+    }]);
+    const bob = subject("bob", [{
+      probeKey,
+      jointEvidence: { kind: "cross-modal-days-v1", tcDays: [
+        { dayOffset: 1, bestOtherGapMs: 100 }, { dayOffset: 2, bestOtherGapMs: 100 },
+      ], vcDays: [{ dayOffset: 1, distinctCoPresentUsers: 5 }] },
+    }]);
+    const carol = subject("carol", [{
+      probeKey,
+      jointEvidence: { kind: "cross-modal-days-v1", tcDays: [
+        { dayOffset: 1, bestOtherGapMs: 100 }, { dayOffset: 2, bestOtherGapMs: 100 }, { dayOffset: 3, bestOtherGapMs: 100 },
+      ], vcDays: [{ dayOffset: 1, distinctCoPresentUsers: 5 }] },
+    }]);
+    const report = executeF5cShadowCalibration(collection([alice, bob, carol]), false);
+    expect(report.coverageWindowValidated).toBe(false);
+    const plan49 = byNo(report, 49);
+    expect(plan49.unknownCount).toBe(1); // alice: TC=0 (absolute zero) is no longer trusted as a real NOT_MATCHED
+    expect(plan49.matchedCount).toBe(2); // bob, carol: positive TC evidence remains trusted regardless
+    expect(plan49.notMatchedCount).toBe(0);
+  });
+
+  it("sensitivity model is explicitly typed as marginal-axis-only, not candidate-level sensitivity (PR #191レビュー第3ラウンド§4)", () => {
+    const report = executeF5cShadowCalibration(collection([]), true);
+    expect(report.sensitivityModel).toBe(F5C2_SENSITIVITY_MODEL);
+  });
+
+  it("selector support has a single executable SSOT — no parallel selector-name list exists alongside the resolvers (PR #191レビュー第3ラウンド§5)", () => {
+    const source = require("node:fs").readFileSync(new URL("../src/titles/v2-shadow-evaluation.ts", import.meta.url), "utf8") as string;
+    expect(source).not.toContain("SUPPORTED_JOINT_SELECTORS");
+    expect(source).toContain("JOINT_ROW_RESOLVERS");
   });
 
   it("G. POST_FILTER_MATCHING_SIZE recomputes matching after the edge filter — it does not reuse the pre-filter structural max", () => {
@@ -230,7 +345,7 @@ describe("F5c2 shadow-calibration executor", () => {
         { counterpartOrdinal: 2, touches: [{ semanticIndex: 2, days: [{ dayOffset: 1, trustedSeconds: 10 }] }] },
       ],
     };
-    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "social-class-context-v1", jointEvidence: evidence }])]));
+    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "social-class-context-v1", jointEvidence: evidence }])]), true);
     const plan26 = byNo(report, 26);
     const matchingSweep = plan26.axisSweeps.find((s) => s.axisKey === "class-person-matching")!;
     expect(matchingSweep.reducerKind).toBe("POST_FILTER_MATCHING_SIZE");
@@ -273,7 +388,7 @@ describe("F5c2 shadow-calibration executor", () => {
       subject("alice", [{ probeKey: "social-class-context-v1", jointEvidence: richGraph() }]),
       subject("bob", [{ probeKey: "social-class-context-v1", jointEvidence: sparseGraph }]),
       subject("carol", [{ probeKey: "social-class-context-v1", jointEvidence: richGraph() }]),
-    ]));
+    ]), true);
     const plan26 = byNo(report, 26);
     expect(plan26.matchedCount).toBe(2); // alice, carol
     expect(plan26.notMatchedCount).toBe(1); // bob
@@ -292,7 +407,7 @@ describe("F5c2 shadow-calibration executor", () => {
       ],
       socialHours: [],
     };
-    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "public-room-social-time-v1", jointEvidence: evidence }])]));
+    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "public-room-social-time-v1", jointEvidence: evidence }])]), true);
     const plan56 = byNo(report, 56);
     const daysSweep = plan56.axisSweeps.find((s) => s.axisKey === "own-room-use-days")!;
     const spanSweep = plan56.axisSweeps.find((s) => s.axisKey === "own-room-use-span")!;
@@ -315,7 +430,7 @@ describe("F5c2 shadow-calibration executor", () => {
         { dayOffset: 3, distinctCoPresentUsers: 3 }, { dayOffset: 4, distinctCoPresentUsers: 3 },
       ],
     };
-    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "cross-modal-v1", jointEvidence: evidence }])]));
+    const report = executeF5cShadowCalibration(collection([subject("alice", [{ probeKey: "cross-modal-v1", jointEvidence: evidence }])]), true);
     const plan49 = byNo(report, 49);
     const tcQualifyingDays = plan49.axisSweeps.find((s) => s.axisKey === "tc-qualifying-days")!;
     const vcQualifyingDays = plan49.axisSweeps.find((s) => s.axisKey === "vc-qualifying-days")!;
@@ -352,7 +467,7 @@ describe("F5c2 shadow-calibration executor", () => {
         { dayOffset: 1, bestOtherGapMs: 100 }, { dayOffset: 2, bestOtherGapMs: 100 }, { dayOffset: 3, bestOtherGapMs: 100 },
       ], vcDays: [{ dayOffset: 1, distinctCoPresentUsers: 5 }] },
     }]);
-    const report = executeF5cShadowCalibration(collection([alice, bob, carol]));
+    const report = executeF5cShadowCalibration(collection([alice, bob, carol]), true);
     const plan49 = byNo(report, 49);
     expect(plan49.unknownCount).toBe(0);
     expect(plan49.notMatchedCount).toBe(1); // alice: TC=0 fails the population's TC boundary for real
@@ -373,7 +488,7 @@ describe("F5c2 shadow-calibration executor", () => {
     }]);
     // subjectB: never measured by this probe at all (no pack for probeKey) — genuinely UNKNOWN.
     const neverMeasured = subject("subjectB", []);
-    const report = executeF5cShadowCalibration(collection([observedEmpty, neverMeasured]));
+    const report = executeF5cShadowCalibration(collection([observedEmpty, neverMeasured]), true);
     const plan78 = byNo(report, 78);
     expect(plan78.notMatchedCount).toBe(1); // subjectA: observed, empty, real zero
     expect(plan78.unknownCount).toBe(1); // subjectB: never measured
@@ -385,7 +500,7 @@ describe("F5c2 shadow-calibration executor", () => {
     // hasNaturalOutflow=0 is a definite NOT_MATCHED; the axis metrics (distinctFamilies etc.) are
     // entirely absent (UNKNOWN) — the combined outcome must be NOT_MATCHED, not UNKNOWN.
     const s = subject("alice", [{ probeKey, metrics: { hasNaturalInflow: 1, hasNaturalOutflow: 0 } }]);
-    const report = executeF5cShadowCalibration(collection([s]));
+    const report = executeF5cShadowCalibration(collection([s]), true);
     const plan61 = byNo(report, 61);
     expect(plan61.notMatchedCount).toBe(1);
     expect(plan61.unknownCount).toBe(0);
@@ -394,7 +509,7 @@ describe("F5c2 shadow-calibration executor", () => {
   it("three-valued AND: no FALSE present but an UNKNOWN input keeps the whole candidate UNKNOWN, never silently MATCHED (No.61)", () => {
     const probeKey = probeKeyFor(61);
     const s = subject("alice", [{ probeKey, metrics: { hasNaturalInflow: 1, hasNaturalOutflow: 1 } }]);
-    const report = executeF5cShadowCalibration(collection([s]));
+    const report = executeF5cShadowCalibration(collection([s]), true);
     const plan61 = byNo(report, 61);
     expect(plan61.unknownCount).toBe(1);
     expect(plan61.matchedCount).toBe(0);
@@ -407,7 +522,7 @@ describe("F5c2 shadow-calibration executor", () => {
     // and organizerCount entirely absent (UNKNOWN) on the ANY_METRIC_POSITIVE criterion — the old
     // buggy `values.some(v => v>0)` read this as NOT_MATCHED; the correct 3-valued OR is UNKNOWN.
     const s = subject("alice", [{ probeKey, metrics: { participantOnlyCount: 1, staffCount: 0 } }]);
-    const report = executeF5cShadowCalibration(collection([s]));
+    const report = executeF5cShadowCalibration(collection([s]), true);
     const plan83 = byNo(report, 83);
     expect(plan83.unknownCount).toBe(1);
     expect(plan83.notMatchedCount).toBe(0);
@@ -437,14 +552,14 @@ describe("F5c2 shadow-calibration executor", () => {
   });
 
   it("F5c1 contract-version and manifest pin drift cannot be hidden by F5c2 literals", () => {
-    const report = executeF5cShadowCalibration(collection([]));
+    const report = executeF5cShadowCalibration(collection([]), true);
     // Read from the SAME F5c1 export F5c2 itself consumes — if F5c2 regressed to a hardcoded
     // literal, this would still pass today but silently drift the next time F5c1 bumps its
     // contract version, which is exactly the failure mode PR #191レビュー§3 forbids.
     expect(report.sweepContractVersion).toBe(F5C_SWEEP_CONTRACT_VERSION);
     const partial = subject("alice", [{ probeKey: "casino-edition-completion-v1", metrics: { distinctCompletedFamilies: F5C1_MANIFEST_PINS.CASINO_EDITION.families.length - 1, allFamiliesCompleted: 0, totalFamilyCompletionDays: 1 } }]);
     const all = subject("bob", [{ probeKey: "casino-edition-completion-v1", metrics: { distinctCompletedFamilies: F5C1_MANIFEST_PINS.CASINO_EDITION.families.length, allFamiliesCompleted: 1, totalFamilyCompletionDays: 1 } }]);
-    const report69 = executeF5cShadowCalibration(collection([partial, all]));
+    const report69 = executeF5cShadowCalibration(collection([partial, all]), true);
     const plan69 = byNo(report69, 69);
     expect(plan69.matchedCount).toBe(1);
     expect(plan69.notMatchedCount).toBe(1);
@@ -453,7 +568,7 @@ describe("F5c2 shadow-calibration executor", () => {
   it("J. manifest ALL_MANIFEST_MEMBERS (No.69) requires the pinned family cardinality, not just >0", () => {
     const partial = subject("alice", [{ probeKey: "casino-edition-completion-v1", metrics: { distinctCompletedFamilies: 3, allFamiliesCompleted: 0, totalFamilyCompletionDays: 3 } }]);
     const all = subject("bob", [{ probeKey: "casino-edition-completion-v1", metrics: { distinctCompletedFamilies: 8, allFamiliesCompleted: 1, totalFamilyCompletionDays: 8 } }]);
-    const report = executeF5cShadowCalibration(collection([partial, all]));
+    const report = executeF5cShadowCalibration(collection([partial, all]), true);
     const plan69 = byNo(report, 69);
     expect(plan69.executionStrategy).toBe("MANIFEST_CRITERIA");
     expect(plan69.matchedCount).toBe(1); // only bob (8/8) satisfies ALL_MANIFEST_MEMBERS
@@ -465,7 +580,7 @@ describe("F5c2 shadow-calibration executor", () => {
     // samples=[3,5,6,7]; p50 nearest-rank boundary = 5 -> subjects with breadth>=5 (5,6,7) MATCHED,
     // breadth=3 NOT_MATCHED (PR #191レビュー§6: this dimension must actually affect prevalence).
     const subjects = [3, 5, 6, 7].map((n, i) => subject(`s${i}`, [{ probeKey: "castle-social-time-v1", metrics: { domainSemanticBreadth: n, domainDayTouches: n, domainActiveDays: n, domainActiveSpanDays: n } }]));
-    const report = executeF5cShadowCalibration(collection(subjects));
+    const report = executeF5cShadowCalibration(collection(subjects), true);
     const plan88 = byNo(report, 88);
     const sweep = plan88.axisSweeps.find((s) => s.axisKey === "manifest:domainSemanticBreadth")!;
     expect(sweep).toBeDefined();
@@ -485,13 +600,13 @@ describe("F5c2 shadow-calibration executor", () => {
     };
     const report = executeF5cShadowCalibration(collection([
       subject("RESTRICTED_SUBJECT_ID_777", [{ probeKey: "tc-conversation-v1", jointEvidence: evidence }]),
-    ]));
+    ]), true);
     const serialized = JSON.stringify(report);
     expect(serialized).not.toContain("RESTRICTED_SUBJECT_ID_777");
   });
 
   it("M. deep-frozen output", () => {
-    const report = executeF5cShadowCalibration(collection([]));
+    const report = executeF5cShadowCalibration(collection([]), true);
     expect(Object.isFrozen(report)).toBe(true);
     expect(Object.isFrozen(report.results)).toBe(true);
     expect(Object.isFrozen(report.results[0])).toBe(true);
@@ -525,7 +640,7 @@ describe("F5c2 shadow-calibration executor", () => {
       participation_key TEXT PRIMARY KEY, market_id INTEGER NOT NULL, market_creator_id TEXT NOT NULL,
       participant_id TEXT NOT NULL, market_mode TEXT NOT NULL, market_created_at INTEGER NOT NULL,
       market_deadline_at INTEGER NOT NULL, occurred_at INTEGER NOT NULL)`);
-    const report = runF5cShadowCalibration(db, { cohortKey: "shadow-integration", subjectUserIds: ["alice", "bob"], window: WINDOW });
+    const report = runF5cShadowCalibration(db, { cohortKey: "shadow-integration", subjectUserIds: ["alice", "bob"], window: WINDOW }, true);
     expect(report.results).toHaveLength(76);
     expect(report.cohort.subjectCount).toBe(2);
     expect(report.unsupportedCandidateCount).toBe(0);

@@ -2614,11 +2614,102 @@ fail-closed、F5c1 contract-version/pin driftの露出、circular windowが
 evaluationへ実際に影響する反例、No.26の代表matching閾値がhardcoded 1
 ではないことの反例）。全ての新guardをmutation-verify済み。
 
+### 14.11.2 意味論的実行可能性フォローアップ第2ラウンド（PR #191レビュー第3ラウンド対応）
+
+第1ラウンド（14.11.1）は受理されたが、さらに5点の指摘があった。
+
+1. **coverageのUNKNOWN判定を実際のsource契約から導く**（§1）:
+   `evidenceIsKnown()`（pack存在+kind一致）だけでは「完全な観測coverage」
+   を主張できない——このcodebaseの全probeが`coverageLimitations`で
+   「safe sourceはunknown/untrusted intervalを省略するため、zeroは
+   観測された不在と欠落したcoverageを区別できない」ことを明記している
+   （F5a-c全体に共通する構造的事実であり、特定のprobeだけの限定では
+   ない）。一方、safe sourceの性質上、正の証拠（何か見つかった）は
+   ねつ造されない——coverage gapはfalse negativeしか生まない。
+   よって、`executeF5cShadowCalibration()`/`runF5cShadowCalibration()`
+   に`coverageWindowValidated: boolean`という**必須**（defaultなし）
+   引数を追加した——呼び出し側が「このcalibration windowは関与する
+   全sourceのrolloutより後で、通常運用中のuntracked gapについても
+   許容できる」と明示的にattestする。`zeroSensitiveOutcome()`が、
+   絶対的なゼロ（`isAbsoluteZero`）が原因のNOT_MATCHEDだけを
+   `coverageWindowValidated=false`のときUNKNOWNへ倒す——MATCHED
+   （正の証拠）や、相対的な境界比較によるNOT_MATCHED（値>0だが
+   母集団のrepresentative境界未満、absence-of-evidenceの主張では
+   ない）には一切影響しない。この値は`F5cShadowCalibrationReport.
+   coverageWindowValidated`としてreportへそのまま転記される
+   ——reportの読み手がどの信頼水準で生成されたかを判断できる
+   （coverage provenanceの伝播）。
+2. **F5c1の circular contract に有限型のintentを追加**（§2）:
+   No.32-35（各daypart target）・No.36（personal time stability）・
+   No.37（multi-daypart breadth）は、旧`F5cJointCircularHourAxis`
+   では同じaxis shapeで区別できず、F5c2の「母集団全体でのbest
+   8-hour window」戦略が全員を同じwindowへ収束させ得た。新設の
+   `F5cCircularIntent`（`DAYPART_TARGET`+`quadrant`／
+   `PERSONAL_STABILITY`／`MULTI_DAYPART_BREADTH`）で構造的パターン
+   だけを宣言する——本番のhour境界は依然として選ばない。
+   `F5C_SWEEP_CONTRACT_VERSION`を4→5へbump。
+   - `DAYPART_TARGET`: 24時間を4等分した中立的quadrant
+     （`QUADRANT_0`=[0,6)〜`QUADRANT_3`=[18,24)、文字列labelにして
+     いるのは`auditF5cCandidateSweepPlans()`の
+     `numericThresholdValueCount`guardが誤ってthreshold値として
+     検出しないようにするため）のうち1つの中でのみ代表windowを
+     探索する。24点の診断的enumerationは変わらず全て返すが、
+     MATCHED/NOT_MATCHEDを決める代表windowの選定だけがquadrantへ
+     制限される。
+   - `PERSONAL_STABILITY`: 母集団共通のwindowを選ばず、各subject
+     自身のrowだけから求めた「自分にとって最良のwindowの占有率」を
+     percentile軸として扱う——異なる（だが同じくらい安定した）
+     usual timeを持つ2人を、母集団内でどちらが人気の時間帯かでは
+     なく、各人の安定度で判定する。
+   - `MULTI_DAYPART_BREADTH`: 同じ4 quadrantのうち、subjectが
+     qualifying rowを持つdistinct quadrant数をpercentile軸として
+     扱う——1つの連続windowに収まる集中とは構造的に区別される。
+3. **No.36 `rows.activity-start-hour`を実際に"start"へ**（§3）:
+   旧実装はdaypart-boundaryと同じ「記録された全hour」を返しており、
+   selector名と実際の意味が食い違っていた。既存evidenceから導出
+   できる最小の修正として、日ごとの最小hour（その日の最初の活動
+   hour）を1件だけ返すよう修正した——新しい測定契約は追加せず、
+   既存の`rows`配列から導出する。
+4. **sensitivity modelを型で明示**（§4）: `axisSweeps[].boundaryPoints`/
+   `circularWindowPoints`はaxis単体のmarginal pass rateであって、
+   他のaxisをrepresentativeへ固定しつつcandidate全体のprevalenceを
+   一軸ずつ再計算する「候補レベルのsensitivity」ではない——実装複雑度と
+   reviewabilityを考慮し、後者は意図的に見送る（次段階で明確な設計を
+   経てから実装する）。`passRate`/`qualifyingRate`フィールドを
+   `marginalPassRate`/`marginalQualifyingRate`へrenameし、
+   report自体に`sensitivityModel: "MARGINAL_AXIS_ONLY"`という
+   typed markerを追加した——後続の製品判断がmarginalな数値を
+   candidate sensitivityと取り違えることを防ぐ。
+5. **selector支持のSSOTを実行可能mappingへ統合**（§5）: 旧実装は
+   `SUPPORTED_JOINT_SELECTORS`（手書きSet）と`resolveJointRows()`の
+   switch文という2つの並行リストを持っており、resolver caseを削除/
+   変更してもregistry側が古いまま残り得た。`JOINT_ROW_RESOLVERS`
+   という1つのnested mapだけを正本にし、`isSupportedJointSelector`
+   と`resolveJointRows`はどちらもこの同じmapを読むだけにした——
+   selectorの「支持」は、実際にそのselectorを解決するresolver関数が
+   同じobjectのkeyとして存在することそのものであり、2つ目の並行
+   リストは存在しない。
+
+`packages/core/tests/titles-v2-shadow-evaluation.test.ts`に、上記全ての
+反例テストを追加した（coverageWindowValidated=falseが絶対ゼロによる
+NOT_MATCHEDだけをUNKNOWNへ倒しMATCHEDには影響しない反例、No.36が
+人気の時間帯ではなく各人の安定度で判定する反例、No.36
+`rows.activity-start-hour`が実際に"start"であることの反例、No.32/34
+のdaypart target候補が同一母集団で異なる判定を返せる反例、No.37の
+multi-daypart breadthが単一quadrant濃縮と区別される反例、sensitivity
+modelがmarginal-axis-onlyとして型で露出していることの確認、selector
+supportの並行リストが再導入されていないことのsource-level確認）。
+全ての新guardをmutation-verify済み。
+
 ### 今回のPRで意図的に含めていないもの（次段階）
 
 - 候補間のoverlap/containment/sensitivity比較（pairwise Jaccard等）は
   設計上の判断（どのペアを比較するか、どう正規化するか）が別途必要な
   ため、次のF5c段階へ明示的に持ち越す。
+- one-axis-at-a-time candidate-level sensitivity（他axisをrepresentative
+  へ固定しつつcandidate全体のprevalenceを再計算すること）は、実装複雑度
+  とreviewabilityを考慮し意図的に見送る——`sensitivityModel:
+  "MARGINAL_AXIS_ONLY"`が現状を型で明示する。
 - production threshold選定・BehaviorTitleDefinition・award/evaluator/
   通知/UI/スケジューラ/Discordコマンドへの接続は一切無い。
 

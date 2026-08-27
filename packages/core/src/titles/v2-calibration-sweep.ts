@@ -12,7 +12,7 @@ import {
 } from "./v2-calibration.js";
 
 /** Planning-only contract. Never import from evaluator, pipeline, Bot, or the public v2 barrel. */
-export const F5C_SWEEP_CONTRACT_VERSION = 4 as const;
+export const F5C_SWEEP_CONTRACT_VERSION = 5 as const;
 
 /**
  * PR #190レビュー第3ラウンド§1: 「manifestが将来改訂されても、古いF5c sweep
@@ -225,9 +225,35 @@ interface F5cJointThresholdAxis {
 }
 
 /**
- * PR #190レビュー§9/§11: 24 JST hourは循環しており、単一のAT_LEAST/AT_MOSTでは
- * 境界を表現できない——operatorを持たない専用variant。F5c1はどのwindowも選ばない。
+ * PR #191レビュー第3ラウンド§2: 同じCIRCULAR_HOUR_WINDOW axis shapeが、実際には
+ * 構造的に異なる3つのcircular意味論を表していた——F5c2はselector/rowGroupKey以外に
+ * 区別する型情報を持たなかったため、No.32-35の異なるdaypart target全てを同じ
+ * 「母集団全体でのbest 8-hour window」へ収束させてしまい得た。以下の有限型は、
+ * どのhour境界も選ばずに「どの構造パターンか」だけを宣言する。
+ *
+ * - `DAYPART_TARGET`: 24時間を4等分した中立的なquadrant（QUADRANT_0=[0,6)、
+ *   QUADRANT_1=[6,12)、QUADRANT_2=[12,18)、QUADRANT_3=[18,24) —
+ *   "morning/afternoon"等のuser-facing labelでも本番のwindow長・境界でもない、
+ *   単にNo.32-35のsearch領域を互いに分離するための固定index。文字列labelにして
+ *   いるのは、`auditF5cCandidateSweepPlans()`の`numericThresholdValueCount`
+ *   （axes内の数値literalは production threshold の疑いとして数える既存guard）が
+ *   これを誤ってthreshold値として検出しないようにするため——実際には閾値では
+ *   なく、単なる分類indexである）のうち1つを対象に、そのquadrant内でのみ
+ *   代表windowを探索する。
+ * - `PERSONAL_STABILITY`: 母集団共通のwindowを選ばず、各subject自身のrowだけ
+ *   から求めた「自分にとって最良のwindowの占有率」を求め、percentile軸として
+ *   扱う——「母集団で人気の時間帯かどうか」ではなく「本人がどれだけ安定して
+ *   いるか」を測る（No.36）。
+ * - `MULTI_DAYPART_BREADTH`: 上と同じ4 quadrantのうち、subjectがqualifying row
+ *   を持つdistinct quadrant数を求め、percentile軸として扱う——1つの連続windowに
+ *   収まる集中（一晩の徹夜等）とは構造的に区別される（No.37）。
  */
+export type F5cCircularQuadrant = "QUADRANT_0" | "QUADRANT_1" | "QUADRANT_2" | "QUADRANT_3";
+export type F5cCircularIntent =
+  | { readonly kind: "DAYPART_TARGET"; readonly quadrant: F5cCircularQuadrant }
+  | { readonly kind: "PERSONAL_STABILITY" }
+  | { readonly kind: "MULTI_DAYPART_BREADTH" };
+
 interface F5cJointCircularHourAxis {
   readonly axisKey: string;
   readonly source: "JOINT_EVIDENCE";
@@ -235,6 +261,7 @@ interface F5cJointCircularHourAxis {
   readonly rowGroupKey: string;
   readonly reducerKind: "CIRCULAR_HOUR_WINDOW";
   readonly boundaryMethod: "CIRCULAR_CANDIDATE_ENUMERATION";
+  readonly circularIntent: F5cCircularIntent;
 }
 
 export type F5cSweepAxis = F5cMetricAxis | F5cJointThresholdAxis | F5cJointCircularHourAxis;
@@ -401,8 +428,8 @@ function jointThresholdAxis(
   return { axisKey, source: "JOINT_EVIDENCE", selector, rowGroupKey, operator, boundaryMethod: "OBSERVED_NEAREST_RANK", reducerKind };
 }
 
-function circularHourAxis(axisKey: string, selector: string, rowGroupKey: string): F5cJointCircularHourAxis {
-  return { axisKey, source: "JOINT_EVIDENCE", selector, rowGroupKey, reducerKind: "CIRCULAR_HOUR_WINDOW", boundaryMethod: "CIRCULAR_CANDIDATE_ENUMERATION" };
+function circularHourAxis(axisKey: string, selector: string, rowGroupKey: string, circularIntent: F5cCircularIntent): F5cJointCircularHourAxis {
+  return { axisKey, source: "JOINT_EVIDENCE", selector, rowGroupKey, reducerKind: "CIRCULAR_HOUR_WINDOW", boundaryMethod: "CIRCULAR_CANDIDATE_ENUMERATION", circularIntent };
 }
 
 function metricAtLeast(metricKey: string, fixedValue: number): F5cFixedCriterion {
@@ -530,9 +557,9 @@ const activityJoint = joint(
 );
 
 /** No.32-37共通: activity-time-day-hour-v1の生rowはすべて同じ row group から導出する。 */
-function activityDayHourAxes(no: number, rowGroupKey: string) {
+function activityDayHourAxes(no: number, rowGroupKey: string, quadrant: F5cCircularQuadrant) {
   return [
-    circularHourAxis(`candidate-${no}-daypart-boundary`, "rows.daypart-boundary", rowGroupKey),
+    circularHourAxis(`candidate-${no}-daypart-boundary`, "rows.daypart-boundary", rowGroupKey, { kind: "DAYPART_TARGET", quadrant }),
     jointThresholdAxis(`candidate-${no}-qualifying-days`, "rows.day-hour-social-evidence", "FILTER_THEN_DISTINCT_DAYS", rowGroupKey),
     jointThresholdAxis(`candidate-${no}-tc-gap-ceiling`, "rows.tc-gap", "SCALAR_SAMPLE", rowGroupKey, "AT_MOST"),
     jointThresholdAxis(`candidate-${no}-vc-seconds`, "rows.vc-seconds", "SCALAR_SAMPLE", rowGroupKey),
@@ -626,9 +653,12 @@ const PLAN_INPUTS: readonly PlanInput[] = [
     axes: [metricAxis("same-person-repeat-days", "maxRepeatedDaysWithOneCounterpart"), metricAxis("relationship-sample-seconds", "trustedOverlapSeconds")],
   }),
 
-  ...([32, 33, 34, 35] as const).map((no) => measuredPlan(no, "JOINT_CORRELATION", activityMetrics, {
+  // PR #191レビュー第3ラウンド§2: No.32=朝番/33=昼下がり/34=宵っ張り/35=深夜営業は、
+  // 24時間を4等分した互いに素なquadrantへ1:1で対応させる——実際の本番hour境界は
+  // 依然として選ばない(quadrantは単なる中立的なsearch領域分離)。
+  ...([[32, "QUADRANT_0"], [33, "QUADRANT_1"], [34, "QUADRANT_2"], [35, "QUADRANT_3"]] as const).map(([no, quadrant]) => measuredPlan(no, "JOINT_CORRELATION", activityMetrics, {
     requiredJointEvidence: activityJoint,
-    axes: activityDayHourAxes(no, `candidate-${no}-activity-day-hour-rows`),
+    axes: activityDayHourAxes(no, `candidate-${no}-activity-day-hour-rows`, quadrant),
     // TC/VCどちらか一方のmodalityが十分であれば行が対象になる(片方だけの必須化を避ける、§5-B)。
     rowGroupCompositions: [rowGroupComposition(`candidate-${no}-activity-day-hour-rows`, "ANY_FILTER")],
     coverageNotes: ["JST hour bins are measurement resolution; F5c1 fixes no daypart boundary."],
@@ -636,7 +666,7 @@ const PLAN_INPUTS: readonly PlanInput[] = [
   measuredPlan(36, "JOINT_CORRELATION", activityMetrics, {
     requiredJointEvidence: joint("activity-time-day-hour-v1", "rows.activity-start-hour", "rows.day-hour-social-evidence", "rows.tc-gap", "rows.vc-seconds"),
     axes: [
-      circularHourAxis("usual-time-start-hour-stability", "rows.activity-start-hour", "usual-time-rows"),
+      circularHourAxis("usual-time-start-hour-stability", "rows.activity-start-hour", "usual-time-rows", { kind: "PERSONAL_STABILITY" }),
       jointThresholdAxis("usual-time-qualifying-days", "rows.day-hour-social-evidence", "FILTER_THEN_DISTINCT_DAYS", "usual-time-rows"),
       metricAxis("usual-time-concentration", "vcTop3HoursShare"),
       metricAxis("usual-time-sample-seconds", "vcTotalTrustedSeconds"),
@@ -646,7 +676,7 @@ const PLAN_INPUTS: readonly PlanInput[] = [
   measuredPlan(37, "JOINT_CORRELATION", activityMetrics, {
     requiredJointEvidence: activityJoint,
     axes: [
-      circularHourAxis("multi-daypart-boundaries", "rows.daypart-boundary", "multi-daypart-rows"),
+      circularHourAxis("multi-daypart-boundaries", "rows.daypart-boundary", "multi-daypart-rows", { kind: "MULTI_DAYPART_BREADTH" }),
       jointThresholdAxis("multi-daypart-distributed-days", "rows.day-hour-social-evidence", "FILTER_THEN_DISTINCT_DAYS", "multi-daypart-rows"),
       jointThresholdAxis("multi-daypart-tc-gap-ceiling", "rows.tc-gap", "SCALAR_SAMPLE", "multi-daypart-rows", "AT_MOST"),
       jointThresholdAxis("multi-daypart-vc-seconds", "rows.vc-seconds", "SCALAR_SAMPLE", "multi-daypart-rows"),
