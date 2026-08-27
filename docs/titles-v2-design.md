@@ -2208,6 +2208,63 @@ F5cはsame cohort/window/observedAt/catalogHash/readinessHashでこのjoint meas
 overlap、sensitivity、boundary comparisonだけをaggregate出力する。threshold、provisional threshold、`matched`、definition、award、
 notification、activation、UI、backfill、自動cohort探索はF5b1に含めない。readinessはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8のまま。
 
+## 14.8 F5b2 Domain Calibration Packs
+
+F5b2はF5a/F5b1と同じ`CalibrationProbe<S>`、typed `CalibrationPayloadBundle<S>`、`TitleSourceCache`、
+`collectCalibrationMeasurements()`、`snapshotFromMeasurementCollection()`を再利用し、残るREADY domainをmeasurement-onlyで
+覆う。対象はNo.50–91のうち57/60/64/73を除くexact 38件で、各candidateは次の1 probeだけへ属する。
+
+| Probe | Candidate | Source |
+|---|---:|---|
+| `public-room-activity-v1` | 50–55 | `public_room_activity_safe` |
+| `public-room-social-time-v1` | 56 | `public_room_activity_safe`, `social_activity_time_safe` |
+| `economy-peer-actions-v1` | 58 | `economy_safe_peer_actions` |
+| `economy-semantic-v1` | 59, 61, 63 | `economy_semantic_safe` |
+| `shop-role-purchase-v1` | 65 | `shop_role_purchase_safe` |
+| `shop-purchase-v1` | 62 | `shop_purchase_safe` |
+| `casino-completed-activity-v1` | 66, 67 | `casino_completed_activity_days` |
+| `casino-activity-v1` | 68 | `casino_activity_days` |
+| `casino-edition-completion-v1` | 69 | `casino_edition_i_completion_safe` |
+| `casino-table-activity-v1` | 70 | `casino_table_activity_safe` |
+| `casino-table-busy-v1` | 71 | `casino_table_activity_safe` |
+| `casino-market-activity-v1` | 72 | `casino_market_activity_safe` |
+| `confirmed-invites-v1` | 74, 75 | `confirmed_invites` |
+| `invite-rooted-v1` | 76–79 | `invite_rooted_safe` |
+| `public-event-completion-v1` | 80, 81 | `public_event_completed_participations` |
+| `public-event-calendar-v1` | 82–84 | `public_event_calendar_involvement_safe` |
+| `castle-experience-v1` | 85, 86, 89 | `castle_experience_safe` |
+| `castle-social-time-v1` | 87, 88 | `castle_experience_safe`, `social_activity_time_safe` |
+| `castle-role-context-v1` | 90, 91 | `castle_experience_safe`, `castle_role_context_safe` |
+
+No.65は独立したrole coverage packとして購入時role-family JOIN済みの`shop_role_purchase_safe`、No.81はcompletion-only packでcanonical completion instanceの
+`public_event_completed_participations`を正本にする。No.71用に未登録の別sourceを新設せず、現行readiness contractどおり
+`casino_table_activity_safe`のowner/host側anonymous guest profileを、来客のあるhosted tableのbusy measurementとして使う。
+
+測定するのはsafe payloadが直接持つcount、distinct breadth、JST active day/range、trusted seconds、gap sample、ratio、stable
+semantic family breadthだけである。public roomはhosted/guest/own-use session/day/breadth、economyはsafe peer day-kind factと
+family/direction/counterpart breadth、shopはeligible product/day、casinoはcommit/completion family/day、Edition-I completion、
+official table/guest seconds、standard market breadth、inviteはconfirmationとanonymous branch activity/next-generation prefix/reunion、
+eventはcompletion count/calendar role profile、CastleはEdition-I family/super-domain/day/public-VC secondsとrole-held/inside/outside
+family/day/seconds/occurrenceを測る。payloadに無いroom seconds、economy amount/recipient concentration、invite retention/depthは
+推測せず、raw ledgerやcurrent roleへ戻らない。比率の分母が0ならnullで、観測済みの実ゼロだけを0にする。
+
+planning-internal joint evidenceは、peer actionの`dayOffset × kind`、inviteのsubject-local anonymous profile/occurrence ordinal、
+public-room/Castleとsocial timeの`domain day semanticIndex × dayOffset`および`dayOffset × hour × TC gap × VC seconds`、
+Castle role-contextのfixed semantic index別inside/outside/role-held day/seconds/occurrenceだけを保持する。Discord user/channel、
+room/table/event/product/counterpart identity、eventKey、exact date/timestamp、raw payloadは保持しない。serialized
+`CalibrationSnapshot`はschema v1のaggregate-only shapeのままで、subject row、ordinal、day/hour row、joint evidenceを出さない。
+
+全packはunknown/untrusted interval、source rollout前、historical backfill不在をcoverage limitationとして扱う。event completion packには
+無関係なlegacy role limitationを付けず、calendar-role packだけがlegacy participant-onlyのままでstaff/organizerを推測しない。
+role-contextのUNKNOWN historyをcurrent assignmentでinside/outsideへ分類しない。
+unique sourceはcohort/scopeごとに一度だけbulk prefetchし、601 subjectsは通常300/300/1の3 calls、Castle 9-adapter sourceは
+27 actual adapter readsとなる。同一sourceを複数probeが使っても再読しない。
+
+F5cはsame cohort/window/observedAt/catalogHash/readinessHashのrestricted measurement collectionを再利用し、threshold candidate
+sweep、percentile boundary、prevalence、overlap、sensitivity、continuous/cumulative・fixed-window・zero/unknown・edition解釈を
+比較してaggregate結果だけを出す。F5b2はproduction threshold、`matched`、BehaviorTitleDefinition、award/evaluator、UI、通知、
+自動cohort、backfillを追加しない。readinessはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8のまま。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。
