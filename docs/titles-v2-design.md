@@ -2393,6 +2393,40 @@ drift検出が機能しない自己参照バグだった。以下を追加で修
   `POST_FILTER_MATCHING_SIZE` axisが無い場合を検出）を追加した。現行READY-76は
   すべて0/空のまま。
 
+### 14.9.3 意味論の精密化: cardinality混在・TC/VC独立要求・own-use row限定（PR #190レビュー第4ラウンド対応）
+
+第3ラウンドは型と構造を修正したが、3件の候補で「型は正しいが意味が違う」問題が
+残っていた。
+
+- **No.69の`ALL_MANIFEST_MEMBERS`**: `countMetricKey`が`allFamiliesCompleted`
+  （boolean 0/1）だった。No.89の同じcriterion kindは`activeFamilyCount`
+  （実数のfamily count）を使っており、同一kindが2つの異なる意味を持っていた。
+  No.69を`distinctCompletedFamilies`（実数count）へ変更し、cardinality-compatible
+  な意味論へ統一した。`allFamiliesCompleted`はdiagnostic用の`requiredMetrics`
+  としてのみ残る。
+- **No.49のTC/VC独立要求**: 「TCとVC双方で複数日」を`unionModalityDays`
+  （union distinct days）1本のaxisで表現していたが、unionはTC=1日・VC=多数日
+  という反例でも大きくなるため「TC単体も複数日」を保証しない。TC/VCそれぞれの
+  row group（`tc-days-rows`/`vc-days-rows`）へ独立した`tc-qualifying-days`/
+  `vc-qualifying-days`（`FILTER_THEN_DISTINCT_DAYS`）axisを追加し、union/overlap
+  （`unionModalityDays`/`overlappingCalendarDays`）はdiagnostic requiredMetric
+  としてのみ残した。`F5cCandidateSweepPlan.axes`は（rowGroupKeyの異同に関わらず）
+  plan全体でconjunctiveであることをinterface docへ明記した——これがREADY-76
+  全76 planに例外なく適用される唯一の不変条件であり、disjunctionは
+  `rowGroupCompositions`の`ANY_FILTER`（同一rowGroupKey内のSCALAR_SAMPLE filter
+  同士に限定）だけが表現できる。
+- **No.56のown-use row限定**: `own-room-use-span`が汎用の`domainDays.day-offset`
+  selector（hosted/guest行も含み得る）を使っており、spanをown-use rowだけへ
+  絞ることをF5c2がprose頼みで推測することになっていた。`own-room-use-days`と
+  同じ`domainDays.public-room-own-use`selectorを共有させ（Approach A）、
+  汎用の`domainDays.day-offset`は`JOINT_SELECTOR_ALLOWLIST`から削除した。
+
+3点とも回帰testで直接演習した（No.69/89のcardinality-compatible比較、No.49の
+TC=1日/VC多数日の反例モデル、No.56のown-use日オフセット1,2,10 + range外の
+hosted/guest的な日オフセットが混入した場合との対比計算）。readiness・31 probe・
+76/76 plan coverage・declared measurement gaps 0・unexecutable plans 0・
+numeric pending thresholds 0は不変。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

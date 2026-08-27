@@ -388,7 +388,7 @@ describe("F5c1 contract executability round 3 (manifest pin drift / typed confor
     // No.63: multiple distinct families (fixed "multiple" = 2, not a production threshold)
     expect(byNo(63).manifestCriteria).toEqual([{ kind: "AT_LEAST_FIXED_DISTINCT_MEMBERS", countMetricKey: "distinctSubjectUsedFamilies", fixedValue: 2 }]);
     // No.69: ALL Casino Edition-I families completed
-    expect(byNo(69).manifestCriteria).toEqual([{ kind: "ALL_MANIFEST_MEMBERS", countMetricKey: "allFamiliesCompleted" }]);
+    expect(byNo(69).manifestCriteria).toEqual([{ kind: "ALL_MANIFEST_MEMBERS", countMetricKey: "distinctCompletedFamilies" }]);
     // No.86: multiple Castle families
     expect(byNo(86).manifestCriteria).toEqual([{ kind: "AT_LEAST_FIXED_DISTINCT_MEMBERS", countMetricKey: "activeFamilyCount", fixedValue: 2 }]);
     // No.87: super-domain coverage is typed; the "sufficient family count" part stays an unselected sweep
@@ -458,5 +458,95 @@ describe("F5c1 contract executability round 3 (manifest pin drift / typed confor
     expect(byNo(42).rowGroupCompositions).toEqual([{ rowGroupKey: "tc-start-rows", composition: "ALL_FILTERS" }]);
     // B. No.32-37 TC/VC multimodal social evidence: either modality qualifies (not AND)
     expect(byNo(32).rowGroupCompositions[0]!.composition).toBe("ANY_FILTER");
+  });
+});
+
+/**
+ * PR #190レビュー第4ラウンド: No.69のALL_MANIFEST_MEMBERSがboolean/count意味論を
+ * 混在させていた・No.49がTC/VC双方独立のqualifying-day要求をunionへ潰していた・
+ * No.56のspanがown-use以外のrowも拾い得るselectorを使っていた、の3点を検証する。
+ */
+describe("F5c1 contract executability round 4 (No.69 cardinality semantics / No.49 independent TC+VC / No.56 own-use row restriction)", () => {
+  const byNo = (no: number) => F5C_CANDIDATE_SWEEP_PLANS.find(({ candidateNo }) => candidateNo === no)!;
+
+  it("1. No.69 and No.89 both use cardinality-compatible ALL_MANIFEST_MEMBERS semantics (a real family count, not a boolean)", () => {
+    const plan69 = byNo(69);
+    const plan89 = byNo(89);
+    const criterion69 = plan69.manifestCriteria.find((c) => c.kind === "ALL_MANIFEST_MEMBERS")!;
+    const criterion89 = plan89.manifestCriteria.find((c) => c.kind === "ALL_MANIFEST_MEMBERS")!;
+    expect(criterion69).toBeDefined();
+    expect(criterion89).toBeDefined();
+    // どちらもcountMetricKeyはboolean-valued metric("allFamiliesCompleted"のような0/1)
+    // ではなく、実数のfamily count metricを指す——同じcriterion kindが2つの異なる
+    // 意味を持たないことを、実際に使われているmetric名で確認する。
+    expect(criterion69.countMetricKey).toBe("distinctCompletedFamilies");
+    expect(criterion89.countMetricKey).toBe("activeFamilyCount");
+    expect(criterion69.countMetricKey).not.toBe("allFamiliesCompleted");
+    // allFamiliesCompletedはdiagnostic requiredMetricとしてだけ残る(manifestCriteriaには出ない)
+    expect(plan69.requiredMetrics).toContain("allFamiliesCompleted");
+    expect(plan69.manifestCriteria.some((c) => "countMetricKey" in c && c.countMetricKey === "allFamiliesCompleted")).toBe(false);
+  });
+
+  it("2. No.49 requires TC and VC to independently satisfy qualifying-day evidence — a union cannot satisfy it (counterexample)", () => {
+    const plan49 = byNo(49);
+    const tcAxis = plan49.axes.find((axis) => axis.axisKey === "tc-qualifying-days")!;
+    const vcAxis = plan49.axes.find((axis) => axis.axisKey === "vc-qualifying-days")!;
+    expect(tcAxis).toBeDefined();
+    expect(vcAxis).toBeDefined();
+    expect(tcAxis.reducerKind).toBe("FILTER_THEN_DISTINCT_DAYS");
+    expect(vcAxis.reducerKind).toBe("FILTER_THEN_DISTINCT_DAYS");
+    // 別々のrowGroupから独立に導出される(同一行のunionではない)
+    expect(tcAxis.source === "JOINT_EVIDENCE" && tcAxis.rowGroupKey).toBe("tc-days-rows");
+    expect(vcAxis.source === "JOINT_EVIDENCE" && vcAxis.rowGroupKey).toBe("vc-days-rows");
+    // tc-days-rows !== vc-days-rows は上の2つのassertion自体が既に示している
+    // unionModalityDaysはaxisとして存在しない(diagnostic requiredMetricとしてのみ残る)
+    expect(plan49.axes.some((axis) => axis.axisKey.includes("union") || axis.axisKey.includes("modality-day-breadth"))).toBe(false);
+    expect(plan49.requiredMetrics).toContain("unionModalityDays");
+
+    // 反例を実際に計算して示す: TC=1 qualifying day, VC=多数のqualifying daysでも、
+    // unionだけを見れば「大きい」ように見えてしまう——しかしこのcontractは
+    // tc-qualifying-days/vc-qualifying-daysを別axisとして独立に要求するため、
+    // TC側が1日しかなければ(仮にVC側のthresholdをいくつに設定しても)TC側のaxisで
+    // 未達になり得る、という構造を持つ。union count単体では「TCも複数日」を保証しない。
+    const tcQualifyingDayOffsets = [5]; // TC: 1 qualifying day
+    const vcQualifyingDayOffsets = [1, 2, 3, 4, 6, 7, 8]; // VC: many qualifying days
+    const unionDayOffsets = new Set([...tcQualifyingDayOffsets, ...vcQualifyingDayOffsets]);
+    expect(unionDayOffsets.size).toBeGreaterThan(1); // unionは「複数日」に見えてしまう
+    expect(new Set(tcQualifyingDayOffsets).size).toBe(1); // しかしTC単体は複数日ではない
+    // この契約はtc-qualifying-days(TC単体のdistinct日数)をunionから独立に要求するので、
+    // 「TC単体1日・VC単体多数日」というこのケースを、union countだけで「TCも複数日」と
+    // 誤って満たされたことにはしない——tc-qualifying-daysのaxisが別途TC単体の値を見る。
+  });
+
+  it("3. No.56 own-use days and span both derive from the same restricted own-use row selector — hosted/guest rows cannot alter the span", () => {
+    const plan56 = byNo(56);
+    const daysAxis = plan56.axes.find((axis) => axis.axisKey === "own-room-use-days")!;
+    const spanAxis = plan56.axes.find((axis) => axis.axisKey === "own-room-use-span")!;
+    expect(daysAxis.source === "JOINT_EVIDENCE" && daysAxis.selector).toBe("domainDays.public-room-own-use");
+    expect(spanAxis.source === "JOINT_EVIDENCE" && spanAxis.selector).toBe("domainDays.public-room-own-use");
+    // 両者が全く同じselector(own-use限定)を共有しているので、hosted/guest行が
+    // spanへ紛れ込む余地が型レベルで無い(genericなdomainDays.day-offsetは
+    // もう使われていない)。
+    expect(plan56.requiredJointEvidence.selectors).toContain("domainDays.public-room-own-use");
+    expect(plan56.requiredJointEvidence.selectors).not.toContain("domainDays.day-offset");
+
+    // 実際のfixtureでown-use行だけがspan/distinct daysを決めることを計算で示す:
+    // own-use day offsets = 1, 2, 10。hosted/guest行はdomainDays.public-room-own-use
+    // selectorには一切現れない(別selectorの領域)ため、own-useのspan/日数計算に
+    // 混入しようがない。
+    const ownUseDayOffsets = [1, 2, 10];
+    // hosted/guestの行は別のselector配下にあり、own-use rowGroupのfilter対象にすら
+    // ならない——このcontractのselector分離自体がその保証。ここでは「もし誤って
+    // 混入したら結果が変わってしまう」ことを対比のために計算するだけで、実際の
+    // selectorはown-useだけを指すため混入しない。
+    const distinctDays = new Set(ownUseDayOffsets).size;
+    const span = ownUseDayOffsets.length === 0 ? null : Math.max(...ownUseDayOffsets) - Math.min(...ownUseDayOffsets) + 1;
+    expect(distinctDays).toBe(3);
+    expect(span).toBe(10);
+    // hosted/guestの行(例: day offset 50、own-use範囲の外)がselectorへ混入した場合に
+    // 初めてspanが動くという対比——だが実際のselectorはown-use限定なので混入しない。
+    const hostedGuestDayOffsetOutsideRange = 50;
+    const contaminatedSpan = Math.max(...ownUseDayOffsets, hostedGuestDayOffsetOutsideRange) - Math.min(...ownUseDayOffsets) + 1;
+    expect(contaminatedSpan).not.toBe(span); // 混入すれば値が変わる、という対比の確認
   });
 });

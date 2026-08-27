@@ -327,6 +327,18 @@ function castleEditionManifestRef(): F5cManifestRef {
   return { kind: "CASTLE_EDITION", editionKey: pin.editionKey, version: pin.version };
 }
 
+/**
+ * PR #190レビュー第4ラウンド§2: `axes`配列内の全axisは、rowGroupKeyの異同に
+ * 関わらず、plan全体としてconjunctive（AND）である——これはREADY-76の76 plan
+ * 全てに例外なく適用される単一の不変条件（`evaluationShape`が
+ * `MULTI_METRIC_CONJUNCTION`/`JOINT_CORRELATION`と名付けられているのもこの
+ * ためであり、per-plan boolean fieldとしては表現しない。何も選択しない）。
+ * disjunction（OR）は`rowGroupCompositions`の`ANY_FILTER`だけが表現でき、
+ * それも同一rowGroupKeyを共有するSCALAR_SAMPLE filter axis同士に限定される
+ * ——別々のrowGroupから導出された2つのaxis（例: No.49のtc-qualifying-days /
+ * vc-qualifying-days）の間には、常にANDだけが存在し、それ以外の合成は
+ * この契約に存在しない。
+ */
 export interface F5cCandidateSweepPlan {
   readonly candidateNo: number;
   readonly provisionalKey: string;
@@ -712,12 +724,19 @@ const PLAN_INPUTS: readonly PlanInput[] = [
     // 十分なprior distinct othersとcontinuation-gap ceilingの両方を満たすjoinだけが対象。
     rowGroupCompositions: [rowGroupComposition("tc-third-party-rows", "ALL_FILTERS")],
   }),
+  // §2(round4): 「TCとVC双方で複数日」はunionでは表現できない
+  // （TC=1日・VC=多数日でもunionは大きくなる反例）。tc/vc双方を別rowGroupで
+  // 独立にqualifying distinct daysへ還元し、plan.axes全体のconjunction
+  // （このcontractの全plan共通の不変条件——下記コメント参照）で両方を要求する。
+  // unionModalityDays/overlappingCalendarDaysはrequiredMetricsのdiagnosticとして
+  // 残すが、どちらもaxisにはしない。
   measuredPlan(49, "JOINT_CORRELATION", ["tcCandidateSocialDays", "vcSocialDays", "unionModalityDays", "overlappingCalendarDays", "tcSpanDays", "vcSpanDays"], {
-    requiredJointEvidence: joint("cross-modal-days-v1", "tc-days.gap", "vc-days.breadth", "modality-day-sets"),
+    requiredJointEvidence: joint("cross-modal-days-v1", "tc-days.gap", "tc-days.day-offset", "vc-days.breadth", "vc-days.day-offset"),
     axes: [
       jointThresholdAxis("tc-meaningful-gap", "tc-days.gap", "SCALAR_SAMPLE", "tc-days-rows", "AT_MOST"),
+      jointThresholdAxis("tc-qualifying-days", "tc-days.day-offset", "FILTER_THEN_DISTINCT_DAYS", "tc-days-rows"),
       jointThresholdAxis("vc-breadth", "vc-days.breadth", "SCALAR_SAMPLE", "vc-days-rows"),
-      jointThresholdAxis("modality-day-breadth", "modality-day-sets", "FILTER_THEN_DISTINCT_DAYS", "tc-vc-union-rows"),
+      jointThresholdAxis("vc-qualifying-days", "vc-days.day-offset", "FILTER_THEN_DISTINCT_DAYS", "vc-days-rows"),
     ],
   }),
 
@@ -737,10 +756,15 @@ const PLAN_INPUTS: readonly PlanInput[] = [
     axes: [metricAxis("host-side-sessions", "hostedSessionCount"), metricAxis("guest-side-sessions", "guestSessionCount"), metricAxis("room-two-sided-span", "activeSpanDays")],
   }),
   measuredPlan(56, "JOINT_CORRELATION", ["domainSemanticBreadth", "domainDayTouches", "domainActiveDays", "domainActiveSpanDays", "socialActiveDays", "socialTcGapSampleCount", "socialVcTrustedSeconds"], {
-    requiredJointEvidence: joint("domain-social-time-v1", "domainDays.public-room-own-use", "domainDays.day-offset"),
+    // §3(round4): own-room-use-daysとown-room-use-spanは同じ制限済みselector
+    // (domainDays.public-room-own-use)から導出する——汎用のdomainDays.day-offset
+    // （hosted/guest行も含み得る）を使うと、F5c2がspanをown-use rowだけへ絞る
+    // ことをprose頼みで推測することになる。row group base predicateをselector
+    // 自体に埋め込む（Approach A）。
+    requiredJointEvidence: joint("domain-social-time-v1", "domainDays.public-room-own-use"),
     axes: [
       jointThresholdAxis("own-room-use-days", "domainDays.public-room-own-use", "FILTER_THEN_DISTINCT_DAYS", "domain-day-rows"),
-      jointThresholdAxis("own-room-use-span", "domainDays.day-offset", "FILTER_THEN_SPAN_DAYS", "domain-day-rows"),
+      jointThresholdAxis("own-room-use-span", "domainDays.public-room-own-use", "FILTER_THEN_SPAN_DAYS", "domain-day-rows"),
     ],
   }),
 
@@ -779,7 +803,11 @@ const PLAN_INPUTS: readonly PlanInput[] = [
   measuredPlan(69, "MANIFEST_CONFORMANCE", ["distinctCompletedFamilies", "allFamiliesCompleted", "totalFamilyCompletionDays"], {
     structuralRequirements: ["Every family in the current Casino Edition-I manifest has canonical completion evidence."],
     manifestRef: casinoEditionManifestRef(),
-    manifestCriteria: [allManifestMembers("allFamiliesCompleted")],
+    // §1(round4): countMetricKeyはcardinality-compatibleなfamily countで統一する
+    // （booleanのallFamiliesCompletedとNo.89のactiveFamilyCountのような実数countを
+    // ALL_MANIFEST_MEMBERSへ混在させない）。allFamiliesCompletedはdiagnostic用として
+    // requiredMetricsに残す。
+    manifestCriteria: [allManifestMembers("distinctCompletedFamilies")],
   }),
   measuredPlan(70, "STRUCTURAL_PRESENCE", ["tableCount", "guestProfileCount", "guestStayRowCount", "guestActiveDays", "totalTrustedGuestSeconds"], {
     structuralRequirements: ["A subject-hosted official table has at least one valid non-owner human guest interval."],
@@ -912,9 +940,9 @@ const JOINT_SELECTOR_ALLOWLIST = Object.freeze({
     "third-party.prior-distinct-others", "third-party.next-other-gap", "third-party.prior-self-gap", "third-party.day-offset",
   ],
   "tc-reaction-posts-v1": ["posts.post-breadth", "posts.day-breadth", "posts.reactor-breadth"],
-  "cross-modal-days-v1": ["tc-days.gap", "vc-days.breadth", "modality-day-sets"],
+  "cross-modal-days-v1": ["tc-days.gap", "tc-days.day-offset", "vc-days.breadth", "vc-days.day-offset"],
   "domain-social-time-v1": [
-    "domainDays.public-room-own-use", "domainDays.day-offset", "domainDays.castle-family-superdomain",
+    "domainDays.public-room-own-use", "domainDays.castle-family-superdomain",
     "domainDays.castle-family-breadth", "socialHours.day-hour-evidence",
   ],
   "economy-actions-v1": [],
