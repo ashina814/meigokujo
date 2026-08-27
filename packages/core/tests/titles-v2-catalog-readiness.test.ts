@@ -98,7 +98,8 @@ describe("L. production evaluator/import graphからcandidate registryが参照�
         // F5 calibrationはcatalog/readiness identityをsnapshot/planへ固定するplanning/operator layer。
         // evaluator/pipeline/Bot/public barrelからは別testで引き続き禁止する。
         !f.includes("v2-calibration.ts") &&
-        !f.includes("v2-calibration-sweep.ts"),
+        !f.includes("v2-calibration-sweep.ts") &&
+        !f.includes("v2-shadow-evaluation.ts"),
     );
     expect(files.length).toBeGreaterThan(0);
     const offenders: string[] = [];
