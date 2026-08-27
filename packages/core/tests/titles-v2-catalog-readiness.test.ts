@@ -95,9 +95,10 @@ describe("L. production evaluator/import graphからcandidate registryが参照�
       (f) =>
         !f.includes("v2-catalog-candidates.ts") &&
         !f.includes("v2-catalog-readiness.ts") &&
-        // F5a calibrationはcatalog/readiness identityをsnapshotへ固定するplanning/operator layer。
+        // F5 calibrationはcatalog/readiness identityをsnapshot/planへ固定するplanning/operator layer。
         // evaluator/pipeline/Bot/public barrelからは別testで引き続き禁止する。
-        !f.includes("v2-calibration.ts"),
+        !f.includes("v2-calibration.ts") &&
+        !f.includes("v2-calibration-sweep.ts"),
     );
     expect(files.length).toBeGreaterThan(0);
     const offenders: string[] = [];

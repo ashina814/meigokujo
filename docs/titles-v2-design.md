@@ -2265,6 +2265,168 @@ sweep、percentile boundary、prevalence、overlap、sensitivity、continuous/cu
 比較してaggregate結果だけを出す。F5b2はproduction threshold、`matched`、BehaviorTitleDefinition、award/evaluator、UI、通知、
 自動cohort、backfillを追加しない。readinessはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8のまま。
 
+## 14.9 F5c1 READY-76 Sweep Contract
+
+F5c1はthresholdを選ぶphaseではなく、SOURCE READY 76件を将来どのmeasurement軸でsweepするかを固定するplanning-only
+contractである。`F5C_CALIBRATION_PROBES`はF5a 2件、F5b1 10件、F5b2 19件のexact 31 probeを一度に実行し、
+`collectF5cCalibrationMeasurements()`はsame cohort/window/observedAtの全unique safe sourceを一つの`TitleSourceCache`へ
+prefetchする。phaseを跨いで`vc_social_safe`、`social_activity_time_safe`、`casino_table_activity_safe`等を再読しない。
+probe candidate unionはreadiness SSOTのREADY集合とexact一致する76件で、PARTIAL/BLOCKED/METAを含まない。
+
+`F5C_CANDIDATE_SWEEP_PLANS`はcandidate no順の76 planで、各planはprovisional key、owner probe、readiness由来の
+threshold category / optimization risk、finiteなevaluation shape、actual probe metric selector、必要なtagged joint evidence、
+sweep axis、semantic structural requirement、coverage/release noteを持つ。shapeはstructural presence、manifest conformance、
+distribution threshold、multi-metric conjunction、joint correlation、structural+distributionに限定し、汎用rule DSLや
+production evaluatorを作らない。plan auditは31 probe / READY 76 / plan 76、candidate ownership、category、risk、actual zero-payload
+metric/joint output、duplicate、非READY混入を機械検証する。現contractのmeasurement gapは0件である。
+
+`THRESHOLD_PENDING`のaxisはmetricまたはidentity-minimized joint evidence selector、operator、
+`OBSERVED_NEAREST_RANK` boundary methodだけを持つ。数値value fieldは型に存在せず、F5c1は仮threshold、hour/daypart境界、
+TC meaningful gap、VC meaningful seconds、share、日数、spanを一切決めない。No.32–37のJST 24hourはmeasurement resolutionの
+ままで、朝/昼/夕方/深夜境界を固定しない。VC Style No.10–21はcandidate semantics別にvolume/day/span、overallとsocial-onlyの
+share/stability、bucket breadth/skewを分け、少量100% shareを単独条件へしない。
+
+`STRUCTURAL_FIXED`はsemanticSpecから一意な事実だけを`structuralRequirements`へ置き、distribution axisを持たない。
+`MANIFEST_DEPENDENT`は現行versioned economy/Casino/Castle manifestの意味を維持し、percentileへ変換しない。
+`STRUCTURAL_PLUS_DISTRIBUTION`のNo.77はcanonical next-generation/entry chronologyをstructural側へ、branch activityとsame-day
+pre-entry evidenceの未決定境界をaxis側へ分離する。No.26/27のperson×semantic-family matching、No.42–47のTC conversation、
+No.49 cross-modal、No.56/87/88 domain social-time、No.76–79 invite branch、No.90/91 Castle role contextは、aggregate marginalだけで
+相関を再構成せず、既存planning-internal tagged joint evidenceを明示して使う。
+
+safe sourceでsemanticSpecをproxyなしにsweepできない候補が将来現れた場合は`MEASUREMENT_GAP`とし、別candidateやraw DB、raw
+Discord/ledger、current role、identityを代用しない。既存safe payloadにすでに含まれる情報をidentity-minimized reducerへ追加する
+範囲を超えるならF5c1でsource/schema/readinessを広げない。unknown/untrusted/pre-rollout coverageは観測済み0と区別し、coverage
+limitationを残す。restricted collectionのsubject IDとjoint rowsはmemory内だけで、serialize/log/persistしない。plan/auditは
+deep-freezeし、public `v2.ts`、evaluator、pipeline、prefetch、Botからimportしない。
+
+F5c2はこのexact contractとsame deterministic measurement engineを使い、観測distributionとnearest-rankからbounded gridを作る。
+shadow prevalence、candidate overlap、sensitivity等を行う場合も出力はaggregateだけで、subject rowやmatch一覧を出さない。
+F5c1自身はprevalence/Jaccard/recommendationを計算しない。F6だけが、別レビューで採択されたthresholdをstable production ruleへ
+変換し、evaluator/award/release gateを扱う。No.58はplan coverageへ含むが、post-award reversal未解決のrelease gateを維持する。
+readinessはREADY 76 / PARTIAL 6 / BLOCKED 9 / META 8のままで、plan coverage 76/76はsource readinessやrelease可否の変更を
+意味しない。
+
+### 14.9.1 Contract executability follow-up（PR #190レビュー対応）
+
+初版のF5c1は、structuralRequirementsがstring[]のみ・JOINT_EVIDENCE axisにsubject-level
+reduction semanticsが無い・measurementStatusが暗黙にMEASUREDへdefaultするという3点で
+「F5c2がre-interpretation無しに実行できる」水準に届いていなかった。以下を追加した
+（production threshold・汎用rule DSLは追加していない）。
+
+- **`F5cFixedCriterion`**（`METRIC_COMPARE` / `METRIC_BOOLEAN_TRUE` / `ANY_METRIC_POSITIVE` /
+  `JOINT_STRUCTURAL_FACT`）: catalog意味論そのものが固定するsemantic constant
+  （例: `eventCount >= 1`、`activeFamilyCount >= 2`、participant-onlyとstaff-or-organizerの
+  AND+OR）を型で持つ。全fixedCriteriaはANDされ、`ANY_METRIC_POSITIVE`だけが明示的なOR。
+  THRESHOLD_PENDINGのdistribution boundaryとは別物——`numericThresholdValueCount`は
+  依然axesだけを見る（fixedCriteriaのfixedValueは数えない）。
+- **`F5cManifestRef`**（`ECONOMY_SEMANTIC_FAMILIES` / `CASINO_EDITION` / `CASTLE_EDITION`）:
+  MANIFEST_DEPENDENT planは、`ECONOMY_FEATURE_FAMILY_MANIFEST_VERSION`・
+  `CASINO_EDITION_I_MANIFEST`・`CASTLE_EXPERIENCE_EDITION_I_MANIFEST`という実在のcanonical
+  versioned定数を直接参照する。auditは毎回同じbuilderを再実行して構造比較し、値を
+  複製せず、manifestが改訂されても古いsweep contractが気づかず変わらないことを保証する。
+- **axis reducer kind**: `F5cAxisReducerKind`（`SCALAR_METRIC` / `SCALAR_SAMPLE` /
+  `FILTER_THEN_COUNT` / `FILTER_THEN_DISTINCT_DAYS` / `FILTER_THEN_SHARE` /
+  `FILTER_THEN_SPAN_DAYS` / `GROUP_FILTER_THEN_MAX` / `POST_FILTER_MATCHING_SIZE` /
+  `CIRCULAR_HOUR_WINDOW` / `SET_BREADTH` / `REPEAT_PERIOD`）をREADY-76の実際のpatternから
+  列挙した（汎用DSLではない、§14.9.2で`POST_FILTER_MATCHING_SIZE`/`FILTER_THEN_SPAN_DAYS`
+  を追加）。同じ生row集合から複数axisが導出される場合は`rowGroupKey`で明示する
+  （No.42のTC start例: quiet-before/continuation-gap filterとqualifying distinct daysが
+  同じstart rowから導出されることを明示）。24 JST hour（No.32-37）は循環windowの専用
+  variantへ分離した——operatorを持たず、`OBSERVED_NEAREST_RANK`を直接割り当てない。
+  No.77/78のroot-before-child/same-day-before-entry chronologyは、AT_LEAST axisとして
+  誤ってsweepable扱いされていたのを`JOINT_STRUCTURAL_FACT` fixedCriteriaへ移し、No.77には
+  正規のdistribution axis（same-day gap/seconds、qualifying count、いずれも
+  `next-gen-rows`で同一row group）を追加した。
+- **measurementStatusの明示化**: `measuredPlan()`/`gapPlan()`のみがconstructorを呼べる。
+  `gapPlan()`は空でない`gapReason`を要求し、型レベルでも`axes`を受け付けない
+  （実行時にも同じ条件をfail-closedで再確認する）。暗黙のdefaultは廃止した。
+- **audit**: `auditF5cCandidateSweepPlans()`は`declaredMeasurementGapCount`（明示的に
+  MEASUREMENT_GAPと宣言したplan数）と`unexecutablePlanCount`（構造上実行不能な
+  plan数——fixedCriteria/manifestRef欠落、JOINT_CORRELATIONなのにaxisが無い、
+  manifestRefが現行canonical定数と食い違う等）を分けて報告する。現行READY-76は
+  両方とも0。
+
+### 14.9.2 Manifest pin drift / typed manifest conformance / matching / span / row-group composition（PR #190レビュー第3ラウンド対応）
+
+第2ラウンドの`F5cManifestRef` builderは、その場で現行canonical定数（
+`CASINO_EDITION_I_MANIFEST`等）を読んでplanへ埋め込み、auditも同じbuilderを再実行して
+比較していたため、manifestが将来改訂されてもplan側とaudit側が同時に追従してしまい、
+drift検出が機能しない自己参照バグだった。以下を追加で修正した。
+
+- **`F5C1_MANIFEST_PINS`**: economy/casino edition/castle editionそれぞれについて、
+  editionKey・version・family一覧（casino editionはactivityKeys、castle editionは
+  superDomainまで含む）と、それを`canonicalManifestFingerprint()`（key順sort済み
+  canonical serialization + sha256）で固定したhardcoded literal fingerprintを持つ。
+  `docs`側の`FROZEN_CATALOG_99_FINAL_SHA256`と同じ考え方——現行constantを呼び出して
+  生成しない。`economyManifestRef()`等のbuilderは、このpinだけからplanへ埋め込む値を
+  作る。`liveManifestFingerprint()`だけが現行constant（`CASINO_EDITION_I_MANIFEST`等）を
+  直接読み、auditがpinとliveを独立に比較する——一方が変わっても他方が追従しない。
+- **`F5cManifestCriterion`**（`ALL_MANIFEST_MEMBERS` / `AT_LEAST_FIXED_DISTINCT_MEMBERS` /
+  `ALL_REQUIRED_SUPERDOMAINS` / `MANIFEST_CARDINALITY_SWEEP`）: `manifestRef`は
+  「どのuniverseを見るか」だけを特定し「そのuniverseに対して何を要求するか」は特定
+  しない——MANIFEST_DEPENDENTの6候補全員（No.63/69/86/87/88/89）へ追加した。No.63/86は
+  「multiple」を固定2としたbreadth要求、No.69/89はALL family conformance、No.87は
+  super-domain coverage（`ALL_REQUIRED_SUPERDOMAINS`）とfamily breadthの両方——後者は
+  値を選ばない`MANIFEST_CARDINALITY_SWEEP`のまま、No.88は「almost all」を同じく
+  未選択のcardinality sweepとして表現する（production numberは発明しない）。No.87向けに
+  `castle_experience_safe`が既に持つ`coveredSuperDomains`を`castle-social-time-v1`
+  probeの`coveredSuperDomainCount`metricとして新規公開した（`measureDomainSocialTime()`
+  の追加引数）。
+- **`POST_FILTER_MATCHING_SIZE`**: No.26/27のgraph matching sizeは、edge filter適用後に
+  再計算される派生値だが、edge閾値を固定すればsubjectごとに1個の整数になる正当な
+  sample集合であるため、通常のAT_LEAST + `OBSERVED_NEAREST_RANK`でsweepできる——
+  第2ラウンドで「operatorを持たない」としたのは誤りだった。pre-filterの
+  `structuralMax*Matching`metricを流用せず、edge filter axisと同じ`rowGroupKey`から
+  再計算する契約であることは変わらない。
+- **`FILTER_THEN_SPAN_DAYS`**: No.56の`own-room-use-span`が`own-room-use-days`
+  （`FILTER_THEN_DISTINCT_DAYS`、件数）と同じreducerを誤って共有していた。span
+  （`max(dayOffset) - min(dayOffset) + 1`、空集合はnull）を独立したreducer kindへ分離した。
+- **`F5cRowGroupComposition`**（`ALL_FILTERS` / `ANY_FILTER`）: 同じ`rowGroupKey`を
+  共有するSCALAR_SAMPLE filter axisが2件以上ある場合、それらがconjunctive（No.42の
+  TC start: quiet-beforeとcontinuation-gapは同じstart rowが両方を満たす）なのか
+  disjunctive（No.32-37/No.77のTC/VC multimodal social evidence: いずれかのmodalityが
+  十分であればよい）なのかを明示する。auditは該当row groupにcomposition宣言が
+  無ければunexecutableとして検出する。
+- **audit拡張**: `manifestFingerprintDrift`（pin vs live fingerprintの不一致kind一覧）、
+  `rowGroupsMissingComposition`、`unusedRequiredJointSelectors`（No.26/27で
+  `counterparts.maximum-matching`をrequiredJointEvidenceへ宣言していながら
+  `POST_FILTER_MATCHING_SIZE` axisが無い場合を検出）を追加した。現行READY-76は
+  すべて0/空のまま。
+
+### 14.9.3 意味論の精密化: cardinality混在・TC/VC独立要求・own-use row限定（PR #190レビュー第4ラウンド対応）
+
+第3ラウンドは型と構造を修正したが、3件の候補で「型は正しいが意味が違う」問題が
+残っていた。
+
+- **No.69の`ALL_MANIFEST_MEMBERS`**: `countMetricKey`が`allFamiliesCompleted`
+  （boolean 0/1）だった。No.89の同じcriterion kindは`activeFamilyCount`
+  （実数のfamily count）を使っており、同一kindが2つの異なる意味を持っていた。
+  No.69を`distinctCompletedFamilies`（実数count）へ変更し、cardinality-compatible
+  な意味論へ統一した。`allFamiliesCompleted`はdiagnostic用の`requiredMetrics`
+  としてのみ残る。
+- **No.49のTC/VC独立要求**: 「TCとVC双方で複数日」を`unionModalityDays`
+  （union distinct days）1本のaxisで表現していたが、unionはTC=1日・VC=多数日
+  という反例でも大きくなるため「TC単体も複数日」を保証しない。TC/VCそれぞれの
+  row group（`tc-days-rows`/`vc-days-rows`）へ独立した`tc-qualifying-days`/
+  `vc-qualifying-days`（`FILTER_THEN_DISTINCT_DAYS`）axisを追加し、union/overlap
+  （`unionModalityDays`/`overlappingCalendarDays`）はdiagnostic requiredMetric
+  としてのみ残した。`F5cCandidateSweepPlan.axes`は（rowGroupKeyの異同に関わらず）
+  plan全体でconjunctiveであることをinterface docへ明記した——これがREADY-76
+  全76 planに例外なく適用される唯一の不変条件であり、disjunctionは
+  `rowGroupCompositions`の`ANY_FILTER`（同一rowGroupKey内のSCALAR_SAMPLE filter
+  同士に限定）だけが表現できる。
+- **No.56のown-use row限定**: `own-room-use-span`が汎用の`domainDays.day-offset`
+  selector（hosted/guest行も含み得る）を使っており、spanをown-use rowだけへ
+  絞ることをF5c2がprose頼みで推測することになっていた。`own-room-use-days`と
+  同じ`domainDays.public-room-own-use`selectorを共有させ（Approach A）、
+  汎用の`domainDays.day-offset`は`JOINT_SELECTOR_ALLOWLIST`から削除した。
+
+3点とも回帰testで直接演習した（No.69/89のcardinality-compatible比較、No.49の
+TC=1日/VC多数日の反例モデル、No.56のown-use日オフセット1,2,10 + range外の
+hosted/guest的な日オフセットが混入した場合との対比計算）。readiness・31 probe・
+76/76 plan coverage・declared measurement gaps 0・unexecutable plans 0・
+numeric pending thresholds 0は不変。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

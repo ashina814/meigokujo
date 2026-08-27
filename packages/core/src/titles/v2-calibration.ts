@@ -367,6 +367,13 @@ interface CalibrationProbeRuntime {
   measureEmpty(context: { readonly windowStart: number }): SubjectMeasurement;
 }
 
+export interface CalibrationProbeMeasurementContract {
+  readonly probeKey: CalibrationProbeKey;
+  readonly candidateNos: readonly number[];
+  readonly metricKeys: readonly string[];
+  readonly jointEvidenceKind: PlanningCalibrationJointEvidence["kind"];
+}
+
 function runtimeProbe<S extends readonly TitleUsableSourceKey[]>(probe: CalibrationProbe<S>): CalibrationProbeRuntime {
   // Fail at module/probe construction, before any cohort read, if readiness/source integrity drifts.
   descriptorFor(probe.candidateNos, probe.sources);
@@ -964,6 +971,13 @@ function measureDomainSocialTime(
   domainDays: readonly { readonly dayOffset: number; readonly semanticIndex: number; readonly magnitude: number }[],
   social: SocialActivityTimeSafeSourcePayload,
   context: { readonly windowStart: number },
+  /**
+   * F5c1レビュー(PR #190)§2: No.87の「social/economy-play/castle-wide super-domain
+   * coverage」はfamily breadth（domainSemanticBreadth）とは別概念——`castle_experience_safe`
+   * payloadが既に持つ`coveredSuperDomains`をそのまま公開する。"public-room"呼び出しには
+   * super-domainの概念が無いためundefinedのまま（metricを出さない）。
+   */
+  castleCoveredSuperDomainCount?: number,
 ): SubjectMeasurement {
   const socialHours = socialHourEvidence(social, context.windowStart);
   const domainOffsets = sortedDistinct(domainDays.map(({ dayOffset }) => dayOffset));
@@ -979,6 +993,7 @@ function measureDomainSocialTime(
     ["overlappingCalendarDays", domainOffsets.filter((day) => socialSet.has(day)).length],
     ["unionCalendarDays", new Set([...domainOffsets, ...socialOffsets]).size],
   ]);
+  if (castleCoveredSuperDomainCount !== undefined) metrics.set("coveredSuperDomainCount", castleCoveredSuperDomainCount);
   setDayRangeMetrics(metrics, "domainActive", domainOffsets);
   setDayRangeMetrics(metrics, "socialActive", socialOffsets);
   return {
@@ -1606,6 +1621,7 @@ const CASTLE_SOCIAL_TIME_PROBE: CalibrationProbe<readonly ["castle_experience_sa
     castleFamilyDayRows(payloads.castle_experience_safe, context.windowStart),
     payloads.social_activity_time_safe,
     context,
+    payloads.castle_experience_safe.coveredSuperDomains.length,
   ),
 };
 const EMPTY_CASTLE_ROLE_CONTEXT = Object.freeze({
@@ -1654,6 +1670,13 @@ export const F5B2_CALIBRATION_PROBES = Object.freeze([
   runtimeProbe(CASTLE_EXPERIENCE_PROBE),
   runtimeProbe(CASTLE_SOCIAL_TIME_PROBE),
   runtimeProbe(CASTLE_ROLE_CONTEXT_PROBE),
+]);
+
+/** All SOURCE READY measurement probes, for planning-only F5c analysis. */
+export const F5C_CALIBRATION_PROBES = Object.freeze([
+  ...F5A_CALIBRATION_PROBES,
+  ...F5B1_CALIBRATION_PROBES,
+  ...F5B2_CALIBRATION_PROBES,
 ]);
 
 export function canonicalReadinessHash(readiness: readonly CandidateReadinessAudit[]): string {
@@ -1780,6 +1803,32 @@ export function collectF5b2CalibrationMeasurements(
   input: F5aCalibrationInput,
 ): PlanningCalibrationMeasurementCollection {
   return collectCalibrationMeasurements(db, input, F5B2_CALIBRATION_PROBES);
+}
+
+/**
+ * Restricted planning API for F5c. All 31 probes share one source cache and one
+ * deterministic cohort/window/observedAt boundary. Never serialize this result.
+ */
+export function collectF5cCalibrationMeasurements(
+  db: Database.Database,
+  input: F5aCalibrationInput,
+): PlanningCalibrationMeasurementCollection {
+  return collectCalibrationMeasurements(db, input, F5C_CALIBRATION_PROBES);
+}
+
+/** Actual zero-payload output contract used to audit F5c metric/joint selectors. */
+export function describeF5cCalibrationProbeContracts(
+  windowStart = 0,
+): readonly CalibrationProbeMeasurementContract[] {
+  return deepFreeze(F5C_CALIBRATION_PROBES.map((probe) => {
+    const measurement = probe.measureEmpty({ windowStart });
+    return {
+      probeKey: probe.probeKey,
+      candidateNos: [...probe.candidateNos].sort((a, b) => a - b),
+      metricKeys: [...measurement.metrics.keys()].sort(),
+      jointEvidenceKind: measurement.jointEvidence?.kind ?? "none",
+    };
+  }).sort((a, b) => a.probeKey.localeCompare(b.probeKey)));
 }
 
 function collectCalibrationMeasurements(
