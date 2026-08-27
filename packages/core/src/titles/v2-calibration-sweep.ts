@@ -12,7 +12,7 @@ import {
 } from "./v2-calibration.js";
 
 /** Planning-only contract. Never import from evaluator, pipeline, Bot, or the public v2 barrel. */
-export const F5C_SWEEP_CONTRACT_VERSION = 6 as const;
+export const F5C_SWEEP_CONTRACT_VERSION = 7 as const;
 
 /**
  * PR #190レビュー第3ラウンド§1: 「manifestが将来改訂されても、古いF5c sweep
@@ -231,30 +231,64 @@ interface F5cJointThresholdAxis {
  * 「母集団全体でのbest 8-hour window」へ収束させてしまい得た。以下の有限型は、
  * どのhour境界も選ばずに「どの構造パターンか」だけを宣言する。
  *
- * - `DAYPART_TARGET`: 24時間を4等分した中立的なquadrant（QUADRANT_0=[0,6)、
- *   QUADRANT_1=[6,12)、QUADRANT_2=[12,18)、QUADRANT_3=[18,24) —
- *   "morning/afternoon"等のuser-facing labelでも本番のwindow長・境界でもない、
- *   単にNo.32-35のsearch領域を互いに分離するための固定index。文字列labelにして
- *   いるのは、`auditF5cCandidateSweepPlans()`の`numericThresholdValueCount`
- *   （axes内の数値literalは production threshold の疑いとして数える既存guard）が
- *   これを誤ってthreshold値として検出しないようにするため——実際には閾値では
- *   なく、単なる分類indexである。PR #191レビュー第4ラウンド§3: F5c2はsubjectを
- *   このquadrant「ちょうど」に対して評価する（windowをquadrant境界の外まで
- *   探索しない）——ある候補が別のdaypartに明確に属する活動から代表意味を
- *   導出できないようにするため。
+ * - `DAYPART_TARGET`: 24時間を4等分した中立的なquadrant（`CIRCULAR_QUADRANT_HOUR_RANGES`
+ *   参照）のうち1つを対象に、そのquadrant「ちょうど」に対してsubjectを評価する
+ *   （PR #191レビュー第4ラウンド§3: windowをquadrant境界の外まで探索しない
+ *   ——ある候補が別のdaypartに明確に属する活動から代表意味を導出できない
+ *   ようにするため）。
  * - `PERSONAL_STABILITY`: 母集団共通のwindowを選ばず、各subject自身のrowだけ
  *   から求めた「自分にとって最良のwindowの占有率」を求め、percentile軸として
  *   扱う——「母集団で人気の時間帯かどうか」ではなく「本人がどれだけ安定して
  *   いるか」を測る（No.36）。
- * - `MULTI_DAYPART_BREADTH`: 上と同じ4 quadrantのうち、subjectがqualifying row
- *   を持つdistinct quadrant数を求め、percentile軸として扱う——1つの連続windowに
- *   収まる集中（一晩の徹夜等）とは構造的に区別される（No.37）。
+ * - `MULTI_DAYPART_BREADTH`: 上と同じ4 quadrantのうち、subjectが
+ *   `minDistinctDaysPerQuadrant`日以上qualifying rowを持つdistinct quadrant数を
+ *   求め、percentile軸として扱う——1つの連続する徹夜セッションは、それが跨いだ
+ *   どのquadrantに対しても高々1日しか寄与できないため、単独では
+ *   「recurring」とは判定されない（No.37、PR #191レビュー第4ラウンド§4）。
+ *
+ * PR #191レビュー第5ラウンド§4: quadrant token（`QUADRANT_0`等）が実際に指す
+ * JST hour範囲は、以前はF5c2側の private constant にしかなく、F5c2が
+ * F5c1のtokenの意味を独自解釈していた。`CIRCULAR_QUADRANT_HOUR_RANGES`を
+ * ここでSSOTとして確定させる——「F5c1はdaypart境界を選ばない」という
+ * deferralは**production title threshold**の選定を指し、この4等分は
+ * production semanticではなく、shadow探索のための中立的な
+ * calibration-analysis解像度（lattice）である。この区別を保つため、
+ * `auditF5cCandidateSweepPlans()`の`numericThresholdValueCount`は意図的に
+ * `entry.axes`だけを走査する——`CIRCULAR_QUADRANT_HOUR_RANGES`や
+ * `MULTI_DAYPART_RECURRENCE_MIN_DAYS`のようなmodule-levelの共有定数は、
+ * 個々のcandidateのaxisへ埋め込まれたthreshold値とは構造的に別物であり、
+ * この監査の対象外——文字列へ隠して回避しているのではなく、対象範囲が
+ * そもそも異なる（axesへ数値literalを直接埋め込むことだけを禁じる）。
  */
 export type F5cCircularQuadrant = "QUADRANT_0" | "QUADRANT_1" | "QUADRANT_2" | "QUADRANT_3";
+
+export interface F5cCircularQuadrantHourRange {
+  readonly startHour: number;
+  readonly lengthHours: number;
+}
+
+/** SSOT for what a quadrant token structurally means — see the doc block above. */
+export const CIRCULAR_QUADRANT_HOUR_RANGES: Readonly<Record<F5cCircularQuadrant, F5cCircularQuadrantHourRange>> = Object.freeze({
+  QUADRANT_0: Object.freeze({ startHour: 0, lengthHours: 6 }),
+  QUADRANT_1: Object.freeze({ startHour: 6, lengthHours: 6 }),
+  QUADRANT_2: Object.freeze({ startHour: 12, lengthHours: 6 }),
+  QUADRANT_3: Object.freeze({ startHour: 18, lengthHours: 6 }),
+});
+
+/**
+ * MULTI_DAYPART_BREADTH（No.37）の「recurring」判定に使う最小distinct日数。安全な
+ * evidenceがF5c2に証明できるのは「同じquadrant内での複数日にわたる再来」だけ
+ * ——生のTC/VC sourceにセッション連続性(いつ始まっていつ終わったか)の情報は無い
+ * ため、「1回の連続した徹夜セッションではない」ことを厳密に証明するものではない。
+ * この定数はNo.37専用のF5c1構造的意味論であり、F5c2側で独立にhardcodeしない
+ * （PR #191レビュー第5ラウンド§5）。
+ */
+export const MULTI_DAYPART_RECURRENCE_MIN_DAYS = 2 as const;
+
 export type F5cCircularIntent =
   | { readonly kind: "DAYPART_TARGET"; readonly quadrant: F5cCircularQuadrant }
   | { readonly kind: "PERSONAL_STABILITY" }
-  | { readonly kind: "MULTI_DAYPART_BREADTH" };
+  | { readonly kind: "MULTI_DAYPART_BREADTH"; readonly minDistinctDaysPerQuadrant: typeof MULTI_DAYPART_RECURRENCE_MIN_DAYS };
 
 interface F5cJointCircularHourAxis {
   readonly axisKey: string;
@@ -262,7 +296,12 @@ interface F5cJointCircularHourAxis {
   readonly selector: string;
   readonly rowGroupKey: string;
   readonly reducerKind: "CIRCULAR_HOUR_WINDOW";
-  readonly boundaryMethod: "CIRCULAR_CANDIDATE_ENUMERATION";
+  // PR #191レビュー第5ラウンド§4: "CIRCULAR_CANDIDATE_ENUMERATION"は、3つのintent全てが
+  // window候補を列挙するという旧設計を前提にした名前だった——DAYPART_TARGET/
+  // MULTI_DAYPART_BREADTHはもう列挙しない（quadrant/recurrenceへの直接reduction）。
+  // PERSONAL_STABILITYだけが実際にwindow候補を列挙する。intentに依らない中立的な
+  // 名前へ改めた。
+  readonly boundaryMethod: "CIRCULAR_ANALYSIS";
   readonly circularIntent: F5cCircularIntent;
 }
 
@@ -431,7 +470,7 @@ function jointThresholdAxis(
 }
 
 function circularHourAxis(axisKey: string, selector: string, rowGroupKey: string, circularIntent: F5cCircularIntent): F5cJointCircularHourAxis {
-  return { axisKey, source: "JOINT_EVIDENCE", selector, rowGroupKey, reducerKind: "CIRCULAR_HOUR_WINDOW", boundaryMethod: "CIRCULAR_CANDIDATE_ENUMERATION", circularIntent };
+  return { axisKey, source: "JOINT_EVIDENCE", selector, rowGroupKey, reducerKind: "CIRCULAR_HOUR_WINDOW", boundaryMethod: "CIRCULAR_ANALYSIS", circularIntent };
 }
 
 function metricAtLeast(metricKey: string, fixedValue: number): F5cFixedCriterion {
@@ -668,7 +707,10 @@ const PLAN_INPUTS: readonly PlanInput[] = [
     axes: activityDayHourAxes(no, `candidate-${no}-activity-day-hour-rows`, quadrant),
     // TC/VCどちらか一方のmodalityが十分であれば行が対象になる(片方だけの必須化を避ける、§5-B)。
     rowGroupCompositions: [rowGroupComposition(`candidate-${no}-activity-day-hour-rows`, "ANY_FILTER")],
-    coverageNotes: ["JST hour bins are measurement resolution; F5c1 fixes no daypart boundary."],
+    // PR #191レビュー第5ラウンド§4: 「daypart境界を選ばない」はproduction titleの
+    // threshold選定を指す——CIRCULAR_QUADRANT_HOUR_RANGESの4等分はF5c2 shadow探索
+    // 専用の中立的calibration-analysis lattice であり、これと矛盾しない。
+    coverageNotes: ["JST hour bins are measurement resolution; F5c1 fixes no PRODUCTION daypart boundary (the neutral 4-quadrant calibration-analysis lattice in CIRCULAR_QUADRANT_HOUR_RANGES is not a production selection)."],
   })),
   measuredPlan(36, "JOINT_CORRELATION", activityMetrics, {
     requiredJointEvidence: joint("activity-time-day-hour-v1", "rows.activity-start-hour", "rows.day-hour-social-evidence", "rows.tc-gap", "rows.vc-seconds"),
@@ -683,13 +725,13 @@ const PLAN_INPUTS: readonly PlanInput[] = [
   measuredPlan(37, "JOINT_CORRELATION", activityMetrics, {
     requiredJointEvidence: activityJoint,
     axes: [
-      circularHourAxis("multi-daypart-boundaries", "rows.daypart-boundary", "multi-daypart-rows", { kind: "MULTI_DAYPART_BREADTH" }),
+      circularHourAxis("multi-daypart-boundaries", "rows.daypart-boundary", "multi-daypart-rows", { kind: "MULTI_DAYPART_BREADTH", minDistinctDaysPerQuadrant: MULTI_DAYPART_RECURRENCE_MIN_DAYS }),
       jointThresholdAxis("multi-daypart-distributed-days", "rows.day-hour-social-evidence", "FILTER_THEN_DISTINCT_DAYS", "multi-daypart-rows"),
       jointThresholdAxis("multi-daypart-tc-gap-ceiling", "rows.tc-gap", "SCALAR_SAMPLE", "multi-daypart-rows", "AT_MOST"),
       jointThresholdAxis("multi-daypart-vc-seconds", "rows.vc-seconds", "SCALAR_SAMPLE", "multi-daypart-rows"),
     ],
     rowGroupCompositions: [rowGroupComposition("multi-daypart-rows", "ANY_FILTER")],
-    coverageNotes: ["JST hour bins are measurement resolution; F5c1 fixes no daypart boundary and does not reward a single all-night session."],
+    coverageNotes: ["JST hour bins are measurement resolution; F5c1 fixes no PRODUCTION daypart boundary (see No.32-35's note). Safe evidence proves recurring day/hour activity per quadrant, not exact session continuity — a single continuous all-night session cannot be distinguished at the row level from two shorter sessions on the same day, but MULTI_DAYPART_RECURRENCE_MIN_DAYS requires distinct days, which no single session (however long) can satisfy for more than one quadrant it happens to span."],
   }),
 
   measuredPlan(38, "STRUCTURAL_PRESENCE", ["eventCount"], {
@@ -1103,10 +1145,24 @@ export interface F5cCandidateSweepPlanAudit {
   readonly exactReadySet: boolean;
 }
 
-function countNumbers(value: unknown): number {
+/**
+ * PR #191レビュー第5ラウンド§4/§5: `entry.axes`へ埋め込まれた数値literalを、production
+ * distribution boundaryが紛れ込んでいる疑いとして数える。`circularIntent`が運ぶ
+ * `minDistinctDaysPerQuadrant`（No.37、`MULTI_DAYPART_RECURRENCE_MIN_DAYS`参照）は
+ * production threshold ではなく、F5c1自身がこのmoduleでSSOTとして確定させた構造的
+ * semantic constant（quadrant token自体——`CIRCULAR_QUADRANT_HOUR_RANGES`が運ぶ実際の
+ * hour範囲——はそもそも文字列tokenとしてのみ`axes`へ現れ、対応する数値はこのmoduleの
+ * 別のtop-level constantにしかない）——この監査が対象にするのはaxisへ直接埋め込まれた
+ * threshold値であり、`circularIntent`はその対象から明示的に除外する（文字列へ隠して
+ * 回避しているのではなく、監査の対象範囲を型で正確にする）。
+ */
+function countNumbers(value: unknown, key?: string): number {
+  if (key === "circularIntent") return 0;
   if (typeof value === "number") return 1;
   if (Array.isArray(value)) return value.reduce((sum, item) => sum + countNumbers(item), 0);
-  if (value !== null && typeof value === "object") return Object.values(value).reduce((sum, item) => sum + countNumbers(item), 0);
+  if (value !== null && typeof value === "object") {
+    return Object.entries(value).reduce((sum, [entryKey, item]) => sum + countNumbers(item, entryKey), 0);
+  }
   return 0;
 }
 

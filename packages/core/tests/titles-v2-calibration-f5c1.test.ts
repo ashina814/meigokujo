@@ -104,7 +104,7 @@ describe("F5c1 READY-76 sweep contract", () => {
       }
       for (const axis of candidatePlan.axes) {
         if (axis.reducerKind === "CIRCULAR_HOUR_WINDOW") {
-          expect(axis.boundaryMethod).toBe("CIRCULAR_CANDIDATE_ENUMERATION");
+          expect(axis.boundaryMethod).toBe("CIRCULAR_ANALYSIS");
           expect("operator" in axis).toBe(false);
         } else {
           expect(axis.boundaryMethod).toBe("OBSERVED_NEAREST_RANK");
@@ -263,7 +263,7 @@ describe("F5c1 contract executability (PR #190 review follow-up)", () => {
     for (const no of [32, 33, 34, 35]) {
       const boundaryAxis = byNo(no).axes.find((axis) => axis.axisKey === `candidate-${no}-daypart-boundary`)!;
       expect(boundaryAxis.reducerKind).toBe("CIRCULAR_HOUR_WINDOW");
-      expect(boundaryAxis.boundaryMethod).toBe("CIRCULAR_CANDIDATE_ENUMERATION");
+      expect(boundaryAxis.boundaryMethod).toBe("CIRCULAR_ANALYSIS");
       expect("operator" in boundaryAxis).toBe(false);
     }
   });

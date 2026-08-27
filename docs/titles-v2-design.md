@@ -2817,6 +2817,109 @@ No.32/34の再設計されたcounterexample、No.37の「1回の徹夜では
 満たせない」counterexampleを追加した。全ての新guardを
 mutation-verify済み。
 
+### 14.11.4 意味論的実行可能性フォローアップ第4ラウンド（PR #191レビュー第5ラウンド対応）
+
+第3ラウンド（14.11.3）は受理されたが、さらに6点の指摘があった。
+
+1. **fixed-boundary certainty と percentile-boundary certainty を分離**（§1）:
+   `coverageSensitiveOutcome()`の非対称ルールは、比較対象のboundary自体が
+   固定・信頼できる値（`criterion.fixedValue`・literal 0・
+   `F5C1_MANIFEST_PINS`由来のpinned total）のときにしか健全ではなかった。
+   反例（レビュー自身のもの）: 観測[2,1,0]のp50=1に対しaliceの観測値
+   2は「observed MATCHED」だが、真値が[2,100,100]ならp50=100で
+   aliceの真値は（undercountされていなければ）2のままかもしれず、
+   真のNOT_MATCHEDになりうる——alice自身の値が真値の下限であっても、
+   boundary自体がどれだけ動くか分からない以上、一方向だけの信頼性
+   主張は成立しない。`plan.axes`（METRIC/JOINT_EVIDENCE/
+   CIRCULAR_HOUR_WINDOW）は例外なくOBSERVED_NEAREST_RANKの
+   representative(p50)boundaryと比較するため、新設
+   `percentileBoundaryOutcome()`が、`coverageWindowValidated=false`の
+   ときこれらの結果を**方向に関わらず一律UNKNOWNへ**倒す
+   ——`coverageSensitiveOutcome()`はfixedCriteria/manifestCriteriaの
+   固定boundary比較専用として維持した（interval/rank proofのような
+   追加統計は導入しない）。
+2. **boundary reliability label をnon-monotonic統計と区別**（§2）:
+   `F5cBoundaryReliability`を`"COVERAGE_ATTESTED" | "OBSERVED_LOWER_BOUND"
+   | "OBSERVED_DIRECTION_UNKNOWN"`へ改称した（旧
+   `"OBSERVED_COMPLETE"`は「証明された事実」に読めてしまうため、
+   実際に分かっていること——呼び出し側の未検証attestationの結果で
+   あること——を表す名前へ改めた）。count/breadth/matching sizeの
+   ような値は、順序統計量の単調性により、観測percentile自体も真の
+   percentileの下限になり得る（`"OBSERVED_LOWER_BOUND"`）。ratio/
+   share/gap/median/IQR/concentration・opaqueなMETRIC scalarは
+   どちらの方向にも動きうるため`"OBSERVED_DIRECTION_UNKNOWN"`とする。
+3. **reliabilityをpipeline全体の性質として扱う**（§3）:
+   `reductionReliability(reducerKind)`はreducerKindだけでなく、その
+   還元がSCALAR_SAMPLE filterを1つ以上経由しているかどうかも見る
+   ——filterの土台となる生値（gap等）自体がundercountの下でどちらの
+   方向に動くか個別に証明しない限り、filter後のqualifying row集合が
+   完全データ下の部分集合であることは主張できない。filterがあれば
+   保守的にNON_MONOTONICへ倒す（汎用のfilter-semantics証明機構は
+   作らない）。POST_FILTER_MATCHING_SIZEは、辺を間引いても最大
+   matching sizeは単調非増加という純粋にグラフ理論的な事実により、
+   専用関数（`evaluatePostFilterMatchingAxis`）で独立に
+   MONOTONIC_LOWER_BOUNDを維持した（§1の一般化により、この分類は
+   もはやoutcome判定を直接gateしない——boundaryReliability labelの
+   決定にのみ使う）。
+4. **circular analysis semanticsをSSOTへ**（§4）:
+   quadrant token（`QUADRANT_0`等）が実際に指すJST hour範囲は、
+   以前はF5c2側のprivate constantにしかなく、F5c2がF5c1のtokenの
+   意味を独自解釈していた。F5c1（`v2-calibration-sweep.ts`）に
+   `CIRCULAR_QUADRANT_HOUR_RANGES`（quadrant→{startHour,
+   lengthHours}）をSSOTとして新設し、F5c2の`quadrantOfHour()`は
+   これを直接読むだけになった（`CIRCULAR_QUADRANT_INDEX`等の
+   private mappingは削除）。「F5c1はdaypart境界を選ばない」という
+   coverageNotesの文言を「PRODUCTION daypart境界を選ばない」へ
+   明確化した——4等分はproduction title semanticではなく、shadow
+   探索専用の中立的calibration-analysis解像度（lattice）である。
+   `numericThresholdValueCount`監査（`entry.axes`内の数値literalを
+   production thresholdの疑いとして数える）は、`circularIntent`
+   sub-objectを対象外にするよう改善した——文字列へ隠して回避するので
+   はなく、監査の対象範囲（axisへ直接埋め込まれたthreshold値）を型で
+   正確にした。`boundaryMethod: "CIRCULAR_CANDIDATE_ENUMERATION"`は、
+   DAYPART_TARGET/MULTI_DAYPART_BREADTHがもうwindow候補を列挙しない
+   （直接quadrant/recurrenceへreductionする）ため、intentに依らない
+   `"CIRCULAR_ANALYSIS"`へ改称した。
+5. **No.37のrecurrence semanticsを契約へ**（§5）: `>=2 distinct日`
+   というNo.37のrecurrence要件を、F5c2の実行時literalではなく
+   F5c1の`MULTI_DAYPART_RECURRENCE_MIN_DAYS`（=2）として確定させ、
+   `F5cCircularIntent`のMULTI_DAYPART_BREADTH variantへ
+   `minDistinctDaysPerQuadrant`フィールドを追加した。coverageNotesも、
+   safe evidenceが実際に証明できるのは「同じquadrant内での複数日
+   にわたる再来」だけであり、セッションの連続性そのものではない
+   ことを明記するよう修正した。
+6. **No.32-35のTC/VC中立性を再確認**（§6）: `rows.daypart-share`
+   （FILTER_THEN_SHAREのshare大きさ）が`vcTrustedSocialSeconds`
+   のみを使っており、row group全体はANY_FILTERでTC/VCどちらの
+   modalityでもqualifyできるのに、TC-onlyで活動するsubjectのshare
+   を常に0（0/0）にしていた。TC gapとVC秒数は方向・単位が異なり
+   単純合算できないため、row 1件ごとに均等な重み(1)を使う修正へ
+   変更した——「このdaypartの全rowのうちqualifyした割合」という
+   modality中立なprominence尺度になる。
+
+`F5C_SWEEP_CONTRACT_VERSION`を6→7へbump（circular analysis SSOT・
+recurrence契約化）。`F5C2_SHADOW_CONTRACT_VERSION`を3→4へbump
+（`boundaryReliability`のenum値変更）。
+
+保持事項（第1-3ラウンドで受理済みの作業）: 修正した Kleene AND/OR、
+No.46の`distinctReactors`契約、F5c1 manifest/version SSOT消費、
+catalog-correct No.32-35 mapping、DAYPART_TARGETのwindow spill除去、
+No.36 personal stabilityモデル、marginal sensitivity naming/model
+marker、`JOINT_ROW_RESOLVERS`（selector support SSOT）、matching
+recomputationとmatching-size boundary semantics、p95/p99 coarse
+grid、aggregate-only出力、production threshold不採用、evaluator/
+award/UI/deployへの接続無し——全てそのまま維持した。
+
+`packages/core/tests/titles-v2-shadow-evaluation.test.ts`に、
+レビュー自身の数値例による「observed MATCH against untrusted
+percentile boundary」counterexample（No.49再設計）、non-monotonic
+統計（No.36 PERSONAL_STABILITY）のUNKNOWN collapse、filter siblingの
+有無によるboundaryReliability labelの変化、
+`CIRCULAR_QUADRANT_HOUR_RANGES`のSSOT検証、No.37 recurrence契約の
+plan-level検証、TC-only prominence counterexampleを追加した。
+`numericThresholdValueCount`監査の改善も専用テストで確認した。
+全ての新guardをmutation-verify済み。
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。

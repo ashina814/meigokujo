@@ -8,7 +8,11 @@ import { BumpCounter } from "../src/rank/bump.js";
 import { RoleFamilyTemporal } from "../src/role-family/temporal.js";
 import { TcSocialObservations } from "../src/tc-social/service.js";
 import { VcPublicSocialPresence } from "../src/vc/public-social-presence.js";
-import { F5C_CANDIDATE_SWEEP_PLANS, F5C_SWEEP_CONTRACT_VERSION, F5C1_MANIFEST_PINS, type F5cCandidateSweepPlan } from "../src/titles/v2-calibration-sweep.js";
+import {
+  F5C_CANDIDATE_SWEEP_PLANS, F5C_SWEEP_CONTRACT_VERSION, F5C1_MANIFEST_PINS,
+  CIRCULAR_QUADRANT_HOUR_RANGES, MULTI_DAYPART_RECURRENCE_MIN_DAYS,
+  type F5cCandidateSweepPlan,
+} from "../src/titles/v2-calibration-sweep.js";
 import { CALIBRATION_SCHEMA_VERSION, CALIBRATION_PERCENTILE_METHOD, canonicalReadinessHash } from "../src/titles/v2-calibration.js";
 import { TITLE_V2_CATALOG_READINESS } from "../src/titles/v2-catalog-readiness.js";
 import { canonicalCatalogHash, TITLE_V2_CATALOG_CANDIDATES } from "../src/titles/v2-catalog-candidates.js";
@@ -194,7 +198,7 @@ describe("F5c2 shadow-calibration executor", () => {
     // with no chosen operator would have produced.
     expect(boundary.boundaryPoints.length).toBeGreaterThan(0);
     expect(boundary.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue).toBe(1);
-    expect(boundary.boundaryReliability).toBe("OBSERVED_COMPLETE");
+    expect(boundary.boundaryReliability).toBe("COVERAGE_ATTESTED");
     expect(plan32.matchedCount).toBe(2); // alice (2 in-Q1), carol (1 in-Q1)
     expect(plan32.notMatchedCount).toBe(1); // bob (0 in-Q1)
   });
@@ -363,33 +367,41 @@ describe("F5c2 shadow-calibration executor", () => {
     expect(plan37.matchedCount).toBe(2); // moderate (1 recurring quadrant), recurring (2)
   });
 
-  it("coverageWindowValidated=false downgrades an absolute-zero NOT_MATCHED to UNKNOWN, but never touches a real MATCHED (PR #191レビュー第3ラウンド§1 counterexample)", () => {
+  it("coverageWindowValidated=false collapses ALL percentile-boundary outcomes to UNKNOWN, even an observed MATCH against a monotonic lower-bound value — the review's own counterexample (PR #191レビュー第5ラウンド§1 counterexample)", () => {
+    // observed TC-qualifying-days = [2, 1, 0] (alice, bob, carol). Population p50 boundary = 1 ->
+    // observed: alice(2>=1) MATCHED, bob(1>=1) MATCHED, carol(0>=1) NOT_MATCHED. Under the round-4
+    // model, alice/bob's MATCHED would have been treated as "reliable" (AT_LEAST + monotonic
+    // count). But the boundary itself is percentile-derived from this same uncertain population:
+    // if the true values were [2, 100, 100], the true p50 would be 100, and alice's own true value
+    // (which could still be exactly 2, if only bob/carol were undercounted) would be a definite
+    // true NOT_MATCHED against that true boundary. An observed MATCH against an untrusted
+    // percentile boundary is therefore not a definite true MATCH — every outcome must collapse.
     const probeKey = probeKeyFor(49);
     const alice = subject("alice", [{
-      probeKey,
-      jointEvidence: { kind: "cross-modal-days-v1", tcDays: [], vcDays: [
-        { dayOffset: 1, distinctCoPresentUsers: 5 }, { dayOffset: 2, distinctCoPresentUsers: 5 },
-        { dayOffset: 3, distinctCoPresentUsers: 5 }, { dayOffset: 4, distinctCoPresentUsers: 5 },
-      ] },
-    }]);
-    const bob = subject("bob", [{
       probeKey,
       jointEvidence: { kind: "cross-modal-days-v1", tcDays: [
         { dayOffset: 1, bestOtherGapMs: 100 }, { dayOffset: 2, bestOtherGapMs: 100 },
       ], vcDays: [{ dayOffset: 1, distinctCoPresentUsers: 5 }] },
     }]);
+    const bob = subject("bob", [{
+      probeKey,
+      jointEvidence: { kind: "cross-modal-days-v1", tcDays: [{ dayOffset: 1, bestOtherGapMs: 100 }], vcDays: [{ dayOffset: 1, distinctCoPresentUsers: 5 }] },
+    }]);
     const carol = subject("carol", [{
       probeKey,
-      jointEvidence: { kind: "cross-modal-days-v1", tcDays: [
-        { dayOffset: 1, bestOtherGapMs: 100 }, { dayOffset: 2, bestOtherGapMs: 100 }, { dayOffset: 3, bestOtherGapMs: 100 },
-      ], vcDays: [{ dayOffset: 1, distinctCoPresentUsers: 5 }] },
+      jointEvidence: { kind: "cross-modal-days-v1", tcDays: [], vcDays: [{ dayOffset: 1, distinctCoPresentUsers: 5 }] },
     }]);
-    const report = executeF5cShadowCalibration(collection([alice, bob, carol]), false);
-    expect(report.coverageWindowValidated).toBe(false);
-    const plan49 = byNo(report, 49);
-    expect(plan49.unknownCount).toBe(1); // alice: TC=0 (absolute zero) is no longer trusted as a real NOT_MATCHED
-    expect(plan49.matchedCount).toBe(2); // bob, carol: positive TC evidence remains trusted regardless
-    expect(plan49.notMatchedCount).toBe(0);
+    const validated = executeF5cShadowCalibration(collection([alice, bob, carol]), true);
+    const plan49Validated = byNo(validated, 49);
+    expect(plan49Validated.matchedCount).toBe(2); // alice, bob — real boundary math, trusted when attested
+    expect(plan49Validated.notMatchedCount).toBe(1); // carol
+
+    const unvalidated = executeF5cShadowCalibration(collection([alice, bob, carol]), false);
+    expect(unvalidated.coverageWindowValidated).toBe(false);
+    const plan49Unvalidated = byNo(unvalidated, 49);
+    expect(plan49Unvalidated.unknownCount).toBe(3); // ALL THREE — including alice/bob's observed MATCH
+    expect(plan49Unvalidated.matchedCount).toBe(0);
+    expect(plan49Unvalidated.notMatchedCount).toBe(0);
   });
 
   describe("coverageSensitiveOutcome — the general AT_LEAST/AT_MOST asymmetric reliability rule (PR #191レビュー第4ラウンド§1)", () => {
@@ -429,24 +441,139 @@ describe("F5c2 shadow-calibration executor", () => {
     });
   });
 
-  it("coverageWindowValidated=false marks every axis's boundary values as an observed lower bound, not a trustworthy population statistic, shifting nothing about the boundary computation itself (PR #191レビュー第4ラウンド§1)", () => {
+  it("boundaryReliability distinguishes COVERAGE_ATTESTED / OBSERVED_LOWER_BOUND / OBSERVED_DIRECTION_UNKNOWN — a percentile of count/breadth lower bounds is itself a lower bound, but a share/ratio/opaque METRIC statistic could move either way (PR #191レビュー第5ラウンド§2)", () => {
+    // No.81 is a plain METRIC axis (opaque scalar, F5c2 cannot introspect whether it's a count or
+    // a ratio) -> conservative OBSERVED_DIRECTION_UNKNOWN when unvalidated.
     const probeKey81 = probeKeyFor(81);
-    const withAxis = (validatedFlag: boolean) => executeF5cShadowCalibration(collection([
+    const withMetricAxis = (validatedFlag: boolean) => executeF5cShadowCalibration(collection([
       subject("alice", [{ probeKey: probeKey81, metrics: { completedParticipationCount: 3 } }]),
       subject("bob", [{ probeKey: probeKey81, metrics: { completedParticipationCount: 5 } }]),
     ]), validatedFlag);
-    const sweepValidated = byNo(withAxis(true), 81).axisSweeps[0]!;
-    const sweepUnvalidated = byNo(withAxis(false), 81).axisSweeps[0]!;
-    expect(sweepValidated.boundaryReliability).toBe("OBSERVED_COMPLETE");
-    expect(sweepUnvalidated.boundaryReliability).toBe("OBSERVED_LOWER_BOUND_ONLY");
+    const metricValidated = byNo(withMetricAxis(true), 81).axisSweeps[0]!;
+    const metricUnvalidated = byNo(withMetricAxis(false), 81).axisSweeps[0]!;
+    expect(metricValidated.boundaryReliability).toBe("COVERAGE_ATTESTED");
+    expect(metricUnvalidated.boundaryReliability).toBe("OBSERVED_DIRECTION_UNKNOWN");
     // the boundary VALUE computed is identical either way — only its labeled trustworthiness changes.
-    expect(sweepUnvalidated.boundaryPoints).toEqual(sweepValidated.boundaryPoints);
+    expect(metricUnvalidated.boundaryPoints).toEqual(metricValidated.boundaryPoints);
+
+    // No.32's daypart-boundary axis (DAYPART_TARGET, a plain in-quadrant row count with no
+    // sibling filter) is a genuine monotonic-lower-bound reduction -> OBSERVED_LOWER_BOUND.
+    const probeKey32 = probeKeyFor(32);
+    const withCountAxis = (validatedFlag: boolean) => executeF5cShadowCalibration(collection([
+      subject("alice", [{ probeKey: probeKey32, jointEvidence: { kind: "activity-time-day-hour-v1", rows: [{ dayOffset: 1, hour: 8, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 500 }] } }]),
+    ]), validatedFlag);
+    const countUnvalidated = byNo(withCountAxis(false), 32).axisSweeps.find((s) => s.axisKey === "candidate-32-daypart-boundary")!;
+    expect(countUnvalidated.boundaryReliability).toBe("OBSERVED_LOWER_BOUND");
   });
 
-  it("F5C2_SHADOW_CONTRACT_VERSION and the report's top-level shape are pinned by a direct regression assertion, so a shape change cannot silently drift undetected (PR #191レビュー第4ラウンド§5)", () => {
-    expect(F5C2_SHADOW_CONTRACT_VERSION).toBe(3);
+  it("No.36 PERSONAL_STABILITY (a non-monotonic share statistic) also collapses to UNKNOWN when unvalidated, not just monotonic count axes (PR #191レビュー第5ラウンド§1/§8)", () => {
+    const probeKey = probeKeyFor(36);
+    const daily = (id: string, hours: readonly number[]) => subject(id, [{
+      probeKey,
+      metrics: { vcTop3HoursShare: 1, vcTotalTrustedSeconds: 1000 },
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: hours.map((hour, i) => ({ dayOffset: i + 1, hour, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 })),
+      },
+    }]);
+    const withStability = (validatedFlag: boolean) => executeF5cShadowCalibration(collection([
+      daily("alice", [8, 8, 8, 8]), daily("bob", [20, 20, 20, 20]), daily("carol", [2, 8, 14, 20]),
+    ]), validatedFlag);
+    // sanity: with validated=true this is the same fixture as the earlier PERSONAL_STABILITY test
+    // (alice/bob MATCH, carol does not) — confirming the collapse below is really about coverage
+    // trust, not a change to the underlying share computation.
+    const plan36Validated = byNo(withStability(true), 36);
+    expect(plan36Validated.matchedCount).toBe(2);
+    expect(plan36Validated.notMatchedCount).toBe(1);
+
+    const plan36Unvalidated = byNo(withStability(false), 36);
+    expect(plan36Unvalidated.unknownCount).toBe(3);
+    expect(plan36Unvalidated.matchedCount).toBe(0);
+    expect(plan36Unvalidated.notMatchedCount).toBe(0);
+  });
+
+  it("a reduction axis's boundaryReliability label downgrades to OBSERVED_DIRECTION_UNKNOWN when it shares a row group with a SCALAR_SAMPLE filter (whose own monotonicity cannot be proven), but stays OBSERVED_LOWER_BOUND when the reduction has no filter siblings at all (PR #191レビュー第5ラウンド§3)", () => {
+    // No.49's tc-qualifying-days shares its row group with the tc-meaningful-gap SCALAR_SAMPLE
+    // filter (AT_MOST on a raw gap value) -> conservative, even though FILTER_THEN_DISTINCT_DAYS
+    // itself would otherwise be monotonic-safe.
+    const probeKey49 = probeKeyFor(49);
+    const filtered = executeF5cShadowCalibration(collection([
+      subject("alice", [{ probeKey: probeKey49, jointEvidence: { kind: "cross-modal-days-v1", tcDays: [{ dayOffset: 1, bestOtherGapMs: 100 }], vcDays: [{ dayOffset: 1, distinctCoPresentUsers: 5 }] } }]),
+    ]), false);
+    const tcSweep = byNo(filtered, 49).axisSweeps.find((s) => s.axisKey === "tc-qualifying-days")!;
+    expect(tcSweep.boundaryReliability).toBe("OBSERVED_DIRECTION_UNKNOWN");
+
+    // No.36's usual-time-qualifying-days (FILTER_THEN_DISTINCT_DAYS on "usual-time-rows") has NO
+    // SCALAR_SAMPLE filter sibling in that row group at all -> the reducerKind's own monotonicity
+    // is trusted for the label.
+    const probeKey36 = probeKeyFor(36);
+    const unfiltered = executeF5cShadowCalibration(collection([
+      subject("alice", [{
+        probeKey: probeKey36,
+        metrics: { vcTop3HoursShare: 1, vcTotalTrustedSeconds: 1000 },
+        jointEvidence: { kind: "activity-time-day-hour-v1", rows: [{ dayOffset: 1, hour: 8, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 100 }] },
+      }]),
+    ]), false);
+    const qualifyingDaysSweep = byNo(unfiltered, 36).axisSweeps.find((s) => s.axisKey === "usual-time-qualifying-days")!;
+    expect(qualifyingDaysSweep.boundaryReliability).toBe("OBSERVED_LOWER_BOUND");
+  });
+
+  it("F5c1's CIRCULAR_QUADRANT_HOUR_RANGES is the single SSOT for what a quadrant token means — F5c2 does not privately redefine the hour partition (PR #191レビュー第5ラウンド§4)", () => {
+    const source = require("node:fs").readFileSync(new URL("../src/titles/v2-shadow-evaluation.ts", import.meta.url), "utf8") as string;
+    expect(source).toContain("CIRCULAR_QUADRANT_HOUR_RANGES");
+    // no private F5c2 hour-range table (e.g. a hardcoded 0/6/12/18 quadrant-boundary object).
+    expect(source).not.toMatch(/QUADRANT_0:\s*0/);
+    // functional proof: an hour exactly at a CIRCULAR_QUADRANT_HOUR_RANGES boundary classifies
+    // into the quadrant the SSOT itself declares, for every declared quadrant. No.32 targets
+    // QUADRANT_1 specifically — with a single-subject population, the axis's own p50 boundaryValue
+    // IS the subject's in-quadrant row count (1 if their row falls in Q1, 0 otherwise).
+    const probeKey = probeKeyFor(32);
+    for (const [quadrant, range] of Object.entries(CIRCULAR_QUADRANT_HOUR_RANGES)) {
+      const report = executeF5cShadowCalibration(collection([
+        subject("alice", [{ probeKey, jointEvidence: { kind: "activity-time-day-hour-v1", rows: [{ dayOffset: 1, hour: range.startHour, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 500 }] } }]),
+      ]), true);
+      const sweep = byNo(report, 32).axisSweeps.find((s) => s.axisKey === "candidate-32-daypart-boundary")!;
+      const inQuadrantCount = sweep.boundaryPoints.find((p) => p.percentile === 50)!.boundaryValue;
+      expect(inQuadrantCount).toBe(quadrant === "QUADRANT_1" ? 1 : 0);
+    }
+  });
+
+  it("No.37's recurrence requirement (>=N distinct days per quadrant) is a shared F5c1 contract constant, not a private F5c2 executor literal (PR #191レビュー第5ラウンド§5)", () => {
+    const plan37 = F5C_CANDIDATE_SWEEP_PLANS.find((p) => p.candidateNo === 37)!;
+    const circularAxis = plan37.axes.find((a) => a.reducerKind === "CIRCULAR_HOUR_WINDOW") as { readonly circularIntent: { readonly kind: string; readonly minDistinctDaysPerQuadrant?: number } };
+    expect(circularAxis.circularIntent.kind).toBe("MULTI_DAYPART_BREADTH");
+    expect(circularAxis.circularIntent.minDistinctDaysPerQuadrant).toBe(MULTI_DAYPART_RECURRENCE_MIN_DAYS);
+    // F5c2 must read this off the plan, not hardcode its own copy of the number.
+    const source = require("node:fs").readFileSync(new URL("../src/titles/v2-shadow-evaluation.ts", import.meta.url), "utf8") as string;
+    expect(source).toContain("minDistinctDaysPerQuadrant");
+    expect(source).not.toMatch(/days\.size >= 2\b/);
+  });
+
+  it("No.32-35's daypart-share is TC/VC-neutral — a TC-only-active subject (zero VC time) still gets a nonzero prominence share, not a forced 0/0 (PR #191レビュー第5ラウンド§6 counterexample)", () => {
+    const probeKey = probeKeyFor(32);
+    // alice: TC-only activity (gap always qualifies, VC seconds always 0) inside QUADRANT_1.
+    const tcOnly = subject("alice", [{
+      probeKey,
+      jointEvidence: {
+        kind: "activity-time-day-hour-v1",
+        rows: [
+          { dayOffset: 1, hour: 8, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 0 },
+          { dayOffset: 2, hour: 8, tcBestOtherGapMs: 100, vcTrustedSocialSeconds: 0 },
+        ],
+      },
+    }]);
+    const report = executeF5cShadowCalibration(collection([tcOnly]), true);
+    const shareSweep = byNo(report, 32).axisSweeps.find((s) => s.axisKey === "candidate-32-activity-share")!;
+    // every row qualified via TC (vc-seconds is always 0, so only the TC-gap filter can admit a
+    // row under ANY_FILTER) -> the TC-only subject's own share must reflect that, not read as 0.
+    expect(shareSweep.observedSampleCount).toBeGreaterThan(0);
+    expect(shareSweep.boundaryPoints.some((p) => p.boundaryValue > 0)).toBe(true);
+  });
+
+  it("F5C2_SHADOW_CONTRACT_VERSION and the report's top-level shape are pinned by a direct regression assertion, so a shape change cannot silently drift undetected (PR #191レビュー第4/第5ラウンド§5)", () => {
+    expect(F5C2_SHADOW_CONTRACT_VERSION).toBe(4);
     const report = executeF5cShadowCalibration(collection([]), true);
-    expect(report.contractVersion).toBe(3);
+    expect(report.contractVersion).toBe(4);
     expect(Object.keys(report).sort()).toEqual([
       "cohort", "contractVersion", "coverageWindowValidated", "executedCandidateCount",
       "readyCandidateCount", "results", "sensitivityModel", "sweepContractVersion",
