@@ -453,17 +453,24 @@ export async function processShopRoleRevocations(client: Client, services: Servi
         failures.push(`role_id_missing:${candidate.purchase_id}`);
         continue;
       }
+      const roleId = candidate.role_id;
 
       // **Discordへ触る前に、保存済みの対象が購入時の事実として裏付くかを毎回確かめる。**
       // 古いキュー行は現在の商品設定から作られている可能性がある（Phase E以前）。
       // 証明できないものは実行しない。毎分retryし続けないよう blocked として畳む。
-      if (!services.shop.roleRevocationTargetProven(candidate.purchase_id, candidate.role_id)) {
+      if (!services.shop.roleRevocationTargetProven(candidate.purchase_id, roleId)) {
         markRoleRevocationBlocked(services, candidate.purchase_id, "target_unproven");
         continue;
       }
 
+      // 前回このworkerが roles.remove() を呼びにいったかもしれない行かどうか。
+      // **立っていれば、有効な契約があっても Discord の実体を見るまで done にしない。**
+      const mayHaveRemoved = services.shop.roleRevocationRemoveAttempted(candidate.purchase_id);
+      const stillEntitled = () =>
+        services.shop.activePurchaseProvesRoleEntitlement(candidate.user_id, roleId, candidate.purchase_id);
+
       // 同じロールを与える有効な別契約があるなら剥がさない。判断は購入時の事実だけで行う。
-      if (services.shop.activePurchaseProvesRoleEntitlement(candidate.user_id, candidate.role_id, candidate.purchase_id)) {
+      if (!mayHaveRemoved && stillEntitled()) {
         markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
         continue;
       }
@@ -482,20 +489,57 @@ export async function processShopRoleRevocations(client: Client, services: Servi
         continue;
       }
 
-      if (!member.roles.cache.has(candidate.role_id)) {
+      /**
+       * 有効な契約があるのに role が無い状態を残さない。
+       * 前回自分が外した可能性がある行では、**戻し切るまで done にしない**。
+       */
+      const restoreThenDone = async (): Promise<boolean> => {
+        if (member.roles.cache.has(roleId)) {
+          markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
+          return true;
+        }
+        try {
+          await member.roles.add(roleId);
+          const confirmed = await guild.members.fetch({ user: candidate.user_id, force: true });
+          if (!confirmed.roles.cache.has(roleId)) throw new Error("rollback_not_confirmed");
+          services.events.log("shop_role_revocation_rolled_back", {
+            actor: "system:shop-role-revocation",
+            target: candidate.user_id,
+            payload: { purchaseId: candidate.purchase_id },
+          });
+          markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
+          return true;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          markRoleRevocationRetryOnce(services, candidate.purchase_id, `rollback_failed:${message}`);
+          failures.push(`rollback:${candidate.purchase_id}:${message}`);
+          return false;
+        }
+      };
+
+      // 再起動やrollback失敗で持ち越した行。有効な契約があるなら、まず実体を収束させる。
+      if (mayHaveRemoved && stillEntitled()) {
+        await restoreThenDone();
+        continue;
+      }
+
+      if (!member.roles.cache.has(roleId)) {
         markRoleRevocationDoneOnce(services, candidate.purchase_id, "already_absent");
         continue;
       }
 
       // **剥がす直前にもう一度確かめる。** ここまでの間（member fetchのawait中）に
       // 新しい契約が成立していると、新しい権利のロールを古い失効が剥がしてしまう。
-      if (services.shop.activePurchaseProvesRoleEntitlement(candidate.user_id, candidate.role_id, candidate.purchase_id)) {
+      if (stillEntitled()) {
         markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
         continue;
       }
 
+      // **呼ぶ前にDBへ残す。** 呼んだ直後に落ちても、次回「自分が外したかもしれない」
+      // と分かるようにする（メモリ上のフラグでは落ちた瞬間に消える）。
+      services.shop.markRoleRevocationRemoveAttempt(candidate.purchase_id);
       try {
-        await member.roles.remove(candidate.role_id);
+        await member.roles.remove(roleId);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         markRoleRevocationRetryOnce(services, candidate.purchase_id, message);
@@ -505,25 +549,8 @@ export async function processShopRoleRevocations(client: Client, services: Servi
 
       // **剥がした直後にも確かめる。** 剥がしている最中に新しい契約が生えていたら、
       // 自分が消したロールを戻す。戻し切れるまでこの失効を done にしない。
-      if (services.shop.activePurchaseProvesRoleEntitlement(candidate.user_id, candidate.role_id, candidate.purchase_id)) {
-        try {
-          await member.roles.add(candidate.role_id);
-          const confirmed = await guild.members.fetch({ user: candidate.user_id, force: true });
-          if (!confirmed.roles.cache.has(candidate.role_id)) {
-            throw new Error("rollback_not_confirmed");
-          }
-          services.events.log("shop_role_revocation_rolled_back", {
-            actor: "system:shop-role-revocation",
-            target: candidate.user_id,
-            payload: { purchaseId: candidate.purchase_id },
-          });
-          markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
-        } catch (error) {
-          // 戻せていない。**doneにしない**——次の巡回で収束させる。
-          const message = error instanceof Error ? error.message : String(error);
-          markRoleRevocationRetryOnce(services, candidate.purchase_id, `rollback_failed:${message}`);
-          failures.push(`rollback:${candidate.purchase_id}:${message}`);
-        }
+      if (stillEntitled()) {
+        await restoreThenDone();
         continue;
       }
 

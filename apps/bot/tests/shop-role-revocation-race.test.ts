@@ -178,12 +178,63 @@ describe("剥奪と新しい契約の競合", () => {
     await expect(processShopRoleRevocations(w.client as never, ctx.services)).rejects.toThrow(/rollback/);
 
     expect(revocationStatus(ctx, old.id)).toBe("pending");
+    expect(w.roles.has(ROLE)).toBe(false); // 外したまま戻せていない
 
-    // 次の巡回では、有効な契約があるので**そもそも剥がさない**
+    // **次の巡回でロールを戻してから done にする。**
+    // 「有効な契約がある」だけを理由に done にすると、role が無いまま完了扱いになる。
     const w2 = world({ hasRole: false });
     await processShopRoleRevocations(w2.client as never, ctx.services);
+
     expect(w2.remove).not.toHaveBeenCalled();
+    expect(w2.add).toHaveBeenCalledWith(ROLE);
+    expect(w2.roles.has(ROLE)).toBe(true);
     expect(revocationStatus(ctx, old.id)).toBe("done");
+    ctx.db.close();
+  });
+
+  it("remove直後にプロセスが落ちても、再起動後にロールを戻してから done にする", async () => {
+    const { processShopRoleRevocations } = await recoveryModule;
+    const ctx = setup();
+    const item = roleItem(ctx, "月額", ROLE);
+    const old = buyDelivered(ctx, item.id);
+    expireNow(ctx, old.id);
+
+    // remove は成功したが、その直後に落ちた状況を再現する。
+    // 「外しにいった」記録はDBに残っている（メモリのフラグでは消えている）。
+    const crashed = world();
+    crashed.remove.mockImplementation(async () => {
+      throw new Error("process died");
+    });
+    ctx.shop.markRoleRevocationRemoveAttempt(old.id);
+    crashed.roles.delete(ROLE);
+    // 落ちている間に新しい契約が成立
+    buyDelivered(ctx, item.id);
+
+    // 再起動後の巡回
+    const w = world({ hasRole: false });
+    await processShopRoleRevocations(w.client as never, ctx.services);
+
+    expect(w.remove).not.toHaveBeenCalled();
+    expect(w.add).toHaveBeenCalledWith(ROLE);
+    expect(w.roles.has(ROLE)).toBe(true);
+    expect(revocationStatus(ctx, old.id)).toBe("done");
+    ctx.db.close();
+  });
+
+  it("戻せなければ done にしない（有効な契約があっても）", async () => {
+    const { processShopRoleRevocations } = await recoveryModule;
+    const ctx = setup();
+    const item = roleItem(ctx, "月額", ROLE);
+    const old = buyDelivered(ctx, item.id);
+    expireNow(ctx, old.id);
+    ctx.shop.markRoleRevocationRemoveAttempt(old.id);
+    buyDelivered(ctx, item.id);
+
+    const w = world({ hasRole: false, addFails: true });
+    await expect(processShopRoleRevocations(w.client as never, ctx.services)).rejects.toThrow(/rollback/);
+
+    expect(w.roles.has(ROLE)).toBe(false);
+    expect(revocationStatus(ctx, old.id)).toBe("pending");
     ctx.db.close();
   });
 

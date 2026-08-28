@@ -904,12 +904,21 @@ CREATE TABLE IF NOT EXISTS shop_purchase_stock_restorations (
 --
 -- 自動配送のスナップショット（delivery_snapshot_json）は auto 購入しか持たないので、
 -- 手動配送の add_role 商品もここに記録する。
+-- **行が無いこと**を「ロール商品ではなかった」の証拠にしない。add_role なのに
+-- role_id が壊れている購入も、非ロール商品も、同じ「行が無い」になってしまうため。
+-- 購入時にどちらだったかを grant_kind として明示的に凍結する。
+--
+--   role      … add_role で、対象ロールを特定できた（role_id あり）
+--   non_role  … ロールを与える契約ではなかった（role_id なし）
+--   invalid   … add_role だが対象を特定できなかった（role_id なし・推測しない）
 CREATE TABLE IF NOT EXISTS shop_purchase_role_grant_provenance (
   purchase_id    INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
-  role_id        TEXT NOT NULL,
+  grant_kind     TEXT NOT NULL CHECK (grant_kind IN ('role','non_role','invalid')),
+  role_id        TEXT,
   delivery_mode  TEXT NOT NULL CHECK (delivery_mode IN ('auto','manual')),
   source         TEXT NOT NULL,
-  captured_at    INTEGER NOT NULL
+  captured_at    INTEGER NOT NULL,
+  CHECK ((grant_kind = 'role') = (role_id IS NOT NULL))
 );
 CREATE INDEX IF NOT EXISTS idx_shop_purchase_role_grant_role
   ON shop_purchase_role_grant_provenance(role_id, purchase_id);
@@ -1509,6 +1518,11 @@ export function openDb(path: string): Database.Database {
   ensureColumn(db, "shop_purchases", "delivery_snapshot_json", "TEXT");
   // 配送状態を課金から分離する（購入は成立したが配送が終わっていない、を表せるようにする）。
   // 旧行の移行は backfillShopDeliveryState() で行う。
+  // Phase E: 「このworkerがDiscordのroleを外しにいった」ことを**DBに**残す。
+  // メモリ上のフラグでは remove 成功直後にプロセスが落ちた場合に失われ、
+  // 再起動後は「有効な契約がある」だけを見て done にしてしまう
+  // （＝roleが無いまま失効処理が完了扱いになる）。
+  ensureColumn(db, "shop_role_revocations", "remove_attempted_at", "INTEGER");
   ensureColumn(db, "shop_purchases", "delivery_state", "TEXT");
   ensureColumn(db, "shop_purchases", "delivery_attempts", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "shop_purchases", "delivery_error", "TEXT");
@@ -1537,6 +1551,7 @@ export function openDb(path: string): Database.Database {
   `);
   backfillEvaluationMarkWeights(db);
   backfillEvaluationPolicySnapshots(db);
+  migrateRoleGrantProvenanceShape(db);
   backfillShopDeliveryState(db);
   backfillLegacyAutoReplaySuppression(db);
   backfillEverMeirei(db);
@@ -1646,6 +1661,43 @@ function backfillLegacyAutoReplaySuppression(db: Database.Database): void {
                  END
         )`,
   ).run(Math.floor(Date.now() / 1000));
+}
+
+/**
+ * `shop_purchase_role_grant_provenance` の旧形（`grant_kind` 無し）を作り直す。
+ *
+ * この表は本PRで初めて導入したもので、productionにも main にも存在しない。
+ * 途中版のブランチで作られたローカルDBだけが旧形を持ちうる。旧形の行はすべて
+ * 「対象を特定できた add_role」だったので `grant_kind='role'` として移す。
+ */
+function migrateRoleGrantProvenanceShape(db: Database.Database): void {
+  const exists = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='shop_purchase_role_grant_provenance'")
+    .get();
+  if (!exists) return;
+  const columns = db.prepare("PRAGMA table_info(shop_purchase_role_grant_provenance)").all() as Array<{ name: string }>;
+  if (columns.some((c) => c.name === "grant_kind")) return;
+
+  db.exec("DROP TRIGGER IF EXISTS trg_shop_purchase_role_grant_provenance_no_update");
+  db.exec("DROP TRIGGER IF EXISTS trg_shop_purchase_role_grant_provenance_no_delete");
+  db.exec(`
+    CREATE TABLE shop_purchase_role_grant_provenance_new (
+      purchase_id    INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
+      grant_kind     TEXT NOT NULL CHECK (grant_kind IN ('role','non_role','invalid')),
+      role_id        TEXT,
+      delivery_mode  TEXT NOT NULL CHECK (delivery_mode IN ('auto','manual')),
+      source         TEXT NOT NULL,
+      captured_at    INTEGER NOT NULL,
+      CHECK ((grant_kind = 'role') = (role_id IS NOT NULL))
+    );
+    INSERT INTO shop_purchase_role_grant_provenance_new
+      (purchase_id, grant_kind, role_id, delivery_mode, source, captured_at)
+      SELECT purchase_id, 'role', role_id, delivery_mode, source, captured_at
+        FROM shop_purchase_role_grant_provenance;
+    DROP TABLE shop_purchase_role_grant_provenance;
+    ALTER TABLE shop_purchase_role_grant_provenance_new
+      RENAME TO shop_purchase_role_grant_provenance;
+  `);
 }
 
 function backfillShopDeliveryState(db: Database.Database): void {

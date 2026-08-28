@@ -234,12 +234,23 @@ export interface ShopRoleRevocationRow {
   created_at: number;
   updated_at: number;
   completed_at: number | null;
+  /**
+   * このworkerがDiscordの `roles.remove()` を呼びにいった時刻。
+   *
+   * **remove の直前に書く。** 呼んだ直後にプロセスが落ちても、再起動後に
+   * 「自分が外したかもしれない」と分かるようにするため。ここが立っている行は、
+   * 有効な契約があるという理由だけで done にしてはいけない——Discordの実体を見て、
+   * roleが無ければ戻してから完了する。
+   */
+  remove_attempted_at: number | null;
 }
 
 /** 購入した時点で「どのロールを与える契約だったか」。append-only。 */
 export interface RoleGrantProvenanceRow {
   readonly purchase_id: number;
-  readonly role_id: string;
+  /** role=対象を特定できた / non_role=ロール契約ではない / invalid=add_roleだが対象不明 */
+  readonly grant_kind: "role" | "non_role" | "invalid";
+  readonly role_id: string | null;
   readonly delivery_mode: "auto" | "manual";
   readonly source: string;
   readonly captured_at: number;
@@ -676,16 +687,18 @@ export class Shop {
     item: ShopItemRow,
     source: string,
   ): void {
-    if (item.delivery_kind !== "add_role") return;
-    const roleId = parseRoleIdFromDeliveryData(item.delivery_data);
-    if (!roleId) return;
+    // **すべての購入について書く。** 行が無いことを「ロール契約ではなかった」の証拠に
+    // すると、add_role なのに role_id が壊れている購入と区別できない。
+    const roleId = item.delivery_kind === "add_role" ? parseRoleIdFromDeliveryData(item.delivery_data) : null;
+    const grantKind =
+      item.delivery_kind !== "add_role" ? "non_role" : roleId ? "role" : "invalid";
     this.db
       .prepare(
         `INSERT OR IGNORE INTO shop_purchase_role_grant_provenance
-           (purchase_id, role_id, delivery_mode, source, captured_at)
-         VALUES (?,?,?,?,?)`,
+           (purchase_id, grant_kind, role_id, delivery_mode, source, captured_at)
+         VALUES (?,?,?,?,?,?)`,
       )
-      .run(purchase.id, roleId, item.delivery === "manual" ? "manual" : "auto", source, now());
+      .run(purchase.id, grantKind, roleId, item.delivery === "manual" ? "manual" : "auto", source, now());
   }
 
   /** 購入時に凍結した「与えるロール」。無ければ legacy。 */
@@ -707,12 +720,24 @@ export class Shop {
    */
   roleGrantTarget(purchase: PurchaseRow): RoleGrantTarget {
     const provenance = this.roleGrantProvenance(purchase.id);
-    if (provenance) return { kind: "proven", roleId: provenance.role_id, source: provenance.source };
+    if (provenance) {
+      if (provenance.grant_kind === "role" && provenance.role_id) {
+        return { kind: "proven", roleId: provenance.role_id, source: provenance.source };
+      }
+      if (provenance.grant_kind === "non_role") return { kind: "proven_non_role" };
+      // invalid: 購入時に add_role だったが対象を特定できなかった。推測しない。
+      return { kind: "legacy_unknown" };
+    }
 
-    // 購入時のfulfillment provenanceがあるのにrole grantが無い＝**確定時にadd_role商品では
-    // なかった**と証明できる（どちらも同じtransactionで書かれる）。手動商品は配送
-    // スナップショットを持たないので、この判定が無いと「不明」に落ちてしまう。
-    if (this.fulfillmentProvenance(purchase.id)) return { kind: "proven_non_role" };
+    // **明示的な移行記録を先に見る。** Phase D 時代の購入は fulfillment provenance を
+    // 持つが Phase E の role provenance を持たない。そこで「行が無い＝ロール契約では
+    // なかった」と早合点すると、移行でロールを配った購入を非ロール扱いにしてしまう。
+    const imported = this.db
+      .prepare("SELECT role_id FROM shop_timed_access_legacy_imports WHERE purchase_id = ?")
+      .get(purchase.id) as { role_id: string } | undefined;
+    if (imported && typeof imported.role_id === "string" && imported.role_id.trim()) {
+      return { kind: "proven", roleId: imported.role_id.trim(), source: "timed_access_legacy_import" };
+    }
 
     const snapshot = parseDeliverySnapshot(purchase.delivery_snapshot_json);
     if (snapshot) {
@@ -725,13 +750,7 @@ export class Shop {
       return { kind: "legacy_unknown" };
     }
 
-    const imported = this.db
-      .prepare("SELECT role_id FROM shop_timed_access_legacy_imports WHERE purchase_id = ?")
-      .get(purchase.id) as { role_id: string } | undefined;
-    if (imported && typeof imported.role_id === "string" && imported.role_id.trim()) {
-      return { kind: "proven", roleId: imported.role_id.trim(), source: "timed_access_legacy_import" };
-    }
-
+    // 購入時の契約を示す記録が何も無い。**現在の商品設定へは落とさない。**
     return { kind: "legacy_unknown" };
   }
 
@@ -3474,6 +3493,27 @@ export class Shop {
   /** 上と同じ判定の件数（上限なし） */
   countUnresolvedExpiryRevocations(): number {
     return this.listUnresolvedExpiryRevocations({ limit: Number.MAX_SAFE_INTEGER }).length;
+  }
+
+  /**
+   * Discordの `roles.remove()` を呼ぶ直前に、その事実をDBへ残す。
+   *
+   * これを呼ばずに remove すると、remove 成功後・完了記録前にプロセスが落ちた場合に
+   * 「roleを外した」という事実がどこにも残らない。次回は有効な契約を見つけて done に
+   * してしまい、**roleが無いまま失効が完了扱い**になる。
+   */
+  markRoleRevocationRemoveAttempt(purchaseId: number): void {
+    this.db
+      .prepare("UPDATE shop_role_revocations SET remove_attempted_at = ?, updated_at = ? WHERE purchase_id = ?")
+      .run(now(), now(), purchaseId);
+  }
+
+  /** このworkerがroleを外しにいった可能性があるか（=完了前にDiscordの実体確認が要る） */
+  roleRevocationRemoveAttempted(purchaseId: number): boolean {
+    const row = this.db
+      .prepare("SELECT remove_attempted_at FROM shop_role_revocations WHERE purchase_id = ?")
+      .get(purchaseId) as { remove_attempted_at: number | null } | undefined;
+    return row?.remove_attempted_at != null;
   }
 
   pendingRoleRevocations(limit = 100): ShopRoleRevocationRow[] {

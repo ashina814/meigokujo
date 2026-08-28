@@ -198,7 +198,9 @@ describe("剥奪対象は購入時の事実で決まる", () => {
     );
     const p = buy(ctx, item.id);
 
-    expect(ctx.shop.roleGrantProvenance(p.id)).toBeUndefined();
+    // **行が無い**のではなく、「ロール契約ではなかった」と明示的に記録する。
+    // 行の不在を否定の証拠にすると、add_role なのに対象が壊れている購入と区別できない。
+    expect(ctx.shop.roleGrantProvenance(p.id)).toMatchObject({ grant_kind: "non_role", role_id: null });
     expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(p.id)!).kind).toBe("proven_non_role");
     ctx.db.close();
   });
@@ -238,6 +240,139 @@ describe("剥奪対象は購入時の事実で決まる", () => {
     expect(() =>
       ctx.db.prepare("DELETE FROM shop_purchase_role_grant_provenance WHERE purchase_id=?").run(p.id),
     ).toThrow(/append-only/);
+    ctx.db.close();
+  });
+});
+
+describe("行が無いことを「ロール契約ではない」の証拠にしない", () => {
+  it("add_role だが role_id が壊れている購入は unknown（非ロールにしない）", () => {
+    const ctx = setup();
+    const item = ctx.shop.createItem(
+      {
+        name: "壊れたロール商品",
+        price_land: 100,
+        kind: "monthly",
+        delivery: "manual",
+        delivery_kind: "add_role",
+        delivery_data: JSON.stringify({ channel_id: "ch-only" }),
+      } as never,
+      STAFF,
+    );
+    const p = buy(ctx, item.id);
+
+    // 購入時の契約は「add_roleだが対象不明」として明示的に残る
+    expect(ctx.shop.roleGrantProvenance(p.id)).toMatchObject({ grant_kind: "invalid", role_id: null });
+    // fulfillment provenance はあるが、それを根拠に非ロールと決めない
+    expect(ctx.shop.fulfillmentProvenance(p.id)).toBeDefined();
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(p.id)!).kind).toBe("legacy_unknown");
+    ctx.db.close();
+  });
+
+  it("自動配送でも、対象が壊れていれば unknown", () => {
+    const ctx = setup();
+    const item = ctx.shop.createItem(
+      {
+        name: "自動ロール商品",
+        price_land: 100,
+        kind: "one_shot",
+        delivery: "auto",
+        delivery_kind: "add_role",
+        delivery_data: JSON.stringify({ role_id: "R1" }),
+      } as never,
+      STAFF,
+    );
+    // 商品作成時の検証は通るので、購入前にDB側で対象を壊す（本番でも起こりうる形）
+    ctx.db
+      .prepare("UPDATE shop_items SET delivery_data=? WHERE id=?")
+      .run(JSON.stringify({ channel_id: "ch-only" }), item.id);
+    const p = buy(ctx, item.id);
+
+    expect(ctx.shop.roleGrantProvenance(p.id)).toMatchObject({ grant_kind: "invalid" });
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(p.id)!).kind).toBe("legacy_unknown");
+    ctx.db.close();
+  });
+
+  it("本当にロール商品でなければ proven_non_role", () => {
+    const ctx = setup();
+    const item = ctx.shop.createItem(
+      { name: "手動商品", price_land: 100, kind: "monthly", delivery: "manual" } as never,
+      STAFF,
+    );
+    const p = buy(ctx, item.id);
+
+    expect(ctx.shop.roleGrantProvenance(p.id)).toMatchObject({ grant_kind: "non_role" });
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(p.id)!).kind).toBe("proven_non_role");
+    ctx.db.close();
+  });
+
+  it("正しい add_role は proven", () => {
+    const ctx = setup();
+    const p = buy(ctx, roleItem(ctx, "月額", "R1").id);
+
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(p.id)!)).toMatchObject({ kind: "proven", roleId: "R1" });
+    ctx.db.close();
+  });
+
+  it("Phase D 時代の移行購入は、明示的な import 記録を対象として拾う", () => {
+    // fulfillment provenance はあるが Phase E の role provenance は無い購入。
+    // 「role provenance が無い＝非ロール」と早合点すると、移行でロールを配った
+    // 購入を非ロール扱いにしてしまう。
+    const ctx = setup();
+    const item = roleItem(ctx, "期限つきアクセス", "R_CURRENT");
+    const info = ctx.db
+      .prepare(
+        "INSERT INTO shop_purchases (item_id,user_id,purchased_at,expires_at,paid_land,status,auto_renew," +
+          "delivery_snapshot_json,delivered_at,delivery_state) VALUES (?,?,?,?,?, 'active',0,NULL,?, 'delivered')",
+      )
+      .run(item.id, USER, 1_700_000_000, 1, 100, 1_700_000_500);
+    const id = Number(info.lastInsertRowid);
+    ctx.db
+      .prepare(
+        "INSERT INTO shop_purchase_fulfillment_provenance (purchase_id,delivery_mode,stock_consumed,captured_at,source)" +
+          " VALUES (?, 'auto', 0, 1, 'legacy_timed_access_import')",
+      )
+      .run(id);
+    ctx.db
+      .prepare(
+        "INSERT INTO shop_timed_access_legacy_runs (migration_key,plan_json,actor_id,reason,started_at,completed_at)" +
+          " VALUES ('mig','{}','staff','r',1,1)",
+      )
+      .run();
+    ctx.db
+      .prepare(
+        "INSERT INTO shop_timed_access_legacy_imports (purchase_id,migration_key,item_id,user_id,role_id,started_at,expires_at,reason,actor_id,created_at)" +
+          " VALUES (?, 'mig', ?, ?, 'R_IMPORTED', 1, 2, 'r', 'staff', 1)",
+      )
+      .run(id, item.id, USER);
+
+    expect(ctx.shop.roleGrantProvenance(id)).toBeUndefined();
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(id)!)).toMatchObject({
+      kind: "proven",
+      roleId: "R_IMPORTED",
+    });
+    ctx.db.close();
+  });
+
+  it("現在の商品設定を変えても、上の判定は変わらない", () => {
+    const ctx = setup();
+    const item = ctx.shop.createItem(
+      {
+        name: "壊れたロール商品",
+        price_land: 100,
+        kind: "monthly",
+        delivery: "manual",
+        delivery_kind: "add_role",
+        delivery_data: JSON.stringify({ channel_id: "ch-only" }),
+      } as never,
+      STAFF,
+    );
+    const p = buy(ctx, item.id);
+    const before = ctx.shop.roleGrantTarget(ctx.shop.getPurchase(p.id)!).kind;
+
+    ctx.shop.updateItem(item.id, { delivery_data: JSON.stringify({ role_id: "R_NEW" }) } as never, STAFF);
+
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(p.id)!).kind).toBe(before);
+    expect(before).toBe("legacy_unknown");
     ctx.db.close();
   });
 });
