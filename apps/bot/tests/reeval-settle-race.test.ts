@@ -132,7 +132,7 @@ describe("確定直前に購入が無効化された場合", () => {
     const { settleInterview } = await reevalModule;
     const ctx = setup();
     const purchaseId = ready(ctx);
-    ctx.shop.markDelivered(purchaseId, STAFF);
+    ctx.shop.consumePurchaseForService(purchaseId, STAFF, { via: "reeval" });
 
     expect(settleInterview(ctx.services, settleInput(purchaseId, true)).ok).toBe(false);
     expect(ctx.entry.getSoul(USER)!.status).toBe("meirei");

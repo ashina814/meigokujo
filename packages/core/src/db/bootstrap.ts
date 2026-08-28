@@ -862,6 +862,40 @@ CREATE TABLE IF NOT EXISTS shop_purchase_title_provenance (
 CREATE INDEX IF NOT EXISTS idx_shop_purchase_title_provenance_user_time
   ON shop_purchase_title_provenance(user_id, purchased_at, purchase_id);
 
+-- Phase D: 購入した時点の「提供のしかた」を凍結する。
+--
+-- delivery_snapshot_json が NULL でも「手動配送だった」の証拠にならない。snapshotは
+-- delivery='auto' のときしか作られないので、snapshot導入前のauto購入もNULLになる。
+-- 現在の shop_items.delivery から遡って推測すると、商品を自動化しただけで過去の仕事が
+-- 消え、手動化しただけで過去の購入が仕事として湧く。だから購入時の事実を別に残す。
+--
+-- stock_consumed は「item.stockが有限そうだった」ではなく、**この購入のtransactionの中で
+-- 実際に在庫を1減らした**という事実。未提供のまま返金するとき、この1枠だけを戻す根拠になる。
+-- 既存rowをcurrent shop_itemsから推測してbackfillしない（証明できないものはunknownのまま）。
+CREATE TABLE IF NOT EXISTS shop_purchase_fulfillment_provenance (
+  purchase_id     INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
+  delivery_mode   TEXT NOT NULL CHECK (delivery_mode IN ('auto','manual')),
+  stock_consumed  INTEGER NOT NULL CHECK (stock_consumed IN (0,1)),
+  captured_at     INTEGER NOT NULL,
+  source          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shop_purchase_fulfillment_mode
+  ON shop_purchase_fulfillment_provenance(delivery_mode, purchase_id);
+
+-- 在庫を戻した記録。purchase_idがPRIMARY KEYなので、返金が二度走っても在庫は二度戻らない。
+--
+-- applied=1 … 実際に shop_items.stock を +1 した（現在も有限在庫の商品）
+-- applied=0 … 現在は無制限販売なので数値は動かさない。ただし「1枠を戻すべきだった」という
+--             事実は消さずに残す（後で有限へ戻すときの判断材料。今回はその設計をしない）
+CREATE TABLE IF NOT EXISTS shop_purchase_stock_restorations (
+  purchase_id  INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
+  item_id      INTEGER NOT NULL,
+  quantity     INTEGER NOT NULL CHECK (quantity > 0),
+  restored_at  INTEGER NOT NULL,
+  reason       TEXT NOT NULL,
+  applied      INTEGER NOT NULL CHECK (applied IN (0,1))
+);
+
 -- status current-stateだけではfixed observedAtを再現できない。refund/cancel occurrenceを
 -- purchaseごとに一度だけappendし、historical snapshotは occurred_at で切る。
 CREATE TABLE IF NOT EXISTS shop_purchase_status_history (
@@ -882,6 +916,26 @@ CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_title_provenance_no_delete
 BEFORE DELETE ON shop_purchase_title_provenance
 BEGIN
   SELECT RAISE(ABORT, 'shop purchase title provenance is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_fulfillment_provenance_no_update
+BEFORE UPDATE ON shop_purchase_fulfillment_provenance
+BEGIN
+  SELECT RAISE(ABORT, 'shop purchase fulfillment provenance is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_fulfillment_provenance_no_delete
+BEFORE DELETE ON shop_purchase_fulfillment_provenance
+BEGIN
+  SELECT RAISE(ABORT, 'shop purchase fulfillment provenance is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_stock_restorations_no_update
+BEFORE UPDATE ON shop_purchase_stock_restorations
+BEGIN
+  SELECT RAISE(ABORT, 'shop stock restoration ledger is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_stock_restorations_no_delete
+BEFORE DELETE ON shop_purchase_stock_restorations
+BEGIN
+  SELECT RAISE(ABORT, 'shop stock restoration ledger is append-only');
 END;
 CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_status_history_no_update
 BEFORE UPDATE ON shop_purchase_status_history

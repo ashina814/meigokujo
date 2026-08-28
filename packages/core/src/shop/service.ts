@@ -213,6 +213,44 @@ export interface ShopRoleRevocationRow {
   completed_at: number | null;
 }
 
+/** 購入した時点の提供のしかた。append-only。 */
+export interface FulfillmentProvenanceRow {
+  readonly purchase_id: number;
+  readonly delivery_mode: "auto" | "manual";
+  readonly stock_consumed: 0 | 1;
+  readonly captured_at: number;
+  readonly source: string;
+}
+
+/** 在庫を戻した記録。purchase_idが主キーなので二度戻らない。 */
+export interface StockRestorationRow {
+  readonly purchase_id: number;
+  readonly item_id: number;
+  readonly quantity: number;
+  readonly restored_at: number;
+  readonly reason: string;
+  /** 1=shop_items.stockを実際に+1した / 0=現在は無制限なので数値は動かさず義務だけ残した */
+  readonly applied: 0 | 1;
+}
+
+/**
+ * 手動対応の完了を試みた結果。
+ *
+ * `void` を返していた頃は、UPDATEが0件でもBotが「完了しました」と言えてしまった。
+ * 何が起きたのかを呼び出し側が必ず受け取る。
+ */
+export type ManualCompletionReason =
+  | "completed"
+  | "already_delivered"
+  | "not_active"
+  | "not_manual"
+  | "legacy_unknown";
+
+export interface ManualCompletionResult {
+  readonly completed: boolean;
+  readonly reason: ManualCompletionReason;
+}
+
 export type ShopErrorCode =
   | "ERR_ITEM_NOT_FOUND"
   | "ERR_ITEM_DISABLED"
@@ -559,6 +597,33 @@ export class Shop {
       origin,
       origin === "storefront" ? 1 : 0,
     );
+  }
+
+  /**
+   * 購入した時点の「提供のしかた」を凍結する。**stock decrementと同じtransactionで書く。**
+   *
+   * `stockConsumed` は呼び出し側が「実際に在庫を1減らしたか」をそのまま渡す。
+   * item.stock を見て推測しない——推測すると、あとから在庫設定を変えただけで
+   * 過去の購入の事実が書き換わったように見えてしまう。
+   */
+  private recordFulfillmentProvenance(
+    purchase: PurchaseRow,
+    input: { deliveryMode: "auto" | "manual"; stockConsumed: boolean; source: string },
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO shop_purchase_fulfillment_provenance
+           (purchase_id, delivery_mode, stock_consumed, captured_at, source)
+         VALUES (?,?,?,?,?)`,
+      )
+      .run(purchase.id, input.deliveryMode, input.stockConsumed ? 1 : 0, now(), input.source);
+  }
+
+  /** 購入時に凍結した提供のしかた。無ければ legacy（購入時の事実が残っていない）。 */
+  fulfillmentProvenance(purchaseId: number): FulfillmentProvenanceRow | undefined {
+    return this.db
+      .prepare("SELECT * FROM shop_purchase_fulfillment_provenance WHERE purchase_id = ?")
+      .get(purchaseId) as FulfillmentProvenanceRow | undefined;
   }
 
   /**
@@ -1117,11 +1182,19 @@ export class Shop {
           delivery_state, delivery_attempts, delivery_error, delivery_updated_at)
          VALUES (?, ?, ?, NULL, ?, NULL, NULL, 'active', ?, 0, NULL, ?, 'delivered', 0, NULL, ?)`,
       ).run(item.id, input.userId, ts, invoice.amount, ts, JSON.stringify(request), ts);
-      if (item.stock !== null) {
+      const stockConsumed = item.stock !== null;
+      if (stockConsumed) {
         this.db.prepare("UPDATE shop_items SET stock = stock - 1, updated_at = ? WHERE id = ?").run(ts, item.id);
       }
       const purchase = this.getPurchase(Number(info.lastInsertRowid))!;
       this.recordTitlePurchaseProvenance(purchase, "original_role_invoice");
+      // 請求払いは発行時点で提供済みとして確定する（delivered_atを入れている）。
+      // genericな手動対応キューの仕事ではない。
+      this.recordFulfillmentProvenance(purchase, {
+        deliveryMode: "auto",
+        stockConsumed,
+        source: "original_role_invoice",
+      });
       const changed = this.db.prepare(
         `UPDATE original_role_invoices
             SET status='paid', paid_by=?, paid_at=?, purchase_id=?, transaction_id=?
@@ -1274,11 +1347,19 @@ export class Shop {
         this.deliverySnapshot(item),
         input.request ? JSON.stringify(input.request) : null,
       );
-    if (item.stock !== null) {
+    // 在庫を実際に減らしたかどうかを**この場で覚える**。あとで item.stock を見ても、
+    // その時点の設定しか分からない（運営が有限/無制限を切り替えられる）。
+    const stockConsumed = item.stock !== null;
+    if (stockConsumed) {
       this.db.prepare("UPDATE shop_items SET stock = stock - 1, updated_at = ? WHERE id = ?").run(ts, item.id);
     }
     const purchase = this.getPurchase(Number(info.lastInsertRowid))!;
     this.recordTitlePurchaseProvenance(purchase, input.titleOrigin);
+    this.recordFulfillmentProvenance(purchase, {
+      deliveryMode: item.delivery === "manual" ? "manual" : "auto",
+      stockConsumed,
+      source: input.titleOrigin,
+    });
     this.events.log("shop_purchased", {
       actor: input.userId,
       payload: { itemId: item.id, purchaseId: purchase.id, paidLand, paidAltKind, paidAltAmount, expiresAt },
@@ -1608,6 +1689,48 @@ export class Shop {
   /**
    * この購入は再評価サービス権として発行されたか。現在の商品設定は一切参照しない。
    */
+  /**
+   * 「まだ人が終わらせていない購入」の共通部分。list と count で二度書かない。
+   *
+   * 条件を二箇所に書くと、片方だけ直したときに「一覧は0件なのにバッジは3」のような
+   * 食い違いが生まれる。完了APIの判定ともここで揃える——**一覧に出るものは必ず完了でき、
+   * 完了APIが断るものは一覧に出さない**。
+   */
+  private static pendingOpenSql(excludeCount: number): string {
+    return `p.status = 'active'
+      AND p.delivered_at IS NULL
+      AND (p.delivery_state IS NULL OR p.delivery_state <> 'delivered')
+      ${excludeCount > 0 ? `AND p.item_id NOT IN (${Array.from({ length: excludeCount }, () => "?").join(",")})` : ""}
+      AND NOT ${Shop.REEVALUATION_EVIDENCE_SQL}`;
+  }
+
+  /** 購入時に「手動配送のstorefront商品」だったと証明できる、未完了の購入。 */
+  private static pendingManualSql(excludeCount: number): string {
+    return `${Shop.pendingOpenSql(excludeCount)}
+      AND EXISTS (
+        SELECT 1 FROM shop_purchase_fulfillment_provenance f
+         WHERE f.purchase_id = p.id
+           AND f.delivery_mode = 'manual'
+           AND f.source = 'storefront'
+      )`;
+  }
+
+  /**
+   * 購入時の提供方式を証明できない未完了の購入（旧購入）。
+   *
+   * 配送スナップショットがある行はここに含めない。スナップショットは
+   * `delivery === 'auto'` のときしか作られないので、**あることは購入時autoの証明**になる。
+   * （逆に、無いことは手動の証明にならない——それがこのバケットの存在理由。）
+   * 証明できるものを「不明」に混ぜると、自動配送の再試行キューと二重に仕事が見える。
+   */
+  private static legacyUnknownSql(excludeCount: number): string {
+    return `${Shop.pendingOpenSql(excludeCount)}
+      AND p.delivery_snapshot_json IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM shop_purchase_fulfillment_provenance f WHERE f.purchase_id = p.id
+      )`;
+  }
+
   isReevaluationPurchase(purchaseId: number): boolean {
     const row = this.db
       .prepare(
@@ -2132,6 +2255,8 @@ export class Shop {
         )
         .run(`refunded:${reason}`.slice(0, 500), statusChangedAt, purchase.id).changes;
       if (updated !== 1) throw new ShopError("ERR_REFUND_RACE", { purchaseId });
+      // 売買そのものを取り消したので、提供されなかった1枠を販売可能在庫へ戻す。
+      this.restoreStockForRefund(purchase, reason, actor);
       this.events.log("shop_refunded", {
         actor,
         target: purchase.user_id,
@@ -2142,14 +2267,131 @@ export class Shop {
     return this.db.inTransaction ? run() : run.immediate();
   }
 
-  /** 手動配送の完了マーク */
-  markDelivered(purchaseId: number, actor: string): void {
-    this.db
+  /**
+   * 未提供のまま返金した購入について、消費した在庫を一度だけ戻す。
+   *
+   * 戻す根拠は**購入時に記録した事実**（`stock_consumed=1`）だけ。現在の
+   * `shop_items.stock` は根拠にしない——運営はいつでも有限/無制限を切り替えられるので、
+   * 「いま有限だから、あの購入も1枠使ったはず」は証明になっていない。逆に
+   * 「いま無制限だから消費していなかった」も違う。
+   *
+   * 二度戻さないのは `shop_purchase_stock_restorations.purchase_id` が主キーだから。
+   * 返金が再実行されても、2行目のINSERTがそこで弾かれる。
+   *
+   * 現在この商品が無制限販売（`stock IS NULL`）なら、数値は動かさない。`NULL + 1` に
+   * 意味は無いし、無制限の商品に在庫数を作ってしまうのは別の変更になる。ただし
+   * 「1枠を戻すべきだった」という事実は台帳へ残す（`applied=0`）。あとで有限へ戻す
+   * ときの判断材料になる——その扱いは今回は決めない。
+   */
+  private restoreStockForRefund(purchase: PurchaseRow, reason: string, actor: string): void {
+    const provenance = this.fulfillmentProvenance(purchase.id);
+    // 購入時の事実が無い旧購入は unknown のまま。推測で在庫を増やさない。
+    if (!provenance || provenance.stock_consumed !== 1) return;
+
+    const item = this.getItem(purchase.item_id);
+    const finiteNow = item !== undefined && item.stock !== null;
+    const restoredAt = now();
+    const inserted = this.db
       .prepare(
-        "UPDATE shop_purchases SET delivered_at = ?, delivery_state = 'delivered', delivery_error = NULL, delivery_updated_at = ? WHERE id = ?",
+        `INSERT OR IGNORE INTO shop_purchase_stock_restorations
+           (purchase_id,item_id,quantity,restored_at,reason,applied)
+         VALUES (?,?,?,?,?,?)`,
       )
-      .run(now(), now(), purchaseId);
-    this.events.log("shop_delivered", { actor, payload: { purchaseId } });
+      .run(purchase.id, purchase.item_id, 1, restoredAt, reason.slice(0, 500), finiteNow ? 1 : 0);
+    // 既に戻していたなら、ここで在庫を触らない（=exactly once）。
+    if (inserted.changes !== 1) return;
+
+    if (finiteNow) {
+      this.db
+        .prepare("UPDATE shop_items SET stock = stock + 1, updated_at = ? WHERE id = ? AND stock IS NOT NULL")
+        .run(restoredAt, purchase.item_id);
+    }
+    this.events.log("shop_stock_restored", {
+      actor,
+      target: purchase.user_id,
+      payload: { purchaseId: purchase.id, itemId: purchase.item_id, quantity: 1, applied: finiteNow ? 1 : 0 },
+    });
+  }
+
+  /** 在庫を戻した記録。無ければ戻していない。 */
+  stockRestoration(purchaseId: number): StockRestorationRow | undefined {
+    return this.db
+      .prepare("SELECT * FROM shop_purchase_stock_restorations WHERE purchase_id = ?")
+      .get(purchaseId) as StockRestorationRow | undefined;
+  }
+
+  /**
+   * 手動対応の完了を記録する。**人が外部作業を終えたあと、帳簿へ「終わった」と書くだけ。**
+   * ここでロール付与などの副作用は起こさない（それは自動配送の状態機械の仕事）。
+   *
+   * 以前は無条件UPDATEだった。そのため、
+   *   1. 一覧を開いて完了ボタンが作られる
+   *   2. 別経路でその購入を返金する
+   *   3. 古いボタンを押す
+   * で `status='refunded'` かつ `delivery_state='delivered'` という矛盾を作れたし、
+   * 存在しない購入IDでもUPDATE 0件のあとに `shop_delivered` を積めた。
+   *
+   * 判定と書き込みを同じ条件付きUPDATEに閉じ込め、**実際に遷移した1件だけ**が
+   * eventを生む。`changes` を見てから記録するので、競合しても二重には積まれない。
+   */
+  completeManualDelivery(purchaseId: number, actor: string): ManualCompletionResult {
+    const run = (): ManualCompletionResult => {
+      const purchase = this.getPurchase(purchaseId);
+      if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
+
+      // 既に届いているものを二度配ったことにしない。返金・取消・失効も対象外。
+      if (purchase.delivered_at !== null || purchase.delivery_state === "delivered") {
+        return { completed: false, reason: "already_delivered" };
+      }
+      if (purchase.status !== "active") return { completed: false, reason: "not_active" };
+
+      const eligibility = this.manualCompletionEligibility(purchase);
+      if (eligibility !== "eligible") return { completed: false, reason: eligibility };
+
+      const ts = now();
+      const changed = this.db
+        .prepare(
+          `UPDATE shop_purchases
+              SET delivered_at = ?, delivery_state = 'delivered', delivery_error = NULL, delivery_updated_at = ?
+            WHERE id = ?
+              AND status = 'active'
+              AND delivered_at IS NULL
+              AND (delivery_state IS NULL OR delivery_state <> 'delivered')`,
+        )
+        .run(ts, ts, purchaseId);
+      // 実際に遷移した時だけ記録する。0件なら誰かが先に確定させている。
+      if (changed.changes !== 1) return { completed: false, reason: "already_delivered" };
+      this.events.log("shop_delivered", { actor, payload: { purchaseId } });
+      return { completed: true, reason: "completed" };
+    };
+    return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
+  }
+
+  /**
+   * この購入を「普通の手動対応」として完了してよいか。
+   *
+   * 判断の根拠は**購入時に凍結した事実**だけ。現在の商品設定は見ない。
+   * - provenanceがある → その時 manual だったか、そして専用サービスでないか
+   * - provenanceが無い（旧購入） → `legacy_unknown`。当時のことが分からないものを
+   *   現在の商品設定から推測して「手動だった」ことにしない。
+   */
+  private manualCompletionEligibility(
+    purchase: PurchaseRow,
+  ): "eligible" | "not_manual" | "legacy_unknown" {
+    const provenance = this.fulfillmentProvenance(purchase.id);
+    if (!provenance) {
+      // 購入時の記録が無くても、配送スナップショットがあれば**購入時autoだと証明できる**
+      // （スナップショットは delivery='auto' のときしか作られない）。
+      // 証明できるものを「不明」にしない。
+      return purchase.delivery_snapshot_json !== null ? "not_manual" : "legacy_unknown";
+    }
+    if (provenance.delivery_mode !== "manual") return "not_manual";
+    // 専用サービス（再評価・評価延長・オリジナルロール・移行）は、それぞれの
+    // 専用writerが完了条件を持っている。genericな「配送完了」で消費させない。
+    if (provenance.source !== "storefront") return "not_manual";
+    // 商品IDではなく実績で見る再評価判定（Phase B）はここでも維持する。
+    if (this.isReevaluationPurchase(purchase.id)) return "not_manual";
+    return "eligible";
   }
 
   // ---- 自動配送の状態機械 ----
@@ -2318,17 +2560,12 @@ export class Shop {
     opts: { excludeItemIds?: readonly number[]; limit?: number } = {},
   ): Array<PurchaseRow & { item_name: string }> {
     const exclude = opts.excludeItemIds ?? [];
-    const placeholders = exclude.map(() => "?").join(",");
     return this.db
       .prepare(
         `SELECT p.*, i.name AS item_name
            FROM shop_purchases p
            JOIN shop_items i ON i.id = p.item_id
-          WHERE p.status = 'active'
-            AND p.delivery_snapshot_json IS NULL
-            AND p.delivered_at IS NULL
-            ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}
-            AND NOT ${Shop.REEVALUATION_EVIDENCE_SQL}
+          WHERE ${Shop.pendingManualSql(exclude.length)}
           ORDER BY p.purchased_at
           LIMIT ?`,
       )
@@ -2338,14 +2575,49 @@ export class Shop {
   /** 手動対応が残っている件数。表示の上限とは無関係に正確な数を返す */
   countPendingManual(opts: { excludeItemIds?: readonly number[] } = {}): number {
     const exclude = opts.excludeItemIds ?? [];
-    const placeholders = exclude.map(() => "?").join(",");
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS c
            FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
-          WHERE p.status = 'active' AND p.delivery_snapshot_json IS NULL AND p.delivered_at IS NULL
-            ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}
-            AND NOT ${Shop.REEVALUATION_EVIDENCE_SQL}`,
+          WHERE ${Shop.pendingManualSql(exclude.length)}`,
+      )
+      .get(...exclude) as { c: number };
+    return row.c;
+  }
+
+  /**
+   * 購入時の提供方式が分からない旧購入（互換バケット）。
+   *
+   * 旧購入は `delivery_snapshot_json` がNULLでも「手動配送だった」とは限らない。
+   * snapshot列より前のauto購入もNULLになるからで、現在の商品設定から遡って
+   * 決めることもできない。**だから普通の作業キューへは混ぜない。**
+   * かといって黙って消すと、本当に人の対応が要る購入が見えなくなる。
+   * 別枠で見せて、運営に提供状況を確かめてもらう。
+   */
+  listLegacyUnknownFulfillment(
+    opts: { excludeItemIds?: readonly number[]; limit?: number } = {},
+  ): Array<PurchaseRow & { item_name: string }> {
+    const exclude = opts.excludeItemIds ?? [];
+    return this.db
+      .prepare(
+        `SELECT p.*, i.name AS item_name
+           FROM shop_purchases p
+           JOIN shop_items i ON i.id = p.item_id
+          WHERE ${Shop.legacyUnknownSql(exclude.length)}
+          ORDER BY p.purchased_at
+          LIMIT ?`,
+      )
+      .all(...exclude, opts.limit ?? 25) as Array<PurchaseRow & { item_name: string }>;
+  }
+
+  /** 互換バケットの件数（`listLegacyUnknownFulfillment` と同じ判定・上限なし） */
+  countLegacyUnknownFulfillment(opts: { excludeItemIds?: readonly number[] } = {}): number {
+    const exclude = opts.excludeItemIds ?? [];
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS c
+           FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
+          WHERE ${Shop.legacyUnknownSql(exclude.length)}`,
       )
       .get(...exclude) as { c: number };
     return row.c;
@@ -2618,6 +2890,13 @@ export class Shop {
           );
           const purchaseId = Number(purchaseInfo.lastInsertRowid);
           this.recordTitlePurchaseProvenance(this.getPurchase(purchaseId)!, "legacy_timed_access_import");
+          // 移行importは既存のロール保有を購入行として写しているだけで、在庫を1つも
+          // 消費していない。勝手に stock_consumed=1 を作らない（返金で在庫が湧く）。
+          this.recordFulfillmentProvenance(this.getPurchase(purchaseId)!, {
+            deliveryMode: "auto",
+            stockConsumed: false,
+            source: "legacy_timed_access_import",
+          });
           insertImport.run(
             purchaseId,
             migrationKey,
