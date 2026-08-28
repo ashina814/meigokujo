@@ -1609,6 +1609,11 @@ function backfillLegacyAutoReplaySuppression(db: Database.Database): void {
              AND CASE
                    WHEN e.payload_json IS NULL THEN 0
                    WHEN NOT json_valid(e.payload_json) THEN 0
+                   -- Shop.deliveredEventSql() と同じ厳密さ。整数フィールドとして
+                   -- 記録されている場合だけ証拠にする（"5" や 5.0 を 5 に寄せない）。
+                   -- ここが緩いと、証拠があると誤判定した行に抑止が入らず、
+                   -- 古い自動配送が流し直される。
+                   WHEN json_type(e.payload_json, '$.purchaseId') <> 'integer' THEN 0
                    ELSE COALESCE(json_extract(e.payload_json, '$.purchaseId') = p.id, 0)
                  END
         )`,

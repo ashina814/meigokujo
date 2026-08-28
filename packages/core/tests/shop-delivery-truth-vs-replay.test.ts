@@ -292,6 +292,13 @@ describe("配送eventの照合は厳密に", () => {
     return legacyAuto(ctx, autoItem(ctx).id);
   }
 
+  /** payload をJSONリテラルとして直接書き込む（型まで指定したいので JSON.stringify を使わない） */
+  function rawDeliveredEvent(ctx: Ctx, purchaseIdLiteral: string) {
+    ctx.db
+      .prepare("INSERT INTO events (type,actor_id,target_id,payload_json,created_at) VALUES ('shop_delivered',?,NULL,?,1)")
+      .run(STAFF, `{"purchaseId":${purchaseIdLiteral}}`);
+  }
+
   it("同じ購入IDの正しいJSONだけが証拠になる", () => {
     const ctx = setup();
     const purchase = legacyRow(ctx);
@@ -315,6 +322,65 @@ describe("配送eventの照合は厳密に", () => {
     ctx.events.log("shop_delivered", { actor: STAFF, payload: { note: `purchaseId:${purchase.id} を確認` } });
     ctx.events.log("shop_delivered", { actor: STAFF, payload: { otherPurchaseId: purchase.id } });
     expect(() => ctx.shop.refund(purchase.id, "x", STAFF)).toThrow(/ERR_FULFILLMENT_UNKNOWN/);
+    ctx.db.close();
+  });
+
+  // SQLiteの比較はaffinityで寄せるので、`json_type` を確認しないと
+  // `"5"`（文字列）も `5.0`（実数）も 5 に一致してしまう。この event は
+  // 返金拒否・期限つきアクセス復元・legacy分類の証拠境界なので、
+  // 「5に見える値」ではなく「purchaseIdという整数が正確に5」を要求する。
+  const NON_INTEGER: Array<[string, string]> = [
+    ["JSON文字列", '"5"'],
+    ["JSON実数", "5.0"],
+  ];
+
+  for (const [label, literal] of NON_INTEGER) {
+    it(`purchaseId が ${label} のeventは証拠にならない（返金）`, () => {
+      const ctx = setup();
+      const purchase = legacyRow(ctx);
+      rawDeliveredEvent(ctx, literal.replace("5", String(purchase.id)));
+
+      expect(() => ctx.shop.refund(purchase.id, "x", STAFF)).toThrow(/ERR_FULFILLMENT_UNKNOWN/);
+      ctx.db.close();
+    });
+
+    it(`purchaseId が ${label} のeventは証拠にならない（結末不明のまま）`, () => {
+      const ctx = setup();
+      const purchase = legacyRow(ctx);
+      rawDeliveredEvent(ctx, literal.replace("5", String(purchase.id)));
+
+      expect(ctx.shop.isLegacyAutoOutcomeUnknown(purchase.id)).toBe(true);
+      expect(ctx.shop.countLegacyAutoOutcomeUnknown()).toBe(1);
+      // 自動再実行もしない（真実と抑止が同時に成り立つ）
+      expect(ctx.shop.listUndeliveredAuto(50).map((r) => r.id)).not.toContain(purchase.id);
+      ctx.db.close();
+    });
+
+    it(`purchaseId が ${label} のeventでは期限つきアクセスを復元しない`, () => {
+      const ctx = setup();
+      const item = autoItem(ctx);
+      const info = ctx.db
+        .prepare(
+          "INSERT INTO shop_purchases (item_id,user_id,purchased_at,expires_at,paid_land,status,auto_renew," +
+            "delivery_snapshot_json,delivered_at,delivery_state,delivery_updated_at)" +
+            " VALUES (?,?,?,?,?, 'active',0,NULL,NULL,'delivered',?)",
+        )
+        .run(item.id, USER, 1_700_000_000, 4_000_000_000, 10_000, 1_700_000_000);
+      const purchaseId = Number(info.lastInsertRowid);
+      rawDeliveredEvent(ctx, literal.replace("5", String(purchaseId)));
+
+      expect(ctx.shop.listActiveTimedAccess(USER).map((g) => g.purchase.id)).not.toContain(purchaseId);
+      ctx.db.close();
+    });
+  }
+
+  it("整数として記録されていれば、これまでどおり証拠になる", () => {
+    const ctx = setup();
+    const purchase = legacyRow(ctx);
+    rawDeliveredEvent(ctx, String(purchase.id));
+
+    expect(() => ctx.shop.refund(purchase.id, "x", STAFF)).toThrow(/ERR_ALREADY_DELIVERED/);
+    expect(ctx.shop.isLegacyAutoOutcomeUnknown(purchase.id)).toBe(false);
     ctx.db.close();
   });
 

@@ -1707,15 +1707,32 @@ export class Shop {
    *
    * 旧行では `delivered_at` か `shop_delivered` event という独立した記録だけを根拠にする。
    */
-  private static readonly DELIVERED_EVENT_SQL = `EXISTS (
+  /**
+   * 「この購入を配送した」と言える `shop_delivered` event の照合。**SQL側とJS側で同じ意味**に
+   * するため、比較する購入IDの式だけを差し替えて使う1箇所の定義。
+   *
+   * `json_type(...) = 'integer'` を要求するのが要点。SQLiteの比較はaffinityで寄せるので、
+   * これが無いと `{"purchaseId":"5"}`（文字列）も `{"purchaseId":5.0}`（実数）も 5 に
+   * 一致してしまう。このeventは返金拒否・期限つきアクセスの復元・legacy分類の
+   * **証拠境界**なので、「5に見える値」ではなく「purchaseIdという整数が正確に5」を要求する。
+   *
+   * 壊れたJSONで例外を投げないよう、CASEで評価順序を固定する（`json_type`/`json_extract`は
+   * 不正JSONに対して throw する。SQLiteは AND を並べ替えるので CASE でなければ守れない）。
+   */
+  private static deliveredEventSql(idExpr: string): string {
+    return `EXISTS (
       SELECT 1 FROM events e
        WHERE e.type = 'shop_delivered'
          AND CASE
                WHEN e.payload_json IS NULL THEN 0
                WHEN NOT json_valid(e.payload_json) THEN 0
-               ELSE COALESCE(json_extract(e.payload_json, '$.purchaseId') = p.id, 0)
+               WHEN json_type(e.payload_json, '$.purchaseId') <> 'integer' THEN 0
+               ELSE COALESCE(json_extract(e.payload_json, '$.purchaseId') = ${idExpr}, 0)
              END
     )`;
+  }
+
+  private static readonly DELIVERED_EVENT_SQL = Shop.deliveredEventSql("p.id");
 
   private static readonly DELIVERED_EVIDENCE_SQL = `(
     p.delivered_at IS NOT NULL
@@ -2482,20 +2499,16 @@ export class Shop {
     return true;
   }
 
-  /** その購入を指す `shop_delivered` event があるか。JSONとして厳密に照合する。 */
+  /**
+   * その購入を指す `shop_delivered` event があるか。
+   * **SQL側の判定（`DELIVERED_EVENT_SQL`）と同じ定義を使う。** 片方だけ厳密で
+   * もう片方が緩いと、一覧と個別判定が食い違う。
+   */
   private hasDeliveredEvent(purchaseId: number): boolean {
     const row = this.db
-      .prepare(
-        `SELECT COUNT(*) AS c FROM events
-          WHERE type = 'shop_delivered'
-            AND CASE
-                  WHEN payload_json IS NULL THEN 0
-                  WHEN NOT json_valid(payload_json) THEN 0
-                  ELSE COALESCE(json_extract(payload_json, '$.purchaseId') = ?, 0)
-                END`,
-      )
-      .get(purchaseId) as { c: number };
-    return row.c > 0;
+      .prepare(`SELECT ${Shop.deliveredEventSql("CAST(? AS INTEGER)")} AS hit`)
+      .get(purchaseId) as { hit: number };
+    return row.hit === 1;
   }
 
   /**
