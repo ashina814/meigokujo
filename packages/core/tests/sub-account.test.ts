@@ -312,12 +312,12 @@ describe("純粋な迷霊は魔人以上の商品を買えない", () => {
 
     // 迷霊ロールだけを持つ人
     expect(() =>
-      shop.purchase({ userId: MAIN, itemId: item.id, actor: "t", memberRoleIds: ["role-meirei"] }),
+      shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, userId: MAIN, itemId: item.id, actor: "t", memberRoleIds: ["role-meirei"] }),
     ).toThrow(/ERR_ROLE_REQUIRED/);
     expect(ledger.balanceOf(`user:${MAIN}`)).toBe(before);
 
     // 魔人なら通る（要件そのものは正しく効いている）
-    expect(shop.purchase({ userId: MAIN, itemId: item.id, actor: "t", memberRoleIds: ["role-majin"] }).purchase.id).toBeGreaterThan(0);
+    expect(shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, userId: MAIN, itemId: item.id, actor: "t", memberRoleIds: ["role-majin"] }).purchase.id).toBeGreaterThan(0);
     db.close();
   });
 });

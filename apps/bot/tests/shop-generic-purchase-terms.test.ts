@@ -255,6 +255,130 @@ describe("購入画面 — 表示した条件でしか課金しない", () => {
   });
 });
 
+describe("返還だけ済んだ状態（取り残し）からの再試行", () => {
+  /**
+   * 確認票の状態と返還記録を**持ち越す**世界。押すたびに新しいmockを作ると、
+   * 「前回すでに返還した」という現実を再現できない。
+   */
+  function chipWorld(ctx: Ctx, itemId: number) {
+    const state = { status: "pending" as string, redeemedGroups: new Set<string>() };
+    const redeemExactFreeChips = vi.fn((userId: string, amount: number, operationId: string) => {
+      state.redeemedGroups.add(`chip:free-redeem:${userId}:external:${operationId.replace(/^external:/, "")}`);
+      return { userId, redeemed: amount, land: amount, reason: "test" };
+    });
+    const row = () => ({
+      id: "c1", userId: USER, operationId: "op-stranded", operationKind: `shop:${itemId}:land`,
+      status: state.status, chipAmount: 1_000,
+    });
+    (ctx.services as unknown as Record<string, unknown>).chipFlow = {
+      externalConfirmation: vi.fn(() => row()),
+      beginExternalConfirmation: vi.fn(() => {
+        state.status = "executing";
+        return row();
+      }),
+      redeemExactFreeChips,
+      cancelExternalConfirmation: vi.fn(() => true),
+      failExternalConfirmation: vi.fn(() => true),
+      completeExternalConfirmation: vi.fn(() => true),
+    };
+    (ctx.services as unknown as Record<string, unknown>).chipAssets = { freeChips: vi.fn(() => 1_000) };
+    // 返還の記録は安定キーで残る。ここが「本当に戻したか」の根拠になる。
+    (ctx.services as unknown as Record<string, unknown>).chipTx = {
+      getGroup: vi.fn((key: string) => (state.redeemedGroups.has(key) ? { group_key: key } : undefined)),
+    };
+    const press = (customId: string) => {
+      const editReply = vi.fn(async () => undefined);
+      const member = { id: USER, roles: { cache: new Collection<string, { id: string }>(), add: vi.fn(async () => undefined) } };
+      return {
+        editReply,
+        ui: {
+          customId,
+          user: { id: USER },
+          guildId: "g1",
+          guild: { id: "g1", members: { fetch: vi.fn(async () => member) } },
+          member,
+          id: `op-${Math.random()}`,
+          client: { channels: { fetch: vi.fn(async () => null) } },
+          isButton: () => true,
+          deferUpdate: vi.fn(async () => undefined),
+          deferReply: vi.fn(async () => undefined),
+          editReply,
+          reply: vi.fn(async () => undefined),
+          update: vi.fn(async () => undefined),
+          deferred: false,
+          replied: false,
+        } as never,
+      };
+    };
+    return { state, redeemExactFreeChips, press };
+  }
+
+  const buttonIds = (fn: ReturnType<typeof vi.fn>): string[] => {
+    const payload = fn.mock.calls.at(-1)?.[0] as
+      | { components?: { toJSON(): { components: { custom_id: string }[] } }[] }
+      | undefined;
+    return (payload?.components ?? []).flatMap((row) => row.toJSON().components.map((c) => c.custom_id));
+  };
+
+  it("返還済みのまま商品が変わったら、追加で何も動かさず、過去の返還も否定しない", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    // 在庫は契約(identity)に含まれないので、在庫だけ切らせば**契約は同じまま**購入だけ失敗する。
+    // これが「返還は成功・購入は失敗」の取り残しを作る。
+    ctx.shop.updateItem(ctx.item.id, { stock: 0 } as never, "staff");
+    const world = chipWorld(ctx, ctx.item.id);
+    const t1 = token(ctx, ctx.item.id);
+
+    // 1回目：返還は成功し、購入だけ失敗して再試行ボタンが残る
+    const first = world.press(`shop:chips:c1:${ctx.item.id}:land:${t1}`);
+    await handleShopButton(first.ui, ctx.services);
+
+    expect(world.redeemExactFreeChips).toHaveBeenCalledTimes(1);
+    expect(purchases(ctx)).toHaveLength(0);
+    const retryId = buttonIds(first.editReply).find((id) => id.startsWith("shop:chips:"));
+    expect(retryId).toBeDefined();
+
+    // 運営が商品内容を変更
+    ctx.shop.updateItem(ctx.item.id, { price_land: 999_999 } as never, "staff");
+    const landBefore = balance(ctx);
+
+    // 2回目：取り残しの再試行ボタンを押す
+    const second = world.press(retryId!);
+    await handleShopButton(second.ui, ctx.services);
+
+    // 追加の資産移動・購入は一切起きない
+    expect(world.redeemExactFreeChips).toHaveBeenCalledTimes(1);
+    expect(balance(ctx)).toBe(landBefore);
+    expect(purchases(ctx)).toHaveLength(0);
+
+    const said = saidAll(second.editReply);
+    expect(said).toContain("商品内容が変更されたため");
+    // **過去の返還まで否定しない**
+    expect(said).not.toContain("チップ・Landは変更していません");
+    expect(said).toContain("以前の返還はすでに完了しており");
+    expect(said).toContain("追加で動かしていません");
+    ctx.db.close();
+  });
+
+  it("まだ一度も返還していない確認票では、これまでどおり「変更していません」と言い切る", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    const world = chipWorld(ctx, ctx.item.id);
+    const stale = `shop:chips:c1:${ctx.item.id}:land:${token(ctx, ctx.item.id)}`;
+    ctx.shop.updateItem(ctx.item.id, { price_land: 999_999 } as never, "staff");
+
+    const h = world.press(stale);
+    await handleShopButton(h.ui, ctx.services);
+
+    expect(world.redeemExactFreeChips).not.toHaveBeenCalled();
+    expect(purchases(ctx)).toHaveLength(0);
+    const said = saidAll(h.editReply);
+    expect(said).toContain("チップ・Landは変更していません");
+    expect(said).not.toContain("以前の返還はすでに完了しており");
+    ctx.db.close();
+  });
+});
+
 describe("チップ返還の確認 — チップを動かす前に契約を見る", () => {
   function chipHarness(ctx: Ctx, itemId: number, customId: string) {
     const redeemExactFreeChips = vi.fn(() => ({ moved: 1_000 }));

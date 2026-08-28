@@ -316,7 +316,7 @@ describe("ショップ 失効とロール剥奪", () => {
       },
       "staff",
     );
-    const purchase = shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
+    const purchase = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(purchase.id);
     shop.expireOverdue("system:test");
     return { db, events, shop, item, purchase };
@@ -324,7 +324,7 @@ describe("ショップ 失効とロール剥奪", () => {
 
   it("失効購入の剥奪再試行時、同じロールを付与するactive購入があれば剥がさず一度だけ完了記録する", async () => {
     const { db, events, shop, item, purchase } = setupShop();
-    shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] });
+    shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] });
     const remove = vi.fn(async () => undefined);
     const member = { roles: { cache: { has: vi.fn(() => true) }, remove } };
     const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
@@ -400,8 +400,8 @@ describe("ショップ 失効とロール剥奪", () => {
       ledger.ensureAccount(`user:${u}`, "user");
       ledger.transfer({ from: TREASURY, to: `user:${u}`, amount: 1_000, type: "adjust", actor: "t", approvedBy: "t", idempotencyKey: `seed:${u}` });
     }
-    const a = shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
-    const b = shop.purchase({ itemId: item.id, userId: "u2", actor: "u2", memberRoleIds: [] }).purchase;
+    const a = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const b = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u2", actor: "u2", memberRoleIds: [] }).purchase;
     db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id IN (?,?)").run(a.id, b.id);
 
     const { expireOverduePurchases } = await import("../src/scheduler-recovery.js");

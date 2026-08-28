@@ -448,6 +448,7 @@ describe("課金後にBotが落ちた場合の収束", () => {
   async function crashedPurchase(ctx: Ctx, w: ReturnType<typeof world>) {
     // 課金と購入行だけ作り、配送前に落ちた状態を作る
     const purchase = ctx.shop.purchase({
+      expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
       itemId: ctx.item.id,
       userId: USER,
       actor: USER,
@@ -547,7 +548,7 @@ describe("課金後にBotが落ちた場合の収束", () => {
       "staff",
     );
     for (let i = 0; i < 25; i++) {
-      const p = ctx.shop.purchase({ itemId: roleItem.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+      const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(roleItem.id).termsToken, itemId: roleItem.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
       ctx.shop.markDeliveryFailed(p.id, "boom", "test");
     }
     // 前提: 全種別から素直に20件取ると、名前変更は1件も入らない
@@ -805,7 +806,7 @@ describe("旧購入の扱い", () => {
     const ctx = setup();
     // 自動化する前に買われた購入（スナップショット無し＝当時は手動）
     ctx.db.prepare("UPDATE shop_items SET delivery='manual', delivery_kind=NULL WHERE id=?").run(ctx.item.id);
-    const legacy = ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const legacy = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
     expect(legacy.delivery_snapshot_json).toBeNull();
     // いま自動化する
     ctx.db.prepare("UPDATE shop_items SET delivery='auto', delivery_kind='set_nickname' WHERE id=?").run(ctx.item.id);
@@ -979,7 +980,7 @@ describe("入城の名前制度との統合", () => {
     const ctx = setup();
     const w = world({ nickname: "まえ" });
     // 課金だけ済んで落ちた
-    ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [], request: { nickname: "よこどり" } });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [], request: { nickname: "よこどり" } });
     // 落ちている間に別の人がその名前を取った
     ctx.nicknames.claim({ userId: "999999999999999999", nickname: "よこどり", setVia: "entry", actor: "t" });
     const client = {
@@ -1073,6 +1074,7 @@ describe("レビュー指摘の4点", () => {
     ctx.nicknames.claim({ userId: USER, nickname: "えー", setVia: "entry", actor: "t" });
     // 課金と仮押さえまで済んで落ちた状態
     const purchase = ctx.shop.purchase({
+      expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
       itemId: ctx.item.id,
       userId: USER,
       actor: USER,
@@ -1104,6 +1106,7 @@ describe("レビュー指摘の4点", () => {
     const w = world({ nickname: "びー" });
     ctx.nicknames.claim({ userId: USER, nickname: "えー", setVia: "entry", actor: "t" });
     const purchase = ctx.shop.purchase({
+      expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
       itemId: ctx.item.id,
       userId: USER,
       actor: USER,

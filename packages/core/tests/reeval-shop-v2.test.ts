@@ -193,6 +193,7 @@ describe("再評価チャレンジV2決済", () => {
     expect(
       codeOf(() =>
         ctx.shop.purchase({
+          expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
           itemId: ctx.item.id,
           userId: USER,
           actor: USER,
@@ -275,7 +276,7 @@ describe("再評価権のidentityは商品IDではない", () => {
     ctx.replaceSaleItem(); // 販売設定はBへ。Aはenabledのまま
 
     const beforeLand = ctx.ledger.balanceOf(`user:${USER}`);
-    expect(codeOf(() => ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: STAFF, memberRoleIds: [] })))
+    expect(codeOf(() => ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, itemId: ctx.item.id, userId: USER, actor: STAFF, memberRoleIds: [] })))
       .toBe("ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED");
     expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(beforeLand);
   });
@@ -340,7 +341,7 @@ describe("再評価権のidentityは商品IDではない", () => {
     expect(ctx.shop.isHistoricalReevaluationItem(b.id)).toBe(true);
 
     const beforeLand = ctx.ledger.balanceOf(`user:${USER}`);
-    expect(codeOf(() => ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: STAFF, memberRoleIds: [] })))
+    expect(codeOf(() => ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, itemId: ctx.item.id, userId: USER, actor: STAFF, memberRoleIds: [] })))
       .toBe("ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED");
     expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(beforeLand);
   });
@@ -412,7 +413,7 @@ describe("再評価権のidentityは商品IDではない", () => {
       type: "initial", actor: STAFF, idempotencyKey: "seed:write-authority",
     });
     const beforeLand = ledger.balanceOf(`user:${USER}`);
-    expect(codeOf(() => shop.purchase({ itemId: a.id, userId: USER, actor: STAFF, memberRoleIds: [] })))
+    expect(codeOf(() => shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(a.id).termsToken, itemId: a.id, userId: USER, actor: STAFF, memberRoleIds: [] })))
       .toBe("ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED");
     expect(ledger.balanceOf(`user:${USER}`)).toBe(beforeLand);
     db.close();
@@ -479,7 +480,7 @@ describe("再評価権のidentityは商品IDではない", () => {
       { name: "手動配送の普通の商品", price_land: 10, kind: "one_shot", delivery: "manual" },
       STAFF,
     );
-    ctx.shop.purchase({ itemId: normal.id, userId: USER, actor: STAFF, memberRoleIds: [] });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(normal.id).termsToken, itemId: normal.id, userId: USER, actor: STAFF, memberRoleIds: [] });
     expect(ctx.shop.countPendingManual()).toBe(1);
     expect(ctx.shop.listPendingManual().map((r) => r.item_id)).toEqual([normal.id]);
   });

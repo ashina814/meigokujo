@@ -43,7 +43,9 @@ function main(): void {
       userId: input.userId!,
       actor: `user:${input.userId}`,
       memberRoleIds: [],
-      expectedTermsToken: input.expectedTermsToken,
+      // **意図的にそのまま渡す。** このrunnerは「tokenを渡し忘れた/壊れたcaller」も
+      // 再現するので、TypeScriptの必須指定を迂回してruntime guardの側を確かめる。
+      expectedTermsToken: input.expectedTermsToken as string,
       idempotencyKey: input.idempotencyKey,
     });
     process.stdout.write(

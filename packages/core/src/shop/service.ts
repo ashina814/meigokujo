@@ -249,6 +249,7 @@ export type ShopErrorCode =
   | "ERR_REEVAL_INTAKE_UNAVAILABLE"
   | "ERR_ALT_PAYMENT_UNSUPPORTED"
   | "ERR_ALT_REFUND_UNSUPPORTED"
+  | "ERR_TERMS_TOKEN_REQUIRED"
   | "ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_EVAL_EXTENSION_ITEM_CONFIG"
   | "ERR_EVAL_EXTENSION_STATUS"
@@ -318,7 +319,21 @@ function canonicalGenericTerms(item: ShopItemRow): GenericPurchaseTerms {
   };
 }
 
+/**
+ * 表示した契約の指紋の長さ（文字数）。Discordのcustom ID上限は100文字で、名前変更の
+ * 確定ボタンには商品ID・確認ID(19桁)・料金・指紋・希望する名前(最長32文字)が同居する。
+ * ここを伸ばすとボタンごとDiscordに拒否されるので、文字数は動かさない。
+ */
 const GENERIC_TERMS_TOKEN_LENGTH = 16;
+
+/** 指紋のbit幅。base64urlは1文字6bitなので、16文字 = 12バイト = 96bit。 */
+const GENERIC_TERMS_TOKEN_BYTES = 12;
+
+/**
+ * 生成した指紋が取りうる形（base64urlの文字だけ・決まった長さ）。長さの定数から作るので、
+ * 片方だけ変えて「検証は通るのに実際の指紋と形が違う」がおきない。
+ */
+const GENERIC_TERMS_TOKEN_PATTERN = new RegExp(`^[A-Za-z0-9_-]{${GENERIC_TERMS_TOKEN_LENGTH}}$`);
 
 function genericTermsToken(terms: GenericPurchaseTerms): string {
   // 順序固定のtuple。JSON.stringifyのkey順に依存させない。
@@ -327,11 +342,16 @@ function genericTermsToken(terms: GenericPurchaseTerms): string {
     terms.kind, terms.durationDays, terms.requireRoleId,
     terms.delivery, terms.deliveryKind, terms.deliveryData,
   ]);
-  // 16 hex（64bit）。これは**変更検知**であって認可トークンではない。比較相手は常に
-  // その場で作り直した現在の契約なので、衝突しても「変わったのに気づかない」だけで、
-  // 見せていない条件で課金する側には倒れない。Discordのcustom ID上限(100文字)に
-  // ニックネーム(最大32文字)等と同居させる必要があるため、この長さに収める。
-  return createHash("sha256").update(canonical, "utf8").digest("hex").slice(0, GENERIC_TERMS_TOKEN_LENGTH);
+  // **衝突は「契約が変わったのに気づかない」＝まさに防ぎたい結果**なので、
+  // 「衝突しても安全」ではない。文字数は変えられないため、同じ16文字で情報量を上げる。
+  // hexは1文字4bitで16文字=64bit。base64urlは1文字6bitなので16文字=96bit。
+  // これは認可のための秘密ではない（利用者にも見えるcustom IDに載る）。あくまで
+  // 表示した契約と現在の契約が同じかを確かめるための指紋。
+  return createHash("sha256")
+    .update(canonical, "utf8")
+    .digest()
+    .subarray(0, GENERIC_TERMS_TOKEN_BYTES)
+    .toString("base64url");
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -891,6 +911,14 @@ export class Shop {
    * `price_alt_kind != null` は「使える」の根拠にならない——**その資源を実際に消費できる
    * 専用writerがあるか**が authority。現状、資源を消費する経路を持つのは再評価チャレンジの
    * invite払い（`purchaseReevaluation`）だけで、それは専用商品なのでgenericには出さない。
+   *
+   * **`true` を返してよくなる条件**（3つ揃うまでは false のまま）:
+   *   1. その資源を実際に減らす writer があること（`paid_alt_*` を書くだけは支払いではない）
+   *   2. 失敗したときの後始末が決まっていること——巻き戻し・返金・取り消しのどれで、
+   *      誰がやるのか。`refund()` が戻せない資源は generic refund の対象外のままなので、
+   *      「配送に失敗したらどうするか」を先に決めていないと課金だけが残る
+   *   3. 1と2を固定するテストがあること
+   * 支払方法ごとの handler registry のような一般化は、実際に2つ目が現れてから考える。
    */
   genericAltPaymentSupported(_itemId: number): boolean {
     return false;
@@ -923,10 +951,15 @@ export class Shop {
     idempotencyKey?: string;
     /**
      * 表示時に確定した契約の指紋（`quoteGenericPurchase()` の `termsToken`）。
-     * 渡された場合、Landを動かす直前に現在の商品から再生成して一致を確認する。
-     * UIのpreflightだけでなくCore側でも見るので、直接callerでも迂回できない。
+     *
+     * **必須**。「先に契約を見せた」証拠なしにgeneric購入は成立させない。省略できる
+     * ようにしておくと、Bot以外のcallerが quote を取らずに現在の条件でそのまま課金
+     * できてしまい、「Coreが最後の関門」という前提が崩れる。
+     *
+     * 専用商品（再評価・評価延長・オリジナルロール・請求）はそれぞれ専用writerが
+     * 固有の事前条件を持つので、この経路は通らない。
      */
-    expectedTermsToken?: string;
+    expectedTermsToken: string;
   }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
     if (this.options.originalRoleItemId?.() === input.itemId) {
       throw new ShopError("ERR_ORIGINAL_ROLE_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
@@ -945,6 +978,11 @@ export class Shop {
     // 成立しえた。altが使えないからLandへ落とす、も禁止——利用者はinviteで払うと言っている。
     if (input.payAlt) {
       throw new ShopError("ERR_ALT_PAYMENT_UNSUPPORTED", { itemId: input.itemId });
+    }
+    // 型を迂回するcaller（JSからの呼び出し・any経由）にも効かせる。undefined・空文字・
+    // 形の違う値は「契約を見せた証拠が無い」であって、現在の条件で課金してよい理由にはならない。
+    if (typeof input.expectedTermsToken !== "string" || !GENERIC_TERMS_TOKEN_PATTERN.test(input.expectedTermsToken)) {
+      throw new ShopError("ERR_TERMS_TOKEN_REQUIRED", { itemId: input.itemId });
     }
     const run = () => this.purchaseInternal({ ...input, titleOrigin: "storefront" });
     return this.db.inTransaction ? run() : this.db.transaction(run).immediate();

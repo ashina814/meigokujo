@@ -216,7 +216,7 @@ describe("現在の通常導線", () => {
     const ctx = setup();
     const before = balance(ctx);
     expectShopError(
-      () => ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [] }),
+      () => ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, itemId: ctx.item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [] }),
       "ERR_ORIGINAL_ROLE_SPECIAL_PURCHASE_REQUIRED",
     );
     expect(balance(ctx)).toBe(before);

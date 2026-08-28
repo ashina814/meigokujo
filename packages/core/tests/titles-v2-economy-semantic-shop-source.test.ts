@@ -148,6 +148,7 @@ function buy(
     return { purchase: ctx.shop.getPurchase(purchaseId)! };
   }
   return ctx.shop.purchase({
+    expectedTermsToken: ctx.shop.quoteGenericPurchase(itemId).termsToken,
     itemId,
     userId,
     actor: `user:${userId}`,
@@ -348,7 +349,7 @@ describe("Shop regressions Q–AG", () => {
     const noPrice = ctx.shop.createItem({ name: "price", price_land: null, kind: "one_shot", delivery: "manual" }, "staff");
     fund(ctx.ledger, "alice");
     for (const item of [disabled, noStock, role, noPrice]) {
-      expect(() => ctx.shop.purchase({ itemId: item.id, userId: "alice", actor: "user:alice", memberRoleIds: [] })).toThrow();
+      expect(() => ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "alice", actor: "user:alice", memberRoleIds: [] })).toThrow();
     }
     expect(readTitleSource(ctx.db, "shop_purchase_safe", "alice", scope(ctx, BASE + DAY, "shop"))).toEqual({
       days: [],

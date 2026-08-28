@@ -390,7 +390,7 @@ describe("汎用の配送完了操作", () => {
     const { handleShokanButton } = await shokanModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    const purchase = ctx.shop.purchase({ itemId: ctx.nickname.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.nickname.id).termsToken, itemId: ctx.nickname.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
     const reply = vi.fn(async () => undefined);
 
     await handleShokanButton(staffInteraction(`shokan:deliver:${purchase.id}`, reply), ctx.services);
@@ -420,7 +420,7 @@ describe("自動更新を廃止した後の利用者表示", () => {
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    ctx.shop.purchase({ itemId: ctx.nickname.id, userId: USER, actor: USER, memberRoleIds: [] });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.nickname.id).termsToken, itemId: ctx.nickname.id, userId: USER, actor: USER, memberRoleIds: [] });
     const reply = vi.fn(async () => undefined);
 
     await handleShopButton(
@@ -444,7 +444,7 @@ describe("期限商品の延長（利用者の手数を増やさない）", () =
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    const purchase = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.pass.id).termsToken, itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
 
     // 1) 契約中を見る
     const list = vi.fn(async () => undefined);
@@ -490,7 +490,7 @@ describe("期限商品の延長（利用者の手数を増やさない）", () =
     const { handleShopSelect } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    const purchase = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.pass.id).termsToken, itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
     const reply = vi.fn(async () => undefined);
 
     await handleShopSelect(
@@ -516,7 +516,7 @@ describe("期限商品の延長（利用者の手数を増やさない）", () =
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    const purchase = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.pass.id).termsToken, itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
     // 同じ確認画面から出た確定ボタン（＝同じ確認ID）を2回押す。
     // interaction.id は毎回違うので、冪等が確認IDで決まっていないと二重課金になる
     const confirmId = `shop:extend-do:${purchase.id}:conf-1:80000:30:${purchase.expires_at}`;
@@ -546,7 +546,7 @@ describe("Botが権利を管理していない契約（旧オリジナルロー�
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.legacy.id).termsToken, itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
     const reply = vi.fn(async () => undefined);
 
     await handleShopButton({ customId: "shop:contracts", user: { id: USER }, reply } as never, ctx.services);
@@ -567,8 +567,8 @@ describe("Botが権利を管理していない契約（旧オリジナルロー�
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
-    const extendable = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.legacy.id).termsToken, itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
+    const extendable = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.pass.id).termsToken, itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
     const reply = vi.fn(async () => undefined);
 
     await handleShopButton({ customId: "shop:contracts", user: { id: USER }, reply } as never, ctx.services);
@@ -594,7 +594,7 @@ describe("Botが権利を管理していない契約（旧オリジナルロー�
     const { handleShopSelect } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.legacy.id).termsToken, itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
     const reply = vi.fn(async () => undefined);
 
     await handleShopSelect(
@@ -621,7 +621,7 @@ describe("Botが権利を管理していない契約（旧オリジナルロー�
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    const purchase = ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.legacy.id).termsToken, itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
     const balance = ctx.ledger.balanceOf(`user:${USER}`);
     const reply = vi.fn(async () => undefined);
 

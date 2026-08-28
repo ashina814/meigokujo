@@ -269,7 +269,7 @@ describe("チケットと購入の対応が崩れている場合", () => {
     ready(ctx);
     // genericなstorefront購入は面談権ではない。ticketへ結び替えても確定できない。
     const generic = ctx.shop.createItem({ name: "別商品", price_land: 1, kind: "one_shot", delivery: "manual" }, STAFF);
-    const other = ctx.shop.purchase({ itemId: generic.id, userId: USER, actor: STAFF, memberRoleIds: [] }).purchase;
+    const other = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(generic.id).termsToken, itemId: generic.id, userId: USER, actor: STAFF, memberRoleIds: [] }).purchase;
     ctx.db.prepare("UPDATE tickets SET linked_purchase_id=? WHERE thread_id=?").run(other.id, THREAD);
 
     expect(settleInterview(ctx.services, settleInput(other.id, true))).toEqual({

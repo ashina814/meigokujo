@@ -593,6 +593,11 @@ function purchaseOnce(
         idempotencyKey: `shop:purchase:op:${input.operationId}`,
       });
     } else {
+      // 普通の商品はgeneric契約を必ず通す。tokenが無いまま来たら、ここで止める。
+      // 「呼び出し元が渡し忘れた」を「現在の条件で課金してよい」に読み替えない。
+      if (input.expectedTermsToken === undefined) {
+        throw new ShopError("ERR_TERMS_TOKEN_REQUIRED", { itemId: input.itemId });
+      }
       result = services.shop.purchase({
         itemId: input.itemId,
         userId: input.userId,
@@ -738,6 +743,46 @@ function originalRolePurchaseRedirect(services: Services, item: ShopItemRow, use
     embeds: [],
     components: item.enabled ? actions.components : [],
   };
+}
+
+/**
+ * チップ返還確認を止めるときの文面。
+ *
+ * **同じ確認票でも、まだ何も動いていない場合と、既にチップがLandへ戻っている場合がある。**
+ * 返還だけ成功して購入が失敗した「取り残し」状態では再試行ボタンが残るので、そのボタンから
+ * ここへ来ることが実際にある。そこで一律に「チップ・Landは変更していません」と言うと、
+ * 過去の返還まで無かったことにする嘘になる。
+ *
+ * どちらとも言い切れないときは、**言い切らない**。この操作で追加の移動が無かったことだけを
+ * 伝える。過去について確かめられないのに「完了しています」とも「変更していません」とも書かない。
+ */
+function chipStoppedMessage(
+  services: Services,
+  userId: string,
+  confirmationId: string,
+  confirmationStatus: string,
+  headline: string,
+): string {
+  const NO_CHANGE = "チップ・Landは変更していません。";
+  const NO_NEW_CHANGE = "この操作ではチップ・Landを追加で動かしていません。";
+  const ALREADY_RETURNED =
+    "以前の返還はすでに完了しており、その分はLand残高に反映されています。この操作では追加で動かしていません。";
+
+  // まだ実行に入っていない確認票なら、返還は起こりようがない。断定してよい。
+  if (confirmationStatus === "pending") return [headline, NO_CHANGE, "商品を選び直してください。"].join("\n");
+
+  // 実行に入ったことがある確認票。返還は `chip:free-redeem:<user>:external:<confirmation>` という
+  // 安定キーで記録されるので、その記録があるかで断定する。
+  let line = NO_NEW_CHANGE;
+  try {
+    const group = services.chipTx?.getGroup(`chip:free-redeem:${userId}:external:${confirmationId}`);
+    if (group !== undefined) line = ALREADY_RETURNED;
+    else line = NO_CHANGE;
+  } catch {
+    // 記録を読めない。過去について**どちらも断定しない**。
+    line = NO_NEW_CHANGE;
+  }
+  return [headline, line, "商品を選び直してください。"].join("\n");
 }
 
 function chipReturnView(
@@ -1299,10 +1344,13 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       if (!isReevalItem(services, configuredItem)) {
         if (services.shop.quoteGenericPurchase(itemId).termsToken !== expectedTermsToken) {
           await interaction.editReply({
-            content: [
+            content: chipStoppedMessage(
+              services,
+              interaction.user.id,
+              confirmationId,
+              confirmation.status,
               "❌ 商品内容が変更されたため、この確認は使用できません。",
-              "チップ・Landは変更していません。商品を選び直してください。",
-            ].join("\n"),
+            ),
             embeds: [],
             components: [],
           });
@@ -1320,10 +1368,13 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         } else {
           // かつての再評価商品。古い確認をBの専用購入へ勝手に読み替えない。0 mutationで停止する。
           await interaction.editReply({
-            content: [
+            content: chipStoppedMessage(
+              services,
+              interaction.user.id,
+              confirmationId,
+              confirmation.status,
               "❌ 商品設定が変更されたため、この確認は使用できません。",
-              "チップ・Landは変更していません。商品を選び直してください。",
-            ].join("\n"),
+            ),
             embeds: [],
             components: [],
           });

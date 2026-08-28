@@ -98,6 +98,7 @@ function buy(context: ReturnType<typeof setup>, at: number) {
   fund(context, "subject", at - 1);
   context.setNow(at);
   return context.shop.purchase({
+    expectedTermsToken: context.shop.quoteGenericPurchase(item.id).termsToken,
     itemId: item.id, userId: "subject", actor: "user:subject", memberRoleIds: [], payAlt: false,
     idempotencyKey: `castle:shop:${++sequence}`,
   });

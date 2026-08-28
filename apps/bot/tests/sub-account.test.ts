@@ -252,7 +252,7 @@ describe("旧契約の二重課金防止", () => {
       "staff",
     );
     ctx.settings.set("shop:sub_account_legacy_item_id", String(legacy.id), "staff");
-    const outcome = ctx.shop.purchase({ userId: MAIN, itemId: legacy.id, actor: "t", memberRoleIds: [] });
+    const outcome = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(legacy.id).termsToken, userId: MAIN, itemId: legacy.id, actor: "t", memberRoleIds: [] });
     if (status === "refunded") ctx.shop.refund(outcome.purchase.id, "test", "staff");
     return outcome.purchase;
   }
@@ -473,6 +473,7 @@ describe("再起動後の収束", () => {
     const ctx = setup();
     const row = approved(ctx);
     const { purchase } = ctx.shop.purchase({
+      expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
       userId: MAIN,
       itemId: ctx.item.id,
       actor: "t",
@@ -602,7 +603,7 @@ describe("旧#4の引き継ぎ（運営導線）", () => {
     const ctx = setup();
     const legacy = ctx.shop.createItem({ name: "サブ垢追加(旧)", price_land: PRICE, kind: "one_shot", delivery: "manual" }, "staff");
     ctx.settings.set("shop:sub_account_legacy_item_id", String(legacy.id), "staff");
-    ctx.shop.purchase({ userId: MAIN, itemId: legacy.id, actor: "t", memberRoleIds: [] });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(legacy.id).termsToken, userId: MAIN, itemId: legacy.id, actor: "t", memberRoleIds: [] });
 
     const text = String(importHome(ctx.services).embeds[0]!.toJSON().description);
 
@@ -1043,6 +1044,7 @@ describe("クラッシュと再起動をまたぐ巻き戻し", () => {
    */
   function paid(ctx: Ctx, rowId: number) {
     const { purchase } = ctx.shop.purchase({
+      expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
       userId: MAIN,
       itemId: ctx.item.id,
       actor: "t",

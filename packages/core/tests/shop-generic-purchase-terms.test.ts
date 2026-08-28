@@ -54,13 +54,32 @@ const balance = (ctx: Ctx) => ctx.ledger.balanceOf(`user:${USER}`);
 const purchaseCount = (ctx: Ctx) =>
   (ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_purchases").get() as { n: number }).n;
 
-function buy(ctx: Ctx, itemId: number, expectedTermsToken?: string) {
+/** 本番と同じ順序：まず契約を見せて、その契約で買う。 */
+function buy(
+  ctx: Ctx,
+  itemId: number,
+  expectedTermsToken: string = ctx.shop.quoteGenericPurchase(itemId).termsToken,
+) {
   return ctx.shop.purchase({
     itemId,
     userId: USER,
     actor: `user:${USER}`,
     memberRoleIds: [],
     expectedTermsToken,
+  });
+}
+
+/**
+ * 型を迂回するcaller（JS・any経由・古い呼び出し）を再現する。
+ * TypeScriptで必須にするだけでは、実行時に来る値を守れない。
+ */
+function buyRaw(ctx: Ctx, itemId: number, rawToken: unknown) {
+  return (ctx.shop.purchase as (input: Record<string, unknown>) => unknown)({
+    itemId,
+    userId: USER,
+    actor: `user:${USER}`,
+    memberRoleIds: [],
+    expectedTermsToken: rawToken,
   });
 }
 
@@ -133,13 +152,91 @@ describe("generic購入契約 — 表示した条件でしか課金しない", (
   });
 });
 
+describe("generic購入契約 — 契約を見せた証拠なしに課金しない", () => {
+  it("tokenを渡さないgeneric購入は成立しない", () => {
+    // 型でも必須だが、型を迂回するcallerにも効かないと「Coreが最後の関門」にならない。
+    const ctx = setup();
+    const item = makeItem(ctx);
+
+    expect(() => buyRaw(ctx, item.id, undefined)).toThrow(/ERR_TERMS_TOKEN_REQUIRED/);
+    expect(balance(ctx)).toBe(START);
+    expect(purchaseCount(ctx)).toBe(0);
+    ctx.db.close();
+  });
+
+  it("空文字・形の違う値も「契約を見せた証拠」にはならない", () => {
+    const ctx = setup();
+    const item = makeItem(ctx);
+    const valid = ctx.shop.quoteGenericPurchase(item.id).termsToken;
+
+    for (const bad of ["", " ", null, 0, false, {}, [], "short", `${valid}x`, valid.slice(0, 15), valid + "="]) {
+      expect(() => buyRaw(ctx, item.id, bad)).toThrow(/ERR_TERMS_TOKEN_REQUIRED/);
+    }
+    expect(balance(ctx)).toBe(START);
+    expect(purchaseCount(ctx)).toBe(0);
+    // 正しい形のtokenなら通る（上の拒否が「常に落ちる」のではないことを示す）
+    expect(buy(ctx, item.id, valid).purchase.paid_land).toBe(10_000);
+    ctx.db.close();
+  });
+
+  it("在庫・配送・delivery stateも一切動かない", () => {
+    const ctx = setup();
+    const item = makeItem(ctx, { stock: 3 });
+
+    expect(() => buyRaw(ctx, item.id, undefined)).toThrow(/ERR_TERMS_TOKEN_REQUIRED/);
+
+    expect(ctx.shop.getItem(item.id)!.stock).toBe(3);
+    expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_purchases").get()).toEqual({ n: 0 });
+    expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM outbox WHERE kind='shop_purchase_log'").get()).toEqual({ n: 0 });
+    ctx.db.close();
+  });
+});
+
+describe("契約の指紋", () => {
+  it("16文字のbase64url（96bit）である", () => {
+    // 衝突は「契約が変わったのに見逃す」＝防ぎたい結果そのものなので、情報量を上げる。
+    // Discordのcustom ID上限があるため文字数は増やせない。同じ16文字で、
+    // hex(1文字4bit=64bit)ではなくbase64url(1文字6bit=96bit)を使う。
+    const ctx = setup();
+    const item = makeItem(ctx);
+    const token = ctx.shop.quoteGenericPurchase(item.id).termsToken;
+
+    expect(token).toHaveLength(16);
+    expect(token).toMatch(/^[A-Za-z0-9_-]{16}$/);
+    // hexだけで構成されていたら64bitに落ちている疑いがある——複数商品で確認する
+    const tokens = [token];
+    for (const patch of [{ price_land: 1 }, { name: "b" }, { description: "c" }, { duration_days: 9 }]) {
+      ctx.shop.updateItem(item.id, patch as never, "staff");
+      tokens.push(ctx.shop.quoteGenericPurchase(item.id).termsToken);
+    }
+    expect(new Set(tokens).size).toBe(tokens.length);
+    expect(tokens.some((t) => /[^0-9a-f]/.test(t))).toBe(true);
+    ctx.db.close();
+  });
+
+  it("同じ契約なら同じ指紋、違う契約なら違う指紋", () => {
+    const ctx = setup();
+    const item = makeItem(ctx);
+    const first = ctx.shop.quoteGenericPurchase(item.id).termsToken;
+    expect(ctx.shop.quoteGenericPurchase(item.id).termsToken).toBe(first);
+
+    ctx.shop.updateItem(item.id, { price_land: 10_001 } as never, "staff");
+    const changed = ctx.shop.quoteGenericPurchase(item.id).termsToken;
+    expect(changed).not.toBe(first);
+
+    ctx.shop.updateItem(item.id, { price_land: 10_000 } as never, "staff");
+    expect(ctx.shop.quoteGenericPurchase(item.id).termsToken).toBe(first);
+    ctx.db.close();
+  });
+});
+
 describe("generic購入契約 — 払えない支払方法で売らない", () => {
   it("代替支払は成立しない（資源を消費する経路が無い）", () => {
     const ctx = setup();
     const item = makeItem(ctx, { price_land: null, price_alt_kind: "invite", price_alt_amount: 3 });
 
     expect(() =>
-      ctx.shop.purchase({ itemId: item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [], payAlt: true }),
+      ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [], payAlt: true }),
     ).toThrow(/ERR_ALT_PAYMENT_UNSUPPORTED/);
     expect(purchaseCount(ctx)).toBe(0);
     expect(balance(ctx)).toBe(START);
@@ -152,7 +249,7 @@ describe("generic購入契約 — 払えない支払方法で売らない", () =
     const item = makeItem(ctx, { price_land: 10_000, price_alt_kind: "invite", price_alt_amount: 3 });
 
     expect(() =>
-      ctx.shop.purchase({ itemId: item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [], payAlt: true }),
+      ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [], payAlt: true }),
     ).toThrow(/ERR_ALT_PAYMENT_UNSUPPORTED/);
     expect(balance(ctx)).toBe(START);
     expect(purchaseCount(ctx)).toBe(0);

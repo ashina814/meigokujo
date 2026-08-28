@@ -77,7 +77,7 @@ describe("official shop purchase log outbox", () => {
       kind: "one_shot",
       delivery: "manual",
     }, "staff");
-    const result = ctx.shop.purchase({ itemId: item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [] });
+    const result = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [] });
     const rows = logs(ctx.db);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
@@ -113,7 +113,7 @@ describe("official shop purchase log outbox", () => {
       delivery_data: JSON.stringify({ role_id: "role-x" }),
     }, "staff");
     const before = ctx.ledger.balanceOf(`user:${USER}`);
-    expect(() => ctx.shop.purchase({ itemId: item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [], payAlt: true }))
+    expect(() => ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [], payAlt: true }))
       .toThrow(/ERR_ALT_PAYMENT_UNSUPPORTED/);
     expect(logs(ctx.db)).toEqual([]);
     expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_purchases").get()).toEqual({ n: 0 });

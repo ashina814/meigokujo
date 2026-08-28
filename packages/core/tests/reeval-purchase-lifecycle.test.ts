@@ -232,7 +232,7 @@ describe("承認直前の再確認（linked_purchase_id を信用しない）", 
     const another = ctx.shop.createItem({ name: "別商品", price_land: 10, kind: "one_shot", delivery: "manual" }, STAFF);
     ctx.ledger.ensureAccount(`user:${USER}`, "user");
     ctx.ledger.transfer({ from: "sys:treasury", to: `user:${USER}`, amount: 1_000, type: "adjust", actor: STAFF, idempotencyKey: "seed-x" });
-    const wrong = ctx.shop.purchase({ itemId: another.id, userId: USER, actor: STAFF, memberRoleIds: [] }).purchase;
+    const wrong = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(another.id).termsToken, itemId: another.id, userId: USER, actor: STAFF, memberRoleIds: [] }).purchase;
     openTicket(ctx, "t-1");
     ctx.tickets.linkPurchase("t-1", wrong.id, STAFF);
 

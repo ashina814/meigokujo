@@ -78,7 +78,7 @@ const buy = (ctx: Ctx, itemId: number) => {
       mode: "land", idempotencyKey: `reeval:${USER}:${Math.random()}`,
     }).purchase;
   }
-  return ctx.shop.purchase({ itemId, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+  return ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(itemId).termsToken, itemId, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
 };
 
 /** 別の利用者としてまとめて購入する（キューを積むため） */
@@ -100,7 +100,7 @@ function buyAs(ctx: Ctx, itemId: number, userId: string) {
       mode: "land", idempotencyKey: `reeval:${userId}:${Math.random()}`,
     }).purchase;
   }
-  return ctx.shop.purchase({ itemId, userId, actor: userId, memberRoleIds: [] }).purchase;
+  return ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(itemId).termsToken, itemId, userId, actor: userId, memberRoleIds: [] }).purchase;
 }
 
 /** 常設パネル（=ephemeralではないメッセージ）から押した体のインタラクション */
