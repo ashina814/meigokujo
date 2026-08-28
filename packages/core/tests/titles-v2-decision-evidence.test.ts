@@ -13,8 +13,10 @@ import { CALIBRATION_SCHEMA_VERSION, CALIBRATION_PERCENTILE_METHOD, canonicalRea
 import { TITLE_V2_CATALOG_READINESS } from "../src/titles/v2-catalog-readiness.js";
 import { canonicalCatalogHash, TITLE_V2_CATALOG_CANDIDATES } from "../src/titles/v2-catalog-candidates.js";
 import {
+  executeCandidateAtSelection,
   executeF5cShadowCalibration,
   F5C2_BOUNDARY_PERCENTILES,
+  F5C2_REPRESENTATIVE_PERCENTILE,
   F5C2_SHADOW_CONTRACT_VERSION,
 } from "../src/titles/v2-shadow-evaluation.js";
 import {
@@ -23,10 +25,11 @@ import {
   f5cOverlapMeasures,
   F5C3_EVIDENCE_CONTRACT_VERSION,
   F5C3_SENSITIVITY_MODEL,
+  F5C3_SIBLING_PINNING,
   F5C3_KNOWN_RELEASE_GATES,
   type F5cDecisionEvidenceReport,
 } from "../src/titles/v2-decision-evidence.js";
-import { parseArgs } from "../scripts/f5c3-decision-evidence.js";
+import { parseArgs, readSubjectUserIds } from "../scripts/f5c3-decision-evidence.js";
 import type { PlanningCalibrationJointEvidence, PlanningCalibrationMeasurementCollection, PlanningCalibrationSubjectMeasurement } from "../src/titles/v2-calibration.js";
 import type { F5cShadowOutcome } from "../src/titles/v2-shadow-evaluation.js";
 
@@ -94,6 +97,44 @@ function welcoming(id: string, distinctOccurrenceDays: number | null, occurrence
   return subject(id, [{ probeKey: probeKeyFor(2), metrics }]);
 }
 
+/**
+ * No.76 is the smallest genuinely DEPENDENT pipeline in READY-76: one SCALAR_SAMPLE filter
+ * (`rooted-branch-social-evidence`, over each activity day's trusted social seconds) feeding one
+ * FILTER_THEN_DISTINCT_DAYS reduction (`rooted-branch-activity-days`) inside a single row group.
+ * Moving the filter changes which rows survive, which changes the reduction's own distribution —
+ * exactly the case a percentile-rank "hold" cannot keep still.
+ */
+function rootedBranch(id: string, days: readonly (readonly [number, number])[]) {
+  return subject(id, [{
+    probeKey: probeKeyFor(76),
+    jointEvidence: {
+      kind: "invite-rooted-v1",
+      unknownEntryAnchorCount: 0,
+      profiles: [{
+        profileOrdinal: 1,
+        activityDays: days.map(([dayOffset, vcTrustedSocialSeconds]) => ({ dayOffset, tcBestOtherGapMs: null, vcTrustedSocialSeconds })),
+        nextGenerationOccurrences: [],
+        unknownNextGenerationEntryAnchorCount: 0,
+        reunionDays: [],
+      }],
+    },
+  }]);
+}
+
+/**
+ * Population trusted-social-seconds samples are [50, 50, 50, 100, 100, 100]: nearest-rank p50 = 50
+ * (every row qualifies) and p75 = 100 (only carol's rows qualify). Baseline qualifying-day samples
+ * are therefore [1, 2, 3] with p50 = 2 — and the reviewer's [0, 0, 3] / p50 = 0 case is exactly
+ * what the filter at p75 produces.
+ */
+const ROOTED_SUBJECTS = [
+  rootedBranch("alice", [[1, 50]]),
+  rootedBranch("bob", [[1, 50], [2, 50]]),
+  rootedBranch("carol", [[1, 100], [2, 100], [3, 100]]),
+];
+const ROOTED_FILTER_DIM = "rooted-branch-social-evidence";
+const ROOTED_REDUCTION_DIM = "rooted-branch-activity-days";
+
 describe("F5c3 decision-evidence layer", () => {
   // ── A. candidate-level sensitivity is NOT the marginal axis pass rate ──────────────────────
   it("A. a candidate-level OAT curve reflects the FINAL conjunction, not the swept axis's own marginal pass rate", () => {
@@ -135,6 +176,101 @@ describe("F5c3 decision-evidence layer", () => {
     expect(span.points.find((p) => p.percentile === 50)!.boundaryValueAtPercentile).toBe(4);
     expect(span.points.find((p) => p.percentile === 50)!.candidatePrevalence).toBe(0.75);
     expect(span.flat).toBe(false);
+  });
+
+  // ── B2. dependent pipeline: the sibling's NUMERIC boundary is what stays still ────────────
+  it("B2. sweeping an upstream filter does not move the downstream reduction's numeric boundary", () => {
+    const evidence = buildF5cDecisionEvidence(collection(ROOTED_SUBJECTS), true);
+    const plan = F5C_CANDIDATE_SWEEP_PLANS.find((p) => p.candidateNo === 76)!;
+
+    // Baseline: filter p50 = 50 admits every row, so qualifying days are [1, 2, 3] and the
+    // reduction's own p50 boundary is 2 — bob and carol clear it, alice does not.
+    expect(sensitivityFor(evidence, 76).representative.candidatePrevalence).toBe(2 / 3);
+    expect(dimensionOf(evidence, 76, ROOTED_REDUCTION_DIM).points.find((p) => p.percentile === 50)!.boundaryValueAtPercentile).toBe(2);
+
+    // Sweeping ONLY the filter to p75 = 100 leaves alice and bob with zero qualifying days, so the
+    // reduction's CONDITIONAL distribution collapses to [0, 0, 3] (conditional p50 = 0). The
+    // decision boundary must stay at the baseline 2, so only carol still matches.
+    const filterDim = dimensionOf(evidence, 76, ROOTED_FILTER_DIM);
+    const atP75 = filterDim.points.find((p) => p.percentile === 75)!;
+    expect(atP75.boundaryValueAtPercentile).toBe(100); // the one boundary that moved
+    expect(atP75.candidatePrevalence).toBe(1 / 3);
+    expect(atP75.matchedCount).toBe(1);
+    expect(atP75.notMatchedCount).toBe(2);
+
+    // ...and this is precisely what percentile-RANK pinning gets wrong. Held at "p50", the sibling
+    // re-derives its boundary from the conditional [0, 0, 3] and lands on 0, so `>= 0` admits
+    // everyone: a one-axis-at-a-time label over a run that moved two production boundaries.
+    const rankPinned = executeCandidateAtSelection(plan, ROOTED_SUBJECTS, true, (key, conditional) =>
+      conditional.get(key === ROOTED_FILTER_DIM ? 75 : 50));
+    expect(rankPinned.result.prevalence).toBe(1);
+    expect(rankPinned.result.matchedCount).toBe(3);
+  });
+
+  it("B2b. sweeping the edge filter does not move the POST_FILTER_MATCHING_SIZE threshold", () => {
+    // The other genuinely dependent path: No.26's matching size is recomputed after its sibling
+    // edge filter, so moving the filter moves the matching-size DISTRIBUTION. The matching-size
+    // decision boundary must not follow it.
+    const richGraph = (): PlanningCalibrationJointEvidence => ({
+      kind: "social-context-graph-v1",
+      dimension: "class",
+      counterparts: [
+        { counterpartOrdinal: 0, touches: [{ semanticIndex: 0, days: [{ dayOffset: 1, trustedSeconds: 100 }] }, { semanticIndex: 1, days: [{ dayOffset: 1, trustedSeconds: 90 }] }] },
+        { counterpartOrdinal: 1, touches: [{ semanticIndex: 1, days: [{ dayOffset: 1, trustedSeconds: 80 }] }, { semanticIndex: 2, days: [{ dayOffset: 1, trustedSeconds: 20 }] }] },
+        { counterpartOrdinal: 2, touches: [{ semanticIndex: 2, days: [{ dayOffset: 1, trustedSeconds: 10 }] }] },
+      ],
+    });
+    const subjects = [
+      subject("alice", [{ probeKey: probeKeyFor(26), jointEvidence: richGraph() }]),
+      subject("bob", [{ probeKey: probeKeyFor(26), jointEvidence: {
+        kind: "social-context-graph-v1", dimension: "class",
+        counterparts: [{ counterpartOrdinal: 0, touches: [{ semanticIndex: 0, days: [{ dayOffset: 1, trustedSeconds: 50 }] }, { semanticIndex: 1, days: [{ dayOffset: 1, trustedSeconds: 3 }] }] }],
+      } }]),
+      subject("carol", [{ probeKey: probeKeyFor(26), jointEvidence: richGraph() }]),
+    ];
+    const evidence = buildF5cDecisionEvidence(collection(subjects), true);
+    const plan = F5C_CANDIDATE_SWEEP_PLANS.find((p) => p.candidateNo === 26)!;
+
+    // baseline: edge boundary 50 -> matching sizes [2, 1, 2] -> matching boundary 2 (alice, carol).
+    expect(sensitivityFor(evidence, 26).representative.candidatePrevalence).toBe(2 / 3);
+    expect(dimensionOf(evidence, 26, "class-person-matching").points.find((p) => p.percentile === 50)!.boundaryValueAtPercentile).toBe(2);
+
+    // sweeping the EDGE filter to p90 = 100 shrinks every graph to matching sizes [1, 0, 1]. The
+    // matching-size threshold stays at the baseline 2, so nobody clears it.
+    const edge = dimensionOf(evidence, 26, "class-edge-trusted-seconds");
+    const atP90 = edge.points.find((p) => p.percentile === 90)!;
+    expect(atP90.boundaryValueAtPercentile).toBe(100);
+    expect(atP90.candidatePrevalence).toBe(0);
+
+    // percentile-RANK pinning instead re-derives the matching threshold from the shrunken [0, 1, 1]
+    // distribution, lands on 1, and reports an unchanged 2/3 — hiding the effect entirely.
+    const rankPinned = executeCandidateAtSelection(plan, subjects, true, (key, conditional) =>
+      conditional.get(key === "class-edge-trusted-seconds" ? 90 : 50));
+    expect(rankPinned.result.prevalence).toBe(2 / 3);
+  });
+
+  it("B3. every OAT curve reproduces the baseline exactly at the representative percentile", () => {
+    // The single strongest drift regression for the F5c2/F5c3 representative SSOT (§2): F5c3 must
+    // consume `F5C2_REPRESENTATIVE_PERCENTILE` rather than restating 50, so that moving F5c2's
+    // representative moves both layers together. If F5c3 held siblings at a hardcoded rank while
+    // F5c2's baseline used a different one, this identity would break for every dependent
+    // candidate at once.
+    expect(F5C2_BOUNDARY_PERCENTILES).toContain(F5C2_REPRESENTATIVE_PERCENTILE);
+    const evidence = buildF5cDecisionEvidence(collection([...ROOTED_SUBJECTS, welcoming("d", 10, 4), welcoming("e", 10, 1)]), true);
+    let checked = 0;
+    for (const candidate of evidence.sensitivity) {
+      for (const dimension of candidate.dimensions) {
+        const atRepresentative = dimension.points.find((p) => p.percentile === F5C2_REPRESENTATIVE_PERCENTILE)!;
+        expect(atRepresentative.knownCount).toBe(candidate.representative.knownCount);
+        expect(atRepresentative.unknownCount).toBe(candidate.representative.unknownCount);
+        expect(atRepresentative.matchedCount).toBe(candidate.representative.matchedCount);
+        expect(atRepresentative.notMatchedCount).toBe(candidate.representative.notMatchedCount);
+        expect(atRepresentative.candidatePrevalence).toBe(candidate.representative.candidatePrevalence);
+        checked += 1;
+      }
+    }
+    expect(checked).toBeGreaterThan(100); // the invariant is checked across the whole READY set
+    expect(evidence.provenance.siblingPinning).toBe(F5C3_SIBLING_PINNING);
   });
 
   // ── C. three-valued propagation ───────────────────────────────────────────────────────────
@@ -208,7 +344,7 @@ describe("F5c3 decision-evidence layer", () => {
     expect(empty.containmentBInA).toBeNull();
   });
 
-  it("E2. overlap pairs come from typed catalog structure (groupKey / seriesKey), not all 76×76 and not title prose", () => {
+  it("E2. overlap pairs come from typed catalog structure (groupKey / seriesKey / stage), not all 76×76 and not title prose", () => {
     const report = buildF5cDecisionEvidence(collection([]), true);
     const readyNos = new Set(F5C_CANDIDATE_SWEEP_PLANS.map((p) => p.candidateNo));
     expect(report.overlap.length).toBeGreaterThan(0);
@@ -216,16 +352,61 @@ describe("F5c3 decision-evidence layer", () => {
     const byNo = new Map(TITLE_V2_CATALOG_CANDIDATES.map((c) => [c.no, c] as const));
     for (const pair of report.overlap) {
       expect(readyNos.has(pair.aCandidateNo) && readyNos.has(pair.bCandidateNo)).toBe(true);
-      expect(pair.aCandidateNo).toBeLessThan(pair.bCandidateNo); // deterministic ordering
       const a = byNo.get(pair.aCandidateNo)!;
       const b = byNo.get(pair.bCandidateNo)!;
       // every emitted pair is justified by a typed catalog relation, never by a name/prose guess.
-      if (pair.relation === "SAME_GROUP") expect(a.groupKey).toBe(b.groupKey);
-      else expect(a.seriesKey).toBe(b.seriesKey);
-      expect(pair.relationKey).toBe(pair.relation === "SAME_GROUP" ? a.groupKey : a.seriesKey);
+      expect(a.groupKey).toBe(b.groupKey);
+      expect(pair.groupKey).toBe(a.groupKey);
+      if (pair.relation === "SERIES_PROGRESSION") {
+        expect(a.seriesKey).toBe(b.seriesKey);
+        expect(pair.seriesKey).toBe(a.seriesKey);
+        expect(pair.relationKey).toBe(a.seriesKey);
+        expect(pair.expectation).toBe("HIGHER_STAGE_WITHIN_LOWER_STAGE");
+        // A is the LOWER stage — the direction the expectation is about — and it comes from the
+        // typed `stage` field, not from candidate numbering.
+        expect(pair.aStage).toBe(a.stage);
+        expect(pair.bStage).toBe(b.stage);
+        expect(pair.aStage!).toBeLessThan(pair.bStage!);
+      } else {
+        expect(pair.relationKey).toBe(a.groupKey);
+        expect(pair.seriesKey).toBeNull();
+        expect(pair.expectation).toBe("NO_STRUCTURAL_EXPECTATION");
+        expect(pair.aCandidateNo).toBeLessThan(pair.bCandidateNo); // deterministic ordering
+        // a group sibling pair is emitted only when no single series already explains it.
+        expect(a.seriesKey === null || a.seriesKey !== b.seriesKey).toBe(true);
+      }
     }
-    // the activity_time facets (No.32-35 dayparts) are exactly the kind of pair worth reviewing.
-    expect(report.overlap.some((p) => p.aCandidateNo === 32 && p.bCandidateNo === 34)).toBe(true);
+    // the activity_time facets (No.32-35 dayparts) share a group but no series: a neutral pair.
+    const dayparts = report.overlap.find((p) => p.aCandidateNo === 32 && p.bCandidateNo === 34)!;
+    expect(dayparts.relation).toBe("GROUP_SIBLING");
+    expect(dayparts.expectation).toBe("NO_STRUCTURAL_EXPECTATION");
+  });
+
+  it("E2b. a pair sharing BOTH groupKey and seriesKey is emitted once, with one coherent reading", () => {
+    // No.10-12 (`vc_duo_style`, stages 1-3) carry the same value in groupKey AND seriesKey — the
+    // case that used to emit each pair twice, once as a "facets that should not overlap" smell and
+    // once as a "containment is expected" progression, attaching two contradictory readings to one
+    // measured number.
+    const report = buildF5cDecisionEvidence(collection([]), true);
+    const byNo = new Map(TITLE_V2_CATALOG_CANDIDATES.map((c) => [c.no, c] as const));
+    expect(byNo.get(10)!.groupKey).toBe(byNo.get(10)!.seriesKey); // the premise really does hold
+    expect(byNo.get(11)!.groupKey).toBe(byNo.get(11)!.seriesKey);
+
+    const staged = report.overlap.filter((p) => p.aCandidateNo === 10 && p.bCandidateNo === 11);
+    expect(staged).toHaveLength(1);
+    expect(staged[0]!.relation).toBe("SERIES_PROGRESSION"); // series wins; no bare group duplicate
+    expect(staged[0]!.groupKey).toBe("vc_duo_style"); // ...and the group fact is still reported
+    expect(staged[0]!.seriesKey).toBe("vc_duo_style");
+    expect(staged[0]!.expectation).toBe("HIGHER_STAGE_WITHIN_LOWER_STAGE");
+
+    // globally: no unordered candidate pair appears more than once, under any relation.
+    const seen = new Set<string>();
+    for (const pair of report.overlap) {
+      const key = `${Math.min(pair.aCandidateNo, pair.bCandidateNo)}-${Math.max(pair.aCandidateNo, pair.bCandidateNo)}`;
+      expect(seen.has(key), `duplicate overlap pair ${key}`).toBe(false);
+      seen.add(key);
+    }
+    expect(seen.size).toBe(report.overlap.length);
   });
 
   it("E3. real candidate outcomes flow into overlap with the both-known denominator intact", () => {
@@ -288,6 +469,7 @@ describe("F5c3 decision-evidence layer", () => {
     expect(p.sweepContractVersion).toBe(F5C_SWEEP_CONTRACT_VERSION);
     expect(p.shadowContractVersion).toBe(F5C2_SHADOW_CONTRACT_VERSION);
     expect(p.evidenceContractVersion).toBe(F5C3_EVIDENCE_CONTRACT_VERSION);
+    expect(p.calibrationSchemaVersion).toBe(c.schemaVersion);
     expect(p.catalogHash).toBe(c.catalogHash);
     expect(p.readinessHash).toBe(c.readinessHash);
     expect(p.catalogCandidateCount).toBe(c.catalogCandidateCount);
@@ -295,17 +477,47 @@ describe("F5c3 decision-evidence layer", () => {
     expect(p.cohortSubjectCount).toBe(c.cohort.subjectCount);
     expect(p.window).toEqual(c.window);
     expect(p.coverageWindowValidated).toBe(false);
+    // reported from the VALIDATED collection, not by substituting today's constant for it.
+    expect(p.percentileMethod).toBe(c.percentileMethod);
     expect(p.percentileMethod).toBe(CALIBRATION_PERCENTILE_METHOD);
     expect(p.percentileGrid).toEqual([...F5C2_BOUNDARY_PERCENTILES]);
     expect(p.candidateSensitivityModel).toBe(F5C3_SENSITIVITY_MODEL);
+    expect(p.siblingPinning).toBe(F5C3_SIBLING_PINNING);
   });
 
-  it("G2. catalog/readiness provenance drift fails closed rather than producing evidence for a different catalog", () => {
-    const subjects = [welcoming("a", 10, 4)];
+  it("G2. every collection incompatibility fails closed rather than producing evidence the provenance misdescribes", () => {
+    const subjects = [welcoming("a", 10, 4), welcoming("b", 10, 1)];
+    const ok = collection(subjects);
+    expect(() => buildF5cDecisionEvidence(ok, true)).not.toThrow(); // the control
+
     expect(() => buildF5cDecisionEvidence(collection(subjects, { catalogHash: "stale-catalog-hash" }), true))
       .toThrow(/catalogHash/);
     expect(() => buildF5cDecisionEvidence(collection(subjects, { readinessHash: "stale-readiness-hash" }), true))
       .toThrow(/readinessHash/);
+    // a stale schema/percentile method must not be quietly overwritten by the live constant in the
+    // provenance — the whole point of pinning it is that it describes THIS collection.
+    expect(() => buildF5cDecisionEvidence(collection(subjects, { schemaVersion: (CALIBRATION_SCHEMA_VERSION + 1) as never }), true))
+      .toThrow(/schemaVersion/);
+    expect(() => buildF5cDecisionEvidence(collection(subjects, { percentileMethod: "linear-interpolation" as never }), true))
+      .toThrow(/percentileMethod/);
+    expect(() => buildF5cDecisionEvidence(collection(subjects, { catalogCandidateCount: TITLE_V2_CATALOG_CANDIDATES.length - 1 }), true))
+      .toThrow(/catalogCandidateCount/);
+    // the displayed cohort size must match the population the numbers were computed over.
+    expect(() => buildF5cDecisionEvidence(collection(subjects, { cohort: { key: "k", subjectCount: 99 } }), true))
+      .toThrow(/subjectCount/);
+  });
+
+  it("G2b. a duplicated subject is refused — it reweights every percentile boundary while the cohort count still looks right", () => {
+    const duplicated = [welcoming("RESTRICTED_DUP_ID", 10, 4), welcoming("RESTRICTED_DUP_ID", 10, 4), welcoming("b", 10, 1)];
+    // cohort.subjectCount agrees with subjects.length here, so only the identity check catches it.
+    expect(() => buildF5cDecisionEvidence(collection(duplicated), true)).toThrow(/duplicate subject/);
+    // ...and the refusal never names the subject: an error message reaches logs and terminals.
+    try {
+      buildF5cDecisionEvidence(collection(duplicated), true);
+      expect.unreachable("expected a refusal");
+    } catch (error) {
+      expect(String(error)).not.toContain("RESTRICTED_DUP_ID");
+    }
   });
 
   it("G3. the report fingerprint is deterministic and changes when any pinned input changes", () => {
@@ -426,25 +638,69 @@ describe("F5c3 decision-evidence layer", () => {
   // ── operator path ─────────────────────────────────────────────────────────────────────────
   it("operator script: arguments are explicit and validated — no defaulted cohort, window, or attestation", () => {
     const base = [
-      "--db=/snap.sqlite", "--cohort-key=k", "--subject-ids=a,b",
+      "--db=/snap.sqlite", "--cohort-key=k", "--subject-ids-file=/cohort.txt",
       "--window-start=100", "--window-end=200", "--observed-at=200",
     ];
     const parsed = parseArgs(base);
     expect(parsed.db).toBe("/snap.sqlite");
     expect(parsed.cohortKey).toBe("k");
-    expect(parsed.subjectUserIds).toEqual(["a", "b"]);
+    expect(parsed.subjectIdsFile).toBe("/cohort.txt");
     expect(parsed.window).toEqual({ start: 100, end: 200, observedAt: 200 });
     // the attestation is opt-in: omitting the flag can never accidentally claim coverage.
     expect(parsed.coverageWindowValidated).toBe(false);
     expect(parseArgs([...base, "--coverage-window-validated"]).coverageWindowValidated).toBe(true);
 
-    for (const missing of ["--db=", "--cohort-key=", "--subject-ids=", "--window-start=", "--window-end=", "--observed-at="]) {
+    for (const missing of ["--db=", "--cohort-key=", "--subject-ids-file=", "--window-start=", "--window-end=", "--observed-at="]) {
       const key = missing.slice(0, -1);
       expect(() => parseArgs(base.filter((a) => !a.startsWith(`${key}=`)))).toThrow();
     }
     expect(() => parseArgs([...base.filter((a) => !a.startsWith("--window-start=")), "--window-start=not-a-number"])).toThrow(/integer/);
-    expect(() => parseArgs([...base.filter((a) => !a.startsWith("--subject-ids=")), "--subject-ids=a,a"])).toThrow(/duplicate/);
     expect(() => parseArgs([...base, "--unknown-flag=1"])).toThrow(/unrecognized/);
+  });
+
+  it("operator CLI contract: restricted subject identities never enter argv", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const os = require("node:os") as typeof import("node:os");
+    const path = require("node:path") as typeof import("node:path");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "f5c3-cohort-"));
+    const cohortFile = path.join(dir, "cohort.txt");
+
+    // The whole point: the parsed argument surface carries a PATH, never an identity. Command-line
+    // arguments survive in shell history and are readable through process inspection and command
+    // auditing, so a clean JSON artifact is not on its own enough to keep a cohort private.
+    fs.writeFileSync(cohortFile, "RESTRICTED_ID_1\nRESTRICTED_ID_2\n", "utf8");
+    const parsed = parseArgs([
+      "--db=/snap.sqlite", "--cohort-key=k", `--subject-ids-file=${cohortFile}`,
+      "--window-start=100", "--window-end=200", "--observed-at=200",
+    ]);
+    expect(JSON.stringify(parsed)).not.toContain("RESTRICTED_ID_1");
+    expect(readSubjectUserIds(cohortFile)).toEqual(["RESTRICTED_ID_1", "RESTRICTED_ID_2"]);
+
+    // the old inline form must fail LOUDLY, explaining why — never be silently accepted.
+    expect(() => parseArgs([
+      "--db=/snap.sqlite", "--cohort-key=k", "--subject-ids=RESTRICTED_ID_1,RESTRICTED_ID_2",
+      "--window-start=100", "--window-end=200", "--observed-at=200",
+    ])).toThrow(/--subject-ids is not accepted/);
+
+    // cohort input itself fails closed on the ways an operator can quietly change the population.
+    fs.writeFileSync(cohortFile, "\n  \n", "utf8");
+    expect(() => readSubjectUserIds(cohortFile)).toThrow(/empty/);
+    fs.writeFileSync(cohortFile, "RESTRICTED_ID_1\nRESTRICTED_ID_1\n", "utf8");
+    expect(() => readSubjectUserIds(cohortFile)).toThrow(/duplicate/);
+    fs.writeFileSync(cohortFile, "RESTRICTED_ID_1,RESTRICTED_ID_2\n", "utf8");
+    expect(() => readSubjectUserIds(cohortFile)).toThrow(/comma/); // pasted inline list
+    // blank lines and stray whitespace are tolerated; nothing else is invented.
+    fs.writeFileSync(cohortFile, "\n  RESTRICTED_ID_1  \n\nRESTRICTED_ID_2\n\n", "utf8");
+    expect(readSubjectUserIds(cohortFile)).toEqual(["RESTRICTED_ID_1", "RESTRICTED_ID_2"]);
+
+    // and the script never echoes the cohort back out: the only stdout it writes is the artifact
+    // (asserted subject-id-free) or a fingerprint/count summary.
+    const script = fs.readFileSync(new URL("../scripts/f5c3-decision-evidence.ts", import.meta.url), "utf8") as string;
+    expect(script).not.toContain("subject-ids=");
+    expect(script.includes("process.stdout.write(serialized)")).toBe(true);
+    for (const line of script.split("\n").filter((l) => l.includes("stdout.write") || l.includes("console."))) {
+      expect(line).not.toContain("subjectUserIds");
+    }
   });
 
   it("operator script: opens the snapshot read-only at the driver level and refuses a missing file", () => {

@@ -8,6 +8,7 @@ import {
 } from "./v2-calibration-sweep.js";
 import {
   CALIBRATION_PERCENTILE_METHOD,
+  CALIBRATION_SCHEMA_VERSION,
   canonicalReadinessHash,
   collectF5cCalibrationMeasurements,
   type F5aCalibrationInput,
@@ -20,11 +21,14 @@ import {
   executeCandidateAtSelection,
   manifestDimensionKey,
   F5C2_BOUNDARY_PERCENTILES,
+  F5C2_REPRESENTATIVE_PERCENTILE,
   F5C2_SENSITIVITY_MODEL,
   F5C2_SHADOW_CONTRACT_VERSION,
   type F5cBoundaryPercentile,
   type F5cBoundaryReliability,
+  type F5cCandidateExecution,
   type F5cCandidateShadowResult,
+  type F5cDecisionBoundarySelection,
   type F5cShadowOutcome,
 } from "./v2-shadow-evaluation.js";
 
@@ -44,7 +48,7 @@ import {
  * evaluator (`executeCandidateAtSelection`), so a candidate cannot mean one thing in F5c2's
  * representative execution and another in F5c3's sensitivity or overlap analysis.
  */
-export const F5C3_EVIDENCE_CONTRACT_VERSION = 1 as const;
+export const F5C3_EVIDENCE_CONTRACT_VERSION = 2 as const;
 
 /**
  * F5c2's `boundaryPoints` are **marginal axis pass rates** (that one axis's own distribution).
@@ -57,17 +61,37 @@ export const F5C3_SENSITIVITY_MODEL = "CANDIDATE_LEVEL_ONE_AXIS_AT_A_TIME" as co
 /** The marginal model F5c2 reports, echoed so a reader sees both models named side by side. */
 export const F5C3_MARGINAL_MODEL_REFERENCE = F5C2_SENSITIVITY_MODEL;
 
+/**
+ * What "one axis at a time" holds fixed (PR #192レビュー第1ラウンド§1). Declared on the report so
+ * an F6 reviewer never has to guess which of the two possible readings a curve answers.
+ *
+ * `BASELINE_NUMERIC_BOUNDARY`: while one dimension is swept, every sibling dimension keeps the
+ * NUMERIC decision boundary it held in the representative execution. Pinning percentile RANKS
+ * instead would not be one-axis-at-a-time on this pipeline: a downstream reduction's grid is
+ * derived from whatever survives its upstream filters, so `[1, 2, 3]` (p50 = 2) can become
+ * `[0, 0, 3]` (p50 = 0) merely because the swept filter moved — two production boundaries moving
+ * in a curve labelled as one. The real dependency is preserved: a filter change still changes each
+ * subject's reduced VALUE; only the sibling's decision BOUNDARY is held still.
+ */
+export const F5C3_SIBLING_PINNING = "BASELINE_NUMERIC_BOUNDARY" as const;
+
 // ─────────────────────────────────────────────────────────────
 // candidate-level one-axis-at-a-time (OAT) sensitivity
 // ─────────────────────────────────────────────────────────────
 
 /**
  * One point of a candidate-level OAT curve: the FINAL candidate outcome distribution with this
- * dimension held at `percentile` and every sibling dimension held at its representative boundary.
+ * dimension's numeric boundary substituted for its baseline value at `percentile`, and every
+ * sibling dimension pinned to its BASELINE NUMERIC boundary (see `F5C3_SIBLING_PINNING`).
  */
 export interface F5cCandidateOatPoint {
   readonly percentile: F5cBoundaryPercentile;
-  /** the dimension's own boundary value at this percentile; null when the population had no samples. */
+  /**
+   * The NUMERIC decision boundary substituted for this dimension at this point — its baseline
+   * grid value at `percentile`. This is the candidate production threshold the point answers for;
+   * null when the baseline population had no samples for this dimension (fail-closed: every
+   * consuming path then treats the dimension as having no usable boundary).
+   */
   readonly boundaryValueAtPercentile: number | null;
   readonly knownCount: number;
   readonly unknownCount: number;
@@ -123,9 +147,31 @@ export interface F5cCandidateSensitivity {
 
 /**
  * Why this pair was selected for comparison. Both come from typed catalog structure
- * (`groupKey` / `seriesKey`) — never from title names or prose (task #192 §3).
+ * (`groupKey` / `seriesKey` / `stage`) — never from title names or prose (task #192 §3).
+ *
+ * Each unordered candidate pair is emitted EXACTLY ONCE (PR #192レビュー第1ラウンド§3). The
+ * catalog's staged ladders share a `groupKey` AND a `seriesKey` (e.g. No.1-4 are both `vc_ignite`),
+ * so emitting one bucket per key attached two different normative readings to the same measured
+ * overlap. `SERIES_PROGRESSION` therefore takes precedence, and `GROUP_SIBLING` covers only the
+ * pairs no single series already explains.
  */
-export type F5cOverlapRelation = "SAME_GROUP" | "SAME_SERIES";
+export type F5cOverlapRelation = "SERIES_PROGRESSION" | "GROUP_SIBLING";
+
+/**
+ * What catalog structure predicts about this pair's overlap — the reviewer-facing normative half,
+ * kept separate from the measured half so a number never carries an unstated verdict.
+ *
+ * - `HIGHER_STAGE_WITHIN_LOWER_STAGE`: a series is a cumulative ladder (docs/titles-v2-design.md
+ *   §「Progression (`{ seriesKey, stage }`)」), so the higher-stage candidate's matched set is
+ *   expected to sit INSIDE the lower-stage one. `A` is always the lower stage here, so the
+ *   prediction is about `containmentBInA`, and a value well below 1 means the staging is not
+ *   actually nested. Stage ordering comes from the typed `stage` field, never from candidate
+ *   numbering or title prose.
+ * - `NO_STRUCTURAL_EXPECTATION`: group siblings that are not stages of one series. High overlap
+ *   here is worth a reviewer's attention, but the catalog does not itself say the two must be
+ *   disjoint — F5c3 reports the measurement and makes no design claim.
+ */
+export type F5cOverlapExpectation = "HIGHER_STAGE_WITHIN_LOWER_STAGE" | "NO_STRUCTURAL_EXPECTATION";
 
 /**
  * All counts are over the **both-known denominator**: subjects whose FINAL outcome is known
@@ -134,11 +180,20 @@ export type F5cOverlapRelation = "SAME_GROUP" | "SAME_SERIES";
  */
 export interface F5cOverlapPair {
   readonly relation: F5cOverlapRelation;
+  /** the shared `seriesKey` for SERIES_PROGRESSION, the shared `groupKey` for GROUP_SIBLING. */
   readonly relationKey: string;
+  /** the shared group, reported for both relations so precedence never hides the group fact. */
+  readonly groupKey: string;
+  /** the shared series — null exactly when the two candidates are not stages of one series. */
+  readonly seriesKey: string | null;
+  readonly expectation: F5cOverlapExpectation;
+  /** for SERIES_PROGRESSION, A is the LOWER stage; otherwise ordered by candidate number. */
   readonly aCandidateNo: number;
   readonly bCandidateNo: number;
   readonly aProvisionalKey: string;
   readonly bProvisionalKey: string;
+  readonly aStage: number | null;
+  readonly bStage: number | null;
   readonly populationCount: number;
   /** the denominator every count/ratio below is computed over. */
   readonly bothKnownCount: number;
@@ -197,14 +252,22 @@ export interface F5cCandidateEvidenceReadiness {
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Enough context for an F6 reviewer to pin exactly which evidence run produced a number. Every
- * field is consumed from the deterministic collection or the live contracts — none is re-stated as
- * a literal here (task #192 §4).
+ * Enough context for an F6 reviewer to pin exactly which evidence run produced a number.
+ *
+ * Every field is consumed from the deterministic collection or the live contracts — none is
+ * re-stated as a literal here (task #192 §4) — and every collection-sourced field is reported as
+ * the VALIDATED COLLECTION's own value rather than being replaced by the current constant
+ * (PR #192レビュー第1ラウンド§4). Substituting a live constant for a collection field is what would
+ * let a stale collection be accepted while the report claims today's percentile method;
+ * `assertCompatibleCollection` refuses the mismatch first, so these two are equal by construction —
+ * but they are reported from the collection so the claim is the checked one.
  */
 export interface F5cEvidenceProvenance {
   readonly sweepContractVersion: number;
   readonly shadowContractVersion: number;
   readonly evidenceContractVersion: typeof F5C3_EVIDENCE_CONTRACT_VERSION;
+  /** the collection's OWN schema version, after it was validated against the live contract. */
+  readonly calibrationSchemaVersion: number;
   readonly catalogHash: string;
   readonly readinessHash: string;
   readonly catalogCandidateCount: number;
@@ -216,6 +279,7 @@ export interface F5cEvidenceProvenance {
   readonly percentileMethod: string;
   readonly percentileGrid: readonly F5cBoundaryPercentile[];
   readonly candidateSensitivityModel: typeof F5C3_SENSITIVITY_MODEL;
+  readonly siblingPinning: typeof F5C3_SIBLING_PINNING;
   readonly marginalAxisModel: typeof F5C3_MARGINAL_MODEL_REFERENCE;
 }
 
@@ -283,8 +347,10 @@ function candidateSensitivityFor(
   plan: F5cCandidateSweepPlan,
   subjects: readonly PlanningCalibrationSubjectMeasurement[],
   coverageWindowValidated: boolean,
-  representative: F5cCandidateShadowResult,
+  baseline: F5cCandidateExecution,
 ): F5cCandidateSensitivity {
+  const representative = baseline.result;
+  const baselineGrids = baseline.boundaryGrids;
   const base = {
     candidateNo: plan.candidateNo,
     provisionalKey: plan.provisionalKey,
@@ -304,17 +370,33 @@ function candidateSensitivityFor(
   }
 
   const dimensions: F5cDimensionSensitivity[] = dims.map((dim) => {
+    const baselineGrid = baselineGrids.get(dim.key);
     const points: F5cCandidateOatPoint[] = F5C2_BOUNDARY_PERCENTILES.map((percentile) => {
-      // ONE dimension moves; every sibling stays representative. This is deliberately not a
-      // Cartesian product — cost is |dimensions| × |grid| candidate evaluations, not |grid|^n.
-      const { result } = executeCandidateAtSelection(plan, subjects, coverageWindowValidated, (key) =>
-        key === dim.key ? percentile : 50,
-      );
-      const sweep = result.axisSweeps.find((s) => s.axisKey === dim.key);
-      const point = sweep?.boundaryPoints.find((p) => p.percentile === percentile);
+      /**
+       * ONE production decision boundary moves; every sibling keeps the NUMERIC boundary the
+       * baseline execution decided against (`F5C3_SIBLING_PINNING`). The dependency itself is
+       * untouched — moving an upstream filter still changes each subject's reduced value, and the
+       * downstream comparison still happens — but the sibling's THRESHOLD no longer drifts with
+       * the conditional distribution, which is what makes this answer the F6 question ("move one
+       * boundary, hold the others") instead of silently moving two.
+       *
+       * Deliberately not a Cartesian product: cost is |dimensions| × |grid| candidate
+       * evaluations, not |grid|^n.
+       */
+      const selectBoundary: F5cDecisionBoundarySelection = (key, conditionalBoundaries) => {
+        // `conditionalBoundaries` is only ever reached if the baseline execution did not consume a
+        // boundary for this dimension at all — structurally impossible here, since the OAT run
+        // walks the same plan through the same evaluator, but falling back to F5c2's own
+        // conditional behaviour keeps an unforeseen path honest rather than silently unbounded.
+        const grid = baselineGrids.get(key) ?? conditionalBoundaries;
+        return grid.get(key === dim.key ? percentile : F5C2_REPRESENTATIVE_PERCENTILE);
+      };
+      const { result } = executeCandidateAtSelection(plan, subjects, coverageWindowValidated, selectBoundary);
       return {
         percentile,
-        boundaryValueAtPercentile: sweep === undefined || point === undefined || point.knownCount === 0 ? null : point.boundaryValue,
+        // the boundary actually substituted — the baseline grid value, not a value re-derived
+        // from the conditional distribution this point produced.
+        boundaryValueAtPercentile: baselineGrid?.get(percentile) ?? null,
         knownCount: result.knownCount,
         unknownCount: result.unknownCount,
         matchedCount: result.matchedCount,
@@ -336,41 +418,96 @@ function candidateSensitivityFor(
   return { ...base, dimensions, nonSweepableReason: null };
 }
 
+interface F5cPairSelection {
+  readonly relation: F5cOverlapRelation;
+  readonly relationKey: string;
+  readonly groupKey: string;
+  readonly seriesKey: string | null;
+  readonly expectation: F5cOverlapExpectation;
+  readonly a: F5cCandidateSweepPlan;
+  readonly b: F5cCandidateSweepPlan;
+  readonly aStage: number | null;
+  readonly bStage: number | null;
+}
+
 /**
- * Pair selection (task #192 §3): typed catalog structure only.
+ * Pair selection (task #192 §3, reworked in PR #192レビュー第1ラウンド§3): typed catalog structure
+ * only — `groupKey`, `seriesKey`, `stage`. Never title names or prose.
  *
- * - `SAME_GROUP` — candidates sharing a `groupKey` are, by catalog design, different facets of one
- *   concept. Suspiciously high overlap there is exactly the title-design smell worth surfacing.
- * - `SAME_SERIES` — candidates sharing a `seriesKey` are a staged progression, where containment
- *   is *expected*; measuring it validates that the staging is actually nested.
+ * Each unordered pair is emitted exactly once, with exactly one normative reading:
+ *
+ * - `SERIES_PROGRESSION` (shared `seriesKey` + both stages typed) — a cumulative ladder, so the
+ *   higher stage is expected to be contained in the lower one. A is the LOWER stage, so the
+ *   prediction is about `containmentBInA`.
+ * - `GROUP_SIBLING` (shared `groupKey`, not explained by one series) — reported neutrally. The
+ *   catalog does not claim group siblings must be disjoint, so F5c3 does not either.
+ *
+ * Series takes precedence because the catalog's ladders share BOTH keys (No.1-4 are `vc_ignite`
+ * for group and series alike): bucketing per key would emit the same pair twice and attach two
+ * different, contradictory interpretations to one measured overlap.
  *
  * Deliberately NOT all 76×76: an all-pairs dump would be thousands of mostly-meaningless numbers
  * with no review value, and choosing pairs any other way would require title-name/prose guesswork.
  */
-function overlapPairsToAnalyze(
-  plans: readonly F5cCandidateSweepPlan[],
-): readonly { readonly relation: F5cOverlapRelation; readonly relationKey: string; readonly a: F5cCandidateSweepPlan; readonly b: F5cCandidateSweepPlan }[] {
+function overlapPairsToAnalyze(plans: readonly F5cCandidateSweepPlan[]): readonly F5cPairSelection[] {
   const byNo = new Map(TITLE_V2_CATALOG_CANDIDATES.map((c) => [c.no, c] as const));
-  const pairs: { relation: F5cOverlapRelation; relationKey: string; a: F5cCandidateSweepPlan; b: F5cCandidateSweepPlan }[] = [];
-  const emit = (relation: F5cOverlapRelation, keyOf: (no: number) => string | null) => {
+  const groupKeyOf = (plan: F5cCandidateSweepPlan): string => byNo.get(plan.candidateNo)?.groupKey ?? "";
+  const stageOf = (plan: F5cCandidateSweepPlan): number | null => byNo.get(plan.candidateNo)?.stage ?? null;
+  const bucket = (keyOf: (plan: F5cCandidateSweepPlan) => string | null): readonly (readonly [string, readonly F5cCandidateSweepPlan[]])[] => {
     const buckets = new Map<string, F5cCandidateSweepPlan[]>();
     for (const plan of plans) {
-      const key = keyOf(plan.candidateNo);
-      if (key === null) continue;
+      const key = keyOf(plan);
+      if (key === null || key === "") continue;
       const list = buckets.get(key) ?? [];
       list.push(plan);
       buckets.set(key, list);
     }
-    for (const [relationKey, members] of [...buckets.entries()].sort(([x], [y]) => x.localeCompare(y))) {
-      const ordered = [...members].sort((x, y) => x.candidateNo - y.candidateNo);
-      for (let i = 0; i < ordered.length; i += 1) {
-        for (let j = i + 1; j < ordered.length; j += 1) pairs.push({ relation, relationKey, a: ordered[i]!, b: ordered[j]! });
+    return [...buckets.entries()].sort(([x], [y]) => x.localeCompare(y));
+  };
+  const unordered = (x: number, y: number): string => `${Math.min(x, y)}-${Math.max(x, y)}`;
+
+  const pairs: F5cPairSelection[] = [];
+  const claimedBySeries = new Set<string>();
+
+  for (const [seriesKey, members] of bucket((plan) => byNo.get(plan.candidateNo)?.seriesKey ?? null)) {
+    // typed stage ordering — never candidate numbering, which is editorial.
+    const ordered = [...members].sort((x, y) => (stageOf(x) ?? 0) - (stageOf(y) ?? 0) || x.candidateNo - y.candidateNo);
+    for (let i = 0; i < ordered.length; i += 1) {
+      for (let j = i + 1; j < ordered.length; j += 1) {
+        const a = ordered[i]!;
+        const b = ordered[j]!;
+        const aStage = stageOf(a);
+        const bStage = stageOf(b);
+        // A series member with no typed stage cannot support a containment DIRECTION, so it does
+        // not get one: it falls through to the neutral group-sibling reading below.
+        if (aStage === null || bStage === null) continue;
+        claimedBySeries.add(unordered(a.candidateNo, b.candidateNo));
+        pairs.push({
+          relation: "SERIES_PROGRESSION", relationKey: seriesKey, groupKey: groupKeyOf(a), seriesKey,
+          expectation: "HIGHER_STAGE_WITHIN_LOWER_STAGE", a, b, aStage, bStage,
+        });
       }
     }
-  };
-  emit("SAME_GROUP", (no) => byNo.get(no)?.groupKey ?? null);
-  emit("SAME_SERIES", (no) => byNo.get(no)?.seriesKey ?? null);
-  return pairs;
+  }
+
+  for (const [groupKey, members] of bucket(groupKeyOf)) {
+    const ordered = [...members].sort((x, y) => x.candidateNo - y.candidateNo);
+    for (let i = 0; i < ordered.length; i += 1) {
+      for (let j = i + 1; j < ordered.length; j += 1) {
+        const a = ordered[i]!;
+        const b = ordered[j]!;
+        if (claimedBySeries.has(unordered(a.candidateNo, b.candidateNo))) continue;
+        pairs.push({
+          relation: "GROUP_SIBLING", relationKey: groupKey, groupKey, seriesKey: null,
+          expectation: "NO_STRUCTURAL_EXPECTATION", a, b, aStage: stageOf(a), bStage: stageOf(b),
+        });
+      }
+    }
+  }
+
+  return pairs.sort((x, y) =>
+    Math.min(x.a.candidateNo, x.b.candidateNo) - Math.min(y.a.candidateNo, y.b.candidateNo)
+    || Math.max(x.a.candidateNo, x.b.candidateNo) - Math.max(y.a.candidateNo, y.b.candidateNo));
 }
 
 /**
@@ -382,7 +519,8 @@ function overlapPairsToAnalyze(
  */
 export type F5cOverlapMeasures = Omit<
   F5cOverlapPair,
-  "relation" | "relationKey" | "aCandidateNo" | "bCandidateNo" | "aProvisionalKey" | "bProvisionalKey"
+  | "relation" | "relationKey" | "groupKey" | "seriesKey" | "expectation"
+  | "aCandidateNo" | "bCandidateNo" | "aProvisionalKey" | "bProvisionalKey" | "aStage" | "bStage"
 >;
 
 export function f5cOverlapMeasures(
@@ -416,13 +554,11 @@ export function f5cOverlapMeasures(
 }
 
 function overlapFor(
-  relation: F5cOverlapRelation,
-  relationKey: string,
-  a: F5cCandidateSweepPlan,
-  b: F5cCandidateSweepPlan,
+  selection: F5cPairSelection,
   outcomes: ReadonlyMap<number, ReadonlyMap<string, F5cShadowOutcome>>,
   subjects: readonly PlanningCalibrationSubjectMeasurement[],
 ): F5cOverlapPair {
+  const { a, b } = selection;
   const aOut = outcomes.get(a.candidateNo);
   const bOut = outcomes.get(b.candidateNo);
   const pairs = subjects.map((s) => [
@@ -430,9 +566,14 @@ function overlapFor(
     bOut?.get(s.subjectUserId) ?? "UNKNOWN",
   ] as const);
   return {
-    relation, relationKey,
+    relation: selection.relation,
+    relationKey: selection.relationKey,
+    groupKey: selection.groupKey,
+    seriesKey: selection.seriesKey,
+    expectation: selection.expectation,
     aCandidateNo: a.candidateNo, bCandidateNo: b.candidateNo,
     aProvisionalKey: a.provisionalKey, bProvisionalKey: b.provisionalKey,
+    aStage: selection.aStage, bStage: selection.bStage,
     ...f5cOverlapMeasures(pairs),
   };
 }
@@ -478,41 +619,75 @@ function evidenceReadinessFor(
 }
 
 /**
+ * Every compatibility check a collection must pass before F5c3 will compute evidence from it, and
+ * before its metadata may be reported as this run's provenance (PR #192レビュー第1ラウンド§4).
+ *
+ * All of it fails closed. Validating only the catalog/readiness hashes was not enough: the report
+ * pins a percentile method, a schema version and a cohort size, and an unchecked collection could
+ * have been accepted while the report claimed the CURRENT constants for values the collection was
+ * never measured under. A hash mismatch is a loud, honest stop; a silently substituted constant is
+ * an F6 reviewer trusting a number that describes a different run.
+ *
+ * `cohort.subjectCount` vs `subjects.length` and the duplicate-ID check both protect the
+ * statistical population itself: a duplicated subject silently doubles one person's weight in
+ * every percentile boundary while the displayed cohort count still looks right.
+ *
+ * Errors deliberately never name a subject — see the privacy boundary on the module doc.
+ */
+function assertCompatibleCollection(collection: PlanningCalibrationMeasurementCollection): void {
+  const refuse = (what: string, got: unknown, expected: unknown): never => {
+    throw new Error(`F5c3 evidence refused: collection ${what} ${String(got)} != live ${String(expected)}`);
+  };
+  if (collection.schemaVersion !== CALIBRATION_SCHEMA_VERSION) refuse("schemaVersion", collection.schemaVersion, CALIBRATION_SCHEMA_VERSION);
+  if (collection.percentileMethod !== CALIBRATION_PERCENTILE_METHOD) refuse("percentileMethod", collection.percentileMethod, CALIBRATION_PERCENTILE_METHOD);
+  const liveCatalogHash = canonicalCatalogHash(TITLE_V2_CATALOG_CANDIDATES);
+  const liveReadinessHash = canonicalReadinessHash(TITLE_V2_CATALOG_READINESS);
+  if (collection.catalogHash !== liveCatalogHash) refuse("catalogHash", collection.catalogHash, liveCatalogHash);
+  if (collection.readinessHash !== liveReadinessHash) refuse("readinessHash", collection.readinessHash, liveReadinessHash);
+  if (collection.catalogCandidateCount !== TITLE_V2_CATALOG_CANDIDATES.length) {
+    refuse("catalogCandidateCount", collection.catalogCandidateCount, TITLE_V2_CATALOG_CANDIDATES.length);
+  }
+  if (collection.cohort.subjectCount !== collection.subjects.length) {
+    throw new Error(`F5c3 evidence refused: collection cohort.subjectCount ${collection.cohort.subjectCount} != subjects.length ${collection.subjects.length}`);
+  }
+  const distinct = new Set(collection.subjects.map((s) => s.subjectUserId)).size;
+  if (distinct !== collection.subjects.length) {
+    // count only — naming the duplicated id here would put a restricted identity in an error
+    // message, a log line, and an operator's terminal.
+    throw new Error(`F5c3 evidence refused: collection contains ${collection.subjects.length - distinct} duplicate subject measurement(s)`);
+  }
+}
+
+/**
  * Builds the aggregate F5c3 decision-evidence artifact from an already-collected planning
  * measurement collection. Restricted subject IDs are used transiently in memory only — the
  * returned report is aggregate-only and deep-frozen.
  *
- * Fails closed when the collection's catalog/readiness provenance no longer matches the live
- * contracts: an F6 reviewer must never be handed evidence computed against a different catalog
- * than the one they are reviewing.
+ * Fails closed on ANY collection incompatibility (see `assertCompatibleCollection`): an F6
+ * reviewer must never be handed evidence computed against a different catalog, schema, percentile
+ * method, or population than the one the report claims.
  */
 export function buildF5cDecisionEvidence(
   collection: PlanningCalibrationMeasurementCollection,
   coverageWindowValidated: boolean,
 ): F5cDecisionEvidenceReport {
-  const liveCatalogHash = canonicalCatalogHash(TITLE_V2_CATALOG_CANDIDATES);
-  const liveReadinessHash = canonicalReadinessHash(TITLE_V2_CATALOG_READINESS);
-  if (collection.catalogHash !== liveCatalogHash) {
-    throw new Error(`F5c3 evidence refused: collection catalogHash ${collection.catalogHash} != live ${liveCatalogHash}`);
-  }
-  if (collection.readinessHash !== liveReadinessHash) {
-    throw new Error(`F5c3 evidence refused: collection readinessHash ${collection.readinessHash} != live ${liveReadinessHash}`);
-  }
+  assertCompatibleCollection(collection);
 
   const subjects = collection.subjects;
   const sensitivity: F5cCandidateSensitivity[] = [];
   const outcomesByCandidate = new Map<number, ReadonlyMap<string, F5cShadowOutcome>>();
 
   for (const plan of F5C_CANDIDATE_SWEEP_PLANS) {
-    // one representative execution per candidate; its per-subject outcomes feed overlap and are
-    // then dropped. The expensive source data was already read once, when `collection` was built.
+    // ONE representative execution per candidate, and it is the baseline every OAT point pins its
+    // sibling boundaries to. Its per-subject outcomes feed overlap and are then dropped; the
+    // expensive source data was already read once, when `collection` was built.
     const execution = executeCandidateAtSelection(plan, subjects, coverageWindowValidated);
     outcomesByCandidate.set(plan.candidateNo, execution.outcomeBySubject);
-    sensitivity.push(candidateSensitivityFor(plan, subjects, coverageWindowValidated, execution.result));
+    sensitivity.push(candidateSensitivityFor(plan, subjects, coverageWindowValidated, execution));
   }
 
   const overlap = overlapPairsToAnalyze(F5C_CANDIDATE_SWEEP_PLANS)
-    .map(({ relation, relationKey, a, b }) => overlapFor(relation, relationKey, a, b, outcomesByCandidate, subjects));
+    .map((selection) => overlapFor(selection, outcomesByCandidate, subjects));
 
   const evidenceReadiness = sensitivity.map((s) => evidenceReadinessFor(s, coverageWindowValidated));
 
@@ -520,6 +695,7 @@ export function buildF5cDecisionEvidence(
     sweepContractVersion: F5C_SWEEP_CONTRACT_VERSION,
     shadowContractVersion: F5C2_SHADOW_CONTRACT_VERSION,
     evidenceContractVersion: F5C3_EVIDENCE_CONTRACT_VERSION,
+    calibrationSchemaVersion: collection.schemaVersion,
     catalogHash: collection.catalogHash,
     readinessHash: collection.readinessHash,
     catalogCandidateCount: collection.catalogCandidateCount,
@@ -527,9 +703,11 @@ export function buildF5cDecisionEvidence(
     cohortSubjectCount: collection.cohort.subjectCount,
     window: collection.window,
     coverageWindowValidated,
-    percentileMethod: CALIBRATION_PERCENTILE_METHOD,
+    // the VALIDATED collection's own method, not today's constant standing in for it.
+    percentileMethod: collection.percentileMethod,
     percentileGrid: F5C2_BOUNDARY_PERCENTILES,
     candidateSensitivityModel: F5C3_SENSITIVITY_MODEL,
+    siblingPinning: F5C3_SIBLING_PINNING,
     marginalAxisModel: F5C3_MARGINAL_MODEL_REFERENCE,
   };
 

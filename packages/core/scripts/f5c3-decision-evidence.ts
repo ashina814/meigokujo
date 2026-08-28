@@ -11,6 +11,9 @@
  *   - the database is opened **read-only at the driver level** (`readonly: true`), so the run
  *     physically cannot write, migrate, or create anything — pass a snapshot copy, not live prod
  *   - the cohort, window and coverage attestation are all explicit arguments; nothing is defaulted
+ *   - **restricted subject identities never enter argv** — the cohort is supplied as a file (or on
+ *     stdin), so no identity reaches shell history, `ps`/process inspection, or command auditing;
+ *     the ids stay transient in memory and are never echoed or logged
  *   - output is deterministic aggregate JSON; no subject id, raw evidence, or source payload is
  *     ever emitted (the artifact is asserted subject-id-free before being written/printed)
  *   - it fails closed when the collection's catalog/readiness provenance no longer matches the
@@ -20,17 +23,22 @@
  *   pnpm --filter @meigokujo/core evidence:f5c3 -- \
  *     --db=/path/to/snapshot.sqlite \
  *     --cohort-key=2026-08-review \
- *     --subject-ids=id1,id2,id3 \
+ *     --subject-ids-file=/path/to/cohort.txt \
  *     --window-start=1756000000 --window-end=1758592000 --observed-at=1758592000 \
  *     [--coverage-window-validated] \
  *     [--out=/path/to/f5c3-evidence.json]
+ *
+ * `--subject-ids-file` is one subject id per line (blank lines ignored); pass `-` to read the list
+ * from stdin instead, which keeps the cohort off disk entirely:
+ *
+ *   ... --subject-ids-file=- < cohort.txt
  *
  * `--coverage-window-validated` is an **operator attestation**, not something this script can
  * verify: pass it only if the window genuinely starts after every source used by READY-76's probes
  * was rolled out AND you accept the residual untracked-gap risk each safe source documents.
  * Omitting it is always safe — the evidence is simply marked not decision-grade.
  */
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import Database from "better-sqlite3";
 import { buildF5cDecisionEvidence } from "../src/titles/v2-decision-evidence.js";
 import { collectF5cCalibrationMeasurements } from "../src/titles/v2-calibration.js";
@@ -38,7 +46,8 @@ import { collectF5cCalibrationMeasurements } from "../src/titles/v2-calibration.
 interface Args {
   readonly db: string;
   readonly cohortKey: string;
-  readonly subjectUserIds: readonly string[];
+  /** where to READ the cohort from — never the ids themselves (PR #192レビュー第1ラウンド§5). */
+  readonly subjectIdsFile: string;
   readonly window: { readonly start: number; readonly end: number; readonly observedAt: number };
   readonly coverageWindowValidated: boolean;
   readonly out: string | null;
@@ -56,7 +65,16 @@ function requireInteger(raw: string, label: string): number {
  * they believe they asked for.
  */
 const VALUE_ARG_KEYS: ReadonlySet<string> = new Set([
-  "db", "cohort-key", "subject-ids", "window-start", "window-end", "observed-at", "out",
+  "db", "cohort-key", "subject-ids-file", "window-start", "window-end", "observed-at", "out",
+]);
+
+/**
+ * Arguments that were once valid and must now fail LOUDLY rather than as a generic "unrecognized
+ * argument". An operator reaching for the old inline form deserves to be told why it is gone, not
+ * left guessing at a typo — and must never have it silently accepted.
+ */
+const REJECTED_ARG_KEYS: ReadonlyMap<string, string> = new Map([
+  ["subject-ids", "--subject-ids is not accepted: command-line arguments are visible through shell history, process inspection, and command auditing. Use --subject-ids-file=<path> (one id per line), or --subject-ids-file=- to read the cohort from stdin."],
 ]);
 
 export function parseArgs(argv: readonly string[]): Args {
@@ -67,6 +85,8 @@ export function parseArgs(argv: readonly string[]): Args {
     const eq = arg.indexOf("=");
     if (!arg.startsWith("--") || eq === -1) throw new Error(`unrecognized argument: ${arg}`);
     const key = arg.slice(2, eq);
+    const rejected = REJECTED_ARG_KEYS.get(key);
+    if (rejected !== undefined) throw new Error(rejected);
     if (!VALUE_ARG_KEYS.has(key)) throw new Error(`unrecognized argument: --${key}`);
     if (single.has(key)) throw new Error(`duplicate --${key}`);
     single.set(key, arg.slice(eq + 1));
@@ -76,20 +96,38 @@ export function parseArgs(argv: readonly string[]): Args {
     if (value === undefined || value === "") throw new Error(`--${key} is required`);
     return value;
   };
-  const subjectUserIds = need("subject-ids").split(",").map((s) => s.trim()).filter((s) => s !== "");
-  if (subjectUserIds.length === 0) throw new Error("--subject-ids must list at least one subject");
-  if (new Set(subjectUserIds).size !== subjectUserIds.length) throw new Error("--subject-ids contains duplicates");
   const start = requireInteger(need("window-start"), "--window-start");
   const end = requireInteger(need("window-end"), "--window-end");
   const observedAt = requireInteger(need("observed-at"), "--observed-at");
   return {
     db: need("db"),
     cohortKey: need("cohort-key"),
-    subjectUserIds,
+    subjectIdsFile: need("subject-ids-file"),
     window: { start, end, observedAt },
     coverageWindowValidated,
     out: single.get("out") ?? null,
   };
+}
+
+/**
+ * Reads the cohort from a file (or stdin, via `-`). The ids exist only as this returned array —
+ * they are never printed, logged, or written back out, and `assertNoSubjectIdentity` re-checks the
+ * artifact against them before anything leaves the process.
+ *
+ * Fails closed on an empty cohort and on duplicates: a duplicate silently doubles one subject's
+ * weight in every percentile boundary the evidence is built from, and `buildF5cDecisionEvidence`
+ * refuses such a collection anyway — better to say so at the input, in the operator's own terms.
+ */
+export function readSubjectUserIds(source: string): readonly string[] {
+  const raw = source === "-" ? readFileSync(0, "utf8") : readFileSync(source, "utf8");
+  const ids = raw.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== "");
+  if (ids.length === 0) throw new Error("subject id input is empty: at least one subject id is required");
+  // a comma almost certainly means the old inline comma-separated list was pasted into the file;
+  // treating "a,b" as a single id would quietly produce an artifact over a cohort of nobody.
+  const comma = ids.find((id) => id.includes(","));
+  if (comma !== undefined) throw new Error("subject id input contains a comma: list one subject id per line");
+  if (new Set(ids).size !== ids.length) throw new Error("subject id input contains duplicate ids");
+  return ids;
 }
 
 /**
@@ -106,17 +144,18 @@ function assertNoSubjectIdentity(serialized: string, subjectUserIds: readonly st
 
 export function main(argv: readonly string[]): void {
   const args = parseArgs(argv);
+  const subjectUserIds = readSubjectUserIds(args.subjectIdsFile);
   // readonly + fileMustExist: this run cannot create, migrate, or modify the snapshot.
   const db = new Database(args.db, { readonly: true, fileMustExist: true });
   try {
     const collection = collectF5cCalibrationMeasurements(db, {
       cohortKey: args.cohortKey,
-      subjectUserIds: args.subjectUserIds,
+      subjectUserIds,
       window: args.window,
     });
     const report = buildF5cDecisionEvidence(collection, args.coverageWindowValidated);
     const serialized = `${JSON.stringify(report, null, 2)}\n`;
-    assertNoSubjectIdentity(serialized, args.subjectUserIds);
+    assertNoSubjectIdentity(serialized, subjectUserIds);
     if (args.out === null) process.stdout.write(serialized);
     else {
       writeFileSync(args.out, serialized, "utf8");

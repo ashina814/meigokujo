@@ -2715,7 +2715,7 @@ F5c3（`packages/core/src/titles/v2-decision-evidence.ts`）はこの5点だけ�
 埋める集約evidence層である。
 
 **契約version**: F5c1 `F5C_SWEEP_CONTRACT_VERSION` / F5c2
-`F5C2_SHADOW_CONTRACT_VERSION` / F5c3 `F5C3_EVIDENCE_CONTRACT_VERSION = 1`。
+`F5C2_SHADOW_CONTRACT_VERSION` / F5c3 `F5C3_EVIDENCE_CONTRACT_VERSION = 2`。
 3つともreportのprovenanceへ転記される。
 
 ### 単一evaluator（F5c1/F5c2の意味論を複製しない）
@@ -2727,9 +2727,15 @@ representative実行・F5c3のOAT・F5c3のoverlapは、同じ関数の同じ経
 なることが構造的に起こらない。
 
 そのためにF5c2側へ入れた唯一の変更が`F5cDimensionSelection`である:
-「この decision dimension をどのpercentileで固定するか」を返す関数を
-`AxisEvalContext`が持ち、F5c2は全dimensionをrepresentative(p50)で、
-F5c3のOATは1つだけを別のpercentileで呼ぶ。F5c2の既定挙動は不変。
+そのためにF5c2側へ入れた唯一の変更が`F5cDecisionBoundarySelection`である:
+「この decision dimension を**どの数値境界で**判定するか」を返す関数を
+`AxisEvalContext`が持ち、F5c2は各dimension自身のgridの
+representative(`F5C2_REPRESENTATIVE_PERCENTILE`)値を、F5c3のOATは1つだけを
+別の値へ差し替えて呼ぶ。F5c2の既定挙動は不変。
+
+`F5C2_REPRESENTATIVE_PERCENTILE`はF5c2がexportする**単一のSSOT**であり、
+F5c3は数値50を書き写さない——片方だけ動いて静かに乖離することを防ぐ
+（専用のdrift regressionあり）。
 
 **dimension key**はaxisの`axisKey`そのもの（manifest cardinality sweepだけ
 `manifest:<countMetricKey>`——F5c2が既に報告しているaxisKeyと同じ）。
@@ -2739,10 +2745,21 @@ F5c3のOATは1つだけを別のpercentileで呼ぶ。F5c2の既定挙動は不�
 `F5C3_SENSITIVITY_MODEL = "CANDIDATE_LEVEL_ONE_AXIS_AT_A_TIME"`。
 
 各sweepable dimensionについて、既存のbounded percentile grid上でその
-dimensionだけを動かし、**兄弟dimensionはrepresentative境界に固定した
-まま**、candidateの最終的なconjunction/manifest/structural意味論を
-再評価して、集約の known / unknown / matched / notMatched /
-`candidatePrevalence` を報告する。
+dimensionだけを動かし、**兄弟dimensionはbaselineの数値境界へpinしたまま**、
+candidateの最終的なconjunction/manifest/structural意味論を再評価して、
+集約の known / unknown / matched / notMatched / `candidatePrevalence` を
+報告する。
+
+**`F5C3_SIBLING_PINNING = "BASELINE_NUMERIC_BOUNDARY"`**（reportへ明記）。
+pinするのはpercentile *rank* ではなく **数値境界** である——このpipelineは
+依存しているため、rankでは固定にならない: downstream reductionのgridは
+upstream filterを通過した分布から導出されるので、filterを動かすだけで
+qualifying-day sampleが`[1, 2, 3]`(p50=2)から`[0, 0, 3]`(p50=0)へ変わり、
+「1軸だけ動かした」と称する実行が**production decision boundaryを2つ**
+動かしてしまう。数値pinなら本来の依存関係は保たれたまま——filterを動かせば
+各subjectの reduced **value** は変わる——兄弟の判定**境界**だけがbaselineに
+留まる。No.76（SCALAR_SAMPLE filter → FILTER_THEN_DISTINCT_DAYS）が
+この反例をそのまま検証する。
 
 - Cartesian積ではない。コストは |dimensions| × |grid| であって
   |grid|^n ではない。
@@ -2759,20 +2776,37 @@ dimensionだけを動かし、**兄弟dimensionはrepresentative境界に固定�
   `nonSweepableReason`を明示する。
 - gridを端から端まで動かしてもprevalenceが動かないdimensionは
   `flat: true`——「threshold選択の情報を持たない」ことを隠さない。
+- `boundaryValueAtPercentile`は**実際に差し替えた数値境界**（baseline grid
+  のその percentile 値）であり、その点で生じた条件付き分布から
+  再計算した値ではない。
 
 ### overlap / containment
 
-pairは**typed catalog structureからのみ**選ぶ（title名やproseからは選ばない）:
+pairは**typed catalog structureからのみ**選ぶ（`groupKey` / `seriesKey` /
+`stage`。title名やproseからは選ばない）。**同じcandidate pairは1度だけ、
+1つの規範的読みだけを伴って**出す:
 
-- `SAME_GROUP` — `groupKey`を共有するcandidateは、catalog設計上は
-  同じ概念の別facetのはず。ここでの高い重複はまさに検出したい
-  title-designの不整合である。
-- `SAME_SERIES` — `seriesKey`を共有するのは段階progressionで、包含は
-  *期待される*。measureすることでstagingが実際にnestされているか検証できる。
+- `SERIES_PROGRESSION` — `seriesKey`を共有し両者に`stage`があるpair。
+  seriesはcumulative ladder（本書§14「Progression」）なので、
+  **上位stageは下位stageに包含されるはず**（`expectation:
+  "HIGHER_STAGE_WITHIN_LOWER_STAGE"`）。A側が常に**下位stage**なので、
+  この予測は`containmentBInA`についての予測であり、1から大きく外れて
+  いればstagingが実際にはnestされていない。順序はtyped `stage`から取る
+  ——candidate番号やtitle名からは推測しない。
+- `GROUP_SIBLING` — `groupKey`だけを共有し、1つのseriesでは説明されない
+  pair。**中立に**報告する: 高い重複はレビューする価値があるが、
+  catalogは「group siblingは互いに素であるべき」と言っていないので、
+  F5c3もそう主張しない。
+
+seriesが**優先**する。catalogの段階ladderは`groupKey`と`seriesKey`に同じ値を
+持つ（No.10-12 = `vc_duo_style`）ため、key毎にbucketすると同じpairが2度出て、
+1つの測定値へ「重複は設計の臭い」と「包含は期待される」という矛盾する2つの
+解釈が同時に付いてしまっていた。優先ルールで解消したが、`groupKey`は
+どちらのrelationでも報告するので、group側の事実は隠れない。
 
 76×76の全pairは**出さない**——数千個のほぼ無意味な数値はレビュー価値が
 無く、他の選び方はtitle名/proseの当て推量になる。READY-76に対して
-実際に出るpairは114件。
+実際に出るpairは70件（SERIES_PROGRESSION 44 / GROUP_SIBLING 26）。
 
 **denominator（分母）はboth-known**: A/B両方のFINAL outcomeがknown
 （MATCHED または NOT_MATCHED）なsubjectだけ。どちらかがUNKNOWNの
@@ -2812,9 +2846,22 @@ percentile method、percentile grid、sensitivity model 2種。すべて
 同じcollectionからは同じ値になり、contract version・catalog・cohort・
 window・attestation・単一のcountのいずれが動いても変わる。
 
-**fail-closed**: collectionのcatalogHash/readinessHashが現行contractと
-一致しなければevidenceの生成自体を拒否する——レビュー中のcatalogとは
-別のcatalogで計算された証拠を人間に渡さないため。
+**fail-closed**（`assertCompatibleCollection`）: 以下のいずれかが合わなければ
+evidenceの生成自体を拒否する。
+
+- `schemaVersion` / `percentileMethod` が現行contractと不一致
+- `catalogHash` / `readinessHash` が現行contractと不一致
+- `catalogCandidateCount` が現行catalog件数と不一致
+- `cohort.subjectCount` が `subjects.length` と不一致
+- `subjects` に**重複subject**が含まれる
+
+hash 2つだけの検証では足りなかった: reportはpercentile method・schema
+version・cohort sizeを「このrunの事実」としてpinするので、未検証のまま
+受け入れると、**collectionが一度も測られていない現行定数**をreportが
+名乗ってしまう。検証後のprovenanceは*validated collection自身の値*を報告
+する（現行定数で置き換えない）。重複subjectは、cohort件数の見た目を保った
+まま1人の重みを二重にしてpercentile境界そのものを歪めるため拒否する
+——エラーには**subject IDを一切載せない**。
 
 ### privacy境界
 
@@ -2840,13 +2887,27 @@ script実行のためだけにpublic subpathを足すとplanning-only境界が�
 pnpm --filter @meigokujo/core evidence:f5c3 -- \
   --db=/path/to/snapshot.sqlite \
   --cohort-key=2026-08-review \
-  --subject-ids=id1,id2,id3 \
+  --subject-ids-file=/path/to/cohort.txt \
   --window-start=<unix> --window-end=<unix> --observed-at=<unix> \
   [--coverage-window-validated] \
   [--out=/path/to/f5c3-evidence.json]
 ```
 
+cohortは**1行1 subject id のファイル**で渡す。`--subject-ids-file=-`なら
+stdinから読み、cohortをディスクへ置かずに済む:
+
+```
+... --subject-ids-file=- < cohort.txt
+```
+
 保証:
+- **subject IDはargvへ入れない**。command-line引数はshell履歴・
+  process inspection（`ps`）・command auditingから見えるため、出力JSONが
+  綺麗でもそれだけでは「restricted identityはtransient/private」という
+  operator境界を満たせない。旧`--subject-ids=`は
+  **理由付きで明示的に拒否**する（黙って受理も、単なる"unrecognized"も
+  しない）。IDはmemory内にのみ存在し、echoもlogもしない。空・重複・
+  カンマ混入（旧inline形式の貼り付け）はfail-closed。
 - DBはdriver levelで**read-only**（`readonly: true, fileMustExist: true`）
   ——実行が物理的に書き込み・migration・作成をできない。live prodでは
   なくsnapshotのコピーを渡すこと。
