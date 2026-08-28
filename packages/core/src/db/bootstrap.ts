@@ -1698,6 +1698,23 @@ function migrateRoleGrantProvenanceShape(db: Database.Database): void {
     ALTER TABLE shop_purchase_role_grant_provenance_new
       RENAME TO shop_purchase_role_grant_provenance;
   `);
+  // **作り直したら index と append-only trigger を戻す。**
+  // DDLはこのmigrationより先に流れているので、ここで戻さないと
+  // 「作り直した直後の1回だけ append-only ではない」DBができてしまう。
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_shop_purchase_role_grant_role
+      ON shop_purchase_role_grant_provenance(role_id, purchase_id);
+    CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_role_grant_provenance_no_update
+    BEFORE UPDATE ON shop_purchase_role_grant_provenance
+    BEGIN
+      SELECT RAISE(ABORT, 'shop purchase role grant provenance is append-only');
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_role_grant_provenance_no_delete
+    BEFORE DELETE ON shop_purchase_role_grant_provenance
+    BEGIN
+      SELECT RAISE(ABORT, 'shop purchase role grant provenance is append-only');
+    END;
+  `);
 }
 
 function backfillShopDeliveryState(db: Database.Database): void {

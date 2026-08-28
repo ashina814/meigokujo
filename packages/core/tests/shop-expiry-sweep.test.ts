@@ -170,9 +170,17 @@ describe("期限切れの失効（課金から独立）", () => {
     deliver(ctx, old.id);
     ctx.db.prepare("UPDATE shop_purchases SET expires_at = 1 WHERE id = ?").run(old.id);
     ctx.shop.expireOverdue("system:test");
-    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] });
+    const next = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
 
+    // 買っただけでは古い失効を守り切らない。提供されたか未確定のうちは
+    // 「剥がさないが、完了にもしない」として持ち越す（後で返金されることがある）。
+    expect(ctx.shop.activeRoleEntitlementState("u1", "role_a", old.id)).toBe("unsettled");
+    expect(ctx.shop.activePurchaseProvesRoleEntitlement("u1", "role_a", old.id)).toBe(false);
+
+    // 提供されたと分かって初めて、古い失効を守る根拠になる。
     // 判定は購入時の事実だけで行う（現在の商品設定は見ない）
+    deliver(ctx, next.id);
+    expect(ctx.shop.activeRoleEntitlementState("u1", "role_a", old.id)).toBe("delivered");
     expect(ctx.shop.activePurchaseProvesRoleEntitlement("u1", "role_a", old.id)).toBe(true);
     ctx.db.close();
   });

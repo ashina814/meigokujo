@@ -268,6 +268,7 @@ export {
   type ManualCompletionResult,
   type RoleGrantProvenanceRow,
   type RoleGrantTarget,
+  type RoleEntitlementState,
 } from "./shop/service.js";
 export {
   Tickets,

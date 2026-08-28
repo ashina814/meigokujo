@@ -376,6 +376,22 @@ export async function convergePendingNicknameChanges(client: Client, services: S
  * 「対応済み」に見えてしまう。`failed` へ置いて理由を残し、運営の確認待ちにする。
  * **Discordには一切触らない。**
  */
+/**
+ * 判断を次の巡回へ持ち越す。**status は変えない。**
+ *
+ * 同じロールを与える新しい購入が「まだ提供されたか分からない」状態のとき、
+ * ロールは剥がさない。かといって古い失効を done にもしない——その購入が後で
+ * 返金されると、有効な契約が無いのにロールだけ残る。決着がつくまで待つ。
+ */
+function markRoleRevocationDeferred(services: Services, purchaseId: number, reason: string): void {
+  const ts = Math.floor(Date.now() / 1000);
+  services.db
+    .prepare(
+      "UPDATE shop_role_revocations SET last_error=?, updated_at=? WHERE purchase_id=? AND status='pending'",
+    )
+    .run(`deferred:${reason}`, ts, purchaseId);
+}
+
 function markRoleRevocationBlocked(services: Services, purchaseId: number, reason: string): void {
   const ts = Math.floor(Date.now() / 1000);
   const updated = services.db
@@ -466,13 +482,22 @@ export async function processShopRoleRevocations(client: Client, services: Servi
       // 前回このworkerが roles.remove() を呼びにいったかもしれない行かどうか。
       // **立っていれば、有効な契約があっても Discord の実体を見るまで done にしない。**
       const mayHaveRemoved = services.shop.roleRevocationRemoveAttempted(candidate.purchase_id);
-      const stillEntitled = () =>
-        services.shop.activePurchaseProvesRoleEntitlement(candidate.user_id, roleId, candidate.purchase_id);
+      const entitlement = () =>
+        services.shop.activeRoleEntitlementState(candidate.user_id, roleId, candidate.purchase_id);
+      const stillEntitled = () => entitlement() === "delivered";
 
       // 同じロールを与える有効な別契約があるなら剥がさない。判断は購入時の事実だけで行う。
-      if (!mayHaveRemoved && stillEntitled()) {
-        markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
-        continue;
+      if (!mayHaveRemoved) {
+        const state = entitlement();
+        if (state === "delivered") {
+          markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
+          continue;
+        }
+        if (state === "unsettled") {
+          // 新しい購入が提供されたか未確定。剥がさないし、完了にもしない。
+          markRoleRevocationDeferred(services, candidate.purchase_id, "active_purchase_unsettled");
+          continue;
+        }
       }
 
       let member;
@@ -530,8 +555,13 @@ export async function processShopRoleRevocations(client: Client, services: Servi
 
       // **剥がす直前にもう一度確かめる。** ここまでの間（member fetchのawait中）に
       // 新しい契約が成立していると、新しい権利のロールを古い失効が剥がしてしまう。
-      if (stillEntitled()) {
+      const beforeRemove = entitlement();
+      if (beforeRemove === "delivered") {
         markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
+        continue;
+      }
+      if (beforeRemove === "unsettled") {
+        markRoleRevocationDeferred(services, candidate.purchase_id, "active_purchase_unsettled");
         continue;
       }
 

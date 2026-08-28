@@ -67,6 +67,17 @@ function buyDelivered(ctx: Ctx, itemId: number) {
   return p;
 }
 
+/** 買っただけ（まだ配送していない）購入 */
+function buyUndelivered(ctx: Ctx, itemId: number) {
+  return ctx.shop.purchase({
+    itemId,
+    userId: USER,
+    actor: `user:${USER}`,
+    memberRoleIds: [],
+    expectedTermsToken: ctx.shop.quoteGenericPurchase(itemId).termsToken,
+  }).purchase;
+}
+
 function expireNow(ctx: Ctx, purchaseId: number) {
   ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(purchaseId);
   ctx.shop.expireIfDue(purchaseId, STAFF);
@@ -302,6 +313,77 @@ describe("剥奪と新しい契約の競合", () => {
     expect(w.remove).toHaveBeenCalledTimes(1);
     expect(w.remove).toHaveBeenCalledWith(ROLE);
     expect(w.remove).not.toHaveBeenCalledWith("r-other");
+    ctx.db.close();
+  });
+});
+
+describe("未確定の新しい購入では、古い失効を完了させない", () => {
+  for (const [label, delivery] of [["自動配送", "auto"], ["手動配送", "manual"]] as const) {
+    it(`${label}: B が未配送のうちは剥がさず、A も完了させない`, async () => {
+      const { processShopRoleRevocations } = await recoveryModule;
+      const ctx = setup();
+      const item =
+        delivery === "auto"
+          ? roleItem(ctx, "月額", ROLE)
+          : ctx.shop.createItem(
+              {
+                name: "手動ロール",
+                price_land: 100,
+                kind: "one_shot",
+                delivery: "manual",
+                delivery_kind: "add_role",
+                delivery_data: JSON.stringify({ role_id: ROLE }),
+              } as never,
+              STAFF,
+            );
+      const old = buyDelivered(ctx, item.id);
+      expireNow(ctx, old.id);
+      const fresh = buyUndelivered(ctx, item.id);
+      const w = world();
+
+      await processShopRoleRevocations(w.client as never, ctx.services);
+
+      // 剥がさない。**かつ完了にもしない**（Bが返金されたらロールだけ残ってしまう）
+      expect(w.remove).not.toHaveBeenCalled();
+      expect(w.roles.has(ROLE)).toBe(true);
+      expect(revocationStatus(ctx, old.id)).toBe("pending");
+
+      // B が配送された → ここで初めて A を完了してよい
+      ctx.shop.beginDelivery(fresh.id);
+      ctx.shop.markDeliverySucceeded(fresh.id, STAFF);
+      const w2 = world();
+      await processShopRoleRevocations(w2.client as never, ctx.services);
+
+      expect(w2.remove).not.toHaveBeenCalled();
+      expect(w2.roles.has(ROLE)).toBe(true);
+      expect(revocationStatus(ctx, old.id)).toBe("done");
+      ctx.db.close();
+    });
+  }
+
+  it("B が返金されたら、A はロールを剥がして完了する", async () => {
+    const { processShopRoleRevocations } = await recoveryModule;
+    const ctx = setup();
+    const item = roleItem(ctx, "月額", ROLE);
+    const old = buyDelivered(ctx, item.id);
+    expireNow(ctx, old.id);
+    const fresh = buyUndelivered(ctx, item.id);
+
+    // 未確定のあいだは何も起きない
+    const w1 = world();
+    await processShopRoleRevocations(w1.client as never, ctx.services);
+    expect(w1.remove).not.toHaveBeenCalled();
+    expect(revocationStatus(ctx, old.id)).toBe("pending");
+
+    // B が配送できずに返金された → 守る契約が無くなる
+    ctx.shop.refund(fresh.id, "配送できなかった", STAFF);
+
+    const w2 = world();
+    await processShopRoleRevocations(w2.client as never, ctx.services);
+
+    expect(w2.remove).toHaveBeenCalledWith(ROLE);
+    expect(w2.roles.has(ROLE)).toBe(false);
+    expect(revocationStatus(ctx, old.id)).toBe("done");
     ctx.db.close();
   });
 });

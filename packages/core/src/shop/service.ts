@@ -263,6 +263,18 @@ export interface RoleGrantProvenanceRow {
  * - `proven_non_role`… 購入時にロールを与える契約ではなかったと証明できる
  * - `legacy_unknown` … 購入時の契約を証明できない（推測して剥がさない）
  */
+/**
+ * 同じロールを与える「有効な別契約」の強さ。
+ *
+ * - `delivered` … 提供済みの証拠がある。古い失効を完了してよい
+ * - `unsettled` … 契約はあるが提供されたか未確定。**剥がさないが、完了もしない**
+ * - `none`      … 守る契約が無い。通常どおり剥奪してよい
+ *
+ * `unsettled` を `delivered` と同じ扱いにすると、未配送の新規購入を見て古い失効を
+ * 完了させたあとにその購入が返金され、**誰も持っていないはずのロールだけが残る**。
+ */
+export type RoleEntitlementState = "delivered" | "unsettled" | "none";
+
 export type RoleGrantTarget =
   | { readonly kind: "proven"; readonly roleId: string; readonly source: string }
   | { readonly kind: "proven_non_role" }
@@ -3447,16 +3459,35 @@ export class Shop {
    * **現在の `shop_items` は見ない。** 商品のロール設定を変えただけで
    * 「この契約はこのロールを与えている」という判定まで変わってしまうため。
    */
-  activePurchaseProvesRoleEntitlement(userId: string, roleId: string, excludePurchaseId?: number): boolean {
+  activeRoleEntitlementState(
+    userId: string,
+    roleId: string,
+    excludePurchaseId?: number,
+  ): RoleEntitlementState {
     const rows = this.db
       .prepare("SELECT * FROM shop_purchases WHERE user_id = ? AND status = 'active'")
       .all(userId) as PurchaseRow[];
+    let unsettled = false;
     for (const purchase of rows) {
       if (excludePurchaseId !== undefined && purchase.id === excludePurchaseId) continue;
       const target = this.roleGrantTarget(purchase);
-      if (target.kind === "proven" && target.roleId === roleId) return true;
+      if (target.kind !== "proven" || target.roleId !== roleId) continue;
+      // 提供済みの証拠がある契約が1つでもあれば、それが最も強い根拠になる。
+      if (this.hasDeliveredEvidence(purchase)) return "delivered";
+      unsettled = true;
     }
-    return false;
+    return unsettled ? "unsettled" : "none";
+  }
+
+  /**
+   * 古い失効を完了してよいほど強い契約があるか。
+   *
+   * **未確定（`unsettled`）は false。** 提供されたか分からない購入を根拠に古い失効を
+   * 完了させると、その購入が後で返金されたときに、有効な契約が無いのにロールだけ
+   * Discordに残る。
+   */
+  activePurchaseProvesRoleEntitlement(userId: string, roleId: string, excludePurchaseId?: number): boolean {
+    return this.activeRoleEntitlementState(userId, roleId, excludePurchaseId) === "delivered";
   }
 
   /**
