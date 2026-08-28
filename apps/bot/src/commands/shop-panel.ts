@@ -640,6 +640,9 @@ function purchaseErrorMessage(error: unknown, services: Services): string {
     ) {
       return "オリジナルロールは、申請が承認されたあとの専用画面からのみ購入できます。料金は発生していません。";
     }
+    if (error.code === "ERR_REEVAL_INTAKE_UNAVAILABLE") {
+      return "現在、再評価面談の受付を利用できないため販売を停止しています。Land・招待実績は消費していません。";
+    }
     if (error.code === "ERR_EVAL_EXTENSION_STATUS") return "評価期間の延長は、現在評価中の亡霊だけが購入できます。";
     if (error.code === "ERR_EVAL_EXTENSION_CYCLE") return "現在の評価サイクルを確認できないため、料金を引かずに停止しました。";
     if (error.code === "ERR_EVAL_EXTENSION_EXPIRED") return "評価期限を過ぎているため、料金を引かずに停止しました。";
@@ -651,7 +654,7 @@ function purchaseErrorMessage(error: unknown, services: Services): string {
       return "評価期間延長商品の設定を確認できないため、料金を引かずに停止しました。運営へご連絡ください。";
     }
     if (error.code === "ERR_REEVAL_STATUS") return "再評価チャレンジは迷霊の方だけが購入できます。";
-    if (error.code === "ERR_REEVAL_RIGHT_EXISTS") return "未使用の再評価権を既に持っています。面談結果の確定後にご利用ください。";
+    if (error.code === "ERR_REEVAL_RIGHT_EXISTS") return "未使用の再評価面談権があります。先にその面談をご利用ください。";
     if (error.code === "ERR_REEVAL_INVITES_INSUFFICIENT") return "未使用の確定招待実績が5件必要です。";
     if (error.code === "ERR_REEVAL_ITEM_CONFIG" || error.code === "ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED") {
       return "再評価チャレンジの設定を確認できないため、購入を停止しました。運営へご連絡ください。";
@@ -1215,8 +1218,26 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         await interaction.editReply(originalRolePurchaseRedirect(services, configuredItem, interaction.user.id));
         return;
       }
-      if (isReevalItem(services, configuredItem)) {
-        services.shop.checkReevaluationPurchase({ itemId, userId: interaction.user.id, mode: "land" });
+      // 再評価系かどうかは**現在の設定だけでは判定しない**。確認を作ってから設定がA→Bへ
+      // 動くと、旧Aの確認が「普通の商品」に見えてしまい、reevaluation preflightを飛ばして
+      // チップをLandへ戻したあとにCoreのguardで購入だけ失敗する——買えないのにチップ資産だけ
+      // 動く、という不要な副作用になる。**チップを1つも動かす前に**semanticで分類する。
+      if (services.shop.isHistoricalReevaluationItem(configuredItem.id)) {
+        if (isReevalItem(services, configuredItem)) {
+          // 今も販売中の再評価商品。通常の前提条件（重複権・受付可用性・階級）を確認する。
+          services.shop.checkReevaluationPurchase({ itemId, userId: interaction.user.id, mode: "land" });
+        } else {
+          // かつての再評価商品。古い確認をBの専用購入へ勝手に読み替えない。0 mutationで停止する。
+          await interaction.editReply({
+            content: [
+              "❌ 商品設定が変更されたため、この確認は使用できません。",
+              "チップ・Landは変更していません。商品を選び直してください。",
+            ].join("\n"),
+            embeds: [],
+            components: [],
+          });
+          return;
+        }
       }
       // チップをLandへ戻す前に、期限付きアクセスの既存ロールを実状態で確認する。
       const memberRoleIds = await verifiedPurchaseRoleIds(interaction, configuredItem);

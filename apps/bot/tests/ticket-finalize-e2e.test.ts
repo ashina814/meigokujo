@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { Collection } from "discord.js";
 import type { Guild, GuildMember } from "discord.js";
-import { Entry, EventLog, Evaluation, Ledger, Returns, Settings, Shop, Tickets, openDb, registerDefaultTxTypes } from "@meigokujo/core";
+import { Entry, EventLog, Evaluation, Ledger, REEVAL_PRICE_LAND, Returns, Settings, Shop, Tickets, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 
 /**
@@ -34,7 +34,12 @@ function setup() {
   const entry = new Entry(db, ledger, settings, events);
   const evaluation = new Evaluation(db, settings, events);
   const returns = new Returns(db, settings, events);
-  const shop = new Shop(db, ledger, events);
+  // 面談権は実際の発行経路で作る（genericなstorefront購入は再評価権ではない）。
+  let reevalItemId: number | null = null;
+  const shop = new Shop(db, ledger, events, {
+    reevalItemId: () => reevalItemId,
+    assertReevaluationIntakeAvailable: () => {},
+  });
   const tickets = new Tickets(db, events);
   for (const [k, v] of [
     ["role:ghost", ROLE.ghost],
@@ -49,7 +54,18 @@ function setup() {
     { id: "return", name: "出戻り申請", title: "出戻り申請", description: "説明", buttonLabel: "申請", staffRoleIds: [ROLE.staff] },
     "test",
   );
-  const item = shop.createItem({ name: "再評価チャレンジ", price_land: 100, kind: "one_shot", delivery: "manual" }, "test");
+  const item = shop.createItem(
+    {
+      name: "再評価チャレンジ",
+      price_land: REEVAL_PRICE_LAND,
+      price_alt_kind: "invite",
+      price_alt_amount: 5,
+      kind: "one_shot",
+      delivery: "manual",
+    },
+    "test",
+  );
+  reevalItemId = item.id;
   settings.set("shop:reeval_item_id", item.id, "test");
   const services = { db, ledger, settings, events, entry, evaluation, returns, shop, tickets, item } as unknown as Services;
   return { db, ledger, settings, events, entry, evaluation, returns, shop, tickets, item, services };
@@ -205,12 +221,19 @@ describe("再評価面談の確定が操作UIを完了状態にする", () => {
     ctx.ledger.transfer({
       from: "sys:treasury",
       to: `user:${USER}`,
-      amount: 10_000,
+      amount: REEVAL_PRICE_LAND * 2,
       type: "adjust",
       actor: "test",
       idempotencyKey: `seed-${USER}`,
     });
-    const purchase = ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: "test", memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchaseReevaluation({
+      itemId: ctx.item.id,
+      userId: USER,
+      actor: "test",
+      memberRoleIds: [],
+      mode: "land",
+      idempotencyKey: `reeval-${Math.random()}`,
+    }).purchase;
     ctx.tickets.upsertPanel(
       { id: "reeval", name: "再評価面談", title: "再評価面談", description: "説明", buttonLabel: "申請", staffRoleIds: [ROLE.staff] },
       "test",

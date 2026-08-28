@@ -88,6 +88,11 @@ function canOperate(
  * 再評価チャレンジは配送する物が無く、権利を消費するのは既存の再評価面談フロー。
  * ここへ出すと「終わらせる方法が無い仕事」がキューに居座る。
  */
+/**
+ * 現在の設定由来の除外。再評価権の除外はこれに**依存しない**——A→B差し替え後の未消費Aも
+ * 「配送する物が無い仕事」なので、Shop側のsemantic判定が list/count 双方から外す。
+ * ここは原職ロール等、他の特別商品のための現行設定除外だけを担う。
+ */
 function excludedItemIds(services: Services): number[] {
   const ids = [
     Number(services.settings.getString("shop:reeval_item_id")),
@@ -583,38 +588,14 @@ export async function handleShokanModal(interaction: ModalSubmitInteraction, ser
   await interaction.reply({ content: `✅ 商品 #${id} を更新しました。`, flags: MessageFlags.Ephemeral });
 }
 
-function configuredReevalItemId(services: Services): number | null {
-  const id = Number(services.settings.getString("shop:reeval_item_id"));
-  return Number.isSafeInteger(id) && id > 0 ? id : null;
-}
-
 function renderReevalCompensations(services: Services, offset = 0) {
-  const itemId = configuredReevalItemId(services);
-  const total = itemId === null
-    ? 0
-    : (services.db
-        .prepare(
-          `SELECT COUNT(*) AS n FROM shop_purchases p
-            LEFT JOIN shop_reeval_compensations c ON c.purchase_id = p.id
-           WHERE p.item_id = ? AND p.status = 'active'
-             AND p.delivered_at IS NOT NULL AND p.delivery_state = 'delivered' AND c.id IS NULL`,
-        )
-        .get(itemId) as { n: number }).n;
-  const rows = itemId === null
-    ? []
-    : (services.db
-        .prepare(
-          `SELECT p.* FROM shop_purchases p
-            LEFT JOIN shop_reeval_compensations c ON c.purchase_id = p.id
-           WHERE p.item_id = ?
-             AND p.status = 'active'
-             AND p.delivered_at IS NOT NULL
-             AND p.delivery_state = 'delivered'
-             AND c.id IS NULL
-           ORDER BY p.delivered_at DESC, p.id DESC
-           LIMIT ? OFFSET ?`,
-        )
-        .all(itemId, REEVAL_COMPENSATION_PAGE, offset) as PurchaseRow[]);
+  // 現在の商品IDではなく「再評価権として発行され、面談で消費済み」というsemanticで出す。
+  // A→B差し替え後の旧Aも、設定を消していても補償候補として見える。
+  const total = services.shop.countCompensableReevaluationPurchases();
+  const rows = services.shop.listCompensableReevaluationPurchases({
+    limit: REEVAL_COMPENSATION_PAGE,
+    offset,
+  });
   const embed = new EmbedBuilder()
     .setTitle("再評価チャレンジ 例外補償")
     .setColor(0xb45309)
@@ -672,12 +653,12 @@ function renderReevalCompensations(services: Services, offset = 0) {
 }
 
 function renderReevalCompensationDepartments(services: Services, purchaseId: number) {
-  const itemId = configuredReevalItemId(services);
-  const purchase = itemId === null ? undefined : services.shop.getPurchase(purchaseId);
+  // 現在の商品設定ではなく、その購入が再評価権として発行されたかで判断する。
+  const purchase = services.shop.getPurchase(purchaseId);
   const already = services.shop.getReevalCompensation(purchaseId);
   if (
     !purchase ||
-    purchase.item_id !== itemId ||
+    !services.shop.isReevaluationPurchase(purchase.id) ||
     purchase.status !== "active" ||
     purchase.delivered_at === null ||
     purchase.delivery_state !== "delivered" ||
@@ -764,14 +745,12 @@ async function handleReevalCompensation(interaction: ModalSubmitInteraction, ser
     await interaction.reply({ content: "支出部署を一意に確認できません。選択からやり直してください。", flags: MessageFlags.Ephemeral });
     return;
   }
-  const itemId = configuredReevalItemId(services);
-  if (itemId === null || !Number.isSafeInteger(purchaseId) || !Number.isSafeInteger(amount) || amount <= 0 || !reason) {
+  if (!Number.isSafeInteger(purchaseId) || !Number.isSafeInteger(amount) || amount <= 0 || !reason) {
     await interaction.reply({ content: "補償内容を確認できません。", flags: MessageFlags.Ephemeral });
     return;
   }
   try {
     const row = services.shop.compensateReevaluation({
-      itemId,
       purchaseId,
       departmentKey,
       amount,

@@ -46,6 +46,15 @@ function setup() {
     "staff",
   );
   reevalItemId = reeval.id;
+  // 本番では、設定済みの状態でShopが構築された時点でこの指定がregistryへ焼き付く。
+  // このfixtureはShopを先に構築するので、同じ状態を明示的に作る。
+  shop.registerReevaluationSaleItem(reeval.id);
+  // 本番のA→Bは settings 行と Shop 側の解決の両方が動く。
+  const switchSaleItemTo = (id: number | null) => {
+    reevalItemId = id;
+    if (id === null) db.prepare("DELETE FROM settings WHERE key='shop:reeval_item_id'").run();
+    else settings.set("shop:reeval_item_id", id, "staff");
+  };
   db.prepare("INSERT INTO souls (user_id,status,updated_at) VALUES (?, 'meirei', 1)").run(USER);
   const nickname = shop.createItem(
     { name: "名前変更", description: "運営が対応します。", price_land: 50_000, kind: "one_shot", delivery: "manual" },
@@ -72,7 +81,7 @@ function setup() {
   settings.set("channel:kessai", "ch-kessai", "staff");
   const originalRoles = new OriginalRoles(db, ledger, events);
   const services = { db, ledger, settings, events, shop, originalRoles, tickets } as unknown as Services;
-  return { db, ledger, settings, events, shop, tickets, reeval, nickname, pass, legacy, services };
+  return { db, ledger, settings, events, shop, tickets, reeval, nickname, pass, legacy, services, switchSaleItemTo };
 }
 
 type Ctx = ReturnType<typeof setup>;
@@ -182,6 +191,97 @@ describe("期限付きアクセスの購入体験", () => {
     expect(lastReply(ui.editReply)).toContain("料金を引かずに停止");
     expect(ctx.shop.listUserPurchases(USER)).toEqual([]);
     expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(200_000);
+    ctx.db.close();
+  });
+});
+
+describe("チップ返還確認と再評価の商品差し替え", () => {
+  /**
+   * A用のchip-return確認を作ったあとで `shop:reeval_item_id` がA→Bへ動くと、旧Aは
+   * 「現在の再評価商品ではない」ので reevaluation preflight を素通りしてしまう。
+   * そのままだとチップをLandへ戻したあとにCoreのhistorical guardで購入だけ失敗し、
+   * **買えないのにチップ資産だけ動く**。チップを1つも動かす前にsemanticで止める。
+   */
+  function chipHarness(ctx: Ctx, itemId: number) {
+    const redeemExactFreeChips = vi.fn(() => undefined);
+    const beginExternalConfirmation = vi.fn(() => ({
+      id: "c1", userId: USER, operationId: "op1", operationKind: `shop:${itemId}:land`,
+      status: "executing", chipAmount: 1_000,
+    }));
+    (ctx.services as unknown as Record<string, unknown>).chipFlow = {
+      externalConfirmation: vi.fn(() => ({
+        id: "c1", userId: USER, operationId: "op1", operationKind: `shop:${itemId}:land`,
+        status: "pending", chipAmount: 1_000,
+      })),
+      beginExternalConfirmation,
+      redeemExactFreeChips,
+      cancelExternalConfirmation: vi.fn(() => true),
+      failExternalConfirmation: vi.fn(() => true),
+      completeExternalConfirmation: vi.fn(() => true),
+    };
+    (ctx.services as unknown as Record<string, unknown>).chipAssets = { freeChips: vi.fn(() => 1_000) };
+    const editReply = vi.fn(async () => undefined);
+    const interaction = {
+      customId: `shop:chips:c1:${itemId}:land`,
+      user: { id: USER },
+      guildId: "g1",
+      member: { roles: { cache: new Map() } },
+      isButton: () => true,
+      deferUpdate: vi.fn(async () => undefined),
+      deferReply: vi.fn(async () => undefined),
+      reply: vi.fn(async () => undefined),
+      update: vi.fn(async () => undefined),
+      editReply,
+      deferred: false,
+      replied: false,
+    };
+    return { interaction, editReply, redeemExactFreeChips };
+  }
+
+  it("A→B差し替え後の古いA確認は、チップもLandも購入も一切動かさずに止まる", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 1_000);
+    const h = chipHarness(ctx, ctx.reeval.id);
+    const beforeLand = ctx.ledger.balanceOf(`user:${USER}`);
+
+    // 確認を作ったあとで販売商品がBへ移った
+    const b = ctx.shop.createItem(
+      { name: "再評価チャレンジ（再作成）", price_land: 500_000, price_alt_kind: "invite", price_alt_amount: 5, kind: "one_shot", delivery: "manual" },
+      "staff",
+    );
+    ctx.switchSaleItemTo(b.id);
+
+    await handleShopButton(h.interaction as never, ctx.services);
+
+    expect(h.redeemExactFreeChips).not.toHaveBeenCalled();
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(beforeLand);
+    expect(ctx.shop.listUserPurchases(USER, { activeOnly: true })).toEqual([]);
+    const said = String((h.editReply.mock.calls.at(-1) as never[])[0].content);
+    expect(said).toContain("商品設定が変更されたため");
+    expect(said).toContain("チップ・Landは変更していません");
+    // 内部識別子は出さない
+    expect(said).not.toMatch(/item_id|shop:reeval_item_id|purchase_item_mismatch/);
+    ctx.db.close();
+  });
+
+  it("販売中のまま未消費権を持っているなら、チップを動かす前に重複で止まる", async () => {
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    fund(ctx, 1_000_000);
+    ctx.shop.purchaseReevaluation({
+      itemId: ctx.reeval.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [],
+      mode: "land", idempotencyKey: "existing-right",
+    });
+    const before = ctx.ledger.balanceOf(`user:${USER}`);
+    const purchasesBefore = ctx.shop.listUserPurchases(USER, { activeOnly: true }).length;
+    const h = chipHarness(ctx, ctx.reeval.id);
+
+    await handleShopButton(h.interaction as never, ctx.services);
+
+    expect(h.redeemExactFreeChips).not.toHaveBeenCalled();
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(before);
+    expect(ctx.shop.listUserPurchases(USER, { activeOnly: true })).toHaveLength(purchasesBefore);
     ctx.db.close();
   });
 });

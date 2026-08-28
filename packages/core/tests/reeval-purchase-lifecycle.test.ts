@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { EventLog, Evaluation, Ledger, Settings, Shop, Tickets, openDb } from "../src/index.js";
+import { EventLog, Evaluation, Ledger, REEVAL_INVITE_COUNT, REEVAL_PRICE_LAND, Settings, Shop, Tickets, openDb } from "../src/index.js";
 import { Entry } from "../src/entry/service.js";
 import { registerDefaultTxTypes } from "../src/ledger/registry.js";
 
@@ -22,12 +22,23 @@ function setup() {
   const events = new EventLog(db);
   const entry = new Entry(db, ledger, settings, events);
   const evaluation = new Evaluation(db, settings, events);
-  const shop = new Shop(db, ledger, events);
   const tickets = new Tickets(db, events);
+  // 面談権は「再評価権として発行された購入」。genericなstorefront購入では作れない
+  // （旧商品がgenericへ落ちるのを防ぐguardが働く）ので、実際の発行経路を通す。
+  let reevalItemId: number | null = null;
+  const shop = new Shop(db, ledger, events, { reevalItemId: () => reevalItemId });
   const item = shop.createItem(
-    { name: "再評価チャレンジ", price_land: 100, kind: "one_shot", delivery: "manual" },
+    {
+      name: "再評価チャレンジ",
+      price_land: REEVAL_PRICE_LAND,
+      price_alt_kind: "invite",
+      price_alt_amount: REEVAL_INVITE_COUNT,
+      kind: "one_shot",
+      delivery: "manual",
+    },
     STAFF,
   );
+  reevalItemId = item.id;
   settings.set("shop:reeval_item_id", item.id, STAFF);
   return { db, ledger, settings, events, entry, evaluation, shop, tickets, item };
 }
@@ -37,12 +48,16 @@ function buy(ctx: ReturnType<typeof setup>, userId = USER) {
   ctx.ledger.transfer({
     from: "sys:treasury",
     to: `user:${userId}`,
-    amount: 10_000,
+    amount: REEVAL_PRICE_LAND * 2,
     type: "adjust",
     actor: STAFF,
     idempotencyKey: `seed-${userId}-${Math.random()}`,
   });
-  return ctx.shop.purchase({ itemId: ctx.item.id, userId, actor: STAFF, memberRoleIds: [] }).purchase;
+  ctx.db.prepare("INSERT OR IGNORE INTO souls (user_id,status,updated_at) VALUES (?, 'meirei', 1)").run(userId);
+  return ctx.shop.purchaseReevaluation({
+    itemId: ctx.item.id, userId, actor: STAFF, memberRoleIds: [],
+    mode: "land", idempotencyKey: `reeval-${userId}-${Math.random()}`,
+  }).purchase;
 }
 
 function openTicket(ctx: ReturnType<typeof setup>, threadId: string, userId = USER) {

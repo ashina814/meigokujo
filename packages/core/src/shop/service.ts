@@ -245,6 +245,7 @@ export type ShopErrorCode =
   | "ERR_REEVAL_NOT_CONSUMED"
   | "ERR_REEVAL_ALREADY_COMPENSATED"
   | "ERR_REEVAL_COMPENSATION_UNAVAILABLE"
+  | "ERR_REEVAL_INTAKE_UNAVAILABLE"
   | "ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_EVAL_EXTENSION_ITEM_CONFIG"
   | "ERR_EVAL_EXTENSION_STATUS"
@@ -380,6 +381,15 @@ export interface ShopOptions {
   roleCheck?: (memberRoleIds: readonly string[], requireRoleId: string) => boolean;
   /** 設定済みの再評価商品。null の間は旧挙動を維持する。 */
   reevalItemId?: () => number | null;
+  /**
+   * 再評価**面談受付**が今すぐ使えるかを、Landや招待実績を動かす直前に確認する。
+   * 使えなければ throw する（`ERR_REEVAL_INTAKE_UNAVAILABLE` 相当）。
+   *
+   * UI側のpreflightだけでは足りない——表示してから確認ボタンを押すまでに受付panelが
+   * 停止される余地がある。purchase transactionの中から呼ぶことで、charge pathに
+   * preflightが1箇所しか無い状態を避ける。未注入なら受付確認は行われない（既存構成互換）。
+   */
+  assertReevaluationIntakeAvailable?: () => void;
   /** 設定済みのオリジナルロール新規作成商品。 */
   originalRoleItemId?: () => number | null;
   /** 専用購入の課金直前に、承認済みの本人申請か再確認する。 */
@@ -434,6 +444,7 @@ export class Shop {
     private readonly options: ShopOptions = {},
   ) {
     this.ensureSchema();
+    this.syncReevaluationSaleItem();
   }
 
   /**
@@ -454,6 +465,24 @@ export class Shop {
       origin,
       origin === "storefront" ? 1 : 0,
     );
+  }
+
+  /**
+   * 現在指定されている再評価販売商品。**参照した時点でregistryへ記録する**。
+   *
+   * 「この商品は再評価サービスの販売商品だ」と認識できた瞬間が、その事実を永続化できる
+   * 最も早い地点。購入成立を待つと、実績0件のまま設定がA→Bへ移ったときに最初の利用者が
+   * 事故対象になる。冪等なINSERT OR IGNOREなので何度参照しても副作用は1回だけ。
+   */
+  private currentReevaluationSaleItemId(): number | null {
+    const configured = this.options.reevalItemId?.() ?? null;
+    if (configured !== null) this.registerReevaluationSaleItem(configured, "sale_setting");
+    return configured;
+  }
+
+  /** 構築時に、現在の指定をregistryへ焼き付ける（最初の利用者を待たない）。 */
+  private syncReevaluationSaleItem(): void {
+    this.currentReevaluationSaleItemId();
   }
 
   private ensureSchema(): void {
@@ -519,6 +548,58 @@ export class Shop {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_shop_reeval_compensations_user ON shop_reeval_compensations(user_id, created_at);
+      -- 「この商品は再評価サービスの販売商品として確定された」という事実そのもの。
+      -- 購入実績とは独立に持つ——実績0件のまま設定がA→Bへ移っても、Aをgeneric storefrontの
+      -- 普通の商品へ落とさないため（現在の設定は正本にできない）。
+      CREATE TABLE IF NOT EXISTS shop_reevaluation_sale_items (
+        item_id       INTEGER PRIMARY KEY REFERENCES shop_items(id),
+        first_seen_at INTEGER NOT NULL,
+        source        TEXT NOT NULL
+      );
+      -- **write authorityで記録する。** 守りたいのは「一度でも再評価sale itemとして
+      -- 指定されたitem」であって、「一度でもShopがその指定を観測したitem」ではない。
+      -- 設定を書いた直後にShopが再評価APIを1度も呼ばないまま次の設定へ移ると、read-time
+      -- syncでは取りこぼす。設定の書き込みそのものをtriggerで捕まえれば、Settings.set()・
+      -- 将来のdedicated UI・別の管理経路・正規のdirect SQLのどれでも同じ不変条件が成立する。
+      --
+      -- 不正値guard: 正の整数として往復一致し（'12abc'のようなCAST事故を弾く）、かつ
+      -- 実在する shop_items.id のときだけ記録する。不正な設定を書いただけでtransaction全体を
+      -- 壊さない——記録しないだけ。trigger内のINSERT OR IGNOREは外側statementのconflict
+      -- 解決に上書きされる（Settings.set()のUPSERTがABORTを強いる）ので、重複行を
+      -- そもそも作らないNOT EXISTS guardにしてある。
+      CREATE TRIGGER IF NOT EXISTS trg_shop_reeval_sale_item_insert
+      AFTER INSERT ON settings
+      WHEN NEW.key = 'shop:reeval_item_id'
+      BEGIN
+        INSERT INTO shop_reevaluation_sale_items (item_id, first_seen_at, source)
+        SELECT CAST(NEW.value AS INTEGER), unixepoch(), 'setting_write'
+         WHERE CAST(NEW.value AS INTEGER) > 0
+           AND CAST(CAST(NEW.value AS INTEGER) AS TEXT) = NEW.value
+           AND EXISTS (SELECT 1 FROM shop_items WHERE id = CAST(NEW.value AS INTEGER))
+           AND NOT EXISTS (SELECT 1 FROM shop_reevaluation_sale_items
+                            WHERE item_id = CAST(NEW.value AS INTEGER));
+      END;
+      -- Settings.set() はUPSERTなので、既存keyの変更はUPDATE側で発火する。
+      -- A→Bという更新そのものが「Aは過去のsale item」「Bは現在のsale item」の両方を残す。
+      CREATE TRIGGER IF NOT EXISTS trg_shop_reeval_sale_item_update
+      AFTER UPDATE OF value ON settings
+      WHEN NEW.key = 'shop:reeval_item_id'
+      BEGIN
+        INSERT INTO shop_reevaluation_sale_items (item_id, first_seen_at, source)
+        SELECT CAST(NEW.value AS INTEGER), unixepoch(), 'setting_write'
+         WHERE CAST(NEW.value AS INTEGER) > 0
+           AND CAST(CAST(NEW.value AS INTEGER) AS TEXT) = NEW.value
+           AND EXISTS (SELECT 1 FROM shop_items WHERE id = CAST(NEW.value AS INTEGER))
+           AND NOT EXISTS (SELECT 1 FROM shop_reevaluation_sale_items
+                            WHERE item_id = CAST(NEW.value AS INTEGER));
+        INSERT INTO shop_reevaluation_sale_items (item_id, first_seen_at, source)
+        SELECT CAST(OLD.value AS INTEGER), unixepoch(), 'setting_write_previous'
+         WHERE CAST(OLD.value AS INTEGER) > 0
+           AND CAST(CAST(OLD.value AS INTEGER) AS TEXT) = OLD.value
+           AND EXISTS (SELECT 1 FROM shop_items WHERE id = CAST(OLD.value AS INTEGER))
+           AND NOT EXISTS (SELECT 1 FROM shop_reevaluation_sale_items
+                            WHERE item_id = CAST(OLD.value AS INTEGER));
+      END;
       CREATE TABLE IF NOT EXISTS shop_eval_extension_uses (
         purchase_id INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
         item_id INTEGER NOT NULL REFERENCES shop_items(id),
@@ -748,7 +829,9 @@ export class Shop {
     if (this.options.originalRoleItemId?.() === input.itemId) {
       throw new ShopError("ERR_ORIGINAL_ROLE_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
     }
-    if (this.options.reevalItemId?.() === input.itemId) {
+    // 現在の販売設定だけでなく、**一度でも再評価権として売られた商品**をgenericから守る。
+    // A→B差し替え後もAがenabledなら、旧Aがstorefrontの普通の商品として買われかねない。
+    if (this.isHistoricalReevaluationItem(input.itemId)) {
       throw new ShopError("ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
     }
     const item = this.getItem(input.itemId);
@@ -1321,6 +1404,172 @@ export class Shop {
   }
 
   /**
+   * 「このpurchaseは再評価サービス権として発行されたか」を、**購入時点で確定した記録だけ**から
+   * 判定するSQL述語。呼び出し側は `shop_purchases` を別名 `p` で束ねること。
+   *
+   * 利用者が買っているのは「商品ID #A」ではなく「再評価面談を1回受けて結果を出してもらう権利」
+   * なので、購入が成立した後は現在の商品設定をidentityに使わない。運営が商品を作り直しても、
+   * `shop:reeval_item_id` を変えても、商品をdisabledにしても、既に買った権利は消えない。
+   *
+   * 使ってよい証拠（いずれも購入時に確定し、後から書き換わらない専用記録）:
+   *   1. `shop_purchase_title_provenance.origin='reevaluation'` — 購入時に凍結されたorigin
+   *   2. `shop_reeval_invite_uses` — 再評価専用のinvite消費台帳
+   *   3. purchase-time delivery snapshot が `revoke_meirei` を証明する
+   *   4. 再評価専用writerがpurchase ID付きで残したappend-only event
+   *
+   * 使ってはいけないもの: 現在の `shop:reeval_item_id`、現在の商品名/description、金額だけ、
+   * invite5という数だけ、item IDの推測。これらは後から変更できるので、運営操作で過去の購入の
+   * 意味が変わってしまう。
+   *
+   * **壊れた証拠は「証明できない」であって「lookup全体の失敗」ではない。** `json_extract()` は
+   * malformed JSONに対してSQLite errorを投げる（`COALESCE`では防げない）ので、必ず
+   * `json_valid()` で先に守る。壊れた1行のせいでShop全体の検索が落ちてはいけないし、
+   * かといって壊れた記録から意味を推測して現在の商品定義へfallbackすることもしない
+   * ——NULL・malformed・valid but non-reeval はすべて「証拠なし」に倒す。
+   */
+  private static readonly REEVALUATION_EVIDENCE_SQL = `COALESCE(
+       EXISTS (SELECT 1 FROM shop_purchase_title_provenance v
+                WHERE v.purchase_id = p.id AND v.origin = 'reevaluation')
+    OR EXISTS (SELECT 1 FROM shop_reeval_invite_uses u WHERE u.purchase_id = p.id)
+    OR CASE
+         WHEN p.delivery_snapshot_json IS NULL THEN 0
+         WHEN NOT json_valid(p.delivery_snapshot_json) THEN 0
+         ELSE COALESCE(json_extract(p.delivery_snapshot_json, '$.delivery_kind') = 'revoke_meirei', 0)
+       END
+    OR EXISTS (SELECT 1 FROM events e
+                WHERE e.type IN ('shop_reeval_right_purchased','reeval_legacy_purchase_recovery','reeval_legacy_rollback')
+                  AND CASE
+                        WHEN e.payload_json IS NULL THEN 0
+                        WHEN NOT json_valid(e.payload_json) THEN 0
+                        ELSE COALESCE(json_extract(e.payload_json, '$.purchaseId') = p.id, 0)
+                      END)
+  , 0)`;
+
+  /** 未消費（面談サービス未提供）の再評価権であることを表す条件。消費済みは delivered で表す。 */
+  private static readonly REEVALUATION_UNCONSUMED_SQL = `
+    p.status = 'active' AND p.delivered_at IS NULL
+    AND COALESCE(p.delivery_state, 'pending') <> 'delivered'`;
+
+  /**
+   * この購入は再評価サービス権として発行されたか。現在の商品設定は一切参照しない。
+   */
+  isReevaluationPurchase(purchaseId: number): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS ok FROM shop_purchases p
+          WHERE p.id = ? AND ${Shop.REEVALUATION_EVIDENCE_SQL} LIMIT 1`,
+      )
+      .get(purchaseId) as { ok: number } | undefined;
+    return row !== undefined;
+  }
+
+  /**
+   * userの**未消費**再評価権。ticketへ予約済みかどうかは問わない——予約中でも権利は
+   * まだ消費されていないので、重複購入のブロックにはこちらを使う。
+   */
+  findUnconsumedReevaluationRight(userId: string): { id: number } | null {
+    return (this.db
+      .prepare(
+        `SELECT p.id FROM shop_purchases p
+          WHERE p.user_id = ? AND ${Shop.REEVALUATION_UNCONSUMED_SQL}
+            AND ${Shop.REEVALUATION_EVIDENCE_SQL}
+          ORDER BY p.purchased_at, p.id LIMIT 1`,
+      )
+      .get(userId) as { id: number } | undefined) ?? null;
+  }
+
+  /**
+   * ticketへ新しく**予約**できる再評価権。未消費かつ、どのticketにも予約されていないもの。
+   * 「権利そのものがあるか」（上）と「今ticketへ予約できるか」（ここ）は別の問い。
+   */
+  findUnreservedReevaluationRight(userId: string): { id: number } | null {
+    return (this.db
+      .prepare(
+        `SELECT p.id FROM shop_purchases p
+          WHERE p.user_id = ? AND ${Shop.REEVALUATION_UNCONSUMED_SQL}
+            AND ${Shop.REEVALUATION_EVIDENCE_SQL}
+            AND NOT EXISTS (SELECT 1 FROM tickets t WHERE t.linked_purchase_id = p.id)
+          ORDER BY p.purchased_at, p.id LIMIT 1`,
+      )
+      .get(userId) as { id: number } | undefined) ?? null;
+  }
+
+  /**
+   * 「この商品は再評価サービスの販売商品である」という指定を永続化する。冪等。
+   *
+   * 記録は3層:
+   *   1. **write-time trigger（primary guarantee）** — `settings` への書き込みそのもの。
+   *      Shopが一度も観測しなくても、指定された事実が残る（`ensureSchema()` 参照）。
+   *   2. **read-time sync（repair / compatibility）** — 構築時と、現在の指定を参照した時。
+   *      trigger導入前のDBや、triggerを持たない経路で書かれた設定を後から回収する。
+   *   3. **purchase evidence（pre-registry legacy fallback）** — registry以前の履歴。
+   *
+   * **購入が成立した時点では遅い**——実績0件のまま設定がA→Bへ移ると、最初の利用者が
+   * 「昨日まで再評価商品だったものが普通の商品に化けた」事故に遭う。
+   */
+  registerReevaluationSaleItem(itemId: number, source = "sale_setting"): void {
+    if (!Number.isSafeInteger(itemId) || itemId <= 0) return;
+    if (!this.getItem(itemId)) return; // 実在しないIDは記録しない
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO shop_reevaluation_sale_items (item_id, first_seen_at, source) VALUES (?,?,?)",
+      )
+      .run(itemId, now(), source);
+  }
+
+  /**
+   * この商品は「再評価サービス商品」として一度でも確定したか。
+   * 現在の販売設定から外れた旧商品Aを、generic storefrontへ落とさないための判定。
+   *
+   * 判定材料は3つとも現在の商品名・価格・descriptionから独立している:
+   *   1. 現在の販売設定（今まさに指定されている）
+   *   2. 販売商品registry（過去に指定された事実。購入実績0でも残る）
+   *   3. その商品でのsemantic reevaluation purchase（registry導入前の履歴を拾う）
+   */
+  isHistoricalReevaluationItem(itemId: number): boolean {
+    if (this.currentReevaluationSaleItemId() === itemId) return true;
+    const registered = this.db
+      .prepare("SELECT 1 AS ok FROM shop_reevaluation_sale_items WHERE item_id = ? LIMIT 1")
+      .get(itemId) as { ok: number } | undefined;
+    if (registered !== undefined) return true;
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS ok FROM shop_purchases p
+          WHERE p.item_id = ? AND ${Shop.REEVALUATION_EVIDENCE_SQL} LIMIT 1`,
+      )
+      .get(itemId) as { ok: number } | undefined;
+    return row !== undefined;
+  }
+
+  /**
+   * 例外補償の候補——面談で消費済みで、まだ補償されていない再評価権。
+   * 現在の `shop:reeval_item_id` も現在の商品IDも要件にしない（A→B後・設定未設定でも出る）。
+   */
+  private static readonly REEVALUATION_COMPENSABLE_SQL = `
+    p.status = 'active' AND p.delivered_at IS NOT NULL AND p.delivery_state = 'delivered'
+    AND NOT EXISTS (SELECT 1 FROM shop_reeval_compensations c WHERE c.purchase_id = p.id)`;
+
+  listCompensableReevaluationPurchases(opts: { limit?: number; offset?: number } = {}): PurchaseRow[] {
+    return this.db
+      .prepare(
+        `SELECT p.* FROM shop_purchases p
+          WHERE ${Shop.REEVALUATION_COMPENSABLE_SQL} AND ${Shop.REEVALUATION_EVIDENCE_SQL}
+          ORDER BY p.delivered_at DESC, p.id DESC
+          LIMIT ? OFFSET ?`,
+      )
+      .all(opts.limit ?? 25, opts.offset ?? 0) as PurchaseRow[];
+  }
+
+  countCompensableReevaluationPurchases(): number {
+    return (this.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM shop_purchases p
+          WHERE ${Shop.REEVALUATION_COMPENSABLE_SQL} AND ${Shop.REEVALUATION_EVIDENCE_SQL}`,
+      )
+      .get() as { c: number }).c;
+  }
+
+  /**
    * 再評価権を購入する。資格確認、支払い、購入行、招待使用台帳を同じ IMMEDIATE transaction で確定する。
    */
   checkReevaluationPurchase(input: {
@@ -1328,7 +1577,7 @@ export class Shop {
     userId: string;
     mode: "land" | "invite";
   }): { availableInvites: number } {
-    const configuredId = this.options.reevalItemId?.() ?? null;
+    const configuredId = this.currentReevaluationSaleItemId();
     const item = this.getItem(input.itemId);
     if (
       configuredId !== input.itemId ||
@@ -1342,21 +1591,21 @@ export class Shop {
     ) {
       throw new ShopError("ERR_REEVAL_ITEM_CONFIG", { itemId: input.itemId, configuredId });
     }
+    // ここまで来た＝この商品は再評価販売商品として現在指定されている。購入の成否に関わらず
+    // その事実を残す（実績0件のまま設定が移っても、旧商品がgenericへ落ちない）。
+    this.registerReevaluationSaleItem(item.id, "sale_check");
+    // 面談を受けられない状態なら新しい権利を売らない。UI表示前・chip返還retry・課金直前の
+    // すべてがこの1つの前提条件を通るので、charge pathにpreflightが1箇所しか無い状態にならない。
+    this.options.assertReevaluationIntakeAvailable?.();
     const soul = this.db.prepare("SELECT status FROM souls WHERE user_id = ?").get(input.userId) as
       | { status: string }
       | undefined;
     if (soul?.status !== "meirei") {
       throw new ShopError("ERR_REEVAL_STATUS", { userId: input.userId, status: soul?.status ?? null });
     }
-    const existing = this.db
-      .prepare(
-        `SELECT id FROM shop_purchases
-          WHERE item_id = ? AND user_id = ? AND status = 'active'
-            AND delivered_at IS NULL
-            AND COALESCE(delivery_state, 'pending') <> 'delivered'
-          ORDER BY id DESC LIMIT 1`,
-      )
-      .get(input.itemId, input.userId) as { id: number } | undefined;
+    // 商品IDではなく「未消費の再評価権を持っているか」で重複を判定する。旧商品Aの権利を
+    // 持ったまま新商品Bを買えてはいけない。予約中でも権利は未消費なので除外しない。
+    const existing = this.findUnconsumedReevaluationRight(input.userId);
     if (existing) throw new ShopError("ERR_REEVAL_RIGHT_EXISTS", { purchaseId: existing.id });
     const availableInvites = input.mode === "invite"
       ? (this.db
@@ -1385,12 +1634,15 @@ export class Shop {
     request?: Record<string, unknown>;
     idempotencyKey: string;
   }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
-    const configuredId = this.options.reevalItemId?.() ?? null;
+    const configuredId = this.currentReevaluationSaleItemId();
     if (configuredId !== input.itemId) {
       throw new ShopError("ERR_REEVAL_ITEM_CONFIG", { itemId: input.itemId, configuredId });
     }
     const body = () => {
       // UIでの事前確認とは別に、支払い確定の直前にもDBの正本を再読する。
+      // 500,000Ld / 招待5件を動かす直前に、資格・重複・受付可用性をまとめて再確認する
+      // （`checkReevaluationPurchase` が受付可用性も見る）。表示から確認ボタンまでの間に
+      // panelが停止される余地があるため、UI側のpreflightだけに任せない。
       this.checkReevaluationPurchase({ itemId: input.itemId, userId: input.userId, mode: input.mode });
 
       let inviteIds: number[] = [];
@@ -1455,7 +1707,8 @@ export class Shop {
 
   /** 消費済み再評価権への例外補償。購入・結果・招待使用は一切巻き戻さない。 */
   compensateReevaluation(input: {
-    itemId: number;
+    /** @deprecated 権威ではない。semantic判定が正本——A→B後でもsetting未設定でも補償できる。 */
+    itemId?: number;
     purchaseId: number;
     departmentKey: string;
     amount: number;
@@ -1465,13 +1718,17 @@ export class Shop {
     idempotencyKey: string;
   }): ReevalCompensationRow {
     const departments = this.options.departments;
-    if (this.options.reevalItemId?.() !== input.itemId || !departments) {
-      throw new ShopError("ERR_REEVAL_COMPENSATION_UNAVAILABLE", { itemId: input.itemId });
+    if (!departments) {
+      throw new ShopError("ERR_REEVAL_COMPENSATION_UNAVAILABLE", { purchaseId: input.purchaseId });
     }
     const body = () => {
       const purchase = this.getPurchase(input.purchaseId);
-      if (!purchase || purchase.item_id !== input.itemId) {
+      if (!purchase) {
         throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+      }
+      // 現在の商品IDではなく、その購入が再評価権として発行されたかで判断する。
+      if (!this.isReevaluationPurchase(purchase.id)) {
+        throw new ShopError("ERR_REEVAL_COMPENSATION_UNAVAILABLE", { purchaseId: input.purchaseId });
       }
       if (purchase.status !== "active" || purchase.delivered_at === null || purchase.delivery_state !== "delivered") {
         throw new ShopError("ERR_REEVAL_NOT_CONSUMED", { purchaseId: input.purchaseId });
@@ -1889,6 +2146,12 @@ export class Shop {
    * 除外する商品IDは呼び出し側が決める。再評価チャレンジのように
    * 「配送する物が無く、専用フローが権利を消費する」商品を、ここへ混ぜないため。
    */
+  /**
+   * 手動配送待ちキュー。再評価権は「配送物」ではなく面談で消費するサービス権なので、
+   * `excludeItemIds`（現在の設定由来）だけでなくsemantic判定でも除外する——A→B差し替え後の
+   * 未消費Aが「終わらせる方法が無い仕事」としてキューに居座らないように。
+   * list と count の両方へ同じ除外を掛ける（表示だけ絞ってcountがズレる形にしない）。
+   */
   listPendingManual(
     opts: { excludeItemIds?: readonly number[]; limit?: number } = {},
   ): Array<PurchaseRow & { item_name: string }> {
@@ -1903,6 +2166,7 @@ export class Shop {
             AND p.delivery_snapshot_json IS NULL
             AND p.delivered_at IS NULL
             ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}
+            AND NOT ${Shop.REEVALUATION_EVIDENCE_SQL}
           ORDER BY p.purchased_at
           LIMIT ?`,
       )
@@ -1918,7 +2182,8 @@ export class Shop {
         `SELECT COUNT(*) AS c
            FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
           WHERE p.status = 'active' AND p.delivery_snapshot_json IS NULL AND p.delivered_at IS NULL
-            ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}`,
+            ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}
+            AND NOT ${Shop.REEVALUATION_EVIDENCE_SQL}`,
       )
       .get(...exclude) as { c: number };
     return row.c;

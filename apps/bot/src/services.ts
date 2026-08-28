@@ -33,6 +33,7 @@ import {
   PublicEvents,
   CasinoParticipationHistory,
   Shop,
+  ShopError,
   ChipLedger,
   ETHER_ESCROW,
   HOUSE_HOLDER,
@@ -64,6 +65,7 @@ import {
   registerDefaultTxTypes,
   RoleFamilyTemporal,
 } from "@meigokujo/core";
+import { reevaluationIntakeUnavailableReason } from "./commands/reeval.js";
 import { config } from "./config.js";
 import { meetsRoleRequirement } from "./rank-requirement.js";
 import { seedSpecialProfiles } from "./special-profile.js";
@@ -169,6 +171,12 @@ export function buildServices() {
     reevalItemId: () => {
       const id = Number(settings.getString("shop:reeval_item_id"));
       return Number.isSafeInteger(id) && id > 0 ? id : null;
+    },
+    // 面談受付が使えないなら再評価権を売らない。UIのpreflightだけに任せず、Landや招待実績を
+    // 動かす直前（purchase transaction内）からも同じDB正本を見る。
+    assertReevaluationIntakeAvailable: () => {
+      const reason = reevaluationIntakeUnavailableReason({ tickets });
+      if (reason !== null) throw new ShopError("ERR_REEVAL_INTAKE_UNAVAILABLE", { reason });
     },
     originalRoleItemId: () => {
       const id = Number(settings.getString("shop:original_role_item_id"));
