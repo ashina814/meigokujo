@@ -172,9 +172,9 @@ describe("original role service invoices", () => {
 
   it("generic shop経由では設定済みオリロ商品を買えない", () => {
     const ctx = setup();
-    expect(() => ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [] })).toThrowError(ShopError);
+    expect(() => ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, itemId: ctx.item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [] })).toThrowError(ShopError);
     try {
-      ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [] });
+      ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, itemId: ctx.item.id, userId: USER, actor: `user:${USER}`, memberRoleIds: [] });
     } catch (error) {
       expect((error as ShopError).code).toBe("ERR_ORIGINAL_ROLE_SPECIAL_PURCHASE_REQUIRED");
     }

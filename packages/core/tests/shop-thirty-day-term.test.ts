@@ -75,7 +75,7 @@ describe("期限の数え方", () => {
     const item = termItem(ctx);
     fund(ctx, "u1", 10_000);
 
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
 
     expect(p.expires_at! - p.purchased_at).toBe(30 * DAY);
     ctx.db.close();
@@ -86,7 +86,7 @@ describe("期限の数え方", () => {
     const item = ctx.shop.createItem({ name: "単発", price_land: 100, kind: "one_shot", delivery: "manual" }, "staff");
     fund(ctx, "u1", 10_000);
 
-    expect(ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase.expires_at).toBeNull();
+    expect(ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase.expires_at).toBeNull();
     ctx.db.close();
   });
 
@@ -115,6 +115,7 @@ describe("汎用の期限付きアクセス", () => {
     const before = ctx.ledger.balanceOf("user:legacy");
 
     expect(() => ctx.shop.purchase({
+      expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken,
       itemId: item.id,
       userId: "legacy",
       actor: "legacy",
@@ -135,7 +136,7 @@ describe("汎用の期限付きアクセス", () => {
     fund(ctx, "u1", 10_000);
     const before = ctx.ledger.balanceOf("user:u1");
 
-    expect(() => ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }))
+    expect(() => ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }))
       .toThrow("ERR_TIMED_ACCESS_CONFIG");
     expect(ctx.ledger.balanceOf("user:u1")).toBe(before);
     expect(ctx.shop.listUserPurchases("u1")).toEqual([]);
@@ -156,7 +157,7 @@ describe("汎用の期限付きアクセス", () => {
       "staff",
     );
     fund(ctx, "u1", 10_000);
-    const purchase = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
 
     expect(ctx.shop.listActiveTimedAccess("u1")).toMatchObject([
       { purchase: { id: purchase.id }, item: { id: item.id }, roleId: "access-role", channelId: "access-channel" },
@@ -170,7 +171,7 @@ describe("汎用の期限付きアクセス", () => {
     const ctx = setup();
     const item = termItem(ctx);
     fund(ctx, "legacy", 10_000);
-    const purchase = ctx.shop.purchase({ itemId: item.id, userId: "legacy", actor: "legacy", memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "legacy", actor: "legacy", memberRoleIds: [] }).purchase;
     ctx.db.prepare(
       "UPDATE shop_purchases SET delivery_snapshot_json=NULL, delivery_state='delivered' WHERE id=?",
     ).run(purchase.id);
@@ -196,7 +197,7 @@ describe("role-only利用者の一回限りlegacy移行", () => {
     const ctx = setup();
     const item = termItem(ctx);
     fund(ctx, "active", 10_000);
-    const existing = ctx.shop.purchase({ itemId: item.id, userId: "active", actor: "active", memberRoleIds: [] }).purchase;
+    const existing = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "active", actor: "active", memberRoleIds: [] }).purchase;
     const txBefore = ctx.db.prepare("SELECT COUNT(*) AS n FROM transactions").get() as { n: number };
 
     const result = migrate(ctx, item.id, ["legacy-b", "active", "legacy-a", "legacy-a"], 2);
@@ -232,7 +233,7 @@ describe("role-only利用者の一回限りlegacy移行", () => {
     const ctx = setup();
     const item = termItem(ctx);
     fund(ctx, "returning", 10_000);
-    const old = ctx.shop.purchase({ itemId: item.id, userId: "returning", actor: "returning", memberRoleIds: [] }).purchase;
+    const old = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "returning", actor: "returning", memberRoleIds: [] }).purchase;
     ctx.db.prepare("UPDATE shop_purchases SET status='expired' WHERE id=?").run(old.id);
 
     const result = migrate(ctx, item.id, ["returning"], 1);
@@ -324,7 +325,7 @@ describe("延長", () => {
     const ctx = setup();
     const item = termItem(ctx);
     fund(ctx, "u1", 10_000);
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
     const balance = ctx.ledger.balanceOf("user:u1");
 
     const result = ctx.shop.extend(extendInput(ctx, p.id, "u1", "op-1"));
@@ -340,7 +341,7 @@ describe("延長", () => {
     const ctx = setup();
     const item = termItem(ctx);
     fund(ctx, "u1", 10_000);
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
 
     const input = extendInput(ctx, p.id, "u1", "op-1");
     const first = ctx.shop.extend(input);
@@ -358,7 +359,7 @@ describe("延長", () => {
     const ctx = setup();
     const item = termItem(ctx);
     fund(ctx, "u1", 1_000);
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
 
     expect(() => ctx.shop.extend(extendInput(ctx, p.id, "u2", "x"))).toThrow("ERR_NOT_OWNER");
     // 残高は購入で使い切っている
@@ -373,9 +374,9 @@ describe("延長", () => {
     const ctx = setup();
     const item = termItem(ctx);
     fund(ctx, "u1", 10_000);
-    ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] });
 
-    expect(() => ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] })).toThrow(
+    expect(() => ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] })).toThrow(
       "ERR_ALREADY_ACTIVE",
     );
     ctx.db.close();
@@ -389,7 +390,7 @@ describe("期限が近い契約", () => {
     const now = Math.floor(Date.now() / 1000);
     for (const [user, offset] of [["soon", 2 * DAY], ["later", 10 * DAY], ["gone", -DAY]] as const) {
       fund(ctx, user, 10_000);
-      const p = ctx.shop.purchase({ itemId: item.id, userId: user, actor: user, memberRoleIds: [] }).purchase;
+      const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: user, actor: user, memberRoleIds: [] }).purchase;
       ctx.db.prepare("UPDATE shop_purchases SET expires_at = ? WHERE id = ?").run(now + offset, p.id);
     }
 
@@ -416,7 +417,7 @@ describe("暦月からの移行", () => {
       const mk = (userId: string, purchasedAt: number) => {
         ledger.ensureAccount(`user:${userId}`, "user");
         ledger.transfer({ from: TREASURY, to: `user:${userId}`, amount: 10_000, type: "adjust", actor: "t", approvedBy: "t", idempotencyKey: `s:${userId}` });
-        const p = shop.purchase({ itemId: item.id, userId, actor: userId, memberRoleIds: [] }).purchase;
+        const p = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId, actor: userId, memberRoleIds: [] }).purchase;
         before.prepare("UPDATE shop_purchases SET purchased_at = ?, expires_at = ? WHERE id = ?").run(purchasedAt, monthEnd, p.id);
         return p.id;
       };
@@ -478,7 +479,7 @@ describe("汎用延長を受け付ける商品の線引き", () => {
     const ctx = setup();
     const item = manualTermItem(ctx);
     fund(ctx, "u1", 10_000);
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
     const balance = ctx.ledger.balanceOf("user:u1");
 
     expect(() => ctx.shop.extend(extendInput(ctx, p.id, "u1", "op-1"))).toThrow("ERR_NOT_EXTENDABLE");
@@ -494,7 +495,7 @@ describe("確認した内容と実際の課金内容", () => {
       const ctx = setup();
       const item = termItem(ctx);
       fund(ctx, "u1", 10_000);
-      const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+      const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
       const stale = extendInput(ctx, p.id, "u1", `op-${change}`);
       // 確認画面を出したあとに条件が動く
       if (change === "price") ctx.shop.updateItem(item.id, { price_land: 2_000 }, "staff");
@@ -513,7 +514,7 @@ describe("確認した内容と実際の課金内容", () => {
     const ctx = setup();
     const item = termItem(ctx);
     fund(ctx, "u1", 10_000);
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
     const old = extendInput(ctx, p.id, "u1", "op-old");
     ctx.shop.extend(extendInput(ctx, p.id, "u1", "op-new")); // 別の画面から先に延長された
 
@@ -529,7 +530,7 @@ describe("課金と期限更新の原子性", () => {
     const ctx = setup();
     const item = termItem(ctx);
     fund(ctx, "u1", 10_000);
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
     const balance = ctx.ledger.balanceOf("user:u1");
     const input = extendInput(ctx, p.id, "u1", "op-1");
     // 課金の**後**に来る期限更新だけを失敗させる
@@ -562,7 +563,7 @@ describe("延長時の階級要件", () => {
     const item = termItem(ctx);
     ctx.shop.updateItem(item.id, { require_role_id: "role-majin" }, "staff");
     fund(ctx, "u1", 10_000);
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: ["role-majin"] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: ["role-majin"] }).purchase;
     const balance = ctx.ledger.balanceOf("user:u1");
 
     // いまは要件ロールを持っていない

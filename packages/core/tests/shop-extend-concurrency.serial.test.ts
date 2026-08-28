@@ -80,7 +80,7 @@ function setupDb() {
   );
   ledger.ensureAccount("user:alice", "user");
   ledger.transfer({ from: TREASURY, to: "user:alice", amount: 1_000_000, type: "initial", actor: "t", idempotencyKey: "seed:alice" });
-  const purchase = shop.purchase({ itemId: item.id, userId: "alice", actor: "alice", memberRoleIds: [] }).purchase;
+  const purchase = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "alice", actor: "alice", memberRoleIds: [] }).purchase;
   const expected = { priceLand: item.price_land!, days: termDays(item)!, expiresAt: purchase.expires_at };
   const balance = ledger.balanceOf("user:alice");
   db.close();

@@ -59,7 +59,7 @@ describe("期限切れの失効（課金から独立）", () => {
     const ctx = setup();
     const item = roleItem(ctx, "30日券", "role_a");
     fund(ctx, "u1", 1_000);
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
     ctx.db.prepare("UPDATE shop_purchases SET expires_at = 1 WHERE id = ?").run(p.id);
 
     const { expired, failed } = ctx.shop.expireOverdue("system:test");
@@ -76,7 +76,7 @@ describe("期限切れの失効（課金から独立）", () => {
     const ctx = setup();
     const item = roleItem(ctx, "30日券", "role_a");
     fund(ctx, "u1", 1_000);
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
     const balanceAfterPurchase = ctx.ledger.balanceOf("user:u1");
     ctx.db.prepare("UPDATE shop_purchases SET expires_at = 1 WHERE id = ?").run(p.id);
 
@@ -93,7 +93,7 @@ describe("期限切れの失効（課金から独立）", () => {
     const ctx = setup();
     const item = roleItem(ctx, "30日券", "role_a");
     fund(ctx, "u1", 1_000);
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
 
     expect(ctx.shop.expireOverdue("system:test").expired).toEqual([]);
     expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
@@ -105,7 +105,7 @@ describe("期限切れの失効（課金から独立）", () => {
     const ctx = setup();
     const item = ctx.shop.createItem({ name: "単発", price_land: 100, kind: "one_shot", delivery: "manual" }, "staff");
     fund(ctx, "u1", 1_000);
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
 
     expect(ctx.shop.expireOverdue("system:test").expired).toEqual([]);
     expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
@@ -116,7 +116,7 @@ describe("期限切れの失効（課金から独立）", () => {
     const ctx = setup();
     const item = roleItem(ctx, "30日券", "role_a");
     fund(ctx, "u1", 1_000);
-    const p = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
     ctx.db.prepare("UPDATE shop_purchases SET expires_at = 1 WHERE id = ?").run(p.id);
 
     ctx.shop.expireOverdue("system:test");
@@ -133,7 +133,7 @@ describe("期限切れの失効（課金から独立）", () => {
     const item = roleItem(ctx, "30日券", "role_a");
     for (const u of ["u1", "u2", "u3"]) {
       fund(ctx, u, 1_000);
-      const p = ctx.shop.purchase({ itemId: item.id, userId: u, actor: u, memberRoleIds: [] }).purchase;
+      const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: u, actor: u, memberRoleIds: [] }).purchase;
       ctx.db.prepare("UPDATE shop_purchases SET expires_at = 1 WHERE id = ?").run(p.id);
     }
 
@@ -149,10 +149,10 @@ describe("期限切れの失効（課金から独立）", () => {
     const ctx = setup();
     const item = roleItem(ctx, "30日券", "role_a");
     fund(ctx, "u1", 1_000);
-    const old = ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    const old = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
     ctx.db.prepare("UPDATE shop_purchases SET expires_at = 1 WHERE id = ?").run(old.id);
     ctx.shop.expireOverdue("system:test");
-    ctx.shop.purchase({ itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] });
 
     expect(ctx.shop.activePurchaseGrantsRole("u1", "role_a", old.id)).toBe(true);
     ctx.db.close();
@@ -164,7 +164,7 @@ describe("期限切れの失効（課金から独立）", () => {
     const ids: number[] = [];
     for (const u of ["u1", "u2", "u3"]) {
       fund(ctx, u, 1_000);
-      const p = ctx.shop.purchase({ itemId: item.id, userId: u, actor: u, memberRoleIds: [] }).purchase;
+      const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: u, actor: u, memberRoleIds: [] }).purchase;
       ctx.db.prepare("UPDATE shop_purchases SET expires_at = ? WHERE id = ?").run(ids.length + 1, p.id);
       ids.push(p.id);
     }

@@ -260,6 +260,8 @@ export {
   type ReevalCompensationRow,
   type EvaluationExtensionQuote,
   type EvaluationExtensionUseRow,
+  type GenericPurchaseTerms,
+  type GenericPurchaseQuote,
 } from "./shop/service.js";
 export {
   Tickets,

@@ -32,7 +32,7 @@ function setup() {
 
 describe("同じ秒の2回目の購入", () => {
   const buy = (ctx: ReturnType<typeof setup>, key?: string) =>
-    ctx.shop.purchase({ userId: USER, itemId: ctx.item.id, actor: "t", memberRoleIds: [], idempotencyKey: key });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, userId: USER, itemId: ctx.item.id, actor: "t", memberRoleIds: [], idempotencyKey: key });
 
   it("**操作ごとの鍵を渡せば、2回目もきちんと課金される**", () => {
     const ctx = setup();

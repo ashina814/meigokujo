@@ -78,7 +78,7 @@ const buy = (ctx: Ctx, itemId: number) => {
       mode: "land", idempotencyKey: `reeval:${USER}:${Math.random()}`,
     }).purchase;
   }
-  return ctx.shop.purchase({ itemId, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+  return ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(itemId).termsToken, itemId, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
 };
 
 /** 別の利用者としてまとめて購入する（キューを積むため） */
@@ -100,7 +100,7 @@ function buyAs(ctx: Ctx, itemId: number, userId: string) {
       mode: "land", idempotencyKey: `reeval:${userId}:${Math.random()}`,
     }).purchase;
   }
-  return ctx.shop.purchase({ itemId, userId, actor: userId, memberRoleIds: [] }).purchase;
+  return ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(itemId).termsToken, itemId, userId, actor: userId, memberRoleIds: [] }).purchase;
 }
 
 /** 常設パネル（=ephemeralではないメッセージ）から押した体のインタラクション */
@@ -410,7 +410,7 @@ describe("通知", () => {
     ctx.settings.set("channel:kessai", "ch-1", "staff");
     const send = vi.fn(async () => undefined);
     const interaction = {
-      customId: `shop:buy:${ctx.nickname.id}:land`,
+      customId: `shop:buy:${ctx.nickname.id}:land:${ctx.shop.quoteGenericPurchase(ctx.nickname.id).termsToken}`,
       user: { id: USER },
       guildId: "g1",
       guild: { id: "g1", members: { fetch: vi.fn(async () => ({ id: USER, roles: { cache: new Collection() } })) } },
@@ -587,7 +587,7 @@ describe("自動処理の失敗通知", () => {
     ctx.settings.set("channel:kessai", "ch-1", "staff");
     const send = vi.fn(async () => undefined);
     const interaction = {
-      customId: `shop:buy:${ctx.pass.id}:land`,
+      customId: `shop:buy:${ctx.pass.id}:land:${ctx.shop.quoteGenericPurchase(ctx.pass.id).termsToken}`,
       user: { id: USER },
       guildId: "g1",
       guild: {

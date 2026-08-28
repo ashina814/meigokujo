@@ -85,7 +85,7 @@ function buy(ctx: ReturnType<typeof setup>): PurchaseRow {
     actor: "test",
     idempotencyKey: `seed-${Math.random()}`,
   });
-  const result = ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: "test", memberRoleIds: [] });
+  const result = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, itemId: ctx.item.id, userId: USER, actor: "test", memberRoleIds: [] });
   return result.purchase;
 }
 
@@ -213,7 +213,7 @@ describe("再評価チャレンジ（revoke_meirei）は自動配送しない", 
       actor: "test",
       idempotencyKey: `seed-${Math.random()}`,
     });
-    return ctx.shop.purchase({ itemId: item.id, userId: USER, actor: "test", memberRoleIds: [] }).purchase;
+    return ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: USER, actor: "test", memberRoleIds: [] }).purchase;
   }
 
   it("status も迷霊ロールも変えない（面談を経ずに復帰させない）", async () => {

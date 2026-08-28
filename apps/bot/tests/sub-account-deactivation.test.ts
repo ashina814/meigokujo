@@ -67,6 +67,7 @@ function paidActive(ctx: ReturnType<typeof setup>) {
     "staff",
   );
   const purchase = ctx.shop.purchase({
+    expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken,
     itemId: item.id,
     userId: MAIN,
     actor: "test",

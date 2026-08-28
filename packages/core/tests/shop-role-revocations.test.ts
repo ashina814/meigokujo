@@ -44,10 +44,10 @@ describe("ショップ 失効時のロール剥奪キュー", () => {
   it("失効購入Aの後に同じ商品を再購入Bした場合、有効購入が同じロールを保護する", () => {
     const { shop, createRoleItem, db } = setup();
     const item = createRoleItem("月額A", "role_old");
-    const a = shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
+    const a = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     lapse(db, a.id);
     shop.expireOverdue("system:test");
-    const b = shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
+    const b = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
 
     expect(b.status).toBe("active");
     expect(shop.activePurchaseGrantsRole("user1", "role_old", a.id)).toBe(true);
@@ -57,10 +57,10 @@ describe("ショップ 失効時のロール剥奪キュー", () => {
     const { shop, createRoleItem, db } = setup();
     const aItem = createRoleItem("月額A", "role_shared");
     const bItem = createRoleItem("月額B", "role_shared");
-    const a = shop.purchase({ itemId: aItem.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
+    const a = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(aItem.id).termsToken, itemId: aItem.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     lapse(db, a.id);
     shop.expireOverdue("system:test");
-    shop.purchase({ itemId: bItem.id, userId: "user1", actor: "user1", memberRoleIds: [] });
+    shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(bItem.id).termsToken, itemId: bItem.id, userId: "user1", actor: "user1", memberRoleIds: [] });
 
     expect(shop.activePurchaseGrantsRole("user1", "role_shared", a.id)).toBe(true);
   });
@@ -68,7 +68,7 @@ describe("ショップ 失効時のロール剥奪キュー", () => {
   it("active購入がなければ保護しない", () => {
     const { shop, createRoleItem, db } = setup();
     const item = createRoleItem("月額A", "role_old");
-    const a = shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
+    const a = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     lapse(db, a.id);
     shop.expireOverdue("system:test");
 
@@ -78,7 +78,7 @@ describe("ショップ 失効時のロール剥奪キュー", () => {
   it("商品設定のrole_idを後から変更しても、購入時スナップショットのロールを剥奪対象にする", () => {
     const { shop, createRoleItem, db } = setup();
     const item = createRoleItem("月額A", "role_old");
-    const a = shop.purchase({ itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
+    const a = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     shop.updateItem(item.id, { delivery_data: JSON.stringify({ role_id: "role_new" }) }, "staff");
     lapse(db, a.id);
     shop.expireOverdue("system:test");
@@ -90,8 +90,8 @@ describe("ショップ 失効時のロール剥奪キュー", () => {
     const { shop, createRoleItem, db } = setup();
     const bad = createRoleItem("bad", "unused");
     const good = createRoleItem("good", "role_good");
-    const pBad = shop.purchase({ itemId: bad.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
-    const pGood = shop.purchase({ itemId: good.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
+    const pBad = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(bad.id).termsToken, itemId: bad.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
+    const pGood = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(good.id).termsToken, itemId: good.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     db.prepare("UPDATE shop_purchases SET delivery_snapshot_json='{' WHERE id=?").run(pBad.id);
     lapse(db, pBad.id);
     lapse(db, pGood.id);

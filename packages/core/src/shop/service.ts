@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { Ledger, TREASURY } from "../ledger/service.js";
 import { EventLog } from "../events/service.js";
@@ -246,6 +247,9 @@ export type ShopErrorCode =
   | "ERR_REEVAL_ALREADY_COMPENSATED"
   | "ERR_REEVAL_COMPENSATION_UNAVAILABLE"
   | "ERR_REEVAL_INTAKE_UNAVAILABLE"
+  | "ERR_ALT_PAYMENT_UNSUPPORTED"
+  | "ERR_ALT_REFUND_UNSUPPORTED"
+  | "ERR_TERMS_TOKEN_REQUIRED"
   | "ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_EVAL_EXTENSION_ITEM_CONFIG"
   | "ERR_EVAL_EXTENSION_STATUS"
@@ -258,6 +262,96 @@ export class ShopError extends Error {
     super(code);
     this.name = "ShopError";
   }
+}
+
+/**
+ * 利用者が画面で確認した「購入契約」の正本。generic storefrontで課金する前に、この内容が
+ * 表示時と同じであることを確認する。
+ *
+ * **含めるもの** — 表示した内容そのもの: 商品ID / 支払方法 / Land価格 / 名前 / 説明 /
+ * 種別 / 期間 / 必要ロール / 配送方法・種別・設定。同じ価格でも「30日→7日」「role A→role B」
+ * のように**中身が変われば別の契約**なので、価格だけを見る実装では足りない。
+ *
+ * **含めないもの**:
+ *   - `stock` の表示時個数 — 他人が1個買っただけで全員の確認をstaleにする必要はない。
+ *     確定時に「まだ在庫がある」ことだけ確認する。
+ *   - `enabled` — 確定時に現在もenabledかを見れば足りる。
+ *   - `updated_at` — 秒単位で、同一秒の複数更新を区別できず、在庫減でも動く。
+ *     「どの条件が契約なのか」と一致しないので identity には使わない。
+ */
+export interface GenericPurchaseTerms {
+  readonly itemId: number;
+  readonly mode: "land";
+  readonly priceLand: number | null;
+  readonly name: string;
+  readonly description: string | null;
+  readonly kind: string;
+  readonly durationDays: number | null;
+  readonly requireRoleId: string | null;
+  readonly delivery: string;
+  readonly deliveryKind: string | null;
+  readonly deliveryData: string | null;
+}
+
+export interface GenericPurchaseQuote {
+  readonly terms: GenericPurchaseTerms;
+  /** 表示時termsのopaqueな指紋。Discord custom IDへ全termsを埋め込まないための identity。 */
+  readonly termsToken: string;
+}
+
+/**
+ * canonicalization と token生成は**ここ1箇所だけ**。Bot側で同じJSON/hashロジックを
+ * 複製すると、片方だけ変えたときに「表示は通るのに課金で落ちる」ような食い違いが生まれる。
+ */
+function canonicalGenericTerms(item: ShopItemRow): GenericPurchaseTerms {
+  return {
+    itemId: item.id,
+    mode: "land",
+    priceLand: item.price_land ?? null,
+    name: item.name,
+    description: item.description ?? null,
+    kind: item.kind,
+    durationDays: item.duration_days ?? null,
+    requireRoleId: item.require_role_id ?? null,
+    delivery: item.delivery,
+    deliveryKind: item.delivery_kind ?? null,
+    deliveryData: item.delivery_data ?? null,
+  };
+}
+
+/**
+ * 表示した契約の指紋の長さ（文字数）。Discordのcustom ID上限は100文字で、名前変更の
+ * 確定ボタンには商品ID・確認ID(19桁)・料金・指紋・希望する名前(最長32文字)が同居する。
+ * ここを伸ばすとボタンごとDiscordに拒否されるので、文字数は動かさない。
+ */
+const GENERIC_TERMS_TOKEN_LENGTH = 16;
+
+/** 指紋のbit幅。base64urlは1文字6bitなので、16文字 = 12バイト = 96bit。 */
+const GENERIC_TERMS_TOKEN_BYTES = 12;
+
+/**
+ * 生成した指紋が取りうる形（base64urlの文字だけ・決まった長さ）。長さの定数から作るので、
+ * 片方だけ変えて「検証は通るのに実際の指紋と形が違う」がおきない。
+ */
+const GENERIC_TERMS_TOKEN_PATTERN = new RegExp(`^[A-Za-z0-9_-]{${GENERIC_TERMS_TOKEN_LENGTH}}$`);
+
+function genericTermsToken(terms: GenericPurchaseTerms): string {
+  // 順序固定のtuple。JSON.stringifyのkey順に依存させない。
+  const canonical = JSON.stringify([
+    terms.itemId, terms.mode, terms.priceLand, terms.name, terms.description,
+    terms.kind, terms.durationDays, terms.requireRoleId,
+    terms.delivery, terms.deliveryKind, terms.deliveryData,
+  ]);
+  // **衝突は「契約が変わったのに気づかない」＝まさに防ぎたい結果**なので、
+  // 「衝突しても安全」ではない。文字数は変えられないため、同じ16文字で情報量を上げる。
+  // hexは1文字4bitで16文字=64bit。base64urlは1文字6bitなので16文字=96bit。
+  // これは認可のための秘密ではない（利用者にも見えるcustom IDに載る）。あくまで
+  // 表示した契約と現在の契約が同じかを確かめるための指紋。
+  return createHash("sha256")
+    .update(canonical, "utf8")
+    .digest()
+    .subarray(0, GENERIC_TERMS_TOKEN_BYTES)
+    .toString("base64url");
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -801,6 +895,36 @@ export class Shop {
   // ---- 購入 ----
 
   /**
+   * generic storefrontの購入契約を表示時に確定する。Botはここで得た `termsToken` だけを
+   * ボタンへ持たせ、確定時にCoreが現在の商品から再生成して比較する。
+   */
+  quoteGenericPurchase(itemId: number): GenericPurchaseQuote {
+    const item = this.getItem(itemId);
+    if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId });
+    const terms = canonicalGenericTerms(item);
+    return { terms, termsToken: genericTermsToken(terms) };
+  }
+
+  /**
+   * generic storefrontで代替支払（invite等）が実際に使えるか。
+   *
+   * `price_alt_kind != null` は「使える」の根拠にならない——**その資源を実際に消費できる
+   * 専用writerがあるか**が authority。現状、資源を消費する経路を持つのは再評価チャレンジの
+   * invite払い（`purchaseReevaluation`）だけで、それは専用商品なのでgenericには出さない。
+   *
+   * **`true` を返してよくなる条件**（3つ揃うまでは false のまま）:
+   *   1. その資源を実際に減らす writer があること（`paid_alt_*` を書くだけは支払いではない）
+   *   2. 失敗したときの後始末が決まっていること——巻き戻し・返金・取り消しのどれで、
+   *      誰がやるのか。`refund()` が戻せない資源は generic refund の対象外のままなので、
+   *      「配送に失敗したらどうするか」を先に決めていないと課金だけが残る
+   *   3. 1と2を固定するテストがあること
+   * 支払方法ごとの handler registry のような一般化は、実際に2つ目が現れてから考える。
+   */
+  genericAltPaymentSupported(_itemId: number): boolean {
+    return false;
+  }
+
+  /**
    * 商品を購入する。
    * - 権限（require_role_id）は bot 側で事前チェック（このメソッドには memberRoleIds を渡す）
    * - Land支払いは tip_burn で TREASURY 焼却（インフレ抑制）
@@ -825,6 +949,17 @@ export class Shop {
      * 購入行だけができて Land が動かない。
      */
     idempotencyKey?: string;
+    /**
+     * 表示時に確定した契約の指紋（`quoteGenericPurchase()` の `termsToken`）。
+     *
+     * **必須**。「先に契約を見せた」証拠なしにgeneric購入は成立させない。省略できる
+     * ようにしておくと、Bot以外のcallerが quote を取らずに現在の条件でそのまま課金
+     * できてしまい、「Coreが最後の関門」という前提が崩れる。
+     *
+     * 専用商品（再評価・評価延長・オリジナルロール・請求）はそれぞれ専用writerが
+     * 固有の事前条件を持つので、この経路は通らない。
+     */
+    expectedTermsToken: string;
   }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
     if (this.options.originalRoleItemId?.() === input.itemId) {
       throw new ShopError("ERR_ORIGINAL_ROLE_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
@@ -837,6 +972,17 @@ export class Shop {
     const item = this.getItem(input.itemId);
     if (item && isEvaluationExtensionItem(item)) {
       throw new ShopError("ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
+    }
+    // 専用商品のguardを通り抜けた「普通の商品」について、代替支払は成立させない。
+    // 旧実装は`paid_alt_*`を書くだけで資源を消費しておらず、**払っていないのに支払済み購入**が
+    // 成立しえた。altが使えないからLandへ落とす、も禁止——利用者はinviteで払うと言っている。
+    if (input.payAlt) {
+      throw new ShopError("ERR_ALT_PAYMENT_UNSUPPORTED", { itemId: input.itemId });
+    }
+    // 型を迂回するcaller（JSからの呼び出し・any経由）にも効かせる。undefined・空文字・
+    // 形の違う値は「契約を見せた証拠が無い」であって、現在の条件で課金してよい理由にはならない。
+    if (typeof input.expectedTermsToken !== "string" || !GENERIC_TERMS_TOKEN_PATTERN.test(input.expectedTermsToken)) {
+      throw new ShopError("ERR_TERMS_TOKEN_REQUIRED", { itemId: input.itemId });
     }
     const run = () => this.purchaseInternal({ ...input, titleOrigin: "storefront" });
     return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
@@ -1044,10 +1190,19 @@ export class Shop {
     payAlt?: boolean;
     request?: Record<string, unknown>;
     idempotencyKey?: string;
+    expectedTermsToken?: string;
     titleOrigin: Exclude<ShopPurchaseTitleOrigin, "original_role_invoice" | "legacy_timed_access_import">;
   }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
     const item = this.getItem(input.itemId);
     if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: input.itemId });
+    // 表示時に確定した契約と、いま課金しようとしている契約が同じかを、Landを動かす前に見る。
+    // enabled / stock は identity ではなく現在値で確認する（下の既存チェック）。
+    if (input.expectedTermsToken !== undefined) {
+      const currentToken = genericTermsToken(canonicalGenericTerms(item));
+      if (currentToken !== input.expectedTermsToken) {
+        throw new ShopError("ERR_TERMS_CHANGED", { itemId: item.id });
+      }
+    }
     if (!item.enabled) throw new ShopError("ERR_ITEM_DISABLED", { itemId: item.id });
     if (item.require_role_id && !this.roleSatisfied(input.memberRoleIds, item.require_role_id)) {
       throw new ShopError("ERR_ROLE_REQUIRED", { roleId: item.require_role_id });
@@ -1940,6 +2095,13 @@ export class Shop {
       // 提供済みのものは返さない（ニックネームが変わったのに返金する、を防ぐ）
       if (purchase.delivered_at !== null || purchase.delivery_state === "delivered") {
         throw new ShopError("ERR_ALREADY_DELIVERED", { purchaseId });
+      }
+      // 代替支払を含む購入は generic refund の対象外。何をどこへ戻すべきかを generic refund は
+      // 知らないし、`paid_alt_*` は「実際にその資源が減った」証拠でもない（旧実装は資源を
+      // 消費していなかった）。amount=0 のまま status='refunded' にすると、**資産を戻して
+      // いないのに「返金完了」という嘘**を台帳へ書くことになる。人へ escalate する。
+      if (purchase.paid_alt_kind !== null || purchase.paid_alt_amount !== null) {
+        throw new ShopError("ERR_ALT_REFUND_UNSUPPORTED", { purchaseId });
       }
       const amount = purchase.paid_land ?? 0;
       if (amount > 0) {

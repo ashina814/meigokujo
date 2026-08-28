@@ -102,7 +102,8 @@ function fund(ctx: Ctx, amount: number) {
 /** 購入ボタンの実インタラクション。#決裁への送信は spy で見る */
 function buyInteraction(ctx: Ctx, itemId: number, send: ReturnType<typeof vi.fn>) {
   return {
-    customId: `shop:buy:${itemId}:land`,
+    // 実際に表示されるボタンと同じ形（表示時の契約をtokenで持つ）
+    customId: `shop:buy:${itemId}:land:${ctx.shop.quoteGenericPurchase(itemId).termsToken}`,
     user: { id: USER },
     guildId: "g1",
     guild: { id: "g1", members: { fetch: vi.fn(async () => ({ id: USER, roles: { cache: new Collection() } })) } },
@@ -119,7 +120,7 @@ function buyInteraction(ctx: Ctx, itemId: number, send: ReturnType<typeof vi.fn>
 const lastReply = (fn: ReturnType<typeof vi.fn>) => String((fn.mock.calls.at(-1) as never[])[0].content ?? "");
 
 describe("期限付きアクセスの購入体験", () => {
-  function accessBuyInteraction(itemId: number, initialRoles: string[] = []) {
+  function accessBuyInteraction(ctx: Ctx, itemId: number, initialRoles: string[] = []) {
     const cache = new Collection(initialRoles.map((id) => [id, { id }]));
     const member = {
       id: USER,
@@ -131,7 +132,7 @@ describe("期限付きアクセスの購入体験", () => {
     const editReply = vi.fn(async () => undefined);
     return {
       interaction: {
-        customId: `shop:buy:${itemId}:land`,
+        customId: `shop:buy:${itemId}:land:${ctx.shop.quoteGenericPurchase(itemId).termsToken}`,
         user: { id: USER },
         guildId: "g1",
         guild: { id: "g1", members: { fetch: vi.fn(async () => member) } },
@@ -150,7 +151,7 @@ describe("期限付きアクセスの購入体験", () => {
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 200_000);
-    const ui = accessBuyInteraction(ctx.pass.id);
+    const ui = accessBuyInteraction(ctx, ctx.pass.id);
 
     await handleShopButton(ui.interaction, ctx.services);
 
@@ -168,7 +169,7 @@ describe("期限付きアクセスの購入体験", () => {
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 200_000);
-    const ui = accessBuyInteraction(ctx.pass.id, ["r-ura"]);
+    const ui = accessBuyInteraction(ctx, ctx.pass.id, ["r-ura"]);
 
     await handleShopButton(ui.interaction, ctx.services);
 
@@ -182,7 +183,7 @@ describe("期限付きアクセスの購入体験", () => {
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 200_000);
-    const ui = accessBuyInteraction(ctx.pass.id);
+    const ui = accessBuyInteraction(ctx, ctx.pass.id);
     (ui.interaction as unknown as { guild: { members: { fetch: ReturnType<typeof vi.fn> } } }).guild.members.fetch =
       vi.fn(async () => { throw new Error("Discord unavailable"); });
 
@@ -222,7 +223,8 @@ describe("チップ返還確認と再評価の商品差し替え", () => {
     (ctx.services as unknown as Record<string, unknown>).chipAssets = { freeChips: vi.fn(() => 1_000) };
     const editReply = vi.fn(async () => undefined);
     const interaction = {
-      customId: `shop:chips:c1:${itemId}:land`,
+      // 実際にBotが描くチップ返還ボタンと同じ形（表示時の契約をtokenで持つ）
+      customId: `shop:chips:c1:${itemId}:land:${ctx.shop.quoteGenericPurchase(itemId).termsToken}`,
       user: { id: USER },
       guildId: "g1",
       member: { roles: { cache: new Map() } },
@@ -388,7 +390,7 @@ describe("汎用の配送完了操作", () => {
     const { handleShokanButton } = await shokanModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    const purchase = ctx.shop.purchase({ itemId: ctx.nickname.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.nickname.id).termsToken, itemId: ctx.nickname.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
     const reply = vi.fn(async () => undefined);
 
     await handleShokanButton(staffInteraction(`shokan:deliver:${purchase.id}`, reply), ctx.services);
@@ -418,7 +420,7 @@ describe("自動更新を廃止した後の利用者表示", () => {
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    ctx.shop.purchase({ itemId: ctx.nickname.id, userId: USER, actor: USER, memberRoleIds: [] });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.nickname.id).termsToken, itemId: ctx.nickname.id, userId: USER, actor: USER, memberRoleIds: [] });
     const reply = vi.fn(async () => undefined);
 
     await handleShopButton(
@@ -442,7 +444,7 @@ describe("期限商品の延長（利用者の手数を増やさない）", () =
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    const purchase = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.pass.id).termsToken, itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
 
     // 1) 契約中を見る
     const list = vi.fn(async () => undefined);
@@ -488,7 +490,7 @@ describe("期限商品の延長（利用者の手数を増やさない）", () =
     const { handleShopSelect } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    const purchase = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.pass.id).termsToken, itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
     const reply = vi.fn(async () => undefined);
 
     await handleShopSelect(
@@ -514,7 +516,7 @@ describe("期限商品の延長（利用者の手数を増やさない）", () =
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    const purchase = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.pass.id).termsToken, itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
     // 同じ確認画面から出た確定ボタン（＝同じ確認ID）を2回押す。
     // interaction.id は毎回違うので、冪等が確認IDで決まっていないと二重課金になる
     const confirmId = `shop:extend-do:${purchase.id}:conf-1:80000:30:${purchase.expires_at}`;
@@ -544,7 +546,7 @@ describe("Botが権利を管理していない契約（旧オリジナルロー�
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.legacy.id).termsToken, itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
     const reply = vi.fn(async () => undefined);
 
     await handleShopButton({ customId: "shop:contracts", user: { id: USER }, reply } as never, ctx.services);
@@ -565,8 +567,8 @@ describe("Botが権利を管理していない契約（旧オリジナルロー�
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
-    const extendable = ctx.shop.purchase({ itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.legacy.id).termsToken, itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
+    const extendable = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.pass.id).termsToken, itemId: ctx.pass.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
     const reply = vi.fn(async () => undefined);
 
     await handleShopButton({ customId: "shop:contracts", user: { id: USER }, reply } as never, ctx.services);
@@ -592,7 +594,7 @@ describe("Botが権利を管理していない契約（旧オリジナルロー�
     const { handleShopSelect } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.legacy.id).termsToken, itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] });
     const reply = vi.fn(async () => undefined);
 
     await handleShopSelect(
@@ -619,7 +621,7 @@ describe("Botが権利を管理していない契約（旧オリジナルロー�
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 1_000_000);
-    const purchase = ctx.shop.purchase({ itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const purchase = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.legacy.id).termsToken, itemId: ctx.legacy.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
     const balance = ctx.ledger.balanceOf(`user:${USER}`);
     const reply = vi.fn(async () => undefined);
 

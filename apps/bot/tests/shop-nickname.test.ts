@@ -150,9 +150,15 @@ function pressInteraction(ctx: Ctx, customId: string, w: ReturnType<typeof world
 const contentOf = (fn: ReturnType<typeof vi.fn>) => String((fn.mock.calls.at(-1) as never[])[0]?.content ?? "");
 const balance = (ctx: Ctx) => ctx.ledger.balanceOf(`user:${USER}`);
 
-/** 確認画面のボタン（確認したときの料金を持つ） */
-const nickDo = (ctx: Ctx, confirmationId: string, wanted: string, price: number = PRICE) =>
-  `shop:nick-do:${ctx.item.id}:${confirmationId}:${price}:${wanted}`;
+/** 確認画面のボタン（確認したときの契約を持つ） */
+const nickDo = (
+  ctx: Ctx,
+  confirmationId: string,
+  wanted: string,
+  price: number = PRICE,
+  // tokenはCoreが正本。テスト側で同じhashを組み立てない。
+  termsToken: string = ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
+) => `shop:nick-do:${ctx.item.id}:${confirmationId}:${price}:${termsToken}:${wanted}`;
 
 /** 直近の返信からボタンの custom_id を取り出す */
 function buttonIdOf(fn: ReturnType<typeof vi.fn>): string {
@@ -271,6 +277,27 @@ describe("課金前に止まるケース（スタッフの仕事にしない）"
       expect(balance(ctx)).toBe(before);
     }
     expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    ctx.db.close();
+  });
+});
+
+describe("ボタンのcustom IDがDiscordの上限に収まる", () => {
+  // 100文字を超えるとDiscordがボタンごと拒否する。確定ボタンには商品ID・確認ID(19桁)・
+  // 料金・契約token・希望する名前(最長32文字)が同居するので、ここが一番きつい。
+  it("最長のニックネーム・高額でも100文字を超えない", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    ctx.shop.updateItem(ctx.item.id, { price_land: 9_999_999 } as never, "staff");
+    const w = world({ nickname: "いまの名前" });
+    const modal = pressInteraction(ctx, `shop:nick-input:${ctx.item.id}`, w, {
+      fields: { getTextInputValue: () => "あ".repeat(32) },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(modal as never, ctx.services);
+
+    const id = buttonIdOf(modal.reply);
+    expect(id.startsWith(`shop:nick-do:${ctx.item.id}:`)).toBe(true);
+    expect(id.length).toBeLessThanOrEqual(100);
     ctx.db.close();
   });
 });
@@ -421,6 +448,7 @@ describe("課金後にBotが落ちた場合の収束", () => {
   async function crashedPurchase(ctx: Ctx, w: ReturnType<typeof world>) {
     // 課金と購入行だけ作り、配送前に落ちた状態を作る
     const purchase = ctx.shop.purchase({
+      expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
       itemId: ctx.item.id,
       userId: USER,
       actor: USER,
@@ -520,7 +548,7 @@ describe("課金後にBotが落ちた場合の収束", () => {
       "staff",
     );
     for (let i = 0; i < 25; i++) {
-      const p = ctx.shop.purchase({ itemId: roleItem.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+      const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(roleItem.id).termsToken, itemId: roleItem.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
       ctx.shop.markDeliveryFailed(p.id, "boom", "test");
     }
     // 前提: 全種別から素直に20件取ると、名前変更は1件も入らない
@@ -778,7 +806,7 @@ describe("旧購入の扱い", () => {
     const ctx = setup();
     // 自動化する前に買われた購入（スナップショット無し＝当時は手動）
     ctx.db.prepare("UPDATE shop_items SET delivery='manual', delivery_kind=NULL WHERE id=?").run(ctx.item.id);
-    const legacy = ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+    const legacy = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
     expect(legacy.delivery_snapshot_json).toBeNull();
     // いま自動化する
     ctx.db.prepare("UPDATE shop_items SET delivery='auto', delivery_kind='set_nickname' WHERE id=?").run(ctx.item.id);
@@ -952,7 +980,7 @@ describe("入城の名前制度との統合", () => {
     const ctx = setup();
     const w = world({ nickname: "まえ" });
     // 課金だけ済んで落ちた
-    ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [], request: { nickname: "よこどり" } });
+    ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [], request: { nickname: "よこどり" } });
     // 落ちている間に別の人がその名前を取った
     ctx.nicknames.claim({ userId: "999999999999999999", nickname: "よこどり", setVia: "entry", actor: "t" });
     const client = {
@@ -1046,6 +1074,7 @@ describe("レビュー指摘の4点", () => {
     ctx.nicknames.claim({ userId: USER, nickname: "えー", setVia: "entry", actor: "t" });
     // 課金と仮押さえまで済んで落ちた状態
     const purchase = ctx.shop.purchase({
+      expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
       itemId: ctx.item.id,
       userId: USER,
       actor: USER,
@@ -1077,6 +1106,7 @@ describe("レビュー指摘の4点", () => {
     const w = world({ nickname: "びー" });
     ctx.nicknames.claim({ userId: USER, nickname: "えー", setVia: "entry", actor: "t" });
     const purchase = ctx.shop.purchase({
+      expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
       itemId: ctx.item.id,
       userId: USER,
       actor: USER,

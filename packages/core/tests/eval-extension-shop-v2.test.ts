@@ -422,11 +422,11 @@ describe("評価期間+1日 V2", () => {
   it("汎用purchase経路と壊れた商品設定は無課金でfail-closed", () => {
     const ctx = setup();
     const before = ctx.ledger.balanceOf(`user:${USER}`);
-    expect(codeOf(() => ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [] })))
+    expect(codeOf(() => ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [] })))
       .toBe("ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED");
     ctx.shop.updateItem(ctx.item.id, { price_land: 49_999, delivery_data: JSON.stringify({ days: 2 }) }, STAFF);
     expect(codeOf(() => buy(ctx, "bad-config"))).toBe("ERR_EVAL_EXTENSION_ITEM_CONFIG");
-    expect(codeOf(() => ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [] })))
+    expect(codeOf(() => ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken, itemId: ctx.item.id, userId: USER, actor: USER, memberRoleIds: [] })))
       .toBe("ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED");
     expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(before);
   });

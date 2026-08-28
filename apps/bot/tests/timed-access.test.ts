@@ -37,7 +37,7 @@ function setup(opts: { legacy?: boolean } = {}) {
     approvedBy: "test",
     idempotencyKey: `seed:${Math.random()}`,
   });
-  const purchase = shop.purchase({ itemId: item.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+  const purchase = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
   if (opts.legacy) {
     db.prepare(
       "UPDATE shop_purchases SET delivery_snapshot_json=NULL, delivery_state='delivered' WHERE id=?",
