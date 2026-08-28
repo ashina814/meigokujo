@@ -775,9 +775,11 @@ function chipStoppedMessage(
   // 安定キーで記録されるので、その記録があるかで断定する。
   let line = NO_NEW_CHANGE;
   try {
-    const group = services.chipTx?.getGroup(`chip:free-redeem:${userId}:external:${confirmationId}`);
-    if (group !== undefined) line = ALREADY_RETURNED;
-    else line = NO_CHANGE;
+    // 記録の置き場そのものが無いなら、それは「返していない」の証拠ではなく**確かめられない**。
+    // optional chaining で undefined を「記録なし」に潰すと、証明できないことを断定してしまう。
+    if (services.chipTx === undefined) throw new Error("chip transaction log unavailable");
+    const group = services.chipTx.getGroup(`chip:free-redeem:${userId}:external:${confirmationId}`);
+    line = group !== undefined ? ALREADY_RETURNED : NO_CHANGE;
   } catch {
     // 記録を読めない。過去について**どちらも断定しない**。
     line = NO_NEW_CHANGE;

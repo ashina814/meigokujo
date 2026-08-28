@@ -360,6 +360,36 @@ describe("返還だけ済んだ状態（取り残し）からの再試行", () =
     ctx.db.close();
   });
 
+  it("返還記録を読めないときは、過去についてどちらも断定しない", async () => {
+    // 「記録が無い」のと「記録を読めない」のは別。読めないのに「変更していません」と
+    // 言い切ると、実際には返還済みだった場合に嘘になる。
+    const { handleShopButton } = await shopPanelModule;
+    const ctx = setup();
+    ctx.shop.updateItem(ctx.item.id, { stock: 0 } as never, "staff");
+    const world = chipWorld(ctx, ctx.item.id);
+    const t1 = token(ctx, ctx.item.id);
+
+    const first = world.press(`shop:chips:c1:${ctx.item.id}:land:${t1}`);
+    await handleShopButton(first.ui, ctx.services);
+    const retryId = buttonIds(first.editReply).find((id) => id.startsWith("shop:chips:"))!;
+
+    // 返還記録の置き場そのものが見えない状態にする
+    (ctx.services as unknown as Record<string, unknown>).chipTx = undefined;
+    ctx.shop.updateItem(ctx.item.id, { price_land: 999_999 } as never, "staff");
+
+    const second = world.press(retryId);
+    await handleShopButton(second.ui, ctx.services);
+
+    expect(world.redeemExactFreeChips).toHaveBeenCalledTimes(1);
+    expect(purchases(ctx)).toHaveLength(0);
+    const said = saidAll(second.editReply);
+    expect(said).toContain("この操作ではチップ・Landを追加で動かしていません");
+    // 過去について断定する文言はどちらも出さない
+    expect(said).not.toContain("チップ・Landは変更していません");
+    expect(said).not.toContain("以前の返還はすでに完了しており");
+    ctx.db.close();
+  });
+
   it("まだ一度も返還していない確認票では、これまでどおり「変更していません」と言い切る", async () => {
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
