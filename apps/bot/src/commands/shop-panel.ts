@@ -1218,8 +1218,26 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         await interaction.editReply(originalRolePurchaseRedirect(services, configuredItem, interaction.user.id));
         return;
       }
-      if (isReevalItem(services, configuredItem)) {
-        services.shop.checkReevaluationPurchase({ itemId, userId: interaction.user.id, mode: "land" });
+      // 再評価系かどうかは**現在の設定だけでは判定しない**。確認を作ってから設定がA→Bへ
+      // 動くと、旧Aの確認が「普通の商品」に見えてしまい、reevaluation preflightを飛ばして
+      // チップをLandへ戻したあとにCoreのguardで購入だけ失敗する——買えないのにチップ資産だけ
+      // 動く、という不要な副作用になる。**チップを1つも動かす前に**semanticで分類する。
+      if (services.shop.isHistoricalReevaluationItem(configuredItem.id)) {
+        if (isReevalItem(services, configuredItem)) {
+          // 今も販売中の再評価商品。通常の前提条件（重複権・受付可用性・階級）を確認する。
+          services.shop.checkReevaluationPurchase({ itemId, userId: interaction.user.id, mode: "land" });
+        } else {
+          // かつての再評価商品。古い確認をBの専用購入へ勝手に読み替えない。0 mutationで停止する。
+          await interaction.editReply({
+            content: [
+              "❌ 商品設定が変更されたため、この確認は使用できません。",
+              "チップ・Landは変更していません。商品を選び直してください。",
+            ].join("\n"),
+            embeds: [],
+            components: [],
+          });
+          return;
+        }
       }
       // チップをLandへ戻す前に、期限付きアクセスの既存ロールを実状態で確認する。
       const memberRoleIds = await verifiedPurchaseRoleIds(interaction, configuredItem);

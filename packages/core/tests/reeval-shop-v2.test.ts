@@ -325,6 +325,74 @@ describe("再評価権のidentityは商品IDではない", () => {
     expect(ctx.shop.listPendingManual({ excludeItemIds: exclude })).toEqual([]);
   });
 
+  it("購入実績0のままA→Bへ切り替えても、Aはgeneric storefrontへ落ちない", () => {
+    // 「一度でも売れたitem」ではなく「一度でも再評価sale itemとして確定したitem」を守る。
+    // 実績0件の旧Aがgenericへ化けると、最初の利用者がそのまま事故対象になる。
+    const ctx = setup();
+    // Aは販売商品として認識されている（構築時syncと販売前提条件の確認の両方で記録される）が、
+    // 購入は1件も無い。
+    ctx.shop.checkReevaluationPurchase({ itemId: ctx.item.id, userId: USER, mode: "land" });
+    expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_purchases").get()).toEqual({ n: 0 });
+
+    const b = ctx.replaceSaleItem();
+    expect(ctx.shop.isHistoricalReevaluationItem(ctx.item.id)).toBe(true);
+    expect(ctx.shop.isHistoricalReevaluationItem(b.id)).toBe(true);
+
+    const beforeLand = ctx.ledger.balanceOf(`user:${USER}`);
+    expect(codeOf(() => ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: STAFF, memberRoleIds: [] })))
+      .toBe("ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED");
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(beforeLand);
+  });
+
+  it("Shop構築時点で、現在指定されている販売商品はregistryへ焼き付く", () => {
+    // 「設定されている」という事実は購入より先に存在する。最初の利用者を待たない。
+    const ctx = setup();
+    // 本番と同じ順序（設定は既にDBにあり、その状態でShopが構築される）を再現する。
+    ctx.db.prepare("DELETE FROM shop_reevaluation_sale_items").run();
+    new Shop(ctx.db, ctx.ledger, ctx.events, { reevalItemId: () => ctx.item.id });
+    expect(
+      ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_reevaluation_sale_items WHERE item_id = ?").get(ctx.item.id),
+    ).toEqual({ n: 1 });
+    // 無関係な商品は記録されない
+    const other = ctx.shop.createItem({ name: "無関係", price_land: 1, kind: "one_shot", delivery: "manual" }, STAFF);
+    expect(ctx.shop.isHistoricalReevaluationItem(other.id)).toBe(false);
+  });
+
+  it("壊れたsnapshotは『証明できない』であって、lookup全体の失敗ではない", () => {
+    // json_extract()はmalformed JSONでSQLite errorを投げる（COALESCEでは防げない）。
+    // 壊れた1行のせいでShop全体の検索が落ちてはいけないし、壊れた記録から意味も推測しない。
+    const ctx = setup();
+    const other = ctx.shop.createItem({ name: "無関係", price_land: 1, kind: "one_shot", delivery: "manual" }, STAFF);
+    const insert = ctx.db.prepare(
+      `INSERT INTO shop_purchases (item_id,user_id,purchased_at,paid_land,status,auto_renew,delivery_snapshot_json)
+       VALUES (?,?,?,1,'active',1,?)`,
+    );
+    insert.run(other.id, USER, 10, "{not json");            // 壊れている
+    insert.run(other.id, USER, 11, "");                      // 空文字
+    insert.run(other.id, USER, 12, "[1,2,3]");               // validだがobjectではない
+    insert.run(other.id, USER, 13, null);                    // NULL
+    const malformedId = (ctx.db.prepare("SELECT MIN(id) AS id FROM shop_purchases").get() as { id: number }).id;
+
+    // どれもthrowしない
+    expect(() => ctx.shop.findUnconsumedReevaluationRight(USER)).not.toThrow();
+    expect(() => ctx.shop.findUnreservedReevaluationRight(USER)).not.toThrow();
+    expect(() => ctx.shop.isReevaluationPurchase(malformedId)).not.toThrow();
+    expect(() => ctx.shop.isHistoricalReevaluationItem(other.id)).not.toThrow();
+    expect(() => ctx.shop.countPendingManual()).not.toThrow();
+    expect(() => ctx.shop.listPendingManual()).not.toThrow();
+    expect(() => ctx.shop.countCompensableReevaluationPurchases()).not.toThrow();
+    expect(() => ctx.shop.listCompensableReevaluationPurchases()).not.toThrow();
+    expect(() => ctx.shop.checkReevaluationPurchase({ itemId: ctx.item.id, userId: USER, mode: "land" })).not.toThrow();
+
+    // そして壊れた行は再評価の証拠として数えない
+    expect(ctx.shop.findUnconsumedReevaluationRight(USER)).toBeNull();
+    expect(ctx.shop.isReevaluationPurchase(malformedId)).toBe(false);
+    expect(ctx.shop.isHistoricalReevaluationItem(other.id)).toBe(false);
+    // 正規の権利はそのまま見つかる
+    const real = buy(ctx, "land", "after-malformed");
+    expect(ctx.shop.findUnconsumedReevaluationRight(USER)).toEqual({ id: real.id });
+  });
+
   it("普通の手動配送商品はキューへ出る（除外が広すぎない）", () => {
     const ctx = setup();
     const normal = ctx.shop.createItem(

@@ -444,6 +444,7 @@ export class Shop {
     private readonly options: ShopOptions = {},
   ) {
     this.ensureSchema();
+    this.syncReevaluationSaleItem();
   }
 
   /**
@@ -464,6 +465,24 @@ export class Shop {
       origin,
       origin === "storefront" ? 1 : 0,
     );
+  }
+
+  /**
+   * 現在指定されている再評価販売商品。**参照した時点でregistryへ記録する**。
+   *
+   * 「この商品は再評価サービスの販売商品だ」と認識できた瞬間が、その事実を永続化できる
+   * 最も早い地点。購入成立を待つと、実績0件のまま設定がA→Bへ移ったときに最初の利用者が
+   * 事故対象になる。冪等なINSERT OR IGNOREなので何度参照しても副作用は1回だけ。
+   */
+  private currentReevaluationSaleItemId(): number | null {
+    const configured = this.options.reevalItemId?.() ?? null;
+    if (configured !== null) this.registerReevaluationSaleItem(configured, "sale_setting");
+    return configured;
+  }
+
+  /** 構築時に、現在の指定をregistryへ焼き付ける（最初の利用者を待たない）。 */
+  private syncReevaluationSaleItem(): void {
+    this.currentReevaluationSaleItemId();
   }
 
   private ensureSchema(): void {
@@ -529,6 +548,14 @@ export class Shop {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_shop_reeval_compensations_user ON shop_reeval_compensations(user_id, created_at);
+      -- 「この商品は再評価サービスの販売商品として確定された」という事実そのもの。
+      -- 購入実績とは独立に持つ——実績0件のまま設定がA→Bへ移っても、Aをgeneric storefrontの
+      -- 普通の商品へ落とさないため（現在の設定は正本にできない）。
+      CREATE TABLE IF NOT EXISTS shop_reevaluation_sale_items (
+        item_id       INTEGER PRIMARY KEY REFERENCES shop_items(id),
+        first_seen_at INTEGER NOT NULL,
+        source        TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS shop_eval_extension_uses (
         purchase_id INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
         item_id INTEGER NOT NULL REFERENCES shop_items(id),
@@ -1349,15 +1376,29 @@ export class Shop {
    * 使ってはいけないもの: 現在の `shop:reeval_item_id`、現在の商品名/description、金額だけ、
    * invite5という数だけ、item IDの推測。これらは後から変更できるので、運営操作で過去の購入の
    * 意味が変わってしまう。
+   *
+   * **壊れた証拠は「証明できない」であって「lookup全体の失敗」ではない。** `json_extract()` は
+   * malformed JSONに対してSQLite errorを投げる（`COALESCE`では防げない）ので、必ず
+   * `json_valid()` で先に守る。壊れた1行のせいでShop全体の検索が落ちてはいけないし、
+   * かといって壊れた記録から意味を推測して現在の商品定義へfallbackすることもしない
+   * ——NULL・malformed・valid but non-reeval はすべて「証拠なし」に倒す。
    */
   private static readonly REEVALUATION_EVIDENCE_SQL = `COALESCE(
        EXISTS (SELECT 1 FROM shop_purchase_title_provenance v
                 WHERE v.purchase_id = p.id AND v.origin = 'reevaluation')
     OR EXISTS (SELECT 1 FROM shop_reeval_invite_uses u WHERE u.purchase_id = p.id)
-    OR COALESCE(json_extract(p.delivery_snapshot_json, '$.delivery_kind') = 'revoke_meirei', 0)
+    OR CASE
+         WHEN p.delivery_snapshot_json IS NULL THEN 0
+         WHEN NOT json_valid(p.delivery_snapshot_json) THEN 0
+         ELSE COALESCE(json_extract(p.delivery_snapshot_json, '$.delivery_kind') = 'revoke_meirei', 0)
+       END
     OR EXISTS (SELECT 1 FROM events e
                 WHERE e.type IN ('shop_reeval_right_purchased','reeval_legacy_purchase_recovery','reeval_legacy_rollback')
-                  AND json_extract(e.payload_json, '$.purchaseId') = p.id)
+                  AND CASE
+                        WHEN e.payload_json IS NULL THEN 0
+                        WHEN NOT json_valid(e.payload_json) THEN 0
+                        ELSE COALESCE(json_extract(e.payload_json, '$.purchaseId') = p.id, 0)
+                      END)
   , 0)`;
 
   /** 未消費（面談サービス未提供）の再評価権であることを表す条件。消費済みは delivered で表す。 */
@@ -1410,11 +1451,37 @@ export class Shop {
   }
 
   /**
-   * この商品は「再評価サービス商品」として一度でも販売実績があるか。
+   * 「この商品は再評価サービスの販売商品である」という指定を永続化する。冪等。
+   *
+   * **購入が成立した時点では遅い**——実績0件のまま設定がA→Bへ移ると、最初の利用者が
+   * 「昨日まで再評価商品だったものが普通の商品に化けた」事故に遭う。設定として認識された
+   * 時点（Shop構築時と、販売前提条件の確認時）で記録する。
+   */
+  registerReevaluationSaleItem(itemId: number, source = "sale_setting"): void {
+    if (!Number.isSafeInteger(itemId) || itemId <= 0) return;
+    if (!this.getItem(itemId)) return; // 実在しないIDは記録しない
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO shop_reevaluation_sale_items (item_id, first_seen_at, source) VALUES (?,?,?)",
+      )
+      .run(itemId, now(), source);
+  }
+
+  /**
+   * この商品は「再評価サービス商品」として一度でも確定したか。
    * 現在の販売設定から外れた旧商品Aを、generic storefrontへ落とさないための判定。
+   *
+   * 判定材料は3つとも現在の商品名・価格・descriptionから独立している:
+   *   1. 現在の販売設定（今まさに指定されている）
+   *   2. 販売商品registry（過去に指定された事実。購入実績0でも残る）
+   *   3. その商品でのsemantic reevaluation purchase（registry導入前の履歴を拾う）
    */
   isHistoricalReevaluationItem(itemId: number): boolean {
-    if (this.options.reevalItemId?.() === itemId) return true;
+    if (this.currentReevaluationSaleItemId() === itemId) return true;
+    const registered = this.db
+      .prepare("SELECT 1 AS ok FROM shop_reevaluation_sale_items WHERE item_id = ? LIMIT 1")
+      .get(itemId) as { ok: number } | undefined;
+    if (registered !== undefined) return true;
     const row = this.db
       .prepare(
         `SELECT 1 AS ok FROM shop_purchases p
@@ -1460,7 +1527,7 @@ export class Shop {
     userId: string;
     mode: "land" | "invite";
   }): { availableInvites: number } {
-    const configuredId = this.options.reevalItemId?.() ?? null;
+    const configuredId = this.currentReevaluationSaleItemId();
     const item = this.getItem(input.itemId);
     if (
       configuredId !== input.itemId ||
@@ -1474,6 +1541,9 @@ export class Shop {
     ) {
       throw new ShopError("ERR_REEVAL_ITEM_CONFIG", { itemId: input.itemId, configuredId });
     }
+    // ここまで来た＝この商品は再評価販売商品として現在指定されている。購入の成否に関わらず
+    // その事実を残す（実績0件のまま設定が移っても、旧商品がgenericへ落ちない）。
+    this.registerReevaluationSaleItem(item.id, "sale_check");
     // 面談を受けられない状態なら新しい権利を売らない。UI表示前・chip返還retry・課金直前の
     // すべてがこの1つの前提条件を通るので、charge pathにpreflightが1箇所しか無い状態にならない。
     this.options.assertReevaluationIntakeAvailable?.();
@@ -1514,7 +1584,7 @@ export class Shop {
     request?: Record<string, unknown>;
     idempotencyKey: string;
   }): { purchase: PurchaseRow; item: ShopItemRow; needsManualDelivery: boolean } {
-    const configuredId = this.options.reevalItemId?.() ?? null;
+    const configuredId = this.currentReevaluationSaleItemId();
     if (configuredId !== input.itemId) {
       throw new ShopError("ERR_REEVAL_ITEM_CONFIG", { itemId: input.itemId, configuredId });
     }
