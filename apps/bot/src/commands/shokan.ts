@@ -103,8 +103,9 @@ function queueCounts(services: Services): { pending: number; failed: number; leg
   return {
     pending: services.shop.countPendingManual(),
     failed: services.shop.countUndeliveredAuto(),
-    // 購入時の提供方式が分からない旧購入。仕事として数えるが、要対応とは別枠にする。
-    legacy: services.shop.countLegacyUnknownFulfillment(),
+    // 購入時の提供方式が分からない旧購入と、方式は分かるが結末が分からない旧購入。
+    // どちらも仕事として数えるが、要対応とは別枠にする。
+    legacy: services.shop.countLegacyUnknownFulfillment() + services.shop.countLegacyAutoOutcomeUnknown(),
   };
 }
 
@@ -263,22 +264,38 @@ function manualCompletionMessage(id: number, reason: ManualCompletionReason): st
  * 本当に人の対応が要る購入が見えなくなる。別枠で出して確認してもらう。
  */
 function renderLegacyUnknown(services: Services) {
-  const rows = services.shop.listLegacyUnknownFulfillment({ limit: QUEUE_DISPLAY });
-  const total = services.shop.countLegacyUnknownFulfillment();
+  const modeRows = services.shop.listLegacyUnknownFulfillment({ limit: QUEUE_DISPLAY });
+  const modeTotal = services.shop.countLegacyUnknownFulfillment();
+  const outcomeRows = services.shop.listLegacyAutoOutcomeUnknown({ limit: QUEUE_DISPLAY });
+  const outcomeTotal = services.shop.countLegacyAutoOutcomeUnknown();
   const embed = new EmbedBuilder().setTitle("🕓 要確認（旧購入）").setColor(0xd97706);
-  if (rows.length === 0) {
+  if (modeTotal + outcomeTotal === 0) {
     embed.setDescription("確認が必要な旧購入はありません。");
     return { embeds: [embed], components: [backButton()], allowedMentions: { parse: [] as never[] } };
   }
-  embed.setDescription(
-    [
-      "旧購入のため、購入時の提供方式を自動では判定できません。提供状況を確認してください。",
+  const line = (p: { id: number; item_name: string; user_id: string; purchased_at: number }) =>
+    `\`#${p.id}\` **${p.item_name}** — <@${p.user_id}>（${fmtJstDate(p.purchased_at)}）`;
+  const body: string[] = ["どちらも提供状況を確認してから判断してください。"];
+  if (modeTotal > 0) {
+    body.push(
       "",
-      ...rows.map((p) => `\`#${p.id}\` **${p.item_name}** — <@${p.user_id}>（${fmtJstDate(p.purchased_at)}）`),
-      ...overflowNote(rows.length, total),
-    ].join("\n"),
-  );
-  embed.setFooter({ text: `ここからワンクリックでは完了にできません（全 ${total}件）。` });
+      `**提供方式を確認できない（${modeTotal}件）**`,
+      ...modeRows.map(line),
+      ...overflowNote(modeRows.length, modeTotal),
+    );
+  }
+  if (outcomeTotal > 0) {
+    body.push(
+      "",
+      `**自動提供だったが完了結果を確認できない（${outcomeTotal}件）**`,
+      ...outcomeRows.map(line),
+      ...overflowNote(outcomeRows.length, outcomeTotal),
+    );
+  }
+  embed.setDescription(body.join("\n"));
+  // どちらもワンクリックの操作は置かない。前者を「完了」にすると提供済みを人の対応に、
+  // 後者を「再試行」にすると古いロール付与や期限延長を流し直すことになる。
+  embed.setFooter({ text: "ここからワンクリックでの完了・再試行はできません。" });
   return { embeds: [embed], components: [backButton()], allowedMentions: { parse: [] as never[] } };
 }
 

@@ -421,14 +421,18 @@ describe("未提供のまま返金したら、消費した1枠を一度だけ戻
   it("購入時の事実が無い旧購入は、現在の在庫設定を見て戻さない", () => {
     const ctx = setup();
     const item = makeItem(ctx, { stock: 3 });
-    // 旧購入。当時在庫を消費したかどうかは記録されていない。
+    // 旧購入。当時在庫を消費したかどうかも、提供したかどうかも記録されていない。
     const purchase = legacyPurchase(ctx, item.id);
+    const before = ctx.ledger.balanceOf(`user:${USER}`);
 
-    ctx.shop.refund(purchase.id, "配送できなかった", STAFF);
+    // 提供したかどうかが分からないので、返金そのものが止まる（人の判断へ回す）
+    expect(() => ctx.shop.refund(purchase.id, "配送できなかった", STAFF)).toThrow(/ERR_FULFILLMENT_UNKNOWN/);
 
     expect(stockOf(ctx, item.id)).toBe(3);
     expect(ctx.shop.stockRestoration(purchase.id)).toBeUndefined();
     expect(restored(ctx)).toBe(0);
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(before);
+    expect(ctx.shop.getPurchase(purchase.id)!.status).toBe("active");
     ctx.db.close();
   });
 });

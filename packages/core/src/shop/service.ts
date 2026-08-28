@@ -288,6 +288,7 @@ export type ShopErrorCode =
   | "ERR_ALT_PAYMENT_UNSUPPORTED"
   | "ERR_ALT_REFUND_UNSUPPORTED"
   | "ERR_TERMS_TOKEN_REQUIRED"
+  | "ERR_FULFILLMENT_UNKNOWN"
   | "ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_EVAL_EXTENSION_ITEM_CONFIG"
   | "ERR_EVAL_EXTENSION_STATUS"
@@ -1706,18 +1707,40 @@ export class Shop {
    *
    * 旧行では `delivered_at` か `shop_delivered` event という独立した記録だけを根拠にする。
    */
-  private static readonly DELIVERED_EVIDENCE_SQL = `(
-    p.delivered_at IS NOT NULL
-    OR EXISTS (
+  private static readonly DELIVERED_EVENT_SQL = `EXISTS (
       SELECT 1 FROM events e
        WHERE e.type = 'shop_delivered'
-         AND (e.payload_json LIKE '%"purchaseId":' || p.id || ',%'
-           OR e.payload_json LIKE '%"purchaseId":' || p.id || '}%')
-    )
+         AND CASE
+               WHEN e.payload_json IS NULL THEN 0
+               WHEN NOT json_valid(e.payload_json) THEN 0
+               ELSE COALESCE(json_extract(e.payload_json, '$.purchaseId') = p.id, 0)
+             END
+    )`;
+
+  private static readonly DELIVERED_EVIDENCE_SQL = `(
+    p.delivered_at IS NOT NULL
+    OR ${Shop.DELIVERED_EVENT_SQL}
     OR EXISTS (
       SELECT 1 FROM shop_purchase_fulfillment_provenance f
        WHERE f.purchase_id = p.id AND p.delivery_state = 'delivered'
     )
+  )`;
+
+  /**
+   * 購入時autoだと証明できるのに、**配送の結末が証明できない**旧購入。
+   *
+   * スナップショットがあることは「自動配送のつもりだった」の証拠でしかない。
+   * 実行が成功したかは別の話で、それを示す記録が無ければ結末は不明のまま。
+   * 不明を `delivered` と書いて片付けない——書けば返金も期限付きアクセスも
+   * その嘘を信じてしまう。
+   */
+  private static readonly LEGACY_AUTO_OUTCOME_UNKNOWN_SQL = `(
+    p.status = 'active'
+    AND p.delivered_at IS NULL
+    AND p.delivery_snapshot_json IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM shop_purchase_fulfillment_provenance f WHERE f.purchase_id = p.id)
+    AND NOT ${Shop.DELIVERED_EVENT_SQL}
+    AND NOT ${Shop.REEVALUATION_EVIDENCE_SQL}
   )`;
 
   /**
@@ -2248,16 +2271,30 @@ export class Shop {
       if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
       if (purchase.status === "refunded") return { refunded: false, amount: purchase.paid_land ?? 0 };
       if (purchase.status !== "active") throw new ShopError("ERR_NOT_ACTIVE", { status: purchase.status });
-      // 提供済みのものは返さない（ニックネームが変わったのに返金する、を防ぐ）
-      if (purchase.delivered_at !== null || purchase.delivery_state === "delivered") {
+      // 提供済みのものは返さない（ニックネームが変わったのに返金する、を防ぐ）。
+      //
+      // **根拠は強い証拠だけ。** 旧行の `delivery_state='delivered'` は移行時の既定値の
+      // ことがあるので、それだけで「提供済みだから返さない」とは言えない。運営が外部で
+      // 確認して「提供していない」と判断した購入に対して、システムが移行推定を理由に
+      // 返金を拒み続けるのは矛盾している。
+      if (this.hasDeliveredEvidence(purchase)) {
         throw new ShopError("ERR_ALREADY_DELIVERED", { purchaseId });
       }
       // 代替支払を含む購入は generic refund の対象外。何をどこへ戻すべきかを generic refund は
       // 知らないし、`paid_alt_*` は「実際にその資源が減った」証拠でもない（旧実装は資源を
       // 消費していなかった）。amount=0 のまま status='refunded' にすると、**資産を戻して
       // いないのに「返金完了」という嘘**を台帳へ書くことになる。人へ escalate する。
+      //
+      // **提供状況より先に見る。** どちらも資産を動かさずに止めるが、こちらの方が
+      // 理由として具体的（何で払ったかは提供状況と無関係に分かっている）。
       if (purchase.paid_alt_kind !== null || purchase.paid_alt_amount !== null) {
         throw new ShopError("ERR_ALT_REFUND_UNSUPPORTED", { purchaseId });
+      }
+      // 「証拠が無い＝未提供」でもない。**不明は不明として止める。**
+      // 自動で返金すると、実際には提供済みだったものまで払い戻してしまう。
+      // 人が確認してから決める（この経路では資産を1つも動かさない）。
+      if (this.fulfillmentUnknown(purchase)) {
+        throw new ShopError("ERR_FULFILLMENT_UNKNOWN", { purchaseId });
       }
       const amount = purchase.paid_land ?? 0;
       if (amount > 0) {
@@ -2423,20 +2460,59 @@ export class Shop {
   private hasDeliveredEvidence(purchase: PurchaseRow): boolean {
     if (purchase.delivered_at !== null) return true;
     if (this.fulfillmentProvenance(purchase.id) && purchase.delivery_state === "delivered") return true;
-    // **CAST が要る。** JSの数値をそのまま `||` で連結すると SQLite は REAL として扱い、
-    // パターンが `"purchaseId":5.0}` になって永久に一致しない（列の連結なら整数のまま）。
-    return (
-      (
-        this.db
-          .prepare(
-            `SELECT COUNT(*) AS c FROM events
-              WHERE type = 'shop_delivered'
-                AND (payload_json LIKE '%"purchaseId":' || CAST(? AS INTEGER) || ',%'
-                  OR payload_json LIKE '%"purchaseId":' || CAST(? AS INTEGER) || '}%')`,
-          )
-          .get(purchase.id, purchase.id) as { c: number }
-      ).c > 0
-    );
+    // 部分一致では「別の購入IDを含む文字列」や「本文にIDが出てくるだけのpayload」まで
+    // 証拠に見えてしまう。ここは権限の境界なのでJSONとして厳密に取り出す。
+    // 壊れたJSONは throw させず「証拠なし」に倒す（json_extract は不正JSONで例外を投げる）。
+    return this.hasDeliveredEvent(purchase.id);
+  }
+
+  /**
+   * 提供したかどうかを**証明できない**購入か。
+   *
+   * 購入時provenanceがあれば、その購入は今のコードが作ったものなので状態を信頼できる。
+   * provenanceが無い旧購入は、配送スナップショットの有無にかかわらず結末が分からない
+   * （スナップショットは方式の証拠であって成功の証拠ではない）。
+   * 独立した配送記録があるならそれは `hasDeliveredEvidence` 側で拾われる。
+   */
+  private fulfillmentUnknown(purchase: PurchaseRow): boolean {
+    if (this.fulfillmentProvenance(purchase.id)) return false;
+    if (this.hasDeliveredEvidence(purchase)) return false;
+    // 専用サービスの権利は、それぞれのフローが消費状態を持っている。
+    if (this.isReevaluationPurchase(purchase.id)) return false;
+    return true;
+  }
+
+  /** その購入を指す `shop_delivered` event があるか。JSONとして厳密に照合する。 */
+  private hasDeliveredEvent(purchaseId: number): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM events
+          WHERE type = 'shop_delivered'
+            AND CASE
+                  WHEN payload_json IS NULL THEN 0
+                  WHEN NOT json_valid(payload_json) THEN 0
+                  ELSE COALESCE(json_extract(payload_json, '$.purchaseId') = ?, 0)
+                END`,
+      )
+      .get(purchaseId) as { c: number };
+    return row.c > 0;
+  }
+
+  /**
+   * 購入時autoは証明できるが、配送の結末が証明できない旧購入か。
+   *
+   * この状態では2つが同時に成り立つ。
+   *   - 提供済みだと言えない（返金や期限付きアクセスの根拠にしない）
+   *   - 自動で再実行してよいとも言えない（古いロール付与や期限延長を流し直さない）
+   */
+  isLegacyAutoOutcomeUnknown(purchaseId: number): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL} AS unknown
+           FROM shop_purchases p WHERE p.id = ?`,
+      )
+      .get(purchaseId) as { unknown: number } | undefined;
+    return row?.unknown === 1;
   }
 
   private manualCompletionEligibility(
@@ -2673,6 +2749,39 @@ export class Shop {
       .all(opts.limit ?? 25) as Array<PurchaseRow & { item_name: string }>;
   }
 
+  /**
+   * 購入時autoは分かるが、配送の結末が分からない旧購入。
+   *
+   * `listLegacyUnknownFulfillment()`（=購入時の**提供方式**が分からない）とは別の不明。
+   * こちらは方式だけ分かっていて結末が分からない。どちらも
+   *   - 提供済みとは言えない
+   *   - 自動で流し直してもいけない
+   * ので、運営に見せて外部で確認してもらう。ワンクリックの操作は用意しない。
+   */
+  listLegacyAutoOutcomeUnknown(opts: { limit?: number } = {}): Array<PurchaseRow & { item_name: string }> {
+    return this.db
+      .prepare(
+        `SELECT p.*, i.name AS item_name
+           FROM shop_purchases p
+           JOIN shop_items i ON i.id = p.item_id
+          WHERE ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}
+          ORDER BY p.purchased_at
+          LIMIT ?`,
+      )
+      .all(opts.limit ?? 25) as Array<PurchaseRow & { item_name: string }>;
+  }
+
+  /** 上と同じ判定の件数（上限なし） */
+  countLegacyAutoOutcomeUnknown(): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
+          WHERE ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}`,
+      )
+      .get() as { c: number };
+    return row.c;
+  }
+
   /** 互換バケットの件数（`listLegacyUnknownFulfillment` と同じ判定・上限なし） */
   countLegacyUnknownFulfillment(): number {
     const row = this.db
@@ -2713,6 +2822,12 @@ export class Shop {
           WHERE p.status = 'active'
             AND p.delivery_snapshot_json IS NOT NULL
             AND COALESCE(p.delivery_state, 'pending') IN ('pending','failed')
+            -- 「再実行してよいか」は「配送したか」とは別の判断。結末が証明できない
+            -- 旧購入は、状態がどうであれ自動では流し直さない。
+            AND NOT EXISTS (
+              SELECT 1 FROM shop_delivery_replay_suppressions r WHERE r.purchase_id = p.id
+            )
+            AND NOT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}
           ORDER BY p.purchased_at DESC`,
       )
       .all() as Array<PurchaseRow & { item_name: string }>;
@@ -2761,8 +2876,14 @@ export class Shop {
           ? snapshot.delivery_data.channel_id.trim()
           : null;
         if (!channelId && current?.roleId === roleId) channelId = current.channelId;
-      } else if (purchase.delivery_snapshot_json === null && purchase.delivery_state === "delivered" && current) {
-        // legacyの購入ID・期限・配送完了は確定事実。ロールだけの人にはこの経路を使わない。
+      } else if (
+        purchase.delivery_snapshot_json === null &&
+        current &&
+        this.hasDeliveredEvidence(purchase)
+      ) {
+        // スナップショット導入前の購入。**実際に配送した証拠があるときだけ**現在の
+        // ロール/チャンネルで互換維持する。`delivery_state='delivered'` 単独では
+        // 移行時の推定でしかなく、それを根拠にロールを配り直すことはできない。
         roleId = current.roleId;
         channelId = current.channelId;
       }

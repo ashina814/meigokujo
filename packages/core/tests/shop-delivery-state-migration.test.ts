@@ -77,9 +77,21 @@ describe("既存購入への配送状態の割り当て", () => {
     db.close();
   });
 
-  it("自動配送で未マークの行は delivered 扱い（一斉再配送を起こさない）", () => {
+  it("自動配送で未マークの行を「提供済み」と書かない（結末は分からない）", () => {
+    // 購入時autoのスナップショットは**配送方式**の証拠であって、成功した証拠ではない。
+    // 以前は「再配送させない」を delivered と書いて表現していたが、それは記録としては嘘で、
+    // 返金や期限付きアクセスがその嘘を信じてしまう。
     const db = openDb(seeded());
-    expect(stateOf(db, "auto_undelivered")).toBe("delivered");
+    expect(stateOf(db, "auto_undelivered")).not.toBe("delivered");
+    db.close();
+  });
+
+  it("それでも自動再配送はしない（抑止は別の台帳に記録する）", () => {
+    const db = openDb(seeded());
+    const suppressed = db
+      .prepare("SELECT reason FROM shop_delivery_replay_suppressions s JOIN shop_purchases p ON p.id=s.purchase_id WHERE p.user_id=?")
+      .get("auto_undelivered") as { reason: string } | undefined;
+    expect(suppressed?.reason).toBe("legacy_auto_outcome_unknown");
     db.close();
   });
 
@@ -95,7 +107,7 @@ describe("既存購入への配送状態の割り当て", () => {
     db.close();
   });
 
-  it("自動再配送の候補にするのは購入時スナップショットを持つ行だけ", () => {
+  it("自動再配送の候補に、結末が不明な旧auto行を入れない", () => {
     const db = openDb(seeded());
     // pending になるのは「人手待ちの手動配送」と「購入時の提供方式を証明できない旧購入」。
     // どちらも購入時スナップショットを持たないので、自動再配送の候補には入らない
@@ -103,13 +115,21 @@ describe("既存購入への配送状態の割り当て", () => {
     const rows = db
       .prepare("SELECT user_id FROM shop_purchases WHERE delivery_state = 'pending' ORDER BY user_id")
       .all();
-    expect(rows).toEqual([{ user_id: "legacy_no_snapshot" }, { user_id: "manual_undelivered" }]);
-    const withSnapshot = db
+    expect(rows).toEqual([
+      { user_id: "auto_undelivered" },
+      { user_id: "legacy_no_snapshot" },
+      { user_id: "manual_undelivered" },
+    ]);
+    // pending でも、スナップショットを持つ旧auto行は抑止台帳に載っているので
+    // 自動再配送の候補にはならない。
+    const replayable = db
       .prepare(
-        "SELECT COUNT(*) AS c FROM shop_purchases WHERE delivery_state='pending' AND delivery_snapshot_json IS NOT NULL",
+        `SELECT COUNT(*) AS c FROM shop_purchases p
+          WHERE p.delivery_state='pending' AND p.delivery_snapshot_json IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM shop_delivery_replay_suppressions r WHERE r.purchase_id=p.id)`,
       )
       .get() as { c: number };
-    expect(withSnapshot.c).toBe(0);
+    expect(replayable.c).toBe(0);
     db.close();
   });
 

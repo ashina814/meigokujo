@@ -200,7 +200,7 @@ describe("旧購入（購入時の提供方式が分からない）", () => {
     await handleShokanButton(panelPress("shokan:legacy-unknown", view), ctx.services);
     const payload = (view.mock.calls.at(-1) as never[])[0] as { embeds: { data: { description?: string } }[] };
     expect(payload.embeds[0]!.data.description).toContain(`#${legacy.id}`);
-    expect(payload.embeds[0]!.data.description).toContain("自動では判定できません");
+    expect(payload.embeds[0]!.data.description).toContain("提供方式を確認できない");
     ctx.db.close();
   });
 

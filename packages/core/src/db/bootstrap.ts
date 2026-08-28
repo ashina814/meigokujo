@@ -896,6 +896,23 @@ CREATE TABLE IF NOT EXISTS shop_purchase_stock_restorations (
   applied      INTEGER NOT NULL CHECK (applied IN (0,1))
 );
 
+-- Phase D round 2: 「配送したか」と「自動で再実行してよいか」を分ける。
+--
+-- 購入時autoのスナップショットは **配送方式** の証拠であって、**配送が成功した** 証拠では
+-- ない。しかし古い add_role / extend_deadline を機械的に流し直すのは危険なので、
+-- 「再実行しない」を delivery_state='delivered'（＝成功した）と書いて表現していた。
+-- それは事実の記録として嘘なので、抑止だけを別の台帳へ出す。
+--
+--   配送の真実  … delivered_at / shop_delivered event / provenance付きのdelivered
+--   再実行の可否 … この表
+--
+-- append-only。purchase_id が主キーなので二重登録されない。
+CREATE TABLE IF NOT EXISTS shop_delivery_replay_suppressions (
+  purchase_id  INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
+  reason       TEXT NOT NULL,
+  created_at   INTEGER NOT NULL
+);
+
 -- status current-stateだけではfixed observedAtを再現できない。refund/cancel occurrenceを
 -- purchaseごとに一度だけappendし、historical snapshotは occurred_at で切る。
 CREATE TABLE IF NOT EXISTS shop_purchase_status_history (
@@ -916,6 +933,16 @@ CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_title_provenance_no_delete
 BEFORE DELETE ON shop_purchase_title_provenance
 BEGIN
   SELECT RAISE(ABORT, 'shop purchase title provenance is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_delivery_replay_suppressions_no_update
+BEFORE UPDATE ON shop_delivery_replay_suppressions
+BEGIN
+  SELECT RAISE(ABORT, 'shop delivery replay suppression is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_delivery_replay_suppressions_no_delete
+BEFORE DELETE ON shop_delivery_replay_suppressions
+BEGIN
+  SELECT RAISE(ABORT, 'shop delivery replay suppression is append-only');
 END;
 CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_fulfillment_provenance_no_update
 BEFORE UPDATE ON shop_purchase_fulfillment_provenance
@@ -1483,6 +1510,7 @@ export function openDb(path: string): Database.Database {
   backfillEvaluationMarkWeights(db);
   backfillEvaluationPolicySnapshots(db);
   backfillShopDeliveryState(db);
+  backfillLegacyAutoReplaySuppression(db);
   backfillEverMeirei(db);
   backfillInviteThresholdSnapshot(db);
   ensureSoulStatusHistory(db);
@@ -1555,6 +1583,38 @@ function backfillEverMeirei(db: Database.Database): void {
  * 以後の購入は配送経路が自分で `pending → delivered/failed` を書くので、
  * この移行が効くのは**この変更より前に作られた行だけ**。
  */
+/**
+ * 既に移行済みの旧auto購入へ、再実行抑止を後追いで記録する。
+ *
+ * `backfillShopDeliveryState()` は `delivery_state IS NULL` の行しか触らないので、
+ * 以前のバージョンで移行済みの行（`delivered` と書かれてしまった行）には抑止の記録が
+ * 無い。状態値そのものは書き換えない——過去の記録を塗り替えるより、**その値をどこでも
+ * 根拠にしない**方が安全で、監査もしやすい。ここでは「自動では流し直さない」という
+ * 判断だけを追加する。購入・Land・在庫には一切触れない。
+ */
+function backfillLegacyAutoReplaySuppression(db: Database.Database): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO shop_delivery_replay_suppressions (purchase_id,reason,created_at)
+     SELECT p.id, 'legacy_auto_outcome_unknown', ?
+       FROM shop_purchases p
+      WHERE p.status = 'active'
+        AND p.delivered_at IS NULL
+        AND p.delivery_snapshot_json IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM shop_purchase_fulfillment_provenance f WHERE f.purchase_id = p.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM events e
+           WHERE e.type = 'shop_delivered'
+             AND CASE
+                   WHEN e.payload_json IS NULL THEN 0
+                   WHEN NOT json_valid(e.payload_json) THEN 0
+                   ELSE COALESCE(json_extract(e.payload_json, '$.purchaseId') = p.id, 0)
+                 END
+        )`,
+  ).run(Math.floor(Date.now() / 1000));
+}
+
 function backfillShopDeliveryState(db: Database.Database): void {
   const rows = db
     .prepare(
@@ -1577,6 +1637,10 @@ function backfillShopDeliveryState(db: Database.Database): void {
     "UPDATE shop_purchases SET delivery_error = 'auto_delivery_withdrawn:revoke_meirei' WHERE id = ? AND delivery_error IS NULL",
   );
   const withdrawn: number[] = [];
+  const legacyAuto: number[] = [];
+  const suppress = db.prepare(
+    "INSERT OR IGNORE INTO shop_delivery_replay_suppressions (purchase_id,reason,created_at) VALUES (?,?,?)",
+  );
   const assign = db.transaction(() => {
     for (const row of rows) {
       let state: "delivered" | "pending" | "failed";
@@ -1605,20 +1669,25 @@ function backfillShopDeliveryState(db: Database.Database): void {
           withdrawn.push(row.id);
           state = "failed";
         } else {
-          // 購入時autoのスナップショットがある行。`delivered_at` は手動完了マークでしか
-          // 埋まらない運用だったので、NULLでも実際には配送済みのことが多い。ここを
-          // pending にすると `listUndeliveredAuto` の候補（スナップショット必須）に
-          // 一斉に入り、ロール付与や期限延長が二度走る。**再配送を起こさない**方を優先し、
-          // 従来どおり delivered として置く。
+          // 購入時autoのスナップショットがある行。**配送方式は分かるが結末は分からない。**
           //
-          // スナップショットが無い行と扱いが違うのは、こちらには購入時autoという
-          // 購入時点の証拠があるため。無い行は上で pending にしている。
-          state = "delivered";
+          // 以前はここで delivered と書いていた。理由は「再配送させないため」で、
+          // 判断としては正しいが、記録としては嘘になる（成功したとは証明できない）。
+          // その嘘を返金も期限付きアクセスも信じてしまう。
+          //
+          // いまは事実として pending（未提供）に置き、**再実行しないという判断は
+          // 別の台帳へ**書く。台帳は下の recordLegacyAutoReplaySuppression() が入れる。
+          state = "pending";
+          legacyAuto.push(row.id);
         }
       }
       update.run(state, row.delivered_at ?? row.purchased_at, row.id);
     }
     for (const id of withdrawn) markWithdrawn.run(id);
+    // 「配送したか分からない」と「自動で流し直してよいか」を別々に記録する。
+    const now = Math.floor(Date.now() / 1000);
+    for (const id of legacyAuto) suppress.run(id, "legacy_auto_outcome_unknown", now);
+    for (const id of withdrawn) suppress.run(id, "auto_delivery_withdrawn", now);
   });
   assign.immediate();
 }
