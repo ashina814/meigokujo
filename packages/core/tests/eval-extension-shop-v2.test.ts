@@ -110,6 +110,25 @@ function insertLegacyExtensionPurchase(ctx: Ctx, itemId: number, purchasedAt: nu
     .run(itemId, USER, purchasedAt, EVAL_EXTENSION_PRICE_LAND, purchasedAt, purchasedAt, snapshot);
 }
 
+/**
+ * PR #131時代のwriterが残し得た状態を再現する。当時はsnapshotの有無に関係なく
+ * 同一itemのdelivered購入をusedCountへ含めていたので、「snapshot無しのV1購入があり、
+ * その後のV2購入が sequence=2 で発行されている」という履歴は旧実装でも成立し得た。
+ */
+function insertLedgerUse(ctx: Ctx, purchaseId: number, sequence: number, cycleStartedAt: number) {
+  ctx.db
+    .prepare(
+      `INSERT INTO shop_eval_extension_uses
+         (purchase_id,item_id,user_id,eval_started_at,previous_deadline_at,new_deadline_at,sequence,created_at)
+       VALUES (?,?,?,?,?,?,?,?)`,
+    )
+    .run(purchaseId, ctx.item.id, USER, cycleStartedAt, NOW, NOW + DAY, sequence, NOW);
+}
+
+function lastPurchaseId(ctx: Ctx): number {
+  return (ctx.db.prepare("SELECT MAX(id) AS id FROM shop_purchases").get() as { id: number }).id;
+}
+
 const EXTENSION_SNAPSHOT = JSON.stringify({
   delivery: "auto",
   delivery_kind: "extend_deadline",
@@ -263,13 +282,53 @@ describe("評価期間+1日 V2", () => {
     const ctx = setup();
     // `delivery_kind`は`updateItem()`で後から変更できるので、「今この商品が延長商品だから」
     // を根拠に過去行を延長扱いすると、商品を作り直した運営操作で無関係な購入が遡って
-    // 5回枠を食い潰しうる。証明できない行は数えない（fail-closed）。
+    // 5回枠を食い潰しうる。よってsnapshotが無い行からは推測しない。
+    // （数えないこと自体は上限に対して緩い側なので「fail-closed」ではない。発行済み
+    //  sequenceを下限として採る別テストが、緩くなりすぎる側を塞いでいる。）
     insertLegacyExtensionPurchase(ctx, ctx.item.id, NOW - 100, null);
     expect(ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER }).usedCount).toBe(0);
     // 壊れたsnapshotも「現在の商品定義で代用」しない。
     insertLegacyExtensionPurchase(ctx, ctx.item.id, NOW - 99, "{not json");
     insertLegacyExtensionPurchase(ctx, ctx.item.id, NOW - 98, JSON.stringify({ delivery: "manual", delivery_kind: "extend_deadline" }));
     expect(ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER }).usedCount).toBe(0);
+  });
+
+  it("発行済みsequenceは使用回数の保守的な下限——表示・上限・書き込みが1つの数で一致する", () => {
+    const ctx = setup();
+    // 旧実装が残し得た履歴: snapshot無しV1購入 + その後のV2購入が sequence=2。
+    insertLegacyExtensionPurchase(ctx, ctx.item.id, NOW - 200, null);
+    insertLegacyExtensionPurchase(ctx, ctx.item.id, NOW - 150, EXTENSION_SNAPSHOT);
+    insertLedgerUse(ctx, lastPurchaseId(ctx), 2, NOW - DAY);
+
+    // 直接証明できるのは台帳1件だけ（snapshot無しV1は推測しない）。しかし sequence=2 が
+    // 発行済みなので「少なくとも2件使われた」を採る。
+    const quote = ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER });
+    expect(quote.usedCount).toBe(2);
+    expect(quote.remainingCount).toBe(3);
+    expect(quote.nextSequence).toBe(3);
+
+    // 購入前 2/5 → 購入後 3/5。DBのsequenceも3。表示と実体が食い違わない。
+    const bought = buy(ctx, "lower-bound:next");
+    expect(bought.extension.sequence).toBe(3);
+    const after = ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER });
+    expect(after.usedCount).toBe(3);
+    expect(after.remainingCount).toBe(2);
+  });
+
+  it("sequence=5が発行済みなら、直接証明できる数が少なくても0 chargeで上限", () => {
+    const ctx = setup();
+    insertLegacyExtensionPurchase(ctx, ctx.item.id, NOW - 150, EXTENSION_SNAPSHOT);
+    insertLedgerUse(ctx, lastPurchaseId(ctx), 5, NOW - DAY);
+
+    const before = ctx.ledger.balanceOf(`user:${USER}`);
+    const deadlineBefore = ctx.db.prepare("SELECT eval_deadline_at AS d FROM souls WHERE user_id=?").get(USER);
+    // 直接証明できるのは1件だが、sequence 5 が既に発行されている以上、枠は使い切っている。
+    expect(codeOf(() => ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER })))
+      .toBe("ERR_EVAL_EXTENSION_LIMIT");
+    expect(codeOf(() => buy(ctx, "lower-bound:limit"))).toBe("ERR_EVAL_EXTENSION_LIMIT");
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(before);
+    expect(ctx.db.prepare("SELECT eval_deadline_at AS d FROM souls WHERE user_id=?").get(USER)).toEqual(deadlineBefore);
+    expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_eval_extension_uses").get()).toEqual({ n: 1 });
   });
 
   it("legacy購入とV2台帳で同じpurchaseを二重に数えない", () => {

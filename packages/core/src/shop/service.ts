@@ -1058,17 +1058,33 @@ export class Shop {
    * 「どの商品から買ったか」というaudit情報として`shop_eval_extension_uses`へ残すが、
    * 「あと何回使えるか」の判断には一切使わない。
    *
+   * この関数が返す1つの数が、表示・上限判断・次のsequenceの**全て**の正本になる。
+   * 「画面に出す回数」と「DB保護用のsequence」を別々に持たない——別々に持つと、
+   * 購入前に 2/5 と見せて実際には3件目として書く、という食い違いが起こりうる。
+   *
    * 内訳:
    *   1. V2 SSOT: `shop_eval_extension_uses` のこのサイクル分。
    *   2. legacy: V2台帳が無い時代の購入のうち、**購入時に確定したdelivery snapshot**が
    *      `delivery=auto` かつ `delivery_kind=extend_deadline` だと証明できるものだけ。
+   *   3. 上記で直接証明できた数と、**このサイクルで既に発行済みのsequenceの最大値**の
+   *      大きい方を採る。
    *
    * legacyの判定にitem名・説明文・現在の商品IDは使わない——商品名からの推測は、
    * 名前を変えただけで意味が変わってしまう。`delivery_snapshot_json`は購入時点の
    * 商品定義を固定した不変記録で、`parseDeliverySnapshot()`（壊れていれば現在の商品定義で
-   * 代用せずnullを返す）だけを正本にする。snapshotが無くextensionだと**証明できない**
-   * 過去行は数えない——推測で数えるより、証明できる分だけを数えるfail-closedを採る
-   * （PR本文のlegacy compatibility policy参照）。
+   * 代用せずnullを返す）だけを正本にする。
+   *
+   * **3の理由**: snapshotが無い行を「延長だった」と推測はしないが、単に数えないだけだと
+   * 5回上限に対してはむしろ緩くなる（fail-closedではない）。PR #131時代のwriterは
+   * snapshotの有無に関係なく同一itemのdelivered購入を数えていたので、
+   * 「snapshot無しV1購入 → その後のV2購入が sequence=2」という状態は旧実装でも
+   * schema上も成立し得た。発行済みのsequence Nは「少なくともN件目の使用が発行された」
+   * という**不変の保守的な下限**なので、直接証明できる数より大きければそちらを採る。
+   * 直接は証明できない使用を推測で無かったことにして追加購入を許すより安全側。
+   *
+   * 正常な新規データでは 直接証明数 === 最大sequence。台帳外のlegacyがあれば
+   * 直接証明数 > 最大sequence も正常。逆に 最大sequence > 直接証明数 のときだけ、
+   * 過去writerが現在は直接証明できない使用をsequenceへ織り込んでいたことを意味する。
    *
    * 同じpurchaseをV2台帳とlegacy側で二重に数えない。
    */
@@ -1095,17 +1111,16 @@ export class Shop {
       const snapshot = parseDeliverySnapshot(row.snapshot);
       return snapshot !== null && snapshot.delivery_kind === "extend_deadline";
     }).length;
+    const directlyProvenCount = ledgerCount + legacyCount;
 
-    return ledgerCount + legacyCount;
-  }
-
-  /** このサイクルで既に発行済みのsequenceの最大値（V2台帳のみ。legacyはsequenceを持たない）。 */
-  private evaluationExtensionMaxSequence(userId: string, cycleStartedAt: number): number {
-    return (this.db
+    // 発行済みsequenceは「少なくともここまで使用が進んでいた」というimmutableな下限。
+    const maxSequence = (this.db
       .prepare(
         "SELECT COALESCE(MAX(sequence), 0) AS n FROM shop_eval_extension_uses WHERE user_id = ? AND eval_started_at = ?",
       )
       .get(userId, cycleStartedAt) as { n: number }).n;
+
+    return Math.max(directlyProvenCount, maxSequence);
   }
 
   /**
@@ -1154,18 +1169,15 @@ export class Shop {
     }
 
     // 商品IDではなく評価サイクルで数える。商品を作り直しても枠は同じ（上のdoc comment参照）。
+    // 表示・上限判断・次のsequenceは全てこの1つの値から出る。
     const usedCount = this.evaluationExtensionUsedCount(input.userId, soul.eval_started_at);
     if (usedCount >= EVAL_EXTENSION_MAX_USES) {
       throw new ShopError("ERR_EVAL_EXTENSION_LIMIT", { usedCount, maxUses: EVAL_EXTENSION_MAX_USES });
     }
-    // application側の上限判断とDB側の`UNIQUE(user_id, eval_started_at, sequence)`が同じ
-    // cycle semanticsを見るようにする。台帳に既にある最大sequenceも必ず超える値を選び、
-    // 「countは4なのにsequence 5が既に存在する」ような不整合をconstraint例外へ落とさず、
-    // Landを1も動かす前に上限として止める。
-    const nextSequence = Math.max(usedCount, this.evaluationExtensionMaxSequence(input.userId, soul.eval_started_at)) + 1;
-    if (nextSequence > EVAL_EXTENSION_MAX_USES) {
-      throw new ShopError("ERR_EVAL_EXTENSION_LIMIT", { usedCount, maxUses: EVAL_EXTENSION_MAX_USES });
-    }
+    // 上限判断を通った時点で usedCount <= 4 なので、必ず 1..5 に収まる。application側の
+    // 判断とDB側の`UNIQUE(user_id, eval_started_at, sequence)`/`CHECK(1..5)`が同じ
+    // cycle countを見るため、constraint例外へ落ちる経路が残らない。
+    const nextSequence = usedCount + 1;
     if (
       input.expected &&
       (input.expected.priceLand !== item.price_land ||
