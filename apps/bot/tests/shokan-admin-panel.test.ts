@@ -29,10 +29,16 @@ function setup() {
   const ledger = new Ledger(db);
   const settings = new Settings(db);
   const events = new EventLog(db);
-  const shop = new Shop(db, ledger, events);
+  // 面談権は実際の発行経路で作る（genericなstorefront購入では作れない）。
+  let reevalItemId: number | null = null;
+  const shop = new Shop(db, ledger, events, { reevalItemId: () => reevalItemId });
   const departments = new Departments(db, ledger);
   const nickname = shop.createItem({ name: "名前変更", price_land: 50_000, kind: "one_shot", delivery: "manual" }, "staff");
-  const reeval = shop.createItem({ name: "再評価チャレンジ", price_land: 500_000, kind: "one_shot", delivery: "manual" }, "staff");
+  const reeval = shop.createItem(
+    { name: "再評価チャレンジ", price_land: 500_000, price_alt_kind: "invite", price_alt_amount: 5, kind: "one_shot", delivery: "manual" },
+    "staff",
+  );
+  reevalItemId = reeval.id;
   const pass = shop.createItem(
     {
       name: "裏チャット入場券",
@@ -64,8 +70,16 @@ function setup() {
 
 type Ctx = ReturnType<typeof setup>;
 
-const buy = (ctx: Ctx, itemId: number) =>
-  ctx.shop.purchase({ itemId, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+const buy = (ctx: Ctx, itemId: number) => {
+  if (itemId === ctx.reeval.id) {
+    ctx.db.prepare("INSERT OR IGNORE INTO souls (user_id,status,updated_at) VALUES (?, 'meirei', 1)").run(USER);
+    return ctx.shop.purchaseReevaluation({
+      itemId, userId: USER, actor: USER, memberRoleIds: [],
+      mode: "land", idempotencyKey: `reeval:${USER}:${Math.random()}`,
+    }).purchase;
+  }
+  return ctx.shop.purchase({ itemId, userId: USER, actor: USER, memberRoleIds: [] }).purchase;
+};
 
 /** 別の利用者としてまとめて購入する（キューを積むため） */
 function buyAs(ctx: Ctx, itemId: number, userId: string) {
@@ -79,6 +93,13 @@ function buyAs(ctx: Ctx, itemId: number, userId: string) {
     approvedBy: "t",
     idempotencyKey: `seed:${userId}`,
   });
+  if (itemId === ctx.reeval.id) {
+    ctx.db.prepare("INSERT OR IGNORE INTO souls (user_id,status,updated_at) VALUES (?, 'meirei', 1)").run(userId);
+    return ctx.shop.purchaseReevaluation({
+      itemId, userId, actor: userId, memberRoleIds: [],
+      mode: "land", idempotencyKey: `reeval:${userId}:${Math.random()}`,
+    }).purchase;
+  }
   return ctx.shop.purchase({ itemId, userId, actor: userId, memberRoleIds: [] }).purchase;
 }
 

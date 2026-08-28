@@ -8,6 +8,7 @@ import {
   Ledger,
   REEVAL_INVITE_COUNT,
   REEVAL_PRICE_LAND,
+  Settings,
   Shop,
   Tickets,
   ShopError,
@@ -356,6 +357,85 @@ describe("再評価権のidentityは商品IDではない", () => {
     // 無関係な商品は記録されない
     const other = ctx.shop.createItem({ name: "無関係", price_land: 1, kind: "one_shot", delivery: "manual" }, STAFF);
     expect(ctx.shop.isHistoricalReevaluationItem(other.id)).toBe(false);
+  });
+
+  it("設定を書いただけで（Shopの再評価APIを一度も呼ばなくても）registryへ残る", () => {
+    // 守りたいのは「一度でも再評価sale itemとして**指定された**item」であって、
+    // 「一度でもShopがその指定を**観測した**item」ではない。設定を書いた直後に再評価の
+    // readを1回も挟まずBへ移す運用でも、Aがgeneric storefrontへ落ちてはいけない。
+    //
+    // このテストは constructor sync / read-time register / purchase evidence のどれでも
+    // 通らない——setting writeそのものが記録されて初めて通る。
+    const db = openDb(":memory:");
+    const ledger = new Ledger(db);
+    const events = new EventLog(db);
+    const settings = new Settings(db);
+    new Tickets(db, events);
+    // 再評価設定は**未設定**のままShopを構築する（構築時syncでは何も記録されない）
+    const shop = new Shop(db, ledger, events, {
+      reevalItemId: () => {
+        const v = Number(settings.getString("shop:reeval_item_id"));
+        return Number.isSafeInteger(v) && v > 0 ? v : null;
+      },
+    });
+    const mk = (name: string) => shop.createItem(
+      {
+        name,
+        price_land: REEVAL_PRICE_LAND,
+        price_alt_kind: "invite",
+        price_alt_amount: REEVAL_INVITE_COUNT,
+        kind: "one_shot",
+        delivery: "manual",
+      },
+      STAFF,
+    );
+    const a = mk("再評価チャレンジA");
+    const b = mk("再評価チャレンジB");
+    expect(db.prepare("SELECT COUNT(*) AS n FROM shop_reevaluation_sale_items").get()).toEqual({ n: 0 });
+
+    // ここから下でShopの再評価APIは一切呼ばない
+    settings.set("shop:reeval_item_id", a.id, STAFF);
+    settings.set("shop:reeval_item_id", b.id, STAFF);
+
+    const registered = (db
+      .prepare("SELECT item_id FROM shop_reevaluation_sale_items ORDER BY item_id")
+      .all() as { item_id: number }[]).map((r) => r.item_id);
+    expect(registered).toEqual([a.id, b.id].sort((x, y) => x - y));
+    // 購入実績は0件のまま
+    expect(db.prepare("SELECT COUNT(*) AS n FROM shop_purchases").get()).toEqual({ n: 0 });
+
+    // 旧AはgenericのstorefrontへB切替後も落ちない
+    db.prepare("INSERT INTO souls (user_id,status,updated_at) VALUES (?,?,1)").run(USER, "meirei");
+    ledger.ensureAccount(`user:${USER}`, "user");
+    ledger.transfer({
+      from: TREASURY, to: `user:${USER}`, amount: 1_000_000,
+      type: "initial", actor: STAFF, idempotencyKey: "seed:write-authority",
+    });
+    const beforeLand = ledger.balanceOf(`user:${USER}`);
+    expect(codeOf(() => shop.purchase({ itemId: a.id, userId: USER, actor: STAFF, memberRoleIds: [] })))
+      .toBe("ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED");
+    expect(ledger.balanceOf(`user:${USER}`)).toBe(beforeLand);
+    db.close();
+  });
+
+  it("不正な設定値を書いても、無関係なitemを登録せず例外にもしない", () => {
+    const db = openDb(":memory:");
+    const events = new EventLog(db);
+    const settings = new Settings(db);
+    const shop = new Shop(db, new Ledger(db), events);
+    const real = shop.createItem({ name: "実在", price_land: 1, kind: "one_shot", delivery: "manual" }, STAFF);
+
+    for (const bad of ["12abc", "-1", "0", "", "999999", "1.5", " 1"]) {
+      expect(() => settings.set("shop:reeval_item_id", bad, STAFF)).not.toThrow();
+    }
+    expect(db.prepare("SELECT COUNT(*) AS n FROM shop_reevaluation_sale_items").get()).toEqual({ n: 0 });
+
+    // 正しい値だけが記録される
+    settings.set("shop:reeval_item_id", real.id, STAFF);
+    expect(
+      db.prepare("SELECT item_id FROM shop_reevaluation_sale_items").all(),
+    ).toEqual([{ item_id: real.id }]);
+    db.close();
   });
 
   it("壊れたsnapshotは『証明できない』であって、lookup全体の失敗ではない", () => {

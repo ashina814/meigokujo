@@ -556,6 +556,50 @@ export class Shop {
         first_seen_at INTEGER NOT NULL,
         source        TEXT NOT NULL
       );
+      -- **write authorityで記録する。** 守りたいのは「一度でも再評価sale itemとして
+      -- 指定されたitem」であって、「一度でもShopがその指定を観測したitem」ではない。
+      -- 設定を書いた直後にShopが再評価APIを1度も呼ばないまま次の設定へ移ると、read-time
+      -- syncでは取りこぼす。設定の書き込みそのものをtriggerで捕まえれば、Settings.set()・
+      -- 将来のdedicated UI・別の管理経路・正規のdirect SQLのどれでも同じ不変条件が成立する。
+      --
+      -- 不正値guard: 正の整数として往復一致し（'12abc'のようなCAST事故を弾く）、かつ
+      -- 実在する shop_items.id のときだけ記録する。不正な設定を書いただけでtransaction全体を
+      -- 壊さない——記録しないだけ。trigger内のINSERT OR IGNOREは外側statementのconflict
+      -- 解決に上書きされる（Settings.set()のUPSERTがABORTを強いる）ので、重複行を
+      -- そもそも作らないNOT EXISTS guardにしてある。
+      CREATE TRIGGER IF NOT EXISTS trg_shop_reeval_sale_item_insert
+      AFTER INSERT ON settings
+      WHEN NEW.key = 'shop:reeval_item_id'
+      BEGIN
+        INSERT INTO shop_reevaluation_sale_items (item_id, first_seen_at, source)
+        SELECT CAST(NEW.value AS INTEGER), unixepoch(), 'setting_write'
+         WHERE CAST(NEW.value AS INTEGER) > 0
+           AND CAST(CAST(NEW.value AS INTEGER) AS TEXT) = NEW.value
+           AND EXISTS (SELECT 1 FROM shop_items WHERE id = CAST(NEW.value AS INTEGER))
+           AND NOT EXISTS (SELECT 1 FROM shop_reevaluation_sale_items
+                            WHERE item_id = CAST(NEW.value AS INTEGER));
+      END;
+      -- Settings.set() はUPSERTなので、既存keyの変更はUPDATE側で発火する。
+      -- A→Bという更新そのものが「Aは過去のsale item」「Bは現在のsale item」の両方を残す。
+      CREATE TRIGGER IF NOT EXISTS trg_shop_reeval_sale_item_update
+      AFTER UPDATE OF value ON settings
+      WHEN NEW.key = 'shop:reeval_item_id'
+      BEGIN
+        INSERT INTO shop_reevaluation_sale_items (item_id, first_seen_at, source)
+        SELECT CAST(NEW.value AS INTEGER), unixepoch(), 'setting_write'
+         WHERE CAST(NEW.value AS INTEGER) > 0
+           AND CAST(CAST(NEW.value AS INTEGER) AS TEXT) = NEW.value
+           AND EXISTS (SELECT 1 FROM shop_items WHERE id = CAST(NEW.value AS INTEGER))
+           AND NOT EXISTS (SELECT 1 FROM shop_reevaluation_sale_items
+                            WHERE item_id = CAST(NEW.value AS INTEGER));
+        INSERT INTO shop_reevaluation_sale_items (item_id, first_seen_at, source)
+        SELECT CAST(OLD.value AS INTEGER), unixepoch(), 'setting_write_previous'
+         WHERE CAST(OLD.value AS INTEGER) > 0
+           AND CAST(CAST(OLD.value AS INTEGER) AS TEXT) = OLD.value
+           AND EXISTS (SELECT 1 FROM shop_items WHERE id = CAST(OLD.value AS INTEGER))
+           AND NOT EXISTS (SELECT 1 FROM shop_reevaluation_sale_items
+                            WHERE item_id = CAST(OLD.value AS INTEGER));
+      END;
       CREATE TABLE IF NOT EXISTS shop_eval_extension_uses (
         purchase_id INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
         item_id INTEGER NOT NULL REFERENCES shop_items(id),
@@ -1453,9 +1497,15 @@ export class Shop {
   /**
    * 「この商品は再評価サービスの販売商品である」という指定を永続化する。冪等。
    *
+   * 記録は3層:
+   *   1. **write-time trigger（primary guarantee）** — `settings` への書き込みそのもの。
+   *      Shopが一度も観測しなくても、指定された事実が残る（`ensureSchema()` 参照）。
+   *   2. **read-time sync（repair / compatibility）** — 構築時と、現在の指定を参照した時。
+   *      trigger導入前のDBや、triggerを持たない経路で書かれた設定を後から回収する。
+   *   3. **purchase evidence（pre-registry legacy fallback）** — registry以前の履歴。
+   *
    * **購入が成立した時点では遅い**——実績0件のまま設定がA→Bへ移ると、最初の利用者が
-   * 「昨日まで再評価商品だったものが普通の商品に化けた」事故に遭う。設定として認識された
-   * 時点（Shop構築時と、販売前提条件の確認時）で記録する。
+   * 「昨日まで再評価商品だったものが普通の商品に化けた」事故に遭う。
    */
   registerReevaluationSaleItem(itemId: number, source = "sale_setting"): void {
     if (!Number.isSafeInteger(itemId) || itemId <= 0) return;
