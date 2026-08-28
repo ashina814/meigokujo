@@ -9,7 +9,13 @@ import { RoleFamilyTemporal } from "../src/role-family/temporal.js";
 import { TcSocialObservations } from "../src/tc-social/service.js";
 import { VcPublicSocialPresence } from "../src/vc/public-social-presence.js";
 import { F5C_CANDIDATE_SWEEP_PLANS, F5C_SWEEP_CONTRACT_VERSION } from "../src/titles/v2-calibration-sweep.js";
-import { CALIBRATION_SCHEMA_VERSION, CALIBRATION_PERCENTILE_METHOD, canonicalReadinessHash } from "../src/titles/v2-calibration.js";
+import {
+  CALIBRATION_SCHEMA_VERSION,
+  CALIBRATION_PERCENTILE_METHOD,
+  CalibrationSnapshotSchemaError,
+  canonicalReadinessHash,
+  classifySnapshotSchemaGap,
+} from "../src/titles/v2-calibration.js";
 import { TITLE_V2_CATALOG_READINESS } from "../src/titles/v2-catalog-readiness.js";
 import { canonicalCatalogHash, TITLE_V2_CATALOG_CANDIDATES } from "../src/titles/v2-catalog-candidates.js";
 import {
@@ -837,4 +843,146 @@ describe("F5c3 decision-evidence layer", () => {
       if (sidecar.endsWith("-wal")) expect(digest(path.join(dir, sidecar))).toBe(EMPTY_SHA256);
     }
   });
+
+  // ── operator polish: pre-rollout snapshot compatibility (task #196) ───────────────────────
+  it("operator diagnostic: a snapshot predating the observers reports EVERY missing dependency at once, fail-closed", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const os = require("node:os") as typeof import("node:os");
+    const path = require("node:path") as typeof import("node:path");
+    const crypto = require("node:crypto") as typeof import("node:crypto");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "f5c3-preroll-"));
+    const snapshot = path.join(dir, "old.sqlite");
+    // Bootstrap alone leaves the service-constructor tables absent — the same shape a snapshot
+    // captured before those observers rolled out actually has.
+    openDb(snapshot).close();
+    const digest = () => crypto.createHash("sha256").update(fs.readFileSync(snapshot)).digest("hex");
+    const before = digest();
+    const beforeTables = tableNames(snapshot);
+
+    let caught: unknown;
+    try {
+      runF5cDecisionEvidence(
+        openSnapshotReadOnly(snapshot),
+        { cohortKey: "preroll", subjectUserIds: ["RESTRICTED_PREROLL_1", "RESTRICTED_PREROLL_2"], window: WINDOW },
+        false,
+      );
+    } catch (error) { caught = error; }
+
+    expect(caught).toBeInstanceOf(CalibrationSnapshotSchemaError);
+    const failure = caught as CalibrationSnapshotSchemaError;
+    // aggregate, not first-failure-wins: an operator fixes the snapshot once, not ten times.
+    expect(failure.gaps.length).toBeGreaterThan(1);
+    expect(failure.requiredSourceCount).toBeGreaterThanOrEqual(failure.gaps.length);
+    expect(failure.gaps.some((g) => g.name === "casino_participations" && g.kind === "table")).toBe(true);
+    expect(failure.message).toMatch(/predates the required observation schema/);
+    expect(failure.message).toMatch(/casino_participations/);
+    // it must say what to do, and must not suggest hand-creating the objects
+    expect(failure.message).toMatch(/rolled out to production/);
+
+    // §4 privacy: schema identifiers only — never cohort membership.
+    expect(failure.message).not.toContain("RESTRICTED_PREROLL_1");
+    expect(JSON.stringify(failure.gaps)).not.toContain("RESTRICTED_PREROLL_1");
+
+    // fail-closed: no bootstrap, no migration, no table creation, not one byte changed.
+    expect(digest()).toBe(before);
+    expect(tableNames(snapshot)).toEqual(beforeTables);
+    expect(tableNames(snapshot)).not.toContain("casino_participations");
+  });
+
+  it("operator diagnostic: a missing COLUMN is reported the same way as a missing table", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const os = require("node:os") as typeof import("node:os");
+    const path = require("node:path") as typeof import("node:path");
+    const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "f5c3-nocol-"));
+    const snapshot = path.join(dir, "nocol.sqlite");
+    openDb(snapshot).close();
+    // drop a column a safe source genuinely reads, leaving the table itself present
+    const w = new Database(snapshot);
+    w.exec("ALTER TABLE vc_segments DROP COLUMN end_quality");
+    w.close();
+
+    let caught: unknown;
+    try {
+      runF5cDecisionEvidence(openSnapshotReadOnly(snapshot), { cohortKey: "nocol", subjectUserIds: ["x"], window: WINDOW }, false);
+    } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(CalibrationSnapshotSchemaError);
+    const failure = caught as CalibrationSnapshotSchemaError;
+    expect(failure.gaps.some((g) => g.kind === "column" && g.name === "end_quality")).toBe(true);
+    expect(failure.message).toMatch(/required column `end_quality` is absent/);
+  });
+
+  it("operator diagnostic: an UNEXPECTED database error keeps its cause and is never relabelled a rollout gap", () => {
+    // only the two "this snapshot lacks schema" shapes may be reclassified...
+    expect(classifySnapshotSchemaGap("s", Object.assign(new Error("no such table: t"), { code: "SQLITE_ERROR" })))
+      .toEqual({ source: "s", kind: "table", name: "t" });
+    expect(classifySnapshotSchemaGap("s", Object.assign(new Error("no such column: c"), { code: "SQLITE_ERROR" })))
+      .toEqual({ source: "s", kind: "column", name: "c" });
+    // ...everything else must pass through untouched, or a real defect would be dismissed as
+    // "the observer was not deployed yet" and silently waited out.
+    for (const other of [
+      Object.assign(new Error("database disk image is malformed"), { code: "SQLITE_CORRUPT" }),
+      Object.assign(new Error("UNIQUE constraint failed: x.y"), { code: "SQLITE_CONSTRAINT" }),
+      Object.assign(new Error("attempt to write a readonly database"), { code: "SQLITE_READONLY" }),
+      Object.assign(new Error("no such table: t"), { code: "SQLITE_CONSTRAINT" }), // right text, wrong code
+      new Error("no such thing: t"),
+      "not an error",
+    ]) {
+      expect(classifySnapshotSchemaGap("s", other)).toBeNull();
+    }
+
+    // and end to end: a non-schema failure propagates as itself, not as CalibrationSnapshotSchemaError
+    const fs = require("node:fs") as typeof import("node:fs");
+    const os = require("node:os") as typeof import("node:os");
+    const path = require("node:path") as typeof import("node:path");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "f5c3-corrupt-"));
+    const broken = path.join(dir, "not-a-db.sqlite");
+    fs.writeFileSync(broken, "this is definitely not a sqlite database");
+    // SQLite opens lazily, so the failure surfaces on first read — what matters is that it stays
+    // its own error and is never dressed up as a rollout-compatibility gap.
+    let thrown: unknown;
+    try {
+      runF5cDecisionEvidence(openSnapshotReadOnly(broken), { cohortKey: "broken", subjectUserIds: ["x"], window: WINDOW }, false);
+    } catch (error) { thrown = error; }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(CalibrationSnapshotSchemaError);
+    expect((thrown as Error).message).toMatch(/not a database|malformed|file is not/i);
+  });
+
+  it("operator CLI: the DOCUMENTED invocation parses, and a stray `--` separator is rejected with its own message", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const documented = [
+      "--db=/path/to/snapshot.sqlite",
+      "--cohort-key=2026-08-review",
+      "--subject-ids-file=/path/to/cohort.txt",
+      "--window-start=1756000000", "--window-end=1758592000", "--observed-at=1758592000",
+      "--coverage-window-validated",
+      "--out=/path/to/f5c3-evidence.json",
+    ];
+    const parsed = parseArgs(documented);
+    expect(parsed.db).toBe("/path/to/snapshot.sqlite");
+    expect(parsed.subjectIdsFile).toBe("/path/to/cohort.txt");
+    expect(parsed.coverageWindowValidated).toBe(true);
+    expect(parsed.out).toBe("/path/to/f5c3-evidence.json");
+
+    // This repository's pnpm forwards `--` to the script. The parser rejects it rather than
+    // silently accepting a separator that means nothing here (task #193/#194 operator finding).
+    expect(() => parseArgs(["--", ...documented])).toThrow(/unrecognized argument: --/);
+
+    // the canonical examples must therefore not show one.
+    const read = (rel: string) => fs.readFileSync(new URL(rel, import.meta.url), "utf8") as string;
+    for (const doc of ["../scripts/f5c3-decision-evidence.ts", "../../../docs/titles-v2-design.md"]) {
+      // the good form is `evidence:f5c3 \`; this substring can only appear in the broken one.
+      expect(read(doc)).not.toContain("evidence:f5c3 --");
+    }
+  });
 });
+
+function tableNames(file: string): readonly string[] {
+  const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+  const db = new Database(file, { readonly: true, fileMustExist: true });
+  const names = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as { name: string }[])
+    .map((r) => r.name);
+  db.close();
+  return names;
+}

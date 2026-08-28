@@ -19,8 +19,10 @@
  *   - it fails closed when the collection's catalog/readiness provenance no longer matches the
  *     live contracts (see `buildF5cDecisionEvidence`)
  *
- * Usage:
- *   pnpm --filter @meigokujo/core evidence:f5c3 -- \
+ * Usage. Do NOT add a `--` separator: this repository's pnpm forwards `--` through to the
+ * script, where the strict argument allowlist correctly rejects it as an unrecognized
+ * argument.
+ *   pnpm --filter @meigokujo/core evidence:f5c3 \
  *     --db=/path/to/snapshot.sqlite \
  *     --cohort-key=2026-08-review \
  *     --subject-ids-file=/path/to/cohort.txt \
