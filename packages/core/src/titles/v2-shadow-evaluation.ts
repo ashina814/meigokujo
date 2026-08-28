@@ -51,8 +51,14 @@ export const F5C2_SHADOW_CONTRACT_VERSION = 4 as const;
  */
 export const F5C2_BOUNDARY_PERCENTILES = [10, 25, 50, 75, 90, 95, 99] as const;
 export type F5cBoundaryPercentile = (typeof F5C2_BOUNDARY_PERCENTILES)[number];
-/** The single illustrative combination used for the plan-level MATCHED/NOT_MATCHED call. */
-const F5C2_REPRESENTATIVE_PERCENTILE: F5cBoundaryPercentile = 50;
+/**
+ * The single illustrative combination used for the plan-level MATCHED/NOT_MATCHED call.
+ *
+ * Exported as the **single source of truth** for "representative" (PR #192レビュー第1ラウンド§2):
+ * F5c3 pins every sibling dimension to its boundary value at this percentile and must not restate
+ * the number, or a future change here would silently desynchronise F5c2 and F5c3.
+ */
+export const F5C2_REPRESENTATIVE_PERCENTILE: F5cBoundaryPercentile = 50;
 
 /**
  * UNKNOWN is never collapsed into false/zero. A criterion/axis is UNKNOWN for a subject when
@@ -820,11 +826,69 @@ function rowPredicateFor(plan: F5cCandidateSweepPlan, rowGroupKey: string): F5cR
   return plan.rowGroupCompositions.find((c) => c.rowGroupKey === rowGroupKey)?.rowPredicate ?? null;
 }
 
+/**
+ * F5c3 (task #192) §1/§2: the **numeric decision boundary** each dimension of the candidate is
+ * held at. F5c2's own representative execution takes each dimension's own conditional grid at
+ * `F5C2_REPRESENTATIVE_PERCENTILE`; F5c3's one-axis-at-a-time sensitivity substitutes exactly one
+ * dimension's numeric boundary and pins every sibling to its baseline numeric value. Routing both
+ * through the same selection function is what guarantees a candidate cannot acquire subtly
+ * different semantics in F5c2 representative execution vs F5c3 OAT vs F5c3 overlap — there is
+ * only one evaluator.
+ *
+ * Why NUMERIC rather than a percentile rank (PR #192レビュー第1ラウンド§1): this pipeline is
+ * dependent. A downstream reduction's boundary grid is derived from the distribution that survives
+ * its upstream SCALAR_SAMPLE filters, so holding a sibling at "p50" does NOT hold its decision
+ * boundary still — move the filter and the qualifying-day samples can go from `[1, 2, 3]`
+ * (p50 = 2) to `[0, 0, 3]` (p50 = 0), which moves TWO production decision boundaries in what the
+ * report calls a one-axis-at-a-time run. Substituting numeric boundaries preserves the real
+ * dependency (a filter change still changes each subject's reduced VALUE) while keeping the
+ * sibling's decision BOUNDARY where the baseline put it.
+ *
+ * `conditionalBoundaries` is the dimension's grid as computed in THIS execution; returning
+ * `undefined` means "this dimension has no usable boundary", which every consuming path already
+ * treats fail-closed (empty qualifying set / UNKNOWN outcome).
+ *
+ * A dimension key is the axis's own `axisKey`, except the manifest cardinality sweep, which is
+ * keyed `manifest:<countMetricKey>` (matching the axisKey F5c2 already reports for it).
+ */
+export type F5cDecisionBoundarySelection = (
+  dimensionKey: string,
+  conditionalBoundaries: ReadonlyMap<F5cBoundaryPercentile, number>,
+) => number | undefined;
+
+const REPRESENTATIVE_SELECTION: F5cDecisionBoundarySelection = (_dimensionKey, boundaries) =>
+  boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+
+/** The dimension key F5c2/F5c3 use for a manifest cardinality sweep criterion. */
+export function manifestDimensionKey(countMetricKey: string): string {
+  return `manifest:${countMetricKey}`;
+}
+
 interface AxisEvalContext {
   readonly plan: F5cCandidateSweepPlan;
   readonly probeKey: string;
   readonly subjects: readonly PlanningCalibrationSubjectMeasurement[];
   readonly coverageWindowValidated: boolean;
+  readonly selectBoundary: F5cDecisionBoundarySelection;
+  /**
+   * The boundary grid each decision dimension was actually offered during this execution, recorded
+   * as it is consumed. A baseline (representative) execution's grids are exactly what F5c3 pins
+   * siblings to; recording them here — rather than re-deriving them from `axisSweeps` — keeps the
+   * pinned value identical to the value the decision was actually made from, including on the
+   * special paths whose decision grid is not the one their own sweep reports — a
+   * POST_FILTER_MATCHING_SIZE axis decides against its sibling filter's grid, not its own.
+   */
+  readonly observedBoundaryGrids: Map<string, ReadonlyMap<F5cBoundaryPercentile, number>>;
+}
+
+/** Record this dimension's grid, then take the caller-selected numeric boundary from it. */
+function decisionBoundary(
+  ctx: AxisEvalContext,
+  dimensionKey: string,
+  boundaries: ReadonlyMap<F5cBoundaryPercentile, number>,
+): number | undefined {
+  ctx.observedBoundaryGrids.set(dimensionKey, boundaries);
+  return ctx.selectBoundary(dimensionKey, boundaries);
 }
 
 function metricSamplesFor(ctx: AxisEvalContext, metricKey: string): { readonly bySubject: ReadonlyMap<string, number | null>; readonly samples: readonly number[] } {
@@ -869,7 +933,7 @@ function evaluateMetricAxis(ctx: AxisEvalContext, axis: F5cSweepAxis & { source:
       marginalPassRate: knownSubjects.length === 0 ? null : passingCount / knownSubjects.length,
     };
   });
-  const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+  const representativeBoundary = decisionBoundary(ctx, axis.axisKey, boundaries);
   const outcomeBySubject = new Map<string, F5cShadowOutcome>();
   for (const [subjectId, value] of bySubject) {
     if (value === null || representativeBoundary === undefined) { outcomeBySubject.set(subjectId, "UNKNOWN"); continue; }
@@ -978,7 +1042,7 @@ function evaluateDaypartTargetAxis(
     const passingCount = samples.filter((s) => s >= boundaryValue).length;
     return { percentile, boundaryValue, knownCount: samples.length, passingCount, marginalPassRate: samples.length === 0 ? null : passingCount / samples.length };
   });
-  const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+  const representativeBoundary = decisionBoundary(ctx, axis.axisKey, boundaries);
 
   const outcomeBySubject = new Map<string, F5cShadowOutcome>();
   for (const subject of ctx.subjects) {
@@ -1044,7 +1108,7 @@ function evaluatePersonalStabilityAxis(
     const passingCount = samples.filter((s) => s >= boundaryValue).length;
     return { percentile, boundaryValue, knownCount: samples.length, passingCount, marginalPassRate: samples.length === 0 ? null : passingCount / samples.length };
   });
-  const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+  const representativeBoundary = decisionBoundary(ctx, axis.axisKey, boundaries);
 
   const outcomeBySubject = new Map<string, F5cShadowOutcome>();
   for (const subject of ctx.subjects) {
@@ -1107,7 +1171,7 @@ function evaluateMultiDaypartBreadthAxis(
     const passingCount = samples.filter((s) => s >= boundaryValue).length;
     return { percentile, boundaryValue, knownCount: samples.length, passingCount, marginalPassRate: samples.length === 0 ? null : passingCount / samples.length };
   });
-  const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+  const representativeBoundary = decisionBoundary(ctx, axis.axisKey, boundaries);
 
   const outcomeBySubject = new Map<string, F5cShadowOutcome>();
   for (const subject of ctx.subjects) {
@@ -1162,9 +1226,16 @@ function evaluatePostFilterMatchingAxis(
   ctx: AxisEvalContext,
   axis: F5cSweepAxis & { reducerKind: "POST_FILTER_MATCHING_SIZE" },
   edgeSampleBoundaries: ReadonlyMap<F5cBoundaryPercentile, number>,
+  edgeAxisKey: string | null,
 ): { readonly sweep: F5cAxisSweepResult; readonly outcomeAtRepresentative: ReadonlyMap<string, F5cShadowOutcome> } {
   const rawRowsBySubject = rowGroupRawRowsFor(ctx, axis);
-  const representativeEdgeBoundary = edgeSampleBoundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+  // F5c3 §2: the edge threshold is the SIBLING filter axis's own decision dimension, so it moves
+  // when that dimension is the one under OAT — not when the matching-size dimension is. Keeping
+  // the two keyed separately is what preserves the real F5c1/F5c2 execution dependency instead of
+  // pretending matching size is an independent scalar comparison.
+  const representativeEdgeBoundary = edgeAxisKey === null
+    ? edgeSampleBoundaries.get(F5C2_REPRESENTATIVE_PERCENTILE)
+    : decisionBoundary(ctx, edgeAxisKey, edgeSampleBoundaries);
   const matchingSizeBySubject = new Map<string, number>();
   const knownSubjectIds: string[] = [];
   for (const subject of ctx.subjects) {
@@ -1193,7 +1264,7 @@ function evaluatePostFilterMatchingAxis(
       marginalPassRate: matchingSizeSamples.length === 0 ? null : passingCount / matchingSizeSamples.length,
     };
   });
-  const representativeMatchingBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE) ?? 0;
+  const representativeMatchingBoundary = decisionBoundary(ctx, axis.axisKey, boundaries) ?? 0;
 
   const observed = [...rawRowsBySubject.values()].reduce((sum, rows) => sum + rows.length, 0);
   const outcomeAtRepresentative = new Map<string, F5cShadowOutcome>();
@@ -1260,7 +1331,7 @@ function evaluateRowGroup(
     const edgeSamples = filterAxis ? rowGroupRawRowsFor(ctx, filterAxis) : new Map<string, readonly RawRow[]>();
     const allEdgeSamples = [...edgeSamples.values()].flat().map((r) => r.sampleValue).filter((v): v is number => v !== null);
     const boundaries = boundaryValuesFor(allEdgeSamples);
-    const result = evaluatePostFilterMatchingAxis(ctx, matchingAxis, boundaries);
+    const result = evaluatePostFilterMatchingAxis(ctx, matchingAxis, boundaries, filterAxis?.axisKey ?? null);
     sweeps.push(result.sweep);
     for (const [subjectId, outcome] of result.outcomeAtRepresentative) {
       outcomeBySubject.set(subjectId, combineOutcomes([outcomeBySubject.get(subjectId) ?? "MATCHED", outcome]));
@@ -1295,7 +1366,7 @@ function evaluateRowGroup(
    */
   const qualifyingFilterSetsFor = (subjectId: string): readonly (readonly RawRow[])[] =>
     group.filterAxes.map((filterAxis, i) => {
-      const boundary = filterBoundaries[i]!.get(F5C2_REPRESENTATIVE_PERCENTILE);
+      const boundary = decisionBoundary(ctx, filterAxis.axisKey, filterBoundaries[i]!);
       const raw = filterRawBySubject[i]!.get(subjectId) ?? [];
       return boundary === undefined ? [] : filterRows(raw, filterAxis.operator, boundary);
     });
@@ -1378,7 +1449,7 @@ function evaluateRowGroup(
     });
     sweeps.push({ axisKey: reductionAxis.axisKey, reducerKind: reductionAxis.reducerKind, observedSampleCount: samples.length, boundaryPoints, hourHistogram: null, boundaryReliability: boundaryReliabilityFor(ctx, reductionReliability(reductionAxis.reducerKind, group.filterAxes.length > 0)) });
 
-    const representativeBoundary = boundaries.get(F5C2_REPRESENTATIVE_PERCENTILE);
+    const representativeBoundary = decisionBoundary(ctx, reductionAxis.axisKey, boundaries);
     for (const subject of ctx.subjects) {
       const result = reducedBySubject.get(subject.subjectUserId)!;
       const prior = outcomeBySubject.get(subject.subjectUserId);
@@ -1513,12 +1584,32 @@ export function auditF5c2SelectorSupport(
   return gaps;
 }
 
-function executeCandidate(
+/**
+ * F5c3 (task #192) §1: the single candidate evaluator. `outcomeBySubject` is transient in-memory
+ * state for aggregate computation only (F5c3 overlap needs per-subject outcomes to intersect two
+ * candidates) — it is NEVER serialized. `executeF5cShadowCalibration` drops it; F5c3 consumes it
+ * to build counts and drops it too.
+ */
+export interface F5cCandidateExecution {
+  readonly result: F5cCandidateShadowResult;
+  readonly outcomeBySubject: ReadonlyMap<string, F5cShadowOutcome>;
+  /**
+   * The numeric boundary grid each decision dimension was evaluated against in THIS execution.
+   * A representative (baseline) execution's grids are what F5c3 substitutes from when it sweeps
+   * one dimension and pins the rest — see `F5cDecisionBoundarySelection`. Aggregate boundary
+   * values only; like `outcomeBySubject`, never serialized by either layer.
+   */
+  readonly boundaryGrids: ReadonlyMap<string, ReadonlyMap<F5cBoundaryPercentile, number>>;
+}
+
+export function executeCandidateAtSelection(
   plan: F5cCandidateSweepPlan,
   subjects: readonly PlanningCalibrationSubjectMeasurement[],
   coverageWindowValidated: boolean,
-): F5cCandidateShadowResult {
-  const ctx: AxisEvalContext = { plan, probeKey: plan.probeKey, subjects, coverageWindowValidated };
+  selectBoundary: F5cDecisionBoundarySelection = REPRESENTATIVE_SELECTION,
+): F5cCandidateExecution {
+  const observedBoundaryGrids = new Map<string, ReadonlyMap<F5cBoundaryPercentile, number>>();
+  const ctx: AxisEvalContext = { plan, probeKey: plan.probeKey, subjects, coverageWindowValidated, selectBoundary, observedBoundaryGrids };
   const axisSweeps: F5cAxisSweepResult[] = [];
   const outcomeBySubject = new Map<string, F5cShadowOutcome[]>();
   const pushOutcome = (subjectId: string, outcome: F5cShadowOutcome) => {
@@ -1551,7 +1642,11 @@ function executeCandidate(
       // 計算し、各subjectをそれに対して実際に判定する。No.87/88のprevalenceはこの
       // 次元を無視してはならない。
       const cardinalitySweepBoundary = criterion.kind === "MANIFEST_CARDINALITY_SWEEP"
-        ? boundaryValuesFor(metricSamplesFor(ctx, criterion.countMetricKey).samples).get(F5C2_REPRESENTATIVE_PERCENTILE) ?? null
+        ? decisionBoundary(
+          ctx,
+          manifestDimensionKey(criterion.countMetricKey),
+          boundaryValuesFor(metricSamplesFor(ctx, criterion.countMetricKey).samples),
+        ) ?? null
         : null;
       for (const subject of subjects) {
         pushOutcome(subject.subjectUserId, evaluateManifestCriterion(criterion, subject, plan.probeKey, pinnedForCriterion, cardinalitySweepBoundary, coverageWindowValidated));
@@ -1611,9 +1706,11 @@ function executeCandidate(
   let matchedCount = 0;
   let notMatchedCount = 0;
   let unknownCount = 0;
+  const finalBySubject = new Map<string, F5cShadowOutcome>();
   for (const subject of subjects) {
     const outcomes = outcomeBySubject.get(subject.subjectUserId) ?? [];
     const combined = combineOutcomes(outcomes);
+    finalBySubject.set(subject.subjectUserId, combined);
     if (combined === "MATCHED") matchedCount += 1;
     else if (combined === "NOT_MATCHED") notMatchedCount += 1;
     else unknownCount += 1;
@@ -1621,19 +1718,23 @@ function executeCandidate(
   const knownCount = matchedCount + notMatchedCount;
 
   return {
-    candidateNo: plan.candidateNo,
-    provisionalKey: plan.provisionalKey,
-    evaluationShape: plan.evaluationShape,
-    thresholdCategory: plan.thresholdCategory,
-    executionStrategy,
-    populationCount: subjects.length,
-    knownCount,
-    unknownCount,
-    matchedCount,
-    notMatchedCount,
-    prevalence: knownCount === 0 ? null : matchedCount / knownCount,
-    axisSweeps,
-    unsupportedReason,
+    result: {
+      candidateNo: plan.candidateNo,
+      provisionalKey: plan.provisionalKey,
+      evaluationShape: plan.evaluationShape,
+      thresholdCategory: plan.thresholdCategory,
+      executionStrategy,
+      populationCount: subjects.length,
+      knownCount,
+      unknownCount,
+      matchedCount,
+      notMatchedCount,
+      prevalence: knownCount === 0 ? null : matchedCount / knownCount,
+      axisSweeps,
+      unsupportedReason,
+    },
+    outcomeBySubject: finalBySubject,
+    boundaryGrids: observedBoundaryGrids,
   };
 }
 
@@ -1658,7 +1759,9 @@ export function executeF5cShadowCalibration(
   collection: PlanningCalibrationMeasurementCollection,
   coverageWindowValidated: boolean,
 ): F5cShadowCalibrationReport {
-  const results = F5C_CANDIDATE_SWEEP_PLANS.map((plan) => executeCandidate(plan, collection.subjects, coverageWindowValidated));
+  // aggregate-only: the per-subject outcomes the shared evaluator produces are dropped here and
+  // never reach the returned report.
+  const results = F5C_CANDIDATE_SWEEP_PLANS.map((plan) => executeCandidateAtSelection(plan, collection.subjects, coverageWindowValidated).result);
   const unsupportedCandidateCount = results.filter((r) => r.executionStrategy === "UNSUPPORTED_GAP").length;
   return deepFreeze({
     contractVersion: F5C2_SHADOW_CONTRACT_VERSION,

@@ -99,7 +99,10 @@ describe("L. production evaluator/import graphからcandidate registryが参照�
         // evaluator/pipeline/Bot/public barrelからは別testで引き続き禁止する。
         !f.includes("v2-calibration.ts") &&
         !f.includes("v2-calibration-sweep.ts") &&
-        !f.includes("v2-shadow-evaluation.ts"),
+        !f.includes("v2-shadow-evaluation.ts") &&
+        // F5c3 decision-evidence: same planning/operator layer, same precedent — it reads the
+        // catalog/readiness registries to pick overlap pairs and classify evidence readiness.
+        !f.includes("v2-decision-evidence.ts"),
     );
     expect(files.length).toBeGreaterThan(0);
     const offenders: string[] = [];

@@ -2692,6 +2692,262 @@ DB/schema変更も無い。
   threshold audit除外を明示allowlist化（fail-closed）。本ドキュメントの
   §14.11を現行仕様として書き直し。
 
+## 14.12 F5c3 — decision-evidence layer（現行仕様）
+
+> このセクションが F5c3 の**現行の正本**である。F5c3は**production
+> thresholdを一切選ばない**——F6のthreshold採択judgementは、人間による
+> 別レビューでゲートされたままである。
+
+### なぜF6の前にF5c3が要るのか
+
+F5c2はREADY-76を実行し、各axisのmarginalな分布を返す。しかしF6で
+「このcandidateのthresholdをここにする」と決めるために人間が必要とする
+証拠は、それだけでは足りない:
+
+- 各candidateにとって、そもそもどのboundary領域が現実的なのか
+- **1つの**decision boundaryを動かしたとき、**最終的な**candidate
+  prevalenceはどう動くのか（axis単体のpass率ではなく）
+- どのcandidate概念が実質的に重複／包含しているのか
+- どこまでが信頼できる証拠で、どこからがcoverage次第なのか
+- production ruleを書くにはまだ証拠が足りないcandidateはどれか
+
+F5c3（`packages/core/src/titles/v2-decision-evidence.ts`）はこの5点だけを
+埋める集約evidence層である。
+
+**契約version**: F5c1 `F5C_SWEEP_CONTRACT_VERSION` / F5c2
+`F5C2_SHADOW_CONTRACT_VERSION` / F5c3 `F5C3_EVIDENCE_CONTRACT_VERSION = 2`。
+3つともreportのprovenanceへ転記される。
+
+### 単一evaluator（F5c1/F5c2の意味論を複製しない）
+
+F5c3はcandidate意味論を**一切所有しない**。数値はすべてF5c2の共有
+evaluator `executeCandidateAtSelection()` から出る——F5c2の
+representative実行・F5c3のOAT・F5c3のoverlapは、同じ関数の同じ経路を
+通る。これにより、あるcandidateが「F5c2では意味A、F5c3では意味A′」に
+なることが構造的に起こらない。
+
+そのためにF5c2側へ入れた唯一の変更が`F5cDecisionBoundarySelection`である:
+「この decision dimension を**どの数値境界で**判定するか」を返す関数を
+`AxisEvalContext`が持ち、F5c2は各dimension自身のgridの
+representative(`F5C2_REPRESENTATIVE_PERCENTILE`)値を、F5c3のOATは1つだけを
+別の値へ差し替えて呼ぶ。F5c2の既定挙動は不変。
+
+`F5C2_REPRESENTATIVE_PERCENTILE`はF5c2がexportする**単一のSSOT**であり、
+F5c3は数値50を書き写さない——片方だけ動いて静かに乖離することを防ぐ
+（専用のdrift regressionあり）。
+
+**dimension key**はaxisの`axisKey`そのもの（manifest cardinality sweepだけ
+`manifest:<countMetricKey>`——F5c2が既に報告しているaxisKeyと同じ）。
+
+### candidate-level OAT sensitivity
+
+`F5C3_SENSITIVITY_MODEL = "CANDIDATE_LEVEL_ONE_AXIS_AT_A_TIME"`。
+
+各sweepable dimensionについて、既存のbounded percentile grid上でその
+dimensionだけを動かし、**兄弟dimensionはbaselineの数値境界へpinしたまま**、
+candidateの最終的なconjunction/manifest/structural意味論を再評価して、
+集約の known / unknown / matched / notMatched / `candidatePrevalence` を
+報告する。
+
+**`F5C3_SIBLING_PINNING = "BASELINE_NUMERIC_BOUNDARY"`**（reportへ明記）。
+pinするのはpercentile *rank* ではなく **数値境界** である——このpipelineは
+依存しているため、rankでは固定にならない: downstream reductionのgridは
+upstream filterを通過した分布から導出されるので、filterを動かすだけで
+qualifying-day sampleが`[1, 2, 3]`(p50=2)から`[0, 0, 3]`(p50=0)へ変わり、
+「1軸だけ動かした」と称する実行が**production decision boundaryを2つ**
+動かしてしまう。数値pinなら本来の依存関係は保たれたまま——filterを動かせば
+各subjectの reduced **value** は変わる——兄弟の判定**境界**だけがbaselineに
+留まる。No.76（SCALAR_SAMPLE filter → FILTER_THEN_DISTINCT_DAYS）が
+この反例をそのまま検証する。
+
+- Cartesian積ではない。コストは |dimensions| × |grid| であって
+  |grid|^n ではない。
+- **marginalとcandidate-levelを取り違えられないようにしてある**:
+  F5c2側のfieldは`marginalPassRate`、F5c3側は`candidatePrevalence`で、
+  型名も別（`F5cBoundarySweepPoint` / `F5cCandidateOatPoint`）、
+  modelマーカーも両方reportへ載る。
+- 特殊dimension（`POST_FILTER_MATCHING_SIZE`、edge filter、circular
+  intent、manifest cardinality sweep）は、F5c1/F5c2の実際の実行依存関係を
+  そのまま保つ——特にmatching sizeのedge閾値は**兄弟filter axisの
+  dimension**であり、matching-size dimension自身を動かしても動かない。
+- 独立に動かす意味が無いcandidate（fixedCriteriaだけ / manifest pinned
+  だけ / unsupported）は、誤解を招くOAT曲線を捏造せず
+  `nonSweepableReason`を明示する。
+- gridを端から端まで動かしてもprevalenceが動かないdimensionは
+  `flat: true`——「threshold選択の情報を持たない」ことを隠さない。
+- `boundaryValueAtPercentile`は**実際に差し替えた数値境界**（baseline grid
+  のその percentile 値）であり、その点で生じた条件付き分布から
+  再計算した値ではない。
+
+### overlap / containment
+
+pairは**typed catalog structureからのみ**選ぶ（`groupKey` / `seriesKey` /
+`stage`。title名やproseからは選ばない）。**同じcandidate pairは1度だけ、
+1つの規範的読みだけを伴って**出す:
+
+- `SERIES_PROGRESSION` — `seriesKey`を共有し両者に`stage`があるpair。
+  seriesはcumulative ladder（本書§14「Progression」）なので、
+  **上位stageは下位stageに包含されるはず**（`expectation:
+  "HIGHER_STAGE_WITHIN_LOWER_STAGE"`）。A側が常に**下位stage**なので、
+  この予測は`containmentBInA`についての予測であり、1から大きく外れて
+  いればstagingが実際にはnestされていない。順序はtyped `stage`から取る
+  ——candidate番号やtitle名からは推測しない。
+- `GROUP_SIBLING` — `groupKey`だけを共有し、1つのseriesでは説明されない
+  pair。**中立に**報告する: 高い重複はレビューする価値があるが、
+  catalogは「group siblingは互いに素であるべき」と言っていないので、
+  F5c3もそう主張しない。
+
+seriesが**優先**する。catalogの段階ladderは`groupKey`と`seriesKey`に同じ値を
+持つ（No.10-12 = `vc_duo_style`）ため、key毎にbucketすると同じpairが2度出て、
+1つの測定値へ「重複は設計の臭い」と「包含は期待される」という矛盾する2つの
+解釈が同時に付いてしまっていた。優先ルールで解消したが、`groupKey`は
+どちらのrelationでも報告するので、group側の事実は隠れない。
+
+76×76の全pairは**出さない**——数千個のほぼ無意味な数値はレビュー価値が
+無く、他の選び方はtitle名/proseの当て推量になる。READY-76に対して
+実際に出るpairは70件（SERIES_PROGRESSION 44 / GROUP_SIBLING 26）。
+
+**denominator（分母）はboth-known**: A/B両方のFINAL outcomeがknown
+（MATCHED または NOT_MATCHED）なsubjectだけ。どちらかがUNKNOWNの
+subjectは分母から外れ、`eitherUnknownCount`として別に数える
+——**UNKNOWNを黙ってNOT_MATCHED扱いにしない**。
+報告する値: bothKnown / aMatched / bMatched / bothMatched / aOnly /
+bOnly / neither / eitherUnknown / `jaccard` (|A∩B|/|A∪B|) /
+`containmentAInB` (|A∩B|/|A|) / `containmentBInA`。分子・分母が空の
+場合は0ではなく`null`。
+
+### coverage解釈
+
+F5c3はF5c2が許す以上に確からしく見せない。`coverageWindowValidated=false`
+のとき、F5c2の`percentileBoundaryOutcome()`はpercentile由来boundaryとの
+比較を両方向ともUNKNOWNへ倒す——F5c3はその結果をそのまま受け、
+`candidatePrevalence: null`として報告する（見栄えのために数値を捏造しない）。
+各dimensionはF5c2自身の`boundaryReliability`
+（`COVERAGE_ATTESTED` / `OBSERVED_LOWER_BOUND` /
+`OBSERVED_DIRECTION_UNKNOWN`）をそのまま持ち回るので、ある数値が
+attestationに基づくのか、下限診断でしかないのか、方向すら不明なのかが
+report上で判別できる。
+
+`coverageWindowValidated`は呼び出し側（operator）の**未検証のattestation**
+であり、F5c3もこれを事実として再解釈しない。
+
+### provenance / 再現性
+
+`F5cEvidenceProvenance`が、F6レビューが「どの証拠を見たのか」をpinできる
+だけの情報を持つ: F5c1/F5c2/F5c3の各contract version、catalogHash、
+readinessHash、catalogCandidateCount、cohort key、cohort subject count、
+window(start/end/observedAt/effectiveEnd)、coverageWindowValidated、
+percentile method、percentile grid、sensitivity model 2種。すべて
+`PlanningCalibrationMeasurementCollection`と実contractから**consume**する
+——literalを再記述しない。
+
+`reportFingerprint`はprovenanceを含む全体のdeterministicなsha256。
+同じcollectionからは同じ値になり、contract version・catalog・cohort・
+window・attestation・単一のcountのいずれが動いても変わる。
+
+**fail-closed**（`assertCompatibleCollection`）: 以下のいずれかが合わなければ
+evidenceの生成自体を拒否する。
+
+- `schemaVersion` / `percentileMethod` が現行contractと不一致
+- `catalogHash` / `readinessHash` が現行contractと不一致
+- `catalogCandidateCount` が現行catalog件数と不一致
+- `cohort.subjectCount` が `subjects.length` と不一致
+- `subjects` に**重複subject**が含まれる
+
+hash 2つだけの検証では足りなかった: reportはpercentile method・schema
+version・cohort sizeを「このrunの事実」としてpinするので、未検証のまま
+受け入れると、**collectionが一度も測られていない現行定数**をreportが
+名乗ってしまう。検証後のprovenanceは*validated collection自身の値*を報告
+する（現行定数で置き換えない）。重複subjectは、cohort件数の見た目を保った
+まま1人の重みを二重にしてpercentile境界そのものを歪めるため拒否する
+——エラーには**subject IDを一切載せない**。
+
+### privacy境界
+
+serializeされるのは集約値だけ。subjectUserId・raw evidence・
+per-subject outcome・source payloadは**一切出さない**。overlapのために
+per-subject outcomeを一時的にmemory内へ持つのは許容されるが、
+それはreportへ載らない（`executeCandidateAtSelection`の
+`outcomeBySubject`はF5c2/F5c3のどちらでも破棄される）。専用testが、
+seedしたsubject IDがserialized artifactへ現れないことを検証する。
+
+F5c3はevaluator / pipeline / award / Bot / public v2 barrel / scheduler
+から一切importされない（専用testで検証）。
+
+### operator evidence-generation path
+
+`packages/core/scripts/f5c3-decision-evidence.ts`（`pnpm --filter
+@meigokujo/core evidence:f5c3`）。既存のoperator script慣習に合わせた
+`--key=value`引数で、**coreパッケージ内**に置いてある——F5c modulesは
+package内部専用（`src/index.ts`にもexports subpathにも無い）であり、
+script実行のためだけにpublic subpathを足すとplanning-only境界が緩むため。
+
+```
+pnpm --filter @meigokujo/core evidence:f5c3 -- \
+  --db=/path/to/snapshot.sqlite \
+  --cohort-key=2026-08-review \
+  --subject-ids-file=/path/to/cohort.txt \
+  --window-start=<unix> --window-end=<unix> --observed-at=<unix> \
+  [--coverage-window-validated] \
+  [--out=/path/to/f5c3-evidence.json]
+```
+
+cohortは**1行1 subject id のファイル**で渡す。`--subject-ids-file=-`なら
+stdinから読み、cohortをディスクへ置かずに済む:
+
+```
+... --subject-ids-file=- < cohort.txt
+```
+
+保証:
+- **subject IDはargvへ入れない**。command-line引数はshell履歴・
+  process inspection（`ps`）・command auditingから見えるため、出力JSONが
+  綺麗でもそれだけでは「restricted identityはtransient/private」という
+  operator境界を満たせない。旧`--subject-ids=`は
+  **理由付きで明示的に拒否**する（黙って受理も、単なる"unrecognized"も
+  しない）。IDはmemory内にのみ存在し、echoもlogもしない。空・重複・
+  カンマ混入（旧inline形式の貼り付け）はfail-closed。
+- DBはdriver levelで**read-only**（`openSnapshotReadOnly()`=
+  `readonly: true, fileMustExist: true`）——実行が物理的に書き込み・
+  migration・作成をできない。live prodではなくsnapshotのコピーを渡すこと。
+  実際にread-only接続で`main()`を通し、DBファイルがbyte単位で不変である
+  ことをE2E testで確認している。
+- ただしWALモードのDBはread-only接続でもSQLiteがWAL index
+  （`-shm` / 空の`-wal`）を**snapshotと同じディレクトリへ作る**。DB本体は
+  一切変更されないが、**置き場のディレクトリは書き込み可能**である必要が
+  ある（read-onlyディレクトリへ置くと開けない）。
+- cohort / window / attestationはすべて明示引数。既定値は無い。
+  未知の引数keyはfail-closed（typoを黙って無視しない）。
+- 出力はdeterministicな集約JSON。書き出し/表示の直前に、実際のcohort
+  IDが混入していないか再検証する。
+- `--coverage-window-validated`はoperatorのattestationであり、scriptが
+  検証できるものではない。省略が常に安全側。
+
+### F6 evidence readiness
+
+`F5cEvidenceReadiness`は各READY candidateを3つに分類する:
+
+- `EVIDENCE_READY_FOR_THRESHOLD_REVIEW`
+- `NEEDS_MORE_CALIBRATION_EVIDENCE`
+- `RELEASE_GATE_STILL_BLOCKED`
+
+これは**evidence** readinessであり、catalogのsource-readiness
+（READY/PARTIAL/BLOCKED/META——F5c3は一切変更しない）でもなければ、
+production activationの許可でもない。
+
+release gateはcalibration signalより常に優先する: 良い分布が出ている
+ことは出荷許可ではない。source-readinessが型として持たない
+non-source release gate（現状No.58のpost-award reversal semantics）は
+`F5C3_KNOWN_RELEASE_GATES`という有限のtyped listに置く——proseを
+scrapeしない、追加は意図的でレビュー可能なdiffになる。
+
+### F6へ明示的に持ち越すもの
+
+- production thresholdの選定そのもの
+- `BehaviorTitleDefinition`等のproduction rule生成
+- evaluator / award / revoke / notification / UI / schedulerへの接続
+- 実データに対するevidence artifactの生成と、それに基づく人間の採択判断
+
 ## 15. PR分割
 
 このPRは**基盤だけ**。
