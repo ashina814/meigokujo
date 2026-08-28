@@ -2883,7 +2883,7 @@ package内部専用（`src/index.ts`にもexports subpathにも無い）であ�
 script実行のためだけにpublic subpathを足すとplanning-only境界が緩むため。
 
 ```
-pnpm --filter @meigokujo/core evidence:f5c3 -- \
+pnpm --filter @meigokujo/core evidence:f5c3 \
   --db=/path/to/snapshot.sqlite \
   --cohort-key=2026-08-review \
   --subject-ids-file=/path/to/cohort.txt \
@@ -2891,6 +2891,10 @@ pnpm --filter @meigokujo/core evidence:f5c3 -- \
   [--coverage-window-validated] \
   [--out=/path/to/f5c3-evidence.json]
 ```
+
+`--`は**付けない**——このrepositoryのpnpmは`--`をscriptへそのまま転送するため、
+strictな引数allowlistが`unrecognized argument: --`として正しく弾く
+（PR #193/#194のoperator所見）。
 
 cohortは**1行1 subject id のファイル**で渡す。`--subject-ids-file=-`なら
 stdinから読み、cohortをディスクへ置かずに済む:
