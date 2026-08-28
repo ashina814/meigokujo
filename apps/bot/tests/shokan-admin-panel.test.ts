@@ -150,6 +150,7 @@ describe("常設パネルの表示", () => {
       "shokan:history:0",
       "shokan:sub",
       "shokan:reeval-comp",
+      "shokan:legacy-unknown",
     ]);
     expect(panel.components?.every((row) => row.toJSON().components.length <= 5)).toBe(true);
     ctx.db.close();
@@ -317,7 +318,7 @@ describe("要対応キュー", () => {
     const second = vi.fn(async () => undefined);
     await handleShokanButton(panelPress(`shokan:deliver:${purchase.id}`, second), ctx.services);
 
-    expect(String(payloadOf(second).content)).toContain("既に対応済み");
+    expect(String(payloadOf(second).content)).toContain("すでに対応済み");
     expect(ctx.events.listByType("shop_delivered")).toHaveLength(1);
     ctx.db.close();
   });
@@ -481,8 +482,12 @@ describe("古い画面からの操作", () => {
 
       await handleShokanButton(panelPress(`shokan:deliver:${purchase.id}`, reply), ctx.services);
 
-      expect(String(payloadOf(reply).content)).toContain(status);
+      const said = String(payloadOf(reply).content);
+      expect(said).toContain("対応完了にできる状態ではありません");
+      // 内部の状態名（expired/refunded/cancelled）はそのまま見せない
+      expect(said).not.toContain(status);
       expect(ctx.shop.getPurchase(purchase.id)!.delivered_at).toBeNull();
+      expect(ctx.shop.getPurchase(purchase.id)!.delivery_state).not.toBe("delivered");
       expect(ctx.events.listByType("shop_delivered")).toHaveLength(0);
       ctx.db.close();
     }
@@ -496,8 +501,9 @@ describe("古い画面からの操作", () => {
 
     await handleShokanButton(panelPress(`shokan:deliver:${purchase.id}`, reply), ctx.services);
 
-    expect(String(payloadOf(reply).content)).toContain("手動対応の商品ではありません");
+    expect(String(payloadOf(reply).content)).toContain("ここで完了にする対象ではありません");
     expect(ctx.shop.getPurchase(purchase.id)!.delivered_at).toBeNull();
+    expect(ctx.events.listByType("shop_delivered")).toHaveLength(0);
     ctx.db.close();
   });
 
@@ -526,7 +532,7 @@ describe("古い画面からの操作", () => {
 
     await handleShokanButton(panelPress(`shokan:deliver:${purchase.id}`, second), ctx.services);
 
-    expect(String(payloadOf(second).content)).toContain("既に対応済み");
+    expect(String(payloadOf(second).content)).toContain("すでに対応済み");
     expect(ctx.events.listByType("shop_delivered")).toHaveLength(1);
     ctx.db.close();
   });

@@ -106,7 +106,7 @@ describe("面談権は予約であって消費ではない", () => {
     ctx.tickets.linkPurchase("t-1", purchase.id, STAFF);
 
     // 面談結果を出した＝面談サービスを提供した
-    ctx.shop.markDelivered(purchase.id, STAFF);
+    ctx.shop.consumePurchaseForService(purchase.id, STAFF, { via: "reeval" });
     ctx.tickets.close("t-1", STAFF);
 
     expect(ctx.tickets.get("t-1")!.linked_purchase_id).toBe(purchase.id);
@@ -126,7 +126,7 @@ describe("面談権は予約であって消費ではない", () => {
     // 承認と同じ確定処理（結果記録 + 消費 + close）
     ctx.db.transaction(() => {
       ctx.evaluation.reinstateFromMeirei(USER, STAFF, { purchaseId: purchase.id });
-      ctx.shop.markDelivered(purchase.id, STAFF);
+      ctx.shop.consumePurchaseForService(purchase.id, STAFF, { via: "reeval" });
       ctx.tickets.close("t-1", STAFF);
     })();
 
@@ -146,7 +146,7 @@ describe("面談権は予約であって消費ではない", () => {
 
     ctx.db.transaction(() => {
       ctx.evaluation.recordReevalRejection(USER, STAFF, { purchaseId: purchase.id });
-      ctx.shop.markDelivered(purchase.id, STAFF);
+      ctx.shop.consumePurchaseForService(purchase.id, STAFF, { via: "reeval" });
       ctx.tickets.close("t-1", STAFF);
     })();
 
@@ -168,7 +168,7 @@ describe("面談権は予約であって消費ではない", () => {
     expect(() =>
       ctx.db.transaction(() => {
         ctx.evaluation.reinstateFromMeirei(USER, STAFF, { purchaseId: purchase.id });
-        ctx.shop.markDelivered(purchase.id, STAFF);
+        ctx.shop.consumePurchaseForService(purchase.id, STAFF, { via: "reeval" });
         throw new Error("close で失敗した");
       })(),
     ).toThrow();
@@ -244,7 +244,7 @@ describe("承認直前の再確認（linked_purchase_id を信用しない）", 
     const purchase = buy(ctx);
     openTicket(ctx, "t-1");
     ctx.tickets.linkPurchase("t-1", purchase.id, STAFF);
-    ctx.shop.markDelivered(purchase.id, STAFF);
+    ctx.shop.consumePurchaseForService(purchase.id, STAFF, { via: "reeval" });
 
     expect(verify(ctx, purchase.id, USER)).toBe("already_consumed");
   });

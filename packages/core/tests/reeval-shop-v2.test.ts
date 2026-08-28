@@ -321,10 +321,10 @@ describe("再評価権のidentityは商品IDではない", () => {
     const ctx = setup();
     buy(ctx, "land", "A:1");
     ctx.replaceSaleItem();
-    // 現在の設定（B）だけを除外しても、旧Aが残ってはいけない。
-    const exclude = [ctx.shop.getItem(ctx.item.id)!.id + 1_000_000]; // 無関係なID
-    expect(ctx.shop.countPendingManual({ excludeItemIds: exclude })).toBe(0);
-    expect(ctx.shop.listPendingManual({ excludeItemIds: exclude })).toEqual([]);
+    // 除外の根拠は購入の実績（semantic evidence）。現在の設定がBを指していても、
+    // 旧Aの未消費権はキューへ出ない。
+    expect(ctx.shop.countPendingManual()).toBe(0);
+    expect(ctx.shop.listPendingManual()).toEqual([]);
   });
 
   it("購入実績0のままA→Bへ切り替えても、Aはgeneric storefrontへ落ちない", () => {

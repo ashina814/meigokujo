@@ -262,6 +262,10 @@ export {
   type EvaluationExtensionUseRow,
   type GenericPurchaseTerms,
   type GenericPurchaseQuote,
+  type FulfillmentProvenanceRow,
+  type StockRestorationRow,
+  type ManualCompletionReason,
+  type ManualCompletionResult,
 } from "./shop/service.js";
 export {
   Tickets,

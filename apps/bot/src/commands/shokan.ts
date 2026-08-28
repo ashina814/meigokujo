@@ -29,7 +29,7 @@ import {
   type MessageCreateOptions,
 } from "discord.js";
 import { createHash } from "node:crypto";
-import { ShopError, type PurchaseRow, type ShopItemRow } from "@meigokujo/core";
+import { ShopError, type ManualCompletionReason, type PurchaseRow, type ShopItemRow } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
 import { isAdmin } from "../permissions.js";
 import { requirementLabel } from "../rank-requirement.js";
@@ -83,26 +83,14 @@ function canOperate(
 }
 
 /**
- * 手動対応のキューから外す商品。
+ * 手動対応の作業キュー。
  *
- * 再評価チャレンジは配送する物が無く、権利を消費するのは既存の再評価面談フロー。
- * ここへ出すと「終わらせる方法が無い仕事」がキューに居座る。
+ * 除外は**Shop側がpurchase固有の証拠で行う**。ここで現在の設定（再評価商品ID等）を
+ * 渡してはいけない——普通の商品を後から専用商品に指定しただけで、過去の普通の購入まで
+ * キューから消えてしまう。
  */
-/**
- * 現在の設定由来の除外。再評価権の除外はこれに**依存しない**——A→B差し替え後の未消費Aも
- * 「配送する物が無い仕事」なので、Shop側のsemantic判定が list/count 双方から外す。
- * ここは原職ロール等、他の特別商品のための現行設定除外だけを担う。
- */
-function excludedItemIds(services: Services): number[] {
-  const ids = [
-    Number(services.settings.getString("shop:reeval_item_id")),
-    Number(services.settings.getString("shop:original_role_item_id")),
-  ];
-  return ids.filter((id) => Number.isInteger(id) && id > 0);
-}
-
 function pendingManual(services: Services): Array<PurchaseRow & { item_name: string }> {
-  return services.shop.listPendingManual({ excludeItemIds: excludedItemIds(services), limit: QUEUE_DISPLAY });
+  return services.shop.listPendingManual({ limit: QUEUE_DISPLAY });
 }
 
 /** 自動配送が終わっていない購入（＝Botが自力で終われなかったもの） */
@@ -111,10 +99,13 @@ function failedAuto(services: Services): Array<PurchaseRow & { item_name: string
 }
 
 /** 残件数。**表示上限で数えない**（11件目以降も正しく出す） */
-function queueCounts(services: Services): { pending: number; failed: number } {
+function queueCounts(services: Services): { pending: number; failed: number; legacy: number } {
   return {
-    pending: services.shop.countPendingManual({ excludeItemIds: excludedItemIds(services) }),
+    pending: services.shop.countPendingManual(),
     failed: services.shop.countUndeliveredAuto(),
+    // 購入時の提供方式が分からない旧購入と、方式は分かるが結末が分からない旧購入。
+    // どちらも仕事として数えるが、要対応とは別枠にする。
+    legacy: services.shop.countLegacyUnknownFulfillment() + services.shop.countLegacyAutoOutcomeUnknown(),
   };
 }
 
@@ -143,7 +134,7 @@ function fmtJstDate(unixSec: number): string {
  * 個人ごとの情報は載せない（押した後の ephemeral で出す）ので、そのまま設置できる。
  */
 export function shopAdminPanelMessage(services: Services): MessageCreateOptions {
-  const { pending, failed } = queueCounts(services);
+  const { pending, failed, legacy } = queueCounts(services);
   const embed = new EmbedBuilder()
     .setTitle("🛠 冥界商館 管理")
     .setColor(pending + failed > 0 ? 0xdc2626 : 0x64748b)
@@ -152,6 +143,7 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
         pending + failed > 0
           ? `**残っている仕事: 要対応 ${pending}件 / 処理失敗 ${failed}件**`
           : "残っている仕事はありません。",
+        legacy > 0 ? `**要確認（旧購入） ${legacy}件** — 購入時の提供方式を自動判定できません。` : "",
         services.originalRoles.countByStatus("pending") > 0
           ? `**旧方式オリジナルロール ${services.originalRoles.countByStatus("pending")}件** がカルテ移行待ちです。`
           : "",
@@ -194,6 +186,11 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
       .setCustomId("shokan:reeval-comp")
       .setLabel("再評価の例外補償")
       .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("shokan:legacy-unknown")
+      .setLabel(legacy > 0 ? `要確認（旧購入） ${legacy}` : "要確認（旧購入）")
+      .setEmoji("🕓")
+      .setStyle(legacy > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row, row2] };
 }
@@ -237,9 +234,74 @@ function queueButtons(
   return components;
 }
 
+/**
+ * 完了にできなかった理由を運営へ伝える。**内部の状態名やエラーコードは出さない。**
+ * 「何が起きたか」と「次に何をすればいいか」だけを書く。
+ */
+function manualCompletionMessage(id: number, reason: ManualCompletionReason): string {
+  switch (reason) {
+    case "already_delivered":
+      return `購入 #${id} はすでに対応済みです。`;
+    case "not_active":
+      return `購入 #${id} は現在、対応完了にできる状態ではありません。一覧を更新してください。`;
+    case "legacy_unknown":
+      return [
+        `購入 #${id} は旧購入のため、購入時の提供方式を自動で判定できません。`,
+        "提供状況を確認してください。",
+      ].join("\n");
+    case "not_manual":
+      return `購入 #${id} はここで完了にする対象ではありません。専用の手続きから進めてください。`;
+    default:
+      return `購入 #${id} は完了にできませんでした。一覧を更新してください。`;
+  }
+}
+
+/**
+ * 購入時の提供方式が分からない旧購入。
+ *
+ * 普通の作業キューへは混ぜない（ワンクリックで完了にすると、実際には自動配送で
+ * 提供済みだったものまで「人が対応した」ことにしてしまう）。かといって消すと、
+ * 本当に人の対応が要る購入が見えなくなる。別枠で出して確認してもらう。
+ */
+function renderLegacyUnknown(services: Services) {
+  const modeRows = services.shop.listLegacyUnknownFulfillment({ limit: QUEUE_DISPLAY });
+  const modeTotal = services.shop.countLegacyUnknownFulfillment();
+  const outcomeRows = services.shop.listLegacyAutoOutcomeUnknown({ limit: QUEUE_DISPLAY });
+  const outcomeTotal = services.shop.countLegacyAutoOutcomeUnknown();
+  const embed = new EmbedBuilder().setTitle("🕓 要確認（旧購入）").setColor(0xd97706);
+  if (modeTotal + outcomeTotal === 0) {
+    embed.setDescription("確認が必要な旧購入はありません。");
+    return { embeds: [embed], components: [backButton()], allowedMentions: { parse: [] as never[] } };
+  }
+  const line = (p: { id: number; item_name: string; user_id: string; purchased_at: number }) =>
+    `\`#${p.id}\` **${p.item_name}** — <@${p.user_id}>（${fmtJstDate(p.purchased_at)}）`;
+  const body: string[] = ["どちらも提供状況を確認してから判断してください。"];
+  if (modeTotal > 0) {
+    body.push(
+      "",
+      `**提供方式を確認できない（${modeTotal}件）**`,
+      ...modeRows.map(line),
+      ...overflowNote(modeRows.length, modeTotal),
+    );
+  }
+  if (outcomeTotal > 0) {
+    body.push(
+      "",
+      `**自動提供だったが完了結果を確認できない（${outcomeTotal}件）**`,
+      ...outcomeRows.map(line),
+      ...overflowNote(outcomeRows.length, outcomeTotal),
+    );
+  }
+  embed.setDescription(body.join("\n"));
+  // どちらもワンクリックの操作は置かない。前者を「完了」にすると提供済みを人の対応に、
+  // 後者を「再試行」にすると古いロール付与や期限延長を流し直すことになる。
+  embed.setFooter({ text: "ここからワンクリックでの完了・再試行はできません。" });
+  return { embeds: [embed], components: [backButton()], allowedMentions: { parse: [] as never[] } };
+}
+
 function renderPending(services: Services) {
   const rows = pendingManual(services);
-  const total = services.shop.countPendingManual({ excludeItemIds: excludedItemIds(services) });
+  const total = services.shop.countPendingManual();
   const embed = new EmbedBuilder().setTitle("🔴 要対応").setColor(0xdc2626);
   if (rows.length === 0) {
     embed.setDescription("対応待ちはありません。");
@@ -430,6 +492,7 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   if (action === "hub") return void (await show(shopAdminPanelMessage(services) as never));
   if (action === "pending") return void (await show(renderPending(services) as never));
   if (action === "failed") return void (await show(renderFailed(services) as never));
+  if (action === "legacy-unknown") return void (await show(renderLegacyUnknown(services) as never));
   if (action === "list") return void (await show(renderList(services) as never));
   if (action === "history") return void (await show(renderHistory(services, Math.max(0, Number(arg ?? 0))) as never));
   if (action === "reeval-comp") {
@@ -464,7 +527,10 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
     // 再評価チャレンジはここで完了させない。買ったのは面談を受ける権利で、
     // 消費するのは既存の再評価面談フローだけ。ここで配送済みにすると
     // 未使用の権利が消え、面談前に 500,000 Ld が失われる（購入 #44 で起きた形）
-    if (excludedItemIds(services).includes(purchase.item_id)) {
+    // 判定は**この購入の実績**で行う。現在 shop:reeval_item_id に指定されているか
+    // どうかでは決めない——普通の商品を後からその設定に入れただけで、過去の普通の購入が
+    // 「再評価権」に化けてしまう。
+    if (services.shop.isReevaluationPurchase(purchase.id)) {
       await interaction.reply({
         content: [
           `⚠️ 購入 #${id} は**再評価を受ける権利**です。ここでは完了にできません。`,
@@ -474,26 +540,16 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
       });
       return;
     }
-    const item = services.shop.getItem(purchase.item_id);
-    if (purchase.status !== "active") {
-      await interaction.reply({
-        content: `購入 #${id} は **${purchase.status}** のため完了にできません。`,
-        flags: MessageFlags.Ephemeral,
-      });
+    // **判定と書き込みはCoreの1文の中で行う。** ここで status を先に見てから
+    // 書きに行くと、その隙に返金が入って「返金済みなのに配送済み」を作れる。
+    const outcome = services.shop.completeManualDelivery(id, `user:${interaction.user.id}`);
+    if (!outcome.completed) {
+      // **理由だけを返す。** ここで一覧を出し直すと説明が消えるうえ、同じ操作に対して
+      // 二度返信することになる。常設パネルの件数だけ最新へ寄せておく。
+      await interaction.reply({ content: manualCompletionMessage(id, outcome.reason), flags: MessageFlags.Ephemeral });
+      await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
       return;
     }
-    if (purchase.delivered_at !== null) {
-      await interaction.reply({ content: `購入 #${id} は既に対応済みです。`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    if (!item || item.delivery !== "manual") {
-      await interaction.reply({
-        content: `購入 #${id} は手動対応の商品ではありません。`,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    services.shop.markDelivered(id, `user:${interaction.user.id}`);
     await show(renderPending(services) as never);
     await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
     return;
