@@ -875,8 +875,8 @@ interface AxisEvalContext {
    * as it is consumed. A baseline (representative) execution's grids are exactly what F5c3 pins
    * siblings to; recording them here — rather than re-deriving them from `axisSweeps` — keeps the
    * pinned value identical to the value the decision was actually made from, including on the
-   * special paths whose decision grid is not the one their own sweep reports (POST_FILTER_MATCHING
-   * _SIZE consumes its sibling filter's grid).
+   * special paths whose decision grid is not the one their own sweep reports — a
+   * POST_FILTER_MATCHING_SIZE axis decides against its sibling filter's grid, not its own.
    */
   readonly observedBoundaryGrids: Map<string, ReadonlyMap<F5cBoundaryPercentile, number>>;
 }
