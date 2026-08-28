@@ -67,10 +67,10 @@ function setup(path = ":memory:") {
 
 type Ctx = ReturnType<typeof setup>;
 
-function buy(ctx: Ctx, key: string) {
-  const quote = ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER });
+function buy(ctx: Ctx, key: string, itemId = ctx.item.id) {
+  const quote = ctx.shop.checkEvaluationExtensionPurchase({ itemId, userId: USER });
   return ctx.shop.purchaseEvaluationExtension({
-    itemId: ctx.item.id,
+    itemId,
     userId: USER,
     actor: `user:${USER}`,
     memberRoleIds: [],
@@ -78,6 +78,44 @@ function buy(ctx: Ctx, key: string) {
     idempotencyKey: key,
   });
 }
+
+/** 運営が延長商品を「作り直した」ときにできる、別IDの正規な延長商品。 */
+function replacementExtensionItem(ctx: Ctx, name: string) {
+  return ctx.shop.createItem(
+    {
+      name,
+      description: "審判の刻限を1日延長します。購入即時反映。",
+      price_land: EVAL_EXTENSION_PRICE_LAND,
+      kind: "one_shot",
+      delivery: "auto",
+      delivery_kind: "extend_deadline",
+      delivery_data: JSON.stringify({ days: 1 }),
+    },
+    STAFF,
+  );
+}
+
+/**
+ * 購入時snapshotを持つlegacy購入（V2台帳が無い時代の、実際の購入経路が残す形）。
+ * `delivery_snapshot_json`は購入時点の商品定義を固定した不変記録で、これがあれば
+ * 商品名や現在のitem設定に頼らず「延長を1日受け取った」と証明できる。
+ */
+function insertLegacyExtensionPurchase(ctx: Ctx, itemId: number, purchasedAt: number, snapshot: string | null) {
+  ctx.db
+    .prepare(
+      `INSERT INTO shop_purchases
+         (item_id,user_id,purchased_at,paid_land,status,delivered_at,delivery_state,delivery_updated_at,auto_renew,delivery_snapshot_json)
+       VALUES (?,?,?,?,'active',?,'delivered',?,1,?)`,
+    )
+    .run(itemId, USER, purchasedAt, EVAL_EXTENSION_PRICE_LAND, purchasedAt, purchasedAt, snapshot);
+}
+
+const EXTENSION_SNAPSHOT = JSON.stringify({
+  delivery: "auto",
+  delivery_kind: "extend_deadline",
+  delivery_data: JSON.stringify({ days: 1 }),
+  captured_at: NOW - 200,
+});
 
 function codeOf(fn: () => unknown): string | undefined {
   try {
@@ -209,19 +247,116 @@ describe("評価期間+1日 V2", () => {
 
   it("現在サイクル中のV1 delivered購入を上限へ含め、過去サイクル分は含めない", () => {
     const ctx = setup();
-    const insert = ctx.db.prepare(
-      `INSERT INTO shop_purchases
-         (item_id,user_id,purchased_at,paid_land,status,delivered_at,delivery_state,delivery_updated_at,auto_renew)
-       VALUES (?,?,?,?,'active',?,'delivered',?,1)`,
-    );
-    insert.run(ctx.item.id, USER, NOW - 2 * DAY, EVAL_EXTENSION_PRICE_LAND, NOW - 2 * DAY, NOW - 2 * DAY);
+    // 過去サイクル分（cycle開始前）は数えない。
+    insertLegacyExtensionPurchase(ctx, ctx.item.id, NOW - 2 * DAY, EXTENSION_SNAPSHOT);
     for (let i = 0; i < 4; i += 1) {
-      insert.run(ctx.item.id, USER, NOW - 100 + i, EVAL_EXTENSION_PRICE_LAND, NOW - 100 + i, NOW - 100 + i);
+      insertLegacyExtensionPurchase(ctx, ctx.item.id, NOW - 100 + i, EXTENSION_SNAPSHOT);
     }
 
     const quote = ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER });
-    expect(quote.usedCount).toBe(4);
+    expect(quote.usedCount).toBe(4); // PR #131契約: V2化で0へ戻らない
     expect(buy(ctx, "legacy:fifth").extension.sequence).toBe(5);
+    expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_eval_extension_uses").get()).toEqual({ n: 1 });
+  });
+
+  it("legacy compatibility boundary: 購入時snapshotが無く延長だと証明できない行は数えない", () => {
+    const ctx = setup();
+    // `delivery_kind`は`updateItem()`で後から変更できるので、「今この商品が延長商品だから」
+    // を根拠に過去行を延長扱いすると、商品を作り直した運営操作で無関係な購入が遡って
+    // 5回枠を食い潰しうる。証明できない行は数えない（fail-closed）。
+    insertLegacyExtensionPurchase(ctx, ctx.item.id, NOW - 100, null);
+    expect(ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER }).usedCount).toBe(0);
+    // 壊れたsnapshotも「現在の商品定義で代用」しない。
+    insertLegacyExtensionPurchase(ctx, ctx.item.id, NOW - 99, "{not json");
+    insertLegacyExtensionPurchase(ctx, ctx.item.id, NOW - 98, JSON.stringify({ delivery: "manual", delivery_kind: "extend_deadline" }));
+    expect(ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER }).usedCount).toBe(0);
+  });
+
+  it("legacy購入とV2台帳で同じpurchaseを二重に数えない", () => {
+    const ctx = setup();
+    buy(ctx, "dedupe:1");
+    buy(ctx, "dedupe:2");
+    // 実購入経路はsnapshotも書くので、legacy側の条件にも合致する行になる。
+    const withSnapshot = (ctx.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM shop_purchases
+          WHERE user_id = ? AND delivery_snapshot_json IS NOT NULL`,
+      )
+      .get(USER) as { n: number }).n;
+    expect(withSnapshot).toBe(2);
+    // それでもusedCountは2——台帳にあるpurchaseはlegacy側から除外される。
+    expect(ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER }).usedCount).toBe(2);
+  });
+
+  // ── 商品IDから切り離されたcycle identity（task #198） ──────────────────────────────
+  it("商品A→Bへ差し替えても同じ評価サイクルなら回数を引き継ぐ", () => {
+    const ctx = setup();
+    buy(ctx, "A:1");
+    buy(ctx, "A:2");
+    const itemB = replacementExtensionItem(ctx, "評価期間1日延長（再作成）");
+    expect(itemB.id).not.toBe(ctx.item.id);
+
+    // 利用者が見ているのは「このサイクルで最大5回」——商品が変わっても 2 / 5 のまま。
+    const quoteB = ctx.shop.checkEvaluationExtensionPurchase({ itemId: itemB.id, userId: USER });
+    expect(quoteB.usedCount).toBe(2);
+    expect(quoteB.remainingCount).toBe(EVAL_EXTENSION_MAX_USES - 2);
+    expect(buy(ctx, "B:3", itemB.id).extension).toMatchObject({ sequence: 3, item_id: itemB.id });
+  });
+
+  it("A+Bを合わせて5回まで、6回目は0 chargeで拒否", () => {
+    const ctx = setup();
+    buy(ctx, "mix:1");
+    buy(ctx, "mix:2");
+    const itemB = replacementExtensionItem(ctx, "延長B");
+    expect(buy(ctx, "mix:3", itemB.id).extension.sequence).toBe(3);
+    expect(buy(ctx, "mix:4", itemB.id).extension.sequence).toBe(4);
+    expect(buy(ctx, "mix:5", itemB.id).extension.sequence).toBe(5);
+
+    const before = ctx.ledger.balanceOf(`user:${USER}`);
+    const deadlineBefore = ctx.db.prepare("SELECT eval_deadline_at AS d FROM souls WHERE user_id=?").get(USER);
+    // A側から6回目を試しても、商品が違うことを理由に枠が復活したりしない。
+    expect(codeOf(() => buy(ctx, "mix:6", ctx.item.id))).toBe("ERR_EVAL_EXTENSION_LIMIT");
+    expect(codeOf(() => buy(ctx, "mix:6b", itemB.id))).toBe("ERR_EVAL_EXTENSION_LIMIT");
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(before);
+    expect(ctx.db.prepare("SELECT eval_deadline_at AS d FROM souls WHERE user_id=?").get(USER)).toEqual(deadlineBefore);
+    expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_eval_extension_uses").get()).toEqual({ n: 5 });
+  });
+
+  it("新しい評価サイクルなら、A/Bの購入履歴が残っていても0へ戻る", () => {
+    const ctx = setup();
+    buy(ctx, "cycle:A1");
+    const itemB = replacementExtensionItem(ctx, "延長B");
+    buy(ctx, "cycle:B2", itemB.id);
+    expect(ctx.shop.checkEvaluationExtensionPurchase({ itemId: itemB.id, userId: USER }).usedCount).toBe(2);
+
+    // サイクルが変わったときだけ新しい5回枠になる（商品IDの変化はresetではない）。
+    ctx.db
+      .prepare("UPDATE souls SET eval_started_at = ?, eval_deadline_at = ?, updated_at = ? WHERE user_id = ?")
+      .run(NOW + 100, NOW + 100 + 14 * DAY, NOW, USER);
+    expect(ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER }).usedCount).toBe(0);
+    expect(ctx.shop.checkEvaluationExtensionPurchase({ itemId: itemB.id, userId: USER }).usedCount).toBe(0);
+    expect(buy(ctx, "cycle:new1", itemB.id).extension).toMatchObject({ eval_started_at: NOW + 100, sequence: 1 });
+  });
+
+  it("stale quote: 表示後に別商品で購入されたら、古い確認はLandを引かずに拒否", () => {
+    const ctx = setup();
+    const staleQuote = ctx.shop.checkEvaluationExtensionPurchase({ itemId: ctx.item.id, userId: USER });
+    const itemB = replacementExtensionItem(ctx, "延長B");
+    buy(ctx, "stale:other", itemB.id); // 別商品でusedCount/deadlineが動く
+
+    const before = ctx.ledger.balanceOf(`user:${USER}`);
+    const code = codeOf(() =>
+      ctx.shop.purchaseEvaluationExtension({
+        itemId: ctx.item.id,
+        userId: USER,
+        actor: `user:${USER}`,
+        memberRoleIds: [],
+        expected: { ...staleQuote, priceLand: EVAL_EXTENSION_PRICE_LAND },
+        idempotencyKey: "stale:confirm",
+      }),
+    );
+    expect(code).toBe("ERR_TERMS_CHANGED");
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(before);
     expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_eval_extension_uses").get()).toEqual({ n: 1 });
   });
 

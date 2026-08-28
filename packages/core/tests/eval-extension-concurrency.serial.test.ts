@@ -92,10 +92,19 @@ function setupDb() {
       idempotencyKey: `seed-use:${i}`,
     });
   }
+  // 運営が延長商品を作り直した想定の、別IDの正規な延長商品。
+  const replacement = shop.createItem({
+    name: "評価期間1日延長（再作成）",
+    price_land: EVAL_EXTENSION_PRICE_LAND,
+    kind: "one_shot",
+    delivery: "auto",
+    delivery_kind: "extend_deadline",
+    delivery_data: JSON.stringify({ days: 1 }),
+  }, "staff");
   const expected = shop.checkEvaluationExtensionPurchase({ itemId: item.id, userId: USER });
   const beforeBalance = ledger.balanceOf(`user:${USER}`);
   db.close();
-  return { dbPath, itemId: item.id, expected, beforeBalance };
+  return { dbPath, itemId: item.id, replacementItemId: replacement.id, expected, beforeBalance };
 }
 
 describe("評価期間+1日の同時購入", () => {
@@ -119,6 +128,44 @@ describe("評価期間+1日の同時購入", () => {
     expect(db.prepare("SELECT COUNT(*) AS n FROM shop_eval_extension_uses WHERE user_id=?").get(USER)).toEqual({ n: 5 });
     expect(db.prepare("SELECT COUNT(*) AS n FROM shop_purchases WHERE user_id=?").get(USER)).toEqual({ n: 5 });
     expect(ledger.balanceOf(`user:${USER}`)).toBe(beforeBalance - EVAL_EXTENSION_PRICE_LAND);
+    expect(results.filter((result) => result.outcome === "ok" && result.sequence === 5)).toHaveLength(1);
+    for (const rejected of results.filter((result) => result.outcome === "error")) {
+      expect(`${rejected.code ?? ""}${rejected.error ?? ""}`).toMatch(
+        /ERR_TERMS_CHANGED|ERR_EVAL_EXTENSION_LIMIT|SQLITE_BUSY|database is locked/i,
+      );
+    }
+    db.close();
+  }, 60_000);
+
+  it("A/B別商品から同時に来ても、sequence重複も5回超過も起きない", async () => {
+    // 使用回数のidentityが商品IDから切り離されているので、別商品からの同時購入でも
+    // 同じサイクルの同じ枠を奪い合う。application側の判定とDBの
+    // UNIQUE(user_id, eval_started_at, sequence) が同じcycle semanticsを見る。
+    const { dbPath, itemId, replacementItemId, expected, beforeBalance } = setupDb();
+    const jobs = Array.from({ length: 4 }, (_, i) => ({
+      itemId: i % 2 === 0 ? itemId : replacementItemId,
+      userId: USER,
+      idempotencyKey: `cross-item:${i}`,
+      expected: {
+        priceLand: EVAL_EXTENSION_PRICE_LAND,
+        cycleStartedAt: expected.cycleStartedAt,
+        currentDeadlineAt: expected.currentDeadlineAt,
+        usedCount: expected.usedCount,
+      },
+    }));
+
+    const results = await runConcurrently(dbPath, jobs);
+    const db = openDb(dbPath);
+    const ledger = new Ledger(db);
+    // 4回使用済み + 成功1件 = 5。商品が2種類でも枠は1つ。
+    expect(db.prepare("SELECT COUNT(*) AS n FROM shop_eval_extension_uses WHERE user_id=?").get(USER)).toEqual({ n: 5 });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM shop_purchases WHERE user_id=?").get(USER)).toEqual({ n: 5 });
+    const sequences = (db
+      .prepare("SELECT sequence FROM shop_eval_extension_uses WHERE user_id=? ORDER BY sequence")
+      .all(USER) as { sequence: number }[]).map((r) => r.sequence);
+    expect(sequences).toEqual([1, 2, 3, 4, 5]); // 重複も欠番も無い
+    expect(ledger.balanceOf(`user:${USER}`)).toBe(beforeBalance - EVAL_EXTENSION_PRICE_LAND);
+    expect(results.filter((result) => result.outcome === "ok")).toHaveLength(1);
     expect(results.filter((result) => result.outcome === "ok" && result.sequence === 5)).toHaveLength(1);
     for (const rejected of results.filter((result) => result.outcome === "error")) {
       expect(`${rejected.code ?? ""}${rejected.error ?? ""}`).toMatch(

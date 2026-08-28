@@ -294,6 +294,12 @@ export interface EvaluationExtensionQuote {
   nextDeadlineAt: number;
   usedCount: number;
   remainingCount: number;
+  /**
+   * `shop_eval_extension_uses.sequence` the next purchase in THIS cycle would take.
+   * Derived from the same cycle-wide count the limit is judged from, so the application's
+   * decision and the table's `UNIQUE(user_id, eval_started_at, sequence)` always agree.
+   */
+  nextSequence: number;
 }
 
 export interface EvaluationExtensionUseRow {
@@ -1044,10 +1050,70 @@ export class Shop {
   }
 
   /**
+   * 現在の評価サイクルで既に使った延長回数。**商品IDからは完全に独立**。
+   *
+   * 利用者が見ている契約は「この評価サイクルでは最大5回」であって、「この商品で5回」では
+   * ない。運営が延長商品を作り直してもIDが変わるだけで、利用者の5回枠は同じサイクルの
+   * 同じ枠である。数え方のidentityは `user_id + eval_started_at` だけ——`item_id` は
+   * 「どの商品から買ったか」というaudit情報として`shop_eval_extension_uses`へ残すが、
+   * 「あと何回使えるか」の判断には一切使わない。
+   *
+   * 内訳:
+   *   1. V2 SSOT: `shop_eval_extension_uses` のこのサイクル分。
+   *   2. legacy: V2台帳が無い時代の購入のうち、**購入時に確定したdelivery snapshot**が
+   *      `delivery=auto` かつ `delivery_kind=extend_deadline` だと証明できるものだけ。
+   *
+   * legacyの判定にitem名・説明文・現在の商品IDは使わない——商品名からの推測は、
+   * 名前を変えただけで意味が変わってしまう。`delivery_snapshot_json`は購入時点の
+   * 商品定義を固定した不変記録で、`parseDeliverySnapshot()`（壊れていれば現在の商品定義で
+   * 代用せずnullを返す）だけを正本にする。snapshotが無くextensionだと**証明できない**
+   * 過去行は数えない——推測で数えるより、証明できる分だけを数えるfail-closedを採る
+   * （PR本文のlegacy compatibility policy参照）。
+   *
+   * 同じpurchaseをV2台帳とlegacy側で二重に数えない。
+   */
+  private evaluationExtensionUsedCount(userId: string, cycleStartedAt: number): number {
+    const ledgerCount = (this.db
+      .prepare("SELECT COUNT(*) AS n FROM shop_eval_extension_uses WHERE user_id = ? AND eval_started_at = ?")
+      .get(userId, cycleStartedAt) as { n: number }).n;
+
+    // V2台帳に載っていない、このサイクル中の配送済み購入だけを候補にする。
+    const legacyCandidates = this.db
+      .prepare(
+        `SELECT p.delivery_snapshot_json AS snapshot
+           FROM shop_purchases p
+          WHERE p.user_id = ? AND p.purchased_at >= ?
+            AND COALESCE(p.delivery_state, CASE WHEN p.delivered_at IS NOT NULL THEN 'delivered' END) = 'delivered'
+            AND p.delivery_snapshot_json IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM shop_eval_extension_uses u WHERE u.purchase_id = p.id)`,
+      )
+      .all(userId, cycleStartedAt) as { snapshot: string | null }[];
+
+    // 判定はSQLのjson_extractではなく既存の`parseDeliverySnapshot()`で行う——delivery_kindの
+    // 妥当性検査（KNOWN_DELIVERY_KINDS）や壊れたJSONの扱いを二重実装して食い違わせない。
+    const legacyCount = legacyCandidates.filter((row) => {
+      const snapshot = parseDeliverySnapshot(row.snapshot);
+      return snapshot !== null && snapshot.delivery_kind === "extend_deadline";
+    }).length;
+
+    return ledgerCount + legacyCount;
+  }
+
+  /** このサイクルで既に発行済みのsequenceの最大値（V2台帳のみ。legacyはsequenceを持たない）。 */
+  private evaluationExtensionMaxSequence(userId: string, cycleStartedAt: number): number {
+    return (this.db
+      .prepare(
+        "SELECT COALESCE(MAX(sequence), 0) AS n FROM shop_eval_extension_uses WHERE user_id = ? AND eval_started_at = ?",
+      )
+      .get(userId, cycleStartedAt) as { n: number }).n;
+  }
+
+  /**
    * 評価期限延長の購入前表示と、課金直前の同じ判定。
    *
-   * 旧V1購入は書き換えない。ただし現在サイクル中に配送済みの同一商品購入は
-   * 既に1日を受け取った事実なので上限へ含め、V2化で回数が0へ戻らないようにする。
+   * 旧V1購入は書き換えない。現在サイクル中に配送済みで、購入時snapshotが延長だと
+   * 証明できる購入は既に1日を受け取った事実なので上限へ含め、V2化で回数が0へ戻らない
+   * ようにする（PR #131のcompatibility契約）。
    */
   checkEvaluationExtensionPurchase(input: {
     itemId: number;
@@ -1087,15 +1153,17 @@ export class Shop {
       throw new ShopError("ERR_EVAL_EXTENSION_EXPIRED", { userId: input.userId, deadlineAt: soul.eval_deadline_at });
     }
 
-    const usedCount = (this.db
-      .prepare(
-        `SELECT COUNT(*) AS n
-           FROM shop_purchases p
-          WHERE p.item_id = ? AND p.user_id = ? AND p.purchased_at >= ?
-            AND COALESCE(p.delivery_state, CASE WHEN p.delivered_at IS NOT NULL THEN 'delivered' END) = 'delivered'`,
-      )
-      .get(item.id, input.userId, soul.eval_started_at) as { n: number }).n;
+    // 商品IDではなく評価サイクルで数える。商品を作り直しても枠は同じ（上のdoc comment参照）。
+    const usedCount = this.evaluationExtensionUsedCount(input.userId, soul.eval_started_at);
     if (usedCount >= EVAL_EXTENSION_MAX_USES) {
+      throw new ShopError("ERR_EVAL_EXTENSION_LIMIT", { usedCount, maxUses: EVAL_EXTENSION_MAX_USES });
+    }
+    // application側の上限判断とDB側の`UNIQUE(user_id, eval_started_at, sequence)`が同じ
+    // cycle semanticsを見るようにする。台帳に既にある最大sequenceも必ず超える値を選び、
+    // 「countは4なのにsequence 5が既に存在する」ような不整合をconstraint例外へ落とさず、
+    // Landを1も動かす前に上限として止める。
+    const nextSequence = Math.max(usedCount, this.evaluationExtensionMaxSequence(input.userId, soul.eval_started_at)) + 1;
+    if (nextSequence > EVAL_EXTENSION_MAX_USES) {
       throw new ShopError("ERR_EVAL_EXTENSION_LIMIT", { usedCount, maxUses: EVAL_EXTENSION_MAX_USES });
     }
     if (
@@ -1121,6 +1189,7 @@ export class Shop {
       nextDeadlineAt: soul.eval_deadline_at + DAY,
       usedCount,
       remainingCount: EVAL_EXTENSION_MAX_USES - usedCount,
+      nextSequence,
     };
   }
 
@@ -1159,7 +1228,7 @@ export class Shop {
             cycleStartedAt: quote.cycleStartedAt,
             previousDeadlineAt: quote.currentDeadlineAt,
             newDeadlineAt: quote.nextDeadlineAt,
-            sequence: quote.usedCount + 1,
+            sequence: quote.nextSequence,
           },
         },
         idempotencyKey: input.idempotencyKey,
@@ -1191,7 +1260,9 @@ export class Shop {
         )
         .run(ts, ts, result.purchase.id).changes;
       if (delivered !== 1) throw new ShopError("ERR_TERMS_CHANGED", { purchaseId: result.purchase.id });
-      const sequence = quote.usedCount + 1;
+      // 課金直前に読み直したquoteの値をそのまま使う——ここで再計算すると、判定した値と
+      // 書き込む値がずれる余地が生まれる。
+      const sequence = quote.nextSequence;
       this.db
         .prepare(
           `INSERT INTO shop_eval_extension_uses
