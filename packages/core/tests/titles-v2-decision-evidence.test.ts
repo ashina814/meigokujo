@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { openDb } from "../src/db/bootstrap.js";
 import { CasinoParticipationHistory } from "../src/casino/participation-history.js";
 import { Takutate } from "../src/casino/takutate.js";
@@ -29,7 +29,7 @@ import {
   F5C3_KNOWN_RELEASE_GATES,
   type F5cDecisionEvidenceReport,
 } from "../src/titles/v2-decision-evidence.js";
-import { parseArgs, readSubjectUserIds } from "../scripts/f5c3-decision-evidence.js";
+import { main, openSnapshotReadOnly, parseArgs, readSubjectUserIds } from "../scripts/f5c3-decision-evidence.js";
 import type { PlanningCalibrationJointEvidence, PlanningCalibrationMeasurementCollection, PlanningCalibrationSubjectMeasurement } from "../src/titles/v2-calibration.js";
 import type { F5cShadowOutcome } from "../src/titles/v2-shadow-evaluation.js";
 
@@ -704,19 +704,20 @@ describe("F5c3 decision-evidence layer", () => {
   });
 
   it("operator script: opens the snapshot read-only at the driver level and refuses a missing file", () => {
-    const Database = require("better-sqlite3") as typeof import("better-sqlite3");
     const path = require("node:path") as typeof import("node:path");
     const os = require("node:os") as typeof import("node:os");
     const fs = require("node:fs") as typeof import("node:fs");
     const snapshot = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "f5c3-snap-")), "snap.sqlite");
     openDb(snapshot).close(); // create a real snapshot file
 
-    // the exact options the script uses must physically prevent writes...
-    const ro = new Database(snapshot, { readonly: true, fileMustExist: true });
+    // exercised through the script's OWN connection factory, not a look-alike built here — the
+    // guarantee has to belong to the thing `main()` actually runs.
+    const ro = openSnapshotReadOnly(snapshot);
+    expect(ro.readonly).toBe(true);
     expect(() => ro.exec("CREATE TABLE leak_probe(x)")).toThrow(/readonly/i);
     ro.close();
-    // ...and must refuse to conjure a database that is not there.
-    expect(() => new Database(path.join(path.dirname(snapshot), "absent.sqlite"), { readonly: true, fileMustExist: true })).toThrow();
+    // ...and it must refuse to conjure a database that is not there.
+    expect(() => openSnapshotReadOnly(path.join(path.dirname(snapshot), "absent.sqlite"))).toThrow();
   });
 
   it("operator path: runF5cDecisionEvidence wires a real DB collection through to the artifact end to end", () => {
@@ -740,5 +741,100 @@ describe("F5c3 decision-evidence layer", () => {
     expect(report.provenance.coverageWindowValidated).toBe(false);
     expect(report.reportFingerprint).toMatch(/^[0-9a-f]{64}$/);
     expect(JSON.stringify(report)).not.toContain("alice");
+  });
+
+  it("operator path (E2E): the documented command runs against a real READ-ONLY snapshot and leaves the database byte-identical", () => {
+    // The invariant this test exists for: the path we tell an operator to run has actually been
+    // executed, in full, under the read-only connection it claims to use. Proving "a read-only
+    // handle rejects writes" and "the collector works against a writable :memory: DB" separately
+    // does not prove their composition — this runs the script's real `main()`.
+    const fs = require("node:fs") as typeof import("node:fs");
+    const os = require("node:os") as typeof import("node:os");
+    const path = require("node:path") as typeof import("node:path");
+    const crypto = require("node:crypto") as typeof import("node:crypto");
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "f5c3-readonly-e2e-"));
+    const snapshot = path.join(dir, "snapshot.sqlite");
+
+    // 1-2. a real on-disk database, bootstrapped through the ordinary WRITABLE setup — same
+    //      schema/source prerequisites the calibration collector reads.
+    const writable = openDb(snapshot);
+    const events = new EventLog(writable);
+    new CasinoParticipationHistory(writable, () => BASE);
+    new Takutate(writable, events, () => BASE);
+    new PublicEvents(writable, () => BASE);
+    new BumpCounter(writable);
+    new RoleFamilyTemporal(writable);
+    new TcSocialObservations(writable);
+    new VcPublicSocialPresence(writable);
+    writable.exec(`CREATE TABLE IF NOT EXISTS casino_market_participation_history (
+      participation_key TEXT PRIMARY KEY, market_id INTEGER NOT NULL, market_creator_id TEXT NOT NULL,
+      participant_id TEXT NOT NULL, market_mode TEXT NOT NULL, market_created_at INTEGER NOT NULL,
+      market_deadline_at INTEGER NOT NULL, occurred_at INTEGER NOT NULL)`);
+    // 3. the writable connection is gone before the operator path ever touches the file.
+    writable.close();
+
+    // the real cohort input: a file, never argv.
+    const cohortFile = path.join(dir, "cohort.txt");
+    fs.writeFileSync(cohortFile, "RESTRICTED_E2E_ID_1\nRESTRICTED_E2E_ID_2\n", "utf8");
+    const out = path.join(dir, "f5c3-evidence.json");
+
+    const digest = (file: string) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+    const databaseDigestBefore = digest(snapshot);
+    const sidecarsBefore = fs.readdirSync(dir).filter((f) => f.startsWith("snapshot.sqlite-"));
+    expect(sidecarsBefore).toEqual([]); // closing the writable connection checkpointed the WAL away
+
+    // The connection the operator path builds is provably read-only — asserted through the very
+    // function `main()` calls, so this cannot drift out of step with what actually runs. (An
+    // OS-level read-only file is NOT a usable substitute here: on Windows SQLite still opens such
+    // a file read-write, so that check would pass no matter what options the script used.)
+    const probe = openSnapshotReadOnly(snapshot);
+    expect(probe.readonly).toBe(true);
+    expect(() => probe.exec("CREATE TABLE leak_probe(x)")).toThrow(/readonly/i);
+    probe.close();
+
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      // 4-5. the exact documented invocation — `main()` opens the snapshot through
+      //      `openSnapshotReadOnly` and runs the real collection + evidence build against it.
+      main([
+        `--db=${snapshot}`,
+        "--cohort-key=readonly-e2e",
+        `--subject-ids-file=${cohortFile}`,
+        `--window-start=${WINDOW.start}`, `--window-end=${WINDOW.end}`, `--observed-at=${WINDOW.observedAt}`,
+        `--out=${out}`,
+      ]);
+      // no subject id is ever printed or logged, not even in the summary line.
+      const printed = stdout.mock.calls.map((c) => String(c[0])).join("");
+      expect(printed).not.toContain("RESTRICTED_E2E_ID_1");
+      expect(printed).not.toContain("RESTRICTED_E2E_ID_2");
+    } finally {
+      stdout.mockRestore();
+    }
+
+    // 6. a valid aggregate report really came out the far end.
+    const report = JSON.parse(fs.readFileSync(out, "utf8")) as F5cDecisionEvidenceReport;
+    expect(report.sensitivity).toHaveLength(F5C_CANDIDATE_SWEEP_PLANS.length);
+    expect(report.overlap.length).toBeGreaterThan(0);
+    expect(report.provenance.evidenceContractVersion).toBe(F5C3_EVIDENCE_CONTRACT_VERSION);
+    expect(report.provenance.cohortKey).toBe("readonly-e2e");
+    expect(report.provenance.cohortSubjectCount).toBe(2);
+    expect(report.provenance.coverageWindowValidated).toBe(false); // attestation stays opt-in
+    expect(report.reportFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    const artifact = fs.readFileSync(out, "utf8");
+    expect(artifact).not.toContain("RESTRICTED_E2E_ID_1");
+    expect(artifact).not.toContain("RESTRICTED_E2E_ID_2");
+
+    // 7. the database itself is untouched, byte for byte.
+    expect(digest(snapshot)).toBe(databaseDigestBefore);
+    // SQLite does materialise its WAL index alongside a WAL-mode database even for a READ-ONLY
+    // connection, so the snapshot's DIRECTORY must be writable — but nothing is ever written to
+    // the database: the journal it leaves is empty. Asserted rather than glossed over, because an
+    // operator pointing this at a fully read-only directory would otherwise be surprised.
+    const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    for (const sidecar of fs.readdirSync(dir).filter((f) => f.startsWith("snapshot.sqlite-"))) {
+      expect(sidecar).toMatch(/^snapshot\.sqlite-(wal|shm)$/);
+      if (sidecar.endsWith("-wal")) expect(digest(path.join(dir, sidecar))).toBe(EMPTY_SHA256);
+    }
   });
 });

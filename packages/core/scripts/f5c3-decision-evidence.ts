@@ -142,11 +142,22 @@ function assertNoSubjectIdentity(serialized: string, subjectUserIds: readonly st
   if (serialized.includes("subjectUserId")) throw new Error("refusing to emit F5c3 evidence: serialized artifact contains a subject id field");
 }
 
+/**
+ * The one place the operator run's database connection is constructed, exported so a test can
+ * prove the SAME construction the run uses is genuinely read-only — rather than asserting it about
+ * a separately-built handle and hoping the two stay in step.
+ *
+ * `readonly` means this connection cannot write, migrate, or create anything; `fileMustExist`
+ * means it will not conjure an empty database when the path is wrong.
+ */
+export function openSnapshotReadOnly(dbPath: string): Database.Database {
+  return new Database(dbPath, { readonly: true, fileMustExist: true });
+}
+
 export function main(argv: readonly string[]): void {
   const args = parseArgs(argv);
   const subjectUserIds = readSubjectUserIds(args.subjectIdsFile);
-  // readonly + fileMustExist: this run cannot create, migrate, or modify the snapshot.
-  const db = new Database(args.db, { readonly: true, fileMustExist: true });
+  const db = openSnapshotReadOnly(args.db);
   try {
     const collection = collectF5cCalibrationMeasurements(db, {
       cohortKey: args.cohortKey,

@@ -2726,7 +2726,6 @@ representative実行・F5c3のOAT・F5c3のoverlapは、同じ関数の同じ経
 通る。これにより、あるcandidateが「F5c2では意味A、F5c3では意味A′」に
 なることが構造的に起こらない。
 
-そのためにF5c2側へ入れた唯一の変更が`F5cDimensionSelection`である:
 そのためにF5c2側へ入れた唯一の変更が`F5cDecisionBoundarySelection`である:
 「この decision dimension を**どの数値境界で**判定するか」を返す関数を
 `AxisEvalContext`が持ち、F5c2は各dimension自身のgridの
@@ -2908,9 +2907,15 @@ stdinから読み、cohortをディスクへ置かずに済む:
   **理由付きで明示的に拒否**する（黙って受理も、単なる"unrecognized"も
   しない）。IDはmemory内にのみ存在し、echoもlogもしない。空・重複・
   カンマ混入（旧inline形式の貼り付け）はfail-closed。
-- DBはdriver levelで**read-only**（`readonly: true, fileMustExist: true`）
-  ——実行が物理的に書き込み・migration・作成をできない。live prodでは
-  なくsnapshotのコピーを渡すこと。
+- DBはdriver levelで**read-only**（`openSnapshotReadOnly()`=
+  `readonly: true, fileMustExist: true`）——実行が物理的に書き込み・
+  migration・作成をできない。live prodではなくsnapshotのコピーを渡すこと。
+  実際にread-only接続で`main()`を通し、DBファイルがbyte単位で不変である
+  ことをE2E testで確認している。
+- ただしWALモードのDBはread-only接続でもSQLiteがWAL index
+  （`-shm` / 空の`-wal`）を**snapshotと同じディレクトリへ作る**。DB本体は
+  一切変更されないが、**置き場のディレクトリは書き込み可能**である必要が
+  ある（read-onlyディレクトリへ置くと開けない）。
 - cohort / window / attestationはすべて明示引数。既定値は無い。
   未知の引数keyはfail-closed（typoを黙って無視しない）。
 - 出力はdeterministicな集約JSON。書き出し/表示の直前に、実際のcohort
