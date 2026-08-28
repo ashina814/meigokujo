@@ -1696,17 +1696,47 @@ export class Shop {
    * 食い違いが生まれる。完了APIの判定ともここで揃える——**一覧に出るものは必ず完了でき、
    * 完了APIが断るものは一覧に出さない**。
    */
-  private static pendingOpenSql(excludeCount: number): string {
+  /**
+   * **実際に提供したと証明できる記録。**
+   *
+   * `delivery_state = 'delivered'` を証拠として使えるのは、購入時provenanceを持つ
+   * 新しい購入だけ。旧行の移行（`backfillShopDeliveryState`）は既定値が `delivered` で、
+   * 配送スナップショットを持たない行は**移行時点の商品設定**次第でそのまま `delivered` が
+   * 残る。つまり旧行の `delivered` は「配送に成功した」の一次証拠ではない。
+   *
+   * 旧行では `delivered_at` か `shop_delivered` event という独立した記録だけを根拠にする。
+   */
+  private static readonly DELIVERED_EVIDENCE_SQL = `(
+    p.delivered_at IS NOT NULL
+    OR EXISTS (
+      SELECT 1 FROM events e
+       WHERE e.type = 'shop_delivered'
+         AND (e.payload_json LIKE '%"purchaseId":' || p.id || ',%'
+           OR e.payload_json LIKE '%"purchaseId":' || p.id || '}%')
+    )
+    OR EXISTS (
+      SELECT 1 FROM shop_purchase_fulfillment_provenance f
+       WHERE f.purchase_id = p.id AND p.delivery_state = 'delivered'
+    )
+  )`;
+
+  /**
+   * まだ終わっていない購入の共通部分。
+   *
+   * `excludeItemIds` は**現在の設定**由来なので、既存purchaseのidentityには使わない
+   * （普通の商品を後から専用商品に指定しただけで、過去の仕事が消えてしまう）。
+   * 専用サービスの除外はpurchase固有の証拠で行う。
+   */
+  private static openSql(): string {
     return `p.status = 'active'
       AND p.delivered_at IS NULL
-      AND (p.delivery_state IS NULL OR p.delivery_state <> 'delivered')
-      ${excludeCount > 0 ? `AND p.item_id NOT IN (${Array.from({ length: excludeCount }, () => "?").join(",")})` : ""}
+      AND NOT ${Shop.DELIVERED_EVIDENCE_SQL}
       AND NOT ${Shop.REEVALUATION_EVIDENCE_SQL}`;
   }
 
   /** 購入時に「手動配送のstorefront商品」だったと証明できる、未完了の購入。 */
-  private static pendingManualSql(excludeCount: number): string {
-    return `${Shop.pendingOpenSql(excludeCount)}
+  private static pendingManualSql(): string {
+    return `${Shop.openSql()}
       AND EXISTS (
         SELECT 1 FROM shop_purchase_fulfillment_provenance f
          WHERE f.purchase_id = p.id
@@ -1721,10 +1751,13 @@ export class Shop {
    * 配送スナップショットがある行はここに含めない。スナップショットは
    * `delivery === 'auto'` のときしか作られないので、**あることは購入時autoの証明**になる。
    * （逆に、無いことは手動の証明にならない——それがこのバケットの存在理由。）
-   * 証明できるものを「不明」に混ぜると、自動配送の再試行キューと二重に仕事が見える。
+   *
+   * `delivery_state = 'delivered'` だけでは除外しない。旧行の移行では既定値が
+   * `delivered` なので、それを提供済みの証拠に使うと**未対応の仕事が黙って消える**。
+   * 除外できるのは `delivered_at` か `shop_delivered` event がある行だけ。
    */
-  private static legacyUnknownSql(excludeCount: number): string {
-    return `${Shop.pendingOpenSql(excludeCount)}
+  private static legacyUnknownSql(): string {
+    return `${Shop.openSql()}
       AND p.delivery_snapshot_json IS NULL
       AND NOT EXISTS (
         SELECT 1 FROM shop_purchase_fulfillment_provenance f WHERE f.purchase_id = p.id
@@ -2339,13 +2372,17 @@ export class Shop {
       const purchase = this.getPurchase(purchaseId);
       if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
 
-      // 既に届いているものを二度配ったことにしない。返金・取消・失効も対象外。
-      if (purchase.delivered_at !== null || purchase.delivery_state === "delivered") {
-        return { completed: false, reason: "already_delivered" };
-      }
+      // 返金・取消・失効は、証拠の強さに関わらずここで確定する。
       if (purchase.status !== "active") return { completed: false, reason: "not_active" };
 
       const eligibility = this.manualCompletionEligibility(purchase);
+      // **順序が効く。** 旧購入の `delivery_state='delivered'` は移行時の既定値でしか
+      // ないことがあるので、先に already_delivered を返すと「分からない」が
+      // 「対応済み」に化ける。分類を先に見て、legacy は legacy のまま返す。
+      if (eligibility === "legacy_unknown") return { completed: false, reason: "legacy_unknown" };
+
+      // 既に届いているものを二度配ったことにしない。
+      if (this.hasDeliveredEvidence(purchase)) return { completed: false, reason: "already_delivered" };
       if (eligibility !== "eligible") return { completed: false, reason: eligibility };
 
       const ts = now();
@@ -2375,6 +2412,33 @@ export class Shop {
    * - provenanceが無い（旧購入） → `legacy_unknown`。当時のことが分からないものを
    *   現在の商品設定から推測して「手動だった」ことにしない。
    */
+  /**
+   * 実際に提供したと証明できるか。
+   *
+   * 新しい購入（provenanceあり）なら `delivery_state='delivered'` を信頼してよい——
+   * いまのwriterは `delivered_at` と同時にしか書かない。旧購入では信頼できない：
+   * 移行の既定値が `delivered` で、スナップショットを持たない行は移行時点の商品設定
+   * 次第でそのまま残るため、「配送に成功した」の一次証拠にならない。
+   */
+  private hasDeliveredEvidence(purchase: PurchaseRow): boolean {
+    if (purchase.delivered_at !== null) return true;
+    if (this.fulfillmentProvenance(purchase.id) && purchase.delivery_state === "delivered") return true;
+    // **CAST が要る。** JSの数値をそのまま `||` で連結すると SQLite は REAL として扱い、
+    // パターンが `"purchaseId":5.0}` になって永久に一致しない（列の連結なら整数のまま）。
+    return (
+      (
+        this.db
+          .prepare(
+            `SELECT COUNT(*) AS c FROM events
+              WHERE type = 'shop_delivered'
+                AND (payload_json LIKE '%"purchaseId":' || CAST(? AS INTEGER) || ',%'
+                  OR payload_json LIKE '%"purchaseId":' || CAST(? AS INTEGER) || '}%')`,
+          )
+          .get(purchase.id, purchase.id) as { c: number }
+      ).c > 0
+    );
+  }
+
   private manualCompletionEligibility(
     purchase: PurchaseRow,
   ): "eligible" | "not_manual" | "legacy_unknown" {
@@ -2383,7 +2447,12 @@ export class Shop {
       // 購入時の記録が無くても、配送スナップショットがあれば**購入時autoだと証明できる**
       // （スナップショットは delivery='auto' のときしか作られない）。
       // 証明できるものを「不明」にしない。
-      return purchase.delivery_snapshot_json !== null ? "not_manual" : "legacy_unknown";
+      if (purchase.delivery_snapshot_json !== null) return "not_manual";
+      // 専用サービスは実績（semantic evidence）で判別する。現在の商品IDでは決めない。
+      if (this.isReevaluationPurchase(purchase.id)) return "not_manual";
+      // 実際に提供した独立記録があるなら、旧購入でも「不明」ではない。
+      if (this.hasDeliveredEvidence(purchase)) return "not_manual";
+      return "legacy_unknown";
     }
     if (provenance.delivery_mode !== "manual") return "not_manual";
     // 専用サービス（再評価・評価延長・オリジナルロール・移行）は、それぞれの
@@ -2547,41 +2616,38 @@ export class Shop {
    * 人が終わらせるしかない**（当時の希望内容が残っていないため）ので、
    * 自動化のたびに過去の仕事がキューから消えるのは誤り。
    *
-   * 除外する商品IDは呼び出し側が決める。再評価チャレンジのように
-   * 「配送する物が無く、専用フローが権利を消費する」商品を、ここへ混ぜないため。
+   * 専用サービス（再評価など）の除外は**purchase固有の証拠**で行う。現在の設定に
+   * 入っている商品IDで除外すると、普通の商品を後から専用商品へ指定しただけで
+   * 過去の普通の購入までキューから消えてしまう。
    */
   /**
    * 手動配送待ちキュー。再評価権は「配送物」ではなく面談で消費するサービス権なので、
-   * `excludeItemIds`（現在の設定由来）だけでなくsemantic判定でも除外する——A→B差し替え後の
-   * 未消費Aが「終わらせる方法が無い仕事」としてキューに居座らないように。
-   * list と count の両方へ同じ除外を掛ける（表示だけ絞ってcountがズレる形にしない）。
+   * **実績（semantic evidence）**で除外する。A→B差し替え後の未消費Aが
+   * 「終わらせる方法が無い仕事」としてキューに居座らないように。
+   * list と count は同じSQL断片を使う（表示だけ絞ってcountがズレる形にしない）。
    */
-  listPendingManual(
-    opts: { excludeItemIds?: readonly number[]; limit?: number } = {},
-  ): Array<PurchaseRow & { item_name: string }> {
-    const exclude = opts.excludeItemIds ?? [];
+  listPendingManual(opts: { limit?: number } = {}): Array<PurchaseRow & { item_name: string }> {
     return this.db
       .prepare(
         `SELECT p.*, i.name AS item_name
            FROM shop_purchases p
            JOIN shop_items i ON i.id = p.item_id
-          WHERE ${Shop.pendingManualSql(exclude.length)}
+          WHERE ${Shop.pendingManualSql()}
           ORDER BY p.purchased_at
           LIMIT ?`,
       )
-      .all(...exclude, opts.limit ?? 25) as Array<PurchaseRow & { item_name: string }>;
+      .all(opts.limit ?? 25) as Array<PurchaseRow & { item_name: string }>;
   }
 
   /** 手動対応が残っている件数。表示の上限とは無関係に正確な数を返す */
-  countPendingManual(opts: { excludeItemIds?: readonly number[] } = {}): number {
-    const exclude = opts.excludeItemIds ?? [];
+  countPendingManual(): number {
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS c
            FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
-          WHERE ${Shop.pendingManualSql(exclude.length)}`,
+          WHERE ${Shop.pendingManualSql()}`,
       )
-      .get(...exclude) as { c: number };
+      .get() as { c: number };
     return row.c;
   }
 
@@ -2594,32 +2660,28 @@ export class Shop {
    * かといって黙って消すと、本当に人の対応が要る購入が見えなくなる。
    * 別枠で見せて、運営に提供状況を確かめてもらう。
    */
-  listLegacyUnknownFulfillment(
-    opts: { excludeItemIds?: readonly number[]; limit?: number } = {},
-  ): Array<PurchaseRow & { item_name: string }> {
-    const exclude = opts.excludeItemIds ?? [];
+  listLegacyUnknownFulfillment(opts: { limit?: number } = {}): Array<PurchaseRow & { item_name: string }> {
     return this.db
       .prepare(
         `SELECT p.*, i.name AS item_name
            FROM shop_purchases p
            JOIN shop_items i ON i.id = p.item_id
-          WHERE ${Shop.legacyUnknownSql(exclude.length)}
+          WHERE ${Shop.legacyUnknownSql()}
           ORDER BY p.purchased_at
           LIMIT ?`,
       )
-      .all(...exclude, opts.limit ?? 25) as Array<PurchaseRow & { item_name: string }>;
+      .all(opts.limit ?? 25) as Array<PurchaseRow & { item_name: string }>;
   }
 
   /** 互換バケットの件数（`listLegacyUnknownFulfillment` と同じ判定・上限なし） */
-  countLegacyUnknownFulfillment(opts: { excludeItemIds?: readonly number[] } = {}): number {
-    const exclude = opts.excludeItemIds ?? [];
+  countLegacyUnknownFulfillment(): number {
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS c
            FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
-          WHERE ${Shop.legacyUnknownSql(exclude.length)}`,
+          WHERE ${Shop.legacyUnknownSql()}`,
       )
-      .get(...exclude) as { c: number };
+      .get() as { c: number };
     return row.c;
   }
 

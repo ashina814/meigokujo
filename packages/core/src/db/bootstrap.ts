@@ -1558,9 +1558,7 @@ function backfillEverMeirei(db: Database.Database): void {
 function backfillShopDeliveryState(db: Database.Database): void {
   const rows = db
     .prepare(
-      `SELECT p.id, p.user_id, p.delivered_at, p.purchased_at, p.delivery_snapshot_json,
-              i.delivery AS item_delivery,
-              (SELECT status FROM souls WHERE souls.user_id = p.user_id) AS soul_status
+      `SELECT p.id, p.user_id, p.delivered_at, p.purchased_at, p.delivery_snapshot_json
          FROM shop_purchases p
          JOIN shop_items i ON i.id = p.item_id
         WHERE p.delivery_state IS NULL`,
@@ -1571,8 +1569,6 @@ function backfillShopDeliveryState(db: Database.Database): void {
     delivered_at: number | null;
     purchased_at: number;
     delivery_snapshot_json: string | null;
-    item_delivery: string;
-    soul_status: string | null;
   }>;
   if (rows.length === 0) return;
 
@@ -1583,23 +1579,41 @@ function backfillShopDeliveryState(db: Database.Database): void {
   const withdrawn: number[] = [];
   const assign = db.transaction(() => {
     for (const row of rows) {
-      let state: "delivered" | "pending" | "failed" = "delivered";
+      let state: "delivered" | "pending" | "failed";
       if (row.delivered_at !== null) {
+        // 実際に配送した記録がある。これだけが delivered の一次証拠。
         state = "delivered";
       } else {
         // 判定の根拠は**購入時スナップショット**。商品の現在設定は使わない
         const snapshot = parseDeliverySnapshot(row.delivery_snapshot_json);
-        if (snapshot && WITHDRAWN_DELIVERY_KINDS.has(snapshot.delivery_kind)) {
+        if (snapshot === null) {
+          // **配送したかどうかを証明できない行。**
+          //
+          // 以前はここで移行時点の `shop_items.delivery` を見て、auto なら delivered、
+          // manual なら pending にしていた。これは「過去の購入時状態を現在の商品設定から
+          // 推測しない」に反するうえ、既定値が delivered だったため
+          // **配送していない購入が「提供済み」として静かに消える**経路になっていた。
+          //
+          // 分からないものを delivered と書かない。未提供として pending に置き、
+          // 提供済みかどうかは読み手が独立した記録（delivered_at / shop_delivered event）で
+          // 判断する。
+          state = "pending";
+        } else if (WITHDRAWN_DELIVERY_KINDS.has(snapshot.delivery_kind)) {
           // 自動配送を取りやめた種別（再評価チャレンジ）。配送は完了していないが、
           // 自動でも運営の回収導線でも実行しない。事実として failed に置き、
           // 面談導線で人が処理する
           withdrawn.push(row.id);
           state = "failed";
-        } else if (snapshot === null && row.item_delivery === "manual") {
-          // スナップショットを持たない手動配送＝元から人手待ちのキュー。
-          // 自動再配送の候補にはならない（listUndeliveredAuto はスナップショット必須）ので、
-          // 意味を変えずに pending のまま残す
-          state = "pending";
+        } else {
+          // 購入時autoのスナップショットがある行。`delivered_at` は手動完了マークでしか
+          // 埋まらない運用だったので、NULLでも実際には配送済みのことが多い。ここを
+          // pending にすると `listUndeliveredAuto` の候補（スナップショット必須）に
+          // 一斉に入り、ロール付与や期限延長が二度走る。**再配送を起こさない**方を優先し、
+          // 従来どおり delivered として置く。
+          //
+          // スナップショットが無い行と扱いが違うのは、こちらには購入時autoという
+          // 購入時点の証拠があるため。無い行は上で pending にしている。
+          state = "delivered";
         }
       }
       update.run(state, row.delivered_at ?? row.purchased_at, row.id);

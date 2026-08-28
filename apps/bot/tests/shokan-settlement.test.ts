@@ -252,6 +252,80 @@ describe("専用サービス・自動配送は普通の仕事として出さな�
   });
 });
 
+describe("現在の商品ID指定で、過去の普通の購入を隠さない", () => {
+  it("普通に買ったあとで再評価商品に指定されても、キューから消えない", async () => {
+    const { handleShokanButton, shopAdminPanelMessage } = await shokanModule;
+    const ctx = setup();
+    const purchase = buy(ctx, ctx.manual.id);
+    expect(ctx.shop.countPendingManual()).toBe(1);
+
+    // あとから運営がこの商品を再評価商品に指定する
+    ctx.settings.set("shop:reeval_item_id", ctx.manual.id, "staff");
+    ctx.setReevalItem(ctx.manual.id);
+
+    // この購入には再評価の実績が無いので、普通の仕事のまま
+    expect(ctx.shop.countPendingManual()).toBe(1);
+    expect(ctx.shop.listPendingManual().map((r) => r.id)).toContain(purchase.id);
+    const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description?: string } }[] };
+    expect(panel.embeds[0]!.data.description).toContain("要対応 1件");
+
+    // **実際に描画される一覧にも出る。** countだけ見ていると、
+    // 「バッジは1件なのに開くと空」というズレを見逃す。
+    const view = vi.fn(async () => undefined);
+    await handleShokanButton(panelPress("shokan:pending", view), ctx.services);
+    const listed = (view.mock.calls.at(-1) as never[])[0] as {
+      embeds: { data: { description?: string } }[];
+      components?: { toJSON(): { components: { custom_id: string }[] } }[];
+    };
+    expect(listed.embeds[0]!.data.description).toContain(`#${purchase.id}`);
+    expect(
+      (listed.components ?? []).flatMap((r) => r.toJSON().components).map((c) => c.custom_id),
+    ).toContain(`shokan:deliver:${purchase.id}`);
+
+    // 完了もできる（一覧に出るのに完了できない、が起きない）
+    await handleShokanButton(panelPress(`shokan:deliver:${purchase.id}`, vi.fn(async () => undefined)), ctx.services);
+    expect(ctx.shop.getPurchase(purchase.id)!.delivered_at).not.toBeNull();
+    expect(deliveredEvents(ctx)).toBe(1);
+    ctx.db.close();
+  });
+
+  it("普通に買ったあとでオリジナルロール商品に指定されても、キューから消えない", async () => {
+    const { handleShokanButton, shopAdminPanelMessage } = await shokanModule;
+    const ctx = setup();
+    const purchase = buy(ctx, ctx.manual.id);
+
+    ctx.settings.set("shop:original_role_item_id", ctx.manual.id, "staff");
+
+    expect(ctx.shop.countPendingManual()).toBe(1);
+    expect(ctx.shop.listPendingManual().map((r) => r.id)).toContain(purchase.id);
+    const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description?: string } }[] };
+    expect(panel.embeds[0]!.data.description).toContain("要対応 1件");
+
+    // 描画される一覧にも出ている（バッジと中身が食い違わない）
+    const view = vi.fn(async () => undefined);
+    await handleShokanButton(panelPress("shokan:pending", view), ctx.services);
+    const listed = (view.mock.calls.at(-1) as never[])[0] as { embeds: { data: { description?: string } }[] };
+    expect(listed.embeds[0]!.data.description).toContain(`#${purchase.id}`);
+    ctx.db.close();
+  });
+
+  it("証拠の無い旧購入は、現在の専用商品IDに一致するだけでは専用扱いしない", async () => {
+    const { handleShokanButton } = await shokanModule;
+    const ctx = setup();
+    const legacy = legacyPurchase(ctx, ctx.manual.id);
+    ctx.settings.set("shop:reeval_item_id", ctx.manual.id, "staff");
+    ctx.setReevalItem(ctx.manual.id);
+
+    // 「不明」として見える（専用サービスとは推測しない）
+    expect(ctx.shop.countLegacyUnknownFulfillment()).toBe(1);
+    const reply = vi.fn(async () => undefined);
+    await handleShokanButton(panelPress(`shokan:deliver:${legacy.id}`, reply), ctx.services);
+    expect(said(reply)).toContain("提供状況を確認してください");
+    expect(deliveredEvents(ctx)).toBe(0);
+    ctx.db.close();
+  });
+});
+
 describe("在庫の戻し（運営から見える結果）", () => {
   it("未提供のまま返金すると、限定商品の在庫が1つ戻る", async () => {
     const ctx = setup();

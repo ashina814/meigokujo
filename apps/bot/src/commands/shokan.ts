@@ -83,26 +83,14 @@ function canOperate(
 }
 
 /**
- * 手動対応のキューから外す商品。
+ * 手動対応の作業キュー。
  *
- * 再評価チャレンジは配送する物が無く、権利を消費するのは既存の再評価面談フロー。
- * ここへ出すと「終わらせる方法が無い仕事」がキューに居座る。
+ * 除外は**Shop側がpurchase固有の証拠で行う**。ここで現在の設定（再評価商品ID等）を
+ * 渡してはいけない——普通の商品を後から専用商品に指定しただけで、過去の普通の購入まで
+ * キューから消えてしまう。
  */
-/**
- * 現在の設定由来の除外。再評価権の除外はこれに**依存しない**——A→B差し替え後の未消費Aも
- * 「配送する物が無い仕事」なので、Shop側のsemantic判定が list/count 双方から外す。
- * ここは原職ロール等、他の特別商品のための現行設定除外だけを担う。
- */
-function excludedItemIds(services: Services): number[] {
-  const ids = [
-    Number(services.settings.getString("shop:reeval_item_id")),
-    Number(services.settings.getString("shop:original_role_item_id")),
-  ];
-  return ids.filter((id) => Number.isInteger(id) && id > 0);
-}
-
 function pendingManual(services: Services): Array<PurchaseRow & { item_name: string }> {
-  return services.shop.listPendingManual({ excludeItemIds: excludedItemIds(services), limit: QUEUE_DISPLAY });
+  return services.shop.listPendingManual({ limit: QUEUE_DISPLAY });
 }
 
 /** 自動配送が終わっていない購入（＝Botが自力で終われなかったもの） */
@@ -113,10 +101,10 @@ function failedAuto(services: Services): Array<PurchaseRow & { item_name: string
 /** 残件数。**表示上限で数えない**（11件目以降も正しく出す） */
 function queueCounts(services: Services): { pending: number; failed: number; legacy: number } {
   return {
-    pending: services.shop.countPendingManual({ excludeItemIds: excludedItemIds(services) }),
+    pending: services.shop.countPendingManual(),
     failed: services.shop.countUndeliveredAuto(),
     // 購入時の提供方式が分からない旧購入。仕事として数えるが、要対応とは別枠にする。
-    legacy: services.shop.countLegacyUnknownFulfillment({ excludeItemIds: excludedItemIds(services) }),
+    legacy: services.shop.countLegacyUnknownFulfillment(),
   };
 }
 
@@ -275,11 +263,8 @@ function manualCompletionMessage(id: number, reason: ManualCompletionReason): st
  * 本当に人の対応が要る購入が見えなくなる。別枠で出して確認してもらう。
  */
 function renderLegacyUnknown(services: Services) {
-  const rows = services.shop.listLegacyUnknownFulfillment({
-    excludeItemIds: excludedItemIds(services),
-    limit: QUEUE_DISPLAY,
-  });
-  const total = services.shop.countLegacyUnknownFulfillment({ excludeItemIds: excludedItemIds(services) });
+  const rows = services.shop.listLegacyUnknownFulfillment({ limit: QUEUE_DISPLAY });
+  const total = services.shop.countLegacyUnknownFulfillment();
   const embed = new EmbedBuilder().setTitle("🕓 要確認（旧購入）").setColor(0xd97706);
   if (rows.length === 0) {
     embed.setDescription("確認が必要な旧購入はありません。");
@@ -299,7 +284,7 @@ function renderLegacyUnknown(services: Services) {
 
 function renderPending(services: Services) {
   const rows = pendingManual(services);
-  const total = services.shop.countPendingManual({ excludeItemIds: excludedItemIds(services) });
+  const total = services.shop.countPendingManual();
   const embed = new EmbedBuilder().setTitle("🔴 要対応").setColor(0xdc2626);
   if (rows.length === 0) {
     embed.setDescription("対応待ちはありません。");
@@ -525,7 +510,10 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
     // 再評価チャレンジはここで完了させない。買ったのは面談を受ける権利で、
     // 消費するのは既存の再評価面談フローだけ。ここで配送済みにすると
     // 未使用の権利が消え、面談前に 500,000 Ld が失われる（購入 #44 で起きた形）
-    if (excludedItemIds(services).includes(purchase.item_id)) {
+    // 判定は**この購入の実績**で行う。現在 shop:reeval_item_id に指定されているか
+    // どうかでは決めない——普通の商品を後からその設定に入れただけで、過去の普通の購入が
+    // 「再評価権」に化けてしまう。
+    if (services.shop.isReevaluationPurchase(purchase.id)) {
       await interaction.reply({
         content: [
           `⚠️ 購入 #${id} は**再評価を受ける権利**です。ここでは完了にできません。`,

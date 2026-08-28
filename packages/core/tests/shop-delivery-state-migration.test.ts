@@ -8,9 +8,16 @@ import { openDb } from "../src/index.js";
  * 既存購入への配送状態の割り当て。
  *
  * `delivered_at` は**手動配送のスタッフ完了マークでしか埋まらない**運用だったので、
- * 「NULL = 未配送」ではない。そのまま pending にすると過去の自動配送が
- * 一斉に再実行され、ロール付与や期限延長が二度走る。移行では
- * **再配送を発生させない**ことを優先する。
+ * 「NULL = 未配送」ではない。購入時スナップショットを持つ自動配送の行をそのまま
+ * pending にすると、過去の自動配送が一斉に再実行され、ロール付与や期限延長が二度走る。
+ * そこはいまも **再配送を発生させない** ことを優先して delivered に置く。
+ *
+ * ただしスナップショットを持たない行は別。当時の提供方式を示す証拠が何も無いので、
+ * 移行時点の `shop_items.delivery` から delivered / pending を決めていた。これは
+ * 「購入時の状態を現在の商品設定から推測しない」に反するうえ、既定値が delivered
+ * だったため**配送していない購入が提供済みとして静かに消える**経路になっていた。
+ * いまは pending に置き、提供済みかどうかは読み手が独立した記録
+ * （`delivered_at` / `shop_delivered` event）で判断する。
  */
 
 const tempDirs: string[] = [];
@@ -88,19 +95,36 @@ describe("既存購入への配送状態の割り当て", () => {
     db.close();
   });
 
-  it("自動再配送の候補には手動待ちの1件も再評価チャレンジも出さない", () => {
+  it("自動再配送の候補にするのは購入時スナップショットを持つ行だけ", () => {
     const db = openDb(seeded());
+    // pending になるのは「人手待ちの手動配送」と「購入時の提供方式を証明できない旧購入」。
+    // どちらも購入時スナップショットを持たないので、自動再配送の候補には入らない
+    // （`listUndeliveredAuto` はスナップショット必須）。
     const rows = db
       .prepare("SELECT user_id FROM shop_purchases WHERE delivery_state = 'pending' ORDER BY user_id")
       .all();
-    // pending は「人手待ちの手動配送」だけ
-    expect(rows).toEqual([{ user_id: "manual_undelivered" }]);
+    expect(rows).toEqual([{ user_id: "legacy_no_snapshot" }, { user_id: "manual_undelivered" }]);
+    const withSnapshot = db
+      .prepare(
+        "SELECT COUNT(*) AS c FROM shop_purchases WHERE delivery_state='pending' AND delivery_snapshot_json IS NOT NULL",
+      )
+      .get() as { c: number };
+    expect(withSnapshot.c).toBe(0);
     db.close();
   });
 
-  it("スナップショットの無い旧購入は、現在の商品定義が revoke_meirei でも候補にしない", () => {
+  it("スナップショットの無い旧購入は、現在の商品定義から提供済みと決めない", () => {
+    // 以前はここで移行時点の `shop_items.delivery` を見て delivered にしていた。
+    // それは「購入時の状態を現在の商品設定から推測しない」に反するうえ、
+    // **配送していない購入が提供済みとして静かに消える**経路だった。
     const db = openDb(seeded());
-    expect(stateOf(db, "legacy_no_snapshot")).toBe("delivered");
+    // 提供済みと言い切らない
+    expect(stateOf(db, "legacy_no_snapshot")).not.toBe("delivered");
+    // かといって自動再配送の候補にもしない（スナップショットが無いので候補に入らない）
+    const row = db
+      .prepare("SELECT delivery_snapshot_json AS snap FROM shop_purchases WHERE user_id='legacy_no_snapshot'")
+      .get() as { snap: string | null };
+    expect(row.snap).toBeNull();
     db.close();
   });
 
