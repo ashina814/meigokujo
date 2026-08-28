@@ -132,12 +132,26 @@ function buy(
 ) {
   if (!opts.alt) fund(ctx.ledger, userId, timestamp - 1);
   at(timestamp);
+  if (opts.alt) {
+    // generic storefrontでは代替支払を成立させなくなったので、alt-paidな購入は
+    // **旧実装が残した履歴行**として作る（本番にも実在する形）。Titles側の関心は
+    // 「alt-paidなstorefront購入もeligible factか」であって、支払機構そのものではない。
+    const info = ctx.db.prepare(
+      `INSERT INTO shop_purchases (item_id,user_id,purchased_at,paid_land,paid_alt_kind,paid_alt_amount,status,auto_renew)
+       VALUES (?,?,?,NULL,'invite',3,'active',1)`,
+    ).run(itemId, userId, timestamp);
+    const purchaseId = Number(info.lastInsertRowid);
+    ctx.db.prepare(
+      `INSERT INTO shop_purchase_title_provenance (purchase_id,user_id,product_key,purchased_at,origin,title_eligible)
+       VALUES (?,?,?,?,'storefront',1)`,
+    ).run(purchaseId, userId, `shop-item:${itemId}`, timestamp);
+    return { purchase: ctx.shop.getPurchase(purchaseId)! };
+  }
   return ctx.shop.purchase({
     itemId,
     userId,
     actor: `user:${userId}`,
     memberRoleIds: [],
-    payAlt: opts.alt,
     idempotencyKey: opts.key ?? `purchase:${userId}:${itemId}:${timestamp}:${sequence++}`,
   });
 }

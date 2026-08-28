@@ -150,9 +150,15 @@ function pressInteraction(ctx: Ctx, customId: string, w: ReturnType<typeof world
 const contentOf = (fn: ReturnType<typeof vi.fn>) => String((fn.mock.calls.at(-1) as never[])[0]?.content ?? "");
 const balance = (ctx: Ctx) => ctx.ledger.balanceOf(`user:${USER}`);
 
-/** 確認画面のボタン（確認したときの料金を持つ） */
-const nickDo = (ctx: Ctx, confirmationId: string, wanted: string, price: number = PRICE) =>
-  `shop:nick-do:${ctx.item.id}:${confirmationId}:${price}:${wanted}`;
+/** 確認画面のボタン（確認したときの契約を持つ） */
+const nickDo = (
+  ctx: Ctx,
+  confirmationId: string,
+  wanted: string,
+  price: number = PRICE,
+  // tokenはCoreが正本。テスト側で同じhashを組み立てない。
+  termsToken: string = ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
+) => `shop:nick-do:${ctx.item.id}:${confirmationId}:${price}:${termsToken}:${wanted}`;
 
 /** 直近の返信からボタンの custom_id を取り出す */
 function buttonIdOf(fn: ReturnType<typeof vi.fn>): string {
@@ -271,6 +277,27 @@ describe("課金前に止まるケース（スタッフの仕事にしない）"
       expect(balance(ctx)).toBe(before);
     }
     expect(ctx.shop.listUserPurchases(USER)).toHaveLength(0);
+    ctx.db.close();
+  });
+});
+
+describe("ボタンのcustom IDがDiscordの上限に収まる", () => {
+  // 100文字を超えるとDiscordがボタンごと拒否する。確定ボタンには商品ID・確認ID(19桁)・
+  // 料金・契約token・希望する名前(最長32文字)が同居するので、ここが一番きつい。
+  it("最長のニックネーム・高額でも100文字を超えない", async () => {
+    const { handleShopModal } = await shopPanelModule;
+    const ctx = setup();
+    ctx.shop.updateItem(ctx.item.id, { price_land: 9_999_999 } as never, "staff");
+    const w = world({ nickname: "いまの名前" });
+    const modal = pressInteraction(ctx, `shop:nick-input:${ctx.item.id}`, w, {
+      fields: { getTextInputValue: () => "あ".repeat(32) },
+    }) as unknown as { reply: ReturnType<typeof vi.fn> };
+
+    await handleShopModal(modal as never, ctx.services);
+
+    const id = buttonIdOf(modal.reply);
+    expect(id.startsWith(`shop:nick-do:${ctx.item.id}:`)).toBe(true);
+    expect(id.length).toBeLessThanOrEqual(100);
     ctx.db.close();
   });
 });

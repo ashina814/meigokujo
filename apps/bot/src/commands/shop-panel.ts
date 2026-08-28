@@ -153,13 +153,52 @@ export function shopPanelMessage(services: Services): MessageCreateOptions {
   return { embeds: [embed], components };
 }
 
+/**
+ * 契約が変わっていたときの導線。内部値やhashは見せず、**新しい内容の画面を出し直す**。
+ * 勝手に新termsへ同意した扱いにして買わせない——新しいボタン（新しいtoken）を押し直してもらう。
+ */
+async function replyWithRefreshedItemDetail(
+  interaction: ButtonInteraction,
+  services: Services,
+  item: ShopItemRow,
+): Promise<void> {
+  const memberRoleIds = interaction.member && "roles" in interaction.member && "cache" in interaction.member.roles
+    ? [...interaction.member.roles.cache.keys()]
+    : [];
+  const hasRole = !item.require_role_id || meetsRoleRequirement(services.settings, memberRoleIds, item.require_role_id);
+  const access = timedAccessConfig(item);
+  const view = itemDetail(
+    item,
+    hasRole,
+    services.ledger.balanceOf(`user:${interaction.user.id}`),
+    requirementLabel(services.settings, item.require_role_id),
+    contractView(services, interaction.user.id, item),
+    !!access && memberRoleIds.includes(access.roleId),
+    services.shop.quoteGenericPurchase(item.id).termsToken,
+    services.shop.genericAltPaymentSupported(item.id) || isReevalItem(services, item),
+  );
+  await interaction.reply({
+    content: "商品の内容が確認後に変更されました。まだ購入していません。新しい内容をご確認ください。",
+    embeds: view.embeds,
+    components: view.components,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
 function itemDetail(
   item: ShopItemRow,
   userHasRole: boolean,
   balance: number,
   requireLabel: string,
-  contract?: { purchase: PurchaseRow; extendable: boolean },
-  accessRolePresent = false,
+  contract: { purchase: PurchaseRow; extendable: boolean } | undefined,
+  accessRolePresent: boolean,
+  /**
+   * 表示している購入契約の指紋（Coreの `quoteGenericPurchase()` 由来）。ボタンへ持たせ、
+   * 確定時にCoreが現在の商品から再生成して比較する。Bot側で同じhashを組み立てない。
+   */
+  termsToken: string,
+  /** generic storefrontで代替支払が実際に成立するか（Coreが authority）。 */
+  altSupported: boolean,
 ): {
   embeds: EmbedBuilder[];
   components: ActionRowBuilder<ButtonBuilder>[];
@@ -227,7 +266,7 @@ function itemDetail(
   if (item.price_land !== null) {
     buttons.push(
       new ButtonBuilder()
-        .setCustomId(`shop:buy:${item.id}:land`)
+        .setCustomId(`shop:buy:${item.id}:land:${termsToken}`)
         .setLabel(`Land で買う (${fmtLd(item.price_land)})`)
         .setEmoji("💰")
         .setStyle(ButtonStyle.Primary)
@@ -235,7 +274,9 @@ function itemDetail(
         .setDisabled(!userHasRole || (item.stock !== null && item.stock <= 0)),
     );
   }
-  if (item.price_alt_kind && item.price_alt_amount !== null) {
+  // `price_alt_kind != null` だけでは「その支払方法が使える」根拠にならない。実際にその
+  // 資源を消費できる専用writerが無い商品では、払えない支払方法をボタンとして見せない。
+  if (altSupported && item.price_alt_kind && item.price_alt_amount !== null) {
     const kindJa = item.price_alt_kind === "invite" ? "招待" : item.price_alt_kind;
     buttons.push(
       new ButtonBuilder()
@@ -425,11 +466,11 @@ function nicknameModal(itemId: number, current: string) {
 }
 
 /**
- * 変更内容と料金の確認。**ここで見せた料金を確定操作まで持たせる。**
+ * 変更内容と料金の確認。**ここで見せた契約を確定操作まで持たせる。**
  *
- * 確認画面のボタンに料金を焼き込み、確定時に商品の現在価格と突き合わせる。
- * 確定時の価格をそのまま課金すると、確認してから押すまでの間に運営が値段を変えただけで
- * 「見せていない額」を引くことになる。
+ * 確認画面のボタンに契約の指紋を焼き込み、確定時に商品の現在の内容と突き合わせる。
+ * 確定時の内容をそのまま課金すると、確認してから押すまでの間に運営が料金や提供方法を
+ * 変えただけで、「見せていない条件」で引くことになる。
  */
 function nicknameConfirm(
   services: Services,
@@ -437,23 +478,27 @@ function nicknameConfirm(
   member: GuildMember,
   wanted: string,
   confirmationId: string,
-  opts: { priceChanged?: boolean } = {},
+  opts: { priceChanged?: boolean; termsChanged?: boolean } = {},
 ) {
   const price = item.price_land ?? 0;
+  const termsToken = services.shop.quoteGenericPurchase(item.id).termsToken;
   const balance = services.ledger.balanceOf(`user:${member.id}`);
   return {
     content: [
       opts.priceChanged
         ? "⚠️ 確認したあとに料金が変わりました。**まだ引き落としていません。**新しい料金でご確認ください。"
-        : "✏️ サーバーニックネームを変更します。",
+        : opts.termsChanged
+          ? "⚠️ 確認したあとに商品の内容が変わりました。**まだ引き落としていません。**新しい内容でご確認ください。"
+          : "✏️ サーバーニックネームを変更します。",
       `**${currentName(services, member)}** → **${wanted}**`,
       `料金 **${fmtLd(price)}** ／ 残高 ${fmtLd(balance)}`,
     ].join("\n"),
     components: [
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
-          // 同じ確認画面からの実行は同じ操作IDになる（二重課金しない）
-          .setCustomId(`shop:nick-do:${item.id}:${confirmationId}:${price}:${wanted}`)
+          // 同じ確認画面からの実行は同じ操作IDになる（二重課金しない）。
+          // 料金だけでなく**商品内容そのもの**を焼き込む（料金は文言選択のための手掛かり）。
+          .setCustomId(`shop:nick-do:${item.id}:${confirmationId}:${price}:${termsToken}:${wanted}`)
           .setLabel("変更する")
           .setStyle(ButtonStyle.Success),
       ),
@@ -479,6 +524,8 @@ function purchaseOnce(
       EvaluationExtensionQuote,
       "cycleStartedAt" | "currentDeadlineAt" | "usedCount"
     > & { priceLand: number };
+    /** 表示時に確定したgeneric購入契約の指紋。Coreが課金直前に再検証する。 */
+    expectedTermsToken?: string;
   },
 ): PurchaseOutcome {
   const execute = services.db.transaction(() => {
@@ -553,6 +600,7 @@ function purchaseOnce(
         memberRoleIds: input.memberRoleIds,
         payAlt: input.mode === "alt",
         request: input.request,
+        expectedTermsToken: input.expectedTermsToken,
         // **操作ごとに違う鍵で課金する。** 既定の鍵は秒までしか分けないので、
         // 返金後のやり直しが同じ秒に入ると Land が動かないまま購入行だけができる
         idempotencyKey: `shop:purchase:op:${input.operationId}`,
@@ -692,7 +740,13 @@ function originalRolePurchaseRedirect(services: Services, item: ShopItemRow, use
   };
 }
 
-function chipReturnView(confirmationId: string, item: ShopItemRow, land: number, chips: number) {
+function chipReturnView(
+  confirmationId: string,
+  item: ShopItemRow,
+  land: number,
+  chips: number,
+  termsToken?: string,
+) {
   return {
     content: [
       `Landが足りません。商品 **${item.name}** は ${fmtLd(item.price_land ?? 0)}、現在のLandは ${fmtLd(land)} です。`,
@@ -703,7 +757,8 @@ function chipReturnView(confirmationId: string, item: ShopItemRow, land: number,
     components: [
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
-          .setCustomId(`shop:chips:${confirmationId}:${item.id}:land`)
+          // 最初のLandボタンで確認した契約を、チップ返還確認にも引き継ぐ。
+          .setCustomId(`shop:chips:${confirmationId}:${item.id}:land:${termsToken ?? ""}`)
           .setLabel("Landへ戻して続ける")
           .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
@@ -723,11 +778,14 @@ function retryConfirmComponents(
   confirmationId: string,
   itemId: number,
   mode: "land" | "alt",
+  // 返還済みの再試行でも、最初に確認した契約をそのまま持たせる。ここでtokenを落とすと
+  // 「チップは既にLandへ動いたのに、再試行ボタンが契約不一致で止まる」に倒れる。
+  termsToken: string | undefined,
 ): ActionRowBuilder<ButtonBuilder>[] {
   return [
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
-        .setCustomId(`shop:chips:${confirmationId}:${itemId}:${mode}`)
+        .setCustomId(`shop:chips:${confirmationId}:${itemId}:${mode}:${termsToken ?? ""}`)
         .setLabel("購入を再試行")
         .setStyle(ButtonStyle.Primary),
     ),
@@ -913,17 +971,26 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
   if (action === "sub-pay") {
     const itemId = Number(parts[2]);
     const applicationId = Number(parts[3]);
+    // 料金は**文言を選ぶためだけ**の手掛かり。契約が同じかどうかの判定はtokenが正本。
     const quotedPrice = Number(parts[4]);
-    const attempt = parts[5] ?? "";
+    const quotedTermsToken = parts[5] ?? "";
+    const attempt = parts[6] ?? "";
     const item = services.shop.getItem(itemId);
     if (!item || !item.enabled || !isSubAccountItem(services, item) || item.price_land === null) {
       await interaction.update({ content: "この商品はいま購入できません。", embeds: [], components: [] });
       return;
     }
     const application = services.subAccounts.get(applicationId);
-    if (quotedPrice !== item.price_land) {
-      // **1 Ld も動かさずに**、新しい額で確かめ直してもらう
-      await interaction.update(subPayRequote(item, applicationId, application?.alt_user_id ?? ""));
+    // 承認時に見せた契約（料金・名称・提供方法・条件）と、いまの商品が同じかを見る。
+    // 料金だけを見ていると、同じ額のまま中身が別物になった商品を売ってしまう。
+    const currentQuote = services.shop.quoteGenericPurchase(item.id);
+    if (quotedTermsToken !== currentQuote.termsToken) {
+      // **1 Ld も動かさずに**、新しい内容で確かめ直してもらう
+      await interaction.update(
+        subPayRequote(item, applicationId, application?.alt_user_id ?? "", currentQuote.termsToken, {
+          priceChanged: quotedPrice !== (currentQuote.terms.priceLand ?? 0),
+        }),
+      );
       return;
     }
     await interaction.deferUpdate();
@@ -962,6 +1029,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
           memberRoleIds: [...((interaction.member as GuildMember | null)?.roles.cache.keys() ?? [])],
           mode: "land",
           request: { applicationId },
+          expectedTermsToken: quotedTermsToken,
         });
       } catch (error) {
         return { error: `❌ ${purchaseErrorMessage(error, services)}` } as SubAttempt;
@@ -1031,7 +1099,8 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     const itemId = Number(parts[2]);
     const confirmationId = parts[3] ?? "";
     const quotedPrice = Number(parts[4]);
-    const wanted = parts.slice(5).join(":");
+    const quotedTermsToken = parts[5] ?? "";
+    const wanted = parts.slice(6).join(":");
     const item = services.shop.getItem(itemId);
     if (!item || !item.enabled || !isNicknameItem(item) || item.price_land === null) {
       await interaction.update({ content: "この商品はいま購入できません。", embeds: [], components: [] });
@@ -1049,11 +1118,15 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       await interaction.update({ content: `⚠️ ${checked.message}`, embeds: [], components: [] });
       return;
     }
-    // **確認した料金でしか引き落とさない。** 変わっていたら課金せず、新しい料金で確認し直す。
-    // 別の料金になる以上、確認IDも取り直す（前の確認への同意を流用しない）
-    if (!Number.isInteger(quotedPrice) || quotedPrice !== item.price_land) {
+    // **確認した契約でしか引き落とさない。** 変わっていたら課金せず、新しい内容で確認し直す。
+    // 別の契約になる以上、確認IDも取り直す（前の確認への同意を流用しない）
+    const currentQuote = services.shop.quoteGenericPurchase(item.id);
+    if (!Number.isInteger(quotedPrice) || quotedTermsToken !== currentQuote.termsToken) {
       await interaction.update({
-        ...nicknameConfirm(services, item, pre.member, wanted, interaction.id, { priceChanged: true }),
+        ...nicknameConfirm(services, item, pre.member, wanted, interaction.id, {
+          priceChanged: quotedPrice !== (currentQuote.terms.priceLand ?? 0),
+          termsChanged: true,
+        }),
         embeds: [],
       });
       return;
@@ -1072,6 +1145,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         memberRoleIds: [...pre.member.roles.cache.keys()],
         mode: "land",
         request: { nickname: wanted },
+        expectedTermsToken: quotedTermsToken,
       });
     } catch (error) {
       await interaction.editReply({ content: `❌ ${purchaseErrorMessage(error, services)}`, embeds: [], components: [] });
@@ -1200,6 +1274,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
     const confirmationId = parts[2];
     const itemId = Number(parts[3]);
     const mode = parts[4] as "land" | "alt";
+    const expectedTermsToken = parts[5];
     if (!confirmationId || !Number.isSafeInteger(itemId) || mode !== "land") return;
     const confirmation = services.chipFlow.externalConfirmation(confirmationId);
     if (!confirmation || confirmation.userId !== interaction.user.id || confirmation.operationKind !== `shop:${itemId}:${mode}`) {
@@ -1217,6 +1292,22 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       if (isOriginalRoleItem(services, configuredItem)) {
         await interaction.editReply(originalRolePurchaseRedirect(services, configuredItem, interaction.user.id));
         return;
+      }
+      // **チップを1つも動かす前に**、表示時の契約と現在の契約が同じかを見る。ここで違えば
+      // 「商品が変わったので買えない」と分かっているのに、チップだけLandへ戻してしまう。
+      // token無しの確認（この変更より前に作られたもの）も同じく止める。
+      if (!isReevalItem(services, configuredItem)) {
+        if (services.shop.quoteGenericPurchase(itemId).termsToken !== expectedTermsToken) {
+          await interaction.editReply({
+            content: [
+              "❌ 商品内容が変更されたため、この確認は使用できません。",
+              "チップ・Landは変更していません。商品を選び直してください。",
+            ].join("\n"),
+            embeds: [],
+            components: [],
+          });
+          return;
+        }
       }
       // 再評価系かどうかは**現在の設定だけでは判定しない**。確認を作ってから設定がA→Bへ
       // 動くと、旧Aの確認が「普通の商品」に見えてしまい、reevaluation preflightを飛ばして
@@ -1259,6 +1350,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         actor: `user:${interaction.user.id}`,
         memberRoleIds,
         mode,
+        expectedTermsToken,
       });
       purchased = true;
       if (!services.chipFlow.completeExternalConfirmation(confirmationId, interaction.user.id)) {
@@ -1280,7 +1372,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
             ].join("\n")
           : `❌ ${purchaseErrorMessage(error, services)}`,
         embeds: [],
-        components: stranded ? retryConfirmComponents(confirmationId, itemId, mode) : [],
+        components: stranded ? retryConfirmComponents(confirmationId, itemId, mode, expectedTermsToken) : [],
       });
     }
     return;
@@ -1289,6 +1381,8 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
   if (action === "buy") {
     const itemId = Number(parts[2]);
     const mode = parts[3] as "land" | "alt";
+    // 表示時に確定した契約の指紋。古いボタン（token無し）は現在の契約で買い直させる。
+    const expectedTermsToken = parts[4];
     const item = services.shop.getItem(itemId);
     if (!item) {
       await interaction.reply({ content: "商品が見つかりません。", flags: MessageFlags.Ephemeral });
@@ -1332,6 +1426,18 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         return;
       }
     }
+    // 専用商品ではない普通の商品で、表示時と契約が変わっていたら課金へ進まない。
+    // 内部値やhashは見せず、現在の内容を出し直して選び直してもらう。
+    //
+    // tokenが**無い**ボタンも同じ扱いにする。このcustom IDを作るのは itemDetail() だけなので、
+    // token無しは「この変更より前に描かれたボタン」を意味する。そのボタンが何を見せていたかを
+    // こちらは知らない以上、「表示した条件で課金した」と言えない。開き直してもらう。
+    if (mode === "land" && !isReevalItem(services, item)) {
+      if (services.shop.quoteGenericPurchase(itemId).termsToken !== expectedTermsToken) {
+        await replyWithRefreshedItemDetail(interaction, services, item);
+        return;
+      }
+    }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       // stale cacheでlegacyロールを見落とし、二重に課金しない。
@@ -1343,6 +1449,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         actor: `user:${interaction.user.id}`,
         memberRoleIds,
         mode,
+        expectedTermsToken,
       });
       await finishPurchase(interaction, services, result);
     } catch (error) {
@@ -1365,7 +1472,7 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
               chipAmount: freeChips,
               expiresAt: Math.floor(Date.now() / 1_000) + EXTERNAL_CONFIRM_TTL_SEC,
             });
-            await interaction.editReply(chipReturnView(confirmation.id, item, land, freeChips));
+            await interaction.editReply(chipReturnView(confirmation.id, item, land, freeChips, expectedTermsToken));
             return;
           } catch (confirmationError) {
             await interaction.editReply({
@@ -1444,6 +1551,9 @@ export async function handleShopSelect(
       requirementLabel(services.settings, item.require_role_id),
       contractView(services, interaction.user.id, item),
       !!access && memberRoleIds.includes(access.roleId),
+      services.shop.quoteGenericPurchase(item.id).termsToken,
+      // 再評価チャレンジのinvite払いは専用経路（資源を実際に消費する）なので残す。
+      services.shop.genericAltPaymentSupported(item.id) || isReevalItem(services, item),
     );
     // サブ垢も同じ形（申請 → 本人確認 → 支払い）。先払いには戻さない
     if (isSubAccountItem(services, item)) {

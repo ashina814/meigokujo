@@ -410,7 +410,7 @@ describe("通知", () => {
     ctx.settings.set("channel:kessai", "ch-1", "staff");
     const send = vi.fn(async () => undefined);
     const interaction = {
-      customId: `shop:buy:${ctx.nickname.id}:land`,
+      customId: `shop:buy:${ctx.nickname.id}:land:${ctx.shop.quoteGenericPurchase(ctx.nickname.id).termsToken}`,
       user: { id: USER },
       guildId: "g1",
       guild: { id: "g1", members: { fetch: vi.fn(async () => ({ id: USER, roles: { cache: new Collection() } })) } },
@@ -587,7 +587,7 @@ describe("自動処理の失敗通知", () => {
     ctx.settings.set("channel:kessai", "ch-1", "staff");
     const send = vi.fn(async () => undefined);
     const interaction = {
-      customId: `shop:buy:${ctx.pass.id}:land`,
+      customId: `shop:buy:${ctx.pass.id}:land:${ctx.shop.quoteGenericPurchase(ctx.pass.id).termsToken}`,
       user: { id: USER },
       guildId: "g1",
       guild: {

@@ -102,7 +102,8 @@ function fund(ctx: Ctx, amount: number) {
 /** 購入ボタンの実インタラクション。#決裁への送信は spy で見る */
 function buyInteraction(ctx: Ctx, itemId: number, send: ReturnType<typeof vi.fn>) {
   return {
-    customId: `shop:buy:${itemId}:land`,
+    // 実際に表示されるボタンと同じ形（表示時の契約をtokenで持つ）
+    customId: `shop:buy:${itemId}:land:${ctx.shop.quoteGenericPurchase(itemId).termsToken}`,
     user: { id: USER },
     guildId: "g1",
     guild: { id: "g1", members: { fetch: vi.fn(async () => ({ id: USER, roles: { cache: new Collection() } })) } },
@@ -119,7 +120,7 @@ function buyInteraction(ctx: Ctx, itemId: number, send: ReturnType<typeof vi.fn>
 const lastReply = (fn: ReturnType<typeof vi.fn>) => String((fn.mock.calls.at(-1) as never[])[0].content ?? "");
 
 describe("期限付きアクセスの購入体験", () => {
-  function accessBuyInteraction(itemId: number, initialRoles: string[] = []) {
+  function accessBuyInteraction(ctx: Ctx, itemId: number, initialRoles: string[] = []) {
     const cache = new Collection(initialRoles.map((id) => [id, { id }]));
     const member = {
       id: USER,
@@ -131,7 +132,7 @@ describe("期限付きアクセスの購入体験", () => {
     const editReply = vi.fn(async () => undefined);
     return {
       interaction: {
-        customId: `shop:buy:${itemId}:land`,
+        customId: `shop:buy:${itemId}:land:${ctx.shop.quoteGenericPurchase(itemId).termsToken}`,
         user: { id: USER },
         guildId: "g1",
         guild: { id: "g1", members: { fetch: vi.fn(async () => member) } },
@@ -150,7 +151,7 @@ describe("期限付きアクセスの購入体験", () => {
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 200_000);
-    const ui = accessBuyInteraction(ctx.pass.id);
+    const ui = accessBuyInteraction(ctx, ctx.pass.id);
 
     await handleShopButton(ui.interaction, ctx.services);
 
@@ -168,7 +169,7 @@ describe("期限付きアクセスの購入体験", () => {
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 200_000);
-    const ui = accessBuyInteraction(ctx.pass.id, ["r-ura"]);
+    const ui = accessBuyInteraction(ctx, ctx.pass.id, ["r-ura"]);
 
     await handleShopButton(ui.interaction, ctx.services);
 
@@ -182,7 +183,7 @@ describe("期限付きアクセスの購入体験", () => {
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
     fund(ctx, 200_000);
-    const ui = accessBuyInteraction(ctx.pass.id);
+    const ui = accessBuyInteraction(ctx, ctx.pass.id);
     (ui.interaction as unknown as { guild: { members: { fetch: ReturnType<typeof vi.fn> } } }).guild.members.fetch =
       vi.fn(async () => { throw new Error("Discord unavailable"); });
 
@@ -222,7 +223,8 @@ describe("チップ返還確認と再評価の商品差し替え", () => {
     (ctx.services as unknown as Record<string, unknown>).chipAssets = { freeChips: vi.fn(() => 1_000) };
     const editReply = vi.fn(async () => undefined);
     const interaction = {
-      customId: `shop:chips:c1:${itemId}:land`,
+      // 実際にBotが描くチップ返還ボタンと同じ形（表示時の契約をtokenで持つ）
+      customId: `shop:chips:c1:${itemId}:land:${ctx.shop.quoteGenericPurchase(itemId).termsToken}`,
       user: { id: USER },
       guildId: "g1",
       member: { roles: { cache: new Map() } },

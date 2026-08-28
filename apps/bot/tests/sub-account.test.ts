@@ -185,7 +185,13 @@ function press(customId: string, w: ReturnType<typeof world>, userId = MAIN, ext
 }
 
 const contentOf = (fn: ReturnType<typeof vi.fn>) => String((fn.mock.calls.at(-1) as never[])[0]?.content ?? "");
-const payId = (ctx: Ctx, appId: number, attempt = "a1") => `shop:sub-pay:${ctx.item.id}:${appId}:${PRICE}:${attempt}`;
+const payId = (
+  ctx: Ctx,
+  appId: number,
+  attempt = "a1",
+  // tokenはCoreが正本。テスト側で同じhashを組み立てない。
+  termsToken: string = ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
+) => `shop:sub-pay:${ctx.item.id}:${appId}:${PRICE}:${termsToken}:${attempt}`;
 
 function approved(ctx: Ctx) {
   const row = ctx.subAccounts.apply({ mainUserId: MAIN, altUserId: ALT, mainStatus: "majin", actor: "t" });
@@ -423,9 +429,11 @@ describe("支払いと有効化", () => {
     const ctx = setup();
     const row = approved(ctx);
     const w = world();
+    // 値上げの**前**に描画されたボタンを持つ（実際の利用者と同じ順序）
+    const staleButton = payId(ctx, row.id);
     ctx.shop.updateItem(ctx.item.id, { price_land: 120_000 }, "staff");
 
-    await handleShopButton(press(payId(ctx, row.id), w), ctx.services);
+    await handleShopButton(press(staleButton, w), ctx.services);
 
     expect(balance(ctx)).toBe(1_000_000);
     expect(ctx.shop.listUserPurchases(MAIN)).toHaveLength(0);

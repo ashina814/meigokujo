@@ -103,7 +103,9 @@ export function subAccountActions(services: Services, item: ShopItemRow, userId:
     buttons.push(
       new ButtonBuilder()
         // **表示した額を確定まで持たせる**（押した時の最新価格で引かない）
-        .setCustomId(`shop:sub-pay:${item.id}:${approved.id}:${item.price_land ?? 0}:${payAttemptToken()}`)
+        // 料金だけでなく**商品内容そのもの**を確定する。承認後に名称・提供方法・条件が
+        // 変わった商品を、承認時に見せた説明のまま売らない。
+        .setCustomId(`shop:sub-pay:${item.id}:${approved.id}:${item.price_land ?? 0}:${services.shop.quoteGenericPurchase(item.id).termsToken}:${payAttemptToken()}`)
         .setLabel(`支払って有効化する (${fmtLd(item.price_land ?? 0)})`)
         .setEmoji("💰")
         .setStyle(ButtonStyle.Success),
@@ -143,12 +145,20 @@ export function applyModal(itemId: number) {
     );
 }
 
-/** 価格が変わっていたときの再確認。**1 Ld も動かさないまま新しい額で確かめ直す** */
-export function payRequote(item: ShopItemRow, applicationId: number, altUserId: string) {
+/** 内容が変わっていたときの再確認。**1 Ld も動かさないまま新しい内容で確かめ直す** */
+export function payRequote(
+  item: ShopItemRow,
+  applicationId: number,
+  altUserId: string,
+  termsToken: string,
+  opts: { priceChanged?: boolean } = {},
+) {
   const price = item.price_land ?? 0;
   return {
     content: [
-      "⚠️ 確認したあとに料金が変わりました。**まだ引き落としていません。**",
+      opts.priceChanged
+        ? "⚠️ 確認したあとに料金が変わりました。**まだ引き落としていません。**"
+        : "⚠️ 確認したあとに商品の内容が変わりました。**まだ引き落としていません。**",
       `サブ垢 <@${altUserId}> の追加料金は現在 **${fmtLd(price)}** です。`,
     ].join("\n"),
     embeds: [],
@@ -156,7 +166,7 @@ export function payRequote(item: ShopItemRow, applicationId: number, altUserId: 
     components: [
       new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
-          .setCustomId(`shop:sub-pay:${item.id}:${applicationId}:${price}:${payAttemptToken()}`)
+          .setCustomId(`shop:sub-pay:${item.id}:${applicationId}:${price}:${termsToken}:${payAttemptToken()}`)
           .setLabel(`この料金で支払う (${fmtLd(price)})`)
           .setEmoji("💰")
           .setStyle(ButtonStyle.Success),
