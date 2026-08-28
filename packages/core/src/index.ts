@@ -266,6 +266,8 @@ export {
   type StockRestorationRow,
   type ManualCompletionReason,
   type ManualCompletionResult,
+  type RoleGrantProvenanceRow,
+  type RoleGrantTarget,
 } from "./shop/service.js";
 export {
   Tickets,

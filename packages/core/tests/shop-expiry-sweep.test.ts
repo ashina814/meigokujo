@@ -51,6 +51,17 @@ function fund(ctx: Ctx, userId: string, amount: number) {
   });
 }
 
+/**
+ * 購入したあと**実際に配送する**。本番では自動配送がロールを付けてから期限が来る。
+ * 提供していない購入の失効でロールを剥がすことはできないので、
+ * 剥奪キューを見るテストではここを通す必要がある。
+ */
+function deliver(ctx: Ctx, purchaseId: number) {
+  ctx.shop.beginDelivery(purchaseId);
+  ctx.shop.markDeliverySucceeded(purchaseId, "system:test");
+  return purchaseId;
+}
+
 const pendingRevocations = (ctx: Ctx) =>
   ctx.db.prepare("SELECT purchase_id, role_id, status FROM shop_role_revocations ORDER BY purchase_id").all();
 
@@ -60,6 +71,7 @@ describe("期限切れの失効（課金から独立）", () => {
     const item = roleItem(ctx, "30日券", "role_a");
     fund(ctx, "u1", 1_000);
     const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    deliver(ctx, p.id);
     ctx.db.prepare("UPDATE shop_purchases SET expires_at = 1 WHERE id = ?").run(p.id);
 
     const { expired, failed } = ctx.shop.expireOverdue("system:test");
@@ -77,6 +89,7 @@ describe("期限切れの失効（課金から独立）", () => {
     const item = roleItem(ctx, "30日券", "role_a");
     fund(ctx, "u1", 1_000);
     const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    deliver(ctx, p.id);
     const balanceAfterPurchase = ctx.ledger.balanceOf("user:u1");
     ctx.db.prepare("UPDATE shop_purchases SET expires_at = 1 WHERE id = ?").run(p.id);
 
@@ -94,6 +107,7 @@ describe("期限切れの失効（課金から独立）", () => {
     const item = roleItem(ctx, "30日券", "role_a");
     fund(ctx, "u1", 1_000);
     const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    deliver(ctx, p.id);
 
     expect(ctx.shop.expireOverdue("system:test").expired).toEqual([]);
     expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
@@ -106,6 +120,7 @@ describe("期限切れの失効（課金から独立）", () => {
     const item = ctx.shop.createItem({ name: "単発", price_land: 100, kind: "one_shot", delivery: "manual" }, "staff");
     fund(ctx, "u1", 1_000);
     const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    deliver(ctx, p.id);
 
     expect(ctx.shop.expireOverdue("system:test").expired).toEqual([]);
     expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
@@ -117,6 +132,7 @@ describe("期限切れの失効（課金から独立）", () => {
     const item = roleItem(ctx, "30日券", "role_a");
     fund(ctx, "u1", 1_000);
     const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    deliver(ctx, p.id);
     ctx.db.prepare("UPDATE shop_purchases SET expires_at = 1 WHERE id = ?").run(p.id);
 
     ctx.shop.expireOverdue("system:test");
@@ -134,6 +150,7 @@ describe("期限切れの失効（課金から独立）", () => {
     for (const u of ["u1", "u2", "u3"]) {
       fund(ctx, u, 1_000);
       const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: u, actor: u, memberRoleIds: [] }).purchase;
+      deliver(ctx, p.id);
       ctx.db.prepare("UPDATE shop_purchases SET expires_at = 1 WHERE id = ?").run(p.id);
     }
 
@@ -150,11 +167,13 @@ describe("期限切れの失効（課金から独立）", () => {
     const item = roleItem(ctx, "30日券", "role_a");
     fund(ctx, "u1", 1_000);
     const old = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
+    deliver(ctx, old.id);
     ctx.db.prepare("UPDATE shop_purchases SET expires_at = 1 WHERE id = ?").run(old.id);
     ctx.shop.expireOverdue("system:test");
     ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] });
 
-    expect(ctx.shop.activePurchaseGrantsRole("u1", "role_a", old.id)).toBe(true);
+    // 判定は購入時の事実だけで行う（現在の商品設定は見ない）
+    expect(ctx.shop.activePurchaseProvesRoleEntitlement("u1", "role_a", old.id)).toBe(true);
     ctx.db.close();
   });
 
@@ -165,6 +184,7 @@ describe("期限切れの失効（課金から独立）", () => {
     for (const u of ["u1", "u2", "u3"]) {
       fund(ctx, u, 1_000);
       const p = ctx.shop.purchase({ expectedTermsToken: ctx.shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: u, actor: u, memberRoleIds: [] }).purchase;
+      deliver(ctx, p.id);
       ctx.db.prepare("UPDATE shop_purchases SET expires_at = ? WHERE id = ?").run(ids.length + 1, p.id);
       ids.push(p.id);
     }

@@ -201,6 +201,29 @@ export function parseDeliverySnapshot(raw: string | null | undefined): DeliveryS
   }
 }
 
+/**
+ * `delivery_data` から `role_id` を厳密に取り出す。
+ *
+ * 商品側はJSON文字列、購入時スナップショット側は既にパース済みのオブジェクトで来る。
+ * どちらも受けるが、**文字列として入っている role_id 以外は認めない**——数値や真偽値を
+ * ロールIDへ変換して剥奪対象にしない。
+ */
+function parseRoleIdFromDeliveryData(raw: unknown): string | null {
+  let data: Record<string, unknown> | null = null;
+  if (typeof raw === "string" && raw.trim()) {
+    try {
+      data = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  } else if (raw && typeof raw === "object") {
+    data = raw as Record<string, unknown>;
+  }
+  if (!data) return null;
+  const roleId = data.role_id;
+  return typeof roleId === "string" && roleId.trim() ? roleId.trim() : null;
+}
+
 export interface ShopRoleRevocationRow {
   purchase_id: number;
   user_id: string;
@@ -212,6 +235,27 @@ export interface ShopRoleRevocationRow {
   updated_at: number;
   completed_at: number | null;
 }
+
+/** 購入した時点で「どのロールを与える契約だったか」。append-only。 */
+export interface RoleGrantProvenanceRow {
+  readonly purchase_id: number;
+  readonly role_id: string;
+  readonly delivery_mode: "auto" | "manual";
+  readonly source: string;
+  readonly captured_at: number;
+}
+
+/**
+ * 失効時にどのロールを剥がすべきか。**現在の商品設定は一切見ない。**
+ *
+ * - `proven`         … 購入時のimmutableな記録からロールを特定できる
+ * - `proven_non_role`… 購入時にロールを与える契約ではなかったと証明できる
+ * - `legacy_unknown` … 購入時の契約を証明できない（推測して剥がさない）
+ */
+export type RoleGrantTarget =
+  | { readonly kind: "proven"; readonly roleId: string; readonly source: string }
+  | { readonly kind: "proven_non_role" }
+  | { readonly kind: "legacy_unknown" };
 
 /** 購入した時点の提供のしかた。append-only。 */
 export interface FulfillmentProvenanceRow {
@@ -618,6 +662,77 @@ export class Shop {
          VALUES (?,?,?,?,?)`,
       )
       .run(purchase.id, input.deliveryMode, input.stockConsumed ? 1 : 0, now(), input.source);
+  }
+
+  /**
+   * 購入時の「与えるロール」を凍結する。**purchase commit と同じtransactionで書く。**
+   *
+   * 自動配送のスナップショットは auto 購入しか持たないので、手動配送の add_role 商品も
+   * ここに記録する。そうしないと Phase E 以降に売った手動 add_role 商品の剥奪対象を、
+   * 後から現在の商品設定に頼って引くことになる。
+   */
+  private recordRoleGrantProvenance(
+    purchase: PurchaseRow,
+    item: ShopItemRow,
+    source: string,
+  ): void {
+    if (item.delivery_kind !== "add_role") return;
+    const roleId = parseRoleIdFromDeliveryData(item.delivery_data);
+    if (!roleId) return;
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO shop_purchase_role_grant_provenance
+           (purchase_id, role_id, delivery_mode, source, captured_at)
+         VALUES (?,?,?,?,?)`,
+      )
+      .run(purchase.id, roleId, item.delivery === "manual" ? "manual" : "auto", source, now());
+  }
+
+  /** 購入時に凍結した「与えるロール」。無ければ legacy。 */
+  roleGrantProvenance(purchaseId: number): RoleGrantProvenanceRow | undefined {
+    return this.db
+      .prepare("SELECT * FROM shop_purchase_role_grant_provenance WHERE purchase_id = ?")
+      .get(purchaseId) as RoleGrantProvenanceRow | undefined;
+  }
+
+  /**
+   * この購入の剥奪対象ロール。**唯一の authority。**
+   *
+   * 優先順位:
+   *   1. 購入時 role grant provenance（新しい購入）
+   *   2. 購入時スナップショット（auto購入のimmutable evidence）
+   *   3. 期限つきアクセスの明示的な移行記録
+   * どれも無ければ `legacy_unknown`。現在の `shop_items` へは絶対に落とさない——
+   * 商品のロール設定を後から変えただけで、過去の購入の剥奪対象が変わってしまう。
+   */
+  roleGrantTarget(purchase: PurchaseRow): RoleGrantTarget {
+    const provenance = this.roleGrantProvenance(purchase.id);
+    if (provenance) return { kind: "proven", roleId: provenance.role_id, source: provenance.source };
+
+    // 購入時のfulfillment provenanceがあるのにrole grantが無い＝**確定時にadd_role商品では
+    // なかった**と証明できる（どちらも同じtransactionで書かれる）。手動商品は配送
+    // スナップショットを持たないので、この判定が無いと「不明」に落ちてしまう。
+    if (this.fulfillmentProvenance(purchase.id)) return { kind: "proven_non_role" };
+
+    const snapshot = parseDeliverySnapshot(purchase.delivery_snapshot_json);
+    if (snapshot) {
+      // スナップショットがある＝購入時autoの契約が残っている。add_role でなければ
+      // 「ロールを与える契約ではなかった」と**証明できる**。
+      if (snapshot.delivery_kind !== "add_role") return { kind: "proven_non_role" };
+      const roleId = parseRoleIdFromDeliveryData(snapshot.delivery_data);
+      if (roleId) return { kind: "proven", roleId, source: "purchase_snapshot" };
+      // add_role なのに対象を取り出せない。推測しない。
+      return { kind: "legacy_unknown" };
+    }
+
+    const imported = this.db
+      .prepare("SELECT role_id FROM shop_timed_access_legacy_imports WHERE purchase_id = ?")
+      .get(purchase.id) as { role_id: string } | undefined;
+    if (imported && typeof imported.role_id === "string" && imported.role_id.trim()) {
+      return { kind: "proven", roleId: imported.role_id.trim(), source: "timed_access_legacy_import" };
+    }
+
+    return { kind: "legacy_unknown" };
   }
 
   /** 購入時に凍結した提供のしかた。無ければ legacy（購入時の事実が残っていない）。 */
@@ -1196,6 +1311,7 @@ export class Shop {
         stockConsumed,
         source: "original_role_invoice",
       });
+      this.recordRoleGrantProvenance(purchase, item, "original_role_invoice");
       const changed = this.db.prepare(
         `UPDATE original_role_invoices
             SET status='paid', paid_by=?, paid_at=?, purchase_id=?, transaction_id=?
@@ -1361,6 +1477,7 @@ export class Shop {
       stockConsumed,
       source: input.titleOrigin,
     });
+    this.recordRoleGrantProvenance(purchase, item, input.titleOrigin);
     this.events.log("shop_purchased", {
       actor: input.userId,
       payload: { itemId: item.id, purchaseId: purchase.id, paidLand, paidAltKind, paidAltAmount, expiresAt },
@@ -3093,6 +3210,7 @@ export class Shop {
             stockConsumed: false,
             source: "legacy_timed_access_import",
           });
+          this.recordRoleGrantProvenance(this.getPurchase(purchaseId)!, item, "legacy_timed_access_import");
           insertImport.run(
             purchaseId,
             migrationKey,
@@ -3182,11 +3300,11 @@ export class Shop {
     const failed: Array<{ purchaseId: number; error: string }> = [];
     for (const row of due) {
       try {
-        const one = this.db.transaction(() => {
-          this.expire(row.id, actor);
-          return this.getPurchase(row.id);
-        });
-        const purchase = this.db.inTransaction ? one() : one.immediate();
+        // 一覧を取ってから実行するまでの間に返金・取消が入りうる。**遷移そのものが
+        // 期限と状態を確かめる**ので、ここでは結果を受け取るだけでよい。
+        const outcome = this.expireIfDue(row.id, actor, ts);
+        if (!outcome.expired) continue;
+        const purchase = this.getPurchase(row.id);
         if (purchase) expired.push(purchase);
       } catch (error) {
         // **1件の失敗で巡回を止めない。** 止めると、失敗した1件より後ろに並んでいる
@@ -3200,39 +3318,162 @@ export class Shop {
     return { expired, failed };
   }
 
-  private expire(purchaseId: number, actor: string): void {
-    const purchase = this.getPurchase(purchaseId);
-    const item = purchase ? this.getItem(purchase.item_id) : undefined;
-    this.db.prepare("UPDATE shop_purchases SET status = 'expired' WHERE id = ?").run(purchaseId);
-    if (purchase) this.enqueueRoleRevocation(purchase, item, actor);
-    this.events.log("shop_expired", { actor, payload: { purchaseId } });
+  /**
+   * 期限が来ていれば失効させる。**判定と書き込みを同じ条件付きUPDATEに閉じ込める。**
+   *
+   * 以前は「期限切れ一覧を先に取り、後から `UPDATE ... WHERE id=?`」だった。その隙に
+   * 返金がcommitすると、`refunded` を `expired` で上書きできてしまう（返金した購入が
+   * 「期限切れ」として記録され、剥奪キューにも載る）。
+   * `changes === 1` のときだけ event と剥奪判断を確定する。
+   */
+  expireIfDue(
+    purchaseId: number,
+    actor: string,
+    observedNow: number = now(),
+  ): { expired: boolean; reason: "expired" | "not_active" | "not_due" | "not_found" } {
+    const run = (): { expired: boolean; reason: "expired" | "not_active" | "not_due" | "not_found" } => {
+      const before = this.getPurchase(purchaseId);
+      if (!before) return { expired: false, reason: "not_found" };
+
+      const changed = this.db
+        .prepare(
+          `UPDATE shop_purchases SET status = 'expired'
+            WHERE id = ?
+              AND status = 'active'
+              AND expires_at IS NOT NULL
+              AND expires_at <= ?`,
+        )
+        .run(purchaseId, observedNow).changes;
+      if (changed !== 1) {
+        // 何も動いていない。なぜ動かなかったかを、いまの行から説明する。
+        if (before.status !== "active") return { expired: false, reason: "not_active" };
+        return { expired: false, reason: "not_due" };
+      }
+
+      const purchase = this.getPurchase(purchaseId)!;
+      this.decideRoleRevocation(purchase, actor);
+      this.events.log("shop_expired", { actor, payload: { purchaseId } });
+      return { expired: true, reason: "expired" };
+    };
+    return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
   }
 
-  private enqueueRoleRevocation(purchase: PurchaseRow, item: ShopItemRow | undefined, actor: string): void {
+  /**
+   * 失効した購入からロールを剥がすかどうかを決める。
+   *
+   * **自動で剥がすには独立した2つの事実が要る。**
+   *   A. この購入がそのロールを与える契約だった（`roleGrantTarget`）
+   *   B. この購入が実際に提供済みだった（`hasDeliveredEvidence`）
+   *
+   * Aだけでは足りない。購入時autoのスナップショットは「そのロールを与えるつもりだった」
+   * を示すだけで、「実際にDiscordへ付与した」ことは示さない（Phase Dの truth/replay 分離）。
+   * 提供していない購入の終了でロールを剥がすのは、与えていないものを取り上げる操作になる。
+   */
+  private decideRoleRevocation(purchase: PurchaseRow, actor: string): void {
+    const target = this.roleGrantTarget(purchase);
+    if (target.kind === "proven_non_role") return; // ロール商品ではない。剥奪する物が無い
+
+    if (target.kind === "legacy_unknown") {
+      // 現在の商品設定から推測しない。人が確認するまで自動では触らない。
+      this.events.log("shop_role_revocation_unresolved", {
+        actor,
+        target: purchase.user_id,
+        payload: { purchaseId: purchase.id, reason: "role_target_unknown" },
+      });
+      return;
+    }
+
+    if (!this.hasDeliveredEvidence(purchase)) {
+      // 与えた証拠が無い。剥がす対象も無い。
+      this.events.log("shop_role_revocation_unresolved", {
+        actor,
+        target: purchase.user_id,
+        payload: { purchaseId: purchase.id, reason: "delivery_unproven" },
+      });
+      return;
+    }
+
     const ts = now();
-    const parsed = this.roleIdFromDelivery(purchase.delivery_snapshot_json, item);
-    if (!parsed.roleId && !parsed.error) return;
-    const status = parsed.roleId ? "pending" : "failed";
-    const error = parsed.roleId ? null : `invalid_delivery:${parsed.error ?? "unknown"}`;
     this.db
       .prepare(
         `INSERT INTO shop_role_revocations
          (purchase_id, user_id, role_id, status, attempts, last_error, created_at, updated_at, completed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, 'pending', 0, NULL, ?, ?, NULL)
          ON CONFLICT(purchase_id) DO UPDATE SET
            role_id=COALESCE(shop_role_revocations.role_id, excluded.role_id),
-           status=CASE WHEN shop_role_revocations.status='done' THEN 'done' ELSE excluded.status END,
-           last_error=excluded.last_error,
+           status=CASE WHEN shop_role_revocations.status='done' THEN 'done' ELSE 'pending' END,
            updated_at=excluded.updated_at`,
       )
-      .run(purchase.id, purchase.user_id, parsed.roleId ?? null, status, status === "failed" ? 1 : 0, error, ts, ts, status === "failed" ? ts : null);
-    if (status === "failed") {
-      this.events.log("shop_role_revocation_invalid", {
-        actor,
-        target: purchase.user_id,
-        payload: { purchaseId: purchase.id, error },
-      });
+      .run(purchase.id, purchase.user_id, target.roleId, ts, ts);
+  }
+
+  /**
+   * この失効行の保存済み `role_id` は、購入時の事実として裏が取れるか。
+   *
+   * 古いキュー行は現在の商品設定から作られている可能性がある。Discordへ
+   * `roles.remove()` を投げる**直前に**ここで再検証し、証明できないものは実行しない。
+   */
+  roleRevocationTargetProven(purchaseId: number, savedRoleId: string | null): boolean {
+    if (!savedRoleId) return false;
+    const purchase = this.getPurchase(purchaseId);
+    if (!purchase) return false;
+    const target = this.roleGrantTarget(purchase);
+    if (target.kind !== "proven" || target.roleId !== savedRoleId) return false;
+    return this.hasDeliveredEvidence(purchase);
+  }
+
+  /**
+   * まだ有効な別契約が、購入時の事実としてこのロールを与えているか。
+   *
+   * **現在の `shop_items` は見ない。** 商品のロール設定を変えただけで
+   * 「この契約はこのロールを与えている」という判定まで変わってしまうため。
+   */
+  activePurchaseProvesRoleEntitlement(userId: string, roleId: string, excludePurchaseId?: number): boolean {
+    const rows = this.db
+      .prepare("SELECT * FROM shop_purchases WHERE user_id = ? AND status = 'active'")
+      .all(userId) as PurchaseRow[];
+    for (const purchase of rows) {
+      if (excludePurchaseId !== undefined && purchase.id === excludePurchaseId) continue;
+      const target = this.roleGrantTarget(purchase);
+      if (target.kind === "proven" && target.roleId === roleId) return true;
     }
+    return false;
+  }
+
+  /**
+   * 剥奪対象を確定できない失効購入（運営の確認待ち）。
+   *
+   * 推測で剥がさない代わりに、黙って消しもしない。
+   */
+  listUnresolvedExpiryRevocations(opts: { limit?: number } = {}): Array<
+    PurchaseRow & { item_name: string; unresolved_reason: "role_target_unknown" | "delivery_unproven" }
+  > {
+    const rows = this.db
+      .prepare(
+        `SELECT p.*, i.name AS item_name
+           FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
+          WHERE p.status = 'expired'
+            AND NOT EXISTS (SELECT 1 FROM shop_role_revocations r WHERE r.purchase_id = p.id AND r.status = 'done')
+          ORDER BY p.purchased_at`,
+      )
+      .all() as Array<PurchaseRow & { item_name: string }>;
+    const out: Array<PurchaseRow & { item_name: string; unresolved_reason: "role_target_unknown" | "delivery_unproven" }> = [];
+    for (const row of rows) {
+      const target = this.roleGrantTarget(row);
+      if (target.kind === "proven_non_role") continue;
+      if (target.kind === "legacy_unknown") {
+        out.push({ ...row, unresolved_reason: "role_target_unknown" });
+      } else if (!this.hasDeliveredEvidence(row)) {
+        out.push({ ...row, unresolved_reason: "delivery_unproven" });
+      }
+      if (out.length >= (opts.limit ?? 25)) break;
+    }
+    return out;
+  }
+
+  /** 上と同じ判定の件数（上限なし） */
+  countUnresolvedExpiryRevocations(): number {
+    return this.listUnresolvedExpiryRevocations({ limit: Number.MAX_SAFE_INTEGER }).length;
   }
 
   pendingRoleRevocations(limit = 100): ShopRoleRevocationRow[] {
@@ -3241,42 +3482,6 @@ export class Shop {
       .all(limit) as ShopRoleRevocationRow[];
   }
 
-  activePurchaseGrantsRole(userId: string, roleId: string, excludePurchaseId?: number): boolean {
-    const rows = this.db
-      .prepare(
-        `SELECT p.*, i.delivery AS item_delivery, i.delivery_kind AS item_delivery_kind, i.delivery_data AS item_delivery_data
-         FROM shop_purchases p
-         JOIN shop_items i ON i.id = p.item_id
-         WHERE p.user_id = ? AND p.status = 'active'`,
-      )
-      .all(userId) as Array<PurchaseRow & { item_delivery: DeliveryMode; item_delivery_kind: DeliveryKind; item_delivery_data: string | null }>;
-    for (const p of rows) {
-      if (excludePurchaseId !== undefined && p.id === excludePurchaseId) continue;
-      const parsed = this.roleIdFromDelivery(
-        p.delivery_snapshot_json,
-        {
-          id: p.item_id,
-          name: "",
-          description: null,
-          price_land: null,
-          price_alt_kind: null,
-          price_alt_amount: null,
-          kind: "monthly",
-          duration_days: null,
-          require_role_id: null,
-          delivery: p.item_delivery,
-          delivery_kind: p.item_delivery_kind,
-          delivery_data: p.item_delivery_data,
-          stock: null,
-          enabled: 1,
-          created_at: 0,
-          updated_at: 0,
-        },
-      );
-      if (parsed.roleId === roleId) return true;
-    }
-    return false;
-  }
 
   markRoleRevocationDone(purchaseId: number, actor: string, reason: string): void {
     const ts = now();

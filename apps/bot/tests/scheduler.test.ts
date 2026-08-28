@@ -291,6 +291,12 @@ describe("チケット24時間通知のスナップショット", () => {
 });
 
 describe("ショップ 失効とロール剥奪", () => {
+  /** 購入を実際に配送する（本番と同じ順序） */
+  function deliver(shop: Shop, purchaseId: number) {
+    shop.beginDelivery(purchaseId);
+    shop.markDeliverySucceeded(purchaseId, "system:test");
+  }
+
   function setupShop(roleId = "role_old") {
     const db = openDb(":memory:");
     const ledger = new Ledger(db);
@@ -317,6 +323,9 @@ describe("ショップ 失効とロール剥奪", () => {
       "staff",
     );
     const purchase = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
+    // 本番では自動配送がロールを付けてから期限が来る。提供していない購入の失効では
+    // 与えていないロールを剥がすことになるので、剥奪キューに載らない。
+    deliver(shop, purchase.id);
     db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(purchase.id);
     shop.expireOverdue("system:test");
     return { db, events, shop, item, purchase };
@@ -324,7 +333,8 @@ describe("ショップ 失効とロール剥奪", () => {
 
   it("失効購入の剥奪再試行時、同じロールを付与するactive購入があれば剥がさず一度だけ完了記録する", async () => {
     const { db, events, shop, item, purchase } = setupShop();
-    shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] });
+    const keeper = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
+    deliver(shop, keeper.id);
     const remove = vi.fn(async () => undefined);
     const member = { roles: { cache: { has: vi.fn(() => true) }, remove } };
     const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
@@ -402,6 +412,8 @@ describe("ショップ 失効とロール剥奪", () => {
     }
     const a = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u1", actor: "u1", memberRoleIds: [] }).purchase;
     const b = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "u2", actor: "u2", memberRoleIds: [] }).purchase;
+    deliver(shop, a.id);
+    deliver(shop, b.id);
     db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id IN (?,?)").run(a.id, b.id);
 
     const { expireOverduePurchases } = await import("../src/scheduler-recovery.js");

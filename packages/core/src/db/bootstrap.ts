@@ -896,6 +896,24 @@ CREATE TABLE IF NOT EXISTS shop_purchase_stock_restorations (
   applied      INTEGER NOT NULL CHECK (applied IN (0,1))
 );
 
+-- Phase E: この購入は「購入した時点でどのロールを与える契約だったか」を凍結する。
+--
+-- 失効時のロール剥奪対象を、現在の shop_items.delivery_data から引くと、運営が商品の
+-- ロール設定を R1 から R2 へ変えただけで、**過去の購入から R2 を剥がす**ことになる。
+-- その購入で R2 を与えた証拠はどこにも無い。だから購入時の事実を別に残す。
+--
+-- 自動配送のスナップショット（delivery_snapshot_json）は auto 購入しか持たないので、
+-- 手動配送の add_role 商品もここに記録する。
+CREATE TABLE IF NOT EXISTS shop_purchase_role_grant_provenance (
+  purchase_id    INTEGER PRIMARY KEY REFERENCES shop_purchases(id),
+  role_id        TEXT NOT NULL,
+  delivery_mode  TEXT NOT NULL CHECK (delivery_mode IN ('auto','manual')),
+  source         TEXT NOT NULL,
+  captured_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shop_purchase_role_grant_role
+  ON shop_purchase_role_grant_provenance(role_id, purchase_id);
+
 -- Phase D round 2: 「配送したか」と「自動で再実行してよいか」を分ける。
 --
 -- 購入時autoのスナップショットは **配送方式** の証拠であって、**配送が成功した** 証拠では
@@ -933,6 +951,16 @@ CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_title_provenance_no_delete
 BEFORE DELETE ON shop_purchase_title_provenance
 BEGIN
   SELECT RAISE(ABORT, 'shop purchase title provenance is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_role_grant_provenance_no_update
+BEFORE UPDATE ON shop_purchase_role_grant_provenance
+BEGIN
+  SELECT RAISE(ABORT, 'shop purchase role grant provenance is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_role_grant_provenance_no_delete
+BEFORE DELETE ON shop_purchase_role_grant_provenance
+BEGIN
+  SELECT RAISE(ABORT, 'shop purchase role grant provenance is append-only');
 END;
 CREATE TRIGGER IF NOT EXISTS trg_shop_delivery_replay_suppressions_no_update
 BEFORE UPDATE ON shop_delivery_replay_suppressions
