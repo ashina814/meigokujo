@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Entry, EventLog, Evaluation, Ledger, Settings, Shop, Tickets, openDb, registerDefaultTxTypes } from "@meigokujo/core";
+import { Entry, EventLog, Evaluation, Ledger, REEVAL_PRICE_LAND, Settings, Shop, Tickets, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
 
 /**
@@ -28,9 +28,27 @@ function setup() {
   const events = new EventLog(db);
   const entry = new Entry(db, ledger, settings, events);
   const evaluation = new Evaluation(db, settings, events);
-  const shop = new Shop(db, ledger, events);
   const tickets = new Tickets(db, events);
-  const item = shop.createItem({ name: "再評価チャレンジ", price_land: 100, kind: "one_shot", delivery: "manual" }, STAFF);
+  // 面談権は「再評価権として発行された購入」なので、fixtureも実際の発行経路
+  // （`purchaseReevaluation`）を通す。genericなstorefront購入は再評価権ではない。
+  let reevalItemId: number | null = null;
+  const shop = new Shop(db, ledger, events, {
+    reevalItemId: () => reevalItemId,
+    // 受付panelはこのfixtureで用意する（`ready()` が作る）。
+    assertReevaluationIntakeAvailable: () => {},
+  });
+  const item = shop.createItem(
+    {
+      name: "再評価チャレンジ",
+      price_land: REEVAL_PRICE_LAND,
+      price_alt_kind: "invite",
+      price_alt_amount: 5,
+      kind: "one_shot",
+      delivery: "manual",
+    },
+    STAFF,
+  );
+  reevalItemId = item.id;
   settings.set("shop:reeval_item_id", item.id, STAFF);
   const services = { db, ledger, settings, events, entry, evaluation, shop, tickets } as unknown as Services;
   return { db, ledger, settings, events, entry, evaluation, shop, tickets, item, services };
@@ -44,12 +62,19 @@ function ready(ctx: ReturnType<typeof setup>) {
   ctx.ledger.transfer({
     from: "sys:treasury",
     to: `user:${USER}`,
-    amount: 10_000,
+    amount: REEVAL_PRICE_LAND * 2,
     type: "adjust",
     actor: STAFF,
     idempotencyKey: `seed-${Math.random()}`,
   });
-  const purchase = ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: STAFF, memberRoleIds: [] }).purchase;
+  const purchase = ctx.shop.purchaseReevaluation({
+    itemId: ctx.item.id,
+    userId: USER,
+    actor: STAFF,
+    memberRoleIds: [],
+    mode: "land",
+    idempotencyKey: `reeval-${Math.random()}`,
+  }).purchase;
   ctx.tickets.create(THREAD, USER, "reeval", { id: "reeval", name: "再評価面談", notifyRoleIds: [], staffRoleIds: [] });
   ctx.tickets.linkPurchase(THREAD, purchase.id, STAFF);
   return purchase.id;
@@ -223,16 +248,34 @@ describe("チケットと購入の対応が崩れている場合", () => {
     expectUntouched(ctx, purchaseId, "meirei");
   });
 
-  it("商品IDの設定が外れていたら確定しない（fail-closed）", async () => {
+  it("販売設定が外れていても、既に成立した面談権は確定できる", async () => {
+    // 利用者が買ったのは商品IDではなく「面談を1回受ける権利」。運営が販売設定を外しても、
+    // 既に成立した権利まで確定不能にしてはいけない（新規販売が止まるだけ）。
     const { settleInterview } = await reevalModule;
     const ctx = setup();
     const purchaseId = ready(ctx);
     ctx.db.prepare("DELETE FROM settings WHERE key = 'shop:reeval_item_id'").run();
 
-    expect(settleInterview(ctx.services, settleInput(purchaseId, true))).toEqual({
+    const result = settleInterview(ctx.services, settleInput(purchaseId, true));
+    expect(result.ok).toBe(true);
+    const purchase = ctx.shop.getPurchase(purchaseId)!;
+    expect(purchase.delivery_state).toBe("delivered");
+    expect(ctx.db.prepare("SELECT status FROM souls WHERE user_id=?").get(USER)).toEqual({ status: "ghost" });
+  });
+
+  it("再評価権として発行されていない購入では確定しない（fail-closed）", async () => {
+    const { settleInterview } = await reevalModule;
+    const ctx = setup();
+    ready(ctx);
+    // genericなstorefront購入は面談権ではない。ticketへ結び替えても確定できない。
+    const generic = ctx.shop.createItem({ name: "別商品", price_land: 1, kind: "one_shot", delivery: "manual" }, STAFF);
+    const other = ctx.shop.purchase({ itemId: generic.id, userId: USER, actor: STAFF, memberRoleIds: [] }).purchase;
+    ctx.db.prepare("UPDATE tickets SET linked_purchase_id=? WHERE thread_id=?").run(other.id, THREAD);
+
+    expect(settleInterview(ctx.services, settleInput(other.id, true))).toEqual({
       ok: false,
-      reason: "reeval_item_setting_missing",
+      reason: "purchase_not_reevaluation",
     });
-    expectUntouched(ctx, purchaseId, "meirei");
+    expect(ctx.db.prepare("SELECT status FROM souls WHERE user_id=?").get(USER)).toEqual({ status: "meirei" });
   });
 });

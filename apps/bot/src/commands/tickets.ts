@@ -36,6 +36,14 @@ const OPEN_PREFIX = "ticket:open:";
 const CLOSE_CONFIRM_PREFIX = "ticket:close-confirm:";
 const inFlightTickets = new Set<string>();
 
+/** preflight通過後に面談権が使えなくなったことを示す。ticket/threadを巻き戻すために投げる。 */
+class ReevalRightUnavailable extends Error {
+  constructor() {
+    super("reeval right became unavailable before it could be reserved");
+    this.name = "ReevalRightUnavailable";
+  }
+}
+
 
 function uniq(values: string[]): string[] {
   return [...new Set(values.map((v) => v.trim()).filter(Boolean))];
@@ -362,6 +370,18 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
     return;
   }
 
+  // 再評価面談は「面談権を買った人のための受付」。権利が無いまま開くと、承認ボタンが
+  // 押せないチケットだけが残り、open ticketがあるせいで次も開けなくなる。
+  // **Discord threadを1つも作る前に**確認して、何も作らずに案内だけ返す。
+  if (panel.id === REEVAL_PANEL_ID && services.shop.findUnreservedReevaluationRight(interaction.user.id) === null) {
+    await interaction.reply({
+      content:
+        "再評価チャレンジを先に購入してください。\nチケットは作成していません。料金も発生していません。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
   const flightKey = `${interaction.user.id}:${panel.id}`;
   if (inFlightTickets.has(flightKey)) {
     await interaction.reply({ content: `「${panel.name}」の受付処理中です。少し待ってから確認してください。`, flags: MessageFlags.Ephemeral });
@@ -430,6 +450,12 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
     // 同じ購入は一意インデックスで1チケットしか消費できない
     const reevalPurchaseId =
       panel.id === REEVAL_PANEL_ID ? linkReevalPurchase(services, thread.id, interaction.user.id) : null;
+    // preflightの後・ここまでの間に、返金/別チケットの予約/別処理での消費が挟まりうる。
+    // 予約できなかったなら初期化失敗として扱い、下のcatchでticket行を巻き戻しthreadも消す。
+    // 「権利なしチケットを完成状態で残す」ことは絶対にしない。
+    if (panel.id === REEVAL_PANEL_ID && reevalPurchaseId === null) {
+      throw new ReevalRightUnavailable();
+    }
     await thread.send({
       ...buildTicketOpeningMessage(services, panel, interaction.user.id, interaction.member as GuildMember | null, {
         panelName: ticket.panel_name ?? panel.name,
@@ -457,7 +483,9 @@ export async function openTicket(interaction: ButtonInteraction, services: Servi
         interaction,
         raced
           ? `✅ 受付は既に完了しています。「${raced.panel_name ?? panel.name}」のスレッドはこちらです: <#${raced.thread_id}>`
-          : `「${panel.name}」の受付処理に失敗しました。チケットは作成されていません。運営に確認してください。`,
+          : e instanceof ReevalRightUnavailable
+            ? "再評価チャレンジを先に購入してください。\nチケットは作成していません。料金も発生していません。"
+            : `「${panel.name}」の受付処理に失敗しました。チケットは作成されていません。運営に確認してください。`,
       );
     } else {
       console.warn("[ticket] チケットは作成済みですが、利用者への完了応答に失敗しました", { threadId: thread?.id });

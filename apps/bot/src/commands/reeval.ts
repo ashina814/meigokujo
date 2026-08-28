@@ -33,6 +33,24 @@ export const REEVAL_PANEL_ID = "reeval";
 /** 面談権にあたる商品（再評価チャレンジ）の設定キー */
 export const REEVAL_ITEM_SETTING_KEY = "shop:reeval_item_id";
 
+/**
+ * 再評価**面談受付**が今すぐ使える状態か。使えないなら理由(内部用)を返す。
+ *
+ * 500,000Ld / 招待5件の商品なので、「買ったのに受け付ける場所が無い」を作らない。
+ * DB上の受付panelだけで判断する——Discord APIへ問い合わせないので、購入transactionの
+ * 中から同期的に呼べる（charge直前の再確認に使う）。
+ */
+export function reevaluationIntakeUnavailableReason(
+  services: Pick<Services, "tickets">,
+): "panel_missing" | "panel_disabled" | "panel_archived" | "panel_not_posted" | null {
+  const panel = services.tickets.getPanel(REEVAL_PANEL_ID);
+  if (!panel) return "panel_missing";
+  if (panel.archivedAt) return "panel_archived";
+  if (!panel.enabled) return "panel_disabled";
+  if (!panel.channelId || !panel.messageId) return "panel_not_posted";
+  return null;
+}
+
 export function reevalActionRow(disabled = false) {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
@@ -54,26 +72,15 @@ export function reevalActionRow(disabled = false) {
  * まだどのチケットにも消費されていない面談権を1件探す。
  *
  * 「未処理の再評価チャレンジ購入が無い人は承認できない」を成立させるための土台。
- * 商品の特定は設定値 `shop:reeval_item_id` に依り、未設定なら誰も承認できない（fail-closed）。
+ *
+ * 商品の特定に現在の `shop:reeval_item_id` は**使わない**——利用者が買ったのは商品IDではなく
+ * 「面談を1回受ける権利」なので、運営が商品を作り直しても設定を外しても権利は生き続ける。
+ * 判定はShopのsemantic API（購入時に確定した不変記録が正本）へ委譲する。Bot側でprovenance
+ * SQLを複製しない。
  */
 export function findUnconsumedReevalPurchase(services: Services, userId: string): { id: number } | null {
-  const itemId = Number(services.settings.getString(REEVAL_ITEM_SETTING_KEY));
-  if (!Number.isInteger(itemId) || itemId <= 0) return null;
-  const row = services.db
-    .prepare(
-      `SELECT p.id
-         FROM shop_purchases p
-        WHERE p.item_id = ? AND p.user_id = ? AND p.status = 'active'
-          -- まだ面談サービスを提供していない購入だけ（消費済みは delivered で表す）
-          AND p.delivered_at IS NULL
-          AND COALESCE(p.delivery_state, 'pending') <> 'delivered'
-          -- 他のチケットが予約中でない
-          AND NOT EXISTS (SELECT 1 FROM tickets t WHERE t.linked_purchase_id = p.id)
-        ORDER BY p.purchased_at
-        LIMIT 1`,
-    )
-    .get(itemId, userId) as { id: number } | undefined;
-  return row ?? null;
+  // ticketへ新しく予約するための探索なので、既に他のticketが予約中のものは除く。
+  return services.shop.findUnreservedReevaluationRight(userId);
 }
 
 /**
@@ -126,12 +133,12 @@ export function settleInterview(
     if (ticket.status !== "open" && ticket.status !== "claimed") throw new SettleAbort(`ticket_${ticket.status}`);
     if (ticket.linked_purchase_id !== input.purchaseId) throw new SettleAbort("purchase_link_changed");
 
-    const itemId = Number(services.settings.getString(REEVAL_ITEM_SETTING_KEY));
-    if (!Number.isInteger(itemId) || itemId <= 0) throw new SettleAbort("reeval_item_setting_missing");
     const purchase = services.shop.getPurchase(input.purchaseId);
     if (!purchase) throw new SettleAbort("purchase_not_found");
     if (purchase.user_id !== input.targetId) throw new SettleAbort("purchase_user_mismatch");
-    if (purchase.item_id !== itemId) throw new SettleAbort("purchase_item_mismatch");
+    // 現在の商品設定は見ない。購入時に確定した意味だけで判断する——A→B差し替え後も、
+    // 設定が消えていても、既に成立した面談権は確定できる。
+    if (!services.shop.isReevaluationPurchase(purchase.id)) throw new SettleAbort("purchase_not_reevaluation");
     if (purchase.status !== "active") throw new SettleAbort(`purchase_${purchase.status}`);
     if (purchase.delivered_at !== null) throw new SettleAbort("purchase_already_delivered");
     if (purchase.delivery_state === "delivered") throw new SettleAbort("purchase_already_consumed");
@@ -239,12 +246,12 @@ type Guard =
  * 別人・別商品の購入が誤って結ばれている、といった状態で承認させないため。
  */
 function verifyPurchase(services: Services, purchaseId: number, ticketUserId: string): string | null {
-  const itemId = Number(services.settings.getString(REEVAL_ITEM_SETTING_KEY));
-  if (!Number.isInteger(itemId) || itemId <= 0) return "再評価チャレンジの商品ID（`shop:reeval_item_id`）が未設定です。";
+  // 現在の販売設定に依存しない。設定が未設定でも、商品がA→Bへ差し替わっていても、
+  // 既に購入済みの面談権は有効。
   const purchase = services.shop.getPurchase(purchaseId);
   if (!purchase) return `面談権の購入 #${purchaseId} が見つかりません。`;
   if (purchase.user_id !== ticketUserId) return `購入 #${purchaseId} は別の利用者のものです。`;
-  if (purchase.item_id !== itemId) return `購入 #${purchaseId} は再評価チャレンジではありません。`;
+  if (!services.shop.isReevaluationPurchase(purchase.id)) return `購入 #${purchaseId} は再評価チャレンジではありません。`;
   if (purchase.status !== "active") return `購入 #${purchaseId} は ${purchase.status} のため面談権として使えません。`;
   if (purchase.delivered_at !== null || purchase.delivery_state === "delivered") {
     return `購入 #${purchaseId} は既に面談で消費済みです。`;

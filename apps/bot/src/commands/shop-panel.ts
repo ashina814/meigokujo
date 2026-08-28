@@ -640,6 +640,9 @@ function purchaseErrorMessage(error: unknown, services: Services): string {
     ) {
       return "オリジナルロールは、申請が承認されたあとの専用画面からのみ購入できます。料金は発生していません。";
     }
+    if (error.code === "ERR_REEVAL_INTAKE_UNAVAILABLE") {
+      return "現在、再評価面談の受付を利用できないため販売を停止しています。Land・招待実績は消費していません。";
+    }
     if (error.code === "ERR_EVAL_EXTENSION_STATUS") return "評価期間の延長は、現在評価中の亡霊だけが購入できます。";
     if (error.code === "ERR_EVAL_EXTENSION_CYCLE") return "現在の評価サイクルを確認できないため、料金を引かずに停止しました。";
     if (error.code === "ERR_EVAL_EXTENSION_EXPIRED") return "評価期限を過ぎているため、料金を引かずに停止しました。";
@@ -651,7 +654,7 @@ function purchaseErrorMessage(error: unknown, services: Services): string {
       return "評価期間延長商品の設定を確認できないため、料金を引かずに停止しました。運営へご連絡ください。";
     }
     if (error.code === "ERR_REEVAL_STATUS") return "再評価チャレンジは迷霊の方だけが購入できます。";
-    if (error.code === "ERR_REEVAL_RIGHT_EXISTS") return "未使用の再評価権を既に持っています。面談結果の確定後にご利用ください。";
+    if (error.code === "ERR_REEVAL_RIGHT_EXISTS") return "未使用の再評価面談権があります。先にその面談をご利用ください。";
     if (error.code === "ERR_REEVAL_INVITES_INSUFFICIENT") return "未使用の確定招待実績が5件必要です。";
     if (error.code === "ERR_REEVAL_ITEM_CONFIG" || error.code === "ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED") {
       return "再評価チャレンジの設定を確認できないため、購入を停止しました。運営へご連絡ください。";

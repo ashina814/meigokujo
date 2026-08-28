@@ -90,6 +90,9 @@ function makeOpenTicketHarness(options: {
   addMember?: (memberId: string) => Promise<void>;
   sendMessage?: () => Promise<void>;
   createTicket?: () => TicketRow;
+  /** 再評価面談の権利探索。null = 未購入 / 使えない。 */
+  findUnreservedReevaluationRight?: () => { id: number } | null;
+  linkPurchase?: () => boolean;
 } = {}) {
   const p = options.panel ?? panel({ staffRoleIds: ["staff_role"] });
   const thread = {
@@ -118,6 +121,12 @@ function makeOpenTicketHarness(options: {
       openByUserPanel: vi.fn(options.openByUserPanel ?? (() => undefined)),
       create: vi.fn(options.createTicket ?? (() => ticket({ thread_id: thread.id, panel_id: p.id, panel_name: p.name }))),
       rollbackCreate: vi.fn(() => ticket({ thread_id: thread.id, panel_id: p.id, panel_name: p.name })),
+      linkPurchase: vi.fn(options.linkPurchase ?? (() => true)),
+    },
+    shop: {
+      findUnreservedReevaluationRight: vi.fn(
+        options.findUnreservedReevaluationRight ?? (() => ({ id: 42 })),
+      ),
     },
   };
   const interaction: any = {
@@ -263,6 +272,62 @@ describe("汎用チケット受付パネル", () => {
     await p1;
     expect(first.channel.threads.create).toHaveBeenCalledTimes(1);
     expect(first.services.tickets.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("再評価: 面談権が無いなら、スレッドもチケット行も一切作らない", async () => {
+    // 権利が無いまま開くと、承認できないチケットだけが残り、open ticketがあるせいで
+    // 次も開けなくなる（ticket-before-purchase trap）。**Discord threadを1つも作る前**に止める。
+    const h = makeOpenTicketHarness({
+      panel: panel({ id: "reeval", name: "再評価面談", staffRoleIds: ["staff_role"] }),
+      findUnreservedReevaluationRight: () => null,
+    });
+
+    await openTicket(h.interaction as any, h.services as any, "reeval");
+
+    expect(h.channel.threads.create).not.toHaveBeenCalled();
+    expect(h.services.tickets.create).not.toHaveBeenCalled();
+    expect(h.interaction.deferReply).not.toHaveBeenCalled();
+    expect(h.interaction.reply).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("再評価チャレンジを先に購入してください") }),
+    );
+    // 内部識別子は出さない
+    const said = (h.interaction.reply.mock.calls[0]?.[0] as { content: string }).content;
+    expect(said).not.toMatch(/item_id|shop:reeval_item_id|purchase_item_mismatch|provenance/);
+    expect(said).toContain("料金も発生していません");
+  });
+
+  it("再評価: preflight後に権利が使えなくなったら、チケット行を巻き戻しスレッドも消す", async () => {
+    // preflightと予約の間に返金・別チケット予約・別処理の消費が挟まりうる。
+    // 「権利なしチケットを完成状態で残す」ことは絶対にしない。
+    const h = makeOpenTicketHarness({
+      panel: panel({ id: "reeval", name: "再評価面談", staffRoleIds: ["staff_role"] }),
+      findUnreservedReevaluationRight: () => ({ id: 42 }),
+      linkPurchase: () => false, // 予約に失敗＝この瞬間に権利が使えなくなった
+    });
+
+    await openTicket(h.interaction as any, h.services as any, "reeval");
+
+    expect(h.channel.threads.create).toHaveBeenCalledTimes(1);
+    expect(h.services.tickets.rollbackCreate).toHaveBeenCalledTimes(1);
+    expect(h.thread.delete).toHaveBeenCalled();
+    expect(h.thread.send).not.toHaveBeenCalled();
+    expect(h.interaction.editReply).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("再評価チャレンジを先に購入してください") }),
+    );
+  });
+
+  it("再評価: 権利があれば通常どおり作成される", async () => {
+    const h = makeOpenTicketHarness({
+      panel: panel({ id: "reeval", name: "再評価面談", staffRoleIds: ["staff_role"] }),
+      findUnreservedReevaluationRight: () => ({ id: 42 }),
+    });
+
+    await openTicket(h.interaction as any, h.services as any, "reeval");
+
+    expect(h.channel.threads.create).toHaveBeenCalledTimes(1);
+    expect(h.services.tickets.create).toHaveBeenCalledTimes(1);
+    expect(h.services.tickets.rollbackCreate).not.toHaveBeenCalled();
+    expect(h.thread.delete).not.toHaveBeenCalled();
   });
 
   it("新規チケットを未対応表示で作成する", async () => {

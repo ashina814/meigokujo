@@ -9,6 +9,7 @@ import {
   REEVAL_INVITE_COUNT,
   REEVAL_PRICE_LAND,
   Shop,
+  Tickets,
   ShopError,
   TREASURY,
   deptAccount,
@@ -31,8 +32,19 @@ function setup() {
   const ledger = new Ledger(db);
   const events = new EventLog(db);
   const departments = new Departments(db, ledger);
+  // 予約状況（tickets.linked_purchase_id）はTicketsが持つ。本番と同じ形にしておく。
+  new Tickets(db, events);
   let itemId: number | null = null;
-  const shop = new Shop(db, ledger, events, { reevalItemId: () => itemId, departments });
+  let intakeUnavailable: string | null = null;
+  const shop = new Shop(db, ledger, events, {
+    reevalItemId: () => itemId,
+    departments,
+    assertReevaluationIntakeAvailable: () => {
+      if (intakeUnavailable !== null) {
+        throw new ShopError("ERR_REEVAL_INTAKE_UNAVAILABLE", { reason: intakeUnavailable });
+      }
+    },
+  });
   const item = shop.createItem(
     {
       name: "再評価チャレンジ",
@@ -56,7 +68,29 @@ function setup() {
     actor: STAFF,
     idempotencyKey: "seed:user",
   });
-  return { db, ledger, events, departments, shop, item };
+  return {
+    db, ledger, events, departments, shop, item,
+    /** 運営が延長商品を作り直して `shop:reeval_item_id` をA→Bへ変えた状態を作る。 */
+    replaceSaleItem(): { id: number } {
+      const next = shop.createItem(
+        {
+          name: "再評価チャレンジ（再作成）",
+          description: "人間による再評価面談を受ける権利",
+          price_land: REEVAL_PRICE_LAND,
+          price_alt_kind: "invite",
+          price_alt_amount: REEVAL_INVITE_COUNT,
+          kind: "one_shot",
+          delivery: "manual",
+        },
+        STAFF,
+      );
+      itemId = next.id;
+      return next;
+    },
+    /** 現在の販売設定を外す（新規販売だけ止まり、既存権は生きるべき）。 */
+    clearSaleItem() { itemId = null; },
+    setIntakeUnavailable(reason: string | null) { intakeUnavailable = reason; },
+  };
 }
 
 function invite(ctx: ReturnType<typeof setup>, count: number, prefix = "guest") {
@@ -64,9 +98,9 @@ function invite(ctx: ReturnType<typeof setup>, count: number, prefix = "guest") 
   for (let i = 0; i < count; i += 1) stmt.run(USER, `${prefix}-${i}`, 100 + i);
 }
 
-function buy(ctx: ReturnType<typeof setup>, mode: "land" | "invite", key = `buy:${mode}`) {
+function buy(ctx: ReturnType<typeof setup>, mode: "land" | "invite", key = `buy:${mode}`, itemId = ctx.item.id) {
   return ctx.shop.purchaseReevaluation({
-    itemId: ctx.item.id,
+    itemId,
     userId: USER,
     actor: `user:${USER}`,
     memberRoleIds: [],
@@ -171,18 +205,135 @@ describe("再評価チャレンジV2決済", () => {
 
   it("旧invite:5購入は使用台帳を捏造せず未消費権として互換維持する", () => {
     const ctx = setup();
+    // 旧購入経路が実際に残していた形。当時の再評価商品は delivery=auto /
+    // delivery_kind=revoke_meirei だったため、購入時snapshotがその意味を凍結している
+    // （本番の未消費権もこの形で残っている）。金額やinvite数ではなく、この不変記録が正本。
     ctx.db
       .prepare(
         `INSERT INTO shop_purchases
-          (item_id,user_id,purchased_at,paid_alt_kind,paid_alt_amount,status,auto_renew)
-         VALUES (?,?,1,'invite',5,'active',1)`,
+          (item_id,user_id,purchased_at,paid_alt_kind,paid_alt_amount,status,auto_renew,delivery_snapshot_json)
+         VALUES (?,?,1,'invite',5,'active',1,?)`,
       )
-      .run(ctx.item.id, USER);
+      .run(ctx.item.id, USER, JSON.stringify({ delivery: "auto", delivery_kind: "revoke_meirei", delivery_data: null, captured_at: 1 }));
     invite(ctx, 1, "legacy-real");
 
     expect(codeOf(() => buy(ctx, "land"))).toBe("ERR_REEVAL_RIGHT_EXISTS");
     expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_reeval_invite_uses").get()).toEqual({ n: 0 });
     expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM invites").get()).toEqual({ n: 1 });
+  });
+});
+
+describe("再評価権のidentityは商品IDではない", () => {
+  it("A→B差し替え後もAはsemanticな未消費権として見つかる", () => {
+    const ctx = setup();
+    const a = buy(ctx, "land", "A:1");
+    const b = ctx.replaceSaleItem();
+    expect(b.id).not.toBe(ctx.item.id);
+
+    expect(ctx.shop.isReevaluationPurchase(a.id)).toBe(true);
+    expect(ctx.shop.findUnconsumedReevaluationRight(USER)).toEqual({ id: a.id });
+    expect(ctx.shop.findUnreservedReevaluationRight(USER)).toEqual({ id: a.id });
+  });
+
+  it("A未消費のままBは買えない（0 charge・invite消費0・購入追加0）", () => {
+    const ctx = setup();
+    buy(ctx, "land", "A:1");
+    const b = ctx.replaceSaleItem();
+    invite(ctx, REEVAL_INVITE_COUNT, "for-b");
+    const beforeLand = ctx.ledger.balanceOf(`user:${USER}`);
+    const beforePurchases = ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_purchases").get() as { n: number };
+
+    expect(codeOf(() => buy(ctx, "land", "B:land", b.id))).toBe("ERR_REEVAL_RIGHT_EXISTS");
+    expect(codeOf(() => buy(ctx, "invite", "B:invite", b.id))).toBe("ERR_REEVAL_RIGHT_EXISTS");
+
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(beforeLand);
+    expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_purchases").get()).toEqual(beforePurchases);
+    expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_reeval_invite_uses").get()).toEqual({ n: 0 });
+  });
+
+  it("販売設定が消えても既存権は生きる。新規販売だけ0 chargeで止まる", () => {
+    const ctx = setup();
+    const a = buy(ctx, "land", "A:1");
+    ctx.clearSaleItem();
+
+    // 既存権は見つかるし、再評価権として認識される
+    expect(ctx.shop.isReevaluationPurchase(a.id)).toBe(true);
+    expect(ctx.shop.findUnconsumedReevaluationRight(USER)).toEqual({ id: a.id });
+    // 新規販売だけ止まる
+    const beforeLand = ctx.ledger.balanceOf(`user:${USER}`);
+    expect(codeOf(() => buy(ctx, "land", "new:after-clear"))).toBe("ERR_REEVAL_ITEM_CONFIG");
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(beforeLand);
+  });
+
+  it("旧商品Aはgeneric storefrontからは買えない（A→B後・A有効のままでも）", () => {
+    const ctx = setup();
+    buy(ctx, "land", "A:1");
+    ctx.shop.consumePurchaseForService(
+      ctx.shop.findUnconsumedReevaluationRight(USER)!.id, STAFF, { result: "rejected" },
+    );
+    ctx.replaceSaleItem(); // 販売設定はBへ。Aはenabledのまま
+
+    const beforeLand = ctx.ledger.balanceOf(`user:${USER}`);
+    expect(codeOf(() => ctx.shop.purchase({ itemId: ctx.item.id, userId: USER, actor: STAFF, memberRoleIds: [] })))
+      .toBe("ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED");
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(beforeLand);
+  });
+
+  it("面談受付が使えないときは売らない（Land・招待実績を1も動かさない）", () => {
+    for (const reason of ["panel_missing", "panel_disabled", "panel_archived", "panel_not_posted"]) {
+      const ctx = setup();
+      invite(ctx, REEVAL_INVITE_COUNT, `inv-${reason}`);
+      ctx.setIntakeUnavailable(reason);
+      const beforeLand = ctx.ledger.balanceOf(`user:${USER}`);
+
+      expect(codeOf(() => buy(ctx, "land", `land:${reason}`))).toBe("ERR_REEVAL_INTAKE_UNAVAILABLE");
+      expect(codeOf(() => buy(ctx, "invite", `invite:${reason}`))).toBe("ERR_REEVAL_INTAKE_UNAVAILABLE");
+      // 表示前のpreflightと同じ前提条件を通るので、確認画面の段階でも止まる
+      expect(codeOf(() => ctx.shop.checkReevaluationPurchase({ itemId: ctx.item.id, userId: USER, mode: "land" })))
+        .toBe("ERR_REEVAL_INTAKE_UNAVAILABLE");
+
+      expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(beforeLand);
+      expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_purchases").get()).toEqual({ n: 0 });
+      expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM shop_reeval_invite_uses").get()).toEqual({ n: 0 });
+      expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM invites WHERE inviter_id = ?").get(USER)).toEqual({
+        n: REEVAL_INVITE_COUNT,
+      });
+    }
+  });
+
+  it("A→B後・設定未設定でも、消費済みAは補償候補として出る", () => {
+    const ctx = setup();
+    const a = buy(ctx, "land", "A:1");
+    ctx.shop.consumePurchaseForService(a.id, STAFF, { result: "rejected" });
+
+    ctx.replaceSaleItem();
+    expect(ctx.shop.countCompensableReevaluationPurchases()).toBe(1);
+    expect(ctx.shop.listCompensableReevaluationPurchases().map((r) => r.id)).toEqual([a.id]);
+
+    ctx.clearSaleItem();
+    expect(ctx.shop.countCompensableReevaluationPurchases()).toBe(1);
+    expect(ctx.shop.listCompensableReevaluationPurchases().map((r) => r.id)).toEqual([a.id]);
+  });
+
+  it("A→B後の未消費Aは商館の手動配送キューへ出ない（list/count両方）", () => {
+    const ctx = setup();
+    buy(ctx, "land", "A:1");
+    ctx.replaceSaleItem();
+    // 現在の設定（B）だけを除外しても、旧Aが残ってはいけない。
+    const exclude = [ctx.shop.getItem(ctx.item.id)!.id + 1_000_000]; // 無関係なID
+    expect(ctx.shop.countPendingManual({ excludeItemIds: exclude })).toBe(0);
+    expect(ctx.shop.listPendingManual({ excludeItemIds: exclude })).toEqual([]);
+  });
+
+  it("普通の手動配送商品はキューへ出る（除外が広すぎない）", () => {
+    const ctx = setup();
+    const normal = ctx.shop.createItem(
+      { name: "手動配送の普通の商品", price_land: 10, kind: "one_shot", delivery: "manual" },
+      STAFF,
+    );
+    ctx.shop.purchase({ itemId: normal.id, userId: USER, actor: STAFF, memberRoleIds: [] });
+    expect(ctx.shop.countPendingManual()).toBe(1);
+    expect(ctx.shop.listPendingManual().map((r) => r.item_id)).toEqual([normal.id]);
   });
 });
 

@@ -245,6 +245,7 @@ export type ShopErrorCode =
   | "ERR_REEVAL_NOT_CONSUMED"
   | "ERR_REEVAL_ALREADY_COMPENSATED"
   | "ERR_REEVAL_COMPENSATION_UNAVAILABLE"
+  | "ERR_REEVAL_INTAKE_UNAVAILABLE"
   | "ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_EVAL_EXTENSION_ITEM_CONFIG"
   | "ERR_EVAL_EXTENSION_STATUS"
@@ -380,6 +381,15 @@ export interface ShopOptions {
   roleCheck?: (memberRoleIds: readonly string[], requireRoleId: string) => boolean;
   /** 設定済みの再評価商品。null の間は旧挙動を維持する。 */
   reevalItemId?: () => number | null;
+  /**
+   * 再評価**面談受付**が今すぐ使えるかを、Landや招待実績を動かす直前に確認する。
+   * 使えなければ throw する（`ERR_REEVAL_INTAKE_UNAVAILABLE` 相当）。
+   *
+   * UI側のpreflightだけでは足りない——表示してから確認ボタンを押すまでに受付panelが
+   * 停止される余地がある。purchase transactionの中から呼ぶことで、charge pathに
+   * preflightが1箇所しか無い状態を避ける。未注入なら受付確認は行われない（既存構成互換）。
+   */
+  assertReevaluationIntakeAvailable?: () => void;
   /** 設定済みのオリジナルロール新規作成商品。 */
   originalRoleItemId?: () => number | null;
   /** 専用購入の課金直前に、承認済みの本人申請か再確認する。 */
@@ -748,7 +758,9 @@ export class Shop {
     if (this.options.originalRoleItemId?.() === input.itemId) {
       throw new ShopError("ERR_ORIGINAL_ROLE_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
     }
-    if (this.options.reevalItemId?.() === input.itemId) {
+    // 現在の販売設定だけでなく、**一度でも再評価権として売られた商品**をgenericから守る。
+    // A→B差し替え後もAがenabledなら、旧Aがstorefrontの普通の商品として買われかねない。
+    if (this.isHistoricalReevaluationItem(input.itemId)) {
       throw new ShopError("ERR_REEVAL_SPECIAL_PURCHASE_REQUIRED", { itemId: input.itemId });
     }
     const item = this.getItem(input.itemId);
@@ -1321,6 +1333,126 @@ export class Shop {
   }
 
   /**
+   * 「このpurchaseは再評価サービス権として発行されたか」を、**購入時点で確定した記録だけ**から
+   * 判定するSQL述語。呼び出し側は `shop_purchases` を別名 `p` で束ねること。
+   *
+   * 利用者が買っているのは「商品ID #A」ではなく「再評価面談を1回受けて結果を出してもらう権利」
+   * なので、購入が成立した後は現在の商品設定をidentityに使わない。運営が商品を作り直しても、
+   * `shop:reeval_item_id` を変えても、商品をdisabledにしても、既に買った権利は消えない。
+   *
+   * 使ってよい証拠（いずれも購入時に確定し、後から書き換わらない専用記録）:
+   *   1. `shop_purchase_title_provenance.origin='reevaluation'` — 購入時に凍結されたorigin
+   *   2. `shop_reeval_invite_uses` — 再評価専用のinvite消費台帳
+   *   3. purchase-time delivery snapshot が `revoke_meirei` を証明する
+   *   4. 再評価専用writerがpurchase ID付きで残したappend-only event
+   *
+   * 使ってはいけないもの: 現在の `shop:reeval_item_id`、現在の商品名/description、金額だけ、
+   * invite5という数だけ、item IDの推測。これらは後から変更できるので、運営操作で過去の購入の
+   * 意味が変わってしまう。
+   */
+  private static readonly REEVALUATION_EVIDENCE_SQL = `COALESCE(
+       EXISTS (SELECT 1 FROM shop_purchase_title_provenance v
+                WHERE v.purchase_id = p.id AND v.origin = 'reevaluation')
+    OR EXISTS (SELECT 1 FROM shop_reeval_invite_uses u WHERE u.purchase_id = p.id)
+    OR COALESCE(json_extract(p.delivery_snapshot_json, '$.delivery_kind') = 'revoke_meirei', 0)
+    OR EXISTS (SELECT 1 FROM events e
+                WHERE e.type IN ('shop_reeval_right_purchased','reeval_legacy_purchase_recovery','reeval_legacy_rollback')
+                  AND json_extract(e.payload_json, '$.purchaseId') = p.id)
+  , 0)`;
+
+  /** 未消費（面談サービス未提供）の再評価権であることを表す条件。消費済みは delivered で表す。 */
+  private static readonly REEVALUATION_UNCONSUMED_SQL = `
+    p.status = 'active' AND p.delivered_at IS NULL
+    AND COALESCE(p.delivery_state, 'pending') <> 'delivered'`;
+
+  /**
+   * この購入は再評価サービス権として発行されたか。現在の商品設定は一切参照しない。
+   */
+  isReevaluationPurchase(purchaseId: number): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS ok FROM shop_purchases p
+          WHERE p.id = ? AND ${Shop.REEVALUATION_EVIDENCE_SQL} LIMIT 1`,
+      )
+      .get(purchaseId) as { ok: number } | undefined;
+    return row !== undefined;
+  }
+
+  /**
+   * userの**未消費**再評価権。ticketへ予約済みかどうかは問わない——予約中でも権利は
+   * まだ消費されていないので、重複購入のブロックにはこちらを使う。
+   */
+  findUnconsumedReevaluationRight(userId: string): { id: number } | null {
+    return (this.db
+      .prepare(
+        `SELECT p.id FROM shop_purchases p
+          WHERE p.user_id = ? AND ${Shop.REEVALUATION_UNCONSUMED_SQL}
+            AND ${Shop.REEVALUATION_EVIDENCE_SQL}
+          ORDER BY p.purchased_at, p.id LIMIT 1`,
+      )
+      .get(userId) as { id: number } | undefined) ?? null;
+  }
+
+  /**
+   * ticketへ新しく**予約**できる再評価権。未消費かつ、どのticketにも予約されていないもの。
+   * 「権利そのものがあるか」（上）と「今ticketへ予約できるか」（ここ）は別の問い。
+   */
+  findUnreservedReevaluationRight(userId: string): { id: number } | null {
+    return (this.db
+      .prepare(
+        `SELECT p.id FROM shop_purchases p
+          WHERE p.user_id = ? AND ${Shop.REEVALUATION_UNCONSUMED_SQL}
+            AND ${Shop.REEVALUATION_EVIDENCE_SQL}
+            AND NOT EXISTS (SELECT 1 FROM tickets t WHERE t.linked_purchase_id = p.id)
+          ORDER BY p.purchased_at, p.id LIMIT 1`,
+      )
+      .get(userId) as { id: number } | undefined) ?? null;
+  }
+
+  /**
+   * この商品は「再評価サービス商品」として一度でも販売実績があるか。
+   * 現在の販売設定から外れた旧商品Aを、generic storefrontへ落とさないための判定。
+   */
+  isHistoricalReevaluationItem(itemId: number): boolean {
+    if (this.options.reevalItemId?.() === itemId) return true;
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS ok FROM shop_purchases p
+          WHERE p.item_id = ? AND ${Shop.REEVALUATION_EVIDENCE_SQL} LIMIT 1`,
+      )
+      .get(itemId) as { ok: number } | undefined;
+    return row !== undefined;
+  }
+
+  /**
+   * 例外補償の候補——面談で消費済みで、まだ補償されていない再評価権。
+   * 現在の `shop:reeval_item_id` も現在の商品IDも要件にしない（A→B後・設定未設定でも出る）。
+   */
+  private static readonly REEVALUATION_COMPENSABLE_SQL = `
+    p.status = 'active' AND p.delivered_at IS NOT NULL AND p.delivery_state = 'delivered'
+    AND NOT EXISTS (SELECT 1 FROM shop_reeval_compensations c WHERE c.purchase_id = p.id)`;
+
+  listCompensableReevaluationPurchases(opts: { limit?: number; offset?: number } = {}): PurchaseRow[] {
+    return this.db
+      .prepare(
+        `SELECT p.* FROM shop_purchases p
+          WHERE ${Shop.REEVALUATION_COMPENSABLE_SQL} AND ${Shop.REEVALUATION_EVIDENCE_SQL}
+          ORDER BY p.delivered_at DESC, p.id DESC
+          LIMIT ? OFFSET ?`,
+      )
+      .all(opts.limit ?? 25, opts.offset ?? 0) as PurchaseRow[];
+  }
+
+  countCompensableReevaluationPurchases(): number {
+    return (this.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM shop_purchases p
+          WHERE ${Shop.REEVALUATION_COMPENSABLE_SQL} AND ${Shop.REEVALUATION_EVIDENCE_SQL}`,
+      )
+      .get() as { c: number }).c;
+  }
+
+  /**
    * 再評価権を購入する。資格確認、支払い、購入行、招待使用台帳を同じ IMMEDIATE transaction で確定する。
    */
   checkReevaluationPurchase(input: {
@@ -1342,21 +1474,18 @@ export class Shop {
     ) {
       throw new ShopError("ERR_REEVAL_ITEM_CONFIG", { itemId: input.itemId, configuredId });
     }
+    // 面談を受けられない状態なら新しい権利を売らない。UI表示前・chip返還retry・課金直前の
+    // すべてがこの1つの前提条件を通るので、charge pathにpreflightが1箇所しか無い状態にならない。
+    this.options.assertReevaluationIntakeAvailable?.();
     const soul = this.db.prepare("SELECT status FROM souls WHERE user_id = ?").get(input.userId) as
       | { status: string }
       | undefined;
     if (soul?.status !== "meirei") {
       throw new ShopError("ERR_REEVAL_STATUS", { userId: input.userId, status: soul?.status ?? null });
     }
-    const existing = this.db
-      .prepare(
-        `SELECT id FROM shop_purchases
-          WHERE item_id = ? AND user_id = ? AND status = 'active'
-            AND delivered_at IS NULL
-            AND COALESCE(delivery_state, 'pending') <> 'delivered'
-          ORDER BY id DESC LIMIT 1`,
-      )
-      .get(input.itemId, input.userId) as { id: number } | undefined;
+    // 商品IDではなく「未消費の再評価権を持っているか」で重複を判定する。旧商品Aの権利を
+    // 持ったまま新商品Bを買えてはいけない。予約中でも権利は未消費なので除外しない。
+    const existing = this.findUnconsumedReevaluationRight(input.userId);
     if (existing) throw new ShopError("ERR_REEVAL_RIGHT_EXISTS", { purchaseId: existing.id });
     const availableInvites = input.mode === "invite"
       ? (this.db
@@ -1391,6 +1520,9 @@ export class Shop {
     }
     const body = () => {
       // UIでの事前確認とは別に、支払い確定の直前にもDBの正本を再読する。
+      // 500,000Ld / 招待5件を動かす直前に、資格・重複・受付可用性をまとめて再確認する
+      // （`checkReevaluationPurchase` が受付可用性も見る）。表示から確認ボタンまでの間に
+      // panelが停止される余地があるため、UI側のpreflightだけに任せない。
       this.checkReevaluationPurchase({ itemId: input.itemId, userId: input.userId, mode: input.mode });
 
       let inviteIds: number[] = [];
@@ -1455,7 +1587,8 @@ export class Shop {
 
   /** 消費済み再評価権への例外補償。購入・結果・招待使用は一切巻き戻さない。 */
   compensateReevaluation(input: {
-    itemId: number;
+    /** @deprecated 権威ではない。semantic判定が正本——A→B後でもsetting未設定でも補償できる。 */
+    itemId?: number;
     purchaseId: number;
     departmentKey: string;
     amount: number;
@@ -1465,13 +1598,17 @@ export class Shop {
     idempotencyKey: string;
   }): ReevalCompensationRow {
     const departments = this.options.departments;
-    if (this.options.reevalItemId?.() !== input.itemId || !departments) {
-      throw new ShopError("ERR_REEVAL_COMPENSATION_UNAVAILABLE", { itemId: input.itemId });
+    if (!departments) {
+      throw new ShopError("ERR_REEVAL_COMPENSATION_UNAVAILABLE", { purchaseId: input.purchaseId });
     }
     const body = () => {
       const purchase = this.getPurchase(input.purchaseId);
-      if (!purchase || purchase.item_id !== input.itemId) {
+      if (!purchase) {
         throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+      }
+      // 現在の商品IDではなく、その購入が再評価権として発行されたかで判断する。
+      if (!this.isReevaluationPurchase(purchase.id)) {
+        throw new ShopError("ERR_REEVAL_COMPENSATION_UNAVAILABLE", { purchaseId: input.purchaseId });
       }
       if (purchase.status !== "active" || purchase.delivered_at === null || purchase.delivery_state !== "delivered") {
         throw new ShopError("ERR_REEVAL_NOT_CONSUMED", { purchaseId: input.purchaseId });
@@ -1889,6 +2026,12 @@ export class Shop {
    * 除外する商品IDは呼び出し側が決める。再評価チャレンジのように
    * 「配送する物が無く、専用フローが権利を消費する」商品を、ここへ混ぜないため。
    */
+  /**
+   * 手動配送待ちキュー。再評価権は「配送物」ではなく面談で消費するサービス権なので、
+   * `excludeItemIds`（現在の設定由来）だけでなくsemantic判定でも除外する——A→B差し替え後の
+   * 未消費Aが「終わらせる方法が無い仕事」としてキューに居座らないように。
+   * list と count の両方へ同じ除外を掛ける（表示だけ絞ってcountがズレる形にしない）。
+   */
   listPendingManual(
     opts: { excludeItemIds?: readonly number[]; limit?: number } = {},
   ): Array<PurchaseRow & { item_name: string }> {
@@ -1903,6 +2046,7 @@ export class Shop {
             AND p.delivery_snapshot_json IS NULL
             AND p.delivered_at IS NULL
             ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}
+            AND NOT ${Shop.REEVALUATION_EVIDENCE_SQL}
           ORDER BY p.purchased_at
           LIMIT ?`,
       )
@@ -1918,7 +2062,8 @@ export class Shop {
         `SELECT COUNT(*) AS c
            FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
           WHERE p.status = 'active' AND p.delivery_snapshot_json IS NULL AND p.delivered_at IS NULL
-            ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}`,
+            ${exclude.length > 0 ? `AND p.item_id NOT IN (${placeholders})` : ""}
+            AND NOT ${Shop.REEVALUATION_EVIDENCE_SQL}`,
       )
       .get(...exclude) as { c: number };
     return row.c;
