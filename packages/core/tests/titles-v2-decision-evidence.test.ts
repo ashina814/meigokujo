@@ -874,10 +874,19 @@ describe("F5c3 decision-evidence layer", () => {
     expect(failure.gaps.length).toBeGreaterThan(1);
     expect(failure.requiredSourceCount).toBeGreaterThanOrEqual(failure.gaps.length);
     expect(failure.gaps.some((g) => g.name === "casino_participations" && g.kind === "table")).toBe(true);
-    expect(failure.message).toMatch(/predates the required observation schema/);
+    // FACT — what a missing table actually proves, stated without a cause.
+    expect(failure.message).toMatch(/required observation schema is missing from this snapshot/);
     expect(failure.message).toMatch(/casino_participations/);
-    // it must say what to do, and must not suggest hand-creating the objects
-    expect(failure.message).toMatch(/rolled out to production/);
+    // POSSIBLE CAUSE — offered as one possibility among others, never asserted. The same SQLite
+    // shape also comes from a failed migration or the wrong database file, so a diagnostic that
+    // declared "this snapshot is old" would send an operator to verify the wrong thing.
+    expect(failure.message).toMatch(/may mean/);
+    expect(failure.message).toMatch(/not installed successfully/);
+    expect(failure.message).toMatch(/Verify the snapshot's capture time/);
+    // it must never state the age of the snapshot as established fact
+    expect(failure.message).not.toMatch(/predates the required observation schema/);
+    // ...and it must still say what NOT to do
+    expect(failure.message).toMatch(/Do not create the missing objects by hand/);
 
     // §4 privacy: schema identifiers only — never cohort membership.
     expect(failure.message).not.toContain("RESTRICTED_PREROLL_1");
@@ -912,14 +921,14 @@ describe("F5c3 decision-evidence layer", () => {
     expect(failure.message).toMatch(/required column `end_quality` is absent/);
   });
 
-  it("operator diagnostic: an UNEXPECTED database error keeps its cause and is never relabelled a rollout gap", () => {
+  it("operator diagnostic: an UNEXPECTED database error keeps its cause and is never relabelled a missing-schema gap", () => {
     // only the two "this snapshot lacks schema" shapes may be reclassified...
     expect(classifySnapshotSchemaGap("s", Object.assign(new Error("no such table: t"), { code: "SQLITE_ERROR" })))
       .toEqual({ source: "s", kind: "table", name: "t" });
     expect(classifySnapshotSchemaGap("s", Object.assign(new Error("no such column: c"), { code: "SQLITE_ERROR" })))
       .toEqual({ source: "s", kind: "column", name: "c" });
     // ...everything else must pass through untouched, or a real defect would be dismissed as
-    // "the observer was not deployed yet" and silently waited out.
+    // absent observation schema — something an operator might then wait out instead of fixing.
     for (const other of [
       Object.assign(new Error("database disk image is malformed"), { code: "SQLITE_CORRUPT" }),
       Object.assign(new Error("UNIQUE constraint failed: x.y"), { code: "SQLITE_CONSTRAINT" }),
@@ -939,7 +948,7 @@ describe("F5c3 decision-evidence layer", () => {
     const broken = path.join(dir, "not-a-db.sqlite");
     fs.writeFileSync(broken, "this is definitely not a sqlite database");
     // SQLite opens lazily, so the failure surfaces on first read — what matters is that it stays
-    // its own error and is never dressed up as a rollout-compatibility gap.
+    // its own error and is never dressed up as a missing-schema gap.
     let thrown: unknown;
     try {
       runF5cDecisionEvidence(openSnapshotReadOnly(broken), { cohortKey: "broken", subjectUserIds: ["x"], window: WINDOW }, false);

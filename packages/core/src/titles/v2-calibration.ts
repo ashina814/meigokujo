@@ -1839,8 +1839,14 @@ export interface CalibrationSnapshotSchemaGap {
 }
 
 /**
- * The snapshot is missing physical schema that a required source reads — normally because it was
- * captured before that observer reached production.
+ * The snapshot is missing physical schema that a required source reads.
+ *
+ * The error states that FACT and nothing more. `no such table` / `no such column` proves only that
+ * the object is absent from this database — it does not prove WHY. A snapshot captured before the
+ * observer rolled out produces exactly the same SQLite shape as an incomplete or failed migration,
+ * the wrong database file, a truncated snapshot, a schema regression, or an inconsistent rollout.
+ * Naming one of those as the cause would send an operator to verify the wrong thing, so possible
+ * causes are offered as possibilities and the operator is pointed at what to check.
  *
  * This is deliberately a distinct, fail-closed error rather than a degraded run: an absent table is
  * NOT "zero observations", and treating it as such would silently manufacture the exact false
@@ -1855,10 +1861,12 @@ export class CalibrationSnapshotSchemaError extends Error {
   constructor(gaps: readonly CalibrationSnapshotSchemaGap[], requiredSourceCount: number) {
     const lines = gaps.map((g) => `  source \`${g.source}\` — required ${g.kind} \`${g.name}\` is absent from this snapshot`);
     super(
-      `F5c collection refused: this snapshot predates the required observation schema.\n${lines.join("\n")}\n` +
+      `F5c collection refused: required observation schema is missing from this snapshot.\n${lines.join("\n")}\n` +
         `${gaps.length} of ${requiredSourceCount} required sources are unavailable. ` +
-        `Capture a snapshot taken after those observers were rolled out to production — ` +
-        `do not create the missing objects by hand, and do not migrate an analysis snapshot.`,
+        `This may mean the snapshot predates those observers' production rollout, or that the ` +
+        `expected schema was not installed successfully. Verify the snapshot's capture time, the ` +
+        `deployed version it was captured from, and the observer migration state. ` +
+        `Do not create the missing objects by hand, and do not migrate an analysis snapshot.`,
     );
     this.name = "CalibrationSnapshotSchemaError";
     this.gaps = gaps;
@@ -1876,7 +1884,7 @@ const SNAPSHOT_SCHEMA_GAP = /^no such (table|column):\s*(\S+)$/;
 export function classifySnapshotSchemaGap(source: string, error: unknown): CalibrationSnapshotSchemaGap | null {
   if (!(error instanceof Error)) return null;
   // When the driver reports a code at all, it must be SQLite's generic error — a constraint,
-  // corruption, or I/O failure must never be read as a rollout gap.
+  // corruption, or I/O failure must never be read as a missing-schema gap.
   const code = (error as { code?: unknown }).code;
   if (code !== undefined && code !== "SQLITE_ERROR") return null;
   const matched = SNAPSHOT_SCHEMA_GAP.exec(error.message.trim());
@@ -1895,8 +1903,8 @@ function collectCalibrationMeasurements(
   const cache = new TitleSourceCache();
   const packsBySubject = new Map(subjectUserIds.map((subjectUserId) => [subjectUserId, [] as PlanningCalibrationPackMeasurement[]]));
   const uniqueSources = [...new Set(probes.flatMap(({ sources }) => sources))].sort();
-  // Every required source is attempted before giving up, so an operator running against a
-  // pre-rollout snapshot is told about ALL of them at once instead of fixing one, re-running, and
+  // Every required source is attempted before giving up, so an operator whose snapshot is missing
+  // observation schema is told about ALL of them at once instead of fixing one, re-running, and
   // discovering the next. This is still fail-closed: nothing is measured and nothing is returned
   // when any source is unavailable — see `CalibrationSnapshotSchemaError`.
   const sourceReadCalls: { source: TitleUsableSourceKey; readCalls: number }[] = [];
@@ -1907,9 +1915,9 @@ function collectCalibrationMeasurements(
       sourceReadCalls.push({ source, readCalls: prefetched.readCalls });
     } catch (error) {
       const gap = classifySnapshotSchemaGap(source, error);
-      // An unexpected DB error is NOT a rollout-compatibility problem. Rethrowing it untouched
-      // keeps its cause and stack, so a genuine defect can never be mislabelled "observer not
-      // deployed" and quietly dismissed.
+      // An unexpected DB error is NOT a missing-schema problem. Rethrowing it untouched keeps its
+      // cause and stack, so a genuine defect can never be mislabelled as absent observation schema
+      // and quietly dismissed.
       if (gap === null) throw error;
       schemaFailures.push(gap);
     }
