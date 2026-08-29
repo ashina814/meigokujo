@@ -108,6 +108,20 @@ export function nicknameBlockReason(
   return null;
 }
 
+/**
+ * **Discord側に副作用が残る種別。** DB内部だけで完結する `extend_deadline` とは分ける。
+ *
+ * この種別は、投げる前に durable な claim を取ってからでないと実行しない。
+ * in-memory lock は再起動で消え、別プロセスにも効かず、Core側の writer（失効）も
+ * 止められないため、authority にはできない。
+ */
+const EXTERNAL_EFFECT_KINDS: ReadonlySet<string> = new Set([
+  "add_role",
+  "set_nickname",
+  "create_original_role",
+  "activate_sub_account",
+]);
+
 const purchaseLocks = new Map<number, Promise<unknown>>();
 
 /**
@@ -189,9 +203,88 @@ export async function deliverPurchaseUnlocked(
     return { state: "already_delivered", message: "この購入は配送済みです。" };
   }
 
-  const fail = (reason: string, userMessage: string, opts: { refundable?: boolean } = {}): DeliveryOutcome => {
+  /**
+   * 外部配送の durable な場所取り。**取れているあいだは返金も失効も通らない。**
+   * 取れなかった種別（DB内部で完結する配送）は null のまま。
+   */
+  let claimToken: string | null = null;
+
+  /**
+   * **外部APIへ一度でも投げたか。** 一度立ったら下がらない（sticky）。
+   *
+   * 投げたあとは、「副作用は無かった」と**再確認できるまで** claim を解放しない。
+   * 解放してしまうと、その場の `deliverOrRefund()` が返金を止めても、あとから来る
+   * 手動返金や失効は claim が無いので素通りする。
+   */
+  let effectMayHaveOccurred = false;
+
+  /** 外部APIを叩く直前に必ず呼ぶ。投げた事実を先に残す。 */
+  const markExternalAttempt = (): void => {
+    effectMayHaveOccurred = true;
+  };
+
+  const fail = (
+    reason: string,
+    userMessage: string,
+    opts: { refundable?: boolean; verifiedNoEffect?: boolean } = {},
+  ): DeliveryOutcome => {
+    // **解放してよいのは「副作用が無い」と証明できるときだけ。**
+    //   - 外部APIをまだ一度も投げていない（投げていないのだから副作用は無い）
+    //   - 投げたあとに、目的状態が成立していないことを実物で確認できた
+    // それ以外は uncertain。**付け忘れたら解放される fail-open にはしない。**
+    const canRelease = !effectMayHaveOccurred || opts.verifiedNoEffect === true;
+    let uncertain = false;
+    if (claimToken !== null) {
+      if (canRelease) {
+        services.shop.releaseExternalDelivery({ purchaseId: purchase.id, token: claimToken, reason, actor });
+      } else {
+        // 投げたが結果を確認できない。claim を消さない＝「失敗だった」と断定しない。
+        // 再起動を跨いで残し、収束処理と運営の目に触れさせる。
+        services.shop.markExternalDeliveryUncertain({ purchaseId: purchase.id, token: claimToken, reason, actor });
+        uncertain = true;
+      }
+      claimToken = null;
+    }
     services.shop.markDeliveryFailed(purchase.id, reason, actor);
-    return { state: "failed", message: userMessage, error: reason, refundable: opts.refundable };
+    return {
+      state: "failed",
+      message: userMessage,
+      error: reason,
+      // **claim の状態が authority。** `refundable` に claim state を決めさせない。
+      // 確認できていないものは絶対に自動返金へ回さない。
+      refundable: uncertain ? false : opts.refundable,
+    };
+  };
+
+  /**
+   * 外部の目的状態を確認したあとの確定。**戻り値を捨てない。**
+   *
+   * 確定できなかった＝そのあいだに purchase が動いた、ということなので
+   * 「Discordでは提供済みだがDBでは未確定」として人へ渡す。自動返金はしない。
+   */
+  const settle = (): boolean => {
+    if (claimToken === null) return services.shop.markDeliverySucceeded(purchase.id, actor);
+    const ok = services.shop.settleExternalDelivery({ purchaseId: purchase.id, token: claimToken, actor });
+    if (ok) claimToken = null;
+    return ok;
+  };
+
+  const unsettled = (userMessage: string): DeliveryOutcome => {
+    if (claimToken !== null) {
+      services.shop.markExternalDeliveryUncertain({
+        purchaseId: purchase.id,
+        token: claimToken,
+        reason: "settlement_conflict",
+        actor,
+      });
+      claimToken = null;
+    }
+    return {
+      state: "failed",
+      message: userMessage,
+      error: "delivery_settlement_conflict",
+      refundable: false,
+    };
   };
 
   const snapshot = parseDeliverySnapshot(purchase.delivery_snapshot_json);
@@ -214,6 +307,36 @@ export async function deliverPurchaseUnlocked(
   const data = snapshot.delivery_data as { role_id?: string; channel_id?: string; days?: number };
   const userId = purchase.user_id;
 
+  // **Discordを叩く前に durable な場所を取る。** 取れているあいだ、返金も失効も
+  // この購入を動かせない。取得と同じ transaction で active と未配送を確かめるので、
+  // 「確認したあとに返金された purchase へ投げる」が起きない。
+  if (EXTERNAL_EFFECT_KINDS.has(kind)) {
+    const claim = services.shop.claimExternalDelivery({ purchaseId: purchase.id, deliveryKind: kind, actor });
+    if (!claim.ok) {
+      if (claim.reason === "already_delivered") {
+        return { state: "already_delivered", message: "この購入は配送済みです。" };
+      }
+      if (claim.reason === "in_flight") {
+        // 別プロセス・別試行が投げている最中。**重ねて投げない。**
+        return {
+          state: "failed",
+          message: "この購入は現在処理中です。少し待ってからご確認ください。",
+          error: "delivery_already_in_flight",
+          refundable: false,
+        };
+      }
+      return {
+        state: "not_active",
+        message:
+          claim.status === "refunded"
+            ? "この購入は返金済みのため、何もしていません。"
+            : `この購入は ${claim.status ?? "対象外"} のため、何もしていません。`,
+        error: `purchase_not_active:${claim.status ?? "unknown"}`,
+      };
+    }
+    claimToken = claim.token;
+  }
+
   try {
     if (kind === "add_role") {
       const roleId = data.role_id;
@@ -224,14 +347,22 @@ export async function deliverPurchaseUnlocked(
       if (!member.roles.cache.has(roleId)) {
         // APIの返り値だけでは成功としない。エラー応答でも実際には付いている場合があるため、
         // mutation後にforce fetchしたDiscord実状態を正本にする。
+        markExternalAttempt();
         const addError = await member.roles.add(roleId).then(() => null).catch((e: Error) => e.message);
         member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
-        if (!member) return fail("member_final_fetch_failed", "ロール付与後の状態を確認できませんでした。自動で再試行します。");
+        if (!member) {
+          // **投げたあとに確認できていない。** 付いているかもしれない。
+          // ここで「失敗」と断定して返金すると、ロールは残ったまま払い戻すことになる。
+          return fail("member_final_fetch_failed", "ロール付与後の状態を確認できませんでした。運営が確認します。");
+        }
         if (!member.roles.cache.has(roleId)) {
-          return fail(`role_add_failed:${addError ?? "role_missing"}`, "ロールの付与に失敗しました。自動で再試行します。");
+          // 取り直した実物に**ロールが無いことを確認できた**。副作用は残っていない
+          return fail(`role_add_failed:${addError ?? "role_missing"}`, "ロールの付与に失敗しました。自動で再試行します。", {
+            verifiedNoEffect: true,
+          });
         }
       }
-      services.shop.markDeliverySucceeded(purchase.id, actor);
+      if (!settle()) return unsettled("ロールは付与済みですが、記録の確定ができませんでした。運営が確認します。");
       const destination = typeof data.channel_id === "string" && data.channel_id.trim()
         ? `\n利用先: <#${data.channel_id.trim()}>`
         : "";
@@ -275,7 +406,7 @@ export async function deliverPurchaseUnlocked(
       if (member.nickname === wanted) {
         // Discord だけ変わって落ちた場合もここに来る。確定させて終わらせる
         services.nicknames.commitRename(userId, key, actor);
-        services.shop.markDeliverySucceeded(purchase.id, actor);
+        if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
         return { state: "delivered", message: `サーバーニックネームは既に **${wanted}** です。` };
       }
       const blocked = nicknameBlockReason(guild, member);
@@ -283,6 +414,7 @@ export async function deliverPurchaseUnlocked(
         services.nicknames.abortRename(userId, key, actor);
         return fail(blocked.reason, blocked.message);
       }
+      markExternalAttempt();
       const setError = await member
         .setNickname(wanted, "公式ショップ: 名前変更")
         .then(() => null)
@@ -319,15 +451,20 @@ export async function deliverPurchaseUnlocked(
         // 通っていた、など。ここで確かめずに取り消すと「名前は変わったのに返金もした」に
         // なる。最新のメンバーを取り直し、希望どおりなら成功として扱う
         const latest = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
-        if (latest?.nickname !== wanted) {
+        if (!latest) {
+          // 送ったが確認できない。**仮押さえも旧名もそのまま**にして人へ渡す
+          return fail("nickname_final_fetch_failed", "名前の変更後の状態を確認できませんでした。運営が確認します。");
+        }
+        if (latest.nickname !== wanted) {
           // **仮押さえだけ解放する。旧名はそのまま。** 名乗っている名前は変わらない
           services.nicknames.abortRename(userId, key, actor);
-          return fail(`nickname_set_failed:${setError}`, "名前の変更に失敗しました。");
+          // 取り直した実物が希望の名前**では無いことを確認できた**。副作用は残っていない
+          return fail(`nickname_set_failed:${setError}`, "名前の変更に失敗しました。", { verifiedNoEffect: true });
         }
       }
       // ここで初めて旧名を手放す
       services.nicknames.commitRename(userId, key, actor);
-      services.shop.markDeliverySucceeded(purchase.id, actor);
+      if (!settle()) return unsettled("名前は変更済みですが、記録の確定ができませんでした。運営が確認します。");
       return { state: "delivered", message: `サーバーニックネームを **${wanted}** に変更しました。` };
     }
 
@@ -342,7 +479,7 @@ export async function deliverPurchaseUnlocked(
       // 落ちて再実行された場合、ロールは作れているのに契約が始まっていないことがある。
       // **作り直さない**（同じ名前のロールが増える）。作った記録があればそれを使う
       if (application.status === "active" && application.role_id) {
-        services.shop.markDeliverySucceeded(purchase.id, actor);
+        if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
         return { state: "delivered", message: `オリジナルロール <@&${application.role_id}> は作成済みです。` };
       }
       if (application.status !== "approved") {
@@ -369,50 +506,66 @@ export async function deliverPurchaseUnlocked(
         }
       }
 
+      // **ここから先は利用者の手元が変わる。** 以降の失敗は、戻せたと確認できるまで
+      // 「副作用は無かった」と言えない
+      markExternalAttempt();
       let added = await member.roles
         .add(role.id, "公式ショップ: オリジナルロール付与")
         .then(() => true)
         .catch((e: Error) => e.message || "unknown");
       if (added !== true) {
         // **エラーだけで決めない。** Discord側では通っていることがある。
-        // 取り直して実際に持っていれば、付与は成功として先へ進む
-        if (await memberHasRole(guild, userId, role.id)) added = true;
+        // 取り直した実物を3状態で見る——`present` / `absent` / `unknown`。
+        // 「確認できなかった」を「付いていない」に倒すと、実際には付いたまま
+        // 返金する経路が開く。
+        const presence = await memberHasRoleStrict(guild, userId, role.id);
+        if (presence === true) {
+          added = true; // 副作用は成立済み。成功側へ続ける
+        } else if (presence === null) {
+          // **確認できていない。** ロールは消さない（消せたかも確かめられない）
+          return fail(`role_add_unverified:${added}`, "ロールの付与を確認できませんでした。運営が確認します。");
+        }
       }
       if (added !== true) {
         // 付けられないロールを残さない（誰のものでもないロールが増える）。
         // 前回の続きで拾ったロールは消さずに残す——記録と結び付いているので、
         // 次の巡回が同じロールで付与だけをやり直せる
         if (createdNow) await role.delete("公式ショップ: 付与に失敗したため取り消し").catch(() => undefined);
-        return fail(`role_add_failed:${added}`, "ロールの付与に失敗しました。");
+        // ここへ来るのは presence === false のときだけ＝**本人が持っていないと確認済み**
+        return fail(`role_add_failed:${added}`, "ロールの付与に失敗しました。", { verifiedNoEffect: true });
       }
       if (!services.originalRoles.activate({ id: application.id, roleId: role.id, purchaseId: purchase.id, actor })) {
         const settled = services.originalRoles.get(application.id);
         // 相手が同じロールで契約を始めていたなら、これは成功の収束。何も戻さない
         if (settled?.status === "active" && settled.role_id === role.id) {
-          services.shop.markDeliverySucceeded(purchase.id, actor);
+          if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
           return { state: "delivered", message: `オリジナルロール <@&${role.id}> を作成しました。**30日間**ご利用いただけます。` };
         }
         // **返金する前に、今つけた副作用を戻す。** 返金だけして付与が残ると
         // 「払っていないのに持っている」になる。引き継いだ既存ロールは消さず、
         // 本人からの付与だけ外す（他の契約の持ち物かもしれない）
-        const removed = await member.roles
+        await member.roles
           .remove(role.id, "公式ショップ: 契約を開始できなかったため取り消し")
           .then(() => true)
           .catch(() => false);
-        // **外せたかどうかを実物で確かめる。** 外れていないまま返金すると
-        // 「払っていないのに持っている」が残る。確認できなければ返金しない
-        const stillHeld = removed ? await memberHasRole(guild, userId, role.id) : await memberHasRoleStrict(guild, userId, role.id);
+        // **`remove()` が解決しただけでは「外れた」と確定しない。**
+        // 応答が返っても実際には残っていることがあるし、取り直しに失敗すれば
+        // そもそも分からない。成功レスポンス + fetch 失敗を「戻せた」にしない。
+        const stillHeld = await memberHasRoleStrict(guild, userId, role.id);
         if (stillHeld !== false) {
+          // **戻せたか確認できていない。** claim は解放しない（`refundable` では決めない）
           return fail(
             "activate_conflict_rollback_failed",
             "契約の開始に失敗しました。運営が確認しますので、そのままお待ちください。",
-            { refundable: false },
           );
         }
         if (createdNow) await role.delete("公式ショップ: 二重実行のため取り消し").catch(() => undefined);
-        return fail("activate_conflict", "契約の開始に失敗しました。運営にお問い合わせください。");
+        // 本人がロールを持っていないことを**実物で確認できた**
+        return fail("activate_conflict", "契約の開始に失敗しました。運営にお問い合わせください。", {
+          verifiedNoEffect: true,
+        });
       }
-      services.shop.markDeliverySucceeded(purchase.id, actor);
+      if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
       return {
         state: "delivered",
         message: `オリジナルロール <@&${role.id}> を作成しました。**30日間**ご利用いただけます。`,
@@ -429,7 +582,7 @@ export async function deliverPurchaseUnlocked(
       if (application.main_user_id !== userId) return fail("application_owner_mismatch", "申請の持ち主が違います。");
       // 落ちて再実行された場合、ロールは付いているのに記録が終わっていないことがある
       if (application.status === "active") {
-        services.shop.markDeliverySucceeded(purchase.id, actor);
+        if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
         return { state: "delivered", message: `サブ垢 <@${application.alt_user_id}> は有効化済みです。` };
       }
       if (application.status !== "approved") {
@@ -467,17 +620,20 @@ export async function deliverPurchaseUnlocked(
         }
         baseline = services.subAccounts.saveActivationBaseline(application.id, current);
       }
+      // 階級ロールを付け外しする＝ここから先は外部副作用が起きうる
+      markExternalAttempt();
       const synced = await reconcileAltRank(services, guild, alt, userId, { baseline });
       if (!synced.ok) {
         // **変更を始めたあとの失敗は、開始前へ戻せた確認が取れるまで返金しない。**
         // 返金だけ通ると「払っていないのに階級ロールが残っている」が起きる
+        // **開始前へ戻せたと確認できたときだけ**「副作用なし」と言える
         const safeToRefund = synced.restored === true;
         return fail(
           `alt_rank_sync_failed:${synced.reason}${synced.restored === true ? "" : ":rollback_unconfirmed"}`,
           safeToRefund
             ? "サブ垢の階級を本体に合わせられなかったため有効化できませんでした。"
             : "サブ垢の階級を戻せたか確認できませんでした。運営が確認しますので、そのままお待ちください。",
-          { refundable: safeToRefund },
+          { refundable: safeToRefund, verifiedNoEffect: safeToRefund },
         );
       }
 
@@ -486,7 +642,7 @@ export async function deliverPurchaseUnlocked(
         const settled = services.subAccounts.get(application.id);
         // 相手が先に有効化していたなら、これは成功の収束
         if (settled?.status === "active") {
-          services.shop.markDeliverySucceeded(purchase.id, actor);
+          if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
           return { state: "delivered", message: `サブ垢 <@${application.alt_user_id}> を有効化しました。` };
         }
         // **返金の前に、階級ロールを処理開始前の状態へ戻す。**
@@ -494,15 +650,18 @@ export async function deliverPurchaseUnlocked(
         // 元からのロールを巻き添えで剥がさない
         const restored = await restoreAltRank(services, guild, alt, baseline);
         if (restored !== true) {
+          // **戻せたか確認できていない。** claim は解放しない
           return fail(
             "sub_account_conflict_rollback_failed",
             "サブ垢の有効化に失敗しました。運営が確認しますので、そのままお待ちください。",
-            { refundable: false },
           );
         }
-        return fail("sub_account_activate_conflict", "サブ垢の有効化に失敗しました。運営にお問い合わせください。");
+        // 開始前の状態へ戻せたことを確認できた
+        return fail("sub_account_activate_conflict", "サブ垢の有効化に失敗しました。運営にお問い合わせください。", {
+          verifiedNoEffect: true,
+        });
       }
-      services.shop.markDeliverySucceeded(purchase.id, actor);
+      if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
       return {
         state: "delivered",
         message: `サブ垢 <@${application.alt_user_id}> を有効化しました。階級は本体に合わせて自動で追従します。`,
@@ -661,11 +820,6 @@ async function resolveOriginalRole(
 }
 
 /** 本当に持っているか、取り直して確かめる。確認できなければ「持っていない」とは言わない */
-async function memberHasRole(guild: Guild, userId: string, roleId: string): Promise<boolean> {
-  const fresh = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
-  return fresh?.roles.cache.has(roleId) ?? false;
-}
-
 /**
  * 外れたかどうかを確かめる。**「確認できなかった」を「外れた」に倒さない。**
  * `null` は確認できなかった合図で、呼び出し側は返金を止める。

@@ -449,6 +449,91 @@ function markRoleRevocationRetryOnce(services: Services, purchaseId: number, err
  * 現在の商品設定ではなく購入時スナップショット由来のrole_idを使い、
  * 同じロールを正当に付与するactive購入があれば剥奪せず完了扱いにする。
  */
+let externalDeliveryRecoveryInFlight = false;
+
+/**
+ * 決着していない外部配送を収束させる。
+ *
+ * 再起動を跨いで残った claim（`in_flight` / `uncertain`）は、「Discordへ投げたが
+ * 結果が分からない」購入そのもの。**推測で返金も剥奪もしない。** Discordの実状態を
+ * force fetch で確かめ、利用者が契約した目的状態が成立しているなら配送済みへ収束させ、
+ * 成立していないなら claim だけ解放して通常の再試行へ戻す。
+ *
+ * **ロールは1つも剥がさない。** ここは「与えたかもしれないものを確認する」処理であって、
+ * 取り上げる処理ではない。別契約で同じロールを持っている場合もあるので、
+ * この購入が付けたと証明できないロールに触れてはいけない。
+ */
+export async function convergeExternalDeliveries(client: Client, services: Services): Promise<void> {
+  if (externalDeliveryRecoveryInFlight) return;
+  externalDeliveryRecoveryInFlight = true;
+  try {
+    const open = services.shop.listUnresolvedExternalDeliveries();
+    if (open.length === 0) return;
+    const guildId = services.settings.getString("guild:main");
+    if (!guildId) return;
+    const guild = await client.guilds.fetch(guildId).catch(() => null);
+    if (!guild) return;
+
+    for (const claim of open) {
+      // 収束できるのは add_role だけ。ほかの種別は「何が目的状態か」を外から
+      // 確かめる手段が無いので、運営が見る対象として残す。
+      if (claim.delivery_kind !== "add_role") continue;
+      const purchase = services.shop.getPurchase(claim.purchase_id);
+      if (!purchase) continue;
+
+      // **購入時の対象ロールだけを使う。** 現在の商品設定は見ない（Phase E）。
+      const target = services.shop.roleGrantTarget(purchase);
+      if (target.kind !== "proven") continue;
+      const roleId = target.roleId;
+
+      const member = await guild.members.fetch({ user: purchase.user_id, force: true }).catch(() => null);
+      if (!member) continue; // 確かめられない。claim は残したまま人へ
+
+      if (member.roles.cache.has(roleId)) {
+        // 利用者が契約した目的状態は成立している。配送済みへ収束させる。
+        // status が動いていれば settle は false を返す——その場合も claim は
+        // uncertain のまま残り、自動返金はされない。
+        if (
+          !services.shop.settleExternalDelivery({
+            purchaseId: claim.purchase_id,
+            token: claim.attempt_token,
+            actor: "system:shop-external-delivery",
+          })
+        ) {
+          services.shop.markExternalDeliveryUncertain({
+            purchaseId: claim.purchase_id,
+            token: claim.attempt_token,
+            reason: "role_present_but_purchase_not_active",
+            actor: "system:shop-external-delivery",
+          });
+        }
+        continue;
+      }
+
+      // ロールが無いことを確かめられた＝副作用は残っていない。
+      // まだ active なら claim を解放して通常の再試行へ戻す。**返金はしない。**
+      if (purchase.status === "active") {
+        services.shop.releaseExternalDelivery({
+          purchaseId: claim.purchase_id,
+          token: claim.attempt_token,
+          reason: "verified_no_effect",
+          actor: "system:shop-external-delivery",
+        });
+        continue;
+      }
+      // active でないのにロールも無い。剥がすものも与えるものも無いので解放してよい。
+      services.shop.releaseExternalDelivery({
+        purchaseId: claim.purchase_id,
+        token: claim.attempt_token,
+        reason: `verified_no_effect:${purchase.status}`,
+        actor: "system:shop-external-delivery",
+      });
+    }
+  } finally {
+    externalDeliveryRecoveryInFlight = false;
+  }
+}
+
 export async function processShopRoleRevocations(client: Client, services: Services): Promise<void> {
   if (shopRoleRevocationInFlight) return;
   shopRoleRevocationInFlight = true;

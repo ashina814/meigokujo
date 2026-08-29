@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
 import { Ledger, TREASURY } from "../ledger/service.js";
 import { EventLog } from "../events/service.js";
@@ -290,6 +290,29 @@ export interface FulfillmentProvenanceRow {
 }
 
 /** 在庫を戻した記録。purchase_idが主キーなので二度戻らない。 */
+/**
+ * 外部（Discord）へ副作用を投げているあいだの durable な場所取り。
+ *
+ * `in_flight` / `uncertain` のあいだは、返金も失効もこの購入を動かせない。
+ * `uncertain` は「投げたが結果を確認できていない」——**推測で返金も剥奪もしない**ため、
+ * 解決するまで生き続ける。
+ */
+export type ExternalDeliveryState = "in_flight" | "settled" | "released" | "uncertain";
+
+export interface ExternalDeliveryAttemptRow {
+  purchase_id: number;
+  attempt_token: string;
+  delivery_kind: string;
+  state: ExternalDeliveryState;
+  started_at: number;
+  updated_at: number;
+  detail: string | null;
+}
+
+export type ExternalDeliveryClaim =
+  | { ok: true; token: string }
+  | { ok: false; reason: "not_active" | "already_delivered" | "in_flight" | "not_found"; status?: PurchaseStatus };
+
 export interface StockRestorationSettlementRow {
   purchase_id: number;
   item_id: number;
@@ -370,6 +393,7 @@ export type ShopErrorCode =
   | "ERR_STOCK_RECONCILIATION_NOT_APPLICABLE"
   | "ERR_STOCK_CHANGE_REQUIRES_API"
   | "ERR_STOCK_VALUE_INVALID"
+  | "ERR_DELIVERY_IN_FLIGHT"
   | "ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_EVAL_EXTENSION_ITEM_CONFIG"
   | "ERR_EVAL_EXTENSION_STATUS"
@@ -565,6 +589,9 @@ function resolveStockForMode(
   if (requestedStock === null) return null;
   return mode === "add_restorations" ? requestedStock + pendingQuantity : requestedStock;
 }
+
+/** 外部配送の確定が競合したときの内部シグナル。transaction を巻き戻すためだけに使う。 */
+class SettlementConflict extends Error {}
 
 const now = () => Math.floor(Date.now() / 1000);
 const DAY = 86_400;
@@ -2547,6 +2574,15 @@ export class Shop {
       if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
       if (purchase.status === "refunded") return { refunded: false, amount: purchase.paid_land ?? 0 };
       if (purchase.status !== "active") throw new ShopError("ERR_NOT_ACTIVE", { status: purchase.status });
+      // **外部へ副作用を投げている最中は返金しない。**
+      //
+      // いま Discord 側でロールが付きつつある購入を返金すると、「返金済みなのに
+      // ロールだけ残る」が成立する。DBの条件付き更新は書き込みの二重化までしか
+      // 止められないので、外部副作用そのものを durable な claim で表す。
+      // 資産も status も1つも動かさずに止める。
+      if (this.externalDeliveryInFlight(purchaseId)) {
+        throw new ShopError("ERR_DELIVERY_IN_FLIGHT", { purchaseId });
+      }
       // 提供済みのものは返さない（ニックネームが変わったのに返金する、を防ぐ）。
       //
       // **根拠は強い証拠だけ。** 旧行の `delivery_state='delivered'` は移行時の既定値の
@@ -2812,6 +2848,161 @@ export class Shop {
       };
     };
     return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+
+  // ── 外部配送の durable claim ────────────────────────────────────────────────
+
+  /** いま生きている claim（`in_flight` / `uncertain`）。無ければ undefined。 */
+  externalDeliveryClaim(purchaseId: number): ExternalDeliveryAttemptRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM shop_external_delivery_attempts
+          WHERE purchase_id = ? AND state IN ('in_flight','uncertain')`,
+      )
+      .get(purchaseId) as ExternalDeliveryAttemptRow | undefined;
+  }
+
+  /** 外部配送が進行中で、status を動かしてはいけない購入か。 */
+  externalDeliveryInFlight(purchaseId: number): boolean {
+    return this.externalDeliveryClaim(purchaseId) !== undefined;
+  }
+
+  /**
+   * Discord へ副作用を投げる**前に**、durable に場所を取る。
+   *
+   * 取れた purchase は、解決するまで返金も失効も通らない。取得と同じ transaction で
+   * `active` と未配送を確かめるので、「確認したあとに返金された purchase へ投げる」が
+   * 起きない。同時に生きている claim は部分ユニーク索引がDB側で1つに縛る。
+   */
+  claimExternalDelivery(input: { purchaseId: number; deliveryKind: string; actor: string }): ExternalDeliveryClaim {
+    const body = (): ExternalDeliveryClaim => {
+      const row = this.db
+        .prepare("SELECT status, delivery_state FROM shop_purchases WHERE id = ?")
+        .get(input.purchaseId) as { status: PurchaseStatus; delivery_state: DeliveryState | null } | undefined;
+      if (!row) return { ok: false, reason: "not_found" };
+      if (row.delivery_state === "delivered") return { ok: false, reason: "already_delivered", status: row.status };
+      if (row.status !== "active") return { ok: false, reason: "not_active", status: row.status };
+      if (this.externalDeliveryClaim(input.purchaseId)) return { ok: false, reason: "in_flight", status: row.status };
+
+      const token = randomBytes(12).toString("base64url");
+      const ts = now();
+      this.db
+        .prepare(
+          `INSERT INTO shop_external_delivery_attempts
+             (purchase_id, attempt_token, delivery_kind, state, started_at, updated_at, detail)
+           VALUES (?,?,?, 'in_flight', ?, ?, NULL)`,
+        )
+        .run(input.purchaseId, token, input.deliveryKind, ts, ts);
+      this.events.log("shop_external_delivery_claimed", {
+        actor: input.actor,
+        payload: { purchaseId: input.purchaseId, deliveryKind: input.deliveryKind },
+      });
+      return { ok: true, token };
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /**
+   * 外部の目的状態を確認できたので、配送済みまで**同じ transaction で**確定する。
+   *
+   * `active` かつ claim が一致することを書き込みと同じ文で確かめる。合わなければ
+   * 1つも書かずに false を返す。**呼び出し側は false を無視してはいけない**——
+   * 無視すると「Discordでは提供済みなのにDBでは未確定」を成功として流してしまう。
+   */
+  settleExternalDelivery(input: { purchaseId: number; token: string; actor: string }): boolean {
+    const body = (): boolean => {
+      const claimed = this.db
+        .prepare(
+          `UPDATE shop_external_delivery_attempts
+              SET state = 'settled', updated_at = ?
+            WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+        )
+        .run(now(), input.purchaseId, input.token).changes;
+      if (claimed !== 1) return false;
+      // status が動いていれば delivered にはしない（返金済みへ配送済みを書かない）。
+      //
+      // **claim も一緒に巻き戻す。** ここで claim だけ settled のまま残すと、
+      // 「Discordにはロールが有るのに、返金も失効も素通りする」購入ができてしまう。
+      // better-sqlite3 は false を返しただけでは巻き戻さないので、投げて戻す。
+      if (!this.markDeliverySucceeded(input.purchaseId, input.actor)) throw new SettlementConflict();
+      return true;
+    };
+    try {
+      return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+    } catch (error) {
+      if (error instanceof SettlementConflict) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * 副作用が起きていないと**確認できた**ので claim を解放する。ここまで来て初めて
+   * 「失敗だった」と言える＝返金してよい。
+   */
+  releaseExternalDelivery(input: { purchaseId: number; token: string; reason: string; actor: string }): boolean {
+    const body = (): boolean => {
+      const changed = this.db
+        .prepare(
+          `UPDATE shop_external_delivery_attempts
+              SET state = 'released', updated_at = ?, detail = ?
+            WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+        )
+        .run(now(), input.reason.slice(0, 500), input.purchaseId, input.token).changes;
+      if (changed !== 1) return false;
+      this.events.log("shop_external_delivery_released", {
+        actor: input.actor,
+        payload: { purchaseId: input.purchaseId, reason: input.reason.slice(0, 200) },
+      });
+      return true;
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /**
+   * 投げたが結果を確認できない。**claim を消さない。**
+   *
+   * ここで解放すると「失敗だった」と断定したことになり、実際には提供済みなのに
+   * 返金する経路が開く。再起動を跨いで残し、収束処理と運営の目に触れさせる。
+   */
+  markExternalDeliveryUncertain(input: { purchaseId: number; token: string; reason: string; actor: string }): boolean {
+    const body = (): boolean => {
+      const changed = this.db
+        .prepare(
+          `UPDATE shop_external_delivery_attempts
+              SET state = 'uncertain', updated_at = ?, detail = ?
+            WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+        )
+        .run(now(), input.reason.slice(0, 500), input.purchaseId, input.token).changes;
+      if (changed !== 1) return false;
+      this.events.log("shop_external_delivery_uncertain", {
+        actor: input.actor,
+        payload: { purchaseId: input.purchaseId, reason: input.reason.slice(0, 200) },
+      });
+      return true;
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /** 決着していない外部配送。再起動後の収束と、運営画面の両方から使う。 */
+  listUnresolvedExternalDeliveries(limit = 50): Array<ExternalDeliveryAttemptRow & { user_id: string; status: PurchaseStatus }> {
+    return this.db
+      .prepare(
+        `SELECT a.*, p.user_id, p.status
+           FROM shop_external_delivery_attempts a
+           JOIN shop_purchases p ON p.id = a.purchase_id
+          WHERE a.state IN ('in_flight','uncertain')
+          ORDER BY a.started_at ASC
+          LIMIT ?`,
+      )
+      .all(limit) as Array<ExternalDeliveryAttemptRow & { user_id: string; status: PurchaseStatus }>;
+  }
+
+  countUnresolvedExternalDeliveries(): number {
+    return this.db
+      .prepare("SELECT COUNT(*) FROM shop_external_delivery_attempts WHERE state IN ('in_flight','uncertain')")
+      .pluck()
+      .get() as number;
   }
 
   /** 始末の記録。無ければまだ始末していない。 */
@@ -3634,10 +3825,19 @@ export class Shop {
     purchaseId: number,
     actor: string,
     observedNow: number = now(),
-  ): { expired: boolean; reason: "expired" | "not_active" | "not_due" | "not_found" } {
-    const run = (): { expired: boolean; reason: "expired" | "not_active" | "not_due" | "not_found" } => {
+  ): { expired: boolean; reason: "expired" | "not_active" | "not_due" | "not_found" | "delivery_in_flight" } {
+    const run = (): {
+      expired: boolean;
+      reason: "expired" | "not_active" | "not_due" | "not_found" | "delivery_in_flight";
+    } => {
       const before = this.getPurchase(purchaseId);
       if (!before) return { expired: false, reason: "not_found" };
+      // **配送中は失効させない。** 期限が来ていても、いま外部へ投げている最中に
+      // expired へ落とすと「失効済みなのにロールだけ付く」が成立する。claim が
+      // 解決してから、次の巡回で通常どおり判断し直す（status は動かさない）。
+      if (this.externalDeliveryInFlight(purchaseId)) {
+        return { expired: false, reason: "delivery_in_flight" };
+      }
 
       const changed = this.db
         .prepare(

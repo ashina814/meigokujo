@@ -33,6 +33,7 @@ import {
   convergePendingOriginalRoles,
   convergePendingSubAccounts,
   expireOverduePurchases,
+  convergeExternalDeliveries,
   processShopRoleRevocations,
   recoverAutoDropNoEvalGhosts,
 } from "./scheduler-recovery.js";
@@ -427,6 +428,13 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     } catch (e) {
       console.error("[サブ垢] 巡回失敗:", e);
     }
+
+    // 決着していない外部配送（Discordへ投げたが結果が分からない）を毎分収束させる。
+    // **剥奪より先に走らせる。** claim が生きているあいだは失効も返金も通らないので、
+    // 先に決着をつけないと剥奪側が判断できない。
+    await convergeExternalDeliveries(client, services).catch((e) =>
+      console.error("[ショップ] 外部配送の収束失敗:", e),
+    );
 
     // 失効購入のロール剥奪は失効処理と分離し、購入ID単位で毎分自己修復する。
     await processShopRoleRevocations(client, services).catch((e) =>

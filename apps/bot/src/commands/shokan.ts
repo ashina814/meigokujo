@@ -99,10 +99,12 @@ function failedAuto(services: Services): Array<PurchaseRow & { item_name: string
 }
 
 /** 残件数。**表示上限で数えない**（11件目以降も正しく出す） */
-function queueCounts(services: Services): { pending: number; failed: number; legacy: number } {
+function queueCounts(services: Services): { pending: number; failed: number; legacy: number; stuck: number } {
   return {
     pending: services.shop.countPendingManual(),
     failed: services.shop.countUndeliveredAuto(),
+    // 外部（Discord）へ投げたが結果が分からない購入。**自動では返金していない**
+    stuck: services.shop.countUnresolvedExternalDeliveries(),
     // 購入時の提供方式が分からない旧購入と、方式は分かるが結末が分からない旧購入。
     // どちらも仕事として数えるが、要対応とは別枠にする。
     legacy: services.shop.countLegacyUnknownFulfillment() + services.shop.countLegacyAutoOutcomeUnknown(),
@@ -134,7 +136,7 @@ function fmtJstDate(unixSec: number): string {
  * 個人ごとの情報は載せない（押した後の ephemeral で出す）ので、そのまま設置できる。
  */
 export function shopAdminPanelMessage(services: Services): MessageCreateOptions {
-  const { pending, failed, legacy } = queueCounts(services);
+  const { pending, failed, legacy, stuck } = queueCounts(services);
   const embed = new EmbedBuilder()
     .setTitle("🛠 冥界商館 管理")
     .setColor(pending + failed > 0 ? 0xdc2626 : 0x64748b)
@@ -144,6 +146,9 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
           ? `**残っている仕事: 要対応 ${pending}件 / 処理失敗 ${failed}件**`
           : "残っている仕事はありません。",
         legacy > 0 ? `**要確認（旧購入） ${legacy}件** — 購入時の提供方式を自動判定できません。` : "",
+        stuck > 0
+          ? `**確認待ちの配送 ${stuck}件** — 外部の状態を確認できていないため、自動返金していません。`
+          : "",
         services.originalRoles.countByStatus("pending") > 0
           ? `**旧方式オリジナルロール ${services.originalRoles.countByStatus("pending")}件** がカルテ移行待ちです。`
           : "",
@@ -186,6 +191,11 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
       .setCustomId("shokan:reeval-comp")
       .setLabel("再評価の例外補償")
       .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("shokan:stuck-delivery")
+      .setLabel(stuck > 0 ? `確認待ちの配送 ${stuck}` : "確認待ちの配送")
+      .setEmoji("🛰")
+      .setStyle(stuck > 0 ? ButtonStyle.Danger : ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId("shokan:legacy-unknown")
       .setLabel(legacy > 0 ? `要確認（旧購入） ${legacy}` : "要確認（旧購入）")
@@ -576,6 +586,61 @@ async function applyStockFix(
   }
 }
 
+/**
+ * 決着していない外部配送の一覧。
+ *
+ * **内部のtokenや状態名は出さない。** 運営が知りたいのは「誰の何が、いつから
+ * 宙ぶらりんで、なぜ自動返金されていないのか」だけ。危険なワンクリック操作は置かない。
+ */
+function renderStuckDeliveries(services: Services) {
+  const rows = services.shop.listUnresolvedExternalDeliveries(QUEUE_DISPLAY);
+  const total = services.shop.countUnresolvedExternalDeliveries();
+  const embed = new EmbedBuilder()
+    .setTitle("🛰 確認待ちの配送")
+    .setColor(total > 0 ? 0xdc2626 : 0x64748b)
+    .setDescription(
+      total === 0
+        ? "確認待ちの配送はありません。"
+        : [
+            "**外部（Discord）の状態を確認できていないため、自動返金していません。**",
+            "提供済みなのに返金する／未提供なのに提供済みにする、のどちらも避けています。",
+            "",
+            "-# ロールが付いているかを確認できれば、次の巡回で自動的に決着します。",
+          ].join("\n"),
+    );
+  for (const row of rows) {
+    embed.addFields({
+      name: `購入 #${row.purchase_id} — ${deliveryKindLabel(row.delivery_kind)}`,
+      value: [
+        `利用者: <@${row.user_id}>`,
+        `購入の状態: ${purchaseStatusLabel(row.status)}`,
+        `未確定になってから: ${fmtJstDate(row.started_at)} から`,
+      ].join("\n"),
+      inline: false,
+    });
+  }
+  return {
+    embeds: [embed],
+    components: [backButton()],
+    ...(total > rows.length ? { content: `ほか ${total - rows.length}件` } : {}),
+  };
+}
+
+function deliveryKindLabel(kind: string): string {
+  if (kind === "add_role") return "ロール付与";
+  if (kind === "set_nickname") return "名前の変更";
+  if (kind === "create_original_role") return "オリジナルロール作成";
+  if (kind === "activate_sub_account") return "サブ垢の有効化";
+  return kind;
+}
+
+function purchaseStatusLabel(status: string): string {
+  if (status === "active") return "有効";
+  if (status === "refunded") return "返金済み";
+  if (status === "expired") return "期限切れ";
+  return status;
+}
+
 export async function handleShokanButton(interaction: ButtonInteraction, services: Services): Promise<void> {
   if (!canOperate(interaction, services)) {
     await interaction.reply({ content: "権限がありません。", flags: MessageFlags.Ephemeral });
@@ -621,6 +686,7 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   if (action === "pending") return void (await show(renderPending(services) as never));
   if (action === "failed") return void (await show(renderFailed(services) as never));
   if (action === "legacy-unknown") return void (await show(renderLegacyUnknown(services) as never));
+  if (action === "stuck-delivery") return void (await show(renderStuckDeliveries(services) as never));
   if (action === "list") return void (await show(renderList(services) as never));
   if (action === "history") return void (await show(renderHistory(services, Math.max(0, Number(arg ?? 0))) as never));
   if (action === "reeval-comp") {
