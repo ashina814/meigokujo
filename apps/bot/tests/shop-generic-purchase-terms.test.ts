@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Collection } from "discord.js";
 import { EventLog, Ledger, OriginalRoles, Settings, Shop, Tickets, openDb, registerDefaultTxTypes } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
+import { setStock } from "./helpers/set-stock.js";
 
 /**
  * 購入画面で見せた条件のまま買えること、そして見せていない条件では買えないこと。
@@ -325,7 +326,7 @@ describe("返還だけ済んだ状態（取り残し）からの再試行", () =
     const ctx = setup();
     // 在庫は契約(identity)に含まれないので、在庫だけ切らせば**契約は同じまま**購入だけ失敗する。
     // これが「返還は成功・購入は失敗」の取り残しを作る。
-    ctx.shop.updateItem(ctx.item.id, { stock: 0 } as never, "staff");
+    setStock(ctx.shop, ctx.item.id, 0);
     const world = chipWorld(ctx, ctx.item.id);
     const t1 = token(ctx, ctx.item.id);
 
@@ -365,7 +366,7 @@ describe("返還だけ済んだ状態（取り残し）からの再試行", () =
     // 言い切ると、実際には返還済みだった場合に嘘になる。
     const { handleShopButton } = await shopPanelModule;
     const ctx = setup();
-    ctx.shop.updateItem(ctx.item.id, { stock: 0 } as never, "staff");
+    setStock(ctx.shop, ctx.item.id, 0);
     const world = chipWorld(ctx, ctx.item.id);
     const t1 = token(ctx, ctx.item.id);
 

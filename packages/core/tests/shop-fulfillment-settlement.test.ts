@@ -11,6 +11,7 @@ import {
   openDb,
   registerDefaultTxTypes,
 } from "../src/index.js";
+import { setStock } from "./helpers/set-stock.js";
 
 registerDefaultTxTypes();
 const USER = "555555555555555555";
@@ -446,7 +447,7 @@ describe("現在の在庫設定を過去の事実の根拠にしない", () => {
     expect(ctx.shop.fulfillmentProvenance(purchase.id)!.stock_consumed).toBe(1);
 
     // 運営が無制限販売へ切り替えた
-    ctx.shop.updateItem(item.id, { stock: null } as never, STAFF);
+    setStock(ctx.shop, item.id, null, STAFF);
 
     ctx.shop.refund(purchase.id, "配送できなかった", STAFF);
 
@@ -466,7 +467,7 @@ describe("現在の在庫設定を過去の事実の根拠にしない", () => {
     expect(ctx.shop.fulfillmentProvenance(purchase.id)!.stock_consumed).toBe(0);
 
     // 運営があとから有限在庫にした
-    ctx.shop.updateItem(item.id, { stock: 10 } as never, STAFF);
+    setStock(ctx.shop, item.id, 10, STAFF);
 
     ctx.shop.refund(purchase.id, "配送できなかった", STAFF);
 

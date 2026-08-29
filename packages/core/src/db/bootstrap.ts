@@ -991,6 +991,36 @@ BEFORE DELETE ON shop_purchase_fulfillment_provenance
 BEGIN
   SELECT RAISE(ABORT, 'shop purchase fulfillment provenance is append-only');
 END;
+-- Phase F: 「戻すべきだった在庫」(applied=0) をどう始末したかの台帳。
+--
+-- shop_purchase_stock_restorations は返金時点の事実なので append-only のまま触らない
+-- （applied=0 を 1 へ書き換えない）。始末は別の事実として、こちらへ1行だけ足す。
+--
+-- disposition
+--   applied  … 運営が入力した数に返金分を上乗せした（実際に在庫が増えた）
+--   absorbed … 運営が入力した数を「最終販売可能数」として確定し、その中に含めた
+--
+-- purchase_id が主キーなので、**同じ返金義務を二度始末できない**。
+CREATE TABLE IF NOT EXISTS shop_stock_restoration_settlements (
+  purchase_id  INTEGER PRIMARY KEY REFERENCES shop_purchase_stock_restorations(purchase_id),
+  item_id      INTEGER NOT NULL,
+  quantity     INTEGER NOT NULL CHECK (quantity > 0),
+  disposition  TEXT NOT NULL CHECK (disposition IN ('applied','absorbed')),
+  settled_at   INTEGER NOT NULL,
+  actor_id     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shop_stock_restoration_settlements_item
+  ON shop_stock_restoration_settlements(item_id, purchase_id);
+CREATE TRIGGER IF NOT EXISTS trg_shop_stock_restoration_settlements_no_update
+BEFORE UPDATE ON shop_stock_restoration_settlements
+BEGIN
+  SELECT RAISE(ABORT, 'shop stock restoration settlement ledger is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_stock_restoration_settlements_no_delete
+BEFORE DELETE ON shop_stock_restoration_settlements
+BEGIN
+  SELECT RAISE(ABORT, 'shop stock restoration settlement ledger is append-only');
+END;
 CREATE TRIGGER IF NOT EXISTS trg_shop_purchase_stock_restorations_no_update
 BEFORE UPDATE ON shop_purchase_stock_restorations
 BEGIN

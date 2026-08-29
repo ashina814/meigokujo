@@ -419,6 +419,7 @@ function renderItem(item: ShopItemRow, services: Services) {
       { name: "期間", value: item.duration_days ? `${item.duration_days}日間` : "単発", inline: true },
       { name: "階級要件", value: requirementLabel(services.settings, item.require_role_id), inline: true },
       { name: "配送", value: item.delivery === "auto" ? "自動" : "手動（スタッフ対応）", inline: true },
+      { name: "在庫", value: stockLabel(item, services), inline: true },
       {
         name: "状態",
         value: item.enabled ? "🟢 販売中" : services.shop.isSalesLocked(item) ? "🔒 移行待ち（再開不可）" : "⚫ 停止中",
@@ -428,6 +429,7 @@ function renderItem(item: ShopItemRow, services: Services) {
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`shokan:edit-basic:${item.id}`).setLabel("名前・価格・説明").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`shokan:edit-role:${item.id}`).setLabel("階級要件").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`shokan:edit-stock:${item.id}`).setLabel("在庫").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`shokan:toggle:${item.id}`)
       .setLabel(item.enabled ? "販売を止める" : services.shop.isSalesLocked(item) ? "移行待ち" : "販売する")
@@ -446,6 +448,126 @@ export async function handleShokanCommand(interaction: ChatInputCommandInteracti
     return;
   }
   await interaction.reply({ ...shopAdminPanelMessage(services), flags: MessageFlags.Ephemeral });
+}
+
+/**
+ * 在庫の表示。**未処理の返金在庫があるなら必ず一緒に出す。**
+ * 数字だけ見せると、有限へ戻すときに何が起きるか運営が判断できない。
+ */
+function stockLabel(item: ShopItemRow, services: Services): string {
+  const pending = services.shop.pendingStockRestorations(item.id);
+  const base = item.stock === null ? "無制限" : `${item.stock}個`;
+  return pending.quantity > 0 ? `${base}\n未処理の返金在庫: ${pending.quantity}個` : base;
+}
+
+function stockModal(id: number, item: ShopItemRow): ModalBuilder {
+  return new ModalBuilder()
+    .setCustomId(`shokan:edit-stock:${id}`)
+    .setTitle(`#${id} 在庫`)
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("stock")
+          .setLabel("在庫数（空欄で無制限）")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setValue(item.stock === null ? "" : String(item.stock)),
+      ),
+    );
+}
+
+/**
+ * 有限へ戻すとき、未処理の返金在庫をどう扱うかを**運営に選ばせる**。
+ * 黙って上乗せもしないし、黙って握りつぶしもしない。
+ */
+function stockReconciliationPrompt(quote: ReturnType<Services["shop"]["quoteStockChange"]>, itemName: string) {
+  const n = quote.requestedStock ?? 0;
+  const x = quote.pending.quantity;
+  const embed = new EmbedBuilder()
+    .setTitle("未処理の返金在庫があります")
+    .setColor(0xf59e0b)
+    .setDescription(
+      [
+        `**${itemName}** は現在 無制限 で、返金で戻すはずだった在庫が **${x}個** 残っています。`,
+        `入力した **${n}** の意味を選んでください。`,
+      ].join("\n"),
+    )
+    .addFields(
+      { name: "入力値を最終在庫にする", value: `販売可能数は **${n}個**（返金分${x}個はこの中に含める）`, inline: false },
+      { name: "返金分を上乗せする", value: `販売可能数は **${n + x}個**（${n} + 返金分${x}）`, inline: false },
+    );
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`shokan:stock-fix:final_stock:${quote.itemId}:${n}:${quote.tokens.final_stock}`)
+      .setLabel(`最終在庫 ${n}個にする`)
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`shokan:stock-fix:add_restorations:${quote.itemId}:${n}:${quote.tokens.add_restorations}`)
+      .setLabel(`${n} + ${x} = ${n + x}個にする`)
+      .setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row], flags: MessageFlags.Ephemeral };
+}
+
+async function applyStockChangeFromModal(
+  interaction: ModalSubmitInteraction,
+  services: Services,
+  itemId: number,
+  requestedStock: number | null,
+  token: string,
+): Promise<void> {
+  try {
+    const result = services.shop.applyStockChange({
+      itemId,
+      requestedStock,
+      reconciliationMode: "none",
+      expectedToken: token,
+      actor: `user:${interaction.user.id}`,
+    });
+    await interaction.reply({
+      content: `✅ 商品 #${itemId} の在庫を **${result.newStock === null ? "無制限" : `${result.newStock}個`}** にしました。`,
+      flags: MessageFlags.Ephemeral,
+    });
+  } catch (error) {
+    const code = error instanceof ShopError ? error.code : undefined;
+    await interaction.reply({
+      content: code === "ERR_STOCK_TERMS_CHANGED" ? STOCK_STALE_MESSAGE : `⚠️ 在庫を変更できませんでした（${code ?? "不明なエラー"}）。`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+}
+
+const STOCK_STALE_MESSAGE =
+  "⚠️ 表示したあとに在庫か返金の状況が変わりました。**何も変更していません。** もう一度「在庫」からやり直してください。";
+
+async function applyStockFix(
+  interaction: ButtonInteraction,
+  services: Services,
+  mode: "final_stock" | "add_restorations" | "none",
+  itemId: number,
+  requestedStock: number | null,
+  token: string,
+): Promise<void> {
+  try {
+    const result = services.shop.applyStockChange({
+      itemId,
+      requestedStock,
+      reconciliationMode: mode,
+      expectedToken: token,
+      actor: `user:${interaction.user.id}`,
+    });
+    const settled = result.settledQuantity > 0 ? `（返金在庫 ${result.settledQuantity}個を${mode === "add_restorations" ? "上乗せ" : "この数に含めて"}処理）` : "";
+    await interaction.reply({
+      content: `✅ 商品 #${itemId} の在庫を **${result.newStock === null ? "無制限" : `${result.newStock}個`}** にしました。${settled}`,
+      flags: MessageFlags.Ephemeral,
+    });
+  } catch (error) {
+    const code = error instanceof ShopError ? error.code : undefined;
+    await interaction.reply({
+      content: code === "ERR_STOCK_TERMS_CHANGED" ? STOCK_STALE_MESSAGE : `⚠️ 在庫を変更できませんでした（${code ?? "不明なエラー"}）。`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
 }
 
 export async function handleShokanButton(interaction: ButtonInteraction, services: Services): Promise<void> {
@@ -500,6 +622,16 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   }
   if (action === "edit-basic" && arg) return void (await interaction.showModal(editBasicModal(Number(arg), services)));
   if (action === "edit-role" && arg) return void (await show(roleEditor(Number(arg)) as never));
+  if (action === "edit-stock" && arg) {
+    const item = services.shop.getItem(Number(arg));
+    if (!item) return;
+    return void (await interaction.showModal(stockModal(item.id, item)));
+  }
+  if (action === "stock-fix" && arg) {
+    // customId: shokan:stock-fix:<mode>:<itemId>:<requested>:<token>
+    const mode = arg === "add_restorations" ? "add_restorations" : "final_stock";
+    return void (await applyStockFix(interaction, services, mode, Number(parts[3]), Number(parts[4]), parts[5] ?? ""));
+  }
   if (action === "toggle" && arg) {
     const id = Number(arg);
     const item = services.shop.getItem(id);
@@ -626,6 +758,25 @@ export async function handleShokanModal(interaction: ModalSubmitInteraction, ser
   }
   if (parts[1] === "reeval-comp-submit") {
     await handleReevalCompensation(interaction, services);
+    return;
+  }
+  if (parts[1] === "edit-stock") {
+    const id = Number(parts[2]);
+    const item = services.shop.getItem(id);
+    if (!item) return;
+    const raw = interaction.fields.getTextInputValue("stock").replaceAll(",", "").trim();
+    const requestedStock = raw === "" ? null : Number(raw);
+    if (requestedStock !== null && (!Number.isInteger(requestedStock) || requestedStock < 0)) {
+      await interaction.reply({ content: "在庫は 0以上の整数 か、空欄（無制限）で入れてください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const quote = services.shop.quoteStockChange(id, requestedStock);
+    // 未処理の返金在庫があるなら、**必ず運営に選ばせてから**確定する
+    if (quote.requiresReconciliation) {
+      await interaction.reply(stockReconciliationPrompt(quote, item.name) as never);
+      return;
+    }
+    await applyStockChangeFromModal(interaction, services, id, requestedStock, quote.tokens.none ?? "");
     return;
   }
   if (parts[1] !== "edit-basic") return;

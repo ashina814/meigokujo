@@ -290,6 +290,15 @@ export interface FulfillmentProvenanceRow {
 }
 
 /** 在庫を戻した記録。purchase_idが主キーなので二度戻らない。 */
+export interface StockRestorationSettlementRow {
+  purchase_id: number;
+  item_id: number;
+  quantity: number;
+  disposition: "applied" | "absorbed";
+  settled_at: number;
+  actor_id: string;
+}
+
 export interface StockRestorationRow {
   readonly purchase_id: number;
   readonly item_id: number;
@@ -356,6 +365,11 @@ export type ShopErrorCode =
   | "ERR_ALT_REFUND_UNSUPPORTED"
   | "ERR_TERMS_TOKEN_REQUIRED"
   | "ERR_FULFILLMENT_UNKNOWN"
+  | "ERR_STOCK_TERMS_CHANGED"
+  | "ERR_STOCK_RECONCILIATION_REQUIRED"
+  | "ERR_STOCK_RECONCILIATION_NOT_APPLICABLE"
+  | "ERR_STOCK_CHANGE_REQUIRES_API"
+  | "ERR_STOCK_VALUE_INVALID"
   | "ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_EVAL_EXTENSION_ITEM_CONFIG"
   | "ERR_EVAL_EXTENSION_STATUS"
@@ -458,6 +472,98 @@ function genericTermsToken(terms: GenericPurchaseTerms): string {
     .digest()
     .subarray(0, GENERIC_TERMS_TOKEN_BYTES)
     .toString("base64url");
+}
+
+/**
+ * 在庫を有限へ確定するとき、未処理の返金義務をどう扱うか。
+ *
+ * - `none`             … 未処理の義務が無い（または無制限のまま）。始末する対象が無い
+ * - `final_stock`      … 入力した N を**最終販売可能数**とする。義務は N の中に含める
+ * - `add_restorations` … 入力した N に返金分を**上乗せ**する。義務は実際に在庫へ戻す
+ *
+ * **既定値を置かない。** 「黙って N+X にする」も「黙って N にする」も、運営が
+ * 入力した数の意味を勝手に決めることになる。有限へ確定するときは必ず選ばせる。
+ */
+export type StockReconciliationMode = "none" | "final_stock" | "add_restorations";
+
+/** まだ始末されていない返金在庫。 */
+export interface PendingStockRestorations {
+  readonly count: number;
+  readonly quantity: number;
+  readonly purchaseIds: readonly number[];
+}
+
+export interface StockChangeQuote {
+  readonly itemId: number;
+  readonly currentStock: number | null;
+  readonly requestedStock: number | null;
+  readonly pending: PendingStockRestorations;
+  /** 有限へ確定するのに未処理の義務があるか。true なら2択が必須 */
+  readonly requiresReconciliation: boolean;
+  /** 確定後に実際に入る在庫数（モード別）。UIはこれをそのまま見せる */
+  readonly resultingStock: Readonly<Partial<Record<StockReconciliationMode, number | null>>>;
+  readonly allowedModes: readonly StockReconciliationMode[];
+  /** モードごとの指紋。確定時はこのどれかをそのまま渡す */
+  readonly tokens: Readonly<Partial<Record<StockReconciliationMode, string>>>;
+}
+
+export interface StockChangeResult {
+  readonly itemId: number;
+  readonly previousStock: number | null;
+  readonly newStock: number | null;
+  readonly mode: StockReconciliationMode;
+  readonly settledPurchaseIds: readonly number[];
+  readonly settledQuantity: number;
+}
+
+/**
+ * 在庫変更の指紋。
+ *
+ * **未処理の義務の中身まで含める。** 件数と合計だけだと、1件始末されて別の返金が
+ * 1件増えた場合に同じ指紋になり、運営が見ていない義務を巻き込んで確定してしまう。
+ */
+function stockTermsToken(facts: {
+  itemId: number;
+  currentStock: number | null;
+  requestedStock: number | null;
+  pendingIds: readonly number[];
+  pendingQuantity: number;
+  mode: StockReconciliationMode;
+}): string {
+  const canonical = JSON.stringify([
+    facts.itemId,
+    facts.currentStock,
+    facts.requestedStock,
+    [...facts.pendingIds].sort((a, b) => a - b),
+    facts.pendingQuantity,
+    facts.mode,
+  ]);
+  return createHash("sha256")
+    .update(canonical, "utf8")
+    .digest()
+    .subarray(0, GENERIC_TERMS_TOKEN_BYTES)
+    .toString("base64url");
+}
+
+/** 在庫として受け付ける値。負の在庫や小数はここで止める。 */
+function assertStockValue(stock: number | null): void {
+  if (stock === null) return;
+  if (!Number.isInteger(stock) || stock < 0) {
+    throw new ShopError("ERR_STOCK_VALUE_INVALID", { stock });
+  }
+}
+
+/**
+ * 確定後に入る在庫数。**`add_restorations` のときだけ上乗せする。**
+ * 既定で上乗せしてはいけない——運営が入力した N の意味を勝手に決めることになる。
+ */
+function resolveStockForMode(
+  requestedStock: number | null,
+  pendingQuantity: number,
+  mode: StockReconciliationMode,
+): number | null {
+  if (requestedStock === null) return null;
+  return mode === "add_restorations" ? requestedStock + pendingQuantity : requestedStock;
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -1065,7 +1171,12 @@ export class Shop {
     if (patch.delivery !== undefined) push("delivery", patch.delivery);
     if (patch.delivery_kind !== undefined) push("delivery_kind", patch.delivery_kind);
     if (patch.delivery_data !== undefined) push("delivery_data", patch.delivery_data);
-    if (patch.stock !== undefined) push("stock", patch.stock);
+    // **在庫はここでは動かせない。** 未処理の返金義務がある商品を有限へ戻すとき、
+    // 汎用の更新経路だと「運営が入力した N」の意味（最終数か上乗せ前か）を誰も
+    // 決めないまま確定してしまう。在庫は applyStockChange() だけが動かす。
+    if (patch.stock !== undefined) {
+      throw new ShopError("ERR_STOCK_CHANGE_REQUIRES_API", { itemId: id });
+    }
     if (patch.enabled !== undefined) push("enabled", patch.enabled ? 1 : 0);
     if (sets.length === 0) return;
     sets.push("updated_at = ?");
@@ -2546,6 +2657,168 @@ export class Shop {
       target: purchase.user_id,
       payload: { purchaseId: purchase.id, itemId: purchase.item_id, quantity: 1, applied: finiteNow ? 1 : 0 },
     });
+  }
+
+  /**
+   * まだ始末していない返金在庫。
+   *
+   * `applied=0`（返金時に無制限だったので数値を動かさなかった）のうち、決済台帳に
+   * 行が無いものだけ。`applied=1` は返金時にもう戻しているので、ここには出さない
+   * ——出すと同じ1枠を二度戻すことになる。
+   */
+  pendingStockRestorations(itemId: number): PendingStockRestorations {
+    const rows = this.db
+      .prepare(
+        `SELECT r.purchase_id AS purchaseId, r.quantity AS quantity
+           FROM shop_purchase_stock_restorations r
+          WHERE r.item_id = ?
+            AND r.applied = 0
+            AND NOT EXISTS (
+              SELECT 1 FROM shop_stock_restoration_settlements s WHERE s.purchase_id = r.purchase_id
+            )
+          ORDER BY r.purchase_id`,
+      )
+      .all(itemId) as { purchaseId: number; quantity: number }[];
+    return {
+      count: rows.length,
+      quantity: rows.reduce((sum, r) => sum + r.quantity, 0),
+      purchaseIds: rows.map((r) => r.purchaseId),
+    };
+  }
+
+  /**
+   * 在庫変更を表示時に確定する。**Botはここで得た指紋だけを確定へ渡す。**
+   *
+   * 未処理の返金義務があるまま有限へ確定する場合は、`final_stock` と
+   * `add_restorations` の2つの指紋を返す。運営がどちらを選んだかが指紋に載るので、
+   * 「Nを最終数のつもりで押したのに N+X になっていた」が起きない。
+   */
+  quoteStockChange(itemId: number, requestedStock: number | null): StockChangeQuote {
+    const item = this.getItem(itemId);
+    if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId });
+    assertStockValue(requestedStock);
+    const pending = this.pendingStockRestorations(itemId);
+    // **結果が有限になるときだけ**2択が要る。無制限のままなら義務は据え置く。
+    const requiresReconciliation = requestedStock !== null && pending.quantity > 0;
+    const allowedModes: StockReconciliationMode[] = requiresReconciliation
+      ? ["final_stock", "add_restorations"]
+      : ["none"];
+    const base = {
+      itemId,
+      currentStock: item.stock,
+      requestedStock,
+      pendingIds: pending.purchaseIds,
+      pendingQuantity: pending.quantity,
+    };
+    const tokens: Partial<Record<StockReconciliationMode, string>> = {};
+    const resultingStock: Partial<Record<StockReconciliationMode, number | null>> = {};
+    for (const mode of allowedModes) {
+      tokens[mode] = stockTermsToken({ ...base, mode });
+      resultingStock[mode] = resolveStockForMode(requestedStock, pending.quantity, mode);
+    }
+    return { itemId, currentStock: item.stock, requestedStock, pending, requiresReconciliation, resultingStock, allowedModes, tokens };
+  }
+
+  /**
+   * 在庫を変更し、未処理の返金義務に始末をつける。**在庫を動かす唯一の運営経路。**
+   *
+   * 確定transactionの中で事実を読み直し、表示したときの指紋と一致しなければ
+   * 1つも書かずに `ERR_STOCK_TERMS_CHANGED` で止まる。表示のあとに返金が増えた
+   * 場合も、別の確定が先に通った場合も、ここで弾かれる。
+   */
+  applyStockChange(input: {
+    itemId: number;
+    requestedStock: number | null;
+    reconciliationMode: StockReconciliationMode;
+    expectedToken: string;
+    actor: string;
+  }): StockChangeResult {
+    assertStockValue(input.requestedStock);
+    if (!GENERIC_TERMS_TOKEN_PATTERN.test(input.expectedToken)) {
+      throw new ShopError("ERR_STOCK_TERMS_CHANGED", { itemId: input.itemId });
+    }
+    const body = (): StockChangeResult => {
+      const item = this.getItem(input.itemId);
+      if (!item) throw new ShopError("ERR_ITEM_NOT_FOUND", { itemId: input.itemId });
+      const pending = this.pendingStockRestorations(input.itemId);
+      const requiresReconciliation = input.requestedStock !== null && pending.quantity > 0;
+
+      // **指紋を先に見る。** 状況が変わっていたなら、理由は常に「変わった」であって
+      // 「そのモードは使えない」ではない。順序を逆にすると、別の確定が先に通って
+      // 義務が無くなっただけの行が `NOT_APPLICABLE` として返り、運営には
+      // 「押し方が悪かった」ように見えてしまう。
+      const expected = stockTermsToken({
+        itemId: input.itemId,
+        currentStock: item.stock,
+        requestedStock: input.requestedStock,
+        pendingIds: pending.purchaseIds,
+        pendingQuantity: pending.quantity,
+        mode: input.reconciliationMode,
+      });
+      if (expected !== input.expectedToken) {
+        throw new ShopError("ERR_STOCK_TERMS_CHANGED", { itemId: input.itemId });
+      }
+
+      // ここから先は「表示した事実と現在の事実が同じ」ことが確かめられている。
+      // それでも意味の通らない組み合わせは通さない——`quoteStockChange()` は
+      // こういう指紋を配らないので、通るのはAPIを直接叩いた場合だけ。
+      if (requiresReconciliation && input.reconciliationMode === "none") {
+        throw new ShopError("ERR_STOCK_RECONCILIATION_REQUIRED", {
+          itemId: input.itemId,
+          pendingQuantity: pending.quantity,
+        });
+      }
+      if (!requiresReconciliation && input.reconciliationMode !== "none") {
+        throw new ShopError("ERR_STOCK_RECONCILIATION_NOT_APPLICABLE", { itemId: input.itemId });
+      }
+
+      const newStock = resolveStockForMode(input.requestedStock, pending.quantity, input.reconciliationMode);
+      const ts = now();
+      this.db.prepare("UPDATE shop_items SET stock = ?, updated_at = ? WHERE id = ?").run(newStock, ts, input.itemId);
+
+      // 義務の始末。主キー衝突で二度目は必ず落ちる（=exactly once）。
+      const disposition = input.reconciliationMode === "add_restorations" ? "applied" : "absorbed";
+      if (input.reconciliationMode !== "none") {
+        const insert = this.db.prepare(
+          `INSERT INTO shop_stock_restoration_settlements
+             (purchase_id,item_id,quantity,disposition,settled_at,actor_id)
+           VALUES (?,?,?,?,?,?)`,
+        );
+        for (const purchaseId of pending.purchaseIds) {
+          const restoration = this.stockRestoration(purchaseId);
+          insert.run(purchaseId, input.itemId, restoration?.quantity ?? 1, disposition, ts, input.actor);
+        }
+      }
+
+      this.events.log("shop_stock_changed", {
+        actor: input.actor,
+        payload: {
+          itemId: input.itemId,
+          previousStock: item.stock,
+          newStock,
+          mode: input.reconciliationMode,
+          settledCount: input.reconciliationMode === "none" ? 0 : pending.count,
+          settledQuantity: input.reconciliationMode === "none" ? 0 : pending.quantity,
+        },
+      });
+
+      return {
+        itemId: input.itemId,
+        previousStock: item.stock,
+        newStock,
+        mode: input.reconciliationMode,
+        settledPurchaseIds: input.reconciliationMode === "none" ? [] : pending.purchaseIds,
+        settledQuantity: input.reconciliationMode === "none" ? 0 : pending.quantity,
+      };
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /** 始末の記録。無ければまだ始末していない。 */
+  stockRestorationSettlement(purchaseId: number): StockRestorationSettlementRow | undefined {
+    return this.db
+      .prepare("SELECT * FROM shop_stock_restoration_settlements WHERE purchase_id = ?")
+      .get(purchaseId) as StockRestorationSettlementRow | undefined;
   }
 
   /** 在庫を戻した記録。無ければ戻していない。 */

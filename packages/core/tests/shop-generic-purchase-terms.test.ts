@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { EventLog, Ledger, Shop, TREASURY, openDb, registerDefaultTxTypes } from "../src/index.js";
+import { setStock } from "./helpers/set-stock.js";
 
 registerDefaultTxTypes();
 const USER = "444444444444444444";
@@ -103,7 +104,7 @@ describe("generic購入契約 — 表示した条件でしか課金しない", (
     const item = makeItem(ctx, { stock: 5 });
     const before = ctx.shop.quoteGenericPurchase(item.id).termsToken;
 
-    ctx.shop.updateItem(item.id, { stock: 4 } as never, "staff");
+    setStock(ctx.shop, item.id, 4);
     expect(ctx.shop.quoteGenericPurchase(item.id).termsToken).toBe(before);
 
     ctx.shop.updateItem(item.id, { enabled: 0 } as never, "staff");
