@@ -435,7 +435,7 @@ export interface ManualCompletionResult {
  * 購入1件について、**いま安全上効いている事実**をひとまとめにしたもの。
  *
  * 巨大な1本のenumにはしない。ここに並ぶのは互いに直交する事実で、たとえば
- * 同じ `active` でも「提供済み・期限内」と「配送失敗・返金義務あり・期限超過」は
+ * 同じ `active` でも「提供済み・期限内」と「配送失敗・返金の復旧待ち・期限超過」は
  * まったく別物になる。1本の名前へ潰すと、その違いが消える。
  *
  * **新しい判定はここで作らない。** どの欄も既存の authority をそのまま呼んだ結果で、
@@ -3694,14 +3694,8 @@ export class Shop {
   }
 
   /**
-   * まだ返金できていない購入。
-   *
-   * **解消は purchase の状態で決まる。** 返金・失効・提供済みのいずれかになれば
-   * 自動的にこの一覧から消えるので、記録を後から書き換える必要が無い。
-   */
-  /**
-   * 返金に失敗した**履歴**があるか。`refundFailureSql()` の「いま返す義務があるか」
-   * とは別物で、こちらの方が広い（提供が後から成功して義務が閉じた購入も含む）。
+   * 返金に失敗した**履歴**があるか。`refundFailureSql()`（いま復旧キューに載るか）
+   * とは別物で、こちらの方が広い——復旧キューから外れた購入も履歴は持ったまま残る。
    *
    * 配送やり直しキューはこちらを使う。**再配送してよいか**の判断なので、
    * 一度でも返金を試した購入は自動の再配送から外す方が安全側になる。
@@ -3711,9 +3705,23 @@ export class Shop {
     return "EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)";
   }
 
+  /**
+   * **いま返金のやり直しキューに載る購入か。**
+   *
+   * これは復旧導線の述語であって、「利用者へ返す義務があるか」という普遍的な
+   * financial truth ではない。`status = 'active'` を条件に含むので、
+   * `expired` / `cancelled` になれば false へ落ちる——`refund()` が active からしか
+   * 動けない以上、復旧キューへ載せても押せるボタンが無いからそうしている。
+   *
+   * したがって **false を「金銭的な義務が無い」と読んではいけない。**
+   * この一覧から外れることと、金銭の決着が済んだことは別の事実で、
+   * 前者を後者の証明に使うと未返金が黙って消える。金が戻ったと言えるのは
+   * `status = 'refunded'` だけ。terminal へ落ちたまま失敗履歴だけが残っている購入は、
+   * `safetySnapshot().contradictions` が監査対象として surface する。
+   */
   private static refundFailureSql(): string {
-    // **提供済みなら「返金の未完了」ではない。** `delivery_state` だけを見ると、
-    // 正常に提供できた購入（active + delivered）が返金待ちとして残り続ける。
+    // **提供済みなら復旧の対象ではない。** `delivery_state` だけを見ると、
+    // 正常に提供できた購入（active + delivered）がキューに残り続ける。
     // 提供済みの判定は既存の authoritative evidence をそのまま使う。
     return `p.status = 'active'
       AND p.delivered_at IS NULL
@@ -3721,7 +3729,10 @@ export class Shop {
       AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)`;
   }
 
-  /** 上と**同じ判定**を1件へ当てる。一覧・件数・確認・確定で条件を分けない。 */
+  /**
+   * 上と**同じ判定**を1件へ当てる。一覧・件数・確認・確定で条件を分けない。
+   * 意味も同じ——「いま復旧キューに載るか」であって「返す義務が無い」ではない。
+   */
   private refundFailureOpen(purchaseId: number): boolean {
     const row = this.db
       .prepare(`SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.refundFailureSql()} LIMIT 1`)
@@ -4628,7 +4639,8 @@ export class Shop {
     //
     // 除外条件は `expireIfDue()` が使うものと**同じ関数から作る**。
     // 「返金失敗の履歴が1件でもあるか」を手書きすると意味がズレる——提供が後から
-    // 成功して義務が閉じた購入まで永久に候補から外れ、失効も剥奪判断も進まなくなる。
+    // 成功して復旧キューから外れた購入まで永久に候補から外れ、失効も剥奪判断も
+    // 進まなくなる。
     const due = this.db
       .prepare(
         `SELECT p.id FROM shop_purchases p
@@ -4789,13 +4801,14 @@ export class Shop {
    * 期限が来ていても**失効させてはいけない理由**。無ければ `null`。
    *
    * 説明（snapshot）と実際の判断（`expireIfDue()`）で同じ関数を使う。別々に書くと、
-   * 画面が「返金待ちだから止まっています」と説明しているのに巡回は失効させる、
+   * 画面が「返金の復旧待ちだから止まっています」と説明しているのに巡回は失効させる、
    * のような食い違いが起きる。
    *
    * - `delivery_in_flight` … いま外部へ投げている最中／結果が分からない。ここで
    *   expired へ落とすと「失効済みなのにロールだけ付く」が成立する
-   * - `refund_pending` … 返すべき金がまだ戻っていない。`refund()` は active からしか
-   *   動けないので、expired にすると復旧そのものが不可能になる
+   * - `refund_pending` … 返金のやり直し待ち。**期限より先に金の決着を終わらせる。**
+   *   `refund()` は active からしか動けないので、ここで expired にすると復旧導線
+   *   そのものが消える（義務が消えるのではなく、押せるボタンが無くなる）
    */
   expiryBlockedBy(purchaseId: number): ExpiryBlockedReason | null {
     if (this.externalDeliveryInFlight(purchaseId)) return "delivery_in_flight";

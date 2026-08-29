@@ -80,8 +80,8 @@ const lapse = (ctx: Ctx, purchaseId: number) =>
 
 const snap = (ctx: Ctx, purchaseId: number) => ctx.shop.safetySnapshot(purchaseId)!;
 
-describe("A. 返金義務は「履歴があること」ではない", () => {
-  it("返金失敗の履歴があっても、あとから提供が成功すれば義務は閉じる", () => {
+describe("A. 返金の復旧待ちは「履歴があること」ではない", () => {
+  it("返金失敗の履歴があっても、あとから提供が成功すれば復旧キューから外れる", () => {
     const ctx = setup();
     const p = buy(ctx);
     ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
@@ -90,7 +90,7 @@ describe("A. 返金義務は「履歴があること」ではない", () => {
     deliver(ctx, p.id);
 
     const after = snap(ctx, p.id);
-    // 履歴は消えない（append-only）。義務だけが閉じる
+    // 履歴は消えない（append-only）。復旧キューから外れるだけ
     expect(after.refund).toEqual({ recoveryOpen: false, failureHistory: 1 });
     expect(after.fulfillment.evidence).toBe(true);
     expect(ctx.shop.countRefundFailures()).toBe(0);
@@ -157,7 +157,7 @@ describe("A2. 提供済みの証拠は、一覧と1件判定で同じ定義", ()
     ctx.events.log("shop_delivered", { actor: "system", payload: { purchaseId: id } });
 
     expect(snap(ctx, id).fulfillment.evidence).toBe(true);
-    // 一覧SQL側も同じ判断。返金の未完了には出ない
+    // 一覧SQL側も同じ判断。返金の復旧キューには出ない
     ctx.shop.recordRefundFailure({ purchaseId: id, amount: 100, reason: "delivery_failed", actor: "system" });
     expect(snap(ctx, id).refund.recoveryOpen).toBe(false);
     expect(ctx.shop.listRefundFailures().map((r) => r.purchaseId)).not.toContain(id);
