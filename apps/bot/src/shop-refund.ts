@@ -99,6 +99,16 @@ export async function refundOrEscalate(
       target: purchase.user_id,
       payload: { purchaseId: purchase.id, reason, error: (error as Error).message },
     });
+    // **イベントを仕事の正本にしない。** 返金できていない事実を durable に残し、
+    // 商館の作業キューから引けるようにする
+    const row = services.shop.getPurchase(purchase.id);
+    services.shop.recordRefundFailure({
+      purchaseId: purchase.id,
+      amount: row?.paid_land ?? 0,
+      reason,
+      detail: (error as Error).message,
+      actor,
+    });
     await refreshShopAdminPanels(client, services).catch(() => undefined);
     await notifyRefundFailure(client, services, purchase.id).catch(() => undefined);
     return "escalated";

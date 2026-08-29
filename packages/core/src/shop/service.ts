@@ -456,6 +456,7 @@ export type ShopErrorCode =
   | "ERR_DELIVERY_IN_FLIGHT"
   | "ERR_RESOLUTION_STALE"
   | "ERR_RESOLUTION_NOT_APPLICABLE"
+  | "ERR_RESOLUTION_EVIDENCE_REQUIRED"
   | "ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_EVAL_EXTENSION_ITEM_CONFIG"
   | "ERR_EVAL_EXTENSION_STATUS"
@@ -3190,7 +3191,10 @@ export class Shop {
   }
 
   /**
-   * 運営の決着を確定する。**判断そのものを台帳へ残してから状態を動かす。**
+   * 運営の決着を確定する。
+   *
+   * **確定した結果を読み直してから、台帳へ1回だけ積む。** 先に台帳を書くと、
+   * そのあとの返金の成否を書き残せない（append-onlyなので後から直せない）。
    *
    * `still_unknown` は状態を変えない（分からないものを false へ倒さない）。
    * `refund: true` は「提供なしを確認したうえで返金まで一気に行う」ためのもので、
@@ -3204,6 +3208,15 @@ export class Shop {
     note?: string;
     refund?: boolean;
   }): OperatorResolutionResult {
+    // **根拠の検証は何よりも先。** UIが止めていることは authority ではない。
+    // ここを通さないと、claim も delivery も ledger も台帳も1つも動かない。
+    const note = (input.note ?? "").trim();
+    if (input.decision !== "still_unknown" && note.length === 0) {
+      throw new ShopError("ERR_RESOLUTION_EVIDENCE_REQUIRED", {
+        purchaseId: input.purchaseId,
+        decision: input.decision,
+      });
+    }
     const body = (): OperatorResolutionResult => {
       const purchase = this.getPurchase(input.purchaseId);
       if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
@@ -3295,7 +3308,7 @@ export class Shop {
           kind,
           input.decision,
           input.actor,
-          (input.note ?? "").slice(0, 1000) || null,
+          note.slice(0, 1000) || null,
           JSON.stringify(before),
           JSON.stringify({
             decision: input.decision,
@@ -3331,8 +3344,35 @@ export class Shop {
     return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
   }
 
-  /** 決着待ちの案件（外部配送の未確定 + 旧購入の不明）を1つの作業キューにする。 */
-  listUnresolvedCases(limit = 25): Array<{
+  /**
+   * 決着待ちの候補を**1本のストリーム**として定義する。
+   *
+   * 一覧も件数もこの定義だけを使う。バケットごとに `LIMIT` を掛けてからJS側で
+   * 重複を除く方式だと、同じ購入が2つの条件に当たったときに1ページの件数が
+   * 足りなくなるし、件数と一覧の集合もずれる。
+   *
+   * 並びは **古い案件優先**（`stuckSince ASC, purchaseId ASC`）で固定する。
+   * 順序が安定していないとページを跨いだときに取りこぼす。
+   */
+  private static unresolvedCandidateSql(): string {
+    return `SELECT id, MIN(stuck_since) AS stuck_since FROM (
+      SELECT a.purchase_id AS id, a.started_at AS stuck_since
+        FROM shop_external_delivery_attempts a
+       WHERE a.state IN ('in_flight','uncertain')
+      UNION ALL
+      SELECT p.id, p.purchased_at FROM shop_purchases p WHERE ${Shop.legacyUnknownSql()}
+      UNION ALL
+      SELECT p.id, p.purchased_at FROM shop_purchases p WHERE ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}
+    ) GROUP BY id`;
+  }
+
+  /**
+   * 決着待ちの案件。**全件を辿れるようにページで返す。**
+   *
+   * 先頭数件を保留し続けると、それより後ろの案件へ永久に到達できない。
+   * `offset` で先へ進める。
+   */
+  listUnresolvedCases(opts: { limit?: number; offset?: number } = {}): Array<{
     purchaseId: number;
     kind: UnresolvedCaseKind;
     userId: string;
@@ -3342,7 +3382,11 @@ export class Shop {
     reason: string;
     stuckSince: number;
   }> {
-    const seen = new Set<number>();
+    const limit = opts.limit ?? 25;
+    const offset = Math.max(0, opts.offset ?? 0);
+    const ids = this.db
+      .prepare(`${Shop.unresolvedCandidateSql()} ORDER BY stuck_since ASC, id ASC LIMIT ? OFFSET ?`)
+      .all(limit, offset) as Array<{ id: number; stuck_since: number }>;
     const out: Array<{
       purchaseId: number;
       kind: UnresolvedCaseKind;
@@ -3353,49 +3397,174 @@ export class Shop {
       reason: string;
       stuckSince: number;
     }> = [];
-    const push = (purchaseId: number) => {
-      if (seen.has(purchaseId) || out.length >= limit) return;
-      const quote = this.quoteOperatorResolution(purchaseId);
-      if (quote.kind === null) return;
-      seen.add(purchaseId);
+    for (const row of ids) {
+      const quote = this.quoteOperatorResolution(row.id);
+      if (quote.kind === null) continue;
       out.push({
-        purchaseId,
+        purchaseId: row.id,
         kind: quote.kind,
         userId: quote.userId,
         itemName: quote.itemName,
         purchasedAt: quote.purchasedAt,
         deliveryKind: quote.deliveryKind,
         reason: quote.reason,
-        stuckSince: quote.stuckSince ?? quote.purchasedAt,
+        stuckSince: row.stuck_since,
       });
-    };
-    for (const row of this.listUnresolvedExternalDeliveries(limit)) push(row.purchase_id);
-    for (const row of this.listLegacyUnknownFulfillment({ limit })) push(row.id);
-    for (const row of this.listLegacyAutoOutcomeUnknown({ limit })) push(row.id);
+    }
     return out;
   }
 
-  /**
-   * 決着待ちの**件数**。
-   *
-   * **一覧と同じ「purchase単位」で数える。** バケットごとの件数を足すと、同じ購入が
-   * 2つの条件に当てはまったときに一覧より多く見える（押せる案件より数字が大きい）。
-   */
+  /** 決着待ちの件数。**一覧とまったく同じ集合定義で数える。** */
   countUnresolvedCases(): number {
     return this.db
-      .prepare(
-        `SELECT COUNT(*) FROM (
-           SELECT a.purchase_id AS id
-             FROM shop_external_delivery_attempts a
-            WHERE a.state IN ('in_flight','uncertain')
-           UNION
-           SELECT p.id FROM shop_purchases p WHERE ${Shop.legacyUnknownSql()}
-           UNION
-           SELECT p.id FROM shop_purchases p WHERE ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}
-         )`,
-      )
+      .prepare(`SELECT COUNT(*) FROM (${Shop.unresolvedCandidateSql()})`)
       .pluck()
       .get() as number;
+  }
+
+  // ── 返金の復旧（Phase H）──────────────────────────────────────────────────
+
+  /**
+   * 返金を**実際に試して失敗した**ことを残す。
+   *
+   * 「確認できないので試していない」(withheld) では呼ばない。ここに載るのは
+   * 利用者の資産が戻っていない購入だけ。
+   */
+  recordRefundFailure(input: { purchaseId: number; amount: number; reason: string; detail?: string; actor: string }): void {
+    this.db
+      .prepare(
+        `INSERT INTO shop_refund_failures (purchase_id, amount, reason, detail, actor_id, failed_at)
+         VALUES (?,?,?,?,?,?)`,
+      )
+      .run(
+        input.purchaseId,
+        input.amount,
+        input.reason.slice(0, 200),
+        (input.detail ?? "").slice(0, 500) || null,
+        input.actor,
+        now(),
+      );
+  }
+
+  /**
+   * まだ返金できていない購入。
+   *
+   * **解消は purchase の状態で決まる。** 返金・失効・提供済みのいずれかになれば
+   * 自動的にこの一覧から消えるので、記録を後から書き換える必要が無い。
+   */
+  private static refundFailureSql(): string {
+    return `p.status = 'active'
+      AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)`;
+  }
+
+  listRefundFailures(opts: { limit?: number; offset?: number } = {}): Array<{
+    purchaseId: number;
+    userId: string;
+    itemName: string;
+    amount: number;
+    reason: string;
+    failedAt: number;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT p.id AS purchaseId, p.user_id AS userId, i.name AS itemName,
+                COALESCE(p.paid_land, 0) AS amount,
+                (SELECT f.reason FROM shop_refund_failures f WHERE f.purchase_id = p.id ORDER BY f.failed_at DESC, f.id DESC LIMIT 1) AS reason,
+                (SELECT MIN(f.failed_at) FROM shop_refund_failures f WHERE f.purchase_id = p.id) AS failedAt
+           FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
+          WHERE ${Shop.refundFailureSql()}
+          ORDER BY failedAt ASC, p.id ASC
+          LIMIT ? OFFSET ?`,
+      )
+      .all(opts.limit ?? 25, Math.max(0, opts.offset ?? 0)) as Array<{
+      purchaseId: number;
+      userId: string;
+      itemName: string;
+      amount: number;
+      reason: string;
+      failedAt: number;
+    }>;
+  }
+
+  countRefundFailures(): number {
+    return this.db
+      .prepare(`SELECT COUNT(*) FROM shop_purchases p WHERE ${Shop.refundFailureSql()}`)
+      .pluck()
+      .get() as number;
+  }
+
+  /** 返金やり直しの確認。`token` は確定時に作り直して照合する。 */
+  quoteRefundRetry(purchaseId: number): {
+    purchaseId: number;
+    userId: string;
+    itemName: string;
+    amount: number;
+    open: boolean;
+    token: string;
+  } {
+    const purchase = this.getPurchase(purchaseId);
+    if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
+    const item = this.getItem(purchase.item_id);
+    const open = this.countRefundFailuresFor(purchaseId) > 0 && purchase.status === "active";
+    return {
+      purchaseId,
+      userId: purchase.user_id,
+      itemName: item?.name ?? `#${purchase.item_id}`,
+      amount: purchase.paid_land ?? 0,
+      open,
+      token: this.refundRetryToken(purchase, open),
+    };
+  }
+
+  private countRefundFailuresFor(purchaseId: number): number {
+    return this.db
+      .prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id = ?")
+      .pluck()
+      .get(purchaseId) as number;
+  }
+
+  private refundRetryToken(purchase: PurchaseRow, open: boolean): string {
+    const canonical = JSON.stringify([
+      purchase.id,
+      purchase.status,
+      purchase.delivery_state,
+      purchase.delivered_at,
+      purchase.paid_land,
+      open,
+      this.countRefundFailuresFor(purchase.id),
+    ]);
+    return createHash("sha256").update(canonical, "utf8").digest().subarray(0, GENERIC_TERMS_TOKEN_BYTES).toString("base64url");
+  }
+
+  /**
+   * 返金をやり直す。**既存の返金 authority をそのまま使う**ので二重返金にならない。
+   *
+   * 画面を開いたあとに状況が変わっていれば1つも書かずに止める。
+   */
+  retryRefund(input: { purchaseId: number; expectedToken: string; actor: string }): { refunded: boolean; amount: number } {
+    const body = (): { refunded: boolean; amount: number } => {
+      const purchase = this.getPurchase(input.purchaseId);
+      if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+      const open = this.countRefundFailuresFor(input.purchaseId) > 0 && purchase.status === "active";
+      if (this.refundRetryToken(purchase, open) !== input.expectedToken) {
+        throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
+      }
+      if (!open) throw new ShopError("ERR_RESOLUTION_NOT_APPLICABLE", { purchaseId: input.purchaseId });
+      try {
+        return this.refund(input.purchaseId, "運営: 返金のやり直し", input.actor);
+      } catch (error) {
+        // 失敗の事実を積み直す（append-only なので上書きはしない）
+        this.recordRefundFailure({
+          purchaseId: input.purchaseId,
+          amount: purchase.paid_land ?? 0,
+          reason: "retry_failed",
+          detail: error instanceof Error ? error.message : String(error),
+          actor: input.actor,
+        });
+        throw error;
+      }
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
   }
 
   /** 始末の記録。無ければまだ始末していない。 */
@@ -3849,6 +4018,11 @@ export class Shop {
             -- 旧購入は、状態がどうであれ自動では流し直さない。
             AND NOT EXISTS (
               SELECT 1 FROM shop_delivery_replay_suppressions r WHERE r.purchase_id = p.id
+            )
+            -- **返金の復旧待ちを配送再試行へ混ぜない。** 返金しようとして失敗した購入は
+            -- 「もう一度配る」ではなく「返金をやり直す」案件。別のキューで扱う。
+            AND NOT EXISTS (
+              SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id
             )
             AND NOT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}
           ORDER BY p.purchased_at DESC`,
@@ -4390,6 +4564,47 @@ export class Shop {
       if (out.length >= (opts.limit ?? 25)) break;
     }
     return out;
+  }
+
+  /**
+   * 自動では二度と再試行されない剥奪。
+   *
+   * worker は `status='pending'` しか拾わない。`blocked:*` として `failed` に落ちた行は
+   * **どの巡回も触らない**ので、人が見なければ永久に残る。「本番で今0件」は
+   * 到達不能の証明にならないので、件数として出せるようにする。
+   */
+  listBlockedRoleRevocations(opts: { limit?: number } = {}): Array<{
+    purchaseId: number;
+    userId: string;
+    itemName: string;
+    reason: string;
+    updatedAt: number;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT r.purchase_id AS purchaseId, p.user_id AS userId, i.name AS itemName,
+                COALESCE(r.last_error, 'blocked') AS reason, r.updated_at AS updatedAt
+           FROM shop_role_revocations r
+           JOIN shop_purchases p ON p.id = r.purchase_id
+           JOIN shop_items i ON i.id = p.item_id
+          WHERE r.status = 'failed'
+          ORDER BY r.updated_at ASC, r.purchase_id ASC
+          LIMIT ?`,
+      )
+      .all(opts.limit ?? 25) as Array<{
+      purchaseId: number;
+      userId: string;
+      itemName: string;
+      reason: string;
+      updatedAt: number;
+    }>;
+  }
+
+  countBlockedRoleRevocations(): number {
+    return this.db
+      .prepare("SELECT COUNT(*) FROM shop_role_revocations WHERE status = 'failed'")
+      .pluck()
+      .get() as number;
   }
 
   /** 上と同じ判定の件数（上限なし） */

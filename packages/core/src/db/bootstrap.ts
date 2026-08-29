@@ -1064,6 +1064,35 @@ CREATE TABLE IF NOT EXISTS shop_operator_resolutions (
 );
 CREATE INDEX IF NOT EXISTS idx_shop_operator_resolutions_purchase
   ON shop_operator_resolutions(purchase_id, resolved_at);
+-- Phase H: 返金を**実際に試して失敗した**という事実。
+--
+-- 「提供できたか確認できないので返金を試していない」(withheld) とは別物。
+-- 前者は利用者の資産が戻っていないので運営が復旧する必要があり、後者は確認待ち。
+-- イベントだけだと仕事の一覧に出せないので、durable に残して商館の正本から引く。
+--
+-- 解消は purchase の状態で決まる（refunded / expired / delivered になれば対象外）ので、
+-- この表を後から書き換える必要は無い＝append-only のままでよい。
+CREATE TABLE IF NOT EXISTS shop_refund_failures (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  purchase_id INTEGER NOT NULL REFERENCES shop_purchases(id),
+  amount      INTEGER NOT NULL,
+  reason      TEXT NOT NULL,
+  detail      TEXT,
+  actor_id    TEXT NOT NULL,
+  failed_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shop_refund_failures_purchase
+  ON shop_refund_failures(purchase_id, failed_at);
+CREATE TRIGGER IF NOT EXISTS trg_shop_refund_failures_no_update
+BEFORE UPDATE ON shop_refund_failures
+BEGIN
+  SELECT RAISE(ABORT, 'shop refund failures are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_refund_failures_no_delete
+BEFORE DELETE ON shop_refund_failures
+BEGIN
+  SELECT RAISE(ABORT, 'shop refund failures are append-only');
+END;
 CREATE TRIGGER IF NOT EXISTS trg_shop_operator_resolutions_no_update
 BEFORE UPDATE ON shop_operator_resolutions
 BEGIN

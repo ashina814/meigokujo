@@ -440,9 +440,13 @@ describe("課金後に変更できなかったとき", () => {
     expect(purchase.status).toBe("active");
     expect(purchase.delivery_state).toBe("failed");
     expect(ctx.events.listByType("shop_refund_failed")).toHaveLength(1);
-    // 管理パネルの「処理失敗」に出る
+    // **配送の再試行ではなく、返金のやり直しとして出る。**
+    // 返金できていない購入を「もう一度配る」キューへ混ぜない
     const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description: string } }[] };
-    expect(panel.embeds[0]!.data.description).toContain("処理失敗 1件");
+    expect(panel.embeds[0]!.data.description).toContain("返金の未完了 1件");
+    expect(panel.embeds[0]!.data.description).not.toContain("処理失敗 1件");
+    expect(ctx.shop.countRefundFailures()).toBe(1);
+    expect(ctx.shop.listUndeliveredAuto(50).map((r) => r.id)).not.toContain(purchase.id);
     ctx.db.close();
   });
 });
@@ -597,7 +601,8 @@ describe("課金後にBotが落ちた場合の収束", () => {
     expect(notice.components ?? []).toHaveLength(0); // 通知にボタンは付けない（操作は管理パネルが正本）
     expect(dm).not.toHaveBeenCalled(); // 返せていないのに「返金しました」とは言わない
     const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description: string } }[] };
-    expect(panel.embeds[0]!.data.description).toContain("処理失敗 1件");
+    expect(panel.embeds[0]!.data.description).toContain("返金の未完了 1件");
+    expect(ctx.shop.countRefundFailures()).toBe(1);
     ctx.db.close();
   });
 });

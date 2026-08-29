@@ -161,6 +161,7 @@ describe("決着は外部状態を壊さない", () => {
       decision: "no_effect",
       expectedToken: quote.token,
       actor: "operator:1",
+      note: "運営確認済み",
       refund: true,
     });
 
@@ -206,6 +207,7 @@ describe("決着は外部状態を壊さない", () => {
       decision: "no_effect",
       expectedToken: quote.token,
       actor: "operator:1",
+      note: "運営確認済み",
       refund: true,
     });
 
@@ -245,6 +247,7 @@ describe("決着は外部状態を壊さない", () => {
       decision: "no_effect",
       expectedToken: quote.token,
       actor: "operator:1",
+      note: "運営確認済み",
       refund: true,
     });
 

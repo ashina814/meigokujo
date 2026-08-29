@@ -121,6 +121,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
       decision: "no_effect",
       expectedToken: quote.token,
       actor: STAFF,
+      note: "運営確認済み",
       refund: true,
     });
 
@@ -202,7 +203,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
     // 旧購入の不明に加えて、外部配送の未確定も付く
     uncertain(ctx, p.id);
 
-    expect(ctx.shop.countUnresolvedCases()).toBe(ctx.shop.listUnresolvedCases(100).length);
+    expect(ctx.shop.countUnresolvedCases()).toBe(ctx.shop.listUnresolvedCases({ limit: 100 }).length);
     expect(ctx.shop.countUnresolvedCases()).toBe(1);
     ctx.db.close();
   });
@@ -219,6 +220,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
       decision: "no_effect",
       expectedToken: quote.token,
       actor: STAFF,
+      note: "運営確認済み",
     });
 
     // 勝手に「返金したこと」にしない
@@ -264,7 +266,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
     const before = landOf(ctx);
     // 別の運営が先に決着させた
     const fresh = ctx.shop.quoteOperatorResolution(p.id);
-    ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: fresh.token, actor: OTHER });
+    ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: fresh.token, actor: OTHER , note: "運営確認済み" });
 
     expect(() =>
       ctx.shop.resolveOperatorCase({
@@ -272,6 +274,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
         decision: "no_effect",
         expectedToken: stale.token,
         actor: STAFF,
+        note: "運営確認済み",
         refund: true,
       }),
     ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_STALE" }));
@@ -296,6 +299,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
       decision: "no_effect",
       expectedToken: quote.token,
       actor: STAFF,
+      note: "運営確認済み",
       refund: true,
     });
     expect(() =>
@@ -304,6 +308,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
         decision: "no_effect",
         expectedToken: quote.token,
         actor: STAFF,
+        note: "運営確認済み",
         refund: true,
       }),
     ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_STALE" }));
@@ -322,7 +327,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
     const before = landOf(ctx);
 
     expect(() =>
-      ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: quote.token, actor: STAFF }),
+      ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: quote.token, actor: STAFF , note: "運営確認済み" }),
     ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_STALE" }));
 
     expect(ctx.shop.getPurchase(p.id)!.status).toBe("refunded");
@@ -339,7 +344,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
     ctx.shop.expireIfDue(p.id, OTHER);
 
     expect(() =>
-      ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: quote.token, actor: STAFF }),
+      ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: quote.token, actor: STAFF , note: "運営確認済み" }),
     ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_STALE" }));
 
     expect(ctx.shop.getPurchase(p.id)!.status).toBe("expired");
@@ -357,9 +362,9 @@ describe("運営による決着 — 外部配送の未確定", () => {
     const b = ctx.shop.quoteOperatorResolution(p.id);
     expect(a.token).toBe(b.token);
 
-    ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: a.token, actor: STAFF });
+    ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: a.token, actor: STAFF , note: "運営確認済み" });
     expect(() =>
-      ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "no_effect", expectedToken: b.token, actor: OTHER, refund: true }),
+      ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "no_effect", expectedToken: b.token, actor: OTHER, refund: true , note: "運営確認済み" }),
     ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_STALE" }));
 
     expect(ctx.shop.getPurchase(p.id)!.delivery_state).toBe("delivered");
@@ -382,6 +387,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
         decision: "delivered",
         expectedToken: quote.token,
         actor: STAFF,
+        note: "運営確認済み",
         refund: true,
       }),
     ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_NOT_APPLICABLE" }));
@@ -410,7 +416,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
     const p = buy(ctx);
     uncertain(ctx, p.id);
     const q1 = ctx.shop.quoteOperatorResolution(p.id);
-    ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: q1.token, actor: STAFF });
+    ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: q1.token, actor: STAFF , note: "運営確認済み" });
 
     const q2 = ctx.shop.quoteOperatorResolution(p.id);
     expect(q2.kind).toBeNull();
@@ -420,7 +426,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
 
     for (const decision of ["delivered", "no_effect", "still_unknown"] as const) {
       expect(() =>
-        ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision, expectedToken: q2.token, actor: OTHER }),
+        ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision, expectedToken: q2.token, actor: OTHER , note: "運営確認済み" }),
       ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_NOT_APPLICABLE" }));
     }
 
@@ -437,10 +443,195 @@ describe("運営による決着 — 外部配送の未確定", () => {
     const p = buy(ctx);
     uncertain(ctx, p.id);
     const quote = ctx.shop.quoteOperatorResolution(p.id);
-    ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: quote.token, actor: STAFF });
+    ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: quote.token, actor: STAFF , note: "運営確認済み" });
 
     expect(() => ctx.db.prepare("UPDATE shop_operator_resolutions SET decision='no_effect'").run()).toThrow(/append-only/);
     expect(() => ctx.db.prepare("DELETE FROM shop_operator_resolutions").run()).toThrow(/append-only/);
+    ctx.db.close();
+  });
+});
+
+describe("根拠が無ければ決着させない（Core側のauthority）", () => {
+  for (const [label, note] of [["空文字", ""], ["空白だけ", "   \n\t "]] as const) {
+    for (const decision of ["delivered", "no_effect"] as const) {
+      it(`${decision} + ${label} → 何も変えずに拒否する`, () => {
+        const ctx = setup();
+        const p = buy(ctx);
+        uncertain(ctx, p.id);
+        const before = landOf(ctx);
+        const quote = ctx.shop.quoteOperatorResolution(p.id);
+
+        expect(() =>
+          ctx.shop.resolveOperatorCase({
+            purchaseId: p.id,
+            decision,
+            expectedToken: quote.token,
+            actor: STAFF,
+            note,
+          }),
+        ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_EVIDENCE_REQUIRED" }));
+
+        // 資産・状態・配送・claim・台帳のどれも動かない
+        expect(landOf(ctx)).toBe(before);
+        expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
+        expect(ctx.shop.getPurchase(p.id)!.delivery_state).not.toBe("delivered");
+        expect(ctx.shop.externalDeliveryClaim(p.id)!.state).toBe("uncertain");
+        expect(resolutionsOf(ctx, p.id)).toHaveLength(0);
+        expect(ctx.events.listByType("shop_refunded")).toHaveLength(0);
+        ctx.db.close();
+      });
+    }
+  }
+
+  it("no_effect + 返金 + 根拠なし → 返金も走らない", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    uncertain(ctx, p.id);
+    const before = landOf(ctx);
+    const quote = ctx.shop.quoteOperatorResolution(p.id);
+
+    expect(() =>
+      ctx.shop.resolveOperatorCase({
+        purchaseId: p.id,
+        decision: "no_effect",
+        expectedToken: quote.token,
+        actor: STAFF,
+        note: "  ",
+        refund: true,
+      }),
+    ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_EVIDENCE_REQUIRED" }));
+
+    expect(landOf(ctx)).toBe(before);
+    expect(ctx.events.listByType("shop_refunded")).toHaveLength(0);
+    expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
+    ctx.db.close();
+  });
+
+  it("still_unknown は根拠が無くてもよい", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    uncertain(ctx, p.id);
+    const quote = ctx.shop.quoteOperatorResolution(p.id);
+
+    const result = ctx.shop.resolveOperatorCase({
+      purchaseId: p.id,
+      decision: "still_unknown",
+      expectedToken: quote.token,
+      actor: STAFF,
+    });
+
+    expect(result.decision).toBe("still_unknown");
+    expect(resolutionsOf(ctx, p.id)[0]!.note).toBeNull();
+    expect(ctx.shop.countUnresolvedCases()).toBe(1);
+    ctx.db.close();
+  });
+
+  it("根拠があれば通常どおり決着する", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    uncertain(ctx, p.id);
+    const quote = ctx.shop.quoteOperatorResolution(p.id);
+
+    ctx.shop.resolveOperatorCase({
+      purchaseId: p.id,
+      decision: "delivered",
+      expectedToken: quote.token,
+      actor: STAFF,
+      note: "  ロールを確認  ",
+    });
+
+    // 前後の空白は落として保存する
+    expect(resolutionsOf(ctx, p.id)[0]!.note).toBe("ロールを確認");
+    expect(ctx.shop.getPurchase(p.id)!.delivery_state).toBe("delivered");
+    ctx.db.close();
+  });
+});
+
+describe("決着待ちキューは全件を辿れる", () => {
+  /** 決着待ちの案件を n 件作る */
+  function makeCases(ctx: Ctx, n: number): number[] {
+    const ids: number[] = [];
+    for (let i = 0; i < n; i += 1) {
+      const id = ctx.db
+        .prepare(
+          `INSERT INTO shop_purchases (item_id,user_id,purchased_at,paid_land,status,delivery_state)
+           VALUES (?,?,?,100,'active','pending') RETURNING id`,
+        )
+        .pluck()
+        .get(ctx.item.id, `${USER}-${i}`, i + 1) as number;
+      ids.push(id);
+    }
+    return ids;
+  }
+
+  it("12件をページで辿れて、重複も欠落もない", () => {
+    const ctx = setup();
+    const ids = makeCases(ctx, 12);
+    expect(ctx.shop.countUnresolvedCases()).toBe(12);
+
+    const page = (offset: number) =>
+      ctx.shop.listUnresolvedCases({ limit: 5, offset }).map((c) => c.purchaseId);
+    const p1 = page(0);
+    const p2 = page(5);
+    const p3 = page(10);
+
+    expect(p1).toHaveLength(5);
+    expect(p2).toHaveLength(5);
+    expect(p3).toHaveLength(2);
+    // 重複なし・全件到達
+    const seen = [...p1, ...p2, ...p3];
+    expect(new Set(seen).size).toBe(12);
+    expect(seen.sort((a, b) => a - b)).toEqual([...ids].sort((a, b) => a - b));
+    // 古い案件が先（stuckSince ASC）
+    expect(p1[0]).toBe(ids[0]);
+    ctx.db.close();
+  });
+
+  it("先頭5件を全部「判断できない」にしても、6件目以降へ到達できる", () => {
+    const ctx = setup();
+    makeCases(ctx, 12);
+    for (const c of ctx.shop.listUnresolvedCases({ limit: 5, offset: 0 })) {
+      const q = ctx.shop.quoteOperatorResolution(c.purchaseId);
+      ctx.shop.resolveOperatorCase({
+        purchaseId: c.purchaseId,
+        decision: "still_unknown",
+        expectedToken: q.token,
+        actor: STAFF,
+      });
+    }
+    // 保留は案件を残すので、1ページ目は同じまま
+    expect(ctx.shop.countUnresolvedCases()).toBe(12);
+    const p1 = ctx.shop.listUnresolvedCases({ limit: 5, offset: 0 }).map((c) => c.purchaseId);
+    const p2 = ctx.shop.listUnresolvedCases({ limit: 5, offset: 5 }).map((c) => c.purchaseId);
+    expect(p2).toHaveLength(5);
+    expect(p1.some((id) => p2.includes(id))).toBe(false);
+    ctx.db.close();
+  });
+
+  it("1件決着させると、件数も一覧も同じだけ減る", () => {
+    const ctx = setup();
+    makeCases(ctx, 12);
+    const first = ctx.shop.listUnresolvedCases({ limit: 1, offset: 0 })[0]!;
+    const q = ctx.shop.quoteOperatorResolution(first.purchaseId);
+    ctx.shop.resolveOperatorCase({
+      purchaseId: first.purchaseId,
+      decision: "delivered",
+      expectedToken: q.token,
+      actor: STAFF,
+      note: "確認済み",
+    });
+
+    expect(ctx.shop.countUnresolvedCases()).toBe(11);
+    const all = ctx.shop.listUnresolvedCases({ limit: 100 }).map((c) => c.purchaseId);
+    expect(all).toHaveLength(11);
+    expect(all).not.toContain(first.purchaseId);
+    ctx.db.close();
+  });
+
+  it("件数は distinct purchase と一致する（一覧と同じ集合）", () => {
+    const ctx = setup();
+    makeCases(ctx, 7);
+    expect(ctx.shop.countUnresolvedCases()).toBe(ctx.shop.listUnresolvedCases({ limit: 1000 }).length);
     ctx.db.close();
   });
 });

@@ -151,6 +151,7 @@ describe("常設パネルの表示", () => {
       "shokan:sub",
       "shokan:reeval-comp",
       "shokan:stuck-delivery",
+      "shokan:refund-open:0",
     ]);
     expect(panel.components?.every((row) => row.toJSON().components.length <= 5)).toBe(true);
     ctx.db.close();

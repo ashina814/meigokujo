@@ -230,7 +230,7 @@ describe("運営の決着UI", () => {
 
     // 別の運営が先に「提供済み」で決着させた
     const q = ctx.shop.quoteOperatorResolution(p.id);
-    ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: q.token, actor: "other" });
+    ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: q.token, actor: "other" , note: "運営確認済み" });
     const before = landOf(ctx);
 
     const confirm = vi.fn(async () => undefined);
