@@ -3463,6 +3463,42 @@ export class Shop {
   }
 
   /**
+   * 「副作用は無いと確認できた失敗」を、**切れ目なく**決着させる。
+   *
+   * claim の解放と返金（または義務の記録）を別々にすると、その隙に失効が入れる。
+   * 失効してしまうと `refund()` は active からしか動けないので復旧不能になる——
+   * 「金は返っていない・失効済み・キューにも出ない」が完成する。
+   *
+   * 1つの IMMEDIATE transaction に閉じるので、外から見える状態は
+   * 「claimで守られている」か「返金済み」か「義務が立っている」のどれかしかない。
+   */
+  settleVerifiedFailure(input: {
+    purchaseId: number;
+    claimToken: string | null;
+    reason: string;
+    actor: string;
+  }): { refunded: boolean; amount: number } | { failed: true; code: string | null; message: string } {
+    const body = ():
+      | { refunded: boolean; amount: number }
+      | { failed: true; code: string | null; message: string } => {
+      if (input.claimToken !== null) {
+        // 解放できなくても続ける。別経路が先に決着させていた場合も、
+        // 下の返金側の条件（active であること）が最終的な安全弁になる。
+        this.db
+          .prepare(
+            `UPDATE shop_external_delivery_attempts
+                SET state = 'released', updated_at = ?, detail = ?
+              WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+          )
+          .run(now(), "verified_no_effect", input.purchaseId, input.claimToken);
+      }
+      this.markDeliveryFailed(input.purchaseId, input.reason, input.actor);
+      return this.refundOrRecordFailure(input.purchaseId, input.reason, input.actor);
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /**
    * 返金を試し、駄目なら**同じ transaction の中で**義務を記録する。
    *
    * 別々にすると、失敗してから記録するまでの隙に失効が割り込める。割り込まれると
@@ -4430,11 +4466,26 @@ export class Shop {
 
   expireOverdue(actor: string, limit = 200): { expired: PurchaseRow[]; failed: Array<{ purchaseId: number; error: string }> } {
     const ts = now();
+    // **動かせない行で LIMIT を埋めない。**
+    //
+    // `refund_pending` や配送中の行は、運営が片付けるまで overdue のまま残り続ける。
+    // それを候補に含めたまま LIMIT を掛けると、古い順に並んだ「絶対に失効しない行」が
+    // 毎回枠を占有し、その後ろの普通の期限切れへ永久に到達できない。
+    // ここで先に外してから LIMIT を掛ける。**最終判断は `expireIfDue()` のまま。**
     const due = this.db
       .prepare(
-        `SELECT id FROM shop_purchases
-          WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?
-          ORDER BY expires_at
+        `SELECT p.id FROM shop_purchases p
+          WHERE p.status = 'active' AND p.expires_at IS NOT NULL AND p.expires_at <= ?
+            AND NOT EXISTS (
+              SELECT 1 FROM shop_external_delivery_attempts a
+               WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM shop_purchases q
+               WHERE q.id = p.id
+                 AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = q.id)
+            )
+          ORDER BY p.expires_at
           LIMIT ?`,
       )
       .all(ts, limit) as Array<{ id: number }>;

@@ -759,6 +759,92 @@ describe("返すべき金は、期限が来ても消えない", () => {
   });
 });
 
+describe("止められた行が、失効の巡回を詰まらせない", () => {
+  /** overdue だが「今は動かせない」購入を n 件作る（古い順に並ぶ） */
+  function guardedOverdue(ctx: Ctx, n: number, kind: "refund" | "claim"): number[] {
+    const ids: number[] = [];
+    for (let i = 0; i < n; i += 1) {
+      const id = ctx.db
+        .prepare(
+          `INSERT INTO shop_purchases (item_id,user_id,purchased_at,expires_at,paid_land,status,delivery_state,delivery_snapshot_json)
+           VALUES (?,?,?,?,100,'active','failed',?) RETURNING id`,
+        )
+        .pluck()
+        .get(ctx.item.id, `${USER}-g${i}`, i + 1, i + 1, JSON.stringify({ delivery_kind: "add_role", delivery_data: { role_id: ROLE } })) as number;
+      if (kind === "refund") {
+        ctx.shop.recordRefundFailure({ purchaseId: id, amount: 100, reason: "delivery_failed", actor: "system" });
+      } else {
+        const claim = ctx.shop.claimExternalDelivery({ purchaseId: id, deliveryKind: "add_role", actor: "system" });
+        ctx.shop.markExternalDeliveryUncertain({
+          purchaseId: id,
+          token: (claim as { token: string }).token,
+          reason: "final_fetch_failed",
+          actor: "system",
+        });
+      }
+      ids.push(id);
+    }
+    return ids;
+  }
+
+  /**
+   * 普通に失効できる overdue 購入（止められた行より新しい期限）。
+   *
+   * **実際に買って実際に配る。** 直接INSERTした行は購入時 provenance を持たないので
+   * 「何を与えたか証明できない旧購入」扱いになり、失効しても剥奪キューへ載らない。
+   * それでは「後処理まで届いた」ことを確かめたことにならない。
+   */
+  function plainOverdue(ctx: Ctx, seq: number): number {
+    const purchase = buy(ctx);
+    ctx.shop.beginDelivery(purchase.id);
+    ctx.shop.markDeliverySucceeded(purchase.id, "system:test");
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=? WHERE id=?").run(100_000 + seq, purchase.id);
+    return purchase.id;
+  }
+
+  it("返金待ちが200件あっても、その後ろの期限切れへ到達できる", () => {
+    const ctx = setup();
+    const guarded = guardedOverdue(ctx, 200, "refund");
+    const plain = plainOverdue(ctx, 1);
+
+    // 既定の limit（200）で1回だけ回す
+    const result = ctx.shop.expireOverdue(STAFF);
+
+    // 止められた200件は active のまま
+    for (const id of guarded) expect(ctx.shop.getPurchase(id)!.status).toBe("active");
+    expect(ctx.shop.countRefundFailures()).toBe(200);
+    // **後ろの普通の購入へ到達できている**
+    expect(result.expired.map((r) => r.id)).toContain(plain);
+    expect(ctx.shop.getPurchase(plain)!.status).toBe("expired");
+    // 通常の後処理（剥奪キュー）も走っている
+    expect(ctx.shop.pendingRoleRevocations().map((r) => r.purchase_id)).toContain(plain);
+    ctx.db.close();
+  });
+
+  it("配送中が200件あっても、その後ろの期限切れへ到達できる", () => {
+    const ctx = setup();
+    const guarded = guardedOverdue(ctx, 200, "claim");
+    const plain = plainOverdue(ctx, 1);
+
+    const result = ctx.shop.expireOverdue(STAFF);
+
+    for (const id of guarded) expect(ctx.shop.getPurchase(id)!.status).toBe("active");
+    expect(result.expired.map((r) => r.id)).toContain(plain);
+    expect(ctx.shop.getPurchase(plain)!.status).toBe("expired");
+    ctx.db.close();
+  });
+
+  it("最終判断は expireIfDue に残っている（候補選択だけを安全境界にしない）", () => {
+    const ctx = setup();
+    const [id] = guardedOverdue(ctx, 1, "refund");
+    // 候補選択を通り越して直接呼んでも止まる
+    expect(ctx.shop.expireIfDue(id!, STAFF)).toEqual({ expired: false, reason: "refund_pending" });
+    const [claimed] = guardedOverdue(ctx, 1, "claim");
+    expect(ctx.shop.expireIfDue(claimed!, STAFF)).toEqual({ expired: false, reason: "delivery_in_flight" });
+    ctx.db.close();
+  });
+});
+
 describe("決着させた旧購入は、もう「不明」に戻らない", () => {
   it("提供なしで決着したら決着キューから消える", () => {
     const ctx = setup();

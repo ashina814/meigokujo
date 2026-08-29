@@ -55,6 +55,15 @@ export interface DeliveryOutcome {
    * 「払っていないのにロールを持っている」が残る。ここは人が見て決める。
    */
   refundable?: boolean;
+  /**
+   * **返金の決着まで持ち越した claim。**
+   *
+   * 「副作用は無い」と確認できた失敗でも、ここで claim を解放してしまうと、
+   * 返金の transaction を取るまでの隙に別プロセスの失効が入れる。失効されると
+   * `refund()` は active からしか動けないので復旧不能になる。
+   * 返金まで面倒を見る呼び出し側（`deliverOrRefund`）へ、鍵を持ったまま渡す。
+   */
+  refundClaimToken?: string;
 }
 
 /**
@@ -193,6 +202,7 @@ export async function deliverPurchaseUnlocked(
   guild: Guild | null,
   purchase: PurchaseRow,
   actor: string,
+  opts: { deferReleaseForRefund?: boolean } = {},
 ): Promise<DeliveryOutcome> {
   const begin = services.shop.beginDelivery(purchase.id);
   if (begin.reason === "not_active") {
@@ -226,6 +236,7 @@ export async function deliverPurchaseUnlocked(
    * 手動返金や失効は claim が無いので素通りする。
    */
   let effectMayHaveOccurred = false;
+  const deferReleaseForRefund = opts.deferReleaseForRefund === true;
 
   /** 外部APIを叩く直前に必ず呼ぶ。投げた事実を先に残す。 */
   const markExternalAttempt = (): void => {
@@ -243,8 +254,12 @@ export async function deliverPurchaseUnlocked(
     // それ以外は uncertain。**付け忘れたら解放される fail-open にはしない。**
     const canRelease = !effectMayHaveOccurred || opts.verifiedNoEffect === true;
     let uncertain = false;
+    let carried: string | null = null;
     if (claimToken !== null) {
-      if (canRelease) {
+      if (canRelease && deferReleaseForRefund) {
+        // **鍵を持ったまま返す。** 解放と返金を1つの transaction で確定させる
+        carried = claimToken;
+      } else if (canRelease) {
         services.shop.releaseExternalDelivery({ purchaseId: purchase.id, token: claimToken, reason, actor });
       } else {
         // 投げたが結果を確認できない。claim を消さない＝「失敗だった」と断定しない。
@@ -254,7 +269,8 @@ export async function deliverPurchaseUnlocked(
       }
       claimToken = null;
     }
-    services.shop.markDeliveryFailed(purchase.id, reason, actor);
+    // 持ち越したときは、配送失敗の確定も返金と同じ transaction でまとめる
+    if (carried === null) services.shop.markDeliveryFailed(purchase.id, reason, actor);
     return {
       state: "failed",
       message: userMessage,
@@ -262,6 +278,7 @@ export async function deliverPurchaseUnlocked(
       // **claim の状態が authority。** `refundable` に claim state を決めさせない。
       // 確認できていないものは絶対に自動返金へ回さない。
       refundable: uncertain ? false : opts.refundable,
+      ...(carried !== null ? { refundClaimToken: carried } : {}),
     };
   };
 

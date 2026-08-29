@@ -146,6 +146,48 @@ const buttonIds = (fn: ReturnType<typeof vi.fn>): string[] =>
   (payload(fn)?.components ?? []).flatMap((r: any) => (r.components ?? []).map((c: any) => c.data?.custom_id ?? ""));
 const landOf = (ctx: Ctx) => ctx.ledger.balanceOf(`user:${USER}`);
 
+describe("返金へ回す失敗は、決着まで守りを外さない", () => {
+  it("返金の決着を呼ぶ時点で、まだ claim を握っている", async () => {
+    const { deliverOrRefund } = await refundModule;
+    const ctx = setup();
+    const p = buy(ctx);
+
+    // 決着が呼ばれた**その瞬間**の状態を写し取る
+    let calledWith: { claimToken: string | null } | null = null;
+    let guardedAtCall: number | null = null;
+    const real = ctx.shop.settleVerifiedFailure.bind(ctx.shop);
+    const spy = vi.spyOn(ctx.shop, "settleVerifiedFailure").mockImplementation((input) => {
+      calledWith = { claimToken: input.claimToken };
+      guardedAtCall = ctx.db
+        .prepare(
+          "SELECT COUNT(*) FROM shop_external_delivery_attempts WHERE purchase_id=? AND state IN ('in_flight','uncertain')",
+        )
+        .pluck()
+        .get(input.purchaseId) as number;
+      return real(input);
+    });
+
+    const settled = await deliverOrRefund(ctx.client as never, ctx.services, verifiedFailureGuild() as never, p, "system:test");
+    spy.mockRestore();
+
+    expect(settled.refund).toBe("refunded");
+    // **鍵を持ったまま渡している。** 先に解放すると、返金を取るまでの隙に失効が入れる
+    expect(calledWith!.claimToken).toEqual(expect.any(String));
+    expect(guardedAtCall).toBe(1);
+    // 決着後は解放され、返金は済んでいる
+    expect(
+      ctx.db
+        .prepare(
+          "SELECT COUNT(*) FROM shop_external_delivery_attempts WHERE purchase_id=? AND state IN ('in_flight','uncertain')",
+        )
+        .pluck()
+        .get(p.id),
+    ).toBe(0);
+    expect(ctx.shop.getPurchase(p.id)!.status).toBe("refunded");
+    ctx.db.close();
+  });
+});
+
 describe("返金の未完了は別のキュー", () => {
   it("返金に失敗した購入は返金キューへ出て、配送再試行には出ない", async () => {
     const ctx = setup();

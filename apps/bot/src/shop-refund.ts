@@ -45,7 +45,10 @@ export function deliverOrRefund(
 ): Promise<Settlement> {
   return withNicknameSerialization(purchase, () =>
     withPurchaseLock(purchase.id, async () => {
-      const outcome = await deliverPurchaseUnlocked(services, guild, purchase, actor);
+      // **返金まで面倒を見るので、claim は解放させずに受け取る。**
+      const outcome = await deliverPurchaseUnlocked(services, guild, purchase, actor, {
+        deferReleaseForRefund: true,
+      });
       if (outcome.state !== "failed") return { outcome };
       if (outcome.refundable === false) {
         // Discord側の副作用を戻せたか確認できていない。**返金しないで人へ渡す**
@@ -60,7 +63,14 @@ export function deliverOrRefund(
         await notifyUncertainDelivery(client, services, purchase.id).catch(() => undefined);
         return { outcome, refund: "withheld" as const };
       }
-      const refund = await refundOrEscalate(client, services, purchase, outcome.error ?? "delivery_failed", actor);
+      const refund = await refundOrEscalate(
+        client,
+        services,
+        purchase,
+        outcome.error ?? "delivery_failed",
+        actor,
+        outcome.refundClaimToken ?? null,
+      );
       return { outcome, refund };
     }),
   );
@@ -80,12 +90,18 @@ export async function refundOrEscalate(
   purchase: { id: number; user_id: string },
   reason: string,
   actor: string,
+  claimToken: string | null = null,
 ): Promise<RefundOutcome> {
-  let outcome: ReturnType<typeof services.shop.refundOrRecordFailure>;
+  let outcome: ReturnType<typeof services.shop.settleVerifiedFailure>;
   try {
-    // **返金の試行と義務の記録を1つの transaction で。** 別々にすると、失敗してから
-    // 記録するまでの隙に失効が割り込み、復旧不能な状態が作れる
-    outcome = services.shop.refundOrRecordFailure(purchase.id, reason, actor);
+    // **claim の解放・配送失敗の確定・返金（または義務の記録）を1つの transaction で。**
+    // 別々にすると、その隙に別プロセスの失効が割り込み、復旧不能な状態が作れる
+    outcome = services.shop.settleVerifiedFailure({
+      purchaseId: purchase.id,
+      claimToken,
+      reason,
+      actor,
+    });
   } catch (error) {
     if (error instanceof ShopError && error.code === "ERR_ALREADY_DELIVERED") {
       // 配送が先に確定していた。返さないのが正しいので、人も呼ばない
