@@ -547,6 +547,170 @@ describe("根拠が無ければ決着させない（Core側のauthority）", () 
   });
 });
 
+describe("返金の未完了は「まだ返せていない」ものだけ", () => {
+  function refundFailed(ctx: Ctx) {
+    const p = buy(ctx);
+    ctx.shop.markDeliveryFailed(p.id, "role_add_failed", "system");
+    ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
+    return p;
+  }
+
+  it("返金に失敗したら出る", () => {
+    const ctx = setup();
+    const p = refundFailed(ctx);
+    expect(ctx.shop.countRefundFailures()).toBe(1);
+    expect(ctx.shop.quoteRefundRetry(p.id).open).toBe(true);
+    ctx.db.close();
+  });
+
+  it("そのあと提供済みになったら消える（返金のやり直しもできない）", () => {
+    const ctx = setup();
+    const p = refundFailed(ctx);
+    ctx.shop.beginDelivery(p.id);
+    ctx.shop.markDeliverySucceeded(p.id, STAFF);
+
+    // active のままだが、提供済みなので「返金の未完了」ではない
+    expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
+    expect(ctx.shop.countRefundFailures()).toBe(0);
+    expect(ctx.shop.listRefundFailures()).toHaveLength(0);
+    const quote = ctx.shop.quoteRefundRetry(p.id);
+    expect(quote.open).toBe(false);
+    expect(() => ctx.shop.retryRefund({ purchaseId: p.id, expectedToken: quote.token, actor: STAFF })).toThrow(
+      expect.objectContaining({ code: "ERR_RESOLUTION_NOT_APPLICABLE" }),
+    );
+    ctx.db.close();
+  });
+
+  it("返金済み・失効になっても消える", () => {
+    for (const finish of ["refunded", "expired"] as const) {
+      const ctx = setup();
+      const p = refundFailed(ctx);
+      if (finish === "refunded") ctx.shop.refund(p.id, "別経路", STAFF);
+      else {
+        ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(p.id);
+        ctx.shop.expireIfDue(p.id, STAFF);
+      }
+      expect(ctx.shop.countRefundFailures()).toBe(0);
+      expect(ctx.shop.quoteRefundRetry(p.id).open).toBe(false);
+      ctx.db.close();
+    }
+  });
+
+  it("やり直してまた失敗したら、その事実が残る", () => {
+    const ctx = setup();
+    const p = refundFailed(ctx);
+    const rows = () => ctx.db.prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id=?").pluck().get(p.id);
+    expect(rows()).toBe(1);
+
+    const spy = () => {
+      throw new Error("ledger unavailable");
+    };
+    const original = ctx.shop.refund.bind(ctx.shop);
+    (ctx.shop as unknown as { refund: unknown }).refund = spy;
+    const q1 = ctx.shop.quoteRefundRetry(p.id);
+    expect(() => ctx.shop.retryRefund({ purchaseId: p.id, expectedToken: q1.token, actor: STAFF })).toThrow();
+    // **記録が巻き戻らない**
+    expect(rows()).toBe(2);
+
+    const q2 = ctx.shop.quoteRefundRetry(p.id);
+    // 失敗が増えたので古いボタンは通らない
+    expect(q2.token).not.toBe(q1.token);
+    expect(() => ctx.shop.retryRefund({ purchaseId: p.id, expectedToken: q1.token, actor: STAFF })).toThrow(
+      expect.objectContaining({ code: "ERR_RESOLUTION_STALE" }),
+    );
+    expect(() => ctx.shop.retryRefund({ purchaseId: p.id, expectedToken: q2.token, actor: STAFF })).toThrow();
+    expect(rows()).toBe(3);
+
+    // まだ active・1件の案件として残る
+    expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
+    expect(ctx.shop.countRefundFailures()).toBe(1);
+
+    // 記録は書き換えも削除もできない
+    expect(() => ctx.db.prepare("UPDATE shop_refund_failures SET reason='x'").run()).toThrow(/append-only/);
+    expect(() => ctx.db.prepare("DELETE FROM shop_refund_failures").run()).toThrow(/append-only/);
+
+    // 復旧すればちょうど一度だけ返る
+    (ctx.shop as unknown as { refund: unknown }).refund = original;
+    const before = landOf(ctx);
+    const q3 = ctx.shop.quoteRefundRetry(p.id);
+    expect(ctx.shop.retryRefund({ purchaseId: p.id, expectedToken: q3.token, actor: STAFF }).refunded).toBe(true);
+    expect(landOf(ctx)).toBe(before + 100);
+    expect(ctx.events.listByType("shop_refunded")).toHaveLength(1);
+    expect(ctx.shop.countRefundFailures()).toBe(0);
+    ctx.db.close();
+  });
+});
+
+describe("決着させた旧購入は、もう「不明」に戻らない", () => {
+  it("提供なしで決着したら決着キューから消える", () => {
+    const ctx = setup();
+    const p = legacyPurchase(ctx);
+    const quote = ctx.shop.quoteOperatorResolution(p.id);
+    ctx.shop.resolveOperatorCase({
+      purchaseId: p.id,
+      decision: "no_effect",
+      expectedToken: quote.token,
+      actor: STAFF,
+      note: "痕跡なし",
+    });
+
+    expect(ctx.shop.unresolvedCaseKind(p.id)).toBeNull();
+    expect(ctx.shop.countUnresolvedCases()).toBe(0);
+    expect(ctx.shop.listUnresolvedCases({ limit: 100 })).toHaveLength(0);
+
+    // 別の決着を後から足せない
+    const fresh = ctx.shop.quoteOperatorResolution(p.id);
+    expect(fresh.kind).toBeNull();
+    expect(fresh.allowedDecisions).toEqual([]);
+    expect(() =>
+      ctx.shop.resolveOperatorCase({
+        purchaseId: p.id,
+        decision: "delivered",
+        expectedToken: fresh.token,
+        actor: OTHER,
+        note: "やっぱり提供済み",
+      }),
+    ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_NOT_APPLICABLE" }));
+
+    // 残した確認は後続の返金の証拠として使える
+    const before = landOf(ctx);
+    expect(ctx.shop.refund(p.id, "運営確認済み", STAFF).refunded).toBe(true);
+    expect(landOf(ctx)).toBe(before + 100);
+    ctx.db.close();
+  });
+
+  it("提供済みで決着しても消える", () => {
+    const ctx = setup();
+    const p = legacyPurchase(ctx);
+    const quote = ctx.shop.quoteOperatorResolution(p.id);
+    ctx.shop.resolveOperatorCase({
+      purchaseId: p.id,
+      decision: "delivered",
+      expectedToken: quote.token,
+      actor: STAFF,
+      note: "記録を確認",
+    });
+    expect(ctx.shop.countUnresolvedCases()).toBe(0);
+    ctx.db.close();
+  });
+
+  it("保留のままなら残る", () => {
+    const ctx = setup();
+    const p = legacyPurchase(ctx);
+    const quote = ctx.shop.quoteOperatorResolution(p.id);
+    ctx.shop.resolveOperatorCase({
+      purchaseId: p.id,
+      decision: "still_unknown",
+      expectedToken: quote.token,
+      actor: STAFF,
+    });
+    expect(ctx.shop.unresolvedCaseKind(p.id)).toBe("legacy_unknown");
+    expect(ctx.shop.countUnresolvedCases()).toBe(1);
+    expect(ctx.shop.listUnresolvedCases({ limit: 100 })).toHaveLength(1);
+    ctx.db.close();
+  });
+});
+
 describe("決着待ちキューは全件を辿れる", () => {
   /** 決着待ちの案件を n 件作る */
   function makeCases(ctx: Ctx, n: number): number[] {

@@ -3117,8 +3117,10 @@ export class Shop {
     const legacy = this.db
       .prepare(
         `SELECT
-           EXISTS (SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.legacyUnknownSql()}) AS unknown_kind,
-           EXISTS (SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}) AS unknown_outcome`,
+           EXISTS (SELECT 1 FROM shop_purchases p
+                    WHERE p.id = ? AND ${Shop.legacyUnknownSql()} AND NOT ${Shop.OPERATOR_DECIDED_SQL}) AS unknown_kind,
+           EXISTS (SELECT 1 FROM shop_purchases p
+                    WHERE p.id = ? AND ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL} AND NOT ${Shop.OPERATOR_DECIDED_SQL}) AS unknown_outcome`,
       )
       .get(purchaseId, purchaseId) as { unknown_kind: number; unknown_outcome: number };
     if (legacy.unknown_kind === 1 || legacy.unknown_outcome === 1) return "legacy_unknown";
@@ -3360,11 +3362,25 @@ export class Shop {
         FROM shop_external_delivery_attempts a
        WHERE a.state IN ('in_flight','uncertain')
       UNION ALL
-      SELECT p.id, p.purchased_at FROM shop_purchases p WHERE ${Shop.legacyUnknownSql()}
+      SELECT p.id, p.purchased_at FROM shop_purchases p
+       WHERE ${Shop.legacyUnknownSql()} AND NOT ${Shop.OPERATOR_DECIDED_SQL}
       UNION ALL
-      SELECT p.id, p.purchased_at FROM shop_purchases p WHERE ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}
+      SELECT p.id, p.purchased_at FROM shop_purchases p
+       WHERE ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL} AND NOT ${Shop.OPERATOR_DECIDED_SQL}
     ) GROUP BY id`;
   }
+
+  /**
+   * 運営が**提供状況を確定させた**購入か。
+   *
+   * `delivered` / `no_effect` は「提供されたか分からない」を終わらせる判断なので、
+   * そのあとで同じ購入を「不明」として出し直すのは事実と矛盾する。
+   * `still_unknown` は決着していないので対象外。
+   */
+  private static readonly OPERATOR_DECIDED_SQL = `EXISTS (
+    SELECT 1 FROM shop_operator_resolutions o
+     WHERE o.purchase_id = p.id AND o.decision IN ('delivered','no_effect')
+  )`;
 
   /**
    * 決着待ちの案件。**全件を辿れるようにページで返す。**
@@ -3453,8 +3469,21 @@ export class Shop {
    * 自動的にこの一覧から消えるので、記録を後から書き換える必要が無い。
    */
   private static refundFailureSql(): string {
+    // **提供済みなら「返金の未完了」ではない。** `delivery_state` だけを見ると、
+    // 正常に提供できた購入（active + delivered）が返金待ちとして残り続ける。
+    // 提供済みの判定は既存の authoritative evidence をそのまま使う。
     return `p.status = 'active'
+      AND p.delivered_at IS NULL
+      AND NOT ${Shop.DELIVERED_EVIDENCE_SQL}
       AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)`;
+  }
+
+  /** 上と**同じ判定**を1件へ当てる。一覧・件数・確認・確定で条件を分けない。 */
+  private refundFailureOpen(purchaseId: number): boolean {
+    const row = this.db
+      .prepare(`SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.refundFailureSql()} LIMIT 1`)
+      .get(purchaseId);
+    return row !== undefined;
   }
 
   listRefundFailures(opts: { limit?: number; offset?: number } = {}): Array<{
@@ -3505,7 +3534,7 @@ export class Shop {
     const purchase = this.getPurchase(purchaseId);
     if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
     const item = this.getItem(purchase.item_id);
-    const open = this.countRefundFailuresFor(purchaseId) > 0 && purchase.status === "active";
+    const open = this.refundFailureOpen(purchaseId);
     return {
       purchaseId,
       userId: purchase.user_id,
@@ -3542,29 +3571,31 @@ export class Shop {
    * 画面を開いたあとに状況が変わっていれば1つも書かずに止める。
    */
   retryRefund(input: { purchaseId: number; expectedToken: string; actor: string }): { refunded: boolean; amount: number } {
-    const body = (): { refunded: boolean; amount: number } => {
-      const purchase = this.getPurchase(input.purchaseId);
-      if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
-      const open = this.countRefundFailuresFor(input.purchaseId) > 0 && purchase.status === "active";
-      if (this.refundRetryToken(purchase, open) !== input.expectedToken) {
-        throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
-      }
-      if (!open) throw new ShopError("ERR_RESOLUTION_NOT_APPLICABLE", { purchaseId: input.purchaseId });
-      try {
-        return this.refund(input.purchaseId, "運営: 返金のやり直し", input.actor);
-      } catch (error) {
-        // 失敗の事実を積み直す（append-only なので上書きはしない）
-        this.recordRefundFailure({
-          purchaseId: input.purchaseId,
-          amount: purchase.paid_land ?? 0,
-          reason: "retry_failed",
-          detail: error instanceof Error ? error.message : String(error),
-          actor: input.actor,
-        });
-        throw error;
-      }
-    };
-    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+    const purchase = this.getPurchase(input.purchaseId);
+    if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+    const open = this.refundFailureOpen(input.purchaseId);
+    if (this.refundRetryToken(purchase, open) !== input.expectedToken) {
+      throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
+    }
+    if (!open) throw new ShopError("ERR_RESOLUTION_NOT_APPLICABLE", { purchaseId: input.purchaseId });
+
+    // **返金の本体と、失敗の記録は別の transaction にする。**
+    // 同じ transaction の中で記録してから throw すると、その記録ごと巻き戻る——
+    // 「やり直して、また失敗した」という事実が durable に残らない。
+    // 二重返金の防止は `refund()` 自身（status条件付きUPDATE）が持っているので、
+    // ここで包み直す必要はない。
+    try {
+      return this.refund(input.purchaseId, "運営: 返金のやり直し", input.actor);
+    } catch (error) {
+      this.recordRefundFailure({
+        purchaseId: input.purchaseId,
+        amount: purchase.paid_land ?? 0,
+        reason: "retry_failed",
+        detail: error instanceof Error ? error.message : String(error),
+        actor: input.actor,
+      });
+      throw error;
+    }
   }
 
   /** 始末の記録。無ければまだ始末していない。 */
@@ -4023,6 +4054,13 @@ export class Shop {
             -- 「もう一度配る」ではなく「返金をやり直す」案件。別のキューで扱う。
             AND NOT EXISTS (
               SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id
+            )
+            -- **確認待ちも混ぜない。** 外部へ投げたまま結果が分からない購入は、
+            -- そもそも重ねて配れない（claimが塞ぐ）。両方のキューに出すと
+            -- 「対応が必要」の件数が同じ購入を二重に数えることになる。
+            AND NOT EXISTS (
+              SELECT 1 FROM shop_external_delivery_attempts a
+               WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
             )
             AND NOT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}
           ORDER BY p.purchased_at DESC`,

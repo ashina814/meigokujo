@@ -141,17 +141,15 @@ describe("常設パネルの表示", () => {
 
     const panel = shopAdminPanelMessage(ctx.services) as ReturnType<typeof payloadOf>;
 
-    expect(panel.embeds[0]!.data.description).toContain("要対応 1件");
+    expect(panel.embeds[0]!.data.description).toContain("対応が必要な仕事: 1件");
+    // **仕事の入口は1つ。** 種類ごとの入口をトップに並べない
     expect(idsOf(panel)).toEqual([
-      "shokan:pending",
-      "shokan:failed",
+      "shokan:work",
       "shokan:list",
       "shokan:orole",
-      "shokan:history:0",
       "shokan:sub",
+      "shokan:history:0",
       "shokan:reeval-comp",
-      "shokan:stuck-delivery",
-      "shokan:refund-open:0",
     ]);
     expect(panel.components?.every((row) => row.toJSON().components.length <= 5)).toBe(true);
     ctx.db.close();
@@ -163,7 +161,7 @@ describe("常設パネルの表示", () => {
 
     const panel = shopAdminPanelMessage(ctx.services) as ReturnType<typeof payloadOf>;
 
-    expect(panel.embeds[0]!.data.description).toContain("残っている仕事はありません");
+    expect(panel.embeds[0]!.data.description).toContain("対応が必要な仕事はありません");
     expect(JSON.stringify(panel)).not.toContain(USER);
     ctx.db.close();
   });
@@ -174,7 +172,7 @@ describe("常設パネルの表示", () => {
     buy(ctx, ctx.reeval.id);
 
     expect((shopAdminPanelMessage(ctx.services) as ReturnType<typeof payloadOf>).embeds[0]!.data.description).toContain(
-      "残っている仕事はありません",
+      "対応が必要な仕事はありません",
     );
     ctx.db.close();
   });
@@ -441,7 +439,7 @@ describe("件数と操作の対応（表示上限で数えない）", () => {
     for (let i = 0; i < 12; i += 1) buyAs(ctx, ctx.nickname.id, `u${i}`);
 
     const panel = shopAdminPanelMessage(ctx.services) as ReturnType<typeof payloadOf>;
-    expect(panel.embeds[0]!.data.description).toContain("要対応 12件");
+    expect(panel.embeds[0]!.data.description).toContain("対応が必要な仕事: 12件");
 
     const reply = vi.fn(async () => undefined);
     await handleShokanButton(panelPress("shokan:pending", reply), ctx.services);
@@ -466,7 +464,7 @@ describe("件数と操作の対応（表示上限で数えない）", () => {
     }
 
     expect((shopAdminPanelMessage(ctx.services) as ReturnType<typeof payloadOf>).embeds[0]!.data.description).toContain(
-      "処理失敗 11件",
+      "対応が必要な仕事: 11件",
     );
     ctx.db.close();
   });

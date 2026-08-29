@@ -123,6 +123,17 @@ function queueCounts(services: Services): {
   };
 }
 
+/**
+ * **商館スタッフが実際に手を動かす仕事の総数。**
+ *
+ * ここに入らないものは「仕事はありません」を覆さない。逆にここへ入れたものは
+ * 必ず商館から辿れて、商館スタッフの権限で終わらせられること。
+ * 剥奪の `blocked` は商館では処理できない（運営判断が要る）ので**含めない**。
+ */
+function merchantWorkTotal(c: { pending: number; failed: number; stuck: number; refundOpen: number }): number {
+  return c.pending + c.failed + c.stuck + c.refundOpen;
+}
+
 /** 表示しきれなかった分の注記。押せないボタンを並べる代わりに件数で伝える */
 function overflowNote(shown: number, total: number): string[] {
   return total > shown ? ["", `-# ほか **${total - shown}件**（対応すると次が出ます）`] : [];
@@ -148,76 +159,114 @@ function fmtJstDate(unixSec: number): string {
  * 個人ごとの情報は載せない（押した後の ephemeral で出す）ので、そのまま設置できる。
  */
 export function shopAdminPanelMessage(services: Services): MessageCreateOptions {
-  const { pending, failed, stuck, refundOpen, blockedRevocations } = queueCounts(services);
+  const counts = queueCounts(services);
+  const work = merchantWorkTotal(counts);
+  const oroleLegacy = services.originalRoles.countByStatus("pending");
+  const subPending = services.subAccounts.countByStatus("pending");
   const embed = new EmbedBuilder()
     .setTitle("🛠 冥界商館 管理")
-    .setColor(pending + failed > 0 ? 0xdc2626 : 0x64748b)
+    .setColor(work > 0 ? 0xdc2626 : 0x64748b)
     .setDescription(
       [
-        pending + failed > 0
-          ? `**残っている仕事: 要対応 ${pending}件 / 処理失敗 ${failed}件**`
-          : "残っている仕事はありません。",
-        stuck > 0
-          ? `**確認待ちの案件 ${stuck}件** — 提供できたか確認できていないため、自動では返金も完了もしていません。`
-          : "",
-        refundOpen > 0 ? `**返金の未完了 ${refundOpen}件** — 返金を試しましたが完了できていません。` : "",
-        blockedRevocations > 0
-          ? `**確認が要る剥奪 ${blockedRevocations}件** — 自動では再試行しません（購入時の対象を証明できませんでした）。`
-          : "",
-        services.originalRoles.countByStatus("pending") > 0
-          ? `**旧方式オリジナルロール ${services.originalRoles.countByStatus("pending")}件** がカルテ移行待ちです。`
-          : "",
+        work > 0 ? `**対応が必要な仕事: ${work}件**` : "対応が必要な仕事はありません。",
+        oroleLegacy > 0 ? `オリジナルロールのカルテ移行待ち: ${oroleLegacy}件` : "",
+        subPending > 0 ? `サブ垢の審査待ち: ${subPending}件` : "",
         "",
-        "-# 通知は変化のお知らせです。仕事の一覧は必ずここから開けます。",
-      ].join("\n"),
+        "-# 通知はお知らせです。やることは必ずここから開けます。",
+      ]
+        .filter((line, i, all) => line !== "" || i === all.length - 2)
+        .join("\n"),
     );
+  // **仕事の入口は1つ。** 中で種類ごとに分かれていても、現場が最初に押す場所は増やさない
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setCustomId("shokan:pending")
-      .setLabel(pending > 0 ? `要対応 ${pending}` : "要対応")
-      .setEmoji("🔴")
-      .setStyle(pending > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("shokan:failed")
-      .setLabel(failed > 0 ? `処理失敗 ${failed}` : "処理失敗")
-      .setEmoji("⚠️")
-      .setStyle(failed > 0 ? ButtonStyle.Danger : ButtonStyle.Secondary),
+      .setCustomId("shokan:work")
+      .setLabel(work > 0 ? `対応が必要 ${work}` : "対応が必要")
+      .setEmoji("📥")
+      .setStyle(work > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("shokan:list").setLabel("商品設定").setEmoji("📦").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId("shokan:orole")
-      .setLabel(
-        services.originalRoles.countByStatus("pending") > 0
-          ? `旧オリロ移行 ${services.originalRoles.countByStatus("pending")}`
-          : "オリジナルロール",
-      )
+      .setLabel(oroleLegacy > 0 ? `旧オリロ移行 ${oroleLegacy}` : "オリジナルロール")
       .setEmoji("🎨")
-      .setStyle(services.originalRoles.countByStatus("pending") > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("shokan:history:0").setLabel("購入履歴").setEmoji("📜").setStyle(ButtonStyle.Secondary),
-  );
-  // 1行は5個まで。増えたぶんは行を足す（超えると描画そのものが落ちる）
-  const subPending = services.subAccounts.countByStatus("pending");
-  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      .setStyle(oroleLegacy > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId("shokan:sub")
       .setLabel(subPending > 0 ? `サブ垢 ${subPending}` : "サブ垢")
       .setEmoji("👥")
       .setStyle(subPending > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("shokan:reeval-comp")
-      .setLabel("再評価の例外補償")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("shokan:stuck-delivery")
-      .setLabel(stuck > 0 ? `確認待ちの案件 ${stuck}` : "確認待ちの案件")
-      .setEmoji("🛰")
-      .setStyle(stuck > 0 ? ButtonStyle.Danger : ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("shokan:refund-open:0")
-      .setLabel(refundOpen > 0 ? `返金の未完了 ${refundOpen}` : "返金の未完了")
-      .setEmoji("💸")
-      .setStyle(refundOpen > 0 ? ButtonStyle.Danger : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("shokan:history:0").setLabel("購入履歴").setEmoji("📜").setStyle(ButtonStyle.Secondary),
+  );
+  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("shokan:reeval-comp").setLabel("再評価の例外補償").setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row, row2] };
+}
+
+/**
+ * 「対応が必要」の中身。**非0のものだけを、やることの言葉で出す。**
+ *
+ * `failed` / `uncertain` / `claim` のような内部の状態名は出さない。
+ * 商館スタッフが読むのは「何をするか」だけでよい。
+ */
+function renderWorkHub(services: Services) {
+  const c = queueCounts(services);
+  const work = merchantWorkTotal(c);
+  const entries: Array<{ id: string; emoji: string; label: string; count: number; what: string }> = [
+    { id: "shokan:pending", emoji: "🔴", label: "手動で対応する", count: c.pending, what: "スタッフが手で提供する購入です。" },
+    { id: "shokan:failed", emoji: "🔁", label: "配送をやり直す", count: c.failed, what: "自動で配れなかった購入です。もう一度配ります。" },
+    {
+      id: "shokan:stuck-delivery:0",
+      emoji: "🔎",
+      label: "提供状況を確認する",
+      count: c.stuck,
+      what: "提供できたか分からない購入です。事実を確認して決着させます。",
+    },
+    {
+      id: "shokan:refund-open:0",
+      emoji: "💰",
+      label: "返金をやり直す",
+      count: c.refundOpen,
+      what: "返金しようとして失敗した購入です。お金がまだ戻っていません。",
+    },
+  ];
+  const open = entries.filter((e) => e.count > 0);
+  const embed = new EmbedBuilder()
+    .setTitle("📥 対応が必要")
+    .setColor(work > 0 ? 0xdc2626 : 0x16a34a)
+    .setDescription(
+      work === 0
+        ? "対応が必要な仕事はありません。"
+        : open.map((e) => `${e.emoji} **${e.label}　${e.count}件**\n-# ${e.what}`).join("\n\n"),
+    );
+  if (c.blockedRevocations > 0) {
+    // 商館では処理できない。**数字だけ出して終わりにしない**ので、誰へ渡すかまで書く
+    embed.addFields({
+      name: "🧭 運営判断が必要（商館では処理できません）",
+      value: [
+        `期限切れの後片付け ${c.blockedRevocations}件 が自動では進みません。`,
+        "購入時に何を渡したのか証明できないため、商館側から取り消す操作は用意していません。",
+        "**運営へ「商館の期限切れ後片付けが止まっている」と伝えてください。**",
+      ].join("\n"),
+      inline: false,
+    });
+  }
+  const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+  if (open.length > 0) {
+    rows.push(
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        ...open.map((e) =>
+          new ButtonBuilder()
+            .setCustomId(e.id)
+            .setLabel(`${e.label} ${e.count}`)
+            .setEmoji(e.emoji)
+            .setStyle(ButtonStyle.Primary),
+        ),
+      ),
+    );
+  }
+  rows.push(backButton());
+  return { embeds: [embed], components: rows };
 }
 
 /**
@@ -674,29 +723,53 @@ function renderCase(services: Services, purchaseId: number) {
     return { embeds: [embed], components: [backToCasesRow()] };
   }
   const t = quote.token;
+  // **「もう一度配れる」と証明できるときだけ、返金しない選択を出す。**
+  // 購入時の配送内容が残っていない旧購入では、何を配り直せばよいか誰も分からない。
+  // 現在の商品設定から推測して配ることは禁止なので、その選択肢は出さない。
+  const canRetryDelivery = quote.deliveryKind !== null;
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`shokan:case-pre:delivered:0:${purchaseId}:${t}`)
-      .setLabel("提供済みだった")
+      .setLabel("提供できていた")
       .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`shokan:case-pre:no_effect:0:${purchaseId}:${t}`)
-      .setLabel("提供なし（返金しない）")
-      .setStyle(ButtonStyle.Secondary),
     ...(quote.refundSupported
       ? [
           new ButtonBuilder()
             .setCustomId(`shokan:case-pre:no_effect:1:${purchaseId}:${t}`)
-            .setLabel("提供なし＋返金")
+            .setLabel("提供できていない → 返金する")
             .setStyle(ButtonStyle.Danger),
+        ]
+      : []),
+    ...(canRetryDelivery
+      ? [
+          new ButtonBuilder()
+            .setCustomId(`shokan:case-pre:no_effect:0:${purchaseId}:${t}`)
+            .setLabel("提供できていない → もう一度配る")
+            .setStyle(ButtonStyle.Secondary),
         ]
       : []),
     new ButtonBuilder()
       .setCustomId(`shokan:case-pre:still_unknown:0:${purchaseId}:${t}`)
-      .setLabel("まだ判断できない")
+      .setLabel("まだ分からない")
       .setStyle(ButtonStyle.Secondary),
   );
+  const notes: string[] = [];
+  if (!quote.refundSupported) {
+    notes.push("この購入は商館からは返金できません（支払い方法が対象外です）。運営へ渡してください。");
+  }
+  if (!canRetryDelivery) {
+    notes.push("購入時の記録が無いため、**もう一度配ることはできません。**");
+  }
+  if (notes.length > 0) embed.addFields({ name: "できないこと", value: notes.join("\n"), inline: false });
   return { embeds: [embed], components: [row, backToCasesRow()] };
+}
+
+/** 終わったあとに、入口を探し直させない */
+function afterActionRow() {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("shokan:stuck-delivery:0").setLabel("次の案件へ").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("shokan:work").setLabel("← 対応が必要").setStyle(ButtonStyle.Secondary),
+  );
 }
 
 function backToCasesRow() {
@@ -718,14 +791,16 @@ function renderCasePreview(
   const stale = quote.token !== token || quote.kind === null;
   const changes =
     decision === "delivered"
-      ? ["この購入を**提供済み**として確定します。", "返金はしません。", "確認待ちの一覧から消えます。"]
+      ? ["この購入を**提供できていた**ものとして確定します。", "返金はしません。", "対応一覧から消えます。"]
       : decision === "no_effect"
         ? [
-            "この購入を**未提供**として確定します。",
-            refund ? `**${fmtLd(quote.refundableAmount)} を返金します。**` : "返金はしません（あとで再配送も返金もできます）。",
-            "確認待ちの一覧から消えます。",
+            "この購入を**提供できていない**ものとして確定します。",
+            refund
+              ? `**${fmtLd(quote.refundableAmount)} を返金します。**`
+              : "返金はしません。もう一度配れる状態に戻します。",
+            "対応一覧から消えます。",
           ]
-        : ["**何も変更しません。**", "確認待ちのまま残ります。", "「見たが判断できなかった」ことだけ記録します。"];
+        : ["**何も変更しません。**", "対応一覧に残ります。", "「確認したが分からなかった」ことだけ記録します。"];
   const embed = new EmbedBuilder()
     .setTitle(`確認: ${DECISION_LABEL[decision]}`)
     .setColor(stale ? 0xdc2626 : 0x0ea5e9)
@@ -821,7 +896,11 @@ async function resolveCase(
             ? `✅ 購入 #${purchaseId} を**未提供**として確定し、${fmtLd(result.refundedAmount)}を返金しました。`
             : `✅ 購入 #${purchaseId} を**未提供**として確定しました（返金はしていません）。`
           : `ℹ️ 購入 #${purchaseId} は**判断保留**として記録しました。状態は変えていません。`;
-    await interaction.reply({ content: done, flags: MessageFlags.Ephemeral });
+    await interaction.reply({
+      content: done,
+      components: [afterActionRow()],
+      flags: MessageFlags.Ephemeral,
+    });
     await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
   } catch (error) {
     const code = error instanceof ShopError ? error.code : undefined;
@@ -951,6 +1030,12 @@ async function doRefundRetry(
       content: result.refunded
         ? `✅ 購入 #${purchaseId} の ${fmtLd(result.amount)} を返金しました。`
         : `ℹ️ 購入 #${purchaseId} は既に返金済みです。**何も変更していません。**`,
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId("shokan:refund-open:0").setLabel("次の返金へ").setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId("shokan:work").setLabel("← 対応が必要").setStyle(ButtonStyle.Secondary),
+        ),
+      ],
       flags: MessageFlags.Ephemeral,
     });
     await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
@@ -1011,6 +1096,7 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   };
 
   if (action === "hub") return void (await show(shopAdminPanelMessage(services) as never));
+  if (action === "work") return void (await show(renderWorkHub(services) as never));
   if (action === "pending") return void (await show(renderPending(services) as never));
   if (action === "failed") return void (await show(renderFailed(services) as never));
   if (action === "stuck-delivery") {

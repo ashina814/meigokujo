@@ -179,7 +179,7 @@ describe("古い完了ボタン", () => {
     expect(ctx.shop.countPendingManual()).toBe(0);
     expect(ctx.shop.listPendingManual()).toEqual([]);
     const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description?: string } }[] };
-    expect(panel.embeds[0]!.data.description).toContain("残っている仕事はありません");
+    expect(panel.embeds[0]!.data.description).toContain("対応が必要な仕事はありません");
     ctx.db.close();
   });
 });
@@ -195,7 +195,7 @@ describe("旧購入（購入時の提供方式が分からない）", () => {
 
     // **旧購入だけの別導線は持たない。** 決着できる1つのキューに出る
     const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description?: string } }[] };
-    expect(panel.embeds[0]!.data.description).toContain("確認待ちの案件 1件");
+    expect(panel.embeds[0]!.data.description).toContain("対応が必要な仕事: 1件");
     expect(panel.embeds[0]!.data.description).not.toContain("要確認（旧購入）");
 
     const view = vi.fn(async () => undefined);
@@ -275,7 +275,7 @@ describe("現在の商品ID指定で、過去の普通の購入を隠さない",
     expect(ctx.shop.countPendingManual()).toBe(1);
     expect(ctx.shop.listPendingManual().map((r) => r.id)).toContain(purchase.id);
     const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description?: string } }[] };
-    expect(panel.embeds[0]!.data.description).toContain("要対応 1件");
+    expect(panel.embeds[0]!.data.description).toContain("対応が必要な仕事: 1件");
 
     // **実際に描画される一覧にも出る。** countだけ見ていると、
     // 「バッジは1件なのに開くと空」というズレを見逃す。
@@ -307,7 +307,7 @@ describe("現在の商品ID指定で、過去の普通の購入を隠さない",
     expect(ctx.shop.countPendingManual()).toBe(1);
     expect(ctx.shop.listPendingManual().map((r) => r.id)).toContain(purchase.id);
     const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description?: string } }[] };
-    expect(panel.embeds[0]!.data.description).toContain("要対応 1件");
+    expect(panel.embeds[0]!.data.description).toContain("対応が必要な仕事: 1件");
 
     // 描画される一覧にも出ている（バッジと中身が食い違わない）
     const view = vi.fn(async () => undefined);

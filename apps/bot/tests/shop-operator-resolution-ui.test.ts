@@ -299,6 +299,48 @@ describe("運営の決着UI", () => {
     ctx.db.close();
   });
 
+  it("購入時の記録が無い旧購入に「もう一度配る」を出さない", async () => {
+    const { handleShokanButton } = await shokanModule;
+    const ctx = setup();
+    // 購入時の配送内容が残っていない旧購入
+    const legacy = ctx.db
+      .prepare(
+        `INSERT INTO shop_purchases (item_id,user_id,purchased_at,paid_land,status,delivery_state)
+         VALUES (?, ?, 1, 100, 'active', 'pending') RETURNING id`,
+      )
+      .pluck()
+      .get(ctx.item.id, USER) as number;
+    expect(ctx.shop.unresolvedCaseKind(legacy)).toBe("legacy_unknown");
+
+    const detail = vi.fn(async () => undefined);
+    await handleShokanButton(press(`shokan:case:${legacy}`, detail), ctx.services);
+
+    const ids = buttonIds(detail);
+    // 何を配り直せばよいか証明できないので、その選択肢は出さない
+    expect(ids.some((id) => id.startsWith("shokan:case-pre:no_effect:0:"))).toBe(false);
+    // 返金と提供済みと保留は出る
+    expect(ids.some((id) => id.startsWith("shokan:case-pre:no_effect:1:"))).toBe(true);
+    expect(ids.some((id) => id.startsWith("shokan:case-pre:delivered:"))).toBe(true);
+    expect(ids.some((id) => id.startsWith("shokan:case-pre:still_unknown:"))).toBe(true);
+    // 「あとで再配送できます」と嘘をつかない
+    const text = JSON.stringify(payload(detail)?.embeds ?? []);
+    expect(text).toContain("もう一度配ることはできません");
+    ctx.db.close();
+  });
+
+  it("購入時の記録があれば「もう一度配る」を出す", async () => {
+    const { handleShokanButton } = await shokanModule;
+    const ctx = setup();
+    const p = buy(ctx);
+    uncertain(ctx, p.id);
+
+    const detail = vi.fn(async () => undefined);
+    await handleShokanButton(press(`shokan:case:${p.id}`, detail), ctx.services);
+
+    expect(buttonIds(detail).some((id) => id.startsWith("shokan:case-pre:no_effect:0:"))).toBe(true);
+    ctx.db.close();
+  });
+
   it("運営画面に内部のtokenや状態名を出さない", async () => {
     const { handleShokanButton } = await shokanModule;
     const ctx = setup();
