@@ -85,13 +85,13 @@ describe("A. 返金義務は「履歴があること」ではない", () => {
     const ctx = setup();
     const p = buy(ctx);
     ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
-    expect(snap(ctx, p.id).refund).toEqual({ obligationOpen: true, failureHistory: 1 });
+    expect(snap(ctx, p.id).refund).toEqual({ recoveryOpen: true, failureHistory: 1 });
 
     deliver(ctx, p.id);
 
     const after = snap(ctx, p.id);
     // 履歴は消えない（append-only）。義務だけが閉じる
-    expect(after.refund).toEqual({ obligationOpen: false, failureHistory: 1 });
+    expect(after.refund).toEqual({ recoveryOpen: false, failureHistory: 1 });
     expect(after.fulfillment.evidence).toBe(true);
     expect(ctx.shop.countRefundFailures()).toBe(0);
     expect(ctx.shop.quoteRefundRetry(p.id).open).toBe(false);
@@ -110,8 +110,8 @@ describe("A. 返金義務は「履歴があること」ではない", () => {
     const listed = ctx.shop.listRefundFailures().map((r) => r.purchaseId);
     expect(listed).toEqual([open]);
     expect(ctx.shop.countRefundFailures()).toBe(listed.length);
-    expect(snap(ctx, open).refund.obligationOpen).toBe(true);
-    expect(snap(ctx, closed).refund.obligationOpen).toBe(false);
+    expect(snap(ctx, open).refund.recoveryOpen).toBe(true);
+    expect(snap(ctx, closed).refund.recoveryOpen).toBe(false);
     ctx.db.close();
   });
 });
@@ -142,7 +142,7 @@ describe("A2. 提供済みの証拠は、一覧と1件判定で同じ定義", ()
     // 1件判定・snapshot・一覧SQL のどれも「提供済み」と言わない
     expect(snap(ctx, id).fulfillment.evidence).toBe(false);
     ctx.shop.recordRefundFailure({ purchaseId: id, amount: 100, reason: "delivery_failed", actor: "system" });
-    expect(snap(ctx, id).refund.obligationOpen).toBe(true);
+    expect(snap(ctx, id).refund.recoveryOpen).toBe(true);
     expect(ctx.shop.listRefundFailures().map((r) => r.purchaseId)).toContain(id);
     // 止まる理由は「提供済みだから」ではなく「結末を証明できないから」。
     // 人が確認すれば返せる状態であって、提供済みとして片付けられてはいない
@@ -159,7 +159,7 @@ describe("A2. 提供済みの証拠は、一覧と1件判定で同じ定義", ()
     expect(snap(ctx, id).fulfillment.evidence).toBe(true);
     // 一覧SQL側も同じ判断。返金の未完了には出ない
     ctx.shop.recordRefundFailure({ purchaseId: id, amount: 100, reason: "delivery_failed", actor: "system" });
-    expect(snap(ctx, id).refund.obligationOpen).toBe(false);
+    expect(snap(ctx, id).refund.recoveryOpen).toBe(false);
     expect(ctx.shop.listRefundFailures().map((r) => r.purchaseId)).not.toContain(id);
     // 1件判定側も同じ。提供済みなので返さない
     expect(() => ctx.shop.refund(id, "manual", STAFF)).toThrow(/ERR_ALREADY_DELIVERED/);
@@ -222,7 +222,7 @@ describe("C. 副作用なしと確認できた失敗は、必ずどちらかへ�
     const okSnap = snap(ctx, ok);
     expect(okSnap.contract.status).toBe("refunded");
     expect(okSnap.externalClaim).toBeNull();
-    expect(okSnap.refund.obligationOpen).toBe(false);
+    expect(okSnap.refund.recoveryOpen).toBe(false);
 
     const ng = buy(ctx, "u-state-3").id;
     const ngToken = claim(ctx, ng);
@@ -234,12 +234,12 @@ describe("C. 副作用なしと確認できた失敗は、必ずどちらかへ�
 
     const ngSnap = snap(ctx, ng);
     expect(ngSnap.contract.status).toBe("active");
-    expect(ngSnap.refund.obligationOpen).toBe(true);
+    expect(ngSnap.refund.recoveryOpen).toBe(true);
     expect(ngSnap.expiry.blockedBy).toBe("refund_pending");
     expect(ctx.shop.quoteRefundRetry(ng).open).toBe(true);
     // どちらの結末でも「守りが外れていて未返金」は残らない
     for (const s of [okSnap, ngSnap]) {
-      expect(s.contract.status === "active" && s.externalClaim === null && !s.refund.obligationOpen && !s.fulfillment.evidence).toBe(
+      expect(s.contract.status === "active" && s.externalClaim === null && !s.refund.recoveryOpen && !s.fulfillment.evidence).toBe(
         false,
       );
     }
@@ -258,7 +258,7 @@ describe("D. 分からないものを、証拠なしで倒さない", () => {
     expect(s.externalClaim).toMatchObject({ state: "uncertain" });
     expect(s.fulfillment.evidence).toBe(false);
     expect(s.operatorCase).toEqual({ unresolved: true, decided: null });
-    expect(s.refund.obligationOpen).toBe(false);
+    expect(s.refund.recoveryOpen).toBe(false);
     // 自動では1つも動かない
     expect(() => ctx.shop.refund(p.id, "auto", "system")).toThrow(/ERR_DELIVERY_IN_FLIGHT/);
     ctx.db.close();
@@ -382,7 +382,7 @@ describe("F. 運営の決着には証拠が要る", () => {
     expect(s.operatorCase).toEqual({ unresolved: false, decided: "delivered" });
     expect(s.fulfillment.evidence).toBe(true);
     expect(s.externalClaim).toBeNull();
-    expect(s.refund.obligationOpen).toBe(false);
+    expect(s.refund.recoveryOpen).toBe(false);
     expect(s.contradictions).toEqual([]);
     ctx.db.close();
   });
@@ -467,15 +467,72 @@ describe("矛盾は隠さず、直しもしない", () => {
     ctx.db.close();
   });
 
-  it("返すべき金を残したまま失効していれば、そう報告する", () => {
+  /**
+   * 終わった購入に、返金を試して失敗した記録だけが残っている。
+   *
+   * `refunded` ではないので「返った」とは言えない。履歴だけから「未返金が確定した」
+   * とも言えない（別経路で戻した可能性を否定できない）。言えるのは
+   * **金の決着を人が監査する必要がある**ということだけ。
+   */
+  for (const status of ["expired", "cancelled"] as const) {
+    it(`${status} + 返金失敗の履歴 + 提供の証拠なし → 監査が要ると報告する`, () => {
+      const ctx = setup();
+      const p = buy(ctx);
+      ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
+      ctx.db.prepare("UPDATE shop_purchases SET status=? WHERE id=?").run(status, p.id);
+
+      const s = snap(ctx, p.id);
+      expect(s.contradictions).toContain(`terminal_with_refund_failure_history_without_delivery_evidence:${status}`);
+      // **復旧キューには載らない。** それは「返す必要が無い」という意味ではない
+      expect(s.refund).toEqual({ recoveryOpen: false, failureHistory: 1 });
+      expect(ctx.shop.countRefundFailures()).toBe(0);
+      // 勝手に「返金済み」とも「未返金」とも書かない。台帳も購入も動かさない
+      expect(ctx.shop.getPurchase(p.id)!.status).toBe(status);
+      expect(ctx.events.listByType("shop_refunded").length).toBe(0);
+      expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(10_000_000 - 100);
+      ctx.db.close();
+    });
+  }
+
+  it("refunded は履歴が残っていても矛盾ではない", () => {
     const ctx = setup();
     const p = buy(ctx);
     ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
-    ctx.db.prepare("UPDATE shop_purchases SET status='expired' WHERE id=?").run(p.id);
+    ctx.shop.retryRefund({ purchaseId: p.id, expectedToken: ctx.shop.quoteRefundRetry(p.id).token, actor: STAFF });
 
     const s = snap(ctx, p.id);
-    expect(s.contradictions).toContain("expired_with_unsettled_refund_history");
-    expect(s.refund).toEqual({ obligationOpen: false, failureHistory: 1 });
+    expect(s.contract.status).toBe("refunded");
+    expect(s.refund).toEqual({ recoveryOpen: false, failureHistory: 1 });
+    expect(s.contradictions).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("提供が成功していれば、履歴が残っていても矛盾ではない", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
+    deliver(ctx, p.id);
+    // 期限まで来て普通に失効しても、提供の証拠があるので監査対象にはならない
+    lapse(ctx, p.id);
+    ctx.shop.expireOverdue(STAFF);
+
+    const s = snap(ctx, p.id);
+    expect(s.contract.status).toBe("expired");
+    expect(s.fulfillment.evidence).toBe(true);
+    expect(s.refund).toEqual({ recoveryOpen: false, failureHistory: 1 });
+    expect(s.contradictions).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("active + 履歴 + 証拠なし は矛盾ではなく、通常の復旧待ち", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
+
+    const s = snap(ctx, p.id);
+    expect(s.refund).toEqual({ recoveryOpen: true, failureHistory: 1 });
+    expect(s.contradictions).toEqual([]);
+    expect(ctx.shop.quoteRefundRetry(p.id).open).toBe(true);
     ctx.db.close();
   });
 

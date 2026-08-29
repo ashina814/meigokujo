@@ -13,13 +13,20 @@ Phase C〜H で積み上げた安全機構の**意味・authority・遷移**を�
 どの欄も既存の authority を呼んだ結果で、一覧SQL・巡回・運営操作と食い違わないことが
 唯一の存在意義。
 
+**snapshot は1つの一貫した読みから作る。** 9本のSELECTを素直に順番へ並べると、
+最初の purchase を読んだあとに別接続が commit した場合、「古い purchase 行 ＋
+新しい claim / 返金 / 決着」という**一度も存在しなかった状態**を返せてしまう。
+運営と監査へ事実を説明する土台なので、資産を動かさなくても不正確な説明は許されない。
+DEFERRED で始めるため読み取りのために書き込みロックは取らず、既に transaction の
+中ならその snapshot をそのまま使う。
+
 ---
 
 ## 1. 状態は1本のenumではない
 
 現在の状態は**互いに直交する複数の事実**からできている。同じ `active` でも、
 
-| 契約 | 提供 | 返金義務 | 期限 | 意味 |
+| 契約 | 提供 | 返金の復旧 | 期限 | 意味 |
 |---|---|---|---|---|
 | active | delivered | closed | 未来 | 正常 |
 | active | failed | open | 超過 | 金を返せておらず、失効も止めている |
@@ -67,19 +74,43 @@ Phase C〜H で積み上げた安全機構の**意味・authority・遷移**を�
 | `settled` | 提供できたと確定した | — | 可 | 不要 |
 | `released` | 副作用が無いと確認して手放した | 可 | 可 | 可 |
 
-生きている状態の集合は `Shop.CLAIM_LIVE_STATES` が唯一の定義。
+生きている状態の集合は `EXTERNAL_CLAIM_LIVE_STATES` が唯一の定義で、
+**Core の query・UPDATE の条件・候補選択・DBの部分ユニーク索引がすべてここから導かれる。**
+
+索引 `uq_shop_external_delivery_open`（1 purchase につき生きた claim は1件）は
+DDL 生成時にこの定義を埋め込む。手で書き写すと、Coreが「生きている」と見なす集合と
+DBが1件に縛る集合が将来ズレて、Coreは止めているつもりなのにDBは重複を許す（またはその逆）
+という穴が開く。
+
+> **⚠ 集合を変えるときは migration が要る。**
+> 索引はDBに焼き付くので、定数を書き換えただけでは既存DBの索引は古い集合のまま残る。
+> 新しい live state を足す／既存の state を live から外す場合は、
+> `DROP INDEX` → `CREATE UNIQUE INDEX` を伴う migration を書くこと。
+> 定義とDBの一致は `shop-claim-live-states.test.ts` が fresh DB で固定している。
 
 ### 返金（Refund）
 
-**「履歴」と「いま返す義務」を混ぜない。**
+**「履歴」と「いま復旧待ちか」を混ぜない。**
 
 | 問い | 正本 |
 |---|---|
 | 返金に失敗したことがあるか | `refundFailureHistorySql()`（`shop_refund_failures` に行がある） |
-| **いま返すべき金が残っているか** | `refundFailureSql()` = `active` かつ `delivered_at IS NULL` かつ delivered evidence なし かつ 履歴あり |
+| **いま返金のやり直しキューに載っているか** | `refundFailureSql()` = `active` かつ `delivered_at IS NULL` かつ delivered evidence なし かつ 履歴あり |
 
-履歴は append-only なので消えない。義務は購入の状態で閉じる——
-返金された・提供が成功した・取り消された、のいずれかで自動的に一覧から落ちる。
+履歴は append-only なので消えない。
+
+> **⚠ `refundFailureSql()` は「返す義務が無い」ことの証明ではない。**
+>
+> これは **いま復旧導線に載っているか**（`recoveryOpen`）であって、普遍的な
+> financial truth ではない。`status='active'` を条件に含むので、terminal な購入では
+> 常に false になる——`refund()` が active からしか動けないため、復旧導線に載せても
+> 意味が無いからそうなっている。
+>
+> したがって `false` を「利用者へ返す義務が存在しない」と一般化してはいけない。
+
+購入が `refunded` になれば金は戻っている。`expired` / `cancelled` になっただけでは
+**戻ったことは証明されない**——復旧キューから落ちるだけで、事実は変わらない。
+この組み合わせは §6 の terminal anomaly として surface する。
 
 ### 人の判断（Human authority）
 
@@ -116,9 +147,10 @@ Phase C〜H で積み上げた安全機構の**意味・authority・遷移**を�
 | 問い | authority |
 |---|---|
 | 購入が有効か | `shop_purchases.status` |
-| 外部配送が進行中／不明か | live external claim（`CLAIM_LIVE_STATES`） |
+| 外部配送が進行中／不明か | live external claim（`EXTERNAL_CLAIM_LIVE_STATES`。Core と DB索引で共有） |
 | 提供済みか | `DELIVERED_EVIDENCE_SQL` / `hasDeliveredEvidence()` |
-| 返すべき金が残っているか | `refundFailureSql()` / `refundFailureOpen()` |
+| いま返金のやり直しキューに載っているか | `refundFailureSql()` / `refundFailureOpen()` |
+| 利用者へ返す義務が本当に無いか | **単一の述語では答えられない**。`refunded` が唯一の「戻った」証拠で、terminal anomaly は監査対象として surface する |
 | 一度でも返金に失敗したか | `refundFailureHistorySql()` |
 | legacy の「提供なし」を誰が証明できるか | `shop_operator_resolutions` の `no_effect`（人が外部を見た事実） |
 | この決着がどの claim を閉じるのか | `settleVerifiedFailure()` に渡す claim token |
@@ -170,7 +202,7 @@ claim 保持中
 → 外部に副作用が無いことを確認（3状態の presence 確認）
 → settleVerifiedFailure（claim解放・配送失敗確定・返金 or 義務記録を1 transaction）
 → refunded  … status=refunded
-   または   … 返金義務が durable に残る（status=active のまま）
+   または   … 返金の義務が durable に残る（status=active のまま。復旧待ちへ）
 → 前者は仕事なし／後者は「返金をやり直す」キュー
 ```
 
@@ -204,10 +236,10 @@ uncertain / legacy unknown
 ### 返金のやり直し
 
 ```
-返金義務 open
+返金の復旧待ち（recoveryOpen）
 → 運営が「返金をやり直す」
-→ refunded            … 義務が閉じる
-   もう一度失敗       … 失敗の事実を**追記**（履歴が積まれ、義務は open のまま）
+→ refunded            … 復旧完了（金が戻った）
+   もう一度失敗       … 失敗の事実を**追記**（履歴が積まれ、復旧待ちのまま）
 → 後者はキューに残る
 ```
 
@@ -216,7 +248,7 @@ uncertain / legacy unknown
 ```
 active + 期限到来
 → live claim があるか → あれば待つ（delivery_in_flight）
-→ 返金義務が open か → あれば待つ（refund_pending）
+→ 返金の復旧待ちか → あれば待つ（refund_pending）
 → どちらも無ければ expired
 → 剥奪の判断（契約が role を与えるか × 実際に与えた証拠があるか）
    → pending（巡回が剥がす）／unresolved（人が確認）／何もしない
@@ -237,7 +269,7 @@ active + 期限到来
 | 手動で提供する | 手動配送の未完了 | `pendingManualSql()` | `countPendingManual` / `listPendingManual` |
 | もう一度配る | 自動配送が pending / failed | `listUndeliveredAuto` | `listUndeliveredAuto` |
 | 提供状況を確認する | uncertain + legacy unknown | `unresolvedCandidateSql()` | `listUnresolvedCases` / `resolveOperatorCase` |
-| 返金をやり直す | 返金義務 open | `refundFailureSql()` | `listRefundFailures` / `retryRefund` |
+| 返金をやり直す | 返金の復旧待ち | `refundFailureSql()` | `listRefundFailures` / `retryRefund` |
 
 合計が `merchantWorkTotal()`。**ここに入るものは必ず商館から辿れて、商館スタッフの
 権限で終わらせられる。**
@@ -269,9 +301,9 @@ legacy や事故で、理論上あり得ない組み合わせが実在しうる�
 | 種別 | 意味 |
 |---|---|
 | `terminal_purchase_with_live_claim:<status>` | 終わった購入に生きた claim が残っている |
-| `expired_with_unsettled_refund_history` | 返すべき金を残したまま失効している（`refund()` は active からしか動けない） |
+| `terminal_with_refund_failure_history_without_delivery_evidence:<status>` | 終わった購入（`expired` / `cancelled`）に、返金を試して失敗した記録だけが残っている。**金の決着を人が監査する必要がある**——「返った」とも「未返金が確定した」とも言わない |
 | `delivered_evidence_vs_operator_no_effect` | 提供済みの証拠と「提供なし」の人の判断が同時に立っている |
-| `delivered_evidence_vs_open_refund_obligation` | 正本の定義上ありえない。出たら定義がどこかでズレている |
+| `delivered_evidence_vs_open_refund_recovery` | 正本の定義上ありえない。出たら定義がどこかでズレている |
 | `delivered_evidence_vs_unresolved_case` | 提供済みなのに「不明」の案件として残っている |
 | `active_purchase_with_pending_revocation` | 有効な契約からロールを剥がそうとしている |
 

@@ -169,6 +169,27 @@ export const AUTO_DELIVERABLE_KINDS: ReadonlySet<string> = new Set([
 ]);
 /** 過去に自動配送として売られたが、いまは自動実行しない種別 */
 export const WITHDRAWN_DELIVERY_KINDS: ReadonlySet<string> = new Set(["revoke_meirei"]);
+
+/**
+ * **まだ結果が確定していない claim の状態。**
+ *
+ * 「外部へ投げている最中」と「投げたが結果が分からない」は扱いが同じ——どちらも
+ * 返金・失効・再配送を止める。
+ *
+ * この集合は Core の判定だけでなく、**DBの部分ユニーク索引**
+ * （`uq_shop_external_delivery_open`: 1 purchase につき生きた claim は1つ）
+ * の定義にも使う。片方だけ書き換えると、Coreが「生きている」と見なす集合と
+ * DBが1件に縛る集合がズレて、守りに穴が開く。
+ *
+ * **索引はDBに焼き付くので、この集合を変えるときはmigrationが要る。**
+ * 定数を書き換えただけでは、既存DBの索引は古い集合のまま残る。
+ */
+export const EXTERNAL_CLAIM_LIVE_STATES = ["in_flight", "uncertain"] as const;
+
+export type ExternalClaimLiveState = (typeof EXTERNAL_CLAIM_LIVE_STATES)[number];
+
+/** 上の集合を SQL の `IN (...)` リテラルにしたもの。DDLとCore queryが同じ文字列を使う */
+export const EXTERNAL_CLAIM_LIVE_STATES_SQL = `(${EXTERNAL_CLAIM_LIVE_STATES.map((v) => `'${v}'`).join(",")})`;
 const KNOWN_DELIVERY_KINDS: ReadonlySet<string> = new Set([...AUTO_DELIVERABLE_KINDS, ...WITHDRAWN_DELIVERY_KINDS]);
 
 /**
@@ -441,8 +462,15 @@ export interface ShopSafetySnapshot {
   };
   /** 外部へ投げた副作用の場所取り。生きている間は返金も失効も止まる */
   externalClaim: { token: string; state: "in_flight" | "uncertain"; startedAt: number } | null;
-  /** 返すべき金。**履歴があること**と**いま義務があること**を分けて持つ */
-  refund: { obligationOpen: boolean; failureHistory: number };
+  /**
+   * 返金。**履歴があること**と**いま復旧待ちであること**を分けて持つ。
+   *
+   * `recoveryOpen` は「いま返金のやり直しキューに載っているか」であって、
+   * **「利用者へ返す義務が存在しない」ことの証明ではない**。terminal な購入では
+   * 常に false になるので、`false` を「返す必要が無い」と一般化してはいけない。
+   * 未返金が疑われる terminal 状態は `contradictions` 側で surface する。
+   */
+  refund: { recoveryOpen: boolean; failureHistory: number };
   /** 人が確認して決着させる案件かどうか */
   operatorCase: { unresolved: boolean; decided: "delivered" | "no_effect" | null };
   /** 期限。止まっているなら、その理由まで */
@@ -2066,14 +2094,8 @@ export class Shop {
    * かといって壊れた記録から意味を推測して現在の商品定義へfallbackすることもしない
    * ——NULL・malformed・valid but non-reeval はすべて「証拠なし」に倒す。
    */
-  /**
-   * **まだ結果が確定していない claim の状態。**
-   *
-   * 「外部へ投げた最中」と「投げたが結果が分からない」は、扱いが同じ——どちらも
-   * 返金・失効・再配送を止める。判定は12か所以上に散っているので、集合そのものを
-   * ここで1度だけ決める。片方だけ書き換えると守りに穴が開く。
-   */
-  private static readonly CLAIM_LIVE_STATES = "('in_flight','uncertain')";
+  /** `EXTERNAL_CLAIM_LIVE_STATES` の SQL 形。DDLの部分ユニーク索引と同じ文字列 */
+  private static readonly CLAIM_LIVE_STATES = EXTERNAL_CLAIM_LIVE_STATES_SQL;
 
   private static readonly REEVALUATION_EVIDENCE_SQL = `COALESCE(
        EXISTS (SELECT 1 FROM shop_purchase_title_provenance v
@@ -4655,12 +4677,25 @@ export class Shop {
    * 説明し始めると、「なぜ返金できないのか」に3通りの答えが出てしまう。
    */
   safetySnapshot(purchaseId: number): ShopSafetySnapshot | null {
+    // **9本のSELECTを1つのsnapshotから読む。**
+    //
+    // 別接続が途中でcommitすると、「古いpurchase行＋新しいclaim/返金/決着」という
+    // **実際には一度も存在しなかった状態**を返せてしまう。ここは運営と監査へ事実を
+    // 説明する土台なので、資産を動かさなくても不正確な説明は許されない。
+    //
+    // DEFERRED で始めるので書き込みロックは取らない（読み取りだけのため）。
+    // 既に transaction の中なら、その snapshot をそのまま使う。
+    const body = (): ShopSafetySnapshot | null => this.safetySnapshotUnlocked(purchaseId);
+    return this.db.inTransaction ? body() : this.db.transaction(body)();
+  }
+
+  private safetySnapshotUnlocked(purchaseId: number): ShopSafetySnapshot | null {
     const purchase = this.getPurchase(purchaseId);
     if (!purchase) return null;
 
     const claimRow = this.externalDeliveryClaim(purchaseId);
     const evidence = this.hasDeliveredEvidence(purchase);
-    const obligationOpen = this.refundFailureOpen(purchaseId);
+    const recoveryOpen = this.refundFailureOpen(purchaseId);
     const failureHistory = this.db
       .prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id = ?")
       .pluck()
@@ -4688,17 +4723,22 @@ export class Shop {
       // 終わった購入に生きた場所取りが残っている。次の配送も返金も塞がれ続ける
       contradictions.push(`terminal_purchase_with_live_claim:${purchase.status}`);
     }
-    if (purchase.status === "expired" && failureHistory > 0 && !evidence) {
-      // 返すべき金が残ったまま失効している。`refund()` は active からしか動けない
-      contradictions.push("expired_with_unsettled_refund_history");
+    if ((purchase.status === "expired" || purchase.status === "cancelled") && failureHistory > 0 && !evidence) {
+      // **終わった購入に、返金を試して失敗した記録だけが残っている。**
+      //
+      // `refunded` ではないので「返った」とは言えない。かといって履歴だけから
+      // 「未返金が確定した」とも言えない（別経路で戻した可能性を否定できない）。
+      // 言えるのは **金の決着を人が監査する必要がある** ということだけ。
+      // `refund()` は active からしか動けないので、通常の復旧導線には載らない。
+      contradictions.push(`terminal_with_refund_failure_history_without_delivery_evidence:${purchase.status}`);
     }
     if (evidence && decided === "no_effect") {
       // 「提供済み」の証拠と「提供されていない」という人の判断が同時に立っている
       contradictions.push("delivered_evidence_vs_operator_no_effect");
     }
-    if (evidence && obligationOpen) {
+    if (evidence && recoveryOpen) {
       // 正本の定義上ありえない組み合わせ。出たら定義がどこかでズレている
-      contradictions.push("delivered_evidence_vs_open_refund_obligation");
+      contradictions.push("delivered_evidence_vs_open_refund_recovery");
     }
     if (evidence && unresolved) {
       contradictions.push("delivered_evidence_vs_unresolved_case");
@@ -4733,7 +4773,7 @@ export class Shop {
               state: claimRow.state as "in_flight" | "uncertain",
               startedAt: claimRow.started_at,
             },
-      refund: { obligationOpen, failureHistory },
+      refund: { recoveryOpen, failureHistory },
       operatorCase: { unresolved, decided: decided ?? null },
       expiry: { expiresAt: purchase.expires_at, due, blockedBy },
       revocation: {

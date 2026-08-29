@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { WITHDRAWN_DELIVERY_KINDS, parseDeliverySnapshot } from "../shop/service.js";
+import { EXTERNAL_CLAIM_LIVE_STATES_SQL, WITHDRAWN_DELIVERY_KINDS, parseDeliverySnapshot } from "../shop/service.js";
 
 /**
  * スキーマは追記専用の台帳を中心に設計されている（経済設計.md §3）。
@@ -1033,9 +1033,13 @@ CREATE TABLE IF NOT EXISTS shop_external_delivery_attempts (
   PRIMARY KEY (purchase_id, attempt_token)
 );
 -- **1 purchase につき同時に生きている claim は1つだけ。** 部分ユニーク索引でDBに守らせる。
+--
+-- 状態の集合は Core と**同じ定義**（EXTERNAL_CLAIM_LIVE_STATES）から作る。
+-- ここへ手で書き写すと、Coreが「生きている」と見なす集合とDBが1件に縛る集合が
+-- 将来ズレる。ただし**索引はDBに焼き付く**ので、集合を変えるときはmigrationが要る。
 CREATE UNIQUE INDEX IF NOT EXISTS uq_shop_external_delivery_open
   ON shop_external_delivery_attempts(purchase_id)
-  WHERE state IN ('in_flight','uncertain');
+  WHERE state IN ${EXTERNAL_CLAIM_LIVE_STATES_SQL};
 CREATE INDEX IF NOT EXISTS idx_shop_external_delivery_state
   ON shop_external_delivery_attempts(state, started_at);
 -- Phase H: 運営が事実を確認して下した決着。**判断そのものを durable な事実として残す。**
