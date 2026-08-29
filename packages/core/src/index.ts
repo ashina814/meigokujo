@@ -281,6 +281,8 @@ export {
   type ManualCompletionResult,
   type RoleGrantProvenanceRow,
   type RoleGrantTarget,
+  type ShopSafetySnapshot,
+  type ExpiryBlockedReason,
   type RoleEntitlementState,
 } from "./shop/service.js";
 export {
