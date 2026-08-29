@@ -260,12 +260,25 @@ describe("商館で処理できない仕事を押し付けない", () => {
     expect(ctx.shop.countBlockedRoleRevocations()).toBe(1);
 
     // **仕事の件数には入らない**（商館スタッフには直せない）
-    expect(panelDesc(ctx, await shokanModule)).toContain("対応が必要な仕事はありません");
+    const top = panelDesc(ctx, await shokanModule);
+    expect(top).toContain("対応が必要な仕事はありません");
+    // **しかしトップから存在は分かる。** 気づかれずに永久に止まるのを防ぐ
+    expect(top).toContain("運営判断が必要: 1件");
+    expect(top).toContain("商館では処理できません");
+    // ボタンからも辿れる（グレーで埋もれさせない）
+    const panel = (await shokanModule).shopAdminPanelMessage(ctx.services) as any;
+    const workBtn = panel.components
+      .flatMap((r: any) => r.toJSON().components)
+      .find((c: any) => c.custom_id === "shokan:work");
+    expect(workBtn.label).toContain("運営判断");
+    expect(workBtn.style).toBe(1); // Primary（Secondaryで埋もれさせない）
 
     const hub = vi.fn(async () => undefined);
     await handleShokanButton(press("shokan:work", hub), ctx.services);
     const f = fields(hub);
     expect(f).toContain("運営判断が必要");
+    // merchant work の総数には混ぜない
+    expect(desc(hub)).toContain("対応が必要な仕事はありません");
     expect(f).toContain("商館では処理できません");
     // 次に誰へ渡すか書いてある
     expect(f).toContain("運営へ");

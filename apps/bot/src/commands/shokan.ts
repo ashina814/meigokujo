@@ -165,10 +165,16 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
   const subPending = services.subAccounts.countByStatus("pending");
   const embed = new EmbedBuilder()
     .setTitle("🛠 冥界商館 管理")
-    .setColor(work > 0 ? 0xdc2626 : 0x64748b)
+    .setColor(work > 0 ? 0xdc2626 : counts.blockedRevocations > 0 ? 0xf59e0b : 0x64748b)
     .setDescription(
       [
         work > 0 ? `**対応が必要な仕事: ${work}件**` : "対応が必要な仕事はありません。",
+        // **商館スタッフの仕事には数えないが、存在は必ず見せる。**
+        // 自動では進まず、人へ渡さない限り永久に止まるので、トップから発見できないと
+        // 「誰も知らないまま止まり続ける」になる
+        counts.blockedRevocations > 0
+          ? `🧭 運営判断が必要: ${counts.blockedRevocations}件（商館では処理できません → 「対応が必要」で内容を確認）`
+          : "",
         oroleLegacy > 0 ? `オリジナルロールのカルテ移行待ち: ${oroleLegacy}件` : "",
         subPending > 0 ? `サブ垢の審査待ち: ${subPending}件` : "",
         "",
@@ -181,9 +187,9 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId("shokan:work")
-      .setLabel(work > 0 ? `対応が必要 ${work}` : "対応が必要")
+      .setLabel(work > 0 ? `対応が必要 ${work}` : counts.blockedRevocations > 0 ? "対応が必要（運営判断あり）" : "対応が必要")
       .setEmoji("📥")
-      .setStyle(work > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+      .setStyle(work > 0 || counts.blockedRevocations > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("shokan:list").setLabel("商品設定").setEmoji("📦").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId("shokan:orole")

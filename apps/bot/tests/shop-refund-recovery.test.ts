@@ -118,7 +118,8 @@ function unverifiableGuild() {
 async function refundFailed(ctx: Ctx) {
   const { deliverOrRefund } = await refundModule;
   const p = buy(ctx);
-  const spy = vi.spyOn(ctx.shop, "refund").mockImplementation(() => {
+  // **実際の失敗経路で作る。** 返金は台帳への振替で失敗する
+  const spy = vi.spyOn(ctx.ledger, "transfer").mockImplementation(() => {
     throw new Error("ledger unavailable");
   });
   const settled = await deliverOrRefund(ctx.client as never, ctx.services, verifiedFailureGuild() as never, p, "system:test");

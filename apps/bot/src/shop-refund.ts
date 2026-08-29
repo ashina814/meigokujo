@@ -81,9 +81,11 @@ export async function refundOrEscalate(
   reason: string,
   actor: string,
 ): Promise<RefundOutcome> {
+  let outcome: ReturnType<typeof services.shop.refundOrRecordFailure>;
   try {
-    services.shop.refund(purchase.id, reason, actor);
-    return "refunded";
+    // **返金の試行と義務の記録を1つの transaction で。** 別々にすると、失敗してから
+    // 記録するまでの隙に失効が割り込み、復旧不能な状態が作れる
+    outcome = services.shop.refundOrRecordFailure(purchase.id, reason, actor);
   } catch (error) {
     if (error instanceof ShopError && error.code === "ERR_ALREADY_DELIVERED") {
       // 配送が先に確定していた。返さないのが正しいので、人も呼ばない
@@ -94,25 +96,17 @@ export async function refundOrEscalate(
       });
       return "already_delivered";
     }
-    services.events.log("shop_refund_failed", {
-      actor,
-      target: purchase.user_id,
-      payload: { purchaseId: purchase.id, reason, error: (error as Error).message },
-    });
-    // **イベントを仕事の正本にしない。** 返金できていない事実を durable に残し、
-    // 商館の作業キューから引けるようにする
-    const row = services.shop.getPurchase(purchase.id);
-    services.shop.recordRefundFailure({
-      purchaseId: purchase.id,
-      amount: row?.paid_land ?? 0,
-      reason,
-      detail: (error as Error).message,
-      actor,
-    });
-    await refreshShopAdminPanels(client, services).catch(() => undefined);
-    await notifyRefundFailure(client, services, purchase.id).catch(() => undefined);
-    return "escalated";
+    throw error;
   }
+  if (!("failed" in outcome)) return "refunded";
+  services.events.log("shop_refund_failed", {
+    actor,
+    target: purchase.user_id,
+    payload: { purchaseId: purchase.id, reason, error: outcome.message },
+  });
+  await refreshShopAdminPanels(client, services).catch(() => undefined);
+  await notifyRefundFailure(client, services, purchase.id).catch(() => undefined);
+  return "escalated";
 }
 
 /**
@@ -128,7 +122,7 @@ async function notifyUncertainDelivery(client: Client, services: Services, purch
   if (!channel?.isTextBased() || !("send" in channel)) return;
   await channel
     .send({
-      content: `🛰 **提供状態を確認できないため、自動返金していません**（購入 #${purchaseId}）。商館の管理パネルの「確認待ちの案件」から確認してください。`,
+      content: `🛰 **提供状態を確認できないため、自動返金していません**（購入 #${purchaseId}）。商館の管理パネル →「対応が必要」→「提供状況を確認する」から進めてください。`,
       allowedMentions: { parse: [] },
     })
     .catch(() => undefined);
@@ -141,7 +135,7 @@ async function notifyRefundFailure(client: Client, services: Services, purchaseI
   if (!channel?.isTextBased() || !("send" in channel)) return;
   await channel
     .send({
-      content: `⚠️ **返金に失敗しました**（購入 #${purchaseId}）。商館の管理パネルの「処理失敗」から確認してください。`,
+      content: `⚠️ **返金に失敗しました**（購入 #${purchaseId}）。商館の管理パネル →「対応が必要」→「返金をやり直す」から進めてください。`,
       allowedMentions: { parse: [] },
     })
     .catch(() => undefined);

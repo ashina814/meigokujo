@@ -3463,6 +3463,43 @@ export class Shop {
   }
 
   /**
+   * 返金を試し、駄目なら**同じ transaction の中で**義務を記録する。
+   *
+   * 別々にすると、失敗してから記録するまでの隙に失効が割り込める。割り込まれると
+   * purchase が expired になったあとで記録が積まれ、`refund()` は active からしか
+   * 動けないので復旧不能になる。IMMEDIATE で囲って、その窓を無くす。
+   *
+   * 返金本体は入れ子 transaction（SAVEPOINT）なので、失敗しても記録だけが残る。
+   */
+  refundOrRecordFailure(
+    purchaseId: number,
+    reason: string,
+    actor: string,
+  ): { refunded: boolean; amount: number } | { failed: true; code: string | null; message: string } {
+    const body = ():
+      | { refunded: boolean; amount: number }
+      | { failed: true; code: string | null; message: string } => {
+      try {
+        return this.refundWith(purchaseId, reason, actor, {});
+      } catch (error) {
+        const code = error instanceof ShopError ? error.code : null;
+        // 提供済みだったので返さない、は「義務」ではない。記録しない。
+        if (code === "ERR_ALREADY_DELIVERED") throw error;
+        const purchase = this.getPurchase(purchaseId);
+        this.recordRefundFailure({
+          purchaseId,
+          amount: purchase?.paid_land ?? 0,
+          reason,
+          detail: error instanceof Error ? error.message : String(error),
+          actor,
+        });
+        return { failed: true, code, message: error instanceof Error ? error.message : String(error) };
+      }
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /**
    * まだ返金できていない購入。
    *
    * **解消は purchase の状態で決まる。** 返金・失効・提供済みのいずれかになれば
@@ -4435,10 +4472,13 @@ export class Shop {
     purchaseId: number,
     actor: string,
     observedNow: number = now(),
-  ): { expired: boolean; reason: "expired" | "not_active" | "not_due" | "not_found" | "delivery_in_flight" } {
+  ): {
+    expired: boolean;
+    reason: "expired" | "not_active" | "not_due" | "not_found" | "delivery_in_flight" | "refund_pending";
+  } {
     const run = (): {
       expired: boolean;
-      reason: "expired" | "not_active" | "not_due" | "not_found" | "delivery_in_flight";
+      reason: "expired" | "not_active" | "not_due" | "not_found" | "delivery_in_flight" | "refund_pending";
     } => {
       const before = this.getPurchase(purchaseId);
       if (!before) return { expired: false, reason: "not_found" };
@@ -4447,6 +4487,14 @@ export class Shop {
       // 解決してから、次の巡回で通常どおり判断し直す（status は動かさない）。
       if (this.externalDeliveryInFlight(purchaseId)) {
         return { expired: false, reason: "delivery_in_flight" };
+      }
+      // **返すべき金がまだ戻っていない購入を失効させない。**
+      //
+      // `refund()` は active からしか refunded へ動けない。ここで expired にすると、
+      // 返金の未完了が一覧から消えるだけでなく**復旧そのものが不可能**になる。
+      // 期限より先に「利用者の金を返す」を終わらせる。
+      if (this.refundFailureOpen(purchaseId)) {
+        return { expired: false, reason: "refund_pending" };
       }
 
       const changed = this.db

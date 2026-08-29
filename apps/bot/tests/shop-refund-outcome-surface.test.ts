@@ -118,8 +118,12 @@ describe("withheld と escalated を混ぜない", () => {
     // 通知は「確認待ち」で、返金失敗とは言わない
     expect(ctx.sent).toHaveLength(1);
     expect(ctx.sent[0]).toContain("自動返金していません");
-    expect(ctx.sent[0]).toContain("確認待ちの案件");
     expect(ctx.sent[0]).not.toContain("返金に失敗");
+    // **現在の入口へ案内する。** 消えた旧名称へ戻さない
+    expect(ctx.sent[0]).toContain("対応が必要");
+    expect(ctx.sent[0]).toContain("提供状況を確認する");
+    expect(ctx.sent[0]).not.toContain("確認待ちの案件");
+    expect(ctx.sent[0]).not.toContain("処理失敗");
     ctx.db.close();
   });
 
@@ -127,8 +131,8 @@ describe("withheld と escalated を混ぜない", () => {
     const { deliverOrRefund } = await refundModule;
     const ctx = setup();
     const p = buy(ctx);
-    // 返金そのものを失敗させる
-    vi.spyOn(ctx.shop, "refund").mockImplementation(() => {
+    // 返金そのものを失敗させる（実際の経路＝台帳への振替で落とす）
+    vi.spyOn(ctx.ledger, "transfer").mockImplementation(() => {
       throw new Error("ledger unavailable");
     });
 
@@ -141,6 +145,10 @@ describe("withheld と escalated を混ぜない", () => {
     expect(ctx.sent).toHaveLength(1);
     expect(ctx.sent[0]).toContain("返金に失敗");
     expect(ctx.sent[0]).not.toContain("自動返金していません");
+    // **現在の入口へ案内する。** 「処理失敗」という入口はもう無い
+    expect(ctx.sent[0]).toContain("対応が必要");
+    expect(ctx.sent[0]).toContain("返金をやり直す");
+    expect(ctx.sent[0]).not.toContain("処理失敗");
     ctx.db.close();
   });
 

@@ -581,19 +581,50 @@ describe("返金の未完了は「まだ返せていない」ものだけ", () =
     ctx.db.close();
   });
 
-  it("返金済み・失効になっても消える", () => {
-    for (const finish of ["refunded", "expired"] as const) {
-      const ctx = setup();
-      const p = refundFailed(ctx);
-      if (finish === "refunded") ctx.shop.refund(p.id, "別経路", STAFF);
-      else {
-        ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(p.id);
-        ctx.shop.expireIfDue(p.id, STAFF);
-      }
-      expect(ctx.shop.countRefundFailures()).toBe(0);
-      expect(ctx.shop.quoteRefundRetry(p.id).open).toBe(false);
-      ctx.db.close();
-    }
+  it("返金済みになったら消える", () => {
+    const ctx = setup();
+    const p = refundFailed(ctx);
+    ctx.shop.refund(p.id, "別経路", STAFF);
+    expect(ctx.shop.countRefundFailures()).toBe(0);
+    expect(ctx.shop.quoteRefundRetry(p.id).open).toBe(false);
+    ctx.db.close();
+  });
+
+  it("期限が来ても、返し終わるまでは失効させない（消えない）", () => {
+    const ctx = setup();
+    const p = refundFailed(ctx);
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(p.id);
+
+    // **失効させない。** 失効させると refund() が active からしか動けないので復旧不能になる
+    expect(ctx.shop.expireIfDue(p.id, STAFF)).toEqual({ expired: false, reason: "refund_pending" });
+    expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
+    expect(ctx.shop.countRefundFailures()).toBe(1);
+    expect(ctx.shop.quoteRefundRetry(p.id).open).toBe(true);
+
+    // 返し終われば、そのあとは普通に失効できる
+    const quote = ctx.shop.quoteRefundRetry(p.id);
+    ctx.shop.retryRefund({ purchaseId: p.id, expectedToken: quote.token, actor: STAFF });
+    expect(ctx.shop.countRefundFailures()).toBe(0);
+    ctx.db.close();
+  });
+
+  it("提供済みで返さないのが正しい場合は、返金義務を作らない", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    ctx.shop.beginDelivery(p.id);
+    ctx.shop.markDeliverySucceeded(p.id, STAFF);
+    const before = landOf(ctx);
+
+    // 提供済みなので返金は拒否される。**これは「返せていない義務」ではない**
+    expect(() => ctx.shop.refundOrRecordFailure(p.id, "delivery_failed", "system")).toThrow(
+      expect.objectContaining({ code: "ERR_ALREADY_DELIVERED" }),
+    );
+
+    expect(ctx.db.prepare("SELECT COUNT(*) FROM shop_refund_failures").pluck().get()).toBe(0);
+    expect(ctx.shop.countRefundFailures()).toBe(0);
+    expect(ctx.shop.quoteRefundRetry(p.id).open).toBe(false);
+    expect(landOf(ctx)).toBe(before);
+    ctx.db.close();
   });
 
   it("やり直してまた失敗したら、その事実が残る", () => {
@@ -637,6 +668,93 @@ describe("返金の未完了は「まだ返せていない」ものだけ", () =
     expect(landOf(ctx)).toBe(before + 100);
     expect(ctx.events.listByType("shop_refunded")).toHaveLength(1);
     expect(ctx.shop.countRefundFailures()).toBe(0);
+    ctx.db.close();
+  });
+});
+
+describe("返すべき金は、期限が来ても消えない", () => {
+  /** 有期限の購入を作り、配送失敗 → 返金失敗まで進める */
+  function owedAndExpiring(ctx: Ctx) {
+    const p = buy(ctx);
+    ctx.shop.markDeliveryFailed(p.id, "role_add_failed", "system");
+    const original = ctx.ledger.transfer.bind(ctx.ledger);
+    (ctx.ledger as unknown as { transfer: unknown }).transfer = () => {
+      throw new Error("ledger unavailable");
+    };
+    const outcome = ctx.shop.refundOrRecordFailure(p.id, "delivery_failed", "system");
+    (ctx.ledger as unknown as { transfer: unknown }).transfer = original;
+    expect(outcome).toMatchObject({ failed: true });
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(p.id);
+    return p;
+  }
+
+  it("返金の未完了がある購入は失効しない", () => {
+    const ctx = setup();
+    const p = owedAndExpiring(ctx);
+    const before = landOf(ctx);
+
+    expect(ctx.shop.expireIfDue(p.id, STAFF)).toEqual({ expired: false, reason: "refund_pending" });
+    const sweep = ctx.shop.expireOverdue(STAFF);
+    expect(sweep.expired.map((r) => r.id)).not.toContain(p.id);
+
+    // 金は返っていない／義務は残る／キューから消えない／復旧できる
+    expect(landOf(ctx)).toBe(before);
+    expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
+    expect(ctx.shop.countRefundFailures()).toBe(1);
+    expect(ctx.shop.quoteRefundRetry(p.id).open).toBe(true);
+
+    const quote = ctx.shop.quoteRefundRetry(p.id);
+    expect(ctx.shop.retryRefund({ purchaseId: p.id, expectedToken: quote.token, actor: STAFF }).refunded).toBe(true);
+    expect(landOf(ctx)).toBe(before + 100);
+    expect(ctx.shop.countRefundFailures()).toBe(0);
+    ctx.db.close();
+  });
+
+  it("何度巡回しても失効せず、再起動後も復旧できる", () => {
+    const ctx = setup();
+    const p = owedAndExpiring(ctx);
+    for (let i = 0; i < 5; i += 1) ctx.shop.expireOverdue(STAFF);
+    expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
+
+    // 別インスタンス（再起動相当）から見ても同じ
+    const fresh = new Shop(ctx.db, ctx.ledger, ctx.events);
+    expect(fresh.countRefundFailures()).toBe(1);
+    expect(fresh.quoteRefundRetry(p.id).open).toBe(true);
+    expect(fresh.expireIfDue(p.id, STAFF).reason).toBe("refund_pending");
+    ctx.db.close();
+  });
+
+  it("返金の試行と義務の記録の間に失効が割り込めない", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    ctx.shop.markDeliveryFailed(p.id, "role_add_failed", "system");
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(p.id);
+
+    let interleaved = false;
+    const original = ctx.ledger.transfer.bind(ctx.ledger);
+    (ctx.ledger as unknown as { transfer: unknown }).transfer = () => {
+      // 同じ transaction の中で失効を走らせる
+      interleaved = true;
+      ctx.shop.expireIfDue(p.id, "system:sweep");
+      throw new Error("ledger unavailable");
+    };
+    const outcome = ctx.shop.refundOrRecordFailure(p.id, "delivery_failed", "system");
+    (ctx.ledger as unknown as { transfer: unknown }).transfer = original;
+
+    expect(interleaved).toBe(true);
+    expect(outcome).toMatchObject({ failed: true });
+    // **義務は残り、購入は active のまま。** 復旧不能な expired にならない
+    expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
+    expect(ctx.shop.countRefundFailures()).toBe(1);
+    expect(ctx.shop.quoteRefundRetry(p.id).open).toBe(true);
+    ctx.db.close();
+  });
+
+  it("義務が無ければ、期限どおり失効する", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(p.id);
+    expect(ctx.shop.expireIfDue(p.id, STAFF)).toEqual({ expired: true, reason: "expired" });
     ctx.db.close();
   });
 });
