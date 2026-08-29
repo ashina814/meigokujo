@@ -1171,7 +1171,7 @@ export class Shop {
     if (patch.delivery !== undefined) push("delivery", patch.delivery);
     if (patch.delivery_kind !== undefined) push("delivery_kind", patch.delivery_kind);
     if (patch.delivery_data !== undefined) push("delivery_data", patch.delivery_data);
-    // **在庫はここでは動かせない。** 未処理の返金義務がある商品を有限へ戻すとき、
+    // **在庫はここでは動かせない。** 未処理の返金義務がある商品で有限在庫を確定するとき、
     // 汎用の更新経路だと「運営が入力した N」の意味（最終数か上乗せ前か）を誰も
     // 決めないまま確定してしまう。在庫は applyStockChange() だけが動かす。
     if (patch.stock !== undefined) {

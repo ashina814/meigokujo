@@ -452,7 +452,7 @@ export async function handleShokanCommand(interaction: ChatInputCommandInteracti
 
 /**
  * 在庫の表示。**未処理の返金在庫があるなら必ず一緒に出す。**
- * 数字だけ見せると、有限へ戻すときに何が起きるか運営が判断できない。
+ * 数字だけ見せると、有限在庫を確定するときに何が起きるか運営が判断できない。
  */
 function stockLabel(item: ShopItemRow, services: Services): string {
   const pending = services.shop.pendingStockRestorations(item.id);
@@ -477,7 +477,8 @@ function stockModal(id: number, item: ShopItemRow): ModalBuilder {
 }
 
 /**
- * 有限へ戻すとき、未処理の返金在庫をどう扱うかを**運営に選ばせる**。
+ * 有限在庫を確定するとき、未処理の返金在庫をどう扱うかを**運営に選ばせる**。
+ * 現在すでに有限で義務だけ残っている商品もあるので、「戻す」とは限らない。
  * 黙って上乗せもしないし、黙って握りつぶしもしない。
  */
 function stockReconciliationPrompt(quote: ReturnType<Services["shop"]["quoteStockChange"]>, itemName: string) {
@@ -488,8 +489,13 @@ function stockReconciliationPrompt(quote: ReturnType<Services["shop"]["quoteStoc
     .setColor(0xf59e0b)
     .setDescription(
       [
-        `**${itemName}** は現在 無制限 で、返金で戻すはずだった在庫が **${x}個** 残っています。`,
-        `入力した **${n}** の意味を選んでください。`,
+        // **現在の在庫は quote が持っている事実をそのまま出す。**
+        // 未処理義務は無制限のあいだにしか作られないが、そのあと運営が有限へ戻して
+        // 義務だけ残っている商品もある（Phase F 以前からの持ち越し）。決め打ちで
+        // 「現在 無制限」と書くと、そういう商品で表示が事実と食い違う。
+        `**${itemName}** の現在の在庫: **${quote.currentStock === null ? "無制限" : `${quote.currentStock}個`}**`,
+        `未処理の返金在庫: **${x}個**`,
+        `入力した **${n}** をどう扱うか選んでください。`,
       ].join("\n"),
     )
     .addFields(
