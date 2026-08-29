@@ -432,14 +432,21 @@ describe("課金後に変更できなかったとき", () => {
 
     await handleShopButton(press as never, ctx.services);
 
-    expect(contentOf(press.editReply)).toContain("返金も完了できませんでした");
+    // 返金を試して失敗した（= escalated）。**確認中とは言わない**
+    expect(contentOf(press.editReply)).toContain("返金も完了できていません");
+    expect(contentOf(press.editReply)).toContain("重ねて購入する必要はありません");
+    expect(contentOf(press.editReply)).not.toContain("提供できたかを確認しています");
     const purchase = ctx.shop.listUserPurchases(USER)[0]!;
     expect(purchase.status).toBe("active");
     expect(purchase.delivery_state).toBe("failed");
     expect(ctx.events.listByType("shop_refund_failed")).toHaveLength(1);
-    // 管理パネルの「処理失敗」に出る
+    // **配送の再試行ではなく、返金のやり直しとして出る。**
+    // 返金できていない購入を「もう一度配る」キューへ混ぜない
     const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description: string } }[] };
-    expect(panel.embeds[0]!.data.description).toContain("処理失敗 1件");
+    expect(panel.embeds[0]!.data.description).toContain("対応が必要な仕事: 1件");
+    expect(panel.embeds[0]!.data.description).not.toContain("処理失敗 1件");
+    expect(ctx.shop.countRefundFailures()).toBe(1);
+    expect(ctx.shop.listUndeliveredAuto(50).map((r) => r.id)).not.toContain(purchase.id);
     ctx.db.close();
   });
 });
@@ -594,7 +601,8 @@ describe("課金後にBotが落ちた場合の収束", () => {
     expect(notice.components ?? []).toHaveLength(0); // 通知にボタンは付けない（操作は管理パネルが正本）
     expect(dm).not.toHaveBeenCalled(); // 返せていないのに「返金しました」とは言わない
     const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description: string } }[] };
-    expect(panel.embeds[0]!.data.description).toContain("処理失敗 1件");
+    expect(panel.embeds[0]!.data.description).toContain("対応が必要な仕事: 1件");
+    expect(ctx.shop.countRefundFailures()).toBe(1);
     ctx.db.close();
   });
 });
@@ -813,7 +821,7 @@ describe("旧購入の扱い", () => {
 
     const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description: string } }[] };
 
-    expect(panel.embeds[0]!.data.description).toContain("要対応 1件");
+    expect(panel.embeds[0]!.data.description).toContain("対応が必要な仕事: 1件");
     expect(ctx.shop.listPendingManual().map((p) => p.id)).toEqual([legacy.id]);
     // 自動処理の対象にはしない（当時の希望内容が無いので勝手に動かさない）
     expect(ctx.shop.listUndeliveredAuto(10)).toHaveLength(0);

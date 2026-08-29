@@ -297,6 +297,66 @@ export interface FulfillmentProvenanceRow {
  * `uncertain` は「投げたが結果を確認できていない」——**推測で返金も剥奪もしない**ため、
  * 解決するまで生き続ける。
  */
+/**
+ * 運営が下せる決着。
+ *
+ * - `delivered`     … 提供済みだと確認した
+ * - `no_effect`     … 提供されていないと確認した（返金・再試行へ進める）
+ * - `still_unknown` … まだ判断できない。**状態を変えない**
+ */
+export type OperatorDecision = "delivered" | "no_effect" | "still_unknown";
+
+/** 何が原因で止まっている案件か。 */
+export type UnresolvedCaseKind = "uncertain_delivery" | "legacy_unknown";
+
+export interface OperatorResolutionRow {
+  id: number;
+  purchase_id: number;
+  kind: UnresolvedCaseKind;
+  decision: OperatorDecision;
+  operator_id: string;
+  note: string | null;
+  before_state: string;
+  after_state: string;
+  attempt_token: string | null;
+  refunded: number;
+  resolved_at: number;
+}
+
+/**
+ * 決着画面を開いた時点の事実と、選べる決着。
+ *
+ * `token` は**その時点の事実の指紋**。確定時に作り直して一致しなければ、
+ * 画面を開いたあとに状況が変わったということなので1つも書かずに止める。
+ */
+export interface OperatorResolutionQuote {
+  readonly purchaseId: number;
+  readonly kind: UnresolvedCaseKind | null;
+  readonly userId: string;
+  readonly itemName: string;
+  readonly purchasedAt: number;
+  readonly status: PurchaseStatus;
+  readonly deliveryState: DeliveryState | null;
+  readonly deliveryKind: string | null;
+  /** 止まっている理由（利用者へは出さない運営向けの説明） */
+  readonly reason: string;
+  readonly stuckSince: number | null;
+  readonly refundableAmount: number;
+  /** 返金まで一気に確定してよいか（代替支払など、generic refund が扱えないものは false） */
+  readonly refundSupported: boolean;
+  readonly allowedDecisions: readonly OperatorDecision[];
+  readonly token: string;
+}
+
+export interface OperatorResolutionResult {
+  readonly purchaseId: number;
+  readonly decision: OperatorDecision;
+  readonly refunded: boolean;
+  readonly refundedAmount: number;
+  readonly deliveryState: DeliveryState | null;
+  readonly status: PurchaseStatus;
+}
+
 export type ExternalDeliveryState = "in_flight" | "settled" | "released" | "uncertain";
 
 export interface ExternalDeliveryAttemptRow {
@@ -394,6 +454,13 @@ export type ShopErrorCode =
   | "ERR_STOCK_CHANGE_REQUIRES_API"
   | "ERR_STOCK_VALUE_INVALID"
   | "ERR_DELIVERY_IN_FLIGHT"
+  | "ERR_CLAIM_UNKNOWN"
+  | "ERR_CLAIM_CONFLICT"
+  | "ERR_CLAIM_SUPERSEDED"
+  | "ERR_CLAIM_STALE"
+  | "ERR_RESOLUTION_STALE"
+  | "ERR_RESOLUTION_NOT_APPLICABLE"
+  | "ERR_RESOLUTION_EVIDENCE_REQUIRED"
   | "ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_EVAL_EXTENSION_ITEM_CONFIG"
   | "ERR_EVAL_EXTENSION_STATUS"
@@ -2569,6 +2636,22 @@ export class Shop {
    * 返金そのものに失敗したら例外を投げる。**そこだけが人の出番**になる。
    */
   refund(purchaseId: number, reason: string, actor: string): { refunded: boolean; amount: number } {
+    return this.refundWith(purchaseId, reason, actor, {});
+  }
+
+  /**
+   * 返金の本体。
+   *
+   * `operatorNoEffect` は「運営がいま**この transaction の中で**『提供されていない』と
+   * 確認した」という authority。台帳へ書いてから読み直す循環に頼らずに済むので、
+   * 決着の結果（返金できたか）を確定してから監査行を1回だけ積める。
+   */
+  private refundWith(
+    purchaseId: number,
+    reason: string,
+    actor: string,
+    opts: { operatorNoEffect?: boolean },
+  ): { refunded: boolean; amount: number } {
     const run = this.db.transaction(() => {
       const purchase = this.getPurchase(purchaseId);
       if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
@@ -2605,7 +2688,7 @@ export class Shop {
       // 「証拠が無い＝未提供」でもない。**不明は不明として止める。**
       // 自動で返金すると、実際には提供済みだったものまで払い戻してしまう。
       // 人が確認してから決める（この経路では資産を1つも動かさない）。
-      if (this.fulfillmentUnknown(purchase)) {
+      if (this.fulfillmentUnknown(purchase, opts)) {
         throw new ShopError("ERR_FULFILLMENT_UNKNOWN", { purchaseId });
       }
       const amount = purchase.paid_land ?? 0;
@@ -2868,6 +2951,14 @@ export class Shop {
     return this.externalDeliveryClaim(purchaseId) !== undefined;
   }
 
+  /** 生きている claim があるか。候補選択と最終判断で同じ意味を使う。 */
+  private static externalDeliveryLiveSql(): string {
+    return `EXISTS (
+      SELECT 1 FROM shop_external_delivery_attempts a
+       WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
+    )`;
+  }
+
   /**
    * Discord へ副作用を投げる**前に**、durable に場所を取る。
    *
@@ -3005,6 +3096,649 @@ export class Shop {
       .get() as number;
   }
 
+
+  // ── 運営による決着（Phase H）────────────────────────────────────────────────
+
+  /** 運営が「提供されていない」と確認した記録があるか。 */
+  operatorConfirmedNoEffect(purchaseId: number): boolean {
+    const row = this.db
+      .prepare(
+        "SELECT 1 FROM shop_operator_resolutions WHERE purchase_id = ? AND decision = 'no_effect' LIMIT 1",
+      )
+      .get(purchaseId);
+    return row !== undefined;
+  }
+
+  /** この購入に対する決着の履歴（新しい順）。 */
+  operatorResolutions(purchaseId: number): OperatorResolutionRow[] {
+    return this.db
+      .prepare("SELECT * FROM shop_operator_resolutions WHERE purchase_id = ? ORDER BY resolved_at DESC, id DESC")
+      .all(purchaseId) as OperatorResolutionRow[];
+  }
+
+  /**
+   * いま決着待ちの案件か。決着済み・自動収束済みなら null。
+   *
+   * **一覧と同じSQLを1件へ当てる。** 片方だけ緩い判定を持つと、キューに出ているのに
+   * 開くと「決着済み」になる（またはその逆）が起きる。
+   */
+  unresolvedCaseKind(purchaseId: number): UnresolvedCaseKind | null {
+    const purchase = this.getPurchase(purchaseId);
+    if (!purchase) return null;
+    if (this.externalDeliveryClaim(purchaseId)) return "uncertain_delivery";
+    const legacy = this.db
+      .prepare(
+        `SELECT
+           EXISTS (SELECT 1 FROM shop_purchases p
+                    WHERE p.id = ? AND ${Shop.legacyUnknownSql()} AND NOT ${Shop.OPERATOR_DECIDED_SQL}) AS unknown_kind,
+           EXISTS (SELECT 1 FROM shop_purchases p
+                    WHERE p.id = ? AND ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL} AND NOT ${Shop.OPERATOR_DECIDED_SQL}) AS unknown_outcome`,
+      )
+      .get(purchaseId, purchaseId) as { unknown_kind: number; unknown_outcome: number };
+    if (legacy.unknown_kind === 1 || legacy.unknown_outcome === 1) return "legacy_unknown";
+    return null;
+  }
+
+  /**
+   * 決着画面を開いたときの事実。**確定はこの `token` を持ってくること。**
+   */
+  quoteOperatorResolution(purchaseId: number): OperatorResolutionQuote {
+    const purchase = this.getPurchase(purchaseId);
+    if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
+    const kind = this.unresolvedCaseKind(purchaseId);
+    const claim = this.externalDeliveryClaim(purchaseId);
+    const snapshot = parseDeliverySnapshot(purchase.delivery_snapshot_json);
+    const item = this.getItem(purchase.item_id);
+    const amount = purchase.paid_land ?? 0;
+    // 代替支払を含む購入は generic refund の対象外（Phase C）。ここでも返金は出さない。
+    const refundSupported =
+      purchase.paid_alt_kind === null && purchase.paid_alt_amount === null && purchase.status === "active";
+    // **決着済みには何も足せない。** UIがボタンを出さないことは authority ではないので、
+    // ここで空にしたうえで確定側でも拒む。
+    const allowed: OperatorDecision[] = kind === null ? [] : ["delivered", "no_effect", "still_unknown"];
+    return {
+      purchaseId,
+      kind,
+      userId: purchase.user_id,
+      itemName: item?.name ?? `#${purchase.item_id}`,
+      purchasedAt: purchase.purchased_at,
+      status: purchase.status,
+      deliveryState: purchase.delivery_state,
+      deliveryKind: snapshot?.delivery_kind ?? claim?.delivery_kind ?? null,
+      reason:
+        kind === null
+          ? "resolved"
+          : kind === "uncertain_delivery"
+            ? `external_${claim?.state ?? "unknown"}`
+            : "legacy_unknown",
+      stuckSince: claim?.started_at ?? purchase.purchased_at,
+      refundableAmount: amount,
+      refundSupported,
+      allowedDecisions: allowed,
+      token: this.operatorResolutionToken(purchase, kind, claim),
+    };
+  }
+
+  /**
+   * 決着の指紋。**画面を開いたあとに動きうるものを全部入れる。**
+   * 1つでも違えば、その画面からの決定は通さない。
+   */
+  private operatorResolutionToken(
+    purchase: PurchaseRow,
+    kind: UnresolvedCaseKind | null,
+    claim: ExternalDeliveryAttemptRow | undefined,
+  ): string {
+    const canonical = JSON.stringify([
+      purchase.id,
+      kind,
+      purchase.status,
+      purchase.delivery_state,
+      purchase.delivered_at,
+      purchase.paid_land,
+      purchase.paid_alt_kind,
+      purchase.paid_alt_amount,
+      claim?.attempt_token ?? null,
+      claim?.state ?? null,
+      this.operatorResolutions(purchase.id).length,
+    ]);
+    return createHash("sha256").update(canonical, "utf8").digest().subarray(0, GENERIC_TERMS_TOKEN_BYTES).toString("base64url");
+  }
+
+  /**
+   * 運営の決着を確定する。
+   *
+   * **確定した結果を読み直してから、台帳へ1回だけ積む。** 先に台帳を書くと、
+   * そのあとの返金の成否を書き残せない（append-onlyなので後から直せない）。
+   *
+   * `still_unknown` は状態を変えない（分からないものを false へ倒さない）。
+   * `refund: true` は「提供なしを確認したうえで返金まで一気に行う」ためのもので、
+   * `no_effect` のときだけ許す。
+   */
+  resolveOperatorCase(input: {
+    purchaseId: number;
+    decision: OperatorDecision;
+    expectedToken: string;
+    actor: string;
+    note?: string;
+    refund?: boolean;
+  }): OperatorResolutionResult {
+    // **根拠の検証は何よりも先。** UIが止めていることは authority ではない。
+    // ここを通さないと、claim も delivery も ledger も台帳も1つも動かない。
+    const note = (input.note ?? "").trim();
+    if (input.decision !== "still_unknown" && note.length === 0) {
+      throw new ShopError("ERR_RESOLUTION_EVIDENCE_REQUIRED", {
+        purchaseId: input.purchaseId,
+        decision: input.decision,
+      });
+    }
+    const body = (): OperatorResolutionResult => {
+      const purchase = this.getPurchase(input.purchaseId);
+      if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+      const kind = this.unresolvedCaseKind(input.purchaseId);
+      const claim = this.externalDeliveryClaim(input.purchaseId);
+
+      // **画面を開いたときの事実と一致しなければ、1つも書かずに止める。**
+      if (this.operatorResolutionToken(purchase, kind, claim) !== input.expectedToken) {
+        throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
+      }
+      if (kind === null) {
+        // もう決着している（別の運営が処理した／自動収束した）。
+        // **`still_unknown` も含めて拒む。** 通すと、決着済みの購入へ偽の
+        // `legacy_unknown / still_unknown` という監査行を後から足せてしまう。
+        throw new ShopError("ERR_RESOLUTION_NOT_APPLICABLE", { purchaseId: input.purchaseId });
+      }
+      if (input.refund && input.decision !== "no_effect") {
+        throw new ShopError("ERR_RESOLUTION_NOT_APPLICABLE", { purchaseId: input.purchaseId });
+      }
+
+      const before = {
+        status: purchase.status,
+        deliveryState: purchase.delivery_state,
+        claim: claim ? { state: claim.state, deliveryKind: claim.delivery_kind } : null,
+        kind,
+      };
+      const ts = now();
+      let refunded = false;
+      let refundedAmount = 0;
+
+      if (input.decision === "delivered") {
+        if (purchase.status !== "active") {
+          throw new ShopError("ERR_RESOLUTION_NOT_APPLICABLE", { purchaseId: input.purchaseId, status: purchase.status });
+        }
+        if (claim) {
+          // claim と delivered を同じ transaction で確定する
+          const settled = this.db
+            .prepare(
+              `UPDATE shop_external_delivery_attempts
+                  SET state = 'settled', updated_at = ?, detail = ?
+                WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+            )
+            .run(ts, "operator_confirmed_delivered", input.purchaseId, claim.attempt_token).changes;
+          if (settled !== 1) throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
+        }
+        if (!this.markDeliverySucceeded(input.purchaseId, input.actor)) {
+          throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
+        }
+      } else if (input.decision === "no_effect") {
+        if (claim) {
+          const released = this.db
+            .prepare(
+              `UPDATE shop_external_delivery_attempts
+                  SET state = 'released', updated_at = ?, detail = ?
+                WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+            )
+            .run(ts, "operator_confirmed_no_effect", input.purchaseId, claim.attempt_token).changes;
+          if (released !== 1) throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
+        }
+        this.markDeliveryFailed(input.purchaseId, "operator_confirmed_no_effect", input.actor);
+      }
+
+      if (input.refund && input.decision === "no_effect") {
+        // **運営の「提供なし」確認をそのまま authority として渡す。**
+        // 台帳へ先に書いてから読み直す循環にすると、監査行を「返金前の姿」で
+        // 積むことになり、実際の結果と食い違う。
+        const outcome = this.refundWith(input.purchaseId, "運営確認: 提供なし", input.actor, {
+          operatorNoEffect: true,
+        });
+        refunded = outcome.refunded;
+        refundedAmount = outcome.amount;
+      }
+
+      const after = this.getPurchase(input.purchaseId)!;
+      const finalClaim = this.db
+        .prepare("SELECT state FROM shop_external_delivery_attempts WHERE purchase_id = ? AND attempt_token = ?")
+        .get(input.purchaseId, claim?.attempt_token ?? "") as { state: string } | undefined;
+
+      // **この transaction が実際に確定した結果を、1回だけ積む。**
+      // append-only なので「仮の行を入れて後で直す」はできない。だから最後に書く。
+      this.db
+        .prepare(
+          `INSERT INTO shop_operator_resolutions
+             (purchase_id, kind, decision, operator_id, note, before_state, after_state, attempt_token, refunded, resolved_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          input.purchaseId,
+          kind,
+          input.decision,
+          input.actor,
+          note.slice(0, 1000) || null,
+          JSON.stringify(before),
+          JSON.stringify({
+            decision: input.decision,
+            status: after.status,
+            deliveryState: after.delivery_state,
+            claimState: finalClaim?.state ?? null,
+            refunded,
+            refundedAmount,
+          }),
+          claim?.attempt_token ?? null,
+          refunded ? 1 : 0,
+          ts,
+        );
+      this.events.log("shop_operator_resolution", {
+        actor: input.actor,
+        target: purchase.user_id,
+        payload: {
+          purchaseId: input.purchaseId,
+          kind,
+          decision: input.decision,
+          refunded,
+        },
+      });
+      return {
+        purchaseId: input.purchaseId,
+        decision: input.decision,
+        refunded,
+        refundedAmount,
+        deliveryState: after.delivery_state,
+        status: after.status,
+      };
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /**
+   * 決着待ちの候補を**1本のストリーム**として定義する。
+   *
+   * 一覧も件数もこの定義だけを使う。バケットごとに `LIMIT` を掛けてからJS側で
+   * 重複を除く方式だと、同じ購入が2つの条件に当たったときに1ページの件数が
+   * 足りなくなるし、件数と一覧の集合もずれる。
+   *
+   * 並びは **古い案件優先**（`stuckSince ASC, purchaseId ASC`）で固定する。
+   * 順序が安定していないとページを跨いだときに取りこぼす。
+   */
+  private static unresolvedCandidateSql(): string {
+    return `SELECT id, MIN(stuck_since) AS stuck_since FROM (
+      SELECT a.purchase_id AS id, a.started_at AS stuck_since
+        FROM shop_external_delivery_attempts a
+       WHERE a.state IN ('in_flight','uncertain')
+      UNION ALL
+      SELECT p.id, p.purchased_at FROM shop_purchases p
+       WHERE ${Shop.legacyUnknownSql()} AND NOT ${Shop.OPERATOR_DECIDED_SQL}
+      UNION ALL
+      SELECT p.id, p.purchased_at FROM shop_purchases p
+       WHERE ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL} AND NOT ${Shop.OPERATOR_DECIDED_SQL}
+    ) GROUP BY id`;
+  }
+
+  /**
+   * 運営が**提供状況を確定させた**購入か。
+   *
+   * `delivered` / `no_effect` は「提供されたか分からない」を終わらせる判断なので、
+   * そのあとで同じ購入を「不明」として出し直すのは事実と矛盾する。
+   * `still_unknown` は決着していないので対象外。
+   */
+  private static readonly OPERATOR_DECIDED_SQL = `EXISTS (
+    SELECT 1 FROM shop_operator_resolutions o
+     WHERE o.purchase_id = p.id AND o.decision IN ('delivered','no_effect')
+  )`;
+
+  /**
+   * 決着待ちの案件。**全件を辿れるようにページで返す。**
+   *
+   * 先頭数件を保留し続けると、それより後ろの案件へ永久に到達できない。
+   * `offset` で先へ進める。
+   */
+  listUnresolvedCases(opts: { limit?: number; offset?: number } = {}): Array<{
+    purchaseId: number;
+    kind: UnresolvedCaseKind;
+    userId: string;
+    itemName: string;
+    purchasedAt: number;
+    deliveryKind: string | null;
+    reason: string;
+    stuckSince: number;
+  }> {
+    const limit = opts.limit ?? 25;
+    const offset = Math.max(0, opts.offset ?? 0);
+    const ids = this.db
+      .prepare(`${Shop.unresolvedCandidateSql()} ORDER BY stuck_since ASC, id ASC LIMIT ? OFFSET ?`)
+      .all(limit, offset) as Array<{ id: number; stuck_since: number }>;
+    const out: Array<{
+      purchaseId: number;
+      kind: UnresolvedCaseKind;
+      userId: string;
+      itemName: string;
+      purchasedAt: number;
+      deliveryKind: string | null;
+      reason: string;
+      stuckSince: number;
+    }> = [];
+    for (const row of ids) {
+      const quote = this.quoteOperatorResolution(row.id);
+      if (quote.kind === null) continue;
+      out.push({
+        purchaseId: row.id,
+        kind: quote.kind,
+        userId: quote.userId,
+        itemName: quote.itemName,
+        purchasedAt: quote.purchasedAt,
+        deliveryKind: quote.deliveryKind,
+        reason: quote.reason,
+        stuckSince: row.stuck_since,
+      });
+    }
+    return out;
+  }
+
+  /** 決着待ちの件数。**一覧とまったく同じ集合定義で数える。** */
+  countUnresolvedCases(): number {
+    return this.db
+      .prepare(`SELECT COUNT(*) FROM (${Shop.unresolvedCandidateSql()})`)
+      .pluck()
+      .get() as number;
+  }
+
+  // ── 返金の復旧（Phase H）──────────────────────────────────────────────────
+
+  /**
+   * 返金を**実際に試して失敗した**ことを残す。
+   *
+   * 「確認できないので試していない」(withheld) では呼ばない。ここに載るのは
+   * 利用者の資産が戻っていない購入だけ。
+   */
+  recordRefundFailure(input: { purchaseId: number; amount: number; reason: string; detail?: string; actor: string }): void {
+    this.db
+      .prepare(
+        `INSERT INTO shop_refund_failures (purchase_id, amount, reason, detail, actor_id, failed_at)
+         VALUES (?,?,?,?,?,?)`,
+      )
+      .run(
+        input.purchaseId,
+        input.amount,
+        input.reason.slice(0, 200),
+        (input.detail ?? "").slice(0, 500) || null,
+        input.actor,
+        now(),
+      );
+  }
+
+  /**
+   * 「副作用は無いと確認できた失敗」を、**切れ目なく**決着させる。
+   *
+   * claim の解放と返金（または義務の記録）を別々にすると、その隙に失効が入れる。
+   * 失効してしまうと `refund()` は active からしか動けないので復旧不能になる——
+   * 「金は返っていない・失効済み・キューにも出ない」が完成する。
+   *
+   * 1つの IMMEDIATE transaction に閉じるので、外から見える状態は
+   * 「claimで守られている」か「返金済み」か「義務が立っている」のどれかしかない。
+   */
+  settleVerifiedFailure(input: {
+    purchaseId: number;
+    claimToken: string | null;
+    reason: string;
+    actor: string;
+  }): { refunded: boolean; amount: number } | { failed: true; code: string | null; message: string } {
+    const body = ():
+      | { refunded: boolean; amount: number }
+      | { failed: true; code: string | null; message: string } => {
+      if (input.claimToken !== null) {
+        const converged = this.releaseSettlementClaim(input);
+        // 既に同じ結末へ収束済みなら、上から何も書かずにその事実を返す
+        if (converged !== null) return converged;
+      }
+      this.markDeliveryFailed(input.purchaseId, input.reason, input.actor);
+      return this.refundOrRecordFailure(input.purchaseId, input.reason, input.actor);
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /**
+   * 決着が閉じようとしている claim が、**本当にいま生きているそれか**を確かめる。
+   *
+   * `refundClaimToken` を持ち越すようにした以上、その token は
+   * 「この決着がどの claim を閉じるのか」という authority です。合っているかを見ずに
+   * 続けると、古い呼び出し元が新しい状態へ配送失敗や返金を書き込めてしまう。
+   * 「purchase が active だから続けてよい」は authority になりません——
+   * その active は、**別の生きている claim が守っている** active かもしれない。
+   *
+   * 返り値
+   *   - `null` … ちょうど1件の live claim を閉じた。決着を続けてよい
+   *   - 決着結果 … 既に同じ結末へ収束済み。**何も書かずに**その事実を返す
+   *   - throw … stale / 別の live claim / 説明できない状態。**1つも書かない**
+   */
+  private releaseSettlementClaim(input: {
+    purchaseId: number;
+    claimToken: string | null;
+    reason: string;
+    actor: string;
+  }): { refunded: boolean; amount: number } | { failed: true; code: string | null; message: string } | null {
+    const token = input.claimToken;
+    if (token === null) return null;
+    const attempt = this.db
+      .prepare("SELECT state FROM shop_external_delivery_attempts WHERE purchase_id = ? AND attempt_token = ?")
+      .get(input.purchaseId, token) as { state: string } | undefined;
+    if (attempt === undefined) {
+      // そんな claim は存在しない。取り違えなので、この呼び出しには何も書かせない
+      throw new ShopError("ERR_CLAIM_UNKNOWN", { purchaseId: input.purchaseId });
+    }
+
+    if (attempt.state === "in_flight" || attempt.state === "uncertain") {
+      const changed = this.db
+        .prepare(
+          `UPDATE shop_external_delivery_attempts
+              SET state = 'released', updated_at = ?, detail = ?
+            WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+        )
+        .run(now(), "verified_no_effect", input.purchaseId, token).changes;
+      // 同時に生きている claim は部分ユニーク索引で1つに縛られている。
+      // それでも1件で無いなら、こちらの前提が崩れている＝書かずに止める
+      if (changed !== 1) throw new ShopError("ERR_CLAIM_CONFLICT", { purchaseId: input.purchaseId });
+      return null;
+    }
+
+    // ここから先、渡された token は既に閉じている。
+    // **別の claim が生きているなら、この決着は過去のもの。** 触らせない
+    const live = this.externalDeliveryClaim(input.purchaseId);
+    if (live !== undefined) throw new ShopError("ERR_CLAIM_SUPERSEDED", { purchaseId: input.purchaseId });
+
+    // 同じ結末へ既に収束しているなら、二重に書かずにその事実を返す
+    const purchase = this.getPurchase(input.purchaseId);
+    if (purchase === undefined || purchase === null) {
+      throw new ShopError("ERR_CLAIM_STALE", { purchaseId: input.purchaseId });
+    }
+    if (purchase.status === "refunded") return { refunded: true, amount: purchase.paid_land ?? 0 };
+    if (this.refundFailureOpen(input.purchaseId)) {
+      return { failed: true, code: "ERR_REFUND_PENDING", message: "refund obligation already recorded" };
+    }
+    // 閉じた claim なのに、決着もされていない。何が起きたか説明できないので書かない
+    throw new ShopError("ERR_CLAIM_STALE", { purchaseId: input.purchaseId });
+  }
+
+  /**
+   * 返金を試し、駄目なら**同じ transaction の中で**義務を記録する。
+   *
+   * 別々にすると、失敗してから記録するまでの隙に失効が割り込める。割り込まれると
+   * purchase が expired になったあとで記録が積まれ、`refund()` は active からしか
+   * 動けないので復旧不能になる。IMMEDIATE で囲って、その窓を無くす。
+   *
+   * 返金本体は入れ子 transaction（SAVEPOINT）なので、失敗しても記録だけが残る。
+   */
+  refundOrRecordFailure(
+    purchaseId: number,
+    reason: string,
+    actor: string,
+  ): { refunded: boolean; amount: number } | { failed: true; code: string | null; message: string } {
+    const body = ():
+      | { refunded: boolean; amount: number }
+      | { failed: true; code: string | null; message: string } => {
+      try {
+        return this.refundWith(purchaseId, reason, actor, {});
+      } catch (error) {
+        const code = error instanceof ShopError ? error.code : null;
+        // 提供済みだったので返さない、は「義務」ではない。記録しない。
+        if (code === "ERR_ALREADY_DELIVERED") throw error;
+        const purchase = this.getPurchase(purchaseId);
+        this.recordRefundFailure({
+          purchaseId,
+          amount: purchase?.paid_land ?? 0,
+          reason,
+          detail: error instanceof Error ? error.message : String(error),
+          actor,
+        });
+        return { failed: true, code, message: error instanceof Error ? error.message : String(error) };
+      }
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /**
+   * まだ返金できていない購入。
+   *
+   * **解消は purchase の状態で決まる。** 返金・失効・提供済みのいずれかになれば
+   * 自動的にこの一覧から消えるので、記録を後から書き換える必要が無い。
+   */
+  private static refundFailureSql(): string {
+    // **提供済みなら「返金の未完了」ではない。** `delivery_state` だけを見ると、
+    // 正常に提供できた購入（active + delivered）が返金待ちとして残り続ける。
+    // 提供済みの判定は既存の authoritative evidence をそのまま使う。
+    return `p.status = 'active'
+      AND p.delivered_at IS NULL
+      AND NOT ${Shop.DELIVERED_EVIDENCE_SQL}
+      AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)`;
+  }
+
+  /** 上と**同じ判定**を1件へ当てる。一覧・件数・確認・確定で条件を分けない。 */
+  private refundFailureOpen(purchaseId: number): boolean {
+    const row = this.db
+      .prepare(`SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.refundFailureSql()} LIMIT 1`)
+      .get(purchaseId);
+    return row !== undefined;
+  }
+
+  listRefundFailures(opts: { limit?: number; offset?: number } = {}): Array<{
+    purchaseId: number;
+    userId: string;
+    itemName: string;
+    amount: number;
+    reason: string;
+    failedAt: number;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT p.id AS purchaseId, p.user_id AS userId, i.name AS itemName,
+                COALESCE(p.paid_land, 0) AS amount,
+                (SELECT f.reason FROM shop_refund_failures f WHERE f.purchase_id = p.id ORDER BY f.failed_at DESC, f.id DESC LIMIT 1) AS reason,
+                (SELECT MIN(f.failed_at) FROM shop_refund_failures f WHERE f.purchase_id = p.id) AS failedAt
+           FROM shop_purchases p JOIN shop_items i ON i.id = p.item_id
+          WHERE ${Shop.refundFailureSql()}
+          ORDER BY failedAt ASC, p.id ASC
+          LIMIT ? OFFSET ?`,
+      )
+      .all(opts.limit ?? 25, Math.max(0, opts.offset ?? 0)) as Array<{
+      purchaseId: number;
+      userId: string;
+      itemName: string;
+      amount: number;
+      reason: string;
+      failedAt: number;
+    }>;
+  }
+
+  countRefundFailures(): number {
+    return this.db
+      .prepare(`SELECT COUNT(*) FROM shop_purchases p WHERE ${Shop.refundFailureSql()}`)
+      .pluck()
+      .get() as number;
+  }
+
+  /** 返金やり直しの確認。`token` は確定時に作り直して照合する。 */
+  quoteRefundRetry(purchaseId: number): {
+    purchaseId: number;
+    userId: string;
+    itemName: string;
+    amount: number;
+    open: boolean;
+    token: string;
+  } {
+    const purchase = this.getPurchase(purchaseId);
+    if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
+    const item = this.getItem(purchase.item_id);
+    const open = this.refundFailureOpen(purchaseId);
+    return {
+      purchaseId,
+      userId: purchase.user_id,
+      itemName: item?.name ?? `#${purchase.item_id}`,
+      amount: purchase.paid_land ?? 0,
+      open,
+      token: this.refundRetryToken(purchase, open),
+    };
+  }
+
+  private countRefundFailuresFor(purchaseId: number): number {
+    return this.db
+      .prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id = ?")
+      .pluck()
+      .get(purchaseId) as number;
+  }
+
+  private refundRetryToken(purchase: PurchaseRow, open: boolean): string {
+    const canonical = JSON.stringify([
+      purchase.id,
+      purchase.status,
+      purchase.delivery_state,
+      purchase.delivered_at,
+      purchase.paid_land,
+      open,
+      this.countRefundFailuresFor(purchase.id),
+    ]);
+    return createHash("sha256").update(canonical, "utf8").digest().subarray(0, GENERIC_TERMS_TOKEN_BYTES).toString("base64url");
+  }
+
+  /**
+   * 返金をやり直す。**既存の返金 authority をそのまま使う**ので二重返金にならない。
+   *
+   * 画面を開いたあとに状況が変わっていれば1つも書かずに止める。
+   */
+  retryRefund(input: { purchaseId: number; expectedToken: string; actor: string }): { refunded: boolean; amount: number } {
+    const purchase = this.getPurchase(input.purchaseId);
+    if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+    const open = this.refundFailureOpen(input.purchaseId);
+    if (this.refundRetryToken(purchase, open) !== input.expectedToken) {
+      throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
+    }
+    if (!open) throw new ShopError("ERR_RESOLUTION_NOT_APPLICABLE", { purchaseId: input.purchaseId });
+
+    // **返金の本体と、失敗の記録は別の transaction にする。**
+    // 同じ transaction の中で記録してから throw すると、その記録ごと巻き戻る——
+    // 「やり直して、また失敗した」という事実が durable に残らない。
+    // 二重返金の防止は `refund()` 自身（status条件付きUPDATE）が持っているので、
+    // ここで包み直す必要はない。
+    try {
+      return this.refund(input.purchaseId, "運営: 返金のやり直し", input.actor);
+    } catch (error) {
+      this.recordRefundFailure({
+        purchaseId: input.purchaseId,
+        amount: purchase.paid_land ?? 0,
+        reason: "retry_failed",
+        detail: error instanceof Error ? error.message : String(error),
+        actor: input.actor,
+      });
+      throw error;
+    }
+  }
+
   /** 始末の記録。無ければまだ始末していない。 */
   stockRestorationSettlement(purchaseId: number): StockRestorationSettlementRow | undefined {
     return this.db
@@ -3103,9 +3837,14 @@ export class Shop {
    * （スナップショットは方式の証拠であって成功の証拠ではない）。
    * 独立した配送記録があるならそれは `hasDeliveredEvidence` 側で拾われる。
    */
-  private fulfillmentUnknown(purchase: PurchaseRow): boolean {
+  private fulfillmentUnknown(purchase: PurchaseRow, opts: { operatorNoEffect?: boolean } = {}): boolean {
     if (this.fulfillmentProvenance(purchase.id)) return false;
     if (this.hasDeliveredEvidence(purchase)) return false;
+    // **運営が「提供されていない」と確認した記録は、欠けている証拠の代わりになる。**
+    // 推測ではなく、人が外部状態を見て残した事実なので、これを根拠に返金してよい。
+    // いま決着中なら、その判断を直接受け取る（台帳へ書いてから読み直す循環を避ける）。
+    if (opts.operatorNoEffect) return false;
+    if (this.operatorConfirmedNoEffect(purchase.id)) return false;
     // 専用サービスの権利は、それぞれのフローが消費状態を持っている。
     if (this.isReevaluationPurchase(purchase.id)) return false;
     return true;
@@ -3452,6 +4191,18 @@ export class Shop {
             AND NOT EXISTS (
               SELECT 1 FROM shop_delivery_replay_suppressions r WHERE r.purchase_id = p.id
             )
+            -- **返金の復旧待ちを配送再試行へ混ぜない。** 返金しようとして失敗した購入は
+            -- 「もう一度配る」ではなく「返金をやり直す」案件。別のキューで扱う。
+            AND NOT EXISTS (
+              SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id
+            )
+            -- **確認待ちも混ぜない。** 外部へ投げたまま結果が分からない購入は、
+            -- そもそも重ねて配れない（claimが塞ぐ）。両方のキューに出すと
+            -- 「対応が必要」の件数が同じ購入を二重に数えることになる。
+            AND NOT EXISTS (
+              SELECT 1 FROM shop_external_delivery_attempts a
+               WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
+            )
             AND NOT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}
           ORDER BY p.purchased_at DESC`,
       )
@@ -3783,11 +4534,23 @@ export class Shop {
 
   expireOverdue(actor: string, limit = 200): { expired: PurchaseRow[]; failed: Array<{ purchaseId: number; error: string }> } {
     const ts = now();
+    // **動かせない行で LIMIT を埋めない。**
+    //
+    // `refund_pending` や配送中の行は、運営が片付けるまで overdue のまま残り続ける。
+    // それを候補に含めたまま LIMIT を掛けると、古い順に並んだ「絶対に失効しない行」が
+    // 毎回枠を占有し、その後ろの普通の期限切れへ永久に到達できない。
+    // ここで先に外してから LIMIT を掛ける。**最終判断は `expireIfDue()` のまま。**
+    //
+    // 除外条件は `expireIfDue()` が使うものと**同じ関数から作る**。
+    // 「返金失敗の履歴が1件でもあるか」を手書きすると意味がズレる——提供が後から
+    // 成功して義務が閉じた購入まで永久に候補から外れ、失効も剥奪判断も進まなくなる。
     const due = this.db
       .prepare(
-        `SELECT id FROM shop_purchases
-          WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?
-          ORDER BY expires_at
+        `SELECT p.id FROM shop_purchases p
+          WHERE p.status = 'active' AND p.expires_at IS NOT NULL AND p.expires_at <= ?
+            AND NOT ${Shop.externalDeliveryLiveSql()}
+            AND NOT (${Shop.refundFailureSql()})
+          ORDER BY p.expires_at
           LIMIT ?`,
       )
       .all(ts, limit) as Array<{ id: number }>;
@@ -3825,10 +4588,13 @@ export class Shop {
     purchaseId: number,
     actor: string,
     observedNow: number = now(),
-  ): { expired: boolean; reason: "expired" | "not_active" | "not_due" | "not_found" | "delivery_in_flight" } {
+  ): {
+    expired: boolean;
+    reason: "expired" | "not_active" | "not_due" | "not_found" | "delivery_in_flight" | "refund_pending";
+  } {
     const run = (): {
       expired: boolean;
-      reason: "expired" | "not_active" | "not_due" | "not_found" | "delivery_in_flight";
+      reason: "expired" | "not_active" | "not_due" | "not_found" | "delivery_in_flight" | "refund_pending";
     } => {
       const before = this.getPurchase(purchaseId);
       if (!before) return { expired: false, reason: "not_found" };
@@ -3837,6 +4603,14 @@ export class Shop {
       // 解決してから、次の巡回で通常どおり判断し直す（status は動かさない）。
       if (this.externalDeliveryInFlight(purchaseId)) {
         return { expired: false, reason: "delivery_in_flight" };
+      }
+      // **返すべき金がまだ戻っていない購入を失効させない。**
+      //
+      // `refund()` は active からしか refunded へ動けない。ここで expired にすると、
+      // 返金の未完了が一覧から消えるだけでなく**復旧そのものが不可能**になる。
+      // 期限より先に「利用者の金を返す」を終わらせる。
+      if (this.refundFailureOpen(purchaseId)) {
+        return { expired: false, reason: "refund_pending" };
       }
 
       const changed = this.db
@@ -3992,6 +4766,47 @@ export class Shop {
       if (out.length >= (opts.limit ?? 25)) break;
     }
     return out;
+  }
+
+  /**
+   * 自動では二度と再試行されない剥奪。
+   *
+   * worker は `status='pending'` しか拾わない。`blocked:*` として `failed` に落ちた行は
+   * **どの巡回も触らない**ので、人が見なければ永久に残る。「本番で今0件」は
+   * 到達不能の証明にならないので、件数として出せるようにする。
+   */
+  listBlockedRoleRevocations(opts: { limit?: number } = {}): Array<{
+    purchaseId: number;
+    userId: string;
+    itemName: string;
+    reason: string;
+    updatedAt: number;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT r.purchase_id AS purchaseId, p.user_id AS userId, i.name AS itemName,
+                COALESCE(r.last_error, 'blocked') AS reason, r.updated_at AS updatedAt
+           FROM shop_role_revocations r
+           JOIN shop_purchases p ON p.id = r.purchase_id
+           JOIN shop_items i ON i.id = p.item_id
+          WHERE r.status = 'failed'
+          ORDER BY r.updated_at ASC, r.purchase_id ASC
+          LIMIT ?`,
+      )
+      .all(opts.limit ?? 25) as Array<{
+      purchaseId: number;
+      userId: string;
+      itemName: string;
+      reason: string;
+      updatedAt: number;
+    }>;
+  }
+
+  countBlockedRoleRevocations(): number {
+    return this.db
+      .prepare("SELECT COUNT(*) FROM shop_role_revocations WHERE status = 'failed'")
+      .pluck()
+      .get() as number;
   }
 
   /** 上と同じ判定の件数（上限なし） */

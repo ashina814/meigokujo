@@ -1038,6 +1038,71 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_shop_external_delivery_open
   WHERE state IN ('in_flight','uncertain');
 CREATE INDEX IF NOT EXISTS idx_shop_external_delivery_state
   ON shop_external_delivery_attempts(state, started_at);
+-- Phase H: 運営が事実を確認して下した決着。**判断そのものを durable な事実として残す。**
+--
+-- ボタンの副作用として status だけ動かすと、あとから「何を根拠にそう決めたのか」が
+-- どこにも残らない。返金・配送済み確定・保留のいずれも、決めた人・根拠・決めた時点の
+-- 状態・結果を1行にして積む。
+--
+-- decision
+--   delivered      … 提供済みだと確認した
+--   no_effect      … 提供されていないと確認した（返金・再試行へ進める）
+--   still_unknown  … まだ判断できない。**状態は変えない**
+CREATE TABLE IF NOT EXISTS shop_operator_resolutions (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  purchase_id   INTEGER NOT NULL REFERENCES shop_purchases(id),
+  kind          TEXT NOT NULL CHECK (kind IN ('uncertain_delivery','legacy_unknown')),
+  decision      TEXT NOT NULL CHECK (decision IN ('delivered','no_effect','still_unknown')),
+  operator_id   TEXT NOT NULL,
+  note          TEXT,
+  -- 決めた時点で見ていた事実と、その結果。あとから監査できるようにJSONで残す
+  before_state  TEXT NOT NULL,
+  after_state   TEXT NOT NULL,
+  attempt_token TEXT,
+  refunded      INTEGER NOT NULL DEFAULT 0 CHECK (refunded IN (0,1)),
+  resolved_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shop_operator_resolutions_purchase
+  ON shop_operator_resolutions(purchase_id, resolved_at);
+-- Phase H: 返金を**実際に試して失敗した**という事実。
+--
+-- 「提供できたか確認できないので返金を試していない」(withheld) とは別物。
+-- 前者は利用者の資産が戻っていないので運営が復旧する必要があり、後者は確認待ち。
+-- イベントだけだと仕事の一覧に出せないので、durable に残して商館の正本から引く。
+--
+-- 解消は purchase の状態で決まる（refunded / expired / delivered になれば対象外）ので、
+-- この表を後から書き換える必要は無い＝append-only のままでよい。
+CREATE TABLE IF NOT EXISTS shop_refund_failures (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  purchase_id INTEGER NOT NULL REFERENCES shop_purchases(id),
+  amount      INTEGER NOT NULL,
+  reason      TEXT NOT NULL,
+  detail      TEXT,
+  actor_id    TEXT NOT NULL,
+  failed_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shop_refund_failures_purchase
+  ON shop_refund_failures(purchase_id, failed_at);
+CREATE TRIGGER IF NOT EXISTS trg_shop_refund_failures_no_update
+BEFORE UPDATE ON shop_refund_failures
+BEGIN
+  SELECT RAISE(ABORT, 'shop refund failures are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_refund_failures_no_delete
+BEFORE DELETE ON shop_refund_failures
+BEGIN
+  SELECT RAISE(ABORT, 'shop refund failures are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_operator_resolutions_no_update
+BEFORE UPDATE ON shop_operator_resolutions
+BEGIN
+  SELECT RAISE(ABORT, 'shop operator resolutions are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_operator_resolutions_no_delete
+BEFORE DELETE ON shop_operator_resolutions
+BEGIN
+  SELECT RAISE(ABORT, 'shop operator resolutions are append-only');
+END;
 CREATE TRIGGER IF NOT EXISTS trg_shop_external_delivery_attempts_no_delete
 BEFORE DELETE ON shop_external_delivery_attempts
 BEGIN

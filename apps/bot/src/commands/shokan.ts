@@ -99,16 +99,39 @@ function failedAuto(services: Services): Array<PurchaseRow & { item_name: string
 }
 
 /** 残件数。**表示上限で数えない**（11件目以降も正しく出す） */
-function queueCounts(services: Services): { pending: number; failed: number; legacy: number; stuck: number } {
+function queueCounts(services: Services): {
+  pending: number;
+  failed: number;
+  stuck: number;
+  refundOpen: number;
+  blockedRevocations: number;
+} {
   return {
     pending: services.shop.countPendingManual(),
     failed: services.shop.countUndeliveredAuto(),
-    // 外部（Discord）へ投げたが結果が分からない購入。**自動では返金していない**
-    stuck: services.shop.countUnresolvedExternalDeliveries(),
-    // 購入時の提供方式が分からない旧購入と、方式は分かるが結末が分からない旧購入。
-    // どちらも仕事として数えるが、要対応とは別枠にする。
-    legacy: services.shop.countLegacyUnknownFulfillment() + services.shop.countLegacyAutoOutcomeUnknown(),
+    // 提供できたか確認できていない案件（外部配送の未確定 + 旧購入の不明）。
+    // **どちらも「開いて決着させる」同じ作業**なので、1つのキューにまとめる。
+    // 旧購入だけを別に見せる導線は持たない——同じ案件が「操作できる場所」と
+    // 「見るだけの場所」の2箇所に出ると、どちらが正本か分からなくなる。
+    stuck: services.shop.countUnresolvedCases(),
+    // **返金しようとして失敗した購入。** 「配れなかったので配り直す」ではなく
+    // 「返せなかったので返し直す」案件なので、処理失敗とは別に数える
+    refundOpen: services.shop.countRefundFailures(),
+    // **どの巡回も触らない剥奪。** worker は pending しか拾わないので、
+    // blocked として failed に落ちた行は人が見るまで永久に残る
+    blockedRevocations: services.shop.countBlockedRoleRevocations(),
   };
+}
+
+/**
+ * **商館スタッフが実際に手を動かす仕事の総数。**
+ *
+ * ここに入らないものは「仕事はありません」を覆さない。逆にここへ入れたものは
+ * 必ず商館から辿れて、商館スタッフの権限で終わらせられること。
+ * 剥奪の `blocked` は商館では処理できない（運営判断が要る）ので**含めない**。
+ */
+function merchantWorkTotal(c: { pending: number; failed: number; stuck: number; refundOpen: number }): number {
+  return c.pending + c.failed + c.stuck + c.refundOpen;
 }
 
 /** 表示しきれなかった分の注記。押せないボタンを並べる代わりに件数で伝える */
@@ -136,73 +159,120 @@ function fmtJstDate(unixSec: number): string {
  * 個人ごとの情報は載せない（押した後の ephemeral で出す）ので、そのまま設置できる。
  */
 export function shopAdminPanelMessage(services: Services): MessageCreateOptions {
-  const { pending, failed, legacy, stuck } = queueCounts(services);
+  const counts = queueCounts(services);
+  const work = merchantWorkTotal(counts);
+  const oroleLegacy = services.originalRoles.countByStatus("pending");
+  const subPending = services.subAccounts.countByStatus("pending");
   const embed = new EmbedBuilder()
     .setTitle("🛠 冥界商館 管理")
-    .setColor(pending + failed > 0 ? 0xdc2626 : 0x64748b)
+    .setColor(work > 0 ? 0xdc2626 : counts.blockedRevocations > 0 ? 0xf59e0b : 0x64748b)
     .setDescription(
       [
-        pending + failed > 0
-          ? `**残っている仕事: 要対応 ${pending}件 / 処理失敗 ${failed}件**`
-          : "残っている仕事はありません。",
-        legacy > 0 ? `**要確認（旧購入） ${legacy}件** — 購入時の提供方式を自動判定できません。` : "",
-        stuck > 0
-          ? `**確認待ちの配送 ${stuck}件** — 外部の状態を確認できていないため、自動返金していません。`
+        work > 0 ? `**対応が必要な仕事: ${work}件**` : "対応が必要な仕事はありません。",
+        // **商館スタッフの仕事には数えないが、存在は必ず見せる。**
+        // 自動では進まず、人へ渡さない限り永久に止まるので、トップから発見できないと
+        // 「誰も知らないまま止まり続ける」になる
+        counts.blockedRevocations > 0
+          ? `🧭 運営判断が必要: ${counts.blockedRevocations}件（商館では処理できません → 「対応が必要」で内容を確認）`
           : "",
-        services.originalRoles.countByStatus("pending") > 0
-          ? `**旧方式オリジナルロール ${services.originalRoles.countByStatus("pending")}件** がカルテ移行待ちです。`
-          : "",
+        oroleLegacy > 0 ? `オリジナルロールのカルテ移行待ち: ${oroleLegacy}件` : "",
+        subPending > 0 ? `サブ垢の審査待ち: ${subPending}件` : "",
         "",
-        "-# 通知は変化のお知らせです。仕事の一覧は必ずここから開けます。",
-      ].join("\n"),
+        "-# 通知はお知らせです。やることは必ずここから開けます。",
+      ]
+        .filter((line, i, all) => line !== "" || i === all.length - 2)
+        .join("\n"),
     );
+  // **仕事の入口は1つ。** 中で種類ごとに分かれていても、現場が最初に押す場所は増やさない
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setCustomId("shokan:pending")
-      .setLabel(pending > 0 ? `要対応 ${pending}` : "要対応")
-      .setEmoji("🔴")
-      .setStyle(pending > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("shokan:failed")
-      .setLabel(failed > 0 ? `処理失敗 ${failed}` : "処理失敗")
-      .setEmoji("⚠️")
-      .setStyle(failed > 0 ? ButtonStyle.Danger : ButtonStyle.Secondary),
+      .setCustomId("shokan:work")
+      .setLabel(work > 0 ? `対応が必要 ${work}` : counts.blockedRevocations > 0 ? "対応が必要（運営判断あり）" : "対応が必要")
+      .setEmoji("📥")
+      .setStyle(work > 0 || counts.blockedRevocations > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("shokan:list").setLabel("商品設定").setEmoji("📦").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId("shokan:orole")
-      .setLabel(
-        services.originalRoles.countByStatus("pending") > 0
-          ? `旧オリロ移行 ${services.originalRoles.countByStatus("pending")}`
-          : "オリジナルロール",
-      )
+      .setLabel(oroleLegacy > 0 ? `旧オリロ移行 ${oroleLegacy}` : "オリジナルロール")
       .setEmoji("🎨")
-      .setStyle(services.originalRoles.countByStatus("pending") > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("shokan:history:0").setLabel("購入履歴").setEmoji("📜").setStyle(ButtonStyle.Secondary),
-  );
-  // 1行は5個まで。増えたぶんは行を足す（超えると描画そのものが落ちる）
-  const subPending = services.subAccounts.countByStatus("pending");
-  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      .setStyle(oroleLegacy > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId("shokan:sub")
       .setLabel(subPending > 0 ? `サブ垢 ${subPending}` : "サブ垢")
       .setEmoji("👥")
       .setStyle(subPending > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("shokan:reeval-comp")
-      .setLabel("再評価の例外補償")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("shokan:stuck-delivery")
-      .setLabel(stuck > 0 ? `確認待ちの配送 ${stuck}` : "確認待ちの配送")
-      .setEmoji("🛰")
-      .setStyle(stuck > 0 ? ButtonStyle.Danger : ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("shokan:legacy-unknown")
-      .setLabel(legacy > 0 ? `要確認（旧購入） ${legacy}` : "要確認（旧購入）")
-      .setEmoji("🕓")
-      .setStyle(legacy > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("shokan:history:0").setLabel("購入履歴").setEmoji("📜").setStyle(ButtonStyle.Secondary),
+  );
+  const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("shokan:reeval-comp").setLabel("再評価の例外補償").setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row, row2] };
+}
+
+/**
+ * 「対応が必要」の中身。**非0のものだけを、やることの言葉で出す。**
+ *
+ * `failed` / `uncertain` / `claim` のような内部の状態名は出さない。
+ * 商館スタッフが読むのは「何をするか」だけでよい。
+ */
+function renderWorkHub(services: Services) {
+  const c = queueCounts(services);
+  const work = merchantWorkTotal(c);
+  const entries: Array<{ id: string; emoji: string; label: string; count: number; what: string }> = [
+    { id: "shokan:pending", emoji: "🔴", label: "手動で対応する", count: c.pending, what: "スタッフが手で提供する購入です。" },
+    { id: "shokan:failed", emoji: "🔁", label: "配送をやり直す", count: c.failed, what: "自動で配れなかった購入です。もう一度配ります。" },
+    {
+      id: "shokan:stuck-delivery:0",
+      emoji: "🔎",
+      label: "提供状況を確認する",
+      count: c.stuck,
+      what: "提供できたか分からない購入です。事実を確認して決着させます。",
+    },
+    {
+      id: "shokan:refund-open:0",
+      emoji: "💰",
+      label: "返金をやり直す",
+      count: c.refundOpen,
+      what: "返金しようとして失敗した購入です。お金がまだ戻っていません。",
+    },
+  ];
+  const open = entries.filter((e) => e.count > 0);
+  const embed = new EmbedBuilder()
+    .setTitle("📥 対応が必要")
+    .setColor(work > 0 ? 0xdc2626 : 0x16a34a)
+    .setDescription(
+      work === 0
+        ? "対応が必要な仕事はありません。"
+        : open.map((e) => `${e.emoji} **${e.label}　${e.count}件**\n-# ${e.what}`).join("\n\n"),
+    );
+  if (c.blockedRevocations > 0) {
+    // 商館では処理できない。**数字だけ出して終わりにしない**ので、誰へ渡すかまで書く
+    embed.addFields({
+      name: "🧭 運営判断が必要（商館では処理できません）",
+      value: [
+        `期限切れの後片付け ${c.blockedRevocations}件 が自動では進みません。`,
+        "購入時に何を渡したのか証明できないため、商館側から取り消す操作は用意していません。",
+        "**運営へ「商館の期限切れ後片付けが止まっている」と伝えてください。**",
+      ].join("\n"),
+      inline: false,
+    });
+  }
+  const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+  if (open.length > 0) {
+    rows.push(
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        ...open.map((e) =>
+          new ButtonBuilder()
+            .setCustomId(e.id)
+            .setLabel(`${e.label} ${e.count}`)
+            .setEmoji(e.emoji)
+            .setStyle(ButtonStyle.Primary),
+        ),
+      ),
+    );
+  }
+  rows.push(backButton());
+  return { embeds: [embed], components: rows };
 }
 
 /**
@@ -266,48 +336,6 @@ function manualCompletionMessage(id: number, reason: ManualCompletionReason): st
   }
 }
 
-/**
- * 購入時の提供方式が分からない旧購入。
- *
- * 普通の作業キューへは混ぜない（ワンクリックで完了にすると、実際には自動配送で
- * 提供済みだったものまで「人が対応した」ことにしてしまう）。かといって消すと、
- * 本当に人の対応が要る購入が見えなくなる。別枠で出して確認してもらう。
- */
-function renderLegacyUnknown(services: Services) {
-  const modeRows = services.shop.listLegacyUnknownFulfillment({ limit: QUEUE_DISPLAY });
-  const modeTotal = services.shop.countLegacyUnknownFulfillment();
-  const outcomeRows = services.shop.listLegacyAutoOutcomeUnknown({ limit: QUEUE_DISPLAY });
-  const outcomeTotal = services.shop.countLegacyAutoOutcomeUnknown();
-  const embed = new EmbedBuilder().setTitle("🕓 要確認（旧購入）").setColor(0xd97706);
-  if (modeTotal + outcomeTotal === 0) {
-    embed.setDescription("確認が必要な旧購入はありません。");
-    return { embeds: [embed], components: [backButton()], allowedMentions: { parse: [] as never[] } };
-  }
-  const line = (p: { id: number; item_name: string; user_id: string; purchased_at: number }) =>
-    `\`#${p.id}\` **${p.item_name}** — <@${p.user_id}>（${fmtJstDate(p.purchased_at)}）`;
-  const body: string[] = ["どちらも提供状況を確認してから判断してください。"];
-  if (modeTotal > 0) {
-    body.push(
-      "",
-      `**提供方式を確認できない（${modeTotal}件）**`,
-      ...modeRows.map(line),
-      ...overflowNote(modeRows.length, modeTotal),
-    );
-  }
-  if (outcomeTotal > 0) {
-    body.push(
-      "",
-      `**自動提供だったが完了結果を確認できない（${outcomeTotal}件）**`,
-      ...outcomeRows.map(line),
-      ...overflowNote(outcomeRows.length, outcomeTotal),
-    );
-  }
-  embed.setDescription(body.join("\n"));
-  // どちらもワンクリックの操作は置かない。前者を「完了」にすると提供済みを人の対応に、
-  // 後者を「再試行」にすると古いロール付与や期限延長を流し直すことになる。
-  embed.setFooter({ text: "ここからワンクリックでの完了・再試行はできません。" });
-  return { embeds: [embed], components: [backButton()], allowedMentions: { parse: [] as never[] } };
-}
 
 function renderPending(services: Services) {
   const rows = pendingManual(services);
@@ -592,41 +620,214 @@ async function applyStockFix(
  * **内部のtokenや状態名は出さない。** 運営が知りたいのは「誰の何が、いつから
  * 宙ぶらりんで、なぜ自動返金されていないのか」だけ。危険なワンクリック操作は置かない。
  */
-function renderStuckDeliveries(services: Services) {
-  const rows = services.shop.listUnresolvedExternalDeliveries(QUEUE_DISPLAY);
-  const total = services.shop.countUnresolvedExternalDeliveries();
+const CASE_PAGE = 5;
+
+function renderStuckDeliveries(services: Services, offset = 0) {
+  const total = services.shop.countUnresolvedCases();
+  // **全件を辿れるようにする。** 先頭を保留し続けても後ろへ進める
+  const start = total === 0 ? 0 : Math.min(Math.max(0, offset), Math.max(0, total - 1));
+  const cases = services.shop.listUnresolvedCases({ limit: CASE_PAGE, offset: start });
   const embed = new EmbedBuilder()
-    .setTitle("🛰 確認待ちの配送")
+    .setTitle("🛰 確認待ちの案件")
     .setColor(total > 0 ? 0xdc2626 : 0x64748b)
     .setDescription(
       total === 0
-        ? "確認待ちの配送はありません。"
+        ? "確認待ちの案件はありません。"
         : [
-            "**外部（Discord）の状態を確認できていないため、自動返金していません。**",
+            "**提供できたか確認できていないため、自動では返金も完了もしていません。**",
             "提供済みなのに返金する／未提供なのに提供済みにする、のどちらも避けています。",
             "",
-            "-# ロールが付いているかを確認できれば、次の巡回で自動的に決着します。",
+            "-# 事実を確認したら「開く」から決着させてください。",
           ].join("\n"),
     );
-  for (const row of rows) {
+  if (total > 0) {
+    embed.setFooter({ text: `${start + 1}〜${start + cases.length} / ${total}件` });
+  }
+  for (const row of cases) {
     embed.addFields({
-      name: `購入 #${row.purchase_id} — ${deliveryKindLabel(row.delivery_kind)}`,
+      name: `購入 #${row.purchaseId} — ${row.itemName}`,
       value: [
-        `利用者: <@${row.user_id}>`,
-        `購入の状態: ${purchaseStatusLabel(row.status)}`,
-        `未確定になってから: ${fmtJstDate(row.started_at)} から`,
+        `利用者: <@${row.userId}>`,
+        `提供方式: ${deliveryKindLabel(row.deliveryKind)}`,
+        `購入: ${fmtJstDate(row.purchasedAt)}`,
+        `止まっている理由: ${stuckReasonLabel(row.reason)}`,
+        `止まってから: ${fmtJstDate(row.stuckSince)}`,
       ].join("\n"),
       inline: false,
     });
   }
-  return {
-    embeds: [embed],
-    components: [backButton()],
-    ...(total > rows.length ? { content: `ほか ${total - rows.length}件` } : {}),
-  };
+  const open = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    ...cases.map((row) =>
+      new ButtonBuilder()
+        .setCustomId(`shokan:case:${row.purchaseId}`)
+        .setLabel(`#${row.purchaseId} を開く`)
+        .setStyle(ButtonStyle.Primary),
+    ),
+  );
+  const nav = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`shokan:stuck-delivery:${Math.max(0, start - CASE_PAGE)}`)
+      .setLabel("← 前へ")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(start === 0),
+    new ButtonBuilder()
+      .setCustomId(`shokan:stuck-delivery:${start + CASE_PAGE}`)
+      .setLabel("次へ →")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(start + cases.length >= total),
+    new ButtonBuilder().setCustomId("shokan:hub").setLabel("← 商館ハブ").setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: cases.length > 0 ? [open, nav] : [backButton()] };
 }
 
-function deliveryKindLabel(kind: string): string {
+function stuckReasonLabel(reason: string): string {
+  if (reason.startsWith("external_")) return "外部（Discord）の状態を確認できていない";
+  if (reason === "legacy_unknown") return "購入時の記録が無く、提供したか判断できない";
+  return reason;
+}
+
+const DECISION_LABEL: Record<string, string> = {
+  delivered: "提供済みだった",
+  no_effect: "提供されていなかった",
+  still_unknown: "まだ判断できない",
+};
+
+/**
+ * 案件の詳細。**ここまでは何も変えない。**
+ * 決着は「選ぶ → 何が起きるか見る → 確定」の3段にする。
+ */
+function renderCase(services: Services, purchaseId: number) {
+  const quote = services.shop.quoteOperatorResolution(purchaseId);
+  const history = services.shop.operatorResolutions(purchaseId);
+  const embed = new EmbedBuilder()
+    .setTitle(`案件 購入 #${purchaseId}`)
+    .setColor(quote.kind === null ? 0x16a34a : 0xf59e0b)
+    .addFields(
+      { name: "利用者", value: `<@${quote.userId}>`, inline: true },
+      { name: "商品", value: quote.itemName, inline: true },
+      { name: "購入", value: fmtJstDate(quote.purchasedAt), inline: true },
+      { name: "提供方式", value: deliveryKindLabel(quote.deliveryKind), inline: true },
+      { name: "購入の状態", value: purchaseStatusLabel(quote.status), inline: true },
+      { name: "支払い", value: fmtLd(quote.refundableAmount), inline: true },
+      {
+        name: "止まっている理由",
+        value: quote.kind === null ? "決着済みです。" : stuckReasonLabel(quote.reason),
+        inline: false,
+      },
+    );
+  if (history.length > 0) {
+    embed.addFields({
+      name: "これまでの判断",
+      value: history
+        .slice(0, 3)
+        .map((row) => `${fmtJstDate(row.resolved_at)} ${DECISION_LABEL[row.decision] ?? row.decision}${row.note ? ` — ${row.note}` : ""}`)
+        .join("\n"),
+      inline: false,
+    });
+  }
+  if (quote.kind === null) {
+    return { embeds: [embed], components: [backToCasesRow()] };
+  }
+  const t = quote.token;
+  // **「もう一度配れる」と証明できるときだけ、返金しない選択を出す。**
+  // 購入時の配送内容が残っていない旧購入では、何を配り直せばよいか誰も分からない。
+  // 現在の商品設定から推測して配ることは禁止なので、その選択肢は出さない。
+  const canRetryDelivery = quote.deliveryKind !== null;
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`shokan:case-pre:delivered:0:${purchaseId}:${t}`)
+      .setLabel("提供できていた")
+      .setStyle(ButtonStyle.Success),
+    ...(quote.refundSupported
+      ? [
+          new ButtonBuilder()
+            .setCustomId(`shokan:case-pre:no_effect:1:${purchaseId}:${t}`)
+            .setLabel("提供できていない → 返金する")
+            .setStyle(ButtonStyle.Danger),
+        ]
+      : []),
+    ...(canRetryDelivery
+      ? [
+          new ButtonBuilder()
+            .setCustomId(`shokan:case-pre:no_effect:0:${purchaseId}:${t}`)
+            .setLabel("提供できていない → もう一度配る")
+            .setStyle(ButtonStyle.Secondary),
+        ]
+      : []),
+    new ButtonBuilder()
+      .setCustomId(`shokan:case-pre:still_unknown:0:${purchaseId}:${t}`)
+      .setLabel("まだ分からない")
+      .setStyle(ButtonStyle.Secondary),
+  );
+  const notes: string[] = [];
+  if (!quote.refundSupported) {
+    notes.push("この購入は商館からは返金できません（支払い方法が対象外です）。運営へ渡してください。");
+  }
+  if (!canRetryDelivery) {
+    notes.push("購入時の記録が無いため、**もう一度配ることはできません。**");
+  }
+  if (notes.length > 0) embed.addFields({ name: "できないこと", value: notes.join("\n"), inline: false });
+  return { embeds: [embed], components: [row, backToCasesRow()] };
+}
+
+/** 終わったあとに、入口を探し直させない */
+function afterActionRow() {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("shokan:stuck-delivery:0").setLabel("次の案件へ").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("shokan:work").setLabel("← 対応が必要").setStyle(ButtonStyle.Secondary),
+  );
+}
+
+function backToCasesRow() {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("shokan:stuck-delivery:0").setLabel("← 確認待ちの案件").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("shokan:hub").setLabel("← 商館ハブ").setStyle(ButtonStyle.Secondary),
+  );
+}
+
+/** 確定前に**実際に起きる変更**を出す。ここでもまだ何も変えない。 */
+function renderCasePreview(
+  services: Services,
+  purchaseId: number,
+  decision: "delivered" | "no_effect" | "still_unknown",
+  refund: boolean,
+  token: string,
+) {
+  const quote = services.shop.quoteOperatorResolution(purchaseId);
+  const stale = quote.token !== token || quote.kind === null;
+  const changes =
+    decision === "delivered"
+      ? ["この購入を**提供できていた**ものとして確定します。", "返金はしません。", "対応一覧から消えます。"]
+      : decision === "no_effect"
+        ? [
+            "この購入を**提供できていない**ものとして確定します。",
+            refund
+              ? `**${fmtLd(quote.refundableAmount)} を返金します。**`
+              : "返金はしません。もう一度配れる状態に戻します。",
+            "対応一覧から消えます。",
+          ]
+        : ["**何も変更しません。**", "対応一覧に残ります。", "「確認したが分からなかった」ことだけ記録します。"];
+  const embed = new EmbedBuilder()
+    .setTitle(`確認: ${DECISION_LABEL[decision]}`)
+    .setColor(stale ? 0xdc2626 : 0x0ea5e9)
+    .setDescription(
+      stale
+        ? "⚠️ 表示したあとに状況が変わりました。**何も変更していません。** 一覧を開き直してください。"
+        : [`購入 #${purchaseId} / <@${quote.userId}>`, "", "**これから起きること**", ...changes.map((c) => `・${c}`)].join("\n"),
+    );
+  if (stale) return { embeds: [embed], components: [backToCasesRow()] };
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`shokan:case-note:${decision}:${refund ? 1 : 0}:${purchaseId}:${token}`)
+      .setLabel("根拠を入力して確定")
+      .setStyle(decision === "no_effect" && refund ? ButtonStyle.Danger : ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`shokan:case:${purchaseId}`).setLabel("やめる").setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+function deliveryKindLabel(kind: string | null): string {
+  if (kind === null) return "記録なし（判断できません）";
   if (kind === "add_role") return "ロール付与";
   if (kind === "set_nickname") return "名前の変更";
   if (kind === "create_original_role") return "オリジナルロール作成";
@@ -639,6 +840,224 @@ function purchaseStatusLabel(status: string): string {
   if (status === "refunded") return "返金済み";
   if (status === "expired") return "期限切れ";
   return status;
+}
+
+/**
+ * 決着の根拠を書いてもらう。
+ *
+ * **人の確認を authority として採用する以上、「何を確認したのか」が残らないと
+ * 監査台帳の意味が無い。** 判断が分かれる決着（提供済み／提供なし）では必須にする。
+ * 保留も「何を見て判断できなかったか」を残せるようにする。
+ */
+function caseNoteModal(
+  decision: "delivered" | "no_effect" | "still_unknown",
+  refund: boolean,
+  purchaseId: number,
+  token: string,
+): ModalBuilder {
+  const required = decision !== "still_unknown";
+  return new ModalBuilder()
+    .setCustomId(`shokan:case-note:${decision}:${refund ? 1 : 0}:${purchaseId}:${token}`)
+    .setTitle(`#${purchaseId} ${DECISION_LABEL[decision]}`)
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("note")
+          .setLabel(required ? "何を確認しましたか（必須）" : "何を確認しましたか（任意）")
+          .setPlaceholder("例: Discordでロールが付いていることを確認")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(required)
+          .setMaxLength(500),
+      ),
+    );
+}
+
+/**
+ * 決着の確定。**staleなら1つも書かずに止める。**
+ * 内部のエラーコードや token は運営画面にも出さない（意味のある言葉だけ返す）。
+ */
+async function resolveCase(
+  interaction: ButtonInteraction | ModalSubmitInteraction,
+  services: Services,
+  decision: "delivered" | "no_effect" | "still_unknown",
+  refund: boolean,
+  purchaseId: number,
+  token: string,
+  note: string,
+): Promise<void> {
+  try {
+    const result = services.shop.resolveOperatorCase({
+      purchaseId,
+      decision,
+      expectedToken: token,
+      actor: `user:${interaction.user.id}`,
+      refund,
+      note,
+    });
+    const done =
+      decision === "delivered"
+        ? `✅ 購入 #${purchaseId} を**提供済み**として確定しました。`
+        : decision === "no_effect"
+          ? result.refunded
+            ? `✅ 購入 #${purchaseId} を**未提供**として確定し、${fmtLd(result.refundedAmount)}を返金しました。`
+            : `✅ 購入 #${purchaseId} を**未提供**として確定しました（返金はしていません）。`
+          : `ℹ️ 購入 #${purchaseId} は**判断保留**として記録しました。状態は変えていません。`;
+    await interaction.reply({
+      content: done,
+      components: [afterActionRow()],
+      flags: MessageFlags.Ephemeral,
+    });
+    await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
+  } catch (error) {
+    const code = error instanceof ShopError ? error.code : undefined;
+    await interaction.reply({
+      content:
+        code === "ERR_RESOLUTION_STALE"
+          ? "⚠️ 表示したあとに状況が変わりました。**何も変更していません。** 一覧を開き直してください。"
+          : code === "ERR_RESOLUTION_NOT_APPLICABLE"
+            ? "ℹ️ この案件は既に決着しています。**何も変更していません。**"
+            : "⚠️ 決着できませんでした。何も変更していません。",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+}
+
+/**
+ * 返金できていない購入の作業キュー。
+ *
+ * **配送の再試行とは別の仕事。** ここに出るのは「返金を実際に試したが完了できなかった」
+ * 購入だけで、「提供できたか確認できていない」ものは確認待ちの案件へ行く。
+ */
+function renderRefundFailures(services: Services, offset = 0) {
+  const total = services.shop.countRefundFailures();
+  const start = total === 0 ? 0 : Math.min(Math.max(0, offset), Math.max(0, total - 1));
+  const rows = services.shop.listRefundFailures({ limit: CASE_PAGE, offset: start });
+  const embed = new EmbedBuilder()
+    .setTitle("💸 返金の未完了")
+    .setColor(total > 0 ? 0xdc2626 : 0x64748b)
+    .setDescription(
+      total === 0
+        ? "返金の未完了はありません。"
+        : [
+            "**返金を試しましたが完了できていません。** 利用者の残高は戻っていません。",
+            "配送のやり直しではなく、返金のやり直しです。",
+          ].join("\n"),
+    );
+  if (total > 0) embed.setFooter({ text: `${start + 1}〜${start + rows.length} / ${total}件` });
+  for (const row of rows) {
+    embed.addFields({
+      name: `購入 #${row.purchaseId} — ${row.itemName}`,
+      value: [
+        `利用者: <@${row.userId}>`,
+        `返金予定額: ${fmtLd(row.amount)}`,
+        `状況: 返金が完了していません（${refundFailureLabel(row.reason)}）`,
+        `発生: ${fmtJstDate(row.failedAt)}`,
+      ].join("\n"),
+      inline: false,
+    });
+  }
+  const open = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    ...rows.map((row) =>
+      new ButtonBuilder()
+        .setCustomId(`shokan:refund-pre:${row.purchaseId}`)
+        .setLabel(`#${row.purchaseId} を返金`)
+        .setStyle(ButtonStyle.Danger),
+    ),
+  );
+  const nav = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`shokan:refund-open:${Math.max(0, start - CASE_PAGE)}`)
+      .setLabel("← 前へ")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(start === 0),
+    new ButtonBuilder()
+      .setCustomId(`shokan:refund-open:${start + CASE_PAGE}`)
+      .setLabel("次へ →")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(start + rows.length >= total),
+    new ButtonBuilder().setCustomId("shokan:hub").setLabel("← 商館ハブ").setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: rows.length > 0 ? [open, nav] : [backButton()] };
+}
+
+/** 内部の例外文をそのまま出さない。運営が読める粒度にする */
+function refundFailureLabel(reason: string): string {
+  if (reason === "retry_failed") return "やり直しにも失敗";
+  return "自動返金が通らなかった";
+}
+
+/** 返金やり直しの確認。ここではまだ何も動かさない。 */
+function renderRefundPreview(services: Services, purchaseId: number) {
+  const quote = services.shop.quoteRefundRetry(purchaseId);
+  const embed = new EmbedBuilder()
+    .setTitle(`確認: 購入 #${purchaseId} を返金`)
+    .setColor(quote.open ? 0x0ea5e9 : 0xdc2626)
+    .setDescription(
+      quote.open
+        ? [
+            `<@${quote.userId}> / ${quote.itemName}`,
+            "",
+            "**これから起きること**",
+            `・**${fmtLd(quote.amount)} を返金します。**`,
+            "・この購入は返金済みになります。",
+            "・返金の未完了一覧から消えます。",
+          ].join("\n")
+        : "⚠️ 表示したあとに状況が変わりました。**何も変更していません。** 一覧を開き直してください。",
+    );
+  if (!quote.open) {
+    return {
+      embeds: [embed],
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId("shokan:refund-open:0").setLabel("← 返金の未完了").setStyle(ButtonStyle.Secondary),
+        ),
+      ],
+    };
+  }
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`shokan:refund-do:${purchaseId}:${quote.token}`)
+      .setLabel("この内容で返金する")
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("shokan:refund-open:0").setLabel("やめる").setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+async function doRefundRetry(
+  interaction: ButtonInteraction,
+  services: Services,
+  purchaseId: number,
+  token: string,
+): Promise<void> {
+  try {
+    const result = services.shop.retryRefund({ purchaseId, expectedToken: token, actor: `user:${interaction.user.id}` });
+    await interaction.reply({
+      content: result.refunded
+        ? `✅ 購入 #${purchaseId} の ${fmtLd(result.amount)} を返金しました。`
+        : `ℹ️ 購入 #${purchaseId} は既に返金済みです。**何も変更していません。**`,
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId("shokan:refund-open:0").setLabel("次の返金へ").setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId("shokan:work").setLabel("← 対応が必要").setStyle(ButtonStyle.Secondary),
+        ),
+      ],
+      flags: MessageFlags.Ephemeral,
+    });
+    await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
+  } catch (error) {
+    const code = error instanceof ShopError ? error.code : undefined;
+    await interaction.reply({
+      content:
+        code === "ERR_RESOLUTION_STALE"
+          ? "⚠️ 表示したあとに状況が変わりました。**何も変更していません。** 一覧を開き直してください。"
+          : code === "ERR_RESOLUTION_NOT_APPLICABLE"
+            ? "ℹ️ この購入はもう返金の対象ではありません。**何も変更していません。**"
+            : "⚠️ 返金できませんでした。記録は残っているので、あとでやり直せます。",
+      flags: MessageFlags.Ephemeral,
+    });
+    await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
+  }
 }
 
 export async function handleShokanButton(interaction: ButtonInteraction, services: Services): Promise<void> {
@@ -683,10 +1102,34 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   };
 
   if (action === "hub") return void (await show(shopAdminPanelMessage(services) as never));
+  if (action === "work") return void (await show(renderWorkHub(services) as never));
   if (action === "pending") return void (await show(renderPending(services) as never));
   if (action === "failed") return void (await show(renderFailed(services) as never));
-  if (action === "legacy-unknown") return void (await show(renderLegacyUnknown(services) as never));
-  if (action === "stuck-delivery") return void (await show(renderStuckDeliveries(services) as never));
+  if (action === "stuck-delivery") {
+    return void (await show(renderStuckDeliveries(services, Math.max(0, Number(arg ?? 0))) as never));
+  }
+  if (action === "refund-open") {
+    return void (await show(renderRefundFailures(services, Math.max(0, Number(arg ?? 0))) as never));
+  }
+  if (action === "refund-pre" && arg) return void (await show(renderRefundPreview(services, Number(arg)) as never));
+  if (action === "refund-do" && arg) {
+    return void (await doRefundRetry(interaction, services, Number(arg), parts[3] ?? ""));
+  }
+  if (action === "case" && arg) return void (await show(renderCase(services, Number(arg)) as never));
+  if (action === "case-pre" && arg) {
+    // customId: shokan:case-pre:<decision>:<refund01>:<purchaseId>:<token>
+    const decision = arg as "delivered" | "no_effect" | "still_unknown";
+    return void (await show(
+      renderCasePreview(services, Number(parts[4]), decision, parts[3] === "1", parts[5] ?? "") as never,
+    ));
+  }
+  if (action === "case-note" && arg) {
+    // customId: shokan:case-note:<decision>:<refund01>:<purchaseId>:<token>
+    const decision = arg as "delivered" | "no_effect" | "still_unknown";
+    return void (await interaction.showModal(
+      caseNoteModal(decision, parts[3] === "1", Number(parts[4]), parts[5] ?? ""),
+    ));
+  }
   if (action === "list") return void (await show(renderList(services) as never));
   if (action === "history") return void (await show(renderHistory(services, Math.max(0, Number(arg ?? 0))) as never));
   if (action === "reeval-comp") {
@@ -830,6 +1273,19 @@ export async function handleShokanModal(interaction: ModalSubmitInteraction, ser
   }
   if (parts[1] === "reeval-comp-submit") {
     await handleReevalCompensation(interaction, services);
+    return;
+  }
+  if (parts[1] === "case-note") {
+    const decision = parts[2] as "delivered" | "no_effect" | "still_unknown";
+    const note = interaction.fields.getTextInputValue("note").trim();
+    if (decision !== "still_unknown" && note.length === 0) {
+      await interaction.reply({
+        content: "根拠を入力してください。**何も変更していません。**",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await resolveCase(interaction, services, decision, parts[3] === "1", Number(parts[4]), parts[5] ?? "", note);
     return;
   }
   if (parts[1] === "edit-stock") {

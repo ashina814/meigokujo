@@ -30,8 +30,8 @@ import {
   type ShopItemRow,
 } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
-import { deliverPurchase, nicknameBlockReason } from "../shop-delivery.js";
-import { deliverOrRefund, type Settlement } from "../shop-refund.js";
+import { UNCERTAIN_USER_MESSAGE, deliverPurchase, nicknameBlockReason } from "../shop-delivery.js";
+import { deliverOrRefund, type RefundOutcome, type Settlement } from "../shop-refund.js";
 import { withUserLock } from "../user-lock.js";
 import {
   isOriginalRoleItem,
@@ -50,6 +50,28 @@ import {
 import { meetsRoleRequirement, requirementLabel } from "../rank-requirement.js";
 import { refreshShopAdminPanels } from "./shokan.js";
 import type { Services } from "../services.js";
+
+/**
+ * 配送が失敗したときに利用者へ出す文言。**`RefundOutcome` の4状態をそれぞれの意味で出す。**
+ *
+ * `withheld`（提供できたか確認できないので返金を試していない）と
+ * `escalated`（返金を試して完了できなかった）を同じ文言にしない。前者で「失敗しました」と
+ * 言うのは嘘だし、後者を「確認中」と言うと返金されていない事実が隠れる。
+ * どちらも**重ねて購入する必要が無い**ことは伝える。
+ */
+export function settlementMessage(
+  refund: RefundOutcome | undefined,
+  opts: { purchaseId: number; paidLand: number; action: string; alreadyDone: string; note?: string },
+): string {
+  const tail = opts.note ? `
+-# ${opts.note}` : "";
+  if (refund === "refunded") return `${opts.action}できなかったため、${fmtLd(opts.paidLand)}は返金しました。${tail}`;
+  if (refund === "already_delivered") return `✅ ${opts.alreadyDone}`;
+  if (refund === "withheld") return `${UNCERTAIN_USER_MESSAGE}
+-# 受付番号 #${opts.purchaseId}`;
+  return `⚠️ ${opts.action}できず、返金も完了できていません。運営が対応します（購入 #${opts.purchaseId}）。
+-# 重ねて購入する必要はありません。`;
+}
 
 /**
  * 公式ショップ（買う側の永続パネル）。
@@ -1103,12 +1125,13 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       return;
     }
     await interaction.editReply({
-      content:
-        refund === "refunded"
-          ? `有効化できなかったため、${fmtLd(paidSub.paid_land ?? 0)}は返金しました。
--# ${outcome.message}`
-          : `⚠️ 有効化に失敗し、返金も完了できませんでした。運営が対応します（購入 #${paidSub.id}）。
--# ${outcome.message}`,
+      content: settlementMessage(refund, {
+        purchaseId: paidSub.id,
+        paidLand: paidSub.paid_land ?? 0,
+        action: "有効化",
+        alreadyDone: "サブ垢の有効化は既に完了しています。",
+        note: outcome.message,
+      }),
       embeds: [],
       components: [],
     });
@@ -1217,12 +1240,13 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
       await interaction.editReply({ content: `✅ ${outcome.message}`, embeds: [], components: [] });
       return;
     }
-    const content =
-      refund === "refunded"
-        ? `変更できなかったため、${fmtLd(purchase.purchase.paid_land ?? 0)}は返金しました。\n-# ${outcome.message}`
-        : refund === "already_delivered"
-          ? `✅ 名前の変更は完了しています。`
-          : `⚠️ 変更に失敗し、返金も完了できませんでした。運営が対応します（購入 #${purchase.purchase.id}）。\n-# ${outcome.message}`;
+    const content = settlementMessage(refund, {
+      purchaseId: purchase.purchase.id,
+      paidLand: purchase.purchase.paid_land ?? 0,
+      action: "変更",
+      alreadyDone: "名前の変更は完了しています。",
+      note: outcome.message,
+    });
     await interaction.editReply({ content, embeds: [], components: [] });
     return;
   }
