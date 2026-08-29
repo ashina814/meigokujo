@@ -84,6 +84,13 @@ export function deliverOrRefund(
  * なるので、管理パネルを更新したうえで**ボタンの無い**通知を出す。
  * 操作は管理パネル（正本）に集約し、通知メッセージを業務の入口にしない。
  */
+/**
+ * 決着が「いまの claim のもの」でなかったことを示すコード。
+ *
+ * 何も書けていないので、利用者へも運営へも「返金に失敗した」と言ってはいけない。
+ */
+const CLAIM_AUTHORITY_CODES = new Set(["ERR_CLAIM_UNKNOWN", "ERR_CLAIM_CONFLICT", "ERR_CLAIM_SUPERSEDED", "ERR_CLAIM_STALE"]);
+
 export async function refundOrEscalate(
   client: Client,
   services: Services,
@@ -111,6 +118,18 @@ export async function refundOrEscalate(
         payload: { purchaseId: purchase.id, reason },
       });
       return "already_delivered";
+    }
+    if (error instanceof ShopError && CLAIM_AUTHORITY_CODES.has(error.code)) {
+      // **この決着は、いまの claim のものではない。** 何も書けていないので
+      // 「返金に失敗しました」ではなく「確認できていない」として人へ渡す
+      services.events.log("shop_refund_withheld", {
+        actor,
+        target: purchase.user_id,
+        payload: { purchaseId: purchase.id, reason, error: error.code },
+      });
+      await refreshShopAdminPanels(client, services).catch(() => undefined);
+      await notifyUncertainDelivery(client, services, purchase.id).catch(() => undefined);
+      return "withheld";
     }
     throw error;
   }

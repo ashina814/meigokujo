@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { EventLog, Ledger, Shop, TREASURY, openDb, registerDefaultTxTypes } from "../src/index.js";
 
 /**
@@ -841,6 +841,215 @@ describe("止められた行が、失効の巡回を詰まらせない", () => {
     expect(ctx.shop.expireIfDue(id!, STAFF)).toEqual({ expired: false, reason: "refund_pending" });
     const [claimed] = guardedOverdue(ctx, 1, "claim");
     expect(ctx.shop.expireIfDue(claimed!, STAFF)).toEqual({ expired: false, reason: "delivery_in_flight" });
+    ctx.db.close();
+  });
+});
+
+describe("返金義務が閉じた購入は、また失効できる", () => {
+  /**
+   * 一度返金に失敗しても、**あとから提供が成功すれば返金の義務は消える**。
+   * 既存の回帰（`countRefundFailures()===0` / `quoteRefundRetry().open===false`）が
+   * それを正本として決めている。失効の候補選択がそれと違う意味を持つと、
+   * 「もう返す必要は無いのに、失効も剥奪判断も永久に来ない」購入ができる。
+   */
+  function refundFailedThenDelivered(ctx: Ctx) {
+    const purchase = buy(ctx);
+    ctx.shop.recordRefundFailure({
+      purchaseId: purchase.id,
+      amount: 100,
+      reason: "delivery_failed",
+      actor: "system",
+    });
+    expect(ctx.shop.countRefundFailures()).toBe(1);
+    // あとから提供が成功した＝返す理由が無くなった
+    ctx.shop.beginDelivery(purchase.id);
+    ctx.shop.markDeliverySucceeded(purchase.id, "system:test");
+    return purchase.id;
+  }
+
+  it("返金失敗の履歴があっても、提供が成功していれば期限で失効する", () => {
+    const ctx = setup();
+    const id = refundFailedThenDelivered(ctx);
+
+    // 正本の判定では、もう返金の未完了ではない
+    expect(ctx.shop.countRefundFailures()).toBe(0);
+    expect(ctx.shop.quoteRefundRetry(id).open).toBe(false);
+
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(id);
+    const result = ctx.shop.expireOverdue(STAFF);
+
+    // **候補に入り、失効し、通常の後処理まで進む**
+    expect(result.expired.map((r) => r.id)).toContain(id);
+    expect(ctx.shop.getPurchase(id)!.status).toBe("expired");
+    expect(
+      ctx.events
+        .listByType("shop_expired")
+        .some((e) => (JSON.parse(e.payload_json ?? "{}") as { purchaseId?: number }).purchaseId === id),
+    ).toBe(true);
+    expect(ctx.shop.pendingRoleRevocations().map((r) => r.purchase_id)).toContain(id);
+    ctx.db.close();
+  });
+
+  it("履歴の有無ではなく、いま返す義務があるかで止める", () => {
+    const ctx = setup();
+    const closed = refundFailedThenDelivered(ctx);
+    // 同じ利用者の月額は二重に持てないので、義務が open な方は別の利用者で作る
+    const other = "u-resolve-2";
+    ctx.ledger.ensureAccount(`user:${other}`, "user");
+    ctx.ledger.transfer({
+      from: TREASURY,
+      to: `user:${other}`,
+      amount: 10_000,
+      type: "adjust",
+      actor: "t",
+      approvedBy: "t",
+      idempotencyKey: "seed:resolve-2",
+    });
+    const open = ctx.shop.purchase({
+      itemId: ctx.item.id,
+      userId: other,
+      actor: `user:${other}`,
+      memberRoleIds: [],
+      expectedTermsToken: ctx.shop.quoteGenericPurchase(ctx.item.id).termsToken,
+    }).purchase.id;
+    ctx.shop.recordRefundFailure({ purchaseId: open, amount: 100, reason: "delivery_failed", actor: "system" });
+
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id IN (?,?)").run(closed, open);
+    const result = ctx.shop.expireOverdue(STAFF);
+
+    expect(result.expired.map((r) => r.id)).toEqual([closed]);
+    expect(ctx.shop.getPurchase(open)!.status).toBe("active");
+    // 最終判断も同じ意味
+    expect(ctx.shop.expireIfDue(open, STAFF)).toEqual({ expired: false, reason: "refund_pending" });
+    ctx.db.close();
+  });
+});
+
+describe("決着は「どの claim を閉じるのか」を検証する", () => {
+  /** 生きている claim を1つ持った、配送失敗直前の購入 */
+  function claimed(ctx: Ctx) {
+    const purchase = buy(ctx);
+    const claim = ctx.shop.claimExternalDelivery({
+      purchaseId: purchase.id,
+      deliveryKind: "add_role",
+      actor: "system",
+    });
+    return { id: purchase.id, token: (claim as { token: string }).token };
+  }
+
+  const snapshot = (ctx: Ctx, id: number) => ({
+    status: ctx.shop.getPurchase(id)!.status,
+    deliveryState: ctx.shop.getPurchase(id)!.delivery_state,
+    balance: ctx.ledger.balanceOf(`user:${USER}`),
+    obligations: ctx.db.prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id=?").pluck().get(id) as number,
+    refunds: ctx.events.listByType("shop_refunded").length,
+    attempts: ctx.db
+      .prepare("SELECT attempt_token, state FROM shop_external_delivery_attempts WHERE purchase_id=? ORDER BY attempt_token")
+      .all(id),
+  });
+
+  const settle = (ctx: Ctx, id: number, token: string | null) =>
+    ctx.shop.settleVerifiedFailure({ purchaseId: id, claimToken: token, reason: "delivery_failed", actor: "system" });
+
+  it("生きている claim をちょうど1件閉じて、返金まで進む", () => {
+    const ctx = setup();
+    const { id, token } = claimed(ctx);
+    const before = ctx.ledger.balanceOf(`user:${USER}`);
+
+    expect(settle(ctx, id, token)).toEqual({ refunded: true, amount: 100 });
+
+    expect(ctx.shop.getPurchase(id)!.status).toBe("refunded");
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(before + 100);
+    expect(ctx.shop.externalDeliveryInFlight(id)).toBe(false);
+    ctx.db.close();
+  });
+
+  it("知らない token では、1つも書かない", () => {
+    const ctx = setup();
+    const { id } = claimed(ctx);
+    const before = snapshot(ctx, id);
+
+    expect(() => settle(ctx, id, "not-a-real-token")).toThrow(/ERR_CLAIM_UNKNOWN/);
+
+    expect(snapshot(ctx, id)).toEqual(before);
+    ctx.db.close();
+  });
+
+  it("既に解放された token では、1つも書かない", () => {
+    const ctx = setup();
+    const { id, token } = claimed(ctx);
+    ctx.shop.releaseExternalDelivery({ purchaseId: id, token, reason: "retry", actor: "system" });
+    const before = snapshot(ctx, id);
+
+    expect(() => settle(ctx, id, token)).toThrow(/ERR_CLAIM_STALE/);
+
+    expect(snapshot(ctx, id)).toEqual(before);
+    ctx.db.close();
+  });
+
+  it("既に決着済みなら、二重に書かずにその結末を返す", () => {
+    const ctx = setup();
+    const { id, token } = claimed(ctx);
+    const before = ctx.ledger.balanceOf(`user:${USER}`);
+    expect(settle(ctx, id, token)).toEqual({ refunded: true, amount: 100 });
+    const after = snapshot(ctx, id);
+
+    // 同じ token でもう一度呼んでも、返金は増えない
+    expect(settle(ctx, id, token)).toEqual({ refunded: true, amount: 100 });
+
+    expect(snapshot(ctx, id)).toEqual(after);
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(before + 100);
+    expect(ctx.events.listByType("shop_refunded").length).toBe(1);
+    ctx.db.close();
+  });
+
+  it("返金の義務が既に立っているなら、積み増さずにその事実を返す", () => {
+    const ctx = setup();
+    const { id, token } = claimed(ctx);
+    const spy = vi.spyOn(ctx.ledger, "transfer").mockImplementation(() => {
+      throw new Error("ledger unavailable");
+    });
+    const first = settle(ctx, id, token);
+    spy.mockRestore();
+    expect(first).toMatchObject({ failed: true });
+    const after = snapshot(ctx, id);
+
+    const again = settle(ctx, id, token);
+
+    expect(again).toMatchObject({ failed: true });
+    expect(snapshot(ctx, id)).toEqual(after);
+    expect(ctx.shop.countRefundFailures()).toBe(1);
+    ctx.db.close();
+  });
+
+  it("別の claim が生きているなら、古い呼び出しには何も書かせない", () => {
+    const ctx = setup();
+    const { id, token: tokenA } = claimed(ctx);
+    // A を片付けて、B を新しく取る（同時に生きている claim は1つだけ）
+    ctx.shop.releaseExternalDelivery({ purchaseId: id, token: tokenA, reason: "retry", actor: "system" });
+    const claimB = ctx.shop.claimExternalDelivery({ purchaseId: id, deliveryKind: "add_role", actor: "system" });
+    const tokenB = (claimB as { token: string }).token;
+    const before = snapshot(ctx, id);
+
+    expect(() => settle(ctx, id, tokenA)).toThrow(/ERR_CLAIM_SUPERSEDED/);
+
+    // 資産も配送状態も claim も動いていない
+    expect(snapshot(ctx, id)).toEqual(before);
+    expect(ctx.shop.externalDeliveryInFlight(id)).toBe(true);
+    // B は生きたまま。正しい token なら通る
+    expect(settle(ctx, id, tokenB)).toEqual({ refunded: true, amount: 100 });
+    ctx.db.close();
+  });
+
+  it("「purchase が active だから」を理由に続けない", () => {
+    const ctx = setup();
+    const { id, token: tokenA } = claimed(ctx);
+    ctx.shop.releaseExternalDelivery({ purchaseId: id, token: tokenA, reason: "retry", actor: "system" });
+    ctx.shop.claimExternalDelivery({ purchaseId: id, deliveryKind: "add_role", actor: "system" });
+
+    // 購入は active のまま——それでも古い token は通さない
+    expect(ctx.shop.getPurchase(id)!.status).toBe("active");
+    expect(() => settle(ctx, id, tokenA)).toThrow(/ERR_CLAIM_SUPERSEDED/);
     ctx.db.close();
   });
 });

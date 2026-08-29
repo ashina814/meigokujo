@@ -454,6 +454,10 @@ export type ShopErrorCode =
   | "ERR_STOCK_CHANGE_REQUIRES_API"
   | "ERR_STOCK_VALUE_INVALID"
   | "ERR_DELIVERY_IN_FLIGHT"
+  | "ERR_CLAIM_UNKNOWN"
+  | "ERR_CLAIM_CONFLICT"
+  | "ERR_CLAIM_SUPERSEDED"
+  | "ERR_CLAIM_STALE"
   | "ERR_RESOLUTION_STALE"
   | "ERR_RESOLUTION_NOT_APPLICABLE"
   | "ERR_RESOLUTION_EVIDENCE_REQUIRED"
@@ -2947,6 +2951,14 @@ export class Shop {
     return this.externalDeliveryClaim(purchaseId) !== undefined;
   }
 
+  /** 生きている claim があるか。候補選択と最終判断で同じ意味を使う。 */
+  private static externalDeliveryLiveSql(): string {
+    return `EXISTS (
+      SELECT 1 FROM shop_external_delivery_attempts a
+       WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
+    )`;
+  }
+
   /**
    * Discord へ副作用を投げる**前に**、durable に場所を取る。
    *
@@ -3482,20 +3494,76 @@ export class Shop {
       | { refunded: boolean; amount: number }
       | { failed: true; code: string | null; message: string } => {
       if (input.claimToken !== null) {
-        // 解放できなくても続ける。別経路が先に決着させていた場合も、
-        // 下の返金側の条件（active であること）が最終的な安全弁になる。
-        this.db
-          .prepare(
-            `UPDATE shop_external_delivery_attempts
-                SET state = 'released', updated_at = ?, detail = ?
-              WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
-          )
-          .run(now(), "verified_no_effect", input.purchaseId, input.claimToken);
+        const converged = this.releaseSettlementClaim(input);
+        // 既に同じ結末へ収束済みなら、上から何も書かずにその事実を返す
+        if (converged !== null) return converged;
       }
       this.markDeliveryFailed(input.purchaseId, input.reason, input.actor);
       return this.refundOrRecordFailure(input.purchaseId, input.reason, input.actor);
     };
     return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /**
+   * 決着が閉じようとしている claim が、**本当にいま生きているそれか**を確かめる。
+   *
+   * `refundClaimToken` を持ち越すようにした以上、その token は
+   * 「この決着がどの claim を閉じるのか」という authority です。合っているかを見ずに
+   * 続けると、古い呼び出し元が新しい状態へ配送失敗や返金を書き込めてしまう。
+   * 「purchase が active だから続けてよい」は authority になりません——
+   * その active は、**別の生きている claim が守っている** active かもしれない。
+   *
+   * 返り値
+   *   - `null` … ちょうど1件の live claim を閉じた。決着を続けてよい
+   *   - 決着結果 … 既に同じ結末へ収束済み。**何も書かずに**その事実を返す
+   *   - throw … stale / 別の live claim / 説明できない状態。**1つも書かない**
+   */
+  private releaseSettlementClaim(input: {
+    purchaseId: number;
+    claimToken: string | null;
+    reason: string;
+    actor: string;
+  }): { refunded: boolean; amount: number } | { failed: true; code: string | null; message: string } | null {
+    const token = input.claimToken;
+    if (token === null) return null;
+    const attempt = this.db
+      .prepare("SELECT state FROM shop_external_delivery_attempts WHERE purchase_id = ? AND attempt_token = ?")
+      .get(input.purchaseId, token) as { state: string } | undefined;
+    if (attempt === undefined) {
+      // そんな claim は存在しない。取り違えなので、この呼び出しには何も書かせない
+      throw new ShopError("ERR_CLAIM_UNKNOWN", { purchaseId: input.purchaseId });
+    }
+
+    if (attempt.state === "in_flight" || attempt.state === "uncertain") {
+      const changed = this.db
+        .prepare(
+          `UPDATE shop_external_delivery_attempts
+              SET state = 'released', updated_at = ?, detail = ?
+            WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+        )
+        .run(now(), "verified_no_effect", input.purchaseId, token).changes;
+      // 同時に生きている claim は部分ユニーク索引で1つに縛られている。
+      // それでも1件で無いなら、こちらの前提が崩れている＝書かずに止める
+      if (changed !== 1) throw new ShopError("ERR_CLAIM_CONFLICT", { purchaseId: input.purchaseId });
+      return null;
+    }
+
+    // ここから先、渡された token は既に閉じている。
+    // **別の claim が生きているなら、この決着は過去のもの。** 触らせない
+    const live = this.externalDeliveryClaim(input.purchaseId);
+    if (live !== undefined) throw new ShopError("ERR_CLAIM_SUPERSEDED", { purchaseId: input.purchaseId });
+
+    // 同じ結末へ既に収束しているなら、二重に書かずにその事実を返す
+    const purchase = this.getPurchase(input.purchaseId);
+    if (purchase === undefined || purchase === null) {
+      throw new ShopError("ERR_CLAIM_STALE", { purchaseId: input.purchaseId });
+    }
+    if (purchase.status === "refunded") return { refunded: true, amount: purchase.paid_land ?? 0 };
+    if (this.refundFailureOpen(input.purchaseId)) {
+      return { failed: true, code: "ERR_REFUND_PENDING", message: "refund obligation already recorded" };
+    }
+    // 閉じた claim なのに、決着もされていない。何が起きたか説明できないので書かない
+    throw new ShopError("ERR_CLAIM_STALE", { purchaseId: input.purchaseId });
   }
 
   /**
@@ -4472,19 +4540,16 @@ export class Shop {
     // それを候補に含めたまま LIMIT を掛けると、古い順に並んだ「絶対に失効しない行」が
     // 毎回枠を占有し、その後ろの普通の期限切れへ永久に到達できない。
     // ここで先に外してから LIMIT を掛ける。**最終判断は `expireIfDue()` のまま。**
+    //
+    // 除外条件は `expireIfDue()` が使うものと**同じ関数から作る**。
+    // 「返金失敗の履歴が1件でもあるか」を手書きすると意味がズレる——提供が後から
+    // 成功して義務が閉じた購入まで永久に候補から外れ、失効も剥奪判断も進まなくなる。
     const due = this.db
       .prepare(
         `SELECT p.id FROM shop_purchases p
           WHERE p.status = 'active' AND p.expires_at IS NOT NULL AND p.expires_at <= ?
-            AND NOT EXISTS (
-              SELECT 1 FROM shop_external_delivery_attempts a
-               WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
-            )
-            AND NOT EXISTS (
-              SELECT 1 FROM shop_purchases q
-               WHERE q.id = p.id
-                 AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = q.id)
-            )
+            AND NOT ${Shop.externalDeliveryLiveSql()}
+            AND NOT (${Shop.refundFailureSql()})
           ORDER BY p.expires_at
           LIMIT ?`,
       )

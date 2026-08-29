@@ -147,6 +147,33 @@ const buttonIds = (fn: ReturnType<typeof vi.fn>): string[] =>
 const landOf = (ctx: Ctx) => ctx.ledger.balanceOf(`user:${USER}`);
 
 describe("返金へ回す失敗は、決着まで守りを外さない", () => {
+  it("古い claim の決着は「返金に失敗」ではなく「確認できていない」として渡す", async () => {
+    const { refundOrEscalate } = await refundModule;
+    const ctx = setup();
+    const p = buy(ctx);
+    // A を取って片付け、いま生きているのは B。A は過去のもの
+    const a = ctx.shop.claimExternalDelivery({ purchaseId: p.id, deliveryKind: "add_role", actor: "system" }) as {
+      token: string;
+    };
+    ctx.shop.releaseExternalDelivery({ purchaseId: p.id, token: a.token, reason: "retry", actor: "system" });
+    ctx.shop.claimExternalDelivery({ purchaseId: p.id, deliveryKind: "add_role", actor: "system" });
+    const before = landOf(ctx);
+
+    const result = await refundOrEscalate(ctx.client as never, ctx.services, p, "delivery_failed", "system:test", a.token);
+
+    // **返金を試していないので「失敗」と言わない。** 資産も配送状態も動かない
+    expect(result).toBe("withheld");
+    expect(landOf(ctx)).toBe(before);
+    expect(ctx.shop.countRefundFailures()).toBe(0);
+    expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
+    expect(ctx.shop.externalDeliveryInFlight(p.id)).toBe(true);
+    expect(ctx.events.listByType("shop_refund_failed").length).toBe(0);
+    expect(ctx.events.listByType("shop_refund_withheld").length).toBe(1);
+    // 利用者向けの通知にも「返金に失敗」と出さない
+    expect(ctx.sent.join(" | ")).not.toContain("返金に失敗");
+    ctx.db.close();
+  });
+
   it("返金の決着を呼ぶ時点で、まだ claim を握っている", async () => {
     const { deliverOrRefund } = await refundModule;
     const ctx = setup();
