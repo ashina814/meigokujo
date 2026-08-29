@@ -55,7 +55,9 @@ export function deliverOrRefund(
           payload: { purchaseId: purchase.id, reason: outcome.error ?? "delivery_failed" },
         });
         await refreshShopAdminPanels(client, services).catch(() => undefined);
-        await notifyRefundFailure(client, services, purchase.id).catch(() => undefined);
+        // **「返金に失敗しました」ではない。** この経路は返金を試していない。
+        // 事実は「提供できたか確認できないので、自動返金していない」
+        await notifyUncertainDelivery(client, services, purchase.id).catch(() => undefined);
         return { outcome, refund: "withheld" as const };
       }
       const refund = await refundOrEscalate(client, services, purchase, outcome.error ?? "delivery_failed", actor);
@@ -101,6 +103,25 @@ export async function refundOrEscalate(
     await notifyRefundFailure(client, services, purchase.id).catch(() => undefined);
     return "escalated";
   }
+}
+
+/**
+ * 提供できたか確認できないまま止まった案件を、スタッフへ知らせる。
+ *
+ * **「返金に失敗しました」と言わない。** この経路は返金を試していない。
+ * 仕事の正本は管理パネルなので、ここではボタンを置かず場所だけ示す。
+ */
+async function notifyUncertainDelivery(client: Client, services: Services, purchaseId: number): Promise<void> {
+  const channelId = services.settings.getString("channel:shokan") ?? services.settings.getString("channel:kessai");
+  if (!channelId) return;
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased() || !("send" in channel)) return;
+  await channel
+    .send({
+      content: `🛰 **提供状態を確認できないため、自動返金していません**（購入 #${purchaseId}）。商館の管理パネルの「確認待ちの案件」から確認してください。`,
+      allowedMentions: { parse: [] },
+    })
+    .catch(() => undefined);
 }
 
 async function notifyRefundFailure(client: Client, services: Services, purchaseId: number): Promise<void> {

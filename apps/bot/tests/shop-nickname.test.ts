@@ -432,7 +432,10 @@ describe("課金後に変更できなかったとき", () => {
 
     await handleShopButton(press as never, ctx.services);
 
-    expect(contentOf(press.editReply)).toContain("返金も完了できませんでした");
+    // 返金を試して失敗した（= escalated）。**確認中とは言わない**
+    expect(contentOf(press.editReply)).toContain("返金も完了できていません");
+    expect(contentOf(press.editReply)).toContain("重ねて購入する必要はありません");
+    expect(contentOf(press.editReply)).not.toContain("提供できたかを確認しています");
     const purchase = ctx.shop.listUserPurchases(USER)[0]!;
     expect(purchase.status).toBe("active");
     expect(purchase.delivery_state).toBe("failed");

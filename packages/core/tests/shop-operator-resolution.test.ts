@@ -134,6 +134,79 @@ describe("運営による決着 — 外部配送の未確定", () => {
     ctx.db.close();
   });
 
+  it("決着の台帳が、実際に確定した結果と一致する", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    uncertain(ctx, p.id);
+    const before = landOf(ctx);
+    const quote = ctx.shop.quoteOperatorResolution(p.id);
+
+    ctx.shop.resolveOperatorCase({
+      purchaseId: p.id,
+      decision: "no_effect",
+      expectedToken: quote.token,
+      actor: STAFF,
+      refund: true,
+      note: "Discord上に痕跡なし",
+    });
+
+    // 実際に起きたこと
+    const purchase = ctx.shop.getPurchase(p.id)!;
+    expect(purchase.status).toBe("refunded");
+    expect(landOf(ctx)).toBe(before + 100);
+    expect(ctx.events.listByType("shop_refunded")).toHaveLength(1);
+
+    // 台帳がそれと一致していること
+    const rows = resolutionsOf(ctx, p.id);
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.refunded).toBe(1);
+    expect(row.note).toBe("Discord上に痕跡なし");
+    const after = JSON.parse(row.after_state) as Record<string, unknown>;
+    expect(after).toMatchObject({
+      decision: "no_effect",
+      status: "refunded",
+      claimState: "released",
+      refunded: true,
+      refundedAmount: 100,
+    });
+    expect(after.deliveryState).toBe(purchase.delivery_state);
+    ctx.db.close();
+  });
+
+  it("返金しない決着なら、台帳も refunded=0 になる", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    uncertain(ctx, p.id);
+    const quote = ctx.shop.quoteOperatorResolution(p.id);
+
+    ctx.shop.resolveOperatorCase({
+      purchaseId: p.id,
+      decision: "delivered",
+      expectedToken: quote.token,
+      actor: STAFF,
+      note: "ロールを目視確認",
+    });
+
+    const row = resolutionsOf(ctx, p.id)[0]!;
+    expect(row.refunded).toBe(0);
+    const after = JSON.parse(row.after_state) as Record<string, unknown>;
+    expect(after).toMatchObject({ decision: "delivered", status: "active", claimState: "settled", refunded: false });
+    expect(after.deliveryState).toBe("delivered");
+    ctx.db.close();
+  });
+
+  it("同じ購入が複数の条件に当てはまっても、件数は一覧と一致する", () => {
+    const ctx = setup();
+    const p = legacyPurchase(ctx);
+    // 旧購入の不明に加えて、外部配送の未確定も付く
+    uncertain(ctx, p.id);
+
+    expect(ctx.shop.countUnresolvedCases()).toBe(ctx.shop.listUnresolvedCases(100).length);
+    expect(ctx.shop.countUnresolvedCases()).toBe(1);
+    ctx.db.close();
+  });
+
   it("提供なしを確認だけ（返金しない）→ 再試行できる状態へ戻す", () => {
     const ctx = setup();
     const p = buy(ctx);
@@ -341,10 +414,21 @@ describe("運営による決着 — 外部配送の未確定", () => {
 
     const q2 = ctx.shop.quoteOperatorResolution(p.id);
     expect(q2.kind).toBeNull();
-    expect(q2.allowedDecisions).toEqual(["still_unknown"]);
-    expect(() =>
-      ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "delivered", expectedToken: q2.token, actor: OTHER }),
-    ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_NOT_APPLICABLE" }));
+    // **決着済みには何も足せない。** UIがボタンを出さないことは authority ではない
+    expect(q2.allowedDecisions).toEqual([]);
+    const beforeRows = resolutionsOf(ctx, p.id).length;
+
+    for (const decision of ["delivered", "no_effect", "still_unknown"] as const) {
+      expect(() =>
+        ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision, expectedToken: q2.token, actor: OTHER }),
+      ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_NOT_APPLICABLE" }));
+    }
+
+    // 偽の監査行を1つも足せない
+    expect(resolutionsOf(ctx, p.id)).toHaveLength(beforeRows);
+    expect(
+      ctx.db.prepare("SELECT COUNT(*) FROM shop_operator_resolutions WHERE kind='legacy_unknown'").pluck().get(),
+    ).toBe(0);
     ctx.db.close();
   });
 
@@ -404,6 +488,30 @@ describe("運営による決着 — 旧購入の不明", () => {
     expect(landOf(ctx)).toBe(before + 100);
     expect(ctx.shop.getPurchase(p.id)!.status).toBe("refunded");
     expect(ctx.shop.unresolvedCaseKind(p.id)).toBeNull();
+    ctx.db.close();
+  });
+
+  it("提供なしと確認しておけば、あとから別経路で返金できる", () => {
+    const ctx = setup();
+    const p = legacyPurchase(ctx);
+    const before = landOf(ctx);
+    const quote = ctx.shop.quoteOperatorResolution(p.id);
+
+    // 返金までは一緒にやらない（確認だけ残す）
+    const result = ctx.shop.resolveOperatorCase({
+      purchaseId: p.id,
+      decision: "no_effect",
+      expectedToken: quote.token,
+      actor: STAFF,
+      note: "痕跡なし",
+    });
+    expect(result.refunded).toBe(false);
+    expect(landOf(ctx)).toBe(before);
+
+    // **残した確認記録が証拠になる。** 別経路の返金がそれを根拠に通る
+    expect(ctx.shop.operatorConfirmedNoEffect(p.id)).toBe(true);
+    expect(ctx.shop.refund(p.id, "運営確認済み", STAFF).refunded).toBe(true);
+    expect(landOf(ctx)).toBe(before + 100);
     ctx.db.close();
   });
 

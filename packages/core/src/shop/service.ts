@@ -2631,6 +2631,22 @@ export class Shop {
    * 返金そのものに失敗したら例外を投げる。**そこだけが人の出番**になる。
    */
   refund(purchaseId: number, reason: string, actor: string): { refunded: boolean; amount: number } {
+    return this.refundWith(purchaseId, reason, actor, {});
+  }
+
+  /**
+   * 返金の本体。
+   *
+   * `operatorNoEffect` は「運営がいま**この transaction の中で**『提供されていない』と
+   * 確認した」という authority。台帳へ書いてから読み直す循環に頼らずに済むので、
+   * 決着の結果（返金できたか）を確定してから監査行を1回だけ積める。
+   */
+  private refundWith(
+    purchaseId: number,
+    reason: string,
+    actor: string,
+    opts: { operatorNoEffect?: boolean },
+  ): { refunded: boolean; amount: number } {
     const run = this.db.transaction(() => {
       const purchase = this.getPurchase(purchaseId);
       if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
@@ -2667,7 +2683,7 @@ export class Shop {
       // 「証拠が無い＝未提供」でもない。**不明は不明として止める。**
       // 自動で返金すると、実際には提供済みだったものまで払い戻してしまう。
       // 人が確認してから決める（この経路では資産を1つも動かさない）。
-      if (this.fulfillmentUnknown(purchase)) {
+      if (this.fulfillmentUnknown(purchase, opts)) {
         throw new ShopError("ERR_FULFILLMENT_UNKNOWN", { purchaseId });
       }
       const amount = purchase.paid_land ?? 0;
@@ -3122,8 +3138,9 @@ export class Shop {
     // 代替支払を含む購入は generic refund の対象外（Phase C）。ここでも返金は出さない。
     const refundSupported =
       purchase.paid_alt_kind === null && purchase.paid_alt_amount === null && purchase.status === "active";
-    const allowed: OperatorDecision[] =
-      kind === null ? ["still_unknown"] : ["delivered", "no_effect", "still_unknown"];
+    // **決着済みには何も足せない。** UIがボタンを出さないことは authority ではないので、
+    // ここで空にしたうえで確定側でも拒む。
+    const allowed: OperatorDecision[] = kind === null ? [] : ["delivered", "no_effect", "still_unknown"];
     return {
       purchaseId,
       kind,
@@ -3197,8 +3214,10 @@ export class Shop {
       if (this.operatorResolutionToken(purchase, kind, claim) !== input.expectedToken) {
         throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
       }
-      if (input.decision !== "still_unknown" && kind === null) {
-        // もう決着している（別の運営が処理した／自動収束した）
+      if (kind === null) {
+        // もう決着している（別の運営が処理した／自動収束した）。
+        // **`still_unknown` も含めて拒む。** 通すと、決着済みの購入へ偽の
+        // `legacy_unknown / still_unknown` という監査行を後から足せてしまう。
         throw new ShopError("ERR_RESOLUTION_NOT_APPLICABLE", { purchaseId: input.purchaseId });
       }
       if (input.refund && input.decision !== "no_effect") {
@@ -3247,32 +3266,49 @@ export class Shop {
         this.markDeliveryFailed(input.purchaseId, "operator_confirmed_no_effect", input.actor);
       }
 
-      // **判断は状態より先に台帳へ残す。** 返金はこの記録を証拠として通る。
-      this.db
-        .prepare(
-          `INSERT INTO shop_operator_resolutions
-             (purchase_id, kind, decision, operator_id, note, before_state, after_state, attempt_token, refunded, resolved_at)
-           VALUES (?,?,?,?,?,?,?,?,0,?)`,
-        )
-        .run(
-          input.purchaseId,
-          kind ?? "legacy_unknown",
-          input.decision,
-          input.actor,
-          (input.note ?? "").slice(0, 1000) || null,
-          JSON.stringify(before),
-          JSON.stringify({ decision: input.decision }),
-          claim?.attempt_token ?? null,
-          ts,
-        );
-
       if (input.refund && input.decision === "no_effect") {
-        const outcome = this.refund(input.purchaseId, "運営確認: 提供なし", input.actor);
+        // **運営の「提供なし」確認をそのまま authority として渡す。**
+        // 台帳へ先に書いてから読み直す循環にすると、監査行を「返金前の姿」で
+        // 積むことになり、実際の結果と食い違う。
+        const outcome = this.refundWith(input.purchaseId, "運営確認: 提供なし", input.actor, {
+          operatorNoEffect: true,
+        });
         refunded = outcome.refunded;
         refundedAmount = outcome.amount;
       }
 
       const after = this.getPurchase(input.purchaseId)!;
+      const finalClaim = this.db
+        .prepare("SELECT state FROM shop_external_delivery_attempts WHERE purchase_id = ? AND attempt_token = ?")
+        .get(input.purchaseId, claim?.attempt_token ?? "") as { state: string } | undefined;
+
+      // **この transaction が実際に確定した結果を、1回だけ積む。**
+      // append-only なので「仮の行を入れて後で直す」はできない。だから最後に書く。
+      this.db
+        .prepare(
+          `INSERT INTO shop_operator_resolutions
+             (purchase_id, kind, decision, operator_id, note, before_state, after_state, attempt_token, refunded, resolved_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          input.purchaseId,
+          kind,
+          input.decision,
+          input.actor,
+          (input.note ?? "").slice(0, 1000) || null,
+          JSON.stringify(before),
+          JSON.stringify({
+            decision: input.decision,
+            status: after.status,
+            deliveryState: after.delivery_state,
+            claimState: finalClaim?.state ?? null,
+            refunded,
+            refundedAmount,
+          }),
+          claim?.attempt_token ?? null,
+          refunded ? 1 : 0,
+          ts,
+        );
       this.events.log("shop_operator_resolution", {
         actor: input.actor,
         target: purchase.user_id,
@@ -3339,12 +3375,27 @@ export class Shop {
     return out;
   }
 
+  /**
+   * 決着待ちの**件数**。
+   *
+   * **一覧と同じ「purchase単位」で数える。** バケットごとの件数を足すと、同じ購入が
+   * 2つの条件に当てはまったときに一覧より多く見える（押せる案件より数字が大きい）。
+   */
   countUnresolvedCases(): number {
-    return (
-      this.countUnresolvedExternalDeliveries() +
-      this.countLegacyUnknownFulfillment() +
-      this.countLegacyAutoOutcomeUnknown()
-    );
+    return this.db
+      .prepare(
+        `SELECT COUNT(*) FROM (
+           SELECT a.purchase_id AS id
+             FROM shop_external_delivery_attempts a
+            WHERE a.state IN ('in_flight','uncertain')
+           UNION
+           SELECT p.id FROM shop_purchases p WHERE ${Shop.legacyUnknownSql()}
+           UNION
+           SELECT p.id FROM shop_purchases p WHERE ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}
+         )`,
+      )
+      .pluck()
+      .get() as number;
   }
 
   /** 始末の記録。無ければまだ始末していない。 */
@@ -3445,11 +3496,13 @@ export class Shop {
    * （スナップショットは方式の証拠であって成功の証拠ではない）。
    * 独立した配送記録があるならそれは `hasDeliveredEvidence` 側で拾われる。
    */
-  private fulfillmentUnknown(purchase: PurchaseRow): boolean {
+  private fulfillmentUnknown(purchase: PurchaseRow, opts: { operatorNoEffect?: boolean } = {}): boolean {
     if (this.fulfillmentProvenance(purchase.id)) return false;
     if (this.hasDeliveredEvidence(purchase)) return false;
     // **運営が「提供されていない」と確認した記録は、欠けている証拠の代わりになる。**
     // 推測ではなく、人が外部状態を見て残した事実なので、これを根拠に返金してよい。
+    // いま決着中なら、その判断を直接受け取る（台帳へ書いてから読み直す循環を避ける）。
+    if (opts.operatorNoEffect) return false;
     if (this.operatorConfirmedNoEffect(purchase.id)) return false;
     // 専用サービスの権利は、それぞれのフローが消費状態を持っている。
     if (this.isReevaluationPurchase(purchase.id)) return false;

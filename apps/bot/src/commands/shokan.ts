@@ -99,16 +99,15 @@ function failedAuto(services: Services): Array<PurchaseRow & { item_name: string
 }
 
 /** 残件数。**表示上限で数えない**（11件目以降も正しく出す） */
-function queueCounts(services: Services): { pending: number; failed: number; legacy: number; stuck: number } {
+function queueCounts(services: Services): { pending: number; failed: number; stuck: number } {
   return {
     pending: services.shop.countPendingManual(),
     failed: services.shop.countUndeliveredAuto(),
     // 提供できたか確認できていない案件（外部配送の未確定 + 旧購入の不明）。
-    // **どちらも「開いて決着させる」同じ作業**なので、1つのキューとして数える
+    // **どちらも「開いて決着させる」同じ作業**なので、1つのキューにまとめる。
+    // 旧購入だけを別に見せる導線は持たない——同じ案件が「操作できる場所」と
+    // 「見るだけの場所」の2箇所に出ると、どちらが正本か分からなくなる。
     stuck: services.shop.countUnresolvedCases(),
-    // 購入時の提供方式が分からない旧購入と、方式は分かるが結末が分からない旧購入。
-    // どちらも仕事として数えるが、要対応とは別枠にする。
-    legacy: services.shop.countLegacyUnknownFulfillment() + services.shop.countLegacyAutoOutcomeUnknown(),
   };
 }
 
@@ -137,7 +136,7 @@ function fmtJstDate(unixSec: number): string {
  * 個人ごとの情報は載せない（押した後の ephemeral で出す）ので、そのまま設置できる。
  */
 export function shopAdminPanelMessage(services: Services): MessageCreateOptions {
-  const { pending, failed, legacy, stuck } = queueCounts(services);
+  const { pending, failed, stuck } = queueCounts(services);
   const embed = new EmbedBuilder()
     .setTitle("🛠 冥界商館 管理")
     .setColor(pending + failed > 0 ? 0xdc2626 : 0x64748b)
@@ -146,7 +145,6 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
         pending + failed > 0
           ? `**残っている仕事: 要対応 ${pending}件 / 処理失敗 ${failed}件**`
           : "残っている仕事はありません。",
-        legacy > 0 ? `**要確認（旧購入） ${legacy}件** — 購入時の提供方式を自動判定できません。` : "",
         stuck > 0
           ? `**確認待ちの案件 ${stuck}件** — 提供できたか確認できていないため、自動では返金も完了もしていません。`
           : "",
@@ -197,11 +195,6 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
       .setLabel(stuck > 0 ? `確認待ちの案件 ${stuck}` : "確認待ちの案件")
       .setEmoji("🛰")
       .setStyle(stuck > 0 ? ButtonStyle.Danger : ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("shokan:legacy-unknown")
-      .setLabel(legacy > 0 ? `要確認（旧購入） ${legacy}` : "要確認（旧購入）")
-      .setEmoji("🕓")
-      .setStyle(legacy > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: [row, row2] };
 }
@@ -267,48 +260,6 @@ function manualCompletionMessage(id: number, reason: ManualCompletionReason): st
   }
 }
 
-/**
- * 購入時の提供方式が分からない旧購入。
- *
- * 普通の作業キューへは混ぜない（ワンクリックで完了にすると、実際には自動配送で
- * 提供済みだったものまで「人が対応した」ことにしてしまう）。かといって消すと、
- * 本当に人の対応が要る購入が見えなくなる。別枠で出して確認してもらう。
- */
-function renderLegacyUnknown(services: Services) {
-  const modeRows = services.shop.listLegacyUnknownFulfillment({ limit: QUEUE_DISPLAY });
-  const modeTotal = services.shop.countLegacyUnknownFulfillment();
-  const outcomeRows = services.shop.listLegacyAutoOutcomeUnknown({ limit: QUEUE_DISPLAY });
-  const outcomeTotal = services.shop.countLegacyAutoOutcomeUnknown();
-  const embed = new EmbedBuilder().setTitle("🕓 要確認（旧購入）").setColor(0xd97706);
-  if (modeTotal + outcomeTotal === 0) {
-    embed.setDescription("確認が必要な旧購入はありません。");
-    return { embeds: [embed], components: [backButton()], allowedMentions: { parse: [] as never[] } };
-  }
-  const line = (p: { id: number; item_name: string; user_id: string; purchased_at: number }) =>
-    `\`#${p.id}\` **${p.item_name}** — <@${p.user_id}>（${fmtJstDate(p.purchased_at)}）`;
-  const body: string[] = ["どちらも提供状況を確認してから判断してください。"];
-  if (modeTotal > 0) {
-    body.push(
-      "",
-      `**提供方式を確認できない（${modeTotal}件）**`,
-      ...modeRows.map(line),
-      ...overflowNote(modeRows.length, modeTotal),
-    );
-  }
-  if (outcomeTotal > 0) {
-    body.push(
-      "",
-      `**自動提供だったが完了結果を確認できない（${outcomeTotal}件）**`,
-      ...outcomeRows.map(line),
-      ...overflowNote(outcomeRows.length, outcomeTotal),
-    );
-  }
-  embed.setDescription(body.join("\n"));
-  // どちらもワンクリックの操作は置かない。前者を「完了」にすると提供済みを人の対応に、
-  // 後者を「再試行」にすると古いロール付与や期限延長を流し直すことになる。
-  embed.setFooter({ text: "ここからワンクリックでの完了・再試行はできません。" });
-  return { embeds: [embed], components: [backButton()], allowedMentions: { parse: [] as never[] } };
-}
 
 function renderPending(services: Services) {
   const rows = pendingManual(services);
@@ -749,8 +700,8 @@ function renderCasePreview(
   if (stale) return { embeds: [embed], components: [backToCasesRow()] };
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setCustomId(`shokan:case-do:${decision}:${refund ? 1 : 0}:${purchaseId}:${token}`)
-      .setLabel("この内容で確定する")
+      .setCustomId(`shokan:case-note:${decision}:${refund ? 1 : 0}:${purchaseId}:${token}`)
+      .setLabel("根拠を入力して確定")
       .setStyle(decision === "no_effect" && refund ? ButtonStyle.Danger : ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`shokan:case:${purchaseId}`).setLabel("やめる").setStyle(ButtonStyle.Secondary),
   );
@@ -774,16 +725,47 @@ function purchaseStatusLabel(status: string): string {
 }
 
 /**
+ * 決着の根拠を書いてもらう。
+ *
+ * **人の確認を authority として採用する以上、「何を確認したのか」が残らないと
+ * 監査台帳の意味が無い。** 判断が分かれる決着（提供済み／提供なし）では必須にする。
+ * 保留も「何を見て判断できなかったか」を残せるようにする。
+ */
+function caseNoteModal(
+  decision: "delivered" | "no_effect" | "still_unknown",
+  refund: boolean,
+  purchaseId: number,
+  token: string,
+): ModalBuilder {
+  const required = decision !== "still_unknown";
+  return new ModalBuilder()
+    .setCustomId(`shokan:case-note:${decision}:${refund ? 1 : 0}:${purchaseId}:${token}`)
+    .setTitle(`#${purchaseId} ${DECISION_LABEL[decision]}`)
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("note")
+          .setLabel(required ? "何を確認しましたか（必須）" : "何を確認しましたか（任意）")
+          .setPlaceholder("例: Discordでロールが付いていることを確認")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(required)
+          .setMaxLength(500),
+      ),
+    );
+}
+
+/**
  * 決着の確定。**staleなら1つも書かずに止める。**
  * 内部のエラーコードや token は運営画面にも出さない（意味のある言葉だけ返す）。
  */
 async function resolveCase(
-  interaction: ButtonInteraction,
+  interaction: ButtonInteraction | ModalSubmitInteraction,
   services: Services,
   decision: "delivered" | "no_effect" | "still_unknown",
   refund: boolean,
   purchaseId: number,
   token: string,
+  note: string,
 ): Promise<void> {
   try {
     const result = services.shop.resolveOperatorCase({
@@ -792,6 +774,7 @@ async function resolveCase(
       expectedToken: token,
       actor: `user:${interaction.user.id}`,
       refund,
+      note,
     });
     const done =
       decision === "delivered"
@@ -861,7 +844,6 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   if (action === "hub") return void (await show(shopAdminPanelMessage(services) as never));
   if (action === "pending") return void (await show(renderPending(services) as never));
   if (action === "failed") return void (await show(renderFailed(services) as never));
-  if (action === "legacy-unknown") return void (await show(renderLegacyUnknown(services) as never));
   if (action === "stuck-delivery") return void (await show(renderStuckDeliveries(services) as never));
   if (action === "case" && arg) return void (await show(renderCase(services, Number(arg)) as never));
   if (action === "case-pre" && arg) {
@@ -871,9 +853,12 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
       renderCasePreview(services, Number(parts[4]), decision, parts[3] === "1", parts[5] ?? "") as never,
     ));
   }
-  if (action === "case-do" && arg) {
+  if (action === "case-note" && arg) {
+    // customId: shokan:case-note:<decision>:<refund01>:<purchaseId>:<token>
     const decision = arg as "delivered" | "no_effect" | "still_unknown";
-    return void (await resolveCase(interaction, services, decision, parts[3] === "1", Number(parts[4]), parts[5] ?? ""));
+    return void (await interaction.showModal(
+      caseNoteModal(decision, parts[3] === "1", Number(parts[4]), parts[5] ?? ""),
+    ));
   }
   if (action === "list") return void (await show(renderList(services) as never));
   if (action === "history") return void (await show(renderHistory(services, Math.max(0, Number(arg ?? 0))) as never));
@@ -1018,6 +1003,19 @@ export async function handleShokanModal(interaction: ModalSubmitInteraction, ser
   }
   if (parts[1] === "reeval-comp-submit") {
     await handleReevalCompensation(interaction, services);
+    return;
+  }
+  if (parts[1] === "case-note") {
+    const decision = parts[2] as "delivered" | "no_effect" | "still_unknown";
+    const note = interaction.fields.getTextInputValue("note").trim();
+    if (decision !== "still_unknown" && note.length === 0) {
+      await interaction.reply({
+        content: "根拠を入力してください。**何も変更していません。**",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await resolveCase(interaction, services, decision, parts[3] === "1", Number(parts[4]), parts[5] ?? "", note);
     return;
   }
   if (parts[1] === "edit-stock") {

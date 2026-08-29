@@ -91,7 +91,7 @@ function uncertain(ctx: Ctx, purchaseId: number) {
   });
 }
 
-function press(customId: string, reply: ReturnType<typeof vi.fn>) {
+function press(customId: string, reply: ReturnType<typeof vi.fn>, showModal = vi.fn(async () => undefined)) {
   return {
     customId,
     user: { id: STAFF, username: "staff" },
@@ -102,7 +102,39 @@ function press(customId: string, reply: ReturnType<typeof vi.fn>) {
     reply,
     update: vi.fn(async () => undefined),
     deferUpdate: vi.fn(async () => undefined),
+    showModal,
   } as never;
+}
+
+/** 根拠入力モーダルの送信 */
+function submitNote(customId: string, note: string, reply: ReturnType<typeof vi.fn>) {
+  return {
+    customId,
+    user: { id: STAFF, username: "staff" },
+    member: { roles: { cache: new Collection([[ADMIN_ROLE, { id: ADMIN_ROLE }]]) } },
+    client: { channels: { fetch: vi.fn(async () => null) } },
+    fields: { getTextInputValue: () => note },
+    reply,
+  } as never;
+}
+
+/** Preview まで進んで、根拠入力モーダルの customId を取り出す */
+async function openNoteModal(
+  handleShokanButton: (i: never, s: Services) => Promise<void>,
+  services: Services,
+  purchaseId: number,
+  match: string,
+): Promise<string> {
+  const detail = vi.fn(async () => undefined);
+  await handleShokanButton(press(`shokan:case:${purchaseId}`, detail), services);
+  const preId = buttonIds(detail).find((id) => id.startsWith(match))!;
+  const preview = vi.fn(async () => undefined);
+  await handleShokanButton(press(preId, preview), services);
+  const noteBtn = buttonIds(preview).find((id) => id.startsWith("shokan:case-note:"))!;
+  const showModal = vi.fn(async () => undefined);
+  await handleShokanButton(press(noteBtn, vi.fn(async () => undefined), showModal), services);
+  const modal = (showModal.mock.calls.at(-1) as never[])[0] as { data: { custom_id: string } };
+  return modal.data.custom_id;
 }
 
 const payload = (fn: ReturnType<typeof vi.fn>) => (fn.mock.calls.at(-1) as never[])?.[0] as any;
@@ -152,7 +184,7 @@ describe("運営の決着UI", () => {
 
     expect(description(preview)).toContain("これから起きること");
     expect(description(preview)).toContain("返金します");
-    expect(buttonIds(preview).some((id) => id.startsWith("shokan:case-do:no_effect:1:"))).toBe(true);
+    expect(buttonIds(preview).some((id) => id.startsWith("shokan:case-note:no_effect:1:"))).toBe(true);
     // まだ1つも動いていない
     expect(landOf(ctx)).toBe(before);
     expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
@@ -167,22 +199,21 @@ describe("運営の決着UI", () => {
     const before = landOf(ctx);
     expect(ctx.shop.countUnresolvedCases()).toBe(1);
 
-    const detail = vi.fn(async () => undefined);
-    await handleShokanButton(press(`shokan:case:${p.id}`, detail), ctx.services);
-    const doId = buttonIds(detail)
-      .find((id) => id.startsWith("shokan:case-pre:no_effect:1:"))!
-      .replace("case-pre", "case-do");
+    const { handleShokanModal } = await shokanModule;
+    const modalId = await openNoteModal(handleShokanButton, ctx.services, p.id, "shokan:case-pre:no_effect:1:");
 
     const confirm = vi.fn(async () => undefined);
-    await handleShokanButton(press(doId, confirm), ctx.services);
+    await handleShokanModal(submitNote(modalId, "Discord上に痕跡なし", confirm), ctx.services);
 
     expect(content(confirm)).toContain("返金しました");
+    // **根拠が台帳へ残る**
+    expect(ctx.shop.operatorResolutions(p.id)[0]!.note).toBe("Discord上に痕跡なし");
     expect(landOf(ctx)).toBe(before + 100);
     expect(ctx.shop.countUnresolvedCases()).toBe(0);
 
     // 二度押しても増えない
     const again = vi.fn(async () => undefined);
-    await handleShokanButton(press(doId, again), ctx.services);
+    await handleShokanModal(submitNote(modalId, "Discord上に痕跡なし", again), ctx.services);
     expect(content(again)).toContain("何も変更していません");
     expect(landOf(ctx)).toBe(before + 100);
     expect(ctx.events.listByType("shop_refunded")).toHaveLength(1);
@@ -194,11 +225,8 @@ describe("運営の決着UI", () => {
     const ctx = setup();
     const p = buy(ctx);
     uncertain(ctx, p.id);
-    const detail = vi.fn(async () => undefined);
-    await handleShokanButton(press(`shokan:case:${p.id}`, detail), ctx.services);
-    const staleDo = buttonIds(detail)
-      .find((id) => id.startsWith("shokan:case-pre:no_effect:1:"))!
-      .replace("case-pre", "case-do");
+    const { handleShokanModal } = await shokanModule;
+    const staleModal = await openNoteModal(handleShokanButton, ctx.services, p.id, "shokan:case-pre:no_effect:1:");
 
     // 別の運営が先に「提供済み」で決着させた
     const q = ctx.shop.quoteOperatorResolution(p.id);
@@ -206,7 +234,7 @@ describe("運営の決着UI", () => {
     const before = landOf(ctx);
 
     const confirm = vi.fn(async () => undefined);
-    await handleShokanButton(press(staleDo, confirm), ctx.services);
+    await handleShokanModal(submitNote(staleModal, "念のため返金", confirm), ctx.services);
 
     expect(content(confirm)).toContain("何も変更していません");
     expect(landOf(ctx)).toBe(before);
@@ -221,19 +249,53 @@ describe("運営の決着UI", () => {
     const p = buy(ctx);
     uncertain(ctx, p.id);
     const before = landOf(ctx);
-    const detail = vi.fn(async () => undefined);
-    await handleShokanButton(press(`shokan:case:${p.id}`, detail), ctx.services);
-    const doId = buttonIds(detail)
-      .find((id) => id.startsWith("shokan:case-pre:still_unknown:"))!
-      .replace("case-pre", "case-do");
+    const { handleShokanModal } = await shokanModule;
+    const modalId = await openNoteModal(handleShokanButton, ctx.services, p.id, "shokan:case-pre:still_unknown:");
 
     const confirm = vi.fn(async () => undefined);
-    await handleShokanButton(press(doId, confirm), ctx.services);
+    await handleShokanModal(submitNote(modalId, "Discordが不安定で確認できず", confirm), ctx.services);
 
     expect(content(confirm)).toContain("判断保留");
     expect(ctx.shop.countUnresolvedCases()).toBe(1);
     expect(ctx.shop.externalDeliveryClaim(p.id)!.state).toBe("uncertain");
     expect(landOf(ctx)).toBe(before);
+    ctx.db.close();
+  });
+
+  it("根拠が空なら確定しない（判断の理由を残さず決着させない）", async () => {
+    const { handleShokanButton, handleShokanModal } = await shokanModule;
+    const ctx = setup();
+    const p = buy(ctx);
+    uncertain(ctx, p.id);
+    const before = landOf(ctx);
+    const modalId = await openNoteModal(handleShokanButton, ctx.services, p.id, "shokan:case-pre:no_effect:1:");
+
+    const rejected = vi.fn(async () => undefined);
+    await handleShokanModal(submitNote(modalId, "   ", rejected), ctx.services);
+
+    expect(content(rejected)).toContain("根拠を入力してください");
+    expect(content(rejected)).toContain("何も変更していません");
+    expect(landOf(ctx)).toBe(before);
+    expect(ctx.shop.operatorResolutions(p.id)).toHaveLength(0);
+    expect(ctx.shop.countUnresolvedCases()).toBe(1);
+    ctx.db.close();
+  });
+
+  it("実UI経由の決着では、根拠が必ず残る", async () => {
+    const { handleShokanButton, handleShokanModal } = await shokanModule;
+    const ctx = setup();
+    const p = buy(ctx);
+    uncertain(ctx, p.id);
+    const modalId = await openNoteModal(handleShokanButton, ctx.services, p.id, "shokan:case-pre:delivered:");
+
+    const confirm = vi.fn(async () => undefined);
+    await handleShokanModal(submitNote(modalId, "ロールを目視で確認した", confirm), ctx.services);
+
+    const rows = ctx.shop.operatorResolutions(p.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.note).not.toBeNull();
+    expect(rows[0]!.note).toBe("ロールを目視で確認した");
+    expect(rows[0]!.operator_id).toContain(STAFF);
     ctx.db.close();
   });
 

@@ -185,7 +185,7 @@ describe("古い完了ボタン", () => {
 });
 
 describe("旧購入（購入時の提供方式が分からない）", () => {
-  it("普通の作業キューには出ず、別枠に出る", async () => {
+  it("普通の作業キューには出ず、決着キューに出る", async () => {
     const { handleShokanButton, shopAdminPanelMessage } = await shokanModule;
     const ctx = setup();
     const legacy = legacyPurchase(ctx, ctx.manual.id);
@@ -193,14 +193,22 @@ describe("旧購入（購入時の提供方式が分からない）", () => {
     expect(ctx.shop.countPendingManual()).toBe(0);
     expect(ctx.shop.countLegacyUnknownFulfillment()).toBe(1);
 
+    // **旧購入だけの別導線は持たない。** 決着できる1つのキューに出る
     const panel = shopAdminPanelMessage(ctx.services) as { embeds: { data: { description?: string } }[] };
-    expect(panel.embeds[0]!.data.description).toContain("要確認（旧購入） 1件");
+    expect(panel.embeds[0]!.data.description).toContain("確認待ちの案件 1件");
+    expect(panel.embeds[0]!.data.description).not.toContain("要確認（旧購入）");
 
     const view = vi.fn(async () => undefined);
-    await handleShokanButton(panelPress("shokan:legacy-unknown", view), ctx.services);
-    const payload = (view.mock.calls.at(-1) as never[])[0] as { embeds: { data: { description?: string } }[] };
-    expect(payload.embeds[0]!.data.description).toContain(`#${legacy.id}`);
-    expect(payload.embeds[0]!.data.description).toContain("提供方式を確認できない");
+    await handleShokanButton(panelPress("shokan:stuck-delivery", view), ctx.services);
+    const payload = (view.mock.calls.at(-1) as never[])[0] as {
+      embeds: { data: { fields?: { name: string; value: string }[] } }[];
+      components: { components: { data: { custom_id?: string } }[] }[];
+    };
+    const fields = JSON.stringify(payload.embeds[0]!.data.fields ?? []);
+    expect(fields).toContain(`#${legacy.id}`);
+    // 見るだけではなく、開いて決着できる
+    const ids = payload.components.flatMap((row) => row.components.map((c) => c.data.custom_id ?? ""));
+    expect(ids).toContain(`shokan:case:${legacy.id}`);
     ctx.db.close();
   });
 
