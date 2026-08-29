@@ -112,6 +112,11 @@ function world(opts: { hasRole?: boolean; onFetch?: (n: number) => void; removeF
   return { client, guild, member, remove, add, roles, fetchCount: () => fetches };
 }
 
+const lastError = (ctx: Ctx, purchaseId: number) =>
+  (ctx.db.prepare("SELECT last_error FROM shop_role_revocations WHERE purchase_id=?").get(purchaseId) as
+    | { last_error: string | null }
+    | undefined)?.last_error;
+
 const revocationStatus = (ctx: Ctx, purchaseId: number) =>
   (ctx.db.prepare("SELECT status FROM shop_role_revocations WHERE purchase_id=?").get(purchaseId) as { status: string } | undefined)
     ?.status;
@@ -228,6 +233,39 @@ describe("剥奪と新しい契約の競合", () => {
     expect(w.remove).not.toHaveBeenCalled();
     expect(w.add).toHaveBeenCalledWith(ROLE);
     expect(w.roles.has(ROLE)).toBe(true);
+    expect(revocationStatus(ctx, old.id)).toBe("done");
+    ctx.db.close();
+  });
+
+  it("remove直後に落ちて、生えていたのが未配送の契約なら、戻すが done にしない", async () => {
+    const { processShopRoleRevocations } = await recoveryModule;
+    const ctx = setup();
+    const item = roleItem(ctx, "月額", ROLE);
+    const old = buyDelivered(ctx, item.id);
+    expireNow(ctx, old.id);
+
+    // remove は通ったが直後に落ちた。記録だけがDBに残っている
+    ctx.shop.markRoleRevocationRemoveAttempt(old.id);
+    // 落ちている間に成立したのは**未配送の**契約
+    const fresh = buyUndelivered(ctx, item.id);
+
+    // 再起動後の巡回。ロールは自分が外したので実体には無い
+    const w = world({ hasRole: false });
+    await processShopRoleRevocations(w.client as never, ctx.services);
+
+    // `already_absent` で素通り done にしてはいけない。**戻した上で持ち越す**
+    expect(w.remove).not.toHaveBeenCalled();
+    expect(w.add).toHaveBeenCalledWith(ROLE);
+    expect(w.roles.has(ROLE)).toBe(true);
+    expect(revocationStatus(ctx, old.id)).toBe("pending");
+    expect(lastError(ctx, old.id)).toBe("deferred:active_purchase_unsettled");
+
+    // B が返金されたら、改めて剥がして完了する
+    ctx.shop.refund(fresh.id, "配送できなかった", STAFF);
+    const w2 = world();
+    await processShopRoleRevocations(w2.client as never, ctx.services);
+    expect(w2.remove).toHaveBeenCalledWith(ROLE);
+    expect(w2.roles.has(ROLE)).toBe(false);
     expect(revocationStatus(ctx, old.id)).toBe("done");
     ctx.db.close();
   });
@@ -360,6 +398,95 @@ describe("未確定の新しい購入では、古い失効を完了させない"
       ctx.db.close();
     });
   }
+
+  /**
+   * `roles.remove()` の await 中に未配送の契約が生えた場合。
+   *
+   * 剥がす前も直前も守る契約は無いので、剥奪は正しく走る。問題はその**直後**で、
+   * 「提供済みの契約だけ」を見ていると未配送の契約（`unsettled`）を見落とし、
+   * **race のときだけ**「剥がさない / done にしない」という契約を破っていた。
+   */
+  for (const [label, delivery] of [["自動配送", "auto"], ["手動配送", "manual"]] as const) {
+    it(`${label}: remove中にBが生えたら、戻した上で A を完了させない`, async () => {
+      const { processShopRoleRevocations } = await recoveryModule;
+      const ctx = setup();
+      const item =
+        delivery === "auto"
+          ? roleItem(ctx, "月額", ROLE)
+          : ctx.shop.createItem(
+              {
+                name: "手動ロール",
+                price_land: 100,
+                kind: "one_shot",
+                delivery: "manual",
+                delivery_kind: "add_role",
+                delivery_data: JSON.stringify({ role_id: ROLE }),
+              } as never,
+              STAFF,
+            );
+      const old = buyDelivered(ctx, item.id);
+      expireNow(ctx, old.id);
+
+      let fresh!: ReturnType<typeof buyUndelivered>;
+      const w = world();
+      // 剥がしている最中に**未配送の**契約が成立した状況
+      w.remove.mockImplementation(async (id: string) => {
+        w.roles.delete(id);
+        fresh = buyUndelivered(ctx, item.id);
+      });
+
+      await processShopRoleRevocations(w.client as never, ctx.services);
+
+      // 剥がしはした（直前までは守る契約が無かった）が、戻す
+      expect(w.remove).toHaveBeenCalledTimes(1);
+      expect(w.add).toHaveBeenCalledTimes(1);
+      expect(w.roles.has(ROLE)).toBe(true);
+      expect(ctx.events.listByType("shop_role_revocation_rolled_back")).toHaveLength(1);
+      // **done にはしない。** Bが返金されたらもう一度剥がす必要がある
+      expect(revocationStatus(ctx, old.id)).toBe("pending");
+      expect(lastError(ctx, old.id)).toBe("deferred:active_purchase_unsettled");
+
+      // ── B が配送された → 次の巡回は剥がさず A を完了する
+      ctx.shop.beginDelivery(fresh.id);
+      ctx.shop.markDeliverySucceeded(fresh.id, STAFF);
+      const w2 = world();
+      await processShopRoleRevocations(w2.client as never, ctx.services);
+
+      expect(w2.remove).not.toHaveBeenCalled();
+      expect(w2.roles.has(ROLE)).toBe(true);
+      expect(revocationStatus(ctx, old.id)).toBe("done");
+      ctx.db.close();
+    });
+  }
+
+  it("remove中に生えたBが後で返金されたら、次の巡回で改めて剥がす", async () => {
+    const { processShopRoleRevocations } = await recoveryModule;
+    const ctx = setup();
+    const item = roleItem(ctx, "月額", ROLE);
+    const old = buyDelivered(ctx, item.id);
+    expireNow(ctx, old.id);
+
+    let fresh!: ReturnType<typeof buyUndelivered>;
+    const w = world();
+    w.remove.mockImplementation(async (id: string) => {
+      w.roles.delete(id);
+      fresh = buyUndelivered(ctx, item.id);
+    });
+
+    await processShopRoleRevocations(w.client as never, ctx.services);
+    expect(w.roles.has(ROLE)).toBe(true); // 戻っている
+    expect(revocationStatus(ctx, old.id)).toBe("pending");
+
+    // ── B が返金された → 守る契約が無くなったので、改めて剥がして完了する
+    ctx.shop.refund(fresh.id, "配送できなかった", STAFF);
+    const w2 = world();
+    await processShopRoleRevocations(w2.client as never, ctx.services);
+
+    expect(w2.remove).toHaveBeenCalledWith(ROLE);
+    expect(w2.roles.has(ROLE)).toBe(false);
+    expect(revocationStatus(ctx, old.id)).toBe("done");
+    ctx.db.close();
+  });
 
   it("B が返金されたら、A はロールを剥がして完了する", async () => {
     const { processShopRoleRevocations } = await recoveryModule;

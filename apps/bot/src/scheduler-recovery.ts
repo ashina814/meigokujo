@@ -484,7 +484,6 @@ export async function processShopRoleRevocations(client: Client, services: Servi
       const mayHaveRemoved = services.shop.roleRevocationRemoveAttempted(candidate.purchase_id);
       const entitlement = () =>
         services.shop.activeRoleEntitlementState(candidate.user_id, roleId, candidate.purchase_id);
-      const stillEntitled = () => entitlement() === "delivered";
 
       // 同じロールを与える有効な別契約があるなら剥がさない。判断は購入時の事実だけで行う。
       if (!mayHaveRemoved) {
@@ -515,14 +514,11 @@ export async function processShopRoleRevocations(client: Client, services: Servi
       }
 
       /**
-       * 有効な契約があるのに role が無い状態を残さない。
-       * 前回自分が外した可能性がある行では、**戻し切るまで done にしない**。
+       * 有効な契約があるのに role が無い状態を残さない。**戻し切れたかどうかだけを返す。**
+       * done にするか持ち越すかは、戻す理由（`delivered` / `unsettled`）で呼び側が決める。
        */
-      const restoreThenDone = async (): Promise<boolean> => {
-        if (member.roles.cache.has(roleId)) {
-          markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
-          return true;
-        }
+      const restoreRole = async (): Promise<boolean> => {
+        if (member.roles.cache.has(roleId)) return true;
         try {
           await member.roles.add(roleId);
           const confirmed = await guild.members.fetch({ user: candidate.user_id, force: true });
@@ -532,7 +528,6 @@ export async function processShopRoleRevocations(client: Client, services: Servi
             target: candidate.user_id,
             payload: { purchaseId: candidate.purchase_id },
           });
-          markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
           return true;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -542,10 +537,33 @@ export async function processShopRoleRevocations(client: Client, services: Servi
         }
       };
 
+      /**
+       * ロールを戻してから、守っている契約の強さで決着をつける。
+       *
+       * - `delivered` … 提供済みの契約が守っている。この失効はもう役目を終えた → done
+       * - `unsettled` … 提供されたか未確定。**戻すが done にはしない**。Bが提供されれば
+       *   次の巡回で done、Bが返金されれば次の巡回で改めて剥がす
+       *
+       * **戻し切れなければどちらでも done にしない。** 次の巡回でやり直す。
+       */
+      const restoreThenSettle = async (state: "delivered" | "unsettled"): Promise<void> => {
+        if (!(await restoreRole())) return;
+        if (state === "delivered") {
+          markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
+          return;
+        }
+        markRoleRevocationDeferred(services, candidate.purchase_id, "active_purchase_unsettled");
+      };
+
       // 再起動やrollback失敗で持ち越した行。有効な契約があるなら、まず実体を収束させる。
-      if (mayHaveRemoved && stillEntitled()) {
-        await restoreThenDone();
-        continue;
+      // **ここも3状態で見る。** `unsettled` を素通りさせると、下の `already_absent` が
+      // 「自分が外したロール」を戻さないまま done にしてしまう（remove直後に落ちた場合）。
+      if (mayHaveRemoved) {
+        const carried = entitlement();
+        if (carried !== "none") {
+          await restoreThenSettle(carried);
+          continue;
+        }
       }
 
       if (!member.roles.cache.has(roleId)) {
@@ -579,8 +597,12 @@ export async function processShopRoleRevocations(client: Client, services: Servi
 
       // **剥がした直後にも確かめる。** 剥がしている最中に新しい契約が生えていたら、
       // 自分が消したロールを戻す。戻し切れるまでこの失効を done にしない。
-      if (stillEntitled()) {
-        await restoreThenDone();
+      // **`delivered` だけを見てはいけない。** `roles.remove()` のawait中に生えた
+      // 未配送の契約（`unsettled`）を無視すると、race のときだけ
+      // 「剥がさない / done にしない」という契約を破る。
+      const afterRemove = entitlement();
+      if (afterRemove !== "none") {
+        await restoreThenSettle(afterRemove);
         continue;
       }
 
