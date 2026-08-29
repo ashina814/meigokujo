@@ -515,15 +515,23 @@ export async function deliverPurchaseUnlocked(
         .catch((e: Error) => e.message || "unknown");
       if (added !== true) {
         // **エラーだけで決めない。** Discord側では通っていることがある。
-        // 取り直して実際に持っていれば、付与は成功として先へ進む
-        if (await memberHasRole(guild, userId, role.id)) added = true;
+        // 取り直した実物を3状態で見る——`present` / `absent` / `unknown`。
+        // 「確認できなかった」を「付いていない」に倒すと、実際には付いたまま
+        // 返金する経路が開く。
+        const presence = await memberHasRoleStrict(guild, userId, role.id);
+        if (presence === true) {
+          added = true; // 副作用は成立済み。成功側へ続ける
+        } else if (presence === null) {
+          // **確認できていない。** ロールは消さない（消せたかも確かめられない）
+          return fail(`role_add_unverified:${added}`, "ロールの付与を確認できませんでした。運営が確認します。");
+        }
       }
       if (added !== true) {
         // 付けられないロールを残さない（誰のものでもないロールが増える）。
         // 前回の続きで拾ったロールは消さずに残す——記録と結び付いているので、
         // 次の巡回が同じロールで付与だけをやり直せる
         if (createdNow) await role.delete("公式ショップ: 付与に失敗したため取り消し").catch(() => undefined);
-        // 本人がロールを持っていないことを**実物で確認済み**
+        // ここへ来るのは presence === false のときだけ＝**本人が持っていないと確認済み**
         return fail(`role_add_failed:${added}`, "ロールの付与に失敗しました。", { verifiedNoEffect: true });
       }
       if (!services.originalRoles.activate({ id: application.id, roleId: role.id, purchaseId: purchase.id, actor })) {
@@ -536,13 +544,14 @@ export async function deliverPurchaseUnlocked(
         // **返金する前に、今つけた副作用を戻す。** 返金だけして付与が残ると
         // 「払っていないのに持っている」になる。引き継いだ既存ロールは消さず、
         // 本人からの付与だけ外す（他の契約の持ち物かもしれない）
-        const removed = await member.roles
+        await member.roles
           .remove(role.id, "公式ショップ: 契約を開始できなかったため取り消し")
           .then(() => true)
           .catch(() => false);
-        // **外せたかどうかを実物で確かめる。** 外れていないまま返金すると
-        // 「払っていないのに持っている」が残る。確認できなければ返金しない
-        const stillHeld = removed ? await memberHasRole(guild, userId, role.id) : await memberHasRoleStrict(guild, userId, role.id);
+        // **`remove()` が解決しただけでは「外れた」と確定しない。**
+        // 応答が返っても実際には残っていることがあるし、取り直しに失敗すれば
+        // そもそも分からない。成功レスポンス + fetch 失敗を「戻せた」にしない。
+        const stillHeld = await memberHasRoleStrict(guild, userId, role.id);
         if (stillHeld !== false) {
           // **戻せたか確認できていない。** claim は解放しない（`refundable` では決めない）
           return fail(
@@ -811,11 +820,6 @@ async function resolveOriginalRole(
 }
 
 /** 本当に持っているか、取り直して確かめる。確認できなければ「持っていない」とは言わない */
-async function memberHasRole(guild: Guild, userId: string, roleId: string): Promise<boolean> {
-  const fresh = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
-  return fresh?.roles.cache.has(roleId) ?? false;
-}
-
 /**
  * 外れたかどうかを確かめる。**「確認できなかった」を「外れた」に倒さない。**
  * `null` は確認できなかった合図で、呼び出し側は返金を止める。
