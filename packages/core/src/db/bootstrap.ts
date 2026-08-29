@@ -1011,6 +1011,38 @@ CREATE TABLE IF NOT EXISTS shop_stock_restoration_settlements (
 );
 CREATE INDEX IF NOT EXISTS idx_shop_stock_restoration_settlements_item
   ON shop_stock_restoration_settlements(item_id, purchase_id);
+-- Phase G: Discord へ副作用を投げているあいだの「配送中」を durable に残す。
+--
+-- in-memory lock は再起動で消え、別プロセスにも効かず、Core側の writer（失効など）も
+-- 止められない。外部副作用と purchase status が割れる race を閉じるには、
+-- Discord を叩く前に DB 側で場所を取っておく必要がある。
+--
+-- state
+--   in_flight … Discord へ投げた／投げる直前。返金も失効もこの間は通さない
+--   settled   … 外部の目的状態を確認し、delivered まで確定した
+--   released  … 副作用が起きていないと確認できたので解放した（返金してよい）
+--   uncertain … 投げたが結果を確認できない。**推測で返金も剥奪もしない**。人が見る
+CREATE TABLE IF NOT EXISTS shop_external_delivery_attempts (
+  purchase_id    INTEGER NOT NULL REFERENCES shop_purchases(id),
+  attempt_token  TEXT NOT NULL,
+  delivery_kind  TEXT NOT NULL,
+  state          TEXT NOT NULL CHECK (state IN ('in_flight','settled','released','uncertain')),
+  started_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  detail         TEXT,
+  PRIMARY KEY (purchase_id, attempt_token)
+);
+-- **1 purchase につき同時に生きている claim は1つだけ。** 部分ユニーク索引でDBに守らせる。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_shop_external_delivery_open
+  ON shop_external_delivery_attempts(purchase_id)
+  WHERE state IN ('in_flight','uncertain');
+CREATE INDEX IF NOT EXISTS idx_shop_external_delivery_state
+  ON shop_external_delivery_attempts(state, started_at);
+CREATE TRIGGER IF NOT EXISTS trg_shop_external_delivery_attempts_no_delete
+BEFORE DELETE ON shop_external_delivery_attempts
+BEGIN
+  SELECT RAISE(ABORT, 'shop external delivery attempts are append-only');
+END;
 CREATE TRIGGER IF NOT EXISTS trg_shop_stock_restoration_settlements_no_update
 BEFORE UPDATE ON shop_stock_restoration_settlements
 BEGIN

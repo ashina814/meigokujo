@@ -108,6 +108,20 @@ export function nicknameBlockReason(
   return null;
 }
 
+/**
+ * **Discord側に副作用が残る種別。** DB内部だけで完結する `extend_deadline` とは分ける。
+ *
+ * この種別は、投げる前に durable な claim を取ってからでないと実行しない。
+ * in-memory lock は再起動で消え、別プロセスにも効かず、Core側の writer（失効）も
+ * 止められないため、authority にはできない。
+ */
+const EXTERNAL_EFFECT_KINDS: ReadonlySet<string> = new Set([
+  "add_role",
+  "set_nickname",
+  "create_original_role",
+  "activate_sub_account",
+]);
+
 const purchaseLocks = new Map<number, Promise<unknown>>();
 
 /**
@@ -189,9 +203,67 @@ export async function deliverPurchaseUnlocked(
     return { state: "already_delivered", message: "この購入は配送済みです。" };
   }
 
-  const fail = (reason: string, userMessage: string, opts: { refundable?: boolean } = {}): DeliveryOutcome => {
+  /**
+   * 外部配送の durable な場所取り。**取れているあいだは返金も失効も通らない。**
+   * 取れなかった種別（DB内部で完結する配送）は null のまま。
+   */
+  let claimToken: string | null = null;
+
+  const fail = (
+    reason: string,
+    userMessage: string,
+    opts: { refundable?: boolean; uncertain?: boolean } = {},
+  ): DeliveryOutcome => {
+    if (claimToken !== null) {
+      if (opts.uncertain) {
+        // **投げたが結果を確認できない。** claim を消さない＝「失敗だった」と断定しない。
+        // 消すと、実際には提供済みなのに返金する経路が開く。再起動を跨いで残す。
+        services.shop.markExternalDeliveryUncertain({ purchaseId: purchase.id, token: claimToken, reason, actor });
+      } else {
+        // 副作用が起きていないと確認できた。ここで初めて「失敗だった」と言える
+        services.shop.releaseExternalDelivery({ purchaseId: purchase.id, token: claimToken, reason, actor });
+      }
+      claimToken = null;
+    }
     services.shop.markDeliveryFailed(purchase.id, reason, actor);
-    return { state: "failed", message: userMessage, error: reason, refundable: opts.refundable };
+    return {
+      state: "failed",
+      message: userMessage,
+      error: reason,
+      // 確認できていないものは絶対に自動返金へ回さない
+      refundable: opts.uncertain ? false : opts.refundable,
+    };
+  };
+
+  /**
+   * 外部の目的状態を確認したあとの確定。**戻り値を捨てない。**
+   *
+   * 確定できなかった＝そのあいだに purchase が動いた、ということなので
+   * 「Discordでは提供済みだがDBでは未確定」として人へ渡す。自動返金はしない。
+   */
+  const settle = (): boolean => {
+    if (claimToken === null) return services.shop.markDeliverySucceeded(purchase.id, actor);
+    const ok = services.shop.settleExternalDelivery({ purchaseId: purchase.id, token: claimToken, actor });
+    if (ok) claimToken = null;
+    return ok;
+  };
+
+  const unsettled = (userMessage: string): DeliveryOutcome => {
+    if (claimToken !== null) {
+      services.shop.markExternalDeliveryUncertain({
+        purchaseId: purchase.id,
+        token: claimToken,
+        reason: "settlement_conflict",
+        actor,
+      });
+      claimToken = null;
+    }
+    return {
+      state: "failed",
+      message: userMessage,
+      error: "delivery_settlement_conflict",
+      refundable: false,
+    };
   };
 
   const snapshot = parseDeliverySnapshot(purchase.delivery_snapshot_json);
@@ -214,6 +286,36 @@ export async function deliverPurchaseUnlocked(
   const data = snapshot.delivery_data as { role_id?: string; channel_id?: string; days?: number };
   const userId = purchase.user_id;
 
+  // **Discordを叩く前に durable な場所を取る。** 取れているあいだ、返金も失効も
+  // この購入を動かせない。取得と同じ transaction で active と未配送を確かめるので、
+  // 「確認したあとに返金された purchase へ投げる」が起きない。
+  if (EXTERNAL_EFFECT_KINDS.has(kind)) {
+    const claim = services.shop.claimExternalDelivery({ purchaseId: purchase.id, deliveryKind: kind, actor });
+    if (!claim.ok) {
+      if (claim.reason === "already_delivered") {
+        return { state: "already_delivered", message: "この購入は配送済みです。" };
+      }
+      if (claim.reason === "in_flight") {
+        // 別プロセス・別試行が投げている最中。**重ねて投げない。**
+        return {
+          state: "failed",
+          message: "この購入は現在処理中です。少し待ってからご確認ください。",
+          error: "delivery_already_in_flight",
+          refundable: false,
+        };
+      }
+      return {
+        state: "not_active",
+        message:
+          claim.status === "refunded"
+            ? "この購入は返金済みのため、何もしていません。"
+            : `この購入は ${claim.status ?? "対象外"} のため、何もしていません。`,
+        error: `purchase_not_active:${claim.status ?? "unknown"}`,
+      };
+    }
+    claimToken = claim.token;
+  }
+
   try {
     if (kind === "add_role") {
       const roleId = data.role_id;
@@ -226,12 +328,18 @@ export async function deliverPurchaseUnlocked(
         // mutation後にforce fetchしたDiscord実状態を正本にする。
         const addError = await member.roles.add(roleId).then(() => null).catch((e: Error) => e.message);
         member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
-        if (!member) return fail("member_final_fetch_failed", "ロール付与後の状態を確認できませんでした。自動で再試行します。");
+        if (!member) {
+          // **投げたあとに確認できていない。** 付いているかもしれない。
+          // ここで「失敗」と断定して返金すると、ロールは残ったまま払い戻すことになる。
+          return fail("member_final_fetch_failed", "ロール付与後の状態を確認できませんでした。運営が確認します。", {
+            uncertain: true,
+          });
+        }
         if (!member.roles.cache.has(roleId)) {
           return fail(`role_add_failed:${addError ?? "role_missing"}`, "ロールの付与に失敗しました。自動で再試行します。");
         }
       }
-      services.shop.markDeliverySucceeded(purchase.id, actor);
+      if (!settle()) return unsettled("ロールは付与済みですが、記録の確定ができませんでした。運営が確認します。");
       const destination = typeof data.channel_id === "string" && data.channel_id.trim()
         ? `\n利用先: <#${data.channel_id.trim()}>`
         : "";
@@ -275,7 +383,7 @@ export async function deliverPurchaseUnlocked(
       if (member.nickname === wanted) {
         // Discord だけ変わって落ちた場合もここに来る。確定させて終わらせる
         services.nicknames.commitRename(userId, key, actor);
-        services.shop.markDeliverySucceeded(purchase.id, actor);
+        if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
         return { state: "delivered", message: `サーバーニックネームは既に **${wanted}** です。` };
       }
       const blocked = nicknameBlockReason(guild, member);
@@ -319,7 +427,13 @@ export async function deliverPurchaseUnlocked(
         // 通っていた、など。ここで確かめずに取り消すと「名前は変わったのに返金もした」に
         // なる。最新のメンバーを取り直し、希望どおりなら成功として扱う
         const latest = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
-        if (latest?.nickname !== wanted) {
+        if (!latest) {
+          // 送ったが確認できない。**仮押さえも旧名もそのまま**にして人へ渡す
+          return fail("nickname_final_fetch_failed", "名前の変更後の状態を確認できませんでした。運営が確認します。", {
+            uncertain: true,
+          });
+        }
+        if (latest.nickname !== wanted) {
           // **仮押さえだけ解放する。旧名はそのまま。** 名乗っている名前は変わらない
           services.nicknames.abortRename(userId, key, actor);
           return fail(`nickname_set_failed:${setError}`, "名前の変更に失敗しました。");
@@ -327,7 +441,7 @@ export async function deliverPurchaseUnlocked(
       }
       // ここで初めて旧名を手放す
       services.nicknames.commitRename(userId, key, actor);
-      services.shop.markDeliverySucceeded(purchase.id, actor);
+      if (!settle()) return unsettled("名前は変更済みですが、記録の確定ができませんでした。運営が確認します。");
       return { state: "delivered", message: `サーバーニックネームを **${wanted}** に変更しました。` };
     }
 
@@ -342,7 +456,7 @@ export async function deliverPurchaseUnlocked(
       // 落ちて再実行された場合、ロールは作れているのに契約が始まっていないことがある。
       // **作り直さない**（同じ名前のロールが増える）。作った記録があればそれを使う
       if (application.status === "active" && application.role_id) {
-        services.shop.markDeliverySucceeded(purchase.id, actor);
+        if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
         return { state: "delivered", message: `オリジナルロール <@&${application.role_id}> は作成済みです。` };
       }
       if (application.status !== "approved") {
@@ -389,7 +503,7 @@ export async function deliverPurchaseUnlocked(
         const settled = services.originalRoles.get(application.id);
         // 相手が同じロールで契約を始めていたなら、これは成功の収束。何も戻さない
         if (settled?.status === "active" && settled.role_id === role.id) {
-          services.shop.markDeliverySucceeded(purchase.id, actor);
+          if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
           return { state: "delivered", message: `オリジナルロール <@&${role.id}> を作成しました。**30日間**ご利用いただけます。` };
         }
         // **返金する前に、今つけた副作用を戻す。** 返金だけして付与が残ると
@@ -412,7 +526,7 @@ export async function deliverPurchaseUnlocked(
         if (createdNow) await role.delete("公式ショップ: 二重実行のため取り消し").catch(() => undefined);
         return fail("activate_conflict", "契約の開始に失敗しました。運営にお問い合わせください。");
       }
-      services.shop.markDeliverySucceeded(purchase.id, actor);
+      if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
       return {
         state: "delivered",
         message: `オリジナルロール <@&${role.id}> を作成しました。**30日間**ご利用いただけます。`,
@@ -429,7 +543,7 @@ export async function deliverPurchaseUnlocked(
       if (application.main_user_id !== userId) return fail("application_owner_mismatch", "申請の持ち主が違います。");
       // 落ちて再実行された場合、ロールは付いているのに記録が終わっていないことがある
       if (application.status === "active") {
-        services.shop.markDeliverySucceeded(purchase.id, actor);
+        if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
         return { state: "delivered", message: `サブ垢 <@${application.alt_user_id}> は有効化済みです。` };
       }
       if (application.status !== "approved") {
@@ -486,7 +600,7 @@ export async function deliverPurchaseUnlocked(
         const settled = services.subAccounts.get(application.id);
         // 相手が先に有効化していたなら、これは成功の収束
         if (settled?.status === "active") {
-          services.shop.markDeliverySucceeded(purchase.id, actor);
+          if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
           return { state: "delivered", message: `サブ垢 <@${application.alt_user_id}> を有効化しました。` };
         }
         // **返金の前に、階級ロールを処理開始前の状態へ戻す。**
@@ -502,7 +616,7 @@ export async function deliverPurchaseUnlocked(
         }
         return fail("sub_account_activate_conflict", "サブ垢の有効化に失敗しました。運営にお問い合わせください。");
       }
-      services.shop.markDeliverySucceeded(purchase.id, actor);
+      if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
       return {
         state: "delivered",
         message: `サブ垢 <@${application.alt_user_id}> を有効化しました。階級は本体に合わせて自動で追従します。`,
