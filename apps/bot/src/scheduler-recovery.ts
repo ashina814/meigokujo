@@ -272,43 +272,26 @@ export async function recoverAutoDropNoEvalGhosts(client: Client, services: Serv
   if (failures.length > 0) throw new Error(`autodrop:role_sync_failed:${failures.join(",")}`);
 }
 
-function roleIdFromSnapshotOrItem(row: ExpiredRolePurchaseRow): { roleId?: string; error?: string; applicable: boolean } {
-  const raw = row.delivery_snapshot_json;
-  try {
-    if (raw) {
-      const snapshot = JSON.parse(raw) as { delivery_kind?: unknown; delivery_data?: unknown };
-      if (snapshot.delivery_kind !== "add_role") return { applicable: false };
-      if (typeof snapshot.delivery_data !== "string" || !snapshot.delivery_data) {
-        return { applicable: true, error: "delivery_data_missing" };
-      }
-      const data = JSON.parse(snapshot.delivery_data) as { role_id?: unknown };
-      return typeof data.role_id === "string" && data.role_id.trim()
-        ? { applicable: true, roleId: data.role_id.trim() }
-        : { applicable: true, error: "role_id_missing" };
-    }
-
-    if (row.item_delivery !== "auto" || row.item_delivery_kind !== "add_role") return { applicable: false };
-    if (!row.item_delivery_data) return { applicable: true, error: "legacy_delivery_data_missing" };
-    const data = JSON.parse(row.item_delivery_data) as { role_id?: unknown };
-    return typeof data.role_id === "string" && data.role_id.trim()
-      ? { applicable: true, roleId: data.role_id.trim() }
-      : { applicable: true, error: "legacy_role_id_missing" };
-  } catch (error) {
-    return { applicable: true, error: error instanceof Error ? error.message : String(error) };
-  }
-}
-
-export function backfillShopRoleRevocations(services: Pick<Services, "db">): void {
+/**
+ * 失効済みでキュー行が無い購入へ、剥奪キューを後から作る。
+ *
+ * **剥奪対象はCoreの `roleGrantTarget()` が唯一のauthority。** 以前はここで
+ * 購入時スナップショットが無い行について現在の `shop_items.delivery_data` へ
+ * fallback していた。それだと運営が商品のロール設定を R1 から R2 へ変えただけで、
+ * 過去の購入から **与えた証拠の無い R2** を剥がすキューが生える。
+ *
+ * 対象を証明できない行・提供した証拠が無い行はキューに載せない。消えるわけではなく、
+ * `listUnresolvedExpiryRevocations()` で運営に見える。
+ */
+export function backfillShopRoleRevocations(services: Pick<Services, "db" | "shop">): void {
   const rows = services.db
     .prepare(
-      `SELECT p.id AS purchase_id, p.user_id, p.delivery_snapshot_json,
-              i.delivery AS item_delivery, i.delivery_kind AS item_delivery_kind, i.delivery_data AS item_delivery_data
-       FROM shop_purchases p
-       JOIN shop_items i ON i.id = p.item_id
-       LEFT JOIN shop_role_revocations r ON r.purchase_id = p.id
-       WHERE p.status = 'expired' AND r.purchase_id IS NULL`,
+      `SELECT p.id
+         FROM shop_purchases p
+         LEFT JOIN shop_role_revocations r ON r.purchase_id = p.id
+        WHERE p.status = 'expired' AND r.purchase_id IS NULL`,
     )
-    .all() as ExpiredRolePurchaseRow[];
+    .all() as Array<{ id: number }>;
   if (rows.length === 0) return;
 
   const insert = services.db.prepare(
@@ -319,24 +302,19 @@ export function backfillShopRoleRevocations(services: Pick<Services, "db">): voi
   const ts = Math.floor(Date.now() / 1000);
   services.db.transaction(() => {
     for (const row of rows) {
-      const parsed = roleIdFromSnapshotOrItem(row);
-      const status = !parsed.applicable ? "done" : parsed.roleId ? "pending" : "failed";
-      const lastError = !parsed.applicable
-        ? "backfill_not_applicable"
-        : parsed.roleId
-          ? null
-          : `backfill_invalid_delivery:${parsed.error ?? "unknown"}`;
-      insert.run(
-        row.purchase_id,
-        row.user_id,
-        parsed.roleId ?? null,
-        status,
-        status === "failed" ? 1 : 0,
-        lastError,
-        ts,
-        ts,
-        status === "pending" ? null : ts,
-      );
+      const purchase = services.shop.getPurchase(row.id);
+      if (!purchase) continue;
+      const target = services.shop.roleGrantTarget(purchase);
+      if (target.kind === "proven_non_role") {
+        // ロールを与える契約ではなかった。剥がす物が無いので完了として畳む。
+        insert.run(row.id, purchase.user_id, null, "done", 0, "backfill_not_applicable", ts, ts, ts);
+        continue;
+      }
+      if (target.kind !== "proven" || !services.shop.roleRevocationTargetProven(row.id, target.roleId)) {
+        // 対象を証明できない、あるいは提供した証拠が無い。**キューへ載せない。**
+        continue;
+      }
+      insert.run(row.id, purchase.user_id, target.roleId, "pending", 0, null, ts, ts, null);
     }
   })();
 }
@@ -388,6 +366,46 @@ export async function convergePendingNicknameChanges(client: Client, services: S
     } catch {
       /* DMが閉じている・届かない。返金は済んでいるので、ここで止めない */
     }
+  }
+}
+
+/**
+ * 剥奪対象を購入時の事実で裏付けられない行を、安全側へ畳む。
+ *
+ * `pending` のまま残すと毎分Discordへ触ろうとし続ける。かといって `done` にすると
+ * 「対応済み」に見えてしまう。`failed` へ置いて理由を残し、運営の確認待ちにする。
+ * **Discordには一切触らない。**
+ */
+/**
+ * 判断を次の巡回へ持ち越す。**status は変えない。**
+ *
+ * 同じロールを与える新しい購入が「まだ提供されたか分からない」状態のとき、
+ * ロールは剥がさない。かといって古い失効を done にもしない——その購入が後で
+ * 返金されると、有効な契約が無いのにロールだけ残る。決着がつくまで待つ。
+ */
+function markRoleRevocationDeferred(services: Services, purchaseId: number, reason: string): void {
+  const ts = Math.floor(Date.now() / 1000);
+  services.db
+    .prepare(
+      "UPDATE shop_role_revocations SET last_error=?, updated_at=? WHERE purchase_id=? AND status='pending'",
+    )
+    .run(`deferred:${reason}`, ts, purchaseId);
+}
+
+function markRoleRevocationBlocked(services: Services, purchaseId: number, reason: string): void {
+  const ts = Math.floor(Date.now() / 1000);
+  const updated = services.db
+    .prepare(
+      `UPDATE shop_role_revocations
+       SET status='failed', last_error=?, updated_at=?, completed_at=COALESCE(completed_at, ?)
+       WHERE purchase_id=? AND status='pending'`,
+    )
+    .run(`blocked:${reason}`, ts, ts, purchaseId);
+  if (updated.changes === 1) {
+    services.events.log("shop_role_revocation_blocked", {
+      actor: "system:shop-role-revocation",
+      payload: { purchaseId, reason },
+    });
   }
 }
 
@@ -451,9 +469,34 @@ export async function processShopRoleRevocations(client: Client, services: Servi
         failures.push(`role_id_missing:${candidate.purchase_id}`);
         continue;
       }
-      if (services.shop.activePurchaseGrantsRole(candidate.user_id, candidate.role_id, candidate.purchase_id)) {
-        markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
+      const roleId = candidate.role_id;
+
+      // **Discordへ触る前に、保存済みの対象が購入時の事実として裏付くかを毎回確かめる。**
+      // 古いキュー行は現在の商品設定から作られている可能性がある（Phase E以前）。
+      // 証明できないものは実行しない。毎分retryし続けないよう blocked として畳む。
+      if (!services.shop.roleRevocationTargetProven(candidate.purchase_id, roleId)) {
+        markRoleRevocationBlocked(services, candidate.purchase_id, "target_unproven");
         continue;
+      }
+
+      // 前回このworkerが roles.remove() を呼びにいったかもしれない行かどうか。
+      // **立っていれば、有効な契約があっても Discord の実体を見るまで done にしない。**
+      const mayHaveRemoved = services.shop.roleRevocationRemoveAttempted(candidate.purchase_id);
+      const entitlement = () =>
+        services.shop.activeRoleEntitlementState(candidate.user_id, roleId, candidate.purchase_id);
+
+      // 同じロールを与える有効な別契約があるなら剥がさない。判断は購入時の事実だけで行う。
+      if (!mayHaveRemoved) {
+        const state = entitlement();
+        if (state === "delivered") {
+          markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
+          continue;
+        }
+        if (state === "unsettled") {
+          // 新しい購入が提供されたか未確定。剥がさないし、完了にもしない。
+          markRoleRevocationDeferred(services, candidate.purchase_id, "active_purchase_unsettled");
+          continue;
+        }
       }
 
       let member;
@@ -470,19 +513,100 @@ export async function processShopRoleRevocations(client: Client, services: Servi
         continue;
       }
 
-      if (!member.roles.cache.has(candidate.role_id)) {
+      /**
+       * 有効な契約があるのに role が無い状態を残さない。**戻し切れたかどうかだけを返す。**
+       * done にするか持ち越すかは、戻す理由（`delivered` / `unsettled`）で呼び側が決める。
+       */
+      const restoreRole = async (): Promise<boolean> => {
+        if (member.roles.cache.has(roleId)) return true;
+        try {
+          await member.roles.add(roleId);
+          const confirmed = await guild.members.fetch({ user: candidate.user_id, force: true });
+          if (!confirmed.roles.cache.has(roleId)) throw new Error("rollback_not_confirmed");
+          services.events.log("shop_role_revocation_rolled_back", {
+            actor: "system:shop-role-revocation",
+            target: candidate.user_id,
+            payload: { purchaseId: candidate.purchase_id },
+          });
+          return true;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          markRoleRevocationRetryOnce(services, candidate.purchase_id, `rollback_failed:${message}`);
+          failures.push(`rollback:${candidate.purchase_id}:${message}`);
+          return false;
+        }
+      };
+
+      /**
+       * ロールを戻してから、守っている契約の強さで決着をつける。
+       *
+       * - `delivered` … 提供済みの契約が守っている。この失効はもう役目を終えた → done
+       * - `unsettled` … 提供されたか未確定。**戻すが done にはしない**。Bが提供されれば
+       *   次の巡回で done、Bが返金されれば次の巡回で改めて剥がす
+       *
+       * **戻し切れなければどちらでも done にしない。** 次の巡回でやり直す。
+       */
+      const restoreThenSettle = async (state: "delivered" | "unsettled"): Promise<void> => {
+        if (!(await restoreRole())) return;
+        if (state === "delivered") {
+          markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
+          return;
+        }
+        markRoleRevocationDeferred(services, candidate.purchase_id, "active_purchase_unsettled");
+      };
+
+      // 再起動やrollback失敗で持ち越した行。有効な契約があるなら、まず実体を収束させる。
+      // **ここも3状態で見る。** `unsettled` を素通りさせると、下の `already_absent` が
+      // 「自分が外したロール」を戻さないまま done にしてしまう（remove直後に落ちた場合）。
+      if (mayHaveRemoved) {
+        const carried = entitlement();
+        if (carried !== "none") {
+          await restoreThenSettle(carried);
+          continue;
+        }
+      }
+
+      if (!member.roles.cache.has(roleId)) {
         markRoleRevocationDoneOnce(services, candidate.purchase_id, "already_absent");
         continue;
       }
 
+      // **剥がす直前にもう一度確かめる。** ここまでの間（member fetchのawait中）に
+      // 新しい契約が成立していると、新しい権利のロールを古い失効が剥がしてしまう。
+      const beforeRemove = entitlement();
+      if (beforeRemove === "delivered") {
+        markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
+        continue;
+      }
+      if (beforeRemove === "unsettled") {
+        markRoleRevocationDeferred(services, candidate.purchase_id, "active_purchase_unsettled");
+        continue;
+      }
+
+      // **呼ぶ前にDBへ残す。** 呼んだ直後に落ちても、次回「自分が外したかもしれない」
+      // と分かるようにする（メモリ上のフラグでは落ちた瞬間に消える）。
+      services.shop.markRoleRevocationRemoveAttempt(candidate.purchase_id);
       try {
-        await member.roles.remove(candidate.role_id);
-        markRoleRevocationDoneOnce(services, candidate.purchase_id, "removed");
+        await member.roles.remove(roleId);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         markRoleRevocationRetryOnce(services, candidate.purchase_id, message);
         failures.push(`role_remove:${candidate.purchase_id}:${message}`);
+        continue;
       }
+
+      // **剥がした直後にも確かめる。** 剥がしている最中に新しい契約が生えていたら、
+      // 自分が消したロールを戻す。戻し切れるまでこの失効を done にしない。
+      // **`delivered` だけを見てはいけない。** `roles.remove()` のawait中に生えた
+      // 未配送の契約（`unsettled`）を無視すると、race のときだけ
+      // 「剥がさない / done にしない」という契約を破る。
+      const afterRemove = entitlement();
+      if (afterRemove !== "none") {
+        await restoreThenSettle(afterRemove);
+        continue;
+      }
+
+      markRoleRevocationDoneOnce(services, candidate.purchase_id, "removed");
     }
 
     if (failures.length > 0) throw new Error(`shop_role_revocation_failed:${failures.join(",")}`);
