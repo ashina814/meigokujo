@@ -109,6 +109,15 @@ export function nicknameBlockReason(
 }
 
 /**
+ * 提供できたか確認できていないときに、**利用者へ出す文言**。
+ *
+ * 「失敗しました。もう一度購入してください」と言ってはいけない——実際には提供済みかも
+ * しれないし、二重購入を誘発する。内部のエラーコードも状態名も出さない。
+ */
+export const UNCERTAIN_USER_MESSAGE =
+  "購入は受け付けています。現在、提供できたかを確認しています。**重ねて購入する必要はありません。** 確認でき次第ご案内します。";
+
+/**
  * **Discord側に副作用が残る種別。** DB内部だけで完結する `extend_deadline` とは分ける。
  *
  * この種別は、投げる前に durable な claim を取ってからでないと実行しない。
@@ -353,7 +362,7 @@ export async function deliverPurchaseUnlocked(
         if (!member) {
           // **投げたあとに確認できていない。** 付いているかもしれない。
           // ここで「失敗」と断定して返金すると、ロールは残ったまま払い戻すことになる。
-          return fail("member_final_fetch_failed", "ロール付与後の状態を確認できませんでした。運営が確認します。");
+          return fail("member_final_fetch_failed", UNCERTAIN_USER_MESSAGE);
         }
         if (!member.roles.cache.has(roleId)) {
           // 取り直した実物に**ロールが無いことを確認できた**。副作用は残っていない
@@ -362,7 +371,7 @@ export async function deliverPurchaseUnlocked(
           });
         }
       }
-      if (!settle()) return unsettled("ロールは付与済みですが、記録の確定ができませんでした。運営が確認します。");
+      if (!settle()) return unsettled(UNCERTAIN_USER_MESSAGE);
       const destination = typeof data.channel_id === "string" && data.channel_id.trim()
         ? `\n利用先: <#${data.channel_id.trim()}>`
         : "";
@@ -406,7 +415,7 @@ export async function deliverPurchaseUnlocked(
       if (member.nickname === wanted) {
         // Discord だけ変わって落ちた場合もここに来る。確定させて終わらせる
         services.nicknames.commitRename(userId, key, actor);
-        if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
+        if (!settle()) return unsettled(UNCERTAIN_USER_MESSAGE);
         return { state: "delivered", message: `サーバーニックネームは既に **${wanted}** です。` };
       }
       const blocked = nicknameBlockReason(guild, member);
@@ -453,7 +462,7 @@ export async function deliverPurchaseUnlocked(
         const latest = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
         if (!latest) {
           // 送ったが確認できない。**仮押さえも旧名もそのまま**にして人へ渡す
-          return fail("nickname_final_fetch_failed", "名前の変更後の状態を確認できませんでした。運営が確認します。");
+          return fail("nickname_final_fetch_failed", UNCERTAIN_USER_MESSAGE);
         }
         if (latest.nickname !== wanted) {
           // **仮押さえだけ解放する。旧名はそのまま。** 名乗っている名前は変わらない
@@ -464,7 +473,7 @@ export async function deliverPurchaseUnlocked(
       }
       // ここで初めて旧名を手放す
       services.nicknames.commitRename(userId, key, actor);
-      if (!settle()) return unsettled("名前は変更済みですが、記録の確定ができませんでした。運営が確認します。");
+      if (!settle()) return unsettled(UNCERTAIN_USER_MESSAGE);
       return { state: "delivered", message: `サーバーニックネームを **${wanted}** に変更しました。` };
     }
 
@@ -479,7 +488,7 @@ export async function deliverPurchaseUnlocked(
       // 落ちて再実行された場合、ロールは作れているのに契約が始まっていないことがある。
       // **作り直さない**（同じ名前のロールが増える）。作った記録があればそれを使う
       if (application.status === "active" && application.role_id) {
-        if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
+        if (!settle()) return unsettled(UNCERTAIN_USER_MESSAGE);
         return { state: "delivered", message: `オリジナルロール <@&${application.role_id}> は作成済みです。` };
       }
       if (application.status !== "approved") {
@@ -523,7 +532,7 @@ export async function deliverPurchaseUnlocked(
           added = true; // 副作用は成立済み。成功側へ続ける
         } else if (presence === null) {
           // **確認できていない。** ロールは消さない（消せたかも確かめられない）
-          return fail(`role_add_unverified:${added}`, "ロールの付与を確認できませんでした。運営が確認します。");
+          return fail(`role_add_unverified:${added}`, UNCERTAIN_USER_MESSAGE);
         }
       }
       if (added !== true) {
@@ -538,7 +547,7 @@ export async function deliverPurchaseUnlocked(
         const settled = services.originalRoles.get(application.id);
         // 相手が同じロールで契約を始めていたなら、これは成功の収束。何も戻さない
         if (settled?.status === "active" && settled.role_id === role.id) {
-          if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
+          if (!settle()) return unsettled(UNCERTAIN_USER_MESSAGE);
           return { state: "delivered", message: `オリジナルロール <@&${role.id}> を作成しました。**30日間**ご利用いただけます。` };
         }
         // **返金する前に、今つけた副作用を戻す。** 返金だけして付与が残ると
@@ -556,7 +565,7 @@ export async function deliverPurchaseUnlocked(
           // **戻せたか確認できていない。** claim は解放しない（`refundable` では決めない）
           return fail(
             "activate_conflict_rollback_failed",
-            "契約の開始に失敗しました。運営が確認しますので、そのままお待ちください。",
+            UNCERTAIN_USER_MESSAGE,
           );
         }
         if (createdNow) await role.delete("公式ショップ: 二重実行のため取り消し").catch(() => undefined);
@@ -565,7 +574,7 @@ export async function deliverPurchaseUnlocked(
           verifiedNoEffect: true,
         });
       }
-      if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
+      if (!settle()) return unsettled(UNCERTAIN_USER_MESSAGE);
       return {
         state: "delivered",
         message: `オリジナルロール <@&${role.id}> を作成しました。**30日間**ご利用いただけます。`,
@@ -582,7 +591,7 @@ export async function deliverPurchaseUnlocked(
       if (application.main_user_id !== userId) return fail("application_owner_mismatch", "申請の持ち主が違います。");
       // 落ちて再実行された場合、ロールは付いているのに記録が終わっていないことがある
       if (application.status === "active") {
-        if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
+        if (!settle()) return unsettled(UNCERTAIN_USER_MESSAGE);
         return { state: "delivered", message: `サブ垢 <@${application.alt_user_id}> は有効化済みです。` };
       }
       if (application.status !== "approved") {
@@ -632,7 +641,7 @@ export async function deliverPurchaseUnlocked(
           `alt_rank_sync_failed:${synced.reason}${synced.restored === true ? "" : ":rollback_unconfirmed"}`,
           safeToRefund
             ? "サブ垢の階級を本体に合わせられなかったため有効化できませんでした。"
-            : "サブ垢の階級を戻せたか確認できませんでした。運営が確認しますので、そのままお待ちください。",
+            : UNCERTAIN_USER_MESSAGE,
           { refundable: safeToRefund, verifiedNoEffect: safeToRefund },
         );
       }
@@ -642,7 +651,7 @@ export async function deliverPurchaseUnlocked(
         const settled = services.subAccounts.get(application.id);
         // 相手が先に有効化していたなら、これは成功の収束
         if (settled?.status === "active") {
-          if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
+          if (!settle()) return unsettled(UNCERTAIN_USER_MESSAGE);
           return { state: "delivered", message: `サブ垢 <@${application.alt_user_id}> を有効化しました。` };
         }
         // **返金の前に、階級ロールを処理開始前の状態へ戻す。**
@@ -653,7 +662,7 @@ export async function deliverPurchaseUnlocked(
           // **戻せたか確認できていない。** claim は解放しない
           return fail(
             "sub_account_conflict_rollback_failed",
-            "サブ垢の有効化に失敗しました。運営が確認しますので、そのままお待ちください。",
+            UNCERTAIN_USER_MESSAGE,
           );
         }
         // 開始前の状態へ戻せたことを確認できた
@@ -661,7 +670,7 @@ export async function deliverPurchaseUnlocked(
           verifiedNoEffect: true,
         });
       }
-      if (!settle()) return unsettled("提供は完了していますが、記録の確定ができませんでした。運営が確認します。");
+      if (!settle()) return unsettled(UNCERTAIN_USER_MESSAGE);
       return {
         state: "delivered",
         message: `サブ垢 <@${application.alt_user_id}> を有効化しました。階級は本体に合わせて自動で追従します。`,

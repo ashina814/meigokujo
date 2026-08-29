@@ -30,7 +30,7 @@ import {
   type ShopItemRow,
 } from "@meigokujo/core";
 import { fmtLd } from "../format.js";
-import { deliverPurchase, nicknameBlockReason } from "../shop-delivery.js";
+import { UNCERTAIN_USER_MESSAGE, deliverPurchase, nicknameBlockReason } from "../shop-delivery.js";
 import { deliverOrRefund, type Settlement } from "../shop-refund.js";
 import { withUserLock } from "../user-lock.js";
 import {
@@ -1107,8 +1107,8 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         refund === "refunded"
           ? `有効化できなかったため、${fmtLd(paidSub.paid_land ?? 0)}は返金しました。
 -# ${outcome.message}`
-          : `⚠️ 有効化に失敗し、返金も完了できませんでした。運営が対応します（購入 #${paidSub.id}）。
--# ${outcome.message}`,
+          : `${UNCERTAIN_USER_MESSAGE}
+-# 受付番号 #${paidSub.id}`,
       embeds: [],
       components: [],
     });
@@ -1222,7 +1222,9 @@ export async function handleShopButton(interaction: ButtonInteraction, services:
         ? `変更できなかったため、${fmtLd(purchase.purchase.paid_land ?? 0)}は返金しました。\n-# ${outcome.message}`
         : refund === "already_delivered"
           ? `✅ 名前の変更は完了しています。`
-          : `⚠️ 変更に失敗し、返金も完了できませんでした。運営が対応します（購入 #${purchase.purchase.id}）。\n-# ${outcome.message}`;
+          : refund === "withheld"
+            ? `${UNCERTAIN_USER_MESSAGE}\n-# 受付番号 #${purchase.purchase.id}`
+            : `⚠️ 変更に失敗し、返金も完了できませんでした。運営が対応します（購入 #${purchase.purchase.id}）。\n-# 重ねて購入する必要はありません。`;
     await interaction.editReply({ content, embeds: [], components: [] });
     return;
   }

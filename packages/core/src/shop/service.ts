@@ -297,6 +297,66 @@ export interface FulfillmentProvenanceRow {
  * `uncertain` は「投げたが結果を確認できていない」——**推測で返金も剥奪もしない**ため、
  * 解決するまで生き続ける。
  */
+/**
+ * 運営が下せる決着。
+ *
+ * - `delivered`     … 提供済みだと確認した
+ * - `no_effect`     … 提供されていないと確認した（返金・再試行へ進める）
+ * - `still_unknown` … まだ判断できない。**状態を変えない**
+ */
+export type OperatorDecision = "delivered" | "no_effect" | "still_unknown";
+
+/** 何が原因で止まっている案件か。 */
+export type UnresolvedCaseKind = "uncertain_delivery" | "legacy_unknown";
+
+export interface OperatorResolutionRow {
+  id: number;
+  purchase_id: number;
+  kind: UnresolvedCaseKind;
+  decision: OperatorDecision;
+  operator_id: string;
+  note: string | null;
+  before_state: string;
+  after_state: string;
+  attempt_token: string | null;
+  refunded: number;
+  resolved_at: number;
+}
+
+/**
+ * 決着画面を開いた時点の事実と、選べる決着。
+ *
+ * `token` は**その時点の事実の指紋**。確定時に作り直して一致しなければ、
+ * 画面を開いたあとに状況が変わったということなので1つも書かずに止める。
+ */
+export interface OperatorResolutionQuote {
+  readonly purchaseId: number;
+  readonly kind: UnresolvedCaseKind | null;
+  readonly userId: string;
+  readonly itemName: string;
+  readonly purchasedAt: number;
+  readonly status: PurchaseStatus;
+  readonly deliveryState: DeliveryState | null;
+  readonly deliveryKind: string | null;
+  /** 止まっている理由（利用者へは出さない運営向けの説明） */
+  readonly reason: string;
+  readonly stuckSince: number | null;
+  readonly refundableAmount: number;
+  /** 返金まで一気に確定してよいか（代替支払など、generic refund が扱えないものは false） */
+  readonly refundSupported: boolean;
+  readonly allowedDecisions: readonly OperatorDecision[];
+  readonly token: string;
+}
+
+export interface OperatorResolutionResult {
+  readonly purchaseId: number;
+  readonly decision: OperatorDecision;
+  readonly refunded: boolean;
+  readonly refundedAmount: number;
+  readonly deliveryState: DeliveryState | null;
+  readonly status: PurchaseStatus;
+}
+
 export type ExternalDeliveryState = "in_flight" | "settled" | "released" | "uncertain";
 
 export interface ExternalDeliveryAttemptRow {
@@ -394,6 +454,8 @@ export type ShopErrorCode =
   | "ERR_STOCK_CHANGE_REQUIRES_API"
   | "ERR_STOCK_VALUE_INVALID"
   | "ERR_DELIVERY_IN_FLIGHT"
+  | "ERR_RESOLUTION_STALE"
+  | "ERR_RESOLUTION_NOT_APPLICABLE"
   | "ERR_EVAL_EXTENSION_SPECIAL_PURCHASE_REQUIRED"
   | "ERR_EVAL_EXTENSION_ITEM_CONFIG"
   | "ERR_EVAL_EXTENSION_STATUS"
@@ -3005,6 +3067,286 @@ export class Shop {
       .get() as number;
   }
 
+
+  // ── 運営による決着（Phase H）────────────────────────────────────────────────
+
+  /** 運営が「提供されていない」と確認した記録があるか。 */
+  operatorConfirmedNoEffect(purchaseId: number): boolean {
+    const row = this.db
+      .prepare(
+        "SELECT 1 FROM shop_operator_resolutions WHERE purchase_id = ? AND decision = 'no_effect' LIMIT 1",
+      )
+      .get(purchaseId);
+    return row !== undefined;
+  }
+
+  /** この購入に対する決着の履歴（新しい順）。 */
+  operatorResolutions(purchaseId: number): OperatorResolutionRow[] {
+    return this.db
+      .prepare("SELECT * FROM shop_operator_resolutions WHERE purchase_id = ? ORDER BY resolved_at DESC, id DESC")
+      .all(purchaseId) as OperatorResolutionRow[];
+  }
+
+  /**
+   * いま決着待ちの案件か。決着済み・自動収束済みなら null。
+   *
+   * **一覧と同じSQLを1件へ当てる。** 片方だけ緩い判定を持つと、キューに出ているのに
+   * 開くと「決着済み」になる（またはその逆）が起きる。
+   */
+  unresolvedCaseKind(purchaseId: number): UnresolvedCaseKind | null {
+    const purchase = this.getPurchase(purchaseId);
+    if (!purchase) return null;
+    if (this.externalDeliveryClaim(purchaseId)) return "uncertain_delivery";
+    const legacy = this.db
+      .prepare(
+        `SELECT
+           EXISTS (SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.legacyUnknownSql()}) AS unknown_kind,
+           EXISTS (SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}) AS unknown_outcome`,
+      )
+      .get(purchaseId, purchaseId) as { unknown_kind: number; unknown_outcome: number };
+    if (legacy.unknown_kind === 1 || legacy.unknown_outcome === 1) return "legacy_unknown";
+    return null;
+  }
+
+  /**
+   * 決着画面を開いたときの事実。**確定はこの `token` を持ってくること。**
+   */
+  quoteOperatorResolution(purchaseId: number): OperatorResolutionQuote {
+    const purchase = this.getPurchase(purchaseId);
+    if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
+    const kind = this.unresolvedCaseKind(purchaseId);
+    const claim = this.externalDeliveryClaim(purchaseId);
+    const snapshot = parseDeliverySnapshot(purchase.delivery_snapshot_json);
+    const item = this.getItem(purchase.item_id);
+    const amount = purchase.paid_land ?? 0;
+    // 代替支払を含む購入は generic refund の対象外（Phase C）。ここでも返金は出さない。
+    const refundSupported =
+      purchase.paid_alt_kind === null && purchase.paid_alt_amount === null && purchase.status === "active";
+    const allowed: OperatorDecision[] =
+      kind === null ? ["still_unknown"] : ["delivered", "no_effect", "still_unknown"];
+    return {
+      purchaseId,
+      kind,
+      userId: purchase.user_id,
+      itemName: item?.name ?? `#${purchase.item_id}`,
+      purchasedAt: purchase.purchased_at,
+      status: purchase.status,
+      deliveryState: purchase.delivery_state,
+      deliveryKind: snapshot?.delivery_kind ?? claim?.delivery_kind ?? null,
+      reason:
+        kind === null
+          ? "resolved"
+          : kind === "uncertain_delivery"
+            ? `external_${claim?.state ?? "unknown"}`
+            : "legacy_unknown",
+      stuckSince: claim?.started_at ?? purchase.purchased_at,
+      refundableAmount: amount,
+      refundSupported,
+      allowedDecisions: allowed,
+      token: this.operatorResolutionToken(purchase, kind, claim),
+    };
+  }
+
+  /**
+   * 決着の指紋。**画面を開いたあとに動きうるものを全部入れる。**
+   * 1つでも違えば、その画面からの決定は通さない。
+   */
+  private operatorResolutionToken(
+    purchase: PurchaseRow,
+    kind: UnresolvedCaseKind | null,
+    claim: ExternalDeliveryAttemptRow | undefined,
+  ): string {
+    const canonical = JSON.stringify([
+      purchase.id,
+      kind,
+      purchase.status,
+      purchase.delivery_state,
+      purchase.delivered_at,
+      purchase.paid_land,
+      purchase.paid_alt_kind,
+      purchase.paid_alt_amount,
+      claim?.attempt_token ?? null,
+      claim?.state ?? null,
+      this.operatorResolutions(purchase.id).length,
+    ]);
+    return createHash("sha256").update(canonical, "utf8").digest().subarray(0, GENERIC_TERMS_TOKEN_BYTES).toString("base64url");
+  }
+
+  /**
+   * 運営の決着を確定する。**判断そのものを台帳へ残してから状態を動かす。**
+   *
+   * `still_unknown` は状態を変えない（分からないものを false へ倒さない）。
+   * `refund: true` は「提供なしを確認したうえで返金まで一気に行う」ためのもので、
+   * `no_effect` のときだけ許す。
+   */
+  resolveOperatorCase(input: {
+    purchaseId: number;
+    decision: OperatorDecision;
+    expectedToken: string;
+    actor: string;
+    note?: string;
+    refund?: boolean;
+  }): OperatorResolutionResult {
+    const body = (): OperatorResolutionResult => {
+      const purchase = this.getPurchase(input.purchaseId);
+      if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+      const kind = this.unresolvedCaseKind(input.purchaseId);
+      const claim = this.externalDeliveryClaim(input.purchaseId);
+
+      // **画面を開いたときの事実と一致しなければ、1つも書かずに止める。**
+      if (this.operatorResolutionToken(purchase, kind, claim) !== input.expectedToken) {
+        throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
+      }
+      if (input.decision !== "still_unknown" && kind === null) {
+        // もう決着している（別の運営が処理した／自動収束した）
+        throw new ShopError("ERR_RESOLUTION_NOT_APPLICABLE", { purchaseId: input.purchaseId });
+      }
+      if (input.refund && input.decision !== "no_effect") {
+        throw new ShopError("ERR_RESOLUTION_NOT_APPLICABLE", { purchaseId: input.purchaseId });
+      }
+
+      const before = {
+        status: purchase.status,
+        deliveryState: purchase.delivery_state,
+        claim: claim ? { state: claim.state, deliveryKind: claim.delivery_kind } : null,
+        kind,
+      };
+      const ts = now();
+      let refunded = false;
+      let refundedAmount = 0;
+
+      if (input.decision === "delivered") {
+        if (purchase.status !== "active") {
+          throw new ShopError("ERR_RESOLUTION_NOT_APPLICABLE", { purchaseId: input.purchaseId, status: purchase.status });
+        }
+        if (claim) {
+          // claim と delivered を同じ transaction で確定する
+          const settled = this.db
+            .prepare(
+              `UPDATE shop_external_delivery_attempts
+                  SET state = 'settled', updated_at = ?, detail = ?
+                WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+            )
+            .run(ts, "operator_confirmed_delivered", input.purchaseId, claim.attempt_token).changes;
+          if (settled !== 1) throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
+        }
+        if (!this.markDeliverySucceeded(input.purchaseId, input.actor)) {
+          throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
+        }
+      } else if (input.decision === "no_effect") {
+        if (claim) {
+          const released = this.db
+            .prepare(
+              `UPDATE shop_external_delivery_attempts
+                  SET state = 'released', updated_at = ?, detail = ?
+                WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+            )
+            .run(ts, "operator_confirmed_no_effect", input.purchaseId, claim.attempt_token).changes;
+          if (released !== 1) throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
+        }
+        this.markDeliveryFailed(input.purchaseId, "operator_confirmed_no_effect", input.actor);
+      }
+
+      // **判断は状態より先に台帳へ残す。** 返金はこの記録を証拠として通る。
+      this.db
+        .prepare(
+          `INSERT INTO shop_operator_resolutions
+             (purchase_id, kind, decision, operator_id, note, before_state, after_state, attempt_token, refunded, resolved_at)
+           VALUES (?,?,?,?,?,?,?,?,0,?)`,
+        )
+        .run(
+          input.purchaseId,
+          kind ?? "legacy_unknown",
+          input.decision,
+          input.actor,
+          (input.note ?? "").slice(0, 1000) || null,
+          JSON.stringify(before),
+          JSON.stringify({ decision: input.decision }),
+          claim?.attempt_token ?? null,
+          ts,
+        );
+
+      if (input.refund && input.decision === "no_effect") {
+        const outcome = this.refund(input.purchaseId, "運営確認: 提供なし", input.actor);
+        refunded = outcome.refunded;
+        refundedAmount = outcome.amount;
+      }
+
+      const after = this.getPurchase(input.purchaseId)!;
+      this.events.log("shop_operator_resolution", {
+        actor: input.actor,
+        target: purchase.user_id,
+        payload: {
+          purchaseId: input.purchaseId,
+          kind,
+          decision: input.decision,
+          refunded,
+        },
+      });
+      return {
+        purchaseId: input.purchaseId,
+        decision: input.decision,
+        refunded,
+        refundedAmount,
+        deliveryState: after.delivery_state,
+        status: after.status,
+      };
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /** 決着待ちの案件（外部配送の未確定 + 旧購入の不明）を1つの作業キューにする。 */
+  listUnresolvedCases(limit = 25): Array<{
+    purchaseId: number;
+    kind: UnresolvedCaseKind;
+    userId: string;
+    itemName: string;
+    purchasedAt: number;
+    deliveryKind: string | null;
+    reason: string;
+    stuckSince: number;
+  }> {
+    const seen = new Set<number>();
+    const out: Array<{
+      purchaseId: number;
+      kind: UnresolvedCaseKind;
+      userId: string;
+      itemName: string;
+      purchasedAt: number;
+      deliveryKind: string | null;
+      reason: string;
+      stuckSince: number;
+    }> = [];
+    const push = (purchaseId: number) => {
+      if (seen.has(purchaseId) || out.length >= limit) return;
+      const quote = this.quoteOperatorResolution(purchaseId);
+      if (quote.kind === null) return;
+      seen.add(purchaseId);
+      out.push({
+        purchaseId,
+        kind: quote.kind,
+        userId: quote.userId,
+        itemName: quote.itemName,
+        purchasedAt: quote.purchasedAt,
+        deliveryKind: quote.deliveryKind,
+        reason: quote.reason,
+        stuckSince: quote.stuckSince ?? quote.purchasedAt,
+      });
+    };
+    for (const row of this.listUnresolvedExternalDeliveries(limit)) push(row.purchase_id);
+    for (const row of this.listLegacyUnknownFulfillment({ limit })) push(row.id);
+    for (const row of this.listLegacyAutoOutcomeUnknown({ limit })) push(row.id);
+    return out;
+  }
+
+  countUnresolvedCases(): number {
+    return (
+      this.countUnresolvedExternalDeliveries() +
+      this.countLegacyUnknownFulfillment() +
+      this.countLegacyAutoOutcomeUnknown()
+    );
+  }
+
   /** 始末の記録。無ければまだ始末していない。 */
   stockRestorationSettlement(purchaseId: number): StockRestorationSettlementRow | undefined {
     return this.db
@@ -3106,6 +3448,9 @@ export class Shop {
   private fulfillmentUnknown(purchase: PurchaseRow): boolean {
     if (this.fulfillmentProvenance(purchase.id)) return false;
     if (this.hasDeliveredEvidence(purchase)) return false;
+    // **運営が「提供されていない」と確認した記録は、欠けている証拠の代わりになる。**
+    // 推測ではなく、人が外部状態を見て残した事実なので、これを根拠に返金してよい。
+    if (this.operatorConfirmedNoEffect(purchase.id)) return false;
     // 専用サービスの権利は、それぞれのフローが消費状態を持っている。
     if (this.isReevaluationPurchase(purchase.id)) return false;
     return true;

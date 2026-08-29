@@ -103,8 +103,9 @@ function queueCounts(services: Services): { pending: number; failed: number; leg
   return {
     pending: services.shop.countPendingManual(),
     failed: services.shop.countUndeliveredAuto(),
-    // 外部（Discord）へ投げたが結果が分からない購入。**自動では返金していない**
-    stuck: services.shop.countUnresolvedExternalDeliveries(),
+    // 提供できたか確認できていない案件（外部配送の未確定 + 旧購入の不明）。
+    // **どちらも「開いて決着させる」同じ作業**なので、1つのキューとして数える
+    stuck: services.shop.countUnresolvedCases(),
     // 購入時の提供方式が分からない旧購入と、方式は分かるが結末が分からない旧購入。
     // どちらも仕事として数えるが、要対応とは別枠にする。
     legacy: services.shop.countLegacyUnknownFulfillment() + services.shop.countLegacyAutoOutcomeUnknown(),
@@ -147,7 +148,7 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
           : "残っている仕事はありません。",
         legacy > 0 ? `**要確認（旧購入） ${legacy}件** — 購入時の提供方式を自動判定できません。` : "",
         stuck > 0
-          ? `**確認待ちの配送 ${stuck}件** — 外部の状態を確認できていないため、自動返金していません。`
+          ? `**確認待ちの案件 ${stuck}件** — 提供できたか確認できていないため、自動では返金も完了もしていません。`
           : "",
         services.originalRoles.countByStatus("pending") > 0
           ? `**旧方式オリジナルロール ${services.originalRoles.countByStatus("pending")}件** がカルテ移行待ちです。`
@@ -193,7 +194,7 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId("shokan:stuck-delivery")
-      .setLabel(stuck > 0 ? `確認待ちの配送 ${stuck}` : "確認待ちの配送")
+      .setLabel(stuck > 0 ? `確認待ちの案件 ${stuck}` : "確認待ちの案件")
       .setEmoji("🛰")
       .setStyle(stuck > 0 ? ButtonStyle.Danger : ButtonStyle.Secondary),
     new ButtonBuilder()
@@ -593,40 +594,171 @@ async function applyStockFix(
  * 宙ぶらりんで、なぜ自動返金されていないのか」だけ。危険なワンクリック操作は置かない。
  */
 function renderStuckDeliveries(services: Services) {
-  const rows = services.shop.listUnresolvedExternalDeliveries(QUEUE_DISPLAY);
-  const total = services.shop.countUnresolvedExternalDeliveries();
+  const cases = services.shop.listUnresolvedCases(5);
+  const total = services.shop.countUnresolvedCases();
   const embed = new EmbedBuilder()
-    .setTitle("🛰 確認待ちの配送")
+    .setTitle("🛰 確認待ちの案件")
     .setColor(total > 0 ? 0xdc2626 : 0x64748b)
     .setDescription(
       total === 0
-        ? "確認待ちの配送はありません。"
+        ? "確認待ちの案件はありません。"
         : [
-            "**外部（Discord）の状態を確認できていないため、自動返金していません。**",
+            "**提供できたか確認できていないため、自動では返金も完了もしていません。**",
             "提供済みなのに返金する／未提供なのに提供済みにする、のどちらも避けています。",
             "",
-            "-# ロールが付いているかを確認できれば、次の巡回で自動的に決着します。",
+            "-# 事実を確認したら「開く」から決着させてください。",
           ].join("\n"),
     );
-  for (const row of rows) {
+  for (const row of cases) {
     embed.addFields({
-      name: `購入 #${row.purchase_id} — ${deliveryKindLabel(row.delivery_kind)}`,
+      name: `購入 #${row.purchaseId} — ${row.itemName}`,
       value: [
-        `利用者: <@${row.user_id}>`,
-        `購入の状態: ${purchaseStatusLabel(row.status)}`,
-        `未確定になってから: ${fmtJstDate(row.started_at)} から`,
+        `利用者: <@${row.userId}>`,
+        `提供方式: ${deliveryKindLabel(row.deliveryKind)}`,
+        `購入: ${fmtJstDate(row.purchasedAt)}`,
+        `止まっている理由: ${stuckReasonLabel(row.reason)}`,
+        `止まってから: ${fmtJstDate(row.stuckSince)}`,
       ].join("\n"),
       inline: false,
     });
   }
+  const open = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    ...cases.map((row) =>
+      new ButtonBuilder()
+        .setCustomId(`shokan:case:${row.purchaseId}`)
+        .setLabel(`#${row.purchaseId} を開く`)
+        .setStyle(ButtonStyle.Primary),
+    ),
+  );
   return {
     embeds: [embed],
-    components: [backButton()],
-    ...(total > rows.length ? { content: `ほか ${total - rows.length}件` } : {}),
+    components: cases.length > 0 ? [open, backButton()] : [backButton()],
+    ...(total > cases.length ? { content: `ほか ${total - cases.length}件` } : {}),
   };
 }
 
-function deliveryKindLabel(kind: string): string {
+function stuckReasonLabel(reason: string): string {
+  if (reason.startsWith("external_")) return "外部（Discord）の状態を確認できていない";
+  if (reason === "legacy_unknown") return "購入時の記録が無く、提供したか判断できない";
+  return reason;
+}
+
+const DECISION_LABEL: Record<string, string> = {
+  delivered: "提供済みだった",
+  no_effect: "提供されていなかった",
+  still_unknown: "まだ判断できない",
+};
+
+/**
+ * 案件の詳細。**ここまでは何も変えない。**
+ * 決着は「選ぶ → 何が起きるか見る → 確定」の3段にする。
+ */
+function renderCase(services: Services, purchaseId: number) {
+  const quote = services.shop.quoteOperatorResolution(purchaseId);
+  const history = services.shop.operatorResolutions(purchaseId);
+  const embed = new EmbedBuilder()
+    .setTitle(`案件 購入 #${purchaseId}`)
+    .setColor(quote.kind === null ? 0x16a34a : 0xf59e0b)
+    .addFields(
+      { name: "利用者", value: `<@${quote.userId}>`, inline: true },
+      { name: "商品", value: quote.itemName, inline: true },
+      { name: "購入", value: fmtJstDate(quote.purchasedAt), inline: true },
+      { name: "提供方式", value: deliveryKindLabel(quote.deliveryKind), inline: true },
+      { name: "購入の状態", value: purchaseStatusLabel(quote.status), inline: true },
+      { name: "支払い", value: fmtLd(quote.refundableAmount), inline: true },
+      {
+        name: "止まっている理由",
+        value: quote.kind === null ? "決着済みです。" : stuckReasonLabel(quote.reason),
+        inline: false,
+      },
+    );
+  if (history.length > 0) {
+    embed.addFields({
+      name: "これまでの判断",
+      value: history
+        .slice(0, 3)
+        .map((row) => `${fmtJstDate(row.resolved_at)} ${DECISION_LABEL[row.decision] ?? row.decision}${row.note ? ` — ${row.note}` : ""}`)
+        .join("\n"),
+      inline: false,
+    });
+  }
+  if (quote.kind === null) {
+    return { embeds: [embed], components: [backToCasesRow()] };
+  }
+  const t = quote.token;
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`shokan:case-pre:delivered:0:${purchaseId}:${t}`)
+      .setLabel("提供済みだった")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`shokan:case-pre:no_effect:0:${purchaseId}:${t}`)
+      .setLabel("提供なし（返金しない）")
+      .setStyle(ButtonStyle.Secondary),
+    ...(quote.refundSupported
+      ? [
+          new ButtonBuilder()
+            .setCustomId(`shokan:case-pre:no_effect:1:${purchaseId}:${t}`)
+            .setLabel("提供なし＋返金")
+            .setStyle(ButtonStyle.Danger),
+        ]
+      : []),
+    new ButtonBuilder()
+      .setCustomId(`shokan:case-pre:still_unknown:0:${purchaseId}:${t}`)
+      .setLabel("まだ判断できない")
+      .setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row, backToCasesRow()] };
+}
+
+function backToCasesRow() {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("shokan:stuck-delivery").setLabel("← 確認待ちの案件").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("shokan:hub").setLabel("← 商館ハブ").setStyle(ButtonStyle.Secondary),
+  );
+}
+
+/** 確定前に**実際に起きる変更**を出す。ここでもまだ何も変えない。 */
+function renderCasePreview(
+  services: Services,
+  purchaseId: number,
+  decision: "delivered" | "no_effect" | "still_unknown",
+  refund: boolean,
+  token: string,
+) {
+  const quote = services.shop.quoteOperatorResolution(purchaseId);
+  const stale = quote.token !== token || quote.kind === null;
+  const changes =
+    decision === "delivered"
+      ? ["この購入を**提供済み**として確定します。", "返金はしません。", "確認待ちの一覧から消えます。"]
+      : decision === "no_effect"
+        ? [
+            "この購入を**未提供**として確定します。",
+            refund ? `**${fmtLd(quote.refundableAmount)} を返金します。**` : "返金はしません（あとで再配送も返金もできます）。",
+            "確認待ちの一覧から消えます。",
+          ]
+        : ["**何も変更しません。**", "確認待ちのまま残ります。", "「見たが判断できなかった」ことだけ記録します。"];
+  const embed = new EmbedBuilder()
+    .setTitle(`確認: ${DECISION_LABEL[decision]}`)
+    .setColor(stale ? 0xdc2626 : 0x0ea5e9)
+    .setDescription(
+      stale
+        ? "⚠️ 表示したあとに状況が変わりました。**何も変更していません。** 一覧を開き直してください。"
+        : [`購入 #${purchaseId} / <@${quote.userId}>`, "", "**これから起きること**", ...changes.map((c) => `・${c}`)].join("\n"),
+    );
+  if (stale) return { embeds: [embed], components: [backToCasesRow()] };
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`shokan:case-do:${decision}:${refund ? 1 : 0}:${purchaseId}:${token}`)
+      .setLabel("この内容で確定する")
+      .setStyle(decision === "no_effect" && refund ? ButtonStyle.Danger : ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`shokan:case:${purchaseId}`).setLabel("やめる").setStyle(ButtonStyle.Secondary),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+function deliveryKindLabel(kind: string | null): string {
+  if (kind === null) return "記録なし（判断できません）";
   if (kind === "add_role") return "ロール付与";
   if (kind === "set_nickname") return "名前の変更";
   if (kind === "create_original_role") return "オリジナルロール作成";
@@ -639,6 +771,50 @@ function purchaseStatusLabel(status: string): string {
   if (status === "refunded") return "返金済み";
   if (status === "expired") return "期限切れ";
   return status;
+}
+
+/**
+ * 決着の確定。**staleなら1つも書かずに止める。**
+ * 内部のエラーコードや token は運営画面にも出さない（意味のある言葉だけ返す）。
+ */
+async function resolveCase(
+  interaction: ButtonInteraction,
+  services: Services,
+  decision: "delivered" | "no_effect" | "still_unknown",
+  refund: boolean,
+  purchaseId: number,
+  token: string,
+): Promise<void> {
+  try {
+    const result = services.shop.resolveOperatorCase({
+      purchaseId,
+      decision,
+      expectedToken: token,
+      actor: `user:${interaction.user.id}`,
+      refund,
+    });
+    const done =
+      decision === "delivered"
+        ? `✅ 購入 #${purchaseId} を**提供済み**として確定しました。`
+        : decision === "no_effect"
+          ? result.refunded
+            ? `✅ 購入 #${purchaseId} を**未提供**として確定し、${fmtLd(result.refundedAmount)}を返金しました。`
+            : `✅ 購入 #${purchaseId} を**未提供**として確定しました（返金はしていません）。`
+          : `ℹ️ 購入 #${purchaseId} は**判断保留**として記録しました。状態は変えていません。`;
+    await interaction.reply({ content: done, flags: MessageFlags.Ephemeral });
+    await refreshShopAdminPanels(interaction.client, services).catch(() => undefined);
+  } catch (error) {
+    const code = error instanceof ShopError ? error.code : undefined;
+    await interaction.reply({
+      content:
+        code === "ERR_RESOLUTION_STALE"
+          ? "⚠️ 表示したあとに状況が変わりました。**何も変更していません。** 一覧を開き直してください。"
+          : code === "ERR_RESOLUTION_NOT_APPLICABLE"
+            ? "ℹ️ この案件は既に決着しています。**何も変更していません。**"
+            : "⚠️ 決着できませんでした。何も変更していません。",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
 }
 
 export async function handleShokanButton(interaction: ButtonInteraction, services: Services): Promise<void> {
@@ -687,6 +863,18 @@ export async function handleShokanButton(interaction: ButtonInteraction, service
   if (action === "failed") return void (await show(renderFailed(services) as never));
   if (action === "legacy-unknown") return void (await show(renderLegacyUnknown(services) as never));
   if (action === "stuck-delivery") return void (await show(renderStuckDeliveries(services) as never));
+  if (action === "case" && arg) return void (await show(renderCase(services, Number(arg)) as never));
+  if (action === "case-pre" && arg) {
+    // customId: shokan:case-pre:<decision>:<refund01>:<purchaseId>:<token>
+    const decision = arg as "delivered" | "no_effect" | "still_unknown";
+    return void (await show(
+      renderCasePreview(services, Number(parts[4]), decision, parts[3] === "1", parts[5] ?? "") as never,
+    ));
+  }
+  if (action === "case-do" && arg) {
+    const decision = arg as "delivered" | "no_effect" | "still_unknown";
+    return void (await resolveCase(interaction, services, decision, parts[3] === "1", Number(parts[4]), parts[5] ?? ""));
+  }
   if (action === "list") return void (await show(renderList(services) as never));
   if (action === "history") return void (await show(renderHistory(services, Math.max(0, Number(arg ?? 0))) as never));
   if (action === "reeval-comp") {

@@ -14,9 +14,13 @@ import type { Services } from "./services.js";
  *
  * - `refunded` … 返した（既に返金済みだった場合も含む）
  * - `already_delivered` … サービスは提供済みだった。**返さないのが正しい**
- * - `escalated` … 返金そのものに失敗した。**ここだけが人の出番**
+ * - `withheld`          … **提供できたか確認できていないので、返金を試していない**
+ * - `escalated`         … 返金を試したが完了できなかった
+ *
+ * `withheld` と `escalated` は利用者への説明がまったく違う。前者は「確認中」、
+ * 後者は「変更できず、返金も完了していない」。混ぜると事実と食い違う。
  */
-export type RefundOutcome = "refunded" | "already_delivered" | "escalated";
+export type RefundOutcome = "refunded" | "already_delivered" | "withheld" | "escalated";
 
 /** 配送の結果と、失敗したときの後始末。`refund` は配送が失敗したときだけ付く */
 export interface Settlement {
@@ -52,7 +56,7 @@ export function deliverOrRefund(
         });
         await refreshShopAdminPanels(client, services).catch(() => undefined);
         await notifyRefundFailure(client, services, purchase.id).catch(() => undefined);
-        return { outcome, refund: "escalated" as const };
+        return { outcome, refund: "withheld" as const };
       }
       const refund = await refundOrEscalate(client, services, purchase, outcome.error ?? "delivery_failed", actor);
       return { outcome, refund };
