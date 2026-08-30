@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { WITHDRAWN_DELIVERY_KINDS, parseDeliverySnapshot } from "../shop/service.js";
+import { EXTERNAL_CLAIM_LIVE_STATES_SQL, WITHDRAWN_DELIVERY_KINDS, parseDeliverySnapshot } from "../shop/service.js";
 
 /**
  * スキーマは追記専用の台帳を中心に設計されている（経済設計.md §3）。
@@ -1033,9 +1033,13 @@ CREATE TABLE IF NOT EXISTS shop_external_delivery_attempts (
   PRIMARY KEY (purchase_id, attempt_token)
 );
 -- **1 purchase につき同時に生きている claim は1つだけ。** 部分ユニーク索引でDBに守らせる。
+--
+-- 状態の集合は Core と**同じ定義**（EXTERNAL_CLAIM_LIVE_STATES）から作る。
+-- ここへ手で書き写すと、Coreが「生きている」と見なす集合とDBが1件に縛る集合が
+-- 将来ズレる。ただし**索引はDBに焼き付く**ので、集合を変えるときはmigrationが要る。
 CREATE UNIQUE INDEX IF NOT EXISTS uq_shop_external_delivery_open
   ON shop_external_delivery_attempts(purchase_id)
-  WHERE state IN ('in_flight','uncertain');
+  WHERE state IN ${EXTERNAL_CLAIM_LIVE_STATES_SQL};
 CREATE INDEX IF NOT EXISTS idx_shop_external_delivery_state
   ON shop_external_delivery_attempts(state, started_at);
 -- Phase H: 運営が事実を確認して下した決着。**判断そのものを durable な事実として残す。**
@@ -1064,14 +1068,38 @@ CREATE TABLE IF NOT EXISTS shop_operator_resolutions (
 );
 CREATE INDEX IF NOT EXISTS idx_shop_operator_resolutions_purchase
   ON shop_operator_resolutions(purchase_id, resolved_at);
--- Phase H: 返金を**実際に試して失敗した**という事実。
+-- Phase H: **自動の返金・決着がその場で完了しなかった**という事実。
 --
--- 「提供できたか確認できないので返金を試していない」(withheld) とは別物。
--- 前者は利用者の資産が戻っていないので運営が復旧する必要があり、後者は確認待ち。
+-- テーブル名は歴史的なもので、行は「実際に振替を試して失敗した」だけを表さない。
+-- generic refund が authority 上扱えない場合（代替支払）も、運営への引き継ぎを
+-- durable にするためにここへ積む。行だけから実際の試行有無は判断できない。
+--
+-- 「提供できたか確認できないので返金の判断自体をしていない」(withheld) は別経路で、
+-- この writer を使わない。あちらはまだ結末が分からないだけで、決着を試してすらいない。
 -- イベントだけだと仕事の一覧に出せないので、durable に残して商館の正本から引く。
 --
--- 解消は purchase の状態で決まる（refunded / expired / delivered になれば対象外）ので、
--- この表を後から書き換える必要は無い＝append-only のままでよい。
+-- **この表は append-only。** 行そのものは消えないし、書き換えもしない。
+-- 「いまどの導線に属するか」は行ではなく、purchase の状態・delivered evidence・
+-- **生きている external claim**・支払い方法から**派生**して決まる:
+--
+--   issue history
+--   ├ refunded / delivered
+--   │  → 正常に決着した。通常の導線には出ない
+--   │
+--   ├ active + 未提供
+--   │  ├ live claim あり
+--   │  │  → claim / 提供状況の確認が先に authority を持つ
+--   │  │     merchant recovery = false / operations handoff = false
+--   │  │
+--   │  └ live claim なし
+--   │     ├ generic refund supported   → 商館の返金復旧
+--   │     └ generic refund unsupported → operations handoff（運営判断）
+--   │
+--   └ expired / cancelled
+--      → 通常の導線からは外れる。**ただしそれだけでは決着済みと断定しない**
+--        （issue history + delivered evidence なしは safetySnapshot の anomaly）
+--
+-- 「通常の導線から外れた」ことと「金銭の決着が済んだ」ことを同じ語で言わない。
 CREATE TABLE IF NOT EXISTS shop_refund_failures (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   purchase_id INTEGER NOT NULL REFERENCES shop_purchases(id),

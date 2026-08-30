@@ -281,6 +281,11 @@ export {
   type ManualCompletionResult,
   type RoleGrantProvenanceRow,
   type RoleGrantTarget,
+  EXTERNAL_CLAIM_LIVE_STATES,
+  EXTERNAL_CLAIM_LIVE_STATES_SQL,
+  type ExternalClaimLiveState,
+  type ShopSafetySnapshot,
+  type ExpiryBlockedReason,
   type RoleEntitlementState,
 } from "./shop/service.js";
 export {

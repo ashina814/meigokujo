@@ -169,6 +169,27 @@ export const AUTO_DELIVERABLE_KINDS: ReadonlySet<string> = new Set([
 ]);
 /** 過去に自動配送として売られたが、いまは自動実行しない種別 */
 export const WITHDRAWN_DELIVERY_KINDS: ReadonlySet<string> = new Set(["revoke_meirei"]);
+
+/**
+ * **まだ結果が確定していない claim の状態。**
+ *
+ * 「外部へ投げている最中」と「投げたが結果が分からない」は扱いが同じ——どちらも
+ * 返金・失効・再配送を止める。
+ *
+ * この集合は Core の判定だけでなく、**DBの部分ユニーク索引**
+ * （`uq_shop_external_delivery_open`: 1 purchase につき生きた claim は1つ）
+ * の定義にも使う。片方だけ書き換えると、Coreが「生きている」と見なす集合と
+ * DBが1件に縛る集合がズレて、守りに穴が開く。
+ *
+ * **索引はDBに焼き付くので、この集合を変えるときはmigrationが要る。**
+ * 定数を書き換えただけでは、既存DBの索引は古い集合のまま残る。
+ */
+export const EXTERNAL_CLAIM_LIVE_STATES = ["in_flight", "uncertain"] as const;
+
+export type ExternalClaimLiveState = (typeof EXTERNAL_CLAIM_LIVE_STATES)[number];
+
+/** 上の集合を SQL の `IN (...)` リテラルにしたもの。DDLとCore queryが同じ文字列を使う */
+export const EXTERNAL_CLAIM_LIVE_STATES_SQL = `(${EXTERNAL_CLAIM_LIVE_STATES.map((v) => `'${v}'`).join(",")})`;
 const KNOWN_DELIVERY_KINDS: ReadonlySet<string> = new Set([...AUTO_DELIVERABLE_KINDS, ...WITHDRAWN_DELIVERY_KINDS]);
 
 /**
@@ -414,6 +435,77 @@ export interface ManualCompletionResult {
   readonly completed: boolean;
   readonly reason: ManualCompletionReason;
 }
+
+/**
+ * 購入1件について、**いま安全上効いている事実**をひとまとめにしたもの。
+ *
+ * 巨大な1本のenumにはしない。ここに並ぶのは互いに直交する事実で、たとえば
+ * 同じ `active` でも「提供済み・期限内」と「配送失敗・返金の復旧待ち・期限超過」は
+ * まったく別物になる。1本の名前へ潰すと、その違いが消える。
+ *
+ * **新しい判定はここで作らない。** どの欄も既存の authority をそのまま呼んだ結果で、
+ * 一覧SQL・巡回・運営操作と食い違わないことが唯一の存在意義。
+ */
+export interface ShopSafetySnapshot {
+  purchaseId: number;
+  /** 契約そのもの */
+  contract: {
+    status: PurchaseStatus;
+    userId: string;
+    itemId: number;
+    paidLand: number | null;
+    paidAltKind: string | null;
+    expiresAt: number | null;
+  };
+  /** 提供したかどうか。`evidence` が authoritative で、`state` は経過にすぎない */
+  fulfillment: {
+    state: string | null;
+    deliveredAt: number | null;
+    evidence: boolean;
+    provenance: boolean;
+    roleGrant: RoleGrantTarget;
+  };
+  /** 外部へ投げた副作用の場所取り。生きている間は返金も失効も止まる */
+  externalClaim: { token: string; state: "in_flight" | "uncertain"; startedAt: number } | null;
+  /**
+   * 返金。**4つの別々の事実**を分けて持つ。1つの語へ潰さない。
+   *
+   * - `settlementIssueHistory` … 自動の返金・決着がその場で終わらず、durable な
+   *   対応記録が積まれた履歴（append-only）。**「返金処理が実際に失敗した」証拠とは
+   *   限らない**——代替支払のように generic refund が authority 上扱えないケースでも、
+   *   運営への引き継ぎを成立させるために行が積まれる
+   * - `settlementPending` … 利用者への金銭決着が**まだ終わっていない**。
+   *   失効を止める authority はこれ。商館が処理できるかは問わない
+   * - `recoveryOpen` … **商館**が「返金をやり直す」で終わらせられる
+   *   （settlement pending ＋ live claim なし ＋ generic refund 可）
+   * - `operationsHandoff` … **運営**へ渡すしかない
+   *   （settlement pending ＋ live claim なし ＋ generic refund 不可）
+   *
+   * **`recoveryOpen === false` を「決着が済んだ」と読んではいけない。**
+   * 代替支払では `recoveryOpen=false` / `settlementPending=true` /
+   * `operationsHandoff=true` が正しい状態として同時に成り立つ。
+   */
+  refund: {
+    settlementIssueHistory: number;
+    settlementPending: boolean;
+    recoveryOpen: boolean;
+    operationsHandoff: boolean;
+  };
+  /** 人が確認して決着させる案件かどうか */
+  operatorCase: { unresolved: boolean; decided: "delivered" | "no_effect" | null };
+  /** 期限。止まっているなら、その理由まで */
+  expiry: { expiresAt: number | null; due: boolean; blockedBy: ExpiryBlockedReason | null };
+  /** 失効後のロール剥奪 */
+  revocation: { status: "pending" | "done" | "failed" | null; roleId: string | null; lastError: string | null };
+  /**
+   * 同時に成り立ってはいけない事実の組み合わせ。**見つけても直さない。**
+   * legacyや事故で実在しうるので、「理論上あり得ない」で隠さず数え上げる。
+   */
+  contradictions: string[];
+}
+
+/** 期限が来ていても失効させてはいけない理由 */
+export type ExpiryBlockedReason = "delivery_in_flight" | "refund_pending";
 
 export type ShopErrorCode =
   | "ERR_ITEM_NOT_FOUND"
@@ -2022,6 +2114,9 @@ export class Shop {
    * かといって壊れた記録から意味を推測して現在の商品定義へfallbackすることもしない
    * ——NULL・malformed・valid but non-reeval はすべて「証拠なし」に倒す。
    */
+  /** `EXTERNAL_CLAIM_LIVE_STATES` の SQL 形。DDLの部分ユニーク索引と同じ文字列 */
+  private static readonly CLAIM_LIVE_STATES = EXTERNAL_CLAIM_LIVE_STATES_SQL;
+
   private static readonly REEVALUATION_EVIDENCE_SQL = `COALESCE(
        EXISTS (SELECT 1 FROM shop_purchase_title_provenance v
                 WHERE v.purchase_id = p.id AND v.origin = 'reevaluation')
@@ -2100,6 +2195,16 @@ export class Shop {
        WHERE f.purchase_id = p.id AND p.delivery_state = 'delivered'
     )
   )`;
+
+  /**
+   * 上の判定を**purchase 1件へ当てるための包み**。
+   *
+   * 同じ「提供済みか」をJSで書き直すと、片方だけ緩い実装が残って一覧と個別判定が
+   * 食い違う。渡された行の値をそのまま束ねて、SQL側の定義に判断させる。
+   */
+  private static readonly DELIVERED_EVIDENCE_ROW_SQL = `WITH p(id, delivered_at, delivery_state) AS (
+    VALUES (CAST(? AS INTEGER), ?, ?)
+  ) SELECT ${Shop.DELIVERED_EVIDENCE_SQL} AS hit FROM p`;
 
   /**
    * 購入時autoだと証明できるのに、**配送の結末が証明できない**旧購入。
@@ -2946,7 +3051,7 @@ export class Shop {
     return this.db
       .prepare(
         `SELECT * FROM shop_external_delivery_attempts
-          WHERE purchase_id = ? AND state IN ('in_flight','uncertain')`,
+          WHERE purchase_id = ? AND state IN ${Shop.CLAIM_LIVE_STATES}`,
       )
       .get(purchaseId) as ExternalDeliveryAttemptRow | undefined;
   }
@@ -2960,7 +3065,7 @@ export class Shop {
   private static externalDeliveryLiveSql(): string {
     return `EXISTS (
       SELECT 1 FROM shop_external_delivery_attempts a
-       WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
+       WHERE a.purchase_id = p.id AND a.state IN ${Shop.CLAIM_LIVE_STATES}
     )`;
   }
 
@@ -3012,7 +3117,7 @@ export class Shop {
         .prepare(
           `UPDATE shop_external_delivery_attempts
               SET state = 'settled', updated_at = ?
-            WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+            WHERE purchase_id = ? AND attempt_token = ? AND state IN ${Shop.CLAIM_LIVE_STATES}`,
         )
         .run(now(), input.purchaseId, input.token).changes;
       if (claimed !== 1) return false;
@@ -3042,7 +3147,7 @@ export class Shop {
         .prepare(
           `UPDATE shop_external_delivery_attempts
               SET state = 'released', updated_at = ?, detail = ?
-            WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+            WHERE purchase_id = ? AND attempt_token = ? AND state IN ${Shop.CLAIM_LIVE_STATES}`,
         )
         .run(now(), input.reason.slice(0, 500), input.purchaseId, input.token).changes;
       if (changed !== 1) return false;
@@ -3067,7 +3172,7 @@ export class Shop {
         .prepare(
           `UPDATE shop_external_delivery_attempts
               SET state = 'uncertain', updated_at = ?, detail = ?
-            WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+            WHERE purchase_id = ? AND attempt_token = ? AND state IN ${Shop.CLAIM_LIVE_STATES}`,
         )
         .run(now(), input.reason.slice(0, 500), input.purchaseId, input.token).changes;
       if (changed !== 1) return false;
@@ -3087,7 +3192,7 @@ export class Shop {
         `SELECT a.*, p.user_id, p.status
            FROM shop_external_delivery_attempts a
            JOIN shop_purchases p ON p.id = a.purchase_id
-          WHERE a.state IN ('in_flight','uncertain')
+          WHERE a.state IN ${Shop.CLAIM_LIVE_STATES}
           ORDER BY a.started_at ASC
           LIMIT ?`,
       )
@@ -3096,7 +3201,7 @@ export class Shop {
 
   countUnresolvedExternalDeliveries(): number {
     return this.db
-      .prepare("SELECT COUNT(*) FROM shop_external_delivery_attempts WHERE state IN ('in_flight','uncertain')")
+      .prepare(`SELECT COUNT(*) FROM shop_external_delivery_attempts WHERE state IN ${Shop.CLAIM_LIVE_STATES}`)
       .pluck()
       .get() as number;
   }
@@ -3279,7 +3384,7 @@ export class Shop {
             .prepare(
               `UPDATE shop_external_delivery_attempts
                   SET state = 'settled', updated_at = ?, detail = ?
-                WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+                WHERE purchase_id = ? AND attempt_token = ? AND state IN ${Shop.CLAIM_LIVE_STATES}`,
             )
             .run(ts, "operator_confirmed_delivered", input.purchaseId, claim.attempt_token).changes;
           if (settled !== 1) throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
@@ -3293,7 +3398,7 @@ export class Shop {
             .prepare(
               `UPDATE shop_external_delivery_attempts
                   SET state = 'released', updated_at = ?, detail = ?
-                WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+                WHERE purchase_id = ? AND attempt_token = ? AND state IN ${Shop.CLAIM_LIVE_STATES}`,
             )
             .run(ts, "operator_confirmed_no_effect", input.purchaseId, claim.attempt_token).changes;
           if (released !== 1) throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
@@ -3380,7 +3485,7 @@ export class Shop {
     return `SELECT id, MIN(stuck_since) AS stuck_since FROM (
       SELECT a.purchase_id AS id, a.started_at AS stuck_since
         FROM shop_external_delivery_attempts a
-       WHERE a.state IN ('in_flight','uncertain')
+       WHERE a.state IN ${Shop.CLAIM_LIVE_STATES}
       UNION ALL
       SELECT p.id, p.purchased_at FROM shop_purchases p
        WHERE ${Shop.legacyUnknownSql()} AND NOT ${Shop.OPERATOR_DECIDED_SQL}
@@ -3461,10 +3566,24 @@ export class Shop {
   // ── 返金の復旧（Phase H）──────────────────────────────────────────────────
 
   /**
-   * 返金を**実際に試して失敗した**ことを残す。
+   * **自動の返金・決着がその場で完了しなかった**ことを、後続対応のため durable に残す。
    *
-   * 「確認できないので試していない」(withheld) では呼ばない。ここに載るのは
-   * 利用者の資産が戻っていない購入だけ。
+   * 積まれる場面は1つではない。
+   *   - 台帳側の失敗（`LedgerError` 等）… 実際に振替を試して失敗した
+   *   - `ERR_ALT_REFUND_UNSUPPORTED` … generic refund が authority 上そもそも扱えない。
+   *     **振替は試していない**が、運営への引き継ぎ（operations handoff）を durable に
+   *     するために記録する
+   *   - その他の事前条件の拒否（結末が不明・既に終わっている等）
+   *
+   * したがって **行の存在から「実際に返金を試したかどうか」を推測してはいけない。**
+   * 言えるのは「自動では決着せず、人が続きをやる必要がある」まで。
+   *
+   * 「確認できないので返金の判断自体をしていない」(withheld) では呼ばない——
+   * あれはまだ結末が分からないだけで、決着を試してすらいない。
+   *
+   * 「利用者の資産が戻っていない購入だけ」とも言えない。`paid_alt_*` は
+   * **実際にその資源が減った証拠ではない**（Phase C 以来の contract）ので、
+   * 何がどれだけ未返却かはこの行だけでは決まらない。
    */
   recordRefundFailure(input: { purchaseId: number; amount: number; reason: string; detail?: string; actor: string }): void {
     this.db
@@ -3547,7 +3666,7 @@ export class Shop {
         .prepare(
           `UPDATE shop_external_delivery_attempts
               SET state = 'released', updated_at = ?, detail = ?
-            WHERE purchase_id = ? AND attempt_token = ? AND state IN ('in_flight','uncertain')`,
+            WHERE purchase_id = ? AND attempt_token = ? AND state IN ${Shop.CLAIM_LIVE_STATES}`,
         )
         .run(now(), "verified_no_effect", input.purchaseId, token).changes;
       // 同時に生きている claim は部分ユニーク索引で1つに縛られている。
@@ -3615,10 +3734,41 @@ export class Shop {
   }
 
   /**
-   * まだ返金できていない購入。
+   * **自動の返金・決着がその場で終わらず、durable な対応記録が積まれた履歴。**
    *
-   * **解消は purchase の状態で決まる。** 返金・失効・提供済みのいずれかになれば
-   * 自動的にこの一覧から消えるので、記録を後から書き換える必要が無い。
+   * `shop_refund_failures` の行があるか、という事実そのもの。テーブル名は歴史的な
+   * ものだが、**いま積まれる行は「返金を試して失敗した」だけではない**。
+   *
+   *   - 台帳側の失敗（`LedgerError` 等）… 実際に返せなかった
+   *   - `ERR_ALT_REFUND_UNSUPPORTED` … generic refund が authority 上そもそも扱えない。
+   *     返金を試して失敗したのではなく、**運営への引き継ぎを durable にするための記録**
+   *
+   * どちらも「自動では決着しなかったので、人が続きをやる必要がある」という点で同じ。
+   * この2つを行から見分ける structured な情報は今のスキーマに無いので、
+   * **`detail` の文字列を解析して分類を捏造しない**。ここで言えるのは
+   * 「対応記録が積まれた」までで、それ以上を名前で主張しない。
+   *
+   * `refundFailureSql()`（いま商館の復旧キューに載るか）とは別物で、こちらの方が広い。
+   * 配送やり直しキューはこちらを使う——**再配送してよいか**の判断なので、
+   * 一度でも自動決着の対応記録が積まれた購入は、自動の再配送から外す方が安全側になる。
+   */
+  private static refundSettlementIssueHistorySql(): string {
+    return "EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)";
+  }
+
+  /**
+   * **いま返金のやり直しキューに載る購入か。**
+   *
+   * これは復旧導線の述語であって、「利用者へ返す義務があるか」という普遍的な
+   * financial truth ではない。`status = 'active'` を条件に含むので、
+   * `expired` / `cancelled` になれば false へ落ちる——`refund()` が active からしか
+   * 動けない以上、復旧キューへ載せても押せるボタンが無いからそうしている。
+   *
+   * したがって **false を「金銭的な義務が無い」と読んではいけない。**
+   * この一覧から外れることと、金銭の決着が済んだことは別の事実で、
+   * 前者を後者の証明に使うと、決着の未了が黙って消える。金が戻ったと言えるのは
+   * `status = 'refunded'` だけ。terminal へ落ちたまま失敗履歴だけが残っている購入は、
+   * `safetySnapshot().contradictions` が監査対象として surface する。
    */
   /**
    * **商館の generic refund で返せる支払いか。**
@@ -3655,7 +3805,7 @@ export class Shop {
     return `p.status = 'active'
       AND p.delivered_at IS NULL
       AND NOT ${Shop.DELIVERED_EVIDENCE_SQL}
-      AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)`;
+      AND ${Shop.refundSettlementIssueHistorySql()}`;
   }
 
   /** 上と同じ判定を1件へ。失効の guard と候補選択が同じ意味を使う */
@@ -3674,33 +3824,38 @@ export class Shop {
    *   - 生きている claim が無い … claim 中の返金は必ず `ERR_DELIVERY_IN_FLIGHT` で拒まれる
    *   - 商館の generic refund で戻せる支払い … 代替支払は必ず拒まれる
    * ものだけ。どちらも「押しても絶対に成功しないボタン」を作らないための条件で、
-   * **決着が済んだかどうかとは関係がない**。外れたものは §handoff 側で人へ渡す。
+   * **決着が済んだかどうかとは関係がない**。
+   *
+   * **外れ先は条件ごとに違う。**
+   *   - live claim があって外れた … `refundHandoffSql()` でもない。claim / 提供状況の
+   *     確認経路が先に authority を持つ（claim が解ければ、そのままどちらかへ移る）
+   *   - live claim は無く generic refund だけが unsupported … `refundHandoffSql()` へ。
+   *     運営判断が必要な案件として渡す
    */
   private static refundFailureSql(): string {
     return `${Shop.refundSettlementPendingSql()}
-      AND NOT EXISTS (
-        SELECT 1 FROM shop_external_delivery_attempts a
-         WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
-      )
+      AND NOT ${Shop.externalDeliveryLiveSql()}
       AND ${Shop.genericRefundSupportedSql()}`;
   }
 
   /**
-   * **返すべき金が残っているが、商館では返せない購入。**
+   * **自動決着が未了で、generic refund では処理できない購入。**
    *
-   * 代替支払を含むので generic refund が扱えない。商館スタッフに処理 authority が
-   * 無いので「対応が必要な仕事」には数えないが、**黙って消さない**——誰も知らないまま
-   * 利用者の資産が戻らない、が最悪の結末なので、運営判断が必要な案件として出す。
+   * 代替支払を含むため、generic refund には「何を・どこへ・どれだけ戻すべきか」を
+   * 判断する authority がない。商館スタッフに処理権限が無いので「対応が必要な仕事」には
+   * 数えないが、**黙って消さない**——決着が未了の案件を誰にも知らせないまま失効・消失
+   * させないために、運営判断が必要な案件として出す。
+   *
+   * **未返却の資産をこの述語から断定しない。** `paid_alt_*` は実際にその資源が減った
+   * 証拠ではない（Phase C 以来の contract）ので、何がどれだけ戻っていないかは
+   * ここでは決まらない。言えるのは「決着が未了で、商館では安全に完了できない」まで。
    *
    * 剥奪の `blocked` とは別物。あちらは「与えたか証明できないので取り消せない」、
-   * こちらは「返す先の資源を generic refund が知らない」。
+   * こちらは「戻す先と量を generic refund が判断できない」。
    */
   private static refundHandoffSql(): string {
     return `${Shop.refundSettlementPendingSql()}
-      AND NOT EXISTS (
-        SELECT 1 FROM shop_external_delivery_attempts a
-         WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
-      )
+      AND NOT ${Shop.externalDeliveryLiveSql()}
       AND NOT ${Shop.genericRefundSupportedSql()}`;
   }
 
@@ -3743,7 +3898,13 @@ export class Shop {
       .get() as number;
   }
 
-  /** 上と**同じ判定**を1件へ当てる。一覧・件数・確認・確定で条件を分けない。 */
+  /**
+   * 上と**同じ判定**を1件へ当てる。一覧・件数・確認・確定で条件を分けない。
+   *
+   * 意味は「**いま商館が返金をやり直せるか**」。`false` は
+   * 「返す義務が無い」でも「金銭の決着が済んだ」でもない——代替支払や claim 保持中も
+   * `false` になる。失効を止めてよいかは `refundSettlementPending()` の方で判断する。
+   */
   private refundFailureOpen(purchaseId: number): boolean {
     const row = this.db
       .prepare(`SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.refundFailureSql()} LIMIT 1`)
@@ -3956,12 +4117,12 @@ export class Shop {
    * 次第でそのまま残るため、「配送に成功した」の一次証拠にならない。
    */
   private hasDeliveredEvidence(purchase: PurchaseRow): boolean {
-    if (purchase.delivered_at !== null) return true;
-    if (this.fulfillmentProvenance(purchase.id) && purchase.delivery_state === "delivered") return true;
-    // 部分一致では「別の購入IDを含む文字列」や「本文にIDが出てくるだけのpayload」まで
-    // 証拠に見えてしまう。ここは権限の境界なのでJSONとして厳密に取り出す。
-    // 壊れたJSONは throw させず「証拠なし」に倒す（json_extract は不正JSONで例外を投げる）。
-    return this.hasDeliveredEvent(purchase.id);
+    // **一覧SQLと同じ定義で判断する。** 渡された行の値を束ねて評価するので、
+    // 呼び出し側が持っている行の内容と食い違うこともない。
+    const row = this.db
+      .prepare(Shop.DELIVERED_EVIDENCE_ROW_SQL)
+      .get(purchase.id, purchase.delivered_at, purchase.delivery_state) as { hit: number };
+    return row.hit === 1;
   }
 
   /**
@@ -3983,18 +4144,6 @@ export class Shop {
     // 専用サービスの権利は、それぞれのフローが消費状態を持っている。
     if (this.isReevaluationPurchase(purchase.id)) return false;
     return true;
-  }
-
-  /**
-   * その購入を指す `shop_delivered` event があるか。
-   * **SQL側の判定（`DELIVERED_EVENT_SQL`）と同じ定義を使う。** 片方だけ厳密で
-   * もう片方が緩いと、一覧と個別判定が食い違う。
-   */
-  private hasDeliveredEvent(purchaseId: number): boolean {
-    const row = this.db
-      .prepare(`SELECT ${Shop.deliveredEventSql("CAST(? AS INTEGER)")} AS hit`)
-      .get(purchaseId) as { hit: number };
-    return row.hit === 1;
   }
 
   /**
@@ -4328,11 +4477,12 @@ export class Shop {
       AND NOT EXISTS (
         SELECT 1 FROM shop_delivery_replay_suppressions r WHERE r.purchase_id = p.id
       )
-      -- **返金の復旧待ちを配送再試行へ混ぜない。** 返金しようとして失敗した購入は
-      -- 「もう一度配る」ではなく「返金をやり直す」案件。別のキューで扱う。
-      AND NOT EXISTS (
-        SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id
-      )
+      -- **決着の途中にある購入を配送再試行へ混ぜない。** 自動決着の対応記録が既にある
+      -- 購入は、商館の返金復旧か運営への引き継ぎという**別の決着経路**へ移っている。
+      -- 「もう一度配る」で上書きしにいかない。
+      -- ここは**対応記録があるか**の方を使う（再配送してよいかの判断なので、
+      -- 一度でも自動決着が止まった購入は自動の再配送から外す方が安全側）。
+      AND NOT ${Shop.refundSettlementIssueHistorySql()}
       AND NOT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}`;
   }
 
@@ -4371,10 +4521,7 @@ export class Shop {
             -- **確認待ちも混ぜない。** 外部へ投げたまま結果が分からない購入は、
             -- そもそも重ねて配れない（claimが塞ぐ）。両方のキューに出すと
             -- 「対応が必要」の件数が同じ購入を二重に数えることになる。
-            AND NOT EXISTS (
-              SELECT 1 FROM shop_external_delivery_attempts a
-               WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
-            )
+            AND NOT ${Shop.externalDeliveryLiveSql()}
           ORDER BY p.purchased_at DESC`,
       )
       .all() as Array<PurchaseRow & { item_name: string }>;
@@ -4713,9 +4860,10 @@ export class Shop {
     // ここで先に外してから LIMIT を掛ける。**最終判断は `expireIfDue()` のまま。**
     //
     // 除外条件は `expireIfDue()` が使うものと**同じ関数から作る**。
-    // 「返金失敗の履歴が1件でもあるか」を手書きすると意味がズレる——提供が後から
-    // 成功して義務が閉じた購入まで永久に候補から外れ、失効も剥奪判断も進まなくなる。
-    // **商館の予約語（`refundFailureSql()`）ではなく金銭決着の方**を使う。前者は
+    // 「自動決着の対応記録が1件でもあるか」を手書きすると意味がズレる——提供が後から
+    // 成功して復旧キューから外れた購入まで永久に候補から外れ、失効も剥奪判断も
+    // 進まなくなる。
+    // **商館の述語（`refundFailureSql()`）ではなく金銭決着の方**を使う。前者は
     // 「商館が返せるか」なので、代替支払の購入が候補に入って失効してしまう。
     const due = this.db
       .prepare(
@@ -4757,6 +4905,160 @@ export class Shop {
    * 「期限切れ」として記録され、剥奪キューにも載る）。
    * `changes === 1` のときだけ event と剥奪判断を確定する。
    */
+  /**
+   * 購入1件の「いま何がどうなっているか」を、**1回で**説明する。
+   *
+   * ここは read model であって authority ではない。どの欄も既存の判定をそのまま
+   * 呼んだ結果で、独自の解釈を挟まない。画面・運営・巡回が別々の理屈で状態を
+   * 説明し始めると、「なぜ返金できないのか」に3通りの答えが出てしまう。
+   */
+  safetySnapshot(purchaseId: number): ShopSafetySnapshot | null {
+    // **9本のSELECTを1つのsnapshotから読む。**
+    //
+    // 別接続が途中でcommitすると、「古いpurchase行＋新しいclaim/返金/決着」という
+    // **実際には一度も存在しなかった状態**を返せてしまう。ここは運営と監査へ事実を
+    // 説明する土台なので、資産を動かさなくても不正確な説明は許されない。
+    //
+    // DEFERRED で始めるので書き込みロックは取らない（読み取りだけのため）。
+    // 既に transaction の中なら、その snapshot をそのまま使う。
+    const body = (): ShopSafetySnapshot | null => this.safetySnapshotUnlocked(purchaseId);
+    return this.db.inTransaction ? body() : this.db.transaction(body)();
+  }
+
+  private safetySnapshotUnlocked(purchaseId: number): ShopSafetySnapshot | null {
+    const purchase = this.getPurchase(purchaseId);
+    if (!purchase) return null;
+
+    const claimRow = this.externalDeliveryClaim(purchaseId);
+    const evidence = this.hasDeliveredEvidence(purchase);
+    const recoveryOpen = this.refundFailureOpen(purchaseId);
+    const settlementPending = this.refundSettlementPending(purchaseId);
+    const operationsHandoff =
+      this.db
+        .prepare(`SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.refundHandoffSql()} LIMIT 1`)
+        .get(purchaseId) !== undefined;
+    const settlementIssueHistory = this.db
+      .prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id = ?")
+      .pluck()
+      .get(purchaseId) as number;
+    const decided = this.db
+      .prepare(
+        `SELECT decision FROM shop_operator_resolutions
+          WHERE purchase_id = ? AND decision IN ('delivered','no_effect')
+          ORDER BY id DESC LIMIT 1`,
+      )
+      .pluck()
+      .get(purchaseId) as "delivered" | "no_effect" | undefined;
+    const unresolved = this.db
+      .prepare(`SELECT 1 FROM (${Shop.unresolvedCandidateSql()}) WHERE id = ? LIMIT 1`)
+      .get(purchaseId) !== undefined;
+    const revocation = this.db
+      .prepare("SELECT status, role_id, last_error FROM shop_role_revocations WHERE purchase_id = ?")
+      .get(purchaseId) as { status: "pending" | "done" | "failed"; role_id: string | null; last_error: string | null } | undefined;
+
+    const due = purchase.expires_at !== null && purchase.expires_at <= now();
+    const blockedBy = this.expiryBlockedBy(purchaseId);
+
+    const contradictions: string[] = [];
+    if (purchase.status !== "active" && claimRow !== undefined) {
+      // 終わった購入に生きた場所取りが残っている。次の配送も返金も塞がれ続ける
+      contradictions.push(`terminal_purchase_with_live_claim:${purchase.status}`);
+    }
+    if ((purchase.status === "expired" || purchase.status === "cancelled") && settlementIssueHistory > 0 && !evidence) {
+      // **終わった購入に、自動決着が終わらなかった記録だけが残っている。**
+      //
+      // `refunded` ではないので「返った」とは言えない。かといって記録だけから
+      // 「未返金が確定した」とも言えない（別経路で戻した可能性を否定できないし、
+      // そもそもこの記録は「返金を試して失敗した」とは限らない）。
+      // 言えるのは **金の決着を人が監査する必要がある** ということだけ。
+      // `refund()` は active からしか動けないので、通常の復旧導線には載らない。
+      contradictions.push(`terminal_with_refund_failure_history_without_delivery_evidence:${purchase.status}`);
+    }
+    if (evidence && decided === "no_effect") {
+      // 「提供済み」の証拠と「提供されていない」という人の判断が同時に立っている
+      contradictions.push("delivered_evidence_vs_operator_no_effect");
+    }
+    if (evidence && (recoveryOpen || settlementPending || operationsHandoff)) {
+      // 正本の定義上ありえない組み合わせ。出たら定義がどこかでズレている
+      contradictions.push("delivered_evidence_vs_open_refund_recovery");
+    }
+    if (recoveryOpen && operationsHandoff) {
+      // 商館の仕事と運営への引き継ぎは排他。両方に出るなら述語がズレている
+      contradictions.push("refund_recovery_and_handoff_both_open");
+    }
+    if ((recoveryOpen || operationsHandoff) && !settlementPending) {
+      // どちらも settlement pending の派生なので、親が false なのはありえない
+      contradictions.push("refund_actionable_without_settlement_pending");
+    }
+    if (evidence && unresolved) {
+      contradictions.push("delivered_evidence_vs_unresolved_case");
+    }
+    if (revocation?.status === "pending" && purchase.status === "active") {
+      // 有効な契約からロールを剥がそうとしている
+      contradictions.push("active_purchase_with_pending_revocation");
+    }
+
+    return {
+      purchaseId,
+      contract: {
+        status: purchase.status,
+        userId: purchase.user_id,
+        itemId: purchase.item_id,
+        paidLand: purchase.paid_land,
+        paidAltKind: purchase.paid_alt_kind,
+        expiresAt: purchase.expires_at,
+      },
+      fulfillment: {
+        state: purchase.delivery_state ?? null,
+        deliveredAt: purchase.delivered_at,
+        evidence,
+        provenance: this.fulfillmentProvenance(purchaseId) !== undefined,
+        roleGrant: this.roleGrantTarget(purchase),
+      },
+      externalClaim:
+        claimRow === undefined
+          ? null
+          : {
+              token: claimRow.attempt_token,
+              state: claimRow.state as "in_flight" | "uncertain",
+              startedAt: claimRow.started_at,
+            },
+      refund: { settlementIssueHistory, settlementPending, recoveryOpen, operationsHandoff },
+      operatorCase: { unresolved, decided: decided ?? null },
+      expiry: { expiresAt: purchase.expires_at, due, blockedBy },
+      revocation: {
+        status: revocation?.status ?? null,
+        roleId: revocation?.role_id ?? null,
+        lastError: revocation?.last_error ?? null,
+      },
+      contradictions,
+    };
+  }
+
+  /**
+   * 期限が来ていても**失効させてはいけない理由**。無ければ `null`。
+   *
+   * 説明（snapshot）と実際の判断（`expireIfDue()`）で同じ関数を使う。別々に書くと、
+   * 画面が「返金の復旧待ちだから止まっています」と説明しているのに巡回は失効させる、
+   * のような食い違いが起きる。
+   *
+   * - `delivery_in_flight` … いま外部へ投げている最中／結果が分からない。ここで
+   *   expired へ落とすと「失効済みなのにロールだけ付く」が成立する
+   * - `refund_pending` … 金銭の決着がまだ終わっていない。**期限より先に金の決着を
+   *   終わらせる。** `refund()` は active からしか動けないので、ここで expired に
+   *   すると復旧導線そのものが消える（義務が消えるのではなく、押せるボタンが無くなる）
+   *
+   * **見るのは「商館で返せるか」ではなく「決着が済んだか」。** 商館の
+   * `refundFailureOpen()` を使うと、代替支払のように商館では返せない購入が
+   * 「商館の仕事ではない」という理由だけで失効し、運営への引き継ぎ一覧
+   * （`status='active'` を要求する）からも消える——決着が未了のまま導線が全部消える。
+   */
+  expiryBlockedBy(purchaseId: number): ExpiryBlockedReason | null {
+    if (this.externalDeliveryInFlight(purchaseId)) return "delivery_in_flight";
+    if (this.refundSettlementPending(purchaseId)) return "refund_pending";
+    return null;
+  }
+
   expireIfDue(
     purchaseId: number,
     actor: string,
@@ -4771,25 +5073,8 @@ export class Shop {
     } => {
       const before = this.getPurchase(purchaseId);
       if (!before) return { expired: false, reason: "not_found" };
-      // **配送中は失効させない。** 期限が来ていても、いま外部へ投げている最中に
-      // expired へ落とすと「失効済みなのにロールだけ付く」が成立する。claim が
-      // 解決してから、次の巡回で通常どおり判断し直す（status は動かさない）。
-      if (this.externalDeliveryInFlight(purchaseId)) {
-        return { expired: false, reason: "delivery_in_flight" };
-      }
-      // **金銭の決着が終わっていない購入を失効させない。**
-      //
-      // `refund()` は active からしか refunded へ動けない。ここで expired にすると、
-      // 返金の未完了が一覧から消えるだけでなく**復旧そのものが不可能**になる。
-      // 期限より先に「利用者の金を返す」を終わらせる。
-      //
-      // **見るのは「商館で返せるか」ではなく「決着が済んだか」。** 商館の
-      // `refundFailureOpen()` を使うと、代替支払のように商館では返せない購入が
-      // 「商館の仕事ではない」という理由だけで失効し、運営への引き継ぎ一覧
-      // （`status='active'` を要求する）からも消える——未返金のまま導線が全部消える。
-      if (this.refundSettlementPending(purchaseId)) {
-        return { expired: false, reason: "refund_pending" };
-      }
+      const blocked = this.expiryBlockedBy(purchaseId);
+      if (blocked !== null) return { expired: false, reason: blocked };
 
       const changed = this.db
         .prepare(

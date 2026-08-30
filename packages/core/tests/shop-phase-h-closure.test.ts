@@ -614,7 +614,7 @@ describe("Round 3: 金銭の決着が終わるまで、期限では失効させ�
     expect(ctx.shop.expireIfDue(id, STAFF)).toEqual({ expired: false, reason: "refund_pending" });
     expect(ctx.shop.expireOverdue(STAFF).expired.map((r) => r.id)).not.toContain(id);
     expect(ctx.shop.getPurchase(id)!.status).toBe("active");
-    // 引き継ぎ一覧から消えない（消えると誰も気づけないまま未返金が残る）
+    // 引き継ぎ一覧から消えない（消えると誰も気づけないまま決着未了が残る）
     expect(inHandoff(ctx, id)).toBe(true);
     ctx.db.close();
   });
