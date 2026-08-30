@@ -94,7 +94,7 @@ DBが1件に縛る集合が将来ズレて、Coreは止めているつもりな�
 
 | # | 概念 | 正本 | 意味 |
 |---|---|---|---|
-| 1 | **返金失敗の履歴** | `refundFailureHistorySql()` | 過去に返金処理が失敗した durable evidence（append-only） |
+| 1 | **自動決着の対応記録** | `refundSettlementIssueHistorySql()` | 自動の返金・決着がその場で終わらず、durable な記録が積まれた履歴（append-only） |
 | 2 | **金銭決着が未了** | `refundSettlementPendingSql()` | 利用者への決着がまだ終わっていない。**失効を止める authority**。誰が処理できるかは問わない |
 | 3 | **商館の返金復旧** | `refundFailureSql()` | 2のうち live claim なし ＋ generic refund 可。商館の「返金をやり直す」 |
 | 4 | **運営への引き継ぎ** | `refundHandoffSql()` | 2のうち live claim なし ＋ generic refund **不可**。商館では処理せず運営へ渡す |
@@ -103,7 +103,7 @@ DBが1件に縛る集合が将来ズレて、Coreは止めているつもりな�
 意味がズレない。互いに排他で、2が false なら両方 false。
 
 ```
-                    返金失敗の履歴（append-only・消えない）
+                 自動決着の対応記録（append-only・消えない）
                               │
                     ┌─────────┴─────────┐
               決着が済んだ          決着が未了 ＝ settlement pending
@@ -117,7 +117,22 @@ DBが1件に縛る集合が将来ズレて、Coreは止めているつもりな�
                           → 商館「返金をやり直す」 → 運営「運営判断が必要」
 ```
 
-履歴は append-only なので消えない。
+記録は append-only なので消えない。
+
+> **⚠ テーブル名 `shop_refund_failures` は歴史的なもの。**
+>
+> いま積まれる行は「返金処理が実際に失敗した」証拠だけではない。
+>
+> | 積まれる場面 | 実際に返金を試したか |
+> |---|---|
+> | 台帳側の失敗（`LedgerError` 等） | **試した。** そして失敗した |
+> | `ERR_ALT_REFUND_UNSUPPORTED`（代替支払） | **試していない。** generic refund が authority 上そもそも扱えない。運営への引き継ぎを durable にするための記録 |
+>
+> 共通して確実に言えるのは「**自動では決着せず、人が続きをやる必要がある**」まで。
+> この2つを行から見分ける structured な情報は現在のスキーマに無いので、
+> **`detail` の文字列を解析して分類を捏造しない**。必要になったら別 Phase で
+> structured evidence を足す。それまでは名前でも説明でも
+> 「返金処理が実際に失敗した証拠」とは言わない。
 
 > **⚠ `refundFailureSql()`（＝ `recoveryOpen`）は「返す義務が無い」ことの証明ではない。**
 >
@@ -169,7 +184,7 @@ DBが1件に縛る集合が将来ズレて、Coreは止めているつもりな�
 | 購入が有効か | `shop_purchases.status` |
 | 外部配送が進行中／不明か | live external claim（`EXTERNAL_CLAIM_LIVE_STATES`。Core と DB索引で共有） |
 | 提供済みか | `DELIVERED_EVIDENCE_SQL` / `hasDeliveredEvidence()` |
-| 一度でも返金に失敗したか | `refundFailureHistorySql()`（履歴。append-only） |
+| 自動決着がその場で終わらなかったことがあるか | `refundSettlementIssueHistorySql()`（対応記録。append-only。**実際に返金を試したかは問わない**） |
 | **金銭の決着が未了か（＝失効させてよいか）** | `refundSettlementPendingSql()` / `refundSettlementPending()` |
 | 商館が「返金をやり直す」で終わらせられるか | `refundFailureSql()` / `refundFailureOpen()` |
 | 運営へ渡すしかないか | `refundHandoffSql()` / `countRefundHandoffs()` |
@@ -337,7 +352,7 @@ legacy や事故で、理論上あり得ない組み合わせが実在しうる�
 | 種別 | 意味 |
 |---|---|
 | `terminal_purchase_with_live_claim:<status>` | 終わった購入に生きた claim が残っている |
-| `terminal_with_refund_failure_history_without_delivery_evidence:<status>` | 終わった購入（`expired` / `cancelled`）に、返金を試して失敗した記録だけが残っている。**金の決着を人が監査する必要がある**——「返った」とも「未返金が確定した」とも言わない |
+| `terminal_with_refund_failure_history_without_delivery_evidence:<status>` | 終わった購入（`expired` / `cancelled`）に、返金を試して失敗した記録だけが残っている。**金の決着を人が監査する必要がある**——「返った」とも「未返金が確定した」とも言わない（「返金を試して失敗した」とは限らない） |
 | `delivered_evidence_vs_operator_no_effect` | 提供済みの証拠と「提供なし」の人の判断が同時に立っている |
 | `delivered_evidence_vs_open_refund_recovery` | 提供済みの証拠があるのに返金の導線が開いている。正本の定義上ありえない |
 | `refund_recovery_and_handoff_both_open` | 商館の仕事と運営への引き継ぎは排他。両方に出るなら述語がズレている |

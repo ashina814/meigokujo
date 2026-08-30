@@ -470,7 +470,10 @@ export interface ShopSafetySnapshot {
   /**
    * 返金。**4つの別々の事実**を分けて持つ。1つの語へ潰さない。
    *
-   * - `failureHistory` … 過去に返金処理が失敗した durable evidence（append-only）
+   * - `settlementIssueHistory` … 自動の返金・決着がその場で終わらず、durable な
+   *   対応記録が積まれた履歴（append-only）。**「返金処理が実際に失敗した」証拠とは
+   *   限らない**——代替支払のように generic refund が authority 上扱えないケースでも、
+   *   運営への引き継ぎを成立させるために行が積まれる
    * - `settlementPending` … 利用者への金銭決着が**まだ終わっていない**。
    *   失効を止める authority はこれ。商館が処理できるかは問わない
    * - `recoveryOpen` … **商館**が「返金をやり直す」で終わらせられる
@@ -483,7 +486,7 @@ export interface ShopSafetySnapshot {
    * `operationsHandoff=true` が正しい状態として同時に成り立つ。
    */
   refund: {
-    failureHistory: number;
+    settlementIssueHistory: number;
     settlementPending: boolean;
     recoveryOpen: boolean;
     operationsHandoff: boolean;
@@ -3717,14 +3720,25 @@ export class Shop {
   }
 
   /**
-   * 返金に失敗した**履歴**があるか。`refundFailureSql()`（いま復旧キューに載るか）
-   * とは別物で、こちらの方が広い——復旧キューから外れた購入も履歴は持ったまま残る。
+   * **自動の返金・決着がその場で終わらず、durable な対応記録が積まれた履歴。**
    *
-   * 配送やり直しキューはこちらを使う。**再配送してよいか**の判断なので、
-   * 一度でも返金を試した購入は自動の再配送から外す方が安全側になる。
-   * 意味が違うものに同じ名前を付けないために、別の関数として名前を持たせている。
+   * `shop_refund_failures` の行があるか、という事実そのもの。テーブル名は歴史的な
+   * ものだが、**いま積まれる行は「返金を試して失敗した」だけではない**。
+   *
+   *   - 台帳側の失敗（`LedgerError` 等）… 実際に返せなかった
+   *   - `ERR_ALT_REFUND_UNSUPPORTED` … generic refund が authority 上そもそも扱えない。
+   *     返金を試して失敗したのではなく、**運営への引き継ぎを durable にするための記録**
+   *
+   * どちらも「自動では決着しなかったので、人が続きをやる必要がある」という点で同じ。
+   * この2つを行から見分ける structured な情報は今のスキーマに無いので、
+   * **`detail` の文字列を解析して分類を捏造しない**。ここで言えるのは
+   * 「対応記録が積まれた」までで、それ以上を名前で主張しない。
+   *
+   * `refundFailureSql()`（いま商館の復旧キューに載るか）とは別物で、こちらの方が広い。
+   * 配送やり直しキューはこちらを使う——**再配送してよいか**の判断なので、
+   * 一度でも自動決着に失敗した購入は自動の再配送から外す方が安全側になる。
    */
-  private static refundFailureHistorySql(): string {
+  private static refundSettlementIssueHistorySql(): string {
     return "EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)";
   }
 
@@ -3777,7 +3791,7 @@ export class Shop {
     return `p.status = 'active'
       AND p.delivered_at IS NULL
       AND NOT ${Shop.DELIVERED_EVIDENCE_SQL}
-      AND ${Shop.refundFailureHistorySql()}`;
+      AND ${Shop.refundSettlementIssueHistorySql()}`;
   }
 
   /** 上と同じ判定を1件へ。失効の guard と候補選択が同じ意味を使う */
@@ -4442,7 +4456,7 @@ export class Shop {
       -- 「もう一度配る」ではなく「返金をやり直す」案件。別のキューで扱う。
       -- ここは**履歴**の方を使う（再配送してよいかの判断なので、一度でも返金を
       -- 試した購入は自動の再配送から外す方が安全側）。
-      AND NOT ${Shop.refundFailureHistorySql()}
+      AND NOT ${Shop.refundSettlementIssueHistorySql()}
       AND NOT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}`;
   }
 
@@ -4897,7 +4911,7 @@ export class Shop {
       this.db
         .prepare(`SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.refundHandoffSql()} LIMIT 1`)
         .get(purchaseId) !== undefined;
-    const failureHistory = this.db
+    const settlementIssueHistory = this.db
       .prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id = ?")
       .pluck()
       .get(purchaseId) as number;
@@ -4924,11 +4938,12 @@ export class Shop {
       // 終わった購入に生きた場所取りが残っている。次の配送も返金も塞がれ続ける
       contradictions.push(`terminal_purchase_with_live_claim:${purchase.status}`);
     }
-    if ((purchase.status === "expired" || purchase.status === "cancelled") && failureHistory > 0 && !evidence) {
-      // **終わった購入に、返金を試して失敗した記録だけが残っている。**
+    if ((purchase.status === "expired" || purchase.status === "cancelled") && settlementIssueHistory > 0 && !evidence) {
+      // **終わった購入に、自動決着が終わらなかった記録だけが残っている。**
       //
-      // `refunded` ではないので「返った」とは言えない。かといって履歴だけから
-      // 「未返金が確定した」とも言えない（別経路で戻した可能性を否定できない）。
+      // `refunded` ではないので「返った」とは言えない。かといって記録だけから
+      // 「未返金が確定した」とも言えない（別経路で戻した可能性を否定できないし、
+      // そもそもこの記録は「返金を試して失敗した」とは限らない）。
       // 言えるのは **金の決着を人が監査する必要がある** ということだけ。
       // `refund()` は active からしか動けないので、通常の復旧導線には載らない。
       contradictions.push(`terminal_with_refund_failure_history_without_delivery_evidence:${purchase.status}`);
@@ -4982,7 +4997,7 @@ export class Shop {
               state: claimRow.state as "in_flight" | "uncertain",
               startedAt: claimRow.started_at,
             },
-      refund: { failureHistory, settlementPending, recoveryOpen, operationsHandoff },
+      refund: { settlementIssueHistory, settlementPending, recoveryOpen, operationsHandoff },
       operatorCase: { unresolved, decided: decided ?? null },
       expiry: { expiresAt: purchase.expires_at, due, blockedBy },
       revocation: {

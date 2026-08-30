@@ -142,15 +142,25 @@ describe("snapshot は commit 前か後のどちらか一方だけを見る", ()
       snapshot.externalClaim.token === claimToken &&
       !snapshot.fulfillment.evidence;
     const after =
-      snapshot.contract.status === "refunded" && snapshot.externalClaim === null && !snapshot.refund.recoveryOpen;
+      snapshot.contract.status === "refunded" && snapshot.externalClaim === null && !snapshot.refund.settlementPending;
 
     // **どちらか一方。** 混ざった state vector は返さない
     expect([before, after]).toContain(true);
     expect(before && after).toBe(false);
-    // 具体的に禁止したい組み合わせ: active なのに守りも義務も無い
+    // 具体的に禁止したい組み合わせ: **active なのに守りが1つも無い**。
+    //
+    // 守りの authority は `recoveryOpen`（商館が返金をやり直せるか）ではなく
+    // `settlementPending`（金銭の決着が終わっていないか）。前者で見ると、
+    // 代替支払の引き継ぎ——`recoveryOpen=false` / `settlementPending=true` /
+    // `operationsHandoff=true`——という**正常な状態を異常として扱ってしまう**。
     expect(
-      snapshot.contract.status === "active" && snapshot.externalClaim === null && !snapshot.refund.recoveryOpen,
+      snapshot.contract.status === "active" && snapshot.externalClaim === null && !snapshot.refund.settlementPending,
     ).toBe(false);
+    // commit 前後どちらでも、4概念が矛盾しない組み合わせになっている
+    expect(snapshot.refund.recoveryOpen && snapshot.refund.operationsHandoff).toBe(false);
+    expect((snapshot.refund.recoveryOpen || snapshot.refund.operationsHandoff) && !snapshot.refund.settlementPending).toBe(
+      false,
+    );
     expect(snapshot.contradictions).toEqual([]);
 
     // 決着そのものは通っている（読み側が書き込みを止めていない）
@@ -175,7 +185,7 @@ describe("snapshot は commit 前か後のどちらか一方だけを見る", ()
     const hookedShop = new Shop(hooked, new Ledger(hooked), new EventLog(hooked));
 
     expect(() => hookedShop.safetySnapshot(purchaseId)).not.toThrow();
-    expect(reader.safetySnapshot(purchaseId)!.refund.failureHistory).toBe(1);
+    expect(reader.safetySnapshot(purchaseId)!.refund.settlementIssueHistory).toBe(1);
     readerDb.close();
     writerDb.close();
   });
