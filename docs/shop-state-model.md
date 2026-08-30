@@ -55,12 +55,51 @@ DEFERRED で始めるため読み取りのために書き込みロックは取�
 | 配送方式のスナップショット | `delivery_snapshot_json` | 「そのつもりだった」の証拠。成功の証拠ではない |
 | 購入時 provenance | `shop_purchase_fulfillment_provenance` | 「今のコードが作った購入」 |
 | ロール付与 provenance | `shop_purchase_role_grant_provenance` | 何のロールを与える契約だったか |
+| 運営の確認 | `shop_operator_resolutions.decision='delivered'` | 証拠（**外部事実の人による確認**） |
 | **提供済みか** | `DELIVERED_EVIDENCE_SQL` / `hasDeliveredEvidence()` | **authoritative** |
 
-`DELIVERED_EVIDENCE_SQL` は `delivered_at IS NOT NULL` **or** `shop_delivered` event
-**or**（provenance あり かつ `delivery_state='delivered'`）。
+`DELIVERED_EVIDENCE_SQL` は次の4つの **or**。どれか1つあれば提供済みと言える。
+
+1. `delivered_at IS NOT NULL`
+2. `shop_delivered` event
+3. provenance あり かつ `delivery_state='delivered'`
+4. `shop_operator_resolutions` に `decision='delivered'`（`OPERATOR_DELIVERED_SQL`）
+
 1件判定はこの定義をそのまま評価する（`DELIVERED_EVIDENCE_ROW_SQL`）ので、
 一覧と個別判定が食い違わない。
+
+#### 4 が「推測」ではなく証拠である理由
+
+1〜3 は Bot が自分の内部状態から言えること。4 は違う——**人が Discord や本人へ
+当たって外部の事実を確かめ、その責任で残した判断**であり、Bot の推測ではない。
+むしろ Bot の内部状態が何も証明できないときに、唯一残る一次情報になる。
+
+`no_effect` は含めない。両方ともキューを閉じるが意味は正反対（提供済み／未提供）で、
+金銭の帰結も逆になる。「どちらもキューを閉じる」を理由に同じ扱いにしてはいけない。
+
+#### 工程の状態と、観測された結末は直交する
+
+| 次元 | 置き場所 | 意味 |
+|---|---|---|
+| 配送の工程状態 | `delivery_state` / `delivered_at` | **その時この Bot が何をしたか**（歴史） |
+| 提供の結末 | delivered evidence | **結局どうなったか**（観測された事実） |
+
+運営が今日「提供できていた」と確認しても、**今日が配送日時だったわけではない**。
+だから決着は `delivered_at` を `now()` で埋めないし、`delivery_state` も動かさない。
+旧行の `delivery_state='delivered'`（移行の推測値）を「正しい値へ直す」こともしない。
+2つは別の次元の事実として並存させる。
+
+> **⚠ かつてここが混ざっていた。** 決着 `delivered` は
+> `markDeliverySucceeded()` → `completeDeliveryWith()` を通っていた。これは
+> 「**配送を実行して完了させる**」operation なので `delivery_state='delivered'` を
+> 見ると二重実行を防ぐために早期 return する。結果、旧購入では
+> **移行の推測値が人間の確認を弾き返し**、`ERR_RESOLUTION_STALE` で永久に
+> 決着できなかった。2つの operation は別物として分ける。
+>
+> | | 何をするか | 二重実行の guard |
+> |---|---|---|
+> | A. 配送を実行して完了させる | 効果を走らせ、工程状態を進める | **要る**（`completeDeliveryWith`） |
+> | B. 提供済みだった事実を記録する | 効果を走らせない。append-only に1行 | 決着の stale guard が持つ |
 
 ### 外部副作用（External delivery claim）
 
@@ -153,7 +192,7 @@ DBが1件に縛る集合が将来ズレて、Coreは止めているつもりな�
 
 | decision | 意味 | 状態を動かすか |
 |---|---|---|
-| `delivered` | 提供済みだと確認した | 動かす（決着） |
+| `delivered` | 提供済みだと確認した | **`shop_purchases` は動かさない。** claim だけ閉じ、この行自体が提供済みの正本になる |
 | `no_effect` | 提供されていないと確認した | 動かす（返金・再試行へ進める） |
 | `still_unknown` | まだ判断できない | **1つも動かさない** |
 
@@ -183,7 +222,7 @@ DBが1件に縛る集合が将来ズレて、Coreは止めているつもりな�
 |---|---|
 | 購入が有効か | `shop_purchases.status` |
 | 外部配送が進行中／不明か | live external claim（`EXTERNAL_CLAIM_LIVE_STATES`。Core と DB索引で共有） |
-| 提供済みか | `DELIVERED_EVIDENCE_SQL` / `hasDeliveredEvidence()` |
+| 提供済みか | `DELIVERED_EVIDENCE_SQL` / `hasDeliveredEvidence()`（運営の `delivered` を含む） |
 | 自動決着がその場で終わらなかったことがあるか | `refundSettlementIssueHistorySql()`（対応記録。append-only。**実際に返金を試したかは問わない**） |
 | **金銭の決着が未了か（＝失効を止めるか）** | `refundSettlementPendingSql()` / `refundSettlementPending()`。**true なら失効させない** |
 | 商館が「返金をやり直す」で終わらせられるか | `refundFailureSql()` / `refundFailureOpen()` |
@@ -262,7 +301,9 @@ claim 保持中
 ```
 uncertain / legacy unknown
 → 人が外部を見る + 根拠を書く
-→ delivered   … 提供済みとして確定（返金しない）
+→ delivered   … 外部で提供済みだった事実の確認。**配送の効果は実行しない**
+                （`delivered_at` も `shop_delivered` も作らない。作れば、
+                  実行していない配送を実行したことにしてしまう）
    no_effect  … 提供なしとして確定（返金 or 再試行へ）
    still_unknown … 1つも動かさない
 → shop_operator_resolutions へ append（判断・根拠・前後の状態・結果）

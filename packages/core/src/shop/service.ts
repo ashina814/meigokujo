@@ -2187,6 +2187,28 @@ export class Shop {
 
   private static readonly DELIVERED_EVENT_SQL = Shop.deliveredEventSql("p.id");
 
+  /**
+   * **運営が外部の事実を確認して「提供できていた」と決着した記録。**
+   *
+   * これは「Botの内部状態から提供済みを推測した」ではない。人が Discord や本人へ
+   * 当たって外部の事実を確かめ、その責任で残した判断であり、`delivered_at` や
+   * `shop_delivered` と**同じ強さの一次証拠**として扱う。
+   *
+   * `no_effect` は含めない。両方ともキューを閉じるが、意味は正反対
+   * （提供済み / 未提供）で、金銭の帰結も逆になる。
+   */
+  private static readonly OPERATOR_DELIVERED_SQL = `EXISTS (
+    SELECT 1 FROM shop_operator_resolutions o
+     WHERE o.purchase_id = p.id AND o.decision = 'delivered'
+  )`;
+
+  /**
+   * **「この購入は提供された」と言える証拠の正本。**
+   *
+   * 4つとも独立した durable evidence で、どれか1つあれば足りる。
+   * 旧行の `delivery_state='delivered'` **単独**は入っていない——移行時の推測値で
+   * しかなく、それを証拠にすると未対応の仕事が黙って消える。
+   */
   private static readonly DELIVERED_EVIDENCE_SQL = `(
     p.delivered_at IS NOT NULL
     OR ${Shop.DELIVERED_EVENT_SQL}
@@ -2194,6 +2216,7 @@ export class Shop {
       SELECT 1 FROM shop_purchase_fulfillment_provenance f
        WHERE f.purchase_id = p.id AND p.delivery_state = 'delivered'
     )
+    OR ${Shop.OPERATOR_DELIVERED_SQL}
   )`;
 
   /**
@@ -2216,10 +2239,11 @@ export class Shop {
    */
   private static readonly LEGACY_AUTO_OUTCOME_UNKNOWN_SQL = `(
     p.status = 'active'
-    AND p.delivered_at IS NULL
     AND p.delivery_snapshot_json IS NOT NULL
     AND NOT EXISTS (SELECT 1 FROM shop_purchase_fulfillment_provenance f WHERE f.purchase_id = p.id)
-    AND NOT ${Shop.DELIVERED_EVENT_SQL}
+    -- **「結末が証明できない」は正本の裏返しそのもの。** ここで条件を手で展開すると、
+    -- 証拠が1つ増えたときに片方だけ古い意味のまま残る
+    AND NOT ${Shop.DELIVERED_EVIDENCE_SQL}
     AND NOT ${Shop.REEVALUATION_EVIDENCE_SQL}
   )`;
 
@@ -3375,11 +3399,22 @@ export class Shop {
       let refundedAmount = 0;
 
       if (input.decision === "delivered") {
+        // **「これから配る」ではなく「外で既に提供された事実を確認した」。**
+        //
+        // だからここでは配送の効果を1つも実行しないし、`completeDeliveryWith()` の
+        // exactly-once guard も通さない。通していた頃は、旧購入の
+        // `delivery_state='delivered'`（移行の**推測値**）が guard に引っかかって
+        // 早期 return し、`ERR_RESOLUTION_STALE` になっていた——
+        // **推測が人間の確認を上書きして黙らせる**、という逆立ちした状態だった。
+        //
+        // 記録するのは下の `shop_operator_resolutions` への1行だけ。それが
+        // 提供済みの正本になる（`OPERATOR_DELIVERED_SQL`）。
         if (purchase.status !== "active") {
           throw new ShopError("ERR_RESOLUTION_NOT_APPLICABLE", { purchaseId: input.purchaseId, status: purchase.status });
         }
         if (claim) {
-          // claim と delivered を同じ transaction で確定する
+          // 外部へ投げたままの場所取りは、決着と同じ transaction で閉じる。
+          // 残すと次の配送も返金も塞がれ続ける
           const settled = this.db
             .prepare(
               `UPDATE shop_external_delivery_attempts
@@ -3389,9 +3424,10 @@ export class Shop {
             .run(ts, "operator_confirmed_delivered", input.purchaseId, claim.attempt_token).changes;
           if (settled !== 1) throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
         }
-        if (!this.markDeliverySucceeded(input.purchaseId, input.actor)) {
-          throw new ShopError("ERR_RESOLUTION_STALE", { purchaseId: input.purchaseId });
-        }
+        // **`shop_purchases` は触らない。** 人が今日確認したことは、
+        // 「今日が配送日時だった」ではない。`delivered_at` を now() で埋めると
+        // 監査の上で偽の配送時刻を作ることになる。工程の状態（`delivery_state`）と
+        // 観測された結末（この決着）は別の次元の事実として並存させる。
       } else if (input.decision === "no_effect") {
         if (claim) {
           const released = this.db
@@ -3501,6 +3537,12 @@ export class Shop {
    * `delivered` / `no_effect` は「提供されたか分からない」を終わらせる判断なので、
    * そのあとで同じ購入を「不明」として出し直すのは事実と矛盾する。
    * `still_unknown` は決着していないので対象外。
+   *
+   * **`OPERATOR_DELIVERED_SQL` とは別の問い。** こちらは「決着したか」だけを見る
+   * （`delivered` と `no_effect` を同じ側へ入れる）。提供済みかどうかは正反対なので、
+   * 提供の証拠として使えるのは `delivered` だけ——そちらは
+   * `DELIVERED_EVIDENCE_SQL` が持つ。両者を混ぜると、未提供と確認した購入まで
+   * 提供済みとして返金を拒むことになる。
    */
   private static readonly OPERATOR_DECIDED_SQL = `EXISTS (
     SELECT 1 FROM shop_operator_resolutions o
@@ -4212,15 +4254,31 @@ export class Shop {
   } {
     const begin = this.db.transaction(() => {
       const row = this.db
-        .prepare("SELECT status, delivery_state, delivery_attempts FROM shop_purchases WHERE id = ?")
+        .prepare("SELECT status, delivery_state, delivery_attempts, delivered_at FROM shop_purchases WHERE id = ?")
         .get(purchaseId) as
-        | { status: PurchaseStatus; delivery_state: DeliveryState | null; delivery_attempts: number }
+        | {
+            status: PurchaseStatus;
+            delivery_state: DeliveryState | null;
+            delivery_attempts: number;
+            delivered_at: number | null;
+          }
         | undefined;
       if (!row) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId });
-      if (row.delivery_state === "delivered") {
+      // **提供済みの正本で止める。** `delivery_state` だけを見ていると、運営が
+      // 外部の事実を確認して「提供できていた」と決着した購入へ、worker が
+      // もう一度ロールや期限延長を流し込める（決着は工程状態を動かさないため）。
+      // 一覧に出ないことは authority ではないので、実行の直前でも確かめる。
+      const delivered =
+        row.delivery_state === "delivered" ||
+        (
+          this.db
+            .prepare(Shop.DELIVERED_EVIDENCE_ROW_SQL)
+            .get(purchaseId, row.delivered_at, row.delivery_state) as { hit: number }
+        ).hit === 1;
+      if (delivered) {
         return {
           proceed: false,
-          state: "delivered" as DeliveryState,
+          state: row.delivery_state ?? ("pending" as DeliveryState),
           attempts: row.delivery_attempts,
           reason: "delivered" as const,
           status: row.status,
@@ -4303,7 +4361,22 @@ export class Shop {
     return transitioned;
   }
 
-  /** 完了マークだけ（効果が外部＝Discord側にあり、既にやり切った場合） */
+  /**
+   * 完了マークだけ（効果が外部＝Discord側にあり、既にやり切った場合）。
+   *
+   * **これは「配送を完了させる」operation であって、証拠を記録する operation ではない。**
+   * `completeDeliveryWith()` の exactly-once guard を通るので、
+   * `delivery_state='delivered'` が**既に立っていると黙って `false` を返す**。
+   *
+   * 旧購入ではその値が移行時の推測でしかないことがあり、そこへ本物の検証済み配送
+   * （期限つきアクセスの復元など）が来ると、**推測値が本物の記録を握り潰す**。
+   * 本番の購入 #58 が実際にこれで `delivered_at` も `shop_delivered` も失っている。
+   *
+   * 外部の事実を独立に検証した呼び出し側は、この戻り値を「配送していない」と
+   * 読んではいけない。**証拠を残したいなら、記録側の authority を使うこと**——
+   * いまあるのは運営の決着（`shop_operator_resolutions`）だけなので、
+   * 自動の検証済み配送を証拠にする経路は別タスクで足す。
+   */
   markDeliverySucceeded(purchaseId: number, actor: string): boolean {
     return this.completeDeliveryWith(purchaseId, actor, () => undefined);
   }
@@ -4483,7 +4556,10 @@ export class Shop {
       -- ここは**対応記録があるか**の方を使う（再配送してよいかの判断なので、
       -- 一度でも自動決着が止まった購入は自動の再配送から外す方が安全側）。
       AND NOT ${Shop.refundSettlementIssueHistorySql()}
-      AND NOT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}`;
+      AND NOT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}
+      -- **提供済みの正本は、ここで一度だけ外す。** 一覧側にだけ足すと
+      -- 「もう一度配る」を画面に出しておいてキューには載らない、が起きる
+      AND NOT ${Shop.DELIVERED_EVIDENCE_SQL}`;
   }
 
   /**
